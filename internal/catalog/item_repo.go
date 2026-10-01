@@ -4063,18 +4063,35 @@ func (r *ItemRepository) CountVisiblePersonalCollectionMembers(ctx context.Conte
 }
 
 func buildCountVisiblePersonalCollectionMembersSQL(userID int, collectionIDs []string, access AccessFilter) (string, []any) {
-	sql := `SELECT upci.collection_id, COUNT(*)
-            FROM user_personal_collection_items upci
-            JOIN media_items mi ON mi.content_id = upci.media_item_id
-            WHERE upci.user_id = $1 AND upci.collection_id = ANY($2) AND upci.sub_item_id = ''`
 	args := []any{userID, collectionIDs}
 	argIdx := 3
-	for _, c := range itemAccessConditions(access, &args, &argIdx) {
-		sql += "\n            AND " + c
+	// Catalog members are checked as themselves; season members as their
+	// parent series, the same rule the collection grid applies. Each branch
+	// binds its own copy of the access arguments.
+	itemConditions := itemAccessConditions(access, &args, &argIdx)
+	seasonConditions := itemAccessConditions(access, &args, &argIdx)
+	sql := `SELECT member.collection_id, COUNT(*)
+            FROM (
+                SELECT upci.collection_id
+                FROM user_personal_collection_items upci
+                JOIN media_items mi ON mi.content_id = upci.media_item_id
+                WHERE upci.user_id = $1 AND upci.collection_id = ANY($2) AND upci.sub_item_id = ''`
+	for _, c := range itemConditions {
+		sql += "\n                AND " + c
 	}
 	// The catalog view never lists manga chapters as items.
-	sql += "\n            AND " + MangaChapterExclusionWhere("mi")
-	return sql + "\n            GROUP BY upci.collection_id", args
+	sql += "\n                AND " + MangaChapterExclusionWhere("mi")
+	sql += `
+                UNION ALL
+                SELECT upci.collection_id
+                FROM user_personal_collection_items upci
+                JOIN seasons season ON season.content_id = upci.media_item_id
+                JOIN media_items mi ON mi.content_id = season.series_id AND mi.type = 'series'
+                WHERE upci.user_id = $1 AND upci.collection_id = ANY($2) AND upci.sub_item_id = ''`
+	for _, c := range seasonConditions {
+		sql += "\n                AND " + c
+	}
+	return sql + "\n            ) member\n            GROUP BY member.collection_id", args
 }
 
 // GetOriginalLanguage returns the original_language for a media item by content ID.

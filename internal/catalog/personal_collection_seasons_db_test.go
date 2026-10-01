@@ -263,3 +263,38 @@ func TestPersonalCollectionWatchedFilterRollsUpSeasonsDB(t *testing.T) {
 		t.Fatalf("watched count = %d, want 1", n)
 	}
 }
+
+func TestCountVisiblePersonalCollectionMembersIncludesSeasonsDB(t *testing.T) {
+	f := newSeasonCollectionFixture(t)
+	repo := NewItemRepository(f.pool)
+	cases := []struct {
+		name   string
+		filter AccessFilter
+		want   int
+	}{
+		{"unrestricted", AccessFilter{}, 5},
+		{"own library", f.access(), 5},
+		{"other library", AccessFilter{AllowedLibraryIDs: []int{f.otherLibrary}}, 0},
+		{"PG ceiling", AccessFilter{AllowedLibraryIDs: []int{f.library}, MaturityLimits: access.MaturityLimits{MaxContentRating: "PG"}}, 1},
+	}
+	for _, tc := range cases {
+		got, err := repo.CountVisiblePersonalCollectionMembers(context.Background(), f.userID, []string{f.collectionID}, tc.filter)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got[f.collectionID] != tc.want {
+			t.Fatalf("%s: count = %d, want %d", tc.name, got[f.collectionID], tc.want)
+		}
+	}
+	batchEquivExec(t, f.pool, `DELETE FROM seasons WHERE content_id=$1`, f.s2)
+	got, err := repo.CountVisiblePersonalCollectionMembers(context.Background(), f.userID, []string{f.collectionID}, f.access())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[f.collectionID] != 4 {
+		t.Fatalf("after deleting season 2: count = %d, want 4", got[f.collectionID])
+	}
+	if items := ids(f.page(t, f.access(), QuerySort{}, 50).Items); len(items) != 4 {
+		t.Fatalf("after deleting season 2 the grid shows %v", items)
+	}
+}
