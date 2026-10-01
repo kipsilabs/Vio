@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"testing"
 	"time"
@@ -179,5 +180,86 @@ func TestPersonalCollectionSeasonsSurviveEverySortDB(t *testing.T) {
 				t.Fatalf("sort %s %s returned %v", field, order, ids(got.Items))
 			}
 		}
+	}
+}
+
+func displayRule(field string, value any) string {
+	return fmt.Sprintf(`{"match":"all","groups":[{"match":"all","rules":[{"field":%q,"op":"is","value":%s}]}]}`, field, mustJSON(value))
+}
+
+func mustJSON(v any) string {
+	b, err := json.Marshal(v)
+	if err != nil {
+		panic(err)
+	}
+	return string(b)
+}
+
+func (f seasonCollectionFixture) setDisplay(t *testing.T, display string) {
+	t.Helper()
+	batchEquivExec(t, f.pool, `UPDATE user_personal_collections SET display_query_definition=$1::jsonb WHERE id=$2`, display, f.collectionID)
+}
+
+func (f seasonCollectionFixture) count(t *testing.T) int {
+	t.Helper()
+	var display string
+	if err := f.pool.QueryRow(context.Background(), `SELECT COALESCE(display_query_definition::text,'') FROM user_personal_collections WHERE id=$1`, f.collectionID).Scan(&display); err != nil {
+		t.Fatal(err)
+	}
+	counts, err := CountPersonalCollections(context.Background(), f.pool, f.userID, []PersonalCollectionDefinition{{ID: f.collectionID, CollectionType: "manual", DisplayQueryDefinition: display}}, f.access())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return counts[f.collectionID]
+}
+
+func (f seasonCollectionFixture) addEpisodes(t *testing.T, seasonID string, n int) {
+	t.Helper()
+	batchEquivExec(t, f.pool, `INSERT INTO episodes (content_id,series_id,season_id,season_number,episode_number,title)
+		SELECT $1 || '-e' || n, s.series_id, s.content_id, s.season_number, n, 'Episode ' || n
+		FROM seasons s, generate_series(1,$2::int) n WHERE s.content_id = $1`, seasonID, n)
+	batchEquivExec(t, f.pool, `INSERT INTO media_files (content_id,episode_id,media_folder_id,file_path)
+		SELECT e.series_id, e.content_id, $2, e.content_id || '.mkv' FROM episodes e WHERE e.season_id = $1`, seasonID, f.library)
+	batchEquivExec(t, f.pool, `INSERT INTO episode_libraries (episode_id,media_folder_id)
+		SELECT content_id, $2 FROM episodes WHERE season_id = $1`, seasonID, f.library)
+}
+
+func (f seasonCollectionFixture) markEpisodesWatched(t *testing.T, seasonID string) {
+	t.Helper()
+	batchEquivExec(t, f.pool, `INSERT INTO user_watch_progress (user_id,profile_id,media_item_id,completed)
+		SELECT $1, $2, content_id, TRUE FROM episodes WHERE season_id = $3`, f.userID, f.profile, seasonID)
+}
+
+func TestPersonalCollectionTypeFilterIncludesSeasonsDB(t *testing.T) {
+	f := newSeasonCollectionFixture(t)
+	f.setDisplay(t, displayRule("type", "series"))
+	got := ids(f.page(t, f.access(), QuerySort{}, 50).Items)
+	if want := []string{f.s2, f.s1, f.series, f.s0}; fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("series filter = %v, want %v", got, want)
+	}
+	if n := f.count(t); n != 4 {
+		t.Fatalf("series filter count = %d, want 4", n)
+	}
+	f.setDisplay(t, displayRule("type", "movie"))
+	if got := ids(f.page(t, f.access(), QuerySort{}, 50).Items); fmt.Sprint(got) != fmt.Sprint([]string{f.movie}) {
+		t.Fatalf("movie filter = %v", got)
+	}
+	if n := f.count(t); n != 1 {
+		t.Fatalf("movie filter count = %d, want 1", n)
+	}
+}
+
+func TestPersonalCollectionWatchedFilterRollsUpSeasonsDB(t *testing.T) {
+	f := newSeasonCollectionFixture(t)
+	f.addEpisodes(t, f.s1, 2)
+	f.addEpisodes(t, f.s2, 2)
+	f.markEpisodesWatched(t, f.s1)
+	f.setDisplay(t, displayRule("watched", true))
+	got := ids(f.page(t, f.access(), QuerySort{}, 50).Items)
+	if fmt.Sprint(got) != fmt.Sprint([]string{f.s1}) {
+		t.Fatalf("watched filter = %v, want only fully watched season 1", got)
+	}
+	if n := f.count(t); n != 1 {
+		t.Fatalf("watched count = %d, want 1", n)
 	}
 }
