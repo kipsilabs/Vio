@@ -298,3 +298,26 @@ func TestCountVisiblePersonalCollectionMembersIncludesSeasonsDB(t *testing.T) {
 		t.Fatalf("after deleting season 2 the grid shows %v", items)
 	}
 }
+
+func TestGetVisibleSeasonsWithAccessDB(t *testing.T) {
+	f := newSeasonCollectionFixture(t)
+	repo := NewItemRepository(f.pool)
+	got, err := repo.GetVisibleSeasonsWithAccess(context.Background(), []string{f.s0, f.s2, f.movie, f.series + "-S9"}, f.access())
+	if err != nil {
+		t.Fatal(err)
+	}
+	titles := map[string]string{}
+	for _, s := range got {
+		titles[s.SeasonID] = s.DisplayTitle()
+	}
+	if len(titles) != 2 || titles[f.s0] != "Alpha — Specials" || titles[f.s2] != "Alpha — Season 2" {
+		t.Fatalf("visible seasons = %v", titles)
+	}
+	hidden, err := repo.GetVisibleSeasonsWithAccess(context.Background(), []string{f.s2}, AccessFilter{AllowedLibraryIDs: []int{f.otherLibrary}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hidden) != 0 {
+		t.Fatalf("other library sees %v", hidden)
+	}
+}
