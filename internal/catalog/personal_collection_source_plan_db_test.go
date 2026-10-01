@@ -8,6 +8,12 @@ import (
 
 func TestPersonalCollectionSourcePlanDB(t *testing.T) {
 	f := newSeasonCollectionFixture(t)
+	// A realistic seasons table: with only a handful of rows the planner
+	// rightly prefers a sequential scan, which says nothing about real sizes.
+	batchEquivExec(t, f.pool, `INSERT INTO seasons(content_id,series_id,season_number)
+		SELECT $1 || '-decoy-' || n, $1, 1000 + n FROM generate_series(1, 3000) n`, f.series)
+	batchEquivExec(t, f.pool, `ANALYZE seasons`)
+	batchEquivExec(t, f.pool, `ANALYZE user_personal_collection_items`)
 	executor := f.resolver.queryExecutorForScope("", nil)
 	usePersonalCollectionSource(executor, f.userID, f.collectionID)
 	sql, args, err := executor.buildPreviewPageSQL(QueryDefinition{}, f.access(), 50, 0, false)
