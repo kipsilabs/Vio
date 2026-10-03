@@ -205,6 +205,20 @@ func validateSectionConfig(sectionType sections.SectionType, config json.RawMess
 	return "", true
 }
 
+// validateRecipeConfig runs the section type's own recipe check, which bulk
+// create and profile saves also run; validateSectionConfig only checks the
+// keys every section type shares.
+func validateRecipeConfig(sectionType sections.SectionType, config json.RawMessage) (string, bool) {
+	rec, ok := recipes.Get(string(sectionType))
+	if !ok {
+		return "", true
+	}
+	if err := rec.Validate(config); err != nil {
+		return err.Error(), false
+	}
+	return "", true
+}
+
 func validateSectionScope(scope string, libraryID *int) (string, bool) {
 	switch scope {
 	case "", "home":

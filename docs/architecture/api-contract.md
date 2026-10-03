@@ -2297,7 +2297,10 @@ defaults and requires the captured scope ETag. Its response is the refreshed can
 with its ETag; clients refetch definitions after replacement. `reset_profiles` selects the separate all-profile
 reset capability described above; an unsupported reset fails before definition writes. Creation
 and bulk creation use POST, while the retained preview POST samples recipe results using the
-requesting profile's access filter without saving a definition. Capabilities report whether the
+requesting profile's access filter without saving a definition. Creation, bulk creation, preview,
+and a PATCH that writes `section_type` or `config` run the recipe's own config check and answer
+`validation_failed` when it fails, for example an Editor's Picks list with no items; a PATCH that
+writes neither does not re-check the stored config. Capabilities report whether the
 service, preview, and atomic profile reset are available. Clients do not automatically replay
 administrator section operations after a conflict or a partial multi-request flow.
 
