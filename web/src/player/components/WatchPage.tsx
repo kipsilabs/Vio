@@ -813,17 +813,38 @@ function WatchPagePlayer({
           // list no richer than the plan's keeps the poll running so a later
           // probe can still expand it.
           const audioTargetChanged = version.file_id !== current.mediaFileId;
+          // A serve-layer rotation moves the resolved candidate while the
+          // collapsed id stays put, so the version identity has to follow the
+          // same source the inventory does. Only a virtual source carries a
+          // candidate URI; an ordinary version switch moves by id alone and
+          // must leave `effectiveVirtualUri` untouched.
+          const resolvedVirtualUri = isVirtualActiveFile ? version.file_path : undefined;
+          // A changed candidate URI under the same resolved row is an
+          // authoritative identity update even when the catalog list is the
+          // same length; it must not be held to the enrichment guard below.
+          const candidateUriChanged =
+            resolvedVirtualUri !== undefined && resolvedVirtualUri !== current.effectiveVirtualUri;
           // A declared (provisional) list is upgraded by the catalog's probed
           // list even when that list is shorter; an already-verified list still
           // only accepts a strict superset so a poorer row cannot shrink it.
           if (
             nextAudioTracks.length > 0 &&
             (audioTargetChanged ||
+              candidateUriChanged ||
               current.audioInventoryProvisional ||
               nextAudioTracks.length > current.planAudioTracks.length)
           ) {
-            applyAudioInventory(nextAudioTracks, version.file_id);
+            if (resolvedVirtualUri !== undefined) {
+              applyAudioInventory(nextAudioTracks, version.file_id, resolvedVirtualUri);
+            } else {
+              applyAudioInventory(nextAudioTracks, version.file_id);
+            }
             audioComplete = true;
+          } else if (candidateUriChanged && resolvedVirtualUri !== undefined) {
+            // Same resolved row, unchanged (possibly empty) list, but the
+            // candidate moved. Re-key the identity without pretending the probe
+            // landed, and keep polling for the new source's inventory.
+            applyAudioInventory(nextAudioTracks, version.file_id, resolvedVirtualUri);
           }
           const resolvedSubtitleTracks = version.subtitle_tracks ?? [];
           // The first-play probe persists its tracks to the resolved candidate
