@@ -5678,4 +5678,286 @@ describe("usePlaybackSession deferred push authority", () => {
     expect(result.current.planAudioTracks).toEqual(rotatedAudio);
     unmount();
   });
+
+  it("preserves a legitimate rotation when a URI-ful original plan is refused", async () => {
+    let releaseReplan: ((response: Response) => void) | undefined;
+    const heldReplan = new Promise<Response>((resolve) => {
+      releaseReplan = resolve;
+    });
+    const replanBodies: Array<Record<string, unknown>> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3({
+              effective_media_file_id: 7,
+              effective_virtual_uri: "virtual://movie/x?result=A",
+              audio_tracks: outgoingAudio,
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/session-1/replan")) {
+        replanBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        return heldReplan;
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    act(() => {
+      void result.current.refreshSubtitles(120);
+    });
+    await waitFor(() => expect(result.current.replanning).toBe(true));
+
+    // The transport rotates to file 8 candidate B while the replan is in
+    // flight. The plan being replanned names file 7 candidate A, so when the
+    // replan is refused the original URI-ful plan is still the live plan and
+    // must not veto the rotation the transport already committed to.
+    act(() =>
+      result.current.applyCommittedSource(
+        {
+          effectiveMediaFileId: 8,
+          effectiveVirtualUri: "virtual://movie/x?result=B",
+          inventoryStatus: "verified",
+        },
+        rotatedAudio,
+      ),
+    );
+    expect(result.current.mediaFileId).toBe(7);
+
+    await act(async () => {
+      releaseReplan?.(
+        jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "adaptation_unavailable",
+          terminal: {
+            reason: "video_conversion_unsupported",
+            message: "No executor can transcode this source.",
+            retryable: false,
+          },
+        }),
+      );
+      await heldReplan;
+    });
+
+    // The plan was refused, not replaced, so it still names file 7 candidate A.
+    // The rotation to B must survive: the refusal is not evidence that the
+    // transport stayed on A.
+    await waitFor(() => expect(result.current.mediaFileId).toBe(8));
+    expect(result.current.effectiveVirtualUri).toBe("virtual://movie/x?result=B");
+    expect(result.current.planAudioTracks).toEqual(rotatedAudio);
+    expect(result.current.plan?.plan_id).toBe("plan:0123456789abcdef");
+    expect(replanBodies).toHaveLength(1);
+    unmount();
+  });
+
+  it("uses the live rotation as the outgoing baseline before the next render", async () => {
+    let releaseReplan: ((response: Response) => void) | undefined;
+    const heldReplan = new Promise<Response>((resolve) => {
+      releaseReplan = resolve;
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3({
+              effective_media_file_id: 7,
+              effective_virtual_uri: "virtual://movie/x?result=A",
+              audio_tracks: outgoingAudio,
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/session-1/replan")) return heldReplan;
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    act(() => {
+      void result.current.refreshSubtitles(120);
+    });
+    await waitFor(() => expect(result.current.replanning).toBe(true));
+
+    // No render between the poll rotation and the deferred push: the menus move
+    // to file 8 candidate B, then a source commit for the same file's other
+    // candidate C is held behind the replan. The next transition must read the
+    // rotation, not the pre-rotation rendered state; otherwise the URI-less
+    // winner would misread C as a cross-file rotation off file 7 and admit it.
+    act(() => {
+      result.current.applyAudioInventory(rotatedAudio, 8, "virtual://movie/x?result=B");
+      result.current.applyCommittedSource(
+        {
+          effectiveMediaFileId: 8,
+          effectiveVirtualUri: "virtual://movie/x?result=C",
+          inventoryStatus: "verified",
+        },
+        collisionAudio,
+      );
+    });
+
+    await act(async () => {
+      releaseReplan?.(
+        jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "playable",
+          session_id: "session-1",
+          playback_plan: fixturePlanV3({
+            plan_id: "plan:no-render001",
+            plan_attempt_key: "v3:no-render001",
+            effective_media_file_id: 8,
+            audio_tracks: [],
+          }),
+        }),
+      );
+      await heldReplan;
+    });
+
+    await waitFor(() => expect(result.current.mediaFileId).toBe(8));
+    // The winner is URI-less on file 8 and the live rotation is already B, so C
+    // shares the live file and cannot be proven. It must not be folded.
+    expect(result.current.effectiveVirtualUri).toBeNull();
+    expect(result.current.planAudioTracks).toEqual([]);
+    unmount();
+  });
+
+  it("does not refold a rejected inventory revision after an accepted rotation", async () => {
+    let releaseReplan: ((response: Response) => void) | undefined;
+    const heldReplan = new Promise<Response>((resolve) => {
+      releaseReplan = resolve;
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3({
+              effective_media_file_id: 8,
+              effective_virtual_uri: "virtual://movie/x?result=B",
+              audio_tracks: outgoingAudio,
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/session-1/replan")) return heldReplan;
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 8, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    act(() => {
+      void result.current.refreshSubtitles(120);
+    });
+    await waitFor(() => expect(result.current.replanning).toBe(true));
+
+    // A file-only inventory revision is held behind the replan. The settled
+    // replacement names candidate B by URI, so a file-only revision cannot be
+    // tied to it and is refused (its revision recorded as handled).
+    act(() =>
+      result.current.applyInventoryUpdate({
+        session_id: "session-1",
+        inventory_revision: "inv:rejected",
+        inventory_status: "verified",
+        effective_media_file_id: 8,
+        audio_tracks: collisionAudio,
+      }),
+    );
+
+    await act(async () => {
+      releaseReplan?.(
+        jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "playable",
+          session_id: "session-1",
+          playback_plan: fixturePlanV3({
+            plan_id: "plan:reject-again",
+            plan_attempt_key: "v3:reject-again",
+            effective_media_file_id: 8,
+            effective_virtual_uri: "virtual://movie/x?result=B",
+            audio_tracks: [],
+          }),
+        }),
+      );
+      await heldReplan;
+    });
+
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe("plan:reject-again"));
+    expect(result.current.effectiveVirtualUri).toBe("virtual://movie/x?result=B");
+    expect(result.current.planAudioTracks).toEqual([]);
+
+    // An accepted source rotation moves the menu to candidate D with an empty
+    // declared inventory. That identity change must not forget the revision the
+    // flush already handled.
+    act(() =>
+      result.current.applyCommittedSource(
+        {
+          effectiveMediaFileId: 8,
+          effectiveVirtualUri: "virtual://movie/x?result=D",
+          inventoryStatus: "verified",
+        },
+        [],
+      ),
+    );
+    expect(result.current.effectiveVirtualUri).toBe("virtual://movie/x?result=D");
+    expect(result.current.planAudioTracks).toEqual([]);
+
+    // Redelivering the refused revision is a no-op, not a second fold. The
+    // rejected payload carries a track the accepted source does not have, so a
+    // forgotten revision would show a stale track under candidate D.
+    act(() =>
+      result.current.applyInventoryUpdate({
+        session_id: "session-1",
+        inventory_revision: "inv:rejected",
+        inventory_status: "verified",
+        effective_media_file_id: 8,
+        audio_tracks: collisionAudio,
+      }),
+    );
+    expect(result.current.effectiveVirtualUri).toBe("virtual://movie/x?result=D");
+    expect(result.current.planAudioTracks).toEqual([]);
+    unmount();
+  });
 });
