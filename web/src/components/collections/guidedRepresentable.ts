@@ -32,13 +32,24 @@ function comparisonKey(qd: QueryDefinition): string {
     .map((group) => {
       const rules = group.rules
         .map(({ field, op, value }) =>
-          // Genre is an array field, where the server runs "contains" and "is"
-          // as the same query, so Guided's switch to "is" changes nothing.
-          JSON.stringify([field, field === "genre" && op === "contains" ? "is" : op, value]),
+          JSON.stringify([
+            field,
+            // Genre is an array field, where the server runs "contains" and "is"
+            // as the same query, so Guided's switch to "is" changes nothing.
+            field === "genre" && op === "contains" ? "is" : op,
+            Array.isArray(value) ? value.map(numberAsString) : numberAsString(value),
+          ]),
         )
         .sort();
       return JSON.stringify([group.match, rules]);
     })
     .sort();
   return JSON.stringify({ ...qd, groups });
+}
+
+// The catalog URL reads "7.5" back as a string and "1917" as a number, while
+// Guided writes ratings as numbers and genres as strings. Comparing numbers as
+// text keeps that type change from counting as a lost rule.
+function numberAsString<T>(value: T): T | string {
+  return typeof value === "number" ? String(value) : value;
 }

@@ -1,8 +1,13 @@
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { createEmptyQueryDefinition, type QueryDefinition } from "@/api/types";
-import type { CatalogSearchState } from "@/pages/catalogSearchParams";
+import {
+  buildCatalogFilterSearchParams,
+  parseCatalogSearchParams,
+  type CatalogSearchState,
+} from "@/pages/catalogSearchParams";
 
 import CatalogFiltersPanel from "./CatalogFiltersPanel";
 
@@ -71,6 +76,17 @@ function renderPanel(state: CatalogSearchState) {
   const onStateChange = vi.fn<(next: CatalogSearchState) => void>();
   render(<CatalogFiltersPanel state={state} onStateChange={onStateChange} />);
   return onStateChange;
+}
+
+// Sends every change through the catalog URL, the way the Catalog page does.
+function UrlBackedPanel({ initial }: { initial: CatalogSearchState }) {
+  const [params, setParams] = useState(() => buildCatalogFilterSearchParams(initial));
+  return (
+    <CatalogFiltersPanel
+      state={parseCatalogSearchParams(params)}
+      onStateChange={(next) => setParams(buildCatalogFilterSearchParams(next))}
+    />
+  );
 }
 
 function choose(currentLabel: string, option: string) {
@@ -180,5 +196,55 @@ describe("CatalogFiltersPanel catalog filters the Guided view can show", () => {
     fireEvent.click(screen.getByRole("button", { name: "Remove Genre: Fantasy" }));
 
     expect(lastQuery(onStateChange)?.groups).toEqual([]);
+  });
+});
+
+describe("CatalogFiltersPanel on a page that keeps filters in the URL", () => {
+  function expectGuidedOpen() {
+    fireEvent.click(screen.getByRole("button", { name: /Filters/ }));
+    const sheet = screen.getByRole("dialog");
+    expect(within(sheet).getByRole("button", { name: "Guided" })).toBeEnabled();
+    expect(within(sheet).queryByText(/Guided view can't show/)).toBeNull();
+  }
+
+  it("keeps Guided open while a decimal IMDb minimum is typed", () => {
+    render(
+      <UrlBackedPanel
+        initial={{ source: "query", query_definition: createEmptyQueryDefinition() }}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /Filters/ }));
+    fireEvent.change(screen.getByPlaceholderText("e.g. 7.0"), { target: { value: "7.5" } });
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+
+    expect(screen.getByText("IMDb: >= 7.5")).toBeVisible();
+    expectGuidedOpen();
+  });
+
+  it("keeps Guided for genre and content rating values that look like numbers", () => {
+    render(
+      <UrlBackedPanel
+        initial={{
+          source: "query",
+          query_definition: {
+            ...createEmptyQueryDefinition(),
+            groups: [
+              {
+                match: "all",
+                rules: [
+                  { field: "genre", op: "is", value: "1917" },
+                  { field: "content_rating", op: "is", value: "16" },
+                ],
+              },
+            ],
+          },
+        }}
+      />,
+    );
+
+    expect(screen.getByText("Genre: 1917")).toBeVisible();
+    expect(screen.getByText("Rated: 16")).toBeVisible();
+    expectGuidedOpen();
   });
 });
