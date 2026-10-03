@@ -150,30 +150,40 @@ interface PlaybackSessionErrorState {
   retryable?: boolean;
 }
 
+/** The live effective identity of a source: its file and, when virtual, its candidate. */
+interface SourceIdentity {
+  fileId: number | null;
+  uri: string | null;
+}
+
 /**
  * A realtime push held back while a start, switch, or replan owns the session.
  *
  * Arrival order is preserved so a flush never replays a newer source commit
- * before an older inventory revision. Each entry carries the adoption
- * generation and the session/plan identities it arrived under, so the flush
- * decides against the adoption that actually won rather than the rendered state,
- * which still describes the outgoing source at a settle path.
+ * before an older inventory revision. Each entry carries the adoption it
+ * arrived under — the plan, the live outgoing identity, the generation, and the
+ * session — so the flush decides against the adoption that actually won rather
+ * than the rendered state, which still describes the outgoing source at a
+ * settle path.
  */
 interface DeferredPushBase {
   /** Local, monotonically increasing arrival order. */
   seq: number;
+  /**
+   * Whether the wire shape named any source at all. An identity-less push
+   * cannot be tied to an adoption, so it may not cross a session change the
+   * way an identity-carrying one is allowed to.
+   */
+  hasIdentity: boolean;
+  identity: SourceIdentity;
+  /** The plan in force at arrival, or null before any plan. */
+  plan: PlanV3 | null;
+  /** The live source identity in force at arrival (rotations included). */
+  outgoing: SourceIdentity;
   /** The adoption generation (`loadSequence`) that owned the session. */
   generation: number;
   /** The session id at arrival. */
   sessionId: string | null;
-  /**
-   * The effective identity of the plan in force at arrival. A deferred push is
-   * captured while its own plan is being replaced, so this describes the
-   * outgoing source; it disambiguates a stale push that names outgoing
-   * candidates the settled plan cannot (two virtual candidates share a file).
-   */
-  plan: { fileId: number | null; uri: string | null };
-  identity: { fileId: number | null; uri: string | null };
 }
 
 type DeferredPush =
@@ -191,7 +201,7 @@ type DeferredPush =
 type DeferredPushInput =
   | {
       kind: "source";
-      identity: DeferredPushBase["identity"];
+      identity: SourceIdentity;
       source: {
         effectiveMediaFileId?: number | null;
         effectiveVirtualUri?: string | null;
@@ -201,49 +211,109 @@ type DeferredPushInput =
     }
   | {
       kind: "inventory";
-      identity: DeferredPushBase["identity"];
+      identity: SourceIdentity;
       payload: PlaybackInventoryUpdatedPayload;
     };
 
-/**
- * Whether a held-back push's identity is vouched for by the settled plan.
- *
- * The plan is the adoption that won; the rendered session state still names the
- * outgoing source here, so it must not be consulted. A push that names no
- * identity cannot be tied to any source and is rejected, as is a candidate the
- * plan contradicts: two virtual candidates can share one file id, so file
- * equality alone never proves ownership.
- */
-function deferredIdentityMatchesPlan(
-  identity: { fileId: number | null; uri: string | null },
-  plan: PlanV3,
-): boolean {
-  const { fileId, uri } = identity;
-  const planFileId = plan.effective_media_file_id;
-  const planUri = plan.effective_virtual_uri ?? null;
-  if (fileId == null && uri == null) return false;
-  if (fileId != null && fileId !== planFileId) return false;
-  if (uri != null && planUri != null && uri !== planUri) return false;
-  // A file-only push cannot be distinguished from another candidate that shares
-  // the file when the settled plan names a concrete candidate URI.
-  if (uri == null && planUri != null) return false;
-  return true;
+/** Whether an identity names a concrete source at all. */
+function identityNamesSource(identity: SourceIdentity): boolean {
+  return identity.uri != null || identity.fileId != null;
 }
 
 /**
- * Whether a held-back push's identity names the source the session was leaving.
+ * Whether the settled plan explicitly names the push's exact identity.
  *
- * Only meaningful when the settled plan cannot name the candidate it adopted
- * (the v2 wire omits `effective_virtual_uri`): there a push naming the outgoing
- * candidate is a stale carrier, while one naming a different candidate may be
- * the incoming source the deferral exists to carry. When the plan does name a
- * candidate, {@link deferredIdentityMatchesPlan} already distinguishes them.
+ * This is ownership evidence: when it holds, the winning plan itself vouches
+ * for the source, so the push is retained even if it also names the candidate
+ * the session was leaving — a replacement can retain the same effective
+ * candidate, and the winner's own identity takes precedence.
  */
-function deferredIdentityIsOutgoing(
-  identity: { fileId: number | null; uri: string | null },
-  outgoing: { fileId: number | null; uri: string | null },
+function identityMatchesPlan(identity: SourceIdentity, plan: PlanV3): boolean {
+  if (identity.uri != null) {
+    if (plan.effective_virtual_uri == null) return false;
+    if (identity.uri !== plan.effective_virtual_uri) return false;
+    if (identity.fileId != null && identity.fileId !== plan.effective_media_file_id) return false;
+    return true;
+  }
+  // A file-only push cannot be tied to a candidate when the plan names one.
+  return (
+    plan.effective_virtual_uri == null &&
+    identity.fileId != null &&
+    identity.fileId === plan.effective_media_file_id
+  );
+}
+
+/**
+ * Whether the settled plan is a different adoption than the one the push
+ * arrived under.
+ *
+ * A plan that was replaced is the winning adoption and its file identity is
+ * authoritative; a plan that is byte-for-byte the arrival plan is the same
+ * (possibly refused) adoption, so it knows no more about the live source than
+ * the arrival plan already did.
+ */
+function planWasReplaced(arrivalPlan: PlanV3 | null, plan: PlanV3): boolean {
+  if (arrivalPlan == null) return true;
+  return (
+    arrivalPlan.plan_id !== plan.plan_id || arrivalPlan.plan_attempt_key !== plan.plan_attempt_key
+  );
+}
+
+/**
+ * Whether an identity names the live outgoing source.
+ *
+ * A URI is the discriminator whenever both sides carry one: a different URI is
+ * a different candidate even on the same file. When either side is URI-less,
+ * the file is the only key, and a shared file is treated as the outgoing source
+ * because two candidates can share a file and the plan cannot tell them apart.
+ */
+function identityNamesSameSource(a: SourceIdentity, b: SourceIdentity): boolean {
+  if (a.uri != null || b.uri != null) return a.uri === b.uri;
+  return a.fileId != null && a.fileId === b.fileId;
+}
+
+/**
+ * Whether a held-back push may be folded under the settled plan.
+ *
+ * The plan is the adoption that won; the rendered state is not consulted. When
+ * the plan names a candidate URI it is the only candidate it vouches for, and
+ * an exact match is retained however it lines up with the outgoing source (a
+ * replacement can retain the effective candidate).
+ *
+ * When the plan is URI-less (the v2 wire omits the candidate) it cannot prove
+ * which of two same-file candidates it owns, so file equality is never proof.
+ * A `source_committed` naming a different file than the live outgoing source is
+ * the only rotation that can be adopted; against a replaced plan it must also
+ * land on the plan's own file. When the plan was refused rather than replaced,
+ * a push that still names the live source is the same source and is kept — the
+ * source never moved — while any other same-file candidate is dropped.
+ */
+function deferredIdentityIsAdmissible(
+  identity: SourceIdentity,
+  plan: PlanV3,
+  arrivalPlan: PlanV3 | null,
+  outgoing: SourceIdentity,
+  allowRotation: boolean,
 ): boolean {
-  return identity.uri != null && identity.uri === outgoing.uri;
+  if (!identityNamesSource(identity)) return false;
+  if (plan.effective_virtual_uri != null) return identityMatchesPlan(identity, plan);
+  // A URI-only push cannot be tied to the URI-less plan's file.
+  if (identity.fileId == null) return false;
+
+  if (!planWasReplaced(arrivalPlan, plan)) {
+    // The plan was refused, not replaced. The live source is still the source
+    // the plan names, so a push that names it exactly is a same-source update;
+    // a source commit may also prove the transport rotated to another file.
+    if (identityNamesSameSource(identity, outgoing)) return true;
+    return allowRotation && (outgoing.fileId == null || identity.fileId !== outgoing.fileId);
+  }
+
+  // The plan was replaced and won. A different file than the live outgoing is
+  // the only evidence that can outweigh the plan's candidate silence, and only
+  // a source commit carries it.
+  if (!allowRotation) return false;
+  if (outgoing.fileId != null && identity.fileId === outgoing.fileId) return false;
+  return identity.fileId === plan.effective_media_file_id;
 }
 
 /** A start body plus the optional force-relink flag the retry path adds. */
@@ -662,6 +732,15 @@ export function usePlaybackSession(
   const transportRevisionRef = useRef(0);
   const serverFeaturesRef = useRef<string[]>([]);
   const stateRef = useRef(state);
+  // The live effective source identity, folded through the same commits and
+  // rotations as `state` but readable synchronously inside callbacks. Deferring
+  // a push still moves where the stream actually is; later decisions (a queued
+  // replan's staleness check, the next rotation's outgoing baseline) must see
+  // that move, which the rendered state at a settle path does not.
+  const liveSourceIdentityRef = useRef<SourceIdentity>({
+    fileId: state.mediaFileId,
+    uri: state.effectiveVirtualUri,
+  });
   const activeRequestKeyRef = useRef<string | null>(null);
   const activeCapabilityRequestKeyRef = useRef<string | null>(null);
   const playbackPositionRef = useRef(initialPosition);
@@ -915,6 +994,12 @@ export function usePlaybackSession(
       planAttemptIdRef.current = randomUUID();
       planRef.current = plan;
       sessionIdRef.current = sessionId ?? null;
+      // The adopted plan is the new live source; a rotation deferred before it
+      // landed is superseded by what the plan itself names.
+      liveSourceIdentityRef.current = {
+        fileId: plan.effective_media_file_id,
+        uri: plan.effective_virtual_uri ?? null,
+      };
       // A live plan means the dead session that forced a rebuild is behind us;
       // a replacement that landed on a new id clears the one-recovery guard so
       // that session can recover once in its turn.
@@ -1043,6 +1128,7 @@ export function usePlaybackSession(
       sessionIdRef.current = null;
       planAttemptIdRef.current = randomUUID();
       deferredPushesRef.current = [];
+      liveSourceIdentityRef.current = { fileId: null, uri: null };
       setState((current) => {
         if (current.sessionId !== expectedSessionId) return current;
         return {
@@ -1178,6 +1264,7 @@ export function usePlaybackSession(
         sessionIdRef.current = null;
         planAttemptIdRef.current = randomUUID();
         deferredPushesRef.current = [];
+        liveSourceIdentityRef.current = { fileId: null, uri: null };
         setState((current) => ({
           ...current,
           plan: null,
@@ -1402,6 +1489,7 @@ export function usePlaybackSession(
     inventoryRevisionRef.current = null;
     appliedInventoryRevisionsRef.current.clear();
     deferredPushesRef.current = [];
+    liveSourceIdentityRef.current = { fileId: null, uri: null };
     // A new request re-derives Auto intent from its own props: without this,
     // the previous request's armed/disarmed state leaks into the new session.
     // Inline (not setAutoFallback: that callback is declared below this
@@ -1527,7 +1615,7 @@ export function usePlaybackSession(
               retireSessionOnRefusal,
               resolve,
               planId: plan.plan_id,
-              mediaFileId: stateRef.current.mediaFileId,
+              mediaFileId: liveSourceIdentityRef.current.fileId,
             };
           });
         }
@@ -1721,7 +1809,7 @@ export function usePlaybackSession(
           // no longer names the same bytes once the transport rebinds.
           const planStillCurrent =
             pendingReplan.planId === planRef.current?.plan_id &&
-            pendingReplan.mediaFileId === stateRef.current.mediaFileId;
+            pendingReplan.mediaFileId === liveSourceIdentityRef.current.fileId;
           const pendingIsPlanBound =
             pendingReplan.options.operation === "failure_recovery" ||
             pendingReplan.options.operation === "seek_failure_recovery" ||
@@ -2031,6 +2119,7 @@ export function usePlaybackSession(
           // identity means a stale re-delivery of an earlier revision must not
           // be treated as already folded.
           appliedInventoryRevisionsRef.current.clear();
+          liveSourceIdentityRef.current = { fileId: nextFileId, uri: nextUri };
         }
         return {
           ...current,
@@ -2064,6 +2153,7 @@ export function usePlaybackSession(
           nextFileId !== current.mediaFileId || nextUri !== current.effectiveVirtualUri;
         if (identityChanged) {
           appliedInventoryRevisionsRef.current.clear();
+          liveSourceIdentityRef.current = { fileId: nextFileId, uri: nextUri };
         }
         // Only positive probe evidence clears the marker. A declared push after
         // a verified one marks the menu provisional again rather than rendering
@@ -2098,21 +2188,23 @@ export function usePlaybackSession(
   /**
    * Captures a push that arrived while a start/switch/replan owned the session.
    *
-   * The entry records the adoption generation and the session/plan identities
-   * in force at arrival, so the flush can tell which adoption it belongs to
-   * without reading the outgoing rendered state.
+   * The entry records the adoption it belongs to — generation, session, the
+   * arrival plan, and the *live* outgoing identity — so the flush can tell
+   * which adoption it belongs to without reading the outgoing rendered state.
+   * The live identity is captured separately because a rotation or poll can
+   * move the source after the arrival plan landed, and the plan alone would
+   * then name the wrong outgoing candidate.
    */
   const captureDeferredPush = useCallback((input: DeferredPushInput) => {
-    const currentPlan = planRef.current;
+    const live = liveSourceIdentityRef.current;
     const base: DeferredPushBase = {
       seq: deferredPushSeqRef.current++,
+      hasIdentity: identityNamesSource(input.identity),
+      identity: input.identity,
+      plan: planRef.current,
+      outgoing: { fileId: live.fileId, uri: live.uri },
       generation: loadSequenceRef.current,
       sessionId: sessionIdRef.current,
-      plan: {
-        fileId: currentPlan?.effective_media_file_id ?? null,
-        uri: currentPlan?.effective_virtual_uri ?? null,
-      },
-      identity: input.identity,
     };
     deferredPushesRef.current.push(
       input.kind === "source"
@@ -2124,6 +2216,15 @@ export function usePlaybackSession(
           }
         : { ...base, kind: "inventory", payload: input.payload },
     );
+    // A deferred source commit still moves where the stream actually is. Record
+    // it so a queued plan-bound replan built against the outgoing source sees
+    // the rotation and is dropped, even though the rendered state has not moved.
+    if (input.kind === "source" && identityNamesSource(input.identity)) {
+      liveSourceIdentityRef.current = {
+        fileId: input.identity.fileId ?? live.fileId,
+        uri: input.identity.uri ?? live.uri,
+      };
+    }
   }, []);
 
   const applyCommittedSource = useCallback(
@@ -2134,11 +2235,11 @@ export function usePlaybackSession(
         inventoryStatus?: string | null;
       },
       audioTracks: PlayerAudioTrack[],
-      identity?: { fileId: number | null; uri: string | null },
+      identity?: SourceIdentity,
     ) => {
-      // A replacement start is rebuilding the session and its plan is the
+      // A start/replan/switch is rebuilding the session and its plan is the
       // authority for identity and inventory. A rotation on the outgoing
-      // transport must not mutate the menus under the pending replacement, nor
+      // transport must not mutate the menus under the pending adoption, nor
       // move the live identity the chained-switch completion compares against.
       // Defer the push instead of discarding it: for a fast pending/declared
       // start the replacement plan may not name the candidate this push does
@@ -2148,7 +2249,7 @@ export function usePlaybackSession(
       // outgoing timeline, so discard that position and let the chained switch
       // seek from the live playhead.
       const currentState = stateRef.current;
-      if (switchingRef.current || currentState.replacing) {
+      if (switchingRef.current || replanInFlightRef.current || currentState.replacing) {
         const movedSource =
           (source.effectiveMediaFileId != null &&
             source.effectiveMediaFileId !== currentState.mediaFileId) ||
@@ -2287,29 +2388,28 @@ export function usePlaybackSession(
    */
   const applyInventoryUpdate = useCallback(
     (payload: PlaybackInventoryUpdatedPayload) => {
-      const identity = {
+      const identity: SourceIdentity = {
         fileId: payload.effective_media_file_id ?? null,
         uri: payload.effective_virtual_uri ?? null,
       };
-      // Mirror applyCommittedSource's guard so a push landing mid-switch does
-      // not mutate the menus under the pending replacement.
-      if (switchingRef.current || stateRef.current.replacing) {
-        const current = stateRef.current;
-        const movedSource =
-          (payload.effective_media_file_id != null &&
-            payload.effective_media_file_id !== current.mediaFileId) ||
-          (payload.effective_virtual_uri != null &&
-            payload.effective_virtual_uri !== current.effectiveVirtualUri);
+      const current = stateRef.current;
+      const movedSource =
+        (payload.effective_media_file_id != null &&
+          payload.effective_media_file_id !== current.mediaFileId) ||
+        (payload.effective_virtual_uri != null &&
+          payload.effective_virtual_uri !== current.effectiveVirtualUri);
+      // The same adoption barrier as applyCommittedSource: a switch, an
+      // in-flight replan, or a replacement start owns the session, so hold the
+      // push and replay it against the plan that wins. Both event kinds must
+      // observe one barrier, otherwise an inventory deferred by a replan can
+      // flush before a newer source commit that folded immediately.
+      if (switchingRef.current || replanInFlightRef.current || current.replacing) {
         if (movedSource) pendingSwitchPositionRef.current = null;
         captureDeferredPush({ kind: "inventory", payload, identity });
         return;
       }
-      const current = stateRef.current;
-      // A push that names another source than the player is on is normally a
-      // stale delivery. While a replan is in flight it may instead be the
-      // replacement plan's new identity arriving ahead of the response, so
-      // defer it and let the flush decide once the plan settles; the revision
-      // gate then drops it when it was stale after all.
+      // No adoption in flight: a push that names another source than the player
+      // is on is a stale delivery and is dropped.
       if (
         (payload.effective_media_file_id != null &&
           current.mediaFileId != null &&
@@ -2318,9 +2418,6 @@ export function usePlaybackSession(
           current.effectiveVirtualUri != null &&
           payload.effective_virtual_uri !== current.effectiveVirtualUri)
       ) {
-        if (replanInFlightRef.current) {
-          captureDeferredPush({ kind: "inventory", payload, identity });
-        }
         return;
       }
       foldInventoryUpdate(payload);
@@ -2336,11 +2433,9 @@ export function usePlaybackSession(
    * a push dropped during a fast pending/declared start is folded in the moment
    * the replacement plan lands rather than being lost. The queue is replayed in
    * arrival order. The settled plan is the adoption that won: a push captured
-   * under another adoption generation, session, or already-replaced plan is
-   * dropped, and an identity the plan contradicts (including a candidate the
-   * plan cannot disambiguate from a same-file sibling) is dropped. A stale
-   * inventory revision still marks itself folded so a later re-delivery does
-   * not re-open the menus.
+   * under another adoption generation or session is dropped, and a push whose
+   * identity the plan cannot vouch for is dropped. A stale inventory revision
+   * still marks itself folded so a later re-delivery does not re-open the menus.
    */
   const flushDeferredPushes = useCallback(() => {
     // A start/replan owns the session while its adoption is in flight, and a
@@ -2359,33 +2454,58 @@ export function usePlaybackSession(
     const queue = deferredPushesRef.current.slice().sort((a, b) => a.seq - b.seq);
     if (queue.length === 0) return;
     deferredPushesRef.current = [];
+    const markRevisionFolded = (entry: DeferredPush) => {
+      // The settled plan is authoritative and its own inventory is on screen;
+      // mark a stale revision as folded so a re-delivery is a no-op. Every
+      // rejection path runs this so bookkeeping does not depend on which
+      // identity check happened to discard the entry.
+      if (entry.kind === "inventory" && entry.payload.inventory_revision != null) {
+        inventoryRevisionRef.current = entry.payload.inventory_revision;
+        appliedInventoryRevisionsRef.current.add(entry.payload.inventory_revision);
+      }
+      // A deferred source commit had moved the live baseline when it was
+      // captured. If nothing later moved it on, put it back on the winning plan
+      // so a source the flush just refused is not left recorded as live.
+      if (
+        entry.kind === "source" &&
+        identityNamesSameSource(liveSourceIdentityRef.current, entry.identity)
+      ) {
+        liveSourceIdentityRef.current = {
+          fileId: plan.effective_media_file_id,
+          uri: plan.effective_virtual_uri ?? null,
+        };
+      }
+    };
     for (const entry of queue) {
       // Only the adoption that won may be mutated. The rendered state still
       // describes the outgoing source here, so it is deliberately not consulted.
       if (entry.generation !== loadSequenceRef.current) continue;
       // A session change is normally foreign, but the replacement this entry
-      // was queued behind adopts a new session id; an entry captured with an
-      // outgoing plan was carried across exactly that adoption and is allowed
-      // through to the identity checks below.
-      const capturedDuringReplacement = entry.plan.fileId != null || entry.plan.uri != null;
+      // was queued behind adopts a new session id; an identity-carrying entry
+      // captured across exactly that adoption is allowed through to the
+      // identity checks below. An identity-less entry cannot be tied to any
+      // adoption and is dropped with the outgoing session.
       if (
         entry.sessionId != null &&
         entry.sessionId !== sessionIdRef.current &&
-        !capturedDuringReplacement
+        !(entry.plan != null && entry.hasIdentity)
       ) {
         continue;
       }
-      // The pending replacement owns its incoming identity: a push that only
-      // names the outgoing candidate is a stale carrier, even when its file id
-      // matches the settled plan (two virtual candidates share a file).
-      if (deferredIdentityIsOutgoing(entry.identity, entry.plan)) continue;
-      if (!deferredIdentityMatchesPlan(entry.identity, plan)) {
-        // The settled plan is authoritative and its own inventory is on screen;
-        // mark a stale revision as folded so a re-delivery is a no-op.
-        if (entry.kind === "inventory" && entry.payload.inventory_revision != null) {
-          inventoryRevisionRef.current = entry.payload.inventory_revision;
-          appliedInventoryRevisionsRef.current.add(entry.payload.inventory_revision);
-        }
+      // The settled plan is the only authority. Its own identity wins over the
+      // outgoing one (a replacement may retain the effective candidate); when
+      // it cannot prove which same-file candidate it owns, the outgoing
+      // identity is never folded and file equality is not proof.
+      if (
+        !deferredIdentityIsAdmissible(
+          entry.identity,
+          plan,
+          entry.plan,
+          entry.outgoing,
+          entry.kind === "source",
+        )
+      ) {
+        markRevisionFolded(entry);
         continue;
       }
       if (entry.kind === "source") {
