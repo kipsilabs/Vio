@@ -1,12 +1,13 @@
 import type { PersonalizedSorts } from "@/lib/querySortOptions";
 import { useMemo, useState } from "react";
 
-import { createEmptyQueryDefinition, type QueryDefinition } from "@/api/types";
+import { createEmptyQueryDefinition, type QueryDefinition, type QuerySort } from "@/api/types";
 import {
   queryDefinitionToGuidedState,
   guidedStateToQueryDefinition,
   type GuidedFormState,
 } from "@/components/collections/CollectionGuidedRulesEditor";
+import { isGuidedRepresentable } from "@/components/collections/guidedRepresentable";
 import { useCatalogFilters } from "@/hooks/queries/catalog";
 import type { QuerySortRelevanceScope } from "@/lib/querySortOptions";
 import {
@@ -17,7 +18,7 @@ import {
 import ActiveFilterBadges from "./ActiveFilterBadges";
 import CatalogFilterBar, { CATALOG_SOURCE_ORDER_SORT_FIELD } from "./CatalogFilterBar";
 import CatalogFilterSheet from "./CatalogFilterSheet";
-import { countActiveFilters, getActiveFilterBadges } from "./catalogFilterBadges";
+import { getActiveFilterBadges } from "./catalogFilterBadges";
 
 export interface CatalogFiltersPanelProps {
   state: CatalogSearchState;
@@ -57,6 +58,12 @@ export default function CatalogFiltersPanel({
 
   const qd = state.query_definition ?? createEmptyQueryDefinition();
   const guidedState = useMemo(() => queryDefinitionToGuidedState(qd), [qd]);
+  const guidedAvailable = useMemo(() => isGuidedRepresentable(qd), [qd]);
+  // Rules Guided can't show move the sheet to Advanced. It stays there once
+  // they're fixed, so the view doesn't jump back to Guided mid-edit.
+  if (!guidedAvailable && editorMode === "guided") {
+    setEditorMode("advanced");
+  }
   const toolbarGuidedState = usesSourceOrder
     ? { ...guidedState, sortField: CATALOG_SOURCE_ORDER_SORT_FIELD }
     : guidedState;
@@ -64,11 +71,16 @@ export default function CatalogFiltersPanel({
     libraryType === "audiobook" ||
     libraryType === "audiobooks" ||
     guidedState.mediaScope === "audiobook";
+  // Guided badges list every rule only when Guided can show them all. Otherwise
+  // they would hide rules, and clearing one would rebuild the definition
+  // without them, so the count comes from the rules and no badges show.
   const badges = useMemo(
-    () => getActiveFilterBadges(guidedState, { isAudiobookLibrary }),
-    [guidedState, isAudiobookLibrary],
+    () => (guidedAvailable ? getActiveFilterBadges(guidedState, { isAudiobookLibrary }) : []),
+    [guidedAvailable, guidedState, isAudiobookLibrary],
   );
-  const activeCount = useMemo(() => countActiveFilters(guidedState), [guidedState]);
+  const activeCount = guidedAvailable
+    ? badges.length
+    : qd.groups.reduce((count, group) => count + group.rules.length, 0);
 
   // Section surfaces are generated blocks and do not expose an overlay editor.
   if (isLocked) {
@@ -83,18 +95,32 @@ export default function CatalogFiltersPanel({
   const libraryOptions =
     libraries ?? state.query_definition.library_ids.map((id) => ({ id, name: `Library ${id}` }));
 
-  function update(patch: Partial<GuidedFormState>) {
+  // The toolbar sets only the media type and sort, so it patches those onto
+  // the definition and leaves every rule as it is.
+  function updateToolbar(patch: Partial<GuidedFormState>) {
     const next = { ...toolbarGuidedState, ...patch };
     const nextUsesSourceOrder =
       supportsSourceOrder && next.sortField === CATALOG_SOURCE_ORDER_SORT_FIELD;
-    const nextForQuery = nextUsesSourceOrder
-      ? { ...next, sortField: guidedState.sortField, sortOrder: guidedState.sortOrder }
-      : next;
-    const nextQd = guidedStateToQueryDefinition(nextForQuery, qd);
     onStateChange({
       ...state,
       uses_source_order: nextUsesSourceOrder,
-      query_definition: nextQd,
+      query_definition: {
+        ...qd,
+        media_scope: next.mediaScope === "all" ? undefined : next.mediaScope,
+        sort: nextUsesSourceOrder
+          ? qd.sort
+          : { field: next.sortField as QuerySort["field"], order: next.sortOrder },
+      },
+    });
+  }
+
+  // Badge removal and Clear All rebuild the definition through Guided. That
+  // loses nothing: badges show only when Guided can show every rule, and
+  // Clear All removes them all.
+  function updateGuided(patch: Partial<GuidedFormState>) {
+    onStateChange({
+      ...state,
+      query_definition: guidedStateToQueryDefinition({ ...guidedState, ...patch }, qd),
     });
   }
 
@@ -102,7 +128,7 @@ export default function CatalogFiltersPanel({
     <div className="space-y-3">
       <CatalogFilterBar
         state={toolbarGuidedState}
-        onUpdate={update}
+        onUpdate={updateToolbar}
         activeFilterCount={activeCount}
         onOpenFilters={() => setSheetOpen(true)}
         showMediaScopeSelector={showMediaScopeSelector}
@@ -122,7 +148,7 @@ export default function CatalogFiltersPanel({
         allowEpisodeMediaScope={!isCollectionSource}
       />
 
-      <ActiveFilterBadges badges={badges} onClear={update} />
+      <ActiveFilterBadges badges={badges} onClear={updateGuided} />
 
       {sheetOpen ? (
         <CatalogFilterSheetContainer
@@ -130,7 +156,7 @@ export default function CatalogFiltersPanel({
           open={sheetOpen}
           onOpenChange={setSheetOpen}
           guidedState={guidedState}
-          onUpdate={update}
+          onUpdate={updateGuided}
           libraries={libraryOptions}
           allowLibrarySelection={allowLibrarySelection}
           showMediaScopeSelector={showMediaScopeSelector}
@@ -139,6 +165,7 @@ export default function CatalogFiltersPanel({
           sortRelevanceScope={sortRelevanceScope}
           editorMode={editorMode}
           onEditorModeChange={setEditorMode}
+          guidedAvailable={guidedAvailable}
           queryDefinition={qd}
           onQueryDefinitionChange={(nextQd) =>
             onStateChange({ ...state, query_definition: nextQd })
@@ -164,6 +191,7 @@ export function CatalogFilterSheetContainer({
   sortRelevanceScope,
   editorMode,
   onEditorModeChange,
+  guidedAvailable,
   queryDefinition,
   onQueryDefinitionChange,
   libraryType,
@@ -181,6 +209,7 @@ export function CatalogFilterSheetContainer({
   sortRelevanceScope?: QuerySortRelevanceScope;
   editorMode: "guided" | "advanced";
   onEditorModeChange: (mode: "guided" | "advanced") => void;
+  guidedAvailable?: boolean;
   queryDefinition: QueryDefinition;
   onQueryDefinitionChange: (nextQd: QueryDefinition) => void;
   libraryType?: string;
@@ -204,6 +233,7 @@ export function CatalogFilterSheetContainer({
       sortRelevanceScope={sortRelevanceScope}
       editorMode={editorMode}
       onEditorModeChange={onEditorModeChange}
+      guidedAvailable={guidedAvailable}
       queryDefinition={queryDefinition}
       onQueryDefinitionChange={onQueryDefinitionChange}
       filters={filtersQuery.data}
