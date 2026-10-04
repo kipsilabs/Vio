@@ -198,6 +198,32 @@ from (`mdblist`, `tmdb`, `tmdb_list`); it is empty when `imports` is false. Chec
 which follows a public TMDB list. The administrator capability document
 (`getAdminCollectionCapabilities`) carries the same field for `importAdminTMDBList`.
 
+## Personal collection imports
+
+A personal collection imported with `importMDBListCollection`, `importTMDBCollection`,
+`importTMDBListCollection`, or `importTraktCollection` holds only titles its owner profile
+can access: titles in the owner's allowed libraries that pass its `max_content_rating`
+ceiling and `max_advisory_age` limit. The owner's hidden-library preference does not count;
+it changes what the owner browses, not what the owner may access. Every sync applies this,
+whether it runs on import, through `syncCollection`, or on the collection's schedule.
+
+- The item limit fills with titles the owner can access. The sync checks every matched
+  source entry before it applies the limit, so titles outside the owner's access never take
+  a slot.
+- `library_ids` keeps only titles in one of the listed libraries, and each title must still
+  be one the owner can access. Omit it to match against everything the owner can access.
+- The sync summary counts only titles the owner can access. `items_matched` and the
+  collection's `item_count` count the titles kept; an entry the owner cannot access counts
+  in `items_unmatched`, like an entry the catalog lacks, so the summary never reveals titles
+  outside the owner's access.
+- When the server cannot resolve the owner's access, the sync fails and the collection keeps
+  its existing members. The collection records `last_sync_status` `failed` and a
+  `last_sync_message` saying it was not updated, so a failed scheduled sync is visible too;
+  `syncCollection` answers with an error. An import in this state still creates the
+  collection, empty and with a failed first sync the caller can retry.
+
+Each viewer of a shared collection still sees only the titles that viewer can access.
+
 ## Library-scoped version lists
 
 `library_id` on `getCatalogItem`, `listCatalogItemVersions`, `listCatalogItemEpisodes`,
