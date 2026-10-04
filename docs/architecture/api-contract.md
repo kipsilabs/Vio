@@ -2039,9 +2039,34 @@ multipart create/update operations. Creation and provider imports mint server ID
 non-retryable. Sync is synchronous and non-retryable: the existing scheduler guard is local to
 one process and does not provide cluster-wide coalescing or a durable request identity.
 
-Collection and group edits, deletes, and ordering require `If-Match`. Clients first load the
-canonical representation: `GET /collections/{id}`, `GET /collections/groups/{id}`,
-`GET /collections/order?group_id=...`, `GET /collections/groups/order`, or
+Ownership and visibility (#1615) are one rule, applied on every read and write path and in both
+user stores. A native personal collection has exactly one owner, `creator_profile_id`. Profile
+`P` on login `U` sees a collection when it belongs to `U` and either `P` created it or `is_shared`
+is true; the decision is made at read time (`userstore.Collection.VisibleTo`), so profiles created
+later see shared collections and no per-profile rows exist. A collection the profile cannot see
+answers `404 not_found` on every operation; a visible collection the profile does not own answers
+`403 permission_denied` on every mutation, including sync. Members and `item_count` are limited to
+what the owner can access and then to what the viewer can access; personalized smart rules and
+display filters use the viewer's state. Audiobookshelf (beta) collections and playlists share the
+PostgreSQL table; only rows with `native = TRUE` are personal collections, and the column defaults
+to false so another writer can never leak into native listings. See
+[the personal collections API](../collections-api.md).
+
+`listCollections` returns the profile's own collections in its order, then other profiles' shared
+collections grouped by owner, each in its owner's order. Each profile has one flat order of its own
+collections (`sort_order` numbered per creator). `reorderCollections` accepts only a permutation of
+the acting profile's own collections; any other ID is a `422 validation_failed` at
+`body.ordered_ids`. The order validator remains account-wide, so another profile's edit can make a
+profile's order tag stale; clients recover from the 412 as for any stale tag.
+
+Personal collection groups are removed in two phases. Today `groups` is always `[]`, `group_id`
+always null, the `groups` capability false, and the six group operations and a `group_id` update
+answer `501 capability_unsupported`. The members and operations leave `/api/v2` once shipped Apple
+and Android builds tolerate their absence, before the lock. `CollectionCapabilities.login_sharing`
+tells clients the server implements this model.
+
+Collection edits, deletes, and ordering require `If-Match`. Clients first load the
+canonical representation: `GET /collections/{id}`, `GET /collections/order`, or
 `GET /collections/{id}/items/order`. Paths in this section have the `/api/v2` prefix.
 Each response supplies a strong ETag bound to the representation, account, profile, and access
 scope. Canonical collection editors omit the volatile presigned poster URL; display listings
@@ -2049,7 +2074,7 @@ continue to provide artwork. Personal collection detail responses include the vi
 `item_count`, so their ETag also binds that count. A catalog or watch-state change that changes
 the count invalidates an earlier tag at precondition evaluation, even without a collection edit.
 The stored collection revision continues to guard concurrent definition edits in the write
-transaction. Ordering writes use PUT, group and collection partial edits use
+transaction. Ordering writes use PUT, collection partial edits use
 PATCH, and a successful delete returns 204 without an ETag. Storage compares the version and advances it in the transaction that applies the write. Missing preconditions return 428; stale
 preconditions return 412 with the current authorized validator. Clients must not automatically retry or implicitly
 replace the observed validator with a wildcard. Web editors retain the observed validator and preserve drafts
@@ -2070,7 +2095,7 @@ Artwork changes use `PUT /collections/{id}/poster` with either a bounded multipa
 then changes the poster; artwork failure leaves the saved collection intact and is reported
 separately. Membership and artwork operations check creator ownership, and item additions also
 require catalog visibility. Adding an existing native member preserves its position; order changes
-use the explicit ordering operation. Shared viewers can read permitted collections but cannot mutate them.
+use the explicit ordering operation. Shared viewers can read shared collections but cannot mutate them.
 Native membership operations preserve audiobook chapter entries in the same storage table.
 
 Collection capabilities describe the acting account's selected user store:
@@ -2080,12 +2105,13 @@ Collection capabilities describe the acting account's selected user store:
 | Existing manual create/read/update/delete and membership | Supported | Supported |
 | Stable bounded manual continuation | Supported | Supported |
 | Guarded definition update/delete | Supported | Supported |
-| Groups and collection/item ordering | Supported | Pre-existing unsupported behavior |
+| Collection/item ordering | Supported | Pre-existing unsupported behavior |
+| Groups | Removed (#1615) | Removed |
 | Imported collections and sync | Supported | Pre-existing unsupported behavior |
 | Collection artwork | Supported | Pre-existing unsupported behavior |
 
-The `groups`, `imports`, `artwork`, and `item_reorder` flags let the bundled web hide unsupported
-actions. Unsupported store features answer the structured 501 `capability_unsupported` problem;
+The `imports`, `artwork`, and `item_reorder` flags let the bundled web hide unsupported
+actions; `groups` is always false. Unsupported store features answer the structured 501 `capability_unsupported` problem;
 they are not silently accepted. This migration does not add those feature families to SQLite.
 
 Apple and Android still need to adopt these v2 collection operation mappings, ID/envelope and

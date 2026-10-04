@@ -186,6 +186,12 @@ v2 collections contract. It is advertised by `admin_item_materialize` on
 `POST /api/v1/admin/collections/{id}/materialize/{item_id}`. See
 [Admin item materialization](#admin-item-materialization).
 
+`login_sharing: true` reports that a personal collection is either private to its
+creator or shared with every profile on the login, that `listCollections` includes other
+profiles' shared collections, and that only the creator changes or orders a collection. Show
+**Shared with me** and the single **Show to other profiles** switch only when it is true; see
+[the personal collections API](collections-api.md). `groups` is always false.
+
 The document's `import_sources` lists the sources a new imported collection can come
 from (`mdblist`, `tmdb`, `tmdb_list`); it is empty when `imports` is false. Check for
 `tmdb_list` before calling `importTMDBListCollection` (`POST /api/v2/collections/import/tmdb-list`),
