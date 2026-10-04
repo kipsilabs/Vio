@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -1098,6 +1099,59 @@ func (r *Relay) markUpstreamAuthRejected(token string) {
 	r.mu.Unlock()
 }
 
+// upstreamStatusFromError extracts the HTTP status embedded by proxyWithClient
+// in an upstream-failure error, or 0 when the error carried none (for example a
+// transport-level connect failure, which never reached a response).
+func upstreamStatusFromError(err error) int {
+	if err == nil {
+		return 0
+	}
+	const prefix = "remote stream returned HTTP "
+	message := err.Error()
+	if !strings.HasPrefix(message, prefix) {
+		return 0
+	}
+	status, parseErr := strconv.Atoi(message[len(prefix):])
+	if parseErr != nil {
+		return 0
+	}
+	return status
+}
+
+// relayTokenPrefix bounds a relay token to a short, non-sensitive prefix for
+// logs. The token is a random loopback handle, but only enough of it to
+// correlate a log line with a registration is needed.
+func relayTokenPrefix(token string) string {
+	const prefixLen = 8
+	if len(token) <= prefixLen {
+		return token
+	}
+	return token[:prefixLen]
+}
+
+// logProxyFailure records why the loopback relay answered 502. Neither the
+// upstream nor the source URL is safe to log in full: signed provider URLs can
+// carry credentials in their query string. This logs only the destination host,
+// the upstream status when the failure was an HTTP response (0 for transport
+// failures), and a short relay-token prefix.
+func (r *Relay) logProxyFailure(token string, target *url.URL, entry *relayEntry, proxyErr error) {
+	host := ""
+	if target != nil {
+		host = target.Host
+	}
+	sourceHost := ""
+	if entry != nil && entry.source != nil {
+		sourceHost = entry.source.Host
+	}
+	slog.Warn("remote stream relay upstream failure",
+		"relay_token", relayTokenPrefix(token),
+		"host", host,
+		"source_host", sourceHost,
+		"upstream_status", upstreamStatusFromError(proxyErr),
+		"error", proxyErr,
+	)
+}
+
 func (r *Relay) handle(w http.ResponseWriter, request *http.Request) {
 	if request.Method != http.MethodGet && request.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
@@ -1155,6 +1209,7 @@ func (r *Relay) handle(w http.ResponseWriter, request *http.Request) {
 	}
 	if proxyErr != nil {
 		if !tracked.wroteHeader {
+			r.logProxyFailure(token, target, entry, proxyErr)
 			http.Error(w, "remote stream unavailable", http.StatusBadGateway)
 			return
 		}

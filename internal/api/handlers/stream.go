@@ -2005,7 +2005,23 @@ func (h *StreamHandler) SubtitleFonts(ctx context.Context, in SubtitleFontReques
 	if !playback.IsASS(file.SubtitleTracks[embeddedIndex].Codec) {
 		return nil, apiError(http.StatusBadRequest, "bad_request", "Subtitle font bundles are only available for ASS/SSA tracks")
 	}
-	fonts, err := playback.ExtractAttachedSubtitleFonts(ctx, file.FilePath, h.ffmpegPath())
+	// A virtual file's stored path is a virtual:// URI that ffprobe cannot
+	// read; resolve the provider input for this request, mirroring the v1
+	// uncached path, and release the relay registration when we return.
+	inputPath := file.FilePath
+	releaseInput := func() {}
+	if isVirtualPlaybackFile(file) && session.VirtualSourceURI != "" && hasVirtualMediaResolver(h) {
+		var resolved ResolvedVirtualMedia
+		resolved, releaseInput, err = h.resolveVirtualInputURI(ctx, file, session.UserID, session.ProfileID, false)
+		if err != nil {
+			logVirtualStreamFailure(ctx, session.ID, file, err)
+			return nil, apiError(http.StatusBadGateway, subtitleSourceUnavailableErrorCode, "Failed to resolve virtual source for the subtitle font bundle")
+		}
+		inputPath = resolved.URL
+	}
+	defer releaseInput()
+
+	fonts, err := playback.ExtractAttachedSubtitleFonts(ctx, inputPath, h.ffmpegPath())
 	if err != nil {
 		h.fontExtractFailures.failed(ctx, fontExtractFailureKey(file.ID, trackIndex),
 			"file_id", file.ID, "track", trackIndex, "error", err)
