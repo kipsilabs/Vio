@@ -767,6 +767,47 @@ describe("useASSSubtitles windowed ASS extraction", () => {
     expect(instances[1]!.destroy).not.toHaveBeenCalled();
   });
 
+  it("measures timeupdate against the refreshed window and only prefetches at its end", async () => {
+    const state = vi.fn();
+    const videoRef = makeVideoRef(1);
+
+    renderHook(() => useASSSubtitles(videoRef, [germanTrack], 6, false, 0, 0, state));
+    await waitFor(() => expect(constructorOpts).toHaveLength(1));
+    expect(String(vi.mocked(fetch).mock.calls[0]![0])).toContain("position=0&duration=600");
+
+    // Cross into the 60s prefetch lead of window [0, 600].
+    videoRef.current!.currentTime = 590;
+    videoRef.current!.dispatchEvent(new Event("timeupdate"));
+
+    await waitFor(() => expect(constructorOpts).toHaveLength(2));
+    expect(String(vi.mocked(fetch).mock.calls[1]![0])).toContain("position=570&duration=600");
+    // windowStart/windowEnd are committed only after the renderer is ready, and
+    // the refresh moved the load state through "loading". Wait for it to flip
+    // back to "ready" so the checks below measure against [570, 1170], not the
+    // outgoing [0, 600].
+    await waitFor(() => expect(state).toHaveBeenLastCalledWith("ready"));
+
+    // Playback inside the refreshed window must not schedule another fetch.
+    for (const t of [600, 650, 700]) {
+      videoRef.current!.currentTime = t;
+      videoRef.current!.dispatchEvent(new Event("timeupdate"));
+    }
+    await act(async () => {});
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(constructorOpts).toHaveLength(2);
+    expect(instances).toHaveLength(2);
+
+    // Entering the 60s prefetch lead of [570, 1170] fetches exactly one next
+    // window and swaps in exactly one renderer.
+    videoRef.current!.currentTime = 1120;
+    videoRef.current!.dispatchEvent(new Event("timeupdate"));
+
+    await waitFor(() => expect(constructorOpts).toHaveLength(3));
+    expect(fetch).toHaveBeenCalledTimes(3);
+    expect(String(vi.mocked(fetch).mock.calls[2]![0])).toContain("position=1100&duration=600");
+    expect(instances).toHaveLength(3);
+  });
+
   it("falls back to the whole-track URL after bounded windowed retries", async () => {
     vi.useFakeTimers();
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -1049,6 +1090,17 @@ describe("useASSSubtitles bounded retry/watchdog policy", () => {
       expect(String(vi.mocked(fetch).mock.calls[2]![0])).toContain("position=2980&duration=600");
       expect(constructorOpts).toHaveLength(2);
       expect(state).toHaveBeenLastCalledWith("ready");
+      // Continued playback inside the replacement window [2980, 3580] must not
+      // kick off another fetch.
+      await act(async () => {
+        videoRef.current!.currentTime = 3010;
+        videoRef.current!.dispatchEvent(new Event("timeupdate"));
+        videoRef.current!.currentTime = 3050;
+        videoRef.current!.dispatchEvent(new Event("timeupdate"));
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(calls).toBe(3);
+      expect(constructorOpts).toHaveLength(2);
     } finally {
       unmount();
       error.mockRestore();

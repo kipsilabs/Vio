@@ -299,13 +299,13 @@ export function useASSSubtitles(
     // Infinity once the whole-track fallback is in use, so boundary refresh
     // never schedules.
     let usingWholeTrack = false;
-    const windowStart = Math.max(
+    let windowStart = Math.max(
       0,
       (video.readyState > 0 ? video.currentTime : 0) +
         sourceOriginRef.current -
         ASS_WINDOW_LEAD_SECONDS,
     );
-    const windowEnd = windowStart + ASS_WINDOW_DURATION_SECONDS;
+    let windowEnd = windowStart + ASS_WINDOW_DURATION_SECONDS;
     // Consecutive windowed failures since the last successful window, shared by
     // the initial load and boundary refreshes so the 3→1→terminal budget is one
     // finite policy. `terminal` latches after the whole-track fallback fails:
@@ -582,8 +582,12 @@ export function useASSSubtitles(
         () => jassubRef.current === instance,
       );
       if (!cancelled && !signal.aborted && jassubRef.current === instance) {
-        // A successful load clears the failure budgets so a later unrelated
-        // error starts fresh.
+        // Advance to the window this instance renders so the next
+        // timeupdate check measures against the loaded track, then clear
+        // the failure budgets so a later unrelated error starts fresh.
+        usingWholeTrack = wholeTrack;
+        windowStart = start;
+        windowEnd = wholeTrack ? Infinity : start + ASS_WINDOW_DURATION_SECONDS;
         windowFailures = 0;
         textFailures = 0;
         retryableTextFailures = 0;
