@@ -2,11 +2,13 @@ package handlers
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
+	"github.com/Silo-Server/silo-server/internal/remotestream"
 )
 
 // TestVirtualEvidenceMatchesBoundFileRequiresRowID pins the row-id half of the
@@ -372,13 +374,13 @@ func TestProbeRotatedVirtualCandidateRefreshesReplacement(t *testing.T) {
 }
 
 // TestProbeRotatedVirtualCandidateRaceDoesNotPersistStaleEvidence is the
-// deterministic rotation race. A gated stage of rotation A's refresh (its
-// provider resolution, or its probe) is parked while the binding is still
-// cand-a; rotation B moves the binding to cand-b; the gate is then released.
-// The superseded work must not persist evidence for the candidate B replaced,
-// and its stale evidence must not authorize serving. Each block stage is
-// covered, because resolution and probing are separate calls that can each
-// outlive a rotation.
+// deterministic rotation race. A gated stage of rotation A's refresh is parked
+// while the binding is still cand-a; rotation B moves the binding to cand-b (a
+// different effective row); the gate is then released. The superseded work must
+// not persist evidence for the candidate B replaced, and its stale evidence must
+// not authorize serving. Each window is covered: the pre-schedule (session,
+// generation) re-read, the effective-row match, the resolve, and the probe, all
+// of which can outlive a rotation.
 func TestProbeRotatedVirtualCandidateRaceDoesNotPersistStaleEvidence(t *testing.T) {
 	const (
 		neutral = "virtual://movie/tt-rot-race"
@@ -387,7 +389,7 @@ func TestProbeRotatedVirtualCandidateRaceDoesNotPersistStaleEvidence(t *testing.
 		uriOld  = neutral + "-old?result=cand-old"
 	)
 
-	for _, blockStage := range []string{"resolve", "probe"} {
+	for _, blockStage := range []string{"schedule", "effective-row", "resolve", "probe"} {
 		t.Run(blockStage, func(t *testing.T) {
 			mgr := playback.NewSessionManager(0, 0)
 			session, err := mgr.StartSession(1, "profile-1", 42, playback.PlayDirect, false)
@@ -407,7 +409,7 @@ func TestProbeRotatedVirtualCandidateRaceDoesNotPersistStaleEvidence(t *testing.
 				t.Fatalf("UpdateStreamState: %v", err)
 			}
 
-			// Rotation A: the binding moves to cand-a.
+			// Rotation A: the binding moves to cand-a on row 42.
 			if err := mgr.SetVirtualSource(session.ID, uriA, 5); err != nil {
 				t.Fatalf("SetVirtualSource A: %v", err)
 			}
@@ -415,87 +417,139 @@ func TestProbeRotatedVirtualCandidateRaceDoesNotPersistStaleEvidence(t *testing.
 			if err != nil {
 				t.Fatalf("GetSession A: %v", err)
 			}
+			generationA, ok := h.inventorySourceGeneration(session.ID)
+			if !ok {
+				t.Fatal("session manager did not expose a binding generation")
+			}
 			fileA := &models.MediaFile{ID: 42, ContentID: "movie-rot-race", FilePath: uriA, Container: "virtual", VirtualOwnerInstallationID: 5}
+			fileB := &models.MediaFile{ID: 43, ContentID: "movie-rot-race", FilePath: uriB, Container: "virtual", VirtualOwnerInstallationID: 5}
 
 			entered := make(chan struct{})
 			release := make(chan struct{})
+			var enteredOnce sync.Once
+			signalEntered := func() { enteredOnce.Do(func() { close(entered) }) }
 			var proberCalls int
 			var persistedPaths []string
+			var saveMu sync.Mutex
 
-			h := NewPlaybackHandler(mgr, testPlaybackFileResolver{file: fileA})
+			h := NewPlaybackHandler(mgr, mapPlaybackFileResolver{files: map[int]*models.MediaFile{42: fileA, 43: fileB}})
 			h.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(_ context.Context, uri string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
 				if blockStage == "resolve" && uri == uriA {
-					// Park rotation A's resolution until rotation B has moved
-					// the binding.
-					close(entered)
+					signalEntered()
 					<-release
 				}
 				return ResolvedVirtualMedia{URL: "http://127.0.0.1:9/" + virtualResultCandidateID(uri), URI: uri, CandidateID: virtualResultCandidateID(uri)}, nil
 			})
+			h.AllowPrivateStreams = func(int) bool { return true }
+			relay := remotestream.NewRelay()
+			defer func() { _ = relay.Close(context.Background()) }()
+			h.RemoteStreamRelay = relay
 			h.VirtualPlaybackSourceProber = func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
 				proberCalls++
 				if blockStage == "probe" {
-					// Park rotation A's probe until rotation B has moved the
-					// binding.
-					close(entered)
+					signalEntered()
 					<-release
 				}
 				f.AudioTracks = []models.AudioTrack{{Codec: "eac3", Channels: 6, Language: "eng"}}
 				return f, nil
 			}
 			h.VirtualFileSaver = func(_ context.Context, args models.VirtualFilePersistArgs) (int64, error) {
+				saveMu.Lock()
 				persistedPaths = append(persistedPaths, args.ExpectedFilePath)
+				saveMu.Unlock()
 				return 1, nil
 			}
 
-			generationA, ok := h.inventorySourceGeneration(session.ID)
-			if !ok {
-				t.Fatal("session manager did not expose a binding generation")
+			// rotateB moves the binding to cand-b on a different effective row.
+			// It reads the generation from the raw manager, never through the
+			// (possibly gated) handler, so it cannot block on the stage gate.
+			rotateB := func() {
+				if err := mgr.SetVirtualSource(session.ID, uriB, 5); err != nil {
+					t.Fatalf("SetVirtualSource B: %v", err)
+				}
+				if err := mgr.SetEffectiveMediaFileID(session.ID, fileB.ID); err != nil {
+					t.Fatalf("SetEffectiveMediaFileID B: %v", err)
+				}
+				generationB, genErr := mgr.VirtualSourceGeneration(session.ID)
+				if genErr != nil {
+					t.Fatalf("VirtualSourceGeneration B: %v", genErr)
+				}
+				if generationB == generationA {
+					t.Fatal("rotation B did not advance the binding generation")
+				}
 			}
 
 			doneA := make(chan struct{})
-			go func() {
-				defer close(doneA)
-				h.probeRotatedVirtualCandidate(context.Background(), sessionA, fileA, generationA)
-			}()
+			if blockStage == "effective-row" {
+				// No blocking needed: the caller holds a torn pair (the live
+				// session is B while the carried file is A's row) and the
+				// current generation, so the effective-row guard is what drops
+				// it. Rotation B lands before the call.
+				rotateB()
+				currentGen, _ := h.inventorySourceGeneration(session.ID)
+				if h.probeRotatedVirtualCandidate(context.Background(), sessionA, fileA, currentGen) {
+					t.Fatal("a torn (session,file) pair was probed")
+				}
+			} else {
+				if blockStage == "schedule" {
+					// Drive the real scheduler and park the window between its
+					// session read and its separate generation read (the
+					// manager does not expose the paired read), so rotation B
+					// lands in the torn-pair gap the reviewer named.
+					h.sessionMgr = gatedSplitSessionManager{
+						SessionManagerInterface: mgr,
+						gate: func() {
+							signalEntered()
+							<-release
+						},
+					}
+					go func() {
+						defer close(doneA)
+						h.PublishSourceCommitted(context.Background(), session.ID)
+					}()
+				} else {
+					go func() {
+						defer close(doneA)
+						h.probeRotatedVirtualCandidate(context.Background(), sessionA, fileA, generationA)
+					}()
+				}
 
-			// Wait until A is parked in the chosen stage.
-			select {
-			case <-entered:
-			case <-time.After(5 * time.Second):
-				t.Fatalf("rotation A never entered the %s stage", blockStage)
+				// Wait until A is parked in the chosen stage.
+				select {
+				case <-entered:
+				case <-time.After(5 * time.Second):
+					t.Fatalf("rotation A never entered the %s stage", blockStage)
+				}
+
+				// Rotation B lands while A is still blocked.
+				rotateB()
+
+				close(release)
+				select {
+				case <-doneA:
+				case <-time.After(5 * time.Second):
+					t.Fatalf("rotation A did not finish after release (%s stage)", blockStage)
+				}
 			}
 
-			// Rotation B lands while A is still blocked.
-			if err := mgr.SetVirtualSource(session.ID, uriB, 5); err != nil {
-				t.Fatalf("SetVirtualSource B: %v", err)
-			}
-			generationB, _ := h.inventorySourceGeneration(session.ID)
-			if generationB == generationA {
-				t.Fatal("rotation B did not advance the binding generation")
-			}
-
-			// Release A and let it finish.
-			close(release)
-			select {
-			case <-doneA:
-			case <-time.After(5 * time.Second):
-				t.Fatalf("rotation A did not finish after release (%s stage)", blockStage)
-			}
-
-			// The fence after the blocking stage must have dropped A's work
-			// before any catalog write. StopVirtualEvidence drains anything that
-			// did get admitted, so the empty result is deterministic rather than
-			// a timing race.
+			// The fence must have dropped A's work before any catalog write.
+			// StopVirtualEvidence drains anything that did get admitted, so the
+			// empty result is deterministic rather than a timing race.
 			h.StopVirtualEvidence()
-			if len(persistedPaths) != 0 {
-				t.Fatalf("%s stage: superseded rotation persisted evidence for %v, want none", blockStage, persistedPaths)
+			saveMu.Lock()
+			gotPaths := append([]string(nil), persistedPaths...)
+			saveMu.Unlock()
+			if len(gotPaths) != 0 {
+				t.Fatalf("%s stage: superseded rotation persisted evidence for %v, want none", blockStage, gotPaths)
 			}
-			if blockStage == "resolve" && proberCalls != 0 {
-				t.Fatalf("resolve stage spent %d probes on a superseded candidate, want 0", proberCalls)
+			wantProbes := 0
+			if blockStage == "probe" {
+				// The probe runs and only then hits the post-probe fence; the
+				// point is that it never persists.
+				wantProbes = 1
 			}
-			if blockStage == "probe" && proberCalls != 1 {
-				t.Fatalf("probe stage prober calls = %d, want 1 (the probe runs, then is fenced)", proberCalls)
+			if proberCalls != wantProbes {
+				t.Fatalf("%s stage spent %d probes, want %d", blockStage, proberCalls, wantProbes)
 			}
 
 			// A's stale release must not authorize serving: the session's bound
@@ -508,9 +562,26 @@ func TestProbeRotatedVirtualCandidateRaceDoesNotPersistStaleEvidence(t *testing.
 			if live.VirtualSourceURI != uriB {
 				t.Fatalf("binding = %q, want the newer rotation %q", live.VirtualSourceURI, uriB)
 			}
-			if virtualEvidenceMatchesBoundFile(&models.MediaFile{ID: 42, FilePath: uriB, Container: "virtual"}, live) {
+			if virtualEvidenceMatchesBoundFile(&models.MediaFile{ID: fileB.ID, FilePath: uriB, Container: "virtual"}, live) {
 				t.Fatal("stale evidence still matched the newer binding: a superseded rotation authorized stale tracks")
 			}
 		})
 	}
+}
+
+// gatedSplitSessionManager exposes VirtualSourceGeneration but parks it on gate,
+// so a test can land a rotation in the window between the caller's session read
+// and the separate generation read (a manager without the paired read).
+type gatedSplitSessionManager struct {
+	SessionManagerInterface
+	gate func()
+}
+
+func (m gatedSplitSessionManager) VirtualSourceGeneration(sessionID string) (uint64, error) {
+	if m.gate != nil {
+		m.gate()
+	}
+	return m.SessionManagerInterface.(interface {
+		VirtualSourceGeneration(string) (uint64, error)
+	}).VirtualSourceGeneration(sessionID)
 }

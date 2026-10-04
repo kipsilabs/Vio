@@ -960,8 +960,22 @@ func (h *PlaybackHandler) PublishSourceCommitted(ctx context.Context, sessionID 
 	if h == nil || sessionID == "" {
 		return
 	}
-	session, err := h.sessionMgr.GetSession(sessionID)
-	if err != nil || session == nil {
+	// Read the session and its candidate-binding generation from one lock, so
+	// the pair the rotation probe is scheduled against cannot be torn by a
+	// rotation that lands between a session read and a separate generation read.
+	// A manager without the pairing capability falls back to a plain session read
+	// plus a separate generation read (best-effort); the probe's effective-row
+	// reload closes that gap before any write.
+	session, generation, paired := h.sessionWithSourceGeneration(sessionID)
+	if !paired {
+		loaded, loadErr := h.sessionMgr.GetSession(sessionID)
+		if loadErr != nil || loaded == nil {
+			return
+		}
+		session = loaded
+		generation, _ = h.inventorySourceGeneration(sessionID)
+	}
+	if session == nil {
 		return
 	}
 	// A committed binding move is a rotation: re-probe the replacement so its
@@ -972,10 +986,15 @@ func (h *PlaybackHandler) PublishSourceCommitted(ctx context.Context, sessionID 
 	// (revision cleared, evidence anchored at the previous candidate) triggers
 	// it, so the ordinary start commit — which just set the revision — does not
 	// double-probe a row the start path already probed.
+	//
+	// The file is loaded from the paired session's effective row after the
+	// capture; a rotation that lands in between is caught by the generation the
+	// refresh carries (and again by the probe's live-row reload), so a file that
+	// no longer names the live effective row is never probed or persisted.
 	if h.fileResolver != nil && session.VirtualSourceURI != "" {
 		if file, loadErr := h.fileResolver.GetByID(ctx, session.MediaFileID); loadErr == nil && file != nil &&
 			virtualCandidateRotationRecordedV3(session, file) {
-			h.refreshRotatedVirtualCandidateBackground(ctx, session, file)
+			h.refreshRotatedVirtualCandidateBackground(ctx, session, generation, file)
 		}
 	}
 	if h.RealtimeHub == nil {
@@ -1032,12 +1051,43 @@ type mediaFileSessionLookup interface {
 // (evidence mismatch rejects the stale inventory) and the version list shows
 // declared metadata. This closes that window.
 //
+// session and generation are the pair PublishSourceCommitted captured (from one
+// lock when the manager exposes sessionWithSourceGeneration, otherwise from a
+// session read plus a separate generation read); file is the effective-row load
+// for that session. Before the detached goroutine is launched the pairing is
+// re-read and the scheduling is dropped unless the binding generation still
+// matches and file still names the live effective row, so a rotation that landed
+// while the file was loading does not start a probe against a stale row.
+//
 // It is best-effort and bounded by the detached-work gate. A handler without a
 // resolver or prober is a no-op; a resolve or probe failure leaves the gate
 // closed exactly as before, so this can never authorize serving stale tracks.
-func (h *PlaybackHandler) refreshRotatedVirtualCandidateBackground(ctx context.Context, session *playback.Session, file *models.MediaFile) {
+func (h *PlaybackHandler) refreshRotatedVirtualCandidateBackground(ctx context.Context, session *playback.Session, generation uint64, file *models.MediaFile) {
 	if h == nil || session == nil || file == nil || !isVirtualPlaybackFile(file) || session.VirtualSourceURI == "" {
 		return
+	}
+	// Re-read the (session, generation) pair and refuse to schedule if the
+	// binding moved since the caller captured it, or if the caller's file no
+	// longer names the live effective row. This is the gap between the caller's
+	// file load and the goroutine launch. A manager without the paired reader
+	// falls back to a plain session read plus a separate generation read; a
+	// manager without any generation capability keeps generation 0 and relies on
+	// the effective-row comparison alone (best-effort, as before).
+	liveSession, liveGen, haveLive := h.sessionWithSourceGeneration(session.ID)
+	if !haveLive {
+		if loaded, loadErr := h.sessionMgr.GetSession(session.ID); loadErr == nil && loaded != nil {
+			liveSession = loaded
+			liveGen, _ = h.inventorySourceGeneration(session.ID)
+			haveLive = true
+		}
+	}
+	if haveLive {
+		if liveGen != generation || liveSession.MediaFileID != file.ID {
+			slog.InfoContext(ctx, "rotated virtual candidate probe dropped: binding moved before scheduling",
+				"component", "api", "session", session.ID,
+				"file_id", file.ID, "live_file_id", liveSession.MediaFileID)
+			return
+		}
 	}
 	if h.VirtualMediaDetailedResolver == nil && h.VirtualMediaResolver == nil {
 		return
@@ -1054,11 +1104,6 @@ func (h *PlaybackHandler) refreshRotatedVirtualCandidateBackground(ctx context.C
 			"component", "api", "session", session.ID, "file_id", file.ID, "virtual_uri", session.VirtualSourceURI)
 		return
 	}
-	// Snapshot the binding generation so a rotation that lands while the probe
-	// is resolving is not re-probed against a superseded candidate and its
-	// evidence is never applied to the wrong row. A manager without the reader
-	// keeps generation 0, which disables the fence (best-effort, as elsewhere).
-	generation, _ := h.inventorySourceGeneration(session.ID)
 	go func() {
 		defer gate.release()
 		bgCtx, cancel := h.virtualDetachedContext(ctx, virtualBackgroundProbeBudget)
@@ -1096,7 +1141,26 @@ func (h *PlaybackHandler) probeRotatedVirtualCandidate(ctx context.Context, sess
 	if !generationFence() {
 		return false
 	}
-	if !isVirtualPlaybackFile(file) {
+	// The caller's file was loaded from the scheduling session's effective row.
+	// If the live effective row has since moved (a rotation landed between the
+	// caller's capture and this read), the carried file names a superseded row:
+	// drop rather than probe or persist the wrong row. Re-derive the file from
+	// the live effective row so the transient clone, neutral key, and persist
+	// call all reference the row the session actually serves; fail closed if it
+	// cannot be loaded or does not match.
+	liveFile := file
+	if h.fileResolver != nil && live.MediaFileID > 0 {
+		if loaded, loadErr := h.fileResolver.GetByID(ctx, live.MediaFileID); loadErr == nil && loaded != nil {
+			liveFile = loaded
+		}
+	}
+	if liveFile == nil || liveFile.ID <= 0 || liveFile.ID != live.MediaFileID || liveFile.ID != file.ID {
+		slog.InfoContext(ctx, "rotated virtual candidate probe dropped: effective row moved",
+			"component", "api", "session", live.ID,
+			"file_id", file.ID, "live_file_id", live.MediaFileID)
+		return false
+	}
+	if !isVirtualPlaybackFile(liveFile) {
 		return false
 	}
 	resolved, cleanup, resolveErr := h.resolveVirtualInputURI(
@@ -1126,15 +1190,15 @@ func (h *PlaybackHandler) probeRotatedVirtualCandidate(ctx context.Context, sess
 		AudioLanguages: resolved.AudioLanguages,
 		RequestHeaders: resolved.RequestHeaders,
 	}
-	probeTransient := cloneVirtualProbeTransient(*file)
+	probeTransient := cloneVirtualProbeTransient(*liveFile)
 	if resolved.URI != "" {
 		probeTransient.FilePath = resolved.URI
 	}
 	h.probeVirtualSourceAndPersist(
 		ctx,
-		bestResultCacheKey(file.ContentID, virtualPlaybackNeutralKey(live.VirtualSourceURI), live.VirtualSourceOwnerInstallationID),
-		file, resolved.URL, probeTransient, probeCand,
-		h.virtualExpectedRuntimeMinutes(ctx, file), live.VirtualSourceOwnerInstallationID,
+		bestResultCacheKey(liveFile.ContentID, virtualPlaybackNeutralKey(live.VirtualSourceURI), live.VirtualSourceOwnerInstallationID),
+		liveFile, resolved.URL, probeTransient, probeCand,
+		h.virtualExpectedRuntimeMinutes(ctx, liveFile), live.VirtualSourceOwnerInstallationID,
 		generationFence,
 	)
 	return true
