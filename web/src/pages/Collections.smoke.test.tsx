@@ -153,8 +153,8 @@ describe("Your collections", () => {
     // "moved over", so assistive technology hears these three.
     // Known gap, pinned on purpose: Collections.tsx sets no `announcements`,
     // so dnd-kit's defaults read collection ids (c1, c3) instead of names.
-    // The Your collections redesign (CB19) should announce names and change
-    // this expectation deliberately.
+    // A change that announces names should update this expectation on
+    // purpose.
     expect(announcements).toEqual([
       "Draggable item c1 was moved over droppable area c1.",
       "Draggable item c1 was moved over droppable area c3.",

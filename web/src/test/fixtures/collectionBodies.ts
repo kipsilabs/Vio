@@ -71,7 +71,7 @@ export const goldens = {
       },
     },
   ] satisfies Writes,
-  /** Admin manual update. Today the editor PATCH carries `featured` (CB06 drops it). */
+  /** Admin manual update. Today the editor PATCH carries `featured`. */
   adminManualUpdate: [
     {
       operation: "PATCH /api/v2/admin/collections/{id}",
@@ -434,7 +434,7 @@ export const goldens = {
       },
     },
   ] satisfies Writes,
-  /** Personal poster removal is sent the moment it is clicked, before Save (CB04 stages it). */
+  /** Personal poster removal is sent the moment it is clicked, before Save. */
   personalPosterRemoval: [
     {
       operation: "DELETE /api/v2/collections/{id}/image",
@@ -445,7 +445,7 @@ export const goldens = {
       },
     },
   ] satisfies Writes,
-  /** Personal manual page: adding a title moves the collection's ETag, and the rename's PATCH still sends the one the page loaded with, so the server answers 412 (CB06 fixes it). */
+  /** Personal manual page: adding a title moves the collection's ETag, and the rename's PATCH still sends the one the page loaded with, so the server answers 412. */
   personalAddThenRename: [
     {
       operation: "PUT /api/v2/collections/{id}/items/{item_id}",
@@ -821,7 +821,7 @@ export const goldens = {
       },
     },
   ] satisfies Writes,
-  /** Add to collection as an acting admin, server manual collection: the admin item route (CB30 removes this group). */
+  /** Add to collection as an acting admin, server manual collection: the admin item route. */
   addToServerCollection: [
     {
       operation: "PUT /api/v2/admin/collections/{id}/items/{item_id}",
