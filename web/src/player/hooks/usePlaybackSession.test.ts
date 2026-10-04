@@ -5320,12 +5320,14 @@ describe("usePlaybackSession deferred push authority", () => {
     unmount();
   });
 
-  it("drops a same-file inventory after the live source already rotated", async () => {
+  it("drops a same-file sibling inventory after the live source already rotated", async () => {
     // The plan owns file 8 without naming a candidate (v2 wire). A poll moves
     // the live source to candidate A. During a replacement that also settles on
-    // file 8 without a candidate, an A inventory is queued. The outgoing live
-    // URI is A even though the plan's captured URI is null, so file equality
-    // must not admit A.
+    // file 8 without a candidate, a C inventory is queued. C is a same-file
+    // sibling of the live outgoing A: the URI-less plan cannot vouch for it and
+    // the concrete live URI contradicts it, so it is a genuine collision and is
+    // dropped. (A same-file push that agrees with the live source is admitted;
+    // see the URI-less acceptance regression below.)
     const startBodies: Array<{ file_id: number }> = [];
     let releaseSwitch: ((response: Response) => void) | undefined;
     const switchResponse = new Promise<Response>((resolve) => {
@@ -5370,14 +5372,16 @@ describe("usePlaybackSession deferred push authority", () => {
     act(() => result.current.switchVersion(9, 0));
     await waitFor(() => expect(startBodies).toHaveLength(2));
 
-    // The outgoing live candidate A is deferred behind the pending replacement.
+    // Candidate C on the same file is deferred behind the pending replacement.
+    // It contradicts the live outgoing A, so the URI-less winner cannot vouch
+    // for it and it must not be folded.
     act(() =>
       result.current.applyInventoryUpdate({
         session_id: "session-1",
-        inventory_revision: "inv:live-a",
+        inventory_revision: "inv:sibling-c",
         inventory_status: "verified",
         effective_media_file_id: 8,
-        effective_virtual_uri: "virtual://movie/x?result=A",
+        effective_virtual_uri: "virtual://movie/x?result=C",
         audio_tracks: outgoingAudio,
       }),
     );
@@ -5405,10 +5409,99 @@ describe("usePlaybackSession deferred push authority", () => {
     });
 
     await waitFor(() => expect(result.current.sessionId).toBe("session-2"));
-    // The outgoing A revision is not corroborated by the URI-less winner and is
-    // dropped; the plan's own (empty, candidate-less) identity is what stands.
+    // Candidate C is a same-file sibling of the live outgoing A, so the
+    // URI-less winner cannot vouch for it and it is dropped; the plan's own
+    // (empty, candidate-less) identity is what stands.
     expect(result.current.effectiveVirtualUri).toBeNull();
     expect(result.current.planAudioTracks).toEqual([]);
+    unmount();
+  });
+
+  it("admits a same-file inventory push against a URI-less settled plan", async () => {
+    // The v2 start wire omits the candidate URI, so the settled replacement plan
+    // names only file 8. The verified inventory push names that same file with
+    // the candidate the plan leaves out; it is the only carrier of the live
+    // identity and must be folded rather than refused for the plan's silence.
+    const startBodies: Array<{ file_id: number }> = [];
+    let releaseSwitch: ((response: Response) => void) | undefined;
+    const switchResponse = new Promise<Response>((resolve) => {
+      releaseSwitch = resolve;
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        const body = JSON.parse(String(init?.body)) as { file_id: number };
+        startBodies.push(body);
+        if (startBodies.length === 2) return switchResponse;
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3({
+              effective_media_file_id: 7,
+              effective_virtual_uri: "virtual://movie/x?result=A",
+              audio_tracks: outgoingAudio,
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    act(() => result.current.switchVersion(8, 0));
+    await waitFor(() => expect(startBodies).toHaveLength(2));
+
+    // A verified inventory for candidate B on the replacement's file 8 is
+    // deferred behind the pending switch.
+    act(() =>
+      result.current.applyInventoryUpdate({
+        session_id: "session-1",
+        inventory_revision: "inv:uri-less",
+        inventory_status: "verified",
+        effective_media_file_id: 8,
+        effective_virtual_uri: "virtual://movie/x?result=B",
+        audio_tracks: rotatedAudio,
+      }),
+    );
+
+    await act(async () => {
+      releaseSwitch?.(
+        jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "playable",
+          session_id: "session-2",
+          playback_plan: fixturePlanV3({
+            session_id: "session-2",
+            plan_id: "plan:uri-less-2",
+            plan_attempt_key: "v3:uri-less-2",
+            requested_media_file_id: 8,
+            effective_media_file_id: 8,
+            audio_tracks: [],
+          }),
+        }),
+      );
+      await switchResponse;
+    });
+
+    await waitFor(() => expect(result.current.mediaFileId).toBe(8));
+    // The push names the plan's own file, so it is folded; the plan itself
+    // carries no candidate URI.
+    expect(result.current.plan?.effective_virtual_uri).toBeUndefined();
+    expect(result.current.effectiveVirtualUri).toBe("virtual://movie/x?result=B");
+    expect(result.current.planAudioTracks).toEqual(rotatedAudio);
     unmount();
   });
 
@@ -5851,7 +5944,12 @@ describe("usePlaybackSession deferred push authority", () => {
     unmount();
   });
 
-  it("does not refold a rejected inventory revision after an accepted rotation", async () => {
+  it("refolds a refused inventory revision once a later rotation matches it", async () => {
+    // A revision refused by a flush is not the same statement as a revision that
+    // was applied: the refusal is about the settled plan at that moment, and the
+    // live source can still move onto the candidate the revision names later in
+    // the same generation. Recording the refusal would swallow that redelivery
+    // and leave the track menus stale for the rest of the session.
     let releaseReplan: ((response: Response) => void) | undefined;
     const heldReplan = new Promise<Response>((resolve) => {
       releaseReplan = resolve;
@@ -5892,15 +5990,16 @@ describe("usePlaybackSession deferred push authority", () => {
     });
     await waitFor(() => expect(result.current.replanning).toBe(true));
 
-    // A file-only inventory revision is held behind the replan. The settled
-    // replacement names candidate B by URI, so a file-only revision cannot be
-    // tied to it and is refused (its revision recorded as handled).
+    // A revision for candidate C is held behind the replan. The settled
+    // replacement names candidate B, so C is a same-file collision and is
+    // refused rather than folded.
     act(() =>
       result.current.applyInventoryUpdate({
         session_id: "session-1",
-        inventory_revision: "inv:rejected",
+        inventory_revision: "inv:redelivered",
         inventory_status: "verified",
         effective_media_file_id: 8,
+        effective_virtual_uri: "virtual://movie/x?result=C",
         audio_tracks: collisionAudio,
       }),
     );
@@ -5913,8 +6012,8 @@ describe("usePlaybackSession deferred push authority", () => {
           outcome: "playable",
           session_id: "session-1",
           playback_plan: fixturePlanV3({
-            plan_id: "plan:reject-again",
-            plan_attempt_key: "v3:reject-again",
+            plan_id: "plan:redeliver0001",
+            plan_attempt_key: "v3:redeliver0001",
             effective_media_file_id: 8,
             effective_virtual_uri: "virtual://movie/x?result=B",
             audio_tracks: [],
@@ -5924,40 +6023,51 @@ describe("usePlaybackSession deferred push authority", () => {
       await heldReplan;
     });
 
-    await waitFor(() => expect(result.current.plan?.plan_id).toBe("plan:reject-again"));
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe("plan:redeliver0001"));
     expect(result.current.effectiveVirtualUri).toBe("virtual://movie/x?result=B");
     expect(result.current.planAudioTracks).toEqual([]);
 
-    // An accepted source rotation moves the menu to candidate D with an empty
-    // declared inventory. That identity change must not forget the revision the
-    // flush already handled.
+    // A rotation moves the live source onto C with an empty inventory. The
+    // revision the flush refused is still unrecorded, so the redelivery now
+    // matches the live identity and must fold.
     act(() =>
       result.current.applyCommittedSource(
         {
           effectiveMediaFileId: 8,
-          effectiveVirtualUri: "virtual://movie/x?result=D",
+          effectiveVirtualUri: "virtual://movie/x?result=C",
           inventoryStatus: "verified",
         },
         [],
       ),
     );
-    expect(result.current.effectiveVirtualUri).toBe("virtual://movie/x?result=D");
+    expect(result.current.effectiveVirtualUri).toBe("virtual://movie/x?result=C");
     expect(result.current.planAudioTracks).toEqual([]);
 
-    // Redelivering the refused revision is a no-op, not a second fold. The
-    // rejected payload carries a track the accepted source does not have, so a
-    // forgotten revision would show a stale track under candidate D.
     act(() =>
       result.current.applyInventoryUpdate({
         session_id: "session-1",
-        inventory_revision: "inv:rejected",
+        inventory_revision: "inv:redelivered",
         inventory_status: "verified",
         effective_media_file_id: 8,
+        effective_virtual_uri: "virtual://movie/x?result=C",
         audio_tracks: collisionAudio,
       }),
     );
-    expect(result.current.effectiveVirtualUri).toBe("virtual://movie/x?result=D");
-    expect(result.current.planAudioTracks).toEqual([]);
+    expect(result.current.planAudioTracks).toEqual(collisionAudio);
+
+    // Now that the revision has genuinely been applied, its duplicate is
+    // suppressed: a redelivery with a different inventory must not overwrite.
+    act(() =>
+      result.current.applyInventoryUpdate({
+        session_id: "session-1",
+        inventory_revision: "inv:redelivered",
+        inventory_status: "verified",
+        effective_media_file_id: 8,
+        effective_virtual_uri: "virtual://movie/x?result=C",
+        audio_tracks: rotatedAudio,
+      }),
+    );
+    expect(result.current.planAudioTracks).toEqual(collisionAudio);
     unmount();
   });
 });

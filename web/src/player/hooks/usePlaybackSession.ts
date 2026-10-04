@@ -283,14 +283,16 @@ function identityNamesSameSource(a: SourceIdentity, b: SourceIdentity): boolean 
  * lines up with the outgoing source (a replacement can retain the effective
  * candidate).
  *
- * When the replaced plan is URI-less (the v2 wire omits the candidate) it
- * cannot prove which of two same-file candidates it owns, so file equality is
- * never proof. A `source_committed` naming a different file than the live
- * outgoing source is the only rotation that can be adopted, and it must land on
- * the plan's own file. When the plan was refused rather than replaced, a push
- * that still names the live source is the same source and is kept — the source
- * never moved — while a source commit naming another file is a rotation the
- * transport already made and is kept too.
+ * When the replaced plan is URI-less (the v2 wire omits the candidate) file
+ * equality is still the only key the wire offers, so a push naming the plan's
+ * own file is admitted even without a URI — the payload routinely carries the
+ * candidate the plan omits, and refusing it would leave the track menus stale
+ * for the whole session. The one collision kept out is a genuine same-file
+ * sibling: a concrete live outgoing URI that disagrees with the push URI names
+ * a different candidate the plan cannot vouch for. When the plan was refused
+ * rather than replaced, a push that still names the live source is the same
+ * source and is kept — the source never moved — while a source commit naming
+ * another file is a rotation the transport already made and is kept too.
  */
 function deferredIdentityIsAdmissible(
   identity: SourceIdentity,
@@ -324,15 +326,26 @@ function deferredIdentityIsAdmissible(
   // it lines up with the outgoing source (a replacement can retain the
   // effective candidate).
   if (plan.effective_virtual_uri != null) return identityMatchesPlan(identity, plan);
-  // A URI-only push cannot be tied to the URI-less plan's file.
-  if (identity.fileId == null) return false;
 
-  // The URI-less winner cannot prove same-file ownership: a different file
-  // than the live outgoing is the only evidence that can outweigh the plan's
-  // candidate silence, and only a source commit carries it.
-  if (!allowRotation) return false;
-  if (outgoing.fileId != null && identity.fileId === outgoing.fileId) return false;
-  return identity.fileId === plan.effective_media_file_id;
+  // The winner is URI-less. File equality is the key the wire offers, so a push
+  // that names the plan's own file is admitted even when it carries the
+  // candidate the plan omits; it is the only carrier of that source's identity.
+  // A push naming another file is a rotation the URI-less plan cannot vouch
+  // for. A push supplying a candidate URI is admitted when neither the plan nor
+  // the live outgoing source names one. The one refusal kept is a genuine
+  // same-file sibling collision: a concrete outgoing candidate URI, on the
+  // push's own file, that disagrees with the push's URI names a different
+  // candidate the URI-less plan cannot resolve.
+  if (identity.fileId != null && identity.fileId !== plan.effective_media_file_id) return false;
+  if (
+    outgoing.uri != null &&
+    identity.uri != null &&
+    identity.uri !== outgoing.uri &&
+    (outgoing.fileId == null || identity.fileId == null || outgoing.fileId === identity.fileId)
+  ) {
+    return false;
+  }
+  return true;
 }
 
 /** A start body plus the optional force-relink flag the retry path adds. */
@@ -2508,8 +2521,10 @@ export function usePlaybackSession(
    * the replacement plan lands rather than being lost. The queue is replayed in
    * arrival order. The settled plan is the adoption that won: a push captured
    * under another adoption generation or session is dropped, and a push whose
-   * identity the plan cannot vouch for is dropped. A stale inventory revision
-   * still marks itself folded so a later re-delivery does not re-open the menus.
+   * identity the plan cannot vouch for is dropped. A refused inventory revision
+   * is left unrecorded, so a redelivery that the plan (or a later rotation) does
+   * vouch for still folds; a genuinely applied revision is recorded by the fold
+   * itself, so duplicate deliveries remain no-ops.
    */
   const flushDeferredPushes = useCallback(() => {
     // A start/replan owns the session while its adoption is in flight, and a
@@ -2528,20 +2543,19 @@ export function usePlaybackSession(
     const queue = deferredPushesRef.current.slice().sort((a, b) => a.seq - b.seq);
     if (queue.length === 0) return;
     deferredPushesRef.current = [];
-    const markRevisionFolded = (entry: DeferredPush) => {
-      // The settled plan is authoritative and its own inventory is on screen;
-      // mark a stale revision as folded so a re-delivery is a no-op. Every
-      // rejection path runs this so bookkeeping does not depend on which
-      // identity check happened to discard the entry. Recording it here does
-      // not fold the push; it only remembers that this generation has handled
-      // the revision, so a redelivered file-only rejection cannot fold later.
-      if (entry.kind === "inventory" && entry.payload.inventory_revision != null) {
-        inventoryRevisionRef.current = entry.payload.inventory_revision;
-        syncRevisionScope().revisions.add(entry.payload.inventory_revision);
-      }
+    const handleRefusedPush = (entry: DeferredPush) => {
       // A deferred source commit had moved the live baseline when it was
       // captured. If nothing later moved it on, put it back on the winning plan
       // so a source the flush just refused is not left recorded as live.
+      //
+      // A refused inventory revision is deliberately *not* recorded as folded:
+      // the refusal is a statement about this flush's settled plan, not about
+      // the revision, and the identity can move later in the same generation
+      // (a rotation onto a candidate the revision names). Recording it here
+      // would swallow the redelivery that finally matches, leaving the menus
+      // stale for the rest of the session. Only a genuinely applied revision is
+      // recorded, by `foldInventoryUpdate`, so duplicates of applied revisions
+      // stay suppressed while a refused one can still apply once it matches.
       if (
         entry.kind === "source" &&
         identityNamesSameSource(liveSourceIdentityRef.current, entry.identity)
@@ -2568,10 +2582,11 @@ export function usePlaybackSession(
       ) {
         continue;
       }
-      // The settled plan is the only authority. Its own identity wins over the
-      // outgoing one (a replacement may retain the effective candidate); when
-      // it cannot prove which same-file candidate it owns, the outgoing
-      // identity is never folded and file equality is not proof.
+      // The settled plan is the primary authority. When it names a candidate
+      // URI, that URI wins over the outgoing one (a replacement may retain the
+      // effective candidate) and an exact match is kept. When it is URI-less,
+      // the push's own file is the key, except for a genuine same-file sibling
+      // collision the plan cannot resolve. See deferredIdentityIsAdmissible.
       if (
         !deferredIdentityIsAdmissible(
           entry.identity,
@@ -2581,7 +2596,7 @@ export function usePlaybackSession(
           entry.kind === "source",
         )
       ) {
-        markRevisionFolded(entry);
+        handleRefusedPush(entry);
         continue;
       }
       if (entry.kind === "source") {
@@ -2590,7 +2605,7 @@ export function usePlaybackSession(
         foldInventoryUpdate(entry.payload);
       }
     }
-  }, [foldCommittedSource, foldInventoryUpdate, syncRevisionScope]);
+  }, [foldCommittedSource, foldInventoryUpdate]);
   flushDeferredPushesRef.current = flushDeferredPushes;
 
   const updatePlaybackState = useCallback((positionSeconds: number, playing: boolean) => {
