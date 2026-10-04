@@ -3,7 +3,6 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { sectionTypeLabel } from "@/lib/sectionTypes";
 import { queryDefinitionFromSectionConfig } from "@/api/types";
-import type { Library } from "@/api/types";
 import { matchRecipePreset, type RecipeCatalogResponse } from "@/lib/recipes";
 import { Eye, EyeOff, GripVertical, Pencil, Star, Trash2 } from "lucide-react";
 import { useSortable } from "@dnd-kit/sortable";
@@ -18,7 +17,6 @@ export interface EditableSectionViewModel {
   itemLimit: number;
   featured: boolean;
   hidden?: boolean;
-  enabled?: boolean;
   isCustom?: boolean;
   config?: Record<string, unknown>;
 }
@@ -51,27 +49,14 @@ function continueTypeLabel(config?: Record<string, unknown>): string | null {
 
 export function SectionSummaryBadges({
   section,
-  libraries,
-  collectionLabels,
   catalog,
   showVisibility = false,
-  showEnabled = false,
 }: {
   section: EditableSectionViewModel;
-  libraries?: Library[];
-  collectionLabels?: Map<string, string>;
   catalog?: RecipeCatalogResponse;
   showVisibility?: boolean;
-  showEnabled?: boolean;
 }) {
   const queryDefinition = queryDefinitionFromSectionConfig(section.config);
-  const collectionId =
-    typeof section.config?.library_collection_id === "string"
-      ? section.config.library_collection_id
-      : typeof section.config?.user_collection_id === "string"
-        ? section.config.user_collection_id
-        : undefined;
-  const collectionLabel = collectionId ? collectionLabels?.get(collectionId) : undefined;
   const resumeLabel =
     section.sectionType === "continue_watching" ? continueTypeLabel(section.config) : null;
 
@@ -86,26 +71,10 @@ export function SectionSummaryBadges({
         <Badge variant="outline">Audiobooks</Badge>
       ) : null}
       {queryDefinition.media_scope === "ebook" ? <Badge variant="outline">Ebooks</Badge> : null}
-      {libraries
-        ? queryDefinition.library_ids.map((libraryId) => {
-            const library = libraries.find((entry) => entry.id === libraryId);
-            return library ? (
-              <Badge key={libraryId} variant="outline">
-                {library.name}
-              </Badge>
-            ) : null;
-          })
-        : null}
-      {collectionLabel ? <Badge variant="outline">{collectionLabel}</Badge> : null}
       {section.featured ? <Badge variant="default">Featured</Badge> : null}
       {showVisibility ? (
         <Badge variant={section.hidden ? "secondary" : "outline"}>
           {section.hidden ? "Hidden" : "Visible"}
-        </Badge>
-      ) : null}
-      {showEnabled ? (
-        <Badge variant={section.enabled ? "default" : "secondary"}>
-          {section.enabled ? "On" : "Off"}
         </Badge>
       ) : null}
     </div>

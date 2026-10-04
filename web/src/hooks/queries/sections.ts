@@ -9,7 +9,6 @@ import {
   bulkCreateAdminSections,
   updateAdminSection,
   deleteAdminSection,
-  reorderAdminSections,
   restoreAdminSections,
   type AdminSectionDeleteTarget,
 } from "@/api/adminSections";
@@ -276,17 +275,6 @@ export function useDeleteSections() {
   });
 
   return { ...mutation, progress };
-}
-
-export function useReorderSections() {
-  const qc = useQueryClient();
-  return useMutation({
-    retry: false,
-    mutationFn: reorderAdminSections,
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: sectionKeys.all });
-    },
-  });
 }
 
 function sectionScopeQuery(scope: ProfileSectionScope, libraryId?: string | number) {
