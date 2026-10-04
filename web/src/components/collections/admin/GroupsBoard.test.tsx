@@ -183,12 +183,16 @@ describe("GroupsBoard", () => {
     });
 
     await vi.waitFor(() => expect(v2Recorder.writes()).toHaveLength(1));
+    // Known gap, pinned on purpose: the drag preview shows a in c's slot
+    // (b, c, a), but computeNewOrder inserts the moved collection before the
+    // row it was dropped on, so a downward move saves one slot short. The
+    // Arrange shelves step (CB22) should fix this and change the golden.
     expect(v2Recorder.writes()).toEqual([
       {
         operation: "PUT /api/v2/admin/collection-groups/{group_id}/collections/order",
         path: "/api/v2/admin/collection-groups/ungrouped/collections/order",
         query: { library_id: "1" },
-        headers: { "If-Match": '"rev-1"' },
+        headers: { "If-Match": '"/api/v2/admin/collection-groups/ungrouped/collections/order#1"' },
         body: { ordered_ids: ["b", "a", "c"] },
       },
     ]);

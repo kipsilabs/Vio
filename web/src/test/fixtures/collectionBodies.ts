@@ -77,7 +77,7 @@ export const goldens = {
       operation: "PATCH /api/v2/admin/collections/{id}",
       path: "/api/v2/admin/collections/c1",
       headers: {
-        "If-Match": '"rev-1"',
+        "If-Match": '"/api/v2/admin/collections/c1#1"',
       },
       body: {
         title: "Renamed",
@@ -95,7 +95,7 @@ export const goldens = {
       operation: "PATCH /api/v2/admin/collections/{id}",
       path: "/api/v2/admin/collections/c1",
       headers: {
-        "If-Match": '"rev-1"',
+        "If-Match": '"/api/v2/admin/collections/c1#1"',
       },
       body: {
         title: "Original",
@@ -121,7 +121,7 @@ export const goldens = {
       operation: "PATCH /api/v2/admin/collections/{id}",
       path: "/api/v2/admin/collections/c1",
       headers: {
-        "If-Match": '"rev-1"',
+        "If-Match": '"/api/v2/admin/collections/c1#1"',
       },
       body: {
         title: "Original",
@@ -150,7 +150,7 @@ export const goldens = {
         operation: "PATCH /api/v2/admin/collections/{id}",
         path: "/api/v2/admin/collections/c1",
         headers: {
-          "If-Match": '"rev-1"',
+          "If-Match": '"/api/v2/admin/collections/c1#1"',
         },
         body: {
           title: "Original",
@@ -188,7 +188,7 @@ export const goldens = {
         operation: "PATCH /api/v2/admin/collections/{id}",
         path: "/api/v2/admin/collections/c1",
         headers: {
-          "If-Match": '"rev-1"',
+          "If-Match": '"/api/v2/admin/collections/c1#1"',
         },
         body: {
           title: "Original",
@@ -226,7 +226,7 @@ export const goldens = {
         operation: "PATCH /api/v2/admin/collections/{id}",
         path: "/api/v2/admin/collections/c1",
         headers: {
-          "If-Match": '"rev-1"',
+          "If-Match": '"/api/v2/admin/collections/c1#1"',
         },
         body: {
           title: "Original",
@@ -268,7 +268,7 @@ export const goldens = {
         operation: "PATCH /api/v2/collections/{id}",
         path: "/api/v2/collections/c1",
         headers: {
-          "If-Match": '"rev-1"',
+          "If-Match": '"/api/v2/collections/c1#1"',
         },
         body: {
           name: "Rainy days",
@@ -303,7 +303,7 @@ export const goldens = {
         operation: "PATCH /api/v2/collections/{id}",
         path: "/api/v2/collections/c1",
         headers: {
-          "If-Match": '"rev-1"',
+          "If-Match": '"/api/v2/collections/c1#1"',
         },
         body: {
           name: "Rainy days",
@@ -338,7 +338,7 @@ export const goldens = {
         operation: "PATCH /api/v2/collections/{id}",
         path: "/api/v2/collections/c1",
         headers: {
-          "If-Match": '"rev-1"',
+          "If-Match": '"/api/v2/collections/c1#1"',
         },
         body: {
           name: "Rainy days",
@@ -425,7 +425,7 @@ export const goldens = {
       operation: "PATCH /api/v2/collections/{id}",
       path: "/api/v2/collections/c1",
       headers: {
-        "If-Match": '"rev-1"',
+        "If-Match": '"/api/v2/collections/c1#1"',
       },
       body: {
         name: "Renamed",
@@ -459,7 +459,7 @@ export const goldens = {
       operation: "PATCH /api/v2/collections/{id}",
       path: "/api/v2/collections/c1",
       headers: {
-        "If-Match": '"rev-1"',
+        "If-Match": '"/api/v2/collections/c1#1"',
       },
       body: {
         name: "Renamed",
@@ -581,7 +581,7 @@ export const goldens = {
       operation: "PATCH /api/v2/admin/collections/{id}",
       path: "/api/v2/admin/collections/c1",
       headers: {
-        "If-Match": '"rev-1"',
+        "If-Match": '"/api/v2/admin/collections/c1#1"',
       },
       body: {
         title: "Original",
@@ -607,7 +607,7 @@ export const goldens = {
       operation: "PATCH /api/v2/admin/collections/{id}",
       path: "/api/v2/admin/collections/c1",
       headers: {
-        "If-Match": '"rev-1"',
+        "If-Match": '"/api/v2/admin/collections/c1#1"',
       },
       body: {
         title: "Trending This Week",
@@ -635,7 +635,7 @@ export const goldens = {
       operation: "PATCH /api/v2/admin/collections/{id}",
       path: "/api/v2/admin/collections/c1",
       headers: {
-        "If-Match": '"rev-1"',
+        "If-Match": '"/api/v2/admin/collections/c1#1"',
       },
       body: {
         title: "Festival Picks",
@@ -660,7 +660,7 @@ export const goldens = {
       operation: "PATCH /api/v2/admin/collections/{id}",
       path: "/api/v2/admin/collections/c1",
       headers: {
-        "If-Match": '"rev-1"',
+        "If-Match": '"/api/v2/admin/collections/c1#1"',
       },
       body: {
         title: "For you",
@@ -687,7 +687,7 @@ export const goldens = {
       operation: "PATCH /api/v2/collections/{id}",
       path: "/api/v2/collections/c1",
       headers: {
-        "If-Match": '"rev-1"',
+        "If-Match": '"/api/v2/collections/c1#1"',
       },
       body: {
         name: "Top Watched",
@@ -703,7 +703,7 @@ export const goldens = {
       operation: "PATCH /api/v2/collections/{id}",
       path: "/api/v2/collections/c1",
       headers: {
-        "If-Match": '"rev-1"',
+        "If-Match": '"/api/v2/collections/c1#1"',
       },
       body: {
         name: "Rainy days",
@@ -781,6 +781,32 @@ export const goldens = {
       body: {
         library_ids: ["1", "2"],
         delete_existing: false,
+      },
+    },
+  ] satisfies Writes,
+  /**
+   * Bundle apply job with the default hero sections and Delete Existing on.
+   * This is the request that deletes server collections; today it is sent
+   * with no confirmation step.
+   */
+  bundleJobDeleteExisting: [
+    {
+      operation: "POST /api/v2/admin/collections/template-bundles/{bundle_id}/apply-job",
+      path: "/api/v2/admin/collections/template-bundles/core_defaults/apply-job",
+      headers: {},
+      body: {
+        library_ids: ["1", "2"],
+        delete_existing: true,
+        featured: {
+          home: {
+            library_id: "1",
+            template_id: "tmdb_trending_movies_week",
+          },
+          libraries: {
+            "1": "tmdb_trending_movies_week",
+            "2": "tmdb_trending_tv_week",
+          },
+        },
       },
     },
   ] satisfies Writes,

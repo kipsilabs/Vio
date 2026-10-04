@@ -151,6 +151,10 @@ describe("Your collections", () => {
     });
     // The pick-up announcement is replaced in the same render by the first
     // "moved over", so assistive technology hears these three.
+    // Known gap, pinned on purpose: Collections.tsx sets no `announcements`,
+    // so dnd-kit's defaults read collection ids (c1, c3) instead of names.
+    // The Your collections redesign (CB19) should announce names and change
+    // this expectation deliberately.
     expect(announcements).toEqual([
       "Draggable item c1 was moved over droppable area c1.",
       "Draggable item c1 was moved over droppable area c3.",
@@ -162,7 +166,7 @@ describe("Your collections", () => {
       {
         operation: "PUT /api/v2/collections/order",
         path: "/api/v2/collections/order",
-        headers: { "If-Match": '"rev-1"' },
+        headers: { "If-Match": '"/api/v2/collections/order#1"' },
         body: { ordered_ids: ["c3", "c1"] },
       },
     ]);

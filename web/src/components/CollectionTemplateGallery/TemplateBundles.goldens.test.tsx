@@ -1,7 +1,7 @@
 /**
  * Goldens: the bodies today's template bundle view sends for a dry run and
- * for the apply job, with its default hero sections, with every hero turned
- * off, and with Delete Existing on.
+ * for the apply job, each with its default hero sections, with every hero
+ * turned off, and with Delete Existing on.
  */
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, screen } from "@testing-library/react";
@@ -142,5 +142,13 @@ describe("template bundle apply", () => {
     await user.click(screen.getByRole("button", { name: "Apply Defaults" }));
     await vi.waitFor(() => expect(v2Recorder.writes()).toHaveLength(1));
     expect(v2Recorder.writes()).toEqual(goldens.bundleJobNoHeroes);
+  });
+
+  it("queues the apply job with existing collections deleted", async () => {
+    const user = await openBundle();
+    await user.click(screen.getByText("Delete Existing Server Collections"));
+    await user.click(screen.getByRole("button", { name: "Apply Defaults" }));
+    await vi.waitFor(() => expect(v2Recorder.writes()).toHaveLength(1));
+    expect(v2Recorder.writes()).toEqual(goldens.bundleJobDeleteExisting);
   });
 });

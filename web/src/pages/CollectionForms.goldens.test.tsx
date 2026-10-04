@@ -307,7 +307,7 @@ describe("personal manual page: a title added before Save", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save Collection" }));
     await vi.waitFor(() => expect(writes()).toHaveLength(2));
     expect(writes()).toEqual(goldens.personalAddThenRename);
-    expect(v2Recorder.etag("/api/v2/collections/c1")).toBe('"rev-2"');
+    expect(v2Recorder.etag("/api/v2/collections/c1")).toBe('"/api/v2/collections/c1#2"');
     await vi.waitFor(() =>
       expect(toast.error).toHaveBeenCalledWith(
         expect.stringContaining("This collection changed while you were editing."),

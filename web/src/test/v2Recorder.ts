@@ -12,7 +12,7 @@
  * are answered from `contracts/api/v2/fixtures`, or from `v2Recorder.answer()`
  * when a test needs a different answer; an operation with neither fails the
  * test. Each concrete path carries a revision: reads and successful writes
- * answer with its ETag, a write bumps it and the collection it belongs to,
+ * answer with its ETag (the path and revision, so no two paths share one), a write bumps it and the collection it belongs to,
  * and a guarded write whose If-Match is not current is answered 412 with the
  * current ETag, as the server does.
  *
@@ -187,9 +187,13 @@ export class V2Recorder {
     this.collectionTypes.set(collection.id, collection.collection_type);
   }
 
-  /** The ETag a path currently answers with. */
+  /**
+   * The ETag a path currently answers with. It names the path, so a write
+   * that sends another resource's ETag (the list's instead of the item's)
+   * gets 412 and shows up in its golden.
+   */
   etag(path: string): string {
-    return `"rev-${this.revisions.get(path) ?? 1}"`;
+    return `"${path}#${this.revisions.get(path) ?? 1}"`;
   }
 
   /** Changes a path's revision as if another writer saved it. */
