@@ -264,7 +264,7 @@ func TestVirtualFileMetadataUpdatePersistsProbeStamp(t *testing.T) {
 }
 
 // A resolution-less stored row whose lister returns a resolution-less
-// candidate and whose RemuxDB gate is closed must still synthesize the 1080p
+// candidate must still synthesize the 1080p
 // baseline through the candidate-merge gate: the immediate plan keeps the
 // synthesized tracks and defers the real probe to the background.
 func TestResolveResolutionlessMergesIntoBaseline(t *testing.T) {
@@ -1521,8 +1521,8 @@ func TestMergeIdempotentAcrossRepeatedCandidates(t *testing.T) {
 }
 
 // No-prober declared path persists DECLARED (non-assumed) metadata: the
-// persistence gate in playback_virtual.go (resolve loop, `!AppliedRemux &&
-// !ResolutionAssumed && prober == nil`) persists declared candidates, unlike
+// persistence gate in playback_virtual.go (resolve loop, `!ResolutionAssumed
+// && prober == nil`) persists declared candidates, unlike
 // the assumed-baseline gate which skips persistence. The saver runs in a
 // background goroutine via persistVirtualMetadataBounded, so the test waits
 // for the async call.

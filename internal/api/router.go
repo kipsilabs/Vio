@@ -72,7 +72,6 @@ import (
 	"github.com/Silo-Server/silo-server/internal/ratingsources"
 	"github.com/Silo-Server/silo-server/internal/recommendations"
 	"github.com/Silo-Server/silo-server/internal/remotestream"
-	"github.com/Silo-Server/silo-server/internal/remuxdb"
 	mediarequests "github.com/Silo-Server/silo-server/internal/requests"
 	"github.com/Silo-Server/silo-server/internal/s3client"
 	"github.com/Silo-Server/silo-server/internal/scanner"
@@ -1404,17 +1403,6 @@ func newChiRouter(deps Dependencies) chi.Router {
 					}
 					return nil, errors.New("media file not found for content")
 				}
-				playbackHandler.RemuxDBConfig = func(ctx context.Context) remuxdb.Config {
-					cfg, err := remuxdb.LoadConfig(ctx, settingsRepo)
-					if err != nil {
-						slog.WarnContext(ctx, "load remuxdb config; using defaults", "component", "api", "error", err)
-						return remuxdb.DefaultConfig()
-					}
-					return cfg
-				}
-				if deps.DB != nil {
-					playbackHandler.RemuxDBStore = remuxdb.NewStore(deps.DB)
-				}
 			}
 			streamHandler = handlers.NewStreamHandler(deps.SessionMgr, deps.FileRepo)
 		} else {
@@ -1459,6 +1447,13 @@ func newChiRouter(deps Dependencies) chi.Router {
 			}
 		}
 		playbackHandler.BestResultCache = handlers.NewVirtualBestResultCache(30*time.Minute, 512)
+		// Watch-detail prefetch: warm virtual listings on detail view so the
+		// later start finds a warm BestResultCache. A nil *FileRepository
+		// must not be boxed into the interface (typed-nil would panic on
+		// GetByID); prefetch stays disabled without it.
+		if itemsHandler != nil && deps.FileRepo != nil {
+			itemsHandler.SetVirtualPrefetcher(playbackHandler, deps.FileRepo)
+		}
 		if deps.UserStoreProvider != nil {
 			// Device-aware candidate ranking: resolve the caller's persisted
 			// capability profile through the store provider, TTL-cached so

@@ -103,7 +103,6 @@ import (
 	"github.com/Silo-Server/silo-server/internal/ratelimit"
 	"github.com/Silo-Server/silo-server/internal/recommendations"
 	"github.com/Silo-Server/silo-server/internal/remotestream"
-	"github.com/Silo-Server/silo-server/internal/remuxdb"
 	mediarequests "github.com/Silo-Server/silo-server/internal/requests"
 	"github.com/Silo-Server/silo-server/internal/s3client"
 	"github.com/Silo-Server/silo-server/internal/scanner"
@@ -508,9 +507,6 @@ func configureOperationalLogging(
 	}
 	if err := diagnostics.SeedDefaults(ctx, settingsRepo); err != nil {
 		log.Fatalf("seed diagnostics defaults: %v", err)
-	}
-	if err := remuxdb.SeedDefaults(ctx, settingsRepo); err != nil {
-		slog.WarnContext(ctx, "seed remuxdb defaults; continuing in degraded mode", "component", "app", "error", err)
 	}
 	opsPM := partman.NewManager(pool, "operational_logs", partman.Daily, 3)
 	if err := opsPM.EnsureFuturePartitions(ctx); err != nil {
@@ -3044,9 +3040,6 @@ func main() {
 			diagnosticsStore,
 		))
 		maintenanceSteps = append(maintenanceSteps, tasks.NewPolicyDecisionLogCleanupTask(deps.DB, settingsRepo, policyPM))
-		if deps.DB != nil {
-			taskMgr.Register(tasks.NewCleanupRemuxDBEvidenceTask(remuxdb.NewStore(deps.DB)))
-		}
 		if deps.FileRepo != nil {
 			// Download prepare-to-file pipeline (Phase 3): a durable, leased encode
 			// queue hosted on the task manager. Built here (before Start) and shared

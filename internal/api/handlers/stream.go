@@ -1196,6 +1196,14 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "not_found", "Media file not found")
 			return
 		}
+		// A canceled lookup is the viewer going away mid-start, not a broken
+		// catalog row: answer 204 without failing the session so it reads as
+		// a cancel in logs and metrics, never a 500.
+		if isClientCancellation(r.Context(), err) {
+			h.abortPlaybackSession(r.Context(), session)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		writeErrorCause(w, http.StatusInternalServerError, "internal_error", "Failed to load media file", err)
 		return
 	}
@@ -1345,7 +1353,7 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 				},
 				ModifyResponse: func(res *http.Response) error {
 					if res.StatusCode >= http.StatusInternalServerError {
-						return fmt.Errorf("relay returned HTTP %d", res.StatusCode)
+						return &relayUpstreamError{StatusCode: res.StatusCode}
 					}
 					return nil
 				},
@@ -1455,7 +1463,12 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 					h.handleTransportStartFailure(r.Context(), session, file, lastProxyErr)
 					if streamWriter.StatusCode() == 0 {
 						logVirtualStreamFailure(r.Context(), sessionID, file, lastProxyErr)
-						writeErrorCause(streamWriter, http.StatusBadGateway, "virtual_stream_unavailable", "Failed to stream virtual media source", lastProxyErr)
+						status := http.StatusBadGateway
+						var upstream *relayUpstreamError
+						if errors.As(lastProxyErr, &upstream) && upstream.StatusCode >= 500 && upstream.StatusCode <= 599 {
+							status = upstream.StatusCode
+						}
+						writeErrorCause(streamWriter, status, "virtual_stream_unavailable", "Failed to stream virtual media source", lastProxyErr)
 					}
 				}
 			}

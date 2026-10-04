@@ -34,7 +34,6 @@ import (
 	"github.com/Silo-Server/silo-server/internal/noderouting"
 	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/remotestream"
-	"github.com/Silo-Server/silo-server/internal/remuxdb"
 	"github.com/Silo-Server/silo-server/internal/scanner"
 	"github.com/Silo-Server/silo-server/internal/settingscontract"
 	"github.com/Silo-Server/silo-server/internal/settingskeys"
@@ -226,6 +225,18 @@ func isClientCancellation(ctx context.Context, err error) bool {
 // already canceled it. That case is a debug line with an explicit reason so it
 // cannot be mistaken for a provider outage; genuine timeouts and provider
 // errors stay at WARN.
+// relayUpstreamError preserves the relay's real HTTP status through the
+// reverse-proxy error path. Without it the serve layer collapses every relay
+// 5xx into one message, making a provider 502/503/504 indistinguishable from
+// a relay-local cancel or timeout in logs.
+type relayUpstreamError struct {
+	StatusCode int
+}
+
+func (e *relayUpstreamError) Error() string {
+	return fmt.Sprintf("relay returned HTTP %d", e.StatusCode)
+}
+
 func logVirtualStreamFailure(ctx context.Context, sessionID string, file *models.MediaFile, err error) {
 	if err == nil || file == nil {
 		return
@@ -536,10 +547,6 @@ type PlaybackHandler struct {
 	VirtualSubtitleSearcher  SubtitleSearchTrigger
 	SubtitleSearchInFlight   *sync.Map
 	DeviceCapabilitySource   DeviceCapabilityProfileSource
-	RemuxDBConfig            func(ctx context.Context) remuxdb.Config
-	RemuxDBStore             *remuxdb.Store
-	remuxSubmitOnce          sync.Once
-	remuxSubmitCh            chan remuxSubmitTask
 	// PlaybackConfig returns the current playback config (ffmpeg path,
 	// hwaccel, transcode dir). Wired to the live config in integrated mode
 	// so admin changes apply to newly started transcodes. Read it through

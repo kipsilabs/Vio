@@ -25,7 +25,6 @@ import (
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/plugins"
-	"github.com/Silo-Server/silo-server/internal/remuxdb"
 	"github.com/Silo-Server/silo-server/internal/scanner"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary/resolver"
@@ -89,8 +88,8 @@ const (
 	virtualProbeFailureMaxEntries = 4096
 )
 
-// virtualStartupBudget bounds the entire cold path: candidate listing, remux
-// matching, provider resolution, probing, retries and the stale-source
+// virtualStartupBudget bounds the entire cold path: candidate listing,
+// provider resolution, probing, retries and the stale-source
 // fallback all run under one deadline started at cold-path entry, so a slow
 // early stage leaves a later stage only the remaining budget. It is a var so
 // tests can shrink the budget and observe the single deadline.
@@ -1251,7 +1250,6 @@ type resolvedVirtualPlaybackSource struct {
 	File              *models.MediaFile
 	ProbeSucceeded    bool
 	Provenance        ProbeProvenance
-	AppliedRemux      bool
 	ResolutionAssumed bool
 	// ResolvedURL is the validated provider URL the resolver returned, with
 	// its parsed expiry and the candidate's durable identity. They are
@@ -1337,7 +1335,7 @@ func shouldListVirtualPlaybackCandidates(noResult, needsCandidateMetadata, force
 // virtualResolveTrace accumulates the wall-clock cost of each phase inside
 // resolveVirtualPlaybackSource. The protocol v3 start timings collapse all of
 // this into a single file_load_probe mark; these attrs split it into the
-// provider candidate list, the RemuxDB match, the provider resolve loop, the
+// provider candidate list, the provider resolve loop, the
 // synchronous probe, and the stale-source re-list fallback, so a cold-start
 // attribution can name the dominant stage instead of guessing. It is
 // observational only and never gates control flow.
@@ -1353,9 +1351,6 @@ type virtualResolveTrace struct {
 
 	list    time.Duration
 	listRan bool
-
-	remux    time.Duration
-	remuxRan bool
 
 	resolve    time.Duration
 	resolveRan bool
@@ -1384,10 +1379,9 @@ type virtualResolveTrace struct {
 
 // totalMS is the sum of the stage durations that ran, using the same rounded
 // millisecond values the per-stage fields report, so total_ms equals
-// list_ms+remux_ms+resolve_ms+probe_ms+fallback_ms exactly.
+// list_ms+resolve_ms+probe_ms+fallback_ms exactly.
 func (t *virtualResolveTrace) totalMS() int64 {
 	return t.list.Milliseconds() +
-		t.remux.Milliseconds() +
 		t.resolve.Milliseconds() +
 		t.probe.Milliseconds() +
 		t.fallback.Milliseconds()
@@ -1434,7 +1428,6 @@ func (t *virtualResolveTrace) fields() []any {
 		d    time.Duration
 	}{
 		{"list", t.listRan, t.list},          //nolint:goconst // log attribute key/value, kept inline for readability.
-		{"remux", t.remuxRan, t.remux},       //nolint:goconst // log attribute key/value, kept inline for readability.
 		{"resolve", t.resolveRan, t.resolve}, //nolint:goconst // log attribute key/value, kept inline for readability.
 		{"probe", t.probeRan, t.probe},
 		{"fallback", t.fallbackRan, t.fallback},
@@ -1896,14 +1889,14 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	// return below, including the fast paths.
 	trace := &virtualResolveTrace{started: time.Now(), budgetMS: virtualStartupBudget.Milliseconds()}
 	defer trace.log(r.Context(), file)
-	// One deadline owns the entire cold path below. Listing, remux matching,
+	// One deadline owns the entire cold path below. Listing,
 	// provider resolution, probing, retries and the stale-source fallback all
 	// derive from this context, so an early stage that burns time cannot hand a
 	// later stage a fresh virtualStartupBudget. Detached background work
 	// deliberately re-bases off r.Context() and is not bounded by this.
 	coldCtx, coldCancel := context.WithTimeout(r.Context(), virtualStartupBudget)
 	defer coldCancel()
-	// Candidate selection (listing and remux matching) must not be able to
+	// Candidate selection (listing) must not be able to
 	// consume the resolve/probe attempt's budget. It runs under a staging
 	// deadline that stops at half the cold budget, reserving the other half for
 	// the attempt loop below. The attempt still inherits coldCtx, so the single
@@ -2018,8 +2011,18 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	// candidate metadata left to fetch. It is only set for a concrete same-row
 	// candidate that carries a usable stored URL, so it cannot mask an
 	// exclusion, a forced relist, a neutral row, or a failed verdict.
+	emptyListKey := virtualRecoveryRelistKey(virtualPlaybackNeutralKey(file.FilePath), file.VirtualOwnerInstallationID)
+	// A provider that just answered empty stays suppressed for the window on
+	// the start path: recovery, forced relists, exclusions, and unusable-row
+	// rotations still list, so failover is never blocked. Suppression only
+	// skips a repeat cold list that would pay the full ~3.5s again.
+	emptySuppressed := !forceRelist && !exclusionPending && !requestedRowUnusable && virtualEmptyListSuppressed(emptyListKey, time.Now())
+	if emptySuppressed {
+		slog.DebugContext(r.Context(), "virtual playback list suppressed: provider answered empty inside window",
+			"component", "api", "content_id", file.ContentID, "file_id", file.ID)
+	}
 	if (shouldListVirtualPlaybackCandidates(noResult, needsCandidateMetadata && !cachedListing, forceRelist) ||
-		((exclusionPending || requestedRowUnusable) && !cachedListing)) && persistedResumeURI == "" && h.VirtualPlaybackStreamLister != nil {
+		((exclusionPending || requestedRowUnusable) && !cachedListing)) && persistedResumeURI == "" && !emptySuppressed && h.VirtualPlaybackStreamLister != nil {
 		trace.listed = true
 		trace.listRan = true
 		listStart := time.Now()
@@ -2033,6 +2036,15 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		streams, err := h.VirtualPlaybackStreamLister.ListVirtualPlaybackStreams(
 			listCtx, file.FilePath, userID, profileID, file.VirtualOwnerInstallationID,
 		)
+		listAnswered := err == nil && len(streams) > 0
+		if listAnswered {
+			virtualEmptyListClear(emptyListKey)
+		} else if err == nil {
+			// An answered empty list suppresses a hot re-list. A listing
+			// error — especially a client cancellation — is not provider
+			// evidence and must not suppress the next viewer's start.
+			virtualEmptyListRecord(emptyListKey, time.Now())
+		}
 		if err == nil && len(streams) > 0 {
 			if len(streams) > maxVirtualPlaybackStreams {
 				streams = streams[:maxVirtualPlaybackStreams]
@@ -2129,21 +2141,13 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	if noResult && !options.sessionBound && !options.explicitSelection && len(candidates) > 1 {
 		candidates = h.preferProbedVirtualCandidates(stagingCtx, candidates, file, file.VirtualOwnerInstallationID)
 	}
-	remuxMatches := map[string]remuxdb.Evidence{}
-	remuxEnabled := false
-	if needsCandidateMetadata && len(candidates) > 0 {
-		trace.remuxRan = true
-		remuxStart := time.Now()
-		remuxMatches, remuxEnabled = h.matchRemuxDBCandidates(stagingCtx, file, candidates)
-		trace.remux = time.Since(remuxStart)
-	}
 	if len(candidates) > maxAttempts {
 		candidates = candidates[:maxAttempts]
 	}
 	trace.candidates = len(candidates)
 	// The attempt loop, its probes, its retries and the stale-source fallback
 	// run on the same cold-path deadline. Reusing coldCtx directly means they
-	// observe whatever budget listing and remux matching left, rather than a
+	// observe whatever budget listing left, rather than a
 	// freshly restarted virtualStartupBudget. The staging deadline above caps
 	// those early stages at half the cold budget, so the attempt is guaranteed
 	// at least that much time rather than being starved.
@@ -2184,10 +2188,6 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		// original lets every error name the candidate the attempt is actually
 		// about instead of the substitute it happened to resolve to.
 		requestedURI := cand.URI
-		// Evidence is keyed by the pre-resolution candidate URI: the detailed
-		// resolver below may rewrite cand.URI, but the match map was populated
-		// from the original candidate list.
-		origKey := remuxEvidenceKey(cand.URI)
 		oid := cand.OwnerInstallationID
 		if oid <= 0 {
 			oid = file.VirtualOwnerInstallationID
@@ -2531,8 +2531,6 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				}
 			}
 		}
-		localResolution := transient.Resolution
-		localCodec := transient.CodecVideo
 		hasCompleteVideoEvidence := completeVirtualVideoEvidenceV3(&transient)
 		hasCompleteAudioEvidence := completeVirtualAudioEvidenceV3(&transient)
 		hasCompleteContainerEvidence := completeVirtualContainerEvidenceV3(&transient)
@@ -2580,27 +2578,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: true, Provenance: ProbeProvenanceVerified,
 			}, resolvedIdentity, resolvedRematched), nil
 		}
-		ev, _ := remuxMatches[origKey]
-		appliedRemux := false
-		if !substituted {
-			// The remux evidence is keyed by the probed candidate's URI; a
-			// substitute must not inherit it.
-			if backfilled := applyRemuxDBEvidence(&transient, remuxMatches, origKey); backfilled != &transient {
-				transient = *backfilled
-				appliedRemux = true
-			}
-		}
-		allowDefer := allowDeferredProbe(
-			deferProbe,
-			remuxEnabled,
-			ev.MatchMethod,
-			localResolution,
-			cand.Resolution,
-			localCodec,
-			cand.CodecVideo,
-			ev.Resolution,
-			ev.CodecVideo,
-		)
+		allowDefer := allowDeferredProbe(deferProbe)
 		if substituted {
 			// The probed candidate's declared metadata is gone, so the deferred
 			// declared-metadata path cannot be trusted; probe the resolved URL
@@ -2675,7 +2653,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				}
 			}
 			return withResolvedCandidate(&resolvedVirtualPlaybackSource{
-				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenancePending, AppliedRemux: appliedRemux, ResolutionAssumed: resolutionAssumed,
+				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenancePending, ResolutionAssumed: resolutionAssumed,
 			}, resolvedIdentity, resolvedRematched), nil
 		}
 		if h.VirtualPlaybackSourceProber == nil && h.VirtualPlaybackSourceProberWithHeaders == nil {
@@ -2696,7 +2674,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			}
 			h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
 			return withResolvedCandidate(&resolvedVirtualPlaybackSource{
-				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenanceDeclared, AppliedRemux: appliedRemux, ResolutionAssumed: resolutionAssumed,
+				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenanceDeclared, ResolutionAssumed: resolutionAssumed,
 			}, resolvedIdentity, resolvedRematched), nil
 		}
 		probeKey := virtualProbeFailureKey(cand.URI, oid)
@@ -2718,7 +2696,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			}
 			h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
 			return withResolvedCandidate(&resolvedVirtualPlaybackSource{
-				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenanceFailed, AppliedRemux: appliedRemux, ResolutionAssumed: resolutionAssumed,
+				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenanceFailed, ResolutionAssumed: resolutionAssumed,
 			}, resolvedIdentity, resolvedRematched), nil
 		}
 		if virtualProbeFailures.recent(probeKey) {
@@ -2748,13 +2726,9 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		if !substituted {
 			if cached := h.virtualProbeFromCache(attemptCtx, file, streamURL, syncProbeFile, cand, oid); cached != nil {
 				trace.probeRan = true
-				empiricalDuration := cached.Duration
 				if transient.ID > 0 {
 					cached.ID = transient.ID
 					cached.MediaFolderID = transient.MediaFolderID
-				}
-				if empiricalDuration > 0 {
-					h.maybeSubmitRemuxDBEvidence(attemptCtx, cached, cand)
 				}
 				if transient.Duration > 0 && cached.Duration <= 0 {
 					cached.Duration = transient.Duration
@@ -2762,7 +2736,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				applyResolvedIdentity(cached, resolvedIdentity)
 				h.maybeTriggerSubtitleSearch(attemptCtx, cached, cand)
 				return withResolvedCandidate(&resolvedVirtualPlaybackSource{
-					URL: streamURL, URI: cand.URI, OwnerID: oid, File: cached, ProbeSucceeded: true, Provenance: ProbeProvenanceVerified, AppliedRemux: appliedRemux,
+					URL: streamURL, URI: cand.URI, OwnerID: oid, File: cached, ProbeSucceeded: true, Provenance: ProbeProvenanceVerified,
 				}, resolvedIdentity, resolvedRematched), nil
 			}
 		}
@@ -2778,13 +2752,9 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			return declaredFallback()
 		}
 		virtualProbeFailures.clear(probeKey)
-		empiricalDuration := probed.Duration
 		if transient.ID > 0 {
 			probed.ID = transient.ID
 			probed.MediaFolderID = transient.MediaFolderID
-		}
-		if empiricalDuration > 0 {
-			h.maybeSubmitRemuxDBEvidence(attemptCtx, probed, cand)
 		}
 		if transient.Duration > 0 && probed.Duration <= 0 {
 			probed.Duration = transient.Duration
@@ -2793,7 +2763,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		applyResolvedIdentity(probed, resolvedIdentity)
 		h.maybeTriggerSubtitleSearch(probeCtx, probed, cand)
 		return withResolvedCandidate(&resolvedVirtualPlaybackSource{
-			URL: streamURL, URI: cand.URI, OwnerID: oid, File: probed, ProbeSucceeded: true, Provenance: ProbeProvenanceVerified, AppliedRemux: appliedRemux,
+			URL: streamURL, URI: cand.URI, OwnerID: oid, File: probed, ProbeSucceeded: true, Provenance: ProbeProvenanceVerified,
 		}, resolvedIdentity, resolvedRematched), nil
 	}
 
@@ -2853,7 +2823,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			result.CandidateCount = len(candidates)
 			return *result, nil
 		}
-		if result.Provenance == ProbeProvenanceVerified || (!result.AppliedRemux && !result.ResolutionAssumed && h.VirtualPlaybackSourceProber == nil && h.VirtualPlaybackSourceProberWithHeaders == nil) {
+		if result.Provenance == ProbeProvenanceVerified || (!result.ResolutionAssumed && h.VirtualPlaybackSourceProber == nil && h.VirtualPlaybackSourceProberWithHeaders == nil) {
 			// Content ground truth: a probed duration wildly different from the
 			// catalog runtime means the provider handed us mislabeled content.
 			// Skip persisting its metadata onto this content's rows and rotate.
@@ -4493,6 +4463,69 @@ func (c *virtualRecoveryRelistCache) clear(key string) {
 // Tests may clear entries directly.
 var virtualRecoveryRelists = &virtualRecoveryRelistCache{marks: make(map[string]virtualRecoveryRelistMark)}
 
+// virtualEmptyListWindow suppresses a hot provider re-list after the provider
+// just answered empty. E02/E03 showed full ~3.5s listings repeating every few
+// seconds with count=0: each episode is a distinct resolver key, so the
+// resolver's own 2m negative cache never shares, and the primary start-path
+// list has no damper (only recovery paths consume virtualRecoveryRelists).
+// This damper is start-path only and never blocks recovery or a forced relist.
+const virtualEmptyListWindow = 30 * time.Second
+
+// virtualEmptyListMarks remembers the last empty provider answer per listing:
+// the neutral virtual path plus owning installation, same identity as
+// virtualRecoveryRelistKey.
+var virtualEmptyListMarks = struct {
+	sync.Mutex
+	marks map[string]time.Time
+}{marks: make(map[string]time.Time)}
+
+// virtualEmptyListSuppressed reports whether key answered empty inside the
+// window. Expired entries are dropped on read so the map stays bounded.
+func virtualEmptyListSuppressed(key string, now time.Time) bool {
+	if key == "" {
+		return false
+	}
+	virtualEmptyListMarks.Lock()
+	defer virtualEmptyListMarks.Unlock()
+	last, ok := virtualEmptyListMarks.marks[key]
+	if !ok {
+		return false
+	}
+	if now.Sub(last) < virtualEmptyListWindow {
+		return true
+	}
+	delete(virtualEmptyListMarks.marks, key)
+	return false
+}
+
+// virtualEmptyListRecord remembers an empty answer at now.
+func virtualEmptyListRecord(key string, now time.Time) {
+	if key == "" {
+		return
+	}
+	virtualEmptyListMarks.Lock()
+	if len(virtualEmptyListMarks.marks) >= virtualRecoveryRelistMaxEntries {
+		for k, t := range virtualEmptyListMarks.marks {
+			if now.Sub(t) >= virtualEmptyListWindow {
+				delete(virtualEmptyListMarks.marks, k)
+			}
+		}
+	}
+	virtualEmptyListMarks.marks[key] = now
+	virtualEmptyListMarks.Unlock()
+}
+
+// virtualEmptyListClear drops the suppression after a listing answered with
+// candidates, so a recovered provider is immediately listable again.
+func virtualEmptyListClear(key string) {
+	if key == "" {
+		return
+	}
+	virtualEmptyListMarks.Lock()
+	delete(virtualEmptyListMarks.marks, key)
+	virtualEmptyListMarks.Unlock()
+}
+
 // virtualRecoveryRelistKey names one provider listing for the recovery damper:
 // the provider-neutral virtual path plus the owning installation, matching the
 // identity the stale fallback lists under.
@@ -5432,312 +5465,10 @@ func (h *PlaybackHandler) maybeTriggerSubtitleSearch(
 	}()
 }
 
-const (
-	remuxDBFetchBudget  = 3 * time.Second
-	remuxDBCacheBudget  = 500 * time.Millisecond
-	remuxDBConfigBudget = 1 * time.Second
-)
-
 // allowDeferredProbe reports whether the virtual probe may be pushed to the
-// background. With RemuxDB disabled it follows the caller's deferProbe flag
-// exactly (the pre-RemuxDB behavior); when RemuxDB is enabled it additionally
-// requires resolution and codec evidence so a deferred probe starts with
-// meaningful metadata confidence. Loose RemuxDB matches (1% size variance or
-// filename stem) are unverified guesses and must not allow probe deferral
-// without local catalog or candidate declarations.
-func allowDeferredProbe(
-	deferProbe bool,
-	remuxEnabled bool,
-	matchMethod remuxdb.MatchMethod,
-	localResolution string,
-	candResolution string,
-	localCodec string,
-	candCodec string,
-	remuxResolution string,
-	remuxCodec string,
-) bool {
-	if !deferProbe {
-		return false
-	}
-	if !remuxEnabled {
-		return true
-	}
-	isLoose := matchMethod == remuxdb.MatchSizeTags || matchMethod == remuxdb.MatchFilename
-	res := localResolution
-	if res == "" {
-		res = candResolution
-	}
-	if !isLoose && res == "" {
-		res = remuxResolution
-	}
-
-	codec := localCodec
-	if codec == "" {
-		codec = candCodec
-	}
-	if !isLoose && codec == "" {
-		codec = remuxCodec
-	}
-
-	return res != "" && codec != ""
-}
-
-// remuxEvidenceKey returns a stable key identifying one concrete provider
-// release within a virtual URI. The key keeps only the scheme/host/path plus
-// the single "result" pick so profile ordering and other query params cannot
-// make the same release key differently between match and apply time.
-func remuxEvidenceKey(candidateURI string) string {
-	parsed, err := url.Parse(candidateURI)
-	if err != nil {
-		return virtualPlaybackNeutralKey(candidateURI)
-	}
-	result := strings.TrimSpace(parsed.Query().Get("result"))
-	if result == "" {
-		return virtualPlaybackNeutralKey(candidateURI)
-	}
-	parsed.RawQuery = ""
-	parsed.Fragment = ""
-	return parsed.String() + "?" + url.Values{"result": []string{result}}.Encode()
-}
-
-func remuxHintForCandidate(file *models.MediaFile, cand VirtualPlaybackStream) remuxdb.MatchHint {
-	size := cand.FileSize
-	resolution := cand.Resolution
-	codecVideo := cand.CodecVideo
-	hdrKnown := false
-	hdr := false
-	sameRelease := file != nil && (file.FilePath == cand.URI || (cand.ID != "" && virtualResultCandidateID(file.FilePath) == cand.ID))
-	if file != nil && sameRelease {
-		if size <= 0 {
-			size = file.FileSize
-		}
-		if resolution == "" {
-			resolution = file.Resolution
-		}
-		if codecVideo == "" {
-			codecVideo = file.CodecVideo
-		}
-		if len(file.VideoTracks) > 0 {
-			hdrKnown = true
-			hdr = file.HDR
-		}
-	}
-	if cand.HDR != "" {
-		hdrKnown = true
-		hdr = true
-	}
-	filename := strings.TrimSpace(cand.Label)
-	if filename == "" && sameRelease {
-		filename = strings.TrimSpace(file.ReleaseName)
-	}
-	infoHash := ""
-	indexerGUID := ""
-	indexer := ""
-	if cand.URI != "" {
-		if parsed, err := url.Parse(cand.URI); err == nil {
-			if h := strings.TrimSpace(parsed.Query().Get("hash")); len(h) == 40 && isHexString(h) {
-				infoHash = h
-			} else if h := strings.TrimSpace(parsed.Query().Get("info_hash")); len(h) == 40 && isHexString(h) {
-				infoHash = h
-			}
-			if g := strings.TrimSpace(parsed.Query().Get("guid")); g != "" {
-				indexerGUID = g
-			} else if g := strings.TrimSpace(parsed.Query().Get("indexer_guid")); g != "" {
-				indexerGUID = g
-			}
-			if idx := strings.TrimSpace(parsed.Query().Get("indexer")); idx != "" {
-				indexer = idx
-			}
-		}
-	}
-	hint := remuxdb.HintFromCandidate(infoHash, nil, size, filename, resolution, codecVideo, hdrKnown, hdr)
-	hint.IndexerGUID = indexerGUID
-	hint.Indexer = indexer
-	return hint
-}
-
-func isHexString(s string) bool {
-	if s == "" {
-		return false
-	}
-	for _, c := range s {
-		if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
-			return false
-		}
-	}
-	return true
-}
-
-func (h *PlaybackHandler) matchRemuxDBCandidates(ctx context.Context, file *models.MediaFile, candidates []VirtualPlaybackStream) (map[string]remuxdb.Evidence, bool) {
-	matched := map[string]remuxdb.Evidence{}
-	if h == nil || file == nil || len(candidates) == 0 {
-		return matched, false
-	}
-	cfg := remuxdb.DefaultConfig()
-	if h.RemuxDBConfig != nil {
-		// Config load reads several settings rows; keep it bounded so a slow
-		// settings store cannot delay playback start. DefaultConfig disables
-		// RemuxDB, so a timeout fails closed.
-		cfgCtx, cfgCancel := context.WithTimeout(ctx, remuxDBConfigBudget)
-		cfg = h.RemuxDBConfig(cfgCtx)
-		if cfgCtx.Err() != nil {
-			cfg = remuxdb.DefaultConfig()
-		}
-		cfgCancel()
-	}
-	if !cfg.Enabled {
-		return matched, false
-	}
-	imdbID := remuxdb.ExtractIMDbID(file.ContentID)
-	if imdbID == "" {
-		imdbID = remuxdb.ExtractIMDbID(file.FilePath)
-	}
-	if imdbID == "" {
-		return matched, true
-	}
-	var seasonPtr, episodePtr *int
-	if file.SeasonNumber > 0 {
-		seasonPtr = &file.SeasonNumber
-	}
-	if file.EpisodeNumber > 0 {
-		episodePtr = &file.EpisodeNumber
-	}
-	type pendingCandidate struct {
-		key  string
-		hint remuxdb.MatchHint
-	}
-	// Cache reads get their own short budget, separate from the network fetch
-	// budget below so a slow store cannot starve the HTTP request.
-	cacheCtx, cacheCancel := context.WithTimeout(ctx, remuxDBCacheBudget)
-	defer cacheCancel()
-
-	pending := make([]pendingCandidate, 0, len(candidates))
-	for _, cand := range candidates {
-		key := remuxEvidenceKey(cand.URI)
-		if key == "" {
-			continue
-		}
-		if _, dup := matched[key]; dup {
-			continue
-		}
-		if h.RemuxDBStore != nil {
-			if ev, ok, err := h.RemuxDBStore.Get(cacheCtx, file.ContentID, file.EpisodeID, file.MediaFolderID, key); err == nil && ok && len(ev.VideoTracks) > 0 {
-				matched[key] = ev
-				continue
-			}
-		}
-		pending = append(pending, pendingCandidate{key: key, hint: remuxHintForCandidate(file, cand)})
-	}
-	if len(pending) == 0 {
-		return matched, true
-	}
-	fetchCtx, fetchCancel := context.WithTimeout(ctx, remuxDBFetchBudget)
-	defer fetchCancel()
-	client := remuxdb.NewClient(cfg.BaseURL, cfg.Token)
-	versions, err := client.FetchProbe(fetchCtx, imdbID, seasonPtr, episodePtr)
-	slog.InfoContext(fetchCtx, "remuxdb match candidates", "component", "api", "imdb_id", imdbID, "pending", len(pending), "versions", len(versions), "error", err)
-	if err != nil || len(versions) == 0 {
-		return matched, true
-	}
-	for _, p := range pending {
-		variant, method := remuxdb.MatchVariant(versions, p.hint)
-		if variant == nil {
-			continue
-		}
-		slog.InfoContext(fetchCtx, "remuxdb candidate matched", "component", "api", "key", p.key, "method", method)
-		ev := remuxdb.EvidenceFromVariant(file.ContentID, file.EpisodeID, file.MediaFolderID, p.key, method, variant)
-		matched[p.key] = ev
-		if h.RemuxDBStore != nil {
-			if recErr := h.RemuxDBStore.Record(fetchCtx, ev); recErr != nil {
-				slog.WarnContext(fetchCtx, "remuxdb store record failed", "component", "api", "key", p.key, "error", recErr)
-			}
-		}
-	}
-	slog.InfoContext(fetchCtx, "remuxdb match complete", "component", "api", "imdb_id", imdbID, "matched", len(matched))
-	return matched, true
-}
-
-type remuxSubmitTask struct {
-	payload remuxdb.SubmissionPayload
-	baseURL string
-	token   string
-}
-
-const (
-	remuxSubmitQueueSize = 64
-	remuxSubmitWorkers   = 2
-)
-
-func (h *PlaybackHandler) maybeSubmitRemuxDBEvidence(ctx context.Context, probed *models.MediaFile, cand VirtualPlaybackStream) {
-	if h == nil || probed == nil {
-		return
-	}
-	cfg := remuxdb.DefaultConfig()
-	if h.RemuxDBConfig != nil {
-		cfg = h.RemuxDBConfig(ctx)
-	}
-	if !cfg.Enabled || !cfg.SubmitEnabled || strings.TrimSpace(cfg.Token) == "" {
-		return
-	}
-	hint := remuxHintForCandidate(probed, cand)
-	if hint.InfoHash == "" && hint.IndexerGUID == "" {
-		return
-	}
-	var nzb *remuxdb.NzbSubmission
-	if hint.IndexerGUID != "" {
-		nzb = &remuxdb.NzbSubmission{
-			Indexer:     hint.Indexer,
-			IndexerGUID: hint.IndexerGUID,
-			Title:       hint.Filename,
-		}
-	}
-	payload, ok := remuxdb.BuildSubmission(probed, hint.Filename, hint.InfoHash, nzb)
-	if !ok {
-		return
-	}
-	h.remuxSubmitOnce.Do(func() {
-		h.remuxSubmitCh = make(chan remuxSubmitTask, remuxSubmitQueueSize)
-		for range remuxSubmitWorkers {
-			go func() {
-				for task := range h.remuxSubmitCh {
-					submitCtx, cancel := h.virtualDetachedContext(h.ServiceContext, 10*time.Second)
-					client := remuxdb.NewClient(task.baseURL, task.token)
-					if err := client.SubmitProbe(submitCtx, task.payload); err != nil {
-						slog.DebugContext(submitCtx, "remuxdb probe submission failed", "component", "api", "filename", task.payload.Filename, "error", err)
-					} else {
-						slog.InfoContext(submitCtx, "remuxdb probe submitted", "component", "api", "filename", task.payload.Filename, "kind", task.payload.Kind)
-					}
-					cancel()
-				}
-			}()
-		}
-	})
-	task := remuxSubmitTask{
-		payload: payload,
-		baseURL: cfg.BaseURL,
-		token:   cfg.Token,
-	}
-	select {
-	case h.remuxSubmitCh <- task:
-	default:
-		slog.WarnContext(ctx, "remuxdb submission queue full; dropping probe submission",
-			"component", "api", "filename", payload.Filename)
-	}
-}
-
-func applyRemuxDBEvidence(file *models.MediaFile, matched map[string]remuxdb.Evidence, key string) *models.MediaFile {
-	if file == nil || len(matched) == 0 {
-		return file
-	}
-	ev, ok := matched[key]
-	if !ok || len(ev.VideoTracks) == 0 {
-		return file
-	}
-	out := *file
-	if remuxdb.ApplyEvidence(ev, &out) {
-		return &out
-	}
-	return file
+// background. It follows the caller's deferProbe flag exactly.
+func allowDeferredProbe(deferProbe bool) bool {
+	return deferProbe
 }
 
 // mergeVirtualCandidateTracks supplements probed virtual file tracks with
