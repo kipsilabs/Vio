@@ -659,6 +659,49 @@ func releaseSizesAgree(a, b int64) bool {
 	return float64(diff)/float64(largest) <= persistedNameSizeDrift
 }
 
+// PersistedIdentitiesMatch reports whether two persisted candidate identities
+// name the same release, comparing compatible tiers symmetrically rather than
+// by a single strongest-tier key.
+//
+// A strongest-tier key cannot answer this: a name-only row keys as name+size
+// while a GUID- or hash-carrying row keys in that stronger tier, so two rows
+// of one release that carry different tiers produce different keys and would
+// be read as distinct releases. This per-tier comparison instead:
+//
+//   - Vetos a tier both sides carry that disagrees (two different hashes or
+//     GUIDs are proof of different releases).
+//   - Matches on any tier both sides carry that agrees (the strongest such
+//     tier is returned for logging).
+//   - Matches on the name tier only when both sides carry the same normalized
+//     release name and their sizes plausibly agree, so a name coincidence does
+//     not merge distinct releases.
+//
+// This is the symmetric sibling of SharedTier, which is deliberately
+// asymmetric because it decides whether a fresh candidate may re-identify the
+// viewer's persisted row. This predicate answers a different question — "are
+// these two catalog rows the same release?" — so both sides are authoritative
+// and a tier absent from one side is neutral in both directions. An identity
+// with every tier empty never matches, so identity-less rows are never merged.
+func PersistedIdentitiesMatch(a, b PersistedIdentityTiers) (string, bool) {
+	if a.VideoHash != "" && b.VideoHash != "" && a.VideoHash != b.VideoHash {
+		return "", false
+	}
+	if a.GUID != "" && b.GUID != "" && a.GUID != b.GUID {
+		return "", false
+	}
+	if a.VideoHash != "" && b.VideoHash != "" {
+		return "video_hash", true
+	}
+	if a.GUID != "" && b.GUID != "" {
+		return "guid", true
+	}
+	if a.ReleaseName != "" && b.ReleaseName != "" && a.ReleaseName == b.ReleaseName &&
+		releaseSizesAgree(a.ReleaseSize, b.ReleaseSize) {
+		return "release_name", true
+	}
+	return "", false
+}
+
 // persistedNameSizeDrift is the tolerated relative size difference on the name
 // tier, matching the ≤10% width the provider classifiers already use so a
 // rounded display size does not miss a renumbered release.

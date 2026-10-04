@@ -172,3 +172,57 @@ func TestMatchCandidateByPersistedIdentityReportDistinguishesMismatch(t *testing
 		t.Fatalf("matched tier = %q, want release_name", report.Tier)
 	}
 }
+
+// TestPersistedIdentitiesMatchSymmetricTiers pins the symmetric predicate the
+// duplicate-rotation guard uses: two persisted rows are the same release when a
+// non-empty tier they both carry agrees, even when their strongest tiers differ.
+// A strongest-tier key cannot see this, so a name-only row and a GUID row of one
+// release would be read as distinct.
+func TestPersistedIdentitiesMatchSymmetricTiers(t *testing.T) {
+	nameOnly := NewPersistedIdentityTiers("", "", "Movie.2024.1080p", 8_000_000_000)
+	guidRow := NewPersistedIdentityTiers("", "guid-1", "Movie.2024.1080p", 8_000_000_000)
+	hashRow := NewPersistedIdentityTiers("hash-1", "", "Movie.2024.1080p", 8_000_000_000)
+
+	if _, ok := PersistedIdentitiesMatch(nameOnly, guidRow); !ok {
+		t.Fatal("name-only row did not share the release with a name+guid row")
+	}
+	if _, ok := PersistedIdentitiesMatch(nameOnly, hashRow); !ok {
+		t.Fatal("name-only row did not share the release with a name+hash row")
+	}
+
+	// A tier both sides carry that disagrees is a veto.
+	otherHash := NewPersistedIdentityTiers("hash-2", "", "Movie.2024.1080p", 8_000_000_000)
+	if _, ok := PersistedIdentitiesMatch(hashRow, otherHash); ok {
+		t.Fatal("two different hashes compared equal")
+	}
+	guidA := NewPersistedIdentityTiers("", "guid-a", "Movie.2024.1080p", 8_000_000_000)
+	guidB := NewPersistedIdentityTiers("", "guid-b", "Movie.2024.1080p", 8_000_000_000)
+	if _, ok := PersistedIdentitiesMatch(guidA, guidB); ok {
+		t.Fatal("two different GUIDs merged on a matching name+size")
+	}
+	// A hash on one side and a GUID on the other is not proof either: the tiers
+	// are disjoint (use bare rows with no shared name).
+	bareHash := NewPersistedIdentityTiers("hash-9", "", "", 0)
+	bareGUID := NewPersistedIdentityTiers("", "guid-9", "", 0)
+	if _, ok := PersistedIdentitiesMatch(bareHash, bareGUID); ok {
+		t.Fatal("a hash row and a GUID row compared equal with no shared tier")
+	}
+
+	// Disjoint tiers (a name-only row against a bare GUID row) are not proof.
+	if _, ok := PersistedIdentitiesMatch(nameOnly, NewPersistedIdentityTiers("", "guid-2", "", 0)); ok {
+		t.Fatal("disjoint tiers compared equal")
+	}
+
+	// An identity with no tier at all is never proof.
+	if _, ok := PersistedIdentitiesMatch(NewPersistedIdentityTiers("", "", "", 0), nameOnly); ok {
+		t.Fatal("an empty identity matched")
+	}
+
+	// The name tier still requires plausible size agreement.
+	if _, ok := PersistedIdentitiesMatch(
+		NewPersistedIdentityTiers("", "", "Movie.2024.1080p", 8_000_000_000),
+		NewPersistedIdentityTiers("", "guid-1", "Movie.2024.1080p", 4_000_000_000),
+	); ok {
+		t.Fatal("a half-size release matched on the name tier")
+	}
+}

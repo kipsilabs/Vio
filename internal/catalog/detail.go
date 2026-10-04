@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net/url"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -4154,9 +4153,14 @@ func versionAvailability(f *models.MediaFile) *bool {
 // let a later serve pick the wrong sibling row.
 //
 // Two rules:
-//   - A byte-identical duplicate (same content, same size, same candidate URI)
-//     collapses to the first occurrence; the order within the list is
-//     preserved otherwise.
+//   - A probed row collapses a later probed row that shares its provider-neutral
+//     candidate URI (every concrete `result=` pick stripped), its declared size
+//     and a non-conflicting durable provider identity. A provider re-list churns
+//     result ids for one release, so the probe stamp alone must not make a
+//     re-listed duplicate escape the collapse: without the neutral path the same
+//     release lists once per renumbering. A distinct declared size or a
+//     conflicting identity tier stays a genuine version distinction. The order
+//     within the list is preserved otherwise.
 //   - An unprobed virtual row collapses only onto a probed row for the same
 //     neutral release (same content, result= stripped) that is positively the
 //     same release: the unprobed row is a size-unknown placeholder (no stored
@@ -4164,11 +4168,15 @@ func versionAvailability(f *models.MediaFile) *bool {
 //     durable provider identity tier (video hash, GUID, release name) the two
 //     both carry disagrees. A concrete unprobed alternate release — a distinct
 //     size or a distinct durable identity — is kept, so it stays selectable. A
-//     placeholder with no probed copy is kept too.
+//     placeholder with no probed copy is kept too. Unprobed rows also collapse
+//     byte-identically among themselves.
 //
 // The concrete `result=` pick is deliberately not part of the identity test:
 // the neutral key strips it precisely because a provider re-list churns result
-// ids for one release, so a rotated sibling would otherwise never collapse.
+// ids for one release, so a rotated sibling would otherwise never collapse. The
+// neutral path is neutralVirtualMediaPath, the same predicate the catalog's SQL
+// adoption uses, so the Go collapse and the persisted-row matching cannot
+// diverge on what counts as one neutral release.
 //
 // Local files are never collapsed: their on-disk paths are already distinct, and
 // a same-path collision is not the virtual duplicate this addresses.
@@ -4186,9 +4194,23 @@ func collapseDuplicateVirtualVersionFiles(files []*models.MediaFile) []*models.M
 		}
 	}
 	out := make([]*models.MediaFile, 0, len(files))
+	keptProbedByNeutral := make(map[string][]*models.MediaFile)
 	seenExact := make(map[string]struct{})
 	for _, f := range files {
 		if f == nil {
+			continue
+		}
+		if f.ProbeUpdatedAt != nil {
+			key := virtualNeutralReleaseKey(f)
+			if key == "" {
+				out = append(out, f)
+				continue
+			}
+			if probedCollapsesAgainstProbedRelease(f, keptProbedByNeutral[key]) {
+				continue
+			}
+			keptProbedByNeutral[key] = append(keptProbedByNeutral[key], f)
+			out = append(out, f)
 			continue
 		}
 		exact := virtualExactReleaseKey(f)
@@ -4199,15 +4221,38 @@ func collapseDuplicateVirtualVersionFiles(files []*models.MediaFile) []*models.M
 		if _, ok := seenExact[exact]; ok {
 			continue
 		}
-		if f.ProbeUpdatedAt == nil {
-			if unprobedCollapsesAgainstProbedRelease(f, probedNeutral[virtualNeutralReleaseKey(f)]) {
-				continue
-			}
+		if unprobedCollapsesAgainstProbedRelease(f, probedNeutral[virtualNeutralReleaseKey(f)]) {
+			continue
 		}
 		seenExact[exact] = struct{}{}
 		out = append(out, f)
 	}
 	return out
+}
+
+// probedCollapsesAgainstProbedRelease reports whether a probed virtual row is a
+// renumbering duplicate of an already-kept probed row: same provider-neutral
+// release, same declared size, and no conflicting durable provider identity. A
+// distinct size or a conflicting identity tier is a genuine version and keeps
+// the row.
+func probedCollapsesAgainstProbedRelease(f *models.MediaFile, kept []*models.MediaFile) bool {
+	if f == nil {
+		return false
+	}
+	size := virtualDeclaredProviderSize(f)
+	for _, k := range kept {
+		if k == nil {
+			continue
+		}
+		if size != virtualDeclaredProviderSize(k) {
+			continue
+		}
+		if virtualProviderIdentityConflicts(f, k) {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 // unprobedCollapsesAgainstProbedRelease reports whether an unprobed virtual
@@ -4274,9 +4319,9 @@ func providerIdentityTierConflicts(a, b string) bool {
 	return a != "" && b != "" && a != b
 }
 
-// virtualExactReleaseKey identifies a virtual row's exact release identity for
-// duplicate collapse: content, size and the concrete candidate URI. Local files
-// return "", so they are never part of the virtual dedup.
+// virtualExactReleaseKey identifies an unprobed virtual row's exact release
+// identity for duplicate collapse: content, size and the concrete candidate
+// URI. Local files return "", so they are never part of the virtual dedup.
 func virtualExactReleaseKey(f *models.MediaFile) string {
 	if f == nil || !isVirtualMediaFile(f) {
 		return ""
@@ -4288,31 +4333,15 @@ func virtualExactReleaseKey(f *models.MediaFile) string {
 // content and the candidate URI with any concrete result= pick stripped. Size is
 // deliberately excluded: an unprobed collection placeholder is stored with size
 // 0 while the probed copy of the same release carries the real size, and the
-// placeholder must still collapse against that probed copy. Local files return
-// "".
+// placeholder must still collapse against that probed copy. The neutral path is
+// neutralVirtualMediaPath, the shared predicate the catalog's SQL row adoption
+// also uses, so the Go collapse and the persisted-row matching cannot diverge.
+// Local files return "".
 func virtualNeutralReleaseKey(f *models.MediaFile) string {
 	if f == nil || !isVirtualMediaFile(f) {
 		return ""
 	}
-	return f.ContentID + "\x00" + neutralVirtualVersionPath(f.FilePath)
-}
-
-// neutralVirtualVersionPath removes a concrete result= pick from a virtual path
-// while preserving every other query parameter (including the quality profile=
-// selection, so distinct profile variants stay distinct). A path that fails to
-// parse is returned unchanged.
-func neutralVirtualVersionPath(virtualPath string) string {
-	parsed, err := url.Parse(virtualPath)
-	if err != nil {
-		return virtualPath
-	}
-	q := parsed.Query()
-	if strings.TrimSpace(q.Get("result")) == "" {
-		return virtualPath
-	}
-	q.Del("result")
-	parsed.RawQuery = q.Encode()
-	return parsed.String()
+	return f.ContentID + "\x00" + neutralVirtualMediaPath(f.FilePath)
 }
 
 func (s *DetailService) buildPlaybackInfo(

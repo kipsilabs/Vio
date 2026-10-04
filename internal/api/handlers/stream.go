@@ -856,7 +856,8 @@ func bindSessionVirtualSourceWithTracks(ctx context.Context, file *models.MediaF
 	// selected. Absent evidence (the flag unset) is the only case with nothing
 	// to apply, and the only case the live row may speak for.
 	hasEvidence := session.VirtualSubtitleEvidenceSet
-	if hasEvidence && !virtualEvidenceMatchesBoundFile(bound, session) {
+	evidenceRejected := hasEvidence && !virtualEvidenceMatchesBoundFile(bound, session)
+	if evidenceRejected {
 		slog.WarnContext(ctx, "virtual session track evidence belongs to a different candidate; using the bound file's tracks",
 			"component", "api",
 			"session", session.ID,
@@ -892,6 +893,23 @@ func bindSessionVirtualSourceWithTracks(ctx context.Context, file *models.MediaF
 		}
 	}
 	if candidate != nil && hasUsableSubtitleTracks(candidate) {
+		if evidenceRejected && (bound.ID <= 0 || candidate.ID != bound.ID) {
+			// The session carried evidence for a specific catalog row and the
+			// bound row is not that row: the evidence was rejected as a
+			// cross-row mismatch. The URI-only fallback must not reauthorize the
+			// rejected row (or any other row that merely shares the candidate
+			// URI) — doing so is the exact bypass this guard exists to stop.
+			// Only the bound row's own declared inventory may speak for it; an
+			// unknown bound row (id 0) cannot be confirmed and fails closed too.
+			slog.WarnContext(ctx, "virtual session fallback refused a rejected evidence row; serving the bound row's own inventory",
+				"component", "api",
+				"session", session.ID,
+				"file_id", file.ID,
+				"evidence_file_id", session.VirtualSubtitleEvidenceFileID,
+				"candidate_file_id", candidate.ID,
+				"file_path", bound.FilePath)
+			return bound
+		}
 		boundCopy := *bound
 		boundCopy.SubtitleTracks = candidate.SubtitleTracks
 		if len(boundCopy.ExternalSubtitles) == 0 {

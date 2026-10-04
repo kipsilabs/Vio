@@ -209,3 +209,164 @@ func TestRefusedProbePublishSkipsSiblingRowSharingURI(t *testing.T) {
 		t.Fatalf("delivered %d events to the sibling row, want 0", len(conn.messages))
 	}
 }
+
+// TestRefusedProbeInventoryFileRejectsUnknownBoundRow pins the zero-ID guard:
+// a session whose effective catalog row is unknown (id 0) cannot be confirmed as
+// the row the probe came from, so it must not receive the in-memory override,
+// even though its requested row and virtual URI match. This mirrors the
+// serving-path rule that rejects a known evidence row against an unknown bound
+// row.
+func TestRefusedProbeInventoryFileRejectsUnknownBoundRow(t *testing.T) {
+	candidateURI := "virtual://movie/dup-zero?result=a"
+	requestedRow := &models.MediaFile{ID: 11, ContentID: "movie-dup-zero", FilePath: candidateURI}
+	probed := &models.MediaFile{
+		AudioTracks:    []models.AudioTrack{{Codec: "eac3", Channels: 6, Language: "eng"}},
+		SubtitleTracks: []models.SubtitleTrack{{Index: 1, Codec: "subrip", Language: "eng"}},
+	}
+	h := NewPlaybackHandler(playback.NewSessionManager(0, 0), mapPlaybackFileResolver{files: map[int]*models.MediaFile{11: requestedRow}})
+
+	unknown := &playback.Session{ID: "s-zero", MediaFileID: 0, VirtualSourceURI: candidateURI}
+	if override := h.refusedProbeInventoryFile(context.Background(), unknown, 0, candidateURI, probed); override != nil {
+		t.Fatalf("unknown bound row received probed inventory: %+v", override)
+	}
+
+	// A known effective row with a row-id-less caller keeps the historical
+	// URI-only path.
+	known := &playback.Session{ID: "s-known", MediaFileID: 11, VirtualSourceURI: candidateURI}
+	if override := h.refusedProbeInventoryFile(context.Background(), known, 0, candidateURI, probed); override == nil {
+		t.Fatal("known effective row lost the historical URI-only override")
+	}
+}
+
+// TestRefusedProbePublishSkipsUnknownEffectiveRow proves the push fan-out does
+// not deliver a probe's tracks to a session whose effective catalog row is
+// unknown: it is enumerated by its requested row, but it carries no identity to
+// confirm against the probed row.
+func TestRefusedProbePublishSkipsUnknownEffectiveRow(t *testing.T) {
+	candidateURI := "virtual://movie/dup-push-zero?result=a"
+	requestedRow := &models.MediaFile{ID: 11, ContentID: "movie-dup-push-zero", FilePath: candidateURI}
+	probed := &models.MediaFile{
+		AudioTracks: []models.AudioTrack{{Codec: "eac3", Channels: 6, Language: "eng"}},
+	}
+
+	mgr := playback.NewSessionManager(0, 0)
+	// Effective row unknown (0); the requested row makes it enumerable.
+	session, err := mgr.StartSessionWithFiles(1, "profile-1", 0, requestedRow.ID, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("StartSessionWithFiles: %v", err)
+	}
+	if err := mgr.SetVirtualSource(session.ID, candidateURI, 5); err != nil {
+		t.Fatalf("SetVirtualSource: %v", err)
+	}
+
+	h := NewPlaybackHandler(mgr, mapPlaybackFileResolver{files: map[int]*models.MediaFile{11: requestedRow}})
+	h.RealtimeHub = playback.NewRealtimeHub()
+	if err := mgr.SetRealtimeConnection(session.ID, true); err != nil {
+		t.Fatalf("SetRealtimeConnection: %v", err)
+	}
+	conn := &sourceCommittedTestConn{}
+	registration := h.RealtimeHub.Register(session.ID, conn)
+	if registration == nil {
+		t.Fatal("expected a realtime registration")
+	}
+	defer h.RealtimeHub.Unregister(registration)
+
+	if notified := h.publishRefusedProbeInventory(context.Background(), requestedRow.ID, candidateURI, probed); notified != 0 {
+		t.Fatalf("notified %d sessions, want 0: an unknown effective row must not receive probed tracks", notified)
+	}
+	if len(conn.messages) != 0 {
+		t.Fatalf("delivered %d events to the unknown-row session, want 0", len(conn.messages))
+	}
+}
+
+// TestProbeRotatedVirtualCandidateRefreshesReplacement proves the post-rotation
+// refresh: once a serve-layer rotation commits a replacement binding, the
+// replacement is re-resolved and probed so its verified evidence lands without a
+// replan. A rotation that moves the binding again before the probe runs is
+// fenced out, so a probe can never be applied to a superseded candidate.
+func TestProbeRotatedVirtualCandidateRefreshesReplacement(t *testing.T) {
+	const (
+		neutral = "virtual://movie/tt-post-rot"
+		oldURI  = neutral + "?result=cand-a"
+		newURI  = neutral + "?result=cand-b"
+	)
+
+	mgr := playback.NewSessionManager(0, 0)
+	session, err := mgr.StartSession(1, "profile-1", 42, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	if err := mgr.UpdateStreamState(session.ID, playback.SessionStreamState{
+		VirtualSourceSet:              true,
+		VirtualSourceOwnershipSet:     true,
+		VirtualSourceURI:              oldURI,
+		VirtualSourceRevision:         "rev-a",
+		VirtualSubtitleEvidenceSet:    true,
+		VirtualSubtitleEvidenceURI:    oldURI,
+		VirtualSubtitleEvidenceFileID: 42,
+		VirtualSubtitleTracks:         []models.SubtitleTrack{{Index: 1, Codec: "subrip", Language: "eng"}},
+	}); err != nil {
+		t.Fatalf("UpdateStreamState: %v", err)
+	}
+	// The rotation moves the binding to the replacement and clears the revision,
+	// leaving the evidence anchored at the old candidate: the recorded-rotation
+	// signal the refresh keys on.
+	if err := mgr.SetVirtualSource(session.ID, newURI, 5); err != nil {
+		t.Fatalf("SetVirtualSource: %v", err)
+	}
+	rotated, err := mgr.GetSession(session.ID)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+
+	file := &models.MediaFile{
+		ID: 42, ContentID: "movie-post-rot", FilePath: newURI,
+		Container: "virtual", VirtualOwnerInstallationID: 5,
+	}
+	if !virtualCandidateRotationRecordedV3(rotated, file) {
+		t.Fatal("rotation was not recorded")
+	}
+
+	var resolvedPath string
+	probed := false
+	h := NewPlaybackHandler(mgr, testPlaybackFileResolver{file: file})
+	h.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(_ context.Context, uri string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+		resolvedPath = uri
+		return ResolvedVirtualMedia{
+			URL: "http://127.0.0.1:9/replacement", URI: newURI, CandidateID: "cand-b", IdentityRematched: true,
+		}, nil
+	})
+	h.VirtualPlaybackSourceProber = func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
+		probed = true
+		f.AudioTracks = []models.AudioTrack{{Codec: "eac3", Channels: 6, Language: "eng"}}
+		return f, nil
+	}
+
+	generation, ok := h.inventorySourceGeneration(session.ID)
+	if !ok {
+		t.Fatal("session manager did not expose a binding generation")
+	}
+	if !h.probeRotatedVirtualCandidate(context.Background(), rotated, file, generation) {
+		t.Fatal("rotation refresh did not probe the replacement")
+	}
+	if resolvedPath != newURI {
+		t.Fatalf("re-resolved %q, want the rotated replacement %q", resolvedPath, newURI)
+	}
+	if !probed {
+		t.Fatal("replacement was not probed after rotation")
+	}
+
+	// A newer rotation moves the binding again before this probe runs: the
+	// stale generation is fenced out and no probe is spent on a superseded
+	// candidate, keeping the gate fail-closed for the new binding.
+	if err := mgr.SetVirtualSource(session.ID, neutral+"?result=cand-c", 5); err != nil {
+		t.Fatalf("second SetVirtualSource: %v", err)
+	}
+	probed = false
+	if h.probeRotatedVirtualCandidate(context.Background(), rotated, file, generation) {
+		t.Fatal("a superseded generation still probed")
+	}
+	if probed {
+		t.Fatal("a superseded generation spent a probe")
+	}
+}

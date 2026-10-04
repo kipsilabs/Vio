@@ -3932,11 +3932,10 @@ func (h *PlaybackHandler) virtualProbeEvidenceRotateTarget(ctx context.Context, 
 
 // virtualSiblingOwnerSharesRelease reports whether a sibling owner row
 // verifiably carries the same release as the requested row, judged by the
-// durable provider identity in the same strongest-tier precedence the
-// deduplication chain uses (video hash, then source GUID, then normalized
-// release name plus exact size). Two rows are the same release only when both
-// carry a usable identity tier and their strongest tiers compare equal; a row
-// with no durable identity is not proof.
+// durable provider identity compared tier-by-tier (video hash, then source
+// GUID, then normalized release name plus a plausibly-equal size). Two rows are
+// the same release only when a non-empty tier they both carry agrees; an
+// identity-less row is not proof.
 //
 // It exists to keep the owner-row rotation from silently repainting a duplicate
 // row of the same release with the requested row's inventory. Distinct rows of
@@ -3944,16 +3943,21 @@ func (h *PlaybackHandler) virtualProbeEvidenceRotateTarget(ctx context.Context, 
 // apart; only the durable identity can. A genuinely different release (distinct
 // hash/GUID/name+size) does not compare equal and still rotates, which is the
 // alternate-version behavior the fallback relies on.
+//
+// The comparison is symmetric across compatible tiers rather than a single
+// strongest-tier key: a name-only row keys as name+size while a GUID/hash row
+// keys in that stronger tier, so a strongest-tier equality would read two rows
+// of one release as distinct and rotate onto the duplicate. Failing to prove
+// the tiers compatible is a refusal (the caller treats false as "not the same
+// release"), so an ambiguous pair fails closed instead of repainting a sibling.
 func virtualSiblingOwnerSharesRelease(a, b *models.MediaFile) bool {
 	if a == nil || b == nil {
 		return false
 	}
-	keyA := resolver.PersistedDedupKey(a.ProviderVideoHash, a.ProviderGUID, a.ProviderReleaseName, a.ProviderReleaseSize)
-	keyB := resolver.PersistedDedupKey(b.ProviderVideoHash, b.ProviderGUID, b.ProviderReleaseName, b.ProviderReleaseSize)
-	if keyA == "" || keyB == "" {
-		return false
-	}
-	return keyA == keyB
+	identityA := resolver.NewPersistedIdentityTiers(a.ProviderVideoHash, a.ProviderGUID, a.ProviderReleaseName, a.ProviderReleaseSize)
+	identityB := resolver.NewPersistedIdentityTiers(b.ProviderVideoHash, b.ProviderGUID, b.ProviderReleaseName, b.ProviderReleaseSize)
+	_, shared := resolver.PersistedIdentitiesMatch(identityA, identityB)
+	return shared
 }
 
 // virtualProbeEvidenceArgsForRow builds the catalog write for one probe result

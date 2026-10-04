@@ -92,9 +92,57 @@ func TestRotateTargetStillRotatesDistinctRelease(t *testing.T) {
 	}
 }
 
+// TestRotateTargetRefusesMixedTierDuplicateRow pins the compatible-tier
+// comparison: a strongest-tier key would read a name-only row and a GUID row of
+// the same release as distinct (different keys) and rotate onto the duplicate.
+// The tier-by-tier predicate recognizes the same release and refuses, so the
+// sibling is not repainted. A genuinely different release in the name tier stays
+// a rotation.
+func TestRotateTargetRefusesMixedTierDuplicateRow(t *testing.T) {
+	const (
+		neutral      = "virtual://movie/tt-mixed"
+		requestedURI = neutral + "?result=a"
+		ownerURI     = neutral + "?result=b"
+		content      = "movie-mixed"
+		folderID     = 9
+		ownerID      = 5
+	)
+	// The requested row carries only the durable name+size tier; the owner row
+	// carries the same name+size plus a source GUID for the same release. A
+	// strongest-tier key reads them as different (name+size vs guid), so it
+	// misses the duplicate and rotates; the tier-by-tier comparison sees the
+	// shared name tier and refuses.
+	requested := &models.MediaFile{
+		ID: 301, ContentID: content, FilePath: requestedURI,
+		MediaFolderID: folderID, VirtualOwnerInstallationID: ownerID, ProbeSource: "virtual",
+		ProviderReleaseName: "Movie.2024.1080p", ProviderReleaseSize: 8_000_000_000,
+	}
+	owner := &models.MediaFile{
+		ID: 302, ContentID: content, FilePath: ownerURI,
+		MediaFolderID: folderID, VirtualOwnerInstallationID: ownerID, ProbeSource: "virtual",
+		ProviderGUID: "guid-shared", ProviderReleaseName: "Movie.2024.1080p", ProviderReleaseSize: 8_000_000_000,
+	}
+	probed := &models.MediaFile{
+		FilePath:    ownerURI,
+		AudioTracks: []models.AudioTrack{{Codec: "eac3", Channels: 6, Language: "eng"}},
+	}
+	h := &PlaybackHandler{
+		fileResolver: byPathPlaybackFileResolver{byPath: map[string]*models.MediaFile{ownerURI: owner}},
+	}
+
+	identityRow, evidence, ok := h.virtualProbeEvidenceRotateTarget(context.Background(), requested, ownerURI, probed)
+	if ok {
+		t.Fatal("mixed-tier duplicate rotation was accepted; a strongest-tier key missed the duplicate")
+	}
+	if identityRow != nil || evidence != nil {
+		t.Fatalf("refused mixed-tier rotation returned (%v, %v), want (nil, nil)", identityRow, evidence)
+	}
+}
+
 // TestVirtualSiblingOwnerSharesRelease pins the durable-identity predicate that
-// separates duplicates of one release from genuinely distinct releases: only
-// matching strongest tiers compare equal, and an identity-less row is not proof.
+// separates duplicates of one release from genuinely distinct releases: matching
+// tiers across a compatible pair compare equal, and an identity-less row is not
+// proof.
 func TestVirtualSiblingOwnerSharesRelease(t *testing.T) {
 	cases := []struct {
 		name string
@@ -106,6 +154,10 @@ func TestVirtualSiblingOwnerSharesRelease(t *testing.T) {
 		{"same guid", &models.MediaFile{ProviderGUID: "g1"}, &models.MediaFile{ProviderGUID: "g1"}, true},
 		{"same name and size", &models.MediaFile{ProviderReleaseName: "Movie.2024", ProviderReleaseSize: 100}, &models.MediaFile{ProviderReleaseName: "Movie.2024", ProviderReleaseSize: 100}, true},
 		{"same name different size", &models.MediaFile{ProviderReleaseName: "Movie.2024", ProviderReleaseSize: 100}, &models.MediaFile{ProviderReleaseName: "Movie.2024", ProviderReleaseSize: 200}, false},
+		{"name-only vs name+guid is the same release", &models.MediaFile{ProviderReleaseName: "Movie.2024", ProviderReleaseSize: 100}, &models.MediaFile{ProviderGUID: "g1", ProviderReleaseName: "Movie.2024", ProviderReleaseSize: 100}, true},
+		{"name-only vs name+hash is the same release", &models.MediaFile{ProviderReleaseName: "Movie.2024", ProviderReleaseSize: 100}, &models.MediaFile{ProviderVideoHash: "h1", ProviderReleaseName: "Movie.2024", ProviderReleaseSize: 100}, true},
+		{"disjoint tiers are not proof", &models.MediaFile{ProviderReleaseName: "Movie.2024", ProviderReleaseSize: 100}, &models.MediaFile{ProviderGUID: "g1"}, false},
+		{"hash vs different hash is not the same release", &models.MediaFile{ProviderVideoHash: "h1", ProviderReleaseName: "Movie.2024"}, &models.MediaFile{ProviderVideoHash: "h2", ProviderReleaseName: "Movie.2024"}, false},
 		{"identity-less is not proof", &models.MediaFile{}, &models.MediaFile{}, false},
 		{"one identity-less is not proof", &models.MediaFile{ProviderVideoHash: "h1"}, &models.MediaFile{}, false},
 	}

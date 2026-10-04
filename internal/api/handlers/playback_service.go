@@ -19,6 +19,7 @@ import (
 
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
 	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/logredact"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
 )
@@ -956,11 +957,28 @@ func (h *PlaybackHandler) inventoryEffectiveFile(ctx context.Context, file *mode
 // the existing inventory poll then upgrades the declared list to probe
 // evidence. Best-effort: a session without a realtime connection is a no-op.
 func (h *PlaybackHandler) PublishSourceCommitted(ctx context.Context, sessionID string) {
-	if h == nil || h.RealtimeHub == nil || sessionID == "" {
+	if h == nil || sessionID == "" {
 		return
 	}
 	session, err := h.sessionMgr.GetSession(sessionID)
 	if err != nil || session == nil {
+		return
+	}
+	// A committed binding move is a rotation: re-probe the replacement so its
+	// verified inventory lands without waiting for a replan. The probe is
+	// scheduled before the realtime check because it is worth doing even for a
+	// session that has not (yet) opened a realtime connection. Only a session
+	// that carries a virtual binding is considered, and only a recorded rotation
+	// (revision cleared, evidence anchored at the previous candidate) triggers
+	// it, so the ordinary start commit — which just set the revision — does not
+	// double-probe a row the start path already probed.
+	if h.fileResolver != nil && session.VirtualSourceURI != "" {
+		if file, loadErr := h.fileResolver.GetByID(ctx, session.MediaFileID); loadErr == nil && file != nil &&
+			virtualCandidateRotationRecordedV3(session, file) {
+			h.refreshRotatedVirtualCandidateBackground(ctx, session, file)
+		}
+	}
+	if h.RealtimeHub == nil {
 		return
 	}
 	// No live realtime connection: there is nothing to push and building the
@@ -1004,6 +1022,104 @@ func (h *PlaybackHandler) PublishSourceCommitted(ctx context.Context, sessionID 
 // no-op rather than an error.
 type mediaFileSessionLookup interface {
 	GetSessionsByMediaFileID(fileID int) []*playback.Session
+}
+
+// refreshRotatedVirtualCandidateBackground re-resolves and re-probes the
+// replacement candidate a serve-layer rotation just committed, so its verified
+// track evidence lands without waiting for a replan or a version-list refresh.
+// The rotation itself only moved the session binding and cleared the carried
+// evidence: until the replacement is probed, the serve path stays fail-closed
+// (evidence mismatch rejects the stale inventory) and the version list shows
+// declared metadata. This closes that window.
+//
+// It is best-effort and bounded by the detached-work gate. A handler without a
+// resolver or prober is a no-op; a resolve or probe failure leaves the gate
+// closed exactly as before, so this can never authorise serving stale tracks.
+func (h *PlaybackHandler) refreshRotatedVirtualCandidateBackground(ctx context.Context, session *playback.Session, file *models.MediaFile) {
+	if h == nil || session == nil || file == nil || !isVirtualPlaybackFile(file) || session.VirtualSourceURI == "" {
+		return
+	}
+	if h.VirtualMediaDetailedResolver == nil && h.VirtualMediaResolver == nil {
+		return
+	}
+	// The probe reads through the loopback relay, exactly as the start-path and
+	// fallback probes do; without a relay the resolved URL is the raw provider
+	// URL and the prober is not wired to read it.
+	if h.RemoteStreamRelay == nil {
+		return
+	}
+	gate := h.detachedGate()
+	if !gate.tryAcquire() {
+		slog.WarnContext(ctx, "rotated virtual candidate probe skipped: detached worker budget exhausted",
+			"component", "api", "session", session.ID, "file_id", file.ID, "virtual_uri", session.VirtualSourceURI)
+		return
+	}
+	// Snapshot the binding generation so a rotation that lands while the probe
+	// is resolving is not re-probed against a superseded candidate and its
+	// evidence is never applied to the wrong row. A manager without the reader
+	// keeps generation 0, which disables the fence (best-effort, as elsewhere).
+	generation, _ := h.inventorySourceGeneration(session.ID)
+	go func() {
+		defer gate.release()
+		bgCtx, cancel := h.virtualDetachedContext(ctx, virtualBackgroundProbeBudget)
+		defer cancel()
+		h.probeRotatedVirtualCandidate(bgCtx, session, file, generation)
+	}()
+}
+
+// probeRotatedVirtualCandidate resolves the rotated candidate's provider URL and
+// probes it, then persists the evidence for the row that owns the candidate. It
+// is the synchronous core of refreshRotatedVirtualCandidateBackground, split out
+// so a test can drive rotation recovery without a goroutine.
+func (h *PlaybackHandler) probeRotatedVirtualCandidate(ctx context.Context, session *playback.Session, file *models.MediaFile, generation uint64) bool {
+	if h == nil || session == nil || file == nil || session.VirtualSourceURI == "" {
+		return false
+	}
+	// The binding may have moved again since the snapshot: re-read it and refuse
+	// when the rotation this probe was scheduled for is no longer current. The
+	// probe belongs to the candidate the session now names.
+	live, err := h.sessionMgr.GetSession(session.ID)
+	if err != nil || live == nil {
+		return false
+	}
+	if generation > 0 {
+		if current, ok := h.inventorySourceGeneration(session.ID); !ok || current != generation {
+			return false
+		}
+	}
+	if !isVirtualPlaybackFile(file) {
+		return false
+	}
+	resolved, cleanup, resolveErr := h.resolveVirtualInputURI(
+		withVirtualSessionBindingV3(ctx, true), live.VirtualSourceURI, live.VirtualSourceOwnerInstallationID,
+		live.UserID, live.ProfileID, false, nil, "",
+	)
+	if cleanup != nil {
+		defer cleanup()
+	}
+	if resolveErr != nil {
+		slog.WarnContext(ctx, "rotated virtual candidate re-resolve failed",
+			"component", "api", "session", live.ID, "virtual_uri", live.VirtualSourceURI,
+			"error", logredact.SanitizeURLError(resolveErr))
+		return false
+	}
+	probeCand := VirtualPlaybackStream{
+		URI:            resolved.URI,
+		CodecAudio:     resolved.CodecAudio,
+		AudioLanguages: resolved.AudioLanguages,
+		RequestHeaders: resolved.RequestHeaders,
+	}
+	probeTransient := cloneVirtualProbeTransient(*file)
+	if resolved.URI != "" {
+		probeTransient.FilePath = resolved.URI
+	}
+	h.probeVirtualSourceAndPersist(
+		ctx,
+		bestResultCacheKey(file.ContentID, virtualPlaybackNeutralKey(live.VirtualSourceURI), live.VirtualSourceOwnerInstallationID),
+		file, resolved.URL, probeTransient, probeCand,
+		h.virtualExpectedRuntimeMinutes(ctx, file), live.VirtualSourceOwnerInstallationID,
+	)
+	return true
 }
 
 // inventoryUpdatedPublishBudget bounds one inventory_updated fan-out so the
@@ -1118,10 +1234,20 @@ func (h *PlaybackHandler) publishRefusedProbeInventory(ctx context.Context, file
 // probedFileID is the catalog row the probe was captured for. Duplicate rows for
 // one release share candidate URIs, so the URI match alone would paint the
 // probed tracks onto a sibling row playing the same candidate; the effective row
-// must be the same row the evidence came from. A non-positive probedFileID (a
-// caller without that identity) keeps the historical URI-only behavior.
+// must be the same row the evidence came from. A session with no known effective
+// row cannot be confirmed as that row and fails closed, mirroring the serve-path
+// guard in stream.go (virtualEvidenceMatchesBoundFile). A non-positive
+// probedFileID (a caller without that identity) keeps the historical URI-only
+// behavior for sessions that do carry an effective row.
 func (h *PlaybackHandler) refusedProbeInventoryFile(ctx context.Context, session *playback.Session, probedFileID int, candidateURI string, probed *models.MediaFile) *models.MediaFile {
 	if session == nil || probed == nil || strings.TrimSpace(candidateURI) == "" {
+		return nil
+	}
+	// An unknown bound row (id 0) carries no identity to confirm against the
+	// evidence; it must not receive the override. This is the same fail-closed
+	// rule the serving path applies when the evidence row is known but the
+	// bound row is not.
+	if session.MediaFileID <= 0 {
 		return nil
 	}
 	if probedFileID > 0 && session.MediaFileID != probedFileID {

@@ -107,6 +107,39 @@ func TestBuildPlaybackInfoKeepsUnprobedPlaceholderWithoutProbedCopy(t *testing.T
 	}
 }
 
+// TestBuildPlaybackInfoCollapsesProbedResultChurn pins the probed-entry
+// neutral-path grouping: two probed rows for one release whose concrete result=
+// picks differ are the same release and must collapse to one version, while a
+// genuinely distinct version (a different declared size or a conflicting durable
+// identity) stays listed.
+func TestBuildPlaybackInfoCollapsesProbedResultChurn(t *testing.T) {
+	a := virtualDupRow(81, 1000, "virtual://movie/churn?result=aaa", "eng", true)
+	b := virtualDupRow(82, 1000, "virtual://movie/churn?result=bbb", "eng", true)
+	versions := buildDupVersions(t, []*models.MediaFile{a, b})
+	if len(versions) != 1 {
+		t.Fatalf("probed result-churn duplicates projected %d versions, want 1", len(versions))
+	}
+	if versions[0].FileID != 81 {
+		t.Fatalf("collapsed to file %d, want the first occurrence 81", versions[0].FileID)
+	}
+
+	// A distinct declared size is a genuine version distinction: it must stay.
+	small := virtualDupRow(83, 1000, "virtual://movie/churn?result=small", "eng", true)
+	large := virtualDupRow(84, 2000, "virtual://movie/churn?result=large", "eng", true)
+	if versions := buildDupVersions(t, []*models.MediaFile{small, large}); len(versions) != 2 {
+		t.Fatalf("distinct-size probed versions projected %d versions, want 2", len(versions))
+	}
+
+	// A conflicting durable identity is a genuine version distinction too.
+	sameSize := virtualDupRow(85, 1000, "virtual://movie/churn?result=hash-a", "eng", true)
+	sameSize.ProviderVideoHash = "hash-a"
+	otherHash := virtualDupRow(86, 1000, "virtual://movie/churn?result=hash-b", "eng", true)
+	otherHash.ProviderVideoHash = "hash-b"
+	if versions := buildDupVersions(t, []*models.MediaFile{sameSize, otherHash}); len(versions) != 2 {
+		t.Fatalf("conflicting-identity probed versions projected %d versions, want 2", len(versions))
+	}
+}
+
 // TestBuildPlaybackInfoDoesNotCollapseLocalFiles proves the collapse is scoped
 // to virtual rows: two local rows with the same content/size but distinct paths
 // are still listed (their paths are their identity).
