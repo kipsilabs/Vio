@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/literaryworks"
 	"github.com/Silo-Server/silo-server/internal/metadata"
@@ -230,9 +232,12 @@ func (h *PeopleHandler) SearchPeopleScoped(ctx context.Context, query string, li
 // due; a speculative prefetch leaves that to the sweep.
 func (h *PeopleHandler) Person(ctx context.Context, id int64, queueRefresh bool, filter catalog.AccessFilter) (PersonView, error) {
 	person, err := h.personRepo.GetVisible(ctx, id, filter)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return PersonView{}, apiError(http.StatusNotFound, policyErrorNotFound, "person not found")
+	}
 	if err != nil {
 		slog.WarnContext(ctx, "people: get person failed", "component", "api", "id", id, "id_str", strconv.FormatInt(id, 10), "error", err)
-		return PersonView{}, apiError(http.StatusNotFound, policyErrorNotFound, "person not found")
+		return PersonView{}, apiError(http.StatusInternalServerError, "internal_error", "Failed to load person")
 	}
 	if queueRefresh {
 		h.enqueuePersonRefreshIfDue(*person)
@@ -259,8 +264,12 @@ func (h *PeopleHandler) RefreshPerson(ctx context.Context, userID int, id int64,
 		return limited
 	}
 	person, err := h.personRepo.GetVisible(ctx, id, filter)
-	if err != nil || person == nil {
+	if errors.Is(err, pgx.ErrNoRows) || (err == nil && person == nil) {
 		return apiError(http.StatusNotFound, policyErrorNotFound, "person not found")
+	}
+	if err != nil {
+		slog.WarnContext(ctx, "people: refresh lookup failed", "component", "api", "id", id, "error", err)
+		return apiError(http.StatusInternalServerError, "internal_error", "Failed to load person")
 	}
 	h.refreshQueue.Enqueue(id)
 	return nil

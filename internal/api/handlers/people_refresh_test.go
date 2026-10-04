@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -244,5 +245,31 @@ func TestV1PersonDetailFailsClosedWithoutAccessResolver(t *testing.T) {
 	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/people/1", nil))
 	if rec.Code != http.StatusInternalServerError || strings.Contains(rec.Body.String(), "Cranston") {
 		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+}
+
+type failingPersonRepo struct{ peopleRepository }
+
+func (failingPersonRepo) GetVisible(context.Context, int64, catalog.AccessFilter) (*models.Person, error) {
+	return nil, errors.New("connection refused")
+}
+
+// A lookup that fails is a server error, not "not found": the person may well
+// be visible, and a 404 would tell the client otherwise.
+func TestPersonLookupFailureIsNotNotFound(t *testing.T) {
+	queue := &recordingPersonRefreshQueue{}
+	h := &PeopleHandler{personRepo: failingPersonRepo{}, refreshQueue: queue, refreshLimiter: ratelimit.NewMemoryLimiter()}
+
+	_, err := h.Person(context.Background(), 1, true, catalog.AccessFilter{})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusInternalServerError {
+		t.Fatalf("Person error = %v, want 500", err)
+	}
+	err = h.RefreshPerson(context.Background(), 7, 1, catalog.AccessFilter{})
+	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusInternalServerError {
+		t.Fatalf("RefreshPerson error = %v, want 500", err)
+	}
+	if len(queue.ids) != 0 {
+		t.Fatalf("queued %v after a failed lookup", queue.ids)
 	}
 }
