@@ -4116,11 +4116,12 @@ func ensureTrackLanguages(tracks []models.AudioTrack) []models.AudioTrack {
 }
 
 // isVirtualMediaFile reports whether a media file row is a zero-storage
-// virtual candidate (provider-backed) rather than a local file. Virtual rows
-// carry a virtual:// path; local liveness (missing_since) never applies to
-// them, and their health signal is the failed_at stamp instead.
+// virtual candidate (provider-backed) rather than a local file. Mirrors the
+// canonical models check (Container == "virtual" or a virtual:// path,
+// case-insensitive): local liveness (missing_since) never applies to virtual
+// rows, and their health signal is the failed_at stamp instead.
 func isVirtualMediaFile(f *models.MediaFile) bool {
-	return f != nil && strings.HasPrefix(f.FilePath, "virtual://")
+	return f != nil && (f.Container == "virtual" || strings.HasPrefix(strings.ToLower(f.FilePath), "virtual://"))
 }
 
 // versionAvailability returns the durable per-version health signal as a
