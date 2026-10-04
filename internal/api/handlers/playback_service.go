@@ -1034,7 +1034,7 @@ type mediaFileSessionLookup interface {
 //
 // It is best-effort and bounded by the detached-work gate. A handler without a
 // resolver or prober is a no-op; a resolve or probe failure leaves the gate
-// closed exactly as before, so this can never authorise serving stale tracks.
+// closed exactly as before, so this can never authorize serving stale tracks.
 func (h *PlaybackHandler) refreshRotatedVirtualCandidateBackground(ctx context.Context, session *playback.Session, file *models.MediaFile) {
 	if h == nil || session == nil || file == nil || !isVirtualPlaybackFile(file) || session.VirtualSourceURI == "" {
 		return
