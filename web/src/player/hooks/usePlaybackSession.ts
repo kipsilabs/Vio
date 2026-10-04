@@ -279,34 +279,64 @@ function identityNamesSameSource(a: SourceIdentity, b: SourceIdentity): boolean 
  * Whether it was replaced at all is decided first, because a refused plan is
  * still the pre-rotation plan and its URI would otherwise veto a legitimate
  * rotation. Against a replaced plan that names a candidate URI, that URI is the
- * only candidate it vouches for, and an exact match is retained however it
- * lines up with the outgoing source (a replacement can retain the effective
- * candidate).
+ * only candidate it vouches for, and an exact match is retained even when the
+ * live outgoing source names a different candidate (a replacement can retain
+ * the effective candidate).
  *
  * When the replaced plan is URI-less (the v2 wire omits the candidate) file
- * equality is still the only key the wire offers, so a push naming the plan's
- * own file is admitted even without a URI — the payload routinely carries the
+ * equality is still the only key the wire offers, so a candidate-bearing push
+ * naming the plan's own file is admitted — the payload routinely carries the
  * candidate the plan omits, and refusing it would leave the track menus stale
- * for the whole session. The one collision kept out is a genuine same-file
- * sibling: a concrete live outgoing URI that disagrees with the push URI names
- * a different candidate the plan cannot vouch for. When the plan was refused
- * rather than replaced, a push that still names the live source is the same
- * source and is kept — the source never moved — while a source commit naming
- * another file is a rotation the transport already made and is kept too.
+ * for the whole session.
+ *
+ * A same-file source the plan cannot resolve stays refused whenever a concrete
+ * candidate is already current on that file: a file-only push under any
+ * concrete candidate, and a concrete push whose URI disagrees with one. That is
+ * checked against two baselines — `outgoing`, the live source captured when the
+ * push arrived, and `applied`, the identity the menus carry when the flush runs
+ * — because a poll bypasses the adoption barrier and can fold a concrete
+ * candidate after the push was queued, including when the plan is later refused
+ * rather than replaced. A URI-bearing source commit is the exception: it is the
+ * transport's own move and concrete candidates are server state, so the
+ * seq-sorted queue replays the newer one last and arrival order decides. When
+ * the plan was refused rather than replaced, the live source is the authority
+ * and `allowRotation` decides whether a cross-file source commit may move it: a
+ * push that still names the live source is kept — the source never moved —
+ * while a source commit naming another file is a rotation the transport already
+ * made and is kept too.
  */
 function deferredIdentityIsAdmissible(
   identity: SourceIdentity,
   plan: PlanV3,
   arrivalPlan: PlanV3 | null,
   outgoing: SourceIdentity,
+  applied: SourceIdentity,
   allowRotation: boolean,
 ): boolean {
   if (!identityNamesSource(identity)) return false;
 
+  // A concrete candidate already current on the push's file is authority the
+  // push cannot outweigh: a file-only push carries no candidate, and a push
+  // naming a different candidate is a sibling collision. Both baselines apply
+  // except for a URI-bearing source commit, which is the transport's own move
+  // judged by arrival order. A cross-file baseline is a different source and
+  // does not apply.
+  const baselines = allowRotation && identity.uri != null ? [outgoing] : [outgoing, applied];
+  for (const baseline of baselines) {
+    if (baseline.uri == null) continue;
+    // An unknown file on either side is treated as the same file: neither can
+    // prove a different source, so a differing concrete URI is a collision.
+    const sameFile =
+      baseline.fileId == null || identity.fileId == null || baseline.fileId === identity.fileId;
+    if (!sameFile) continue;
+    if (identity.uri == null || identity.uri !== baseline.uri) return false;
+  }
+
   // Whether the settled plan is a different adoption or the byte-for-byte
   // arrival plan. This must be decided before the winner's URI is consulted: a
   // refused plan still names the pre-rotation source, so its URI must not veto
-  // a rotation the transport already committed to.
+  // a rotation the transport already committed to. `allowRotation` applies to
+  // this branch only; the replaced-plan branches below decide from the winner.
   if (!planWasReplaced(arrivalPlan, plan)) {
     // The plan was refused, not replaced. The live source is authoritative: a
     // push that names it exactly is a same-source update, and a source commit
@@ -322,30 +352,15 @@ function deferredIdentityIsAdmissible(
   }
 
   // The plan was replaced and won. When it names a candidate URI, that URI is
-  // the only candidate it vouches for, and an exact match is retained however
-  // it lines up with the outgoing source (a replacement can retain the
-  // effective candidate).
+  // the only candidate it vouches for, and an exact match is retained regardless
+  // of the outgoing source (a replacement can retain the effective candidate).
   if (plan.effective_virtual_uri != null) return identityMatchesPlan(identity, plan);
 
-  // The winner is URI-less. File equality is the key the wire offers, so a push
-  // that names the plan's own file is admitted even when it carries the
-  // candidate the plan omits; it is the only carrier of that source's identity.
-  // A push naming another file is a rotation the URI-less plan cannot vouch
-  // for. A push supplying a candidate URI is admitted when neither the plan nor
-  // the live outgoing source names one. The one refusal kept is a genuine
-  // same-file sibling collision: a concrete outgoing candidate URI, on the
-  // push's own file, that disagrees with the push's URI names a different
-  // candidate the URI-less plan cannot resolve.
-  if (identity.fileId != null && identity.fileId !== plan.effective_media_file_id) return false;
-  if (
-    outgoing.uri != null &&
-    identity.uri != null &&
-    identity.uri !== outgoing.uri &&
-    (outgoing.fileId == null || identity.fileId == null || outgoing.fileId === identity.fileId)
-  ) {
-    return false;
-  }
-  return true;
+  // The winner is URI-less. The baseline loop above already refused a same-file
+  // collision, so a push naming the plan's own file (or naming no file at all)
+  // is admitted; a push naming another file is a rotation the URI-less plan
+  // cannot vouch for.
+  return identity.fileId == null || identity.fileId === plan.effective_media_file_id;
 }
 
 /** A start body plus the optional force-relink flag the retry path adds. */
@@ -2507,6 +2522,19 @@ export function usePlaybackSession(
       ) {
         return;
       }
+      // A file-only push cannot be tied to a candidate. When the live source
+      // already names a concrete candidate on that same file, the file alone is
+      // not proof of ownership and must not re-key the menus under that
+      // candidate. This mirrors `deferredIdentityIsAdmissible` so a refused
+      // file-only revision cannot slip back in through the direct path.
+      if (
+        payload.effective_media_file_id != null &&
+        payload.effective_virtual_uri == null &&
+        liveIdentity.uri != null &&
+        payload.effective_media_file_id === liveIdentity.fileId
+      ) {
+        return;
+      }
       foldInventoryUpdate(payload);
     },
     [captureDeferredPush, foldInventoryUpdate],
@@ -2543,6 +2571,12 @@ export function usePlaybackSession(
     const queue = deferredPushesRef.current.slice().sort((a, b) => a.seq - b.seq);
     if (queue.length === 0) return;
     deferredPushesRef.current = [];
+    // The identity the menus carry when the flush starts. It captures movements
+    // an outside push made while these entries waited (a poll folds without the
+    // adoption barrier); it is snapshotted once so the entries replayed below do
+    // not become a veto baseline for each other, which would invert arrival
+    // order when two concrete candidates are queued.
+    const appliedIdentity = menuIdentityRef.current;
     const handleRefusedPush = (entry: DeferredPush) => {
       // A deferred source commit had moved the live baseline when it was
       // captured. If nothing later moved it on, put it back on the winning plan
@@ -2585,14 +2619,17 @@ export function usePlaybackSession(
       // The settled plan is the primary authority. When it names a candidate
       // URI, that URI wins over the outgoing one (a replacement may retain the
       // effective candidate) and an exact match is kept. When it is URI-less,
-      // the push's own file is the key, except for a genuine same-file sibling
-      // collision the plan cannot resolve. See deferredIdentityIsAdmissible.
+      // the push's own file is the key, except for a same-file source the plan
+      // cannot resolve. `appliedIdentity` is the menu identity at flush start,
+      // so a push deferred before a poll folded a concrete candidate cannot
+      // overwrite it. See deferredIdentityIsAdmissible.
       if (
         !deferredIdentityIsAdmissible(
           entry.identity,
           plan,
           entry.plan,
           entry.outgoing,
+          appliedIdentity,
           entry.kind === "source",
         )
       ) {
