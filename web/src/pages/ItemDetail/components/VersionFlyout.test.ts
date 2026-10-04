@@ -1,6 +1,15 @@
 import { describe, expect, it } from "vitest";
 import type { FileVersion } from "@/api/types";
 import { buildQualitySummary, buildDetailLine, sortByResolution } from "./VersionFlyout";
+import {
+  audioLanguageLabels,
+  buildQualitySummary as buildSharedQualitySummary,
+  buildVersionDetailLine,
+  formatScoreBadgeLabel,
+  formatScoreTitle,
+  hasFormatScore,
+  subtitleLanguageLabels,
+} from "./versionFormatUtils";
 
 function makeVersion(overrides: Partial<FileVersion> = {}): FileVersion {
   return {
@@ -276,5 +285,84 @@ describe("sortByResolution", () => {
     const sorted = sortByResolution(versions);
     expect(sorted[0]!.resolution).toBe("1080p");
     expect(sorted[1]!.resolution).toBe("unknown");
+  });
+});
+
+describe("shared version row builders", () => {
+  // These are the exact call sites the in-player menu and the item-page picker
+  // use, driven through the public exports, so a drift between the two lists
+  // fails here.
+  function playerSummary(version: FileVersion): string {
+    return buildSharedQualitySummary(version);
+  }
+  function playerDetail(version: FileVersion): string {
+    return buildVersionDetailLine(version);
+  }
+
+  it("produces the identical quality summary for both list builders", () => {
+    const cases: FileVersion[] = [
+      makeVersion({ resolution: "2160p", codec_video: "hevc", hdr: true, codec_audio: "truehd" }),
+      makeVersion({
+        resolution: "2160p",
+        codec_video: "hevc",
+        hdr: true,
+        codec_audio: "TrueHD Atmos",
+        file_name: "Movie.2160p.Remux.mkv",
+      }),
+      makeVersion({ resolution: "", codec_video: "", codec_audio: "", container: "epub" }),
+      makeVersion({ file_path: "virtual://movie/tt1?results=all" }),
+      makeVersion({ file_path: "virtual://movie/tt1?results=all&result=abc123" }),
+      makeVersion({ resolution: "1080p", codec_video: "", codec_audio: "", hdr: false }),
+    ];
+
+    for (const version of cases) {
+      expect(buildQualitySummary(version)).toBe(playerSummary(version));
+    }
+
+    // The "More results…" action must reach the player list too.
+    expect(playerSummary(makeVersion({ file_path: "virtual://movie/tt1?results=all" }))).toBe(
+      "More results…",
+    );
+  });
+
+  it("produces the identical detail line for both list builders", () => {
+    const cases: FileVersion[] = [
+      makeVersion({ file_size: 45 * 1024 ** 3, file_name: "Movie.2160p.Remux.mkv" }),
+      makeVersion({ release_name: "Movie.2023.1080p.WEB-DL.x264-GRP", file_size: 10 * 1024 ** 3 }),
+      makeVersion({
+        edition_raw: "Disclosure Day 2160p · 45 GB",
+        container: "virtual",
+        file_size: 0,
+      }),
+      makeVersion({ file_size: 0, file_name: undefined }),
+    ];
+
+    for (const version of cases) {
+      expect(buildDetailLine(version)).toBe(playerDetail(version));
+    }
+
+    // Empty details read the same (empty) on both lists.
+    expect(playerDetail(makeVersion({ file_size: 0 }))).toBe("");
+  });
+
+  it("derives audio and subtitle badges through the shared language helper", () => {
+    const version = makeVersion({
+      audio_tracks: [{ language: "eng" }, { languages: ["en", "fr", "es"] }],
+      subtitle_tracks: [{ language: "deu" }, { language: "German" }],
+    });
+    expect(audioLanguageLabels(version.audio_tracks)).toEqual(["English", "French", "Spanish"]);
+    expect(subtitleLanguageLabels(version.subtitle_tracks)).toEqual(["German"]);
+  });
+
+  it("derives the format-score badge identically for both lists", () => {
+    expect(hasFormatScore(850)).toBe(true);
+    expect(hasFormatScore(0)).toBe(false);
+    expect(hasFormatScore(undefined)).toBe(false);
+    expect(hasFormatScore(-200)).toBe(true);
+
+    expect(formatScoreBadgeLabel(850)).toBe("★ 850");
+    expect(formatScoreBadgeLabel(-200)).toBe("★ -200");
+    expect(formatScoreTitle(850, "4K+HDR")).toBe("Format score 850 · 4K+HDR");
+    expect(formatScoreTitle(850, null)).toBe("Format score 850");
   });
 });

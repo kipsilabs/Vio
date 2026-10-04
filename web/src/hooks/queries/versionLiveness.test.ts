@@ -247,10 +247,7 @@ describe("useVersionLiveness", () => {
 
 describe("applyVersionAvailability", () => {
   it("stamps a reported verdict and clears a stale one", () => {
-    const versions = [
-      makeVersion({ file_id: 1 }),
-      makeVersion({ file_id: 2, available: false }),
-    ];
+    const versions = [makeVersion({ file_id: 1 }), makeVersion({ file_id: 2, available: false })];
 
     const next = applyVersionAvailability(
       versions,

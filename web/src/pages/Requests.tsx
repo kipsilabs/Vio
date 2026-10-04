@@ -34,6 +34,8 @@ import {
   useRequestSearch,
 } from "@/hooks/queries/useRequests";
 import { useDocumentTitle } from "@/hooks/useDocumentTitle";
+import { useWatchlistTitleToggle } from "@/hooks/useWatchlistTitleToggle";
+import { requestDiscoverSectionHref } from "@/lib/mediaRequests";
 import { cn } from "@/lib/utils";
 import { formatRequestStatus, requestInputFromMediaResult } from "@/lib/mediaRequests";
 
@@ -140,6 +142,7 @@ export default function Requests() {
   const search = useRequestSearch(mediaType, searchQuery, searchPage);
   const mine = useMyMediaRequests({ limit: 100 });
   const createRequest = useCreateMediaRequest();
+  const watchlist = useWatchlistTitleToggle();
   const pendingRequestKey = createRequest.variables
     ? mediaRequestKey(createRequest.variables.media_type, createRequest.variables.tmdb_id)
     : undefined;
@@ -287,6 +290,7 @@ export default function Requests() {
               pendingRequestKey={pendingRequestKey}
               isSubmitting={createRequest.isPending}
               onRequest={submitRequest}
+              watchlist={watchlist}
             />
           ) : discovery.isLoading ? (
             <DiscoveryCarouselSkeleton />
@@ -304,6 +308,7 @@ export default function Requests() {
                   pendingRequestKey={pendingRequestKey}
                   isSubmitting={createRequest.isPending}
                   onRequest={submitRequest}
+                  watchlist={watchlist}
                 />
               ))}
               <BrandCarousel
@@ -531,11 +536,13 @@ function DiscoverySectionRow({
   pendingRequestKey,
   isSubmitting,
   onRequest,
+  watchlist,
 }: {
   section: RequestDiscoverySection;
   pendingRequestKey?: string;
   isSubmitting: boolean;
   onRequest: (item: RequestMediaResult) => void;
+  watchlist: ReturnType<typeof useWatchlistTitleToggle>;
 }) {
   const eyebrow = sectionEyebrow(section.key);
   return (
@@ -545,7 +552,10 @@ function DiscoverySectionRow({
           {eyebrow}
         </span>
       </div>
-      <MediaCarousel title={section.title}>
+      <MediaCarousel
+        title={section.title}
+        viewAllHref={section.total_pages > 1 ? requestDiscoverSectionHref(section.key) : undefined}
+      >
         {section.results.map((item) => (
           <RequestPosterCard
             key={`${item.media_type}-${item.tmdb_id}`}
@@ -555,6 +565,8 @@ function DiscoverySectionRow({
               isSubmitting && pendingRequestKey === mediaRequestKey(item.media_type, item.tmdb_id)
             }
             onRequest={() => onRequest(item)}
+            onToggleWatchlist={watchlist.enabled ? () => watchlist.toggle(item) : undefined}
+            isWatchlistPending={watchlist.isPending(item)}
           />
         ))}
       </MediaCarousel>
@@ -593,6 +605,7 @@ function SearchResultsView({
   pendingRequestKey,
   isSubmitting,
   onRequest,
+  watchlist,
 }: {
   query: string;
   mediaType: RequestSearchMediaType;
@@ -606,6 +619,7 @@ function SearchResultsView({
   pendingRequestKey?: string;
   isSubmitting: boolean;
   onRequest: (item: RequestMediaResult) => void;
+  watchlist: ReturnType<typeof useWatchlistTitleToggle>;
 }) {
   const typeLabel =
     mediaType === "series" ? "series" : mediaType === "movie" ? "movies" : "movies and series";
@@ -685,6 +699,8 @@ function SearchResultsView({
                   pendingRequestKey === mediaRequestKey(item.media_type, item.tmdb_id)
                 }
                 onRequest={() => onRequest(item)}
+                onToggleWatchlist={watchlist.enabled ? () => watchlist.toggle(item) : undefined}
+                isWatchlistPending={watchlist.isPending(item)}
                 fluid
               />
             ))}

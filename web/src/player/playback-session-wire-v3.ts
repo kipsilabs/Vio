@@ -65,6 +65,13 @@ export interface ReplanOptions {
   audio?: TrackIdentityV3;
   subtitle?: TrackIdentityV3 | null;
   failure?: FailureV3;
+  /**
+   * The viewer's current Auto intent. Present on every replan so the server's
+   * session flag matches the menu: a viewer who started on an explicit pick and
+   * later re-armed Auto would otherwise be pinned to that pick, and a
+   * dead-source recovery would refuse to rotate while the menu shows Auto.
+   */
+  autoFallback?: boolean;
 }
 
 export interface StartRequestInput {
@@ -195,6 +202,7 @@ export function buildReplanRequestV3(input: ReplanRequestInput): ReplanRequestV3
     quality_preference: input.qualityPreference,
     position_seconds: clampPosition(input.positionSeconds),
     metered: input.metered,
+    ...(input.autoFallback !== undefined ? { auto_fallback: input.autoFallback } : {}),
     selected_tracks: selectedTracks,
     client_capabilities: input.clientCapabilities,
     client_playback_context: input.clientPlaybackContext,

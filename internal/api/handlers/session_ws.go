@@ -109,13 +109,13 @@ func (h *PlaybackHandler) HandleSessionWebSocket(w http.ResponseWriter, r *http.
 		if err != nil {
 			break
 		}
-		if err := h.handleRealtimeClientMessage(sessionID, data); err != nil {
+		if err := h.handleRealtimeClientMessage(ctx, sessionID, data); err != nil {
 			slog.WarnContext(r.Context(), "invalid realtime client message", "component", "api", "session", sessionID, "playback_session_id", sessionID, "error", err)
 		}
 	}
 }
 
-func (h *PlaybackHandler) handleRealtimeClientMessage(sessionID string, data []byte) error {
+func (h *PlaybackHandler) handleRealtimeClientMessage(ctx context.Context, sessionID string, data []byte) error {
 	var base realtimeClientMessage
 	if err := json.Unmarshal(data, &base); err != nil {
 		return err
@@ -137,6 +137,14 @@ func (h *PlaybackHandler) handleRealtimeClientMessage(sessionID string, data []b
 			h.syncSessionsNow(context.Background(), "realtime_hello")
 		}
 		h.touchSessionActivity(sessionID)
+		if session, err := h.sessionMgr.GetSession(sessionID); err == nil && session != nil {
+			if ctx == nil {
+				ctx = context.Background()
+			}
+			publishCtx, cancel := context.WithTimeout(ctx, inventoryUpdatedPublishBudget)
+			h.publishInventoryUpdatedToSession(publishCtx, session, "", nil)
+			cancel()
+		}
 		return nil
 	case playback.RealtimeMessageTypeAck:
 		var ack playback.AckEnvelope

@@ -10,6 +10,7 @@ import (
 	"maps"
 	"net/http"
 	"net/textproto"
+	"net/url"
 	"runtime/debug"
 	"strings"
 	"time"
@@ -29,6 +30,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/literaryworks"
 	"github.com/Silo-Server/silo-server/internal/metadata/translation"
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/ratingsources"
 	"github.com/Silo-Server/silo-server/internal/recommendations"
 	mediarequests "github.com/Silo-Server/silo-server/internal/requests"
 	"github.com/Silo-Server/silo-server/internal/sections"
@@ -95,6 +97,7 @@ type Dependencies struct {
 	AdminAutoscanRewrites           AdminAutoscanRewritesService
 	AdminAutoscanAvailableSources   AdminAutoscanAvailableSourcesService
 	AdminAuditLogs                  AdminAuditLogsService
+	ExternalSignIn                  ExternalSignInService
 	AdminOperationalLogs            AdminOperationalLogsService
 	AdminJellyfinCompatSettings     AdminJellyfinCompatSettingsService
 	OrderedAndroidPush              OrderedAndroidPushService
@@ -241,6 +244,7 @@ type Dependencies struct {
 	SubtitleReads         SubtitleReadService
 	SubtitleDownloads     SubtitleDownloadService
 	SubtitleUploads       SubtitleUploadService
+	SubtitleSync          SubtitleSyncAPI
 	AdminSettingsWrite    AdminSettingsWriteService
 	PluginContent         PluginContentService
 	SubtitleAICancel      SubtitleAICancelService
@@ -262,6 +266,9 @@ type Dependencies struct {
 	// CatalogSettings reads the server settings catalog reads consult per
 	// request (catalog.scope_versions_to_library); nil means every default.
 	CatalogSettings CatalogSettingsReader
+	// RatingSources decides which external ratings cards and title pages
+	// show; nil shows IMDb and TMDB only.
+	RatingSources *ratingsources.Policy
 	// RateLimit is the generic authenticated-route limiter.
 	RateLimit func(http.Handler) http.Handler
 	// CursorSecret keys pagination cursors. It must be shared by every replica
@@ -301,6 +308,11 @@ type Dependencies struct {
 	// VirtualLibraryStatus reports whether the indexer search and provider
 	// enqueue paths are wired for the capability document.
 	VirtualLibraryStatus VirtualLibraryStatusService
+	// Trickplay reads published seek-bar previews (*trickplay.Reader).
+	Trickplay TrickplayService
+	// AdminTrickplay reports and regenerates seek-bar previews
+	// (*trickplay.Admin).
+	AdminTrickplay AdminTrickplayService
 	// Profiles applies profile updates (*handlers.ProfileHandler).
 	Profiles ProfileService
 	// Libraries answers which library identifiers exist
@@ -315,6 +327,16 @@ type Dependencies struct {
 	AdminAccessGroups    AdminAccessGroupService
 	// AdminPlaybackHistory pages the finalized playback log for administrators (*handlers.AdminHandler).
 	AdminPlaybackHistory AdminPlaybackHistoryService
+	// AdminAccountDevices lists one account's devices (*handlers.AdminHandler).
+	AdminAccountDevices AdminAccountDeviceService
+	// AdminWatchSummary totals one account's finalized plays (*handlers.AdminHandler).
+	AdminWatchSummary AdminWatchSummaryService
+	// AdminAccountDownloads reads one account's managed downloads and series
+	// monitors (*downloads.Service).
+	AdminAccountDownloads AdminAccountDownloadService
+	// AdminRequestUsage reports one account's request quota use
+	// (*requests.Service).
+	AdminRequestUsage AdminRequestUsageService
 	// SettingsContract answers the settings capability document
 	// (*handlers.SettingValuesHandler).
 	SettingsContract SettingsContractService
@@ -362,6 +384,12 @@ type Dependencies struct {
 	// PersonalLists reads and edits a profile's favorites
 	// (*handlers.PersonalDataHandler).
 	PersonalLists PersonalListService
+	// WatchlistTitles keeps a profile's watchlist entries for titles the
+	// library doesn't have (*handlers.PersonalDataHandler).
+	WatchlistTitles WatchlistTitleService
+	// WatchlistRequests gates the watchlist title operations and applies
+	// watchlist requests (*requests.Service).
+	WatchlistRequests WatchlistRequestService
 	// Ratings reads and edits a profile's ratings (*handlers.RatingsHandler).
 	Ratings RatingService
 	// Recommendations answers the profile-scoped recommendation reads
@@ -779,6 +807,7 @@ type AccountService interface {
 	NeedsSetup(ctx context.Context) (bool, error)
 	SetupWizardCompleted(ctx context.Context) (bool, error)
 	CurrentUser(ctx context.Context, claims *auth.Claims) (handlers.UserView, error)
+	OAuthUserView(ctx context.Context, user *models.User) handlers.UserView
 }
 
 // ProgressService is the slice of *handlers.ProgressHandler the progress
@@ -1039,6 +1068,8 @@ type MediaRequestService interface {
 	BrowseStudio(ctx context.Context, viewer mediarequests.Viewer, slug, sort string, page int) (*mediarequests.DiscoverBrowseResponse, error)
 	BrowseNetwork(ctx context.Context, viewer mediarequests.Viewer, slug, sort string, page int) (*mediarequests.DiscoverBrowseResponse, error)
 	BrowseGenre(ctx context.Context, viewer mediarequests.Viewer, slug string, mediaType mediarequests.MediaType, sort string, page int) (*mediarequests.DiscoverBrowseResponse, error)
+	Follow(ctx context.Context, viewer mediarequests.Viewer, mediaType mediarequests.MediaType, tmdbID int) (mediarequests.RequestState, error)
+	Unfollow(ctx context.Context, viewer mediarequests.Viewer, mediaType mediarequests.MediaType, tmdbID int) error
 }
 
 // CatalogSettingsReader is the slice of the server settings store catalog
@@ -1123,7 +1154,11 @@ func serviceProblem(err error) *Problem {
 			// attached for the request log, never the response body.
 			return NewProblem(TypeInternalError, "An unexpected error occurred.").withCause(err)
 		}
-		p := NewProblem(TypeForStatus(apiErr.Status), apiErr.Message)
+		kind := TypeForStatus(apiErr.Status)
+		if t, ok := externalSignInProblemTypes[apiErr.Code]; ok && t.Status == apiErr.Status {
+			kind = t
+		}
+		p := NewProblem(kind, apiErr.Message)
 		if apiErr.RetryAfter > 0 {
 			p = p.WithRetryAfter(apiErr.RetryAfter)
 		}
@@ -1132,12 +1167,41 @@ func serviceProblem(err error) *Problem {
 	return NewProblem(TypeInternalError, "An unexpected error occurred.").withCause(err)
 }
 
-// OAuthService is the slice of *auth.OAuthHandler completeOAuthLogin uses.
+// externalSignInProblemTypes keeps the external sign-in codes a shared
+// handler reports (handlers.APIError.Code) as their own problem types.
+var externalSignInProblemTypes = map[string]ProblemType{
+	TypeNotPermitted.ID:            TypeNotPermitted,
+	TypeLocalLoginDisabled.ID:      TypeLocalLoginDisabled,
+	TypeProviderPasswordExpired.ID: TypeProviderPasswordExpired,
+	TypeEmailInUse.ID:              TypeEmailInUse,
+	TypeIdentityLinkedElsewhere.ID: TypeIdentityLinkedElsewhere,
+	TypeProviderAlreadyEnabled.ID:  TypeProviderAlreadyEnabled,
+	TypeBreakGlassRequired.ID:      TypeBreakGlassRequired,
+	TypeLastSignInMethod.ID:        TypeLastSignInMethod,
+	TypeProviderUnavailable.ID:     TypeProviderUnavailable,
+	TypeAlreadyLinked.ID:           TypeAlreadyLinked,
+}
+
+// OAuthService is the slice of *auth.OAuthHandler the OAuth operations use:
+// the flow starts and callback (raw redirects), code redemption, link
+// tickets and provider logout.
 type OAuthService interface {
-	Complete(ctx context.Context, code string) (auth.OAuthCompletion, error)
+	Complete(ctx context.Context, code, verifier, browser string) (auth.OAuthCompletion, error)
 	CallbackURL(prefix string, installID int) string
-	Init(ctx context.Context, installID int, next, redirectURI string) (string, error)
-	Callback(ctx context.Context, in auth.OAuthCallbackInput) string
+	PublicURL(path string, query url.Values) string
+	NativeSignInAvailable() bool
+	ServeStart(w http.ResponseWriter, r *http.Request, req auth.OAuthStartRequest, bounceURL string, bounceStatus int)
+	ServeCallback(w http.ResponseWriter, r *http.Request, prefix string, installID int)
+	LinkingAvailable() bool
+	IssueLinkTicket(ctx context.Context, userID, installationID int, password string) (auth.OAuthLinkTicket, error)
+	OnPublicOrigin(r *http.Request) bool
+	StartLink(ctx context.Context, userID int, prefix, ticket, next string) (auth.OAuthStartResult, error)
+	CompleteLink(ctx context.Context, userID int, code, verifier string) error
+	ProviderLogoutAvailable() bool
+	ProviderLogoutURL(ctx context.Context, userID int) (string, error)
+	// PostLogoutRedirectURL is the post-logout redirect URI on the public
+	// URL; empty when none is configured.
+	PostLogoutRedirectURL() string
 }
 
 // SessionService is the slice of *handlers.AuthHandler the login-session
@@ -1146,7 +1210,9 @@ type SessionService interface {
 	Login(ctx context.Context, in handlers.LoginInput) (handlers.TokenPairView, error)
 	Logout(ctx context.Context, claims *auth.Claims) error
 	EndImpersonation(ctx context.Context, claims *auth.Claims) error
-	ListProviders() []auth.LoginProviderInfo
+	// DiscoverProviders lists the providers a client may offer and whether
+	// any of them takes a password.
+	DiscoverProviders(ctx context.Context) (auth.ProviderDiscovery, error)
 	Refresh(ctx context.Context, refreshToken string) (handlers.RefreshedTokensView, error)
 	ListSessionsPage(ctx context.Context, userID int, after *auth.SessionKey, limit int) ([]*models.AuthSession, bool, error)
 	RevokeSession(ctx context.Context, sessionID string, userID int) error
@@ -1165,6 +1231,7 @@ type DeviceLoginService interface {
 	ApproveDeviceLogin(ctx context.Context, input auth.DeviceLoginLookupInput, userID int) (handlers.DeviceLoginDecision, error)
 	ApproveDeviceHandoff(ctx context.Context, input auth.DeviceLoginLookupInput, userID int, profileID string) (handlers.DeviceLoginDecision, error)
 	DenyDeviceLogin(ctx context.Context, input auth.DeviceLoginLookupInput, userID int) (handlers.DeviceLoginDecision, error)
+	CancelDeviceLogin(ctx context.Context, deviceCode string) (string, error)
 }
 
 // Record only after the actual adapter has mounted the handler. The observer

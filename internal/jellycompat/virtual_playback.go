@@ -231,10 +231,10 @@ func isCompatVirtualSource(source PlaybackMediaSource) bool {
 	return isCompatVirtualPath(source.VirtualSourceURI) || isCompatVirtualPath(source.Version.FilePath) || strings.EqualFold(strings.TrimSpace(source.Version.Container), "virtual")
 }
 
-// Dedicated nodes cannot resolve provider-neutral virtual identities or use
-// the central server's relay, so virtual playback stays on the integrated path.
+// Virtual sources resolve through the integrated server and relay before
+// remote transcode dispatch, allowing pooled transcode nodes to serve them.
 func shouldUseCompatNodePool(source PlaybackMediaSource, file *models.MediaFile) bool {
-	return !isCompatVirtualSource(source) && !isCompatVirtualFile(file)
+	return file != nil || source.Version.FilePath != "" || source.VirtualSourceURI != ""
 }
 
 // boundVirtualDownloadSource returns the exact provider-neutral source chosen

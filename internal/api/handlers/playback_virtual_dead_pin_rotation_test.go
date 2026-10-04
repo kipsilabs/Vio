@@ -575,3 +575,67 @@ func TestPrepareTransportTimelineRotatesAbsentSessionPin(t *testing.T) {
 		t.Fatalf("resolver calls = %d, want exactly 2 (session-bound then rotation)", calls)
 	}
 }
+
+// TestResolveVirtualAnchorURIExcludesFailedCandidate proves a seek-anchor
+// retry whose relay token 5xxes can walk to an alternate same-identity
+// candidate instead of re-probing the token that just failed: the failed pin
+// is excluded, the retry forces a fresh listing with rotation declared, and a
+// same-release (identity-rematched) candidate is accepted.
+func TestResolveVirtualAnchorURIExcludesFailedCandidate(t *testing.T) {
+	const (
+		neutralURI = "virtual://movie/tt-anchor-5xx"
+		pinnedURI  = neutralURI + "?result=pinned"
+		siblingURI = neutralURI + "?result=sibling"
+	)
+	file := &models.MediaFile{
+		ID: 9, ContentID: "movie-anchor-5xx", FilePath: pinnedURI,
+		VirtualOwnerInstallationID: 5, ProviderVideoHash: "hash-a", ProviderReleaseName: "Movie.2024",
+	}
+	h := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	var excluded [][]string
+	h.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(ctx context.Context, uri string, _ int, _ int, _ string, forceRefresh bool, excludedCandidateIDs []string, _ string) (ResolvedVirtualMedia, error) {
+		excluded = append(excluded, append([]string(nil), excludedCandidateIDs...))
+		return ResolvedVirtualMedia{
+			URL: "http://127.0.0.1:9/sibling", URI: siblingURI, CandidateID: "sibling",
+			IdentityRematched: true, ProviderVideoHash: "hash-a", ProviderReleaseName: "Movie.2024",
+		}, nil
+	})
+	session := &playback.Session{ID: "anchor-5xx", UserID: 1, ProfileID: "profile-1"}
+
+	rotated, cleanup, err := h.resolveVirtualAnchorURIExcludingFailedV3(context.Background(), session, file, "pinned")
+	if err != nil {
+		t.Fatalf("resolveVirtualAnchorURIExcludingFailedV3: %v", err)
+	}
+	if cleanup != nil {
+		cleanup()
+	}
+	if got := virtualResultCandidateID(rotated.URI); got != "sibling" {
+		t.Fatalf("resolved anchor = %q, want the rotated same-release sibling", got)
+	}
+	if len(excluded) != 1 || !containsStringExactV3(excluded[0], "pinned") {
+		t.Fatalf("retry exclusions = %v, want the failed pin excluded", excluded)
+	}
+}
+
+// TestResolveVirtualAnchorURIExcludingFailedRefusesDifferentRelease proves the
+// failed-candidate rotation never silently swaps releases: a candidate that is
+// neither identity-rematched nor identity-matching is refused.
+func TestResolveVirtualAnchorURIExcludingFailedRefusesDifferentRelease(t *testing.T) {
+	const pinnedURI = "virtual://movie/tt-anchor-5xx-other?result=pinned"
+	file := &models.MediaFile{
+		ID: 10, ContentID: "movie-anchor-5xx-other", FilePath: pinnedURI,
+		VirtualOwnerInstallationID: 5, ProviderVideoHash: "hash-a", ProviderReleaseName: "Movie.2024",
+	}
+	h := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	h.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(context.Context, string, int, int, string, bool, []string, string) (ResolvedVirtualMedia, error) {
+		return ResolvedVirtualMedia{
+			URL: "http://127.0.0.1:9/other", URI: "virtual://movie/tt-anchor-5xx-other?result=other",
+			ProviderVideoHash: "hash-B", ProviderReleaseName: "Other.2024",
+		}, nil
+	})
+	session := &playback.Session{ID: "anchor-5xx-other", UserID: 1, ProfileID: "profile-1"}
+
+	if _, _, err := h.resolveVirtualAnchorURIExcludingFailedV3(context.Background(), session, file, "pinned"); err == nil {
+		t.Fatal("expected a refusal when rotation resolves a different release")
+	}
+}

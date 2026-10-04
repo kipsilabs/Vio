@@ -936,6 +936,17 @@ discard the viewer's requested quality unless the client explicitly asks it to.
 Clients should still send the current preference when they know it, so their
 intent remains explicit in diagnostics.
 
+**Re-negotiating auto fallback mid-session.** `auto_fallback` is an optional
+boolean on a replan. When present it replaces the session's version-fallback
+intent, which is what lets a viewer who started on an explicit pick re-arm Auto
+from the version menu and still have a later dead-source `failure_recovery`
+rotate instead of being pinned to the start-time choice. Omitting it leaves that
+intent unchanged, so clients that predate the field behave exactly as before.
+The re-arm is committed with the replan: if the replan does not complete, the
+intent change is discarded rather than half-applied. Auto fallback never
+authorizes a healthy mid-play version switch: only a dead or unplayable source
+advances it.
+
 For failure recovery, `attempted_plan_keys` is the loop guard. The client sends
 back every `plan_attempt_key` it has already tried for this attempt (up to 16);
 the server will not hand back a plan whose key is in that list. `attempt_count`
@@ -1679,6 +1690,25 @@ that candidate declares a bitrate. The core virtual lister does not populate
 `Bitrate` on listed candidates, so on the core path the picker never demotes at
 pick time and the planner enforces the cap after probing the selected file; a
 plugin lister that reports bitrate gets the earlier pick-time demotion.
+remain accepted for stored/default preferences and size their output like
+`auto` below.
+
+`auto` picks its resolution from the shared bitrate ladder
+([quality-ladder.md](quality-ladder.md)): 80% of the bandwidth estimate or cap
+earns a class for the source's frame rate. A source whose height already fits
+the class is sent as-is when its bitrate allows, even when it is wider than the
+16:9 box (a 2560x1080 film at the 1080p class). Otherwise automatic and
+plain-label targets fit the source into that class's 16:9 box, so a 3840x1600
+film at the 1080p class streams at 1920x800, and encode at the class bitrate: 20000 kbps for 2160p, 6000
+for 1080p, 2000 for 720p, 1800 for 540p and 1500 for 480p, never above that 80%
+budget. A source that already fits the class but whose bitrate exceeds 80% of the
+bandwidth estimate is re-encoded at its own size within that budget rather than
+sent as-is; a source of unknown bitrate counts as needing its class's full
+bitrate. Under a cap, a source over the cap itself is re-encoded, and so is a
+video source of unknown bitrate, since it cannot be shown to fit. A transcode
+also never targets more than the source's own bitrate, counted in the output
+codec (H.264 for a scaled encode, or HEVC for any encode when the planner
+chooses HEVC).
 
 Registry availability is deliberately *not* consulted when building the menu: a
 capability check there could trigger lazy node fetches that a source-preserving
@@ -1753,7 +1783,14 @@ session updates preserve codec, source/target channels, bitrate, and the
 transcode decision as one recipe. A failed Jellyfin audio switch restores the
 prior durable selection and executor facts so the same client report can retry.
 Prepared downloads persist the audio recipe version and use `audio_v2_*` queue
-states that pre-v2 API workers cannot claim or publish as ready.
+states that pre-v2 API workers cannot claim or publish as ready. The multi-track
+prepared layout (every audio track, plain-text subtitles as MP4 timed text,
+ASS/SSA and PGS as manifest sidecars) is a
+separate `track_recipe_version` with `tracks_v1_*` queue states that outrank the
+audio and tone-map families. Its per-track plan travels in the prepare request
+and execution fingerprint; only transcode nodes advertising the
+`prepared_tracks_v1` transport feature receive it, and an older node's legacy
+receipt is rejected.
 
 They are advertised only if an eligible executor actually has the required
 capability. The ordinary FFmpeg feature probe is cached; the more expensive

@@ -222,11 +222,26 @@ type VirtualCandidateEnricher interface {
 // VirtualCandidatesRefreshExecutor runs the asynchronous refresh pipeline:
 // provider re-list and persist first (fatal on failure), then a best-effort
 // indexer search whose failure degrades to an altmount-only result, then a
-// best-effort probe pass over the new candidates, and finally a catalog
-// invalidation so every client reloads the version list.
+// best-effort probe pass over the new candidates, then a cleanup pass that
+// prunes dead candidates the fresh listing no longer offers, and finally a
+// catalog invalidation so every client reloads the version list.
 type VirtualCandidatesRefreshExecutor struct {
 	// Refresh performs step (a): force-list and persist the provider candidates.
 	Refresh *VirtualCandidatesRefreshService
+	// ProviderRefresher forces a fresh provider classification snapshot before
+	// the listing so the resolver classifies against current AltMount
+	// completed/failed state, not a cached snapshot. Nil skips it; a failure
+	// is warned and the job continues (classification then uses the snapshot
+	// the resolver already has).
+	ProviderRefresher VirtualProviderStateRefresher
+	// Pruner deletes persisted candidate rows that are both absent from the
+	// fresh listing and dead, while honoring the same retention keep-list the
+	// re-list sweep uses. Nil skips it.
+	Pruner VirtualCandidatePruner
+	// ReleaseDownloading reports whether AltMount is actively fetching a
+	// release, for the pending-candidate count. Nil skips the count. An
+	// unconfigured provider (known=false) never marks a release pending.
+	ReleaseDownloading func(releaseName string) (downloading bool, known bool)
 	// Store persists the indexer-only releases (step c).
 	Store *virtuallibrary.IndexerReleaseStore
 	// Searcher is the on-demand Prowlarr lookup (step b). Nil skips the search.
@@ -240,9 +255,24 @@ type VirtualCandidatesRefreshExecutor struct {
 	searchBudget time.Duration
 }
 
+// VirtualProviderStateRefresher forces a fresh virtual provider classification
+// snapshot (AltMount's completed/failed history) before the refresh lists. It is
+// implemented by *virtuallibrary.Service.
+type VirtualProviderStateRefresher interface {
+	RefreshProviderState(ctx context.Context) error
+}
+
+// VirtualCandidatePruner removes persisted provider-candidate rows that the
+// fresh listing no longer offers and that are dead, without touching any row
+// the sweep's retention keeps. It is implemented by *CandidateDeadPruner.
+type VirtualCandidatePruner interface {
+	PruneDeadAbsentCandidates(ctx context.Context, contentID, episodeID string, sources []*models.MediaFile, fresh []VirtualPlaybackStream) (int, error)
+}
+
 // Execute runs the pipeline. It returns an error only for a non-degradable
-// failure: a provider listing that could not be persisted. An indexer search or
-// probe failure is a warning, never a failed job.
+// failure: a provider listing that could not be persisted. A provider-state
+// refresh, indexer search, probe failure, or candidate prune is a warning,
+// never a failed job.
 func (e *VirtualCandidatesRefreshExecutor) Execute(ctx context.Context, req adminjob.VirtualCandidatesRefreshRequest, progress func(current, total int, message string)) (*adminjob.VirtualCandidatesRefreshResult, error) {
 	if e == nil || e.Refresh == nil {
 		return nil, errors.New("virtual candidates refresh executor is not configured")
@@ -253,8 +283,21 @@ func (e *VirtualCandidatesRefreshExecutor) Execute(ctx context.Context, req admi
 			progress(current, total, message)
 		}
 	}
+	const totalSteps = 6
 
-	report(0, 4, "Listing provider candidates")
+	// Force the provider's authoritative completed/failed snapshot current
+	// before the listing. Classification runs on every serve, so a stale
+	// history would let a release that just failed (or just completed) be
+	// persisted under the old verdict for up to one refresh interval.
+	report(0, totalSteps, "Refreshing provider state")
+	if e.ProviderRefresher != nil {
+		if err := e.ProviderRefresher.RefreshProviderState(ctx); err != nil {
+			logger.WarnContext(ctx, "virtual candidates refresh: provider state refresh failed; classifying against cached state",
+				"component", "api", contentIDKey, req.ContentID, "error", err)
+		}
+	}
+
+	report(1, totalSteps, "Listing provider candidates")
 	sources, streams, err := e.Refresh.RefreshSources(ctx, req.ContentID, req.UserID, req.ProfileID)
 	if err != nil {
 		return nil, fmt.Errorf("list provider candidates: %w", err)
@@ -265,11 +308,11 @@ func (e *VirtualCandidatesRefreshExecutor) Execute(ctx context.Context, req admi
 		ProviderCandidates: len(streams),
 	}
 
-	report(1, 4, "Searching indexers")
+	report(2, totalSteps, "Searching indexers")
 	indexerReleases, searchOK := e.searchIndexerReleases(ctx, req)
 	result.IndexerSearchOK = searchOK
 
-	report(2, 4, "Persisting indexer releases")
+	report(3, totalSteps, "Persisting indexer releases")
 	persisted, err := e.persistIndexerReleases(ctx, req, sources, streams, indexerReleases)
 	if err != nil {
 		return nil, fmt.Errorf("persist indexer releases: %w", err)
@@ -277,20 +320,58 @@ func (e *VirtualCandidatesRefreshExecutor) Execute(ctx context.Context, req admi
 	result.IndexerReleases = len(persisted)
 	result.Releases = persisted
 
-	report(3, 4, "Enriching provider candidates")
+	// Count freshly listed candidates AltMount is still fetching: these are
+	// the releases playback will wait for rather than skip. Best-effort and
+	// informational only. Counted per release, not per variant: one release
+	// with several result= variants is one pending release.
+	if e.ReleaseDownloading != nil {
+		seen := make(map[string]struct{})
+		for _, stream := range streams {
+			name := strings.TrimSpace(stream.ProviderReleaseName)
+			if name == "" {
+				continue
+			}
+			key := strings.ToLower(name)
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			if downloading, known := e.ReleaseDownloading(name); known && downloading {
+				result.PendingCandidates++
+			}
+		}
+	}
+
+	report(4, totalSteps, "Enriching provider candidates")
 	if e.Enricher != nil && len(streams) > 0 {
 		result.Enriched = e.Enricher.EnrichVirtualCandidates(ctx, req.ContentID, req.EpisodeID, req.UserID, req.ProfileID, streams)
+	}
+
+	// Prune after persistence: a row the fresh listing dropped is now provably
+	// absent, so the only question left is whether it is dead and unprotected.
+	// A prune failure is cleanup-only and must not fail an otherwise good
+	// refresh; the next run retries it.
+	report(5, totalSteps, "Pruning dead candidates")
+	if e.Pruner != nil {
+		pruned, pruneErr := e.Pruner.PruneDeadAbsentCandidates(ctx, req.ContentID, req.EpisodeID, sources, streams)
+		if pruneErr != nil {
+			logger.WarnContext(ctx, "virtual candidates refresh: dead-candidate prune failed",
+				"component", "api", contentIDKey, req.ContentID, episodeIDKey, req.EpisodeID, "error", pruneErr)
+		} else {
+			result.PrunedCandidates = pruned
+		}
 	}
 
 	// Publish only after persistence: a client that reloads on the event must
 	// read the new rows, not the pre-refresh list.
 	e.publishVersionsUpdated(ctx, req.ContentID)
 
-	report(4, 4, "Refresh complete")
+	report(totalSteps, totalSteps, "Refresh complete")
 	logger.InfoContext(ctx, "virtual candidates refresh complete",
 		"component", "api", contentIDKey, req.ContentID, episodeIDKey, req.EpisodeID,
 		"provider_candidates", result.ProviderCandidates, "indexer_releases", result.IndexerReleases,
-		"indexer_search_ok", result.IndexerSearchOK, "enriched", result.Enriched)
+		"indexer_search_ok", result.IndexerSearchOK, "enriched", result.Enriched,
+		"pruned_candidates", result.PrunedCandidates)
 	return result, nil
 }
 

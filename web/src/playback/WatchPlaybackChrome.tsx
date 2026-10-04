@@ -38,10 +38,8 @@ import {
 } from "@/hooks/queries/settingValues";
 import { SETTING_KEYS, type SettingKey } from "@/lib/settingsContract";
 import { useWatchDetail } from "@/hooks/queries/items";
-import {
-  applyVersionAvailability,
-  useVersionLiveness,
-} from "@/hooks/queries/versionLiveness";
+import { useVersionLiveness } from "@/hooks/queries/versionLiveness";
+import { useStampedVersions } from "./useStampedVersions";
 import { catalogKeys } from "@/hooks/queries/keys";
 import { applyPlaybackProgressToCache } from "@/hooks/queries/playbackProgressCache";
 import { invalidatePlaybackSurfaceQueries } from "@/hooks/queries/playbackSurfaceRefresh";
@@ -609,6 +607,7 @@ function WatchPlaybackHostContent() {
   // (the same read the item page already makes), not a poll: the server still
   // drives any automatic re-listing after a dead source.
   const versionLiveness = useVersionLiveness(activeItem?.versions ?? [], !!activeItem);
+  const stampedVersions = useStampedVersions(activeItem?.versions, versionLiveness);
 
   const playerConfig = useMemo<PlayerConfig>(
     () => ({
@@ -930,6 +929,7 @@ function WatchPlaybackHostContent() {
     },
     [requestKeyValue, setPictureInPictureActive],
   );
+  const inRoom = Boolean(activeRequest?.roomId && activeRequest.roomToken);
   const handlePlaybackStateChange = useCallback(
     (snapshot: WatchPlaybackSnapshot) => {
       if (!requestKeyValue) return;
@@ -942,8 +942,13 @@ function WatchPlaybackHostContent() {
       // Enter post-roll early when approaching end of a series episode.
       // Fires regardless of whether a next episode exists so the end-of-
       // series case still gets a graceful overlay instead of an HLS tail loop.
+      // A Watch Together room decides what follows for everyone: it returns to
+      // its lobby when the item finishes. The player's room exit only goes
+      // back to the room from the foreground, so post-roll would leave the
+      // member on an empty player page.
       if (
         !postRollEnteredRef.current &&
+        !inRoom &&
         seriesIdRef.current &&
         modeRef.current === "foreground" &&
         snapshot.duration > 0 &&
@@ -955,7 +960,7 @@ function WatchPlaybackHostContent() {
         controller.enterPostRoll(requestKeyValue);
       }
     },
-    [requestKeyValue, updatePlaybackSnapshot, controller],
+    [requestKeyValue, updatePlaybackSnapshot, controller, inRoom],
   );
   const handlePlaybackTransportReady = useCallback(
     (controls: WatchPlaybackTransportControls | null) => {
@@ -1023,11 +1028,15 @@ function WatchPlaybackHostContent() {
   const maxBitrateKbps = effectivePlaybackSettings?.[SETTING_KEYS.PLAYBACK_MAX_BITRATE_KBPS]
     ?.value as number | null | undefined;
   // Stamp the server's liveness verdict on the rows before they become player
-  // props. The player's version menu reads a row's health from `available`; the
-  // watch detail does not carry it, so without this the menu shows no health.
+  // props (memoized above so the identity only moves with the rows or the
+  // verdicts). The player's version menu reads a row's health from
+  // `available`; the watch detail does not carry it, so without this the menu
+  // shows no health. Versions is absent until the detail read resolves (the
+  // room-exit tests render without one), so fall back to an empty list rather
+  // than mapping over undefined.
   const itemForPlayer: WatchDetail = {
     ...activeItem,
-    versions: applyVersionAvailability(activeItem.versions, versionLiveness),
+    versions: stampedVersions,
   };
   const watchPageProps = buildWatchPageProps({
     request: activeRequest,
@@ -1091,6 +1100,7 @@ function WatchPlaybackHostContent() {
       <Suspense fallback={isForeground || isPostRoll ? <PlaybackPreparingScreen /> : null}>
         <WatchPage
           {...watchPageProps}
+          versionLiveness={versionLiveness}
           maxBitrateKbps={maxBitrateKbps ?? null}
           introSkipMode={introSkipMode}
           autoSkipRecap={autoSkipRecap}

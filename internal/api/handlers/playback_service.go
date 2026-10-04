@@ -40,12 +40,6 @@ type PlaybackCaller struct {
 	DeviceID, DeviceName, Platform                        string
 	UserAgent, RemoteAddr                                 string
 	ClientName, ClientVersion, ClientBuild, ClientChannel string
-	// SiloClientName is the X-Silo-Client product name the v2 listener labels
-	// its request metrics with. The first-party apps send it, not the
-	// X-Client-Name the playback operations declare, so a route event falls
-	// back to it to name its client in playback_route_events and in
-	// silo_playback_first_frame_seconds.
-	SiloClientName string
 }
 
 // PlaybackCapabilitiesView is the v2 capabilities body. State is always
@@ -188,7 +182,7 @@ func (h *PlaybackHandler) PlaybackCapabilities(ctx context.Context, userID int, 
 		return view, playbackOperationError(http.StatusConflict, "capability_not_configured", "Playback installation identity is not configured")
 	}
 	view.InstallationID = h.InstallationID
-	view.Features = append(playback.NativeServerFeaturesV3(), "sequenced_progress_v1", "fixed_media_file_v1", "marker_segments_v1")
+	view.Features = append(playback.NativeServerFeaturesV3(), "sequenced_progress_v1", "fixed_media_file_v1", "marker_segments_v1", "trickplay_v1")
 	if h.WatchTogetherAvailable {
 		view.Features = append(view.Features, "watch_party_source_fallback_v1", "watch_party_coordinator_v1")
 	}
@@ -785,7 +779,7 @@ func (h *PlaybackHandler) ReportRouteEventV2(ctx context.Context, caller Playbac
 		return playbackOperationError(http.StatusForbidden, "forbidden", "Route event does not belong to this profile")
 	}
 	event.Diagnostics = sanitizeDiagnosticsV3(event.Diagnostics)
-	h.enqueueRouteEventV3(playback.RouteEventRecordV3{RouteEventV3: event, EventID: command.EventID, UserID: caller.UserID, ProfileID: caller.ProfileID, ClientName: firstNonEmptyValue(caller.ClientName, caller.SiloClientName), ClientVersion: caller.ClientVersion, ClientBuild: caller.ClientBuild, ClientChannel: caller.ClientChannel, ClientModel: event.Diagnostics["device_model"]})
+	h.enqueueRouteEventV3(playback.RouteEventRecordV3{RouteEventV3: event, EventID: command.EventID, UserID: caller.UserID, ProfileID: caller.ProfileID, ClientName: caller.ClientName, ClientVersion: caller.ClientVersion, ClientBuild: caller.ClientBuild, ClientChannel: caller.ClientChannel, ClientModel: event.Diagnostics["device_model"]})
 	return nil
 }
 
@@ -848,6 +842,9 @@ func (h *PlaybackHandler) playbackInventoryForSession(ctx context.Context, sessi
 	if h == nil || session == nil {
 		return playback.PlaybackInventoryV3{}, playbackSessionNotFoundOperationError()
 	}
+	if h.fileResolver == nil {
+		return playback.PlaybackInventoryV3{}, errors.New("file resolver not configured")
+	}
 	file, err := h.fileResolver.GetByID(ctx, session.MediaFileID)
 	if err != nil || file == nil {
 		return playback.PlaybackInventoryV3{}, playbackOperationError(http.StatusNotFound, "not_found", "Media file not found")
@@ -861,6 +858,21 @@ func (h *PlaybackHandler) playbackInventoryForSession(ctx context.Context, sessi
 		}
 		effectiveVirtualURI = candidateURI
 		file = h.inventoryEffectiveFile(ctx, file, session, candidateURI)
+	}
+
+	return h.playbackInventoryForFileV3(ctx, session, record, file, effectiveVirtualURI)
+}
+
+// playbackInventoryForFileV3 builds the wire inventory for one session from an
+// already-resolved effective file. It is the shared tail of
+// playbackInventoryForSession and the in-memory serve for a refused probe: the
+// effective file, its identity, its status and its revision are all derived from
+// the file argument, so a caller can describe a session's inventory from a
+// catalog row or from probed-but-unwritten evidence without the two ever
+// disagreeing about the shape.
+func (h *PlaybackHandler) playbackInventoryForFileV3(ctx context.Context, session *playback.Session, record *playback.AttemptRecordV3, file *models.MediaFile, effectiveVirtualURI string) (playback.PlaybackInventoryV3, error) {
+	if h == nil || session == nil {
+		return playback.PlaybackInventoryV3{}, playbackSessionNotFoundOperationError()
 	}
 
 	var clientFeatures []string
@@ -1000,6 +1012,17 @@ type mediaFileSessionLookup interface {
 // read.
 const inventoryUpdatedPublishBudget = 3 * time.Second
 
+// inventoryPublishSummary reports what one PublishInventoryUpdated fan-out
+// actually delivered: the file id whose committed evidence was pushed, how many
+// live sessions received an inventory_updated event, and the revision of the
+// last delivery. Callers log it so a live run can confirm delivery instead of
+// inferring it from the absence of errors.
+type inventoryPublishSummary struct {
+	FileID           int
+	SessionsNotified int
+	Revision         string
+}
+
 // PublishInventoryUpdated pushes the probe-verified track inventory to every
 // live realtime session currently playing fileID. It is invoked from the
 // background probe's persistence points — the local start-path repair and the
@@ -1014,13 +1037,14 @@ const inventoryUpdatedPublishBudget = 3 * time.Second
 // a declared inventory is what the client already holds, so re-sending it would
 // be noise. The payload carries the session's inventory revision so a client
 // gates duplicates and out-of-order pushes.
-func (h *PlaybackHandler) PublishInventoryUpdated(ctx context.Context, fileID int) {
+func (h *PlaybackHandler) PublishInventoryUpdated(ctx context.Context, fileID int) inventoryPublishSummary {
+	summary := inventoryPublishSummary{FileID: fileID}
 	if h == nil || h.RealtimeHub == nil || fileID <= 0 {
-		return
+		return summary
 	}
 	lookup, ok := h.sessionMgr.(mediaFileSessionLookup)
 	if !ok {
-		return
+		return summary
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -1031,8 +1055,126 @@ func (h *PlaybackHandler) PublishInventoryUpdated(ctx context.Context, fileID in
 		if session == nil || session.ID == "" || !session.HasRealtimeConnection {
 			continue
 		}
-		h.publishInventoryUpdatedToSession(publishCtx, session)
+		revision, delivered := h.publishInventoryUpdatedToSession(publishCtx, session, "", nil)
+		if delivered {
+			summary.SessionsNotified++
+			summary.Revision = revision
+		}
 	}
+	return summary
+}
+
+// publishRefusedProbeInventory serves probe evidence that the identity guard
+// refused to write, without touching the catalog. The guard is right to block a
+// write whose path ownership cannot be proven, but playback truth must not stay
+// stale while it does: the probed tracks are the verified inventory of the
+// release the client is watching, so they are pushed in memory to every live
+// session bound to fileID. Only sessions whose bound virtual source names
+// candidateURI receive the override; a mismatch falls back to the committed
+// catalog inventory.
+//
+// It returns how many sessions received the overridden inventory and logs the
+// delivery, so the next live run can confirm the fallback reached the menu.
+func (h *PlaybackHandler) publishRefusedProbeInventory(ctx context.Context, fileID int, candidateURI string, probed *models.MediaFile) int {
+	if h == nil || h.RealtimeHub == nil || fileID <= 0 || probed == nil || strings.TrimSpace(candidateURI) == "" {
+		return 0
+	}
+	lookup, ok := h.sessionMgr.(mediaFileSessionLookup)
+	if !ok {
+		return 0
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	publishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), inventoryUpdatedPublishBudget)
+	defer cancel()
+	notified := 0
+	for _, session := range lookup.GetSessionsByMediaFileID(fileID) {
+		if session == nil || session.ID == "" || !session.HasRealtimeConnection {
+			continue
+		}
+		if _, delivered := h.publishInventoryUpdatedToSession(publishCtx, session, candidateURI, probed); delivered {
+			notified++
+		}
+	}
+	if notified > 0 {
+		slog.InfoContext(ctx, "virtual probe evidence served to live session without a catalog write",
+			virtualEvidenceLogKeyComponent, virtualEvidenceLogValueAPI,
+			virtualEvidenceLogKeyFileID, fileID,
+			"candidate_uri", candidateURI,
+			"sessions_notified", notified)
+	}
+	return notified
+}
+
+// refusedProbeInventoryFile overlays probed tracks onto a copy of the session's
+// effective catalog row when the session is bound to the exact candidate the
+// probe ran against. It returns nil when there is no override to apply, so the
+// caller keeps the committed catalog inventory. The returned file keeps the
+// row's id (the catalog is not written), takes the probed tracks, and is stamped
+// so the built inventory reports verified evidence and a fresh revision.
+func (h *PlaybackHandler) refusedProbeInventoryFile(ctx context.Context, session *playback.Session, candidateURI string, probed *models.MediaFile) *models.MediaFile {
+	if session == nil || probed == nil || strings.TrimSpace(candidateURI) == "" {
+		return nil
+	}
+	if !sameVirtualCandidate(session.VirtualSourceURI, candidateURI) {
+		return nil
+	}
+	base, err := h.fileResolver.GetByID(ctx, session.MediaFileID)
+	if err != nil || base == nil {
+		return nil
+	}
+	override := *base
+	override.AudioTracks = probed.AudioTracks
+	override.SubtitleTracks = probed.SubtitleTracks
+	override.ExternalSubtitles = probed.ExternalSubtitles
+	probedAt := time.Now().UTC()
+	override.ProbeUpdatedAt = &probedAt
+	return &override
+}
+
+// virtualSourceGenerationReader is the optional session-manager capability the
+// inventory publisher fences on. A manager that does not expose it (a minimal
+// test manager) keeps the prior best-effort behavior.
+type virtualSourceGenerationReader interface {
+	VirtualSourceGeneration(sessionID string) (uint64, error)
+}
+
+// inventorySourceGeneration reads the session's current source-binding
+// generation and reports whether the manager can supply one.
+func (h *PlaybackHandler) inventorySourceGeneration(sessionID string) (uint64, bool) {
+	reader, ok := h.sessionMgr.(virtualSourceGenerationReader)
+	if !ok {
+		return 0, false
+	}
+	generation, err := reader.VirtualSourceGeneration(sessionID)
+	if err != nil {
+		return 0, false
+	}
+	return generation, true
+}
+
+// sessionWithSourceGenerationReader is the optional session-manager capability
+// that returns a session copy paired with its candidate-binding generation from
+// one lock. Both come from the same read, so a caller cannot compare a copy
+// against a generation that belongs to a different binding move.
+type sessionWithSourceGenerationReader interface {
+	GetSessionWithSourceGeneration(sessionID string) (*playback.Session, uint64, error)
+}
+
+// sessionWithSourceGeneration reads the live session and its binding generation
+// atomically. It reports false for a manager that does not expose the pairing
+// (a minimal test manager) so the caller keeps its prior best-effort behavior.
+func (h *PlaybackHandler) sessionWithSourceGeneration(sessionID string) (*playback.Session, uint64, bool) {
+	reader, ok := h.sessionMgr.(sessionWithSourceGenerationReader)
+	if !ok {
+		return nil, 0, false
+	}
+	session, generation, err := reader.GetSessionWithSourceGeneration(sessionID)
+	if err != nil || session == nil {
+		return nil, 0, false
+	}
+	return session, generation, true
 }
 
 // publishInventoryUpdatedToSession builds and delivers one inventory_updated
@@ -1040,7 +1182,16 @@ func (h *PlaybackHandler) PublishInventoryUpdated(ctx context.Context, fileID in
 // through the same playbackInventoryForSession the inventory endpoint uses, so
 // a rotation, a re-probe, and a poll can never disagree about the tracks, the
 // effective identity, or the revision.
-func (h *PlaybackHandler) publishInventoryUpdatedToSession(ctx context.Context, session *playback.Session) {
+//
+// probed, when non-nil, is probe evidence that could not be written to the
+// catalog (the identity guard refused the write). It is applied only to a
+// session whose bound virtual source names candidateURI, so a refused probe can
+// still reach the live menu of the exact release it probed without being shown
+// to a session playing anything else.
+//
+// It returns the delivered revision and whether an event was actually sent, so
+// the caller can log delivery without re-deriving it.
+func (h *PlaybackHandler) publishInventoryUpdatedToSession(ctx context.Context, session *playback.Session, candidateURI string, probed *models.MediaFile) (string, bool) {
 	// Two background probes (a start-path repair and a virtual-evidence worker)
 	// can publish for the same session concurrently. Serialize the build and
 	// the send under the session's per-session lock so an older build cannot be
@@ -1049,33 +1200,76 @@ func (h *PlaybackHandler) publishInventoryUpdatedToSession(ctx context.Context, 
 	// indistinguishable from a fresh state at the receiver.
 	release := h.progressSideEffectLock(session.ID)
 	defer release()
+	// The caller enumerated sessions before the lock was held, so the snapshot
+	// it passed can already name a superseded source binding. Re-read the live
+	// session under the lock and take the binding generation from that same
+	// read, then re-check the generation before the send: a binding move that
+	// lands while the inventory is being resolved invalidates this build
+	// instead of delivering an older release's revision after a newer one. The
+	// move's own publish carries the current revision. Reading the generation
+	// with the copy (not separately afterwards) means a move that lands between
+	// the read and the comparison cannot make a payload built from the current
+	// source look stale: only a build whose live copy is genuinely superseded is
+	// dropped.
+	generation, hasGeneration := h.inventorySourceGeneration(session.ID)
+	live, err := h.sessionMgr.GetSession(session.ID)
+	if err != nil || live == nil {
+		return "", false
+	}
+	if refreshed, gen, ok := h.sessionWithSourceGeneration(session.ID); ok {
+		live = refreshed
+		generation = gen
+		hasGeneration = true
+	}
 	var record *playback.AttemptRecordV3
 	if h.PlanStoreV3 != nil {
 		if loaded, err := h.PlanStoreV3.GetAttempt(ctx, session.ID); err == nil {
 			record = loaded
 		}
 	}
-	inventory, err := h.playbackInventoryForSession(ctx, session, record)
+	var inventory playback.PlaybackInventoryV3
+	if override := h.refusedProbeInventoryFile(ctx, live, candidateURI, probed); override != nil {
+		// Refused (unwritten) evidence for the exact release this session is
+		// bound to: serve the probed tracks in memory. The catalog row is
+		// untouched, so the effective identity stays the row's own id and the
+		// client's revision gate still sees a new revision.
+		inventory, err = h.playbackInventoryForFileV3(ctx, live, record, override, candidateURI)
+	} else {
+		inventory, err = h.playbackInventoryForSession(ctx, live, record)
+	}
 	if err != nil {
 		slog.DebugContext(ctx, "inventory updated event skipped: inventory unavailable",
 			"component", "playback", "session", session.ID, "error", err)
-		return
+		return "", false
 	}
 	if inventory.InventoryStatus != string(ProbeProvenanceVerified) {
 		// The probe has not upgraded this session's bound release, so the client
 		// already holds exactly this declared inventory.
-		return
+		return inventory.InventoryRevision, false
+	}
+	if hasGeneration {
+		if current, ok := h.inventorySourceGeneration(session.ID); !ok || current != generation {
+			slog.DebugContext(ctx, "inventory updated event skipped: source binding moved while building",
+				"component", "playback", "session", session.ID, "built_generation", generation)
+			return inventory.InventoryRevision, false
+		}
 	}
 	event, err := playback.NewInventoryUpdatedEvent(session.ID, inventory)
 	if err != nil {
 		slog.WarnContext(ctx, "failed to encode inventory updated realtime event",
 			"component", "playback", "session", session.ID, "error", err)
-		return
+		return inventory.InventoryRevision, false
 	}
-	if err := h.RealtimeHub.Send(session.ID, event); err != nil && !errors.Is(err, playback.ErrRealtimeConnectionNotFound) {
-		slog.WarnContext(ctx, "failed to deliver inventory updated realtime event",
-			"component", "playback", "session", session.ID, "error", err)
+	if err := h.RealtimeHub.Send(session.ID, event); err != nil {
+		if !errors.Is(err, playback.ErrRealtimeConnectionNotFound) {
+			slog.WarnContext(ctx, "failed to deliver inventory updated realtime event",
+				"component", "playback", "session", session.ID, "error", err)
+		}
+		// A session without a realtime connection received nothing; do not
+		// count it as notified.
+		return inventory.InventoryRevision, false
 	}
+	return inventory.InventoryRevision, true
 }
 
 // ReplanDigestV3 fingerprints the exact replan body so a reused request id with

@@ -57,6 +57,41 @@ const ASS_STALL_TIMEOUT_MS = 60_000;
 const ASS_WINDOW_MAX_ATTEMPTS = 3;
 // Retry backoff after a failed windowed attempt.
 const ASS_RETRY_BACKOFF_MS = 5_000;
+// Hard ceiling on consecutive subtitle TEXT fetch failures for one mount,
+// counting the windowed attempts and the whole-track fallback together. The
+// per-position windowed budget resets on a seek so a new position gets a fair
+// try, which lets a release that errors every request be re-fetched forever as
+// playback re-anchors; this counter does not reset on a seek. Once it is spent
+// the pipeline latches terminal.
+const ASS_TEXT_MAX_FAILURES = 4;
+// Generous ceiling for explicitly-retryable TEXT failures (502/503/504/429/
+// 408) on the same backoff loop. A transient upstream flap must not spend the
+// 4-deep terminal budget above, but a source that never recovers still
+// terminates instead of polling forever.
+const ASS_RETRYABLE_TEXT_MAX_FAILURES = 12;
+
+/** True for statuses the server marks retry-after-backoff rather than failed. */
+function isRetryableSubtitleStatus(status: number): boolean {
+  return status === 408 || status === 429 || status === 502 || status === 503 || status === 504;
+}
+
+/** A non-OK subtitle response, carrying the status so the retry policy can
+ * distinguish a definitive 4xx from a possibly-transient failure. */
+class SubtitleFetchError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = "SubtitleFetchError";
+  }
+}
+
+/** True when a status cannot be satisfied by retrying the same URL. */
+function isDefinitiveSubtitleStatus(status: number): boolean {
+  // 409 is resolved by a replan, not a retry, and is handled before this.
+  return status >= 400 && status < 500 && status !== 409;
+}
 // Bounded background refresh of a font bundle the server reported as pending
 // (empty bundle, extraction still running). It stops as soon as fonts arrive
 // or a definitive font-less bundle is reported, so it can never poll forever.
@@ -187,6 +222,9 @@ export function useASSSubtitles(
   sourceGeneration = 0,
   videoFit: VideoFitMode = "contain",
   coverCrop: CoverCrop = NO_COVER_CROP,
+  // Bumped when the server retimed the active track behind an unchanged URL
+  // (subtitle sync or a timing reset); changing it reloads the track.
+  cueRevision = 0,
 ): { isActive: boolean } {
   const onLoadStateRef = useRef(onLoadState);
   onLoadStateRef.current = onLoadState;
@@ -274,6 +312,16 @@ export function useASSSubtitles(
     // no further attempts, ever.
     let windowFailures = 0;
     let terminal = false;
+    // Consecutive TEXT fetch failures for this mount, reset only on a
+    // successful load — not on a seek. Unlike `windowFailures` (which a seek
+    // resets so a new position gets a fair try), this is the backstop that
+    // stops a release erroring every request from being re-fetched forever.
+    let textFailures = 0;
+    // Consecutive explicitly-retryable TEXT failures (502/503/504/429/408)
+    // since the last successful load. Same backoff loop on a separate generous
+    // budget so a transient upstream flap does not spend the terminal budget
+    // and wedge the mount on "Retrying…".
+    let retryableTextFailures = 0;
     let busy = false;
     // Newest seek target queued while an attempt is in flight.
     let pendingStart: number | null = null;
@@ -452,7 +500,7 @@ export function useASSSubtitles(
               onSourceChangedRef.current?.();
               throw new DOMException("Subtitle source changed", "AbortError"); // bypass the retry
             }
-            throw new Error(`HTTP ${response.status}`);
+            throw new SubtitleFetchError(response.status, `HTTP ${response.status}`);
           }
           progress();
           if (!response.body) return response.text();
@@ -534,14 +582,15 @@ export function useASSSubtitles(
         () => jassubRef.current === instance,
       );
       if (!cancelled && !signal.aborted && jassubRef.current === instance) {
-        // The window this instance now renders is `start`, not the bounds the
-        // effect began with. Advance them (or latch the whole-track fallback)
-        // so the next timeupdate boundary check is measured against the track
-        // actually loaded; otherwise every tick past the stale end refetches.
+        // Advance to the window this instance renders so the next
+        // timeupdate check measures against the loaded track, then clear
+        // the failure budgets so a later unrelated error starts fresh.
         usingWholeTrack = wholeTrack;
         windowStart = start;
         windowEnd = wholeTrack ? Infinity : start + ASS_WINDOW_DURATION_SECONDS;
         windowFailures = 0;
+        textFailures = 0;
+        retryableTextFailures = 0;
         onLoadStateRef.current?.("ready");
       }
     }
@@ -552,6 +601,12 @@ export function useASSSubtitles(
      * instead of blocking the pipeline forever. Success resets the shared
      * budget inside `initJASSUB`; failure applies the one finite policy:
      * 3 windowed attempts, then 1 whole-track fallback, then terminal.
+     *
+     * Two things end the loop early rather than retrying: a definitive 4xx
+     * (the URL can never satisfy this request, so the whole-track fallback is
+     * pointless too), and the shared ASS_TEXT_MAX_FAILURES ceiling, which stops
+     * a release that errors every request from being re-fetched forever as the
+     * window re-anchors on seeks.
      */
     async function attempt(start: number, wholeTrack: boolean) {
       if (cancelled || terminal || busy) return;
@@ -576,13 +631,39 @@ export function useASSSubtitles(
         // refresh adopts a new plan and activeUrl changes.
         if (sourceChangedSignaled) return;
         if (supersededBySeek) {
-          // A seek cancelled this request to replace it: do not count it.
+          // A seek cancelled this request to replace it: it is not a failure.
           return;
         }
         console.error("[useASSSubtitles] Unable to load subtitles:", err);
         onLoadStateRef.current?.("error");
-        if (wholeTrack) {
+        // Count every genuine failure (a 4xx, 5xx, stall, or network error)
+        // against the shared ceiling before deciding the next step — except
+        // explicitly-retryable statuses, which ride the same backoff loop on
+        // a separate generous budget so a transient upstream flap does not
+        // spend the terminal budget and wedge the mount on "Retrying…".
+        const retryableFailure =
+          err instanceof SubtitleFetchError && isRetryableSubtitleStatus(err.status);
+        if (retryableFailure) {
+          retryableTextFailures += 1;
+          if (retryableTextFailures >= ASS_RETRYABLE_TEXT_MAX_FAILURES) {
+            terminal = true;
+            return;
+          }
+        } else {
+          retryableTextFailures = 0;
+          textFailures += 1;
+        }
+        if (wholeTrack && !retryableFailure) {
           // The whole-track fallback failed too: terminal, no retry loop.
+          // A retryable whole-track failure falls through to the backoff
+          // retry below so a flap recovers instead of wedging the mount.
+          terminal = true;
+          return;
+        }
+        // A definitive 4xx cannot be fixed by the whole-track fallback or
+        // another windowed attempt: stop now instead of burning the budget on
+        // requests the server has already rejected.
+        if (err instanceof SubtitleFetchError && isDefinitiveSubtitleStatus(err.status)) {
           terminal = true;
           return;
         }
@@ -591,6 +672,12 @@ export function useASSSubtitles(
           // Bounded windowed retries exhausted: request the param-less
           // whole-track URL once instead of hammering the failing window.
           usingWholeTrack = true;
+        }
+        if (textFailures >= ASS_TEXT_MAX_FAILURES) {
+          // The shared failure ceiling is spent: no further attempt, even the
+          // whole-track fallback.
+          terminal = true;
+          return;
         }
         const retryStart = usingWholeTrack
           ? windowStart
@@ -666,7 +753,7 @@ export function useASSSubtitles(
     // videoRef is a stable ref object. streamOriginSeconds is read from
     // sourceOriginRef inside the async function to always get the latest value.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeUrl, activeLanguage, activeFontBundleUrl, isDetached, sourceGeneration]);
+  }, [activeUrl, activeLanguage, activeFontBundleUrl, isDetached, sourceGeneration, cueRevision]);
 
   // Update JASSUB's time offset when either the media timeline remaps or
   // the user nudges subtitle sync. Avoids destroying and recreating the

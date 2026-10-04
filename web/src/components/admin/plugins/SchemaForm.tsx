@@ -48,9 +48,24 @@ type Props = {
   optionsLoading?: boolean;
   idPrefix?: string;
   onValidityChange?: (valid: boolean) => void;
+  /**
+   * Fields the host owns for this form and does not show. Their values pass
+   * through untouched, they are left out of validation (an admin could not fix
+   * a field they cannot see), and a section left with no fields is dropped.
+   */
+  hiddenKeys?: readonly string[];
+  /** Render every section open and without its Show/Hide toggle. */
+  expandSections?: boolean;
+  /**
+   * Fields shown but not editable right now, each with the reason, which is
+   * shown under the control (e.g. why a server's type cannot change).
+   */
+  lockedKeys?: Readonly<Record<string, string>>;
 };
 
 const EMPTY_LIBRARIES: Library[] = [];
+const NO_HIDDEN_KEYS: readonly string[] = [];
+const NO_LOCKED_KEYS: Readonly<Record<string, string>> = {};
 
 function optionsFor(
   field: PluginAdminFormField,
@@ -93,6 +108,9 @@ function isPending(
 ): boolean {
   return Boolean(field.dynamic_options) && Boolean(optionsLoading) && options.length === 0;
 }
+
+// Stands in for a SELECT option whose value is the empty string.
+const EMPTY_OPTION_VALUE = "\u0000empty";
 
 // Loading placeholder for a single dynamic SELECT: a select-sized row with a
 // spinner and a shimmer bar, so the field reads as "fetching from the service".
@@ -177,12 +195,14 @@ function SchemaFormSection({
   values,
   fields,
   forceOpen,
+  expanded,
   renderFields,
 }: {
   section: PluginAdminFormSection;
   values: Record<string, unknown>;
   fields: PluginAdminFormField[];
   forceOpen: boolean;
+  expanded: boolean;
   renderFields: (keys: string[]) => React.ReactNode;
 }) {
   // null = operator hasn't toggled; fall back to collapsed_default. forceOpen
@@ -193,8 +213,9 @@ function SchemaFormSection({
     return null;
   }
 
+  const collapsible = section.collapsible && !expanded;
   const open = forceOpen || (userOpen ?? !section.collapsed_default);
-  const showFields = section.collapsible ? open : true;
+  const showFields = collapsible ? open : true;
 
   return (
     <section className="border-border/70 bg-muted/10 space-y-3 rounded-lg border p-4">
@@ -203,7 +224,7 @@ function SchemaFormSection({
           <Label className="text-foreground text-sm font-semibold">{section.title}</Label>
           <FieldDescription text={section.description} />
         </div>
-        {section.collapsible ? (
+        {collapsible ? (
           <Button type="button" size="xs" variant="ghost" onClick={() => setUserOpen(!open)}>
             {open ? "Hide" : "Show"}
           </Button>
@@ -223,6 +244,9 @@ export function SchemaForm({
   optionsLoading,
   idPrefix = "schema",
   onValidityChange,
+  hiddenKeys = NO_HIDDEN_KEYS,
+  expandSections = false,
+  lockedKeys = NO_LOCKED_KEYS,
 }: Props) {
   // /api/v2/libraries is admin-gated and SchemaForm renders on user-facing
   // pages too, so only ask for the library list when a picker needs it.
@@ -231,19 +255,20 @@ export function SchemaForm({
     [descriptor.fields],
   );
   const libraries = useAdminLibraries({ enabled: hasLibraryPicker }).data ?? EMPTY_LIBRARIES;
-
+  const hidden = useMemo(() => new Set(hiddenKeys), [hiddenKeys]);
   const byKey = useMemo(() => {
     const map = new Map<string, PluginAdminFormField>();
     for (const field of descriptor.fields) {
-      map.set(field.key, field);
+      if (!hidden.has(field.key)) map.set(field.key, field);
     }
     return map;
-  }, [descriptor.fields]);
+  }, [descriptor.fields, hidden]);
 
-  const clientErrors = useMemo(
-    () => validateSchemaValues(descriptor, values),
-    [descriptor, values],
-  );
+  const clientErrors = useMemo(() => {
+    const all = validateSchemaValues(descriptor, values);
+    if (hidden.size === 0) return all;
+    return Object.fromEntries(Object.entries(all).filter(([key]) => !hidden.has(key)));
+  }, [descriptor, values, hidden]);
 
   const mergedErrors = useMemo(() => {
     return { ...clientErrors, ...(errors ?? {}) };
@@ -271,8 +296,24 @@ export function SchemaForm({
     onChange({ ...values, [key]: value });
   }
 
+  function lockNoteId(field: PluginAdminFormField): string {
+    return `${idPrefix}-${field.key}-locked`;
+  }
+
+  // The reason a locked field cannot change, tied to its control.
+  function renderLockNote(field: PluginAdminFormField): React.ReactNode {
+    const reason = lockedKeys[field.key];
+    return reason ? (
+      <p id={lockNoteId(field)} className="text-muted-foreground text-xs">
+        {reason}
+      </p>
+    ) : null;
+  }
+
   function renderControl(field: PluginAdminFormField): React.ReactNode {
     const id = `${idPrefix}-${field.key}`;
+    const locked = lockedKeys[field.key] !== undefined;
+    const describedBy = locked ? lockNoteId(field) : undefined;
 
     if (field.control === "SELECT") {
       const options = withCurrentLibraryOption(
@@ -283,17 +324,26 @@ export function SchemaForm({
       if (isPending(field, options, optionsLoading)) {
         return <SelectSkeleton />;
       }
+      // Radix reserves the empty string for "no selection", so an option
+      // whose value is "" (a plugin's "Provider default") travels as a
+      // stand-in and is written back as "".
+      const current = String(effectiveValue(field, values) ?? "");
+      const hasEmptyOption = options.some((option) => option.value === "");
+      const toItem = (value: string) => (value === "" ? EMPTY_OPTION_VALUE : value);
       return (
         <Select
-          value={String(effectiveValue(field, values) ?? "")}
-          onValueChange={(nextValue) => setField(field.key, nextValue)}
+          value={hasEmptyOption ? toItem(current) : current}
+          onValueChange={(nextValue) =>
+            setField(field.key, nextValue === EMPTY_OPTION_VALUE ? "" : nextValue)
+          }
+          disabled={locked}
         >
-          <SelectTrigger id={id} className="w-full">
+          <SelectTrigger id={id} className="w-full" aria-describedby={describedBy}>
             <SelectValue placeholder={field.placeholder || "Select"} />
           </SelectTrigger>
           <SelectContent>
             {options.map((option) => (
-              <SelectItem key={option.value} value={option.value}>
+              <SelectItem key={option.value} value={toItem(option.value)}>
                 {option.label}
               </SelectItem>
             ))}
@@ -326,6 +376,8 @@ export function SchemaForm({
                 type="button"
                 size="xs"
                 variant={isSelected ? "default" : "outline"}
+                disabled={locked}
+                aria-describedby={describedBy}
                 onClick={() => {
                   const next = isSelected
                     ? selected.filter((value) => value !== option.value)
@@ -353,6 +405,8 @@ export function SchemaForm({
           data-1p-ignore="true"
           data-bwignore="true"
           onChange={(event) => setField(field.key, event.target.value)}
+          disabled={locked}
+          aria-describedby={describedBy}
         />
       );
     }
@@ -361,6 +415,8 @@ export function SchemaForm({
     return (
       <Input
         id={id}
+        disabled={locked}
+        aria-describedby={describedBy}
         type={isSecretOrPassword ? "password" : field.control === "NUMBER" ? "number" : "text"}
         autoComplete={isSecretOrPassword ? "new-password" : "off"}
         data-1p-ignore="true"
@@ -389,6 +445,7 @@ export function SchemaForm({
           <FieldDescription text={field.description} />
         </div>
         {renderControl(field)}
+        {renderLockNote(field)}
         {err ? <p className="text-destructive text-xs">{err}</p> : null}
       </div>
     );
@@ -407,12 +464,15 @@ export function SchemaForm({
             className="mt-0.5 shrink-0"
             checked={Boolean(effectiveValue(field, values))}
             onCheckedChange={(checked) => setField(field.key, checked)}
+            disabled={lockedKeys[field.key] !== undefined}
+            aria-describedby={lockedKeys[field.key] !== undefined ? lockNoteId(field) : undefined}
           />
           <div className="min-w-0 space-y-0.5">
             <Label htmlFor={id} className="cursor-pointer font-medium">
               {field.label || field.key}
             </Label>
             <FieldDescription text={field.description} />
+            {renderLockNote(field)}
           </div>
         </div>
         {err ? <p className="text-destructive mt-1.5 ml-11 text-xs">{err}</p> : null}
@@ -469,7 +529,9 @@ export function SchemaForm({
       groupedKeys.add(key);
     }
   }
-  const ungroupedFields = descriptor.fields.filter((field) => !groupedKeys.has(field.key));
+  const ungroupedFields = descriptor.fields.filter(
+    (field) => !groupedKeys.has(field.key) && !hidden.has(field.key),
+  );
 
   const resolveKeys = (keys: string[]): PluginAdminFormField[] =>
     keys
@@ -479,16 +541,19 @@ export function SchemaForm({
   return (
     <div className="grid gap-5">
       {ungroupedFields.length > 0 ? renderFieldList(ungroupedFields) : null}
-      {sections.map((section) => (
-        <SchemaFormSection
-          key={section.key}
-          section={section}
-          values={values}
-          fields={descriptor.fields}
-          forceOpen={section.field_keys.some((key) => mergedErrors[key] != null)}
-          renderFields={(keys) => renderFieldList(resolveKeys(keys))}
-        />
-      ))}
+      {sections
+        .filter((section) => resolveKeys(section.field_keys).length > 0)
+        .map((section) => (
+          <SchemaFormSection
+            key={section.key}
+            section={section}
+            values={values}
+            fields={descriptor.fields}
+            forceOpen={section.field_keys.some((key) => mergedErrors[key] != null)}
+            expanded={expandSections}
+            renderFields={(keys) => renderFieldList(resolveKeys(keys))}
+          />
+        ))}
     </div>
   );
 }

@@ -54,7 +54,7 @@ services:
       - ${VIO_DATA_ROOT:-${SILO_DATA_ROOT:-/opt/vio}}/meilisearch:/meili_data
 
   vio:
-    image: ${VIO_IMAGE:-${SILO_IMAGE:-ghcr.io/drondeseries/vio:latest}}
+    image: ${VIO_IMAGE:-${SILO_IMAGE:-ghcr.io/kipsilabs/vio:dev}}
     restart: unless-stopped
     environment:
       MODE: integrated
@@ -105,7 +105,7 @@ services:
   # Optional distributed-mode example. Most single-host installs should
   # just use the integrated service above.
   # vio-proxy:
-  #   image: ${VIO_IMAGE:-${SILO_IMAGE:-ghcr.io/drondeseries/vio:latest}}
+  #   image: ${VIO_IMAGE:-${SILO_IMAGE:-ghcr.io/kipsilabs/vio:dev}}
   #   restart: unless-stopped
   #   profiles: [proxy]
   #   environment:
@@ -142,7 +142,7 @@ services:
   # Optional distributed-mode example. Most single-host installs should
   # just use the integrated service above.
   # vio-transcode:
-  #   image: ${VIO_IMAGE:-${SILO_IMAGE:-ghcr.io/drondeseries/vio:latest}}
+  #   image: ${VIO_IMAGE:-${SILO_IMAGE:-ghcr.io/kipsilabs/vio:dev}}
   #   restart: unless-stopped
   #   profiles: [transcode]
   #   environment:

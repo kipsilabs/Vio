@@ -76,6 +76,27 @@ func TestDeviceHeaderGuardRefusesRepeatedAndMalformedValues(t *testing.T) {
 	}
 }
 
+// The legacy X-Silo-Device-Id spelling is accepted on ingest (see
+// rejectMalformedDeviceHeader): a request carrying only the legacy spelling
+// has it promoted to X-Vio-Device-Id before the operation binds it.
+func TestDeviceHeaderGuardPromotesLegacySpelling(t *testing.T) {
+	svc := &fakeDownloadCreation{row: &downloads.Download{ID: "entry", ContentID: "movie", MediaFileID: 42, Revision: 1, CreatedAt: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)}}
+	deps := pilotDeps(nil, nil)
+	deps.DownloadCreation = svc
+	h := newTestHandler(t, deps)
+	body := `{"content_id":"movie","media_file_id":"42","expected_revision":0}`
+	r := httptest.NewRequest(http.MethodPost, Prefix+"/downloads", strings.NewReader(body))
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("Authorization", "Bearer "+memberToken)
+	r.Header.Set("X-Profile-Id", "p-owner")
+	r.Header.Set("X-Silo-Device-Id", "legacy-tv-1")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, r)
+	if rec.Code != http.StatusAccepted || svc.req.DeviceID != "legacy-tv-1" {
+		t.Fatalf("legacy header: %d %s %q", rec.Code, rec.Body.String(), svc.req.DeviceID)
+	}
+}
+
 // The guard runs for every v2 operation, including ones that never bind the
 // header, and its refusal is a problem document with the request id.
 func TestDeviceHeaderGuardCoversEveryOperation(t *testing.T) {
@@ -92,5 +113,31 @@ func TestDeviceHeaderGuardCoversEveryOperation(t *testing.T) {
 		if requestIDHeader(rec) == "" {
 			t.Fatalf("%s: refusal lost the request id", path)
 		}
+	}
+}
+
+// The legacy X-Silo-Client-Family spelling is promoted to X-Vio-Client-Family
+// before binding, like the legacy device header. Canonical wins when both are
+// present; an invalid legacy value is left for the operation's own enum
+// validation.
+func TestClientFamilyHeaderPromotesLegacySpelling(t *testing.T) {
+	promote := func(headers map[string]string) string {
+		rr := httptest.NewRequest(http.MethodGet, Prefix+"/system/info", nil)
+		for k, v := range headers {
+			rr.Header.Set(k, v)
+		}
+		rejectMalformedDeviceHeader(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			w.Header().Set("X-Promoted-Family", req.Header.Get(clientFamilyHeader))
+		})).ServeHTTP(httptest.NewRecorder(), rr)
+		return rr.Header.Get(clientFamilyHeader)
+	}
+	if got := promote(map[string]string{"X-Silo-Client-Family": "tv"}); got != "tv" {
+		t.Fatalf("legacy-only not promoted: %q", got)
+	}
+	if got := promote(map[string]string{"X-Vio-Client-Family": "mobile", "X-Silo-Client-Family": "tv"}); got != "mobile" {
+		t.Fatalf("canonical must win: %q", got)
+	}
+	if got := promote(map[string]string{"X-Silo-Client-Family": "not-a-family"}); got != "not-a-family" {
+		t.Fatalf("invalid legacy must pass through to operation validation: %q", got)
 	}
 }

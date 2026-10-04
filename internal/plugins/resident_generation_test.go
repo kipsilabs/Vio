@@ -8,6 +8,7 @@ import (
 	"time"
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
+	"github.com/Silo-Server/silo-plugin-sdk/pkg/pluginsdk/capability"
 
 	"github.com/Silo-Server/silo-server/internal/pluginhost"
 )
@@ -103,11 +104,11 @@ func (h *seqFakeHost) snapshot() (starts int, stopped []uint64) {
 func TestResidentSupervisorNewGenerationNeverAdoptsInFlightOlderLaunch(t *testing.T) {
 	old := buildResidentFixture(t)
 	store := newFakeServiceInstallationStore(&Installation{ID: 5, PluginID: "silo.test.resident", Version: "0.1.0", InstallPath: old, Enabled: true, Kind: KindPlugin})
-	store.listCapabilities = []*Capability{{InstallationID: 5, Type: "network_access_provider.v1", ID: "stub"}}
+	store.listCapabilities = []*Capability{{InstallationID: 5, Type: capability.NetworkAccessProvider, ID: "stub"}}
 	host := newSeqFakeHost()
 	service := &Service{installations: store, host: host}
 	service.resident = newResidentSupervisor(service, ResidentOptions{MinBackoff: 10 * time.Millisecond, MaxBackoff: 50 * time.Millisecond})
-	service.AddLifecycleHook(func(context.Context) { service.invalidateInstallationCache() })
+	service.AddLifecycleHook(func(context.Context) { service.InvalidateInstallationCache() })
 	service.AddLifecycleHook(func(ctx context.Context) { service.resident.Reconcile(ctx) })
 	t.Cleanup(func() {
 		host.release.Do(func() { close(host.gate) })

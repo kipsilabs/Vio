@@ -7,68 +7,21 @@ import {
   DropdownMenuLabel,
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
-import { mapAudioLabel } from "@/lib/mediaFormat";
-import { videoRangeLabel } from "@/lib/videoRange";
 import {
-  collectLanguageLabels,
-  extractSourceHint,
-  formatVersionDetail,
-  sanitizeVersionLabel,
+  audioLanguageLabels,
+  buildQualitySummary,
+  buildVersionDetailLine,
+  subtitleLanguageLabels,
 } from "./versionFormatUtils";
 import { audioScore, resolutionScore } from "./versionRankingUtils";
 import { isVersionUnavailable, useVersionVisibility } from "./versionAvailability";
 
-// ---------------------------------------------------------------------------
-// Exported helper functions (also used by tests)
-// ---------------------------------------------------------------------------
+export { buildQualitySummary };
 
-export function buildQualitySummary(version: FileVersion): string {
-  if (version.file_path) {
-    try {
-      const parsed = new URL(version.file_path, "http://silo.local");
-      if (parsed.searchParams.get("results") === "all" && !parsed.searchParams.has("result")) {
-        return "More results…";
-      }
-    } catch {
-      // Fall through to the regular media quality summary for malformed paths.
-    }
-  }
-  const parts: string[] = [];
-
-  if (version.resolution) parts.push(version.resolution);
-
-  const textToScan = [version.file_name, version.edition_raw].filter(Boolean).join(" ");
-  const sourceHint = textToScan ? extractSourceHint(textToScan) : null;
-  if (sourceHint) parts.push(sourceHint);
-
-  if (version.codec_video) parts.push(version.codec_video.toUpperCase());
-  const rangeLabel = videoRangeLabel(version);
-  if (rangeLabel) parts.push(rangeLabel);
-  if (version.codec_audio) parts.push(mapAudioLabel(version.codec_audio));
-  // Audio languages are now rendered as badges in the UI.
-  // const audioLangs = audioLanguageSummary(version.audio_tracks);
-  // if (audioLangs) parts.push(audioLangs);
-  // "virtual" is internal plumbing, not a user-facing codec; leaving it out
-  // lets the row fall back to its release identity instead of a bare "VIRTUAL".
-  if (parts.length === 0 && version.container && version.container.toLowerCase() !== "virtual") {
-    parts.push(version.container.toUpperCase());
-  }
-
-  return parts.join(" · ");
-}
-
-// The release name (provider label for virtual candidates, file stem for local
-// files) leads the line; edition_raw is the fallback for rows scanned before
-// release_name existed. Shared with the in-player version menu so both show the
-// same information and the same single size.
+// The item-page picker's detail line, sharing one derivation with the player
+// menu so empty details read identically across both lists.
 export function buildDetailLine(version: FileVersion): string {
-  return formatVersionDetail({
-    label: sanitizeVersionLabel(version.release_name || version.edition_raw),
-    fileSize: version.file_size,
-    scanText: [version.file_name, version.edition_raw, version.release_name]
-      .filter(Boolean)
-      .join(" "),
-  });
+  return buildVersionDetailLine(version);
 }
 
 export function sortByResolution(versions: FileVersion[]): FileVersion[] {
@@ -147,27 +100,23 @@ export default function VersionFlyoutItems({ versions, onPlayVersion }: VersionF
                   )}
                 </span>
                 <div className="flex flex-wrap gap-1">
-                  {collectLanguageLabels(version.audio_tracks?.map((t) => t.language) ?? []).map(
-                    (lang) => (
-                      <Badge
-                        key={lang}
-                        variant="outline"
-                        className="border-blue-500/20 bg-blue-500/10 px-1 py-0 text-[10px] font-medium text-blue-400"
-                      >
-                        <span className="mr-0.5 opacity-70">🔊</span>
-                        {lang}
-                      </Badge>
-                    ),
-                  )}
+                  {audioLanguageLabels(version.audio_tracks).map((lang) => (
+                    <Badge
+                      key={lang}
+                      variant="outline"
+                      className="border-blue-500/20 bg-blue-500/10 px-1 py-0 text-[10px] font-medium text-blue-400"
+                    >
+                      <span className="mr-0.5 opacity-70">🔊</span>
+                      {lang}
+                    </Badge>
+                  ))}
                 </div>
               </div>
               {detailLine && (
                 <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1">
                   <span className="text-muted-foreground text-xs">{detailLine}</span>
                   <div className="flex flex-wrap gap-1">
-                    {collectLanguageLabels(
-                      version.subtitle_tracks?.map((t) => t.language) ?? [],
-                    ).map((lang) => (
+                    {subtitleLanguageLabels(version.subtitle_tracks).map((lang) => (
                       <Badge
                         key={lang}
                         variant="outline"

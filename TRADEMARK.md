@@ -85,8 +85,8 @@ trademark policy in the upstream project.
 The only official Vio software comes from this repository and the builds it
 publishes:
 
-- the **Vio** repository — <https://github.com/drondeseries/vio-server>
-- container images at `ghcr.io/drondeseries/vio-server`
+- the **Vio** repository — <https://github.com/kipsilabs/Vio>
+- container images at `ghcr.io/kipsilabs/vio`
 
 Any "Vio" build that does not originate from the above is **not** official
 and is **not** authorized to present itself as Vio.

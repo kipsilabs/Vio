@@ -377,6 +377,13 @@ export interface ReplanRequestV3 {
   quality_preference: string;
   position_seconds: number;
   metered: boolean;
+  /**
+   * Re-negotiates the session's version-fallback intent. Set when the viewer
+   * re-arms Auto mid-session so a later dead-source recovery rotates even
+   * though the session started on an explicit pick. Omitted leaves the
+   * start-time intent unchanged. Never authorizes a healthy mid-play switch.
+   */
+  auto_fallback?: boolean;
   bandwidth_estimate_kbps?: number;
   bandwidth_cap_kbps?: number;
   selected_tracks: SelectedTracksV3;
@@ -670,6 +677,19 @@ export interface PlanV3 {
    * stamp-derived `inventory_status`.
    */
   inventory_provenance?: string;
+  /**
+   * The catalog row the client asked for when the effective release differs
+   * from it. Absent when the effective row is the requested one. It lets the
+   * player render an honest substitution notice without first diffing ids.
+   */
+  substituted_from_file_id?: number;
+  /**
+   * The machine-readable cause of a substitution, present only with
+   * `substituted_from_file_id`: a dead release, a provider listing failure, a
+   * transport failure, or a decode rejection. Unknown values are treated as a
+   * generic substitution.
+   */
+  substitution_reason?: string;
 }
 
 export interface TerminalV3 {

@@ -2,11 +2,13 @@ import type { VersionAudioTrack, VersionSubtitleTrack, VersionVideoTrack } from 
 import { normalizeSortCriteria } from "@/components/streaming/scoringPresets";
 import { englishLanguageName, getLanguageName } from "@/lib/languageNames";
 import type { ServerVersionRanking } from "@/lib/qualityRanking";
+import { videoRangeLabel, type VideoRangeTrack } from "@/lib/videoRange";
 import {
   formatBitrate,
   formatChannels,
   formatFileSize,
   formatSampleRate,
+  mapAudioLabel,
   stripReleaseSizeToken,
 } from "@/lib/mediaFormat";
 
@@ -36,6 +38,125 @@ export function collectLanguageLabels(
     labels.push(label);
   }
   return labels;
+}
+
+/** The track fields both the catalog and the player version shapes expose. */
+interface LanguageTrack {
+  language?: string;
+  languages?: string[];
+}
+
+/**
+ * Audio language badges for a version row. A track advertising a `languages`
+ * list (a MULTI track) contributes the whole list; otherwise its single
+ * `language`. This is the one derivation both the item-page picker and the
+ * in-player menu render, so the two lists agree badge for badge.
+ */
+export function audioLanguageLabels(tracks: ReadonlyArray<LanguageTrack> | undefined): string[] {
+  return collectLanguageLabels(
+    (tracks ?? []).flatMap((track) => {
+      const languages = track.languages?.filter((language) => language?.trim());
+      return languages && languages.length > 0 ? languages : [track.language?.trim()];
+    }),
+  );
+}
+
+/** Subtitle language badges for a version row, from the same helper as audio. */
+export function subtitleLanguageLabels(
+  tracks: ReadonlyArray<{ language?: string }> | undefined,
+): string[] {
+  return collectLanguageLabels((tracks ?? []).map((track) => track.language ?? ""));
+}
+
+/** The version fields a quality summary reads. Both version shapes satisfy it. */
+export interface QualitySummarySource {
+  file_path?: string;
+  resolution?: string;
+  codec_video?: string;
+  codec_audio?: string;
+  container?: string;
+  file_name?: string;
+  edition_raw?: string;
+  hdr?: boolean;
+  video_tracks?: VideoRangeTrack[];
+}
+
+/**
+ * The one-line quality summary a version row leads with, shared by every
+ * version list. It joins resolution, a source hint, the video codec, the
+ * dynamic range, and the audio codec, falling back to the container for
+ * ebook-style files, and labels the just-in-time "More results…" action.
+ */
+export function buildQualitySummary(version: QualitySummarySource): string {
+  if (version.file_path) {
+    try {
+      const parsed = new URL(version.file_path, "http://silo.local");
+      if (parsed.searchParams.get("results") === "all" && !parsed.searchParams.has("result")) {
+        return "More results…";
+      }
+    } catch {
+      // Fall through to the regular media quality summary for malformed paths.
+    }
+  }
+  const parts: string[] = [];
+
+  if (version.resolution) parts.push(version.resolution);
+
+  const textToScan = [version.file_name, version.edition_raw].filter(Boolean).join(" ");
+  const sourceHint = textToScan ? extractSourceHint(textToScan) : null;
+  if (sourceHint) parts.push(sourceHint);
+
+  if (version.codec_video) parts.push(version.codec_video.toUpperCase());
+  const rangeLabel = videoRangeLabel(version);
+  if (rangeLabel) parts.push(rangeLabel);
+  if (version.codec_audio) parts.push(mapAudioLabel(version.codec_audio));
+  // Audio languages are rendered as badges in the UI.
+  // "virtual" is internal plumbing, not a user-facing codec; leaving it out
+  // lets the row fall back to its release identity instead of a bare "VIRTUAL".
+  if (parts.length === 0 && version.container && version.container.toLowerCase() !== "virtual") {
+    parts.push(version.container.toUpperCase());
+  }
+
+  return parts.join(" · ");
+}
+
+/** The version fields a detail line reads. Both version shapes satisfy it. */
+export interface VersionDetailSource {
+  release_name?: string;
+  edition_raw?: string;
+  file_size?: number;
+  file_name?: string;
+}
+
+/**
+ * The release + structured size + source hint line a version row shows below
+ * the summary. The release name leads; `edition_raw` is the fallback for rows
+ * scanned before `release_name` existed. Shared so the in-player menu and the
+ * item-page picker read identically, including their empty-detail fallback.
+ */
+export function buildVersionDetailLine(version: VersionDetailSource): string {
+  return formatVersionDetail({
+    label: sanitizeVersionLabel(version.release_name || version.edition_raw),
+    fileSize: version.file_size,
+    scanText: [version.file_name, version.edition_raw, version.release_name]
+      .filter(Boolean)
+      .join(" "),
+  });
+}
+
+/** True when a version's custom-format score should render a badge. */
+export function hasFormatScore(score?: number): score is number {
+  return typeof score === "number" && score !== 0;
+}
+
+/** The ★ badge text for a custom-format score. */
+export function formatScoreBadgeLabel(score: number): string {
+  return `★ ${score}`;
+}
+
+/** The tooltip a format-score badge shows, naming the profile when ranked. */
+export function formatScoreTitle(score: number, profileLabel?: string | null): string {
+  return `Format score ${score}${profileLabel ? ` · ${profileLabel}` : ""}`;
 }
 
 /** Compact, deduplicated audio language list ("Multi/French") or null. */

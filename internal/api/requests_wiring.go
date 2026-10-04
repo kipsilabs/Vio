@@ -242,6 +242,39 @@ func (c *compositeRequestRouter) Validate(ctx context.Context, installationID in
 	return c.plugin.Validate(ctx, installationID, capabilityID, conn, siblings)
 }
 
+// RouterFeatures forwards the optional request_router.v1 feature read to
+// the provider that owns the capability. Without this the Service sees the
+// composite wrapper — which declares nothing itself — and season- or
+// progress-capable plugins read as incapable in mixed deployments. The
+// core virtual router declares no optional features, matching the
+// pre-composite behavior where its provider never satisfied the reader
+// assertion.
+func (c *compositeRequestRouter) RouterFeatures(ctx context.Context, installationID int, capabilityID string) (mediarequests.RouterFeatures, error) {
+	if c.isVirtual(installationID, capabilityID) {
+		return mediarequests.RouterFeatures{}, nil
+	}
+	if reader, ok := c.plugin.(mediarequests.RouterFeatureReader); ok {
+		return reader.RouterFeatures(ctx, installationID, capabilityID)
+	}
+	return mediarequests.RouterFeatures{}, nil
+}
+
+// RouterFeatures reads the optional request_router.v1 features the
+// capability's stored manifest declares, without launching the plugin.
+func (a PluginRequestRouterAdapter) RouterFeatures(ctx context.Context, installationID int, capabilityID string) (mediarequests.RouterFeatures, error) {
+	if a.Svc == nil {
+		return mediarequests.RouterFeatures{}, errors.New("request router plugin service is not configured")
+	}
+	descriptor, err := a.Svc.RequestRouterDescriptor(ctx, installationID, capabilityID)
+	if err != nil {
+		return mediarequests.RouterFeatures{}, err
+	}
+	return mediarequests.RouterFeatures{
+		SupportsSeasons:         descriptor.GetSupportsSeasons(),
+		ReportsDownloadProgress: descriptor.GetReportsDownloadProgress(),
+	}, nil
+}
+
 // AttachRequestRouter wires the router provider onto a requests service, combining
 // core virtual library routing (when active) and external plugin routing.
 func AttachRequestRouter(svc *mediarequests.Service, pluginService *plugins.Service, vlSvc ...*virtuallibrary.Service) {

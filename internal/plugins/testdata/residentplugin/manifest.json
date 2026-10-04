@@ -11,10 +11,14 @@
   ],
   "capabilities": [
     {
-      "type": "metadata_provider.v1",
+      "type": "network_access_provider.v1",
       "id": "stub",
       "display_name": "Resident Fixture",
-      "description": "Test fixture declaring a resident capability."
+      "description": "Test fixture declaring a resident capability.",
+      "network_access_provider": {
+        "provider": "stub",
+        "display_name": "Resident Fixture"
+      }
     }
   ]
 }

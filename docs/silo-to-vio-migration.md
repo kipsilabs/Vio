@@ -36,7 +36,7 @@ app is running:
 | Download artifacts | `silo-download-artifacts` (sibling of the transcode dir) | `vio-download-artifacts` | Same sibling-dir rule, new leaf name. Custom artifact dirs keep working unchanged. |
 | Env prefix | `SILO_*` | `VIO_*` | `SILO_DATA_ROOT` → `VIO_DATA_ROOT`, `SILO_IMAGE` → `VIO_IMAGE`, `SILO_PLUGIN_CACHE_DIR` → `VIO_PLUGIN_CACHE_DIR`, etc. Legacy `SILO_*` values are still accepted as fallback when the `VIO_*` equivalent is unset — set the `VIO_*` form going forward. |
 | Compose service | `silo` | `vio` | Update `docker compose logs`, `exec`, and health-check references. |
-| Container image | `ghcr.io/silo-server/silo-server:latest` (`SILO_IMAGE`) | `ghcr.io/drondeseries/vio-server:latest` (`VIO_IMAGE`) | Override `VIO_IMAGE` to pin a specific tag. |
+| Container image | `ghcr.io/silo-server/silo-server:latest` (`SILO_IMAGE`) | `ghcr.io/kipsilabs/vio:latest` (`VIO_IMAGE`) | Override `VIO_IMAGE` to pin a specific tag. |
 | PostgreSQL defaults | `POSTGRES_USER=silo`, `POSTGRES_DB=silo` | `POSTGRES_USER=vio`, `POSTGRES_DB=vio` for **new** installs | **Migrating installs must keep the old values.** If the old database used `silo` (or any custom) credentials, keep those exact values. Do not switch to the Vio defaults unless you are starting with a fresh database. |
 | Meilisearch index | `silo_media_items` (`catalog.search.meilisearch.index`) | unchanged in Phase 1 | Keep the existing index name and let the existing index keep serving. Do not rename or rebuild indexes as part of the cutover. |
 | Meilisearch embedder | `silo_recommendations` | unchanged in Phase 1 | Keep the existing embedder name. |
@@ -56,7 +56,7 @@ Translate your Silo values:
 MEDIA_ROOT=/host/path/to/media
 MEDIA_CONTAINER_ROOT=/old/container/path/to/media
 VIO_DATA_ROOT=/opt/vio
-VIO_IMAGE=ghcr.io/drondeseries/vio-server:latest
+VIO_IMAGE=ghcr.io/kipsilabs/vio:latest
 POSTGRES_USER=silo
 POSTGRES_PASSWORD=<existing password, unchanged>
 POSTGRES_DB=silo

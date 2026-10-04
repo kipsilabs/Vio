@@ -122,6 +122,40 @@ func virtualCandidateTrustedForOutageRetry(row *models.MediaFile, window time.Du
 	return virtualCandidateWithinStoreWindow(row, time.Now(), window)
 }
 
+// virtualPendingHoldCap bounds one wait for an in-flight AltMount import
+// (SABnzbd queue, not history). It matches the observed 1–10s fetch window:
+// long enough for a progressing download to flip to completed, short enough
+// that a stuck slot cannot pin playback.
+const virtualPendingHoldCap = 10 * time.Second
+
+// virtualPendingHoldReserve is the room the hold leaves for the retry
+// resolve after the pause: one probe-class attempt plus scheduling margin.
+// A caller with less than reserve plus a minimal pause degrades immediately
+// instead of waiting away the retry budget.
+const virtualPendingHoldReserve = 15 * time.Second
+
+// virtualPendingLoopPause spaces startup-loop retries of a pending release
+// so a lapsed input hold (low remaining budget) cannot spin fresh provider
+// listings with no sleep.
+const virtualPendingLoopPause = 1 * time.Second
+
+// waitVirtualPendingHold pauses for an in-flight import, bounded by the hold
+// cap and the caller's remaining budget. It reports whether the caller should
+// re-list: false when the pause would consume the room for the retry resolve,
+// in which case the caller degrades to the pending error immediately.
+func waitVirtualPendingHold(ctx context.Context) bool {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return sleepWithContext(ctx, virtualPendingHoldCap)
+	}
+	remaining := time.Until(deadline)
+	wait := min(virtualPendingHoldCap, remaining-virtualPendingHoldReserve)
+	if wait <= 0 {
+		return false
+	}
+	return sleepWithContext(ctx, wait)
+}
+
 // retryVirtualProviderOutageResolve runs resolve, and while it fails with a
 // transient provider-listing outage for a trusted session-bound row, retries
 // with the bounded schedule. A canceled request stops immediately. Retry
@@ -204,6 +238,23 @@ func virtualStartUnresolvedTerminalV3(resolveErr error) playback.DecisionRespons
 		return playback.NewTerminalResponseV3("virtual_source_unavailable", "The provider listed no streams for this title.", true)
 	default:
 		return playback.NewTerminalResponseV3("virtual_source_unavailable", "The virtual source could not be resolved for playback.", true)
+	}
+}
+
+// virtualSubstitutionReasonV3 classifies why a fresh start resolved to a
+// release other than the one the viewer requested, into the additive
+// substitution_reason wire value. A transient provider-listing outage and a
+// confirmed-dead pin are both listing failures; every other cause is left
+// unknown rather than guessed from a message.
+func virtualSubstitutionReasonV3(resolveErr error) string {
+	switch {
+	case errors.Is(resolveErr, ErrVirtualCandidateMarkedFailed):
+		// The requested release is confirmed dead, not merely unreachable.
+		return substitutionReasonDeadReleaseV3
+	case virtualProviderListingOutage(resolveErr):
+		return substitutionReasonListingFailedV3
+	default:
+		return substitutionReasonUnknownV3
 	}
 }
 

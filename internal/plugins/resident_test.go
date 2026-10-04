@@ -68,7 +68,7 @@ func newResidentFixture(t *testing.T, opts ResidentOptions) *residentFixture {
 		Enabled:     true,
 		Kind:        KindPlugin,
 	})
-	store.listCapabilities = []*Capability{{InstallationID: 5, Type: "network_access_provider.v1", ID: "stub"}}
+	store.listCapabilities = []*Capability{{InstallationID: 5, Type: capability.NetworkAccessProvider, ID: "stub"}}
 
 	broker := netaccess.NewBroker()
 	host := pluginhost.NewHost(pluginhost.Config{
@@ -90,7 +90,7 @@ func newResidentFixture(t *testing.T, opts ResidentOptions) *residentFixture {
 	service.resident = newResidentSupervisor(service, opts)
 	// Same hook order as NewService and NewNodeService: the row cache is
 	// dropped before the supervisor reads the rows.
-	service.AddLifecycleHook(func(context.Context) { service.invalidateInstallationCache() })
+	service.AddLifecycleHook(func(context.Context) { service.InvalidateInstallationCache() })
 	service.AddLifecycleHook(func(ctx context.Context) { service.resident.Reconcile(ctx) })
 	host.SetExitHandler(service.HandleResidentExit)
 	t.Cleanup(func() {
@@ -323,7 +323,7 @@ func TestResidentBackoffSchedule(t *testing.T) {
 }
 
 func TestResidentPredicateNeedsCapability(t *testing.T) {
-	if !IsResidentCapabilityType("network_access_provider.v1") {
+	if !IsResidentCapabilityType(capability.NetworkAccessProvider) {
 		t.Fatal("network_access_provider.v1 must be resident")
 	}
 	for _, typ := range []string{capability.MetadataProvider, capability.ScheduledTask, capability.WatchSyncProvider, ""} {
@@ -346,7 +346,7 @@ func TestResidentRestartOfNonResidentOnlyStops(t *testing.T) {
 	}
 	disabled := false
 	_ = store.Update(context.Background(), 2, UpdateInstallationInput{Enabled: &disabled})
-	service.invalidateInstallationCache()
+	service.InvalidateInstallationCache()
 	if err := service.RestartInstallation(context.Background(), 2); !errors.Is(err, ErrInstallationDisabled) {
 		t.Fatalf("RestartInstallation(disabled) = %v, want ErrInstallationDisabled", err)
 	}
@@ -505,14 +505,14 @@ func TestResidentSupervisorReplacesRehydratedProcessOnNewRelease(t *testing.T) {
 // Two enabled installations declaring one provider slug: only the lowest id
 // is resident. The duplicate is never commanded or reported, so it must not
 // run either.
-func skippedTestResidentSupervisorDoesNotStartADuplicateProviderSlug(t *testing.T) {
+func TestResidentSupervisorDoesNotStartADuplicateProviderSlug(t *testing.T) {
 	f := newResidentFixture(t, ResidentOptions{})
 	ctx := context.Background()
 	second := buildResidentFixture(t)
 	dup := &Installation{ID: 6, PluginID: "silo.test.resident-copy", Version: "0.1.0", InstallPath: second, Enabled: true, Kind: KindPlugin}
 	f.store.byID[dup.ID] = dup
 	f.store.byPluginID[dup.PluginID] = append(f.store.byPluginID[dup.PluginID], dup)
-	f.store.listCapabilities = append(f.store.listCapabilities, &Capability{InstallationID: 6, Type: "network_access_provider.v1", ID: "stub"})
+	f.store.listCapabilities = append(f.store.listCapabilities, &Capability{InstallationID: 6, Type: capability.NetworkAccessProvider, ID: "stub"})
 
 	f.service.StartResidents(ctx)
 	waitState(t, f.service, 5, "owner running", running)
@@ -530,7 +530,7 @@ func skippedTestResidentSupervisorDoesNotStartADuplicateProviderSlug(t *testing.
 	}
 }
 
-func skippedTestResidentLazyRPCDoesNotLaunchBeforeTheGateOpens(t *testing.T) {
+func TestResidentLazyRPCDoesNotLaunchBeforeTheGateOpens(t *testing.T) {
 	f := newResidentFixture(t, ResidentOptions{})
 	for _, armed := range []bool{false, true} {
 		if armed {
@@ -623,7 +623,7 @@ func TestResidentSupervisorConcurrentReconcilesDoNotResurrectADisabledResident(t
 	}
 }
 
-func skippedTestResidentSupervisorKeepsRunningProviderWhenManifestUnavailable(t *testing.T) {
+func TestResidentSupervisorKeepsRunningProviderWhenManifestUnavailable(t *testing.T) {
 	f := newResidentFixture(t, ResidentOptions{})
 	ctx := t.Context()
 	f.service.StartResidents(ctx)

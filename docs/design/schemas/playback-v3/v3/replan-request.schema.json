@@ -86,6 +86,10 @@
     "metered": {
       "type": "boolean"
     },
+    "auto_fallback": {
+      "type": "boolean",
+      "description": "Re-negotiates the session's version-fallback intent. Set when the viewer re-arms Auto mid-session so a later dead-source recovery rotates even though the session started on an explicit pick; omitted leaves the start-time intent unchanged. Never authorizes a healthy mid-play switch."
+    },
     "bandwidth_estimate_kbps": {
       "$ref": "#/$defs/bandwidth_kbps"
     },

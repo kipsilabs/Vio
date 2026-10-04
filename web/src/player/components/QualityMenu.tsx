@@ -8,9 +8,15 @@ import { useVersionSortPreference } from "@/hooks/useVersionSortPreference";
 import { sortVersionsByCriteria, type VersionSortable } from "@/lib/qualityRanking";
 import { resolveActiveQualityOptionId } from "../playback-info";
 import { deriveVersionHealth } from "@/lib/versionHealth";
+import type { EffectiveRecipeV3 } from "../protocol-v3";
 import type { PlayerIndexerRelease, QualityOption } from "../types";
 import { PlayerMenuSurface } from "./PlayerMenuSurface";
-import { serverRankingFromVersions } from "@/pages/ItemDetail/components/versionFormatUtils";
+import {
+  formatScoreBadgeLabel,
+  formatScoreTitle,
+  hasFormatScore,
+  serverRankingFromVersions,
+} from "@/pages/ItemDetail/components/versionFormatUtils";
 
 export interface VersionInfo {
   fileId: number;
@@ -44,6 +50,8 @@ export interface VersionInfo {
 interface QualityMenuProps {
   options: QualityOption[];
   activeId: string;
+  /** The plan's effective recipe, which shows when a bitrate cap reduced the source. */
+  deliveredRecipe?: EffectiveRecipeV3;
   isTranscoding: boolean;
   error: string | null;
   onSelect: (id: string) => void;
@@ -81,6 +89,7 @@ export { REFRESH_VERSIONS_ERROR };
 export function QualityMenu({
   options,
   activeId,
+  deliveredRecipe,
   isTranscoding,
   error,
   onSelect,
@@ -197,7 +206,7 @@ export function QualityMenu({
 
   if (options.length === 0) return null;
 
-  const resolvedActiveId = resolveActiveQualityOptionId(options, activeId);
+  const resolvedActiveId = resolveActiveQualityOptionId(options, activeId, deliveredRecipe);
   const activeOption = options.find((option) => option.id === resolvedActiveId);
   // Explicit roving-focus slots per group. Mixing a render-time counter with the
   // refresh rows' commit-time `ref` increments let one overwrite another; naming
@@ -241,6 +250,7 @@ export function QualityMenu({
 
       {open && (
         <PlayerMenuSurface
+          anchorRef={menuRef}
           className="absolute right-0 bottom-full z-30 mb-2 min-w-[200px] rounded-lg bg-black/90 py-1 shadow-lg backdrop-blur"
           onClose={() => setOpen(false)}
           onKeyDown={handleMenuKeyDown}
@@ -314,13 +324,15 @@ export function QualityMenu({
                       const idx = versionRowStart + versionIndex;
                       const statusLabels = buildVersionStatusLabels(v);
                       const health = versionHealthOf(v);
-                      const hasFormatScore =
-                        typeof v.formatScore === "number" && v.formatScore !== 0;
+                      const hasScore = hasFormatScore(v.formatScore);
+                      // One detail derivation for both lists; `detail` carries the
+                      // shared release+size+hint line, and `releaseName` is only a
+                      // fallback for callers that supply no detail at all.
                       const detailLine = v.detail || v.releaseName;
                       const audioLanguages = v.audioLanguages ?? [];
                       const subtitleLanguages = v.subtitleLanguages ?? [];
                       const hasBadges =
-                        hasFormatScore ||
+                        hasScore ||
                         statusLabels.length > 0 ||
                         audioLanguages.length > 0 ||
                         subtitleLanguages.length > 0;
@@ -351,20 +363,20 @@ export function QualityMenu({
                             </span>
                             {hasBadges && (
                               <span className="flex flex-wrap gap-1">
-                                {hasFormatScore && (
+                                {hasScore && (
                                   <span
                                     className="rounded border border-white/15 bg-white/10 px-1.5 py-0.5 text-[10px] leading-none text-white/60"
-                                    title={`Format score ${v.formatScore}${
-                                      v.profileLabel ? ` · ${v.profileLabel}` : ""
-                                    }`}
+                                    title={formatScoreTitle(v.formatScore!, v.profileLabel)}
                                   >
-                                    ★ {v.formatScore}
+                                    {formatScoreBadgeLabel(v.formatScore!)}
                                   </span>
                                 )}
                                 {statusLabels.map((status) => (
                                   <span
                                     key={status}
-                                    title={health && health.label === status ? health.title : undefined}
+                                    title={
+                                      health && health.label === status ? health.title : undefined
+                                    }
                                     className={`rounded border border-white/15 px-1.5 py-0.5 text-[10px] leading-none ${
                                       health && health.label === status && health.tone === "danger"
                                         ? "border-red-500/30 bg-red-500/20 text-red-400"

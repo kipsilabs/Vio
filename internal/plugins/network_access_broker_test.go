@@ -1,14 +1,10 @@
 package plugins
 
-// NOTE (fork, stripped for SDK): this file tested the provider-RPC path
-// (list/connect/disconnect/status through a live fixture plugin), which needs
-// network_access_provider.v1 support in the plugin SDK. The pinned SDK
-// predates it, so these tests are parked until the SDK is updated.
-
 import (
 	"context"
 	"net"
 	"os/exec"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -39,7 +35,7 @@ func (l *callbackListener) Accept() (net.Conn, error) {
 // The plugin must dial the callback stream during BindHostBroker, before any
 // capability RPC needs Host(). Observing that connection directly catches the
 // lazy-dial regression without waiting out go-plugin's pending-stream timeout.
-func skippedTestNetworkAccessHostCallbackConnectsAtBind(t *testing.T) {
+func TestNetworkAccessHostCallbackConnectsAtBind(t *testing.T) {
 	process := plugin.NewClient(&plugin.ClientConfig{
 		HandshakeConfig:  pluginhost.HandshakeConfig(),
 		AllowedProtocols: []plugin.Protocol{plugin.ProtocolGRPC},
@@ -82,5 +78,12 @@ func skippedTestNetworkAccessHostCallbackConnectsAtBind(t *testing.T) {
 	case <-observed.accepted:
 	case <-ctx.Done():
 		t.Fatal("plugin did not open its callback connection during binding")
+	}
+	status, err := client.NetworkAccessProvider().GetStatus(ctx, &pluginv1.NetworkAccessGetStatusRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Error != "" || !strings.HasSuffix(status.ProviderVersion, "host-ok") {
+		t.Fatalf("host callback failed: %+v", status)
 	}
 }

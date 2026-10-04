@@ -1509,7 +1509,9 @@ func ResolveQualityPolicyV3(request StartRequestV3, source SourceDescriptorV3) Q
 		warnings = append(warnings, DegradationWarningV3{Code: "quality_preference_normalized", Message: "Unknown quality preference was normalized to auto."})
 	}
 	capKbps := optionalValueV3(request.BandwidthCapKbps)
-	capExceededBySource := capKbps > 0 && source.BitrateKbps > capKbps
+	// The cap is a hard ceiling, so a video source whose bitrate is unknown
+	// cannot be shown to fit it, as with the server cap.
+	capExceededBySource := capKbps > 0 && (source.BitrateKbps > capKbps || source.BitrateKbps <= 0 && source.VideoCodec != "")
 	if quality == QualityOriginalV3 && !capExceededBySource {
 		result := originalQualityResultV3(source)
 		result.Warnings = warnings
@@ -1522,14 +1524,26 @@ func ResolveQualityPolicyV3(request StartRequestV3, source SourceDescriptorV3) Q
 	reason := "quality_auto_source"
 	explicitRung := false
 	capApplied := false
+	// budgetKbps is the share of a bandwidth estimate or cap that automatic
+	// quality plans for; the encode never targets more than it. A source over
+	// the estimate's budget is re-encoded at its own size rather than sent
+	// as-is; a cap keeps its own source rule below.
+	budgetKbps := 0
+	overEstimate := false
+	// classLimit is the tallest class the preference, device, bandwidth or
+	// cap allows, before the source's own height bounds targetHeight; 0 is
+	// no limit. It keeps a cropped source in the class it earned.
+	var classLimit int
 	switch {
 	case quality == QualityOriginalV3:
 		// Only reached when the source bitrate exceeds the cap: the cap is a
 		// hard ceiling and outranks the original preference.
-		targetHeight = ladderHeightForBandwidthV3(int(float64(capKbps) * 0.8))
+		targetHeight = streamLadderClassV3(capKbps, source)
+		classLimit = targetHeight
 		capApplied = true
 	case quality != "auto":
 		targetHeight, _ = strconv.Atoi(strings.TrimSuffix(quality, "p"))
+		classLimit = targetHeight
 		reason = "quality_fixed_rung"
 		explicitRung = true
 	default:
@@ -1538,14 +1552,29 @@ func ResolveQualityPolicyV3(request StartRequestV3, source SourceDescriptorV3) Q
 			targetHeight = maxHeight
 			reason = "quality_device_limit"
 		}
+		classLimit = maxHeight
 		bandwidth := optionalValueV3(request.BandwidthEstimateKbps)
+		fromEstimate := bandwidth > 0
 		if capKbps > 0 && (bandwidth == 0 || capKbps < bandwidth) {
 			bandwidth = capKbps
+			fromEstimate = false
 		}
 		if bandwidth > 0 {
-			targetHeight = minPositiveV3(targetHeight, ladderHeightForBandwidthV3(int(float64(bandwidth)*0.8)))
+			earned := streamLadderClassV3(bandwidth, source)
+			targetHeight = minPositiveV3(targetHeight, earned)
+			classLimit = minPositiveV3(classLimit, earned)
+			budgetKbps = streamBudgetKbpsV3(bandwidth)
+			// A source of unknown bitrate counts as needing the full bitrate
+			// of the class it would be sent at, so it goes as-is only when the
+			// budget covers that.
+			sourceKbps := source.BitrateKbps
+			if sourceKbps <= 0 {
+				sourceKbps = ladderClassBitrateKbpsV3(streamClassV3(minPositiveV3(targetHeight, source.Height), classLimit, source))
+			}
+			overEstimate = fromEstimate && sourceKbps > budgetKbps
 			reason = "quality_bandwidth_limit"
 		} else if request.Metered {
+			classLimit = minPositiveV3(classLimit, 720)
 			if capped := minPositiveV3(targetHeight, 720); capped != targetHeight {
 				targetHeight = capped
 				reason = "quality_metered_limit"
@@ -1572,11 +1601,12 @@ func ResolveQualityPolicyV3(request StartRequestV3, source SourceDescriptorV3) Q
 		reason = decisionReasonBandwidthCapV3
 		warnings = append(warnings, DegradationWarningV3{Code: "bandwidth_cap_applied", Message: "Delivery quality is limited by the configured bandwidth cap."})
 	}
-	if source.Height > 0 && targetHeight >= source.Height && !capApplied {
+	if source.Height > 0 && targetHeight >= source.Height && !capApplied && !overEstimate {
+		label, width, height := sourceFrameV3(source)
 		return QualityResultV3{
-			Label:           strconv.Itoa(source.Height) + "p",
-			Width:           source.Width,
-			Height:          source.Height,
+			Label:           label,
+			Width:           width,
+			Height:          height,
 			BitrateKbps:     source.BitrateKbps,
 			PreservesSource: true,
 			ExplicitRung:    explicitRung,
@@ -1584,20 +1614,39 @@ func ResolveQualityPolicyV3(request StartRequestV3, source SourceDescriptorV3) Q
 			Warnings:        warnings,
 		}
 	}
-	label := resolutionLabelV3(targetHeight)
-	effectiveHeight := resolutionHeightV3(label)
-	if source.Height > 0 && effectiveHeight > source.Height {
-		effectiveHeight = source.Height
-		label = resolutionLabelV3(effectiveHeight)
+	// Snap to a ladder class and fit the source into that class's box, so a
+	// scope film at the 1080p class is 1920x800. The label is the exact height
+	// the encoder scales to.
+	class := ladderClassesFrom(streamClassV3(targetHeight, classLimit, source))[0]
+	width, effectiveHeight := FitLadderBox(source.Width, source.Height, class.Height)
+	if effectiveHeight == 0 {
+		effectiveHeight = class.Height
 	}
-	width, bitrate := qualityDimensionsV3(effectiveHeight, source.Width, source.Height)
+	if width == 0 {
+		width = class.Width
+	}
+	// A fit that keeps an odd source frame still encodes an even one.
+	width, effectiveHeight = encodedFrame(source.Width, source.Height, width, effectiveHeight)
+	label := heightLabel(effectiveHeight)
+	bitrate := ladderClassBitrateKbpsV3(class.Height)
+	if budgetKbps > 0 && bitrate > budgetKbps {
+		// A class is earned at its floor, which can sit below the class
+		// bitrate; keep the headroom the class choice assumed.
+		bitrate = budgetKbps
+	}
+	if source.BitrateKbps > 0 {
+		// A smaller frame never needs more bits than the whole source used,
+		// counted as H.264, the output the planner starts from.
+		sourceEquivalent := int(float64(source.BitrateKbps) / codecEfficiency(source.VideoCodec))
+		bitrate = min(bitrate, max(sourceEquivalent, 1))
+	}
 	if capKbps > 0 && bitrate > capKbps {
 		// The ladder has no rung below 480p, so a cap under the lowest rung's
 		// bitrate is honored by lowering the encode target directly: the cap
 		// is a hard delivery ceiling, never advisory.
 		bitrate = capKbps
 	}
-	result := QualityResultV3{Label: label, Width: width, Height: effectiveHeight, BitrateKbps: bitrate, PreservesSource: !capApplied && source.Height > 0 && effectiveHeight >= source.Height, ExplicitRung: explicitRung, Reason: reason, Warnings: warnings}
+	result := QualityResultV3{Label: label, Width: width, Height: effectiveHeight, BitrateKbps: bitrate, PreservesSource: !capApplied && !overEstimate && source.Height > 0 && effectiveHeight >= source.Height, ExplicitRung: explicitRung, Reason: reason, Warnings: warnings}
 	result.RequiresTranscode = !result.PreservesSource
 	return result
 }
@@ -1628,10 +1677,11 @@ func compoundRungQualityResultV3(rung ladderRungV3, source SourceDescriptorV3, c
 	}
 	fitsRung := sourceClassHeight > 0 && sourceClassHeight <= rung.Height && source.BitrateKbps > 0 && source.BitrateKbps <= rung.BitrateKbps
 	if fitsRung && !capApplied {
+		label, width, height := sourceFrameV3(source)
 		return QualityResultV3{
-			Label:           strconv.Itoa(source.Height) + "p",
-			Width:           source.Width,
-			Height:          source.Height,
+			Label:           label,
+			Width:           width,
+			Height:          height,
 			BitrateKbps:     source.BitrateKbps,
 			PreservesSource: true,
 			ExplicitRung:    true,
@@ -1647,8 +1697,8 @@ func compoundRungQualityResultV3(rung ladderRungV3, source SourceDescriptorV3, c
 	if width == 0 {
 		width, _ = dimensionsFromResolutionV3(resolutionLabelV3(height))
 	}
-	// Keep the clamped height exact. The transcoder leaves non-ladder heights
-	// unscaled, preserving the source crop even on a lower-class rung.
+	// Keep the clamped height exact. The transcoder scales to exactly this
+	// height, so a source crop is preserved even on a lower-class rung.
 	targetLabel := strconv.Itoa(height) + "p"
 	return QualityResultV3{
 		Label:             targetLabel,
@@ -1701,8 +1751,43 @@ func forcedEncodeQualityResultV3(source SourceDescriptorV3, quality QualityResul
 	return replaced
 }
 
+// originalQualityResultV3 keeps the source's frame. Its label is the exact
+// source height: a class label would scale a 3840x1600 source to 1080 lines
+// whenever the original route still needs a video transcode.
 func originalQualityResultV3(source SourceDescriptorV3) QualityResultV3 {
-	return QualityResultV3{Label: resolutionLabelV3(source.Height), Width: source.Width, Height: source.Height, BitrateKbps: source.BitrateKbps, PreservesSource: true, Reason: "quality_original"}
+	label, width, height := sourceFrameV3(source)
+	return QualityResultV3{Label: label, Width: width, Height: height, BitrateKbps: source.BitrateKbps, PreservesSource: true, Reason: "quality_original"}
+}
+
+// streamClassV3 is the ladder class an automatic encode snaps into for a
+// target height already bounded by the source. A target below the source is
+// a downscale into the class at or below it. A target that keeps the source
+// height uses the class the source's frame belongs to by both dimensions,
+// within limit (0 for none), so a cropped 1920x800 film under a 1080p limit
+// re-encodes at its own size in the 1080p class rather than dropping to 720p.
+func streamClassV3(targetHeight, limit int, source SourceDescriptorV3) int {
+	class := ladderClassesFrom(targetHeight)[0].Height
+	if source.Height > 0 && targetHeight >= source.Height {
+		if own := ladderClassForSize(source.Width, source.Height); own > 0 {
+			class = own
+			if limit > 0 {
+				class = min(class, ladderClassesFrom(limit)[0].Height)
+			}
+		}
+	}
+	return class
+}
+
+// sourceFrameV3 is the frame a route that keeps the source size encodes when
+// it still converts (a codec change): the source frame with an odd height
+// rounded down to the even one 4:2:0 output needs, the width scale=-2 then
+// gives, and that height as the label. An unknown height has no label.
+func sourceFrameV3(source SourceDescriptorV3) (label string, width, height int) {
+	if source.Height <= 0 {
+		return "", source.Width, source.Height
+	}
+	width, height = encodedFrame(source.Width, source.Height, source.Width, source.Height)
+	return heightLabel(height), width, height
 }
 
 // hlsNativeAudioCodecV3 reports whether an audio codec can be stream-copied
@@ -2117,6 +2202,19 @@ func resolutionLabelV3(h int) string {
 		return "480p"
 	}
 }
+
+// streamLadderClassV3 is the ladder class a streaming bandwidth budget
+// earns for this source. Automatic quality keeps a fifth of the measured
+// bandwidth as headroom and plans H.264, the output every route can decode.
+func streamLadderClassV3(kbps int, source SourceDescriptorV3) int {
+	return LadderClassForBitrate(streamBudgetKbpsV3(kbps), source.FrameRate, transcodeCodecH264)
+}
+
+// streamBudgetKbpsV3 is the part of a bandwidth figure automatic quality
+// plans to use.
+func streamBudgetKbpsV3(kbps int) int {
+	return int(float64(kbps) * 0.8)
+}
 func ladderHeightForBandwidthV3(kbps int) int {
 	switch {
 	case kbps >= 20_000:
@@ -2129,6 +2227,7 @@ func ladderHeightForBandwidthV3(kbps int) int {
 		return 480
 	}
 }
+
 func minPositiveV3(a, b int) int {
 	if a <= 0 {
 		return b
@@ -2173,6 +2272,24 @@ func CappedRungHeightV3(rungHeight, sourceHeight, sourceBitrateKbps, capKbps int
 func ladderBitrateKbpsV3(height int) int {
 	bitrates := map[int]int{480: 1_500, 720: 2_000, 1080: 6_000, 2160: 20_000}
 	return bitrates[resolutionHeightV3(resolutionLabelV3(height))]
+}
+
+// ladderClassBitrateKbpsV3 is the encode bitrate automatic quality and the
+// plain resolution preferences use for a ladder class; a target between
+// classes takes the class below it. Explicit menu steps use ladderRungsV3.
+func ladderClassBitrateKbpsV3(height int) int {
+	switch ladderClassesFrom(height)[0].Height {
+	case 2160:
+		return 20_000
+	case 1080:
+		return 6_000
+	case 720:
+		return 2_000
+	case 540:
+		return 1_800
+	default:
+		return 1_500
+	}
 }
 
 type ladderRungV3 struct {
@@ -2247,19 +2364,6 @@ func ladderRungPublishableV3(rung ladderRungV3, source SourceDescriptorV3) bool 
 		return false
 	}
 	return source.BitrateKbps > 0 && rung.BitrateKbps < source.BitrateKbps
-}
-
-func qualityDimensionsV3(height, sourceWidth, sourceHeight int) (int, int) {
-	rung := resolutionHeightV3(resolutionLabelV3(height))
-	width := 0
-	if sourceWidth > 0 && sourceHeight > 0 {
-		width = sourceWidth * rung / sourceHeight
-		width -= width % 2
-	}
-	if width == 0 {
-		width, _ = dimensionsFromResolutionV3(resolutionLabelV3(rung))
-	}
-	return width, ladderBitrateKbpsV3(rung)
 }
 
 func SortedTransformationNamesV3(values []TransformationV3) []string {

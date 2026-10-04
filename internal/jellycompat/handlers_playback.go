@@ -276,6 +276,10 @@ type sessionExpirationHookAdder interface {
 	AddExpirationHook(func(*playback.Session))
 }
 
+type sessionFinisher interface {
+	FinishSession(ctx context.Context, sessionID string) error
+}
+
 // PlaybackSessionSyncer flushes the in-memory native-session snapshot into the
 // shared admin live-session table (playback_sessions_sync). Without it, compat
 // session starts and stops only become visible on the periodic reconciler
@@ -332,6 +336,7 @@ type PlaybackHandler struct {
 	tm                     *playback.TranscodeManager
 	SubtitleRepo           subtitles.Repository  // optional; enables downloaded subtitles
 	SubtitleBlobs          subtitles.BlobStore   // optional; backs downloaded subtitle reads
+	Trickplay              TrickplaySheets       // optional; serves seek-bar preview sheets
 	SettingsRepo           SettingsReader        // optional; reads watched threshold setting
 	SessionSyncer          PlaybackSessionSyncer // optional; enables immediate session sync to shared admin view
 	WatchScrobbler         PlaybackWatchScrobbler
@@ -1190,18 +1195,26 @@ func compatVideoToolboxToneMapBitrateKbps(version catalog.FileVersion, recipe co
 	}
 }
 
-func compatMaxResolutionForBitrateKbps(kbps int64) string {
+// compatTargetResolutionForBitrate is the encoder height a Jellyfin client's
+// bitrate limit earns on Silo's shared ladder (playback.LadderClassForBitrate),
+// fit to the source's aspect ratio. Empty leaves the source unscaled: at 20
+// Mbps and above, and whenever the source already fits the class.
+func compatTargetResolutionForBitrate(kbps int64, track models.VideoTrack) string {
+	if kbps <= 0 {
+		return ""
+	}
+	class := playback.LadderClassForBitrate(int(kbps), parseCompatFrameRate(track.FrameRate), compatTargetVideoCodec)
+	if class >= 2160 {
+		return ""
+	}
+	width, height := playback.FitLadderBox(track.Width, track.Height, class)
 	switch {
-	case kbps <= 0:
+	case height == 0:
+		return strconv.Itoa(class) + "p"
+	case width == track.Width && height == track.Height:
 		return ""
-	case kbps < 2000:
-		return "480p"
-	case kbps < 6000:
-		return compatResolution720p
-	case kbps < 20000:
-		return compatResolution1080p
 	default:
-		return ""
+		return strconv.Itoa(height) + "p"
 	}
 }
 
@@ -1598,7 +1611,7 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 	initialSeekSeconds float64,
 	transcodeNodeURL string,
 	requiredToneMapMode tonemap.Mode,
-) error {
+) (err error) {
 	// Remote contenders for one upstream session single-flight across route
 	// binding, node start, and durable publication. This uses a dedicated key,
 	// so a local software fallback can still proceed and win through the normal
@@ -1610,6 +1623,12 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 			return errRemoteStartAdoptedLocal
 		}
 	}
+	var virtualCleanup func()
+	defer func() {
+		if virtualCleanup != nil && err != nil {
+			virtualCleanup()
+		}
+	}()
 	if h.playbackStore != nil {
 		expectedSourceAudioChannels := compatHLSRecipeSourceAudioChannels(source)
 		expectedAudioTrackIndex := compatAudioOrdinalOrDefault(source)
@@ -1729,9 +1748,63 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 		}
 	}
 
+	inputPath := file.FilePath
+	if isCompatVirtualSource(source) || isCompatVirtualFile(file) {
+		canonicalPath := file.FilePath
+		if isCompatVirtualPath(source.VirtualSourceURI) {
+			canonicalPath = source.VirtualSourceURI
+		} else if isCompatVirtualPath(source.Version.FilePath) {
+			canonicalPath = source.Version.FilePath
+		}
+		userID := 0
+		profileID := ""
+		if h.sessionMgr != nil {
+			if upstream, sessionErr := h.sessionMgr.GetSession(upstreamSessionID); sessionErr == nil && upstream != nil {
+				userID = upstream.UserID
+				profileID = upstream.ProfileID
+			}
+		}
+		ownerInstallationID := effectiveVirtualOwner(file.VirtualOwnerInstallationID, source.VirtualSourceOwnerInstallationID)
+		if h.tm != nil && h.tm.ResolveInput != nil {
+			var resolveErr error
+			inputPath, virtualCleanup, resolveErr = h.tm.ResolveInput(ctx, file.ID, ownerInstallationID, userID, profileID, canonicalPath)
+			if resolveErr != nil {
+				return fmt.Errorf("resolve virtual input for remote transcode: %w", resolveErr)
+			}
+		} else if (h.VirtualMediaDetailedResolver != nil || h.VirtualMediaResolver != nil) && h.RemoteStreamRelay != nil {
+			var resolved string
+			var headers map[string]string
+			var err error
+			effectiveOwner := ownerInstallationID
+			if h.VirtualMediaDetailedResolver != nil {
+				res, dErr := h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(ctx, canonicalPath, ownerInstallationID, userID, profileID, false, nil, "")
+				if dErr != nil {
+					return fmt.Errorf("resolve virtual input for remote transcode: %w", dErr)
+				}
+				resolved = res.URL
+				headers = res.RequestHeaders
+				effectiveOwner = effectiveVirtualOwner(res.OwnerID, ownerInstallationID)
+			} else {
+				resolved, err = h.VirtualMediaResolver.ResolveVirtualMedia(ctx, canonicalPath, ownerInstallationID, userID, profileID)
+				if err != nil {
+					return fmt.Errorf("resolve virtual input for remote transcode: %w", err)
+				}
+			}
+			insecure := h.AllowPrivateStreams != nil && h.AllowPrivateStreams(effectiveOwner)
+			var regErr error
+			inputPath, virtualCleanup, regErr = registerRemoteStreamInputWithHeaders(ctx, h.RemoteStreamRelay, resolved, headers, insecure)
+			if regErr != nil {
+				return fmt.Errorf("register virtual relay for remote transcode: %w", regErr)
+			}
+		}
+		if isCompatVirtualPath(inputPath) {
+			return fmt.Errorf("%w: unresolved virtual source cannot be dispatched to remote transcode node", errRemoteTranscodeStartFailed)
+		}
+	}
+
 	reqBody := transcodenode.TranscodeStartRequest{
 		SessionID:              upstreamSessionID,
-		InputPath:              file.FilePath,
+		InputPath:              inputPath,
 		SourceVideoCodec:       sourceVideoCodec,
 		SourceVideoProfile:     sourceVideoProfile,
 		SourceVideoBitDepth:    sourceVideoBitDepth,
@@ -2672,14 +2745,10 @@ func (h *PlaybackHandler) buildPlaybackSourceWithVirtual(
 		_, audioBitrateKbps := playback.ResolveAACOutputV3(targetAudioChannels, 0)
 		targetBitrateKbps = int(maxBitrate*95/100/1000) - audioBitrateKbps
 	}
-	targetResolution := compatMaxResolutionForBitrateKbps(maxBitrate / 1000)
-	if ceiling, err := strconv.Atoi(strings.TrimSuffix(targetResolution, "p")); err == nil {
-		if height := compatPrimaryVideoTrack(version).Height; height > 0 && height <= ceiling {
-			// FFmpeg scales to an exact height; a bandwidth ceiling must not
-			// enlarge a source already below it.
-			targetResolution = ""
-		}
-	}
+	// The class follows the video's share of the ceiling, the same budget the
+	// encode targets, so a limit near a class floor does not earn a class its
+	// video bitrate cannot fill.
+	targetResolution := compatTargetResolutionForBitrate(int64(max(targetBitrateKbps, 0)), compatPrimaryVideoTrack(version))
 	targetVideoCodec := compatTargetVideoCodec
 	canEncodeOutput := profile.supportsTranscodingOutput(version, targetAudioChannels, max(targetBitrateKbps, 0), targetResolution)
 	// HEVC needs server opt-in and an explicit compatible HLS fMP4 profile.

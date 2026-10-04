@@ -405,3 +405,34 @@ func TestVerdictLookupStillRejectsDifferentProfileVariant(t *testing.T) {
 		t.Fatalf("different profile variant error = %v, want errVirtualCandidateVerdictIncomplete", err)
 	}
 }
+
+// TestVerdictLookupDoesNotVetoSiblingWithIdentity proves a failed row that
+// carries durable identity never vetoes a different pick under the same
+// neutral key: the German STARS row's verdict must not refuse the ToonsHub
+// candidate. Only same-identity rows, or identity-less legacy rows, bind.
+func TestVerdictLookupDoesNotVetoSiblingWithIdentity(t *testing.T) {
+	const candidate = "virtual://series/tt-toonshub?result=toonshub1"
+	file := &models.MediaFile{ID: 7, ContentID: "series-toonshub", FilePath: candidate}
+	failedAt := time.Now()
+	h := &PlaybackHandler{
+		VirtualFileLookup: func(context.Context, string) (*models.MediaFile, error) {
+			return nil, ErrVirtualCandidateNotFound
+		},
+		VirtualCandidateFileLookup: func(context.Context, string, string, string, int) (*models.MediaFile, error) {
+			return &models.MediaFile{
+				ID: 77, FilePath: "virtual://series/tt-toonshub?result=stars1",
+				ProviderReleaseName: "germanstarsrelease1080p", FailedAt: &failedAt,
+			}, nil
+		},
+	}
+	row, found, err := h.lookupVirtualCandidateRowDetailed(context.Background(), candidate, file.ContentID, file.EpisodeID, 5)
+	if err != nil {
+		t.Fatalf("sibling lookup treated as incomplete: %v", err)
+	}
+	if !found || row == nil {
+		t.Fatal("sibling row not found for metadata adoption")
+	}
+	if err := h.virtualCandidateVerdictError(context.Background(), candidate, file, 5, false); err != nil {
+		t.Fatalf("failed sibling with identity vetoed a different pick: %v", err)
+	}
+}

@@ -170,6 +170,36 @@ func TestHandleSubtitleFontsReturns500OnDefinitiveFailure(t *testing.T) {
 	}
 }
 
+// A non-ASS embedded ordinal must answer 400, not reach extraction or the
+// cache paths. The client prefetch guards on codec, but a mistyped or
+// hand-built URL must not mint a 500 a retrying client re-issues.
+func TestHandleSubtitleFontsRejectsNonASSTrackBeforeExtraction(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+	handler, session, _, probeLog, _ := newFontBundleHTTPFixture(t, []models.SubtitleTrack{{Index: 4, Codec: "srt"}}, "ok")
+	recorder := httptest.NewRecorder()
+	handler.HandleSubtitleFonts(recorder, fontBundleHTTPRequest(session.ID, "0"))
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, body = %s, want 400 for a non-ASS font request", recorder.Code, recorder.Body.String())
+	}
+	if got := countLogLines(t, probeLog); got != 0 {
+		t.Fatalf("ffprobe ran %d times for a rejected request, want 0", got)
+	}
+}
+
+// An ordinal outside the embedded range must answer 404 without reaching the
+// extraction or cache paths (which can 500 on a missing file or bind a
+// shared flight for a request no retry can satisfy).
+func TestHandleSubtitleFontsRejectsOutOfRangeOrdinalBeforePreflight(t *testing.T) {
+	handler, session, _, _, _ := newFontBundleHTTPFixture(t, assTestTracks(), "fail")
+	recorder := httptest.NewRecorder()
+	handler.HandleSubtitleFonts(recorder, fontBundleHTTPRequest(session.ID, "9"))
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, body = %s, want 404 for an out-of-range ordinal", recorder.Code, recorder.Body.String())
+	}
+}
+
 // Two parallel track requests for the same file must not run two extractions:
 // the fast-empty path still registers the shared flight.
 func TestHandleSubtitleFontsCoalescesParallelTrackRequests(t *testing.T) {

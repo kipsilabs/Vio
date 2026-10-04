@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
-import { fontBundleCacheKey, loadSubtitleFontBundle } from "./subtitleFonts";
+import {
+  fontBundleCacheKey,
+  loadSubtitleFontBundle,
+  loadSubtitleFontBundleResult,
+} from "./subtitleFonts";
 
 describe("fontBundleCacheKey", () => {
   it("strips only the embedded_stream_index query param", () => {
@@ -39,6 +43,28 @@ describe("loadSubtitleFontBundle cache sharing", () => {
       expect(fontsA).toEqual([expect.any(Uint8Array)]);
       // The second URL hit the shared (normalized-key) cache entry: exactly one
       // network fetch happened.
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
+  it("treats a non-409 HTTP error as definitive and does not refetch it", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: false,
+      status: 500,
+      headers: { get: () => null },
+    } as unknown as Response);
+    try {
+      const result = await loadSubtitleFontBundleResult("/fonts/definitive-500");
+      // A 5xx names this URL as broken, not a budget miss: it must not be
+      // reported pending, or the bounded refresh re-requests the same failure.
+      expect(result).toEqual({ fonts: [], pending: false });
+
+      const again = await loadSubtitleFontBundleResult("/fonts/definitive-500");
+      expect(again).toEqual({ fonts: [], pending: false });
+      // The definitive empty result is cached, so a second read is not a
+      // second request against a URL the server just failed.
       expect(fetchMock).toHaveBeenCalledTimes(1);
     } finally {
       fetchMock.mockRestore();

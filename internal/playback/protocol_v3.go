@@ -128,6 +128,11 @@ const (
 	// node that approves theme files as progressive AAC inputs.
 	TransportFeatureThemeAudioEgressV1    = "theme_audio_egress_v1"
 	TransportFeatureThemeAudioExecutionV1 = "theme_audio_execution_v1"
+	// A transcode node that executes the multi-track prepared-download layout
+	// (PreparedTracksRecipeVersion).
+	TransportFeaturePreparedTracksV1 = "prepared_tracks_v1"
+	// A transcode node that makes trickplay sheets (POST /trickplay/extract).
+	TransportFeatureTrickplayExtractV1 = "trickplay_extract_v1"
 )
 
 // Degradation warning codes reported by playback plans.
@@ -706,11 +711,18 @@ type ReplanRequestV3 struct {
 	// LocalMutations reports client-applied local plan mutations (for example
 	// a PCM recovery route) so the server can fold them into the attempt key it
 	// computes for the failed plan. Clients never hash anything themselves.
-	LocalMutations        []string                  `json:"local_mutations,omitempty"`
-	AttemptCount          int                       `json:"attempt_count"`
-	QualityPreference     string                    `json:"quality_preference"`
-	PositionSeconds       float64                   `json:"position_seconds"`
-	Metered               bool                      `json:"metered"`
+	LocalMutations    []string `json:"local_mutations,omitempty"`
+	AttemptCount      int      `json:"attempt_count"`
+	QualityPreference string   `json:"quality_preference"`
+	PositionSeconds   float64  `json:"position_seconds"`
+	Metered           bool     `json:"metered"`
+	// AutoFallback re-negotiates the session's version-fallback intent. A
+	// viewer who re-arms Auto mid-session states it here so a later dead-source
+	// recovery rotates even though the session started on an explicit pick.
+	// Omitted leaves the start-time intent unchanged, so clients that predate
+	// the field keep their existing behavior. It never authorizes a healthy
+	// mid-play switch: only a dead or unplayable source advances it.
+	AutoFallback          *bool                     `json:"auto_fallback,omitempty"`
 	BandwidthEstimateKbps *int                      `json:"bandwidth_estimate_kbps,omitempty"`
 	BandwidthCapKbps      *int                      `json:"bandwidth_cap_kbps,omitempty"`
 	SelectedTracks        SelectedTracksV3          `json:"selected_tracks"`
@@ -1006,6 +1018,20 @@ type PlanV3 struct {
 	DecisionReason       string                 `json:"decision_reason"`
 	RequestedMediaFileID int                    `json:"requested_media_file_id"`
 	EffectiveMediaFileID int                    `json:"effective_media_file_id"`
+	// SubstitutedFromFileID names the catalog row the client asked for when the
+	// effective release differs from it; it is the requested row id and is
+	// omitted when the effective row is the requested one. It exists so a
+	// client can surface an honest substitution notice without first diffing
+	// the requested/effective ids, and carries SubstitutionReason alongside.
+	// UI-only, like the inventory hints below: it is set after plan identity is
+	// finalized and is deliberately excluded from plan identity hashing.
+	SubstitutedFromFileID int `json:"substituted_from_file_id,omitempty"`
+	// SubstitutionReason is the machine-readable cause of a version
+	// substitution, present only with SubstitutedFromFileID: a dead release, a
+	// provider listing failure, a transport failure, or a decode rejection.
+	// The set is additive; clients treat an unknown value as a generic
+	// substitution rather than failing to render.
+	SubstitutionReason string `json:"substitution_reason,omitempty"`
 	// EffectiveVirtualURI is the provider-neutral virtual:// candidate URI the
 	// planner selected and probed when it substituted a real candidate for a
 	// neutral catalog row. UI-only: clients use it to keep the version menu in

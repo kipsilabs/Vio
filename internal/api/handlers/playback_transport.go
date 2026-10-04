@@ -384,6 +384,28 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 		)
 		if resolveErr != nil {
 			lastErr = resolveErr
+			// A pending release (AltMount actively fetching) is never
+			// indicted: it is neither dead nor ready, so excluding it and
+			// scrubbing it from the best-result cache would be the skip this
+			// hold exists to prevent. Retry it fresh instead; the loop's own
+			// attempt bound still terminates a release that never completes.
+			if errors.Is(resolveErr, virtuallibrary.ErrProviderPending) {
+				if targetURI == canonicalPath {
+					canonicalPath = neutralPath
+					if file != nil {
+						file.FilePath = neutralPath
+					}
+				}
+				// Pause before the fresh retry: the input resolver already
+				// held once, but a lapsed hold (low remaining budget) would
+				// otherwise spin this loop with no sleep, hammering the
+				// provider with fresh listings. One second per attempt is
+				// negligible against the hold cap and bounds the spin.
+				if !sleepWithContext(resolveStartupCtx, virtualPendingLoopPause) {
+					break
+				}
+				continue
+			}
 			failedID := resolvedMedia.CandidateID
 			if failedID == "" {
 				if parsed, err := url.Parse(targetURI); err == nil {
@@ -939,6 +961,20 @@ func (h *PlaybackHandler) resolveVirtualInputURI(
 					retryCtx, virtualURI, ownerInstallationID, userID, profileID, forceRefresh || relist, excludedCandidateIDs, preferredCandidateID,
 				)
 			})
+			// A release AltMount is actively fetching is worth waiting for,
+			// not skipping: hold briefly for the import, then re-list once
+			// (forced, so a flip to completed is picked up) and take whatever
+			// that answer is. The retry carries the caller's exclusions and
+			// rotation intent unchanged (no outage marker: a progressing
+			// download is not an outage, so outage budgets must not move).
+			// A lapsed hold degrades to the pending error, which callers
+			// handle like any unresolvable release — except the startup
+			// loop, which must not indict it (see below).
+			if errors.Is(err, virtuallibrary.ErrProviderPending) && waitVirtualPendingHold(ctx) {
+				res, err = h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
+					ctx, virtualURI, ownerInstallationID, userID, profileID, true, excludedCandidateIDs, preferredCandidateID,
+				)
+			}
 			if err == nil && res.IdentityRematched && storedRow != nil {
 				// The pinned id was absent but the same release re-identified
 				// under a new id. Adopt it through the Phase-1 CAS/fence write
@@ -1025,8 +1061,8 @@ func (h *PlaybackHandler) resolveVirtualInputURI(
 // their existing public error envelopes while executing identical transport
 // startup and response parsing.
 func (h *PlaybackHandler) startRemotePlaybackTransport(ctx context.Context, nodeURL string, request transcodenode.TranscodeStartRequest) (transcodenode.TranscodeStartResponse, int, error) {
-	if strings.HasPrefix(strings.ToLower(request.InputPath), virtualPlaybackPrefix) {
-		return transcodenode.TranscodeStartResponse{}, 0, errors.New("virtual sources require an integrated transcode transport")
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(request.InputPath)), virtualPlaybackPrefix) {
+		return transcodenode.TranscodeStartResponse{}, 0, errors.New("unresolved virtual sources require an integrated transcode transport")
 	}
 	body, err := json.Marshal(request)
 	if err != nil {

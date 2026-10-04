@@ -54,7 +54,7 @@ type PlaybackMediaHandlers struct {
 }
 
 type SubtitleFontService interface {
-	SubtitleFonts(context.Context, apihandlers.SubtitleFontRequest) ([]playback.SubtitleFontBundleItem, error)
+	SubtitleFonts(context.Context, apihandlers.SubtitleFontRequest) ([]playback.SubtitleFontBundleItem, bool, error)
 }
 
 type PlaybackSubtitleFont struct {
@@ -79,7 +79,12 @@ func (in *PlaybackSubtitleFontsInput) Resolve(ctx huma.Context) []error {
 
 type PlaybackSubtitleFontsOutput struct {
 	CacheControl string `header:"Cache-Control"`
-	Body         Collection[PlaybackSubtitleFont]
+	// FontBundlePending marks an in-flight extraction: the body is a valid
+	// empty bundle the client must not retain as a definitive font-less
+	// result. Empty on definitive answers. The header name matches the bridge
+	// API's pending marker so one client constant covers both surfaces.
+	FontBundlePending string `header:"X-Vio-Font-Bundle-Pending"`
+	Body              Collection[PlaybackSubtitleFont]
 }
 
 func registerPlaybackDelivery(reg *Registry) {
@@ -176,7 +181,7 @@ func registerPlaybackDelivery(reg *Registry) {
 		if reg.deps.PlaybackMedia == nil || reg.deps.PlaybackMedia.SubtitleFonts == nil {
 			return nil, NewProblem(TypeDependencyUnavailable, "Playback delivery is not configured.")
 		}
-		items, err := reg.deps.PlaybackMedia.SubtitleFonts.SubtitleFonts(ctx, apihandlers.SubtitleFontRequest{
+		items, pending, err := reg.deps.PlaybackMedia.SubtitleFonts.SubtitleFonts(ctx, apihandlers.SubtitleFontRequest{
 			SessionID: string(in.SessionID), Track: in.Track, Query: in.query,
 		})
 		if err != nil {
@@ -186,7 +191,21 @@ func registerPlaybackDelivery(reg *Registry) {
 		for _, item := range items {
 			fonts = append(fonts, PlaybackSubtitleFont{Name: item.Name, Data: item.Data})
 		}
-		return &PlaybackSubtitleFontsOutput{CacheControl: playbackCacheControl, Body: NewCollection(fonts)}, nil
+		out := &PlaybackSubtitleFontsOutput{Body: NewCollection(fonts)}
+		if pending {
+			// In-flight extraction: uncacheable empty bundle plus the pending
+			// marker, mirroring the bridge API. The client falls back to
+			// default fonts immediately and re-fetches for the completed
+			// bundle instead of retaining the empty state.
+			out.CacheControl = "no-store"
+			out.FontBundlePending = "true"
+		} else {
+			// Definitive answer (fonts or a genuinely font-less file):
+			// cacheable, so the client stops after one fetch instead of
+			// treating every response as pending.
+			out.CacheControl = "private, max-age=600"
+		}
+		return out, nil
 	})
 }
 

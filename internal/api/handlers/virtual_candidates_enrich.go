@@ -59,7 +59,7 @@ func (h *PlaybackHandler) EnrichVirtualCandidates(ctx context.Context, contentID
 			probed.Duration = probeTransient.Duration
 		}
 		mergeVirtualCandidateTracks(probed, stream)
-		args, ok := h.virtualProbeEvidenceArgs(enrichCtx, row, stream.URI, probed, true)
+		args, _, ok := h.virtualProbeEvidenceArgs(enrichCtx, row, stream.URI, probed, true)
 		if !ok {
 			continue
 		}

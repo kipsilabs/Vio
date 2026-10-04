@@ -37,6 +37,7 @@ import {
 } from "@/components/realtimeEventsContext";
 import {
   createCatalogInvalidationScheduler,
+  invalidateAccessDependentState,
   invalidateCatalogState,
   scheduleProgressHomeRefresh,
   userStateChangeAffectsSectionMembership,
@@ -48,7 +49,13 @@ import { adminStatsKey } from "@/hooks/queries/admin/stats";
 import { useAuth } from "@/hooks/useAuth";
 import { useIsActingAdmin } from "@/hooks/useIsActingAdmin";
 import { usePageActivity } from "@/hooks/usePageActivity";
-import { adminKeys, historyImportKeys, libraryKeys, sectionKeys } from "@/hooks/queries/keys";
+import {
+  adminKeys,
+  historyImportKeys,
+  libraryKeys,
+  requestKeys,
+  sectionKeys,
+} from "@/hooks/queries/keys";
 import {
   isTerminalItemDetailNotFound,
   scheduleMediaSurfaceInvalidation,
@@ -79,6 +86,28 @@ const CATALOG_ITEM_CHANGED_EVENTS = new Set([
   "library.item_added",
   "metadata.updated",
 ]);
+
+// Everything that shows a title's request state: the request list, title
+// pages, Discover, and request search results. The feature status and brand
+// lists don't depend on it.
+const REQUEST_STATE_QUERIES: QueryFilters[] = [
+  { queryKey: requestKeys.mineAll() },
+  { queryKey: requestKeys.detailAll() },
+  { queryKey: requestKeys.discovery() },
+  { queryKey: requestKeys.discoverBrowseAll() },
+  { queryKey: requestKeys.searchAll() },
+];
+
+function isRequestNotification(notification: Pick<AppNotification, "type">) {
+  return notification.type?.startsWith("request.") ?? false;
+}
+
+/**
+ * Close code the server ends the events socket with after an access_changed
+ * frame. The client refetches access-dependent data and reconnects at once.
+ */
+export const EVENTS_ACCESS_CHANGED_CLOSE_CODE = 4001;
+
 function buildEventsUrl(location: Pick<Location, "protocol" | "host">) {
   const protocol = location.protocol === "https:" ? "wss:" : "ws:";
   return `${protocol}//${location.host}/api/v2/events/ws`;
@@ -403,7 +432,7 @@ function handleUserStateEvent(
 
 export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
   const queryClient = useQueryClient();
-  const { user, profile } = useAuth();
+  const { user, profile, refreshAccount } = useAuth();
   const actingAdmin = useIsActingAdmin();
   const pageActivity = usePageActivity();
   const location = useLocation();
@@ -563,7 +592,13 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
         break;
       case "notifications":
         if (Array.isArray(message.data)) {
-          applyNotificationsSnapshot(queryClient, message.data as AppNotification[]);
+          const rows = message.data as AppNotification[];
+          applyNotificationsSnapshot(queryClient, rows);
+          // A reconnect sends request changes made while the socket was down
+          // as unread rows here, not as notification.created events.
+          if (rows.some(isRequestNotification)) {
+            refreshQueries(...REQUEST_STATE_QUERIES);
+          }
         }
         break;
       default:
@@ -572,9 +607,17 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
     dispatchChannelMessage(message.channel, "snapshot", message);
   }
 
-  function handleNotificationEvent(message: EventsEventMessage) {
+  function handleNotificationEvent(
+    message: EventsEventMessage,
+    refreshQueries: (...filters: QueryFilters[]) => void,
+  ) {
     if (message.event === "notification.created") {
       const notification = message.data as AppNotification;
+      // A request changed state (approved, declined, arrived). The scheduler
+      // batches a burst (a scan fulfilling many requests) into one refetch.
+      if (isRequestNotification(notification)) {
+        refreshQueries(...REQUEST_STATE_QUERIES);
+      }
       if (
         notification.profile_id &&
         activeProfileIDRef.current &&
@@ -589,11 +632,18 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
           description: [episodeCode, notification.episode_title].filter(Boolean).join(" — "),
         });
       } else if (notification.type === "request.fulfilled") {
+        const follower = notification.reason_flags?.follower === true;
         toast(
           notification.series_title
             ? `${notification.series_title} is now available`
-            : "Your request is now available",
-          { description: "Your media request has arrived in the library." },
+            : follower
+              ? "A title you followed is now available"
+              : "Your request is now available",
+          {
+            description: follower
+              ? "A title you asked to hear about has arrived in the library."
+              : "Your media request has arrived in the library.",
+          },
         );
       } else if (
         notification.type === "request.approved" ||
@@ -693,7 +743,7 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
         );
         break;
       case "notifications":
-        handleNotificationEvent(message);
+        handleNotificationEvent(message, refreshQueries);
         break;
       default:
         break;
@@ -728,11 +778,16 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
       predicate: (query) =>
         !isDashboardQueryKey(query.queryKey) && !isTerminalItemDetailNotFound(query),
     });
+    // The account record is not a query. An access change made while the
+    // socket was down never sends access_changed: the reconnect's ticket
+    // already carries the new access.
+    void refreshAccount().catch(() => {});
   }, [
     authenticatedUserID,
     isForegroundPlaybackRoute,
     pageActivity.canApplyRealtimeUpdates,
     queryClient,
+    refreshAccount,
   ]);
 
   useEffect(() => {
@@ -821,6 +876,19 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
 
       activeSocket = socket;
       socketRef.current = socket;
+      // The server sends access_changed and then closes with
+      // EVENTS_ACCESS_CHANGED_CLOSE_CODE; whichever arrives first refreshes.
+      let accessChangeHandled = false;
+      const handleAccessChanged = () => {
+        if (accessChangeHandled) return;
+        accessChangeHandled = true;
+        invalidateAccessDependentState(queryClient, {
+          allowDashboardRefetch: allowDashboardRealtimeUpdatesRef.current,
+        });
+        void refreshAccount().catch(() => {});
+        // The new access applies to the next ticket, so reconnect at once.
+        nextReconnectDelayRef.current = 0;
+      };
 
       socket.onopen = () => {
         if (closedByEffect || socketRef.current !== socket || !authorityActive()) {
@@ -877,6 +945,9 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
           case "event":
             handleEvent(message, authority, refreshSessions, adminRefresh.schedule);
             return;
+          case "access_changed":
+            handleAccessChanged();
+            return;
           case "error":
             return;
         }
@@ -889,9 +960,16 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
         setConnectionState("disconnected");
       };
 
-      socket.onclose = () => {
+      socket.onclose = (event: CloseEvent) => {
         if (socketRef.current !== socket) {
           return;
+        }
+        if (
+          event.code === EVENTS_ACCESS_CHANGED_CLOSE_CODE &&
+          !closedByEffect &&
+          authorityActive()
+        ) {
+          handleAccessChanged();
         }
         socketRef.current = null;
         activeSocket = null;
@@ -937,6 +1015,7 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
     renderedAuthority?.profileToken,
     pageActivity.canApplyRealtimeUpdates,
     queryClient,
+    refreshAccount,
     sendSubscribe,
   ]);
 

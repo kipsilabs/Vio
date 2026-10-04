@@ -271,9 +271,9 @@ func TestPlaybackDecisionV2ProjectsAudioInventorySelectionOrdinal(t *testing.T) 
 	}
 }
 
-type fakeSubtitleFontService func(context.Context, handlers.SubtitleFontRequest) ([]playback.SubtitleFontBundleItem, error)
+type fakeSubtitleFontService func(context.Context, handlers.SubtitleFontRequest) ([]playback.SubtitleFontBundleItem, bool, error)
 
-func (f fakeSubtitleFontService) SubtitleFonts(ctx context.Context, in handlers.SubtitleFontRequest) ([]playback.SubtitleFontBundleItem, error) {
+func (f fakeSubtitleFontService) SubtitleFonts(ctx context.Context, in handlers.SubtitleFontRequest) ([]playback.SubtitleFontBundleItem, bool, error) {
 	return f(ctx, in)
 }
 
@@ -295,18 +295,18 @@ func TestPlaybackSubtitleDeliveryV2(t *testing.T) {
 			}
 			_, _ = w.Write([]byte("WEBVTT\n\n00:00.000 --> 00:01.000\ncue\n"))
 		}),
-		SubtitleFonts: fakeSubtitleFontService(func(ctx context.Context, in handlers.SubtitleFontRequest) ([]playback.SubtitleFontBundleItem, error) {
+		SubtitleFonts: fakeSubtitleFontService(func(ctx context.Context, in handlers.SubtitleFontRequest) ([]playback.SubtitleFontBundleItem, bool, error) {
 			fontCalls++
 			if fontError != nil {
-				return nil, fontError
+				return nil, false, fontError
 			}
 			if in.SessionID != deliveryTestSession || in.Track != "1" || in.Query.Get("st") != "opaque" || in.Query.Get("file_id") != "42" || profileFrom(ctx) != "p-owner" {
 				t.Errorf("font service lost admission or inventory identity: %+v profile=%q", in, profileFrom(ctx))
 			}
 			if emptyFonts {
-				return nil, nil
+				return nil, false, nil
 			}
-			return []playback.SubtitleFontBundleItem{{Name: "synthetic.ttf", Data: "AAEC"}}, nil
+			return []playback.SubtitleFontBundleItem{{Name: "synthetic.ttf", Data: "AAEC"}}, false, nil
 		}),
 	}
 	h := newTestHandler(t, deps)
@@ -322,7 +322,7 @@ func TestPlaybackSubtitleDeliveryV2(t *testing.T) {
 	fonts := do(t, h, http.MethodGet, Prefix+"/stream/"+deliveryTestSession+"/subtitles/1/fonts?file_id=42&st=opaque", "", viewerHeaders())
 	var bundle Collection[PlaybackSubtitleFont]
 	decodeBody(t, fonts.Body, &bundle)
-	if fonts.Code != 200 || len(bundle.Items) != 1 || bundle.Items[0].Name != "synthetic.ttf" || bundle.Items[0].Data != "AAEC" || fonts.Header().Get("Cache-Control") != "no-store" || fonts.Header().Get("Access-Control-Allow-Origin") != "" {
+	if fonts.Code != 200 || len(bundle.Items) != 1 || bundle.Items[0].Name != "synthetic.ttf" || bundle.Items[0].Data != "AAEC" || fonts.Header().Get("Cache-Control") != "private, max-age=600" || fonts.Header().Get("Access-Control-Allow-Origin") != "" {
 		t.Fatalf("fonts: %d %+v %v", fonts.Code, bundle, fonts.Header())
 	}
 	emptyFonts = true

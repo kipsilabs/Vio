@@ -20,7 +20,12 @@ that before it ships.
 | Settings secrets | Indexer keys use `SecretField` (configured indicator + clear) | `web/src/pages/admin-settings/StreamingSettings.tsx` | `StreamingSettings.test.tsx` |
 | Settings checks | `remuxdb` + `virtual_library` check kinds; safe messages | `internal/api/handlers/admin_settings_checks*.go` | `admin_settings_check_service_test.go` |
 | Monitor registrar | Library-scoped registration, episode URIs, plugin-path fallbacks | `internal/virtuallibrary/registrar.go`, `monitor/monitor.go` | virtuallibrary suites |
-| Image builds | Decoupled `node-base` stage for BuildKit frontend pruning, unshadowed Go module layer caching, persisted Go compiler cache (`buildkit-cache-dance`), deduplicated `workflow_dispatch` frontend builds, base images pinned to patch/dated tags, and skipped image attestations | `Dockerfile`, `.github/workflows/docker.yml` | invariant script |
+| Plugin SDK | Upstream SDK v0.21.0, no replacement; fork virtual plugin RPCs retired; virtual registration/resolution remain core-owned (`internal/virtuallibrary`, `internal/catalog/virtual_media.go`); network-access provider support follows upstream. | `go.mod`, `go.sum` | requests suites |
+| V3 transcode planner | Vio's ladder/HEVC/output-check planner (`targetVideoSelectionV3`, `CappedRungHeightV3` shared with the virtual picker, QSV `-1` width, 2160p min-clamp, 420p/328p rungs) instead of upstream's shared-ladder rework (#1659: `bitrateLadder`, decoder-bounded H264, generalized `scaleTargetHeight` switches). Portable #1659 pieces taken: `scaleTargetHeight`/`vaapiNV12Filter` helpers, `softwareEncode` rename, server-cap audio reserve, `anchorRef` menu wiring, exact ladder-fit heights (`800p` bubbles, `heightLabel`) in the quality resolver. The hardware scalers (`vaapiScaleFilter`, `qsvScaleFilterWithMapMode`, `qsvVPPInputScaleFilter`) scale exact heights in their defaults — a plan/filer mismatch here encodes at source size while the plan advertises the fit, so any future filter must parse `scaleTargetHeight` too. Removed #1659 planner-behavior tests are replaced by Vio equivalents: `TestHardwareScaleFiltersShareExactLadderHeights`, `TestScopeFilmAutoPlanScalesOnHardwareFilters` plus the retained HEVC fallback/decoder tests in `hevc_transcode_v3_test.go`. | `internal/playback/plan_v3.go`, `internal/playback/transcode.go`, `internal/api/handlers/playback_virtual.go` | playback suites (Vio ladder/HEVC/output-check tests) |
+| Audio selection | MULTi track awareness (`track.Languages`, `trackHasLanguage`, `trackLanguageRank`), cross-version language preservation, and fine-grained regional/script discrimination | `internal/playback/audio_select.go`, `internal/lang/lang.go` | `internal/playback/audio_select_test.go`, `internal/api/handlers/playback_virtual_languages_test.go`, `internal/jellycompat/jelly_gap_test.go` |
+| Image builds | Decoupled `node-base` stage for BuildKit frontend pruning, unshadowed Go module layer caching, persisted Go compiler cache (`buildkit-cache-dance`), deduplicated `workflow_dispatch` frontend builds, base images pinned to patch/dated tags, skipped image attestations, and publishing default-branch images as `:dev` with `:latest` reserved for stable releases or manual promotion | `Dockerfile`, `.github/workflows/docker.yml`, `docker-compose.yml`, `.env.example` | invariant script |
+| Upstream non-goals | Not adopted: the fork may explore remote/debrid-backed library integrations (Live TV/IPTV/DVR, `.strm`-style remote-URL playback) that upstream permanently rejects. Upstream non-goals changes must not silently reimpose scope here; the Apple/Google store risk stands and any shipped integration owns it | `AGENTS.md` (Non-goals section) | merge-procedure review |
+| Virtual transcode worker dispatch | Virtual library sources (`virtual://`) resolve to pre-resolved stream relay URLs (`/source/<token>/...`) and dispatch to pooled remote transcode worker nodes for video transcoding, while direct play and progressive remux remain restricted to the integrated API path. The transcode node path authorizer permits approved relay stream URLs | `internal/api/handlers/playback_v3.go`, `internal/api/handlers/playback_transport.go`, `internal/jellycompat/virtual_playback.go`, `internal/jellycompat/streams.go`, `internal/transcodenode/path_authorizer.go` | transcodenode, jellycompat, and api handlers playback suites |
 
 ## Merge procedure
 
@@ -36,19 +41,24 @@ that before it ships.
      catches callers; keep routing core-only.
    - `internal/config/admin_settings.go` changes: check for key renames or
      removed fork-used keys.
+   - `internal/playback/audio_select.go` changes: upstream lacks MULTi track
+     awareness (`track.Languages`, `trackHasLanguage`) and fine-grained
+     regional/script discrimination. Do not adopt upstream `audio_select.go`
+     wholesale.
    - `contracts/api/v2/*` and `web/src/api/v2/{operations,schema}.ts` churn:
      expected when upstream changes the contract. These are generated —
      resolve by regenerating (`make apiv2-*`), never by hand-editing.
-   - `Dockerfile` and `.github/workflows/docker.yml` hunks: upstream lacks the
+   - `Dockerfile`, `docker-compose.yml`, `.env.example`, and `.github/workflows/docker.yml` hunks: upstream lacks the
      decoupled `node-base` stage (which enables BuildKit frontend pruning when
      prebuilt assets are injected), shadows Go module layers with cache mounts,
-     lacks `buildkit-cache-dance` to persist Go compiler caches, and duplicates
-     manual frontend builds across runners. Do not let upstream merges
-     overwrite Vio's optimized build pipeline. Note that `.github/workflows/docker.yml`
-is preserved automatically via `.gitattributes` (`merge=ours`, configured by
-      `make install-hooks`), while `Dockerfile` hunks must be reviewed to keep
-      the decoupled `node-base` stage, unshadowed module layer caching, and the
-      pinned base image versions. Floating base image tags (`node:22-slim`,
+     lacks `buildkit-cache-dance` to persist Go compiler caches, duplicates
+     manual frontend builds across runners, and continuously overwrites the `:latest`
+     tag on every main branch commit. Do not let upstream merges
+     overwrite Vio's optimized build pipeline or revert `:dev` defaults to `:latest`. Note that `.github/workflows/docker.yml`
+     is preserved automatically via `.gitattributes` (`merge=ours`, configured by
+     `make install-hooks`), while `Dockerfile`, `docker-compose.yml`, and `.env.example` hunks must be reviewed to keep
+     the decoupled `node-base` stage, unshadowed module layer caching, the
+     pinned base image versions, and the `:dev` image tags. Floating base image tags (`node:22-slim`,
       `golang:1.26`, `debian:trixie-slim`) bump silently and invalidate the
       layer cache and the Go build cache, so the fork pins them to patch/dated
       tags and bumps them as a deliberate change. CI and

@@ -161,11 +161,11 @@ describe("VersionDropdown Refresh List", () => {
     }
 
     await act(async () => {
-      reject(new Error("network"));
+      reject(new Error("provider unreachable"));
       await Promise.resolve();
     });
 
-    expect(await screen.findAllByText(REFRESH_VERSIONS_ERROR)).toHaveLength(2);
+    expect(await screen.findAllByText("provider unreachable")).toHaveLength(2);
     // The known versions stay on screen next to the failure; both controls
     // unlock together.
     expect(dialog.getByRole("button", { name: /2160p/ })).toBeInTheDocument();
@@ -173,6 +173,26 @@ describe("VersionDropdown Refresh List", () => {
     for (const row of dialog.getAllByRole("button", { name: /Refresh List/ })) {
       expect(row).not.toBeDisabled();
     }
+  });
+
+  it("falls back to the generic copy when the failure carries no message", async () => {
+    let reject: (error: unknown) => void = () => {};
+    const onRefreshVersions = vi.fn(
+      () =>
+        new Promise<void>((_resolve, rej) => {
+          reject = rej;
+        }),
+    );
+    const dialog = openPicker(versions, { onRefreshVersions });
+
+    fireEvent.click(dialog.getAllByRole("button", { name: /Refresh List/ })[0]!);
+
+    await act(async () => {
+      reject(new Error(""));
+      await Promise.resolve();
+    });
+
+    expect(await screen.findAllByText(REFRESH_VERSIONS_ERROR)).toHaveLength(2);
   });
 
   it("omits both rows when no refresh handler is wired", () => {
@@ -512,6 +532,37 @@ describe("VersionDropdown rich row content", () => {
 
     expect(dialog.getByText(/Ranking: score ↓/)).toBeInTheDocument();
     expect(dialog.getByText(/4K\+HDR/)).toBeInTheDocument();
+  });
+
+  it("falls back to the watch detail's tracks when the catalog row omits them", () => {
+    watchDetailMock.current = {
+      versions: [
+        {
+          file_id: 2,
+          audio_tracks: [{ language: "eng" }, { language: "fra" }],
+          subtitle_tracks: [{ language: "deu" }],
+        },
+      ],
+    };
+    const dialog = openPicker(
+      [
+        makeVersion({ file_id: 1, resolution: "2160p" }),
+        // The catalog FileVersion omits the track inventories the watch detail
+        // carries; a release label keeps the row's detail section visible.
+        makeVersion({
+          file_id: 2,
+          resolution: "1080p",
+          edition_raw: "Movie.2026.1080p.WEB-DL",
+        }),
+      ],
+      { contentId: "movie-1" },
+    );
+
+    // The lazy watch detail still supplies the badges for the row that lacks
+    // its own tracks, matching the in-player menu.
+    expect(dialog.getByText("English")).toBeInTheDocument();
+    expect(dialog.getByText("French")).toBeInTheDocument();
+    expect(dialog.getByText("German")).toBeInTheDocument();
   });
 });
 

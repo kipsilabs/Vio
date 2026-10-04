@@ -134,7 +134,7 @@ function pendingHeaderFontBundleResponse(): Response {
   return {
     ok: true,
     status: 200,
-    headers: responseHeaders({ "X-Silo-Font-Bundle-Pending": "true" }),
+    headers: responseHeaders({ "X-Vio-Font-Bundle-Pending": "true" }),
     json: vi.fn().mockResolvedValue([]),
   } as unknown as Response;
 }
@@ -866,6 +866,93 @@ describe("useASSSubtitles bounded retry/watchdog policy", () => {
         await vi.advanceTimersByTimeAsync(10 * 60_000);
       });
       expect(fetch).toHaveBeenCalledTimes(4);
+      expect(constructorOpts).toHaveLength(0);
+    } finally {
+      unmount();
+      error.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("caps a persistently 500ing text fetch at the shared attempt ceiling", async () => {
+    vi.useFakeTimers();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const state = vi.fn();
+    vi.mocked(fetch).mockResolvedValue({ ok: false, status: 500 } as unknown as Response);
+    const videoRef = makeVideoRef(1);
+    const { unmount } = renderHook(() =>
+      useASSSubtitles(videoRef, [germanTrack], 6, false, 0, 0, state),
+    );
+    try {
+      // A 500 is retried with backoff, but the shared ceiling (3 windowed + 1
+      // whole-track) stops the loop instead of re-fetching the same failing URL
+      // for the life of the mount.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10 * 60_000);
+      });
+      expect(state).toHaveBeenLastCalledWith("error");
+      expect(fetch).toHaveBeenCalledTimes(4);
+      // Terminal: later timeupdate/seek events do not revive the loop.
+      await act(async () => {
+        videoRef.current!.currentTime = 590;
+        videoRef.current!.dispatchEvent(new Event("timeupdate"));
+        await vi.advanceTimersByTimeAsync(10 * 60_000);
+      });
+      expect(fetch).toHaveBeenCalledTimes(4);
+    } finally {
+      unmount();
+      error.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("recovers after retryable 503s past the shared attempt ceiling", async () => {
+    vi.useFakeTimers();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const state = vi.fn();
+    // Five 503s would have spent the 4-deep terminal ceiling; retryable
+    // statuses ride their own generous budget, so the 6th attempt still
+    // fetches and the track recovers instead of latching terminal.
+    vi.mocked(fetch)
+      .mockResolvedValueOnce({ ok: false, status: 503 } as unknown as Response)
+      .mockResolvedValueOnce({ ok: false, status: 503 } as unknown as Response)
+      .mockResolvedValueOnce({ ok: false, status: 503 } as unknown as Response)
+      .mockResolvedValueOnce({ ok: false, status: 503 } as unknown as Response)
+      .mockResolvedValueOnce({ ok: false, status: 503 } as unknown as Response)
+      .mockResolvedValue(mockFetchResponse("[Script Info]"));
+    const videoRef = makeVideoRef();
+    const { unmount } = renderHook(() =>
+      useASSSubtitles(videoRef, [germanTrack], 6, false, 0, 0, state),
+    );
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10 * 60_000);
+      });
+      expect(state).toHaveBeenLastCalledWith("ready");
+    } finally {
+      unmount();
+      error.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops at a definitive 4xx instead of trying the whole-track fallback", async () => {
+    vi.useFakeTimers();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const state = vi.fn();
+    vi.mocked(fetch).mockResolvedValue({ ok: false, status: 415 } as unknown as Response);
+    const videoRef = makeVideoRef(1);
+    const { unmount } = renderHook(() =>
+      useASSSubtitles(videoRef, [germanTrack], 6, false, 0, 0, state),
+    );
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10 * 60_000);
+      });
+      // The URL can never satisfy this request, so neither another window nor
+      // the param-less whole-track URL is attempted.
+      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(state).toHaveBeenLastCalledWith("error");
       expect(constructorOpts).toHaveLength(0);
     } finally {
       unmount();

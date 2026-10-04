@@ -191,7 +191,7 @@ require_docker_daemon() {
 	postgres_db="$(env_value POSTGRES_DB continuum)"
 	media_root="$(env_value MEDIA_ROOT '')"
 	media_container_root="$(env_value MEDIA_CONTAINER_ROOT /mnt/media)"
-	image="$(env_value VIO_IMAGE "$(env_value SILO_IMAGE 'ghcr.io/drondeseries/vio-server:latest')")"
+	image="$(env_value VIO_IMAGE "$(env_value SILO_IMAGE 'ghcr.io/kipsilabs/vio:latest')")"
 	docker_ready="false"
 	if docker info >/dev/null 2>&1; then
 		docker_ready="true"

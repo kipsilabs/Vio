@@ -1,9 +1,5 @@
 package plugins
 
-// NOTE (fork, stripped for SDK): provider-RPC tests in this file need
-// network_access_provider.v1 support in the plugin SDK. The pinned SDK
-// predates it, so they are parked until the SDK is updated.
-
 import (
 	"context"
 	"errors"
@@ -88,7 +84,7 @@ func hostByID(t *testing.T, report NetworkAccessReport, id string) NetworkAccess
 // and then each enabled proxy in id order, applies the command only to the
 // named hosts, and turns a node's failure into that host's unavailable row
 // without hiding the others.
-func skippedTestNetworkAccessFansOutToProxyNodes(t *testing.T) {
+func TestNetworkAccessFansOutToProxyNodes(t *testing.T) {
 	f := newResidentFixture(t, ResidentOptions{})
 	ctx := context.Background()
 	f.service.SetNetworkAccessStatusSink(f.broker)
@@ -193,7 +189,7 @@ func skippedTestNetworkAccessFansOutToProxyNodes(t *testing.T) {
 // A proxy's own service answers for itself: HostNetworkAccessStatus lists
 // each provider instance here, connect and disconnect act on this host, and
 // an unknown slug is ErrNetworkAccessProviderNotFound for the route's 404.
-func skippedTestHostNetworkAccessOperationsAnswerForThisHost(t *testing.T) {
+func TestHostNetworkAccessOperationsAnswerForThisHost(t *testing.T) {
 	f := newResidentFixture(t, ResidentOptions{})
 	ctx := context.Background()
 	broker := f.broker
@@ -246,7 +242,7 @@ func skippedTestHostNetworkAccessOperationsAnswerForThisHost(t *testing.T) {
 
 // A closed resident gate keeps every resident stopped and names the reason
 // in the admin status; opening it lets the next reconcile start them.
-func skippedTestResidentGateHoldsResidentsUntilItOpens(t *testing.T) {
+func TestResidentGateHoldsResidentsUntilItOpens(t *testing.T) {
 	f := newResidentFixture(t, ResidentOptions{})
 	ctx := context.Background()
 	f.service.SetNetworkAccessStatusSink(f.broker)

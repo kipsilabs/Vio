@@ -669,3 +669,40 @@ func TestClampOpenEndedWindow(t *testing.T) {
 		})
 	}
 }
+
+func TestIsSubtitleUpstreamError(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "nil", err: nil, want: false},
+		{
+			name: "relay 5xx",
+			err:  errors.New("ffmpeg subtitle stream failed: exit status 8 (stderr: [in#0] Error opening input: Server returned 5XX Server Error reply)"),
+			want: true,
+		},
+		{
+			name: "wrapped relay 5xx",
+			err:  errors.Join(errors.New("extract"), errors.New("Server returned 503 Service Unavailable")),
+			want: true,
+		},
+		{
+			name: "map error is not upstream",
+			err:  errors.New("ffmpeg subtitle stream failed: Stream map '0:s:9' matches no streams"),
+			want: false,
+		},
+		{
+			name: "generic failure is not upstream",
+			err:  errors.New("ffmpeg subtitle stream failed: exit status 1"),
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsSubtitleUpstreamError(tc.err); got != tc.want {
+				t.Fatalf("IsSubtitleUpstreamError(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}

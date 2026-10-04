@@ -850,6 +850,12 @@ func newRemoteTranscodeHandler(t *testing.T, nodeURL string, recipeStore *stubRe
 		JWTSecret:       "test-secret",
 		RecipeNodeStore: recipeStore,
 	}
+	handler.tm.ResolveInput = func(ctx context.Context, mediaFileID, ownerInstallationID, userID int, profileID, canonicalPath string) (string, func(), error) {
+		if !isCompatVirtualPath(canonicalPath) {
+			return canonicalPath, nil, nil
+		}
+		return "http://127.0.0.1:45678/source/mock-token/stream.mkv", func() {}, nil
+	}
 	return handler, sessionMgr, playbackStore
 }
 
@@ -1388,6 +1394,81 @@ func TestStartRemoteTranscode_VirtualRecipeUsesCanonicalSource(t *testing.T) {
 	}
 	if card.InputPath != source.VirtualSourceURI || card.VirtualSourceOwnerInstallationID != 19 {
 		t.Fatalf("recipe source = %q owner %d, want %q owner 19", card.InputPath, card.VirtualSourceOwnerInstallationID, source.VirtualSourceURI)
+	}
+}
+
+func TestStartRemoteTranscode_VirtualResolvesToRelayInput(t *testing.T) {
+	recipeStore := &stubRecipeNodeStore{}
+	var received transcodenode.TranscodeStartRequest
+	node := fakeTranscodeNode(t, &received)
+	handler, _, playbackStore := newRemoteTranscodeHandler(t, node.URL, recipeStore)
+	resolvedRelayURL := "http://127.0.0.1:45678/source/tok123/stream.mkv"
+	cleanupCalled := false
+	handler.tm.ResolveInput = func(ctx context.Context, mediaFileID, ownerInstallationID, userID int, profileID, canonicalPath string) (string, func(), error) {
+		return resolvedRelayURL, func() { cleanupCalled = true }, nil
+	}
+	playbackStore.Put(PlaybackSession{
+		ID:                 "play-virtual-relay",
+		CompatToken:        "token-virtual-relay",
+		UpstreamSessionID:  "upstream-1",
+		UpstreamPlayMethod: "transcode",
+		MediaSources: []PlaybackMediaSource{{
+			FileID:                           42,
+			Version:                          catalog.FileVersion{FileID: 42, FilePath: "virtual://movie/tt1234567", Container: "virtual"},
+			VirtualSourceURI:                 "virtual://movie/tt1234567?result=stable",
+			VirtualSourceOwnerInstallationID: 19,
+		}},
+	})
+
+	source := PlaybackMediaSource{
+		FileID:                           42,
+		Version:                          catalog.FileVersion{FileID: 42, FilePath: "virtual://movie/tt1234567", Container: "virtual"},
+		VirtualSourceURI:                 "virtual://movie/tt1234567?result=stable",
+		VirtualSourceOwnerInstallationID: 19,
+	}
+	if err := handler.startRemoteTranscode(context.Background(), "play-virtual-relay", "upstream-1", source, &models.MediaFile{ID: 42, FilePath: "virtual://movie/tt1234567", VirtualOwnerInstallationID: 19}, 0, node.URL); err != nil {
+		t.Fatalf("startRemoteTranscode: %v", err)
+	}
+	if received.InputPath != resolvedRelayURL {
+		t.Fatalf("remote node received InputPath = %q, want %q", received.InputPath, resolvedRelayURL)
+	}
+	card, ok := recipeStore.Get("upstream-1")
+	if !ok {
+		t.Fatal("expected virtual recipe in control-plane store")
+	}
+	if card.InputPath != source.VirtualSourceURI {
+		t.Fatalf("recipe card InputPath = %q, want canonical %q", card.InputPath, source.VirtualSourceURI)
+	}
+	_ = cleanupCalled
+}
+
+func TestStartRemoteTranscode_UnresolvedVirtualInputRejection(t *testing.T) {
+	recipeStore := &stubRecipeNodeStore{}
+	var received transcodenode.TranscodeStartRequest
+	node := fakeTranscodeNode(t, &received)
+	handler, _, playbackStore := newRemoteTranscodeHandler(t, node.URL, recipeStore)
+	handler.tm.ResolveInput = nil
+
+	playbackStore.Put(PlaybackSession{
+		ID:                 "play-virtual-unresolved",
+		CompatToken:        "token-virtual-unresolved",
+		UpstreamSessionID:  "upstream-unresolved",
+		UpstreamPlayMethod: "transcode",
+		MediaSources: []PlaybackMediaSource{{
+			FileID:           42,
+			Version:          catalog.FileVersion{FileID: 42, FilePath: "virtual://movie/tt1234567", Container: "virtual"},
+			VirtualSourceURI: "virtual://movie/tt1234567?result=stable",
+		}},
+	})
+
+	source := PlaybackMediaSource{
+		FileID:           42,
+		Version:          catalog.FileVersion{FileID: 42, FilePath: "virtual://movie/tt1234567", Container: "virtual"},
+		VirtualSourceURI: "virtual://movie/tt1234567?result=stable",
+	}
+	err := handler.startRemoteTranscode(context.Background(), "play-virtual-unresolved", "upstream-unresolved", source, &models.MediaFile{ID: 42, FilePath: "virtual://movie/tt1234567"}, 0, node.URL)
+	if err == nil || !strings.Contains(err.Error(), "unresolved virtual source cannot be dispatched") {
+		t.Fatalf("expected unresolved virtual source error, got: %v", err)
 	}
 }
 

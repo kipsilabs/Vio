@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,6 +13,7 @@ import (
 
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
 	"github.com/Silo-Server/silo-server/internal/auth"
+	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
 )
 
@@ -106,4 +108,83 @@ func waitForPlaybackRealtimeState(t *testing.T, sessionMgr *playback.SessionMana
 		want,
 		want,
 	)
+}
+
+func TestHandleSessionWebSocket_PushesVerifiedInventoryOnHello(t *testing.T) {
+	sessionMgr := playback.NewSessionManager(0, 0)
+	session, err := sessionMgr.StartSession(1, "profile-1", 100, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+
+	probedAt := time.Now()
+	file := &models.MediaFile{
+		ID:             100,
+		FilePath:       "/media/test.mkv",
+		ProbeUpdatedAt: &probedAt,
+		AudioTracks: []models.AudioTrack{
+			{Index: 1, Codec: "aac", Channels: 2, Language: "eng", Default: true},
+		},
+		SubtitleTracks: []models.SubtitleTrack{
+			{Index: 2, Codec: "subrip", Language: "eng", Default: true},
+		},
+	}
+
+	handler := NewPlaybackHandler(sessionMgr, testPlaybackFileResolver{file: file})
+	handler.RealtimeHub = playback.NewRealtimeHub()
+
+	router := chi.NewRouter()
+	router.Get("/playback/ws/{session_id}", func(w http.ResponseWriter, r *http.Request) {
+		ctx := apimw.SetClaims(r.Context(), &auth.Claims{UserID: 1, Role: "user", TokenType: auth.TokenTypeAccess})
+		handler.HandleSessionWebSocket(w, r.WithContext(ctx))
+	})
+
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/playback/ws/" + session.ID
+	conn, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if resp != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
+	if err != nil {
+		t.Fatalf("Dial websocket: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	if err := conn.WriteJSON(playback.HelloEnvelope{
+		Type:      playback.RealtimeMessageTypeHello,
+		SessionID: session.ID,
+		Client: playback.HelloClientInfo{
+			Name:    "web",
+			Version: "1.0.0",
+		},
+	}); err != nil {
+		t.Fatalf("WriteJSON hello: %v", err)
+	}
+
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	var event playback.EventEnvelope
+	if err := conn.ReadJSON(&event); err != nil {
+		t.Fatalf("ReadJSON inventory_updated: %v", err)
+	}
+
+	if event.Name != playback.RealtimeEventInventoryUpdated {
+		t.Fatalf("event name = %q, want %q", event.Name, playback.RealtimeEventInventoryUpdated)
+	}
+
+	var payload playback.InventoryUpdatedPayload
+	if err := json.Unmarshal(event.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+
+	if payload.SessionID != session.ID {
+		t.Fatalf("payload session_id = %q, want %q", payload.SessionID, session.ID)
+	}
+	if payload.InventoryStatus != "verified" {
+		t.Fatalf("payload inventory_status = %q, want verified", payload.InventoryStatus)
+	}
+	if len(payload.SubtitleInventory) != 1 {
+		t.Fatalf("len(payload.SubtitleInventory) = %d, want 1", len(payload.SubtitleInventory))
+	}
 }

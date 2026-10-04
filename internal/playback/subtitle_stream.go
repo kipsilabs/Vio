@@ -490,6 +490,21 @@ func IsSubtitleStreamMapError(err error) bool {
 		strings.Contains(message, "for option 'map'")
 }
 
+// IsSubtitleUpstreamError reports whether an ffmpeg subtitle-extract failure
+// came from the input server answering 5xx ("Server returned 5xx") rather
+// than from the extraction itself. A virtual relay input 5xxes when its
+// upstream flaps; the extraction command is fine and a retry may succeed, so
+// callers answer retryable instead of failed. Conservative by design: only
+// ffmpeg's upstream-5xx diagnostic matches, so genuine ffmpeg failures stay
+// loud. Checked after IsSubtitleStreamMapError: a rotated layout that also
+// 5xxes is still a rotation first.
+func IsSubtitleUpstreamError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "server returned 5")
+}
+
 // LogSubtitleStreamError writes a non-fatal warning for subtitle stream
 // failures. Handlers that already committed HTTP headers call this so
 // the user sees a truncated subtitle instead of an error response, and

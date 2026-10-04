@@ -15,6 +15,7 @@ import {
   useSetSettingValue,
   useSettingValue,
   useSettingsCapabilities,
+  useStoredSettingValues,
 } from "./settingValues";
 
 const v2Mock = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
@@ -34,6 +35,34 @@ describe("self-service setting identities", () => {
   afterEach(() => {
     cleanup();
     v2Mock.mockClear();
+  });
+
+  it("reads the values stored at one scope, leaving out keys with nothing stored", async () => {
+    v2Mock.mockResolvedValueOnce({
+      revision: 8,
+      items: [
+        { key: "ui.title_art", scope: "profile_device", is_set: true, value: false },
+        { key: "player.hdr_enabled", scope: "profile_device", is_set: false },
+      ],
+    });
+
+    const { result } = renderHook(
+      () =>
+        useStoredSettingValues({
+          keys: [SETTING_KEYS.UI_TITLE_ART, SETTING_KEYS.PLAYER_HDR_ENABLED],
+          identity: { scope: "profile_device", deviceId: "apple-tv" },
+        }),
+      { wrapper },
+    );
+
+    await waitFor(() => expect(result.current.data).toEqual({ "ui.title_art": false }));
+    expect(v2Mock).toHaveBeenCalledWith("GET /api/v2/settings/values", {
+      query: expect.objectContaining({
+        scope: "profile_device",
+        device_id: "apple-tv",
+        keys: [SETTING_KEYS.UI_TITLE_ART, SETTING_KEYS.PLAYER_HDR_ENABLED],
+      }),
+    });
   });
 
   it("cannot address another client family through a query parameter", async () => {

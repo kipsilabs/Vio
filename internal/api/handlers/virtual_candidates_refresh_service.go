@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -23,6 +24,68 @@ const virtualCandidatesRefreshTimeout = 30 * time.Second
 // ErrVirtualRefreshProvider marks a provider-side refresh failure: the caller
 // answers a retryable dependency problem and never touches the persisted rows.
 var ErrVirtualRefreshProvider = errors.New("virtual candidate provider refresh failed")
+
+// refreshEmbeddedURLPattern matches request URLs embedded in transport error
+// text (a *url.Error renders as `Get "https://host/path?query": ...`). Provider
+// URLs may carry credentials or tokens, so they are redacted from any message
+// a client can read; only the bare host is ever reported (see
+// refreshProviderCause).
+var refreshEmbeddedURLPattern = regexp.MustCompile(`https?://[^\s"']+`)
+
+// providerUnavailableError converts a failed provider listing into the
+// retryable 503 the refresh surface answers, carrying the underlying cause in
+// the message. A bare "the provider could not be reached" cannot distinguish
+// a dead endpoint from a slow one, a rate limit, an ID-translation failure,
+// or an empty answer — and the async job persists exactly this message, so
+// the version-list banner can only show what is kept here.
+func providerUnavailableError(err error) error {
+	if cause := refreshProviderCause(err); cause != "" {
+		if strings.Contains(cause, "provider returned no candidates") {
+			return apiError(http.StatusServiceUnavailable, "unavailable", "The provider answered but listed no candidates; try again.")
+		}
+		return apiError(http.StatusServiceUnavailable, "unavailable", "The provider could not be reached ("+cause+"); try again.")
+	}
+	return apiError(http.StatusServiceUnavailable, "unavailable", "The provider could not be reached; try again.")
+}
+
+// refreshProviderCause extracts a user-safe cause from a failed provider
+// listing. Inner errors are codebase-generated and URL-free by convention,
+// except transport errors (*url.Error) which embed the request URL: those are
+// reduced to host plus root cause. It returns "" when there is nothing useful
+// to add.
+func refreshProviderCause(err error) string {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		root := urlErr.Err
+		seen := map[error]bool{}
+		for root != nil && !seen[root] {
+			seen[root] = true
+			next := errors.Unwrap(root)
+			if next == nil {
+				break
+			}
+			root = next
+		}
+		host := strings.TrimSpace(urlErr.URL)
+		if parsed, parseErr := url.Parse(urlErr.URL); parseErr == nil && parsed.Hostname() != "" {
+			host = parsed.Hostname()
+		}
+		if host == "" {
+			host = "the provider"
+		}
+		if root == nil {
+			return host
+		}
+		return host + ": " + root.Error()
+	}
+	msg := err.Error()
+	msg = strings.TrimSpace(strings.TrimPrefix(msg, ErrVirtualRefreshProvider.Error()+": "))
+	msg = strings.TrimSpace(strings.TrimPrefix(msg, ErrVirtualRefreshProvider.Error()))
+	if msg == "" {
+		return ""
+	}
+	return refreshEmbeddedURLPattern.ReplaceAllString(msg, "the provider")
+}
 
 // VirtualCandidateFiles resolves an item's media files by content or episode
 // id. Either may be nil when the store cannot answer for that kind.
@@ -106,7 +169,7 @@ func (s *VirtualCandidatesRefreshService) RefreshVirtualCandidates(ctx context.C
 		}
 		if refreshRes.Err != nil {
 			if errors.Is(refreshRes.Err, ErrVirtualRefreshProvider) {
-				return nil, apiError(http.StatusServiceUnavailable, "unavailable", "The provider could not be reached; try again.")
+				return nil, providerUnavailableError(refreshRes.Err)
 			}
 			return nil, apiError(http.StatusInternalServerError, "internal_error", "Failed to refresh virtual candidates")
 		}
@@ -169,7 +232,7 @@ func (s *VirtualCandidatesRefreshService) RefreshSources(ctx context.Context, co
 				// The job treats a provider re-list failure as fatal: the
 				// version list cannot be trusted if the provider was not
 				// reachable, and the executor documents this degradation.
-				return nil, nil, apiError(http.StatusServiceUnavailable, "unavailable", "The provider could not be reached; try again.")
+				return nil, nil, providerUnavailableError(refreshRes.Err)
 			}
 			return nil, nil, refreshRes.Err
 		}

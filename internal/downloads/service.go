@@ -72,6 +72,7 @@ type Capability struct {
 	Enabled              bool
 	DownloadAllowed      bool
 	QualityPresets       []string
+	QualityOptions       []QualityOption
 	TranscodeEnabled     bool
 	TranscodeUserAllowed bool
 	// SeasonDownload reports whether per-season series downloads are available;
@@ -125,6 +126,7 @@ type Service struct {
 	subtitleSource   SubtitleSource
 	artworkSource    ManifestSource
 	httpClient       *http.Client
+	subtitleCache    *playback.SubtitleCache
 
 	// Prepare-to-file pipeline (Phase 3); nil until SetArtifactManager wires it.
 	artifacts *ArtifactManager
@@ -140,6 +142,10 @@ type Service struct {
 	cfg         config.DownloadConfig
 	cfgLoadedAt time.Time
 }
+
+// SetSubtitleCache shares the streaming subtitle cache with embedded subtitle
+// sidecars. Nil disables caching.
+func (s *Service) SetSubtitleCache(cache *playback.SubtitleCache) { s.subtitleCache = cache }
 
 // SetOfflineDeps wires the offline-manifest dependencies (catalog detail for
 // manifest + artwork, subtitle assets, and an HTTP client for streaming
@@ -157,9 +163,7 @@ func (s *Service) SetOfflineDeps(detail ManifestSource, subs SubtitleSource, cli
 		return s.artifacts.repo.GetByID(ctx, id)
 	})
 	s.manifest.MarkerPopulation = s.markerPopulation
-	if client == nil {
-		client = http.DefaultClient
-	}
+	// A nil client leaves artwork fetches on artworkClient and its timeout.
 	s.httpClient = client
 }
 
@@ -312,11 +316,13 @@ func (s *Service) Capability(ctx context.Context, userID int) (Capability, error
 		TranscodeEnabled:     cfg.TranscodeEnabled,
 		TranscodeUserAllowed: policyUser.Policy.DownloadTranscodeAllowed,
 	}
+	policyCeiling := ""
 	if s.actionDecider != nil {
-		c.QualityPresets = s.policyPresetsFor(ctx, policyUser, cfg, s.artifacts != nil)
+		c.QualityPresets, policyCeiling = s.policyPresetsFor(ctx, policyUser, cfg, s.artifacts != nil)
 	} else {
 		c.QualityPresets = s.policy.PresetsFor(policyUser, cfg, s.artifacts != nil)
 	}
+	c.QualityOptions = qualityOptionsFor(c.QualityPresets, cfg, policyUser, policyCeiling)
 	if len(c.QualityPresets) > 0 {
 		// Per-season download is always available when downloads are enabled;
 		// auto-download monitoring additionally requires the subscription repo.
@@ -371,10 +377,11 @@ type CreateRequest struct {
 	Caps playback.ClientCapabilities
 }
 
-// Create creates a download for a single item (movie or episode). For
-// public `original` it registers an idempotent managed entry or queues an
-// ephemeral row unless compatibility requires a prepared artifact. Bitrate
-// qualities always prepare a transcode artifact before the row becomes ready.
+// Create creates a download for a single item (movie or episode). When the
+// source is served as-is — `original`, or a bitrate preset the source already
+// fits — it registers an idempotent managed entry or queues an ephemeral row;
+// otherwise it prepares a remux or transcode artifact before the row becomes
+// ready.
 func (s *Service) Create(ctx context.Context, userID int, req CreateRequest, filter catalog.AccessFilter) (*Download, error) {
 	cfg, user, err := s.downloadConfigForUser(ctx, userID, req.DeviceID)
 	if err != nil {
@@ -432,8 +439,8 @@ func (s *Service) Create(ctx context.Context, userID int, req CreateRequest, fil
 			Kind:             KindQueued,
 			Status:           StatusQueued,
 			Format:           FormatOriginal,
-			Quality:          QualityOriginal,
-			EffectiveQuality: QualityOriginal,
+			Quality:          decision.RequestedQuality,
+			EffectiveQuality: decision.EffectiveQuality,
 			Revision:         1,
 			FileSize:         file.FileSize,
 			CreatedAt:        now,

@@ -216,6 +216,45 @@ describe("QualityMenu", () => {
       "true",
     );
   });
+
+  it("shows Original for a fitting source unless the delivered recipe shows a cap", () => {
+    const options = [
+      {
+        id: "original",
+        label: "Original",
+        sublabel: "20 Mbps",
+        resolution: "1080p",
+        bitrateKbps: 20_000,
+        isOriginal: true,
+      },
+      {
+        id: "1080p-medium",
+        label: "1080p Medium",
+        sublabel: "6 Mbps",
+        resolution: "1080p",
+        bitrateKbps: 6000,
+        isOriginal: false,
+      },
+    ];
+    const props = { options, activeId: "1080p", isTranscoding: false, error: null };
+    const { rerender } = render(
+      createElement(QualityMenu, {
+        ...props,
+        deliveredRecipe: { bitrate_kbps: 20_000 },
+        onSelect: () => {},
+      }),
+    );
+    expect(screen.getByRole("button", { name: "Quality" })).toHaveTextContent("Original");
+
+    rerender(
+      createElement(QualityMenu, {
+        ...props,
+        deliveredRecipe: { width: 1920, height: 1080, bitrate_kbps: 6000 },
+        onSelect: () => {},
+      }),
+    );
+    expect(screen.getByRole("button", { name: "Quality" })).toHaveTextContent("1080p Medium");
+  });
 });
 
 describe("QualityMenu version format score", () => {
@@ -514,12 +553,12 @@ describe("QualityMenu version list refresh", () => {
   });
 
   it("keeps the version rows, shows the message on both rows, and unlocks them after a failure", async () => {
-    const onRefreshVersions = vi.fn().mockRejectedValue(new Error("network"));
+    const onRefreshVersions = vi.fn().mockRejectedValue(new Error("provider unreachable"));
     renderVersionMenu({ onRefreshVersions });
 
     fireEvent.click(screen.getAllByRole("menuitem", { name: /Refresh List/ })[0]!);
 
-    expect(await screen.findAllByText(REFRESH_VERSIONS_ERROR)).toHaveLength(2);
+    expect(await screen.findAllByText("provider unreachable")).toHaveLength(2);
     // The known candidates stay on screen next to the failure.
     expect(screen.getByRole("menuitem", { name: /1080p H264/ })).toBeInTheDocument();
     expect(screen.getByRole("menuitem", { name: /2160p HEVC/ })).toBeInTheDocument();

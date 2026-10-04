@@ -98,10 +98,30 @@ grep -q 'frontend-dist-' .github/workflows/docker.yml \
   && pass "docker workflow deduplicated manual frontend builds" \
   || reject "docker workflow missing deduplicated manual frontend build artifact handoff"
 
+grep -q 'type=raw,value=dev' .github/workflows/docker.yml \
+  && pass "docker workflow publishes :dev for default branch" \
+  || reject "docker workflow missing :dev tag for default branch"
+
+grep -q 'ghcr.io/kipsilabs/vio:dev' docker-compose.yml \
+  && pass "docker-compose defaults to vio:dev" \
+  || reject "docker-compose default image overwritten from vio:dev"
+
+grep -q 'ghcr.io/kipsilabs/vio:dev' .env.example \
+  && pass ".env.example defaults to vio:dev" \
+  || reject ".env.example default image overwritten from vio:dev"
+
 if grep -q '^\.github/workflows/docker\.yml merge=ours$' .gitattributes 2>/dev/null; then
   pass "docker.yml merge=ours preserved in .gitattributes"
 else
   reject "docker.yml merge=ours entry missing from .gitattributes"
+fi
+
+# 8. Audio selection: MULTi trackHasLanguage and MatchRank preserved.
+if grep -q 'trackHasLanguage' internal/playback/audio_select.go \
+  && grep -q 'MatchRank' internal/lang/lang.go; then
+  pass "audio selection MULTi trackHasLanguage and MatchRank preserved"
+else
+  reject "audio selection MULTi trackHasLanguage or MatchRank missing from internal/playback/audio_select.go or internal/lang/lang.go"
 fi
 # The merge driver itself is per-clone setup (see `make install-hooks`), not
 # committed content: fresh CI checkouts never have it. Report, don't fail —

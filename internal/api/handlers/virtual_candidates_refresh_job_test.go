@@ -284,6 +284,128 @@ func TestRefreshJobWithoutEventHubCompletes(t *testing.T) {
 	}
 }
 
+// fakeProviderStateRefresher records the forced provider-state refresh.
+type fakeProviderStateRefresher struct {
+	calls int
+	err   error
+}
+
+func (f *fakeProviderStateRefresher) RefreshProviderState(context.Context) error {
+	f.calls++
+	return f.err
+}
+
+// fakeCandidatePruner records the prune call and returns a fixed count.
+type fakeCandidatePruner struct {
+	calls   int
+	pruned  int
+	err     error
+	sources int
+	fresh   int
+	content string
+	episode string
+}
+
+func (f *fakeCandidatePruner) PruneDeadAbsentCandidates(_ context.Context, contentID, episodeID string, sources []*models.MediaFile, fresh []VirtualPlaybackStream) (int, error) {
+	f.calls++
+	f.content = contentID
+	f.episode = episodeID
+	f.sources = len(sources)
+	f.fresh = len(fresh)
+	if f.err != nil {
+		return 0, f.err
+	}
+	return f.pruned, nil
+}
+
+// TestRefreshJobForcesProviderStateAndPrunes proves the executor forces a fresh
+// provider classification snapshot before listing and runs the dead-candidate
+// prune after persistence, reporting the prune count through the progress
+// reporter.
+func TestRefreshJobForcesProviderStateAndPrunes(t *testing.T) {
+	store := refreshJobTestStore(t)
+	refresher := &fakeProviderStateRefresher{}
+	pruner := &fakeCandidatePruner{pruned: 3}
+	executor := refreshJobExecutorFor(store, nil, nil, nil, "movie:job-prune")
+	executor.ProviderRefresher = refresher
+	executor.Pruner = pruner
+
+	var messages []string
+	var lastCurrent, lastTotal int
+	result, err := executor.Execute(t.Context(), adminjob.VirtualCandidatesRefreshRequest{
+		ContentID: "movie:job-prune", MediaFolderID: 2, Title: "Heat",
+	}, func(current, total int, message string) {
+		messages = append(messages, message)
+		lastCurrent, lastTotal = current, total
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if refresher.calls != 1 {
+		t.Fatalf("provider-state refresher calls = %d, want 1", refresher.calls)
+	}
+	if pruner.calls != 1 {
+		t.Fatalf("pruner calls = %d, want 1", pruner.calls)
+	}
+	if pruner.content != "movie:job-prune" || pruner.sources == 0 || pruner.fresh != 1 {
+		t.Fatalf("pruner args: content=%q sources=%d fresh=%d", pruner.content, pruner.sources, pruner.fresh)
+	}
+	if result.PrunedCandidates != 3 {
+		t.Fatalf("PrunedCandidates = %d, want 3", result.PrunedCandidates)
+	}
+	if lastCurrent != lastTotal || lastTotal == 0 {
+		t.Fatalf("progress ended at %d/%d, want complete", lastCurrent, lastTotal)
+	}
+	sawPrune := false
+	for _, message := range messages {
+		if strings.Contains(message, "Prun") {
+			sawPrune = true
+		}
+	}
+	if !sawPrune {
+		t.Fatalf("progress messages did not report the prune step: %v", messages)
+	}
+}
+
+// TestRefreshJobProviderStateFailureIsNonFatal proves a provider-state refresh
+// failure warns and continues: the job still lists, persists, and completes.
+func TestRefreshJobProviderStateFailureIsNonFatal(t *testing.T) {
+	store := refreshJobTestStore(t)
+	refresher := &fakeProviderStateRefresher{err: errors.New("altmount offline")}
+	executor := refreshJobExecutorFor(store, nil, nil, nil, "movie:job-refresh-state-fail")
+	executor.ProviderRefresher = refresher
+	executor.Pruner = &fakeCandidatePruner{pruned: 1}
+
+	result, err := executor.Execute(t.Context(), adminjob.VirtualCandidatesRefreshRequest{
+		ContentID: "movie:job-refresh-state-fail", MediaFolderID: 2, Title: "Heat",
+	}, nil)
+	if err != nil {
+		t.Fatalf("provider-state failure must not fail the job: %v", err)
+	}
+	if refresher.calls != 1 || result.ProviderCandidates != 1 {
+		t.Fatalf("result = %+v, refresher calls = %d", result, refresher.calls)
+	}
+}
+
+// TestRefreshJobPruneFailureIsNonFatal proves a prune failure warns and
+// continues: an otherwise good refresh is not failed by cleanup.
+func TestRefreshJobPruneFailureIsNonFatal(t *testing.T) {
+	store := refreshJobTestStore(t)
+	pruner := &fakeCandidatePruner{err: errors.New("delete failed")}
+	executor := refreshJobExecutorFor(store, nil, nil, nil, "movie:job-prune-fail")
+	executor.Pruner = pruner
+
+	result, err := executor.Execute(t.Context(), adminjob.VirtualCandidatesRefreshRequest{
+		ContentID: "movie:job-prune-fail", MediaFolderID: 2, Title: "Heat",
+	}, nil)
+	if err != nil {
+		t.Fatalf("prune failure must not fail the job: %v", err)
+	}
+	if result.PrunedCandidates != 0 {
+		t.Fatalf("PrunedCandidates = %d, want 0 on a prune failure", result.PrunedCandidates)
+	}
+}
+
 // TestRefreshJobCapsPersistedBatch proves the batch is capped before the
 // upsert.
 func TestRefreshJobCapsPersistedBatch(t *testing.T) {

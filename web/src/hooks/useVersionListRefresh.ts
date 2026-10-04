@@ -3,6 +3,18 @@ import { useCallback, useRef, useState } from "react";
 /** Concise failure copy shared by every version-list refresh entry. */
 export const REFRESH_VERSIONS_ERROR = "Couldn't refresh. Try again.";
 
+/**
+ * What a failed refresh shows inline: the failure's own message when it says
+ * anything (the job's `error_message`, e.g. an unreachable provider), else the
+ * generic copy. A refresh that fails with no message at all — an aborted
+ * request with no error text — still reads as a failure rather than blank.
+ */
+export function refreshErrorMessage(error: unknown): string {
+  const message =
+    typeof error === "string" ? error.trim() : error instanceof Error ? error.message.trim() : "";
+  return message || REFRESH_VERSIONS_ERROR;
+}
+
 export interface VersionListRefreshState {
   /** True while the refresh request is in flight. */
   refreshing: boolean;
@@ -55,8 +67,8 @@ export function useVersionListRefresh(
     setRefreshing(true);
     setError(null);
     void onRefresh()
-      .catch(() => {
-        if (!cancelledRef.current) setError(REFRESH_VERSIONS_ERROR);
+      .catch((error: unknown) => {
+        if (!cancelledRef.current) setError(refreshErrorMessage(error));
       })
       .finally(() => setRefreshing(false));
   }, [onRefresh, onCancel, refreshing]);

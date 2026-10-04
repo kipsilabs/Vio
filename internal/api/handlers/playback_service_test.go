@@ -334,7 +334,7 @@ func TestDeniedSessionIsGoneOnEveryServePath(t *testing.T) {
 			t.Fatalf("%s: status = %d, body = %s", name, rr.Code, rr.Body.String())
 		}
 	}
-	_, err = stream.SubtitleFonts(newAuthorizedPlaybackContext(), SubtitleFontRequest{SessionID: session.ID, Track: "0"})
+	_, _, err = stream.SubtitleFonts(newAuthorizedPlaybackContext(), SubtitleFontRequest{SessionID: session.ID, Track: "0"})
 	if failure, ok := errors.AsType[*APIError](err); !ok || failure.Status != http.StatusGone || failure.Code != playbackSessionEndedErrorCode {
 		t.Fatalf("typed font service ignored deny marker: %v", err)
 	}
@@ -604,7 +604,7 @@ func TestSubtitleFontServiceReconstructsAndChecksAdmission(t *testing.T) {
 	ctx := apimw.SetProfileID(newAuthorizedPlaybackContext(), "profile-1")
 	// Reaching the codec refusal proves the service reconstructed and loaded
 	// the requested file without running the HTTP font handler.
-	_, err := stream.SubtitleFonts(ctx, request)
+	_, _, err := stream.SubtitleFonts(ctx, request)
 	if failure, ok := errors.AsType[*APIError](err); !ok || failure.Status != http.StatusBadRequest || !strings.Contains(failure.Message, "ASS/SSA") {
 		t.Fatalf("reconstruction did not reach font selection: %v", err)
 	}
@@ -623,7 +623,7 @@ func TestSubtitleFontServiceReconstructsAndChecksAdmission(t *testing.T) {
 		{"unrelated file", ctx, url.Values{"file_id": {"200"}}, http.StatusBadRequest},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := stream.SubtitleFonts(tc.ctx, SubtitleFontRequest{SessionID: sessionID, Track: "0", Query: tc.query})
+			_, _, err := stream.SubtitleFonts(tc.ctx, SubtitleFontRequest{SessionID: sessionID, Track: "0", Query: tc.query})
 			if failure, ok := errors.AsType[*APIError](err); !ok || failure.Status != tc.status {
 				t.Fatalf("admission failure = %v, want %d", err, tc.status)
 			}
@@ -632,7 +632,7 @@ func TestSubtitleFontServiceReconstructsAndChecksAdmission(t *testing.T) {
 	if err := os.Remove(file.FilePath); err != nil {
 		t.Fatal(err)
 	}
-	_, err = stream.SubtitleFonts(ctx, request)
+	_, _, err = stream.SubtitleFonts(ctx, request)
 	if failure, ok := errors.AsType[*APIError](err); !ok || failure.Status != http.StatusNotFound {
 		t.Fatalf("missing source file = %v, want 404", err)
 	}

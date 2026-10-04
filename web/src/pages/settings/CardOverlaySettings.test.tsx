@@ -4,6 +4,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import CardOverlaySettings from "./CardOverlaySettings";
 
+vi.mock("@/hooks/queries/ratingsCapability", () => ({
+  useShownRatingSources: () => new Set(["imdb", "tmdb"]),
+}));
+
 const mocks = vi.hoisted(() => ({
   overlaysEnabled: true,
   setOverlaysEnabled: vi.fn(),
@@ -20,6 +24,7 @@ vi.mock("@/hooks/useOverlayPrefs", () => ({
     setQuickActionsEnabled: mocks.setQuickActionsEnabled,
     overlaysEnabled: mocks.overlaysEnabled,
     setOverlaysEnabled: mocks.setOverlaysEnabled,
+    isOverlaySupported: () => true,
     isLoading: false,
   }),
 }));

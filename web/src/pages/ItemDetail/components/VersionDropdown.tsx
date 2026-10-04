@@ -16,9 +16,13 @@ import { videoRangeLabel } from "@/lib/videoRange";
 import DetailPopover from "./DetailPopover";
 import { sortPlaybackVariantsByEditionPreference } from "./versionRankingUtils";
 import {
-  collectLanguageLabels,
+  audioLanguageLabels,
+  formatScoreBadgeLabel,
+  formatScoreTitle,
+  hasFormatScore,
   profileLabelFromFilePath,
   serverRankingFromVersions,
+  subtitleLanguageLabels,
 } from "./versionFormatUtils";
 import { buildDetailLine, buildQualitySummary, sortByResolution } from "./VersionFlyout";
 import { isVersionUnavailable, useVersionVisibility } from "./versionAvailability";
@@ -139,24 +143,37 @@ function VersionDropdown({
     () => sortVersionsByCriteria(activeVersions, effectiveCriteria, versionSortableFromFile),
     [activeVersions, effectiveCriteria],
   );
-  const scoreByFileId = useMemo(() => {
-    const scores = new Map<number, number>();
+  const watchVersionByFileId = useMemo(() => {
+    const versions = new Map<number, FileVersion>();
     for (const version of watch?.versions ?? []) {
-      if (version.format_score != null) {
-        scores.set(version.file_id, version.format_score);
-      }
+      versions.set(version.file_id, version);
     }
-    return scores;
+    return versions;
   }, [watch]);
   const renderedVersions = useMemo(
     () =>
       orderedVersions.map((version) => {
-        const score = scoreByFileId.get(version.file_id);
-        return score != null && version.format_score == null
-          ? { ...version, format_score: score }
-          : version;
+        const watchVersion = watchVersionByFileId.get(version.file_id);
+        // The catalog item detail lacks the custom-format score and may omit
+        // the track inventories; both live on the watch detail. Merge per
+        // field, falling back to the watch row's tracks, so the rows show the
+        // score and language badges the in-player menu shows.
+        const score = watchVersion?.format_score;
+        const needsScore = score != null && version.format_score == null;
+        const needsAudio = !version.audio_tracks?.length && watchVersion?.audio_tracks?.length;
+        const needsSubtitle =
+          !version.subtitle_tracks?.length && watchVersion?.subtitle_tracks?.length;
+        if (!needsScore && !needsAudio && !needsSubtitle) {
+          return version;
+        }
+        return {
+          ...version,
+          ...(needsScore ? { format_score: score } : {}),
+          ...(needsAudio ? { audio_tracks: watchVersion?.audio_tracks } : {}),
+          ...(needsSubtitle ? { subtitle_tracks: watchVersion?.subtitle_tracks } : {}),
+        };
       }),
-    [orderedVersions, scoreByFileId],
+    [orderedVersions, watchVersionByFileId],
   );
 
   const { visibleVersions, hiddenUnavailableCount, setShowUnavailable } = useVersionVisibility(
@@ -298,22 +315,18 @@ function VersionDropdown({
                             {health.label}
                           </Badge>
                         ) : null}
-                        {typeof version.format_score === "number" && version.format_score !== 0 ? (
+                        {hasFormatScore(version.format_score) ? (
                           <Badge
                             variant="outline"
                             className="text-muted-foreground bg-muted/40 px-1.5 py-0 font-mono text-[10px] font-medium"
-                            title={`Format score ${version.format_score}${
-                              versionProfileLabel ? ` · ${versionProfileLabel}` : ""
-                            }`}
+                            title={formatScoreTitle(version.format_score, versionProfileLabel)}
                           >
-                            ★ {version.format_score}
+                            {formatScoreBadgeLabel(version.format_score)}
                           </Badge>
                         ) : null}
                       </div>
                       <div className="flex flex-wrap gap-1">
-                        {collectLanguageLabels(
-                          version.audio_tracks?.map((t) => t.language) ?? [],
-                        ).map((lang) => (
+                        {audioLanguageLabels(version.audio_tracks).map((lang) => (
                           <Badge
                             key={lang}
                             variant="outline"
@@ -329,9 +342,7 @@ function VersionDropdown({
                       <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1">
                         <span className="text-muted-foreground text-xs">{detail}</span>
                         <div className="flex flex-wrap gap-1">
-                          {collectLanguageLabels(
-                            version.subtitle_tracks?.map((t) => t.language) ?? [],
-                          ).map((lang) => (
+                          {subtitleLanguageLabels(version.subtitle_tracks).map((lang) => (
                             <Badge
                               key={lang}
                               variant="outline"

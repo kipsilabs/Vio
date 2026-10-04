@@ -133,6 +133,97 @@ func TestSelectAudioTrack_ChineseScripts(t *testing.T) {
 	}
 }
 
+func TestSelectAudioTrack_ScriptAndRegionalFidelity(t *testing.T) {
+	// Matching script beats conflicting script even when conflicting script is index 0
+	tracksWithScript := []models.AudioTrack{
+		{Language: "zh-Hant", Codec: "aac", Channels: 2},
+		{Language: "zh-Hans-CN", Codec: "aac", Channels: 2},
+	}
+	if got := playback.SelectAudioTrack(tracksWithScript, "zh-Hans", nil); got != 1 {
+		t.Fatalf("zh-Hans preference on [zh-Hant, zh-Hans-CN] = %d, want 1", got)
+	}
+
+	// Matching script with extra subtag beats bare language tag
+	tracksWithBare := []models.AudioTrack{
+		{Language: "zh", Codec: "aac", Channels: 2},
+		{Language: "zh-Hans-CN", Codec: "aac", Channels: 2},
+	}
+	if got := playback.SelectAudioTrack(tracksWithBare, "zh-Hans", nil); got != 1 {
+		t.Fatalf("zh-Hans preference on [zh, zh-Hans-CN] = %d, want 1", got)
+	}
+
+	// Bare language tag beats conflicting script
+	tracksBareVsConflict := []models.AudioTrack{
+		{Language: "zh-Hant", Codec: "aac", Channels: 2},
+		{Language: "zh", Codec: "aac", Channels: 2},
+	}
+	if got := playback.SelectAudioTrack(tracksBareVsConflict, "zh-Hans", nil); got != 1 {
+		t.Fatalf("zh-Hans preference on [zh-Hant, zh] = %d, want bare track 1", got)
+	}
+}
+
+func TestSelectAudioTrack_SavedIndexRejectsConflictingScript(t *testing.T) {
+	tracks := []models.AudioTrack{
+		{Language: "zh-Hant", Codec: "aac", Channels: 2},
+		{Language: "zh-Hans", Codec: "aac", Channels: 2},
+	}
+	// Saved index points to index 0 (zh-Hant), but AudioLanguage is zh-Hans.
+	// Since zh-Hant has a conflicting script with zh-Hans, it must NOT retain index 0,
+	// and should instead fall through to select track 1 (zh-Hans).
+	pref := &playback.AudioTrackPreference{
+		AudioTrackIndex: 0,
+		AudioLanguage:   "zh-Hans",
+	}
+	if got := playback.SelectAudioTrack(tracks, "", pref); got != 1 {
+		t.Fatalf("saved index on conflicting script = %d, want language match 1", got)
+	}
+
+	// Unregistered variant on conflicting script (e.g. zh-Hant-foobar) must also
+	// be rejected as a conflicting script, not accepted via parser error fallback.
+	tracksUnregistered := []models.AudioTrack{
+		{Language: "zh-Hant-foobar", Codec: "aac", Channels: 2},
+		{Language: "zh-Hans", Codec: "aac", Channels: 2},
+	}
+	prefUnregistered := &playback.AudioTrackPreference{
+		AudioTrackIndex: 0,
+		AudioLanguage:   "zh-Hans",
+	}
+	if got := playback.SelectAudioTrack(tracksUnregistered, "", prefUnregistered); got != 1 {
+		t.Fatalf("saved index on unregistered conflicting script = %d, want language match 1", got)
+	}
+}
+
+func TestSelectAudioTrack_RegionDerivedScripts(t *testing.T) {
+	// A bare language tag (zh) beats another regional variant (zh-HK) for zh-TW,
+	// maintaining the standard exact > bare > variant precedence chain.
+	tracks := []models.AudioTrack{
+		{Language: "zh-HK", Codec: "aac", Channels: 2},
+		{Language: "zh", Codec: "aac", Channels: 2},
+	}
+	if got := playback.SelectAudioTrack(tracks, "zh-TW", nil); got != 1 {
+		t.Fatalf("zh-TW preference on [zh-HK, zh] = %d, want bare zh 1", got)
+	}
+
+	// Compatible regional variant (zh-HK, Hant) beats conflicting script (zh-CN, Hans).
+	tracksCompatibleVsConflict := []models.AudioTrack{
+		{Language: "zh-CN", Codec: "aac", Channels: 2},
+		{Language: "zh-HK", Codec: "aac", Channels: 2},
+	}
+	if got := playback.SelectAudioTrack(tracksCompatibleVsConflict, "zh-TW", nil); got != 1 {
+		t.Fatalf("zh-TW preference on [zh-CN, zh-HK] = %d, want compatible zh-HK 1", got)
+	}
+
+	// zh-CN implies Simplified (Hans) while zh-TW implies Traditional (Hant).
+	// A zh-TW preference on [zh-CN, zh] picks bare zh over conflicting zh-CN.
+	conflictTracks := []models.AudioTrack{
+		{Language: "zh-CN", Codec: "aac", Channels: 2},
+		{Language: "zh", Codec: "aac", Channels: 2},
+	}
+	if got := playback.SelectAudioTrack(conflictTracks, "zh-TW", nil); got != 1 {
+		t.Fatalf("zh-TW preference on [zh-CN, zh] = %d, want bare zh 1", got)
+	}
+}
+
 func TestSelectAudioTrack_MULTiLanguageList(t *testing.T) {
 	multi := []models.AudioTrack{
 		{Language: "en", Languages: []string{"en", "fr", "de"}, Codec: "eac3", Channels: 6, Default: true},

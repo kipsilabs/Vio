@@ -91,11 +91,12 @@ function renderTracks(initial: {
   durationRef: RefObject<number>;
   anchorRef?: RefObject<number>;
   readyState?: number;
+  streamGeneration?: number;
 }) {
   const videoRef = makeVideoRef(initial.readyState);
   const defaultAnchor = { current: 0 };
   const hook = renderHook(
-    ({ origin, durationRef, anchorRef }) =>
+    ({ origin, durationRef, anchorRef, streamGeneration }) =>
       useSubtitleTracks(
         videoRef,
         [srtTrack],
@@ -104,6 +105,9 @@ function renderTracks(initial: {
         0,
         durationRef,
         anchorRef ?? defaultAnchor,
+        undefined,
+        null,
+        streamGeneration ?? 0,
       ),
     { initialProps: initial },
   );
@@ -264,6 +268,44 @@ describe("useSubtitleTracks", () => {
     },
   );
 
+  it("refetches retimed cues behind an unchanged URL when the cue revision changes", async () => {
+    fetchMock
+      .mockResolvedValueOnce(vttResponse("WEBVTT\n\n00:00:10.000 --> 00:00:12.000\nold\n\n"))
+      .mockResolvedValueOnce(vttResponse("WEBVTT\n\n00:00:12.300 --> 00:00:14.300\nnew\n\n"));
+
+    const videoRef = makeVideoRef(1);
+    const anchorRef = { current: 0 };
+    const durationRef = { current: 7200 };
+    const { rerender } = renderHook(
+      ({ revision }) =>
+        useSubtitleTracks(
+          videoRef,
+          [srtTrack],
+          1,
+          0,
+          0,
+          durationRef,
+          anchorRef,
+          undefined,
+          null,
+          0,
+          undefined,
+          undefined,
+          0,
+          revision,
+        ),
+      { initialProps: { revision: 0 } },
+    );
+
+    await waitFor(() => expect(createdTracks[0]?.cues.map((c) => c.text)).toEqual(["old"]));
+    rerender({ revision: 1 });
+
+    await waitFor(() => expect(createdTracks).toHaveLength(2));
+    await waitFor(() => expect(createdTracks[1]!.cues.map((c) => c.text)).toEqual(["new"]));
+    expect(createdTracks[1]!.cues[0]!.startTime).toBeCloseTo(12.3);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it("deduplicates restored cues newly visible after the origin moves backward", async () => {
     fetchMock.mockImplementation(async () =>
       vttResponse(
@@ -338,17 +380,63 @@ describe("useSubtitleTracks", () => {
     }
   });
 
-  it("backs off repeated failures, caps the delay, and resets after recovery", async () => {
+  it("stops scheduling retries after the consecutive-failure ceiling", async () => {
     vi.useFakeTimers();
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
     fetchMock.mockRejectedValue(new Error("extractor unavailable"));
     const { videoRef, unmount } = renderTracks({ origin: 0, durationRef: { current: 7200 } });
     try {
       await act(async () => {
+        // The remaining backoff ladder the budget allows: initial fetch, then
+        // the 5s/10s/20s retries spend it (the 4th failure never schedules a
+        // 40s retry). Advance step-by-step, nudging media events between
+        // backoff expirations like real playback would.
         await vi.advanceTimersByTimeAsync(0);
       });
       let attempts = 1;
-      for (const delay of [5000, 10000, 20000, 40000, 60000, 60000]) {
+      for (const delay of [5000, 10000, 20000]) {
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(delay - 1);
+          videoRef.current!.dispatchEvent(new Event("timeupdate"));
+        });
+        // Inside the backoff window the event must not fetch.
+        expect(fetchMock).toHaveBeenCalledTimes(attempts);
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(1);
+        });
+        // Past the backoff: the scheduled retry fetches.
+        expect(fetchMock).toHaveBeenCalledTimes(++attempts);
+      }
+      expect(fetchMock).toHaveBeenCalledTimes(4);
+      // The budget is spent: no further retry fires, and media events do not
+      // revive the fetcher for this mount.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10 * 60_000);
+        videoRef.current!.dispatchEvent(new Event("timeupdate"));
+        await vi.advanceTimersByTimeAsync(10 * 60_000);
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(4);
+    } finally {
+      unmount();
+      error.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps retrying explicitly-retryable 503s past the terminal ceiling", async () => {
+    vi.useFakeTimers();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    fetchMock.mockResolvedValue({ ok: false, status: 503 } as unknown as Response);
+    const { videoRef, unmount } = renderTracks({ origin: 0, durationRef: { current: 7200 } });
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      // Four failures would have spent the terminal budget; retryable statuses
+      // ride their own generous budget, so attempts 5 and 6 still fetch on the
+      // 40s/60s backoff rungs instead of latching terminal.
+      let attempts = 1;
+      for (const delay of [5000, 10000, 20000, 40000, 60000]) {
         await act(async () => {
           await vi.advanceTimersByTimeAsync(delay - 1);
           videoRef.current!.dispatchEvent(new Event("timeupdate"));
@@ -359,22 +447,66 @@ describe("useSubtitleTracks", () => {
         });
         expect(fetchMock).toHaveBeenCalledTimes(++attempts);
       }
-      fetchMock.mockResolvedValueOnce(
+      expect(fetchMock).toHaveBeenCalledTimes(6);
+    } finally {
+      unmount();
+      error.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("recovers only on a track rebuild after the consecutive-failure ceiling latches terminal", async () => {
+    vi.useFakeTimers();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    // Every fetch fails until the rebuild, then the rebuilt mount succeeds.
+    fetchMock.mockRejectedValue(new Error("relay is dead"));
+    const { videoRef, rerender, unmount } = renderTracks({
+      origin: 0,
+      durationRef: { current: 7200 },
+    });
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      let attempts = 1;
+      // The backoff ladder spends the budget: initial fetch, then 5s/10s/20s
+      // retries; the 4th failure never schedules another retry.
+      for (const delay of [5000, 10000, 20000]) {
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(delay - 1);
+          videoRef.current!.dispatchEvent(new Event("timeupdate"));
+        });
+        expect(fetchMock).toHaveBeenCalledTimes(attempts);
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(1);
+        });
+        expect(fetchMock).toHaveBeenCalledTimes(++attempts);
+      }
+      expect(fetchMock).toHaveBeenCalledTimes(4);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10 * 60_000);
+        videoRef.current!.dispatchEvent(new Event("timeupdate"));
+        videoRef.current!.dispatchEvent(new Event("seeking"));
+        videoRef.current!.dispatchEvent(new Event("seeked"));
+        await vi.advanceTimersByTimeAsync(10 * 60_000);
+      });
+      // Terminal for this mount: no backoff retry, no media-event revival.
+      expect(fetchMock).toHaveBeenCalledTimes(4);
+
+      // A stream restart rebuilds the fetcher (streamGeneration bump) and its
+      // fresh budget lets the rebuilt mount fetch and recover.
+      fetchMock.mockResolvedValue(
         vttResponse("WEBVTT\n\n00:00:10.000 --> 00:00:12.000\nrecovered\n\n"),
       );
+      rerender({ origin: 0, durationRef: { current: 7200 }, streamGeneration: 1 });
       await act(async () => {
-        await vi.advanceTimersByTimeAsync(60000);
+        await vi.advanceTimersByTimeAsync(0);
       });
-      expect(createdTracks[0]!.cues).toHaveLength(1);
+      expect(fetchMock).toHaveBeenCalledTimes(5);
       await act(async () => {
-        videoRef.current!.currentTime = 580;
-        videoRef.current!.dispatchEvent(new Event("timeupdate"));
+        await vi.advanceTimersByTimeAsync(200);
       });
-      const beforeRetry = fetchMock.mock.calls.length;
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(5000);
-      });
-      expect(fetchMock).toHaveBeenCalledTimes(beforeRetry + 1);
+      expect(createdTracks[1]!.cues.map((c) => c.text)).toEqual(["recovered"]);
     } finally {
       unmount();
       error.mockRestore();

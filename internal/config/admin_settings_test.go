@@ -629,3 +629,39 @@ func TestHEVCEncodingSettingDefaultAndValidation(t *testing.T) {
 		t.Fatal("invalid HEVC boolean accepted")
 	}
 }
+
+func TestAuthProviderRecheckInterval(t *testing.T) {
+	for raw, want := range map[string]time.Duration{
+		"":      12 * time.Hour,
+		"bogus": 12 * time.Hour,
+		"-1h":   12 * time.Hour,
+		"30m":   30 * time.Minute,
+		"2d":    48 * time.Hour,
+		" 6h ":  6 * time.Hour,
+	} {
+		if got := AuthProviderRecheckInterval(raw); got != want {
+			t.Errorf("AuthProviderRecheckInterval(%q) = %v, want %v", raw, got, want)
+		}
+	}
+}
+
+// TestNormalizeAdminSettingRejectsBadCustomFormatRegex proves a custom
+// format with an uncompilable pattern is rejected at save time with a field
+// error naming it, so the operator fixes the regex before persisting instead
+// of discovering a dormant virtual library after the next restart. Valid
+// formats still save unchanged.
+func TestNormalizeAdminSettingRejectsBadCustomFormatRegex(t *testing.T) {
+	good := `[{"name":"Good","pattern":"\\b1080p\\b","patternType":"regex"}]`
+	if _, err := NormalizeAdminSetting("virtual_library.custom_formats", good); err != nil {
+		t.Fatalf("valid formats rejected: %v", err)
+	}
+	bad := `[{"name":"Good","pattern":"\\b1080p\\b","patternType":"regex"},{"name":"Bad","pattern":"(?:(?<=^)MULTI)","patternType":"regex"}]`
+	if _, err := NormalizeAdminSetting("virtual_library.custom_formats", bad); err == nil {
+		t.Fatal("expected a field error for the uncompilable pattern")
+	} else if !strings.Contains(err.Error(), "Bad") {
+		t.Fatalf("error %q does not name the bad format", err)
+	}
+	if _, err := NormalizeAdminSetting("virtual_library.custom_formats", "not-json"); err == nil {
+		t.Fatal("expected a field error for non-JSON input")
+	}
+}

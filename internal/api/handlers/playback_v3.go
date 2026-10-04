@@ -104,6 +104,14 @@ const (
 	// transportStartupReadyV3 is the "outcome" of a transport startup whose
 	// first manifest became ready.
 	transportStartupReadyV3 = "ready"
+	// Substitution reasons published on a plan when the effective release
+	// differs from the requested one. They are additive wire values; a client
+	// that does not recognize one renders the generic substitution notice.
+	substitutionReasonDeadReleaseV3     = "dead_release"
+	substitutionReasonListingFailedV3   = "listing_failed"
+	substitutionReasonTransportFailedV3 = "transport_failed"
+	substitutionReasonDecodeRejectedV3  = "decode_rejected"
+	substitutionReasonUnknownV3         = "unknown"
 	// Failed capability fetches are memoized briefly so an unreachable node
 	// costs one timeout per window instead of one per planning request.
 	v3NodeCapabilityErrorTTL = 15 * time.Second
@@ -1894,6 +1902,12 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		resolutionProvenance = resolved.Provenance
 		virtualDecision.candidateRank = resolved.CandidateRank
 		virtualDecision.candidateCount = resolved.CandidateCount
+		// The alternate-version walk resolved a different release than the one
+		// asked for. Carry that truth onto the plan so the client can show an
+		// honest substitution notice naming the requested release.
+		if resolved.SubstitutedFromFileID > 0 {
+			virtualDecision.substitutionReason = resolved.SubstitutionReason
+		}
 	} else {
 		requestedFile = h.ensurePlaybackProbeStart(r.Context(), requestedFile)
 	}
@@ -2267,7 +2281,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	// remux/transcode ffmpeg is started lazily by StreamHandler on the first
 	// request, so no transport spawn or manifest wait is included here. The
 	// mark only covers an eager local HLS/transcode startup for HLS deliveries.
-	response, statusErr := h.startPlannedPlaybackV3(r, userID, profileID, req, requestDigests, requestedFile, effectiveFile, audioIndex, virtualDecision, result, clientInfo)
+	response, statusErr := h.startPlannedPlaybackV3(r, userID, profileID, req, requestDigests, requestedFile, effectiveFile, audioIndex, virtualDecision, result, clientInfo, virtualDecision.substitutionReason)
 	timings.mark("session_transport_commit")
 	if statusErr != nil {
 		// A decoder-rejected source is a candidate failure, not a route failure:
@@ -2295,6 +2309,19 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		// guard makes the audio exclusion explicit so a future caller cannot
 		// fold an audio reason back into the video transport reason.
 		if statusErr.reason == transcodeStartFailedReasonV3 && !audioOnlyTransportReasonV3(statusErr.reason) && isVirtualPlaybackFile(requestedFile) && req.FileSelection != playback.FileSelectionExplicitV3 {
+			// A single transient provider error (an upstream 5xx or timeout on
+			// the seek-anchor probe or the first bytes) must not change the
+			// release. Retry the same release once with a fresh relay
+			// registration and a short bounded backoff before considering a
+			// sibling; only a second transient failure — or a hard signal —
+			// walks the alternates below. The fresh marker mints a new relay
+			// entry so the retry presents new bytes instead of replaying the
+			// registration whose upstream just failed.
+			if retriedResponse, retried := h.recoverVirtualTransportSameReleaseV3(r.Context(), playback.IsTransientProviderError(statusErr.cause), func(retryCtx context.Context) (playback.DecisionResponseV3, *transportErrorV3) {
+				return h.startPlannedPlaybackV3(r.WithContext(retryCtx), userID, profileID, req, requestDigests, requestedFile, effectiveFile, audioIndex, virtualDecision, result, clientInfo)
+			}); retried {
+				return retriedResponse, nil
+			}
 			alternateOrder := alternateOrderingForClient(req.Capabilities)
 			// A transient provider (upstream 5xx) failure caps the alternates
 			// tried in this start so the failing upstream is not hammered once
@@ -2330,7 +2357,10 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 							alternateDecision := virtualDecision
 							alternateDecision.candidateRank = alternateRank
 							alternateDecision.candidateCount = len(alternates)
-							if alternateResponse, alternateStatusErr := h.startPlannedPlaybackV3(r, userID, profileID, alternateRequest, requestDigests, requestedFile, alternate, alternateAudio, alternateDecision, alternateResult, clientInfo); alternateStatusErr == nil {
+							// A transport failure moved the release: name the
+							// requested row and the cause on the plan.
+							alternateDecision.substitutionReason = substitutionReasonTransportFailedV3
+							if alternateResponse, alternateStatusErr := h.startPlannedPlaybackV3(r, userID, profileID, alternateRequest, requestDigests, requestedFile, alternate, alternateAudio, alternateDecision, alternateResult, clientInfo, alternateDecision.substitutionReason); alternateStatusErr == nil {
 								return alternateResponse, nil
 							}
 						}
@@ -2437,6 +2467,12 @@ func (h *PlaybackHandler) resolveVirtualStartWithVersionFallback(
 			virtualResolveOptionsV3{sessionBound: false, bypassProviderFloor: true},
 		)
 		if altErr == nil && altResolved.File != nil {
+			// Mark the substitution so the plan can tell the client the
+			// requested release was replaced, and why. The requested row is the
+			// one the caller asked for, which this walk deliberately walked away
+			// from because its listing failed.
+			altResolved.SubstitutedFromFileID = file.ID
+			altResolved.SubstitutionReason = virtualSubstitutionReasonV3(resolveErr)
 			slog.InfoContext(walkCtx, "virtual start fell back to an alternate version after a listing failure",
 				logComponentKey, playbackLogValueV3,
 				"requested_file_id", file.ID, "alternate_file_id", alternate.ID,
@@ -2580,7 +2616,7 @@ func (h *PlaybackHandler) rotateRejectedVirtualCandidateStartV3(
 		if planResult.Terminal != nil || planResult.Plan == nil {
 			return playback.DecisionResponseV3{}, false
 		}
-		response, statusErr := h.startPlannedPlaybackV3(r, userID, profileID, req, requestDigests, catalogFile, &resolvedFile, audioIndex, virtualPlanDecisionV3{candidateRank: resolved.CandidateRank, candidateCount: resolved.CandidateCount}, planResult, clientInfo)
+		response, statusErr := h.startPlannedPlaybackV3(r, userID, profileID, req, requestDigests, catalogFile, &resolvedFile, audioIndex, virtualPlanDecisionV3{candidateRank: resolved.CandidateRank, candidateCount: resolved.CandidateCount, substitutionReason: substitutionReasonDecodeRejectedV3}, planResult, clientInfo, substitutionReasonDecodeRejectedV3)
 		if statusErr == nil {
 			// The start committed a replacement candidate after excluding the
 			// rejected ones. Persist the chain on the new attempt so a later
@@ -2752,6 +2788,9 @@ type virtualPlanDecisionV3 struct {
 	preferredAudioLanguage string
 	candidateRank          int
 	candidateCount         int
+	// substitutionReason carries the alternate-version or rotation walk's
+	// substitution cause to the plan. Empty for a same-release resolve.
+	substitutionReason string
 }
 
 // selectedAudioTrackLogFieldsV3 names the audio track a plan will play: its
@@ -2807,7 +2846,11 @@ func virtualPlanDecisionAttrsV3(result playback.PlannerResultV3, audioIndex int,
 	return attrs
 }
 
-func (h *PlaybackHandler) startPlannedPlaybackV3(r *http.Request, userID int, profileID string, req playback.StartRequestV3, requestDigests playbackStartRequestDigestsV3, requestedFile, effectiveFile *models.MediaFile, audioIndex int, virtualDecision virtualPlanDecisionV3, result playback.PlannerResultV3, clientInfo playback.ClientInfo) (playback.DecisionResponseV3, *transportErrorV3) {
+func (h *PlaybackHandler) startPlannedPlaybackV3(r *http.Request, userID int, profileID string, req playback.StartRequestV3, requestDigests playbackStartRequestDigestsV3, requestedFile, effectiveFile *models.MediaFile, audioIndex int, virtualDecision virtualPlanDecisionV3, result playback.PlannerResultV3, clientInfo playback.ClientInfo, substitutionReason ...string) (playback.DecisionResponseV3, *transportErrorV3) {
+	substitutionReasonV3 := ""
+	if len(substitutionReason) > 0 {
+		substitutionReasonV3 = substitutionReason[0]
+	}
 	if result.Plan == nil {
 		return playback.DecisionResponseV3{}, &transportErrorV3{reason: "internal_error", message: "The server produced no playback plan."}
 	}
@@ -2876,6 +2919,14 @@ func (h *PlaybackHandler) startPlannedPlaybackV3(r *http.Request, userID int, pr
 		abort()
 		return playback.DecisionResponseV3{}, transportErr
 	}
+	// Publish the substitution truth additively on the plan: when the effective
+	// release differs from the requested row, name the requested row and a
+	// machine-readable cause so the client can show an honest notice without
+	// diffing ids first. These fields are set after the plan identity is
+	// finalized inside the planner, so they never change the plan hash. The web
+	// player still compares the live effective identity against the requested
+	// one at render time, so a serve-layer rotation is covered too.
+	publishSubstitutionFieldsV3(result.Plan, requestedFile.ID, effectiveFile.ID, substitutionReasonV3)
 	// One line per final plan decision so route selection is reconstructible
 	// from server logs.
 	planDecisionAttrs := []any{
@@ -3155,6 +3206,10 @@ func (h *PlaybackHandler) prepareTransportWithPolicyAndExclusionsV3(
 		policy.RemuxEgress = config.PlaybackEgressAPIOnly
 		policy.VideoTranscodeEgress = config.PlaybackEgressAPIOnly
 		policy.DirectPlayEgress = config.PlaybackEgressAPIOnly
+	} else if isVirtualPlaybackFile(file) || strings.HasPrefix(strings.ToLower(strings.TrimSpace(file.FilePath)), virtualPlaybackPrefix) {
+		policy.RemuxExecution = config.PlaybackExecutionAPIOnly
+		policy.RemuxEgress = config.PlaybackEgressAPIOnly
+		policy.DirectPlayEgress = config.PlaybackEgressAPIOnly
 	}
 	timeline, timelineErr := h.prepareTransportTimelineV3(r.Context(), session, file, result)
 	if timelineErr != nil {
@@ -3415,7 +3470,76 @@ func copySeekAnchorRetryReserved(ctx context.Context) bool {
 	return time.Until(deadline) > playback.CopySeekProbeRetryBudget()+copySeekProbeRetryMargin
 }
 
-// waitCopySeekAnchorBackoff pauses before re-probing a candidate after a
+// virtualTransportSameReleaseRetryKey marks a start request that has already
+// spent its one same-release transport retry, so a retry that itself fails
+// transiently walks to an alternate instead of retrying in a loop.
+type virtualTransportSameReleaseRetryKey struct{}
+
+func withVirtualTransportSameReleaseRetried(ctx context.Context) context.Context {
+	if ctx == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, virtualTransportSameReleaseRetryKey{}, true)
+}
+
+func virtualTransportSameReleaseRetried(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	retried, _ := ctx.Value(virtualTransportSameReleaseRetryKey{}).(bool)
+	return retried
+}
+
+// publishSubstitutionFieldsV3 sets the additive substitution fields on a plan
+// when the effective release differs from the requested row. It is called after
+// the plan identity is finalized inside the planner, so the UI-only fields
+// never change the plan hash, and it is a no-op for the ordinary same-release
+// case (effectiveFileID == requestedFileID) or an unknown effective row. A
+// reason already carried from the resolve walk wins over the caller's fallback
+// so the more specific cause is preserved.
+func publishSubstitutionFieldsV3(plan *playback.PlanV3, requestedFileID, effectiveFileID int, fallbackReason string) {
+	if plan == nil || effectiveFileID <= 0 || effectiveFileID == requestedFileID {
+		return
+	}
+	if plan.SubstitutionReason == "" {
+		plan.SubstitutionReason = fallbackReason
+	}
+	plan.SubstitutedFromFileID = requestedFileID
+}
+
+// recoverVirtualTransportSameReleaseV3 spends one bounded same-release retry
+// after a transient provider error, before the caller walks to another edition.
+// It fires only for a transient cause, only once per request (the retry marks
+// its context so a second transient failure does not loop), and only after a
+// short pause so a provider that is already failing is not hammered.
+//
+// attempt re-runs the transport for the same release; it returns the retry's
+// response and true only when that attempt succeeded. retried=false covers a
+// non-transient cause, a request that already retried, a context that cannot
+// fit the pause, and a retry that failed again — every case where the caller
+// should proceed to its alternate walk or persist the terminal.
+func (h *PlaybackHandler) recoverVirtualTransportSameReleaseV3(
+	ctx context.Context,
+	transient bool,
+	attempt func(context.Context) (playback.DecisionResponseV3, *transportErrorV3),
+) (playback.DecisionResponseV3, bool) {
+	if !transient || attempt == nil || virtualTransportSameReleaseRetried(ctx) {
+		return playback.DecisionResponseV3{}, false
+	}
+	retryCtx := withVirtualTransportSameReleaseRetried(withVirtualRelayFreshRegistration(ctx))
+	if !h.waitCopySeekAnchorBackoff(retryCtx, 0) {
+		return playback.DecisionResponseV3{}, false
+	}
+	slog.InfoContext(ctx, "virtual playback transport failed once on a transient provider error; retrying the same release",
+		logComponentKey, playbackLogValueV3)
+	response, retryErr := attempt(retryCtx)
+	if retryErr != nil {
+		return playback.DecisionResponseV3{}, false
+	}
+	return response, true
+}
+
+// waitCopySeekAnchorBackoff pauses before retrying a candidate after a
 // transient provider (upstream 5xx) failure. It returns false when the wait or
 // its result cannot fit the caller's remaining budget, so the retry is skipped
 // instead of started without time to finish. remaining is the value already
@@ -3568,12 +3692,34 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 						break
 					}
 					if anchorInput == lastProbedInput {
-						slog.WarnContext(ctx, "virtual seek anchor re-resolve returned the same relay token; skipping a duplicate probe",
-							"component", "api",
-							"playback_session_id", session.ID,
-							"requested_seek_seconds", requested,
-						)
-						break
+						// The re-resolve handed back the token that just 5xxed:
+						// probing it again repeats a known failure. On a
+						// transient provider error, walk to an alternate
+						// same-identity candidate once instead of giving up;
+						// anything else (or no alternate) keeps the terminal.
+						if playback.IsTransientProviderError(err) {
+							if rotated, cleanup, rotErr := h.resolveVirtualAnchorURIExcludingFailedV3(ctx, session, file, virtualResultCandidateID(file.FilePath)); rotErr == nil {
+								releaseAnchor()
+								anchorInput = rotated.URL
+								anchorExpiresAt = rotated.ExpiresAt
+								releaseAnchor = cleanup
+							} else {
+								slog.WarnContext(ctx, "virtual seek anchor re-resolve returned the same relay token; skipping a duplicate probe",
+									"component", "api",
+									"playback_session_id", session.ID,
+									"requested_seek_seconds", requested,
+									"rotation_error", rotErr,
+								)
+								break
+							}
+						} else {
+							slog.WarnContext(ctx, "virtual seek anchor re-resolve returned the same relay token; skipping a duplicate probe",
+								"component", "api",
+								"playback_session_id", session.ID,
+								"requested_seek_seconds", requested,
+							)
+							break
+						}
 					}
 					if fits, remaining := copySeekAnchorRetryFits(ctx); !fits {
 						slog.WarnContext(ctx, "copy-video seek anchor retry skipped after re-resolve: insufficient remaining budget",
@@ -3586,12 +3732,20 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 					}
 				}
 				lastProbedInput = anchorInput
+				probeStarted := time.Now()
 				origin, startSegment, err = probeAnchor(ctx)
 				if err == nil || ctx.Err() != nil || attempt == 2 {
 					break
 				}
 				fits, remaining := copySeekAnchorRetryFits(ctx)
-				if !fits || !retryReserved {
+				// A fast transient failure (relay 5xx in milliseconds, not a
+				// consumed 15s probe) leaves room for a full second probe:
+				// gate the retry on the single-probe fit rather than the
+				// up-front two-probe reservation, which a slow resolve may
+				// already have spent. Slow failures keep the conservative
+				// gate so a truncated second probe cannot mask the error.
+				fastTransient := playback.IsTransientProviderError(err) && time.Since(probeStarted) < playback.CopySeekProbeTimeout
+				if !fits || (!retryReserved && !fastTransient) {
 					slog.WarnContext(ctx, "copy-video seek anchor retry skipped: insufficient remaining budget",
 						"component", "api",
 						"playback_session_id", session.ID,
@@ -3987,11 +4141,10 @@ func (h *PlaybackHandler) prepareIdentityTransportV3(r *http.Request, session *p
 	}, nil
 }
 
-// Virtual sources resolve through the integrated server and relay. Dedicated
-// nodes cannot resolve their provider-neutral virtual:// identity or access
-// the central server's relay, so they must never be selected for playback.
+// Virtual sources resolve through the integrated server and relay before
+// remote transcode dispatch, allowing pooled transcode nodes to serve them.
 func shouldUsePooledPlaybackNodeV3(file *models.MediaFile) bool {
-	return !isVirtualPlaybackFile(file)
+	return file != nil
 }
 
 // planIdentityProxyV3 selects the proxy node that will serve a direct-play or
@@ -5272,7 +5425,48 @@ func (h *PlaybackHandler) prepareRemoteTransportV3(r *http.Request, session *pla
 			hwAccel = playback.HWAccelNone
 		}
 	}
-	req := transcodenode.TranscodeStartRequest{SessionID: transportID, InputPath: file.FilePath, SourceVideoCodec: sourceMetadata.VideoCodec, SourceVideoProfile: sourceProfile, SourceVideoBitDepth: sourceBitDepth, SourceAudioChannels: result.SourceAudioChannels, SourceFrameRate: result.SourceFrameRate, SourceHeight: result.SourceHeight, SoftwareVideoDecode: sourceMetadata.SoftwareVideoDecode, ToneMapPolicy: result.ToneMapPolicy, ToneMapMode: result.ToneMapMode, ToneMapSourceKind: result.ToneMapSourceKind, ToneMapRecipeVersion: result.ToneMapRecipeVersion, ToneMapPreflightRequired: result.ToneMapPreflightRequired, ToneMapSourceRevision: result.ToneMapSourceRevision, VideoBitstreamFilter: videoBitstreamFilterForPlanV3(result.Plan), VideoSampleEntry: videoSampleEntryForPlanV3(result.Plan), SeekSeconds: timeline.seekSeconds, StreamOriginSeconds: timeline.streamOriginSeconds, CopySeekAnchorResolved: timeline.copySeekAnchorResolved, StartSegmentNumber: timeline.startSegmentNumber, TargetResolution: result.TargetResolution, TargetCodecVideo: videoCodec, TargetCodecAudio: result.TargetAudioCodec, TargetAudioChannels: result.TargetAudioChannels, TargetAudioBitrateKbps: result.TargetAudioBitrateKbps, TargetBitrateKbps: result.TargetBitrateKbps, SegmentDuration: playback.DefaultSegmentDuration, HWAccel: hwAccel, AudioTrackIndex: audioStreamOrdinalV3(file, plannedAudioTrackIndexV3(result, session.AudioTrackIndex)), SubtitleTrackIndex: result.SubtitleTransportTrackIndex, SubtitleBurnIn: result.SubtitleBurnIn, SubtitleCodec: result.SubtitleCodec, TotalDuration: sourceMetadata.DurationSeconds, RequireReady: true}
+	inputPath := file.FilePath
+	var virtualCleanup func()
+	if isVirtualPlaybackFile(file) || strings.HasPrefix(strings.ToLower(strings.TrimSpace(file.FilePath)), virtualPlaybackPrefix) {
+		ownerInstallationID := file.VirtualOwnerInstallationID
+		userID, profileID := 0, ""
+		if session != nil {
+			ownerInstallationID = effectiveVirtualOwner(file.VirtualOwnerInstallationID, session.VirtualSourceOwnerInstallationID)
+			userID, profileID = session.UserID, session.ProfileID
+		}
+		resolveCtx := virtualResolveContextWithPersistedIdentity(r.Context(), file)
+		if h.tm != nil && h.tm.ResolveInput != nil {
+			var resolveErr error
+			inputPath, virtualCleanup, resolveErr = h.tm.ResolveInput(resolveCtx, file.ID, ownerInstallationID, userID, profileID, file.FilePath)
+			if resolveErr != nil {
+				return preparedTransportV3{}, &transportErrorV3{
+					reason:    transcodeStartFailedReasonV3,
+					message:   "Failed to resolve virtual media for remote transcode.",
+					retryable: true,
+					cause:     resolveErr,
+				}
+			}
+		} else {
+			res, cleanup, resolveErr := h.ResolveVirtualTransportInput(resolveCtx, file.FilePath, ownerInstallationID, userID, profileID)
+			if resolveErr != nil {
+				return preparedTransportV3{}, &transportErrorV3{
+					reason:    transcodeStartFailedReasonV3,
+					message:   "Failed to resolve virtual media for remote transcode.",
+					retryable: true,
+					cause:     resolveErr,
+				}
+			}
+			inputPath = res.URL
+			virtualCleanup = cleanup
+		}
+	}
+	cleanupOnFailure := func() {
+		if virtualCleanup != nil {
+			virtualCleanup()
+			virtualCleanup = nil
+		}
+	}
+	req := transcodenode.TranscodeStartRequest{SessionID: transportID, InputPath: inputPath, SourceVideoCodec: sourceMetadata.VideoCodec, SourceVideoProfile: sourceProfile, SourceVideoBitDepth: sourceBitDepth, SourceAudioChannels: result.SourceAudioChannels, SourceFrameRate: result.SourceFrameRate, SourceHeight: result.SourceHeight, SoftwareVideoDecode: sourceMetadata.SoftwareVideoDecode, ToneMapPolicy: result.ToneMapPolicy, ToneMapMode: result.ToneMapMode, ToneMapSourceKind: result.ToneMapSourceKind, ToneMapRecipeVersion: result.ToneMapRecipeVersion, ToneMapPreflightRequired: result.ToneMapPreflightRequired, ToneMapSourceRevision: result.ToneMapSourceRevision, VideoBitstreamFilter: videoBitstreamFilterForPlanV3(result.Plan), VideoSampleEntry: videoSampleEntryForPlanV3(result.Plan), SeekSeconds: timeline.seekSeconds, StreamOriginSeconds: timeline.streamOriginSeconds, CopySeekAnchorResolved: timeline.copySeekAnchorResolved, StartSegmentNumber: timeline.startSegmentNumber, TargetResolution: result.TargetResolution, TargetCodecVideo: videoCodec, TargetCodecAudio: result.TargetAudioCodec, TargetAudioChannels: result.TargetAudioChannels, TargetAudioBitrateKbps: result.TargetAudioBitrateKbps, TargetBitrateKbps: result.TargetBitrateKbps, SegmentDuration: playback.DefaultSegmentDuration, HWAccel: hwAccel, AudioTrackIndex: audioStreamOrdinalV3(file, plannedAudioTrackIndexV3(result, session.AudioTrackIndex)), SubtitleTrackIndex: result.SubtitleTransportTrackIndex, SubtitleBurnIn: result.SubtitleBurnIn, SubtitleCodec: result.SubtitleCodec, TotalDuration: sourceMetadata.DurationSeconds, RequireReady: true}
 	req.ThrottleSeconds = playback.ConfiguredTranscodeThrottleSeconds(r.Context(), h.SettingsRepo)
 	if strings.EqualFold(videoCodec, "copy") {
 		req.CopyFMP4RecipeVersion = playback.CopyFMP4RecipeVersion
@@ -5309,6 +5503,7 @@ func (h *PlaybackHandler) prepareRemoteTransportV3(r *http.Request, session *pla
 		"outcome", remoteOutcome,
 	)
 	if err != nil {
+		cleanupOnFailure()
 		if req.ToneMapMode != "" && (errors.Is(err, tonemap.ErrSourceRevisionChanged) ||
 			errors.Is(err, tonemap.ErrSourcePreflightRejected) ||
 			errors.Is(err, playback.ErrToneMapSourceValidationUnavailable) ||
@@ -5323,10 +5518,12 @@ func (h *PlaybackHandler) prepareRemoteTransportV3(r *http.Request, session *pla
 		return preparedTransportV3{}, &transportErrorV3{reason: "transcode_node_unavailable", message: "The selected transcode node is unavailable.", retryable: true, cause: err}
 	}
 	if status != http.StatusAccepted {
+		cleanupOnFailure()
 		h.tm.StopRemoteTranscode(transportID, node.URL)
 		return preparedTransportV3{}, &transportErrorV3{reason: transcodeStartFailedReasonV3, message: "The selected transcode node rejected the playback transport.", retryable: true}
 	}
 	if err := transcodenode.ValidateAudioRecipeAttestation(req, nodeResp); err != nil {
+		cleanupOnFailure()
 		h.tm.StopRemoteTranscode(transportID, node.URL)
 		// A node that cannot confirm the audio adaptation recipe is an audio
 		// failure, not a video one. The distinct reason keeps the start/replan
@@ -5336,14 +5533,17 @@ func (h *PlaybackHandler) prepareRemoteTransportV3(r *http.Request, session *pla
 		return preparedTransportV3{}, &transportErrorV3{reason: audioAdaptationFailedReasonV3, message: "The selected transcode node did not confirm the audio recipe.", retryable: true, cause: err}
 	}
 	if err := transcodenode.ValidateCopyFMP4RecipeAttestation(req, nodeResp); err != nil {
+		cleanupOnFailure()
 		h.tm.StopRemoteTranscode(transportID, node.URL)
 		return preparedTransportV3{}, &transportErrorV3{reason: transcodeStartFailedReasonV3, message: "The selected transcode node did not confirm the copy-video recipe.", retryable: true, cause: err}
 	}
 	if err := transcodenode.ValidateThrottleAttestation(req, nodeResp); err != nil {
+		cleanupOnFailure()
 		h.tm.StopRemoteTranscode(transportID, node.URL)
 		return preparedTransportV3{}, &transportErrorV3{reason: transcodeStartFailedReasonV3, message: "The selected transcode node did not confirm the throttle policy.", retryable: true, cause: err}
 	}
 	if req.ToneMapMode != "" && nodeResp.ToneMapMode != req.ToneMapMode {
+		cleanupOnFailure()
 		h.tm.StopRemoteTranscode(transportID, node.URL)
 		return preparedTransportV3{}, &transportErrorV3{reason: transcodeStartFailedReasonV3, message: "The selected transcode node did not confirm the tone-map recipe.", retryable: true}
 	}
@@ -5414,6 +5614,7 @@ func (h *PlaybackHandler) prepareRemoteTransportV3(r *http.Request, session *pla
 		h.applyRemoteTransportMarkV3(r.Context(), session.ID, servedByProxy)
 	}
 	rollbackTransport := func(requireCancellation bool) error {
+		cleanupOnFailure()
 		if committed {
 			return nil
 		}
@@ -5662,7 +5863,7 @@ func (h *PlaybackHandler) v3SessionStreamState(ctx context.Context, session *pla
 		state.VirtualExternalSubtitles = file.ExternalSubtitles
 		state.VirtualAudioTracks = file.AudioTracks
 		state.VirtualSubtitleEvidenceURI = file.FilePath
-		state.VirtualSubtitleEvidenceSet = true
+		state.VirtualSubtitleEvidenceSet = file.ProbeUpdatedAt != nil
 	}
 	return state
 }
@@ -6272,6 +6473,35 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 	// fast on a genuinely stuck provider.
 	replanCtx, cancelReplan := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancelReplan()
+	// A viewer who re-armed Auto mid-session states it on the replan, so a
+	// later dead-source recovery rotates even though the session started
+	// explicit. Applying it before execution is what lets executeReplanV3's
+	// autoFallbackForSession read the same intent the client is showing; it is
+	// also written to the durable normalized request so a reconstructed session
+	// keeps the negotiated policy instead of reverting to the start request. A
+	// policy the session cannot adopt refuses the replan rather than continuing
+	// with a stale intent.
+	//
+	// The apply is speculative: executeReplanV3 may still fail, and the live
+	// flag is read mid-execution, so capture the prior policy first and restore
+	// both halves on every failure path below. Only a replacement plan that
+	// actually commits keeps the new policy, which is when live and durable
+	// already agree on it.
+	autoFallbackRollback := h.captureAutoFallbackRollbackV3(sessionID, record)
+	autoFallbackCommitted := false
+	defer func() {
+		if !autoFallbackCommitted {
+			autoFallbackRollback.restore()
+		}
+	}()
+	if err := h.renegotiateAutoFallbackV3(sessionID, record, req); err != nil {
+		slog.WarnContext(r.Context(), "protocol v3 replan auto-fallback re-negotiation failed",
+			"component", "api", "session", sessionID, "error", err)
+		if errors.Is(err, playback.ErrSessionNotFound) {
+			return playback.DecisionResponseV3{}, replanSessionNotFoundV3()
+		}
+		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to apply the version fallback policy")
+	}
 	response, updated, transport, replanErr := h.executeReplanV3(r.WithContext(replanCtx), record, req)
 	if replanErr != nil {
 		if transport != nil {
@@ -6291,6 +6521,12 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 		}
 		response := playback.NewTerminalResponseV3(replanErr.reason, replanErr.message, replanErr.retryable)
 		encoded, _ := json.Marshal(response)
+		// The failed replan did not adopt the stated policy, so the terminal
+		// record must persist the policy in force before it, not the one this
+		// request tried. Restore the durable half now, before the record is
+		// copied into the terminal decision; the deferred restore covers the
+		// live half and re-applies harmlessly.
+		autoFallbackRollback.restore()
 		terminalRecord := *record
 		terminalRecord.CurrentReplanRequestID = req.ReplanRequestID
 		if err := h.PlanStoreV3.CompleteReplan(r.Context(), sessionID, req.ReplanRequestID, lease.LeaseToken, record.CurrentReplanRequestID, encoded, terminalRecord); err != nil {
@@ -6308,6 +6544,7 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 		leaseCompleted = true
 		return response, nil
 	}
+
 	updated.CurrentReplanRequestID = req.ReplanRequestID
 	encoded, _ := json.Marshal(response)
 	var rollbackSession func() error
@@ -6354,6 +6591,11 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to commit the replacement plan")
 	}
 	leaseCompleted = true
+	// The replacement plan is durable, so the speculative policy application is
+	// now the adopted policy: live and durable agree and the deferred rollback
+	// must not undo it. A later transport commit failure aborts the live session
+	// without reverting the durable plan.
+	autoFallbackCommitted = true
 	if transport != nil {
 		if commitErr := transport.commit(); commitErr != nil {
 			_ = h.abortPlaybackSessionByID(context.WithoutCancel(r.Context()), sessionID)
@@ -7816,12 +8058,10 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		// an explicit start turns it off so a replan must not silently substitute
 		// another version, and the viewer re-selecting Auto turns it back on even
 		// for a session that started explicit. An unset flag (a reconstruction)
-		// keeps the original request's semantics.
-		autoFallback := record.NormalizedRequest.AllowsAlternateVersions() &&
-			record.NormalizedRequest.FileSelection != playback.FileSelectionExplicitV3
-		if negotiated, ok := autoFallbackForSession(h.sessionMgr, session.ID); ok {
-			autoFallback = negotiated
-		}
+		// falls back to the durable normalized request, which a mid-session re-arm
+		// updates, so the reconstructed policy still matches the viewer's intent
+		// instead of the original start request.
+		autoFallback := resolveReplanAutoFallbackV3(h.sessionMgr, session.ID, record)
 		replanFallbackAllowed := autoFallback &&
 			(replanAllowsAlternateFileV3(operation, start.QualityPreference) ||
 				(isVirtualPlaybackFile(requestedFile) && operation == playback.ReplanOperationFailureRecoveryV3))
@@ -7835,6 +8075,30 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		// place rather than substituting a sibling.
 		audioOnlyAllowed := replanFallbackAllowed && audioOnlyTerminalV3(result.Terminal)
 		alternateFileAllowed := replanFallbackAllowed && terminalAllowsAlternateFileV3(result.Terminal)
+		// versionPickFallback remembers whether the hunt below runs for an
+		// explicitly picked but unplannable release, so its success publishes
+		// the substitution notice (the shared hunt is silent by default).
+		versionPickFallback := false
+		if !alternateFileAllowed && trackChange && result.Terminal != nil &&
+			result.Terminal.Reason == sourceMetadataIncompleteReasonV3 &&
+			requestedFile != nil && effectiveFile != nil &&
+			requestedFile.ID != 0 && requestedFile.ID != effectiveFile.ID &&
+			playback.VirtualRouteVideoMetadataGapsV3(requestedFile) != "" &&
+			playback.VirtualRouteVideoMetadataGapsV3(effectiveFile) == "" {
+			// A track_change naming a different file than mounted is a
+			// version pick, not a subtitle/audio pick (those name the
+			// mounted file and never reach this branch). When planning the
+			// pick terminals on missing metadata while the mounted release
+			// is fully characterized, fall back through the same alternate
+			// hunt (with substitution notice) instead of stranding on a
+			// terminal for a row that was never probed. Subtitle/audio
+			// terminals keep their in-place degrade above; this branch
+			// deliberately bypasses the auto-fallback flag because an
+			// explicitly picked but unplannable release with a playable
+			// bound sibling is exactly what the notice exists for.
+			alternateFileAllowed = true
+			versionPickFallback = true
+		}
 		if subtitleOnlyAllowed {
 			// A subtitle-only refusal must not move the release. Re-plan the
 			// file already mounted with the subtitle dropped; the in-place
@@ -7921,6 +8185,15 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 						preparedTransport = &eval.transport
 						transportPrepared = true
 						reservationHeld = eval.reservationHeld
+						if versionPickFallback {
+							// The hunt ran for an explicitly picked but
+							// unplannable release: name the substitution so
+							// the client shows the notice instead of playing
+							// a different release silently. Unknown reason:
+							// the pick was unplannable (missing metadata),
+							// not confirmed dead.
+							publishSubstitutionFieldsV3(result.Plan, requestedFile.ID, effectiveFile.ID, substitutionReasonUnknownV3)
+						}
 						break
 					}
 					if firstFailureEval == nil && eval != nil {
@@ -9012,6 +9285,11 @@ const (
 	terminalSubtitleConversionUnsupportedV3 = "subtitle_conversion_unsupported"
 	terminalSubtitleUnavailableInVersionV3  = "subtitle_unavailable_in_version"
 	terminalBitratePolicyUnavailableV3      = playback.TerminalBitratePolicyUnavailableV3
+	// sourceMetadataIncompleteReasonV3 is the planner terminal for a source
+	// missing video metadata. A version pick (not a subtitle/audio pick)
+	// terminaling on it with a fully-characterized bound sibling falls back
+	// through the alternate hunt instead of stranding on terminal.
+	sourceMetadataIncompleteReasonV3 = "source_metadata_incomplete"
 )
 
 // terminalAllowsAlternateFileV3 reports whether a refusal is the kind another
@@ -9113,6 +9391,130 @@ func autoFallbackForSession(sessionMgr SessionManagerInterface, sessionID string
 		return false, false
 	}
 	return getter.AutoFallback(sessionID)
+}
+
+// resolveReplanAutoFallbackV3 resolves the attempt's effective version-fallback
+// policy for a replan. The live session flag wins while it is set (it carries a
+// mid-session re-arm); otherwise the durable normalized request is
+// authoritative, so a reconstructed session whose in-memory flag was lost with
+// the process keeps the negotiated policy instead of reverting to the start
+// request.
+func resolveReplanAutoFallbackV3(sessionMgr SessionManagerInterface, sessionID string, record *playback.AttemptRecordV3) bool {
+	autoFallback := false
+	if record != nil {
+		autoFallback = record.NormalizedRequest.AllowsAlternateVersions() &&
+			record.NormalizedRequest.FileSelection != playback.FileSelectionExplicitV3
+	}
+	if negotiated, ok := autoFallbackForSession(sessionMgr, sessionID); ok {
+		autoFallback = negotiated
+	}
+	return autoFallback
+}
+
+// errAutoFallbackUnsupportedV3 reports a session manager that cannot negotiate
+// auto-fallback. The replan refuses rather than applying a policy the session
+// would not honor.
+var errAutoFallbackUnsupportedV3 = errors.New("session manager does not expose auto-fallback negotiation")
+
+// renegotiateAutoFallbackV3 applies a replan's auto-fallback intent to the live
+// session and the durable attempt record. Clients that start on an explicit
+// pick and later re-select Auto from the version menu have no start request to
+// carry the intent, so the next replan states it here. Recording it on the
+// durable normalized request as well is what lets a reconstructed session keep
+// the negotiated policy instead of reverting to the start request. A set
+// failure is returned to the caller so the replan fails closed: running with a
+// policy the session will not honor, or one that will not survive a
+// reconstruction, is worse than a retryable failure. An absent field leaves the
+// negotiated intent untouched.
+func (h *PlaybackHandler) renegotiateAutoFallbackV3(sessionID string, record *playback.AttemptRecordV3, req playback.ReplanRequestV3) error {
+	if req.AutoFallback == nil {
+		return nil
+	}
+	setter, ok := h.sessionMgr.(interface {
+		SetAutoFallback(sessionID string, enabled bool) error
+	})
+	if !ok {
+		return errAutoFallbackUnsupportedV3
+	}
+	if err := setter.SetAutoFallback(sessionID, *req.AutoFallback); err != nil {
+		return err
+	}
+	persistAutoFallbackPolicyV3(&record.NormalizedRequest, *req.AutoFallback)
+	return nil
+}
+
+// autoFallbackRollbackV3 captures the auto-fallback policy in force before a
+// replan speculatively applies a new one. The handler applies the new intent to
+// the live session before executeReplanV3 so execution reads the same policy the
+// client is showing; if execution then fails, the speculative write must be
+// undone. Both halves are restored: the live session's boolean and set-bit (an
+// unset session must go back to reporting ok=false, not a spurious explicit
+// "off"), and the durable normalized request the record carries, so a terminal
+// failure does not persist the policy the failed replan never adopted.
+type autoFallbackRollbackV3 struct {
+	handler   *PlaybackHandler
+	sessionID string
+	record    *playback.AttemptRecordV3
+
+	enabled bool
+	set     bool
+
+	allowAlternate *bool
+	fileSelection  playback.FileSelectionV3
+}
+
+// captureAutoFallbackRollbackV3 snapshots the live and durable policy so a
+// later failure can restore it. Call it before renegotiateAutoFallbackV3.
+func (h *PlaybackHandler) captureAutoFallbackRollbackV3(sessionID string, record *playback.AttemptRecordV3) autoFallbackRollbackV3 {
+	rollback := autoFallbackRollbackV3{handler: h, sessionID: sessionID, record: record}
+	rollback.enabled, rollback.set = autoFallbackForSession(h.sessionMgr, sessionID)
+	if record != nil {
+		if record.NormalizedRequest.AllowAlternateVersions != nil {
+			allow := *record.NormalizedRequest.AllowAlternateVersions
+			rollback.allowAlternate = &allow
+		}
+		rollback.fileSelection = record.NormalizedRequest.FileSelection
+	}
+	return rollback
+}
+
+// restore puts the captured policy back. The live restore tolerates a session
+// that vanished while the replan ran (session_expired) — there is nothing left
+// to restore on in that case. The durable restore always applies, because the
+// record is a local snapshot the caller may still persist.
+func (rb autoFallbackRollbackV3) restore() {
+	if rb.record != nil {
+		rb.record.NormalizedRequest.AllowAlternateVersions = rb.allowAlternate
+		rb.record.NormalizedRequest.FileSelection = rb.fileSelection
+	}
+	restorer, ok := rb.handler.sessionMgr.(interface {
+		RestoreAutoFallback(sessionID string, enabled bool, set bool) error
+	})
+	if !ok {
+		return
+	}
+	if err := restorer.RestoreAutoFallback(rb.sessionID, rb.enabled, rb.set); err != nil && !errors.Is(err, playback.ErrSessionNotFound) {
+		slog.Warn("protocol v3 replan auto-fallback rollback failed", "component", "api", "session", rb.sessionID, "error", err)
+	}
+}
+
+// persistAutoFallbackPolicyV3 materializes a negotiated version-fallback policy
+// into the durable normalized request. The reconstruction read derives fallback
+// from the request's selection intent, so enabling clears an explicit pin and
+// disabling records one; the explicit boolean is written too, so a reader does
+// not have to infer it from the selection when a client sends an explicit
+// allow_alternate_versions.
+func persistAutoFallbackPolicyV3(req *playback.StartRequestV3, enabled bool) {
+	if req == nil {
+		return
+	}
+	allow := enabled
+	req.AllowAlternateVersions = &allow
+	if enabled {
+		req.FileSelection = playback.FileSelectionAutoV3
+	} else {
+		req.FileSelection = playback.FileSelectionExplicitV3
+	}
 }
 
 func replanAllowsAlternateFileV3(operation playback.ReplanOperationV3, qualityPreference string) bool {

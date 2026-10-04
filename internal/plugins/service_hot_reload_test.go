@@ -195,9 +195,6 @@ func (f *fakeServiceHost) Shutdown(context.Context) error {
 type fakePluginClient struct {
 	manifest              *pluginv1.PluginManifest
 	metadataProviderCalls int
-	httpRoutesClient      *pluginhost.HTTPRoutesClient
-	httpRoutesErr         error
-	virtualStreamClient   *pluginhost.VirtualStreamProviderClient
 }
 
 func (f *fakePluginClient) Manifest() *pluginv1.PluginManifest {
@@ -242,14 +239,14 @@ func (f *fakePluginClient) AuthProvider(string) (*pluginhost.AuthProviderClient,
 }
 
 func (f *fakePluginClient) HTTPRoutes(string) (*pluginhost.HTTPRoutesClient, error) {
-	return f.httpRoutesClient, f.httpRoutesErr
-}
-
-func (f *fakePluginClient) VirtualStreamProvider(string) (*pluginhost.VirtualStreamProviderClient, error) {
-	return f.virtualStreamClient, nil
+	return nil, nil
 }
 
 func (f *fakePluginClient) WatchSyncProvider(string) (*pluginhost.WatchSyncProviderClient, error) {
+	return nil, nil
+}
+
+func (f *fakePluginClient) NetworkAccessProvider(string) (*pluginhost.NetworkAccessProviderClient, error) {
 	return nil, nil
 }
 

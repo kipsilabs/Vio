@@ -4,11 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
+	"github.com/Silo-Server/silo-plugin-sdk/pkg/pluginsdk/capability"
 
 	"github.com/Silo-Server/silo-server/internal/netaccess"
 	"github.com/Silo-Server/silo-server/internal/pluginhost"
@@ -127,13 +130,48 @@ func (s *Service) SetNetworkAccessStatusSink(sink NetworkAccessStatusSink) {
 // ListNetworkAccessProviders returns every enabled installation declaring
 // network_access_provider.v1, in installation id order. An installation whose
 // manifest cannot be read is logged and skipped rather than hiding the rest.
-//
-// NOTE (fork, stripped for SDK): provider discovery needs
-// network_access_provider.v1 descriptor support in the plugin SDK, which the
-// pinned SDK predates, so no installation is ever listed until the SDK is
-// updated.
 func (s *Service) ListNetworkAccessProviders(ctx context.Context) ([]NetworkAccessProvider, error) {
-	return nil, nil
+	if s == nil || s.installations == nil {
+		return nil, nil
+	}
+	installations, err := s.installations.ListEnabledWithCapabilityTypes(ctx, []string{capability.NetworkAccessProvider})
+	if err != nil {
+		return nil, fmt.Errorf("list network access providers: %w", err)
+	}
+	providers := make([]NetworkAccessProvider, 0, len(installations))
+	seen := make(map[string]int, len(installations))
+	for _, installation := range installations {
+		if installation == nil || installation.IsBuiltin() {
+			continue
+		}
+		manifest, err := s.networkAccessManifest(ctx, installation)
+		if err != nil {
+			slog.WarnContext(ctx, "network access provider manifest unavailable; skipping", "component", "plugins",
+				"installation_id", installation.ID, "plugin_id", installation.PluginID, "error", err)
+			continue
+		}
+		descriptor, slug := pluginhost.NetworkAccessProviderCapability(manifest)
+		if descriptor == nil {
+			continue
+		}
+		// A slug names one provider per deployment. Installations are listed
+		// in id order, so the oldest enabled one owns the slug and later
+		// duplicates are skipped everywhere the slug is resolved and are
+		// excluded from the resident set.
+		if first, dup := seen[slug]; dup {
+			slog.WarnContext(ctx, "network access provider slug is declared by more than one enabled installation; using the first", "component", "plugins",
+				"provider", slug, "installation_id", first, "skipped_installation_id", installation.ID, "plugin_id", installation.PluginID)
+			continue
+		}
+		seen[slug] = installation.ID
+		providers = append(providers, NetworkAccessProvider{
+			InstallationID: installation.ID,
+			CapabilityID:   descriptor.GetId(),
+			Provider:       slug,
+			DisplayName:    networkAccessDisplayName(descriptor, slug),
+		})
+	}
+	return providers, nil
 }
 
 // networkAccessManifest keeps a running provider discoverable and commandable
@@ -149,6 +187,16 @@ func (s *Service) networkAccessManifest(ctx context.Context, installation *Insta
 		return client.Manifest(), nil
 	}
 	return nil, err
+}
+
+func networkAccessDisplayName(descriptor *pluginv1.CapabilityDescriptor, slug string) string {
+	if name := strings.TrimSpace(descriptor.GetNetworkAccessProvider().GetDisplayName()); name != "" {
+		return name
+	}
+	if name := strings.TrimSpace(descriptor.GetDisplayName()); name != "" {
+		return name
+	}
+	return slug
 }
 
 // networkAccessProvider resolves a slug to its installation.
@@ -215,6 +263,9 @@ func (s *Service) networkAccessTargets(ctx context.Context) ([]networkAccessTarg
 	return targets, nil
 }
 
+// networkAccessCommand is one provider RPC applied to a host.
+type networkAccessCommand func(ctx context.Context, client *pluginhost.NetworkAccessProviderClient) (*pluginv1.NetworkAccessStatus, error)
+
 // networkAccessOperation names what a report applies to each targeted host.
 type networkAccessOperation int
 
@@ -223,6 +274,22 @@ const (
 	networkAccessConnect
 	networkAccessDisconnect
 )
+
+func (op networkAccessOperation) command() networkAccessCommand {
+	switch op {
+	case networkAccessConnect:
+		return func(ctx context.Context, client *pluginhost.NetworkAccessProviderClient) (*pluginv1.NetworkAccessStatus, error) {
+			return client.Connect(ctx, &pluginv1.NetworkAccessConnectRequest{})
+		}
+	case networkAccessDisconnect:
+		return func(ctx context.Context, client *pluginhost.NetworkAccessProviderClient) (*pluginv1.NetworkAccessStatus, error) {
+			return client.Disconnect(ctx, &pluginv1.NetworkAccessDisconnectRequest{})
+		}
+	}
+	return func(ctx context.Context, client *pluginhost.NetworkAccessProviderClient) (*pluginv1.NetworkAccessStatus, error) {
+		return client.GetStatus(ctx, &pluginv1.NetworkAccessGetStatusRequest{})
+	}
+}
 
 // NetworkAccessStatus reads the provider's live status on every host.
 func (s *Service) NetworkAccessStatus(ctx context.Context, provider string) (NetworkAccessReport, error) {
@@ -258,6 +325,7 @@ func (s *Service) networkAccessReport(ctx context.Context, slug string, targets 
 	if err != nil {
 		return NetworkAccessReport{}, err
 	}
+	targeted := make(map[string]bool, len(targets))
 	for _, id := range targets {
 		id = strings.TrimSpace(id)
 		known := false
@@ -270,14 +338,30 @@ func (s *Service) networkAccessReport(ctx context.Context, slug string, targets 
 		if !known {
 			return NetworkAccessReport{}, fmt.Errorf("%w: %q", ErrNetworkAccessHostUnknown, id)
 		}
+		targeted[id] = true
 	}
 	report := NetworkAccessReport{Provider: provider, Hosts: make([]NetworkAccessHostStatus, len(hosts))}
+	var wg sync.WaitGroup
 	for i, target := range hosts {
-		hostCtx, cancel := context.WithTimeout(ctx, NetworkAccessHostTimeout)
-		status := s.applyNetworkAccess(hostCtx, provider)
-		cancel()
-		report.Hosts[i] = NetworkAccessHostStatus{Host: target.host, Status: status}
+		apply := networkAccessRead
+		if targets == nil || targeted[target.host.ID] {
+			apply = op
+		}
+		wg.Add(1)
+		go func(i int, target networkAccessTarget, apply networkAccessOperation) {
+			defer wg.Done()
+			hostCtx, cancel := context.WithTimeout(ctx, NetworkAccessHostTimeout)
+			defer cancel()
+			var status netaccess.Status
+			if target.node == nil {
+				status = s.applyNetworkAccess(hostCtx, provider, apply.command())
+			} else {
+				status = s.applyNodeNetworkAccess(hostCtx, *target.node, provider, apply)
+			}
+			report.Hosts[i] = NetworkAccessHostStatus{Host: target.host, Status: status}
+		}(i, target, apply)
 	}
+	wg.Wait()
 	return report, nil
 }
 
@@ -336,7 +420,7 @@ func (s *Service) HostNetworkAccessStatus(ctx context.Context) (netaccess.HostSt
 	}
 	for _, provider := range providers {
 		hostCtx, cancel := context.WithTimeout(ctx, NetworkAccessHostTimeout)
-		report.Providers = append(report.Providers, s.applyNetworkAccess(hostCtx, provider))
+		report.Providers = append(report.Providers, s.applyNetworkAccess(hostCtx, provider, networkAccessRead.command()))
 		cancel()
 	}
 	return report, nil
@@ -369,17 +453,58 @@ func (s *Service) hostNetworkAccess(ctx context.Context, slug string, op network
 	}
 	hostCtx, cancel := context.WithTimeout(ctx, NetworkAccessHostTimeout)
 	defer cancel()
-	return s.applyNetworkAccess(hostCtx, provider), nil
+	return s.applyNetworkAccess(hostCtx, provider, op.command()), nil
 }
 
-// applyNetworkAccess answers one provider read or command on this host.
-// NOTE (fork, stripped for SDK): provider RPCs need
-// network_access_provider.v1 client support in the plugin SDK, which the
-// pinned SDK predates, so every operation answers unavailable with the
-// reason until the SDK is updated. Host validation and report shapes are
-// unchanged, so the admin and capability surfaces keep working.
-func (s *Service) applyNetworkAccess(ctx context.Context, provider NetworkAccessProvider) netaccess.Status {
-	return netaccess.Status{InstallationID: provider.InstallationID, Provider: provider.Provider, State: netaccess.StateUnavailable, Error: "network access providers require a plugin SDK with network_access_provider.v1 support"}
+// applyNetworkAccess runs one RPC against the provider instance in this
+// process. The process is never launched here: the resident supervisor owns
+// that, and a host whose instance is not running answers unavailable with
+// the supervisor's last error, so an admin sees why without a second read.
+func (s *Service) applyNetworkAccess(ctx context.Context, provider NetworkAccessProvider, apply networkAccessCommand) netaccess.Status {
+	unavailable := netaccess.Status{InstallationID: provider.InstallationID, Provider: provider.Provider, State: netaccess.StateUnavailable}
+	// Every unavailable answer also replaces the cached status: whatever
+	// origin the instance last pushed is not being served by a process this
+	// host can reach, so the origin check and the node health report must
+	// stop advertising it. The plugin's next push restores it.
+	// The returned status carries no updated_at: the contract defines it as
+	// when the host last heard from the provider, which an unavailable
+	// answer is not. The cache stamps its own copy on Report.
+	var ingressToken string
+	if s.networkAccessStatus != nil {
+		ingressToken, _ = s.networkAccessStatus.IngressToken(provider.InstallationID)
+	}
+	fail := func(reason string) netaccess.Status {
+		unavailable.Error = reason
+		if s.networkAccessStatus != nil {
+			s.networkAccessStatus.ReportFor(provider.InstallationID, ingressToken, unavailable)
+		}
+		return unavailable
+	}
+	if s.host == nil {
+		return fail("plugin host is not running")
+	}
+	if reason := s.resident.GateError(); reason != "" {
+		return fail(reason)
+	}
+	pc, err := s.host.Client(provider.InstallationID)
+	if err != nil {
+		return fail(networkAccessUnavailableReason(err, s.RuntimeState(provider.InstallationID)))
+	}
+	client, err := pc.NetworkAccessProvider(provider.CapabilityID)
+	if err != nil {
+		return fail(err.Error())
+	}
+	ingressToken = client.IngressToken()
+	reported, err := apply(ctx, client)
+	if err != nil {
+		return fail(err.Error())
+	}
+	status := pluginhost.NetworkAccessStatusFromProto(provider.InstallationID, provider.Provider, reported)
+	status.UpdatedAt = time.Now()
+	if s.networkAccessStatus != nil {
+		s.networkAccessStatus.ReportFor(provider.InstallationID, ingressToken, status)
+	}
+	return status
 }
 
 func networkAccessUnavailableReason(err error, state RuntimeState) string {

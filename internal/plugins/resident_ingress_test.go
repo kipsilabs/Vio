@@ -1,9 +1,5 @@
 package plugins
 
-// NOTE (fork, stripped for SDK): ingress-token lifecycle tests need
-// network_access_provider.v1 detection in the plugin SDK. The pinned SDK
-// predates it, so they are parked until the SDK is updated.
-
 import (
 	"context"
 	"testing"
@@ -21,7 +17,7 @@ import (
 // Starting a network access provider issues its ingress token before the
 // plugin can ask for it; stopping the process revokes it and forgets its
 // status, so a request still carrying the old token is refused.
-func skippedTestHostStartIssuesAndStopRevokesIngressToken(t *testing.T) {
+func TestHostStartIssuesAndStopRevokesIngressToken(t *testing.T) {
 	bin := buildResidentFixture(t)
 	manifest, err := LoadManifestFile(InstalledManifestPath(bin))
 	if err != nil {

@@ -46,13 +46,20 @@ type VirtualCandidatesRefreshRequest struct {
 // carries the retained watch-shape indexer release list so the accepted job
 // echoes what every client will read next.
 type VirtualCandidatesRefreshResult struct {
-	ContentID          string                 `json:"content_id"`
-	EpisodeID          string                 `json:"episode_id,omitempty"`
-	ProviderCandidates int                    `json:"provider_candidates"`
-	IndexerReleases    int                    `json:"indexer_releases"`
-	Enriched           int                    `json:"enriched"`
-	IndexerSearchOK    bool                   `json:"indexer_search_ok"`
-	Releases           []IndexerReleaseResult `json:"releases,omitempty"`
+	ContentID          string `json:"content_id"`
+	EpisodeID          string `json:"episode_id,omitempty"`
+	ProviderCandidates int    `json:"provider_candidates"`
+	IndexerReleases    int    `json:"indexer_releases"`
+	Enriched           int    `json:"enriched"`
+	// PrunedCandidates is how many dead, absent, unprotected candidate rows the
+	// cleanup pass deleted. Purely informational.
+	PrunedCandidates int `json:"pruned_candidates"`
+	// PendingCandidates is how many freshly listed candidates AltMount
+	// reports as actively fetching. Purely informational: these are the
+	// releases playback will wait for rather than skip.
+	PendingCandidates int                    `json:"pending_candidates"`
+	IndexerSearchOK   bool                   `json:"indexer_search_ok"`
+	Releases          []IndexerReleaseResult `json:"releases,omitempty"`
 }
 
 // IndexerReleaseResult is the safe, URL-free projection of one persisted

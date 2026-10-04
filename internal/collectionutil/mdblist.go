@@ -175,7 +175,7 @@ func MDBListHTTPClient(base *http.Client) *http.Client {
 	}
 	clone := *base
 	if clone.Timeout == 0 {
-		clone.Timeout = 30 * time.Second
+		clone.Timeout = MDBListRequestTimeout
 	}
 	parentRedirect := base.CheckRedirect
 	clone.CheckRedirect = func(req *http.Request, via []*http.Request) error {

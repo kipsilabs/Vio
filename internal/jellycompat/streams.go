@@ -765,12 +765,16 @@ func (h *PlaybackHandler) HandleVideoStream(w http.ResponseWriter, r *http.Reque
 
 	requiresAudioBoost := method == string(playback.PlayRemux) && source.TranscodeAudio && compatSourceAudioChannels(*source) > 0
 	routingPolicy := h.playbackRoutingPolicy()
-	if isCompatVirtualSource(*source) {
+	if !shouldUseCompatNodePool(*source, file) {
 		routingPolicy.DirectPlayEgress = config.PlaybackEgressAPIOnly
 		routingPolicy.RemuxExecution = config.PlaybackExecutionAPIOnly
 		routingPolicy.RemuxEgress = config.PlaybackEgressAPIOnly
 		routingPolicy.VideoTranscodeExecution = config.PlaybackExecutionAPIOnly
 		routingPolicy.VideoTranscodeEgress = config.PlaybackEgressAPIOnly
+	} else if isCompatVirtualSource(*source) || isCompatVirtualFile(file) {
+		routingPolicy.DirectPlayEgress = config.PlaybackEgressAPIOnly
+		routingPolicy.RemuxExecution = config.PlaybackExecutionAPIOnly
+		routingPolicy.RemuxEgress = config.PlaybackEgressAPIOnly
 	}
 	decision := h.resolveCompatIdentityRouteWithPolicy(r.Context(), playSession.UpstreamSessionID, method, source.Version.Bitrate, requiresAudioBoost, routingPolicy)
 	if !decision.Selected() {
@@ -1053,12 +1057,16 @@ func (h *PlaybackHandler) HandleMasterManifest(w http.ResponseWriter, r *http.Re
 	localRouteSelected := false
 	localRoutingWorkload := noderouting.Workload("")
 	routingPolicy := h.playbackRoutingPolicy()
-	if isCompatVirtualSource(*source) {
+	if !shouldUseCompatNodePool(*source, file) {
 		routingPolicy.DirectPlayEgress = config.PlaybackEgressAPIOnly
 		routingPolicy.RemuxExecution = config.PlaybackExecutionAPIOnly
 		routingPolicy.RemuxEgress = config.PlaybackEgressAPIOnly
 		routingPolicy.VideoTranscodeExecution = config.PlaybackExecutionAPIOnly
 		routingPolicy.VideoTranscodeEgress = config.PlaybackEgressAPIOnly
+	} else if isCompatVirtualSource(*source) || isCompatVirtualFile(file) {
+		routingPolicy.DirectPlayEgress = config.PlaybackEgressAPIOnly
+		routingPolicy.RemuxExecution = config.PlaybackExecutionAPIOnly
+		routingPolicy.RemuxEgress = config.PlaybackEgressAPIOnly
 	}
 	var lastPreparationErr error
 	for attempts := 0; attempts < 32; attempts++ {
@@ -1808,6 +1816,14 @@ func (h *PlaybackHandler) HandleSubtitleStream(w http.ResponseWriter, r *http.Re
 				writeError(w, http.StatusInternalServerError, "ServerError", "Failed to load subtitle from storage")
 				return
 			}
+			// Apply the stored timing correction before conversion or windowing.
+			data, err = subtitles.DeliveryBytes(&dl, data)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, "ServerError", "Failed to prepare subtitle")
+				return
+			}
+			// The correction can change behind the same URL.
+			w.Header().Set("Cache-Control", "private, no-cache")
 
 			// Serve downloaded ASS/SSA as raw data when requested.
 			if requestedFormat == "ass" && playback.IsASS(string(dl.Format)) {
@@ -2176,7 +2192,14 @@ func (h *PlaybackHandler) cleanupPlaySession(
 		h.tm.CloseTranscodeSession(playSession.UpstreamSessionID, transcodeNodeURL)
 	}
 	if h.sessionMgr != nil {
-		_ = h.sessionMgr.StopSession(playSession.UpstreamSessionID)
+		// The play is over, so finish rather than stop the native session: its
+		// finish hook records the play in watch and admin history. Mid-play
+		// replacements keep using StopSession.
+		if finisher, ok := h.sessionMgr.(sessionFinisher); ok {
+			_ = finisher.FinishSession(ctx, playSession.UpstreamSessionID)
+		} else {
+			_ = h.sessionMgr.StopSession(playSession.UpstreamSessionID)
+		}
 	}
 	// Deliberate stop: drop the node recipe so a buffered/retrying request after
 	// a node restart cannot reconstruct a fresh ffmpeg for this stopped session.
@@ -2621,8 +2644,8 @@ func (h *PlaybackHandler) handlePlaybackReport(w http.ResponseWriter, r *http.Re
 	// Only the Stopped report and the report that marks the item watched change
 	// the taste profile; a position-only report does not. A Stopped report
 	// refreshes even when it carries no position: the play's earlier reports
-	// already wrote its progress, and StopSession does not run the native stop
-	// finalizer that would otherwise refresh the profile.
+	// already wrote its progress, and a stop that reaches a replica without
+	// the native session records no history there to refresh the profile.
 	refreshTasteProfile := stop
 	// Ignore early zero reports while a client is still seeking to its resume
 	// point, matching the native playback persistence rule.
@@ -2904,6 +2927,7 @@ func (h *PlaybackHandler) ensureUpstreamPlayback(ctx context.Context, compatSess
 			return errUpstreamReplaced
 		}
 		current.UpstreamSessionID = session.ID
+		current.UpstreamMediaFileID = source.FileID
 		current.UpstreamPlayMethod = method
 		current.TranscodeStarted = false
 		// A new upstream session has no committed HLS route yet. Retaining the

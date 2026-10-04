@@ -3,13 +3,18 @@ package watchsync
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
 	"github.com/Silo-Server/silo-server/internal/historyimport"
+	hostplugins "github.com/Silo-Server/silo-server/internal/plugins"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -32,6 +37,8 @@ type fakeWatchSyncPluginClient struct {
 	devicePollResponse  *pluginv1.WatchSyncDeviceAuthorizationServicePollResponse
 	listResponse        *pluginv1.WatchSyncListRemoteStateResponse
 	listResponses       []*pluginv1.WatchSyncListRemoteStateResponse
+	applyStatus         pluginv1.WatchSyncApplyStatus // answers every event when applyResponse is nil
+	applyFault          *pluginv1.WatchSyncFault      // attached to each applyStatus answer
 	applyErr            error
 	applyRequest        *pluginv1.WatchSyncApplyEventsRequest
 	exchangeRequest     *pluginv1.WatchSyncExchangeAPIKeyRequest
@@ -78,6 +85,13 @@ func (f *fakeWatchSyncPluginClient) GetAccount(_ context.Context, req *pluginv1.
 }
 func (f *fakeWatchSyncPluginClient) ApplyEvents(_ context.Context, req *pluginv1.WatchSyncApplyEventsRequest) (*pluginv1.WatchSyncApplyEventsResponse, error) {
 	f.applyRequest = req
+	if f.applyResponse == nil && f.applyStatus != pluginv1.WatchSyncApplyStatus_WATCH_SYNC_APPLY_STATUS_UNSPECIFIED {
+		response := &pluginv1.WatchSyncApplyEventsResponse{}
+		for _, event := range req.GetEvents() {
+			response.Results = append(response.Results, &pluginv1.WatchSyncApplyResult{EventId: event.GetEventId(), Status: f.applyStatus, Fault: f.applyFault})
+		}
+		return response, f.applyErr
+	}
 	return f.applyResponse, f.applyErr
 }
 
@@ -1280,6 +1294,12 @@ func TestPluginProviderMapsAllCapabilitiesAndListOperations(t *testing.T) {
 		ImportFavorites: true, ExportFavorites: true, RemoveFavorites: true,
 		ImportWatchlist: true, ExportWatchlist: true, RemoveWatchlist: true,
 		ProvidesWatchlistOrder: true, ScrobblePlayback: true, MaxBatchSize: 25,
+		ImportRatings: true, ExportRatings: true, SyncDropped: true,
+		SupportedMediaTypes: []pluginv1.WatchSyncMediaType{
+			pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_MOVIE,
+			pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_EPISODE,
+			pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_SERIES,
+		},
 	}
 	client := &fakeWatchSyncPluginClient{}
 	provider := testPluginProviderWithDescriptor(t, client, descriptor)
@@ -1288,6 +1308,7 @@ func TestPluginProviderMapsAllCapabilitiesAndListOperations(t *testing.T) {
 		ImportFavorites: true, ExportFavorites: true, RemoveFavorites: true,
 		ImportWatchlist: true, ExportWatchlist: true, RemoveWatchlist: true,
 		ProvidesWatchlistOrder: true, ScrobblePlayback: true,
+		ImportRatings: true, ExportRatings: true, SyncDropped: true,
 	}) {
 		t.Fatalf("capabilities = %#v", provider.Capabilities())
 	}
@@ -1409,5 +1430,953 @@ func TestPluginProviderForwardsAuthoritativeScrobbleCompletion(t *testing.T) {
 	}, pluginv1.WatchSyncOperation_WATCH_SYNC_OPERATION_SCROBBLE_STOP)
 	if incomplete.GetCompleted() {
 		t.Fatal("incomplete event = true, want false")
+	}
+}
+
+const testSeriesMediaID = "series-1"
+
+func ratingTestDescriptor(media ...pluginv1.WatchSyncMediaType) *pluginv1.WatchSyncProviderDescriptor {
+	return &pluginv1.WatchSyncProviderDescriptor{
+		AuthMethods:         []pluginv1.WatchSyncAuthMethod{pluginv1.WatchSyncAuthMethod_WATCH_SYNC_AUTH_METHOD_API_KEY},
+		ImportRatings:       true,
+		ExportRatings:       true,
+		SupportedMediaTypes: media,
+		MaxBatchSize:        25,
+	}
+}
+
+func remoteRatingState(key string, mediaType pluginv1.WatchSyncMediaType, imdbID string, rating int32, ratedAt *timestamppb.Timestamp) *pluginv1.WatchSyncRemoteState {
+	return &pluginv1.WatchSyncRemoteState{
+		ProviderItemKey: key,
+		Media:           &pluginv1.WatchSyncMedia{MediaType: mediaType, Title: "Title", ExternalIds: map[string]string{"imdb": imdbID}},
+		Rating:          &pluginv1.WatchSyncRemoteRatingState{Rating: rating, RatedAt: ratedAt},
+	}
+}
+
+func TestPluginProviderDecodesRatingSnapshot(t *testing.T) {
+	ratedAt := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	client := &fakeWatchSyncPluginClient{listResponse: &pluginv1.WatchSyncListRemoteStateResponse{
+		CompleteSnapshot: true,
+		NextCursor:       "cursor-2",
+		Items: []*pluginv1.WatchSyncRemoteState{
+			remoteRatingState("m1", pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_MOVIE, "tt1", 8, timestamppb.New(ratedAt)),
+			remoteRatingState("s1", pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_SERIES, "tt2", 7, nil),
+			// Silo does not sync episode ratings.
+			remoteRatingState("e1", pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_EPISODE, "tt3", 9, nil),
+		},
+	}}
+	provider := testPluginProviderWithDescriptor(t, client, ratingTestDescriptor(
+		pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_MOVIE,
+		pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_EPISODE,
+		pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_SERIES,
+	))
+	batch, err := provider.FetchRatings(context.Background(), ServerConfig{}, Connection{
+		SyncCursors: map[string]string{pluginRatingsCursorKey: testCursorOne},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(client.listRequests) != 1 || client.listRequests[0].GetCursor() != testCursorOne ||
+		len(client.listRequests[0].GetStateKinds()) != 1 ||
+		client.listRequests[0].GetStateKinds()[0] != pluginv1.WatchSyncRemoteStateKind_WATCH_SYNC_REMOTE_STATE_KIND_RATING {
+		t.Fatalf("requests = %#v", client.listRequests)
+	}
+	if !slices.Equal(batch.SnapshotKinds, []string{historyimport.KindMovie, historyimport.KindSeries}) ||
+		batch.UpdatedCursors[pluginRatingsCursorKey] != "cursor-2" || len(batch.Warnings) != 0 || len(batch.Rows) != 2 {
+		t.Fatalf("batch = %#v", batch)
+	}
+	movie, series := batch.Rows[0], batch.Rows[1]
+	if movie.Provider != testPluginProviderKey || movie.ProviderItemKey != "m1" || movie.Kind != historyimport.KindMovie ||
+		movie.IMDbID != "tt1" || movie.Rating != 8 || !movie.RatedAt.Equal(ratedAt) || movie.Removed {
+		t.Fatalf("movie row = %#v", movie)
+	}
+	if series.ProviderItemKey != "s1" || series.Kind != historyimport.KindSeries || series.IMDbID != "tt2" ||
+		series.Rating != 7 || !series.RatedAt.IsZero() {
+		t.Fatalf("series row = %#v", series)
+	}
+
+	// The cursor resets with the agreed ratings on an account change.
+	kept := withoutRatingCursors(map[string]string{pluginRatingsCursorKey: "a", pluginWatchedCursorKey: "b"})
+	if _, ok := kept[pluginRatingsCursorKey]; ok || kept[pluginWatchedCursorKey] != "b" {
+		t.Fatalf("cursors kept after account change = %#v", kept)
+	}
+}
+
+func TestPluginProviderRatingSnapshotKindsFollowSupportedMedia(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		media []pluginv1.WatchSyncMediaType
+		want  []string
+	}{
+		{name: "default media", want: []string{historyimport.KindMovie}},
+		{name: "series only", media: []pluginv1.WatchSyncMediaType{pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_SERIES}, want: []string{historyimport.KindSeries}},
+		{name: "episodes only", media: []pluginv1.WatchSyncMediaType{pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_EPISODE}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &fakeWatchSyncPluginClient{listResponse: &pluginv1.WatchSyncListRemoteStateResponse{CompleteSnapshot: true}}
+			provider := testPluginProviderWithDescriptor(t, client, ratingTestDescriptor(tc.media...))
+			batch, err := provider.FetchRatings(context.Background(), ServerConfig{}, Connection{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(batch.SnapshotKinds, tc.want) {
+				t.Fatalf("SnapshotKinds = %#v, want %#v", batch.SnapshotKinds, tc.want)
+			}
+		})
+	}
+}
+
+func TestPluginProviderPaginatesIncrementalRatingsWithTombstone(t *testing.T) {
+	client := &fakeWatchSyncPluginClient{listResponses: []*pluginv1.WatchSyncListRemoteStateResponse{
+		{
+			Items:         []*pluginv1.WatchSyncRemoteState{remoteRatingState("m1", pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_MOVIE, "tt1", 6, nil)},
+			NextPageToken: "page-2",
+		},
+		{
+			Items:      []*pluginv1.WatchSyncRemoteState{{ProviderItemKey: "m2", Rating: &pluginv1.WatchSyncRemoteRatingState{Removed: true}}},
+			NextCursor: "cursor-2",
+		},
+	}}
+	provider := testPluginProviderWithDescriptor(t, client, ratingTestDescriptor(
+		pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_MOVIE,
+		pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_SERIES,
+	))
+	batch, err := provider.FetchRatings(context.Background(), ServerConfig{}, Connection{
+		SyncCursors: map[string]string{pluginRatingsCursorKey: testCursorOne},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(client.listRequests) != 2 || client.listRequests[1].GetCursor() != testCursorOne ||
+		client.listRequests[1].GetPageToken() != "page-2" {
+		t.Fatalf("requests = %#v", client.listRequests)
+	}
+	// An incremental read is complete for no kind, so absent ratings stay unknown.
+	if len(batch.SnapshotKinds) != 0 || batch.UpdatedCursors[pluginRatingsCursorKey] != "cursor-2" || len(batch.Rows) != 2 {
+		t.Fatalf("batch = %#v", batch)
+	}
+	tombstone := batch.Rows[1]
+	if !tombstone.Removed || tombstone.ProviderItemKey != "m2" || tombstone.Kind != "" || tombstone.Rating != 0 {
+		t.Fatalf("tombstone = %#v", tombstone)
+	}
+}
+
+func TestPluginProviderWarnsAndSkipsInvalidRatings(t *testing.T) {
+	client := &fakeWatchSyncPluginClient{listResponse: &pluginv1.WatchSyncListRemoteStateResponse{
+		CompleteSnapshot: true,
+		Items: []*pluginv1.WatchSyncRemoteState{
+			remoteRatingState("zero", pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_MOVIE, "tt0", 0, nil),
+			remoteRatingState("eleven", pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_MOVIE, "tt11", 11, nil),
+			remoteRatingState("ten", pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_MOVIE, "tt10", 10, nil),
+			{Rating: &pluginv1.WatchSyncRemoteRatingState{Removed: true}},
+		},
+	}}
+	provider := testPluginProviderWithDescriptor(t, client, ratingTestDescriptor())
+	batch, err := provider.FetchRatings(context.Background(), ServerConfig{}, Connection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(batch.Rows) != 1 || batch.Rows[0].Rating != 10 {
+		t.Fatalf("rows = %#v", batch.Rows)
+	}
+	want := []string{
+		"watch sync plugin returned an out-of-range rating 0",
+		"watch sync plugin returned an out-of-range rating 11",
+		"watch sync plugin returned a rating tombstone without provider identity",
+		watchSyncIncompleteRatingSnapshotWarning,
+	}
+	if !slices.Equal(batch.Warnings, want) {
+		t.Fatalf("warnings = %#v", batch.Warnings)
+	}
+}
+
+// A complete snapshot that drops an unreadable rating cannot say which kind the
+// row was, so it covers no kind and absent ratings stay unknown. A dropped
+// tombstone reads as absent, which the snapshot already treats as removed.
+func TestPluginProviderRatingSnapshotWithUnreadableRatingCoversNoKind(t *testing.T) {
+	valid := remoteRatingState("m1", pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_MOVIE, "tt1", 8, nil)
+	for _, tc := range []struct {
+		name      string
+		complete  bool
+		bad       *pluginv1.WatchSyncRemoteState
+		wantKinds []string
+		wantWarn  []string
+	}{
+		{
+			name: "bad media", complete: true,
+			bad:      remoteRatingState("x", pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_UNSPECIFIED, "tt2", 7, nil),
+			wantWarn: []string{"watch sync plugin returned unsupported remote media", watchSyncIncompleteRatingSnapshotWarning},
+		},
+		{
+			name: "missing key", complete: true,
+			bad:      remoteRatingState("", pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_SERIES, "tt2", 7, nil),
+			wantWarn: []string{"watch sync plugin returned remote state without identity", watchSyncIncompleteRatingSnapshotWarning},
+		},
+		{
+			name: "out of range", complete: true,
+			bad:      remoteRatingState("x", pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_MOVIE, "tt2", 11, nil),
+			wantWarn: []string{"watch sync plugin returned an out-of-range rating 11", watchSyncIncompleteRatingSnapshotWarning},
+		},
+		{
+			name: "missing rating payload", complete: true,
+			bad:      &pluginv1.WatchSyncRemoteState{ProviderItemKey: "x"},
+			wantWarn: []string{"watch sync plugin returned remote state without a rating", watchSyncIncompleteRatingSnapshotWarning},
+		},
+		{
+			name: "nil item", complete: true,
+			bad:      nil,
+			wantWarn: []string{"watch sync plugin returned remote state without a rating", watchSyncIncompleteRatingSnapshotWarning},
+		},
+		{
+			name: "bad tombstone keeps the snapshot", complete: true,
+			bad:       &pluginv1.WatchSyncRemoteState{Rating: &pluginv1.WatchSyncRemoteRatingState{Removed: true}},
+			wantKinds: []string{historyimport.KindMovie, historyimport.KindSeries},
+			wantWarn:  []string{"watch sync plugin returned a rating tombstone without provider identity"},
+		},
+		{
+			name:     "incremental read",
+			bad:      remoteRatingState("", pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_MOVIE, "tt2", 7, nil),
+			wantWarn: []string{"watch sync plugin returned remote state without identity"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &fakeWatchSyncPluginClient{listResponse: &pluginv1.WatchSyncListRemoteStateResponse{
+				CompleteSnapshot: tc.complete,
+				Items:            []*pluginv1.WatchSyncRemoteState{valid, tc.bad},
+			}}
+			provider := testPluginProviderWithDescriptor(t, client, ratingTestDescriptor(
+				pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_MOVIE,
+				pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_SERIES,
+			))
+			batch, err := provider.FetchRatings(context.Background(), ServerConfig{}, Connection{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(batch.SnapshotKinds, tc.wantKinds) {
+				t.Fatalf("SnapshotKinds = %#v, want %#v", batch.SnapshotKinds, tc.wantKinds)
+			}
+			if !slices.Equal(batch.Warnings, tc.wantWarn) {
+				t.Fatalf("warnings = %#v, want %#v", batch.Warnings, tc.wantWarn)
+			}
+			if len(batch.Rows) != 1 || batch.Rows[0].ProviderItemKey != "m1" {
+				t.Fatalf("rows = %#v", batch.Rows)
+			}
+		})
+	}
+}
+
+func TestPluginProviderMapsSeriesMediaBothWays(t *testing.T) {
+	series := LocalFavorite{
+		MediaItemID: testSeriesMediaID, Kind: historyimport.KindSeries, Title: "Show", Year: 2020,
+		IMDbID: "tt9", TMDBID: "99", TVDBID: "77", ProviderItemKey: "imdb:tt9",
+	}
+	media := mediaFromLocalFavorite(series)
+	if media.GetMediaType() != pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_SERIES ||
+		media.GetTitle() != "Show" || media.GetYear() != 2020 ||
+		media.GetExternalIds()["imdb"] != "tt9" || media.GetExternalIds()["tmdb"] != "99" || media.GetExternalIds()["tvdb"] != "77" ||
+		len(media.GetSeriesExternalIds()) != 0 || media.GetSeasonNumber() != 0 || media.GetEpisodeNumber() != 0 {
+		t.Fatalf("series media = %#v", media)
+	}
+
+	client := &fakeWatchSyncPluginClient{listResponses: []*pluginv1.WatchSyncListRemoteStateResponse{
+		{CompleteSnapshot: true, Items: []*pluginv1.WatchSyncRemoteState{{ProviderItemKey: "s1", Media: media, Favorite: &pluginv1.WatchSyncRemoteListState{}}}},
+		{Items: []*pluginv1.WatchSyncRemoteState{{ProviderItemKey: "s1", Media: media, Watched: &pluginv1.WatchSyncRemoteWatchedState{PlayCount: 1}}}},
+	}}
+	provider := testPluginProviderWithDescriptor(t, client, &pluginv1.WatchSyncProviderDescriptor{
+		AuthMethods:     []pluginv1.WatchSyncAuthMethod{pluginv1.WatchSyncAuthMethod_WATCH_SYNC_AUTH_METHOD_API_KEY},
+		ImportFavorites: true, ImportWatched: true, MaxBatchSize: 25,
+		SupportedMediaTypes: []pluginv1.WatchSyncMediaType{pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_SERIES},
+	})
+	favorites, err := provider.FetchFavoritesBatch(context.Background(), ServerConfig{}, Connection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(favorites.Rows) != 1 || favorites.Rows[0].Kind != historyimport.KindSeries || favorites.Rows[0].IMDbID != "tt9" ||
+		favorites.Rows[0].TVDBID != "77" || favorites.Rows[0].SeriesIMDbID != "" {
+		t.Fatalf("favorites = %#v", favorites)
+	}
+	// SERIES is not defined for watched state; a series-level row would
+	// otherwise mark every local episode watched.
+	watched, err := provider.FetchWatchedBatch(context.Background(), ServerConfig{}, Connection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(watched.Rows) != 0 || len(watched.Warnings) != 1 || !strings.Contains(watched.Warnings[0], "series-level watched") {
+		t.Fatalf("watched = %#v", watched)
+	}
+}
+
+func TestPluginProviderSendsSeriesListEventsOnlyWhenSupported(t *testing.T) {
+	series := LocalFavorite{MediaItemID: testSeriesMediaID, Kind: historyimport.KindSeries, IMDbID: "tt9", ProviderItemKey: "imdb:tt9"}
+	client := &fakeWatchSyncPluginClient{applyStatus: pluginv1.WatchSyncApplyStatus_WATCH_SYNC_APPLY_STATUS_APPLIED}
+	provider := testPluginProviderWithDescriptor(t, client, &pluginv1.WatchSyncProviderDescriptor{
+		AuthMethods:     []pluginv1.WatchSyncAuthMethod{pluginv1.WatchSyncAuthMethod_WATCH_SYNC_AUTH_METHOD_API_KEY},
+		ExportFavorites: true, MaxBatchSize: 25,
+		SupportedMediaTypes: []pluginv1.WatchSyncMediaType{
+			pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_MOVIE,
+			pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_SERIES,
+		},
+	})
+	result, err := provider.ExportFavorites(context.Background(), ServerConfig{}, Connection{}, []LocalFavorite{series})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Sent) != 1 || client.applyRequest.GetEvents()[0].GetMedia().GetMediaType() != pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_SERIES {
+		t.Fatalf("result=%#v request=%#v", result, client.applyRequest)
+	}
+
+	// A plugin that does not list SERIES still never receives series items.
+	client = &fakeWatchSyncPluginClient{}
+	result, err = testPluginProvider(t, client).ExportFavorites(context.Background(), ServerConfig{}, Connection{}, []LocalFavorite{series})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if client.applyRequest != nil || result.Failed[testSeriesMediaID] != watchSyncUnsupportedSeriesMediaMessage {
+		t.Fatalf("result=%#v request=%#v", result, client.applyRequest)
+	}
+}
+
+func TestPluginProviderRatingEventsCarryValueAndDistinctIDs(t *testing.T) {
+	client := &fakeWatchSyncPluginClient{applyStatus: pluginv1.WatchSyncApplyStatus_WATCH_SYNC_APPLY_STATUS_APPLIED}
+	provider := testPluginProviderWithDescriptor(t, client, ratingTestDescriptor(
+		pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_MOVIE,
+		pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_SERIES,
+	))
+	movie := LocalFavorite{MediaItemID: testMovieMediaID, Kind: historyimport.KindMovie, IMDbID: "tt1", ProviderItemKey: "imdb:tt1"}
+	ratedAt := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	set := func(rating int, at time.Time) *pluginv1.WatchSyncEvent {
+		t.Helper()
+		result, err := provider.ExportRatings(context.Background(), ServerConfig{}, Connection{}, []LocalRating{{LocalFavorite: movie, Rating: rating, RatedAt: at}})
+		if err != nil || len(result.Sent) != 1 || result.Sent[0] != testMovieMediaID {
+			t.Fatalf("result=%#v err=%v", result, err)
+		}
+		return client.applyRequest.GetEvents()[0]
+	}
+	remove := func() *pluginv1.WatchSyncEvent {
+		t.Helper()
+		result, err := provider.RemoveRatings(context.Background(), ServerConfig{}, Connection{}, []LocalFavorite{movie})
+		if err != nil || len(result.Sent) != 1 || result.Sent[0] != testMovieMediaID {
+			t.Fatalf("result=%#v err=%v", result, err)
+		}
+		return client.applyRequest.GetEvents()[0]
+	}
+
+	event := set(8, ratedAt)
+	wantID := fmt.Sprintf("%s:%s:8:%d", pluginv1.WatchSyncOperation_WATCH_SYNC_OPERATION_SET_RATING, testMovieMediaID, ratedAt.UnixNano())
+	if event.GetEventId() != wantID || event.GetOperation() != pluginv1.WatchSyncOperation_WATCH_SYNC_OPERATION_SET_RATING ||
+		event.GetRating() != 8 || !event.GetOccurredAt().AsTime().Equal(ratedAt) || event.GetProviderItemKey() != "imdb:tt1" ||
+		event.GetMedia().GetMediaType() != pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_MOVIE || event.GetMedia().GetExternalIds()["imdb"] != "tt1" {
+		t.Fatalf("set event = %#v", event)
+	}
+	if retry := set(8, ratedAt); retry.GetEventId() != event.GetEventId() {
+		t.Fatalf("retry event ID = %q, want %q", retry.GetEventId(), event.GetEventId())
+	}
+	if rerated := set(8, ratedAt.Add(time.Hour)); rerated.GetEventId() == event.GetEventId() {
+		t.Fatal("a later re-rate to the same value reused the event ID")
+	}
+	if changed := set(6, ratedAt); changed.GetEventId() == event.GetEventId() {
+		t.Fatal("a different rating reused the event ID")
+	}
+
+	removedAt := ratedAt.Add(2 * time.Hour)
+	provider.now = func() time.Time { return removedAt }
+	removal := remove()
+	wantID = fmt.Sprintf("%s:%s:%d", pluginv1.WatchSyncOperation_WATCH_SYNC_OPERATION_REMOVE_RATING, testMovieMediaID, removedAt.UnixNano())
+	if removal.GetEventId() != wantID || removal.GetOperation() != pluginv1.WatchSyncOperation_WATCH_SYNC_OPERATION_REMOVE_RATING ||
+		removal.GetRating() != 0 || removal.GetOccurredAt() != nil || removal.GetProviderItemKey() != "imdb:tt1" {
+		t.Fatalf("remove event = %#v", removal)
+	}
+	provider.now = func() time.Time { return removedAt.Add(time.Hour) }
+	if later := remove(); later.GetEventId() == removal.GetEventId() {
+		t.Fatal("a later removal reused the event ID")
+	}
+}
+
+// Clearing an absent rating must answer APPLIED or NO_CHANGE, so a REJECTED
+// removal is a failure the service retries. A rejected SET_RATING, like a
+// rejected list or watched event, still means the plugin has no such title.
+func TestPluginProviderRejectedRatingRemovalFails(t *testing.T) {
+	client := &fakeWatchSyncPluginClient{
+		applyStatus: pluginv1.WatchSyncApplyStatus_WATCH_SYNC_APPLY_STATUS_REJECTED,
+		applyFault:  &pluginv1.WatchSyncFault{SafeMessage: "rating removal refused for " + testSecretValue},
+	}
+	provider := testPluginProviderWithDescriptor(t, client, ratingTestDescriptor(pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_MOVIE))
+	conn := Connection{AccessToken: testSecretValue}
+	movie := LocalFavorite{MediaItemID: testMovieMediaID, Kind: historyimport.KindMovie, IMDbID: "tt1", ProviderItemKey: "imdb:tt1"}
+
+	removed, err := provider.RemoveRatings(context.Background(), ServerConfig{}, conn, []LocalFavorite{movie})
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := removed.Failed[testMovieMediaID]
+	if len(removed.Sent) != 0 || len(removed.NotFound) != 0 || !strings.HasPrefix(message, "rating removal refused for ") ||
+		strings.Contains(message, testSecretValue) {
+		t.Fatalf("remove result = %#v", removed)
+	}
+
+	set, err := provider.ExportRatings(context.Background(), ServerConfig{}, conn, []LocalRating{{LocalFavorite: movie, Rating: 8}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(set.Failed) != 0 || !slices.Equal(set.NotFound, []string{testMovieMediaID}) {
+		t.Fatalf("set result = %#v", set)
+	}
+
+	listRemoved, err := provider.RemoveFavorites(context.Background(), ServerConfig{}, conn, []LocalFavorite{movie})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listRemoved.Failed) != 0 || !slices.Equal(listRemoved.NotFound, []string{testMovieMediaID}) {
+		t.Fatalf("favorite removal result = %#v", listRemoved)
+	}
+}
+
+func TestPluginProviderRatingEventsFailUnsupportedMedia(t *testing.T) {
+	client := &fakeWatchSyncPluginClient{applyStatus: pluginv1.WatchSyncApplyStatus_WATCH_SYNC_APPLY_STATUS_APPLIED}
+	provider := testPluginProviderWithDescriptor(t, client, ratingTestDescriptor(pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_MOVIE))
+	series := LocalFavorite{MediaItemID: testSeriesMediaID, Kind: historyimport.KindSeries, IMDbID: "tt9"}
+	result, err := provider.ExportRatings(context.Background(), ServerConfig{}, Connection{}, []LocalRating{
+		{LocalFavorite: LocalFavorite{MediaItemID: testMovieMediaID, Kind: historyimport.KindMovie, IMDbID: "tt1"}, Rating: 8},
+		{LocalFavorite: series, Rating: 6},
+		{LocalFavorite: LocalFavorite{MediaItemID: "movie-2", Kind: historyimport.KindMovie, IMDbID: "tt2"}, Rating: 0},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(client.applyRequest.GetEvents()) != 1 || len(result.Sent) != 1 || result.Sent[0] != testMovieMediaID ||
+		result.Failed[testSeriesMediaID] != watchSyncUnsupportedSeriesMediaMessage || result.Failed["movie-2"] == "" {
+		t.Fatalf("result=%#v request=%#v", result, client.applyRequest)
+	}
+
+	client.applyRequest = nil
+	result, err = provider.RemoveRatings(context.Background(), ServerConfig{}, Connection{}, []LocalFavorite{series})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if client.applyRequest != nil || result.Failed[testSeriesMediaID] != watchSyncUnsupportedSeriesMediaMessage {
+		t.Fatalf("result=%#v request=%#v", result, client.applyRequest)
+	}
+}
+
+func TestPluginProviderRatingCapabilitiesSurviveCapabilityStorage(t *testing.T) {
+	stored := ratingTestDescriptor(
+		pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_MOVIE,
+		pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_SERIES,
+	)
+	stored.SyncDropped = true
+	stored.RatingExportRequiresWatched = []pluginv1.WatchSyncMediaType{pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_MOVIE}
+	records, err := hostplugins.CapabilityRecordsFromManifest(&pluginv1.PluginManifest{Capabilities: []*pluginv1.CapabilityDescriptor{{
+		Type: "watch_sync_provider.v1", Id: testPluginCapabilityID, DisplayName: "AniList",
+		WatchSyncProvider: stored,
+	}}})
+	if err != nil || len(records) != 1 {
+		t.Fatalf("records=%#v err=%v", records, err)
+	}
+	// Capability metadata is stored as JSON and decoded on provider reload.
+	metadata, err := json.Marshal(records[0].Metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	records[0].Metadata = nil
+	if err := json.Unmarshal(metadata, &records[0].Metadata); err != nil {
+		t.Fatal(err)
+	}
+	descriptor, err := hostplugins.DecodeCapability(&records[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := testPluginProviderWithDescriptor(t, &fakeWatchSyncPluginClient{}, descriptor.GetWatchSyncProvider())
+	capabilities := provider.Capabilities()
+	if !capabilities.ImportRatings || !capabilities.ExportRatings || !capabilities.SyncDropped ||
+		!provider.supportsMedia(pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_SERIES) ||
+		!provider.RatingExportRequiresWatched(historyimport.KindMovie) {
+		t.Fatalf("capabilities=%#v descriptor=%#v", capabilities, descriptor.GetWatchSyncProvider())
+	}
+}
+
+func TestSupportedWatchSyncMediaTypesIgnoresTypesFromNewerSDKs(t *testing.T) {
+	future := pluginv1.WatchSyncMediaType(99)
+	supported, err := supportedWatchSyncMediaTypes(&pluginv1.WatchSyncProviderDescriptor{
+		SupportedMediaTypes: []pluginv1.WatchSyncMediaType{pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_MOVIE, future},
+	})
+	if err != nil {
+		t.Fatalf("a future media type must not reject the plugin: %v", err)
+	}
+	if _, ok := supported[future]; ok || len(supported) != 1 {
+		t.Fatalf("supported = %v, want only movie", supported)
+	}
+	if _, err := supportedWatchSyncMediaTypes(&pluginv1.WatchSyncProviderDescriptor{
+		SupportedMediaTypes: []pluginv1.WatchSyncMediaType{future},
+	}); err == nil {
+		t.Fatal("a plugin with no media type this server supports must be rejected")
+	}
+	if _, err := supportedWatchSyncMediaTypes(&pluginv1.WatchSyncProviderDescriptor{
+		SupportedMediaTypes: []pluginv1.WatchSyncMediaType{pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_UNSPECIFIED},
+	}); err == nil {
+		t.Fatal("an unspecified media type must still be rejected")
+	}
+}
+
+func TestPluginProviderSyncsRatingKindFollowsSupportedMedia(t *testing.T) {
+	supported, err := supportedWatchSyncMediaTypes(&pluginv1.WatchSyncProviderDescriptor{
+		SupportedMediaTypes: []pluginv1.WatchSyncMediaType{pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_MOVIE},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &PluginProvider{supportedMedia: supported}
+	if !provider.SyncsRatingKind(historyimport.KindMovie) || provider.SyncsRatingKind(historyimport.KindSeries) {
+		t.Fatal("a movie-only plugin must rate movies and skip series")
+	}
+}
+
+var (
+	_ DroppedImporter       = (*PluginProvider)(nil)
+	_ DroppedExporter       = (*PluginProvider)(nil)
+	_ RatingExportWatchGate = (*PluginProvider)(nil)
+)
+
+func droppedTestDescriptor(media ...pluginv1.WatchSyncMediaType) *pluginv1.WatchSyncProviderDescriptor {
+	if len(media) == 0 {
+		media = []pluginv1.WatchSyncMediaType{pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_SERIES}
+	}
+	return &pluginv1.WatchSyncProviderDescriptor{
+		AuthMethods:         []pluginv1.WatchSyncAuthMethod{pluginv1.WatchSyncAuthMethod_WATCH_SYNC_AUTH_METHOD_API_KEY},
+		SyncDropped:         true,
+		SupportedMediaTypes: media,
+		MaxBatchSize:        25,
+	}
+}
+
+func remoteDroppedState(key, tmdbID string, droppedAt *timestamppb.Timestamp) *pluginv1.WatchSyncRemoteState {
+	return &pluginv1.WatchSyncRemoteState{
+		ProviderItemKey: key,
+		Media: &pluginv1.WatchSyncMedia{
+			MediaType:   pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_SERIES,
+			Title:       "Show",
+			ExternalIds: map[string]string{"tmdb": tmdbID},
+		},
+		Dropped: &pluginv1.WatchSyncRemoteListState{ListedAt: droppedAt},
+	}
+}
+
+func droppedTombstone(key string) *pluginv1.WatchSyncRemoteState {
+	return &pluginv1.WatchSyncRemoteState{ProviderItemKey: key, Dropped: &pluginv1.WatchSyncRemoteListState{Removed: true}}
+}
+
+func TestPluginProviderDecodesDroppedSnapshot(t *testing.T) {
+	droppedAt := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	client := &fakeWatchSyncPluginClient{listResponse: &pluginv1.WatchSyncListRemoteStateResponse{
+		CompleteSnapshot: true,
+		NextCursor:       "cursor-2",
+		Items: []*pluginv1.WatchSyncRemoteState{
+			remoteDroppedState("s1", "201", timestamppb.New(droppedAt)),
+			remoteDroppedState("s2", "202", nil),
+		},
+	}}
+	provider := testPluginProviderWithDescriptor(t, client, droppedTestDescriptor())
+	batch, err := provider.FetchDropped(context.Background(), ServerConfig{}, Connection{
+		SyncCursors: map[string]string{pluginDroppedCursorKey: testCursorOne},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(client.listRequests) != 1 || client.listRequests[0].GetCursor() != testCursorOne ||
+		!slices.Equal(client.listRequests[0].GetStateKinds(), []pluginv1.WatchSyncRemoteStateKind{
+			pluginv1.WatchSyncRemoteStateKind_WATCH_SYNC_REMOTE_STATE_KIND_DROPPED,
+		}) {
+		t.Fatalf("requests = %#v", client.listRequests)
+	}
+	if !batch.Complete || batch.UpdatedCursors[pluginDroppedCursorKey] != "cursor-2" || len(batch.Warnings) != 0 || len(batch.Rows) != 2 {
+		t.Fatalf("batch = %#v", batch)
+	}
+	first, second := batch.Rows[0], batch.Rows[1]
+	if first.Provider != testPluginProviderKey || first.ProviderItemKey != "s1" || first.Kind != historyimport.KindSeries ||
+		first.TMDBID != "201" || first.Title != "Show" || !first.DroppedAt.Equal(droppedAt) || first.Removed {
+		t.Fatalf("first row = %#v", first)
+	}
+	if second.ProviderItemKey != "s2" || second.TMDBID != "202" || !second.DroppedAt.IsZero() {
+		t.Fatalf("a drop without listed_at has an unknown time: %#v", second)
+	}
+
+	// The cursor resets with the agreed drops on an account change.
+	kept := withoutDroppedCursors(map[string]string{pluginDroppedCursorKey: "a", pluginRatingsCursorKey: "b"})
+	if _, ok := kept[pluginDroppedCursorKey]; ok || kept[pluginRatingsCursorKey] != "b" {
+		t.Fatalf("cursors kept after account change = %#v", kept)
+	}
+}
+
+func TestPluginProviderPaginatesIncrementalDroppedWithTombstone(t *testing.T) {
+	client := &fakeWatchSyncPluginClient{listResponses: []*pluginv1.WatchSyncListRemoteStateResponse{
+		{Items: []*pluginv1.WatchSyncRemoteState{remoteDroppedState("s1", "201", nil)}, NextPageToken: "page-2"},
+		{Items: []*pluginv1.WatchSyncRemoteState{droppedTombstone("s2")}, NextCursor: "cursor-2"},
+	}}
+	provider := testPluginProviderWithDescriptor(t, client, droppedTestDescriptor())
+	batch, err := provider.FetchDropped(context.Background(), ServerConfig{}, Connection{
+		SyncCursors: map[string]string{pluginDroppedCursorKey: testCursorOne},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(client.listRequests) != 2 || client.listRequests[1].GetCursor() != testCursorOne ||
+		client.listRequests[1].GetPageToken() != "page-2" {
+		t.Fatalf("requests = %#v", client.listRequests)
+	}
+	// An incremental read leaves every absent series unknown.
+	if batch.Complete || batch.UpdatedCursors[pluginDroppedCursorKey] != "cursor-2" || len(batch.Rows) != 2 {
+		t.Fatalf("batch = %#v", batch)
+	}
+	tombstone := batch.Rows[1]
+	if !tombstone.Removed || tombstone.ProviderItemKey != "s2" || tombstone.Kind != "" || !tombstone.DroppedAt.IsZero() {
+		t.Fatalf("tombstone = %#v", tombstone)
+	}
+}
+
+// A complete snapshot that cannot read a row may be hiding a series that is
+// still dropped, so it is not complete. An unreadable tombstone reads as
+// absent, which the snapshot already treats as undropped.
+func TestPluginProviderDroppedSnapshotWithUnreadableRowIsIncomplete(t *testing.T) {
+	valid := remoteDroppedState("s1", "201", nil)
+	movie := remoteDroppedState("m1", "301", nil)
+	movie.Media.MediaType = pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_MOVIE
+	unspecified := remoteDroppedState("x", "302", nil)
+	unspecified.Media.MediaType = pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_UNSPECIFIED
+	for _, tc := range []struct {
+		name         string
+		complete     bool
+		bad          *pluginv1.WatchSyncRemoteState
+		wantComplete bool
+		wantWarn     []string
+	}{
+		{
+			name: "bad media", complete: true, bad: unspecified,
+			wantWarn: []string{"watch sync plugin returned unsupported remote media", watchSyncIncompleteDroppedSnapshotWarning},
+		},
+		{
+			name: "missing key", complete: true, bad: remoteDroppedState("", "202", nil),
+			wantWarn: []string{"watch sync plugin returned remote state without identity", watchSyncIncompleteDroppedSnapshotWarning},
+		},
+		{
+			name: "not a series", complete: true, bad: movie,
+			wantWarn: []string{"watch sync plugin returned a dropped show that is not a series", watchSyncIncompleteDroppedSnapshotWarning},
+		},
+		{
+			name: "missing dropped payload", complete: true, bad: &pluginv1.WatchSyncRemoteState{ProviderItemKey: "x", Media: valid.GetMedia()},
+			wantWarn: []string{"watch sync plugin returned remote state without a dropped show", watchSyncIncompleteDroppedSnapshotWarning},
+		},
+		{
+			name: "nil item", complete: true, bad: nil,
+			wantWarn: []string{"watch sync plugin returned remote state without a dropped show", watchSyncIncompleteDroppedSnapshotWarning},
+		},
+		{
+			name: "bad tombstone keeps the snapshot", complete: true, bad: droppedTombstone(""),
+			wantComplete: true,
+			wantWarn:     []string{"watch sync plugin returned an undrop tombstone without provider identity"},
+		},
+		{
+			name: "incremental read", bad: remoteDroppedState("", "202", nil),
+			wantWarn: []string{"watch sync plugin returned remote state without identity"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &fakeWatchSyncPluginClient{listResponse: &pluginv1.WatchSyncListRemoteStateResponse{
+				CompleteSnapshot: tc.complete,
+				Items:            []*pluginv1.WatchSyncRemoteState{valid, tc.bad},
+			}}
+			provider := testPluginProviderWithDescriptor(t, client, droppedTestDescriptor())
+			batch, err := provider.FetchDropped(context.Background(), ServerConfig{}, Connection{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if batch.Complete != tc.wantComplete {
+				t.Fatalf("Complete = %v, want %v", batch.Complete, tc.wantComplete)
+			}
+			if !slices.Equal(batch.Warnings, tc.wantWarn) {
+				t.Fatalf("warnings = %#v, want %#v", batch.Warnings, tc.wantWarn)
+			}
+			if len(batch.Rows) != 1 || batch.Rows[0].ProviderItemKey != "s1" {
+				t.Fatalf("rows = %#v", batch.Rows)
+			}
+		})
+	}
+}
+
+func TestPluginProviderDroppedEventsCarrySeriesMediaAndDistinctIDs(t *testing.T) {
+	client := &fakeWatchSyncPluginClient{applyStatus: pluginv1.WatchSyncApplyStatus_WATCH_SYNC_APPLY_STATUS_APPLIED}
+	provider := testPluginProviderWithDescriptor(t, client, droppedTestDescriptor(
+		pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_MOVIE,
+		pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_SERIES,
+	))
+	sentAt := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	provider.now = func() time.Time { return sentAt }
+	series := LocalFavorite{
+		MediaItemID: testSeriesMediaID, Kind: historyimport.KindSeries, Title: "Show", Year: 2020,
+		IMDbID: "tt9", TMDBID: "99", TVDBID: "77", ProviderItemKey: "remote-9",
+	}
+	movie := LocalFavorite{MediaItemID: testMovieMediaID, Kind: historyimport.KindMovie, IMDbID: "tt1"}
+	for _, tc := range []struct {
+		name      string
+		send      func(context.Context, ServerConfig, Connection, []LocalFavorite) (ExportResult, error)
+		operation pluginv1.WatchSyncOperation
+	}{
+		{name: "drop", send: provider.ExportDropped, operation: pluginv1.WatchSyncOperation_WATCH_SYNC_OPERATION_MARK_DROPPED},
+		{name: "undrop", send: provider.RemoveDropped, operation: pluginv1.WatchSyncOperation_WATCH_SYNC_OPERATION_UNMARK_DROPPED},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client.applyRequest = nil
+			result, err := tc.send(context.Background(), ServerConfig{}, Connection{}, []LocalFavorite{movie, series})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(result.Sent, []string{testSeriesMediaID}) || result.Failed[testMovieMediaID] != watchSyncDroppedNotSeriesMessage {
+				t.Fatalf("result = %#v", result)
+			}
+			events := client.applyRequest.GetEvents()
+			if len(events) != 1 {
+				t.Fatalf("events = %#v, want the series only", events)
+			}
+			event := events[0]
+			wantID := fmt.Sprintf("%s:%s:%d", tc.operation, testSeriesMediaID, sentAt.UnixNano())
+			if event.GetEventId() != wantID || event.GetOperation() != tc.operation ||
+				event.GetOrigin() != pluginv1.WatchSyncOrigin_WATCH_SYNC_ORIGIN_MANUAL ||
+				event.GetProviderItemKey() != "remote-9" || event.GetOccurredAt() != nil || event.GetRating() != 0 {
+				t.Fatalf("event = %#v", event)
+			}
+			media := event.GetMedia()
+			if media.GetMediaType() != pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_SERIES ||
+				media.GetMediaItemId() != testSeriesMediaID || media.GetTitle() != "Show" || media.GetYear() != 2020 ||
+				media.GetExternalIds()["imdb"] != "tt9" || media.GetExternalIds()["tmdb"] != "99" || media.GetExternalIds()["tvdb"] != "77" ||
+				len(media.GetSeriesExternalIds()) != 0 {
+				t.Fatalf("media = %#v", media)
+			}
+		})
+	}
+
+	// A later drop of the same series never reuses an event ID.
+	first := fmt.Sprintf("%s:%s:%d", pluginv1.WatchSyncOperation_WATCH_SYNC_OPERATION_MARK_DROPPED, testSeriesMediaID, sentAt.UnixNano())
+	provider.now = func() time.Time { return sentAt.Add(time.Hour) }
+	if _, err := provider.ExportDropped(context.Background(), ServerConfig{}, Connection{}, []LocalFavorite{series}); err != nil {
+		t.Fatal(err)
+	}
+	if client.applyRequest.GetEvents()[0].GetEventId() == first {
+		t.Fatal("a later drop reused the event ID")
+	}
+
+	// A plugin that does not list SERIES never receives drops.
+	client = &fakeWatchSyncPluginClient{}
+	result, err := testPluginProvider(t, client).ExportDropped(context.Background(), ServerConfig{}, Connection{}, []LocalFavorite{series})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if client.applyRequest != nil || result.Failed[testSeriesMediaID] != watchSyncUnsupportedSeriesMediaMessage {
+		t.Fatalf("result=%#v request=%#v", result, client.applyRequest)
+	}
+}
+
+// Dropping a dropped series or undropping one that is not dropped must answer
+// APPLIED or NO_CHANGE, so a REJECTED undrop is a failure to retry. A REJECTED
+// drop, like a rejected list add, means the plugin does not know the series.
+func TestPluginProviderMapsDroppedEventResults(t *testing.T) {
+	series := LocalFavorite{MediaItemID: testSeriesMediaID, Kind: historyimport.KindSeries, TMDBID: "99", ProviderItemKey: "tmdb:99"}
+	drop := pluginv1.WatchSyncOperation_WATCH_SYNC_OPERATION_MARK_DROPPED
+	undrop := pluginv1.WatchSyncOperation_WATCH_SYNC_OPERATION_UNMARK_DROPPED
+	for _, tc := range []struct {
+		name          string
+		operation     pluginv1.WatchSyncOperation
+		status        pluginv1.WatchSyncApplyStatus
+		fault         *pluginv1.WatchSyncFault
+		wantSent      bool
+		wantNotFound  bool
+		wantFailed    string
+		wantRateLimit bool
+	}{
+		{name: "applied drop", operation: drop, status: pluginv1.WatchSyncApplyStatus_WATCH_SYNC_APPLY_STATUS_APPLIED, wantSent: true},
+		{name: "unchanged undrop", operation: undrop, status: pluginv1.WatchSyncApplyStatus_WATCH_SYNC_APPLY_STATUS_NO_CHANGE, wantSent: true},
+		{name: "rejected drop", operation: drop, status: pluginv1.WatchSyncApplyStatus_WATCH_SYNC_APPLY_STATUS_REJECTED, wantNotFound: true},
+		{
+			name: "rejected undrop", operation: undrop, status: pluginv1.WatchSyncApplyStatus_WATCH_SYNC_APPLY_STATUS_REJECTED,
+			fault:      &pluginv1.WatchSyncFault{SafeMessage: "undrop refused for " + testSecretValue},
+			wantFailed: "undrop refused for [REDACTED]",
+		},
+		{
+			name: "retry", operation: drop, status: pluginv1.WatchSyncApplyStatus_WATCH_SYNC_APPLY_STATUS_RETRY,
+			fault:      &pluginv1.WatchSyncFault{Code: pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_TEMPORARY, SafeMessage: "try later"},
+			wantFailed: "try later",
+		},
+		{
+			name: "rate limited", operation: undrop, status: pluginv1.WatchSyncApplyStatus_WATCH_SYNC_APPLY_STATUS_RETRY,
+			fault:         &pluginv1.WatchSyncFault{Code: pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_RATE_LIMITED},
+			wantRateLimit: true,
+		},
+		{name: "omitted result", operation: drop, wantFailed: "watch sync plugin omitted a valid event result"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &fakeWatchSyncPluginClient{applyStatus: tc.status, applyFault: tc.fault}
+			provider := testPluginProviderWithDescriptor(t, client, droppedTestDescriptor())
+			send := provider.ExportDropped
+			if tc.operation == undrop {
+				send = provider.RemoveDropped
+			}
+			result, err := send(context.Background(), ServerConfig{}, Connection{AccessToken: testSecretValue}, []LocalFavorite{series})
+			if _, limited := AsRateLimited(err); limited != tc.wantRateLimit || (err != nil && !tc.wantRateLimit) {
+				t.Fatalf("err = %v, want rate limited %v", err, tc.wantRateLimit)
+			}
+			if slices.Contains(result.Sent, testSeriesMediaID) != tc.wantSent ||
+				slices.Contains(result.NotFound, testSeriesMediaID) != tc.wantNotFound ||
+				result.Failed[testSeriesMediaID] != tc.wantFailed {
+				t.Fatalf("result = %#v", result)
+			}
+		})
+	}
+}
+
+func TestPluginProviderRatingExportWatchGateFollowsDescriptor(t *testing.T) {
+	movie := pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_MOVIE
+	episode := pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_EPISODE
+	series := pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_SERIES
+	for _, tc := range []struct {
+		name          string
+		gated         []pluginv1.WatchSyncMediaType
+		movie, series bool
+	}{
+		{name: "none"},
+		{name: "movies", gated: []pluginv1.WatchSyncMediaType{movie}, movie: true},
+		{name: "series", gated: []pluginv1.WatchSyncMediaType{series}, series: true},
+		{name: "both", gated: []pluginv1.WatchSyncMediaType{movie, series}, movie: true, series: true},
+		// Only movie and series ratings sync, so an episode entry gates nothing.
+		{name: "episodes", gated: []pluginv1.WatchSyncMediaType{episode}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			descriptor := ratingTestDescriptor(movie, episode, series)
+			descriptor.RatingExportRequiresWatched = tc.gated
+			provider := testPluginProviderWithDescriptor(t, &fakeWatchSyncPluginClient{}, descriptor)
+			if got := provider.RatingExportRequiresWatched(historyimport.KindMovie); got != tc.movie {
+				t.Fatalf("movie gated = %v, want %v", got, tc.movie)
+			}
+			if got := provider.RatingExportRequiresWatched(historyimport.KindSeries); got != tc.series {
+				t.Fatalf("series gated = %v, want %v", got, tc.series)
+			}
+			if provider.RatingExportRequiresWatched(historyimport.KindEpisode) || provider.RatingExportRequiresWatched("") {
+				t.Fatal("only movie and series ratings can be gated")
+			}
+		})
+	}
+}
+
+func TestPluginProviderKeepsBoundedSanitizedPageWarnings(t *testing.T) {
+	long := strings.Repeat("é", 400)
+	pageOne := []string{"token " + testSecretValue + " leaked\nhere", "   ", long}
+	for i := range 40 {
+		pageOne = append(pageOne, fmt.Sprintf("skipped item %d", i))
+	}
+	var pageTwo []string
+	for i := range 12 {
+		pageTwo = append(pageTwo, fmt.Sprintf("later item %d", i))
+	}
+	client := &fakeWatchSyncPluginClient{listResponses: []*pluginv1.WatchSyncListRemoteStateResponse{
+		{Warnings: pageOne, NextPageToken: "page-2"},
+		{Warnings: pageTwo, NextCursor: "cursor-2"},
+	}}
+	provider := testPluginProviderWithDescriptor(t, client, droppedTestDescriptor())
+	batch, err := provider.FetchDropped(context.Background(), ServerConfig{}, Connection{AccessToken: testSecretValue})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 42 usable warnings from page one and 12 from page two: 50 are kept and
+	// the other 4 are counted in one closing note.
+	if len(batch.Warnings) != maxRemoteStateWarnings+1 {
+		t.Fatalf("warnings = %d, want %d: %#v", len(batch.Warnings), maxRemoteStateWarnings+1, batch.Warnings)
+	}
+	if batch.Warnings[0] != "token [REDACTED] leaked here" {
+		t.Fatalf("first warning = %q, want it sanitized", batch.Warnings[0])
+	}
+	truncated := batch.Warnings[1]
+	if len(truncated) > maxRemoteStateWarningBytes || !utf8.ValidString(truncated) ||
+		!strings.HasPrefix(truncated, "éé") || !strings.HasSuffix(truncated, "…") {
+		t.Fatalf("long warning = %d bytes %q", len(truncated), truncated)
+	}
+	if got := batch.Warnings[maxRemoteStateWarnings-1]; got != "later item 7" {
+		t.Fatalf("last kept warning = %q", got)
+	}
+	if got := batch.Warnings[maxRemoteStateWarnings]; got != "watch sync plugin returned 4 more warnings that are not shown" {
+		t.Fatalf("closing note = %q", got)
+	}
+}
+
+// A warning that echoes any secret the read carried, not only the tokens, is
+// redacted before it reaches the sync run.
+func TestPluginProviderRedactsEverySecretFromPageWarnings(t *testing.T) {
+	client := &fakeWatchSyncPluginClient{listResponses: []*pluginv1.WatchSyncListRemoteStateResponse{{
+		Warnings:   []string{"client app-secret-value and attribute attribute-secret-value"},
+		NextCursor: "cursor-1",
+	}}}
+	provider, err := NewPluginProvider(PluginProviderOptions{
+		InstallationID: 4,
+		ProviderKey:    testPluginProviderKey,
+		CapabilityID:   testPluginCapabilityID,
+		Descriptor:     droppedTestDescriptor(),
+		ResolveClient: func(context.Context, int, string) (WatchSyncPluginClient, error) {
+			return client, nil
+		},
+		ResolveConfig: func(context.Context, int) (*pluginv1.WatchSyncProviderConfig, error) {
+			return &pluginv1.WatchSyncProviderConfig{SecretValues: map[string]string{"app.client_secret": "app-secret-value"}}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch, err := provider.FetchDropped(context.Background(), ServerConfig{}, Connection{
+		AccessToken:      testSecretValue,
+		SecretAttributes: map[string]string{"session": "attribute-secret-value"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(batch.Warnings, []string{"client [REDACTED] and attribute [REDACTED]"}) {
+		t.Fatalf("warnings = %q, want both secrets redacted", batch.Warnings)
+	}
+}
+
+func TestPluginProviderEveryRemoteStateBatchCarriesPageWarnings(t *testing.T) {
+	ctx := context.Background()
+	for name, fetch := range map[string]func(*PluginProvider) ([]string, error){
+		"watched": func(p *PluginProvider) ([]string, error) {
+			batch, err := p.FetchWatchedBatch(ctx, ServerConfig{}, Connection{})
+			return batch.Warnings, err
+		},
+		"progress": func(p *PluginProvider) ([]string, error) {
+			batch, err := p.FetchProgressBatch(ctx, ServerConfig{}, Connection{})
+			return batch.Warnings, err
+		},
+		"favorites": func(p *PluginProvider) ([]string, error) {
+			batch, err := p.FetchFavoritesBatch(ctx, ServerConfig{}, Connection{})
+			return batch.Warnings, err
+		},
+		"watchlist": func(p *PluginProvider) ([]string, error) {
+			batch, err := p.FetchWatchlistBatch(ctx, ServerConfig{}, Connection{})
+			return batch.Warnings, err
+		},
+		"ratings": func(p *PluginProvider) ([]string, error) {
+			batch, err := p.FetchRatings(ctx, ServerConfig{}, Connection{})
+			return batch.Warnings, err
+		},
+		"dropped": func(p *PluginProvider) ([]string, error) {
+			batch, err := p.FetchDropped(ctx, ServerConfig{}, Connection{})
+			return batch.Warnings, err
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			client := &fakeWatchSyncPluginClient{listResponses: []*pluginv1.WatchSyncListRemoteStateResponse{
+				{Warnings: []string{"page one"}, NextPageToken: "page-2"},
+				{Warnings: []string{"page two"}},
+			}}
+			warnings, err := fetch(testPluginProvider(t, client))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(warnings, []string{"page one", "page two"}) {
+				t.Fatalf("warnings = %#v", warnings)
+			}
+		})
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -331,6 +332,91 @@ func TestPublishInventoryUpdatedEmitsVerifiedInventory(t *testing.T) {
 	}
 }
 
+func TestColdCandidateSessionDoesNotFreezeEmptySubtitleEvidence(t *testing.T) {
+	sessionMgr := playback.NewSessionManager(0, 0)
+	session, err := sessionMgr.StartSession(1, "profile-1", 100, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+
+	coldVirtualFile := &models.MediaFile{
+		ID:             100,
+		ContentID:      "movie-cold-virtual",
+		FilePath:       "virtual://movie/cold-cand?result=cand-1",
+		Container:      "virtual",
+		ProbeUpdatedAt: nil,
+	}
+
+	h := NewPlaybackHandler(sessionMgr, testPlaybackFileResolver{file: coldVirtualFile})
+	state := h.v3SessionStreamState(context.Background(), session, coldVirtualFile, playback.PlannerResultV3{}, preparedTransportV3{}, mediaAuthModeV3{})
+	if state.VirtualSubtitleEvidenceSet {
+		t.Fatal("cold candidate with nil ProbeUpdatedAt must not freeze VirtualSubtitleEvidenceSet to true")
+	}
+
+	// Apply stream state to the session manager, reflecting the live start decision
+	if err := sessionMgr.UpdateStreamState(session.ID, state); err != nil {
+		t.Fatalf("UpdateStreamState: %v", err)
+	}
+
+	// When probe completes, probe evidence arrives on the row with multi-audio and subtitles
+	probedAt := time.Now()
+	coldVirtualFile.ProbeUpdatedAt = &probedAt
+	coldVirtualFile.AudioTracks = []models.AudioTrack{
+		{Index: 1, Codec: "aac", Channels: 2, Language: "eng", Default: true},
+		{Index: 2, Codec: "ac3", Channels: 6, Language: "fre"},
+	}
+	coldVirtualFile.SubtitleTracks = []models.SubtitleTrack{
+		{Index: 3, Codec: "subrip", Language: "eng", Default: true},
+		{Index: 4, Codec: "subrip", Language: "fre"},
+	}
+
+	h.RealtimeHub = playback.NewRealtimeHub()
+	if err := sessionMgr.SetRealtimeConnection(session.ID, true); err != nil {
+		t.Fatalf("SetRealtimeConnection: %v", err)
+	}
+	conn := &sourceCommittedTestConn{}
+	registration := h.RealtimeHub.Register(session.ID, conn)
+	if registration == nil {
+		t.Fatal("expected a realtime registration")
+	}
+	defer h.RealtimeHub.Unregister(registration)
+
+	h.PublishInventoryUpdated(context.Background(), coldVirtualFile.ID)
+
+	if len(conn.messages) != 1 {
+		t.Fatalf("delivered %d events, want 1", len(conn.messages))
+	}
+	event := conn.messages[0].(playback.EventEnvelope)
+	if event.Name != playback.RealtimeEventInventoryUpdated {
+		t.Fatalf("event name = %q, want %q", event.Name, playback.RealtimeEventInventoryUpdated)
+	}
+	var payload playback.InventoryUpdatedPayload
+	if err := json.Unmarshal(event.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if payload.SessionID != session.ID {
+		t.Fatalf("payload session_id = %q, want %q", payload.SessionID, session.ID)
+	}
+	if payload.InventoryStatus != "verified" {
+		t.Fatalf("payload inventory_status = %q, want verified", payload.InventoryStatus)
+	}
+	if len(payload.AudioTracks) != 2 {
+		t.Fatalf("audio tracks len = %d, want 2 (multi-audio)", len(payload.AudioTracks))
+	}
+	if len(payload.SubtitleInventory) != 2 {
+		t.Fatalf("subtitle inventory len = %d, want 2", len(payload.SubtitleInventory))
+	}
+
+	// Verify the active session remains healthy and usable in session manager
+	active, err := sessionMgr.GetSession(session.ID)
+	if err != nil || active == nil {
+		t.Fatalf("session %s no longer active in manager: %v", session.ID, err)
+	}
+	if active.MediaFileID != coldVirtualFile.ID {
+		t.Fatalf("active session file ID = %d, want %d", active.MediaFileID, coldVirtualFile.ID)
+	}
+}
+
 type sourceCommittedTestConn struct {
 	messages []any
 }
@@ -338,6 +424,203 @@ type sourceCommittedTestConn struct {
 func (c *sourceCommittedTestConn) WriteJSON(v any) error {
 	c.messages = append(c.messages, v)
 	return nil
+}
+
+// bindingMoveFileResolverV3 fires a source-binding move on the first file load,
+// modeling a rotation that lands while an inventory build is resolving.
+type bindingMoveFileResolverV3 struct {
+	FilePathResolver
+	move func()
+	once sync.Once
+}
+
+func (r *bindingMoveFileResolverV3) GetByID(ctx context.Context, id int) (*models.MediaFile, error) {
+	r.once.Do(func() {
+		if r.move != nil {
+			r.move()
+		}
+	})
+	return r.FilePathResolver.GetByID(ctx, id)
+}
+
+// generationTearManager lands a binding move between the inventory publisher's
+// generation read and its session re-read, reproducing the exact tear the
+// atomic read closes: the generation is captured pre-move while the copy is
+// post-move. A manager without the atomic capability would drop the fresh build.
+type generationTearManager struct {
+	*playback.SessionManager
+	from string
+	to   string
+	once sync.Once
+}
+
+func (m *generationTearManager) GetSession(sessionID string) (*playback.Session, error) {
+	m.once.Do(func() {
+		if m.from != "" {
+			_ = m.SetVirtualSource(sessionID, m.to, 5)
+		}
+	})
+	return m.SessionManager.GetSession(sessionID)
+}
+
+// virtualProbedInventoryFile builds a probed virtual release with one audio
+// track whose language identifies the release in the published payload.
+func virtualProbedInventoryFile(uri, language string) *models.MediaFile {
+	probedAt := time.Now()
+	return &models.MediaFile{
+		ID:             100,
+		ContentID:      "movie-inventory-fence",
+		FilePath:       uri,
+		ProbeUpdatedAt: &probedAt,
+		AudioTracks:    []models.AudioTrack{{Index: 1, Codec: "aac", Language: language, Default: true}},
+	}
+}
+
+// TestPublishInventoryUpdatedReReadsLiveSourceBinding pins the pre-lock read
+// fix: the caller's session snapshot is taken before the per-session lock, so a
+// binding that moved in between must be published from the live session, not
+// the stale snapshot.
+func TestPublishInventoryUpdatedReReadsLiveSourceBinding(t *testing.T) {
+	sessionMgr := playback.NewSessionManager(0, 0)
+	session, err := sessionMgr.StartSession(1, "profile-1", 100, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	const releaseA = "virtual://movie/inventory-fence?result=A"
+	releaseB := virtualProbedInventoryFile("virtual://movie/inventory-fence?result=B", "deu")
+	if err := sessionMgr.SetVirtualSource(session.ID, releaseA, 5); err != nil {
+		t.Fatalf("SetVirtualSource A: %v", err)
+	}
+	if err := sessionMgr.SetVirtualSource(session.ID, releaseB.FilePath, 5); err != nil {
+		t.Fatalf("SetVirtualSource B: %v", err)
+	}
+
+	h := NewPlaybackHandler(sessionMgr, testPlaybackFileResolver{file: releaseB})
+	h.RealtimeHub = playback.NewRealtimeHub()
+	if err := sessionMgr.SetRealtimeConnection(session.ID, true); err != nil {
+		t.Fatalf("SetRealtimeConnection: %v", err)
+	}
+	conn := &sourceCommittedTestConn{}
+	registration := h.RealtimeHub.Register(session.ID, conn)
+	if registration == nil {
+		t.Fatal("expected a realtime registration")
+	}
+	defer h.RealtimeHub.Unregister(registration)
+
+	// The snapshot the caller enumerated still names release A.
+	stale := *session
+	stale.VirtualSourceURI = releaseA
+	h.publishInventoryUpdatedToSession(context.Background(), &stale, "", nil)
+
+	if len(conn.messages) != 1 {
+		t.Fatalf("delivered %d events, want 1", len(conn.messages))
+	}
+	event, ok := conn.messages[0].(playback.EventEnvelope)
+	if !ok {
+		t.Fatalf("message type = %T, want playback.EventEnvelope", conn.messages[0])
+	}
+	var payload playback.InventoryUpdatedPayload
+	if err := json.Unmarshal(event.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	if payload.EffectiveVirtualURI != releaseB.FilePath {
+		t.Fatalf("published effective_virtual_uri = %q, want the live binding %q", payload.EffectiveVirtualURI, releaseB.FilePath)
+	}
+	if len(payload.AudioTracks) != 1 || payload.AudioTracks[0].Language != "deu" {
+		t.Fatalf("published audio tracks = %#v, want the live release's deu track", payload.AudioTracks)
+	}
+}
+
+// TestPublishInventoryUpdatedDropsBuildRacedByBindingMove pins the generation
+// fence: when a source-binding move lands while the inventory is being built,
+// the older build must be dropped rather than delivered after the newer
+// release's inventory.
+func TestPublishInventoryUpdatedDropsBuildRacedByBindingMove(t *testing.T) {
+	sessionMgr := playback.NewSessionManager(0, 0)
+	session, err := sessionMgr.StartSession(1, "profile-1", 100, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	releaseA := virtualProbedInventoryFile("virtual://movie/inventory-fence?result=A", "eng")
+	if err := sessionMgr.SetVirtualSource(session.ID, releaseA.FilePath, 5); err != nil {
+		t.Fatalf("SetVirtualSource: %v", err)
+	}
+
+	h := NewPlaybackHandler(sessionMgr, testPlaybackFileResolver{file: releaseA})
+	h.RealtimeHub = playback.NewRealtimeHub()
+	if err := sessionMgr.SetRealtimeConnection(session.ID, true); err != nil {
+		t.Fatalf("SetRealtimeConnection: %v", err)
+	}
+	conn := &sourceCommittedTestConn{}
+	registration := h.RealtimeHub.Register(session.ID, conn)
+	if registration == nil {
+		t.Fatal("expected a realtime registration")
+	}
+	defer h.RealtimeHub.Unregister(registration)
+
+	// The binding moves to release B while release A's inventory is resolved.
+	h.fileResolver = &bindingMoveFileResolverV3{
+		FilePathResolver: h.fileResolver,
+		move: func() {
+			if moveErr := sessionMgr.SetVirtualSource(session.ID, "virtual://movie/inventory-fence?result=B", 5); moveErr != nil {
+				t.Errorf("move binding: %v", moveErr)
+			}
+		},
+	}
+
+	h.PublishInventoryUpdated(context.Background(), releaseA.ID)
+
+	if len(conn.messages) != 0 {
+		t.Fatalf("delivered %d events, want 0: the build raced a source-binding move", len(conn.messages))
+	}
+}
+
+// TestPublishInventoryUpdatedKeepsFreshBuildWhenReadGenerationLags pins finding
+// 4: the fence must pair the generation with the live copy the build actually
+// uses. A move that lands between a separately read generation and the session
+// re-read leaves the build using the current source; the fence must not drop
+// that payload on the strength of the older generation. The manager below
+// performs exactly that move when the generation is read.
+func TestPublishInventoryUpdatedKeepsFreshBuildWhenReadGenerationLags(t *testing.T) {
+	base := playback.NewSessionManager(0, 0)
+	session, err := base.StartSession(1, "profile-1", 100, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	releaseB := virtualProbedInventoryFile("virtual://movie/inventory-fence?result=B", "deu")
+	if err := base.SetVirtualSource(session.ID, "virtual://movie/inventory-fence?result=A", 5); err != nil {
+		t.Fatalf("SetVirtualSource A: %v", err)
+	}
+
+	// The manager moves the binding to the verified release B just before the
+	// session re-read, so a separately captured generation still names A's
+	// binding while the copy the build uses is B. The fresh build from B must
+	// not be dropped, and the atomic read that pairs copy and generation must
+	// see this tear and still deliver.
+	manager := &generationTearManager{SessionManager: base, from: "virtual://movie/inventory-fence?result=A", to: releaseB.FilePath}
+
+	h := NewPlaybackHandler(manager, testPlaybackFileResolver{file: releaseB})
+	h.RealtimeHub = playback.NewRealtimeHub()
+	if err := base.SetRealtimeConnection(session.ID, true); err != nil {
+		t.Fatalf("SetRealtimeConnection: %v", err)
+	}
+	conn := &sourceCommittedTestConn{}
+	registration := h.RealtimeHub.Register(session.ID, conn)
+	if registration == nil {
+		t.Fatal("expected a realtime registration")
+	}
+	defer h.RealtimeHub.Unregister(registration)
+
+	// A stale snapshot from before the binding moved, as PublishInventoryUpdated
+	// enumerates before taking the per-session lock.
+	stale := *session
+	stale.VirtualSourceURI = "virtual://movie/inventory-fence?result=A"
+
+	h.publishInventoryUpdatedToSession(context.Background(), &stale, "", nil)
+
+	if len(conn.messages) != 1 {
+		t.Fatalf("delivered %d events, want 1: a payload built from the live binding must not be dropped by a lagging generation read", len(conn.messages))
+	}
 }
 
 func TestComputeInventoryRevisionDeterministic(t *testing.T) {

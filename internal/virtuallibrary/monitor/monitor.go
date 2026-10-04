@@ -268,6 +268,49 @@ func (s *Monitor) ReleaseCached(releaseName string) (cached bool, known bool) {
 	return cached, true
 }
 
+// ReleaseFailed reports whether AltMount has reported the named release failed.
+// known is false when no AltMount client is configured, so an unconfigured
+// provider is never mistaken for "not failed". It is the symmetric read to
+// ReleaseCached: a caller holding a persisted candidate row, rather than a
+// freshly listed candidate, uses it to ask whether the source of truth has
+// branded that row's release dead without re-listing the provider. It answers
+// from the cached snapshot, so it is cheap and side-effect free.
+func (s *Monitor) ReleaseFailed(releaseName string) (failed bool, known bool) {
+	if s == nil || s.monitor == nil {
+		return false, false
+	}
+	client := s.monitor.configuredAltmount()
+	if client == nil || client.URL() == "" {
+		return false, false
+	}
+	key := altmount.ReleaseKey(releaseName)
+	if key == "" {
+		return false, false
+	}
+	return client.ReleaseFailed(key)
+}
+
+// ReleaseDownloading reports whether AltMount has reported the named release
+// as actively fetching (SABnzbd queue, not history). known is false when no
+// AltMount client is configured. A downloading release is pending: neither
+// dead (so failed-drops and the pruner must ignore it) nor ready (so the
+// resolver may hold for it). It answers from the cached snapshot, so it is
+// cheap and side-effect free.
+func (s *Monitor) ReleaseDownloading(releaseName string) (downloading bool, known bool) {
+	if s == nil || s.monitor == nil {
+		return false, false
+	}
+	client := s.monitor.configuredAltmount()
+	if client == nil || client.URL() == "" {
+		return false, false
+	}
+	key := altmount.ReleaseKey(releaseName)
+	if key == "" {
+		return false, false
+	}
+	return client.ReleaseDownloading(key)
+}
+
 // ProviderStale reports whether any configured virtual provider's cached state
 // has aged past its refresh interval. It is the read half of the stale-provider
 // seam the playback layer probes before a resolve, so a long-lived process does
@@ -310,6 +353,37 @@ func (s *Monitor) RefreshStaleProvider(ctx context.Context) error {
 		}
 	}
 	if prowlarrClient != nil && prowlarrClient.URL() != "" && prowlarrClient.Stale() {
+		if err := prowlarrClient.RefreshIfStale(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("refresh Prowlarr search: %w", err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// RefreshProviderState forces a fresh classification snapshot from every
+// configured virtual provider before a caller classifies candidates. Unlike
+// RefreshStaleProvider it does not honor the refresh interval: an explicit
+// "Refresh List" must classify against the provider's current completed/failed
+// state, not a snapshot up to one interval old. It reuses the existing AltMount
+// history fetch and Prowlarr RSS refresh and adds no new snapshot machinery. One
+// unreachable provider never blocks the other; both are attempted and their
+// errors are joined.
+func (s *Monitor) RefreshProviderState(ctx context.Context) error {
+	if s == nil || s.monitor == nil {
+		return nil
+	}
+	m := s.monitor
+	m.mu.Lock()
+	altmountClient := m.altmount
+	prowlarrClient := m.prowlarr
+	m.mu.Unlock()
+	var errs []error
+	if altmountClient != nil && altmountClient.URL() != "" {
+		if err := altmountClient.Refresh(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("refresh AltMount state: %w", err))
+		}
+	}
+	if prowlarrClient != nil && prowlarrClient.URL() != "" {
 		if err := prowlarrClient.RefreshIfStale(ctx); err != nil {
 			errs = append(errs, fmt.Errorf("refresh Prowlarr search: %w", err))
 		}

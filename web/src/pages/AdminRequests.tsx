@@ -96,7 +96,7 @@ import {
   REQUEST_STATUSES,
 } from "@/lib/mediaRequests";
 import { applyExclusivity } from "./requestExclusivity";
-import { supportedMediaTypesForConfig } from "./requestIntegrationMediaTypes";
+import { supportedMediaTypesForConfig } from "./admin-settings/requestIntegrationMediaTypes";
 
 type StatusFilter = MediaRequestStatus | "all";
 type OutcomeFilter = MediaRequestOutcome | "all";
@@ -778,11 +778,13 @@ function useConnectionOptions(
   // only commits its result if no newer probe has begun since.
   const genRef = useRef(0);
 
+  const isVirtual =
+    draft.installation_id === 0 || draft.capability_id === "virtual-library-requests";
   const canLoad =
     draft.base_url.trim().length > 0 &&
-    Boolean(draft.installation_id) &&
+    draft.installation_id !== undefined &&
     draft.capability_id.trim().length > 0 &&
-    Boolean(draft.api_key_ref.trim() || draft.has_api_key);
+    Boolean(draft.api_key_ref.trim() || draft.has_api_key || isVirtual);
 
   // Options depend ONLY on the connection identity. plugin_config is still sent
   // in the request body so the plugin can resolve options, but it is not part of
@@ -1062,12 +1064,21 @@ function IntegrationEditor({
   // installation resolves the exact backend; fall back to installation-only for
   // connections whose capability_id isn't set yet (adopts that installation's
   // capability).
-  const selected =
-    installations.find(
-      (entry) =>
-        entry.installationID === selectedInstallationID &&
-        entry.capability.id === form.capability_id,
-    ) ?? installations.find((entry) => entry.installationID === selectedInstallationID);
+  const selected = hasInstallation
+    ? (installations.find(
+        (entry) =>
+          entry.installationID === selectedInstallationID &&
+          entry.capability.id === form.capability_id,
+      ) ?? installations.find((entry) => entry.installationID === selectedInstallationID))
+    : undefined;
+
+  const isVirtualTarget = Boolean(
+    hasInstallation &&
+    (selected?.installationID === 0 ||
+      selected?.capability.id === "virtual-library-requests" ||
+      form.capability_id === "virtual-library-requests" ||
+      form.installation_id === "0"),
+  );
 
   const selectedDefaults = requestRouterConnectionDefaults(selected?.capability.metadata);
   useEffect(() => {
@@ -1237,7 +1248,13 @@ function IntegrationEditor({
             aria-invalid={Boolean(fieldErrors.api_key_ref)}
             value={form.api_key_ref}
             onChange={(event) => patchForm({ api_key_ref: event.target.value })}
-            placeholder={form.has_api_key ? "Leave blank to keep saved key" : "API key"}
+            placeholder={
+              form.has_api_key
+                ? "Leave blank to keep saved key"
+                : isVirtualTarget
+                  ? "core-managed"
+                  : "API key"
+            }
           />
         </Field>
       </div>
@@ -1247,7 +1264,7 @@ function IntegrationEditor({
           aria-invalid={Boolean(fieldErrors.base_url)}
           value={form.base_url}
           onChange={(event) => patchForm({ base_url: event.target.value })}
-          placeholder="http://localhost:7878"
+          placeholder={isVirtualTarget ? "virtual://streaming" : "http://localhost:7878"}
         />
       </Field>
 

@@ -1705,8 +1705,40 @@ func TestBuildFFmpegArgs_NVENCH264UsesCudaPipeline(t *testing.T) {
 	if strings.Contains(joined, "-vf scale=-2:720") {
 		t.Fatalf("nvenc args must not use software scale on cuda frames: %s", joined)
 	}
-	if !strings.Contains(joined, "-b:v 2000k -maxrate 2000k -bufsize 4000k") {
+	if !strings.Contains(joined, "-b:v 1800k -maxrate 2000k -bufsize 4000k") {
 		t.Fatalf("nvenc args should include bitrate cap controls: %s", joined)
+	}
+}
+
+// A cap must be a ceiling on every hardware encoder: QSV selects CBR when
+// -b:v equals -maxrate, and VAAPI ignores -maxrate once -qp selects CQP.
+// VAAPI forces the capped mode detected on the device (FFmpeg's automatic
+// mode can pick AVBR, which does not honor -maxrate).
+func TestAppendVideoArgs_HardwareBitrateCapIsVBRCeiling(t *testing.T) {
+	for _, tc := range []struct {
+		hwAccel, codec, want string
+	}{
+		{"qsv", "h264", "-c:v h264_qsv -preset veryfast -b:v 4500k -maxrate 5000k -bufsize 10000k"},
+		{"qsv", "hevc", "-c:v hevc_qsv -preset veryfast -b:v 4500k -maxrate 5000k -bufsize 10000k"},
+		{"vaapi", "h264", "-c:v h264_vaapi -b:v 4500k -maxrate 5000k -bufsize 10000k"},
+		{"vaapi", "hevc", "-c:v hevc_vaapi -b:v 4500k -maxrate 5000k -bufsize 10000k"},
+		{"nvenc", "h264", "-c:v h264_nvenc -rc:v vbr -b:v 4500k -maxrate 5000k -bufsize 10000k"},
+		{"nvenc", "hevc", "-c:v hevc_nvenc -rc:v vbr -b:v 4500k -maxrate 5000k -bufsize 10000k"},
+	} {
+		joined := strings.Join(appendVideoArgs(nil, TranscodeOpts{HWAccel: tc.hwAccel, TargetCodecVideo: tc.codec, TargetBitrateKbps: 5000}), " ")
+		if joined != tc.want {
+			t.Errorf("%s/%s capped args = %q, want %q", tc.hwAccel, tc.codec, joined, tc.want)
+		}
+		if tc.hwAccel == "vaapi" {
+			detected := strings.Join(appendVideoArgs(nil, TranscodeOpts{HWAccel: tc.hwAccel, TargetCodecVideo: tc.codec, TargetBitrateKbps: 5000, vaapiRateControl: "VBR"}), " ")
+			if want := strings.Replace(tc.want, "_vaapi ", "_vaapi -rc_mode VBR ", 1); detected != want {
+				t.Errorf("%s/%s capped args with VBR detected = %q, want %q", tc.hwAccel, tc.codec, detected, want)
+			}
+		}
+		uncapped := strings.Join(appendVideoArgs(nil, TranscodeOpts{HWAccel: tc.hwAccel, TargetCodecVideo: tc.codec, vaapiRateControl: "VBR"}), " ")
+		if strings.Contains(uncapped, "-maxrate") || strings.Contains(uncapped, "-rc_mode") {
+			t.Errorf("%s/%s uncapped args must keep constant-quality mode: %q", tc.hwAccel, tc.codec, uncapped)
+		}
 	}
 }
 
@@ -2198,5 +2230,97 @@ func TestBuildFFmpegArgs_NVENCFullHardwareArgsUnchanged(t *testing.T) {
 				t.Fatalf("full-hardware NVENC should scale CUDA frames directly: %s", joined)
 			}
 		})
+	}
+}
+
+// Every backend scales to the same height for a ladder label or an exact
+// box-fit height, and leaves the source alone for anything else.
+// The rate-control probe runs the ordinary VAAPI smoke encode in the capped
+// mode a transcode would request, and a detected mode is forced.
+func TestVAAPIRateControlSmokeArgsAndForcedMode(t *testing.T) {
+	joined := strings.Join(vaapiRateControlSmokeArgs("/dev/dri/renderD128", "hevc_vaapi", "CBR"), " ")
+	for _, want := range []string{"-c:v hevc_vaapi -rc_mode CBR -b:v 1800k -maxrate 2000k -f null -", "/dev/dri/renderD128"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("rate-control smoke args missing %q: %s", want, joined)
+		}
+	}
+	cbr := strings.Join(appendVideoArgs(nil, TranscodeOpts{HWAccel: "vaapi", TargetCodecVideo: "h264", TargetBitrateKbps: 5000, vaapiRateControl: "CBR"}), " ")
+	if cbr != "-c:v h264_vaapi -rc_mode CBR -b:v 4500k -maxrate 5000k -bufsize 10000k" {
+		t.Fatalf("CBR-only device args = %q", cbr)
+	}
+	if opts, err := resolveVAAPIRateControl(context.Background(), TranscodeOpts{HWAccel: "qsv", TargetBitrateKbps: 5000, vaapiRateControl: "VBR"}); err != nil || opts.vaapiRateControl != "" {
+		t.Fatalf("a non-VAAPI encode must not keep a VAAPI mode: %q %v", opts.vaapiRateControl, err)
+	}
+	if opts, err := resolveVAAPIRateControl(context.Background(), TranscodeOpts{HWAccel: "vaapi", vaapiRateControl: "VBR"}); err != nil || opts.vaapiRateControl != "" {
+		t.Fatalf("an uncapped VAAPI encode needs no mode: %q %v", opts.vaapiRateControl, err)
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := resolveVAAPIRateControl(canceled, TranscodeOpts{HWAccel: "vaapi", TargetCodecVideo: "h264", TargetBitrateKbps: 5000, FFmpegPath: "/nonexistent/ffmpeg"}); err == nil {
+		t.Fatal("a canceled start must stop instead of launching FFmpeg")
+	}
+}
+
+func TestHardwareScaleFiltersShareExactLadderHeights(t *testing.T) {
+	t.Parallel()
+
+	// The ladder fit names exact heights (a 3840x1600 film at the 1080p
+	// class encodes 1920x800): every hardware scaler must scale them, or
+	// the plan advertises a frame the encoder never produces. Each input
+	// is checked against its own height.
+	for _, tc := range []struct{ res, height string }{
+		{"800p", "h=800"},
+		{"540p", "h=540"},
+		{" 1080P ", "h=1080"},
+	} {
+		if got := vaapiScaleFilter(tc.res); !strings.Contains(got, tc.height) {
+			t.Fatalf("vaapiScaleFilter(%q) = %q, want %s scaling", tc.res, got, tc.height)
+		}
+		if got := qsvScaleFilterWithMapMode(tc.res, ""); !strings.Contains(got, tc.height) {
+			t.Fatalf("qsvScaleFilterWithMapMode(%q) = %q, want %s scaling", tc.res, got, tc.height)
+		}
+		if got := qsvVPPInputScaleFilter(tc.res); !strings.Contains(got, tc.height) {
+			t.Fatalf("qsvVPPInputScaleFilter(%q) = %q, want %s scaling", tc.res, got, tc.height)
+		}
+	}
+	// VPP keeps Vio's iHD width constraint on exact heights too.
+	if got := qsvVPPInputScaleFilter("800p"); got != "vpp_qsv=w=-1:h=800:format=nv12" {
+		t.Fatalf("qsvVPPInputScaleFilter(800p) = %q, want w=-1 exact scaling", got)
+	}
+	if got := vaapiScaleFilter("800p"); got != "scale_vaapi=w=-2:h=800:format=nv12" {
+		t.Fatalf("vaapiScaleFilter(800p) = %q", got)
+	}
+	// Odd heights, which 4:2:0 output cannot take, and absurd ones leave
+	// the source unscaled, as unknown labels always have.
+	for _, res := range []string{"801p", "5000p", " UH D ", ""} {
+		if got := vaapiScaleFilter(res); got != vaapiNV12Filter {
+			t.Fatalf("vaapiScaleFilter(%q) = %q, want passthrough %q", res, got, vaapiNV12Filter)
+		}
+		if got := qsvVPPInputScaleFilter(res); got != "vpp_qsv=format=nv12" {
+			t.Fatalf("qsvVPPInputScaleFilter(%q) = %q, want passthrough", res, got)
+		}
+	}
+	// A 2160p target still never upscales a shorter source.
+	if got := vaapiScaleFilter("2160p"); !strings.Contains(got, "min(2160\\,ih)") {
+		t.Fatalf("vaapiScaleFilter(2160p) = %q, want the no-upscale clamp", got)
+	}
+}
+
+func TestScopeFilmAutoPlanScalesOnHardwareFilters(t *testing.T) {
+	t.Parallel()
+
+	// End to end for the reported mismatch: a scope film at auto must
+	// produce a label the hardware scalers actually scale.
+	source := SourceDescriptorV3{Width: 3840, Height: 1600, VideoCodec: "h264", BitrateKbps: 20000}
+	estimate := 9000 // 80% plans 7200 kbps: the 1080p class for this source.
+	quality := ResolveQualityPolicyV3(StartRequestV3{QualityPreference: "auto", BandwidthEstimateKbps: &estimate}, source)
+	if quality.Label != "800p" {
+		t.Fatalf("scope auto label = %q, want 800p", quality.Label)
+	}
+	if got := vaapiScaleFilter(quality.Label); !strings.Contains(got, "h=800") {
+		t.Fatalf("vaapiScaleFilter(%q) = %q, want 800p scaling", quality.Label, got)
+	}
+	if got := qsvVPPInputScaleFilter(quality.Label); !strings.Contains(got, "h=800") {
+		t.Fatalf("qsvVPPInputScaleFilter(%q) = %q, want 800p scaling", quality.Label, got)
 	}
 }

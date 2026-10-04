@@ -335,3 +335,135 @@ func TestHandleStartPlaybackV3ReturnsBoundedOnSlowProbe(t *testing.T) {
 	close(ensurer.release)
 	handler.probeRefreshWG.Wait()
 }
+
+// Safe metadata allows immediate startup without waiting on probeStartBudget:
+// the start path returns known metadata instantly while repair runs detached.
+func TestEnsurePlaybackProbeStartReturnsImmediatelyWhenSafe(t *testing.T) {
+	ensurer := newGatedPlaybackProbeEnsurer()
+	h := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	h.ProbeEnsurer = ensurer
+	h.probeStartBudget = 5 * time.Second
+
+	file := &models.MediaFile{
+		ID:         99,
+		FilePath:   "/library/safe.mkv",
+		FileSize:   1024,
+		Duration:   120,
+		Container:  "mkv",
+		CodecVideo: "h264",
+		CodecAudio: "aac",
+		Resolution: "1080p",
+		Bitrate:    5000,
+		VideoTracks: []models.VideoTrack{{
+			Codec:     "h264",
+			Width:     1920,
+			Height:    1080,
+			BitDepth:  8,
+			Bitrate:   5000,
+			FrameRate: "24",
+		}},
+		AudioTracks: []models.AudioTrack{{
+			Codec:    "aac",
+			Channels: 2,
+		}},
+	}
+
+	start := time.Now()
+	got := h.ensurePlaybackProbeStart(context.Background(), file)
+	elapsed := time.Since(start)
+
+	if got != file {
+		t.Fatalf("safe start changed the served file: got %p want %p", got, file)
+	}
+	if elapsed > 200*time.Millisecond {
+		t.Fatalf("safe start waited %s on in-flight refresh, want immediate return", elapsed)
+	}
+
+	select {
+	case <-ensurer.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background probe repair never started")
+	}
+	close(ensurer.release)
+	h.probeRefreshWG.Wait()
+	if got := ensurer.calls.Load(); got != 1 {
+		t.Fatalf("background probe called %d times, want 1", got)
+	}
+}
+
+// When video metadata is complete but audio is unknown on an unprobed file,
+// ensurePlaybackProbeStart must not bypass repair: it must wait for the probe
+// so the audio codec can be verified before planning.
+func TestEnsurePlaybackProbeStartAwaitsWhenAudioUnknown(t *testing.T) {
+	ensurer := newGatedPlaybackProbeEnsurer()
+	h := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	h.ProbeEnsurer = ensurer
+	h.probeStartBudget = 50 * time.Millisecond
+
+	// Video is complete, but audio is completely unknown and unprobed
+	file := &models.MediaFile{
+		ID:         101,
+		FilePath:   "/library/unknown-audio.mkv",
+		FileSize:   1024,
+		Duration:   120,
+		Container:  "mkv",
+		CodecVideo: "h264",
+		Resolution: "1080p",
+		Bitrate:    5000,
+		VideoTracks: []models.VideoTrack{{
+			Codec:     "h264",
+			Width:     1920,
+			Height:    1080,
+			BitDepth:  8,
+			Bitrate:   5000,
+			FrameRate: "24",
+		}},
+		ProbeUpdatedAt: nil,
+	}
+
+	start := time.Now()
+	got := h.ensurePlaybackProbeStart(context.Background(), file)
+	elapsed := time.Since(start)
+
+	if got != file {
+		t.Fatalf("unknown-audio start changed file: got %p want %p", got, file)
+	}
+	// Must have waited for the budget (50ms) rather than returning immediately (<10ms)
+	if elapsed < 40*time.Millisecond {
+		t.Fatalf("unknown audio returned in %s, must wait for probe budget", elapsed)
+	}
+
+	select {
+	case <-ensurer.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background probe repair never started")
+	}
+	close(ensurer.release)
+	h.probeRefreshWG.Wait()
+}
+
+// When an in-flight repair completes, a joiner immediately honors the repaired
+// row without waiting or re-running the probe.
+func TestEnsurePlaybackProbeStartJoinerHonorsCompletedRepair(t *testing.T) {
+	file := &models.MediaFile{ID: 102, FilePath: "/library/join-complete.mkv", FileSize: 1024}
+	repaired := *file
+	repaired.Duration = 120
+	repaired.CodecVideo = "h264"
+	repaired.CodecAudio = "aac"
+
+	h := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	h.ProbeEnsurer = &immediateRepairProbeEnsurer{repaired: &repaired}
+
+	// Prime the memo with completed repair
+	gotFirst := h.ensurePlaybackProbeStart(context.Background(), file)
+	if gotFirst != &repaired {
+		t.Fatalf("first start = %+v, want repaired %+v", gotFirst, &repaired)
+	}
+
+	// Second start is a joiner/subsequent start on the same generation:
+	// must immediately return repaired without waiting
+	gotSecond := h.ensurePlaybackProbeStart(context.Background(), file)
+	if gotSecond != &repaired {
+		t.Fatalf("second start = %+v, want repaired %+v", gotSecond, &repaired)
+	}
+}

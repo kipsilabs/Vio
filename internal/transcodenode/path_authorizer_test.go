@@ -59,6 +59,19 @@ func TestCatalogPathAuthorizerRejectsUnsafeOrUncataloguedInputs(t *testing.T) {
 	for _, candidate := range []string{
 		"relative/movie.mkv",
 		"http://example.test/movie.mkv",
+		"virtual://movie/example",
+		"http://127.0.0.1:45678/source/",
+		"http://127.0.0.1:45678/source/../etc/passwd",
+		"http://127.0.0.1:45678/source/./movie.mp4",
+		"http://127.0.0.1:45678/source",
+		"http://127.0.0.1:45678/source/token/../../etc/passwd",
+		"http://127.0.0.1:45678/source/token/../../../etc/shadow",
+		"http://127.0.0.1:45678/source/token/sub/../../etc/passwd",
+		"http://127.0.0.1:45678/source/token/%2e%2e/passwd",
+		"http://127.0.0.1:45678/source/token/..",
+		"http://127.0.0.1:45678/source/token/.",
+		"http:///source/token/movie.mp4",
+		"ftp://127.0.0.1:45678/source/token/movie.mp4",
 		"file:" + existingUncatalogued,
 		"concat:" + existingUncatalogued + "|" + existingUncatalogued,
 		existingUncatalogued,
@@ -71,6 +84,23 @@ func TestCatalogPathAuthorizerRejectsUnsafeOrUncataloguedInputs(t *testing.T) {
 		}
 		if allowed {
 			t.Errorf("candidate %q was allowed", candidate)
+		}
+	}
+}
+
+func TestCatalogPathAuthorizerAllowsStreamURLs(t *testing.T) {
+	authorizer := NewCatalogPathAuthorizer(staticCatalogPaths{})
+	for _, candidate := range []string{
+		"http://127.0.0.1:45678/source/token",
+		"http://127.0.0.1:45678/source/token/movie.mp4",
+		"https://example.com/source/token/stream.mkv",
+	} {
+		allowed, err := authorizer.Allowed(context.Background(), candidate)
+		if err != nil {
+			t.Fatalf("candidate %q: %v", candidate, err)
+		}
+		if !allowed {
+			t.Errorf("candidate %q was not allowed", candidate)
 		}
 	}
 }

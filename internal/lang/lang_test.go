@@ -33,6 +33,14 @@ func TestPrimaryLanguage(t *testing.T) {
 	}
 }
 
+func TestISO6392(t *testing.T) {
+	for in, want := range map[string]string{"en": "eng", "eng": "eng", "pt-BR": "por", "zh-Hant": "zho", "fr": "fra", "fil": "fil", "": "", "und": "", "x-private": "", "unknown": ""} {
+		if got := ISO6392(in); got != want {
+			t.Errorf("ISO6392(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 func TestCanonical(t *testing.T) {
 	cases := []struct {
 		in, want string
@@ -191,5 +199,63 @@ func TestCodeAliases(t *testing.T) {
 		if got := CodeAliases(input); !slices.Equal(got, want) {
 			t.Errorf("CodeAliases(%q) = %v, want %v", input, got, want)
 		}
+	}
+}
+
+func TestMatchRank(t *testing.T) {
+	cases := []struct {
+		candidate string
+		preferred string
+		want      int
+	}{
+		// Exact matches (0)
+		{"en", "en", RankExactMatch},
+		{"en-US", "en-US", RankExactMatch},
+		{"zh-Hans", "zh-Hans", RankExactMatch},
+		{"zh-Hant", "zh-Hant", RankExactMatch},
+		{"fr-CA", "fr-CA", RankExactMatch},
+
+		// Matching script or region (1 or 2)
+		{"zh-Hans-CN", "zh-Hans", RankMatchingScript},
+		{"zh-Hant-TW", "zh-Hant", RankMatchingScript},
+		{"zh-CN", "zh-Hans", RankMatchingScript},
+		{"zh-Hans-foobar", "zh-Hans", RankMatchingScript},
+
+		// Bare language candidate (3)
+		{"fr", "fr-CA", RankBareLanguage},
+		{"en", "en-US", RankBareLanguage},
+		{"zh", "zh-Hans", RankBareLanguage},
+		{"zh", "zh-Hant", RankBareLanguage},
+		{"zh", "zh-TW", RankBareLanguage},
+
+		// Regional variant with compatible script (4)
+		{"fr-BE", "fr-CA", RankRegionalVariant},
+		{"en-GB", "en-US", RankRegionalVariant},
+		{"zh-Hans", "zh", RankRegionalVariant},
+		{"zh-Hant", "zh", RankRegionalVariant},
+		{"zh-HK", "zh-TW", RankRegionalVariant},
+
+		// Conflicting script (5)
+		{"zh-Hant", "zh-Hans", RankScriptConflict},
+		{"zh-Hans", "zh-Hant", RankScriptConflict},
+		{"zh-TW", "zh-Hans", RankScriptConflict},
+		{"zh-CN", "zh-Hant", RankScriptConflict},
+		{"zh-CN", "zh-TW", RankScriptConflict},
+		{"zh-Hant-foobar", "zh-Hans", RankScriptConflict},
+
+		// Mismatch (-1)
+		{"de", "fr-CA", -1},
+		{"", "en", -1},
+		{"en", "", -1},
+		{"und", "en", -1},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.candidate+"_vs_"+tc.preferred, func(t *testing.T) {
+			got := MatchRank(tc.candidate, tc.preferred)
+			if got != tc.want {
+				t.Errorf("MatchRank(%q, %q) = %d, want %d", tc.candidate, tc.preferred, got, tc.want)
+			}
+		})
 	}
 }

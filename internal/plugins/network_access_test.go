@@ -1,10 +1,5 @@
 package plugins
 
-// NOTE (fork, stripped for SDK): this file tested the provider-RPC path
-// (list/connect/disconnect/status through a live fixture plugin), which needs
-// network_access_provider.v1 support in the plugin SDK. The pinned SDK
-// predates it, so these tests are parked until the SDK is updated.
-
 import (
 	"context"
 	"errors"
@@ -20,7 +15,7 @@ import (
 // without a launch, an installation whose process is not running answers
 // unavailable, and once the supervisor has it running the status, connect
 // and disconnect RPCs reach the plugin and refresh the status sink.
-func skippedTestNetworkAccessProvidersAndCommands(t *testing.T) {
+func TestNetworkAccessProvidersAndCommands(t *testing.T) {
 	f := newResidentFixture(t, ResidentOptions{})
 	ctx := context.Background()
 	broker := f.broker
@@ -105,7 +100,7 @@ func skippedTestNetworkAccessProvidersAndCommands(t *testing.T) {
 // advertising its last connected origin: the failed read replaces the cached
 // status with unavailable so the origin check and the node health report
 // stop naming it.
-func skippedTestNetworkAccessFailedRPCReportsUnavailableToTheStatusSink(t *testing.T) {
+func TestNetworkAccessFailedRPCReportsUnavailableToTheStatusSink(t *testing.T) {
 	f := newResidentFixture(t, ResidentOptions{})
 	ctx := context.Background()
 	broker := f.broker

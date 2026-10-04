@@ -55,12 +55,12 @@ func findExactAudioTrack(tracks []models.AudioTrack, sig *userstore.AudioTrackSi
 	// rank language matches instead of taking the first compatible hit: an
 	// exact tag wins over another variant, and a legacy bare-language
 	// signature still matches a regional track when nothing closer exists.
-	best, bestRank := -1, 3
+	best, bestRank := -1, lang.RankScriptConflict+1
 	for i, track := range tracks {
 		if !audioTrackMatchesSignature(track, sig) {
 			continue
 		}
-		if rank := langMatchRank(track.Language, sig.Language); rank < bestRank {
+		if rank := langMatchRank(track.Language, sig.Language); rank >= 0 && rank < bestRank {
 			best, bestRank = i, rank
 		}
 	}

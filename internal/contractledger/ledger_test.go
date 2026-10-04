@@ -878,7 +878,13 @@ func TestConcurrencyMarkingIsRestricted(t *testing.T) {
 // legacy route and so have no ledger row to mark, each with the reason. It
 // is empty today; the reconcile test refuses an unmapped guarded operation
 // that is not listed here.
-var guardedWithoutLegacyRow = map[string]string{}
+var guardedWithoutLegacyRow = map[string]string{
+	"updateRequestRoute":           "V2-only request routing rule: the rule's revision from request_editor_revision_seq is its ETag.",
+	"deleteRequestRoute":           "V2-only request routing rule: deletion is guarded by the rule's revision.",
+	"updateAdminRequestGroupLimit": "V2-only access-group request limit: the limit's revision from request_editor_revision_seq is its ETag; a group with none saved is revision zero.",
+	"updateRequestRouting":         "V2-only request routing mode (Standard or Advanced): the mode's revision from request_editor_revision_seq is its ETag.",
+	"setStoredSubtitleTiming":      "V2-only stored subtitle timing correction: guarded by the viewer subtitle validator, whose revision every subtitle row update bumps.",
+}
 
 // TestGuardedOperationsAreMarkedIfMatch reconciles the v2 registry with the
 // ledger: every operation registered Guarded must have each legacy row that
@@ -1207,8 +1213,30 @@ func TestRetrySafetyMismatchesFire(t *testing.T) {
 // mutation that is not listed here, the same rule guardedWithoutLegacyRow
 // applies to concurrency.
 var mutationWithoutLegacyRow = map[string]string{
+	"syncStoredSubtitle":                   "V2-only subtitle sync (v1 is frozen), coalescing on the subtitle's active job; a replay after it finished starts another job that aligns the same bytes and reaches the same timing.",
+	"setStoredSubtitleTiming":              "V2-only stored subtitle timing correction, guarded by If-Match on the subtitle's revision; replaying the same timing after success answers 412 and changes nothing.",
+	"deleteAccountIdentity":                "V2-only external sign-in (OIDC/LDAP) identity disconnect: v1 had no linked identities to manage. It deletes one identity of the caller's account by id, so a replay after success finds nothing and answers 404, leaving the same state.",
+	"createAdminUserIdentity":              "V2-only administrator link of an account to an external sign-in identity: v1 had no identity management. The identity key and the one-identity-per-provider rule are unique, so a replay is refused with 409 and cannot link twice.",
+	"deleteAdminUserIdentity":              "V2-only administrator unlink of an external sign-in identity: v1 had no identity management. A replay after success finds nothing and answers 404, leaving the same state.",
+	"testAdminPluginAuthBinding":           "V2-only auth plugin connection test on staged settings: v1 had no auth provider checks. It stores nothing but reaches the identity provider or directory, so an uncertain result is not retried automatically.",
+	"createAccountIdentityLinkTicket":      "V2-only link ticket for starting an OAuth linking flow: v1 had no account linking. Each call checks the password and mints a new single-use ticket, so it is non-retryable; an unused ticket expires unredeemed.",
+	"startAccountIdentityLink":             "V2-only web linking start: v1 had no account linking. It consumes a single-use link ticket and opens one provider flow bound to this browser, so a replay finds the ticket spent and answers 404; it is non-retryable.",
+	"completeAccountIdentityLink":          "V2-only confirmation of a native app's linking flow: v1 had no account linking. It redeems a single-use code, so a replay finds the code gone and answers 401 without linking twice; it is non-retryable.",
+	"linkAccountIdentityWithCredentials":   "V2-only directory (LDAP) linking: v1 had no account linking. Each call checks the local password and asks the directory again, and a replay after success is refused with 409 (local_password_required once linking turned local sign-in off, already_linked for a break-glass account) instead of linking twice; it is non-retryable.",
+	"cancelDeviceLogin":                    "V2-only device sign-in withdrawal: v1 had no cancel. It moves only a pending or approved-but-uncollected request to canceled, so a replay converges on the same state and reports it.",
 	"redetectAdminItemMarkers":             "V2-only choice of marker kinds to re-detect: v1 re-detected episode intros only, which redetectAdminEpisodeIntro keeps porting. Work is coalesced per item within the process, so a replay while it runs reports already_running; a later replay analyzes again, so it is non-retryable like the intro action.",
 	"transferAdminUserOwnership":           "V2-only server ownership transfer (issue #1382): v1 had no Owner. Replaying a completed transfer is refused because the caller is no longer the Owner, so it cannot move ownership twice.",
+	"createRequestRoute":                   "V2-only request routing rule (routing replaced the router plugin's per-connection default switches). Creating a rule is non-retryable: a replay adds a second rule.",
+	"updateRequestRoute":                   "V2-only request routing rule replacement, guarded by If-Match on the rule's revision; a replay after success answers 412.",
+	"deleteRequestRoute":                   "V2-only request routing rule deletion, guarded by If-Match on the rule's revision; a replay finds no rule.",
+	"updateAdminRequestGroupLimit":         "V2-only access-group request limit replacement, guarded by If-Match on the limit's revision; a replay after success answers 412.",
+	"updateRequestRouting":                 "V2-only request routing mode switch, guarded by If-Match on the mode's revision; a replay after success answers 412.",
+	"reorderRequestRoutes":                 "V2-only reorder of a media type's routing rules. The body names the full order, so a replay sets the same positions; it is non-retryable because it moves every rule to a new revision.",
+	"previewRequestRoute":                  "V2-only read-only route preview (POST for the request body). It reads TMDB and the rules and writes nothing, so a replay returns the same answer.",
+	"followRequestMedia":                   "V2-only title follow (Requests acceptance AC1/AC5): v1 had no way to follow a title someone else requested. The follow row is keyed by title and profile, so a replay converges on the same follow.",
+	"unfollowRequestMedia":                 "V2-only title unfollow, the inverse of followRequestMedia. Deleting an absent follow is a no-op, so a replay converges on no follow.",
+	"addWatchlistTitle":                    "V2-only watchlist entry for a title the library doesn't have: v1 had no such entries. The entry is keyed by title and profile, but the add can also create or follow a request and, for a title the library has, fires the library watchlist add's provider and refresh effects, so it is non-retryable like addToWatchlist.",
+	"deleteWatchlistTitle":                 "V2-only removal of a watchlist title entry, the inverse of addWatchlistTitle. An absent entry succeeds, but the removal can cancel a watchlist-made request and repeat the library watchlist removal's provider and refresh effects, so it is non-retryable like deleteWatchlistEntry.",
 	"importAdminTMDBList":                  "V2-only administrator import of a public TMDB list: v1 had no TMDB list source. Like the other imports it creates a new collection per call and is non-retryable.",
 	"importTMDBListCollection":             "V2-only personal import of a public TMDB list: v1 had no TMDB list source. Like the other imports it creates a new collection per call and is non-retryable.",
 	"createAdminUserPasswordReset":         "V2-only password reset link issue (issue #1442): v1 had no reset links. Each call replaces the account's single live link, so a replay only supersedes the previous link; it is non-retryable because an emailed link may already have been delivered.",
@@ -1232,6 +1260,7 @@ var mutationWithoutLegacyRow = map[string]string{
 	"startWatchTogetherRoomPlayback":       "V2-only start of a staged lobby item: v1 has no lobby/start split. An already playing room answers with its current snapshot, so a duplicate press cannot restart playback.",
 	"stopWatchTogetherRoomPlayback":        "V2-only stop that keeps the room: v1 only ends a room. A room that is not playing answers with its current snapshot, so repeating the call cannot disturb the lobby it produced.",
 	"updateWatchTogetherRoomSelectionMode": "V2-only lobby mode switch: v1 fixes selection_mode at creation. Repeating the same mode is a no-op; the switch drops the staged item, which is the documented meaning of the value rather than a side effect of retrying.",
+	"regenerateAdminItemTrickplay":         "V2-only seek-bar preview regeneration: v1 had no trickplay. A replay while the files are queued or being made changes nothing, but a later replay makes the previews again, so it is non-retryable like redetectAdminItemMarkers.",
 	"queryWatchTogetherMemberState":        "V2-only POST-shaped read: the content id set (up to 200) exceeds what a query string carries. It changes no state; repeating it returns the current classification.", "refreshVirtualCandidates": "V2-only explicit re-list of a virtual item's provider candidates; v1 had no endpoint for this and re-resolved on demand. The legacy watch and playback rows remain mapped separately.",
 	"requestVirtualRelease":          "V2-only request of an indexer release on the provider; v1 had no indexer-release surface. domain_identity: the persisted release row is the identity, so a duplicate request for an already-queued release returns the same queued state without a second enqueue.",
 	"cancelVirtualCandidatesRefresh": "V2-only owner cancellation of the managed virtual-candidates refresh job; v1 had no such endpoint. The job state machine makes repeated cancellation requests converge on the same terminal canceled state.",

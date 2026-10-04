@@ -89,6 +89,10 @@ Apple and Google stores, and a server that plays arbitrary remote stream URLs pu
 client suite at risk. This is settled product direction, not a design problem to solve; do not
 write code for it, and say so plainly if asked.
 
+Vio fork exception: this fork does not adopt the upstream non-goals above — see
+[fork-divergence](docs/architecture/fork-divergence.md). Remote/debrid-backed library
+integrations may be explored here; the store risk stands and any shipped integration owns it.
+
 ## Gotchas
 
 The first two are irreversible — data loss, not inconvenience. Treat them as absolute.

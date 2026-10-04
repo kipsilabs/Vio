@@ -2,32 +2,45 @@ package plugins
 
 import (
 	"context"
-	"strings"
 	"testing"
 
+	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
 	"github.com/Silo-Server/silo-server/internal/netaccess"
+	"github.com/Silo-Server/silo-server/internal/pluginhost"
 )
 
-// NOTE (fork, stripped for SDK): provider RPCs need
-// network_access_provider.v1 client support in the plugin SDK, which the
-// pinned SDK predates. applyNetworkAccess answers unavailable for any
-// operation; this pins that contract.
-func TestNetworkAccessApplyAnswersUnavailable(t *testing.T) {
+func TestNetworkAccessLateRPCDoesNotRestoreRevokedOrReplacedStatus(t *testing.T) {
 	f := newResidentFixture(t, ResidentOptions{})
+	f.service.SetNetworkAccessStatusSink(f.broker)
 	ctx := context.Background()
-	provider := NetworkAccessProvider{InstallationID: 5, CapabilityID: "stub", Provider: "stub", DisplayName: "Stub Overlay"}
-
-	got := f.service.applyNetworkAccess(ctx, provider)
-	if got.InstallationID != 5 || got.Provider != "stub" {
-		t.Fatalf("identity = %+v", got)
+	f.service.StartResidents(ctx)
+	waitState(t, f.service, 5, "running", running)
+	provider, err := f.service.networkAccessProvider(ctx, "stub")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if got.State != netaccess.StateUnavailable {
-		t.Fatalf("state = %q, want unavailable", got.State)
+	token, ok := f.broker.IngressToken(5)
+	if !ok {
+		t.Fatal("no token issued")
 	}
-	if !strings.Contains(got.Error, "plugin SDK") {
-		t.Fatalf("error = %q, want the SDK reason", got.Error)
-	}
+	f.service.applyNetworkAccess(ctx, provider, func(context.Context, *pluginhost.NetworkAccessProviderClient) (*pluginv1.NetworkAccessStatus, error) {
+		// A successful RPC response arrives, then the process stops before
+		// the caller can publish that response to the shared cache.
+		f.broker.Revoke(5, token)
+		return &pluginv1.NetworkAccessStatus{State: netaccess.StateConnected, Origin: "https://old.example.test"}, nil
+	})
 	if _, ok := f.broker.Status.Get(5); ok {
-		t.Fatal("unavailable answer populated the status cache")
+		t.Fatal("late RPC response restored a revoked origin")
+	}
+	fresh, err := f.broker.Issue(5, "stub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.broker.ReportFor(5, fresh, netaccess.Status{InstallationID: 5, Provider: "stub", State: netaccess.StateDisconnected})
+	f.service.applyNetworkAccess(ctx, provider, func(context.Context, *pluginhost.NetworkAccessProviderClient) (*pluginv1.NetworkAccessStatus, error) {
+		return &pluginv1.NetworkAccessStatus{State: netaccess.StateConnected, Origin: "https://old.example.test"}, nil
+	})
+	if got, ok := f.broker.Status.Get(5); !ok || got.State != netaccess.StateDisconnected {
+		t.Fatalf("old client overwrote replacement status: %+v %v", got, ok)
 	}
 }

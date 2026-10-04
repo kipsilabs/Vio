@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import ViewTransitionLink from "@/components/ViewTransitionLink";
 import MediaCarousel from "@/components/MediaCarousel";
 import { useCatalogItemDetail } from "@/hooks/queries/catalogRead";
@@ -17,7 +18,9 @@ interface RecommendationGridProps {
 interface RecommendationItemCardProps {
   itemId: string;
   showCaption: boolean;
-  className: string;
+  // Sized by the row's wrapper in the default grid; direct card users pass
+  // their own width classes.
+  className?: string;
   onTerminalError: (itemId: string) => void;
 }
 
@@ -91,10 +94,41 @@ function RecommendationItemCard({
   );
 }
 
-export default function RecommendationGrid({ items, maxItems = 12 }: RecommendationGridProps) {
+interface MoreLikeThisRowProps<T> {
+  items: T[];
+  itemKey: (item: T) => string;
+  renderItem: (item: T, showCaption: boolean) => ReactNode;
+  maxItems?: number;
+}
+
+/**
+ * The "More Like This" rail on detail pages: poster-width slides inside the
+ * page shell, sized by the viewer's card settings. Library items and titles
+ * known only from TMDB supply their own cards.
+ */
+export function MoreLikeThisRow<T>({
+  items,
+  itemKey,
+  renderItem,
+  maxItems = MAX_MORE_LIKE_THIS_ITEMS,
+}: MoreLikeThisRowProps<T>) {
   const { cardPresentation } = useUICustomization();
   const itemLimit = Math.max(0, Math.min(maxItems, MAX_MORE_LIKE_THIS_ITEMS));
   const posterWidthClasses = carouselCardWidthClasses(cardPresentation.poster_size);
+  const showCaption = cardPresentation.caption !== "artwork";
+
+  return (
+    <MediaCarousel title="More Like This" edgePadding={false}>
+      {items.slice(0, itemLimit).map((item) => (
+        <div key={itemKey(item)} className={posterWidthClasses}>
+          {renderItem(item, showCaption)}
+        </div>
+      ))}
+    </MediaCarousel>
+  );
+}
+
+export default function RecommendationGrid({ items, maxItems = 12 }: RecommendationGridProps) {
   const [failedItemIds, setFailedItemIds] = useState<ReadonlySet<string>>(() => new Set());
 
   const handleTerminalError = useCallback((itemId: string) => {
@@ -111,16 +145,17 @@ export default function RecommendationGrid({ items, maxItems = 12 }: Recommendat
   const visibleItems = items.filter((si) => !failedItemIds.has(si.content_id));
 
   return (
-    <MediaCarousel title="More Like This" edgePadding={false}>
-      {visibleItems.slice(0, itemLimit).map((si) => (
+    <MoreLikeThisRow
+      items={visibleItems}
+      maxItems={maxItems}
+      itemKey={(item) => item.content_id}
+      renderItem={(item, showCaption) => (
         <RecommendationItemCard
-          key={si.content_id}
-          itemId={si.content_id}
-          showCaption={cardPresentation.caption !== "artwork"}
-          className={posterWidthClasses}
+          itemId={item.content_id}
+          showCaption={showCaption}
           onTerminalError={handleTerminalError}
         />
-      ))}
-    </MediaCarousel>
+      )}
+    />
   );
 }

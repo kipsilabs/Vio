@@ -5,6 +5,9 @@ import (
 	"net"
 	"strings"
 
+	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
+	"github.com/Silo-Server/silo-plugin-sdk/pkg/pluginsdk/capability"
+
 	"github.com/Silo-Server/silo-server/internal/netaccess"
 )
 
@@ -72,10 +75,56 @@ type NetworkAccessBroker interface {
 	ReportFor(installationID int, token string, status netaccess.Status) (previous netaccess.Status, changed bool, accepted bool)
 }
 
-// NOTE (fork, stripped for SDK): provider detection from manifests needs
-// network_access_provider.v1 descriptor support in the plugin SDK, which the
-// pinned SDK predates. No installation is treated as a provider until the
-// SDK is updated.
+// NetworkAccessProviderSlug returns the provider slug a manifest declares
+// through network_access_provider.v1 (the typed descriptor's provider, or the
+// capability id when the descriptor is absent) and whether it declares one.
+func NetworkAccessProviderSlug(manifest *pluginv1.PluginManifest) (string, bool) {
+	descriptor, slug := NetworkAccessProviderCapability(manifest)
+	return slug, descriptor != nil
+}
+
+// NetworkAccessProviderCapability returns the manifest's
+// network_access_provider.v1 descriptor and the provider slug it declares
+// (the typed descriptor's provider, or the capability id when the descriptor
+// is absent). The descriptor is nil when the manifest declares none; a
+// manifest declares at most one, so the first wins.
+func NetworkAccessProviderCapability(manifest *pluginv1.PluginManifest) (*pluginv1.CapabilityDescriptor, string) {
+	for _, descriptor := range manifest.GetCapabilities() {
+		if descriptor.GetType() != capability.NetworkAccessProvider {
+			continue
+		}
+		if slug := strings.TrimSpace(descriptor.GetNetworkAccessProvider().GetProvider()); slug != "" {
+			return descriptor, slug
+		}
+		if id := strings.TrimSpace(descriptor.GetId()); id != "" {
+			return descriptor, id
+		}
+	}
+	return nil, ""
+}
+
+// NetworkAccessStatusFromProto converts a provider's reported status into the
+// host's SDK-free form. Both the push (ReportNetworkAccessStatus) and the
+// on-demand reads the admin API makes go through it so the status cache and
+// the API agree on every field.
+func NetworkAccessStatusFromProto(installationID int, provider string, reported *pluginv1.NetworkAccessStatus) netaccess.Status {
+	entry := netaccess.Status{
+		InstallationID:   installationID,
+		Provider:         provider,
+		State:            strings.TrimSpace(reported.GetState()),
+		Hostname:         reported.GetHostname(),
+		Origin:           reported.GetOrigin(),
+		Addresses:        append([]string(nil), reported.GetAddresses()...),
+		AuthURL:          reported.GetAuthUrl(),
+		Error:            reported.GetError(),
+		ProviderVersion:  reported.GetProviderVersion(),
+		DesiredConnected: reported.GetDesiredConnected(),
+	}
+	for _, listener := range reported.GetListeners() {
+		entry.Listeners = append(entry.Listeners, netaccess.Listener{Name: listener.GetName(), Origin: listener.GetOrigin()})
+	}
+	return entry
+}
 
 // LoopbackDialAddress turns a listen address into the host:port a plugin in
 // the same process namespace dials: a wildcard or empty host becomes

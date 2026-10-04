@@ -47,6 +47,11 @@ func TestPlanPlaybackV3HEVCTranscodeSelectionAndFallbacks(t *testing.T) {
 	}
 }
 
+// A failed HEVC attempt falls back to H.264 at the H.264 bitrate; H.264
+// stays the universal HLS output. (Upstream's exact rung-table tests for
+// source-bitrate bounds, decoder-bounded H.264 sizing and the 2160p cap do
+// not apply to Vio's retained planner; equivalent fork invariants are
+// follow-up work — see docs/architecture/fork-divergence.md.)
 func TestPlanPlaybackV3HEVCFailureFallsBackToH264(t *testing.T) {
 	input := hevcTranscodePlannerInputV3(true, true, true)
 	first := PlanPlaybackV3(input)

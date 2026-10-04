@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary/stream"
@@ -296,5 +297,32 @@ func TestProcessCandidatesKeeperMapFilteredByCap(t *testing.T) {
 	lastKeeperID := stream.CandidateVariantID(in[len(in)-2])
 	if mapped, ok := dropped[lastVariantID]; ok {
 		t.Fatalf("dropped[last variant] = %q, want the entry removed (keeper %q was cut)", mapped, lastKeeperID)
+	}
+}
+
+func TestCandidateDedupNameFallsBackToDescription(t *testing.T) {
+	// A listing entry with no usable name, title, filename, or URL base —
+	// exactly the shape that persisted identity-less rows in prod — still
+	// derives identity from the description's first line when it names a
+	// release.
+	bare := StreamCandidate{
+		Description: "Frieren.Beyond.Journeys.End.S01E03.1080p.CR.WEB-DL.H264-ToonsHub\n1.6 GB",
+	}
+	if got := candidateDedupName(bare); got == "" || !strings.Contains(got, "toonshub") {
+		t.Fatalf("description-derived name = %q, want the ToonsHub release identity", got)
+	}
+	// A bare spec line must never become identity: it would collide across
+	// unrelated releases sharing a resolution.
+	specLine := StreamCandidate{Description: "1080p"}
+	if got := candidateDedupName(specLine); got != "" {
+		t.Fatalf("spec-line description produced identity %q, want empty", got)
+	}
+	// Existing tiers keep precedence: a real Name wins over Description.
+	realName := StreamCandidate{
+		Name:        "Frieren.Beyond.Journeys.End.S01E03.2160p.WEB-DL.H265-CSWEB",
+		Description: "Something.Else.2024.1080p.WEB-DL.x264-OTHER",
+	}
+	if got, want := candidateDedupName(realName), candidateDedupName(StreamCandidate{Name: "Frieren.Beyond.Journeys.End.S01E03.2160p.WEB-DL.H265-CSWEB"}); got != want {
+		t.Fatalf("name-tier precedence broken: %q vs %q", got, want)
 	}
 }

@@ -1119,11 +1119,12 @@ func (m *TranscodeManager) CloseTranscodeSession(sessionID, transcodeNodeURL str
 	retained := m.retired[sessionID]
 	delete(m.retired, sessionID)
 	stopRetainedTimerLocked(retained)
+	reaped := retained == nil || claimRetainedReapedLocked(retained)
 	m.transcodeMu.Unlock()
 	if session != nil {
 		_ = session.Close()
 	}
-	if retained != nil && retained.Session != nil {
+	if reaped && retained != nil && retained.Session != nil {
 		_ = retained.Session.Close()
 	}
 
@@ -1138,6 +1139,13 @@ func (m *TranscodeManager) CloseTranscodeSession(sessionID, transcodeNodeURL str
 type RetainedGeneration struct {
 	Session   *TranscodeSession
 	ExpiresAt time.Time
+	// reaped is closed exactly once by whichever path (timer, read, close, or
+	// shutdown) wins the entry. Every path Closes the session outside the map
+	// lock, and time.AfterFunc may already be running when another path wins
+	// the entry (Stop does not wait for a running callback), so the loser must
+	// skip its Close rather than double-closing the session. Guarded by
+	// transcodeMu.
+	reaped chan struct{}
 	// timer reaps the entry at ExpiresAt even when no serve request ever reads
 	// it. Read-time reaping alone would leave a displaced directory pinned past
 	// its window when a switch is lost before a successor is registered (for
@@ -1178,14 +1186,23 @@ func (m *TranscodeManager) RetireTranscodeSessionPredecessor(sessionID string, p
 	}
 	// Replace any prior retained generation: only the most recently displaced
 	// bytes can still match the client's in-flight playlist. Its timer is
-	// stopped so a replaced entry cannot fire later.
+	// stopped so a replaced entry cannot fire later. Its reaped channel is
+	// claimed here, so a timer already running when this replacement wins
+	// cannot double-close the displaced session. The entry is swapped under
+	// the same lock acquisition that claimed the prior, so a racing timer
+	// that already passed its map check finds neither entry and reaps
+	// nothing.
 	if prior := m.retired[sessionID]; prior != nil {
 		stopRetainedTimerLocked(prior)
-		if prior.Session != nil && prior.Session != predecessor {
+		reaped := claimRetainedReapedLocked(prior)
+		delete(m.retired, sessionID)
+		if reaped && prior.Session != nil && prior.Session != predecessor {
+			m.transcodeMu.Unlock()
 			_ = prior.Session.Close()
+			m.transcodeMu.Lock()
 		}
 	}
-	entry := &RetainedGeneration{Session: predecessor, ExpiresAt: time.Now().Add(retention)}
+	entry := &RetainedGeneration{Session: predecessor, ExpiresAt: time.Now().Add(retention), reaped: make(chan struct{})}
 	m.retired[sessionID] = entry
 	// Reap at expiry even if no serve request ever reads the entry, so a switch
 	// lost before its successor is published cannot pin the directory past the
@@ -1199,7 +1216,10 @@ func (m *TranscodeManager) RetireTranscodeSessionPredecessor(sessionID string, p
 // reapRetainedIfCurrent removes and closes a retained generation only while the
 // map still holds this exact entry, so a replacement or an earlier read that
 // already reaped it is left untouched. It is the timer-driven counterpart of
-// the read-time reap in GetRetainedTranscodeSession.
+// the read-time reap in GetRetainedTranscodeSession. The entry's reaped channel
+// fences the Close against a racing read: time.AfterFunc may already be running
+// when a read wins the entry, and Stop does not wait for it, so the loser must
+// skip its Close rather than double-closing the session.
 func (m *TranscodeManager) reapRetainedIfCurrent(sessionID string, entry *RetainedGeneration) {
 	if m == nil || entry == nil {
 		return
@@ -1210,7 +1230,11 @@ func (m *TranscodeManager) reapRetainedIfCurrent(sessionID string, entry *Retain
 		return
 	}
 	delete(m.retired, sessionID)
+	reaped := claimRetainedReapedLocked(entry)
 	m.transcodeMu.Unlock()
+	if !reaped {
+		return
+	}
 	if entry.Session != nil {
 		_ = entry.Session.Close()
 	}
@@ -1226,9 +1250,29 @@ func stopRetainedTimerLocked(entry *RetainedGeneration) {
 	}
 }
 
+// claimRetainedReapedLocked closes the entry's reaped channel iff this path is
+// the first to reap it, reporting whether the caller owns the Close. Callers
+// already hold transcodeMu.
+func claimRetainedReapedLocked(entry *RetainedGeneration) bool {
+	if entry.reaped == nil {
+		entry.reaped = make(chan struct{})
+		close(entry.reaped)
+		return true
+	}
+	select {
+	case <-entry.reaped:
+		return false
+	default:
+		close(entry.reaped)
+		return true
+	}
+}
+
 // GetRetainedTranscodeSession returns a displaced generation still inside its
 // overlap window, or nil. It reaps an expired entry (deleting its output dir)
 // on read; the entry's own timer reaps it out-of-band when no read arrives.
+// The reaped channel fences the Close against a racing timer (see
+// reapRetainedIfCurrent).
 func (m *TranscodeManager) GetRetainedTranscodeSession(sessionID string) *TranscodeSession {
 	if m == nil {
 		return nil
@@ -1242,8 +1286,9 @@ func (m *TranscodeManager) GetRetainedTranscodeSession(sessionID string) *Transc
 	if !time.Now().Before(entry.ExpiresAt) {
 		delete(m.retired, sessionID)
 		stopRetainedTimerLocked(entry)
+		reaped := claimRetainedReapedLocked(entry)
 		m.transcodeMu.Unlock()
-		if entry.Session != nil {
+		if reaped && entry.Session != nil {
 			_ = entry.Session.Close()
 		}
 		return nil
@@ -1271,8 +1316,12 @@ func (m *TranscodeManager) StartShutdownCleanup(ctx context.Context) <-chan stru
 		m.transcodes = make(map[string]*TranscodeSession)
 		retired := m.retired
 		m.retired = make(map[string]*RetainedGeneration)
+		reaped := make([]*RetainedGeneration, 0, len(retired))
 		for _, entry := range retired {
 			stopRetainedTimerLocked(entry)
+			if entry != nil && claimRetainedReapedLocked(entry) {
+				reaped = append(reaped, entry)
+			}
 		}
 		m.transcodeMu.Unlock()
 		for _, session := range transcodes {
@@ -1280,8 +1329,8 @@ func (m *TranscodeManager) StartShutdownCleanup(ctx context.Context) <-chan stru
 				_ = session.Close()
 			}
 		}
-		for _, entry := range retired {
-			if entry != nil && entry.Session != nil {
+		for _, entry := range reaped {
+			if entry.Session != nil {
 				_ = entry.Session.Close()
 			}
 		}

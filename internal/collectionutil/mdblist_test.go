@@ -535,3 +535,20 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 	return f(r)
 }
+
+func TestMDBListHTTPClientBoundsRequests(t *testing.T) {
+	t.Parallel()
+
+	if got := MDBListHTTPClient(nil).Timeout; got != MDBListRequestTimeout {
+		t.Fatalf("nil base timeout = %v, want %v", got, MDBListRequestTimeout)
+	}
+	if got := MDBListHTTPClient(&http.Client{}).Timeout; got != MDBListRequestTimeout {
+		t.Fatalf("unbounded base timeout = %v, want %v", got, MDBListRequestTimeout)
+	}
+	if got := MDBListHTTPClient(&http.Client{Timeout: 5 * time.Second}).Timeout; got != 5*time.Second {
+		t.Fatalf("explicit base timeout = %v, want 5s", got)
+	}
+	if http.DefaultClient.Timeout != 0 {
+		t.Fatal("MDBListHTTPClient mutated http.DefaultClient")
+	}
+}

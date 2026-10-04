@@ -472,10 +472,14 @@ describe("AdminPluginDetail", () => {
     expect(screen.getByText(heading)).toBeInTheDocument();
   });
 
-  it("shows no tier notice for Silo's own plugins", () => {
-    renderPage();
-    expect(screen.queryByRole("note")).not.toBeInTheDocument();
-  });
+  it.each(["silo", "vio"] as const)(
+    "shows no tier notice for %s first-party plugins",
+    (sourceKind) => {
+      installationsQuery = query([makeInstallation({ source_kind: sourceKind })]);
+      renderPage();
+      expect(screen.queryByRole("note")).not.toBeInTheDocument();
+    },
+  );
 
   it("renders setup Markdown as text, never as HTML", () => {
     const { container } = renderPage();

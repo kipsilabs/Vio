@@ -47,8 +47,6 @@ type Config struct {
 	// GlobalConfigSetter persists SetGlobalConfigEntry calls from plugins. When
 	// nil, SetGlobalConfigEntry returns an error.
 	GlobalConfigSetter GlobalConfigSetter
-	// VirtualCatalog owns virtual media registration requested by plugins.
-	VirtualCatalog VirtualCatalogRegistrar
 	// HostInfo answers GetHostInfo. When nil, GetHostInfo is Unimplemented.
 	HostInfo HostInfoFunc
 	// InstanceState persists ReadInstanceState / WriteInstanceState for this
@@ -87,7 +85,6 @@ type Host struct {
 	catalogPresence     CatalogPresenceLookup
 	installedPlugins    InstalledPluginLister
 	globalConfigSetter  GlobalConfigSetter
-	virtualCatalog      VirtualCatalogRegistrar
 	hostInfo            HostInfoFunc
 	instanceState       InstanceStateStore
 	runtimeHostForStart func(context.Context) (HostInfoFunc, InstanceStateStore, error)
@@ -147,7 +144,6 @@ func NewHost(cfg Config) *Host {
 		catalogPresence:     cfg.CatalogPresence,
 		installedPlugins:    cfg.InstalledPlugins,
 		globalConfigSetter:  cfg.GlobalConfigSetter,
-		virtualCatalog:      cfg.VirtualCatalog,
 		hostInfo:            cfg.HostInfo,
 		instanceState:       cfg.InstanceState,
 		runtimeHostForStart: cfg.RuntimeHostForStart,
@@ -194,18 +190,26 @@ func (h *Host) Start(ctx context.Context, req StartRequest) (*Client, error) {
 	}
 	h.mu.Unlock()
 
-	// NOTE (fork, stripped for SDK): network access provider detection needs
-	// network_access_provider.v1 descriptor support in the plugin SDK, which
-	// the pinned SDK predates. No installation is treated as a provider, so
-	// no ingress token is issued until the SDK is updated.
-	provider := ""
+	// A network access provider gets a fresh ingress token for this process
+	// instance before it can ask GetHostInfo for it. Config test-runs
+	// (negative installation ids) are not persisted installations and get
+	// none.
+	provider, isProvider := NetworkAccessProviderSlug(req.Manifest)
 	var ingressToken string
+	if !isProvider || req.InstallationID <= 0 || h.networkAccess == nil {
+		provider = ""
+	} else {
+		token, err := h.networkAccess.Issue(req.InstallationID, provider)
+		if err != nil {
+			return nil, fmt.Errorf("issue ingress token: %w", err)
+		}
+		ingressToken = token
+	}
 
 	command := exec.Command(req.BinaryPath)
 	process := plugin.NewClient(&plugin.ClientConfig{
 		HandshakeConfig: HandshakeConfig(),
 		GRPCDialOptions: []grpc.DialOption{grpc.WithChainUnaryInterceptor(observePluginRPC)},
-		AutoMTLS:        true,
 		AllowedProtocols: []plugin.Protocol{
 			plugin.ProtocolGRPC,
 		},
@@ -528,7 +532,7 @@ func (h *Host) stopInstance(instance *instance) {
 //
 // Skipped when no RuntimeHost services are configured.
 func (h *Host) bindRuntimeHost(ctx context.Context, sdkClient *sdkruntime.Client, pluginID string, installationID int, provider, ingressToken string, hostInfo HostInfoFunc, instanceState InstanceStateStore) error {
-	if h.eventPublisher == nil && h.libraryLister == nil && h.catalogPresence == nil && h.installedPlugins == nil && h.globalConfigSetter == nil && h.virtualCatalog == nil &&
+	if h.eventPublisher == nil && h.libraryLister == nil && h.catalogPresence == nil && h.installedPlugins == nil && h.globalConfigSetter == nil &&
 		hostInfo == nil && instanceState == nil && h.networkAccess == nil {
 		return nil
 	}
@@ -549,7 +553,6 @@ func (h *Host) bindRuntimeHost(ctx context.Context, sdkClient *sdkruntime.Client
 			Catalog:               h.catalogPresence,
 			InstalledPlugins:      h.installedPlugins,
 			GlobalConfigSetter:    h.globalConfigSetter,
-			VirtualCatalog:        h.virtualCatalog,
 			HostInfo:              hostInfo,
 			InstanceState:         instanceState,
 			NetworkAccess:         h.networkAccess,
@@ -560,8 +563,6 @@ func (h *Host) bindRuntimeHost(ctx context.Context, sdkClient *sdkruntime.Client
 			IngressToken:          ingressToken,
 		})
 		pluginv1.RegisterRuntimeHostServer(s, srv)
-		reader, _ := h.virtualCatalog.(releaseOverrideReader)
-		registerReleaseOverrideRPC(s, reader, installationID)
 		return s
 	})
 

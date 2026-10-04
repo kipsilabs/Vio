@@ -10,8 +10,6 @@ import (
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
 	"google.golang.org/protobuf/types/known/structpb"
-
-	"github.com/Silo-Server/silo-server/internal/pluginhost"
 )
 
 type fakeServiceConfigStore struct {
@@ -300,6 +298,94 @@ func TestSetGlobalConfigWithClearsPreservesAndExplicitlyClearsNestedSecretObject
 	}
 	if _, present := store.puts[1].value["connection"]; present {
 		t.Fatalf("explicitly cleared connection remained: %#v", store.puts[1].value)
+	}
+}
+
+// TestSetGlobalConfigClearsEmptiedNonSecretFields: an admin who empties a
+// declared non-secret field (an explicit "" or null) clears what was stored,
+// even when the field's schema would refuse an empty value, while a blank
+// secret keeps the stored one and undeclared plugin-owned fields stay.
+func TestSetGlobalConfigClearsEmptiedNonSecretFields(t *testing.T) {
+	manifest := connectionTestManifest(t, "silo.auth.oidc", "0.1.0")
+	manifest.GlobalConfigSchema[0].JsonSchema = `{
+		"type":"object",
+		"properties":{
+			"issuer_url":{"type":"string"},
+			"client_secret":{"type":"string","writeOnly":true},
+			"allowed_groups":{"type":"string"},
+			"scopes":{"type":"string"},
+			"ca_pem":{"type":"string"},
+			"refresh_token_lifetime":{"type":"string","pattern":"^[0-9]+d$"},
+			"max_age":{"type":"integer","minimum":1}
+		},
+		"additionalProperties":false
+	}`
+	manifest.GlobalConfigSchema[0].AdminForm = nil
+	installPath := writeInstalledPluginManifest(t, manifest)
+	store := &fakeServiceConfigStore{configsByInstallation: map[int][]*RuntimeConfig{
+		7: {{
+			InstallationID: 7,
+			Key:            "connection",
+			Value: map[string]any{
+				"issuer_url":             "https://idp.example.invalid",
+				"client_secret":          "stored-secret",
+				"allowed_groups":         "silo-users",
+				"scopes":                 "openid groups",
+				"ca_pem":                 "-----BEGIN CERTIFICATE-----",
+				"refresh_token_lifetime": "30d",
+				"max_age":                float64(60),
+				"plugin_owned":           "retained",
+			},
+		}},
+	}}
+	service := &Service{
+		installations: newFakeServiceInstallationStore(&Installation{
+			ID:          7,
+			PluginID:    manifest.GetPluginId(),
+			Version:     manifest.GetVersion(),
+			InstallPath: installPath,
+			Enabled:     true,
+		}),
+		configs: store,
+	}
+	submitted := map[string]any{
+		"issuer_url":             "https://idp.example.invalid",
+		"client_secret":          "",
+		"allowed_groups":         "",
+		"scopes":                 "   ",
+		"ca_pem":                 nil,
+		"refresh_token_lifetime": "",
+		"max_age":                nil,
+	}
+
+	// A connection test sees the cleared draft too.
+	staged, err := service.prepareStagedGlobalConfig(context.Background(), 7, manifest, "connection", submitted, nil, func(err error) error { return err })
+	if err != nil {
+		t.Fatalf("staged: %v", err)
+	}
+	if err := service.SetGlobalConfigWithClears(context.Background(), 7, "connection", submitted, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.puts) != 1 {
+		t.Fatalf("put calls = %d, want 1", len(store.puts))
+	}
+	want := map[string]any{
+		"issuer_url":    "https://idp.example.invalid",
+		"client_secret": "stored-secret",
+		"plugin_owned":  "retained",
+	}
+	for name, got := range map[string]map[string]any{"saved": store.puts[0].value, "staged": staged} {
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("%s config = %#v, want %#v", name, got, want)
+		}
+	}
+
+	// Clearing an undeclared field is not a clear: it is validated (and
+	// refused) like any other undeclared value.
+	err = service.SetGlobalConfigWithClears(context.Background(), 7, "connection", map[string]any{"plugin_owned": nil}, nil)
+	var validationErr *ConfigValidationError
+	if !errors.As(err, &validationErr) || len(store.puts) != 1 {
+		t.Fatalf("undeclared clear: err = %v, puts = %d", err, len(store.puts))
 	}
 }
 
@@ -730,36 +816,6 @@ func TestServiceTestGlobalConfigReturnsUnsupportedWithoutStartingPlugin(t *testi
 	}
 }
 
-func TestServiceTestGlobalConfigAcceptsRequestRouterConnectionChecks(t *testing.T) {
-	manifest := connectionTestManifest(t, "com.example.virtual", "0.1.0")
-	manifest.GlobalConfigSchema[0].JsonSchema = `{"type":"object","properties":{},"additionalProperties":false}`
-	manifest.Capabilities = []*pluginv1.CapabilityDescriptor{{
-		Type: "request_router.v1",
-		Id:   "virtual-requests",
-	}}
-	installPath := writeInstalledPluginManifest(t, manifest)
-	host := &fakeServiceHost{startResult: &fakePluginClient{manifest: manifest}}
-	service := &Service{
-		installations: newFakeServiceInstallationStore(&Installation{
-			ID: 9, PluginID: manifest.GetPluginId(), Version: manifest.GetVersion(), InstallPath: installPath,
-		}),
-		host: host,
-	}
-	originalProbe := runPluginConnectionCheck
-	t.Cleanup(func() { runPluginConnectionCheck = originalProbe })
-	probed := false
-	runPluginConnectionCheck = func(context.Context, pluginClient, *pluginv1.PluginManifest) error {
-		probed = true
-		return nil
-	}
-	if err := service.TestGlobalConfig(context.Background(), 9, "connection", map[string]any{}); err != nil {
-		t.Fatalf("TestGlobalConfig() returned error: %v", err)
-	}
-	if !probed {
-		t.Fatal("request-router connection check was not invoked")
-	}
-}
-
 func TestServiceTestGlobalConfigStopsTemporaryInstanceOnProbeFailure(t *testing.T) {
 	originalProbe := runPluginConnectionCheck
 	t.Cleanup(func() {
@@ -856,190 +912,6 @@ func TestServiceTestGlobalConfigUsesUniqueTemporaryInstallationIDs(t *testing.T)
 	}
 }
 
-func TestConnectionCheckCapabilityIDUsesVirtualStreamProvider(t *testing.T) {
-	manifest := connectionTestManifest(t, "com.example.virtual", "0.1.0")
-	manifest.Capabilities = []*pluginv1.CapabilityDescriptor{{
-		Type: virtualStreamProviderCapabilityType,
-		Id:   "virtual-connection",
-	}}
-
-	capabilityType, capabilityID, err := connectionCheckCapabilityID(manifest)
-	if err != nil {
-		t.Fatalf("connectionCheckCapabilityID() error = %v", err)
-	}
-	if capabilityType != virtualStreamProviderCapabilityType {
-		t.Fatalf("capability type = %q, want %q", capabilityType, virtualStreamProviderCapabilityType)
-	}
-	if capabilityID != "virtual-connection" {
-		t.Fatalf("capability id = %q, want virtual-connection", capabilityID)
-	}
-}
-
-func TestConnectionCheckCapabilityIDPrefersRequestRouterOverVirtualStreamProvider(t *testing.T) {
-	manifest := connectionTestManifest(t, "com.example.virtual", "0.1.0")
-	manifest.Capabilities = []*pluginv1.CapabilityDescriptor{
-		{
-			Type: virtualStreamProviderCapabilityType,
-			Id:   "virtual-connection",
-		},
-		{
-			Type: "request_router.v1",
-			Id:   "virtual-requests",
-		},
-	}
-
-	capabilityType, capabilityID, err := connectionCheckCapabilityID(manifest)
-	if err != nil {
-		t.Fatalf("connectionCheckCapabilityID() error = %v", err)
-	}
-	if capabilityType != "request_router.v1" {
-		t.Fatalf("capability type = %q, want request_router.v1", capabilityType)
-	}
-	if capabilityID != "virtual-requests" {
-		t.Fatalf("capability id = %q, want virtual-requests", capabilityID)
-	}
-}
-
-func TestConnectionCheckCapabilityIDPrefersVirtualStreamProviderOverMetadataProvider(t *testing.T) {
-	manifest := connectionTestManifest(t, "com.example.virtual", "0.1.0")
-	manifest.Capabilities = []*pluginv1.CapabilityDescriptor{
-		{
-			Type: "metadata_provider.v1",
-			Id:   "metadata",
-		},
-		{
-			Type: virtualStreamProviderCapabilityType,
-			Id:   "virtual-connection",
-		},
-	}
-
-	capabilityType, capabilityID, err := connectionCheckCapabilityID(manifest)
-	if err != nil {
-		t.Fatalf("connectionCheckCapabilityID() error = %v", err)
-	}
-	if capabilityType != virtualStreamProviderCapabilityType {
-		t.Fatalf("capability type = %q, want %q", capabilityType, virtualStreamProviderCapabilityType)
-	}
-	if capabilityID != "virtual-connection" {
-		t.Fatalf("capability id = %q, want virtual-connection", capabilityID)
-	}
-}
-
-func TestConnectionCheckCapabilityIDReturnsUnsupportedWithoutSupportedCapability(t *testing.T) {
-	manifest := connectionTestManifest(t, "com.example.simple", "0.1.0")
-	manifest.Capabilities = []*pluginv1.CapabilityDescriptor{{
-		Type: "scheduled_task.v1",
-		Id:   "refresh",
-	}}
-
-	_, _, err := connectionCheckCapabilityID(manifest)
-	if !errors.Is(err, ErrConnectionTestUnsupported) {
-		t.Fatalf("connectionCheckCapabilityID() error = %v, want ErrConnectionTestUnsupported", err)
-	}
-}
-
-func TestRunPluginConnectionCheckProbesVirtualStreamProvider(t *testing.T) {
-	var gotRequest *pluginv1.ListVirtualStreamProfilesRequest
-	grpcClient := &fakeVirtualStreamGRPCClient{
-		profilesFunc: func(
-			_ context.Context,
-			request *pluginv1.ListVirtualStreamProfilesRequest,
-		) (*pluginv1.ListVirtualStreamProfilesResponse, error) {
-			gotRequest = request
-			return &pluginv1.ListVirtualStreamProfilesResponse{
-				Profiles: []*pluginv1.VirtualStreamProfile{{Label: "1080p"}},
-			}, nil
-		},
-	}
-	manifest := connectionTestManifest(t, "com.example.virtual", "0.1.0")
-	manifest.Capabilities = []*pluginv1.CapabilityDescriptor{{
-		Type: virtualStreamProviderCapabilityType,
-		Id:   "virtual-connection",
-	}}
-	client := &fakePluginClient{
-		manifest:            manifest,
-		virtualStreamClient: pluginhost.NewVirtualStreamProviderClientForTest(grpcClient, time.Second),
-	}
-
-	if err := runPluginConnectionCheck(context.Background(), client, manifest); err != nil {
-		t.Fatalf("runPluginConnectionCheck() error = %v", err)
-	}
-	if gotRequest == nil {
-		t.Fatal("ListVirtualStreamProfiles was not called")
-	}
-	if gotRequest.GetCapabilityId() != "virtual-connection" {
-		t.Fatalf("capability id = %q, want virtual-connection", gotRequest.GetCapabilityId())
-	}
-	if gotRequest.GetMediaType() != "movie" {
-		t.Fatalf("media type = %q, want movie", gotRequest.GetMediaType())
-	}
-	if client.metadataProviderCalls != 0 {
-		t.Fatalf("metadata provider calls = %d, want 0", client.metadataProviderCalls)
-	}
-}
-
-func TestRunPluginConnectionCheckVirtualStreamProviderProbeError(t *testing.T) {
-	probeErr := errors.New("upstream unavailable")
-	grpcClient := &fakeVirtualStreamGRPCClient{
-		profilesFunc: func(
-			context.Context,
-			*pluginv1.ListVirtualStreamProfilesRequest,
-		) (*pluginv1.ListVirtualStreamProfilesResponse, error) {
-			return nil, probeErr
-		},
-	}
-	manifest := connectionTestManifest(t, "com.example.virtual", "0.1.0")
-	manifest.Capabilities = []*pluginv1.CapabilityDescriptor{{
-		Type: virtualStreamProviderCapabilityType,
-		Id:   "virtual-connection",
-	}}
-	client := &fakePluginClient{
-		manifest:            manifest,
-		virtualStreamClient: pluginhost.NewVirtualStreamProviderClientForTest(grpcClient, time.Second),
-	}
-
-	err := runPluginConnectionCheck(context.Background(), client, manifest)
-	var connectionErr *ConnectionTestError
-	if !errors.As(err, &connectionErr) {
-		t.Fatalf("runPluginConnectionCheck() error = %v, want ConnectionTestError", err)
-	}
-	if !errors.Is(connectionErr, probeErr) {
-		t.Fatalf("ConnectionTestError cause = %v, want %v", connectionErr.Cause, probeErr)
-	}
-	if errors.Is(connectionErr, ErrConnectionTestFailed) {
-		t.Fatalf("ConnectionTestError cause = ErrConnectionTestFailed, want probe error")
-	}
-}
-
-func TestRunPluginConnectionCheckVirtualStreamProviderEmptyResponse(t *testing.T) {
-	grpcClient := &fakeVirtualStreamGRPCClient{
-		profilesFunc: func(
-			context.Context,
-			*pluginv1.ListVirtualStreamProfilesRequest,
-		) (*pluginv1.ListVirtualStreamProfilesResponse, error) {
-			return nil, nil
-		},
-	}
-	manifest := connectionTestManifest(t, "com.example.virtual", "0.1.0")
-	manifest.Capabilities = []*pluginv1.CapabilityDescriptor{{
-		Type: virtualStreamProviderCapabilityType,
-		Id:   "virtual-connection",
-	}}
-	client := &fakePluginClient{
-		manifest:            manifest,
-		virtualStreamClient: pluginhost.NewVirtualStreamProviderClientForTest(grpcClient, time.Second),
-	}
-
-	err := runPluginConnectionCheck(context.Background(), client, manifest)
-	var connectionErr *ConnectionTestError
-	if !errors.As(err, &connectionErr) {
-		t.Fatalf("runPluginConnectionCheck() error = %v, want ConnectionTestError", err)
-	}
-	if !errors.Is(connectionErr, ErrConnectionTestFailed) {
-		t.Fatalf("ConnectionTestError cause = %v, want ErrConnectionTestFailed", connectionErr.Cause)
-	}
-}
-
 func connectionTestManifest(t *testing.T, pluginID, version string) *pluginv1.PluginManifest {
 	t.Helper()
 
@@ -1053,4 +925,48 @@ func connectionTestManifest(t *testing.T, pluginID, version string) *pluginv1.Pl
 		},
 	}
 	return manifest
+}
+
+// TestSetGlobalConfigClearsUseAdminFormSecrets: the clear rule takes the
+// public and secret fields from the JSON schema and the admin form alike, so
+// an emptied text field is cleared while a password control whose JSON
+// schema property carries no secret annotation keeps its stored value.
+func TestSetGlobalConfigClearsUseAdminFormSecrets(t *testing.T) {
+	manifest := connectionTestManifest(t, "silo.auth.oidc", "0.1.0")
+	manifest.GlobalConfigSchema[0].JsonSchema = `{"type":"object","properties":{"issuer_url":{"type":"string"},"button_label":{"type":"string"},"api_token":{"type":"string"}}}`
+	manifest.GlobalConfigSchema[0].AdminForm = &pluginv1.AdminFormDescriptor{Fields: []*pluginv1.AdminFormField{
+		{Key: "issuer_url"},
+		{Key: "button_label"},
+		{Key: "api_token", Control: pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_PASSWORD},
+	}}
+	installPath := writeInstalledPluginManifest(t, manifest)
+	store := &fakeServiceConfigStore{configsByInstallation: map[int][]*RuntimeConfig{
+		7: {{
+			InstallationID: 7,
+			Key:            "connection",
+			Value: map[string]any{
+				"issuer_url":   "https://idp.example.invalid",
+				"button_label": "Company SSO",
+				"api_token":    "stored-token",
+			},
+		}},
+	}}
+	service := &Service{
+		installations: newFakeServiceInstallationStore(&Installation{
+			ID:          7,
+			PluginID:    manifest.GetPluginId(),
+			Version:     manifest.GetVersion(),
+			InstallPath: installPath,
+			Enabled:     true,
+		}),
+		configs: store,
+	}
+	submitted := map[string]any{"issuer_url": "https://idp.example.invalid", "button_label": "", "api_token": ""}
+	if err := service.SetGlobalConfigWithClears(context.Background(), 7, "connection", submitted, nil); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]any{"issuer_url": "https://idp.example.invalid", "api_token": "stored-token"}
+	if len(store.puts) != 1 || !reflect.DeepEqual(store.puts[0].value, want) {
+		t.Fatalf("saved = %#v, want %#v", store.puts, want)
+	}
 }

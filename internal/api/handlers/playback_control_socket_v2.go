@@ -411,7 +411,7 @@ func (h *PlaybackControlSocketV2) ServeHTTP(w http.ResponseWriter, r *http.Reque
 			// from this connection no longer belong to the session.
 			return
 		}
-		if err := h.Playback.handleRealtimeClientMessage(sessionID, data); err != nil {
+		if err := h.Playback.handleRealtimeClientMessage(readCtx, sessionID, data); err != nil {
 			slog.WarnContext(r.Context(), "invalid realtime client message", "component", "api", "session", sessionID, "playback_session_id", sessionID, "error", err)
 		}
 	}

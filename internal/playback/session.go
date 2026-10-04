@@ -401,6 +401,7 @@ type SessionManager struct {
 	activeGrace          time.Duration
 	pausedGrace          time.Duration
 	expireHooks          []func(*Session)
+	finishHooks          []func(context.Context, *Session)
 	compatActivityReader SessionActivityReader
 	compatExpiryClaimer  SessionExpiryClaimer
 	// transportStops holds the stop channels of media transports this replica
@@ -538,6 +539,17 @@ func (m *SessionManager) AddExpirationHook(fn func(*Session)) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.expireHooks = append(m.expireHooks, fn)
+}
+
+// AddFinishHook registers a callback that runs after FinishSession removes a
+// session. The hook executes outside the manager lock.
+func (m *SessionManager) AddFinishHook(fn func(context.Context, *Session)) {
+	if fn == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.finishHooks = append(m.finishHooks, fn)
 }
 
 func normalizeClientMetadataValue(value string, maxLen int) string {
@@ -1538,6 +1550,26 @@ func (m *SessionManager) SetAutoFallback(sessionID string, enabled bool) error {
 	return nil
 }
 
+// RestoreAutoFallback returns a session's auto-fallback state to a value
+// captured by AutoFallback before a speculative renegotiation. It restores both
+// the boolean and the set-bit, so a session that had never negotiated the field
+// goes back to reporting ok=false rather than a spurious explicit "off". A
+// failed replan that applied a new policy before execution must roll back to
+// exactly the prior state, not just the boolean, or a later replan would treat
+// an unset session as having explicitly disabled fallback.
+func (m *SessionManager) RestoreAutoFallback(sessionID string, enabled bool, set bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		return ErrSessionNotFound
+	}
+	s.autoFallback = enabled
+	s.autoFallbackSet = set
+	return nil
+}
+
 // AutoFallback reports the session's negotiated auto-fallback state. ok is
 // false for a session that never set it (for example a reconstruction), so a
 // caller keeps its own conservative default instead of assuming a value.
@@ -2012,6 +2044,29 @@ func (m *SessionManager) StopSession(sessionID string) error {
 	return nil
 }
 
+// FinishSession is StopSession for a play that has ended, as opposed to a
+// session replaced mid-play. The finish hooks run only when this call removed
+// the session, so a retried stop, or one that loses to stale cleanup, runs
+// them at most once per local copy.
+func (m *SessionManager) FinishSession(ctx context.Context, sessionID string) error {
+	m.mu.Lock()
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		m.mu.Unlock()
+		return ErrSessionNotFound
+	}
+	finished := *s
+	delete(m.sessions, sessionID)
+	m.stopTransportsLocked(sessionID)
+	hooks := append([]func(context.Context, *Session){}, m.finishHooks...)
+	m.mu.Unlock()
+
+	for _, hook := range hooks {
+		hook(ctx, &finished)
+	}
+	return nil
+}
+
 // GetSession returns the session with the given ID, or ErrSessionNotFound.
 func (m *SessionManager) GetSession(sessionID string) (*Session, error) {
 	m.mu.RLock()
@@ -2025,6 +2080,25 @@ func (m *SessionManager) GetSession(sessionID string) (*Session, error) {
 	// Return a copy to avoid races.
 	cp := *s
 	return &cp, nil
+}
+
+// GetSessionWithSourceGeneration returns the session copy and, from the same
+// lock, the candidate-binding generation that copy carries. The generation is
+// read under the lock with the copy so a reader cannot pair a copy with a
+// generation that belongs to a different binding move: a caller that builds a
+// payload from the copy and later compares the generation gets a pairing that
+// was never torn.
+func (m *SessionManager) GetSessionWithSourceGeneration(sessionID string) (*Session, uint64, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		return nil, 0, ErrSessionNotFound
+	}
+
+	cp := *s
+	return &cp, cp.virtualSourceGeneration, nil
 }
 
 // GetUserSessions returns all active sessions for a user.

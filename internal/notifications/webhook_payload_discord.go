@@ -125,11 +125,14 @@ func BuildDiscordDMPayload(rows []DeliveryRow) ([]byte, error) {
 
 // discordEmbedAuthorLine renders the small "what happened" line above the
 // embed title.
-func discordEmbedAuthorLine(deliveryType string) string {
-	switch deliveryType {
+func discordEmbedAuthorLine(row DeliveryRow) string {
+	switch row.Type {
 	case DeliveryTypeEpisodeAvailable:
 		return "New episode on Vio"
 	case DeliveryTypeRequestFulfilled:
+		if parseRequestFlags(row.ReasonFlags).Follower {
+			return "Now available on Vio"
+		}
 		return "Your request is now available on Vio"
 	case DeliveryTypeRequestApproved:
 		return "Your request was approved on Vio"
@@ -177,7 +180,7 @@ func buildDiscordEmbed(row DeliveryRow, test bool) discordEmbed {
 			Title:       "Rating set",
 			Description: fmt.Sprintf("Rated %d/5", ratingFlags.Rating),
 			Color:       discordColorRating,
-			Author:      &discordEmbedAuthor{Name: discordEmbedAuthorLine(row.Type)},
+			Author:      &discordEmbedAuthor{Name: discordEmbedAuthorLine(row)},
 			Footer:      &discordEmbedFooter{Text: discordEmbedFooterText(row.ContentRating, test)},
 			Fields: []discordEmbedField{
 				{Name: "Item", Value: itemID, Inline: true},
@@ -251,7 +254,7 @@ func buildDiscordEmbed(row DeliveryRow, test bool) discordEmbed {
 		URL:         ids.titleURL(),
 		Description: embedDescription(overview, ids),
 		Color:       color,
-		Author:      &discordEmbedAuthor{Name: discordEmbedAuthorLine(row.Type)},
+		Author:      &discordEmbedAuthor{Name: discordEmbedAuthorLine(row)},
 		Footer:      &discordEmbedFooter{Text: discordEmbedFooterText(row.ContentRating, test)},
 		Fields:      fields,
 	}

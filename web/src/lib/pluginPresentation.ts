@@ -20,6 +20,7 @@ export function pluginPagePath(
 /** The plugin's tier, shown on every plugin (1.0 plugin-management AC4). */
 export function sourceLabel(sourceKind: string): string {
   switch (sourceKind) {
+    case "vio":
     case "silo":
       return "Silo maintained";
     case "approved_community":
@@ -35,6 +36,7 @@ export function sourceLabel(sourceKind: string): string {
  */
 export function tierNotice(sourceKind: string): string | null {
   switch (sourceKind) {
+    case "vio":
     case "silo":
       return null;
     case "approved_community":
@@ -49,10 +51,29 @@ export function configPanelId(key: string): string {
   return `config-${key}`;
 }
 
-export const CATALOG_GROUPS: { kind: PluginSourceKind; title: string }[] = [
-  { kind: "silo", title: "Made by Silo" },
-  { kind: "approved_community", title: "Approved community" },
-  { kind: "external", title: "Other sources" },
+export interface CatalogGroup {
+  kind: PluginSourceKind;
+  title: string;
+  matches: (sourceKind: string) => boolean;
+}
+
+export const CATALOG_GROUPS: readonly CatalogGroup[] = [
+  {
+    kind: "vio",
+    title: "Silo maintained",
+    matches: (sourceKind: string) => sourceKind === "vio" || sourceKind === "silo",
+  },
+  {
+    kind: "approved_community",
+    title: "Approved community",
+    matches: (sourceKind: string) => sourceKind === "approved_community",
+  },
+  {
+    kind: "external",
+    title: "Other sources",
+    matches: (sourceKind: string) =>
+      sourceKind !== "vio" && sourceKind !== "silo" && sourceKind !== "approved_community",
+  },
 ];
 
 export function pluginDisplayName(pluginID: string, presentation?: PluginPresentation): string {
@@ -60,7 +81,7 @@ export function pluginDisplayName(pluginID: string, presentation?: PluginPresent
   if (displayName) return displayName;
 
   const derived = pluginID
-    .replace(/^silo[._-]?/, "")
+    .replace(/^(silo|vio)[._-]?/, "")
     .split(/[._-]+/)
     .filter(Boolean)
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1))

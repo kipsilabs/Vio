@@ -125,7 +125,7 @@ function decodeFontBundleItems(payload: unknown): SubtitleFontBundleItem[] {
  * font-less file stays cacheable and does not carry it. Pending bundles are also
  * served with `Cache-Control: no-store`; either signal marks the response.
  */
-export const FONT_BUNDLE_PENDING_HEADER = "X-Silo-Font-Bundle-Pending";
+export const FONT_BUNDLE_PENDING_HEADER = "X-Vio-Font-Bundle-Pending";
 
 function isPendingFontBundleResponse(response: Response): boolean {
   const marker = response.headers?.get?.(FONT_BUNDLE_PENDING_HEADER);
@@ -211,7 +211,14 @@ export function loadSubtitleFontBundleResult(
           onSourceChanged?.();
           return { fonts: [], pending: true };
         }
-        throw new Error(`HTTP ${response.status}`);
+        // Any other non-OK status is definitive for this URL: re-requesting
+        // the same bytes cannot succeed on its own, so a 5xx is the server's
+        // answer, not a budget miss. Marking it pending drove a bounded but
+        // repeated refresh per window on top of the prefetch, which flooded
+        // the fonts endpoint with identical failing requests. Return a
+        // cacheable empty bundle instead; a new plan or session mints new
+        // URLs (the session id is in the path) and gets a fresh attempt.
+        return { fonts: [], pending: false };
       }
       const pending = isPendingFontBundleResponse(response);
       const items = decodeFontBundleItems(await response.json());

@@ -13,6 +13,10 @@ import type { PlayerSubtitleInfo, VideoFitMode } from "../types";
 import { HLS_DEFAULT_MAX_BUFFER_SIZE_BYTES } from "../utils/bufferPolicy";
 import { HLS_STARTUP_TIMEOUT_MS } from "../utils/hlsStartupGuard";
 import { PENDING_SEEK_HOLD_TIMEOUT_MS } from "../utils/pendingSeek";
+import {
+  buildQualitySummary,
+  buildVersionDetailLine,
+} from "@/pages/ItemDetail/components/versionFormatUtils";
 import { VideoPlayer } from "./VideoPlayer";
 
 const realtimeOptions = vi.hoisted(() => ({
@@ -48,6 +52,8 @@ const subtitleTimeline = vi.hoisted(() => ({
   liveCues: [] as Array<{ text: string }>,
   liveKey: null as string | null,
   streamGeneration: 0,
+  cueRevision: 0,
+  assCueRevision: 0,
 }));
 const toastError = vi.hoisted(() => vi.fn());
 const hlsJS = vi.hoisted(() => ({
@@ -92,6 +98,7 @@ vi.mock("../hooks/useSubtitleTracks", () => ({
     subtitleTimeline.liveKey = args[8] as string | null;
     subtitleTimeline.streamGeneration = args[9] as number;
     subtitleHooks.vttSourceChanged = (args[11] as (() => void) | undefined) ?? null;
+    subtitleTimeline.cueRevision = args[13] as number;
     return [];
   },
 }));
@@ -99,6 +106,7 @@ vi.mock("../hooks/useASSSubtitles", () => ({
   useASSSubtitles: (...args: unknown[]) => {
     subtitleTimeline.assOffsetSeconds = args[4] as number;
     subtitleHooks.assSourceChanged = (args[7] as (() => void) | undefined) ?? null;
+    subtitleTimeline.assCueRevision = args[11] as number;
     return { isActive: false };
   },
 }));
@@ -3191,6 +3199,89 @@ describe("VideoPlayer server-invalidated transport swap", () => {
   });
 });
 
+describe("VideoPlayer stored subtitle timing", () => {
+  const storedTrack: PlayerSubtitleInfo = {
+    index: 2,
+    language: "en",
+    label: "English",
+    source: "downloaded",
+    codec: "srt",
+    url: "/api/v1/stream/session-1/subtitles/2.vtt?file_id=7&downloaded_subtitle_id=31",
+  };
+  const timingChanged = (fileId: number, subtitleId: number): PlaybackRealtimeEventEnvelope => ({
+    type: "event",
+    session_id: "session-1",
+    name: "subtitle_timing_changed",
+    payload: { session_id: "session-1", file_id: fileId, subtitle_id: subtitleId },
+  });
+
+  beforeEach(() => {
+    realtimeOptions.current = null;
+    controls.current = null;
+    playerV2Mock
+      .mockReset()
+      .mockImplementation(
+        async (_config: unknown, route: string, options: { path?: { id?: string } }) => {
+          const subtitle = { id: "31", media_file_id: "7", timing: { offset_ms: 0, scale: 1 } };
+          if (route === "GET /api/v2/subtitles/{media_file_id}") return { subtitles: [subtitle] };
+          if (route === "GET /api/v2/subtitles/stored/{id}/sync") {
+            return {
+              subtitle: {
+                ...subtitle,
+                id: options.path?.id,
+                timing: { offset_ms: 1200, scale: 1 },
+              },
+            };
+          }
+          return {};
+        },
+      );
+    vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
+    vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
+    vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("refetches the active stored track when its timing changes on this file", async () => {
+    renderPlayer({ subtitleUrls: [storedTrack] });
+    act(() =>
+      (controls.current as unknown as { onSubtitleSelect: (i: number) => void }).onSubtitleSelect(
+        2,
+      ),
+    );
+    await act(async () => {});
+    expect(subtitleTimeline.cueRevision).toBe(0);
+
+    // Another file's subtitle and an inactive subtitle leave the cues alone.
+    act(() => realtimeOptions.current?.onEvent?.(timingChanged(8, 31)));
+    act(() => realtimeOptions.current?.onEvent?.(timingChanged(7, 99)));
+    await act(async () => {});
+    expect(subtitleTimeline.cueRevision).toBe(0);
+
+    act(() => realtimeOptions.current?.onEvent?.(timingChanged(7, 31)));
+    await act(async () => {});
+    expect(subtitleTimeline.cueRevision).toBe(1);
+    expect(subtitleTimeline.assCueRevision).toBe(1);
+    // The follow-up read refreshes the menu's status without a second reload.
+    expect(playerV2Mock).toHaveBeenCalledWith(
+      playerConfig,
+      "GET /api/v2/subtitles/stored/{id}/sync",
+      { path: { id: "31" } },
+    );
+    expect(subtitleTimeline.cueRevision).toBe(1);
+    const sync = (
+      controls.current as unknown as {
+        storedSubtitleSync: { entries: Record<string, { subtitle: { timing: unknown } }> };
+      }
+    ).storedSubtitleSync;
+    expect(sync.entries["31"]?.subtitle.timing).toEqual({ offset_ms: 1200, scale: 1 });
+  });
+});
+
 describe("VideoPlayer translation handoff", () => {
   beforeEach(() => {
     toastError.mockClear();
@@ -4328,6 +4419,55 @@ describe("VideoPlayer version switch UX", () => {
 
     // A version with no server score carries no badge value.
     expect(props.versions?.find((v) => v.fileId === 7)?.formatScore).toBeUndefined();
+  });
+
+  it("builds each version row's label and detail from the shared builders", () => {
+    const versionWithHints = {
+      ...versionB,
+      resolution: "2160p",
+      codec_video: "hevc",
+      codec_audio: "TrueHD Atmos",
+      hdr: true,
+      file_size: 50_570_000_000,
+      edition_raw: "Movie.2026.2160p.Remux.50.53GB",
+      audio_tracks: [{ languages: ["en", "fr"] }],
+      subtitle_tracks: [{ language: "deu" }],
+    };
+    renderPlayer({ versions: [versionA, versionWithHints], activeFileId: 7 });
+
+    const props = controls.current as unknown as {
+      versions?: Array<{
+        fileId: number;
+        label: string;
+        releaseName?: string;
+        detail?: string;
+        audioLanguages?: string[];
+        subtitleLanguages?: string[];
+      }>;
+    };
+    const row = props.versions?.find((v) => v.fileId === 99);
+    // The in-player label is the shared one-line summary, not the old inline
+    // template string, so it matches the item-page picker for the same fields.
+    expect(row?.label).toBe(buildQualitySummary(versionWithHints));
+    expect(row?.detail).toBe(buildVersionDetailLine(versionWithHints));
+    expect(row?.releaseName).toBe(buildVersionDetailLine(versionWithHints));
+    expect(row?.label).toContain("Atmos");
+    expect(row?.label).toContain("HEVC");
+    expect(row?.audioLanguages).toEqual(["English", "French"]);
+    expect(row?.subtitleLanguages).toEqual(["German"]);
+  });
+
+  it("labels a bare More-results row through the shared summary", () => {
+    const moreResults = {
+      ...versionB,
+      file_id: 101,
+      container: "virtual",
+      file_path: "virtual://movie/tt1?results=all",
+    };
+    renderPlayer({ versions: [versionA, moreResults], activeFileId: 7 });
+
+    const props = controls.current as unknown as { versions?: Array<{ label: string }> };
+    expect(props.versions?.find((v) => v.label === "More results…")).toBeDefined();
   });
 
   it("shows the quality ellipsis only for quality replans, not track changes", async () => {

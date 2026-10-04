@@ -3,7 +3,10 @@ package handlers
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -349,5 +352,77 @@ func TestVirtualCandidatesRefreshServiceWaiterCancelDoesNotAbortSharedWork(t *te
 	}
 	if got := atomic.LoadInt32(&listCalls); got < 1 || got > 2 {
 		t.Fatalf("provider list calls = %d, want 1 or 2 (join or fresh wave)", got)
+	}
+}
+
+// TestVirtualCandidatesRefreshServiceProviderCauseSurfaces proves a failed
+// provider listing keeps its underlying cause in the retryable 503: the async
+// job persists exactly this message, so the version-list banner can only show
+// what is kept here. Transport errors embed the request URL, which may carry
+// credentials, so only the host plus the root cause may surface.
+func TestVirtualCandidatesRefreshServiceProviderCauseSurfaces(t *testing.T) {
+	cases := []struct {
+		name    string
+		listErr error
+		wantSub string
+		notSub  []string
+	}{
+		{
+			name:    "id translation failure passes through",
+			listErr: fmt.Errorf("%w: %w", ErrVirtualRefreshProvider, errors.New("TVMaze returned status 429 for TVDB series ID 424536")),
+			wantSub: "TVMaze returned status 429 for TVDB series ID 424536",
+		},
+		{
+			name:    "fail-fast backoff passes through",
+			listErr: fmt.Errorf("%w: %w", ErrVirtualRefreshProvider, errors.New("provider listing failed recently")),
+			wantSub: "provider listing failed recently",
+		},
+		{
+			name: "transport error is reduced to host plus root cause",
+			listErr: fmt.Errorf("%w: %w", ErrVirtualRefreshProvider,
+				fmt.Errorf("lookup TVDB series ID 424536: %w", &url.Error{
+					Op:  "Get",
+					URL: "https://provider.example/streams?token=secret-token-123",
+					Err: errors.New("connection refused"),
+				})),
+			wantSub: "provider.example: connection refused",
+			notSub:  []string{"secret-token-123", "https://provider.example"},
+		},
+		{
+			name:    "bare sentinel keeps the generic message",
+			listErr: ErrVirtualRefreshProvider,
+			wantSub: "The provider could not be reached; try again.",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			source := refreshTestSource(7, "series:x", "virtual://series/x")
+			svc := &VirtualCandidatesRefreshService{
+				ListFresh: VirtualPlaybackStreamListerFunc(func(context.Context, string, int, string, int) ([]VirtualPlaybackStream, error) {
+					return nil, tc.listErr
+				}),
+				Persist: func(context.Context, *models.MediaFile, []VirtualPlaybackStream) error {
+					t.Fatal("persist must not run on provider failure")
+					return nil
+				},
+				ContentFiles: func(context.Context, string) ([]*models.MediaFile, error) {
+					return []*models.MediaFile{source}, nil
+				},
+				Detail: &fakeRefreshDetail{detail: refreshTestDetail()},
+			}
+			_, _, err := refreshSources(svc, "series:x", 1, "p")
+			var apiErr *APIError
+			if !errors.As(err, &apiErr) || apiErr.Status != http.StatusServiceUnavailable {
+				t.Fatalf("err = %v, want a 503 APIError", err)
+			}
+			if !strings.Contains(apiErr.Message, tc.wantSub) {
+				t.Fatalf("message = %q, want substring %q", apiErr.Message, tc.wantSub)
+			}
+			for _, banned := range tc.notSub {
+				if strings.Contains(apiErr.Message, banned) {
+					t.Fatalf("message = %q, must not contain %q", apiErr.Message, banned)
+				}
+			}
+		})
 	}
 }

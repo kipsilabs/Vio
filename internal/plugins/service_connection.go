@@ -15,15 +15,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/pluginhost"
 )
 
-var (
-	ErrConnectionTestUnsupported = errors.New("plugin connection test unsupported")
-	ErrConnectionTestFailed      = errors.New("plugin connection test failed")
-)
-
-// connectionProbeMediaType is the content type every plugin connection probe
-// asks about. The probes are configuration checks, so one representative type
-// is enough: a provider that answers nothing for a movie is not usable.
-const connectionProbeMediaType = "movie"
+var ErrConnectionTestUnsupported = errors.New("plugin connection test unsupported")
 
 type ConnectionTestError struct {
 	Message string
@@ -49,66 +41,17 @@ var runPluginConnectionCheck = func(
 	client pluginClient,
 	manifest *pluginv1.PluginManifest,
 ) error {
-	capabilityType, capabilityID, err := connectionCheckCapabilityID(manifest)
+	capabilityID, err := metadataProviderConnectionCheckCapabilityID(manifest)
 	if err != nil {
 		return err
 	}
-	if capabilityType == "request_router.v1" {
-		router, err := client.RequestRouter(capabilityID)
-		if err != nil {
-			return &ConnectionTestError{Message: fmt.Sprintf("Failed to initialize the request router: %v", err), Cause: err}
-		}
-		probeCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-		defer cancel()
-		resp, err := router.TestConnection(probeCtx, &pluginv1.TestConnectionRequest{
-			CapabilityId: capabilityID,
-			Connection:   &pluginv1.RouterConnection{Id: "global-config"},
-		})
-		if err != nil {
-			return &ConnectionTestError{Message: fmt.Sprintf("Connection check failed: %v", err), Cause: err}
-		}
-		if !resp.GetOk() {
-			return &ConnectionTestError{Message: resp.GetMessage(), Cause: ErrConnectionTestFailed}
-		}
-		return nil
-	}
-
-	if capabilityType == virtualStreamProviderCapabilityType {
-		virtualClient, err := client.VirtualStreamProvider(capabilityID)
-		if err != nil {
-			return &ConnectionTestError{
-				Message: fmt.Sprintf("Failed to initialize the virtual stream provider: %v", err),
-				Cause:   err,
-			}
-		}
-		probeCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-		defer cancel()
-		response, err := virtualClient.ListVirtualStreamProfiles(probeCtx, &pluginv1.ListVirtualStreamProfilesRequest{
-			CapabilityId: capabilityID,
-			MediaType:    connectionProbeMediaType,
-		})
-		if err != nil {
-			return &ConnectionTestError{
-				Message: fmt.Sprintf("Connection check failed: %v", err),
-				Cause:   err,
-			}
-		}
-		if response == nil {
-			return &ConnectionTestError{
-				Message: "Connection check returned an empty response",
-				Cause:   ErrConnectionTestFailed,
-			}
-		}
-		return nil
-	}
-
 	capability := metadataProviderConnectionCheckCapability(manifest, capabilityID)
-	if !metadataProviderSupportsConnectionProbe(capability, connectionProbeMediaType) {
+	if !metadataProviderSupportsConnectionProbe(capability, "movie") {
 		slog.DebugContext(ctx,
 			"skipping metadata provider connection check for unsupported probe type", "component", "plugins",
 			"plugin_id", manifest.GetPluginId(),
 			"capability_id", capabilityID,
-			"item_type", connectionProbeMediaType,
+			"item_type", "movie",
 		)
 		return nil
 	}
@@ -126,7 +69,7 @@ var runPluginConnectionCheck = func(
 
 	if _, err := metadataClient.Search(probeCtx, &pluginv1.SearchMetadataRequest{
 		Query:    "The Matrix",
-		ItemType: connectionProbeMediaType,
+		ItemType: "movie",
 		Year:     1999,
 		Language: "en",
 	}); err != nil {
@@ -137,24 +80,6 @@ var runPluginConnectionCheck = func(
 	}
 
 	return nil
-}
-
-func connectionCheckCapabilityID(manifest *pluginv1.PluginManifest) (string, string, error) {
-	for _, capability := range manifest.GetCapabilities() {
-		if capability.GetType() == "request_router.v1" {
-			return capability.GetType(), capability.GetId(), nil
-		}
-	}
-	for _, capability := range manifest.GetCapabilities() {
-		if capability.GetType() == virtualStreamProviderCapabilityType {
-			return capability.GetType(), capability.GetId(), nil
-		}
-	}
-	capabilityID, err := metadataProviderConnectionCheckCapabilityID(manifest)
-	if err != nil {
-		return "", "", err
-	}
-	return "metadata_provider.v1", capabilityID, nil
 }
 
 func (s *Service) TestGlobalConfig(
@@ -188,37 +113,13 @@ func (s *Service) TestGlobalConfigWithClears(
 		return err
 	}
 
-	if value == nil {
-		value = map[string]any{}
-	}
-	submitted := value
-	secretFields := GlobalConfigSecretFields(manifest, key)
-	secretPaths := GlobalConfigSecretPaths(manifest, key)
-	clearSet, err := validatedSecretClearSet(key, secretFields, clearSecrets)
-	if err != nil {
+	value, err = s.prepareStagedGlobalConfig(ctx, installationID, manifest, key, value, clearSecrets, func(err error) error {
 		return &ConnectionTestError{Message: err.Error(), Cause: err}
-	}
-	value, err = s.preserveStoredSecrets(
-		ctx,
-		installationID,
-		key,
-		value,
-		secretPaths,
-	)
+	})
 	if err != nil {
 		return err
 	}
-	for field := range clearSet {
-		delete(value, field)
-	}
-	projection := globalConfigValidationProjection(manifest, key, value, submitted)
-	if err := ValidateGlobalConfigValue(manifest, key, projection); err != nil {
-		return &ConnectionTestError{
-			Message: err.Error(),
-			Cause:   err,
-		}
-	}
-	if _, _, err := connectionCheckCapabilityID(manifest); err != nil {
+	if _, err := metadataProviderConnectionCheckCapabilityID(manifest); err != nil {
 		return err
 	}
 
@@ -255,27 +156,66 @@ func (s *Service) TestGlobalConfigWithClears(
 	return runPluginConnectionCheck(ctx, client, manifest)
 }
 
+// prepareStagedGlobalConfig applies one staged global config entry the way
+// a save would, without saving it: blank secret fields keep the stored
+// secret, clearSecrets drops stored ones, emptied declared fields are
+// cleared, and the result must validate.
+// invalid wraps a rejected entry in the caller's error type.
+func (s *Service) prepareStagedGlobalConfig(
+	ctx context.Context,
+	installationID int,
+	manifest *pluginv1.PluginManifest,
+	key string,
+	value map[string]any,
+	clearSecrets []string,
+	invalid func(error) error,
+) (map[string]any, error) {
+	if value == nil {
+		value = map[string]any{}
+	}
+	clearSet, err := validatedSecretClearSet(key, GlobalConfigSecretFields(manifest, key), clearSecrets)
+	if err != nil {
+		return nil, invalid(err)
+	}
+	merged, err := s.preserveStoredSecrets(ctx, installationID, key, value, GlobalConfigSecretPaths(manifest, key))
+	if err != nil {
+		return nil, err
+	}
+	if err := applyGlobalConfigClears(manifest, key, merged, value, clearSet); err != nil {
+		return nil, invalid(err)
+	}
+	return merged, nil
+}
+
+// storedGlobalConfigs returns copies of an installation's saved global
+// config entries by key.
+func (s *Service) storedGlobalConfigs(ctx context.Context, installationID int) (map[string]map[string]any, error) {
+	configsByKey := make(map[string]map[string]any)
+	if s.configs == nil {
+		return configsByKey, nil
+	}
+	configs, err := s.configs.ListGlobalConfigs(ctx, installationID)
+	if err != nil {
+		return nil, fmt.Errorf("list plugin runtime configs for installation %d: %w", installationID, err)
+	}
+	for _, config := range configs {
+		if config != nil {
+			configsByKey[config.Key] = cloneConfigMap(config.Value)
+		}
+	}
+	return configsByKey, nil
+}
+
 func (s *Service) mergedGlobalConfigEntries(
 	ctx context.Context,
 	installationID int,
 	key string,
 	value map[string]any,
 ) ([]*pluginv1.ConfigEntry, error) {
-	configsByKey := make(map[string]map[string]any)
-
-	if s.configs != nil {
-		configs, err := s.configs.ListGlobalConfigs(ctx, installationID)
-		if err != nil {
-			return nil, fmt.Errorf("list plugin runtime configs for installation %d: %w", installationID, err)
-		}
-		for _, config := range configs {
-			if config == nil {
-				continue
-			}
-			configsByKey[config.Key] = cloneConfigMap(config.Value)
-		}
+	configsByKey, err := s.storedGlobalConfigs(ctx, installationID)
+	if err != nil {
+		return nil, err
 	}
-
 	configsByKey[key] = cloneConfigMap(value)
 	return configEntriesFromValues(configsByKey, installationID)
 }

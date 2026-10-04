@@ -7,9 +7,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/drondeseries/vio-server/releases"><img alt="Latest GitHub release" src="https://img.shields.io/github/v/release/drondeseries/vio-server?include_prereleases&amp;sort=semver&amp;display_name=tag&amp;style=flat-square&amp;label=release"></a>
-  <a href="https://github.com/drondeseries/vio-server/pkgs/container/vio-server"><img alt="Container image on GHCR" src="https://img.shields.io/badge/container-GHCR-2496ED?style=flat-square&amp;logo=docker&amp;logoColor=white"></a>
-  <a href="https://github.com/drondeseries/vio-server/actions/workflows/ci.yml"><img alt="Continuous integration" src="https://img.shields.io/github/actions/workflow/status/drondeseries/vio-server/ci.yml?branch=main&amp;style=flat-square&amp;label=CI"></a>
+  <a href="https://github.com/kipsilabs/Vio/releases"><img alt="Latest GitHub release" src="https://img.shields.io/github/v/release/kipsilabs/Vio?include_prereleases&amp;sort=semver&amp;display_name=tag&amp;style=flat-square&amp;label=release"></a>
+  <a href="https://github.com/kipsilabs/Vio/pkgs/container/vio"><img alt="Container image on GHCR" src="https://img.shields.io/badge/container-GHCR-2496ED?style=flat-square&amp;logo=docker&amp;logoColor=white"></a>
+  <a href="https://github.com/kipsilabs/Vio/actions/workflows/ci.yml"><img alt="Continuous integration" src="https://img.shields.io/github/actions/workflow/status/kipsilabs/Vio/ci.yml?branch=main&amp;style=flat-square&amp;label=CI"></a>
   <img alt="Go 1.26" src="https://img.shields.io/badge/Go-1.26-00ADD8?style=flat-square&amp;logo=go&amp;logoColor=white">
   <img alt="React 19" src="https://img.shields.io/badge/React-19-149ECA?style=flat-square&amp;logo=react&amp;logoColor=white">
   <a href="LICENSE"><img alt="AGPL-3.0-or-later license" src="https://img.shields.io/badge/license-AGPL--3.0--or--later-555555?style=flat-square"></a>
@@ -86,8 +86,8 @@ Requires Docker Compose 2.24 or newer. The default stack runs Vio Server,
 PostgreSQL with pgvector, and Redis.
 
 ```sh
-git clone https://github.com/drondeseries/vio-server.git
-cd vio-server
+git clone https://github.com/kipsilabs/Vio.git
+cd Vio
 cp .env.example .env
 chmod 600 .env
 printf '\nPOSTGRES_PASSWORD=%s\nSECRET_KEY=%s\n' \
@@ -102,8 +102,8 @@ docker compose up -d
 
 Open <http://localhost:8090> and complete onboarding.
 
-The published image is `ghcr.io/drondeseries/vio-server:latest` (override with
-`VIO_IMAGE` to pin a tag). Server data lives under `/opt/vio` by default;
+The published developmental image is `ghcr.io/kipsilabs/vio:dev` (override with
+`VIO_IMAGE` to pin a tag or use `:latest` for releases). Server data lives under `/opt/vio` by default;
 set `VIO_DATA_ROOT` in `.env` to relocate it. When running from source, the
 server binary is `./vio`.
 
@@ -130,7 +130,7 @@ defines each tag and the SemVer contract.
 ## Community and contributions
 
 Vio is an independent fork with its own builds. Please file issues and pull
-requests against this repository (`drondeseries/vio-server`); upstream Silo
+requests against this repository (`kipsilabs/Vio`); upstream Silo
 does not take Vio patches.
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. Features,

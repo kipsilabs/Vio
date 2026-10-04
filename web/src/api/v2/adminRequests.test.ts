@@ -3,8 +3,8 @@ import { captureProfileRequestContext, isProfileRequestContextCurrent } from "@/
 import { v2, V2ProblemError } from "./request";
 import {
   getAdminRequestIntegrationV2,
-  listAdminMediaRequestsV2,
   listAdminRequestIntegrationsV2,
+  listAdminRequestQueuePageV2,
   putAdminRequestSettingsV2,
   putAdminRequestUserLimitV2,
   requestValidationErrors,
@@ -124,7 +124,7 @@ describe("admin request v2 adapter", () => {
     vi.mocked(captureProfileRequestContext).mockReturnValue(authority);
     vi.mocked(isProfileRequestContextCurrent).mockReturnValue(true);
     vi.mocked(v2).mockResolvedValue({ items: [], page: { has_more: true } } as never);
-    await expect(listAdminMediaRequestsV2({ limit: 100 })).rejects.toThrow(
+    await expect(listAdminRequestQueuePageV2({ view: "failed" })).rejects.toThrow(
       "Incomplete request page",
     );
     vi.mocked(v2).mockResolvedValue({
@@ -133,7 +133,36 @@ describe("admin request v2 adapter", () => {
     } as never);
     await expect(listAdminRequestIntegrationsV2()).rejects.toThrow("Incomplete integration page");
     vi.mocked(isProfileRequestContextCurrent).mockReturnValue(false);
-    await expect(listAdminMediaRequestsV2()).rejects.toThrow("account or server changed");
+    await expect(listAdminRequestQueuePageV2({ view: "failed" })).rejects.toThrow(
+      "account or server changed",
+    );
+  });
+  it("sends the queue filters as the server names them and returns the next cursor", async () => {
+    vi.mocked(captureProfileRequestContext).mockReturnValue(authority);
+    vi.mocked(isProfileRequestContextCurrent).mockReturnValue(true);
+    vi.mocked(v2).mockResolvedValue({
+      items: [],
+      page: { has_more: true, next_cursor: "next" },
+    } as never);
+    const page = await listAdminRequestQueuePageV2(
+      { view: "needs_approval", q: "  dune ", mediaType: "movie", requestedByUserId: 7 },
+      { limit: 25, cursor: "here" },
+    );
+    expect(page).toEqual({ items: [], nextCursor: "next" });
+    expect(vi.mocked(v2).mock.calls[0]).toEqual([
+      "GET /api/v2/admin/requests",
+      expect.objectContaining({
+        profileContext: authority,
+        query: {
+          view: "needs_approval",
+          q: "dune",
+          media_type: "movie",
+          requested_by_user_id: "7",
+          limit: 25,
+          cursor: "here",
+        },
+      }),
+    ]);
   });
   it("maps problem field details inline and unwraps options with string installation IDs", async () => {
     const error = new V2ProblemError("save", {
@@ -160,5 +189,49 @@ describe("admin request v2 adapter", () => {
   it("requires the canonical GET validator", async () => {
     vi.mocked(v2).mockResolvedValue({ id: "a" } as never);
     await expect(getAdminRequestIntegrationV2("a")).rejects.toThrow("Reload");
+  });
+});
+
+describe("listAdminMediaRequestsV2 compatibility", () => {
+  function row(id: string, status: string, outcome: string, created_at: string) {
+    return {
+      id,
+      provider: "tmdb",
+      media_type: "movie",
+      tmdb_id: 1,
+      title: id,
+      status,
+      outcome,
+      created_at,
+      updated_at: created_at,
+      targets: [],
+    };
+  }
+  it("merges views newest-first and filters client-side", async () => {
+    vi.mocked(v2).mockImplementation((_op, options) => {
+      const query = (options as { query: Record<string, unknown> }).query;
+      const items =
+        query.view === "needs_approval"
+          ? [row("old-pending", "pending", "active", "2026-01-01T00:00:00Z")]
+          : query.view === "in_progress"
+            ? [row("new-approved", "approved", "active", "2026-09-01T00:00:00Z")]
+            : [];
+      return Promise.resolve({ items, page: { has_more: false } }) as never;
+    });
+    vi.mocked(captureProfileRequestContext).mockReturnValue(authority as never);
+    vi.mocked(isProfileRequestContextCurrent).mockReturnValue(true);
+    const { listAdminMediaRequestsV2 } = await import("./adminRequests");
+    const all = await listAdminMediaRequestsV2({ limit: 100 });
+    expect(all.map((r) => r.id)).toEqual(["new-approved", "old-pending"]);
+    const pending = await listAdminMediaRequestsV2({ status: "pending" });
+    expect(pending.map((r) => r.id)).toEqual(["old-pending"]);
+    // A status filter fans out to its single view only.
+    expect(
+      vi
+        .mocked(v2)
+        .mock.calls.map(
+          ([, options]) => (options as { query: Record<string, unknown> }).query.view,
+        ),
+    ).toContain("needs_approval");
   });
 });

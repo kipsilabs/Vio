@@ -130,6 +130,25 @@ func CodeAliases(value string) []string {
 	return aliases
 }
 
+// ISO6392 returns the ISO 639-2/T code of value's primary language, the form
+// container formats such as MP4 store per track. Undefined, private-use, and
+// malformed values return "".
+func ISO6392(value string) string {
+	primary := PrimaryLanguage(value)
+	if primary == "" {
+		return ""
+	}
+	tag, err := language.Parse(primary)
+	if err != nil {
+		return ""
+	}
+	base, _ := tag.Base()
+	if code := base.ISO3(); code != "und" {
+		return code
+	}
+	return ""
+}
+
 // PrimaryLanguage intentionally drops script and region for language matching.
 // It never infers a language from an undefined or private-use tag.
 func PrimaryLanguage(value string) string {
@@ -139,6 +158,169 @@ func PrimaryLanguage(value string) string {
 		return ""
 	}
 	return base
+}
+
+const (
+	// RankExactMatch represents an identical BCP-47 tag match.
+	RankExactMatch = 0
+	// RankExactScriptRegion represents matching script and matching region.
+	RankExactScriptRegion = 1
+	// RankMatchingScript represents matching script or matching region.
+	RankMatchingScript = 2
+	// RankBareLanguage represents a bare language tag (unspecified script and region).
+	RankBareLanguage = 3
+	// RankRegionalVariant represents another regional/script variant with non-conflicting script.
+	RankRegionalVariant = 4
+	// RankScriptConflict represents an explicitly conflicting script.
+	RankScriptConflict = 5
+
+	scriptUnspecified = "Zzzz"
+	regionUnspecified = "ZZ"
+)
+
+// MatchRank compares candidate against preferred and returns the match rank
+// (lower is better, -1 for no match).
+//
+// Priority:
+//
+//	0: Exact BCP-47 tag match
+//	1: Same script and same region
+//	2: Matching script with neutral/different region, or matching region
+//	3: Bare language tag (unspecified script and region)
+//	4: Regional variant with non-conflicting script
+//	5: Conflicting script
+func MatchRank(candidate, preferred string) int {
+	candidate = CompatibleTag(candidate)
+	preferred = CompatibleTag(preferred)
+	if candidate == "" || preferred == "" {
+		return -1
+	}
+	if candidate == preferred {
+		return RankExactMatch
+	}
+	candidateBase := PrimaryLanguage(candidate)
+	preferredBase := PrimaryLanguage(preferred)
+	if candidateBase == "" || candidateBase != preferredBase {
+		return -1
+	}
+
+	_, cScript, cRegion, cLikelyScript := tagSubtags(candidate)
+	_, pScript, pRegion, pLikelyScript := tagSubtags(preferred)
+
+	// Bare language tag in candidate has unspecified script and region.
+	if cScript == scriptUnspecified && cRegion == regionUnspecified && !strings.Contains(candidate, "-") {
+		return RankBareLanguage
+	}
+
+	// Detect conflicting scripts:
+	// A script conflict only arises when preferred specifies or implies a script preference,
+	// and candidate carries an explicitly conflicting script or conflicting region.
+	hasScriptConflict := false
+	if pScript != scriptUnspecified {
+		if cScript != scriptUnspecified && cScript != pScript {
+			hasScriptConflict = true
+		} else if cRegion != regionUnspecified && cLikelyScript != "" && cLikelyScript != pScript {
+			hasScriptConflict = true
+		}
+	} else if pRegion != regionUnspecified && pLikelyScript != "" {
+		if cScript != scriptUnspecified && cScript != pLikelyScript {
+			hasScriptConflict = true
+		} else if cRegion != regionUnspecified && cLikelyScript != "" && cLikelyScript != pLikelyScript {
+			hasScriptConflict = true
+		}
+	}
+
+	if hasScriptConflict {
+		return RankScriptConflict
+	}
+
+	// Check for matching explicit or region-derived script preferences:
+	// 1. Both explicitly specify the same script (e.g. zh-Hans-CN vs zh-Hans).
+	// 2. Preferred explicitly specifies script, and candidate region implies it (e.g. zh-CN for zh-Hans).
+	// 3. Candidate explicitly specifies script, and preferred region implies it (e.g. zh-Hans for zh-CN).
+	// Note: When neither tag carries an explicit script (e.g. fr-BE vs fr-CA, zh-HK vs zh-TW),
+	// candidate is ranked as a regional variant (RankRegionalVariant = 4), allowing the bare
+	// language tag (RankBareLanguage = 3) to take precedence over another region's dialect.
+	matchingScript := (cScript != scriptUnspecified && pScript != scriptUnspecified && cScript == pScript) ||
+		(pScript != scriptUnspecified && cRegion != regionUnspecified && cLikelyScript == pScript) ||
+		(pRegion != regionUnspecified && cScript != scriptUnspecified && pLikelyScript == cScript)
+
+	matchingRegion := cRegion != regionUnspecified && pRegion != regionUnspecified && cRegion == pRegion
+
+	if matchingScript && matchingRegion {
+		return RankExactScriptRegion
+	}
+	if matchingScript || matchingRegion {
+		return RankMatchingScript
+	}
+
+	return RankRegionalVariant
+}
+
+func tagSubtags(tagStr string) (base, script, region, likelyScript string) {
+	base = PrimaryLanguage(tagStr)
+	script = scriptUnspecified
+	region = regionUnspecified
+
+	if t, err := language.Parse(tagStr); err == nil {
+		_, sRaw, rRaw := t.Raw()
+		if sRaw.String() != scriptUnspecified {
+			script = sRaw.String()
+		}
+		if rRaw.String() != regionUnspecified {
+			region = rRaw.String()
+		}
+		ls, _ := t.Script()
+		likelyScript = ls.String()
+	}
+
+	// If script or region was not parsed by language.Parse (e.g. unregistered variant subtags),
+	// extract structurally from canonicalized BCP-47 parts.
+	parts := strings.Split(tagStr, "-")
+	inExtension := false
+	for i := 1; i < len(parts); i++ {
+		part := parts[i]
+		if len(part) == 1 {
+			inExtension = true
+			continue
+		}
+		if inExtension {
+			continue
+		}
+		if script == scriptUnspecified && len(part) == 4 && isAlpha(part) {
+			script = strings.ToUpper(part[:1]) + strings.ToLower(part[1:])
+		} else if region == regionUnspecified && ((len(part) == 2 && isAlpha(part)) || (len(part) == 3 && isNumeric(part))) {
+			region = strings.ToUpper(part)
+		}
+	}
+
+	if likelyScript == "" {
+		if script != scriptUnspecified {
+			likelyScript = script
+		} else if region != regionUnspecified {
+			if t2, err := language.Parse(base + "-" + region); err == nil {
+				ls2, _ := t2.Script()
+				likelyScript = ls2.String()
+			}
+		}
+		if likelyScript == "" {
+			if t3, err := language.Parse(base); err == nil {
+				ls3, _ := t3.Script()
+				likelyScript = ls3.String()
+			}
+		}
+	}
+
+	return base, script, region, likelyScript
+}
+
+func isNumeric(value string) bool {
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 var languageNames = map[string]string{

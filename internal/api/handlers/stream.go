@@ -171,7 +171,11 @@ type StreamHandler struct {
 	// fontExtractFailures throttles the repetitive "subtitle font extraction
 	// failed" warning to the first failure per file+track; repeats drop to
 	// debug. A successful extraction clears the key, so a later regression warns
-	// again. Font extraction never fails playback: the endpoint's 500
+	// again. The key space is the target identity (file_id+track, or
+	// session+track before the file resolves), so recovery and failure always
+	// address the same slot; the retained map is capped with TTL and
+	// count-based eviction (see fontExtractFailLog). Font extraction never
+	// fails playback: the endpoint's 500
 	// (font_extract_failed) stays the client-visible signal and the debug line
 	// keeps the diagnostic trail.
 	fontExtractFailures fontExtractFailLog
@@ -179,32 +183,96 @@ type StreamHandler struct {
 
 // fontExtractFailLog throttles the subtitle-font extraction warning. See the
 // field doc on StreamHandler.fontExtractFailures.
+//
+// Retention is bounded two ways so unique keys — pre-resolution session+track
+// pairs above all, since session IDs are unbounded over the process lifetime —
+// cannot grow the map without bound: an entry expires (and the next failure
+// for it warns again) after fontExtractFailLogTTL, and the map evicts the
+// oldest entries once it reaches fontExtractFailLogMaxEntries. A failed or
+// abandoned target may never reach a success path that clears its key, so
+// cleanup-on-success alone would leak those entries.
 type fontExtractFailLog struct {
 	mu   sync.Mutex
-	seen map[string]struct{}
+	seen map[string]time.Time
+	// now is the clock used for TTL checks and eviction ordering; nil uses
+	// time.Now. Tests inject a monotonic fake.
+	now func() time.Time
+}
+
+const (
+	// fontExtractFailLogMaxEntries caps the throttle map. Eviction is by
+	// oldest insertion, so a live target keeps its slot while it keeps
+	// failing inside the TTL; an evicted target merely warns again on its
+	// next failure — diagnostics only, never correctness.
+	fontExtractFailLogMaxEntries = 512
+	// fontExtractFailLogTTL bounds how long one failure can stay throttled,
+	// so an unrecovered failure cannot suppress warnings forever.
+	fontExtractFailLogTTL = time.Hour
+)
+
+func (l *fontExtractFailLog) clock() time.Time {
+	if l.now != nil {
+		return l.now()
+	}
+	return time.Now()
 }
 
 // failed logs the first failure for key at warn and repeats at debug.
 func (l *fontExtractFailLog) failed(ctx context.Context, key string, attrs ...any) {
 	l.mu.Lock()
+	now := l.clock()
 	if l.seen == nil {
-		l.seen = make(map[string]struct{})
+		l.seen = make(map[string]time.Time)
 	}
-	_, repeat := l.seen[key]
+	at, repeat := l.seen[key]
+	if repeat && now.Sub(at) >= fontExtractFailLogTTL {
+		// The entry expired: a target that kept failing silently for the TTL
+		// re-warns once instead of staying throttled forever.
+		repeat = false
+	}
 	if !repeat {
-		l.seen[key] = struct{}{}
+		l.evictLocked(now)
+		l.seen[key] = now
 	}
 	l.mu.Unlock()
+	// The message wording is fixed so sloglint sees string literals; the
+	// cause attribute distinguishes the failure kinds, and the throttle key
+	// space gives each cause its own slot.
 	args := append([]any{virtualEvidenceLogKeyComponent, virtualEvidenceLogValueAPI}, attrs...)
 	if repeat {
-		slog.DebugContext(ctx, "subtitle font extraction failed", args...)
+		slog.DebugContext(ctx, "subtitle font request failed", args...)
 		return
 	}
-	slog.WarnContext(ctx, "subtitle font extraction failed", args...)
+	slog.WarnContext(ctx, "subtitle font request failed", args...)
+}
+
+// evictLocked makes room when the map is full: it drops expired entries
+// first, then the oldest ones, so the map never grows past
+// fontExtractFailLogMaxEntries no matter how many unique session/track
+// failures arrive.
+func (l *fontExtractFailLog) evictLocked(now time.Time) {
+	for len(l.seen) >= fontExtractFailLogMaxEntries {
+		oldestAt := now
+		oldestKey := ""
+		for key, at := range l.seen {
+			if now.Sub(at) >= fontExtractFailLogTTL {
+				delete(l.seen, key)
+				continue
+			}
+			if oldestKey == "" || at.Before(oldestAt) {
+				oldestAt, oldestKey = at, key
+			}
+		}
+		if oldestKey != "" {
+			delete(l.seen, oldestKey)
+		}
+	}
 }
 
 // recovered clears the throttle key after a successful extraction so a later
-// failure is reported at warn again.
+// failure is reported at warn again. The key must be the same one the failure
+// inserted — success and failure both build it with fontExtractFailureKey, so
+// failure → recovery → failure warns again.
 func (l *fontExtractFailLog) recovered(key string) {
 	l.mu.Lock()
 	delete(l.seen, key)
@@ -214,6 +282,48 @@ func (l *fontExtractFailLog) recovered(key string) {
 // fontExtractFailureKey identifies an extraction target across retries.
 func fontExtractFailureKey(fileID, trackIndex int) string {
 	return strconv.Itoa(fileID) + ":" + strconv.Itoa(trackIndex)
+}
+
+// logSubtitleFontInternalError records the cause behind the font route's
+// internal_error returns. Neither the session-load nor the source-preflight
+// failure used to log anything, so a client that retried a broken font URL
+// produced a flood the v2 request log could only describe as a bare
+// internal_error. The extraction-failure throttle backs it: the first failure
+// per target warns with file_id+track (or session+track before the file
+// resolves) and repeats drop to debug. Status codes and bodies are unchanged.
+//
+// The throttle key is the target identity alone — file_id+track, or
+// session+track before the file resolves. The cause travels as an attribute:
+// recovery clears exactly the key a failure inserted, so failure →
+// recovery → failure warns again regardless of which causes were involved.
+// The session path keys on the parsed track index (normalized) rather than the
+// raw request string when it can, keeping the keyspace bounded.
+func (h *StreamHandler) logSubtitleFontInternalError(ctx context.Context, in SubtitleFontRequest, fileID, trackIndex int, cause string, err error) {
+	if h == nil || err == nil {
+		return
+	}
+	if fileID > 0 {
+		h.fontExtractFailures.failed(ctx, fontExtractFailureKey(fileID, trackIndex),
+			"file_id", fileID,
+			"track", trackIndex,
+			"cause", cause,
+			"error", err,
+		)
+		return
+	}
+	// The file (and its track list) is not known yet, so the raw request
+	// track is the only identity available. Parsing it here, when it parses,
+	// normalizes the key against what the file-side path would later use.
+	rawTrack := in.Track
+	if parsed, _, parseErr := playback.ParseSubtitleTrackParam(rawTrack); parseErr == nil {
+		rawTrack = strconv.Itoa(parsed)
+	}
+	h.fontExtractFailures.failed(ctx, "session:"+in.SessionID+":track:"+rawTrack,
+		"session", in.SessionID,
+		"track", in.Track,
+		"cause", cause,
+		"error", err,
+	)
 }
 
 // ffmpegPath returns the currently configured ffmpeg binary path.
@@ -983,9 +1093,9 @@ func (h *StreamHandler) resolveVirtualInputURIExcluding(
 	// A serve-path retry that follows a transient relay/edge failure sets the
 	// fresh-registration marker (see withVirtualRelayFreshRegistration): it must
 	// present a newly minted relay entry instead of reusing the live token whose
-	// upstream just answered 502, mirroring the remux seek-anchor retry. Every
-	// other caller keeps the content-key reuse that shares one upstream and one
-	// range-cache scope.
+	// upstream just answered 5xx/502/503, mirroring the remux seek-anchor retry.
+	// Every other caller keeps the content-key reuse that shares one upstream
+	// and one range-cache scope.
 	fresh := virtualRelayFreshRegistrationRequested(ctx)
 	switch {
 	case insecure && fresh:
@@ -1228,13 +1338,29 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			var lastProxyErr error
+			// relayNotFound captures a relay-own 404 (unknown/expired token —
+			// upstream 404s arrive collapsed as 502, so a 404 here always
+			// means our registration lapsed, never a dead release).
+			relayNotFound := false
+			// relayTemporary captures a relay error response that marks the
+			// upstream failure as transport-temporary (5xx after the relay's
+			// open retry, or an unreachable upstream). Such a failure is
+			// availability-shaped, so it must not stamp a durable
+			// dead-candidate verdict; the pinned release may still rotate for
+			// this attempt when a sibling exists.
+			relayTemporary := false
 			proxy := &httputil.ReverseProxy{
 				Rewrite: func(pr *httputil.ProxyRequest) {
 					pr.Out.URL = targetURL
 					pr.Out.Host = targetURL.Host
 				},
 				ModifyResponse: func(res *http.Response) error {
+					if res.StatusCode == http.StatusNotFound {
+						relayNotFound = true
+						return fmt.Errorf("relay token not found")
+					}
 					if res.StatusCode >= http.StatusInternalServerError {
+						relayTemporary = remotestream.RelayTemporaryFailure(res)
 						return fmt.Errorf("relay returned HTTP %d", res.StatusCode)
 					}
 					return nil
@@ -1270,13 +1396,14 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 								deliveredPath = resolvedVirtualCandidatePath(healedResolved)
 								releaseInput = healCleanup
 								lastProxyErr = nil
+								relayTemporary = false
 								proxy.ServeHTTP(streamWriter, r)
 								// The heal is a handoff only when the retried
 								// stream actually delivered. A non-loopback
 								// target, a parse failure, or a second proxy
 								// error must fall through to failure marking and
-								// sibling rotation rather than answer 502 while a
-								// live sibling exists.
+								// sibling rotation rather than answer 5xx/502/503
+								// while a live sibling exists.
 								healed = lastProxyErr == nil
 							}
 						}
@@ -1287,27 +1414,102 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 						}
 					}
 					if !handoffAttempted {
+						// The pinned candidate served no bytes. Before
+						// indicting it, one same-release retry covers a
+						// lapsed relay registration: re-resolve mints a
+						// fresh token (no backoff needed — the token, not
+						// time, is the fix). Serving bytes heals without
+						// indictment; anything else falls through to the
+						// existing mark-and-rotate path unchanged.
+						// (Transient 5xx flaps are already retried once at
+						// the relay open phase; retrying them again here
+						// would break the pinned single-relist and
+						// rotation-declaration contracts, so they proceed
+						// to bounded rotation with the durable stamp
+						// suppressed below.)
+						if relayNotFound {
+							sameRetryCtx := withVirtualRelayFreshRegistration(r.Context())
+							sameMedia, sameCleanup, sameErr := h.resolveVirtualInputURIExcluding(sameRetryCtx, file, session.UserID, session.ProfileID, true, nil, false)
+							sameID := ""
+							if sameErr == nil {
+								sameID = sameMedia.CandidateID
+								if sameID == "" {
+									if parsed, err := url.Parse(sameMedia.URI); err == nil {
+										sameID = parsed.Query().Get("result")
+									}
+								}
+							}
+							var expectedID string
+							if parsed, err := url.Parse(file.FilePath); err == nil {
+								expectedID = parsed.Query().Get("result")
+							}
+							if sameErr == nil && (expectedID == "" || sameID == expectedID) {
+								if sameURL, parseErr := url.Parse(sameMedia.URL); parseErr == nil && sameURL.Scheme == "http" {
+									if sameHost := sameURL.Hostname(); sameHost == "127.0.0.1" || sameHost == "::1" || sameHost == "[::1]" {
+										targetURL = sameURL
+										deliveredPath = resolvedVirtualCandidatePath(sameMedia)
+										releaseInput = sameCleanup
+										sameCleanup = nil
+										lastProxyErr = nil
+										relayNotFound = false
+										relayTemporary = false
+										proxy.ServeHTTP(streamWriter, r)
+									}
+								}
+							}
+							if sameCleanup != nil {
+								sameCleanup()
+							}
+						}
+						if lastProxyErr == nil {
+							// The same-release retry healed: skip indictment
+							// and sibling rotation entirely — the pin just
+							// served bytes. Mirrors the success tail below.
+							if virtualCandidateDeliveryEvidence(streamWriter.StatusCode(), streamWriter.BytesWritten()) {
+								h.clearVirtualCandidateRecovered(r.Context(), file, deliveredPath, virtualObservedFailedAt)
+							}
+							return
+						}
 						// The pinned candidate served no bytes (corrupted NZB, dead
-						// provider URL). Mark it failed and re-resolve with it
-						// excluded so the next-ranked release is tried.
+						// provider URL), or a transport-temporary upstream failure
+						// exhausted both attempts. Re-resolve with the failed
+						// candidate excluded so the next-ranked release is tried.
+						//
+						// A transport-temporary relay failure (upstream 5xx after
+						// the relay's own open retry, or an unreachable upstream)
+						// is a provider-availability event, not a verdict about
+						// the release: two 503s half a second apart cannot
+						// distinguish an outage from a dead release, so the
+						// durable dead-candidate stamp is suppressed. The
+						// bounded rotation below still runs — the exclusion and
+						// relist let a same-release sibling serve this attempt —
+						// but nothing is persisted, so the pin stays eligible
+						// for the next auto-pick.
 						failedID := virtualResultCandidateID(deliveredPath)
-						if failedID != "" {
+						if failedID != "" && !relayTemporary {
 							h.markVirtualCandidateFailed(r.Context(), file, failedID)
 						}
 						excluded := []string{failedID}
 						if failedID == "" {
 							excluded = nil
 						}
-						// The retry is only reached because this serve layer just
-						// indicted the delivered candidate (failedID non-empty) and
-						// excluded it; declare substitution so the resolver may
-						// serve a sibling. A retry with no indictment (failedID
-						// empty) keeps refusing.
-						// The retry re-resolves with a forced relist and, because
-						// the edge just failed, a fresh relay registration: a
-						// reused token would replay the registration whose
-						// upstream returned 502 instead of presenting newly
-						// resolved bytes, mirroring the remux seek-anchor retry.
+						// Re-resolve with the failed candidate excluded so the
+						// next-ranked release can serve this attempt. The
+						// exclusion is normally the serve layer's own
+						// indictment of the delivered candidate; for a
+						// transport-temporary failure it is a bounded,
+						// non-durable rotation (the stamp above was skipped),
+						// so the resolver may serve a same-release sibling
+						// without anything being persisted. Declare
+						// substitution in either case: a retry with no
+						// identified candidate (failedID empty) keeps
+						// refusing, so a live pin is never swapped blindly.
+						// The retry re-resolves with a forced relist and,
+						// because the edge just failed, a fresh relay
+						// registration: a reused token would replay the
+						// registration whose upstream returned 5xx/502/503
+						// instead of presenting newly resolved bytes, mirroring
+						// the remux seek-anchor retry.
 						retryCtx := withVirtualRelayFreshRegistration(r.Context())
 						refreshedMedia, refreshCleanup, refreshErr := h.resolveVirtualInputURIExcluding(retryCtx, file, session.UserID, session.ProfileID, true, excluded, failedID != "")
 						if refreshErr == nil {
@@ -1326,6 +1528,16 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 								}
 								lastProxyErr = fmt.Errorf("refreshed candidate %q does not match pinned candidate %q", refreshedMedia.CandidateID, expectedCandidateID)
 							} else {
+								// Release any adopted registration first: the
+								// same-release retry above may hold one, and
+								// overwriting it would leak it until LRU/24h
+								// expiry. The original flow always arrives
+								// with nil here (released at failure entry),
+								// so this is a no-op there.
+								if releaseInput != nil {
+									releaseInput()
+									releaseInput = nil
+								}
 								releaseInput = refreshCleanup
 								refreshedURL, parseErr := url.Parse(refreshedMedia.URL)
 								if parseErr == nil && refreshedURL.Scheme == "http" {
@@ -1334,6 +1546,13 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 										targetURL = refreshedURL
 										deliveredPath = resolvedVirtualCandidatePath(refreshedMedia)
 										lastProxyErr = nil
+										// The rotated attempt has its own
+										// disposition: the first attempt's
+										// temporary/not-found marker must not
+										// decide whether this sibling's own
+										// verdict is stamped.
+										relayTemporary = false
+										relayNotFound = false
 										proxy.ServeHTTP(streamWriter, r)
 									}
 								}
@@ -1732,7 +1951,7 @@ func (h *StreamHandler) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 				"Failed to load external subtitle", err)
 			return
 		}
-		playback.ServeSubtitle(w, vttData, "vtt")
+		serveSubtitleVTT(w, vttData)
 		return
 	}
 
@@ -1811,6 +2030,18 @@ func (h *StreamHandler) serveDownloadedSubtitle(w http.ResponseWriter, r *http.R
 		writeErrorCause(w, http.StatusBadGateway, "s3_error", "Failed to load subtitle from storage", err)
 		return
 	}
+	// The stored timing correction can change behind the same URL; a player
+	// refetching after a sync or reset must not get a cached copy.
+	w.Header().Set("Cache-Control", "private, no-cache")
+	// Apply the stored timing correction to the original bytes, before any
+	// conversion; a per-request timestamp_offset still stacks on top.
+	data, err = subtitles.DeliveryBytes(&subtitle, data)
+	if err != nil {
+		slog.ErrorContext(r.Context(), "apply downloaded subtitle timing failed", "component", "api",
+			"downloaded_subtitle_id", subtitle.ID, "error", err)
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to prepare subtitle")
+		return
+	}
 
 	// Serve ASS/SSA downloaded subtitles as raw data, and SRT the same way
 	// when the URL asks for .srt.
@@ -1825,7 +2056,7 @@ func (h *StreamHandler) serveDownloadedSubtitle(w http.ResponseWriter, r *http.R
 
 	// If the subtitle is already VTT, serve directly.
 	if subtitle.Format == subtitles.FormatVTT {
-		playback.ServeSubtitle(w, data, "vtt")
+		serveSubtitleVTT(w, data)
 		return
 	}
 
@@ -1835,7 +2066,7 @@ func (h *StreamHandler) serveDownloadedSubtitle(w http.ResponseWriter, r *http.R
 		writeErrorCause(w, http.StatusInternalServerError, "convert_error", "Failed to convert subtitle", err)
 		return
 	}
-	playback.ServeSubtitle(w, vttData, "vtt")
+	serveSubtitleVTT(w, vttData)
 }
 
 // subtitleSidecarFormatSupported keeps bitmap and styled-text requests within
@@ -1870,6 +2101,13 @@ func servesOriginalSubRip(r *http.Request, codec, requestedFormat string) bool {
 		strings.EqualFold(strings.TrimSpace(requestedFormat), subtitleFormatSRT) &&
 		r.URL.Query().Get(playback.SubtitleOriginalParamV3) == "1" &&
 		isNativeAPIV2(r.Context())
+}
+
+// serveSubtitleVTT writes a sidecar or downloaded subtitle as WebVTT. Files
+// written for left-to-right players get their right-to-left lines marked so
+// the punctuation lands where the author put it.
+func serveSubtitleVTT(w http.ResponseWriter, data []byte) {
+	playback.ServeSubtitle(w, subtitles.MarkLTRAuthoredLines(data), "vtt")
 }
 
 // serveOriginalSubRip writes stored SRT bytes as they are. SRT declares no
@@ -1950,85 +2188,174 @@ type SubtitleFontRequest struct {
 // SubtitleFonts loads a bounded bundle of embedded ASS/SSA fonts. Both API
 // transports use this operation so reconstruction, deny markers and source-file
 // admission stay identical without invoking another transport's HTTP handler.
-func (h *StreamHandler) SubtitleFonts(ctx context.Context, in SubtitleFontRequest) ([]playback.SubtitleFontBundleItem, error) {
+func (h *StreamHandler) SubtitleFonts(ctx context.Context, in SubtitleFontRequest) ([]playback.SubtitleFontBundleItem, bool, error) {
 	userID := apimw.GetUserID(ctx)
 	if userID == 0 {
-		return nil, apiError(http.StatusUnauthorized, "unauthorized", "Authentication required")
+		return nil, false, apiError(http.StatusUnauthorized, "unauthorized", "Authentication required")
 	}
 	if in.SessionID == "" {
-		return nil, apiError(http.StatusBadRequest, "bad_request", "Session ID is required")
+		return nil, false, apiError(http.StatusBadRequest, "bad_request", "Session ID is required")
 	}
 	if lc := activitylog.GetPlaybackLogContext(ctx); lc != nil {
 		lc.PlaybackSessionID = in.SessionID
 	}
 	if h.StreamDeny.Denied(ctx, in.SessionID) {
-		return nil, apiError(http.StatusGone, playbackSessionEndedErrorCode, "Playback session has ended")
+		return nil, false, apiError(http.StatusGone, playbackSessionEndedErrorCode, "Playback session has ended")
 	}
 	session, claims, err := h.loadSidecarSession(ctx, in.Query.Get(streamTokenParam), in.SessionID, userID)
 	if err != nil {
-		return nil, err
+		var apiErr *APIError
+		if errors.As(err, &apiErr) && apiErr.Status >= http.StatusInternalServerError {
+			cause := apiErr.cause
+			if cause == nil {
+				cause = apiErr
+			}
+			h.logSubtitleFontInternalError(ctx, in, 0, -1, "session_load", cause)
+		}
+		return nil, false, err
 	}
 	attachPlaybackSession(ctx, session, claims)
 
 	fileID, err := subtitleSourceFile(in.Query.Get("file_id"), session)
 	if err != nil {
-		return nil, apiError(http.StatusBadRequest, "bad_request", err.Error())
+		return nil, false, apiError(http.StatusBadRequest, "bad_request", err.Error())
 	}
 	file, err := h.fileResolver.GetByID(ctx, fileID)
 	if err != nil || file == nil {
-		return nil, apiError(http.StatusNotFound, "not_found", "Media file not found")
+		return nil, false, apiError(http.StatusNotFound, "not_found", "Media file not found")
 	}
 
 	trackIndex, _, err := playback.ParseSubtitleTrackParam(in.Track)
 	if err != nil {
-		return nil, apiError(http.StatusBadRequest, "bad_request", "Invalid subtitle track index")
+		return nil, false, apiError(http.StatusBadRequest, "bad_request", "Invalid subtitle track index")
 	}
 	file, trackIndex, err = h.resolveSubtitleSourceRequest(ctx, file, session, trackIndex, in.Query)
 	if err != nil {
 		if errors.Is(err, errSubtitleIdentityInvalid) {
-			return nil, apiError(http.StatusBadRequest, "bad_request", err.Error())
+			return nil, false, apiError(http.StatusBadRequest, "bad_request", err.Error())
 		}
-		return nil, apiError(http.StatusNotFound, "not_found", err.Error())
+		return nil, false, apiError(http.StatusNotFound, "not_found", err.Error())
 	}
+	// Source admission comes first: a missing local file must answer 404 and
+	// end the session regardless of the codec, and only a genuinely
+	// inaccessible file answers internal_error. (Virtual rows short-circuit
+	// preflight, so their codec refusal below still answers without any
+	// provider round-trip.)
 	if err := preflightPlaybackFile(ctx, file, h.MissingMarker, h.EventsHub); err != nil {
 		if isPlaybackFileMissing(err) {
 			h.abortPlaybackSession(ctx, session)
-			return nil, apiError(http.StatusNotFound, "not_found", "Source media file is missing")
+			return nil, false, apiError(http.StatusNotFound, "not_found", "Source media file is missing")
 		}
-		return nil, apiError(http.StatusInternalServerError, "internal_error", "Failed to access source media file")
+		h.logSubtitleFontInternalError(ctx, in, file.ID, trackIndex, "source_preflight", err)
+		return nil, false, apiError(http.StatusInternalServerError, "internal_error", "Failed to access source media file")
 	}
-
+	// Validate the requested ordinal and codec before extraction. A non-ASS
+	// ordinal or one outside the embedded range is a client error no retry
+	// can satisfy; it answers 4xx here and never reaches the (500-capable)
+	// extraction.
 	embeddedIndex := trackIndex - len(file.ExternalSubtitles)
 	if embeddedIndex < 0 || embeddedIndex >= len(file.SubtitleTracks) {
-		return nil, apiError(http.StatusNotFound, "not_found", "Embedded subtitle track not found")
+		return nil, false, apiError(http.StatusNotFound, "not_found", "Embedded subtitle track not found")
 	}
 	if !playback.IsASS(file.SubtitleTracks[embeddedIndex].Codec) {
-		return nil, apiError(http.StatusBadRequest, "bad_request", "Subtitle font bundles are only available for ASS/SSA tracks")
+		return nil, false, apiError(http.StatusBadRequest, "bad_request", "Subtitle font bundles are only available for ASS/SSA tracks")
 	}
-	// A virtual file's stored path is a virtual:// URI that ffprobe cannot
-	// read; resolve the provider input for this request, mirroring the v1
-	// uncached path, and release the relay registration when we return.
-	inputPath := file.FilePath
-	releaseInput := func() {}
-	if isVirtualPlaybackFile(file) && session.VirtualSourceURI != "" && hasVirtualMediaResolver(h) {
-		var resolved ResolvedVirtualMedia
-		resolved, releaseInput, err = h.resolveVirtualInputURI(ctx, file, session.UserID, session.ProfileID, false)
-		if err != nil {
+	// Virtual rows resolve through the relay inside the shared core: a
+	// provider-neutral virtual:// URI is not an FFmpeg input, so probing it
+	// directly always fails with a 500 the client then retries in a storm.
+	items, pending, err := h.fontBundleForRequest(ctx, session, file, trackIndex)
+	if err != nil {
+		if errors.Is(err, errVirtualFontResolve) {
 			logVirtualStreamFailure(ctx, session.ID, file, err)
-			return nil, apiError(http.StatusBadGateway, subtitleSourceUnavailableErrorCode, "Failed to resolve virtual source for the subtitle font bundle")
+			return nil, false, apiError(http.StatusBadGateway, subtitleSourceUnavailableErrorCode, "Failed to resolve virtual source for the subtitle font bundle")
 		}
-		inputPath = resolved.URL
+		// Throttle logging already happened in the shared core.
+		return nil, false, apiError(http.StatusInternalServerError, "font_extract_failed", "Failed to extract subtitle fonts")
+	}
+	return items, pending, nil
+}
+
+// fontBundleForRequest resolves one already-admitted embedded ASS track's
+// attached-font bundle through the warmed cache shared with the v1 route and
+// the playback pre-warm. A cache hit serves immediately; otherwise a detached
+// single-flight extracts while the caller waits up to fontBundleClientWait and
+// then receives pending=true. Virtual inputs are resolved through the relay —
+// a provider-neutral virtual:// URI is not an FFmpeg input, so probing it
+// directly always fails. Virtual keys without a pinned result= are
+// uncacheable and extract uncached within the request. The returned pending
+// flag tells the caller to answer uncacheable/pending rather than definitive.
+func (h *StreamHandler) fontBundleForRequest(ctx context.Context, session *playback.Session, file *models.MediaFile, trackIndex int) ([]playback.SubtitleFontBundleItem, bool, error) {
+	failKey := fontExtractFailureKey(file.ID, trackIndex)
+	failAttrs := []any{"file_id", file.ID, "track", trackIndex}
+	virtualFontSource := isVirtualPlaybackFile(file) && session.VirtualSourceURI != ""
+	cacheKey := fontBundleCacheKey(file, session.VirtualSourceURI, h.ffmpegPath())
+
+	resolveInput := func(extractCtx context.Context) (string, func(), error) {
+		inputPath := file.FilePath
+		releaseInput := func() {}
+		if virtualFontSource && hasVirtualMediaResolver(h) {
+			resolved, cleanup, resolveErr := h.resolveVirtualInputURI(extractCtx, file, session.UserID, session.ProfileID, false)
+			if resolveErr != nil {
+				return "", nil, fmt.Errorf("%w: %w", errVirtualFontResolve, resolveErr)
+			}
+			inputPath = resolved.URL
+			releaseInput = cleanup
+		}
+		return inputPath, releaseInput, nil
+	}
+
+	if h.SubtitleCache != nil && !(virtualFontSource && cacheKey.PinnedResult == "") {
+		if cached, ok := h.SubtitleCache.LookupFontBundle(cacheKey); ok {
+			h.fontExtractFailures.recovered(failKey)
+			var items []playback.SubtitleFontBundleItem
+			if err := json.Unmarshal(cached, &items); err != nil {
+				return nil, false, err
+			}
+			return items, false, nil
+		}
+		bundle, ready, err := h.SubtitleCache.ExtractFontBundleWithin(ctx, cacheKey, fontBundleClientWait, func(extractCtx context.Context) ([]byte, error) {
+			inputPath, releaseInput, resolveErr := resolveInput(extractCtx)
+			if resolveErr != nil {
+				return nil, resolveErr
+			}
+			defer releaseInput()
+			fonts, extractErr := playback.ExtractAttachedSubtitleFonts(extractCtx, inputPath, h.ffmpegPath())
+			if extractErr != nil {
+				return nil, extractErr
+			}
+			return json.Marshal(playback.EncodeSubtitleFontBundle(fonts))
+		})
+		if err != nil {
+			if !errors.Is(err, errVirtualFontResolve) {
+				h.fontExtractFailures.failed(ctx, failKey, append(failAttrs, "error", err)...)
+			}
+			return nil, false, err
+		}
+		if !ready {
+			return nil, true, nil
+		}
+		h.fontExtractFailures.recovered(failKey)
+		var items []playback.SubtitleFontBundleItem
+		if err := json.Unmarshal(bundle, &items); err != nil {
+			return nil, false, err
+		}
+		return items, false, nil
+	}
+
+	// No cache configured, or an uncacheable virtual key: extract uncached
+	// within the request, still resolved through the relay.
+	inputPath, releaseInput, err := resolveInput(ctx)
+	if err != nil {
+		return nil, false, err
 	}
 	defer releaseInput()
-
 	fonts, err := playback.ExtractAttachedSubtitleFonts(ctx, inputPath, h.ffmpegPath())
 	if err != nil {
-		h.fontExtractFailures.failed(ctx, fontExtractFailureKey(file.ID, trackIndex),
-			"file_id", file.ID, "track", trackIndex, "error", err)
-		return nil, apiError(http.StatusInternalServerError, "font_extract_failed", "Failed to extract subtitle fonts")
+		h.fontExtractFailures.failed(ctx, failKey, append(failAttrs, "error", err)...)
+		return nil, false, err
 	}
-	h.fontExtractFailures.recovered(fontExtractFailureKey(file.ID, trackIndex))
-	return playback.EncodeSubtitleFontBundle(fonts), nil
+	h.fontExtractFailures.recovered(failKey)
+	return playback.EncodeSubtitleFontBundle(fonts), false, nil
 }
 
 // HandleSubtitleFonts preserves the bridge API's array response and serves
@@ -2053,6 +2380,18 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 
 	session, claims, err := h.loadSidecarSession(r.Context(), r.URL.Query().Get(streamTokenParam), sessionID, userID)
 	if err != nil {
+		var apiErr *APIError
+		if errors.As(err, &apiErr) && apiErr.Status >= http.StatusInternalServerError {
+			cause := apiErr.cause
+			if cause == nil {
+				cause = apiErr
+			}
+			h.logSubtitleFontInternalError(r.Context(), SubtitleFontRequest{
+				SessionID: sessionID,
+				Track:     chi.URLParam(r, "track"),
+				Query:     r.URL.Query(),
+			}, 0, -1, "session_load", cause)
+		}
 		writeAPIError(w, err)
 		return
 	}
@@ -2096,14 +2435,29 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 		}
 		return
 	}
+	// Source admission comes first (same ordering as SubtitleFonts): a
+	// missing local file answers 404 and ends the session regardless of the
+	// codec; a genuinely inaccessible file answers internal_error. Virtual
+	// rows short-circuit preflight, so their codec refusal below still
+	// answers without a provider round-trip.
 	if err := preflightPlaybackFile(r.Context(), file, h.MissingMarker, h.EventsHub); err != nil {
 		if isPlaybackFileMissing(err) {
 			h.abortPlaybackSession(r.Context(), session)
+			writePlaybackFilePreflightError(w, err)
+			return
 		}
+		h.logSubtitleFontInternalError(r.Context(), SubtitleFontRequest{
+			SessionID: sessionID,
+			Track:     trackParam,
+			Query:     r.URL.Query(),
+		}, file.ID, trackIndex, "source_preflight", err)
 		writePlaybackFilePreflightError(w, err)
 		return
 	}
-
+	// Validate the requested ordinal and codec before extraction, so a
+	// permanently unsatisfiable request (non-ASS ordinal, ordinal outside the
+	// embedded range) answers 4xx and never reaches the 500-capable
+	// extraction.
 	embeddedIndex := trackIndex - len(file.ExternalSubtitles)
 	if embeddedIndex < 0 || embeddedIndex >= len(file.SubtitleTracks) {
 		writeError(w, http.StatusNotFound, "not_found", "Embedded subtitle track not found")
@@ -2131,6 +2485,10 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 	// no relay registration, no ffmpeg spawn.
 	if h.SubtitleCache != nil {
 		if cached, ok := h.SubtitleCache.LookupFontBundle(cacheKey); ok {
+			// A detached extraction can complete between requests; serving its
+			// cached bundle is confirmed recovery, so clear the throttle key
+			// and let a later regression warn again.
+			h.fontExtractFailures.recovered(fontExtractFailureKey(file.ID, trackIndex))
 			writeFontBundleResponse(w, cached)
 			return
 		}
@@ -2214,18 +2572,22 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusInternalServerError, "font_extract_failed", "Failed to extract subtitle fonts")
 		return
 	}
-	h.fontExtractFailures.recovered(fontExtractFailureKey(file.ID, trackIndex))
 	if !ready {
 		// The extraction is still running detached. Hold the request only for
 		// fontBundleClientWait, then hand the client a distinguishable,
 		// uncacheable pending bundle so it falls back to default fonts
 		// immediately and re-fetches; the single-flighted extraction keeps
-		// running and lands in the cache for that next fetch.
+		// running and lands in the cache for that next fetch. A prior failure
+		// key stays set: recovery is not confirmed until a bundle is actually
+		// served, so a slow retry that fails still logs at debug.
 		slog.DebugContext(r.Context(), "subtitle font bundle extraction in flight; serving pending bundle",
 			"component", "api", "file_id", file.ID, "track", trackIndex)
 		writePendingFontBundleResponse(w)
 		return
 	}
+	// Recovery is confirmed by the completed bundle; only now clear the
+	// throttle key so a later regression warns again.
+	h.fontExtractFailures.recovered(fontExtractFailureKey(file.ID, trackIndex))
 	writeFontBundleResponse(w, bundle)
 }
 
@@ -2617,6 +2979,16 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 			panic(http.ErrAbortHandler)
 		}
 		if !virtualActive || !playback.IsSubtitleStreamMapError(extractErr) {
+			if playback.IsSubtitleUpstreamError(extractErr) || isRelayTokenNotFoundError(extractErr, opts.InputPath) {
+				// The relay input 5xxed under ffmpeg, or our relay token
+				// lapsed mid-flight: the extraction command is fine and a
+				// retry (which re-resolves a fresh token) may succeed.
+				// Answer retryable rather than failed so the client keeps
+				// its backoff loop instead of spending its terminal budget.
+				clearSubtitleCoverageHeaders(w.Header())
+				writeSubtitleSourceUnavailable(w)
+				return
+			}
 			clearSubtitleCoverageHeaders(w.Header())
 			writeError(w, http.StatusInternalServerError, "subtitle_extract_failed", "Failed to extract subtitles")
 			return
@@ -2659,6 +3031,11 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 			}
 			if playback.IsSubtitleStreamMapError(retryErr) {
 				writeSubtitleSourceChanged(w)
+				return
+			}
+			if playback.IsSubtitleUpstreamError(retryErr) || isRelayTokenNotFoundError(retryErr, opts.InputPath) {
+				clearSubtitleCoverageHeaders(w.Header())
+				writeSubtitleSourceUnavailable(w)
 				return
 			}
 			clearSubtitleCoverageHeaders(w.Header())
@@ -2966,6 +3343,28 @@ func (h *StreamHandler) verifyVirtualSubtitleLayout(ctx context.Context, request
 		"codec", liveTrack.Codec,
 		"language", liveTrack.Language)
 	return true, nil
+}
+
+// isRelayTokenNotFoundError reports whether an ffmpeg extraction failure is
+// a relay-own 404: the relay URL (always loopback) answered 404, which means
+// our registration lapsed (LRU eviction, 24h expiry) — never a dead release,
+// because upstream 404s arrive collapsed as 502. Callers answer retryable so
+// the client's next fetch re-resolves a fresh token instead of spending the
+// terminal budget on our bookkeeping.
+func isRelayTokenNotFoundError(err error, inputPath string) bool {
+	if err == nil {
+		return false
+	}
+	parsed, parseErr := url.Parse(strings.TrimSpace(inputPath))
+	if parseErr != nil || parsed == nil {
+		return false
+	}
+	switch parsed.Hostname() {
+	case "127.0.0.1", "::1":
+	default:
+		return false
+	}
+	return strings.Contains(err.Error(), "Server returned 404")
 }
 
 // clearSubtitleCoverageHeaders removes the bounded-window markers before an

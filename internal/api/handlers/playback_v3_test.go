@@ -4519,6 +4519,26 @@ func TestRemotePlaybackTransportSanitizesNodeURLFromTransportError(t *testing.T)
 	}
 }
 
+func TestRemotePlaybackTransportRejectsUnresolvedVirtualInput(t *testing.T) {
+	handler := &PlaybackHandler{}
+	for _, candidate := range []string{
+		"virtual://movie/123",
+		"  virtual://movie/123",
+		"VIRTUAL://movie/123",
+	} {
+		_, _, err := handler.startRemotePlaybackTransport(
+			context.Background(),
+			"http://127.0.0.1:8080",
+			transcodenode.TranscodeStartRequest{
+				InputPath: candidate,
+			},
+		)
+		if err == nil || !strings.Contains(err.Error(), "unresolved virtual sources require an integrated transcode transport") {
+			t.Fatalf("candidate %q: expected unresolved virtual input rejection, got: %v", candidate, err)
+		}
+	}
+}
+
 func TestCombineTransportErrorsV3KeepsAnyRetryableValidationFailure(t *testing.T) {
 	stale := toneMapExecutionTransportErrorV3(tonemap.ErrSourceRevisionChanged, "stale")
 	transient := toneMapExecutionTransportErrorV3(playback.ErrToneMapSourceValidationUnavailable, "transient")
@@ -8423,6 +8443,51 @@ func TestPrepareTransportV3KeepsVirtualSourceOnIntegratedTransport(t *testing.T)
 	}
 }
 
+func TestPrepareTransportV3KeepsVirtualProgressiveRemuxOnIntegratedTransport(t *testing.T) {
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	handler.JWTSecret = "test-secret"
+	handler.v3Registry = playback.NewTransformationRegistryV3([]playback.TransformationSpecV3{
+		{Name: playback.TransformationAudioToAACV3, RecipeVersion: playback.TransformationAudioToAACRecipeVersionV3, Available: true},
+	})
+	planner := &recordingNodePlannerV3{plan: nodepool.Plan{ProxyNode: &nodepool.Node{URL: "http://proxy-virtual"}}}
+	handler.NodePlanner = planner
+
+	file := v3HandlerFixtureFile(t)
+	file.FilePath = "virtual://movie/example?result=stable"
+	file.Container = "mkv"
+	transport, transportErr := handler.prepareTransportV3(
+		httptest.NewRequest(http.MethodPost, "/", nil),
+		&playback.Session{ID: "session-virtual-remux", UserID: 7, ProfileID: "profile-1"},
+		file,
+		playback.PlannerResultV3{
+			Plan: identityProxyPlanV3(playback.DeliveryRemuxProgressiveV3, playback.TransformationV3{
+				Name:          playback.TransformationAudioToAACV3,
+				Executor:      playback.ExecutorServerV3,
+				RecipeVersion: playback.TransformationAudioToAACRecipeVersionV3,
+			}),
+			PlayMethod: playback.PlayRemux,
+		},
+		mediaAuthModeV3{},
+	)
+	if transportErr != nil {
+		t.Fatalf("prepare virtual remux transport: %v", transportErr)
+	}
+	defer transport.rollback()
+
+	if !strings.HasPrefix(transport.url, "/stream/session-virtual-remux") {
+		t.Fatalf("virtual stream url = %q, want the integrated API path", transport.url)
+	}
+	if planner.plannedSessionID != "" {
+		t.Fatalf("virtual remux was assigned to pooled node for session %q", planner.plannedSessionID)
+	}
+	if transport.routingExecution != noderouting.ExecutionAPI {
+		t.Fatalf("virtual remux execution = %q, want %q", transport.routingExecution, noderouting.ExecutionAPI)
+	}
+	if transport.routingEgress != noderouting.EgressAPI {
+		t.Fatalf("virtual remux egress = %q, want %q", transport.routingEgress, noderouting.EgressAPI)
+	}
+}
+
 func TestPrepareTransportV3VirtualRemuxResolvesCopyAnchorThroughRelay(t *testing.T) {
 	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
 	handler.JWTSecret = "test-secret"
@@ -10241,6 +10306,64 @@ func TestPrepareLocalTransportV3CarriesSourceFrameRateAndHeight(t *testing.T) {
 	if claims.SourceFrameRate != 23.976 || claims.SourceHeight != 2160 {
 		t.Fatalf("local recipe source facts = (%v, %d), want (23.976, 2160)", claims.SourceFrameRate, claims.SourceHeight)
 	}
+}
+
+func TestPrepareRemoteTransportV3ResolvesVirtualInputToRelay(t *testing.T) {
+	var got transcodenode.TranscodeStartRequest
+	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/transcode/start" {
+			if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(transcodenode.TranscodeStartResponse{
+				SessionID:          got.SessionID,
+				Status:             "started",
+				AudioRecipeVersion: got.AudioRecipeVersion,
+			})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer node.Close()
+
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	handler.JWTSecret = "test-secret"
+	resolvedRelayURL := "http://127.0.0.1:45678/source/tok123/stream.mkv"
+	cleanupCalled := false
+	handler.tm.ResolveInput = func(ctx context.Context, mediaFileID int, ownerInstallationID int, userID int, profileID string, canonicalPath string) (string, func(), error) {
+		return resolvedRelayURL, func() { cleanupCalled = true }, nil
+	}
+
+	result := remoteHLSResultV3()
+	virtualFile := &models.MediaFile{
+		ID:                         42,
+		FilePath:                   "virtual://movie/tt1234567",
+		Container:                  "virtual",
+		VirtualOwnerInstallationID: 19,
+	}
+
+	transport, transportErr := handler.prepareRemoteTransportV3(
+		httptest.NewRequest(http.MethodPost, "/", nil),
+		&playback.Session{ID: "session-virtual-remote", UserID: 7, ProfileID: "profile-1"},
+		virtualFile, result,
+		nodepool.Plan{TranscodeNode: &nodepool.Node{URL: node.URL}},
+		preparedTimelineV3{},
+		headerAuthenticatedMediaV3([]string{playback.FeatureHeaderAuthenticatedMediaV3}),
+	)
+	if transportErr != nil {
+		t.Fatalf("prepare remote transport: %v", transportErr)
+	}
+	defer transport.rollback()
+
+	if got.InputPath != resolvedRelayURL {
+		t.Fatalf("remote node received InputPath = %q, want %q", got.InputPath, resolvedRelayURL)
+	}
+	if !shouldUsePooledPlaybackNodeV3(virtualFile) {
+		t.Fatal("virtual file should be allowed on pooled playback nodes")
+	}
+	_ = cleanupCalled
 }
 
 func startPlaybackV2IntoRecorder(t *testing.T, h *PlaybackHandler, rr *httptest.ResponseRecorder, request playback.StartRequestV3) {

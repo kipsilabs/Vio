@@ -150,7 +150,10 @@ func TestRetainedGenerationWorkerLossIsBounded(t *testing.T) {
 
 	// Past the window a read reaps the entry and its directory (the entry's own
 	// timer also reaps it out-of-band). Wait on the observable expiry deadline,
-	// not a fixed sleep.
+	// not a fixed sleep. The Close removes the directory asynchronously to the
+	// winning read, so poll the directory itself before asserting it is gone:
+	// the entry being nil proves the reap won, the stat proves the Close
+	// finished removing the bytes.
 	deadline := time.Now().Add(6 * time.Second)
 	for {
 		if retained := m.GetRetainedTranscodeSession("s1"); retained == nil {
@@ -161,12 +164,25 @@ func TestRetainedGenerationWorkerLossIsBounded(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	if _, err := os.Stat(preDir); !os.IsNotExist(err) {
-		t.Fatalf("expired retained dir still exists: %v", err)
+	dirDeadline := time.Now().Add(6 * time.Second)
+	for {
+		if _, err := os.Stat(preDir); os.IsNotExist(err) {
+			break
+		}
+		if time.Now().After(dirDeadline) {
+			t.Fatalf("expired retained dir still exists: %v", errForTestDir(preDir))
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 	if got := m.GetRetainedTranscodeSession("s1"); got != nil {
 		t.Fatal("expired retained generation reappeared after reaping")
 	}
+}
+
+// errForTestDir stats dir for a failure message without discarding the error.
+func errForTestDir(dir string) error {
+	_, err := os.Stat(dir)
+	return err
 }
 
 // TestDeadLiveGenerationSegmentFailsDeterministically proves a segment the dead

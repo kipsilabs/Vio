@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"time"
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
 	"github.com/hashicorp/go-hclog"
@@ -15,7 +14,6 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/events"
 )
 
@@ -89,22 +87,6 @@ func (f GlobalConfigSetterFunc) SetGlobalConfigEntry(ctx context.Context, instal
 	return f(ctx, installationID, key, value)
 }
 
-// VirtualCatalogRegistrar performs host-owned transactional registration of
-// virtual media submitted by an installed plugin.
-type VirtualCatalogRegistrar interface {
-	UpsertVirtualMedia(context.Context, int, catalog.VirtualMedia) (*catalog.VirtualMediaResult, error)
-}
-
-type VirtualCatalogReconciler interface {
-	ReconcileVirtualMedia(context.Context, int, string, []string, []int) (catalog.VirtualReconcileResult, error)
-}
-
-type VirtualCatalogRegistrarFunc func(context.Context, int, catalog.VirtualMedia) (*catalog.VirtualMediaResult, error)
-
-func (f VirtualCatalogRegistrarFunc) UpsertVirtualMedia(ctx context.Context, installationID int, req catalog.VirtualMedia) (*catalog.VirtualMediaResult, error) {
-	return f(ctx, installationID, req)
-}
-
 // DefaultPublishEventRatePerSec is the default maximum number of events a
 // plugin may publish per second. It also serves as the burst size so a plugin
 // can fire a short burst at a higher rate before being throttled.
@@ -123,7 +105,6 @@ type RuntimeHostServer struct {
 
 	installedPlugins InstalledPluginLister
 	configSetter     GlobalConfigSetter
-	virtualCatalog   VirtualCatalogRegistrar
 	installationID   int
 
 	hostInfo      HostInfoFunc
@@ -148,11 +129,7 @@ type RuntimeHostOptions struct {
 	HostInfo           HostInfoFunc
 	InstanceState      InstanceStateStore
 	NetworkAccess      NetworkAccessBroker
-	// VirtualCatalog owns virtual media registration requested by plugins
-	// (fork: virtual-library traffic resolves through core; plugins register
-	// into the catalog via this host-owned registrar, never via dispatch).
-	VirtualCatalog VirtualCatalogRegistrar
-	Logger         hclog.Logger
+	Logger             hclog.Logger
 	// EventRatePerSec caps PublishEvent; <= 0 takes DefaultPublishEventRatePerSec.
 	EventRatePerSec int
 
@@ -178,7 +155,6 @@ func NewRuntimeHostServerWithOptions(opts RuntimeHostOptions) *RuntimeHostServer
 	s.hostInfo = opts.HostInfo
 	s.instanceState = opts.InstanceState
 	s.networkAccess = opts.NetworkAccess
-	s.virtualCatalog = opts.VirtualCatalog
 	s.provider = opts.NetworkAccessProvider
 	s.ingressToken = opts.IngressToken
 	s.logger = opts.Logger
@@ -232,154 +208,14 @@ func NewRuntimeHostServerWithServices(
 	catalog CatalogPresenceLookup,
 	installedPlugins InstalledPluginLister,
 	configSetter GlobalConfigSetter,
-	virtualCatalog VirtualCatalogRegistrar,
 	pluginID string,
 	installationID int,
 ) *RuntimeHostServer {
 	s := NewRuntimeHostServerWithCatalog(publisher, libs, catalog, pluginID)
 	s.installedPlugins = installedPlugins
 	s.configSetter = configSetter
-	s.virtualCatalog = virtualCatalog
 	s.installationID = installationID
 	return s
-}
-
-func (s *RuntimeHostServer) UpsertVirtualMedia(ctx context.Context, req *pluginv1.UpsertVirtualMediaRequest) (*pluginv1.UpsertVirtualMediaResponse, error) {
-	if s.virtualCatalog == nil {
-		return nil, fmt.Errorf("server: virtual catalog is not configured")
-	}
-	if s.installationID <= 0 {
-		return nil, fmt.Errorf("server: plugin installation is not bound")
-	}
-
-	variants := make([]catalog.VirtualMediaVariant, 0, len(req.GetVariants()))
-	for _, v := range req.GetVariants() {
-		variants = append(variants, catalog.VirtualMediaVariant{
-			VirtualURI:     v.GetVirtualUri(),
-			Label:          v.GetLabel(),
-			Resolution:     v.GetResolution(),
-			CodecVideo:     v.GetCodecVideo(),
-			CodecAudio:     v.GetCodecAudio(),
-			HDR:            v.GetHdr(),
-			Bitrate:        int(v.GetBitrate()),
-			RuntimeMinutes: int(v.GetRuntimeMinutes()),
-			FileSize:       v.GetFileSize(), Container: v.GetContainer(), SourceType: v.GetSourceType(),
-			AudioLanguages: v.GetAudioLanguages(), SubtitleLanguages: v.GetSubtitleLanguages(), Availability: v.GetAvailability(),
-		})
-	}
-
-	episodes := make([]catalog.VirtualEpisode, 0, len(req.GetEpisodes()))
-	for _, episode := range req.GetEpisodes() {
-		var airDate time.Time
-		if episode.GetAirDateUnix() > 0 {
-			airDate = time.Unix(episode.GetAirDateUnix(), 0).UTC()
-		}
-		epVariants := make([]catalog.VirtualMediaVariant, 0, len(episode.GetVariants()))
-		for _, v := range episode.GetVariants() {
-			epVariants = append(epVariants, catalog.VirtualMediaVariant{
-				VirtualURI:     v.GetVirtualUri(),
-				Label:          v.GetLabel(),
-				Resolution:     v.GetResolution(),
-				CodecVideo:     v.GetCodecVideo(),
-				CodecAudio:     v.GetCodecAudio(),
-				HDR:            v.GetHdr(),
-				Bitrate:        int(v.GetBitrate()),
-				RuntimeMinutes: int(v.GetRuntimeMinutes()),
-				FileSize:       v.GetFileSize(), Container: v.GetContainer(), SourceType: v.GetSourceType(),
-				AudioLanguages: v.GetAudioLanguages(), SubtitleLanguages: v.GetSubtitleLanguages(), Availability: v.GetAvailability(),
-			})
-		}
-		// Carry first-variant metadata to the episode so non-variant
-		// upsertVirtualFileWithMeta stores audio/subtitle languages.
-		var epResolution, epCodecVideo, epCodecAudio, epHDR, epContainer, epSourceType string
-		var epBitrate int
-		var epFileSize int64
-		var epAudioLangs, epSubLangs []string
-		if len(epVariants) > 0 {
-			epResolution = epVariants[0].Resolution
-			epCodecVideo = epVariants[0].CodecVideo
-			epCodecAudio = epVariants[0].CodecAudio
-			epHDR = epVariants[0].HDR
-			epBitrate = epVariants[0].Bitrate
-			epFileSize = epVariants[0].FileSize
-			epContainer = epVariants[0].Container
-			epSourceType = epVariants[0].SourceType
-			epAudioLangs = epVariants[0].AudioLanguages
-			epSubLangs = epVariants[0].SubtitleLanguages
-		}
-		episodes = append(episodes, catalog.VirtualEpisode{
-			SeasonNumber: int(episode.GetSeasonNumber()), EpisodeNumber: int(episode.GetEpisodeNumber()),
-			Title: episode.GetTitle(), Overview: episode.GetOverview(), AirDate: airDate,
-			RuntimeMinutes: int(episode.GetRuntimeMinutes()), StillPath: episode.GetStillPath(), VirtualURI: episode.GetVirtualUri(),
-			Variants:   epVariants,
-			Resolution: epResolution, CodecVideo: epCodecVideo, CodecAudio: epCodecAudio,
-			HDR: epHDR, Bitrate: epBitrate, FileSize: epFileSize,
-			Container: epContainer, SourceType: epSourceType,
-			AudioLanguages: epAudioLangs, SubtitleLanguages: epSubLangs,
-		})
-	}
-
-	// Carry top-level stream metadata from the first variant when the request
-	// carries no dedicated top-level fields — this lets the catalog store
-	// resolution, codecs, audio/subtitle languages so the watch detail and
-	// player UI show track options without waiting for a playback probe.
-	var topResolution, topCodecVideo, topCodecAudio, topHDR, topContainer, topSourceType string
-	var topBitrate int
-	var topFileSize int64
-	var topAudioLangs, topSubLangs []string
-	if len(variants) > 0 {
-		topResolution = variants[0].Resolution
-		topCodecVideo = variants[0].CodecVideo
-		topCodecAudio = variants[0].CodecAudio
-		topHDR = variants[0].HDR
-		topBitrate = variants[0].Bitrate
-		topFileSize = variants[0].FileSize
-		topContainer = variants[0].Container
-		topSourceType = variants[0].SourceType
-		topAudioLangs = variants[0].AudioLanguages
-		topSubLangs = variants[0].SubtitleLanguages
-	}
-	vm := catalog.VirtualMedia{
-		LibraryID: req.GetLibraryId(), MediaType: req.GetMediaType(), Title: req.GetTitle(), Year: int(req.GetYear()),
-		IMDbID: req.GetImdbId(), TMDBID: req.GetTmdbId(), TVDBID: req.GetTvdbId(), Overview: req.GetOverview(),
-		Genres: req.GetGenres(), PosterPath: req.GetPosterPath(), BackdropPath: req.GetBackdropPath(),
-		VirtualURI: req.GetVirtualUri(), RuntimeMinutes: int(req.GetRuntimeMinutes()), Episodes: episodes,
-		Variants: variants, Source: req.GetSourceKey(),
-		Resolution: topResolution, CodecVideo: topCodecVideo, CodecAudio: topCodecAudio,
-		HDR: topHDR, Bitrate: topBitrate, FileSize: topFileSize,
-		Container: topContainer, SourceType: topSourceType,
-		AudioLanguages: topAudioLangs, SubtitleLanguages: topSubLangs,
-	}
-
-	result, err := s.virtualCatalog.UpsertVirtualMedia(ctx, s.installationID, vm)
-	if err != nil {
-		return nil, err
-	}
-	return &pluginv1.UpsertVirtualMediaResponse{MediaId: result.MediaID, LibraryId: result.LibraryID, EpisodesUpserted: int32(result.EpisodesUpserted)}, nil
-}
-
-func (s *RuntimeHostServer) ReconcileVirtualMedia(ctx context.Context, req *pluginv1.ReconcileVirtualMediaRequest) (*pluginv1.ReconcileVirtualMediaResponse, error) {
-	reconciler, ok := s.virtualCatalog.(VirtualCatalogReconciler)
-	if !ok {
-		return nil, errors.New("server: virtual catalog is not configured")
-	}
-	sourceKey := strings.TrimSpace(req.GetSourceKey())
-	if sourceKey == "" {
-		return nil, errors.New("source_key is required")
-	}
-	libraryIDs := make([]int, 0, len(req.GetLibraryIds()))
-	for _, value := range req.GetLibraryIds() {
-		id, err := strconv.Atoi(strings.TrimSpace(value))
-		if err != nil || id <= 0 {
-			return nil, fmt.Errorf("invalid library_id %q", value)
-		}
-		libraryIDs = append(libraryIDs, id)
-	}
-	result, err := reconciler.ReconcileVirtualMedia(ctx, s.installationID, sourceKey, req.GetKeepMediaIds(), libraryIDs)
-	if err != nil {
-		return nil, err
-	}
-	return &pluginv1.ReconcileVirtualMediaResponse{ItemsRemoved: int32(result.ItemsRemoved), FilesRemoved: int32(result.FilesRemoved)}, nil
 }
 
 // PublishEvent auto-prefixes the plugin's event name with "plugin.<plugin_id>."
@@ -558,10 +394,9 @@ func (s *RuntimeHostServer) CheckMediaPresence(ctx context.Context, req *pluginv
 	return resp, nil
 }
 
-// GetHostInfo reports the hosting process: public and loopback base URLs.
-// NOTE (fork, stripped for SDK): the pinned plugin SDK predates the
-// HostRole/HostName/NodeId/Listeners/IngressToken response fields, so only
-// the base URLs are reported until the SDK is updated.
+// GetHostInfo reports the hosting process: public and loopback base URLs,
+// role, name, node id, the listeners a network access provider should expose
+// and, for providers, the ingress token issued for this process instance.
 func (s *RuntimeHostServer) GetHostInfo(ctx context.Context, _ *pluginv1.GetHostInfoRequest) (*pluginv1.GetHostInfoResponse, error) {
 	if s.hostInfo == nil {
 		return nil, status.Error(codes.Unimplemented, "host info is not configured")
@@ -572,6 +407,9 @@ func (s *RuntimeHostServer) GetHostInfo(ctx context.Context, _ *pluginv1.GetHost
 	}
 	resp := &pluginv1.GetHostInfoResponse{
 		PublicBaseUrl: strings.TrimRight(info.PublicBaseURL, "/"),
+		HostRole:      info.Role,
+		HostName:      info.Name,
+		NodeId:        info.NodeID,
 	}
 	if resp.PublicBaseUrl != "" && info.PluginContentPrefix != "" && s.installationID > 0 {
 		resp.PluginProxyBaseUrl = resp.PublicBaseUrl + info.PluginContentPrefix + "/plugins/" + strconv.Itoa(s.installationID)
@@ -580,8 +418,54 @@ func (s *RuntimeHostServer) GetHostInfo(ctx context.Context, _ *pluginv1.GetHost
 		if listener.Name == ListenerAPI && listener.Address != "" {
 			resp.InternalBaseUrl = "http://" + listener.Address
 		}
+		resp.Listeners = append(resp.Listeners, &pluginv1.HostListener{
+			Name:        listener.Name,
+			Address:     listener.Address,
+			DefaultPort: int32(listener.DefaultPort),
+		})
+	}
+	if s.provider != "" && s.networkAccess != nil && s.installationID > 0 {
+		if token, ok := s.networkAccess.IngressToken(s.installationID); ok {
+			resp.IngressToken = token
+		}
 	}
 	return resp, nil
+}
+
+// ReadInstanceState returns one key of the instance's private state. The
+// scope is fixed by the store the host configured for this process.
+func (s *RuntimeHostServer) ReadInstanceState(ctx context.Context, req *pluginv1.ReadInstanceStateRequest) (*pluginv1.ReadInstanceStateResponse, error) {
+	if err := ValidateInstanceStateKey(req.GetKey()); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	if s.instanceState == nil || s.installationID <= 0 {
+		return nil, status.Error(codes.FailedPrecondition, ErrInstanceStateUnavailable.Error())
+	}
+	value, found, err := s.instanceState.ReadInstanceState(ctx, s.installationID, req.GetKey())
+	if err != nil {
+		return nil, instanceStateError(err)
+	}
+	if !found {
+		return &pluginv1.ReadInstanceStateResponse{}, nil
+	}
+	return &pluginv1.ReadInstanceStateResponse{Value: value, Found: true}, nil
+}
+
+// WriteInstanceState stores one key of the instance's private state.
+func (s *RuntimeHostServer) WriteInstanceState(ctx context.Context, req *pluginv1.WriteInstanceStateRequest) (*pluginv1.WriteInstanceStateResponse, error) {
+	if err := ValidateInstanceStateKey(req.GetKey()); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	if len(req.GetValue()) > InstanceStateMaxValueBytes {
+		return nil, status.Error(codes.InvalidArgument, ErrInstanceStateValueTooLarge.Error())
+	}
+	if s.instanceState == nil || s.installationID <= 0 {
+		return nil, status.Error(codes.FailedPrecondition, ErrInstanceStateUnavailable.Error())
+	}
+	if err := s.instanceState.WriteInstanceState(ctx, s.installationID, req.GetKey(), req.GetValue()); err != nil {
+		return nil, instanceStateError(err)
+	}
+	return &pluginv1.WriteInstanceStateResponse{}, nil
 }
 
 func instanceStateError(err error) error {
@@ -594,4 +478,42 @@ func instanceStateError(err error) error {
 		return status.Error(codes.FailedPrecondition, err.Error())
 	}
 	return fmt.Errorf("instance state: %w", err)
+}
+
+// ReportNetworkAccessStatus records a provider's status push in the host's
+// status cache. Only state transitions are logged; auth_url never is.
+func (s *RuntimeHostServer) ReportNetworkAccessStatus(_ context.Context, req *pluginv1.ReportNetworkAccessStatusRequest) (*pluginv1.ReportNetworkAccessStatusResponse, error) {
+	if s.provider == "" {
+		return nil, status.Error(codes.PermissionDenied, "plugin does not declare network_access_provider.v1")
+	}
+	if req.GetStatus() == nil {
+		return nil, status.Error(codes.InvalidArgument, "status is required")
+	}
+	if s.networkAccess == nil || s.installationID <= 0 {
+		// Config test-runs and hosts without netaccess wiring accept and drop
+		// the push so a provider does not fail on it.
+		return &pluginv1.ReportNetworkAccessStatusResponse{}, nil
+	}
+	entry := NetworkAccessStatusFromProto(s.installationID, s.provider, req.GetStatus())
+	previous, changed, accepted := s.networkAccess.ReportFor(s.installationID, s.ingressToken, entry)
+	if !accepted {
+		// This process's token was revoked while the push was in flight:
+		// the host already stopped or replaced it. Its status must not
+		// overwrite whatever the replacement reports.
+		s.logger.Debug("network access status from a revoked process instance dropped",
+			"plugin_id", s.pluginID, "installation_id", s.installationID, "provider", s.provider)
+		return &pluginv1.ReportNetworkAccessStatusResponse{}, nil
+	}
+	if changed {
+		s.logger.Info("network access provider state changed",
+			"plugin_id", s.pluginID,
+			"installation_id", s.installationID,
+			"provider", s.provider,
+			"from", previous.State,
+			"to", entry.State,
+			"origin", entry.Origin,
+			"error", entry.Error,
+		)
+	}
+	return &pluginv1.ReportNetworkAccessStatusResponse{}, nil
 }

@@ -1,18 +1,19 @@
 // Command residentplugin is a test fixture for the resident plugin
-// supervisor: it exits with status 3 as soon as the file named by
-// SILO_TEST_PLUGIN_EXIT_FILE exists, so a test can make it crash on demand.
-//
-// NOTE (fork, stripped for SDK): the network_access_provider.v1 stub the
-// fixture used to serve needs a newer plugin SDK, so the fixture only
-// exercises process lifecycle until the SDK is updated. The manifest still
-// declares the capability type string so resident-type matching keeps working.
+// supervisor and the network access admin API: it declares
+// network_access_provider.v1 (so the host treats it as resident), answers
+// Connect/Disconnect/GetStatus from an in-memory state, and exits with status
+// 3 as soon as the file named by SILO_TEST_PLUGIN_EXIT_FILE exists, so a test
+// can make it crash on demand.
 package main
 
 import (
+	"context"
 	_ "embed"
 	"os"
+	"sync"
 	"time"
 
+	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
 	sdkruntime "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginsdk/runtime"
 )
 
@@ -23,6 +24,61 @@ var manifestJSON []byte
 // second release of the same plugin build it with
 // -ldflags "-X main.version=0.2.0".
 var version = "0.1.0"
+
+// provider is a stub overlay: connecting "succeeds" at once with a fixed
+// origin, so tests can observe the state each RPC reports.
+type provider struct {
+	pluginv1.UnimplementedNetworkAccessProviderServer
+
+	mu        sync.Mutex
+	connected bool
+}
+
+func (p *provider) status() *pluginv1.NetworkAccessStatus {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	status := &pluginv1.NetworkAccessStatus{State: "disconnected", ProviderVersion: "stub 0.1.0"}
+	if p.connected {
+		status.State = "connected"
+		status.Hostname = "silo.stub.test"
+		status.Origin = "https://silo.stub.test"
+		status.Addresses = []string{"100.64.0.7"}
+		status.Listeners = []*pluginv1.NetworkAccessListener{{Name: "api", Origin: "https://silo.stub.test"}}
+		status.DesiredConnected = true
+	}
+	return status
+}
+
+func (p *provider) Connect(context.Context, *pluginv1.NetworkAccessConnectRequest) (*pluginv1.NetworkAccessStatus, error) {
+	p.mu.Lock()
+	p.connected = true
+	p.mu.Unlock()
+	return p.status(), nil
+}
+
+func (p *provider) Disconnect(context.Context, *pluginv1.NetworkAccessDisconnectRequest) (*pluginv1.NetworkAccessStatus, error) {
+	p.mu.Lock()
+	p.connected = false
+	p.mu.Unlock()
+	return p.status(), nil
+}
+
+func (p *provider) GetStatus(ctx context.Context, _ *pluginv1.NetworkAccessGetStatusRequest) (*pluginv1.NetworkAccessStatus, error) {
+	status := p.status()
+	// Exercise the host broker on demand: the status carries whether the
+	// callback path works after the broker connection is established.
+	if host := sdkruntime.Host(); host != nil {
+		if _, err := host.GetHostInfo(ctx); err != nil {
+			status.Error = "host callback: " + err.Error()
+		} else {
+			status.Error = ""
+			status.ProviderVersion += " host-ok"
+		}
+	} else {
+		status.Error = "host callback: broker unavailable"
+	}
+	return status, nil
+}
 
 func main() {
 	if exitFile := os.Getenv("SILO_TEST_PLUGIN_EXIT_FILE"); exitFile != "" {
@@ -35,5 +91,7 @@ func main() {
 			}
 		}()
 	}
-	sdkruntime.ServeManifest(manifestJSON, version, sdkruntime.CapabilityServers{})
+	sdkruntime.ServeManifest(manifestJSON, version, sdkruntime.CapabilityServers{
+		NetworkAccessProvider: &provider{},
+	})
 }

@@ -168,7 +168,7 @@ func (i *Installer) ReplaceBinary(ctx context.Context, existing *Installation, r
 	if err != nil {
 		return nil, err
 	}
-	return i.replaceBinary(ctx, existing, binaryData, actualChecksum, manifest)
+	return i.replaceBinary(ctx, existing, binaryData, actualChecksum, manifest, req.RepositoryID)
 }
 
 func (i *Installer) downloadBinary(
@@ -229,12 +229,17 @@ func (i *Installer) InstallBinaryUpload(ctx context.Context, binaryData []byte) 
 	return i.installBinary(ctx, binaryData, actualChecksum, manifest, nil)
 }
 
+// replaceBinary replaces existing in place with a binary from repositoryID,
+// nil for an uploaded binary. The row then names the new source: trust that
+// depends on where a package came from, such as a first-party watch provider
+// keeping its built-in key, must not carry over to a package from elsewhere.
 func (i *Installer) replaceBinary(
 	ctx context.Context,
 	existing *Installation,
 	binaryData []byte,
 	checksum string,
 	manifest *pluginv1.PluginManifest,
+	repositoryID *int,
 ) (*InstallResult, error) {
 	if existing == nil {
 		return nil, fmt.Errorf("existing installation is required")
@@ -303,12 +308,13 @@ func (i *Installer) replaceBinary(
 	enabled := existing.Enabled
 	availableVersion := ""
 	if err := i.installations.Update(ctx, existing.ID, UpdateInstallationInput{
-		Version:            &version,
-		InstallPath:        &binaryPath,
-		Enabled:            &enabled,
-		AvailableVersion:   &availableVersion,
-		Capabilities:       capabilities,
-		RemoveVirtualMedia: false,
+		Version:          &version,
+		InstallPath:      &binaryPath,
+		Enabled:          &enabled,
+		AvailableVersion: &availableVersion,
+		Capabilities:     capabilities,
+		SetRepository:    true,
+		RepositoryID:     repositoryID,
 	}); err != nil {
 		return nil, fmt.Errorf("update replacement plugin installation: %w", err)
 	}
@@ -324,6 +330,7 @@ func (i *Installer) replaceBinary(
 	updated.Version = version
 	updated.InstallPath = binaryPath
 	updated.Enabled = enabled
+	updated.RepositoryID = repositoryID
 
 	return &InstallResult{
 		Installation: &updated,
@@ -347,7 +354,6 @@ func (i *Installer) replaceArchive(
 	if err != nil {
 		return nil, err
 	}
-	_ = repositoryID
 
 	installRoot := filepath.Join(i.baseDir, sanitizeFilesystemSegment(manifest.GetPluginId()), sanitizeFilesystemSegment(manifest.GetVersion()))
 	if err := os.MkdirAll(installRoot, 0755); err != nil {
@@ -385,12 +391,13 @@ func (i *Installer) replaceArchive(
 	enabled := existing.Enabled
 	availableVersion := ""
 	if err := i.installations.Update(ctx, existing.ID, UpdateInstallationInput{
-		Version:            &version,
-		InstallPath:        &binaryPath,
-		Enabled:            &enabled,
-		AvailableVersion:   &availableVersion,
-		Capabilities:       capabilities,
-		RemoveVirtualMedia: false,
+		Version:          &version,
+		InstallPath:      &binaryPath,
+		Enabled:          &enabled,
+		AvailableVersion: &availableVersion,
+		Capabilities:     capabilities,
+		SetRepository:    true,
+		RepositoryID:     repositoryID,
 	}); err != nil {
 		return nil, fmt.Errorf("update replacement plugin installation: %w", err)
 	}
@@ -406,6 +413,7 @@ func (i *Installer) replaceArchive(
 	updated.Version = version
 	updated.InstallPath = binaryPath
 	updated.Enabled = enabled
+	updated.RepositoryID = repositoryID
 
 	return &InstallResult{
 		Installation: &updated,

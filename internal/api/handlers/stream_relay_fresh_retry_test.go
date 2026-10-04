@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/Silo-Server/silo-server/internal/models"
@@ -57,5 +58,37 @@ func TestStreamResolveFreshRegistrationMintsNewRelayToken(t *testing.T) {
 	}
 	if fresh.URL == first.URL {
 		t.Fatalf("fresh re-registration reused the live relay token %q", first.URL)
+	}
+}
+
+func TestIsRelayTokenNotFoundError(t *testing.T) {
+	relayErr := func() error {
+		return errors.New(`ffmpeg subtitle stream failed: exit status 8 (stderr: [in#0] Error opening input: Server returned 404 Not Found
+Error opening input file http://127.0.0.1:36367/source/abc/stream)`)
+	}
+	cases := []struct {
+		name  string
+		err   error
+		input string
+		want  bool
+	}{
+		{"nil", nil, "http://127.0.0.1:1/source/x/stream", false},
+		{"relay 404", relayErr(), "http://127.0.0.1:36367/source/abc/stream", true},
+		{"ipv6 relay 404", relayErr(), "http://[::1]:36367/source/abc/stream", true},
+		{"non-relay 404 stays permanent", relayErr(), "https://provider.example/video.mkv", false},
+		{
+			"relay 500 is not token expiry",
+			errors.New("ffmpeg subtitle stream failed: exit status 8 (stderr: Server returned 500)"),
+			"http://127.0.0.1:1/source/x/stream",
+			false,
+		},
+		{"local path never matches", relayErr(), "/media/movie.mkv", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isRelayTokenNotFoundError(tc.err, tc.input); got != tc.want {
+				t.Fatalf("isRelayTokenNotFoundError = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

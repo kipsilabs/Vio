@@ -10,6 +10,7 @@ import (
 	"time"
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
+	"github.com/Silo-Server/silo-plugin-sdk/pkg/pluginsdk/capability"
 	"github.com/Silo-Server/silo-server/internal/pluginhost"
 )
 
@@ -55,11 +56,7 @@ var ErrNotResident = errors.New("plugin installation is not resident")
 // must run as residents: started when the API listener is up, restarted
 // after a crash, stopped before the HTTP drain. Network access providers are
 // the first kind; later kinds are one more entry here.
-// NOTE (fork, stripped for SDK): the pinned plugin SDK predates
-// network_access_provider.v1, so the literal is used instead of the SDK
-// capability constant until the SDK is updated.
-// capability.NetworkAccessProvider = "network_access_provider.v1"
-var residentCapabilityTypes = []string{"network_access_provider.v1"}
+var residentCapabilityTypes = []string{capability.NetworkAccessProvider}
 
 // IsResidentCapabilityType reports whether an installation declaring the
 // capability type must run as a resident.
@@ -442,13 +439,29 @@ func (r *ResidentSupervisor) desiredResidents(ctx context.Context) (map[int]*Ins
 		return nil, fmt.Errorf("list enabled resident installations: %w", err)
 	}
 	desired := make(map[int]*Installation, len(installations))
-	// NOTE (fork, stripped for SDK): provider-slug dedup needs
-	// network_access_provider.v1 descriptor support in the plugin SDK, which
-	// the pinned SDK predates. Every enabled resident installation is
-	// desired until the SDK is updated.
+	// A provider slug is owned by the lowest enabled installation declaring
+	// it (ListNetworkAccessProviders). A later duplicate is not commanded,
+	// reported, or listed anywhere, so it must not run either: a resident
+	// nobody can disconnect would keep serving ingress unseen. Installations
+	// arrive in id order, so the first holder of a slug is the owner.
+	slugOwner := make(map[string]int, len(installations))
 	for _, installation := range installations {
 		if installation == nil || installation.IsBuiltin() {
 			continue
+		}
+		manifest, err := r.service.networkAccessManifest(ctx, installation)
+		if err != nil {
+			r.opts.Logger.WarnContext(ctx, "resident plugin manifest unavailable; not starting it", "component", "plugins",
+				"installation_id", installation.ID, "plugin_id", installation.PluginID, "error", err)
+			continue
+		}
+		if _, slug := pluginhost.NetworkAccessProviderCapability(manifest); slug != "" {
+			if owner, dup := slugOwner[slug]; dup {
+				r.opts.Logger.WarnContext(ctx, "network access provider slug is already owned by another installation; not starting the duplicate", "component", "plugins",
+					"provider", slug, "installation_id", owner, "skipped_installation_id", installation.ID, "plugin_id", installation.PluginID)
+				continue
+			}
+			slugOwner[slug] = installation.ID
 		}
 		desired[installation.ID] = installation
 	}
@@ -805,7 +818,7 @@ func (s *Service) RestartInstallation(ctx context.Context, installationID int) e
 		if err := s.installations.Update(ctx, installationID, UpdateInstallationInput{Restart: true}); err != nil {
 			return fmt.Errorf("record plugin restart: %w", err)
 		}
-		s.invalidateInstallationCache()
+		s.InvalidateInstallationCache()
 		if installation, err := s.loadInstallation(ctx, installationID, true); err == nil {
 			// This host restarts synchronously below; record the new
 			// generation on its entry so the next reconcile does not

@@ -2,7 +2,9 @@ package transcodenode
 
 import (
 	"context"
+	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -10,9 +12,9 @@ import (
 	"github.com/Silo-Server/silo-server/internal/themesongs"
 )
 
-// InputPathAuthorizer approves a local media input before a node passes it to
-// FFmpeg. Implementations must reject protocol URLs and paths outside the
-// authoritative media catalog.
+// InputPathAuthorizer approves a media input before a node passes it to FFmpeg.
+// Implementations must reject unsafe protocol schemes and paths outside the
+// authoritative media catalog, while permitting approved relay and HTTP(S) stream URLs.
 type InputPathAuthorizer interface {
 	Allowed(ctx context.Context, path string) (bool, error)
 }
@@ -21,11 +23,12 @@ type catalogPathSource interface {
 	IsActivePath(ctx context.Context, path string) (bool, error)
 }
 
-// CatalogPathAuthorizer permits only existing regular files whose exact
-// logical path is active in the media catalog. The scanner deliberately keeps
-// logical paths for readable symlinks, so catalog membership is the correct
-// authority: resolving the target and requiring it to remain under the logical
-// library root would reject media layouts the scanner explicitly supports.
+// CatalogPathAuthorizer permits existing regular files whose exact logical
+// path is active in the media catalog as well as approved relay and HTTP(S) stream
+// URLs. The scanner deliberately keeps logical paths for readable symlinks, so catalog
+// membership is the correct authority: resolving the target and requiring it to
+// remain under the logical library root would reject media layouts the scanner
+// explicitly supports.
 type CatalogPathAuthorizer struct {
 	paths catalogPathSource
 }
@@ -37,10 +40,18 @@ func NewCatalogPathAuthorizer(paths catalogPathSource) *CatalogPathAuthorizer {
 }
 
 // Allowed reports whether path is an active catalog entry that resolves to a
-// regular file on this node. os.Stat follows scanner-approved symlinks while
-// rejecting dangling links, directories, and other non-regular inputs.
+// regular file on this node, or an approved relay/http(s) stream URL. os.Stat
+// follows scanner-approved symlinks while rejecting dangling links,
+// directories, and other non-regular inputs.
 func (a *CatalogPathAuthorizer) Allowed(ctx context.Context, path string) (bool, error) {
-	if a == nil || a.paths == nil || !plainAbsolutePath(path) {
+	if a == nil {
+		return false, nil
+	}
+	path = strings.TrimSpace(path)
+	if isAllowedStreamURL(path) {
+		return true, nil
+	}
+	if a.paths == nil || !plainAbsolutePath(path) {
 		return false, nil
 	}
 	active, err := a.paths.IsActivePath(ctx, path)
@@ -52,6 +63,40 @@ func (a *CatalogPathAuthorizer) Allowed(ctx context.Context, path string) (bool,
 	}
 	info, err := os.Stat(path)
 	return err == nil && info.Mode().IsRegular(), nil
+}
+
+func isAllowedStreamURL(pathStr string) bool {
+	if strings.ContainsRune(pathStr, '\x00') {
+		return false
+	}
+	u, err := url.Parse(pathStr)
+	if err != nil {
+		return false
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return false
+	}
+	if u.Host == "" {
+		return false
+	}
+	if u.RawPath != "" {
+		lowerRaw := strings.ToLower(u.RawPath)
+		if strings.Contains(lowerRaw, "%2e") || strings.Contains(lowerRaw, "%2f") {
+			return false
+		}
+	}
+	for _, segment := range strings.Split(u.Path, "/") {
+		if segment == "." || segment == ".." {
+			return false
+		}
+	}
+	cleaned := path.Clean(u.Path)
+	rest, found := strings.CutPrefix(cleaned, "/source/")
+	if !found {
+		return false
+	}
+	token, _, _ := strings.Cut(rest, "/")
+	return token != "" && token != "." && token != ".."
 }
 
 // ThemeInputApprover approves a detail-page theme file as the input of a

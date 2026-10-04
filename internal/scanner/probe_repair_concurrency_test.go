@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -351,5 +353,46 @@ func completeProbeRepairTestData() *ProbeData {
 		VideoTracks: []VideoTrackInfo{{Codec: "hevc", ColorRange: "tv"}},
 		AudioTracks: []AudioTrackInfo{{Codec: "aac"}},
 		Chapters:    []ChapterInfo{},
+	}
+}
+
+func TestPlaybackProbeEnsurerDetectsExternalSubtitles(t *testing.T) {
+	dir := t.TempDir()
+	mediaPath := filepath.Join(dir, "Movie.mkv")
+	if err := os.WriteFile(mediaPath, []byte("fake media content"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	srtPath := filepath.Join(dir, "Movie.en.srt")
+	if err := os.WriteFile(srtPath, []byte("1\n00:00:01,000 --> 00:00:02,000\nHello\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	modified := time.Now()
+	stale := &models.MediaFile{
+		ID:             55,
+		FilePath:       mediaPath,
+		FileSize:       1024,
+		FileModifiedAt: &modified,
+		FileHash:       "hash-55",
+	}
+	repo := &probeRepairTestRepository{files: map[int]*models.MediaFile{stale.ID: stale}}
+	ensurer := &PlaybackProbeEnsurer{
+		fileRepo:    repo,
+		ffprobePath: "ffprobe",
+		timeout:     time.Second,
+		probeFile: func(ctx context.Context, _, _ string) (*ProbeData, error) {
+			return completeProbeRepairTestData(), nil
+		},
+	}
+
+	repaired, err := ensurer.EnsureProbeOnly(context.Background(), stale)
+	if err != nil {
+		t.Fatalf("EnsureProbeOnly: %v", err)
+	}
+	if len(repaired.ExternalSubtitles) != 1 {
+		t.Fatalf("len(ExternalSubtitles) = %d, want 1", len(repaired.ExternalSubtitles))
+	}
+	if repaired.ExternalSubtitles[0].Language != "en" || repaired.ExternalSubtitles[0].Path != srtPath {
+		t.Fatalf("ExternalSubtitle = %+v, want %s with en", repaired.ExternalSubtitles[0], srtPath)
 	}
 }

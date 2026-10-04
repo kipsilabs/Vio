@@ -16,6 +16,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/config"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
 )
@@ -60,7 +61,7 @@ func TestPrepareVirtualPlaybackVersionBindsProbedCandidate(t *testing.T) {
 	}
 }
 
-func TestShouldUseCompatNodePoolRejectsVirtualSources(t *testing.T) {
+func TestShouldUseCompatNodePoolAllowsVirtualSources(t *testing.T) {
 	local := PlaybackMediaSource{Version: catalog.FileVersion{FilePath: "/media/movie.mkv", Container: "mkv"}}
 	if !shouldUseCompatNodePool(local, &models.MediaFile{FilePath: local.Version.FilePath, Container: local.Version.Container}) {
 		t.Fatal("local source should remain eligible for pooled playback")
@@ -70,8 +71,46 @@ func TestShouldUseCompatNodePoolRejectsVirtualSources(t *testing.T) {
 		Version:          catalog.FileVersion{FilePath: "virtual://movie/example", Container: "mkv"},
 		VirtualSourceURI: "virtual://movie/example?result=stable",
 	}
-	if shouldUseCompatNodePool(virtual, &models.MediaFile{FilePath: virtual.Version.FilePath, Container: virtual.Version.Container}) {
-		t.Fatal("virtual source must use integrated playback")
+	if !shouldUseCompatNodePool(virtual, &models.MediaFile{FilePath: virtual.Version.FilePath, Container: virtual.Version.Container}) {
+		t.Fatal("virtual source should be eligible for pooled playback")
+	}
+}
+
+func TestVirtualPlaybackRoutingPolicyRestrictsRemuxAndDirectPlay(t *testing.T) {
+	virtual := PlaybackMediaSource{
+		Version:          catalog.FileVersion{FilePath: "virtual://movie/example", Container: "mkv"},
+		VirtualSourceURI: "virtual://movie/example?result=stable",
+	}
+	file := &models.MediaFile{FilePath: virtual.Version.FilePath, Container: virtual.Version.Container}
+
+	routingPolicy := config.DefaultPlaybackRoutingPolicy()
+
+	if !shouldUseCompatNodePool(virtual, file) {
+		routingPolicy.DirectPlayEgress = config.PlaybackEgressAPIOnly
+		routingPolicy.RemuxExecution = config.PlaybackExecutionAPIOnly
+		routingPolicy.RemuxEgress = config.PlaybackEgressAPIOnly
+		routingPolicy.VideoTranscodeExecution = config.PlaybackExecutionAPIOnly
+		routingPolicy.VideoTranscodeEgress = config.PlaybackEgressAPIOnly
+	} else if isCompatVirtualSource(virtual) || isCompatVirtualFile(file) {
+		routingPolicy.DirectPlayEgress = config.PlaybackEgressAPIOnly
+		routingPolicy.RemuxExecution = config.PlaybackExecutionAPIOnly
+		routingPolicy.RemuxEgress = config.PlaybackEgressAPIOnly
+	}
+
+	if routingPolicy.DirectPlayEgress != config.PlaybackEgressAPIOnly {
+		t.Errorf("DirectPlayEgress = %v, want %v", routingPolicy.DirectPlayEgress, config.PlaybackEgressAPIOnly)
+	}
+	if routingPolicy.RemuxExecution != config.PlaybackExecutionAPIOnly {
+		t.Errorf("RemuxExecution = %v, want %v", routingPolicy.RemuxExecution, config.PlaybackExecutionAPIOnly)
+	}
+	if routingPolicy.RemuxEgress != config.PlaybackEgressAPIOnly {
+		t.Errorf("RemuxEgress = %v, want %v", routingPolicy.RemuxEgress, config.PlaybackEgressAPIOnly)
+	}
+	if routingPolicy.VideoTranscodeExecution != config.PlaybackExecutionPreferTranscode {
+		t.Errorf("VideoTranscodeExecution = %v, want %v", routingPolicy.VideoTranscodeExecution, config.PlaybackExecutionPreferTranscode)
+	}
+	if routingPolicy.VideoTranscodeEgress != config.PlaybackEgressPreferProxy {
+		t.Errorf("VideoTranscodeEgress = %v, want %v", routingPolicy.VideoTranscodeEgress, config.PlaybackEgressPreferProxy)
 	}
 }
 

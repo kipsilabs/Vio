@@ -156,6 +156,11 @@ type virtualEvidenceTask struct {
 	updatedAt time.Time
 	probeAt   *time.Time
 	args      models.VirtualFilePersistArgs
+	// originFileID is the row the probe was requested for. It differs from
+	// args.FileID only when the identity guard rotated the write to a sibling
+	// owner row, so the terminal delivery log can name both ends of the
+	// rotation.
+	originFileID int
 }
 
 // virtualEvidenceKey identifies an evidence target. Same row, same expected
@@ -468,7 +473,15 @@ func (h *PlaybackHandler) stopVirtualEvidence() {
 
 // enqueueVirtualProbeEvidence admits one catalog write into the evidence
 // buffer. It never blocks: a full buffer rejects instead.
-func (h *PlaybackHandler) enqueueVirtualProbeEvidence(_ context.Context, args models.VirtualFilePersistArgs) virtualEvidenceAdmission {
+func (h *PlaybackHandler) enqueueVirtualProbeEvidence(ctx context.Context, args models.VirtualFilePersistArgs) virtualEvidenceAdmission {
+	return h.enqueueVirtualProbeEvidenceFor(ctx, args, args.FileID)
+}
+
+// enqueueVirtualProbeEvidenceFor is enqueueVirtualProbeEvidence for a write that
+// may target a row other than the one the probe was requested for. originFileID
+// is recorded on the task so the delivery log can name a rotated write's source
+// and owner rows; it has no effect on admission, coalescing, or the write.
+func (h *PlaybackHandler) enqueueVirtualProbeEvidenceFor(_ context.Context, args models.VirtualFilePersistArgs, originFileID int) virtualEvidenceAdmission {
 	if h == nil || h.VirtualFileSaver == nil {
 		return virtualEvidenceRejected
 	}
@@ -477,11 +490,12 @@ func (h *PlaybackHandler) enqueueVirtualProbeEvidence(_ context.Context, args mo
 	}
 	buf := h.evidenceBuffer()
 	task := &virtualEvidenceTask{
-		key:       virtualEvidenceKey(args),
-		seq:       buf.nextSeq(),
-		updatedAt: args.UpdatedAt,
-		probeAt:   args.ProbeUpdatedAt,
-		args:      args,
+		key:          virtualEvidenceKey(args),
+		seq:          buf.nextSeq(),
+		updatedAt:    args.UpdatedAt,
+		probeAt:      args.ProbeUpdatedAt,
+		args:         args,
+		originFileID: originFileID,
 	}
 	return buf.admit(task)
 }
@@ -509,7 +523,7 @@ func (h *PlaybackHandler) persistVirtualEvidenceDirect(ctx context.Context, args
 			return false
 		}
 		if result.MetadataUpdated {
-			h.PublishInventoryUpdated(writeCtx, args.FileID)
+			h.logInventoryDelivery(h.PublishInventoryUpdated(writeCtx, args.FileID), 0)
 		}
 		return result.MetadataUpdated
 	}
@@ -520,9 +534,30 @@ func (h *PlaybackHandler) persistVirtualEvidenceDirect(ctx context.Context, args
 		return false
 	}
 	if rows > 0 {
-		h.PublishInventoryUpdated(writeCtx, args.FileID)
+		h.logInventoryDelivery(h.PublishInventoryUpdated(writeCtx, args.FileID), 0)
 	}
 	return rows > 0
+}
+
+// logInventoryDelivery records a successful inventory_updated fan-out: the file
+// whose evidence was pushed, how many live sessions received it, the revision,
+// and — for a rotated write — the row the probe was originally requested for.
+// It emits nothing when no session was notified, so an idle background probe
+// does not fill the log.
+func (h *PlaybackHandler) logInventoryDelivery(summary inventoryPublishSummary, originFileID int) {
+	if summary.SessionsNotified <= 0 {
+		return
+	}
+	attrs := []any{
+		virtualEvidenceLogKeyComponent, virtualEvidenceLogValueAPI,
+		virtualEvidenceLogKeyFileID, summary.FileID,
+		"sessions_notified", summary.SessionsNotified,
+		fieldRevision, summary.Revision,
+	}
+	if originFileID > 0 && originFileID != summary.FileID {
+		attrs = append(attrs, "rotated_from_file_id", originFileID)
+	}
+	slog.Info("virtual probe evidence inventory delivered", attrs...)
 }
 
 // runVirtualEvidenceWorker drains accepted work until the buffer is closed by
@@ -640,7 +675,13 @@ func (h *PlaybackHandler) persistVirtualEvidenceTask(task *virtualEvidenceTask, 
 			// to any live session bound to it, so a menu stops showing the
 			// declared snapshot. The publish bounds its own context and is
 			// best-effort: a failure here never affects the committed write.
-			h.PublishInventoryUpdated(context.Background(), task.args.FileID)
+			//
+			// The publish is the single delivery for this revision: the write
+			// targets the row that owns the bytes (the owner row after a
+			// rotation), and the session-bound lookup reaches every live menu on
+			// it. The delivery log below is what makes a rotation's publish
+			// observable; it does not publish a second time.
+			h.logInventoryDelivery(h.PublishInventoryUpdated(context.Background(), task.args.FileID), task.originFileID)
 			return nil
 		}
 		lastErr = err

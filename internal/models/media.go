@@ -23,6 +23,9 @@ type MediaFolder struct {
 	AutoTranslateMetadata    bool   // AI-translate descriptions when providers lack this language
 	ChapterThumbnailsEnabled bool
 	IntroDetectionEnabled    bool
+	// TrickplayEnabled generates seek-bar previews for the library's video
+	// files (internal/trickplay). Off by default.
+	TrickplayEnabled bool
 	// RealtimeMonitoring is the library's real-time monitoring switch. It
 	// takes effect only while the server-wide scanner.realtime_monitoring
 	// setting is on and the library is enabled.
@@ -1021,4 +1024,12 @@ type VirtualFilePersistArgs struct {
 	// the collection row so the adoption can land atomically with the probed
 	// evidence; without it a collection path is never rewritten.
 	ReconcileCollectionVariant bool
+	// RefusalReason names the concrete cause the caller expects a required
+	// adoption to be refused for, so the saver's refusal log can distinguish a
+	// sibling path owner from a live failed verdict, or a collection row from a
+	// stale CAS snapshot, instead of emitting one lumped bucket. It is only
+	// consulted on refusal: a write that succeeds ignores it. An empty value
+	// falls back to a neutral reason, so callers that do not classify stay
+	// honest rather than guessing.
+	RefusalReason string
 }

@@ -46,7 +46,7 @@ and `allowed` is `true`; a server without playback wired answers
 `not_configured` with `allowed: false`. `installation_id` is the persisted
 server instance UUID that diagnostics also report. `protocol_versions` is
 `[3]`. `features` is the v3 server feature set plus `sequenced_progress_v1`,
-`fixed_media_file_v1`, and `marker_segments_v1`. When the room service and
+`fixed_media_file_v1`, `marker_segments_v1`, and `trickplay_v1`. When the room service and
 authenticated room socket are configured, it also includes
 `watch_party_source_fallback_v1` and `watch_party_coordinator_v1`.
 The coordinator capability covers shared room
@@ -136,6 +136,17 @@ Marker reads and watch detail can populate the selected file's markers after
 authorization. A provider error leaves the available markers readable.
 See [Marker API](markers-api.md) for reads, manual edits, and provenance.
 
+## Seek previews
+
+The `trickplay_v1` capability covers seek-preview manifests at
+`GET /api/v2/watch/{id}/trickplay?file_id=`. Clients fetch the sheet URLs the
+manifest returns and refresh the manifest after `expires_at`. Local storage
+and S3 with a separate public or token-authenticated delivery endpoint return
+signed `/api/v2/artwork/...` URLs; the server reads the storage API to avoid
+external delivery lag. Standard S3 delivery returns direct presigned URLs.
+See [trickplay](architecture/trickplay.md#serving) for access rules, sheet
+geometry, and revision retention.
+
 ## Start
 
 When `playback.allow_hevc_encoding` is enabled, video adaptation may encode
@@ -152,6 +163,13 @@ negotiated HEVC output. Hardware tone mapping can still perform the HDR-to-SDR
 conversion before its frames feed the software encoder. An optional HEVC probe
 failure removes HEVC availability without invalidating successful AAC or H.264
 capability checks.
+
+A bitrate cap is a ceiling on every encoder. A capped VAAPI encode forces the
+VBR rate-control mode, or CBR where the assigned device offers only that, after
+a cached one-frame check on that device; FFmpeg's automatic mode could choose
+AVBR, which ignores the cap. When the device accepts neither mode, the encode
+uses libx264 or libx265 in the same way, keeping hardware tone mapping where
+the recipe uses it.
 
 The body is the v3 start request plus `installation_id`. `file_id` and
 `profile_id` are strings; `profile_id` must be the authenticated profile. Start

@@ -1588,3 +1588,126 @@ func TestReplaceVirtualCandidatesEmptyListingPreservesState(t *testing.T) {
 		t.Fatal("failed_at was cleared by an empty listing, want it preserved")
 	}
 }
+
+// TestPruneDeadAbsentVirtualCandidatesHonorsRetention proves the repository
+// prune applies the same keep-list the re-list sweep does: a row that delivered
+// bytes, is inside the candidate store window, is some user's last-played file,
+// or is pointed at by a live playback attempt survives even when the caller
+// nominates it for deletion. Only the genuinely unprotected dead row is removed.
+func TestPruneDeadAbsentVirtualCandidatesHonorsRetention(t *testing.T) {
+	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("SILO_TEST_DATABASE_URL is not set")
+	}
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect test database: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	suffix := time.Now().UnixNano()
+	contentID := fmt.Sprintf("virtual-prune-retention-%d", suffix)
+	basePath := fmt.Sprintf("virtual://movie/tt-prune-%d", suffix)
+
+	var folderID, userID int
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO media_folders(type,name,enabled)
+		VALUES('movies',$1,true) RETURNING id`, fmt.Sprintf("Prune Retention %d", suffix)).Scan(&folderID); err != nil {
+		t.Fatalf("seed folder: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO users(username, role) VALUES($1,'user') RETURNING id`,
+		fmt.Sprintf("prune-retention-%d", suffix)).Scan(&userID); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO media_items(content_id,type,title,status,genres)
+		VALUES($1,'movie','Prune Retention','matched','{}'::text[])`, contentID); err != nil {
+		t.Fatalf("seed item: %v", err)
+	}
+	t.Cleanup(func() {
+		b := context.Background()
+		_, _ = pool.Exec(b, `DELETE FROM playback_v3_attempts WHERE user_id=$1`, userID)
+		_, _ = pool.Exec(b, `DELETE FROM user_watch_progress WHERE user_id=$1`, userID)
+		_, _ = pool.Exec(b, `DELETE FROM media_files WHERE content_id=$1`, contentID)
+		_, _ = pool.Exec(b, `DELETE FROM media_items WHERE content_id=$1`, contentID)
+		_, _ = pool.Exec(b, `DELETE FROM media_folders WHERE id=$1`, folderID)
+		_, _ = pool.Exec(b, `DELETE FROM users WHERE id=$1`, userID)
+	})
+
+	seed := func(result string, delivered bool) int {
+		var deliveredAt *time.Time
+		if delivered {
+			now := time.Now()
+			deliveredAt = &now
+		}
+		var id int
+		if err := pool.QueryRow(ctx, `
+			INSERT INTO media_files(content_id,media_folder_id,file_path,file_size,container,virtual_owner_installation_id,failed_at,last_delivered_at)
+			VALUES($1,$2,$3,0,'virtual',5,NOW(),$4) RETURNING id`,
+			contentID, folderID, basePath+"?result="+result, deliveredAt).Scan(&id); err != nil {
+			t.Fatalf("seed %q: %v", result, err)
+		}
+		return id
+	}
+	removable := seed("removable", false)
+	delivered := seed("delivered", true)
+	inWindow := seed("in-window", false)
+	lastPlayed := seed("last-played", false)
+	liveAttempt := seed("live-attempt", false)
+
+	// Backdate every row except the in-window one beyond the 24h window, so the
+	// window protects only that row and the others are decided by their specific
+	// retention evidence.
+	if _, err := pool.Exec(ctx, `
+		UPDATE media_files SET updated_at = NOW() - interval '48 hours'
+		WHERE id = ANY($1::bigint[])`,
+		[]int{removable, delivered, lastPlayed, liveAttempt}); err != nil {
+		t.Fatalf("backdate rows: %v", err)
+	}
+
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO user_watch_progress(user_id, profile_id, media_item_id, position_seconds, duration_seconds, last_file_id)
+		VALUES($1,'default',$2,1,100,$3)`, userID, contentID, lastPlayed); err != nil {
+		t.Fatalf("seed watch progress: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO playback_v3_attempts(
+			playback_attempt_id, session_id, user_id, profile_id,
+			requested_media_file_id, effective_media_file_id,
+			current_plan_id, current_plan, normalized_request, expires_at)
+		VALUES($1, gen_random_uuid(), $2, 'default', $3, $3, 'plan', '{}'::jsonb, '{}'::jsonb, NOW() + interval '1 hour')`,
+		fmt.Sprintf("attempt-%d", suffix), userID, liveAttempt); err != nil {
+		t.Fatalf("seed live attempt: %v", err)
+	}
+
+	repo := NewFileRepository(pool)
+	repo.SetVirtualCandidateStoreWindow(func() time.Duration { return 24 * time.Hour })
+	t.Cleanup(func() { repo.SetVirtualCandidateStoreWindow(nil) })
+
+	all := []int{removable, delivered, inWindow, lastPlayed, liveAttempt}
+	pruned, err := repo.PruneDeadAbsentVirtualCandidates(ctx, all)
+	if err != nil {
+		t.Fatalf("PruneDeadAbsentVirtualCandidates: %v", err)
+	}
+	if pruned != 1 {
+		t.Fatalf("pruned = %d, want 1 (only the unprotected row)", pruned)
+	}
+
+	exists := func(id int) bool {
+		var count int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM media_files WHERE id=$1`, id).Scan(&count); err != nil {
+			t.Fatalf("count %d: %v", id, err)
+		}
+		return count > 0
+	}
+	if exists(removable) {
+		t.Fatal("unprotected dead row survived the prune")
+	}
+	for name, id := range map[string]int{"delivered": delivered, "in-window": inWindow, "last-played": lastPlayed, "live-attempt": liveAttempt} {
+		if !exists(id) {
+			t.Fatalf("%s row was pruned despite its retention rule", name)
+		}
+	}
+}

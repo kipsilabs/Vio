@@ -34,8 +34,12 @@ type AudioTrackPreference struct {
 	TrackSignature  *userstore.AudioTrackSignature
 }
 
-// langMatch accepts compatible languages for previously saved track selections.
-func langMatch(a, b string) bool { return langMatchRank(a, b) >= 0 }
+// langMatch accepts compatible languages for previously saved track selections,
+// rejecting explicitly conflicting scripts.
+func langMatch(a, b string) bool {
+	rank := langMatchRank(a, b)
+	return rank >= 0 && rank < lang.RankScriptConflict
+}
 
 // trackLanguageRank returns the best language rank for a track against the
 // preferred language, considering both the primary code and the MULTi
@@ -60,31 +64,18 @@ func trackLanguageRank(track models.AudioTrack, preferred string) int {
 }
 
 // trackHasLanguage reports whether the track carries the preferred language,
-// either as its primary code or anywhere in its MULTi language list.
+// either as its primary code or anywhere in its MULTi language list,
+// without an explicit script conflict.
 func trackHasLanguage(track models.AudioTrack, preferred string) bool {
-	return trackLanguageRank(track, preferred) >= 0
+	rank := trackLanguageRank(track, preferred)
+	return rank >= 0 && rank < lang.RankScriptConflict
 }
 
-// langMatchRank prefers an exact BCP-47 tag, then a bare language tag, and
-// finally another regional/script variant of the same language.
+// langMatchRank delegates to lang.MatchRank to rank language closeness:
+// exact (0) > matching script/region (1-2) > bare tag (3) >
+// regional variant (4) > conflicting script (5).
 func langMatchRank(candidate, preferred string) int {
-	candidate = lang.CompatibleTag(candidate)
-	preferred = lang.CompatibleTag(preferred)
-	if candidate == "" || preferred == "" {
-		return -1
-	}
-	if candidate == preferred {
-		return 0
-	}
-	candidateBase := lang.PrimaryLanguage(candidate)
-	preferredBase := lang.PrimaryLanguage(preferred)
-	if candidateBase == "" || candidateBase != preferredBase {
-		return -1
-	}
-	if !strings.Contains(candidate, "-") {
-		return 1
-	}
-	return 2
+	return lang.MatchRank(candidate, preferred)
 }
 
 // SelectAudioTrack determines which audio track to use based on preferences.
@@ -97,9 +88,10 @@ func langMatchRank(candidate, preferred string) int {
 // 5. File's default track (first track with Default: true)
 // 6. First track (index 0)
 //
-// Language matches rank exact tag > bare language > another variant of the same
-// language. Track order breaks ties within a language rank. Saved signatures
-// and compatible saved indices take precedence over language-only preferences.
+// Language matches rank exact tag > matching script/region > bare language >
+// another variant of the same language > conflicting script. Track order breaks
+// ties within a language rank. Saved signatures and compatible saved indices
+// take precedence over language-only preferences.
 func SelectAudioTrack(tracks []models.AudioTrack, preferredLang string, seriesPref *AudioTrackPreference) int {
 	if len(tracks) == 0 {
 		return 0
@@ -148,7 +140,7 @@ func SelectAudioTrack(tracks []models.AudioTrack, preferredLang string, seriesPr
 }
 
 func bestLanguageTrack(tracks []models.AudioTrack, preferred string) int {
-	best, bestRank := -1, 3
+	best, bestRank := -1, lang.RankScriptConflict+1
 	for i, track := range tracks {
 		if rank := trackLanguageRank(track, preferred); rank >= 0 && rank < bestRank {
 			best, bestRank = i, rank

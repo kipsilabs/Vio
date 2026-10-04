@@ -23,13 +23,12 @@ vi.mock("@/api/client", async (importOriginal) => ({
   isProfileRequestContextCurrent: () => true,
 }));
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
+const mockAdminPluginInstallations = vi.fn(() => ({
+  data: [{ id: 1, plugin_id: "router", capabilities: [{ type: "request_router.v1", id: "arr" }] }],
+  isLoading: false,
+}));
 vi.mock("@/hooks/queries/admin/plugins", () => ({
-  useAdminPluginInstallations: () => ({
-    data: [
-      { id: 1, plugin_id: "router", capabilities: [{ type: "request_router.v1", id: "arr" }] },
-    ],
-    isLoading: false,
-  }),
+  useAdminPluginInstallations: () => mockAdminPluginInstallations(),
 }));
 vi.mock("@/hooks/queries/admin/users", () => ({
   useAdminUsers: () => ({ data: [{ id: 1, username: "member" }], isLoading: false }),
@@ -73,6 +72,9 @@ function mount(tab: string) {
   );
   return client;
 }
+window.HTMLElement.prototype.scrollIntoView ??= () => {};
+window.HTMLElement.prototype.hasPointerCapture ??= () => false;
+
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
@@ -282,6 +284,133 @@ describe("request administration conflict handling", () => {
     expect(writes()[1]![1]).toMatchObject({
       headers: { "If-Match": '"reloaded"' },
       body: { max_requests: 6 },
+    });
+  });
+  it("populates virtual://streaming and creates virtual library connection", async () => {
+    mockAdminPluginInstallations.mockReturnValueOnce({
+      data: [],
+      isLoading: false,
+    });
+    vi.mocked(v2).mockImplementation((operation, options) => {
+      if (operation === "GET /api/v2/admin/requests/capabilities")
+        return reply(options, { available: true, guarded_configuration: true });
+      if (operation === "GET /api/v2/admin/request-integrations")
+        return reply(options, { items: [], page: { has_more: false } });
+      if (operation === "POST /api/v2/admin/request-integrations") {
+        return reply(options, {
+          id: "conn-virt",
+          name: "Virtual Library (Core Streaming)",
+          enabled: true,
+          base_url: "virtual://streaming",
+          has_api_key: true,
+          installation_id: "0",
+          capability_id: "virtual-library-requests",
+          plugin_config: {},
+          supported_media_types: [],
+          last_check_at: null,
+          last_check_status: "",
+          last_check_error: "",
+          updated_at: "2026-10-02T00:00:00Z",
+        });
+      }
+      if (operation === "POST /api/v2/admin/request-integrations/{id}/options")
+        return reply(options, { options: {} });
+      throw new Error(operation);
+    });
+    mount("integrations");
+    fireEvent.click(await screen.findByRole("button", { name: "Add connection" }));
+
+    const nameInput = (await screen.findByPlaceholderText("Connection name")) as HTMLInputElement;
+    expect(nameInput.value).toBe("Virtual Library (Core Streaming)");
+    expect((screen.getByPlaceholderText("virtual://streaming") as HTMLInputElement).value).toBe(
+      "virtual://streaming",
+    );
+    expect((screen.getByPlaceholderText("core-managed") as HTMLInputElement).value).toBe(
+      "core-managed",
+    );
+
+    const createBtn = screen.getByRole("button", { name: "Create connection" });
+    fireEvent.click(createBtn);
+    await waitFor(() => {
+      const creates = vi
+        .mocked(v2)
+        .mock.calls.filter(([op]) => op === "POST /api/v2/admin/request-integrations");
+      expect(creates).toHaveLength(1);
+      expect(creates[0]![1]!).toMatchObject({
+        body: {
+          name: "Virtual Library (Core Streaming)",
+          base_url: "virtual://streaming",
+          api_key_ref: "core-managed",
+          installation_id: "0",
+          capability_id: "virtual-library-requests",
+        },
+      });
+    });
+  });
+  it("populates virtual defaults when selecting virtual library plugin from multiple plugins", async () => {
+    vi.mocked(v2).mockImplementation((operation, options) => {
+      if (operation === "GET /api/v2/admin/requests/capabilities")
+        return reply(options, { available: true, guarded_configuration: true });
+      if (operation === "GET /api/v2/admin/request-integrations")
+        return reply(options, { items: [], page: { has_more: false } });
+      if (operation === "POST /api/v2/admin/request-integrations") {
+        return reply(options, {
+          id: "conn-virt-2",
+          name: "Virtual Library (Core Streaming)",
+          enabled: true,
+          base_url: "virtual://streaming",
+          has_api_key: true,
+          installation_id: "0",
+          capability_id: "virtual-library-requests",
+          plugin_config: {},
+          supported_media_types: [],
+          last_check_at: null,
+          last_check_status: "",
+          last_check_error: "",
+          updated_at: "2026-10-02T00:00:00Z",
+        });
+      }
+      if (operation === "POST /api/v2/admin/request-integrations/{id}/options")
+        return reply(options, { options: {} });
+      throw new Error(operation);
+    });
+    mount("integrations");
+    fireEvent.click(await screen.findByRole("button", { name: "Add connection" }));
+
+    expect(screen.getByText("Select a plugin to configure this connection.")).toBeInTheDocument();
+
+    fireEvent.keyDown(screen.getByRole("combobox"), { key: "ArrowDown" });
+    fireEvent.click(
+      await screen.findByRole("option", {
+        name: "Virtual Library (Core Streaming) (virtual-library-requests)",
+      }),
+    );
+
+    const nameInput = (await screen.findByPlaceholderText("Connection name")) as HTMLInputElement;
+    expect(nameInput.value).toBe("Virtual Library (Core Streaming)");
+    expect((screen.getByPlaceholderText("virtual://streaming") as HTMLInputElement).value).toBe(
+      "virtual://streaming",
+    );
+    expect((screen.getByPlaceholderText("core-managed") as HTMLInputElement).value).toBe(
+      "core-managed",
+    );
+
+    const createBtn = screen.getByRole("button", { name: "Create connection" });
+    fireEvent.click(createBtn);
+    await waitFor(() => {
+      const creates = vi
+        .mocked(v2)
+        .mock.calls.filter(([op]) => op === "POST /api/v2/admin/request-integrations");
+      expect(creates).toHaveLength(1);
+      expect(creates[0]![1]!).toMatchObject({
+        body: {
+          name: "Virtual Library (Core Streaming)",
+          base_url: "virtual://streaming",
+          api_key_ref: "core-managed",
+          installation_id: "0",
+          capability_id: "virtual-library-requests",
+        },
+      });
     });
   });
 });

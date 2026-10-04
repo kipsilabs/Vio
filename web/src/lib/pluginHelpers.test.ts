@@ -5,6 +5,7 @@ import type { PluginInstallation } from "@/api/types";
 import { capabilityKind, capabilityListLabel, catalogJobs } from "./pluginCapabilities";
 import { parsePluginMarkdown } from "./pluginMarkdown";
 import {
+  CATALOG_GROUPS,
   licenseLabel,
   pluginDisplayName,
   pluginPagePath,
@@ -73,11 +74,30 @@ describe("pluginPresentation", () => {
 
   it("labels every tier and gives community and external plugins a notice", () => {
     expect(sourceLabel("silo")).toBe("Silo maintained");
+    expect(sourceLabel("vio")).toBe("Silo maintained");
     expect(sourceLabel("approved_community")).toBe("Approved community");
     expect(sourceLabel("external")).toBe("External source");
     expect(tierNotice("silo")).toBeNull();
+    expect(tierNotice("vio")).toBeNull();
     expect(tierNotice("approved_community")).toMatch(/Reviewed by Silo maintainers/);
     expect(tierNotice("external")).toMatch(/Silo has not reviewed this plugin/);
+  });
+
+  it("matches catalog groups correctly, falling back unknown kinds to external", () => {
+    const vioGroup = CATALOG_GROUPS.find((g) => g.kind === "vio")!;
+    const communityGroup = CATALOG_GROUPS.find((g) => g.kind === "approved_community")!;
+    const externalGroup = CATALOG_GROUPS.find((g) => g.kind === "external")!;
+
+    expect(vioGroup.matches("vio")).toBe(true);
+    expect(vioGroup.matches("silo")).toBe(true);
+    expect(vioGroup.matches("approved_community")).toBe(false);
+
+    expect(communityGroup.matches("approved_community")).toBe(true);
+    expect(communityGroup.matches("vio")).toBe(false);
+
+    expect(externalGroup.matches("external")).toBe(true);
+    expect(externalGroup.matches("unknown_kind")).toBe(true);
+    expect(externalGroup.matches("vio")).toBe(false);
   });
 
   it("only allows http and https links", () => {

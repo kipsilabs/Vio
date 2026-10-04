@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,6 +23,19 @@ import (
 func isVirtualMediaFile(file *models.MediaFile) bool {
 	return file != nil &&
 		(strings.HasPrefix(file.FilePath, "virtual://") || strings.EqualFold(file.Container, "virtual"))
+}
+
+// isLocalFilesystemFile reports whether a media file is stored on the local
+// filesystem rather than served from a remote stream or virtual URL.
+func isLocalFilesystemFile(file *models.MediaFile) bool {
+	if file == nil || isVirtualMediaFile(file) {
+		return false
+	}
+	path := strings.TrimSpace(file.FilePath)
+	if strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://") {
+		return false
+	}
+	return filepath.IsAbs(path)
 }
 
 // NeedsCriticalProbeRepair reports whether playback-critical probe metadata is
@@ -523,6 +537,11 @@ func (e *PlaybackProbeEnsurer) ensureCriticalProbe(ctx context.Context, file *mo
 		}
 		updated := *current
 		applyProbeData(&updated, probe, "local")
+		if isLocalFilesystemFile(current) {
+			if sidecars, err := DetectExternalSubtitles(current.FilePath); err == nil {
+				updated.ExternalSubtitles = externalSubtitleModels(sidecars)
+			}
+		}
 		return e.fileRepo.Upsert(probeCtx, updated)
 	})
 	select {
