@@ -117,3 +117,47 @@ func TestBuildPlaybackInfoDoesNotCollapseLocalFiles(t *testing.T) {
 		t.Fatalf("local files projected %d versions, want 2", len(versions))
 	}
 }
+
+// TestBuildPlaybackInfoKeepsDistinctUnprobedCandidateBeneathProbedCopy pins the
+// placeholder-identification requirement: an unprobed row that is a concrete
+// alternate release — a distinct size or a distinct durable provider identity —
+// must stay selectable beside the probed copy even when it shares the probed
+// row's provider-neutral URI. Only a genuine placeholder (unknown size, no
+// conflicting identity) collapses.
+func TestBuildPlaybackInfoKeepsDistinctUnprobedCandidateBeneathProbedCopy(t *testing.T) {
+	probed := virtualDupRow(71, 1000, "virtual://movie/dup?result=probed", "eng", true)
+	probed.ProviderReleaseName = "Movie.2024.1080p"
+	probed.ProviderVideoHash = "hash-probed"
+
+	// A concrete alternate with a different advertised size must not vanish,
+	// even though no provider identity tier conflicts (the alternate declares
+	// none).
+	distinctSize := virtualDupRow(72, 2000, "virtual://movie/dup?result=alt-size", "", false)
+	if versions := buildDupVersions(t, []*models.MediaFile{probed, distinctSize}); len(versions) != 2 {
+		t.Fatalf("distinct-size unprobed alternate beside a probed copy projected %d versions, want 2", len(versions))
+	}
+
+	// Same unknown stored size, but a provider-declared size that disagrees:
+	// the durable size tier is ProviderReleaseSize, so a row whose size lives
+	// only there is not a size-unknown placeholder.
+	sizedProbed := virtualDupRow(75, 0, "virtual://movie/dup?result=probed-size", "", true)
+	sizedProbed.ProviderReleaseSize = 1000
+	distinctProviderSize := virtualDupRow(76, 0, "virtual://movie/dup?result=alt-provider-size", "", false)
+	distinctProviderSize.ProviderReleaseSize = 2000
+	if versions := buildDupVersions(t, []*models.MediaFile{sizedProbed, distinctProviderSize}); len(versions) != 2 {
+		t.Fatalf("distinct provider-size unprobed alternate beside a probed copy projected %d versions, want 2", len(versions))
+	}
+
+	// Same unknown size, but a durable provider identity that disagrees.
+	distinctHash := virtualDupRow(73, 1000, "virtual://movie/dup?result=alt-hash", "", false)
+	distinctHash.ProviderVideoHash = "hash-other"
+	if versions := buildDupVersions(t, []*models.MediaFile{probed, distinctHash}); len(versions) != 2 {
+		t.Fatalf("distinct-identity unprobed alternate beside a probed copy projected %d versions, want 2", len(versions))
+	}
+
+	// A genuine placeholder (size 0, no identity) still collapses.
+	sizeZeroPlaceholder := virtualDupRow(74, 0, "virtual://movie/dup?result=placeholder", "", false)
+	if versions := buildDupVersions(t, []*models.MediaFile{probed, sizeZeroPlaceholder}); len(versions) != 1 {
+		t.Fatalf("size-0 placeholder beside a probed copy projected %d versions, want 1", len(versions))
+	}
+}

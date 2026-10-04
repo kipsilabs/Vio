@@ -47,6 +47,56 @@ func TestVirtualEvidenceMatchesBoundFileRequiresRowID(t *testing.T) {
 	}
 }
 
+// TestVirtualEvidenceMatchesBoundFileEnforcesRowIDWithoutEvidenceURI pins the
+// missing-URI branch: a session that predates the evidence URI field still
+// carries a known evidence row id, and that row id must be checked before the
+// session-URI fallback. A mismatched row must not match even though the
+// session's virtual URI names the bound candidate.
+func TestVirtualEvidenceMatchesBoundFileEnforcesRowIDWithoutEvidenceURI(t *testing.T) {
+	uri := "virtual://movie/dup?result=a"
+	bound := &models.MediaFile{ID: 12, FilePath: uri}
+
+	mismatchedRow := &playback.Session{
+		VirtualSourceURI:              uri,
+		VirtualSubtitleEvidenceSet:    true,
+		VirtualSubtitleEvidenceFileID: 11,
+	}
+	if virtualEvidenceMatchesBoundFile(bound, mismatchedRow) {
+		t.Fatal("mismatched evidence row 11 matched bound row 12 through the URI-only fallback")
+	}
+
+	sameRow := *mismatchedRow
+	sameRow.VirtualSubtitleEvidenceFileID = 12
+	if !virtualEvidenceMatchesBoundFile(bound, &sameRow) {
+		t.Fatal("same-row evidence without an evidence URI lost its URI-only match")
+	}
+}
+
+// TestVirtualEvidenceMatchesBoundFileRejectsUnknownBoundRow pins the final
+// branch: a known evidence row cannot be confirmed against an unknown bound row
+// (id 0), so it must not match — a bound row with no identity cannot be the row
+// the evidence was captured from.
+func TestVirtualEvidenceMatchesBoundFileRejectsUnknownBoundRow(t *testing.T) {
+	uri := "virtual://movie/dup?result=a"
+	unknownBound := &models.MediaFile{FilePath: uri}
+
+	known := &playback.Session{
+		VirtualSourceURI:              uri,
+		VirtualSubtitleEvidenceSet:    true,
+		VirtualSubtitleEvidenceURI:    uri,
+		VirtualSubtitleEvidenceFileID: 12,
+	}
+	if virtualEvidenceMatchesBoundFile(unknownBound, known) {
+		t.Fatal("known evidence row 12 matched an unknown bound row")
+	}
+
+	legacy := *known
+	legacy.VirtualSubtitleEvidenceFileID = 0
+	if !virtualEvidenceMatchesBoundFile(unknownBound, &legacy) {
+		t.Fatal("legacy evidence without a row id lost its URI-only match")
+	}
+}
+
 // TestV3SessionStreamStateCapturesEvidenceRowID proves the plan-time capture
 // writes the effective file's row id alongside the URI, so a later serve can
 // disambiguate duplicate rows.
@@ -100,7 +150,7 @@ func TestRefusedProbeInventoryFileRequiresSameRow(t *testing.T) {
 		AudioTracks:    []models.AudioTrack{{Codec: "eac3", Channels: 6, Language: "eng"}},
 		SubtitleTracks: []models.SubtitleTrack{{Index: 1, Codec: "subrip", Language: "eng"}},
 	}
-	h := NewPlaybackHandler(playback.NewSessionManager(0, 0), mapPlaybackFileResolver{files: map[int]*models.MediaFile{11: requestedRow, 12: &models.MediaFile{ID: 12, ContentID: "movie-dup", FilePath: candidateURI}}})
+	h := NewPlaybackHandler(playback.NewSessionManager(0, 0), mapPlaybackFileResolver{files: map[int]*models.MediaFile{11: requestedRow, 12: {ID: 12, ContentID: "movie-dup", FilePath: candidateURI}}})
 
 	sameRow := &playback.Session{ID: "s1", MediaFileID: 11, VirtualSourceURI: candidateURI}
 	if override := h.refusedProbeInventoryFile(context.Background(), sameRow, 11, candidateURI, probed); override == nil {

@@ -4115,13 +4115,20 @@ func ensureTrackLanguages(tracks []models.AudioTrack) []models.AudioTrack {
 	return tracks
 }
 
+// virtualMediaContainer is the container sentinel a provider-backed virtual
+// row carries. It mirrors models.MediaFile.ResolvedVirtualProvenance, which is
+// the canonical definition of "this row is virtual"; the value is duplicated
+// rather than exported because models is imported here, not the other way
+// round.
+const virtualMediaContainer = "virtual"
+
 // isVirtualMediaFile reports whether a media file row is a zero-storage
 // virtual candidate (provider-backed) rather than a local file. Mirrors the
 // canonical models check (Container == "virtual" or a virtual:// path,
 // case-insensitive): local liveness (missing_since) never applies to virtual
 // rows, and their health signal is the failed_at stamp instead.
 func isVirtualMediaFile(f *models.MediaFile) bool {
-	return f != nil && (f.Container == "virtual" || strings.HasPrefix(strings.ToLower(f.FilePath), "virtual://"))
+	return f != nil && (f.Container == virtualMediaContainer || strings.HasPrefix(strings.ToLower(f.FilePath), "virtual://"))
 }
 
 // versionAvailability returns the durable per-version health signal as a
@@ -4150,10 +4157,18 @@ func versionAvailability(f *models.MediaFile) *bool {
 //   - A byte-identical duplicate (same content, same size, same candidate URI)
 //     collapses to the first occurrence; the order within the list is
 //     preserved otherwise.
-//   - An unprobed virtual placeholder collapses when a probed row for the same
-//     neutral release (same content, same size, result= stripped) is present:
-//     the probed copy is authoritative. A placeholder that has no probed copy
-//     is kept, so a not-yet-probed release still appears in the selector.
+//   - An unprobed virtual row collapses only onto a probed row for the same
+//     neutral release (same content, result= stripped) that is positively the
+//     same release: the unprobed row is a size-unknown placeholder (no stored
+//     or provider-declared size) or shares the probed row's size, and no
+//     durable provider identity tier (video hash, GUID, release name) the two
+//     both carry disagrees. A concrete unprobed alternate release — a distinct
+//     size or a distinct durable identity — is kept, so it stays selectable. A
+//     placeholder with no probed copy is kept too.
+//
+// The concrete `result=` pick is deliberately not part of the identity test:
+// the neutral key strips it precisely because a provider re-list churns result
+// ids for one release, so a rotated sibling would otherwise never collapse.
 //
 // Local files are never collapsed: their on-disk paths are already distinct, and
 // a same-path collision is not the virtual duplicate this addresses.
@@ -4161,13 +4176,13 @@ func collapseDuplicateVirtualVersionFiles(files []*models.MediaFile) []*models.M
 	if len(files) < 2 {
 		return files
 	}
-	probedNeutral := make(map[string]struct{})
+	probedNeutral := make(map[string][]*models.MediaFile)
 	for _, f := range files {
 		if f == nil || f.ProbeUpdatedAt == nil {
 			continue
 		}
 		if key := virtualNeutralReleaseKey(f); key != "" {
-			probedNeutral[key] = struct{}{}
+			probedNeutral[key] = append(probedNeutral[key], f)
 		}
 	}
 	out := make([]*models.MediaFile, 0, len(files))
@@ -4185,7 +4200,7 @@ func collapseDuplicateVirtualVersionFiles(files []*models.MediaFile) []*models.M
 			continue
 		}
 		if f.ProbeUpdatedAt == nil {
-			if _, ok := probedNeutral[virtualNeutralReleaseKey(f)]; ok {
+			if unprobedCollapsesAgainstProbedRelease(f, probedNeutral[virtualNeutralReleaseKey(f)]) {
 				continue
 			}
 		}
@@ -4193,6 +4208,70 @@ func collapseDuplicateVirtualVersionFiles(files []*models.MediaFile) []*models.M
 		out = append(out, f)
 	}
 	return out
+}
+
+// unprobedCollapsesAgainstProbedRelease reports whether an unprobed virtual
+// row is positively the same release as one of the probed rows sharing its
+// provider-neutral key. It refuses unless the two rows are a likely placeholder
+// pair (the unprobed row's stored or provider-declared size is unknown, or
+// matches) and carry no conflicting durable provider identity, so a concrete
+// alternate release is never hidden.
+func unprobedCollapsesAgainstProbedRelease(f *models.MediaFile, probed []*models.MediaFile) bool {
+	if f == nil {
+		return false
+	}
+	size := virtualDeclaredProviderSize(f)
+	for _, p := range probed {
+		if p == nil {
+			continue
+		}
+		if size > 0 && size != virtualDeclaredProviderSize(p) {
+			continue
+		}
+		if virtualProviderIdentityConflicts(f, p) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// virtualDeclaredProviderSize returns the size a virtual row advertises for its
+// release, preferring the stored stream size and falling back to the durable
+// provider-declared size tier. Zero means the provider declared no size, which
+// is what marks an unprobed row as a size-unknown placeholder; a row whose size
+// lives only in the behaviorHints/videoSize tier would otherwise look sizeless
+// and collapse across releases it does not match.
+func virtualDeclaredProviderSize(f *models.MediaFile) int64 {
+	if f == nil {
+		return 0
+	}
+	if f.FileSize > 0 {
+		return f.FileSize
+	}
+	return f.ProviderReleaseSize
+}
+
+// virtualProviderIdentityConflicts reports whether two virtual rows carry
+// mutually exclusive durable provider identity. A tier that only one row
+// populates is not a conflict: an unprobed placeholder has no identity to
+// disagree with, while two populated, different tiers are a genuine release
+// swap.
+func virtualProviderIdentityConflicts(a, b *models.MediaFile) bool {
+	if a == nil || b == nil {
+		return true
+	}
+	return providerIdentityTierConflicts(a.ProviderVideoHash, b.ProviderVideoHash) ||
+		providerIdentityTierConflicts(a.ProviderGUID, b.ProviderGUID) ||
+		providerIdentityTierConflicts(a.ProviderReleaseName, b.ProviderReleaseName) ||
+		providerIdentityTierConflicts(a.ReleaseName, b.ReleaseName)
+}
+
+// providerIdentityTierConflicts reports whether two populated identity tiers
+// name different things. An empty side is unknown, never a conflict.
+func providerIdentityTierConflicts(a, b string) bool {
+	a, b = strings.TrimSpace(a), strings.TrimSpace(b)
+	return a != "" && b != "" && a != b
 }
 
 // virtualExactReleaseKey identifies a virtual row's exact release identity for
