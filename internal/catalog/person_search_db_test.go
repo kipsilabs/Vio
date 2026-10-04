@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/Silo-Server/silo-server/internal/access"
 )
@@ -172,7 +174,35 @@ func TestPersonSearchViewerAccessPostgres(t *testing.T) {
 			if !slices.Equal(got, tc.want) {
 				t.Fatalf("got %v, want %v", got, tc.want)
 			}
+			requireGetVisibleMatchesSearch(t, repo, prefix, ids, tc.filter)
 		})
+	}
+}
+
+// requireGetVisibleMatchesSearch checks that person detail admits exactly the
+// people an unscoped people search returns under the same viewer access, and
+// that a hidden person reads like an unknown ID.
+func requireGetVisibleMatchesSearch(t *testing.T, repo *PersonRepository, query string, ids []int64, filter AccessFilter) {
+	t.Helper()
+	searched, err := repo.SearchScoped(t.Context(), query, 100, "", filter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listed := make(map[int64]bool, len(searched))
+	for _, p := range searched {
+		listed[p.ID] = true
+	}
+	for _, id := range ids {
+		person, err := repo.GetVisible(t.Context(), id, filter)
+		switch {
+		case listed[id] && (err != nil || person == nil || person.ID != id):
+			t.Fatalf("person %d is searchable but detail answered %+v, %v", id, person, err)
+		case !listed[id] && !errors.Is(err, pgx.ErrNoRows):
+			t.Fatalf("person %d is not searchable but detail answered %+v, %v", id, person, err)
+		}
+	}
+	if _, err := repo.GetVisible(t.Context(), -1, filter); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("unknown person: %v", err)
 	}
 }
 
@@ -262,6 +292,9 @@ func TestPersonSearchEpisodeParentAccessPostgres(t *testing.T) {
 				}
 				if !slices.Equal(got, tc.want) {
 					t.Fatalf("got %v, want %v", got, tc.want)
+				}
+				if scope == "" {
+					requireGetVisibleMatchesSearch(t, repo, prefix, ids, tc.filter)
 				}
 			})
 		}

@@ -18,6 +18,7 @@ import (
 
 type peopleRepository interface {
 	Get(ctx context.Context, id int64) (*models.Person, error)
+	GetVisible(ctx context.Context, id int64, filter catalog.AccessFilter) (*models.Person, error)
 	Search(ctx context.Context, query string, limit int) ([]models.Person, error)
 	SearchScoped(ctx context.Context, query string, limit int, mediaScope string, filter catalog.AccessFilter) ([]models.Person, error)
 	Update(ctx context.Context, p models.Person) error
@@ -109,12 +110,32 @@ func (h *PeopleHandler) HandleGetPerson(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	resp, err := h.Person(r.Context(), id, true)
+	filter, ok := h.viewerAccessFilter(w, r)
+	if !ok {
+		return
+	}
+	resp, err := h.Person(r.Context(), id, true, filter)
 	if err != nil {
 		writeAPIError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// viewerAccessFilter resolves the requesting profile's catalog access, the
+// same filter the v2 people operations use. It fails closed and writes the
+// error answer itself.
+func (h *PeopleHandler) viewerAccessFilter(w http.ResponseWriter, r *http.Request) (catalog.AccessFilter, bool) {
+	if h.itemsHandler == nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to resolve user access")
+		return catalog.AccessFilter{}, false
+	}
+	filter, err := h.itemsHandler.ContextAccessFilter(r.Context(), AccessFilterOptions{})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to resolve user access")
+		return catalog.AccessFilter{}, false
+	}
+	return filter, true
 }
 
 // HandleRefreshPerson serves POST /api/v1/people/:id/refresh.
@@ -127,7 +148,11 @@ func (h *PeopleHandler) HandleRefreshPerson(w http.ResponseWriter, r *http.Reque
 	if !ok {
 		return
 	}
-	if err := h.RefreshPerson(r.Context(), apimw.GetUserID(r.Context()), id); err != nil {
+	filter, ok := h.viewerAccessFilter(w, r)
+	if !ok {
+		return
+	}
+	if err := h.RefreshPerson(r.Context(), apimw.GetUserID(r.Context()), id, filter); err != nil {
 		writeAPIError(w, err)
 		return
 	}

@@ -116,6 +116,14 @@ its existing alphabetical, unscoped search.
 as a view: when the person's metadata is incomplete or stale and no provider lookup
 ran recently, the server queues a background refresh.
 
+Person detail and `POST /api/v2/catalog/people/{id}/refresh` (`refreshPerson`)
+apply the same visibility rule as an unscoped people search: the viewer must be
+able to see at least one of the person's credits. Otherwise both answer `404`,
+exactly as for an unknown ID, so a profile cannot read the name, biography, or
+photo of someone who appears only in titles it cannot see. The v1 bridge routes
+`GET /api/v1/people/{id}` and `POST /api/v1/people/{id}/refresh` follow the same
+rule. The admin person routes are not filtered.
+
 Clients that warm a cache speculatively, such as web prefetching the cast of an
 open item, pass `prefetch=true`. A prefetch returns the same person but does not
 queue a refresh; missing metadata is left to the server's background sweep. Read

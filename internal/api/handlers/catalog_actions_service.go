@@ -224,10 +224,12 @@ func (h *PeopleHandler) SearchPeopleScoped(ctx context.Context, query string, li
 	return resp, nil
 }
 
-// Person answers one person. A view (queueRefresh) also queues a provider
-// refresh when one is due; a speculative prefetch leaves that to the sweep.
-func (h *PeopleHandler) Person(ctx context.Context, id int64, queueRefresh bool) (PersonView, error) {
-	person, err := h.personRepo.Get(ctx, id)
+// Person answers one person the viewer can see through at least one credit
+// (the people search predicate); any other person is not found, like an
+// unknown ID. A view (queueRefresh) also queues a provider refresh when one is
+// due; a speculative prefetch leaves that to the sweep.
+func (h *PeopleHandler) Person(ctx context.Context, id int64, queueRefresh bool, filter catalog.AccessFilter) (PersonView, error) {
+	person, err := h.personRepo.GetVisible(ctx, id, filter)
 	if err != nil {
 		slog.WarnContext(ctx, "people: get person failed", "component", "api", "id", id, "id_str", strconv.FormatInt(id, 10), "error", err)
 		return PersonView{}, apiError(http.StatusNotFound, policyErrorNotFound, "person not found")
@@ -239,8 +241,9 @@ func (h *PeopleHandler) Person(ctx context.Context, id int64, queueRefresh bool)
 }
 
 // RefreshPerson queues a provider refresh of the person for the viewer
-// userID, at most personRefreshRate per user.
-func (h *PeopleHandler) RefreshPerson(ctx context.Context, userID int, id int64) error {
+// userID, at most personRefreshRate per user. A person the viewer cannot see
+// is not found, as in Person.
+func (h *PeopleHandler) RefreshPerson(ctx context.Context, userID int, id int64, filter catalog.AccessFilter) error {
 	if h == nil || h.refreshQueue == nil {
 		return apiError(http.StatusServiceUnavailable, policyErrorUnavailable, "Person refresh is not configured")
 	}
@@ -255,7 +258,7 @@ func (h *PeopleHandler) RefreshPerson(ctx context.Context, userID int, id int64)
 		}
 		return limited
 	}
-	person, err := h.personRepo.Get(ctx, id)
+	person, err := h.personRepo.GetVisible(ctx, id, filter)
 	if err != nil || person == nil {
 		return apiError(http.StatusNotFound, policyErrorNotFound, "person not found")
 	}

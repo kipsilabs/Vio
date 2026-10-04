@@ -2,11 +2,22 @@ package handlers
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5"
+
+	"github.com/Silo-Server/silo-server/internal/access"
+	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
+	"github.com/Silo-Server/silo-server/internal/auth"
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/ratelimit"
 )
 
 type recordingPersonRefreshQueue struct {
@@ -144,7 +155,7 @@ type singlePersonRepo struct {
 	person models.Person
 }
 
-func (r singlePersonRepo) Get(context.Context, int64) (*models.Person, error) {
+func (r singlePersonRepo) GetVisible(context.Context, int64, catalog.AccessFilter) (*models.Person, error) {
 	return &r.person, nil
 }
 
@@ -154,11 +165,84 @@ func TestPersonQueuesRefreshOnlyForViews(t *testing.T) {
 		queue := &recordingPersonRefreshQueue{}
 		handler := &PeopleHandler{personRepo: singlePersonRepo{person: due}, refreshQueue: queue}
 
-		if _, err := handler.Person(context.Background(), due.ID, queueRefresh); err != nil {
+		if _, err := handler.Person(context.Background(), due.ID, queueRefresh, catalog.AccessFilter{}); err != nil {
 			t.Fatal(err)
 		}
 		if queued := len(queue.ids) == 1; queued != queueRefresh {
 			t.Fatalf("queueRefresh=%v queued=%v", queueRefresh, queued)
 		}
+	}
+}
+
+// matureOnlyPersonRepo stands in for PersonRepository.GetVisible: person 1's
+// only credit is a TV-MA title, so a viewer under a rating ceiling cannot see
+// them, and every other ID is unknown. Get is left unimplemented so a viewer
+// path that bypasses visibility panics.
+type matureOnlyPersonRepo struct {
+	peopleRepository
+	filters []catalog.AccessFilter
+}
+
+func (r *matureOnlyPersonRepo) GetVisible(_ context.Context, id int64, filter catalog.AccessFilter) (*models.Person, error) {
+	r.filters = append(r.filters, filter)
+	if id != 1 || filter.MaxContentRating != "" {
+		return nil, pgx.ErrNoRows
+	}
+	return &models.Person{ID: 1, Name: "Bryan Cranston", Bio: "Actor", TmdbID: "17419", UpdatedAt: time.Now()}, nil
+}
+
+func TestV1PersonDetailAndRefreshHonorViewerAccess(t *testing.T) {
+	repo := &matureOnlyPersonRepo{}
+	queue := &recordingPersonRefreshQueue{}
+	h := &PeopleHandler{personRepo: repo, itemsHandler: &ItemsHandler{}, refreshQueue: queue, refreshLimiter: ratelimit.NewMemoryLimiter()}
+	router := chi.NewRouter()
+	router.Get("/people/{id}", h.HandleGetPerson)
+	router.Post("/people/{id}/refresh", h.HandleRefreshPerson)
+	serve := func(method, path string, scope access.Scope) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(method, path, nil)
+		ctx := apimw.SetClaims(req.Context(), &auth.Claims{UserID: 5})
+		req = req.WithContext(access.SetScope(ctx, scope))
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec
+	}
+	kid := access.Scope{AllowedLibraryIDs: []int{3}, MaturityLimits: access.MaturityLimits{MaxContentRating: "TV-Y7"}}
+	adult := access.Scope{AllowedLibraryIDs: []int{3}}
+
+	unknown := serve(http.MethodGet, "/people/2", kid)
+	hidden := serve(http.MethodGet, "/people/1", kid)
+	if hidden.Code != http.StatusNotFound || hidden.Body.String() != unknown.Body.String() || strings.Contains(hidden.Body.String(), "Cranston") {
+		t.Fatalf("hidden person: %d %s, unknown: %d %s", hidden.Code, hidden.Body.String(), unknown.Code, unknown.Body.String())
+	}
+	got := repo.filters[len(repo.filters)-1]
+	if got.MaxContentRating != "TV-Y7" || !slices.Equal(got.AllowedLibraryIDs, []int{3}) {
+		t.Fatalf("detail did not pass the viewer's access: %+v", got)
+	}
+	if rec := serve(http.MethodPost, "/people/1/refresh", kid); rec.Code != http.StatusNotFound {
+		t.Fatalf("hidden refresh: %d %s", rec.Code, rec.Body.String())
+	}
+	if len(queue.ids) != 0 {
+		t.Fatalf("hidden person was queued: %v", queue.ids)
+	}
+
+	visible := serve(http.MethodGet, "/people/1", adult)
+	if visible.Code != http.StatusOK || !strings.Contains(visible.Body.String(), `"name":"Bryan Cranston"`) {
+		t.Fatalf("visible person: %d %s", visible.Code, visible.Body.String())
+	}
+	viewed := len(queue.ids) // The view may queue a due refresh on its own.
+	if rec := serve(http.MethodPost, "/people/1/refresh", adult); rec.Code != http.StatusAccepted || len(queue.ids) != viewed+1 {
+		t.Fatalf("visible refresh: %d %s, queued %v", rec.Code, rec.Body.String(), queue.ids)
+	}
+}
+
+func TestV1PersonDetailFailsClosedWithoutAccessResolver(t *testing.T) {
+	h := &PeopleHandler{personRepo: &matureOnlyPersonRepo{}}
+	router := chi.NewRouter()
+	router.Get("/people/{id}", h.HandleGetPerson)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/people/1", nil))
+	if rec.Code != http.StatusInternalServerError || strings.Contains(rec.Body.String(), "Cranston") {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
 	}
 }

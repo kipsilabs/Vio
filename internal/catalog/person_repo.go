@@ -508,12 +508,27 @@ func (r *PersonRepository) BatchFindOrCreate(ctx context.Context, people []model
 
 // Get retrieves a person by ID.
 func (r *PersonRepository) Get(ctx context.Context, id int64) (*models.Person, error) {
+	return r.getByID(ctx, id, "", []any{id})
+}
+
+// GetVisible retrieves a person by ID only when the viewer can see at least
+// one of the person's credits, using the predicate SearchScoped applies with
+// no media scope. A person the viewer cannot see answers pgx.ErrNoRows, the
+// same as an unknown ID, so the answer does not reveal that the person exists.
+func (r *PersonRepository) GetVisible(ctx context.Context, id int64, filter AccessFilter) (*models.Person, error) {
+	args := []any{id}
+	argIdx := 2
+	visible := personCreditVisibleSQL("people.id", nil, filter, &args, &argIdx)
+	return r.getByID(ctx, id, " AND "+visible, args)
+}
+
+func (r *PersonRepository) getByID(ctx context.Context, id int64, extraWhere string, args []any) (*models.Person, error) {
 	var p models.Person
 	err := r.pool.QueryRow(ctx, `
 		SELECT id, name, sort_name, bio, birth_date, death_date, birthplace, homepage,
 			photo_path, photo_source_path, photo_thumbhash, tmdb_id, imdb_id, tvdb_id, plex_guid, created_at, updated_at,
 			metadata_refresh_attempted_at
-		FROM people WHERE id = $1`, id,
+		FROM people WHERE id = $1`+extraWhere, args...,
 	).Scan(&p.ID, &p.Name, &p.SortName, &p.Bio, &p.BirthDate, &p.DeathDate, &p.Birthplace, &p.Homepage,
 		&p.PhotoPath, &p.PhotoSourcePath, &p.PhotoThumbhash, &p.TmdbID, &p.ImdbID, &p.TvdbID, &p.PlexGUID, &p.CreatedAt, &p.UpdatedAt,
 		&p.MetadataRefreshAttemptedAt,
@@ -568,25 +583,8 @@ func (r *PersonRepository) search(ctx context.Context, query string, limit int, 
 	args := []any{query, limit}
 	where := "name ILIKE '%' || $1 || '%'"
 	if filter != nil {
-		conditions := []string{"ip.person_id = people.id"}
 		argIdx := 3
-		if types := MediaScopeItemTypes(mediaScope); len(types) > 0 {
-			conditions = append(conditions, "mi.type = ANY($3::text[])")
-			args = append(args, types)
-			argIdx++
-		}
-		// Episode access follows the parent series, while scope and excluded
-		// media types describe the credited item itself.
-		appendLibraryAccessConditions("access_item.content_id", *filter, &conditions, &args, &argIdx)
-		applyAccessFilter("access_item", AccessFilter{MaturityLimits: filter.MaturityLimits}, &conditions, &args, &argIdx)
-		applyAccessFilter("mi", AccessFilter{ExcludedMediaTypes: filter.ExcludedMediaTypes}, &conditions, &args, &argIdx)
-		where += ` AND EXISTS (
-			SELECT 1 FROM item_people ip
-			JOIN media_items mi ON mi.content_id = ip.content_id
-			JOIN media_items access_item ON access_item.content_id = CASE
-				WHEN mi.type = 'episode' THEN ` + episodeParentSeriesIDExpr("mi.content_id") + `
-				ELSE mi.content_id END
-			WHERE ` + strings.Join(conditions, " AND ") + ")"
+		where += " AND " + personCreditVisibleSQL("people.id", MediaScopeItemTypes(mediaScope), *filter, &args, &argIdx)
 	}
 	order := "name ASC"
 	if filter != nil {
@@ -618,6 +616,31 @@ func (r *PersonRepository) search(ctx context.Context, query string, limit int, 
 		people = append(people, p)
 	}
 	return people, rows.Err()
+}
+
+// personCreditVisibleSQL renders an EXISTS predicate that holds when the person
+// at personIDExpr has at least one credit the viewer can see, limited to
+// credits on items of the given types when types is non-empty. People search
+// and person detail share it so a person found by one opens in the other.
+func personCreditVisibleSQL(personIDExpr string, types []string, filter AccessFilter, args *[]any, argIdx *int) string {
+	conditions := []string{"ip.person_id = " + personIDExpr}
+	if len(types) > 0 {
+		conditions = append(conditions, fmt.Sprintf("mi.type = ANY($%d::text[])", *argIdx))
+		*args = append(*args, types)
+		*argIdx = *argIdx + 1
+	}
+	// Episode access follows the parent series, while scope and excluded
+	// media types describe the credited item itself.
+	appendLibraryAccessConditions("access_item.content_id", filter, &conditions, args, argIdx)
+	applyAccessFilter("access_item", AccessFilter{MaturityLimits: filter.MaturityLimits}, &conditions, args, argIdx)
+	applyAccessFilter("mi", AccessFilter{ExcludedMediaTypes: filter.ExcludedMediaTypes}, &conditions, args, argIdx)
+	return `EXISTS (
+			SELECT 1 FROM item_people ip
+			JOIN media_items mi ON mi.content_id = ip.content_id
+			JOIN media_items access_item ON access_item.content_id = CASE
+				WHEN mi.type = 'episode' THEN ` + episodeParentSeriesIDExpr("mi.content_id") + `
+				ELSE mi.content_id END
+			WHERE ` + strings.Join(conditions, " AND ") + ")"
 }
 
 // maxPersonConflictResolutions bounds how many external-id collisions a single
