@@ -2260,6 +2260,7 @@ func (h *StreamHandler) SubtitleFonts(ctx context.Context, in SubtitleFontReques
 	if !playback.IsASS(file.SubtitleTracks[embeddedIndex].Codec) {
 		return nil, false, apiError(http.StatusBadRequest, "bad_request", "Subtitle font bundles are only available for ASS/SSA tracks")
 	}
+
 	// Virtual rows resolve through the relay inside the shared core: a
 	// provider-neutral virtual:// URI is not an FFmpeg input, so probing it
 	// directly always fails with a 500 the client then retries in a storm.
