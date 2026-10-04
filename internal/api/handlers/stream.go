@@ -1196,6 +1196,14 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "not_found", "Media file not found")
 			return
 		}
+		// A canceled lookup is the viewer going away mid-start, not a broken
+		// catalog row: answer 204 without failing the session so it reads as
+		// a cancel in logs and metrics, never a 500.
+		if isClientCancellation(r.Context(), err) {
+			h.abortPlaybackSession(r.Context(), session)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		writeErrorCause(w, http.StatusInternalServerError, "internal_error", "Failed to load media file", err)
 		return
 	}

@@ -263,6 +263,7 @@ func TestSensitiveSettingKeys_Audited(t *testing.T) {
 		"redis.sentinel_password",   // was missing from the old redaction map
 		"recommendations.openai_api_key",
 		"tmdb.api_key",
+		"remuxdb.token", // removed integration (rev 17): deprecated but still a credential
 		"requests.radarr.api_key",
 		"requests.sonarr.api_key",
 		"watchsync.trakt.client_secret",
