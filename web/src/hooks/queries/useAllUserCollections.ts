@@ -12,7 +12,6 @@ export interface CollectionOption {
   library_id?: number;
   library_name?: string;
   collection_type?: LibraryCollection["collection_type"];
-  source_config?: LibraryCollection["source_config"];
   last_sync_status?: LibraryCollection["last_sync_status"];
 }
 
@@ -59,7 +58,6 @@ export function buildAllUserCollectionOptions(
         library_id: library.id,
         library_name: library.name,
         collection_type: collection.collection_type,
-        source_config: collection.source_config,
         last_sync_status: collection.last_sync_status,
       };
       libraryOptions.set(collection.id, { option, libraryNames: [library.name] });
