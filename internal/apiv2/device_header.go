@@ -56,6 +56,16 @@ func rejectMalformedDeviceHeader(next http.Handler) http.Handler {
 			// header clamp already trims before storing.
 			r.Header.Set(deviceIDHeader, v)
 		}
+		// The client family header is bound by enum at each operation, so
+		// promotion here only fills the canonical spelling from the legacy
+		// one when the canonical header is absent. Canonical wins when both
+		// are present; an invalid legacy value is left for the operation's
+		// own validation to refuse.
+		familyCanonical := textproto.CanonicalMIMEHeaderKey(clientFamilyHeader)
+		familyLegacy := textproto.CanonicalMIMEHeaderKey(legacyClientFamilyHeader)
+		if len(r.Header[familyCanonical]) == 0 && len(r.Header[familyLegacy]) > 0 {
+			r.Header[familyCanonical] = r.Header[familyLegacy]
+		}
 		next.ServeHTTP(w, r)
 	})
 }

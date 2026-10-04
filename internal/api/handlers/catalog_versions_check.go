@@ -17,6 +17,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary"
+	"github.com/Silo-Server/silo-server/internal/virtuallibrary/resolver"
 )
 
 const (
@@ -44,6 +45,80 @@ type versionCheckResponse struct {
 	Results []versionCheckResult `json:"results"`
 }
 
+// versionCheckOutcome is one file's liveness verdict before stamps are
+// applied. Resolution and classification run concurrently per file, but
+// stamps apply only after the whole batch is judged (see
+// gateVersionCheckStamps): one volatile listing must never mass-tag
+// versions as dead.
+type versionCheckOutcome struct {
+	fileID int
+	// file is the resolved row, carried so the deferred stamp can fence on
+	// its identity and observed verdict. Nil when the file was not found.
+	file *models.MediaFile
+	// available is the per-file answer: durable state when the round is
+	// ambiguous or gated, live resolution otherwise.
+	available bool
+	// stamp is true when this round found the pin dead.
+	stamp bool
+	// durableAlive mirrors the row's pre-round failed_at (true when the row
+	// carried no verdict): the answer to report when stamping is gated off.
+	durableAlive bool
+	// checked is true when the file got a provider resolution attempt, the
+	// only outcomes that speak to listing health. Denied, unknown, local,
+	// and unwired files report without resolving and stay out of the gate
+	// denominator.
+	checked bool
+}
+
+const (
+	// minVersionCheckStampQuorum is the minimum dead-pin count that can trip
+	// the batch gate. Below it every stamp applies: a lone genuinely-dead
+	// pin (the common single-file check) must still be recorded.
+	minVersionCheckStampQuorum = 4
+	// versionCheckStampDisagreementRate is the dead-pin fraction above which
+	// the listing itself is distrusted instead of the pins. Past it the
+	// round reports durable state and stamps nothing: a renumber storm or a
+	// degraded partial listing disagrees with everything at once, and that
+	// pattern means the observation is bad, not forty releases at once.
+	// The comparison is strictly past the rate: an exact-half split still
+	// stamps, deciding ties in favor of recording genuinely-dead pins
+	// rather than protecting against a volatile listing.
+	versionCheckStampDisagreementRate = 0.5
+)
+
+// gateVersionCheckStamps decides which outcomes may stamp. It returns the
+// file IDs to stamp; availability in the returned outcomes already reflects
+// the decision (durable state when gated, live resolution otherwise).
+func gateVersionCheckStamps(outcomes []versionCheckOutcome) ([]versionCheckOutcome, []int) {
+	dead, checked := 0, 0
+	for _, outcome := range outcomes {
+		if !outcome.checked {
+			continue
+		}
+		checked++
+		if outcome.stamp {
+			dead++
+		}
+	}
+	gated := checked > 0 && dead >= minVersionCheckStampQuorum &&
+		float64(dead)/float64(checked) > versionCheckStampDisagreementRate
+	final := make([]versionCheckOutcome, 0, len(outcomes))
+	var toStamp []int
+	for _, outcome := range outcomes {
+		if gated && outcome.stamp {
+			// Listing untrustworthy this round: report the durable signal
+			// and stamp nothing.
+			outcome.available = outcome.durableAlive
+			outcome.stamp = false
+		}
+		if outcome.stamp {
+			toStamp = append(toStamp, outcome.fileID)
+		}
+		final = append(final, outcome)
+	}
+	return final, toStamp
+}
+
 // HandleCheckVersions implements POST /catalog/versions/check: a batched
 // liveness probe for the media page's version list. Each file is tested
 // cheaply — virtual rows resolve their pinned ?result= candidate through the
@@ -65,7 +140,7 @@ func (h *CatalogResourceHandler) HandleCheckVersions(w http.ResponseWriter, r *h
 	ctx, cancel := context.WithTimeout(r.Context(), versionCheckOverallBudget)
 	defer cancel()
 
-	results := make([]versionCheckResult, 0, len(req.FileIDs))
+	outcomes := make([]versionCheckOutcome, 0, len(req.FileIDs))
 	var mu sync.Mutex
 	eg, egCtx := errgroup.WithContext(ctx)
 	eg.SetLimit(versionCheckConcurrency)
@@ -75,9 +150,9 @@ func (h *CatalogResourceHandler) HandleCheckVersions(w http.ResponseWriter, r *h
 		}
 		id := id
 		eg.Go(func() error {
-			available := h.checkVersion(egCtx, id)
+			outcome := h.checkVersion(egCtx, id)
 			mu.Lock()
-			results = append(results, versionCheckResult{FileID: id, Available: available})
+			outcomes = append(outcomes, outcome)
 			mu.Unlock()
 			return nil
 		})
@@ -85,6 +160,21 @@ func (h *CatalogResourceHandler) HandleCheckVersions(w http.ResponseWriter, r *h
 	// Per-file failures are folded into the availability verdict; the batch
 	// itself never fails on one file.
 	_ = eg.Wait()
+
+	// Stamps apply only after the whole batch is judged: one volatile
+	// listing disagreeing with everything must not mass-tag versions.
+	final, toStamp := gateVersionCheckStamps(outcomes)
+	stampByID := make(map[int]struct{}, len(toStamp))
+	for _, id := range toStamp {
+		stampByID[id] = struct{}{}
+	}
+	results := make([]versionCheckResult, 0, len(final))
+	for _, outcome := range final {
+		if _, ok := stampByID[outcome.fileID]; ok {
+			h.stampVirtualCandidateFailed(ctx, outcome.fileID, outcome.file)
+		}
+		results = append(results, versionCheckResult{FileID: outcome.fileID, Available: outcome.available})
+	}
 
 	writeJSON(w, http.StatusOK, versionCheckResponse{Results: results})
 }
@@ -99,26 +189,31 @@ func (h *CatalogResourceHandler) HandleCheckVersions(w http.ResponseWriter, r *h
 // Ambiguous provider errors (timeout, network, resolver not configured) leave
 // the stamp unchanged and report the row's current computed availability, so
 // a provider outage cannot mass-tag versions as dead.
-func (h *CatalogResourceHandler) checkVersion(ctx context.Context, fileID int) bool {
+func (h *CatalogResourceHandler) checkVersion(ctx context.Context, fileID int) versionCheckOutcome {
+	outcome := versionCheckOutcome{fileID: fileID}
 	if h == nil || h.FileResolver == nil {
-		return false
+		return outcome
 	}
 	file, err := h.FileResolver.GetByID(ctx, fileID)
 	if err != nil || file == nil {
-		return false
+		return outcome
 	}
+	outcome.file = file
+	outcome.durableAlive = file.FailedAt == nil
 	if !h.fileAccessible(ctx, file) {
 		// Denied by the profile's catalog/library access policy: report the
 		// same shape as an unknown ID and never resolve or stamp.
-		return false
+		return outcome
 	}
 	if !isVirtualPlaybackFile(file) {
-		return file.MissingSince == nil
+		outcome.available = file.MissingSince == nil
+		return outcome
 	}
 	if h.VirtualResolver == nil {
 		// No provider resolver wired (playback disabled): report the durable
 		// stamp only, never stamp anything.
-		return file.FailedAt == nil
+		outcome.available = outcome.durableAlive
+		return outcome
 	}
 
 	perFileCtx, cancel := context.WithTimeout(ctx, versionCheckPerFileBudget)
@@ -144,6 +239,7 @@ func (h *CatalogResourceHandler) checkVersion(ctx context.Context, fileID int) b
 		// for an absent pin. A successful resolution counts when it named the
 		// requested candidate, or when the durable identity proves it is the
 		// same release under a renumbered result id (IdentityRematched).
+		outcome.checked = true
 		if resolvedIdentityMatches(resolved, requestedCandidateID) || resolvedMatchesPersistedIdentity(resolved, file) {
 			// A healthy liveness observation for the same identity clears a
 			// stale failed_at so the auto-pick considers the release again.
@@ -158,45 +254,68 @@ func (h *CatalogResourceHandler) checkVersion(ctx context.Context, fileID int) b
 					h.VirtualFileMetadataSaver, h.VirtualFileSaver,
 				)
 			}
-			return true
+			outcome.available = true
+			return outcome
 		}
 		if requestedCandidateID == "" {
 			// The row carries no concrete pin (profile-neutral row): any
 			// resolution of its identity is listing evidence. Report live.
 			h.clearVirtualCandidateIfFailed(ctx, fileID, file)
-			return true
+			outcome.available = true
+			return outcome
 		}
 		// The provider answered with a different candidate and the row's
 		// durable identity does not match it: the requested release is
-		// genuinely gone. Stamp it (fenced) so the auto-pick skips it. A row
-		// with no durable identity is indistinguishable from a renumbered
+		// genuinely gone. Record the stamp for the batch gate; a row with
+		// no durable identity is indistinguishable from a renumbered
 		// listing, so it is left alone (ambiguous) rather than mass-stamped.
 		if _, hasIdentity := persistedVirtualIdentity(file); hasIdentity {
-			h.stampVirtualCandidateFailed(ctx, fileID, file)
+			outcome.stamp = true
 		}
-		return false
+		outcome.available = false
+		return outcome
+	}
+	if isVirtualProviderListingTemporaryError(err) {
+		// Transport-temporary: the provider's listing request failed, timed
+		// out, or answered 5xx. That is availability-shaped and says nothing
+		// about the pinned release, so this must be classified BEFORE the
+		// string-based confirmed-dead classifier and before any
+		// identity-grounded absent-pin branch. A joined error can carry both a
+		// transient listing cause and a "no matching candidate" fallback text
+		// (or an absent-pin sentinel); letting either be read as a verdict is
+		// what let a provider flap indict a pin the liveness check then
+		// reported dead.
+		outcome.checked = true
+		outcome.available = outcome.durableAlive
+		return outcome
 	}
 	if isVirtualCandidateDeadError(err) {
 		// Confirmed dead pin: the provider listed but the pinned candidate is
-		// gone or unusable. Stamp it so the auto-pick skips it. The stamp is
-		// fenced the same way: a candidate rotated while resolution was in
-		// flight is never mis-marked.
-		h.stampVirtualCandidateFailed(ctx, fileID, file)
-		return false
+		// gone or unusable. Record the stamp for the batch gate; the write
+		// itself is fenced the same way, so a candidate rotated while
+		// resolution was in flight is never mis-marked.
+		outcome.checked = true
+		outcome.stamp = true
+		outcome.available = false
+		return outcome
 	}
 	if _, hasIdentity := persistedVirtualIdentity(file); hasIdentity &&
 		errors.Is(err, virtuallibrary.ErrSessionBoundCandidateAbsent) {
 		// The provider listed, the row carries a durable identity, and the
 		// resolver still refused because no listed candidate re-identified the
 		// same release. That is a confirmed absence, not a renumbered listing:
-		// stamp it. Without identity the sentinel is ambiguous and is left
-		// alone below.
-		h.stampVirtualCandidateFailed(ctx, fileID, file)
-		return false
+		// record the stamp for the batch gate. Without identity the sentinel
+		// is ambiguous and is left alone below.
+		outcome.checked = true
+		outcome.stamp = true
+		outcome.available = false
+		return outcome
 	}
 	// Ambiguous (provider down, timeout, identity-less absence): do not stamp.
 	// Report the current durable signal so an outage cannot mass-tag versions.
-	return file.FailedAt == nil
+	outcome.checked = true
+	outcome.available = outcome.durableAlive
+	return outcome
 }
 
 // stampVirtualCandidateFailed applies the fenced failed_at verdict the check
@@ -294,6 +413,67 @@ func (h *CatalogResourceHandler) fileAccessible(ctx context.Context, file *model
 	return catalog.FileAllowedByAccess(file, filter)
 }
 
+// isVirtualProviderListingTemporaryError reports whether a resolution failure
+// is transport-temporary / availability-shaped rather than a verdict about the
+// pinned release: the provider listing could not be produced (request failed,
+// timed out, or answered 5xx), the release is still being fetched, or the
+// trusted persisted candidate was absent from a listing the resolver refused to
+// substitute from. None of these may indict a pin; the caller reports durable
+// state instead.
+//
+// This is deliberately checked BEFORE the string-based
+// isVirtualCandidateDeadError: a joined error can carry both a transient
+// listing cause and a "no matching candidate" fallback text, and the transient
+// cause must win. Every typed sentinel from internal/virtuallibrary and
+// internal/virtuallibrary/resolver is matched with errors.Is so a rename of the
+// human text cannot silently re-open the indictment; the provider-neutral
+// strings below cover a wrapped RPC failure the core path does not type.
+func isVirtualProviderListingTemporaryError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, resolver.ErrProviderUnavailable) ||
+		errors.Is(err, virtuallibrary.ErrProviderPending) ||
+		errors.Is(err, virtuallibrary.ErrPersistedCandidateTrusted) ||
+		errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, context.Canceled) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "request failed") ||
+		strings.Contains(msg, "resolver is not installed") ||
+		strings.Contains(msg, "load owning virtual stream provider") ||
+		strings.Contains(msg, "no streams available") ||
+		strings.Contains(msg, "provider unavailable") ||
+		strings.Contains(msg, "failed recently") ||
+		strings.Contains(msg, "bad gateway") ||
+		strings.Contains(msg, "service unavailable") ||
+		strings.Contains(msg, "temporarily unavailable") ||
+		containsProvider5xxStatus(msg)
+}
+
+// containsProvider5xxStatus reports whether an error message names an HTTP 5xx
+// provider status ("... returned status 503", "... HTTP 503"). A listing that
+// failed with a raw 5xx is transport-temporary even when the surrounding text
+// also carries a fallback "no matching candidate", so the dead-pin classifier
+// must defer to it.
+func containsProvider5xxStatus(msg string) bool {
+	if strings.Contains(msg, " 5xx") {
+		return true
+	}
+	for _, marker := range []string{"status 5", "http 5"} {
+		idx := strings.Index(msg, marker)
+		if idx < 0 {
+			continue
+		}
+		rest := msg[idx+len(marker):]
+		if len(rest) >= 2 && rest[0] >= '0' && rest[0] <= '9' && rest[1] >= '0' && rest[1] <= '9' {
+			return true
+		}
+	}
+	return false
+}
+
 // isVirtualCandidateDeadError classifies a resolution failure as a confirmed
 // dead pin: the provider answered, listed candidates, and the pinned candidate
 // is no longer among them or is unusable. Provider-down/timeout errors do not
@@ -302,7 +482,10 @@ func (h *CatalogResourceHandler) fileAccessible(ctx context.Context, file *model
 // internal/plugins/virtual_playback.go). A joined error that also carries a
 // provider RPC failure ("request failed") is ambiguous even when a fallback
 // provider reported no matching candidate: the owner provider that owns the pin
-// may simply be down.
+// may simply be down. A transport-temporary cause always wins over the
+// dead-pin strings, so a listing failure joined with a "no matching candidate"
+// fallback text is never read as a verdict (see
+// isVirtualProviderListingTemporaryError).
 //
 // An EMPTY listing ("no streams available from provider") is deliberately NOT
 // classified as dead. A zero-count answer is a provider hiccup that proves
@@ -310,16 +493,10 @@ func (h *CatalogResourceHandler) fileAccessible(ctx context.Context, file *model
 // empty listing for a title whose releases are all still offered. Stamping pins
 // on it is how a 2.6 s burst marked 50 of 57 rows failed in the incident.
 func isVirtualCandidateDeadError(err error) bool {
-	if err == nil {
+	if err == nil || isVirtualProviderListingTemporaryError(err) {
 		return false
 	}
 	msg := strings.ToLower(err.Error())
-	if strings.Contains(msg, "request failed") ||
-		strings.Contains(msg, "resolver is not installed") ||
-		strings.Contains(msg, "load owning virtual stream provider") ||
-		strings.Contains(msg, "no streams available") {
-		return false
-	}
 	return strings.Contains(msg, "no matching candidate") ||
 		strings.Contains(msg, "no usable stream")
 }

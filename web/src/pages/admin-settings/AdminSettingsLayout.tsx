@@ -20,6 +20,7 @@ import { SettingsPageRail } from "@/components/settings/SettingsPageRail";
 import GeneralSettings from "./GeneralSettings";
 import AppearanceSettings from "./AppearanceSettings";
 import SecurityAccessSettings from "./SecurityAccessSettings";
+import SignInSettings from "./SignInSettings";
 import LibraryMetadataSettings from "./LibraryMetadataSettings";
 import StreamingSettings from "./StreamingSettings";
 import PlaybackSettings from "./PlaybackSettings";
@@ -43,6 +44,7 @@ const SETTINGS_COMPONENTS: Record<string, ComponentType> = {
   general: GeneralSettings,
   appearance: AppearanceSettings,
   security: SecurityAccessSettings,
+  "sign-in": SignInSettings,
   library: LibraryMetadataSettings,
   streaming: StreamingSettings,
   playback: PlaybackSettings,

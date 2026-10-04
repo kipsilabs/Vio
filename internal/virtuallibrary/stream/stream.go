@@ -113,10 +113,14 @@ type StreamCandidate struct {
 	// SourceConfirmed marks a candidate whose release the configured source of
 	// truth (AltMount's completed/imported state, or Prowlarr as a fallback)
 	// has already accepted. SourceFailed marks a release AltMount reports as
-	// failed. Both are provider-local derived state, never part of the Stremio
-	// payload, so a provider response cannot spoof them.
+	// failed. SourcePending marks a release AltMount reports as actively
+	// fetching (SABnzbd queue, not history): neither dead (so failed-drops
+	// and the pruner must ignore it) nor ready (so the resolver may hold for
+	// it). All three are provider-local derived state, never part of the
+	// Stremio payload, so a provider response cannot spoof them.
 	SourceConfirmed bool `json:"-"`
 	SourceFailed    bool `json:"-"`
+	SourcePending   bool `json:"-"`
 	// SourceGUID is the stable GUID of the indexed release the classifier tied
 	// this candidate to (Prowlarr exposes one per result). It is the dedup
 	// identity when the provider carries no content hash, so two variants of

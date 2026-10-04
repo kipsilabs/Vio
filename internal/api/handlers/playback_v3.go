@@ -8075,6 +8075,30 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		// place rather than substituting a sibling.
 		audioOnlyAllowed := replanFallbackAllowed && audioOnlyTerminalV3(result.Terminal)
 		alternateFileAllowed := replanFallbackAllowed && terminalAllowsAlternateFileV3(result.Terminal)
+		// versionPickFallback remembers whether the hunt below runs for an
+		// explicitly picked but unplannable release, so its success publishes
+		// the substitution notice (the shared hunt is silent by default).
+		versionPickFallback := false
+		if !alternateFileAllowed && trackChange && result.Terminal != nil &&
+			result.Terminal.Reason == sourceMetadataIncompleteReasonV3 &&
+			requestedFile != nil && effectiveFile != nil &&
+			requestedFile.ID != 0 && requestedFile.ID != effectiveFile.ID &&
+			playback.VirtualRouteVideoMetadataGapsV3(requestedFile) != "" &&
+			playback.VirtualRouteVideoMetadataGapsV3(effectiveFile) == "" {
+			// A track_change naming a different file than mounted is a
+			// version pick, not a subtitle/audio pick (those name the
+			// mounted file and never reach this branch). When planning the
+			// pick terminals on missing metadata while the mounted release
+			// is fully characterized, fall back through the same alternate
+			// hunt (with substitution notice) instead of stranding on a
+			// terminal for a row that was never probed. Subtitle/audio
+			// terminals keep their in-place degrade above; this branch
+			// deliberately bypasses the auto-fallback flag because an
+			// explicitly picked but unplannable release with a playable
+			// bound sibling is exactly what the notice exists for.
+			alternateFileAllowed = true
+			versionPickFallback = true
+		}
 		if subtitleOnlyAllowed {
 			// A subtitle-only refusal must not move the release. Re-plan the
 			// file already mounted with the subtitle dropped; the in-place
@@ -8161,6 +8185,15 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 						preparedTransport = &eval.transport
 						transportPrepared = true
 						reservationHeld = eval.reservationHeld
+						if versionPickFallback {
+							// The hunt ran for an explicitly picked but
+							// unplannable release: name the substitution so
+							// the client shows the notice instead of playing
+							// a different release silently. Unknown reason:
+							// the pick was unplannable (missing metadata),
+							// not confirmed dead.
+							publishSubstitutionFieldsV3(result.Plan, requestedFile.ID, effectiveFile.ID, substitutionReasonUnknownV3)
+						}
 						break
 					}
 					if firstFailureEval == nil && eval != nil {
@@ -9252,6 +9285,11 @@ const (
 	terminalSubtitleConversionUnsupportedV3 = "subtitle_conversion_unsupported"
 	terminalSubtitleUnavailableInVersionV3  = "subtitle_unavailable_in_version"
 	terminalBitratePolicyUnavailableV3      = playback.TerminalBitratePolicyUnavailableV3
+	// sourceMetadataIncompleteReasonV3 is the planner terminal for a source
+	// missing video metadata. A version pick (not a subtitle/audio pick)
+	// terminaling on it with a fully-characterized bound sibling falls back
+	// through the alternate hunt instead of stranding on terminal.
+	sourceMetadataIncompleteReasonV3 = "source_metadata_incomplete"
 )
 
 // terminalAllowsAlternateFileV3 reports whether a refusal is the kind another

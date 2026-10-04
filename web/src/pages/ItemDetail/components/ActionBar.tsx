@@ -20,6 +20,7 @@ import {
   Download,
   ExternalLink,
   FolderPlus,
+  GalleryHorizontal,
   Inbox,
   Info,
   Loader2,
@@ -61,6 +62,7 @@ import type {
 import RefreshMetadataDialog from "@/components/RefreshMetadataDialog";
 import { MarkerEditor } from "@/components/markers/MarkerEditor";
 import RedetectMarkersDialog from "@/components/markers/RedetectMarkersDialog";
+import { TrickplayStatusDialog } from "@/components/admin/trickplay/TrickplayStatusDialog";
 import StarRating from "@/components/StarRating";
 import { MediaActionIcon } from "@/components/mediaActionIcons";
 import { useWatchPlaybackController } from "@/playback/watchPlaybackContext";
@@ -223,6 +225,8 @@ export interface ActionBarProps {
   canCurateMetadata?: boolean;
   /** Enables the "Edit Markers" action (playable items only: movies/episodes). */
   canEditMarkers?: boolean;
+  /** Enables the admin "Seek Previews" action; the server must offer seek previews. */
+  canManageTrickplay?: boolean;
   versions?: FileVersion[];
   playbackVariants?: PlaybackVariant[];
   selectedVersion?: FileVersion | null;
@@ -288,6 +292,7 @@ export default function ActionBar({
   isAdmin = false,
   canCurateMetadata = false,
   canEditMarkers = false,
+  canManageTrickplay = false,
   versions,
   playbackVariants,
   selectedVersion,
@@ -331,6 +336,8 @@ export default function ActionBar({
   const [redetectDialogOpen, setRedetectDialogOpen] = useState(false);
   const [addToCollectionOpen, setAddToCollectionOpen] = useState(false);
   const [markerEditorOpen, setMarkerEditorOpen] = useState(false);
+  const [trickplayOpen, setTrickplayOpen] = useState(false);
+  const showTrickplay = isAdmin && canManageTrickplay && !!contentId;
   const deleteMediaItem = useDeleteMediaItem();
   const queryClient = useQueryClient();
   const { awaitAdminJob } = useRealtimeEvents();
@@ -974,6 +981,15 @@ export default function ActionBar({
                           : "Re-detect Markers"}
                     </DetailOverflowMenuItem>
                   )}
+                  {showTrickplay && (
+                    <DetailOverflowMenuItem
+                      closeMenu={closeOverflowMenu}
+                      onAction={() => setTrickplayOpen(true)}
+                    >
+                      <GalleryHorizontal className="size-4" />
+                      Seek Previews
+                    </DetailOverflowMenuItem>
+                  )}
                   {canCurateMetadata && onEditMetadata && (
                     <DetailOverflowMenuItem closeMenu={closeOverflowMenu} onAction={onEditMetadata}>
                       <MediaActionIcon action="editMetadata" />
@@ -1069,6 +1085,14 @@ export default function ActionBar({
           onConfirm={handleRefreshConfirm}
           isPending={isRefreshing}
         />
+        {showTrickplay && contentId && (
+          <TrickplayStatusDialog
+            open={trickplayOpen}
+            onOpenChange={setTrickplayOpen}
+            itemId={contentId}
+            versions={versions}
+          />
+        )}
         {isAdmin && onRedetectMarkers && !redetectKind && (
           <RedetectMarkersDialog
             open={redetectDialogOpen}

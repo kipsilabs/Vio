@@ -28,7 +28,7 @@ const deviceIDHeader = "X-Vio-Device-Id"
 
 // legacyDeviceIDHeader is the pre-rebrand device header spelling, accepted on
 // ingest only and never emitted.
-const legacyDeviceIDHeader = "X-Vio-Device-Id"
+const legacyDeviceIDHeader = "X-Silo-Device-Id"
 
 // fieldDeviceID is the seam's name for a rejected device id; it is rendered
 // at the header the framework declared, not as a body member.
@@ -652,7 +652,7 @@ func pluginSettingsInstallationFromView(v handlers.PluginUserSettingsView) Plugi
 const clientFamilyHeader = "X-Vio-Client-Family"
 
 // legacyClientFamilyHeader is the pre-rebrand spelling, ingest only.
-const legacyClientFamilyHeader = "X-Vio-Client-Family"
+const legacyClientFamilyHeader = "X-Silo-Client-Family"
 
 // JSONValue is a setting value on the wire: any JSON document. The settings
 // contract's value_schema for the key fixes its shape, so this document does

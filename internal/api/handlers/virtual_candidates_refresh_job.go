@@ -238,6 +238,10 @@ type VirtualCandidatesRefreshExecutor struct {
 	// fresh listing and dead, while honoring the same retention keep-list the
 	// re-list sweep uses. Nil skips it.
 	Pruner VirtualCandidatePruner
+	// ReleaseDownloading reports whether AltMount is actively fetching a
+	// release, for the pending-candidate count. Nil skips the count. An
+	// unconfigured provider (known=false) never marks a release pending.
+	ReleaseDownloading func(releaseName string) (downloading bool, known bool)
 	// Store persists the indexer-only releases (step c).
 	Store *virtuallibrary.IndexerReleaseStore
 	// Searcher is the on-demand Prowlarr lookup (step b). Nil skips the search.
@@ -315,6 +319,28 @@ func (e *VirtualCandidatesRefreshExecutor) Execute(ctx context.Context, req admi
 	}
 	result.IndexerReleases = len(persisted)
 	result.Releases = persisted
+
+	// Count freshly listed candidates AltMount is still fetching: these are
+	// the releases playback will wait for rather than skip. Best-effort and
+	// informational only. Counted per release, not per variant: one release
+	// with several result= variants is one pending release.
+	if e.ReleaseDownloading != nil {
+		seen := make(map[string]struct{})
+		for _, stream := range streams {
+			name := strings.TrimSpace(stream.ProviderReleaseName)
+			if name == "" {
+				continue
+			}
+			key := strings.ToLower(name)
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			if downloading, known := e.ReleaseDownloading(name); known && downloading {
+				result.PendingCandidates++
+			}
+		}
+	}
 
 	report(4, totalSteps, "Enriching provider candidates")
 	if e.Enricher != nil && len(streams) > 0 {

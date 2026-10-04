@@ -53,9 +53,13 @@ type VirtualCandidatesRefreshResult struct {
 	Enriched           int    `json:"enriched"`
 	// PrunedCandidates is how many dead, absent, unprotected candidate rows the
 	// cleanup pass deleted. Purely informational.
-	PrunedCandidates int                    `json:"pruned_candidates"`
-	IndexerSearchOK  bool                   `json:"indexer_search_ok"`
-	Releases         []IndexerReleaseResult `json:"releases,omitempty"`
+	PrunedCandidates int `json:"pruned_candidates"`
+	// PendingCandidates is how many freshly listed candidates AltMount
+	// reports as actively fetching. Purely informational: these are the
+	// releases playback will wait for rather than skip.
+	PendingCandidates int                    `json:"pending_candidates"`
+	IndexerSearchOK   bool                   `json:"indexer_search_ok"`
+	Releases          []IndexerReleaseResult `json:"releases,omitempty"`
 }
 
 // IndexerReleaseResult is the safe, URL-free projection of one persisted

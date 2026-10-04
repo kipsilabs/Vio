@@ -78,6 +78,8 @@ export interface PlayerFileVersion {
   recap?: PlayerTimeRange | null;
   preview?: PlayerTimeRange | null;
   marker_segments?: PlayerMarkerSegment[];
+  /** Seek-bar previews are published for this file. */
+  trickplay_available?: boolean;
 }
 
 /**

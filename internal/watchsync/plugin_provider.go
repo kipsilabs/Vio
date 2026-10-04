@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/url"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -35,6 +36,10 @@ type WatchSyncPluginClient interface {
 type WatchSyncPluginClientResolver func(context.Context, int, string) (WatchSyncPluginClient, error)
 type WatchSyncPluginConfigResolver func(context.Context, int) (*pluginv1.WatchSyncProviderConfig, error)
 
+// WatchSyncPluginConfigReady reports whether an installation has the global
+// config its manifest requires.
+type WatchSyncPluginConfigReady func(context.Context, int) (bool, error)
+
 type PluginCredentialRepository interface {
 	UpsertConnection(context.Context, Connection) (Connection, error)
 }
@@ -48,7 +53,9 @@ type PluginProviderOptions struct {
 	ConnectionConfigSchema []*pluginv1.ConfigSchema
 	ResolveClient          WatchSyncPluginClientResolver
 	ResolveConfig          WatchSyncPluginConfigResolver
-	Repository             PluginCredentialRepository
+	// ConfigReady is optional; without it the plugin counts as configured.
+	ConfigReady WatchSyncPluginConfigReady
+	Repository  PluginCredentialRepository
 }
 
 type PluginProvider struct {
@@ -62,12 +69,15 @@ type PluginProvider struct {
 	supportedMedia         map[pluginv1.WatchSyncMediaType]struct{}
 	resolveClient          WatchSyncPluginClientResolver
 	resolveConfig          WatchSyncPluginConfigResolver
+	configReady            WatchSyncPluginConfigReady
 	repository             PluginCredentialRepository
+	now                    func() time.Time
 }
 
 const (
 	watchSyncUnsupportedMovieMediaMessage   = "watch sync plugin does not support movie media"
 	watchSyncUnsupportedEpisodeMediaMessage = "watch sync plugin does not support episode media"
+	watchSyncUnsupportedSeriesMediaMessage  = "watch sync plugin does not support series media"
 	watchSyncUnsupportedMediaMessage        = "watch sync plugin does not support this media type"
 	watchSyncJSONSchemaNumberType           = "number"
 	watchSyncJSONSchemaBooleanType          = "boolean"
@@ -111,7 +121,9 @@ func NewPluginProvider(options PluginProviderOptions) (*PluginProvider, error) {
 		supportedMedia:         supportedMedia,
 		resolveClient:          options.ResolveClient,
 		resolveConfig:          options.ResolveConfig,
+		configReady:            options.ConfigReady,
 		repository:             options.Repository,
+		now:                    time.Now,
 	}, nil
 }
 
@@ -150,6 +162,16 @@ func (p *PluginProvider) ConnectionConfigSchema() []hostplugins.ConfigSchemaView
 
 func (p *PluginProvider) usesHostPluginConfig() {}
 
+// CredentialsConfigured reports whether the plugin has the global config its
+// manifest requires, such as a provider app's client ID, so a profile can
+// connect.
+func (p *PluginProvider) CredentialsConfigured(ctx context.Context) (bool, error) {
+	if p.configReady == nil {
+		return true, nil
+	}
+	return p.configReady(ctx, p.installationID)
+}
+
 func (p *PluginProvider) authoritativeRefreshProvider() {}
 
 func (p *PluginProvider) ExportBatchSize() int {
@@ -173,6 +195,9 @@ func (p *PluginProvider) Capabilities() Capabilities {
 		RemoveWatchlist:        p.descriptor.GetRemoveWatchlist(),
 		ProvidesWatchlistOrder: p.descriptor.GetProvidesWatchlistOrder(),
 		ScrobblePlayback:       p.descriptor.GetScrobblePlayback(),
+		ImportRatings:          p.descriptor.GetImportRatings(),
+		ExportRatings:          p.descriptor.GetExportRatings(),
+		SyncDropped:            p.descriptor.GetSyncDropped(),
 	}
 }
 
@@ -561,6 +586,22 @@ func (p *PluginProvider) authenticatedContext(ctx context.Context, conn Connecti
 		ProviderConfig: config,
 		Credentials:    credentialsFromConnection(conn),
 	}, nil
+}
+
+// authenticatedContextSecrets lists every secret an RPC carried to the
+// plugin: its tokens, secret credential attributes, and secret config values,
+// such as a provider app's client secret. Text the plugin returns is scrubbed
+// of all of them.
+func authenticatedContextSecrets(authContext *pluginv1.WatchSyncAuthenticatedContext) []string {
+	credentials := authContext.GetCredentials()
+	secrets := []string{credentials.GetAccessToken(), credentials.GetRefreshToken()}
+	for _, value := range credentials.GetSecretAttributes() {
+		secrets = append(secrets, value)
+	}
+	for _, value := range authContext.GetProviderConfig().GetSecretValues() {
+		secrets = append(secrets, value)
+	}
+	return secrets
 }
 
 func (p *PluginProvider) providerConfig(ctx context.Context) (*pluginv1.WatchSyncProviderConfig, error) {
@@ -1152,12 +1193,41 @@ func mediaFromIdentity(mediaItemID, kind, title string, year int, imdbID, tmdbID
 	}
 }
 
+// SyncsRatingKind reports whether the plugin rates items of kind, from the
+// media types it supports. Without it, the host would send a movie-only plugin
+// every series rating on each sync and log the rejection.
+func (p *PluginProvider) SyncsRatingKind(kind string) bool {
+	return p.supportsMedia(watchSyncMediaType(kind))
+}
+
+// RatingExportRequiresWatched reports whether the plugin lists the media type
+// of kind in rating_export_requires_watched, meaning its SET_RATING also marks
+// the title watched upstream. Only movie and series ratings are synced.
+func (p *PluginProvider) RatingExportRequiresWatched(kind string) bool {
+	mediaType := watchSyncMediaType(kind)
+	if mediaType != pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_MOVIE &&
+		mediaType != pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_SERIES {
+		return false
+	}
+	return slices.Contains(p.descriptor.GetRatingExportRequiresWatched(), mediaType)
+}
+
+// mediaFromLocalFavorite builds list and rating media. A series item carries
+// its own ids, so its SERIES media has them in external_ids and no series_*.
+func mediaFromLocalFavorite(item LocalFavorite) *pluginv1.WatchSyncMedia {
+	return mediaFromIdentity(item.MediaItemID, item.Kind, item.Title, item.Year,
+		item.IMDbID, item.TMDBID, item.TVDBID, "", 0,
+		item.SeriesIMDbID, item.SeriesTMDBID, item.SeriesTVDBID, 0, 0)
+}
+
 func watchSyncMediaType(kind string) pluginv1.WatchSyncMediaType {
 	switch strings.ToLower(strings.TrimSpace(kind)) {
 	case historyimport.KindMovie:
 		return pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_MOVIE
 	case historyimport.KindEpisode:
 		return pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_EPISODE
+	case historyimport.KindSeries:
+		return pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_SERIES
 	default:
 		return pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_UNSPECIFIED
 	}
@@ -1263,11 +1333,19 @@ func supportedWatchSyncMediaTypes(descriptor *pluginv1.WatchSyncProviderDescript
 	for _, mediaType := range media {
 		switch mediaType {
 		case pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_MOVIE,
-			pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_EPISODE:
+			pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_EPISODE,
+			pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_SERIES:
 			supported[mediaType] = struct{}{}
-		default:
+		case pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_UNSPECIFIED:
 			return nil, fmt.Errorf("advertises unsupported media type %q", mediaType.String())
+		default:
+			// A media type added by a newer SDK is ignored rather than
+			// rejecting the plugin, so a plugin release that opts into a new
+			// type keeps its existing sync on servers that predate the type.
 		}
+	}
+	if len(supported) == 0 {
+		return nil, errors.New("advertises no media type this server supports")
 	}
 	return supported, nil
 }
@@ -1286,6 +1364,8 @@ func unsupportedWatchSyncMediaMessage(mediaType pluginv1.WatchSyncMediaType) str
 		return watchSyncUnsupportedMovieMediaMessage
 	case pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_EPISODE:
 		return watchSyncUnsupportedEpisodeMediaMessage
+	case pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_SERIES:
+		return watchSyncUnsupportedSeriesMediaMessage
 	default:
 		return watchSyncUnsupportedMediaMessage
 	}
@@ -1300,10 +1380,17 @@ func safeApplyMessage(result *pluginv1.WatchSyncApplyResult, secrets ...string) 
 
 func sanitizeWatchSyncMessage(message string, fallback string, secrets ...string) string {
 	message = normalizeWatchSyncText(message)
+	// Longest first, so a secret that contains a shorter one is still
+	// redacted whole.
+	ordered := make([]string, 0, len(secrets))
 	for _, secret := range secrets {
 		if secret = normalizeWatchSyncText(secret); secret != "" {
-			message = strings.ReplaceAll(message, secret, "[REDACTED]")
+			ordered = append(ordered, secret)
 		}
+	}
+	slices.SortFunc(ordered, func(a, b string) int { return len(b) - len(a) })
+	for _, secret := range ordered {
+		message = strings.ReplaceAll(message, secret, "[REDACTED]")
 	}
 	if message == "" {
 		return fallback

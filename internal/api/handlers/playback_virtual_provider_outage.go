@@ -122,6 +122,40 @@ func virtualCandidateTrustedForOutageRetry(row *models.MediaFile, window time.Du
 	return virtualCandidateWithinStoreWindow(row, time.Now(), window)
 }
 
+// virtualPendingHoldCap bounds one wait for an in-flight AltMount import
+// (SABnzbd queue, not history). It matches the observed 1–10s fetch window:
+// long enough for a progressing download to flip to completed, short enough
+// that a stuck slot cannot pin playback.
+const virtualPendingHoldCap = 10 * time.Second
+
+// virtualPendingHoldReserve is the room the hold leaves for the retry
+// resolve after the pause: one probe-class attempt plus scheduling margin.
+// A caller with less than reserve plus a minimal pause degrades immediately
+// instead of waiting away the retry budget.
+const virtualPendingHoldReserve = 15 * time.Second
+
+// virtualPendingLoopPause spaces startup-loop retries of a pending release
+// so a lapsed input hold (low remaining budget) cannot spin fresh provider
+// listings with no sleep.
+const virtualPendingLoopPause = 1 * time.Second
+
+// waitVirtualPendingHold pauses for an in-flight import, bounded by the hold
+// cap and the caller's remaining budget. It reports whether the caller should
+// re-list: false when the pause would consume the room for the retry resolve,
+// in which case the caller degrades to the pending error immediately.
+func waitVirtualPendingHold(ctx context.Context) bool {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return sleepWithContext(ctx, virtualPendingHoldCap)
+	}
+	remaining := time.Until(deadline)
+	wait := min(virtualPendingHoldCap, remaining-virtualPendingHoldReserve)
+	if wait <= 0 {
+		return false
+	}
+	return sleepWithContext(ctx, wait)
+}
+
 // retryVirtualProviderOutageResolve runs resolve, and while it fails with a
 // transient provider-listing outage for a trusted session-bound row, retries
 // with the bounded schedule. A canceled request stops immediately. Retry

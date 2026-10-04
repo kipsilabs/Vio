@@ -85,6 +85,7 @@ import type {
   SubtitleMode,
   VideoFitMode,
 } from "../types";
+import type { PlayerTrickplay } from "../trickplay";
 import type { FailureV3, PlanV3, SubtitleInventoryItemV3 } from "../protocol-v3";
 import { decodeFailure, isServerDecodeFailure } from "../decode-failure";
 import {
@@ -222,6 +223,11 @@ interface VideoPlayerProps {
    */
   activeVirtualUri?: string | null;
   chapters?: PlayerChapter[];
+  /** Seek-bar previews of the file being played. */
+  trickplay?: PlayerTrickplay | null;
+  trickplayUpdatedAt?: number;
+  /** A preview sheet failed to load; read the previews again. */
+  onTrickplayError?: () => void;
   onSwitchVersion?: (fileId: number, currentPosition: number) => void;
   /** Arms automatic version fallback from the version menu's Auto entry. */
   onSelectAutoVersion?: () => void;
@@ -439,6 +445,9 @@ export function VideoPlayer({
   activeFileId,
   activeVirtualUri,
   chapters = [],
+  trickplay = null,
+  trickplayUpdatedAt,
+  onTrickplayError,
   onSwitchVersion,
   onSelectAutoVersion,
   autoFallback,
@@ -4638,6 +4647,9 @@ export function VideoPlayer({
           duration={duration}
           buffered={buffered}
           chapters={chapters}
+          trickplay={trickplay}
+          trickplayUpdatedAt={trickplayUpdatedAt}
+          onTrickplayError={onTrickplayError}
           regions={markerRegions}
           editing={markerEditor.editing}
           activeEditKind={markerEditor.activeKind}

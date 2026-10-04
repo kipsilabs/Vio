@@ -42,7 +42,11 @@ const mocks = vi.hoisted(() => {
     useToggleWatchlist: vi.fn(),
     useRefreshItemMetadata: vi.fn(),
     useRedetectItemMarkers: vi.fn(),
+    useItemFiles: vi.fn(),
+    useSearchItemMatchCandidates: vi.fn(),
+    useSplitItem: vi.fn(),
     useAdminMarkerCapabilities: vi.fn(),
+    useLibraryCapabilities: vi.fn(),
     useWatchedStateMutation: vi.fn(),
     useRating: vi.fn(),
     useSetRating: vi.fn(),
@@ -76,9 +80,16 @@ vi.mock("@/hooks/queries/admin/markers", () => ({
   useAdminMarkerCapabilities: mocks.useAdminMarkerCapabilities,
 }));
 
+vi.mock("@/hooks/queries/admin/libraries", () => ({
+  useLibraryCapabilities: mocks.useLibraryCapabilities,
+}));
+
 vi.mock("@/hooks/queries/items", () => ({
   useRefreshItemMetadata: mocks.useRefreshItemMetadata,
   useRedetectItemMarkers: mocks.useRedetectItemMarkers,
+  useItemFiles: mocks.useItemFiles,
+  useSearchItemMatchCandidates: mocks.useSearchItemMatchCandidates,
+  useSplitItem: mocks.useSplitItem,
   useWatchedStateMutation: mocks.useWatchedStateMutation,
 }));
 
@@ -266,7 +277,16 @@ describe("MovieContent", () => {
     mocks.useToggleWatchlist.mockReturnValue({ mutate: vi.fn() });
     mocks.useRefreshItemMetadata.mockReturnValue({ mutate: vi.fn(), isPending: false });
     mocks.useRedetectItemMarkers.mockReturnValue({ mutate: vi.fn(), isPending: false });
+    mocks.useItemFiles.mockReturnValue({ data: undefined, isLoading: false });
+    mocks.useSearchItemMatchCandidates.mockReturnValue({
+      mutate: vi.fn(),
+      isPending: false,
+      isSuccess: false,
+      data: undefined,
+    });
+    mocks.useSplitItem.mockReturnValue({ mutate: vi.fn(), isPending: false });
     mocks.useAdminMarkerCapabilities.mockReturnValue({ data: undefined });
+    mocks.useLibraryCapabilities.mockReturnValue({ data: undefined });
     mocks.useWatchedStateMutation.mockReturnValue({ mutate: vi.fn(), isPending: false });
     mocks.useRating.mockReturnValue({ data: { rating: 4, rated_at: "2026-03-22T00:00:00Z" } });
     mocks.useSetRating.mockReturnValue({ mutate: vi.fn() });
@@ -413,6 +433,93 @@ describe("MovieContent", () => {
       canCurateMetadata: false,
       canEditMarkers: true,
     });
+  });
+
+  it.each([
+    [{ role: "admin" }, { data: { trickplay: true, trickplay_supported: true } }, true],
+    [{ role: "admin" }, { data: { trickplay: true, trickplay_supported: false } }, false],
+    [{ role: "admin" }, { data: { trickplay: true } }, false],
+    [{ role: "admin" }, { data: { trickplay: false } }, false],
+    [{ role: "admin" }, { data: undefined }, false],
+  ])("offers seek-preview status to %o with capability %o: %s", (user, capability, offered) => {
+    mocks.useAuth.mockReturnValue({ user });
+    mocks.useLibraryCapabilities.mockReturnValue(capability);
+
+    renderToStaticMarkup(
+      <MemoryRouter initialEntries={["/item/movie-1"]}>
+        <MovieContent item={makeMovieItem()} />
+      </MemoryRouter>,
+    );
+
+    expect(mocks.capturedActionBarProps.value?.canManageTrickplay).toBe(offered);
+    expect(mocks.useLibraryCapabilities).toHaveBeenLastCalledWith(true);
+  });
+
+  it("does not read library capabilities for viewers", () => {
+    mocks.useAuth.mockReturnValue({ user: null });
+    renderToStaticMarkup(
+      <MemoryRouter initialEntries={["/item/movie-1"]}>
+        <MovieContent item={makeMovieItem()} />
+      </MemoryRouter>,
+    );
+    expect(mocks.useLibraryCapabilities).toHaveBeenLastCalledWith(false);
+  });
+
+  it("passes credits re-detection only for admins", () => {
+    const redetect = vi.fn();
+    mocks.useAuth.mockReturnValue({ user: { role: "admin" } });
+    mocks.useRedetectItemMarkers.mockReturnValue({ mutate: redetect, isPending: false });
+    mocks.useAdminMarkerCapabilities.mockReturnValue({
+      data: { redetect_markers: true, movie_credits: true },
+    });
+
+    renderToStaticMarkup(
+      <MemoryRouter initialEntries={["/item/movie-1"]}>
+        <MovieContent item={makeMovieItem()} />
+      </MemoryRouter>,
+    );
+
+    expect(mocks.capturedActionBarProps.value).toMatchObject({
+      isAdmin: true,
+      redetectKind: "credits",
+      isRedetectingMarkers: false,
+    });
+    const onRedetectMarkers = mocks.capturedActionBarProps.value?.onRedetectMarkers;
+    expect(typeof onRedetectMarkers).toBe("function");
+    (onRedetectMarkers as (kind: string) => void)("credits");
+    expect(redetect).toHaveBeenCalledWith({ itemId: "movie-1", kind: "credits" });
+
+    mocks.useAuth.mockReturnValue({ user: null });
+    renderToStaticMarkup(
+      <MemoryRouter initialEntries={["/item/movie-1"]}>
+        <MovieContent item={makeMovieItem()} />
+      </MemoryRouter>,
+    );
+    expect(mocks.capturedActionBarProps.value?.onRedetectMarkers).toBeUndefined();
+  });
+
+  it.each([
+    ["a pending capability read", { data: undefined }],
+    ["a failed capability read", { data: undefined, isError: true }],
+    ["a node without redetect_markers", { data: { movie_credits: true } }],
+    [
+      "a node with redetect_markers off",
+      { data: { redetect_markers: false, movie_credits: true } },
+    ],
+    ["a node without movie_credits", { data: { redetect_markers: true } }],
+    ["a node with movie_credits off", { data: { redetect_markers: true, movie_credits: false } }],
+  ])("offers no credits re-detection for %s", (_label, capability) => {
+    mocks.useAuth.mockReturnValue({ user: { role: "admin" } });
+    mocks.useAdminMarkerCapabilities.mockReturnValue(capability);
+
+    renderToStaticMarkup(
+      <MemoryRouter initialEntries={["/item/movie-1"]}>
+        <MovieContent item={makeMovieItem()} />
+      </MemoryRouter>,
+    );
+
+    expect(mocks.capturedActionBarProps.value?.isAdmin).toBe(true);
+    expect(mocks.capturedActionBarProps.value?.onRedetectMarkers).toBeUndefined();
   });
 
   it("does not pass playHref or restartHref when the movie has no versions or play targets", () => {

@@ -383,10 +383,25 @@ func (h *PlaybackHandler) clearVirtualCandidateVerdict(ctx context.Context, file
 // plus an absent pin that carries durable identity; an empty provider listing
 // is a transient hiccup and is deliberately never stamped (the versions check
 // documents why: a 2.6s empty-listing burst once marked 50 of 57 rows dead).
+// Any transport-temporary cause in the chain short-circuits the whole verdict
+// before the absent-pin branch is consulted, so a joined outage+absent shape
+// cannot smuggle a durable indictment past the transient guard.
 // Best-effort: a stamp failure does not change the resolve outcome the caller
 // already has. file is the catalog row the request pinned.
 func (h *PlaybackHandler) stampStartVirtualCandidateFailed(ctx context.Context, file *models.MediaFile, resolveErr error) {
 	if h == nil || h.VirtualCandidateFailMarker == nil || file == nil || file.FailedAt != nil || resolveErr == nil {
+		return
+	}
+	// Transport-temporary shapes (provider outage, deadline, pending release,
+	// empty listing) are availability-shaped and say nothing about the pinned
+	// release, so they must be classified BEFORE either dead-verdict branch. A
+	// joined error can carry both a transient listing cause and an absent-pin
+	// sentinel (for example errors.Join(resolver.ErrProviderUnavailable,
+	// virtuallibrary.ErrSessionBoundCandidateAbsent)); letting the identity
+	// branch read the absent sentinel as a verdict is what let a provider flap
+	// durably indict a pin. This mirrors the pre-verdict guard in
+	// checkVersion (catalog_versions_check.go).
+	if isVirtualProviderListingTemporaryError(resolveErr) {
 		return
 	}
 	dead := isVirtualCandidateDeadError(resolveErr)
@@ -2479,7 +2494,12 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			// source, on a prior attempt). An explicit selection and a forced
 			// relink allow a manual retry; a decode-driven rotation carries its
 			// exclusion explicitly so it never depends on the async stamp.
-			if !allowFailed && virtualCandidateVerdictActive(dbFile.FailedAt, time.Now()) {
+			// The verdict binds only the row's own release identity: a
+			// failed sibling under the same neutral key must not veto this
+			// pick (it is tried once and re-indicted under its own id if
+			// still dead). Metadata adoption below is unaffected.
+			if !allowFailed && virtualCandidateVerdictBindsRow(dbFile, cand.URI) &&
+				virtualCandidateVerdictActive(dbFile.FailedAt, time.Now()) {
 				// Name the candidate this attempt is about first. On a
 				// substitution, cand.URI is the sibling the resolver selected,
 				// so reporting only it made the log's candidate_uri and error
@@ -4154,10 +4174,35 @@ func (h *PlaybackHandler) virtualCandidateVerdictError(ctx context.Context, cand
 		// No catalog row owns the candidate: there is no verdict to enforce.
 		return nil
 	}
-	if virtualCandidateVerdictActive(row.FailedAt, now) {
+	// The row's verdict binds only its own release identity: a failed sibling
+	// row under the same neutral key (same episode/profile, different
+	// ?result= pick) must never veto a different pick. A renumbered dead
+	// release is tried once and re-indicted under its new id instead.
+	if virtualCandidateVerdictBindsRow(row, candidateURI) &&
+		virtualCandidateVerdictActive(row.FailedAt, now) {
 		return fmt.Errorf("%w: candidate %s is marked failed", ErrVirtualCandidateMarkedFailed, candidateURI)
 	}
 	return nil
+}
+
+// virtualCandidateVerdictBindsRow reports whether a failed catalog row's
+// verdict binds a candidate URI. Same-identity rows always bind. A row
+// carrying durable identity (hash, GUID, or release name) binds only its own
+// release: a failed sibling must never veto a different pick. A row without
+// identity binds neutral matches, preserving the legacy conservative behavior
+// for rows that predate identity persistence (and for renumbered releases
+// neither side can re-identify: the candidate is tried once and re-indicted
+// under its own id if still dead).
+func virtualCandidateVerdictBindsRow(row *models.MediaFile, candidateURI string) bool {
+	if row == nil || candidateURI == "" {
+		return false
+	}
+	if sameVirtualReleaseIdentity(row.FilePath, candidateURI) {
+		return true
+	}
+	return strings.TrimSpace(row.ProviderVideoHash) == "" &&
+		strings.TrimSpace(row.ProviderGUID) == "" &&
+		strings.TrimSpace(row.ProviderReleaseName) == ""
 }
 
 // virtualCandidateRowVerified reports whether a catalog lookup result actually

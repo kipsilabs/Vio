@@ -33,6 +33,7 @@ import type {
   QualityOption,
   VideoFitMode,
 } from "../types";
+import type { PlayerTrickplay } from "../trickplay";
 import type { VersionInfo } from "./QualityMenu";
 import type { EffectiveRecipeV3 } from "../protocol-v3";
 import type { PlayerConfig } from "../context/PlayerConfigContext";
@@ -55,6 +56,10 @@ interface PlayerControlsProps {
   // Seek bar markers
   chapters?: PlayerChapter[];
   regions?: MarkerRegionView[];
+  // Seek bar previews
+  trickplay?: PlayerTrickplay | null;
+  trickplayUpdatedAt?: number;
+  onTrickplayError?: () => void;
   // Marker editing
   editing?: boolean;
   activeEditKind?: MarkerKind | null;
@@ -149,6 +154,9 @@ export function PlayerControls({
   buffered,
   chapters,
   regions,
+  trickplay,
+  trickplayUpdatedAt,
+  onTrickplayError,
   editing,
   activeEditKind,
   onRegionEdgeChange,
@@ -335,6 +343,9 @@ export function PlayerControls({
           buffered={buffered}
           chapters={chapters}
           regions={regions}
+          trickplay={trickplay}
+          trickplayUpdatedAt={trickplayUpdatedAt}
+          onTrickplayError={onTrickplayError}
           editing={editing}
           activeEditKind={activeEditKind}
           onRegionEdgeChange={onRegionEdgeChange}

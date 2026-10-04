@@ -763,8 +763,8 @@ func TestRelayStalledErrorBodyReturnsBoundedError(t *testing.T) {
 	defer func() { _ = resp.Body.Close() }()
 
 	elapsed := time.Since(start)
-	if resp.StatusCode != http.StatusBadGateway {
-		t.Fatalf("status = %d, want 502", resp.StatusCode)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want upstream 503 forwarded", resp.StatusCode)
 	}
 	if elapsed >= 2500*time.Millisecond {
 		t.Fatalf("elapsed = %v, want < 2.5s", elapsed)
@@ -2134,5 +2134,26 @@ func TestRelayRegistrationStatusReportsUpstreamAuthRejection(t *testing.T) {
 				t.Fatalf("status after upstream %d = %v, want RegistrationAuthRejected", status, got)
 			}
 		})
+	}
+}
+
+func TestRelayRetriesTransientUpstream5xxOnce(t *testing.T) {
+	var calls int
+	relay := NewRelay()
+	relay.client = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		calls++
+		if calls == 1 {
+			return relayResponse(request, http.StatusServiceUnavailable, "text/plain", "flap"), nil
+		}
+		return relayResponse(request, http.StatusOK, "video/mp4", "0123456789abcdef"), nil
+	})}
+	relayURL, cleanup := registerRelayForTest(t, relay, "flap", "https://1.1.1.1/video.mp4")
+	defer cleanup()
+	got := fetchRelay(t, relay, relayURL, http.MethodGet, "")
+	if got.status != http.StatusOK {
+		t.Fatalf("flapping upstream status = %d, want 200 after one retry", got.status)
+	}
+	if calls != 2 {
+		t.Fatalf("upstream calls = %d, want exactly 2 (one retry, no more)", calls)
 	}
 }

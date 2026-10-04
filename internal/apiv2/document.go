@@ -545,6 +545,7 @@ func registerAll(reg *Registry) {
 	registerAdminUsers(reg)
 	registerAdminPlaybackHistory(reg)
 	registerAdminAccounts(reg)
+	registerExternalSignIn(reg)
 	registerNotificationInbox(reg)
 	registerAdminNotificationPush(reg)
 	registerAdminNotificationDiscord(reg)
@@ -725,6 +726,8 @@ func registerAll(reg *Registry) {
 	registerWatch(reg)
 	registerMediaCandidates(reg)
 	registerVirtualLibraryCapabilities(reg)
+	registerWatchTrickplay(reg)
+	registerAdminTrickplay(reg)
 	registerOpenAPIDocument(reg)
 	registerAPIDocs(reg)
 }

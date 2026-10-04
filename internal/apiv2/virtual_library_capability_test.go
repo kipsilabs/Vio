@@ -11,10 +11,12 @@ type fakeVirtualLibraryStatus struct {
 	search  bool
 	request bool
 	prune   bool
+	waits   bool
 }
 
 func (f fakeVirtualLibraryStatus) IndexerCapabilities() (bool, bool) { return f.search, f.request }
 func (f fakeVirtualLibraryStatus) RefreshPrunesDeadCandidates() bool { return f.prune }
+func (f fakeVirtualLibraryStatus) WaitForImports() bool              { return f.waits }
 
 func TestVirtualLibraryCapabilities(t *testing.T) {
 	type wantCase = struct {
@@ -24,6 +26,7 @@ func TestVirtualLibraryCapabilities(t *testing.T) {
 		search  bool
 		request bool
 		prune   bool
+		waits   bool
 	}
 	cases := []wantCase{
 		{
@@ -44,10 +47,10 @@ func TestVirtualLibraryCapabilities(t *testing.T) {
 			name: "both wired",
 			deps: func() Dependencies {
 				deps := pilotDeps(nil, nil)
-				deps.VirtualLibraryStatus = fakeVirtualLibraryStatus{search: true, request: true, prune: true}
+				deps.VirtualLibraryStatus = fakeVirtualLibraryStatus{search: true, request: true, prune: true, waits: true}
 				return deps
 			},
-			want: StateAvailable, search: true, request: true, prune: true,
+			want: StateAvailable, search: true, request: true, prune: true, waits: true,
 		},
 	}
 	for _, tc := range cases {
@@ -62,6 +65,7 @@ func TestVirtualLibraryCapabilities(t *testing.T) {
 				IndexerSearch               bool   `json:"indexer_search"`
 				IndexerRequest              bool   `json:"indexer_request"`
 				RefreshPrunesDeadCandidates bool   `json:"refresh_prunes_dead_candidates"`
+				WaitForImports              bool   `json:"wait_for_imports"`
 				Revision                    string `json:"revision"`
 			}
 			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
@@ -75,6 +79,9 @@ func TestVirtualLibraryCapabilities(t *testing.T) {
 			}
 			if body.RefreshPrunesDeadCandidates != tc.prune {
 				t.Fatalf("refresh_prunes_dead_candidates = %v want %v", body.RefreshPrunesDeadCandidates, tc.prune)
+			}
+			if body.WaitForImports != tc.waits {
+				t.Fatalf("wait_for_imports = %v want %v", body.WaitForImports, tc.waits)
 			}
 			if body.Revision == "" {
 				t.Fatal("capability document has no revision")

@@ -30,6 +30,7 @@ const queryClientOverride = vi.hoisted(() => ({ current: null as unknown }));
 const roomConnectionMock = vi.hoisted(() => vi.fn());
 const playbackCapabilitiesMock = vi.hoisted(() => vi.fn());
 const startPlaybackMock = vi.hoisted(() => vi.fn());
+const trickplayRefetchMock = vi.hoisted(() => vi.fn());
 vi.mock("../start-v2", () => ({ playbackCapabilitiesV2: playbackCapabilitiesMock }));
 
 vi.mock("../hooks/usePlaybackSession", () => ({
@@ -64,6 +65,7 @@ vi.mock("@tanstack/react-query", async (importOriginal) => {
   return {
     ...actual,
     useQueryClient: () => queryClientOverride.current ?? { fetchQuery: fetchQueryMock },
+    useQuery: () => ({ data: undefined, refetch: trickplayRefetchMock }),
   };
 });
 vi.mock("@/playback/watchPlaybackContext", () => ({
@@ -167,6 +169,7 @@ beforeEach(() => {
   startPlaybackMock.mockReset();
   playbackSessionMock.mockReset();
   videoPlayerMock.mockReset();
+  trickplayRefetchMock.mockReset();
   toastErrorMock.mockReset();
   fetchWatchDetailMock.mockReset();
   awaitVirtualCandidatesRefreshMock.mockReset();
@@ -1467,8 +1470,95 @@ describe("WatchPage live inventory refresh", () => {
       await vi.advanceTimersByTimeAsync(2_000);
     });
 
-    expect(applyAudioInventory).toHaveBeenCalledWith(richerAudioTracks, 8);
+    // The candidate's probed inventory is adopted, and its path re-keys the
+    // live identity so the version menu follows the same source.
+    expect(applyAudioInventory).toHaveBeenCalledWith(
+      richerAudioTracks,
+      8,
+      "/media/Movies/Example (2024)/Example.1080p.mkv",
+    );
     expect(refreshSubtitles).toHaveBeenCalledTimes(1);
+  });
+
+  it("re-keys a same-file candidate whose URI moved even when the list is unchanged", async () => {
+    const applyAudioInventory = vi.fn();
+    const refreshSubtitles = vi.fn();
+    // The session already plays candidate A of virtual row 7 and carries a
+    // verified single-track list. The catalog read now resolves candidate B of
+    // the same row with the same list length; only the path moved. A single
+    // track keeps the poll's virtual-file completeness gate open.
+    const singleTrack = [
+      { codec: "eac3", channels: 6, layout: "5.1", language: "eng", default: true },
+    ];
+    const versionA: PlayerFileVersion = {
+      ...virtualVersion,
+      file_id: 7,
+      file_path: "virtual://movie/x?result=A",
+      audio_tracks: singleTrack,
+    };
+    const versionB: PlayerFileVersion = {
+      ...virtualVersion,
+      file_id: 7,
+      file_path: "virtual://movie/x?result=B",
+      audio_tracks: singleTrack,
+    };
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        mediaFileId: 7,
+        effectiveVirtualUri: versionA.file_path ?? null,
+        planAudioTracks: singleTrack,
+        subtitleUrls: [planSubtitle],
+        applyAudioInventory,
+        refreshSubtitles,
+      }),
+    );
+    fetchWatchDetailMock.mockResolvedValue({ versions: [versionB] });
+
+    render(createElement(WatchPage, { ...watchPageProps, versions: [versionA, versionB] }));
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+
+    // The verified list is the same length, but the candidate moved, so the
+    // poll must still re-key the identity to the row that is now playing.
+    expect(applyAudioInventory).toHaveBeenCalledWith(singleTrack, 7, versionB.file_path);
+  });
+
+  it("re-keys a moved same-file candidate even when its probed list is empty", async () => {
+    const applyAudioInventory = vi.fn();
+    const versionA: PlayerFileVersion = {
+      ...virtualVersion,
+      file_id: 7,
+      file_path: "virtual://movie/x?result=A",
+    };
+    const versionB: PlayerFileVersion = {
+      ...virtualVersion,
+      file_id: 7,
+      file_path: "virtual://movie/x?result=B",
+      audio_tracks: [],
+    };
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        mediaFileId: 7,
+        effectiveVirtualUri: versionA.file_path ?? null,
+        planAudioTracks: richerAudioTracks,
+        subtitleUrls: [planSubtitle],
+        audioInventoryProvisional: true,
+        applyAudioInventory,
+      }),
+    );
+    fetchWatchDetailMock.mockResolvedValue({ versions: [versionB] });
+
+    render(createElement(WatchPage, { ...watchPageProps, versions: [versionA, versionB] }));
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+
+    // An empty probed list is not evidence, but the identity still moves so the
+    // version menu follows the source actually playing.
+    expect(applyAudioInventory).toHaveBeenCalledWith([], 7, versionB.file_path);
   });
 
   it("falls back to the collapsed id when the plan publishes no effective virtual URI", async () => {
@@ -2473,4 +2563,21 @@ describe("Watch Party source fallback", () => {
     view.rerender(createElement(WatchPage, props));
     expect(fallbackSource).toHaveBeenCalledTimes(1);
   });
+});
+
+it("bounds sheet error refreshes and lets a changed file refresh independently", () => {
+  playbackSessionMock.mockReturnValue(playbackSession());
+  const view = render(createElement(WatchPage, watchPageProps));
+  const refresh = () => videoPlayerMock.mock.calls.at(-1)?.[0].onTrickplayError();
+  refresh();
+  for (let attempt = 0; attempt < 20; attempt++) refresh();
+  expect(trickplayRefetchMock).toHaveBeenCalledTimes(1);
+  playbackSessionMock.mockReturnValue(playbackSession({ mediaFileId: 8 }));
+  view.rerender(createElement(WatchPage, watchPageProps));
+  refresh();
+  expect(trickplayRefetchMock).toHaveBeenCalledTimes(2);
+  const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 60_001);
+  refresh();
+  expect(trickplayRefetchMock).toHaveBeenCalledTimes(3);
+  clock.mockRestore();
 });

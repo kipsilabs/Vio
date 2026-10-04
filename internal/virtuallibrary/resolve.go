@@ -445,6 +445,16 @@ var ErrSessionBoundCandidateAbsent = fmt.Errorf("session-bound candidate absent 
 // window.
 var ErrPersistedCandidateTrusted = fmt.Errorf("persisted virtual candidate is inside the trust window")
 
+// ErrProviderPending reports that the only viable candidate is a release
+// AltMount is actively fetching (SABnzbd queue, not history). It is neither
+// dead (so callers must not rotate, indict, or prune on it) nor ready (so
+// callers must hold briefly rather than serve). Callers that can wait (the
+// serve layer startup loop) pause and re-list; callers that cannot treat it
+// as an ordinary unresolvable release. It is distinct from
+// ErrProviderUnavailable precisely so a flap backoff is never recorded for a
+// release that is progressing.
+var ErrProviderPending = fmt.Errorf("virtual playback provider release is still fetching")
+
 // ResolveDetailed resolves a virtual path to a concrete stream URL through
 // the core resolver, preserving full candidate identity and selection semantics:
 //
@@ -798,9 +808,14 @@ func (s *Service) ResolveDetailed(
 	ordered := orderCandidates(candidates, effectivePreferredID)
 
 	var lastErr error
+	// pendingSkipped records that a pending (actively fetching) candidate was
+	// passed over. A pending candidate is never failed through URL validation:
+	// its URL names bytes that do not exist yet. When nothing else resolves,
+	// the caller learns the release is worth waiting for rather than dead.
+	var pendingSkipped bool
 	// tryCandidate returns the resolved stream for one candidate, or false when
 	// the candidate is excluded, is the blocked pin, does not satisfy
-	// requirePin, or fails URL validation.
+	// requirePin, is pending, or fails URL validation.
 	tryCandidate := func(c stream.StreamCandidate, requirePin bool) (ResolvedVirtualStream, bool) {
 		id := stream.CandidateVariantID(c)
 		if _, skip := excluded[id]; skip {
@@ -810,6 +825,10 @@ func (s *Service) ResolveDetailed(
 			return ResolvedVirtualStream{}, false
 		}
 		if requirePin && id != effectiveResultID {
+			return ResolvedVirtualStream{}, false
+		}
+		if c.SourcePending {
+			pendingSkipped = true
 			return ResolvedVirtualStream{}, false
 		}
 		validated, validateErr := s.validateStreamURL(ctx, c.URL)
@@ -882,6 +901,9 @@ func (s *Service) ResolveDetailed(
 
 	if lastErr != nil {
 		return ResolvedVirtualStream{}, fmt.Errorf("virtual playback provider returned an unsafe stream URL: %w", lastErr)
+	}
+	if pendingSkipped {
+		return ResolvedVirtualStream{}, ErrProviderPending
 	}
 	return ResolvedVirtualStream{}, fmt.Errorf("no streams available from provider")
 }

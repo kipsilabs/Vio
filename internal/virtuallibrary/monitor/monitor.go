@@ -290,6 +290,27 @@ func (s *Monitor) ReleaseFailed(releaseName string) (failed bool, known bool) {
 	return client.ReleaseFailed(key)
 }
 
+// ReleaseDownloading reports whether AltMount has reported the named release
+// as actively fetching (SABnzbd queue, not history). known is false when no
+// AltMount client is configured. A downloading release is pending: neither
+// dead (so failed-drops and the pruner must ignore it) nor ready (so the
+// resolver may hold for it). It answers from the cached snapshot, so it is
+// cheap and side-effect free.
+func (s *Monitor) ReleaseDownloading(releaseName string) (downloading bool, known bool) {
+	if s == nil || s.monitor == nil {
+		return false, false
+	}
+	client := s.monitor.configuredAltmount()
+	if client == nil || client.URL() == "" {
+		return false, false
+	}
+	key := altmount.ReleaseKey(releaseName)
+	if key == "" {
+		return false, false
+	}
+	return client.ReleaseDownloading(key)
+}
+
 // ProviderStale reports whether any configured virtual provider's cached state
 // has aged past its refresh interval. It is the read half of the stale-provider
 // seam the playback layer probes before a resolve, so a long-lived process does

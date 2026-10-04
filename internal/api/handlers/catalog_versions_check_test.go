@@ -966,3 +966,125 @@ func TestCatalogVersionsCheckIdentityVerdicts(t *testing.T) {
 		}
 	})
 }
+
+// TestGateVersionCheckStampsSkipsMassDisagreement proves one volatile
+// listing disagreeing with everything stamps nothing: past the quorum and
+// the disagreement rate the round reports durable state instead of
+// mass-tagging versions as dead.
+func TestGateVersionCheckStampsSkipsMassDisagreement(t *testing.T) {
+	outcomes := make([]versionCheckOutcome, 0, 8)
+	for i := 1; i <= 8; i++ {
+		outcomes = append(outcomes, versionCheckOutcome{
+			fileID: i, available: false, stamp: true, durableAlive: true, checked: true,
+		})
+	}
+	final, toStamp := gateVersionCheckStamps(outcomes)
+	if len(toStamp) != 0 {
+		t.Fatalf("stamped %v on a unanimous-disagreement round, want none", toStamp)
+	}
+	for _, outcome := range final {
+		if !outcome.available {
+			t.Fatalf("file %d reported unavailable on a gated round, want durable state", outcome.fileID)
+		}
+		if outcome.stamp {
+			t.Fatalf("file %d still marked for stamping on a gated round", outcome.fileID)
+		}
+	}
+}
+
+// TestGateVersionCheckStampsAppliesLoneVerdicts proves small numbers of
+// disagreements still stamp: a lone genuinely-dead pin (the common
+// single-file check) records its verdict, and a below-quorum batch is
+// unaffected by the gate.
+func TestGateVersionCheckStampsAppliesLoneVerdicts(t *testing.T) {
+	outcomes := []versionCheckOutcome{
+		{fileID: 1, available: false, stamp: true, durableAlive: true, checked: true},
+		{fileID: 2, available: true, checked: true},
+		{fileID: 3, available: true, checked: true},
+	}
+	_, toStamp := gateVersionCheckStamps(outcomes)
+	if len(toStamp) != 1 || toStamp[0] != 1 {
+		t.Fatalf("stamped %v, want exactly [1]", toStamp)
+	}
+}
+
+// TestGateVersionCheckStampsBoundaries pins the quorum and rate edges: an
+// exact-half split still stamps (the tie goes to the pins), past-half gates,
+// unanimous disagreement gates, below-quorum batches always stamp, and an
+// already-failed row on a gated round reports its durable not-alive without
+// a redundant stamp.
+func TestGateVersionCheckStampsBoundaries(t *testing.T) {
+	dead := func(ids ...int) []versionCheckOutcome {
+		outcomes := make([]versionCheckOutcome, 0, 8)
+		for i := 1; i <= 8; i++ {
+			outcome := versionCheckOutcome{fileID: i, available: true, checked: true, durableAlive: true}
+			for _, id := range ids {
+				if id == i {
+					outcome.available = false
+					outcome.stamp = true
+				}
+			}
+			outcomes = append(outcomes, outcome)
+		}
+		return outcomes[:8]
+	}
+	cases := []struct {
+		name       string
+		deadIDs    []int
+		total      int
+		wantStamps []int
+	}{
+		// Exactly half of 8: rate is not past 0.5, stamps apply.
+		{name: "exact half stamps", deadIDs: []int{1, 2, 3, 4}, total: 8, wantStamps: []int{1, 2, 3, 4}},
+		// Past half: gated, nothing stamps.
+		{name: "past half gates", deadIDs: []int{1, 2, 3, 4, 5}, total: 8, wantStamps: nil},
+		// Unanimous: gated.
+		{name: "unanimous gates", deadIDs: []int{1, 2, 3, 4, 5, 6, 7, 8}, total: 8, wantStamps: nil},
+		// Below quorum even when unanimous over the checked set.
+		{name: "below quorum stamps", deadIDs: []int{1, 2, 3}, total: 3, wantStamps: []int{1, 2, 3}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			outcomes := dead(tc.deadIDs...)
+			outcomes = outcomes[:tc.total]
+			final, toStamp := gateVersionCheckStamps(outcomes)
+			if len(toStamp) != len(tc.wantStamps) {
+				t.Fatalf("stamped %v, want %v", toStamp, tc.wantStamps)
+			}
+			for i, id := range tc.wantStamps {
+				if toStamp[i] != id {
+					t.Fatalf("stamped %v, want %v", toStamp, tc.wantStamps)
+				}
+			}
+			if len(toStamp) == 0 {
+				for _, outcome := range final {
+					if !outcome.available {
+						t.Fatalf("file %d unavailable on a gated round, want durable alive", outcome.fileID)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestGateVersionCheckStampsReportsDurableNotAlive proves an already-failed
+// row on a gated round reports unavailable (its durable verdict) without a
+// redundant stamp write.
+func TestGateVersionCheckStampsReportsDurableNotAlive(t *testing.T) {
+	outcomes := []versionCheckOutcome{}
+	for i := 1; i <= 8; i++ {
+		outcome := versionCheckOutcome{fileID: i, available: false, stamp: true, checked: true, durableAlive: i > 6}
+		outcomes = append(outcomes, outcome)
+	}
+	// Files 7-8 carry no verdict (durable alive); files 1-6 already failed.
+	final, toStamp := gateVersionCheckStamps(outcomes)
+	if len(toStamp) != 0 {
+		t.Fatalf("stamped %v on a gated round, want none", toStamp)
+	}
+	for _, outcome := range final {
+		want := outcome.fileID > 6
+		if outcome.available != want {
+			t.Fatalf("file %d available=%v, want durable %v", outcome.fileID, outcome.available, want)
+		}
+	}
+}

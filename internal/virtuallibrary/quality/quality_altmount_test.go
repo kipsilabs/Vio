@@ -204,3 +204,83 @@ func TestSortCandidatesForProfileLanguageAndChannels(t *testing.T) {
 		t.Fatalf("expected candidate 1 (PT-BR) to sort ahead of candidate 0 (ENG), got candidate %d", candidates[0].OriginalIndex)
 	}
 }
+
+// TestValidateLenientSkipsBadRegex proves one uncompilable custom format no
+// longer fails the whole config: the source pattern stays intact (so
+// repetition is stable and strict Validate still sees the original text),
+// the compiled matcher is cleared, the skip is reported with a pattern-free
+// reason, the good format still compiles, and structural problems still
+// error.
+func TestValidateLenientSkipsBadRegex(t *testing.T) {
+	const badPattern = `(?:(?<=^)MULTI)`
+	newConfig := func() QualityConfig {
+		return QualityConfig{CustomFormats: []CustomFormat{
+			{Name: "Good", Pattern: `\b1080p\b`, PatternType: "regex", Enabled: true},
+			{Name: "Bad", Pattern: badPattern, PatternType: "regex", Enabled: true},
+		}}
+	}
+	qc := newConfig()
+	if err := qc.Validate(); err == nil {
+		t.Fatal("strict Validate must still fail on the bad pattern")
+	}
+	for attempt := 1; attempt <= 2; attempt++ {
+		skipped, err := qc.ValidateLenient()
+		if err != nil {
+			t.Fatalf("ValidateLenient attempt %d: %v", attempt, err)
+		}
+		if len(skipped) != 1 || skipped[0].Name != "Bad" {
+			t.Fatalf("attempt %d: skipped = %+v, want [{Bad ...}]", attempt, skipped)
+		}
+		if skipped[0].Reason == "" || strings.Contains(skipped[0].Reason, "MULTI") {
+			t.Fatalf("attempt %d: reason %q must be non-empty and pattern-free", attempt, skipped[0].Reason)
+		}
+	}
+	if got := qc.CustomFormats[1].EffectivePattern(); got != badPattern {
+		t.Fatalf("bad source pattern not preserved: %q", got)
+	}
+	if qc.CustomFormats[0].Compiled() == nil {
+		t.Fatal("good format lost its compiled matcher")
+	}
+	// Strict validation still rejects the original bad regex afterward.
+	if err := qc.Validate(); err == nil {
+		t.Fatal("strict Validate must still fail after lenient validation")
+	}
+}
+
+// TestValidateLenientBadRuleNeverScores proves an isolated bad rule
+// contributes neither score nor rejection for ordinary, inverted, and
+// reject rules, while a good rule keeps scoring.
+func TestValidateLenientBadRuleNeverScores(t *testing.T) {
+	qc := QualityConfig{CustomFormats: []CustomFormat{
+		{Name: "Good", Pattern: `\b1080p\b`, PatternType: "regex", Score: 10, Enabled: true},
+		{Name: "BadPlain", Pattern: `(?:(?<=^)MULTI)`, PatternType: "regex", Score: 10, Enabled: true},
+		{Name: "BadInvert", Pattern: `(?!uncompilable`, PatternType: "regex", Score: 10, Invert: true, Enabled: true},
+		{Name: "BadReject", Pattern: `(?<!broken`, PatternType: "regex", Reject: true, Enabled: true},
+	}}
+	if _, err := qc.ValidateLenient(); err != nil {
+		t.Fatalf("ValidateLenient: %v", err)
+	}
+	candidate := stream.StreamCandidate{Name: "Show.S01E01.1080p.WEB-DL-GRP"}
+	score, rejected := CustomFormatScore(candidate, qc.CustomFormats)
+	if rejected {
+		t.Fatal("isolated bad reject rule must not reject the candidate")
+	}
+	if score != 10 {
+		t.Fatalf("score = %d, want 10 (good rule only)", score)
+	}
+}
+
+// TestValidateLenientKeepsStructuralErrors proves leniency covers only
+// regex compilability: duplicate names, empty patterns, and bad types still
+// fail activation the same way.
+func TestValidateLenientKeepsStructuralErrors(t *testing.T) {
+	for name, formats := range map[string][]CustomFormat{
+		"duplicate": {{Name: "X", Pattern: "x"}, {Name: "X", Pattern: "y"}},
+		"empty":     {{Name: "X", Pattern: "   "}},
+	} {
+		qc := QualityConfig{CustomFormats: formats}
+		if _, err := qc.ValidateLenient(); err == nil {
+			t.Fatalf("%s: expected a structural error", name)
+		}
+	}
+}

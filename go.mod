@@ -129,7 +129,7 @@ require (
 )
 
 require (
-	github.com/Silo-Server/silo-plugin-sdk v0.21.0
+	github.com/Silo-Server/silo-plugin-sdk v0.22.0
 	github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.7.14 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.30 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.7.30 // indirect
@@ -150,15 +150,15 @@ require (
 	github.com/prometheus/common v0.67.5 // indirect
 	github.com/prometheus/procfs v0.20.1
 	github.com/robfig/cron/v3 v3.0.1
-	go.opentelemetry.io/contrib/bridges/otelslog v0.19.0
+	go.opentelemetry.io/contrib/bridges/otelslog v0.20.0
 	go.opentelemetry.io/otel v1.45.0
-	go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc v0.20.0
-	go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp v0.20.0
+	go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc v0.21.0
+	go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp v0.21.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.45.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.45.0
-	go.opentelemetry.io/otel/log v0.20.0
+	go.opentelemetry.io/otel/log v0.21.0
 	go.opentelemetry.io/otel/sdk v1.45.0
-	go.opentelemetry.io/otel/sdk/log v0.20.0
+	go.opentelemetry.io/otel/sdk/log v0.21.0
 	go.uber.org/atomic v1.11.0 // indirect
 	go.yaml.in/yaml/v2 v2.4.4 // indirect
 	golang.org/x/sync v0.22.0
