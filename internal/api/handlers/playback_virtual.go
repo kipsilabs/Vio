@@ -3929,12 +3929,28 @@ func (h *PlaybackHandler) virtualProbeEvidenceRotateTarget(ctx context.Context, 
 		return nil, nil, false
 	}
 	if ownerRow != nil && ownerRow.ID != catalogFile.ID {
-		// The candidate's path is an existing alternate version. Rotate the
-		// binding to its owner row: keep the owner's catalog identity and CAS
-		// snapshot (the current generation) and overlay the freshly probed
-		// tracks so the verified inventory is not lost. The write is then a
-		// same-release metadata update on a row that already owns the path, so
-		// the SQL adoption fence is not involved.
+		if virtualSiblingOwnerSharesRelease(catalogFile, ownerRow) {
+			// Duplicate catalog rows for one release share candidate URIs and
+			// neutral keys. Rotating here would overlay the requested row's
+			// probed inventory onto its duplicate sibling (and, on the reverse
+			// probe, the sibling's onto the requested row): exactly the silent
+			// cross-row contamination this guard exists to stop. Refuse the
+			// write outright — a metadata write on the requested row would be
+			// refused by the SQL sibling fence anyway — and serve the probed
+			// tracks in memory only to sessions bound to the requested row id,
+			// so the playing menu stays live while no sibling row is repainted.
+			slog.WarnContext(ctx, "virtual probe evidence rotation refused: sibling owner row is a duplicate of the same release",
+				"component", "api", "requested_file_id", catalogFile.ID, "owner_file_id", ownerRow.ID,
+				"candidate_uri", resolvedPath, "reason", "sibling_owner_same_release")
+			h.publishRefusedProbeInventory(ctx, catalogFile.ID, resolvedPath, probed)
+			return nil, nil, false
+		}
+		// The candidate's path is an existing alternate version of a genuinely
+		// different release. Rotate the binding to its owner row: keep the
+		// owner's catalog identity and CAS snapshot (the current generation) and
+		// overlay the freshly probed tracks so the verified inventory is not
+		// lost. The write is then a same-release metadata update on a row that
+		// already owns the path, so the SQL adoption fence is not involved.
 		rotated := rotateVirtualSourceToOwnerRow(probed, ownerRow, resolvedPath)
 		slog.InfoContext(ctx, "virtual probe evidence rotated to the candidate's owner row",
 			"component", "api", "requested_file_id", catalogFile.ID, "owner_file_id", ownerRow.ID,
@@ -3942,6 +3958,32 @@ func (h *PlaybackHandler) virtualProbeEvidenceRotateTarget(ctx context.Context, 
 		return rotated, rotated, true
 	}
 	return catalogFile, probed, true
+}
+
+// virtualSiblingOwnerSharesRelease reports whether a sibling owner row
+// verifiably carries the same release as the requested row, judged by the
+// durable provider identity in the same strongest-tier precedence the
+// deduplication chain uses (video hash, then source GUID, then normalized
+// release name plus exact size). Two rows are the same release only when both
+// carry a usable identity tier and their strongest tiers compare equal; a row
+// with no durable identity is not proof.
+//
+// It exists to keep the owner-row rotation from silently repainting a duplicate
+// row of the same release with the requested row's inventory. Distinct rows of
+// one release share candidate URIs, so the candidate URI alone cannot tell them
+// apart; only the durable identity can. A genuinely different release (distinct
+// hash/GUID/name+size) does not compare equal and still rotates, which is the
+// alternate-version behavior the fallback relies on.
+func virtualSiblingOwnerSharesRelease(a, b *models.MediaFile) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	keyA := resolver.PersistedDedupKey(a.ProviderVideoHash, a.ProviderGUID, a.ProviderReleaseName, a.ProviderReleaseSize)
+	keyB := resolver.PersistedDedupKey(b.ProviderVideoHash, b.ProviderGUID, b.ProviderReleaseName, b.ProviderReleaseSize)
+	if keyA == "" || keyB == "" {
+		return false
+	}
+	return keyA == keyB
 }
 
 // virtualProbeEvidenceArgsForRow builds the catalog write for one probe result

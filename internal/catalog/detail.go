@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -4138,6 +4139,102 @@ func versionAvailability(f *models.MediaFile) *bool {
 	return boolPtr(false)
 }
 
+// collapseDuplicateVirtualVersionFiles drops duplicate virtual catalog rows so
+// one release lists once. Duplicate rows for a release share a candidate URI
+// (and, for a neutral row, its provider-neutral key) and differ only by the
+// catalog row id, so projecting each row would list the same release twice and
+// let a later serve pick the wrong sibling row.
+//
+// Two rules:
+//   - A byte-identical duplicate (same content, same size, same candidate URI)
+//     collapses to the first occurrence; the order within the list is
+//     preserved otherwise.
+//   - An unprobed virtual placeholder collapses when a probed row for the same
+//     neutral release (same content, same size, result= stripped) is present:
+//     the probed copy is authoritative. A placeholder that has no probed copy
+//     is kept, so a not-yet-probed release still appears in the selector.
+//
+// Local files are never collapsed: their on-disk paths are already distinct, and
+// a same-path collision is not the virtual duplicate this addresses.
+func collapseDuplicateVirtualVersionFiles(files []*models.MediaFile) []*models.MediaFile {
+	if len(files) < 2 {
+		return files
+	}
+	probedNeutral := make(map[string]struct{})
+	for _, f := range files {
+		if f == nil || f.ProbeUpdatedAt == nil {
+			continue
+		}
+		if key := virtualNeutralReleaseKey(f); key != "" {
+			probedNeutral[key] = struct{}{}
+		}
+	}
+	out := make([]*models.MediaFile, 0, len(files))
+	seenExact := make(map[string]struct{})
+	for _, f := range files {
+		if f == nil {
+			continue
+		}
+		exact := virtualExactReleaseKey(f)
+		if exact == "" {
+			out = append(out, f)
+			continue
+		}
+		if _, ok := seenExact[exact]; ok {
+			continue
+		}
+		if f.ProbeUpdatedAt == nil {
+			if _, ok := probedNeutral[virtualNeutralReleaseKey(f)]; ok {
+				continue
+			}
+		}
+		seenExact[exact] = struct{}{}
+		out = append(out, f)
+	}
+	return out
+}
+
+// virtualExactReleaseKey identifies a virtual row's exact release identity for
+// duplicate collapse: content, size and the concrete candidate URI. Local files
+// return "", so they are never part of the virtual dedup.
+func virtualExactReleaseKey(f *models.MediaFile) string {
+	if f == nil || !isVirtualMediaFile(f) {
+		return ""
+	}
+	return f.ContentID + "\x00" + strconv.FormatInt(f.FileSize, 10) + "\x00" + f.FilePath
+}
+
+// virtualNeutralReleaseKey groups a virtual row by its provider-neutral release:
+// content and the candidate URI with any concrete result= pick stripped. Size is
+// deliberately excluded: an unprobed collection placeholder is stored with size
+// 0 while the probed copy of the same release carries the real size, and the
+// placeholder must still collapse against that probed copy. Local files return
+// "".
+func virtualNeutralReleaseKey(f *models.MediaFile) string {
+	if f == nil || !isVirtualMediaFile(f) {
+		return ""
+	}
+	return f.ContentID + "\x00" + neutralVirtualVersionPath(f.FilePath)
+}
+
+// neutralVirtualVersionPath removes a concrete result= pick from a virtual path
+// while preserving every other query parameter (including the quality profile=
+// selection, so distinct profile variants stay distinct). A path that fails to
+// parse is returned unchanged.
+func neutralVirtualVersionPath(virtualPath string) string {
+	parsed, err := url.Parse(virtualPath)
+	if err != nil {
+		return virtualPath
+	}
+	q := parsed.Query()
+	if strings.TrimSpace(q.Get("result")) == "" {
+		return virtualPath
+	}
+	q.Del("result")
+	parsed.RawQuery = q.Encode()
+	return parsed.String()
+}
+
 func (s *DetailService) buildPlaybackInfo(
 	ctx context.Context,
 	files []*models.MediaFile,
@@ -4161,6 +4258,13 @@ func (s *DetailService) buildPlaybackInfoWith(
 	versions := make([]FileVersion, 0, len(files))
 	subtitleSet := make(map[string]SubtitleInfo)
 	var firstIntro, firstCredits, firstRecap, firstPreview *Marker
+
+	// Collapse byte-identical duplicate catalog rows before projecting versions:
+	// duplicate virtual rows for one release share candidate URIs/neutral keys
+	// and would otherwise list the same release more than once (and let a later
+	// serve pick the wrong sibling). A probed copy is preferred and an unprobed
+	// placeholder is kept only when no probed copy exists.
+	files = collapseDuplicateVirtualVersionFiles(files)
 
 	// Runtime fallbacks are request-invariant too. Every file in one call shares
 	// one item (movies, extras) and, for episode versions, one episode, so a

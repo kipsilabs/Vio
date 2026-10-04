@@ -908,6 +908,14 @@ func bindSessionVirtualSourceWithTracks(ctx context.Context, file *models.MediaF
 // evidence URI is authoritative when present. Sessions created before that field
 // existed fall back to the plan-time binding: evidence captured while the file
 // path matched the session's virtual URI still belongs to the bound file.
+//
+// The URI alone is ambiguous: duplicate catalog rows for one release share
+// candidate URIs and neutral keys, so a serve-layer rotation can move the
+// binding to a sibling row that names the same candidate while the carried
+// inventory still describes the row the plan captured it from. The evidence
+// row id disambiguates them: evidence captured from row A must not be applied
+// to sibling row B. A zero evidence row id (a legacy or reconstructed session)
+// falls back to URI-only matching, preserving the historical behavior.
 func virtualEvidenceMatchesBoundFile(bound *models.MediaFile, session *playback.Session) bool {
 	if session == nil || bound == nil {
 		return false
@@ -919,7 +927,15 @@ func virtualEvidenceMatchesBoundFile(bound *models.MediaFile, session *playback.
 		// the bound file names that same candidate.
 		return session.VirtualSourceURI != "" && sameVirtualCandidate(session.VirtualSourceURI, bound.FilePath)
 	}
-	return sameVirtualCandidate(evidenceURI, bound.FilePath)
+	if !sameVirtualCandidate(evidenceURI, bound.FilePath) {
+		return false
+	}
+	if id := session.VirtualSubtitleEvidenceFileID; id > 0 && bound.ID > 0 && id != bound.ID {
+		// Same candidate URI, different catalog row: the evidence belongs to
+		// the sibling row that planned it, not this one.
+		return false
+	}
+	return true
 }
 
 // sameVirtualCandidate reports whether two provider-neutral virtual paths name
