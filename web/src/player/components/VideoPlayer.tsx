@@ -2464,11 +2464,13 @@ export function VideoPlayer({
                   });
                   const retryAfter = manifestRetryAfterMs(data);
                   const instance = hls;
+                  const manifestUrl = instance?.url ?? data.frag?.url ?? data.url;
                   const timer = window.setTimeout(() => {
                     if (destroyed) return;
                     if (hlsStartupGuardRef.current?.isStarting() !== true) return;
                     if (hlsRef.current !== instance) return;
-                    instance?.loadSource(instance.url);
+                    if (manifestUrl == null) return;
+                    instance?.loadSource(manifestUrl);
                   }, retryAfter);
                   manifestPollbackRef.current = timer;
                   return;
