@@ -5,7 +5,7 @@ import {
   providerSaveMessage,
   type ProviderEditor,
 } from "@/api/v2/adminSubtitleProviderConfiguration";
-import { useEffect, useRef, useState } from "react";
+import { useRef, useState } from "react";
 import { Link } from "react-router";
 import { toast } from "sonner";
 
