@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Pre-push gate: run everything CI would catch that can run locally.
+# Fast checks first so a typo fails in seconds, not minutes.
+# Bypass with: git push --no-verify (then say why in the PR).
+set -euo pipefail
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+fail=0
+step() { echo "pre-push: $*"; }
+
+run() {
+	if ! "$@" ; then
+		echo "pre-push FAILED: $*" >&2
+		fail=1
+	fi
+}
+
+step "go build"
+run go build ./...
+
+step "gofmt (must print nothing)"
+if [ -n "$(gofmt -l internal/ cmd/)" ]; then
+	echo "pre-push FAILED: gofmt -l internal/ cmd/ listed files above" >&2
+	fail=1
+fi
+
+step "go vet (touched packages)"
+run go vet ./internal/api/handlers/ ./internal/catalog/ ./internal/config/ ./cmd/silo/
+
+step "whitespace"
+run git diff --check
+
+# Only when relevant files changed.
+if git diff --name-only HEAD | grep -qE '^(migrations/sql/|contracts/settings/|internal/settingskeys/)'; then
+	step "migrate-validate + settings bindings"
+	run make migrate-validate
+	run make verify-settings-bindings
+fi
+
+if [ -d web/node_modules ]; then
+	step "web lint + format check"
+	(cd web && run pnpm run lint)
+	(cd web && run pnpm run format:check)
+else
+	echo "pre-push: skipping web lint (web/node_modules absent; run pnpm install)"
+fi
+
+step "changed-lines lint"
+if command -v golangci-lint >/dev/null 2>&1; then
+	run make lint-changed
+else
+	echo "pre-push: skipping lint-changed (golangci-lint not installed)"
+fi
+
+if [ "$fail" -ne 0 ]; then
+	echo "pre-push: gate failed — fix the above, then push again." >&2
+	exit 1
+fi
+echo "pre-push: gate passed."
