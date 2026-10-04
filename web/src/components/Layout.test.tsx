@@ -11,7 +11,6 @@ const mocks = vi.hoisted(() => ({
   prefetchQuery: vi.fn(),
   getQueryData: vi.fn(),
   renderSurface: true,
-  backgroundBar: false,
   beginResult: undefined as boolean | undefined,
   profile: {
     name: "Admin",
@@ -49,7 +48,7 @@ vi.mock("@/hooks/useCurrentProfile", () => ({
 }));
 vi.mock("@/hooks/useIsActingAdmin", () => ({ useIsActingAdmin: () => false }));
 vi.mock("@/playback/watchPlaybackContext", () => ({
-  useWatchPlaybackController: () => ({ isBackgroundBarVisible: mocks.backgroundBar }),
+  useWatchPlaybackController: () => ({ isBackgroundBarVisible: false }),
 }));
 vi.mock("@/pages/audiobooks/player/audiobookPlaybackContext", () => ({
   useAudiobookPlaybackController: () => null,
@@ -158,7 +157,6 @@ beforeEach(() => {
   mocks.prefetchQuery.mockReset();
   mocks.getQueryData.mockReset();
   mocks.renderSurface = true;
-  mocks.backgroundBar = false;
   mocks.beginResult = undefined;
   mocks.profile = {
     name: "Admin",
@@ -270,27 +268,19 @@ describe("Layout sidebar collapse", () => {
   });
 });
 
-describe("Layout background playback bar", () => {
-  // Fixed page chrome (the collection editor's save bar) reads this inset to
-  // rise above the background playback bar instead of hiding under it.
-  it("publishes the playback bar's clearance on main only while the bar shows", () => {
-    const view = renderLayout();
-    expect(screen.getByRole("main")).not.toHaveClass("[--main-inset-bottom:8rem]");
+describe("Layout page gutter", () => {
+  // Fixed page chrome (the collection editor's save bar) reads this gutter so
+  // it lines up with the content column instead of guessing the padding.
+  it("pads the page by the gutter it publishes", () => {
+    setRoute("/collections", "collections");
+    renderLayout();
 
-    mocks.backgroundBar = true;
-    view.rerender(
-      <MemoryRouter>
-        <Layout>
-          <Harness />
-        </Layout>
-      </MemoryRouter>,
-    );
-
-    expect(screen.getByRole("main")).toHaveClass(
-      "pb-32",
-      "sm:pb-36",
-      "[--main-inset-bottom:8rem]",
-      "sm:[--main-inset-bottom:9rem]",
+    expect(screen.getByRole("main").firstElementChild).toHaveClass(
+      "px-(--page-gutter)",
+      "[--page-gutter:1rem]",
+      "sm:[--page-gutter:1.5rem]",
+      "lg:[--page-gutter:2.5rem]",
+      "xl:[--page-gutter:3rem]",
     );
   });
 });
@@ -299,7 +289,7 @@ describe("Layout request routes", () => {
   // The padded shell wraps the page in one gutter div; unpadded pages render
   // straight into <main>.
   const isShellPadded = () =>
-    screen.getByRole("main").firstElementChild?.classList.contains("lg:px-10") ?? false;
+    screen.getByRole("main").firstElementChild?.classList.contains("px-(--page-gutter)") ?? false;
 
   it.each([
     ["/requests", false, false],

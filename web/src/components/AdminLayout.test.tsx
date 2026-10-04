@@ -7,7 +7,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const mocks = vi.hoisted(() => ({
   useAdminServerStatus: vi.fn(),
   shortcutLabel: "Ctrl K",
-  backgroundBar: false,
 }));
 
 vi.mock("@/hooks/queries/admin/settings", () => ({
@@ -25,7 +24,7 @@ vi.mock("@/components/AdminSectionCommandDialog", () => ({
 }));
 vi.mock("@/components/ServerActivity", () => ({ default: () => null }));
 vi.mock("@/playback/watchPlaybackContext", () => ({
-  useWatchPlaybackController: () => ({ isBackgroundBarVisible: mocks.backgroundBar }),
+  useWatchPlaybackController: () => ({ isBackgroundBarVisible: false }),
 }));
 vi.mock("@/pages/audiobooks/player/audiobookPlaybackContext", () => ({
   useAudiobookPlaybackController: () => null,
@@ -71,7 +70,6 @@ function renderAdmin(initialPath = "/admin") {
 beforeEach(() => {
   mocks.useAdminServerStatus.mockReturnValue({ data: { restart_required: true } });
   mocks.shortcutLabel = "Ctrl K";
-  mocks.backgroundBar = false;
   vi.stubGlobal("matchMedia", (query: string) => ({
     matches: query === "(min-width: 64rem)",
     media: query,
@@ -120,23 +118,18 @@ describe("AdminLayout shell attribute", () => {
   });
 });
 
-describe("AdminLayout background playback bar", () => {
-  // Fixed page chrome (the collection editor's save bar) reads this inset to
-  // rise above the background playback bar instead of hiding under it.
-  it("reserves no clearance while no playback bar shows", () => {
-    renderAdmin();
-    expect(screen.getByRole("main")).not.toHaveClass("[--main-inset-bottom:8rem]");
-  });
-
-  it("matches the clearance to the main padding the bar already reserves", () => {
-    mocks.backgroundBar = true;
+describe("AdminLayout page gutter", () => {
+  // Fixed page chrome (the collection editor's save bar) reads this gutter so
+  // it lines up with the content column instead of guessing the padding.
+  it("pads main by the gutter it publishes", () => {
     renderAdmin();
 
     expect(screen.getByRole("main")).toHaveClass(
-      "pb-32",
-      "sm:pb-36",
-      "[--main-inset-bottom:8rem]",
-      "sm:[--main-inset-bottom:9rem]",
+      "px-(--page-gutter)",
+      "[--page-gutter:1rem]",
+      "sm:[--page-gutter:1.5rem]",
+      "lg:[--page-gutter:2rem]",
+      "xl:[--page-gutter:2.5rem]",
     );
   });
 });

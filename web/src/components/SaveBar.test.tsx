@@ -112,9 +112,10 @@ describe("SaveBar on a page", () => {
 
   // The page bar starts at the sidebar edge either shell publishes in
   // `--app-sidebar-offset` (260px, the 64px rail, or the admin 240px) instead of
-  // assuming the admin sidebar, and rises above the background playback bar by
-  // the `--main-inset-bottom` both shells set on <main> while that bar shows.
-  it("spans the main column and clears the background playback bar", () => {
+  // assuming the admin sidebar. It rises by `--playback-bar-clearance`, the
+  // measured height of whichever background playback bar shows, so it clears
+  // the taller stacked watch bar on phones as well as the desktop one.
+  it("spans the main column and clears the measured playback bar", () => {
     renderBar({ placement: "page" });
 
     const dock = screen.getByRole("region", { name: "Unsaved changes" }).parentElement;
@@ -122,14 +123,105 @@ describe("SaveBar on a page", () => {
       "fixed",
       "left-[var(--app-sidebar-offset,0px)]",
       "right-0",
-      "bottom-[calc(var(--main-inset-bottom,0px)+0.75rem)]",
+      "bottom-[calc(var(--playback-bar-clearance,0px)+0.75rem)]",
+      "lg:bottom-[calc(var(--playback-bar-clearance,0px)+1.125rem)]",
     );
     expect(dock).not.toHaveClass("lg:left-[240px]");
   });
 
-  it("stays hidden while nothing is staged", () => {
-    const { container } = renderBar({ placement: "page", dirtyCount: 0 });
+  // The bar's side padding is the gutter the shell gives page content, so the
+  // bar lines up with the content column in both shells at every width.
+  it("uses the shell's page gutter for its side padding", () => {
+    renderBar({ placement: "page" });
 
-    expect(container).toBeEmptyDOMElement();
+    const dock = screen.getByRole("region", { name: "Unsaved changes" }).parentElement;
+    expect(dock).toHaveClass("px-(--page-gutter,1rem)");
+  });
+
+  // The admin shell drops its playback padding at lg, so the bar's own scroll
+  // room has to cover the playback bar too, or the end of the page stays under
+  // the raised save bar at full scroll.
+  it("leaves scroll room for itself and the playback bar under it", () => {
+    const { container } = renderBar({ placement: "page" });
+
+    expect(container.querySelector("[aria-hidden='true']")).toHaveClass(
+      "h-[calc(7rem+var(--playback-bar-clearance,0px))]",
+    );
+  });
+
+  it("raises its scrim with the bar so content fades out above the bar", () => {
+    const { container } = renderBar({ placement: "page" });
+
+    const scrim = container.querySelectorAll("[aria-hidden='true']")[1];
+    expect(scrim).toHaveClass("fixed", "bottom-(--playback-bar-clearance,0px)");
+  });
+
+  it("shows nothing visible and no landmark while nothing is staged", () => {
+    renderBar({ placement: "page", dirtyCount: 0 });
+
+    expect(screen.queryByRole("region")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button")).not.toBeInTheDocument();
+    expect(screen.getByRole("status")).toBeEmptyDOMElement();
+  });
+
+  // A live region inserted with its text already in it is often not read out.
+  // The empty status stays mounted while the page is clean, so the first edit
+  // fills a region the screen reader already watches.
+  it("announces the first change through a status that was already mounted", () => {
+    const view = renderBar({ placement: "page", dirtyCount: 0 });
+    const status = screen.getByRole("status");
+
+    view.rerender(
+      <SaveBar
+        dirtyCount={1}
+        onSave={vi.fn()}
+        onDiscard={vi.fn()}
+        isSaving={false}
+        placement="page"
+        message="Name not saved"
+      />,
+    );
+
+    expect(screen.getByRole("status")).toBe(status);
+    expect(status).toHaveTextContent("Name not saved");
+    expect(screen.getByRole("region", { name: "Unsaved changes" })).toContainElement(status);
+  });
+
+  // Create mode: the bar shows before anything is staged, with a muted dot,
+  // its own label and the primary action held back until it can run.
+  it("can show while clean with a muted dot for a collection not created yet", () => {
+    renderBar({
+      placement: "page",
+      dirtyCount: 0,
+      visible: true,
+      tone: "idle",
+      label: "Create collection",
+      message: "Not created yet",
+      saveLabel: "Create collection",
+      discardLabel: "Cancel",
+      canSave: false,
+    });
+
+    const region = screen.getByRole("region", { name: "Create collection" });
+    const status = within(region).getByRole("status");
+    expect(status).toHaveTextContent("Not created yet");
+    expect(status.querySelector("[aria-hidden='true']")).toHaveClass("bg-muted-foreground");
+    expect(status.querySelector("[aria-hidden='true']")).not.toHaveClass("bg-warning");
+    expect(within(region).getByRole("button", { name: "Create collection" })).toBeDisabled();
+    expect(within(region).getByRole("button", { name: "Cancel" })).toBeEnabled();
+  });
+
+  it("marks staged changes with the warning dot", () => {
+    renderBar({ placement: "page" });
+
+    const status = screen.getByRole("status");
+    expect(status.querySelector("[aria-hidden='true']")).toHaveClass("bg-warning");
+  });
+
+  it("can stay hidden while edits are staged, e.g. while the page loads", () => {
+    renderBar({ placement: "page", visible: false });
+
+    expect(screen.queryByRole("region")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button")).not.toBeInTheDocument();
   });
 });
