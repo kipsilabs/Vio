@@ -199,6 +199,33 @@ changed-line findings as CI while analyzing only the packages the branch touched
 
 Go stays `gofmt`/`goimports` clean; the frontend follows `web/.prettierrc`.
 
+## Pre-push checklist (first-try green)
+
+Run every item before each push, not just before opening the PR. The two
+most-skipped steps cause the most CI failures.
+
+```sh
+# Go (repo root)
+go build ./...
+gofmt -l internal/ cmd/              # must print nothing
+go vet ./...                         # or at least touched packages
+git diff --check                     # whitespace errors
+# If touched: migrations, settings manifest/keys, apiv2 routes
+make migrate-validate
+make verify-settings-bindings
+```
+
+```sh
+# Web (web/)
+pnpm run lint                        # unused imports kill CI
+pnpm run format:check                # or prettier --write the edited files first
+```
+
+Plus: focused `go test` on touched packages, and after pushing,
+`gh pr checks <n>` to watch the first run. Rebase onto `origin/main`
+right after branching so CI runs against a current target instead of
+surfacing merge drift late.
+
 ## Development environment
 
 Copy `.silo-dev.env.example` to `.silo-dev.env` and fill in how to

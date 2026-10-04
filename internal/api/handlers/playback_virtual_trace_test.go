@@ -38,32 +38,28 @@ func virtualTraceFieldsToMap(t *testing.T, fields []any) map[string]any {
 // the displayed stage durations.
 func TestVirtualResolveTraceRanVersusZero(t *testing.T) {
 	trace := &virtualResolveTrace{
-		started:  time.Now(),
-		list:     3 * time.Millisecond,
-		listRan:  true,
-		remux:    2 * time.Millisecond,
-		remuxRan: true,
-		resolve:  time.Millisecond,
+		started: time.Now(),
+		list:    3 * time.Millisecond,
+		listRan: true,
+		resolve: time.Millisecond,
 		// Ran, but below the millisecond resolution the field reports.
 		probe:      500 * time.Microsecond,
 		probeRan:   true,
 		resolveRan: true,
 	}
-	if got := trace.totalMS(); got != 6 {
-		t.Fatalf("totalMS = %d, want 6", got)
+	if got := trace.totalMS(); got != 4 {
+		t.Fatalf("totalMS = %d, want 4", got)
 	}
 
 	fields := virtualTraceFieldsToMap(t, trace.fields())
 	for key, want := range map[string]any{
 		"list_ran":    true,
 		"list_ms":     int64(3),
-		"remux_ran":   true,
-		"remux_ms":    int64(2),
 		"resolve_ran": true,
 		"resolve_ms":  int64(1),
 		"probe_ran":   true,
 		"probe_ms":    int64(0), // ran in under 1 ms, still a measurement
-		"total_ms":    int64(6),
+		"total_ms":    int64(4),
 	} {
 		if got := fields[key]; got != want {
 			t.Fatalf("%s = %#v, want %#v", key, got, want)
@@ -140,7 +136,7 @@ func TestResolveVirtualTimingReportsRanStages(t *testing.T) {
 		}
 	})
 
-	for _, stage := range []string{"list", "remux", "resolve"} {
+	for _, stage := range []string{"list", "resolve"} {
 		if entry[stage+"_ran"] != true {
 			t.Fatalf("%s_ran = %#v, want true", stage, entry[stage+"_ran"])
 		}
@@ -164,7 +160,7 @@ func TestResolveVirtualTimingReportsRanStages(t *testing.T) {
 	}
 
 	var sum float64
-	for _, stage := range []string{"list_ms", "remux_ms", "resolve_ms", "probe_ms", "fallback_ms"} {
+	for _, stage := range []string{"list_ms", "resolve_ms", "probe_ms", "fallback_ms"} {
 		if value, ok := entry[stage].(float64); ok {
 			sum += value
 		}
@@ -199,7 +195,7 @@ func TestResolveVirtualTimingFlagsFastPathWithoutRanStages(t *testing.T) {
 	if total, _ := entry["total_ms"].(float64); total != 0 {
 		t.Fatalf("total_ms = %#v, want 0", entry["total_ms"])
 	}
-	for _, stage := range []string{"list", "remux", "resolve", "probe", "fallback"} {
+	for _, stage := range []string{"list", "resolve", "probe", "fallback"} {
 		if entry[stage+"_ran"] != false {
 			t.Fatalf("%s_ran = %#v, want false on the fast path", stage, entry[stage+"_ran"])
 		}

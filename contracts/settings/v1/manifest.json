@@ -1,6 +1,6 @@
 {
   "api_version": 1,
-  "revision": 16,
+  "revision": 17,
   "option_sets": {
     "playback_audio_languages": {
       "type": "language_tag",
@@ -956,7 +956,7 @@
       "label": "Show forced subtitles",
       "description": "Show subtitles for foreign-language dialogue even when subtitles are off.",
       "recommended_control": "switch",
-      "notes": "Default is true because that is what the server resolves today: user_profiles.show_forced_subtitles is NOT NULL DEFAULT true (migration 029) and profile creation sets it true. A false default here would silently turn forced subtitles off for every profile that never touched the toggle. The Has* companion booleans on LibraryPlaybackPreference and SubtitlePreference encode set-vs-unset at the library and series scopes, so migration writes rows there only where Has* is true. The profile column has no companion and cannot distinguish an explicit true from the column default, so migration writes a profile row only where the value is false — the value that differs from the default."
+      "notes": "Default is true because that is what the server resolves today: user_profiles.show_forced_subtitles is NOT NULL DEFAULT true (migration 029) and profile creation sets it true. A false default here would silently turn forced subtitles off for every profile that never touched the toggle. The Has* companion booleans on LibraryPlaybackPreference and SubtitlePreference encode set-vs-unset at the library and series scopes, so migration writes rows there only where Has* is true. The profile column has no companion and cannot distinguish an explicit true from the column default, so migration writes a profile row only where the value is false \u2014 the value that differs from the default."
     },
     {
       "key": "playback.subtitle_appearance",
@@ -1045,7 +1045,7 @@
       "label": "Preferred quality",
       "description": "Pick the quality Silo should prefer.",
       "recommended_control": "select",
-      "notes": "The resolution axis. Members are exactly the vocabulary the server already speaks: NormalizeQualityV3 in internal/playback/protocol_v3.go accepts auto, 480p, 720p, 1080p, 2160p and original and normalizes anything else to auto with a degradation warning. Transcode ladder rungs (328p, 720p-high, 1080p-8 and friends) are deliberately absent — they were never a third dimension, only a bitrate spelled into the resolution string. web/src/player/hooks/useTranscodeQuality.ts already decomposes them, defining 1080p-high as {resolution: 1080p, bitrate: 10000} and sending the two to the server separately, so the compound form never reached the wire. playback.max_bitrate_kbps is now that second axis, and clients compose the two into whatever presets they want to show. Members are listed ascending so the ceiling constraint has a defined direction; \"auto\" sorts lowest because it never exceeds a cap, and \"original\" highest because it is the uncapped source. Enforcing the ceiling needs internal/access/quality.go to learn both sentinels: qualityRank ranks neither today, so auto and original both tie at 0 with unset and a cap would let original through. Migrates user_profiles.quality_preference as the profile fallback. The legacy column is NOT NULL DEFAULT '1080p', and that default was the effective playback cap, so existing profiles receive explicit 1080p and 6000 kbps rows; newly created profiles use the contract's auto/null defaults. The account/profile max_playback_quality columns stay in internal/policy and are NOT settings."
+      "notes": "The resolution axis. Members are exactly the vocabulary the server already speaks: NormalizeQualityV3 in internal/playback/protocol_v3.go accepts auto, 480p, 720p, 1080p, 2160p and original and normalizes anything else to auto with a degradation warning. Transcode ladder rungs (328p, 720p-high, 1080p-8 and friends) are deliberately absent \u2014 they were never a third dimension, only a bitrate spelled into the resolution string. web/src/player/hooks/useTranscodeQuality.ts already decomposes them, defining 1080p-high as {resolution: 1080p, bitrate: 10000} and sending the two to the server separately, so the compound form never reached the wire. playback.max_bitrate_kbps is now that second axis, and clients compose the two into whatever presets they want to show. Members are listed ascending so the ceiling constraint has a defined direction; \"auto\" sorts lowest because it never exceeds a cap, and \"original\" highest because it is the uncapped source. Enforcing the ceiling needs internal/access/quality.go to learn both sentinels: qualityRank ranks neither today, so auto and original both tie at 0 with unset and a cap would let original through. Migrates user_profiles.quality_preference as the profile fallback. The legacy column is NOT NULL DEFAULT '1080p', and that default was the effective playback cap, so existing profiles receive explicit 1080p and 6000 kbps rows; newly created profiles use the contract's auto/null defaults. The account/profile max_playback_quality columns stay in internal/policy and are NOT settings."
     },
     {
       "key": "playback.max_bitrate_kbps",
@@ -1072,7 +1072,7 @@
       "label": "Maximum bitrate",
       "description": "Cap how much bandwidth playback may use. No cap means Silo picks for the chosen resolution.",
       "recommended_control": "select",
-      "notes": "The bitrate axis, orthogonal to playback.preferred_quality. Splitting them is what the clients were already doing: the in-player switcher sends resolution and bitrate as separate fields, and downloads (DownloadQuality in silo-android) dropped resolution entirely and kept only a bitrate ladder. Two values rather than one compound enum means a client can offer \"1080p High\" without the server having to agree on what \"High\" means — retuning a preset is a client release, not a contract break, and it stays additive under the widening rule. null is uncapped, which is why this is nullable rather than defaulting to a large number: absent and \"as much as you like\" are the same statement, and a numeric sentinel would have to be widened every time hardware improves. The bounds are deliberately loose — 100 kbps is below any watchable stream and 200 Mbps is above any remux — because this caps a preference, not a policy; entitlement limits live in internal/policy. Migration decomposes the legacy compound values: 1080p-high becomes (1080p, 10000), 720p-medium becomes (720p, 3000), 420p becomes (480p, 720), following the bitrates in web/src/player/hooks/useTranscodeQuality.ts, so no stored preference is lost to the rejects table."
+      "notes": "The bitrate axis, orthogonal to playback.preferred_quality. Splitting them is what the clients were already doing: the in-player switcher sends resolution and bitrate as separate fields, and downloads (DownloadQuality in silo-android) dropped resolution entirely and kept only a bitrate ladder. Two values rather than one compound enum means a client can offer \"1080p High\" without the server having to agree on what \"High\" means \u2014 retuning a preset is a client release, not a contract break, and it stays additive under the widening rule. null is uncapped, which is why this is nullable rather than defaulting to a large number: absent and \"as much as you like\" are the same statement, and a numeric sentinel would have to be widened every time hardware improves. The bounds are deliberately loose \u2014 100 kbps is below any watchable stream and 200 Mbps is above any remux \u2014 because this caps a preference, not a policy; entitlement limits live in internal/policy. Migration decomposes the legacy compound values: 1080p-high becomes (1080p, 10000), 720p-medium becomes (720p, 3000), 420p becomes (480p, 720), following the bitrates in web/src/player/hooks/useTranscodeQuality.ts, so no stored preference is lost to the rejects table."
     },
     {
       "key": "playback.auto_skip_intro",
@@ -1584,7 +1584,7 @@
       "label": "Default sleep timer",
       "description": "Duration the sleep timer starts on when you turn it on. 0 leaves it off.",
       "recommended_control": "stepper",
-      "notes": "Android keeps this device-local today and clamps to 0..240; it was never written to the server rather than written and rejected. The maximum matches that clamp rather than exceeding it, and the default matches Android's shipped 30, because a manifest that disagrees with the only client implementing a setting is the drift this contract exists to remove — and a default of 0 would silently turn the preset off for everyone at cutover. Raising the maximum later is additive under the widening rule: replace the bare maximum with its history so a client can still see the 240 an older server enforces. This is the duration the timer starts on, not whether one is running: the design classes a running sleep timer as private local, so only the persisted default is registered."
+      "notes": "Android keeps this device-local today and clamps to 0..240; it was never written to the server rather than written and rejected. The maximum matches that clamp rather than exceeding it, and the default matches Android's shipped 30, because a manifest that disagrees with the only client implementing a setting is the drift this contract exists to remove \u2014 and a default of 0 would silently turn the preset off for everyone at cutover. Raising the maximum later is additive under the widening rule: replace the bare maximum with its history so a client can still see the 240 an older server enforces. This is the duration the timer starts on, not whether one is running: the design classes a running sleep timer as private local, so only the persisted default is registered."
     },
     {
       "key": "ui.theme",
@@ -2002,7 +2002,7 @@
       "category": "appearance",
       "label": "Poster badges",
       "description": "Which badges appear on poster cards, and where.",
-      "notes": "Registered from the legacy unprefixed key card_overlays, which reached the server only through the unknown-key extension bag — stored as an arbitrary string with no validation. null means the user has expressed no preference, which is what lets the server-wide admin default in the overlay-config endpoint apply; writing a resolved-but-unchosen value would silently pin them. The server-wide default configuration stays in server_settings and is not a user setting. This key describes which badges to show, not whether to show them — that is ui.card_overlays_enabled. Revision 13 adds the advisory_age overlay id; a server below revision 13 rejects a value that contains it, so a client offers that badge only when manifest_revision is at least 13. Revision 15 adds the request_status overlay id (a watchlist title's request status on its poster) under the same rule: a client offers it only when manifest_revision is at least 15."
+      "notes": "Registered from the legacy unprefixed key card_overlays, which reached the server only through the unknown-key extension bag \u2014 stored as an arbitrary string with no validation. null means the user has expressed no preference, which is what lets the server-wide admin default in the overlay-config endpoint apply; writing a resolved-but-unchosen value would silently pin them. The server-wide default configuration stays in server_settings and is not a user setting. This key describes which badges to show, not whether to show them \u2014 that is ui.card_overlays_enabled. Revision 13 adds the advisory_age overlay id; a server below revision 13 rejects a value that contains it, so a client offers that badge only when manifest_revision is at least 13. Revision 15 adds the request_status overlay id (a watchlist title's request status on its poster) under the same rule: a client offers it only when manifest_revision is at least 15."
     },
     {
       "key": "ui.card_overlays_enabled",
@@ -2267,7 +2267,7 @@
       "category": "navigation",
       "label": "Hidden libraries",
       "description": "Libraries you have hidden from your own browsing.",
-      "notes": "Registered from the legacy unprefixed key disabled_library_ids. This is the user hiding a library from themselves — it is not an access control. Library visibility enforcement lives in internal/access and internal/policy, and nothing here may be read as a permission. Profile scope rather than profile_device because hiding a library is a statement about what you want to see, not about one screen."
+      "notes": "Registered from the legacy unprefixed key disabled_library_ids. This is the user hiding a library from themselves \u2014 it is not an access control. Library visibility enforcement lives in internal/access and internal/policy, and nothing here may be read as a permission. Profile scope rather than profile_device because hiding a library is a statement about what you want to see, not about one screen."
     },
     {
       "key": "ui.library_order",
@@ -2419,7 +2419,7 @@
       "label": "Match device caption settings",
       "description": "Use the operating system's caption style instead of Silo's.",
       "recommended_control": "switch",
-      "notes": "Contract-known local: reads OS accessibility settings that only exist on the device. When enabled, playback.subtitle_appearance is not applied. Apple's existing copy separating this from profile subtitle behavior is the UX baseline. A contract key names a setting; it is not a storage key. Clients keep whatever local key they already use — Android stores this at subtitle.matches_device.local, Apple at player.subtitleMatchesSystemAppearance — so adopting the contract does not reset anyone's local preferences. The same applies to downloads.wifi_only and downloads.keep_watched, which Apple stores as downloads.wifiOnly and downloads.keepWatchedDownloads."
+      "notes": "Contract-known local: reads OS accessibility settings that only exist on the device. When enabled, playback.subtitle_appearance is not applied. Apple's existing copy separating this from profile subtitle behavior is the UX baseline. A contract key names a setting; it is not a storage key. Clients keep whatever local key they already use \u2014 Android stores this at subtitle.matches_device.local, Apple at player.subtitleMatchesSystemAppearance \u2014 so adopting the contract does not reset anyone's local preferences. The same applies to downloads.wifi_only and downloads.keep_watched, which Apple stores as downloads.wifiOnly and downloads.keepWatchedDownloads."
     },
     {
       "key": "player.resume_rewind_seconds",
@@ -2557,7 +2557,9 @@
       "category": "providers",
       "label": "RemuxDB stream metadata",
       "description": "Look up crowdsourced stream metadata for cold virtual files.",
-      "recommended_control": "switch"
+      "recommended_control": "switch",
+      "deprecated": true,
+      "notes": "Removed in revision 17: the RemuxDB integration was deleted and the key is ignored."
     },
     {
       "key": "remuxdb.base_url",
@@ -2578,7 +2580,9 @@
       "category": "providers",
       "label": "RemuxDB base URL",
       "description": "Base URL of the RemuxDB API service.",
-      "recommended_control": "text"
+      "recommended_control": "text",
+      "deprecated": true,
+      "notes": "Removed in revision 17: the RemuxDB integration was deleted and the key is ignored."
     },
     {
       "key": "remuxdb.token",
@@ -2599,7 +2603,9 @@
       "category": "providers",
       "label": "RemuxDB API token",
       "description": "API token for RemuxDB submissions.",
-      "recommended_control": "text"
+      "recommended_control": "text",
+      "deprecated": true,
+      "notes": "Removed in revision 17: the RemuxDB integration was deleted and the key is ignored."
     },
     {
       "key": "remuxdb.submit_enabled",
@@ -2619,7 +2625,9 @@
       "category": "providers",
       "label": "Contribute to RemuxDB",
       "description": "Submit probed stream metadata to RemuxDB to help the community.",
-      "recommended_control": "switch"
+      "recommended_control": "switch",
+      "deprecated": true,
+      "notes": "Removed in revision 17: the RemuxDB integration was deleted and the key is ignored."
     },
     {
       "key": "catalog.show_advisory_age",
@@ -2696,9 +2704,16 @@
       "key": "requests.watchlist_auto_request",
       "introduced_in": 15,
       "persistence": "remote",
-      "allowed_scopes": ["profile"],
-      "resolution_order": ["profile", "default"],
-      "value_schema": { "type": "boolean" },
+      "allowed_scopes": [
+        "profile"
+      ],
+      "resolution_order": [
+        "profile",
+        "default"
+      ],
+      "value_schema": {
+        "type": "boolean"
+      },
       "default_value": true,
       "category": "requests",
       "label": "Request titles I add to my watchlist",
@@ -2710,11 +2725,27 @@
       "key": "ui.title_art",
       "introduced_in": 16,
       "persistence": "remote",
-      "allowed_scopes": ["profile", "profile_device"],
-      "resolution_order": ["profile", "profile_device", "default"],
-      "value_schema": { "type": "boolean" },
+      "allowed_scopes": [
+        "profile",
+        "profile_device"
+      ],
+      "resolution_order": [
+        "profile",
+        "profile_device",
+        "default"
+      ],
+      "value_schema": {
+        "type": "boolean"
+      },
       "default_value": true,
-      "platforms": ["web", "ios", "tvos", "macos", "android", "android_tv"],
+      "platforms": [
+        "web",
+        "ios",
+        "tvos",
+        "macos",
+        "android",
+        "android_tv"
+      ],
       "category": "appearance",
       "label": "Show title art",
       "description": "Use a title's logo artwork as its name on detail pages when one is available. When off, the name is always shown as text.",

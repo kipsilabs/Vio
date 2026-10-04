@@ -6,11 +6,11 @@ import (
 	"fmt"
 	"sort"
 
+	"github.com/Silo-Server/silo-server/internal/settingskeys"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/Silo-Server/silo-server/internal/config"
 	"github.com/Silo-Server/silo-server/internal/secret"
-	"github.com/Silo-Server/silo-server/internal/settingskeys"
 )
 
 // SettingsStore is the read/write surface over server_settings shared by the
@@ -72,9 +72,12 @@ var SensitiveSettingKeys = map[string]bool{
 	"redis.sentinel_password": true,
 
 	// Metadata / list-provider API keys.
-	"tmdb.api_key":            true,
-	"mdblist.api_key":         true,
-	"introdb.api_key":         true,
+	"tmdb.api_key":    true, //nolint:goconst // Keep the audited allowlist readable as a contract.
+	"mdblist.api_key": true,
+	"introdb.api_key": true,
+	// Removed RemuxDB integration (rev 17): the key is deprecated and ignored
+	// at runtime, but stays encrypted/redacted so an old client write of a
+	// credential can never land in plaintext.
 	settingskeys.RemuxdbToken: true,
 
 	// Shared AI endpoint API keys (+ legacy subtitle_ai alias the loader still
