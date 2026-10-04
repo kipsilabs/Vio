@@ -3024,6 +3024,13 @@ func (h *PlaybackHandler) virtualExpectedRuntimeMinutes(ctx context.Context, fil
 // revalidation. bgCtx bounds the whole probe; the runtime-plausibility guard
 // and the probe-failure damper are applied here so both callers behave
 // identically.
+//
+// fence, when supplied, is re-checked after the blocking probe returns and
+// before any failure verdict, unpin, or catalog write. A caller whose work was
+// scheduled against a binding that another rotation superseded passes a fence
+// that reports false once the binding moves, so the stale probe neither indicts
+// the pin, releases it, nor persists evidence for a candidate the session no
+// longer serves. The newer rotation's own refresh re-probes the live candidate.
 func (h *PlaybackHandler) probeVirtualSourceAndPersist(
 	bgCtx context.Context,
 	stickyKey string,
@@ -3033,11 +3040,21 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersist(
 	probeCand VirtualPlaybackStream,
 	expectedRuntimeMinutes int,
 	ownerInstallationID int,
+	fence ...func() bool,
 ) {
 	probeKey := virtualProbeFailureKey(probeCand.URI, ownerInstallationID)
 	probeCtx, probeCancel := context.WithTimeout(bgCtx, virtualBackgroundProbeBudget)
 	probed, probeErr := h.probeVirtualSource(probeCtx, probeURL, &probeTransient, probeCand.RequestHeaders)
 	probeCancel()
+	// The probe (the last blocking call) can outlive the binding it was
+	// scheduled for. Re-check the fence before this probe touches shared state:
+	// a superseded verdict must not mark the damper, unpin the current
+	// candidate, or persist evidence onto a row the session no longer serves.
+	if len(fence) > 0 && fence[0] != nil && !fence[0]() {
+		slog.InfoContext(bgCtx, "virtual probe evidence dropped: candidate binding moved during the probe",
+			"component", "api", "candidate_uri", probeCand.URI, "file_id", catalogFile.ID)
+		return
+	}
 	if probeErr != nil || probed == nil {
 		virtualProbeFailures.mark(probeKey)
 		slog.WarnContext(bgCtx, "background virtual stream probe failed", "component", "api", "candidate_uri", probeCand.URI, "error", probeErr)

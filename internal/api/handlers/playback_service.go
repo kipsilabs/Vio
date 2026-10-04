@@ -1082,10 +1082,19 @@ func (h *PlaybackHandler) probeRotatedVirtualCandidate(ctx context.Context, sess
 	if err != nil || live == nil {
 		return false
 	}
-	if generation > 0 {
-		if current, ok := h.inventorySourceGeneration(session.ID); !ok || current != generation {
-			return false
+	// generationFence reports whether the binding this work was scheduled for is
+	// still current. It is re-checked after every blocking stage so a rotation
+	// that lands while the resolve or the probe runs cannot let the stale work
+	// authorize a selection, persist evidence, or release the pin.
+	generationFence := func() bool {
+		if generation == 0 {
+			return true
 		}
+		current, ok := h.inventorySourceGeneration(session.ID)
+		return ok && current == generation
+	}
+	if !generationFence() {
+		return false
 	}
 	if !isVirtualPlaybackFile(file) {
 		return false
@@ -1096,6 +1105,14 @@ func (h *PlaybackHandler) probeRotatedVirtualCandidate(ctx context.Context, sess
 	)
 	if cleanup != nil {
 		defer cleanup()
+	}
+	// The resolve (a provider round-trip) is the other blocking stage: a
+	// rotation that landed while it ran means this resolved URL names a
+	// superseded candidate. Drop it rather than probe or persist it.
+	if !generationFence() {
+		slog.InfoContext(ctx, "rotated virtual candidate re-resolve dropped: binding moved during resolution",
+			"component", "api", "session", live.ID, "virtual_uri", live.VirtualSourceURI)
+		return false
 	}
 	if resolveErr != nil {
 		slog.WarnContext(ctx, "rotated virtual candidate re-resolve failed",
@@ -1118,6 +1135,7 @@ func (h *PlaybackHandler) probeRotatedVirtualCandidate(ctx context.Context, sess
 		bestResultCacheKey(file.ContentID, virtualPlaybackNeutralKey(live.VirtualSourceURI), live.VirtualSourceOwnerInstallationID),
 		file, resolved.URL, probeTransient, probeCand,
 		h.virtualExpectedRuntimeMinutes(ctx, file), live.VirtualSourceOwnerInstallationID,
+		generationFence,
 	)
 	return true
 }
