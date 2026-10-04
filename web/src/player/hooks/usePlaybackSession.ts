@@ -170,6 +170,13 @@ interface DeferredPushBase {
   /** Local, monotonically increasing arrival order. */
   seq: number;
   /**
+   * The source-identity transition clock at arrival. A later external transition
+   * (a poll fold, or an adopted plan) raises the clock above this; a value still
+   * at or below it is the state the entry already saw at capture and is already
+   * represented by its `outgoing` baseline.
+   */
+  arrivalTransitionClock: number;
+  /**
    * Whether the wire shape named any source at all. An identity-less push
    * cannot be tied to an adoption, so it may not cross a session change the
    * way an identity-carrying one is allowed to.
@@ -180,6 +187,13 @@ interface DeferredPushBase {
   plan: PlanV3 | null;
   /** The live source identity in force at arrival (rotations included). */
   outgoing: SourceIdentity;
+  /**
+   * True when `outgoing` was itself produced by an earlier deferred source
+   * commit rather than by the settled plan or an external poll. Such a baseline
+   * is just the transport's previous move captured from the same queue, so it is
+   * not authority a newer source commit must answer to.
+   */
+  outgoingFromDeferredSource: boolean;
   /** The adoption generation (`loadSequence`) that owned the session. */
   generation: number;
   /** The session id at arrival. */
@@ -279,38 +293,117 @@ function identityNamesSameSource(a: SourceIdentity, b: SourceIdentity): boolean 
  * Whether it was replaced at all is decided first, because a refused plan is
  * still the pre-rotation plan and its URI would otherwise veto a legitimate
  * rotation. Against a replaced plan that names a candidate URI, that URI is the
- * only candidate it vouches for, and an exact match is retained however it
- * lines up with the outgoing source (a replacement can retain the effective
- * candidate).
+ * only candidate it vouches for, and an exact match is retained even when the
+ * live outgoing source names a different candidate (a replacement can retain
+ * the effective candidate) — so a replaced URI-ful winner is decided by exact
+ * identity *before* any ambiguity guard, or an outgoing candidate the session
+ * was leaving would veto the plan the server just selected.
  *
- * When the replaced plan is URI-less (the v2 wire omits the candidate) it
- * cannot prove which of two same-file candidates it owns, so file equality is
- * never proof. A `source_committed` naming a different file than the live
- * outgoing source is the only rotation that can be adopted, and it must land on
- * the plan's own file. When the plan was refused rather than replaced, a push
- * that still names the live source is the same source and is kept — the source
- * never moved — while a source commit naming another file is a rotation the
- * transport already made and is kept too.
+ * When the replaced plan is URI-less (the v2 wire omits the candidate) file
+ * equality is still the only key the wire offers, so a candidate-bearing push
+ * naming the plan's own file is admitted — the payload routinely carries the
+ * candidate the plan omits, and refusing it would leave the track menus stale
+ * for the whole session. A URI-only push (no file id) cannot be tied to the
+ * settled file by itself; it is admitted only when the arrival-time live source
+ * was already on the winner's file, which corroborates that the candidate
+ * belongs to the adoption the flush kept. Otherwise the push may be inventory
+ * for the file the session was leaving, and folding it would inherit an
+ * unrelated replacement file.
+ *
+ * A same-file source the plan cannot resolve stays refused whenever a concrete
+ * candidate is already current on that file: a file-only push under any
+ * concrete candidate, and a concrete push whose URI disagrees with one. That is
+ * checked against two baselines — `outgoing`, the live source captured when the
+ * push arrived, and `applied`, the identity the menus carry when the flush runs
+ * — because a poll bypasses the adoption barrier and can fold a concrete
+ * candidate after the push was queued, including when the plan is later refused
+ * rather than replaced.
+ *
+ * A URI-bearing source commit is the transport's own move, so arrival order
+ * decides among the queue's own commits: when such a commit supersedes a
+ * previous deferred source commit, `outgoingSuperseded` drops that queue-produced
+ * `outgoing` baseline. It does not license the commit to overwrite external
+ * state: a candidate a poll applied after the entry was queued is newer than the
+ * commit and stays authoritative. `appliedPollNewer` carries that candidate — the
+ * menus may have moved on since — and is checked as an extra baseline. A
+ * candidate the menus carried before the entry was queued is either the arrival
+ * state already captured by `outgoing`, or a sibling the arrival collision
+ * already rejects, so it is not re-checked.
+ *
+ * When the plan was refused rather than replaced, the live source is the
+ * authority and `allowRotation` decides whether a cross-file source commit may
+ * move it: a push that still names the live source is kept — the source never
+ * moved — while a source commit naming another file is a rotation the transport
+ * already made and is kept too.
  */
 function deferredIdentityIsAdmissible(
   identity: SourceIdentity,
   plan: PlanV3,
   arrivalPlan: PlanV3 | null,
   outgoing: SourceIdentity,
+  applied: SourceIdentity,
   allowRotation: boolean,
+  /**
+   * The concrete candidate a poll applied *after* this entry was queued, or null
+   * when none did. A URI-bearing source commit is judged by arrival order against
+   * its own queue, but this state is newer than the commit and still vetoes it.
+   */
+  appliedPollNewer: SourceIdentity | null,
+  outgoingSuperseded = false,
 ): boolean {
   if (!identityNamesSource(identity)) return false;
 
   // Whether the settled plan is a different adoption or the byte-for-byte
-  // arrival plan. This must be decided before the winner's URI is consulted: a
-  // refused plan still names the pre-rotation source, so its URI must not veto
-  // a rotation the transport already committed to.
-  if (!planWasReplaced(arrivalPlan, plan)) {
-    // The plan was refused, not replaced. The live source is authoritative: a
-    // push that names it exactly is a same-source update, and a source commit
-    // may also prove the transport rotated to another file. The refused plan's
-    // own URI describes the source before that rotation, so it is not applied
-    // as authority here.
+  // arrival plan. A refused plan still names the pre-rotation source, so its
+  // URI must not veto a rotation the transport already committed to.
+  const replaced = planWasReplaced(arrivalPlan, plan);
+
+  // The winner was replaced and names a concrete candidate: its URI is the only
+  // candidate it vouches for, and an exact match wins outright. This must be
+  // decided before the collision guards below, which would otherwise let the
+  // outgoing candidate the session was leaving veto the explicitly winning plan.
+  if (replaced && plan.effective_virtual_uri != null) {
+    return identityMatchesPlan(identity, plan);
+  }
+
+  // A concrete candidate already current on the push's file is authority the
+  // push cannot outweigh: a file-only push carries no candidate, and a push
+  // naming a different candidate is a sibling collision. A cross-file baseline
+  // is a different source and does not apply.
+  //
+  // A URI-bearing source commit is the transport's own move, so arrival order
+  // decides among the queue's own commits: `outgoingSuperseded` drops the
+  // queue-produced `outgoing` baseline of an earlier deferred source commit. The
+  // live `outgoing` baseline is still consulted — it is the source the transport
+  // was on at arrival, and a differing concrete candidate on the same file is a
+  // real collision. What arrival order does *not* license is overwriting a
+  // candidate a poll folded *after* the entry was queued: that `appliedPollNewer`
+  // state is newer than the commit, so it is added as a veto even for a commit.
+  // An older applied candidate predates the entry and is either the arrival state
+  // already captured by `outgoing` or a sibling the arrival collision already
+  // rejects, so it is not re-checked.
+  const judgedByArrival = allowRotation && identity.uri != null;
+  const baselines: SourceIdentity[] = [outgoing];
+  if (!judgedByArrival) baselines.push(applied);
+  else if (appliedPollNewer != null) baselines.push(appliedPollNewer);
+  for (const baseline of baselines) {
+    if (outgoingSuperseded && baseline === outgoing) continue;
+    if (baseline.uri == null) continue;
+    // An unknown file on either side is treated as the same file: neither can
+    // prove a different source, so a differing concrete URI is a collision.
+    const sameFile =
+      baseline.fileId == null || identity.fileId == null || baseline.fileId === identity.fileId;
+    if (!sameFile) continue;
+    if (identity.uri == null || identity.uri !== baseline.uri) return false;
+  }
+
+  // The plan was refused, not replaced. `allowRotation` applies to this branch
+  // only; the replaced-plan branches decide from the winner.
+  if (!replaced) {
+    // The live source is authoritative: a push that names it exactly is a
+    // same-source update, and a source commit may also prove the transport
+    // rotated to another file. The refused plan's own URI describes the source
+    // before that rotation, so it is not applied as authority here.
     if (identityNamesSameSource(identity, outgoing)) return true;
     return (
       allowRotation &&
@@ -319,20 +412,17 @@ function deferredIdentityIsAdmissible(
     );
   }
 
-  // The plan was replaced and won. When it names a candidate URI, that URI is
-  // the only candidate it vouches for, and an exact match is retained however
-  // it lines up with the outgoing source (a replacement can retain the
-  // effective candidate).
-  if (plan.effective_virtual_uri != null) return identityMatchesPlan(identity, plan);
-  // A URI-only push cannot be tied to the URI-less plan's file.
-  if (identity.fileId == null) return false;
-
-  // The URI-less winner cannot prove same-file ownership: a different file
-  // than the live outgoing is the only evidence that can outweigh the plan's
-  // candidate silence, and only a source commit carries it.
-  if (!allowRotation) return false;
-  if (outgoing.fileId != null && identity.fileId === outgoing.fileId) return false;
-  return identity.fileId === plan.effective_media_file_id;
+  // The winner is URI-less. The baseline loop above already refused a same-file
+  // collision, so a push naming the plan's own file is admitted; a push naming
+  // another file is a rotation the URI-less plan cannot vouch for.
+  if (identity.fileId != null) {
+    return identity.fileId === plan.effective_media_file_id;
+  }
+  // A URI-only push offers no file key. Admit it only when the arrival-time live
+  // source was on the winner's file, which ties the candidate to the settled
+  // adoption; otherwise it may belong to the file being replaced and must wait
+  // for a current-source refresh instead of inheriting the replacement's id.
+  return outgoing.fileId != null && outgoing.fileId === plan.effective_media_file_id;
 }
 
 /** A start body plus the optional force-relink flag the retry path adds. */
@@ -760,6 +850,25 @@ export function usePlaybackSession(
     fileId: state.mediaFileId,
     uri: state.effectiveVirtualUri,
   });
+  // The identity the most recent deferred source commit moved the live mirror
+  // to, when nothing external has transitioned it since. A later deferred source
+  // commit must not treat its own predecessor from the same queue as an
+  // authority to answer to, while a poll fold is external and stays
+  // authoritative; `transitionSourceIdentity` clears this on every such fold.
+  const lastDeferredSourceIdentityRef = useRef<SourceIdentity | null>(null);
+  // A monotonic clock raised on every *external* source-identity transition (a
+  // poll fold or an adopted plan), never by the deferred queue's own replay. A
+  // deferred push records the clock at arrival; a later poll fold raises it, so
+  // the flush can tell a candidate folded after the entry was queued from one
+  // the menus already carried at capture. See `captureDeferredPush`.
+  const identityTransitionClockRef = useRef(0);
+  // The live candidate a poll folded on the last external transition, with the
+  // clock reading of that transition. Between an entry's arrival and its flush a
+  // poll can move the menus to a candidate, and the winning plan's own adoption
+  // can then overwrite the menu mirror before the flush runs. Remembering the
+  // poll's candidate lets the flush veto a stale commit that would otherwise
+  // overwrite it; the clock says whether the fold was newer than the entry.
+  const lastPollAppliedRef = useRef<{ clock: number; identity: SourceIdentity } | null>(null);
   // The identity the menus render, mirrored outside the state updater. A poll
   // or rotation can fold before React has processed an earlier push in the same
   // tick, so the next transition is computed against this synchronous mirror;
@@ -921,23 +1030,38 @@ export function usePlaybackSession(
       menuIdentityRef.current = { fileId, uri };
       // A fold of the menu identity is also a commit of the live source, so the
       // outgoing baseline for the next rotation follows it. A deferred push
-      // moves the live mirror separately in `captureDeferredPush`.
+      // moves the live mirror separately in `captureDeferredPush`. Any external
+      // transition supersedes the last deferred source commit, so it is no
+      // longer a baseline a later queued commit may ignore.
       liveSourceIdentityRef.current = { fileId, uri };
+      lastDeferredSourceIdentityRef.current = null;
+      identityTransitionClockRef.current += 1;
       return changed;
     },
     [],
   );
 
   /**
+   * Records a candidate a catalog poll folded, with the transition clock of the
+   * fold. `deferredIdentityIsAdmissible` consults it so a source commit queued
+   * before the poll cannot overwrite the poll's newer candidate, even after the
+   * winning plan's own adoption has since overwritten the menu mirror.
+   */
+  const recordPollApplied = useCallback((identity: SourceIdentity) => {
+    lastPollAppliedRef.current = { clock: identityTransitionClockRef.current, identity };
+  }, []);
+
+  /**
    * The revision bookkeeping scope for the current session generation.
    *
    * A revision is the server's opaque digest of the whole inventory *and* the
-   * effective source it describes, so within one session a redelivery is the
-   * same payload and folding it twice is wrong — including a redelivery of a
-   * revision the flush refused. The scope is keyed by the load generation and
-   * resets only when that moves; an identity rotation must not clear it, or a
-   * redelivered file-only rejection would fold once a later source moved the
-   * menu.
+   * effective source it describes, so within one session redelivering a revision
+   * that was already folded is the same payload and folding it twice is wrong.
+   * Only genuinely applied revisions are recorded; a revision the flush refused
+   * is deliberately left unrecorded, so a redelivery that the plan (or a later
+   * rotation) vouches for still folds. The scope is keyed by the load generation
+   * and resets only when that moves; an identity rotation must not clear it, or a
+   * revision folded before the rotation would fold again once the source moved.
    */
   const revisionScopeRef = useRef<{ generation: number; revisions: Set<string> }>({
     generation: -1,
@@ -2179,7 +2303,14 @@ export function usePlaybackSession(
       // the live source changed, so the menu must follow it. Commit the
       // transition synchronously and outside the updater; the revision scope is
       // generation-keyed and is deliberately not cleared here.
-      if (identityChanged) transitionSourceIdentity(nextFileId, nextUri);
+      if (identityChanged) {
+        transitionSourceIdentity(nextFileId, nextUri);
+        // A catalog poll is external state. Record the candidate it moved to,
+        // with the transition clock, so a deferred source commit queued before
+        // this fold cannot overwrite it even if a later plan adoption replaces
+        // the menu mirror before the flush runs.
+        recordPollApplied({ fileId: nextFileId, uri: nextUri });
+      }
       setState((current) => {
         if (identityChanged) {
           return {
@@ -2209,7 +2340,7 @@ export function usePlaybackSession(
         };
       });
     },
-    [transitionSourceIdentity],
+    [recordPollApplied, transitionSourceIdentity],
   );
 
   const foldCommittedSource = useCallback(
@@ -2271,12 +2402,18 @@ export function usePlaybackSession(
    */
   const captureDeferredPush = useCallback((input: DeferredPushInput) => {
     const live = liveSourceIdentityRef.current;
+    const lastDeferredSource = lastDeferredSourceIdentityRef.current;
     const base: DeferredPushBase = {
       seq: deferredPushSeqRef.current++,
+      arrivalTransitionClock: identityTransitionClockRef.current,
       hasIdentity: identityNamesSource(input.identity),
       identity: input.identity,
       plan: planRef.current,
       outgoing: { fileId: live.fileId, uri: live.uri },
+      outgoingFromDeferredSource:
+        lastDeferredSource != null &&
+        lastDeferredSource.fileId === live.fileId &&
+        lastDeferredSource.uri === live.uri,
       generation: loadSequenceRef.current,
       sessionId: sessionIdRef.current,
     };
@@ -2298,6 +2435,7 @@ export function usePlaybackSession(
         fileId: input.identity.fileId ?? live.fileId,
         uri: input.identity.uri ?? live.uri,
       };
+      lastDeferredSourceIdentityRef.current = liveSourceIdentityRef.current;
     }
   }, []);
 
@@ -2494,6 +2632,19 @@ export function usePlaybackSession(
       ) {
         return;
       }
+      // A file-only push cannot be tied to a candidate. When the live source
+      // already names a concrete candidate on that same file, the file alone is
+      // not proof of ownership and must not re-key the menus under that
+      // candidate. This mirrors `deferredIdentityIsAdmissible` so a refused
+      // file-only revision cannot slip back in through the direct path.
+      if (
+        payload.effective_media_file_id != null &&
+        payload.effective_virtual_uri == null &&
+        liveIdentity.uri != null &&
+        payload.effective_media_file_id === liveIdentity.fileId
+      ) {
+        return;
+      }
       foldInventoryUpdate(payload);
     },
     [captureDeferredPush, foldInventoryUpdate],
@@ -2508,8 +2659,10 @@ export function usePlaybackSession(
    * the replacement plan lands rather than being lost. The queue is replayed in
    * arrival order. The settled plan is the adoption that won: a push captured
    * under another adoption generation or session is dropped, and a push whose
-   * identity the plan cannot vouch for is dropped. A stale inventory revision
-   * still marks itself folded so a later re-delivery does not re-open the menus.
+   * identity the plan cannot vouch for is dropped. A refused inventory revision
+   * is left unrecorded, so a redelivery that the plan (or a later rotation) does
+   * vouch for still folds; a genuinely applied revision is recorded by the fold
+   * itself, so duplicate deliveries remain no-ops.
    */
   const flushDeferredPushes = useCallback(() => {
     // A start/replan owns the session while its adoption is in flight, and a
@@ -2528,20 +2681,25 @@ export function usePlaybackSession(
     const queue = deferredPushesRef.current.slice().sort((a, b) => a.seq - b.seq);
     if (queue.length === 0) return;
     deferredPushesRef.current = [];
-    const markRevisionFolded = (entry: DeferredPush) => {
-      // The settled plan is authoritative and its own inventory is on screen;
-      // mark a stale revision as folded so a re-delivery is a no-op. Every
-      // rejection path runs this so bookkeeping does not depend on which
-      // identity check happened to discard the entry. Recording it here does
-      // not fold the push; it only remembers that this generation has handled
-      // the revision, so a redelivered file-only rejection cannot fold later.
-      if (entry.kind === "inventory" && entry.payload.inventory_revision != null) {
-        inventoryRevisionRef.current = entry.payload.inventory_revision;
-        syncRevisionScope().revisions.add(entry.payload.inventory_revision);
-      }
+    // The identity the menus carry when the flush starts. It captures movements
+    // an outside push made while these entries waited (a poll folds without the
+    // adoption barrier); it is snapshotted once so the entries replayed below do
+    // not become a veto baseline for each other, which would invert arrival
+    // order when two concrete candidates are queued.
+    const appliedIdentity = menuIdentityRef.current;
+    const handleRefusedPush = (entry: DeferredPush) => {
       // A deferred source commit had moved the live baseline when it was
       // captured. If nothing later moved it on, put it back on the winning plan
       // so a source the flush just refused is not left recorded as live.
+      //
+      // A refused inventory revision is deliberately *not* recorded as folded:
+      // the refusal is a statement about this flush's settled plan, not about
+      // the revision, and the identity can move later in the same generation
+      // (a rotation onto a candidate the revision names). Recording it here
+      // would swallow the redelivery that finally matches, leaving the menus
+      // stale for the rest of the session. Only a genuinely applied revision is
+      // recorded, by `foldInventoryUpdate`, so duplicates of applied revisions
+      // stay suppressed while a refused one can still apply once it matches.
       if (
         entry.kind === "source" &&
         identityNamesSameSource(liveSourceIdentityRef.current, entry.identity)
@@ -2550,6 +2708,7 @@ export function usePlaybackSession(
           fileId: plan.effective_media_file_id,
           uri: plan.effective_virtual_uri ?? null,
         };
+        lastDeferredSourceIdentityRef.current = null;
       }
     };
     for (const entry of queue) {
@@ -2568,20 +2727,34 @@ export function usePlaybackSession(
       ) {
         continue;
       }
-      // The settled plan is the only authority. Its own identity wins over the
-      // outgoing one (a replacement may retain the effective candidate); when
-      // it cannot prove which same-file candidate it owns, the outgoing
-      // identity is never folded and file equality is not proof.
+      // The settled plan is the primary authority. When it names a candidate
+      // URI, that URI wins over the outgoing one (a replacement may retain the
+      // effective candidate) and an exact match is kept. When it is URI-less,
+      // the push's own file is the key, except for a same-file source the plan
+      // cannot resolve. `appliedIdentity` is the menu identity at flush start, so
+      // a push deferred before a poll folded a concrete candidate cannot
+      // overwrite it. A URI-bearing source commit is judged by arrival order, but
+      // only against state older than it: a poll that folded a candidate after
+      // this entry was queued is external and newer and still vetoes the commit.
+      // See deferredIdentityIsAdmissible.
+      const pollApplied = lastPollAppliedRef.current;
+      const appliedPollNewer =
+        pollApplied != null && pollApplied.clock > entry.arrivalTransitionClock
+          ? pollApplied.identity
+          : null;
       if (
         !deferredIdentityIsAdmissible(
           entry.identity,
           plan,
           entry.plan,
           entry.outgoing,
+          appliedIdentity,
           entry.kind === "source",
+          appliedPollNewer,
+          entry.kind === "source" && entry.outgoingFromDeferredSource,
         )
       ) {
-        markRevisionFolded(entry);
+        handleRefusedPush(entry);
         continue;
       }
       if (entry.kind === "source") {
@@ -2590,7 +2763,7 @@ export function usePlaybackSession(
         foldInventoryUpdate(entry.payload);
       }
     }
-  }, [foldCommittedSource, foldInventoryUpdate, syncRevisionScope]);
+  }, [foldCommittedSource, foldInventoryUpdate]);
   flushDeferredPushesRef.current = flushDeferredPushes;
 
   const updatePlaybackState = useCallback((positionSeconds: number, playing: boolean) => {
