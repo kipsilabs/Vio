@@ -417,8 +417,8 @@ func TestProbeRotatedVirtualCandidateRaceDoesNotPersistStaleEvidence(t *testing.
 			if err != nil {
 				t.Fatalf("GetSession A: %v", err)
 			}
-			generationA, ok := h.inventorySourceGeneration(session.ID)
-			if !ok {
+			generationA, genErr := mgr.VirtualSourceGeneration(session.ID)
+			if genErr != nil {
 				t.Fatal("session manager did not expose a binding generation")
 			}
 			fileA := &models.MediaFile{ID: 42, ContentID: "movie-rot-race", FilePath: uriA, Container: "virtual", VirtualOwnerInstallationID: 5}
