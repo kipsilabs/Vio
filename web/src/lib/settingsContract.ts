@@ -9,7 +9,7 @@
  */
 
 export const SETTINGS_API_VERSION = 1;
-export const SETTINGS_REVISION = 16;
+export const SETTINGS_REVISION = 17;
 
 export interface SettingSuggestedOption {
   value: string;
@@ -1179,6 +1179,7 @@ export const SETTING_DEFINITIONS: Record<SettingKey, SettingDefinition> = {
     nullable: false,
     persistence: "remote",
     introducedIn: 9,
+    deprecated: true,
     scopes: ["account"],
     scopeIntroducedIn: [9],
     resolutionOrder: ["account", "default"],
@@ -1194,6 +1195,7 @@ export const SETTING_DEFINITIONS: Record<SettingKey, SettingDefinition> = {
     nullable: false,
     persistence: "remote",
     introducedIn: 9,
+    deprecated: true,
     scopes: ["account"],
     scopeIntroducedIn: [9],
     resolutionOrder: ["account", "default"],
@@ -1209,6 +1211,7 @@ export const SETTING_DEFINITIONS: Record<SettingKey, SettingDefinition> = {
     nullable: false,
     persistence: "remote",
     introducedIn: 9,
+    deprecated: true,
     scopes: ["account"],
     scopeIntroducedIn: [9],
     resolutionOrder: ["account", "default"],
@@ -1224,6 +1227,7 @@ export const SETTING_DEFINITIONS: Record<SettingKey, SettingDefinition> = {
     nullable: false,
     persistence: "remote",
     introducedIn: 9,
+    deprecated: true,
     scopes: ["account"],
     scopeIntroducedIn: [9],
     resolutionOrder: ["account", "default"],

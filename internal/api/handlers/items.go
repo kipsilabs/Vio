@@ -117,6 +117,34 @@ type ItemsHandler struct {
 	AccessGroups             access.GroupPolicyProvider // optional; resolves inherited library access when no scope is in context
 	MarkerPopulation         MarkerPopulationService
 	MarkerFileResolver       FilePathResolver
+	// VirtualPrefetcher warms virtual candidate listings when a watch detail
+	// is viewed, so the later playback start finds a warm BestResultCache.
+	// Nil disables prefetch. Set via SetVirtualPrefetcher.
+	virtualPrefetcher VirtualPrefetcher
+	// VirtualFileByID loads a MediaFile for a version FileID so prefetch can
+	// warm exactly the rows the detail page offers. Nil disables prefetch.
+	virtualFileByID VirtualFileByID
+}
+
+// VirtualPrefetcher warms virtual playback listings off the click path.
+// Satisfied by *PlaybackHandler.PrefetchVirtualPlayback.
+type VirtualPrefetcher interface {
+	PrefetchVirtualPlayback(ctx context.Context, files []*models.MediaFile, profileID string)
+}
+
+// VirtualFileByID loads one media file row for prefetch warming.
+type VirtualFileByID interface {
+	GetByID(ctx context.Context, id int) (*models.MediaFile, error)
+}
+
+// SetVirtualPrefetcher wires watch-detail prefetch. Either arg may be nil to
+// keep prefetch disabled.
+func (h *ItemsHandler) SetVirtualPrefetcher(p VirtualPrefetcher, files VirtualFileByID) {
+	if h == nil {
+		return
+	}
+	h.virtualPrefetcher = p
+	h.virtualFileByID = files
 }
 
 // NewItemsHandler creates a new ItemsHandler.
@@ -532,7 +560,62 @@ func (h *ItemsHandler) HandleGetWatchDetail(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	h.prefetchWatchDetailVirtual(r.Context(), detail, requestProfileID(r))
 	writeJSON(w, http.StatusOK, detail)
+}
+
+// prefetchWatchDetailVirtual warms virtual candidate listings for the rows a
+// watch detail offers, off the playback click path. Fire-and-forget:
+// PrefetchVirtualPlayback is already bounded (2 files), deduped, and runs on
+// a detached worker pool, so this never blocks the detail response. Only the
+// first virtual version is warmed; the start path ranks per device from the
+// neutral cache entry.
+func (h *ItemsHandler) prefetchWatchDetailVirtual(ctx context.Context, detail *catalog.WatchDetail, profileID string) {
+	if h == nil || h.virtualPrefetcher == nil || h.virtualFileByID == nil || detail == nil || profileID == "" {
+		return
+	}
+	if detail.Type != itemTypeMovie && detail.Type != itemTypeEpisode {
+		return
+	}
+	fileIDs := make([]int, 0, 2)
+	seen := make(map[int]bool)
+	for _, v := range detail.Versions {
+		if v.FileID != 0 && !seen[v.FileID] {
+			seen[v.FileID] = true
+			fileIDs = append(fileIDs, v.FileID)
+		}
+		if len(fileIDs) >= 2 {
+			break
+		}
+	}
+	if len(fileIDs) == 0 {
+		return
+	}
+	// Row loads run off the response path: the detail response must not wait
+	// on database reads for an optional warm. A short timeout bounds the
+	// background load; PrefetchVirtualPlayback itself is already bounded
+	// (2 files), deduped, and detached.
+	prefetcher := h.virtualPrefetcher
+	loader := h.virtualFileByID
+	go func() {
+		// WithoutCancel keeps request values (user ID for PrefetchVirtualPlayback)
+		// while detaching from request cancellation; the timeout still bounds
+		// the background load.
+		loadCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		files := make([]*models.MediaFile, 0, len(fileIDs))
+		for _, fid := range fileIDs {
+			f, err := loader.GetByID(loadCtx, fid)
+			if err != nil || f == nil || !isVirtualPlaybackFile(f) {
+				continue
+			}
+			files = append(files, f)
+		}
+		if len(files) == 0 {
+			return
+		}
+		prefetcher.PrefetchVirtualPlayback(loadCtx, files, profileID)
+	}()
 }
 
 // trailerRefreshRate bounds how often one user may trigger trailer fetches

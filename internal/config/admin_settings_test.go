@@ -36,15 +36,6 @@ func TestEffectiveAdminSettingsUsesRuntimeDefaults(t *testing.T) {
 	if got := effective["custom.setting"]; got != "kept" {
 		t.Fatalf("custom.setting = %q, want kept", got)
 	}
-	if got := effective["remuxdb.enabled"]; got != "false" {
-		t.Fatalf("remuxdb.enabled = %q, want false", got)
-	}
-	if got := effective["remuxdb.base_url"]; got != "https://remuxdb.1632022.xyz" {
-		t.Fatalf("remuxdb.base_url = %q, want default URL", got)
-	}
-	if got := effective["remuxdb.submit_enabled"]; got != "false" {
-		t.Fatalf("remuxdb.submit_enabled = %q, want false", got)
-	}
 }
 
 func TestEffectiveAdminSettingsMarkerDefaultsPreserveExplicitModes(t *testing.T) {
@@ -293,10 +284,6 @@ func TestNormalizeAdminSettingRejectsInvalidValues(t *testing.T) {
 		{key: "opslog.capture_level", value: "chatty"},
 		{key: "s3.metadata_presign_expiry", value: "0s"},
 		{key: "recommendations.embeddings_job_timeout", value: "soon"},
-		{key: "remuxdb.enabled", value: "maybe"},
-		{key: "remuxdb.submit_enabled", value: "sure"},
-		{key: "remuxdb.base_url", value: "not-a-valid-url"},
-		{key: "remuxdb.base_url", value: "ftp://remuxdb.example.com"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.key, func(t *testing.T) {
