@@ -72,7 +72,7 @@ var SensitiveSettingKeys = map[string]bool{
 	"redis.sentinel_password": true,
 
 	// Metadata / list-provider API keys.
-	"tmdb.api_key":    true,
+	"tmdb.api_key":    true, //nolint:goconst // Keep the audited allowlist readable as a contract.
 	"mdblist.api_key": true,
 	"introdb.api_key": true,
 	// Removed RemuxDB integration (rev 17): the key is deprecated and ignored

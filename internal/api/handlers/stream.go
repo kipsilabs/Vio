@@ -1369,7 +1369,7 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 					}
 					if res.StatusCode >= http.StatusInternalServerError {
 						relayTemporary = remotestream.RelayTemporaryFailure(res)
-						return &relayUpstreamError{StatusCode: res.StatusCode}
+						return fmt.Errorf("relay returned HTTP %d", res.StatusCode)
 					}
 					return nil
 				},
@@ -1572,12 +1572,7 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 					h.handleTransportStartFailure(r.Context(), session, file, lastProxyErr)
 					if streamWriter.StatusCode() == 0 {
 						logVirtualStreamFailure(r.Context(), sessionID, file, lastProxyErr)
-						status := http.StatusBadGateway
-						var upstream *relayUpstreamError
-						if errors.As(lastProxyErr, &upstream) && upstream.StatusCode >= 500 && upstream.StatusCode <= 599 {
-							status = upstream.StatusCode
-						}
-						writeErrorCause(streamWriter, status, "virtual_stream_unavailable", "Failed to stream virtual media source", lastProxyErr)
+						writeErrorCause(streamWriter, http.StatusBadGateway, "virtual_stream_unavailable", "Failed to stream virtual media source", lastProxyErr)
 					}
 				}
 			}
