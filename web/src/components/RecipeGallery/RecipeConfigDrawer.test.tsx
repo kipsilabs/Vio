@@ -115,22 +115,30 @@ describe("RecipeConfigDrawer", () => {
     expect(screen.queryByRole("button", { name: "Libraries" })).toBeNull();
   });
 
-  it("requires a collection before submitting collection presets", async () => {
+  // The server refuses new Trakt-backed rows, so a preset naming Trakt as its
+  // source gets no exception: it needs a collection like any other.
+  it.each([
+    ["a collection preset", { library_collection_id: "" }],
+    [
+      "a preset naming Trakt as its source",
+      {
+        library_collection_id: "",
+        source_provider: "trakt",
+        source_preset: "trending",
+        media_type: "movie",
+      },
+    ],
+  ])("requires a collection before submitting %s", async (_name, defaultParams) => {
     const collectionDef = {
       ...def,
       type: "collection",
       presets: [
         {
-          key: "trakt_recommended_shows",
-          display_name: "Trakt Recommended Shows",
-          icon: "🎯",
-          description_short: "Recommended shows",
-          default_params: {
-            library_collection_id: "",
-            source_provider: "trakt",
-            source_preset: "recommended",
-            media_type: "tv",
-          },
+          key: "picked_collection",
+          display_name: "Picked Collection",
+          icon: "📚",
+          description_short: "A collection",
+          default_params: defaultParams,
         },
       ],
     };
@@ -147,57 +155,12 @@ describe("RecipeConfigDrawer", () => {
 
     const addButton = screen.getByRole("button", { name: /add section/i });
     expect(addButton).toBeDisabled();
-    expect(screen.getByText(/choose a synced collection/i)).toBeInTheDocument();
-    expect(screen.getByText(/no synced trakt recommended shows collection/i)).toBeInTheDocument();
+    expect(screen.getByText("Choose a collection before adding this section.")).toBeInTheDocument();
+    expect(screen.getByText("Collection")).toBeInTheDocument();
+    expect(screen.queryByText(/created automatically/i)).not.toBeInTheDocument();
 
     await userEvent.click(addButton);
     expect(onAdd).not.toHaveBeenCalled();
-  });
-
-  it("hides the collection picker for auto-backed Trakt public presets", async () => {
-    const collectionDef = {
-      ...def,
-      type: "collection",
-      presets: [
-        {
-          key: "trakt_trending_movies",
-          display_name: "Trakt Trending Movies",
-          icon: "📈",
-          description_short: "Trending movies",
-          default_params: {
-            library_collection_id: "",
-            source_provider: "trakt",
-            source_preset: "trending",
-            media_type: "movie",
-          },
-        },
-      ],
-    };
-    const onAdd = vi.fn();
-
-    render(
-      <RecipeConfigDrawer
-        def={collectionDef}
-        preset={collectionDef.presets[0]!}
-        onCancel={() => {}}
-        onAdd={onAdd}
-      />,
-    );
-
-    expect(screen.queryByText(/^Collection$/i)).not.toBeInTheDocument();
-    expect(screen.getByText(/will be created automatically/i)).toBeInTheDocument();
-
-    await userEvent.click(screen.getByRole("button", { name: /add section/i }));
-    expect(onAdd).toHaveBeenCalledWith(
-      expect.objectContaining({
-        title: "Trakt Trending Movies",
-        config: expect.objectContaining({
-          source_provider: "trakt",
-          source_preset: "trending",
-          media_type: "movie",
-        }),
-      }),
-    );
   });
 
   it("delegates manually selected bulk libraries to onAdd", async () => {

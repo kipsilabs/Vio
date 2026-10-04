@@ -59,12 +59,7 @@ export default function RecipeConfigDrawer({
   const userCollectionID =
     typeof params.user_collection_id === "string" ? params.user_collection_id : "";
   const collectionID = libraryCollectionID || userCollectionID;
-  const isAutoBackedTraktPreset =
-    def.type === "collection" &&
-    params.source_provider === "trakt" &&
-    (params.source_preset === "trending" || params.source_preset === "popular");
-  const collectionMissing =
-    def.type === "collection" && collectionID.trim() === "" && !isAutoBackedTraktPreset;
+  const collectionMissing = def.type === "collection" && collectionID.trim() === "";
   const curatedListEmpty =
     def.type === "admin_curated_list" &&
     (!Array.isArray(params.item_ids) || params.item_ids.length === 0);
@@ -138,7 +133,7 @@ export default function RecipeConfigDrawer({
 
       {collectionMissing ? (
         <p className="mt-2 text-xs text-amber-300">
-          Choose a synced collection before adding this section.
+          Choose a collection before adding this section.
         </p>
       ) : null}
 

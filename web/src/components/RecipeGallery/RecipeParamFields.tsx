@@ -680,39 +680,12 @@ function CollectionParamField({
   const libraryID = (params.library_collection_id as string) ?? "";
   const userID = (params.user_collection_id as string) ?? "";
   const value = userID || libraryID;
-  const sourceProvider = typeof params.source_provider === "string" ? params.source_provider : "";
-  const sourcePreset = typeof params.source_preset === "string" ? params.source_preset : "";
-  const mediaType = typeof params.media_type === "string" ? params.media_type : "";
-  const isTraktPreset = sourceProvider === "trakt";
-  const isAutoBackedTraktPreset =
-    isTraktPreset && (sourcePreset === "trending" || sourcePreset === "popular");
-  const collectionOptions = isTraktPreset
-    ? collections.filter((collection) => {
-        if (collection.source !== "library" || collection.collection_type !== "trakt") {
-          return false;
-        }
-        const sourceConfig = collection.source_config;
-        if (!sourceConfig || typeof sourceConfig !== "object" || Array.isArray(sourceConfig)) {
-          return false;
-        }
-        return sourceConfig.preset === sourcePreset && sourceConfig.media_type === mediaType;
-      })
-    : collections;
-
-  if (isAutoBackedTraktPreset && !value) {
-    return (
-      <p className="text-xs text-white/50">
-        A synced Trakt {sourcePreset} {mediaType === "tv" ? "shows" : "movies"} collection will be
-        created automatically.
-      </p>
-    );
-  }
 
   return (
     <div className="space-y-1">
       <span className="block text-xs text-white/70">Collection</span>
       <CollectionSearchableSelect
-        options={collectionOptions}
+        options={collections}
         value={value}
         onChange={(next) => {
           // Pick the right param key based on the chosen collection's source.
@@ -721,7 +694,7 @@ function CollectionParamField({
             onChange({ ...params, library_collection_id: "", user_collection_id: "" });
             return;
           }
-          const picked = collectionOptions.find((c) => c.id === next);
+          const picked = collections.find((c) => c.id === next);
           if (picked?.source === "user") {
             onChange({ ...params, library_collection_id: "", user_collection_id: next });
           } else {
@@ -731,12 +704,6 @@ function CollectionParamField({
         disabled={isLoading}
         isLoading={isLoading}
       />
-      {isTraktPreset && !isLoading && collectionOptions.length === 0 ? (
-        <p className="text-xs text-amber-300">
-          No synced Trakt {sourcePreset} {mediaType === "tv" ? "shows" : "movies"} collection was
-          found. Create and sync one from Admin Collections first.
-        </p>
-      ) : null}
     </div>
   );
 }
