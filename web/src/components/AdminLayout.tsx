@@ -170,12 +170,16 @@ export default function AdminLayout() {
       {/* `lg:pt-16` starts the content below the fixed Search/activity
           controls (top-5, h-9 → they end 3.5rem down). With less, a page
           header's right-aligned buttons sit underneath them until the capped
-          content column pulls away from the viewport's right edge. */}
+          content column pulls away from the viewport's right edge.
+          `--main-inset-bottom` tells fixed page chrome (the collection editor's
+          save bar) how far to rise to clear the background playback bar. */}
       <main
         id="main-content"
         tabIndex={-1}
         className={`relative z-10 min-h-screen min-w-0 px-4 py-4 sm:px-6 lg:ml-[240px] lg:px-8 lg:pt-16 lg:pb-8 xl:px-10 ${
-          hasBackgroundBar ? "pb-32 sm:pb-36" : ""
+          hasBackgroundBar
+            ? "pb-32 [--main-inset-bottom:8rem] sm:pb-36 sm:[--main-inset-bottom:9rem]"
+            : ""
         }`}
       >
         <div className="admin-shell">

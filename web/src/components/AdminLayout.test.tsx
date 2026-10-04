@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const mocks = vi.hoisted(() => ({
   useAdminServerStatus: vi.fn(),
   shortcutLabel: "Ctrl K",
+  backgroundBar: false,
 }));
 
 vi.mock("@/hooks/queries/admin/settings", () => ({
@@ -24,7 +25,7 @@ vi.mock("@/components/AdminSectionCommandDialog", () => ({
 }));
 vi.mock("@/components/ServerActivity", () => ({ default: () => null }));
 vi.mock("@/playback/watchPlaybackContext", () => ({
-  useWatchPlaybackController: () => ({ isBackgroundBarVisible: false }),
+  useWatchPlaybackController: () => ({ isBackgroundBarVisible: mocks.backgroundBar }),
 }));
 vi.mock("@/pages/audiobooks/player/audiobookPlaybackContext", () => ({
   useAudiobookPlaybackController: () => null,
@@ -70,6 +71,7 @@ function renderAdmin(initialPath = "/admin") {
 beforeEach(() => {
   mocks.useAdminServerStatus.mockReturnValue({ data: { restart_required: true } });
   mocks.shortcutLabel = "Ctrl K";
+  mocks.backgroundBar = false;
   vi.stubGlobal("matchMedia", (query: string) => ({
     matches: query === "(min-width: 64rem)",
     media: query,
@@ -115,6 +117,27 @@ describe("AdminLayout shell attribute", () => {
     expect(document.documentElement).toHaveAttribute("data-admin-shell", "true");
     unmount();
     expect(document.documentElement).not.toHaveAttribute("data-admin-shell");
+  });
+});
+
+describe("AdminLayout background playback bar", () => {
+  // Fixed page chrome (the collection editor's save bar) reads this inset to
+  // rise above the background playback bar instead of hiding under it.
+  it("reserves no clearance while no playback bar shows", () => {
+    renderAdmin();
+    expect(screen.getByRole("main")).not.toHaveClass("[--main-inset-bottom:8rem]");
+  });
+
+  it("matches the clearance to the main padding the bar already reserves", () => {
+    mocks.backgroundBar = true;
+    renderAdmin();
+
+    expect(screen.getByRole("main")).toHaveClass(
+      "pb-32",
+      "sm:pb-36",
+      "[--main-inset-bottom:8rem]",
+      "sm:[--main-inset-bottom:9rem]",
+    );
   });
 });
 

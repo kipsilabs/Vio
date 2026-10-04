@@ -11,6 +11,7 @@ const mocks = vi.hoisted(() => ({
   prefetchQuery: vi.fn(),
   getQueryData: vi.fn(),
   renderSurface: true,
+  backgroundBar: false,
   beginResult: undefined as boolean | undefined,
   profile: {
     name: "Admin",
@@ -48,7 +49,7 @@ vi.mock("@/hooks/useCurrentProfile", () => ({
 }));
 vi.mock("@/hooks/useIsActingAdmin", () => ({ useIsActingAdmin: () => false }));
 vi.mock("@/playback/watchPlaybackContext", () => ({
-  useWatchPlaybackController: () => ({ isBackgroundBarVisible: false }),
+  useWatchPlaybackController: () => ({ isBackgroundBarVisible: mocks.backgroundBar }),
 }));
 vi.mock("@/pages/audiobooks/player/audiobookPlaybackContext", () => ({
   useAudiobookPlaybackController: () => null,
@@ -157,6 +158,7 @@ beforeEach(() => {
   mocks.prefetchQuery.mockReset();
   mocks.getQueryData.mockReset();
   mocks.renderSurface = true;
+  mocks.backgroundBar = false;
   mocks.beginResult = undefined;
   mocks.profile = {
     name: "Admin",
@@ -265,6 +267,31 @@ describe("Layout sidebar collapse", () => {
     expect(screen.getByTestId("sidebar-surface")).toHaveAttribute("data-collapsed", "true");
     expect(screen.getByRole("main")).toHaveClass("lg:ml-16");
     expect(screen.getByRole("status", { name: "details-ready" })).toHaveTextContent("true");
+  });
+});
+
+describe("Layout background playback bar", () => {
+  // Fixed page chrome (the collection editor's save bar) reads this inset to
+  // rise above the background playback bar instead of hiding under it.
+  it("publishes the playback bar's clearance on main only while the bar shows", () => {
+    const view = renderLayout();
+    expect(screen.getByRole("main")).not.toHaveClass("[--main-inset-bottom:8rem]");
+
+    mocks.backgroundBar = true;
+    view.rerender(
+      <MemoryRouter>
+        <Layout>
+          <Harness />
+        </Layout>
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByRole("main")).toHaveClass(
+      "pb-32",
+      "sm:pb-36",
+      "[--main-inset-bottom:8rem]",
+      "sm:[--main-inset-bottom:9rem]",
+    );
   });
 });
 

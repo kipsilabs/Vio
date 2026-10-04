@@ -454,14 +454,20 @@ export default function Layout({ children }: LayoutProps) {
           </div>
         )}
 
-        {/* Main content — offset by sidebar width on desktop */}
+        {/* Main content — offset by sidebar width on desktop. While the
+          background playback bar shows, `--main-inset-bottom` tells fixed page
+          chrome (the collection editor's save bar) how far to rise to clear it. */}
         <main
           id="main-content"
           data-sidebar-target-collapsed={targetDetailImmersion ? "true" : undefined}
           data-sidebar-visual-collapsed={visualDetailImmersion ? "true" : undefined}
           className={`sidebar-main-stage relative min-h-screen ${
             targetDetailImmersion ? "lg:ml-16" : "lg:ml-[260px]"
-          } ${hasBackgroundBar ? "pb-32 sm:pb-36" : ""}`}
+          } ${
+            hasBackgroundBar
+              ? "pb-32 [--main-inset-bottom:8rem] sm:pb-36 sm:[--main-inset-bottom:9rem]"
+              : ""
+          }`}
           style={{ viewTransitionName: "main-content" }}
         >
           {needsNoPadding ? (
