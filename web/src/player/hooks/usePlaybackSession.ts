@@ -170,6 +170,13 @@ interface DeferredPushBase {
   /** Local, monotonically increasing arrival order. */
   seq: number;
   /**
+   * The source-identity transition clock at arrival. A later external transition
+   * (a poll fold, or an adopted plan) raises the clock above this; a value still
+   * at or below it is the state the entry already saw at capture and is already
+   * represented by its `outgoing` baseline.
+   */
+  arrivalTransitionClock: number;
+  /**
    * Whether the wire shape named any source at all. An identity-less push
    * cannot be tied to an adoption, so it may not cross a session change the
    * way an identity-carrying one is allowed to.
@@ -310,17 +317,24 @@ function identityNamesSameSource(a: SourceIdentity, b: SourceIdentity): boolean 
  * push arrived, and `applied`, the identity the menus carry when the flush runs
  * — because a poll bypasses the adoption barrier and can fold a concrete
  * candidate after the push was queued, including when the plan is later refused
- * rather than replaced. A URI-bearing source commit is the exception: it is the
- * transport's own move and concrete candidates are server state, so the
- * seq-sorted queue replays the newer one last and arrival order decides. When
- * such a commit supersedes a previous deferred source commit, that previous
- * commit is not an authority the newer one must answer to, so `outgoingSuperseded`
- * drops it from the baselines; an external concrete candidate (a poll fold) is
- * still authoritative. When the plan was refused rather than replaced, the live
- * source is the authority and `allowRotation` decides whether a cross-file
- * source commit may move it: a push that still names the live source is kept —
- * the source never moved — while a source commit naming another file is a
- * rotation the transport already made and is kept too.
+ * rather than replaced.
+ *
+ * A URI-bearing source commit is the transport's own move, so arrival order
+ * decides among the queue's own commits: when such a commit supersedes a
+ * previous deferred source commit, `outgoingSuperseded` drops that queue-produced
+ * `outgoing` baseline. It does not license the commit to overwrite external
+ * state: a candidate a poll applied after the entry was queued is newer than the
+ * commit and stays authoritative. `appliedPollNewer` carries that candidate — the
+ * menus may have moved on since — and is checked as an extra baseline. A
+ * candidate the menus carried before the entry was queued is either the arrival
+ * state already captured by `outgoing`, or a sibling the arrival collision
+ * already rejects, so it is not re-checked.
+ *
+ * When the plan was refused rather than replaced, the live source is the
+ * authority and `allowRotation` decides whether a cross-file source commit may
+ * move it: a push that still names the live source is kept — the source never
+ * moved — while a source commit naming another file is a rotation the transport
+ * already made and is kept too.
  */
 function deferredIdentityIsAdmissible(
   identity: SourceIdentity,
@@ -329,6 +343,12 @@ function deferredIdentityIsAdmissible(
   outgoing: SourceIdentity,
   applied: SourceIdentity,
   allowRotation: boolean,
+  /**
+   * The concrete candidate a poll applied *after* this entry was queued, or null
+   * when none did. A URI-bearing source commit is judged by arrival order against
+   * its own queue, but this state is newer than the commit and still vetoes it.
+   */
+  appliedPollNewer: SourceIdentity | null,
   outgoingSuperseded = false,
 ): boolean {
   if (!identityNamesSource(identity)) return false;
@@ -348,12 +368,24 @@ function deferredIdentityIsAdmissible(
 
   // A concrete candidate already current on the push's file is authority the
   // push cannot outweigh: a file-only push carries no candidate, and a push
-  // naming a different candidate is a sibling collision. Both baselines apply
-  // except for a URI-bearing source commit, which is the transport's own move
-  // judged by arrival order. A cross-file baseline is a different source and
-  // does not apply. A baseline that an earlier deferred source commit produced
-  // is not an external authority, so it does not veto the newer commit.
-  const baselines = allowRotation && identity.uri != null ? [outgoing] : [outgoing, applied];
+  // naming a different candidate is a sibling collision. A cross-file baseline
+  // is a different source and does not apply.
+  //
+  // A URI-bearing source commit is the transport's own move, so arrival order
+  // decides among the queue's own commits: `outgoingSuperseded` drops the
+  // queue-produced `outgoing` baseline of an earlier deferred source commit. The
+  // live `outgoing` baseline is still consulted — it is the source the transport
+  // was on at arrival, and a differing concrete candidate on the same file is a
+  // real collision. What arrival order does *not* license is overwriting a
+  // candidate a poll folded *after* the entry was queued: that `appliedPollNewer`
+  // state is newer than the commit, so it is added as a veto even for a commit.
+  // An older applied candidate predates the entry and is either the arrival state
+  // already captured by `outgoing` or a sibling the arrival collision already
+  // rejects, so it is not re-checked.
+  const judgedByArrival = allowRotation && identity.uri != null;
+  const baselines: SourceIdentity[] = [outgoing];
+  if (!judgedByArrival) baselines.push(applied);
+  else if (appliedPollNewer != null) baselines.push(appliedPollNewer);
   for (const baseline of baselines) {
     if (outgoingSuperseded && baseline === outgoing) continue;
     if (baseline.uri == null) continue;
@@ -824,6 +856,19 @@ export function usePlaybackSession(
   // authority to answer to, while a poll fold is external and stays
   // authoritative; `transitionSourceIdentity` clears this on every such fold.
   const lastDeferredSourceIdentityRef = useRef<SourceIdentity | null>(null);
+  // A monotonic clock raised on every *external* source-identity transition (a
+  // poll fold or an adopted plan), never by the deferred queue's own replay. A
+  // deferred push records the clock at arrival; a later poll fold raises it, so
+  // the flush can tell a candidate folded after the entry was queued from one
+  // the menus already carried at capture. See `captureDeferredPush`.
+  const identityTransitionClockRef = useRef(0);
+  // The live candidate a poll folded on the last external transition, with the
+  // clock reading of that transition. Between an entry's arrival and its flush a
+  // poll can move the menus to a candidate, and the winning plan's own adoption
+  // can then overwrite the menu mirror before the flush runs. Remembering the
+  // poll's candidate lets the flush veto a stale commit that would otherwise
+  // overwrite it; the clock says whether the fold was newer than the entry.
+  const lastPollAppliedRef = useRef<{ clock: number; identity: SourceIdentity } | null>(null);
   // The identity the menus render, mirrored outside the state updater. A poll
   // or rotation can fold before React has processed an earlier push in the same
   // tick, so the next transition is computed against this synchronous mirror;
@@ -990,21 +1035,33 @@ export function usePlaybackSession(
       // longer a baseline a later queued commit may ignore.
       liveSourceIdentityRef.current = { fileId, uri };
       lastDeferredSourceIdentityRef.current = null;
+      identityTransitionClockRef.current += 1;
       return changed;
     },
     [],
   );
 
   /**
+   * Records a candidate a catalog poll folded, with the transition clock of the
+   * fold. `deferredIdentityIsAdmissible` consults it so a source commit queued
+   * before the poll cannot overwrite the poll's newer candidate, even after the
+   * winning plan's own adoption has since overwritten the menu mirror.
+   */
+  const recordPollApplied = useCallback((identity: SourceIdentity) => {
+    lastPollAppliedRef.current = { clock: identityTransitionClockRef.current, identity };
+  }, []);
+
+  /**
    * The revision bookkeeping scope for the current session generation.
    *
    * A revision is the server's opaque digest of the whole inventory *and* the
-   * effective source it describes, so within one session a redelivery is the
-   * same payload and folding it twice is wrong — including a redelivery of a
-   * revision the flush refused. The scope is keyed by the load generation and
-   * resets only when that moves; an identity rotation must not clear it, or a
-   * redelivered file-only rejection would fold once a later source moved the
-   * menu.
+   * effective source it describes, so within one session redelivering a revision
+   * that was already folded is the same payload and folding it twice is wrong.
+   * Only genuinely applied revisions are recorded; a revision the flush refused
+   * is deliberately left unrecorded, so a redelivery that the plan (or a later
+   * rotation) vouches for still folds. The scope is keyed by the load generation
+   * and resets only when that moves; an identity rotation must not clear it, or a
+   * revision folded before the rotation would fold again once the source moved.
    */
   const revisionScopeRef = useRef<{ generation: number; revisions: Set<string> }>({
     generation: -1,
@@ -2246,7 +2303,14 @@ export function usePlaybackSession(
       // the live source changed, so the menu must follow it. Commit the
       // transition synchronously and outside the updater; the revision scope is
       // generation-keyed and is deliberately not cleared here.
-      if (identityChanged) transitionSourceIdentity(nextFileId, nextUri);
+      if (identityChanged) {
+        transitionSourceIdentity(nextFileId, nextUri);
+        // A catalog poll is external state. Record the candidate it moved to,
+        // with the transition clock, so a deferred source commit queued before
+        // this fold cannot overwrite it even if a later plan adoption replaces
+        // the menu mirror before the flush runs.
+        recordPollApplied({ fileId: nextFileId, uri: nextUri });
+      }
       setState((current) => {
         if (identityChanged) {
           return {
@@ -2276,7 +2340,7 @@ export function usePlaybackSession(
         };
       });
     },
-    [transitionSourceIdentity],
+    [recordPollApplied, transitionSourceIdentity],
   );
 
   const foldCommittedSource = useCallback(
@@ -2341,6 +2405,7 @@ export function usePlaybackSession(
     const lastDeferredSource = lastDeferredSourceIdentityRef.current;
     const base: DeferredPushBase = {
       seq: deferredPushSeqRef.current++,
+      arrivalTransitionClock: identityTransitionClockRef.current,
       hasIdentity: identityNamesSource(input.identity),
       identity: input.identity,
       plan: planRef.current,
@@ -2666,11 +2731,17 @@ export function usePlaybackSession(
       // URI, that URI wins over the outgoing one (a replacement may retain the
       // effective candidate) and an exact match is kept. When it is URI-less,
       // the push's own file is the key, except for a same-file source the plan
-      // cannot resolve. `appliedIdentity` is the menu identity at flush start,
-      // so a push deferred before a poll folded a concrete candidate cannot
-      // overwrite it. A source commit is judged by arrival order, so a baseline
-      // produced by an earlier source commit in the same queue does not veto it.
+      // cannot resolve. `appliedIdentity` is the menu identity at flush start, so
+      // a push deferred before a poll folded a concrete candidate cannot
+      // overwrite it. A URI-bearing source commit is judged by arrival order, but
+      // only against state older than it: a poll that folded a candidate after
+      // this entry was queued is external and newer and still vetoes the commit.
       // See deferredIdentityIsAdmissible.
+      const pollApplied = lastPollAppliedRef.current;
+      const appliedPollNewer =
+        pollApplied != null && pollApplied.clock > entry.arrivalTransitionClock
+          ? pollApplied.identity
+          : null;
       if (
         !deferredIdentityIsAdmissible(
           entry.identity,
@@ -2679,6 +2750,7 @@ export function usePlaybackSession(
           entry.outgoing,
           appliedIdentity,
           entry.kind === "source",
+          appliedPollNewer,
           entry.kind === "source" && entry.outgoingFromDeferredSource,
         )
       ) {
