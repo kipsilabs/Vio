@@ -114,6 +114,23 @@ async function openGalleryConfig(tab: "Home" | "Library") {
   await userEvent.click(await screen.findByRole("button", { name: "Choose Recently Added" }));
 }
 
+describe("admin Home rows page", () => {
+  it("is titled Home rows and says who sees the rows", async () => {
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <AdminSections />
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByRole("heading", { level: 1, name: "Home rows" })).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "The rows everyone sees on Home and on library pages. Profiles can still hide, rename or reorder them.",
+      ),
+    ).toBeInTheDocument();
+  });
+});
+
 describe("admin section gallery", () => {
   it("creates one Home row from the Home tab, without offering library bulk apply", async () => {
     await openGalleryConfig("Home");

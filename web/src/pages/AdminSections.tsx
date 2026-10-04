@@ -837,7 +837,11 @@ export default function AdminSections() {
       </Dialog>
       <div className="page-header gap-5">
         <div className="space-y-3">
-          <h1 className="page-title text-[clamp(2rem,4vw,3rem)]">Sections</h1>
+          <h1 className="page-title text-[clamp(2rem,4vw,3rem)]">Home rows</h1>
+          <p className="page-subtitle text-sm sm:text-base">
+            The rows everyone sees on Home and on library pages. Profiles can still hide, rename or
+            reorder them.
+          </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <Button
