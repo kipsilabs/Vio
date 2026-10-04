@@ -88,6 +88,7 @@ import type {
 import type { PlayerTrickplay } from "../trickplay";
 import type { FailureV3, PlanV3, SubtitleInventoryItemV3 } from "../protocol-v3";
 import { decodeFailure, isServerDecodeFailure } from "../decode-failure";
+import { isServerManifestNotReady, manifestRetryAfterMs } from "../manifest-not-ready";
 import {
   mediaDurationSeconds,
   subtitleStartPositionSeconds,
@@ -515,6 +516,7 @@ export function VideoPlayer({
   const isMountedRef = useRef(true);
   const effectiveTransportRevision = transportRevision ?? planRevision;
   const hlsRef = useRef<HlsType | null>(null);
+  const manifestPollbackRef = useRef<number | undefined>(undefined);
   const hlsStartupGuardRef = useRef<HlsStartupGuard | null>(null);
   // Buffer settings for the active HLS transport. Kept in a ref because the
   // media event listeners are subscribed once and cannot close over per-plan
@@ -2439,6 +2441,40 @@ export function VideoPlayer({
                 error: data.error?.message,
               });
 
+              // A not-ready transcode manifest reaches hls.js as a fatal
+              // manifest network error carrying the server's 503 with the
+              // not_ready_retry code. The encoder is alive but slow — retrying
+              // later can succeed, so reload the manifest source outside the
+              // 3x network recovery budget instead of counting it as a
+              // transport failure. This check sits first because the code is
+              // authoritative: anything else 503 stays on the fatal path.
+              if (data.type === Hls.ErrorTypes.NETWORK_ERROR && isServerManifestNotReady(data)) {
+                // Poll-back applies while initial startup is still in
+                // flight only: loadSource on the same URL restarts a manifest
+                // fetch without touching playback state. Buffer occupancy is
+                // not the gate (buffers empty after eviction); the startup
+                // guard's explicit state is. Once playable, later failures
+                // stay on the fatal path. The timer is tracked so teardown
+                // cancels it; the retry fires only while this hls instance
+                // is still current and startup has not completed or failed.
+                if (hlsStartupGuardRef.current?.isStarting() === true) {
+                  console.warn("[hls.js] Transcode manifest not ready; polling again", {
+                    details: data.details,
+                    url: data.frag?.url ?? data.url,
+                  });
+                  const retryAfter = manifestRetryAfterMs(data);
+                  const instance = hls;
+                  const timer = window.setTimeout(() => {
+                    if (destroyed) return;
+                    if (hlsStartupGuardRef.current?.isStarting() !== true) return;
+                    if (hlsRef.current !== instance) return;
+                    instance?.loadSource(instance.url);
+                  }, retryAfter);
+                  manifestPollbackRef.current = timer;
+                  return;
+                }
+              }
+
               // A decode rejection reaches hls.js as a fatal manifest network
               // error carrying the server's 422 and X-Vio-Decode-Error verdict.
               // Retrying the manifest can never succeed, and reporting it as a
@@ -2575,6 +2611,10 @@ export function VideoPlayer({
     return () => {
       destroyed = true;
       cleanupStartupListeners();
+      if (manifestPollbackRef.current !== undefined) {
+        window.clearTimeout(manifestPollbackRef.current);
+        manifestPollbackRef.current = undefined;
+      }
       if (hls) {
         hls.destroy();
         hlsRef.current = null;

@@ -85,7 +85,27 @@ func (h *CatalogResourceHandler) HandleGetItemDetail(w http.ResponseWriter, r *h
 		writeAPIError(w, err)
 		return
 	}
+	h.prefetchItemDetailVirtual(r.Context(), view, requestProfileID(r))
 	writeJSON(w, http.StatusOK, view)
+}
+
+// prefetchItemDetailVirtual warms virtual listings for a movie/episode detail
+// view. Series details carry no versions and are skipped; per-episode warming
+// happens on the season-episodes read instead.
+func (h *CatalogResourceHandler) prefetchItemDetailVirtual(ctx context.Context, view *catalog.ItemDetail, profileID string) {
+	if h == nil || h.items == nil || view == nil {
+		return
+	}
+	fileIDs := make([]int, 0, 2)
+	for _, v := range view.Versions {
+		if v.FileID != 0 {
+			fileIDs = append(fileIDs, v.FileID)
+		}
+		if len(fileIDs) >= 2 {
+			break
+		}
+	}
+	h.items.prefetchVirtualFileIDs(ctx, fileIDs, profileID)
 }
 
 func (h *CatalogResourceHandler) HandleGetItemVersions(w http.ResponseWriter, r *http.Request) {
@@ -141,6 +161,7 @@ func (h *CatalogResourceHandler) HandleGetItemEpisodes(w http.ResponseWriter, r 
 		writeAPIError(w, err)
 		return
 	}
+	h.prefetchEpisodeViewsVirtual(r.Context(), view, requestProfileID(r))
 	writeJSON(w, http.StatusOK, episodesListResponse{Episodes: view})
 }
 
@@ -214,7 +235,28 @@ func (h *CatalogResourceHandler) HandleGetEpisodes(w http.ResponseWriter, r *htt
 		writeAPIError(w, err)
 		return
 	}
+	h.prefetchEpisodeViewsVirtual(r.Context(), view, requestProfileID(r))
 	writeJSON(w, http.StatusOK, episodesListResponse{Episodes: view})
+}
+
+// prefetchEpisodeViewsVirtual warms the first episode's files only: it is the
+// likely next play (autoplay/next-up order), and warming a whole season would
+// fan out provider listings per episode. Bounded to 2 file rows like the
+// other triggers.
+func (h *CatalogResourceHandler) prefetchEpisodeViewsVirtual(ctx context.Context, views []EpisodeView, profileID string) {
+	if h == nil || h.items == nil || len(views) == 0 {
+		return
+	}
+	fileIDs := make([]int, 0, 2)
+	for _, f := range views[0].Files {
+		if f.FileID != 0 {
+			fileIDs = append(fileIDs, f.FileID)
+		}
+		if len(fileIDs) >= 2 {
+			break
+		}
+	}
+	h.items.prefetchVirtualFileIDs(ctx, fileIDs, profileID)
 }
 
 func (h *CatalogResourceHandler) syntheticSeasonDetail(ctx context.Context, v ItemViewer, seasonID string) (*catalog.ItemDetail, error) {
