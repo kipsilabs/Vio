@@ -9,9 +9,12 @@ import (
 )
 
 // AllowedSyncSchedules maps a UI-friendly cadence label to the cron
-// expression we persist. The set is fixed (no user-supplied cron) so we can
-// guarantee the >= 24h minimum-interval cap without re-parsing the cron tree.
-// All schedules fire at 04:30 UTC to spread load across the cluster.
+// expression we persist. The set is fixed (no user-supplied cron) so no
+// schedule runs more than once a day, which keeps provider quota bounded
+// without re-parsing the cron tree. All schedules fire at 04:30 on the node's
+// local clock (see catalog.ComputeNextSyncAtFrom), so across a daylight saving
+// change two daily runs are 23 or 25 hours apart, plus up to 15 minutes of
+// jitter either way.
 var AllowedSyncSchedules = map[string]string{
 	"daily":   "30 4 * * *",
 	"weekly":  "30 4 * * 0",
