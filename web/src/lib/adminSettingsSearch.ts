@@ -495,8 +495,7 @@ export const ADMIN_SETTINGS_GROUPS: AdminSettingsSearchGroup[] = [
       {
         id: "providers",
         label: "Subtitles & Metadata",
-        description:
-          "Subtitle provider accounts, the MDBList metadata key, and marker providers.",
+        description: "Subtitle provider accounts, the MDBList metadata key, and marker providers.",
         groups: ["Subtitle providers", "Metadata providers", "Marker providers"],
         keywords: [
           "opensubtitles",
