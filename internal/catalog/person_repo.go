@@ -508,7 +508,7 @@ func (r *PersonRepository) BatchFindOrCreate(ctx context.Context, people []model
 
 // Get retrieves a person by ID.
 func (r *PersonRepository) Get(ctx context.Context, id int64) (*models.Person, error) {
-	return r.getByID(ctx, id, "", []any{id})
+	return r.getByID(ctx, id, "")
 }
 
 // GetVisible retrieves a person by ID only when the viewer can see at least
@@ -516,13 +516,20 @@ func (r *PersonRepository) Get(ctx context.Context, id int64) (*models.Person, e
 // no media scope. A person the viewer cannot see answers pgx.ErrNoRows, the
 // same as an unknown ID, so the answer does not reveal that the person exists.
 func (r *PersonRepository) GetVisible(ctx context.Context, id int64, filter AccessFilter) (*models.Person, error) {
-	args := []any{id}
-	argIdx := 2
+	var args []any
+	argIdx := getByIDFirstExtraArg
 	visible := personCreditVisibleSQL("people.id", nil, filter, &args, &argIdx)
-	return r.getByID(ctx, id, " AND "+visible, args)
+	return r.getByID(ctx, id, " AND "+visible, args...)
 }
 
-func (r *PersonRepository) getByID(ctx context.Context, id int64, extraWhere string, args []any) (*models.Person, error) {
+// getByIDFirstExtraArg is the first placeholder number an extraWhere passed to
+// getByID may use; $1 is the person ID.
+const getByIDFirstExtraArg = 2
+
+// getByID reads the person with the given ID, narrowed by extraWhere, whose
+// placeholders start at getByIDFirstExtraArg and bind extraArgs in order.
+func (r *PersonRepository) getByID(ctx context.Context, id int64, extraWhere string, extraArgs ...any) (*models.Person, error) {
+	args := append([]any{id}, extraArgs...)
 	var p models.Person
 	err := r.pool.QueryRow(ctx, `
 		SELECT id, name, sort_name, bio, birth_date, death_date, birthplace, homepage,

@@ -14,6 +14,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/literaryworks"
 	"github.com/Silo-Server/silo-server/internal/metadata"
 	"github.com/Silo-Server/silo-server/internal/metadata/translation"
+	"github.com/Silo-Server/silo-server/internal/models"
 )
 
 // Seams of the catalog-items section's actions and lookups: trailer refresh,
@@ -231,13 +232,9 @@ func (h *PeopleHandler) SearchPeopleScoped(ctx context.Context, query string, li
 // unknown ID. A view (queueRefresh) also queues a provider refresh when one is
 // due; a speculative prefetch leaves that to the sweep.
 func (h *PeopleHandler) Person(ctx context.Context, id int64, queueRefresh bool, filter catalog.AccessFilter) (PersonView, error) {
-	person, err := h.personRepo.GetVisible(ctx, id, filter)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return PersonView{}, apiError(http.StatusNotFound, policyErrorNotFound, "person not found")
-	}
+	person, err := h.visiblePerson(ctx, id, filter)
 	if err != nil {
-		slog.WarnContext(ctx, "people: get person failed", "component", "api", "id", id, "id_str", strconv.FormatInt(id, 10), "error", err)
-		return PersonView{}, apiError(http.StatusInternalServerError, "internal_error", "Failed to load person")
+		return PersonView{}, err
 	}
 	if queueRefresh {
 		h.enqueuePersonRefreshIfDue(*person)
@@ -263,16 +260,26 @@ func (h *PeopleHandler) RefreshPerson(ctx context.Context, userID int, id int64,
 		}
 		return limited
 	}
-	person, err := h.personRepo.GetVisible(ctx, id, filter)
-	if errors.Is(err, pgx.ErrNoRows) || (err == nil && person == nil) {
-		return apiError(http.StatusNotFound, policyErrorNotFound, "person not found")
-	}
-	if err != nil {
-		slog.WarnContext(ctx, "people: refresh lookup failed", "component", "api", "id", id, "error", err)
-		return apiError(http.StatusInternalServerError, "internal_error", "Failed to load person")
+	if _, err := h.visiblePerson(ctx, id, filter); err != nil {
+		return err
 	}
 	h.refreshQueue.Enqueue(id)
 	return nil
+}
+
+// visiblePerson loads a person the viewer can see through at least one credit.
+// A hidden or unknown person is a 404; a failed lookup is a 500, because the
+// person may well be visible.
+func (h *PeopleHandler) visiblePerson(ctx context.Context, id int64, filter catalog.AccessFilter) (*models.Person, error) {
+	person, err := h.personRepo.GetVisible(ctx, id, filter)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, apiError(http.StatusNotFound, policyErrorNotFound, "person not found")
+	}
+	if err != nil {
+		slog.WarnContext(ctx, "people: get person failed", "component", "api", "id", id, "id_str", strconv.FormatInt(id, 10), "error", err)
+		return nil, apiError(http.StatusInternalServerError, "internal_error", "Failed to load person")
+	}
+	return person, nil
 }
 
 // Work answers a literary work with the formats the viewer can see.
