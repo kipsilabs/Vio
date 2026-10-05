@@ -721,14 +721,13 @@ func FindPendingAudioReconciliation(record *playback.AttemptRecordV3, planID str
 	var found *playback.AudioReconcileEntryV3
 	for i := range record.AudioReconcileLedger.Entries {
 		entry := record.AudioReconcileLedger.Entries[i]
-		// A refusal recorded for the same (generation, session) pair is the
-		// divergence verdict: it supersedes the invalidation that evaluator
-		// lost to, so reading the invalidation instead would let a correction
-		// a rejected re-evaluation had already invalidated reach the client.
-		if entry.Decision == playback.AudioReconcileRefused && found != nil && entry.Generation == found.Generation {
-			found = nil
-			continue
-		}
+		// A divergence refusal is what a LATER evaluator recorded after
+		// losing the claim on an already-settled generation — typically two
+		// concurrent evaluations that captured a different playhead. It is
+		// not a verdict on the winner: erasing the settled invalidation here
+		// would discard a correction that was already announced to the client
+		// and that this replan exists to consume. The winning decision stays
+		// authoritative; the refusal remains in the ledger as an audit record.
 		if entry.Decision != playback.AudioReconcileInvalidated || entry.PlanID != planID {
 			continue
 		}

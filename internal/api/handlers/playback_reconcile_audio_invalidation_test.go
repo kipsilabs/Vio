@@ -348,6 +348,83 @@ func TestReconcileAudioImmutableIdentity(t *testing.T) {
 // TestReconcileAudioWithdrawalSkippedWithoutCapability is the capability gate:
 // a client that never advertised plan_invalidated_v1 gets no event, and its
 // decision is still recorded so the correction lands on its next start.
+// The pending correction must be layered onto the executable selection, not
+// onto the request after the selection was already applied: audio resolution
+// reads start.AudioTrackID/AudioTrackIndex, so a correction applied afterwards
+// never reaches the plan or the executor's audio map.
+func TestPendingAudioCorrectionReachesTheStartSelection(t *testing.T) {
+	f := newInvalidationFixture(t, []string{playback.FeaturePlanInvalidatedV3}, 10)
+
+	after := f.reconcile(t)
+	entry := playback.FindAudioReconcileEntry(after.AudioReconcileLedger, reconcileGenerationV3(f.verified), f.session.ID)
+	if entry == nil || entry.Request == nil || entry.Request.SelectedTracks.Audio == nil {
+		t.Fatal("expected a settled correction carrying an audio identity")
+	}
+
+	// A client replan off the withdrawn plan, with no audio identity of its own.
+	start := after.NormalizedRequest
+	req := &playback.ReplanRequestV3{
+		ProtocolVersion: playback.ProtocolV3,
+		Operation:       playback.ReplanOperationTrackChangeV3,
+		FailedPlanID:    entry.PlanID,
+	}
+	f.handler.pendingAudioReconciliationReplan(after, req)
+	if req.SelectedTracks.Audio == nil {
+		t.Fatal("the replan did not consume the pending correction")
+	}
+
+	// Now the ordering that actually matters: applying the selection must
+	// happen AFTER the correction, exactly as the replan overlay does.
+	applySelectedTracksToStartV3(&start, req.SelectedTracks)
+	if start.AudioTrackID == "" && start.AudioTrackIndex == nil {
+		t.Fatal("the corrected audio identity never reached the start selection")
+	}
+	if start.AudioTrackIndex == nil || entry.Request.SelectedTracks.Audio.Index == nil {
+		t.Fatal("the corrected audio identity did not carry an index onto the start selection")
+	}
+	if *start.AudioTrackIndex != *entry.Request.SelectedTracks.Audio.Index {
+		t.Fatalf("start audio index = %d, want the corrected %d",
+			*start.AudioTrackIndex, *entry.Request.SelectedTracks.Audio.Index)
+	}
+}
+
+// A refusal recorded by a later evaluator must not erase the correction the
+// winning evaluator already settled and announced: two concurrent evaluations
+// that captured different playheads would otherwise strand the correction.
+func TestRefusalDoesNotStrandTheSettledCorrection(t *testing.T) {
+	f := newInvalidationFixture(t, []string{playback.FeaturePlanInvalidatedV3}, 10)
+
+	after := f.reconcile(t)
+	entry := playback.FindAudioReconcileEntry(after.AudioReconcileLedger, reconcileGenerationV3(f.verified), f.session.ID)
+	if entry == nil {
+		t.Fatal("expected a settled correction")
+	}
+
+	// A diverged re-evaluation records an explicit refusal for the same
+	// (generation, session).
+	record, err := f.handler.PlanStoreV3.GetAttempt(context.Background(), f.session.ID)
+	if err != nil {
+		t.Fatalf("get attempt: %v", err)
+	}
+	record.AudioReconcileLedger.Entries = append(record.AudioReconcileLedger.Entries,
+		playback.AudioReconcileEntryV3{
+			Generation:    entry.Generation,
+			SessionID:     f.session.ID,
+			PlanID:        entry.PlanID,
+			Decision:      playback.AudioReconcileRefused,
+			AudioIndex:    entry.AudioIndex,
+			RequestDigest: "divergent-digest",
+		})
+
+	found := FindPendingAudioReconciliation(record, entry.PlanID)
+	if found == nil {
+		t.Fatal("a later refusal stranded the already-announced correction")
+	}
+	if found.RequestDigest != entry.RequestDigest {
+		t.Fatalf("pending correction digest = %q, want the winning %q", found.RequestDigest, entry.RequestDigest)
+	}
+}
+
 func TestReconcileAudioWithdrawalSkippedWithoutCapability(t *testing.T) {
 	f := newInvalidationFixture(t, []string{playback.FeaturePlaybackPlanV3}, 5)
 

@@ -7826,6 +7826,15 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			// capability payloads. Omission keeps the start-time features.
 			start.ClientFeatures = req.ClientFeatures
 		}
+		// A replan that answers a default-audio reconciliation withdrawal
+		// carries the correction the settled decision recorded: the client
+		// replans off the withdrawn plan, which still names the pre-reorder
+		// stream, so without this the correction never reaches the transport.
+		// This must run BEFORE the selection is applied onto start: audio
+		// resolution reads start.AudioTrackID/AudioTrackIndex, so a correction
+		// layered on afterwards would never reach the plan or the executor's
+		// audio map.
+		h.pendingAudioReconciliationReplan(record, &req)
 		if trackChange {
 			// A track_change is the only operation where an omitted subtitle
 			// means "subtitles off". Failure, seek, and quality replans may omit
@@ -7834,11 +7843,6 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		} else {
 			applySelectedTrackOverridesToStartV3(&start, req.SelectedTracks)
 		}
-		// A replan that answers a default-audio reconciliation withdrawal
-		// carries the correction the settled decision recorded: the client
-		// replans off the withdrawn plan, which still names the pre-reorder
-		// stream, so without this the correction never reaches the transport.
-		h.pendingAudioReconciliationReplan(record, &req)
 	}
 	// Native selection is negotiated at start and can only be disabled during
 	// an attempt. Keep a confirmed failure disabled even when a later client
