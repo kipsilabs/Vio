@@ -2004,14 +2004,433 @@ describe("usePlaybackSession version switches", () => {
 
     await waitFor(() => expect(result.current.mediaFileId).toBe(99));
     expect(result.current.plan?.plan_id).toBe("plan:switch-2");
-    expect(replanBodies).toEqual([]);
+    // The refused seek replays against the settled replacement plan, while the
+    // refused track/quality intents stay dropped.
+    await waitFor(() => expect(replanBodies).toHaveLength(1));
+    expect(replanBodies[0]).toMatchObject({ operation: "seek_reanchor", position_seconds: 140 });
 
     // Once the switch settles the fence lifts and replans flow again.
     act(() => {
       void result.current.reanchorSeek(150);
     });
-    await waitFor(() => expect(replanBodies).toHaveLength(1));
+    await waitFor(() => expect(replanBodies).toHaveLength(2));
 
+    unmount();
+  });
+
+  it("drops a mid-switch seek when its switch fails", async () => {
+    const replanBodies: Array<Record<string, unknown>> = [];
+    let startCount = 0;
+    let releaseSwitch: ((response: Response) => void) | null = null;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        startCount += 1;
+        if (startCount === 1) {
+          return jsonResponse(
+            {
+              protocol_version: 3,
+              server_features: ["playback_plan_v3"],
+              outcome: "playable",
+              session_id: "session-1",
+              playback_plan: fixturePlanV3(),
+            },
+            { status: 201 },
+          );
+        }
+        // Hold the version switch open so the seek lands while it is
+        // demonstrably pending, then fail it on release.
+        return new Promise<Response>((resolve) => {
+          releaseSwitch = resolve;
+        });
+      }
+      if (url.endsWith("/replan")) {
+        replanBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        return jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "playable",
+          session_id: "session-1",
+          playback_plan: fixturePlanV3(),
+        });
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    act(() => {
+      void (async () => {
+        await result.current.switchVersion(99, 0);
+      })();
+    });
+    // The second start is in flight — the switch is demonstrably pending.
+    await waitFor(() => expect(startCount).toBe(2));
+    expect(result.current.replacing).toBe(true);
+    // The seek lands while switchingRef owns the session, so it is
+    // remembered rather than issued.
+    act(() => {
+      void result.current.reanchorSeek(140);
+    });
+    expect(replanBodies.filter((b) => b.operation === "seek_reanchor")).toHaveLength(0);
+    // Fail the switch: the remembered seek must be discarded with it.
+    await act(async () => {
+      releaseSwitch!(
+        jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "terminal",
+            session_id: null,
+            terminal: { reason: "source_unavailable", message: "gone", retryable: false },
+          },
+          { status: 200 },
+        ),
+      );
+    });
+    await waitFor(() => expect(result.current.error).not.toBeNull());
+    // The failed switch retires its session and surfaces an error; the
+    // remembered seek must not replan against whatever lands next.
+    expect(replanBodies.filter((b) => b.operation === "seek_reanchor")).toHaveLength(0);
+    unmount();
+  });
+
+  it("ignores a stale declared push in the same tick as a verified one", async () => {
+    const verifiedTracks = [
+      { codec: "eac3", channels: 6, layout: "5.1", language: "eng", default: true },
+    ];
+    const declaredTracks = [
+      { codec: "eac3", channels: 6, layout: "5.1", language: "eng", default: true },
+      { codec: "ac3", channels: 6, layout: "5.1", language: "spa", default: false },
+    ];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3({
+              inventory_status: "declared",
+              audio_tracks: declaredTracks,
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+    expect(result.current.audioInventoryProvisional).toBe(true);
+
+    // Verified and declared pushes arriving in the same tick — before React
+    // renders — must still leave the verified list in place.
+    act(() => {
+      result.current.applyCommittedSource(
+        { effectiveMediaFileId: 7, effectiveVirtualUri: null, inventoryStatus: "verified" },
+        verifiedTracks,
+      );
+      result.current.applyCommittedSource(
+        { effectiveMediaFileId: 7, effectiveVirtualUri: null, inventoryStatus: "declared" },
+        declaredTracks,
+      );
+    });
+
+    expect(result.current.planAudioTracks).toEqual(verifiedTracks);
+    expect(result.current.audioInventoryProvisional).toBe(false);
+    unmount();
+  });
+
+  it("keeps declared inventory usable after a same-file candidate rotation", async () => {
+    const candidateA = [
+      { codec: "eac3", channels: 6, layout: "5.1", language: "eng", default: true },
+    ];
+    const candidateB = [
+      { codec: "ac3", channels: 6, layout: "5.1", language: "spa", default: true },
+    ];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3({
+              inventory_status: "verified",
+              inventory_provenance: "verified",
+              audio_tracks: candidateA,
+              effective_virtual_uri: "virtual://movie/x?result=A",
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+    expect(result.current.audioInventoryProvisional).toBe(false);
+
+    // The serve layer rotates to candidate B under the same file id. Verified
+    // evidence for A must not suppress B's declared inventory.
+    act(() =>
+      result.current.applyCommittedSource(
+        {
+          effectiveMediaFileId: 7,
+          effectiveVirtualUri: "virtual://movie/x?result=B",
+          inventoryStatus: "declared",
+        },
+        candidateB,
+      ),
+    );
+    expect(result.current.planAudioTracks).toEqual(candidateB);
+    expect(result.current.audioInventoryProvisional).toBe(true);
+    unmount();
+  });
+
+  it("stamps a verified subtitle anchor with the payload identity across rotation", async () => {
+    const subtitleA = {
+      track_id: "file:7:subtitle:0",
+      combined_index: 0,
+      source: "embedded",
+      codec: "subrip",
+      language: "eng",
+      forced: false,
+      default: false,
+      hearing_impaired: false,
+      delivery: "sidecar",
+      url: "/stream/session-1/subtitles/0.vtt?file_id=7",
+    };
+    const subtitleB = {
+      ...subtitleA,
+      track_id: "file:7:subtitle:9",
+      combined_index: 9,
+      language: "spa",
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3({
+              inventory_status: "declared",
+              effective_virtual_uri: "virtual://movie/x?result=A",
+              subtitle: { mode: "off", inventory: [] },
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    // Rotation to B plus verified B inventory (audio + subtitle) in one
+    // tick, then a stale declared B push in the same tick: the subtitle
+    // anchor must carry B's URI so the stale push is suppressed, not applied.
+    // A serve-layer rotation first arrives as a source commit, then its
+    // verified inventory follows on the same socket.
+    act(() => {
+      result.current.applyCommittedSource(
+        {
+          effectiveMediaFileId: 7,
+          effectiveVirtualUri: "virtual://movie/x?result=B",
+          inventoryStatus: "declared",
+        },
+        [],
+      );
+      result.current.applyInventoryUpdate({
+        session_id: "session-1",
+        inventory_revision: "inv:b-verified",
+        inventory_status: "verified",
+        effective_media_file_id: 7,
+        effective_virtual_uri: "virtual://movie/x?result=B",
+        audio_tracks: [
+          { codec: "ac3", channels: 6, layout: "5.1", language: "spa", default: true },
+        ],
+        subtitle_inventory: [subtitleB],
+      });
+      result.current.applyInventoryUpdate({
+        session_id: "session-1",
+        inventory_revision: "inv:b-declared-stale",
+        inventory_status: "declared",
+        effective_media_file_id: 7,
+        effective_virtual_uri: "virtual://movie/x?result=B",
+        audio_tracks: [],
+        subtitle_inventory: [subtitleA],
+      });
+    });
+
+    expect(result.current.effectiveVirtualUri).toBe("virtual://movie/x?result=B");
+    expect(result.current.subtitleUrls).toHaveLength(1);
+    expect(result.current.subtitleUrls[0]?.language).toBe("spa");
+    expect(result.current.subtitleInventoryProvisional).toBe(false);
+    expect(result.current.audioInventoryProvisional).toBe(false);
+    unmount();
+  });
+
+  it("folds a mid-switch seek into a chained switch without a competing replan", async () => {
+    const startBodies: Array<{ file_id: number; start_position?: number }> = [];
+    const replanBodies: Array<Record<string, unknown>> = [];
+    const releases: Array<(response: Response) => void> = [];
+    const switchGate = (resolve: (response: Response) => void) => {
+      releases.push(resolve);
+    };
+    let switchCount = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        const body = JSON.parse(String(init?.body)) as { file_id: number; start_position?: number };
+        startBodies.push(body);
+        if (startBodies.length >= 2) {
+          switchCount += 1;
+          const gate = new Promise<Response>(switchGate);
+          if (switchCount === 1) {
+            // Hold the first switch open: queue a chained switch and seeks.
+            return gate;
+          }
+          return gate;
+        }
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3(),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/replan")) {
+        replanBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        return jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "playable",
+          session_id: "session-2",
+          playback_plan: fixturePlanV3({
+            session_id: "session-2",
+            plan_id: "plan:switch-99",
+            plan_attempt_key: "v3:switch-99",
+            requested_media_file_id: 99,
+            effective_media_file_id: 99,
+          }),
+        });
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    // First switch to 98 stays pending; queue a chained switch to 99 while a
+    // seek lands mid-flight.
+    act(() => result.current.switchVersion(98, 0));
+    await waitFor(() => expect(startBodies).toHaveLength(2));
+    act(() => {
+      result.current.switchVersion(99, 300);
+      void result.current.reanchorSeek(140);
+      void result.current.reanchorSeek(150);
+    });
+
+    // Release the first switch: a fresh latest-wins target replaces the old
+    // queued one, so the chained switch must start at the remembered 150.
+    await act(async () => {
+      releases[0]!(
+        jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-2",
+            playback_plan: fixturePlanV3({
+              session_id: "session-2",
+              plan_id: "plan:switch-98",
+              plan_attempt_key: "v3:switch-98",
+              requested_media_file_id: 98,
+              effective_media_file_id: 98,
+            }),
+          },
+          { status: 201 },
+        ),
+      );
+    });
+    await waitFor(() => expect(startBodies).toHaveLength(3));
+    // The chained switch carries the latest remembered seek, not the older
+    // queued switch position.
+    expect(startBodies[2]).toMatchObject({ file_id: 99, start_position: 150 });
+    // Settle the chained switch, then prove no competing replan raced it:
+    // the fold replaces the replan, it does not precede one.
+    await act(async () => {
+      releases[1]!(
+        jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-3",
+            playback_plan: fixturePlanV3({
+              session_id: "session-3",
+              plan_id: "plan:switch-99",
+              plan_attempt_key: "v3:switch-99",
+              requested_media_file_id: 99,
+              effective_media_file_id: 99,
+            }),
+          },
+          { status: 201 },
+        ),
+      );
+    });
+    await waitFor(() => expect(result.current.mediaFileId).toBe(99));
+    // The chained switch settled with replacing cleared; any racing replay
+    // would have issued a replan by now.
+    await waitFor(() => expect(result.current.replacing).toBe(false));
+    expect(replanBodies).toHaveLength(0);
     unmount();
   });
 
@@ -4313,7 +4732,7 @@ describe("usePlaybackSession plan audio inventory", () => {
     unmount();
   });
 
-  it("marks a committed declared source provisional after a verified plan", async () => {
+  it("ignores a same-source declared commit after a verified plan", async () => {
     const verifiedTracks = [
       { codec: "eac3", channels: 6, layout: "5.1", language: "eng", default: true },
     ];
@@ -4352,8 +4771,9 @@ describe("usePlaybackSession plan audio inventory", () => {
     await waitFor(() => expect(result.current.plan).not.toBeNull());
     expect(result.current.audioInventoryProvisional).toBe(false);
 
-    // A same-source committed push carries declared metadata; it must re-mark
-    // the menu provisional rather than rendering the list as final.
+    // A same-source declared commit is a stale delivery after the probe
+    // landed: it must leave the verified list and marker in place instead of
+    // flapping the menus disabled/enabled.
     act(() =>
       result.current.applyCommittedSource(
         { effectiveMediaFileId: 7, effectiveVirtualUri: null, inventoryStatus: "declared" },
@@ -4361,8 +4781,87 @@ describe("usePlaybackSession plan audio inventory", () => {
       ),
     );
 
-    expect(result.current.planAudioTracks).toEqual(declaredTracks);
-    expect(result.current.audioInventoryProvisional).toBe(true);
+    expect(result.current.planAudioTracks).toEqual(verifiedTracks);
+    expect(result.current.audioInventoryProvisional).toBe(false);
+    unmount();
+  });
+
+  it("ignores a same-source declared subtitle inventory after a verified one", async () => {
+    const verifiedSubtitles = [
+      {
+        track_id: "file:7:subtitle:0",
+        combined_index: 0,
+        source: "embedded",
+        codec: "subrip",
+        language: "eng",
+        forced: false,
+        default: false,
+        hearing_impaired: false,
+        delivery: "sidecar",
+        url: "/stream/session-1/subtitles/0.vtt?file_id=7",
+      },
+    ];
+    const declaredSubtitles = [
+      ...verifiedSubtitles,
+      {
+        track_id: "file:7:subtitle:1",
+        combined_index: 1,
+        source: "embedded",
+        codec: "subrip",
+        language: "spa",
+        forced: false,
+        default: false,
+        hearing_impaired: false,
+        delivery: "sidecar",
+        url: "/stream/session-1/subtitles/1.vtt?file_id=7",
+      },
+    ];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3({
+              inventory_status: "verified",
+              inventory_provenance: "verified",
+              subtitle: { mode: "off", inventory: verifiedSubtitles },
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+    expect(result.current.subtitleInventoryProvisional).toBe(false);
+
+    // A stale same-source declared delivery must not flap the subtitle menu
+    // back to provisional or overwrite the verified list.
+    act(() =>
+      result.current.applyInventoryUpdate({
+        session_id: "session-1",
+        inventory_revision: "inv:declared-after-verified",
+        inventory_status: "declared",
+        effective_media_file_id: 7,
+        audio_tracks: [],
+        subtitle_inventory: declaredSubtitles,
+      }),
+    );
+
+    expect(result.current.subtitleUrls).toHaveLength(1);
+    expect(result.current.subtitleInventoryProvisional).toBe(false);
     unmount();
   });
 

@@ -1008,6 +1008,19 @@ export function usePlaybackSession(
   const issueReplanRef = useRef<
     (options: ReplanOptions, retireSessionOnRefusal?: boolean) => Promise<boolean>
   >(async () => false);
+  // Latest-wins target for a reanchor dropped while a version switch owned the
+  // session. The switch completion replays it against the settled plan so a
+  // cold-start seek issued mid-switch is not silently lost — but only if the
+  // switch succeeded, the same playback generation still owns it, and no
+  // chained switch is about to replace the plan again.
+  const pendingSeekRef = useRef<{
+    positionSeconds: number;
+    playbackAttemptId: string | null;
+  } | null>(null);
+  // Late-bound reanchor: declared ahead of `reanchorSeek` so the switch
+  // completion above can call it without depending on render order. Bound in
+  // an effect — render-time ref writes are unsafe under concurrent React.
+  const reanchorSeekRef = useRef<(positionSeconds: number) => Promise<boolean>>(async () => false);
   const qualityRef = useRef(qualityPreference?.trim() || "auto");
 
   useEffect(() => {
@@ -1036,6 +1049,10 @@ export function usePlaybackSession(
       liveSourceIdentityRef.current = { fileId, uri };
       lastDeferredSourceIdentityRef.current = null;
       identityTransitionClockRef.current += 1;
+      // A source rotation moves where the stream actually is; verified evidence
+      // bound to the previous file/URI must not suppress inventory updates for
+      // the new one.
+      lastVerifiedIdentityRef.current = null;
       return changed;
     },
     [],
@@ -1072,6 +1089,9 @@ export function usePlaybackSession(
     if (scope.generation !== loadSequenceRef.current) {
       scope.generation = loadSequenceRef.current;
       scope.revisions.clear();
+      // A new load generation also abandons any remembered mid-switch seek: it
+      // belongs to the session this generation replaces.
+      pendingSeekRef.current = null;
     }
     return scope;
   }, []);
@@ -1194,6 +1214,14 @@ export function usePlaybackSession(
       // The adopted plan is the new live source; a rotation deferred before it
       // landed is superseded by what the plan itself names.
       transitionSourceIdentity(plan.effective_media_file_id, plan.effective_virtual_uri ?? null);
+      // A plan adopted with verified inventory seeds the verified-identity
+      // anchor that same-source declared pushes must not downgrade.
+      if (isInventoryProvisional(plan.inventory_status, plan.inventory_provenance) === false) {
+        lastVerifiedIdentityRef.current = {
+          fileId: plan.effective_media_file_id,
+          uri: plan.effective_virtual_uri ?? null,
+        };
+      }
       // A live plan means the dead session that forced a rebuild is behind us;
       // a replacement that landed on a new id clears the one-recovery guard so
       // that session can recover once in its turn.
@@ -1323,6 +1351,8 @@ export function usePlaybackSession(
       planAttemptIdRef.current = randomUUID();
       deferredPushesRef.current = [];
       transitionSourceIdentity(null, null);
+      pendingSeekRef.current = null;
+      lastVerifiedIdentityRef.current = null;
       setState((current) => {
         if (current.sessionId !== expectedSessionId) return current;
         return {
@@ -1685,6 +1715,9 @@ export function usePlaybackSession(
     revisionScopeRef.current.revisions.clear();
     deferredPushesRef.current = [];
     transitionSourceIdentity(null, null);
+    // A remembered mid-switch seek belongs to the request this effect resets.
+    pendingSeekRef.current = null;
+    lastVerifiedIdentityRef.current = null;
     // A new request re-derives Auto intent from its own props: without this,
     // the previous request's armed/disarmed state leaks into the new session.
     // Inline (not setAutoFallback: that callback is declared below this
@@ -1729,6 +1762,7 @@ export function usePlaybackSession(
       // Let that reply take the stale-start path and stop its own session
       // instead of adopting it into an abandoned player.
       loadSequenceRef.current += 1;
+      pendingSeekRef.current = null;
       const sid = sessionIdRef.current;
       if (!sid) return;
       // sendBeacon doesn't support DELETE, so the stop uses fetch keepalive.
@@ -1764,7 +1798,20 @@ export function usePlaybackSession(
       // switch's sequence once the switch lands, so it could clobber the
       // replacement instead of being discarded. Refuse until the switch
       // settles; the switch completion path owns what happens next.
-      if (switchingRef.current) return false;
+      if (switchingRef.current) {
+        // A cold-start seek is a viewer intent, not a stale op against the
+        // outgoing plan: remember its live target so the switch completion can
+        // replay it against the replacement once it settles. Scoped to the
+        // current playback generation so a failed or superseded switch never
+        // replays it, and a new session never inherits it.
+        if (options.operation === "seek_reanchor") {
+          pendingSeekRef.current = {
+            positionSeconds: options.positionSeconds ?? 0,
+            playbackAttemptId: playbackAttemptIdRef.current,
+          };
+        }
+        return false;
+      }
       if (replanInFlightRef.current) {
         const isPendingFailureRecovery =
           options.operation === "failure_recovery" || options.operation === "seek_failure_recovery";
@@ -2225,6 +2272,9 @@ export function usePlaybackSession(
     },
     [replan, reportEvent],
   );
+  useEffect(() => {
+    reanchorSeekRef.current = reanchorSeek;
+  }, [reanchorSeek]);
 
   /**
    * Re-reads the subtitle inventory.
@@ -2343,6 +2393,12 @@ export function usePlaybackSession(
     [recordPollApplied, transitionSourceIdentity],
   );
 
+  // The source identity (file + URI) last folded with a verified inventory.
+  // Guards the same-source declared-after-verified downgrade against interleaved
+  // pushes in one tick: the provisional flag on rendered state lags, so the
+  // synchronous identity is the authority for "this source is verified".
+  const lastVerifiedIdentityRef = useRef<SourceIdentity | null>(null);
+
   const foldCommittedSource = useCallback(
     (
       source: {
@@ -2359,11 +2415,27 @@ export function usePlaybackSession(
       const nextUri = source.effectiveVirtualUri ?? identity.uri;
       const identityChanged = nextFileId !== identity.fileId || nextUri !== identity.uri;
       if (identityChanged) transitionSourceIdentity(nextFileId, nextUri);
+      // Snapshot the verified identity *before* this fold stamps a new one, so
+      // the downgrade guard below answers "was the source we are about to
+      // replace already verified?" A verified push always wins; it is the
+      // declared-after-verified case that must be suppressed.
+      const verifiedAnchor = lastVerifiedIdentityRef.current;
+      if (source.inventoryStatus === "verified") {
+        lastVerifiedIdentityRef.current = { fileId: nextFileId, uri: nextUri };
+      }
       setState((current) => {
-        // Only positive probe evidence clears the marker. A declared push after
-        // a verified one marks the menu provisional again rather than rendering
-        // the (possibly empty) declared list as final.
+        // Only positive probe evidence clears the marker. A declared push for
+        // the same source after a verified one leaves the verified list and
+        // its confident marker in place; re-marking it would flap the menus
+        // disabled/enabled on every interleaved declared delivery.
         const verified = source.inventoryStatus === "verified";
+        const sameVerifiedSource =
+          !identityChanged &&
+          verifiedAnchor !== null &&
+          verifiedAnchor.fileId === nextFileId &&
+          (verifiedAnchor.uri ?? null) === (nextUri ?? null);
+        const declaredDowngrade = !verified && source.inventoryStatus != null && sameVerifiedSource;
+        if (declaredDowngrade) return current;
         const provisional =
           source.inventoryStatus == null ? current.audioInventoryProvisional : !verified;
         const richer = audioTracks.length > current.planAudioTracks.length;
@@ -2492,23 +2564,48 @@ export function usePlaybackSession(
    * live-inventory push carries, so a revision that drops, reorders, or empties
    * the tracks renders exactly what the server published. Only positive probe
    * evidence (`inventory_status: "verified"`) clears the provisional marker; a
-   * declared push after a verified one marks the menu provisional again rather
-   * than rendering the (possibly shorter) declared list as final. The plan
-   * object and its revisions are untouched, so the transport keeps playing.
+   * declared push after a verified one is a stale same-source delivery and is
+   * ignored instead of re-marking the menu. The plan object and its revisions
+   * are untouched, so the transport keeps playing.
    */
   const applySubtitleInventory = useCallback(
     (
       inventory: SubtitleInventoryItemV3[],
       inventoryStatus?: string | null,
       fileId?: number | null,
+      overrideVirtualUri?: string | null,
     ) => {
       const plan = planRef.current;
       if (!plan) return;
       const effectiveFileId = fileId ?? plan.effective_media_file_id;
+      // The URI must travel with the fold, not be re-read from rendered state:
+      // a rotation folded earlier in the same tick has moved the synchronous
+      // mirror but not yet the rendered state, so stateRef would stamp the
+      // verified anchor with the previous source's URI.
       const effectiveVirtualUri =
-        stateRef.current.effectiveVirtualUri ?? plan.effective_virtual_uri;
+        overrideVirtualUri ?? stateRef.current.effectiveVirtualUri ?? plan.effective_virtual_uri;
       const verified = inventoryStatus === "verified";
       const sameFile = effectiveFileId === plan.effective_media_file_id;
+      // A declared push after a verified one leaves the verified list and its
+      // confident marker in place; re-marking it would flap the subtitle menu
+      // disabled/enabled on every interleaved declared delivery. Same-source
+      // means same identity (file + URI) as the last verified evidence, not
+      // the UI provisional flag, which lags a same-tick pair. Snapshot before
+      // this fold stamps a new verified identity (a verified push must win).
+      const verifiedAnchor = lastVerifiedIdentityRef.current;
+      const sameVerifiedSource =
+        verifiedAnchor !== null &&
+        verifiedAnchor.fileId === effectiveFileId &&
+        (verifiedAnchor.uri ?? null) === (effectiveVirtualUri ?? null);
+      const declaredDowngrade =
+        sameVerifiedSource && inventoryStatus != null && inventoryStatus !== "verified";
+      if (declaredDowngrade) return;
+      if (verified) {
+        lastVerifiedIdentityRef.current = {
+          fileId: effectiveFileId,
+          uri: effectiveVirtualUri ?? null,
+        };
+      }
       const provisional =
         inventoryStatus == null ? stateRef.current.subtitleInventoryProvisional : !verified;
       // A verified push is the probe landing: it replaces a declared list even
@@ -2572,10 +2669,14 @@ export function usePlaybackSession(
         );
       }
       if (payload.subtitle_inventory !== undefined) {
+        // Carry the payload's identity into the subtitle fold: after an A→B
+        // rotation earlier in the same tick, the rendered state still names A,
+        // and only the payload names the source B's inventory describes.
         applySubtitleInventory(
           payload.subtitle_inventory,
           payload.inventory_status ?? null,
           payload.effective_media_file_id ?? null,
+          payload.effective_virtual_uri ?? null,
         );
       }
       if (payload.inventory_revision != null) {
@@ -2862,15 +2963,32 @@ export function usePlaybackSession(
           // held back; now that the replacement plan has settled, fold it in if
           // it still names the file that won.
           flushDeferredPushesRef.current();
+          const rememberedSeek = pendingSeekRef.current;
+          pendingSeekRef.current = null;
           const latest = pendingSwitchFileIdRef.current;
           const latestPosition = pendingSwitchPositionRef.current;
           pendingSwitchFileIdRef.current = null;
           pendingSwitchPositionRef.current = null;
           if (latest !== null && latest !== stateRef.current.mediaFileId) {
-            // A rotation during the switch clears the queued position (it was
-            // captured against the outgoing timeline), so fall back to the live
-            // playhead rather than the first click's stale closure position.
-            switchVersion(latest, latestPosition ?? playbackPositionRef.current);
+            // A chained switch wins: fold the remembered seek into its start
+            // position instead of issuing a replan against the plan that is
+            // about to be replaced.
+            switchVersion(
+              latest,
+              rememberedSeek && rememberedSeek.playbackAttemptId === playbackAttemptIdRef.current
+                ? rememberedSeek.positionSeconds
+                : (latestPosition ?? playbackPositionRef.current),
+            );
+          } else if (
+            rememberedSeek &&
+            rememberedSeek.playbackAttemptId !== null &&
+            rememberedSeek.playbackAttemptId === playbackAttemptIdRef.current &&
+            planRef.current
+          ) {
+            // Only replay when the switch adopted the same playback attempt the
+            // seek was refused in; a chained switch, a failed switch, or a
+            // fresh attempt all discard it via the resets above.
+            void reanchorSeekRef.current(rememberedSeek.positionSeconds);
           }
         }
       })();
