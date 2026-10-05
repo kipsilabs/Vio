@@ -109,7 +109,7 @@ func (s *Service) failClaim(ctx context.Context, claim RunClaim, summary Executi
 	}
 	if err := s.repo.failRun(finishCtx, claim, summary, message); err != nil {
 		if !errors.Is(err, ErrRunNotFound) {
-			slog.WarnContext(finishCtx, "history import: terminal write failed", "run_id", claim.RunID, "error", runFailureCause(err), "cause", runFailureCause(cause))
+			slog.WarnContext(finishCtx, "history import: terminal write failed", "run_id", claim.RunID, "error", err, "cause", runFailureCause(cause))
 		}
 		return
 	}
