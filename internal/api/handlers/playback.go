@@ -660,6 +660,13 @@ type PlaybackHandler struct {
 	subtitleSlotsOnce sync.Once
 	subtitleSlots     *virtualDetachedGate
 
+	// virtualPreprobeOnce guards lazy construction of the content-keyed
+	// pin-liveness memo (see playback_virtual_preprobe.go). A fresh listing
+	// observation lets a cold start whose row already names a candidate skip
+	// the provider listing; a miss falls through to the normal path.
+	virtualPreprobeOnce  sync.Once
+	virtualPreprobeCache *virtualPreprobeCache
+
 	// prefetchOnce guards the lazy prefetch worker pool. Prefetch work is
 	// admitted into a bounded queue (prefetchQueue) before any goroutine
 	// handles it, deduplicated by source+profile equivalence key

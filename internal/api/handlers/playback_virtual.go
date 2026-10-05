@@ -1372,6 +1372,14 @@ type resolvedVirtualPlaybackSource struct {
 	// release re-identified, not a substitution, and a rotation that requires
 	// release continuity may accept it.
 	IdentityRematched bool
+	// DeferredProbe, when non-nil, is the probe the fresh-start resolve wants
+	// run after the transport commits and the first-byte URL is handed back.
+	// The resolve deliberately does not spawn it inline: session creation,
+	// recipe persistence, and transport commit run first so the client gets a
+	// playable URL without waiting on ffprobe enumeration, and the start path
+	// spawns the probe the moment the URL exists. Nil for a resolve that probed
+	// synchronously or had nothing to probe.
+	DeferredProbe *virtualDeferredProbeV3
 }
 
 // virtualProbeIdentity is the durable provider identity of the candidate a
@@ -1611,6 +1619,14 @@ type virtualResolveOptionsV3 struct {
 	// automatic resolves never set it and stay on the floor. The startup
 	// budgets still bound the recovery, and exhaustion keeps its honest cause.
 	bypassProviderFloor bool
+	// deferProbePastCommit hands the candidate-declared upgrade probe back to
+	// the caller instead of spawning it on the start path, so session creation,
+	// recipe persistence, and the transport commit run before any ffprobe. Only
+	// the fresh-start resolve sets it: its caller (the v3 start path) spawns the
+	// probe once the first-byte URL exists and marks the plan tracks_pending.
+	// A synchronous replan/rehydration leaves it false so the probed inventory
+	// is available on its response.
+	deferProbePastCommit bool
 }
 
 // virtualCandidateRotationContextKeyV3 carries the rotation intent across the
@@ -2142,8 +2158,18 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		slog.DebugContext(r.Context(), "virtual playback list suppressed: provider answered empty inside window",
 			"component", "api", "content_id", file.ContentID, "file_id", file.ID)
 	}
+	// Pin-liveness pre-probe: a fresh listing observation for this content lets
+	// a row that already names a concrete candidate skip the full provider
+	// listing. It only removes a listing that a live observation already
+	// justified — a row without a persisted candidate still needs the list, and
+	// a forced relist, an exclusion, or an unusable/failed row still lists so
+	// recovery is never blocked. A miss falls through to the normal path.
+	preprobeHit := h.virtualPreprobeHit(
+		&fileIdentityV3{contentID: file.ContentID, ownerID: file.VirtualOwnerInstallationID},
+		persistedResultURI, requestedRowUnusable, exclusionPending, forceRelist, time.Now(),
+	)
 	if (shouldListVirtualPlaybackCandidates(noResult, needsCandidateMetadata && !cachedListing, forceRelist) ||
-		((exclusionPending || requestedRowUnusable) && !cachedListing)) && persistedResumeURI == "" && !emptySuppressed && h.VirtualPlaybackStreamLister != nil {
+		((exclusionPending || requestedRowUnusable) && !cachedListing)) && persistedResumeURI == "" && !emptySuppressed && !preprobeHit && h.VirtualPlaybackStreamLister != nil {
 		trace.listed = true
 		trace.listRan = true
 		listStart := time.Now()
@@ -2170,6 +2196,11 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			if len(streams) > maxVirtualPlaybackStreams {
 				streams = streams[:maxVirtualPlaybackStreams]
 			}
+			// The listing answered with candidates: stamp a short-lived
+			// preprobe liveness observation so a subsequent start whose row
+			// names a concrete candidate can skip this listing while it stays
+			// fresh (see virtualPreprobeHit).
+			h.recordVirtualPreprobeLiveness(&fileIdentityV3{contentID: file.ContentID, ownerID: file.VirtualOwnerInstallationID}, time.Now())
 			// The provider answered with candidates, so a recovery bypass is no
 			// longer defeating a provider fail-fast: clear this listing's
 			// budget so a later failure starts from a full window. An empty
@@ -2735,10 +2766,19 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				transient.HDR = true
 			}
 			h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
+			// The ffprobe enumeration is deliberately not spawned inline on the
+			// fresh-start path: the resolve hands the probe to the start path,
+			// which spawns it only after the transport commit and the first-byte
+			// URL. Session creation, recipe persistence, and the commit therefore
+			// run without waiting on a multi-second remote ffprobe, and the
+			// client gets its playable URL immediately. A caller that needs the
+			// probed inventory on the response (a synchronous replan/rehydration)
+			// does not opt in and keeps the inline probe below.
+			var deferred *virtualDeferredProbeV3
 			if h.VirtualPlaybackSourceProber != nil || h.VirtualPlaybackSourceProberWithHeaders != nil {
 				probeKey := virtualProbeFailureKey(cand.URI, oid)
 				probeTransient := cloneVirtualProbeTransient(transient)
-				// Zero the duration so the background probe measures the
+				// Zero the duration so the deferred probe measures the
 				// empirical duration instead of inheriting the catalog value.
 				probeTransient.Duration = 0
 				if virtualProbeFailures.recent(probeKey) {
@@ -2752,34 +2792,34 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 						URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenanceDeclared, ResolutionAssumed: resolutionAssumed,
 					}, resolvedIdentity, resolvedRematched), nil
 				}
-				probeCand := cand
-				expectedRuntimeMinutes := h.virtualExpectedRuntimeMinutes(r.Context(), file)
-				if gate := h.detachedGate(); gate.tryAcquire() {
-					// The start path may outlive the request (the client can
-					// disconnect while the probe completes), so its context
-					// drops the request cancellation but still follows the
-					// service lifecycle. The goroutine starts after the
-					// synchronous provider resolve returned, so the fetch time
-					// does not consume this budget.
-					bgCtx, bgCancel := h.virtualDetachedContext(r.Context(), virtualBackgroundProbeBudget)
-					go func() {
-						defer gate.release()
-						defer bgCancel()
-						h.probeVirtualSourceAndPersist(bgCtx, stickyKey, file, streamURL, probeTransient, probeCand, expectedRuntimeMinutes, oid)
-					}()
+				if options.deferProbePastCommit {
+					deferred = &virtualDeferredProbeV3{
+						stickyKey:              stickyKey,
+						file:                   file,
+						streamURL:              streamURL,
+						probeTransient:         &probeTransient,
+						cand:                   cand,
+						expectedRuntimeMinutes: h.virtualExpectedRuntimeMinutes(r.Context(), file),
+						ownerID:                oid,
+					}
 				} else {
-					slog.WarnContext(r.Context(), "virtual background probe skipped: detached worker budget exhausted",
-						"component", "api", "candidate_uri", cand.URI)
-					// This candidate is the one the foreground request will
-					// serve, so gate pressure must not leave its row unprobed
-					// and force the slow list+probe path on every later play.
-					// One bounded synchronous probe+direct write per foreground
-					// request keeps the fallback from becoming a second pool.
-					h.probeVirtualCandidateForegroundFallback(r.Context(), stickyKey, file, streamURL, probeTransient, probeCand, expectedRuntimeMinutes, oid)
+					probeCand := cand
+					expectedRuntimeMinutes := h.virtualExpectedRuntimeMinutes(r.Context(), file)
+					if gate := h.detachedGate(); gate.tryAcquire() {
+						bgCtx, bgCancel := h.virtualDetachedContext(r.Context(), virtualBackgroundProbeBudget)
+						go func() {
+							defer gate.release()
+							defer bgCancel()
+							h.probeVirtualSourceAndPersist(bgCtx, stickyKey, file, streamURL, probeTransient, probeCand, expectedRuntimeMinutes, oid)
+						}()
+					} else {
+						h.probeVirtualCandidateForegroundFallback(r.Context(), stickyKey, file, streamURL, probeTransient, probeCand, expectedRuntimeMinutes, oid)
+					}
 				}
 			}
 			return withResolvedCandidate(&resolvedVirtualPlaybackSource{
 				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenancePending, ResolutionAssumed: resolutionAssumed,
+				DeferredProbe: deferred,
 			}, resolvedIdentity, resolvedRematched), nil
 		}
 		if h.VirtualPlaybackSourceProber == nil && h.VirtualPlaybackSourceProberWithHeaders == nil {

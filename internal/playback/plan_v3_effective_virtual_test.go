@@ -361,6 +361,26 @@ func TestPlanAttemptKeyV3IgnoresVirtualSourceRevision(t *testing.T) {
 	}
 }
 
+// TracksPending is a provisional-inventory marker, not a route input: the same
+// executable recipe served with a pending or complete menu is the same plan, so
+// marking it must not perturb plan identity or a client replay would see a
+// spurious new attempt.
+func TestPlanAttemptKeyV3IgnoresTracksPending(t *testing.T) {
+	requested := &models.MediaFile{ID: 41, ContentID: "movie-tt1234567", Container: "mkv", FilePath: "virtual://movie/tt1234567"}
+	plan := virtualCandidatePlanV3(t, requested, "working")
+
+	beforeID := DeterministicPlanIDV3("attempt-1", plan.RequestedMediaFileID, plan.EffectiveMediaFileID, *plan)
+	before := PlanAttemptKeyV3(*plan, "output-1", nil)
+	mutated := *plan
+	mutated.TracksPending = true
+	if after := DeterministicPlanIDV3("attempt-1", mutated.RequestedMediaFileID, mutated.EffectiveMediaFileID, mutated); after != beforeID {
+		t.Errorf("plan ID changed with tracks_pending: %q -> %q", beforeID, after)
+	}
+	if after := PlanAttemptKeyV3(mutated, "output-1", nil); after != before {
+		t.Errorf("attempt key changed with tracks_pending: %q -> %q", before, after)
+	}
+}
+
 // The audio-only planner builds its own plan; it must expose the revision too.
 func TestPlanPlaybackV3AudioOnlyExposesVirtualSourceRevision(t *testing.T) {
 	candidate := audioOnlyFixtureFileV3()
