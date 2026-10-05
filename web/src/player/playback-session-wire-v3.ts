@@ -1,4 +1,5 @@
 import {
+  FEATURE_DEFAULT_AUDIO_RECONCILE_RESPONSE_V3,
   FEATURE_INVENTORY_UPDATED_V3,
   FEATURE_PLAN_INVALIDATED_V3,
   FEATURE_PLAYBACK_PLAN_V3,
@@ -37,9 +38,16 @@ const BASE_CLIENT_FEATURES_V3 = [FEATURE_PLAYBACK_PLAN_V3];
  * server names, follows the realtime `source_committed` event to re-key its
  * version menu to the streamed release, and folds the realtime
  * `inventory_updated` push into its track menus.
+ *
+ * `plan_invalidated_v1` stays on its own promise and is not sufficient for the
+ * audio reconciliation: the server gates that withdrawal on
+ * `default_audio_reconcile_response_v1`, which this surface also advertises
+ * because it answers the withdrawal as a non-failure `track_change` and names
+ * the reason on the replan.
  */
 export const VIDEO_CLIENT_FEATURES_V3 = [
   FEATURE_PLAN_INVALIDATED_V3,
+  FEATURE_DEFAULT_AUDIO_RECONCILE_RESPONSE_V3,
   FEATURE_SOURCE_COMMITTED_V3,
   FEATURE_INVENTORY_UPDATED_V3,
 ];
@@ -72,6 +80,13 @@ export interface ReplanOptions {
    * dead-source recovery would refuse to rotate while the menu shows Auto.
    */
   autoFallback?: boolean;
+  /**
+   * The `reason` string of the `plan_invalidated` command this replan answers,
+   * verbatim. Set only by the default-audio reconciliation path in
+   * `invalidatePlan`; every other replan omits it, so the server can correlate
+   * this replan with the decision it is holding without a heuristic.
+   */
+  answersPlanInvalidation?: string;
 }
 
 export interface StartRequestInput {
@@ -203,6 +218,12 @@ export function buildReplanRequestV3(input: ReplanRequestInput): ReplanRequestV3
     position_seconds: clampPosition(input.positionSeconds),
     metered: input.metered,
     ...(input.autoFallback !== undefined ? { auto_fallback: input.autoFallback } : {}),
+    // Omitted rather than sent empty: an absent field means "this replan is not
+    // an answer to any withdrawal", which is what every non-reconciliation
+    // replan actually is.
+    ...(input.answersPlanInvalidation
+      ? { answers_plan_invalidation: input.answersPlanInvalidation }
+      : {}),
     selected_tracks: selectedTracks,
     client_capabilities: input.clientCapabilities,
     client_playback_context: input.clientPlaybackContext,

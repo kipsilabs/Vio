@@ -116,6 +116,11 @@ describe("buildStartRequestV3", () => {
 
   // Feature tokens are promises the server enforces, so a surface advertises
   // only what it implements: the base set alone unless the caller names more.
+  // `default_audio_reconcile_response_v1` is part of the video surface's promise
+  // — the server gates the audio reconciliation withdrawal on it, so a start
+  // that omits it is sent no withdrawal at all and plays the wrong audio until
+  // its next start. `plan_invalidated_v1` stays alongside it for genuine route
+  // failures.
   it("advertises only the surface's own features", () => {
     expect(
       buildStartRequestV3({ ...startBase, extraClientFeatures: VIDEO_CLIENT_FEATURES_V3 })
@@ -123,6 +128,7 @@ describe("buildStartRequestV3", () => {
     ).toEqual([
       "playback_plan_v3",
       "plan_invalidated_v1",
+      "default_audio_reconcile_response_v1",
       "source_committed_event_v1",
       "inventory_updated_event_v1",
     ]);
@@ -245,7 +251,8 @@ describe("buildReplanRequestV3", () => {
 
   // A replan that sends `client_features` replaces the negotiated list, so a
   // replan which advertised less than the start did would silently withdraw the
-  // promise the server gates the invalidation command on.
+  // promise the server gates the invalidation command on — including the
+  // reconciliation capability.
   it("re-advertises the same features a start negotiated", () => {
     expect(
       buildReplanRequestV3({
@@ -256,9 +263,31 @@ describe("buildReplanRequestV3", () => {
     ).toEqual([
       "playback_plan_v3",
       "plan_invalidated_v1",
+      "default_audio_reconcile_response_v1",
       "source_committed_event_v1",
       "inventory_updated_event_v1",
     ]);
+  });
+
+  // The correlation field asserts "this replan is the answer to that withdrawal",
+  // so it travels verbatim and only when the caller has one to name.
+  it("carries the answered invalidation reason when the replan has one", () => {
+    const body = buildReplanRequestV3({
+      ...replanBase,
+      operation: "track_change",
+      answersPlanInvalidation: "default_audio_reconciliation",
+    });
+
+    expect(body.answers_plan_invalidation).toBe("default_audio_reconciliation");
+  });
+
+  it("omits the answered invalidation reason from an ordinary replan", () => {
+    expect(buildReplanRequestV3({ ...replanBase, operation: "quality_change" })).not.toHaveProperty(
+      "answers_plan_invalidation",
+    );
+    expect(
+      buildReplanRequestV3({ ...replanBase, operation: "failure_recovery" }),
+    ).not.toHaveProperty("answers_plan_invalidation");
   });
 
   it("re-arms the server's auto fallback when the viewer selects Auto", () => {
@@ -3508,6 +3537,10 @@ describe("usePlaybackSession server-invalidated plans", () => {
     const body = replanBodies[0]!;
     expect(body.operation).toBe("track_change");
     expect(body.position_seconds).toBe(450);
+    // The reason goes back on the wire verbatim so the server can match this
+    // replan against the decision it is still holding, instead of inferring the
+    // pairing from the operation and the absent failure.
+    expect(body.answers_plan_invalidation).toBe(PLAN_INVALIDATED_DEFAULT_AUDIO_RECONCILIATION);
     // No failure payload: the server rejects one on a track_change, and the
     // classification would indict a route that never failed.
     expect(body).not.toHaveProperty("failure");
@@ -3570,6 +3603,10 @@ describe("usePlaybackSession server-invalidated plans", () => {
       attempted_plan_keys: ["v3:0123456789abcdef"],
       failure: { classification: "video_copy_unsafe" },
     });
+    // A route failure carries its own evidence in `failure`; echoing a reason
+    // here would claim the server asked for a non-failure correction it never
+    // sent, and the server correlates on it.
+    expect(replanBodies[0]).not.toHaveProperty("answers_plan_invalidation");
 
     unmount();
   });
@@ -3614,6 +3651,103 @@ describe("usePlaybackSession server-invalidated plans", () => {
       attempted_plan_keys: ["v3:0123456789abcdef"],
       failure: { classification: "some_reason_from_a_newer_server" },
     });
+
+    unmount();
+  });
+
+  // The correlation field is scoped to the reconciliation path because it is a
+  // claim about a pending server decision. A quality change, a subtitle change
+  // and an inventory refresh are viewer intents with no withdrawal to answer,
+  // and one of them happens to share the reconciliation's `track_change`
+  // operation — which is exactly why the field cannot be inferred from the
+  // operation alone.
+  it("sends no answered-invalidation reason on viewer-initiated replans", async () => {
+    const replanBodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal(
+      "fetch",
+      invalidationFetchMock(replanBodies, {
+        protocol_version: 3,
+        server_features: ["playback_plan_v3"],
+        outcome: "playable",
+        session_id: "session-1",
+        playback_plan: fixturePlanV3(),
+      }),
+    );
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "original"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe("plan:0123456789abcdef"));
+
+    await act(async () => {
+      result.current.changeQuality("720p", 120);
+    });
+    await waitFor(() => expect(replanBodies).toHaveLength(1));
+
+    await act(async () => {
+      result.current.changeSubtitleTrack(0, 200);
+    });
+    await waitFor(() => expect(replanBodies).toHaveLength(2));
+
+    await act(async () => {
+      await result.current.refreshSubtitles(300);
+    });
+    await waitFor(() => expect(replanBodies).toHaveLength(3));
+
+    expect(replanBodies.map((body) => body.operation)).toEqual([
+      "quality_change",
+      "track_change",
+      "track_change",
+    ]);
+    for (const body of replanBodies) {
+      expect(body).not.toHaveProperty("answers_plan_invalidation");
+    }
+
+    unmount();
+  });
+
+  // The server decides whether to send the reconciliation withdrawal by reading
+  // the advertised features, so both the capability and the promise it belongs
+  // to have to be on every request that can carry one — start and replan alike,
+  // because a replan replaces the negotiated list.
+  it("advertises the reconciliation capability on start and replan", async () => {
+    const replanBodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal(
+      "fetch",
+      invalidationFetchMock(replanBodies, {
+        protocol_version: 3,
+        server_features: ["playback_plan_v3"],
+        outcome: "playable",
+        session_id: "session-1",
+        playback_plan: fixturePlanV3({ plan_id: "plan:2222222222222222" }),
+      }),
+    );
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe("plan:0123456789abcdef"));
+
+    await act(async () => {
+      await result.current.invalidatePlan(
+        "plan:0123456789abcdef",
+        PLAN_INVALIDATED_DEFAULT_AUDIO_RECONCILIATION,
+        450,
+      );
+    });
+    expect(replanBodies).toHaveLength(1);
+
+    const startCall = vi
+      .mocked(fetch)
+      .mock.calls.find(([url]) => String(url).endsWith("/playback/start"));
+    const startBody = JSON.parse(String(startCall?.[1]?.body)) as { client_features: string[] };
+    for (const features of [startBody.client_features, replanBodies[0]!.client_features]) {
+      expect(features).toContain("default_audio_reconcile_response_v1");
+      // Genuine route-failure invalidations still depend on the older token.
+      expect(features).toContain("plan_invalidated_v1");
+    }
 
     unmount();
   });

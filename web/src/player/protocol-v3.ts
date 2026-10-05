@@ -138,6 +138,20 @@ export const FEATURE_OUTPUT_CHANGE_V3 = "output_change_v1";
 export const FEATURE_PLAN_INVALIDATED_V3 = "plan_invalidated_v1";
 
 /**
+ * The client can answer the `default_audio_reconciliation` withdrawal without
+ * failure semantics, and can name that withdrawal as the reason for a replan.
+ *
+ * It is a separate promise from {@link FEATURE_PLAN_INVALIDATED_V3} on purpose.
+ * The server gates the *audio reconciliation* withdrawal on this token rather
+ * than on `plan_invalidated_v1`, because a client that has never heard of that
+ * reason would replay it as a `failure_recovery` and exclude the very route
+ * that is working. A client without this token is therefore sent no withdrawal
+ * at all and simply plays the corrected audio on its next start, which is
+ * degraded but healthy — strictly better than the failure path.
+ */
+export const FEATURE_DEFAULT_AUDIO_RECONCILE_RESPONSE_V3 = "default_audio_reconcile_response_v1";
+
+/**
  * The client handles the realtime `source_committed` event: it re-keys its
  * version menu to the effective source the transport committed to and adopts
  * the declared audio inventory without waiting for a replan or probe. It is a
@@ -384,6 +398,16 @@ export interface ReplanRequestV3 {
    * start-time intent unchanged. Never authorizes a healthy mid-play switch.
    */
   auto_fallback?: boolean;
+  /**
+   * The `reason` of the `plan_invalidated` command this replan is answering,
+   * verbatim. Set only by a client that advertises
+   * {@link FEATURE_DEFAULT_AUDIO_RECONCILE_RESPONSE_V3} and only on the
+   * reconciliation replan, so the server can correlate the response with the
+   * decision it is still holding rather than infer it. Every other replan omits
+   * it: a claim of answering a withdrawal that never happened would be worse
+   * than silence.
+   */
+  answers_plan_invalidation?: string;
   bandwidth_estimate_kbps?: number;
   bandwidth_cap_kbps?: number;
   selected_tracks: SelectedTracksV3;

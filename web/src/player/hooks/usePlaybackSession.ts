@@ -2251,6 +2251,13 @@ export function usePlaybackSession(
    * `fallback_reason` reports the server's own reason verbatim, which already
    * tells the two cases apart.
    *
+   * That replan also echoes the reason back as `answers_plan_invalidation`, so
+   * the server can match it against the decision it is holding rather than
+   * infer the pairing from the operation and the missing failure. It is the only
+   * replan that does so: the field asserts "this is the answer to that
+   * withdrawal", and every other replan — including the failure recovery below —
+   * has no withdrawal to answer.
+   *
    * A start or replan already in flight is waited out first. The server commits
    * a replacement plan and starts the copy-safety scan behind it *before* the
    * response reaches the client, so an invalidation can name a plan this client
@@ -2277,7 +2284,15 @@ export function usePlaybackSession(
       // reconciliation reason if the server sent something longer, which is a
       // different reason and must keep failure semantics.
       if (reason.trim() === PLAN_INVALIDATED_DEFAULT_AUDIO_RECONCILIATION) {
-        return replan({ operation: "track_change", positionSeconds: currentPosition });
+        // The reason goes back on the wire verbatim, not trimmed to the
+        // classification: it is how the server tells that this replan *is* the
+        // answer to the decision it persisted, instead of falling back to a
+        // weaker heuristic on the operation and the absence of a failure.
+        return replan({
+          operation: "track_change",
+          positionSeconds: currentPosition,
+          answersPlanInvalidation: reason.trim(),
+        });
       }
       return replan({
         operation: "failure_recovery",
