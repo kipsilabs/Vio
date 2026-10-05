@@ -37,6 +37,11 @@ export class HlsStartupGuard {
     return this.state === "failed";
   }
 
+  /** True only while initial startup is still in flight (not yet playable). */
+  isStarting() {
+    return this.state === "starting";
+  }
+
   dispose() {
     this.state = "disposed";
     this.clearTimeout();

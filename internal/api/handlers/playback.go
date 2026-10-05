@@ -2511,6 +2511,19 @@ func (h *PlaybackHandler) HandleGetTranscodeManifest(w http.ResponseWriter, r *h
 			writeError(w, http.StatusNotFound, "not_found", "Transcode session not found")
 			return
 		}
+		// A slow-but-alive encoder (upstream stall, slow probe) must not kill
+		// the session: answer 503 + Retry-After with a retryable code so the
+		// client polls the manifest again instead of erroring out. A 200 with
+		// a segment-less playlist is fatal to hls.js ("no levels found"), so
+		// the retry signal stays a 503 — but a retryable one, distinct from
+		// the dead-encoder case below. This is what the ff4ecbcf incident
+		// showed: ffmpeg ran 20 minutes producing segments while four polls
+		// 503'd with a body the client treated as terminal.
+		if transcodeSession != nil && !transcodeSession.IsSourceRejected() && transcodeSession.IsRunning() {
+			w.Header().Set("Retry-After", "2")
+			writeError(w, http.StatusServiceUnavailable, "not_ready_retry", "Transcode manifest not ready yet")
+			return
+		}
 		slog.ErrorContext(r.Context(), "build transcode manifest", "component", "api", "error", err, "session", sessionID, "playback_session_id", sessionID)
 		writeError(w, http.StatusServiceUnavailable, "unavailable", "Transcode manifest not ready")
 		return

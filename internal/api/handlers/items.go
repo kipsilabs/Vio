@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -124,6 +126,17 @@ type ItemsHandler struct {
 	// VirtualFileByID loads a MediaFile for a version FileID so prefetch can
 	// warm exactly the rows the detail page offers. Nil disables prefetch.
 	virtualFileByID VirtualFileByID
+	// virtualPrefetchInflight collapses repeated catalog reads for the same
+	// file+profile before any row load or goroutine: the entry lives only
+	// while the background load runs. Delete is deferred as the goroutine's
+	// first statement, so it runs even on panic unwind; no reaper needed.
+	virtualPrefetchInflight sync.Map // string -> struct{}
+	// virtualPrefetchLoadSem bounds concurrent background row-loads across
+	// distinct keys. Created once via prefetchSemOnce; the local captured in
+	// prefetchVirtualFileIDs is used for both acquire and release so a
+	// concurrent init can never split them across channels.
+	virtualPrefetchLoadSem chan struct{}
+	prefetchSemOnce        sync.Once
 }
 
 // VirtualPrefetcher warms virtual playback listings off the click path.
@@ -571,33 +584,77 @@ func (h *ItemsHandler) HandleGetWatchDetail(w http.ResponseWriter, r *http.Reque
 // first virtual version is warmed; the start path ranks per device from the
 // neutral cache entry.
 func (h *ItemsHandler) prefetchWatchDetailVirtual(ctx context.Context, detail *catalog.WatchDetail, profileID string) {
-	if h == nil || h.virtualPrefetcher == nil || h.virtualFileByID == nil || detail == nil || profileID == "" {
+	if detail == nil {
 		return
 	}
 	if detail.Type != itemTypeMovie && detail.Type != itemTypeEpisode {
 		return
 	}
 	fileIDs := make([]int, 0, 2)
-	seen := make(map[int]bool)
 	for _, v := range detail.Versions {
-		if v.FileID != 0 && !seen[v.FileID] {
-			seen[v.FileID] = true
+		if v.FileID != 0 {
 			fileIDs = append(fileIDs, v.FileID)
 		}
 		if len(fileIDs) >= 2 {
 			break
 		}
 	}
-	if len(fileIDs) == 0 {
+	h.prefetchVirtualFileIDs(ctx, fileIDs, profileID)
+}
+
+// prefetchVirtualFileIDs warms virtual candidate listings for raw file rows,
+// shared by watch-detail, item-detail, and episode-list triggers. Dedupes,
+// caps at 2, and runs fully off the response path.
+func (h *ItemsHandler) prefetchVirtualFileIDs(ctx context.Context, fileIDs []int, profileID string) {
+	if h == nil || h.virtualPrefetcher == nil || h.virtualFileByID == nil || profileID == "" {
 		return
 	}
+	seen := make(map[int]bool)
+	unique := make([]int, 0, 2)
+	for _, fid := range fileIDs {
+		if fid != 0 && !seen[fid] {
+			seen[fid] = true
+			unique = append(unique, fid)
+		}
+		if len(unique) >= 2 {
+			break
+		}
+	}
+	if len(unique) == 0 {
+		return
+	}
+	fileIDs = unique
 	// Row loads run off the response path: the detail response must not wait
 	// on database reads for an optional warm. A short timeout bounds the
 	// background load; PrefetchVirtualPlayback itself is already bounded
 	// (2 files), deduped, and detached.
+	//
+	// File-level admission runs BEFORE the goroutine and the row loads: the
+	// content-keyed admission inside PrefetchVirtualPlayback only fires after
+	// rows load, so without this every catalog read would pay DB lookups even
+	// for an already-warming file. Keys live only for the load window.
+	admitKey := virtualPrefetchFileAdmitKey(fileIDs, profileID)
+	if _, loaded := h.virtualPrefetchInflight.LoadOrStore(admitKey, struct{}{}); loaded {
+		return
+	}
+	// Shed when saturated: speculative work must never queue without bound.
+	// capVirtualPrefetchLoads mirrors the prefetch worker count so background
+	// loads cannot outrun the workers that consume them.
+	h.prefetchSemOnce.Do(func() {
+		h.virtualPrefetchLoadSem = make(chan struct{}, capVirtualPrefetchLoads)
+	})
+	sem := h.virtualPrefetchLoadSem
+	select {
+	case sem <- struct{}{}:
+	default:
+		h.virtualPrefetchInflight.Delete(admitKey)
+		return
+	}
 	prefetcher := h.virtualPrefetcher
 	loader := h.virtualFileByID
 	go func() {
+		defer h.virtualPrefetchInflight.Delete(admitKey)
+		defer func() { <-sem }()
 		// WithoutCancel keeps request values (user ID for PrefetchVirtualPlayback)
 		// while detaching from request cancellation; the timeout still bounds
 		// the background load.
@@ -617,6 +674,29 @@ func (h *ItemsHandler) prefetchWatchDetailVirtual(ctx context.Context, detail *c
 		prefetcher.PrefetchVirtualPlayback(loadCtx, files, profileID)
 	}()
 }
+
+// virtualPrefetchFileAdmitKey collapses repeated catalog reads for the same
+// rows+profile before any row load. Sorted so episode order doesn't multiply
+// keys; capped at the same 2 rows the loader warms.
+func virtualPrefetchFileAdmitKey(fileIDs []int, profileID string) string {
+	sorted := append([]int(nil), fileIDs...)
+	sort.Ints(sorted)
+	var sb strings.Builder
+	sb.WriteString(profileID)
+	sb.WriteByte(0)
+	for i, fid := range sorted {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteString(strconv.Itoa(fid))
+	}
+	return sb.String()
+}
+
+// capVirtualPrefetchLoads bounds concurrent background catalog-prefetch row
+// loads. Distinct file-set keys each take one slot; identical repeats collapse
+// on the inflight map before reaching here.
+const capVirtualPrefetchLoads = 4
 
 // trailerRefreshRate bounds how often one user may trigger trailer fetches
 // across all items. The per-item cooldown enforced by the metadata service is
