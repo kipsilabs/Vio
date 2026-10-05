@@ -15,6 +15,7 @@ import {
   VIDEO_CLIENT_FEATURES_V3,
 } from "../playback-session-wire-v3";
 import { markPlaybackIntent } from "../first-frame";
+import { PLAN_INVALIDATED_DEFAULT_AUDIO_RECONCILIATION } from "../realtime-protocol";
 import type { PlayerAudioTrack } from "../types";
 import type { SubtitleInventoryItemV3 } from "../protocol-v3";
 import { usePlaybackSession } from "./usePlaybackSession";
@@ -3456,6 +3457,163 @@ describe("usePlaybackSession server-invalidated plans", () => {
       failure: { classification: "video_copy_unsafe" },
     });
     await waitFor(() => expect(result.current.plan?.plan_id).toBe("plan:2222222222222222"));
+
+    unmount();
+  });
+
+  // Cold-start default-audio reconciliation is not a route failure: the recipe
+  // plays the wrong audio stream, not the wrong bytes. Replanning as
+  // `failure_recovery` would fold the healthy route's attempt key into
+  // `attempted_plan_keys` and force a worse route (or a failure) onto a session
+  // that was playing fine.
+  it("replans off a default-audio correction without failure semantics", async () => {
+    const replanBodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal(
+      "fetch",
+      invalidationFetchMock(replanBodies, {
+        protocol_version: 3,
+        server_features: ["playback_plan_v3"],
+        outcome: "playable",
+        session_id: "session-1",
+        playback_plan: fixturePlanV3({
+          plan_id: "plan:2222222222222222",
+          plan_attempt_key: "v3:2222222222222222",
+        }),
+      }),
+    );
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe("plan:0123456789abcdef"));
+    // The viewer is watching, then pauses: the replacement replan must carry the
+    // position across the correction and leave the transport paused.
+    act(() => {
+      result.current.updatePlaybackState(300, true);
+      result.current.updatePlaybackState(450, false);
+    });
+
+    let outcome: boolean | undefined;
+    await act(async () => {
+      outcome = await result.current.invalidatePlan(
+        "plan:0123456789abcdef",
+        PLAN_INVALIDATED_DEFAULT_AUDIO_RECONCILIATION,
+        450,
+      );
+    });
+
+    expect(outcome).toBe(true);
+    expect(replanBodies).toHaveLength(1);
+    const body = replanBodies[0]!;
+    expect(body.operation).toBe("track_change");
+    expect(body.position_seconds).toBe(450);
+    // No failure payload: the server rejects one on a track_change, and the
+    // classification would indict a route that never failed.
+    expect(body).not.toHaveProperty("failure");
+    // Nothing failed, so the route that is playing stays eligible — the loop
+    // guard resets rather than excluding the plan it is replacing.
+    expect(body.attempted_plan_keys).toEqual([]);
+    // The echoed selection is the withdrawn plan's own, unchanged: the client
+    // chose no audio and carries none of the correction's identity. The server
+    // overwrites it from the decision it persisted for this plan (§6.1.1), so
+    // the client must not assert anything about the corrected index here.
+    expect(body.selected_tracks).toMatchObject({
+      audio: fixturePlanV3().selected_tracks.audio,
+    });
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe("plan:2222222222222222"));
+    // Pause state is untouched: the adopted plan reports the transport's own
+    // paused state rather than autoplaying over the viewer's pause.
+    expect(result.current.shouldAutoPlay).toBe(false);
+
+    unmount();
+  });
+
+  // The generic path is what a genuine route failure depends on, and it must not
+  // have widened to swallow every reason while the audio path was carved out.
+  it("keeps failure_recovery semantics for any other invalidation reason", async () => {
+    const replanBodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal(
+      "fetch",
+      invalidationFetchMock(replanBodies, {
+        protocol_version: 3,
+        server_features: ["playback_plan_v3"],
+        outcome: "playable",
+        session_id: "session-1",
+        playback_plan: fixturePlanV3({
+          plan_id: "plan:3333333333333333",
+          plan_attempt_key: "v3:3333333333333333",
+        }),
+      }),
+    );
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe("plan:0123456789abcdef"));
+
+    let outcome: boolean | undefined;
+    await act(async () => {
+      outcome = await result.current.invalidatePlan(
+        "plan:0123456789abcdef",
+        "video_copy_unsafe",
+        200,
+      );
+    });
+
+    expect(outcome).toBe(true);
+    expect(replanBodies[0]).toMatchObject({
+      operation: "failure_recovery",
+      failed_plan_id: "plan:0123456789abcdef",
+      position_seconds: 200,
+      attempted_plan_keys: ["v3:0123456789abcdef"],
+      failure: { classification: "video_copy_unsafe" },
+    });
+
+    unmount();
+  });
+
+  // An unrecognized reason is a route verdict this client cannot interpret, so
+  // it recovers exactly as before rather than guessing at a non-failure path.
+  it("keeps failure_recovery semantics for an unrecognized reason", async () => {
+    const replanBodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal(
+      "fetch",
+      invalidationFetchMock(replanBodies, {
+        protocol_version: 3,
+        server_features: ["playback_plan_v3"],
+        outcome: "playable",
+        session_id: "session-1",
+        playback_plan: fixturePlanV3({
+          plan_id: "plan:4444444444444444",
+          plan_attempt_key: "v3:4444444444444444",
+        }),
+      }),
+    );
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe("plan:0123456789abcdef"));
+
+    let outcome: boolean | undefined;
+    await act(async () => {
+      outcome = await result.current.invalidatePlan(
+        "plan:0123456789abcdef",
+        "some_reason_from_a_newer_server",
+        90,
+      );
+    });
+
+    expect(outcome).toBe(true);
+    expect(replanBodies[0]).toMatchObject({
+      operation: "failure_recovery",
+      position_seconds: 90,
+      attempted_plan_keys: ["v3:0123456789abcdef"],
+      failure: { classification: "some_reason_from_a_newer_server" },
+    });
 
     unmount();
   });

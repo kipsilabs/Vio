@@ -1120,8 +1120,14 @@ A client that advertises `plan_invalidated_v1` in `client_features` promises to:
 2. run its ordinary recovery replan — `operation: "failure_recovery"`, with the
    invalidated plan's `plan_attempt_key` in `attempted_plan_keys` so the copy
    route is excluded deterministically (the now-persisted verdict excludes it
-   too), and
+   too), **unless** `reason` is `default_audio_reconciliation`, which replans as
+   an intent operation instead (§6.1.1), and
 3. send `{"type":"result","status":"completed"}` when the replan is done.
+
+`failure_recovery` is the right default because it is the one operation that
+excludes the withdrawn route without the client reasoning about deliveries. It
+is wrong for a reason that withdraws a plan without indicting it, and that is the
+only such reason on this command.
 
 **Everything else is a session stop.** The server pushes the command only to a
 session that negotiated the feature *and* holds a live realtime connection. No
@@ -1250,11 +1256,31 @@ That split makes the ordering load-bearing:
 - A refused divergence supersedes the invalidation it disputes: a correction a
   rejected re-evaluation has already invalidated never reaches the client.
 
-The client's replacement replan cannot echo a track it never chose, so it does
-not name one. The replan that replans off the withdrawn plan therefore consumes
-the stored decision and fills in the audio identity. The correction is one-shot
-rather than an ongoing override: it is keyed to the withdrawn plan, and the
-plan the replan commits becomes current, so the client's next replan is its own.
+**The replacement replan is an intent operation, not a failure recovery.** The
+route is healthy and nothing failed: the committed recipe plays the wrong audio
+stream, not wrong bytes. `failure_recovery` would fold the withdrawn plan's
+`plan_attempt_key` into `attempted_plan_keys` and so exclude the route that is
+currently playing from its own replacement — pushing a working session onto a
+worse route, or onto a terminal. A client therefore replans off a
+`default_audio_reconciliation` withdrawal as `operation: "track_change"`, with no
+`failure` payload (the server rejects one on that operation anyway) and no route
+exclusion, carrying only its live position. It is the operation the server's own
+automatic replan already uses for this correction, and a `track_change` that
+changes nothing still returns a fresh plan. `client_features` is unchanged: this
+reuses the existing operation rather than adding one.
+
+The two sides name the reason independently — the server from
+`playback.PlanInvalidatedDefaultAudioReconciliation`, the browser from its own
+mirror of the string — and each half pins the other with a test
+(`internal/playback/realtime_invalidation_reason_test.go` and
+`web/src/player/defaultAudioReconciliationReason.test.ts`), because a rename on
+one side is invisible at runtime and merely degrades a healthy session into a
+failure recovery. Every other `plan_invalidated` reason keeps the recovery
+semantics of §6.1.
+
+The correction is one-shot rather than an ongoing override: it is keyed to the
+withdrawn plan, and the plan the replan commits becomes current, so the client's
+next replan is its own.
 
 Four rules bound it:
 
