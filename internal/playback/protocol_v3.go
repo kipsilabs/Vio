@@ -729,7 +729,18 @@ type ReplanRequestV3 struct {
 	Failure               FailureV3                 `json:"failure,omitzero"`
 	Capabilities          ClientCodecCapabilitiesV3 `json:"client_capabilities"`
 	ClientPlaybackContext ClientPlaybackContextV3   `json:"client_playback_context"`
+	// Automatic marks a replan request the server built itself (no client
+	// gesture behind it). It is server-side only: omitempty keeps it off the
+	// client wire in practice, Validate ignores it, and clients never send
+	// it. The replan application uses it to suppress user-preference
+	// persistence for automatic corrections; explicit user track changes
+	// keep persisting. Empty means a client-issued request.
+	Automatic string `json:"automatic,omitempty"`
 }
+
+// ReplanAutomaticV3 is the Automatic marker for server-built reconciliation
+// replans (see ReplanRequestV3.Automatic).
+const ReplanAutomaticV3 = "automatic"
 
 const (
 	RouteEventPlanSelectedV3               = "plan_selected"

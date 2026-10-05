@@ -6608,6 +6608,19 @@ func downloadedSubtitleLabelV3(value subtitles.DownloadedSubtitle) string {
 	return value.ReleaseName + " (" + value.Provider + ")"
 }
 
+// stripClientSuppliedAutomatic clears the server-owned `Automatic` provenance
+// marker on a decoded client replan request. Reconciliation builds its own
+// replan in-process with the marker already set; that path never passes
+// through this function. A client that forges the marker would otherwise
+// impersonate server reconciliation and suppress its own preference
+// persistence, so the inbound boundary drops whatever arrived on the wire.
+func stripClientSuppliedAutomatic(req *playback.ReplanRequestV3) {
+	if req == nil {
+		return
+	}
+	req.Automatic = ""
+}
+
 // HandleReplanPlaybackV3 provides persistent idempotency and preserves the old
 // transport until a successor has entered its startup state and the new plan is
 // durably committed.
@@ -6645,6 +6658,11 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 	if err := json.Unmarshal(body, &req); err != nil {
 		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusBadRequest, "bad_request", "Invalid replan request")
 	}
+	// Automatic marks a server-built reconciliation replan. It is internal
+	// provenance: a client that forges it would suppress preference
+	// persistence and impersonate reconciliation, so strip whatever the
+	// client sent and let the server set it only on its own path.
+	stripClientSuppliedAutomatic(&req)
 	// Reject malformed identity/bounds before doing any session lookup. When
 	// client_features is omitted, temporarily allow the only validation rule
 	// that depends on the durable start request; the authoritative merge and a
@@ -8840,10 +8858,16 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		cancelReservation()
 		afterCtx, afterCancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
 		defer afterCancel()
-		if trackChange {
+		if trackChange && req.Automatic != playback.ReplanAutomaticV3 {
 			// A deliberate track switch is the same signal the legacy audio
 			// PATCH recorded; a failure recovery is not, so its forced audio
-			// route must not be written back as a user preference.
+			// route must not be written back as a user preference. An
+			// automatic reconciliation is not a viewer choice either: it
+			// replays the start-time language preference, so persisting its
+			// outcome would launder a server correction into a stored user
+			// preference and steer every later start. The Automatic marker
+			// (server-side only, see ReplanRequestV3) suppresses that write
+			// for reconciliation ops; explicit user track changes persist.
 			h.persistCurrentAudioPreferenceV3(afterCtx, session.ID, session.UserID, session.ProfileID, effectiveFile, plannedAudioTrackIndexV3(result, session.AudioTrackIndex))
 		}
 		h.syncSessionsNow(afterCtx, "v3_replan")

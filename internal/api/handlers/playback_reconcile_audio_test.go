@@ -12,12 +12,6 @@ import (
 	"github.com/Silo-Server/silo-server/internal/userstore"
 )
 
-// reconcileTestSessionManager is the minimal session surface the
-// reconciliation path needs: live sessions plus lookup by file.
-type reconcileTestSessionManager struct {
-	*playback.SessionManager
-}
-
 // verifiedFileResolver serves one fixed catalog row for reconcile tests.
 type verifiedFileResolver struct {
 	file *models.MediaFile
@@ -141,10 +135,6 @@ func TestReconcileVerifiedDefaultAudioReordersToPreferredLanguage(t *testing.T) 
 
 func intPtrReconcile(v int) *int { return &v }
 
-// sessionForReconcile is a UUID so the automatic replan seam (which
-// requires canonical session ids) accepts the fixture session.
-const sessionForReconcile = "11111111-1111-1111-1111-111111111111"
-
 // MULTi membership: a track whose Languages list carries eng beats a bare
 // eng track only on rank, while a bare MULTi primary with no member list
 // never counts as a concrete language match.
@@ -193,13 +183,18 @@ func TestReconcileRegionalVariantFidelity(t *testing.T) {
 	}}
 	selected := verified.AudioTracks[0]
 	intent := audioSelectionIntent{origin: SelectionOriginAuto, preferredLang: "pt-BR"}
-	if !defaultAudioLanguageStillSatisfied(selected, intent) {
+	if !defaultAudioLanguageStillSatisfied(selected, verified.AudioTracks, 0, intent) {
 		t.Fatal("reordered exact pt-BR track must still satisfy the pt-BR preference")
 	}
-	if defaultAudioLanguageStillSatisfied(verified.AudioTracks[1], intent) == false {
-		// pt-PT is a regional variant, not an exact tag; it still satisfies
-		// the language under the rank chain but must not win over exact.
-		t.Fatal("pt-PT must rank under the pt-BR preference, not fail it outright")
+	// pt-PT is a regional variant, not the exact tag SelectAudioTrack
+	// returned for this inventory: the executable check must reject it as
+	// "not the selector's choice" even though the language rank alone
+	// would call it a match. That is the unavailable-language guard: a
+	// fallback that lands on the same stream is a no-op (see the
+	// unavailable-language test below), but a different stream is never
+	// papered over by language proximity.
+	if defaultAudioLanguageStillSatisfied(verified.AudioTracks[1], verified.AudioTracks, 0, intent) {
+		t.Fatal("pt-PT at index 1 is not the selector's index-0 choice and must fail the executable check")
 	}
 }
 
@@ -404,6 +399,86 @@ func TestReconcileSourceRotationRefusesStaleEvidence(t *testing.T) {
 // landed before the session attached), the attach-side hook must find no
 // record and return without failing; legacy records without intent must
 // likewise do nothing.
+// Blocker 4 guard: Automatic is server-owned provenance. A client that forges
+// it in the wire body must be treated as a user-initiated track_change, so
+// preference persistence still happens.
+func TestReconcileClientSuppliedAutomaticIsStripped(t *testing.T) {
+	body, err := json.Marshal(playback.ReplanRequestV3{
+		ProtocolVersion:   playback.ProtocolV3,
+		Operation:         playback.ReplanOperationTrackChangeV3,
+		Automatic:         playback.ReplanAutomaticV3,
+		ReplanRequestID:   "client-forged-1",
+		PlaybackAttemptID: "attempt-reconcile-1",
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	var decoded playback.ReplanRequestV3
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		t.Fatalf("unmarshal request: %v", err)
+	}
+	if decoded.Automatic != playback.ReplanAutomaticV3 {
+		t.Fatalf("fixture must carry the forged marker on the wire, got %q", decoded.Automatic)
+	}
+
+	// The inbound application seam is what the HTTP handler calls; it owns
+	// stripping untrusted provenance before validation or persistence.
+	stripClientSuppliedAutomatic(&decoded)
+	if decoded.Automatic != "" {
+		t.Fatalf("client-supplied Automatic survived: %q", decoded.Automatic)
+	}
+
+	// A server-built reconciliation request keeps its marker: that path never
+	// goes through the inbound seam.
+	serverBuilt := playback.ReplanRequestV3{
+		Operation: playback.ReplanOperationTrackChangeV3,
+		Automatic: playback.ReplanAutomaticV3,
+	}
+	if serverBuilt.Automatic != playback.ReplanAutomaticV3 {
+		t.Fatal("server-built reconciliation lost its Automatic marker")
+	}
+}
+
+// Blocker 3 guard: one entry deadline, propagated, never reset. A caller
+// whose context is already done must not buy a fresh 10s budget.
+func TestReconcilePropagatesCallerDeadlineWithoutReset(t *testing.T) {
+	if testing.Short() {
+		t.Skip("deadline propagation assertion needs a stalled dependency")
+	}
+	verified := &models.MediaFile{ID: 7, ProbeUpdatedAt: ptr(time.Now())}
+	verified.AudioTracks = []models.AudioTrack{
+		{Language: "por", Codec: "eac3"},
+		{Language: "eng", Codec: "eac3"},
+	}
+	session := &playback.Session{
+		ID:                 "11111111-1111-1111-1111-111111111111",
+		UserID:             1,
+		ProfileID:          "profile-1",
+		Position:           42,
+		SelectionOrigin:    SelectionOriginAuto,
+		VirtualAudioTracks: verified.AudioTracks,
+	}
+	record := reconcileIntent("eng", nil, nil)
+	handler := reconcileFixture(t, session, record, verified)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// An already-cancelled caller context: reconciliation must return on
+		// it rather than arming its own timeout.
+		cancelled, cancel := context.WithCancel(context.Background())
+		cancel()
+		handler.reconcilePendingAudioStartup(cancelled, session.ID)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(reconcileProbeBudgetV3 + 5*time.Second):
+		t.Fatal("reconciliation ignored the caller deadline and blocked past the budget")
+	}
+}
+
 func TestReconcileProbeBeforeRegistrationDefersToAttach(t *testing.T) {
 	manager := playback.NewSessionManager(0, 0)
 	session := &playback.Session{
