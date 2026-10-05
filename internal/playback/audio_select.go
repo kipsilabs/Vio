@@ -44,16 +44,21 @@ func langMatch(a, b string) bool {
 // trackLanguageRank returns the best language rank for a track against the
 // preferred language, considering both the primary code and the MULTi
 // language list. -1 when nothing matches.
+//
+// Bare MULTI/DUAL membership sentinels carry no language information: they
+// are skipped before matching so they never boost a track above real language
+// evidence, but the track still falls through to the default/first-track
+// selection below (neutral, not disqualifying).
 func trackLanguageRank(track models.AudioTrack, preferred string) int {
 	best := -1
-	if rank := langMatchRank(track.Language, preferred); rank >= 0 {
+	if rank := rankedLanguageMatch(track.Language, preferred); rank >= 0 {
 		best = rank
 		if best == 0 {
 			return best
 		}
 	}
 	for _, code := range track.Languages {
-		if rank := langMatchRank(code, preferred); rank >= 0 && (best < 0 || rank < best) {
+		if rank := rankedLanguageMatch(code, preferred); rank >= 0 && (best < 0 || rank < best) {
 			best = rank
 			if best == 0 {
 				break
@@ -63,12 +68,51 @@ func trackLanguageRank(track models.AudioTrack, preferred string) int {
 	return best
 }
 
+// rankedLanguageMatch ranks one language token against the preference, or -1
+// when there is no match. Tokens that only declare MULTI/DUAL/unknown
+// membership are neutral: never a match (no -1 from the membership test
+// unless every token is neutral), and never a positive rank that would push
+// the track above real language evidence in bestLanguageTrack.
+func rankedLanguageMatch(candidate, preferred string) int {
+	if unknownLanguageMembership(candidate) {
+		return -1
+	}
+	return langMatchRank(candidate, preferred)
+}
+
+// unknownLanguageMembership reports whether a language token declares only
+// MULTI/DUAL/undetermined membership (or nothing at all) instead of a
+// concrete language. Such tokens are release/intake vocabulary, not language
+// evidence, and must stay neutral in language preference matching.
+func unknownLanguageMembership(token string) bool {
+	switch lang.Canonical(strings.TrimSpace(token)) {
+	case "", "und", "mul":
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(token)) {
+	case "multi", "multiple", "dual", "unknown", "undefined":
+		return true
+	}
+	return false
+}
+
 // trackHasLanguage reports whether the track carries the preferred language,
 // either as its primary code or anywhere in its MULTi language list,
-// without an explicit script conflict.
+// without an explicit script conflict. A bare MULTI/DUAL primary with no
+// member list is not a match: unknown membership stays neutral. It is the
+// shared membership authority for reconciliations and cross-version remaps;
+// SelectAudioTrack keeps its own ranking rules on top of this predicate.
 func trackHasLanguage(track models.AudioTrack, preferred string) bool {
 	rank := trackLanguageRank(track, preferred)
 	return rank >= 0 && rank < lang.RankScriptConflict
+}
+
+// TrackCarriesLanguage is the exported membership authority: it reports
+// whether the track carries the preferred language via its primary code or
+// its MULTi member list. Bare MULTI/DUAL tokens (unknown membership) never
+// count as a concrete match but do not fail closed either.
+func TrackCarriesLanguage(track models.AudioTrack, preferred string) bool {
+	return trackHasLanguage(track, preferred)
 }
 
 // langMatchRank delegates to lang.MatchRank to rank language closeness:

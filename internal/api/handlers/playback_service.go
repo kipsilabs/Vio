@@ -22,6 +22,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/logredact"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
+	"github.com/Silo-Server/silo-server/internal/userstore"
 )
 
 // Playback service seams for the v2 adapter (internal/apiv2/playback.go).
@@ -1489,6 +1490,32 @@ func (h *PlaybackHandler) publishInventoryUpdatedToSession(ctx context.Context, 
 		return inventory.InventoryRevision, false
 	}
 	return inventory.InventoryRevision, true
+}
+
+// AudioReconciliationReasonV3 names the automatic default-audio
+// reconciliation replan: it is a server-initiated track_change with no user
+// gesture behind it, preserved in ClientPlaybackContext-independent data so
+// the replan lease history distinguishes it from a viewer's manual switch.
+// The replan still flows through the same application path (see §2 of
+// playback_reconcile_audio.go); the marker only attributes the decision.
+const AudioReconciliationReasonV3 = "automatic_default_audio_reconciliation"
+
+// SetAudioSelectionIntent is the handler-owned entry point for recording one
+// session's durable audio selection intent at start time. It binds the
+// origin, the resolved preferred language, the series-preference snapshot and
+// the committed track signature on the live session; the attempt record
+// carries the same tuple for sessions rebuilt without the live copy.
+func (h *PlaybackHandler) SetAudioSelectionIntent(sessionID, origin, preferredLang string, seriesSig, selectedSig *userstore.AudioTrackSignature) error {
+	if h == nil || h.sessionMgr == nil {
+		return errors.New("session manager is not configured")
+	}
+	setter, ok := h.sessionMgr.(interface {
+		SetAudioSelectionIntent(sessionID, origin, preferredLang string, seriesSig, selectedSig *userstore.AudioTrackSignature) error
+	})
+	if !ok {
+		return errors.New("session manager cannot record audio selection intent")
+	}
+	return setter.SetAudioSelectionIntent(sessionID, origin, preferredLang, seriesSig, selectedSig)
 }
 
 // ReplanDigestV3 fingerprints the exact replan body so a reused request id with

@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/Silo-Server/silo-server/internal/userstore"
 )
 
 var ErrIdempotencyKeyReusedV3 = errors.New("idempotency key reused")
@@ -134,6 +136,24 @@ type AttemptRecordV3 struct {
 	// ServerBitrateCapKbps is fixed when the attempt starts; replans must not
 	// pick up later administrator edits to the account or access group.
 	ServerBitrateCapKbps int
+	// SelectionOrigin records whether the committed audio selection came
+	// from the server's language preference ("auto") or an explicit viewer
+	// choice ("explicit"). Legacy records predate the field and carry the
+	// empty string; reconciliation must then do nothing, never assume a
+	// default, since the pre-intent selection semantics are unknown.
+	SelectionOrigin string `json:"selection_origin,omitempty"`
+	// PreferredAudioLanguage is the canonical full tag that steered the
+	// server-preference selection (e.g. "pt-BR"), or "" when none was
+	// resolved. Compared against the verified inventory, never against an
+	// ordinal.
+	PreferredAudioLanguage string `json:"preferred_audio_language,omitempty"`
+	// SeriesAudioPreferenceSignature is the series-preference snapshot the
+	// start fed to SelectAudioTrack. Old records leave it nil.
+	SeriesAudioPreferenceSignature *userstore.AudioTrackSignature `json:"series_audio_preference_signature,omitempty"`
+	// SelectedAudioSignature is the signature of the committed selection at
+	// start time. It anchors the executable comparison at probe landing and
+	// detects a user track change that superseded the start selection.
+	SelectedAudioSignature *userstore.AudioTrackSignature `json:"selected_audio_signature,omitempty"`
 	// StartResponse is the latest durable decision for this attempt. It begins
 	// as the exact start response and advances atomically with each completed
 	// replan so an idempotent start retry never resurrects a superseded plan.

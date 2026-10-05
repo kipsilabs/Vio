@@ -1,6 +1,7 @@
 package playback_test
 
 import (
+	"math/rand"
 	"testing"
 
 	"github.com/Silo-Server/silo-server/internal/models"
@@ -604,6 +605,68 @@ func TestIsOriginalLanguagePreference(t *testing.T) {
 	} {
 		if got := playback.IsOriginalLanguagePreference(value); got != want {
 			t.Errorf("IsOriginalLanguagePreference(%q) = %v, want %v", value, got, want)
+		}
+	}
+}
+
+// TestSelectAudioTrack_BareMultiIsNeutral pins the cold-start stability
+// rule: a bare MULTI/DUAL primary (unknown membership) must never win a
+// concrete language preference over real language evidence, but it stays
+// eligible as the neutral fallback when nothing matches.
+func TestSelectAudioTrack_BareMultiIsNeutral(t *testing.T) {
+	for _, bare := range []string{"mul", "MULTi", "DUAL", "dual", "und"} {
+		tracks := []models.AudioTrack{
+			{Language: bare, Codec: "eac3", Channels: 6},
+			{Language: "eng", Codec: "aac", Channels: 2},
+		}
+		if got := playback.SelectAudioTrack(tracks, "eng", nil); got != 1 {
+			t.Fatalf("bare %q stole the eng preference: selected %d, want 1", bare, got)
+		}
+	}
+	// Nothing matches: the bare track is still a legal fallback, not an error.
+	tracks := []models.AudioTrack{
+		{Language: "mul", Codec: "eac3", Channels: 6},
+		{Language: "jpn", Codec: "aac", Channels: 2},
+	}
+	if got := playback.SelectAudioTrack(tracks, "deu", nil); got != 0 {
+		t.Fatalf("unmatched preference on bare MULTi: selected %d, want neutral first 0", got)
+	}
+	// A genuine member-list entry keeps winning through the primary skip.
+	membered := []models.AudioTrack{
+		{Language: "mul", Languages: []string{"eng"}, Codec: "eac3", Channels: 6},
+		{Language: "jpn", Codec: "aac", Channels: 2},
+	}
+	if got := playback.SelectAudioTrack(membered, "eng", nil); got != 0 {
+		t.Fatalf("MULTi [eng] membership: selected %d, want 0", got)
+	}
+}
+
+// TestSelectAudioTrack_RegionalPermutationFuzz replays ~200 reorderings of
+// a track list with one unique best regional match (pt-BR) and requires the
+// exact tag to win every permutation, so probe reorder can never move the
+// preference by position.
+func TestSelectAudioTrack_RegionalPermutationFuzz(t *testing.T) {
+	base := []models.AudioTrack{
+		{Language: "pt", Codec: "aac", Channels: 2},
+		{Language: "pt-PT", Codec: "aac", Channels: 2},
+		{Language: "pt-BR", Codec: "aac", Channels: 2},
+		{Language: "en", Codec: "aac", Channels: 2},
+		{Language: "es", Codec: "aac", Channels: 2},
+	}
+	rng := rand.New(rand.NewSource(7))
+	for i := 0; i < 200; i++ {
+		order := rng.Perm(len(base))
+		tracks := make([]models.AudioTrack, len(base))
+		want := -1
+		for pos, src := range order {
+			tracks[pos] = base[src]
+			tracks[pos].Index = pos + 1
+			if base[src].Language == "pt-BR" {
+				want = pos
+			}
+		}
+		if got := playback.SelectAudioTrack(tracks, "pt-BR", nil); got != want {
+			t.Fatalf("permutation %d: selected %d (%q), want %d (pt-BR)", i, got, tracks[got].Language, want)
 		}
 	}
 }

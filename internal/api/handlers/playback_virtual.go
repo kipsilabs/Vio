@@ -21,6 +21,7 @@ import (
 	"time"
 
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
+	langpkg "github.com/Silo-Server/silo-server/internal/lang"
 	"github.com/Silo-Server/silo-server/internal/logredact"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
@@ -6172,12 +6173,15 @@ func mergeVirtualCandidateLanguages(probed *models.MediaFile, candidate VirtualP
 	channels := inferChannelsFromCodec(audioCodec)
 	if len(candidate.AudioLanguages) > 0 {
 		existing := make(map[string]bool, len(candidate.AudioLanguages))
-		for _, lang := range candidate.AudioLanguages {
-			lang = strings.TrimSpace(lang)
-			if lang == "" || !isRealVirtualLanguageTag(lang) {
+		for _, candidateLang := range candidate.AudioLanguages {
+			candidateLang = strings.TrimSpace(candidateLang)
+			if candidateLang == "" || !isRealVirtualLanguageTag(candidateLang) {
 				continue
 			}
-			canonical := virtualLanguageBaseSubtag(lang)
+			canonical := langpkg.CanonicalTag(candidateLang)
+			if canonical == "" {
+				canonical = virtualLanguageBaseSubtag(candidateLang)
+			}
 			if existing[canonical] {
 				continue
 			}
@@ -6186,7 +6190,7 @@ func mergeVirtualCandidateLanguages(probed *models.MediaFile, candidate VirtualP
 				// Synthesized tracks carry no real container stream index; the
 				// array position is the ordinal (audioStreamOrdinalV3 falls back
 				// to it when Index <= 0).
-				Language: lang,
+				Language: candidateLang,
 				Codec:    audioCodec,
 				Channels: channels,
 			})
