@@ -748,17 +748,30 @@ func (h *PlaybackHandler) pendingAudioReconciliationReplan(record *playback.Atte
 	// to the builder's echo and the identity heuristic alone would either
 	// override a real viewer choice or suppress a real echo-lane correction.
 	//
-	// The identity heuristic stays as the fallback for clients that have not
-	// adopted answers_plan_invalidation yet: it is a weaker discriminator (it
-	// cannot tell a deliberate re-pick from an inherited echo in the reorder
-	// case, as above), but it preserves correct behavior for the common echo
-	// case those clients produce.
+	// The identity heuristic is a fallback for clients that have NOT adopted
+	// the echo, and for them alone. A client that advertised
+	// default_audio_reconcile_response_v1 is required to answer with the
+	// matching marker: it is the only signal that separates "answering the
+	// withdrawal" from "re-picking the track I already had", and falling back
+	// for it would leave the very ambiguity the capability exists to remove.
+	// Without the capability, a genuine viewer decision still wins via the
+	// heuristic, which preserves correct behavior for the common echo case
+	// those clients produce.
 	isReconciliationAnswer := strings.TrimSpace(req.AnswersPlanInvalidation) != "" &&
 		strings.TrimSpace(req.AnswersPlanInvalidation) == strings.TrimSpace(entry.Reason)
-	if !isReconciliationAnswer && namesDifferentAudioIdentityV3(req.SelectedTracks.Audio, record.CurrentPlan) {
-		slog.Debug("replan keeps the viewer's audio choice over a pending correction",
-			"component", "api", "session", record.SessionID, "generation", entry.Generation)
-		return
+	legacyFallback := !playback.HasFeatureV3(
+		record.NormalizedRequest.ClientFeatures, playback.FeatureDefaultAudioReconcileResponseV3)
+	if !isReconciliationAnswer {
+		if !legacyFallback {
+			slog.Debug("replan without the reconciliation marker keeps the viewer's selection",
+				"component", "api", "session", record.SessionID, "generation", entry.Generation)
+			return
+		}
+		if namesDifferentAudioIdentityV3(req.SelectedTracks.Audio, record.CurrentPlan) {
+			slog.Debug("replan keeps the viewer's audio choice over a pending correction",
+				"component", "api", "session", record.SessionID, "generation", entry.Generation)
+			return
+		}
 	}
 	req.SelectedTracks.Audio = entry.Request.SelectedTracks.Audio
 	// Restore server-owned provenance for the correction we are applying. The

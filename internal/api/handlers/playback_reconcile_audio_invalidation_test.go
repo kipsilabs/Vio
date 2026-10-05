@@ -359,7 +359,7 @@ func TestReconcileAudioImmutableIdentity(t *testing.T) {
 // reads start.AudioTrackID/AudioTrackIndex, so a correction applied afterwards
 // never reaches the plan or the executor's audio map.
 func TestPendingAudioCorrectionReachesTheStartSelection(t *testing.T) {
-	f := newInvalidationFixture(t, []string{playback.FeaturePlanInvalidatedV3, playback.FeatureDefaultAudioReconcileResponseV3}, 10)
+	f := newInvalidationFixture(t, []string{playback.FeaturePlanInvalidatedV3}, 10)
 
 	after := f.reconcile(t)
 	entry := playback.FindAudioReconcileEntry(after.AudioReconcileLedger, reconcileGenerationV3(f.verified), f.session.ID)
@@ -448,7 +448,7 @@ func TestRefusalDoesNotStrandTheSettledCorrection(t *testing.T) {
 // redundant viewer pick not being persisted, which is far smaller than writing
 // a server decision into a stored preference.
 func TestInheritedAudioEchoIsTreatedAsReconciliationResponse(t *testing.T) {
-	f := newInvalidationFixture(t, []string{playback.FeaturePlanInvalidatedV3, playback.FeatureDefaultAudioReconcileResponseV3}, 10)
+	f := newInvalidationFixture(t, []string{playback.FeaturePlanInvalidatedV3}, 10)
 	after := f.reconcile(t)
 	entry := playback.FindAudioReconcileEntry(after.AudioReconcileLedger, reconcileGenerationV3(f.verified), f.session.ID)
 	if entry == nil || entry.Request == nil || entry.Request.SelectedTracks.Audio == nil {
@@ -705,19 +705,40 @@ func TestPendingAudioReconciliationConsumesOnce(t *testing.T) {
 // clientReplanForInvalidation builds the failure_recovery body a client issues
 // when it answers a plan withdrawal: it names the plan it was playing, carries
 // its live position, and selects no audio track of its own.
+// clientReplanForInvalidation builds the request a capability-aware web client
+// actually sends in answer to the withdrawal: operation track_change, no failure
+// payload, the plan's own audio identity echoed by the request builder, and the
+// answers_plan_invalidation marker naming the reason it is answering.
 func clientReplanForInvalidation(f *invalidationFixture, failedPlanID string) playback.ReplanRequestV3 {
 	return playback.ReplanRequestV3{
-		ProtocolVersion:   playback.ProtocolV3,
-		Operation:         playback.ReplanOperationFailureRecoveryV3,
-		PlaybackAttemptID: f.record.PlaybackAttemptID,
-		ReplanRequestID:   "client-replan-1",
-		FailedPlanID:      failedPlanID,
-		PlanAttemptID:     "client-plan-attempt-1",
-		PlanAttemptKey:    f.record.CurrentPlan.PlanAttemptKey,
-		AttemptCount:      2,
-		PositionSeconds:   321.5,
-		Failure:           playback.FailureV3{Classification: playback.PlanInvalidatedDefaultAudioReconciliation},
+		ProtocolVersion:         playback.ProtocolV3,
+		Operation:               playback.ReplanOperationTrackChangeV3,
+		PlaybackAttemptID:       f.record.PlaybackAttemptID,
+		ReplanRequestID:         "client-replan-1",
+		FailedPlanID:            failedPlanID,
+		PlanAttemptID:           "client-plan-attempt-1",
+		PlanAttemptKey:          f.record.CurrentPlan.PlanAttemptKey,
+		AttemptCount:            2,
+		PositionSeconds:         321.5,
+		AnswersPlanInvalidation: playback.PlanInvalidatedDefaultAudioReconciliation,
+		SelectedTracks: playback.SelectedTracksV3{
+			Audio: copiedTrackIdentityForTest(f.record.CurrentPlan.SelectedTracks.Audio),
+		},
 	}
+}
+
+// copiedTrackIdentityForTest clones a track identity so a test asserts on the
+// value the request builder produced, not on the plan's own pointer.
+func copiedTrackIdentityForTest(identity *playback.TrackIdentityV3) *playback.TrackIdentityV3 {
+	if identity == nil {
+		return nil
+	}
+	copied := *identity
+	if identity.Index != nil {
+		index := *identity.Index
+		copied.Index = &index
+	}
+	return &copied
 }
 
 // replayRequestForTest deep-copies a request the way the replan handler does
