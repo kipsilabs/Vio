@@ -14,6 +14,8 @@ const data = vi.hoisted(() => ({
   memberStateCalls: [] as string[][],
   search: [] as { content_id: string; type: string; title: string; year?: number }[],
   home: [] as { content_id: string; type: string; title: string; year?: number }[],
+  /** When set, the item detail stays loading until this settles. */
+  pendingDetail: null as Promise<object> | null,
 }));
 vi.mock("@/lib/watchTogether", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/watchTogether")>()),
@@ -71,31 +73,43 @@ vi.mock("@/components/MediaCarousel", () => ({
     </section>
   ),
 }));
-vi.mock("@/hooks/queries/catalogRead", () => ({
-  useCatalogItemDetail: (id?: string) => ({
-    isLoading: false,
-    data: id
-      ? {
-          content_id: id,
-          type: "movie",
-          title: "Arrival",
-          year: 2016,
-          runtime: 116,
-          content_rating: "PG-13",
-          genres: ["Drama", "Science Fiction"],
-          overview: "A linguist is recruited to communicate with alien visitors.",
-          rating_imdb: 7.9,
-          rating_tmdb: null,
-          rating_rt_critic: null,
-          poster_url: "",
-          poster_thumbhash: "",
-          backdrop_url: "",
-          // The series' next-up episode, in its second season.
-          play_content_id: id === "severance" ? "sev-s2e4" : undefined,
-        }
-      : undefined,
-  }),
-}));
+vi.mock("@/hooks/queries/catalogRead", async () => {
+  const { useQuery } = await import("@tanstack/react-query");
+  return {
+    useCatalogItemDetail: (id?: string) => {
+      const pending = useQuery({
+        queryKey: ["pending-detail", id],
+        queryFn: () => data.pendingDetail!,
+        enabled: !!id && data.pendingDetail !== null,
+      });
+      return data.pendingDetail ? pending : detailFor(id);
+    },
+  };
+});
+const detailFor = (id?: string) => ({
+  isLoading: false,
+  isFetching: false,
+  data: id
+    ? {
+        content_id: id,
+        type: "movie",
+        title: "Arrival",
+        year: 2016,
+        runtime: 116,
+        content_rating: "PG-13",
+        genres: ["Drama", "Science Fiction"],
+        overview: "A linguist is recruited to communicate with alien visitors.",
+        rating_imdb: 7.9,
+        rating_tmdb: null,
+        rating_rt_critic: null,
+        poster_url: "",
+        poster_thumbhash: "",
+        backdrop_url: "",
+        // The series' next-up episode, in its second season.
+        play_content_id: id === "severance" ? "sev-s2e4" : undefined,
+      }
+    : undefined,
+});
 const episodes: EpisodeListItem[] = [1, 2, 3, 4].map(
   (n): EpisodeListItem => ({
     content_id: `sev-s2e${n}`,
@@ -205,6 +219,7 @@ function stateFor(id: string, states: Record<number, "unseen" | "in_progress" | 
 }
 
 beforeEach(() => {
+  data.pendingDetail = null;
   data.memberStateCalls = [];
   data.search = [];
   data.picker = {
@@ -438,6 +453,22 @@ describe("CandidateStage", () => {
 
   it("opens a series picked outside Continue Together on the viewer's next-up season", async () => {
     renderCandidate({ card: { content_id: "severance", type: "series", title: "Severance" } });
+    await screen.findByText("Episode 4");
+    expect(screen.getByRole("button", { name: /Season 2/, pressed: true })).toBeInTheDocument();
+  });
+
+  it("waits for a late series detail before choosing the season", async () => {
+    let resolveDetail!: (detail: object) => void;
+    data.pendingDetail = new Promise((resolve) => (resolveDetail = resolve));
+    renderCandidate({ card: { content_id: "severance", type: "series", title: "Severance" } });
+    await screen.findByRole("button", { name: /Season 1/ });
+    expect(screen.queryByRole("button", { name: /Season/, pressed: true })).toBeNull();
+    resolveDetail({
+      content_id: "severance",
+      type: "series",
+      title: "Severance",
+      play_content_id: "sev-s2e4",
+    });
     await screen.findByText("Episode 4");
     expect(screen.getByRole("button", { name: /Season 2/, pressed: true })).toBeInTheDocument();
   });

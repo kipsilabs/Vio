@@ -150,23 +150,25 @@ export function SeriesDrilldown({
   const [season, setSeason] = useState<number | null>(initialSeason ?? null);
   // Without a season from the shelf, open where the viewer left off, as the
   // series page does: the season whose own play target is the series' target.
+  // Both targets move as the viewer watches, so choose only once neither
+  // query is fetching; a cached copy of one can disagree with the other.
   const playContentId = item?.play_content_id;
+  const resolvingSeason = seasons.isFetching || detail.isFetching;
   useEffect(() => {
-    if (season !== null || seasonList.length === 0 || detail.isLoading) return;
+    if (season !== null || seasonList.length === 0 || resolvingSeason) return;
     const resume = playContentId
       ? seasonList.find((s) => s.play_content_id === playContentId)
       : undefined;
     const first = resume ?? seasonList.find((s) => !s.is_specials) ?? seasonList[0]!;
     setSeason(first.season_number);
-  }, [season, seasonList, detail.isLoading, playContentId]);
+  }, [season, seasonList, resolvingSeason, playContentId]);
   const episodesQuery = useSeasonEpisodes(
     season === null ? undefined : series.content_id,
     season ?? -1,
   );
   // Until a season is chosen the episode query is idle; keep the skeletons up
   // rather than flash an empty season.
-  const loadingEpisodes =
-    episodesQuery.isLoading || (season === null && (seasons.isLoading || detail.isLoading));
+  const loadingEpisodes = episodesQuery.isLoading || (season === null && resolvingSeason);
   const episodes = useMemo(
     () => (episodesQuery.data?.episodes ?? []).filter((e) => e.files.length > 0),
     [episodesQuery.data?.episodes],
