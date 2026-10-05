@@ -466,6 +466,15 @@ func (h *PlaybackHandler) stampStartVirtualCandidateFailed(ctx context.Context, 
 // to its decision budget while still recording a confirmed-dead verdict, and the
 // detached context keeps request values for logging and follows the service
 // lifecycle so shutdown stops an outstanding stamp.
+//
+// The detached write is admitted through the handler's bounded detached-work
+// gate. Without that bound each confirmed-dead alternate would spawn an
+// unrestricted goroutine, so a slow database would accumulate one stuck write
+// per alternate across concurrent starts; startCandidateFailStampBudget bounds
+// each write's lifetime but not how many are in flight. Admission is
+// non-blocking and drop-on-exhaustion: the walk must never wait on a slot, so a
+// shed stamp leaves the row unindicted and only costs a later start the same
+// resolve, exactly like the other best-effort detached stamps.
 func (h *PlaybackHandler) stampStartVirtualCandidateFailedAsync(ctx context.Context, file *models.MediaFile, resolveErr error) {
 	if h == nil || h.VirtualCandidateFailMarker == nil || file == nil || file.FailedAt != nil {
 		return
@@ -473,8 +482,15 @@ func (h *PlaybackHandler) stampStartVirtualCandidateFailedAsync(ctx context.Cont
 	if !virtualCandidateConfirmedDead(file, resolveErr) {
 		return
 	}
+	gate := h.detachedGate()
+	if !gate.tryAcquire() {
+		slog.DebugContext(ctx, "virtual candidate verdict stamp skipped: detached worker budget exhausted",
+			"component", "api", "file_id", file.ID, "candidate_uri", file.FilePath)
+		return
+	}
 	stampCtx, cancel := h.virtualDetachedContext(ctx, startCandidateFailStampBudget)
 	go func() {
+		defer gate.release()
 		defer cancel()
 		h.markVirtualCandidateFailed(stampCtx, file)
 	}()

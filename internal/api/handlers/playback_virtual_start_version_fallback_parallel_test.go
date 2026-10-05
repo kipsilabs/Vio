@@ -217,20 +217,19 @@ func TestRunVirtualVersionFallbackCandidatesCompetingSuccessCarriesWinnerIndex(t
 		var entered atomic.Int32
 		bothIn := make(chan struct{})
 		release := make(chan struct{})
-		resolve := func(ctx context.Context, file *models.MediaFile) (resolvedVirtualPlaybackSource, bool) {
+		// completed carries every resolver that returned success, so the test
+		// can require that BOTH successes ran to completion rather than letting
+		// the winner's cancellation make the second return false before it
+		// returns. A resolver ignores its context here: after the shared
+		// release it must succeed unconditionally.
+		completed := make(chan int, len(candidates))
+		resolve := func(_ context.Context, file *models.MediaFile) (resolvedVirtualPlaybackSource, bool) {
 			if entered.Add(1) == int32(len(candidates)) {
 				close(bothIn)
 			}
-			select {
-			case <-bothIn:
-			case <-ctx.Done():
-				return resolvedVirtualPlaybackSource{}, false
-			}
-			select {
-			case <-release:
-			case <-ctx.Done():
-				return resolvedVirtualPlaybackSource{}, false
-			}
+			<-bothIn
+			<-release
+			completed <- file.ID
 			return resolvedVirtualPlaybackSource{URI: file.FilePath, File: file}, true
 		}
 		// Open the release only once both successes are in their resolve, so
@@ -253,6 +252,22 @@ func TestRunVirtualVersionFallbackCandidatesCompetingSuccessCarriesWinnerIndex(t
 		if winner.URI != candidates[index].FilePath {
 			t.Fatalf("iteration %d: winner URI %q does not belong to the returned index %d (%q)",
 				i, winner.URI, index, candidates[index].FilePath)
+		}
+		// Both successes must be observed to have completed: the point of the
+		// race is that two successful completions contend for attribution, not
+		// that cancellation quietly reduced it to one.
+		seen := make(map[int]bool, len(candidates))
+		for n := 0; n < len(candidates); n++ {
+			select {
+			case id := <-completed:
+				if seen[id] {
+					t.Fatalf("iteration %d: candidate %d completed twice", i, id)
+				}
+				seen[id] = true
+			case <-time.After(2 * time.Second):
+				t.Fatalf("iteration %d: observed %d of %d successful completions; want both successes to race",
+					i, len(seen), len(candidates))
+			}
 		}
 	}
 }
@@ -407,4 +422,205 @@ func TestResolveVirtualStartWithVersionFallbackDoesNotJoinBlockedVerdictStamp(t 
 		t.Fatal("no confirmed-dead alternate stamp was attempted")
 	}
 	close(releaseStamp)
+}
+
+// TestResolveVirtualStartWithVersionFallbackBoundsConcurrentVerdictStamps pins
+// the admission cap on the detached verdict stamps. Four alternates resolve
+// confirmed-dead together, so four async stamps fire; the handler's detached
+// gate is shrunk to one slot, so only one marker write may be in flight while
+// the rest are shed. The walk must still terminal at its decision budget while
+// that one marker is blocked, proving the stamp is both bounded and detached
+// from the walk, and no second write is ever admitted to a full gate.
+func TestResolveVirtualStartWithVersionFallbackBoundsConcurrentVerdictStamps(t *testing.T) {
+	resetVirtualRecoveryRelists(t)
+	listingBudget, decisionBudget, stampBudget := 150*time.Millisecond, 150*time.Millisecond, 1200*time.Millisecond
+	prevListing, prevDecision, prevStamp := virtualStartVersionFallbackListingBudget, virtualStartVersionFallbackDecisionBudget, startCandidateFailStampBudget
+	virtualStartVersionFallbackListingBudget, virtualStartVersionFallbackDecisionBudget, startCandidateFailStampBudget = listingBudget, decisionBudget, stampBudget
+	t.Cleanup(func() {
+		virtualStartVersionFallbackListingBudget, virtualStartVersionFallbackDecisionBudget, startCandidateFailStampBudget = prevListing, prevDecision, prevStamp
+	})
+
+	const (
+		content = "movie-bounded-stamp"
+		neutral = "virtual://movie/" + content
+	)
+	primary := &models.MediaFile{ID: 1, ContentID: content, FilePath: neutral + "?result=A", VirtualOwnerInstallationID: 5}
+	const altCount = 4
+	alternates := make([]*models.MediaFile, 0, altCount)
+	for i := 0; i < altCount; i++ {
+		alternates = append(alternates, &models.MediaFile{
+			ID: 11 + i, ContentID: content,
+			FilePath:                   neutral + "?result=" + string(rune('B'+i)),
+			VirtualOwnerInstallationID: 5, ProviderVideoHash: "hash-b", ProviderReleaseName: "Movie.2024",
+		})
+	}
+
+	var stampsInFlight, maxStampsInFlight, stampsAdmitted atomic.Int32
+	var altAttempted atomic.Int32
+	stampEntered := make(chan struct{}, altCount)
+	releaseStamp := make(chan struct{})
+	h := &PlaybackHandler{
+		FileVersionFetcher: testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{
+			content: append([]*models.MediaFile{primary}, alternates...),
+		}},
+		VirtualPlaybackResolver: VirtualPlaybackResolverFunc(func(context.Context, string, int, string, int) (string, error) {
+			return "", errors.New("simple resolver must not be used when the detailed resolver is set")
+		}),
+		VirtualMediaDetailedResolver: VirtualMediaDetailedResolverFunc(func(ctx context.Context, uri string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+			if virtualResultCandidateID(uri) == "A" {
+				return ResolvedVirtualMedia{}, providerEmptyListing()
+			}
+			altAttempted.Add(1)
+			// Each alternate burns its whole listing budget, so every
+			// confirmed-dead stamp fires at roughly the decision deadline.
+			<-ctx.Done()
+			return ResolvedVirtualMedia{}, errors.New("virtual stream provider returned no matching candidate")
+		}),
+		VirtualCandidateFailMarker: func(ctx context.Context, _ int, _ string, _ *time.Time) error {
+			stampsAdmitted.Add(1)
+			cur := stampsInFlight.Add(1)
+			for {
+				old := maxStampsInFlight.Load()
+				if cur <= old || maxStampsInFlight.CompareAndSwap(old, cur) {
+					break
+				}
+			}
+			stampEntered <- struct{}{}
+			select {
+			case <-releaseStamp:
+			case <-ctx.Done():
+			}
+			stampsInFlight.Add(-1)
+			return nil
+		},
+	}
+	// One slot: the cap on concurrently admitted verdict stamps is observable,
+	// and a saturated gate must shed rather than queue the extras.
+	h.detachedWorkGate = newVirtualDetachedGate(1)
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/playback/start", nil)
+
+	walkDone := make(chan time.Duration, 1)
+	go func() {
+		start := time.Now()
+		_, _ = h.resolveVirtualStartWithVersionFallback(req, primary, "profile-1", playback.StartRequestV3{QualityPreference: "auto"}, false, 0)
+		walkDone <- time.Since(start)
+	}()
+
+	// Exactly one marker is admitted and blocked; the remaining stamps must be
+	// shed, never admitted to the full gate.
+	select {
+	case <-stampEntered:
+	case <-time.After(time.Second):
+		close(releaseStamp)
+		t.Fatal("no verdict stamp was admitted")
+	}
+	select {
+	case <-stampEntered:
+		close(releaseStamp)
+		t.Fatal("a second verdict stamp was admitted while the gate held one slot")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// The walk terminals promptly while that admitted stamp is still blocked.
+	select {
+	case elapsed := <-walkDone:
+		if elapsed >= stampBudget/2 {
+			close(releaseStamp)
+			t.Fatalf("walk took %s with a blocked verdict marker; want it bounded to the decision budget (%s)",
+				elapsed, decisionBudget)
+		}
+	case <-time.After(stampBudget / 2):
+		close(releaseStamp)
+		t.Fatal("walk did not terminal while its verdict stamp was blocked on the saturated gate")
+	}
+	// The runner joins its workers before returning, so by now every alternate
+	// has attempted its stamp. All four attempted; exactly one was admitted and
+	// three were shed by the one-slot gate.
+	if got := altAttempted.Load(); got != altCount {
+		close(releaseStamp)
+		t.Fatalf("attempted %d alternate(s), want all %d to earn a verdict stamp", got, altCount)
+	}
+	if got := len(stampEntered); got != 0 {
+		close(releaseStamp)
+		t.Fatalf("a second verdict stamp was queued (%d buffered), want exactly 1 admitted", got)
+	}
+	if got := stampsAdmitted.Load(); got != 1 {
+		close(releaseStamp)
+		t.Fatalf("marker entered %d time(s), want exactly 1: the gate has one slot and the rest must be shed", got)
+	}
+	if got := maxStampsInFlight.Load(); got != 1 {
+		close(releaseStamp)
+		t.Fatalf("peak in-flight verdict stamps = %d, want 1", got)
+	}
+	close(releaseStamp)
+}
+
+// TestStampStartVirtualCandidateFailedAsyncShedsAtGateCap is the direct unit
+// test for the detached stamp's non-blocking admission: a saturated gate must
+// shed the write and return at once, and freeing a slot admits the next stamp.
+func TestStampStartVirtualCandidateFailedAsyncShedsAtGateCap(t *testing.T) {
+	prevStamp := startCandidateFailStampBudget
+	startCandidateFailStampBudget = 2 * time.Second
+	t.Cleanup(func() { startCandidateFailStampBudget = prevStamp })
+
+	release := make(chan struct{})
+	entered := make(chan struct{}, 4)
+	h := &PlaybackHandler{
+		VirtualCandidateFailMarker: func(ctx context.Context, _ int, _ string, _ *time.Time) error {
+			entered <- struct{}{}
+			select {
+			case <-release:
+			case <-ctx.Done():
+			}
+			return nil
+		},
+	}
+	gate := newVirtualDetachedGate(1)
+	h.detachedWorkGate = gate
+
+	dead := errors.New("virtual stream provider returned no matching candidate")
+	file := func(id int) *models.MediaFile {
+		return &models.MediaFile{ID: id, FilePath: "virtual://movie/movie-dead?result=x", ProviderVideoHash: "h", ProviderReleaseName: "Movie.2024"}
+	}
+
+	h.stampStartVirtualCandidateFailedAsync(context.Background(), file(1), dead)
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("the first confirmed-dead stamp was not admitted")
+	}
+
+	// The slot is held by a blocked marker. The next stamp must be shed
+	// without spawning a worker and without blocking its caller.
+	returned := make(chan struct{})
+	go func() {
+		h.stampStartVirtualCandidateFailedAsync(context.Background(), file(2), dead)
+		close(returned)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(time.Second):
+		t.Fatal("a shed verdict stamp blocked the caller on a saturated gate")
+	}
+	select {
+	case <-entered:
+		t.Fatal("a second stamp entered while the gate had no free slot")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Free the slot; the next stamp is admitted again.
+	close(release)
+	deadline := time.Now().Add(2 * time.Second)
+	for len(gate.slots) != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if len(gate.slots) != 0 {
+		t.Fatal("the admitted stamp did not release its gate slot")
+	}
+	h.stampStartVirtualCandidateFailedAsync(context.Background(), file(3), dead)
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("a verdict stamp was not admitted after the gate freed a slot")
+	}
 }

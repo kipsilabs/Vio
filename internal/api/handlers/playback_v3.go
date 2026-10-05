@@ -2583,12 +2583,16 @@ func runVirtualVersionFallbackCandidatesV3(
 // too, and resolving them serially paid one full upstream listing timeout per
 // dead version before the terminal. Each listing is bounded to
 // virtualStartVersionFallbackListingBudget and the walk as a whole to
-// virtualStartVersionFallbackDecisionBudget, so a terminal decision lands in
-// about two seconds instead of seven to eleven. The first healthy candidate
-// wins and cancels the rest. When no version resolves, the original listing
-// failure is returned so the caller reports the honest underlying cause (an
-// edge 5xx, an empty listing, or every version failed) instead of a generic
-// error.
+// virtualStartVersionFallbackDecisionBudget, so the walk itself terminals in
+// about two seconds instead of seven to eleven. That two-second figure
+// describes the alternate walk, not the end-to-end start request: when the walk
+// finds no candidate, the caller's synchronous primary stamp
+// (stampStartVirtualCandidateFailed) runs after it and can add up to
+// startCandidateFailStampBudget (~3s) of database write before the terminal
+// response. The first healthy candidate wins and cancels the rest. When no
+// version resolves, the original listing failure is returned so the caller
+// reports the honest underlying cause (an edge 5xx, an empty listing, or every
+// version failed) instead of a generic error.
 func (h *PlaybackHandler) resolveVirtualStartWithVersionFallback(
 	r *http.Request,
 	file *models.MediaFile,
