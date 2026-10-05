@@ -135,6 +135,19 @@ func TestReconcileVerifiedDefaultAudioReordersToPreferredLanguage(t *testing.T) 
 
 func intPtrReconcile(v int) *int { return &v }
 
+// reconcileCapabilities is the minimum client codec evidence a v3 replan body
+// must carry to be valid.
+func reconcileCapabilities() playback.ClientCodecCapabilitiesV3 {
+	return playback.ClientCodecCapabilitiesV3{
+		VideoEvidence: playback.EvidenceExactV3,
+		AudioEvidence: playback.EvidenceExactV3,
+		CodecsVideo:   []string{"h264"},
+		CodecsAudio:   []string{"aac"},
+		Containers:    []string{"mp4"},
+		MaxResolution: "1080p",
+	}
+}
+
 // MULTi membership: a track whose Languages list carries eng beats a bare
 // eng track only on rank, while a bare MULTi primary with no member list
 // never counts as a concrete language match.
@@ -465,11 +478,11 @@ func TestReconcilePropagatesCallerDeadlineWithoutReset(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		// An already-cancelled caller context: reconciliation must return on
+		// An already-canceled caller context: reconciliation must return on
 		// it rather than arming its own timeout.
-		cancelled, cancel := context.WithCancel(context.Background())
+		canceled, cancel := context.WithCancel(context.Background())
 		cancel()
-		handler.reconcilePendingAudioStartup(cancelled, session.ID)
+		handler.reconcilePendingAudioStartup(canceled, session.ID)
 	}()
 
 	select {

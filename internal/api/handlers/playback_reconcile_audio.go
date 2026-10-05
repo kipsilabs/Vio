@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/userstore"
@@ -48,6 +50,12 @@ const (
 // ReplanRequestV3.Validate), so the reason travels in the deterministic
 // replan-request id and the plan log, both additive and client-invisible.
 const AudioReconciliationReplanReason = "default_audio_reconciliation"
+
+// audioReconcileInvalidationDeadline is the deadline the withdrawal command
+// carries. The client acknowledges the command and answers it with the result
+// of its own replacement replan, which plans from scratch, so the deadline
+// bounds that replan rather than a transport change on this side.
+const audioReconcileInvalidationDeadline = 8 * time.Second
 
 // reconcileVerifiedDefaultAudio replays persisted audio selection intent
 // against the committed verified inventory for fileID. It is invoked after
@@ -147,15 +155,23 @@ func (h *PlaybackHandler) audioSelectionIntentForSession(ctx context.Context, se
 }
 
 // reconcileAutoAudioSelection re-runs SelectAudioTrack against the verified
-// inventory and issues an automatic track_change replan when the executable
-// selection moved. Identical executable selection is a byte-equal no-op.
+// inventory and, when the executable selection moved, persists the corrected
+// decision and withdraws the active plan so the client replans onto it.
+// Identical executable selection is a byte-equal no-op.
+//
+// The server never commits the replacement itself. Reconciliation corrects the
+// durable inventory and records one canonical request; the plan replacement is
+// the client's own replan, which captures its live position and pause state and
+// lands on the corrected audio index. Two competing commit paths (a
+// server-committed recipe plus a client replan) would race for the same
+// transport, so there is exactly one: this one records and asks.
 //
 // Bounded by generation: every verified inventory is keyed by its probe
-// generation (the row's probe stamp), and the attempt's settled ledger
-// records one decision per generation. A generation with a settled entry is
-// never re-evaluated — a retried probe write or a second replica replays the
-// stored decision instead of minting a second replan — so heartbeats and
-// duplicate evidence commits converge rather than issuing unbounded replans.
+// generation (the row's probe stamp), and the attempt's settled ledger records
+// one decision per (generation, session). A pair with a settled entry is never
+// re-evaluated — a retried probe write or a second replica replays the stored
+// decision instead of minting a second event — so heartbeats and duplicate
+// evidence commits converge rather than emitting unbounded invalidations.
 func (h *PlaybackHandler) reconcileAutoAudioSelection(ctx context.Context, session *playback.Session, intent audioSelectionIntent, fileID int) {
 	if h == nil || h.fileResolver == nil || h.PlanStoreV3 == nil {
 		return
@@ -175,16 +191,23 @@ func (h *PlaybackHandler) reconcileAutoAudioSelection(ctx context.Context, sessi
 		return
 	}
 	generation := reconcileGenerationV3(verified)
-	if h.audioReconcileSettled(ctx, live.ID, generation) {
-		return
-	}
 	record, err := h.PlanStoreV3.GetAttempt(ctx, live.ID)
 	if err != nil || record == nil {
 		return
 	}
+	if entry := playback.FindAudioReconcileEntry(record.AudioReconcileLedger, generation, live.ID); entry != nil {
+		// The attempt row already carries the ledger, so this needs no second
+		// store read. A settled generation is never re-evaluated and never
+		// re-announced: a retried probe write, a second replica or a retried
+		// heartbeat replays the stored decision instead of emitting a second
+		// event for one correction. A delivery that failed had no client to
+		// receive it, and that client's next start or reconnect plans against
+		// the corrected inventory anyway.
+		return
+	}
 	if strings.TrimSpace(record.SelectionOrigin) != "" && strings.TrimSpace(record.SelectionOrigin) != SelectionOriginAuto {
 		// A racing explicit change persisted first: never override.
-		h.recordAudioReconcileDecision(ctx, live.ID, generation, playback.AudioReconcileEntryV3{Generation: generation, Decision: playback.AudioReconcileRefused})
+		h.recordAudioReconcileDecision(ctx, live.ID, generation, playback.AudioReconcileEntryV3{Generation: generation, SessionID: live.ID, Decision: playback.AudioReconcileRefused})
 		return
 	}
 	if !virtualEvidenceMatchesBoundFile(verified, live) {
@@ -194,7 +217,7 @@ func (h *PlaybackHandler) reconcileAutoAudioSelection(ctx context.Context, sessi
 		h.publishRefusedProbeInventory(ctx, fileID, strings.TrimSpace(live.VirtualSourceURI), verified)
 		slog.InfoContext(ctx, "default audio reconciliation refused: stale evidence for the bound candidate",
 			"component", "api", "session", session.ID, "file_id", fileID)
-		h.recordAudioReconcileDecision(ctx, live.ID, generation, playback.AudioReconcileEntryV3{Generation: generation, Decision: playback.AudioReconcileRefused})
+		h.recordAudioReconcileDecision(ctx, live.ID, generation, playback.AudioReconcileEntryV3{Generation: generation, SessionID: live.ID, Decision: playback.AudioReconcileRefused})
 		return
 	}
 	// The live session must still carry the committed start selection: a
@@ -203,7 +226,7 @@ func (h *PlaybackHandler) reconcileAutoAudioSelection(ctx context.Context, sessi
 	// newer choice. Compare executable signature identity, not the ordinal,
 	// because the reorder is exactly what can shift ordinals.
 	if !liveSelectionStillCommitted(live, record, intent) {
-		h.recordAudioReconcileDecision(ctx, live.ID, generation, playback.AudioReconcileEntryV3{Generation: generation, Decision: playback.AudioReconcileRefused})
+		h.recordAudioReconcileDecision(ctx, live.ID, generation, playback.AudioReconcileEntryV3{Generation: generation, SessionID: live.ID, Decision: playback.AudioReconcileRefused})
 		return
 	}
 	committedIndex := committedAudioTrackIndexV3(record, live)
@@ -216,6 +239,7 @@ func (h *PlaybackHandler) reconcileAutoAudioSelection(ctx context.Context, sessi
 			ID:                 live.ID,
 			UserID:             live.UserID,
 			ProfileID:          live.ProfileID,
+			Position:           live.Position,
 			AudioTrackIndex:    committedIndex,
 			VirtualAudioTracks: verified.AudioTracks,
 		}
@@ -233,20 +257,54 @@ func (h *PlaybackHandler) reconcileAutoAudioSelection(ctx context.Context, sessi
 		// Byte-equal no-op: the executable selection is identical. Settle
 		// the generation so later heartbeats and duplicate evidence writes
 		// replay the decision instead of re-evaluating.
-		h.recordAudioReconcileDecision(ctx, live.ID, generation, playback.AudioReconcileEntryV3{Generation: generation, Decision: playback.AudioReconcileNoop})
+		h.recordAudioReconcileDecision(ctx, live.ID, generation, playback.AudioReconcileEntryV3{Generation: generation, SessionID: live.ID, Decision: playback.AudioReconcileNoop})
 		return
 	}
-	req, body, err := h.reconcileDefaultAudioReplan(ctx, live, record, verified, recomputed)
+	h.settleAudioReconcileInvalidation(ctx, live, record, verified, recomputed)
+}
+
+// reconcilePendingAudioStartup re-checks one session when it attaches after
+// this replica owns a realtime connection for a client that negotiated the
+// replacement-plan handshake, withdraws the active plan so the client replans.
+//
+// Ordering is the point: the canonical request and the decision it belongs to
+// are written in one ledger CAS before anything is emitted. A duplicate probe
+// write, a second replica or a retried heartbeat therefore finds the generation
+// settled and replays the stored decision instead of emitting a second event,
+// and an evaluation interrupted after the write replays the exact stored bytes
+// — the same request id and the same digest — so the replan lease answers with
+// the stored response rather than refusing the replay as a reused id.
+//
+// A client that never negotiated the handshake gets no event: the decision is
+// still recorded, and the correction lands on its next start or reconnect,
+// which plans against the verified inventory anyway.
+func (h *PlaybackHandler) settleAudioReconcileInvalidation(ctx context.Context, live *playback.Session, record *playback.AttemptRecordV3, verified *models.MediaFile, audioIndex int) {
+	generation := reconcileGenerationV3(verified)
+	req, err := h.buildReconcileAudioRequest(live, record, verified, audioIndex)
 	if err != nil {
-		slog.WarnContext(ctx, "default audio reconciliation replan failed",
-			"component", "api", "session", live.ID, "file_id", fileID, "error", err)
+		slog.WarnContext(ctx, "default audio reconciliation request build failed",
+			"component", "api", "session", live.ID, "file_id", verified.ID, "error", err)
 		return
 	}
-	audioIndex := recomputed
-	h.recordAudioReconcileDecision(ctx, live.ID, generation, playback.AudioReconcileEntryV3{
-		Generation: generation, Decision: playback.AudioReconcileReplanned,
-		AudioIndex: &audioIndex, Request: &req, RequestDigest: ReplanDigestV3(body),
+	digest := ReplanDigestV3(req.bytes)
+	audioIndexCopy := audioIndex
+	storedRequest := req.request
+	stored, settledByThisWriter := h.commitAudioReconcileDecision(ctx, live.ID, generation, playback.AudioReconcileEntryV3{
+		Decision:      playback.AudioReconcileInvalidated,
+		AudioIndex:    &audioIndexCopy,
+		PlanID:        record.CurrentPlanID,
+		Request:       &storedRequest,
+		RequestDigest: digest,
 	})
+	// Only the writer that actually settled this (generation, session) emits.
+	// A replayed generation returns the stored decision, already delivered (or
+	// being delivered by the writer that stored it), and a diverged evaluation
+	// is refused outright — neither may hand a client a second invalidation for
+	// one correction.
+	if !settledByThisWriter || stored.RequestDigest != digest || stored.Decision != playback.AudioReconcileInvalidated {
+		return
+	}
+	h.announceAudioReconcileInvalidation(ctx, live, record, stored)
 }
 
 // reconcileProbeBudgetV3 bounds one reconcile evaluation: catalog read,
@@ -313,7 +371,7 @@ func (h *PlaybackHandler) audioReconcileSettled(ctx context.Context, sessionID, 
 	if err != nil {
 		return false
 	}
-	return playback.FindAudioReconcileEntry(ledger, generation) != nil
+	return playback.FindAudioReconcileEntry(ledger, generation, sessionID) != nil
 }
 
 // recordAudioReconcileDecision settles one generation in the durable ledger
@@ -322,36 +380,102 @@ func (h *PlaybackHandler) audioReconcileSettled(ctx context.Context, sessionID, 
 // A store without the ledger capability (legacy wrapper) keeps the
 // reconcile path working unledgered rather than failing the probe write.
 func (h *PlaybackHandler) recordAudioReconcileDecision(ctx context.Context, sessionID, generation string, entry playback.AudioReconcileEntryV3) {
+	if entry.SessionID == "" {
+		entry.SessionID = sessionID
+	}
+	_, _ = h.commitAudioReconcileDecision(ctx, sessionID, generation, entry)
+}
+
+// commitAudioReconcileDecision settles one generation in the durable ledger
+// with bounded revision-conflict retry and reports what the ledger holds
+// afterwards, together with whether THIS caller is the writer that settled it.
+//
+// That distinction is the dedup authority for the invalidation push: the loser
+// of a CAS against an already-settled (generation, session) pair replays the
+// stored decision without emitting, while the winner emits exactly once. It is
+// also where an evaluation that built a different canonical request for a
+// settled generation is refused and written down, rather than silently
+// competing with the decision a client is already replanning against.
+//
+// A store without the ledger capability (legacy wrapper) keeps the reconcile
+// path working unledgered rather than failing the probe write.
+func (h *PlaybackHandler) commitAudioReconcileDecision(ctx context.Context, sessionID, generation string, entry playback.AudioReconcileEntryV3) (playback.AudioReconcileEntryV3, bool) {
 	if h == nil || h.PlanStoreV3 == nil || generation == "" {
-		return
+		return playback.AudioReconcileEntryV3{}, false
 	}
 	store, ok := h.PlanStoreV3.(playback.AudioReconcileStoreV3)
 	if !ok {
-		return
+		return playback.AudioReconcileEntryV3{}, false
 	}
+	entry.Generation = generation
+	entry.SessionID = sessionID
 	ledger, revision, err := store.GetAudioReconcileLedger(ctx, sessionID)
 	if err != nil {
-		return
-	}
-	if playback.FindAudioReconcileEntry(ledger, generation) != nil {
-		return
+		return playback.AudioReconcileEntryV3{}, false
 	}
 	for attempt := 0; attempt < reconcileLedgerMaxAttempts; attempt++ {
-		if _, _, err := store.RecordAudioReconciliation(ctx, sessionID, revision, entry); err == nil {
-			return
-		} else if !errors.Is(err, playback.ErrRecoveryRevisionConflictV3) {
-			return
-		} else {
-			current, currentRevision, readErr := store.GetAudioReconcileLedger(ctx, sessionID)
-			if readErr != nil {
-				return
+		if existing := playback.FindAudioReconcileEntry(ledger, generation, sessionID); existing != nil {
+			if entry.RequestDigest != "" && existing.RequestDigest != entry.RequestDigest {
+				// Two evaluations of one generation disagree about the
+				// canonical request. The first recorded decision stands:
+				// the client may already be replanning against it. Record the
+				// refusal so the divergence is durable and auditable, and
+				// emit nothing.
+				h.recordAudioReconcileDivergence(ctx, store, sessionID, ledger, revision, generation, sessionID, entry)
+				slog.WarnContext(ctx, "default audio reconciliation refused: canonical request diverged for a settled generation",
+					"component", "api", "session", sessionID, "generation", generation,
+					"stored_digest", existing.RequestDigest, "rejected_digest", entry.RequestDigest)
 			}
-			if playback.FindAudioReconcileEntry(current, generation) != nil {
-				return
+			return *existing, false
+		}
+		merged, _, writeErr := store.RecordAudioReconciliation(ctx, sessionID, revision, entry)
+		switch {
+		case writeErr == nil:
+			if stored := playback.FindAudioReconcileEntry(merged, generation, sessionID); stored != nil {
+				return *stored, true
 			}
-			revision = currentRevision
+			return entry, true
+		case errors.Is(writeErr, playback.ErrRecoveryRevisionConflictV3):
+			ledger, revision, err = store.GetAudioReconcileLedger(ctx, sessionID)
+			if err != nil {
+				return playback.AudioReconcileEntryV3{}, false
+			}
+		default:
+			slog.WarnContext(ctx, "audio reconciliation decision write failed",
+				"component", "api", "session", sessionID, "generation", generation, "error", writeErr)
+			return playback.AudioReconcileEntryV3{}, false
 		}
 	}
+	slog.WarnContext(ctx, "audio reconciliation decision gave up on the ledger revision",
+		"component", "api", "session", sessionID, "generation", generation)
+	return playback.AudioReconcileEntryV3{}, false
+}
+
+// recordAudioReconcileDivergence appends the refusal a diverged evaluation
+// earns against an already-settled generation. It is deliberately not
+// retried: it runs on the path that lost, and a lost CAS there means another
+// evaluator recorded the same refusal.
+func (h *PlaybackHandler) recordAudioReconcileDivergence(ctx context.Context, store playback.AudioReconcileStoreV3, sessionID string, ledger playback.AudioReconcileLedgerV3, revision int64, generation, settledSession string, entry playback.AudioReconcileEntryV3) {
+	refusal := playback.AudioReconcileEntryV3{
+		Generation:    generation,
+		SessionID:     settledSession,
+		Decision:      playback.AudioReconcileRefused,
+		PlanID:        entry.PlanID,
+		RequestDigest: entry.RequestDigest,
+	}
+	// A refusal is a SECOND entry for a pair that already has one: it records
+	// the rejected digest next to the stored one, so dedup by (generation,
+	// session) is not what suppresses it. Its own idempotency key is the
+	// rejected digest — a retried evaluation of the same diverged body records
+	// nothing further.
+	for _, existing := range ledger.Entries {
+		if existing.Generation == refusal.Generation &&
+			existing.Decision == playback.AudioReconcileRefused &&
+			existing.RequestDigest == refusal.RequestDigest {
+			return
+		}
+	}
+	_, _, _ = store.RecordAudioReconciliation(ctx, sessionID, revision, refusal)
 }
 
 // reconcileLedgerMaxAttempts bounds the revision-conflict retry when two
@@ -472,13 +596,38 @@ func defaultAudioLanguageStillSatisfied(selected models.AudioTrack, verified []m
 // client surface is required. The settled ledger entry (recorded by the
 // caller only after the replan commits) is what stops a duplicate probe
 // write from minting a second replan — not the push.
-func (h *PlaybackHandler) reconcileDefaultAudioReplan(ctx context.Context, session *playback.Session, record *playback.AttemptRecordV3, verified *models.MediaFile, audioIndex int) (playback.ReplanRequestV3, []byte, error) {
+// reconcileAudioRequest is the canonical replacement request a settled
+// decision is replayed under: the request value plus the exact bytes its digest
+// is taken from, so a retry reuses verbatim what was stored.
+type reconcileAudioRequest struct {
+	request playback.ReplanRequestV3
+	bytes   []byte
+}
+
+// buildReconcileAudioRequest builds the automatic track_change replan from the
+// committed recipe, remapped onto the verified order, preserving position,
+// with no route exclusion and no failure classification (track_change must not
+// carry one). The replan-request id names the reconciliation reason so the
+// durable lease history attributes the change to the server, not the viewer;
+// no new operation or client-visible field is introduced.
+//
+// The body is built here and persisted with the decision instead of being
+// executed. Two properties follow from freezing it here rather than at the
+// replan:
+//
+//   - The stored bytes are the identity. The request id is derived from the
+//     plan and target index, both immutable, while the body also carries the
+//     live position, which is not. A replay of the stored decision therefore
+//     carries the same id AND the same digest, so the replan lease answers
+//     with its stored response instead of rejecting a reused id — while two
+//     evaluations that disagree about position are caught as a digest
+//     mismatch against the settled entry and refused.
+//   - Nothing is executed before the decision is durable, so an interrupted
+//     evaluation cannot leave a committed recipe with no record of the request
+//     that produced it.
+func (h *PlaybackHandler) buildReconcileAudioRequest(session *playback.Session, record *playback.AttemptRecordV3, verified *models.MediaFile, audioIndex int) (reconcileAudioRequest, error) {
 	verifiedIndex := audioIndex
 	audioID := playback.TrackIDV3(verified.ID, "audio", verifiedIndex)
-	caller := PlaybackCaller{
-		UserID:    session.UserID,
-		ProfileID: session.ProfileID,
-	}
 	req := playback.ReplanRequestV3{
 		ProtocolVersion:   playback.ProtocolV3,
 		Operation:         playback.ReplanOperationTrackChangeV3,
@@ -502,17 +651,155 @@ func (h *PlaybackHandler) reconcileDefaultAudioReplan(ctx context.Context, sessi
 	}
 	body, err := json.Marshal(req)
 	if err != nil {
-		return playback.ReplanRequestV3{}, nil, err
+		return reconcileAudioRequest{}, err
 	}
-	response, err := h.ReplanPlaybackV2(ctx, caller, session.ID, PlaybackReplanCommand{Request: req, Digest: ReplanDigestV3(body)})
+	if err := req.Validate(); err != nil {
+		return reconcileAudioRequest{}, fmt.Errorf("reconcile replan request invalid: %w", err)
+	}
+	return reconcileAudioRequest{request: req, bytes: body}, nil
+}
+
+// sessionNegotiatedPlanInvalidation reports whether this attempt's client
+// advertised plan_invalidated_v1 — the promise to handle a mid-session plan
+// withdrawal and replan off it.
+//
+// The attempt row is the authority rather than the live session: the feature is
+// attempt-sticky, negotiated once at start, and the withdrawal may outlive the
+// in-memory session (a rebuilt one from the card). A legacy row without the
+// field never negotiated it, and an unnegotiated client must not be pushed a
+// command it never promised to handle — its correction lands on the next start
+// or reconnect instead.
+func (h *PlaybackHandler) sessionNegotiatedPlanInvalidation(ctx context.Context, sessionID string) bool {
+	if h == nil || h.PlanStoreV3 == nil {
+		return false
+	}
+	record, err := h.PlanStoreV3.GetAttempt(ctx, sessionID)
+	if err != nil || record == nil {
+		return false
+	}
+	return playback.HasFeatureV3(record.NormalizedRequest.ClientFeatures, playback.FeaturePlanInvalidatedV3)
+}
+
+// pendingAudioReconciliationReplan consumes the same pending decision the
+// withdrawal named: the client's replan, whatever body it carries, replans off
+// the withdrawn plan, so it has to select the corrected audio stream or the
+// correction never reaches the transport. Applying the stored selection is
+// additive on the wire — it fills the audio identity the client omitted — and
+// leaves every other field the client sent (position, pause state, attempt
+// key, failure classification) exactly as it arrived, which is what preserves
+// the viewer's position across the adoption.
+//
+// Only a client-issued replan off the withdrawn plan consumes it. The server's
+// own automatic replan already names the corrected selection, and a replan off
+// any other plan is a viewer decision that must not be overridden.
+func (h *PlaybackHandler) pendingAudioReconciliationReplan(record *playback.AttemptRecordV3, req *playback.ReplanRequestV3) {
+	if record == nil || req == nil || req.Automatic != "" {
+		return
+	}
+	entry := FindPendingAudioReconciliation(record, req.FailedPlanID)
+	if entry == nil {
+		return
+	}
+	req.SelectedTracks.Audio = entry.Request.SelectedTracks.Audio
+	slog.Debug("replan consumes the pending default audio correction",
+		"component", "api", "session", record.SessionID,
+		"generation", entry.Generation, "audio_index", entry.AudioIndex)
+}
+
+// FindPendingAudioReconciliation returns the settled automatic correction a
+// replan replanning off planID would consume, or nil when there is none.
+//
+// The entry is NOT consumed here: it is keyed by the plan the withdrawal
+// named, and the plan this replan commits becomes current, so the client's next
+// replan — off the new plan — finds nothing and plans with whatever selection
+// it was built with. That is what makes the correction one-shot rather than a
+// permanent override of viewer choice.
+func FindPendingAudioReconciliation(record *playback.AttemptRecordV3, planID string) *playback.AudioReconcileEntryV3 {
+	if record == nil || planID == "" {
+		return nil
+	}
+	var found *playback.AudioReconcileEntryV3
+	for i := range record.AudioReconcileLedger.Entries {
+		entry := record.AudioReconcileLedger.Entries[i]
+		// A refusal recorded for the same (generation, session) pair is the
+		// divergence verdict: it supersedes the invalidation that evaluator
+		// lost to, so reading the invalidation instead would let a correction
+		// a rejected re-evaluation had already invalidated reach the client.
+		if entry.Decision == playback.AudioReconcileRefused && found != nil && entry.Generation == found.Generation {
+			found = nil
+			continue
+		}
+		if entry.Decision != playback.AudioReconcileInvalidated || entry.PlanID != planID {
+			continue
+		}
+		if entry.Request == nil || entry.Request.SelectedTracks.Audio == nil {
+			continue
+		}
+		found = &entry
+	}
+	return found
+}
+
+// announceAudioReconcileInvalidation withdraws the plan the decision was
+// recorded against, so the client replans onto the corrected audio index.
+//
+// It reuses the existing plan_invalidated command and the session's own hub
+// lane — the same per-session delivery every other realtime push uses. A lane
+// is registered by the replica serving that session's control socket, so this
+// reaches the owner without any cross-replica RPC; the same evidence commit
+// on another replica is deduplicated by the ledger and emits nothing.
+//
+// A session whose attempt never negotiated plan_invalidated_v1 gets no event:
+// the hub refuses the push before the envelope is built. Its decision stays
+// recorded, and the corrected selection lands on its next start or reconnect,
+// which plans against the verified inventory anyway.
+func (h *PlaybackHandler) announceAudioReconcileInvalidation(ctx context.Context, live *playback.Session, record *playback.AttemptRecordV3, stored playback.AudioReconcileEntryV3) {
+	if h == nil || h.RealtimeHub == nil {
+		return
+	}
+	if stored.AudioIndex == nil {
+		return
+	}
+	planID := stored.PlanID
+	if planID == "" {
+		planID = record.CurrentPlanID
+	}
+	if planID == "" {
+		return
+	}
+	if !h.sessionNegotiatedPlanInvalidation(ctx, live.ID) {
+		slog.DebugContext(ctx, "default audio correction recorded without a withdrawal",
+			"component", "api", "session", live.ID, "generation", stored.Generation,
+			"audio_index", *stored.AudioIndex)
+		return
+	}
+	command, err := playback.NewPlanInvalidatedCommandForGeneration(
+		live.ID,
+		uuid.NewString(),
+		planID,
+		playback.PlanInvalidatedDefaultAudioReconciliation,
+		stored.Generation,
+	)
 	if err != nil {
-		return playback.ReplanRequestV3{}, nil, err
+		slog.WarnContext(ctx, "default audio withdrawal command could not be built",
+			"component", "api", "session", live.ID, "error", err)
+		return
 	}
-	_ = response
+	// The documented replacement handshake requires a deadline: the client
+	// answers the command with the result of its own replacement replan, which
+	// plans from scratch.
+	if command.DeadlineMS == 0 {
+		command.DeadlineMS = int(audioReconcileInvalidationDeadline / time.Millisecond)
+	}
+	if err := h.RealtimeHub.Send(live.ID, command); err != nil {
+		slog.DebugContext(ctx, "default audio withdrawal push undelivered",
+			"component", "api", "session", live.ID, "plan_id", planID, "error", err)
+		return
+	}
 	slog.InfoContext(ctx, "default audio reconciled to the verified inventory",
-		"component", "api", "session", session.ID, "file_id", verified.ID,
-		"audio_index", verifiedIndex, "reason", AudioReconciliationReplanReason)
-	return req, body, nil
+		"component", "api", "session", live.ID, "plan_id", planID,
+		"generation", stored.Generation, "audio_index", *stored.AudioIndex,
+		"reason", AudioReconciliationReplanReason)
 }
 
 // verifyExplicitAudioSelection checks that an explicit viewer selection still
@@ -557,12 +844,12 @@ func (h *PlaybackHandler) verifyExplicitAudioSelection(ctx context.Context, sess
 	// the old array index: a reorder moves the explicit track without
 	// removing it, and only a genuinely absent signature is missing.
 	if explicitAudioSelectionPresent(verified.AudioTracks, committedAudioTrackIndexV3(record, live), intent.selectedOverride) {
-		h.recordAudioReconcileDecision(ctx, live.ID, generation, playback.AudioReconcileEntryV3{Generation: generation, Decision: playback.AudioReconcileNoop})
+		h.recordAudioReconcileDecision(ctx, live.ID, generation, playback.AudioReconcileEntryV3{Decision: playback.AudioReconcileNoop})
 		return
 	}
 	slog.WarnContext(ctx, "explicit audio selection missing from the verified inventory",
 		"component", "api", "session", live.ID, "file_id", fileID, "audio_index", committedAudioTrackIndexV3(record, live))
-	h.recordAudioReconcileDecision(ctx, live.ID, generation, playback.AudioReconcileEntryV3{Generation: generation, Decision: playback.AudioReconcileRefused})
+	h.recordAudioReconcileDecision(ctx, live.ID, generation, playback.AudioReconcileEntryV3{Decision: playback.AudioReconcileRefused})
 	if record != nil {
 		h.enqueueRouteEventV3(playback.RouteEventRecordV3{
 			RouteEventV3: playback.RouteEventV3{

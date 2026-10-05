@@ -7834,6 +7834,11 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		} else {
 			applySelectedTrackOverridesToStartV3(&start, req.SelectedTracks)
 		}
+		// A replan that answers a default-audio reconciliation withdrawal
+		// carries the correction the settled decision recorded: the client
+		// replans off the withdrawn plan, which still names the pre-reorder
+		// stream, so without this the correction never reaches the transport.
+		h.pendingAudioReconciliationReplan(record, &req)
 	}
 	// Native selection is negotiated at start and can only be disabled during
 	// an attempt. Keep a confirmed failure disabled even when a later client

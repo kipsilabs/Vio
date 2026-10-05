@@ -1102,6 +1102,10 @@ any other, not a fire-and-forget event:
   "reason": "video_copy_unsafe",
   "deadline_ms": 8000,
   "payload": {"reason": "video_copy_unsafe", "plan_id": "<the invalidated plan>"}
+
+<!-- §6.1.1 adds one more reason to this command; the payload above gains an
+     additive generation field there, and nothing else about the envelope
+     changes. -->
 }
 ```
 
@@ -1209,6 +1213,68 @@ verdict write is conditional on the row still holding the size and mtime that
 were scanned: a file rewritten in place while the scan read it produces a
 verdict about bytes nobody is serving, which is neither persisted nor pushed at
 any session.
+
+#### 6.1.1 `default_audio_reconciliation` — a late probe withdraws a cold-start plan
+
+The second reason on this command has a different cause. Cold-start default-audio
+reconciliation compares the audio inventory a plan was built against against the
+verified one the probe lands afterwards. When the verified order moves the
+server-resolved selection to a different stream, the committed recipe no longer
+plays the preferred language — and it is still the plan on screen.
+
+The same command withdraws it, and for the same reason: the server learns the
+route is wrong after the plan was handed out. What differs is the decision
+around it.
+
+**The server never commits the replacement for this reason.** It persists the
+corrected selection and a canonical `track_change` replan body in one
+compare-and-set on the attempt's reconciliation ledger, then pushes the
+withdrawal and stops. The client's own replan is what commits the new recipe,
+because the client's replan is what carries its live position and pause state.
+A server-side commit plus a client replan would race for the same transport, so
+there is exactly one commit path and it is the client's.
+
+That split makes the ordering load-bearing:
+
+- The decision and the request it belongs to are written **before** anything is
+  emitted. A duplicate probe write, a second replica, or a retried heartbeat
+  finds the generation settled and replays the stored decision instead of
+  emitting a second event for one correction.
+- The replan-request id is derived from the plan and the target audio index,
+  both immutable, while the body also embeds the live position, which is not.
+  A replay of the stored decision therefore carries the same id **and** the same
+  digest — so the replan lease answers with its stored response rather than
+  rejecting a reused id — while two evaluations that disagree about position
+  are caught as a digest mismatch against the settled entry and refused, with
+  the rejection recorded next to the stored digest.
+- A refused divergence supersedes the invalidation it disputes: a correction a
+  rejected re-evaluation has already invalidated never reaches the client.
+
+The client's replacement replan cannot echo a track it never chose, so it does
+not name one. The replan that replans off the withdrawn plan therefore consumes
+the stored decision and fills in the audio identity. The correction is one-shot
+rather than an ongoing override: it is keyed to the withdrawn plan, and the
+plan the replan commits becomes current, so the client's next replan is its own.
+
+Four rules bound it:
+
+- **The feature still gates delivery.** A client that never advertised
+  `plan_invalidated_v1` gets no event. Its decision is still recorded, and the
+  correction lands on its next start or reconnect — which plans against the
+  verified inventory anyway, because the inventory is what moved.
+- **A byte-equal no-op still settles the generation.** Heartbeats and duplicate
+  evidence writes converge on the stored decision instead of re-evaluating.
+- **Every automatic-selection gate still runs before the decision**: a stale or
+  rotated source, an explicit viewer selection, or a viewer track change between
+  start and probe all refuse rather than withdraw.
+- **Delivery is in-process**, on the session's own hub lane, exactly as for
+  `video_copy_unsafe`. The ledger, not a cross-replica RPC, is what keeps the
+  replica that persisted the same evidence from emitting a duplicate.
+
+The payload carries the generation alongside the existing `plan_id` and
+`reason`, which is additive: a client that ignores it behaves exactly as before,
+and one that reads it can tell an in-flight duplicate from a correction that
+landed afterwards.
 
 ### 6.2 `source_committed_event_v1` — the committed version is published at commit
 

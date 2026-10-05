@@ -314,9 +314,9 @@ func (s *Postgres) AppendRecoveryExclusions(ctx context.Context, sessionID strin
 // concurrent records on the attempt row, and the base-revision compare makes
 // a writer that read a stale revision lose with
 // ErrRecoveryRevisionConflictV3 instead of clobbering a newer decision.
-// Recording the same generation twice is a no-op returning the stored
-// ledger: retries and second replicas converge instead of minting a second
-// replan.
+// Recording the same (generation, session, decision, digest) twice is a no-op
+// returning the stored ledger: retries and second replicas converge instead of
+// minting a second event.
 func (s *Postgres) RecordAudioReconciliation(ctx context.Context, sessionID string, baseRevision int64, entry playback.AudioReconcileEntryV3) (playback.AudioReconcileLedgerV3, int64, error) {
 	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
@@ -346,6 +346,15 @@ func (s *Postgres) RecordAudioReconciliation(ctx context.Context, sessionID stri
 	}
 	base.Revision = revision
 	merged := playback.AppendAudioReconcileEntry(base, entry)
+	if len(merged.Entries) == len(base.Entries) {
+		// The same decision is already recorded: report the stored ledger
+		// without taking the write lock's revision. A retry must not look
+		// like a new decision to a caller reading the revision it handed back.
+		if err := tx.Commit(ctx); err != nil {
+			return playback.AudioReconcileLedgerV3{}, 0, err
+		}
+		return base, revision, nil
+	}
 	merged.Revision = revision + 1
 	mergedJSON, err := json.Marshal(merged)
 	if err != nil {
