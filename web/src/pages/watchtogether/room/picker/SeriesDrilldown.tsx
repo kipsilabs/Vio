@@ -163,6 +163,10 @@ export function SeriesDrilldown({
     season === null ? undefined : series.content_id,
     season ?? -1,
   );
+  // Until a season is chosen the episode query is idle; keep the skeletons up
+  // rather than flash an empty season.
+  const loadingEpisodes =
+    episodesQuery.isLoading || (season === null && (seasons.isLoading || detail.isLoading));
   const episodes = useMemo(
     () => (episodesQuery.data?.episodes ?? []).filter((e) => e.files.length > 0),
     [episodesQuery.data?.episodes],
@@ -307,9 +311,7 @@ export function SeriesDrilldown({
                   ? "Specials"
                   : `Season ${currentSeason.season_number}`
                 : "Episodes"}
-              {!episodesQuery.isLoading && episodes.length > 0
-                ? ` · ${episodes.length} episodes`
-                : ""}
+              {!loadingEpisodes && episodes.length > 0 ? ` · ${episodes.length} episodes` : ""}
             </span>
             {members.length > 0 ? (
               <span className="hidden @xl:block">
@@ -321,7 +323,7 @@ export function SeriesDrilldown({
             ref={listRef}
             className="overlay-scroll flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto px-2 py-2"
           >
-            {episodesQuery.isLoading
+            {loadingEpisodes
               ? Array.from({ length: 5 }).map((_, i) => (
                   <li key={i} className="bg-surface h-20 animate-pulse rounded-lg" />
                 ))
@@ -391,7 +393,7 @@ export function SeriesDrilldown({
                     </li>
                   );
                 })}
-            {!episodesQuery.isLoading && episodes.length === 0 ? (
+            {!loadingEpisodes && episodes.length === 0 ? (
               <li className="text-muted-foreground px-2 py-8 text-center text-sm">
                 No playable episodes in this season.
               </li>

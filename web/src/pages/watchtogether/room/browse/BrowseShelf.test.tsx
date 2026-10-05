@@ -442,6 +442,15 @@ describe("CandidateStage", () => {
     expect(screen.getByRole("button", { name: /Season 2/, pressed: true })).toBeInTheDocument();
   });
 
+  it("keeps the season the shelf passed over the viewer's next-up season", async () => {
+    renderCandidate({
+      card: { content_id: "severance", type: "series", title: "Severance" },
+      season: 1,
+    });
+    await screen.findByText("No playable episodes in this season.");
+    expect(screen.getByRole("button", { name: /Season 1/, pressed: true })).toBeInTheDocument();
+  });
+
   it("dismisses on Escape", () => {
     const { onDismiss } = renderCandidate({
       card: { content_id: "arrival", type: "movie", title: "Arrival" },
