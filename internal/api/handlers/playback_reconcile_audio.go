@@ -700,7 +700,22 @@ func (h *PlaybackHandler) pendingAudioReconciliationReplan(record *playback.Atte
 	if entry == nil {
 		return
 	}
+	// A viewer who names an audio identity on this replan is making a choice,
+	// not answering the withdrawal. The correction replays a start-time
+	// language preference the viewer never re-picked, so an explicit selection
+	// supersedes it rather than being overwritten.
+	if req.SelectedTracks.Audio != nil {
+		slog.Debug("replan keeps the explicit audio choice over a pending correction",
+			"component", "api", "session", record.SessionID, "generation", entry.Generation)
+		return
+	}
 	req.SelectedTracks.Audio = entry.Request.SelectedTracks.Audio
+	// Restore server-owned provenance for the correction we are applying. The
+	// inbound boundary strips a client-supplied marker, and the client cannot
+	// set this one: the automatic correction replays stored intent, so
+	// persisting its outcome would launder a server decision into a viewer
+	// preference and steer every later start.
+	req.Automatic = playback.ReplanAutomaticV3
 	slog.Debug("replan consumes the pending default audio correction",
 		"component", "api", "session", record.SessionID,
 		"generation", entry.Generation, "audio_index", entry.AudioIndex)
