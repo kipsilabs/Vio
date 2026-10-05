@@ -295,6 +295,7 @@ func (h *PlaybackHandler) settleAudioReconcileInvalidation(ctx context.Context, 
 		PlanID:        record.CurrentPlanID,
 		Request:       &storedRequest,
 		RequestDigest: digest,
+		Reason:        playback.PlanInvalidatedDefaultAudioReconciliation,
 	})
 	// Only the writer that actually settled this (generation, session) emits.
 	// A replayed generation returns the stored decision, already delivered (or
@@ -680,6 +681,27 @@ func (h *PlaybackHandler) sessionNegotiatedPlanInvalidation(ctx context.Context,
 	return playback.HasFeatureV3(record.NormalizedRequest.ClientFeatures, playback.FeaturePlanInvalidatedV3)
 }
 
+// sessionNegotiatedDefaultAudioReconcileResponse reports whether this
+// attempt's client advertised the response-side capability for the
+// default-audio reconciliation withdrawal. It is a stricter gate than
+// sessionNegotiatedPlanInvalidation: a client that advertises only
+// plan_invalidated_v1 handles every withdrawal as a route failure and folds
+// the invalidated attempt key into attempted_plan_keys, which would exclude
+// a perfectly healthy route from its own replacement. Such a client gets NO
+// withdrawal; its decision is still recorded, and the correction lands on
+// its next start or reconnect, which plans against the verified inventory
+// anyway.
+func (h *PlaybackHandler) sessionNegotiatedDefaultAudioReconcileResponse(ctx context.Context, sessionID string) bool {
+	if h == nil || h.PlanStoreV3 == nil {
+		return false
+	}
+	record, err := h.PlanStoreV3.GetAttempt(ctx, sessionID)
+	if err != nil || record == nil {
+		return false
+	}
+	return playback.HasFeatureV3(record.NormalizedRequest.ClientFeatures, playback.FeatureDefaultAudioReconcileResponseV3)
+}
+
 // pendingAudioReconciliationReplan consumes the same pending decision the
 // withdrawal named: the client's replan, whatever body it carries, replans off
 // the withdrawn plan, so it has to select the corrected audio stream or the
@@ -706,7 +728,34 @@ func (h *PlaybackHandler) pendingAudioReconciliationReplan(record *playback.Atte
 	// chose nothing. Only a selection that names something OTHER than the
 	// withdrawn plan's audio is a fresh viewer choice, and it supersedes the
 	// automatic correction; an inherited echo must not suppress it.
-	if namesDifferentAudioIdentityV3(req.SelectedTracks.Audio, record.CurrentPlan) {
+	//
+	// Note: the ingress boundary (replanPlaybackApplicationV3) strips a
+	// client-supplied Automatic marker because a forged one would impersonate
+	// server reconciliation and suppress the viewer's preference persistence.
+	// AnswersPlanInvalidation is NOT trust-sensitive in that way: at worst it
+	// can cause the server to apply a correction the SERVER itself decided to
+	// apply and already announced, so the boundary deliberately does not
+	// strip it.
+	//
+	// The answers_plan_invalidation echo is the authoritative discriminator:
+	// when it matches the reason recorded with the pending entry, this request
+	// IS the reconciliation response — the client read the withdrawal, chose
+	// "apply the server-decided correction" as the answer — and we apply the
+	// correction regardless of the echoed audio identity. That matters in the
+	// reorder case, where the correction targets the same ordinal the withdrawn
+	// plan named and the echoed identity is derived from that ordinal, so a
+	// deliberate re-pick of the track the viewer already had is byte-identical
+	// to the builder's echo and the identity heuristic alone would either
+	// override a real viewer choice or suppress a real echo-lane correction.
+	//
+	// The identity heuristic stays as the fallback for clients that have not
+	// adopted answers_plan_invalidation yet: it is a weaker discriminator (it
+	// cannot tell a deliberate re-pick from an inherited echo in the reorder
+	// case, as above), but it preserves correct behavior for the common echo
+	// case those clients produce.
+	isReconciliationAnswer := strings.TrimSpace(req.AnswersPlanInvalidation) != "" &&
+		strings.TrimSpace(req.AnswersPlanInvalidation) == strings.TrimSpace(entry.Reason)
+	if !isReconciliationAnswer && namesDifferentAudioIdentityV3(req.SelectedTracks.Audio, record.CurrentPlan) {
 		slog.Debug("replan keeps the viewer's audio choice over a pending correction",
 			"component", "api", "session", record.SessionID, "generation", entry.Generation)
 		return
@@ -806,7 +855,14 @@ func (h *PlaybackHandler) announceAudioReconcileInvalidation(ctx context.Context
 	if planID == "" {
 		return
 	}
-	if !h.sessionNegotiatedPlanInvalidation(ctx, live.ID) {
+	if !h.sessionNegotiatedDefaultAudioReconcileResponse(ctx, live.ID) ||
+		!h.sessionNegotiatedPlanInvalidation(ctx, live.ID) {
+		// The withdrawal is gated on the NEW response capability, not merely
+		// on plan_invalidated_v1: an older client that advertises only the
+		// latter treats every withdrawal as a route failure and folds the
+		// invalidated key into attempted_plan_keys, excluding a healthy
+		// route from its own replacement. Such a client gets no withdrawal;
+		// the correction lands on its next start/reconnect instead.
 		slog.DebugContext(ctx, "default audio correction recorded without a withdrawal",
 			"component", "api", "session", live.ID, "generation", stored.Generation,
 			"audio_index", *stored.AudioIndex)

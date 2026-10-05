@@ -289,6 +289,13 @@ type AudioReconcileEntryV3 struct {
 	PlanID        string           `json:"plan_id,omitempty"`
 	Request       *ReplanRequestV3 `json:"request,omitempty"`
 	RequestDigest string           `json:"request_digest,omitempty"`
+	// Reason is the plan_invalidated reason string this settled decision
+	// implies: "default_audio_reconciliation" for replanned/invalidated
+	// decisions, the empty string otherwise. The replan answering the
+	// withdrawal echoes it back in answers_plan_invalidation, and matching
+	// it against this field is what makes the replan authoritatively a
+	// reconciliation response rather than an identity heuristic.
+	Reason string `json:"reason,omitempty"`
 }
 
 // RecoveryExclusionV3 is one confirmed candidate failure. The tuple is scoped

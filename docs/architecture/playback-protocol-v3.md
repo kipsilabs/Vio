@@ -1266,8 +1266,10 @@ worse route, or onto a terminal. A client therefore replans off a
 `failure` payload (the server rejects one on that operation anyway) and no route
 exclusion, carrying only its live position. It is the operation the server's own
 automatic replan already uses for this correction, and a `track_change` that
-changes nothing still returns a fresh plan. `client_features` is unchanged: this
-reuses the existing operation rather than adding one.
+changes nothing still returns a fresh plan. The one advertisement change is the
+withdrawal gate below: `client_features` gains `default_audio_reconcile_response_v1`,
+because this reason cannot be answered correctly under `plan_invalidated_v1`
+alone. No new operation is introduced.
 
 The two sides name the reason independently — the server from
 `playback.PlanInvalidatedDefaultAudioReconciliation`, the browser from its own
@@ -1282,12 +1284,38 @@ The correction is one-shot rather than an ongoing override: it is keyed to the
 withdrawn plan, and the plan the replan commits becomes current, so the client's
 next replan is its own.
 
-Four rules bound it:
+Six rules bound it:
 
-- **The feature still gates delivery.** A client that never advertised
-  `plan_invalidated_v1` gets no event. Its decision is still recorded, and the
-  correction lands on its next start or reconnect — which plans against the
-  verified inventory anyway, because the inventory is what moved.
+- **Two features gate delivery, and they are not the same promise.** The
+  withdrawal needs `default_audio_reconcile_response_v1` **and**
+  `plan_invalidated_v1`. The second alone is not enough: a client that
+  advertised only `plan_invalidated_v1` has never heard of this reason, so it
+  replays the withdrawal as a `failure_recovery`, folds the withdrawn
+  `plan_attempt_key` into `attempted_plan_keys`, and excludes the healthy route
+  it is currently playing from its own replacement. Sending it the withdrawal
+  anyway would trade a wrong-language session for a broken one. Its decision is
+  still recorded, and the correction lands on its next start or reconnect —
+  which plans against the verified inventory anyway, because the inventory is
+  what moved. `plan_invalidated_v1` alone still gates every other withdrawal
+  reason (§6.1).
+- **`answers_plan_invalidation` is the authoritative correlation.** The
+  withdrawal's `reason` is recorded on the settled ledger entry, and the replan
+  that answers it echoes the same string back. That echo — not the request
+  shape — is what tells the server this replan is a reconciliation response.
+  The field is deliberately **not** stripped at the ingress boundary, unlike
+  `Automatic`: forging it can at worst make the server apply a correction the
+  server itself decided and announced, whereas forging `Automatic` would
+  impersonate server reconciliation and suppress the viewer's preference
+  persistence. An echo is a required input, never an authority: a mismatching
+  echo falls through to the identity heuristic below.
+- **The echoed audio identity is a fallback discriminator, not the contract.**
+  Without an echo, a selection that names something other than the withdrawn
+  plan's audio is read as a fresh viewer choice that supersedes the
+  correction — correct for the usual shape, because the request builder echoes
+  the plan's own audio on every replan. It cannot tell a deliberate re-pick of
+  the track the viewer already had from that inherited echo when the probe
+  reorders the inventory and the correction targets the same ordinal, which is
+  exactly why the echo exists.
 - **A byte-equal no-op still settles the generation.** Heartbeats and duplicate
   evidence writes converge on the stored decision instead of re-evaluating.
 - **Every automatic-selection gate still runs before the decision**: a stale or

@@ -137,7 +137,7 @@ func (f *invalidationFixture) reconcile(t *testing.T) *playback.AttemptRecordV3 
 // recipe of its own. The client's own replan then consumes the same decision
 // and lands on the corrected audio index with its position preserved.
 func TestReconcileAudioReplanAdoptsThroughPlanInvalidated(t *testing.T) {
-	f := newInvalidationFixture(t, []string{playback.FeaturePlanInvalidatedV3}, 321.5)
+	f := newInvalidationFixture(t, []string{playback.FeaturePlanInvalidatedV3, playback.FeatureDefaultAudioReconcileResponseV3}, 321.5)
 	activePlanID := f.record.CurrentPlanID
 	activeStreamURL := f.record.CurrentPlan.Stream.URL
 
@@ -248,7 +248,7 @@ func TestReconcileAudioReplanAdoptsThroughPlanInvalidated(t *testing.T) {
 // second probe write and a second heartbeat on a settled generation emit
 // nothing, and the stored canonical request replays verbatim.
 func TestReconcileAudioNoDoubleCorrection(t *testing.T) {
-	f := newInvalidationFixture(t, []string{playback.FeaturePlanInvalidatedV3}, 12)
+	f := newInvalidationFixture(t, []string{playback.FeaturePlanInvalidatedV3, playback.FeatureDefaultAudioReconcileResponseV3}, 12)
 
 	after := f.reconcile(t)
 	entry := playback.FindAudioReconcileEntry(after.AudioReconcileLedger, reconcileGenerationV3(f.verified), f.session.ID)
@@ -289,7 +289,7 @@ func TestReconcileAudioNoDoubleCorrection(t *testing.T) {
 // them) must not both proceed. The second is refused and recorded, and only one
 // replan is ever issued.
 func TestReconcileAudioImmutableIdentity(t *testing.T) {
-	f := newInvalidationFixture(t, []string{playback.FeaturePlanInvalidatedV3}, 10)
+	f := newInvalidationFixture(t, []string{playback.FeaturePlanInvalidatedV3, playback.FeatureDefaultAudioReconcileResponseV3}, 10)
 
 	after := f.reconcile(t)
 	entry := playback.FindAudioReconcileEntry(after.AudioReconcileLedger, reconcileGenerationV3(f.verified), f.session.ID)
@@ -359,7 +359,7 @@ func TestReconcileAudioImmutableIdentity(t *testing.T) {
 // reads start.AudioTrackID/AudioTrackIndex, so a correction applied afterwards
 // never reaches the plan or the executor's audio map.
 func TestPendingAudioCorrectionReachesTheStartSelection(t *testing.T) {
-	f := newInvalidationFixture(t, []string{playback.FeaturePlanInvalidatedV3}, 10)
+	f := newInvalidationFixture(t, []string{playback.FeaturePlanInvalidatedV3, playback.FeatureDefaultAudioReconcileResponseV3}, 10)
 
 	after := f.reconcile(t)
 	entry := playback.FindAudioReconcileEntry(after.AudioReconcileLedger, reconcileGenerationV3(f.verified), f.session.ID)
@@ -398,7 +398,7 @@ func TestPendingAudioCorrectionReachesTheStartSelection(t *testing.T) {
 // winning evaluator already settled and announced: two concurrent evaluations
 // that captured different playheads would otherwise strand the correction.
 func TestRefusalDoesNotStrandTheSettledCorrection(t *testing.T) {
-	f := newInvalidationFixture(t, []string{playback.FeaturePlanInvalidatedV3}, 10)
+	f := newInvalidationFixture(t, []string{playback.FeaturePlanInvalidatedV3, playback.FeatureDefaultAudioReconcileResponseV3}, 10)
 
 	after := f.reconcile(t)
 	entry := playback.FindAudioReconcileEntry(after.AudioReconcileLedger, reconcileGenerationV3(f.verified), f.session.ID)
@@ -448,7 +448,7 @@ func TestRefusalDoesNotStrandTheSettledCorrection(t *testing.T) {
 // redundant viewer pick not being persisted, which is far smaller than writing
 // a server decision into a stored preference.
 func TestInheritedAudioEchoIsTreatedAsReconciliationResponse(t *testing.T) {
-	f := newInvalidationFixture(t, []string{playback.FeaturePlanInvalidatedV3}, 10)
+	f := newInvalidationFixture(t, []string{playback.FeaturePlanInvalidatedV3, playback.FeatureDefaultAudioReconcileResponseV3}, 10)
 	after := f.reconcile(t)
 	entry := playback.FindAudioReconcileEntry(after.AudioReconcileLedger, reconcileGenerationV3(f.verified), f.session.ID)
 	if entry == nil || entry.Request == nil || entry.Request.SelectedTracks.Audio == nil {
@@ -492,7 +492,7 @@ func TestInheritedAudioEchoIsTreatedAsReconciliationResponse(t *testing.T) {
 // A viewer who picks a different track while the withdrawal is in flight is
 // making a choice, and it supersedes the automatic correction.
 func TestExplicitAudioChoiceSupersedesPendingCorrection(t *testing.T) {
-	f := newInvalidationFixture(t, []string{playback.FeaturePlanInvalidatedV3}, 10)
+	f := newInvalidationFixture(t, []string{playback.FeaturePlanInvalidatedV3, playback.FeatureDefaultAudioReconcileResponseV3}, 10)
 	after := f.reconcile(t)
 	entry := playback.FindAudioReconcileEntry(after.AudioReconcileLedger, reconcileGenerationV3(f.verified), f.session.ID)
 	if entry == nil || entry.Request == nil || entry.Request.SelectedTracks.Audio == nil {
@@ -517,7 +517,7 @@ func TestExplicitAudioChoiceSupersedesPendingCorrection(t *testing.T) {
 }
 
 func TestPendingCorrectionRestoresAutomaticProvenance(t *testing.T) {
-	f := newInvalidationFixture(t, []string{playback.FeaturePlanInvalidatedV3}, 10)
+	f := newInvalidationFixture(t, []string{playback.FeaturePlanInvalidatedV3, playback.FeatureDefaultAudioReconcileResponseV3}, 10)
 	after := f.reconcile(t)
 	entry := playback.FindAudioReconcileEntry(after.AudioReconcileLedger, reconcileGenerationV3(f.verified), f.session.ID)
 	if entry == nil {
@@ -565,13 +565,76 @@ func TestReconcileAudioWithdrawalSkippedWithoutCapability(t *testing.T) {
 	}
 }
 
+// TestReconcileAudioWithdrawalSkippedWithoutReconcileResponseCapability is the
+// compatibility half of the gate: a client that advertised
+// plan_invalidated_v1 but NOT default_audio_reconcile_response_v1 replays any
+// withdrawal it receives as a failure_recovery — folding the withdrawn attempt
+// key into attempted_plan_keys and excluding the healthy route that is
+// currently playing from its own replacement. The withdrawal is therefore
+// withheld from it specifically, while the decision stays recorded so the
+// correction lands on its next start or reconnect.
+func TestReconcileAudioWithdrawalSkippedWithoutReconcileResponseCapability(t *testing.T) {
+	f := newInvalidationFixture(t, []string{
+		playback.FeaturePlaybackPlanV3,
+		playback.FeaturePlanInvalidatedV3,
+	}, 5)
+
+	after := f.reconcile(t)
+
+	if got := len(f.conn.commands()); got != 0 {
+		t.Fatalf("plan_invalidated pushes = %d without default_audio_reconcile_response_v1, want 0", got)
+	}
+	entry := playback.FindAudioReconcileEntry(after.AudioReconcileLedger, reconcileGenerationV3(f.verified), f.session.ID)
+	if entry == nil {
+		t.Fatal("the decision must still be recorded without the reconcile-response capability")
+	}
+	if entry.Decision != playback.AudioReconcileInvalidated || entry.Request == nil {
+		t.Fatalf("decision = %+v, want a recorded invalidation with its canonical request", entry)
+	}
+	if entry.Reason != playback.PlanInvalidatedDefaultAudioReconciliation {
+		t.Fatalf("entry reason = %q, want %q", entry.Reason, playback.PlanInvalidatedDefaultAudioReconciliation)
+	}
+	if after.CurrentPlanID != f.record.CurrentPlanID {
+		t.Fatal("an unnegotiated client must not get its plan replaced server-side either")
+	}
+}
+
+// TestSettledReconcileEntryRecordsTheWithdrawalReason pins the correlation
+// half: the settled entry carries the exact reason string the withdrawal was
+// announced with, because that is what an answering replan echoes back in
+// answers_plan_invalidation and what pendingAudioReconciliationReplan matches
+// against.
+func TestSettledReconcileEntryRecordsTheWithdrawalReason(t *testing.T) {
+	f := newInvalidationFixture(t, []string{
+		playback.FeaturePlaybackPlanV3,
+		playback.FeaturePlanInvalidatedV3,
+		playback.FeatureDefaultAudioReconcileResponseV3,
+	}, 9)
+
+	after := f.reconcile(t)
+	entry := playback.FindAudioReconcileEntry(after.AudioReconcileLedger, reconcileGenerationV3(f.verified), f.session.ID)
+	if entry == nil {
+		t.Fatal("expected a settled entry")
+	}
+	if entry.Reason != playback.PlanInvalidatedDefaultAudioReconciliation {
+		t.Fatalf("entry reason = %q, want %q", entry.Reason, playback.PlanInvalidatedDefaultAudioReconciliation)
+	}
+	// The stored canonical request must NOT echo the reason back: it is a
+	// server-built automatic replan, not the client's answer to a withdrawal,
+	// and its bytes are the idempotency identity.
+	if entry.Request.AnswersPlanInvalidation != "" {
+		t.Fatalf("stored automatic replan answers_plan_invalidation = %q, want empty",
+			entry.Request.AnswersPlanInvalidation)
+	}
+}
+
 // TestReconcileAudioWithdrawalReachesOnlyTheOwnerLane pins the multi-node
 // contract: the withdrawal travels the session's own hub lane, so it reaches
 // the replica that owns that session's control socket and nothing else. The
 // ledger, not a cross-replica RPC, is what keeps another replica from
 // emitting a duplicate.
 func TestReconcileAudioWithdrawalReachesOnlyTheOwnerLane(t *testing.T) {
-	f := newInvalidationFixture(t, []string{playback.FeaturePlanInvalidatedV3}, 7)
+	f := newInvalidationFixture(t, []string{playback.FeaturePlanInvalidatedV3, playback.FeatureDefaultAudioReconcileResponseV3}, 7)
 	other := &reconcileInvalidationConn{}
 	otherRegistration := f.handler.RealtimeHub.Register("22222222-2222-2222-2222-222222222222", other)
 	if otherRegistration == nil {
