@@ -11,6 +11,7 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/config"
+	"github.com/Silo-Server/silo-server/internal/lang"
 	"github.com/Silo-Server/silo-server/internal/models"
 )
 
@@ -195,7 +196,7 @@ func (m *mapper) itemFromList(item upstreamListItem, isFavorite bool, progress *
 		dto.Tags = []string{}
 	}
 	if allFields || fields["productionlocations"] {
-		dto.ProductionLocations = append([]string{}, item.Countries...)
+		dto.ProductionLocations = append([]string{}, lang.UniqueCountries(item.Countries)...)
 	}
 	if allFields || fields["mediasourcecount"] {
 		// The list path has no version data, so assume matched playable items
@@ -331,7 +332,7 @@ func (m *mapper) itemFromDetailWithFields(item upstreamItemDetail, isFavorite bo
 	dto.SortName = firstNonEmpty(item.SortTitle, item.OriginalTitle, item.Title)
 	dto.ForcedSortName = dto.SortName
 	dto.Studios = m.namePairs(item.Studios, EncodedIDStudio)
-	dto.ProductionLocations = append([]string{}, item.Countries...)
+	dto.ProductionLocations = append([]string{}, lang.UniqueCountries(item.Countries)...)
 	if item.Tagline != "" {
 		dto.Taglines = []string{item.Tagline}
 	}
