@@ -1761,7 +1761,11 @@ func (h *PlaybackHandler) resolveRehydratedVirtualSourceV3(
 // the provider's current list, it retries once with a fresh relist and rotation
 // declared, excluding the absent pin, and threads the anchor row's durable
 // identity so a renumbered same-release candidate is re-identified rather than
-// mistaken for a sibling.
+// mistaken for a sibling. The retry gate is the same provider-listing outage
+// predicate the plan-time walk and the serve layer use, so an empty provider
+// listing (a transient blackout, not an absent pin) also gets the forced
+// relist instead of terminaling the already-built plan at the first live
+// resolve.
 //
 // It accepts the rotated candidate only when it is the same release as the
 // anchor: the resolver reports IdentityRematched, or the candidate's durable
@@ -1780,7 +1784,7 @@ func (h *PlaybackHandler) resolveVirtualAnchorURIWithRotationV3(
 		ctx, file.FilePath, file.VirtualOwnerInstallationID,
 		session.UserID, session.ProfileID, false, nil, "",
 	)
-	if err == nil || (!errors.Is(err, virtuallibrary.ErrSessionBoundCandidateAbsent) && !errors.Is(err, ErrVirtualCandidateMarkedFailed)) {
+	if err == nil || (!virtualProviderListingOutage(err) && !errors.Is(err, ErrVirtualCandidateMarkedFailed)) {
 		return resolved, cleanup, err
 	}
 	pinnedID := virtualResultCandidateID(file.FilePath)

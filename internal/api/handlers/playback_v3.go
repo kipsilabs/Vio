@@ -3620,7 +3620,19 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 				// same-identity candidate is still listed. A different release is
 				// refused rather than silently anchored.
 				if resolveErr := resolveAnchorInput(ctx); resolveErr != nil {
-					return preparedTimelineV3{}, &transportErrorV3{reason: transcodeStartFailedReasonV3, message: "Failed to resolve remux seek position.", retryable: true, cause: resolveErr}
+					// This is the first live provider listing for an already-built
+					// plan: a remux seek start binds the row's probe evidence via
+					// the P0 fast path with no liveness check, by design. A
+					// transient provider listing outage here (empty answer, 5xx)
+					// is a dependency failure, not a verdict about the release, so
+					// classify it as the retryable provider_unavailable — for
+					// identity-less rows too, which the evidence-gated outage
+					// retry cannot cover. A genuine absent-pin or marked-failed
+					// release verdict is left as-is so the start's alternate walk
+					// still runs.
+					classified := classifyVirtualAnchorProviderOutage(resolveErr)
+					return preparedTimelineV3{}, transportStartFailureV3(classified,
+						&transportErrorV3{reason: transcodeStartFailedReasonV3, message: "Failed to resolve remux seek position.", retryable: true, cause: classified})
 				}
 				// A stored URL that has already lapsed is renewed before the probe,
 				// bounded to virtualProbeBudget, so the seek does not fail on a
