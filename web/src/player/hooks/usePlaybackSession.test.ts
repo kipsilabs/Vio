@@ -16,6 +16,7 @@ import {
 } from "../playback-session-wire-v3";
 import { markPlaybackIntent } from "../first-frame";
 import type { PlayerAudioTrack } from "../types";
+import type { SubtitleInventoryItemV3 } from "../protocol-v3";
 import { usePlaybackSession } from "./usePlaybackSession";
 import { resetCodecDetectionForTests } from "./useCodecDetection";
 import { resetSessionMutations } from "../session-mutations";
@@ -2215,7 +2216,7 @@ describe("usePlaybackSession version switches", () => {
   });
 
   it("stamps a verified subtitle anchor with the payload identity across rotation", async () => {
-    const subtitleA = {
+    const subtitleA: SubtitleInventoryItemV3 = {
       track_id: "file:7:subtitle:0",
       combined_index: 0,
       source: "embedded",
@@ -4787,7 +4788,7 @@ describe("usePlaybackSession plan audio inventory", () => {
   });
 
   it("ignores a same-source declared subtitle inventory after a verified one", async () => {
-    const verifiedSubtitles = [
+    const verifiedSubtitles: SubtitleInventoryItemV3[] = [
       {
         track_id: "file:7:subtitle:0",
         combined_index: 0,
@@ -4801,7 +4802,7 @@ describe("usePlaybackSession plan audio inventory", () => {
         url: "/stream/session-1/subtitles/0.vtt?file_id=7",
       },
     ];
-    const declaredSubtitles = [
+    const declaredSubtitles: SubtitleInventoryItemV3[] = [
       ...verifiedSubtitles,
       {
         track_id: "file:7:subtitle:1",
