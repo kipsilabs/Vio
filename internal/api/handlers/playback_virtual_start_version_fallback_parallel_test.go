@@ -48,7 +48,7 @@ func TestRunVirtualVersionFallbackCandidatesDeadCandidatesResolveInParallel(t *t
 	decisionCtx, cancel := context.WithTimeout(context.Background(), virtualStartVersionFallbackDecisionBudget)
 	defer cancel()
 	start := time.Now()
-	_, ok := runVirtualVersionFallbackCandidatesV3(decisionCtx, candidates, workers, virtualStartVersionFallbackListingBudget, resolve)
+	_, _, ok := runVirtualVersionFallbackCandidatesV3(decisionCtx, candidates, workers, virtualStartVersionFallbackListingBudget, resolve)
 	elapsed := time.Since(start)
 
 	if ok {
@@ -79,7 +79,7 @@ func TestRunVirtualVersionFallbackCandidatesFirstHealthyWinsCancelsRest(t *testi
 
 	var deadStarted atomic.Int32
 	allDeadStarted := make(chan struct{})
-	cancelled := make(chan int, len(dead))
+	canceled := make(chan int, len(dead))
 	resolve := func(ctx context.Context, file *models.MediaFile) (resolvedVirtualPlaybackSource, bool) {
 		if file.ID == healthy.ID {
 			// Hold the winner until the whole fan-out wave is in flight, so
@@ -91,21 +91,26 @@ func TestRunVirtualVersionFallbackCandidatesFirstHealthyWinsCancelsRest(t *testi
 			close(allDeadStarted)
 		}
 		<-ctx.Done()
-		cancelled <- file.ID
+		canceled <- file.ID
 		return resolvedVirtualPlaybackSource{}, false
 	}
 
-	winner, ok := runVirtualVersionFallbackCandidatesV3(context.Background(), candidates, 4, virtualStartVersionFallbackListingBudget, resolve)
+	winner, winnerIndex, ok := runVirtualVersionFallbackCandidatesV3(context.Background(), candidates, 4, virtualStartVersionFallbackListingBudget, resolve)
 	if !ok {
 		t.Fatal("a healthy candidate was present; want the winner")
 	}
 	if winner.File == nil || winner.File.ID != healthy.ID {
 		t.Fatalf("winner = %#v, want the healthy candidate %d", winner, healthy.ID)
 	}
+	// The winner's own index must travel with the result; candidate 1 is the
+	// healthy one in the fallback order above.
+	if winnerIndex != 1 || candidates[winnerIndex] != healthy {
+		t.Fatalf("winner index = %d, want the healthy candidate's index 1", winnerIndex)
+	}
 	// The three dead candidates must all observe the winner's cancellation.
 	for i := 0; i < len(dead); i++ {
 		select {
-		case <-cancelled:
+		case <-canceled:
 		case <-time.After(time.Second):
 			t.Fatal("a straggler was not canceled after the first healthy candidate won")
 		}
@@ -124,7 +129,7 @@ func TestRunVirtualVersionFallbackCandidatesTerminalOnlyAfterAllFail(t *testing.
 		return resolvedVirtualPlaybackSource{}, false
 	}
 
-	_, ok := runVirtualVersionFallbackCandidatesV3(context.Background(), candidates, 2, virtualStartVersionFallbackListingBudget, resolve)
+	_, _, ok := runVirtualVersionFallbackCandidatesV3(context.Background(), candidates, 2, virtualStartVersionFallbackListingBudget, resolve)
 	if ok {
 		t.Fatal("every candidate failed; want the terminal, not a winner")
 	}
@@ -194,4 +199,212 @@ func TestResolveVirtualStartWithVersionFallbackDeadPinsResolveInParallel(t *test
 	if got := altStarted.Load(); got != altCount {
 		t.Fatalf("started %d alternate resolve(s), want all %d", got, altCount)
 	}
+}
+
+// TestRunVirtualVersionFallbackCandidatesCompetingSuccessCarriesWinnerIndex is
+// the gated competing-success race test. Two candidates can both resolve; the
+// two successes are released together so they race to publish on the winner
+// channel. The result must carry the winning source together with the index of
+// the candidate that produced it, never a competing worker's index read from a
+// shared variable the straggler could overwrite. Run with -race and repeated so
+// both publish orders are exercised.
+func TestRunVirtualVersionFallbackCandidatesCompetingSuccessCarriesWinnerIndex(t *testing.T) {
+	first := &models.MediaFile{ID: 101, FilePath: "virtual://movie/movie-compete?result=first"}
+	second := &models.MediaFile{ID: 102, FilePath: "virtual://movie/movie-compete?result=second"}
+	candidates := []*models.MediaFile{first, second}
+
+	for i := 0; i < 200; i++ {
+		var entered atomic.Int32
+		bothIn := make(chan struct{})
+		release := make(chan struct{})
+		resolve := func(ctx context.Context, file *models.MediaFile) (resolvedVirtualPlaybackSource, bool) {
+			if entered.Add(1) == int32(len(candidates)) {
+				close(bothIn)
+			}
+			select {
+			case <-bothIn:
+			case <-ctx.Done():
+				return resolvedVirtualPlaybackSource{}, false
+			}
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return resolvedVirtualPlaybackSource{}, false
+			}
+			return resolvedVirtualPlaybackSource{URI: file.FilePath, File: file}, true
+		}
+		// Open the release only once both successes are in their resolve, so
+		// the two publish attempts genuinely race rather than arriving serially.
+		go func() {
+			<-bothIn
+			close(release)
+		}()
+
+		winner, index, ok := runVirtualVersionFallbackCandidatesV3(
+			context.Background(), candidates, len(candidates), virtualStartVersionFallbackListingBudget, resolve,
+		)
+		if !ok {
+			t.Fatalf("iteration %d: both candidates succeeded; want a winner", i)
+		}
+		if index < 0 || index >= len(candidates) || candidates[index] != winner.File {
+			t.Fatalf("iteration %d: winner source %q / file %v was paired with index %d (%v); the originating index must travel with the source",
+				i, winner.URI, winner.File, index, candidates[index])
+		}
+		if winner.URI != candidates[index].FilePath {
+			t.Fatalf("iteration %d: winner URI %q does not belong to the returned index %d (%q)",
+				i, winner.URI, index, candidates[index].FilePath)
+		}
+	}
+}
+
+// TestRunVirtualVersionFallbackCandidatesLaterWaveSharesDecisionBudget pins the
+// deliberate sliding-wave tradeoff: the first `workers` candidates each get the
+// full per-listing budget, and a candidate that only receives a worker slot
+// after an earlier wave has timed out inherits only the remainder of the
+// decision budget. Four listings that each burn the whole listing budget leave
+// a fifth candidate a fraction of it, and the walk terminals on the decision
+// budget instead of paying one full listing budget per candidate.
+func TestRunVirtualVersionFallbackCandidatesLaterWaveSharesDecisionBudget(t *testing.T) {
+	const workers = 4
+	candidates := []*models.MediaFile{{ID: 1}, {ID: 2}, {ID: 3}, {ID: 4}, {ID: 5}}
+	// The decision budget is deliberately below two listing budgets, so the
+	// candidate that only starts after the first wave times out can never be
+	// handed a fresh full listing budget.
+	listingBudget := 150 * time.Millisecond
+	decisionBudget := 250 * time.Millisecond
+
+	var attempted atomic.Int32
+	var laterRemaining atomic.Int64
+	laterRemaining.Store(-1)
+	resolve := func(ctx context.Context, file *models.MediaFile) (resolvedVirtualPlaybackSource, bool) {
+		attempted.Add(1)
+		if file.ID == 5 {
+			if deadline, ok := ctx.Deadline(); ok {
+				laterRemaining.Store(int64(time.Until(deadline)))
+			}
+		}
+		// Every candidate times out its own listing, so the first wave consumes
+		// the whole listing budget and the second wave only gets the remainder.
+		<-ctx.Done()
+		return resolvedVirtualPlaybackSource{}, false
+	}
+
+	decisionCtx, cancel := context.WithTimeout(context.Background(), decisionBudget)
+	defer cancel()
+	start := time.Now()
+	_, _, ok := runVirtualVersionFallbackCandidatesV3(decisionCtx, candidates, workers, listingBudget, resolve)
+	elapsed := time.Since(start)
+
+	if ok {
+		t.Fatal("every candidate timed out; want the terminal, not a winner")
+	}
+	if got := attempted.Load(); got != int32(len(candidates)) {
+		t.Fatalf("attempted %d candidate(s), want all %d", got, len(candidates))
+	}
+	remaining := time.Duration(laterRemaining.Load())
+	if remaining < 0 {
+		t.Fatal("the later-wave candidate ran without a per-listing deadline")
+	}
+	if remaining >= listingBudget {
+		t.Fatalf("later-wave listing deadline had %s remaining, want less than one listing budget (%s): a later wave must share the decision budget",
+			remaining, listingBudget)
+	}
+	// A serial per-candidate budget would be len(candidates)*listingBudget; the
+	// wave must instead land near the decision budget.
+	if elapsed >= 3*listingBudget {
+		t.Fatalf("walk took %s, want it bounded near the decision budget (%s) rather than one full listing budget per candidate",
+			elapsed, decisionBudget)
+	}
+}
+
+// TestResolveVirtualStartWithVersionFallbackDoesNotJoinBlockedVerdictStamp pins
+// the separation of verdict persistence from resolution. The one alternate
+// resolves confirmed-dead when its own listing budget expires, which fires the
+// decision budget at the same moment; the failed_at marker is then blocked for
+// its whole budget. The walk must terminal at the listing/decision deadline
+// regardless, because the stamp is detached: a synchronous stamp held the
+// worker mid-resolve, so the budget-elapsed join on the worker stretched the
+// walk by startCandidateFailStampBudget. The blocked marker is what proves the
+// deadline expires rather than the walk waiting out the stamp.
+func TestResolveVirtualStartWithVersionFallbackDoesNotJoinBlockedVerdictStamp(t *testing.T) {
+	resetVirtualRecoveryRelists(t)
+	// Shrink the walk budgets so the test is fast and the relationship is
+	// explicit. The listing and decision budgets coincide, so the failed
+	// listing and the walk deadline expire together and the blocked marker is
+	// the only thing that could stretch the walk.
+	listingBudget, decisionBudget, stampBudget := 150*time.Millisecond, 150*time.Millisecond, 1200*time.Millisecond
+	prevListing, prevDecision, prevStamp := virtualStartVersionFallbackListingBudget, virtualStartVersionFallbackDecisionBudget, startCandidateFailStampBudget
+	virtualStartVersionFallbackListingBudget, virtualStartVersionFallbackDecisionBudget, startCandidateFailStampBudget = listingBudget, decisionBudget, stampBudget
+	t.Cleanup(func() {
+		virtualStartVersionFallbackListingBudget, virtualStartVersionFallbackDecisionBudget, startCandidateFailStampBudget = prevListing, prevDecision, prevStamp
+	})
+
+	const (
+		content = "movie-blocked-stamp"
+		neutral = "virtual://movie/" + content
+	)
+	primary := &models.MediaFile{ID: 1, ContentID: content, FilePath: neutral + "?result=A", VirtualOwnerInstallationID: 5}
+	alternate := &models.MediaFile{
+		ID: 11, ContentID: content, FilePath: neutral + "?result=B",
+		VirtualOwnerInstallationID: 5, ProviderVideoHash: "hash-b", ProviderReleaseName: "Movie.2024",
+	}
+
+	stampEntered := make(chan struct{}, 1)
+	releaseStamp := make(chan struct{})
+	h := &PlaybackHandler{
+		FileVersionFetcher: testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{
+			content: {primary, alternate},
+		}},
+		VirtualPlaybackResolver: VirtualPlaybackResolverFunc(func(context.Context, string, int, string, int) (string, error) {
+			return "", errors.New("simple resolver must not be used when the detailed resolver is set")
+		}),
+		VirtualMediaDetailedResolver: VirtualMediaDetailedResolverFunc(func(ctx context.Context, uri string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+			if virtualResultCandidateID(uri) == "A" {
+				return ResolvedVirtualMedia{}, providerEmptyListing()
+			}
+			// The alternate burns its whole listing budget, so its failure and
+			// the walk deadline land together.
+			<-ctx.Done()
+			return ResolvedVirtualMedia{}, errors.New("virtual stream provider returned no matching candidate")
+		}),
+		VirtualCandidateFailMarker: func(ctx context.Context, _ int, _ string, _ *time.Time) error {
+			stampEntered <- struct{}{}
+			select {
+			case <-releaseStamp:
+			case <-ctx.Done():
+			}
+			return nil
+		},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/playback/start", nil)
+
+	walkDone := make(chan time.Duration, 1)
+	go func() {
+		start := time.Now()
+		_, _ = h.resolveVirtualStartWithVersionFallback(req, primary, "profile-1", playback.StartRequestV3{QualityPreference: "auto"}, false, 0)
+		walkDone <- time.Since(start)
+	}()
+
+	// The walk must terminal near the deadline while the marker is blocked. A
+	// synchronous stamp would hold it for the whole stamp budget.
+	select {
+	case elapsed := <-walkDone:
+		if elapsed >= stampBudget/2 {
+			close(releaseStamp)
+			t.Fatalf("walk took %s with a blocked verdict marker; want it bounded to the decision budget (%s), not joined to the stamp budget %s",
+				elapsed, decisionBudget, stampBudget)
+		}
+	case <-time.After(stampBudget / 2):
+		close(releaseStamp)
+		t.Fatal("walk did not terminal while the verdict marker was blocked; the stamp is joined to the walk")
+	}
+
+	// The confirmed-dead alternate must still attempt its verdict stamp.
+	select {
+	case <-stampEntered:
+	case <-time.After(time.Second):
+		close(releaseStamp)
+		t.Fatal("no confirmed-dead alternate stamp was attempted")
+	}
+	close(releaseStamp)
 }
