@@ -1757,24 +1757,40 @@ func (h *PlaybackHandler) resolveRehydratedVirtualSourceV3(
 
 // resolveVirtualAnchorURIWithRotationV3 resolves the session-bound virtual
 // anchor for transport preparation (the remux seek anchor and the transport
-// input). When the resolver refuses because the pinned candidate is absent from
-// the provider's current list, it retries once with a fresh relist and rotation
-// declared, excluding the absent pin, and threads the anchor row's durable
-// identity so a renumbered same-release candidate is re-identified rather than
-// mistaken for a sibling. The retry gate is the same provider-listing outage
-// predicate the plan-time walk and the serve layer use, so an empty provider
-// listing (a transient blackout, not an absent pin) also gets the forced
-// relist instead of terminaling the already-built plan at the first live
-// resolve.
+// input). The retry gate is the same provider-listing outage predicate the
+// plan-time walk and the serve layer use, so an empty provider listing (a
+// transient blackout, not an absent pin) also gets a forced relist instead of
+// terminaling the already-built plan at the first live resolve.
 //
-// It accepts the rotated candidate only when it is the same release as the
+// The retry distinguishes a release verdict from a transient listing outage:
+//
+//   - A verdict that indicts the release — an absent session pin
+//     (ErrSessionBoundCandidateAbsent) or a catalog marked-failed candidate —
+//     excludes the dead pin and declares rotation, so a renumbered same-release
+//     candidate is re-identified rather than mistaken for a sibling. The anchor
+//     row's durable identity is threaded so the re-match can prove the release.
+//   - A transient listing outage (an empty answer, a 5xx, or a trusted pin
+//     absent from an empty answer) is not a verdict. The retry re-lists and
+//     re-serves the SAME bound pin without excluding or indicting it, so a
+//     provider that recovers with the same candidate id recovers instead of
+//     having the healthy candidate skipped as if it were dead.
+//
+// The forced retry is marked as a provider-outage relist. Without that marker a
+// forced resolve re-honors the fresh-serve floor and the provider-failure
+// backoff, so it would replay the very empty answer (or fail-fast negative) the
+// outage just cached; the marker bypasses both. This matters for identity-less
+// rows too, which the evidence-gated outage retry inside resolveVirtualInputURI
+// cannot cover.
+//
+// It accepts a substituted candidate only when it is the same release as the
 // anchor: the resolver reports IdentityRematched, or the candidate's durable
-// identity tier matches the row's. A genuinely different release is refused
-// with the original absent-pin cause instead of silently anchoring the
-// already-built plan on sibling bytes; the caller keeps its terminal/rotation
-// policy and no release swap happens under a plan that never replanned. This is
-// the same narrow contract the serve layer (stream.go) and the replan
-// rehydration (resolveRehydratedVirtualSourceV3) apply.
+// identity tier matches the row's. Serving the pinned id itself is accepted
+// unconditionally — it is the bound candidate. A genuinely different release is
+// refused with the original cause instead of silently anchoring the already-
+// built plan on sibling bytes; the caller keeps its terminal/rotation policy and
+// no release swap happens under a plan that never replanned. This is the same
+// narrow contract the serve layer (stream.go) and the replan rehydration
+// (resolveRehydratedVirtualSourceV3) apply.
 func (h *PlaybackHandler) resolveVirtualAnchorURIWithRotationV3(
 	ctx context.Context,
 	session *playback.Session,
@@ -1788,23 +1804,37 @@ func (h *PlaybackHandler) resolveVirtualAnchorURIWithRotationV3(
 		return resolved, cleanup, err
 	}
 	pinnedID := virtualResultCandidateID(file.FilePath)
+	// Only a verdict about the release authorizes excluding (and rotating past)
+	// the bound pin. A transient listing outage must retry the pin it still
+	// believes in; excluding it would skip the healthy candidate the moment the
+	// provider recovers with the same id.
+	releaseIndicted := errors.Is(err, virtuallibrary.ErrSessionBoundCandidateAbsent) ||
+		errors.Is(err, ErrVirtualCandidateMarkedFailed)
 	var excluded []string
-	if pinnedID != "" {
+	if releaseIndicted && pinnedID != "" {
 		excluded = []string{pinnedID}
 	}
 	// Thread the durable identity explicitly: the retry relists (forceRefresh),
 	// so the stored-row lookup that normally carries the identity is bypassed. A
-	// legacy row with no identity is unchanged and the retry falls back to an
-	// ordinary rotation.
+	// legacy row with no identity is unchanged; a same-release re-match then
+	// cannot be proven and the assertion below keeps the original cause.
 	retryCtx := virtualResolveContextWithPersistedIdentity(ctx, file)
+	// Mark the forced retry as an outage relist so the resolver asks the
+	// provider again instead of serving the recent empty answer or honoring the
+	// provider-failure backoff the outage just recorded.
+	retryCtx = virtuallibrary.WithProviderOutageRelist(retryCtx)
 	rotated, rotatedCleanup, rotateErr := h.resolveVirtualInputURI(
 		retryCtx, file.FilePath, file.VirtualOwnerInstallationID,
-		session.UserID, session.ProfileID, true, excluded, "", true,
+		session.UserID, session.ProfileID, true, excluded, "", releaseIndicted,
 	)
 	if rotateErr != nil {
 		return rotated, rotatedCleanup, rotateErr
 	}
-	if !rotated.IdentityRematched && !resolvedMatchesPersistedIdentity(rotated, file) {
+	// The bound pin itself is never a substitution, even without durable
+	// identity: a provider that recovered with the same candidate id resolves
+	// exactly the release the session is serving.
+	samePin := pinnedID != "" && rotated.CandidateID == pinnedID
+	if !samePin && !rotated.IdentityRematched && !resolvedMatchesPersistedIdentity(rotated, file) {
 		if rotatedCleanup != nil {
 			rotatedCleanup()
 		}
@@ -1814,10 +1844,11 @@ func (h *PlaybackHandler) resolveVirtualAnchorURIWithRotationV3(
 			"new_candidate_id", virtualResultCandidateID(rotated.URI))
 		return ResolvedVirtualMedia{}, nil, err
 	}
-	slog.InfoContext(ctx, "virtual transport anchor rotated an absent session-bound candidate",
+	slog.InfoContext(ctx, "virtual transport anchor re-resolved the session-bound candidate",
 		"component", "api", "session_anchor", file.FilePath,
-		"status", "rotated", "old_candidate_id", pinnedID,
-		"new_candidate_id", virtualResultCandidateID(rotated.URI), "virtual_uri", rotated.URI)
+		"status", "recovered", "old_candidate_id", pinnedID,
+		"new_candidate_id", virtualResultCandidateID(rotated.URI), "virtual_uri", rotated.URI,
+		"release_indicted", releaseIndicted)
 	return rotated, rotatedCleanup, nil
 }
 
