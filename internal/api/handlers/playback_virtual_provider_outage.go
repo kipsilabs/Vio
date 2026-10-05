@@ -72,6 +72,43 @@ func virtualProviderListingOutage(err error) bool {
 	return strings.Contains(err.Error(), "no streams available from provider")
 }
 
+// virtualAnchorProviderOutage reports whether a failed session-bound anchor
+// resolve is a transient provider-listing outage that should surface as the
+// retryable provider_unavailable rather than a transcode_start_failed verdict.
+// It is deliberately narrower than virtualProviderListingOutage: an absent
+// session pin (ErrSessionBoundCandidateAbsent) or a candidate the catalog
+// marked failed is a verdict about the release, and the start path must still
+// walk its alternates for it. Only the causes a live provider outage produces —
+// the provider request failed/5XX, a trusted pin absent from an empty answer,
+// or an empty listing — are classified here.
+//
+// Unlike classifyVirtualProviderOutage this does not gate on the durable-
+// identity trust predicate: the remux seek anchor is the first live provider
+// listing for a plan already bound by the probe-evidence P0 fast path, so a row
+// without durable provider identity (which the evidence-gated outage retry
+// cannot cover) must still surface the retryable dependency failure.
+func virtualAnchorProviderOutage(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, virtuallibrary.ErrSessionBoundCandidateAbsent) || errors.Is(err, ErrVirtualCandidateMarkedFailed) {
+		return false
+	}
+	return virtualProviderListingOutage(err)
+}
+
+// classifyVirtualAnchorProviderOutage wraps an anchor's transient provider
+// outage so the start surfaces the retryable provider_unavailable instead of
+// transcode_start_failed. It is a no-op for a release verdict (an absent pin or
+// a marked-failed candidate) or a non-outage error, so the caller's alternate
+// walk is preserved.
+func classifyVirtualAnchorProviderOutage(err error) error {
+	if !virtualAnchorProviderOutage(err) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", errVirtualProviderUnavailable, err)
+}
+
 // virtualProviderOutageRetries returns how many bounded forced relists a
 // retryable provider-listing failure gets. A pinned id that is merely absent
 // from the listing gets exactly one: providers renumber result ids per listing,
