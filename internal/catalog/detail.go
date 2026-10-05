@@ -4114,12 +4114,20 @@ func ensureTrackLanguages(tracks []models.AudioTrack) []models.AudioTrack {
 	return tracks
 }
 
+// virtualMediaContainer is the container sentinel a provider-backed virtual
+// row carries. It mirrors models.MediaFile.ResolvedVirtualProvenance, which is
+// the canonical definition of "this row is virtual"; the value is duplicated
+// rather than exported because models is imported here, not the other way
+// round.
+const virtualMediaContainer = "virtual"
+
 // isVirtualMediaFile reports whether a media file row is a zero-storage
-// virtual candidate (provider-backed) rather than a local file. Virtual rows
-// carry a virtual:// path; local liveness (missing_since) never applies to
-// them, and their health signal is the failed_at stamp instead.
+// virtual candidate (provider-backed) rather than a local file. Mirrors the
+// canonical models check (Container == "virtual" or a virtual:// path,
+// case-insensitive): local liveness (missing_since) never applies to virtual
+// rows, and their health signal is the failed_at stamp instead.
 func isVirtualMediaFile(f *models.MediaFile) bool {
-	return f != nil && strings.HasPrefix(f.FilePath, "virtual://")
+	return f != nil && (f.Container == virtualMediaContainer || strings.HasPrefix(strings.ToLower(f.FilePath), "virtual://"))
 }
 
 // versionAvailability returns the durable per-version health signal as a
@@ -4136,6 +4144,204 @@ func versionAvailability(f *models.MediaFile) *bool {
 		return nil
 	}
 	return boolPtr(false)
+}
+
+// collapseDuplicateVirtualVersionFiles drops duplicate virtual catalog rows so
+// one release lists once. Duplicate rows for a release share a candidate URI
+// (and, for a neutral row, its provider-neutral key) and differ only by the
+// catalog row id, so projecting each row would list the same release twice and
+// let a later serve pick the wrong sibling row.
+//
+// Two rules:
+//   - A probed row collapses a later probed row that shares its provider-neutral
+//     candidate URI (every concrete `result=` pick stripped), its declared size
+//     and a non-conflicting durable provider identity. A provider re-list churns
+//     result ids for one release, so the probe stamp alone must not make a
+//     re-listed duplicate escape the collapse: without the neutral path the same
+//     release lists once per renumbering. A distinct declared size or a
+//     conflicting identity tier stays a genuine version distinction. The order
+//     within the list is preserved otherwise.
+//   - An unprobed virtual row collapses only onto a probed row for the same
+//     neutral release (same content, result= stripped) that is positively the
+//     same release: the unprobed row is a size-unknown placeholder (no stored
+//     or provider-declared size) or shares the probed row's size, and no
+//     durable provider identity tier (video hash, GUID, release name) the two
+//     both carry disagrees. A concrete unprobed alternate release — a distinct
+//     size or a distinct durable identity — is kept, so it stays selectable. A
+//     placeholder with no probed copy is kept too. Unprobed rows also collapse
+//     byte-identically among themselves.
+//
+// The concrete `result=` pick is deliberately not part of the identity test:
+// the neutral key strips it precisely because a provider re-list churns result
+// ids for one release, so a rotated sibling would otherwise never collapse. The
+// neutral path is neutralVirtualMediaPath, the same predicate the catalog's SQL
+// adoption uses, so the Go collapse and the persisted-row matching cannot
+// diverge on what counts as one neutral release.
+//
+// Local files are never collapsed: their on-disk paths are already distinct, and
+// a same-path collision is not the virtual duplicate this addresses.
+func collapseDuplicateVirtualVersionFiles(files []*models.MediaFile) []*models.MediaFile {
+	if len(files) < 2 {
+		return files
+	}
+	probedNeutral := make(map[string][]*models.MediaFile)
+	for _, f := range files {
+		if f == nil || f.ProbeUpdatedAt == nil {
+			continue
+		}
+		if key := virtualNeutralReleaseKey(f); key != "" {
+			probedNeutral[key] = append(probedNeutral[key], f)
+		}
+	}
+	out := make([]*models.MediaFile, 0, len(files))
+	keptProbedByNeutral := make(map[string][]*models.MediaFile)
+	seenExact := make(map[string]struct{})
+	for _, f := range files {
+		if f == nil {
+			continue
+		}
+		if f.ProbeUpdatedAt != nil {
+			key := virtualNeutralReleaseKey(f)
+			if key == "" {
+				out = append(out, f)
+				continue
+			}
+			if probedCollapsesAgainstProbedRelease(f, keptProbedByNeutral[key]) {
+				continue
+			}
+			keptProbedByNeutral[key] = append(keptProbedByNeutral[key], f)
+			out = append(out, f)
+			continue
+		}
+		exact := virtualExactReleaseKey(f)
+		if exact == "" {
+			out = append(out, f)
+			continue
+		}
+		if _, ok := seenExact[exact]; ok {
+			continue
+		}
+		if unprobedCollapsesAgainstProbedRelease(f, probedNeutral[virtualNeutralReleaseKey(f)]) {
+			continue
+		}
+		seenExact[exact] = struct{}{}
+		out = append(out, f)
+	}
+	return out
+}
+
+// probedCollapsesAgainstProbedRelease reports whether a probed virtual row is a
+// renumbering duplicate of an already-kept probed row: same provider-neutral
+// release, same declared size, and no conflicting durable provider identity. A
+// distinct size or a conflicting identity tier is a genuine version and keeps
+// the row.
+func probedCollapsesAgainstProbedRelease(f *models.MediaFile, kept []*models.MediaFile) bool {
+	if f == nil {
+		return false
+	}
+	size := virtualDeclaredProviderSize(f)
+	for _, k := range kept {
+		if k == nil {
+			continue
+		}
+		if size != virtualDeclaredProviderSize(k) {
+			continue
+		}
+		if virtualProviderIdentityConflicts(f, k) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// unprobedCollapsesAgainstProbedRelease reports whether an unprobed virtual
+// row is positively the same release as one of the probed rows sharing its
+// provider-neutral key. It refuses unless the two rows are a likely placeholder
+// pair (the unprobed row's stored or provider-declared size is unknown, or
+// matches) and carry no conflicting durable provider identity, so a concrete
+// alternate release is never hidden.
+func unprobedCollapsesAgainstProbedRelease(f *models.MediaFile, probed []*models.MediaFile) bool {
+	if f == nil {
+		return false
+	}
+	size := virtualDeclaredProviderSize(f)
+	for _, p := range probed {
+		if p == nil {
+			continue
+		}
+		if size > 0 && size != virtualDeclaredProviderSize(p) {
+			continue
+		}
+		if virtualProviderIdentityConflicts(f, p) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// virtualDeclaredProviderSize returns the size a virtual row advertises for its
+// release, preferring the stored stream size and falling back to the durable
+// provider-declared size tier. Zero means the provider declared no size, which
+// is what marks an unprobed row as a size-unknown placeholder; a row whose size
+// lives only in the behaviorHints/videoSize tier would otherwise look sizeless
+// and collapse across releases it does not match.
+func virtualDeclaredProviderSize(f *models.MediaFile) int64 {
+	if f == nil {
+		return 0
+	}
+	if f.FileSize > 0 {
+		return f.FileSize
+	}
+	return f.ProviderReleaseSize
+}
+
+// virtualProviderIdentityConflicts reports whether two virtual rows carry
+// mutually exclusive durable provider identity. A tier that only one row
+// populates is not a conflict: an unprobed placeholder has no identity to
+// disagree with, while two populated, different tiers are a genuine release
+// swap.
+func virtualProviderIdentityConflicts(a, b *models.MediaFile) bool {
+	if a == nil || b == nil {
+		return true
+	}
+	return providerIdentityTierConflicts(a.ProviderVideoHash, b.ProviderVideoHash) ||
+		providerIdentityTierConflicts(a.ProviderGUID, b.ProviderGUID) ||
+		providerIdentityTierConflicts(a.ProviderReleaseName, b.ProviderReleaseName) ||
+		providerIdentityTierConflicts(a.ReleaseName, b.ReleaseName)
+}
+
+// providerIdentityTierConflicts reports whether two populated identity tiers
+// name different things. An empty side is unknown, never a conflict.
+func providerIdentityTierConflicts(a, b string) bool {
+	a, b = strings.TrimSpace(a), strings.TrimSpace(b)
+	return a != "" && b != "" && a != b
+}
+
+// virtualExactReleaseKey identifies an unprobed virtual row's exact release
+// identity for duplicate collapse: content, size and the concrete candidate
+// URI. Local files return "", so they are never part of the virtual dedup.
+func virtualExactReleaseKey(f *models.MediaFile) string {
+	if f == nil || !isVirtualMediaFile(f) {
+		return ""
+	}
+	return f.ContentID + "\x00" + strconv.FormatInt(f.FileSize, 10) + "\x00" + f.FilePath
+}
+
+// virtualNeutralReleaseKey groups a virtual row by its provider-neutral release:
+// content and the candidate URI with any concrete result= pick stripped. Size is
+// deliberately excluded: an unprobed collection placeholder is stored with size
+// 0 while the probed copy of the same release carries the real size, and the
+// placeholder must still collapse against that probed copy. The neutral path is
+// neutralVirtualMediaPath, the shared predicate the catalog's SQL row adoption
+// also uses, so the Go collapse and the persisted-row matching cannot diverge.
+// Local files return "".
+func virtualNeutralReleaseKey(f *models.MediaFile) string {
+	if f == nil || !isVirtualMediaFile(f) {
+		return ""
+	}
+	return f.ContentID + "\x00" + neutralVirtualMediaPath(f.FilePath)
 }
 
 func (s *DetailService) buildPlaybackInfo(
@@ -4161,6 +4367,13 @@ func (s *DetailService) buildPlaybackInfoWith(
 	versions := make([]FileVersion, 0, len(files))
 	subtitleSet := make(map[string]SubtitleInfo)
 	var firstIntro, firstCredits, firstRecap, firstPreview *Marker
+
+	// Collapse byte-identical duplicate catalog rows before projecting versions:
+	// duplicate virtual rows for one release share candidate URIs/neutral keys
+	// and would otherwise list the same release more than once (and let a later
+	// serve pick the wrong sibling). A probed copy is preferred and an unprobed
+	// placeholder is kept only when no probed copy exists.
+	files = collapseDuplicateVirtualVersionFiles(files)
 
 	// Runtime fallbacks are request-invariant too. Every file in one call shares
 	// one item (movies, extras) and, for episode versions, one episode, so a

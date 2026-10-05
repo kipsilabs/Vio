@@ -856,7 +856,8 @@ func bindSessionVirtualSourceWithTracks(ctx context.Context, file *models.MediaF
 	// selected. Absent evidence (the flag unset) is the only case with nothing
 	// to apply, and the only case the live row may speak for.
 	hasEvidence := session.VirtualSubtitleEvidenceSet
-	if hasEvidence && !virtualEvidenceMatchesBoundFile(bound, session) {
+	evidenceRejected := hasEvidence && !virtualEvidenceMatchesBoundFile(bound, session)
+	if evidenceRejected {
 		slog.WarnContext(ctx, "virtual session track evidence belongs to a different candidate; using the bound file's tracks",
 			"component", "api",
 			"session", session.ID,
@@ -892,6 +893,23 @@ func bindSessionVirtualSourceWithTracks(ctx context.Context, file *models.MediaF
 		}
 	}
 	if candidate != nil && hasUsableSubtitleTracks(candidate) {
+		if evidenceRejected && (bound.ID <= 0 || candidate.ID != bound.ID) {
+			// The session carried evidence for a specific catalog row and the
+			// bound row is not that row: the evidence was rejected as a
+			// cross-row mismatch. The URI-only fallback must not reauthorize the
+			// rejected row (or any other row that merely shares the candidate
+			// URI) — doing so is the exact bypass this guard exists to stop.
+			// Only the bound row's own declared inventory may speak for it; an
+			// unknown bound row (id 0) cannot be confirmed and fails closed too.
+			slog.WarnContext(ctx, "virtual session fallback refused a rejected evidence row; serving the bound row's own inventory",
+				"component", "api",
+				"session", session.ID,
+				"file_id", file.ID,
+				"evidence_file_id", session.VirtualSubtitleEvidenceFileID,
+				"candidate_file_id", candidate.ID,
+				"file_path", bound.FilePath)
+			return bound
+		}
 		boundCopy := *bound
 		boundCopy.SubtitleTracks = candidate.SubtitleTracks
 		if len(boundCopy.ExternalSubtitles) == 0 {
@@ -905,19 +923,39 @@ func bindSessionVirtualSourceWithTracks(ctx context.Context, file *models.MediaF
 
 // virtualEvidenceMatchesBoundFile reports whether the session's carried virtual
 // subtitle evidence was captured for the candidate the bound file names. The
-// evidence URI is authoritative when present. Sessions created before that field
-// existed fall back to the plan-time binding: evidence captured while the file
-// path matched the session's virtual URI still belongs to the bound file.
+// evidence row id, when known, is authoritative; the candidate URI is a second
+// anchor that always applies. Sessions created before the provenance URI or row
+// id existed fall back to the plan-time binding.
+//
+// The URI alone is ambiguous: duplicate catalog rows for one release share
+// candidate URIs and neutral keys, so a serve-layer rotation can move the
+// binding to a sibling row that names the same candidate while the carried
+// inventory still describes the row the plan captured it from. The evidence
+// row id disambiguates them: evidence captured from row A must not be applied
+// to sibling row B, and an unknown bound row (id 0) carries no identity to
+// confirm. A zero evidence row id (a legacy or reconstructed session) falls
+// back to URI-only matching, preserving the historical behavior.
 func virtualEvidenceMatchesBoundFile(bound *models.MediaFile, session *playback.Session) bool {
 	if session == nil || bound == nil {
 		return false
 	}
+	// Known evidence-row identity is enforced on both URI paths: the bound row
+	// must be the exact row the evidence was captured from. An unknown bound row
+	// (id 0) cannot be confirmed and is rejected rather than trusted.
+	if evidenceID := session.VirtualSubtitleEvidenceFileID; evidenceID > 0 && bound.ID != evidenceID {
+		return false
+	}
+	// The candidate URI applies even on a matching row: a row adopted in place
+	// by a provider rotation rewrites its file path, so a URI that no longer
+	// names the evidence's candidate means the evidence is stale. Legacy
+	// sessions predate the evidence URI field; they still matched on the
+	// session's virtual source URI.
 	evidenceURI := strings.TrimSpace(session.VirtualSubtitleEvidenceURI)
 	if evidenceURI == "" {
-		// Legacy sessions predate the provenance field. The only binding the
-		// evidence had was the session's virtual URI, so it still matches when
-		// the bound file names that same candidate.
-		return session.VirtualSourceURI != "" && sameVirtualCandidate(session.VirtualSourceURI, bound.FilePath)
+		evidenceURI = strings.TrimSpace(session.VirtualSourceURI)
+	}
+	if evidenceURI == "" {
+		return false
 	}
 	return sameVirtualCandidate(evidenceURI, bound.FilePath)
 }

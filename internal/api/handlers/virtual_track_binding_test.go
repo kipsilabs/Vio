@@ -83,6 +83,48 @@ func TestBindVirtualSourceLegacyEvidenceUsesPlanBinding(t *testing.T) {
 	}
 }
 
+// A rejected evidence row must not be reauthorized by the URI-only live-row
+// fallback. When the session carries evidence for a specific catalog row that
+// is not the bound row, the fallback is allowed to consult the live candidate
+// only when it resolves the bound row itself; a sibling row that merely shares
+// the candidate URI is exactly the cross-row contamination the guard rejects.
+func TestBindVirtualSourceFallbackCannotReauthorizeRejectedRow(t *testing.T) {
+	uri := "virtual://movie/tt-fallback?result=cand-a"
+	rejectedRow := &models.MediaFile{
+		ID:       12,
+		FilePath: uri,
+		SubtitleTracks: []models.SubtitleTrack{
+			{Index: 1, Codec: "subrip", Language: "eng"},
+		},
+	}
+	// The bound row carries only provider-declared placeholders, so the
+	// historical fallback would otherwise look the live row up by URI.
+	boundFile := &models.MediaFile{ID: 99, FilePath: uri}
+	resolver := byPathPlaybackFileResolver{byPath: map[string]*models.MediaFile{uri: rejectedRow}}
+
+	session := &playback.Session{
+		ID:                            "sess-fallback",
+		VirtualSourceURI:              uri,
+		VirtualSubtitleEvidenceSet:    true,
+		VirtualSubtitleEvidenceURI:    uri,
+		VirtualSubtitleEvidenceFileID: 12, // captured from sibling row 12, not bound 99
+		VirtualSubtitleTracks:         []models.SubtitleTrack{{Index: 9, Codec: "subrip"}},
+	}
+
+	bound := bindSessionVirtualSourceWithTracks(context.Background(), boundFile, session, resolver)
+	if len(bound.SubtitleTracks) != 0 || len(bound.ExternalSubtitles) != 0 {
+		t.Fatalf("URI-only fallback reauthorized the rejected row: %+v", bound.SubtitleTracks)
+	}
+
+	// Absent evidence has no rejected row to protect, so the historical fallback
+	// to the live URI row must keep working.
+	absent := &playback.Session{ID: "sess-absent", VirtualSourceURI: uri}
+	bound = bindSessionVirtualSourceWithTracks(context.Background(), boundFile, absent, resolver)
+	if len(bound.SubtitleTracks) != 1 || bound.SubtitleTracks[0].Language != "eng" {
+		t.Fatalf("absent evidence lost the live-row fallback: %+v", bound.SubtitleTracks)
+	}
+}
+
 // Remapping must run for a same-row rotation whose inventory fingerprint moved,
 // translating a French ordinal onto the equivalent French track of the new
 // release rather than carrying the stale position.

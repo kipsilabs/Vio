@@ -19,6 +19,7 @@ import (
 
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
 	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/logredact"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
 )
@@ -956,11 +957,47 @@ func (h *PlaybackHandler) inventoryEffectiveFile(ctx context.Context, file *mode
 // the existing inventory poll then upgrades the declared list to probe
 // evidence. Best-effort: a session without a realtime connection is a no-op.
 func (h *PlaybackHandler) PublishSourceCommitted(ctx context.Context, sessionID string) {
-	if h == nil || h.RealtimeHub == nil || sessionID == "" {
+	if h == nil || sessionID == "" {
 		return
 	}
-	session, err := h.sessionMgr.GetSession(sessionID)
-	if err != nil || session == nil {
+	// Read the session and its candidate-binding generation from one lock, so
+	// the pair the rotation probe is scheduled against cannot be torn by a
+	// rotation that lands between a session read and a separate generation read.
+	// A manager without the pairing capability falls back to a plain session read
+	// plus a separate generation read (best-effort); the probe's effective-row
+	// reload closes that gap before any write.
+	session, generation, paired := h.sessionWithSourceGeneration(sessionID)
+	if !paired {
+		loaded, loadErr := h.sessionMgr.GetSession(sessionID)
+		if loadErr != nil || loaded == nil {
+			return
+		}
+		session = loaded
+		generation, _ = h.inventorySourceGeneration(sessionID)
+	}
+	if session == nil {
+		return
+	}
+	// A committed binding move is a rotation: re-probe the replacement so its
+	// verified inventory lands without waiting for a replan. The probe is
+	// scheduled before the realtime check because it is worth doing even for a
+	// session that has not (yet) opened a realtime connection. Only a session
+	// that carries a virtual binding is considered, and only a recorded rotation
+	// (revision cleared, evidence anchored at the previous candidate) triggers
+	// it, so the ordinary start commit — which just set the revision — does not
+	// double-probe a row the start path already probed.
+	//
+	// The file is loaded from the paired session's effective row after the
+	// capture; a rotation that lands in between is caught by the generation the
+	// refresh carries (and again by the probe's live-row reload), so a file that
+	// no longer names the live effective row is never probed or persisted.
+	if h.fileResolver != nil && session.VirtualSourceURI != "" {
+		if file, loadErr := h.fileResolver.GetByID(ctx, session.MediaFileID); loadErr == nil && file != nil &&
+			virtualCandidateRotationRecordedV3(session, file) {
+			h.refreshRotatedVirtualCandidateBackground(ctx, session, generation, file)
+		}
+	}
+	if h.RealtimeHub == nil {
 		return
 	}
 	// No live realtime connection: there is nothing to push and building the
@@ -1004,6 +1041,167 @@ func (h *PlaybackHandler) PublishSourceCommitted(ctx context.Context, sessionID 
 // no-op rather than an error.
 type mediaFileSessionLookup interface {
 	GetSessionsByMediaFileID(fileID int) []*playback.Session
+}
+
+// refreshRotatedVirtualCandidateBackground re-resolves and re-probes the
+// replacement candidate a serve-layer rotation just committed, so its verified
+// track evidence lands without waiting for a replan or a version-list refresh.
+// The rotation itself only moved the session binding and cleared the carried
+// evidence: until the replacement is probed, the serve path stays fail-closed
+// (evidence mismatch rejects the stale inventory) and the version list shows
+// declared metadata. This closes that window.
+//
+// session and generation are the pair PublishSourceCommitted captured (from one
+// lock when the manager exposes sessionWithSourceGeneration, otherwise from a
+// session read plus a separate generation read); file is the effective-row load
+// for that session. Before the detached goroutine is launched the pairing is
+// re-read and the scheduling is dropped unless the binding generation still
+// matches and file still names the live effective row, so a rotation that landed
+// while the file was loading does not start a probe against a stale row.
+//
+// It is best-effort and bounded by the detached-work gate. A handler without a
+// resolver or prober is a no-op; a resolve or probe failure leaves the gate
+// closed exactly as before, so this can never authorize serving stale tracks.
+func (h *PlaybackHandler) refreshRotatedVirtualCandidateBackground(ctx context.Context, session *playback.Session, generation uint64, file *models.MediaFile) {
+	if h == nil || session == nil || file == nil || !isVirtualPlaybackFile(file) || session.VirtualSourceURI == "" {
+		return
+	}
+	// Re-read the (session, generation) pair and refuse to schedule if the
+	// binding moved since the caller captured it, or if the caller's file no
+	// longer names the live effective row. This is the gap between the caller's
+	// file load and the goroutine launch. A manager without the paired reader
+	// falls back to a plain session read plus a separate generation read; a
+	// manager without any generation capability keeps generation 0 and relies on
+	// the effective-row comparison alone (best-effort, as before).
+	liveSession, liveGen, haveLive := h.sessionWithSourceGeneration(session.ID)
+	if !haveLive {
+		if loaded, loadErr := h.sessionMgr.GetSession(session.ID); loadErr == nil && loaded != nil {
+			liveSession = loaded
+			liveGen, _ = h.inventorySourceGeneration(session.ID)
+			haveLive = true
+		}
+	}
+	if haveLive {
+		if liveGen != generation || liveSession.MediaFileID != file.ID {
+			slog.InfoContext(ctx, "rotated virtual candidate probe dropped: binding moved before scheduling",
+				"component", "api", "session", session.ID,
+				"file_id", file.ID, "live_file_id", liveSession.MediaFileID)
+			return
+		}
+	}
+	if h.VirtualMediaDetailedResolver == nil && h.VirtualMediaResolver == nil {
+		return
+	}
+	// The probe reads through the loopback relay, exactly as the start-path and
+	// fallback probes do; without a relay the resolved URL is the raw provider
+	// URL and the prober is not wired to read it.
+	if h.RemoteStreamRelay == nil {
+		return
+	}
+	gate := h.detachedGate()
+	if !gate.tryAcquire() {
+		slog.WarnContext(ctx, "rotated virtual candidate probe skipped: detached worker budget exhausted",
+			"component", "api", "session", session.ID, "file_id", file.ID, "virtual_uri", session.VirtualSourceURI)
+		return
+	}
+	go func() {
+		defer gate.release()
+		bgCtx, cancel := h.virtualDetachedContext(ctx, virtualBackgroundProbeBudget)
+		defer cancel()
+		h.probeRotatedVirtualCandidate(bgCtx, session, file, generation)
+	}()
+}
+
+// probeRotatedVirtualCandidate resolves the rotated candidate's provider URL and
+// probes it, then persists the evidence for the row that owns the candidate. It
+// is the synchronous core of refreshRotatedVirtualCandidateBackground, split out
+// so a test can drive rotation recovery without a goroutine.
+func (h *PlaybackHandler) probeRotatedVirtualCandidate(ctx context.Context, session *playback.Session, file *models.MediaFile, generation uint64) bool {
+	if h == nil || session == nil || file == nil || session.VirtualSourceURI == "" {
+		return false
+	}
+	// The binding may have moved again since the snapshot: re-read it and refuse
+	// when the rotation this probe was scheduled for is no longer current. The
+	// probe belongs to the candidate the session now names.
+	live, err := h.sessionMgr.GetSession(session.ID)
+	if err != nil || live == nil {
+		return false
+	}
+	// generationFence reports whether the binding this work was scheduled for is
+	// still current. It is re-checked after every blocking stage so a rotation
+	// that lands while the resolve or the probe runs cannot let the stale work
+	// authorize a selection, persist evidence, or release the pin.
+	generationFence := func() bool {
+		if generation == 0 {
+			return true
+		}
+		current, ok := h.inventorySourceGeneration(session.ID)
+		return ok && current == generation
+	}
+	if !generationFence() {
+		return false
+	}
+	// The caller's file was loaded from the scheduling session's effective row.
+	// If the live effective row has since moved (a rotation landed between the
+	// caller's capture and this read), the carried file names a superseded row:
+	// drop rather than probe or persist the wrong row. Re-derive the file from
+	// the live effective row so the transient clone, neutral key, and persist
+	// call all reference the row the session actually serves; fail closed if it
+	// cannot be loaded or does not match.
+	liveFile := file
+	if h.fileResolver != nil && live.MediaFileID > 0 {
+		if loaded, loadErr := h.fileResolver.GetByID(ctx, live.MediaFileID); loadErr == nil && loaded != nil {
+			liveFile = loaded
+		}
+	}
+	if liveFile == nil || liveFile.ID <= 0 || liveFile.ID != live.MediaFileID || liveFile.ID != file.ID {
+		slog.InfoContext(ctx, "rotated virtual candidate probe dropped: effective row moved",
+			"component", "api", "session", live.ID,
+			"file_id", file.ID, "live_file_id", live.MediaFileID)
+		return false
+	}
+	if !isVirtualPlaybackFile(liveFile) {
+		return false
+	}
+	resolved, cleanup, resolveErr := h.resolveVirtualInputURI(
+		withVirtualSessionBindingV3(ctx, true), live.VirtualSourceURI, live.VirtualSourceOwnerInstallationID,
+		live.UserID, live.ProfileID, false, nil, "",
+	)
+	if cleanup != nil {
+		defer cleanup()
+	}
+	// The resolve (a provider round-trip) is the other blocking stage: a
+	// rotation that landed while it ran means this resolved URL names a
+	// superseded candidate. Drop it rather than probe or persist it.
+	if !generationFence() {
+		slog.InfoContext(ctx, "rotated virtual candidate re-resolve dropped: binding moved during resolution",
+			"component", "api", "session", live.ID, "virtual_uri", live.VirtualSourceURI)
+		return false
+	}
+	if resolveErr != nil {
+		slog.WarnContext(ctx, "rotated virtual candidate re-resolve failed",
+			"component", "api", "session", live.ID, "virtual_uri", live.VirtualSourceURI,
+			"error", logredact.SanitizeURLError(resolveErr))
+		return false
+	}
+	probeCand := VirtualPlaybackStream{
+		URI:            resolved.URI,
+		CodecAudio:     resolved.CodecAudio,
+		AudioLanguages: resolved.AudioLanguages,
+		RequestHeaders: resolved.RequestHeaders,
+	}
+	probeTransient := cloneVirtualProbeTransient(*liveFile)
+	if resolved.URI != "" {
+		probeTransient.FilePath = resolved.URI
+	}
+	h.probeVirtualSourceAndPersist(
+		ctx,
+		bestResultCacheKey(liveFile.ContentID, virtualPlaybackNeutralKey(live.VirtualSourceURI), live.VirtualSourceOwnerInstallationID),
+		liveFile, resolved.URL, probeTransient, probeCand,
+		h.virtualExpectedRuntimeMinutes(ctx, liveFile), live.VirtualSourceOwnerInstallationID,
+		generationFence,
+	)
+	return true
 }
 
 // inventoryUpdatedPublishBudget bounds one inventory_updated fan-out so the
@@ -1055,7 +1253,7 @@ func (h *PlaybackHandler) PublishInventoryUpdated(ctx context.Context, fileID in
 		if session == nil || session.ID == "" || !session.HasRealtimeConnection {
 			continue
 		}
-		revision, delivered := h.publishInventoryUpdatedToSession(publishCtx, session, "", nil)
+		revision, delivered := h.publishInventoryUpdatedToSession(publishCtx, session, 0, "", nil)
 		if delivered {
 			summary.SessionsNotified++
 			summary.Revision = revision
@@ -1070,8 +1268,9 @@ func (h *PlaybackHandler) PublishInventoryUpdated(ctx context.Context, fileID in
 // stale while it does: the probed tracks are the verified inventory of the
 // release the client is watching, so they are pushed in memory to every live
 // session bound to fileID. Only sessions whose bound virtual source names
-// candidateURI receive the override; a mismatch falls back to the committed
-// catalog inventory.
+// candidateURI, from the same catalog row fileID, receive the override; a
+// mismatch (a sibling row that shares the candidate URI) falls back to the
+// committed catalog inventory, so one row's probed tracks never paint another.
 //
 // It returns how many sessions received the overridden inventory and logs the
 // delivery, so the next live run can confirm the fallback reached the menu.
@@ -1093,7 +1292,7 @@ func (h *PlaybackHandler) publishRefusedProbeInventory(ctx context.Context, file
 		if session == nil || session.ID == "" || !session.HasRealtimeConnection {
 			continue
 		}
-		if _, delivered := h.publishInventoryUpdatedToSession(publishCtx, session, candidateURI, probed); delivered {
+		if _, delivered := h.publishInventoryUpdatedToSession(publishCtx, session, fileID, candidateURI, probed); delivered {
 			notified++
 		}
 	}
@@ -1113,8 +1312,27 @@ func (h *PlaybackHandler) publishRefusedProbeInventory(ctx context.Context, file
 // caller keeps the committed catalog inventory. The returned file keeps the
 // row's id (the catalog is not written), takes the probed tracks, and is stamped
 // so the built inventory reports verified evidence and a fresh revision.
-func (h *PlaybackHandler) refusedProbeInventoryFile(ctx context.Context, session *playback.Session, candidateURI string, probed *models.MediaFile) *models.MediaFile {
+//
+// probedFileID is the catalog row the probe was captured for. Duplicate rows for
+// one release share candidate URIs, so the URI match alone would paint the
+// probed tracks onto a sibling row playing the same candidate; the effective row
+// must be the same row the evidence came from. A session with no known effective
+// row cannot be confirmed as that row and fails closed, mirroring the serve-path
+// guard in stream.go (virtualEvidenceMatchesBoundFile). A non-positive
+// probedFileID (a caller without that identity) keeps the historical URI-only
+// behavior for sessions that do carry an effective row.
+func (h *PlaybackHandler) refusedProbeInventoryFile(ctx context.Context, session *playback.Session, probedFileID int, candidateURI string, probed *models.MediaFile) *models.MediaFile {
 	if session == nil || probed == nil || strings.TrimSpace(candidateURI) == "" {
+		return nil
+	}
+	// An unknown bound row (id 0) carries no identity to confirm against the
+	// evidence; it must not receive the override. This is the same fail-closed
+	// rule the serving path applies when the evidence row is known but the
+	// bound row is not.
+	if session.MediaFileID <= 0 {
+		return nil
+	}
+	if probedFileID > 0 && session.MediaFileID != probedFileID {
 		return nil
 	}
 	if !sameVirtualCandidate(session.VirtualSourceURI, candidateURI) {
@@ -1185,13 +1403,14 @@ func (h *PlaybackHandler) sessionWithSourceGeneration(sessionID string) (*playba
 //
 // probed, when non-nil, is probe evidence that could not be written to the
 // catalog (the identity guard refused the write). It is applied only to a
-// session whose bound virtual source names candidateURI, so a refused probe can
-// still reach the live menu of the exact release it probed without being shown
-// to a session playing anything else.
+// session whose bound virtual source names candidateURI AND whose effective row
+// is probedFileID, so a refused probe can still reach the live menu of the exact
+// release — and only that row — it probed without being shown to a session
+// playing a different row or a sibling that shares the candidate URI.
 //
 // It returns the delivered revision and whether an event was actually sent, so
 // the caller can log delivery without re-deriving it.
-func (h *PlaybackHandler) publishInventoryUpdatedToSession(ctx context.Context, session *playback.Session, candidateURI string, probed *models.MediaFile) (string, bool) {
+func (h *PlaybackHandler) publishInventoryUpdatedToSession(ctx context.Context, session *playback.Session, probedFileID int, candidateURI string, probed *models.MediaFile) (string, bool) {
 	// Two background probes (a start-path repair and a virtual-evidence worker)
 	// can publish for the same session concurrently. Serialize the build and
 	// the send under the session's per-session lock so an older build cannot be
@@ -1228,7 +1447,7 @@ func (h *PlaybackHandler) publishInventoryUpdatedToSession(ctx context.Context, 
 		}
 	}
 	var inventory playback.PlaybackInventoryV3
-	if override := h.refusedProbeInventoryFile(ctx, live, candidateURI, probed); override != nil {
+	if override := h.refusedProbeInventoryFile(ctx, live, probedFileID, candidateURI, probed); override != nil {
 		// Refused (unwritten) evidence for the exact release this session is
 		// bound to: serve the probed tracks in memory. The catalog row is
 		// untouched, so the effective identity stays the row's own id and the

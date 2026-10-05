@@ -81,7 +81,16 @@ type Session struct {
 	// may only be applied to a file bound to the same candidate, and a
 	// rotation must move or clear it together with the evidence.
 	VirtualSubtitleEvidenceURI string
-	VirtualSubtitleEvidenceSet bool
+	// VirtualSubtitleEvidenceFileID is the media_files row id the evidence was
+	// captured from. Duplicate catalog rows for one release share candidate
+	// URIs and neutral keys, so the URI alone cannot tell the rows apart; a
+	// session that planned against row A must not apply A's inventory to the
+	// sibling row B that happens to name the same candidate. It is deliberately
+	// left at the old row when the binding moves (see SetVirtualSource), which
+	// is what makes the cross-row mismatch detectable. Zero means unknown
+	// (a legacy or reconstructed session) and falls back to the URI anchor.
+	VirtualSubtitleEvidenceFileID int
+	VirtualSubtitleEvidenceSet    bool
 
 	// RequireMediaAuthorization distinguishes v3 transports whose session ID is
 	// only a route (media requests must present an authenticated user) from
@@ -232,7 +241,13 @@ type SessionStreamState struct {
 	// carried evidence belongs to. It is the provenance anchor for the serve
 	// path: evidence may only be applied to a file bound to the same candidate.
 	VirtualSubtitleEvidenceURI string
-	VirtualSubtitleEvidenceSet bool
+	// VirtualSubtitleEvidenceFileID is the row id the evidence was captured
+	// from. Duplicate rows for one release share candidate URIs, so the URI
+	// alone cannot tell them apart; a session planned against row A must not
+	// apply A's inventory to sibling row B. Zero means unknown (legacy or
+	// reconstructed) and falls back to the URI anchor.
+	VirtualSubtitleEvidenceFileID int
+	VirtualSubtitleEvidenceSet    bool
 
 	// Byte-affecting transcode recipe fields preserved so an offloaded restart
 	// (e.g. audio switch) can rebuild the exact same stream. SubtitleTrackIndex
@@ -1278,6 +1293,7 @@ func applySessionStreamStateLocked(s *Session, state SessionStreamState) {
 			s.VirtualExternalSubtitles = state.VirtualExternalSubtitles
 			s.VirtualAudioTracks = state.VirtualAudioTracks
 			s.VirtualSubtitleEvidenceURI = state.VirtualSubtitleEvidenceURI
+			s.VirtualSubtitleEvidenceFileID = state.VirtualSubtitleEvidenceFileID
 			s.VirtualSourceRevision = state.VirtualSourceRevision
 			s.VirtualSubtitleEvidenceSet = true
 		} else if state.VirtualSourceOwnershipSet {
@@ -1291,6 +1307,7 @@ func applySessionStreamStateLocked(s *Session, state SessionStreamState) {
 			s.VirtualExternalSubtitles = nil
 			s.VirtualAudioTracks = nil
 			s.VirtualSubtitleEvidenceURI = ""
+			s.VirtualSubtitleEvidenceFileID = 0
 			s.VirtualSourceRevision = ""
 			s.VirtualSubtitleEvidenceSet = false
 		}
@@ -1353,6 +1370,7 @@ func snapshotSessionStreamStateLocked(s *Session) SessionStreamState {
 		VirtualExternalSubtitles:         s.VirtualExternalSubtitles,
 		VirtualAudioTracks:               s.VirtualAudioTracks,
 		VirtualSubtitleEvidenceURI:       s.VirtualSubtitleEvidenceURI,
+		VirtualSubtitleEvidenceFileID:    s.VirtualSubtitleEvidenceFileID,
 		VirtualSubtitleEvidenceSet:       s.VirtualSubtitleEvidenceSet,
 		SubtitleTrackIndex:               s.SubtitleTrackIndex,
 		SubtitleBurnIn:                   s.SubtitleBurnIn,
@@ -1407,12 +1425,14 @@ func restoreSessionStreamStateLocked(s *Session, state SessionStreamState) {
 		s.VirtualExternalSubtitles = state.VirtualExternalSubtitles
 		s.VirtualAudioTracks = state.VirtualAudioTracks
 		s.VirtualSubtitleEvidenceURI = state.VirtualSubtitleEvidenceURI
+		s.VirtualSubtitleEvidenceFileID = state.VirtualSubtitleEvidenceFileID
 		s.VirtualSubtitleEvidenceSet = true
 	} else {
 		s.VirtualSubtitleTracks = nil
 		s.VirtualExternalSubtitles = nil
 		s.VirtualAudioTracks = nil
 		s.VirtualSubtitleEvidenceURI = ""
+		s.VirtualSubtitleEvidenceFileID = 0
 		s.VirtualSubtitleEvidenceSet = false
 	}
 	s.SubtitleTrackIndex = state.SubtitleTrackIndex

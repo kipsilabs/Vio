@@ -3024,6 +3024,13 @@ func (h *PlaybackHandler) virtualExpectedRuntimeMinutes(ctx context.Context, fil
 // revalidation. bgCtx bounds the whole probe; the runtime-plausibility guard
 // and the probe-failure damper are applied here so both callers behave
 // identically.
+//
+// fence, when supplied, is re-checked after the blocking probe returns and
+// before any failure verdict, unpin, or catalog write. A caller whose work was
+// scheduled against a binding that another rotation superseded passes a fence
+// that reports false once the binding moves, so the stale probe neither indicts
+// the pin, releases it, nor persists evidence for a candidate the session no
+// longer serves. The newer rotation's own refresh re-probes the live candidate.
 func (h *PlaybackHandler) probeVirtualSourceAndPersist(
 	bgCtx context.Context,
 	stickyKey string,
@@ -3033,11 +3040,21 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersist(
 	probeCand VirtualPlaybackStream,
 	expectedRuntimeMinutes int,
 	ownerInstallationID int,
+	fence ...func() bool,
 ) {
 	probeKey := virtualProbeFailureKey(probeCand.URI, ownerInstallationID)
 	probeCtx, probeCancel := context.WithTimeout(bgCtx, virtualBackgroundProbeBudget)
 	probed, probeErr := h.probeVirtualSource(probeCtx, probeURL, &probeTransient, probeCand.RequestHeaders)
 	probeCancel()
+	// The probe (the last blocking call) can outlive the binding it was
+	// scheduled for. Re-check the fence before this probe touches shared state:
+	// a superseded verdict must not mark the damper, unpin the current
+	// candidate, or persist evidence onto a row the session no longer serves.
+	if len(fence) > 0 && fence[0] != nil && !fence[0]() {
+		slog.InfoContext(bgCtx, "virtual probe evidence dropped: candidate binding moved during the probe",
+			"component", "api", "candidate_uri", probeCand.URI, "file_id", catalogFile.ID)
+		return
+	}
 	if probeErr != nil || probed == nil {
 		virtualProbeFailures.mark(probeKey)
 		slog.WarnContext(bgCtx, "background virtual stream probe failed", "component", "api", "candidate_uri", probeCand.URI, "error", probeErr)
@@ -3899,12 +3916,28 @@ func (h *PlaybackHandler) virtualProbeEvidenceRotateTarget(ctx context.Context, 
 		return nil, nil, false
 	}
 	if ownerRow != nil && ownerRow.ID != catalogFile.ID {
-		// The candidate's path is an existing alternate version. Rotate the
-		// binding to its owner row: keep the owner's catalog identity and CAS
-		// snapshot (the current generation) and overlay the freshly probed
-		// tracks so the verified inventory is not lost. The write is then a
-		// same-release metadata update on a row that already owns the path, so
-		// the SQL adoption fence is not involved.
+		if virtualSiblingOwnerSharesRelease(catalogFile, ownerRow) {
+			// Duplicate catalog rows for one release share candidate URIs and
+			// neutral keys. Rotating here would overlay the requested row's
+			// probed inventory onto its duplicate sibling (and, on the reverse
+			// probe, the sibling's onto the requested row): exactly the silent
+			// cross-row contamination this guard exists to stop. Refuse the
+			// write outright — a metadata write on the requested row would be
+			// refused by the SQL sibling fence anyway — and serve the probed
+			// tracks in memory only to sessions bound to the requested row id,
+			// so the playing menu stays live while no sibling row is repainted.
+			slog.WarnContext(ctx, "virtual probe evidence rotation refused: sibling owner row is a duplicate of the same release",
+				"component", "api", "requested_file_id", catalogFile.ID, "owner_file_id", ownerRow.ID,
+				"candidate_uri", resolvedPath, "reason", "sibling_owner_same_release")
+			h.publishRefusedProbeInventory(ctx, catalogFile.ID, resolvedPath, probed)
+			return nil, nil, false
+		}
+		// The candidate's path is an existing alternate version of a genuinely
+		// different release. Rotate the binding to its owner row: keep the
+		// owner's catalog identity and CAS snapshot (the current generation) and
+		// overlay the freshly probed tracks so the verified inventory is not
+		// lost. The write is then a same-release metadata update on a row that
+		// already owns the path, so the SQL adoption fence is not involved.
 		rotated := rotateVirtualSourceToOwnerRow(probed, ownerRow, resolvedPath)
 		slog.InfoContext(ctx, "virtual probe evidence rotated to the candidate's owner row",
 			"component", "api", "requested_file_id", catalogFile.ID, "owner_file_id", ownerRow.ID,
@@ -3912,6 +3945,36 @@ func (h *PlaybackHandler) virtualProbeEvidenceRotateTarget(ctx context.Context, 
 		return rotated, rotated, true
 	}
 	return catalogFile, probed, true
+}
+
+// virtualSiblingOwnerSharesRelease reports whether a sibling owner row
+// verifiably carries the same release as the requested row, judged by the
+// durable provider identity compared tier-by-tier (video hash, then source
+// GUID, then normalized release name plus a plausibly-equal size). Two rows are
+// the same release only when a non-empty tier they both carry agrees; an
+// identity-less row is not proof.
+//
+// It exists to keep the owner-row rotation from silently repainting a duplicate
+// row of the same release with the requested row's inventory. Distinct rows of
+// one release share candidate URIs, so the candidate URI alone cannot tell them
+// apart; only the durable identity can. A genuinely different release (distinct
+// hash/GUID/name+size) does not compare equal and still rotates, which is the
+// alternate-version behavior the fallback relies on.
+//
+// The comparison is symmetric across compatible tiers rather than a single
+// strongest-tier key: a name-only row keys as name+size while a GUID/hash row
+// keys in that stronger tier, so a strongest-tier equality would read two rows
+// of one release as distinct and rotate onto the duplicate. Failing to prove
+// the tiers compatible is a refusal (the caller treats false as "not the same
+// release"), so an ambiguous pair fails closed instead of repainting a sibling.
+func virtualSiblingOwnerSharesRelease(a, b *models.MediaFile) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	identityA := resolver.NewPersistedIdentityTiers(a.ProviderVideoHash, a.ProviderGUID, a.ProviderReleaseName, a.ProviderReleaseSize)
+	identityB := resolver.NewPersistedIdentityTiers(b.ProviderVideoHash, b.ProviderGUID, b.ProviderReleaseName, b.ProviderReleaseSize)
+	_, shared := resolver.PersistedIdentitiesMatch(identityA, identityB)
+	return shared
 }
 
 // virtualProbeEvidenceArgsForRow builds the catalog write for one probe result

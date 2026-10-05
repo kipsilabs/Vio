@@ -510,7 +510,7 @@ func TestPublishInventoryUpdatedReReadsLiveSourceBinding(t *testing.T) {
 	// The snapshot the caller enumerated still names release A.
 	stale := *session
 	stale.VirtualSourceURI = releaseA
-	h.publishInventoryUpdatedToSession(context.Background(), &stale, "", nil)
+	h.publishInventoryUpdatedToSession(context.Background(), &stale, 0, "", nil)
 
 	if len(conn.messages) != 1 {
 		t.Fatalf("delivered %d events, want 1", len(conn.messages))
@@ -616,7 +616,7 @@ func TestPublishInventoryUpdatedKeepsFreshBuildWhenReadGenerationLags(t *testing
 	stale := *session
 	stale.VirtualSourceURI = "virtual://movie/inventory-fence?result=A"
 
-	h.publishInventoryUpdatedToSession(context.Background(), &stale, "", nil)
+	h.publishInventoryUpdatedToSession(context.Background(), &stale, 0, "", nil)
 
 	if len(conn.messages) != 1 {
 		t.Fatalf("delivered %d events, want 1: a payload built from the live binding must not be dropped by a lagging generation read", len(conn.messages))

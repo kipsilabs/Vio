@@ -5863,6 +5863,11 @@ func (h *PlaybackHandler) v3SessionStreamState(ctx context.Context, session *pla
 		state.VirtualExternalSubtitles = file.ExternalSubtitles
 		state.VirtualAudioTracks = file.AudioTracks
 		state.VirtualSubtitleEvidenceURI = file.FilePath
+		// The evidence row id is as important as the URI: duplicate catalog
+		// rows for one release share candidate URIs and neutral keys, so a
+		// later serve must apply this inventory only to the exact row it was
+		// captured from, never to a sibling row the probe rotated onto.
+		state.VirtualSubtitleEvidenceFileID = file.ID
 		state.VirtualSubtitleEvidenceSet = file.ProbeUpdatedAt != nil
 	}
 	return state
