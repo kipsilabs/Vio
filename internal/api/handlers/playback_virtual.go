@@ -617,6 +617,25 @@ func (g *virtualDetachedGate) tryAcquire() bool {
 	}
 }
 
+// acquire takes a slot, blocking until one is free or ctx ends. It is only for
+// dedicated background workers that are allowed to wait off the request path
+// (the post-commit probe pool): the request path must keep using tryAcquire so
+// it never stalls. A nil gate admits immediately.
+func (g *virtualDetachedGate) acquire(ctx context.Context) bool {
+	if g == nil {
+		return true
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case g.slots <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
 // release returns a slot. It never blocks: a release without a matching acquire
 // is a bug, and blocking on it would make things worse.
 func (g *virtualDetachedGate) release() {
@@ -2159,14 +2178,17 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			"component", "api", "content_id", file.ContentID, "file_id", file.ID)
 	}
 	// Pin-liveness pre-probe: a fresh listing observation for this content lets
-	// a row that already names a concrete candidate skip the full provider
-	// listing. It only removes a listing that a live observation already
-	// justified — a row without a persisted candidate still needs the list, and
-	// a forced relist, an exclusion, or an unusable/failed row still lists so
+	// a row that already names a concrete candidate and whose candidate metadata
+	// is already complete skip the full provider listing. It only removes a
+	// listing that a live observation already justified — a row without a
+	// persisted candidate still needs the list, a row still missing candidate
+	// metadata still needs the list (the listing is the only declaration of the
+	// codec/language labels the committed recipe must not synthesize), and a
+	// forced relist, an exclusion, or an unusable/failed row still lists so
 	// recovery is never blocked. A miss falls through to the normal path.
 	preprobeHit := h.virtualPreprobeHit(
 		&fileIdentityV3{contentID: file.ContentID, ownerID: file.VirtualOwnerInstallationID},
-		persistedResultURI, requestedRowUnusable, exclusionPending, forceRelist, time.Now(),
+		persistedResultURI, requestedRowUnusable, exclusionPending, forceRelist, needsCandidateMetadata, time.Now(),
 	)
 	if (shouldListVirtualPlaybackCandidates(noResult, needsCandidateMetadata && !cachedListing, forceRelist) ||
 		((exclusionPending || requestedRowUnusable) && !cachedListing)) && persistedResumeURI == "" && !emptySuppressed && !preprobeHit && h.VirtualPlaybackStreamLister != nil {
@@ -3187,7 +3209,7 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersist(
 	expectedRuntimeMinutes int,
 	ownerInstallationID int,
 	fence ...func() bool,
-) {
+) string {
 	probeKey := virtualProbeFailureKey(probeCand.URI, ownerInstallationID)
 	probeCtx, probeCancel := context.WithTimeout(bgCtx, virtualBackgroundProbeBudget)
 	probed, probeErr := h.probeVirtualSource(probeCtx, probeURL, &probeTransient, probeCand.RequestHeaders)
@@ -3199,7 +3221,7 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersist(
 	if len(fence) > 0 && fence[0] != nil && !fence[0]() {
 		slog.InfoContext(bgCtx, "virtual probe evidence dropped: candidate binding moved during the probe",
 			"component", "api", "candidate_uri", probeCand.URI, "file_id", catalogFile.ID)
-		return
+		return ""
 	}
 	if probeErr != nil || probed == nil {
 		virtualProbeFailures.mark(probeKey)
@@ -3213,7 +3235,7 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersist(
 			virtualProbeFailures.count(probeKey) >= virtualProbeFailureRepeatThreshold {
 			h.unpinVirtualSticky(stickyKey, probeCand.URI)
 		}
-		return
+		return probeOutcomeFailed
 	}
 	if !virtualRuntimePlausible(probed.Duration, expectedRuntimeMinutes) {
 		virtualProbeFailures.mark(probeKey)
@@ -3221,7 +3243,7 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersist(
 			"component", "api", "candidate_uri", probeCand.URI, "file_id", catalogFile.ID,
 			"probed_duration_seconds", probed.Duration, "expected_runtime_minutes", expectedRuntimeMinutes)
 		h.unpinVirtualSticky(stickyKey, probeCand.URI)
-		return
+		return probeOutcomeFailed
 	}
 	virtualProbeFailures.clear(probeKey)
 	if probeTransient.ID > 0 {
@@ -3233,6 +3255,7 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersist(
 	}
 	mergeVirtualCandidateTracks(probed, probeCand)
 	h.persistVirtualProbeEvidence(bgCtx, catalogFile, probeCand.URI, probed, true, false)
+	return probeOutcomeVerified
 }
 
 // virtualProbeFromCache returns a probe already completed for this candidate's

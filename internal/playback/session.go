@@ -76,6 +76,14 @@ type Session struct {
 	// binding; it is the rotation signal a track fingerprint cannot always
 	// provide.
 	VirtualSourceRevision string
+	// VirtualProbeOutcome is the disposition of the most recent background probe
+	// for this session's bound virtual candidate. It is set to pending when the
+	// full track enumeration is deferred past the first-byte commit, then to
+	// verified or failed by the probe worker. Empty means no deferred probe is
+	// outstanding: the inventory the plan published is already final. It exists
+	// so an inventory reader can distinguish an unfinished probe from one that
+	// terminally failed and let the client leave its loading state either way.
+	VirtualProbeOutcome string
 	// VirtualSubtitleEvidenceURI names the provider-neutral candidate the
 	// evidence above was captured for. It is the provenance anchor: evidence
 	// may only be applied to a file bound to the same candidate, and a
@@ -1288,6 +1296,12 @@ func applySessionStreamStateLocked(s *Session, state SessionStreamState) {
 		}
 		s.VirtualSourceURI = state.VirtualSourceURI
 		s.VirtualSourceOwnerInstallationID = state.VirtualSourceOwnerInstallationID
+		// A committed plan owns the probe lifecycle: whatever outcome a
+		// superseded plan's deferred probe reached does not describe this
+		// binding. A fresh-start resolve re-arms it to pending at spawn time.
+		if state.VirtualSourceOwnershipSet {
+			s.VirtualProbeOutcome = ""
+		}
 		if state.VirtualSubtitleEvidenceSet {
 			s.VirtualSubtitleTracks = state.VirtualSubtitleTracks
 			s.VirtualExternalSubtitles = state.VirtualExternalSubtitles
@@ -1477,11 +1491,34 @@ func (m *SessionManager) setVirtualSourceLocked(s *Session, virtualURI string, o
 		// what makes the mismatch detectable downstream.
 		s.VirtualSourceRevision = ""
 	}
+	// A binding move starts a fresh probe lifecycle: whatever outcome the
+	// previous candidate's deferred probe reached says nothing about this one.
+	s.VirtualProbeOutcome = ""
 	s.VirtualSourceURI = trimmed
 	s.VirtualSourceOwnerInstallationID = ownerInstallationID
 	s.streamRevision++
 	s.virtualSourceGeneration++
 	m.touchSessionLocked(s)
+}
+
+// SetVirtualProbeOutcome records the disposition of the deferred background
+// probe for the session's bound virtual candidate: "pending" while the full
+// track enumeration is outstanding, then "verified" or "failed" when it lands.
+// It is deliberately a dedicated setter rather than part of the stream-state
+// snapshot: the outcome is written by the detached probe worker, which must not
+// race a plan replacement's wholesale stream-state apply, and an empty value
+// means "no deferred probe outstanding". An unknown session is a no-op so a
+// probe that completes after its session ended does not error.
+func (m *SessionManager) SetVirtualProbeOutcome(sessionID, outcome string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		return ErrSessionNotFound
+	}
+	s.VirtualProbeOutcome = outcome
+	return nil
 }
 
 // VirtualSourceBindingSnapshot captures the full candidate-binding state under the session lock.

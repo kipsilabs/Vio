@@ -2,12 +2,14 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"strconv"
 	"sync"
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/playback"
 )
 
 // The preprobe pin-liveness cache is a lightweight, content-keyed memo that a
@@ -157,13 +159,26 @@ func (h *PlaybackHandler) recordVirtualPreprobeLiveness(file *fileIdentityV3, no
 }
 
 // virtualPreprobeHit reports whether a fresh listing observation lets this
-// resolve skip the provider list. It requires the row to already name a
-// concrete candidate (persistedResultURI): a neutral row has no candidate to
-// bind without a list, so liveness alone cannot serve it. A forced relist, an
-// exclusion, or an unusable/failed row all bypass the memo so recovery is never
-// blocked.
-func (h *PlaybackHandler) virtualPreprobeHit(file *fileIdentityV3, persistedResultURI, requestedRowUnusable bool, exclusionPending, forceRelist bool, now time.Time) bool {
-	if h == nil || file == nil || !persistedResultURI || forceRelist || exclusionPending || requestedRowUnusable {
+// resolve skip the provider list. A hit requires all of:
+//
+//   - a concrete candidate on the row (persistedResultURI): a neutral row has
+//     no candidate to bind without a list, so liveness alone cannot serve it;
+//   - complete candidate metadata (needsCandidateMetadata false): the listing
+//     is the only source of a candidate's declared audio/subtitle labels, so
+//     skipping it while metadata is missing makes mergeVirtualCandidateTracks
+//     synthesize a codec (e.g. aac) that the provider never declared and that
+//     the later inventory push cannot repair — the plan already committed the
+//     synthesized recipe. A liveness hit may therefore only ever remove a
+//     listing that the row's own evidence already made redundant;
+//   - no forced relist, exclusion, or unusable/failed row, so recovery is never
+//     blocked.
+//
+// The metadata guard means a hit can only suppress a listing that
+// shouldListVirtualPlaybackCandidates would otherwise run; when the row already
+// has complete evidence that gate is already closed, so the memo never removes
+// the provider declaration a route needs.
+func (h *PlaybackHandler) virtualPreprobeHit(file *fileIdentityV3, persistedResultURI, requestedRowUnusable bool, exclusionPending, forceRelist, needsCandidateMetadata bool, now time.Time) bool {
+	if h == nil || file == nil || !persistedResultURI || needsCandidateMetadata || forceRelist || exclusionPending || requestedRowUnusable {
 		return false
 	}
 	return h.preprobeCache().hit(virtualPreprobeKey(file.contentID, file.ownerID), now)
@@ -191,29 +206,274 @@ type virtualDeferredProbeV3 struct {
 	cand                   VirtualPlaybackStream
 	expectedRuntimeMinutes int
 	ownerID                int
+	// sessionID is the live session the deferred plan was committed to. It is
+	// set by the start path after the transport commits (the resolve runs
+	// before the session exists) and carries the probe's terminal outcome back
+	// to the session so the inventory reader can leave the loading state.
+	sessionID string
 }
 
-// spawnDeferredVirtualProbeV3 runs a probe deferred past the transport commit.
-// It uses the same detached gate and bounded context the inline start-path probe
-// used, so scheduling it later changes only when the ffprobe runs, never the
-// concurrency budget or the persistence guarantees. When the gate is exhausted
-// it falls back to the bounded foreground probe so the served row is not left
-// unprobed on every later play.
-func (h *PlaybackHandler) spawnDeferredVirtualProbeV3(ctx context.Context, deferred *virtualDeferredProbeV3) {
+const (
+	// virtualDeferredProbeWorkers bounds the dedicated post-commit probe pool.
+	// The pool is separate from the aggregate detached gate: a worker may park
+	// waiting for a gate slot, and parking must not consume a request-path
+	// worker or a gate slot. Small enough that a fleet of cold starts cannot
+	// stampede a provider, large enough that a burst of replays drains.
+	virtualDeferredProbeWorkers = 8
+	// virtualDeferredProbeQueueSize bounds probes waiting for a pool worker.
+	// A full queue is backpressure, not an error: the session stays in the
+	// pending state and a later trigger (a replay, a rotation, or the inventory
+	// poll) re-runs the probe pool rather than the request path probing inline.
+	virtualDeferredProbeQueueSize = 64
+)
+
+// Probe lifecycle outcomes recorded on a session via SetVirtualProbeOutcome. They
+// are the wire-visible inventory_status values for a deferred probe: pending
+// while the enumeration is outstanding, then verified or failed. Empty means no
+// deferred probe is outstanding.
+const (
+	probeOutcomePending  = "pending"
+	probeOutcomeVerified = "verified"
+	probeOutcomeFailed   = "failed"
+)
+
+// virtualProbeOutcomeWriter is the optional session-manager capability that
+// records a deferred probe's disposition on the live session. A manager without
+// it (a minimal test manager) cannot carry the outcome, so the poll path falls
+// back to the catalog probe stamp alone.
+type virtualProbeOutcomeWriter interface {
+	SetVirtualProbeOutcome(sessionID, outcome string) error
+}
+
+// setVirtualProbeOutcome records a deferred probe outcome on the live session.
+// It is a no-op when the manager cannot carry one or the session has already
+// ended, so a probe that completes after its session does not error.
+func (h *PlaybackHandler) setVirtualProbeOutcome(sessionID, outcome string) {
+	if h == nil || sessionID == "" {
+		return
+	}
+	writer, ok := h.sessionMgr.(virtualProbeOutcomeWriter)
+	if !ok {
+		return
+	}
+	if err := writer.SetVirtualProbeOutcome(sessionID, outcome); err != nil && !errors.Is(err, playback.ErrSessionNotFound) {
+		slog.Warn("failed to record virtual probe outcome",
+			"component", "api", "session", sessionID, "outcome", outcome, "error", err)
+	}
+}
+
+// startDeferredProbeWorkers lazily starts the fixed post-commit probe pool. The
+// pool is bounded, so enqueuing a probe never spawns a goroutine per request.
+func (h *PlaybackHandler) startDeferredProbeWorkers() {
+	if h == nil {
+		return
+	}
+	h.deferredProbeOnce.Do(func() {
+		if h.deferredProbeQueue == nil {
+			h.deferredProbeQueue = make(chan *virtualDeferredProbeV3, virtualDeferredProbeQueueSize)
+		}
+		if h.deferredProbeRetry == nil {
+			h.deferredProbeRetry = make(map[string]*virtualDeferredProbeV3)
+		}
+		if h.deferredProbeSignal == nil {
+			h.deferredProbeSignal = make(chan struct{}, 1)
+		}
+		h.deferredProbeWG.Add(virtualDeferredProbeWorkers)
+		for range virtualDeferredProbeWorkers {
+			go func() {
+				defer h.deferredProbeWG.Done()
+				h.runDeferredProbeWorker()
+			}()
+		}
+	})
+}
+
+// deferredProbeKey identifies one outstanding deferred probe so a re-admitted
+// probe folds onto the same entry instead of stacking duplicates. It binds the
+// live session to the exact candidate the enumeration is for.
+func deferredProbeKey(deferred *virtualDeferredProbeV3) string {
+	if deferred == nil {
+		return ""
+	}
+	return deferred.sessionID + "\x00" + deferred.cand.URI
+}
+
+// enqueueDeferredVirtualProbeV3 admits one deferred probe into the bounded pool.
+// It never blocks and never probes on the request path: a full queue is
+// backpressure, and the session is already marked pending, so the probe parks in
+// a bounded retry set that a later worker completion drains. This is the fix for
+// a saturated detached gate putting remote probing back on the first-byte path
+// under load.
+func (h *PlaybackHandler) enqueueDeferredVirtualProbeV3(ctx context.Context, deferred *virtualDeferredProbeV3) {
 	if h == nil || deferred == nil || deferred.file == nil {
 		return
 	}
-	gate := h.detachedGate()
-	if !gate.tryAcquire() {
-		slog.WarnContext(ctx, "deferred virtual post-commit probe skipped: detached worker budget exhausted",
-			"component", "api", "candidate_uri", deferred.cand.URI)
-		h.probeVirtualCandidateForegroundFallback(ctx, deferred.stickyKey, deferred.file, deferred.streamURL, *deferred.probeTransient, deferred.cand, deferred.expectedRuntimeMinutes, deferred.ownerID)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	h.startDeferredProbeWorkers()
+	h.setVirtualProbeOutcome(deferred.sessionID, probeOutcomePending)
+	select {
+	case h.deferredProbeQueue <- deferred:
+	default:
+		// The queue is full. Park the probe in a bounded retry set rather than
+		// dropping it: a worker re-admits it when it next drains, so a later
+		// completion or the next trigger finishes the enumeration while the
+		// request path is never asked to probe synchronously. Beyond the retry
+		// bound the probe is shed; the session stays pending and the next
+		// replay, rotation, or inventory read re-enqueues it.
+		h.deferredProbeMu.Lock()
+		if len(h.deferredProbeRetry) >= virtualDeferredProbeQueueSize {
+			h.deferredProbeMu.Unlock()
+			slog.WarnContext(ctx, "deferred virtual post-commit probe shed: probe pool saturated",
+				"component", "api", "candidate_uri", deferred.cand.URI)
+			return
+		}
+		h.deferredProbeRetry[deferredProbeKey(deferred)] = deferred
+		h.deferredProbeMu.Unlock()
+		h.signalDeferredProbeRetry()
+	}
+}
+
+// signalDeferredProbeRetry wakes one idle worker to drain the retry set. It
+// never blocks: the buffered signal coalesces, so a burst of parked probes is
+// drained by whichever workers next become free.
+func (h *PlaybackHandler) signalDeferredProbeRetry() {
+	if h == nil || h.deferredProbeSignal == nil {
 		return
 	}
-	bgCtx, bgCancel := h.virtualDetachedContext(ctx, virtualBackgroundProbeBudget)
-	go func() {
-		defer gate.release()
-		defer bgCancel()
-		h.probeVirtualSourceAndPersist(bgCtx, deferred.stickyKey, deferred.file, deferred.streamURL, *deferred.probeTransient, deferred.cand, deferred.expectedRuntimeMinutes, deferred.ownerID)
-	}()
+	select {
+	case h.deferredProbeSignal <- struct{}{}:
+	default:
+	}
+}
+
+// runDeferredProbeWorker drains admitted probes until the service context ends.
+// A worker parks on the aggregate detached gate rather than trying it once:
+// parking is what turns saturation into backpressure instead of a synchronous
+// fallback, and it happens off the request path.
+func (h *PlaybackHandler) runDeferredProbeWorker() {
+	var serviceDone <-chan struct{}
+	if h.ServiceContext != nil {
+		serviceDone = h.ServiceContext.Done()
+	}
+	for {
+		select {
+		case <-serviceDone:
+			return
+		case deferred := <-h.deferredProbeQueue:
+			if deferred == nil {
+				continue
+			}
+			h.runDeferredVirtualProbe(deferred)
+		case <-h.deferredProbeSignal:
+			// A probe that arrived while the queue was full is parked in the
+			// retry set; drain one so a saturated burst still completes.
+			if next := h.takeDeferredRetry(); next != nil {
+				h.runDeferredVirtualProbe(next)
+			}
+		}
+	}
+}
+
+// takeDeferredRetry removes and returns one parked probe, if any. A worker calls
+// it when the retry signal fires, so a probe parked under queue pressure still
+// runs once a worker is free — bounded steps, no second worker pool.
+func (h *PlaybackHandler) takeDeferredRetry() *virtualDeferredProbeV3 {
+	h.deferredProbeMu.Lock()
+	defer h.deferredProbeMu.Unlock()
+	for key, deferred := range h.deferredProbeRetry {
+		delete(h.deferredProbeRetry, key)
+		return deferred
+	}
+	return nil
+}
+
+// runDeferredVirtualProbe runs one admitted post-commit probe under the
+// aggregate detached gate and the service lifecycle, then records the terminal
+// outcome on the session. The gate is acquired with a blocking wait: a
+// saturated gate delays the probe, never converts it to a synchronous one.
+func (h *PlaybackHandler) runDeferredVirtualProbe(deferred *virtualDeferredProbeV3) {
+	if h == nil || deferred == nil || deferred.file == nil {
+		return
+	}
+	waitCtx, waitCancel := h.virtualDetachedContext(h.ServiceContext, virtualBackgroundProbeBudget)
+	defer waitCancel()
+	gate := h.detachedGate()
+	if !gate.acquire(waitCtx) {
+		// The wait ended before a slot freed. If the service is still alive this
+		// was only a wait-budget expiry: re-park the probe so the pool keeps
+		// retrying it off the request path, and the session's pending state stays
+		// honest until it lands. A service shutdown drops it — there is nothing
+		// left to serve.
+		if h.ServiceContext == nil || h.ServiceContext.Err() == nil {
+			h.deferredProbeMu.Lock()
+			if len(h.deferredProbeRetry) < virtualDeferredProbeQueueSize {
+				h.deferredProbeRetry[deferredProbeKey(deferred)] = deferred
+			}
+			h.deferredProbeMu.Unlock()
+			h.signalDeferredProbeRetry()
+		}
+		return
+	}
+	defer gate.release()
+	bgCtx, bgCancel := h.virtualDetachedContext(h.ServiceContext, virtualBackgroundProbeBudget)
+	defer bgCancel()
+	outcome := h.probeVirtualSourceAndPersist(bgCtx, deferred.stickyKey, deferred.file, deferred.streamURL, *deferred.probeTransient, deferred.cand, deferred.expectedRuntimeMinutes, deferred.ownerID, h.deferredProbeBindingIntact(deferred.sessionID, deferred.cand.URI))
+	switch outcome {
+	case probeOutcomeVerified:
+		h.setVirtualProbeOutcome(deferred.sessionID, probeOutcomeVerified)
+	case probeOutcomeFailed:
+		// A terminally failed or timed-out probe must still let the client leave
+		// the loading state. Record the terminal outcome and push it: the plan
+		// committed its declared inventory, and the later inventory_updated push
+		// (or the inventory poll) now reports the failure instead of leaving the
+		// menu provisional forever.
+		h.setVirtualProbeOutcome(deferred.sessionID, probeOutcomeFailed)
+		h.publishDeferredProbeFailed(deferred)
+	default:
+		// The binding moved under the probe; the new binding owns its own
+		// lifecycle, so no outcome is written.
+	}
+	// A parked probe may be waiting on the retry set; wake a worker to drain it.
+	h.signalDeferredProbeRetry()
+}
+
+// deferredProbeBindingIntact reports whether the session is still bound to the
+// exact candidate the deferred probe is for. It is the fence the probe worker
+// passes to probeVirtualSourceAndPersist: without it, a probe that completes
+// after a rotation could write its outcome — and evidence — onto the new
+// binding. A manager that cannot supply the binding (a minimal test manager)
+// reports intact so the probe proceeds, matching the pre-existing best-effort
+// behavior on those managers.
+func (h *PlaybackHandler) deferredProbeBindingIntact(sessionID, candidateURI string) func() bool {
+	return func() bool {
+		if h == nil || sessionID == "" {
+			return true
+		}
+		reader, ok := h.sessionMgr.(interface {
+			VirtualSourceBinding(sessionID string) (playback.VirtualSourceBindingSnapshot, error)
+		})
+		if !ok {
+			return true
+		}
+		binding, err := reader.VirtualSourceBinding(sessionID)
+		if err != nil {
+			return false
+		}
+		return sameVirtualCandidate(binding.VirtualURI, candidateURI)
+	}
+}
+
+// publishDeferredProbeFailed pushes the terminal failed inventory to the
+// session's live realtime channel so a client watching the push path leaves its
+// loading state. The inventory poll observes the same status from the session,
+// so both paths end the deferred lifecycle.
+func (h *PlaybackHandler) publishDeferredProbeFailed(deferred *virtualDeferredProbeV3) {
+	if deferred == nil || deferred.file == nil {
+		return
+	}
+	ctx, cancel := h.virtualDetachedContext(h.ServiceContext, inventoryUpdatedPublishBudget)
+	defer cancel()
+	h.PublishInventoryUpdated(ctx, deferred.file.ID)
 }

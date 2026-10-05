@@ -2294,22 +2294,22 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	if resolved.DeferredProbe != nil && result.Plan != nil {
 		result.Plan.TracksPending = true
 	}
-	// spawnDeferredPostCommitProbe runs the fresh-start resolve's deferred
+	// enqueueDeferredPostCommitProbe runs the fresh-start resolve's deferred
 	// audio/subtitle enumeration once a transport has committed and the
 	// first-byte URL is on the response. It is shared by the main start and the
 	// same-release transient transport retry so a plan marked tracks_pending
-	// always gets the follow-up inventory_updated push it promises; a deferred
-	// plan that never spawned its probe would leave the client on the
-	// provisional menu forever. The probe runs detached from the request (see
-	// spawnDeferredVirtualProbeV3), so passing the original request context is
-	// safe on both paths.
-	spawnDeferredPostCommitProbe := func() {
+	// always gets the follow-up it promises. The probe is admitted into the
+	// bounded deferred-probe pool; a full pool or a saturated detached gate is
+	// backpressure that leaves the session in the pending state, never a
+	// synchronous probe on the response path.
+	enqueueDeferredPostCommitProbe := func(sessionID string) {
 		deferred := resolved.DeferredProbe
 		if deferred == nil {
 			return
 		}
+		deferred.sessionID = sessionID
 		timings.mark("post_commit_probe_scheduled")
-		h.spawnDeferredVirtualProbeV3(r.Context(), deferred)
+		h.enqueueDeferredVirtualProbeV3(r.Context(), deferred)
 	}
 	response, statusErr := h.startPlannedPlaybackV3(r, userID, profileID, req, requestDigests, requestedFile, effectiveFile, audioIndex, virtualDecision, result, clientInfo, virtualDecision.substitutionReason)
 	timings.mark("session_transport_commit")
@@ -2352,7 +2352,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 			}); retried {
 				// The retry committed a transport for the same deferred plan, so
 				// run the enumeration it still promises before returning.
-				spawnDeferredPostCommitProbe()
+				enqueueDeferredPostCommitProbe(retriedResponse.SessionID)
 				return retriedResponse, nil
 			}
 			alternateOrder := alternateOrderingForClient(req.Capabilities)
@@ -2431,11 +2431,11 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	}
 	// The transport has committed and the first-byte URL is on the response.
 	// The fresh-start resolve deferred its full audio/subtitle enumeration, so
-	// spawn it now: the client can start streaming immediately while ffprobe
+	// schedule it now: the client can start streaming immediately while ffprobe
 	// runs, and the existing inventory_updated push (or the inventory poll)
 	// delivers the probed track menu as a follow-up. The plan already carries
 	// tracks_pending so a client keeps the provisional menu until then.
-	spawnDeferredPostCommitProbe()
+	enqueueDeferredPostCommitProbe(response.SessionID)
 	timings.mark("response_ready")
 	return response, nil
 }

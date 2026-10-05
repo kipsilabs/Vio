@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -280,11 +281,13 @@ func TestDeferredInventorySpawnedAfterSameReleaseTransientRetry(t *testing.T) {
 	}
 }
 
-// TestPreprobeLivenessHitSkipsProviderListing proves the preprobe half: a fresh
-// listing observation for the content lets a row that already names a concrete
-// candidate skip the provider list, and without the observation the same resolve
-// still lists (so the memo can only remove a listing a live call justified).
-func TestPreprobeLivenessHitSkipsProviderListing(t *testing.T) {
+// TestPreprobeLivenessHitPreservesMissingCandidateMetadata is the point-3
+// regression: a fresh listing observation must not suppress the provider
+// listing a row still needs to declare its candidate's codec. The row carries a
+// concrete ?result= candidate but no audio evidence, so without the listing the
+// merge would synthesize an "aac" fallback and commit it into the recipe; the
+// provider's declaration ("eac3") must win instead.
+func TestPreprobeLivenessHitPreservesMissingCandidateMetadata(t *testing.T) {
 	newRow := func() *models.MediaFile {
 		return &models.MediaFile{
 			ID:                         710,
@@ -297,58 +300,76 @@ func TestPreprobeLivenessHitSkipsProviderListing(t *testing.T) {
 			Duration:                   3600,
 			VirtualOwnerInstallationID: 5,
 			VideoTracks:                []models.VideoTrack{{Codec: "h264", Width: 1920, Height: 1080, BitDepth: 8}},
-			// Audio evidence is incomplete, so a resolve without the preprobe
-			// observation must list the provider to fill it in.
+			// Audio evidence is incomplete, so the listing is the only source of
+			// the candidate's declared codec.
 		}
 	}
-	newHandler := func(listerCalls *atomic.Int32) *PlaybackHandler {
-		return &PlaybackHandler{
-			VirtualPlaybackResolver: VirtualPlaybackResolverFunc(func(_ context.Context, path string, _ int, _ string, _ int) (string, error) {
-				return "http://127.0.0.1:8080/stream?path=" + path, nil
-			}),
-			VirtualPlaybackStreamLister: VirtualPlaybackStreamListerFunc(func(_ context.Context, _ string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
-				listerCalls.Add(1)
-				return []VirtualPlaybackStream{{
-					ID: "cand-1", URI: "virtual://movie/tt-preprobe-710?result=cand-1",
-					Resolution: "1080p", CodecVideo: "h264", CodecAudio: "aac", Container: "mkv",
-				}}, nil
-			}),
-			VirtualFileLookup: func(_ context.Context, _ string) (*models.MediaFile, error) {
-				return newRow(), nil
-			},
-		}
+	var listerCalls atomic.Int32
+	h := &PlaybackHandler{
+		VirtualPlaybackResolver: VirtualPlaybackResolverFunc(func(_ context.Context, path string, _ int, _ string, _ int) (string, error) {
+			return "http://127.0.0.1:8080/stream?path=" + path, nil
+		}),
+		VirtualPlaybackStreamLister: VirtualPlaybackStreamListerFunc(func(_ context.Context, _ string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
+			listerCalls.Add(1)
+			return []VirtualPlaybackStream{{
+				ID: "cand-1", URI: "virtual://movie/tt-preprobe-710?result=cand-1",
+				Resolution: "1080p", CodecVideo: "h264", CodecAudio: "eac3", Container: "mkv",
+			}}, nil
+		}),
+		VirtualFileLookup: func(_ context.Context, _ string) (*models.MediaFile, error) {
+			return newRow(), nil
+		},
 	}
+	// A live observation exists for this content, which under the old
+	// timestamp-only gate would have skipped the listing.
+	h.recordVirtualPreprobeLiveness(&fileIdentityV3{contentID: "movie-preprobe-710", ownerID: 5}, time.Now())
 
-	t.Run("hit skips the list", func(t *testing.T) {
-		var listerCalls atomic.Int32
-		h := newHandler(&listerCalls)
-		h.recordVirtualPreprobeLiveness(&fileIdentityV3{contentID: "movie-preprobe-710", ownerID: 5}, time.Now())
-		file := newRow()
-		req := httptest.NewRequest(http.MethodPost, "/api/v2/playback/start", nil)
-		resolved, err := h.resolveVirtualPlaybackSource(req, file, "profile-1", true, nil, "", "", 0, false)
-		if err != nil {
-			t.Fatalf("resolveVirtualPlaybackSource error: %v", err)
-		}
-		if listerCalls.Load() != 0 {
-			t.Fatalf("provider lister called %d times on a preprobe hit, want 0", listerCalls.Load())
-		}
-		if resolved.URI != file.FilePath {
-			t.Fatalf("resolved URI = %q, want the row's own candidate %q", resolved.URI, file.FilePath)
-		}
-	})
+	file := newRow()
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/playback/start", nil)
+	resolved, err := h.resolveVirtualPlaybackSource(req, file, "profile-1", true, nil, "", "", 0, false)
+	if err != nil {
+		t.Fatalf("resolveVirtualPlaybackSource error: %v", err)
+	}
+	if listerCalls.Load() != 1 {
+		t.Fatalf("provider lister called %d times while candidate metadata was missing, want 1 (the listing must run despite the liveness hit)", listerCalls.Load())
+	}
+	if resolved.File == nil {
+		t.Fatal("resolve returned no file")
+	}
+	if resolved.File.CodecAudio != "eac3" {
+		t.Fatalf("resolved audio codec = %q, want the provider's declared eac3, not a synthesized fallback", resolved.File.CodecAudio)
+	}
+}
 
-	t.Run("miss lists as before", func(t *testing.T) {
-		var listerCalls atomic.Int32
-		h := newHandler(&listerCalls)
-		file := newRow()
-		req := httptest.NewRequest(http.MethodPost, "/api/v2/playback/start", nil)
-		if _, err := h.resolveVirtualPlaybackSource(req, file, "profile-1", true, nil, "", "", 0, false); err != nil {
-			t.Fatalf("resolveVirtualPlaybackSource error: %v", err)
-		}
-		if listerCalls.Load() != 1 {
-			t.Fatalf("provider lister called %d times without a preprobe observation, want 1", listerCalls.Load())
-		}
-	})
+// TestPreprobeHitRequiresCompleteCandidateMetadata pins the exact scope of the
+// liveness guard: a fresh observation only suppresses a listing for a row whose
+// candidate metadata is already complete. Missing metadata must force the
+// listing, because the listing is the only source of the provider's codec
+// declaration and the committed recipe must not synthesize a fallback.
+func TestPreprobeHitRequiresCompleteCandidateMetadata(t *testing.T) {
+	h := &PlaybackHandler{}
+	h.recordVirtualPreprobeLiveness(&fileIdentityV3{contentID: "movie-preprobe-scope", ownerID: 5}, time.Now())
+	identity := &fileIdentityV3{contentID: "movie-preprobe-scope", ownerID: 5}
+	now := time.Now()
+
+	if !h.virtualPreprobeHit(identity, true, false, false, false, false, now) {
+		t.Fatal("a fresh observation with a concrete candidate and complete metadata did not hit")
+	}
+	if h.virtualPreprobeHit(identity, true, false, false, false, true, now) {
+		t.Fatal("a fresh observation suppressed the listing while candidate metadata was missing")
+	}
+	if h.virtualPreprobeHit(identity, false, false, false, false, false, now) {
+		t.Fatal("a neutral row with no concrete candidate hit the memo")
+	}
+	if h.virtualPreprobeHit(identity, true, true, false, false, false, now) {
+		t.Fatal("an unusable row hit the memo instead of listing for recovery")
+	}
+	if h.virtualPreprobeHit(identity, true, false, true, false, false, now) {
+		t.Fatal("a row with a pending exclusion hit the memo instead of listing")
+	}
+	if h.virtualPreprobeHit(identity, true, false, false, true, false, now) {
+		t.Fatal("a forced relist hit the memo")
+	}
 }
 
 // TestVirtualPreprobeCacheExpiresAndIsBounded pins the TTL and admission bound
@@ -374,5 +395,291 @@ func TestVirtualPreprobeCacheExpiresAndIsBounded(t *testing.T) {
 	cache.record("c", now)
 	if len(cache.entries) > 2 {
 		t.Fatalf("cache size = %d, want <= 2", len(cache.entries))
+	}
+}
+
+// TestDeferredProbeFailureEndsLoadingViaPushAndPoll is the point-1 regression:
+// a deferred probe that terminally fails must end the client's loading state
+// through both surfaces. The plan promised tracks_pending, so a failure that
+// returned silently would leave the menu provisional forever. The failure is
+// observed as inventory_status "failed" on the inventory_updated push AND on a
+// subsequent inventory poll, so a client watching either surface leaves loading.
+func TestDeferredProbeFailureEndsLoadingViaPushAndPoll(t *testing.T) {
+	source := v3HandlerFixtureFile(t)
+	source.ID = 701
+	source.ContentID = "movie-deferred-fail-701"
+	source.FilePath = "virtual://movie/tt-deferred-fail-701?result=cand-1"
+	source.VirtualOwnerInstallationID = 5
+	source.ProbeUpdatedAt = nil
+
+	manager := playback.NewSessionManager(0, 0)
+	handler := NewPlaybackHandler(manager, testPlaybackFileResolver{file: source})
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "true"}}
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	handler.PlaybackConfig = playbackTestConfig("", "")
+	handler.RealtimeHub = playback.NewRealtimeHub()
+	handler.InstallationID = "test-install"
+	stubCopySeekAnchorV3(handler)
+
+	handler.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(func(_ context.Context, path string, _ int, _ string, _ int) (string, error) {
+		return "http://127.0.0.1:8080/stream?path=" + path, nil
+	})
+	probeStarted := make(chan struct{})
+	releaseProbe := make(chan struct{})
+	var probeOnce sync.Once
+	handler.VirtualPlaybackSourceProber = func(_ context.Context, _ string, _ *models.MediaFile) (*models.MediaFile, error) {
+		probeOnce.Do(func() { close(probeStarted) })
+		<-releaseProbe
+		return nil, errors.New("provider probe refused the stream")
+	}
+
+	start := startV3PlaybackForHandlerTest(t, handler, func() playback.StartRequestV3 {
+		request := v3HandlerStartRequest()
+		request.FileID = source.ID
+		request.QualityPreference = "original"
+		return request
+	}())
+	if start.PlaybackPlan == nil || !start.PlaybackPlan.TracksPending {
+		t.Fatalf("start plan = %#v, want a provisional plan", start.PlaybackPlan)
+	}
+	t.Cleanup(func() { handler.tm.CloseTranscodeSession(start.SessionID, "") })
+
+	select {
+	case <-probeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("deferred post-commit probe was not scheduled")
+	}
+	if err := manager.SetRealtimeConnection(start.SessionID, true); err != nil {
+		t.Fatalf("SetRealtimeConnection: %v", err)
+	}
+	conn := newDeferredInventoryPush()
+	registration := handler.RealtimeHub.Register(start.SessionID, conn)
+	if registration == nil {
+		t.Fatal("expected a realtime registration")
+	}
+	defer handler.RealtimeHub.Unregister(registration)
+
+	close(releaseProbe)
+
+	// Push surface: the failure must be delivered so a push-driven client exits
+	// the loading state.
+	select {
+	case event := <-conn.ch:
+		if event.payload.InventoryStatus != string(ProbeProvenanceFailed) {
+			t.Fatalf("pushed inventory status = %q, want failed", event.payload.InventoryStatus)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no inventory_updated failure push delivered after the deferred probe failed")
+	}
+
+	// Poll surface: a client that never holds the push connection must observe
+	// the same terminal status from the inventory endpoint.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		inventory, err := handler.GetPlaybackInventoryV2(newAuthorizedPlaybackContext(), PlaybackCaller{UserID: 1, ProfileID: "profile-1", InstallationID: "test-install"}, start.SessionID)
+		if err != nil {
+			t.Fatalf("GetPlaybackInventoryV2: %v", err)
+		}
+		if inventory.InventoryStatus == string(ProbeProvenanceFailed) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("inventory poll status = %q, want failed", inventory.InventoryStatus)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestDeferredProbePendingThenVerifiedPollTransitions proves the poll surface
+// distinguishes an unfinished probe from a failed one: while the probe is
+// outstanding the inventory reports pending, and once it verifies the poll
+// reports verified. A poll that collapsed both into "declared" would leave a
+// client unable to tell "still loading" from "done".
+func TestDeferredProbePendingThenVerifiedPollTransitions(t *testing.T) {
+	source := v3HandlerFixtureFile(t)
+	source.ID = 702
+	source.ContentID = "movie-deferred-poll-702"
+	source.FilePath = "virtual://movie/tt-deferred-poll-702?result=cand-1"
+	source.VirtualOwnerInstallationID = 5
+	source.ProbeUpdatedAt = nil
+
+	manager := playback.NewSessionManager(0, 0)
+	handler := NewPlaybackHandler(manager, testPlaybackFileResolver{file: source})
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "true"}}
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	handler.PlaybackConfig = playbackTestConfig("", "")
+	handler.RealtimeHub = playback.NewRealtimeHub()
+	handler.InstallationID = "test-install"
+	stubCopySeekAnchorV3(handler)
+
+	handler.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(func(_ context.Context, path string, _ int, _ string, _ int) (string, error) {
+		return "http://127.0.0.1:8080/stream?path=" + path, nil
+	})
+	probeStarted := make(chan struct{})
+	releaseProbe := make(chan struct{})
+	var probeOnce sync.Once
+	handler.VirtualPlaybackSourceProber = func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
+		probeOnce.Do(func() { close(probeStarted) })
+		<-releaseProbe
+		f.AudioTracks = []models.AudioTrack{{Codec: "eac3", Channels: 6, Language: "deu"}}
+		f.CodecAudio = "eac3"
+		return f, nil
+	}
+
+	start := startV3PlaybackForHandlerTest(t, handler, func() playback.StartRequestV3 {
+		request := v3HandlerStartRequest()
+		request.FileID = source.ID
+		request.QualityPreference = "original"
+		return request
+	}())
+	if start.PlaybackPlan == nil {
+		t.Fatal("start returned no playback plan")
+	}
+	t.Cleanup(func() { handler.tm.CloseTranscodeSession(start.SessionID, "") })
+	select {
+	case <-probeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("deferred post-commit probe was not scheduled")
+	}
+
+	pending, err := handler.GetPlaybackInventoryV2(newAuthorizedPlaybackContext(), PlaybackCaller{UserID: 1, ProfileID: "profile-1", InstallationID: "test-install"}, start.SessionID)
+	if err != nil {
+		t.Fatalf("GetPlaybackInventoryV2: %v", err)
+	}
+	if pending.InventoryStatus != string(ProbeProvenancePending) {
+		t.Fatalf("in-flight poll status = %q, want pending", pending.InventoryStatus)
+	}
+
+	close(releaseProbe)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		verified, err := handler.GetPlaybackInventoryV2(newAuthorizedPlaybackContext(), PlaybackCaller{UserID: 1, ProfileID: "profile-1", InstallationID: "test-install"}, start.SessionID)
+		if err != nil {
+			t.Fatalf("GetPlaybackInventoryV2: %v", err)
+		}
+		if verified.InventoryStatus == string(ProbeProvenanceVerified) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("post-probe poll status = %q, want verified", verified.InventoryStatus)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestSaturatedGateDefersProbeInsteadOfProbingOnRequestPath is the point-2
+// regression: when the aggregate detached gate is saturated, the deferred probe
+// must not fall back to a synchronous probe before the response returns. The
+// start request has to come back promptly, and the probe must run only once a
+// gate slot frees — proving saturation became backpressure, not a first-byte
+// probe.
+func TestSaturatedGateDefersProbeInsteadOfProbingOnRequestPath(t *testing.T) {
+	source := v3HandlerFixtureFile(t)
+	source.ID = 703
+	source.ContentID = "movie-deferred-gate-703"
+	source.FilePath = "virtual://movie/tt-deferred-gate-703?result=cand-1"
+	source.VirtualOwnerInstallationID = 5
+	source.ProbeUpdatedAt = nil
+
+	manager := playback.NewSessionManager(0, 0)
+	handler := NewPlaybackHandler(manager, testPlaybackFileResolver{file: source})
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "true"}}
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	handler.PlaybackConfig = playbackTestConfig("", "")
+	stubCopySeekAnchorV3(handler)
+	handler.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(func(_ context.Context, path string, _ int, _ string, _ int) (string, error) {
+		return "http://127.0.0.1:8080/stream?path=" + path, nil
+	})
+
+	probeStarted := make(chan struct{})
+	releaseProbe := make(chan struct{})
+	var probeOnce sync.Once
+	handler.VirtualPlaybackSourceProber = func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
+		probeOnce.Do(func() { close(probeStarted) })
+		<-releaseProbe
+		return f, nil
+	}
+
+	// Saturate the aggregate detached gate so the deferred worker has nowhere
+	// to run. The request path uses only non-blocking acquisitions, so the start
+	// must still complete.
+	gate := handler.detachedGate()
+	held := gate.capacity()
+	for i := 0; i < held; i++ {
+		if !gate.tryAcquire() {
+			t.Fatalf("could not hold slot %d of %d", i, held)
+		}
+	}
+	defer func() {
+		for i := 0; i < held; i++ {
+			gate.release()
+		}
+	}()
+
+	startDone := make(chan playback.DecisionResponseV3, 1)
+	go func() {
+		startDone <- startV3PlaybackForHandlerTest(t, handler, func() playback.StartRequestV3 {
+			request := v3HandlerStartRequest()
+			request.FileID = source.ID
+			request.QualityPreference = "original"
+			return request
+		}())
+	}()
+
+	var start playback.DecisionResponseV3
+	select {
+	case start = <-startDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("start blocked while the detached gate was saturated")
+	}
+	if start.PlaybackPlan == nil || !start.PlaybackPlan.TracksPending {
+		t.Fatalf("start plan = %#v, want a provisional plan", start.PlaybackPlan)
+	}
+	t.Cleanup(func() { handler.tm.CloseTranscodeSession(start.SessionID, "") })
+
+	// The response is out and the probe must not have run on the request path:
+	// the saturated gate parked it.
+	select {
+	case <-probeStarted:
+		t.Fatal("probe ran synchronously on the request path while the detached gate was saturated")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// Freeing a slot lets the parked worker run the probe.
+	gate.release()
+	held--
+	select {
+	case <-probeStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("deferred probe never ran after a gate slot freed")
+	}
+	close(releaseProbe)
+}
+
+// TestDeferredProbeOutcomeFencedByCandidateBinding proves a deferred probe that
+// completes after the session rotated to a different candidate does not write
+// its outcome onto the new binding. The old candidate's disposition says
+// nothing about the new one; the new binding's own probe owns its lifecycle.
+func TestDeferredProbeOutcomeFencedByCandidateBinding(t *testing.T) {
+	manager := playback.NewSessionManager(0, 0)
+	session, err := manager.StartSession(1, "profile-1", 100, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	if err := manager.SetVirtualSource(session.ID, "virtual://movie/tt-fence?result=old", 5); err != nil {
+		t.Fatalf("SetVirtualSource: %v", err)
+	}
+	h := NewPlaybackHandler(manager)
+
+	// Intact while the binding still names the probed candidate.
+	if !h.deferredProbeBindingIntact(session.ID, "virtual://movie/tt-fence?result=old")() {
+		t.Fatal("binding fence reported false for the still-bound candidate")
+	}
+	// Rotate the session to a different candidate: the old probe is now stale.
+	if err := manager.SetVirtualSource(session.ID, "virtual://movie/tt-fence?result=new", 5); err != nil {
+		t.Fatalf("SetVirtualSource rotate: %v", err)
+	}
+	if h.deferredProbeBindingIntact(session.ID, "virtual://movie/tt-fence?result=old")() {
+		t.Fatal("binding fence accepted a probe for the superseded candidate")
 	}
 }

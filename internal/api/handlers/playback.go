@@ -667,6 +667,26 @@ type PlaybackHandler struct {
 	virtualPreprobeOnce  sync.Once
 	virtualPreprobeCache *virtualPreprobeCache
 
+	// deferredProbeOnce guards lazy construction of the bounded post-commit
+	// probe pool (see enqueueDeferredVirtualProbeV3). A fresh-start resolve
+	// hands its deferred full-track enumeration to this pool instead of probing
+	// inline, so a saturated aggregate gate becomes backpressure that leaves the
+	// client in the provisional inventory state, not a synchronous probe on the
+	// first-byte path. The queue and workers are fixed; admission never spawns a
+	// goroutine per request.
+	deferredProbeOnce  sync.Once
+	deferredProbeQueue chan *virtualDeferredProbeV3
+	deferredProbeWG    sync.WaitGroup
+	// deferredProbeRetry parks probes that arrived while the queue was full.
+	// A worker drains one per completed probe, so a saturated burst completes in
+	// bounded steps without a second worker pool and without a synchronous probe
+	// on the request path.
+	deferredProbeMu    sync.Mutex
+	deferredProbeRetry map[string]*virtualDeferredProbeV3
+	// deferredProbeSignal wakes an idle worker to drain the retry set. It is
+	// buffered (size 1) and never blocks the request path.
+	deferredProbeSignal chan struct{}
+
 	// prefetchOnce guards the lazy prefetch worker pool. Prefetch work is
 	// admitted into a bounded queue (prefetchQueue) before any goroutine
 	// handles it, deduplicated by source+profile equivalence key
