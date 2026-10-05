@@ -2400,6 +2400,169 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	return response, nil
 }
 
+// virtualStartVersionFallbackWorkers bounds how many alternate versions the
+// cold-start version-fallback walk resolves at once. Each alternate resolve is
+// dominated by one upstream listing, so fan-out turns a walk of N dead pins
+// from N serial listing rounds into roughly one. Four is small enough that a
+// provider outage is not amplified into a storm of concurrent listings.
+//
+// The fan-out is a sliding wave, not a single round: a worker that finishes a
+// candidate takes the next index immediately, so only the first
+// virtualStartVersionFallbackWorkers candidates share the per-listing budget
+// from the start. A candidate in a later wave inherits whatever remains of the
+// decision budget, so four listings that each burn the full 1.5s
+// virtualStartVersionFallbackListingBudget leave a fifth candidate at most
+// ~0.5s before the 2s virtualStartVersionFallbackDecisionBudget terminals the
+// walk. That is the deliberate tradeoff: a slow early wave is allowed to
+// shorten a later candidate's window rather than let the walk stretch toward
+// one full listing budget per candidate. It is pinned by
+// TestRunVirtualVersionFallbackCandidatesLaterWaveSharesDecisionBudget.
+const virtualStartVersionFallbackWorkers = 4
+
+// virtualStartVersionFallbackListingBudget bounds one alternate's resolve in
+// the walk. A dead pin (empty listing, provider outage, absent candidate)
+// answers or times out inside this window, so a walk never pays a full startup
+// budget per dead version. It is a var so tests can pin it.
+var virtualStartVersionFallbackListingBudget = 1500 * time.Millisecond
+
+// virtualStartVersionFallbackDecisionBudget bounds the walk as a whole: the
+// first healthy candidate wins; if none does, the terminal is returned once
+// every candidate has failed or this budget elapses, whichever is first. It is
+// larger than one listing budget so a single fan-out wave can finish, and far
+// below the cold-start budget so the walk cannot itself burn the 7-11s window
+// the parallel walk exists to remove.
+var virtualStartVersionFallbackDecisionBudget = 2 * time.Second
+
+// runVirtualVersionFallbackCandidatesV3 resolves alternate version candidates
+// with bounded parallel fan-out and returns the first healthy candidate. It is
+// the scheduling half of the cold-start version-fallback walk, kept separate
+// from the provider calls so the fan-out (worker bound, per-listing budget,
+// first-wins, cancel stragglers, all-failed terminal) is testable without a
+// provider.
+//
+// candidates is in fallback order. Each is resolved by resolve within a
+// per-listing budget derived from ctx. The first success (ok=true) wins: the
+// remaining listings are canceled and this returns at once, without waiting for
+// them to unwind, so a healthy candidate is never delayed behind a straggler.
+// false is returned only after every candidate has failed or the decision
+// context elapses, whichever happens first; on both of those paths the in-flight
+// listings are canceled and the workers are joined before returning, so no
+// resolve mutates handler state after a terminal verdict. The caller keeps the
+// original resolve error in the false case.
+//
+// The winner is returned with the index of the candidate that produced it, so
+// the caller never has to correlate the returned source with a side-channel
+// write made by the winning worker. Two workers can both succeed; whichever
+// publishes first wins the buffered channel, and its own index travels with it.
+// On a false result (or no publish) index is -1.
+func runVirtualVersionFallbackCandidatesV3(
+	decisionCtx context.Context,
+	candidates []*models.MediaFile,
+	workers int,
+	listingBudget time.Duration,
+	resolve func(context.Context, *models.MediaFile) (resolvedVirtualPlaybackSource, bool),
+) (resolvedVirtualPlaybackSource, int, bool) {
+	if len(candidates) == 0 || workers <= 0 {
+		return resolvedVirtualPlaybackSource{}, -1, false
+	}
+	if workers > len(candidates) {
+		workers = len(candidates)
+	}
+	ctx, cancel := context.WithCancel(decisionCtx)
+	defer cancel()
+
+	// virtualVersionFallbackResultV3 pairs a resolved source with the index of
+	// the candidate that produced it, so the identity of the winning alternate
+	// is published atomically with its source rather than through a shared
+	// write a competing success could overwrite before the caller reads it.
+	type virtualVersionFallbackResultV3 struct {
+		source resolvedVirtualPlaybackSource
+		index  int
+	}
+
+	indexes := make(chan int)
+	winnerCh := make(chan virtualVersionFallbackResultV3, 1)
+
+	var workersWG sync.WaitGroup
+	workersWG.Add(workers)
+	for range workers {
+		go func() {
+			defer workersWG.Done()
+			for {
+				var idx int
+				select {
+				case <-ctx.Done():
+					return
+				case i, ok := <-indexes:
+					if !ok {
+						return
+					}
+					idx = i
+				}
+				// A winner or the decision budget already canceled the walk;
+				// do not start another provider listing.
+				if ctx.Err() != nil {
+					return
+				}
+				listCtx, listCancel := context.WithTimeout(ctx, listingBudget)
+				resolved, ok := resolve(listCtx, candidates[idx])
+				listCancel()
+				if ok {
+					select {
+					case winnerCh <- virtualVersionFallbackResultV3{source: resolved, index: idx}:
+					default:
+					}
+					cancel()
+					return
+				}
+			}
+		}()
+	}
+
+	go func() {
+		defer close(indexes)
+		for i := range candidates {
+			select {
+			case <-ctx.Done():
+				return
+			case indexes <- i:
+			}
+		}
+	}()
+
+	drained := make(chan struct{})
+	go func() {
+		workersWG.Wait()
+		close(drained)
+	}()
+
+	// preferWinner drains a result that may have landed exactly as the final
+	// worker exited, so a success is never dropped in favor of the terminal.
+	preferWinner := func() (resolvedVirtualPlaybackSource, int, bool) {
+		select {
+		case winner := <-winnerCh:
+			return winner.source, winner.index, true
+		default:
+			return resolvedVirtualPlaybackSource{}, -1, false
+		}
+	}
+
+	select {
+	case winner := <-winnerCh:
+		return winner.source, winner.index, true
+	case <-drained:
+		return preferWinner()
+	case <-decisionCtx.Done():
+		// The walk's decision budget elapsed. Cancel the in-flight listings and
+		// wait for the workers to stop, so no resolve mutates handler state
+		// after this returns. A candidate that finished just as the budget fired
+		// still counts as the winner.
+		cancel()
+		<-drained
+		return preferWinner()
+	}
+}
+
 // resolveVirtualStartWithVersionFallback resolves the virtual source for a
 // fresh start. When the pinned release's listing fails and nothing is playing
 // yet, it walks the content's alternate versions/files — each with its own
@@ -2415,11 +2578,21 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 // deliberate decision that a zero-count answer is a provider hiccup and not a
 // verdict about any release.
 //
-// The walk is bounded by the caller's startup budget (virtualStartupBudget),
-// and each resolve additionally bounds its own probe with virtualProbeBudget.
-// When no version resolves, the original listing failure is returned so the
-// caller reports the honest underlying cause (an edge 5xx, an empty listing,
-// or every version failed) instead of a generic error.
+// The alternates are resolved with bounded parallel fan-out rather than one at
+// a time: a cold start whose pin is dead commonly has every alternative dead
+// too, and resolving them serially paid one full upstream listing timeout per
+// dead version before the terminal. Each listing is bounded to
+// virtualStartVersionFallbackListingBudget and the walk as a whole to
+// virtualStartVersionFallbackDecisionBudget, so the walk itself terminals in
+// about two seconds instead of seven to eleven. That two-second figure
+// describes the alternate walk, not the end-to-end start request: when the walk
+// finds no candidate, the caller's synchronous primary stamp
+// (stampStartVirtualCandidateFailed) runs after it and can add up to
+// startCandidateFailStampBudget (~3s) of database write before the terminal
+// response. The first healthy candidate wins and cancels the rest. When no
+// version resolves, the original listing failure is returned so the caller
+// reports the honest underlying cause (an edge 5xx, an empty listing, or every
+// version failed) instead of a generic error.
 func (h *PlaybackHandler) resolveVirtualStartWithVersionFallback(
 	r *http.Request,
 	file *models.MediaFile,
@@ -2442,14 +2615,23 @@ func (h *PlaybackHandler) resolveVirtualStartWithVersionFallback(
 	// One deadline owns the whole walk. resolveVirtualPlaybackSource re-bases
 	// its own cold path on r.Context() and context.WithTimeout keeps the
 	// earlier deadline, so this bounds every alternate without restarting the
-	// budget once per version.
-	walkCtx, cancel := context.WithTimeout(r.Context(), virtualStartupBudget)
+	// budget once per version. The decision budget is deliberately separate
+	// from the per-listing budget: a healthy candidate is returned the moment
+	// it resolves, while a walk of dead pins terminals once the decision budget
+	// elapses rather than waiting out the full cold-start budget per version.
+	walkCtx, cancel := context.WithTimeout(r.Context(), virtualStartVersionFallbackDecisionBudget)
 	defer cancel()
 	alternates, alternateErr := h.findAlternateFiles(walkCtx, file, alternateOrderingForClient(req.Capabilities))
 	if alternateErr != nil || len(alternates) == 0 {
 		return resolved, resolveErr
 	}
 	walkReq := r.WithContext(walkCtx)
+
+	// candidateRows keeps one entry per walkable alternate, in fallback order.
+	// Skipping an AltMount-failed version here (rather than inside the resolve
+	// closure) keeps the walk order and the fan-out deterministic: a skipped
+	// version is never handed a worker slot.
+	candidateRows := make([]*models.MediaFile, 0, len(alternates))
 	for _, alternate := range alternates {
 		if alternate == nil || alternate.ID == file.ID || !isVirtualPlaybackFile(alternate) {
 			continue
@@ -2459,34 +2641,64 @@ func (h *PlaybackHandler) resolveVirtualStartWithVersionFallback(
 			// attempt it, however the primary listing failed.
 			continue
 		}
-		if walkCtx.Err() != nil {
-			break
-		}
+		candidateRows = append(candidateRows, alternate)
+	}
+	if len(candidateRows) == 0 {
+		return resolved, resolveErr
+	}
+
+	// resolveAlternate runs one alternate's existing resolve. It is exactly the
+	// call the serial walk made, so its side effects (pinning, caching) and its
+	// verdict classification are unchanged. A confirmed-dead verdict is
+	// persisted off this worker's critical path by
+	// stampStartVirtualCandidateFailedAsync: the stamp detaches from listCtx and
+	// carries its own budget, so the runner joining a worker that is mid-stamp
+	// cannot stretch the walk past its decision budget. The candidate that won
+	// is published together with its index on the runner's channel, never via a
+	// shared variable, so two concurrent successes cannot race for it and a
+	// straggler cannot overwrite the winner the caller reads.
+	resolveAlternate := func(listCtx context.Context, alternate *models.MediaFile) (resolvedVirtualPlaybackSource, bool) {
+		listReq := walkReq.WithContext(listCtx)
 		altResolved, altErr := h.resolveVirtualPlaybackSource(
-			walkReq, alternate, profileID, true, nil, "", req.QualityPreference, bandwidthCapKbps, false,
+			listReq, alternate, profileID, true, nil, "", req.QualityPreference, bandwidthCapKbps, false,
 			virtualResolveOptionsV3{sessionBound: false, bypassProviderFloor: true},
 		)
 		if altErr == nil && altResolved.File != nil {
-			// Mark the substitution so the plan can tell the client the
-			// requested release was replaced, and why. The requested row is the
-			// one the caller asked for, which this walk deliberately walked away
-			// from because its listing failed.
-			altResolved.SubstitutedFromFileID = file.ID
-			altResolved.SubstitutionReason = virtualSubstitutionReasonV3(resolveErr)
-			slog.InfoContext(walkCtx, "virtual start fell back to an alternate version after a listing failure",
-				logComponentKey, playbackLogValueV3,
-				"requested_file_id", file.ID, "alternate_file_id", alternate.ID,
-				"candidate_id", virtualResultCandidateID(altResolved.URI))
-			return altResolved, nil
+			return altResolved, true
 		}
 		if altErr != nil {
 			// A confirmed-dead version is indicted so a later start skips it;
 			// an empty listing or provider outage is transient and only
-			// advances the walk.
-			h.stampStartVirtualCandidateFailed(walkCtx, alternate, altErr)
+			// advances the walk. Fire-and-forget: the stamp writes through a
+			// detached budgeted context, so a canceled straggler still records
+			// the verdict it earned without holding the walk open for it.
+			h.stampStartVirtualCandidateFailedAsync(listCtx, alternate, altErr)
 		}
+		return resolvedVirtualPlaybackSource{}, false
 	}
-	return resolved, resolveErr
+
+	winner, winnerIndex, ok := runVirtualVersionFallbackCandidatesV3(
+		walkCtx, candidateRows, virtualStartVersionFallbackWorkers, virtualStartVersionFallbackListingBudget, resolveAlternate,
+	)
+	if !ok {
+		return resolved, resolveErr
+	}
+	// Mark the substitution so the plan can tell the client the requested
+	// release was replaced, and why. The requested row is the one the caller
+	// asked for, which this walk deliberately walked away from because its
+	// listing failed.
+	winner.SubstitutedFromFileID = file.ID
+	winner.SubstitutionReason = virtualSubstitutionReasonV3(resolveErr)
+	logAttrs := []any{
+		logComponentKey, playbackLogValueV3,
+		"requested_file_id", file.ID,
+		"candidate_id", virtualResultCandidateID(winner.URI),
+	}
+	if winnerIndex >= 0 && winnerIndex < len(candidateRows) {
+		logAttrs = append(logAttrs, "alternate_file_id", candidateRows[winnerIndex].ID)
+	}
+	slog.InfoContext(walkCtx, "virtual start fell back to an alternate version after a listing failure", logAttrs...)
+	return winner, nil
 }
 
 // virtualStartVersionFallbackEligibleV3 is the cross-version fallback gate,

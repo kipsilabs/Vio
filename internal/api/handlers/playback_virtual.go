@@ -376,21 +376,28 @@ func (h *PlaybackHandler) clearVirtualCandidateVerdict(ctx context.Context, file
 		"component", "api", "status", "verdict_cleared", "file_id", file.ID, "candidate_uri", resolvedURI)
 }
 
-// stampStartVirtualCandidateFailed applies the start path's fenced failed_at
-// verdict for a confirmed-dead pinned candidate, so the next start rotates to a
-// sibling or fails fast instead of re-resolving the release the provider just
-// dropped. Only the code's own dead verdict counts (isVirtualCandidateDeadError)
-// plus an absent pin that carries durable identity; an empty provider listing
-// is a transient hiccup and is deliberately never stamped (the versions check
-// documents why: a 2.6s empty-listing burst once marked 50 of 57 rows dead).
-// Any transport-temporary cause in the chain short-circuits the whole verdict
-// before the absent-pin branch is consulted, so a joined outage+absent shape
-// cannot smuggle a durable indictment past the transient guard.
-// Best-effort: a stamp failure does not change the resolve outcome the caller
-// already has. file is the catalog row the request pinned.
-func (h *PlaybackHandler) stampStartVirtualCandidateFailed(ctx context.Context, file *models.MediaFile, resolveErr error) {
-	if h == nil || h.VirtualCandidateFailMarker == nil || file == nil || file.FailedAt != nil || resolveErr == nil {
-		return
+// startCandidateFailStampBudget bounds one detached failed_at stamp write. The
+// stamp is fired off the resolve path, so it carries its own budget instead of
+// inheriting the walk's decision deadline; a var so tests can shrink it.
+var startCandidateFailStampBudget = 3 * time.Second
+
+// virtualCandidateConfirmedDead classifies a resolve failure as a confirmed-dead
+// pin for the start path: the provider answered and the pinned release is gone
+// or unusable. It is a pure predicate so callers can decide whether a stamp is
+// warranted without performing the write, which lets the write be detached from
+// the resolve that produced the verdict.
+//
+// Only the code's own dead verdict counts (isVirtualCandidateDeadError) plus an
+// absent pin that carries durable identity; an empty provider listing is a
+// transient hiccup and is deliberately never dead (the versions check documents
+// why: a 2.6s empty-listing burst once marked 50 of 57 rows dead). Any
+// transport-temporary cause in the chain short-circuits the whole verdict before
+// the absent-pin branch is consulted, so a joined outage+absent shape cannot
+// smuggle a durable indictment past the transient guard. This mirrors the
+// pre-verdict guard in checkVersion (catalog_versions_check.go).
+func virtualCandidateConfirmedDead(file *models.MediaFile, resolveErr error) bool {
+	if file == nil || resolveErr == nil {
+		return false
 	}
 	// Transport-temporary shapes (provider outage, deadline, pending release,
 	// empty listing) are availability-shaped and say nothing about the pinned
@@ -399,30 +406,94 @@ func (h *PlaybackHandler) stampStartVirtualCandidateFailed(ctx context.Context, 
 	// sentinel (for example errors.Join(resolver.ErrProviderUnavailable,
 	// virtuallibrary.ErrSessionBoundCandidateAbsent)); letting the identity
 	// branch read the absent sentinel as a verdict is what let a provider flap
-	// durably indict a pin. This mirrors the pre-verdict guard in
-	// checkVersion (catalog_versions_check.go).
+	// durably indict a pin.
 	if isVirtualProviderListingTemporaryError(resolveErr) {
+		return false
+	}
+	if isVirtualCandidateDeadError(resolveErr) {
+		return true
+	}
+	if _, hasIdentity := persistedVirtualIdentity(file); hasIdentity &&
+		errors.Is(resolveErr, virtuallibrary.ErrSessionBoundCandidateAbsent) {
+		return true
+	}
+	return false
+}
+
+// markVirtualCandidateFailed performs one fenced failed_at stamp for a candidate
+// the classifier already found confirmed-dead, on the caller's context. The
+// caller owns the write's budget and detachment: the synchronous start path
+// hands it a context.WithoutCancel with startCandidateFailStampBudget, while the
+// version-fallback walk hands it a detached, budgeted context. Best-effort: a
+// stamp failure does not change the resolve outcome the caller already has.
+func (h *PlaybackHandler) markVirtualCandidateFailed(ctx context.Context, file *models.MediaFile) {
+	if h == nil || h.VirtualCandidateFailMarker == nil || file == nil || file.FailedAt != nil {
 		return
 	}
-	dead := isVirtualCandidateDeadError(resolveErr)
-	if !dead {
-		if _, hasIdentity := persistedVirtualIdentity(file); hasIdentity &&
-			errors.Is(resolveErr, virtuallibrary.ErrSessionBoundCandidateAbsent) {
-			dead = true
-		}
-	}
-	if !dead {
-		return
-	}
-	stampCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
-	defer cancel()
-	if err := h.VirtualCandidateFailMarker(stampCtx, file.ID, file.FilePath, file.FailedAt); err != nil {
+	if err := h.VirtualCandidateFailMarker(ctx, file.ID, file.FilePath, file.FailedAt); err != nil {
 		slog.WarnContext(ctx, "mark virtual playback candidate failed",
 			"component", "api", "file_id", file.ID, "candidate_uri", file.FilePath, "error", err)
 		return
 	}
 	slog.InfoContext(ctx, "virtual playback candidate indicted after a confirmed-dead resolve",
 		"component", "api", "status", "candidate_failed", "file_id", file.ID, "candidate_uri", file.FilePath)
+}
+
+// stampStartVirtualCandidateFailed applies the start path's fenced failed_at
+// verdict synchronously, so the caller can rely on the write having landed
+// before it returns. It is used by the primary terminal path, which is not
+// joined by a bounded walk. A caller that must not wait on the write (the
+// parallel version-fallback walk) uses stampStartVirtualCandidateFailedAsync
+// instead.
+func (h *PlaybackHandler) stampStartVirtualCandidateFailed(ctx context.Context, file *models.MediaFile, resolveErr error) {
+	if h == nil || h.VirtualCandidateFailMarker == nil || file == nil || file.FailedAt != nil {
+		return
+	}
+	if !virtualCandidateConfirmedDead(file, resolveErr) {
+		return
+	}
+	stampCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), startCandidateFailStampBudget)
+	defer cancel()
+	h.markVirtualCandidateFailed(stampCtx, file)
+}
+
+// stampStartVirtualCandidateFailedAsync classifies synchronously (a pure
+// predicate) and persists the verdict on a detached, budgeted goroutine. It is
+// the version-fallback walk's stamp: the walk joins its workers before
+// returning a terminal, so a synchronous marker write near the decision
+// deadline would stretch the walk by up to startCandidateFailStampBudget
+// (three seconds) past that deadline. Detaching the write keeps the walk bounded
+// to its decision budget while still recording a confirmed-dead verdict, and the
+// detached context keeps request values for logging and follows the service
+// lifecycle so shutdown stops an outstanding stamp.
+//
+// The detached write is admitted through the handler's bounded detached-work
+// gate. Without that bound each confirmed-dead alternate would spawn an
+// unrestricted goroutine, so a slow database would accumulate one stuck write
+// per alternate across concurrent starts; startCandidateFailStampBudget bounds
+// each write's lifetime but not how many are in flight. Admission is
+// non-blocking and drop-on-exhaustion: the walk must never wait on a slot, so a
+// shed stamp leaves the row unindicted and only costs a later start the same
+// resolve, exactly like the other best-effort detached stamps.
+func (h *PlaybackHandler) stampStartVirtualCandidateFailedAsync(ctx context.Context, file *models.MediaFile, resolveErr error) {
+	if h == nil || h.VirtualCandidateFailMarker == nil || file == nil || file.FailedAt != nil {
+		return
+	}
+	if !virtualCandidateConfirmedDead(file, resolveErr) {
+		return
+	}
+	gate := h.detachedGate()
+	if !gate.tryAcquire() {
+		slog.DebugContext(ctx, "virtual candidate verdict stamp skipped: detached worker budget exhausted",
+			"component", "api", "file_id", file.ID, "candidate_uri", file.FilePath)
+		return
+	}
+	stampCtx, cancel := h.virtualDetachedContext(ctx, startCandidateFailStampBudget)
+	go func() {
+		defer gate.release()
+		defer cancel()
+		h.markVirtualCandidateFailed(stampCtx, file)
+	}()
 }
 
 // virtualFallbackEligibility is the explicit release-identity contract for the
