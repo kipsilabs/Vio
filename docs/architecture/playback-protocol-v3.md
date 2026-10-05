@@ -1246,14 +1246,29 @@ That split makes the ordering load-bearing:
   emitted. A duplicate probe write, a second replica, or a retried heartbeat
   finds the generation settled and replays the stored decision instead of
   emitting a second event for one correction.
-- The withdrawal is durable and retried until a capable client acknowledges it:
-  the entry's delivery state (`announced_at`) is separate from its decision, so
-  a settled but un-delivered invalidation is re-attempted on a later
-  heartbeat/attach/probe pass while the session still negotiates both
-  capabilities. The retry is bounded (an in-process window, comfortably larger
-  than the probe budget); after the bound the correction still lands on the
-  next start or reconnect, which plans against the already-corrected
-  inventory. Once `announced_at` is set, the generation emits nothing again.
+- The withdrawal is durable and stops on **completion, not on send**. `announced_at`
+  records that the hub accepted the command, which proves only that the server
+  wrote it; a client can still disconnect before reading it, fail its replan, or
+  reconnect on another node later. So delivery ends when the attempt's current plan
+  id moves off the plan the entry withdraws — any replan commits a new plan, and
+  whether the client adopted our correction or chose something else, both end the
+  obligation to keep withdrawing a plan it no longer plays. Until then, and only
+  while the session still negotiates both capabilities, the withdrawal is
+  re-attempted on later heartbeat/attach/probe passes. The bound is an explicit
+  rate-and-burst policy rather than an eventual-silence guarantee: one burst of 20
+  accepted deliveries, a 15-minute cooldown before the next burst, and an immediate
+  fresh burst whenever the session's control connection reconnects. A client that
+  keeps reconnecting without adopting the correction keeps being reminded; one that
+  stays connected and ignores it stops being pushed. Only accepted deliveries count,
+  capacity is reserved atomically before each send and returned when the write fails,
+  and the in-process state is dropped on session teardown and swept when idle, so it
+  stays bounded. Past the ceiling the correction still lands on the next start, which
+  plans against the already-corrected inventory. Every
+  re-delivery of one decision reuses the same command id, derived from the session
+  and generation, so a client that receives it twice recognizes one withdrawal
+  rather than two competing ones. The corrected identity deliberately does not
+  decide completion: it is recorded against the still-current plan, so comparing it
+  there compares against the stale selection and can match by coincidence.
 - The replan-request id is derived from the plan and the target audio index,
   both immutable, while the body also embeds the live position, which is not.
   A replay of the stored decision therefore carries the same id **and** the same

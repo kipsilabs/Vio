@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -70,7 +71,16 @@ type invalidationFixture struct {
 }
 
 func newInvalidationFixture(t *testing.T, features []string, position float64) *invalidationFixture {
+	return newInvalidationFixtureWithStamp(t, features, position, nil)
+}
+
+// newInvalidationFixtureWithStamp lets a test choose the probe stamp, and
+// therefore the reconciliation generation.
+func newInvalidationFixtureWithStamp(t *testing.T, features []string, position float64, stamp *time.Time) *invalidationFixture {
 	t.Helper()
+	if stamp == nil {
+		stamp = &invalidationProbeStamp
+	}
 	planTime := []models.AudioTrack{
 		{Index: 1, Language: "en", Codec: "aac", Channels: 2, Layout: "stereo"},
 		{Index: 3, Language: "pt", Codec: "eac3", Channels: 6, Layout: "5.1"},
@@ -82,7 +92,7 @@ func newInvalidationFixture(t *testing.T, features []string, position float64) *
 			{Index: 3, Language: "pt", Codec: "eac3", Channels: 6, Layout: "5.1"},
 			{Index: 1, Language: "en", Codec: "aac", Channels: 2, Layout: "stereo"},
 		},
-		ProbeUpdatedAt: &invalidationProbeStamp,
+		ProbeUpdatedAt: stamp,
 	}
 	session := &playback.Session{
 		ID: "11111111-1111-1111-1111-111111111111", UserID: 1, ProfileID: "profile-1",
@@ -253,15 +263,19 @@ type failingSendConn struct{}
 
 func (failingSendConn) WriteJSON(_ any) error { return errors.New("client not attached yet") }
 
-// TestReconcileAudioWithdrawalRetriedUntilCapableClientAcks covers the
-// durable-delivery fix: a withdrawal whose first announce failed is retried
-// on a later reconcile pass once a healthy hub lane exists, the entry then
-// carries AnnouncedAt, and a third pass emits nothing.
-func TestReconcileAudioWithdrawalRetriedUntilCapableClientAcks(t *testing.T) {
+// TestReconcileAudioWithdrawalRetriedUntilCorrectionCommits covers durable
+// delivery honestly: a Send that fails is retried, and a Send that SUCCEEDS is
+// still not treated as completion. Only the committed correction ends delivery.
+//
+//  1. First pass over a failing lane: the decision settles, nothing is delivered.
+//  2. A healthy lane appears: the withdrawal is delivered and AnnouncedAt records
+//     the attempt, but the entry is still outstanding — the client has not
+//     replanned, so a later pass re-sends the SAME command id.
+//  3. The corrected selection commits: delivery stops permanently.
+func TestReconcileAudioWithdrawalRetriedUntilCorrectionCommits(t *testing.T) {
 	f := newInvalidationFixture(t, []string{playback.FeaturePlanInvalidatedV3, playback.FeatureDefaultAudioReconcileResponseV3}, 12)
 
-	// First pass with a failing/nil hub send: the decision settles but
-	// AnnouncedAt stays nil.
+	// (1) A failing lane: the hub refuses the write, so nothing is delivered.
 	f.handler.RealtimeHub = playback.NewRealtimeHub()
 	failingRegistration := f.handler.RealtimeHub.Register(f.session.ID, failingSendConn{})
 	t.Cleanup(func() { f.handler.RealtimeHub.Unregister(failingRegistration) })
@@ -278,8 +292,9 @@ func TestReconcileAudioWithdrawalRetriedUntilCapableClientAcks(t *testing.T) {
 		t.Fatalf("failing hub must deliver no plan_invalidated, got %d", got)
 	}
 
-	// Swap in a healthy lane; a later reconcile pass must retry the
-	// withdrawal and stamp AnnouncedAt.
+	// (2) A healthy lane: the withdrawal is delivered. AnnouncedAt records the
+	// attempt, and because no correction has committed the entry is still
+	// outstanding, so the next pass re-sends the same stable command id.
 	f.handler.RealtimeHub.Unregister(failingRegistration)
 	healthyRegistration := f.handler.RealtimeHub.Register(f.session.ID, f.conn)
 	t.Cleanup(func() { f.handler.RealtimeHub.Unregister(healthyRegistration) })
@@ -290,16 +305,590 @@ func TestReconcileAudioWithdrawalRetriedUntilCapableClientAcks(t *testing.T) {
 		t.Fatal("the settled decision must survive the retry")
 	}
 	if retryEntry.AnnouncedAt == nil {
-		t.Fatal("AnnouncedAt must be set after a successful announce")
+		t.Fatal("AnnouncedAt must record the successful delivery attempt")
 	}
 	if got := len(f.conn.commands()); got != 1 {
-		t.Fatalf("a healthy hub must receive exactly one plan_invalidated on the retry, got %d", got)
+		t.Fatalf("a healthy hub must deliver exactly one plan_invalidated, got %d", got)
+	}
+	firstCommandID := f.conn.commands()[0].CommandID
+	if firstCommandID == "" {
+		t.Fatal("the withdrawal must carry a command id")
 	}
 
-	// A third pass on the announced entry must emit nothing.
+	// The client has not replanned yet: the correction is still outstanding, so
+	// the next pass re-delivers the SAME command rather than minting a new one.
+	afterSecond := f.reconcile(t)
+	secondEntry := playback.FindAudioReconcileEntry(afterSecond.AudioReconcileLedger, entry.Generation, f.session.ID)
+	if secondEntry == nil || secondEntry.AnnouncedAt == nil {
+		t.Fatal("the outstanding entry must keep its delivery stamp across retries")
+	}
+	commands := f.conn.commands()
+	if len(commands) != 2 {
+		t.Fatalf("an outstanding correction must be re-announced, got %d commands", len(commands))
+	}
+	if commands[1].CommandID != firstCommandID {
+		t.Fatalf("retry command id = %q, want the stable id %q from the first attempt",
+			commands[1].CommandID, firstCommandID)
+	}
+
+	// (3) The client answers: the corrected selection is committed. Delivery is
+	// over and no further withdrawal is emitted.
+	f.commitCorrectedAudioForTest(t, secondEntry.Request.SelectedTracks.Audio)
+
+	afterCommit := f.reconcile(t)
+	commitEntry := playback.FindAudioReconcileEntry(afterCommit.AudioReconcileLedger, entry.Generation, f.session.ID)
+	if commitEntry == nil {
+		t.Fatal("the settled decision must survive the completion")
+	}
+	if got := len(f.conn.commands()); got != 2 {
+		t.Fatalf("a committed correction must stop delivery, got %d commands", got)
+	}
+
+	// And it stays stopped on later heartbeats.
+	f.handler.reconcilePendingAudioStartup(context.Background(), f.session.ID)
+	if got := len(f.conn.commands()); got != 2 {
+		t.Fatalf("a completed correction must never re-announce, got %d commands", got)
+	}
+}
+
+// TestReconcileAudioCommandIDIsStablePerGeneration pins the identity rule the
+// retry contract depends on: one (session, generation) withdrawal always carries
+// the same command id, so a client that sees it twice recognizes one command.
+func TestReconcileAudioCommandIDIsStablePerGeneration(t *testing.T) {
+	sessionID := "11111111-1111-1111-1111-111111111111"
+	first := audioReconcileCommandIDV3(sessionID, "probe:2026-10-05T00:00:00Z")
+	again := audioReconcileCommandIDV3(sessionID, "probe:2026-10-05T00:00:00Z")
+	if first != again {
+		t.Fatalf("command id is not stable: %q then %q", first, again)
+	}
+	if other := audioReconcileCommandIDV3(sessionID, "probe:2026-10-06T00:00:00Z"); other == first {
+		t.Fatal("a different generation must get a different command id")
+	}
+	if other := audioReconcileCommandIDV3("22222222-2222-2222-2222-222222222222", "probe:2026-10-05T00:00:00Z"); other == first {
+		t.Fatal("a different session must get a different command id")
+	}
+}
+
+// TestForgetAudioReconcileAttemptsIsSessionScoped pins that tearing one session
+// down drops ONLY that session's retry state. An empty-prefix match here would
+// wipe every other session's budget, so an unrelated playback stop could
+// repeatedly replenish an exhausted burst.
+func TestForgetAudioReconcileAttemptsIsSessionScoped(t *testing.T) {
+	const otherSession = "99999999-9999-9999-9999-999999999999"
+	first := &playback.AudioReconcileEntryV3{
+		Decision:   playback.AudioReconcileInvalidated,
+		Generation: "probe:2026-10-05T00:00:00Z",
+		SessionID:  "11111111-1111-1111-1111-111111111111",
+	}
+	second := &playback.AudioReconcileEntryV3{
+		Decision:   playback.AudioReconcileInvalidated,
+		Generation: "probe:2026-10-05T00:00:00Z",
+		SessionID:  otherSession,
+	}
+	firstKey := first.Generation + "|" + first.SessionID
+	secondKey := second.Generation + "|" + second.SessionID
+
+	audioReconcileAttemptsMu.Lock()
+	audioReconcileAttempts[firstKey] = audioReconcileAttemptState{Delivered: 3, UpdatedAt: time.Now()}
+	audioReconcileAttempts[secondKey] = audioReconcileAttemptState{Delivered: 7, UpdatedAt: time.Now()}
+	audioReconcileAttemptsMu.Unlock()
+
+	forgetAudioReconcileAttemptsForSession(first.SessionID)
+
+	audioReconcileAttemptsMu.Lock()
+	_, keptFirst := audioReconcileAttempts[firstKey]
+	keptSecond := audioReconcileAttempts[secondKey]
+	audioReconcileAttemptsMu.Unlock()
+	if keptFirst {
+		t.Fatal("teardown must drop the torn-down session's retry state")
+	}
+	if keptSecond.Delivered != 7 {
+		t.Fatalf("another session's delivery count = %d, want it untouched at 7", keptSecond.Delivered)
+	}
+	delete(audioReconcileAttempts, firstKey)
+	delete(audioReconcileAttempts, secondKey)
+}
+
+// TestReleaseAudioReconcileReservationIsEpochScoped pins that a failed send can
+// only refund its OWN reservation. A refund landing on a newer burst would hand
+// the client capacity the rearmed budget never lent, weakening the ceiling exactly
+// when a reconnect re-opened delivery.
+func TestReleaseAudioReconcileReservationIsEpochScoped(t *testing.T) {
+	entry := &playback.AudioReconcileEntryV3{
+		Decision:   playback.AudioReconcileInvalidated,
+		Generation: "probe:2026-10-05T00:00:01Z",
+		SessionID:  "22222222-2222-2222-2222-222222222222",
+	}
+	key := entry.Generation + "|" + entry.SessionID
+
+	reserved, epoch := reserveAudioReconcileDelivery(entry, time.Now())
+	if !reserved {
+		t.Fatal("the first reservation must be admitted")
+	}
+
+	// A reconnect rearms the burst: the budget is cleared and the epoch moves.
+	rearmAudioReconcileAttempts(entry)
+	rearmed, rearmEpoch := reserveAudioReconcileDelivery(entry, time.Now())
+	if !rearmed || rearmEpoch == epoch {
+		t.Fatalf("a rearm must start a new epoch, got %d then %d", epoch, rearmEpoch)
+	}
+
+	// The stale send now fails. Its refund must NOT touch the fresh burst.
+	releaseAudioReconcileReservation(entry, epoch)
+
+	audioReconcileAttemptsMu.Lock()
+	delivered := audioReconcileAttempts[key].Delivered
+	currentEpoch := audioReconcileAttempts[key].Epoch
+	audioReconcileAttemptsMu.Unlock()
+	if delivered != 1 {
+		t.Fatalf("a stale refund changed the fresh burst to %d deliveries, want 1", delivered)
+	}
+	if currentEpoch != rearmEpoch {
+		t.Fatalf("a stale refund moved the epoch to %d, want %d", currentEpoch, rearmEpoch)
+	}
+
+	// The fresh reservation still refunds correctly.
+	releaseAudioReconcileReservation(entry, rearmEpoch)
+	audioReconcileAttemptsMu.Lock()
+	delivered = audioReconcileAttempts[key].Delivered
+	audioReconcileAttemptsMu.Unlock()
+	if delivered != 0 {
+		t.Fatalf("a current refund must return capacity, got %d deliveries, want 0", delivered)
+	}
+	delete(audioReconcileAttempts, key)
+}
+
+// TestAudioReconcileEpochSurvivesCrossSessionSweep closes the ABA hole through the
+// sweep: a rearmed entry must not be evictable, because an eviction would let the
+// next reserve recreate it at a reused epoch, and a send still in flight against
+// the old epoch would then refund a burst it never reserved on.
+func TestAudioReconcileEpochSurvivesCrossSessionSweep(t *testing.T) {
+	held := &playback.AudioReconcileEntryV3{
+		Decision:   playback.AudioReconcileInvalidated,
+		Generation: "probe:2026-10-05T00:00:02Z",
+		SessionID:  "33333333-3333-3333-3333-333333333333",
+	}
+	// Another session's activity drives the periodic sweep.
+	churn := &playback.AudioReconcileEntryV3{
+		Decision:   playback.AudioReconcileInvalidated,
+		Generation: "probe:2026-10-05T00:00:03Z",
+		SessionID:  "44444444-4444-4444-4444-444444444444",
+	}
+	heldKey := held.Generation + "|" + held.SessionID
+
+	reserved, epoch := reserveAudioReconcileDelivery(held, time.Now())
+	if !reserved {
+		t.Fatal("the first reservation must be admitted")
+	}
+
+	// The client reconnects, so the budget rearms.
+	rearmAudioReconcileAttempts(held)
+
+	// An unrelated session forces the periodic sweep that runs on every reserve.
+	audioReconcileLastSweep = time.Time{}
+	for i := 0; i < 3; i++ {
+		if admitted, _ := reserveAudioReconcileDelivery(churn, time.Now()); !admitted {
+			t.Fatal("the unrelated session's reservation must be admitted")
+		}
+	}
+
+	audioReconcileAttemptsMu.Lock()
+	live, present := audioReconcileAttempts[heldKey]
+	rearmedEpoch := live.Epoch
+	rearmedStamp := live.UpdatedAt
+	audioReconcileAttemptsMu.Unlock()
+	if !present {
+		t.Fatal("a rearmed entry is live and must not be swept by another session's activity")
+	}
+	if rearmedStamp.IsZero() {
+		t.Fatal("rearming must leave a current UpdatedAt, or the entry looks idle to the sweep")
+	}
+	if rearmedEpoch == epoch {
+		t.Fatalf("rearming must advance the epoch past the in-flight %d, got %d", epoch, rearmedEpoch)
+	}
+
+	// The next reservation on this session must NOT reuse the old epoch.
+	if _, next := reserveAudioReconcileDelivery(held, time.Now()); next == epoch {
+		t.Fatalf("a post-sweep reserve reused epoch %d", next)
+	}
+
+	// The stale send now fails and must not refund the live burst.
+	releaseAudioReconcileReservation(held, epoch)
+	audioReconcileAttemptsMu.Lock()
+	delivered := audioReconcileAttempts[heldKey].Delivered
+	audioReconcileAttemptsMu.Unlock()
+	if delivered != 1 {
+		t.Fatalf("a stale refund changed the live burst to %d deliveries, want 1", delivered)
+	}
+	delete(audioReconcileAttempts, heldKey)
+	delete(audioReconcileAttempts, churn.Generation+"|"+churn.SessionID)
+}
+
+// TestReconcileAudioCeilingHoldsUnderConcurrency pins the ceiling as a real
+// ceiling. Admission and accounting were once separate steps, so concurrent
+// evaluations could each observe remaining capacity and then all send; the bound
+// would have held only for sequential passes.
+func TestReconcileAudioCeilingHoldsUnderConcurrency(t *testing.T) {
+	f := newInvalidationFixtureWithStamp(t, []string{playback.FeaturePlanInvalidatedV3, playback.FeatureDefaultAudioReconcileResponseV3}, 12, freshReconcileGeneration())
+	f.handler.InstallAudioReconcileRearm(context.Background())
+	after := f.reconcile(t)
+	entry := playback.FindAudioReconcileEntry(after.AudioReconcileLedger, reconcileGenerationV3(f.verified), f.session.ID)
+	if entry == nil {
+		t.Fatal("the first evaluation must settle the generation")
+	}
+
+	// Race well past the ceiling: the hub accepts every write, so the reservation
+	// is the only thing that can hold the line.
+	const racers = 200
+	var wg sync.WaitGroup
+	wg.Add(racers)
+	for i := 0; i < racers; i++ {
+		go func() {
+			defer wg.Done()
+			f.handler.reconcileSessionDefaultAudio(context.Background(), f.session, f.verified.ID)
+		}()
+	}
+	wg.Wait()
+
+	if got, want := len(f.conn.commands()), audioReconcileAnnounceMaxAttempts; got != want {
+		t.Fatalf("concurrent deliveries = %d, want exactly the ceiling %d", got, want)
+	}
+	audioReconcileAttemptsMu.Lock()
+	delivered := audioReconcileAttempts[entry.Generation+"|"+entry.SessionID].Delivered
+	audioReconcileAttemptsMu.Unlock()
+	if delivered > audioReconcileAnnounceMaxAttempts {
+		t.Fatalf("recorded deliveries = %d, must never exceed the ceiling %d",
+			delivered, audioReconcileAnnounceMaxAttempts)
+	}
+}
+
+// TestReconcileAudioDisconnectThenReconnectRearms pins the COMMON reconnect
+// lifecycle: Unregister DELETES the lane, so the next registration takes the
+// hub's first-registration branch. Deciding "reconnect" by whether a lane already
+// existed would miss exactly this case and leave the budget exhausted.
+func TestReconcileAudioDisconnectThenReconnectRearms(t *testing.T) {
+	f := newInvalidationFixtureWithStamp(t, []string{playback.FeaturePlanInvalidatedV3, playback.FeatureDefaultAudioReconcileResponseV3}, 12, freshReconcileGeneration())
+	f.handler.InstallAudioReconcileRearm(context.Background())
+	after := f.reconcile(t)
+	entry := playback.FindAudioReconcileEntry(after.AudioReconcileLedger, reconcileGenerationV3(f.verified), f.session.ID)
+	if entry == nil {
+		t.Fatal("the first evaluation must settle the generation")
+	}
+	firstCommandID := f.conn.commands()[0].CommandID
+
+	// Spend the budget.
+	for i := 0; i < audioReconcileAnnounceMaxAttempts; i++ {
+		f.reconcile(t)
+	}
+	spent := len(f.conn.commands())
+	if spent < audioReconcileAnnounceMaxAttempts {
+		t.Fatalf("the client must receive the withdrawal up to the budget, got %d pushes", spent)
+	}
+	if got := spent; got > audioReconcileAnnounceMaxAttempts {
+		t.Fatalf("sequential deliveries = %d, must never exceed the ceiling %d", got, audioReconcileAnnounceMaxAttempts)
+	}
+	f.reconcile(t)
+	if got := len(f.conn.commands()); got != spent {
+		t.Fatalf("an exhausted budget must stop pushing: %d pushes, want %d", got, spent)
+	}
+
+	// Disconnect, then reconnect. The hub fires its reconnect hook for a session
+	// whose lane was released, so the budget is restored and the withdrawal is
+	// re-delivered under the SAME command identity.
+	registration := f.handler.RealtimeHub.Register(f.session.ID, &reconcileInvalidationConn{})
+	if !f.handler.RealtimeHub.Unregister(registration) {
+		t.Fatal("the first registration must be releasable")
+	}
+	reconnected := &reconcileInvalidationConn{}
+	next := f.handler.RealtimeHub.Register(f.session.ID, reconnected)
+	t.Cleanup(func() { f.handler.RealtimeHub.Unregister(next) })
+
+	f.reconcile(t)
+	commands := reconnected.commands()
+	if len(commands) != 1 {
+		t.Fatalf("a disconnect-then-reconnect must re-deliver the withdrawal: %d pushes, want 1", len(commands))
+	}
+	if got := commands[0].CommandID; got != firstCommandID {
+		t.Fatalf("reconnect command id = %q, want the stable id %q", got, firstCommandID)
+	}
+}
+
+// TestAudioReconcileAttemptStateIsBounded pins the memory bound: state for a
+// finished session is dropped on teardown, and state idle past retention is swept
+// so sessions that ended without teardown on this replica cannot accumulate.
+func TestAudioReconcileAttemptStateIsBounded(t *testing.T) {
+	f := newInvalidationFixtureWithStamp(t, []string{playback.FeaturePlanInvalidatedV3, playback.FeatureDefaultAudioReconcileResponseV3}, 12, freshReconcileGeneration())
+	f.handler.InstallAudioReconcileRearm(context.Background())
+	after := f.reconcile(t)
+	entry := playback.FindAudioReconcileEntry(after.AudioReconcileLedger, reconcileGenerationV3(f.verified), f.session.ID)
+	key := entry.Generation + "|" + entry.SessionID
+
+	audioReconcileAttemptsMu.Lock()
+	if _, ok := audioReconcileAttempts[key]; !ok {
+		audioReconcileAttemptsMu.Unlock()
+		t.Fatal("a delivered withdrawal must record its delivery state")
+	}
+	audioReconcileAttemptsMu.Unlock()
+
+	// Teardown drops it.
+	forgetAudioReconcileAttemptsForSession(f.session.ID)
+	audioReconcileAttemptsMu.Lock()
+	_, afterTeardown := audioReconcileAttempts[key]
+	audioReconcileAttemptsMu.Unlock()
+	if afterTeardown {
+		t.Fatal("session teardown must drop the retry state for that session")
+	}
+
+	// An idle entry beyond retention is swept, while a fresh one survives.
+	audioReconcileAttemptsMu.Lock()
+	audioReconcileAttempts[key] = audioReconcileAttemptState{Delivered: 3, UpdatedAt: time.Now().Add(-audioReconcileRetentionForTest - time.Minute)}
+	audioReconcileLastSweep = time.Time{}
+	audioReconcileAttemptsMu.Unlock()
+	sweepAudioReconcileAttempts(time.Now())
+
+	audioReconcileAttemptsMu.Lock()
+	_, stale := audioReconcileAttempts[key]
+	audioReconcileAttempts[key] = audioReconcileAttemptState{Delivered: 3, UpdatedAt: time.Now()}
+	audioReconcileLastSweep = time.Time{}
+	audioReconcileAttemptsMu.Unlock()
+	sweepAudioReconcileAttempts(time.Now())
+
+	audioReconcileAttemptsMu.Lock()
+	_, fresh := audioReconcileAttempts[key]
+	audioReconcileAttemptsMu.Unlock()
+	if stale {
+		t.Fatal("retry state idle past retention must be swept")
+	}
+	if !fresh {
+		t.Fatal("sweeping must not drop live retry state: eviction cannot replenish an exhausted budget")
+	}
+}
+
+// TestReconcileAudioReconnectRearmsExhaustedBudget pins the reconnect case: a
+// client that reconnects on the same active plan after the delivered-attempt
+// budget is spent MUST still receive the withdrawal. A ceiling consumed by
+// passes that ran with no socket attached would otherwise strand the
+// correction in exactly the running-session reconnect case delivery exists to
+// fix, which is permanent abandonment wearing a counter's clothing.
+func TestReconcileAudioReconnectRearmsExhaustedBudget(t *testing.T) {
+	f := newInvalidationFixtureWithStamp(t, []string{playback.FeaturePlanInvalidatedV3, playback.FeatureDefaultAudioReconcileResponseV3}, 12, freshReconcileGeneration())
+	f.handler.InstallAudioReconcileRearm(context.Background())
+
+	// Spend the whole budget on passes with a healthy lane: the client receives
+	// the withdrawal and ignores it every time.
+	after := f.reconcile(t)
+	entry := playback.FindAudioReconcileEntry(after.AudioReconcileLedger, reconcileGenerationV3(f.verified), f.session.ID)
+	if entry == nil {
+		t.Fatal("the first evaluation must settle the generation")
+	}
+	firstCommandID := f.conn.commands()[0].CommandID
+	for i := 0; i < audioReconcileAnnounceMaxAttempts; i++ {
+		f.reconcile(t)
+	}
+	if got := len(f.conn.commands()); got < audioReconcileAnnounceMaxAttempts {
+		t.Fatalf("the client must receive the withdrawal up to the budget, got %d pushes", got)
+	}
+
+	// The budget is now spent and the plan has not moved: a bare evaluation
+	// pass must not push again.
+	before := len(f.conn.commands())
+	f.reconcile(t)
+	if got := len(f.conn.commands()); got != before {
+		t.Fatalf("an exhausted budget must stop pushing: %d pushes, want %d", got, before)
+	}
+
+	// The client reconnects. A new registration taking over the live lane is a
+	// genuine reconnect: the budget is rearmed and the next pass re-delivers
+	// under the SAME command identity, so one withdrawal is still one command.
+	reconnected := &reconcileInvalidationConn{}
+	registration := f.handler.RealtimeHub.Register(f.session.ID, reconnected)
+	t.Cleanup(func() { f.handler.RealtimeHub.Unregister(registration) })
+	f.handler.reconcilePendingAudioStartup(context.Background(), f.session.ID)
+	commands := reconnected.commands()
+	if len(commands) != 1 {
+		t.Fatalf("a reconnect must re-deliver the outstanding withdrawal: %d pushes, want 1", len(commands))
+	}
+	if got := commands[0].CommandID; got != firstCommandID {
+		t.Fatalf("reconnect command id = %q, want the stable id %q", got, firstCommandID)
+	}
+
+	// The client now acts on it, and delivery stops for good.
+	f.commitCorrectedAudioForTest(t, entry.Request.SelectedTracks.Audio)
+	f.reconcile(t)
+	f.handler.reconcilePendingAudioStartup(context.Background(), f.session.ID)
+	if got := len(reconnected.commands()); got != 1 {
+		t.Fatalf("a completed correction must stay silent, got %d pushes, want 1", got)
+	}
+}
+
+// TestReconcileAudioExpiredBurstBuysOneMoreBurst pins the cooldown as a bounded
+// re-open, not an open door: once a burst expires, the client gets exactly
+// audioReconcileAnnounceMaxAttempts further deliveries and is then shut again.
+// Opening admission without resetting the count let a permanently non-adopting
+// client be pushed on every pass forever.
+func TestReconcileAudioExpiredBurstBuysOneMoreBurst(t *testing.T) {
+	f := newInvalidationFixtureWithStamp(t, []string{playback.FeaturePlanInvalidatedV3, playback.FeatureDefaultAudioReconcileResponseV3}, 12, freshReconcileGeneration())
+	f.handler.InstallAudioReconcileRearm(context.Background())
+	after := f.reconcile(t)
+	entry := playback.FindAudioReconcileEntry(after.AudioReconcileLedger, reconcileGenerationV3(f.verified), f.session.ID)
+	if entry == nil {
+		t.Fatal("the first evaluation must settle the generation")
+	}
+
+	// Spend the first burst.
+	for i := 0; i < audioReconcileAnnounceMaxAttempts; i++ {
+		f.reconcile(t)
+	}
+	spent := len(f.conn.commands())
+	if spent < audioReconcileAnnounceMaxAttempts {
+		t.Fatalf("the client must receive the first burst, got %d pushes", spent)
+	}
+
+	// Age the burst past the cooldown. The next ACCEPTED delivery opens a fresh
+	// burst and counts itself as attempt 1, so the client gets exactly
+	// audioReconcileAnnounceMaxAttempts further deliveries and is shut again.
+	// Resetting on delivery rather than opening admission is what stops a
+	// permanently non-adopting client from being pushed on every pass forever.
+	ageAudioReconcileBurstForTest(entry, time.Now().Add(-audioReconcileAnnounceCooldown-time.Minute))
+	for i := 0; i < audioReconcileAnnounceMaxAttempts*2; i++ {
+		f.reconcile(t)
+	}
+	if got, want := len(f.conn.commands()), audioReconcileAnnounceMaxAttempts*2; got != want {
+		t.Fatalf("an expired burst must buy exactly %d further deliveries, got %d", want, got)
+	}
+
+	// Still shut on further passes.
+	before := len(f.conn.commands())
+	f.reconcile(t)
+	if got := len(f.conn.commands()); got != before {
+		t.Fatalf("the second burst must also shut: %d pushes, want %d", got, before)
+	}
+}
+
+// TestReconcileAudioProgressReportDoesNotRearm pins that the budget is rearmed
+// only by a genuine reconnect. reconcilePendingAudioStartup also runs on every
+// progress report, so rearming there would let a connected client that never
+// replans receive withdrawals indefinitely.
+func TestReconcileAudioProgressReportDoesNotRearm(t *testing.T) {
+	f := newInvalidationFixtureWithStamp(t, []string{playback.FeaturePlanInvalidatedV3, playback.FeatureDefaultAudioReconcileResponseV3}, 12, freshReconcileGeneration())
+	f.handler.InstallAudioReconcileRearm(context.Background())
+
+	after := f.reconcile(t)
+	entry := playback.FindAudioReconcileEntry(after.AudioReconcileLedger, reconcileGenerationV3(f.verified), f.session.ID)
+	if entry == nil {
+		t.Fatal("the first evaluation must settle the generation")
+	}
+	for i := 0; i < audioReconcileAnnounceMaxAttempts; i++ {
+		f.reconcile(t)
+	}
+
+	// Repeated progress reports on the SAME connection must not rearm.
+	before := len(f.conn.commands())
+	for i := 0; i < audioReconcileAnnounceMaxAttempts; i++ {
+		f.handler.reconcilePendingAudioStartup(context.Background(), f.session.ID)
+	}
+	if got := len(f.conn.commands()); got != before {
+		t.Fatalf("progress reports must not rearm an exhausted burst: %d pushes, want %d", got, before)
+	}
+
+	// A genuine new connection does rearm, and keeps the command identity.
+	reconnected := &reconcileInvalidationConn{}
+	registration := f.handler.RealtimeHub.Register(f.session.ID, reconnected)
+	t.Cleanup(func() { f.handler.RealtimeHub.Unregister(registration) })
+	if !f.handler.RealtimeHub.EmitNewConnectionForTest(f.session.ID) {
+		t.Fatal("the reconnect hook must be installed to rearm the delivery budget")
+	}
+	f.handler.reconcilePendingAudioStartup(context.Background(), f.session.ID)
+	commands := reconnected.commands()
+	if len(commands) != 1 {
+		t.Fatalf("a genuine reconnect must re-deliver the withdrawal: %d pushes, want 1", len(commands))
+	}
+	if got := commands[0].CommandID; got != audioReconcileCommandIDV3(f.session.ID, entry.Generation) {
+		t.Fatalf("reconnect command id = %q, want the stable id for this session and generation", got)
+	}
+}
+
+// freshGenerationCounter hands each budget test a distinct reconciliation
+// generation. The delivered-attempt budget is keyed by (generation, session),
+// and these tests assert absolute push counts, so tests sharing the fixture's
+// default generation would let one test's burst spend another's budget.
+var freshGenerationCounter atomic.Int64
+
+func freshReconcileGeneration() *time.Time {
+	stamp := time.Now().UTC().Add(time.Duration(freshGenerationCounter.Add(1)) * time.Nanosecond)
+	return &stamp
+}
+
+// ageAudioReconcileBurstForTest backdates the delivered-attempt stamp so the
+// cooldown is observably satisfied without the test waiting for it.
+func ageAudioReconcileBurstForTest(entry *playback.AudioReconcileEntryV3, at time.Time) {
+	audioReconcileAttemptsMu.Lock()
+	defer audioReconcileAttemptsMu.Unlock()
+	key := entry.Generation + "|" + entry.SessionID
+	state := audioReconcileAttempts[key]
+	state.DeliveredAt = at
+	audioReconcileAttempts[key] = state
+}
+
+// TestReconcileAudioRetryBudgetIgnoresUndeliveredPasses pins what the ceiling
+// counts: only attempts the hub ACCEPTED. Passes with no control socket must
+// not consume the budget, because those are the passes that end with the client
+// reconnecting.
+func TestReconcileAudioRetryBudgetIgnoresUndeliveredPasses(t *testing.T) {
+	f := newInvalidationFixtureWithStamp(t, []string{playback.FeaturePlanInvalidatedV3, playback.FeatureDefaultAudioReconcileResponseV3}, 12, freshReconcileGeneration())
+
+	// No lane at all: the decision settles and nothing is delivered.
+	f.handler.RealtimeHub = playback.NewRealtimeHub()
+	after := f.reconcile(t)
+	entry := playback.FindAudioReconcileEntry(after.AudioReconcileLedger, reconcileGenerationV3(f.verified), f.session.ID)
+	if entry == nil {
+		t.Fatal("the first evaluation must settle the generation")
+	}
+	for i := 0; i < audioReconcileAnnounceMaxAttempts*2; i++ {
+		f.reconcile(t)
+	}
+	if got := len(f.conn.commands()); got != 0 {
+		t.Fatalf("an absent lane must deliver nothing, got %d pushes", got)
+	}
+
+	// The client connects. The budget must be untouched, so the very first
+	// pass after attach delivers.
+	registration := f.handler.RealtimeHub.Register(f.session.ID, f.conn)
+	t.Cleanup(func() { f.handler.RealtimeHub.Unregister(registration) })
+	f.reconcile(t)
+	commands := f.conn.commands()
+	if len(commands) != 1 {
+		t.Fatalf("undelivered passes must not spend the budget: %d pushes after attach, want 1", len(commands))
+	}
+
+	// And the same command identity as the very first decision.
+	if got := commands[0].CommandID; got != audioReconcileCommandIDV3(f.session.ID, entry.Generation) {
+		t.Fatalf("command id = %q, want the stable id derived from the session and generation", got)
+	}
+}
+
+// TestReconcileAudioSupersededPlanStopsDelivery pins the other completion
+// signal: once the plan the withdrawal names is no longer the attempt's current
+// plan, a replacement replan superseded it and our delivery obligation is over,
+// whatever the client then chose.
+func TestReconcileAudioSupersededPlanStopsDelivery(t *testing.T) {
+	f := newInvalidationFixture(t, []string{playback.FeaturePlanInvalidatedV3, playback.FeatureDefaultAudioReconcileResponseV3}, 12)
+
 	f.reconcile(t)
 	if got := len(f.conn.commands()); got != 1 {
-		t.Fatalf("an announced entry must never re-emit, got %d pushes", got)
+		t.Fatalf("the first evaluation must emit one withdrawal, got %d", got)
+	}
+
+	// A replacement replan supersedes the withdrawn plan.
+	f.supersedeCurrentPlanForTest(t)
+
+	after := f.reconcile(t)
+	entry := playback.FindAudioReconcileEntry(after.AudioReconcileLedger, reconcileGenerationV3(f.verified), f.session.ID)
+	if entry == nil {
+		t.Fatal("the settled decision must survive the supersede")
+	}
+	if got := len(f.conn.commands()); got != 1 {
+		t.Fatalf("a superseded plan must stop delivery, got %d commands", got)
 	}
 }
 
@@ -318,10 +907,31 @@ func TestReconcileAudioAnnouncedOnceStaysSilent(t *testing.T) {
 		t.Fatalf("the first evaluation must emit exactly one push, got %d", got)
 	}
 
-	// Second heartbeat on a settled+announced generation: silent.
+	// Heartbeats on a settled-but-outstanding generation may re-deliver the
+	// withdrawal, because delivery stops on the client's replan rather than on
+	// the send. What must never happen is a second DECISION or a second command
+	// identity: every re-delivery is the same command.
 	f.handler.reconcilePendingAudioStartup(context.Background(), f.session.ID)
-	if got := len(f.conn.commands()); got != 1 {
-		t.Fatalf("an announced entry must never re-emit on a heartbeat, got %d pushes", got)
+	commands := f.conn.commands()
+	if len(commands) < 2 {
+		t.Fatal("a settled-but-uncompleted withdrawal must still be re-delivered")
+	}
+	first := commands[0].CommandID
+	for i, command := range commands {
+		if command.CommandID != first {
+			t.Fatalf("command %d has id %q, want the stable id %q: one withdrawal is one command",
+				i, command.CommandID, first)
+		}
+	}
+
+	// Once the client has replanned, delivery stops for good.
+	f.commitCorrectedAudioForTest(t, entry.Request.SelectedTracks.Audio)
+	before := len(f.conn.commands())
+	f.reconcile(t)
+	f.handler.reconcilePendingAudioStartup(context.Background(), f.session.ID)
+	if got := len(f.conn.commands()); got != before {
+		t.Fatalf("a completed correction must never re-announce: %d pushes after completion, want %d",
+			got, before)
 	}
 }
 
@@ -361,8 +971,23 @@ func TestReconcileAudioNoDoubleCorrection(t *testing.T) {
 	// A second heartbeat after the generation settled.
 	f.handler.reconcilePendingAudioStartup(context.Background(), f.session.ID)
 
-	if got := len(f.conn.commands()); got != 1 {
-		t.Fatalf("plan_invalidated pushes = %d after duplicate write and heartbeat, want exactly 1", got)
+	// Duplicate evidence must not produce a second correction. Re-delivery of
+	// the same outstanding withdrawal is expected (it stops on the client's
+	// replan, not on the send), so the invariant is one command identity for
+	// every push, never two competing corrections.
+	commands := f.conn.commands()
+	if len(commands) == 0 {
+		t.Fatal("the settled generation must have been withdrawn at least once")
+	}
+	first := commands[0].CommandID
+	for i, command := range commands {
+		if command.CommandID != first {
+			t.Fatalf("push %d has command id %q, want the stable id %q: one correction is one command",
+				i, command.CommandID, first)
+		}
+		if command.Payload == nil {
+			t.Fatalf("push %d carries no withdrawal payload", i)
+		}
 	}
 	replayed, err := f.handler.PlanStoreV3.GetAttempt(context.Background(), f.session.ID)
 	if err != nil {
@@ -826,6 +1451,55 @@ func clientReplanForInvalidation(f *invalidationFixture, failedPlanID string) pl
 			Audio: copiedTrackIdentityForTest(f.record.CurrentPlan.SelectedTracks.Audio),
 		},
 	}
+}
+
+// replaceAttemptForTest overwrites the in-memory attempt row. Durable stores
+// are insert-once for attempts, so only the memory store can model the post-
+// replan row the reconcile loop reads back.
+func (f *invalidationFixture) replaceAttemptForTest(t *testing.T, record playback.AttemptRecordV3) {
+	t.Helper()
+	store, ok := f.handler.PlanStoreV3.(*playback.MemoryPlanStoreV3)
+	if !ok {
+		t.Fatal("fixture needs a *playback.MemoryPlanStoreV3 to rewrite an attempt")
+	}
+	store.ReplaceAttempt(context.Background(), record)
+}
+
+// commitCorrectedAudioForTest commits the corrected audio identity onto the
+// attempt's current plan, which is what the server observes when the client has
+// replanned onto the correction. It goes through the real store so the durable
+// attempt row is what the next evaluation reads.
+func (f *invalidationFixture) commitCorrectedAudioForTest(t *testing.T, corrected *playback.TrackIdentityV3) {
+	t.Helper()
+	record, err := f.handler.PlanStoreV3.GetAttempt(context.Background(), f.session.ID)
+	if err != nil {
+		t.Fatalf("get attempt before commit: %v", err)
+	}
+	if corrected == nil {
+		t.Fatal("the entry must carry the canonical corrected identity")
+	}
+	updated := *record
+	updated.CurrentPlan.SelectedTracks.Audio = copiedTrackIdentityForTest(corrected)
+	// A real replan commits a NEW plan; that plan-id movement is the
+	// server-observable signal that the client acted on the withdrawal.
+	updated.CurrentPlanID = record.CurrentPlanID + "-replaced"
+	f.replaceAttemptForTest(t, updated)
+	if live, liveErr := f.handler.sessionMgr.GetSession(f.session.ID); liveErr == nil && live != nil && corrected.Index != nil {
+		live.AudioTrackIndex = *corrected.Index
+	}
+}
+
+// supersedeCurrentPlanForTest points the attempt at a different current plan,
+// modeling a replacement replan that superseded the withdrawn one.
+func (f *invalidationFixture) supersedeCurrentPlanForTest(t *testing.T) {
+	t.Helper()
+	record, err := f.handler.PlanStoreV3.GetAttempt(context.Background(), f.session.ID)
+	if err != nil {
+		t.Fatalf("get attempt before supersede: %v", err)
+	}
+	updated := *record
+	updated.CurrentPlanID = record.CurrentPlanID + "-replaced"
+	f.replaceAttemptForTest(t, updated)
 }
 
 // copiedTrackIdentityForTest clones a track identity so a test asserts on the

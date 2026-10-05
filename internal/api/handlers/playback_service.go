@@ -513,6 +513,10 @@ func (h *PlaybackHandler) forgetProgressSideEffectLock(sessionID string) {
 		return
 	}
 	h.virtualDeliveryCleared.Delete(sessionID)
+	// The session is terminal, so no outstanding audio withdrawal can still be
+	// delivered or complete. Dropping its in-process retry state here keeps a
+	// long-lived process from retaining state for every session it ever served.
+	forgetAudioReconcileAttemptsForSession(sessionID)
 }
 
 func (h *PlaybackHandler) scrobblePauseTransitionV2(ctx context.Context, sess *playback.Session, wasPaused bool) {

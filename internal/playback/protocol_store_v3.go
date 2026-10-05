@@ -297,14 +297,16 @@ type AudioReconcileEntryV3 struct {
 	// it against this field is what makes the replan authoritatively a
 	// reconciliation response rather than an identity heuristic.
 	Reason string `json:"reason,omitempty"`
-	// AnnouncedAt is set once the withdrawal for this entry was accepted by
-	// the realtime hub for a client that negotiated both
-	// plan_invalidated_v1 and default_audio_reconcile_response_v1. It is
-	// the delivery state and is separate from the decision: an invalidated
-	// entry with a nil AnnouncedAt was never delivered to a capable
-	// client, so the reconcile loop retries it on a later heartbeat
-	// (bounded by audioReconcileAnnounceWindow). An invalidated entry
-	// with AnnouncedAt set is never re-emitted.
+	// AnnouncedAt records when the realtime hub last accepted this entry's
+	// withdrawal for a client that negotiated both plan_invalidated_v1 and
+	// default_audio_reconcile_response_v1. It is delivery ATTEMPT state and is
+	// deliberately not terminal: a nil value means the withdrawal has never
+	// been delivered, but a set value proves only that the server wrote the
+	// command, not that the client read it, replanned onto it, or stayed
+	// connected to commit. The reconcile loop therefore keys its silence on
+	// completion — the attempt's current plan id moving off this entry's PlanID
+	// — and keeps re-announcing an outstanding correction (with the same
+	// command id, bounded by an in-process attempt ceiling) until that happens.
 	AnnouncedAt *time.Time `json:"announced_at,omitempty"`
 }
 

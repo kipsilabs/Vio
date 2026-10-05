@@ -13,8 +13,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
-
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/userstore"
@@ -198,25 +196,27 @@ func (h *PlaybackHandler) reconcileAutoAudioSelection(ctx context.Context, sessi
 	}
 	if entry := playback.FindAudioReconcileEntry(record.AudioReconcileLedger, generation, live.ID); entry != nil {
 		// The attempt row already carries the ledger, so this needs no second
-		// store read. A settled + announced generation is never re-evaluated
-		// and never re-announced: a retried probe write, a second replica or
-		// a retried heartbeat replays the stored decision instead of emitting
-		// a second event for one correction.
-		if entry.Decision == playback.AudioReconcileInvalidated &&
-			entry.AnnouncedAt == nil &&
-			h.sessionNegotiatedPlanInvalidation(ctx, live.ID) &&
+		// store read. A settled generation is never re-decided: a retried probe
+		// write, a second replica or a retried heartbeat replays the stored
+		// decision instead of deciding one correction twice.
+		if entry.Decision != playback.AudioReconcileInvalidated {
+			return
+		}
+		// Stop on completion, not on send. A successful RealtimeHub.Send
+		// proves the server wrote the command; it does not prove the client
+		// read it, replanned onto it, or stayed connected long enough to
+		// commit. Keying silence on the send would strand the correction for
+		// the rest of the session whenever the client disconnects before
+		// processing, its replan fails transiently, or its reconnect lands
+		// after the previous bound. Completion is the state the server can
+		// actually observe: the corrected selection is committed, or the stale
+		// plan is superseded by the replacement replan.
+		if audioReconcileCorrectionCompleted(entry, record) {
+			return
+		}
+		if h.sessionNegotiatedPlanInvalidation(ctx, live.ID) &&
 			h.sessionNegotiatedDefaultAudioReconcileResponse(ctx, live.ID) {
-			// Settled but never delivered: the original announce missed (no
-			// client attached yet, a replica without the session owner, a
-			// transient hub error). Re-attempt on this heartbeat/attach/probe
-			// pass so a client that connects AFTER the probe settled still
-			// receives the withdrawal. Bounded: retry only while the settled
-			// decision is still inside audioReconcileAnnounceWindow; after the
-			// bound the correction still lands on the next start/reconnect,
-			// which plans against the corrected inventory anyway.
-			if withinAudioReconcileAnnounceWindow(entry, time.Now()) {
-				h.announceAudioReconcileInvalidation(ctx, live, record, *entry)
-			}
+			h.announceAudioReconcileInvalidation(ctx, live, record, *entry)
 		}
 		return
 	}
@@ -323,36 +323,238 @@ func (h *PlaybackHandler) settleAudioReconcileInvalidation(ctx context.Context, 
 	h.announceAudioReconcileInvalidation(ctx, live, record, stored)
 }
 
-// audioReconcileAnnounceWindow bounds how long the evaluation loop re-attempts
-// delivering a settled but un-announced invalidation.
-const audioReconcileAnnounceWindow = 2 * time.Minute
-
-// withinAudioReconcileAnnounceWindow reports whether the settled entry is
-// still inside the retry window. The window is tracked in-process, keyed by
-// (generation, session), because the settled entry carries no settled-at
-// timestamp and the generation is a content hash with no wall clock. That is
-// a deliberate bound: a short attach gap still retries, a permanently
-// undeliverable session stops spinning, and the correction still lands on
-// the next start regardless.
-
-var (
-	audioReconcileFirstSeen   = map[string]time.Time{}
-	audioReconcileFirstSeenMu sync.Mutex
+// audioReconcileAnnounceMaxAttempts bounds the DELIVERED re-announce attempts for
+// one outstanding withdrawal, so a session whose client ignores the command stops
+// receiving it instead of being pushed for its whole lifetime.
+//
+// Only attempts the hub actually accepted count. A pass with no control socket
+// attached, or one whose write failed, must not consume the budget: those are
+// precisely the cases that end with the client reconnecting, and a ceiling spent
+// on undeliverable passes would strand the correction in the running-session
+// reconnect case that delivery exists to fix. The bound therefore throttles a
+// client that receives and ignores the withdrawal, and never abandons one that has
+// not received it at all.
+//
+// The budget also rearms. A new connection registration for the session clears the
+// count, because a reconnecting client is a fresh candidate for delivery, and a
+// cooldown window releases it on the same track for a client that never
+// re-registers. Exhausting the budget is not permanent abandonment: either path can
+// rearm it, and past both the correction still lands on the next start, which plans
+// against the verified inventory anyway.
+const (
+	audioReconcileAnnounceMaxAttempts = 20
+	audioReconcileAnnounceCooldown    = 15 * time.Minute
 )
 
-func withinAudioReconcileAnnounceWindow(entry *playback.AudioReconcileEntryV3, now time.Time) bool {
+var (
+	audioReconcileAttempts   = map[string]audioReconcileAttemptState{}
+	audioReconcileAttemptsMu sync.Mutex
+	// audioReconcileLastSweep bounds how often orphaned retry state is swept, so
+	// the sweep cost is amortized rather than paid per evaluation.
+	audioReconcileLastSweep time.Time
+)
+
+// audioReconcileAttemptRetention is how long retry state outlives its last
+// update before the sweep may drop it. It is generous relative to the cooldown:
+// state that is still within its cooldown must be kept, because that is what
+// bounds the next burst, and dropping it early would hand a permanently
+// non-adopting client a fresh budget on every sweep.
+const (
+	audioReconcileAttemptRetention = audioReconcileAnnounceCooldown + time.Hour
+	audioReconcileSweepInterval    = 5 * time.Minute
+)
+
+// audioReconcileAttemptState tracks re-announce delivery for one outstanding
+// (generation, session) withdrawal.
+type audioReconcileAttemptState struct {
+	Delivered   int
+	DeliveredAt time.Time
+	UpdatedAt   time.Time
+	// Epoch increases every time the burst is rearmed, so a failed send can only
+	// refund the reservation it actually took. Without it, a send that fails
+	// after a reconnect-rearm would decrement the fresh budget and hand the
+	// client capacity it never spent.
+	Epoch uint64
+}
+
+// forgetAudioReconcileAttempts drops the retry state for one session. It runs on
+// session teardown so a long-lived process does not retain state for sessions
+// that ended.
+func forgetAudioReconcileAttemptsForSession(sessionID string) {
+	if sessionID == "" {
+		return
+	}
+	audioReconcileAttemptsMu.Lock()
+	defer audioReconcileAttemptsMu.Unlock()
+	suffix := "|" + sessionID
+	for key := range audioReconcileAttempts {
+		// The session id is the SUFFIX of every key for this session: the key is
+		// generation|session. No prefix matching is needed, and an empty-prefix
+		// match would delete every other session's budget on any teardown.
+		if strings.HasSuffix(key, suffix) {
+			delete(audioReconcileAttempts, key)
+		}
+	}
+}
+
+// sweepAudioReconcileAttempts drops retry state that has been idle past
+// audioReconcileAttemptRetention, bounding memory for sessions that ended
+// without a teardown on this replica. Retention exceeds the cooldown, so state
+// that still governs a burst is never swept: eviction must not become a way to
+// replenish an active exhausted budget.
+func sweepAudioReconcileAttempts(now time.Time) {
+	// Same bookkeeping normalization as reserveAudioReconcileDelivery: ages are
+	// compared correctly across zones either way, but one zone keeps the stored
+	// stamps comparable.
+	now = now.UTC()
+	audioReconcileAttemptsMu.Lock()
+	defer audioReconcileAttemptsMu.Unlock()
+	if !audioReconcileLastSweep.IsZero() && now.Sub(audioReconcileLastSweep) < audioReconcileSweepInterval {
+		return
+	}
+	audioReconcileLastSweep = now
+	for key, state := range audioReconcileAttempts {
+		if now.Sub(state.UpdatedAt) > audioReconcileAttemptRetention {
+			delete(audioReconcileAttempts, key)
+		}
+	}
+}
+
+// reserveAudioReconcileDelivery atomically admits and spends one delivered-attempt
+// from the budget for this outstanding entry, returning false when the burst is
+// spent, or true plus the epoch the reservation was taken against. Admission,
+// spending and expiry are decided under ONE lock so concurrent evaluations cannot
+// each observe capacity and then all send: that is what keeps the ceiling a real
+// ceiling rather than a hint under concurrency.
+//
+// A send that fails releases its own reservation via releaseAudioReconcileReservation
+// with the epoch returned here, so a refund can never land on a newer burst.
+func reserveAudioReconcileDelivery(entry *playback.AudioReconcileEntryV3, now time.Time) (bool, uint64) {
 	if entry == nil {
-		return false
+		return false, 0
 	}
 	key := entry.Generation + "|" + entry.SessionID
-	audioReconcileFirstSeenMu.Lock()
-	defer audioReconcileFirstSeenMu.Unlock()
-	first, ok := audioReconcileFirstSeen[key]
-	if !ok {
-		first = now
-		audioReconcileFirstSeen[key] = now
+	// Normalize so every stamp in this map is recorded in one zone. This is
+	// bookkeeping consistency, not a correctness fix: time.Sub compares instants
+	// correctly across zones, so the ages below are right either way.
+	now = now.UTC()
+	audioReconcileAttemptsMu.Lock()
+	state := audioReconcileAttempts[key]
+	admitted := false
+	if state.Delivered < audioReconcileAnnounceMaxAttempts {
+		state.Delivered++
+		state.DeliveredAt = now
+		state.UpdatedAt = now
+		admitted = true
+	} else if !state.DeliveredAt.IsZero() && now.Sub(state.DeliveredAt) >= audioReconcileAnnounceCooldown {
+		// The burst expired: start exactly one fresh burst, counting this attempt
+		// as its first delivery. Resetting HERE rather than in the accounting call
+		// is deliberate: accounting only runs after a successful send, and nothing
+		// is sent while the budget is shut, so a reset there could never be
+		// reached. Resetting here also keeps a permanently non-adopting client
+		// bounded to one burst per cooldown.
+		state = audioReconcileAttemptState{
+			Delivered: 1, DeliveredAt: now, UpdatedAt: now, Epoch: state.Epoch + 1,
+		}
+		admitted = true
 	}
-	return now.Sub(first) <= audioReconcileAnnounceWindow
+	if admitted {
+		audioReconcileAttempts[key] = state
+	}
+	epoch := state.Epoch
+	audioReconcileAttemptsMu.Unlock()
+	if admitted {
+		// Sweep outside the lock: it takes the same mutex, and an entry this
+		// stale can only belong to a session that ended without teardown here.
+		sweepAudioReconcileAttempts(now)
+	}
+	return admitted, epoch
+}
+
+// releaseAudioReconcileReservation returns an unused reservation to the budget, so
+// a send that never reached the client does not consume capacity.
+func releaseAudioReconcileReservation(entry *playback.AudioReconcileEntryV3, epoch uint64) {
+	if entry == nil {
+		return
+	}
+	key := entry.Generation + "|" + entry.SessionID
+	audioReconcileAttemptsMu.Lock()
+	defer audioReconcileAttemptsMu.Unlock()
+	state, ok := audioReconcileAttempts[key]
+	if !ok || state.Delivered <= 0 || state.Epoch != epoch {
+		// The burst was rearmed while this send was in flight. Refunding now
+		// would hand the client capacity the fresh budget never lent.
+		return
+	}
+	state.Delivered--
+	audioReconcileAttempts[key] = state
+}
+
+// rearmAudioReconcileAttempts releases the delivered-attempt budget for one
+// outstanding entry. A new control connection is exactly the moment a previously
+// undeliverable withdrawal becomes deliverable again, so a reconnect must never
+// inherit an exhausted budget.
+//
+// The epoch advances rather than the state being dropped, so a send that was
+// already in flight against the old burst cannot refund the rearmed one.
+func rearmAudioReconcileAttempts(entry *playback.AudioReconcileEntryV3) {
+	if entry == nil {
+		return
+	}
+	key := entry.Generation + "|" + entry.SessionID
+	audioReconcileAttemptsMu.Lock()
+	defer audioReconcileAttemptsMu.Unlock()
+	state := audioReconcileAttempts[key]
+	now := time.Now().UTC()
+	audioReconcileAttempts[key] = audioReconcileAttemptState{
+		// UpdatedAt stays current on purpose. A rearmed entry is LIVE again, and
+		// a zero stamp would let the very next cross-session sweep delete it —
+		// after which the next reserve would recreate the entry at a reused epoch,
+		// and a send still in flight against the old epoch would refund a burst
+		// it never reserved on.
+		//
+		// A fresh stamp is not on its own proof that no send is still in flight;
+		// it is what keeps the entry inside the retention window, and retention
+		// far exceeds any send's lifetime.
+		Epoch: state.Epoch + 1, UpdatedAt: now,
+	}
+}
+
+// forgetAudioReconcileAttempts drops the in-process retry state for one entry.
+func forgetAudioReconcileAttempts(entry *playback.AudioReconcileEntryV3) {
+	rearmAudioReconcileAttempts(entry)
+}
+
+// sweepAudioReconcileAttemptRetention exposes the retention window to tests and
+// documents the sweep bound they assert against.
+const audioReconcileRetentionForTest = audioReconcileAttemptRetention
+
+// audioReconcileCorrectionCompleted reports whether this entry's correction is
+// durably in effect, which is what ends delivery.
+//
+// The signal is the attempt's current plan id moving off the plan this entry
+// withdraws. Any replan commits a new plan, so that movement means the client
+// acted on the withdrawal — it either replanned onto our correction or picked
+// something else, and both end our obligation to keep withdrawing a plan it no
+// longer plays.
+//
+// The corrected identity deliberately does NOT decide completion. The entry is
+// recorded against the still-current plan, so that plan already carries
+// whatever the client was playing when the withdrawal went out; comparing our
+// corrected identity against it compares against the STALE selection and can
+// match by coincidence — a reorder that corrects one track can leave the
+// committed index equal — reporting completion before the client ever replanned.
+func audioReconcileCorrectionCompleted(entry *playback.AudioReconcileEntryV3, record *playback.AttemptRecordV3) bool {
+	if entry == nil || record == nil {
+		return false
+	}
+	if entry.PlanID == "" || record.CurrentPlanID == "" || record.CurrentPlanID == entry.PlanID {
+		// Still the withdrawn plan: the client has not replanned, so nothing
+		// about this decision is complete and the withdrawal stays outstanding.
+		return false
+	}
+	forgetAudioReconcileAttempts(entry)
+	return true
 }
 
 // reconcileProbeBudgetV3 bounds one reconcile evaluation: catalog read,
@@ -930,14 +1132,25 @@ func (h *PlaybackHandler) announceAudioReconcileInvalidation(ctx context.Context
 			"audio_index", *stored.AudioIndex)
 		return
 	}
+	// Reserve capacity BEFORE sending, under the same lock that enforces the
+	// ceiling. Accounting after the write would let concurrent evaluations each
+	// observe room and all send, so the ceiling would bound nothing. It sits
+	// after the capability gate so a client that can never receive the command
+	// never spends budget.
+	reserved, epoch := reserveAudioReconcileDelivery(&stored, time.Now().UTC())
+	if !reserved {
+		return
+	}
 	command, err := playback.NewPlanInvalidatedCommandForGeneration(
 		live.ID,
-		uuid.NewString(),
+		audioReconcileCommandIDV3(live.ID, stored.Generation),
 		planID,
 		playback.PlanInvalidatedDefaultAudioReconciliation,
 		stored.Generation,
 	)
 	if err != nil {
+		// Nothing will be sent, so the reservation must not be spent.
+		releaseAudioReconcileReservation(&stored, epoch)
 		slog.WarnContext(ctx, "default audio withdrawal command could not be built",
 			"component", "api", "session", live.ID, "error", err)
 		return
@@ -949,21 +1162,46 @@ func (h *PlaybackHandler) announceAudioReconcileInvalidation(ctx context.Context
 		command.DeadlineMS = int(audioReconcileInvalidationDeadline / time.Millisecond)
 	}
 	if err := h.RealtimeHub.Send(live.ID, command); err != nil {
+		// Return the reservation: a write that never reached the client must not
+		// spend the burst that bounds DELIVERED attempts.
+		releaseAudioReconcileReservation(&stored, epoch)
 		slog.DebugContext(ctx, "default audio withdrawal push undelivered",
 			"component", "api", "session", live.ID, "plan_id", planID, "error", err)
 		return
 	}
-	// The hub accepted the command for a capable client: mark the entry
-	// announced so the retry loop does not re-emit it, and persist that
-	// delivery state through the revision-checked ledger writer. Dedup on
-	// (generation, session, decision, digest) means this is an in-place
-	// enrichment of the settled entry, not a new decision.
+	// The hub accepted the command for a capable client. Record that attempt
+	// through the revision-checked ledger writer; dedup on (generation,
+	// session, decision, digest) makes it an in-place enrichment of the
+	// settled entry, not a new decision.
+	//
+	// This is a DELIVERY ATTEMPT, not completion. A nil return from Send
+	// proves the server wrote the command and nothing more, so it must not
+	// suppress further attempts: the client may disconnect before processing,
+	// fail its replan, or reconnect on a different node later. Silencing is
+	// keyed on audioReconcileCorrectionCompleted instead, which observes the
+	// committed correction or the superseded plan. AnnouncedAt therefore
+	// answers "has this been sent, and when" — useful for diagnostics and
+	// backoff — while the retry loop keys off completion.
 	announcedAt := time.Now().UTC()
 	h.recordAudioReconcileAnnouncement(ctx, live.ID, stored, &announcedAt)
-	slog.InfoContext(ctx, "default audio reconciled to the verified inventory",
+	slog.InfoContext(ctx, "default audio withdrawal delivered, awaiting the client replan",
 		"component", "api", "session", live.ID, "plan_id", planID,
 		"generation", stored.Generation, "audio_index", *stored.AudioIndex,
 		"reason", AudioReconciliationReplanReason)
+}
+
+// audioReconcileCommandIDV3 derives the withdrawal command id for one
+// (session, generation) pair. The id is deliberately deterministic rather than
+// a fresh UUID per attempt: every re-announce of the same unsettled correction
+// is the SAME logical command, so a client that receives it twice (a retry
+// after a dropped connection, or a duplicate across replicas) can recognize it
+// as one withdrawal instead of two competing ones, and a send that succeeded
+// while the AnnouncedAt write lost its CAS can no longer mint a second id for
+// the same decision. Different generations are different corrections and get
+// different ids.
+func audioReconcileCommandIDV3(sessionID, generation string) string {
+	sum := sha256.Sum256([]byte("audio-reconcile\x00" + sessionID + "\x00" + generation))
+	return "audio-reconcile-" + hex.EncodeToString(sum[:16])
 }
 
 // recordAudioReconcileAnnouncement persists the AnnouncedAt stamp on a settled
@@ -1154,7 +1392,54 @@ func (h *PlaybackHandler) reconcilePendingAudioStartup(ctx context.Context, sess
 	if strings.TrimSpace(record.SelectionOrigin) == "" {
 		return
 	}
+	// A reconnecting client is a fresh candidate for delivery, so it must never
+	// inherit an exhausted delivered-attempt budget from passes that ran while
+	// no socket was attached.
+	//
+	// Nothing to rearm on an ordinary pass. The budget is released by a genuine
+	// reconnect through the hub hook (see InstallAudioReconcileRearm) and by the
+	// burst cooldown. It must NOT be rearmed here: this entry point also runs on
+	// every progress report, and a rearm on each one would let a connected client
+	// that never replans receive withdrawals indefinitely.
 	h.reconcileSessionDefaultAudio(deadlineCtx, session, record.EffectiveMediaFileID)
+}
+
+// InstallAudioReconcileRearm wires the reconnect hook: when a session's control
+// connection genuinely reconnects, every outstanding withdrawal on its attempt
+// gets a fresh delivery budget. This is the only path that rearms besides the
+// burst cooldown, and it is driven by a new connection rather than by an
+// evaluation, so a client that stays connected and ignores the withdrawal is
+// still bounded.
+func (h *PlaybackHandler) InstallAudioReconcileRearm(ctx context.Context) {
+	if h == nil || h.RealtimeHub == nil || h.PlanStoreV3 == nil {
+		return
+	}
+	h.RealtimeHub.SetOnNewConnection(func(sessionID string) {
+		if h.PlanStoreV3 == nil || sessionID == "" {
+			return
+		}
+		record, err := h.PlanStoreV3.GetAttempt(ctx, sessionID)
+		if err != nil || record == nil {
+			return
+		}
+		rearmPendingAudioReconcileAttempts(record)
+	})
+}
+
+// rearmPendingAudioReconcileAttempts releases the delivered-attempt budget for
+// every outstanding withdrawal on this attempt, so a reconnecting client is not
+// throttled by attempts made before it was connected.
+func rearmPendingAudioReconcileAttempts(record *playback.AttemptRecordV3) {
+	if record == nil {
+		return
+	}
+	for i := range record.AudioReconcileLedger.Entries {
+		entry := record.AudioReconcileLedger.Entries[i]
+		if entry.Decision != playback.AudioReconcileInvalidated {
+			continue
+		}
+		rearmAudioReconcileAttempts(&entry)
+	}
 }
 
 // reconcileReplanRequestID mints a generation-aware identity for one
