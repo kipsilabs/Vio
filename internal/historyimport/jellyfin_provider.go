@@ -6,6 +6,8 @@ import (
 	"maps"
 	"slices"
 	"strings"
+
+	"github.com/Silo-Server/silo-server/internal/logredact"
 )
 
 type JellyfinProvider struct {
@@ -35,7 +37,9 @@ func (p *JellyfinProvider) Fetch(ctx context.Context) ([]Record, []string, error
 		if ctx.Err() != nil {
 			return nil, nil, err
 		}
-		slog.WarnContext(ctx, "jellyfin history import: resume positions unavailable", "component", "historyimport", "error", err)
+		// Mask credentials: the error can carry up to 2 KB of the response body.
+		slog.WarnContext(ctx, "jellyfin history import: resume positions unavailable", "component", "historyimport",
+			"error", logredact.SanitizeText(logredact.SanitizeURLError(err).Error()))
 		warnings = append(warnings, warnJellyfinResumeUnavailable)
 		resumable = nil
 	}
