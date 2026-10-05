@@ -700,12 +700,14 @@ func (h *PlaybackHandler) pendingAudioReconciliationReplan(record *playback.Atte
 	if entry == nil {
 		return
 	}
-	// A viewer who names an audio identity on this replan is making a choice,
-	// not answering the withdrawal. The correction replays a start-time
-	// language preference the viewer never re-picked, so an explicit selection
-	// supersedes it rather than being overwritten.
-	if req.SelectedTracks.Audio != nil {
-		slog.Debug("replan keeps the explicit audio choice over a pending correction",
+	// Presence is not intent. The web request builder echoes the plan's own
+	// audio identity on every replan (buildReplanRequestV3), so the answering
+	// request normally carries the pre-reorder selection even though the viewer
+	// chose nothing. Only a selection that names something OTHER than the
+	// withdrawn plan's audio is a fresh viewer choice, and it supersedes the
+	// automatic correction; an inherited echo must not suppress it.
+	if namesDifferentAudioIdentityV3(req.SelectedTracks.Audio, record.CurrentPlan) {
+		slog.Debug("replan keeps the viewer's audio choice over a pending correction",
 			"component", "api", "session", record.SessionID, "generation", entry.Generation)
 		return
 	}
@@ -719,6 +721,29 @@ func (h *PlaybackHandler) pendingAudioReconciliationReplan(record *playback.Atte
 	slog.Debug("replan consumes the pending default audio correction",
 		"component", "api", "session", record.SessionID,
 		"generation", entry.Generation, "audio_index", entry.AudioIndex)
+}
+
+// namesDifferentAudioIdentityV3 reports whether the replan carries an audio
+// identity the withdrawn plan did not select. The web request builder echoes
+// the current plan's audio on every replan, so a present identity usually means
+// "unchanged", not "chosen": only a genuinely different selection is a viewer
+// decision that must survive an automatic correction. A nil identity is
+// treated as inherited, because the correction fills it in either way.
+func namesDifferentAudioIdentityV3(identity *playback.TrackIdentityV3, plan playback.PlanV3) bool {
+	if identity == nil {
+		return false
+	}
+	committed := plan.SelectedTracks.Audio
+	if committed == nil {
+		return true
+	}
+	if identity.ID != committed.ID {
+		return true
+	}
+	if identity.Index == nil || committed.Index == nil {
+		return false
+	}
+	return *identity.Index != *committed.Index
 }
 
 // FindPendingAudioReconciliation returns the settled automatic correction a

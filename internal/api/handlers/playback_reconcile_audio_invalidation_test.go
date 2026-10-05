@@ -431,9 +431,66 @@ func TestRefusalDoesNotStrandTheSettledCorrection(t *testing.T) {
 	}
 }
 
-// A viewer who names an audio identity on the answering replan is making a
-// choice. The automatic correction replays start-time intent the viewer never
-// re-picked, so an explicit selection must supersede it.
+// The web request builder echoes the current plan's audio identity on every
+// replan (buildReplanRequestV3), so the answering request normally carries the
+// selection the withdrawn plan already had, even though the viewer chose
+// nothing. Treating presence as intent skipped reconciliation on exactly that
+// path and left the pre-reorder stream playing.
+//
+// Note the reorder case makes ID comparison a weak discriminator on its own:
+// the correction targets the same ordinal the withdrawn plan named, and the
+// identity string is derived from that ordinal, so the corrected and echoed
+// identities are byte-equal while naming different underlying streams. The
+// policy is therefore deliberately asymmetric — an identity the withdrawn plan
+// did not select is a viewer choice and wins; anything else (echo, or no
+// identity at all) is the reconciliation response, so the correction is
+// applied and marked automatic. The cost of being wrong in that direction is a
+// redundant viewer pick not being persisted, which is far smaller than writing
+// a server decision into a stored preference.
+func TestInheritedAudioEchoIsTreatedAsReconciliationResponse(t *testing.T) {
+	f := newInvalidationFixture(t, []string{playback.FeaturePlanInvalidatedV3}, 10)
+	after := f.reconcile(t)
+	entry := playback.FindAudioReconcileEntry(after.AudioReconcileLedger, reconcileGenerationV3(f.verified), f.session.ID)
+	if entry == nil || entry.Request == nil || entry.Request.SelectedTracks.Audio == nil {
+		t.Fatal("expected a settled correction carrying an audio identity")
+	}
+
+	// The real client shape: the builder echoes the plan's own audio.
+	echoed := *after.CurrentPlan.SelectedTracks.Audio
+	req := &playback.ReplanRequestV3{
+		ProtocolVersion: playback.ProtocolV3,
+		Operation:       playback.ReplanOperationTrackChangeV3,
+		FailedPlanID:    entry.PlanID,
+		SelectedTracks:  playback.SelectedTracksV3{Audio: &echoed},
+	}
+	f.handler.pendingAudioReconciliationReplan(after, req)
+
+	if req.SelectedTracks.Audio == nil {
+		t.Fatal("the correction was skipped on an inherited echo")
+	}
+	if !sameTrackIdentityV3(req.SelectedTracks.Audio, entry.Request.SelectedTracks.Audio) {
+		t.Fatalf("echoed identity was not replaced by the correction: got %+v, want %+v",
+			req.SelectedTracks.Audio, entry.Request.SelectedTracks.Audio)
+	}
+	if req.Automatic != playback.ReplanAutomaticV3 {
+		t.Fatalf("Automatic = %q, want %q: an echoed response is still a server correction and must not persist as a viewer preference",
+			req.Automatic, playback.ReplanAutomaticV3)
+	}
+
+	// No identity at all is the same case: the correction fills it in.
+	bare := &playback.ReplanRequestV3{
+		ProtocolVersion: playback.ProtocolV3,
+		Operation:       playback.ReplanOperationTrackChangeV3,
+		FailedPlanID:    entry.PlanID,
+	}
+	f.handler.pendingAudioReconciliationReplan(after, bare)
+	if bare.SelectedTracks.Audio == nil || bare.Automatic != playback.ReplanAutomaticV3 {
+		t.Fatal("a request with no audio identity must still receive the correction, marked automatic")
+	}
+}
+
+// A viewer who picks a different track while the withdrawal is in flight is
+// making a choice, and it supersedes the automatic correction.
 func TestExplicitAudioChoiceSupersedesPendingCorrection(t *testing.T) {
 	f := newInvalidationFixture(t, []string{playback.FeaturePlanInvalidatedV3}, 10)
 	after := f.reconcile(t)
@@ -442,30 +499,23 @@ func TestExplicitAudioChoiceSupersedesPendingCorrection(t *testing.T) {
 		t.Fatal("expected a settled correction carrying an audio identity")
 	}
 
-	explicit := 0
+	// Something the withdrawn plan did not select.
+	chosen := &playback.TrackIdentityV3{ID: playback.TrackIDV3(7, "audio", 99)}
 	req := &playback.ReplanRequestV3{
 		ProtocolVersion: playback.ProtocolV3,
 		Operation:       playback.ReplanOperationTrackChangeV3,
 		FailedPlanID:    entry.PlanID,
-		SelectedTracks: playback.SelectedTracksV3{
-			Audio: &playback.TrackIdentityV3{Index: &explicit},
-		},
+		SelectedTracks:  playback.SelectedTracksV3{Audio: chosen},
 	}
 	f.handler.pendingAudioReconciliationReplan(after, req)
-	if req.SelectedTracks.Audio == nil || req.SelectedTracks.Audio.Index == nil {
-		t.Fatal("the explicit choice was erased")
-	}
-	if *req.SelectedTracks.Audio.Index != explicit {
-		t.Fatalf("audio index = %d, want the viewer's %d", *req.SelectedTracks.Audio.Index, explicit)
+	if req.SelectedTracks.Audio == nil || req.SelectedTracks.Audio.ID != chosen.ID {
+		t.Fatalf("the viewer's choice was overwritten: got %+v", req.SelectedTracks.Audio)
 	}
 	if req.Automatic == playback.ReplanAutomaticV3 {
 		t.Fatal("a viewer's explicit change must not be marked as an automatic correction")
 	}
 }
 
-// A correction the server applies on the viewer's behalf is not a viewer
-// choice: the Automatic marker must be restored so preference persistence is
-// suppressed for it.
 func TestPendingCorrectionRestoresAutomaticProvenance(t *testing.T) {
 	f := newInvalidationFixture(t, []string{playback.FeaturePlanInvalidatedV3}, 10)
 	after := f.reconcile(t)
