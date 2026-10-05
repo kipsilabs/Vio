@@ -1246,6 +1246,14 @@ That split makes the ordering load-bearing:
   emitted. A duplicate probe write, a second replica, or a retried heartbeat
   finds the generation settled and replays the stored decision instead of
   emitting a second event for one correction.
+- The withdrawal is durable and retried until a capable client acknowledges it:
+  the entry's delivery state (`announced_at`) is separate from its decision, so
+  a settled but un-delivered invalidation is re-attempted on a later
+  heartbeat/attach/probe pass while the session still negotiates both
+  capabilities. The retry is bounded (an in-process window, comfortably larger
+  than the probe budget); after the bound the correction still lands on the
+  next start or reconnect, which plans against the already-corrected
+  inventory. Once `announced_at` is set, the generation emits nothing again.
 - The replan-request id is derived from the plan and the target audio index,
   both immutable, while the body also embeds the live position, which is not.
   A replay of the stored decision therefore carries the same id **and** the same

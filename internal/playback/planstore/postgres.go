@@ -346,10 +346,12 @@ func (s *Postgres) RecordAudioReconciliation(ctx context.Context, sessionID stri
 	}
 	base.Revision = revision
 	merged := playback.AppendAudioReconcileEntry(base, entry)
-	if len(merged.Entries) == len(base.Entries) {
-		// The same decision is already recorded: report the stored ledger
-		// without taking the write lock's revision. A retry must not look
-		// like a new decision to a caller reading the revision it handed back.
+	if len(merged.Entries) == len(base.Entries) &&
+		playback.AudioReconcileLedgerEntriesEqual(merged.Entries, base.Entries) {
+		// The same decision is already recorded with the same delivery
+		// state: report the stored ledger without taking the write lock's
+		// revision. A retry must not look like a new decision to a caller
+		// reading the revision it handed back.
 		if err := tx.Commit(ctx); err != nil {
 			return playback.AudioReconcileLedgerV3{}, 0, err
 		}

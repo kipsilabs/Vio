@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -296,6 +297,15 @@ type AudioReconcileEntryV3 struct {
 	// it against this field is what makes the replan authoritatively a
 	// reconciliation response rather than an identity heuristic.
 	Reason string `json:"reason,omitempty"`
+	// AnnouncedAt is set once the withdrawal for this entry was accepted by
+	// the realtime hub for a client that negotiated both
+	// plan_invalidated_v1 and default_audio_reconcile_response_v1. It is
+	// the delivery state and is separate from the decision: an invalidated
+	// entry with a nil AnnouncedAt was never delivered to a capable
+	// client, so the reconcile loop retries it on a later heartbeat
+	// (bounded by audioReconcileAnnounceWindow). An invalidated entry
+	// with AnnouncedAt set is never re-emitted.
+	AnnouncedAt *time.Time `json:"announced_at,omitempty"`
 }
 
 // RecoveryExclusionV3 is one confirmed candidate failure. The tuple is scoped
@@ -459,18 +469,50 @@ func FindAudioReconcileEntry(ledger AudioReconcileLedgerV3, generation, sessionI
 // already settled as an invalidation is a distinct entry: it carries the
 // rejected canonical digest next to the stored one, which is what makes a
 // diverged re-evaluation auditable instead of silently dropped.
+//
+// The one in-place mutation on an otherwise append-only chain is the
+// delivery-state enrichment of a settled invalidation: recording the same
+// decision with a nil AnnouncedAt keeps the stored entry, but recording it
+// with AnnouncedAt set adopts the timestamp onto the stored entry (the
+// decision semantics — generation, session, decision, digest — are unchanged).
 func AppendAudioReconcileEntry(base AudioReconcileLedgerV3, entry AudioReconcileEntryV3) AudioReconcileLedgerV3 {
 	for _, existing := range base.Entries {
 		if existing.Generation == entry.Generation &&
 			existing.SessionID == entry.SessionID &&
 			existing.Decision == entry.Decision &&
 			existing.RequestDigest == entry.RequestDigest {
-			return base
+			if entry.AnnouncedAt == nil || (existing.AnnouncedAt != nil && !existing.AnnouncedAt.IsZero()) {
+				return base
+			}
+			// The same decision was recorded but its delivery state advanced
+			// (AnnouncedAt nil -> set): enrich the stored entry in place rather
+			// than appending a duplicate. This keeps one entry per settled
+			// decision while still persisting the acknowledgement.
+			merged := base
+			merged.Entries = append([]AudioReconcileEntryV3(nil), base.Entries...)
+			for i := range merged.Entries {
+				if merged.Entries[i].Generation == entry.Generation &&
+					merged.Entries[i].SessionID == entry.SessionID &&
+					merged.Entries[i].Decision == entry.Decision &&
+					merged.Entries[i].RequestDigest == entry.RequestDigest {
+					merged.Entries[i].AnnouncedAt = entry.AnnouncedAt
+				}
+			}
+			return merged
 		}
 	}
 	merged := base
 	merged.Entries = append(append([]AudioReconcileEntryV3(nil), base.Entries...), entry)
 	return merged
+}
+
+// AudioReconcileLedgerEntriesEqual reports whether two entry chains carry the
+// same entries in the same order, including each entry's AnnouncedAt delivery
+// state. The stores use it to tell a true no-op (same decision, same delivery
+// state) from an in-place delivery-state enrichment of a settled entry, which
+// must still be written and bump the ledger revision.
+func AudioReconcileLedgerEntriesEqual(a, b []AudioReconcileEntryV3) bool {
+	return reflect.DeepEqual(a, b)
 }
 
 // UnionRecoveryExclusions appends the incoming exclusions to a copy of base,
@@ -841,7 +883,8 @@ func (s *MemoryPlanStoreV3) RecordAudioReconciliation(_ context.Context, session
 		return AudioReconcileLedgerV3{}, record.AudioReconcileLedger.Revision, ErrRecoveryRevisionConflictV3
 	}
 	merged := AppendAudioReconcileEntry(record.AudioReconcileLedger, entry)
-	if len(merged.Entries) == len(record.AudioReconcileLedger.Entries) {
+	if len(merged.Entries) == len(record.AudioReconcileLedger.Entries) &&
+		AudioReconcileLedgerEntriesEqual(merged.Entries, record.AudioReconcileLedger.Entries) {
 		return record.AudioReconcileLedger, record.AudioReconcileLedger.Revision, nil
 	}
 	merged.Revision = record.AudioReconcileLedger.Revision + 1

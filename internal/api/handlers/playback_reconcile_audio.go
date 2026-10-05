@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -197,12 +198,26 @@ func (h *PlaybackHandler) reconcileAutoAudioSelection(ctx context.Context, sessi
 	}
 	if entry := playback.FindAudioReconcileEntry(record.AudioReconcileLedger, generation, live.ID); entry != nil {
 		// The attempt row already carries the ledger, so this needs no second
-		// store read. A settled generation is never re-evaluated and never
-		// re-announced: a retried probe write, a second replica or a retried
-		// heartbeat replays the stored decision instead of emitting a second
-		// event for one correction. A delivery that failed had no client to
-		// receive it, and that client's next start or reconnect plans against
-		// the corrected inventory anyway.
+		// store read. A settled + announced generation is never re-evaluated
+		// and never re-announced: a retried probe write, a second replica or
+		// a retried heartbeat replays the stored decision instead of emitting
+		// a second event for one correction.
+		if entry.Decision == playback.AudioReconcileInvalidated &&
+			entry.AnnouncedAt == nil &&
+			h.sessionNegotiatedPlanInvalidation(ctx, live.ID) &&
+			h.sessionNegotiatedDefaultAudioReconcileResponse(ctx, live.ID) {
+			// Settled but never delivered: the original announce missed (no
+			// client attached yet, a replica without the session owner, a
+			// transient hub error). Re-attempt on this heartbeat/attach/probe
+			// pass so a client that connects AFTER the probe settled still
+			// receives the withdrawal. Bounded: retry only while the settled
+			// decision is still inside audioReconcileAnnounceWindow; after the
+			// bound the correction still lands on the next start/reconnect,
+			// which plans against the corrected inventory anyway.
+			if withinAudioReconcileAnnounceWindow(entry, time.Now()) {
+				h.announceAudioReconcileInvalidation(ctx, live, record, *entry)
+			}
+		}
 		return
 	}
 	if strings.TrimSpace(record.SelectionOrigin) != "" && strings.TrimSpace(record.SelectionOrigin) != SelectionOriginAuto {
@@ -306,6 +321,38 @@ func (h *PlaybackHandler) settleAudioReconcileInvalidation(ctx context.Context, 
 		return
 	}
 	h.announceAudioReconcileInvalidation(ctx, live, record, stored)
+}
+
+// audioReconcileAnnounceWindow bounds how long the evaluation loop re-attempts
+// delivering a settled but un-announced invalidation.
+const audioReconcileAnnounceWindow = 2 * time.Minute
+
+// withinAudioReconcileAnnounceWindow reports whether the settled entry is
+// still inside the retry window. The window is tracked in-process, keyed by
+// (generation, session), because the settled entry carries no settled-at
+// timestamp and the generation is a content hash with no wall clock. That is
+// a deliberate bound: a short attach gap still retries, a permanently
+// undeliverable session stops spinning, and the correction still lands on
+// the next start regardless.
+
+var (
+	audioReconcileFirstSeen   = map[string]time.Time{}
+	audioReconcileFirstSeenMu sync.Mutex
+)
+
+func withinAudioReconcileAnnounceWindow(entry *playback.AudioReconcileEntryV3, now time.Time) bool {
+	if entry == nil {
+		return false
+	}
+	key := entry.Generation + "|" + entry.SessionID
+	audioReconcileFirstSeenMu.Lock()
+	defer audioReconcileFirstSeenMu.Unlock()
+	first, ok := audioReconcileFirstSeen[key]
+	if !ok {
+		first = now
+		audioReconcileFirstSeen[key] = now
+	}
+	return now.Sub(first) <= audioReconcileAnnounceWindow
 }
 
 // reconcileProbeBudgetV3 bounds one reconcile evaluation: catalog read,
@@ -875,7 +922,9 @@ func (h *PlaybackHandler) announceAudioReconcileInvalidation(ctx context.Context
 		// latter treats every withdrawal as a route failure and folds the
 		// invalidated key into attempted_plan_keys, excluding a healthy
 		// route from its own replacement. Such a client gets no withdrawal;
-		// the correction lands on its next start/reconnect instead.
+		// the correction lands on its next start/reconnect instead. Leave
+		// AnnouncedAt nil so a later pass with a capable client can still
+		// deliver it.
 		slog.DebugContext(ctx, "default audio correction recorded without a withdrawal",
 			"component", "api", "session", live.ID, "generation", stored.Generation,
 			"audio_index", *stored.AudioIndex)
@@ -904,10 +953,70 @@ func (h *PlaybackHandler) announceAudioReconcileInvalidation(ctx context.Context
 			"component", "api", "session", live.ID, "plan_id", planID, "error", err)
 		return
 	}
+	// The hub accepted the command for a capable client: mark the entry
+	// announced so the retry loop does not re-emit it, and persist that
+	// delivery state through the revision-checked ledger writer. Dedup on
+	// (generation, session, decision, digest) means this is an in-place
+	// enrichment of the settled entry, not a new decision.
+	announcedAt := time.Now().UTC()
+	h.recordAudioReconcileAnnouncement(ctx, live.ID, stored, &announcedAt)
 	slog.InfoContext(ctx, "default audio reconciled to the verified inventory",
 		"component", "api", "session", live.ID, "plan_id", planID,
 		"generation", stored.Generation, "audio_index", *stored.AudioIndex,
 		"reason", AudioReconciliationReplanReason)
+}
+
+// recordAudioReconcileAnnouncement persists the AnnouncedAt stamp on a settled
+// entry through the same revision-checked ledger writer the decision used. A
+// CAS conflict (another writer advanced the ledger between the settle read
+// and this write) is retried a bounded number of times; the dedup key keeps
+// the entry a single decision, so the retry only carries the timestamp
+// forward. A store without the ledger capability keeps the entry un-announced
+// and the retry loop re-attempts on the next pass — delivery state is never
+// silently dropped.
+func (h *PlaybackHandler) recordAudioReconcileAnnouncement(ctx context.Context, sessionID string, stored playback.AudioReconcileEntryV3, announcedAt *time.Time) {
+	if h == nil || h.PlanStoreV3 == nil {
+		return
+	}
+	store, ok := h.PlanStoreV3.(playback.AudioReconcileStoreV3)
+	if !ok {
+		return
+	}
+	if announcedAt == nil || announcedAt.IsZero() {
+		now := time.Now().UTC()
+		announcedAt = &now
+	}
+	for attempt := 0; attempt < reconcileLedgerMaxAttempts; attempt++ {
+		ledger, revision, err := store.GetAudioReconcileLedger(ctx, sessionID)
+		if err != nil {
+			return
+		}
+		if existing := playback.FindAudioReconcileEntry(ledger, stored.Generation, sessionID); existing != nil &&
+			existing.AnnouncedAt != nil && !existing.AnnouncedAt.IsZero() {
+			// Another writer (or an earlier retry) already recorded the
+			// acknowledgement. The no-double-correction invariant is
+			// satisfied; nothing further to persist.
+			return
+		}
+		stamped := stored
+		if existing := playback.FindAudioReconcileEntry(ledger, stored.Generation, sessionID); existing != nil {
+			// Carry the stored entry so refusal/digest fields stay authoritative;
+			// only the delivery stamp moves forward.
+			stamped = *existing
+		}
+		stamped.AnnouncedAt = announcedAt
+		_, _, writeErr := store.RecordAudioReconciliation(ctx, sessionID, revision, stamped)
+		switch {
+		case writeErr == nil:
+			return
+		case errors.Is(writeErr, playback.ErrRecoveryRevisionConflictV3):
+			// Re-read and retry the enrichment against the committed ledger.
+		default:
+			slog.WarnContext(ctx, "audio reconciliation announcement write failed",
+				"component", "api", "session", sessionID, "generation", stored.Generation, "error", writeErr)
+			return
+		}
+	}
 }
 
 // verifyExplicitAudioSelection checks that an explicit viewer selection still

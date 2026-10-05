@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -241,6 +242,105 @@ func TestReconcileAudioReplanAdoptsThroughPlanInvalidated(t *testing.T) {
 	if applied.Automatic != playback.ReplanAutomaticV3 {
 		t.Fatalf("Automatic = %q, want the restored %q so the correction is not stored as a viewer preference",
 			applied.Automatic, playback.ReplanAutomaticV3)
+	}
+}
+
+// failingSendConn is a RealtimeConnection whose WriteJSON fails, so the hub
+// send reports an error and announceAudioReconcileInvalidation leaves
+// AnnouncedAt nil. It models a client that connected but whose lane the hub
+// has not accepted yet, or a replica without the session owner.
+type failingSendConn struct{}
+
+func (failingSendConn) WriteJSON(_ any) error { return errors.New("client not attached yet") }
+
+// TestReconcileAudioWithdrawalRetriedUntilCapableClientAcks covers the
+// durable-delivery fix: a withdrawal whose first announce failed is retried
+// on a later reconcile pass once a healthy hub lane exists, the entry then
+// carries AnnouncedAt, and a third pass emits nothing.
+func TestReconcileAudioWithdrawalRetriedUntilCapableClientAcks(t *testing.T) {
+	f := newInvalidationFixture(t, []string{playback.FeaturePlanInvalidatedV3, playback.FeatureDefaultAudioReconcileResponseV3}, 12)
+
+	// First pass with a failing/nil hub send: the decision settles but
+	// AnnouncedAt stays nil.
+	f.handler.RealtimeHub = playback.NewRealtimeHub()
+	failingRegistration := f.handler.RealtimeHub.Register(f.session.ID, failingSendConn{})
+	t.Cleanup(func() { f.handler.RealtimeHub.Unregister(failingRegistration) })
+
+	after := f.reconcile(t)
+	entry := playback.FindAudioReconcileEntry(after.AudioReconcileLedger, reconcileGenerationV3(f.verified), f.session.ID)
+	if entry == nil {
+		t.Fatal("the first evaluation must settle the generation")
+	}
+	if entry.AnnouncedAt != nil {
+		t.Fatalf("AnnouncedAt must stay nil when the hub send failed, got %v", entry.AnnouncedAt)
+	}
+	if got := len(f.conn.commands()); got != 0 {
+		t.Fatalf("failing hub must deliver no plan_invalidated, got %d", got)
+	}
+
+	// Swap in a healthy lane; a later reconcile pass must retry the
+	// withdrawal and stamp AnnouncedAt.
+	f.handler.RealtimeHub.Unregister(failingRegistration)
+	healthyRegistration := f.handler.RealtimeHub.Register(f.session.ID, f.conn)
+	t.Cleanup(func() { f.handler.RealtimeHub.Unregister(healthyRegistration) })
+
+	afterRetry := f.reconcile(t)
+	retryEntry := playback.FindAudioReconcileEntry(afterRetry.AudioReconcileLedger, entry.Generation, f.session.ID)
+	if retryEntry == nil {
+		t.Fatal("the settled decision must survive the retry")
+	}
+	if retryEntry.AnnouncedAt == nil {
+		t.Fatal("AnnouncedAt must be set after a successful announce")
+	}
+	if got := len(f.conn.commands()); got != 1 {
+		t.Fatalf("a healthy hub must receive exactly one plan_invalidated on the retry, got %d", got)
+	}
+
+	// A third pass on the announced entry must emit nothing.
+	f.reconcile(t)
+	if got := len(f.conn.commands()); got != 1 {
+		t.Fatalf("an announced entry must never re-emit, got %d pushes", got)
+	}
+}
+
+// TestReconcileAudioAnnouncedOnceStaysSilent covers the no-double-correction
+// invariant from the other side: a settled+announced entry never re-emits on
+// a subsequent heartbeat.
+func TestReconcileAudioAnnouncedOnceStaysSilent(t *testing.T) {
+	f := newInvalidationFixture(t, []string{playback.FeaturePlanInvalidatedV3, playback.FeatureDefaultAudioReconcileResponseV3}, 12)
+
+	after := f.reconcile(t)
+	entry := playback.FindAudioReconcileEntry(after.AudioReconcileLedger, reconcileGenerationV3(f.verified), f.session.ID)
+	if entry == nil || entry.AnnouncedAt == nil {
+		t.Fatal("the first evaluation must settle and announce the generation")
+	}
+	if got := len(f.conn.commands()); got != 1 {
+		t.Fatalf("the first evaluation must emit exactly one push, got %d", got)
+	}
+
+	// Second heartbeat on a settled+announced generation: silent.
+	f.handler.reconcilePendingAudioStartup(context.Background(), f.session.ID)
+	if got := len(f.conn.commands()); got != 1 {
+		t.Fatalf("an announced entry must never re-emit on a heartbeat, got %d pushes", got)
+	}
+}
+
+// TestReconcileAudioNoAnnounceWithoutResponseCapability pins the gate: a
+// settled decision for a client that negotiated plan_invalidated_v1 but NOT
+// default_audio_reconcile_response_v1 is never announced.
+func TestReconcileAudioNoAnnounceWithoutResponseCapability(t *testing.T) {
+	f := newInvalidationFixture(t, []string{playback.FeaturePlanInvalidatedV3}, 12)
+
+	after := f.reconcile(t)
+	entry := playback.FindAudioReconcileEntry(after.AudioReconcileLedger, reconcileGenerationV3(f.verified), f.session.ID)
+	if entry == nil {
+		t.Fatal("the generation must settle even without the capability")
+	}
+	if entry.AnnouncedAt != nil {
+		t.Fatalf("AnnouncedAt must stay nil when the response capability was not negotiated, got %v", entry.AnnouncedAt)
+	}
+	if got := len(f.conn.commands()); got != 0 {
+		t.Fatalf("a client without the response capability must receive no plan_invalidated, got %d", got)
 	}
 }
 
@@ -530,6 +630,7 @@ func TestPendingCorrectionRestoresAutomaticProvenance(t *testing.T) {
 		Operation:       playback.ReplanOperationTrackChangeV3,
 		FailedPlanID:    entry.PlanID,
 	}
+	req.AnswersPlanInvalidation = playback.PlanInvalidatedDefaultAudioReconciliation
 	stripClientSuppliedAutomatic(req)
 	if req.Automatic != "" {
 		t.Fatalf("inbound marker survived: %q", req.Automatic)
