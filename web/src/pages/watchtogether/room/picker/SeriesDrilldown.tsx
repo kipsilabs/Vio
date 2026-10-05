@@ -148,12 +148,17 @@ export function SeriesDrilldown({
   const seasons = useSeasons(series.content_id);
   const seasonList = useMemo(() => seasons.data?.seasons ?? [], [seasons.data?.seasons]);
   const [season, setSeason] = useState<number | null>(initialSeason ?? null);
+  // Without a season from the shelf, open where the viewer left off, as the
+  // series page does: the season whose own play target is the series' target.
+  const playContentId = item?.play_content_id;
   useEffect(() => {
-    if (season === null && seasonList.length > 0) {
-      const first = seasonList.find((s) => !s.is_specials) ?? seasonList[0]!;
-      setSeason(first.season_number);
-    }
-  }, [season, seasonList]);
+    if (season !== null || seasonList.length === 0 || detail.isLoading) return;
+    const resume = playContentId
+      ? seasonList.find((s) => s.play_content_id === playContentId)
+      : undefined;
+    const first = resume ?? seasonList.find((s) => !s.is_specials) ?? seasonList[0]!;
+    setSeason(first.season_number);
+  }, [season, seasonList, detail.isLoading, playContentId]);
   const episodesQuery = useSeasonEpisodes(
     season === null ? undefined : series.content_id,
     season ?? -1,

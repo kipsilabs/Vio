@@ -90,6 +90,8 @@ vi.mock("@/hooks/queries/catalogRead", () => ({
           poster_url: "",
           poster_thumbhash: "",
           backdrop_url: "",
+          // The series' next-up episode, in its second season.
+          play_content_id: id === "severance" ? "sev-s2e4" : undefined,
         }
       : undefined,
   }),
@@ -118,10 +120,26 @@ const episodes: EpisodeListItem[] = [1, 2, 3, 4].map(
     ],
   }),
 );
+// Stable like a query result, so an empty season does not re-report its ids
+// on every render.
+const noEpisodes = { episodes: [] as EpisodeListItem[] };
 vi.mock("@/hooks/queries/episodes", () => ({
   useSeasons: () => ({
     data: {
       seasons: [
+        {
+          content_id: "s1",
+          season_number: 1,
+          is_specials: false,
+          title: "S1",
+          overview: "",
+          air_date: null,
+          episode_count: 4,
+          poster_url: "",
+          poster_thumbhash: "",
+          play_content_id: "sev-s1e1",
+          user_data: { watched_count: 4, unplayed_count: 0, in_progress_count: 0 },
+        },
         {
           content_id: "s2",
           season_number: 2,
@@ -132,13 +150,14 @@ vi.mock("@/hooks/queries/episodes", () => ({
           episode_count: 4,
           poster_url: "",
           poster_thumbhash: "",
+          play_content_id: "sev-s2e4",
           user_data: { watched_count: 3, unplayed_count: 1, in_progress_count: 1 },
         },
       ],
     },
   }),
   useSeasonEpisodes: (id?: string, season?: number) => ({
-    data: id && season === 2 ? { episodes } : { episodes: [] },
+    data: id && season === 2 ? { episodes } : noEpisodes,
     isLoading: false,
   }),
 }));
@@ -415,6 +434,12 @@ describe("CandidateStage", () => {
         subtitle: "Severance · S2 E4",
       }),
     );
+  });
+
+  it("opens a series picked outside Continue Together on the viewer's next-up season", async () => {
+    renderCandidate({ card: { content_id: "severance", type: "series", title: "Severance" } });
+    await screen.findByText("Episode 4");
+    expect(screen.getByRole("button", { name: /Season 2/, pressed: true })).toBeInTheDocument();
   });
 
   it("dismisses on Escape", () => {
