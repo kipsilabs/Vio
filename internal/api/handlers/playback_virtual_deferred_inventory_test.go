@@ -37,7 +37,7 @@ func (c *deferredInventoryPush) WriteJSON(v any) error {
 	}
 	var payload playback.InventoryUpdatedPayload
 	if err := json.Unmarshal(event.Payload, &payload); err != nil {
-		return nil
+		return err
 	}
 	select {
 	case c.ch <- deferredInventoryEvent{payload: payload}:
