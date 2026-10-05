@@ -95,7 +95,14 @@ import { ChoiceCard, StepTrail } from "./ChoiceCard";
 import InlineConnectionPicker, { type ConnectionOption } from "./InlineConnectionPicker";
 import { sourceTargets } from "./sourceTargets";
 import { WebhookInstructions, WebhookMappingEditor } from "./WebhookSetupStep";
-import { hasUsableMapping, seedMappings, usableMappings, type MappingDraft } from "./webhookSetup";
+import {
+  hasUsableMapping,
+  seedMappings,
+  settingsPathFor,
+  triggersFor,
+  usableMappings,
+  type MappingDraft,
+} from "./webhookSetup";
 import {
   connectionIsMandatory,
   parseConfigValues,
@@ -705,8 +712,11 @@ export function WebhookEndpointSection({
               </Button>
             </div>
             <p className="text-muted-foreground text-xs">
-              Paste into Sonarr/Radarr → Settings → Connect → Webhook (On Import, On Rename, On File
-              Delete).
+              Paste into {settingsPathFor(provider)} (
+              {triggersFor(provider)
+                .map((trigger) => trigger.label)
+                .join(", ")}
+              ).
             </p>
           </>
         ) : (
@@ -1858,7 +1868,9 @@ export default function SourcesPanel() {
     return <p className="text-muted-foreground py-4 text-sm">Loading sources…</p>;
   }
 
-  if (sources.isError) {
+  // A failed refetch keeps the last list on screen. Replacing the panel with
+  // the error would unmount the add dialog and lose its "Connect it" step.
+  if (sources.isError && !sources.data) {
     return (
       <p className="text-destructive py-4 text-sm">
         Failed to load scan sources. Please reload the page.
@@ -1867,54 +1879,33 @@ export default function SourcesPanel() {
   }
 
   const list = sources.data ?? [];
+  // Another admin can delete the source while its confirmation is open.
+  const deleteOpen =
+    deleteTarget !== null && list.some((source) => source.id === deleteTarget.source.id);
 
-  if (list.length === 0) {
-    return (
-      <div className="space-y-4">
-        {header}
+  // The add dialog stays at one position in the tree whether or not sources
+  // exist. Creating the first source switches to the list; if the dialog moved
+  // with it, React would remount it and drop the "Connect it" step.
+  return (
+    <div className="space-y-4">
+      {header}
+
+      {sources.isError && (
+        <p className="text-destructive text-sm">
+          Could not refresh scan sources. Showing the last loaded list.
+        </p>
+      )}
+
+      {list.length === 0 ? (
         <div className="rounded-lg border border-dashed p-8 text-center">
           <p className="text-muted-foreground text-sm">
             No scan sources yet. Click <span className="font-medium">Add source</span> to create one
             from an installed scan-source plugin.
           </p>
         </div>
-        {addDialog}
-      </div>
-    );
-  }
-
-  return (
-    <div className="space-y-4">
-      {header}
-
-      <div className="space-y-3 lg:hidden">
-        {list.map((source) => (
-          <SourceRow
-            key={source.id}
-            source={source}
-            descriptor={descriptorForSource(source)}
-            connectionOptions={connectionOptions}
-            pluginDisplayNames={pluginDisplayNames}
-            globalPollInterval={globalPollInterval}
-            onDelete={requestDelete}
-            layout="card"
-          />
-        ))}
-      </div>
-
-      <div className="hidden rounded-lg border lg:block">
-        <Table>
-          <TableHeader>
-            <TableRow>
-              <TableHead>Source</TableHead>
-              <TableHead>Connection</TableHead>
-              <TableHead>Interval &amp; settings</TableHead>
-              <TableHead>Enabled</TableHead>
-              <TableHead>Last run</TableHead>
-              <TableHead className="w-0" />
-            </TableRow>
-          </TableHeader>
-          <TableBody>
+      ) : (
+        <>
+          <div className="space-y-3 lg:hidden">
             {list.map((source) => (
               <SourceRow
                 key={source.id}
@@ -1924,18 +1915,46 @@ export default function SourcesPanel() {
                 pluginDisplayNames={pluginDisplayNames}
                 globalPollInterval={globalPollInterval}
                 onDelete={requestDelete}
-                layout="table"
+                layout="card"
               />
             ))}
-          </TableBody>
-        </Table>
-      </div>
+          </div>
+
+          <div className="hidden rounded-lg border lg:block">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Source</TableHead>
+                  <TableHead>Connection</TableHead>
+                  <TableHead>Interval &amp; settings</TableHead>
+                  <TableHead>Enabled</TableHead>
+                  <TableHead>Last run</TableHead>
+                  <TableHead className="w-0" />
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {list.map((source) => (
+                  <SourceRow
+                    key={source.id}
+                    source={source}
+                    descriptor={descriptorForSource(source)}
+                    connectionOptions={connectionOptions}
+                    pluginDisplayNames={pluginDisplayNames}
+                    globalPollInterval={globalPollInterval}
+                    onDelete={requestDelete}
+                    layout="table"
+                  />
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+        </>
+      )}
+
+      {addDialog}
 
       {/* Delete confirmation */}
-      <AlertDialog
-        open={deleteTarget !== null}
-        onOpenChange={(open) => !open && setDeleteTarget(null)}
-      >
+      <AlertDialog open={deleteOpen} onOpenChange={(open) => !open && setDeleteTarget(null)}>
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>Delete source?</AlertDialogTitle>
@@ -1963,8 +1982,6 @@ export default function SourcesPanel() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
-
-      {addDialog}
     </div>
   );
 }
