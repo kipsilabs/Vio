@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/models"
+	chimw "github.com/go-chi/chi/v5/middleware"
 )
 
 // virtualTraceFieldsToMap converts the stable []any key/value shape returned by
@@ -131,10 +132,17 @@ func TestResolveVirtualTimingReportsRanStages(t *testing.T) {
 
 	entry := captureVirtualResolveTiming(t, func() {
 		req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil)
+		// The trace must carry the start's own edge id so it joins to its
+		// start timing and its provider fetch without timestamp forensics.
+		req = req.WithContext(context.WithValue(req.Context(), chimw.RequestIDKey, "trace-start-req-1"))
 		if _, err := h.resolveVirtualPlaybackSource(req, file, "profile-1", true, nil, "", "", 0, false); err != nil {
 			t.Fatalf("resolveVirtualPlaybackSource error: %v", err)
 		}
 	})
+
+	if entry["request_id"] != "trace-start-req-1" {
+		t.Fatalf("request_id = %#v, want the start request's edge id", entry["request_id"])
+	}
 
 	for _, stage := range []string{"list", "resolve"} {
 		if entry[stage+"_ran"] != true {
