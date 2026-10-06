@@ -1395,7 +1395,10 @@ func (f *Fetcher) fetchUserCollection(ctx context.Context, s ResolvedSection, li
 			return f.fetchFiltered(ctx, synth, libraryID, libraryIDs, filter)
 		}
 
-		qd = applySectionLibraryScopeToQuery(qd.Normalize(), libraryID, libraryIDs)
+		qd, ok := applySectionLibraryScopeToQuery(qd.Normalize(), libraryID, libraryIDs)
+		if !ok {
+			return []*models.MediaItem{}, 0, nil
+		}
 		qd = catalog.ApplySmartCollectionItemLimit(qd)
 		limit := catalog.DefaultSmartCollectionItemLimit
 		if qd.Limit != nil && *qd.Limit > 0 {
@@ -2012,15 +2015,9 @@ func (f *Fetcher) fetchEditorialSpotlightWithTitle(ctx context.Context, s Resolv
 		return nil, 0, "", fmt.Errorf("editorial_spotlight build query: %w", err)
 	}
 
-	switch {
-	case libraryID != nil:
-		def.LibraryIDs = []int{*libraryID}
-	case libraryIDs != nil:
-		if len(def.LibraryIDs) == 0 {
-			def.LibraryIDs = append([]int(nil), libraryIDs...)
-		} else {
-			def.LibraryIDs = intersectLibraryIDs(def.LibraryIDs, libraryIDs)
-		}
+	def, ok := applySectionLibraryScopeToQuery(def, libraryID, libraryIDs)
+	if !ok {
+		return []*models.MediaItem{}, 0, "", nil
 	}
 
 	limit := s.ItemLimit
@@ -2542,7 +2539,10 @@ func (f *Fetcher) fetchFiltered(ctx context.Context, s ResolvedSection, libraryI
 		return nil, 0, fmt.Errorf("parsing query definition: %w", err)
 	}
 
-	def = applySectionLibraryScopeToQuery(def, libraryID, libraryIDs)
+	def, ok := applySectionLibraryScopeToQuery(def, libraryID, libraryIDs)
+	if !ok {
+		return []*models.MediaItem{}, 0, nil
+	}
 
 	if s.ItemLimit > 0 {
 		limit := s.ItemLimit
@@ -2563,18 +2563,28 @@ func (f *Fetcher) fetchFiltered(ctx context.Context, s ResolvedSection, libraryI
 	return items, total, nil
 }
 
-func applySectionLibraryScopeToQuery(def catalog.QueryDefinition, libraryID *int, libraryIDs []int) catalog.QueryDefinition {
+// applySectionLibraryScopeToQuery scopes a section's query to the fetch's
+// libraries: a pinned libraryID replaces the query's own libraries, and
+// libraryIDs limits them. It reports false when the query names libraries
+// and none of them is in libraryIDs; the section must then return nothing.
+// Clearing the query's libraries instead would read as "every library" and
+// fill the section from libraries it was never scoped to.
+func applySectionLibraryScopeToQuery(def catalog.QueryDefinition, libraryID *int, libraryIDs []int) (catalog.QueryDefinition, bool) {
 	switch {
 	case libraryID != nil:
 		def.LibraryIDs = []int{*libraryID}
 	case libraryIDs != nil:
 		if len(def.LibraryIDs) == 0 {
 			def.LibraryIDs = append([]int(nil), libraryIDs...)
-		} else {
-			def.LibraryIDs = intersectLibraryIDs(def.LibraryIDs, libraryIDs)
+			break
 		}
+		scoped := intersectLibraryIDs(def.LibraryIDs, libraryIDs)
+		if len(scoped) == 0 {
+			return def, false
+		}
+		def.LibraryIDs = scoped
 	}
-	return def
+	return def, true
 }
 
 func buildRandomQuery(s ResolvedSection, libraryID *int, libraryIDs []int, filter catalog.AccessFilter) (string, []any, int) {
@@ -3536,15 +3546,9 @@ func (f *Fetcher) fetchSeasonalThemed(ctx context.Context, s ResolvedSection, li
 	}
 
 	// Apply library scope the same way fetchFiltered / fetchEditorialSpotlight do.
-	switch {
-	case libraryID != nil:
-		def.LibraryIDs = []int{*libraryID}
-	case libraryIDs != nil:
-		if len(def.LibraryIDs) == 0 {
-			def.LibraryIDs = append([]int(nil), libraryIDs...)
-		} else {
-			def.LibraryIDs = intersectLibraryIDs(def.LibraryIDs, libraryIDs)
-		}
+	def, ok := applySectionLibraryScopeToQuery(def, libraryID, libraryIDs)
+	if !ok {
+		return []*models.MediaItem{}, 0, nil
 	}
 
 	limit := s.ItemLimit
@@ -3708,15 +3712,9 @@ func (f *Fetcher) fetchMoodCollection(ctx context.Context, s ResolvedSection, li
 		},
 	}
 
-	switch {
-	case libraryID != nil:
-		def.LibraryIDs = []int{*libraryID}
-	case libraryIDs != nil:
-		if len(def.LibraryIDs) == 0 {
-			def.LibraryIDs = append([]int(nil), libraryIDs...)
-		} else {
-			def.LibraryIDs = intersectLibraryIDs(def.LibraryIDs, libraryIDs)
-		}
+	def, ok = applySectionLibraryScopeToQuery(def, libraryID, libraryIDs)
+	if !ok {
+		return []*models.MediaItem{}, 0, nil
 	}
 
 	limit := s.ItemLimit
