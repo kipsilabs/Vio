@@ -326,7 +326,7 @@ func (s *Postgres) RecordAudioReconciliation(ctx context.Context, sessionID stri
 	var ledgerJSON []byte
 	var revision int64
 	err = tx.QueryRow(ctx, `
-		SELECT audio_reconcile_ledger, (audio_reconcile_ledger->>'revision')::bigint FROM playback_v3_attempts
+		SELECT audio_reconcile_ledger, COALESCE((audio_reconcile_ledger->>'revision')::bigint, 0) FROM playback_v3_attempts
 		WHERE session_id = $1::uuid AND expires_at > NOW()
 		FOR UPDATE`, sessionID).Scan(&ledgerJSON, &revision)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -382,7 +382,7 @@ func (s *Postgres) GetAudioReconcileLedger(ctx context.Context, sessionID string
 	var ledgerJSON []byte
 	var revision int64
 	err := s.db.QueryRow(ctx, `
-		SELECT audio_reconcile_ledger, (audio_reconcile_ledger->>'revision')::bigint FROM playback_v3_attempts
+		SELECT audio_reconcile_ledger, COALESCE((audio_reconcile_ledger->>'revision')::bigint, 0) FROM playback_v3_attempts
 		WHERE session_id = $1::uuid AND expires_at > NOW()`, sessionID).Scan(&ledgerJSON, &revision)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return playback.AudioReconcileLedgerV3{}, 0, playback.ErrSessionNotFound
