@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -68,6 +69,19 @@ type stalePinRecoveryHandlerOpts struct {
 	probeDuration int
 	probeErr      error
 	noProber      bool
+	// resolverURI, when set, is returned verbatim as the resolved URI (and the
+	// CandidateID is derived from it) instead of echoing the requested URI. It
+	// lets a test return a provider-neutral URI or a cross-content URI.
+	resolverURI string
+	// resolverCandidateID, when set, overrides the CandidateID the resolver
+	// returns, so a test can return a CandidateID inconsistent with the URI.
+	resolverCandidateID string
+	// resolverOwnerID, when set, is returned as the resolver's OwnerID.
+	resolverOwnerID int
+	// pathOwnerRow, when set, is returned by the handler's exact-path lookup, so
+	// the recovery can persist replacement evidence against an existing owner.
+	pathOwnerRow      *models.MediaFile
+	pathOwnerResolves bool
 }
 
 type stalePinRecoveryFixture struct {
@@ -75,10 +89,22 @@ type stalePinRecoveryFixture struct {
 	resolveCalls *atomic.Int32
 	listCalls    *atomic.Int32
 	saveCalls    *atomic.Int32
+	// saved records every write admitted by the evidence saver; savedArgsMu
+	// guards it for the interleaving test, which drives two recoveries from
+	// separate goroutines.
+	savedMu   sync.Mutex
+	savedArgs []models.VirtualFilePersistArgs
+}
+
+func (f *stalePinRecoveryFixture) saved() []models.VirtualFilePersistArgs {
+	f.savedMu.Lock()
+	defer f.savedMu.Unlock()
+	return append([]models.VirtualFilePersistArgs(nil), f.savedArgs...)
 }
 
 func newStalePinRecoveryFixture(pinnedURI string, opts stalePinRecoveryHandlerOpts) *stalePinRecoveryFixture {
 	var resolveCalls, listCalls, saveCalls atomic.Int32
+	fixture := &stalePinRecoveryFixture{}
 	h := &PlaybackHandler{
 		VirtualPlaybackResolver: VirtualPlaybackResolverFunc(func(context.Context, string, int, string, int) (string, error) {
 			return "", errors.New("simple resolver must not be used when the detailed resolver is set")
@@ -96,14 +122,43 @@ func newStalePinRecoveryFixture(pinnedURI string, opts stalePinRecoveryHandlerOp
 			if opts.substituteURI != "" {
 				resolvedURI = opts.substituteURI
 			}
-			return ResolvedVirtualMedia{URL: "http://127.0.0.1:8080/stream?uri=" + resolvedURI, URI: resolvedURI, CandidateID: virtualResultCandidateID(resolvedURI)}, nil
+			if opts.resolverURI != "" {
+				resolvedURI = opts.resolverURI
+			}
+			candidateID := virtualResultCandidateID(resolvedURI)
+			if opts.resolverCandidateID != "" {
+				candidateID = opts.resolverCandidateID
+			}
+			resolved := ResolvedVirtualMedia{URL: "http://127.0.0.1:8080/stream?uri=" + resolvedURI, URI: resolvedURI, CandidateID: candidateID}
+			if opts.resolverOwnerID != 0 {
+				resolved.OwnerID = opts.resolverOwnerID
+			}
+			return resolved, nil
 		}),
-		VirtualFileSaver: func(context.Context, models.VirtualFilePersistArgs) (int64, error) {
+		VirtualFileSaver: func(_ context.Context, args models.VirtualFilePersistArgs) (int64, error) {
 			saveCalls.Add(1)
+			fixture.savedMu.Lock()
+			fixture.savedArgs = append(fixture.savedArgs, args)
+			fixture.savedMu.Unlock()
 			return 1, nil
 		},
 	}
-	fixture := &stalePinRecoveryFixture{handler: h, resolveCalls: &resolveCalls, listCalls: &listCalls, saveCalls: &saveCalls}
+	if opts.pathOwnerRow != nil || opts.pathOwnerResolves {
+		owner := opts.pathOwnerRow
+		h.fileResolver = stalePinPathResolver{
+			getByID: func(int) (*models.MediaFile, error) { return owner, nil },
+			getByPath: func(string) (*models.MediaFile, error) {
+				if opts.pathOwnerResolves {
+					return owner, nil
+				}
+				return nil, ErrVirtualCandidateNotFound
+			},
+		}
+	}
+	fixture.handler = h
+	fixture.resolveCalls = &resolveCalls
+	fixture.listCalls = &listCalls
+	fixture.saveCalls = &saveCalls
 	if !opts.noProber {
 		h.VirtualPlaybackSourceProber = func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
 			if opts.probeErr != nil {
@@ -116,6 +171,22 @@ func newStalePinRecoveryFixture(pinnedURI string, opts stalePinRecoveryHandlerOp
 		}
 	}
 	return fixture
+}
+
+// stalePinPathResolver is the minimal FilePathResolver the recovery needs: the
+// exact-path lookup behind the owner check. Only GetByID and GetByPath are
+// reached by the recovery; both are supplied per test.
+type stalePinPathResolver struct {
+	getByID   func(int) (*models.MediaFile, error)
+	getByPath func(string) (*models.MediaFile, error)
+}
+
+func (r stalePinPathResolver) GetByID(_ context.Context, id int) (*models.MediaFile, error) {
+	return r.getByID(id)
+}
+
+func (r stalePinPathResolver) GetByPath(_ context.Context, path string) (*models.MediaFile, error) {
+	return r.getByPath(path)
 }
 
 func stalePinRecoveryRequest() *http.Request {
@@ -635,9 +706,9 @@ func TestStalePinRecoveryClearsOldCandidateState(t *testing.T) {
 	row.ExternalSubtitles = []models.ExternalSubtitle{{Path: "/tmp/old.srt"}}
 
 	live := []VirtualPlaybackStream{stalePinLiveStream(neutral, "NEW", row.FileSize, "h264")}
-	match, matchedStream, found := virtualStalePinBestStreamMatch(row, live)
-	if !found {
-		t.Fatal("the fingerprint match was not found")
+	match, matchedStream, matched := virtualStalePinMatchStream(row, live)
+	if matched != 1 {
+		t.Fatalf("the fingerprint match was not found uniquely (matched=%d)", matched)
 	}
 	if match.FilePath != neutral+"?result=NEW" {
 		t.Fatalf("matched path = %q, want the live candidate", match.FilePath)
@@ -685,4 +756,285 @@ func TestStalePinRecoveryRefusesSessionBound(t *testing.T) {
 	if got := fx.listCalls.Load(); got != 0 {
 		t.Fatalf("listings = %d, want 0 (the recovery must not even list)", got)
 	}
+}
+
+// TestStalePinRecoveryRefusesAmbiguousFingerprint is the fix-boundary test for
+// ambiguous fingerprints: two same-title releases share codec, size and
+// runtime, so both fingerprint-match the row. The recovery must REFUSE rather
+// than rank-pick the first, whatever the listing order. Both orders are checked
+// so "first match wins" cannot pass by accident.
+func TestStalePinRecoveryRefusesAmbiguousFingerprint(t *testing.T) {
+	const neutral = "virtual://movie/tt-stale-ambiguous"
+	row := stalePinRow(19, "movie-stale-ambiguous", neutral, "STALE")
+
+	first := stalePinLiveStream(neutral, "AAA", row.FileSize, "h264")
+	second := stalePinLiveStream(neutral, "BBB", row.FileSize, "h264")
+	if first.URI == second.URI {
+		t.Fatal("fixture candidates must be distinct identities")
+	}
+
+	for _, tc := range []struct {
+		name string
+		live []VirtualPlaybackStream
+	}{
+		{"listed AAA then BBB", []VirtualPlaybackStream{first, second}},
+		{"listed BBB then AAA", []VirtualPlaybackStream{second, first}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newStalePinRecoveryFixture(neutral+"?result=STALE", stalePinRecoveryHandlerOpts{
+				live:          tc.live,
+				probeDuration: row.Duration,
+			})
+			_, ok := fx.handler.recoverStaleIdentityLessPinV3(stalePinRecoveryRequest(), row, "profile-1")
+			if ok {
+				t.Fatal("an ambiguous fingerprint must not recover: rank-picking could adopt a different release")
+			}
+			if got := fx.resolveCalls.Load(); got != 0 {
+				t.Fatalf("resolves = %d, want 0 on an ambiguous match", got)
+			}
+			if got := fx.saveCalls.Load(); got != 0 {
+				t.Fatalf("evidence writes = %d, want 0 on an ambiguous match", got)
+			}
+			if got := fx.handler.peekVirtualSticky(fx.stickyKey(row)); got != "" {
+				t.Fatalf("sticky pin = %q, want none on an ambiguous match", got)
+			}
+			if got := virtualResultCandidateID(row.FilePath); got != "STALE" {
+				t.Fatalf("catalog row pin = %q, want the durable STALE unchanged", got)
+			}
+		})
+	}
+}
+
+// TestStalePinRecoveryVetoesResolutionConflict proves a known resolution
+// conflict vetoes a candidate that the size+codec tiers alone would have let
+// through, so an edition at a different resolution cannot be adopted and does
+// not make the remaining match ambiguous.
+func TestStalePinRecoveryVetoesResolutionConflict(t *testing.T) {
+	const neutral = "virtual://movie/tt-stale-resolution"
+	row := stalePinRow(20, "movie-stale-resolution", neutral, "STALE")
+	row.Resolution = "1080p"
+
+	hd := stalePinLiveStream(neutral, "HD", row.FileSize, "h264")
+	hd.Resolution = "1080p"
+	sd := stalePinLiveStream(neutral, "SD", row.FileSize, "h264")
+	sd.Resolution = "720p"
+
+	for _, tc := range []struct {
+		name string
+		live []VirtualPlaybackStream
+	}{
+		{"HD then SD", []VirtualPlaybackStream{hd, sd}},
+		{"SD then HD", []VirtualPlaybackStream{sd, hd}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			match, stream, matched := virtualStalePinMatchStream(row, tc.live)
+			if matched != 1 {
+				t.Fatalf("matched=%d, want the single resolution-compatible candidate", matched)
+			}
+			if stream.URI != hd.URI || match.FilePath != hd.URI {
+				t.Fatalf("matched %q, want the 1080p candidate %q", stream.URI, hd.URI)
+			}
+		})
+	}
+}
+
+// TestStalePinRecoveryVetoesAudioLanguageConflict proves a known
+// audio-language conflict vetoes a same-size same-codec candidate that is a
+// different language variant of the title.
+func TestStalePinRecoveryVetoesAudioLanguageConflict(t *testing.T) {
+	const neutral = "virtual://movie/tt-stale-language"
+	row := stalePinRow(21, "movie-stale-language", neutral, "STALE")
+	row.AudioTracks = []models.AudioTrack{{Codec: "aac", Channels: 2, Language: "eng"}}
+
+	french := stalePinLiveStream(neutral, "FRA", row.FileSize, "h264")
+	french.AudioLanguages = []string{"fra"}
+	english := stalePinLiveStream(neutral, "ENG", row.FileSize, "h264")
+	english.AudioLanguages = []string{"ENG"}
+
+	for _, tc := range []struct {
+		name string
+		live []VirtualPlaybackStream
+		want string
+	}{
+		{"french then english", []VirtualPlaybackStream{french, english}, english.URI},
+		{"english then french", []VirtualPlaybackStream{english, french}, english.URI},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			match, stream, matched := virtualStalePinMatchStream(row, tc.live)
+			if matched != 1 {
+				t.Fatalf("matched=%d, want only the language-compatible candidate", matched)
+			}
+			if stream.URI != tc.want || match.FilePath != tc.want {
+				t.Fatalf("matched %q, want %q", stream.URI, tc.want)
+			}
+		})
+	}
+
+	// A listing whose only candidate is a conflicting language is ambiguous in
+	// the sense that matters: it is not the same release, so no match at all.
+	_, _, matched := virtualStalePinMatchStream(row, []VirtualPlaybackStream{french})
+	if matched != 0 {
+		t.Fatalf("a lone conflicting-language candidate matched=%d, want no match", matched)
+	}
+}
+
+// TestStalePinRecoveryNewerSelectionFinishesFirst is the generation-fence proof
+// for the early allocation. An earlier-started recovery blocks in its listing;
+// a newer selection pins and caches first; the recovery then finishes. Because
+// the recovery captured its generation before listing, its publication carries
+// an older generation and must NOT overwrite the newer selection. Allocating the
+// generation at publication instead would let the recovery's later finish win.
+func TestStalePinRecoveryNewerSelectionFinishesFirst(t *testing.T) {
+	const neutral = "virtual://movie/tt-stale-interleave"
+	row := stalePinRow(22, "movie-stale-interleave", neutral, "STALE")
+	newerURI := neutral + "?result=NEWER"
+
+	started := make(chan struct{})
+	releaseList := make(chan struct{})
+	var listOnce sync.Once
+	h := &PlaybackHandler{
+		VirtualPlaybackResolver: VirtualPlaybackResolverFunc(func(context.Context, string, int, string, int) (string, error) {
+			return "", errors.New("simple resolver must not be used")
+		}),
+		VirtualPlaybackStreamLister: VirtualPlaybackStreamListerFunc(func(context.Context, string, int, string, int) ([]VirtualPlaybackStream, error) {
+			listOnce.Do(func() { close(started) })
+			<-releaseList
+			return []VirtualPlaybackStream{stalePinLiveStream(neutral, "RECOVERED", row.FileSize, "h264")}, nil
+		}),
+		VirtualMediaDetailedResolver: VirtualMediaDetailedResolverFunc(func(_ context.Context, uri string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+			return ResolvedVirtualMedia{URL: "http://127.0.0.1:8080/stream?uri=" + uri, URI: uri, CandidateID: virtualResultCandidateID(uri)}, nil
+		}),
+		VirtualPlaybackSourceProber: func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
+			probed := stalePinProbedTrack(row.Duration)
+			probed.ID = f.ID
+			probed.FilePath = f.FilePath
+			return probed, nil
+		},
+	}
+
+	stickyKey := bestResultCacheKey(row.ContentID, neutral, row.VirtualOwnerInstallationID)
+	done := make(chan bool, 1)
+	go func() {
+		_, ok := h.recoverStaleIdentityLessPinV3(stalePinRecoveryRequest(), row, "profile-1")
+		done <- ok
+	}()
+
+	// Wait until the recovery has captured its generation and entered the
+	// listing, then let a newer selection finish first.
+	<-started
+	h.pinVirtualStickyAt(stickyKey, newerURI, nextVirtualCacheGeneration())
+	close(releaseList)
+
+	if ok := <-done; !ok {
+		t.Fatal("the recovery should still resolve its unique candidate")
+	}
+	if got := h.peekVirtualSticky(stickyKey); got != newerURI {
+		t.Fatalf("sticky pin = %q, want the newer selection %q: the late-finishing recovery must not overwrite it", got, newerURI)
+	}
+}
+
+// TestStalePinRecoveryRejectsNeutralAndCrossContentSubstitutions proves the
+// exact-candidate check requires a concrete matched candidate: a neutral URI
+// (no result= pick) and a same-id candidate under a different content both
+// reject before any publication.
+func TestStalePinRecoveryRejectsNeutralAndCrossContentSubstitutions(t *testing.T) {
+	const (
+		neutral = "virtual://movie/tt-stale-exact"
+		foreign = "virtual://movie/tt-stale-foreign"
+	)
+	row := stalePinRow(23, "movie-stale-exact", neutral, "STALE")
+
+	cases := []struct {
+		name        string
+		resolverURI string
+		candidateID string
+	}{
+		{"neutral URI", neutral, ""},
+		{"same result id under a different content", foreign + "?result=NEW", ""},
+		{"candidate id inconsistent with the URI", neutral + "?result=NEW", "DIFFERENT"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newStalePinRecoveryFixture(neutral+"?result=STALE", stalePinRecoveryHandlerOpts{
+				live:                []VirtualPlaybackStream{stalePinLiveStream(neutral, "NEW", row.FileSize, "h264")},
+				probeDuration:       row.Duration,
+				resolverURI:         tc.resolverURI,
+				resolverCandidateID: tc.candidateID,
+			})
+			_, ok := fx.handler.recoverStaleIdentityLessPinV3(stalePinRecoveryRequest(), row, "profile-1")
+			if ok {
+				t.Fatal("a substituted candidate identity must not recover the pin")
+			}
+			if got := fx.resolveCalls.Load(); got != 1 {
+				t.Fatalf("resolves = %d, want exactly 1", got)
+			}
+			if got := fx.saveCalls.Load(); got != 0 {
+				t.Fatalf("evidence writes = %d, want 0 on a rejected substitution", got)
+			}
+			if got := fx.handler.peekVirtualSticky(fx.stickyKey(row)); got != "" {
+				t.Fatalf("sticky pin = %q, want none on a rejected substitution", got)
+			}
+		})
+	}
+}
+
+// TestStalePinRecoveryPersistsOnlyAgainstExistingOwner proves the recovery is
+// transient: with no row already owning the matched concrete path, it persists
+// no evidence at all (so it can never adopt the path onto the requested row);
+// with an existing alternate owner it writes a metadata-only update against that
+// owner, never the requested row.
+func TestStalePinRecoveryPersistsOnlyAgainstExistingOwner(t *testing.T) {
+	const neutral = "virtual://movie/tt-stale-owner"
+	row := stalePinRow(24, "movie-stale-owner", neutral, "STALE")
+	live := []VirtualPlaybackStream{stalePinLiveStream(neutral, "NEW", row.FileSize, "h264")}
+
+	t.Run("no existing owner persists nothing", func(t *testing.T) {
+		fx := newStalePinRecoveryFixture(neutral+"?result=STALE", stalePinRecoveryHandlerOpts{
+			live:          live,
+			probeDuration: row.Duration,
+		})
+		_, ok := fx.handler.recoverStaleIdentityLessPinV3(stalePinRecoveryRequest(), row, "profile-1")
+		if !ok {
+			t.Fatal("the unique candidate should recover")
+		}
+		if got := fx.saveCalls.Load(); got != 0 {
+			t.Fatalf("evidence writes = %d, want 0: the recovery must not adopt the candidate onto the requested row", got)
+		}
+		if got := virtualResultCandidateID(row.FilePath); got != "STALE" {
+			t.Fatalf("catalog row pin = %q, want the durable STALE unchanged", got)
+		}
+	})
+
+	t.Run("existing alternate owner gets a metadata-only write", func(t *testing.T) {
+		ownerRow := &models.MediaFile{
+			ID:                         99,
+			ContentID:                  row.ContentID,
+			FilePath:                   neutral + "?result=NEW",
+			VirtualOwnerInstallationID: row.VirtualOwnerInstallationID,
+			MediaFolderID:              row.MediaFolderID,
+			ProbeSource:                "virtual",
+		}
+		fx := newStalePinRecoveryFixture(neutral+"?result=STALE", stalePinRecoveryHandlerOpts{
+			live:              live,
+			probeDuration:     row.Duration,
+			pathOwnerRow:      ownerRow,
+			pathOwnerResolves: true,
+		})
+		_, ok := fx.handler.recoverStaleIdentityLessPinV3(stalePinRecoveryRequest(), row, "profile-1")
+		if !ok {
+			t.Fatal("the unique candidate should recover")
+		}
+		fx.handler.StopVirtualEvidence()
+
+		saved := fx.saved()
+		if len(saved) != 1 {
+			t.Fatalf("evidence writes = %d, want exactly 1 against the existing owner", len(saved))
+		}
+		if saved[0].FileID != ownerRow.ID {
+			t.Fatalf("evidence write targeted file %d, want the owner %d", saved[0].FileID, ownerRow.ID)
+		}
+		if saved[0].AdoptPath != "" || saved[0].RequireAdopt {
+			t.Fatalf("owner write nominated an adoption target: %+v", saved[0])
+		}
+	})
 }
