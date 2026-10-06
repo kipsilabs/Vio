@@ -660,13 +660,6 @@ type PlaybackHandler struct {
 	subtitleSlotsOnce sync.Once
 	subtitleSlots     *virtualDetachedGate
 
-	// virtualPreprobeOnce guards lazy construction of the content-keyed
-	// pin-liveness memo (see playback_virtual_preprobe.go). A fresh listing
-	// observation lets a cold start whose row already names a candidate skip
-	// the provider listing; a miss falls through to the normal path.
-	virtualPreprobeOnce  sync.Once
-	virtualPreprobeCache *virtualPreprobeCache
-
 	// deferredProbeOnce guards lazy construction of the bounded post-commit
 	// probe pool (see enqueueDeferredVirtualProbeV3). A fresh-start resolve
 	// hands its deferred full-track enumeration to this pool instead of probing
@@ -686,6 +679,17 @@ type PlaybackHandler struct {
 	// deferredProbeSignal wakes an idle worker to drain the retry set. It is
 	// buffered (size 1) and never blocks the request path.
 	deferredProbeSignal chan struct{}
+	// deferredPublishOnce guards the bounded pool that delivers a shed probe's
+	// terminal inventory after the response has returned (see
+	// scheduleDeferredProbeInventoryPublish). It is separate from the probe pool
+	// so a slow catalog read or realtime fan-out cannot delay the response or
+	// starve the probes. The retry set coalesces by file id, so duplicate sheds
+	// for one release cannot grow it without bound.
+	deferredPublishOnce   sync.Once
+	deferredPublishQueue  chan *virtualDeferredProbeV3
+	deferredPublishMu     sync.Mutex
+	deferredPublishRetry  map[int]*virtualDeferredProbeV3
+	deferredPublishSignal chan struct{}
 
 	// prefetchOnce guards the lazy prefetch worker pool. Prefetch work is
 	// admitted into a bounded queue (prefetchQueue) before any goroutine

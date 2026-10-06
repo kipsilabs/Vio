@@ -893,13 +893,13 @@ func (h *PlaybackHandler) playbackInventoryForFileV3(ctx context.Context, sessio
 		status = string(ProbeProvenanceVerified)
 	} else {
 		// No probe stamp on the effective row. A deferred full-track
-		// enumeration may be outstanding, may have completed with its evidence
-		// write still in the buffer, or may have terminally failed; the session
-		// carries that disposition so an inventory reader can tell an unfinished
-		// probe from a finished or failed one and leave the loading state either
-		// way. Only the verified stamp outranks this, because it is the row's own
-		// committed evidence; a verified outcome means the probe itself
-		// succeeded, so the client may also stop treating the menu as loading.
+		// enumeration may be outstanding, may have committed its evidence
+		// without a stamp, or may have terminally failed; the session carries
+		// that disposition so an inventory reader can tell an unfinished probe
+		// from a finished or failed one and leave the loading state either way.
+		// Only the verified stamp outranks this, because it is the row's own
+		// committed evidence; a verified outcome means the probe's durable write
+		// committed, so the client may also stop treating the menu as loading.
 		switch session.VirtualProbeOutcome {
 		case probeOutcomePending:
 			status = probeOutcomePending

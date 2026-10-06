@@ -2177,21 +2177,8 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		slog.DebugContext(r.Context(), "virtual playback list suppressed: provider answered empty inside window",
 			"component", "api", "content_id", file.ContentID, "file_id", file.ID)
 	}
-	// Pin-liveness pre-probe: a fresh listing observation for this content lets
-	// a row that already names a concrete candidate and whose candidate metadata
-	// is already complete skip the full provider listing. It only removes a
-	// listing that a live observation already justified — a row without a
-	// persisted candidate still needs the list, a row still missing candidate
-	// metadata still needs the list (the listing is the only declaration of the
-	// codec/language labels the committed recipe must not synthesize), and a
-	// forced relist, an exclusion, or an unusable/failed row still lists so
-	// recovery is never blocked. A miss falls through to the normal path.
-	preprobeHit := h.virtualPreprobeHit(
-		&fileIdentityV3{contentID: file.ContentID, ownerID: file.VirtualOwnerInstallationID},
-		persistedResultURI, requestedRowUnusable, exclusionPending, forceRelist, needsCandidateMetadata, time.Now(),
-	)
 	if (shouldListVirtualPlaybackCandidates(noResult, needsCandidateMetadata && !cachedListing, forceRelist) ||
-		((exclusionPending || requestedRowUnusable) && !cachedListing)) && persistedResumeURI == "" && !emptySuppressed && !preprobeHit && h.VirtualPlaybackStreamLister != nil {
+		((exclusionPending || requestedRowUnusable) && !cachedListing)) && persistedResumeURI == "" && !emptySuppressed && h.VirtualPlaybackStreamLister != nil {
 		trace.listed = true
 		trace.listRan = true
 		listStart := time.Now()
@@ -2218,11 +2205,6 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			if len(streams) > maxVirtualPlaybackStreams {
 				streams = streams[:maxVirtualPlaybackStreams]
 			}
-			// The listing answered with candidates: stamp a short-lived
-			// preprobe liveness observation so a subsequent start whose row
-			// names a concrete candidate can skip this listing while it stays
-			// fresh (see virtualPreprobeHit).
-			h.recordVirtualPreprobeLiveness(&fileIdentityV3{contentID: file.ContentID, ownerID: file.VirtualOwnerInstallationID}, time.Now())
 			// The provider answered with candidates, so a recovery bypass is no
 			// longer defeating a provider fail-fast: clear this listing's
 			// budget so a later failure starts from a full window. An empty
@@ -3219,14 +3201,14 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersist(
 
 // probeVirtualSourceAndPersistWith is probeVirtualSourceAndPersist with an
 // explicit evidence-write mode. durableEvidence makes the catalog write
-// synchronous and its result authoritative: the probe reports verified only once
-// the committed row actually carries the enumerated tracks, and reports failed
-// when the write is rejected or terminally fails. The deferred post-commit probe
-// uses it so a session's outcome never claims a verified menu before the row the
-// poll reads is readable — the premature-verified case where a client stops
-// loading on the old menu. Ordinary background callers pass false and keep the
-// queued, coalescing write, where a positive verdict means "probe succeeded",
-// not "row committed", exactly as before.
+// synchronous and its result authoritative: the probe reports verified only when
+// the write committed, and reports failed when the write is rejected or
+// terminally fails. The deferred post-commit probe uses it so a session's
+// outcome never claims a verified menu while the row the poll reads still shows
+// the old one — the premature-verified case where a client stops loading on the
+// old menu. Ordinary background callers pass false and keep the queued,
+// coalescing write, where a positive verdict means "probe succeeded", not "row
+// committed", exactly as before.
 func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 	bgCtx context.Context,
 	stickyKey string,
@@ -3284,13 +3266,13 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 	}
 	mergeVirtualCandidateTracks(probed, probeCand)
 	if durableEvidence {
-		// The outcome must not outrun the evidence: report verified only when
-		// the committed row that the inventory poll reads actually carries the
-		// enumerated tracks. A rejected or failed write is a terminal failed
+		// The outcome must not outrun the write: report verified only when the
+		// durable write committed the enumerated tracks onto the row the
+		// inventory poll reads. A rejected or failed write is a terminal failed
 		// outcome so the client leaves loading instead of showing a stale menu
 		// as verified.
 		if !h.persistVirtualProbeEvidenceDurable(bgCtx, catalogFile, probeCand.URI, probed, true) {
-			slog.WarnContext(bgCtx, "deferred virtual probe evidence not readable after durable write; reporting failed",
+			slog.WarnContext(bgCtx, "deferred virtual probe evidence write did not commit; reporting failed",
 				"component", "api", "candidate_uri", probeCand.URI, "file_id", catalogFile.ID)
 			return probeOutcomeFailed
 		}
@@ -3300,20 +3282,19 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 	return probeOutcomeVerified
 }
 
-// persistVirtualProbeEvidenceDurable performs one synchronous, read-back-checked
-// evidence write for a caller whose outcome depends on the evidence being
-// visible. It exists for the deferred post-commit probe: that probe's terminal
-// outcome is stored on the session and read by the inventory poll, so reporting
-// verified while the row still shows its old menu would make a client stop
-// loading on stale tracks. A queued write cannot give that guarantee — it may
-// still be pending, or be rejected, or coalesce onto a later snapshot — so the
-// durable path bypasses the buffer rather than guessing.
+// persistVirtualProbeEvidenceDurable performs one synchronous evidence write for
+// a caller whose verdict depends on the write's outcome. It exists for the
+// deferred post-commit probe: that probe's terminal outcome is stored on the
+// session and read by the inventory poll, so reporting verified while the row
+// still shows its old menu would make a client stop loading on stale tracks. A
+// queued write cannot report that outcome — it may still be pending, be rejected,
+// or coalesce onto a later snapshot — so the durable path bypasses the buffer.
 //
-// The write prefers the explicit adoption-result saver so it can tell a genuine
-// commit (MetadataUpdated) from a no-op CAS miss; a bare row-count saver is
-// accepted only as a positive signal and cannot promise a read-back, so the call
-// reports false rather than a false success. It returns whether the probe
-// evidence is committed and therefore readable from the catalog row.
+// The write prefers the explicit adoption-result saver, whose MetadataUpdated
+// distinguishes a genuine commit from a no-op CAS miss. Without that saver a bare
+// row-count saver is used: a positive row count is accepted as a committed write,
+// and a zero row count as a stale snapshot. It returns whether the write
+// committed; it does not itself re-read the row.
 func (h *PlaybackHandler) persistVirtualProbeEvidenceDurable(ctx context.Context, catalogFile *models.MediaFile, resolvedPath string, probed *models.MediaFile, stampProbe bool) bool {
 	args, _, ok := h.virtualProbeEvidenceArgs(ctx, catalogFile, resolvedPath, probed, stampProbe)
 	if !ok {

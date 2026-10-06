@@ -1501,26 +1501,6 @@ func (m *SessionManager) setVirtualSourceLocked(s *Session, virtualURI string, o
 	m.touchSessionLocked(s)
 }
 
-// SetVirtualProbeOutcome records the disposition of the deferred background
-// probe for the session's bound virtual candidate: "pending" while the full
-// track enumeration is outstanding, then "verified" or "failed" when it lands.
-// It is deliberately a dedicated setter rather than part of the stream-state
-// snapshot: the outcome is written by the detached probe worker, which must not
-// race a plan replacement's wholesale stream-state apply, and an empty value
-// means "no deferred probe outstanding". An unknown session is a no-op so a
-// probe that completes after its session ended does not error.
-func (m *SessionManager) SetVirtualProbeOutcome(sessionID, outcome string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	s, ok := m.sessions[sessionID]
-	if !ok {
-		return ErrSessionNotFound
-	}
-	s.VirtualProbeOutcome = outcome
-	return nil
-}
-
 // SetVirtualProbeOutcomeIfGeneration records a deferred probe's outcome on the
 // session only while its candidate binding is still the exact one the probe was
 // scheduled against (compare-and-swap on virtualSourceGeneration). A probe that
@@ -1529,7 +1509,12 @@ func (m *SessionManager) SetVirtualProbeOutcome(sessionID, outcome string) error
 // subsequent poll would end the new release's loading state with the old
 // release's outcome. It returns applied=false when the binding moved, so the
 // caller can treat the result as superseded rather than an error. An unknown
-// session is a no-op, like SetVirtualProbeOutcome.
+// session is reported with ErrSessionNotFound and writes nothing.
+//
+// It is deliberately a dedicated setter rather than part of the stream-state
+// snapshot: the outcome is written by the detached probe worker, which must not
+// race a plan replacement's wholesale stream-state apply, and an empty value
+// means "no deferred probe outstanding".
 func (m *SessionManager) SetVirtualProbeOutcomeIfGeneration(sessionID string, generation uint64, outcome string) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
