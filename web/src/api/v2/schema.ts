@@ -24594,6 +24594,7 @@ export interface components {
       effective_recipe: components["schemas"]["EffectiveRecipeV3"];
       effective_virtual_uri?: string;
       expires_at?: string;
+      inventory_url?: string;
       plan_attempt_key: string;
       plan_id: string;
       /** Format: int64 */
@@ -24611,6 +24612,7 @@ export interface components {
       subtitle: components["schemas"]["SubtitleDecisionV3"];
       subtitle_fidelity_policy: string;
       timeline: components["schemas"]["TimelineV3"];
+      tracks_pending?: boolean;
       transformations: components["schemas"]["TransformationV3"][];
       virtual_source_revision?: string;
     };

@@ -354,9 +354,11 @@ func holdDetachedGate(t *testing.T, handler *PlaybackHandler) func() {
 	}
 }
 
-// saveAttempt registers the session's attempt row so the inventory poll can
-// resolve it, matching the state a real start commits.
-func (fx *deferredLifecycleFixture) saveAttempt(t *testing.T) {
+// saveAttemptWithoutNegotiation registers a session's attempt row without the
+// deferred_track_inventory_v1 negotiation on either side, modeling a session
+// that was never in the deferred lifecycle (a frozen v1 start, or a v2 client
+// that did not advertise the feature).
+func (fx *deferredLifecycleFixture) saveAttemptWithoutNegotiation(t *testing.T) {
 	t.Helper()
 	if err := fx.handler.PlanStoreV3.SaveAttempt(context.Background(), playback.AttemptRecordV3{
 		PlaybackAttemptID:    "attempt-lifecycle",
@@ -366,6 +368,33 @@ func (fx *deferredLifecycleFixture) saveAttempt(t *testing.T) {
 		RequestedMediaFileID: fx.source.ID,
 		EffectiveMediaFileID: fx.source.ID,
 		ExpiresAt:            time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("SaveAttempt: %v", err)
+	}
+}
+
+// saveAttempt registers the session's attempt row so the inventory poll can
+// resolve it, matching the state a real start commits. The row carries the
+// deferred_track_inventory_v1 negotiation on both sides, because a session in
+// the deferred lifecycle can only have been started by a client that negotiated
+// it (the start gate); the delivery-side guard reads exactly this record to
+// decide whether a failed inventory is meaningful to the session.
+func (fx *deferredLifecycleFixture) saveAttempt(t *testing.T) {
+	t.Helper()
+	if err := fx.handler.PlanStoreV3.SaveAttempt(context.Background(), playback.AttemptRecordV3{
+		PlaybackAttemptID:    "attempt-lifecycle",
+		SessionID:            fx.session.ID,
+		UserID:               1,
+		ProfileID:            "profile-1",
+		RequestedMediaFileID: fx.source.ID,
+		EffectiveMediaFileID: fx.source.ID,
+		NormalizedRequest: playback.StartRequestV3{
+			ClientFeatures: []string{playback.FeatureDeferredTrackInventoryV3},
+		},
+		StartResponse: playback.DecisionResponseV3{
+			ServerFeatures: []string{playback.FeatureDeferredTrackInventoryV3},
+		},
+		ExpiresAt: time.Now().Add(time.Hour),
 	}); err != nil {
 		t.Fatalf("SaveAttempt: %v", err)
 	}
@@ -1889,5 +1918,47 @@ func TestDeferredProbePublishBackpressureSkipsPush(t *testing.T) {
 	fx.handler.deferredPublishMu.Unlock()
 	if parked != 1 {
 		t.Fatalf("parked publish entries = %d, want the shed session's notification parked", parked)
+	}
+}
+
+// TestDeferredProbeFailedPushScopedToNegotiatedSessions is the point-2
+// delivery-side guard: a terminal "failed" inventory is the deferred
+// lifecycle's signal, meaningful only to a session whose attempt negotiated
+// deferred_track_inventory_v1. A session that never negotiated it must not
+// receive the failed push (it was never promised a provisional menu), while a
+// negotiated session still does. The attempt record is the discriminator, so
+// the test drives both sides of it through the real publish path.
+func TestDeferredProbeFailedPushScopedToNegotiatedSessions(t *testing.T) {
+	// Unnegotiated session: the attempt row carries neither the client token
+	// nor the server feature, so a failed inventory is not for it.
+	plain := newDeferredLifecycleFixture(t, 930, "virtual://movie/tt-guard-plain?result=cand-1")
+	plain.saveAttemptWithoutNegotiation(t)
+	plainConn := plain.registerPush(t)
+	if err := plain.manager.SetVirtualProbeOutcome(plain.session.ID, probeOutcomeFailed); err != nil {
+		t.Fatalf("SetVirtualProbeOutcome: %v", err)
+	}
+	plain.handler.PublishInventoryUpdatedToSession(context.Background(), plain.session.ID, 0)
+	select {
+	case event := <-plainConn.ch:
+		t.Fatalf("unnegotiated session received a failed inventory push (status %q)", event.payload.InventoryStatus)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	// Negotiated session: the attempt row carries both sides, so the failed
+	// push is delivered and the client can leave loading.
+	negotiated := newDeferredLifecycleFixture(t, 931, "virtual://movie/tt-guard-negotiated?result=cand-1")
+	negotiated.saveAttempt(t)
+	negotiatedConn := negotiated.registerPush(t)
+	if err := negotiated.manager.SetVirtualProbeOutcome(negotiated.session.ID, probeOutcomeFailed); err != nil {
+		t.Fatalf("SetVirtualProbeOutcome: %v", err)
+	}
+	negotiated.handler.PublishInventoryUpdatedToSession(context.Background(), negotiated.session.ID, 0)
+	select {
+	case event := <-negotiatedConn.ch:
+		if event.payload.InventoryStatus != string(ProbeProvenanceFailed) {
+			t.Fatalf("negotiated session failed push status = %q, want failed", event.payload.InventoryStatus)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("negotiated session did not receive the failed inventory push")
 	}
 }

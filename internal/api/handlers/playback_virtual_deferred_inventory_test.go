@@ -121,10 +121,11 @@ func TestStartPlaybackDefersTrackInventoryUntilPostCommitPush(t *testing.T) {
 		return VirtualFileMetadataUpdateResult{MetadataUpdated: true, RowsAffected: 1}, nil
 	}
 
-	start := startV3PlaybackForHandlerTest(t, handler, func() playback.StartRequestV3 {
+	start := startV3PlaybackV2ForHandlerTest(t, handler, func() playback.StartRequestV3 {
 		request := v3HandlerStartRequest()
 		request.FileID = source.ID
 		request.QualityPreference = "original"
+		request.ClientFeatures = append(request.ClientFeatures, playback.FeatureDeferredTrackInventoryV3)
 		return request
 	}())
 
@@ -247,9 +248,10 @@ func TestDeferredInventorySpawnedAfterSameReleaseTransientRetry(t *testing.T) {
 		return f, nil
 	}
 
-	start := startV3PlaybackForHandlerTest(t, handler, func() playback.StartRequestV3 {
+	start := startV3PlaybackV2ForHandlerTest(t, handler, func() playback.StartRequestV3 {
 		request := v3HandlerStartRequest()
 		request.FileID = source.ID
+		request.ClientFeatures = append(request.ClientFeatures, playback.FeatureDeferredTrackInventoryV3)
 		position := 120.0
 		request.StartPosition = &position
 		// m3u8-only output over an mkv source forces a copy HLS remux; the seek
@@ -383,10 +385,11 @@ func TestDeferredProbeFailureEndsLoadingViaPushAndPoll(t *testing.T) {
 	virtualProbeFailures.clear(failureKey)
 	t.Cleanup(func() { virtualProbeFailures.clear(failureKey) })
 
-	start := startV3PlaybackForHandlerTest(t, handler, func() playback.StartRequestV3 {
+	start := startV3PlaybackV2ForHandlerTest(t, handler, func() playback.StartRequestV3 {
 		request := v3HandlerStartRequest()
 		request.FileID = source.ID
 		request.QualityPreference = "original"
+		request.ClientFeatures = append(request.ClientFeatures, playback.FeatureDeferredTrackInventoryV3)
 		return request
 	}())
 	if start.PlaybackPlan == nil || !start.PlaybackPlan.TracksPending {
@@ -493,10 +496,11 @@ func TestDeferredProbePendingThenVerifiedPollTransitions(t *testing.T) {
 		return VirtualFileMetadataUpdateResult{MetadataUpdated: true, RowsAffected: 1}, nil
 	}
 
-	start := startV3PlaybackForHandlerTest(t, handler, func() playback.StartRequestV3 {
+	start := startV3PlaybackV2ForHandlerTest(t, handler, func() playback.StartRequestV3 {
 		request := v3HandlerStartRequest()
 		request.FileID = source.ID
 		request.QualityPreference = "original"
+		request.ClientFeatures = append(request.ClientFeatures, playback.FeatureDeferredTrackInventoryV3)
 		return request
 	}())
 	if start.PlaybackPlan == nil {
@@ -595,10 +599,11 @@ func TestSaturatedGateDefersProbeInsteadOfProbingOnRequestPath(t *testing.T) {
 
 	startDone := make(chan playback.DecisionResponseV3, 1)
 	go func() {
-		startDone <- startV3PlaybackForHandlerTest(t, handler, func() playback.StartRequestV3 {
+		startDone <- startV3PlaybackV2ForHandlerTest(t, handler, func() playback.StartRequestV3 {
 			request := v3HandlerStartRequest()
 			request.FileID = source.ID
 			request.QualityPreference = "original"
+			request.ClientFeatures = append(request.ClientFeatures, playback.FeatureDeferredTrackInventoryV3)
 			return request
 		}())
 	}()

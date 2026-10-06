@@ -264,6 +264,43 @@ func requireAttemptAPISurfaceV3(ctx context.Context, record *playback.AttemptRec
 	return nil
 }
 
+// deferTrackInventoryNegotiatedV3 reports whether this start may defer its full
+// track enumeration past the first-byte commit. Deferral is a new lifecycle
+// (the plan carries tracks_pending and the client waits for a follow-up
+// inventory_updated push or a poll of inventory_url), so it is scoped to the
+// surface and client that negotiated it:
+//
+//   - the request must arrive through /api/v2: the shared handler also serves
+//     the frozen /api/v1 bridge, whose contract must not grow tracks_pending;
+//   - the client must advertise deferred_track_inventory_v1 in its
+//     client_features. A v2 client that did not advertise it has no promise to
+//     handle a provisional menu, so it keeps the pre-#228 synchronous upgrade
+//     and never sees tracks_pending.
+//
+// Both are required; a missing either-way yields the unchanged pre-#228 path
+// (the candidate-declared upgrade probe runs in the background).
+func (h *PlaybackHandler) deferTrackInventoryNegotiatedV3(r *http.Request, req playback.StartRequestV3) bool {
+	if r == nil || !isNativeAPIV2(r.Context()) {
+		return false
+	}
+	return playback.HasFeatureV3(req.ClientFeatures, playback.FeatureDeferredTrackInventoryV3)
+}
+
+// attemptNegotiatedDeferTrackInventoryV3 reports whether an attempt negotiated
+// the deferred track-inventory lifecycle: the client sent
+// deferred_track_inventory_v1 and a decision of this server (the StartResponse)
+// offered it. Like attemptNegotiatedSubRipV3, the stored client token alone is
+// not enough on a v1 surface, where the server never advertised the feature.
+// It is the durable test the deferred failed-notification fan-out uses to
+// decide whether a session's client can consume a terminal failed inventory.
+func attemptNegotiatedDeferTrackInventoryV3(record *playback.AttemptRecordV3) bool {
+	if record == nil {
+		return false
+	}
+	return playback.HasFeatureV3(record.NormalizedRequest.ClientFeatures, playback.FeatureDeferredTrackInventoryV3) &&
+		playback.HasFeatureV3(record.StartResponse.ServerFeatures, playback.FeatureDeferredTrackInventoryV3)
+}
+
 // replanSubtitleFeaturesV3 returns the client features a replan attaches its
 // subtitle artifact with: subrip_sidecar_v1 present exactly when the attempt
 // negotiated original SRT. Every replan, not only a seek reanchor, keeps that
@@ -1533,6 +1570,21 @@ func (h *PlaybackHandler) publishInventoryUpdatedToSession(ctx context.Context, 
 		// deferred probe has terminally failed, so the client already holds
 		// exactly this declared inventory. A failed status is new information —
 		// it ends the deferred loading state — so it is pushed.
+		return inventory.InventoryRevision, false
+	}
+	if inventory.InventoryStatus == string(ProbeProvenanceFailed) &&
+		record != nil && !attemptNegotiatedDeferTrackInventoryV3(record) {
+		// A "failed" inventory is the deferred lifecycle's terminal signal: it
+		// tells a client that negotiated deferred_track_inventory_v1 to leave
+		// its provisional (tracks_pending) loading state. A session that did
+		// not negotiate the lifecycle was never promised a provisional menu, so
+		// a failed status is meaningless to it and must not be delivered. The
+		// deferral gate already keeps such sessions out of the lifecycle; this
+		// is the delivery-side guard that keeps a failed push from ever
+		// reaching a session whose attempt did not negotiate. A nil record
+		// (a minimal manager without a plan store) preserves the pre-existing
+		// best-effort push. Verified pushes are untouched: they are the
+		// pre-existing background upgrade any session may receive.
 		return inventory.InventoryRevision, false
 	}
 	if hasGeneration {

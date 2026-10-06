@@ -2647,10 +2647,15 @@ func (h *PlaybackHandler) resolveVirtualStartWithVersionFallback(
 			allowFailedCandidate: allowFailedCandidate,
 			sessionBound:         false,
 			explicitSelection:    req.FileSelection == playback.FileSelectionExplicitV3,
-			// The fresh-start resolve defers its candidate-declared upgrade
-			// probe past the transport commit; the start path spawns it and
-			// marks the plan tracks_pending.
-			deferProbePastCommit: true,
+			// Defer the candidate-declared upgrade probe past the transport
+			// commit only when the surface AND the client negotiated the
+			// deferred track-inventory lifecycle (see
+			// deferTrackInventoryNegotiatedV3). On the frozen v1 surface, or a
+			// v2 client that did not advertise deferred_track_inventory_v1, the
+			// resolve keeps the pre-#228 behavior: it upgrades the inventory with
+			// a background probe and never marks the plan tracks_pending, so the
+			// v1 contract is byte-for-byte unchanged.
+			deferProbePastCommit: h.deferTrackInventoryNegotiatedV3(r, req),
 		},
 	)
 	if resolveErr == nil || !virtualStartVersionFallbackEligibleV3(req) || !virtualProviderListingOutage(resolveErr) {

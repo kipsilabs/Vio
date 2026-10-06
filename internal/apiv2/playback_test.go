@@ -28,6 +28,9 @@ type fakePlaybackService struct {
 	response playback.DecisionResponseV3
 	mutation handlers.PlaybackMutationView
 	err      error
+	// inventoryStatus, when set, is the status the inventory endpoint reports;
+	// empty keeps the default verified fixture.
+	inventoryStatus string
 }
 
 func (f *fakePlaybackService) PlaybackCapabilities(context.Context, int, string) (handlers.PlaybackCapabilitiesView, error) {
@@ -73,10 +76,14 @@ func (f *fakePlaybackService) GetPlaybackInventoryV2(_ context.Context, caller h
 	if f.err != nil {
 		return playback.PlaybackInventoryV3{}, f.err
 	}
+	status := f.inventoryStatus
+	if status == "" {
+		status = "verified"
+	}
 	return playback.PlaybackInventoryV3{
 		SessionID:         session,
 		InventoryRevision: "inv:test1234",
-		InventoryStatus:   "verified",
+		InventoryStatus:   status,
 	}, nil
 }
 

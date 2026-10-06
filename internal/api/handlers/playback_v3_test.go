@@ -8555,6 +8555,26 @@ func startV3PlaybackForHandlerTest(t *testing.T, handler *PlaybackHandler, reque
 	return started
 }
 
+// startV3PlaybackV2ForHandlerTest drives the shared v3 start through the
+// /api/v2 surface mark, the surface the deferred track-inventory lifecycle is
+// scoped to. The request must carry
+// playback.FeatureDeferredTrackInventoryV3 to negotiate it; without the
+// feature this is byte-for-byte the frozen behavior (a background upgrade
+// probe and no tracks_pending).
+func startV3PlaybackV2ForHandlerTest(t *testing.T, handler *PlaybackHandler, request playback.StartRequestV3) playback.DecisionResponseV3 {
+	t.Helper()
+	rr := httptest.NewRecorder()
+	handler.HandleStartPlayback(rr, httptest.NewRequest(http.MethodPost, "/api/v2/playback/start", strings.NewReader(marshalV3StartRequest(t, request))).WithContext(WithNativeAPIV2(newAuthorizedPlaybackContext())))
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("v2 start status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var started playback.DecisionResponseV3
+	if err := json.Unmarshal(rr.Body.Bytes(), &started); err != nil || started.PlaybackPlan == nil {
+		t.Fatalf("v2 start response: err=%v response=%#v", err, started)
+	}
+	return started
+}
+
 type recordingPlaybackProbeEnsurer struct {
 	mu    sync.Mutex
 	calls []int

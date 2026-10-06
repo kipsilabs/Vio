@@ -3276,6 +3276,17 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 				"component", "api", "candidate_uri", probeCand.URI, "file_id", catalogFile.ID)
 			return probeOutcomeFailed
 		}
+		// Integration note: this durable write commits a verified inventory
+		// for a session whose committed recipe was built from declared
+		// metadata, so a probe that reorders the audio tracks can leave the
+		// executable default-audio selection on the wrong language. The
+		// default-audio reconciliation work on the shared evidence path runs a
+		// post-commit correction for exactly that case; this deferred path
+		// bypasses it and must run the same correction once that lands, or
+		// deferred sessions keep the pre-reconciliation behavior. Until then
+		// the committed selection is untouched here, which is the correct
+		// conservative outcome: a failed or reordered menu never switches a
+		// viewer's audio track on its own.
 		return probeOutcomeVerified
 	}
 	h.persistVirtualProbeEvidence(bgCtx, catalogFile, probeCand.URI, probed, true, false)

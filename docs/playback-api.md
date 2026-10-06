@@ -38,6 +38,40 @@ release's own; a rotated session whose new release is not yet probed reports
 `inventory_status: declared` and that release's declared (possibly empty)
 tracks, never the previous release's.
 
+### Deferred track inventory
+
+A cold start normally resolves a virtual source from provider-declared metadata
+and upgrades it with a full ffprobe enumeration. On `/api/v2` a client that
+advertises `deferred_track_inventory_v1` may instead receive a plan whose
+first-byte URL is already playable while the enumeration runs after the
+transport commit. The plan carries `tracks_pending: true` and
+`inventory_url`; the menu is provisional until the follow-up lands. The frozen
+`/api/v1` surface and a v2 client that did not advertise the feature never see
+the fields and keep the pre-existing behavior, so the deferred lifecycle is
+strictly opt-in.
+
+The session's inventory status moves `declared` → `pending` → `verified` or
+`failed`. `pending` means the enumeration is outstanding; the client keeps the
+provisional menu. `verified` means the enumerated tracks are committed and the
+follow-up `inventory_updated` push (or a poll of `inventory_url`) replaces the
+menu. `failed` is terminal: the enumeration could not be completed — a probe
+error, an unreadable evidence write, or a saturated worker pool that could not
+admit the probe — and the client must leave the loading state and keep the
+provisional menu it already holds. A failed upgrade never changes the stream or
+the executable audio selection; a viewer who picked an audio track keeps it.
+`tracks_pending` is a menu hint and is excluded from plan identity, so an
+idempotent start retry replays the same plan with the same marker.
+
+Apple and Android clients that adopt the feature must: read `tracks_pending`
+from the start and replan responses and render the track menu as loading while
+it is true; consume the existing `inventory_updated` realtime event
+(`inventory_updated_event_v1`) or poll `inventory_url` (honoring its `ETag` /
+`If-None-Match`) until the status is terminal; adopt the enumerated menu on
+`verified`; on `failed`, stop showing the loading state and keep the current
+menu and audio selection without issuing a replan; and drop the marker on any
+plan replacement. Until they do, they must not send
+`deferred_track_inventory_v1`.
+
 ## Capabilities
 
 The response is `{installation_id, revision, state, allowed, protocol_versions,
