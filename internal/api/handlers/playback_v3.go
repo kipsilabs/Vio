@@ -1865,7 +1865,12 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		// earlier auto pick; only an explicit pick or a forced relink re-tries
 		// the known-bad candidate.
 		allowFailedCandidate := req.FileSelection == playback.FileSelectionExplicitV3 || req.ForceRelink
-		resolved, resolveErr := h.resolveVirtualStartWithVersionFallback(r, requestedFile, profileID, req, allowFailedCandidate, intOrZeroHandlerV3(req.BandwidthCapKbps))
+		// The start path is a fresh selection: declare the unbound intent on the
+		// request handed to the walk, which threads it (rather than forcing it)
+		// so the stale-pin recovery may re-pin here while a future session-bound
+		// caller reusing the walk keeps its own binding intent and refuses.
+		walkSourceReq := r.WithContext(withVirtualSessionBindingV3(r.Context(), false))
+		resolved, resolveErr := h.resolveVirtualStartWithVersionFallback(walkSourceReq, requestedFile, profileID, req, allowFailedCandidate, intOrZeroHandlerV3(req.BandwidthCapKbps))
 		if resolveErr != nil {
 			// A confirmed-dead pinned release is indicted here so a retry does
 			// not re-resolve it; an empty provider listing is not a verdict and
@@ -2631,19 +2636,21 @@ func (h *PlaybackHandler) resolveVirtualStartWithVersionFallback(
 	// elapses rather than waiting out the full cold-start budget per version.
 	walkCtx, cancel := context.WithTimeout(r.Context(), virtualStartVersionFallbackDecisionBudget)
 	defer cancel()
-	// Declare the fresh-start intent explicitly: the version-fallback walk is a
-	// cold start, never a session-bound resolve. The stale-pin recovery checks
-	// this declaration before it will re-pin, so a future session-bound caller
-	// that reuses the walk with an undeclared context keeps the conservative
-	// session-bound default and refuses to touch a live session's binding.
-	walkReq := r.WithContext(withVirtualSessionBindingV3(walkCtx, false))
+	// Thread the caller's session-binding intent rather than forcing it false.
+	// The fresh-start start path declares unbound on the request context before
+	// calling this walk, so the stale-pin recovery may re-pin; a future
+	// session-bound caller that reuses the walk keeps its declaration (or the
+	// conservative session-bound default) and the recovery refuses to touch a
+	// live session's binding.
+	walkReq := r.WithContext(withVirtualSessionBindingV3(walkCtx, VirtualSessionBinding(r.Context())))
 
 	// Guarded stale-pin recovery for identity-less rows: when the pin id is
 	// absent from a non-empty live listing and the row carries no durable
 	// provider identity to rematch on, re-pin in memory to the best
-	// fingerprint-matched live candidate and retry once. Bounded to one attempt;
-	// a miss falls through to the alternate walk below with the terminal intact.
-	if recovered, recoveredOK := h.recoverStaleIdentityLessPinV3(walkReq, file, profileID, req, bandwidthCapKbps); recoveredOK {
+	// fingerprint-matched live candidate and retry once. Bounded to one attempt
+	// inside its own sub-budget; a miss falls through to the alternate walk
+	// below with the terminal intact.
+	if recovered, recoveredOK := h.recoverStaleIdentityLessPinV3(walkReq, file, profileID); recoveredOK {
 		return recovered, nil
 	}
 

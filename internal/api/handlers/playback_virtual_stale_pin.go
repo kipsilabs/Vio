@@ -2,6 +2,8 @@ package handlers
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -10,7 +12,7 @@ import (
 
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
 	"github.com/Silo-Server/silo-server/internal/models"
-	"github.com/Silo-Server/silo-server/internal/playback"
+	"github.com/Silo-Server/silo-server/internal/virtuallibrary"
 )
 
 // Guarded stale-pin recovery for identity-less rows.
@@ -63,21 +65,54 @@ const (
 	// tighter than the runtime tolerance used for probe plausibility because this
 	// gate authorizes adopting different bytes.
 	virtualStalePinDurationTolerance = 0.02
-	// virtualStalePinListBudget bounds the one provider listing the recovery pays.
-	// The walk's own decision budget still bounds the whole start.
-	virtualStalePinListBudget = 5 * time.Second
 )
+
+// virtualStalePinRecoveryBudget bounds the entire stale-pin recovery: its one
+// provider listing plus the single exact-candidate resolve and probe. It is a
+// small fraction of the version-fallback walk's decision budget so a slow
+// recovery yields the remaining time to the healthy alternate rows the walk
+// still has to try; a recovery that cannot finish inside this window is
+// abandoned and the walk proceeds to the alternates. Without this sub-budget a
+// synchronous recovery could consume the whole parent budget on one listing and
+// starve every alternate. It is a var so tests can pin it.
+var virtualStalePinRecoveryBudget = 500 * time.Millisecond
+
+// stalePinCandidateResolutionV3 is the outcome of the recovery's single
+// exact-candidate resolve+probe: the probed file (its Duration is the value the
+// probe measured, never a copied or stale value), the canonical candidate URI,
+// and the transport facts the caller needs to pin and persist it.
+type stalePinCandidateResolutionV3 struct {
+	file                *models.MediaFile
+	uri                 string
+	url                 string
+	headers             map[string]string
+	providerVideoHash   string
+	providerGUID        string
+	providerReleaseName string
+	providerReleaseSize int64
+}
 
 // recoverStaleIdentityLessPinV3 attempts the guarded in-memory re-pin described
 // above. It returns ok=true only when a fingerprint-matched live candidate was
-// resolved; any other outcome leaves the caller's terminal in place. It performs
-// exactly one candidate resolve (no loops) and never mutates the catalog pin.
+// resolved; any other outcome leaves the caller's terminal in place.
+//
+// The recovery obeys three safety contracts:
+//   - a single attempt: it resolves the exact re-pinned candidate through a
+//     bespoke one-candidate resolve (no sibling iteration, no stale-source
+//     fallback), never the general resolver whose candidate loop and fallback
+//     would break the promised retry bound;
+//   - validation before side effects: identity and duration are checked before
+//     anything is persisted or pinned, so a rejected recovery publishes no
+//     evidence and leaves no new sticky selection;
+//   - measured duration: the duration comparison uses the probe result's own
+//     measured runtime, and a no-prober or failed probe is a no-match rather
+//     than a comparison against the copied row's stale value.
+//
+// It never mutates the durable catalog pin.
 func (h *PlaybackHandler) recoverStaleIdentityLessPinV3(
 	r *http.Request,
 	file *models.MediaFile,
 	profileID string,
-	req playback.StartRequestV3,
-	bandwidthCapKbps int,
 ) (resolvedVirtualPlaybackSource, bool) {
 	if !virtualStalePinRecoveryEnabled || h == nil || file == nil || r == nil {
 		return resolvedVirtualPlaybackSource{}, false
@@ -85,10 +120,8 @@ func (h *PlaybackHandler) recoverStaleIdentityLessPinV3(
 	if h.VirtualPlaybackStreamLister == nil || h.VirtualMediaDetailedResolver == nil {
 		return resolvedVirtualPlaybackSource{}, false
 	}
-	// Cold start only, never a session-bound resolve. This function is called
-	// from the fresh-start version-fallback walk, which is unbound by
-	// construction, but the session binding is the one contract a stale-pin
-	// re-pin must never touch: a session already serving a release keeps
+	// Cold start only, never a session-bound resolve. The binding intent is the
+	// caller's, preserved by the walk: a session already serving a release keeps
 	// refusing an absent pin so the serve layer's rotation policy owns it. The
 	// guard makes that invariant explicit and testable rather than implicit in
 	// the caller's wiring.
@@ -114,11 +147,13 @@ func (h *PlaybackHandler) recoverStaleIdentityLessPinV3(
 	}
 	ctx := r.Context()
 	userID := apimw.GetUserID(ctx)
-	listCtx, cancel := context.WithTimeout(ctx, virtualStalePinListBudget)
+	// Bound the whole recovery well under the walk's decision budget so the
+	// alternates the walk still has to try keep their time.
+	recoveryCtx, cancel := context.WithTimeout(ctx, virtualStalePinRecoveryBudget)
+	defer cancel()
 	streams, err := h.VirtualPlaybackStreamLister.ListVirtualPlaybackStreams(
-		listCtx, neutralKey, userID, profileID, file.VirtualOwnerInstallationID,
+		recoveryCtx, neutralKey, userID, profileID, file.VirtualOwnerInstallationID,
 	)
-	cancel()
 	if err != nil || len(streams) == 0 {
 		// An empty (or failed) listing is a transient outage, not a renumber.
 		// Preserve the caller's terminal.
@@ -138,53 +173,151 @@ func (h *PlaybackHandler) recoverStaleIdentityLessPinV3(
 	if len(candidates) == 0 {
 		return resolvedVirtualPlaybackSource{}, false
 	}
-	match, found := virtualStalePinBestStreamMatch(file, candidates)
+	match, matchedStream, found := virtualStalePinBestStreamMatch(file, candidates)
 	if !found {
 		slog.DebugContext(ctx, "virtual stale-pin recovery found no fingerprint match",
 			"component", "api", "file_id", file.ID, "old_candidate_id", pinnedID,
 			"candidate_count", len(candidates))
 		return resolvedVirtualPlaybackSource{}, false
 	}
-	// Re-pin in memory and resolve the matched candidate exactly once. The row's
-	// durable ?result= is never rewritten; only process state moves.
+	// Resolve and probe the EXACT re-pinned candidate in a single attempt.
+	ownerID := effectiveVirtualOwner(match.VirtualOwnerInstallationID, file.VirtualOwnerInstallationID)
 	matchedID := virtualResultCandidateID(match.FilePath)
-	recovered, resolveErr := h.resolveVirtualPlaybackSource(
-		r, &match, profileID, false, nil, "", req.QualityPreference, bandwidthCapKbps, false,
-		virtualResolveOptionsV3{sessionBound: false, bypassProviderFloor: true},
-	)
-	if resolveErr != nil || recovered.File == nil {
-		return resolvedVirtualPlaybackSource{}, false
-	}
-	// Refuse a substitution: the recovery authorized serving the exact matched
-	// candidate, so a resolve that returned a different result id (a sibling the
-	// resolver preferred) must not be adopted under the re-pin. This keeps the
-	// recovery's blast radius to the candidate the fingerprint actually matched.
-	if got := virtualResultCandidateID(recovered.URI); got != "" && matchedID != "" && got != matchedID {
-		slog.DebugContext(ctx, "virtual stale-pin recovery refused a substituted candidate",
+	resolution, resolveErr := h.resolveStalePinCandidateOnceV3(recoveryCtx, &match, matchedID, matchedStream, ownerID, userID, profileID)
+	if resolveErr != nil {
+		slog.DebugContext(ctx, "virtual stale-pin recovery did not resolve the matched candidate",
 			"component", "api", "file_id", file.ID, "old_candidate_id", pinnedID,
-			"matched_candidate_id", matchedID, "resolved_candidate_id", got)
+			"matched_candidate_id", matchedID, "error", resolveErr)
 		return resolvedVirtualPlaybackSource{}, false
 	}
-	if !virtualStalePinDurationMatch(file.Duration, recovered.File.Duration) {
+	if !virtualStalePinDurationMatch(file.Duration, resolution.file.Duration) {
 		slog.DebugContext(ctx, "virtual stale-pin recovery rejected a duration mismatch",
 			"component", "api", "file_id", file.ID, "old_candidate_id", pinnedID,
-			"new_candidate_id", virtualResultCandidateID(recovered.URI),
-			"row_duration", file.Duration, "candidate_duration", recovered.File.Duration)
+			"new_candidate_id", virtualResultCandidateID(resolution.uri),
+			"row_duration", file.Duration, "candidate_duration", resolution.file.Duration)
 		return resolvedVirtualPlaybackSource{}, false
 	}
+	// Validation passed; only now may the recovery touch shared state. Pin the
+	// matched candidate for later starts and persist its probed evidence.
+	fingerprint := ""
+	if caps, ok := h.requestDeviceCapabilities(r); ok {
+		fingerprint = caps.Fingerprint()
+	}
+	stickyKey := bestResultCacheKey(file.ContentID, neutralKey, file.VirtualOwnerInstallationID, fingerprint)
+	h.pinVirtualStickyAt(stickyKey, resolution.uri, nextVirtualCacheGeneration())
+	h.persistVirtualProbeEvidence(ctx, file, resolution.uri, resolution.file, true, true)
 	slog.InfoContext(ctx, "virtual stale-pin recovery re-pinned an identity-less candidate in memory",
 		"component", "api", "file_id", file.ID, "old_candidate_id", pinnedID,
-		"new_candidate_id", virtualResultCandidateID(recovered.URI),
-		"virtual_uri", recovered.URI)
-	return recovered, true
+		"new_candidate_id", virtualResultCandidateID(resolution.uri),
+		"virtual_uri", resolution.uri)
+	return resolvedVirtualPlaybackSource{
+		URL:                 resolution.url,
+		URI:                 resolution.uri,
+		OwnerID:             ownerID,
+		File:                resolution.file,
+		ProbeSucceeded:      true,
+		Provenance:          ProbeProvenanceVerified,
+		ResolvedURL:         resolution.url,
+		ProviderVideoHash:   resolution.providerVideoHash,
+		ProviderGUID:        resolution.providerGUID,
+		ProviderReleaseName: resolution.providerReleaseName,
+		ProviderReleaseSize: resolution.providerReleaseSize,
+		RequestHeaders:      cloneHeaderMap(resolution.headers),
+	}, true
+}
+
+// resolveStalePinCandidateOnceV3 resolves and probes exactly one candidate for
+// the stale-pin recovery. It performs one provider resolve and at most one
+// probe, and it has no persistence or sticky-pin side effect: the general
+// resolver would iterate siblings and invoke the stale-source fallback before
+// returning, and would persist evidence and pin the candidate before the
+// recovery's own identity and duration checks ran. The caller validates the
+// returned identity and measured duration and only then persists and pins.
+func (h *PlaybackHandler) resolveStalePinCandidateOnceV3(
+	ctx context.Context,
+	match *models.MediaFile,
+	matchedID string,
+	matchedStream VirtualPlaybackStream,
+	ownerID int,
+	userID int,
+	profileID string,
+) (stalePinCandidateResolutionV3, error) {
+	// The recovery is a declared re-list: it must see the provider past the
+	// fresh-serve floor and the short provider-failure fail-fast, exactly as the
+	// general resolver's bypassProviderFloor did, without which a recent
+	// background failure would hide the renumbered candidate.
+	ctx = virtuallibrary.WithProviderOutageRelist(ctx)
+	res, err := h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
+		ctx, match.FilePath, ownerID, userID, profileID, true, nil, "",
+	)
+	if err != nil {
+		return stalePinCandidateResolutionV3{}, err
+	}
+	if strings.TrimSpace(res.URL) == "" {
+		return stalePinCandidateResolutionV3{}, errors.New("stale-pin candidate resolved without a stream URL")
+	}
+	resolvedURI := strings.TrimSpace(res.URI)
+	if resolvedURI == "" {
+		resolvedURI = match.FilePath
+	}
+	// The resolver must have returned the exact matched candidate. A sibling it
+	// preferred (a substitution) is not the bytes the fingerprint authorized.
+	if got := virtualResultCandidateID(resolvedURI); got != "" && matchedID != "" && got != matchedID {
+		return stalePinCandidateResolutionV3{}, fmt.Errorf("resolver substituted candidate %q for matched %q", got, matchedID)
+	}
+	probeTransient := cloneVirtualProbeTransient(*match)
+	probeTransient.FilePath = resolvedURI
+	probeTransient.VirtualOwnerInstallationID = ownerID
+	// Zero the copied row's duration so the fingerprint's duration tier is
+	// measured by the probe, never inherited from the previous pin. A prober
+	// that reports no runtime then leaves Duration at zero and the caller treats
+	// the recovery as a no-match rather than comparing a stale value.
+	probeTransient.Duration = 0
+	probed, probeErr := h.probeVirtualSource(ctx, res.URL, &probeTransient, cloneHeaderMap(res.RequestHeaders))
+	if probeErr != nil || probed == nil {
+		// No probe result means no measured duration: the recovery must not fall
+		// back to the copied row's stale runtime.
+		return stalePinCandidateResolutionV3{}, fmt.Errorf("stale-pin candidate probe failed: %w", probeErr)
+	}
+	if probed.Duration <= 0 {
+		// A probe that measured no runtime cannot confirm the fingerprint's
+		// duration tier, so the recovery is a no-match.
+		return stalePinCandidateResolutionV3{}, errors.New("stale-pin candidate probe measured no duration")
+	}
+	// A candidate the serve layer already indicted must never be re-served by the
+	// recovery. Check the identity the resolver actually returned, exactly as the
+	// general resolver's verdict gate does.
+	if err := h.virtualCandidateVerdictError(ctx, resolvedURI, match, ownerID, false); err != nil {
+		return stalePinCandidateResolutionV3{}, err
+	}
+	probed.FilePath = resolvedURI
+	if match.ID > 0 {
+		probed.ID = match.ID
+		probed.MediaFolderID = match.MediaFolderID
+	}
+	// Fill declared gaps the same way the general resolver does, so the served
+	// file carries the candidate's language/codec hints where the probe left
+	// them empty. This never overwrites probed evidence.
+	mergeVirtualCandidateTracks(probed, matchedStream)
+	return stalePinCandidateResolutionV3{
+		file:                probed,
+		uri:                 resolvedURI,
+		url:                 res.URL,
+		headers:             res.RequestHeaders,
+		providerVideoHash:   res.ProviderVideoHash,
+		providerGUID:        res.ProviderGUID,
+		providerReleaseName: res.ProviderReleaseName,
+		providerReleaseSize: res.ProviderReleaseSize,
+	}, nil
 }
 
 // virtualStalePinBestStreamMatch returns the best live candidate whose declared
-// evidence matches the row's stored fingerprint, re-pinned as a copy of the row.
-// "Best" is the first match in provider rank order: the listing is already
-// ranked, so the first fingerprint match is the strongest one, and a single
-// deterministic choice keeps the recovery one-shot. It reports ok=false when no
-// candidate matches.
+// evidence matches the row's stored fingerprint, re-pinned as a copy of the row
+// alongside the matched stream itself (whose declared tracks the caller may merge
+// into the probe result). "Best" is the first match in provider rank order: the
+// listing is already ranked, so the first fingerprint match is the strongest one,
+// and a single deterministic choice keeps the recovery one-shot. It reports
+// ok=false when no candidate matches.
 //
 // The returned copy keeps the row's catalog id, its declared fingerprint fields
 // (size, codec, resolution, duration) — those are what the match was made
@@ -196,7 +329,7 @@ func (h *PlaybackHandler) recoverStaleIdentityLessPinV3(
 // verified for the new candidate). The cleared state makes the caller resolve
 // and probe the matched candidate afresh, which is the only thing that may
 // authorize serving its bytes or inventory.
-func virtualStalePinBestStreamMatch(row *models.MediaFile, candidates []VirtualPlaybackStream) (models.MediaFile, bool) {
+func virtualStalePinBestStreamMatch(row *models.MediaFile, candidates []VirtualPlaybackStream) (models.MediaFile, VirtualPlaybackStream, bool) {
 	for _, candidate := range candidates {
 		if !virtualStalePinStreamFingerprintMatch(row, candidate) {
 			continue
@@ -208,9 +341,9 @@ func virtualStalePinBestStreamMatch(row *models.MediaFile, candidates []VirtualP
 		// the served path changes.
 		match.VirtualOwnerInstallationID = effectiveVirtualOwner(candidate.OwnerInstallationID, row.VirtualOwnerInstallationID)
 		clearVirtualStalePinOldCandidateState(&match)
-		return match, true
+		return match, candidate, true
 	}
-	return models.MediaFile{}, false
+	return models.MediaFile{}, VirtualPlaybackStream{}, false
 }
 
 // clearVirtualStalePinOldCandidateState drops the fields a re-pinned row must
