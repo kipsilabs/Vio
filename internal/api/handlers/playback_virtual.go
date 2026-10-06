@@ -618,6 +618,25 @@ func (g *virtualDetachedGate) tryAcquire() bool {
 	}
 }
 
+// acquire takes a slot, blocking until one is free or ctx ends. It is only for
+// dedicated background workers that are allowed to wait off the request path
+// (the post-commit probe pool): the request path must keep using tryAcquire so
+// it never stalls. A nil gate admits immediately.
+func (g *virtualDetachedGate) acquire(ctx context.Context) bool {
+	if g == nil {
+		return true
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case g.slots <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
 // release returns a slot. It never blocks: a release without a matching acquire
 // is a bug, and blocking on it would make things worse.
 func (g *virtualDetachedGate) release() {
@@ -1373,6 +1392,14 @@ type resolvedVirtualPlaybackSource struct {
 	// release re-identified, not a substitution, and a rotation that requires
 	// release continuity may accept it.
 	IdentityRematched bool
+	// DeferredProbe, when non-nil, is the probe the fresh-start resolve wants
+	// run after the transport commits and the first-byte URL is handed back.
+	// The resolve deliberately does not spawn it inline: session creation,
+	// recipe persistence, and transport commit run first so the client gets a
+	// playable URL without waiting on ffprobe enumeration, and the start path
+	// spawns the probe the moment the URL exists. Nil for a resolve that probed
+	// synchronously or had nothing to probe.
+	DeferredProbe *virtualDeferredProbeV3
 }
 
 // virtualProbeIdentity is the durable provider identity of the candidate a
@@ -1612,6 +1639,14 @@ type virtualResolveOptionsV3 struct {
 	// automatic resolves never set it and stay on the floor. The startup
 	// budgets still bound the recovery, and exhaustion keeps its honest cause.
 	bypassProviderFloor bool
+	// deferProbePastCommit hands the candidate-declared upgrade probe back to
+	// the caller instead of spawning it on the start path, so session creation,
+	// recipe persistence, and the transport commit run before any ffprobe. Only
+	// the fresh-start resolve sets it: its caller (the v3 start path) spawns the
+	// probe once the first-byte URL exists and marks the plan tracks_pending.
+	// A synchronous replan/rehydration leaves it false so the probed inventory
+	// is available on its response.
+	deferProbePastCommit bool
 }
 
 // virtualCandidateRotationContextKeyV3 carries the rotation intent across the
@@ -2736,10 +2771,19 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				transient.HDR = true
 			}
 			h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
+			// The ffprobe enumeration is deliberately not spawned inline on the
+			// fresh-start path: the resolve hands the probe to the start path,
+			// which spawns it only after the transport commit and the first-byte
+			// URL. Session creation, recipe persistence, and the commit therefore
+			// run without waiting on a multi-second remote ffprobe, and the
+			// client gets its playable URL immediately. A caller that needs the
+			// probed inventory on the response (a synchronous replan/rehydration)
+			// does not opt in and keeps the inline probe below.
+			var deferred *virtualDeferredProbeV3
 			if h.VirtualPlaybackSourceProber != nil || h.VirtualPlaybackSourceProberWithHeaders != nil {
 				probeKey := virtualProbeFailureKey(cand.URI, oid)
 				probeTransient := cloneVirtualProbeTransient(transient)
-				// Zero the duration so the background probe measures the
+				// Zero the duration so the deferred probe measures the
 				// empirical duration instead of inheriting the catalog value.
 				probeTransient.Duration = 0
 				if virtualProbeFailures.recent(probeKey) {
@@ -2753,34 +2797,34 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 						URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenanceDeclared, ResolutionAssumed: resolutionAssumed,
 					}, resolvedIdentity, resolvedRematched), nil
 				}
-				probeCand := cand
-				expectedRuntimeMinutes := h.virtualExpectedRuntimeMinutes(r.Context(), file)
-				if gate := h.detachedGate(); gate.tryAcquire() {
-					// The start path may outlive the request (the client can
-					// disconnect while the probe completes), so its context
-					// drops the request cancellation but still follows the
-					// service lifecycle. The goroutine starts after the
-					// synchronous provider resolve returned, so the fetch time
-					// does not consume this budget.
-					bgCtx, bgCancel := h.virtualDetachedContext(r.Context(), virtualBackgroundProbeBudget)
-					go func() {
-						defer gate.release()
-						defer bgCancel()
-						h.probeVirtualSourceAndPersist(bgCtx, stickyKey, file, streamURL, probeTransient, probeCand, expectedRuntimeMinutes, oid)
-					}()
+				if options.deferProbePastCommit {
+					deferred = &virtualDeferredProbeV3{
+						stickyKey:              stickyKey,
+						file:                   file,
+						streamURL:              streamURL,
+						probeTransient:         &probeTransient,
+						cand:                   cand,
+						expectedRuntimeMinutes: h.virtualExpectedRuntimeMinutes(r.Context(), file),
+						ownerID:                oid,
+					}
 				} else {
-					slog.WarnContext(r.Context(), "virtual background probe skipped: detached worker budget exhausted",
-						"component", "api", "candidate_uri", cand.URI)
-					// This candidate is the one the foreground request will
-					// serve, so gate pressure must not leave its row unprobed
-					// and force the slow list+probe path on every later play.
-					// One bounded synchronous probe+direct write per foreground
-					// request keeps the fallback from becoming a second pool.
-					h.probeVirtualCandidateForegroundFallback(r.Context(), stickyKey, file, streamURL, probeTransient, probeCand, expectedRuntimeMinutes, oid)
+					probeCand := cand
+					expectedRuntimeMinutes := h.virtualExpectedRuntimeMinutes(r.Context(), file)
+					if gate := h.detachedGate(); gate.tryAcquire() {
+						bgCtx, bgCancel := h.virtualDetachedContext(r.Context(), virtualBackgroundProbeBudget)
+						go func() {
+							defer gate.release()
+							defer bgCancel()
+							h.probeVirtualSourceAndPersist(bgCtx, stickyKey, file, streamURL, probeTransient, probeCand, expectedRuntimeMinutes, oid)
+						}()
+					} else {
+						h.probeVirtualCandidateForegroundFallback(r.Context(), stickyKey, file, streamURL, probeTransient, probeCand, expectedRuntimeMinutes, oid)
+					}
 				}
 			}
 			return withResolvedCandidate(&resolvedVirtualPlaybackSource{
 				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenancePending, ResolutionAssumed: resolutionAssumed,
+				DeferredProbe: deferred,
 			}, resolvedIdentity, resolvedRematched), nil
 		}
 		if h.VirtualPlaybackSourceProber == nil && h.VirtualPlaybackSourceProberWithHeaders == nil {
@@ -3148,7 +3192,36 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersist(
 	expectedRuntimeMinutes int,
 	ownerInstallationID int,
 	fence ...func() bool,
-) {
+) string {
+	var bindingFence func() bool
+	if len(fence) > 0 {
+		bindingFence = fence[0]
+	}
+	return h.probeVirtualSourceAndPersistWith(bgCtx, stickyKey, catalogFile, probeURL, probeTransient, probeCand, expectedRuntimeMinutes, ownerInstallationID, false, bindingFence)
+}
+
+// probeVirtualSourceAndPersistWith is probeVirtualSourceAndPersist with an
+// explicit evidence-write mode. durableEvidence makes the catalog write
+// synchronous and its result authoritative: the probe reports verified only when
+// the write committed, and reports failed when the write is rejected or
+// terminally fails. The deferred post-commit probe uses it so a session's
+// outcome never claims a verified menu while the row the poll reads still shows
+// the old one — the premature-verified case where a client stops loading on the
+// old menu. Ordinary background callers pass false and keep the queued,
+// coalescing write, where a positive verdict means "probe succeeded", not "row
+// committed", exactly as before.
+func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
+	bgCtx context.Context,
+	stickyKey string,
+	catalogFile *models.MediaFile,
+	probeURL string,
+	probeTransient models.MediaFile,
+	probeCand VirtualPlaybackStream,
+	expectedRuntimeMinutes int,
+	ownerInstallationID int,
+	durableEvidence bool,
+	fence func() bool,
+) string {
 	probeKey := virtualProbeFailureKey(probeCand.URI, ownerInstallationID)
 	probeCtx, probeCancel := context.WithTimeout(bgCtx, virtualBackgroundProbeBudget)
 	probed, probeErr := h.probeVirtualSource(probeCtx, probeURL, &probeTransient, probeCand.RequestHeaders)
@@ -3157,10 +3230,10 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersist(
 	// scheduled for. Re-check the fence before this probe touches shared state:
 	// a superseded verdict must not mark the damper, unpin the current
 	// candidate, or persist evidence onto a row the session no longer serves.
-	if len(fence) > 0 && fence[0] != nil && !fence[0]() {
+	if fence != nil && !fence() {
 		slog.InfoContext(bgCtx, "virtual probe evidence dropped: candidate binding moved during the probe",
 			"component", "api", "candidate_uri", probeCand.URI, "file_id", catalogFile.ID)
-		return
+		return ""
 	}
 	if probeErr != nil || probed == nil {
 		virtualProbeFailures.mark(probeKey)
@@ -3174,7 +3247,7 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersist(
 			virtualProbeFailures.count(probeKey) >= virtualProbeFailureRepeatThreshold {
 			h.unpinVirtualSticky(stickyKey, probeCand.URI)
 		}
-		return
+		return probeOutcomeFailed
 	}
 	if !virtualRuntimePlausible(probed.Duration, expectedRuntimeMinutes) {
 		virtualProbeFailures.mark(probeKey)
@@ -3182,7 +3255,7 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersist(
 			"component", "api", "candidate_uri", probeCand.URI, "file_id", catalogFile.ID,
 			"probed_duration_seconds", probed.Duration, "expected_runtime_minutes", expectedRuntimeMinutes)
 		h.unpinVirtualSticky(stickyKey, probeCand.URI)
-		return
+		return probeOutcomeFailed
 	}
 	virtualProbeFailures.clear(probeKey)
 	if probeTransient.ID > 0 {
@@ -3193,7 +3266,97 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersist(
 		probed.Duration = probeTransient.Duration
 	}
 	mergeVirtualCandidateTracks(probed, probeCand)
+	if durableEvidence {
+		// The outcome must not outrun the write: report verified only when the
+		// durable write committed the enumerated tracks onto the row the
+		// inventory poll reads. A rejected or failed write is a terminal failed
+		// outcome so the client leaves loading instead of showing a stale menu
+		// as verified.
+		if !h.persistVirtualProbeEvidenceDurable(bgCtx, catalogFile, probeCand.URI, probed, true) {
+			slog.WarnContext(bgCtx, "deferred virtual probe evidence write did not commit; reporting failed",
+				"component", "api", "candidate_uri", probeCand.URI, "file_id", catalogFile.ID)
+			return probeOutcomeFailed
+		}
+		// Integration note: this durable write commits a verified inventory
+		// for a session whose committed recipe was built from declared
+		// metadata, so a probe that reorders the audio tracks can leave the
+		// executable default-audio selection on the wrong language. The
+		// default-audio reconciliation work on the shared evidence path runs a
+		// post-commit correction for exactly that case; this deferred path
+		// bypasses it and must run the same correction once that lands, or
+		// deferred sessions keep the pre-reconciliation behavior. Until then
+		// the committed selection is untouched here, which is the correct
+		// conservative outcome: a failed or reordered menu never switches a
+		// viewer's audio track on its own.
+		return probeOutcomeVerified
+	}
 	h.persistVirtualProbeEvidence(bgCtx, catalogFile, probeCand.URI, probed, true, false)
+	return probeOutcomeVerified
+}
+
+// persistVirtualProbeEvidenceDurable performs one synchronous, durable evidence
+// write for a caller whose outcome depends on the evidence being visible before
+// the outcome is recorded. It exists for the deferred post-commit probe: that
+// probe's terminal outcome is stored on the session and read by the inventory
+// poll, so reporting verified while the row still shows its old menu would make
+// a client stop loading on stale tracks. Visibility comes from ordering, not a
+// read-back — the write commits synchronously before the outcome and publish, so
+// a poll that follows the outcome reads the committed row. A queued write cannot
+// give that guarantee — it may still be pending, or be rejected, or coalesce
+// onto a later snapshot — so the durable path bypasses the buffer rather than
+// guessing.
+//
+// The write prefers the explicit adoption-result saver so it can tell a genuine
+// commit (MetadataUpdated) from a no-op CAS miss. The bare row-count saver only
+// reports how many rows matched, so it is treated as committed when it affected
+// at least one row and as not-committed otherwise — it cannot distinguish a CAS
+// miss (superseded snapshot) from a plain no-op, but a zero-row write is never
+// reported verified. It returns whether the probe evidence is committed and
+// therefore readable from the catalog row.
+func (h *PlaybackHandler) persistVirtualProbeEvidenceDurable(ctx context.Context, catalogFile *models.MediaFile, resolvedPath string, probed *models.MediaFile, stampProbe bool) bool {
+	args, _, ok := h.virtualProbeEvidenceArgs(ctx, catalogFile, resolvedPath, probed, stampProbe)
+	if !ok {
+		slog.WarnContext(ctx, "durable virtual probe evidence write refused before execution",
+			"component", "api", "file_id", catalogFileIDOrZero(catalogFile), "candidate_uri", resolvedPath)
+		return false
+	}
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), virtualEvidencePersistBudget)
+	defer cancel()
+	if h.VirtualFileMetadataSaver != nil {
+		result, err := h.VirtualFileMetadataSaver(writeCtx, args)
+		if err != nil {
+			slog.WarnContext(ctx, "durable virtual probe evidence write failed",
+				"component", "api", "file_id", args.FileID, "error", err)
+			return false
+		}
+		if result.MetadataUpdated {
+			return true
+		}
+		// A CAS miss is the expected outcome when a newer writer already
+		// committed the row; the evidence this probe enumerated is then
+		// superseded and must not be reported verified.
+		slog.WarnContext(ctx, "durable virtual probe evidence write matched no row (superseded snapshot)",
+			"component", "api", "file_id", args.FileID, "candidate_uri", resolvedPath)
+		return false
+	}
+	if h.VirtualFileSaver == nil {
+		return false
+	}
+	rows, err := h.VirtualFileSaver(writeCtx, args)
+	if err != nil {
+		slog.WarnContext(ctx, "durable virtual probe evidence write failed",
+			"component", "api", "file_id", args.FileID, "error", err)
+		return false
+	}
+	return rows > 0
+}
+
+// catalogFileIDOrZero is a nil-safe file id for a log attribute.
+func catalogFileIDOrZero(file *models.MediaFile) int {
+	if file == nil {
+		return 0
+	}
+	return file.ID
 }
 
 // virtualProbeFromCache returns a probe already completed for this candidate's
@@ -3973,7 +4136,7 @@ func (h *PlaybackHandler) persistVirtualProbeEvidence(ctx context.Context, catal
 // alternate-version row must bind the evidence to the version that actually
 // plays, not be dropped onto the pinned row forever.
 func (h *PlaybackHandler) virtualProbeEvidenceArgs(ctx context.Context, catalogFile *models.MediaFile, resolvedPath string, probed *models.MediaFile, stampProbe bool) (models.VirtualFilePersistArgs, int, bool) {
-	if h == nil || h.VirtualFileSaver == nil || catalogFile == nil || probed == nil || catalogFile.ID <= 0 {
+	if h == nil || (h.VirtualFileSaver == nil && h.VirtualFileMetadataSaver == nil) || catalogFile == nil || probed == nil || catalogFile.ID <= 0 {
 		return models.VirtualFilePersistArgs{}, 0, false
 	}
 	identityRow, evidence, ok := h.virtualProbeEvidenceRotateTarget(ctx, catalogFile, resolvedPath, probed)
