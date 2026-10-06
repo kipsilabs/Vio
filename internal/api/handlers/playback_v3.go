@@ -2665,11 +2665,26 @@ func (h *PlaybackHandler) resolveVirtualStartWithVersionFallback(
 	// elapses rather than waiting out the full cold-start budget per version.
 	walkCtx, cancel := context.WithTimeout(r.Context(), virtualStartVersionFallbackDecisionBudget)
 	defer cancel()
+	// Declare the fresh-start intent explicitly: the version-fallback walk is a
+	// cold start, never a session-bound resolve. The stale-pin recovery checks
+	// this declaration before it will re-pin, so a future session-bound caller
+	// that reuses the walk with an undeclared context keeps the conservative
+	// session-bound default and refuses to touch a live session's binding.
+	walkReq := r.WithContext(withVirtualSessionBindingV3(walkCtx, false))
+
+	// Guarded stale-pin recovery for identity-less rows: when the pin id is
+	// absent from a non-empty live listing and the row carries no durable
+	// provider identity to rematch on, re-pin in memory to the best
+	// fingerprint-matched live candidate and retry once. Bounded to one attempt;
+	// a miss falls through to the alternate walk below with the terminal intact.
+	if recovered, recoveredOK := h.recoverStaleIdentityLessPinV3(walkReq, file, profileID, req, bandwidthCapKbps); recoveredOK {
+		return recovered, nil
+	}
+
 	alternates, alternateErr := h.findAlternateFiles(walkCtx, file, alternateOrderingForClient(req.Capabilities))
 	if alternateErr != nil || len(alternates) == 0 {
 		return resolved, resolveErr
 	}
-	walkReq := r.WithContext(walkCtx)
 
 	// candidateRows keeps one entry per walkable alternate, in fallback order.
 	// Skipping an AltMount-failed version here (rather than inside the resolve
