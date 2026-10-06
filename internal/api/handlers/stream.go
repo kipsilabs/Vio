@@ -1005,6 +1005,77 @@ func resolvedVirtualCandidatePath(resolved ResolvedVirtualMedia) string {
 	return uri
 }
 
+// virtualProxyDisposition names how a failed direct-play proxy attempt ended
+// before any heal or rotation runs: the first-attempt verdict the verdict log
+// records. Client cancellation is the viewer's own doing; relay_not_found is
+// the lapsed registration the same-release retry covers; relay_temporary is
+// the upstream 5xx the rotation treats as availability, not a dead release;
+// committed means the response had committed headers when the error arrived
+// (headers written, not necessarily media bytes — mid-stream copy failures
+// panic with ErrAbortHandler instead of reaching this verdict); failed_open
+// is everything else. The disposition is a log value only and never steers
+// recovery: the branches below keep their own conditions.
+func virtualProxyDisposition(ctx context.Context, proxyErr error, statusCode int, relayNotFound, relayTemporary bool) string {
+	if isClientCancellation(ctx, proxyErr) {
+		return "client_canceled"
+	}
+	if relayNotFound {
+		return "relay_not_found"
+	}
+	if relayTemporary {
+		return "relay_temporary"
+	}
+	if statusCode != 0 {
+		return "committed"
+	}
+	return "failed_open"
+}
+
+// logVirtualProxyVerdict records the first-attempt serve verdict of a failed
+// direct-play proxy: the session, the pinned candidate, the candidate the
+// attempt served, and the disposition above. The delivered candidate id is the
+// ?result= identity on the path the transport actually served; at verdict time
+// no heal or rotation has run yet, so it agrees with the pin on the common
+// path and is empty when the attempt failed before serving one. Provider URLs
+// never appear here: only provider-neutral virtual URIs. Client cancellation
+// logs at debug; a genuine failure keeps its WARN so it stays visible in the
+// operational log. The verdict is first-attempt classification, not the final
+// recovery outcome: a later heal or rotation can still serve the request.
+func logVirtualProxyVerdict(ctx context.Context, sessionID string, file *models.MediaFile, deliveredPath, disposition string, proxyErr error) {
+	pinnedID := virtualCandidateID(file)
+	deliveredID := virtualResultCandidateID(deliveredPath)
+	attrs := []any{
+		"component", "api",
+		"session", sessionID,
+		"playback_session_id", sessionID,
+		"pinned_candidate_id", pinnedID,
+		"delivered_candidate_id", deliveredID,
+		"disposition", disposition,
+	}
+	if file != nil {
+		attrs = append(attrs, "file_id", file.ID)
+	}
+	if proxyErr != nil {
+		attrs = append(attrs, "error", logredact.SanitizeURLError(proxyErr))
+	}
+	if disposition == "client_canceled" {
+		slog.DebugContext(ctx, "virtual stream proxy verdict", attrs...)
+		return
+	}
+	slog.WarnContext(ctx, "virtual stream proxy verdict", attrs...)
+}
+
+// virtualCandidateID is the ?result= identity bound to a catalog row's
+// virtual URI, or "" when the row carries no explicit pick. The log field
+// must never be a fabricated join key, so absence stays empty. A nil file
+// has no identity either.
+func virtualCandidateID(file *models.MediaFile) string {
+	if file == nil {
+		return ""
+	}
+	return virtualResultCandidateID(file.FilePath)
+}
+
 func hasVirtualMediaResolver(h *StreamHandler) bool {
 	return h != nil && (h.VirtualMediaResolver != nil || h.VirtualMediaDetailedResolver != nil || h.VirtualMediaRefreshResolver != nil)
 }
@@ -1417,6 +1488,17 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 			}
 			proxy.ServeHTTP(streamWriter, r)
 			if lastProxyErr != nil {
+				// Log the first-attempt serve verdict while the recovery state
+				// is still observable: which candidate the attempt served and
+				// how that attempt ended. This is first-attempt
+				// classification, not the final recovery outcome — a later
+				// heal or rotation can still serve the request. A later 503
+				// names only the status; this line names the release and the
+				// path taken, so the next virtual_stream_unavailable is a
+				// join, not forensics. Client cancellation stays debug (see
+				// logVirtualStreamFailure); a genuine failure keeps its WARN.
+				disposition := virtualProxyDisposition(r.Context(), lastProxyErr, streamWriter.StatusCode(), relayNotFound, relayTemporary)
+				logVirtualProxyVerdict(r.Context(), sessionID, file, deliveredPath, disposition, lastProxyErr)
 				// A client that navigated away is not a candidate failure:
 				// never stamp the pinned release known-bad or spend a failover
 				// resolve on it. The upstream request already aborted with the
@@ -1609,7 +1691,7 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 				if lastProxyErr != nil {
 					h.handleTransportStartFailure(r.Context(), session, file, lastProxyErr)
 					if streamWriter.StatusCode() == 0 {
-						logVirtualStreamFailure(r.Context(), sessionID, file, lastProxyErr)
+						logVirtualStreamFailure(r.Context(), sessionID, file, lastProxyErr, deliveredPath)
 						writeErrorCause(streamWriter, http.StatusBadGateway, "virtual_stream_unavailable", "Failed to stream virtual media source", lastProxyErr)
 					}
 				}
@@ -2774,6 +2856,7 @@ func (h *StreamHandler) handleTransportStartFailure(ctx context.Context, session
 	slog.WarnContext(ctx, "stream transport startup failed", "component", "api",
 		"session", session.ID,
 		"file_id", session.MediaFileID,
+		"pinned_candidate_id", virtualCandidateID(file),
 		"error", err,
 		"playback_session_id", session.ID,
 	)

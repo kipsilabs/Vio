@@ -29,6 +29,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/scanner"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary/resolver"
+	chimw "github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"golang.org/x/text/language"
@@ -1497,11 +1498,21 @@ func (t *virtualResolveTrace) finishBudget() {
 // runs first in log), so the reported elapsed and the exceeded verdict can
 // never disagree near the boundary.
 func (t *virtualResolveTrace) fields() []any {
+	return t.fieldsWithContext(context.Background())
+}
+
+// fieldsWithContext is fields plus the edge request id, read from the start
+// request's context. It joins this line to the start that owns it (protocol
+// v3 start timing) and to the provider listing it may have triggered
+// (provider candidates fetched). Empty stays empty rather than a fabricated
+// join key. Split out so tests can call fields() without a request context.
+func (t *virtualResolveTrace) fieldsWithContext(ctx context.Context) []any {
 	elapsedMS := t.budgetElapsed.Milliseconds()
 	if !t.budgetRan {
 		elapsedMS = time.Since(t.started).Milliseconds()
 	}
 	attrs := []any{
+		requestIDLogKeyV3, chimw.GetReqID(ctx),
 		"elapsed_ms", elapsedMS,
 		"total_ms", t.totalMS(), //nolint:goconst // log attribute key/value, kept inline for readability.
 		"candidates", t.candidates, //nolint:goconst // log attribute key/value, kept inline for readability.
@@ -1537,7 +1548,7 @@ func (t *virtualResolveTrace) log(ctx context.Context, file *models.MediaFile) {
 	}
 	t.finishBudget()
 	attrs := []any{logComponentKey, "api", "content_id", file.ContentID} //nolint:goconst // log attribute key/value, kept inline for readability.
-	attrs = append(attrs, t.fields()...)
+	attrs = append(attrs, t.fieldsWithContext(ctx)...)
 	slog.InfoContext(ctx, "virtual resolve timing", attrs...)
 }
 
