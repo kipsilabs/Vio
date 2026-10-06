@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Silo-Server/silo-server/internal/logredact"
 )
@@ -173,10 +174,43 @@ func attrValue(v slog.Value) any {
 	case slog.KindTime:
 		return v.Time().UTC().Format(time.RFC3339Nano)
 	case slog.KindAny:
+		// Errors marshal to {} with encoding/json, which is how
+		// "error:{}" rows appear in operational_logs. Store the
+		// sanitized message text so a transport or resolve failure
+		// stays diagnosable. SanitizeURLError strips URL-embedded
+		// credentials; it passes non-URL errors through unchanged, so
+		// this sink is safe for URL-bearing transport errors but is not
+		// a general secret scrubber for prose-embedded secrets. The
+		// message is bounded so a wrapped multi-error chain cannot
+		// bloat the attrs column.
+		if err, ok := v.Any().(error); ok {
+			if err == nil {
+				return ""
+			}
+			return truncateErrorText(logredact.SanitizeURLError(err).Error())
+		}
 		return snapshot(v.Any())
 	default:
 		return v.String()
 	}
+}
+
+// maxPersistedErrorText bounds one error attribute persisted to
+// operational_logs. Multi-error joins can chain several provider messages;
+// the bound keeps one failure from bloating the attrs column. Truncation
+// keeps a prefix (the outermost, most actionable message) and records the
+// original length, and it cuts on UTF-8 boundaries.
+const maxPersistedErrorText = 2000
+
+func truncateErrorText(message string) string {
+	if len(message) <= maxPersistedErrorText {
+		return message
+	}
+	cut := maxPersistedErrorText
+	for cut > 0 && !utf8.ValidString(message[:cut]) {
+		cut--
+	}
+	return message[:cut] + fmt.Sprintf("…[truncated %d bytes]", len(message)-cut)
 }
 
 // snapshot encodes a value the caller still owns, such as a map, slice or
