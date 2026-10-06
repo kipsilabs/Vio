@@ -112,7 +112,7 @@ func (r *syncPlaybackFileResolver) GetByID(context.Context, int) (*models.MediaF
 	return &cp, nil
 }
 
-// update runs fn against the row under the lock, modelling a committed catalog
+// update runs fn against the row under the lock, modeling a committed catalog
 // write.
 func (r *syncPlaybackFileResolver) update(fn func(*models.MediaFile)) {
 	r.mu.Lock()
