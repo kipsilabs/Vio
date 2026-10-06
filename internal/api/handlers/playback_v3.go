@@ -2621,7 +2621,12 @@ func (h *PlaybackHandler) resolveVirtualStartWithVersionFallback(
 	// elapses rather than waiting out the full cold-start budget per version.
 	walkCtx, cancel := context.WithTimeout(r.Context(), virtualStartVersionFallbackDecisionBudget)
 	defer cancel()
-	walkReq := r.WithContext(walkCtx)
+	// Declare the fresh-start intent explicitly: the version-fallback walk is a
+	// cold start, never a session-bound resolve. The stale-pin recovery checks
+	// this declaration before it will re-pin, so a future session-bound caller
+	// that reuses the walk with an undeclared context keeps the conservative
+	// session-bound default and refuses to touch a live session's binding.
+	walkReq := r.WithContext(withVirtualSessionBindingV3(walkCtx, false))
 
 	// Guarded stale-pin recovery for identity-less rows: when the pin id is
 	// absent from a non-empty live listing and the row carries no durable
