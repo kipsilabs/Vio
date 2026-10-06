@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/Silo-Server/silo-server/internal/access"
+	"github.com/Silo-Server/silo-server/internal/models"
 )
 
 func TestPersonSearchScopeAndRankingPostgres(t *testing.T) {
@@ -81,9 +82,13 @@ func TestPersonSearchScopeAndRankingPostgres(t *testing.T) {
 			}
 		})
 	}
-	legacy, err := repo.Search(ctx, name, 1)
+	legacy, err := repo.SearchAlphabetical(ctx, name, 1, AccessFilter{})
 	if err != nil || len(legacy) != 1 || legacy[0].ID != ids[1] {
 		t.Fatalf("legacy alphabetical search changed: %+v, %v", legacy, err)
+	}
+	legacy, err = repo.SearchAlphabetical(ctx, name, 20, AccessFilter{})
+	if err != nil || len(legacy) != 4 || slices.ContainsFunc(legacy, func(p models.Person) bool { return p.ID == ids[4] }) {
+		t.Fatalf("legacy search listed a person with no visible credit: %+v, %v", legacy, err)
 	}
 }
 
@@ -191,6 +196,14 @@ func requireGetVisibleMatchesSearch(t *testing.T, repo *PersonRepository, query 
 	listed := make(map[int64]bool, len(searched))
 	for _, p := range searched {
 		listed[p.ID] = true
+	}
+	// The v1 bridge search lists the same people, in its own order.
+	legacy, err := repo.SearchAlphabetical(t.Context(), query, 100, filter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(legacy) != len(searched) || slices.ContainsFunc(legacy, func(p models.Person) bool { return !listed[p.ID] }) {
+		t.Fatalf("v1 search listed %+v, v2 search %+v", legacy, searched)
 	}
 	for _, id := range ids {
 		person, err := repo.GetVisible(t.Context(), id, filter)

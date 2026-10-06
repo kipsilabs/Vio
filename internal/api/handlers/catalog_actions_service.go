@@ -198,12 +198,13 @@ func (h *MetadataAIHandler) TranslateOnView(ctx context.Context, filter catalog.
 	return job, nil
 }
 
-// SearchPeople answers up to limit people matching query; limit <= 0 is 20.
-func (h *PeopleHandler) SearchPeople(ctx context.Context, query string, limit int) ([]PersonView, error) {
+// SearchPeople answers up to limit people matching query that the viewer can
+// see through at least one credit, as person detail requires; limit <= 0 is 20.
+func (h *PeopleHandler) SearchPeople(ctx context.Context, query string, limit int, filter catalog.AccessFilter) ([]PersonView, error) {
 	if limit <= 0 {
 		limit = 20
 	}
-	people, err := h.personRepo.Search(ctx, query, limit)
+	people, err := h.personRepo.SearchAlphabetical(ctx, query, limit, filter)
 	if err != nil {
 		return nil, apiError(http.StatusInternalServerError, "search_failed", err.Error())
 	}

@@ -19,7 +19,7 @@ import (
 type peopleRepository interface {
 	Get(ctx context.Context, id int64) (*models.Person, error)
 	GetVisible(ctx context.Context, id int64, filter catalog.AccessFilter) (*models.Person, error)
-	Search(ctx context.Context, query string, limit int) ([]models.Person, error)
+	SearchAlphabetical(ctx context.Context, query string, limit int, filter catalog.AccessFilter) ([]models.Person, error)
 	SearchScoped(ctx context.Context, query string, limit int, mediaScope string, filter catalog.AccessFilter) ([]models.Person, error)
 	Update(ctx context.Context, p models.Person) error
 }
@@ -95,8 +95,12 @@ type PersonView struct {
 
 // HandleSearch serves GET /api/people?q=&limit=
 func (h *PeopleHandler) HandleSearch(w http.ResponseWriter, r *http.Request) {
+	filter, ok := h.viewerAccessFilter(w, r)
+	if !ok {
+		return
+	}
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	resp, err := h.SearchPeople(r.Context(), r.URL.Query().Get("q"), limit)
+	resp, err := h.SearchPeople(r.Context(), r.URL.Query().Get("q"), limit, filter)
 	if err != nil {
 		writeAPIError(w, err)
 		return

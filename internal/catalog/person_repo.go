@@ -564,7 +564,11 @@ func (r *PersonRepository) GetByName(ctx context.Context, name string) (*models.
 	return &p, nil
 }
 
-// Search finds persons by name substring (case-insensitive), ordered by name.
+// SearchAlphabetical finds persons by name substring (case-insensitive), ordered by
+// name, among the people the viewer can see through at least one credit (the
+// predicate SearchScoped and GetVisible apply with no media scope). It keeps
+// the v1 bridge search's untrimmed query and alphabetical order; only the
+// visibility filter is added.
 //
 // The predicate is `name ILIKE '%term%'` rather than `LOWER(name) LIKE ...` so
 // the pg_trgm GIN index idx_people_name_trgm can serve it: for a rare 3+ char
@@ -572,33 +576,29 @@ func (r *PersonRepository) GetByName(ctx context.Context, name string) (*models.
 // scan. ILIKE is itself case-insensitive, so this stays equivalent to the prior
 // LOWER(name) comparison (including its existing treatment of % and _ in the
 // term as LIKE wildcards).
-func (r *PersonRepository) Search(ctx context.Context, query string, limit int) ([]models.Person, error) {
-	return r.search(ctx, query, limit, "", nil)
+func (r *PersonRepository) SearchAlphabetical(ctx context.Context, query string, limit int, filter AccessFilter) ([]models.Person, error) {
+	return r.search(ctx, query, limit, "", filter, false)
 }
 
 // SearchScoped ranks exact names first and restricts people to credits in the
 // selected media scope and viewer access before applying the limit. Empty scope
 // includes accessible credits across all media types.
 func (r *PersonRepository) SearchScoped(ctx context.Context, query string, limit int, mediaScope string, filter AccessFilter) ([]models.Person, error) {
-	return r.search(ctx, strings.TrimSpace(query), limit, mediaScope, &filter)
+	return r.search(ctx, strings.TrimSpace(query), limit, mediaScope, filter, true)
 }
 
-func (r *PersonRepository) search(ctx context.Context, query string, limit int, mediaScope string, filter *AccessFilter) ([]models.Person, error) {
+// search runs a name search over the people the viewer can see. rankExact
+// puts exact name matches first, as v2 search does.
+func (r *PersonRepository) search(ctx context.Context, query string, limit int, mediaScope string, filter AccessFilter, rankExact bool) ([]models.Person, error) {
 	if limit <= 0 {
 		limit = 20
 	}
 	args := []any{query, limit}
-	where := "name ILIKE '%' || $1 || '%'"
-	if filter != nil {
-		argIdx := 3
-		where += " AND " + personCreditVisibleSQL("people.id", MediaScopeItemTypes(mediaScope), *filter, &args, &argIdx)
-	}
-	order := "name ASC"
-	if filter != nil {
-		order = "name ASC, id ASC"
-		if query != "" {
-			order = "(LOWER(name) = LOWER($1)) DESC, " + order
-		}
+	argIdx := 3
+	where := "name ILIKE '%' || $1 || '%' AND " + personCreditVisibleSQL("people.id", MediaScopeItemTypes(mediaScope), filter, &args, &argIdx)
+	order := "name ASC, id ASC"
+	if rankExact && query != "" {
+		order = "(LOWER(name) = LOWER($1)) DESC, " + order
 	}
 	rows, err := r.pool.Query(ctx, `
 		SELECT id, name, sort_name, bio, birth_date, death_date, birthplace, homepage,

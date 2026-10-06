@@ -124,7 +124,8 @@ name, biography, or photo of someone who appears only in titles the viewer canno
 see. The v1 bridge routes `GET /api/v1/people/{id}` and
 `POST /api/v1/people/{id}/refresh`, and the Jellyfin-compatible `GET /Items/{id}`
 for a person, follow the same rule. The v1 bridge search `GET /api/v1/people?q=`
-does not filter by visibility, and the admin person routes are not filtered.
+lists only people the viewer can see this way and keeps its alphabetical order
+without exact-name ranking. The admin person routes are not filtered.
 
 Clients that warm a cache speculatively, such as web prefetching the cast of an
 open item, pass `prefetch=true`. A prefetch returns the same person but does not

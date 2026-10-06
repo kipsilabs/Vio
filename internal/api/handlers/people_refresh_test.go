@@ -192,11 +192,20 @@ func (r *matureOnlyPersonRepo) GetVisible(_ context.Context, id int64, filter ca
 	return &models.Person{ID: 1, Name: "Bryan Cranston", Bio: "Actor", TmdbID: "17419", UpdatedAt: time.Now()}, nil
 }
 
-func TestV1PersonDetailAndRefreshHonorViewerAccess(t *testing.T) {
+func (r *matureOnlyPersonRepo) SearchAlphabetical(_ context.Context, _ string, _ int, filter catalog.AccessFilter) ([]models.Person, error) {
+	r.filters = append(r.filters, filter)
+	if filter.MaxContentRating != "" {
+		return nil, nil
+	}
+	return []models.Person{{ID: 1, Name: "Bryan Cranston", Bio: "Actor", TmdbID: "17419", UpdatedAt: time.Now()}}, nil
+}
+
+func TestV1PeopleRoutesHonorViewerAccess(t *testing.T) {
 	repo := &matureOnlyPersonRepo{}
 	queue := &recordingPersonRefreshQueue{}
 	h := &PeopleHandler{personRepo: repo, itemsHandler: &ItemsHandler{}, refreshQueue: queue, refreshLimiter: ratelimit.NewMemoryLimiter()}
 	router := chi.NewRouter()
+	router.Get("/people", h.HandleSearch)
 	router.Get("/people/{id}", h.HandleGetPerson)
 	router.Post("/people/{id}/refresh", h.HandleRefreshPerson)
 	serve := func(method, path string, scope access.Scope) *httptest.ResponseRecorder {
@@ -219,6 +228,15 @@ func TestV1PersonDetailAndRefreshHonorViewerAccess(t *testing.T) {
 	got := repo.filters[len(repo.filters)-1]
 	if got.MaxContentRating != "TV-Y7" || !slices.Equal(got.AllowedLibraryIDs, []int{3}) {
 		t.Fatalf("detail did not pass the viewer's access: %+v", got)
+	}
+	if rec := serve(http.MethodGet, "/people?q=cranston", kid); rec.Code != http.StatusOK || strings.Contains(rec.Body.String(), "Cranston") {
+		t.Fatalf("hidden person in search: %d %s", rec.Code, rec.Body.String())
+	}
+	if got := repo.filters[len(repo.filters)-1]; got.MaxContentRating != "TV-Y7" {
+		t.Fatalf("search did not pass the viewer's access: %+v", got)
+	}
+	if rec := serve(http.MethodGet, "/people?q=cranston", adult); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"name":"Bryan Cranston"`) {
+		t.Fatalf("visible person in search: %d %s", rec.Code, rec.Body.String())
 	}
 	if rec := serve(http.MethodPost, "/people/1/refresh", kid); rec.Code != http.StatusNotFound {
 		t.Fatalf("hidden refresh: %d %s", rec.Code, rec.Body.String())
