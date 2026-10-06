@@ -2621,11 +2621,21 @@ func (h *PlaybackHandler) resolveVirtualStartWithVersionFallback(
 	// elapses rather than waiting out the full cold-start budget per version.
 	walkCtx, cancel := context.WithTimeout(r.Context(), virtualStartVersionFallbackDecisionBudget)
 	defer cancel()
+	walkReq := r.WithContext(walkCtx)
+
+	// Guarded stale-pin recovery for identity-less rows: when the pin id is
+	// absent from a non-empty live listing and the row carries no durable
+	// provider identity to rematch on, re-pin in memory to the best
+	// fingerprint-matched live candidate and retry once. Bounded to one attempt;
+	// a miss falls through to the alternate walk below with the terminal intact.
+	if recovered, recoveredOK := h.recoverStaleIdentityLessPinV3(walkReq, file, profileID, req, bandwidthCapKbps); recoveredOK {
+		return recovered, nil
+	}
+
 	alternates, alternateErr := h.findAlternateFiles(walkCtx, file, alternateOrderingForClient(req.Capabilities))
 	if alternateErr != nil || len(alternates) == 0 {
 		return resolved, resolveErr
 	}
-	walkReq := r.WithContext(walkCtx)
 
 	// candidateRows keeps one entry per walkable alternate, in fallback order.
 	// Skipping an AltMount-failed version here (rather than inside the resolve
