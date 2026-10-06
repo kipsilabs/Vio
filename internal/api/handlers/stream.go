@@ -1045,7 +1045,7 @@ func logVirtualProxyVerdict(ctx context.Context, sessionID string, file *models.
 	pinnedID := virtualCandidateID(file)
 	deliveredID := virtualResultCandidateID(deliveredPath)
 	attrs := []any{
-		"component", "api",
+		logComponentKey, "api", //nolint:goconst // log attribute key/value, kept inline for readability.
 		"session", sessionID,
 		"playback_session_id", sessionID,
 		"pinned_candidate_id", pinnedID,
