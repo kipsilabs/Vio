@@ -85,6 +85,18 @@ func (h *PlaybackHandler) recoverStaleIdentityLessPinV3(
 	if h.VirtualPlaybackStreamLister == nil || h.VirtualMediaDetailedResolver == nil {
 		return resolvedVirtualPlaybackSource{}, false
 	}
+	// Cold start only, never a session-bound resolve. This function is called
+	// from the fresh-start version-fallback walk, which is unbound by
+	// construction, but the session binding is the one contract a stale-pin
+	// re-pin must never touch: a session already serving a release keeps
+	// refusing an absent pin so the serve layer's rotation policy owns it. The
+	// guard makes that invariant explicit and testable rather than implicit in
+	// the caller's wiring.
+	if VirtualSessionBinding(r.Context()) {
+		slog.DebugContext(r.Context(), "virtual stale-pin recovery skipped: session-bound resolve",
+			"component", "api", "file_id", file.ID, "candidate_uri", file.FilePath)
+		return resolvedVirtualPlaybackSource{}, false
+	}
 	pinnedID := virtualResultCandidateID(file.FilePath)
 	if pinnedID == "" {
 		// A neutral row has no pin to go stale.
@@ -173,6 +185,17 @@ func (h *PlaybackHandler) recoverStaleIdentityLessPinV3(
 // ranked, so the first fingerprint match is the strongest one, and a single
 // deterministic choice keeps the recovery one-shot. It reports ok=false when no
 // candidate matches.
+//
+// The returned copy keeps the row's catalog id, its declared fingerprint fields
+// (size, codec, resolution, duration) — those are what the match was made
+// against — and the row's own lifecycle fields (verdict, delivery stamp). Every
+// field that describes the OLD pinned bytes is cleared: the stored provider URL
+// and its headers, the durable identity tiers, and the probe evidence. Without
+// this the re-pinned candidate would inherit the old pin's URL (serving the old
+// bytes under the new id) and its probe stamp (reporting the old inventory as
+// verified for the new candidate). The cleared state makes the caller resolve
+// and probe the matched candidate afresh, which is the only thing that may
+// authorize serving its bytes or inventory.
 func virtualStalePinBestStreamMatch(row *models.MediaFile, candidates []VirtualPlaybackStream) (models.MediaFile, bool) {
 	for _, candidate := range candidates {
 		if !virtualStalePinStreamFingerprintMatch(row, candidate) {
@@ -184,9 +207,47 @@ func virtualStalePinBestStreamMatch(row *models.MediaFile, candidates []VirtualP
 		// has no catalog row yet, and adopting its row id would fabricate one. Only
 		// the served path changes.
 		match.VirtualOwnerInstallationID = effectiveVirtualOwner(candidate.OwnerInstallationID, row.VirtualOwnerInstallationID)
+		clearVirtualStalePinOldCandidateState(&match)
 		return match, true
 	}
 	return models.MediaFile{}, false
+}
+
+// clearVirtualStalePinOldCandidateState drops the fields a re-pinned row must
+// not carry from its previous pin. It is deliberately narrower than
+// clearVirtualCandidateDeclaredMetadata: the row's declared fingerprint fields
+// (size, codec, resolution, duration) are kept because they are the evidence the
+// match was made against and drive candidate ranking, while the previous pin's
+// transport and probe evidence are cleared so the matched candidate is resolved
+// and probed on its own merits.
+//
+// The verdict (failed_at) and delivery (last_delivered_at) lifecycle fields are
+// deliberately left in place: they describe the row's own lifecycle, not the
+// bytes a candidate names, and the recovery must not alter verdict semantics.
+// Clearing the stored URL is what matters most: without it the durable-resume
+// fast path would serve the previous pin's URL under the new candidate's id.
+func clearVirtualStalePinOldCandidateState(file *models.MediaFile) {
+	if file == nil {
+		return
+	}
+	// The stored URL and its headers name the previous pin's bytes.
+	file.ResolvedURL = ""
+	file.ResolvedURLExpiresAt = nil
+	file.ProviderRequestHeaders = nil
+	// Durable identity tiers (empty on an identity-less row, cleared for safety
+	// so a partially-populated legacy row cannot leak them onto the new pin).
+	file.ProviderVideoHash = ""
+	file.ProviderGUID = ""
+	file.ProviderReleaseName = ""
+	file.ProviderReleaseSize = 0
+	// Probe evidence describes the previous pin's bytes; serving it as verified
+	// for the new candidate would be the premature-verified failure.
+	file.ProbeUpdatedAt = nil
+	file.ProbeSource = ""
+	file.VideoTracks = nil
+	file.AudioTracks = nil
+	file.SubtitleTracks = nil
+	file.ExternalSubtitles = nil
 }
 
 // virtualStalePinStreamFingerprintMatch is the cheap half of the fingerprint,

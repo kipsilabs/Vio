@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
@@ -65,6 +66,14 @@ func stalePinRecoveryHandler(live []VirtualPlaybackStream, pinnedURI string, fai
 }
 
 func stalePinRecoveryRequest() *http.Request {
+	// Declare the cold-start intent the version-fallback walk threads: the
+	// recovery refuses a session-bound resolve, and the conservative default is
+	// bound, so a unit test must opt in exactly as the walk does.
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/playback/start", nil)
+	return req.WithContext(withVirtualSessionBindingV3(req.Context(), false))
+}
+
+func stalePinSessionBoundRequest() *http.Request {
 	return httptest.NewRequest(http.MethodPost, "/api/v2/playback/start", nil)
 }
 
@@ -237,39 +246,144 @@ func TestStalePinRecoveryKillSwitchDisables(t *testing.T) {
 }
 
 // TestStalePinRecoveryIntegratedInVersionFallbackWalk proves the walk actually
-// invokes the recovery: an identity-less pin absent from the live listing
-// recovers to the fingerprint-matched candidate instead of terminaling. The
-// control run below (recovery disabled) proves the recovery is load-bearing.
+// invokes the recovery and that it is load-bearing: the primary resolve fails
+// because the provider answers empty for the pin's own listing AND for the
+// stale-source fallback's re-list, but the recovery's neutral re-list answers a
+// renumbered candidate whose fingerprint matches, so the walk recovers instead
+// of terminaling. The control run below (recovery disabled) reaches the same
+// dead pin and must terminal, proving the recovery — not an ordinary
+// substitution — is what recovered it.
+//
+// The lister answers empty for the first two calls (the primary listing and the
+// fallback's re-list) and the renumbered sibling thereafter, so the primary
+// genuinely terminals before the recovery is consulted. The resolver answers
+// the pin with an absent-pin refusal (a genuine renumber) and the sibling with a
+// successful resolve.
 func TestStalePinRecoveryIntegratedInVersionFallbackWalk(t *testing.T) {
 	const neutral = "virtual://movie/tt-stale-walk"
-	pinnedURI := neutral + "?result=STALE"
 	row := stalePinRow(9, "movie-stale-walk", neutral, "STALE")
 	live := []VirtualPlaybackStream{stalePinLiveStream(neutral, "NEW", row.FileSize, "h264")}
-	h, resolveCalls, _ := stalePinRecoveryHandler(live, pinnedURI, false)
-	h.FileVersionFetcher = testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{row.ContentID: {row}}}
+
+	newHandler := func() *PlaybackHandler {
+		var listCalls atomic.Int32
+		return &PlaybackHandler{
+			FileVersionFetcher: testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{row.ContentID: {row}}},
+			VirtualPlaybackResolver: VirtualPlaybackResolverFunc(func(context.Context, string, int, string, int) (string, error) {
+				return "", errors.New("simple resolver must not be used when the detailed resolver is set")
+			}),
+			VirtualPlaybackStreamLister: VirtualPlaybackStreamListerFunc(func(context.Context, string, int, string, int) ([]VirtualPlaybackStream, error) {
+				if listCalls.Add(1) <= 2 {
+					// The primary listing and the fallback's re-list: the
+					// provider is empty, so the primary resolve terminal.
+					return nil, nil
+				}
+				// The recovery's re-list: the renumbered sibling.
+				return live, nil
+			}),
+			VirtualMediaDetailedResolver: VirtualMediaDetailedResolverFunc(func(_ context.Context, uri string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+				if virtualResultCandidateID(uri) == "STALE" {
+					return ResolvedVirtualMedia{}, absentSessionPinError("STALE")
+				}
+				return ResolvedVirtualMedia{URL: "http://127.0.0.1:8080/stream?uri=" + uri, URI: uri, CandidateID: virtualResultCandidateID(uri)}, nil
+			}),
+		}
+	}
 
 	req := stalePinRecoveryRequest()
-	resolved, err := h.resolveVirtualStartWithVersionFallback(req, row, "profile-1", stalePinRequest(), false, 0)
+	resolved, err := newHandler().resolveVirtualStartWithVersionFallback(req, row, "profile-1", stalePinRequest(), false, 0)
 	if err != nil {
 		t.Fatalf("walk recovery: %v", err)
 	}
 	if resolved.File == nil || virtualResultCandidateID(resolved.URI) != "NEW" {
 		t.Fatalf("resolved = %#v, want the fingerprint-matched candidate NEW", resolved)
 	}
-	if got := resolveCalls.Load(); got == 0 {
-		t.Fatal("the walk never consulted the resolver")
-	}
 
-	// Control: with the recovery disabled the same scenario terminals, so the
+	// Control: with the recovery disabled the same dead pin terminals, so the
 	// recovery is what recovers it.
 	prev := virtualStalePinRecoveryEnabled
 	virtualStalePinRecoveryEnabled = false
 	t.Cleanup(func() { virtualStalePinRecoveryEnabled = prev })
-	control := stalePinRow(10, "movie-stale-walk", neutral, "STALE")
-	controlHandler, _, _ := stalePinRecoveryHandler(live, pinnedURI, false)
-	controlHandler.FileVersionFetcher = testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{control.ContentID: {control}}}
-	if _, controlErr := controlHandler.resolveVirtualStartWithVersionFallback(stalePinRecoveryRequest(), control, "profile-1", stalePinRequest(), false, 0); controlErr == nil {
+	if _, controlErr := newHandler().resolveVirtualStartWithVersionFallback(req, row, "profile-1", stalePinRequest(), false, 0); controlErr == nil {
 		t.Fatal("with the recovery disabled the dead pin must terminal; the recovery is masking a walk that already substitutes")
+	}
+}
+
+// TestStalePinRecoveryRefusesSessionBound proves the cold-start-only contract:
+// a session-bound resolve must keep refusing an absent pin, never re-pin it.
+// The default (no declaration) is the conservative session-bound intent.
+func TestStalePinRecoveryRefusesSessionBound(t *testing.T) {
+	const neutral = "virtual://movie/tt-stale-bound"
+	row := stalePinRow(11, "movie-stale-bound", neutral, "STALE")
+	live := []VirtualPlaybackStream{stalePinLiveStream(neutral, "NEW", row.FileSize, "h264")}
+	h, resolveCalls, listCalls := stalePinRecoveryHandler(live, neutral+"?result=STALE", false)
+
+	_, ok := h.recoverStaleIdentityLessPinV3(stalePinSessionBoundRequest(), row, "profile-1", stalePinRequest(), 0)
+	if ok {
+		t.Fatal("a session-bound resolve must not be re-pinned")
+	}
+	if got := resolveCalls.Load(); got != 0 {
+		t.Fatalf("resolver calls = %d, want 0 for a session-bound resolve", got)
+	}
+	if got := listCalls.Load(); got != 0 {
+		t.Fatalf("lister calls = %d, want 0 (the recovery must not even list)", got)
+	}
+}
+
+// TestStalePinRecoveryClearsOldCandidateState pins the in-memory re-pin's field
+// hygiene: the matched candidate must not inherit the previous pin's stored
+// URL, headers, durable identity, or probe evidence. Carrying the stored URL
+// would serve the old bytes under the new id; carrying the probe stamp would
+// report the old inventory as verified for the new candidate. The row's own
+// lifecycle fields (verdict and delivery stamp) are deliberately preserved, so
+// the recovery does not alter verdict semantics.
+func TestStalePinRecoveryClearsOldCandidateState(t *testing.T) {
+	const neutral = "virtual://movie/tt-stale-clear"
+	expiry := time.Now().Add(2 * time.Hour)
+	delivered := time.Now().Add(-time.Minute)
+	failedAt := time.Now().Add(-time.Minute)
+	probedAt := time.Now().Add(-time.Minute)
+	row := stalePinRow(13, "movie-stale-clear", neutral, "STALE")
+	row.ResolvedURL = "https://old.example/stale.mkv"
+	row.ResolvedURLExpiresAt = &expiry
+	row.ProviderRequestHeaders = map[string]string{"Referer": "https://old.example/"}
+	row.ProviderVideoHash = "old-hash"
+	row.ProviderReleaseName = "Old.Release"
+	row.ProviderReleaseSize = row.FileSize
+	row.LastDeliveredAt = &delivered
+	row.FailedAt = &failedAt
+	row.ProbeUpdatedAt = &probedAt
+	row.ProbeSource = virtualCollectionProbeSource
+	row.VideoTracks = []models.VideoTrack{{Codec: "h264", Width: 1920, Height: 1080}}
+	row.AudioTracks = []models.AudioTrack{{Codec: "aac", Channels: 2}}
+	row.SubtitleTracks = []models.SubtitleTrack{{Codec: "subrip", Language: "eng"}}
+	row.ExternalSubtitles = []models.ExternalSubtitle{{Path: "/tmp/old.srt"}}
+
+	live := []VirtualPlaybackStream{stalePinLiveStream(neutral, "NEW", row.FileSize, "h264")}
+
+	match, found := virtualStalePinBestStreamMatch(row, live)
+	if !found {
+		t.Fatal("the fingerprint match was not found")
+	}
+	if match.FilePath != neutral+"?result=NEW" {
+		t.Fatalf("matched path = %q, want the live candidate", match.FilePath)
+	}
+	if match.ResolvedURL != "" || match.ResolvedURLExpiresAt != nil || match.ProviderRequestHeaders != nil {
+		t.Fatalf("re-pin carried the old transport state: url=%q expires=%v headers=%v", match.ResolvedURL, match.ResolvedURLExpiresAt, match.ProviderRequestHeaders)
+	}
+	if match.ProviderVideoHash != "" || match.ProviderReleaseName != "" || match.ProviderReleaseSize != 0 {
+		t.Fatalf("re-pin carried the old durable identity: hash=%q name=%q size=%d", match.ProviderVideoHash, match.ProviderReleaseName, match.ProviderReleaseSize)
+	}
+	if match.LastDeliveredAt == nil || match.FailedAt == nil {
+		t.Fatalf("re-pin cleared the row's own lifecycle state: delivered=%v failed=%v (verdict/delivery semantics must be untouched)", match.LastDeliveredAt, match.FailedAt)
+	}
+	if match.ProbeUpdatedAt != nil || match.ProbeSource != "" || len(match.VideoTracks) != 0 || len(match.AudioTracks) != 0 || len(match.SubtitleTracks) != 0 || len(match.ExternalSubtitles) != 0 {
+		t.Fatalf("re-pin carried the old probe evidence: stamp=%v source=%q video=%d audio=%d subs=%d ext=%d",
+			match.ProbeUpdatedAt, match.ProbeSource, len(match.VideoTracks), len(match.AudioTracks), len(match.SubtitleTracks), len(match.ExternalSubtitles))
+	}
+	// The declared fingerprint fields are what the match was made against and
+	// must survive so candidate ranking still sees a 1080p h264 release.
+	if match.FileSize != row.FileSize || match.CodecVideo != "h264" || match.Resolution != "1080p" {
+		t.Fatalf("re-pin dropped the matched fingerprint fields: size=%d codec=%q res=%q", match.FileSize, match.CodecVideo, match.Resolution)
 	}
 }
 
