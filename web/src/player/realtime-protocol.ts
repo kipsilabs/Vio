@@ -57,6 +57,23 @@ export interface PlaybackPlanInvalidatedPayload {
   plan_id: string;
 }
 
+/**
+ * The `plan_invalidated` reason that withdraws a cold-start plan because a late
+ * probe moved the server-resolved default audio selection to a different
+ * stream. The route is healthy and nothing failed — the committed recipe just
+ * plays the wrong audio — so this is the one reason a client replans as an
+ * audio correction rather than a failure recovery, which would exclude the
+ * working route from its own replacement.
+ *
+ * Must stay byte-equal to the Go constant
+ * `playback.PlanInvalidatedDefaultAudioReconciliation` in
+ * `internal/playback/realtime.go`; the two halves of the wire are checked
+ * against each other by `defaultAudioReconciliationReason.test.ts` and the Go
+ * side of that check in `internal/playback/realtime_invalidation_reason_test.go`.
+ * Documented in `docs/architecture/playback-protocol-v3.md` §6.1.1.
+ */
+export const PLAN_INVALIDATED_DEFAULT_AUDIO_RECONCILIATION = "default_audio_reconciliation";
+
 export interface PlaybackRealtimeHelloEnvelope {
   type: "hello";
   session_id: string;

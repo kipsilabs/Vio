@@ -2046,6 +2046,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 		}
 		commandTracker := playback.NewCommandTracker()
 		playbackHandler.RealtimeHub = realtimeHub
+		playbackHandler.InstallAudioReconcileRearm(context.Background())
 		playbackHandler.CommandTracker = commandTracker
 		playbackHandler.CommandDispatcher = playback.NewCommandDispatcher(deps.SessionMgr, realtimeHub, commandTracker)
 		playbackCommandDispatcher = playbackHandler.CommandDispatcher

@@ -750,6 +750,9 @@ func goldenConformanceMatrix() playback.ConformanceMatrixV3 {
 		fail("golden decision has no plan")
 	}
 	trackIndex := 1
+	// The corrected default index after a probe reorder; distinct from the
+	// ordinal the stale plan carried, which is what makes the answer meaningful.
+	reconcileIndex := 2
 	trackChange := goldenReplanRequest()
 	trackChange.Operation = playback.ReplanOperationTrackChangeV3
 	trackChange.ReplanRequestID = "replan-track-change-0001"
@@ -770,6 +773,34 @@ func goldenConformanceMatrix() playback.ConformanceMatrixV3 {
 	seekReanchor.Failure = playback.FailureV3{}
 	seekReanchor.PositionSeconds = 321.25
 
+	// The default-audio withdrawal answered through the dedicated correlation.
+	// It is an INTENT replan, not failure recovery, and it echoes the withdrawal's
+	// reason: that echo is the only signal separating "answering the withdrawal"
+	// from "re-picking the track the viewer already had". Both scenarios below
+	// advertise the capability, because the server's handling FORKS on it — a
+	// capable client that omits the marker keeps its own selection, so a vector
+	// without the feature would not exercise the answer at all.
+	reconcileFeatures := []string{
+		playback.FeaturePlaybackPlanV3,
+		playback.FeaturePlanInvalidatedV3,
+		playback.FeatureDefaultAudioReconcileResponseV3,
+	}
+	reconcileAnswer := goldenReplanRequest()
+	reconcileAnswer.Operation = playback.ReplanOperationTrackChangeV3
+	reconcileAnswer.ReplanRequestID = "replan-reconcile-answer-0001"
+	reconcileAnswer.Failure = playback.FailureV3{}
+	reconcileAnswer.ClientFeatures = reconcileFeatures
+	reconcileAnswer.AnswersPlanInvalidation = playback.PlanInvalidatedDefaultAudioReconciliation
+	reconcileAnswer.SelectedTracks.Audio = &playback.TrackIdentityV3{ID: "", Index: &reconcileIndex}
+	// The same replan from the SAME capable client without the marker: an ordinary
+	// viewer re-pick, which the server must not read as the answer. The pair is
+	// only meaningful together, since the difference between them is the whole
+	// correlation.
+	reconcileAnswer.PositionSeconds = 321.25
+	reconcileUnmarked := reconcileAnswer
+	reconcileUnmarked.ReplanRequestID = "replan-reconcile-unmarked-0001"
+	reconcileUnmarked.AnswersPlanInvalidation = ""
+
 	trackChange.PositionSeconds = 321.25
 	qualityChange.PositionSeconds = 321.25
 	trackDuplicate := trackChange
@@ -785,6 +816,8 @@ func goldenConformanceMatrix() playback.ConformanceMatrixV3 {
 	qualityMidSeek := qualityChange
 	qualityMidSeek.ReplanRequestID = "replan-quality-mid-seek-0001"
 	replans := []playback.ReplanScenarioV3{
+		{Name: "default_audio_reconcile_answer", Category: "default_audio_reconciliation", Request: reconcileAnswer, Expected: playback.ReplanExpectationV3{HTTPStatus: http.StatusOK, PreserveUnmodifiedTracks: true, PositionSeconds: 321.25, PositionPreserved: true}},
+		{Name: "default_audio_reconcile_without_marker", Category: "default_audio_reconciliation", Request: reconcileUnmarked, Expected: playback.ReplanExpectationV3{HTTPStatus: http.StatusOK, PreserveUnmodifiedTracks: true, PositionSeconds: 321.25, PositionPreserved: true}},
 		{Name: "track_change", Category: "track_change_replan", Request: trackChange, Expected: playback.ReplanExpectationV3{HTTPStatus: http.StatusOK, PreserveUnmodifiedTracks: true}},
 		{Name: "quality_change", Category: "quality_change_replan", Request: qualityChange, Expected: playback.ReplanExpectationV3{HTTPStatus: http.StatusOK, SelectedQuality: resolutionHD}},
 		{Name: "output_change", Category: "output_change_replan", Request: outputChange, Expected: playback.ReplanExpectationV3{HTTPStatus: http.StatusOK, PreserveUnmodifiedTracks: true}},

@@ -24627,6 +24627,8 @@ export interface components {
       sequence: number;
     };
     PlaybackReplanBody: {
+      /** @description Echoes the reason from the plan_invalidated command this replan answers. Correlates a client that negotiated default_audio_reconcile_response_v1's response with the server's own withdrawal; omitting it on such a replan leaves the viewer's selection in place. Not trust-sensitive: at worst it names a correction the server already decided and announced. */
+      answers_plan_invalidation?: string;
       /** Format: int64 */
       attempt_count: number;
       attempted_plan_keys: string[];

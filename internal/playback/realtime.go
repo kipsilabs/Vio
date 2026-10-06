@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/Silo-Server/silo-server/internal/models"
 )
@@ -617,6 +618,17 @@ const (
 	// scan came back multi-PPS after the plan was already playing, so the video
 	// stream-copy route it named cannot serve this source.
 	PlanInvalidatedVideoCopyUnsafe = "video_copy_unsafe"
+	// PlanInvalidatedDefaultAudioReconciliation means the verified probe
+	// inventory that landed after the plan was issued moved the server-resolved
+	// default audio selection to a different stream, so the committed recipe no
+	// longer plays the preferred language. The corrected inventory and the
+	// decision naming the target index are already durable when this is
+	// pushed; only the client's replacement replan commits the new recipe.
+	//
+	// It is a second reason on the existing command rather than a new one, so
+	// the wire contract, the command-name vocabulary and the client's decoder
+	// are unchanged.
+	PlanInvalidatedDefaultAudioReconciliation = "default_audio_reconciliation"
 )
 
 // PlanInvalidatedPayload names the plan the server withdrew and why.
@@ -631,14 +643,45 @@ type PlanInvalidatedPayload struct {
 
 // NewPlanInvalidatedCommand builds a validated plan_invalidated command.
 func NewPlanInvalidatedCommand(sessionID, commandID, planID, reason string) (CommandEnvelope, error) {
+	command, err := NewPlanInvalidatedCommandForGeneration(sessionID, commandID, planID, reason, "")
+	return command, err
+}
+
+// NewPlanInvalidatedCommandForGeneration is NewPlanInvalidatedCommand with the
+// verified generation the withdrawal was decided against.
+//
+// The envelope's top-level reason and the payload's plan_id and reason are the
+// existing contract, unchanged. The generation is an ADDITIVE payload field: a
+// client that does not read it ignores it, and one that does can tell an
+// in-flight duplicate for a generation it already replanned from a correction
+// that landed afterwards. An empty generation leaves the payload exactly the
+// two-field shape a pre-existing client expects.
+func NewPlanInvalidatedCommandForGeneration(sessionID, commandID, planID, reason, generation string) (CommandEnvelope, error) {
 	if planID == "" || reason == "" {
 		return CommandEnvelope{}, ErrInvalidRealtimePayload
 	}
-	payload, err := json.Marshal(PlanInvalidatedPayload{Reason: reason, PlanID: planID})
+	payload := PlanInvalidatedPayload{Reason: reason, PlanID: planID}
+	body, err := json.Marshal(payload)
 	if err != nil {
 		return CommandEnvelope{}, err
 	}
-	return NewCommandEnvelope(sessionID, commandID, CommandPlanInvalidated, payload)
+	if strings.TrimSpace(generation) != "" {
+		extended := struct {
+			PlanInvalidatedPayload
+			Generation string `json:"generation,omitempty"`
+		}{PlanInvalidatedPayload: payload, Generation: generation}
+		if body, err = json.Marshal(extended); err != nil {
+			return CommandEnvelope{}, err
+		}
+	}
+	command, err := NewCommandEnvelope(sessionID, commandID, CommandPlanInvalidated, body)
+	if err != nil {
+		return CommandEnvelope{}, err
+	}
+	// The reason rides in both places the contract already defines it: the
+	// envelope field and the payload. A client reads either.
+	command.Reason = reason
+	return command, nil
 }
 
 // NewCommandEnvelope creates a validated command envelope.

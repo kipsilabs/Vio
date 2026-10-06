@@ -46,7 +46,10 @@ import {
   VIDEO_CLIENT_FEATURES_V3,
   type ReplanOptions,
 } from "../playback-session-wire-v3";
-import type { PlaybackInventoryUpdatedPayload } from "../realtime-protocol";
+import {
+  PLAN_INVALIDATED_DEFAULT_AUDIO_RECONCILIATION,
+  type PlaybackInventoryUpdatedPayload,
+} from "../realtime-protocol";
 import type {
   PlayerAudioTrack,
   PlayerFileVersion,
@@ -458,9 +461,11 @@ export interface UsePlaybackSessionResult extends PlaybackSessionState {
   /** `failure_recovery` replan after the client could not play the plan. */
   recoverFromFailure: (failure: FailureV3, currentPosition: number) => void;
   /**
-   * `failure_recovery` replan for a plan the *server* invalidated over the
-   * realtime `plan_invalidated` command. Resolves to whether a replacement plan
-   * is now playing; the caller reports that back as the command's result.
+   * Replans off a plan the *server* invalidated over the realtime
+   * `plan_invalidated` command: `failure_recovery` for a route failure, or a
+   * non-failure `track_change` for the default-audio reconciliation reason.
+   * Resolves to whether a replacement plan is now playing; the caller reports
+   * that back as the command's result.
    */
   invalidatePlan: (planId: string, reason: string, currentPosition: number) => Promise<boolean>;
   /**
@@ -2226,12 +2231,32 @@ export function usePlaybackSession(
   /**
    * Replans off a plan the server invalidated mid-playback.
    *
-   * This is an ordinary `failure_recovery`, deliberately: that operation is
-   * what folds the current plan's attempt key into `attempted_plan_keys`, so
-   * the route the server just disqualified is excluded from the replacement
-   * plan without the client reasoning about deliveries at all. The plan
-   * revision the adopted plan bumps rebuilds the transport and restores the
-   * position, exactly as it does after a client-detected failure.
+   * For a route failure this is an ordinary `failure_recovery`, deliberately:
+   * that operation is what folds the current plan's attempt key into
+   * `attempted_plan_keys`, so the route the server just disqualified is
+   * excluded from the replacement plan without the client reasoning about
+   * deliveries at all. The plan revision the adopted plan bumps rebuilds the
+   * transport and restores the position, exactly as it does after a
+   * client-detected failure.
+   *
+   * Cold-start default-audio reconciliation is the exception: nothing failed and
+   * the route is healthy, the committed recipe simply plays the wrong audio
+   * stream because a late probe reordered the inventory. Declaring that a
+   * failure would exclude the very route that is working and push the session
+   * onto a worse one, so it replans as a `track_change` — the operation that
+   * already models an audio correction — with no failure payload and no route
+   * exclusion. The server fills the corrected audio identity into that replan
+   * from the decision it persisted (§6.1.1 of the v3 protocol), so the client
+   * only has to carry its live position. Telemetry is unchanged either way:
+   * `fallback_reason` reports the server's own reason verbatim, which already
+   * tells the two cases apart.
+   *
+   * That replan also echoes the reason back as `answers_plan_invalidation`, so
+   * the server can match it against the decision it is holding rather than
+   * infer the pairing from the operation and the missing failure. It is the only
+   * replan that does so: the field asserts "this is the answer to that
+   * withdrawal", and every other replan — including the failure recovery below —
+   * has no withdrawal to answer.
    *
    * A start or replan already in flight is waited out first. The server commits
    * a replacement plan and starts the copy-safety scan behind it *before* the
@@ -2254,6 +2279,21 @@ export function usePlaybackSession(
       if (plan.plan_id !== planId) return true;
       const classification = reason.trim().slice(0, 64) || "plan_invalidated";
       reportEvent("plan_invalidated", { fallbackReason: classification });
+      // Compare the trimmed reason against the server's own string, not the
+      // truncated classification: a classification can only be a prefix of the
+      // reconciliation reason if the server sent something longer, which is a
+      // different reason and must keep failure semantics.
+      if (reason.trim() === PLAN_INVALIDATED_DEFAULT_AUDIO_RECONCILIATION) {
+        // The reason goes back on the wire verbatim, not trimmed to the
+        // classification: it is how the server tells that this replan *is* the
+        // answer to the decision it persisted, instead of falling back to a
+        // weaker heuristic on the operation and the absence of a failure.
+        return replan({
+          operation: "track_change",
+          positionSeconds: currentPosition,
+          answersPlanInvalidation: reason.trim(),
+        });
+      }
       return replan({
         operation: "failure_recovery",
         positionSeconds: currentPosition,

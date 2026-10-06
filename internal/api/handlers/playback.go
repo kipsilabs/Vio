@@ -2243,6 +2243,12 @@ func (h *PlaybackHandler) HandleUpdateProgress(w http.ResponseWriter, r *http.Re
 	// Persist progress to UserStore (best-effort).
 	if sess, getErr := h.sessionMgr.GetSession(sessionID); getErr == nil {
 		h.persistProgress(r.Context(), sess)
+		// The first progress report after attach is the probe-before-attach
+		// hook: evidence may have landed while no session was registered, so
+		// the attach-side check replayed nothing yet. Replays are idempotent
+		// (a settled selection is a byte-equal no-op), bounded to one
+		// heartbeat-triggered check per session attach generation.
+		h.reconcilePendingAudioStartup(r.Context(), sessionID)
 		if !sess.DisableProgressPersistence && h.WatchScrobbler != nil && wasPaused != sess.IsPaused {
 			if file, loadErr := h.loadFileByPreferredID(r.Context(), requestedMediaFileID(sess), sess.MediaFileID); loadErr == nil && file != nil {
 				targetID := playbackProgressTarget(file)

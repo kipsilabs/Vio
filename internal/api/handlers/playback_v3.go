@@ -41,6 +41,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/subtitles"
 	"github.com/Silo-Server/silo-server/internal/tonemap"
 	"github.com/Silo-Server/silo-server/internal/transcodenode"
+	"github.com/Silo-Server/silo-server/internal/userstore"
 )
 
 const (
@@ -1946,6 +1947,15 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		if err != nil {
 			return playback.DecisionResponseV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to load the saved audio preference")
 		}
+		if req.CarriedAudioTrackID == "" {
+			// A carried selection is an explicit viewer choice remapped onto
+			// this file; only a fully omitted selection is server-resolved.
+			virtualDecision.startAudioSelectionOrigin = SelectionOriginAuto
+		} else {
+			virtualDecision.startAudioSelectionOrigin = SelectionOriginExplicit
+		}
+	} else {
+		virtualDecision.startAudioSelectionOrigin = SelectionOriginExplicit
 	}
 	timings.mark("audio_preference")
 	effectiveFile := requestedFile
@@ -2828,7 +2838,7 @@ func (h *PlaybackHandler) rotateRejectedVirtualCandidateStartV3(
 		if planResult.Terminal != nil || planResult.Plan == nil {
 			return playback.DecisionResponseV3{}, false
 		}
-		response, statusErr := h.startPlannedPlaybackV3(r, userID, profileID, req, requestDigests, catalogFile, &resolvedFile, audioIndex, virtualPlanDecisionV3{candidateRank: resolved.CandidateRank, candidateCount: resolved.CandidateCount, substitutionReason: substitutionReasonDecodeRejectedV3}, planResult, clientInfo, substitutionReasonDecodeRejectedV3)
+		response, statusErr := h.startPlannedPlaybackV3(r, userID, profileID, req, requestDigests, catalogFile, &resolvedFile, audioIndex, virtualPlanDecisionV3{candidateRank: resolved.CandidateRank, candidateCount: resolved.CandidateCount, substitutionReason: substitutionReasonDecodeRejectedV3, startAudioSelectionOrigin: virtualPlanSelectionOriginForRequestV3(req)}, planResult, clientInfo, substitutionReasonDecodeRejectedV3)
 		if statusErr == nil {
 			// The start committed a replacement candidate after excluding the
 			// rejected ones. Persist the chain on the new attempt so a later
@@ -3003,6 +3013,11 @@ type virtualPlanDecisionV3 struct {
 	// substitutionReason carries the alternate-version or rotation walk's
 	// substitution cause to the plan. Empty for a same-release resolve.
 	substitutionReason string
+	// startAudioSelectionOrigin records whether the committed audio
+	// selection was omitted ("auto") or explicitly picked ("explicit").
+	// Captured where preferredAudioTrackIndexV3 returns, before defaults
+	// erase the distinction, and consumed by intentForCommittedStartV3.
+	startAudioSelectionOrigin string
 }
 
 // selectedAudioTrackLogFieldsV3 names the audio track a plan will play: its
@@ -3179,6 +3194,26 @@ func (h *PlaybackHandler) startPlannedPlaybackV3(r *http.Request, userID int, pr
 	}
 	response := playback.DecisionResponseV3{ProtocolVersion: playback.ProtocolV3, ServerFeatures: serverFeaturesForRequestV3(r.Context()), Outcome: playback.OutcomePlayableV3, SessionID: session.ID, PlaybackPlan: result.Plan}
 	record := playback.AttemptRecordV3{PlaybackAttemptID: req.PlaybackAttemptID, SessionID: session.ID, UserID: userID, ProfileID: profileID, RequestedMediaFileID: requestedFile.ID, EffectiveMediaFileID: effectiveFile.ID, CurrentPlanID: result.Plan.PlanID, CurrentPlan: *result.Plan, FrozenRecipe: frozenRecipe, NormalizedRequest: req, ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), StartResponse: response, RequestDigest: requestDigests.current, ExpiresAt: time.Now().Add(playback.MaxTokenTTL)}
+	// Capture the durable audio selection intent before the session state
+	// and attempt are committed: SelectionOrigin distinguishes an omitted
+	// start (server-resolved language preference, reconcilable) from an
+	// explicit viewer choice (never auto-overridden). The snapshot is taken
+	// from the planned selection, so later synchronous probe writes inside
+	// this start cannot erase the omitted-vs-explicit distinction.
+	recordIntentV3, intentErr := intentForCommittedStartV3(r.Context(), h, userID, profileID, req, effectiveFile, plannedAudioTrackIndexV3(result, audioIndex), virtualDecision)
+	if intentErr != nil {
+		transport.rollback()
+		abort()
+		return playback.DecisionResponseV3{}, &transportErrorV3{reason: "internal_error", message: "Failed to resolve the playback audio preference.", cause: intentErr}
+	}
+	record.SelectionOrigin = recordIntentV3.origin
+	record.PreferredAudioLanguage = recordIntentV3.preferredLang
+	record.SeriesAudioPreferenceSignature = recordIntentV3.seriesSignature
+	record.SelectedAudioSignature = recordIntentV3.selectedOverride
+	if err := h.SetAudioSelectionIntent(session.ID, record.SelectionOrigin, record.PreferredAudioLanguage, record.SeriesAudioPreferenceSignature, record.SelectedAudioSignature); err != nil {
+		slog.WarnContext(r.Context(), "protocol v3 start: audio selection intent not recorded on the session",
+			"component", "api", "session", session.ID, "error", err)
+	}
 	if err := h.updateV3SessionState(r.Context(), session, effectiveFile, result, transport, mode); err != nil {
 		transport.rollback()
 		abort()
@@ -4979,6 +5014,69 @@ func (h *PlaybackHandler) multipartResumeFileV3(ctx context.Context, file *model
 	return nil, 0, nil
 }
 
+// committedStartAudioIntentV3 is the durable audio selection intent for one
+// committed start: the origin, the resolved preference language, the series
+// snapshot and the signature of the committed track.
+type committedStartAudioIntentV3 struct {
+	origin           string
+	preferredLang    string
+	seriesSignature  *userstore.AudioTrackSignature
+	selectedOverride *userstore.AudioTrackSignature
+}
+
+// virtualPlanSelectionOriginForRequestV3 names the audio selection origin
+// for a start that never passed through the omitted-selection resolution
+// above (decode-rejection rotations, version fallback alternates): explicit
+// when the request names a track, auto otherwise.
+func virtualPlanSelectionOriginForRequestV3(req playback.StartRequestV3) string {
+	if strings.TrimSpace(req.AudioTrackID) != "" || req.AudioTrackIndex != nil || strings.TrimSpace(req.CarriedAudioTrackID) != "" {
+		return SelectionOriginExplicit
+	}
+	return SelectionOriginAuto
+}
+
+// intentForCommittedStartV3 snapshots the audio selection intent for the
+// committed start. An omitted audio selection resolves through the same
+// preference pipeline the catalog menu used (identical inputs: the committed
+// audio index, the resolved language and the stored series preference), so
+// reconciliation replays exactly the start's decision against the verified
+// inventory. An explicit selection is marked explicit with only its committed
+// signature: reconciliation may verify that it still exists, never move it.
+func intentForCommittedStartV3(ctx context.Context, h *PlaybackHandler, userID int, profileID string, req playback.StartRequestV3, file *models.MediaFile, committedIndex int, decision virtualPlanDecisionV3) (committedStartAudioIntentV3, error) {
+	var intent committedStartAudioIntentV3
+	if file != nil && committedIndex >= 0 && committedIndex < len(file.AudioTracks) {
+		intent.selectedOverride = playback.AudioTrackSignatureFromTrack(file.AudioTracks[committedIndex])
+	}
+	if strings.TrimSpace(req.AudioTrackID) != "" || req.AudioTrackIndex != nil || strings.TrimSpace(req.CarriedAudioTrackID) != "" {
+		intent.origin = SelectionOriginExplicit
+		return intent, nil
+	}
+	if decision.startAudioSelectionOrigin != "" {
+		intent.origin = decision.startAudioSelectionOrigin
+	} else {
+		intent.origin = SelectionOriginAuto
+	}
+	intent.preferredLang = strings.TrimSpace(decision.preferredAudioLanguage)
+	if h == nil || h.StoreProvider == nil {
+		return intent, nil
+	}
+	store, err := h.StoreProvider.ForUser(ctx, userID)
+	if err != nil {
+		return committedStartAudioIntentV3{}, err
+	}
+	seriesID := h.resolveSeriesID(ctx, file)
+	if seriesID != "" {
+		stored, prefErr := store.GetAudioPreference(ctx, profileID, seriesID)
+		if prefErr != nil {
+			return committedStartAudioIntentV3{}, prefErr
+		}
+		if stored != nil {
+			intent.seriesSignature = stored.TrackSignature
+		}
+	}
+	return intent, nil
+}
+
 // preferredAudioTrackIndexV3 answers what an omitted audio track means: the
 // language this profile has settled on for this series, this library, this
 // device, or generally — the same resolution the catalog performs when it
@@ -6510,6 +6608,19 @@ func downloadedSubtitleLabelV3(value subtitles.DownloadedSubtitle) string {
 	return value.ReleaseName + " (" + value.Provider + ")"
 }
 
+// stripClientSuppliedAutomatic clears the server-owned `Automatic` provenance
+// marker on a decoded client replan request. Reconciliation builds its own
+// replan in-process with the marker already set; that path never passes
+// through this function. A client that forges the marker would otherwise
+// impersonate server reconciliation and suppress its own preference
+// persistence, so the inbound boundary drops whatever arrived on the wire.
+func stripClientSuppliedAutomatic(req *playback.ReplanRequestV3) {
+	if req == nil {
+		return
+	}
+	req.Automatic = ""
+}
+
 // HandleReplanPlaybackV3 provides persistent idempotency and preserves the old
 // transport until a successor has entered its startup state and the new plan is
 // durably committed.
@@ -6547,6 +6658,11 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 	if err := json.Unmarshal(body, &req); err != nil {
 		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusBadRequest, "bad_request", "Invalid replan request")
 	}
+	// Automatic marks a server-built reconciliation replan. It is internal
+	// provenance: a client that forges it would suppress preference
+	// persistence and impersonate reconciliation, so strip whatever the
+	// client sent and let the server set it only on its own path.
+	stripClientSuppliedAutomatic(&req)
 	// Reject malformed identity/bounds before doing any session lookup. When
 	// client_features is omitted, temporarily allow the only validation rule
 	// that depends on the durable start request; the authoritative merge and a
@@ -7710,6 +7826,15 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			// capability payloads. Omission keeps the start-time features.
 			start.ClientFeatures = req.ClientFeatures
 		}
+		// A replan that answers a default-audio reconciliation withdrawal
+		// carries the correction the settled decision recorded: the client
+		// replans off the withdrawn plan, which still names the pre-reorder
+		// stream, so without this the correction never reaches the transport.
+		// This must run BEFORE the selection is applied onto start: audio
+		// resolution reads start.AudioTrackID/AudioTrackIndex, so a correction
+		// layered on afterwards would never reach the plan or the executor's
+		// audio map.
+		h.pendingAudioReconciliationReplan(record, &req)
 		if trackChange {
 			// A track_change is the only operation where an omitted subtitle
 			// means "subtitles off". Failure, seek, and quality replans may omit
@@ -8742,10 +8867,16 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		cancelReservation()
 		afterCtx, afterCancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
 		defer afterCancel()
-		if trackChange {
+		if trackChange && req.Automatic != playback.ReplanAutomaticV3 {
 			// A deliberate track switch is the same signal the legacy audio
 			// PATCH recorded; a failure recovery is not, so its forced audio
-			// route must not be written back as a user preference.
+			// route must not be written back as a user preference. An
+			// automatic reconciliation is not a viewer choice either: it
+			// replays the start-time language preference, so persisting its
+			// outcome would launder a server correction into a stored user
+			// preference and steer every later start. The Automatic marker
+			// (server-side only, see ReplanRequestV3) suppresses that write
+			// for reconciliation ops; explicit user track changes persist.
 			h.persistCurrentAudioPreferenceV3(afterCtx, session.ID, session.UserID, session.ProfileID, effectiveFile, plannedAudioTrackIndexV3(result, session.AudioTrackIndex))
 		}
 		h.syncSessionsNow(afterCtx, "v3_replan")

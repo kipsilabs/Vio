@@ -71,6 +71,17 @@ const (
 	// the client's ordinary recovery then mints a fresh attempt that plans
 	// against the now-persisted verdict.
 	FeaturePlanInvalidatedV3 = "plan_invalidated_v1"
+	// FeatureDefaultAudioReconcileResponseV3 is the client's promise that it
+	// can (a) answer a default_audio_reconciliation withdrawal through the
+	// dedicated answers_plan_invalidation correlation instead of the ordinary
+	// failure_recovery semantics, and (b) name that withdrawal's reason back
+	// to the server on its replan. A client that advertises only
+	// plan_invalidated_v1 treats every plan_invalidated as a route failure and
+	// folds the withdrawn attempt key into attempted_plan_keys, so a
+	// default-audio withdrawal would exclude a perfectly healthy route from
+	// its own replacement: the server withholds the withdrawal from such
+	// clients and lands the correction on the next start/reconnect instead.
+	FeatureDefaultAudioReconcileResponseV3 = "default_audio_reconcile_response_v1"
 	// FeatureSubripSidecarV3 is the client's statement that it parses SubRip
 	// itself, including {\anN} placement. An opted-in client receives
 	// external and downloaded SRT tracks as the original .srt bytes instead
@@ -159,6 +170,11 @@ func ServerFeaturesV3() []string {
 		FeatureAuthorizedMediaOriginsV3,
 		FeatureSoftwareVideoDecodeV3,
 		FeaturePlanInvalidatedV3,
+		// Advertised so the withdrawal side and the response side of
+		// default-audio reconciliation can be negotiated independently:
+		// a client that only handles route-failure invalidations never
+		// receives a default-audio withdrawal (§6.1.1).
+		FeatureDefaultAudioReconcileResponseV3,
 		// Advertised so a client can tell "this server does not populate
 		// source.duration_seconds" apart from "this server knows the runtime
 		// is genuinely unknown". Without the distinction both look like an
@@ -722,14 +738,37 @@ type ReplanRequestV3 struct {
 	// Omitted leaves the start-time intent unchanged, so clients that predate
 	// the field keep their existing behavior. It never authorizes a healthy
 	// mid-play switch: only a dead or unplayable source advances it.
-	AutoFallback          *bool                     `json:"auto_fallback,omitempty"`
-	BandwidthEstimateKbps *int                      `json:"bandwidth_estimate_kbps,omitempty"`
-	BandwidthCapKbps      *int                      `json:"bandwidth_cap_kbps,omitempty"`
-	SelectedTracks        SelectedTracksV3          `json:"selected_tracks"`
-	Failure               FailureV3                 `json:"failure,omitzero"`
-	Capabilities          ClientCodecCapabilitiesV3 `json:"client_capabilities"`
-	ClientPlaybackContext ClientPlaybackContextV3   `json:"client_playback_context"`
+	AutoFallback          *bool `json:"auto_fallback,omitempty"`
+	BandwidthEstimateKbps *int  `json:"bandwidth_estimate_kbps,omitempty"`
+	BandwidthCapKbps      *int  `json:"bandwidth_cap_kbps,omitempty"`
+	// AnswersPlanInvalidation carries the `reason` string from the
+	// plan_invalidated command this replan is answering. It is the
+	// authoritative correlation between a withdrawal and its response:
+	// present only on the replan that answers a withdrawn plan, never on
+	// ordinary failure recovery or intent replans. It is NOT trust-sensitive
+	// the way Automatic is: at worst it can make the server apply a
+	// correction the server itself already decided and announced, so the
+	// ingress boundary does not strip it (contrast
+	// stripClientSuppliedAutomatic, which drops a marker the client has no
+	// right to set because forging it would impersonate server
+	// reconciliation).
+	AnswersPlanInvalidation string                    `json:"answers_plan_invalidation,omitempty"`
+	SelectedTracks          SelectedTracksV3          `json:"selected_tracks"`
+	Failure                 FailureV3                 `json:"failure,omitzero"`
+	Capabilities            ClientCodecCapabilitiesV3 `json:"client_capabilities"`
+	ClientPlaybackContext   ClientPlaybackContextV3   `json:"client_playback_context"`
+	// Automatic marks a replan request the server built itself (no client
+	// gesture behind it). It is server-side only: omitempty keeps it off the
+	// client wire in practice, Validate ignores it, and clients never send
+	// it. The replan application uses it to suppress user-preference
+	// persistence for automatic corrections; explicit user track changes
+	// keep persisting. Empty means a client-issued request.
+	Automatic string `json:"automatic,omitempty"`
 }
+
+// ReplanAutomaticV3 is the Automatic marker for server-built reconciliation
+// replans (see ReplanRequestV3.Automatic).
+const ReplanAutomaticV3 = "automatic"
 
 const (
 	RouteEventPlanSelectedV3               = "plan_selected"
@@ -1873,7 +1912,7 @@ func HasFeatureV3(features []string, wanted string) bool {
 //
 // Stop/start is the explicit boundary for changing any of them.
 func AttemptStickyFeaturesV3() []string {
-	return []string{FeatureHeaderAuthenticatedMediaV3, FeatureAuthorizedMediaOriginsV3, FeatureSoftwareVideoDecodeV3, FeatureSubripSidecarV3}
+	return []string{FeatureHeaderAuthenticatedMediaV3, FeatureAuthorizedMediaOriginsV3, FeatureSoftwareVideoDecodeV3, FeatureSubripSidecarV3, FeatureDefaultAudioReconcileResponseV3}
 }
 
 // PinAttemptStickyFeaturesV3 returns requested with every attempt-sticky
