@@ -1868,6 +1868,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		// when the row already carries a concrete result= identity adopted by an
 		// earlier auto pick; only an explicit pick or a forced relink re-tries
 		// the known-bad candidate.
+		allowFailedCandidate := req.FileSelection == playback.FileSelectionExplicitV3 || req.ForceRelink
 		// The start path is a fresh selection: declare the unbound intent on the
 		// request handed to the walk, which threads it (rather than forcing it)
 		// so the stale-pin recovery may re-pin here while a future session-bound
