@@ -891,6 +891,23 @@ func (h *PlaybackHandler) playbackInventoryForFileV3(ctx context.Context, sessio
 	status := string(ProbeProvenanceDeclared)
 	if file != nil && file.ProbeUpdatedAt != nil {
 		status = string(ProbeProvenanceVerified)
+	} else {
+		// No probe stamp on the effective row. A deferred full-track
+		// enumeration may be outstanding, may have committed its evidence
+		// without a stamp, or may have terminally failed; the session carries
+		// that disposition so an inventory reader can tell an unfinished probe
+		// from a finished or failed one and leave the loading state either way.
+		// Only the verified stamp outranks this, because it is the row's own
+		// committed evidence; a verified outcome means the probe's durable write
+		// committed, so the client may also stop treating the menu as loading.
+		switch session.VirtualProbeOutcome {
+		case probeOutcomePending:
+			status = probeOutcomePending
+		case probeOutcomeVerified:
+			status = string(ProbeProvenanceVerified)
+		case probeOutcomeFailed:
+			status = string(ProbeProvenanceFailed)
+		}
 	}
 
 	effectiveFileID := 0
@@ -1461,9 +1478,11 @@ func (h *PlaybackHandler) publishInventoryUpdatedToSession(ctx context.Context, 
 			"component", "playback", "session", session.ID, "error", err)
 		return "", false
 	}
-	if inventory.InventoryStatus != string(ProbeProvenanceVerified) {
-		// The probe has not upgraded this session's bound release, so the client
-		// already holds exactly this declared inventory.
+	if inventory.InventoryStatus != string(ProbeProvenanceVerified) && inventory.InventoryStatus != string(ProbeProvenanceFailed) {
+		// The probe has not upgraded this session's bound release and no
+		// deferred probe has terminally failed, so the client already holds
+		// exactly this declared inventory. A failed status is new information —
+		// it ends the deferred loading state — so it is pushed.
 		return inventory.InventoryRevision, false
 	}
 	if hasGeneration {

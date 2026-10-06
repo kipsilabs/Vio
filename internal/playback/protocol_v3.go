@@ -90,11 +90,17 @@ const (
 	// source_committed or its plan with the probe-verified audio and subtitle
 	// inventory, gating on inventory_revision. It only appears on /api/v2, like
 	// the other realtime-v3 capabilities.
-	FeatureInventoryUpdatedV3  = "inventory_updated_event_v1"
-	PlanRecipeVersionV3        = "v3.4"
-	ClientDV7ToDV81V3          = "client_dv7_to_dv81"
-	ClientDV7ToHDR10V3         = "client_dv7_to_hdr10"
-	ClientDVTransformVersionV3 = "1"
+	FeatureInventoryUpdatedV3 = "inventory_updated_event_v1"
+	// FeatureDeferredTrackInventoryV3 is the client's promise to handle a plan
+	// that defers its full track enumeration: it reads playback_plan.tracks_pending
+	// and keeps the provisional menu until the follow-up inventory_updated push
+	// (or the inventory poll named by playback_plan.inventory_url) lands. It
+	// only appears on /api/v2, like the other realtime-v3 capabilities.
+	FeatureDeferredTrackInventoryV3 = "deferred_track_inventory_v1"
+	PlanRecipeVersionV3             = "v3.4"
+	ClientDV7ToDV81V3               = "client_dv7_to_dv81"
+	ClientDV7ToHDR10V3              = "client_dv7_to_hdr10"
+	ClientDVTransformVersionV3      = "1"
 	// ClaimClientManagedDynamicRangeV3 is scoped to the original_http
 	// delivery. A client that advertises it accepts responsibility for mapping
 	// any source dynamic range it declares decodable onto the active output;
@@ -172,7 +178,7 @@ func ServerFeaturesV3() []string {
 // advertises and honors only on /api/v2. They postdate the /api/v1 freeze, so
 // the frozen surface neither advertises nor negotiates them.
 func NativeServerFeaturesV3() []string {
-	return append(ServerFeaturesV3(), FeatureSubripSidecarV3, FeatureLiveInventoryV3, FeatureSourceCommittedV3, FeatureInventoryUpdatedV3)
+	return append(ServerFeaturesV3(), FeatureSubripSidecarV3, FeatureLiveInventoryV3, FeatureSourceCommittedV3, FeatureInventoryUpdatedV3, FeatureDeferredTrackInventoryV3)
 }
 
 // WithoutFeatureV3 returns features with every spelling of feature removed.
@@ -1081,6 +1087,16 @@ type PlanV3 struct {
 	// InventoryURL is the relative URL clients can fetch (with ETag/If-None-Match)
 	// to retrieve refreshed audio and subtitle inventories without replanning.
 	InventoryURL string `json:"inventory_url,omitempty"`
+	// TracksPending marks a plan whose audio and subtitle inventory is
+	// deliberately provisional: the first-byte URL was handed back with the
+	// minimal executable recipe (video plus the default audio) and the full
+	// track enumeration is still being probed. It is additive and omitted on a
+	// plan whose inventory is already complete. A client shows its track menu
+	// as loading until the follow-up `inventory_updated` push (or the existing
+	// inventory poll) replaces the provisional list; the value never changes
+	// stream selection or the executable recipe, and it is excluded from plan
+	// identity hashing like the inventory fields beside it.
+	TracksPending bool `json:"tracks_pending,omitempty"`
 }
 
 // PlaybackInventoryV3 is the live audio and subtitle inventory of an active
