@@ -1102,12 +1102,11 @@ any other, not a fire-and-forget event:
   "reason": "video_copy_unsafe",
   "deadline_ms": 8000,
   "payload": {"reason": "video_copy_unsafe", "plan_id": "<the invalidated plan>"}
-
-<!-- §6.1.1 adds one more reason to this command; the payload above gains an
-     additive generation field there, and nothing else about the envelope
-     changes. -->
 }
 ```
+
+§6.1.1 adds one more reason to this command; for that reason the payload also
+carries an additive `generation` field, and nothing else about the envelope changes.
 
 `payload.plan_id` names the plan being withdrawn, which is not necessarily the
 one on screen: a client that has already replanned past it has nothing to do and
@@ -1330,7 +1329,19 @@ Six rules bound it:
   server itself decided and announced, whereas forging `Automatic` would
   impersonate server reconciliation and suppress the viewer's preference
   persistence. An echo is a required input, never an authority: a mismatching
-  echo falls through to the identity heuristic below.
+  echo never lets a client claim a reconciliation response, and it does not fall
+  through to the identity heuristic below when the client negotiated
+  `default_audio_reconcile_response_v1`. That heuristic exists for clients that
+  have *not* adopted the echo, and for them alone: falling back for a client that
+  advertised the capability would reintroduce the exact ambiguity the capability
+  removes, so a capable client that replans without the matching marker simply
+  keeps its own selection and the correction stays pending.
+   The field travels on the replan body of both surfaces: `/api/v1` decodes it
+   directly, and `/api/v2` declares it as an optional request property on the
+   replan body. It is part of the body the replan digest fingerprints, so a retry
+   that claims a different answer is detectable rather than silently replayed.
+   Because the v2 replan schema forbids additional properties, a client that sends
+   the field to a server that has not declared it is refused rather than ignored.
 - **The echoed audio identity is a fallback discriminator, not the contract.**
   Without an echo, a selection that names something other than the withdrawn
   plan's audio is read as a fresh viewer choice that supersedes the

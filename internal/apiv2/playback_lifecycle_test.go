@@ -95,6 +95,98 @@ func TestPlaybackV2ReplanUsesTypedServiceAndDigest(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestPlaybackV2ReplanCarriesPlanInvalidationAnswer pins the correlation the
+// default-audio withdrawal depends on. A client that negotiated
+// default_audio_reconcile_response_v1 answers a withdrawal by naming its reason
+// on the replan; if v2 dropped the field the answer would be lost, and since the
+// schema forbids additional properties the request would be refused outright
+// rather than merely ignored.
+func TestPlaybackV2ReplanCarriesPlanInvalidationAnswer(t *testing.T) {
+	const reason = "default_audio_reconciliation"
+	deps, _ := catalogDeps(t)
+	fake := &fakePlaybackService{}
+	deps.Playback = fake
+	data, err := os.ReadFile("../playback/testdata/protocol_v3/decision_response.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &fake.response); err != nil {
+		t.Fatal(err)
+	}
+	h := newTestHandler(t, deps)
+
+	// The echoed reason survives strict validation and reaches the service.
+	body := playbackReplanFixture(t)
+	body["answers_plan_invalidation"] = reason
+	rec := do(t, h, http.MethodPost, Prefix+"/playback/11111111-1111-4111-8111-111111111111/replan", playbackJSON(t, body), viewerHeaders())
+	if rec.Code != 200 {
+		t.Fatalf("replan answering a withdrawal: %d %s", rec.Code, rec.Body.String())
+	}
+	if fake.replan.Request.AnswersPlanInvalidation != reason {
+		t.Fatalf("answers_plan_invalidation = %q, want %q", fake.replan.Request.AnswersPlanInvalidation, reason)
+	}
+
+	// The field is optional: an ordinary intent replan omits it entirely and is
+	// still accepted, so a client that never sees a withdrawal is unaffected.
+	plain := playbackReplanFixture(t)
+	rec = do(t, h, http.MethodPost, Prefix+"/playback/11111111-1111-4111-8111-111111111111/replan", playbackJSON(t, plain), viewerHeaders())
+	if rec.Code != 200 {
+		t.Fatalf("replan without the answer: %d %s", rec.Code, rec.Body.String())
+	}
+	if fake.replan.Request.AnswersPlanInvalidation != "" {
+		t.Fatalf("answers_plan_invalidation = %q, want it absent", fake.replan.Request.AnswersPlanInvalidation)
+	}
+
+	// The answer is part of the body the digest fingerprints, so a retry that
+	// claims a different answer is detectable rather than silently replayed.
+	answered := playbackReplanFixture(t)
+	answered["answers_plan_invalidation"] = reason
+	do(t, h, http.MethodPost, Prefix+"/playback/11111111-1111-4111-8111-111111111111/replan", playbackJSON(t, answered), viewerHeaders())
+	answeredDigest := fake.replan.Digest
+	answered["answers_plan_invalidation"] = "some_other_reason"
+	do(t, h, http.MethodPost, Prefix+"/playback/11111111-1111-4111-8111-111111111111/replan", playbackJSON(t, answered), viewerHeaders())
+	if fake.replan.Digest == answeredDigest {
+		t.Fatal("a changed answers_plan_invalidation kept the same digest")
+	}
+}
+
+func TestPlaybackV2ReplanValidationRejectsBadAnswers(t *testing.T) {
+	deps, _ := catalogDeps(t)
+	fake := &fakePlaybackService{}
+	deps.Playback = fake
+	data, err := os.ReadFile("../playback/testdata/protocol_v3/decision_response.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &fake.response); err != nil {
+		t.Fatal(err)
+	}
+	h := newTestHandler(t, deps)
+	body := playbackReplanFixture(t)
+	body["answers_plan_invalidation"] = string(make([]byte, 65))
+	rec := do(t, h, http.MethodPost, Prefix+"/playback/11111111-1111-4111-8111-111111111111/replan", playbackJSON(t, body), viewerHeaders())
+	if rec.Code != 422 {
+		t.Fatalf("an over-long answer must be refused: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestPlaybackV2ReplanMapsOperationErrors covers the replan error mapping that
+// used to live at the end of TestPlaybackV2ReplanUsesTypedServiceAndDigest; it is
+// its own test so the digest and validation assertions above stay readable.
+func TestPlaybackV2ReplanMapsOperationErrors(t *testing.T) {
+	deps, _ := catalogDeps(t)
+	fake := &fakePlaybackService{}
+	deps.Playback = fake
+	data, err := os.ReadFile("../playback/testdata/protocol_v3/decision_response.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &fake.response); err != nil {
+		t.Fatal(err)
+	}
+	h := newTestHandler(t, deps)
 	for _, tc := range []struct {
 		err  *handlers.PlaybackOperationError
 		want ProblemType
