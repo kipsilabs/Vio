@@ -1313,10 +1313,13 @@ func newChiRouter(deps Dependencies) chi.Router {
 			// by path through core.
 			if deps.VirtualLibraryService != nil {
 				playbackHandler.VirtualPlaybackResolver = handlers.VirtualPlaybackResolverFunc(func(ctx context.Context, path string, userID int, profileID string, ownerInstallationID int) (string, error) {
-					return deps.VirtualLibraryService.Resolve(ctx, path)
+					// Serve-time single-URL resolve: no provider list runs
+					// here, so no fetch log needs correlating. The request
+					// id is still threaded for the refusal logs downstream.
+					return deps.VirtualLibraryService.Resolve(virtuallibrary.WithRequestID(ctx, middleware.GetReqID(ctx)), path)
 				})
 				playbackHandler.VirtualPlaybackStreamLister = handlers.VirtualPlaybackStreamListerFunc(func(ctx context.Context, path string, userID int, profileID string, ownerInstallationID int) ([]handlers.VirtualPlaybackStream, error) {
-					streams, err := deps.VirtualLibraryService.ListStreams(ctx, path)
+					streams, err := deps.VirtualLibraryService.ListStreams(virtuallibrary.WithRequestID(ctx, middleware.GetReqID(ctx)), path)
 					if err != nil {
 						return nil, err
 					}
@@ -1352,7 +1355,10 @@ func newChiRouter(deps Dependencies) chi.Router {
 				if itemsHandler != nil {
 					virtualCandidatesRefresh = &handlers.VirtualCandidatesRefreshService{
 						ListFresh: handlers.VirtualPlaybackStreamListerFunc(func(ctx context.Context, path string, userID int, profileID string, ownerInstallationID int) ([]handlers.VirtualPlaybackStream, error) {
-							streams, err := deps.VirtualLibraryService.ListStreamsFresh(ctx, path)
+							// Explicit user refresh: a provider list does run,
+							// so the fetch log is correlated like the start
+							// path's listing.
+							streams, err := deps.VirtualLibraryService.ListStreamsFresh(virtuallibrary.WithRequestID(ctx, middleware.GetReqID(ctx)), path)
 							if err != nil {
 								return nil, err
 							}
@@ -1452,11 +1458,15 @@ func newChiRouter(deps Dependencies) chi.Router {
 			deps.RegisterShutdownFunc("virtual-evidence-drain", playbackHandler.StopVirtualEvidence)
 		}
 		if deps.VirtualLibraryService != nil {
+			// The detailed resolver threads the edge id itself
+			// (virtual_detailed_resolver.go); the plain adapters below are
+			// serve-time single-URL paths with no provider list, so they
+			// thread the id only for the refusal logs downstream.
 			playbackHandler.VirtualMediaResolver = handlers.VirtualMediaResolverFunc(func(ctx context.Context, path string, ownerInstallationID int, userID int, profileID string) (string, error) {
-				return deps.VirtualLibraryService.Resolve(ctx, path)
+				return deps.VirtualLibraryService.Resolve(virtuallibrary.WithRequestID(ctx, middleware.GetReqID(ctx)), path)
 			})
 			playbackHandler.VirtualMediaRefreshResolver = handlers.VirtualMediaRefreshResolverFunc(func(ctx context.Context, path string, ownerInstallationID int, userID int, profileID string) (string, error) {
-				return deps.VirtualLibraryService.Refresh(ctx, path)
+				return deps.VirtualLibraryService.Refresh(virtuallibrary.WithRequestID(ctx, middleware.GetReqID(ctx)), path)
 			})
 			playbackHandler.VirtualMediaDetailedResolver = newVirtualMediaDetailedResolver(deps.VirtualLibraryService)
 			// Expose the provider-staleness capability the resolve probes before

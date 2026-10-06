@@ -1839,7 +1839,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	// virtualDecision accumulates the virtual-source facts the plan log names.
 	// It stays zero for a local source, and the log only reads it when the
 	// plan carries a virtual candidate URI.
-	virtualDecision := virtualPlanDecisionV3{}
+	virtualDecision := virtualPlanDecisionV3{candidateCount: -1}
 	// resolvedEffectiveFileID is the catalog row id of the candidate the
 	// virtual resolver actually served. It differs from the requested row when
 	// the resolver substituted a different candidate that has its own row
@@ -2392,6 +2392,8 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		if statusErr.cause != nil {
 			failureAttrs = append(failureAttrs, "error", statusErr.cause)
 		}
+		// The error text is sanitized centrally by the opslog sink; keep the
+		// structured cause here so the failure line stays diagnosable.
 		switch {
 		case statusErr.reason == policyErrorInternal:
 			slog.ErrorContext(r.Context(), "protocol v3 planned playback failed", failureAttrs...)
@@ -2699,6 +2701,9 @@ func (h *PlaybackHandler) resolveVirtualStartWithVersionFallback(
 	// listing failed.
 	winner.SubstitutedFromFileID = file.ID
 	winner.SubstitutionReason = virtualSubstitutionReasonV3(resolveErr)
+	// The winner resolved and ranked through the normal path, so it carries
+	// its own measured rank/count; the primary's unknown or zero values must
+	// not leak onto the substituted plan's log line.
 	logAttrs := []any{
 		logComponentKey, playbackLogValueV3,
 		"requested_file_id", file.ID,
@@ -3009,7 +3014,10 @@ func appendStartWarningsV3(result *playback.PlannerResultV3, warnings []playback
 type virtualPlanDecisionV3 struct {
 	preferredAudioLanguage string
 	candidateRank          int
-	candidateCount         int
+	// candidateCount is the ranked candidate list's length, or -1 when the
+	// resolve took a path that never ranked (a fast path with no list). The
+	// plan-decision log distinguishes that unknown from a measured zero.
+	candidateCount int
 	// substitutionReason carries the alternate-version or rotation walk's
 	// substitution cause to the plan. Empty for a same-release resolve.
 	substitutionReason string
@@ -3047,9 +3055,11 @@ func selectedAudioTrackLogFieldsV3(result playback.PlannerResultV3, audioIndex i
 // virtualPlanDecisionAttrsV3 is the virtual-source part of the plan-decision
 // line: the selected candidate, its rank in the considered list, the audio
 // track the plan will play, and the resolved playback.audio_language that
-// steered it. A non-virtual plan yields no attributes. The rank is omitted
-// until a ranked candidate count is known, and absent preferences render as
-// empty strings, so a missing value is never printed as a misleading zero.
+// steered it. A non-virtual plan yields no attributes. The count and rank
+// are omitted when the count is unknown (negative), and the rank is omitted
+// whenever it does not name a real position in the counted list (including
+// a measured zero), so a missing value is never printed as a misleading
+// zero. Absent preferences render as empty strings for the same reason.
 func virtualPlanDecisionAttrsV3(result playback.PlannerResultV3, audioIndex int, decision virtualPlanDecisionV3) []any {
 	uri := ""
 	if result.Plan != nil {
@@ -3061,13 +3071,21 @@ func virtualPlanDecisionAttrsV3(result playback.PlannerResultV3, audioIndex int,
 	audioLanguage, audioCodec, audioOrdinal := selectedAudioTrackLogFieldsV3(result, audioIndex)
 	attrs := []any{
 		"candidate_uri", uri,
-		"candidate_count", decision.candidateCount,
 		"preferred_audio_language", decision.preferredAudioLanguage,
 		"audio_track_language", audioLanguage,
 		"audio_track_codec", audioCodec,
 		"audio_track_index", audioOrdinal,
 	}
-	if decision.candidateCount > 0 {
+	// candidate_count -1 means the resolve never ranked, so the count is
+	// unknown and both fields are omitted. A measured count (including zero
+	// from an empty ranked list, or defensively from any path that never set
+	// the field) prints the count; the rank prints only when it names a real
+	// position inside that list, so rank 0 into an empty list never renders.
+	if decision.candidateCount < 0 {
+		return attrs
+	}
+	attrs = append(attrs, "candidate_count", decision.candidateCount)
+	if decision.candidateRank >= 0 && decision.candidateRank < decision.candidateCount {
 		attrs = append(attrs, "candidate_rank", decision.candidateRank)
 	}
 	return attrs

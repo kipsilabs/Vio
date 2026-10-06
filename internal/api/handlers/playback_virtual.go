@@ -1355,9 +1355,13 @@ type resolvedVirtualPlaybackSource struct {
 	// CandidateRank is the 0-based position of the selected candidate in the
 	// ranked candidate list this resolve considered, or -1 when the resolve
 	// took a path that did not rank (a stored-URL fast path with no list).
-	// CandidateCount is that list's length. They feed the plan-decision log so
-	// a deployment question ("which candidate did it pick, and out of how
-	// many?") is answerable without a second resolve.
+	// CandidateCount is that list's length: the count the selected rank is
+	// measured against, or -1 when unknown. A measured zero comes from an
+	// empty ranked list (or, defensively, from any path that never set the
+	// field); it is not a rank into a list and must render without one.
+	// They feed the plan-decision log so a deployment question ("which
+	// candidate did it pick, and out of how many?") is answerable without a
+	// second resolve.
 	CandidateRank  int
 	CandidateCount int
 	// SubstitutedFromFileID names the catalog row the caller asked for when the
@@ -2378,6 +2382,9 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			return &resolvedVirtualPlaybackSource{
 				URL: "", URI: cand.URI, OwnerID: oid, File: &transient,
 				ProbeSucceeded: false, Provenance: ProbeProvenancePending,
+				// Unranked: this path skipped the candidate list, so the
+				// rank/count stay unknown rather than the zero value.
+				CandidateRank: -1, CandidateCount: -1,
 			}, nil
 		}
 		// Durable-resume fast path. The repeat-play gate above cannot apply
@@ -2418,6 +2425,8 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				return &resolvedVirtualPlaybackSource{
 					URL: "", URI: cand.URI, OwnerID: oid, File: &transient,
 					ProbeSucceeded: false, Provenance: ProbeProvenancePending,
+					// Unranked: this path skipped the candidate list.
+					CandidateRank: -1, CandidateCount: -1,
 				}, nil
 			}
 		}
@@ -2463,6 +2472,8 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				return &resolvedVirtualPlaybackSource{
 					URL: "", URI: cand.URI, OwnerID: oid, File: &transient,
 					ProbeSucceeded: false, Provenance: ProbeProvenancePending,
+					// Unranked: this path skipped the candidate list.
+					CandidateRank: -1, CandidateCount: -1,
 				}, nil
 			}
 		}
@@ -2901,11 +2912,12 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		if fastPathHit {
 			// The repeat-play fast path already committed the persisted
 			// candidate; return it without re-ranking or unpinning the pin.
+			// The rank/count describe the candidate list this start ranked,
+			// which the fast path skipped: keep them unknown (-1) rather than
+			// stamping a rank 0 into a list that was never measured.
 			if result == nil {
 				return resolvedVirtualPlaybackSource{}, errors.New("virtual playback fast path returned no source")
 			}
-			result.CandidateRank = i
-			result.CandidateCount = len(candidates)
 			return *result, nil
 		}
 		if err != nil || result.Provenance == ProbeProvenanceFailed {
@@ -3010,6 +3022,8 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		if firstResolved.Provenance == ProbeProvenanceVerified {
 			h.persistVirtualProbeEvidence(r.Context(), file, firstResolved.File.FilePath, firstResolved.File, true, true)
 		}
+		// The rank/count were set where this result was produced; a
+		// fast-path result that skipped ranking keeps its unknown (-1).
 		return *firstResolved, nil
 	}
 	if attemptErr == nil {
