@@ -3210,6 +3210,35 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersist(
 	ownerInstallationID int,
 	fence ...func() bool,
 ) string {
+	var bindingFence func() bool
+	if len(fence) > 0 {
+		bindingFence = fence[0]
+	}
+	return h.probeVirtualSourceAndPersistWith(bgCtx, stickyKey, catalogFile, probeURL, probeTransient, probeCand, expectedRuntimeMinutes, ownerInstallationID, false, bindingFence)
+}
+
+// probeVirtualSourceAndPersistWith is probeVirtualSourceAndPersist with an
+// explicit evidence-write mode. durableEvidence makes the catalog write
+// synchronous and its result authoritative: the probe reports verified only once
+// the committed row actually carries the enumerated tracks, and reports failed
+// when the write is rejected or terminally fails. The deferred post-commit probe
+// uses it so a session's outcome never claims a verified menu before the row the
+// poll reads is readable — the premature-verified case where a client stops
+// loading on the old menu. Ordinary background callers pass false and keep the
+// queued, coalescing write, where a positive verdict means "probe succeeded",
+// not "row committed", exactly as before.
+func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
+	bgCtx context.Context,
+	stickyKey string,
+	catalogFile *models.MediaFile,
+	probeURL string,
+	probeTransient models.MediaFile,
+	probeCand VirtualPlaybackStream,
+	expectedRuntimeMinutes int,
+	ownerInstallationID int,
+	durableEvidence bool,
+	fence func() bool,
+) string {
 	probeKey := virtualProbeFailureKey(probeCand.URI, ownerInstallationID)
 	probeCtx, probeCancel := context.WithTimeout(bgCtx, virtualBackgroundProbeBudget)
 	probed, probeErr := h.probeVirtualSource(probeCtx, probeURL, &probeTransient, probeCand.RequestHeaders)
@@ -3218,7 +3247,7 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersist(
 	// scheduled for. Re-check the fence before this probe touches shared state:
 	// a superseded verdict must not mark the damper, unpin the current
 	// candidate, or persist evidence onto a row the session no longer serves.
-	if len(fence) > 0 && fence[0] != nil && !fence[0]() {
+	if fence != nil && !fence() {
 		slog.InfoContext(bgCtx, "virtual probe evidence dropped: candidate binding moved during the probe",
 			"component", "api", "candidate_uri", probeCand.URI, "file_id", catalogFile.ID)
 		return ""
@@ -3254,8 +3283,81 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersist(
 		probed.Duration = probeTransient.Duration
 	}
 	mergeVirtualCandidateTracks(probed, probeCand)
+	if durableEvidence {
+		// The outcome must not outrun the evidence: report verified only when
+		// the committed row that the inventory poll reads actually carries the
+		// enumerated tracks. A rejected or failed write is a terminal failed
+		// outcome so the client leaves loading instead of showing a stale menu
+		// as verified.
+		if !h.persistVirtualProbeEvidenceDurable(bgCtx, catalogFile, probeCand.URI, probed, true) {
+			slog.WarnContext(bgCtx, "deferred virtual probe evidence not readable after durable write; reporting failed",
+				"component", "api", "candidate_uri", probeCand.URI, "file_id", catalogFile.ID)
+			return probeOutcomeFailed
+		}
+		return probeOutcomeVerified
+	}
 	h.persistVirtualProbeEvidence(bgCtx, catalogFile, probeCand.URI, probed, true, false)
 	return probeOutcomeVerified
+}
+
+// persistVirtualProbeEvidenceDurable performs one synchronous, read-back-checked
+// evidence write for a caller whose outcome depends on the evidence being
+// visible. It exists for the deferred post-commit probe: that probe's terminal
+// outcome is stored on the session and read by the inventory poll, so reporting
+// verified while the row still shows its old menu would make a client stop
+// loading on stale tracks. A queued write cannot give that guarantee — it may
+// still be pending, or be rejected, or coalesce onto a later snapshot — so the
+// durable path bypasses the buffer rather than guessing.
+//
+// The write prefers the explicit adoption-result saver so it can tell a genuine
+// commit (MetadataUpdated) from a no-op CAS miss; a bare row-count saver is
+// accepted only as a positive signal and cannot promise a read-back, so the call
+// reports false rather than a false success. It returns whether the probe
+// evidence is committed and therefore readable from the catalog row.
+func (h *PlaybackHandler) persistVirtualProbeEvidenceDurable(ctx context.Context, catalogFile *models.MediaFile, resolvedPath string, probed *models.MediaFile, stampProbe bool) bool {
+	args, _, ok := h.virtualProbeEvidenceArgs(ctx, catalogFile, resolvedPath, probed, stampProbe)
+	if !ok {
+		slog.WarnContext(ctx, "durable virtual probe evidence write refused before execution",
+			"component", "api", "file_id", catalogFileIDOrZero(catalogFile), "candidate_uri", resolvedPath)
+		return false
+	}
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), virtualEvidencePersistBudget)
+	defer cancel()
+	if h.VirtualFileMetadataSaver != nil {
+		result, err := h.VirtualFileMetadataSaver(writeCtx, args)
+		if err != nil {
+			slog.WarnContext(ctx, "durable virtual probe evidence write failed",
+				"component", "api", "file_id", args.FileID, "error", err)
+			return false
+		}
+		if result.MetadataUpdated {
+			return true
+		}
+		// A CAS miss is the expected outcome when a newer writer already
+		// committed the row; the evidence this probe enumerated is then
+		// superseded and must not be reported verified.
+		slog.WarnContext(ctx, "durable virtual probe evidence write matched no row (superseded snapshot)",
+			"component", "api", "file_id", args.FileID, "candidate_uri", resolvedPath)
+		return false
+	}
+	if h.VirtualFileSaver == nil {
+		return false
+	}
+	rows, err := h.VirtualFileSaver(writeCtx, args)
+	if err != nil {
+		slog.WarnContext(ctx, "durable virtual probe evidence write failed",
+			"component", "api", "file_id", args.FileID, "error", err)
+		return false
+	}
+	return rows > 0
+}
+
+// catalogFileIDOrZero is a nil-safe file id for a log attribute.
+func catalogFileIDOrZero(file *models.MediaFile) int {
+	if file == nil {
+		return 0
+	}
+	return file.ID
 }
 
 // virtualProbeFromCache returns a probe already completed for this candidate's
@@ -4035,7 +4137,7 @@ func (h *PlaybackHandler) persistVirtualProbeEvidence(ctx context.Context, catal
 // alternate-version row must bind the evidence to the version that actually
 // plays, not be dropped onto the pinned row forever.
 func (h *PlaybackHandler) virtualProbeEvidenceArgs(ctx context.Context, catalogFile *models.MediaFile, resolvedPath string, probed *models.MediaFile, stampProbe bool) (models.VirtualFilePersistArgs, int, bool) {
-	if h == nil || h.VirtualFileSaver == nil || catalogFile == nil || probed == nil || catalogFile.ID <= 0 {
+	if h == nil || (h.VirtualFileSaver == nil && h.VirtualFileMetadataSaver == nil) || catalogFile == nil || probed == nil || catalogFile.ID <= 0 {
 		return models.VirtualFilePersistArgs{}, 0, false
 	}
 	identityRow, evidence, ok := h.virtualProbeEvidenceRotateTarget(ctx, catalogFile, resolvedPath, probed)

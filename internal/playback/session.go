@@ -1521,6 +1521,30 @@ func (m *SessionManager) SetVirtualProbeOutcome(sessionID, outcome string) error
 	return nil
 }
 
+// SetVirtualProbeOutcomeIfGeneration records a deferred probe's outcome on the
+// session only while its candidate binding is still the exact one the probe was
+// scheduled against (compare-and-swap on virtualSourceGeneration). A probe that
+// started before a rotation and finishes after it must not stamp its verdict —
+// "verified" or "failed" — onto the replacement binding's lifecycle, or a
+// subsequent poll would end the new release's loading state with the old
+// release's outcome. It returns applied=false when the binding moved, so the
+// caller can treat the result as superseded rather than an error. An unknown
+// session is a no-op, like SetVirtualProbeOutcome.
+func (m *SessionManager) SetVirtualProbeOutcomeIfGeneration(sessionID string, generation uint64, outcome string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		return false, ErrSessionNotFound
+	}
+	if s.virtualSourceGeneration != generation {
+		return false, nil
+	}
+	s.VirtualProbeOutcome = outcome
+	return true, nil
+}
+
 // VirtualSourceBindingSnapshot captures the full candidate-binding state under the session lock.
 type VirtualSourceBindingSnapshot struct {
 	VirtualURI           string

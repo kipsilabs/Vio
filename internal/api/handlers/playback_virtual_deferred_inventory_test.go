@@ -67,8 +67,10 @@ func TestStartPlaybackDefersTrackInventoryUntilPostCommitPush(t *testing.T) {
 
 	manager := playback.NewSessionManager(0, 0)
 	// The resolver serves the same row so the post-commit publish re-reads the
-	// exact row it probed.
-	handler := NewPlaybackHandler(manager, testPlaybackFileResolver{file: source})
+	// exact row it probed. The row is mutex-guarded because the evidence write
+	// mutates it while the publish reads it.
+	resolver := &syncPlaybackFileResolver{file: *source}
+	handler := NewPlaybackHandler(manager, resolver)
 	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "true"}}
 	handler.ItemAccess = allowAllPlaybackItemAccess{}
 	handler.PlaybackConfig = playbackTestConfig("", "")
@@ -109,10 +111,12 @@ func TestStartPlaybackDefersTrackInventoryUntilPostCommitPush(t *testing.T) {
 		if err := json.Unmarshal(args.SubtitleTracks, &subs); err != nil {
 			return VirtualFileMetadataUpdateResult{}, err
 		}
-		source.AudioTracks = audio
-		source.SubtitleTracks = subs
-		source.CodecAudio = "eac3"
-		source.ProbeUpdatedAt = &probedAt
+		resolver.update(func(f *models.MediaFile) {
+			f.AudioTracks = audio
+			f.SubtitleTracks = subs
+			f.CodecAudio = "eac3"
+			f.ProbeUpdatedAt = &probedAt
+		})
 		saveOnce.Do(func() { close(savedCh) })
 		return VirtualFileMetadataUpdateResult{MetadataUpdated: true, RowsAffected: 1}, nil
 	}
@@ -504,7 +508,8 @@ func TestDeferredProbePendingThenVerifiedPollTransitions(t *testing.T) {
 	source.ProbeUpdatedAt = nil
 
 	manager := playback.NewSessionManager(0, 0)
-	handler := NewPlaybackHandler(manager, testPlaybackFileResolver{file: source})
+	resolver := &syncPlaybackFileResolver{file: *source}
+	handler := NewPlaybackHandler(manager, resolver)
 	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "true"}}
 	handler.ItemAccess = allowAllPlaybackItemAccess{}
 	handler.PlaybackConfig = playbackTestConfig("", "")
@@ -524,6 +529,21 @@ func TestDeferredProbePendingThenVerifiedPollTransitions(t *testing.T) {
 		f.AudioTracks = []models.AudioTrack{{Codec: "eac3", Channels: 6, Language: "deu"}}
 		f.CodecAudio = "eac3"
 		return f, nil
+	}
+	// The deferred probe's evidence write is durable and read-back-checked, so
+	// the saver must model the committed catalog row the poll reads.
+	probedAt := time.Now().UTC()
+	handler.VirtualFileMetadataSaver = func(_ context.Context, args models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error) {
+		var audio []models.AudioTrack
+		if err := json.Unmarshal(args.AudioTracks, &audio); err != nil {
+			return VirtualFileMetadataUpdateResult{}, err
+		}
+		resolver.update(func(f *models.MediaFile) {
+			f.AudioTracks = audio
+			f.CodecAudio = args.CodecAudio
+			f.ProbeUpdatedAt = &probedAt
+		})
+		return VirtualFileMetadataUpdateResult{MetadataUpdated: true, RowsAffected: 1}, nil
 	}
 
 	start := startV3PlaybackForHandlerTest(t, handler, func() playback.StartRequestV3 {
@@ -582,7 +602,8 @@ func TestSaturatedGateDefersProbeInsteadOfProbingOnRequestPath(t *testing.T) {
 	source.ProbeUpdatedAt = nil
 
 	manager := playback.NewSessionManager(0, 0)
-	handler := NewPlaybackHandler(manager, testPlaybackFileResolver{file: source})
+	resolver := &syncPlaybackFileResolver{file: *source}
+	handler := NewPlaybackHandler(manager, resolver)
 	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "true"}}
 	handler.ItemAccess = allowAllPlaybackItemAccess{}
 	handler.PlaybackConfig = playbackTestConfig("", "")
@@ -598,6 +619,15 @@ func TestSaturatedGateDefersProbeInsteadOfProbingOnRequestPath(t *testing.T) {
 		probeOnce.Do(func() { close(probeStarted) })
 		<-releaseProbe
 		return f, nil
+	}
+	// The durable evidence write is read-back-checked; model the committed row.
+	probedAt := time.Now().UTC()
+	handler.VirtualFileMetadataSaver = func(_ context.Context, args models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error) {
+		resolver.update(func(f *models.MediaFile) {
+			f.AudioTracks = []models.AudioTrack{{Codec: args.CodecAudio, Channels: 2}}
+			f.ProbeUpdatedAt = &probedAt
+		})
+		return VirtualFileMetadataUpdateResult{MetadataUpdated: true, RowsAffected: 1}, nil
 	}
 
 	// Saturate the aggregate detached gate so the deferred worker has nowhere
