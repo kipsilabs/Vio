@@ -3282,19 +3282,25 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 	return probeOutcomeVerified
 }
 
-// persistVirtualProbeEvidenceDurable performs one synchronous evidence write for
-// a caller whose verdict depends on the write's outcome. It exists for the
-// deferred post-commit probe: that probe's terminal outcome is stored on the
-// session and read by the inventory poll, so reporting verified while the row
-// still shows its old menu would make a client stop loading on stale tracks. A
-// queued write cannot report that outcome — it may still be pending, be rejected,
-// or coalesce onto a later snapshot — so the durable path bypasses the buffer.
+// persistVirtualProbeEvidenceDurable performs one synchronous, durable evidence
+// write for a caller whose outcome depends on the evidence being visible before
+// the outcome is recorded. It exists for the deferred post-commit probe: that
+// probe's terminal outcome is stored on the session and read by the inventory
+// poll, so reporting verified while the row still shows its old menu would make
+// a client stop loading on stale tracks. Visibility comes from ordering, not a
+// read-back — the write commits synchronously before the outcome and publish, so
+// a poll that follows the outcome reads the committed row. A queued write cannot
+// give that guarantee — it may still be pending, or be rejected, or coalesce
+// onto a later snapshot — so the durable path bypasses the buffer rather than
+// guessing.
 //
-// The write prefers the explicit adoption-result saver, whose MetadataUpdated
-// distinguishes a genuine commit from a no-op CAS miss. Without that saver a bare
-// row-count saver is used: a positive row count is accepted as a committed write,
-// and a zero row count as a stale snapshot. It returns whether the write
-// committed; it does not itself re-read the row.
+// The write prefers the explicit adoption-result saver so it can tell a genuine
+// commit (MetadataUpdated) from a no-op CAS miss. The bare row-count saver only
+// reports how many rows matched, so it is treated as committed when it affected
+// at least one row and as not-committed otherwise — it cannot distinguish a CAS
+// miss (superseded snapshot) from a plain no-op, but a zero-row write is never
+// reported verified. It returns whether the probe evidence is committed and
+// therefore readable from the catalog row.
 func (h *PlaybackHandler) persistVirtualProbeEvidenceDurable(ctx context.Context, catalogFile *models.MediaFile, resolvedPath string, probed *models.MediaFile, stampProbe bool) bool {
 	args, _, ok := h.virtualProbeEvidenceArgs(ctx, catalogFile, resolvedPath, probed, stampProbe)
 	if !ok {

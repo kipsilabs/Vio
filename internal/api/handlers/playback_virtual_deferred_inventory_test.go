@@ -285,18 +285,18 @@ func TestDeferredInventorySpawnedAfterSameReleaseTransientRetry(t *testing.T) {
 	}
 }
 
-// TestResolveListingPreservesMissingCandidateCodec is the codec regression: a
-// row that carries a concrete ?result= candidate but no audio evidence must
-// still run the provider listing, because the listing is the only source of the
-// candidate's declared codec. Without it the merge would synthesize an "aac"
-// fallback and commit it into the recipe; the provider's declaration ("eac3")
-// must win instead.
-func TestResolveListingPreservesMissingCandidateCodec(t *testing.T) {
+// TestMissingCandidateMetadataForcesProviderListing is the contradictory-codec
+// regression: a row that names a concrete ?result= candidate but carries no
+// audio evidence must still pay the provider listing, because the listing is the
+// only declaration of the candidate's codec. Without it the merge would
+// synthesize an "aac" fallback and commit it into the recipe; the provider's
+// declaration ("eac3") must win instead.
+func TestMissingCandidateMetadataForcesProviderListing(t *testing.T) {
 	newRow := func() *models.MediaFile {
 		return &models.MediaFile{
 			ID:                         710,
-			ContentID:                  "movie-declared-codec-710",
-			FilePath:                   "virtual://movie/tt-declared-codec-710?result=cand-1",
+			ContentID:                  "movie-preprobe-710",
+			FilePath:                   "virtual://movie/tt-preprobe-710?result=cand-1",
 			Container:                  "virtual",
 			CodecVideo:                 "h264",
 			CodecAudio:                 "",
@@ -316,7 +316,7 @@ func TestResolveListingPreservesMissingCandidateCodec(t *testing.T) {
 		VirtualPlaybackStreamLister: VirtualPlaybackStreamListerFunc(func(_ context.Context, _ string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
 			listerCalls.Add(1)
 			return []VirtualPlaybackStream{{
-				ID: "cand-1", URI: "virtual://movie/tt-declared-codec-710?result=cand-1",
+				ID: "cand-1", URI: "virtual://movie/tt-preprobe-710?result=cand-1",
 				Resolution: "1080p", CodecVideo: "h264", CodecAudio: "eac3", Container: "mkv",
 			}}, nil
 		}),
@@ -324,7 +324,6 @@ func TestResolveListingPreservesMissingCandidateCodec(t *testing.T) {
 			return newRow(), nil
 		},
 	}
-
 	file := newRow()
 	req := httptest.NewRequest(http.MethodPost, "/api/v2/playback/start", nil)
 	resolved, err := h.resolveVirtualPlaybackSource(req, file, "profile-1", true, nil, "", "", 0, false)
@@ -332,7 +331,7 @@ func TestResolveListingPreservesMissingCandidateCodec(t *testing.T) {
 		t.Fatalf("resolveVirtualPlaybackSource error: %v", err)
 	}
 	if listerCalls.Load() != 1 {
-		t.Fatalf("provider lister called %d times while candidate metadata was missing, want 1 (the listing is the only source of the declared codec)", listerCalls.Load())
+		t.Fatalf("provider lister called %d times while candidate metadata was missing, want 1 (the listing is the only codec declaration)", listerCalls.Load())
 	}
 	if resolved.File == nil {
 		t.Fatal("resolve returned no file")
@@ -376,6 +375,13 @@ func TestDeferredProbeFailureEndsLoadingViaPushAndPoll(t *testing.T) {
 		<-releaseProbe
 		return nil, errors.New("provider probe refused the stream")
 	}
+	// The failed probe marks the process-wide failure damper for this
+	// candidate; a re-run of the test in the same process would read the
+	// recent mark and skip the deferred probe, so the plan would not be
+	// provisional. Clear the key before and after so the test is repeatable.
+	failureKey := virtualProbeFailureKey(source.FilePath, source.VirtualOwnerInstallationID)
+	virtualProbeFailures.clear(failureKey)
+	t.Cleanup(func() { virtualProbeFailures.clear(failureKey) })
 
 	start := startV3PlaybackForHandlerTest(t, handler, func() playback.StartRequestV3 {
 		request := v3HandlerStartRequest()
@@ -470,8 +476,9 @@ func TestDeferredProbePendingThenVerifiedPollTransitions(t *testing.T) {
 		f.CodecAudio = "eac3"
 		return f, nil
 	}
-	// The deferred probe's evidence write is durable, so the saver must model
-	// the committed catalog row the poll reads.
+	// The deferred probe's evidence write is durable — committed synchronously
+	// before the outcome and publish — so the saver models the committed catalog
+	// row the poll reads.
 	probedAt := time.Now().UTC()
 	handler.VirtualFileMetadataSaver = func(_ context.Context, args models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error) {
 		var audio []models.AudioTrack
@@ -560,8 +567,7 @@ func TestSaturatedGateDefersProbeInsteadOfProbingOnRequestPath(t *testing.T) {
 		<-releaseProbe
 		return f, nil
 	}
-	// The durable evidence write is not itself a read-back; model the committed
-	// row that the poll reads after it commits.
+	// The durable evidence write commits synchronously; model the committed row.
 	probedAt := time.Now().UTC()
 	handler.VirtualFileMetadataSaver = func(_ context.Context, args models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error) {
 		resolver.update(func(f *models.MediaFile) {
@@ -642,10 +648,10 @@ func TestDeferredProbeOutcomeFencedByCandidateBinding(t *testing.T) {
 	}
 	h := NewPlaybackHandler(manager)
 
-	deferred := deferredOverflowProbe(session, "virtual://movie/tt-fence?result=old")
-	bindOrFail(t, h, deferred)
-
-	// Intact while the binding still names the probed candidate.
+	// Capture the live binding generation the way admission does, so the fence
+	// checks the candidate and generation together.
+	deferred := readmitDeferredProbe(t, h, deferredOverflowProbe(session, "virtual://movie/tt-fence?result=old"))
+	// Intact while the binding still names the probed candidate and generation.
 	if !h.deferredProbeBindingIntact(deferred)() {
 		t.Fatal("binding fence reported false for the still-bound candidate")
 	}

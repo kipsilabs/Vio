@@ -1252,6 +1252,12 @@ type inventoryPublishSummary struct {
 // a declared inventory is what the client already holds, so re-sending it would
 // be noise. The payload carries the session's inventory revision so a client
 // gates duplicates and out-of-order pushes.
+//
+// This file-wide fan-out is for catalog-evidence callers whose evidence commit
+// concerns every session on the file. Per-session terminal notifications (the
+// deferred-probe dispatcher) must use PublishInventoryUpdatedToSession instead:
+// they ack delivery per session and per binding generation, so pushing sibling
+// sessions on the same file would break their exactly-once accounting.
 func (h *PlaybackHandler) PublishInventoryUpdated(ctx context.Context, fileID int) inventoryPublishSummary {
 	summary := inventoryPublishSummary{FileID: fileID}
 	if h == nil || h.RealtimeHub == nil || fileID <= 0 {
@@ -1275,6 +1281,50 @@ func (h *PlaybackHandler) PublishInventoryUpdated(ctx context.Context, fileID in
 			summary.SessionsNotified++
 			summary.Revision = revision
 		}
+	}
+	return summary
+}
+
+// PublishInventoryUpdatedToSession pushes the committed track inventory to one
+// specific session, in contrast to PublishInventoryUpdated's file-wide fan-out.
+// It exists for the deferred-probe terminal-notification path: that machinery
+// acknowledges delivery per session and per binding generation, so pushing a
+// sibling session that happens to play the same file would deliver an event the
+// sibling never acked — and ack this session's generation against a push the
+// sibling also received, breaking exactly-once for both. The payload is built by
+// the same publishInventoryUpdatedToSession the fan-out uses (and the realtime
+// hello republish targets directly), so the delivered inventory is identical;
+// only the recipient set differs. fileID is the intent's recorded file, used
+// only to skip the send when the session no longer serves that file; the payload
+// itself is always resolved from the live session. Best-effort: an unknown,
+// ended, or realtime-less session is a no-op.
+func (h *PlaybackHandler) PublishInventoryUpdatedToSession(ctx context.Context, sessionID string, fileID int) inventoryPublishSummary {
+	summary := inventoryPublishSummary{FileID: fileID}
+	if h == nil || h.RealtimeHub == nil || sessionID == "" {
+		return summary
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	session, err := h.sessionMgr.GetSession(sessionID)
+	if err != nil || session == nil {
+		return summary
+	}
+	if !session.HasRealtimeConnection {
+		return summary
+	}
+	// The intent was parked against a file the session served at park time. A
+	// session that moved to a different file since then is absent from this
+	// notification's scope; the move's own lifecycle carries its own push.
+	if fileID > 0 && session.MediaFileID != fileID && session.RequestedMediaFileID != fileID {
+		return summary
+	}
+	publishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), inventoryUpdatedPublishBudget)
+	defer cancel()
+	revision, delivered := h.publishInventoryUpdatedToSession(publishCtx, session, 0, "", nil)
+	if delivered {
+		summary.SessionsNotified++
+		summary.Revision = revision
 	}
 	return summary
 }
