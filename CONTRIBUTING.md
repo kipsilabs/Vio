@@ -226,8 +226,9 @@ when none applies. Either way, the Problem section has to stand on its own. Keep
 limited to the stated problem. Keep the description proportional to the change;
 omit session history, full logs, and private report links other than a
 maintainer's `Evidence:` line. Follow the
-[public-content and media rules](AGENTS.md#pull-requests). Screenshots and recordings
-are not routine PR requirements; attach them only when explicitly requested.
+[public-content and media rules](AGENTS.md#pull-requests), and include evidence
+for every change users can see, as [Show visible changes](#show-visible-changes)
+describes.
 
 ### Write the description
 
@@ -251,6 +252,39 @@ change does; the rest should help them decide how closely to review.
   subtle change can take more. There is no word limit, so do not count words
   or trim to a target. Long supporting evidence, such as tables or
   measurements, can go in a `<details>` block after the summary.
+
+### Show visible changes
+
+A pull request that changes what a user sees must show the change in its
+Evidence section, so reviewers can see it without building the branch. In this
+repository that means the web app and web admin, and every client that renders
+server data. A change is visible when it alters any of these:
+
+- layout, styling, copy, navigation, focus, empty and error states;
+- which items a screen shows, or in what order: search results, home sections,
+  recommendations, library browsing, collections, sorting, or filtering;
+- what an item shows: titles, artwork, descriptions, ratings, badges, episode
+  grouping, or availability;
+- playback behavior a user notices, such as default audio or subtitle tracks,
+  markers, controls, or resume position;
+- a native API or jellycompat response field that clients render.
+
+Provide evidence that fits the change:
+
+- **Changes to a screen:** before-and-after screenshots of the same screen with
+  the same data, one pair per affected surface. Add a short recording when
+  motion, timing, focus movement, or a multi-step flow matters.
+- **Server changes no client shows yet:** before-and-after excerpts of the API
+  response for the same request, trimmed to the fields that changed, such as the
+  ordered list of result titles.
+- Name the surface and the build or commit each capture came from.
+
+Capture against a test library or public-domain media where you can. Crop or
+blur hostnames, URLs, account names, and personal library contents. When the
+evidence cannot be made public, a maintainer may link an
+`evidence.siloserver.org` page instead. If you could not capture evidence,
+say why; the reviewer decides whether the pull request can merge without it.
+Changes users cannot see write `Evidence: none, no user-visible change`.
 
 ## Review expectations
 
