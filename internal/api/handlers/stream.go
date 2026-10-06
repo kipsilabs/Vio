@@ -1015,7 +1015,12 @@ func resolvedVirtualCandidatePath(resolved ResolvedVirtualMedia) string {
 // panic with ErrAbortHandler instead of reaching this verdict); failed_open
 // is everything else. The disposition is a log value only and never steers
 // recovery: the branches below keep their own conditions.
-func virtualProxyDisposition(ctx context.Context, proxyErr error, statusCode int, relayNotFound, relayTemporary bool) string {
+//
+// The returned values are the verdict's contract vocabulary, pinned by
+// TestVirtualProxyDisposition. They stay inline rather than named constants
+// so the five outcomes read as one closed set at the single site that
+// produces them.
+func virtualProxyDisposition(ctx context.Context, proxyErr error, statusCode int, relayNotFound, relayTemporary bool) string { //nolint:goconst // Verdict vocabulary reads as one closed set at its single production site.
 	if isClientCancellation(ctx, proxyErr) {
 		return "client_canceled"
 	}
@@ -1041,7 +1046,13 @@ func virtualProxyDisposition(ctx context.Context, proxyErr error, statusCode int
 // logs at debug; a genuine failure keeps its WARN so it stays visible in the
 // operational log. The verdict is first-attempt classification, not the final
 // recovery outcome: a later heal or rotation can still serve the request.
-func logVirtualProxyVerdict(ctx context.Context, sessionID string, file *models.MediaFile, deliveredPath, disposition string, proxyErr error) {
+//
+// The attribute keys are the verdict's join contract (session,
+// playback_session_id, candidate ids, disposition), pinned by
+// TestLogVirtualProxyVerdictCarriesJoinKeys. They stay inline rather than
+// named constants so the logged shape reads as one block at the single site
+// that emits it.
+func logVirtualProxyVerdict(ctx context.Context, sessionID string, file *models.MediaFile, deliveredPath, disposition string, proxyErr error) { //nolint:goconst // Verdict join keys read as one block at their single emission site.
 	pinnedID := virtualCandidateID(file)
 	deliveredID := virtualResultCandidateID(deliveredPath)
 	attrs := []any{
