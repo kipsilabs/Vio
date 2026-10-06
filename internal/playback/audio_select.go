@@ -80,17 +80,31 @@ func rankedLanguageMatch(candidate, preferred string) int {
 	return langMatchRank(candidate, preferred)
 }
 
+// Language sentinels that carry no concrete language evidence. Release and
+// intake vocabulary uses these to mean "several" or "not stated", which must
+// stay neutral in preference matching rather than rank as a match.
+const (
+	langUndetermined = "und"
+	langMulti        = "mul"
+
+	langLongMulti     = "multi"
+	langLongMultiple  = "multiple"
+	langLongDual      = "dual"
+	langLongUnknown   = "unknown"
+	langLongUndefined = "undefined"
+)
+
 // unknownLanguageMembership reports whether a language token declares only
 // MULTI/DUAL/undetermined membership (or nothing at all) instead of a
 // concrete language. Such tokens are release/intake vocabulary, not language
 // evidence, and must stay neutral in language preference matching.
 func unknownLanguageMembership(token string) bool {
 	switch lang.Canonical(strings.TrimSpace(token)) {
-	case "", "und", "mul":
+	case "", langUndetermined, langMulti:
 		return true
 	}
 	switch strings.ToLower(strings.TrimSpace(token)) {
-	case "multi", "multiple", "dual", "unknown", "undefined":
+	case langLongMulti, langLongMultiple, langLongDual, langLongUnknown, langLongUndefined:
 		return true
 	}
 	return false
@@ -264,7 +278,7 @@ func crossVersionAudioLanguages(track models.AudioTrack) []string {
 // language intent: empty, "und"/"mul", or their long forms.
 func isPlaceholderLanguage(code string) bool {
 	canonical := lang.Canonical(code)
-	return canonical == "" || canonical == "und" || canonical == "mul"
+	return canonical == "" || canonical == langUndetermined || canonical == langMulti
 }
 
 // BrowserSupportsAudioCodec returns true if the given audio codec can be
