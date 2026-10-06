@@ -154,7 +154,7 @@ func TestScheduledRefreshBatchKeepsFullSeriesPersistInline(t *testing.T) {
 	}
 }
 
-func TestScheduledRefreshBatchFlushSkipsCancelledContext(t *testing.T) {
+func TestScheduledRefreshBatchFlushSkipsCanceledContext(t *testing.T) {
 	h, seriesID, _, linkPasses, debts := seedSeriesSyncCounters(t)
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -166,10 +166,10 @@ func TestScheduledRefreshBatchFlushSkipsCancelledContext(t *testing.T) {
 	flush(ctx)
 
 	if got := linkPasses.Load(); got != 0 {
-		t.Fatalf("series link passes after a cancelled flush = %d, want 0", got)
+		t.Fatalf("series link passes after a canceled flush = %d, want 0", got)
 	}
 	if got := debts.sweepCount(seriesID); got != 0 {
-		t.Fatalf("series debt sweeps after a cancelled flush = %d, want 0", got)
+		t.Fatalf("series debt sweeps after a canceled flush = %d, want 0", got)
 	}
 }
 

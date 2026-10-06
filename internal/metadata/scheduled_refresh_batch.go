@@ -90,7 +90,7 @@ func (s *MetadataService) flushScheduledRefreshBatch(ctx context.Context, batch 
 		case <-ctx.Done():
 		}
 		if err := ctx.Err(); err != nil {
-			slog.InfoContext(ctx, "metadata: skipped deferred series sync for a cancelled refresh batch", "component", "metadata",
+			slog.InfoContext(ctx, "metadata: skipped deferred series sync for a canceled refresh batch", "component", "metadata",
 				"skipped_series", len(series)-i, "error", err)
 			break
 		}
