@@ -2989,6 +2989,7 @@ func (s *MetadataService) refreshTarget(ctx context.Context, targetType, content
 		err := s.refreshEpisodeTarget(ctx, contentID, folderID, mode)
 		if err != nil {
 			s.recordRefreshTargetFailure(ctx, targetType, contentID, err, incrementDebtAttempt)
+			noteScheduledRefreshFailure(ctx, contentID, err)
 			return err
 		}
 		return s.syncRefreshDebtForTarget(ctx, targetType, contentID)
@@ -5992,9 +5993,19 @@ func (s *MetadataService) refreshSeriesEpisodeMetadataState(ctx context.Context,
 		return
 	}
 
+	// Episode targets that failed during a scheduled refresh batch keep the
+	// failure their own refresh recorded; only the other episodes are synced.
+	failedEpisodes := failedEpisodeDebtFromContext(ctx)
+	keptActionable := false
 	var completeEpisodeIDs []string
 	var actionableEpisodes []*models.Episode
 	for _, episode := range episodes {
+		if episode != nil {
+			if _, failed := failedEpisodes[strings.TrimSpace(episode.ContentID)]; failed {
+				keptActionable = keptActionable || EpisodeHasActionableMetadataDebt(episode, now)
+				continue
+			}
+		}
 		if !EpisodeHasActionableMetadataDebt(episode, now) {
 			if s.refreshDebtRepo != nil && episode != nil {
 				if id := strings.TrimSpace(episode.ContentID); id != "" {
@@ -6021,7 +6032,7 @@ func (s *MetadataService) refreshSeriesEpisodeMetadataState(ctx context.Context,
 		}
 	}
 
-	s.updateEpisodeMetadataState(ctx, seriesID, len(actionableEpisodes) > 0, new(now))
+	s.updateEpisodeMetadataState(ctx, seriesID, len(actionableEpisodes) > 0 || keptActionable, new(now))
 }
 
 func (s *MetadataService) syncVisibleEpisodeRefreshDebt(ctx context.Context, episode *models.Episode, now time.Time) error {

@@ -188,7 +188,7 @@ func (r *failingStaleIDRepo) GetByContentID(ctx context.Context, contentID strin
 }
 
 func TestScheduledRefreshBatchSyncsSeriesWhenALaterLanguageFails(t *testing.T) {
-	h, seriesID, _, linkPasses, _ := seedSeriesSyncCounters(t)
+	h, seriesID, _, linkPasses, debts := seedSeriesSyncCounters(t)
 	ctx := context.Background()
 	h.libraryRepo.setMetadataLanguages(seriesID, []string{"en", "fr"}, nil)
 	h.service.staleIDRepo = &failingStaleIDRepo{fakeStaleIDRepo: newFakeStaleIDRepo()}
@@ -210,6 +210,51 @@ func TestScheduledRefreshBatchSyncsSeriesWhenALaterLanguageFails(t *testing.T) {
 	if got := linkPasses.Load(); got != 1 {
 		t.Fatalf("series link passes after the flush = %d, want 1 for the rows the first language wrote", got)
 	}
+	assertEpisodeFailureDebtKept(t, debts.fakeRefreshDebtRepo, "episode-s05e04")
+}
+
+// assertEpisodeFailureDebtKept checks that a batch flush left the failure an
+// episode target recorded during the batch in place.
+func assertEpisodeFailureDebtKept(t *testing.T, debts *fakeRefreshDebtRepo, episodeID string) {
+	t.Helper()
+	debt, err := debts.GetTarget(context.Background(), RefreshTargetEpisode, episodeID)
+	if err != nil {
+		t.Fatalf("debt for failed target %s after the flush: %v", episodeID, err)
+	}
+	if !hasRefreshDebtReason(debt.ReasonMask, RefreshDebtReasonRefreshFailure) || debt.LastError == "" {
+		t.Fatalf("debt for failed target %s after the flush = reason %d, last_error %q; want the recorded failure kept",
+			episodeID, debt.ReasonMask, debt.LastError)
+	}
+}
+
+func TestScheduledRefreshBatchKeepsFailureDebtOfAFailedSibling(t *testing.T) {
+	provider := &targetRefreshProvider{
+		episodesBySeason: map[int][]EpisodeResult{
+			5: {{SeasonNumber: 5, EpisodeNumber: 3, Title: "Provider Episode 3", Overview: "Episode 3 overview"}},
+		},
+	}
+	h, seriesID, _, _ := seedTargetRefreshHarness(provider)
+	debts := newSweepCountingRefreshDebtRepo()
+	h.service.refreshDebtRepo = debts
+	ctx := context.Background()
+
+	batchCtx, flush := h.service.BeginScheduledRefreshBatch(ctx)
+	if err := h.service.RefreshScheduledTarget(batchCtx, RefreshTargetEpisode, "episode-s05e03"); err != nil {
+		t.Fatalf("RefreshScheduledTarget S05E03: %v", err)
+	}
+	if err := h.service.RefreshScheduledTarget(batchCtx, RefreshTargetEpisode, "episode-s05e04"); err == nil {
+		t.Fatal("RefreshScheduledTarget S05E04 succeeded, want no provider metadata")
+	}
+	assertEpisodeFailureDebtKept(t, debts.fakeRefreshDebtRepo, "episode-s05e04")
+
+	flush(ctx)
+
+	// The sibling's success queued a sweep of the whole series. That sweep must
+	// not turn the failed episode's row back into a plain success.
+	if got := debts.sweepCount(seriesID); got != 1 {
+		t.Fatalf("series debt sweeps after the flush = %d, want 1", got)
+	}
+	assertEpisodeFailureDebtKept(t, debts.fakeRefreshDebtRepo, "episode-s05e04")
 }
 
 func TestScheduledRefreshBatchFlushSyncsEachRecordedSeriesOnce(t *testing.T) {
