@@ -46,6 +46,10 @@ vi.mock("@/hooks/queries/catalog", () => ({
   useCatalogMetadataFilters: (...args: unknown[]) => mockUseCatalogFilters(...args),
 }));
 
+vi.mock("@/hooks/queries/shuffles", () => ({
+  useStartShuffle: () => ({ startShuffle: vi.fn(), isStarting: false }),
+}));
+
 vi.mock("@/hooks/queries/personSearch", () => ({
   usePersonSearch: (...args: unknown[]) => mockUsePersonSearch(...args),
 }));
