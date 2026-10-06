@@ -3933,12 +3933,16 @@ func (s *MetadataService) refreshSeriesChildTarget(
 		if len(seasons) == 0 && len(episodes) == 0 {
 			continue
 		}
-		s.persistSeasonsAndEpisodes(ctx, series, providerIDs, canonicalLanguage, language, seasons, episodes, mergeMode)
-		updated = true
+		if s.persistSeasonAndEpisodeRows(ctx, series, providerIDs, canonicalLanguage, language, seasons, episodes, mergeMode) {
+			updated = true
+		}
 	}
 	if !updated {
 		return ErrMetadataNotFound
 	}
+	// The link and debt passes cover the whole series, so a scheduled refresh
+	// batch runs them once per series instead of once per season or episode.
+	s.syncSeriesEpisodeStateOrDefer(ctx, seriesID)
 	return nil
 }
 
@@ -4707,7 +4711,9 @@ func bulkUpsertWithFallback[T any](
 	return succeeded
 }
 
-// persistSeasonsAndEpisodes creates/updates seasons and episodes in the DB.
+// persistSeasonsAndEpisodes writes provider seasons and episodes for a whole
+// series refresh, then relinks the series' files and re-syncs its episode
+// debt straight away: the caller's own debt sync reads the result.
 func (s *MetadataService) persistSeasonsAndEpisodes(
 	ctx context.Context,
 	series *models.MediaItem,
@@ -4718,8 +4724,27 @@ func (s *MetadataService) persistSeasonsAndEpisodes(
 	episodes []EpisodeResult,
 	mergeMode MergeMode,
 ) {
-	if series == nil || strings.TrimSpace(series.ContentID) == "" {
+	if !s.persistSeasonAndEpisodeRows(ctx, series, providerIDs, canonicalLanguage, language, seasons, episodes, mergeMode) {
 		return
+	}
+	s.syncSeriesEpisodeState(ctx, series.ContentID)
+}
+
+// persistSeasonAndEpisodeRows writes provider seasons and episodes and queues
+// their images without the series-wide link and debt passes. It reports false
+// when there is no series to write to.
+func (s *MetadataService) persistSeasonAndEpisodeRows(
+	ctx context.Context,
+	series *models.MediaItem,
+	providerIDs map[string]string,
+	canonicalLanguage string,
+	language string,
+	seasons []SeasonResult,
+	episodes []EpisodeResult,
+	mergeMode MergeMode,
+) bool {
+	if series == nil || strings.TrimSpace(series.ContentID) == "" {
+		return false
 	}
 	seriesID := series.ContentID
 	seasonIDs := make(map[int]string, len(seasons))
@@ -5473,7 +5498,12 @@ func (s *MetadataService) persistSeasonsAndEpisodes(
 	}
 
 	s.enqueueSeriesChildImages(ctx, seriesID, imageJobs)
+	return true
+}
 
+// syncSeriesEpisodeState relinks a series' files to its episodes and re-syncs
+// the series' episode metadata debt. Both passes walk the whole series.
+func (s *MetadataService) syncSeriesEpisodeState(ctx context.Context, seriesID string) {
 	if err := s.ensureSeriesEpisodeLinks(ctx, seriesID); err != nil {
 		slog.WarnContext(ctx, "metadata: failed to ensure series episode links", "component", "metadata",
 			"series_id", seriesID, "error", err)
@@ -6001,7 +6031,10 @@ func (s *MetadataService) syncVisibleEpisodeRefreshDebt(ctx context.Context, epi
 	if err != nil {
 		return err
 	}
-	logRefreshDebtTerminal(RefreshTargetEpisode, episode.ContentID, reasonMask, attemptCount)
+	// No terminal notice here: this sweep re-syncs every incomplete episode in
+	// the series, and a success leaves attempt_count unchanged, so a row at the
+	// terminal count would be reported again on every sweep. The episode's own
+	// target sync reports the claim that took it there.
 	return s.refreshDebtRepo.MarkTargetSuccess(
 		ctx,
 		RefreshTargetEpisode,

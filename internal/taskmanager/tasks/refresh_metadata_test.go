@@ -7,6 +7,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/Silo-Server/silo-server/internal/metadata"
 	"github.com/Silo-Server/silo-server/internal/worker"
 )
 
@@ -116,5 +117,76 @@ func TestRefreshMetadataTask_DrainsFullBatches(t *testing.T) {
 	}
 	if !seen["item:item-000"] || !seen["item:item-199"] || !seen["episode:final-item"] {
 		t.Fatalf("expected calls from both claimed batches, got %v", calls)
+	}
+}
+
+// The production refresher must keep satisfying the optional batch interface;
+// a silent mismatch would leave every claimed batch unbatched.
+var _ MetadataRefreshBatcher = (*metadata.MetadataService)(nil)
+
+type batchMarkerKey struct{}
+
+// batchingMetadataRefresher records how the task opens and flushes refresh
+// batches around the targets it refreshes.
+type batchingMetadataRefresher struct {
+	fakeMetadataRefresher
+	batchMu        sync.Mutex
+	begins         int
+	flushes        int
+	callsAtFlush   []int
+	unbatchedCalls int
+}
+
+func (f *batchingMetadataRefresher) BeginScheduledRefreshBatch(ctx context.Context) (context.Context, func(context.Context)) {
+	f.batchMu.Lock()
+	f.begins++
+	batch := f.begins
+	f.batchMu.Unlock()
+	return context.WithValue(ctx, batchMarkerKey{}, batch), func(context.Context) {
+		calls := len(f.Calls())
+		f.batchMu.Lock()
+		defer f.batchMu.Unlock()
+		f.flushes++
+		f.callsAtFlush = append(f.callsAtFlush, calls)
+	}
+}
+
+func (f *batchingMetadataRefresher) RefreshScheduledTarget(ctx context.Context, targetType, contentID string) error {
+	if ctx.Value(batchMarkerKey{}) == nil {
+		f.batchMu.Lock()
+		f.unbatchedCalls++
+		f.batchMu.Unlock()
+	}
+	return f.fakeMetadataRefresher.RefreshScheduledTarget(ctx, targetType, contentID)
+}
+
+func TestRefreshMetadataTask_FlushesEachBatchAfterItsTargets(t *testing.T) {
+	firstBatch := make([]worker.RefreshCandidate, refreshMetadataBatchSize)
+	for i := range firstBatch {
+		firstBatch[i] = worker.RefreshCandidate{TargetType: "episode", ContentID: fmt.Sprintf("episode-%03d", i)}
+	}
+	secondBatch := []worker.RefreshCandidate{
+		{TargetType: "season", ContentID: "season-final"},
+		{TargetType: "episode", ContentID: "episode-final"},
+	}
+	finder := &fakeRefreshCandidateFinder{
+		batches: [][]worker.RefreshCandidate{firstBatch, secondBatch},
+	}
+	refresher := &batchingMetadataRefresher{}
+	task := NewRefreshMetadataTask(finder, refresher)
+
+	if err := task.Execute(context.Background(), noopProgressReporter{}); err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+
+	if refresher.begins != 2 || refresher.flushes != 2 {
+		t.Fatalf("batches begun/flushed = %d/%d, want 2/2", refresher.begins, refresher.flushes)
+	}
+	wantCallsAtFlush := []int{refreshMetadataBatchSize, refreshMetadataBatchSize + len(secondBatch)}
+	if fmt.Sprint(refresher.callsAtFlush) != fmt.Sprint(wantCallsAtFlush) {
+		t.Fatalf("refresh calls completed at each flush = %v, want %v", refresher.callsAtFlush, wantCallsAtFlush)
+	}
+	if refresher.unbatchedCalls != 0 {
+		t.Fatalf("%d targets refreshed outside their batch context", refresher.unbatchedCalls)
 	}
 }

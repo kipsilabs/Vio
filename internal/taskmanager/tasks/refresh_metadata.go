@@ -22,6 +22,14 @@ type MetadataRefresher interface {
 	RefreshScheduledTarget(ctx context.Context, targetType, contentID string) error
 }
 
+// MetadataRefreshBatcher is implemented by refreshers that can defer
+// series-wide follow-up work across a claimed batch. Targets refreshed with the
+// returned context share the batch, and the task calls flush once after every
+// target in the batch has returned.
+type MetadataRefreshBatcher interface {
+	BeginScheduledRefreshBatch(ctx context.Context) (context.Context, func(context.Context))
+}
+
 // RefreshCandidateFinder finds items needing metadata refresh.
 type RefreshCandidateFinder interface {
 	FindCandidates(ctx context.Context, limit int) ([]worker.RefreshCandidate, error)
@@ -130,6 +138,15 @@ func (t *RefreshMetadataTask) refreshBatch(
 		workerCount = len(candidates)
 	}
 
+	// Every return below happens after the workers have stopped, so the
+	// deferred flush sees the whole batch's refreshes.
+	itemParent := ctx
+	if batcher, ok := t.refresher.(MetadataRefreshBatcher); ok {
+		var flush func(context.Context)
+		itemParent, flush = batcher.BeginScheduledRefreshBatch(ctx)
+		defer flush(ctx)
+	}
+
 	type refreshJob struct {
 		candidate worker.RefreshCandidate
 	}
@@ -163,7 +180,7 @@ func (t *RefreshMetadataTask) refreshBatch(
 					startErrored,
 				))
 
-				itemCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+				itemCtx, cancel := context.WithTimeout(itemParent, 2*time.Minute)
 				err := t.refresher.RefreshScheduledTarget(itemCtx, job.candidate.TargetType, job.candidate.ContentID)
 				cancel()
 
