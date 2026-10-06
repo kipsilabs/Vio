@@ -875,6 +875,26 @@ func TestDeferredProbePublishOverflowRescansAllSessions(t *testing.T) {
 		if err := manager.SetVirtualSource(session.ID, uri, 5); err != nil {
 			t.Fatalf("SetVirtualSource %d: %v", i, err)
 		}
+		// These sessions model deferred-lifecycle clients, which by
+		// construction negotiated deferred_track_inventory_v1; the failed-push
+		// guard reads the attempt row, so seed the negotiation it would see.
+		if err := handler.PlanStoreV3.SaveAttempt(context.Background(), playback.AttemptRecordV3{
+			PlaybackAttemptID:    fmt.Sprintf("attempt-overflow-%d", i),
+			SessionID:            session.ID,
+			UserID:               1,
+			ProfileID:            "profile-1",
+			RequestedMediaFileID: session.MediaFileID,
+			EffectiveMediaFileID: session.MediaFileID,
+			NormalizedRequest: playback.StartRequestV3{
+				ClientFeatures: []string{playback.FeatureDeferredTrackInventoryV3},
+			},
+			StartResponse: playback.DecisionResponseV3{
+				ServerFeatures: []string{playback.FeatureDeferredTrackInventoryV3},
+			},
+			ExpiresAt: time.Now().Add(time.Hour),
+		}); err != nil {
+			t.Fatalf("SaveAttempt %d: %v", i, err)
+		}
 		if err := manager.SetRealtimeConnection(session.ID, true); err != nil {
 			t.Fatalf("SetRealtimeConnection %d: %v", i, err)
 		}
@@ -1961,4 +1981,48 @@ func TestDeferredProbeFailedPushScopedToNegotiatedSessions(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("negotiated session did not receive the failed inventory push")
 	}
+}
+
+// failingGetAttemptPlanStoreV3 models a plan-store outage on the publish path:
+// every attempt read fails, so publishInventoryUpdatedToSession cannot load the
+// record that carries the deferred negotiation and builds its event with a nil
+// record.
+type failingGetAttemptPlanStoreV3 struct {
+	playback.PlanStoreV3
+	err error
+}
+
+func (s *failingGetAttemptPlanStoreV3) GetAttempt(context.Context, string) (*playback.AttemptRecordV3, error) {
+	return nil, s.err
+}
+
+// TestDeferredProbeFailedPushFailsClosedOnStoreError pins the nil-record arm of
+// the delivery-side guard. When the attempt row cannot be read, the negotiation
+// cannot be established, so a terminal "failed" inventory is suppressed rather
+// than delivered to a client that may never have negotiated the lifecycle. The
+// suppression is delivery-side only: once the store recovers, the session's own
+// poll still reports the terminal status, which is what leaves the client's
+// loading state.
+func TestDeferredProbeFailedPushFailsClosedOnStoreError(t *testing.T) {
+	fx := newDeferredLifecycleFixture(t, 932, "virtual://movie/tt-guard-store-error?result=cand-1")
+	fx.saveAttempt(t)
+	conn := fx.registerPush(t)
+	if err := fx.manager.SetVirtualProbeOutcome(fx.session.ID, probeOutcomeFailed); err != nil {
+		t.Fatalf("SetVirtualProbeOutcome: %v", err)
+	}
+
+	healthy := fx.handler.PlanStoreV3
+	fx.handler.PlanStoreV3 = &failingGetAttemptPlanStoreV3{PlanStoreV3: healthy, err: errors.New("plan store unavailable")}
+	t.Cleanup(func() { fx.handler.PlanStoreV3 = healthy })
+	fx.handler.PublishInventoryUpdatedToSession(context.Background(), fx.session.ID, 0)
+	select {
+	case event := <-conn.ch:
+		t.Fatalf("store-error publish delivered a failed inventory push (status %q); the guard must fail closed", event.payload.InventoryStatus)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	// The failed push is suppressed, not the terminal state: with the store
+	// recovered the poll carries it.
+	fx.handler.PlanStoreV3 = healthy
+	fx.pollInventoryStatus(t, string(ProbeProvenanceFailed))
 }

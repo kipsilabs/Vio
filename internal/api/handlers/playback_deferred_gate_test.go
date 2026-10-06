@@ -2,8 +2,12 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -158,6 +162,13 @@ func TestDeferredTrackInventoryGateV2WithoutFeature(t *testing.T) {
 	if !playback.HasFeatureV3(start.ServerFeatures, playback.FeatureDeferredTrackInventoryV3) {
 		t.Fatal("v2 start did not advertise deferred_track_inventory_v1 to the client")
 	}
+	// inventory_url is unconditional on v2: it names the same live-inventory
+	// endpoint getPlaybackInventory serves and predates the deferral. Only the
+	// provisional marker is gated, so a non-deferred v2 plan still carries the
+	// poll URL. This is the real response, not a projection unit check.
+	if start.PlaybackPlan.InventoryURL != "/api/v2/playback/"+start.SessionID+"/inventory" {
+		t.Fatalf("non-deferred v2 plan inventory_url = %q, want the live-inventory endpoint", start.PlaybackPlan.InventoryURL)
+	}
 }
 
 // TestDeferredTrackInventoryGateV2WithFeature is the negotiated path: a v2
@@ -311,4 +322,239 @@ func requireDeferredInventoryStatus(t *testing.T, handler *PlaybackHandler, sess
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+}
+
+// replayV3StartForHandlerTest issues one start through the requested surface
+// and returns the raw recorder without asserting the status, so a test can
+// observe an idempotency/surface refusal as well as a replay.
+func replayV3StartForHandlerTest(t *testing.T, handler *PlaybackHandler, v2 bool, request playback.StartRequestV3) *httptest.ResponseRecorder {
+	t.Helper()
+	path := "/api/v1/playback/start"
+	ctx := newAuthorizedPlaybackContext()
+	if v2 {
+		path = "/api/v2/playback/start"
+		ctx = WithNativeAPIV2(ctx)
+	}
+	rr := httptest.NewRecorder()
+	handler.HandleStartPlayback(rr, httptest.NewRequest(http.MethodPost, path, strings.NewReader(marshalV3StartRequest(t, request))).WithContext(ctx))
+	return rr
+}
+
+// TestDeferredTrackInventoryCrossSurfaceReplayClosed is the cross-surface
+// replay regression: the request digest does not bind the API surface, and the
+// shared PlanV3 serializes tracks_pending, so without a surface check the same
+// body could replay a deferred-v2 attempt through the frozen v1 bridge (and a
+// v2 client could adopt an unnegotiated attempt). The attempt-surface guard
+// refuses both directions with the existing playback_attempt_reused code.
+func TestDeferredTrackInventoryCrossSurfaceReplayClosed(t *testing.T) {
+	fx := newDeferredGateFixture(t, 735)
+	request := func(attemptID string) playback.StartRequestV3 {
+		r := v3HandlerStartRequest()
+		r.PlaybackAttemptID = attemptID
+		r.FileID = fx.source.ID
+		r.QualityPreference = "original"
+		r.ClientFeatures = append(r.ClientFeatures, playback.FeatureDeferredTrackInventoryV3)
+		return r
+	}
+
+	// Direction A: a deferred-v2 attempt replayed through /api/v1. The retried
+	// body is byte-identical, so the digest matches and only the surface guard
+	// can stop the replay of a plan whose tracks_pending v1 cannot consume.
+	deferredReq := request("attempt-cross-surface-deferred-v2")
+	first := replayV3StartForHandlerTest(t, fx.handler, true, deferredReq)
+	if first.Code != http.StatusCreated {
+		t.Fatalf("v2 deferred start: %d %s", first.Code, first.Body.String())
+	}
+	var started playback.DecisionResponseV3
+	if err := json.Unmarshal(first.Body.Bytes(), &started); err != nil || started.PlaybackPlan == nil || !started.PlaybackPlan.TracksPending {
+		t.Fatalf("v2 deferred start body: err=%v response=%#v", err, started)
+	}
+	v1Replay := replayV3StartForHandlerTest(t, fx.handler, false, deferredReq)
+	if v1Replay.Code != http.StatusConflict || !strings.Contains(v1Replay.Body.String(), "playback_attempt_reused") {
+		t.Fatalf("v1 replay of a deferred-v2 attempt = %d %s, want 409 playback_attempt_reused", v1Replay.Code, v1Replay.Body.String())
+	}
+
+	// Direction B: the frozen v1 surface never advertises the feature, so a v1
+	// start whose client sent deferred_track_inventory_v1 persists an
+	// unnegotiated attempt (client token present, server feature absent; only
+	// subrip_sidecar_v1 is stripped from the normalized request). The
+	// byte-identical v2 retry has the feature in its requested list and must be
+	// refused rather than adopt an attempt that will never defer.
+	plainBody := request("attempt-cross-surface-plain-v1")
+	plainFirst := replayV3StartForHandlerTest(t, fx.handler, false, plainBody)
+	if plainFirst.Code != http.StatusCreated {
+		t.Fatalf("v1 start: %d %s", plainFirst.Code, plainFirst.Body.String())
+	}
+	var plainStarted playback.DecisionResponseV3
+	if err := json.Unmarshal(plainFirst.Body.Bytes(), &plainStarted); err != nil || plainStarted.PlaybackPlan == nil {
+		t.Fatalf("v1 start body: err=%v response=%#v", err, plainStarted)
+	}
+	if plainStarted.PlaybackPlan.TracksPending {
+		t.Fatal("a v1 start entered the deferred lifecycle")
+	}
+	v2Retry := replayV3StartForHandlerTest(t, fx.handler, true, plainBody)
+	if v2Retry.Code != http.StatusConflict || !strings.Contains(v2Retry.Body.String(), "playback_attempt_reused") {
+		t.Fatalf("v2 deferred retry of an unnegotiated attempt = %d %s, want 409 playback_attempt_reused", v2Retry.Code, v2Retry.Body.String())
+	}
+}
+
+// TestDeferredTrackInventoryCrossSurfaceReplanClosed proves the same guard
+// protects a replan: a deferred-v2 attempt must not continue on the frozen v1
+// replan route, whose response would carry tracks_pending and whose push/poll
+// lifecycle v1 cannot consume.
+func TestDeferredTrackInventoryCrossSurfaceReplanClosed(t *testing.T) {
+	fx := newDeferredGateFixture(t, 736)
+	req := v3HandlerStartRequest()
+	req.FileID = fx.source.ID
+	req.QualityPreference = "original"
+	req.ClientFeatures = append(req.ClientFeatures, playback.FeatureDeferredTrackInventoryV3)
+	first := replayV3StartForHandlerTest(t, fx.handler, true, req)
+	if first.Code != http.StatusCreated {
+		t.Fatalf("v2 deferred start: %d %s", first.Code, first.Body.String())
+	}
+	var started playback.DecisionResponseV3
+	if err := json.Unmarshal(first.Body.Bytes(), &started); err != nil || started.PlaybackPlan == nil {
+		t.Fatalf("decode start: %v", err)
+	}
+
+	body, err := json.Marshal(playback.ReplanRequestV3{
+		ProtocolVersion: playback.ProtocolV3, Operation: playback.ReplanOperationSeekReanchorV3,
+		PlaybackAttemptID: req.PlaybackAttemptID,
+		ReplanRequestID:   "seek-reanchor-cross-surface", FailedPlanID: started.PlaybackPlan.PlanID,
+		PlanAttemptID: "plan-attempt-cross-surface", PlanAttemptKey: playback.PlanAttemptKeyV3(*started.PlaybackPlan, req.ClientPlaybackContext.Output.OutputContextID, nil), AttemptCount: 1,
+		QualityPreference: "original", PositionSeconds: 321,
+		SelectedTracks: started.PlaybackPlan.SelectedTracks,
+		Capabilities:   req.Capabilities, ClientPlaybackContext: req.ClientPlaybackContext,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rr := httptest.NewRecorder()
+	handler := fx.handler
+	handler.HandleReplanPlaybackV3(rr, withPlaybackRouteParam(httptest.NewRequest(http.MethodPost, "/api/v1/playback/"+started.SessionID+"/replan", strings.NewReader(string(body))).WithContext(newAuthorizedPlaybackContext()), "session_id", started.SessionID))
+	if rr.Code != http.StatusConflict || !strings.Contains(rr.Body.String(), "playback_attempt_reused") {
+		t.Fatalf("v1 replan of a deferred-v2 attempt = %d %s, want 409 playback_attempt_reused", rr.Code, rr.Body.String())
+	}
+}
+
+// TestDeferredTrackInventorySurfaceGuardMatrix pins the guard directly for both
+// negotiation axes so a future edit cannot weaken one while the integration
+// tests still pass through the other.
+func TestDeferredTrackInventorySurfaceGuardMatrix(t *testing.T) {
+	record := func(client, server []string) *playback.AttemptRecordV3 {
+		r := &playback.AttemptRecordV3{}
+		r.NormalizedRequest.ClientFeatures = client
+		r.StartResponse.ServerFeatures = server
+		return r
+	}
+	deferred := []string{playback.FeatureDeferredTrackInventoryV3}
+	none := []string(nil)
+	v1, v2 := t.Context(), WithNativeAPIV2(t.Context())
+
+	for name, tc := range map[string]struct {
+		ctx       context.Context
+		record    *playback.AttemptRecordV3
+		requested []string
+		refused   bool
+	}{
+		"deferred v2 attempt is refused on v1":         {v1, record(deferred, deferred), deferred, true},
+		"deferred v2 attempt replays on v2":            {v2, record(deferred, deferred), deferred, false},
+		"unnegotiated attempt continues on v1":         {v1, record(none, none), none, false},
+		"v2 deferred retry of an unnegotiated attempt": {v2, record(none, none), deferred, true},
+		"v2 deferred retry of a declared-only attempt": {v2, record(deferred, none), deferred, true},
+		"v2 deferred retry of a client-only attempt":   {v2, record(none, deferred), deferred, true},
+		"v2 ordinary retry of an unnegotiated attempt": {v2, record(none, none), none, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := requireAttemptAPISurfaceV3(tc.ctx, tc.record, tc.requested); (err != nil) != tc.refused {
+				t.Fatalf("refused = %v, want %v", err != nil, tc.refused)
+			}
+		})
+	}
+}
+
+// forceConflictOnSavePlanStoreV3 drives the start path's concurrent-duplicate
+// recovery branch deterministically: every idempotency lookup before the save
+// reports the attempt absent, SaveAttempt then collides as if another request
+// won the CAS, and the post-collision re-read returns the durable record so the
+// recovery branch (and its surface guard) is actually exercised.
+type forceConflictOnSavePlanStoreV3 struct {
+	playback.PlanStoreV3
+	collided bool
+}
+
+func (s *forceConflictOnSavePlanStoreV3) GetAttemptByPlaybackAttemptID(ctx context.Context, attemptID string) (*playback.AttemptRecordV3, error) {
+	if s.collided {
+		return s.PlanStoreV3.GetAttemptByPlaybackAttemptID(ctx, attemptID)
+	}
+	// Before the save collision, every idempotency lookup misses so the start
+	// cannot take the ordinary replay path.
+	return nil, playback.ErrSessionNotFound
+}
+
+func (s *forceConflictOnSavePlanStoreV3) SaveAttempt(context.Context, playback.AttemptRecordV3) error {
+	s.collided = true
+	return playback.ErrPlaybackAttemptExistsV3
+}
+
+// TestDeferredTrackInventoryConcurrentDuplicateReplayClosed drives the
+// concurrent-duplicate branch of the start path: two identical starts race, the
+// first wins the SaveAttempt CAS, and the loser re-reads the durable record and
+// replays it through requireAttemptAPISurfaceV3. On one surface the duplicate
+// must replay; a surface-crossing retry must be refused. The store wrapper makes
+// the loser deterministic by missing the pre-save lookup and then colliding.
+func TestDeferredTrackInventoryConcurrentDuplicateReplayClosed(t *testing.T) {
+	request := func(fx *deferredGateFixture) playback.StartRequestV3 {
+		req := v3HandlerStartRequest()
+		req.FileID = fx.source.ID
+		req.QualityPreference = "original"
+		req.ClientFeatures = append(req.ClientFeatures, playback.FeatureDeferredTrackInventoryV3)
+		return req
+	}
+
+	t.Run("same-surface duplicate replays", func(t *testing.T) {
+		fx := newDeferredGateFixture(t, 737)
+		req := request(fx)
+		winner := replayV3StartForHandlerTest(t, fx.handler, true, req)
+		if winner.Code != http.StatusCreated {
+			t.Fatalf("winner start: %d %s", winner.Code, winner.Body.String())
+		}
+		var won playback.DecisionResponseV3
+		if err := json.Unmarshal(winner.Body.Bytes(), &won); err != nil {
+			t.Fatal(err)
+		}
+		conflicting := &forceConflictOnSavePlanStoreV3{PlanStoreV3: fx.handler.PlanStoreV3}
+		fx.handler.PlanStoreV3 = conflicting
+		loser := replayV3StartForHandlerTest(t, fx.handler, true, req)
+		if loser.Code != http.StatusCreated {
+			t.Fatalf("duplicate replay through the collision branch = %d %s, want a replay", loser.Code, loser.Body.String())
+		}
+		if !conflicting.collided {
+			t.Fatal("the loser never hit the SaveAttempt collision; the recovery branch was not exercised")
+		}
+		var replayed playback.DecisionResponseV3
+		if err := json.Unmarshal(loser.Body.Bytes(), &replayed); err != nil || replayed.PlaybackPlan == nil || !replayed.PlaybackPlan.TracksPending {
+			t.Fatalf("duplicate replay body: err=%v response=%#v", err, replayed)
+		}
+		// A genuine replay of the durable record names the winner's session; a
+		// freshly planned start would mint a new one and pass a weaker status
+		// check.
+		if replayed.SessionID != won.SessionID {
+			t.Fatalf("duplicate replay session = %q, want the winner's %q", replayed.SessionID, won.SessionID)
+		}
+	})
+
+	t.Run("cross-surface retry is refused", func(t *testing.T) {
+		fx := newDeferredGateFixture(t, 738)
+		req := request(fx)
+		winner := replayV3StartForHandlerTest(t, fx.handler, true, req)
+		if winner.Code != http.StatusCreated {
+			t.Fatalf("winner start: %d %s", winner.Code, winner.Body.String())
+		}
+		fx.handler.PlanStoreV3 = &forceConflictOnSavePlanStoreV3{PlanStoreV3: fx.handler.PlanStoreV3}
+		loser := replayV3StartForHandlerTest(t, fx.handler, false, req)
+		if loser.Code != http.StatusConflict || !strings.Contains(loser.Body.String(), "playback_attempt_reused") {
+			t.Fatalf("cross-surface duplicate = %d %s, want 409 playback_attempt_reused", loser.Code, loser.Body.String())
+		}
+	})
 }

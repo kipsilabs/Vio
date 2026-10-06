@@ -241,25 +241,43 @@ func attemptNegotiatedSubRipV3(record *playback.AttemptRecordV3) bool {
 }
 
 // requireAttemptAPISurfaceV3 keeps an attempt on the API surface that
-// negotiated its SRT representation. /api/v1 must not continue an attempt that
-// negotiated original SRT: v1 would replay or replan its .srt?original=1 URLs,
-// including ones for tracks that appear later, on a route that serves WebVTT
-// for them. And a start retried through /api/v2 with subrip_sidecar_v1 must
-// not replay an attempt negotiated without it, which would break the feature's
-// promise. requested is the retried start's feature list; replans pass nil
-// because a replan keeps the negotiated representation anyway. The error
-// reuses the existing playback_attempt_reused code so /api/v1 gains no new
-// contract.
+// negotiated its SRT representation and its deferred track-inventory
+// lifecycle.
+//
+// SRT: /api/v1 must not continue an attempt that negotiated original SRT, since
+// v1 would replay or replan its .srt?original=1 URLs, including ones for tracks
+// that appear later, on a route that serves WebVTT for them. And a start
+// retried through /api/v2 with subrip_sidecar_v1 must not replay an attempt
+// negotiated without it, which would break the feature's promise.
+//
+// Deferred inventory: /api/v1 must not continue an attempt that negotiated
+// deferred_track_inventory_v1, because the shared PlanV3 serializes
+// tracks_pending and the session's pending/failed inventory is consumable only
+// through the v2 push and poll. And a start retried through /api/v2 with
+// deferred_track_inventory_v1 must not replay an attempt negotiated without
+// it: that client promised to keep its menu loading, but the attempt it would
+// adopt never defers, so it would wait for a follow-up that will never arrive.
+// The request digest excludes the API surface and does not carry these
+// features into its identity, so this guard is the only thing that stops the
+// same body from crossing surfaces.
+//
+// requested is the retried start's feature list; replans pass nil because a
+// replan keeps the negotiated representation anyway and never defers. The
+// error reuses the existing playback_attempt_reused code so /api/v1 gains no
+// new contract.
 func requireAttemptAPISurfaceV3(ctx context.Context, record *playback.AttemptRecordV3, requested []string) error {
 	if record == nil {
 		return nil
 	}
-	negotiated := attemptNegotiatedSubRipV3(record)
+	subrip := attemptNegotiatedSubRipV3(record)
+	deferred := attemptNegotiatedDeferTrackInventoryV3(record)
 	switch {
-	case !isNativeAPIV2(ctx) && negotiated:
+	case !isNativeAPIV2(ctx) && (subrip || deferred):
 		return playbackOperationError(http.StatusConflict, "playback_attempt_reused", "The playback attempt belongs to an /api/v2 session")
-	case isNativeAPIV2(ctx) && !negotiated && playback.HasFeatureV3(requested, playback.FeatureSubripSidecarV3):
+	case isNativeAPIV2(ctx) && !subrip && playback.HasFeatureV3(requested, playback.FeatureSubripSidecarV3):
 		return playbackOperationError(http.StatusConflict, "playback_attempt_reused", "The playback attempt was negotiated without subrip_sidecar_v1")
+	case isNativeAPIV2(ctx) && !deferred && playback.HasFeatureV3(requested, playback.FeatureDeferredTrackInventoryV3):
+		return playbackOperationError(http.StatusConflict, "playback_attempt_reused", "The playback attempt was negotiated without deferred_track_inventory_v1")
 	}
 	return nil
 }
@@ -1573,7 +1591,7 @@ func (h *PlaybackHandler) publishInventoryUpdatedToSession(ctx context.Context, 
 		return inventory.InventoryRevision, false
 	}
 	if inventory.InventoryStatus == string(ProbeProvenanceFailed) &&
-		record != nil && !attemptNegotiatedDeferTrackInventoryV3(record) {
+		(record == nil || !attemptNegotiatedDeferTrackInventoryV3(record)) {
 		// A "failed" inventory is the deferred lifecycle's terminal signal: it
 		// tells a client that negotiated deferred_track_inventory_v1 to leave
 		// its provisional (tracks_pending) loading state. A session that did
@@ -1581,10 +1599,16 @@ func (h *PlaybackHandler) publishInventoryUpdatedToSession(ctx context.Context, 
 		// a failed status is meaningless to it and must not be delivered. The
 		// deferral gate already keeps such sessions out of the lifecycle; this
 		// is the delivery-side guard that keeps a failed push from ever
-		// reaching a session whose attempt did not negotiate. A nil record
-		// (a minimal manager without a plan store) preserves the pre-existing
-		// best-effort push. Verified pushes are untouched: they are the
-		// pre-existing background upgrade any session may receive.
+		// reaching a session whose attempt did not negotiate.
+		//
+		// Fail closed: a nil record means the attempt could not be read (a plan
+		// store error, not a store-less manager — production always wires one).
+		// Without the record the negotiation cannot be established, and a failed
+		// status delivered to a client that never negotiated it is a protocol
+		// surprise it has no reason to handle. Suppress instead, since the
+		// session's own poll still carries the terminal status. Verified pushes
+		// are untouched: they are the pre-existing background upgrade any
+		// session may receive.
 		return inventory.InventoryRevision, false
 	}
 	if hasGeneration {

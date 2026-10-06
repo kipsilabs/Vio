@@ -47,8 +47,23 @@ first-byte URL is already playable while the enumeration runs after the
 transport commit. The plan carries `tracks_pending: true` and
 `inventory_url`; the menu is provisional until the follow-up lands. The frozen
 `/api/v1` surface and a v2 client that did not advertise the feature never see
-the fields and keep the pre-existing behavior, so the deferred lifecycle is
-strictly opt-in.
+`tracks_pending` and keep the pre-existing behavior, so the deferred lifecycle
+is strictly opt-in.
+
+`inventory_url` is not gated by the negotiation: it is present on every fresh
+plan, negotiated or not. It names the same live-inventory endpoint
+`getPlaybackInventory` serves, and v2 clients have always been able to poll it.
+What the negotiation adds is the promise that the menu may be provisional, which
+is exactly what `tracks_pending` signals. A start that does not negotiate the
+lifecycle still probes its source (inline when the start is synchronous, in the
+background otherwise) and does not gate the menu on that probe; if it polls
+`inventory_url` anyway, it simply observes `declared` until the probe lands.
+
+The lifecycle is start-only. `replanPlayback` never defers: a replan either
+replays the attempt's plan — including its `tracks_pending` marker — or runs its
+own synchronous resolve, and it always carries `inventory_url`. A client must
+therefore read `tracks_pending` from a replan response too, not assume the
+lifecycle ended at start.
 
 The session's inventory status moves `declared` → `pending` → `verified` or
 `failed`. `pending` means the enumeration is outstanding; the client keeps the
