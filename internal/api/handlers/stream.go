@@ -1005,6 +1005,27 @@ func resolvedVirtualCandidatePath(resolved ResolvedVirtualMedia) string {
 	return uri
 }
 
+// Disposition vocabulary for the direct-play proxy verdict. Each names one
+// first-attempt outcome; the verdict log records exactly one of them. Named
+// constants (not inline literals) so the closed set reads in one place and
+// stays out of the repeated-literal lint.
+const (
+	virtualProxyDispositionClientCanceled = "client_canceled"
+	virtualProxyDispositionRelayNotFound  = "relay_not_found"
+	virtualProxyDispositionRelayTemporary = "relay_temporary"
+	virtualProxyDispositionCommitted      = "committed"
+	virtualProxyDispositionFailedOpen     = "failed_open"
+)
+
+// Attribute keys for the proxy verdict line. The verdict is the single site
+// that emits this shape, so the keys live with it rather than as package
+// shared constants; logVirtualStreamFailure in playback.go keeps its own
+// inline keys (two occurrences stay below the repeated-literal lint).
+const (
+	virtualVerdictLogKeySession         = "session"
+	virtualVerdictLogKeyPlaybackSession = "playback_session_id"
+)
+
 // virtualProxyDisposition names how a failed direct-play proxy attempt ended
 // before any heal or rotation runs: the first-attempt verdict the verdict log
 // records. Client cancellation is the viewer's own doing; relay_not_found is
@@ -1017,23 +1038,21 @@ func resolvedVirtualCandidatePath(resolved ResolvedVirtualMedia) string {
 // recovery: the branches below keep their own conditions.
 //
 // The returned values are the verdict's contract vocabulary, pinned by
-// TestVirtualProxyDisposition. They stay inline rather than named constants
-// so the five outcomes read as one closed set at the single site that
-// produces them.
-func virtualProxyDisposition(ctx context.Context, proxyErr error, statusCode int, relayNotFound, relayTemporary bool) string { //nolint:goconst // Verdict vocabulary reads as one closed set at its single production site.
+// TestVirtualProxyDisposition.
+func virtualProxyDisposition(ctx context.Context, proxyErr error, statusCode int, relayNotFound, relayTemporary bool) string {
 	if isClientCancellation(ctx, proxyErr) {
-		return "client_canceled"
+		return virtualProxyDispositionClientCanceled
 	}
 	if relayNotFound {
-		return "relay_not_found"
+		return virtualProxyDispositionRelayNotFound
 	}
 	if relayTemporary {
-		return "relay_temporary"
+		return virtualProxyDispositionRelayTemporary
 	}
 	if statusCode != 0 {
-		return "committed"
+		return virtualProxyDispositionCommitted
 	}
-	return "failed_open"
+	return virtualProxyDispositionFailedOpen
 }
 
 // logVirtualProxyVerdict records the first-attempt serve verdict of a failed
@@ -1049,16 +1068,18 @@ func virtualProxyDisposition(ctx context.Context, proxyErr error, statusCode int
 //
 // The attribute keys are the verdict's join contract (session,
 // playback_session_id, candidate ids, disposition), pinned by
-// TestLogVirtualProxyVerdictCarriesJoinKeys. They stay inline rather than
-// named constants so the logged shape reads as one block at the single site
-// that emits it.
-func logVirtualProxyVerdict(ctx context.Context, sessionID string, file *models.MediaFile, deliveredPath, disposition string, proxyErr error) { //nolint:goconst // Verdict join keys read as one block at their single emission site.
+// TestLogVirtualProxyVerdictCarriesJoinKeys. Provider URLs never appear
+// here: only provider-neutral virtual URIs. Client cancellation logs at
+// debug; a genuine failure keeps its WARN so it stays visible in the
+// operational log. The verdict is first-attempt classification, not the final
+// recovery outcome: a later heal or rotation can still serve the request.
+func logVirtualProxyVerdict(ctx context.Context, sessionID string, file *models.MediaFile, deliveredPath, disposition string, proxyErr error) {
 	pinnedID := virtualCandidateID(file)
 	deliveredID := virtualResultCandidateID(deliveredPath)
 	attrs := []any{
 		logComponentKey, "api", //nolint:goconst // log attribute key/value, kept inline for readability.
-		"session", sessionID,
-		"playback_session_id", sessionID,
+		virtualVerdictLogKeySession, sessionID,
+		virtualVerdictLogKeyPlaybackSession, sessionID,
 		"pinned_candidate_id", pinnedID,
 		"delivered_candidate_id", deliveredID,
 		"disposition", disposition,
@@ -1069,7 +1090,7 @@ func logVirtualProxyVerdict(ctx context.Context, sessionID string, file *models.
 	if proxyErr != nil {
 		attrs = append(attrs, "error", logredact.SanitizeURLError(proxyErr))
 	}
-	if disposition == "client_canceled" {
+	if disposition == virtualProxyDispositionClientCanceled {
 		slog.DebugContext(ctx, "virtual stream proxy verdict", attrs...)
 		return
 	}
