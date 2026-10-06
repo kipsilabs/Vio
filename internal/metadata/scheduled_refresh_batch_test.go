@@ -3,6 +3,8 @@ package metadata
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -171,13 +173,109 @@ func TestScheduledRefreshBatchFlushSkipsCancelledContext(t *testing.T) {
 	}
 }
 
-func captureDefaultLogs(t *testing.T) *bytes.Buffer {
+// failingStaleIDRepo fails every stale provider ID lookup after the first,
+// which lets a two-language refresh write its first language and then fail.
+type failingStaleIDRepo struct {
+	*fakeStaleIDRepo
+	calls atomic.Int32
+}
+
+func (r *failingStaleIDRepo) GetByContentID(ctx context.Context, contentID string) ([]*models.StaleMediaID, error) {
+	if r.calls.Add(1) > 1 {
+		return nil, errors.New("stale id lookup failed")
+	}
+	return r.fakeStaleIDRepo.GetByContentID(ctx, contentID)
+}
+
+func TestScheduledRefreshBatchSyncsSeriesWhenALaterLanguageFails(t *testing.T) {
+	h, seriesID, _, linkPasses, _ := seedSeriesSyncCounters(t)
+	ctx := context.Background()
+	h.libraryRepo.setMetadataLanguages(seriesID, []string{"en", "fr"}, nil)
+	h.service.staleIDRepo = &failingStaleIDRepo{fakeStaleIDRepo: newFakeStaleIDRepo()}
+
+	batchCtx, flush := h.service.BeginScheduledRefreshBatch(ctx)
+	if err := h.service.RefreshScheduledTarget(batchCtx, RefreshTargetEpisode, "episode-s05e04"); err == nil {
+		t.Fatal("RefreshScheduledTarget succeeded, want the second language's lookup error")
+	}
+	updated, err := h.service.episodeRepo.GetBySeriesAndNumber(ctx, seriesID, 5, 4)
+	if err != nil {
+		t.Fatalf("GetBySeriesAndNumber S05E04: %v", err)
+	}
+	if updated.Overview != "Episode 4 overview" {
+		t.Fatalf("S05E04 overview = %q, want the first language's rows written", updated.Overview)
+	}
+
+	flush(ctx)
+
+	if got := linkPasses.Load(); got != 1 {
+		t.Fatalf("series link passes after the flush = %d, want 1 for the rows the first language wrote", got)
+	}
+}
+
+func TestScheduledRefreshBatchFlushSyncsEachRecordedSeriesOnce(t *testing.T) {
+	h := newTestHarness()
+	h.service.episodeRepo = newFakeEpisodeRepo()
+	var mu sync.Mutex
+	passes := make(map[string]int)
+	h.service.hooks.ensureSeriesEpisodeLinks = func(_ context.Context, seriesID string) error {
+		mu.Lock()
+		passes[seriesID]++
+		mu.Unlock()
+		return nil
+	}
+	ctx := context.Background()
+
+	batchCtx, flush := h.service.BeginScheduledRefreshBatch(ctx)
+	seriesIDs := make([]string, 0, 2*scheduledRefreshFlushWorkers)
+	for i := range 2 * scheduledRefreshFlushWorkers {
+		seriesIDs = append(seriesIDs, fmt.Sprintf("series-%02d", i))
+	}
+	for range 3 {
+		for _, seriesID := range seriesIDs {
+			h.service.syncSeriesEpisodeStateOrDefer(batchCtx, seriesID)
+		}
+	}
+	flush(ctx)
+	flush(ctx)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(passes) != len(seriesIDs) {
+		t.Fatalf("series synced = %d, want %d", len(passes), len(seriesIDs))
+	}
+	for _, seriesID := range seriesIDs {
+		if passes[seriesID] != 1 {
+			t.Fatalf("series %s link passes = %d, want 1", seriesID, passes[seriesID])
+		}
+	}
+}
+
+// lockedLogBuffer serializes writes from any goroutine that logs while a test
+// has replaced the default logger.
+type lockedLogBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func captureDefaultLogs(t *testing.T) *lockedLogBuffer {
 	t.Helper()
-	var buf bytes.Buffer
+	buf := &lockedLogBuffer{}
 	previous := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	slog.SetDefault(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	t.Cleanup(func() { slog.SetDefault(previous) })
-	return &buf
+	return buf
 }
 
 func TestSeriesDebtSweepDoesNotRepeatTerminalWarnings(t *testing.T) {

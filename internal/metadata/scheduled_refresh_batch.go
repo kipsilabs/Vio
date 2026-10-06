@@ -7,10 +7,16 @@ import (
 	"time"
 )
 
-// scheduledRefreshSeriesSyncTimeout bounds each series' deferred link and
-// debt pass when a scheduled refresh batch is flushed. It matches the
-// per-target timeout of the scheduled refresh task.
-const scheduledRefreshSeriesSyncTimeout = 2 * time.Minute
+const (
+	// scheduledRefreshSeriesSyncTimeout bounds each series' deferred link and
+	// debt pass when a scheduled refresh batch is flushed. It matches the
+	// per-target timeout of the scheduled refresh task.
+	scheduledRefreshSeriesSyncTimeout = 2 * time.Minute
+	// scheduledRefreshFlushWorkers caps how many series a flush syncs at once.
+	// It matches the scheduled refresh task's worker count, which is how many
+	// of these passes could run at once before they were batched.
+	scheduledRefreshFlushWorkers = 12
+)
 
 type scheduledRefreshBatchKey struct{}
 
@@ -50,7 +56,7 @@ func (b *scheduledRefreshBatch) take() []string {
 // refresh in the batch has returned. Whole-series refreshes keep their passes
 // inline because their own debt sync reads the result.
 //
-// A flush whose context is already done skips the remaining series. Their
+// A flush whose context is done skips the series it has not started. Their
 // links and episode debt catch up on the next refresh or scan of the series.
 func (s *MetadataService) BeginScheduledRefreshBatch(ctx context.Context) (context.Context, func(context.Context)) {
 	batch := &scheduledRefreshBatch{seen: make(map[string]struct{})}
@@ -76,14 +82,26 @@ func (s *MetadataService) syncSeriesEpisodeStateOrDefer(ctx context.Context, ser
 
 func (s *MetadataService) flushScheduledRefreshBatch(ctx context.Context, batch *scheduledRefreshBatch) {
 	series := batch.take()
+	slots := make(chan struct{}, scheduledRefreshFlushWorkers)
+	var wg sync.WaitGroup
 	for i, seriesID := range series {
+		select {
+		case slots <- struct{}{}:
+		case <-ctx.Done():
+		}
 		if err := ctx.Err(); err != nil {
 			slog.InfoContext(ctx, "metadata: skipped deferred series sync for a cancelled refresh batch", "component", "metadata",
 				"skipped_series", len(series)-i, "error", err)
-			return
+			break
 		}
-		seriesCtx, cancel := context.WithTimeout(ctx, scheduledRefreshSeriesSyncTimeout)
-		s.syncSeriesEpisodeState(seriesCtx, seriesID)
-		cancel()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-slots }()
+			seriesCtx, cancel := context.WithTimeout(ctx, scheduledRefreshSeriesSyncTimeout)
+			defer cancel()
+			s.syncSeriesEpisodeState(seriesCtx, seriesID)
+		}()
 	}
+	wg.Wait()
 }

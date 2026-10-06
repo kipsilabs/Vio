@@ -190,3 +190,52 @@ func TestRefreshMetadataTask_FlushesEachBatchAfterItsTargets(t *testing.T) {
 		t.Fatalf("%d targets refreshed outside their batch context", refresher.unbatchedCalls)
 	}
 }
+
+// cancellingBatchRefresher cancels the task's context during the first
+// refresh and records the context each flush receives.
+type cancellingBatchRefresher struct {
+	batchingMetadataRefresher
+	cancel     context.CancelFunc
+	cancelOnce sync.Once
+	flushErrs  []error
+}
+
+func (f *cancellingBatchRefresher) BeginScheduledRefreshBatch(ctx context.Context) (context.Context, func(context.Context)) {
+	batchCtx, flush := f.batchingMetadataRefresher.BeginScheduledRefreshBatch(ctx)
+	return batchCtx, func(flushCtx context.Context) {
+		f.batchMu.Lock()
+		f.flushErrs = append(f.flushErrs, flushCtx.Err())
+		f.batchMu.Unlock()
+		flush(flushCtx)
+	}
+}
+
+func (f *cancellingBatchRefresher) RefreshScheduledTarget(ctx context.Context, targetType, contentID string) error {
+	f.cancelOnce.Do(f.cancel)
+	return f.batchingMetadataRefresher.RefreshScheduledTarget(ctx, targetType, contentID)
+}
+
+func TestRefreshMetadataTask_FlushesACancelledBatch(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	candidates := make([]worker.RefreshCandidate, 50)
+	for i := range candidates {
+		candidates[i] = worker.RefreshCandidate{TargetType: "episode", ContentID: fmt.Sprintf("episode-%03d", i)}
+	}
+	finder := &fakeRefreshCandidateFinder{batches: [][]worker.RefreshCandidate{candidates}}
+	refresher := &cancellingBatchRefresher{cancel: cancel}
+	task := NewRefreshMetadataTask(finder, refresher)
+
+	if err := task.Execute(ctx, noopProgressReporter{}); err == nil {
+		t.Fatal("Execute succeeded, want the cancellation error")
+	}
+
+	// The batch is still flushed once with the cancelled context, so the
+	// refresher can decide what to skip instead of losing the batch silently.
+	if refresher.begins != 1 || refresher.flushes != 1 {
+		t.Fatalf("batches begun/flushed = %d/%d, want 1/1", refresher.begins, refresher.flushes)
+	}
+	if len(refresher.flushErrs) != 1 || refresher.flushErrs[0] == nil {
+		t.Fatalf("flush context errors = %v, want one cancelled flush", refresher.flushErrs)
+	}
+}

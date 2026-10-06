@@ -3905,6 +3905,14 @@ func (s *MetadataService) refreshSeriesChildTarget(
 	}
 
 	updated := false
+	// The link and debt passes cover the whole series, so a scheduled refresh
+	// batch runs them once per series instead of once per season or episode.
+	// They also run when a later language fails after an earlier one wrote rows.
+	defer func() {
+		if updated {
+			s.syncSeriesEpisodeStateOrDefer(ctx, seriesID)
+		}
+	}()
 	childCtx, err := s.seriesChildLocalContextForContent(ctx, seriesID, folderID)
 	if err != nil {
 		return err
@@ -3940,9 +3948,6 @@ func (s *MetadataService) refreshSeriesChildTarget(
 	if !updated {
 		return ErrMetadataNotFound
 	}
-	// The link and debt passes cover the whole series, so a scheduled refresh
-	// batch runs them once per series instead of once per season or episode.
-	s.syncSeriesEpisodeStateOrDefer(ctx, seriesID)
 	return nil
 }
 
