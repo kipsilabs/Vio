@@ -73,6 +73,36 @@ const (
 	probeOutcomeFailed   = "failed"
 )
 
+// virtualSessionProbeOutcome returns the disposition of the session's deferred
+// track-inventory probe, or "" when the session carries none (no deferred probe
+// was scheduled, a manager that cannot answer, or the session is gone). It is
+// read by the replan deferred-verdict guard: a replan must not terminal on
+// incomplete metadata while this is still "pending", because the metadata it
+// cannot see is what the outstanding probe is about to persist.
+func virtualSessionProbeOutcome(session *playback.Session) string {
+	if session == nil {
+		return ""
+	}
+	return session.VirtualProbeOutcome
+}
+
+// replanDefersIncompleteMetadataVerdict reports whether a replan terminal must
+// be deferred because the session's deferred track-inventory probe is still
+// pending. It is the single predicate the replan terminal path consults: a
+// source_metadata_incomplete verdict while the probe outcome is "pending" is
+// deferred (the probe will persist exactly the metadata the planner could not
+// see), and every other terminal, or a probe that has already landed
+// (verified/failed) or was never scheduled (""), passes through unchanged.
+func replanDefersIncompleteMetadataVerdict(terminal *playback.TerminalV3, session *playback.Session) bool {
+	if terminal == nil {
+		return false
+	}
+	if terminal.Reason != sourceMetadataIncompleteReasonV3 {
+		return false
+	}
+	return virtualSessionProbeOutcome(session) == probeOutcomePending
+}
+
 // startDeferredProbeWorkers lazily starts the fixed post-commit probe pool. The
 // pool is bounded, so enqueuing a probe never spawns a goroutine per request.
 func (h *PlaybackHandler) startDeferredProbeWorkers() {

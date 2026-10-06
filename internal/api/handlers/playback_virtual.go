@@ -2696,6 +2696,13 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		hasCompleteAudioEvidence := completeVirtualAudioEvidenceV3(&transient)
 		hasCompleteContainerEvidence := completeVirtualContainerEvidenceV3(&transient)
 		skipProbe := hasCompleteVideoEvidence && hasCompleteAudioEvidence && hasCompleteContainerEvidence
+		// minimalVideoEvidencePresent records whether the transient already
+		// carries REAL essential video evidence (a prior probe's track
+		// inventory), evaluated HERE, before any candidate merge below can
+		// synthesize bit depth, frame rate or bitrate. The deferred minimal
+		// recipe uses it so a listing that declared nothing cannot reach the
+		// planner metadata-blind and produce a black-screen recipe.
+		minimalVideoEvidencePresent := virtualTransientHasEssentialVideoMetadata(&transient, cand)
 		// A row that has never been probed carries NULL tracks and no probe
 		// stamp. Candidate-declared metadata can synthesize complete-looking
 		// evidence for the immediate plan, but it must not short-circuit the
@@ -2769,62 +2776,101 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			if !transient.HDR && cand.HDR != "" {
 				transient.HDR = true
 			}
-			h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
-			// The ffprobe enumeration is deliberately not spawned inline on the
-			// fresh-start path: the resolve hands the probe to the start path,
-			// which spawns it only after the transport commit and the first-byte
-			// URL. Session creation, recipe persistence, and the commit therefore
-			// run without waiting on a multi-second remote ffprobe, and the
-			// client gets its playable URL immediately. A caller that needs the
-			// probed inventory on the response (a synchronous replan/rehydration)
-			// does not opt in and keeps the inline probe below.
-			var deferred *virtualDeferredProbeV3
-			if h.VirtualPlaybackSourceProber != nil || h.VirtualPlaybackSourceProberWithHeaders != nil {
-				probeKey := virtualProbeFailureKey(cand.URI, oid)
-				probeTransient := cloneVirtualProbeTransient(transient)
-				// Zero the duration so the deferred probe measures the
-				// empirical duration instead of inheriting the catalog value.
-				probeTransient.Duration = 0
-				if virtualProbeFailures.recent(probeKey) {
-					// A fresh failure already consumed the probe budget. The
-					// inner probe may still have completed and landed in the
-					// cache, so try a cache-only recovery before falling back
-					// to declared metadata; otherwise the row stays unprobed
-					// until the damper lapses.
-					h.recoverVirtualProbeFromCache(r.Context(), file, streamURL, probeTransient, cand, oid)
-					return withResolvedCandidate(&resolvedVirtualPlaybackSource{
-						URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenanceDeclared, ResolutionAssumed: resolutionAssumed,
-					}, resolvedIdentity, resolvedRematched), nil
-				}
-				if options.deferProbePastCommit {
-					deferred = &virtualDeferredProbeV3{
-						stickyKey:              stickyKey,
-						file:                   file,
-						streamURL:              streamURL,
-						probeTransient:         &probeTransient,
-						cand:                   cand,
-						expectedRuntimeMinutes: h.virtualExpectedRuntimeMinutes(r.Context(), file),
-						ownerID:                oid,
-					}
+			// Minimal-recipe guard. This branch is the fresh-start deferred
+			// commit (deferProbePastCommit): it hands the client a playable URL
+			// whose video metadata comes from the candidate declaration. The
+			// merge above synthesizes bit depth, frame rate and bitrate for a
+			// listing that declared none, so completeVirtualVideoEvidenceV3
+			// would report a metadata-blind transient as complete and the
+			// deferred commit would route the decoder on guessed fields — the
+			// production black-screen (video track committed without bit
+			// depth/frame rate/bitrate/HDR flags) whose later replans terminal
+			// source_metadata_incomplete. The guard therefore re-checks REAL
+			// evidence (the pre-merge flag plus the raw transient), and when it
+			// is missing, pays ONE bounded ffprobe to fill the gaps; only if
+			// that also fails does it fall back to the synchronous full probe
+			// for this start. Correctness beats the deferral: a metadata-blind
+			// video recipe is never committed.
+			//
+			// It is deliberately scoped to the deferred post-commit commit only.
+			// The background-probe branch below (a best-effort upgrade of an
+			// already-synthesized plan for a synchronous replan/rehydration)
+			// keeps its existing behavior, so a slow background probe cannot
+			// change which plan the response carries.
+			if options.deferProbePastCommit && !minimalVideoEvidencePresent && !transient.IsAudioOnly() {
+				if filled := h.fillDeferredMinimalRecipeVideoMetadata(attemptCtx, streamURL, &transient, cand); filled != nil {
+					transient = *filled
 				} else {
-					probeCand := cand
-					expectedRuntimeMinutes := h.virtualExpectedRuntimeMinutes(r.Context(), file)
-					if gate := h.detachedGate(); gate.tryAcquire() {
-						bgCtx, bgCancel := h.virtualDetachedContext(r.Context(), virtualBackgroundProbeBudget)
-						go func() {
-							defer gate.release()
-							defer bgCancel()
-							h.probeVirtualSourceAndPersist(bgCtx, stickyKey, file, streamURL, probeTransient, probeCand, expectedRuntimeMinutes, oid)
-						}()
-					} else {
-						h.probeVirtualCandidateForegroundFallback(r.Context(), stickyKey, file, streamURL, probeTransient, probeCand, expectedRuntimeMinutes, oid)
-					}
+					// The bounded fill could not supply real metadata: deferring
+					// would commit a metadata-blind recipe, so probe
+					// synchronously for this start instead.
+					allowDefer = false
 				}
 			}
-			return withResolvedCandidate(&resolvedVirtualPlaybackSource{
-				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenancePending, ResolutionAssumed: resolutionAssumed,
-				DeferredProbe: deferred,
-			}, resolvedIdentity, resolvedRematched), nil
+			if allowDefer {
+				h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
+				// The ffprobe enumeration is deliberately not spawned inline on the
+				// fresh-start path: the resolve hands the probe to the start path,
+				// which spawns it only after the transport commit and the first-byte
+				// URL. Session creation, recipe persistence, and the commit therefore
+				// run without waiting on a multi-second remote ffprobe, and the
+				// client gets its playable URL immediately. A caller that needs the
+				// probed inventory on the response (a synchronous replan/rehydration)
+				// does not opt in and keeps the inline probe below.
+				var deferred *virtualDeferredProbeV3
+				if h.VirtualPlaybackSourceProber != nil || h.VirtualPlaybackSourceProberWithHeaders != nil {
+					probeKey := virtualProbeFailureKey(cand.URI, oid)
+					probeTransient := cloneVirtualProbeTransient(transient)
+					// Zero the duration so the deferred probe measures the
+					// empirical duration instead of inheriting the catalog value.
+					probeTransient.Duration = 0
+					if virtualProbeFailures.recent(probeKey) {
+						// A fresh failure already consumed the probe budget. The
+						// inner probe may still have completed and landed in the
+						// cache, so try a cache-only recovery before falling back
+						// to declared metadata; otherwise the row stays unprobed
+						// until the damper lapses. The metadata-blind guard above
+						// still applies: the transient was validated before this
+						// branch, so serving it here is not blind.
+						h.recoverVirtualProbeFromCache(r.Context(), file, streamURL, probeTransient, cand, oid)
+						return withResolvedCandidate(&resolvedVirtualPlaybackSource{
+							URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenanceDeclared, ResolutionAssumed: resolutionAssumed,
+						}, resolvedIdentity, resolvedRematched), nil
+					}
+					if options.deferProbePastCommit {
+						deferred = &virtualDeferredProbeV3{
+							stickyKey:              stickyKey,
+							file:                   file,
+							streamURL:              streamURL,
+							probeTransient:         &probeTransient,
+							cand:                   cand,
+							expectedRuntimeMinutes: h.virtualExpectedRuntimeMinutes(r.Context(), file),
+							ownerID:                oid,
+						}
+					} else {
+						probeCand := cand
+						expectedRuntimeMinutes := h.virtualExpectedRuntimeMinutes(r.Context(), file)
+						if gate := h.detachedGate(); gate.tryAcquire() {
+							bgCtx, bgCancel := h.virtualDetachedContext(r.Context(), virtualBackgroundProbeBudget)
+							go func() {
+								defer gate.release()
+								defer bgCancel()
+								h.probeVirtualSourceAndPersist(bgCtx, stickyKey, file, streamURL, probeTransient, probeCand, expectedRuntimeMinutes, oid)
+							}()
+						} else {
+							h.probeVirtualCandidateForegroundFallback(r.Context(), stickyKey, file, streamURL, probeTransient, probeCand, expectedRuntimeMinutes, oid)
+						}
+					}
+				}
+				return withResolvedCandidate(&resolvedVirtualPlaybackSource{
+					URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenancePending, ResolutionAssumed: resolutionAssumed,
+					DeferredProbe: deferred,
+				}, resolvedIdentity, resolvedRematched), nil
+			}
+			// The minimal-recipe guard refused the deferral: fall through to the
+			// synchronous full probe below with the (now metadata-complete or
+			// still-unknown) transient, so this start still gets a plan built
+			// from real evidence rather than a guessed one.
 		}
 		if h.VirtualPlaybackSourceProber == nil && h.VirtualPlaybackSourceProberWithHeaders == nil {
 			// Resolution precedence: stored evidence wins; otherwise adopt
@@ -5829,6 +5875,108 @@ func (h *PlaybackHandler) maybeTriggerSubtitleSearch(
 // background. It follows the caller's deferProbe flag exactly.
 func allowDeferredProbe(deferProbe bool) bool {
 	return deferProbe
+}
+
+// virtualMinimalRecipeFillBudget bounds the single bounded ffprobe the deferred
+// path may pay to fill video metadata a sparse listing did not declare. It is
+// deliberately short — the listing is expected to carry the metadata, and this
+// is a corrective probe, not the full enumeration — and it runs on the resolve's
+// existing cold-path budget, so it can never start a fresh one.
+var virtualMinimalRecipeFillBudget = 6 * time.Second
+
+// virtualTransientHasEssentialVideoMetadata reports whether a transient file
+// already carries every essential video field from real evidence (a prior
+// probe's track inventory), so the deferred minimal recipe may commit it
+// without a bounded fill probe and without relying on the candidate merge's
+// synthesis. It is evaluated before any merge so a synthesized default cannot
+// masquerade as evidence.
+//
+// The required fields are exactly the planner's routeVideoMetadataCompleteV3
+// set — video codec, bit depth, dimensions, a parseable frame rate and a
+// positive bitrate — because a missing one of these is what makes the planner
+// terminal source_metadata_incomplete. Bit depth and frame rate are the fields
+// the merge synthesizes, which is precisely what produced the black-screen
+// recipe (an 8-bit default on 10-bit bytes routed the decoder wrongly).
+//
+// It additionally refuses a candidate whose declaration proves HDR/DV when the
+// real evidence still reports a plain SDR range: committing that would stamp
+// SDR onto HDR bytes. An SDR candidate needs no range string from the probe
+// (ffprobe routinely omits it for SDR), so the range is only a veto when the
+// declaration contradicts it.
+func virtualTransientHasEssentialVideoMetadata(file *models.MediaFile, cand VirtualPlaybackStream) bool {
+	if file == nil {
+		return false
+	}
+	if file.IsAudioOnly() {
+		// An audio-only row has no video route to validate or to synthesize,
+		// so it is never metadata-blind in the sense this guard exists for.
+		return true
+	}
+	if !playback.VirtualRouteVideoMetadataCompleteV3(file) {
+		return false
+	}
+	declaresHDR, _ := virtualDVMetadata(cand.HDR)
+	if (declaresHDR || cand.HDR != "") && len(file.VideoTracks) > 0 {
+		track := file.VideoTracks[0]
+		rangeText := strings.ToLower(strings.TrimSpace(track.VideoRange + " " + track.VideoRangeType))
+		plainSDR := strings.Contains(rangeText, "sdr") && !track.HDR10Plus && track.DVProfile == 0
+		if rangeText == "" || plainSDR {
+			return false
+		}
+	}
+	return true
+}
+
+// fillDeferredMinimalRecipeVideoMetadata runs ONE bounded ffprobe for the
+// candidate the deferred plan is about to commit and returns a copy carrying the
+// probed evidence. It returns nil when the probe could not run, failed, or
+// reported no real essential video metadata — the caller then falls back to the
+// synchronous full probe for this start rather than committing a metadata-blind
+// recipe.
+//
+// The completeness check runs on the RAW ffprobe output, before any candidate
+// merge: the merge synthesizes bit depth, frame rate and range defaults, and it
+// is precisely those synthesized defaults that must never authorize the commit.
+func (h *PlaybackHandler) fillDeferredMinimalRecipeVideoMetadata(
+	ctx context.Context,
+	streamURL string,
+	transient *models.MediaFile,
+	cand VirtualPlaybackStream,
+) *models.MediaFile {
+	if h == nil || transient == nil || strings.TrimSpace(streamURL) == "" {
+		return nil
+	}
+	if h.VirtualPlaybackSourceProber == nil && h.VirtualPlaybackSourceProberWithHeaders == nil {
+		return nil
+	}
+	fillCtx, cancel := context.WithTimeout(ctx, virtualMinimalRecipeFillBudget)
+	probeCopy := cloneVirtualProbeTransient(*transient)
+	// Zero the duration so the fill measures the empirical duration rather than
+	// inheriting the catalog value, exactly like the deferred enumeration.
+	probeCopy.Duration = 0
+	probed, probeErr := h.probeVirtualSource(fillCtx, streamURL, &probeCopy, cand.RequestHeaders)
+	cancel()
+	if probeErr != nil || probed == nil {
+		slog.WarnContext(ctx, "virtual minimal-recipe metadata fill probe failed; falling back to the synchronous probe",
+			"component", "api", "candidate_uri", cand.URI, "file_id", transient.ID, "error", probeErr)
+		return nil
+	}
+	if !virtualTransientHasEssentialVideoMetadata(probed, cand) {
+		slog.WarnContext(ctx, "virtual minimal-recipe metadata fill probe returned incomplete evidence; falling back to the synchronous probe",
+			"component", "api", "candidate_uri", cand.URI, "file_id", transient.ID)
+		return nil
+	}
+	if transient.ID > 0 {
+		probed.ID = transient.ID
+		probed.MediaFolderID = transient.MediaFolderID
+	}
+	if transient.Duration > 0 && probed.Duration <= 0 {
+		probed.Duration = transient.Duration
+	}
+	mergeVirtualCandidateTracks(probed, cand)
+	slog.InfoContext(ctx, "virtual minimal-recipe metadata filled by a bounded probe",
+		"component", "api", "candidate_uri", cand.URI, "file_id", transient.ID)
+	return probed
 }
 
 // mergeVirtualCandidateTracks supplements probed virtual file tracks with

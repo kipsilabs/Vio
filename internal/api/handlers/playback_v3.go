@@ -8555,6 +8555,28 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	// unlogged terminal made client reports impossible to reconstruct from
 	// server logs alone.
 	clientInfo := playbackClientInfoForStartV3(r, req.ClientPlaybackContext)
+	// Deferred-verdict guard. A replan that lands while the session's deferred
+	// probe outcome is still "pending" must not terminal on
+	// source_metadata_incomplete: the metadata it cannot see is exactly what the
+	// outstanding deferred probe is about to persist. A terminal here would
+	// strand a session whose own follow-up is still in flight; the verdict is
+	// deferred to the probe's own outcome (an inventory_updated push or the
+	// inventory poll reports verified/failed when it lands). Every other
+	// terminal is a real route/policy verdict and is unaffected.
+	if replanDefersIncompleteMetadataVerdict(result.Terminal, session) {
+		slog.InfoContext(r.Context(), "playback replan deferred: deferred probe still pending for the bound candidate",
+			logComponentKey, "playback",
+			"operation", string(operation),
+			"session_id", record.SessionID,
+			"requested_file_id", record.RequestedMediaFileID,
+			"effective_file_id", effectiveFile.ID,
+			"detail", result.Terminal.Detail)
+		return playback.NewTerminalResponseV3(
+			replanProbePendingReasonV3,
+			"The server is still enumerating this source's tracks; the verdict is deferred until the probe lands.",
+			true,
+		), *record, nil, nil
+	}
 	if result.Terminal != nil {
 		slog.InfoContext(r.Context(), "playback replan decided", append([]any{
 			logComponentKey, "playback",
@@ -9578,6 +9600,14 @@ const (
 	// terminaling on it with a fully-characterized bound sibling falls back
 	// through the alternate hunt instead of stranding on terminal.
 	sourceMetadataIncompleteReasonV3 = "source_metadata_incomplete"
+	// replanProbePendingReasonV3 is the retryable terminal a replan returns when
+	// it would otherwise terminal on source_metadata_incomplete while the
+	// session's deferred track-inventory probe is still pending. The
+	// incomplete-metadata verdict is deferred to that probe: the push/poll
+	// reports verified or failed when it lands, and the client may retry the
+	// replan then. It is deliberately NOT source_metadata_incomplete, so a
+	// transient "still enumerating" state is never shown as a scan failure.
+	replanProbePendingReasonV3 = "inventory_probe_pending"
 )
 
 // terminalAllowsAlternateFileV3 reports whether a refusal is the kind another
