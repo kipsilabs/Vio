@@ -149,6 +149,10 @@ func TestApplySectionLibraryScopeToQuery(t *testing.T) {
 		// the viewer can see.
 		{name: "disjoint libraries match nothing", def: []int{1}, libraryIDs: []int{3}, wantOK: false},
 		{name: "nonexistent query library matches nothing", def: []int{999}, libraryIDs: []int{3}, wantOK: false},
+		// An empty, non-nil scope means the viewer can reach no library; it
+		// must not read as "every library".
+		{name: "empty scope matches nothing", libraryIDs: []int{}, wantOK: false},
+		{name: "empty scope with query libraries matches nothing", def: []int{1}, libraryIDs: []int{}, wantOK: false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

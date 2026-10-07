@@ -2565,8 +2565,9 @@ func (f *Fetcher) fetchFiltered(ctx context.Context, s ResolvedSection, libraryI
 
 // applySectionLibraryScopeToQuery scopes a section's query to the fetch's
 // libraries: a pinned libraryID replaces the query's own libraries, and
-// libraryIDs limits them. It reports false when the query names libraries
-// and none of them is in libraryIDs; the section must then return nothing.
+// libraryIDs limits them. It reports false when libraryIDs is empty but
+// non-nil, or when the query names libraries and none of them is in
+// libraryIDs; the section must then return nothing.
 // Clearing the query's libraries instead would read as "every library" and
 // fill the section from libraries it was never scoped to.
 func applySectionLibraryScopeToQuery(def catalog.QueryDefinition, libraryID *int, libraryIDs []int) (catalog.QueryDefinition, bool) {
@@ -2574,6 +2575,9 @@ func applySectionLibraryScopeToQuery(def catalog.QueryDefinition, libraryID *int
 	case libraryID != nil:
 		def.LibraryIDs = []int{*libraryID}
 	case libraryIDs != nil:
+		if len(libraryIDs) == 0 {
+			return def, false
+		}
 		if len(def.LibraryIDs) == 0 {
 			def.LibraryIDs = append([]int(nil), libraryIDs...)
 			break
