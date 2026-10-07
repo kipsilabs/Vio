@@ -2,7 +2,6 @@ package metadata
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 	"strings"
 	"sync"
@@ -10,10 +9,10 @@ import (
 )
 
 const (
-	// scheduledRefreshSeriesSyncTimeout bounds each series' deferred link and
-	// debt pass when a scheduled refresh batch is flushed. It matches the
-	// per-target timeout of the scheduled refresh task.
-	scheduledRefreshSeriesSyncTimeout = 2 * time.Minute
+	// seriesEpisodeSyncTimeout bounds one series' link and debt pass, whether
+	// it runs straight after a target refresh or in a batch flush. It matches
+	// the per-target timeout of the scheduled refresh task.
+	seriesEpisodeSyncTimeout = 2 * time.Minute
 	// scheduledRefreshFlushWorkers caps how many series a flush syncs at once.
 	// It matches the scheduled refresh task's worker count, which is how many
 	// of these passes could run at once before they were batched.
@@ -35,6 +34,15 @@ type scheduledRefreshBatch struct {
 	series         []string
 	seen           map[string]struct{}
 	failedEpisodes map[string]struct{}
+	// targets holds the season and episode targets that refreshed successfully.
+	// Their own debt rows stay claimed until the flush has run their series'
+	// passes, so a batch that never flushes leaves them for a later claim.
+	targets []refreshDebtTarget
+}
+
+type refreshDebtTarget struct {
+	targetType string
+	contentID  string
 }
 
 func (b *scheduledRefreshBatch) add(seriesID string) {
@@ -53,14 +61,21 @@ func (b *scheduledRefreshBatch) markEpisodeFailed(episodeID string) {
 	b.failedEpisodes[episodeID] = struct{}{}
 }
 
-func (b *scheduledRefreshBatch) take() ([]string, map[string]struct{}) {
+func (b *scheduledRefreshBatch) addTarget(targetType, contentID string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	series, failed := b.series, b.failedEpisodes
+	b.targets = append(b.targets, refreshDebtTarget{targetType: targetType, contentID: contentID})
+}
+
+func (b *scheduledRefreshBatch) take() ([]string, map[string]struct{}, []refreshDebtTarget) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	series, failed, targets := b.series, b.failedEpisodes, b.targets
 	b.series = nil
 	b.seen = make(map[string]struct{})
 	b.failedEpisodes = make(map[string]struct{})
-	return series, failed
+	b.targets = nil
+	return series, failed, targets
 }
 
 // BeginScheduledRefreshBatch starts a scheduled refresh batch. Season and
@@ -70,12 +85,18 @@ func (b *scheduledRefreshBatch) take() ([]string, map[string]struct{}) {
 // refresh in the batch has returned. Whole-series refreshes keep their passes
 // inline because their own debt sync reads the result.
 //
-// An episode target whose failure was recorded during the batch keeps that
-// failure: the flush's series sweep leaves its debt row alone, as the sweep
-// that ran before the failure was recorded did when the passes were inline.
+// A season or episode target that succeeds inside the batch syncs its own debt
+// row in the flush, after its series' passes, as it did when the passes ran
+// inline. Until then the row stays claimed under its lease.
 //
-// A flush whose context is done skips the series it has not started. Their
-// links and episode debt catch up on the next refresh or scan of the series.
+// An episode target whose failure was recorded during the batch keeps that
+// failure while it still has debt: the flush's series sweep leaves its row
+// alone, as the sweep that ran before the failure was recorded did when the
+// passes were inline.
+//
+// A flush whose context is done skips the series it has not started and every
+// deferred target debt sync. Those targets' rows are still claimed, so the
+// next claim after their lease expires refreshes them and runs the passes.
 func (s *MetadataService) BeginScheduledRefreshBatch(ctx context.Context) (context.Context, func(context.Context)) {
 	batch := &scheduledRefreshBatch{seen: make(map[string]struct{}), failedEpisodes: make(map[string]struct{})}
 	return context.WithValue(ctx, scheduledRefreshBatchKey{}, batch), func(flushCtx context.Context) {
@@ -98,17 +119,26 @@ func (s *MetadataService) syncSeriesEpisodeStateOrDefer(ctx context.Context, ser
 	s.syncSeriesEpisodeState(ctx, seriesID)
 }
 
+// syncRefreshDebtForTargetOrDefer syncs a successful season or episode
+// target's debt row now, or leaves it claimed for the enclosing scheduled
+// refresh batch to sync after the flush has run its series' passes.
+func (s *MetadataService) syncRefreshDebtForTargetOrDefer(ctx context.Context, targetType, contentID string) error {
+	if batch := scheduledRefreshBatchFromContext(ctx); batch != nil {
+		batch.addTarget(targetType, contentID)
+		return nil
+	}
+	return s.syncRefreshDebtForTarget(ctx, targetType, contentID)
+}
+
 // noteScheduledRefreshFailure records an episode target whose refresh failure
 // was written to its debt row, so the enclosing batch's series sweep keeps it.
-// Canceled and timed-out refreshes record no failure, so there is nothing to keep.
-func noteScheduledRefreshFailure(ctx context.Context, episodeID string, refreshErr error) {
+func noteScheduledRefreshFailure(ctx context.Context, targetType, contentID string) {
 	batch := scheduledRefreshBatchFromContext(ctx)
-	episodeID = strings.TrimSpace(episodeID)
-	if batch == nil || episodeID == "" || refreshErr == nil ||
-		errors.Is(refreshErr, context.Canceled) || errors.Is(refreshErr, context.DeadlineExceeded) {
+	contentID = strings.TrimSpace(contentID)
+	if batch == nil || contentID == "" || NormalizeRefreshTargetType(targetType) != RefreshTargetEpisode {
 		return
 	}
-	batch.markEpisodeFailed(episodeID)
+	batch.markEpisodeFailed(contentID)
 }
 
 // failedEpisodeDebtFromContext returns the episode targets whose recorded
@@ -119,7 +149,7 @@ func failedEpisodeDebtFromContext(ctx context.Context) map[string]struct{} {
 }
 
 func (s *MetadataService) flushScheduledRefreshBatch(ctx context.Context, batch *scheduledRefreshBatch) {
-	series, failedEpisodes := batch.take()
+	series, failedEpisodes, targets := batch.take()
 	if len(failedEpisodes) > 0 {
 		ctx = context.WithValue(ctx, failedEpisodeDebtKey{}, failedEpisodes)
 	}
@@ -139,10 +169,24 @@ func (s *MetadataService) flushScheduledRefreshBatch(ctx context.Context, batch 
 		go func() {
 			defer wg.Done()
 			defer func() { <-slots }()
-			seriesCtx, cancel := context.WithTimeout(ctx, scheduledRefreshSeriesSyncTimeout)
+			seriesCtx, cancel := context.WithTimeout(ctx, seriesEpisodeSyncTimeout)
 			defer cancel()
 			s.syncSeriesEpisodeState(seriesCtx, seriesID)
 		}()
 	}
 	wg.Wait()
+
+	for i, target := range targets {
+		if err := ctx.Err(); err != nil {
+			slog.InfoContext(ctx, "metadata: left deferred target debt claimed for a canceled refresh batch", "component", "metadata",
+				"skipped_targets", len(targets)-i, "error", err)
+			return
+		}
+		if err := s.syncRefreshDebtForTarget(ctx, target.targetType, target.contentID); err != nil {
+			slog.WarnContext(ctx, "metadata: failed to sync refresh debt after a scheduled refresh batch", "component", "metadata",
+				"target_type", target.targetType,
+				"content_id", target.contentID,
+				"error", err)
+		}
+	}
 }

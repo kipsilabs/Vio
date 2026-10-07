@@ -3039,15 +3039,14 @@ func (s *MetadataService) refreshTarget(ctx context.Context, targetType, content
 			s.recordRefreshTargetFailure(ctx, targetType, contentID, err, incrementDebtAttempt)
 			return err
 		}
-		return s.syncRefreshDebtForTarget(ctx, targetType, contentID)
+		return s.syncRefreshDebtForTargetOrDefer(ctx, targetType, contentID)
 	case RefreshTargetEpisode:
 		err := s.refreshEpisodeTarget(ctx, contentID, folderID, mode)
 		if err != nil {
 			s.recordRefreshTargetFailure(ctx, targetType, contentID, err, incrementDebtAttempt)
-			noteScheduledRefreshFailure(ctx, contentID, err)
 			return err
 		}
-		return s.syncRefreshDebtForTarget(ctx, targetType, contentID)
+		return s.syncRefreshDebtForTargetOrDefer(ctx, targetType, contentID)
 	default:
 		return fmt.Errorf("unsupported metadata refresh target type %q", targetType)
 	}
@@ -3609,7 +3608,9 @@ func (s *MetadataService) recordRefreshTargetFailure(ctx context.Context, target
 			"content_id", contentID,
 			"refresh_error", refreshErr,
 			"error", err)
+		return
 	}
+	noteScheduledRefreshFailure(ctx, targetType, contentID)
 }
 
 func (s *MetadataService) syncRefreshDebtForItem(ctx context.Context, contentID string) error {
@@ -3963,10 +3964,14 @@ func (s *MetadataService) refreshSeriesChildTarget(
 	updated := false
 	// The link and debt passes cover the whole series, so a scheduled refresh
 	// batch runs them once per series instead of once per season or episode.
-	// They also run when a later language fails after an earlier one wrote rows.
+	// They also run when a later language fails after an earlier one wrote
+	// rows, on a context detached from the refresh's own cancellation, since
+	// that failure may be the refresh's deadline.
 	defer func() {
 		if updated {
-			s.syncSeriesEpisodeStateOrDefer(ctx, seriesID)
+			syncCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), seriesEpisodeSyncTimeout)
+			defer cancel()
+			s.syncSeriesEpisodeStateOrDefer(syncCtx, seriesID)
 		}
 	}()
 	childCtx, err := s.seriesChildLocalContextForContent(ctx, seriesID, folderID)
@@ -6049,15 +6054,17 @@ func (s *MetadataService) refreshSeriesEpisodeMetadataState(ctx context.Context,
 	}
 
 	// Episode targets that failed during a scheduled refresh batch keep the
-	// failure their own refresh recorded; only the other episodes are synced.
+	// failure their own refresh recorded while they still have debt; a later
+	// target in the batch that completed one lets the sweep clear its row.
 	failedEpisodes := failedEpisodeDebtFromContext(ctx)
 	keptActionable := false
 	var completeEpisodeIDs []string
 	var actionableEpisodes []*models.Episode
 	for _, episode := range episodes {
 		if episode != nil {
-			if _, failed := failedEpisodes[strings.TrimSpace(episode.ContentID)]; failed {
-				keptActionable = keptActionable || EpisodeHasActionableMetadataDebt(episode, now)
+			if _, failed := failedEpisodes[strings.TrimSpace(episode.ContentID)]; failed &&
+				EpisodeHasActionableMetadataDebt(episode, now) {
+				keptActionable = true
 				continue
 			}
 		}

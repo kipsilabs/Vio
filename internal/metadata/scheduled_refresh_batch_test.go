@@ -372,3 +372,148 @@ func TestSeriesDebtSweepDoesNotRepeatTerminalWarnings(t *testing.T) {
 		t.Fatalf("terminal warning does not name the refreshed target\n%s", logs.String())
 	}
 }
+
+// targetDebtSyncCountingRepo counts the writes that settle one target's debt
+// row, which a successful target's own debt sync or a series sweep makes.
+type targetDebtSyncCountingRepo struct {
+	*sweepCountingRefreshDebtRepo
+	contentID string
+	settled   atomic.Int32
+}
+
+func (r *targetDebtSyncCountingRepo) MarkTargetSuccess(ctx context.Context, targetType, contentID string, priority int, reasonMask int64, nextRefreshAt time.Time) error {
+	if contentID == r.contentID {
+		r.settled.Add(1)
+	}
+	return r.sweepCountingRefreshDebtRepo.MarkTargetSuccess(ctx, targetType, contentID, priority, reasonMask, nextRefreshAt)
+}
+
+func (r *targetDebtSyncCountingRepo) DeleteTargetDebt(ctx context.Context, targetType, contentID string) error {
+	if contentID == r.contentID {
+		r.settled.Add(1)
+	}
+	return r.sweepCountingRefreshDebtRepo.DeleteTargetDebt(ctx, targetType, contentID)
+}
+
+func TestScheduledRefreshBatchSyncsTargetDebtAfterTheFlush(t *testing.T) {
+	for _, canceled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("canceled=%t", canceled), func(t *testing.T) {
+			h, _, _, linkPasses, _ := seedSeriesSyncCounters(t)
+			debts := &targetDebtSyncCountingRepo{
+				sweepCountingRefreshDebtRepo: newSweepCountingRefreshDebtRepo(),
+				contentID:                    "episode-s05e03",
+			}
+			h.service.refreshDebtRepo = debts
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			batchCtx, flush := h.service.BeginScheduledRefreshBatch(ctx)
+			if err := h.service.RefreshScheduledTarget(batchCtx, RefreshTargetEpisode, "episode-s05e03"); err != nil {
+				t.Fatalf("RefreshScheduledTarget: %v", err)
+			}
+			// The target's own debt row must stay claimed until its series has
+			// been relinked, so a batch that never flushes leaves retryable work.
+			if got := debts.settled.Load(); got != 0 {
+				t.Fatalf("target debt writes before the flush = %d, want 0", got)
+			}
+			if canceled {
+				cancel()
+			}
+			flush(ctx)
+
+			if canceled {
+				if got := debts.settled.Load(); got != 0 {
+					t.Fatalf("target debt writes after a canceled flush = %d, want 0 so the lease brings it back", got)
+				}
+				return
+			}
+			if got := linkPasses.Load(); got != 1 {
+				t.Fatalf("series link passes after the flush = %d, want 1", got)
+			}
+			if got := debts.settled.Load(); got == 0 {
+				t.Fatal("target debt was never synced after the flush")
+			}
+		})
+	}
+}
+
+func TestSeriesDebtSweepClearsAFailedEpisodeThatIsNowComplete(t *testing.T) {
+	h := newTestHarness()
+	h.service.episodeRepo = newFakeEpisodeRepo()
+	debts := newFakeRefreshDebtRepo()
+	h.service.refreshDebtRepo = debts
+	ctx := context.Background()
+	seriesID := "series-failed-then-complete"
+	_ = h.service.episodeRepo.Upsert(ctx, &models.Episode{
+		ContentID:      "episode-complete",
+		SeriesID:       seriesID,
+		SeasonNumber:   1,
+		EpisodeNumber:  1,
+		Title:          "Pilot",
+		TmdbID:         "101",
+		MetadataSource: "provider",
+	})
+	_ = h.service.episodeRepo.Upsert(ctx, &models.Episode{
+		ContentID:      "episode-incomplete",
+		SeriesID:       seriesID,
+		SeasonNumber:   1,
+		EpisodeNumber:  2,
+		MetadataSource: "provider",
+	})
+	for _, episodeID := range []string{"episode-complete", "episode-incomplete"} {
+		if err := h.service.syncRefreshDebtTargetFailure(ctx, RefreshTargetEpisode, episodeID, errors.New("provider failed"), true); err != nil {
+			t.Fatalf("syncRefreshDebtTargetFailure(%s): %v", episodeID, err)
+		}
+	}
+
+	sweepCtx := context.WithValue(ctx, failedEpisodeDebtKey{}, map[string]struct{}{
+		"episode-complete":   {},
+		"episode-incomplete": {},
+	})
+	h.service.refreshSeriesEpisodeMetadataState(sweepCtx, seriesID, time.Now().UTC())
+
+	// A later target in the batch completed this episode, so its failure row
+	// has nothing left to retry.
+	if _, err := debts.GetTarget(ctx, RefreshTargetEpisode, "episode-complete"); !errors.Is(err, ErrRefreshDebtNotFound) {
+		t.Fatalf("debt for the completed failed episode: err = %v, want it cleared", err)
+	}
+	assertEpisodeFailureDebtKept(t, debts, "episode-incomplete")
+}
+
+// cancelingStaleIDRepo cancels the refresh's context on the second stale
+// provider ID lookup, so a two-language refresh writes its first language and
+// then fails on its own deadline.
+type cancelingStaleIDRepo struct {
+	*fakeStaleIDRepo
+	cancel context.CancelFunc
+	calls  atomic.Int32
+}
+
+func (r *cancelingStaleIDRepo) GetByContentID(ctx context.Context, contentID string) ([]*models.StaleMediaID, error) {
+	if r.calls.Add(1) > 1 {
+		r.cancel()
+		return nil, context.Canceled
+	}
+	return r.fakeStaleIDRepo.GetByContentID(ctx, contentID)
+}
+
+func TestTargetRefreshSyncsSeriesOnALiveContextAfterItsOwnCancellation(t *testing.T) {
+	h, seriesID, _, _, _ := seedSeriesSyncCounters(t)
+	h.libraryRepo.setMetadataLanguages(seriesID, []string{"en", "fr"}, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h.service.staleIDRepo = &cancelingStaleIDRepo{fakeStaleIDRepo: newFakeStaleIDRepo(), cancel: cancel}
+	var linkCtxErrs []error
+	h.service.hooks.ensureSeriesEpisodeLinks = func(linkCtx context.Context, _ string) error {
+		linkCtxErrs = append(linkCtxErrs, linkCtx.Err())
+		return nil
+	}
+
+	if err := h.service.RefreshScheduledTarget(ctx, RefreshTargetEpisode, "episode-s05e04"); err == nil {
+		t.Fatal("RefreshScheduledTarget succeeded, want the canceled second language")
+	}
+
+	if len(linkCtxErrs) != 1 || linkCtxErrs[0] != nil {
+		t.Fatalf("series link passes = %v, want one on a live context for the rows the first language wrote", linkCtxErrs)
+	}
+}
