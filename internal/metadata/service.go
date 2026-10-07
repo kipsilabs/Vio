@@ -8463,14 +8463,16 @@ func ImageTypeToString(t ImageType) string {
 	}
 }
 
-// ImageTypeFromString converts a string to an ImageType.
+// ImageTypeFromString converts a string to an ImageType. "titlecard" is the
+// client-facing name for an episode's still, so it maps to ImageStill: the
+// artwork target validation then accepts it only on episode scope.
 func ImageTypeFromString(s string) ImageType {
 	switch s {
 	case "backdrop":
 		return ImageBackdrop
 	case "logo":
 		return ImageLogo
-	case "still":
+	case "still", "titlecard":
 		return ImageStill
 	case "profile":
 		return ImageProfile

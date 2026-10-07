@@ -33,7 +33,7 @@ type AdminImageApplyInput struct {
 	ID   string `path:"id" minLength:"1" maxLength:"512"`
 	Body struct {
 		OriginalURL string `json:"original_url" minLength:"1" maxLength:"8192"`
-		Type        string `json:"type" minLength:"1" maxLength:"100"`
+		Type        string `json:"type" minLength:"1" maxLength:"100" doc:"One of poster, backdrop, logo, still, or titlecard. still and titlecard name the same episode title card and are accepted only for an episode; a movie, series, or season is refused with 400 unsupported_image_type. An episode stores any applied image as its still." example:"poster"`
 		ProviderID  string `json:"provider_id,omitempty" maxLength:"512"`
 	}
 }
@@ -152,4 +152,7 @@ type CurrentImages struct {
 	PosterURL   string `json:"poster_url,omitempty"`
 	BackdropURL string `json:"backdrop_url,omitempty"`
 	LogoURL     string `json:"logo_url,omitempty"`
+	// StillURL is an episode's current title card. Absent on every other
+	// scope, which has no still.
+	StillURL string `json:"still_url,omitempty"`
 }
