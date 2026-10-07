@@ -30,8 +30,7 @@ runs:
 
     - name: Restore the libvips packages
       if: runner.environment == 'github-hosted'
-      id: libvips-cache
-      uses: actions/cache/restore@v4
+      uses: actions/cache@v4
       with:
         path: ${{ runner.temp }}/libvips-debs
         key: ${{ steps.libvips-cache-key.outputs.key }}
@@ -44,16 +43,19 @@ runs:
           exit 0
         fi
         # libvips and its dependencies use the runner's official Ubuntu sources.
-        # The Acquire options bound a stalled mirror: without them apt-get
-        # update can sit on a slow connection for the whole job (seen at 22
-        # minutes). Languages=none skips the translation indexes.
+        # The Acquire options bound a stalled or failing mirror: without them
+        # apt-get update once sat on a slow connection for 22 minutes, and with
+        # three retries an install against a mirror returning 502s spent 16
+        # minutes retrying per package. Languages=none skips the translation
+        # indexes. The update below refreshes the runner's mirror selection, so
+        # the install that follows uses whatever mirror is healthy now.
         test -f /etc/apt/sources.list.d/ubuntu.sources
         apt_options=(
           -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources
           -o Dir::Etc::sourceparts=-
-          -o Acquire::Retries=3
-          -o Acquire::http::Timeout=30
-          -o Acquire::https::Timeout=30
+          -o Acquire::Retries=1
+          -o Acquire::http::Timeout=20
+          -o Acquire::https::Timeout=20
           -o Acquire::ForceIPv4=true
           -o Acquire::Languages=none
         )
@@ -71,26 +73,10 @@ runs:
             fi
           fi
         fi
-        # The runner image ships package lists, so try the install before
-        # paying for an index update. This is the step that stalled; a stale or
-        # missing list falls through to the update below.
-        echo "installing libvips"
-        if sudo apt-get "${apt_options[@]}" install -y --no-install-recommends libvips-dev; then
-          exit 0
-        fi
-        echo "updating package lists and retrying"
+        echo "updating package lists"
         sudo apt-get "${apt_options[@]}" update
+        echo "installing libvips"
         sudo apt-get "${apt_options[@]}" install -y --no-install-recommends libvips-dev
-
-    # Saved only on a push to main, where the cache is shared with PRs; the
-    # key is the runner image, not the commit, so one entry serves every run
-    # on that image.
-    - name: Save the libvips packages
-      if: runner.environment == 'github-hosted' && github.event_name != 'pull_request' && steps.libvips-cache.outputs.cache-hit != 'true'
-      uses: actions/cache/save@v4
-      with:
-        path: ${{ runner.temp }}/libvips-debs
-        key: ${{ steps.libvips-cache.outputs.cache-primary-key }}
 
     # setup-go's own cache is keyed on go.sum alone and written only on a
     # miss, so between dependency bumps every run restored a build cache
