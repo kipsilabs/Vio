@@ -471,6 +471,18 @@ First-party mobile clients need the same badge-or-plain rule when they adopt
 inference; Play eligibility stays unchanged; unknown/absent states render
 as today.
 
+## Episode title cards
+
+An episode's title card is its still. Episode rows (`listCatalogItemEpisodes`,
+`listSeasonEpisodes`) and episode details (`getCatalogItem` on an episode id)
+carry it as `still_url` and `still_thumbhash`, falling back to the series'
+backdrop or poster when the episode has no still of its own. An administrator
+sets it through `POST /api/v2/admin/items/{episode_id}/images/apply` with
+`type: "titlecard"` (or `"still"`); see
+[Admin catalog API](admin-catalog-api.md#item-image-selection). The two names
+are the same artwork. A title card applied to a movie, series, or season is
+refused with `unsupported_image_type`, because only an episode has one.
+
 ## Collection membership titles
 
 `GET /api/v2/collections/{id}/items` and

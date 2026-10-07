@@ -103,6 +103,9 @@ type currentImages struct {
 	PosterURL   string `json:"poster_url,omitempty"`
 	BackdropURL string `json:"backdrop_url,omitempty"`
 	LogoURL     string `json:"logo_url,omitempty"`
+	// StillURL is the episode's current title card. v1 is frozen, so it is
+	// kept out of the shared JSON body and emitted by apiv2 as still_url.
+	StillURL string `json:"-"`
 }
 
 type applyItemImageRequest struct {
@@ -290,6 +293,12 @@ func (h *AdminImageHandler) GetAdminItemImages(ctx context.Context, contentID st
 	if resolved.season != nil {
 		current.PosterURL = resolved.season.PosterPath
 	}
+	// An episode owns its title card (still) independently of the parent
+	// series. Emit it additively as still_url; poster_url keeps its existing
+	// meaning so the frozen v1 body is unchanged.
+	if resolved.episode != nil {
+		current.StillURL = resolved.episode.StillPath
+	}
 
 	return AdminItemImagesView{
 		Images:         entries,
@@ -338,8 +347,12 @@ func (h *AdminImageHandler) ApplyAdminItemImage(ctx context.Context, contentID s
 	}
 
 	imageType := metadata.ImageTypeFromString(req.Type)
-	// Episodes only have stills. Clients historically sent "poster" here (the
-	// old flow silently dropped it), so coerce rather than reject.
+	// Episodes only have stills, and a still is the episode's title card. The
+	// "titlecard" alias resolves to ImageStill above, so a title card (or an
+	// explicit still) requested on a movie, series, or season is rejected by
+	// the target validation below before any download. Clients historically
+	// sent "poster" for an episode (the old flow silently dropped it), so
+	// coerce rather than reject.
 	if resolved.contentType == "episode" {
 		imageType = metadata.ImageStill
 	}
