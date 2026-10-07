@@ -18,10 +18,11 @@ runs:
     # nothing under ./... compiles without the headers. The Dockerfile
     # installs the same package in its build stage.
     #
-    # On a GitHub-hosted runner the .deb files are cached per runner image, so
-    # a warm cache installs them offline: no apt-get update and no downloads.
-    # The private runner image already carries the headers, so pkg-config
-    # short-circuits there.
+    # On a GitHub-hosted runner the .deb files are cached per runner image: a
+    # warm cache installs them offline with no apt-get update and no downloads,
+    # while a cold cache runs the bounded update and install below. The private
+    # runner image already carries the headers, so pkg-config short-circuits
+    # there.
     - name: Read the libvips cache key
       if: runner.environment == 'github-hosted'
       id: libvips-cache-key
@@ -30,7 +31,8 @@ runs:
 
     - name: Restore the libvips packages
       if: runner.environment == 'github-hosted'
-      uses: actions/cache@v4
+      id: libvips-cache
+      uses: actions/cache/restore@v4
       with:
         path: ${{ runner.temp }}/libvips-debs
         key: ${{ steps.libvips-cache-key.outputs.key }}
@@ -66,7 +68,7 @@ runs:
           # and the cache step then cannot read them, so the save failed and the
           # cache stayed empty on every run. Hand the dir back before the step
           # (and any early exit) finishes.
-          trap 'sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/libvips-debs" 2>/dev/null || true' EXIT
+          trap 'sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/libvips-debs" 2>/dev/null || echo "::warning::could not chown the libvips deb cache; the save may be skipped"' EXIT
           # The restore has no fallback keys, so packages are present only when
           # they were saved on this runner image. apt then installs them as
           # local files without touching the network.
@@ -82,6 +84,16 @@ runs:
         sudo apt-get "${apt_options[@]}" update
         echo "installing libvips"
         sudo apt-get "${apt_options[@]}" install -y --no-install-recommends libvips-dev
+
+    # Saved only on a push to main, where the key (the runner image, not the
+    # commit) is shared with every PR. PR runs restore only, so a cold key
+    # cannot be raced into a duplicate save by every job in the run.
+    - name: Save the libvips packages
+      if: runner.environment == 'github-hosted' && github.event_name != 'pull_request' && steps.libvips-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ runner.temp }}/libvips-debs
+        key: ${{ steps.libvips-cache.outputs.cache-primary-key }}
 
     # setup-go's own cache is keyed on go.sum alone and written only on a
     # miss, so between dependency bumps every run restored a build cache
