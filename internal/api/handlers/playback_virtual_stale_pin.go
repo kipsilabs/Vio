@@ -162,6 +162,20 @@ func (h *PlaybackHandler) recoverStaleIdentityLessPinV3(
 	// the generation order the start order, and every write below carries this
 	// token.
 	generation := nextVirtualCacheGeneration()
+	// The recovery is a declared re-list: it bypasses the provider floor, so it
+	// must draw on the same per-listing budget as the sibling fallback and the
+	// other floor-bypassing recovery resolves. Without this bound a burst of
+	// dead-pin cold starts would re-list a failing provider without the shared
+	// backpressure the rest of recovery honors. Acquire before listing; a
+	// listing that answers with candidates clears the budget below, matching the
+	// fallback's accounting. An exhausted budget preserves the caller's terminal
+	// so the walk falls through to the same alternate rows it would otherwise.
+	recoveryKey := virtualRecoveryRelistKey(neutralKey, file.VirtualOwnerInstallationID)
+	if !virtualRecoveryRelists.allow(recoveryKey) {
+		slog.WarnContext(ctx, "virtual stale-pin recovery re-list budget exhausted; preserving the terminal",
+			"component", "api", "file_id", file.ID, "neutral_key", neutralKey)
+		return resolvedVirtualPlaybackSource{}, false
+	}
 	// Bound the whole recovery well under the walk's decision budget so the
 	// alternates the walk still has to try keep their time.
 	recoveryCtx, cancel := context.WithTimeout(ctx, virtualStalePinRecoveryBudget)
@@ -171,9 +185,16 @@ func (h *PlaybackHandler) recoverStaleIdentityLessPinV3(
 	)
 	if err != nil || len(streams) == 0 {
 		// An empty (or failed) listing is a transient outage, not a renumber.
-		// Preserve the caller's terminal.
+		// Preserve the caller's terminal. It deliberately does not clear the
+		// budget, so a provider that keeps answering [] still accumulates
+		// toward the bound instead of being re-listed on every press.
 		return resolvedVirtualPlaybackSource{}, false
 	}
+	// The provider answered with candidates, so this re-list is no longer
+	// defeating a provider fail-fast: clear the budget so a later failure starts
+	// from a full window. Cleared before the downstream gates below, exactly as
+	// the sibling fallback clears once a listing answers.
+	virtualRecoveryRelists.clear(recoveryKey)
 	// The pin must be absent from the live listing. If it is still listed the
 	// ordinary resolve owns it and a recovery would only mask a different fault.
 	for _, stream := range streams {

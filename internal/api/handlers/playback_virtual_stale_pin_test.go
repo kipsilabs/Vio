@@ -1038,3 +1038,79 @@ func TestStalePinRecoveryPersistsOnlyAgainstExistingOwner(t *testing.T) {
 		}
 	})
 }
+
+// TestStalePinRecoveryReListHonorsSharedDamper proves the recovery's re-list is
+// bounded by the same per-provider budget the sibling fallback uses: once the
+// damper is exhausted the recovery yields deterministically instead of listing,
+// with no sleep and no side effects. It also proves the recovery is what spends
+// that budget, so a burst of dead-pin starts cannot re-list a failing provider
+// without the shared backpressure.
+func TestStalePinRecoveryReListHonorsSharedDamper(t *testing.T) {
+	resetVirtualRecoveryRelists(t)
+	const neutral = "virtual://movie/tt-stale-damper"
+	row := stalePinRow(25, "movie-stale-damper", neutral, "STALE")
+	live := []VirtualPlaybackStream{stalePinLiveStream(neutral, "NEW", row.FileSize, "h264")}
+
+	// A full budget admits the recovery once and spends exactly one re-list.
+	// A successful listing clears the key, so use a first recovery that answers
+	// empty to keep the spent mark, then a second recovery must be denied.
+	fxEmpty := newStalePinRecoveryFixture(neutral+"?result=STALE", stalePinRecoveryHandlerOpts{probeDuration: row.Duration})
+	for i := 0; i < virtualRecoveryRelistMax; i++ {
+		if _, ok := fxEmpty.handler.recoverStaleIdentityLessPinV3(stalePinRecoveryRequest(), row, "profile-1"); ok {
+			t.Fatalf("recovery %d answered an empty listing but reported success", i+1)
+		}
+	}
+	if got := fxEmpty.listCalls.Load(); got != int32(virtualRecoveryRelistMax) {
+		t.Fatalf("listings = %d, want %d: an empty answer must accumulate toward the damper", got, virtualRecoveryRelistMax)
+	}
+
+	// The budget is now exhausted. A fingerprint-matched recovery must not even
+	// list: the damper is what stops it, deterministically and without sleeping.
+	fx := newStalePinRecoveryFixture(neutral+"?result=STALE", stalePinRecoveryHandlerOpts{
+		live:          live,
+		probeDuration: row.Duration,
+	})
+	recovered, ok := fx.handler.recoverStaleIdentityLessPinV3(stalePinRecoveryRequest(), row, "profile-1")
+	if ok {
+		t.Fatalf("recovery = %#v, want the terminal preserved once the shared damper is exhausted", recovered)
+	}
+	if got := fx.listCalls.Load(); got != 0 {
+		t.Fatalf("listings = %d, want 0: an exhausted budget must not re-list the provider", got)
+	}
+	if got := fx.resolveCalls.Load(); got != 0 {
+		t.Fatalf("resolves = %d, want 0 after a denied recovery re-list", got)
+	}
+	if got := fx.handler.peekVirtualSticky(fx.stickyKey(row)); got != "" {
+		t.Fatalf("sticky pin = %q, want none after a denied recovery re-list", got)
+	}
+	if got := virtualResultCandidateID(row.FilePath); got != "STALE" {
+		t.Fatalf("catalog row pin = %q, want the durable STALE unchanged", got)
+	}
+}
+
+// TestStalePinRecoveryReListClearsBudgetOnAnswer proves the recovery uses the
+// fallback's accounting exactly: a listing that answers with candidates is no
+// longer defeating a provider fail-fast, so the recovery clears the key and a
+// later failure starts from a full budget. A listing that answers empty
+// deliberately keeps the mark, which the damper test above exercises.
+func TestStalePinRecoveryReListClearsBudgetOnAnswer(t *testing.T) {
+	resetVirtualRecoveryRelists(t)
+	const neutral = "virtual://movie/tt-stale-clear-budget"
+	row := stalePinRow(26, "movie-stale-clear-budget", neutral, "STALE")
+	live := []VirtualPlaybackStream{stalePinLiveStream(neutral, "NEW", row.FileSize, "h264")}
+	fx := newStalePinRecoveryFixture(neutral+"?result=STALE", stalePinRecoveryHandlerOpts{
+		live:          live,
+		probeDuration: row.Duration,
+	})
+
+	if _, ok := fx.handler.recoverStaleIdentityLessPinV3(stalePinRecoveryRequest(), row, "profile-1"); !ok {
+		t.Fatal("the unique fingerprint match should recover")
+	}
+	recoveryKey := virtualRecoveryRelistKey(neutral, row.VirtualOwnerInstallationID)
+	virtualRecoveryRelists.mu.Lock()
+	_, marked := virtualRecoveryRelists.marks[recoveryKey]
+	virtualRecoveryRelists.mu.Unlock()
+	if marked {
+		t.Fatal("an answered recovery listing must clear the key so a later failure starts from a full budget")
+	}
+}
