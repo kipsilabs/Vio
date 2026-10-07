@@ -47,3 +47,17 @@ func TestApplyItemImageReturnsExactImmutableRevision(t *testing.T) {
 		t.Fatalf("Revision = %q, want new-revision", result.Revision)
 	}
 }
+
+// TestImageTypeFromStringTitlecardAliasesStill pins that the client-facing
+// "titlecard" name and the pipeline's "still" resolve to the same image type,
+// so an episode title card is stored and validated as the episode's still.
+func TestImageTypeFromStringTitlecardAliasesStill(t *testing.T) {
+	for _, name := range []string{"still", "titlecard"} {
+		if got := ImageTypeFromString(name); got != ImageStill {
+			t.Errorf("ImageTypeFromString(%q) = %v, want ImageStill", name, got)
+		}
+	}
+	if ImageTypeToString(ImageStill) != "still" {
+		t.Fatalf("ImageTypeToString(ImageStill) = %q, want still", ImageTypeToString(ImageStill))
+	}
+}

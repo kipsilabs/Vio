@@ -6003,6 +6003,10 @@
             "type": "string"
           },
           "type": {
+            "description": "One of poster, backdrop, logo, still, or titlecard. still and titlecard name the same episode title card and are accepted only for an episode; a movie, series, or season is refused with 400 unsupported_image_type. An episode stores any applied image as its still.",
+            "examples": [
+              "poster"
+            ],
             "maxLength": 100,
             "minLength": 1,
             "type": "string"
@@ -23382,6 +23386,9 @@
             "type": "string"
           },
           "poster_url": {
+            "type": "string"
+          },
+          "still_url": {
             "type": "string"
           }
         },

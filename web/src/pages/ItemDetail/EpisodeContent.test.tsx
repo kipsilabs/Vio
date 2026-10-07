@@ -467,6 +467,120 @@ describe("EpisodeContent", () => {
     });
   });
 
+  it("shows the episode's own title card as the hero backdrop", () => {
+    renderToStaticMarkup(
+      <MemoryRouter initialEntries={["/item/episode-1"]}>
+        <EpisodeContent
+          item={makeEpisodeItem({
+            poster_url: "/stills/episode-1.webp",
+            poster_thumbhash: "still-thumbhash",
+            backdrop_url: "/backdrops/series.webp",
+            backdrop_thumbhash: "backdrop-thumbhash",
+          })}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(mocks.capturedDetailHeroProps.value).toMatchObject({
+      backdropUrl: "/stills/episode-1.webp",
+      backdropThumbhash: "still-thumbhash",
+    });
+  });
+
+  it("keeps the series backdrop when the episode has no title card of its own", () => {
+    renderToStaticMarkup(
+      <MemoryRouter initialEntries={["/item/episode-1"]}>
+        <EpisodeContent
+          item={makeEpisodeItem({
+            backdrop_url: "/backdrops/series.webp",
+            backdrop_thumbhash: "backdrop-thumbhash",
+          })}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(mocks.capturedDetailHeroProps.value).toMatchObject({
+      backdropUrl: "/backdrops/series.webp",
+      backdropThumbhash: "backdrop-thumbhash",
+    });
+  });
+
+  it("shows the preferred still with no placeholder even though the backdrop has a thumbhash", () => {
+    renderToStaticMarkup(
+      <MemoryRouter initialEntries={["/item/episode-1"]}>
+        <EpisodeContent
+          item={makeEpisodeItem({
+            poster_url: "/stills/episode-1.webp",
+            poster_thumbhash: "",
+            backdrop_url: "/backdrops/series.webp",
+            backdrop_thumbhash: "backdrop-thumbhash",
+          })}
+        />
+      </MemoryRouter>,
+    );
+
+    // The URL picks the still, so the placeholder must be the still's — empty,
+    // not the series backdrop's hash for a different image.
+    expect(mocks.capturedDetailHeroProps.value).toMatchObject({
+      backdropUrl: "/stills/episode-1.webp",
+      backdropThumbhash: "",
+    });
+  });
+
+  it("ignores an orphaned still thumbhash when the still URL is absent", () => {
+    renderToStaticMarkup(
+      <MemoryRouter initialEntries={["/item/episode-1"]}>
+        <EpisodeContent
+          item={makeEpisodeItem({
+            poster_url: "",
+            poster_thumbhash: "orphan-still-thumbhash",
+            backdrop_url: "/backdrops/series.webp",
+            backdrop_thumbhash: "backdrop-thumbhash",
+          })}
+        />
+      </MemoryRouter>,
+    );
+
+    // With no still URL the source is the series backdrop, so the hash must not
+    // leak across from the unselected still.
+    expect(mocks.capturedDetailHeroProps.value).toMatchObject({
+      backdropUrl: "/backdrops/series.webp",
+      backdropThumbhash: "backdrop-thumbhash",
+    });
+  });
+
+  it("falls back to the season episode row's still when the detail carries no artwork", () => {
+    mocks.useSeasonEpisodes.mockReturnValue({
+      data: {
+        episodes: [
+          {
+            content_id: "episode-1",
+            season_number: 1,
+            episode_number: 1,
+            title: "Pilot",
+            overview: "",
+            air_date: null,
+            runtime: 42,
+            still_url: "/stills/row.webp",
+            still_thumbhash: "row-thumbhash",
+            files: [],
+          },
+        ],
+      },
+    });
+
+    renderToStaticMarkup(
+      <MemoryRouter initialEntries={["/item/episode-1"]}>
+        <EpisodeContent item={makeEpisodeItem()} />
+      </MemoryRouter>,
+    );
+
+    expect(mocks.capturedDetailHeroProps.value).toMatchObject({
+      backdropUrl: "/stills/row.webp",
+      backdropThumbhash: "row-thumbhash",
+    });
+  });
+
   it("shows all season episodes in the carousel, not just nearby ones", () => {
     const allEpisodes = Array.from({ length: 10 }, (_, i) => ({
       content_id: `ep-${i + 1}`,
