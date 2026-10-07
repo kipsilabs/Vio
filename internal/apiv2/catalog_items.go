@@ -390,6 +390,20 @@ type CatalogItemDetail struct {
 	Audiobook                       *catalogpkg.AudiobookDetailExtension `json:"audiobook,omitempty"`
 	Ebook                           *catalogpkg.EbookDetailExtension     `json:"ebook,omitempty"`
 	Manga                           *catalogpkg.MangaDetailExtension     `json:"manga,omitempty"`
+	// Collections are the visible collections this item belongs to: the
+	// title page's "Collections" row, each linking to the collection's view.
+	// Present on every v2 item detail, as an empty array when the item is in
+	// none.
+	Collections []ItemCollection `json:"collections" doc:"Visible collections containing this item (movies and series); empty, never null"`
+}
+
+// ItemCollection is one collection a title page lists under Collections.
+type ItemCollection struct {
+	ID              string `json:"id" example:"01J9Z8C3W4R5T6Y7U8I9O0P1Q2"`
+	Title           string `json:"title" example:"Dune Saga"`
+	PosterURL       string `json:"poster_url" doc:"Presigned, short-lived; empty when none"`
+	PosterThumbhash string `json:"poster_thumbhash,omitempty"`
+	ItemCount       int    `json:"item_count" example:"3"`
 }
 
 // CatalogRatingSource is one source's rating of an item.
@@ -603,6 +617,7 @@ func registerCatalogItems(reg *Registry) {
 		"The episodes of one season of a series by number.")), reg.listSeasonEpisodes)
 	registerCatalogActions(reg)
 	registerRatingsCapability(reg)
+	registerItemCollectionsCapability(reg)
 }
 
 // --- helpers ---
@@ -1116,6 +1131,7 @@ func (reg *Registry) getCatalogItem(ctx context.Context, in *CatalogItemInput) (
 		return nil, serviceProblem(err)
 	}
 	out := catalogItemDetailOf(detail, reg.ratingSelection(ctx))
+	out.Collections = NonNil(reg.itemCollections(ctx, detail, viewer.Access))
 	if reg.deps.ThemeSongs != nil && (detail.Type == themeOwnerMovie || detail.Type == themeOwnerSeries || detail.Type == themeOwnerSeason || detail.Type == themeOwnerEpisode) {
 		themes, err := reg.deps.ThemeSongs.Discover(ctx, in.ID, true, viewer.Access)
 		if err != nil {
@@ -1128,6 +1144,43 @@ func (reg *Registry) getCatalogItem(ctx context.Context, in *CatalogItemInput) (
 		}
 	}
 	return &CatalogItemDetailOutput{Body: out}, nil
+}
+
+// itemCollections answers the item's collections for the detail page. It is
+// best-effort: when the index service is not wired, or the lookup fails, the
+// result is nil and the detail page still succeeds with an empty row,
+// following the theme lookup's non-fatal contract.
+//
+// Collections store movies and series; an episode contributes its parent
+// series id, and a season contributes its series. Other types (audiobooks,
+// ebooks) have no collection membership and answer empty.
+func (reg *Registry) itemCollections(ctx context.Context, detail *catalogpkg.ItemDetail, access catalogpkg.AccessFilter) []ItemCollection {
+	index, ok := reg.deps.LibraryCollections.(ItemCollectionIndex)
+	if !ok || index == nil || detail == nil {
+		return nil
+	}
+	var membership string
+	switch detail.Type {
+	case themeOwnerMovie, themeOwnerSeries:
+		membership = detail.ContentID
+	case themeOwnerEpisode, themeOwnerSeason:
+		membership = detail.SeriesID
+	default:
+		return nil
+	}
+	if membership == "" {
+		return nil
+	}
+	views, err := index.ItemCollections(ctx, membership, access)
+	if err != nil {
+		slog.WarnContext(ctx, "catalog item collections lookup failed", "component", "apiv2", "item_id", detail.ContentID, "error", err)
+		return nil
+	}
+	out := make([]ItemCollection, 0, len(views))
+	for _, c := range views {
+		out = append(out, ItemCollection{ID: c.ID, Title: c.Title, PosterURL: c.PosterURL, PosterThumbhash: c.PosterThumbhash, ItemCount: c.ItemCount})
+	}
+	return out
 }
 
 func (reg *Registry) listCatalogItemVersions(ctx context.Context, in *CatalogItemInput) (*FileVersionCollectionOutput, error) {
@@ -1340,7 +1393,7 @@ func catalogItemDetailOf(d *catalogpkg.ItemDetail, sel ratingsources.Selection) 
 		FolderPaths: d.FolderPaths, Subtitles: NonNil(d.Subtitles), Intro: d.Intro, Credits: d.Credits, Recap: d.Recap, Preview: d.Preview,
 		EffectiveVersionResolution: d.EffectiveVersionResolution,
 		EffectiveVersionHDR:        d.EffectiveVersionHDR, EffectiveVersionCodecVideo: d.EffectiveVersionCodecVideo, EffectiveVersionEditionKey: d.EffectiveVersionEditionKey,
-		Audiobook: d.Audiobook, Ebook: d.Ebook, Manga: d.Manga,
+		Audiobook: d.Audiobook, Ebook: d.Ebook, Manga: d.Manga, Collections: []ItemCollection{},
 	}
 	if d.EffectiveSubtitleTrackSignature != nil {
 		out.EffectiveSubtitleTrackSignature = watchSignatureOf(*d.EffectiveSubtitleTrackSignature)

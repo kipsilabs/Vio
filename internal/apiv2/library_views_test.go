@@ -11,6 +11,7 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/adminjob"
 	"github.com/Silo-Server/silo-server/internal/api/handlers"
+	catalogpkg "github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/usercollections"
 )
@@ -121,6 +122,17 @@ func (f *fakeLibraryAdmin) SetLibraryProviders(_ context.Context, id int, levels
 
 type fakeLibraryViews struct {
 	err error
+	// collections backs ItemCollections; empty answers an empty slice.
+	collections     []handlers.ItemCollectionView
+	lastCollections string
+}
+
+func (f *fakeLibraryViews) ItemCollections(_ context.Context, membership string, _ catalogpkg.AccessFilter) ([]handlers.ItemCollectionView, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	f.lastCollections = membership
+	return f.collections, nil
 }
 
 func fakeCard() handlers.SectionItemView {

@@ -6555,6 +6555,44 @@
       "body_file": "get_image_capabilities_ok.json"
     },
     {
+      "name": "get_item_collections_capability_authentication_required",
+      "operation_id": "getItemCollectionsCapability",
+      "scenario": "The item-collections capability document without a credential.",
+      "request": {
+        "method": "GET",
+        "path": "/api/v2/capabilities/item-collections"
+      },
+      "expected_status": 401,
+      "response_headers": {
+        "Cache-Control": "no-store",
+        "Content-Type": "application/problem+json"
+      },
+      "response_media_type": "application/problem+json",
+      "schema": "#/components/schemas/Problem",
+      "body_file": "get_item_collections_capability_authentication_required.json"
+    },
+    {
+      "name": "get_item_collections_capability_ok",
+      "operation_id": "getItemCollectionsCapability",
+      "scenario": "The item-collections capability document on a server whose item detail carries the collections row.",
+      "request": {
+        "method": "GET",
+        "path": "/api/v2/capabilities/item-collections",
+        "headers": {
+          "Authorization": "Bearer tok-member",
+          "X-Profile-Id": "p-owner"
+        }
+      },
+      "expected_status": 200,
+      "response_headers": {
+        "Cache-Control": "private, no-cache",
+        "Content-Type": "application/json"
+      },
+      "response_media_type": "application/json",
+      "schema": "#/components/schemas/ItemCollectionsCapability",
+      "body_file": "get_item_collections_capability_ok.json"
+    },
+    {
       "name": "get_item_markers_ok",
       "operation_id": "getItemMarkers",
       "scenario": "Synthetic marker projection; supplied segments update or clear while omitted segments remain unchanged.",

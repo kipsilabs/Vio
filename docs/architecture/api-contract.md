@@ -1568,6 +1568,16 @@ contract; an unconfigured action is `409 capability_not_configured` rather than 
 with `limit` validated `1..100`, integer identifiers are strings, and the work document's lists are
 empty arrays rather than `null`.
 
+**Section catalog-items (Phase 4), stage C.** `getCatalogItem` gained the additive `collections`
+member — the visible server collections a movie or series belongs to, with `id`, `title`,
+`poster_url`, and `item_count` — plus its feature document `getItemCollectionsCapability`
+(`/capabilities/item-collections`, `available` when the collection index is wired, `unsupported`
+otherwise). There is no v1 counterpart, so no new ledger row. The reverse lookup reuses
+`library_collection_items` (`LibraryCollectionRepository.ListContainingItem`); the reader filters
+by `CanAccessLibraryCollection` and resolves posters through the same viewer-aware path as the
+library Collections tab, so a hidden or out-of-scope collection never leaks. An episode or season
+detail answers its parent series' collections, because only movies and series can be members.
+
 ## v1 lifecycle and release sequence
 
 1. Freeze v1 feature development. Critical fixes needed to keep the bridge usable may still land;

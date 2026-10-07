@@ -962,6 +962,14 @@ type LibraryCollectionService interface {
 	LibraryUserCollections(ctx context.Context, libraryID, userID int, profileID string) ([]usercollections.ServerVisibleCollection, error)
 }
 
+// ItemCollectionIndex is the reverse membership lookup item detail adds as
+// its "collections" field. It is a narrow type assertion on the same
+// *handlers.LibraryCollectionHandler, so adding the capability does not widen
+// LibraryCollectionService for every existing fake.
+type ItemCollectionIndex interface {
+	ItemCollections(ctx context.Context, membership string, access mediacatalog.AccessFilter) ([]handlers.ItemCollectionView, error)
+}
+
 // CalendarService is the slice of *handlers.CalendarHandler getCalendar uses.
 type CalendarService interface {
 	Calendar(ctx context.Context, q handlers.CalendarQuery, access mediacatalog.AccessFilter) (handlers.CalendarView, error)

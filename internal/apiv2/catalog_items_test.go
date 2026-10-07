@@ -108,6 +108,10 @@ func (f *fakeCatalog) ItemDetail(_ context.Context, v handlers.ItemViewer, id st
 		return nil, f.err
 	}
 	f.lastViewer = v
+	if id == "episode:severance-s01e01" {
+		return &catalogpkg.ItemDetail{ContentID: id, Type: "episode", Title: "Good News About Hell", SeriesID: "series:severance",
+			Genres: []string{}, Cast: []catalogpkg.CastCredit{}, Crew: []catalogpkg.CrewCredit{}, Versions: []catalogpkg.FileVersion{}, Subtitles: []catalogpkg.SubtitleInfo{}}, nil
+	}
 	if id != "movie:heat-1995" {
 		return nil, notFoundItem()
 	}
@@ -648,5 +652,50 @@ func TestGetCatalogItemScopesVersionsToLibraryWhenEnabled(t *testing.T) {
 	}
 	if fake.lastViewer.Access.ScopeFilesToLibrary {
 		t.Fatalf("viewer = %+v", fake.lastViewer.Access)
+	}
+}
+
+// TestGetCatalogItemCarriesCollections pins the additive item detail
+// "collections" row: a movie's detail fetches the reverse lookup with its own
+// content id, an episode resolves to its parent series, the chips carry
+// poster and count, and an item in none answers an empty array, never null.
+func TestGetCatalogItemCarriesCollections(t *testing.T) {
+	deps, _ := catalogDeps(t)
+	fake := deps.LibraryCollections.(*fakeLibraryViews)
+	fake.collections = []handlers.ItemCollectionView{{ID: "alpha", Title: "Dune Saga", PosterURL: "https://cdn.example.test/alpha.jpg", ItemCount: 3}}
+	h := newTestHandler(t, deps)
+
+	rec := do(t, h, http.MethodGet, "/api/v2/catalog/items/movie:heat-1995", "", viewerHeaders())
+	if rec.Code != http.StatusOK {
+		t.Fatal(rec.Code, rec.Body.String())
+	}
+	var movie CatalogItemDetail
+	decodeJSON(t, rec.Body, &movie)
+	if fake.lastCollections != "movie:heat-1995" {
+		t.Fatalf("lookup = %q, want the movie id", fake.lastCollections)
+	}
+	if len(movie.Collections) != 1 || movie.Collections[0].ID != "alpha" || movie.Collections[0].Title != "Dune Saga" ||
+		movie.Collections[0].ItemCount != 3 || movie.Collections[0].PosterURL != "https://cdn.example.test/alpha.jpg" {
+		t.Fatalf("movie collections = %+v", movie.Collections)
+	}
+
+	rec = do(t, h, http.MethodGet, "/api/v2/catalog/items/episode:severance-s01e01", "", viewerHeaders())
+	if rec.Code != http.StatusOK {
+		t.Fatal(rec.Code, rec.Body.String())
+	}
+	var episode CatalogItemDetail
+	decodeJSON(t, rec.Body, &episode)
+	if fake.lastCollections != "series:severance" {
+		t.Fatalf("episode lookup = %q, want the parent series id", fake.lastCollections)
+	}
+	if len(episode.Collections) != 1 || episode.Collections[0].ID != "alpha" {
+		t.Fatalf("episode collections = %+v", episode.Collections)
+	}
+
+	// An item in no collection answers an empty array, not null.
+	fake.collections = nil
+	rec = do(t, h, http.MethodGet, "/api/v2/catalog/items/movie:heat-1995", "", viewerHeaders())
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"collections":[]`) {
+		t.Fatalf("empty collections = %s", rec.Body.String())
 	}
 }

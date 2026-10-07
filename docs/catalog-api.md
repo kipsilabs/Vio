@@ -564,6 +564,31 @@ book libraries, never carry an advisory age, so the limit never hides them.
 
 Frozen v1 responses do not expose these fields.
 
+## Collections on title pages
+
+The v2 item detail of a movie or series carries `collections`, the visible
+server collections the item belongs to. Each entry has:
+
+- `id`: the collection id, used to open its full item list
+  (`listCatalogItems?source=library_collection&collection_id=<id>`).
+- `title`: the collection's display name.
+- `poster_url`: the collection's poster, presigned and short-lived, empty when
+  it has none.
+- `item_count`: the collection's member count.
+
+The list is present on every v2 item detail as an array, empty when the item is
+in none. Only movies and series can be members, so an episode detail answers
+its parent series' collections and a season detail answers its series'. A
+collection the viewer's library scope cannot reach, and a hidden collection,
+are never listed. The `poster_url` follows the same viewer rule as the library
+Collections tab: an uploaded or template poster is shared, while a generated
+collage shows only members the viewer can access.
+
+`GET /api/v2/capabilities/item-collections` is the feature-detection document.
+It answers `state: available` on a server whose item detail carries
+`collections`, and `unsupported` otherwise. Clients that omit the row on an
+older server without the operation keep their existing behavior.
+
 ## Ratings on title pages
 
 Every client shows a title's external ratings the same way: the v2 item detail
