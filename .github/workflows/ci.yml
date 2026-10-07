@@ -289,6 +289,57 @@ jobs:
       - name: Test
         run: make test-go
 
+  # DB-backed tests that need the full pgvector schema migrated before they
+  # run. They used to sit in the full-tree lint job, which provides no Postgres
+  # service and no SILO_TEST_DATABASE_URL: every one skipped while still paying
+  # its compile time on the critical path. They run here instead, in their own
+  # database job, in parallel with the rest of the gate.
+  go-integration:
+    name: Go integration
+    runs-on: ubuntu-latest
+    services:
+      integration-postgres:
+        # pgvector, not stock postgres: the migrations and the taste-cluster
+        # tests need the vector extension.
+        image: pgvector/pgvector:pg18
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: silo_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d silo_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      SILO_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/silo_test?sslmode=disable
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: ./.github/actions/setup-go
+        with:
+          cache-name: integration
+
+      # The tests below read the migrated base schema (media_items, admin_jobs,
+      # ...), so the database is migrated once before they run.
+      - name: Migrate the test database
+        run: DATABASE_URL="$SILO_TEST_DATABASE_URL" SECRET_KEY="$(openssl rand -base64 48)" go run ./cmd/silo/ --migrate-only
+
+      - name: Test image cache cleanup resumption against Postgres
+        run: go test -race -count=1 -run '^(TestImageCacheCleanup|TestRequeuedImageCacheCleanup|TestJobOutcomeIsRecorded)' ./internal/adminjob/
+
+      - name: Test taste cluster replacement against Postgres
+        run: go test -race -count=1 -run '^TestUpsertTasteClusters.*Postgres$' ./internal/recommendations/
+
+      - name: Test Jellyfin detail preferences against Postgres
+        run: go test -race -count=1 -run '^TestCompatDetailServiceResolvesViewerSubtitleDefaultsPostgres$' ./cmd/silo/
+
   lint:
     name: Go lint (changed lines)
     runs-on: ubuntu-latest
@@ -363,9 +414,9 @@ jobs:
 
   # The inventory's lint rule (recovering a router from a handler) has to hold
   # over the whole tree, not only the lines a branch touched: an old line
-  # folded in by a rebase is as much of a hole as a new one. It re-analyzes
-  # the tree from scratch, so it runs as its own lane rather than behind the
-  # changed-lines lint.
+  # folded in by a rebase is as much of a hole as a new one. It runs as its own
+  # lane rather than behind the changed-lines lint; the build and analysis
+  # caches below keep the full-tree pass cheap.
   lint-router-recovery:
     name: Go lint (router recovery, full tree)
     runs-on: ubuntu-latest
@@ -376,24 +427,15 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Install libvips
-        run: |
-          test -f /etc/apt/sources.list.d/ubuntu.sources
-          apt_options=(
-            -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources
-            -o Dir::Etc::sourceparts=-
-          )
-          sudo apt-get "${apt_options[@]}" update
-          sudo apt-get "${apt_options[@]}" install -y --no-install-recommends libvips-dev
-
+      # The composite action installs libvips, sets up the Go toolchain, stubs
+      # the embedded frontend bundle, and restores a per-commit build and module
+      # cache. That last part is what pre-warms the build cache the full-tree
+      # type-check reuses; a bare setup-go here restored only its own stale
+      # go.sum-keyed cache instead.
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: ./.github/actions/setup-go
         with:
-          go-version-file: go.mod
-          cache: true
-
-      - name: Stub the embedded frontend bundle
-        run: make embed-stub
+          cache-name: lint-router-recovery
 
       # The toolchain the binary was built with matters: a golangci-lint
       # binary refuses a host Go newer than the one it was built against, so
@@ -419,17 +461,23 @@ jobs:
       - name: Put golangci-lint on PATH
         run: echo "$HOME/bin" >> "$GITHUB_PATH"
 
+      # golangci-lint caches per-package analysis and facts. Without restoring
+      # that cache this job re-analyzed the whole tree from scratch every run
+      # (~14 min), while the go-lint job runs the identical command over a
+      # restored cache in under a minute. The cache is saved under a
+      # job-specific key and restored from the shared prefix, so it also picks
+      # up the cache the go-lint job writes.
+      - name: Restore the golangci-lint analysis cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/golangci-lint
+          key: golangci-lint-cache-router-${{ runner.os }}-${{ env.GOLANGCI_LINT_VERSION }}-${{ github.sha }}
+          restore-keys: |
+            golangci-lint-cache-router-${{ runner.os }}-${{ env.GOLANGCI_LINT_VERSION }}-
+            golangci-lint-cache-${{ runner.os }}-${{ env.GOLANGCI_LINT_VERSION }}-
+
       - name: Lint router recovery full-tree
         run: make lint-router-recovery
-
-      - name: Test taste cluster replacement against Postgres
-        run: go test -race -count=1 -run '^TestUpsertTasteClusters.*Postgres$' ./internal/recommendations/
-
-      - name: Test Jellyfin detail preferences against Postgres
-        run: go test -race -count=1 -run '^TestCompatDetailServiceResolvesViewerSubtitleDefaultsPostgres$' ./cmd/silo/
-
-      - name: Test image cache cleanup resumption against Postgres
-        run: go test -race -count=1 -run '^(TestImageCacheCleanup|TestRequeuedImageCacheCleanup|TestJobOutcomeIsRecorded)' ./internal/adminjob/
 
   web:
     name: Web
