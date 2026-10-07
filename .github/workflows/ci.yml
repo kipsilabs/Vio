@@ -29,13 +29,14 @@ env:
 permissions:
   contents: read
 
-# The Go-side work is split across three parallel jobs: build+verify+test,
-# lint of the lines a branch touched, and the full-tree router-recovery lint.
-# They recompile the same tree in different ways and each dominated the old
-# single-job run, so running them side by side costs one tree build instead
-# of three in sequence. Every check runs unchanged; only the scheduling
-# differs. docker.yml triggers on this workflow's success for main/apiv2, so
-# the workflow name and its overall success semantics must not change.
+# The Go-side work is split across parallel jobs: build+verify+test, lint of
+# the lines a branch touched, the full-tree router-recovery lint, and the
+# DB-backed integration tests. They recompile the same tree in different ways
+# and each dominated the old single-job run, so running them side by side
+# costs one tree build instead of several in sequence. Every check runs
+# unchanged; only the scheduling differs. docker.yml triggers on this
+# workflow's success for main/apiv2, so the workflow name and its overall
+# success semantics must not change.
 jobs:
   # The Go gate is three jobs so that lint, the contract checks, and the test
   # suite run side by side; each one alone is shorter than the serial job they
