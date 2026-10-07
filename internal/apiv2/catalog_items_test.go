@@ -3,6 +3,7 @@ package apiv2
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -108,6 +109,18 @@ func (f *fakeCatalog) ItemDetail(_ context.Context, v handlers.ItemViewer, id st
 		return nil, f.err
 	}
 	f.lastViewer = v
+	if id == "episode:severance-s01e01" {
+		return &catalogpkg.ItemDetail{ContentID: id, Type: "episode", Title: "Good News About Hell", SeriesID: "series:severance",
+			Genres: []string{}, Cast: []catalogpkg.CastCredit{}, Crew: []catalogpkg.CrewCredit{}, Versions: []catalogpkg.FileVersion{}, Subtitles: []catalogpkg.SubtitleInfo{}}, nil
+	}
+	if id == "series:severance-S01" {
+		return &catalogpkg.ItemDetail{ContentID: id, Type: "season", Title: "Season 1", SeriesID: "series:severance",
+			Genres: []string{}, Cast: []catalogpkg.CastCredit{}, Crew: []catalogpkg.CrewCredit{}, Versions: []catalogpkg.FileVersion{}, Subtitles: []catalogpkg.SubtitleInfo{}}, nil
+	}
+	if id == "series:severance" {
+		return &catalogpkg.ItemDetail{ContentID: id, Type: "series", Title: "Severance",
+			Genres: []string{}, Cast: []catalogpkg.CastCredit{}, Crew: []catalogpkg.CrewCredit{}, Versions: []catalogpkg.FileVersion{}, Subtitles: []catalogpkg.SubtitleInfo{}}, nil
+	}
 	if id != "movie:heat-1995" {
 		return nil, notFoundItem()
 	}
@@ -648,5 +661,92 @@ func TestGetCatalogItemScopesVersionsToLibraryWhenEnabled(t *testing.T) {
 	}
 	if fake.lastViewer.Access.ScopeFilesToLibrary {
 		t.Fatalf("viewer = %+v", fake.lastViewer.Access)
+	}
+}
+
+// TestGetCatalogItemCarriesCollections pins the additive item detail
+// "collections" row: a movie's detail fetches the reverse lookup with its own
+// content id under the viewer's resolved access filter, an episode and a
+// season resolve to their parent series, the chips carry poster and count, an
+// item in none answers an empty array, never null, and a lookup failure leaves
+// the detail a success with an empty row.
+func TestGetCatalogItemCarriesCollections(t *testing.T) {
+	deps, _ := catalogDeps(t)
+	fake := deps.LibraryCollections.(*fakeLibraryViews)
+	fake.collections = []handlers.ItemCollectionView{{ID: "alpha", Title: "Dune Saga", PosterURL: "https://cdn.example.test/alpha.jpg", ItemCount: 3}}
+	h := newTestHandler(t, deps)
+
+	rec := do(t, h, http.MethodGet, "/api/v2/catalog/items/movie:heat-1995", "", viewerHeaders())
+	if rec.Code != http.StatusOK {
+		t.Fatal(rec.Code, rec.Body.String())
+	}
+	var movie CatalogItemDetail
+	decodeJSON(t, rec.Body, &movie)
+	if fake.lastCollections != "movie:heat-1995" {
+		t.Fatalf("lookup = %q, want the movie id", fake.lastCollections)
+	}
+	// The viewer's resolved access filter reaches the lookup; the fake catalog
+	// resolves allowed libraries {1, 2}.
+	if got := fake.lastCollectionsAccess.AllowedLibraryIDs; len(got) != 2 || got[0] != 1 || got[1] != 2 {
+		t.Fatalf("lookup access = %+v, want allowed libraries [1 2]", fake.lastCollectionsAccess)
+	}
+	if len(movie.Collections) != 1 || movie.Collections[0].ID != "alpha" || movie.Collections[0].Title != "Dune Saga" ||
+		movie.Collections[0].ItemCount != 3 || movie.Collections[0].PosterURL != "https://cdn.example.test/alpha.jpg" {
+		t.Fatalf("movie collections = %+v", movie.Collections)
+	}
+
+	rec = do(t, h, http.MethodGet, "/api/v2/catalog/items/episode:severance-s01e01", "", viewerHeaders())
+	if rec.Code != http.StatusOK {
+		t.Fatal(rec.Code, rec.Body.String())
+	}
+	var episode CatalogItemDetail
+	decodeJSON(t, rec.Body, &episode)
+	if fake.lastCollections != "series:severance" {
+		t.Fatalf("episode lookup = %q, want the parent series id", fake.lastCollections)
+	}
+	if len(episode.Collections) != 1 || episode.Collections[0].ID != "alpha" {
+		t.Fatalf("episode collections = %+v", episode.Collections)
+	}
+
+	// A season answers its series' collections the same way.
+	rec = do(t, h, http.MethodGet, "/api/v2/catalog/items/series:severance-S01", "", viewerHeaders())
+	if rec.Code != http.StatusOK {
+		t.Fatal(rec.Code, rec.Body.String())
+	}
+	var season CatalogItemDetail
+	decodeJSON(t, rec.Body, &season)
+	if fake.lastCollections != "series:severance" {
+		t.Fatalf("season lookup = %q, want the parent series id", fake.lastCollections)
+	}
+	if len(season.Collections) != 1 || season.Collections[0].ID != "alpha" {
+		t.Fatalf("season collections = %+v", season.Collections)
+	}
+
+	// A series answers its own collections by its own id.
+	rec = do(t, h, http.MethodGet, "/api/v2/catalog/items/series:severance", "", viewerHeaders())
+	if rec.Code != http.StatusOK {
+		t.Fatal(rec.Code, rec.Body.String())
+	}
+	var series CatalogItemDetail
+	decodeJSON(t, rec.Body, &series)
+	if fake.lastCollections != "series:severance" {
+		t.Fatalf("series lookup = %q, want the series id itself", fake.lastCollections)
+	}
+	if len(series.Collections) != 1 || series.Collections[0].ID != "alpha" {
+		t.Fatalf("series collections = %+v", series.Collections)
+	}
+
+	// An item in no collection answers an empty array, not null.
+	fake.collections = nil
+	rec = do(t, h, http.MethodGet, "/api/v2/catalog/items/movie:heat-1995", "", viewerHeaders())
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"collections":[]`) {
+		t.Fatalf("empty collections = %s", rec.Body.String())
+	}
+
+	// A lookup failure is best-effort: the detail succeeds with an empty row.
+	fake.err = errors.New("boom")
+	rec = do(t, h, http.MethodGet, "/api/v2/catalog/items/movie:heat-1995", "", viewerHeaders())
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"collections":[]`) {
+		t.Fatalf("failed lookup collections = %d %s", rec.Code, rec.Body.String())
 	}
 }

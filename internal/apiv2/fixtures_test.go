@@ -1743,7 +1743,9 @@ func fixtureCases() []fixtureCase {
 	cases = append(cases, watchTrickplayFixtureCases()...)
 	cases = append(cases, adminTrickplayFixtureCases()...)
 	cases = append(cases, deviceSignInFixtureCases()...)
-	return append(cases, externalSignInFixtureCases()...)
+	cases = append(cases, externalSignInFixtureCases()...)
+	cases = append(cases, itemCollectionsCapabilityFixtureCases()...)
+	return cases
 }
 
 // deviceSignInFixtureCases covers the TV sign-in additions: the opened
@@ -1854,7 +1856,9 @@ func fixtureDeps() Dependencies {
 	deps.PermissionGates[policy.PermissionMetadataCuration] = adminTranslationGate
 	deps.LibraryJobs = &fixtureAdminCollectionJobs{fakeLibraryJobs: *deps.LibraryJobs.(*fakeLibraryJobs)}
 	deps.LibrarySections = &fakeLibraryViews{}
-	deps.LibraryCollections = &fakeLibraryViews{}
+	deps.LibraryCollections = &fakeLibraryViews{collections: []handlers.ItemCollectionView{{
+		ID: "oscar-winners", Title: "Oscar Winners", PosterURL: "https://cdn.example.invalid/oscar-winners.jpg", ItemCount: 12,
+	}}}
 	home := &fakeHome{}
 	deps.Calendar = home
 	deps.HomeDismissals = home

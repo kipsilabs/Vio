@@ -11,6 +11,7 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/adminjob"
 	"github.com/Silo-Server/silo-server/internal/api/handlers"
+	catalogpkg "github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/usercollections"
 )
@@ -121,6 +122,22 @@ func (f *fakeLibraryAdmin) SetLibraryProviders(_ context.Context, id int, levels
 
 type fakeLibraryViews struct {
 	err error
+	// collections backs ItemCollections; empty answers an empty slice.
+	collections []handlers.ItemCollectionView
+	// lastCollections, lastCollectionsAccess record what the reverse lookup
+	// received, so a test can prove the membership id and the viewer access
+	// filter are what the caller resolved.
+	lastCollections       string
+	lastCollectionsAccess catalogpkg.AccessFilter
+}
+
+func (f *fakeLibraryViews) ItemCollections(_ context.Context, membership string, access catalogpkg.AccessFilter) ([]handlers.ItemCollectionView, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	f.lastCollections = membership
+	f.lastCollectionsAccess = access
+	return f.collections, nil
 }
 
 func fakeCard() handlers.SectionItemView {

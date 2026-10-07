@@ -573,4 +573,38 @@ describe("MovieContent", () => {
     expect(firstCall?.[0]).toEqual([expect.objectContaining({ file_id: 2 })]);
     expect(firstCall?.[1]).toBe(true);
   });
+
+  it("renders a Collections row when the movie belongs to collections", () => {
+    const markup = renderToStaticMarkup(
+      <MemoryRouter initialEntries={["/item/movie-1"]}>
+        <MovieContent
+          item={makeMovieItem({
+            collections: [
+              {
+                id: "oscar-winners",
+                title: "Oscar Winners",
+                poster_url: "/collections/oscar-winners.jpg",
+                item_count: 12,
+              },
+            ],
+          })}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(markup).toContain("Oscar Winners");
+    expect(markup).toContain("12 items");
+    expect(markup).toContain("collection_id=oscar-winners");
+  });
+
+  it("renders no Collections row when the movie is in no collections", () => {
+    const markup = renderToStaticMarkup(
+      <MemoryRouter initialEntries={["/item/movie-1"]}>
+        <MovieContent item={makeMovieItem({ collections: [] })} />
+      </MemoryRouter>,
+    );
+
+    expect(markup).not.toContain("collection_id=");
+    expect(markup).not.toContain("Collections");
+  });
 });

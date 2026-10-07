@@ -336,6 +336,7 @@ export function catalogItemDetailFromV2(item: CatalogItemDetailV2): ItemDetail {
     audiobook: item.audiobook,
     ebook: item.ebook,
     manga: item.manga,
+    collections: item.collections,
   };
 }
 
