@@ -5,8 +5,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Silo-Server/silo-server/internal/access"
 	"github.com/Silo-Server/silo-server/internal/adminjob"
 	"github.com/Silo-Server/silo-server/internal/api/handlers"
+	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
 	catalogsvc "github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/policy"
@@ -56,6 +58,40 @@ func TestAdminItemMetadataTransport(t *testing.T) {
 		}
 	}
 }
+
+// TestUpdateAdminItemMetadataCarriesCollections pins that a successful metadata
+// save answers the same collections row the read detail does, using the
+// viewer's resolved access, so an item in a collection does not appear to lose
+// its memberships until a refetch.
+func TestUpdateAdminItemMetadataCarriesCollections(t *testing.T) {
+	deps, _ := catalogDeps(t)
+	deps.AdminItemMetadata = &fakeAdminItemMetadata{}
+	deps.PermissionGates[policy.PermissionMetadataCuration] = adminTranslationGate
+	// The metadata route is not profile-scoped, so the lookup reads the scope
+	// the permission gate resolved. Restrict it so the test proves that scope,
+	// not the catalog seam's default, reaches the reverse lookup.
+	deps.ViewerAccess = apimw.NewViewerAccessMiddleware(policyResolver{scope: &access.Scope{AllowedLibraryIDs: []int{1, 2}}})
+	fake := deps.LibraryCollections.(*fakeLibraryViews)
+	fake.collections = []handlers.ItemCollectionView{{ID: "alpha", Title: "Dune Saga", ItemCount: 3}}
+	h := newTestHandler(t, deps)
+
+	rec := do(t, h, "PATCH", Prefix+"/admin/items/item-1/metadata", `{"title":"Updated"}`, bearer(memberToken))
+	if rec.Code != 200 {
+		t.Fatalf("update: %d %s", rec.Code, rec.Body)
+	}
+	var detail CatalogItemDetail
+	decodeJSON(t, rec.Body, &detail)
+	if fake.lastCollections != "item-1" {
+		t.Fatalf("lookup = %q, want the edited item id", fake.lastCollections)
+	}
+	if got := fake.lastCollectionsAccess.AllowedLibraryIDs; len(got) != 2 || got[0] != 1 || got[1] != 2 {
+		t.Fatalf("lookup access = %+v, want the gate-resolved allowed libraries [1 2]", fake.lastCollectionsAccess)
+	}
+	if len(detail.Collections) != 1 || detail.Collections[0].ID != "alpha" || detail.Collections[0].Title != "Dune Saga" || detail.Collections[0].ItemCount != 3 {
+		t.Fatalf("collections = %+v, want the membership row on the save response", detail.Collections)
+	}
+}
+
 func adminCatalogItemMetadataFixtureCases() []fixtureCase {
 	return []fixtureCase{
 		{name: "admin_item_refresh_queued", operationID: "refreshAdminItemMetadata", method: "POST", path: Prefix + "/admin/items/item-1/refresh-metadata", body: `{"mode":"complete"}`, headers: bearer(memberToken), status: 202, schema: "#/components/schemas/AdminTaskJob", assertHeaders: []string{"Content-Type", "Location", "Retry-After"}, scenario: "A delegated curator receives a persisted refresh job without administrator-only payloads."},

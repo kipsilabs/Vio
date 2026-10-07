@@ -9,5 +9,13 @@
   "crew": [],
   "versions": [],
   "ratings": [],
-  "subtitles": []
+  "subtitles": [],
+  "collections": [
+    {
+      "id": "oscar-winners",
+      "title": "Oscar Winners",
+      "poster_url": "https://cdn.example.invalid/oscar-winners.jpg",
+      "item_count": 12
+    }
+  ]
 }

@@ -1175,6 +1175,19 @@ export interface ItemVideo {
   is_official: boolean;
 }
 
+/**
+ * One collection a title page lists under its Collections row: the visible
+ * collections this item belongs to, as the v2 item detail reports them.
+ */
+export interface ItemCollection {
+  id: string;
+  title: string;
+  /** Presigned, short-lived; empty when the collection has no poster. */
+  poster_url: string;
+  poster_thumbhash?: string;
+  item_count: number;
+}
+
 /** Local extras file attached to an item; content_id is a watchable target. */
 export interface ItemExtra {
   content_id: string;
@@ -1305,6 +1318,12 @@ export interface ItemDetail {
   audiobook?: AudiobookDetailExtension;
   ebook?: EbookDetailExtension;
   manga?: MangaDetailExtension;
+  /**
+   * The visible collections this title belongs to. Present on every v2 item
+   * detail as an empty array when the item is in none; optional here so
+   * hand-built fixtures that predate the field still typecheck.
+   */
+  collections?: ItemCollection[];
 }
 
 export interface WatchDetail {

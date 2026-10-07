@@ -55,6 +55,16 @@ type ItemUserStateView = itemUserStateResponse
 // CollectionItemView is one catalog item card in a collection listing.
 type CollectionItemView = itemListResponse
 
+// ItemCollectionView is one collection an item belongs to: the chip the item
+// detail "collections" row links to.
+type ItemCollectionView struct {
+	ID              string `json:"id"`
+	Title           string `json:"title"`
+	PosterURL       string `json:"poster_url"`
+	PosterThumbhash string `json:"poster_thumbhash,omitempty"`
+	ItemCount       int    `json:"item_count"`
+}
+
 // LibraryCollectionTabView is a library's Collections tab.
 type LibraryCollectionTabView = libraryTabResponse
 
@@ -417,4 +427,49 @@ func (h *LibraryCollectionHandler) LibraryCollectionItems(ctx context.Context, l
 // either library too.
 func collectionSpansLibrary(collection *models.LibraryCollection, libraryID int) bool {
 	return collection.LibraryID == libraryID || slices.Contains(collection.LibraryIDs, libraryID)
+}
+
+// ItemCollections answers the reverse membership lookup behind the item
+// detail "collections" field: the visible collections that store the member
+// content id, as linkable chips. membership is a media item content id (a
+// movie or series); the caller resolves an episode or season to its parent
+// series first, because collections store movies and series, never episodes.
+// A collection outside the viewer's library scope is filtered out, mirroring
+// the collection-detail authorization. Poster resolution matches the library
+// Collections tab.
+func (h *LibraryCollectionHandler) ItemCollections(ctx context.Context, membership string, access catalog.AccessFilter) ([]ItemCollectionView, error) {
+	if membership == "" {
+		return []ItemCollectionView{}, nil
+	}
+	var index itemCollectionIndex
+	if h.itemCollectionIndex != nil {
+		index = h.itemCollectionIndex
+	} else if h.repo != nil {
+		index = h.repo
+	}
+	if index == nil {
+		return nil, apiError(http.StatusInternalServerError, "internal_error", "Failed to load item collections")
+	}
+	containing, err := index.ListContainingItem(ctx, membership)
+	if err != nil {
+		return nil, apiError(http.StatusInternalServerError, "internal_error", "Failed to load item collections")
+	}
+	viewable := make([]*models.LibraryCollection, 0, len(containing))
+	for _, collection := range containing {
+		if catalog.CanAccessLibraryCollection(collection, access) {
+			viewable = append(viewable, collection)
+		}
+	}
+	viewable = h.withViewerPosters(ctx, viewable, access)
+	out := make([]ItemCollectionView, 0, len(viewable))
+	for _, collection := range viewable {
+		out = append(out, ItemCollectionView{
+			ID:              collection.ID,
+			Title:           collection.Title,
+			PosterURL:       h.presignGPURLCtx(ctx, collection.PosterURL),
+			PosterThumbhash: collection.PosterThumbhash,
+			ItemCount:       collection.ItemCount,
+		})
+	}
+	return out, nil
 }

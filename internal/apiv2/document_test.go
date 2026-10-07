@@ -520,6 +520,7 @@ var libraryViewOperationIDs = []string{
 	"getCatalogSearchCapabilities", "listCatalogItems", "listAudiobookGroups", "getCatalogFilters", "searchCatalogFacet", "queryCatalogItems", "getCatalogItem",
 	"listCatalogItemEpisodes", "listCatalogItemMangaFiles", "listCatalogItemVersions", "listSeriesSeasons", "getSeriesSeason", "listSeasonEpisodes",
 	"getTrailersCapability", "refreshCatalogItemTrailers", "getMetadataAICapability", "translateCatalogItemDescription", "getRatingsCapability",
+	"getItemCollectionsCapability",
 	"listPeople", "getPerson", "refreshPerson", "getLiteraryWork",
 	"getLibraryLayout", "listLibrarySections", "getLibrarySectionItems", "getLibraryCollections", "listLibraryUserCollections",
 }
