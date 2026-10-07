@@ -44,18 +44,25 @@ runs:
           exit 0
         fi
         # libvips and its dependencies use the runner's official Ubuntu sources.
+        # The Acquire options bound a stalled mirror: without them apt-get
+        # update can sit on a slow connection for the whole job (seen at 22
+        # minutes). Languages=none skips the translation indexes.
         test -f /etc/apt/sources.list.d/ubuntu.sources
         apt_options=(
           -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources
           -o Dir::Etc::sourceparts=-
+          -o Acquire::Retries=3
+          -o Acquire::http::Timeout=30
+          -o Acquire::https::Timeout=30
+          -o Acquire::ForceIPv4=true
+          -o Acquire::Languages=none
         )
         if [ "$RUNNER_ENVIRONMENT" = github-hosted ]; then
           mkdir -p "$RUNNER_TEMP/libvips-debs"
           apt_options+=(-o "Dir::Cache::archives=$RUNNER_TEMP/libvips-debs")
           # The restore has no fallback keys, so packages are present only when
           # they were saved on this runner image. apt then installs them as
-          # local files without updating its package lists; if it cannot, the
-          # update and install below run as usual.
+          # local files without touching the network.
           debs=("$RUNNER_TEMP"/libvips-debs/*.deb)
           if [ -e "${debs[0]}" ]; then
             echo "installing libvips from the cache"
@@ -64,7 +71,14 @@ runs:
             fi
           fi
         fi
-        echo "downloading libvips"
+        # The runner image ships package lists, so try the install before
+        # paying for an index update. This is the step that stalled; a stale or
+        # missing list falls through to the update below.
+        echo "installing libvips"
+        if sudo apt-get "${apt_options[@]}" install -y --no-install-recommends libvips-dev; then
+          exit 0
+        fi
+        echo "updating package lists and retrying"
         sudo apt-get "${apt_options[@]}" update
         sudo apt-get "${apt_options[@]}" install -y --no-install-recommends libvips-dev
 
