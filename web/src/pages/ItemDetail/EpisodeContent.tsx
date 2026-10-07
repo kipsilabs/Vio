@@ -278,12 +278,22 @@ export default function EpisodeContent({ item }: { item: ItemDetail & { type: "e
   // presigns an episode's still as `poster_url`, and episode rows name the same
   // artwork `still_url`, consulted last for a series that has a poster but no
   // backdrop. The series backdrop keeps its place in between, so an episode with
-  // no title card of its own renders as it did before; the thumbhash follows the
-  // same order so the generated thumbnail stands in for the image it belongs to.
+  // no title card of its own renders as it did before.
+  //
+  // The URL picks the source; the thumbhash is that same source's, even when it
+  // has none. Pairing the two independently could show one image behind another
+  // image's generated thumbnail, so the placeholder would not belong to the
+  // artwork it stands in for.
   const currentEpisode = siblingEpisodes.find((episode) => episode.content_id === item.content_id);
-  const heroBackdropUrl = item.poster_url || item.backdrop_url || currentEpisode?.still_url;
-  const heroBackdropThumbhash =
-    item.poster_thumbhash || item.backdrop_thumbhash || currentEpisode?.still_thumbhash;
+  const heroArtwork = item.poster_url
+    ? { url: item.poster_url, thumbhash: item.poster_thumbhash }
+    : item.backdrop_url
+      ? { url: item.backdrop_url, thumbhash: item.backdrop_thumbhash }
+      : currentEpisode?.still_url
+        ? { url: currentEpisode.still_url, thumbhash: currentEpisode.still_thumbhash }
+        : undefined;
+  const heroBackdropUrl = heroArtwork?.url;
+  const heroBackdropThumbhash = heroArtwork?.thumbhash;
   // The page glow follows the artwork the hero actually shows, the way the ebook
   // and manga pages key it to their poster.
   useAmbientColor(heroBackdropThumbhash);

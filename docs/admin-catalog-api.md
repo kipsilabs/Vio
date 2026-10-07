@@ -488,8 +488,13 @@ optional `provider_id`. `type` is one of `poster`, `backdrop`, `logo`, `still`,
 or `titlecard`. `still` and `titlecard` are the same episode title card and are
 only accepted for an episode; a movie, series, or season is refused with `400
 unsupported_image_type` before any download, rather than silently stored as a
-poster. An episode accepts any of these values only as its still, keeping the
-historical coercion of a `poster` sent for an episode. An HTTP(S) `original_url`
+poster. That refusal is an allowed bridge correctness fix: before `titlecard`
+resolved to the still, the shared resolver fell through to `poster` and stored
+the image as that scope's poster with no signal, and a silent wrong-type store
+was a bug rather than a contract. Every request that was valid before keeps its
+image type and result. An episode accepts any of these values only as its
+still, keeping the historical coercion of a `poster` sent for an episode. An
+HTTP(S) `original_url`
 may name a public or local-network address; link-local, cloud metadata and other
 blocked addresses are refused (see
 [Outbound address guard](architecture/outbound-address-guard.md#artwork-downloads)).

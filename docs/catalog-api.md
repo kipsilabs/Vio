@@ -474,14 +474,27 @@ as today.
 ## Episode title cards
 
 An episode's title card is its still. Episode rows (`listCatalogItemEpisodes`,
-`listSeasonEpisodes`) and episode details (`getCatalogItem` on an episode id)
-carry it as `still_url` and `still_thumbhash`, falling back to the series'
-backdrop or poster when the episode has no still of its own. An administrator
-sets it through `POST /api/v2/admin/items/{episode_id}/images/apply` with
-`type: "titlecard"` (or `"still"`); see
+`listSeasonEpisodes`) carry it as `still_url` and `still_thumbhash`, falling
+back to the series' backdrop or poster when the episode has no still of its own
+(`episodeResponseShell`). Episode details (`getCatalogItem` on an episode id)
+are a different shape: the episode's still is served as `poster_url` with
+`poster_thumbhash`, and the series backdrop is served separately as
+`backdrop_url` with `backdrop_thumbhash`. Neither detail member falls back to
+the other; when the episode has no still, `poster_url` is absent and the series
+backdrop remains in `backdrop_url`. The bundled web client picks the hero
+artwork in its own order — `poster_url` (the still), then `backdrop_url`, then
+the season row's `still_url` — and pairs the chosen URL with that same source's
+thumbhash even when it has none. An administrator sets a title card through
+`POST /api/v2/admin/items/{episode_id}/images/apply` with `type: "titlecard"`
+(or `"still"`); see
 [Admin catalog API](admin-catalog-api.md#item-image-selection). The two names
 are the same artwork. A title card applied to a movie, series, or season is
-refused with `unsupported_image_type`, because only an episode has one.
+refused with `unsupported_image_type`, because only an episode has one. That
+refusal is an allowed bridge correctness fix: before `titlecard` aliased the
+still, the shared apply resolver fell through to `poster` and silently stored
+the image as that scope's poster. A silent wrong-type store was a bug, not a
+contract, so refusing it on the frozen bridge is a fix rather than a contract
+change; every request that was valid before keeps its image type and result.
 
 ## Collection membership titles
 

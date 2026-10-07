@@ -60,11 +60,13 @@ func newTitlecardHandler(episode *models.Episode, svc *titlecardImageService) *A
 	return NewAdminImageHandler(items, imageSeasonLookupFake{}, titlecardEpisodes{episode: episode}, nil, svc, nil, nil)
 }
 
-// TestApplyTitlecardStoresEpisodeStill pins that "titlecard" is accepted on an
-// episode and resolved as that episode's still, with the season and episode
-// numbers scoping the cache key so siblings do not collide. The image service
-// fails after recording so publication, which needs a database, is not reached.
-func TestApplyTitlecardStoresEpisodeStill(t *testing.T) {
+// TestApplyTitlecardMapsRequestToEpisodeStill pins the request mapping for
+// "titlecard" on an episode: it resolves as that episode's still, with the
+// season and episode numbers scoping the cache key so siblings do not collide.
+// The image service fails after recording so publication, which needs a
+// database, is not reached; admin_images_titlecard_publication_test.go covers
+// successful publication through to detail and row reads.
+func TestApplyTitlecardMapsRequestToEpisodeStill(t *testing.T) {
 	episode := &models.Episode{ContentID: "episode:severance-s01e01", SeriesID: "series:severance", SeasonNumber: 1, EpisodeNumber: 1}
 	svc := &titlecardImageService{fail: true}
 	h := newTitlecardHandler(episode, svc)
