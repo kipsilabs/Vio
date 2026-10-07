@@ -306,4 +306,42 @@ describe("SeriesContent", () => {
     expect(mocks.setRatingMutate).toHaveBeenCalledWith(5);
     expect(mocks.deleteRatingMutate).toHaveBeenCalledTimes(1);
   });
+
+  it("renders a Collections row when the series belongs to collections", () => {
+    const markup = renderToStaticMarkup(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter initialEntries={["/item/series-1"]}>
+          <SeriesContent
+            item={makeSeriesItem({
+              collections: [
+                {
+                  id: "prestige-drama",
+                  title: "Prestige Drama",
+                  poster_url: "/collections/prestige-drama.jpg",
+                  item_count: 4,
+                },
+              ],
+            })}
+          />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    expect(markup).toContain("Prestige Drama");
+    expect(markup).toContain("4 items");
+    expect(markup).toContain("collection_id=prestige-drama");
+  });
+
+  it("renders no Collections row when the series is in no collections", () => {
+    const markup = renderToStaticMarkup(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter initialEntries={["/item/series-1"]}>
+          <SeriesContent item={makeSeriesItem({ collections: [] })} />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    expect(markup).not.toContain("collection_id=");
+    expect(markup).not.toContain("Collections");
+  });
 });
