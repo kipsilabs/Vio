@@ -479,11 +479,24 @@ the provider list again; pagination bounds response size, not provider work or
 memory, and stores no server-side snapshot. Provider failures expose generic
 messages. The web drains all pages under one captured authority and refuses
 repeated or invalid continuation rather than publishing a partial list.
+`current` carries the stored selection: `poster_url`, `backdrop_url`, and
+`logo_url`, plus `still_url` for an episode, which is its title card. Every
+member is absent when the scope has no such artwork.
 
 `POST /api/v2/admin/items/{id}/images/apply` accepts `original_url`, `type`, and
-optional `provider_id`. An HTTP(S) `original_url` may name a public or
-local-network address; link-local, cloud metadata and other blocked addresses
-are refused (see
+optional `provider_id`. `type` is one of `poster`, `backdrop`, `logo`, `still`,
+or `titlecard`. `still` and `titlecard` are the same episode title card and are
+only accepted for an episode; a movie, series, or season is refused with `400
+unsupported_image_type` before any download, rather than silently stored as a
+poster. That refusal is an allowed bridge correctness fix: before `titlecard`
+resolved to the still, the shared resolver fell through to `poster` and stored
+the image as that scope's poster with no signal, and a silent wrong-type store
+was a bug rather than a contract. Every request that was valid before keeps its
+image type and result. An episode accepts any of these values only as its
+still, keeping the historical coercion of a `poster` sent for an episode. An
+HTTP(S) `original_url`
+may name a public or local-network address; link-local, cloud metadata and other
+blocked addresses are refused (see
 [Outbound address guard](architecture/outbound-address-guard.md#artwork-downloads)).
 It preserves target validation before remote work,
 episode-to-still coercion, parent/season/episode cache identity, immutable upload,
@@ -491,5 +504,6 @@ transactional catalog publication and orphan-GC scheduling after publication
 failure. Success returns the stored path, thumbhash and available revision/display
 URL. This is synchronous and may fail after upload; it is not a persisted job
 or replay-safe operation. Both web retry layers are disabled. Frozen v1 retains
-its response shapes and error codes. No native or Jellyfin caller is present in
-the migration inventory.
+its response shapes and error codes and never emits `current.still_url`; that
+field is v2-only. No native or Jellyfin caller is present in the
+migration inventory.

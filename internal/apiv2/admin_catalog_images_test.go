@@ -13,11 +13,12 @@ type fakeAdminImages struct {
 	calls   int
 	rows    []handlers.AdminImageEntryView
 	request handlers.AdminItemImageRequest
+	current handlers.AdminCurrentImagesView
 }
 
 func (f *fakeAdminImages) GetAdminItemImages(context.Context, string) (handlers.AdminItemImagesView, error) {
 	f.calls++
-	return handlers.AdminItemImagesView{Images: f.rows, ProviderErrors: map[string]string{"provider": "private upstream details"}}, nil
+	return handlers.AdminItemImagesView{Images: f.rows, Current: f.current, ProviderErrors: map[string]string{"provider": "private upstream details"}}, nil
 }
 func (f *fakeAdminImages) ApplyAdminItemImage(_ context.Context, id string, r handlers.AdminItemImageRequest) (handlers.AdminItemImageResult, error) {
 	f.calls++
@@ -82,6 +83,59 @@ func TestAdminImagePagesAndApply(t *testing.T) {
 		t.Fatalf("empty %d %s", rec.Code, rec.Body)
 	}
 }
+
+// TestAdminItemImagesCarriesEpisodeStill pins the additive v2 still_url: the
+// shared handler view keeps an episode's current title card, and apiv2 emits
+// it as still_url while leaving poster_url in place.
+func TestAdminItemImagesCarriesEpisodeStill(t *testing.T) {
+	deps := pilotDeps(nil, nil)
+	deps.AdminCatalogImages = &fakeAdminImages{current: handlers.AdminCurrentImagesView{
+		PosterURL: "tmdb/series/1/poster.jpg",
+		StillURL:  "tmdb/series/1/still/original.rev.webp",
+	}}
+	h := newTestHandler(t, deps)
+	rec := do(t, h, "GET", Prefix+"/admin/items/episode:severance-s01e01/images", "", bearer(adminToken))
+	if rec.Code != 200 {
+		t.Fatalf("status %d %s", rec.Code, rec.Body)
+	}
+	var page AdminImagesPage
+	if err := json.Unmarshal(rec.Body.Bytes(), &page); err != nil {
+		t.Fatal(err)
+	}
+	if page.Current.StillURL != "tmdb/series/1/still/original.rev.webp" {
+		t.Fatalf("still_url = %q, want the episode title card", page.Current.StillURL)
+	}
+	if page.Current.PosterURL != "tmdb/series/1/poster.jpg" {
+		t.Fatalf("poster_url = %q, want the parent poster", page.Current.PosterURL)
+	}
+}
+
+// TestAdminItemImagesOmitsUnsetStillURL pins the other direction of the
+// additive v2 member: when the scope has no title card, the v2 body omits
+// still_url entirely (omitempty), so a client can distinguish an episode with
+// one from a movie, series, season, or episode without one.
+func TestAdminItemImagesOmitsUnsetStillURL(t *testing.T) {
+	deps := pilotDeps(nil, nil)
+	deps.AdminCatalogImages = &fakeAdminImages{current: handlers.AdminCurrentImagesView{
+		PosterURL: "tmdb/series/1/poster.jpg",
+	}}
+	h := newTestHandler(t, deps)
+	rec := do(t, h, "GET", Prefix+"/admin/items/movie:heat-1995/images", "", bearer(adminToken))
+	if rec.Code != 200 {
+		t.Fatalf("status %d %s", rec.Code, rec.Body)
+	}
+	if strings.Contains(rec.Body.String(), "still_url") {
+		t.Fatalf("v2 body emitted still_url with no title card: %s", rec.Body)
+	}
+	var page AdminImagesPage
+	if err := json.Unmarshal(rec.Body.Bytes(), &page); err != nil {
+		t.Fatal(err)
+	}
+	if page.Current.StillURL != "" {
+		t.Fatalf("unset still_url decoded as %q, want empty", page.Current.StillURL)
+	}
+}
+
 func adminCatalogImagesFixtureCases() []fixtureCase {
 	return []fixtureCase{
 		{name: "admin_item_images", operationID: "listAdminItemImages", method: "GET", path: Prefix + "/admin/items/item-1/images", headers: bearer(adminToken), status: 200, schema: "#/components/schemas/AdminImagesPage", assertHeaders: []string{"Content-Type"}, scenario: "Administrator image choices use a bounded collection with current selection."},
