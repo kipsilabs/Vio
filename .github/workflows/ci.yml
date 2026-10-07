@@ -38,6 +38,43 @@ permissions:
 # workflow's success for main/apiv2, so the workflow name and its overall
 # success semantics must not change.
 jobs:
+  # Old per-commit caches pile up until GitHub's 10 GB budget evicts whatever it
+  # wants, which was taking the small golangci-lint analysis caches with it and
+  # leaving the lint lanes cold. Keep only the newest cache per lane on this ref.
+  # Runs on a push to main, before the other jobs save this push's entries.
+  prune-go-caches:
+    name: Prune old Go caches
+    if: github.ref_name == github.event.repository.default_branch && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Keep the newest cache for each lane
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # Paginate so pruning covers every cache on this ref, even above the
+          # CLI's default list limit.
+          gh api --paginate -X GET "repos/$GH_REPO/actions/caches" \
+            -f ref="$GITHUB_REF" -f per_page=100 \
+            --jq '.actions_caches[] | {id, key, ref, createdAt: .created_at}' > "$RUNNER_TEMP/go-caches.json"
+          cache_ids="$(jq -sr --arg ref "$GITHUB_REF" '
+            map(select(.ref == $ref) | . + {
+              prefix: (.key | capture("^(?<prefix>go-lint-router-recovery-|go-lint-|go-verify-|go-test-|go-integration-|golangci-lint-cache-router-|golangci-lint-cache-|libvips-dev-)").prefix)
+            })
+            | group_by(.prefix)[]
+            | sort_by(.createdAt, .id) | reverse
+            | .[1:][] | .id
+          ' "$RUNNER_TEMP/go-caches.json")"
+          while IFS= read -r cache_id; do
+            [ -n "$cache_id" ] || continue
+            echo "Deleting Go cache: $cache_id"
+            gh cache delete "$cache_id"
+          done <<< "$cache_ids"
+
   # The Go gate is three jobs so that lint, the contract checks, and the test
   # suite run side by side; each one alone is shorter than the serial job they
   # replace. They share the composite setup action under .github/actions.
@@ -110,7 +147,19 @@ jobs:
         if: steps.golangci-lint-binary.outputs.cache-hit != 'true'
         run: go install "github.com/golangci/golangci-lint/v2/cmd/golangci-lint@${GOLANGCI_LINT_VERSION}"
 
+      # Restored by every run; saved only on a push to main, so all PRs share
+      # one analysis cache instead of each saving a copy no other PR can read.
       - name: Restore the golangci-lint analysis cache
+        if: github.event_name == 'pull_request'
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/golangci-lint
+          key: golangci-lint-cache-${{ runner.os }}-${{ env.GOLANGCI_LINT_VERSION }}-${{ github.sha }}
+          restore-keys: |
+            golangci-lint-cache-${{ runner.os }}-${{ env.GOLANGCI_LINT_VERSION }}-
+
+      - name: Restore and save the golangci-lint analysis cache
+        if: github.event_name != 'pull_request'
         uses: actions/cache@v4
         with:
           path: ~/.cache/golangci-lint
@@ -452,10 +501,20 @@ jobs:
       # golangci-lint caches per-package analysis and facts. Without restoring
       # that cache this job re-analyzed the whole tree from scratch every run
       # (~14 min), while the go-lint job runs the identical command over a
-      # restored cache in under a minute. The cache is saved under a
-      # job-specific key and restored from the shared prefix, so it also picks
-      # up the cache the go-lint job writes.
+      # restored cache in under a minute. Restored from the shared prefix, so
+      # it also picks up what go-lint writes; saved only on a push to main.
       - name: Restore the golangci-lint analysis cache
+        if: github.event_name == 'pull_request'
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/golangci-lint
+          key: golangci-lint-cache-router-${{ runner.os }}-${{ env.GOLANGCI_LINT_VERSION }}-${{ github.sha }}
+          restore-keys: |
+            golangci-lint-cache-router-${{ runner.os }}-${{ env.GOLANGCI_LINT_VERSION }}-
+            golangci-lint-cache-${{ runner.os }}-${{ env.GOLANGCI_LINT_VERSION }}-
+
+      - name: Restore and save the golangci-lint analysis cache
+        if: github.event_name != 'pull_request'
         uses: actions/cache@v4
         with:
           path: ~/.cache/golangci-lint

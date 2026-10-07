@@ -94,8 +94,25 @@ runs:
       shell: bash
       run: echo "version=$(go env GOVERSION)" >> "$GITHUB_OUTPUT"
 
+    # A PR run restores the build and module cache main last saved but does not
+    # save one. Each lane's cache is 0.6-1.4 GB, and saving a per-PR copy on
+    # every run filled GitHub's 10 GB budget, which then evicted the small
+    # caches (the golangci-lint analysis cache) that make the lint lanes fast.
+    # Only a push to main saves, and the prune job keeps the newest per lane.
     - name: Restore the Go build and module cache
-      if: runner.environment == 'github-hosted'
+      if: runner.environment == 'github-hosted' && github.event_name == 'pull_request'
+      uses: actions/cache/restore@v4
+      with:
+        path: |
+          ~/.cache/go-build
+          ~/go/pkg/mod
+        key: go-${{ inputs.cache-name }}-${{ runner.os }}-${{ steps.go.outputs.version }}-${{ hashFiles('go.sum') }}-${{ github.sha }}
+        restore-keys: |
+          go-${{ inputs.cache-name }}-${{ runner.os }}-${{ steps.go.outputs.version }}-${{ hashFiles('go.sum') }}-
+          go-${{ inputs.cache-name }}-${{ runner.os }}-${{ steps.go.outputs.version }}-
+
+    - name: Restore and save the Go build and module cache
+      if: runner.environment == 'github-hosted' && github.event_name != 'pull_request'
       uses: actions/cache@v4
       with:
         path: |
