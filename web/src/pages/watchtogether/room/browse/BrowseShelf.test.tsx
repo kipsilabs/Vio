@@ -107,6 +107,7 @@ const detailFor = (id?: string) => ({
         backdrop_url: "",
         // The series' next-up episode, in its second season.
         play_content_id: id === "severance" ? "sev-s2e4" : undefined,
+        play_season_number: id === "severance" ? 2 : undefined,
       }
     : undefined,
 });
@@ -468,7 +469,23 @@ describe("CandidateStage", () => {
       type: "series",
       title: "Severance",
       play_content_id: "sev-s2e4",
+      play_season_number: 2,
     });
+    await screen.findByText("Episode 4");
+    expect(screen.getByRole("button", { name: /Season 2/, pressed: true })).toBeInTheDocument();
+  });
+
+  it("opens the detail's next-up season when the cached season targets are older", async () => {
+    // The season list still names E4 as season 2's next episode; the fresher
+    // detail has moved on to E5.
+    data.pendingDetail = Promise.resolve({
+      content_id: "severance",
+      type: "series",
+      title: "Severance",
+      play_content_id: "sev-s2e5",
+      play_season_number: 2,
+    });
+    renderCandidate({ card: { content_id: "severance", type: "series", title: "Severance" } });
     await screen.findByText("Episode 4");
     expect(screen.getByRole("button", { name: /Season 2/, pressed: true })).toBeInTheDocument();
   });

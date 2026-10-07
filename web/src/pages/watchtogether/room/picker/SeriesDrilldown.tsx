@@ -148,20 +148,18 @@ export function SeriesDrilldown({
   const seasons = useSeasons(series.content_id);
   const seasonList = useMemo(() => seasons.data?.seasons ?? [], [seasons.data?.seasons]);
   const [season, setSeason] = useState<number | null>(initialSeason ?? null);
-  // Without a season from the shelf, open where the viewer left off, as the
-  // series page does: the season whose own play target is the series' target.
-  // Both targets move as the viewer watches, so choose only once neither
-  // query is fetching; a cached copy of one can disagree with the other.
-  const playContentId = item?.play_content_id;
-  const resolvingSeason = seasons.isFetching || detail.isFetching;
+  // Without a season from the shelf, open where the viewer left off: the
+  // season of the series' play target. The detail carries that season with
+  // the target, so the season list's own targets need not agree with it; wait
+  // for a detail refetch so a stale copy does not choose.
+  const playSeasonNumber = item?.play_season_number;
+  const resolvingSeason = seasons.isLoading || detail.isFetching;
   useEffect(() => {
     if (season !== null || seasonList.length === 0 || resolvingSeason) return;
-    const resume = playContentId
-      ? seasonList.find((s) => s.play_content_id === playContentId)
-      : undefined;
+    const resume = seasonList.find((s) => s.season_number === playSeasonNumber);
     const first = resume ?? seasonList.find((s) => !s.is_specials) ?? seasonList[0]!;
     setSeason(first.season_number);
-  }, [season, seasonList, resolvingSeason, playContentId]);
+  }, [season, seasonList, resolvingSeason, playSeasonNumber]);
   const episodesQuery = useSeasonEpisodes(
     season === null ? undefined : series.content_id,
     season ?? -1,
