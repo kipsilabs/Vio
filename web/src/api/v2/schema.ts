@@ -13556,6 +13556,10 @@ export interface components {
     AdminImageApplyInputBody: {
       original_url: string;
       provider_id?: string;
+      /**
+       * @description One of poster, backdrop, logo, still, or titlecard. still and titlecard name the same episode title card and are accepted only for an episode; a movie, series, or season is refused with 400 unsupported_image_type. An episode stores any applied image as its still.
+       * @example poster
+       */
       type: string;
     };
     AdminImagesPage: {
@@ -19922,6 +19926,7 @@ export interface components {
       backdrop_url?: string;
       logo_url?: string;
       poster_url?: string;
+      still_url?: string;
     };
     DecideDeviceLoginInputBody: {
       /**

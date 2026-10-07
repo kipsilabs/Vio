@@ -61,7 +61,6 @@ export default function EpisodeContent({ item }: { item: ItemDetail & { type: "e
     useOnViewTranslation(item);
   const navigate = useNavigate();
   const location = useLocation();
-  useAmbientColor(item.backdrop_thumbhash);
   const { user } = useAuth();
   const isAdmin = useIsActingAdmin();
   const { profile: currentProfile } = useCurrentProfile();
@@ -275,6 +274,19 @@ export default function EpisodeContent({ item }: { item: ItemDetail & { type: "e
     siblingSeason?.seasonNumber ?? -1,
   );
   const siblingEpisodes = episodesData?.episodes ?? [];
+  // The hero backdrop prefers this episode's own title card: the detail
+  // presigns an episode's still as `poster_url`, and episode rows name the same
+  // artwork `still_url`, consulted last for a series that has a poster but no
+  // backdrop. The series backdrop keeps its place in between, so an episode with
+  // no title card of its own renders as it did before; the thumbhash follows the
+  // same order so the generated thumbnail stands in for the image it belongs to.
+  const currentEpisode = siblingEpisodes.find((episode) => episode.content_id === item.content_id);
+  const heroBackdropUrl = item.poster_url || item.backdrop_url || currentEpisode?.still_url;
+  const heroBackdropThumbhash =
+    item.poster_thumbhash || item.backdrop_thumbhash || currentEpisode?.still_thumbhash;
+  // The page glow follows the artwork the hero actually shows, the way the ebook
+  // and manga pages key it to their poster.
+  useAmbientColor(heroBackdropThumbhash);
   const seasonLabel =
     navigationState?.parentSeasonLabel ??
     (currentSeason
@@ -314,8 +326,8 @@ export default function EpisodeContent({ item }: { item: ItemDetail & { type: "e
           title={title}
           topNav={<PageBack />}
           context={<DetailBreadcrumb segments={breadcrumbSegments} />}
-          backdropUrl={item.backdrop_url}
-          backdropThumbhash={item.backdrop_thumbhash}
+          backdropUrl={heroBackdropUrl}
+          backdropThumbhash={heroBackdropThumbhash}
           hidePoster
           logoUrl={item.logo_url}
           metadata={
