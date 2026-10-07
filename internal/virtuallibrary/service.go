@@ -251,6 +251,11 @@ func New(cfg Config, registrar *catalog.VirtualMediaRegistrar, logger *slog.Logg
 	r.SetCandidateEnricher(resolver.DefaultEnricher)
 	r.SetCandidateClassifier(m)
 	r.SetLogger(logger)
+	// The resolver must not import this package, so it cannot read the edge
+	// request id this package threads into resolve contexts. Install the
+	// canonical reader once here, where both packages are visible, so the
+	// provider-fetch log carries the start's request id.
+	r.SetRequestIDReader(RequestIDFromContext)
 	if store := m.ReleaseStore(); store != nil {
 		r.SetReleaseGate(store)
 	}

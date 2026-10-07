@@ -279,6 +279,62 @@ func TestPostgresPlanStore(t *testing.T) {
 		}
 	})
 
+	// Regression test for the reconciliation ledger bootstrap. A freshly saved
+	// attempt carries an empty ledger `{}`, and `->>'revision'` on `{}` is SQL
+	// NULL, which cannot scan into an int64. Without COALESCE the first read
+	// fails and reconciliation can never record or announce a correction on the
+	// production store. This pins the whole bootstrap: save, read zero, record
+	// the first decision, read one.
+	t.Run("AudioReconcileLedgerBootstrapsFromEmptyJSON", func(t *testing.T) {
+		sessionID := uuid.NewString()
+		attemptID := "att-reconcile-" + sessionID
+		record := f.attemptRecord(sessionID, attemptID, "digest-reconcile")
+		if err := store.SaveAttempt(ctx, record); err != nil {
+			t.Fatalf("SaveAttempt: %v", err)
+		}
+
+		// The empty ledger must read as revision zero, not as a scan error.
+		ledger, revision, err := store.GetAudioReconcileLedger(ctx, sessionID)
+		if err != nil {
+			t.Fatalf("GetAudioReconcileLedger on a fresh attempt: %v", err)
+		}
+		if revision != 0 {
+			t.Fatalf("fresh ledger revision = %d, want 0", revision)
+		}
+		if len(ledger.Entries) != 0 {
+			t.Fatalf("fresh ledger has %d entries, want 0", len(ledger.Entries))
+		}
+
+		// Recording the first decision must succeed against that same empty
+		// ledger and advance the revision, which is what lets a later writer
+		// detect a stale read instead of clobbering.
+		entry := playback.AudioReconcileEntryV3{
+			Decision:   playback.AudioReconcileInvalidated,
+			Generation: "probe:2026-10-05T00:00:02Z",
+			SessionID:  "33333333-3333-3333-3333-333333333333",
+			Reason:     playback.PlanInvalidatedDefaultAudioReconciliation,
+		}
+		merged, next, err := store.RecordAudioReconciliation(ctx, sessionID, revision, entry)
+		if err != nil {
+			t.Fatalf("RecordAudioReconciliation: %v", err)
+		}
+		if next != 1 {
+			t.Fatalf("revision after first record = %d, want 1", next)
+		}
+		if len(merged.Entries) != 1 || merged.Entries[0].Generation != entry.Generation {
+			t.Fatalf("recorded ledger = %+v, want one entry for %q", merged.Entries, entry.Generation)
+		}
+
+		// And the advanced revision must read back cleanly too.
+		again, revision, err := store.GetAudioReconcileLedger(ctx, sessionID)
+		if err != nil {
+			t.Fatalf("GetAudioReconcileLedger after record: %v", err)
+		}
+		if revision != 1 || len(again.Entries) != 1 {
+			t.Fatalf("reread ledger = %+v revision %d, want one entry at revision 1", again.Entries, revision)
+		}
+	})
+
 	t.Run("SaveAttemptIdempotency", func(t *testing.T) {
 		sessionID := uuid.NewString()
 		attemptID := "att-save-" + sessionID

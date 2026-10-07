@@ -524,6 +524,10 @@ func (h *PlaybackHandler) persistVirtualEvidenceDirect(ctx context.Context, args
 		}
 		if result.MetadataUpdated {
 			h.logInventoryDelivery(h.PublishInventoryUpdated(writeCtx, args.FileID), 0)
+			// The row now carries the verified inventory: replay any
+			// cold-start default audio selection against the committed order
+			// so the executable recipe keeps the preferred language.
+			h.reconcileVerifiedDefaultAudio(context.Background(), args.FileID)
 		}
 		return result.MetadataUpdated
 	}
@@ -535,6 +539,7 @@ func (h *PlaybackHandler) persistVirtualEvidenceDirect(ctx context.Context, args
 	}
 	if rows > 0 {
 		h.logInventoryDelivery(h.PublishInventoryUpdated(writeCtx, args.FileID), 0)
+		h.reconcileVerifiedDefaultAudio(context.Background(), args.FileID)
 	}
 	return rows > 0
 }
@@ -682,6 +687,10 @@ func (h *PlaybackHandler) persistVirtualEvidenceTask(task *virtualEvidenceTask, 
 			// it. The delivery log below is what makes a rotation's publish
 			// observable; it does not publish a second time.
 			h.logInventoryDelivery(h.PublishInventoryUpdated(context.Background(), task.args.FileID), task.originFileID)
+			// The verified inventory is committed: replay cold-start default
+			// audio intent against its order so the executable recipe keeps
+			// the preferred language instead of the declared ordinal.
+			h.reconcileVerifiedDefaultAudio(context.Background(), task.args.FileID)
 			return nil
 		}
 		lastErr = err

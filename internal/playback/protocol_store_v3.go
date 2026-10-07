@@ -4,11 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/Silo-Server/silo-server/internal/userstore"
 )
 
 var ErrIdempotencyKeyReusedV3 = errors.New("idempotency key reused")
@@ -134,6 +137,33 @@ type AttemptRecordV3 struct {
 	// ServerBitrateCapKbps is fixed when the attempt starts; replans must not
 	// pick up later administrator edits to the account or access group.
 	ServerBitrateCapKbps int
+	// SelectionOrigin records whether the committed audio selection came
+	// from the server's language preference ("auto") or an explicit viewer
+	// choice ("explicit"). Legacy records predate the field and carry the
+	// empty string; reconciliation must then do nothing, never assume a
+	// default, since the pre-intent selection semantics are unknown.
+	SelectionOrigin string `json:"selection_origin,omitempty"`
+	// PreferredAudioLanguage is the canonical full tag that steered the
+	// server-preference selection (e.g. "pt-BR"), or "" when none was
+	// resolved. Compared against the verified inventory, never against an
+	// ordinal.
+	PreferredAudioLanguage string `json:"preferred_audio_language,omitempty"`
+	// SeriesAudioPreferenceSignature is the series-preference snapshot the
+	// start fed to SelectAudioTrack. Old records leave it nil.
+	SeriesAudioPreferenceSignature *userstore.AudioTrackSignature `json:"series_audio_preference_signature,omitempty"`
+	// SelectedAudioSignature is the signature of the committed selection at
+	// start time. It anchors the executable comparison at probe landing and
+	// detects a user track change that superseded the start selection.
+	SelectedAudioSignature *userstore.AudioTrackSignature `json:"selected_audio_signature,omitempty"`
+	// AudioReconcileLedger is the settled/pending reconciliation ledger for
+	// this attempt: one entry per verified generation the reconcile path has
+	// decided on. Like RecoveryState it is written only by a dedicated
+	// revision-checked writer (RecordAudioReconciliation), never by
+	// SaveAttempt or CompleteReplan, so a stale attempt write can never
+	// shrink it. Entries persist in the audio_reconcile_ledger column; the
+	// memory store keeps them on the record itself. A fresh attempt starts
+	// with the zero value and inherits nothing.
+	AudioReconcileLedger AudioReconcileLedgerV3
 	// StartResponse is the latest durable decision for this attempt. It begins
 	// as the exact start response and advances atomically with each completed
 	// replan so an idempotent start retry never resurrects a superseded plan.
@@ -177,6 +207,107 @@ type RecoveryStateV3 struct {
 	// scoped by provider/source so a candidate id from one release set cannot
 	// suppress an identically named candidate from another.
 	Exclusions []RecoveryExclusionV3 `json:"exclusions,omitempty"`
+}
+
+// AudioSelectionV3 is the JSONB shape of the audio_selection attempt
+// column: the durable start-time audio selection intent. AttemptRecordV3
+// carries the same fields inline for the memory store; Postgres splits them
+// into their own column so CompleteReplan (which rewrites only plan
+// columns) can never clobber them.
+type AudioSelectionV3 struct {
+	Origin            string                         `json:"origin,omitempty"`
+	PreferredLanguage string                         `json:"preferred_language,omitempty"`
+	SeriesSignature   *userstore.AudioTrackSignature `json:"series_signature,omitempty"`
+	SelectedSignature *userstore.AudioTrackSignature `json:"selected_signature,omitempty"`
+}
+
+// AudioReconcileLedgerV3 is the durable, attempt-scoped memory of automatic
+// default-audio reconciliation decisions. One entry per (generation, session)
+// the reconcile path has settled (a committed replan, a byte-equal no-op, a
+// plan invalidation, or a refusal), keyed by that pair so a retried probe
+// write or a second replica replays the same decision instead of minting a
+// second event.
+type AudioReconcileLedgerV3 struct {
+	// Entries is the settled chain, in the order decisions were recorded. It
+	// is scoped by generation: entries for different generations never
+	// suppress each other, and a new probe generation always re-evaluates.
+	Entries []AudioReconcileEntryV3 `json:"entries,omitempty"`
+	// Revision advances with every durable ledger write. It is the
+	// compare-and-set token for concurrent decision records: a writer that
+	// read a stale revision loses with ErrRecoveryRevisionConflictV3 instead
+	// of clobbering a newer decision.
+	Revision int64 `json:"revision,omitempty"`
+}
+
+// AudioReconcileDecisionV3 names the settled outcome recorded for one
+// verified generation.
+type AudioReconcileDecisionV3 string
+
+const (
+	// AudioReconcileReplanned means an automatic track_change replan for the
+	// generation committed (or replayed idempotently) through the replan
+	// lease. The entry's RequestDigest pins the exact replan body: a retry of
+	// the same decision reuses the same bytes, so the lease answers with the
+	// stored response instead of colliding on the request id.
+	AudioReconcileReplanned AudioReconcileDecisionV3 = "replanned"
+	// AudioReconcileNoop means the generation compared byte-equal against
+	// the committed selection: no replan, no session mutation, no push.
+	AudioReconcileNoop AudioReconcileDecisionV3 = "noop"
+	// AudioReconcileRefused means the generation was stale (rotation),
+	// explicit (never overridden), or superseded by a viewer change: the
+	// reconcile path declined and must not retry the generation.
+	AudioReconcileRefused AudioReconcileDecisionV3 = "refused"
+	// AudioReconcileInvalidated means the corrected executable selection was
+	// persisted together with the canonical request, and the active plan was
+	// withdrawn through the realtime plan_invalidated route event instead of
+	// being replaced server-side. Only the client's own replacement replan
+	// commits a new recipe, so the decision and the request it eventually
+	// consumes are one ledger entry: the entry is written before anything is
+	// emitted, and a duplicate probe write or a retried heartbeat replays the
+	// stored decision rather than minting a second event.
+	AudioReconcileInvalidated AudioReconcileDecisionV3 = "invalidated"
+)
+
+// AudioReconcileEntryV3 is one settled reconciliation decision. Generation
+// names the verified inventory it was decided against; Request holds the
+// exact automatic replan body for a replanned decision (nil otherwise) so a
+// retry replays the same bytes; RequestDigest fingerprints those bytes and
+// is the idempotency key the decision is retried under.
+type AudioReconcileEntryV3 struct {
+	Generation string `json:"generation"`
+	// SessionID is the attempt session the decision was recorded under. The
+	// ledger is stored per session row, so this is normally that row's own
+	// session; it is persisted with the entry so a replayed entry can be
+	// validated against the session it was decided for rather than the plan id
+	// that happened to be current when the ledger was read.
+	SessionID  string                   `json:"session_id,omitempty"`
+	Decision   AudioReconcileDecisionV3 `json:"decision"`
+	AudioIndex *int                     `json:"audio_index,omitempty"`
+	// PlanID is the plan the decision was decided against, and the plan an
+	// AudioReconcileInvalidated entry withdraws. Keying a lookup on it would
+	// be wrong: the same generation is re-evaluated against whichever plan is
+	// active then, and the plan id moves as replans commit.
+	PlanID        string           `json:"plan_id,omitempty"`
+	Request       *ReplanRequestV3 `json:"request,omitempty"`
+	RequestDigest string           `json:"request_digest,omitempty"`
+	// Reason is the plan_invalidated reason string this settled decision
+	// implies: "default_audio_reconciliation" for replanned/invalidated
+	// decisions, the empty string otherwise. The replan answering the
+	// withdrawal echoes it back in answers_plan_invalidation, and matching
+	// it against this field is what makes the replan authoritatively a
+	// reconciliation response rather than an identity heuristic.
+	Reason string `json:"reason,omitempty"`
+	// AnnouncedAt records when the realtime hub last accepted this entry's
+	// withdrawal for a client that negotiated both plan_invalidated_v1 and
+	// default_audio_reconcile_response_v1. It is delivery ATTEMPT state and is
+	// deliberately not terminal: a nil value means the withdrawal has never
+	// been delivered, but a set value proves only that the server wrote the
+	// command, not that the client read it, replanned onto it, or stayed
+	// connected to commit. The reconcile loop therefore keys its silence on
+	// completion — the attempt's current plan id moving off this entry's PlanID
+	// — and keeps re-announcing an outstanding correction (with the same
+	// command id, bounded by an in-process attempt ceiling) until that happens.
+	AnnouncedAt *time.Time `json:"announced_at,omitempty"`
 }
 
 // RecoveryExclusionV3 is one confirmed candidate failure. The tuple is scoped
@@ -290,6 +421,100 @@ type RecoveryStateStoreV3 interface {
 	AppendRecoveryExclusions(ctx context.Context, sessionID string, baseRevision int64, exclusions []RecoveryExclusionV3) (RecoveryStateV3, int64, error)
 	// GetRecoveryState reads the durable chain and its current revision.
 	GetRecoveryState(ctx context.Context, sessionID string) (RecoveryStateV3, int64, error)
+}
+
+// AudioReconcileStoreV3 is the durable attempt-scoped reconciliation ledger.
+// It is a separate capability so the handler can detect a store that cannot
+// persist it (a legacy wrapper) and run the reconcile path without a ledger
+// rather than silently dropping a recorded decision. An implementation must
+// append, never replace: a generation is recorded once, and concurrent
+// writers serialize on the ledger revision so neither loses a decision.
+type AudioReconcileStoreV3 interface {
+	// RecordAudioReconciliation appends the settled decision to the attempt's
+	// durable ledger and returns the resulting ledger. baseRevision is the
+	// revision the caller read alongside its current ledger; a mismatched
+	// write returns ErrRecoveryRevisionConflictV3 with the committed revision
+	// instead of clobbering, and the caller re-reads and retries. A negative
+	// baseRevision appends unconditionally. Recording the same
+	// (generation, session) pair twice is a no-op returning the stored entry.
+	// It returns ErrSessionNotFound when there is no live attempt row.
+	RecordAudioReconciliation(ctx context.Context, sessionID string, baseRevision int64, entry AudioReconcileEntryV3) (AudioReconcileLedgerV3, int64, error)
+	// GetAudioReconcileLedger reads the durable ledger and its revision.
+	GetAudioReconcileLedger(ctx context.Context, sessionID string) (AudioReconcileLedgerV3, int64, error)
+}
+
+// FindAudioReconcileEntry returns the settled entry for the (generation,
+// session) pair, or nil when that generation has no recorded decision for that
+// session. The session is part of the key because one verified generation can
+// be reconciled for several live sessions, each with its own committed plan
+// and its own canonical request: settling one session must never suppress
+// another. Entries recorded before the session id was persisted are matched by
+// generation alone, so an in-flight upgrade of the ledger cannot re-decide a
+// generation that was already settled.
+func FindAudioReconcileEntry(ledger AudioReconcileLedgerV3, generation, sessionID string) *AudioReconcileEntryV3 {
+	for i := range ledger.Entries {
+		entry := ledger.Entries[i]
+		if entry.Generation != generation {
+			continue
+		}
+		if entry.SessionID == "" || strings.TrimSpace(sessionID) == "" || entry.SessionID == sessionID {
+			return &entry
+		}
+	}
+	return nil
+}
+
+// AppendAudioReconcileEntry returns base with entry appended, or base
+// unchanged when the same (generation, session, decision) is already recorded.
+// One decision per pair is the invariant — a replayed record is a no-op, so
+// concurrent commits converge — while a REFUSED entry recorded for a pair that
+// already settled as an invalidation is a distinct entry: it carries the
+// rejected canonical digest next to the stored one, which is what makes a
+// diverged re-evaluation auditable instead of silently dropped.
+//
+// The one in-place mutation on an otherwise append-only chain is the
+// delivery-state enrichment of a settled invalidation: recording the same
+// decision with a nil AnnouncedAt keeps the stored entry, but recording it
+// with AnnouncedAt set adopts the timestamp onto the stored entry (the
+// decision semantics — generation, session, decision, digest — are unchanged).
+func AppendAudioReconcileEntry(base AudioReconcileLedgerV3, entry AudioReconcileEntryV3) AudioReconcileLedgerV3 {
+	for _, existing := range base.Entries {
+		if existing.Generation == entry.Generation &&
+			existing.SessionID == entry.SessionID &&
+			existing.Decision == entry.Decision &&
+			existing.RequestDigest == entry.RequestDigest {
+			if entry.AnnouncedAt == nil || (existing.AnnouncedAt != nil && !existing.AnnouncedAt.IsZero()) {
+				return base
+			}
+			// The same decision was recorded but its delivery state advanced
+			// (AnnouncedAt nil -> set): enrich the stored entry in place rather
+			// than appending a duplicate. This keeps one entry per settled
+			// decision while still persisting the acknowledgement.
+			merged := base
+			merged.Entries = append([]AudioReconcileEntryV3(nil), base.Entries...)
+			for i := range merged.Entries {
+				if merged.Entries[i].Generation == entry.Generation &&
+					merged.Entries[i].SessionID == entry.SessionID &&
+					merged.Entries[i].Decision == entry.Decision &&
+					merged.Entries[i].RequestDigest == entry.RequestDigest {
+					merged.Entries[i].AnnouncedAt = entry.AnnouncedAt
+				}
+			}
+			return merged
+		}
+	}
+	merged := base
+	merged.Entries = append(append([]AudioReconcileEntryV3(nil), base.Entries...), entry)
+	return merged
+}
+
+// AudioReconcileLedgerEntriesEqual reports whether two entry chains carry the
+// same entries in the same order, including each entry's AnnouncedAt delivery
+// state. The stores use it to tell a true no-op (same decision, same delivery
+// state) from an in-place delivery-state enrichment of a settled entry, which
+// must still be written and bump the ledger revision.
+func AudioReconcileLedgerEntriesEqual(a, b []AudioReconcileEntryV3) bool {
+	return reflect.DeepEqual(a, b)
 }
 
 // UnionRecoveryExclusions appends the incoming exclusions to a copy of base,
@@ -641,6 +866,44 @@ func (s *MemoryPlanStoreV3) GetRecoveryState(_ context.Context, sessionID string
 		return RecoveryStateV3{}, 0, ErrSessionNotFound
 	}
 	return record.RecoveryState, record.RecoveryRevision, nil
+}
+
+// RecordAudioReconciliation appends the settled decision to the attempt's
+// durable ledger. It is a compare-and-set on the ledger revision: a caller
+// presenting a stale revision loses and retries against the committed
+// ledger, so no writer can drop another's decision. Recording the same
+// (generation, session, decision, digest) again returns the stored entry
+// without growing the chain.
+func (s *MemoryPlanStoreV3) RecordAudioReconciliation(_ context.Context, sessionID string, baseRevision int64, entry AudioReconcileEntryV3) (AudioReconcileLedgerV3, int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	attemptID, record := s.findAttemptLocked(sessionID)
+	if record == nil {
+		return AudioReconcileLedgerV3{}, 0, ErrSessionNotFound
+	}
+	if baseRevision >= 0 && record.AudioReconcileLedger.Revision != baseRevision {
+		return AudioReconcileLedgerV3{}, record.AudioReconcileLedger.Revision, ErrRecoveryRevisionConflictV3
+	}
+	merged := AppendAudioReconcileEntry(record.AudioReconcileLedger, entry)
+	if len(merged.Entries) == len(record.AudioReconcileLedger.Entries) &&
+		AudioReconcileLedgerEntriesEqual(merged.Entries, record.AudioReconcileLedger.Entries) {
+		return record.AudioReconcileLedger, record.AudioReconcileLedger.Revision, nil
+	}
+	merged.Revision = record.AudioReconcileLedger.Revision + 1
+	record.AudioReconcileLedger = merged
+	s.attempts[attemptID] = *record
+	return merged, merged.Revision, nil
+}
+
+// GetAudioReconcileLedger reads the durable ledger and its revision.
+func (s *MemoryPlanStoreV3) GetAudioReconcileLedger(_ context.Context, sessionID string) (AudioReconcileLedgerV3, int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, record := s.findAttemptLocked(sessionID)
+	if record == nil {
+		return AudioReconcileLedgerV3{}, 0, ErrSessionNotFound
+	}
+	return record.AudioReconcileLedger, record.AudioReconcileLedger.Revision, nil
 }
 
 // findAttemptLocked returns the live attempt for a session; the caller holds

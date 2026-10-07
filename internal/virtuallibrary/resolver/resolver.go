@@ -184,6 +184,11 @@ func DefaultEnricher(c *StreamCandidate) {
 
 // Resolver fetches Stremio stream candidates from a manifest provider with a
 // bounded cache. Safe for concurrent use.
+//
+// requestIDReader extracts the edge request id from a fetch context for the
+// provider-fetch log. It is a per-resolver field (not a package global) so
+// concurrent resolvers in tests never share wiring; production installs the
+// parent virtuallibrary reader via SetRequestIDReader before first use.
 type Resolver struct {
 	client *http.Client
 
@@ -194,6 +199,8 @@ type Resolver struct {
 	classifier  CandidateClassifier
 	releaseGate ReleaseGate
 	logger      *slog.Logger
+
+	requestIDReader func(context.Context) string
 
 	cacheMu         sync.Mutex
 	cache           map[string]candidateCacheEntry
@@ -295,6 +302,31 @@ func (r *Resolver) SetLogger(logger *slog.Logger) {
 	r.mu.Lock()
 	r.logger = logger
 	r.mu.Unlock()
+}
+
+// SetRequestIDReader installs the request-id reader for provider-fetch
+// logging (the parent virtuallibrary helper in production). It must be
+// called before the resolver serves traffic; until then fetches log without
+// a request id rather than a wrong one. A nil reader is ignored.
+func (r *Resolver) SetRequestIDReader(reader func(context.Context) string) {
+	if r == nil || reader == nil {
+		return
+	}
+	r.mu.Lock()
+	r.requestIDReader = reader
+	r.mu.Unlock()
+}
+
+// fetchRequestID resolves the edge request id for the provider-fetch log
+// through the installed reader, or "" when none is installed.
+func (r *Resolver) fetchRequestID(ctx context.Context) string {
+	r.mu.RLock()
+	reader := r.requestIDReader
+	r.mu.RUnlock()
+	if reader == nil {
+		return ""
+	}
+	return reader(ctx)
 }
 
 // unreleasedError reports that tracked release metadata places the requested
@@ -1178,7 +1210,7 @@ func (r *Resolver) getCandidatesRaw(ctx context.Context, virtualPath string, for
 	// one provider fetch per listing, with every caller served its result. The
 	// join respects context cancellation, so a caller bounded by its own
 	// per-file budget still returns when that budget fires.
-	if wait := r.joinFlight(cacheKey, config, generation, mediaType, mediaID); wait != nil {
+	if wait := r.joinFlight(ctx, cacheKey, config, generation, mediaType, mediaID); wait != nil {
 		candidates, ok, err := r.awaitFlight(ctx, wait, cacheKey)
 		if err != nil {
 			// The joined flight failed. Surface its provider error instead of
@@ -1292,8 +1324,11 @@ func (r *Resolver) awaitFlight(ctx context.Context, flight *candidateFlight, cac
 // other flight is active for the key. It returns the flight to wait on. The
 // fetch runs on a background goroutine and publishes its provider error on the
 // flight before closing it, so every waiter can distinguish a failed fetch
-// from a successful one. Callers must NOT hold cacheMu.
-func (r *Resolver) joinFlight(cacheKey string, config Config, generation uint64, mediaType, mediaID string) *candidateFlight {
+// from a successful one. The detached fetch context preserves the caller's
+// request values (including the edge request id for the fetch log) while
+// carrying its own timeout, so a canceled caller does not kill the shared
+// fetch its waiters still need. Callers must NOT hold cacheMu.
+func (r *Resolver) joinFlight(ctx context.Context, cacheKey string, config Config, generation uint64, mediaType, mediaID string) *candidateFlight {
 	r.cacheMu.Lock()
 	defer r.cacheMu.Unlock()
 	if r.refreshes == nil {
@@ -1321,9 +1356,9 @@ func (r *Resolver) joinFlight(cacheKey string, config Config, generation uint64,
 			r.cacheMu.Unlock()
 			close(flight.done)
 		}()
-		ctx, cancel := context.WithTimeout(context.Background(), syncFetchTimeout)
+		fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), syncFetchTimeout)
 		defer cancel()
-		_, err := r.fetchProviderCandidates(ctx, config, generation, cacheKey, mediaType, mediaID)
+		_, err := r.fetchProviderCandidates(fetchCtx, config, generation, cacheKey, mediaType, mediaID)
 		flight.err = err
 		if err != nil {
 			r.recordProviderFailure(cacheKey)
@@ -1443,10 +1478,16 @@ func (r *Resolver) fetchProviderCandidates(ctx context.Context, config Config, g
 	logger := r.logger
 	r.mu.RUnlock()
 	if logger != nil {
-		logger.Info("provider candidates fetched",
+		attrs := []any{
 			"media_type", mediaType, "media_id", mediaID,
 			"count", len(validCandidates),
-			"duration_ms", time.Since(started).Milliseconds())
+			"duration_ms", time.Since(started).Milliseconds(),
+			"cache_key", cacheKey,
+		}
+		if requestID := r.fetchRequestID(ctx); requestID != "" {
+			attrs = append(attrs, "request_id", requestID)
+		}
+		logger.InfoContext(ctx, "provider candidates fetched", attrs...)
 	}
 	return validCandidates, nil
 }

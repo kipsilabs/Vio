@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -407,6 +408,56 @@ func TestConcurrentRequestsJoinSingleFlight(t *testing.T) {
 		}
 		if len(results[i]) != 1 || results[i][0].URL != answer[0].URL {
 			t.Fatalf("caller %d result = %+v, want %+v", i, results[i], answer)
+		}
+	}
+}
+
+// TestSharedFlightPreservesInitiatingRequestID proves the boundary fix the
+// production correlation depends on: the shared singleflight fetch runs
+// detached (a canceled initiator must not kill the fetch its waiters need),
+// but it carries the initiating request's values, so the fetch log still
+// names the start that triggered it. Without the value-preserving detach,
+// the provider line logs without a request id even on a request-driven cold
+// fetch.
+func TestSharedFlightPreservesInitiatingRequestID(t *testing.T) {
+	release := make(chan struct{})
+	firstHit := make(chan struct{})
+	var once sync.Once
+	p := newCountingProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		once.Do(func() { close(firstHit) })
+		<-release
+		writeStreams(w, []StreamCandidate{{URL: "https://cdn.example/one.mkv", Name: "One"}})
+	})
+	r := New(testConfig(p))
+	var buf fetchLogBuffer
+	r.SetLogger(slog.New(slog.NewTextHandler(&buf, nil)))
+	r.SetRequestIDReader(requestIDReaderFromContext)
+
+	ctx := contextWithRequestID(context.Background(), "req-shared")
+	done := make(chan struct{})
+	var fetchErr error
+	go func() {
+		defer close(done)
+		_, _, _, fetchErr = r.GetCandidates(ctx, "virtual://movie/tt1")
+	}()
+	select {
+	case <-firstHit:
+	case <-time.After(5 * time.Second):
+		t.Fatal("provider was never called")
+	}
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("fetch never completed")
+	}
+	if fetchErr != nil {
+		t.Fatalf("GetCandidates: %v", fetchErr)
+	}
+	out := buf.String()
+	for _, want := range []string{"provider candidates fetched", "req-shared", "movie|tt1"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("shared-flight provider log %q missing %q", out, want)
 		}
 	}
 }

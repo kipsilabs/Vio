@@ -21,6 +21,7 @@ import (
 	"time"
 
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
+	langpkg "github.com/Silo-Server/silo-server/internal/lang"
 	"github.com/Silo-Server/silo-server/internal/logredact"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
@@ -28,6 +29,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/scanner"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary/resolver"
+	chimw "github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"golang.org/x/text/language"
@@ -1373,9 +1375,13 @@ type resolvedVirtualPlaybackSource struct {
 	// CandidateRank is the 0-based position of the selected candidate in the
 	// ranked candidate list this resolve considered, or -1 when the resolve
 	// took a path that did not rank (a stored-URL fast path with no list).
-	// CandidateCount is that list's length. They feed the plan-decision log so
-	// a deployment question ("which candidate did it pick, and out of how
-	// many?") is answerable without a second resolve.
+	// CandidateCount is that list's length: the count the selected rank is
+	// measured against, or -1 when unknown. A measured zero comes from an
+	// empty ranked list (or, defensively, from any path that never set the
+	// field); it is not a rank into a list and must render without one.
+	// They feed the plan-decision log so a deployment question ("which
+	// candidate did it pick, and out of how many?") is answerable without a
+	// second resolve.
 	CandidateRank  int
 	CandidateCount int
 	// SubstitutedFromFileID names the catalog row the caller asked for when the
@@ -1519,11 +1525,21 @@ func (t *virtualResolveTrace) finishBudget() {
 // runs first in log), so the reported elapsed and the exceeded verdict can
 // never disagree near the boundary.
 func (t *virtualResolveTrace) fields() []any {
+	return t.fieldsWithContext(context.Background())
+}
+
+// fieldsWithContext is fields plus the edge request id, read from the start
+// request's context. It joins this line to the start that owns it (protocol
+// v3 start timing) and to the provider listing it may have triggered
+// (provider candidates fetched). Empty stays empty rather than a fabricated
+// join key. Split out so tests can call fields() without a request context.
+func (t *virtualResolveTrace) fieldsWithContext(ctx context.Context) []any {
 	elapsedMS := t.budgetElapsed.Milliseconds()
 	if !t.budgetRan {
 		elapsedMS = time.Since(t.started).Milliseconds()
 	}
 	attrs := []any{
+		requestIDLogKeyV3, chimw.GetReqID(ctx),
 		"elapsed_ms", elapsedMS,
 		"total_ms", t.totalMS(), //nolint:goconst // log attribute key/value, kept inline for readability.
 		"candidates", t.candidates, //nolint:goconst // log attribute key/value, kept inline for readability.
@@ -1559,7 +1575,7 @@ func (t *virtualResolveTrace) log(ctx context.Context, file *models.MediaFile) {
 	}
 	t.finishBudget()
 	attrs := []any{logComponentKey, "api", "content_id", file.ContentID} //nolint:goconst // log attribute key/value, kept inline for readability.
-	attrs = append(attrs, t.fields()...)
+	attrs = append(attrs, t.fieldsWithContext(ctx)...)
 	slog.InfoContext(ctx, "virtual resolve timing", attrs...)
 }
 
@@ -2412,6 +2428,9 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			return &resolvedVirtualPlaybackSource{
 				URL: "", URI: cand.URI, OwnerID: oid, File: &transient,
 				ProbeSucceeded: false, Provenance: ProbeProvenancePending,
+				// Unranked: this path skipped the candidate list, so the
+				// rank/count stay unknown rather than the zero value.
+				CandidateRank: -1, CandidateCount: -1,
 			}, nil
 		}
 		// Durable-resume fast path. The repeat-play gate above cannot apply
@@ -2452,6 +2471,8 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				return &resolvedVirtualPlaybackSource{
 					URL: "", URI: cand.URI, OwnerID: oid, File: &transient,
 					ProbeSucceeded: false, Provenance: ProbeProvenancePending,
+					// Unranked: this path skipped the candidate list.
+					CandidateRank: -1, CandidateCount: -1,
 				}, nil
 			}
 		}
@@ -2497,6 +2518,8 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				return &resolvedVirtualPlaybackSource{
 					URL: "", URI: cand.URI, OwnerID: oid, File: &transient,
 					ProbeSucceeded: false, Provenance: ProbeProvenancePending,
+					// Unranked: this path skipped the candidate list.
+					CandidateRank: -1, CandidateCount: -1,
 				}, nil
 			}
 		}
@@ -2944,11 +2967,12 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		if fastPathHit {
 			// The repeat-play fast path already committed the persisted
 			// candidate; return it without re-ranking or unpinning the pin.
+			// The rank/count describe the candidate list this start ranked,
+			// which the fast path skipped: keep them unknown (-1) rather than
+			// stamping a rank 0 into a list that was never measured.
 			if result == nil {
 				return resolvedVirtualPlaybackSource{}, errors.New("virtual playback fast path returned no source")
 			}
-			result.CandidateRank = i
-			result.CandidateCount = len(candidates)
 			return *result, nil
 		}
 		if err != nil || result.Provenance == ProbeProvenanceFailed {
@@ -3053,6 +3077,8 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		if firstResolved.Provenance == ProbeProvenanceVerified {
 			h.persistVirtualProbeEvidence(r.Context(), file, firstResolved.File.FilePath, firstResolved.File, true, true)
 		}
+		// The rank/count were set where this result was produced; a
+		// fast-path result that skipped ranking keeps its unknown (-1).
 		return *firstResolved, nil
 	}
 	if attemptErr == nil {
@@ -6335,12 +6361,15 @@ func mergeVirtualCandidateLanguages(probed *models.MediaFile, candidate VirtualP
 	channels := inferChannelsFromCodec(audioCodec)
 	if len(candidate.AudioLanguages) > 0 {
 		existing := make(map[string]bool, len(candidate.AudioLanguages))
-		for _, lang := range candidate.AudioLanguages {
-			lang = strings.TrimSpace(lang)
-			if lang == "" || !isRealVirtualLanguageTag(lang) {
+		for _, candidateLang := range candidate.AudioLanguages {
+			candidateLang = strings.TrimSpace(candidateLang)
+			if candidateLang == "" || !isRealVirtualLanguageTag(candidateLang) {
 				continue
 			}
-			canonical := virtualLanguageBaseSubtag(lang)
+			canonical := langpkg.CanonicalTag(candidateLang)
+			if canonical == "" {
+				canonical = virtualLanguageBaseSubtag(candidateLang)
+			}
 			if existing[canonical] {
 				continue
 			}
@@ -6349,7 +6378,7 @@ func mergeVirtualCandidateLanguages(probed *models.MediaFile, candidate VirtualP
 				// Synthesized tracks carry no real container stream index; the
 				// array position is the ordinal (audioStreamOrdinalV3 falls back
 				// to it when Index <= 0).
-				Language: lang,
+				Language: candidateLang,
 				Codec:    audioCodec,
 				Channels: channels,
 			})

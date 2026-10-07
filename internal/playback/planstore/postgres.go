@@ -88,6 +88,19 @@ func (s *Postgres) SaveAttempt(ctx context.Context, record playback.AttemptRecor
 	if err != nil {
 		return err
 	}
+	selectionJSON, err := json.Marshal(playback.AudioSelectionV3{
+		Origin:            record.SelectionOrigin,
+		PreferredLanguage: record.PreferredAudioLanguage,
+		SeriesSignature:   record.SeriesAudioPreferenceSignature,
+		SelectedSignature: record.SelectedAudioSignature,
+	})
+	if err != nil {
+		return err
+	}
+	ledgerJSON, err := json.Marshal(record.AudioReconcileLedger)
+	if err != nil {
+		return err
+	}
 	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return err
@@ -115,13 +128,15 @@ func (s *Postgres) SaveAttempt(ctx context.Context, record playback.AttemptRecor
 			playback_attempt_id, session_id, user_id, profile_id,
 			requested_media_file_id, effective_media_file_id,
 			current_plan_id, current_replan_request_id, current_plan, frozen_recipe,
-			normalized_request, start_response, request_digest, expires_at, server_bitrate_cap_kbps
-		) VALUES ($1, NULLIF($2, '')::uuid, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+			normalized_request, start_response, request_digest, expires_at, server_bitrate_cap_kbps,
+			audio_selection, audio_reconcile_ledger
+		) VALUES ($1, NULLIF($2, '')::uuid, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
 		ON CONFLICT DO NOTHING`,
 		record.PlaybackAttemptID, record.SessionID, record.UserID, record.ProfileID,
 		record.RequestedMediaFileID, record.EffectiveMediaFileID,
 		record.CurrentPlanID, record.CurrentReplanRequestID, planJSON, recipeJSON,
-		requestJSON, responseJSON, record.RequestDigest, record.ExpiresAt, record.ServerBitrateCapKbps)
+		requestJSON, responseJSON, record.RequestDigest, record.ExpiresAt, record.ServerBitrateCapKbps,
+		selectionJSON, ledgerJSON)
 	if err != nil {
 		return err
 	}
@@ -177,13 +192,14 @@ func (s *Postgres) getAttemptIdentity(ctx context.Context, predicate string, val
 
 func (s *Postgres) getAttempt(ctx context.Context, predicate string, value any) (*playback.AttemptRecordV3, error) {
 	var record playback.AttemptRecordV3
-	var planJSON, recipeJSON, requestJSON, responseJSON, sampleJSON, recoveryJSON []byte
+	var planJSON, recipeJSON, requestJSON, responseJSON, sampleJSON, recoveryJSON, selectionJSON, ledgerJSON []byte
 	err := s.db.QueryRow(ctx, `
 		SELECT playback_attempt_id, COALESCE(session_id::text, ''), user_id, profile_id,
 		       requested_media_file_id, effective_media_file_id,
 		       current_plan_id, current_replan_request_id, current_plan, frozen_recipe,
 		       normalized_request, start_response, request_digest, expires_at, server_bitrate_cap_kbps,
-		       last_sequence, last_sample, stopped_at, updated_at, recovery_state, recovery_revision
+		       last_sequence, last_sample, stopped_at, updated_at, recovery_state, recovery_revision,
+		       audio_selection, audio_reconcile_ledger
 		FROM playback_v3_attempts
 		WHERE `+predicate+` AND expires_at > NOW()`, value).Scan(
 		&record.PlaybackAttemptID, &record.SessionID, &record.UserID, &record.ProfileID,
@@ -192,6 +208,7 @@ func (s *Postgres) getAttempt(ctx context.Context, predicate string, value any) 
 		&requestJSON, &responseJSON, &record.RequestDigest, &record.ExpiresAt, &record.ServerBitrateCapKbps,
 		&record.LastSequence, &sampleJSON, &record.StoppedAt, &record.LastSampleAt,
 		&recoveryJSON, &record.RecoveryRevision,
+		&selectionJSON, &ledgerJSON,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, playback.ErrSessionNotFound
@@ -216,6 +233,24 @@ func (s *Postgres) getAttempt(ctx context.Context, predicate string, value any) 
 	}
 	if len(recoveryJSON) > 0 {
 		if err := json.Unmarshal(recoveryJSON, &record.RecoveryState); err != nil {
+			return nil, err
+		}
+	}
+	// audio_selection and audio_reconcile_ledger postdate the intent work:
+	// rows written before the migration carry '{}' and decode to the zero
+	// value, which reconciliation treats as "no intent / no decision".
+	if len(selectionJSON) > 0 {
+		var selection playback.AudioSelectionV3
+		if err := json.Unmarshal(selectionJSON, &selection); err != nil {
+			return nil, err
+		}
+		record.SelectionOrigin = selection.Origin
+		record.PreferredAudioLanguage = selection.PreferredLanguage
+		record.SeriesAudioPreferenceSignature = selection.SeriesSignature
+		record.SelectedAudioSignature = selection.SelectedSignature
+	}
+	if len(ledgerJSON) > 0 {
+		if err := json.Unmarshal(ledgerJSON, &record.AudioReconcileLedger); err != nil {
 			return nil, err
 		}
 	}
@@ -272,6 +307,97 @@ func (s *Postgres) AppendRecoveryExclusions(ctx context.Context, sessionID strin
 		return playback.RecoveryStateV3{}, 0, err
 	}
 	return merged, next, nil
+}
+
+// RecordAudioReconciliation appends the settled reconciliation decision to
+// the attempt's durable ledger under a row lock. The transaction serializes
+// concurrent records on the attempt row, and the base-revision compare makes
+// a writer that read a stale revision lose with
+// ErrRecoveryRevisionConflictV3 instead of clobbering a newer decision.
+// Recording the same (generation, session, decision, digest) twice is a no-op
+// returning the stored ledger: retries and second replicas converge instead of
+// minting a second event.
+func (s *Postgres) RecordAudioReconciliation(ctx context.Context, sessionID string, baseRevision int64, entry playback.AudioReconcileEntryV3) (playback.AudioReconcileLedgerV3, int64, error) {
+	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return playback.AudioReconcileLedgerV3{}, 0, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var ledgerJSON []byte
+	var revision int64
+	err = tx.QueryRow(ctx, `
+		SELECT audio_reconcile_ledger, COALESCE((audio_reconcile_ledger->>'revision')::bigint, 0) FROM playback_v3_attempts
+		WHERE session_id = $1::uuid AND expires_at > NOW()
+		FOR UPDATE`, sessionID).Scan(&ledgerJSON, &revision)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return playback.AudioReconcileLedgerV3{}, 0, playback.ErrSessionNotFound
+	}
+	if err != nil {
+		return playback.AudioReconcileLedgerV3{}, 0, err
+	}
+	if baseRevision >= 0 && revision != baseRevision {
+		return playback.AudioReconcileLedgerV3{}, revision, playback.ErrRecoveryRevisionConflictV3
+	}
+	var base playback.AudioReconcileLedgerV3
+	if len(ledgerJSON) > 0 {
+		if err := json.Unmarshal(ledgerJSON, &base); err != nil {
+			return playback.AudioReconcileLedgerV3{}, 0, err
+		}
+	}
+	base.Revision = revision
+	merged := playback.AppendAudioReconcileEntry(base, entry)
+	if len(merged.Entries) == len(base.Entries) &&
+		playback.AudioReconcileLedgerEntriesEqual(merged.Entries, base.Entries) {
+		// The same decision is already recorded with the same delivery
+		// state: report the stored ledger without taking the write lock's
+		// revision. A retry must not look like a new decision to a caller
+		// reading the revision it handed back.
+		if err := tx.Commit(ctx); err != nil {
+			return playback.AudioReconcileLedgerV3{}, 0, err
+		}
+		return base, revision, nil
+	}
+	merged.Revision = revision + 1
+	mergedJSON, err := json.Marshal(merged)
+	if err != nil {
+		return playback.AudioReconcileLedgerV3{}, 0, err
+	}
+	var next int64
+	if err := tx.QueryRow(ctx, `
+		UPDATE playback_v3_attempts
+		SET audio_reconcile_ledger = $2, updated_at = NOW()
+		WHERE session_id = $1::uuid AND expires_at > NOW()
+		RETURNING (audio_reconcile_ledger->>'revision')::bigint`, sessionID, mergedJSON).Scan(&next); err != nil {
+		return playback.AudioReconcileLedgerV3{}, 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return playback.AudioReconcileLedgerV3{}, 0, err
+	}
+	return merged, next, nil
+}
+
+// GetAudioReconcileLedger reads the durable reconciliation ledger and its
+// revision.
+func (s *Postgres) GetAudioReconcileLedger(ctx context.Context, sessionID string) (playback.AudioReconcileLedgerV3, int64, error) {
+	var ledgerJSON []byte
+	var revision int64
+	err := s.db.QueryRow(ctx, `
+		SELECT audio_reconcile_ledger, COALESCE((audio_reconcile_ledger->>'revision')::bigint, 0) FROM playback_v3_attempts
+		WHERE session_id = $1::uuid AND expires_at > NOW()`, sessionID).Scan(&ledgerJSON, &revision)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return playback.AudioReconcileLedgerV3{}, 0, playback.ErrSessionNotFound
+	}
+	if err != nil {
+		return playback.AudioReconcileLedgerV3{}, 0, err
+	}
+	var ledger playback.AudioReconcileLedgerV3
+	if len(ledgerJSON) > 0 {
+		if err := json.Unmarshal(ledgerJSON, &ledger); err != nil {
+			return playback.AudioReconcileLedgerV3{}, 0, err
+		}
+	}
+	ledger.Revision = revision
+	return ledger, revision, nil
 }
 
 // GetRecoveryState reads the durable exclusion chain and its revision.

@@ -218,22 +218,42 @@ func isClientCancellation(ctx context.Context, err error) bool {
 // logVirtualStreamFailure records the sanitized cause behind a virtual-stream
 // 502. A provider URL can be embedded in a wrapped *url.Error, so the cause is
 // passed through logredact; only the provider-neutral virtual URI, the file,
-// the session, and the owner installation are logged directly.
+// the session, the pinned and delivered candidate identities, and the owner
+// installation are logged directly.
+//
+// deliveredPath is the virtual:// path the transport actually served (the
+// ?result= identity the bytes came from), or "" when the failure happened
+// before any candidate was served — a resolve failure, an unparseable relay
+// target, a lapsed-registration retry that never re-resolved. It must be
+// passed explicitly because the catalog row (file.FilePath) still names the
+// pinned candidate after a heal or rotation rebinds the served path: reading
+// the identity off the row would blame the pin for a sibling's failure.
+// pinned_candidate_id is the ?result= on the row; delivered_candidate_id is
+// the ?result= on deliveredPath, empty when nothing was served. The two agree
+// on the common path and disagree exactly when attribution matters.
 //
 // A client cancellation is not a transport failure: the upstream fetch runs on
 // the request context, so the viewer navigating away (or hls.js giving up)
 // already canceled it. That case is a debug line with an explicit reason so it
 // cannot be mistaken for a provider outage; genuine timeouts and provider
 // errors stay at WARN.
-func logVirtualStreamFailure(ctx context.Context, sessionID string, file *models.MediaFile, err error) {
+func logVirtualStreamFailure(ctx context.Context, sessionID string, file *models.MediaFile, err error, deliveredPath ...string) {
 	if err == nil || file == nil {
 		return
+	}
+	pinnedID := virtualCandidateID(file)
+	deliveredID := ""
+	if len(deliveredPath) > 0 {
+		deliveredID = virtualResultCandidateID(deliveredPath[0])
 	}
 	if isClientCancellation(ctx, err) {
 		slog.DebugContext(ctx, "virtual stream transport canceled by client",
 			"component", "api",
 			"session", sessionID,
+			"playback_session_id", sessionID,
 			"file_id", file.ID,
+			"pinned_candidate_id", pinnedID,
+			"delivered_candidate_id", deliveredID,
 			"reason", "client_canceled",
 		)
 		return
@@ -241,7 +261,10 @@ func logVirtualStreamFailure(ctx context.Context, sessionID string, file *models
 	slog.WarnContext(ctx, "virtual stream transport failed",
 		"component", "api",
 		"session", sessionID,
+		"playback_session_id", sessionID,
 		"file_id", file.ID,
+		"pinned_candidate_id", pinnedID,
+		"delivered_candidate_id", deliveredID,
 		"owner_installation_id", file.VirtualOwnerInstallationID,
 		"virtual_uri", file.FilePath,
 		"error", logredact.SanitizeURLError(err),
@@ -2329,6 +2352,12 @@ func (h *PlaybackHandler) HandleUpdateProgress(w http.ResponseWriter, r *http.Re
 	// Persist progress to UserStore (best-effort).
 	if sess, getErr := h.sessionMgr.GetSession(sessionID); getErr == nil {
 		h.persistProgress(r.Context(), sess)
+		// The first progress report after attach is the probe-before-attach
+		// hook: evidence may have landed while no session was registered, so
+		// the attach-side check replayed nothing yet. Replays are idempotent
+		// (a settled selection is a byte-equal no-op), bounded to one
+		// heartbeat-triggered check per session attach generation.
+		h.reconcilePendingAudioStartup(r.Context(), sessionID)
 		if !sess.DisableProgressPersistence && h.WatchScrobbler != nil && wasPaused != sess.IsPaused {
 			if file, loadErr := h.loadFileByPreferredID(r.Context(), requestedMediaFileID(sess), sess.MediaFileID); loadErr == nil && file != nil {
 				targetID := playbackProgressTarget(file)

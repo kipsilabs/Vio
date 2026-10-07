@@ -256,28 +256,29 @@ type PlaybackMutationOutput struct {
 // PlaybackReplanBody is the v3 replan request: failure recovery, seek
 // re-anchor, and track, quality or output changes for a live session.
 type PlaybackReplanBody struct {
-	InstallationID        ID                                 `json:"installation_id" minLength:"1"`
-	ProtocolVersion       int                                `json:"protocol_version"`
-	ClientFeatures        []string                           `json:"client_features,omitempty"`
-	Operation             playback.ReplanOperationV3         `json:"operation,omitempty" enum:"failure_recovery,seek_reanchor,seek_failure_recovery,track_change,quality_change,output_change"`
-	PlaybackAttemptID     string                             `json:"playback_attempt_id" minLength:"8" maxLength:"128"`
-	ReplanRequestID       string                             `json:"replan_request_id" minLength:"8" maxLength:"128" doc:"Client-minted identity of this replan; a retry with the same body replays the durable decision"`
-	FailedPlanID          string                             `json:"failed_plan_id" minLength:"8" maxLength:"128"`
-	PlanAttemptID         string                             `json:"plan_attempt_id" minLength:"8" maxLength:"128"`
-	PlanAttemptKey        string                             `json:"plan_attempt_key" minLength:"8" maxLength:"128"`
-	AttemptedPlanKeys     []string                           `json:"attempted_plan_keys" maxItems:"16"`
-	LocalMutations        []string                           `json:"local_mutations,omitempty" maxItems:"8"`
-	AttemptCount          int                                `json:"attempt_count" minimum:"1" maximum:"8"`
-	QualityPreference     string                             `json:"quality_preference"`
-	PositionSeconds       float64                            `json:"position_seconds" minimum:"0"`
-	Metered               bool                               `json:"metered"`
-	AutoFallback          *bool                              `json:"auto_fallback,omitempty" nullable:"false" doc:"Re-negotiates the session's version-fallback intent. Set true when the viewer re-arms Auto mid-session; omitted leaves the start-time intent unchanged. Never authorizes a healthy mid-play switch."`
-	BandwidthEstimateKbps *int                               `json:"bandwidth_estimate_kbps,omitempty" nullable:"false"`
-	BandwidthCapKbps      *int                               `json:"bandwidth_cap_kbps,omitempty" nullable:"false"`
-	SelectedTracks        playback.SelectedTracksV3          `json:"selected_tracks"`
-	Failure               playback.FailureV3                 `json:"failure,omitzero"`
-	Capabilities          playback.ClientCodecCapabilitiesV3 `json:"client_capabilities"`
-	ClientPlaybackContext playback.ClientPlaybackContextV3   `json:"client_playback_context"`
+	InstallationID          ID                                 `json:"installation_id" minLength:"1"`
+	ProtocolVersion         int                                `json:"protocol_version"`
+	ClientFeatures          []string                           `json:"client_features,omitempty"`
+	Operation               playback.ReplanOperationV3         `json:"operation,omitempty" enum:"failure_recovery,seek_reanchor,seek_failure_recovery,track_change,quality_change,output_change"`
+	PlaybackAttemptID       string                             `json:"playback_attempt_id" minLength:"8" maxLength:"128"`
+	ReplanRequestID         string                             `json:"replan_request_id" minLength:"8" maxLength:"128" doc:"Client-minted identity of this replan; a retry with the same body replays the durable decision"`
+	FailedPlanID            string                             `json:"failed_plan_id" minLength:"8" maxLength:"128"`
+	PlanAttemptID           string                             `json:"plan_attempt_id" minLength:"8" maxLength:"128"`
+	PlanAttemptKey          string                             `json:"plan_attempt_key" minLength:"8" maxLength:"128"`
+	AttemptedPlanKeys       []string                           `json:"attempted_plan_keys" maxItems:"16"`
+	LocalMutations          []string                           `json:"local_mutations,omitempty" maxItems:"8"`
+	AttemptCount            int                                `json:"attempt_count" minimum:"1" maximum:"8"`
+	QualityPreference       string                             `json:"quality_preference"`
+	PositionSeconds         float64                            `json:"position_seconds" minimum:"0"`
+	Metered                 bool                               `json:"metered"`
+	AutoFallback            *bool                              `json:"auto_fallback,omitempty" nullable:"false" doc:"Re-negotiates the session's version-fallback intent. Set true when the viewer re-arms Auto mid-session; omitted leaves the start-time intent unchanged. Never authorizes a healthy mid-play switch."`
+	BandwidthEstimateKbps   *int                               `json:"bandwidth_estimate_kbps,omitempty" nullable:"false"`
+	BandwidthCapKbps        *int                               `json:"bandwidth_cap_kbps,omitempty" nullable:"false"`
+	AnswersPlanInvalidation string                             `json:"answers_plan_invalidation,omitempty" maxLength:"64" doc:"Echoes the reason from the plan_invalidated command this replan answers. Correlates a client that negotiated default_audio_reconcile_response_v1's response with the server's own withdrawal; omitting it on such a replan leaves the viewer's selection in place. Not trust-sensitive: at worst it names a correction the server already decided and announced."`
+	SelectedTracks          playback.SelectedTracksV3          `json:"selected_tracks"`
+	Failure                 playback.FailureV3                 `json:"failure,omitzero"`
+	Capabilities            playback.ClientCodecCapabilitiesV3 `json:"client_capabilities"`
+	ClientPlaybackContext   playback.ClientPlaybackContextV3   `json:"client_playback_context"`
 }
 type PlaybackReplanInput struct {
 	PlaybackRequestHeaders
@@ -450,7 +451,7 @@ func registerPlaybackReplan(reg *Registry, op func(method, path, id string) Oper
 	})
 }
 func (in PlaybackReplanBody) domain() playback.ReplanRequestV3 {
-	return playback.ReplanRequestV3{ProtocolVersion: in.ProtocolVersion, ClientFeatures: in.ClientFeatures, Operation: in.Operation, PlaybackAttemptID: in.PlaybackAttemptID, ReplanRequestID: in.ReplanRequestID, FailedPlanID: in.FailedPlanID, PlanAttemptID: in.PlanAttemptID, PlanAttemptKey: in.PlanAttemptKey, AttemptedPlanKeys: in.AttemptedPlanKeys, LocalMutations: in.LocalMutations, AttemptCount: in.AttemptCount, QualityPreference: in.QualityPreference, PositionSeconds: in.PositionSeconds, Metered: in.Metered, AutoFallback: in.AutoFallback, BandwidthEstimateKbps: in.BandwidthEstimateKbps, BandwidthCapKbps: in.BandwidthCapKbps, SelectedTracks: in.SelectedTracks, Failure: in.Failure, Capabilities: in.Capabilities, ClientPlaybackContext: in.ClientPlaybackContext}
+	return playback.ReplanRequestV3{ProtocolVersion: in.ProtocolVersion, ClientFeatures: in.ClientFeatures, Operation: in.Operation, PlaybackAttemptID: in.PlaybackAttemptID, ReplanRequestID: in.ReplanRequestID, FailedPlanID: in.FailedPlanID, PlanAttemptID: in.PlanAttemptID, PlanAttemptKey: in.PlanAttemptKey, AttemptedPlanKeys: in.AttemptedPlanKeys, LocalMutations: in.LocalMutations, AttemptCount: in.AttemptCount, QualityPreference: in.QualityPreference, PositionSeconds: in.PositionSeconds, Metered: in.Metered, AutoFallback: in.AutoFallback, BandwidthEstimateKbps: in.BandwidthEstimateKbps, BandwidthCapKbps: in.BandwidthCapKbps, AnswersPlanInvalidation: in.AnswersPlanInvalidation, SelectedTracks: in.SelectedTracks, Failure: in.Failure, Capabilities: in.Capabilities, ClientPlaybackContext: in.ClientPlaybackContext}
 }
 func registerPlaybackRouteEvents(reg *Registry, op func(method, path, id string) Operation) {
 	Register(reg, op(http.MethodPost, "/route-events", opReportPlaybackRouteEvent), func(ctx context.Context, in *PlaybackRouteEventInput) (*PlaybackRouteEventOutput, error) {

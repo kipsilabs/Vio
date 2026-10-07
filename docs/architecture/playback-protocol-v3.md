@@ -1105,6 +1105,9 @@ any other, not a fire-and-forget event:
 }
 ```
 
+§6.1.1 adds one more reason to this command; for that reason the payload also
+carries an additive `generation` field, and nothing else about the envelope changes.
+
 `payload.plan_id` names the plan being withdrawn, which is not necessarily the
 one on screen: a client that has already replanned past it has nothing to do and
 completes the command as a no-op. That is why the field is required — acting
@@ -1116,8 +1119,14 @@ A client that advertises `plan_invalidated_v1` in `client_features` promises to:
 2. run its ordinary recovery replan — `operation: "failure_recovery"`, with the
    invalidated plan's `plan_attempt_key` in `attempted_plan_keys` so the copy
    route is excluded deterministically (the now-persisted verdict excludes it
-   too), and
+   too), **unless** `reason` is `default_audio_reconciliation`, which replans as
+   an intent operation instead (§6.1.1), and
 3. send `{"type":"result","status":"completed"}` when the replan is done.
+
+`failure_recovery` is the right default because it is the one operation that
+excludes the withdrawn route without the client reasoning about deliveries. It
+is wrong for a reason that withdraws a plan without indicting it, and that is the
+only such reason on this command.
 
 **Everything else is a session stop.** The server pushes the command only to a
 session that negotiated the feature *and* holds a live realtime connection. No
@@ -1209,6 +1218,151 @@ verdict write is conditional on the row still holding the size and mtime that
 were scanned: a file rewritten in place while the scan read it produces a
 verdict about bytes nobody is serving, which is neither persisted nor pushed at
 any session.
+
+#### 6.1.1 `default_audio_reconciliation` — a late probe withdraws a cold-start plan
+
+The second reason on this command has a different cause. Cold-start default-audio
+reconciliation compares the audio inventory a plan was built against against the
+verified one the probe lands afterwards. When the verified order moves the
+server-resolved selection to a different stream, the committed recipe no longer
+plays the preferred language — and it is still the plan on screen.
+
+The same command withdraws it, and for the same reason: the server learns the
+route is wrong after the plan was handed out. What differs is the decision
+around it.
+
+**The server never commits the replacement for this reason.** It persists the
+corrected selection and a canonical `track_change` replan body in one
+compare-and-set on the attempt's reconciliation ledger, then pushes the
+withdrawal and stops. The client's own replan is what commits the new recipe,
+because the client's replan is what carries its live position and pause state.
+A server-side commit plus a client replan would race for the same transport, so
+there is exactly one commit path and it is the client's.
+
+That split makes the ordering load-bearing:
+
+- The decision and the request it belongs to are written **before** anything is
+  emitted. A duplicate probe write, a second replica, or a retried heartbeat
+  finds the generation settled and replays the stored decision instead of
+  emitting a second event for one correction.
+- The withdrawal is durable and stops on **completion, not on send**. `announced_at`
+  records that the hub accepted the command, which proves only that the server
+  wrote it; a client can still disconnect before reading it, fail its replan, or
+  reconnect on another node later. So delivery ends when the attempt's current plan
+  id moves off the plan the entry withdraws — any replan commits a new plan, and
+  whether the client adopted our correction or chose something else, both end the
+  obligation to keep withdrawing a plan it no longer plays. Until then, and only
+  while the session still negotiates both capabilities, the withdrawal is
+  re-attempted on later heartbeat/attach/probe passes. The bound is an explicit
+  rate-and-burst policy rather than an eventual-silence guarantee: one burst of 20
+  accepted deliveries, a 15-minute cooldown before the next burst, and an immediate
+  fresh burst whenever the session's control connection reconnects. A client that
+  keeps reconnecting without adopting the correction keeps being reminded; one that
+  stays connected and ignores it stops being pushed. Only accepted deliveries count,
+  capacity is reserved atomically before each send and returned when the write fails,
+  and the in-process state is dropped on session teardown and swept when idle, so it
+  stays bounded. Past the ceiling the correction still lands on the next start, which
+  plans against the already-corrected inventory. Every
+  re-delivery of one decision reuses the same command id, derived from the session
+  and generation, so a client that receives it twice recognizes one withdrawal
+  rather than two competing ones. The corrected identity deliberately does not
+  decide completion: it is recorded against the still-current plan, so comparing it
+  there compares against the stale selection and can match by coincidence.
+- The replan-request id is derived from the plan and the target audio index,
+  both immutable, while the body also embeds the live position, which is not.
+  A replay of the stored decision therefore carries the same id **and** the same
+  digest — so the replan lease answers with its stored response rather than
+  rejecting a reused id — while two evaluations that disagree about position
+  are caught as a digest mismatch against the settled entry and refused, with
+  the rejection recorded next to the stored digest.
+- A refused divergence supersedes the invalidation it disputes: a correction a
+  rejected re-evaluation has already invalidated never reaches the client.
+
+**The replacement replan is an intent operation, not a failure recovery.** The
+route is healthy and nothing failed: the committed recipe plays the wrong audio
+stream, not wrong bytes. `failure_recovery` would fold the withdrawn plan's
+`plan_attempt_key` into `attempted_plan_keys` and so exclude the route that is
+currently playing from its own replacement — pushing a working session onto a
+worse route, or onto a terminal. A client therefore replans off a
+`default_audio_reconciliation` withdrawal as `operation: "track_change"`, with no
+`failure` payload (the server rejects one on that operation anyway) and no route
+exclusion, carrying only its live position. It is the operation the server's own
+automatic replan already uses for this correction, and a `track_change` that
+changes nothing still returns a fresh plan. The one advertisement change is the
+withdrawal gate below: `client_features` gains `default_audio_reconcile_response_v1`,
+because this reason cannot be answered correctly under `plan_invalidated_v1`
+alone. No new operation is introduced.
+
+The two sides name the reason independently — the server from
+`playback.PlanInvalidatedDefaultAudioReconciliation`, the browser from its own
+mirror of the string — and each half pins the other with a test
+(`internal/playback/realtime_invalidation_reason_test.go` and
+`web/src/player/defaultAudioReconciliationReason.test.ts`), because a rename on
+one side is invisible at runtime and merely degrades a healthy session into a
+failure recovery. Every other `plan_invalidated` reason keeps the recovery
+semantics of §6.1.
+
+The correction is one-shot rather than an ongoing override: it is keyed to the
+withdrawn plan, and the plan the replan commits becomes current, so the client's
+next replan is its own.
+
+Six rules bound it:
+
+- **Two features gate delivery, and they are not the same promise.** The
+  withdrawal needs `default_audio_reconcile_response_v1` **and**
+  `plan_invalidated_v1`. The second alone is not enough: a client that
+  advertised only `plan_invalidated_v1` has never heard of this reason, so it
+  replays the withdrawal as a `failure_recovery`, folds the withdrawn
+  `plan_attempt_key` into `attempted_plan_keys`, and excludes the healthy route
+  it is currently playing from its own replacement. Sending it the withdrawal
+  anyway would trade a wrong-language session for a broken one. Its decision is
+  still recorded, and the correction lands on its next start or reconnect —
+  which plans against the verified inventory anyway, because the inventory is
+  what moved. `plan_invalidated_v1` alone still gates every other withdrawal
+  reason (§6.1).
+- **`answers_plan_invalidation` is the authoritative correlation.** The
+  withdrawal's `reason` is recorded on the settled ledger entry, and the replan
+  that answers it echoes the same string back. That echo — not the request
+  shape — is what tells the server this replan is a reconciliation response.
+  The field is deliberately **not** stripped at the ingress boundary, unlike
+  `Automatic`: forging it can at worst make the server apply a correction the
+  server itself decided and announced, whereas forging `Automatic` would
+  impersonate server reconciliation and suppress the viewer's preference
+  persistence. An echo is a required input, never an authority: a mismatching
+  echo never lets a client claim a reconciliation response, and it does not fall
+  through to the identity heuristic below when the client negotiated
+  `default_audio_reconcile_response_v1`. That heuristic exists for clients that
+  have *not* adopted the echo, and for them alone: falling back for a client that
+  advertised the capability would reintroduce the exact ambiguity the capability
+  removes, so a capable client that replans without the matching marker simply
+  keeps its own selection and the correction stays pending.
+   The field travels on the replan body of both surfaces: `/api/v1` decodes it
+   directly, and `/api/v2` declares it as an optional request property on the
+   replan body. It is part of the body the replan digest fingerprints, so a retry
+   that claims a different answer is detectable rather than silently replayed.
+   Because the v2 replan schema forbids additional properties, a client that sends
+   the field to a server that has not declared it is refused rather than ignored.
+- **The echoed audio identity is a fallback discriminator, not the contract.**
+  Without an echo, a selection that names something other than the withdrawn
+  plan's audio is read as a fresh viewer choice that supersedes the
+  correction — correct for the usual shape, because the request builder echoes
+  the plan's own audio on every replan. It cannot tell a deliberate re-pick of
+  the track the viewer already had from that inherited echo when the probe
+  reorders the inventory and the correction targets the same ordinal, which is
+  exactly why the echo exists.
+- **A byte-equal no-op still settles the generation.** Heartbeats and duplicate
+  evidence writes converge on the stored decision instead of re-evaluating.
+- **Every automatic-selection gate still runs before the decision**: a stale or
+  rotated source, an explicit viewer selection, or a viewer track change between
+  start and probe all refuse rather than withdraw.
+- **Delivery is in-process**, on the session's own hub lane, exactly as for
+  `video_copy_unsafe`. The ledger, not a cross-replica RPC, is what keeps the
+  replica that persisted the same evidence from emitting a duplicate.
+
+The payload carries the generation alongside the existing `plan_id` and
+`reason`, which is additive: a client that ignores it behaves exactly as before,
+and one that reads it can tell an in-flight duplicate from a correction that
+landed afterwards.
 
 ### 6.2 `source_committed_event_v1` — the committed version is published at commit
 

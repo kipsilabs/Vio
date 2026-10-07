@@ -240,6 +240,9 @@ func TestConformanceMatrixEmbeddedWireBodiesSatisfySchemas(t *testing.T) {
 				t.Errorf("scenario %q intent-only replan carries failure = %#v", name, failure)
 			}
 		}
+		if scenario["category"] == "default_audio_reconciliation" {
+			assertDefaultAudioReconcileScenario(t, name, request)
+		}
 	}
 	protocolSchemas := map[string]string{
 		"start_request":      "start-request.schema.json",
@@ -261,6 +264,43 @@ func TestConformanceMatrixEmbeddedWireBodiesSatisfySchemas(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// assertDefaultAudioReconcileScenario pins what the two reconciliation vectors
+// exist to show: a capable client that echoes the withdrawal reason is answering
+// it, and the SAME client omitting the marker is an ordinary re-pick. Schema
+// validation alone cannot see that difference, so without these assertions the
+// pair is two identical bodies that prove nothing.
+//
+// The capability must be advertised on both. The server's handling forks on it —
+// a client that negotiated the capability is required to answer with the marker —
+// so a vector without the feature would not exercise the correlation at all.
+func assertDefaultAudioReconcileScenario(t *testing.T, name string, request map[string]any) {
+	t.Helper()
+	features, _ := request["client_features"].([]any)
+	if !slices.ContainsFunc(features, func(f any) bool {
+		return f == playback.FeatureDefaultAudioReconcileResponseV3
+	}) {
+		t.Errorf("scenario %q does not advertise %s, so it cannot exercise the withdrawal answer",
+			name, playback.FeatureDefaultAudioReconcileResponseV3)
+	}
+	answer, hasAnswer := request["answers_plan_invalidation"]
+	switch name {
+	case "default_audio_reconcile_answer":
+		if !hasAnswer || answer != playback.PlanInvalidatedDefaultAudioReconciliation {
+			t.Errorf("scenario %q must answer with %q, got %#v",
+				name, playback.PlanInvalidatedDefaultAudioReconciliation, request["answers_plan_invalidation"])
+		}
+	case "default_audio_reconcile_without_marker":
+		if hasAnswer {
+			t.Errorf("scenario %q is the unmarked re-pick and must carry no answer, got %#v", name, answer)
+		}
+	}
+	// An empty string on the wire is not the same as an absent field: one is a
+	// malformed echo, the other an ordinary replan.
+	if raw, present := request["answers_plan_invalidation"]; present && raw == "" {
+		t.Errorf("scenario %q sends an empty answer; omit the field instead", name)
 	}
 }
 

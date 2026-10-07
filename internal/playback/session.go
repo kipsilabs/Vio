@@ -18,6 +18,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/netaccess"
 	"github.com/Silo-Server/silo-server/internal/streamlocation"
 	"github.com/Silo-Server/silo-server/internal/tonemap"
+	"github.com/Silo-Server/silo-server/internal/userstore"
 )
 
 // Transport output facts are independent of the whole-session play method.
@@ -99,6 +100,21 @@ type Session struct {
 	// (a legacy or reconstructed session) and falls back to the URI anchor.
 	VirtualSubtitleEvidenceFileID int
 	VirtualSubtitleEvidenceSet    bool
+	// SelectionOrigin mirrors the attempt's audio selection intent onto the
+	// live session ("auto" when the server resolved an omitted selection,
+	// "explicit" when the viewer named a track). In-memory recovery and
+	// reconnects keep the intent alongside the track index, so a resumed
+	// session cannot silently downgrade to an ordinal-only comparison.
+	// Empty for sessions that started before intent capture.
+	SelectionOrigin string
+	// PreferredAudioLanguage and SeriesAudioPreferenceSignature replay the
+	// start-time inputs of the auto selection (SelectAudioTrack's
+	// preferredLang and series-snapshot arguments); SelectedAudioSignature
+	// names the committed track they produced. Reconciliation replays these
+	// against the verified inventory, never against a shifted ordinal.
+	PreferredAudioLanguage         string
+	SeriesAudioPreferenceSignature *userstore.AudioTrackSignature
+	SelectedAudioSignature         *userstore.AudioTrackSignature
 
 	// RequireMediaAuthorization distinguishes v3 transports whose session ID is
 	// only a route (media requests must present an authenticated user) from
@@ -266,6 +282,18 @@ type SessionStreamState struct {
 	// reconstructed) and falls back to the URI anchor.
 	VirtualSubtitleEvidenceFileID int
 	VirtualSubtitleEvidenceSet    bool
+	// SelectionOrigin, PreferredAudioLanguage,
+	// SeriesAudioPreferenceSignature and SelectedAudioSignature mirror the
+	// attempt's audio selection intent (see Session) onto the stream state so
+	// ApplyReplacement survives a session-manager-level rebuild.
+	// SelectionOriginSet distinguishes an explicit origin ("", unset) from a
+	// state that never carried intent: an unset origin keeps the session's
+	// intent, so a legacy builder does not accidentally blank a newer intent.
+	SelectionOrigin                string
+	SelectionOriginSet             bool
+	PreferredAudioLanguage         string
+	SeriesAudioPreferenceSignature *userstore.AudioTrackSignature
+	SelectedAudioSignature         *userstore.AudioTrackSignature
 
 	// Byte-affecting transcode recipe fields preserved so an offloaded restart
 	// (e.g. audio switch) can rebuild the exact same stream. SubtitleTrackIndex
@@ -1339,6 +1367,16 @@ func applySessionStreamStateLocked(s *Session, state SessionStreamState) {
 	s.SubtitleTrackIndex = state.SubtitleTrackIndex
 	s.SubtitleBurnIn = state.SubtitleBurnIn
 	s.SegmentDuration = state.SegmentDuration
+	// Audio selection intent survives every stream-state round trip: it is
+	// written once at start and only a user's explicit track change rotates
+	// it, so reconciliation always compares the verified inventory against
+	// what the viewer actually committed to, not a transient replan default.
+	if state.SelectionOriginSet {
+		s.SelectionOrigin = state.SelectionOrigin
+		s.PreferredAudioLanguage = state.PreferredAudioLanguage
+		s.SeriesAudioPreferenceSignature = state.SeriesAudioPreferenceSignature
+		s.SelectedAudioSignature = state.SelectedAudioSignature
+	}
 	if state.TranscodeRouteSet {
 		// Only the replacement commit consumes the v3 capacity reservation;
 		// unrelated legacy stream updates arriving mid-replan must not release
@@ -1396,6 +1434,11 @@ func snapshotSessionStreamStateLocked(s *Session) SessionStreamState {
 		VirtualSubtitleEvidenceURI:       s.VirtualSubtitleEvidenceURI,
 		VirtualSubtitleEvidenceFileID:    s.VirtualSubtitleEvidenceFileID,
 		VirtualSubtitleEvidenceSet:       s.VirtualSubtitleEvidenceSet,
+		SelectionOrigin:                  s.SelectionOrigin,
+		SelectionOriginSet:               true,
+		PreferredAudioLanguage:           s.PreferredAudioLanguage,
+		SeriesAudioPreferenceSignature:   s.SeriesAudioPreferenceSignature,
+		SelectedAudioSignature:           s.SelectedAudioSignature,
 		SubtitleTrackIndex:               s.SubtitleTrackIndex,
 		SubtitleBurnIn:                   s.SubtitleBurnIn,
 		SegmentDuration:                  s.SegmentDuration,
@@ -1462,6 +1505,10 @@ func restoreSessionStreamStateLocked(s *Session, state SessionStreamState) {
 	s.SubtitleTrackIndex = state.SubtitleTrackIndex
 	s.SubtitleBurnIn = state.SubtitleBurnIn
 	s.SegmentDuration = state.SegmentDuration
+	s.SelectionOrigin = state.SelectionOrigin
+	s.PreferredAudioLanguage = state.PreferredAudioLanguage
+	s.SeriesAudioPreferenceSignature = state.SeriesAudioPreferenceSignature
+	s.SelectedAudioSignature = state.SelectedAudioSignature
 }
 
 // SetVirtualSource binds a live session to the provider-neutral candidate that
@@ -1671,6 +1718,29 @@ func (m *SessionManager) SetAutoFallback(sessionID string, enabled bool) error {
 	}
 	s.autoFallback = enabled
 	s.autoFallbackSet = true
+	return nil
+}
+
+// SetAudioSelectionIntent records the attempt's durable audio selection intent
+// on the live session: whether the committed selection came from the server's
+// language preference ("auto") or an explicit viewer choice ("explicit"), the
+// resolved preferred language, the series-preference snapshot and the
+// signature of the committed track. Probe-landing reconciliation replays
+// these fields against the verified inventory; legacy sessions carry the zero
+// value and are never reconciled.
+func (m *SessionManager) SetAudioSelectionIntent(sessionID, origin, preferredLang string, seriesSig, selectedSig *userstore.AudioTrackSignature) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		return ErrSessionNotFound
+	}
+	s.SelectionOrigin = origin
+	s.PreferredAudioLanguage = preferredLang
+	s.SeriesAudioPreferenceSignature = seriesSig
+	s.SelectedAudioSignature = selectedSig
+	m.touchSessionLocked(s)
 	return nil
 }
 

@@ -4218,10 +4218,13 @@ export function VideoPlayer({
           });
           return;
         case "plan_invalidated": {
-          // The server decided the route it planned cannot serve this source
-          // after all. Ack (already sent by the transport), replan off it, and
-          // report the outcome: a rejection is the server's cue to stop the
-          // session so the client's own recovery can mint a fresh attempt.
+          // The server decided the recipe or the route it planned cannot serve
+          // this source after all. Ack (already sent by the transport), replan
+          // off it, and report the outcome: a rejection is the server's cue to
+          // stop the session so the client's own recovery can mint a fresh
+          // attempt. Which replan the session runs depends on the reason —
+          // `usePlaybackSession.invalidatePlan` treats a default-audio
+          // reconciliation as an audio correction rather than a route failure.
           const invalidated = readPlanInvalidatedPayload(command.payload);
           if (!invalidated) {
             throw new Error("invalid_plan_invalidated_payload");

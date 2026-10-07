@@ -1,10 +1,13 @@
 package resolver
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary/stream"
@@ -20,6 +23,20 @@ func newProviderResolver(t *testing.T, streams []StreamCandidate) (*Resolver, *c
 	return New(testConfig(p)), p
 }
 
+type testRequestIDContextKey struct{}
+
+func contextWithRequestID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, testRequestIDContextKey{}, id)
+}
+
+func requestIDReaderFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	id, _ := ctx.Value(testRequestIDContextKey{}).(string)
+	return id
+}
+
 // fetchRaw drives the provider ingestion stage directly so tests can inspect
 // the candidates before dedup/classification/truncation.
 func fetchRaw(t *testing.T, r *Resolver) []StreamCandidate {
@@ -29,6 +46,82 @@ func fetchRaw(t *testing.T, r *Resolver) []StreamCandidate {
 		t.Fatalf("fetchProviderCandidates: %v", err)
 	}
 	return got
+}
+
+// fetchLogBuffer collects logger output for fetch-log assertions.
+type fetchLogBuffer struct {
+	mu     sync.Mutex
+	buffer bytes.Buffer
+}
+
+func (b *fetchLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.Write(p)
+}
+
+func (b *fetchLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.String()
+}
+
+// TestFetchProviderCandidatesLogsRequestIDAndCacheKey proves the provider
+// fetch line carries the edge request id resolved through the per-resolver
+// reader plus the cache key, so one slow fetch is joinable to the start that
+// waited on it instead of only to an aggregate media id. The reader stands
+// in for the parent virtuallibrary reader wired by SetRequestIDReader in
+// production.
+func TestFetchProviderCandidatesLogsRequestIDAndCacheKey(t *testing.T) {
+	streams := []StreamCandidate{{URL: "https://cdn.example/a.mkv", Name: "Release"}}
+	p := newCountingProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		writeStreams(w, streams)
+	})
+	r := New(testConfig(p))
+	var buf fetchLogBuffer
+	r.SetLogger(slog.New(slog.NewTextHandler(&buf, nil)))
+
+	r.SetRequestIDReader(requestIDReaderFromContext)
+
+	ctx := contextWithRequestID(context.Background(), "req-abc")
+	got, err := r.fetchProviderCandidates(ctx, r.config, 0, "movie|tt1", "movie", "tt1")
+	if err != nil {
+		t.Fatalf("fetchProviderCandidates: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("candidates = %d, want 1", len(got))
+	}
+	out := buf.String()
+	for _, want := range []string{"provider candidates fetched", "req-abc", "movie|tt1"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("provider log %q missing %q", out, want)
+		}
+	}
+}
+
+// TestFetchProviderCandidatesOmitsRequestIDWithoutProvider proves the fetch
+// line stays joinable by cache key when no request id is available (a
+// background refresh with no waiting start, or a resolver with no reader
+// installed), instead of printing a misleading empty value.
+func TestFetchProviderCandidatesOmitsRequestIDWithoutProvider(t *testing.T) {
+	streams := []StreamCandidate{{URL: "https://cdn.example/a.mkv", Name: "Release"}}
+	p := newCountingProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		writeStreams(w, streams)
+	})
+	r := New(testConfig(p))
+	var buf fetchLogBuffer
+	r.SetLogger(slog.New(slog.NewTextHandler(&buf, nil)))
+
+	if _, err := r.fetchProviderCandidates(context.Background(), r.config, 0, "movie|tt1", "movie", "tt1"); err != nil {
+		t.Fatalf("fetchProviderCandidates: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "movie|tt1") {
+		t.Fatalf("provider log %q missing cache key", out)
+	}
+	if strings.Contains(out, "request_id") {
+		t.Fatalf("provider log %q prints request_id without a provider", out)
+	}
 }
 
 func TestFetchProviderCandidatesOnlyAbsoluteHTTPURLsSurvive(t *testing.T) {
