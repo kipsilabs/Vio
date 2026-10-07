@@ -52,11 +52,18 @@ func TestPlaybackDecisionV2ProjectsDeferredTrackInventory(t *testing.T) {
 	}
 }
 
-// TestPlaybackV2DeferredStartAndInventoryPoll is the end-to-end v2 proof: a
-// negotiated deferred start returns tracks_pending and inventory_url, and the
-// inventory endpoint reports pending while the enumeration is outstanding and
-// the terminal status (failed) once it lands. A client watching either the push
-// or the poll leaves its loading state.
+// TestPlaybackV2DeferredStartAndInventoryPoll is the v2 wire-contract proof for
+// the deferred lifecycle: a negotiated deferred start returns tracks_pending and
+// inventory_url, and the inventory endpoint reports pending, then the terminal
+// status, through the real apiv2 HTTP handler and its projection. It deliberately
+// drives a fakePlaybackService rather than the handler's probe worker: this
+// package owns the v2 envelope (routing, field projection, problem mapping), and
+// asserting it here with a controlled service answer is what isolates the wire
+// contract from the worker. The worker integration itself — admission, the
+// post-commit probe, the retryable re-park, and the session-targeted publish —
+// is covered directly in internal/api/handlers (TestStartPlaybackDefersTrack…
+// and the playback_virtual_deferred_* tests), which construct the real handler.
+// Together the two layers cover the lifecycle; neither substitutes for the other.
 func TestPlaybackV2DeferredStartAndInventoryPoll(t *testing.T) {
 	deps, _ := catalogDeps(t)
 	fake := &fakePlaybackService{}
@@ -105,9 +112,11 @@ func TestPlaybackV2DeferredStartAndInventoryPoll(t *testing.T) {
 		t.Fatalf("pending poll: %d %s", pending.Code, pending.Body.String())
 	}
 
-	// The terminal failure is observable on the same endpoint; the revision
-	// changed, so a client gating on ETag re-reads instead of serving its stale
-	// pending copy.
+	// The terminal failure is observable on the same endpoint. The fake service
+	// reports a fixed revision, so this asserts the status body only; the
+	// revision-changes-on-status-change behavior is covered where the revision
+	// is actually computed (TestComputeInventoryRevisionDeterministic against
+	// ComputeInventoryRevisionV3), not by this wire-contract fixture.
 	fake.inventoryStatus = "failed"
 	terminal := do(t, h, http.MethodGet, Prefix+"/playback/11111111-1111-4111-8111-111111111111/inventory", "", viewerHeaders())
 	if terminal.Code != http.StatusOK || !strings.Contains(terminal.Body.String(), `"inventory_status":"failed"`) {

@@ -982,16 +982,23 @@ func TestDeferredProbePublishOverflowRescansAllSessions(t *testing.T) {
 	}
 
 	// The system must STAY settled: an empty map or a clear flag seen during a
-	// rescan refill is transient. Wait past two backstop ticks, then assert the
-	// map is empty, the rescan flag is clear, and the outstanding-notification
-	// accessor reports nothing left — and that no session got a second push.
-	time.Sleep(3 * deferredPublishBackstop)
+	// rescan refill is transient. Wait on the observable settled state — the
+	// pending map empty, no in-flight worker, the rescan flag clear, and the
+	// outstanding-notification accessor reporting nothing left — instead of
+	// sleeping a fixed number of backstop ticks. Once every one of those is true
+	// nothing schedules another push, so the per-session counts below are final.
+	waitDeferredCondition(t, func() bool {
+		handler.deferredPublishMu.Lock()
+		settled := len(handler.deferredPublishPending) == 0 && !handler.deferredPublishRescan && len(handler.deferredPublishInFlight) == 0
+		handler.deferredPublishMu.Unlock()
+		return settled && len(manager.VirtualProbeOutstandingNotifications(virtualDeferredPublishPendingCap+total)) == 0
+	}, "dispatcher settled: empty map, no in-flight worker, clear rescan flag, no outstanding notifications")
 	handler.deferredPublishMu.Lock()
 	remaining := len(handler.deferredPublishPending)
 	rescan = handler.deferredPublishRescan
 	handler.deferredPublishMu.Unlock()
 	if remaining != 0 || rescan {
-		t.Fatalf("dispatcher not settled after 3 ticks: parked entries = %d, rescan = %v; want empty map and clear flag", remaining, rescan)
+		t.Fatalf("dispatcher not settled: parked entries = %d, rescan = %v; want empty map and clear flag", remaining, rescan)
 	}
 	if outstanding := manager.VirtualProbeOutstandingNotifications(virtualDeferredPublishPendingCap + total); len(outstanding) != 0 {
 		t.Fatalf("outstanding terminal notifications after settle = %d, want 0", len(outstanding))

@@ -981,7 +981,8 @@ func (h *PlaybackHandler) playbackInventoryForFileV3(ctx context.Context, sessio
 		effectiveFileID = file.ID
 	}
 	// Include the effective source in the revision so a rotation to a sibling
-	// with an identical inventory still changes the ETag the poll compares.
+	// with an identical inventory still changes the revision the inventory
+	// endpoint returns (and therefore the ETag it emits from it).
 	revision := playback.ComputeInventoryRevisionV3(status, audioTracks, subtitleInventory, playback.InventorySourceIdentityV3{
 		EffectiveMediaFileID:  effectiveFileID,
 		EffectiveVirtualURI:   effectiveVirtualURI,

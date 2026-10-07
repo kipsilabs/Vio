@@ -690,8 +690,10 @@ func (h *PlaybackHandler) startDeferredPublishDispatcher() {
 // releases the slot, so a backlog unwinds in bounded steps without pinning a
 // slot. The map is always the record — after any wake and after every batch the
 // loop re-reads it, so a signal lost to coalescing can never strand a parked
-// notification. It sleeps only when a batch reports the map empty and no rescan
-// owed, and exits when the service context ends.
+// notification. It sleeps when a batch reports nothing dispatchable — an empty
+// map, only in-flight or retry-backoff entries, or a saturated gate — and exits
+// when the service context ends; a parked retryable entry is woken by the
+// backstop ticker once its delay elapses.
 //
 // Delivery is acknowledged per binding generation: a publish worker acks the
 // generation it carried once its attempt completes, and the overflow rescan only
@@ -737,40 +739,51 @@ func (h *PlaybackHandler) deferredPublishDispatcher() {
 // drainDeferredPublishBatch publishes up to deferredPublishBatchCap parked
 // sessions, claiming one gate slot per publication and handing that slot
 // straight to the publish worker. It reports whether more work may remain
-// (dispatchable entries remain or a rescan is owed) so the dispatcher keeps
-// draining a backlog, and reports false when nothing is dispatchable — the map
-// is empty with nothing owed (sleep until the next wake), every parked entry is
-// mid-publish (sleep until a worker's completion signal or the ticker; never
-// spin batches against the in-flight set), or the gate is saturated
-// (backpressure — sleep and let the next signal or ticker retry rather than
-// hammering acquire).
+// (a full batch was dispatched) so the dispatcher keeps draining a backlog, and
+// reports false when nothing is dispatchable — the map is empty, every parked
+// entry is mid-publish (sleep until a worker's completion signal or the ticker;
+// never spin batches against the in-flight set), an entry is waiting out its
+// retry backoff, or the gate is saturated (backpressure — sleep and let the next
+// signal or ticker retry rather than hammering acquire). A false return is
+// always a sleep decision, never a "rescan is owed" deferral: the rescan runs at
+// the top of the next batch and only needs the map to have room, and a
+// retryable entry held in backoff still reserves its slot, so returning "more
+// work" for an owed rescan would spin the inner loop with nothing to dispatch.
 //
 // Selection and the slot claim are separate steps with distinct lock
 // discipline. Selection (selectDeferredPublishCandidate) validates each
 // candidate under one deferredPublishMu section — not in-flight, watermark
-// does not already cover the intent's generation — and pops the winner
-// WITHOUT marking it in-flight. The claim (takeDeferredPublishSlot) takes the
-// slot with a non-blocking tryAcquire outside the lock, then marks the session
-// in-flight under the same lock section that re-validates the intent, so a
-// session is never observed as neither-parked-nor-in-flight while its publish
-// is outstanding, and a saturated gate leaves the entry parked the whole time.
-// The watermark read calls into the session manager while the mutex is held,
-// which is the documented lock order; the worker's ack (session lock) always
-// precedes its in-flight clear (deferredPublishMu), so a generation observed
-// covered at selection or claim can never belong to a session whose publish is
-// still outstanding. Undispatchable entries stay parked; already-delivered ones
-// are dropped.
+// does not already cover the intent's generation, not still in retry backoff —
+// and pops the winner WITHOUT marking it in-flight. The claim
+// (takeDeferredPublishSlot) takes the slot with a non-blocking tryAcquire
+// outside the lock, then marks the session in-flight under the same lock
+// section that re-validates the intent, so a session is never observed as
+// neither-parked-nor-in-flight while its publish is outstanding, and a saturated
+// gate leaves the entry parked the whole time. The watermark read calls into the
+// session manager while the mutex is held, which is the documented lock order;
+// the worker's ack (session lock) always precedes its in-flight clear
+// (deferredPublishMu), so a generation observed covered at selection or claim can
+// never belong to a session whose publish is still outstanding. Undispatchable
+// entries stay parked; already-delivered ones are dropped.
 func (h *PlaybackHandler) drainDeferredPublishBatch(base context.Context) bool {
 	// Recover overflow intent before deciding there is nothing to do: a map that
 	// drained empty with the rescan flag set still owes the overflowed sessions.
 	h.rescanDeferredPublishOverflow()
 
 	for popped := 0; popped < deferredPublishBatchCap; popped++ {
-		sessionID, intent, found, rescanOwed := h.selectDeferredPublishCandidate()
+		sessionID, intent, found := h.selectDeferredPublishCandidate()
 		if !found {
-			// Nothing dispatchable: a pending rescan still owes work, otherwise
-			// sleep until the next park signal, worker completion, or tick.
-			return rescanOwed
+			// Nothing dispatchable this pass. This is the dispatcher's sleep
+			// decision, and it must be a sleep even when a rescan is still owed:
+			// the rescan runs at the top of the next batch and only needs the
+			// map to have room, and a retryable entry held in backoff keeps a
+			// slot reserved, so returning "more work" here would spin the inner
+			// drain loop with no dispatchable entry to make progress. The
+			// backstop ticker (or a retry worker's completion signal) resumes
+			// once the backoff elapses, at which point the rescan can recover
+			// any overflow. The full-batch return below is the only
+			// "keep draining" signal, and it always follows real dispatch.
+			return false
 		}
 		claimed, stale := h.takeDeferredPublishSlot(sessionID, intent)
 		if !claimed {
@@ -806,16 +819,16 @@ func (h *PlaybackHandler) drainDeferredPublishBatch(base context.Context) bool {
 // selectDeferredPublishCandidate atomically picks one dispatchable parked
 // entry: under a single deferredPublishMu section it validates each candidate
 // against the dispatchability predicate, removes the winner from the map, and
-// returns it. It reports found=false when no parked entry is dispatchable,
-// alongside whether a rescan is still owed. Entries whose generation the
-// watermark already covers are dropped, not returned: their push already
-// landed, so dispatching them would duplicate it. An entry whose retryable
-// backoff has not yet elapsed is skipped so the batch does not spin on it; the
-// dispatcher's backstop ticker wakes it once the delay has passed. The in-flight
-// mark is NOT taken here — it moves into takeDeferredPublishSlot, which marks it
-// under the same lock section as the gate-slot claim, so a session is never
-// observed as neither-parked-nor-in-flight while its publish is outstanding.
-func (h *PlaybackHandler) selectDeferredPublishCandidate() (sessionID string, intent deferredPublishIntent, found bool, rescanOwed bool) {
+// returns it. It reports found=false when no parked entry is dispatchable.
+// Entries whose generation the watermark already covers are dropped, not
+// returned: their push already landed, so dispatching them would duplicate it.
+// An entry whose retryable backoff has not yet elapsed is skipped so the batch
+// does not spin on it; the dispatcher's backstop ticker wakes it once the delay
+// has passed. The in-flight mark is NOT taken here — it moves into
+// takeDeferredPublishSlot, which marks it under the same lock section as the
+// gate-slot claim, so a session is never observed as neither-parked-nor-in-flight
+// while its publish is outstanding.
+func (h *PlaybackHandler) selectDeferredPublishCandidate() (sessionID string, intent deferredPublishIntent, found bool) {
 	h.deferredPublishMu.Lock()
 	defer h.deferredPublishMu.Unlock()
 	now := time.Now()
@@ -837,9 +850,9 @@ func (h *PlaybackHandler) selectDeferredPublishCandidate() (sessionID string, in
 			continue
 		}
 		delete(h.deferredPublishPending, id)
-		return id, candidate, true, h.deferredPublishRescan
+		return id, candidate, true
 	}
-	return "", deferredPublishIntent{}, false, h.deferredPublishRescan
+	return "", deferredPublishIntent{}, false
 }
 
 // takeDeferredPublishSlot claims a gate slot for a selected candidate and, in
@@ -882,13 +895,19 @@ func (h *PlaybackHandler) takeDeferredPublishSlot(sessionID string, intent defer
 }
 
 // rescanDeferredPublishOverflow re-parks sessions that overflowed the bounded
-// pending map. It runs only when the map is empty AND the coalesced rescan flag
-// is set. It pulls a bounded page of sessions with an outstanding terminal
-// notification (terminal outcome generation newer than the delivered watermark),
-// so the rescan converges: a session whose push landed is acked
-// (MarkVirtualProbeNotified) and never returned again. A full page means more
-// may remain, so the flag stays set for the next cycle; a short page clears it.
-// Bounded both ways: the snapshot and the map are each capped, and a session
+// pending map. It runs when the map has room and the coalesced rescan flag is
+// set — not only when the map is empty. Requiring an empty map deadlocked
+// overflow recovery behind a retryable entry: a retryable notification stays
+// parked while it waits out its backoff, so the map never emptied and the
+// overflow sessions were never recovered. The rescan is safe at any occupancy
+// because it re-validates each candidate under the lock and only parks a
+// session that is neither already parked, nor in-flight, nor already covered by
+// the delivered watermark. It pulls a bounded page of sessions with an
+// outstanding terminal notification (terminal outcome generation newer than the
+// delivered watermark), so the rescan converges: a session whose push landed is
+// acked (MarkVirtualProbeNotified) and never returned again. A full page means
+// more may remain, so the flag stays set for the next cycle; a short page clears
+// it. Bounded both ways: the snapshot and the map are each capped, and a session
 // that already ended is absent from the manager's list.
 //
 // Validation and dispatch eligibility are ATOMIC w.r.t. the ack path: the
@@ -905,7 +924,9 @@ func (h *PlaybackHandler) takeDeferredPublishSlot(sessionID string, intent defer
 // for a duplicate push.
 func (h *PlaybackHandler) rescanDeferredPublishOverflow() {
 	h.deferredPublishMu.Lock()
-	if !h.deferredPublishRescan || len(h.deferredPublishPending) > 0 {
+	if !h.deferredPublishRescan || len(h.deferredPublishPending) >= virtualDeferredPublishPendingCap {
+		// Nothing to recover (flag clear) or no room to park the overflow:
+		// leave the flag set and let the dispatcher retry once a slot frees.
 		h.deferredPublishMu.Unlock()
 		return
 	}
@@ -977,6 +998,38 @@ func (h *PlaybackHandler) markDeferredPublishInFlight(sessionID string) bool {
 	return true
 }
 
+// reparkDeferredPublishRetryLocked records a retryable notification for a later
+// attempt. It must be called with deferredPublishMu held (the worker's cleanup
+// defer owns it). It re-parks only when nothing newer or already-delivered owns
+// the session: a covering ack means the outcome landed, and a newer parked
+// generation supersedes this one. When the map is full and this is a new session
+// it sets the coalesced rescan flag — the same overflow path a full park uses —
+// instead of dropping the intent, so the rescan recovers it from the session
+// manager once the map has room. The intent is not stored in that case, so it
+// cannot pin the map or its backoff; the rescan re-creates the intent with a
+// fresh bounded schedule. It reports whether the intent was re-parked.
+func (h *PlaybackHandler) reparkDeferredPublishRetryLocked(sessionID string, intent deferredPublishIntent) bool {
+	current, parked := h.deferredPublishPending[sessionID]
+	if parked && current.generation > intent.generation {
+		// A newer park owns the session; this stale attempt is superseded.
+		return false
+	}
+	if h.deferredProbeNotifiedCovers(sessionID, intent.generation) {
+		// The outcome was already delivered while this attempt was outstanding.
+		return false
+	}
+	if !parked && len(h.deferredPublishPending) >= virtualDeferredPublishPendingCap {
+		// No room for a new session: retain the intent on the overflow path so
+		// the rescan recovers it from the session manager once the map has room.
+		h.deferredPublishRescan = true
+		return false
+	}
+	intent.attempts++
+	intent.notBefore = time.Now().Add(deferredPublishRetryDelay(intent.attempts))
+	h.deferredPublishPending[sessionID] = intent
+	return true
+}
+
 // runDeferredPublishWorker publishes one terminal inventory on a gate slot the
 // caller already holds, then releases the slot. It runs under the service
 // lifecycle with the publish budget. The publish is SESSION-TARGETED
@@ -1011,27 +1064,33 @@ func (h *PlaybackHandler) runDeferredPublishWorker(sessionID string, intent defe
 		var retry bool
 		defer func() {
 			h.deferredPublishMu.Lock()
+			// The direct (unsaturated) publish path never parks and so never
+			// initializes the pending map; a retryable attempt on that path
+			// writes the map below, so it must be lazily initialized here under
+			// the same lock the park path uses, or the write panics in this
+			// background goroutine and takes the process down.
+			if h.deferredPublishPending == nil {
+				h.deferredPublishPending = make(map[string]deferredPublishIntent)
+			}
+			if h.deferredPublishInFlight == nil {
+				h.deferredPublishInFlight = make(map[string]struct{})
+			}
 			if retry {
-				// Re-park only if nothing newer/covering landed while this
-				// attempt was outstanding: a covering ack means the outcome was
-				// already delivered, and a newer park owns the session now.
-				current, parked := h.deferredPublishPending[sessionID]
-				if !parked || current.generation <= intent.generation {
-					if !h.deferredProbeNotifiedCovers(sessionID, intent.generation) {
-						intent.attempts++
-						intent.notBefore = time.Now().Add(deferredPublishRetryDelay(intent.attempts))
-						h.deferredPublishPending[sessionID] = intent
-					}
-				}
+				h.reparkDeferredPublishRetryLocked(sessionID, intent)
 			} else {
 				h.ackDeferredProbeNotified(sessionID, intent.generation)
 			}
 			delete(h.deferredPublishInFlight, sessionID)
 			h.deferredPublishMu.Unlock()
-			// Wake the dispatcher: entries it skipped as in-flight on its last
-			// pass may be dispatchable now. Buffered-1 and nonblocking — a
-			// queued signal is enough because the dispatcher always re-reads
-			// the map after any wake.
+			// Guarantee the dispatcher exists before waking it. A retryable
+			// attempt on the direct path reaches here without the dispatcher
+			// ever having started (nothing parked on that path), so a bare
+			// non-nil check on deferredPublishDone would leave the re-parked
+			// notification with no goroutine to deliver it. startDeferredPublish-
+			// Dispatcher is idempotent, so calling it on every completion is
+			// free. Buffered-1 and nonblocking: a queued signal is enough because
+			// the dispatcher always re-reads the map after any wake.
+			h.startDeferredPublishDispatcher()
 			if h.deferredPublishDone != nil {
 				select {
 				case h.deferredPublishDone <- struct{}{}:

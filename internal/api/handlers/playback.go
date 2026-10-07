@@ -717,40 +717,50 @@ type PlaybackHandler struct {
 	// never happens, and every code path here must keep it that way.
 	//
 	// deferredPublishPending is the bounded set of terminal inventory
-	// notifications that could not publish because the aggregate detached gate
-	// was full, keyed by session ID so a later terminal state for the same
-	// session coalesces onto one entry; the value carries the file whose
-	// inventory the push re-reads and the binding generation the notification
-	// acks after publish. Coalescing rule: a park replaces the parked entry
-	// only when the new generation is at least the parked generation, and is
-	// dropped entirely when the session's notified watermark already covers
-	// the new generation — an older or already-delivered intent can never
-	// overwrite a newer outstanding one. deferredPublishRescan is the
-	// coalesced overflow flag: a park that finds the map full sets it rather
-	// than dropping intent, and the dispatcher re-parks the overflow from the
-	// session manager once the map drains. The map is the record of what to
-	// publish; the signal channel is only a wake hint, so a lost signal can
-	// never strand a parked notification — the dispatcher always re-reads the
-	// map after any wake.
+	// notifications still owed a push, keyed by session ID so a later terminal
+	// state for the same session coalesces onto one entry. An entry lands here
+	// by one of two routes: a park when the aggregate detached gate was full, or
+	// a retryable attempt (a transient catalog/plan-store read or a realtime
+	// write that did not reach the client) re-parked with a bounded backoff. The
+	// value carries the file whose inventory the push re-reads, the binding
+	// generation the notification acks after publish, and — for a retryable
+	// entry — the attempt count and the not-before instant that hold it out of
+	// selection until its delay elapses. Coalescing rule: a park replaces the
+	// parked entry only when the new generation is at least the parked
+	// generation, and is dropped entirely when the session's notified watermark
+	// already covers the new generation — an older or already-delivered intent
+	// can never overwrite a newer outstanding one. deferredPublishRescan is the
+	// coalesced overflow flag: a park OR a retry-insert that finds the map full
+	// sets it rather than dropping intent, and the dispatcher re-parks the
+	// overflow from the session manager as soon as the map has room (not only
+	// when it drains — a retryable entry can keep it occupied while it waits out
+	// its backoff). The map is the record of what to publish; the signal channel
+	// is only a wake hint, so a lost signal can never strand a parked
+	// notification — the dispatcher always re-reads the map after any wake.
 	//
-	// Dispatchability predicate: a parked entry is dispatchable only while
-	// its session is not in deferredPublishInFlight and the session's
-	// notified watermark does not already cover the entry's generation. The
-	// dispatcher re-checks both at selection time under this mutex, so a
-	// session mid-publish is never handed a second worker and an
-	// already-delivered generation is never republished.
+	// Dispatchability predicate: a parked entry is dispatchable only while its
+	// session is not in deferredPublishInFlight, the session's notified
+	// watermark does not already cover the entry's generation, and — for a
+	// retryable entry — its not-before instant has passed. The dispatcher
+	// re-checks all three at selection time under this mutex, so a session
+	// mid-publish is never handed a second worker, an already-delivered
+	// generation is never republished, and an entry in retry backoff never spins
+	// a batch.
 	deferredPublishMu      sync.Mutex
 	deferredPublishPending map[string]deferredPublishIntent
 	deferredPublishRescan  bool
 	// deferredPublishInFlight tracks sessions whose parked intent was popped by
-	// a batch and handed to a publish worker but not yet acked. A session in
-	// this window still reads as "outstanding" to the overflow rescan (its
-	// generation is newer than the delivered watermark, which only advances on
-	// the worker's post-publish ack), so without this guard the rescan would
-	// re-park it and a second worker would publish the same notification again
-	// — a duplicate push. The rescan skips in-flight sessions; the entry is
-	// removed when the worker acks, so a session whose publish attempt finished
-	// is eligible for the rescan only if it genuinely still owes a notification.
+	// a batch and handed to a publish worker but whose attempt has not yet
+	// recorded its final disposition (an ack, or a re-park on a retryable
+	// outcome). A session in this window still reads as "outstanding" to the
+	// overflow rescan (its generation is newer than the delivered watermark,
+	// which only advances on the worker's post-publish ack), so without this
+	// guard the rescan would re-park it and a second worker would publish the
+	// same notification again — a duplicate push. The rescan skips in-flight
+	// sessions; the marker is cleared after the disposition is recorded, so a
+	// session whose attempt finished is eligible for the rescan only if it
+	// genuinely still owes a notification (a re-parked retryable entry is
+	// covered by its own parked intent, not this marker).
 	deferredPublishInFlight map[string]struct{}
 	// deferredPublishSignal is the buffered-1 wake hint for the dispatcher. A
 	// park sends it nonblocking; a full buffer is fine because the dispatcher
