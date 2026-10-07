@@ -17,6 +17,25 @@ runs:
     # github.com/h2non/bimg binds libvips through cgo and pkg-config, so
     # nothing under ./... compiles without the headers. The Dockerfile
     # installs the same package in its build stage.
+    #
+    # On a GitHub-hosted runner the .deb files are cached per runner image, so
+    # a warm cache installs them offline: no apt-get update and no downloads.
+    # The private runner image already carries the headers, so pkg-config
+    # short-circuits there.
+    - name: Read the libvips cache key
+      if: runner.environment == 'github-hosted'
+      id: libvips-cache-key
+      shell: bash
+      run: echo "key=libvips-dev-${ImageOS:?}-${ImageVersion:?}-${RUNNER_ARCH}" >> "$GITHUB_OUTPUT"
+
+    - name: Restore the libvips packages
+      if: runner.environment == 'github-hosted'
+      id: libvips-cache
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ runner.temp }}/libvips-debs
+        key: ${{ steps.libvips-cache-key.outputs.key }}
+
     - name: Install libvips
       shell: bash
       run: |
@@ -30,8 +49,34 @@ runs:
           -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources
           -o Dir::Etc::sourceparts=-
         )
+        if [ "$RUNNER_ENVIRONMENT" = github-hosted ]; then
+          mkdir -p "$RUNNER_TEMP/libvips-debs"
+          apt_options+=(-o "Dir::Cache::archives=$RUNNER_TEMP/libvips-debs")
+          # The restore has no fallback keys, so packages are present only when
+          # they were saved on this runner image. apt then installs them as
+          # local files without updating its package lists; if it cannot, the
+          # update and install below run as usual.
+          debs=("$RUNNER_TEMP"/libvips-debs/*.deb)
+          if [ -e "${debs[0]}" ]; then
+            echo "installing libvips from the cache"
+            if sudo apt-get "${apt_options[@]}" install -y --no-install-recommends --no-download "${debs[@]}"; then
+              exit 0
+            fi
+          fi
+        fi
+        echo "downloading libvips"
         sudo apt-get "${apt_options[@]}" update
         sudo apt-get "${apt_options[@]}" install -y --no-install-recommends libvips-dev
+
+    # Saved only on a push to main, where the cache is shared with PRs; the
+    # key is the runner image, not the commit, so one entry serves every run
+    # on that image.
+    - name: Save the libvips packages
+      if: runner.environment == 'github-hosted' && github.event_name != 'pull_request' && steps.libvips-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ runner.temp }}/libvips-debs
+        key: ${{ steps.libvips-cache.outputs.cache-primary-key }}
 
     # setup-go's own cache is keyed on go.sum alone and written only on a
     # miss, so between dependency bumps every run restored a build cache

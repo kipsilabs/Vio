@@ -353,27 +353,14 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      # The lint jobs typecheck the whole tree, so cgo packages need libvips
-      # headers even though neither lint step links anything.
-      - name: Install libvips
-        run: |
-          test -f /etc/apt/sources.list.d/ubuntu.sources
-          apt_options=(
-            -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources
-            -o Dir::Etc::sourceparts=-
-          )
-          sudo apt-get "${apt_options[@]}" update
-          sudo apt-get "${apt_options[@]}" install -y --no-install-recommends libvips-dev
-
+      # The composite action installs libvips (cached per runner image), sets
+      # up the Go toolchain, restores the per-commit build cache, and stubs the
+      # embedded frontend bundle. The lint jobs typecheck the whole tree, so
+      # cgo packages need libvips headers even though neither lint step links.
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: ./.github/actions/setup-go
         with:
-          go-version-file: go.mod
-          cache: true
-
-      # cmd/silo embeds the built frontend; the stub satisfies the compiler.
-      - name: Stub the embedded frontend bundle
-        run: make embed-stub
+          cache-name: lint
 
       # The toolchain the binary was built with matters: a golangci-lint
       # binary refuses a host Go newer than the one it was built against, so
