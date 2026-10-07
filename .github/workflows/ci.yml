@@ -61,10 +61,15 @@ jobs:
           gh api --paginate -X GET "repos/$GH_REPO/actions/caches" \
             -f ref="$GITHUB_REF" -f per_page=100 \
             --jq '.actions_caches[] | {id, key, ref, createdAt: .created_at}' > "$RUNNER_TEMP/go-caches.json"
-          cache_ids="$(jq -sr --arg ref "$GITHUB_REF" '
-            map(select(.ref == $ref) | . + {
-              prefix: (.key | capture("^(?<prefix>go-lint-router-recovery-|go-lint-|go-verify-|go-test-|go-integration-|golangci-lint-cache-router-|golangci-lint-cache-|libvips-dev-)").prefix)
-            })
+          # Only lane keys are grouped; any other cache (golangci-lint-binary-,
+          # setup-go-, node-cache-, docker) is skipped, so one foreign key
+          # cannot abort the capture and silently skip every lane.
+          cache_ids="$(jq -sr --arg ref "$GITHUB_REF" --arg re "^(?<prefix>go-lint-router-recovery-|go-lint-|go-verify-|go-test-|go-integration-|golangci-lint-cache-router-|golangci-lint-cache-|libvips-dev-)" '
+            map(
+              select(.ref == $ref)
+              | select(.key | test($re))
+              | . + { prefix: (.key | capture($re).prefix) }
+            )
             | group_by(.prefix)[]
             | sort_by(.createdAt, .id) | reverse
             | .[1:][] | .id
@@ -72,12 +77,13 @@ jobs:
           while IFS= read -r cache_id; do
             [ -n "$cache_id" ] || continue
             echo "Deleting Go cache: $cache_id"
-            gh cache delete "$cache_id"
+            gh api -X DELETE "repos/$GH_REPO/actions/caches/$cache_id"
           done <<< "$cache_ids"
 
-  # The Go gate is three jobs so that lint, the contract checks, and the test
-  # suite run side by side; each one alone is shorter than the serial job they
-  # replace. They share the composite setup action under .github/actions.
+  # The Go gate runs as four parallel lanes — the lint lanes, the contract
+  # checks, the test suite, and the DB-backed integration tests — so each one
+  # alone is shorter than the serial job they replace. They share the composite
+  # setup action under .github/actions.
   go-lint:
     name: Go lint
     runs-on: ubuntu-latest
