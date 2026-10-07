@@ -17,6 +17,26 @@ runs:
     # github.com/h2non/bimg binds libvips through cgo and pkg-config, so
     # nothing under ./... compiles without the headers. The Dockerfile
     # installs the same package in its build stage.
+    #
+    # On a GitHub-hosted runner the .deb files are cached per runner image: a
+    # warm cache installs them offline with no apt-get update and no downloads,
+    # while a cold cache runs the bounded update and install below. The private
+    # runner image already carries the headers, so pkg-config short-circuits
+    # there.
+    - name: Read the libvips cache key
+      if: runner.environment == 'github-hosted'
+      id: libvips-cache-key
+      shell: bash
+      run: echo "key=libvips-dev-${ImageOS:?}-${ImageVersion:?}-${RUNNER_ARCH}" >> "$GITHUB_OUTPUT"
+
+    - name: Restore the libvips packages
+      if: runner.environment == 'github-hosted'
+      id: libvips-cache
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ runner.temp }}/libvips-debs
+        key: ${{ steps.libvips-cache-key.outputs.key }}
+
     - name: Install libvips
       shell: bash
       run: |
@@ -25,13 +45,55 @@ runs:
           exit 0
         fi
         # libvips and its dependencies use the runner's official Ubuntu sources.
+        # The Acquire options bound a stalled or failing mirror: without them
+        # apt-get update once sat on a slow connection for 22 minutes, and with
+        # three retries an install against a mirror returning 502s spent 16
+        # minutes retrying per package. Languages=none skips the translation
+        # indexes. The update below refreshes the runner's mirror selection, so
+        # the install that follows uses whatever mirror is healthy now.
         test -f /etc/apt/sources.list.d/ubuntu.sources
         apt_options=(
           -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources
           -o Dir::Etc::sourceparts=-
+          -o Acquire::Retries=1
+          -o Acquire::http::Timeout=20
+          -o Acquire::https::Timeout=20
+          -o Acquire::ForceIPv4=true
+          -o Acquire::Languages=none
         )
+        if [ "$RUNNER_ENVIRONMENT" = github-hosted ]; then
+          mkdir -p "$RUNNER_TEMP/libvips-debs"
+          apt_options+=(-o "Dir::Cache::archives=$RUNNER_TEMP/libvips-debs")
+          # sudo apt-get creates lock/ and partial/ in the archive dir as root,
+          # and the cache step then cannot read them, so the save failed and the
+          # cache stayed empty on every run. Hand the dir back before the step
+          # (and any early exit) finishes.
+          trap 'sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/libvips-debs" 2>/dev/null || echo "::warning::could not chown the libvips deb cache; the save may be skipped"' EXIT
+          # The restore has no fallback keys, so packages are present only when
+          # they were saved on this runner image. apt then installs them as
+          # local files without touching the network.
+          debs=("$RUNNER_TEMP"/libvips-debs/*.deb)
+          if [ -e "${debs[0]}" ]; then
+            echo "installing libvips from the cache"
+            if sudo apt-get "${apt_options[@]}" install -y --no-install-recommends --no-download "${debs[@]}"; then
+              exit 0
+            fi
+          fi
+        fi
+        echo "updating package lists"
         sudo apt-get "${apt_options[@]}" update
+        echo "installing libvips"
         sudo apt-get "${apt_options[@]}" install -y --no-install-recommends libvips-dev
+
+    # Saved only on a push to main, where the key (the runner image, not the
+    # commit) is shared with every PR. PR runs restore only, so a cold key
+    # cannot be raced into a duplicate save by every job in the run.
+    - name: Save the libvips packages
+      if: runner.environment == 'github-hosted' && github.event_name != 'pull_request' && steps.libvips-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ runner.temp }}/libvips-debs
+        key: ${{ steps.libvips-cache.outputs.cache-primary-key }}
 
     # setup-go's own cache is keyed on go.sum alone and written only on a
     # miss, so between dependency bumps every run restored a build cache
@@ -49,8 +111,25 @@ runs:
       shell: bash
       run: echo "version=$(go env GOVERSION)" >> "$GITHUB_OUTPUT"
 
+    # A PR run restores the build and module cache main last saved but does not
+    # save one. Each lane's cache is 0.6-1.4 GB, and saving a per-PR copy on
+    # every run filled GitHub's 10 GB budget, which then evicted the small
+    # caches (the golangci-lint analysis cache) that make the lint lanes fast.
+    # Only a push to main saves, and the prune job keeps the newest per lane.
     - name: Restore the Go build and module cache
-      if: runner.environment == 'github-hosted'
+      if: runner.environment == 'github-hosted' && github.event_name == 'pull_request'
+      uses: actions/cache/restore@v4
+      with:
+        path: |
+          ~/.cache/go-build
+          ~/go/pkg/mod
+        key: go-${{ inputs.cache-name }}-${{ runner.os }}-${{ steps.go.outputs.version }}-${{ hashFiles('go.sum') }}-${{ github.sha }}
+        restore-keys: |
+          go-${{ inputs.cache-name }}-${{ runner.os }}-${{ steps.go.outputs.version }}-${{ hashFiles('go.sum') }}-
+          go-${{ inputs.cache-name }}-${{ runner.os }}-${{ steps.go.outputs.version }}-
+
+    - name: Restore and save the Go build and module cache
+      if: runner.environment == 'github-hosted' && github.event_name != 'pull_request'
       uses: actions/cache@v4
       with:
         path: |
