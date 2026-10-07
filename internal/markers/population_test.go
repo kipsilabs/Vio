@@ -135,6 +135,13 @@ func TestPopulationRequiresCompletedSetup(t *testing.T) {
 	service.opts.Settings.(populationSettings)["setup.completed"] = "false"
 	var logs bytes.Buffer
 	service.opts.Registry.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	// With online lookups switched off, finishing the wizard would not start
+	// them, so the notice must not suggest it.
+	service.opts.Settings.(populationSettings)[SettingMode] = "local"
+	if _, _, err := service.Refresh(t.Context(), &models.MediaFile{ID: 1}); err != nil || logs.Len() != 0 {
+		t.Fatalf("local mode before setup: err=%v logs=%q", err, logs.String())
+	}
+	service.opts.Settings.(populationSettings)[SettingMode] = "online"
 	for range 2 {
 		_, changed, err := service.Populate(t.Context(), &models.MediaFile{ID: 1})
 		if err != nil || changed || store.claimed != 0 {

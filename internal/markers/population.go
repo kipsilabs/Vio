@@ -115,6 +115,13 @@ func (s *PopulationService) enabled(ctx context.Context) (bool, error) {
 	if s == nil || s.opts.Registry == nil || s.opts.Resolver == nil || s.opts.Store == nil || s.opts.Settings == nil {
 		return false, nil
 	}
+	raw, err := s.opts.Settings.Get(ctx, SettingMode)
+	if err != nil {
+		return false, err
+	}
+	if mode := NormalizeMode(raw); mode != ModeOnline && mode != ModeBoth {
+		return false, nil
+	}
 	complete, err := s.opts.Settings.Get(ctx, "setup.completed")
 	if err != nil {
 		return false, err
@@ -131,12 +138,7 @@ func (s *PopulationService) enabled(ctx context.Context) (bool, error) {
 		}
 		return false, nil
 	}
-	raw, err := s.opts.Settings.Get(ctx, SettingMode)
-	if err != nil {
-		return false, err
-	}
-	mode := NormalizeMode(raw)
-	return mode == ModeOnline || mode == ModeBoth, nil
+	return true, nil
 }
 
 // Populate returns an effective file even when one provider fails. Stored mode
