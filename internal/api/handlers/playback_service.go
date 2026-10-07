@@ -87,6 +87,12 @@ func playbackPreflightOperationError(err error) error {
 	return playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to access source media file")
 }
 func playbackPersistenceOperationError(err error) error {
+	// A surface refusal raised by the terminal-save collision branch is already
+	// a concrete playback operation error; pass it through so a cross-surface
+	// replay is a 409 playback_attempt_reused rather than a generic 500.
+	if e, ok := errors.AsType[*PlaybackOperationError](err); ok {
+		return e
+	}
 	if errors.Is(err, playback.ErrIdempotencyKeyReusedV3) {
 		return playbackOperationError(http.StatusConflict, "playback_attempt_reused", "The playback attempt ID belongs to a different request")
 	}
@@ -1298,6 +1304,28 @@ type inventoryPublishSummary struct {
 	Revision         string
 }
 
+// inventoryPublishResult classifies one session-targeted publish attempt for the
+// deferred-probe dispatcher. The dispatcher acknowledges a notification once its
+// publish attempt completes, so it must know whether an attempt that delivered
+// nothing means the notification is done (obsolete) or must be retried: a
+// transient catalog or plan-store read, or a realtime write that could not reach
+// the client, is retryable and must not advance the delivered watermark, or a
+// push-only client would be left loading forever with no reconnect or poll to
+// rescue it.
+type inventoryPublishResult int
+
+const (
+	// inventoryPublishRetryable: the attempt could not deliver for a transient
+	// reason; the notification is still owed and the dispatcher must re-park it.
+	inventoryPublishRetryable inventoryPublishResult = iota
+	// inventoryPublishDelivered: an inventory_updated event reached the session.
+	inventoryPublishDelivered
+	// inventoryPublishObsolete: the notification no longer needs to be delivered
+	// (the session ended, moved, never negotiated the lifecycle, or already
+	// carries the status); ack it so the overflow rescan converges.
+	inventoryPublishObsolete
+)
+
 // PublishInventoryUpdated pushes the probe-verified track inventory to every
 // live realtime session currently playing fileID. It is invoked from the
 // background probe's persistence points — the local start-path repair and the
@@ -1336,8 +1364,8 @@ func (h *PlaybackHandler) PublishInventoryUpdated(ctx context.Context, fileID in
 		if session == nil || session.ID == "" || !session.HasRealtimeConnection {
 			continue
 		}
-		revision, delivered := h.publishInventoryUpdatedToSession(publishCtx, session, 0, "", nil)
-		if delivered {
+		revision, result := h.publishInventoryUpdatedToSession(publishCtx, session, 0, "", nil)
+		if result == inventoryPublishDelivered {
 			summary.SessionsNotified++
 			summary.Revision = revision
 		}
@@ -1356,37 +1384,42 @@ func (h *PlaybackHandler) PublishInventoryUpdated(ctx context.Context, fileID in
 // hello republish targets directly), so the delivered inventory is identical;
 // only the recipient set differs. fileID is the intent's recorded file, used
 // only to skip the send when the session no longer serves that file; the payload
-// itself is always resolved from the live session. Best-effort: an unknown,
-// ended, or realtime-less session is a no-op.
-func (h *PlaybackHandler) PublishInventoryUpdatedToSession(ctx context.Context, sessionID string, fileID int) inventoryPublishSummary {
+// itself is always resolved from the live session. It returns the delivery
+// summary and the disposition, so the deferred dispatcher can ack a delivered or
+// obsolete notification and re-park a retryable one. An unknown, ended, or
+// realtime-less session is obsolete, not an error.
+func (h *PlaybackHandler) PublishInventoryUpdatedToSession(ctx context.Context, sessionID string, fileID int) (inventoryPublishSummary, inventoryPublishResult) {
 	summary := inventoryPublishSummary{FileID: fileID}
 	if h == nil || h.RealtimeHub == nil || sessionID == "" {
-		return summary
+		return summary, inventoryPublishObsolete
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	session, err := h.sessionMgr.GetSession(sessionID)
 	if err != nil || session == nil {
-		return summary
+		return summary, inventoryPublishObsolete
 	}
 	if !session.HasRealtimeConnection {
-		return summary
+		// A session that has no realtime connection now may attach later; the
+		// hello republish delivers the live inventory then, so this notification
+		// is obsolete rather than retryable and the dispatcher must not spin.
+		return summary, inventoryPublishObsolete
 	}
 	// The intent was parked against a file the session served at park time. A
 	// session that moved to a different file since then is absent from this
 	// notification's scope; the move's own lifecycle carries its own push.
 	if fileID > 0 && session.MediaFileID != fileID && session.RequestedMediaFileID != fileID {
-		return summary
+		return summary, inventoryPublishObsolete
 	}
 	publishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), inventoryUpdatedPublishBudget)
 	defer cancel()
-	revision, delivered := h.publishInventoryUpdatedToSession(publishCtx, session, 0, "", nil)
-	if delivered {
+	revision, result := h.publishInventoryUpdatedToSession(publishCtx, session, 0, "", nil)
+	if result == inventoryPublishDelivered {
 		summary.SessionsNotified++
 		summary.Revision = revision
 	}
-	return summary
+	return summary, result
 }
 
 // publishRefusedProbeInventory serves probe evidence that the identity guard
@@ -1419,7 +1452,7 @@ func (h *PlaybackHandler) publishRefusedProbeInventory(ctx context.Context, file
 		if session == nil || session.ID == "" || !session.HasRealtimeConnection {
 			continue
 		}
-		if _, delivered := h.publishInventoryUpdatedToSession(publishCtx, session, fileID, candidateURI, probed); delivered {
+		if _, result := h.publishInventoryUpdatedToSession(publishCtx, session, fileID, candidateURI, probed); result == inventoryPublishDelivered {
 			notified++
 		}
 	}
@@ -1535,9 +1568,12 @@ func (h *PlaybackHandler) sessionWithSourceGeneration(sessionID string) (*playba
 // release — and only that row — it probed without being shown to a session
 // playing a different row or a sibling that shares the candidate URI.
 //
-// It returns the delivered revision and whether an event was actually sent, so
-// the caller can log delivery without re-deriving it.
-func (h *PlaybackHandler) publishInventoryUpdatedToSession(ctx context.Context, session *playback.Session, probedFileID int, candidateURI string, probed *models.MediaFile) (string, bool) {
+// It returns the delivered revision and a disposition, so the caller can log
+// delivery and, for the deferred-probe dispatcher, decide whether a notification
+// that delivered nothing is obsolete or still owed. The bool-returning callers
+// treat anything other than inventoryPublishDelivered as "no event was sent",
+// which is the pre-existing best-effort contract.
+func (h *PlaybackHandler) publishInventoryUpdatedToSession(ctx context.Context, session *playback.Session, probedFileID int, candidateURI string, probed *models.MediaFile) (string, inventoryPublishResult) {
 	// Two background probes (a start-path repair and a virtual-evidence worker)
 	// can publish for the same session concurrently. Serialize the build and
 	// the send under the session's per-session lock so an older build cannot be
@@ -1560,7 +1596,7 @@ func (h *PlaybackHandler) publishInventoryUpdatedToSession(ctx context.Context, 
 	generation, hasGeneration := h.inventorySourceGeneration(session.ID)
 	live, err := h.sessionMgr.GetSession(session.ID)
 	if err != nil || live == nil {
-		return "", false
+		return "", inventoryPublishObsolete
 	}
 	if refreshed, gen, ok := h.sessionWithSourceGeneration(session.ID); ok {
 		live = refreshed
@@ -1568,9 +1604,12 @@ func (h *PlaybackHandler) publishInventoryUpdatedToSession(ctx context.Context, 
 		hasGeneration = true
 	}
 	var record *playback.AttemptRecordV3
+	recordReadFailed := false
 	if h.PlanStoreV3 != nil {
 		if loaded, err := h.PlanStoreV3.GetAttempt(ctx, session.ID); err == nil {
 			record = loaded
+		} else {
+			recordReadFailed = true
 		}
 	}
 	var inventory playback.PlaybackInventoryV3
@@ -1586,14 +1625,17 @@ func (h *PlaybackHandler) publishInventoryUpdatedToSession(ctx context.Context, 
 	if err != nil {
 		slog.DebugContext(ctx, "inventory updated event skipped: inventory unavailable",
 			"component", "playback", "session", session.ID, "error", err)
-		return "", false
+		// The inventory could not be built (a transient catalog read). The
+		// notification is still owed, so the dispatcher re-parks it rather than
+		// acking an undelivered terminal status.
+		return "", inventoryPublishRetryable
 	}
 	if inventory.InventoryStatus != string(ProbeProvenanceVerified) && inventory.InventoryStatus != string(ProbeProvenanceFailed) {
 		// The probe has not upgraded this session's bound release and no
 		// deferred probe has terminally failed, so the client already holds
 		// exactly this declared inventory. A failed status is new information —
 		// it ends the deferred loading state — so it is pushed.
-		return inventory.InventoryRevision, false
+		return inventory.InventoryRevision, inventoryPublishObsolete
 	}
 	if inventory.InventoryStatus == string(ProbeProvenanceFailed) &&
 		(record == nil || !attemptNegotiatedDeferTrackInventoryV3(record)) {
@@ -1606,39 +1648,49 @@ func (h *PlaybackHandler) publishInventoryUpdatedToSession(ctx context.Context, 
 		// is the delivery-side guard that keeps a failed push from ever
 		// reaching a session whose attempt did not negotiate.
 		//
-		// Fail closed: a nil record means the attempt could not be read (a plan
-		// store error, not a store-less manager — production always wires one).
-		// Without the record the negotiation cannot be established, and a failed
-		// status delivered to a client that never negotiated it is a protocol
-		// surprise it has no reason to handle. Suppress instead, since the
-		// session's own poll still carries the terminal status. Verified pushes
-		// are untouched: they are the pre-existing background upgrade any
-		// session may receive.
-		return inventory.InventoryRevision, false
+		// A nil record here is one of two things. A plan-store read failure
+		// (production always wires a store) means the negotiation cannot be
+		// established right now: suppress the push but report it retryable so
+		// the deferred dispatcher re-parks the notification instead of acking
+		// an undelivered terminal status — otherwise a push-only client would
+		// be left loading with neither a reconnect nor a poll to rescue it. A
+		// store-less handler (a minimal test double) has no recovery path, so
+		// it stays obsolete and the pre-existing best-effort behavior holds.
+		// Verified pushes are untouched: they are the pre-existing background
+		// upgrade any session may receive.
+		if recordReadFailed {
+			return inventory.InventoryRevision, inventoryPublishRetryable
+		}
+		return inventory.InventoryRevision, inventoryPublishObsolete
 	}
 	if hasGeneration {
 		if current, ok := h.inventorySourceGeneration(session.ID); !ok || current != generation {
 			slog.DebugContext(ctx, "inventory updated event skipped: source binding moved while building",
 				"component", "playback", "session", session.ID, "built_generation", generation)
-			return inventory.InventoryRevision, false
+			// A newer binding owns its own lifecycle; the notification for the
+			// superseded one must not be retried against it.
+			return inventory.InventoryRevision, inventoryPublishObsolete
 		}
 	}
 	event, err := playback.NewInventoryUpdatedEvent(session.ID, inventory)
 	if err != nil {
 		slog.WarnContext(ctx, "failed to encode inventory updated realtime event",
 			"component", "playback", "session", session.ID, "error", err)
-		return inventory.InventoryRevision, false
+		return inventory.InventoryRevision, inventoryPublishRetryable
 	}
 	if err := h.RealtimeHub.Send(session.ID, event); err != nil {
 		if !errors.Is(err, playback.ErrRealtimeConnectionNotFound) {
 			slog.WarnContext(ctx, "failed to deliver inventory updated realtime event",
 				"component", "playback", "session", session.ID, "error", err)
+			// A real write failure may clear; the notification is still owed.
+			return inventory.InventoryRevision, inventoryPublishRetryable
 		}
 		// A session without a realtime connection received nothing; do not
-		// count it as notified.
-		return inventory.InventoryRevision, false
+		// count it as notified. The hello republish delivers once it attaches,
+		// so the notification is obsolete rather than retryable.
+		return inventory.InventoryRevision, inventoryPublishObsolete
 	}
-	return inventory.InventoryRevision, true
+	return inventory.InventoryRevision, inventoryPublishDelivered
 }
 
 // AudioReconciliationReasonV3 names the automatic default-audio

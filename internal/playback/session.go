@@ -1618,6 +1618,34 @@ func (m *SessionManager) SetVirtualProbeOutcomeIfGeneration(sessionID string, ge
 	return true, nil
 }
 
+// ArmVirtualProbePendingIfGeneration transitions a binding generation's probe
+// outcome from empty to pending, and only from empty. It is the exclusive
+// ownership fence for deferred-probe admission: a duplicate start whose
+// SaveAttempt lost the CAS adopts the winner's session and re-enters the start
+// path, but it must not re-arm — and re-probe — a lifecycle the winner already
+// armed or completed. It returns false when the outcome was already set (armed,
+// verified, or failed), when the binding moved, or for an unknown session, so
+// the caller drops the duplicate job without an outcome write.
+func (m *SessionManager) ArmVirtualProbePendingIfGeneration(sessionID string, generation uint64) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		return false, ErrSessionNotFound
+	}
+	if s.virtualSourceGeneration != generation {
+		return false, nil
+	}
+	if s.VirtualProbeOutcome != "" {
+		// The lifecycle is already armed or terminal for this binding: a
+		// duplicate admission owns nothing and must not restart it.
+		return false, nil
+	}
+	s.VirtualProbeOutcome = VirtualProbeOutcomePending
+	return true, nil
+}
+
 // VirtualSourceBindingSnapshot captures the full candidate-binding state under the session lock.
 type VirtualSourceBindingSnapshot struct {
 	VirtualURI           string

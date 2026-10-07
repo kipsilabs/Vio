@@ -3222,7 +3222,8 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersist(
 	if len(fence) > 0 {
 		bindingFence = fence[0]
 	}
-	return h.probeVirtualSourceAndPersistWith(bgCtx, stickyKey, catalogFile, probeURL, probeTransient, probeCand, expectedRuntimeMinutes, ownerInstallationID, false, bindingFence)
+	outcome, _ := h.probeVirtualSourceAndPersistWith(bgCtx, stickyKey, catalogFile, probeURL, probeTransient, probeCand, expectedRuntimeMinutes, ownerInstallationID, false, bindingFence)
+	return outcome
 }
 
 // probeVirtualSourceAndPersistWith is probeVirtualSourceAndPersist with an
@@ -3246,7 +3247,7 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 	ownerInstallationID int,
 	durableEvidence bool,
 	fence func() bool,
-) string {
+) (string, int) {
 	probeKey := virtualProbeFailureKey(probeCand.URI, ownerInstallationID)
 	probeCtx, probeCancel := context.WithTimeout(bgCtx, virtualBackgroundProbeBudget)
 	probed, probeErr := h.probeVirtualSource(probeCtx, probeURL, &probeTransient, probeCand.RequestHeaders)
@@ -3258,7 +3259,7 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 	if fence != nil && !fence() {
 		slog.InfoContext(bgCtx, "virtual probe evidence dropped: candidate binding moved during the probe",
 			"component", "api", "candidate_uri", probeCand.URI, "file_id", catalogFile.ID)
-		return ""
+		return "", 0
 	}
 	if probeErr != nil || probed == nil {
 		virtualProbeFailures.mark(probeKey)
@@ -3272,7 +3273,7 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 			virtualProbeFailures.count(probeKey) >= virtualProbeFailureRepeatThreshold {
 			h.unpinVirtualSticky(stickyKey, probeCand.URI)
 		}
-		return probeOutcomeFailed
+		return probeOutcomeFailed, 0
 	}
 	if !virtualRuntimePlausible(probed.Duration, expectedRuntimeMinutes) {
 		virtualProbeFailures.mark(probeKey)
@@ -3280,7 +3281,7 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 			"component", "api", "candidate_uri", probeCand.URI, "file_id", catalogFile.ID,
 			"probed_duration_seconds", probed.Duration, "expected_runtime_minutes", expectedRuntimeMinutes)
 		h.unpinVirtualSticky(stickyKey, probeCand.URI)
-		return probeOutcomeFailed
+		return probeOutcomeFailed, 0
 	}
 	virtualProbeFailures.clear(probeKey)
 	if probeTransient.ID > 0 {
@@ -3296,27 +3297,26 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 		// durable write committed the enumerated tracks onto the row the
 		// inventory poll reads. A rejected or failed write is a terminal failed
 		// outcome so the client leaves loading instead of showing a stale menu
-		// as verified.
-		if !h.persistVirtualProbeEvidenceDurable(bgCtx, catalogFile, probeCand.URI, probed, true) {
+		// as verified. committedFileID is the row the write actually targeted: a
+		// rotation can move it off catalogFile, and the caller's post-commit
+		// default-audio reconciliation must run against the owner row.
+		committed, committedFileID := h.persistVirtualProbeEvidenceDurable(bgCtx, catalogFile, probeCand.URI, probed, true)
+		if !committed {
 			slog.WarnContext(bgCtx, "deferred virtual probe evidence write did not commit; reporting failed",
 				"component", "api", "candidate_uri", probeCand.URI, "file_id", catalogFile.ID)
-			return probeOutcomeFailed
+			return probeOutcomeFailed, 0
 		}
-		// Integration note: this durable write commits a verified inventory
-		// for a session whose committed recipe was built from declared
-		// metadata, so a probe that reorders the audio tracks can leave the
-		// executable default-audio selection on the wrong language. The
-		// default-audio reconciliation work on the shared evidence path runs a
-		// post-commit correction for exactly that case; this deferred path
-		// bypasses it and must run the same correction once that lands, or
-		// deferred sessions keep the pre-reconciliation behavior. Until then
-		// the committed selection is untouched here, which is the correct
-		// conservative outcome: a failed or reordered menu never switches a
-		// viewer's audio track on its own.
-		return probeOutcomeVerified
+		// The durable write committed a verified inventory for a session whose
+		// committed recipe was built from declared metadata, so a reorder can
+		// leave the executable default-audio selection on the wrong language.
+		// The caller runs the shared reconcileVerifiedDefaultAudio hook against
+		// the returned owner row after it releases the shared gate, exactly as
+		// the direct and queued evidence paths do, so a deferred session's
+		// recipe keeps the preferred language.
+		return probeOutcomeVerified, committedFileID
 	}
 	h.persistVirtualProbeEvidence(bgCtx, catalogFile, probeCand.URI, probed, true, false)
-	return probeOutcomeVerified
+	return probeOutcomeVerified, 0
 }
 
 // persistVirtualProbeEvidenceDurable performs one synchronous, durable evidence
@@ -3337,13 +3337,15 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 // at least one row and as not-committed otherwise — it cannot distinguish a CAS
 // miss (superseded snapshot) from a plain no-op, but a zero-row write is never
 // reported verified. It returns whether the probe evidence is committed and
-// therefore readable from the catalog row.
-func (h *PlaybackHandler) persistVirtualProbeEvidenceDurable(ctx context.Context, catalogFile *models.MediaFile, resolvedPath string, probed *models.MediaFile, stampProbe bool) bool {
+// therefore readable from the catalog row, together with the row the write
+// actually targeted (a rotation can move it off catalogFile), so the caller can
+// run the post-commit default-audio reconciliation against the owner row.
+func (h *PlaybackHandler) persistVirtualProbeEvidenceDurable(ctx context.Context, catalogFile *models.MediaFile, resolvedPath string, probed *models.MediaFile, stampProbe bool) (bool, int) {
 	args, _, ok := h.virtualProbeEvidenceArgs(ctx, catalogFile, resolvedPath, probed, stampProbe)
 	if !ok {
 		slog.WarnContext(ctx, "durable virtual probe evidence write refused before execution",
 			"component", "api", "file_id", catalogFileIDOrZero(catalogFile), "candidate_uri", resolvedPath)
-		return false
+		return false, 0
 	}
 	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), virtualEvidencePersistBudget)
 	defer cancel()
@@ -3352,28 +3354,28 @@ func (h *PlaybackHandler) persistVirtualProbeEvidenceDurable(ctx context.Context
 		if err != nil {
 			slog.WarnContext(ctx, "durable virtual probe evidence write failed",
 				"component", "api", "file_id", args.FileID, "error", err)
-			return false
+			return false, 0
 		}
 		if result.MetadataUpdated {
-			return true
+			return true, args.FileID
 		}
 		// A CAS miss is the expected outcome when a newer writer already
 		// committed the row; the evidence this probe enumerated is then
 		// superseded and must not be reported verified.
 		slog.WarnContext(ctx, "durable virtual probe evidence write matched no row (superseded snapshot)",
 			"component", "api", "file_id", args.FileID, "candidate_uri", resolvedPath)
-		return false
+		return false, 0
 	}
 	if h.VirtualFileSaver == nil {
-		return false
+		return false, 0
 	}
 	rows, err := h.VirtualFileSaver(writeCtx, args)
 	if err != nil {
 		slog.WarnContext(ctx, "durable virtual probe evidence write failed",
 			"component", "api", "file_id", args.FileID, "error", err)
-		return false
+		return false, 0
 	}
-	return rows > 0
+	return rows > 0, args.FileID
 }
 
 // catalogFileIDOrZero is a nil-safe file id for a log attribute.

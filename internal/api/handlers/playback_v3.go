@@ -11167,6 +11167,20 @@ func (h *PlaybackHandler) persistTerminalStartDecisionV3(ctx context.Context, us
 		existing.RequestedMediaFileID != requestedFileID || !requestDigests.matches(existing.RequestDigest) {
 		return playback.DecisionResponseV3{}, playback.ErrIdempotencyKeyReusedV3
 	}
+	existingResponse := decisionResponseFromAttemptV3(existing)
+	// A terminal publishes no subtitle URLs and no playable plan, so it replays
+	// on either surface; the surface guard protects only a playable plan. This
+	// is the terminal-save collision: a concurrent duplicate start lost the
+	// SaveAttempt CAS, re-read a winner whose plan may have negotiated the
+	// deferred track-inventory lifecycle (or original SRT), and must not hand
+	// that plan back through the other surface. Without this guard the losing
+	// request's terminal save would replay the winner's playable plan —
+	// tracks_pending and all — through a surface that never negotiated it.
+	if existingResponse.Terminal == nil {
+		if err := requireAttemptAPISurfaceV3(ctx, existing, req.ClientFeatures); err != nil {
+			return playback.DecisionResponseV3{}, err
+		}
+	}
 	// A publication failure can leave a durable attempt whose session was
 	// aborted. A terminal-save collision must not resurrect that playable plan.
 	if existing.SessionID != "" {
@@ -11174,7 +11188,7 @@ func (h *PlaybackHandler) persistTerminalStartDecisionV3(ctx context.Context, us
 			return playback.NewTerminalResponseV3("session_expired", "The playback session for this attempt has ended.", true), nil //nolint:nilerr // Expiration is a successful terminal protocol response.
 		}
 	}
-	return decisionResponseFromAttemptV3(existing), nil
+	return existingResponse, nil
 }
 
 func (h *PlaybackHandler) startFailureDecisionV3(ctx context.Context, userID int, profileID string, req playback.StartRequestV3, requestDigests playbackStartRequestDigestsV3, requestedFileID, effectiveFileID int, failure *transportErrorV3) (playback.DecisionResponseV3, error) {

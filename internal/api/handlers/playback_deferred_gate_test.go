@@ -558,3 +558,135 @@ func TestDeferredTrackInventoryConcurrentDuplicateReplayClosed(t *testing.T) {
 		}
 	})
 }
+
+// seedTerminalSaveCollisionStore pre-loads one playable durable attempt (the
+// concurrent winner) and returns a handler whose post-collision read finds it.
+// The terminal-save collision branch re-reads by playback attempt id after a
+// losing SaveAttempt, so the store must return the winner record there while the
+// initial lookup (the ordinary replay path) is bypassed by the caller driving
+// persistTerminalStartDecisionV3 directly.
+func seedTerminalSaveCollisionStore(t *testing.T, record playback.AttemptRecordV3) *PlaybackHandler {
+	t.Helper()
+	manager := playback.NewSessionManager(0, 0)
+	manager.RegisterReconstructed(&playback.Session{
+		ID: record.SessionID, UserID: record.UserID, ProfileID: record.ProfileID,
+		MediaFileID: record.EffectiveMediaFileID, RequestedMediaFileID: record.RequestedMediaFileID,
+		PlayMethod: playback.PlayDirect,
+	})
+	handler := NewPlaybackHandler(manager)
+	if err := handler.PlanStoreV3.SaveAttempt(context.Background(), record); err != nil {
+		t.Fatalf("seed attempt: %v", err)
+	}
+	return handler
+}
+
+// TestTerminalSaveCollisionKeepsSurfaceGuard is the #1 regression: a losing
+// terminal save must not replay the concurrent winner's playable plan through
+// the wrong surface. The winner negotiated the deferred track-inventory
+// lifecycle on /api/v2 (a plan carrying tracks_pending); the loser's terminal
+// save collides, re-reads that record, and must refuse to hand the playable plan
+// back through /api/v1. Terminal decisions (no playable plan) still replay on
+// either surface, and the same-surface retry still replays.
+func TestTerminalSaveCollisionKeepsSurfaceGuard(t *testing.T) {
+	deferred := []string{playback.FeatureDeferredTrackInventoryV3}
+	subrip := []string{playback.FeatureSubripSidecarV3}
+	terminalReq := v3HandlerStartRequest()
+
+	record := func(attemptID string, clientFeatures, serverFeatures []string) playback.AttemptRecordV3 {
+		plan := playback.PlanV3{PlanID: "plan-terminal-collision", TracksPending: true}
+		return playback.AttemptRecordV3{
+			PlaybackAttemptID:    attemptID,
+			SessionID:            "11111111-1111-1111-1111-111111111111",
+			UserID:               1,
+			ProfileID:            "profile-1",
+			RequestedMediaFileID: 42,
+			EffectiveMediaFileID: 42,
+			ExpiresAt:            time.Now().Add(time.Hour),
+			RequestDigest:        "digest-terminal-collision",
+			NormalizedRequest:    playback.StartRequestV3{ClientFeatures: clientFeatures},
+			StartResponse: playback.DecisionResponseV3{
+				ProtocolVersion: playback.ProtocolV3,
+				Outcome:         playback.OutcomePlayableV3,
+				SessionID:       "11111111-1111-1111-1111-111111111111",
+				ServerFeatures:  serverFeatures,
+				PlaybackPlan:    &playback.PlanV3{PlanID: "plan-terminal-collision", SessionID: "11111111-1111-1111-1111-111111111111", TracksPending: true},
+			},
+			CurrentPlan: plan,
+		}
+	}
+
+	call := func(t *testing.T, h *PlaybackHandler, v2 bool, attemptID string, clientFeatures []string) (playback.DecisionResponseV3, error) {
+		t.Helper()
+		req := terminalReq
+		req.PlaybackAttemptID = attemptID
+		req.ClientFeatures = append(append([]string(nil), req.ClientFeatures...), clientFeatures...)
+		digests := playbackStartRequestDigestsV3{current: "digest-terminal-collision"}
+		ctx := newAuthorizedPlaybackContext()
+		if v2 {
+			ctx = WithNativeAPIV2(ctx)
+		}
+		terminal := playback.NewTerminalResponseV3("source_unavailable", "The provider listed no streams for this title.", true)
+		return h.persistTerminalStartDecisionV3(ctx, 1, "profile-1", req, digests, 42, 42, terminal)
+	}
+
+	t.Run("deferred v2 winner refused through v1 terminal save", func(t *testing.T) {
+		h := seedTerminalSaveCollisionStore(t, record("attempt-tsc-deferred", deferred, deferred))
+		if _, err := call(t, h, false, "attempt-tsc-deferred", deferred); err == nil {
+			t.Fatal("v1 terminal save replayed a deferred-v2 playable plan; the surface guard must refuse it")
+		} else if e, ok := errors.AsType[*PlaybackOperationError](err); !ok || e.Code != "playback_attempt_reused" {
+			t.Fatalf("refusal = %v, want a playback_attempt_reused operation error", err)
+		}
+	})
+
+	t.Run("subrip v2 winner refused through v1 terminal save", func(t *testing.T) {
+		h := seedTerminalSaveCollisionStore(t, record("attempt-tsc-subrip", subrip, subrip))
+		if _, err := call(t, h, false, "attempt-tsc-subrip", nil); err == nil {
+			t.Fatal("v1 terminal save replayed an original-SRT v2 plan; the surface guard must refuse it")
+		}
+	})
+
+	t.Run("same-surface terminal collision replays the winner", func(t *testing.T) {
+		h := seedTerminalSaveCollisionStore(t, record("attempt-tsc-same", deferred, deferred))
+		response, err := call(t, h, true, "attempt-tsc-same", deferred)
+		if err != nil {
+			t.Fatalf("same-surface terminal collision = %v, want the winner replay", err)
+		}
+		if response.PlaybackPlan == nil || !response.PlaybackPlan.TracksPending {
+			t.Fatalf("same-surface replay = %#v, want the winner's provisional plan", response)
+		}
+	})
+
+	t.Run("unnegotiated winner replays through v1", func(t *testing.T) {
+		h := seedTerminalSaveCollisionStore(t, record("attempt-tsc-plain", nil, nil))
+		if _, err := call(t, h, false, "attempt-tsc-plain", nil); err != nil {
+			t.Fatalf("unnegotiated winner must replay through v1, got %v", err)
+		}
+	})
+
+	t.Run("v2 deferred loser refused through an unnegotiated winner", func(t *testing.T) {
+		// The other direction: the loser is the v2 deferred start and the
+		// winner's stored plan never negotiated deferred_track_inventory_v1. The
+		// guard must refuse it too, or the v2 client adopts a plan that promised a
+		// follow-up it will never receive.
+		h := seedTerminalSaveCollisionStore(t, record("attempt-tsc-v2loser", nil, nil))
+		if _, err := call(t, h, true, "attempt-tsc-v2loser", deferred); err == nil {
+			t.Fatal("v2 deferred terminal save replayed an unnegotiated v1 plan; the surface guard must refuse it")
+		}
+	})
+
+	t.Run("terminal winner replays cross-surface", func(t *testing.T) {
+		// A terminal publishes no plan, so the surface guard is deliberately
+		// skipped for it: a terminal collision must still replay through the
+		// other surface. This is the exception the playable-only guard protects.
+		rec := record("attempt-tsc-terminal", deferred, deferred)
+		rec.StartResponse = playback.NewTerminalResponseV3("source_unavailable", "The provider listed no streams for this title.", true)
+		h := seedTerminalSaveCollisionStore(t, rec)
+		response, err := call(t, h, false, "attempt-tsc-terminal", deferred)
+		if err != nil {
+			t.Fatalf("cross-surface terminal collision = %v, want the terminal replay", err)
+		}
+		if response.Terminal == nil || response.Terminal.Reason != "source_unavailable" {
+			t.Fatalf("cross-surface terminal collision = %#v, want the terminal replay", response)
+		}
+	})
+}

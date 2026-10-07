@@ -74,6 +74,13 @@ error, an unreadable evidence write, or a saturated worker pool that could not
 admit the probe — and the client must leave the loading state and keep the
 provisional menu it already holds. A failed upgrade never changes the stream or
 the executable audio selection; a viewer who picked an audio track keeps it.
+When the durable evidence write commits a verified inventory whose order differs
+from the declared one, the server replays the attempt's persisted audio
+selection intent against it (the same default-audio reconciliation the
+non-deferred evidence path runs) and asks the client to replan through the
+existing `plan_invalidated` handshake, so the executable recipe keeps the
+preferred language. An explicit viewer selection is verified present and never
+overridden.
 `tracks_pending` is a menu hint and is excluded from plan identity, so an
 idempotent start retry replays the same plan with the same marker.
 

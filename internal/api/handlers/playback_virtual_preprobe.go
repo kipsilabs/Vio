@@ -166,16 +166,30 @@ func (h *PlaybackHandler) enqueueDeferredVirtualProbeV3(ctx context.Context, def
 	h.signalDeferredProbeRetry()
 }
 
+// virtualProbePendingArmer is the session-manager capability that transitions a
+// binding generation's probe outcome to pending only from empty. It is the
+// exclusive ownership fence for deferred-probe admission: a duplicate start that
+// adopted a winner's session must not restart a lifecycle that is already armed
+// or terminal.
+type virtualProbePendingArmer interface {
+	ArmVirtualProbePendingIfGeneration(sessionID string, generation uint64) (bool, error)
+}
+
 // armDeferredProbePending captures the session's candidate binding and marks the
-// deferred inventory pending on it. The binding identity and generation are one
-// manager read, so a rotation cannot interleave between them: the generation is
-// then retained on the job for every later fence, and the pending write CASes on
-// it so a rotation landing between this read and the write drops the pending
-// mark instead of showing it on the replacement binding. It reports false — the
-// job is stale and must not be admitted — when the session is gone or already
-// bound to a different candidate. A manager without the binding reader (a
-// minimal test manager) admits unfenced, matching the pre-existing best-effort
-// behavior on those managers.
+// deferred inventory pending on it, but only when no lifecycle is already armed
+// or terminal for that binding generation. The binding identity and generation
+// are one manager read, so a rotation cannot interleave between them: the
+// generation is then retained on the job for every later fence, and the pending
+// write CASes on it so a rotation landing between this read and the write drops
+// the pending mark instead of showing it on the replacement binding. It reports
+// false — the job is stale and must not be admitted — when the session is gone,
+// already bound to a different candidate, or already carries a probe outcome for
+// this binding (armed or terminal). That last case is the duplicate-start fence:
+// a concurrent winner's terminal save returns its plan to a loser that then
+// re-enters the start path, and the loser must not re-probe and re-arm the
+// winner's completed lifecycle. A manager without the binding reader (a minimal
+// test manager) admits unfenced, matching the pre-existing best-effort behavior
+// on those managers.
 func (h *PlaybackHandler) armDeferredProbePending(ctx context.Context, deferred *virtualDeferredProbeV3) bool {
 	if h == nil || deferred == nil || h.sessionMgr == nil || deferred.sessionID == "" {
 		return true
@@ -198,6 +212,24 @@ func (h *PlaybackHandler) armDeferredProbePending(ctx context.Context, deferred 
 		return false
 	}
 	deferred.bindingGeneration = binding.Generation
+	if armer, ok := h.sessionMgr.(virtualProbePendingArmer); ok {
+		// Exclusive ownership: arm only from empty, so a duplicate start cannot
+		// restart a lifecycle the winner already armed or completed. A manager
+		// exposing only the outcome CAS keeps the pre-existing best-effort
+		// behavior below.
+		applied, armErr := armer.ArmVirtualProbePendingIfGeneration(deferred.sessionID, binding.Generation)
+		if armErr != nil {
+			slog.DebugContext(ctx, "deferred virtual post-commit probe dropped: pending mark not applied",
+				"component", "api", "session", deferred.sessionID, "candidate_uri", deferred.cand.URI, "error", armErr)
+			return false
+		}
+		if !applied {
+			slog.DebugContext(ctx, "deferred virtual post-commit probe dropped: lifecycle already armed or terminal for the binding",
+				"component", "api", "session", deferred.sessionID, "candidate_uri", deferred.cand.URI, "generation", binding.Generation)
+			return false
+		}
+		return true
+	}
 	h.setVirtualProbeOutcomeIfGeneration(deferred.sessionID, binding.Generation, probeOutcomePending)
 	return true
 }
@@ -356,13 +388,22 @@ func (h *PlaybackHandler) runDeferredVirtualProbe(deferred *virtualDeferredProbe
 	}
 	bgCtx, bgCancel := h.virtualDetachedContext(h.ServiceContext, virtualBackgroundProbeBudget)
 	defer bgCancel()
-	outcome := h.probeVirtualSourceAndPersistWith(bgCtx, deferred.stickyKey, deferred.file, deferred.streamURL, *deferred.probeTransient, deferred.cand, deferred.expectedRuntimeMinutes, deferred.ownerID, true, h.deferredProbeBindingIntact(deferred))
+	outcome, verifiedFileID := h.probeVirtualSourceAndPersistWith(bgCtx, deferred.stickyKey, deferred.file, deferred.streamURL, *deferred.probeTransient, deferred.cand, deferred.expectedRuntimeMinutes, deferred.ownerID, true, h.deferredProbeBindingIntact(deferred))
 	// The probe is done with the shared gate: release this worker's slot before
 	// the terminal outcome write and publish so a saturated gate is not held by
 	// catalog/realtime fan-out that carries its own budget. Parked terminal
 	// notifications need no drain call here — the dispatcher owns wakeups and
 	// re-checks its map on its own signal and backstop ticker.
 	gate.release()
+	// The durable write committed verified evidence on verifiedFileID; run the
+	// shared cold-start default-audio reconciliation against that owner row (a
+	// rotation can move it off deferred.file), with the gate released so its own
+	// catalog/session sweep is not charged to this worker's slot. The probe's
+	// binding fence already refuses a superseded verdict, and the reconcile
+	// sweep re-checks the committed row before issuing any correction.
+	if outcome == probeOutcomeVerified && verifiedFileID > 0 {
+		h.reconcileVerifiedDefaultAudio(context.Background(), verifiedFileID)
+	}
 	switch outcome {
 	case probeOutcomeVerified, probeOutcomeFailed:
 		// probeVirtualSourceAndPersist has already attempted the durable
@@ -446,6 +487,33 @@ const deferredPublishBatchCap = 8
 // signal was coalesced away, so no release-site cooperation is ever required.
 const deferredPublishBackstop = time.Second
 
+// Retry backoff for a notification whose publish attempt was retryable (a
+// transient catalog/plan-store read or a realtime write that did not reach the
+// client). The delay grows with the attempt count and is capped, so a flapping
+// dependency is retried without a hot loop while a push-only client still leaves
+// loading within a bounded time.
+const (
+	deferredPublishRetryBaseDelay = 250 * time.Millisecond
+	deferredPublishRetryMaxDelay  = 10 * time.Second
+)
+
+// deferredPublishRetryDelay is the bounded backoff before a retryable
+// notification is dispatched again. attempts is the number of retryable attempts
+// already made (>= 1 when called).
+func deferredPublishRetryDelay(attempts int) time.Duration {
+	if attempts <= 1 {
+		return deferredPublishRetryBaseDelay
+	}
+	delay := deferredPublishRetryBaseDelay
+	for i := 1; i < attempts; i++ {
+		delay *= 2
+		if delay >= deferredPublishRetryMaxDelay {
+			return deferredPublishRetryMaxDelay
+		}
+	}
+	return delay
+}
+
 // publishDeferredProbeInventory pushes the session's committed deferred-probe
 // inventory to live realtime sessions, so a client watching the push path leaves
 // its loading state. It must only run after the session outcome has been stored,
@@ -487,17 +555,21 @@ func (h *PlaybackHandler) publishDeferredProbeInventory(deferred *virtualDeferre
 		h.parkDeferredProbePublish(deferred.sessionID, deferred.file.ID, deferred.bindingGeneration)
 		return
 	}
-	h.runDeferredPublishWorker(deferred.sessionID, deferred.file.ID, deferred.bindingGeneration)
+	h.runDeferredPublishWorker(deferred.sessionID, deferredPublishIntent{fileID: deferred.file.ID, generation: deferred.bindingGeneration})
 }
 
 // deferredPublishIntent is one parked terminal notification: the file whose
 // inventory the push re-reads and the binding generation the notification
 // carries. The generation flows park → dispatcher → publish worker, so the ack
 // after publish (MarkVirtualProbeNotified) marks exactly that binding's outcome
-// delivered and never an older or newer one.
+// delivered and never an older or newer one. notBefore, when non-zero, holds a
+// retryable notification until its bounded backoff elapses; attempts counts the
+// retryable publish attempts so the backoff grows without a hot loop.
 type deferredPublishIntent struct {
 	fileID     int
 	generation uint64
+	attempts   int
+	notBefore  time.Time
 }
 
 // parkDeferredProbePublish records that a session's terminal inventory still
@@ -725,7 +797,7 @@ func (h *PlaybackHandler) drainDeferredPublishBatch(base context.Context) bool {
 			// takeDeferredPublishSlot. Re-select rather than publish stale.
 			continue
 		}
-		h.runDeferredPublishWorker(sessionID, intent.fileID, intent.generation)
+		h.runDeferredPublishWorker(sessionID, intent)
 	}
 	// A full batch published: the map may still hold more, so keep draining.
 	return true
@@ -737,13 +809,16 @@ func (h *PlaybackHandler) drainDeferredPublishBatch(base context.Context) bool {
 // returns it. It reports found=false when no parked entry is dispatchable,
 // alongside whether a rescan is still owed. Entries whose generation the
 // watermark already covers are dropped, not returned: their push already
-// landed, so dispatching them would duplicate it. The in-flight mark is NOT
-// taken here — it moves into takeDeferredPublishSlot, which marks it under the
-// same lock section as the gate-slot claim, so a session is never observed as
-// neither-parked-nor-in-flight while its publish is outstanding.
+// landed, so dispatching them would duplicate it. An entry whose retryable
+// backoff has not yet elapsed is skipped so the batch does not spin on it; the
+// dispatcher's backstop ticker wakes it once the delay has passed. The in-flight
+// mark is NOT taken here — it moves into takeDeferredPublishSlot, which marks it
+// under the same lock section as the gate-slot claim, so a session is never
+// observed as neither-parked-nor-in-flight while its publish is outstanding.
 func (h *PlaybackHandler) selectDeferredPublishCandidate() (sessionID string, intent deferredPublishIntent, found bool, rescanOwed bool) {
 	h.deferredPublishMu.Lock()
 	defer h.deferredPublishMu.Unlock()
+	now := time.Now()
 	for id, candidate := range h.deferredPublishPending {
 		if _, inFlight := h.deferredPublishInFlight[id]; inFlight {
 			// Mid-publish: skip at selection time so the batch never burns a
@@ -754,6 +829,11 @@ func (h *PlaybackHandler) selectDeferredPublishCandidate() (sessionID string, in
 			// Acks that landed while the entry sat parked already delivered
 			// this generation; drop it instead of publishing a duplicate.
 			delete(h.deferredPublishPending, id)
+			continue
+		}
+		if !candidate.notBefore.IsZero() && now.Before(candidate.notBefore) {
+			// A retryable attempt is still in backoff. Leave it parked and
+			// wait for the backstop ticker rather than spinning a batch on it.
 			continue
 		}
 		delete(h.deferredPublishPending, id)
@@ -905,24 +985,47 @@ func (h *PlaybackHandler) markDeferredPublishInFlight(sessionID string) bool {
 // sessions on the same file would deliver events they never ack — and ack this
 // session against a push its siblings also received, breaking exactly-once for
 // both. A session that ended before its slot was granted is simply absent from
-// the targeted publish. After the attempt it acks the generation the
-// notification carried, so the overflow rescan stops returning this session;
-// the ack is forward-only, so a superseded binding's late ack never clears a
-// newer binding's outstanding intent.
-func (h *PlaybackHandler) runDeferredPublishWorker(sessionID string, fileID int, generation uint64) {
+// the targeted publish.
+//
+// The disposition decides the follow-up. A DELIVERED or OBSOLETE attempt acks
+// the generation the notification carried, so the overflow rescan stops
+// returning this session; the ack is forward-only, so a superseded binding's
+// late ack never clears a newer binding's outstanding intent. A RETRYABLE
+// attempt (a transient catalog/plan-store read, or a realtime write that did
+// not reach the client) must NOT advance the delivered watermark: it re-parks
+// the notification with a bounded backoff so the dispatcher retries it. That is
+// what keeps a push-only client, which has neither a reconnect nor a poll to
+// rescue it, from being left loading forever by a single transient failure.
+func (h *PlaybackHandler) runDeferredPublishWorker(sessionID string, intent deferredPublishIntent) {
 	gate := h.detachedGate()
 	go func() {
 		// Deferred cleanup, in order: the gate slot is always returned, and the
-		// ack always runs. The ack (session lock, watermark forward-only)
-		// deliberately precedes the in-flight clear (deferredPublishMu) — that
-		// ordering is what lets the rescan and the batch selection treat
-		// "in-flight marker absent" as "ack already landed", never observing a
-		// session whose ack has not landed as re-parkable. See the lock-order
-		// note on deferredPublishMu in playback.go.
+		// final disposition is always recorded. The ack/re-park (session lock,
+		// watermark forward-only) deliberately precedes the in-flight clear
+		// (deferredPublishMu) — that ordering is what lets the rescan and the
+		// batch selection treat "in-flight marker absent" as "ack already
+		// landed", never observing a session whose ack has not landed as
+		// re-parkable. See the lock-order note on deferredPublishMu in
+		// playback.go.
 		defer gate.release()
+		var retry bool
 		defer func() {
-			h.ackDeferredProbeNotified(sessionID, generation)
 			h.deferredPublishMu.Lock()
+			if retry {
+				// Re-park only if nothing newer/covering landed while this
+				// attempt was outstanding: a covering ack means the outcome was
+				// already delivered, and a newer park owns the session now.
+				current, parked := h.deferredPublishPending[sessionID]
+				if !parked || current.generation <= intent.generation {
+					if !h.deferredProbeNotifiedCovers(sessionID, intent.generation) {
+						intent.attempts++
+						intent.notBefore = time.Now().Add(deferredPublishRetryDelay(intent.attempts))
+						h.deferredPublishPending[sessionID] = intent
+					}
+				}
+			} else {
+				h.ackDeferredProbeNotified(sessionID, intent.generation)
+			}
 			delete(h.deferredPublishInFlight, sessionID)
 			h.deferredPublishMu.Unlock()
 			// Wake the dispatcher: entries it skipped as in-flight on its last
@@ -938,7 +1041,9 @@ func (h *PlaybackHandler) runDeferredPublishWorker(sessionID string, fileID int,
 		}()
 		ctx, cancel := h.virtualDetachedContext(h.ServiceContext, inventoryUpdatedPublishBudget)
 		defer cancel()
-		h.logInventoryDelivery(h.PublishInventoryUpdatedToSession(ctx, sessionID, fileID), 0)
+		summary, result := h.PublishInventoryUpdatedToSession(ctx, sessionID, intent.fileID)
+		h.logInventoryDelivery(summary, 0)
+		retry = result == inventoryPublishRetryable
 	}()
 }
 
