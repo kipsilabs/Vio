@@ -77,6 +77,14 @@ type Session struct {
 	// binding; it is the rotation signal a track fingerprint cannot always
 	// provide.
 	VirtualSourceRevision string
+	// VirtualProbeOutcome is the disposition of the most recent background probe
+	// for this session's bound virtual candidate. It is set to pending when the
+	// full track enumeration is deferred past the first-byte commit, then to
+	// verified or failed by the probe worker. Empty means no deferred probe is
+	// outstanding: the inventory the plan published is already final. It exists
+	// so an inventory reader can distinguish an unfinished probe from one that
+	// terminally failed and let the client leave its loading state either way.
+	VirtualProbeOutcome string
 	// VirtualSubtitleEvidenceURI names the provider-neutral candidate the
 	// evidence above was captured for. It is the provenance anchor: evidence
 	// may only be applied to a file bound to the same candidate, and a
@@ -189,6 +197,16 @@ type Session struct {
 	// afresh and passes back to SetVirtualSourceIfGeneration, so a handoff that
 	// started before a newer binding move is refused instead of clobbering it.
 	virtualSourceGeneration uint64
+	// virtualProbeNotifiedGeneration is the binding generation whose terminal
+	// probe outcome was last pushed to the client, distinct from
+	// VirtualProbeOutcome (the verdict itself). It lets the notification
+	// dispatcher tell an outstanding push (terminal outcome generation newer
+	// than this) from an already-delivered one, so the overflow rescan
+	// converges instead of republishing every terminal session forever. It
+	// advances forward-only: an older generation's ack never overwrites a newer
+	// binding's notified state, and an ack for a generation newer than the
+	// current binding is refused as stale.
+	virtualProbeNotifiedGeneration uint64
 	// remoteTransport marks a session whose media bytes are served by another
 	// node, so this server never sees the transport request that would
 	// otherwise keep it alive. See SetRemoteTransport.
@@ -1316,6 +1334,12 @@ func applySessionStreamStateLocked(s *Session, state SessionStreamState) {
 		}
 		s.VirtualSourceURI = state.VirtualSourceURI
 		s.VirtualSourceOwnerInstallationID = state.VirtualSourceOwnerInstallationID
+		// A committed plan owns the probe lifecycle: whatever outcome a
+		// superseded plan's deferred probe reached does not describe this
+		// binding. A fresh-start resolve re-arms it to pending at spawn time.
+		if state.VirtualSourceOwnershipSet {
+			s.VirtualProbeOutcome = ""
+		}
 		if state.VirtualSubtitleEvidenceSet {
 			s.VirtualSubtitleTracks = state.VirtualSubtitleTracks
 			s.VirtualExternalSubtitles = state.VirtualExternalSubtitles
@@ -1524,11 +1548,102 @@ func (m *SessionManager) setVirtualSourceLocked(s *Session, virtualURI string, o
 		// what makes the mismatch detectable downstream.
 		s.VirtualSourceRevision = ""
 	}
+	// A binding move starts a fresh probe lifecycle: whatever outcome the
+	// previous candidate's deferred probe reached says nothing about this one.
+	s.VirtualProbeOutcome = ""
 	s.VirtualSourceURI = trimmed
 	s.VirtualSourceOwnerInstallationID = ownerInstallationID
 	s.streamRevision++
 	s.virtualSourceGeneration++
 	m.touchSessionLocked(s)
+}
+
+// Deferred-probe lifecycle outcomes recorded on a session. They are the
+// wire-visible inventory_status values: pending while the enumeration is
+// outstanding, then verified or failed. Empty means no deferred probe is
+// outstanding. These are the single source of truth; the handlers package
+// aliases them for its own use.
+const (
+	VirtualProbeOutcomePending  = "pending"
+	VirtualProbeOutcomeVerified = "verified"
+	VirtualProbeOutcomeFailed   = "failed"
+)
+
+// SetVirtualProbeOutcome records the disposition of the deferred background
+// probe for the session's bound virtual candidate: "pending" while the full
+// track enumeration is outstanding, then "verified" or "failed" when it lands.
+// It is deliberately a dedicated setter rather than part of the stream-state
+// snapshot: the outcome is written by the detached probe worker, which must not
+// race a plan replacement's wholesale stream-state apply, and an empty value
+// means "no deferred probe outstanding". An unknown session is a no-op so a
+// probe that completes after its session ended does not error.
+func (m *SessionManager) SetVirtualProbeOutcome(sessionID, outcome string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		return ErrSessionNotFound
+	}
+	s.VirtualProbeOutcome = outcome
+	return nil
+}
+
+// SetVirtualProbeOutcomeIfGeneration records a deferred probe's outcome on the
+// session only while its candidate binding is still the exact one the probe was
+// scheduled against (compare-and-swap on virtualSourceGeneration). A probe that
+// started before a rotation and finishes after it must not stamp its verdict —
+// "verified" or "failed" — onto the replacement binding's lifecycle, or a
+// subsequent poll would end the new release's loading state with the old
+// release's outcome. It returns applied=false when the binding moved, so the
+// caller can treat the result as superseded rather than an error. An unknown
+// session is reported with ErrSessionNotFound and writes nothing.
+//
+// It is deliberately a dedicated setter rather than part of the stream-state
+// snapshot: the outcome is written by the detached probe worker, which must not
+// race a plan replacement's wholesale stream-state apply, and an empty value
+// means "no deferred probe outstanding".
+func (m *SessionManager) SetVirtualProbeOutcomeIfGeneration(sessionID string, generation uint64, outcome string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		return false, ErrSessionNotFound
+	}
+	if s.virtualSourceGeneration != generation {
+		return false, nil
+	}
+	s.VirtualProbeOutcome = outcome
+	return true, nil
+}
+
+// ArmVirtualProbePendingIfGeneration transitions a binding generation's probe
+// outcome from empty to pending, and only from empty. It is the exclusive
+// ownership fence for deferred-probe admission: a duplicate start whose
+// SaveAttempt lost the CAS adopts the winner's session and re-enters the start
+// path, but it must not re-arm — and re-probe — a lifecycle the winner already
+// armed or completed. It returns false when the outcome was already set (armed,
+// verified, or failed), when the binding moved, or for an unknown session, so
+// the caller drops the duplicate job without an outcome write.
+func (m *SessionManager) ArmVirtualProbePendingIfGeneration(sessionID string, generation uint64) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		return false, ErrSessionNotFound
+	}
+	if s.virtualSourceGeneration != generation {
+		return false, nil
+	}
+	if s.VirtualProbeOutcome != "" {
+		// The lifecycle is already armed or terminal for this binding: a
+		// duplicate admission owns nothing and must not restart it.
+		return false, nil
+	}
+	s.VirtualProbeOutcome = VirtualProbeOutcomePending
+	return true, nil
 }
 
 // VirtualSourceBindingSnapshot captures the full candidate-binding state under the session lock.
@@ -1599,6 +1714,23 @@ func (m *SessionManager) VirtualSourceGeneration(sessionID string) (uint64, erro
 		return 0, ErrSessionNotFound
 	}
 	return s.virtualSourceGeneration, nil
+}
+
+// VirtualProbeNotifiedGeneration returns the binding generation whose terminal
+// probe outcome was last acked delivered (see MarkVirtualProbeNotified). It is
+// the read side of the terminal-notification watermark: the dispatcher's
+// overflow rescan skips a session whose binding generation is not newer than
+// this value, and convergence tests assert it catches up to the binding
+// generation once the push lands.
+func (m *SessionManager) VirtualProbeNotifiedGeneration(sessionID string) (uint64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		return 0, ErrSessionNotFound
+	}
+	return s.virtualProbeNotifiedGeneration, nil
 }
 
 // SetAutoFallback records whether a session may fail over to another media
@@ -2224,6 +2356,103 @@ func (m *SessionManager) GetSessionsByMediaFileID(fileID int) []*Session {
 		result = append(result, &cp)
 	}
 	return result
+}
+
+// VirtualProbeTerminalSession describes one live session with an outstanding
+// terminal-probe notification, for the dispatcher's overflow rescan: the
+// session ID to re-park, the file whose inventory the push re-reads, and the
+// binding generation the notification carries (so the ack after publish marks
+// exactly that generation delivered).
+type VirtualProbeTerminalSession struct {
+	SessionID  string
+	FileID     int
+	Generation uint64
+}
+
+// VirtualProbeOutstandingNotifications returns up to limit live sessions whose
+// terminal probe outcome has not yet been pushed — the binding generation that
+// reached a terminal ("verified" or "failed") outcome is newer than the
+// generation last acked delivered. It exists for the terminal-notification
+// dispatcher's overflow rescan so the rescan converges: a session whose push
+// already landed is acked (MarkVirtualProbeNotified) and never returned again.
+// The read holds the session lock but stops at limit, so the snapshot is always
+// bounded regardless of fleet size; a full page (len == limit) tells the caller
+// more may remain. A session that ends after the snapshot is skipped downstream
+// by the publish path, which re-reads the live session set.
+func (m *SessionManager) VirtualProbeOutstandingNotifications(limit int) []VirtualProbeTerminalSession {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if limit <= 0 {
+		return nil
+	}
+	var result []VirtualProbeTerminalSession
+	for _, s := range m.sessions {
+		if len(result) >= limit {
+			break
+		}
+		if s.VirtualProbeOutcome != VirtualProbeOutcomeVerified && s.VirtualProbeOutcome != VirtualProbeOutcomeFailed {
+			continue
+		}
+		// Outstanding means the terminal outcome's binding generation is newer
+		// than the last delivered one. An equal-or-older generation was already
+		// pushed (or never armed a notification) and must not be republished.
+		if s.virtualSourceGeneration <= s.virtualProbeNotifiedGeneration {
+			continue
+		}
+		fileID := s.MediaFileID
+		if fileID <= 0 {
+			fileID = s.RequestedMediaFileID
+		}
+		result = append(result, VirtualProbeTerminalSession{SessionID: s.ID, FileID: fileID, Generation: s.virtualSourceGeneration})
+	}
+	return result
+}
+
+// MarkVirtualProbeNotified records that the terminal probe outcome for the
+// given binding generation was pushed to the client, advancing the session's
+// delivered-generation watermark. It is forward-only: a generation older than
+// the watermark (a stale worker's late ack) is a no-op, and a generation newer
+// than the session's current binding (an ack for a binding that was superseded
+// before its push landed) is refused, so an old probe's delivery never clears a
+// newer binding's outstanding notification. It reports whether the watermark
+// advanced. An unknown session is a no-op so a push that lands after teardown
+// does not error.
+func (m *SessionManager) MarkVirtualProbeNotified(sessionID string, generation uint64) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		return false
+	}
+	if generation > s.virtualSourceGeneration || generation <= s.virtualProbeNotifiedGeneration {
+		return false
+	}
+	s.virtualProbeNotifiedGeneration = generation
+	return true
+}
+
+// VirtualProbeNotificationOutstanding reports whether a session's terminal
+// probe outcome is still owed a push: the binding generation that reached a
+// terminal outcome is newer than the generation last acked delivered. It is
+// the per-session form of VirtualProbeOutstandingNotifications, used by the
+// overflow rescan to re-validate a snapshot candidate at re-park time — the
+// snapshot is taken outside the publish lock, so a session whose push landed
+// and was acked between the snapshot and the re-park must not be re-parked
+// (re-parking it would schedule a duplicate push).
+func (m *SessionManager) VirtualProbeNotificationOutstanding(sessionID string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		return false
+	}
+	if s.VirtualProbeOutcome != VirtualProbeOutcomeVerified && s.VirtualProbeOutcome != VirtualProbeOutcomeFailed {
+		return false
+	}
+	return s.virtualSourceGeneration > s.virtualProbeNotifiedGeneration
 }
 
 // ActiveCount returns the number of active sessions for a user.

@@ -683,6 +683,98 @@ type PlaybackHandler struct {
 	subtitleSlotsOnce sync.Once
 	subtitleSlots     *virtualDetachedGate
 
+	// deferredProbeOnce guards lazy construction of the bounded post-commit
+	// probe pool (see enqueueDeferredVirtualProbeV3). A fresh-start resolve
+	// hands its deferred full-track enumeration to this pool instead of probing
+	// inline, so a saturated aggregate gate becomes backpressure that leaves the
+	// client in the provisional inventory state, not a synchronous probe on the
+	// first-byte path. The queue and workers are fixed; admission never spawns a
+	// goroutine per request.
+	deferredProbeOnce  sync.Once
+	deferredProbeQueue chan *virtualDeferredProbeV3
+	deferredProbeWG    sync.WaitGroup
+	// deferredProbeRetry parks probes that arrived while the queue was full.
+	// A worker drains one per completed probe, so a saturated burst completes in
+	// bounded steps without a second worker pool and without a synchronous probe
+	// on the request path.
+	deferredProbeMu    sync.Mutex
+	deferredProbeRetry map[string]*virtualDeferredProbeV3
+	// deferredProbeSignal wakes an idle worker to drain the retry set. It is
+	// buffered (size 1) and never blocks the request path.
+	deferredProbeSignal chan struct{}
+	// deferredPublishOnce guards lazy construction of the single
+	// terminal-notification dispatcher (see startDeferredPublishDispatcher).
+	// One goroutine per handler, tied to the service context.
+	deferredPublishOnce sync.Once
+	// deferredPublishMu guards deferredPublishPending, deferredPublishRescan,
+	// and deferredPublishInFlight.
+	//
+	// LOCK ORDER: deferredPublishMu is always the OUTER lock. A caller may
+	// hold deferredPublishMu and then call a session-manager method (which
+	// takes the session lock internally — see the watermark check inside
+	// parkDeferredProbePublish and the rescan's per-candidate re-validation);
+	// the reverse — session lock held while acquiring deferredPublishMu —
+	// never happens, and every code path here must keep it that way.
+	//
+	// deferredPublishPending is the bounded set of terminal inventory
+	// notifications still owed a push, keyed by session ID so a later terminal
+	// state for the same session coalesces onto one entry. An entry lands here
+	// by one of two routes: a park when the aggregate detached gate was full, or
+	// a retryable attempt (a transient catalog/plan-store read or a realtime
+	// write that did not reach the client) re-parked with a bounded backoff. The
+	// value carries the file whose inventory the push re-reads, the binding
+	// generation the notification acks after publish, and — for a retryable
+	// entry — the attempt count and the not-before instant that hold it out of
+	// selection until its delay elapses. Coalescing rule: a park replaces the
+	// parked entry only when the new generation is at least the parked
+	// generation, and is dropped entirely when the session's notified watermark
+	// already covers the new generation — an older or already-delivered intent
+	// can never overwrite a newer outstanding one. deferredPublishRescan is the
+	// coalesced overflow flag: a park OR a retry-insert that finds the map full
+	// sets it rather than dropping intent, and the dispatcher re-parks the
+	// overflow from the session manager as soon as the map has room (not only
+	// when it drains — a retryable entry can keep it occupied while it waits out
+	// its backoff). The map is the record of what to publish; the signal channel
+	// is only a wake hint, so a lost signal can never strand a parked
+	// notification — the dispatcher always re-reads the map after any wake.
+	//
+	// Dispatchability predicate: a parked entry is dispatchable only while its
+	// session is not in deferredPublishInFlight, the session's notified
+	// watermark does not already cover the entry's generation, and — for a
+	// retryable entry — its not-before instant has passed. The dispatcher
+	// re-checks all three at selection time under this mutex, so a session
+	// mid-publish is never handed a second worker, an already-delivered
+	// generation is never republished, and an entry in retry backoff never spins
+	// a batch.
+	deferredPublishMu      sync.Mutex
+	deferredPublishPending map[string]deferredPublishIntent
+	deferredPublishRescan  bool
+	// deferredPublishInFlight tracks sessions whose parked intent was popped by
+	// a batch and handed to a publish worker but whose attempt has not yet
+	// recorded its final disposition (an ack, or a re-park on a retryable
+	// outcome). A session in this window still reads as "outstanding" to the
+	// overflow rescan (its generation is newer than the delivered watermark,
+	// which only advances on the worker's post-publish ack), so without this
+	// guard the rescan would re-park it and a second worker would publish the
+	// same notification again — a duplicate push. The rescan skips in-flight
+	// sessions; the marker is cleared after the disposition is recorded, so a
+	// session whose attempt finished is eligible for the rescan only if it
+	// genuinely still owes a notification (a re-parked retryable entry is
+	// covered by its own parked intent, not this marker).
+	deferredPublishInFlight map[string]struct{}
+	// deferredPublishSignal is the buffered-1 wake hint for the dispatcher. A
+	// park sends it nonblocking; a full buffer is fine because the dispatcher
+	// re-checks the map regardless of how many signals it coalesced.
+	deferredPublishSignal chan struct{}
+	// deferredPublishDone is the buffered-1 completion signal: a publish
+	// worker sends it nonblocking when it clears its in-flight marker, so a
+	// dispatcher that found every parked entry in-flight (nothing dispatchable)
+	// is woken the moment one finishes instead of busy-looping batches against
+	// the in-flight set or waiting a full backstop tick. Coalescing is safe for
+	// the same reason as the park signal: the dispatcher always re-reads the
+	// map after any wake.
+	deferredPublishDone chan struct{}
+
 	// prefetchOnce guards the lazy prefetch worker pool. Prefetch work is
 	// admitted into a bounded queue (prefetchQueue) before any goroutine
 	// handles it, deduplicated by source+profile equivalence key
@@ -1932,6 +2024,10 @@ func (h *PlaybackHandler) finalizeSessionStopWithResult(ctx context.Context, ses
 		ctx = context.Background()
 	}
 	h.cancelPlaybackStartSideEffectsV3(ctx, session.ID)
+	// The session is gone: a terminal inventory notification parked behind a
+	// full detached gate would re-publish against a session ID the manager no
+	// longer knows, so discard it rather than let the drain retry a dead session.
+	h.dropDeferredPublish(session.ID)
 
 	stopResult := h.recordStopHistory(ctx, session)
 	if h.WatchScrobbler != nil {

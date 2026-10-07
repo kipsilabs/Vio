@@ -111,6 +111,20 @@ type PlaybackPlan struct {
 	// virtual source candidate; it changes on a release rotation and stays fixed
 	// while the same candidate is served. Empty for a non-virtual source.
 	VirtualSourceRevision string `json:"virtual_source_revision,omitempty"`
+	// TracksPending marks a plan whose audio and subtitle inventory is
+	// deliberately provisional: the first-byte URL was handed back with the
+	// minimal executable recipe (video plus the default audio) and the full
+	// track enumeration is still being probed. It mirrors PlanV3.TracksPending
+	// so the promised v2 wire contract carries it; a client that negotiated
+	// deferred_track_inventory_v1 reads it and keeps the menu loading until the
+	// follow-up inventory_updated push (or a poll of InventoryURL) lands. It
+	// never changes stream selection.
+	TracksPending bool `json:"tracks_pending,omitempty"`
+	// InventoryURL is the relative URL a client fetches (with ETag /
+	// If-None-Match) to retrieve the refreshed audio and subtitle inventories
+	// without replanning. It mirrors PlanV3.InventoryURL so a deferred v2 client
+	// can poll for the pending → terminal inventory transition.
+	InventoryURL string `json:"inventory_url,omitempty"`
 }
 type PlaybackSource struct {
 	MediaFileID        ID                          `json:"media_file_id"`
@@ -573,7 +587,7 @@ func playbackDecision(in playback.DecisionResponseV3) PlaybackDecision {
 		p := in.PlaybackPlan
 		stream := p.Stream
 		stream.URL = playbackV2MediaURL(stream.URL)
-		out.PlaybackPlan = &PlaybackPlan{ProtocolVersion: p.ProtocolVersion, PlanID: p.PlanID, PlanAttemptKey: p.PlanAttemptKey, SessionID: p.SessionID, ExpiresAt: p.ExpiresAt, Delivery: p.Delivery, Stream: stream, Timeline: p.Timeline, SelectedTracks: p.SelectedTracks, EffectiveRecipe: p.EffectiveRecipe, Claims: p.Claims, Subtitle: playbackV2Subtitle(p.Subtitle), AudioTracks: p.AudioTracks, Transformations: p.Transformations, AppliedQuirks: p.AppliedQuirks, RuntimeCorrections: p.RuntimeCorrections, AvailableQualities: p.AvailableQualities, DegradationWarnings: p.DegradationWarnings, DecisionReason: p.DecisionReason, RequestedMediaFileID: ID(strconv.Itoa(p.RequestedMediaFileID)), EffectiveMediaFileID: ID(strconv.Itoa(p.EffectiveMediaFileID)), EffectiveVirtualURI: p.EffectiveVirtualURI, VirtualSourceRevision: p.VirtualSourceRevision, Source: playbackSource(p.Source), SubtitleFidelityPolicy: p.SubtitleFidelityPolicy}
+		out.PlaybackPlan = &PlaybackPlan{ProtocolVersion: p.ProtocolVersion, PlanID: p.PlanID, PlanAttemptKey: p.PlanAttemptKey, SessionID: p.SessionID, ExpiresAt: p.ExpiresAt, Delivery: p.Delivery, Stream: stream, Timeline: p.Timeline, SelectedTracks: p.SelectedTracks, EffectiveRecipe: p.EffectiveRecipe, Claims: p.Claims, Subtitle: playbackV2Subtitle(p.Subtitle), AudioTracks: p.AudioTracks, Transformations: p.Transformations, AppliedQuirks: p.AppliedQuirks, RuntimeCorrections: p.RuntimeCorrections, AvailableQualities: p.AvailableQualities, DegradationWarnings: p.DegradationWarnings, DecisionReason: p.DecisionReason, RequestedMediaFileID: ID(strconv.Itoa(p.RequestedMediaFileID)), EffectiveMediaFileID: ID(strconv.Itoa(p.EffectiveMediaFileID)), EffectiveVirtualURI: p.EffectiveVirtualURI, VirtualSourceRevision: p.VirtualSourceRevision, TracksPending: p.TracksPending, InventoryURL: playbackV2InventoryURL(p.InventoryURL), Source: playbackSource(p.Source), SubtitleFidelityPolicy: p.SubtitleFidelityPolicy}
 	}
 	return out
 }
@@ -589,6 +603,18 @@ func playbackV2MediaURL(raw string) string {
 		return Prefix + raw
 	}
 	if strings.HasPrefix(raw, "/api/v1/stream/") || strings.HasPrefix(raw, "/api/v1/playback/transcode/") {
+		return Prefix + strings.TrimPrefix(raw, "/api/v1")
+	}
+	return raw
+}
+
+// playbackV2InventoryURL projects the plan's inventory URL into the v2
+// namespace. The handler already builds it as an /api/v2 path, so this is
+// idempotent there; the helper also normalizes a v1-prefixed value so the
+// field cannot leak a frozen-surface path. Any other value (empty, absolute) is
+// returned unchanged.
+func playbackV2InventoryURL(raw string) string {
+	if strings.HasPrefix(raw, "/api/v1/playback/") {
 		return Prefix + strings.TrimPrefix(raw, "/api/v1")
 	}
 	return raw

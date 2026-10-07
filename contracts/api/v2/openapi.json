@@ -34960,6 +34960,9 @@
           "expires_at": {
             "type": "string"
           },
+          "inventory_url": {
+            "type": "string"
+          },
           "plan_attempt_key": {
             "type": "string"
           },
@@ -35004,6 +35007,9 @@
           },
           "timeline": {
             "$ref": "#/components/schemas/TimelineV3"
+          },
+          "tracks_pending": {
+            "type": "boolean"
           },
           "transformations": {
             "items": {
