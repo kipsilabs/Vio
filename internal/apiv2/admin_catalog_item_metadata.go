@@ -88,5 +88,11 @@ func (reg *Registry) updateAdminItemMetadata(ctx context.Context, in *AdminItemM
 	// The operation is gated on metadata curation, so the editor gets every
 	// stored rating back.
 	detail.ViewerCurates = true
-	return &CatalogItemDetailOutput{Body: catalogItemDetailOf(detail, reg.ratingSelection(ctx))}, nil
+	out := catalogItemDetailOf(detail, reg.ratingSelection(ctx))
+	// The editor sees the same collections row the read detail shows, so a save
+	// does not appear to drop the item's memberships until a refetch. Access
+	// comes from the scope the permission gate resolved; the route is not
+	// profile-scoped, so there is no declared profile to resolve.
+	out.Collections = NonNil(reg.itemCollections(ctx, detail, handlers.AccessFilterFromContext(ctx, "")))
+	return &CatalogItemDetailOutput{Body: out}, nil
 }

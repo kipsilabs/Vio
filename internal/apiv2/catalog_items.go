@@ -1151,9 +1151,10 @@ func (reg *Registry) getCatalogItem(ctx context.Context, in *CatalogItemInput) (
 // result is nil and the detail page still succeeds with an empty row,
 // following the theme lookup's non-fatal contract.
 //
-// Collections store movies and series; an episode contributes its parent
-// series id, and a season contributes its series. Other types (audiobooks,
-// ebooks) have no collection membership and answer empty.
+// The membership key is an item's own content id for a movie or series; an
+// episode or season contributes its parent series id, because a membership row
+// names the series rather than an episode. Any other type, and a title whose
+// series id is empty, answers empty.
 func (reg *Registry) itemCollections(ctx context.Context, detail *catalogpkg.ItemDetail, access catalogpkg.AccessFilter) []ItemCollection {
 	index, ok := reg.deps.LibraryCollections.(ItemCollectionIndex)
 	if !ok || index == nil || detail == nil {
