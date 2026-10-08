@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -548,6 +549,26 @@ func TestSearchRequestMedia(t *testing.T) {
 	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/requests/search?q=%20", "", requestOwner), TypeValidationFailed)
 	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/requests/search?q=heat&media_type=tv", "", requestOwner), TypeValidationFailed)
 	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/requests/search?q=heat&page=0", "", requestOwner), TypeValidationFailed)
+	// A canceled provider lookup masks the same way: the body reports the
+	// cancellation without echoing the cause marker, and unknown failures
+	// keep the generic envelope.
+	buf := captureLogs(t)
+	svc.err = fmt.Errorf("request search private-search-marker: %w", context.Canceled)
+	rec = do(t, h, http.MethodGet, "/api/v2/requests/search?q=heat", "", requestOwner)
+	p := requireProblem(t, rec, TypeInternalError)
+	if !strings.Contains(rec.Body.String(), "The request was canceled.") || strings.Contains(rec.Body.String(), "private-search-marker") {
+		t.Fatalf("canceled search body = %s", rec.Body.String())
+	}
+	if !strings.Contains(buf.String(), "private-search-marker") || !strings.Contains(buf.String(), `"request_id":"`+requestIDHeader(rec)+`"`) {
+		t.Fatalf("canceled search log lacks marker or request id: %s", buf.String())
+	}
+	_ = p
+	svc.err = fmt.Errorf("request search other-failure")
+	rec = do(t, h, http.MethodGet, "/api/v2/requests/search?q=heat", "", requestOwner)
+	requireProblem(t, rec, TypeInternalError)
+	if !strings.Contains(rec.Body.String(), "An unexpected error occurred.") || strings.Contains(rec.Body.String(), "other-failure") {
+		t.Fatalf("masked search body = %s", rec.Body.String())
+	}
 }
 
 func TestGetRequestMediaDetail(t *testing.T) {

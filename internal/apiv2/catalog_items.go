@@ -733,7 +733,7 @@ func catalogProblem(err error, location string) *Problem {
 		}
 	}
 	if errors.Is(err, context.Canceled) {
-		return NewProblem(TypeInternalError, "The request was canceled.")
+		return NewProblem(TypeInternalError, "The request was canceled.").withCause(err)
 	}
 	return serviceProblem(err)
 }
