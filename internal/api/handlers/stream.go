@@ -2869,6 +2869,16 @@ func (h *StreamHandler) handleTransportStartFailure(ctx context.Context, session
 	// canceled request is never rewritten into a missing-file abort, and
 	// downgrade to debug; a timeout or provider error stays at WARN.
 	if isClientCancellation(ctx, err) {
+		// A transport cancel is liveness evidence: the viewer navigated off (or
+		// hls.js gave up). Record it on the session so a failure_recovery
+		// arriving shortly after is recognized as a zombie and does not run
+		// recovery to a terminal on a client that is already gone. Best-effort:
+		// a missing session or a manager without the seam changes nothing.
+		if marker, ok := h.sessionMgr.(interface {
+			MarkClientCanceled(sessionID string) error
+		}); ok {
+			_ = marker.MarkClientCanceled(session.ID)
+		}
 		slog.DebugContext(ctx, "stream transport canceled by client",
 			"component", "api",
 			"session", session.ID,

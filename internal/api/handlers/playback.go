@@ -79,6 +79,12 @@ type SessionManagerInterface interface {
 	SetProgressPersistenceDisabled(sessionID string, disabled bool) error
 	StopSession(sessionID string) error
 	GetSession(sessionID string) (*playback.Session, error)
+	// MarkClientCanceled records liveness evidence that the client canceled a
+	// transport; ClearClientCanceled drops it. The v3 replan gates a
+	// failure_recovery on the absence of a recent cancel, so a zombie session
+	// never spends the adaptation budget on a terminal.
+	MarkClientCanceled(sessionID string) error
+	ClearClientCanceled(sessionID string) error
 }
 
 type transcodePermissionChecker interface {

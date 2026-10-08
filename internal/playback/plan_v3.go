@@ -110,6 +110,24 @@ type PlannerInputV3 struct {
 	// attempted when the planner exhausts a server-transcode route after a
 	// decoder failure. It is surfaced on the terminal so `detail` is not empty.
 	DecodeAttemptDetail string
+	// StickyDelivery is the delivery the session is already serving. When set
+	// on a replan that has no principled reason to switch, the planner prefers
+	// to keep its class: it first plans naturally, and only when that would
+	// move the route class does it retry with the running delivery's class as
+	// the sole option. It is empty for a fresh start and for a failure
+	// recovery, where the failure itself is the reason to change routes. The
+	// negotiation unit is the delivery class (original_http, progressive, hls),
+	// so a within-class recipe swap (remux-HLS to transcode-HLS) is not a route
+	// move the client advertises; stickiness targets the class that decides the
+	// pipeline shape.
+	StickyDelivery DeliveryV3
+	// DeliveryAllowList restricts planning to the named delivery classes. It is
+	// set only by the delivery-stickiness retry (see StickyDelivery); empty
+	// means every advertised delivery is eligible. It is applied by disabling
+	// every other class on a private copy of the request's delivery map, so
+	// every existing delivery gate honors it and the caller's map is never
+	// mutated.
+	DeliveryAllowList []string
 }
 
 // SourceExecutionMetadataV3 is the immutable source probe snapshot used to
@@ -216,6 +234,13 @@ type PlannerResultV3 struct {
 	// plan. The transport turns it into the VPP filter only when the resolved
 	// executor is QSV; see prepareLocalTransportV3.
 	ToneMapVPPEnabled bool
+	// StickyDeliveryKept reports that the planner kept the delivery the session
+	// was already serving via the stickiness retry (see PlannerInputV3.
+	// StickyDelivery). It is false on a fresh start, on a failure recovery, and
+	// whenever the natural plan already matched or the sticky class could not
+	// serve the request. It exists so the handler can log the stickiness
+	// decision where DeliveryChange logging already lives.
+	StickyDeliveryKept bool
 }
 
 // hlsToneMapCapabilities resolves the lazy pooled inventory when present and
@@ -231,9 +256,44 @@ func (input PlannerInputV3) hlsToneMapCapabilities() tonemap.Capabilities {
 
 // PlanPlaybackV3 chooses a playable protocol-v3 route from source and client facts.
 func PlanPlaybackV3(input PlannerInputV3) (result PlannerResultV3) {
+	result = planPlaybackOnceV3(input)
+	// Delivery stickiness backstop: a replan that re-derives the serving route
+	// from scratch can thrash the pipeline (production saw transcode-HLS ->
+	// remux-HLS -> transcode-HLS across two track changes in ~8s) even when
+	// nothing about the source or output changed. When the caller pinned the
+	// delivery the session is already running, keep it: retry once with the
+	// running delivery's class as the only option, and take that plan only when
+	// it is playable. A class that genuinely cannot serve the new intent (a
+	// subtitle that now needs burn-in, a forced video encode, a quality rung
+	// that forces the ladder) still moves, because the constrained retry
+	// terminals or the natural plan already matched.
+	if input.StickyDelivery != "" && result.Plan != nil {
+		naturalClass := DeliveryClassV3(result.Plan.Delivery)
+		stickyClass := DeliveryClassV3(input.StickyDelivery)
+		if naturalClass != stickyClass {
+			stickyInput := input
+			stickyInput.DeliveryAllowList = []string{stickyClass}
+			if sticky := planPlaybackOnceV3(stickyInput); sticky.Plan != nil {
+				sticky.StickyDeliveryKept = true
+				return sticky
+			}
+		}
+	}
+	return result
+}
+
+// planPlaybackOnceV3 chooses a route under the caller's delivery allow list (all
+// deliveries when it is empty). It is the un-stickied planner body; PlanPlaybackV3
+// wraps it with the delivery-stickiness retry.
+func planPlaybackOnceV3(input PlannerInputV3) (result PlannerResultV3) {
 	if input.RequestedFile == nil {
 		return terminalPlannerResultV3("source_unavailable", "The requested media source is unavailable.", false)
 	}
+	// Enforce the delivery allow list by disabling every class it excludes on a
+	// private copy of the request's delivery map. Every delivery gate reads the
+	// map, so no route can escape the restriction, and the caller's map (which
+	// may be a durable attempt's, aliased into the request) is never mutated.
+	input.Request = restrictRequestDeliveriesV3(input.Request, input.DeliveryAllowList)
 	file := input.EffectiveFile
 	if file == nil {
 		file = input.RequestedFile
@@ -1880,6 +1940,28 @@ func toneMapRecipeVersionV3(enabled bool) string {
 		return TransformationHDRToSDRToneMapRecipeVersionV3
 	}
 	return ""
+}
+
+// restrictRequestDeliveriesV3 returns request with every delivery class not in
+// allow disabled. An empty allow list means every class stays as advertised. It
+// clones the delivery map so a caller's durable request (which may be aliased
+// into the planner input) is never mutated, and leaves an excluded class's
+// other fields intact so diagnostics still describe what the client offered.
+func restrictRequestDeliveriesV3(request StartRequestV3, allow []string) StartRequestV3 {
+	if len(allow) == 0 {
+		return request
+	}
+	deliveries := CloneDeliveryCapabilitiesV3(request.ClientPlaybackContext.Deliveries)
+	for class, capability := range deliveries {
+		if containsFoldV3(allow, class) {
+			continue
+		}
+		capability.Enabled = false
+		capability.SupportedOnDevice = false
+		deliveries[class] = capability
+	}
+	request.ClientPlaybackContext.Deliveries = deliveries
+	return request
 }
 
 // videoTranscodeExecutableV3 mirrors planVideoTranscodeV3's terminal
