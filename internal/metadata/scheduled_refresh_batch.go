@@ -183,7 +183,7 @@ func failedEpisodeDebtFromContext(ctx context.Context) map[string]struct{} {
 // flushScheduledRefreshBatch runs the batch's deferred work: each recorded
 // series' link and debt passes, at most scheduledRefreshFlushWorkers at a time
 // and each under seriesEpisodeSyncTimeout, then the debt sync of every target
-// whose series finished. BeginScheduledRefreshBatch describes what a cancelled
+// whose series finished. BeginScheduledRefreshBatch describes what a canceled
 // flush or a failed series pass leaves claimed.
 func (s *MetadataService) flushScheduledRefreshBatch(ctx context.Context, batch *scheduledRefreshBatch) {
 	series, failedEpisodes, targets := batch.take()
