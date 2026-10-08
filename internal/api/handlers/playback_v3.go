@@ -6198,7 +6198,7 @@ func (h *PlaybackHandler) v3SessionStreamState(ctx context.Context, session *pla
 		TranscodeAudio:            result.TranscodeAudio,
 		RemuxDVMode:               remuxDVModeForPlanV3(result.Plan),
 		DVProfile:                 planDVProfileV3(result.Plan),
-		DVProfilePin:              playback.DVPinV3{FileID: file.ID, Source: file.FilePath, Profile: planDVProfileV3(result.Plan)},
+		DVProfilePin:              playback.PinDVPinV3(playback.DVPinV3{}, file, planDVProfileV3(result.Plan)),
 		TranscodeHWAccel:          transport.hwAccel,
 		ToneMapMode:               transport.toneMapMode,
 		TranscodeNodeURL:          transport.nodeURL,
