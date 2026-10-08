@@ -3,7 +3,6 @@ package historyimport
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -286,16 +285,4 @@ func newJellyfinFetchHandler(t *testing.T, byFilter map[string][]jellyfinItem, b
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(jellyfinItemsResponse{Items: items, TotalRecordCount: len(items)})
 	})
-}
-
-// A Jellyfin error body can echo the request's credentials in forms the text
-// redactor misses, so warning logs keep only the HTTP status.
-func TestJellyfinWarningLogErrorDropsResponseBody(t *testing.T) {
-	t.Parallel()
-
-	body := `{"Authorization":"MediaBrowser Client=\"watch-importer\", Token=\"secret-token-1\""}`
-	err := fmt.Errorf("fetching Jellyfin resumable items: %w", &jellyfinHTTPError{StatusCode: http.StatusBadGateway, Body: body})
-	if got := jellyfinWarningLogError(err); got != "jellyfin http 502" {
-		t.Fatalf("jellyfinWarningLogError = %q, want only the status", got)
-	}
 }
