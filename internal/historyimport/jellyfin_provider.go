@@ -25,20 +25,13 @@ func (p *JellyfinProvider) Fetch(ctx context.Context) ([]Record, []string, error
 	if err != nil {
 		return nil, nil, err
 	}
+	resumable, err := p.client.FetchResumableItems(ctx, p.auth)
+	if err != nil {
+		return nil, nil, err
+	}
 	var warnings []string
 	// Warnings store fixed text: v1 returns them verbatim, and upstream errors
 	// can carry the server's response body. The error itself is logged.
-	// Resume positions are secondary to the played history: a slow or failing
-	// resume query must not discard it. Cancellation still ends the run.
-	resumable, err := p.client.FetchResumableItems(ctx, p.auth)
-	if err != nil {
-		if ctx.Err() != nil {
-			return nil, nil, err
-		}
-		slog.WarnContext(ctx, "jellyfin history import: resume positions unavailable", "component", "historyimport", "error", err)
-		warnings = append(warnings, warnJellyfinResumeUnavailable)
-		resumable = nil
-	}
 	favorites, err := p.client.FetchItems(ctx, p.auth, "IsFavorite", jellyfinFavoriteItemTypes)
 	if err != nil {
 		slog.WarnContext(ctx, "jellyfin history import: favorites unavailable", "component", "historyimport", "error", err)
