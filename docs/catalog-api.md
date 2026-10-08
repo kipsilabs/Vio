@@ -589,6 +589,45 @@ book libraries, never carry an advisory age, so the limit never hides them.
 
 Frozen v1 responses do not expose these fields.
 
+## Collections on title pages
+
+The v2 item detail of a movie or series carries `collections`, the visible
+server collections the item belongs to. Each entry has:
+
+- `id`: the collection id, used to open its full item list
+  (`listCatalogItems?source=library_collection&collection_id=<id>`).
+- `title`: the collection's display name.
+- `poster_url`: the collection's poster, presigned and short-lived, empty when
+  it has none.
+- `poster_thumbhash`: the poster's thumbhash, absent when the collection has no
+  poster.
+- `item_count`: the collection's stored member total.
+
+The list is present on every v2 item detail as an array, empty when the item is
+in none and when the membership lookup fails. It lists stored server-collection
+memberships only: a smart collection derives its members from its query at read
+time and stores no rows, so it is never listed, and personal (user) collections
+are a separate surface this field does not include. `item_count` is the
+collection's total membership, not the members the viewer may see.
+
+The membership key is the item's own id for a movie or series. An episode detail
+answers its parent series' collections and a season detail answers its series',
+so both report the series' memberships rather than their own; a title with no
+series, such as an audiobook or ebook, answers empty. A collection the viewer's
+library scope cannot reach, and a hidden collection, are never listed.
+`poster_url` follows the same viewer rule as the library Collections tab: an
+uploaded or template poster is shared, while a generated collage shows only
+members the viewer can access.
+
+`PATCH /api/v2/admin/items/{id}/metadata` returns the same `collections` row on
+its detail body, so a metadata save does not appear to drop the item's
+memberships.
+
+`GET /api/v2/capabilities/item-collections` is the feature-detection document.
+It answers `state: available` on a server whose item detail carries
+`collections`, and `unsupported` otherwise. Clients that omit the row on an
+older server without the operation keep their existing behavior.
+
 ## Ratings on title pages
 
 Every client shows a title's external ratings the same way: the v2 item detail

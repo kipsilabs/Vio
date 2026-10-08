@@ -27,6 +27,7 @@ import { useOnViewTranslation } from "@/hooks/useOnViewTranslation";
 import MetadataBadges from "./components/MetadataBadges";
 import TrailersSection from "./components/TrailersSection";
 import ExtrasSection from "./components/ExtrasSection";
+import CollectionsSection from "./components/CollectionsSection";
 import QualityBadges from "./components/QualityBadges";
 import ScoreRow from "./components/ScoreRow";
 import HeroCrewLine from "./components/HeroCrewLine";
@@ -453,6 +454,8 @@ export default function MovieContent({
       )}
 
       {item.crew && item.crew.length > 0 && <CrewList crew={item.crew} />}
+
+      <CollectionsSection collections={item.collections} />
 
       {/* More Like This */}
       {similarLoading ? (

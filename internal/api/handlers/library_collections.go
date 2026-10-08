@@ -60,6 +60,18 @@ type LibraryCollectionHandler struct {
 	JobRepo               *adminjob.Repository
 	EventsHub             *evt.Hub
 	SortPreferenceCleaner *userstore.CollectionSortPreferenceCleaner
+
+	// itemCollectionIndex answers the item→collections reverse lookup behind
+	// the item detail "collections" field. Nil means use repo; tests inject a
+	// fake so the lookup is exercised without a database.
+	itemCollectionIndex itemCollectionIndex
+}
+
+// itemCollectionIndex is the reverse membership lookup the item detail
+// "collections" field needs: the visible collections that store a membership
+// row for one item. *catalog.LibraryCollectionRepository implements it.
+type itemCollectionIndex interface {
+	ListContainingItem(ctx context.Context, mediaItemID string) ([]*models.LibraryCollection, error)
 }
 
 var errLibraryCollectionInUse = catalog.ErrLibraryCollectionInUse

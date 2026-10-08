@@ -27,6 +27,7 @@ import SeasonEpisodeGrid from "./components/SeasonEpisodeGrid";
 import MetadataBadges from "./components/MetadataBadges";
 import TrailersSection from "./components/TrailersSection";
 import ExtrasSection from "./components/ExtrasSection";
+import CollectionsSection from "./components/CollectionsSection";
 import ScoreRow from "./components/ScoreRow";
 import HeroCrewLine from "./components/HeroCrewLine";
 import MediaUserActionBar from "./components/MediaUserActionBar";
@@ -252,6 +253,8 @@ export default function SeriesContent({
         </DetailSection>
       )}
       {item.crew && item.crew.length > 0 && <CrewList crew={item.crew} />}
+
+      <CollectionsSection collections={item.collections} />
 
       {similarLoading ? (
         <RecommendationGridSkeleton />

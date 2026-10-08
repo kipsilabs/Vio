@@ -425,6 +425,7 @@ GET /api/v2/calendar	non-media
 GET /api/v2/capabilities/downloads	non-media
 GET /api/v2/capabilities/ebooks	non-media
 GET /api/v2/capabilities/episode-release	non-media
+GET /api/v2/capabilities/item-collections	non-media
 GET /api/v2/capabilities/metadata-ai	non-media
 GET /api/v2/capabilities/password-reset	non-media
 GET /api/v2/capabilities/ratings	non-media
@@ -1660,6 +1661,7 @@ GET /api/v2/calendar	non-media
 GET /api/v2/capabilities/downloads	non-media
 GET /api/v2/capabilities/ebooks	non-media
 GET /api/v2/capabilities/episode-release	non-media
+GET /api/v2/capabilities/item-collections	non-media
 GET /api/v2/capabilities/metadata-ai	non-media
 GET /api/v2/capabilities/password-reset	non-media
 GET /api/v2/capabilities/ratings	non-media
