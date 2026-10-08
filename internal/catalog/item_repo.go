@@ -4023,59 +4023,6 @@ func (r *ItemRepository) buildGetByIDsWithAccessSQL(contentIDs []string, access 
 	return sql, args
 }
 
-// VisibleSeasonMember is a stored season whose parent series the viewer can see.
-type VisibleSeasonMember struct {
-	SeasonID     string
-	SeriesID     string
-	SeriesTitle  string
-	SeasonNumber int
-}
-
-// DisplayTitle names a season member in plain lists: "Series — Season N", or
-// "Series — Specials" for season 0.
-func (m VisibleSeasonMember) DisplayTitle() string {
-	if m.SeasonNumber == 0 {
-		return m.SeriesTitle + " — Specials"
-	}
-	return fmt.Sprintf("%s — Season %d", m.SeriesTitle, m.SeasonNumber)
-}
-
-// GetVisibleSeasonsWithAccess returns the stored seasons among contentIDs whose
-// parent series passes access: the same library and maturity predicates
-// GetByIDsWithAccess applies to catalog items, evaluated on the series.
-func (r *ItemRepository) GetVisibleSeasonsWithAccess(ctx context.Context, contentIDs []string, access AccessFilter) ([]VisibleSeasonMember, error) {
-	if len(contentIDs) == 0 {
-		return nil, nil
-	}
-	if access.AllowedLibraryIDs != nil && len(access.AllowedLibraryIDs) == 0 {
-		return nil, nil
-	}
-	sql := `SELECT season.content_id, season.series_id, mi.title, season.season_number
-            FROM seasons season
-            JOIN media_items mi ON mi.content_id = season.series_id AND mi.type = 'series'
-            WHERE season.content_id = ANY($1)`
-	args := []any{contentIDs}
-	argIdx := 2
-	for _, c := range itemAccessConditions(access, &args, &argIdx) {
-		sql += "\n            AND " + c
-	}
-	sql += " ORDER BY season.content_id ASC"
-	rows, err := r.pool.Query(ctx, sql, args...)
-	if err != nil {
-		return nil, fmt.Errorf("fetching visible seasons: %w", err)
-	}
-	defer rows.Close()
-	var out []VisibleSeasonMember
-	for rows.Next() {
-		var m VisibleSeasonMember
-		if err := rows.Scan(&m.SeasonID, &m.SeriesID, &m.SeriesTitle, &m.SeasonNumber); err != nil {
-			return nil, fmt.Errorf("scanning visible season: %w", err)
-		}
-		out = append(out, m)
-	}
-	return out, rows.Err()
-}
-
 // itemAccessConditions are the predicates over media_items mi that decide
 // whether the viewer may see an item addressed by ID: library access, the
 // maturity limits, and excluded media types.
