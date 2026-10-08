@@ -8174,7 +8174,15 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				// so nothing needs the bypass; bypassing stamps here is what
 				// would let sequential rotations cycle A→B→C→A instead of
 				// terminating when every sibling is known-bad.
-				resolved, resolveErr := h.resolveRehydratedVirtualSourceV3(r, &pinnedFile, record.ProfileID, excludedCandidateIDs, preferredCandidateID, start.QualityPreference, intOrZeroHandlerV3(start.BandwidthCapKbps), virtualResolveOptionsV3{allowFailedCandidate: false, rotateCandidates: virtualDecodeRotation, sessionBound: true, sessionAnchorURI: session.VirtualSourceURI, bypassProviderFloor: true})
+				//
+				// One rotation policy for the session. The explicit-pick
+				// protection is carried as intent (refuseRotation) rather than
+				// inferred from an absent sentinel, so the rehydration's
+				// absent/dead-pin auto-retry cannot rotate a release the
+				// session-bound door (serve, transport, resolver refusal) would
+				// refuse: an explicit pin is never substituted, and an auto
+				// selection keeps its documented renumbered/dead-pin recovery.
+				resolved, resolveErr := h.resolveRehydratedVirtualSourceV3(r, &pinnedFile, record.ProfileID, excludedCandidateIDs, preferredCandidateID, start.QualityPreference, intOrZeroHandlerV3(start.BandwidthCapKbps), virtualResolveOptionsV3{allowFailedCandidate: false, rotateCandidates: virtualDecodeRotation, refuseRotation: h.explicitVirtualPinV3(record), sessionBound: true, sessionAnchorURI: session.VirtualSourceURI, bypassProviderFloor: true})
 				if resolveErr != nil {
 					slog.WarnContext(r.Context(), "virtual playback rehydration failed", "component", "api", "session_id", record.SessionID, "file_id", currentEffectiveFile.ID, "owner_installation_id", session.VirtualSourceOwnerInstallationID, "error", logredact.SanitizeURLError(resolveErr))
 					virtualRehydrationFailed = true
@@ -8731,7 +8739,27 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	// plan, which may already carry the same warning from its own start, so the
 	// helper skips duplicates.
 	appendStartWarningsV3(&result, replanCapabilityWarnings)
-	slog.InfoContext(r.Context(), "playback replan decided", append([]any{
+	// Explicit mid-session delivery-swap signaling. A failure-recovery replan
+	// may legitimately change the serving route (for example transcode-HLS to
+	// remux-progressive). Without a marker the client only sees the new plan
+	// body and cannot distinguish a planned route change from a silent mid-play
+	// swap. Record the change additively on the plan and name old->new on the one
+	// decision line below. A seek reanchor replays the durable route verbatim and
+	// cannot change it, so it never produces a marker. The marker is UI-only and
+	// excluded from plan identity hashing (the identity was finalized in the
+	// planner before this point).
+	var previousPlayMethod playback.PlayMethod
+	if session != nil {
+		previousPlayMethod = session.PlayMethod
+	}
+	var deliveryChange *playback.DeliveryChangeV3
+	if !seekReanchor {
+		deliveryChange = deliveryChangeV3(record.CurrentPlan.Delivery, previousPlayMethod, result.Plan.Delivery, result.PlayMethod)
+	}
+	if deliveryChange != nil {
+		result.Plan.DeliveryChange = deliveryChange
+	}
+	replanLogAttrs := []any{
 		logComponentKey, "playback",
 		"outcome", "plan",
 		"decision_reason", result.Plan.DecisionReason,
@@ -8750,7 +8778,18 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		"software_video_decode", forceSoftwareDecode,
 		"decode_failure_count", decodeFailureCount,
 		"decode_failure_sample", decodeFailureSample,
-	}, clientInfo.LogAttrs()...)...)
+	}
+	if deliveryChange != nil {
+		replanLogAttrs = append(replanLogAttrs,
+			"previous_delivery", deliveryChange.PreviousDelivery,
+			"new_delivery", deliveryChange.Delivery,
+			"previous_play_method", string(deliveryChange.PreviousPlayMethod),
+			"new_play_method", string(deliveryChange.PlayMethod),
+			"delivery_changed", deliveryChange.DeliveryChanged,
+			"play_method_changed", deliveryChange.PlayMethodChanged,
+		)
+	}
+	slog.InfoContext(r.Context(), "playback replan decided", append(replanLogAttrs, clientInfo.LogAttrs()...)...)
 	mode = headerAuthenticatedMediaV3(start.ClientFeatures)
 	_, reservationHeld = h.sessionMgr.(replacementReservationCancellerV3)
 	result.Plan.SessionID = session.ID
@@ -8992,6 +9031,27 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	}
 	reservationHandedOff = true
 	return response, updated, &transport, nil
+}
+
+// deliveryChangeV3 builds the additive mid-session delivery-swap marker, or
+// returns nil when the serving route did not change. A delivery change is always
+// detectable; a play-method change is only reported when the previous method is
+// known, so a reconstructed session with no cached method does not emit a
+// spurious marker for an unchanged route.
+func deliveryChangeV3(previousDelivery playback.DeliveryV3, previousPlayMethod playback.PlayMethod, nextDelivery playback.DeliveryV3, nextPlayMethod playback.PlayMethod) *playback.DeliveryChangeV3 {
+	deliveryChanged := previousDelivery != "" && previousDelivery != nextDelivery
+	playMethodChanged := previousPlayMethod != "" && previousPlayMethod != nextPlayMethod
+	if !deliveryChanged && !playMethodChanged {
+		return nil
+	}
+	return &playback.DeliveryChangeV3{
+		PreviousDelivery:   previousDelivery,
+		Delivery:           nextDelivery,
+		PreviousPlayMethod: previousPlayMethod,
+		PlayMethod:         nextPlayMethod,
+		DeliveryChanged:    deliveryChanged,
+		PlayMethodChanged:  playMethodChanged,
+	}
 }
 
 // softwareDecodeRouteDiagnosticsV3 records the reactive software-decode
@@ -10885,7 +10945,7 @@ func (h *PlaybackHandler) virtualCandidateRotationPendingV3(record *playback.Att
 		!corroboratedStartupTimeoutV3(req.Failure.Classification) {
 		return false
 	}
-	if record.NormalizedRequest.FileSelection == playback.FileSelectionExplicitV3 {
+	if h.explicitVirtualPinV3(record) {
 		return false
 	}
 	if record.CurrentPlan.Delivery != playback.DeliveryTranscodeHLSV3 || !planHasVideoEncodeV3(record.CurrentPlan) {
@@ -10904,6 +10964,18 @@ func (h *PlaybackHandler) virtualCandidateRotationPendingV3(record *playback.Att
 		return false
 	}
 	return true
+}
+
+// explicitVirtualPinV3 reports whether the attempt's requested release is an
+// explicit user version pick, which is never substituted. It is the single
+// predicate every rotation door reads, so the decode-rotation demotion hold and
+// the rehydration's absent/dead-pin auto-retry cannot disagree about whether a
+// release may rotate: an explicit pin protects, an auto selection does not.
+func (h *PlaybackHandler) explicitVirtualPinV3(record *playback.AttemptRecordV3) bool {
+	if record == nil {
+		return false
+	}
+	return record.NormalizedRequest.FileSelection == playback.FileSelectionExplicitV3
 }
 
 // virtualAttemptProviderSourceV3 returns the provider/source scope for a

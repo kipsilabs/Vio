@@ -107,6 +107,12 @@ type PlaybackPlan struct {
 	// its version menu. Empty for a non-virtual source. It carries no provider
 	// URL, token, or header.
 	EffectiveVirtualURI string `json:"effective_virtual_uri,omitempty"`
+	// DeliveryChange, when present, records that this replan changed the
+	// serving route mid-session (the delivery and/or play method differs from
+	// the plan the session was previously serving). It mirrors
+	// PlanV3.DeliveryChange so a v2 client can tell a planned route change from
+	// a silent mid-play swap. UI-only, additive.
+	DeliveryChange *playback.DeliveryChangeV3 `json:"delivery_change,omitempty"`
 	// VirtualSourceRevision is an opaque, non-secret revision of the resolved
 	// virtual source candidate; it changes on a release rotation and stays fixed
 	// while the same candidate is served. Empty for a non-virtual source.
@@ -587,7 +593,7 @@ func playbackDecision(in playback.DecisionResponseV3) PlaybackDecision {
 		p := in.PlaybackPlan
 		stream := p.Stream
 		stream.URL = playbackV2MediaURL(stream.URL)
-		out.PlaybackPlan = &PlaybackPlan{ProtocolVersion: p.ProtocolVersion, PlanID: p.PlanID, PlanAttemptKey: p.PlanAttemptKey, SessionID: p.SessionID, ExpiresAt: p.ExpiresAt, Delivery: p.Delivery, Stream: stream, Timeline: p.Timeline, SelectedTracks: p.SelectedTracks, EffectiveRecipe: p.EffectiveRecipe, Claims: p.Claims, Subtitle: playbackV2Subtitle(p.Subtitle), AudioTracks: p.AudioTracks, Transformations: p.Transformations, AppliedQuirks: p.AppliedQuirks, RuntimeCorrections: p.RuntimeCorrections, AvailableQualities: p.AvailableQualities, DegradationWarnings: p.DegradationWarnings, DecisionReason: p.DecisionReason, RequestedMediaFileID: ID(strconv.Itoa(p.RequestedMediaFileID)), EffectiveMediaFileID: ID(strconv.Itoa(p.EffectiveMediaFileID)), EffectiveVirtualURI: p.EffectiveVirtualURI, VirtualSourceRevision: p.VirtualSourceRevision, TracksPending: p.TracksPending, InventoryURL: playbackV2InventoryURL(p.InventoryURL), Source: playbackSource(p.Source), SubtitleFidelityPolicy: p.SubtitleFidelityPolicy}
+		out.PlaybackPlan = &PlaybackPlan{ProtocolVersion: p.ProtocolVersion, PlanID: p.PlanID, PlanAttemptKey: p.PlanAttemptKey, SessionID: p.SessionID, ExpiresAt: p.ExpiresAt, Delivery: p.Delivery, Stream: stream, Timeline: p.Timeline, SelectedTracks: p.SelectedTracks, EffectiveRecipe: p.EffectiveRecipe, Claims: p.Claims, Subtitle: playbackV2Subtitle(p.Subtitle), AudioTracks: p.AudioTracks, Transformations: p.Transformations, AppliedQuirks: p.AppliedQuirks, RuntimeCorrections: p.RuntimeCorrections, AvailableQualities: p.AvailableQualities, DegradationWarnings: p.DegradationWarnings, DecisionReason: p.DecisionReason, RequestedMediaFileID: ID(strconv.Itoa(p.RequestedMediaFileID)), EffectiveMediaFileID: ID(strconv.Itoa(p.EffectiveMediaFileID)), EffectiveVirtualURI: p.EffectiveVirtualURI, DeliveryChange: p.DeliveryChange, VirtualSourceRevision: p.VirtualSourceRevision, TracksPending: p.TracksPending, InventoryURL: playbackV2InventoryURL(p.InventoryURL), Source: playbackSource(p.Source), SubtitleFidelityPolicy: p.SubtitleFidelityPolicy}
 	}
 	return out
 }

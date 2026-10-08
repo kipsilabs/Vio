@@ -1646,6 +1646,15 @@ type virtualResolveOptionsV3 struct {
 	// refused (never swapped) when it is not. An auto selection leaves this
 	// false and keeps the ordinary fallback/substitution behavior.
 	explicitSelection bool
+	// refuseRotation declares that the caller has explicitly withheld the
+	// rotation intent, so no recoverable resolve path may substitute a sibling
+	// release for a pinned candidate. It is the explicit-pick protection carried
+	// as intent rather than inferred: resolveRehydratedVirtualSourceV3's absent-
+	// pin auto-retry consults it so the session-bound refusal door and the
+	// failure_recovery rotation door honor one policy. An explicit version pick
+	// sets it (the viewer chose that release); an auto selection leaves it false
+	// and keeps the documented renumbered/dead-pin recovery.
+	refuseRotation bool
 	// bypassProviderFloor marks a deliberate recovery resolve — an automatic
 	// replan rotation or an alternate-version fallback — as a declared outage
 	// re-list: it re-lists past the fresh-serve floor and the 30s
@@ -1835,7 +1844,7 @@ func (h *PlaybackHandler) resolveRehydratedVirtualSourceV3(
 	opts virtualResolveOptionsV3,
 ) (resolvedVirtualPlaybackSource, error) {
 	resolved, err := h.resolveVirtualPlaybackSource(r, pinnedFile, profileID, false, excludedCandidateIDs, preferredCandidateID, qualityPreference, bandwidthCapKbps, false, opts)
-	if err == nil || opts.rotateCandidates || !isRehydratedVirtualSourceRotatableV3(err) {
+	if err == nil || opts.rotateCandidates || opts.refuseRotation || !isRehydratedVirtualSourceRotatableV3(err) {
 		return resolved, err
 	}
 	if len(excludedCandidateIDs) == 0 {
@@ -2310,7 +2319,15 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	// accepted/rejected group so compatibility still wins — evidence only
 	// breaks ties within a group. Explicit picks and session-bound resolves
 	// are untouched: the viewer chose that exact release.
-	if noResult && !options.sessionBound && !options.explicitSelection && len(candidates) > 1 {
+	//
+	// The preference also runs when the requested row is itself an unprobed
+	// placeholder that already carries a persisted ?result= (noResult false):
+	// otherwise the request binds the size-0 stub at index 0 while a fully
+	// probed row for the same profile/content exists, and the session later
+	// has to rotate — the very cascade this preference exists to avoid. A row
+	// the planner can route (complete evidence) keeps the existing noResult-
+	// only behavior, so this only ever promotes a probed sibling over a stub.
+	if (noResult || needsCandidateMetadata) && !options.sessionBound && !options.explicitSelection && len(candidates) > 1 {
 		candidates = h.preferProbedVirtualCandidates(stagingCtx, candidates, file, file.VirtualOwnerInstallationID)
 	}
 	if len(candidates) > maxAttempts {
