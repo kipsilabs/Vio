@@ -3,7 +3,9 @@ package apiv2
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -86,7 +88,7 @@ func (f *fakeWatch) SetWatchedState(_ context.Context, userID int, profileID, co
 	return handlers.WatchedStateView{ContentID: contentID, Type: "movie", AffectedCount: 1, Played: played}, nil
 }
 
-func watchDeps(watch *fakeWatch) Dependencies {
+func watchDeps(watch WatchService) Dependencies {
 	deps := pilotDeps(nil, nil)
 	deps.Watch = watch
 	return deps
@@ -252,6 +254,25 @@ func TestGetWatchStateRejects(t *testing.T) {
 	requireProblem(t, do(t, off, http.MethodGet, "/api/v2/watch/movie:heat-1995", "", owner), TypeDependencyUnavailable)
 }
 
+// fakeWatchFilters fails only the access-filter read: the watch detail and
+// mark paths need a filter before they can do anything else, so both mask the
+// same failure. It keeps WatchDetail usable for content the fake needs.
+type fakeWatchFilters struct {
+	err error
+}
+
+func (f *fakeWatchFilters) ContextAccessFilter(context.Context, handlers.AccessFilterOptions) (catalogpkg.AccessFilter, error) {
+	return catalogpkg.AccessFilter{}, f.err
+}
+
+func (f *fakeWatchFilters) WatchDetail(_ context.Context, userID int, profileID, contentID string, _ catalogpkg.AccessFilter) (*catalogpkg.WatchDetail, error) {
+	return nil, &handlers.APIError{Status: http.StatusNotFound, Code: "not_found", Message: "Watch target not found"}
+}
+
+func (f *fakeWatchFilters) SetWatchedState(_ context.Context, userID int, profileID, contentID string, played bool, _ catalogpkg.AccessFilter) (handlers.WatchedStateView, error) {
+	return handlers.WatchedStateView{}, &handlers.APIError{Status: http.StatusNotFound, Code: "not_found", Message: "Item not found"}
+}
+
 func TestMarkWatched(t *testing.T) {
 	watch := &fakeWatch{}
 	h := newTestHandler(t, watchDeps(watch))
@@ -279,6 +300,30 @@ func TestMarkWatched(t *testing.T) {
 
 	watch.err = &handlers.APIError{Status: http.StatusInternalServerError, Code: "internal_error", Message: "Failed to update watched state"}
 	requireProblem(t, do(t, h, http.MethodPost, "/api/v2/watched/movie:heat-1995", "", owner), TypeInternalError)
+
+	// An access-filter failure masks the same way on both watch paths: the
+	// body reports the generic error without echoing the cause marker, and
+	// the request log carries the marker under the same request id.
+	filterWatch := &fakeWatchFilters{err: fmt.Errorf("watch access private-watch-marker: %w", context.Canceled)}
+	filterHandler := newTestHandler(t, watchDeps(filterWatch))
+	buf := captureLogs(t)
+	rec = do(t, filterHandler, http.MethodGet, "/api/v2/watch/movie:heat-1995", "", owner)
+	requireProblem(t, rec, TypeInternalError)
+	if !strings.Contains(rec.Body.String(), "An unexpected error occurred.") || strings.Contains(rec.Body.String(), "private-watch-marker") {
+		t.Fatalf("masked watch body = %s", rec.Body.String())
+	}
+	if line := buf.String(); !strings.Contains(line, "private-watch-marker") || !strings.Contains(line, `"request_id":"`+requestIDHeader(rec)+`"`) {
+		t.Fatalf("masked watch log lacks marker or request id: %s", line)
+	}
+	buf.Reset()
+	rec = do(t, filterHandler, http.MethodPost, "/api/v2/watched/movie:heat-1995", "", owner)
+	requireProblem(t, rec, TypeInternalError)
+	if !strings.Contains(rec.Body.String(), "An unexpected error occurred.") || strings.Contains(rec.Body.String(), "private-watch-marker") {
+		t.Fatalf("masked mark body = %s", rec.Body.String())
+	}
+	if line := buf.String(); !strings.Contains(line, "private-watch-marker") || !strings.Contains(line, `"request_id":"`+requestIDHeader(rec)+`"`) {
+		t.Fatalf("masked mark log lacks marker or request id: %s", line)
+	}
 
 	off := newTestHandler(t, parityDeps(false))
 	requireProblem(t, do(t, off, http.MethodPost, "/api/v2/watched/movie:heat-1995", "", owner), TypeDependencyUnavailable)

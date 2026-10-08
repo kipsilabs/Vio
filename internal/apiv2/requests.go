@@ -785,7 +785,13 @@ func requestProblem(err error) *Problem {
 		return p.WithErrors(errs...)
 	}
 	var quota mediarequests.QuotaError
+	// A canceled lookup (client gone, or a dependency reporting the canceled
+	// context) masks like every other failure: status and type unchanged, a
+	// stable detail, the cause on the log only. Detail strings are never a
+	// contract surface (api-contract.md: clients never parse detail).
 	switch {
+	case errors.Is(err, context.Canceled):
+		return NewProblem(TypeInternalError, "The request was canceled.").withCause(err)
 	case errors.As(err, &quota):
 		return NewProblem(TypeRateLimited, "Request quota exceeded: "+strconv.Itoa(quota.Used)+" of "+strconv.Itoa(quota.Limit)+" requests used in the last "+strconv.Itoa(quota.WindowDays)+" days.")
 	case errors.Is(err, mediarequests.ErrInvalidMediaType):

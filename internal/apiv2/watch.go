@@ -355,7 +355,7 @@ func (reg *Registry) getWatchState(ctx context.Context, in *WatchDetailInput) (*
 	}
 	filter, err := reg.deps.Watch.ContextAccessFilter(ctx, opts)
 	if err != nil {
-		return nil, NewProblem(TypeInternalError, "An unexpected error occurred.")
+		return nil, NewProblem(TypeInternalError, "An unexpected error occurred.").withCause(err)
 	}
 	detail, err := reg.deps.Watch.WatchDetail(ctx, claims.UserID, profileFrom(ctx), string(in.ID), filter)
 	if err != nil {
@@ -423,7 +423,7 @@ func (reg *Registry) setWatched(ctx context.Context, in *WatchedInput, played bo
 	}
 	filter, err := reg.deps.Watch.ContextAccessFilter(ctx, handlers.AccessFilterOptions{})
 	if err != nil {
-		return nil, NewProblem(TypeInternalError, "An unexpected error occurred.")
+		return nil, NewProblem(TypeInternalError, "An unexpected error occurred.").withCause(err)
 	}
 	if _, err := reg.deps.Watch.SetWatchedState(ctx, userID, profileID, string(in.ID), played, filter); err != nil {
 		return nil, serviceProblem(err)
