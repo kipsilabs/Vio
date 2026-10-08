@@ -2,6 +2,7 @@ package tasks
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -15,7 +16,17 @@ const (
 	refreshMetadataTaskInterval = 6 * time.Hour
 	refreshMetadataBatchSize    = 200
 	refreshMetadataWorkerCount  = 12
+	// refreshClaimMissesBeforeStop is how many claim renewals in a row may fail
+	// before a batch stops. Renewals run every third of the lease, so after two
+	// misses the next one would come after the claims lapse. By then another
+	// node may hold the rows, and this batch's flush would settle them under
+	// that node's claim.
+	refreshClaimMissesBeforeStop = 2
 )
+
+// errRefreshClaimsLost stops a batch whose claims could not be renewed. Its
+// rows are left claimed and are retried once their lease expires.
+var errRefreshClaimsLost = errors.New("refresh claims could not be renewed")
 
 // MetadataRefresher can refresh metadata for a queued target.
 type MetadataRefresher interface {
@@ -146,18 +157,23 @@ func (t *RefreshMetadataTask) refreshBatch(
 		workerCount = len(candidates)
 	}
 
+	// The batch stops early when its claims can no longer be renewed. The
+	// flush then runs on the stopped context, so it settles nothing.
+	batchCtx, stopBatch := context.WithCancelCause(ctx)
+	defer stopBatch(nil)
+
 	// Deferred calls run in reverse, so the claims stay renewed through the flush.
 	if renewer, ok := t.finder.(RefreshClaimRenewer); ok {
-		defer renewRefreshClaims(ctx, renewer, candidates)()
+		defer renewRefreshClaims(batchCtx, renewer, candidates, stopBatch)()
 	}
 
 	// Every return below happens after the workers have stopped, so the
 	// deferred flush sees the whole batch's refreshes.
-	itemParent := ctx
+	itemParent := batchCtx
 	if batcher, ok := t.refresher.(MetadataRefreshBatcher); ok {
 		var flush func(context.Context)
-		itemParent, flush = batcher.BeginScheduledRefreshBatch(ctx)
-		defer flush(ctx)
+		itemParent, flush = batcher.BeginScheduledRefreshBatch(batchCtx)
+		defer flush(batchCtx)
 	}
 
 	type refreshJob struct {
@@ -174,7 +190,7 @@ func (t *RefreshMetadataTask) refreshBatch(
 		go func() {
 			defer wg.Done()
 			for job := range jobs {
-				if ctx.Err() != nil {
+				if batchCtx.Err() != nil {
 					return
 				}
 
@@ -231,24 +247,26 @@ func (t *RefreshMetadataTask) refreshBatch(
 	for _, candidate := range candidates {
 		select {
 		case jobs <- refreshJob{candidate: candidate}:
-		case <-ctx.Done():
+		case <-batchCtx.Done():
 			close(jobs)
 			wg.Wait()
-			return refreshed, errored, ctx.Err()
+			return refreshed, errored, context.Cause(batchCtx)
 		}
 	}
 	close(jobs)
 	wg.Wait()
 
-	if ctx.Err() != nil {
-		return refreshed, errored, ctx.Err()
+	if batchCtx.Err() != nil {
+		return refreshed, errored, context.Cause(batchCtx)
 	}
 	return refreshed, errored, nil
 }
 
 // renewRefreshClaims renews the batch's claims on the renewer's interval until
-// the returned stop function is called or ctx is done.
-func renewRefreshClaims(ctx context.Context, renewer RefreshClaimRenewer, candidates []worker.RefreshCandidate) func() {
+// the returned stop function is called or ctx is done. After
+// refreshClaimMissesBeforeStop failed renewals in a row it stops the batch
+// with errRefreshClaimsLost.
+func renewRefreshClaims(ctx context.Context, renewer RefreshClaimRenewer, candidates []worker.RefreshCandidate, stopBatch context.CancelCauseFunc) func() {
 	interval := renewer.ClaimRenewInterval()
 	if interval <= 0 || len(candidates) == 0 {
 		return func() {}
@@ -259,14 +277,26 @@ func renewRefreshClaims(ctx context.Context, renewer RefreshClaimRenewer, candid
 		defer close(done)
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
+		misses := 0
 		for {
 			select {
 			case <-renewCtx.Done():
 				return
 			case <-ticker.C:
-				if err := renewer.RenewClaims(renewCtx, candidates); err != nil && renewCtx.Err() == nil {
-					slog.WarnContext(renewCtx, "refresh task: failed to renew claims", "component", "taskmanager",
-						"claims", len(candidates), "error", err)
+				err := renewer.RenewClaims(renewCtx, candidates)
+				if renewCtx.Err() != nil {
+					return
+				}
+				if err == nil {
+					misses = 0
+					continue
+				}
+				misses++
+				slog.WarnContext(renewCtx, "refresh task: failed to renew claims", "component", "taskmanager",
+					"claims", len(candidates), "misses", misses, "error", err)
+				if misses >= refreshClaimMissesBeforeStop {
+					stopBatch(fmt.Errorf("%w: %w", errRefreshClaimsLost, err))
+					return
 				}
 			}
 		}
