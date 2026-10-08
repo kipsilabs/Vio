@@ -33,7 +33,7 @@ func TestRedisChannelScopesByDatabaseNumber(t *testing.T) {
 			owners[name] = owner
 		}
 	}
-	if got, want := redisChannel(ChannelAdmin, 3), "silo:admin@db3"; got != want {
+	if got, want := redisChannel(ChannelAdmin, 3), ChannelAdmin+"@db3"; got != want {
 		t.Errorf("redisChannel(ChannelAdmin, 3) = %q, want %q", got, want)
 	}
 	if got := redisChannel(ChannelAdmin, -1); got != ChannelAdmin {
@@ -177,13 +177,13 @@ func readRESPCommand(r *bufio.Reader) ([]string, error) {
 // Runs without a Redis server: the name Redis receives must carry the database
 // number that the same connection selected.
 func TestRedisEventBusSendsScopedChannelToRedis(t *testing.T) {
-	bare := []string{"SUBSCRIBE silo:admin on database 0", "PUBLISH silo:admin on database 0"}
+	bare := []string{"SUBSCRIBE " + ChannelAdmin + " on database 0", "PUBLISH " + ChannelAdmin + " on database 0"}
 	for _, tc := range []struct {
 		name string
 		path string
 		want []string
 	}{
-		{"database 3", "/3", []string{"SUBSCRIBE silo:admin@db3 on database 3", "PUBLISH silo:admin@db3 on database 3"}},
+		{"database 3", "/3", []string{"SUBSCRIBE " + ChannelAdmin + "@db3 on database 3", "PUBLISH " + ChannelAdmin + "@db3 on database 3"}},
 		{"database 0", "/0", bare},
 		{"no database number", "", bare},
 		{"negative database number", "/-1", bare},
