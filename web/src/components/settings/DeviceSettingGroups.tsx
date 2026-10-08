@@ -134,12 +134,6 @@ function DeviceSettingRow({
   const changedHere = effective?.scope === "profile_device" || retainedHere;
   const locked = effective?.constraint_kind === "locked";
   const constrained = Boolean(effective?.constrained);
-  // Where an unchanged row's value comes from. Skipped when the profile-wide
-  // note already says so, and under a household limit, where the value shown
-  // is the limit's (the badge names it) while `source` still names the choice
-  // the limit capped.
-  const inheritedFrom =
-    changedHere || profileWide || constrained ? null : sourceLabel(effective, ownerLabel);
   const value = effective?.value ?? definition.defaultValue;
   const inlineControl = controlKindFor(definition) === "switch";
 
