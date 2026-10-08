@@ -138,6 +138,48 @@ func TestReplanDeliverySwapMarkerAndLog(t *testing.T) {
 			t.Fatalf("v1 replan leaked the v2-only delivery_change marker: %#v", recovered.PlaybackPlan.DeliveryChange)
 		}
 	})
+
+	// The durable replan lease is shared by both surfaces: a v2 decision that
+	// swapped the route is cached, and a replay of the identical canonical
+	// request through v1 must not re-emit the v2-only marker from the cached
+	// bytes. The replay is byte-identical to the v2 request (same body, same
+	// replan_request_id), so the lease matches and execution is skipped; the
+	// surface gate at the response boundary is the only thing that keeps the
+	// frozen bridge from growing the field.
+	t.Run("v1 replay of a cached v2 swap withholds the marker", func(t *testing.T) {
+		handler, start := setup(t)
+		started := startV3PlaybackV2ForHandlerTest(t, handler, start)
+		plan := started.PlaybackPlan
+		if plan.Delivery != playback.DeliveryOriginalHTTPV3 {
+			t.Fatalf("fixture expected a direct-play start, got %s", plan.Delivery)
+		}
+		recovery := recoveryFor(start, plan)
+
+		recovered := postPlaybackReplanV2ForHandlerTest(t, handler, started.SessionID, recovery)
+		if recovered.Terminal != nil || recovered.PlaybackPlan == nil || recovered.PlaybackPlan.DeliveryChange == nil {
+			t.Fatalf("fixture precondition: the v2 recovery must have swapped the route with a marker: terminal=%#v plan=%v", recovered.Terminal, recovered.PlaybackPlan)
+		}
+
+		// The identical canonical request through the frozen v1 bridge: the
+		// lease replays the cached decision without re-executing.
+		replayed := postPlaybackReplanV3(t, handler, started.SessionID, recovery)
+		if replayed.Terminal != nil || replayed.PlaybackPlan == nil {
+			t.Fatalf("v1 replay did not return the cached plan: terminal=%#v plan=%v", replayed.Terminal, replayed.PlaybackPlan)
+		}
+		if replayed.PlaybackPlan.PlanID != recovered.PlaybackPlan.PlanID {
+			t.Fatalf("v1 replay plan = %q, want the cached v2 plan %q", replayed.PlaybackPlan.PlanID, recovered.PlaybackPlan.PlanID)
+		}
+		if replayed.PlaybackPlan.DeliveryChange != nil {
+			t.Fatalf("v1 replay of a cached v2 swap leaked delivery_change: %#v", replayed.PlaybackPlan.DeliveryChange)
+		}
+
+		// The durable v2 decision still carries the marker: a v2 replay of the
+		// same request returns the cached bytes unchanged.
+		replayedV2 := postPlaybackReplanV2ForHandlerTest(t, handler, started.SessionID, recovery)
+		if replayedV2.Terminal != nil || replayedV2.PlaybackPlan == nil || replayedV2.PlaybackPlan.DeliveryChange == nil {
+			t.Fatalf("v2 replay lost the marker: terminal=%#v plan=%v", replayedV2.Terminal, replayedV2.PlaybackPlan)
+		}
+	})
 }
 
 // TestDeliveryChangeV3NoMarkerForUnchangedRoute pins the marker's nil contract:
