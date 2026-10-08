@@ -19,13 +19,13 @@ vi.mock("react-router", async () => {
   };
 });
 
-// A signed-in admin, so the admin gate lets the navigation through; the
-// session itself is not under test.
+// A signed-in admin on a chosen profile, so the admin gate lets the
+// navigation through; the session itself is not under test.
 vi.mock("@/hooks/useAuth", async () => {
   const actual = await vi.importActual<typeof import("@/hooks/useAuth")>("@/hooks/useAuth");
   const auth = {
     user: { id: 1, username: "alex", role: "admin" },
-    profile: null,
+    profile: { id: "profile-1", name: "Alex" },
     loading: false,
     setupLoading: false,
     setupRequired: false,
