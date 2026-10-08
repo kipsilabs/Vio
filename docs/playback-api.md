@@ -345,6 +345,13 @@ Route events take the v3 event plus `installation_id` and a client-minted
 same `event_id` is recorded once (partial unique index on attempt and event
 id); clients never retry automatically and treat `429` as drop.
 
+A replan response also carries the additive `playback_plan.delivery_change`
+marker, described in the [protocol spec](architecture/playback-protocol-v3.md#92-mid-session-delivery-change):
+it is present only when the replan changed the serving route mid-session, and
+names the old and new `delivery` and `play_method` so a client can tell a
+planned route change from a silent swap. It is absent on a start and on a seek
+reanchor, and is excluded from plan identity.
+
 ## Delivery
 
 | Operation | Method and path |
@@ -416,3 +423,9 @@ code, the deny marker and the attempt row with v2. Apple and Android use this
 surface until they adopt v2; it is retired with the rest of `/api/v1` under the
 `410 client_upgrade_required` tombstone
 ([API contract](architecture/api-contract.md)).
+
+The shared v3 decision body the bridge serves carries `playback_plan.delivery_change`
+only on `/api/v2`: the handler clears it on a v1 decision, so the frozen bridge
+grows no field. It is scoped the same way as `tracks_pending`, the other v2-only
+plan hint, and the [protocol spec](architecture/playback-protocol-v3.md#92-mid-session-delivery-change)
+records the decision.

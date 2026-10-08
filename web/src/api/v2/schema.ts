@@ -19980,6 +19980,14 @@ export interface components {
       validated_claims: string[];
       video_codecs: string[];
     };
+    DeliveryChange: {
+      delivery?: string;
+      delivery_changed?: boolean;
+      play_method?: string;
+      play_method_changed?: boolean;
+      previous_delivery?: string;
+      previous_play_method?: string;
+    };
     DeliverySubtitleCapabilitiesV3: {
       ass_styling: boolean;
       embedded_bitmap: boolean;
@@ -24635,6 +24643,7 @@ export interface components {
       decision_reason: string;
       degradation_warnings: components["schemas"]["DegradationWarningV3"][];
       delivery: string;
+      delivery_change?: components["schemas"]["DeliveryChange"];
       /**
        * @description Opaque identifier
        * @example 1

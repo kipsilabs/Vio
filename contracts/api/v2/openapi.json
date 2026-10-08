@@ -23513,6 +23513,30 @@
         ],
         "type": "object"
       },
+      "DeliveryChange": {
+        "additionalProperties": false,
+        "properties": {
+          "delivery": {
+            "type": "string"
+          },
+          "delivery_changed": {
+            "type": "boolean"
+          },
+          "play_method": {
+            "type": "string"
+          },
+          "play_method_changed": {
+            "type": "boolean"
+          },
+          "previous_delivery": {
+            "type": "string"
+          },
+          "previous_play_method": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
       "DeliverySubtitleCapabilitiesV3": {
         "additionalProperties": false,
         "properties": {
@@ -35017,6 +35041,9 @@
           },
           "delivery": {
             "type": "string"
+          },
+          "delivery_change": {
+            "$ref": "#/components/schemas/DeliveryChange"
           },
           "effective_media_file_id": {
             "description": "Opaque identifier",

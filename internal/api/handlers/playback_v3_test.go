@@ -6803,6 +6803,29 @@ func postPlaybackReplanV3(t *testing.T, handler *PlaybackHandler, sessionID stri
 	return response
 }
 
+// postPlaybackReplanV2ForHandlerTest drives the shared replan application
+// through the /api/v2 surface mark, the surface the v2-only plan hints are
+// scoped to. It is byte-for-byte the v1 helper otherwise.
+func postPlaybackReplanV2ForHandlerTest(t *testing.T, handler *PlaybackHandler, sessionID string, request playback.ReplanRequestV3) playback.DecisionResponseV3 {
+	t.Helper()
+	body, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/playback/"+sessionID+"/replan", strings.NewReader(string(body))).WithContext(WithNativeAPIV2(newAuthorizedPlaybackContext()))
+	req = withPlaybackRouteParam(req, "session_id", sessionID)
+	rr := httptest.NewRecorder()
+	handler.HandleReplanPlaybackV3(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("v2 replan status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var response playback.DecisionResponseV3
+	if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	return response
+}
+
 // recordingNodePlannerV3 is a planner double that records what the transport
 // asked for and whether the reservation was released.
 type recordingNodePlannerV3 struct {

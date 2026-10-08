@@ -107,6 +107,14 @@ type PlaybackPlan struct {
 	// its version menu. Empty for a non-virtual source. It carries no provider
 	// URL, token, or header.
 	EffectiveVirtualURI string `json:"effective_virtual_uri,omitempty"`
+	// DeliveryChange, when present, records that this replan changed the
+	// serving route mid-session (the delivery and/or play method differs from
+	// the plan the session was previously serving). It mirrors
+	// PlanV3.DeliveryChange so a v2 client can tell a planned route change from
+	// a silent mid-play swap. UI-only, additive. It is projected into this
+	// apiv2-owned DTO (rather than reusing the domain type) so the native v2
+	// schema is owned by the transport package, not a shared domain struct.
+	DeliveryChange *DeliveryChange `json:"delivery_change,omitempty"`
 	// VirtualSourceRevision is an opaque, non-secret revision of the resolved
 	// virtual source candidate; it changes on a release rotation and stays fixed
 	// while the same candidate is served. Empty for a non-virtual source.
@@ -126,6 +134,29 @@ type PlaybackPlan struct {
 	// can poll for the pending → terminal inventory transition.
 	InventoryURL string `json:"inventory_url,omitempty"`
 }
+
+// DeliveryChange is the v2 projection of a mid-session serving-route change on
+// a replan. It is a transport-owned DTO: the native schema name
+// DeliveryChangeV3 must be owned by the apiv2 package, so the domain
+// playback.DeliveryChangeV3 is projected into it at the handler boundary
+// instead of being published directly. The wire shape is identical (it carries
+// wire tokens only, no URLs, tokens, or headers).
+type DeliveryChange struct {
+	// PreviousDelivery is the delivery the session served before this plan, and
+	// Delivery is the delivery this plan will serve.
+	PreviousDelivery playback.DeliveryV3 `json:"previous_delivery,omitempty"`
+	Delivery         playback.DeliveryV3 `json:"delivery,omitempty"`
+	// PreviousPlayMethod and PlayMethod are the serve path before and after
+	// (direct, remux, or transcode).
+	PreviousPlayMethod playback.PlayMethod `json:"previous_play_method,omitempty"`
+	PlayMethod         playback.PlayMethod `json:"play_method,omitempty"`
+	// DeliveryChanged and PlayMethodChanged name which of the two actually
+	// moved, so a client can react to a route-shape change without diffing the
+	// tokens itself.
+	DeliveryChanged   bool `json:"delivery_changed,omitempty"`
+	PlayMethodChanged bool `json:"play_method_changed,omitempty"`
+}
+
 type PlaybackSource struct {
 	MediaFileID        ID                          `json:"media_file_id"`
 	DurationSeconds    *float64                    `json:"duration_seconds,omitempty"`
@@ -587,10 +618,29 @@ func playbackDecision(in playback.DecisionResponseV3) PlaybackDecision {
 		p := in.PlaybackPlan
 		stream := p.Stream
 		stream.URL = playbackV2MediaURL(stream.URL)
-		out.PlaybackPlan = &PlaybackPlan{ProtocolVersion: p.ProtocolVersion, PlanID: p.PlanID, PlanAttemptKey: p.PlanAttemptKey, SessionID: p.SessionID, ExpiresAt: p.ExpiresAt, Delivery: p.Delivery, Stream: stream, Timeline: p.Timeline, SelectedTracks: p.SelectedTracks, EffectiveRecipe: p.EffectiveRecipe, Claims: p.Claims, Subtitle: playbackV2Subtitle(p.Subtitle), AudioTracks: p.AudioTracks, Transformations: p.Transformations, AppliedQuirks: p.AppliedQuirks, RuntimeCorrections: p.RuntimeCorrections, AvailableQualities: p.AvailableQualities, DegradationWarnings: p.DegradationWarnings, DecisionReason: p.DecisionReason, RequestedMediaFileID: ID(strconv.Itoa(p.RequestedMediaFileID)), EffectiveMediaFileID: ID(strconv.Itoa(p.EffectiveMediaFileID)), EffectiveVirtualURI: p.EffectiveVirtualURI, VirtualSourceRevision: p.VirtualSourceRevision, TracksPending: p.TracksPending, InventoryURL: playbackV2InventoryURL(p.InventoryURL), Source: playbackSource(p.Source), SubtitleFidelityPolicy: p.SubtitleFidelityPolicy}
+		out.PlaybackPlan = &PlaybackPlan{ProtocolVersion: p.ProtocolVersion, PlanID: p.PlanID, PlanAttemptKey: p.PlanAttemptKey, SessionID: p.SessionID, ExpiresAt: p.ExpiresAt, Delivery: p.Delivery, Stream: stream, Timeline: p.Timeline, SelectedTracks: p.SelectedTracks, EffectiveRecipe: p.EffectiveRecipe, Claims: p.Claims, Subtitle: playbackV2Subtitle(p.Subtitle), AudioTracks: p.AudioTracks, Transformations: p.Transformations, AppliedQuirks: p.AppliedQuirks, RuntimeCorrections: p.RuntimeCorrections, AvailableQualities: p.AvailableQualities, DegradationWarnings: p.DegradationWarnings, DecisionReason: p.DecisionReason, RequestedMediaFileID: ID(strconv.Itoa(p.RequestedMediaFileID)), EffectiveMediaFileID: ID(strconv.Itoa(p.EffectiveMediaFileID)), EffectiveVirtualURI: p.EffectiveVirtualURI, DeliveryChange: playbackV2DeliveryChange(p.DeliveryChange), VirtualSourceRevision: p.VirtualSourceRevision, TracksPending: p.TracksPending, InventoryURL: playbackV2InventoryURL(p.InventoryURL), Source: playbackSource(p.Source), SubtitleFidelityPolicy: p.SubtitleFidelityPolicy}
 	}
 	return out
 }
+
+// playbackV2DeliveryChange projects the domain route-change marker into the
+// apiv2-owned DTO. It returns nil for an absent marker so the field stays
+// omitted on the wire, and carries every field through unchanged so the two
+// shapes cannot drift.
+func playbackV2DeliveryChange(in *playback.DeliveryChangeV3) *DeliveryChange {
+	if in == nil {
+		return nil
+	}
+	return &DeliveryChange{
+		PreviousDelivery:   in.PreviousDelivery,
+		Delivery:           in.Delivery,
+		PreviousPlayMethod: in.PreviousPlayMethod,
+		PlayMethod:         in.PlayMethod,
+		DeliveryChanged:    in.DeliveryChanged,
+		PlayMethodChanged:  in.PlayMethodChanged,
+	}
+}
+
 func playbackSource(in playback.SourceDescriptorV3) PlaybackSource {
 	return PlaybackSource{MediaFileID: ID(strconv.Itoa(in.MediaFileID)), DurationSeconds: in.DurationSeconds, Container: in.Container, VideoCodec: in.VideoCodec, VideoProfile: in.VideoProfile, VideoLevel: in.VideoLevel, BitDepth: in.BitDepth, ColorRange: in.ColorRange, Width: in.Width, Height: in.Height, FrameRate: in.FrameRate, BitrateKbps: in.BitrateKbps, DynamicRange: in.DynamicRange, HDR10Plus: in.HDR10Plus, DVProfile: in.DVProfile, DVLevel: in.DVLevel, DVBLCompatID: in.DVBLCompatID, DVBaseLayerProven: in.DVBaseLayerProven, DVEnhancementLayer: in.DVEnhancementLayer, AudioCodec: in.AudioCodec, AudioChannels: in.AudioChannels, AudioLayout: in.AudioLayout, VideoCopyUnsafe: in.VideoCopyUnsafe}
 }

@@ -1721,7 +1721,32 @@ The `/api/v2` playback plan projection carries `effective_virtual_uri` alongside
 `virtual_source_revision`, so a v2 client can detect a substituted virtual
 candidate and adopt it in its version menu.
 
-### 9.2 Persisted-candidate trust window
+### 9.2 Mid-session delivery change
+
+`playback_plan.delivery_change` is an additive, optional marker present only on a
+replan that changed the serving route while the session was already playing: the
+`delivery` and/or `play_method` differs from the plan the session was serving.
+It carries the old and new `delivery` and `play_method` wire tokens plus a
+`delivery_changed` / `play_method_changed` boolean pair, so a client can
+distinguish a planned route change (for example a failure recovery that moves
+`server_transcode_hls` to `server_remux_progressive`) from a silent mid-play swap
+without diffing plan bodies. It carries wire tokens only — no provider URL,
+token, or header. A plan that did not change the route omits the field, and a
+seek reanchor never produces it: it replays the durable route verbatim, so the
+marker is cleared rather than re-emitted from the copied current plan.
+
+Like `effective_virtual_uri` and `virtual_source_revision`, `delivery_change`
+is a UI hint set after plan identity was finalized, and it is deliberately
+excluded from `plan_id` and `plan_attempt_key`.
+
+It is v2-only, scoped to the native surface exactly like the deferred
+track-inventory hint `tracks_pending`. The frozen `/api/v1` bridge withholds it
+(the handler clears the field on a v1 decision), so a bridge client never sees
+a new field: v1 is frozen for new contract work, and a presentational route
+marker is not a bridge-usability fix. A v2 client that does not know the field
+ignores it.
+
+### 9.3 Persisted-candidate trust window
 
 Virtual provider result ids churn between listings. The server already rematches
 the same release by its durable provider identity when the provider renumbers

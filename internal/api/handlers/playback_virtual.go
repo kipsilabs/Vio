@@ -2310,7 +2310,15 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	// accepted/rejected group so compatibility still wins — evidence only
 	// breaks ties within a group. Explicit picks and session-bound resolves
 	// are untouched: the viewer chose that exact release.
-	if noResult && !options.sessionBound && !options.explicitSelection && len(candidates) > 1 {
+	//
+	// The preference also runs when the requested row is itself an unprobed
+	// placeholder that already carries a persisted ?result= (noResult false):
+	// otherwise the request binds the size-0 stub at index 0 while a fully
+	// probed row for the same profile/content exists, and the session later
+	// has to rotate — the very cascade this preference exists to avoid. A row
+	// the planner can route (complete evidence) keeps the existing noResult-
+	// only behavior, so this only ever promotes a probed sibling over a stub.
+	if (noResult || needsCandidateMetadata) && !options.sessionBound && !options.explicitSelection && len(candidates) > 1 {
 		candidates = h.preferProbedVirtualCandidates(stagingCtx, candidates, file, file.VirtualOwnerInstallationID)
 	}
 	if len(candidates) > maxAttempts {

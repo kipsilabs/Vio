@@ -1027,6 +1027,28 @@ const (
 	QualityRung720pLowV3     = "720p-low"
 )
 
+// DeliveryChangeV3 records a mid-session serving-route change on a replan. It
+// is the explicit marker for a delivery and/or play-method swap so a client can
+// distinguish a planned route change from a silent one. It carries wire tokens
+// only (no URLs, tokens, or headers).
+type DeliveryChangeV3 struct {
+	// PreviousDelivery is the delivery the session was serving before this plan.
+	PreviousDelivery DeliveryV3 `json:"previous_delivery,omitempty"`
+	// Delivery is the delivery this plan will serve. It always differs from
+	// PreviousDelivery when the marker is present.
+	Delivery DeliveryV3 `json:"delivery,omitempty"`
+	// PreviousPlayMethod is the serve path before this plan (direct, remux, or
+	// transcode).
+	PreviousPlayMethod PlayMethod `json:"previous_play_method,omitempty"`
+	// PlayMethod is the serve path this plan will use.
+	PlayMethod PlayMethod `json:"play_method,omitempty"`
+	// DeliveryChanged and PlayMethodChanged name which of the two actually
+	// moved, so a client can react to a route-shape change without diffing the
+	// tokens itself.
+	DeliveryChanged   bool `json:"delivery_changed,omitempty"`
+	PlayMethodChanged bool `json:"play_method_changed,omitempty"`
+}
+
 // AvailableQualityV3 is one server-ladder rung valid for this source and
 // client, published on the plan so clients can render a quality menu without
 // owning a bitrate table. The QualityOriginalV3 entry preserves the source;
@@ -1077,6 +1099,16 @@ type PlanV3 struct {
 	// The set is additive; clients treat an unknown value as a generic
 	// substitution rather than failing to render.
 	SubstitutionReason string `json:"substitution_reason,omitempty"`
+	// DeliveryChange, when present, records that this plan changed the serving
+	// route mid-session: the delivery and/or play method differs from the plan
+	// the session was previously serving. A failure-recovery replan may
+	// legitimately move from one delivery to another (for example
+	// server_transcode_hls to server_remux_progressive), and without an explicit
+	// marker the client only sees the new plan body and cannot tell a silent
+	// mid-play route swap from a planned change. It is a UI-only signal, set
+	// after plan identity is finalized and deliberately excluded from plan
+	// identity hashing, like the substitution and inventory hints beside it.
+	DeliveryChange *DeliveryChangeV3 `json:"delivery_change,omitempty"`
 	// EffectiveVirtualURI is the provider-neutral virtual:// candidate URI the
 	// planner selected and probed when it substituted a real candidate for a
 	// neutral catalog row. UI-only: clients use it to keep the version menu in
