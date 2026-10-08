@@ -8,8 +8,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-
-	"github.com/Silo-Server/silo-server/internal/logredact"
 )
 
 // ErrSessionNotFound is returned when a compat session does not exist.
@@ -113,7 +111,7 @@ func (s *SessionStore) Get(token string) (*Session, bool) {
 	persisted, err := s.repo.GetByToken(context.Background(), token, s.now())
 	if err != nil {
 		if !errors.Is(err, ErrSessionNotFound) {
-			slog.Warn("jellycompat session store load failed", "token_prefix", safeTokenPrefix(token), "error", logredact.SanitizeText(err.Error()))
+			slog.Warn("jellycompat session store load failed", "token", token, "error", err)
 		}
 		return nil, false
 	}
@@ -145,7 +143,7 @@ func (s *SessionStore) maybeExtendSession(session *Session, token string) {
 
 	if s.repo != nil {
 		if err := s.repo.Upsert(context.Background(), *session); err != nil {
-			slog.Warn("jellycompat session store extend failed", "token_prefix", safeTokenPrefix(token), "error", logredact.SanitizeText(err.Error()))
+			slog.Warn("jellycompat session store extend failed", "token", token, "error", err)
 		}
 	}
 }
@@ -157,7 +155,7 @@ func (s *SessionStore) Delete(token string) {
 	s.mu.Unlock()
 	if s.repo != nil {
 		if err := s.repo.DeleteByToken(context.Background(), token); err != nil && !errors.Is(err, ErrSessionNotFound) {
-			slog.Warn("jellycompat session store delete failed", "token_prefix", safeTokenPrefix(token), "error", logredact.SanitizeText(err.Error()))
+			slog.Warn("jellycompat session store delete failed", "token", token, "error", err)
 		}
 	}
 }
