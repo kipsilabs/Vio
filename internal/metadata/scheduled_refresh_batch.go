@@ -19,6 +19,8 @@ const (
 	scheduledRefreshFlushWorkers = 12
 )
 
+// scheduledRefreshBatchKey carries the open *scheduledRefreshBatch on the
+// contexts of the refreshes that belong to it.
 type scheduledRefreshBatchKey struct{}
 
 // failedEpisodeDebtKey carries the episode targets whose refresh failure was
@@ -41,12 +43,16 @@ type scheduledRefreshBatch struct {
 	targets []refreshDebtTarget
 }
 
+// refreshDebtTarget is a successful season or episode target whose debt row
+// the flush syncs once its series' passes have finished.
 type refreshDebtTarget struct {
 	targetType string
 	contentID  string
 	seriesID   string
 }
 
+// add records a series for the flush, once however many of its seasons or
+// episodes the batch refreshes.
 func (b *scheduledRefreshBatch) add(seriesID string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -57,18 +63,24 @@ func (b *scheduledRefreshBatch) add(seriesID string) {
 	b.series = append(b.series, seriesID)
 }
 
+// markEpisodeFailed records an episode target whose refresh failure was
+// written to its debt row during the batch.
 func (b *scheduledRefreshBatch) markEpisodeFailed(episodeID string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.failedEpisodes[episodeID] = struct{}{}
 }
 
+// addTarget records a successful season or episode target whose debt row
+// stays claimed until the flush has run its series' passes.
 func (b *scheduledRefreshBatch) addTarget(targetType, contentID, seriesID string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.targets = append(b.targets, refreshDebtTarget{targetType: targetType, contentID: contentID, seriesID: seriesID})
 }
 
+// take returns everything the batch has recorded and empties it, so a second
+// flush has nothing left to sync.
 func (b *scheduledRefreshBatch) take() ([]string, map[string]struct{}, []refreshDebtTarget) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -107,6 +119,8 @@ func (s *MetadataService) BeginScheduledRefreshBatch(ctx context.Context) (conte
 	}
 }
 
+// scheduledRefreshBatchFromContext returns the batch a refresh belongs to, or
+// nil when it runs outside a scheduled refresh batch.
 func scheduledRefreshBatchFromContext(ctx context.Context) *scheduledRefreshBatch {
 	batch, _ := ctx.Value(scheduledRefreshBatchKey{}).(*scheduledRefreshBatch)
 	return batch
@@ -166,6 +180,11 @@ func failedEpisodeDebtFromContext(ctx context.Context) map[string]struct{} {
 	return failed
 }
 
+// flushScheduledRefreshBatch runs the batch's deferred work: each recorded
+// series' link and debt passes, at most scheduledRefreshFlushWorkers at a time
+// and each under seriesEpisodeSyncTimeout, then the debt sync of every target
+// whose series finished. BeginScheduledRefreshBatch describes what a cancelled
+// flush or a failed series pass leaves claimed.
 func (s *MetadataService) flushScheduledRefreshBatch(ctx context.Context, batch *scheduledRefreshBatch) {
 	series, failedEpisodes, targets := batch.take()
 	if len(failedEpisodes) > 0 {
