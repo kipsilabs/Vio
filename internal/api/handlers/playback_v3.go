@@ -8175,14 +8175,20 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				// would let sequential rotations cycle A→B→C→A instead of
 				// terminating when every sibling is known-bad.
 				//
-				// One rotation policy for the session. The explicit-pick
-				// protection is carried as intent (refuseRotation) rather than
-				// inferred from an absent sentinel, so the rehydration's
-				// absent/dead-pin auto-retry cannot rotate a release the
-				// session-bound door (serve, transport, resolver refusal) would
-				// refuse: an explicit pin is never substituted, and an auto
+				// One rotation policy for the session. The retry's same-release
+				// assertion is the single arbiter of what an explicit pin may
+				// accept: a renumbered or dropped anchor is re-identified by its
+				// durable provider identity and allowed through (the same
+				// recovery the transport anchor and serve-layer doors allow),
+				// while a genuinely different release, or one with no durable
+				// identity to prove the match, is refused and keeps the original
+				// absent/marked-failed cause. An explicit pick is therefore never
+				// substituted with a different release on any door, and an auto
 				// selection keeps its documented renumbered/dead-pin recovery.
-				resolved, resolveErr := h.resolveRehydratedVirtualSourceV3(r, &pinnedFile, record.ProfileID, excludedCandidateIDs, preferredCandidateID, start.QualityPreference, intOrZeroHandlerV3(start.BandwidthCapKbps), virtualResolveOptionsV3{allowFailedCandidate: false, rotateCandidates: virtualDecodeRotation, refuseRotation: h.explicitVirtualPinV3(record), sessionBound: true, sessionAnchorURI: session.VirtualSourceURI, bypassProviderFloor: true})
+				// The terminal-driven alternate-file hunt below is separately
+				// gated by the negotiated fallback policy, so a failed
+				// rehydration never silently swaps in a sibling version.
+				resolved, resolveErr := h.resolveRehydratedVirtualSourceV3(r, &pinnedFile, record.ProfileID, excludedCandidateIDs, preferredCandidateID, start.QualityPreference, intOrZeroHandlerV3(start.BandwidthCapKbps), virtualResolveOptionsV3{allowFailedCandidate: false, rotateCandidates: virtualDecodeRotation, sessionBound: true, sessionAnchorURI: session.VirtualSourceURI, bypassProviderFloor: true})
 				if resolveErr != nil {
 					slog.WarnContext(r.Context(), "virtual playback rehydration failed", "component", "api", "session_id", record.SessionID, "file_id", currentEffectiveFile.ID, "owner_installation_id", session.VirtualSourceOwnerInstallationID, "error", logredact.SanitizeURLError(resolveErr))
 					virtualRehydrationFailed = true
@@ -8247,12 +8253,34 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	// whichever plan this replan ultimately returns.
 	var replanCapabilityWarnings []playback.DegradationWarningV3
 	transportPrepared := false
+	// One version-fallback policy for the whole replan. Both alternate-version
+	// hunts — the rehydration-failure recovery below and the terminal-driven one
+	// further down — read this single value, so an explicit version pick is never
+	// substituted on either door and a viewer's mid-session re-arm of Auto is
+	// honored consistently. resolveReplanAutoFallbackV3 prefers the live session
+	// flag over the durable start request, so a reconstructed session keeps the
+	// negotiated intent. Without this gate the rehydration path silently swapped
+	// an explicit pin's release whenever its rehydration failed but a sibling
+	// edition was still available.
+	replanFallbackAllowed := resolveReplanAutoFallbackV3(h.sessionMgr, session.ID, record) &&
+		(replanAllowsAlternateFileV3(operation, start.QualityPreference) ||
+			(isVirtualPlaybackFile(requestedFile) && operation == playback.ReplanOperationFailureRecoveryV3))
 
 	if virtualRehydrationFailed {
-		alternateOrder := alternateOrderingForClient(req.Capabilities)
-		alternates, alternateErr := h.findAlternateFiles(r.Context(), requestedFile, alternateOrder)
-		if alternateErr != nil {
-			virtualRehydrationErr = errors.Join(virtualRehydrationErr, alternateErr)
+		// Gate the alternate hunt on the same negotiated fallback policy the
+		// non-rehydration path applies. An explicit pin whose release fails to
+		// rehydrate must not be substituted: the resolver refused the sibling
+		// above, and hunting for one here would contradict that refusal. When the
+		// policy withholds fallback no alternate is tried, and the honest
+		// refresh cause is returned through the exhaustion classifier below.
+		var alternates []*models.MediaFile
+		if replanFallbackAllowed {
+			alternateOrder := alternateOrderingForClient(req.Capabilities)
+			found, alternateErr := h.findAlternateFiles(r.Context(), requestedFile, alternateOrder)
+			if alternateErr != nil {
+				virtualRehydrationErr = errors.Join(virtualRehydrationErr, alternateErr)
+			}
+			alternates = found
 		}
 		plannerSettings, plannerSettingsErr = h.plannerSettingsV3Result(r.Context())
 		attemptedKeys := append([]string(nil), req.AttemptedPlanKeys...)
@@ -8505,17 +8533,14 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		// terminalAllowsAlternateFileV3: subtitle_conversion_unsupported is no
 		// longer in that set precisely so a subtitle problem cannot reach the
 		// sibling hunt.
-		// The session's negotiated auto-fallback flag is authoritative when set:
-		// an explicit start turns it off so a replan must not silently substitute
-		// another version, and the viewer re-selecting Auto turns it back on even
-		// for a session that started explicit. An unset flag (a reconstruction)
-		// falls back to the durable normalized request, which a mid-session re-arm
-		// updates, so the reconstructed policy still matches the viewer's intent
-		// instead of the original start request.
-		autoFallback := resolveReplanAutoFallbackV3(h.sessionMgr, session.ID, record)
-		replanFallbackAllowed := autoFallback &&
-			(replanAllowsAlternateFileV3(operation, start.QualityPreference) ||
-				(isVirtualPlaybackFile(requestedFile) && operation == playback.ReplanOperationFailureRecoveryV3))
+		// replanFallbackAllowed (computed once above) is the session's negotiated
+		// auto-fallback policy: an explicit start turns it off so a replan must
+		// not silently substitute another version, and the viewer re-selecting
+		// Auto turns it back on even for a session that started explicit. An
+		// unset flag (a reconstruction) falls back to the durable normalized
+		// request, which a mid-session re-arm updates, so the reconstructed
+		// policy still matches the viewer's intent instead of the original start
+		// request.
 		subtitleOnlyAllowed := replanFallbackAllowed && subtitleOnlyTerminalV3(result.Terminal)
 		// An audio-only refusal takes the same in-place route as a subtitle
 		// one: keep the mounted release and re-plan it with another audio
@@ -8756,8 +8781,19 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	if !seekReanchor {
 		deliveryChange = deliveryChangeV3(record.CurrentPlan.Delivery, previousPlayMethod, result.Plan.Delivery, result.PlayMethod)
 	}
-	if deliveryChange != nil {
+	// The marker is scoped to the native v2 surface, like the deferred
+	// track-inventory hint (tracks_pending): the frozen /api/v1 bridge must not
+	// grow a new field, so a v1 response never exposes it. It is assigned — to
+	// nil on v1 and on a seek reanchor — unconditionally, never only when
+	// non-nil: a seek replays the durable route verbatim via
+	// frozenSeekReanchorResultV3, which copies record.CurrentPlan wholesale and
+	// therefore already carries any marker stamped on the recovery plan that
+	// produced the current route, so an omitted assignment would re-emit a stale
+	// A->B swap. A nil assignment clears it on both surfaces.
+	if isNativeAPIV2(r.Context()) {
 		result.Plan.DeliveryChange = deliveryChange
+	} else {
+		result.Plan.DeliveryChange = nil
 	}
 	replanLogAttrs := []any{
 		logComponentKey, "playback",

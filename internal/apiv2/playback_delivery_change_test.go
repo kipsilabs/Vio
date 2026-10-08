@@ -10,9 +10,11 @@ import (
 
 // TestPlaybackDecisionV2ProjectsDeliveryChange locks the additive v2 wire
 // contract for the mid-session delivery-swap marker (issue #244 item 3): the
-// plan's delivery_change is projected from PlanV3 verbatim, carrying the old and
-// new delivery/play-method tokens, and is omitted entirely on a plan with no
-// swap so a client never sees a spurious route change.
+// plan's delivery_change is projected from PlanV3 into the apiv2-owned
+// DeliveryChange DTO, carrying the old and new delivery/play-method tokens, and
+// is omitted entirely on a plan with no swap so a client never sees a spurious
+// route change. The DTO projection is what keeps the native schema owned by
+// apiv2 rather than the shared domain type.
 func TestPlaybackDecisionV2ProjectsDeliveryChange(t *testing.T) {
 	in := playback.DecisionResponseV3{PlaybackPlan: &playback.PlanV3{
 		Delivery: playback.DeliveryRemuxProgressiveV3,
@@ -29,8 +31,16 @@ func TestPlaybackDecisionV2ProjectsDeliveryChange(t *testing.T) {
 	if out.PlaybackPlan == nil || out.PlaybackPlan.DeliveryChange == nil {
 		t.Fatal("projection dropped the delivery change")
 	}
-	if *out.PlaybackPlan.DeliveryChange != *in.PlaybackPlan.DeliveryChange {
-		t.Fatalf("delivery change = %#v, want %#v", out.PlaybackPlan.DeliveryChange, in.PlaybackPlan.DeliveryChange)
+	want := DeliveryChange{
+		PreviousDelivery:   playback.DeliveryTranscodeHLSV3,
+		Delivery:           playback.DeliveryRemuxProgressiveV3,
+		PreviousPlayMethod: playback.PlayTranscode,
+		PlayMethod:         playback.PlayRemux,
+		DeliveryChanged:    true,
+		PlayMethodChanged:  true,
+	}
+	if *out.PlaybackPlan.DeliveryChange != want {
+		t.Fatalf("delivery change = %#v, want %#v", out.PlaybackPlan.DeliveryChange, want)
 	}
 	encoded, err := json.Marshal(out.PlaybackPlan)
 	if err != nil {

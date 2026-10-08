@@ -1646,15 +1646,6 @@ type virtualResolveOptionsV3 struct {
 	// refused (never swapped) when it is not. An auto selection leaves this
 	// false and keeps the ordinary fallback/substitution behavior.
 	explicitSelection bool
-	// refuseRotation declares that the caller has explicitly withheld the
-	// rotation intent, so no recoverable resolve path may substitute a sibling
-	// release for a pinned candidate. It is the explicit-pick protection carried
-	// as intent rather than inferred: resolveRehydratedVirtualSourceV3's absent-
-	// pin auto-retry consults it so the session-bound refusal door and the
-	// failure_recovery rotation door honor one policy. An explicit version pick
-	// sets it (the viewer chose that release); an auto selection leaves it false
-	// and keeps the documented renumbered/dead-pin recovery.
-	refuseRotation bool
 	// bypassProviderFloor marks a deliberate recovery resolve — an automatic
 	// replan rotation or an alternate-version fallback — as a declared outage
 	// re-list: it re-lists past the fresh-serve floor and the 30s
@@ -1844,7 +1835,7 @@ func (h *PlaybackHandler) resolveRehydratedVirtualSourceV3(
 	opts virtualResolveOptionsV3,
 ) (resolvedVirtualPlaybackSource, error) {
 	resolved, err := h.resolveVirtualPlaybackSource(r, pinnedFile, profileID, false, excludedCandidateIDs, preferredCandidateID, qualityPreference, bandwidthCapKbps, false, opts)
-	if err == nil || opts.rotateCandidates || opts.refuseRotation || !isRehydratedVirtualSourceRotatableV3(err) {
+	if err == nil || opts.rotateCandidates || !isRehydratedVirtualSourceRotatableV3(err) {
 		return resolved, err
 	}
 	if len(excludedCandidateIDs) == 0 {
