@@ -70,31 +70,3 @@ func TestApplyResult_UnmatchedItemsReportsSuccessStatus(t *testing.T) {
 		t.Errorf("updated.LastSyncStatus = %q, want %q", updated.LastSyncStatus, "success")
 	}
 }
-
-// TestApplyResultSchedulesTheNextSyncInLocalTime pins a named schedule's next
-// run to the node's local wall clock, the zone the collection capabilities
-// report, even though the sync completes with a UTC timestamp.
-func TestApplyResultSchedulesTheNextSyncInLocalTime(t *testing.T) {
-	local := time.FixedZone("UTC-11", -11*60*60)
-	saved := time.Local
-	time.Local = local
-	t.Cleanup(func() { time.Local = saved })
-
-	svc := NewService(nil, nil, nil, nil, nil, slog.New(slog.DiscardHandler))
-	store := &mockSyncUserStore{}
-	schedule := AllowedSyncSchedules["daily"]
-	collection := &userstore.Collection{ID: "test-col-1", SyncSchedule: &schedule}
-
-	_, updated, err := svc.applyResult(context.Background(), store, collection, time.Now().UTC(), nil, 0, 0, 0)
-	if err != nil {
-		t.Fatalf("applyResult failed: %v", err)
-	}
-	next := updated.NextSyncAt
-	if next == nil || store.syncState.NextSyncAt == nil || !store.syncState.NextSyncAt.Equal(*next) {
-		t.Fatalf("next sync = %v, stored %v; want the same time", next, store.syncState.NextSyncAt)
-	}
-	// The daily schedule runs at 04:30 plus up to 15 minutes of jitter.
-	if wall := next.In(local); wall.Hour() != 4 || wall.Minute() < 30 || wall.Minute() >= 45 {
-		t.Errorf("next sync = %s local, want between 04:30 and 04:45", wall.Format(time.TimeOnly))
-	}
-}

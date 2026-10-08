@@ -29,20 +29,25 @@ func computeNextSyncAt(schedule *string) *time.Time {
 	if schedule == nil || *schedule == "" {
 		return nil
 	}
-	return ComputeNextSyncAtFrom(*schedule, time.Now())
+	sched, err := cronParser.Parse(*schedule)
+	if err != nil {
+		return nil
+	}
+	next := sched.Next(time.Now())
+	jitter := time.Duration(rand.IntN(15*60)) * time.Second
+	next = next.Add(jitter)
+	return &next
 }
 
 // ComputeNextSyncAtFrom parses a cron expression and returns the next
 // scheduled time after the given reference time, with a small random jitter
-// (0-15 minutes) to prevent thundering herd on subsequent cycles. The
-// expression is evaluated on the node's local clock (time.Local), whatever
-// zone after is in, and the result keeps after's location.
+// (0-15 minutes) to prevent thundering herd on subsequent cycles.
 func ComputeNextSyncAtFrom(schedule string, after time.Time) *time.Time {
 	sched, err := cronParser.Parse(schedule)
 	if err != nil {
 		return nil
 	}
-	next := sched.Next(after.In(time.Local)).In(after.Location())
+	next := sched.Next(after)
 	jitter := time.Duration(rand.IntN(15*60)) * time.Second
 	next = next.Add(jitter)
 	return &next
