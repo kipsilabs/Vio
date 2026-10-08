@@ -1,3 +1,4 @@
+import { render, screen } from "@testing-library/react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 
@@ -90,5 +91,37 @@ describe("FilterRuleEditor", () => {
       "In Progress",
     );
     expect(movieOptions.find((option) => option.value === "watched")?.label).toBe("Watched");
+  });
+
+  it("shows rules its controls cannot represent as read-only unsupported rules", () => {
+    render(
+      <FilterRuleEditor
+        value={{
+          match: "all",
+          groups: [
+            {
+              match: "all",
+              rules: [
+                { field: "genre", op: "is", value: "Drama" },
+                { field: "year", op: "contains", value: 1999 },
+                { field: "year", op: "between", value: "1990-1999" },
+                { field: "hdr", op: "is", value: "true" },
+                { field: "in_watchlist", op: "is", value: true },
+              ],
+            },
+          ],
+        }}
+        onChange={() => {}}
+      />,
+    );
+
+    expect(
+      screen.getAllByRole("group", { name: "Unsupported rule" }).map((rule) => rule.textContent),
+    ).toEqual([
+      "Unsupported rule year contains 1999Remove",
+      'Unsupported rule year between "1990-1999"Remove',
+      'Unsupported rule hdr is "true"Remove',
+      "Unsupported rule in_watchlist is trueRemove",
+    ]);
   });
 });

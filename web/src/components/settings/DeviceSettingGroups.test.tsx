@@ -164,6 +164,26 @@ describe("DeviceSettingGroups", () => {
     expect(typeof firstCall![1]).toBe("boolean");
   });
 
+  // A household limit replaces the value but keeps the source, so the source
+  // would credit the profile or the default with a value neither set.
+  it("leaves the source to the household limit when the limit narrowed the value", () => {
+    renderGroups({
+      "playback.preferred_quality": effective({
+        key: "playback.preferred_quality",
+        value: "1080p",
+        stored_value: "2160p",
+        source: "profile",
+        scope: "profile",
+        constrained: true,
+        constraint_kind: "ceiling",
+      }),
+    });
+
+    expect(screen.getByText("Household limit")).toBeInTheDocument();
+    expect(screen.queryByText("From your profile")).not.toBeInTheDocument();
+    expect(screen.queryByText("App default")).not.toBeInTheDocument();
+  });
+
   it("offers the three intro modes and writes the selected device override", async () => {
     const { onChange } = renderGroups({
       "playback.intro_skip_mode": effective({

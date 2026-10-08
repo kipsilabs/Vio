@@ -4,9 +4,27 @@ import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import type { UserDevice } from "@/api/types";
 import type { SettingsCapabilities } from "@/hooks/queries/settingValues";
 
+function device(overrides: Partial<UserDevice>): UserDevice {
+  return {
+    device_id: "living-room",
+    device_name: "Living Room TV",
+    device_platform: "tvOS",
+    last_seen_at: "2026-08-04T00:00:00Z",
+    profile_id: "profile-1",
+    profile_name: "Taylor",
+    is_current_device: true,
+    changed_count: 0,
+    ...overrides,
+  };
+}
+
 const mocks = vi.hoisted(() => ({
+  ownDevices: [] as UserDevice[],
+  householdDevices: [] as UserDevice[],
+  profile: { id: "profile-1", is_primary: false },
   refetchCapabilities: vi.fn(),
   useEffectiveSettings: vi.fn(),
   useStoredSettingValues: vi.fn(),
@@ -20,19 +38,8 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("@/hooks/queries/devices", () => ({
-  useMyDevices: () => ({
-    data: [
-      {
-        device_id: "living-room",
-        device_name: "Living Room TV",
-        device_platform: "tvOS",
-        last_seen_at: "2026-08-04T00:00:00Z",
-        profile_id: "profile-1",
-        profile_name: "Taylor",
-        is_current_device: true,
-        changed_count: 0,
-      },
-    ],
+  useMyDevices: (options?: { household?: boolean }) => ({
+    data: options?.household ? mocks.householdDevices : mocks.ownDevices,
     isLoading: false,
   }),
   useClearDeviceSettings: () => ({ mutate: vi.fn(), isPending: false }),
@@ -55,14 +62,15 @@ vi.mock("@/hooks/queries/settingValues", async (importOriginal) => {
 });
 
 vi.mock("@/hooks/useCurrentProfile", () => ({
-  useCurrentProfile: () => ({ profile: { id: "profile-1", is_primary: false } }),
+  useCurrentProfile: () => ({ profile: mocks.profile }),
 }));
 
 vi.mock("@/hooks/useIsActingAdmin", () => ({
   useIsActingAdmin: () => false,
 }));
 
-vi.mock("@/components/settings/DeviceList", () => ({
+vi.mock("@/components/settings/DeviceList", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/components/settings/DeviceList")>()),
   DeviceList: () => <div>Device list</div>,
   lastSeenLabel: () => "recently",
 }));
@@ -90,6 +98,9 @@ describe("DeviceSettings capability discovery", () => {
   };
 
   beforeEach(() => {
+    mocks.ownDevices = [device({})];
+    mocks.householdDevices = [device({})];
+    mocks.profile = { id: "profile-1", is_primary: false };
     mocks.refetchCapabilities.mockReset();
     mocks.useEffectiveSettings.mockReset();
     mocks.useEffectiveSettings.mockReturnValue({ data: {}, isLoading: false });
@@ -202,5 +213,82 @@ describe("DeviceSettings capability discovery", () => {
     expect(mocks.deviceSettingGroupsProps).toHaveBeenLastCalledWith(
       expect.objectContaining({ storedOnDevice: { "ui.title_art": false } }),
     );
+  });
+});
+
+describe("DeviceSettings initial device", () => {
+  beforeEach(() => {
+    mocks.profile = { id: "profile-1", is_primary: false };
+    mocks.useEffectiveSettings.mockReset();
+    mocks.useEffectiveSettings.mockReturnValue({ data: {}, isLoading: false });
+    mocks.useStoredSettingValues.mockReset();
+    mocks.useStoredSettingValues.mockReturnValue({ data: undefined });
+    mocks.capabilities.data = undefined;
+    mocks.capabilities.isError = true;
+  });
+
+  function lastOpenedDevice() {
+    const calls = mocks.useEffectiveSettings.mock.calls;
+    const options = calls[calls.length - 1]?.[0] as { deviceId: string; profileId?: string };
+    return { deviceId: options.deviceId, profileId: options.profileId };
+  }
+
+  it("opens on the device you are using even when another was seen more recently", () => {
+    // The server orders by last use, so another browser on the same account
+    // can sit above the one you are on.
+    mocks.ownDevices = [
+      device({
+        device_id: "safari",
+        device_name: "Safari on macOS",
+        device_platform: "web",
+        is_current_device: false,
+      }),
+      device({ device_id: "chrome", device_name: "Chrome on Windows", device_platform: "web" }),
+    ];
+
+    render(<DeviceSettings />);
+
+    expect(lastOpenedDevice()).toEqual({ deviceId: "chrome", profileId: undefined });
+    expect(screen.getByRole("heading", { name: "Chrome on Windows" })).toBeInTheDocument();
+  });
+
+  it("falls back to the first device when the one you are using is not listed", () => {
+    mocks.ownDevices = [
+      device({ device_id: "safari", device_name: "Safari on macOS", is_current_device: false }),
+      device({ device_id: "ipad", device_name: "iPad", is_current_device: false }),
+    ];
+
+    render(<DeviceSettings />);
+
+    expect(lastOpenedDevice()).toEqual({ deviceId: "safari", profileId: undefined });
+  });
+
+  it("opens on your own row for the current device in the household view", async () => {
+    const user = userEvent.setup();
+    mocks.profile = { id: "profile-1", is_primary: true };
+    mocks.ownDevices = [
+      device({ device_id: "safari", device_name: "Safari on macOS", is_current_device: false }),
+      device({ device_id: "chrome", device_name: "Chrome on Windows" }),
+    ];
+    // Another profile on this account used the same browser more recently,
+    // so the same device appears twice and both rows are flagged current.
+    mocks.householdDevices = [
+      device({
+        device_id: "chrome",
+        device_name: "Chrome on Windows",
+        profile_id: "profile-2",
+        profile_name: "Alex",
+      }),
+      device({ device_id: "safari", device_name: "Safari on macOS", is_current_device: false }),
+      device({ device_id: "chrome", device_name: "Chrome on Windows" }),
+    ];
+
+    render(<DeviceSettings />);
+    expect(lastOpenedDevice()).toEqual({ deviceId: "chrome", profileId: undefined });
+
+    await user.click(screen.getByRole("button", { name: /Everyone/ }));
+
+    // Still your own Chrome, not Alex's, even though Alex's row comes first.
+    expect(lastOpenedDevice()).toEqual({ deviceId: "chrome", profileId: undefined });
   });
 });

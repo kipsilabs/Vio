@@ -844,10 +844,9 @@ type libraryTabResponse struct {
 	Ungrouped   *libraryTabUngrouped        `json:"ungrouped,omitempty"`
 }
 
-// HandleListLibraryUserCollections returns the viewer's own personal
-// collections that they've opted into their library Collections tab and whose
-// library scope matches the requested library. Personal collections are
-// private to their owner; this endpoint never reveals other users' rows.
+// HandleListLibraryUserCollections serves LibraryUserCollections: the
+// personal collections on the library's Collections tab that the viewer can
+// see, never another login's.
 func (h *LibraryCollectionHandler) HandleListLibraryUserCollections(w http.ResponseWriter, r *http.Request) {
 	libraryID, ok := parsePathLibraryID(w, r)
 	if !ok {

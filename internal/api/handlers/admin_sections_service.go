@@ -81,6 +81,9 @@ func (h *SectionHandler) CreateAdminSection(ctx context.Context, req AdminSectio
 	if msg, ok := validateSectionConfig(sections.SectionType(req.SectionType), req.Config); !ok {
 		return none, apiError(http.StatusBadRequest, "bad_request", msg)
 	}
+	if msg, ok := validateRecipeConfig(sections.SectionType(req.SectionType), req.Config); !ok {
+		return none, apiError(http.StatusBadRequest, "bad_request", msg)
+	}
 
 	sec := &sections.PageSection{
 		Scope:       scope,
@@ -412,6 +415,13 @@ func (h *SectionHandler) UpdateAdminSection(ctx context.Context, id string, req 
 		}
 		if msg, ok := validateSectionConfig(existing.SectionType, existing.Config); !ok {
 			return none, apiError(400, "bad_request", msg)
+		}
+		// Only writes to the type or config run the recipe check, so a row saved
+		// before create ran it can still be moved, renamed or disabled.
+		if req.SectionType != "" || len(req.Config) > 0 {
+			if msg, ok := validateRecipeConfig(existing.SectionType, existing.Config); !ok {
+				return none, apiError(400, "bad_request", msg)
+			}
 		}
 		willBeTraktBacked := isTraktBackedSection(string(existing.SectionType), existing.Config)
 		if !wasTraktBacked && willBeTraktBacked {

@@ -38915,17 +38915,9 @@
       "upgrades_websocket": false,
       "capability_endpoint": null,
       "consumers": [
-        "web"
+        "unused"
       ],
-      "consumer_call_sites": [
-        {
-          "repo": "web",
-          "file": "src/lib/recipes.ts",
-          "line": 79,
-          "types": [],
-          "match": "mechanical"
-        }
-      ],
+      "consumer_call_sites": [],
       "section": "catalog-home",
       "release_flow": "browse_search",
       "tier": 1,

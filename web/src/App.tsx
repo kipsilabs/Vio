@@ -61,6 +61,7 @@ import {
   buildUserCollectionCatalogHref,
 } from "@/pages/catalogSearchParams";
 import { buildLegacyAutoscanRedirectTarget } from "@/pages/autoscanSearchParams";
+import LegacyAdminSectionsRedirect from "@/pages/LegacyAdminSectionsRedirect";
 import LegacyRequestDetailRedirect from "@/pages/LegacyRequestDetailRedirect";
 import { buildLegacyWebhookSyncRedirectTarget } from "@/lib/webhookSync";
 import { guardRedirectTarget } from "@/lib/authRedirect";
@@ -156,7 +157,6 @@ const WatchPartyHub = lazy(() => import("@/pages/watchtogether/WatchPartyHub"));
 const WatchPartyInvite = lazy(() => import("@/pages/watchtogether/WatchPartyInvite"));
 const WatchTogetherRoomPage = lazy(() => import("@/pages/watchtogether/WatchTogetherRoomPage"));
 const WatchRoute = lazy(() => import("@/pages/WatchRoute"));
-const ProfileCustomizeHome = lazy(() => import("@/pages/ProfileCustomizeHome"));
 
 /**
  * Routes a browsing session reaches within the first few interactions. Home
@@ -528,7 +528,8 @@ function AppRoutes() {
                   <Route path="devices" element={<AdminDevices />} />
                   <Route path="devices/:userId/:deviceId" element={<AdminDevices />} />
                   <Route path="nodes" element={<AdminNodes />} />
-                  <Route path="sections" element={<AdminSections />} />
+                  <Route path="home-rows" element={<AdminSections />} />
+                  <Route path="sections" element={<LegacyAdminSectionsRedirect />} />
                   <Route path="plugins" element={<AdminPlugins />} />
                   <Route path="plugins/:pluginId" element={<AdminPluginDetail />} />
                   <Route path="settings/*" element={<AdminSettingsLayout />} />
@@ -708,9 +709,10 @@ function AppRoutes() {
                           />
                           <Route path="/calendar" element={<Calendar />} />
                           <Route path="/notifications" element={<Notifications />} />
+                          {/* Retired second profile Home editor; keep old links working. */}
                           <Route
                             path="/profile/customize-home"
-                            element={<ProfileCustomizeHome />}
+                            element={<Navigate to="/settings/home-screen" replace />}
                           />
                           <Route path="*" element={<Navigate to="/" replace />} />
                         </Routes>

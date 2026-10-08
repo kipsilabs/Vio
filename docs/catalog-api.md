@@ -116,6 +116,17 @@ its existing alphabetical, unscoped search.
 as a view: when the person's metadata is incomplete or stale and no provider lookup
 ran recently, the server queues a background refresh.
 
+Person detail and `POST /api/v2/catalog/people/{id}/refresh` (`refreshPerson`)
+apply the same visibility rule as a v2 people search without `media_scope`: the
+viewer must be able to see at least one of the person's credits. Otherwise both
+answer `404`, exactly as for an unknown ID, so these routes do not return the
+name, biography, or photo of someone who appears only in titles the viewer cannot
+see. The v1 bridge routes `GET /api/v1/people/{id}` and
+`POST /api/v1/people/{id}/refresh`, and the Jellyfin-compatible `GET /Items/{id}`
+for a person, follow the same rule. The v1 bridge search `GET /api/v1/people?q=`
+lists only people the viewer can see this way and keeps its alphabetical order
+without exact-name ranking. The admin person routes are not filtered.
+
 Clients that warm a cache speculatively, such as web prefetching the cast of an
 open item, pass `prefetch=true`. A prefetch returns the same person but does not
 queue a refresh; missing metadata is left to the server's background sweep. Read
@@ -186,11 +197,43 @@ v2 collections contract. It is advertised by `admin_item_materialize` on
 `POST /api/v1/admin/collections/{id}/materialize/{item_id}`. See
 [Admin item materialization](#admin-item-materialization).
 
+`login_sharing: true` reports that a personal collection is either private to its
+creator or shared with every profile on the login, that `listCollections` includes other
+profiles' shared collections, and that only the creator changes or orders a collection. Show
+**Shared with me** and the single **Show to other profiles** switch only when it is true; see
+[the personal collections API](collections-api.md). `groups` is always false.
+
 The document's `import_sources` lists the sources a new imported collection can come
 from (`mdblist`, `tmdb`, `tmdb_list`); it is empty when `imports` is false. Check for
 `tmdb_list` before calling `importTMDBListCollection` (`POST /api/v2/collections/import/tmdb-list`),
 which follows a public TMDB list. The administrator capability document
 (`getAdminCollectionCapabilities`) carries the same field for `importAdminTMDBList`.
+
+## Personal collection imports
+
+A personal collection imported with `importMDBListCollection`, `importTMDBCollection`,
+`importTMDBListCollection`, or `importTraktCollection` holds only titles its owner profile
+can access: titles in the owner's allowed libraries that pass its `max_content_rating`
+ceiling and `max_advisory_age` limit. The owner's hidden-library preference does not count;
+it changes what the owner browses, not what the owner may access. Every sync applies this,
+whether it runs on import, through `syncCollection`, or on the collection's schedule.
+
+- The item limit fills with titles the owner can access. The sync checks every matched
+  source entry before it applies the limit, so titles outside the owner's access never take
+  a slot.
+- `library_ids` keeps only titles in one of the listed libraries, and each title must still
+  be one the owner can access. Omit it to match against everything the owner can access.
+- The sync summary counts only titles the owner can access. `items_matched` and the
+  collection's `item_count` count the titles kept; an entry the owner cannot access counts
+  in `items_unmatched`, like an entry the catalog lacks, so the summary never reveals titles
+  outside the owner's access.
+- When the server cannot resolve the owner's access, the sync fails and the collection keeps
+  its existing members. The collection records `last_sync_status` `failed` and a
+  `last_sync_message` saying it was not updated, so a failed scheduled sync is visible too;
+  `syncCollection` answers with an error. An import in this state still creates the
+  collection, empty and with a failed first sync the caller can retry.
+
+Each viewer of a shared collection still sees only the titles that viewer can access.
 
 ## Library-scoped version lists
 

@@ -26,6 +26,25 @@ describe("buildAllUserCollectionOptions", () => {
     ]);
   });
 
+  it("leaves the source config out of a library collection option", () => {
+    const options = buildAllUserCollectionOptions([{ id: 1, name: "Movies" }], undefined, [
+      [{ ...libraryCollection("library", "Staff Picks"), source_config: { mode: "x" } }],
+    ]);
+
+    expect(options).toEqual([
+      {
+        id: "library",
+        title: "Staff Picks",
+        source: "library",
+        group: "Movies",
+        library_id: 1,
+        library_name: "Movies",
+        collection_type: "smart",
+        last_sync_status: "success",
+      },
+    ]);
+  });
+
   it("lists a multi-library collection once with its combined scope", () => {
     const shared = libraryCollection("shared", "Network Originals");
 

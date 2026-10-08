@@ -35,6 +35,8 @@ const mocks = vi.hoisted(() => ({
   /** The account the detail page renders, reset per test. */
   user: null as AdminUser | null,
   userError: null as Error | null,
+  /** The account read arrived without a strong ETag (a proxy stripped it). */
+  noEditor: false,
   refetchUser: vi.fn(),
   live: [] as unknown[],
   setSignIn: vi.fn(),
@@ -108,9 +110,10 @@ vi.mock("@/hooks/queries/admin/users", () => ({
   }),
   useAdminUser: () => ({
     data: mocks.user ?? undefined,
-    editor: mocks.user
-      ? { user: mocks.user, etag: '"cached"', profileContext: captureProfileRequestContext() }
-      : undefined,
+    editor:
+      mocks.user && !mocks.noEditor
+        ? { user: mocks.user, etag: '"cached"', profileContext: captureProfileRequestContext() }
+        : undefined,
     isLoading: false,
     isFetching: false,
     error: mocks.userError,
@@ -279,6 +282,7 @@ beforeEach(() => {
   mocks.viewerIsOwner = false;
   mocks.available = true;
   mocks.userError = null;
+  mocks.noEditor = false;
   mocks.refetchUser.mockReset();
   mocks.live = [];
   mocks.setSignIn.mockReset();
@@ -344,6 +348,14 @@ describe("page states", () => {
     mocks.userError = userProblem(404);
     renderUserDetail();
     expect(screen.getByRole("heading", { level: 1, name: "User not found" })).toBeInTheDocument();
+  });
+
+  it("says why the account can't be changed when its read had no strong ETag", () => {
+    mocks.noEditor = true;
+    renderUserDetail("/admin/users/7?tab=access");
+    expect(screen.getByRole("heading", { level: 1, name: "taylor" })).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("without a strong ETag");
+    expect(screen.getByRole("button", { name: "Edit Playback & streaming" })).toBeDisabled();
   });
 
   it("disables every action while user administration is unavailable", () => {

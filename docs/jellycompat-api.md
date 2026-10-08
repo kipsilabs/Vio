@@ -36,7 +36,10 @@ reported date without making a new edit disappear behind a history tombstone.
 Positional updates require a playable item; marking a series or season played
 uses its child episodes. Parent reads and mutation responses derive `Played`,
 `PlayCount`, and `UnplayedItemCount` from those episodes while retaining the
-parent's favorite status; an empty parent remains unplayed. A combined
+parent's favorite status; an empty parent remains unplayed. As in Jellyfin,
+reads derive `PlayedPercentage` from the resume position, so a watched movie or
+episode with no resume point omits it, while a played series or season reports
+100. A combined
 played/favorite update commits the child progress and history together with the
 series or season's favorite status; a storage failure rolls back the entire
 update. Marking played or unplayed clears the resume position unless the request
@@ -96,8 +99,12 @@ is the audio track Silo selects for the viewer (audio language preference,
 original language, and the series' remembered track), falling back to the
 file's default track. `DefaultSubtitleStreamIndex` follows Jellyfin 12.1's
 `MediaStreamSelector` for the effective subtitle mode and language, judged
-against the starting audio track: external files (including downloaded
-subtitles) sort first, and an unset subtitle language matches any language.
+against the starting audio track, with one change: Jellyfin sorts external files
+first, while Silo ranks them by Jellyfin's remaining rules and uses the source
+only to break ties, preferring embedded tracks over external and downloaded
+files. A file's default-flagged track therefore beats an external file in
+`Default` mode, and an external file is still chosen when nothing embedded is
+flagged. An unset subtitle language matches any language.
 In `Always` mode, Silo's per-series remembered subtitle track is applied first,
 as on item details. An explicit `SubtitleStreamIndex` in the request still wins.
 

@@ -46,6 +46,10 @@ vi.mock("@/hooks/queries/catalog", () => ({
   useCatalogMetadataFilters: (...args: unknown[]) => mockUseCatalogFilters(...args),
 }));
 
+vi.mock("@/hooks/queries/shuffles", () => ({
+  useStartShuffle: () => ({ startShuffle: vi.fn(), isStarting: false }),
+}));
+
 vi.mock("@/hooks/queries/personSearch", () => ({
   usePersonSearch: (...args: unknown[]) => mockUsePersonSearch(...args),
 }));
@@ -117,6 +121,15 @@ vi.mock("@/components/ErrorBoundary", () => ({
 
 vi.mock("@/components/ui/sonner", () => ({
   Toaster: () => null,
+}));
+
+// The playback chrome reads its snapshot store through useSyncExternalStore
+// with no server snapshot, so a static render of the app shell can't include
+// it. Nothing on the catalog page depends on it.
+vi.mock("@/playback/WatchPlaybackChrome", () => ({
+  WatchPlaybackProvider: ({ children }: { children: ReactNode }) => <>{children}</>,
+  WatchPlaybackHost: () => null,
+  WatchPlaybackBar: () => null,
 }));
 
 vi.mock("@/components/Layout", () => ({

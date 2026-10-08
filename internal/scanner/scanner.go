@@ -2012,16 +2012,18 @@ func (s *Scanner) markMissingExcludingProtected(
 			result.MissingSkippedProtected++
 			continue
 		}
-		// Only mark as missing if not already marked.
-		if existing.MissingSince == nil {
-			if err := s.fileRepo.MarkMissing(ctx, existing.ID, now); err != nil {
-				slog.ErrorContext(ctx, "scanner: failed to mark file missing", "component", "scanner",
-					"path", existing.FilePath,
-					"error", err,
-				)
-				result.Errors++
-				continue
-			}
+		// A file already marked by an earlier scan is waiting out the removal
+		// grace period; it is not news to this scan, so it is not counted.
+		if existing.MissingSince != nil {
+			continue
+		}
+		if err := s.fileRepo.MarkMissing(ctx, existing.ID, now); err != nil {
+			slog.ErrorContext(ctx, "scanner: failed to mark file missing", "component", "scanner",
+				"path", existing.FilePath,
+				"error", err,
+			)
+			result.Errors++
+			continue
 		}
 		result.Missing++
 	}

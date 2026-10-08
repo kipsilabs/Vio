@@ -2327,7 +2327,7 @@ func (s *DetailService) buildMediaItemDetail(ctx context.Context, item *models.M
 		Crew:                       crewCredits,
 		Studios:                    item.Studios,
 		Networks:                   item.Networks,
-		Countries:                  item.Countries,
+		Countries:                  lang.UniqueCountries(item.Countries),
 		LockedFields:               item.LockedFields,
 		FirstAirDate:               item.FirstAirDate,
 		LastAirDate:                item.LastAirDate,
@@ -3657,7 +3657,7 @@ func (s *DetailService) effectiveSubtitleDefaults(
 		return defaults
 	}
 
-	rc := settingsresolve.Context{ProfileID: filter.ProfileID}
+	rc := settingsresolve.Context{ProfileID: filter.ProfileID, DeviceID: filter.DeviceID}
 	if libraryID := preferredPlayableLibraryID(files, filter.SelectedFileID); libraryID > 0 {
 		rc.LibraryIDs = []int{libraryID}
 	}

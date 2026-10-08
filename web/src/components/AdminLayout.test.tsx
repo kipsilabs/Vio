@@ -49,6 +49,7 @@ function renderAdmin(initialPath = "/admin") {
         children: [
           { index: true, element: <h1>Admin dashboard</h1> },
           { path: "users", element: <h1>Admin users</h1> },
+          { path: "home-rows", element: <h1>Admin home rows</h1> },
         ],
       },
     ],
@@ -114,6 +115,35 @@ describe("AdminLayout shell attribute", () => {
     expect(document.documentElement).toHaveAttribute("data-admin-shell", "true");
     unmount();
     expect(document.documentElement).not.toHaveAttribute("data-admin-shell");
+  });
+});
+
+describe("AdminLayout page gutter", () => {
+  // Fixed page chrome (the collection editor's save bar) reads this gutter so
+  // it lines up with the content column instead of guessing the padding.
+  it("pads main by the gutter it publishes", () => {
+    renderAdmin();
+
+    expect(screen.getByRole("main")).toHaveClass(
+      "px-(--page-gutter)",
+      "[--page-gutter:1rem]",
+      "sm:[--page-gutter:1.5rem]",
+      "lg:[--page-gutter:2rem]",
+      "xl:[--page-gutter:2.5rem]",
+    );
+  });
+});
+
+describe("AdminLayout page title", () => {
+  // The tab title, the route-change announcement and the phone header all read
+  // this name, so a renamed route must not fall back to the generic "Admin"
+  // (which the phone header shows as "Dashboard").
+  it("names the Home rows page in the tab and the phone header", () => {
+    renderAdmin("/admin/home-rows");
+
+    expect(document.title).toBe("Admin Home rows · Silo");
+    expect(screen.getByText("Home rows")).toBeInTheDocument();
+    expect(screen.queryByText("Dashboard")).not.toBeInTheDocument();
   });
 });
 
