@@ -296,3 +296,86 @@ func TestDeferredPublishRetryInsertHonorsPendingBound(t *testing.T) {
 		t.Fatal("retry insert at the bound did not set the overflow rescan flag")
 	}
 }
+
+// TestDeferredPublishFailedAcquisitionReparkHonorsPendingBound is the regression
+// for the failed-acquisition repark bypassing the pending cap. Selection deletes
+// the winner from the map BEFORE the gate claim, so the freed slot can be refilled
+// by a concurrent park while the batch is between selection and the failed
+// acquisition; an unconditional reinsert would then grow the map past its bound.
+// The test drives the real production steps: selectDeferredPublishCandidate
+// deletes the seeded entry, a concurrent park refills the freed slot to the cap,
+// the saturated gate makes takeDeferredPublishSlot fail, and the repark must
+// retain the intent through the rescan flag instead of inserting a cap+1'th entry.
+func TestDeferredPublishFailedAcquisitionReparkHonorsPendingBound(t *testing.T) {
+	h := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	const selected = "selected-session"
+	h.deferredPublishPending = map[string]deferredPublishIntent{
+		selected: {fileID: 4242, generation: 2},
+	}
+	releaseGate := holdDetachedGate(t, h)
+	defer releaseGate()
+
+	// Production selection deletes the winner before the gate claim, leaving its
+	// slot free.
+	id, intent, found := h.selectDeferredPublishCandidate()
+	if !found || id != selected {
+		t.Fatalf("selection = (%q, found=%v), want the seeded session", id, found)
+	}
+	if _, still := h.deferredPublishPending[selected]; still {
+		t.Fatal("selection did not delete the entry before the gate claim")
+	}
+
+	// The freed slot is refilled by a concurrent park, so the map is back at its
+	// cap when the failed acquisition runs.
+	h.deferredPublishMu.Lock()
+	for i := 0; i < virtualDeferredPublishPendingCap; i++ {
+		h.deferredPublishPending[fmt.Sprintf("filler-%d", i)] = deferredPublishIntent{fileID: i + 1, generation: 1}
+	}
+	h.deferredPublishMu.Unlock()
+
+	// The gate is fully held, so the claim fails and the batch repark runs.
+	claimed, _ := h.takeDeferredPublishSlot(id, intent)
+	if claimed {
+		t.Fatal("slot claim succeeded against a saturated gate; the regression path was not exercised")
+	}
+	h.deferredPublishMu.Lock()
+	h.reparkDeferredPublishSelectedLocked(id, intent)
+	h.deferredPublishMu.Unlock()
+
+	if _, exists := h.deferredPublishPending[selected]; exists {
+		t.Fatal("failed-acquisition repark grew the pending map past its bound")
+	}
+	if len(h.deferredPublishPending) != virtualDeferredPublishPendingCap {
+		t.Fatalf("pending map size = %d, want the bound %d", len(h.deferredPublishPending), virtualDeferredPublishPendingCap)
+	}
+	if !h.deferredPublishRescan {
+		t.Fatal("failed-acquisition repark at the bound did not set the overflow rescan flag")
+	}
+}
+
+// TestDeferredPublishFailedAcquisitionReparkDoesNotCountAsRetry proves the
+// failed-acquisition repark preserves the intent's schedule: a saturated gate is
+// backpressure, not a failed publish, so the reinsert must NOT increment the retry
+// attempt count or set a not-before backoff (unlike the retryable-outcome repark,
+// which does both). With room in the map the selected intent is stored as-is.
+func TestDeferredPublishFailedAcquisitionReparkDoesNotCountAsRetry(t *testing.T) {
+	h := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+
+	h.deferredPublishMu.Lock()
+	h.reparkDeferredPublishSelectedLocked("session-a", deferredPublishIntent{fileID: 7, generation: 3})
+	h.deferredPublishMu.Unlock()
+
+	stored, parked := h.deferredPublishPending["session-a"]
+	if !parked {
+		t.Fatal("failed-acquisition repark with room did not park the intent")
+	}
+	if stored.attempts != 0 {
+		t.Fatalf("failed-acquisition repark bumped the retry attempt count to %d; a saturated gate must not count as a failed publish", stored.attempts)
+	}
+	if !stored.notBefore.IsZero() {
+		t.Fatalf("failed-acquisition repark set a retry backoff at %v; a saturated gate is not a failed publish", stored.notBefore)
+	}
+	if h.deferredPublishRescan {
+		t.Fatal("failed-acquisition repark set the rescan flag with room available")
+	}
+}
