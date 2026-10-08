@@ -64,6 +64,18 @@ func TestLogRunFailureRecordsTheCauseWithoutCredentials(t *testing.T) {
 		t.Errorf("log line %q contains the credential", line)
 	}
 
+	// A credential nested inside a non-secret assignment is masked and the
+	// rest of the failure stays readable.
+	out.Reset()
+	logRunFailure(context.Background(), logger, RunClaim{RunID: "run-nested"}, errors.New("rpc error: code = Unauthenticated desc = api_key=FAKE_FIXTURE_SECRET rejected"))
+	line = out.String()
+	if strings.Contains(line, "FAKE_FIXTURE_SECRET") {
+		t.Errorf("log line %q contains the nested credential", line)
+	}
+	if !strings.Contains(line, "Unauthenticated") || !strings.Contains(line, "rejected") {
+		t.Errorf("log line %q lost the underlying failure", line)
+	}
+
 	// A request URL loses its whole query, including credentials under names
 	// the text masking does not know.
 	out.Reset()
