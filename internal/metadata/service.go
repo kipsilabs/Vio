@@ -3034,19 +3034,19 @@ func (s *MetadataService) refreshTarget(ctx context.Context, targetType, content
 	case RefreshTargetItem:
 		return s.refreshItemTarget(ctx, contentID, folderID, mode, incrementDebtAttempt)
 	case RefreshTargetSeason:
-		err := s.refreshSeasonTarget(ctx, contentID, folderID, mode)
+		seriesID, err := s.refreshSeasonTarget(ctx, contentID, folderID, mode)
 		if err != nil {
 			s.recordRefreshTargetFailure(ctx, targetType, contentID, err, incrementDebtAttempt)
 			return err
 		}
-		return s.syncRefreshDebtForTargetOrDefer(ctx, targetType, contentID)
+		return s.syncRefreshDebtForTargetOrDefer(ctx, targetType, contentID, seriesID)
 	case RefreshTargetEpisode:
-		err := s.refreshEpisodeTarget(ctx, contentID, folderID, mode)
+		seriesID, err := s.refreshEpisodeTarget(ctx, contentID, folderID, mode)
 		if err != nil {
 			s.recordRefreshTargetFailure(ctx, targetType, contentID, err, incrementDebtAttempt)
 			return err
 		}
-		return s.syncRefreshDebtForTargetOrDefer(ctx, targetType, contentID)
+		return s.syncRefreshDebtForTargetOrDefer(ctx, targetType, contentID, seriesID)
 	default:
 		return fmt.Errorf("unsupported metadata refresh target type %q", targetType)
 	}
@@ -3908,26 +3908,28 @@ func itemHasEpisodeMetadataDebt(item *models.MediaItem) bool {
 		item.EpisodeMetadataIncomplete
 }
 
-func (s *MetadataService) refreshSeasonTarget(ctx context.Context, seasonID string, folderID int, mode RefreshMode) error {
+// refreshSeasonTarget refreshes one season and reports the series it belongs to.
+func (s *MetadataService) refreshSeasonTarget(ctx context.Context, seasonID string, folderID int, mode RefreshMode) (string, error) {
 	if s == nil || s.seasonRepo == nil {
-		return ErrMetadataNotFound
+		return "", ErrMetadataNotFound
 	}
 	season, err := s.seasonRepo.GetByID(ctx, seasonID)
 	if err != nil {
-		return err
+		return "", err
 	}
-	return s.refreshSeriesChildTarget(ctx, season.SeriesID, season.SeasonNumber, 0, folderID, mode)
+	return season.SeriesID, s.refreshSeriesChildTarget(ctx, season.SeriesID, season.SeasonNumber, 0, folderID, mode)
 }
 
-func (s *MetadataService) refreshEpisodeTarget(ctx context.Context, episodeID string, folderID int, mode RefreshMode) error {
+// refreshEpisodeTarget refreshes one episode and reports the series it belongs to.
+func (s *MetadataService) refreshEpisodeTarget(ctx context.Context, episodeID string, folderID int, mode RefreshMode) (string, error) {
 	if s == nil || s.episodeRepo == nil {
-		return ErrMetadataNotFound
+		return "", ErrMetadataNotFound
 	}
 	episode, err := s.episodeRepo.GetByID(ctx, episodeID)
 	if err != nil {
-		return err
+		return "", err
 	}
-	return s.refreshSeriesChildTarget(ctx, episode.SeriesID, episode.SeasonNumber, episode.EpisodeNumber, folderID, mode)
+	return episode.SeriesID, s.refreshSeriesChildTarget(ctx, episode.SeriesID, episode.SeasonNumber, episode.EpisodeNumber, folderID, mode)
 }
 
 func (s *MetadataService) refreshSeriesChildTarget(
@@ -6028,9 +6030,12 @@ func (s *MetadataService) updateEpisodeMetadataState(ctx context.Context, series
 	}
 }
 
-func (s *MetadataService) refreshSeriesEpisodeMetadataState(ctx context.Context, seriesID string, now time.Time) {
+// refreshSeriesEpisodeMetadataState re-syncs the series' episode refresh debt
+// and incomplete flag. It reports false when it could not read the series'
+// debt or episodes; failures on single rows are logged and do not count.
+func (s *MetadataService) refreshSeriesEpisodeMetadataState(ctx context.Context, seriesID string, now time.Time) bool {
 	if s == nil || s.episodeRepo == nil {
-		return
+		return true
 	}
 
 	// Observe debt versions before reading completeness so a concurrent refresh's
@@ -6042,7 +6047,7 @@ func (s *MetadataService) refreshSeriesEpisodeMetadataState(ctx context.Context,
 		if err != nil {
 			slog.WarnContext(ctx, "metadata: failed to snapshot episode refresh debt", "component", "metadata",
 				"series_id", seriesID, "error", err)
-			return
+			return false
 		}
 	}
 
@@ -6050,7 +6055,7 @@ func (s *MetadataService) refreshSeriesEpisodeMetadataState(ctx context.Context,
 	if err != nil {
 		slog.WarnContext(ctx, "metadata: failed to list series episodes for completeness check", "component", "metadata",
 			"series_id", seriesID, "error", err)
-		return
+		return false
 	}
 
 	// Episode targets that failed during a scheduled refresh batch keep the
@@ -6095,6 +6100,7 @@ func (s *MetadataService) refreshSeriesEpisodeMetadataState(ctx context.Context,
 	}
 
 	s.updateEpisodeMetadataState(ctx, seriesID, len(actionableEpisodes) > 0 || keptActionable, new(now))
+	return true
 }
 
 func (s *MetadataService) syncVisibleEpisodeRefreshDebt(ctx context.Context, episode *models.Episode, now time.Time) error {

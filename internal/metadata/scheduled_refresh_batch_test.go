@@ -517,3 +517,28 @@ func TestTargetRefreshSyncsSeriesOnALiveContextAfterItsOwnCancellation(t *testin
 		t.Fatalf("series link passes = %v, want one on a live context for the rows the first language wrote", linkCtxErrs)
 	}
 }
+
+func TestScheduledRefreshBatchLeavesTargetDebtClaimedWhenItsSeriesSyncFails(t *testing.T) {
+	h, _, _, _, _ := seedSeriesSyncCounters(t)
+	debts := &targetDebtSyncCountingRepo{
+		sweepCountingRefreshDebtRepo: newSweepCountingRefreshDebtRepo(),
+		contentID:                    "episode-s05e03",
+	}
+	h.service.refreshDebtRepo = debts
+	h.service.hooks.ensureSeriesEpisodeLinks = func(context.Context, string) error {
+		return errors.New("link pass failed")
+	}
+	ctx := context.Background()
+
+	batchCtx, flush := h.service.BeginScheduledRefreshBatch(ctx)
+	if err := h.service.RefreshScheduledTarget(batchCtx, RefreshTargetEpisode, "episode-s05e03"); err != nil {
+		t.Fatalf("RefreshScheduledTarget: %v", err)
+	}
+	flush(ctx)
+
+	// The files the refresh could have linked are still unlinked, so the row
+	// must stay claimed for the next claim after its lease to retry.
+	if got := debts.settled.Load(); got != 0 {
+		t.Fatalf("target debt writes after a failed series sync = %d, want 0", got)
+	}
+}

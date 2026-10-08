@@ -35,6 +35,14 @@ type RefreshCandidateFinder interface {
 	FindCandidates(ctx context.Context, limit int) ([]worker.RefreshCandidate, error)
 }
 
+// RefreshClaimRenewer is implemented by finders whose claims expire. The task
+// renews a batch's claims until the batch, including its flush, has finished,
+// so a long batch keeps the rows it has not settled yet.
+type RefreshClaimRenewer interface {
+	RenewClaims(ctx context.Context, candidates []worker.RefreshCandidate) error
+	ClaimRenewInterval() time.Duration
+}
+
 type RefreshDebtPruner interface {
 	PruneDisabledLibraryDebt(ctx context.Context) error
 }
@@ -138,6 +146,11 @@ func (t *RefreshMetadataTask) refreshBatch(
 		workerCount = len(candidates)
 	}
 
+	// Deferred calls run in reverse, so the claims stay renewed through the flush.
+	if renewer, ok := t.finder.(RefreshClaimRenewer); ok {
+		defer renewRefreshClaims(ctx, renewer, candidates)()
+	}
+
 	// Every return below happens after the workers have stopped, so the
 	// deferred flush sees the whole batch's refreshes.
 	itemParent := ctx
@@ -231,4 +244,35 @@ func (t *RefreshMetadataTask) refreshBatch(
 		return refreshed, errored, ctx.Err()
 	}
 	return refreshed, errored, nil
+}
+
+// renewRefreshClaims renews the batch's claims on the renewer's interval until
+// the returned stop function is called or ctx is done.
+func renewRefreshClaims(ctx context.Context, renewer RefreshClaimRenewer, candidates []worker.RefreshCandidate) func() {
+	interval := renewer.ClaimRenewInterval()
+	if interval <= 0 || len(candidates) == 0 {
+		return func() {}
+	}
+	renewCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-renewCtx.Done():
+				return
+			case <-ticker.C:
+				if err := renewer.RenewClaims(renewCtx, candidates); err != nil && renewCtx.Err() == nil {
+					slog.WarnContext(renewCtx, "refresh task: failed to renew claims", "component", "taskmanager",
+						"claims", len(candidates), "error", err)
+				}
+			}
+		}
+	}()
+	return func() {
+		cancel()
+		<-done
+	}
 }

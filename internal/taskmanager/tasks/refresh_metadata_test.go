@@ -3,9 +3,11 @@ package tasks
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Silo-Server/silo-server/internal/metadata"
 	"github.com/Silo-Server/silo-server/internal/worker"
@@ -237,5 +239,83 @@ func TestRefreshMetadataTask_FlushesACanceledBatch(t *testing.T) {
 	}
 	if len(refresher.flushErrs) != 1 || refresher.flushErrs[0] == nil {
 		t.Fatalf("flush context errors = %v, want one canceled flush", refresher.flushErrs)
+	}
+}
+
+// The production finder must keep satisfying the optional renewal interface;
+// a silent mismatch would let long batches outlive their claims.
+var _ RefreshClaimRenewer = (*worker.RefreshWorker)(nil)
+
+// renewingCandidateFinder reports each claim renewal on a channel.
+type renewingCandidateFinder struct {
+	fakeRefreshCandidateFinder
+	renewals chan []worker.RefreshCandidate
+}
+
+func (f *renewingCandidateFinder) RenewClaims(_ context.Context, candidates []worker.RefreshCandidate) error {
+	select {
+	case f.renewals <- candidates:
+	default:
+	}
+	return nil
+}
+
+func (f *renewingCandidateFinder) ClaimRenewInterval() time.Duration { return time.Millisecond }
+
+// renewalWaitingRefresher holds each refresh and the flush until a claim
+// renewal arrives, standing in for a batch that outlasts one claim lease.
+type renewalWaitingRefresher struct {
+	batchingMetadataRefresher
+	renewals    <-chan []worker.RefreshCandidate
+	flushRenews int
+}
+
+func (f *renewalWaitingRefresher) waitForRenewal() bool {
+	select {
+	case <-f.renewals:
+		return true
+	case <-time.After(5 * time.Second):
+		return false
+	}
+}
+
+func (f *renewalWaitingRefresher) BeginScheduledRefreshBatch(ctx context.Context) (context.Context, func(context.Context)) {
+	batchCtx, flush := f.batchingMetadataRefresher.BeginScheduledRefreshBatch(ctx)
+	return batchCtx, func(flushCtx context.Context) {
+		if f.waitForRenewal() {
+			f.flushRenews++
+		}
+		flush(flushCtx)
+	}
+}
+
+func (f *renewalWaitingRefresher) RefreshScheduledTarget(ctx context.Context, targetType, contentID string) error {
+	if !f.waitForRenewal() {
+		return errors.New("no claim renewal while the target was refreshing")
+	}
+	return f.batchingMetadataRefresher.RefreshScheduledTarget(ctx, targetType, contentID)
+}
+
+func TestRefreshMetadataTask_RenewsClaimsThroughTheFlush(t *testing.T) {
+	candidates := []worker.RefreshCandidate{
+		{TargetType: "episode", ContentID: "episode-1", ClaimedAt: time.Unix(100, 0)},
+		{TargetType: "season", ContentID: "season-1", ClaimedAt: time.Unix(100, 0)},
+	}
+	finder := &renewingCandidateFinder{
+		fakeRefreshCandidateFinder: fakeRefreshCandidateFinder{batches: [][]worker.RefreshCandidate{candidates}},
+		renewals:                   make(chan []worker.RefreshCandidate),
+	}
+	refresher := &renewalWaitingRefresher{renewals: finder.renewals}
+	task := NewRefreshMetadataTask(finder, refresher)
+
+	if err := task.Execute(context.Background(), noopProgressReporter{}); err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+
+	if got := len(refresher.Calls()); got != len(candidates) {
+		t.Fatalf("refreshed targets = %d, want %d each renewed while refreshing", got, len(candidates))
+	}
+	if refresher.flushRenews != 1 {
+		t.Fatal("claims were not renewed while the batch flushed")
 	}
 }
