@@ -87,6 +87,12 @@ func playbackPreflightOperationError(err error) error {
 	return playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to access source media file")
 }
 func playbackPersistenceOperationError(err error) error {
+	// A surface refusal raised by the terminal-save collision branch is already
+	// a concrete playback operation error; pass it through so a cross-surface
+	// replay is a 409 playback_attempt_reused rather than a generic 500.
+	if e, ok := errors.AsType[*PlaybackOperationError](err); ok {
+		return e
+	}
 	if errors.Is(err, playback.ErrIdempotencyKeyReusedV3) {
 		return playbackOperationError(http.StatusConflict, "playback_attempt_reused", "The playback attempt ID belongs to a different request")
 	}
@@ -242,27 +248,82 @@ func attemptNegotiatedSubRipV3(record *playback.AttemptRecordV3) bool {
 }
 
 // requireAttemptAPISurfaceV3 keeps an attempt on the API surface that
-// negotiated its SRT representation. /api/v1 must not continue an attempt that
-// negotiated original SRT: v1 would replay or replan its .srt?original=1 URLs,
-// including ones for tracks that appear later, on a route that serves WebVTT
-// for them. And a start retried through /api/v2 with subrip_sidecar_v1 must
-// not replay an attempt negotiated without it, which would break the feature's
-// promise. requested is the retried start's feature list; replans pass nil
-// because a replan keeps the negotiated representation anyway. The error
-// reuses the existing playback_attempt_reused code so /api/v1 gains no new
-// contract.
+// negotiated its SRT representation and its deferred track-inventory
+// lifecycle.
+//
+// SRT: /api/v1 must not continue an attempt that negotiated original SRT, since
+// v1 would replay or replan its .srt?original=1 URLs, including ones for tracks
+// that appear later, on a route that serves WebVTT for them. And a start
+// retried through /api/v2 with subrip_sidecar_v1 must not replay an attempt
+// negotiated without it, which would break the feature's promise.
+//
+// Deferred inventory: /api/v1 must not continue an attempt that negotiated
+// deferred_track_inventory_v1, because the shared PlanV3 serializes
+// tracks_pending and the session's pending/failed inventory is consumable only
+// through the v2 push and poll. And a start retried through /api/v2 with
+// deferred_track_inventory_v1 must not replay an attempt negotiated without
+// it: that client promised to keep its menu loading, but the attempt it would
+// adopt never defers, so it would wait for a follow-up that will never arrive.
+// The request digest excludes the API surface and does not carry these
+// features into its identity, so this guard is the only thing that stops the
+// same body from crossing surfaces.
+//
+// requested is the retried start's feature list; replans pass nil because a
+// replan keeps the negotiated representation anyway and never defers. The
+// error reuses the existing playback_attempt_reused code so /api/v1 gains no
+// new contract.
 func requireAttemptAPISurfaceV3(ctx context.Context, record *playback.AttemptRecordV3, requested []string) error {
 	if record == nil {
 		return nil
 	}
-	negotiated := attemptNegotiatedSubRipV3(record)
+	subrip := attemptNegotiatedSubRipV3(record)
+	deferred := attemptNegotiatedDeferTrackInventoryV3(record)
 	switch {
-	case !isNativeAPIV2(ctx) && negotiated:
+	case !isNativeAPIV2(ctx) && (subrip || deferred):
 		return playbackOperationError(http.StatusConflict, "playback_attempt_reused", "The playback attempt belongs to an /api/v2 session")
-	case isNativeAPIV2(ctx) && !negotiated && playback.HasFeatureV3(requested, playback.FeatureSubripSidecarV3):
+	case isNativeAPIV2(ctx) && !subrip && playback.HasFeatureV3(requested, playback.FeatureSubripSidecarV3):
 		return playbackOperationError(http.StatusConflict, "playback_attempt_reused", "The playback attempt was negotiated without subrip_sidecar_v1")
+	case isNativeAPIV2(ctx) && !deferred && playback.HasFeatureV3(requested, playback.FeatureDeferredTrackInventoryV3):
+		return playbackOperationError(http.StatusConflict, "playback_attempt_reused", "The playback attempt was negotiated without deferred_track_inventory_v1")
 	}
 	return nil
+}
+
+// deferTrackInventoryNegotiatedV3 reports whether this start may defer its full
+// track enumeration past the first-byte commit. Deferral is a new lifecycle
+// (the plan carries tracks_pending and the client waits for a follow-up
+// inventory_updated push or a poll of inventory_url), so it is scoped to the
+// surface and client that negotiated it:
+//
+//   - the request must arrive through /api/v2: the shared handler also serves
+//     the frozen /api/v1 bridge, whose contract must not grow tracks_pending;
+//   - the client must advertise deferred_track_inventory_v1 in its
+//     client_features. A v2 client that did not advertise it has no promise to
+//     handle a provisional menu, so it keeps the pre-#228 synchronous upgrade
+//     and never sees tracks_pending.
+//
+// Both are required; a missing either-way yields the unchanged pre-#228 path
+// (the candidate-declared upgrade probe runs in the background).
+func (h *PlaybackHandler) deferTrackInventoryNegotiatedV3(r *http.Request, req playback.StartRequestV3) bool {
+	if r == nil || !isNativeAPIV2(r.Context()) {
+		return false
+	}
+	return playback.HasFeatureV3(req.ClientFeatures, playback.FeatureDeferredTrackInventoryV3)
+}
+
+// attemptNegotiatedDeferTrackInventoryV3 reports whether an attempt negotiated
+// the deferred track-inventory lifecycle: the client sent
+// deferred_track_inventory_v1 and a decision of this server (the StartResponse)
+// offered it. Like attemptNegotiatedSubRipV3, the stored client token alone is
+// not enough on a v1 surface, where the server never advertised the feature.
+// It is the durable test the deferred failed-notification fan-out uses to
+// decide whether a session's client can consume a terminal failed inventory.
+func attemptNegotiatedDeferTrackInventoryV3(record *playback.AttemptRecordV3) bool {
+	if record == nil {
+		return false
+	}
+	return playback.HasFeatureV3(record.NormalizedRequest.ClientFeatures, playback.FeatureDeferredTrackInventoryV3) &&
+		playback.HasFeatureV3(record.StartResponse.ServerFeatures, playback.FeatureDeferredTrackInventoryV3)
 }
 
 // replanSubtitleFeaturesV3 returns the client features a replan attaches its
@@ -896,6 +957,23 @@ func (h *PlaybackHandler) playbackInventoryForFileV3(ctx context.Context, sessio
 	status := string(ProbeProvenanceDeclared)
 	if file != nil && file.ProbeUpdatedAt != nil {
 		status = string(ProbeProvenanceVerified)
+	} else {
+		// No probe stamp on the effective row. A deferred full-track
+		// enumeration may be outstanding, may have committed its evidence
+		// without a stamp, or may have terminally failed; the session carries
+		// that disposition so an inventory reader can tell an unfinished probe
+		// from a finished or failed one and leave the loading state either way.
+		// Only the verified stamp outranks this, because it is the row's own
+		// committed evidence; a verified outcome means the probe's durable write
+		// committed, so the client may also stop treating the menu as loading.
+		switch session.VirtualProbeOutcome {
+		case probeOutcomePending:
+			status = probeOutcomePending
+		case probeOutcomeVerified:
+			status = string(ProbeProvenanceVerified)
+		case probeOutcomeFailed:
+			status = string(ProbeProvenanceFailed)
+		}
 	}
 
 	effectiveFileID := 0
@@ -903,7 +981,8 @@ func (h *PlaybackHandler) playbackInventoryForFileV3(ctx context.Context, sessio
 		effectiveFileID = file.ID
 	}
 	// Include the effective source in the revision so a rotation to a sibling
-	// with an identical inventory still changes the ETag the poll compares.
+	// with an identical inventory still changes the revision the inventory
+	// endpoint returns (and therefore the ETag it emits from it).
 	revision := playback.ComputeInventoryRevisionV3(status, audioTracks, subtitleInventory, playback.InventorySourceIdentityV3{
 		EffectiveMediaFileID:  effectiveFileID,
 		EffectiveVirtualURI:   effectiveVirtualURI,
@@ -1226,6 +1305,28 @@ type inventoryPublishSummary struct {
 	Revision         string
 }
 
+// inventoryPublishResult classifies one session-targeted publish attempt for the
+// deferred-probe dispatcher. The dispatcher acknowledges a notification once its
+// publish attempt completes, so it must know whether an attempt that delivered
+// nothing means the notification is done (obsolete) or must be retried: a
+// transient catalog or plan-store read, or a realtime write that could not reach
+// the client, is retryable and must not advance the delivered watermark, or a
+// push-only client would be left loading forever with no reconnect or poll to
+// rescue it.
+type inventoryPublishResult int
+
+const (
+	// inventoryPublishRetryable: the attempt could not deliver for a transient
+	// reason; the notification is still owed and the dispatcher must re-park it.
+	inventoryPublishRetryable inventoryPublishResult = iota
+	// inventoryPublishDelivered: an inventory_updated event reached the session.
+	inventoryPublishDelivered
+	// inventoryPublishObsolete: the notification no longer needs to be delivered
+	// (the session ended, moved, never negotiated the lifecycle, or already
+	// carries the status); ack it so the overflow rescan converges.
+	inventoryPublishObsolete
+)
+
 // PublishInventoryUpdated pushes the probe-verified track inventory to every
 // live realtime session currently playing fileID. It is invoked from the
 // background probe's persistence points — the local start-path repair and the
@@ -1240,6 +1341,12 @@ type inventoryPublishSummary struct {
 // a declared inventory is what the client already holds, so re-sending it would
 // be noise. The payload carries the session's inventory revision so a client
 // gates duplicates and out-of-order pushes.
+//
+// This file-wide fan-out is for catalog-evidence callers whose evidence commit
+// concerns every session on the file. Per-session terminal notifications (the
+// deferred-probe dispatcher) must use PublishInventoryUpdatedToSession instead:
+// they ack delivery per session and per binding generation, so pushing sibling
+// sessions on the same file would break their exactly-once accounting.
 func (h *PlaybackHandler) PublishInventoryUpdated(ctx context.Context, fileID int) inventoryPublishSummary {
 	summary := inventoryPublishSummary{FileID: fileID}
 	if h == nil || h.RealtimeHub == nil || fileID <= 0 {
@@ -1258,13 +1365,62 @@ func (h *PlaybackHandler) PublishInventoryUpdated(ctx context.Context, fileID in
 		if session == nil || session.ID == "" || !session.HasRealtimeConnection {
 			continue
 		}
-		revision, delivered := h.publishInventoryUpdatedToSession(publishCtx, session, 0, "", nil)
-		if delivered {
+		revision, result := h.publishInventoryUpdatedToSession(publishCtx, session, 0, "", nil)
+		if result == inventoryPublishDelivered {
 			summary.SessionsNotified++
 			summary.Revision = revision
 		}
 	}
 	return summary
+}
+
+// PublishInventoryUpdatedToSession pushes the committed track inventory to one
+// specific session, in contrast to PublishInventoryUpdated's file-wide fan-out.
+// It exists for the deferred-probe terminal-notification path: that machinery
+// acknowledges delivery per session and per binding generation, so pushing a
+// sibling session that happens to play the same file would deliver an event the
+// sibling never acked — and ack this session's generation against a push the
+// sibling also received, breaking exactly-once for both. The payload is built by
+// the same publishInventoryUpdatedToSession the fan-out uses (and the realtime
+// hello republish targets directly), so the delivered inventory is identical;
+// only the recipient set differs. fileID is the intent's recorded file, used
+// only to skip the send when the session no longer serves that file; the payload
+// itself is always resolved from the live session. It returns the delivery
+// summary and the disposition, so the deferred dispatcher can ack a delivered or
+// obsolete notification and re-park a retryable one. An unknown, ended, or
+// realtime-less session is obsolete, not an error.
+func (h *PlaybackHandler) PublishInventoryUpdatedToSession(ctx context.Context, sessionID string, fileID int) (inventoryPublishSummary, inventoryPublishResult) {
+	summary := inventoryPublishSummary{FileID: fileID}
+	if h == nil || h.RealtimeHub == nil || sessionID == "" {
+		return summary, inventoryPublishObsolete
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	session, err := h.sessionMgr.GetSession(sessionID)
+	if err != nil || session == nil {
+		return summary, inventoryPublishObsolete
+	}
+	if !session.HasRealtimeConnection {
+		// A session that has no realtime connection now may attach later; the
+		// hello republish delivers the live inventory then, so this notification
+		// is obsolete rather than retryable and the dispatcher must not spin.
+		return summary, inventoryPublishObsolete
+	}
+	// The intent was parked against a file the session served at park time. A
+	// session that moved to a different file since then is absent from this
+	// notification's scope; the move's own lifecycle carries its own push.
+	if fileID > 0 && session.MediaFileID != fileID && session.RequestedMediaFileID != fileID {
+		return summary, inventoryPublishObsolete
+	}
+	publishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), inventoryUpdatedPublishBudget)
+	defer cancel()
+	revision, result := h.publishInventoryUpdatedToSession(publishCtx, session, 0, "", nil)
+	if result == inventoryPublishDelivered {
+		summary.SessionsNotified++
+		summary.Revision = revision
+	}
+	return summary, result
 }
 
 // publishRefusedProbeInventory serves probe evidence that the identity guard
@@ -1297,7 +1453,7 @@ func (h *PlaybackHandler) publishRefusedProbeInventory(ctx context.Context, file
 		if session == nil || session.ID == "" || !session.HasRealtimeConnection {
 			continue
 		}
-		if _, delivered := h.publishInventoryUpdatedToSession(publishCtx, session, fileID, candidateURI, probed); delivered {
+		if _, result := h.publishInventoryUpdatedToSession(publishCtx, session, fileID, candidateURI, probed); result == inventoryPublishDelivered {
 			notified++
 		}
 	}
@@ -1413,9 +1569,12 @@ func (h *PlaybackHandler) sessionWithSourceGeneration(sessionID string) (*playba
 // release — and only that row — it probed without being shown to a session
 // playing a different row or a sibling that shares the candidate URI.
 //
-// It returns the delivered revision and whether an event was actually sent, so
-// the caller can log delivery without re-deriving it.
-func (h *PlaybackHandler) publishInventoryUpdatedToSession(ctx context.Context, session *playback.Session, probedFileID int, candidateURI string, probed *models.MediaFile) (string, bool) {
+// It returns the delivered revision and a disposition, so the caller can log
+// delivery and, for the deferred-probe dispatcher, decide whether a notification
+// that delivered nothing is obsolete or still owed. The bool-returning callers
+// treat anything other than inventoryPublishDelivered as "no event was sent",
+// which is the pre-existing best-effort contract.
+func (h *PlaybackHandler) publishInventoryUpdatedToSession(ctx context.Context, session *playback.Session, probedFileID int, candidateURI string, probed *models.MediaFile) (string, inventoryPublishResult) {
 	// Two background probes (a start-path repair and a virtual-evidence worker)
 	// can publish for the same session concurrently. Serialize the build and
 	// the send under the session's per-session lock so an older build cannot be
@@ -1438,7 +1597,7 @@ func (h *PlaybackHandler) publishInventoryUpdatedToSession(ctx context.Context, 
 	generation, hasGeneration := h.inventorySourceGeneration(session.ID)
 	live, err := h.sessionMgr.GetSession(session.ID)
 	if err != nil || live == nil {
-		return "", false
+		return "", inventoryPublishObsolete
 	}
 	if refreshed, gen, ok := h.sessionWithSourceGeneration(session.ID); ok {
 		live = refreshed
@@ -1446,9 +1605,12 @@ func (h *PlaybackHandler) publishInventoryUpdatedToSession(ctx context.Context, 
 		hasGeneration = true
 	}
 	var record *playback.AttemptRecordV3
+	recordReadFailed := false
 	if h.PlanStoreV3 != nil {
 		if loaded, err := h.PlanStoreV3.GetAttempt(ctx, session.ID); err == nil {
 			record = loaded
+		} else {
+			recordReadFailed = true
 		}
 	}
 	var inventory playback.PlaybackInventoryV3
@@ -1464,36 +1626,72 @@ func (h *PlaybackHandler) publishInventoryUpdatedToSession(ctx context.Context, 
 	if err != nil {
 		slog.DebugContext(ctx, "inventory updated event skipped: inventory unavailable",
 			"component", "playback", "session", session.ID, "error", err)
-		return "", false
+		// The inventory could not be built (a transient catalog read). The
+		// notification is still owed, so the dispatcher re-parks it rather than
+		// acking an undelivered terminal status.
+		return "", inventoryPublishRetryable
 	}
-	if inventory.InventoryStatus != string(ProbeProvenanceVerified) {
-		// The probe has not upgraded this session's bound release, so the client
-		// already holds exactly this declared inventory.
-		return inventory.InventoryRevision, false
+	if inventory.InventoryStatus != string(ProbeProvenanceVerified) && inventory.InventoryStatus != string(ProbeProvenanceFailed) {
+		// The probe has not upgraded this session's bound release and no
+		// deferred probe has terminally failed, so the client already holds
+		// exactly this declared inventory. A failed status is new information —
+		// it ends the deferred loading state — so it is pushed.
+		return inventory.InventoryRevision, inventoryPublishObsolete
+	}
+	if inventory.InventoryStatus == string(ProbeProvenanceFailed) &&
+		(record == nil || !attemptNegotiatedDeferTrackInventoryV3(record)) {
+		// A "failed" inventory is the deferred lifecycle's terminal signal: it
+		// tells a client that negotiated deferred_track_inventory_v1 to leave
+		// its provisional (tracks_pending) loading state. A session that did
+		// not negotiate the lifecycle was never promised a provisional menu, so
+		// a failed status is meaningless to it and must not be delivered. The
+		// deferral gate already keeps such sessions out of the lifecycle; this
+		// is the delivery-side guard that keeps a failed push from ever
+		// reaching a session whose attempt did not negotiate.
+		//
+		// A nil record here is one of two things. A plan-store read failure
+		// (production always wires a store) means the negotiation cannot be
+		// established right now: suppress the push but report it retryable so
+		// the deferred dispatcher re-parks the notification instead of acking
+		// an undelivered terminal status — otherwise a push-only client would
+		// be left loading with neither a reconnect nor a poll to rescue it. A
+		// store-less handler (a minimal test double) has no recovery path, so
+		// it stays obsolete and the pre-existing best-effort behavior holds.
+		// Verified pushes are untouched: they are the pre-existing background
+		// upgrade any session may receive.
+		if recordReadFailed {
+			return inventory.InventoryRevision, inventoryPublishRetryable
+		}
+		return inventory.InventoryRevision, inventoryPublishObsolete
 	}
 	if hasGeneration {
 		if current, ok := h.inventorySourceGeneration(session.ID); !ok || current != generation {
 			slog.DebugContext(ctx, "inventory updated event skipped: source binding moved while building",
 				"component", "playback", "session", session.ID, "built_generation", generation)
-			return inventory.InventoryRevision, false
+			// A newer binding owns its own lifecycle; the notification for the
+			// superseded one must not be retried against it.
+			return inventory.InventoryRevision, inventoryPublishObsolete
 		}
 	}
 	event, err := playback.NewInventoryUpdatedEvent(session.ID, inventory)
 	if err != nil {
 		slog.WarnContext(ctx, "failed to encode inventory updated realtime event",
 			"component", "playback", "session", session.ID, "error", err)
-		return inventory.InventoryRevision, false
+		return inventory.InventoryRevision, inventoryPublishRetryable
 	}
 	if err := h.RealtimeHub.Send(session.ID, event); err != nil {
 		if !errors.Is(err, playback.ErrRealtimeConnectionNotFound) {
 			slog.WarnContext(ctx, "failed to deliver inventory updated realtime event",
 				"component", "playback", "session", session.ID, "error", err)
+			// A real write failure may clear; the notification is still owed.
+			return inventory.InventoryRevision, inventoryPublishRetryable
 		}
 		// A session without a realtime connection received nothing; do not
-		// count it as notified.
-		return inventory.InventoryRevision, false
+		// count it as notified. The hello republish delivers once it attaches,
+		// so the notification is obsolete rather than retryable.
+		return inventory.InventoryRevision, inventoryPublishObsolete
 	}
-	return inventory.InventoryRevision, true
+	return inventory.InventoryRevision, inventoryPublishDelivered
 }
 
 // AudioReconciliationReasonV3 names the automatic default-audio

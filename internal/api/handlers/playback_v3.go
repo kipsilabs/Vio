@@ -1846,6 +1846,10 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	// (dedup keeper, rotation, sibling); the plan's effective_media_file_id
 	// must name that row so the substitution is visible to the client.
 	resolvedEffectiveFileID := 0
+	// resolved holds the virtual resolver's result when this start took the
+	// virtual path. It is kept so the post-commit spawn can read the deferred
+	// probe the resolve handed back (see resolved.DeferredProbe).
+	var resolved resolvedVirtualPlaybackSource
 	// Virtual sources are provider-neutral URIs, not FFmpeg inputs. Resolve and
 	// probe them through the virtual provider before the generic probe repair
 	// path, which only understands local/HTTP media files.
@@ -1869,8 +1873,9 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		// request handed to the walk, which threads it (rather than forcing it)
 		// so the stale-pin recovery may re-pin here while a future session-bound
 		// caller reusing the walk keeps its own binding intent and refuses.
+		var resolveErr error
 		walkSourceReq := r.WithContext(withVirtualSessionBindingV3(r.Context(), false))
-		resolved, resolveErr := h.resolveVirtualStartWithVersionFallback(walkSourceReq, requestedFile, profileID, req, allowFailedCandidate, intOrZeroHandlerV3(req.BandwidthCapKbps))
+		resolved, resolveErr = h.resolveVirtualStartWithVersionFallback(walkSourceReq, requestedFile, profileID, req, allowFailedCandidate, intOrZeroHandlerV3(req.BandwidthCapKbps))
 		if resolveErr != nil {
 			// A confirmed-dead pinned release is indicted here so a retry does
 			// not re-resolve it; an empty provider listing is not a verdict and
@@ -2296,6 +2301,31 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	// remux/transcode ffmpeg is started lazily by StreamHandler on the first
 	// request, so no transport spawn or manifest wait is included here. The
 	// mark only covers an eager local HLS/transcode startup for HLS deliveries.
+	// The fresh-start resolve deferred its full audio/subtitle enumeration and
+	// handed back the probe to run once the transport has committed. Mark the
+	// plan provisional now, before the transport commit and before the attempt
+	// record is written, so an idempotent replay of this attempt republishes the
+	// same provisional truth instead of appearing fully probed.
+	if resolved.DeferredProbe != nil && result.Plan != nil {
+		result.Plan.TracksPending = true
+	}
+	// enqueueDeferredPostCommitProbe runs the fresh-start resolve's deferred
+	// audio/subtitle enumeration once a transport has committed and the
+	// first-byte URL is on the response. It is shared by the main start and the
+	// same-release transient transport retry so a plan marked tracks_pending
+	// always gets the follow-up it promises. The probe is admitted into the
+	// bounded deferred-probe pool; a full pool or a saturated detached gate is
+	// backpressure that leaves the session in the pending state, never a
+	// synchronous probe on the response path.
+	enqueueDeferredPostCommitProbe := func(sessionID string) {
+		deferred := resolved.DeferredProbe
+		if deferred == nil {
+			return
+		}
+		deferred.sessionID = sessionID
+		timings.mark("post_commit_probe_scheduled")
+		h.enqueueDeferredVirtualProbeV3(r.Context(), deferred)
+	}
 	response, statusErr := h.startPlannedPlaybackV3(r, userID, profileID, req, requestDigests, requestedFile, effectiveFile, audioIndex, virtualDecision, result, clientInfo, virtualDecision.substitutionReason)
 	timings.mark("session_transport_commit")
 	if statusErr != nil {
@@ -2335,6 +2365,9 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 			if retriedResponse, retried := h.recoverVirtualTransportSameReleaseV3(r.Context(), playback.IsTransientProviderError(statusErr.cause), func(retryCtx context.Context) (playback.DecisionResponseV3, *transportErrorV3) {
 				return h.startPlannedPlaybackV3(r.WithContext(retryCtx), userID, profileID, req, requestDigests, requestedFile, effectiveFile, audioIndex, virtualDecision, result, clientInfo)
 			}); retried {
+				// The retry committed a transport for the same deferred plan, so
+				// run the enumeration it still promises before returning.
+				enqueueDeferredPostCommitProbe(retriedResponse.SessionID)
 				return retriedResponse, nil
 			}
 			alternateOrder := alternateOrderingForClient(req.Capabilities)
@@ -2413,6 +2446,13 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		}
 		return persistedResponse, nil
 	}
+	// The transport has committed and the first-byte URL is on the response.
+	// The fresh-start resolve deferred its full audio/subtitle enumeration, so
+	// schedule it now: the client can start streaming immediately while ffprobe
+	// runs, and the existing inventory_updated push (or the inventory poll)
+	// delivers the probed track menu as a follow-up. The plan already carries
+	// tracks_pending so a client keeps the provisional menu until then.
+	enqueueDeferredPostCommitProbe(response.SessionID)
 	timings.mark("response_ready")
 	return response, nil
 }
@@ -2624,6 +2664,15 @@ func (h *PlaybackHandler) resolveVirtualStartWithVersionFallback(
 			allowFailedCandidate: allowFailedCandidate,
 			sessionBound:         false,
 			explicitSelection:    req.FileSelection == playback.FileSelectionExplicitV3,
+			// Defer the candidate-declared upgrade probe past the transport
+			// commit only when the surface AND the client negotiated the
+			// deferred track-inventory lifecycle (see
+			// deferTrackInventoryNegotiatedV3). On the frozen v1 surface, or a
+			// v2 client that did not advertise deferred_track_inventory_v1, the
+			// resolve keeps the pre-#228 behavior: it upgrades the inventory with
+			// a background probe and never marks the plan tracks_pending, so the
+			// v1 contract is byte-for-byte unchanged.
+			deferProbePastCommit: h.deferTrackInventoryNegotiatedV3(r, req),
 		},
 	)
 	if resolveErr == nil || !virtualStartVersionFallbackEligibleV3(req) || !virtualProviderListingOutage(resolveErr) {
@@ -11118,6 +11167,20 @@ func (h *PlaybackHandler) persistTerminalStartDecisionV3(ctx context.Context, us
 		existing.RequestedMediaFileID != requestedFileID || !requestDigests.matches(existing.RequestDigest) {
 		return playback.DecisionResponseV3{}, playback.ErrIdempotencyKeyReusedV3
 	}
+	existingResponse := decisionResponseFromAttemptV3(existing)
+	// A terminal publishes no subtitle URLs and no playable plan, so it replays
+	// on either surface; the surface guard protects only a playable plan. This
+	// is the terminal-save collision: a concurrent duplicate start lost the
+	// SaveAttempt CAS, re-read a winner whose plan may have negotiated the
+	// deferred track-inventory lifecycle (or original SRT), and must not hand
+	// that plan back through the other surface. Without this guard the losing
+	// request's terminal save would replay the winner's playable plan —
+	// tracks_pending and all — through a surface that never negotiated it.
+	if existingResponse.Terminal == nil {
+		if err := requireAttemptAPISurfaceV3(ctx, existing, req.ClientFeatures); err != nil {
+			return playback.DecisionResponseV3{}, err
+		}
+	}
 	// A publication failure can leave a durable attempt whose session was
 	// aborted. A terminal-save collision must not resurrect that playable plan.
 	if existing.SessionID != "" {
@@ -11125,7 +11188,7 @@ func (h *PlaybackHandler) persistTerminalStartDecisionV3(ctx context.Context, us
 			return playback.NewTerminalResponseV3("session_expired", "The playback session for this attempt has ended.", true), nil //nolint:nilerr // Expiration is a successful terminal protocol response.
 		}
 	}
-	return decisionResponseFromAttemptV3(existing), nil
+	return existingResponse, nil
 }
 
 func (h *PlaybackHandler) startFailureDecisionV3(ctx context.Context, userID int, profileID string, req playback.StartRequestV3, requestDigests playbackStartRequestDigestsV3, requestedFileID, effectiveFileID int, failure *transportErrorV3) (playback.DecisionResponseV3, error) {
