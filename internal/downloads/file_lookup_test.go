@@ -104,7 +104,9 @@ func (allowItemAccess) EnsureAccessible(context.Context, string, catalog.AccessF
 // an access-filter miss (library scope or quality ceiling) is
 // ErrFileAccessDenied, and a non-original format is ErrFormatUnavailable. Each
 // still satisfies the historical catalog.ErrItemNotFound for the two 404
-// branches so existing not-found handling is unchanged.
+// branches so existing not-found handling is unchanged. Authorization runs
+// before virtual classification, so a denied virtual row reads as the access
+// refusal rather than leaking its classification.
 func TestResolveDirectFileDistinguishesRefusalReasons(t *testing.T) {
 	ctx := context.Background()
 
@@ -174,12 +176,33 @@ func TestResolveDirectFileDistinguishesRefusalReasons(t *testing.T) {
 		}
 	})
 
-	t.Run("virtual placeholder", func(t *testing.T) {
+	t.Run("authorized virtual placeholder", func(t *testing.T) {
 		svc := serviceWithFileRepo(fileRepoWithFile{file: &models.MediaFile{ID: 42, ContentID: "movie-1", FilePath: "virtual://movie/tt1?result=cand", Container: "virtual"}})
 		svc.itemAccess = allowItemAccess{}
 		_, err := svc.ResolveDirectFile(ctx, 7, 42, "", catalog.AccessFilter{})
 		if !errors.Is(err, ErrFormatUnavailable) {
 			t.Fatalf("err = %v, want ErrFormatUnavailable for a virtual row", err)
+		}
+		if !errors.Is(err, catalog.ErrItemNotFound) {
+			t.Fatalf("err = %v, want it to keep wrapping catalog.ErrItemNotFound so v1 keeps its 404", err)
+		}
+	})
+
+	// Authorization runs before virtual classification: a denied virtual row
+	// must read as the access refusal, not as a format verdict that leaks the
+	// row's classification and produces the wrong copy.
+	t.Run("unauthorized virtual placeholder", func(t *testing.T) {
+		svc := serviceWithFileRepo(fileRepoWithFile{file: &models.MediaFile{ID: 42, ContentID: "movie-1", FilePath: "virtual://movie/tt1?result=cand", Container: "virtual"}})
+		svc.itemAccess = denyItemAccess{}
+		_, err := svc.ResolveDirectFile(ctx, 7, 42, "", catalog.AccessFilter{})
+		if !errors.Is(err, ErrFileAccessDenied) {
+			t.Fatalf("err = %v, want ErrFileAccessDenied for an unauthorized virtual row", err)
+		}
+		if errors.Is(err, ErrFormatUnavailable) {
+			t.Fatalf("err = %v, an access refusal must not leak the row classification", err)
+		}
+		if !errors.Is(err, catalog.ErrItemNotFound) {
+			t.Fatalf("err = %v, want it to keep wrapping catalog.ErrItemNotFound", err)
 		}
 	})
 }

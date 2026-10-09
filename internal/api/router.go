@@ -3584,8 +3584,8 @@ func newChiRouter(deps Dependencies) chi.Router {
 			})
 		}
 		v2deps.DirectDownloads = &apiv2.DirectDownloadHandlers{
-			Original: direct("/api/v2/direct-download", downloadHandler.HandleDirectDownload),
-			Proxy:    direct("/api/v2/direct-download-proxy", downloadHandler.HandleDirectDownloadViaProxy),
+			Original: direct("/api/v2/direct-download", downloadHandler.HandleDirectDownloadV2),
+			Proxy:    direct("/api/v2/direct-download-proxy", downloadHandler.HandleDirectDownloadViaProxyV2),
 		}
 	}
 

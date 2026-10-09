@@ -1042,13 +1042,10 @@ func (s *Service) ResolveDirectFile(ctx context.Context, userID, fileID int, for
 	if file == nil || file.MissingSince != nil {
 		return nil, fmt.Errorf("%w: %w", ErrFileUnavailable, catalog.ErrItemNotFound)
 	}
-	// A zero-storage virtual row carries a provider URI, not local bytes.
-	// Direct download exists to serve original files; refusing it here names
-	// the real reason (non-original) instead of letting the file open fail as
-	// an anonymous not-found after the resolve already succeeded.
-	if isVirtualMediaFile(file) {
-		return nil, ErrFormatUnavailable
-	}
+	// Authorization runs before classification: an unauthorized virtual row
+	// must read as an access refusal, not as a format verdict that leaks the
+	// row's classification and produces the wrong copy. Both checks are on the
+	// content row, so they are independent of whether it carries local bytes.
 	if err := s.itemAccess.EnsureAccessible(ctx, file.ContentID, filter); err != nil {
 		if errors.Is(err, catalog.ErrItemNotFound) {
 			return nil, fmt.Errorf("%w: %w", ErrFileAccessDenied, catalog.ErrItemNotFound)
@@ -1057,6 +1054,15 @@ func (s *Service) ResolveDirectFile(ctx context.Context, userID, fileID int, for
 	}
 	if !catalog.FileAllowedByAccess(file, filter) {
 		return nil, fmt.Errorf("%w: %w", ErrFileAccessDenied, catalog.ErrItemNotFound)
+	}
+	// A zero-storage virtual row carries a provider URI, not local bytes.
+	// Direct download exists to serve original files, so name the non-original
+	// reason instead of letting the file open fail as an anonymous not-found.
+	// It keeps catalog.ErrItemNotFound in the chain so the frozen v1 surface
+	// still answers with its historical 404/not_found; only the v2 adapter
+	// reads ErrFormatUnavailable to name the distinct refusal.
+	if isVirtualMediaFile(file) {
+		return nil, fmt.Errorf("%w: %w", ErrFormatUnavailable, catalog.ErrItemNotFound)
 	}
 	return &FileTarget{Path: file.FilePath, MediaFileID: file.ID, ProxyEligible: proxyDeliveryAllowed(cfg)}, nil
 }

@@ -47,7 +47,7 @@ func directDownloadTestHandler(t *testing.T, f *directDownloadFixture) http.Hand
 	t.Helper()
 	deps, _ := catalogDeps(t)
 	h := handlers.NewDownloadHandler(f)
-	deps.DirectDownloads = &DirectDownloadHandlers{Original: http.HandlerFunc(h.HandleDirectDownload), Proxy: http.HandlerFunc(h.HandleDirectDownloadViaProxy)}
+	deps.DirectDownloads = &DirectDownloadHandlers{Original: http.HandlerFunc(h.HandleDirectDownloadV2), Proxy: http.HandlerFunc(h.HandleDirectDownloadViaProxyV2)}
 	return newTestHandler(t, deps)
 }
 func TestDirectDownloadDelivery(t *testing.T) {
@@ -115,6 +115,7 @@ func TestDirectDownloadRefusalReasonsAreDistinct(t *testing.T) {
 		{"unavailable", fmt.Errorf("%w: %w", downloads.ErrFileUnavailable, catalogpkg.ErrItemNotFound), TypeFileUnavailable},
 		{"denied", fmt.Errorf("%w: %w", downloads.ErrFileAccessDenied, catalogpkg.ErrItemNotFound), TypeFileAccessDenied},
 		{"format", downloads.ErrFormatUnavailable, TypeFormatUnavailable},
+		{"virtual", fmt.Errorf("%w: %w", downloads.ErrFormatUnavailable, catalogpkg.ErrItemNotFound), TypeFormatUnavailable},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := &directDownloadFixture{err: tc.err}
@@ -192,7 +193,7 @@ func TestDirectDownloadProxyAuthorityAndReservation(t *testing.T) {
 			const secret = "synthetic-direct-proxy-key"
 			legacy.SetProxyDelivery(planner, func() string { return secret })
 			deps, _ := catalogDeps(t)
-			deps.DirectDownloads = &DirectDownloadHandlers{Proxy: http.HandlerFunc(legacy.HandleDirectDownloadViaProxy)}
+			deps.DirectDownloads = &DirectDownloadHandlers{Proxy: http.HandlerFunc(legacy.HandleDirectDownloadViaProxyV2)}
 			h := newTestHandler(t, deps)
 			method := "GET"
 			if kind == "head" {
