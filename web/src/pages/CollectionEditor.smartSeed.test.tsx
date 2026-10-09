@@ -67,16 +67,33 @@ function seededHref() {
   return buildSaveAsSmartCollectionHref(parseCatalogSearchParams(catalogFilterParams));
 }
 
-function showSeededEditor() {
-  render(
+function showSeededEditor(href = seededHref()) {
+  return render(
     <QueryClientProvider client={new QueryClient()}>
-      <MemoryRouter initialEntries={[seededHref()]}>
+      <MemoryRouter initialEntries={[href]}>
         <Routes>
           <Route path="/collections/new" element={<CollectionEditor />} />
         </Routes>
       </MemoryRouter>
     </QueryClientProvider>,
   );
+}
+
+function seededHrefWithLimit(limit: string | null) {
+  const params = new URLSearchParams(catalogFilterParams);
+  if (limit === null) {
+    params.delete("query_limit");
+  } else {
+    params.set("query_limit", limit);
+  }
+  return buildSaveAsSmartCollectionHref(parseCatalogSearchParams(params));
+}
+
+function lastCreateBody() {
+  const createCall = mocks.v2.mock.calls.find(([operation]) =>
+    String(operation).startsWith("POST /api/v2/collections"),
+  );
+  return (createCall?.[1] as { body: Record<string, unknown> }).body;
 }
 
 beforeEach(() => {
@@ -161,4 +178,55 @@ describe("save catalog filters as a smart collection", () => {
       },
     });
   });
+
+  it("keeps the entered title and step when the parent rerenders", async () => {
+    // A background refetch in the page above the wizard re-renders this tree;
+    // the draft and step are wizard-local state and must survive it.
+    const tree = () => (
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter initialEntries={[seededHref()]}>
+          <Routes>
+            <Route path="/collections/new" element={<CollectionEditor />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+    const view = render(tree());
+
+    expect(await screen.findByRole("heading", { name: "New Collection" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Next: Details" }));
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Halfway typed" } });
+
+    view.rerender(tree());
+
+    expect(screen.getByLabelText("Name")).toHaveValue("Halfway typed");
+    expect(screen.getByRole("button", { name: "Create Collection" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Next: Details" })).not.toBeInTheDocument();
+  });
+
+  it.each([
+    { seedLimit: null, expectedLimit: 100 },
+    { seedLimit: "900", expectedLimit: 500 },
+  ])(
+    "reviews and saves a $expectedLimit item cap for a seed limit of $seedLimit",
+    async ({ seedLimit, expectedLimit }) => {
+      showSeededEditor(seededHrefWithLimit(seedLimit));
+
+      expect(await screen.findByRole("heading", { name: "New Collection" })).toBeInTheDocument();
+      // The wizard is where the viewer reviews the applied cap before saving.
+      expect(screen.getByLabelText("Max items")).toHaveValue(expectedLimit);
+
+      fireEvent.click(screen.getByRole("button", { name: "Next: Details" }));
+      fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Cap check" } });
+      fireEvent.click(screen.getByRole("button", { name: "Create Collection" }));
+
+      await waitFor(() =>
+        expect(mocks.v2).toHaveBeenCalledWith("POST /api/v2/collections", expect.anything()),
+      );
+      expect(lastCreateBody()).toMatchObject({
+        name: "Cap check",
+        query_definition: expect.objectContaining({ limit: expectedLimit }),
+      });
+    },
+  );
 });
