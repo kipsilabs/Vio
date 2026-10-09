@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -34,17 +35,38 @@ type TranscodeThrottleStarter interface {
 // duration. Zero means throttling is disabled. The resolved value can cross a
 // node boundary without giving the executor access to the API server's settings
 // store.
+//
+// Throttling is enabled by default: only an explicit "false" turns it off, and
+// an absent row (the state of a fresh install, since none is seeded) resolves to
+// the default rather than to off, or the advertised default would never take
+// effect at runtime — the reader sees the raw store value, not the admin UI's
+// effective default.
+//
+// A settings read failure disables throttling instead of enabling it. Treating a
+// failed read as "unset" would turn a transient store outage into an unrequested
+// behavior change; failing closed keeps playback at its prior, unbounded
+// lookahead until the store is reachable again.
 func ConfiguredTranscodeThrottleSeconds(ctx context.Context, settings TranscodeThrottleSettings) int {
 	if settings == nil {
 		return 0
 	}
-	enabled, _ := settings.Get(ctx, "enable_transcode_throttle")
-	if enabled != "true" {
+	enabled, err := settings.Get(ctx, "enable_transcode_throttle")
+	if err != nil {
+		return 0
+	}
+	if strings.EqualFold(strings.TrimSpace(enabled), "false") {
+		return 0
+	}
+	raw, err := settings.Get(ctx, "transcode_throttle_seconds")
+	if err != nil {
+		// The threshold read failed, so the intended forward-buffer duration is
+		// unknown. Fail closed like an enable-read failure rather than silently
+		// arming the 300-second default.
 		return 0
 	}
 	threshold := 300
-	if raw, _ := settings.Get(ctx, "transcode_throttle_seconds"); raw != "" {
-		if configured, err := strconv.Atoi(raw); err == nil && configured > 0 {
+	if raw != "" {
+		if configured, parseErr := strconv.Atoi(raw); parseErr == nil && configured > 0 {
 			threshold = max(configured, minThresholdSeconds)
 		}
 	}
