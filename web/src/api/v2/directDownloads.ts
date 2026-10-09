@@ -37,20 +37,52 @@ export function directDownloadErrorMessage(status: number): string {
   }
 }
 
-/** Whether the browser still holds the user activation a programmatic click needs. */
-function userActivationAvailable(): boolean {
-  if (typeof navigator === "undefined") return true;
-  const activation = (navigator as Navigator & { userActivation?: { isActive?: boolean } })
-    .userActivation;
-  return !activation || activation.isActive !== false;
+/** A fetched, save-ready download. The caller owns the object URL and disposes it. */
+export interface PreparedDirectDownload {
+  /** Same-origin blob URL holding the fetched file. */
+  readonly url: string;
+  /** Filename suggested by the server, or a safe fallback. */
+  readonly filename: string;
+  /** Release the object URL once the save link is gone. */
+  dispose(): void;
+}
+
+function decodeFilenamePart(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+/** A filesystem-safe filename from Content-Disposition, falling back to the caller's hint. */
+function filenameFromDisposition(header: string | null, hint?: string): string {
+  const match = header?.match(/filename\*?=(?:UTF-8''|")?([^";]+)/i);
+  const candidate = (match ? decodeFilenamePart(match[1]?.trim() ?? "") : (hint ?? ""))
+    .replace(/[\p{Cc}\\/]+/gu, "_")
+    .trim();
+  return candidate.length > 0 ? candidate : "download";
+}
+
+/** Whether a probe status authorizes the file (200 full body or 206 partial). */
+function probeAccepted(status: number): boolean {
+  return status === 200 || status === 206;
 }
 
 // Browser navigation cannot set headers. Retain the existing account-token
 // authority; do not imply that the selected profile/PIN travels in this URL.
-export async function launchDirectDownload(
+//
+// Two requests, both awaited: a ranged GET is a preflight that fails fast when
+// the captured token is no longer authorized, and a full GET is the transfer
+// itself. Because the transfer is an awaited fetch, a refusal, network failure
+// or mid-stream drop is observable instead of vanishing behind a navigation.
+// The bytes come back as a blob object URL for an explicit user-clicked save,
+// so no inferred activation check can turn a slow probe into a false refusal.
+export async function prepareDirectDownload(
   fileId: number,
   isCurrent: () => boolean,
-): Promise<void> {
+  filenameHint?: string,
+): Promise<PreparedDirectDownload> {
   if (!Number.isSafeInteger(fileId) || fileId <= 0)
     throw new DirectDownloadError(0, "Invalid file ID.");
   const token = getAccessToken();
@@ -67,19 +99,15 @@ export async function launchDirectDownload(
   };
   requireCurrent();
   const url = `/api/v2/direct-download?${new URLSearchParams({ file_id: String(fileId), token: token! })}`;
-  // One request only, using the same verb and URL the browser will navigate to.
-  // A HEAD 200 could pass while the navigation GET was refused, which stranded
-  // the user on a silent no-op; the GET probe authorizes exactly what follows.
-  // A one-byte range keeps the probe from streaming the file, and the captured
-  // token is reused for the navigation so a rotation cannot split the two.
-  const controller = new AbortController();
-  let res: Response;
+
+  const probe = new AbortController();
+  let probeRes: Response;
   try {
-    res = await fetch(url, {
+    probeRes = await fetch(url, {
       method: "GET",
       headers: { Range: "bytes=0-0" },
       cache: "no-store",
-      signal: controller.signal,
+      signal: probe.signal,
     });
   } catch (error) {
     // A rejected probe must not report into a replacement authority either.
@@ -87,31 +115,39 @@ export async function launchDirectDownload(
     throw error;
   } finally {
     // Only the status was needed; stop any body the probe started.
-    controller.abort();
+    probe.abort();
   }
   requireCurrent();
-  if (res.status !== 200 && res.status !== 206) {
-    throw new DirectDownloadError(res.status, directDownloadErrorMessage(res.status));
+  if (!probeAccepted(probeRes.status)) {
+    throw new DirectDownloadError(probeRes.status, directDownloadErrorMessage(probeRes.status));
   }
-  if (!userActivationAvailable()) {
-    throw new DirectDownloadError(
-      0,
-      "Your browser blocked the download. Allow downloads for this site and try again.",
-    );
-  }
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.download = "";
-  anchor.referrerPolicy = "no-referrer";
-  document.body.appendChild(anchor);
+
+  let transferRes: Response;
   try {
-    anchor.click();
-  } catch {
-    throw new DirectDownloadError(
-      0,
-      "Your browser blocked the download. Allow downloads for this site and try again.",
-    );
-  } finally {
-    anchor.remove();
+    transferRes = await fetch(url, { method: "GET", cache: "no-store" });
+  } catch (error) {
+    requireCurrent();
+    throw error;
   }
+  requireCurrent();
+  if (!transferRes.ok) {
+    throw new DirectDownloadError(
+      transferRes.status,
+      directDownloadErrorMessage(transferRes.status),
+    );
+  }
+  let blob: Blob;
+  try {
+    blob = await transferRes.blob();
+  } catch {
+    requireCurrent();
+    throw new DirectDownloadError(0, "The download stopped before it finished. Try again.");
+  }
+  requireCurrent();
+  const objectUrl = URL.createObjectURL(blob);
+  return {
+    url: objectUrl,
+    filename: filenameFromDisposition(transferRes.headers.get("Content-Disposition"), filenameHint),
+    dispose: () => URL.revokeObjectURL(objectUrl),
+  };
 }

@@ -7,7 +7,12 @@ import DownloadVersionPicker from "./DownloadVersionPicker";
 const mocks = vi.hoisted(() => ({ error: vi.fn() }));
 vi.mock("sonner", () => ({ toast: { error: mocks.error } }));
 vi.mock("@/hooks/queries/downloads", () => ({
-  useDownloadCapability: () => ({ data: { enabled: true, allowed: true, download_allowed: true } }),
+  useDownloadCapability: () => ({
+    data: { enabled: true, allowed: true, download_allowed: true },
+    isLoading: false,
+    isError: false,
+    refetch: vi.fn(),
+  }),
 }));
 // Use the real directDownloads helper and real client authority state.
 const versions = [{ file_id: 42, resolution: "1080p", file_size: 1024 } as FileVersion];
@@ -16,6 +21,8 @@ beforeEach(() => {
   setAccessToken("original-account");
   setProfileId("original-profile");
   setProfileToken("original-pin");
+  vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:download");
+  vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
 });
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -36,7 +43,6 @@ it.each(["account", "profile", "pin", "unchanged"])(
         }),
     );
     vi.stubGlobal("fetch", fetch);
-    const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
     const close = vi.fn();
     render(<DownloadVersionPicker open onOpenChange={close} versions={versions} />);
     fireEvent.click(screen.getByRole("button", { name: /1080p/ }));
@@ -53,8 +59,36 @@ it.each(["account", "profile", "pin", "unchanged"])(
       reject(new TypeError("connection lost"));
     });
     expect(fetch).toHaveBeenCalledTimes(1);
-    expect(click).not.toHaveBeenCalled();
+    expect(screen.queryByRole("link", { name: /Save file/i })).toBeNull();
     expect(close).not.toHaveBeenCalled();
     expect(mocks.error).toHaveBeenCalledTimes(authority === "unchanged" ? 1 : 0);
   },
 );
+
+it("fences a late second request after an authority change with no save link", async () => {
+  let resolveTransfer!: (r: Response) => void;
+  vi.stubGlobal(
+    "fetch",
+    vi
+      .fn()
+      .mockResolvedValueOnce(new Response(null, { status: 206 }))
+      .mockImplementationOnce(
+        () =>
+          new Promise<Response>((r) => {
+            resolveTransfer = r;
+          }),
+      ),
+  );
+  const close = vi.fn();
+  render(<DownloadVersionPicker open onOpenChange={close} versions={versions} />);
+  fireEvent.click(screen.getByRole("button", { name: /1080p/ }));
+  await vi.waitFor(() => expect(resolveTransfer).toBeDefined());
+  // The probe authorized the transfer; the profile changes before it lands.
+  setProfileId("replacement-profile");
+  await act(async () => {
+    resolveTransfer(new Response("bytes", { status: 200 }));
+  });
+  expect(screen.queryByRole("link", { name: /Save file/i })).toBeNull();
+  expect(close).not.toHaveBeenCalled();
+  expect(mocks.error).not.toHaveBeenCalled();
+});
