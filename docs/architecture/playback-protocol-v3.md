@@ -1416,6 +1416,15 @@ feature; a client that does not know the name ignores it. `/api/v2` advertises
 `source_committed_event_v1` in `features` so a client can tell a server that
 sends it apart from one that does not.
 
+**Inventory adoption is in place.** Folding the real video/audio/subtitle track
+lists from a deferred probe, a `source_committed`, or an `inventory_updated`
+push is menu data: it must never replan, switch rows or files, or reload the
+media element. What is already playing keeps playing, and only the lists the
+watch page and in-player menus render change. A client that adopts a *verified*
+inventory for a source must also refuse to regress it to a declared or pending
+list when a later plan for the same source is adopted — a replan can have been
+built before the probe persisted, and the menus must stay on the real evidence.
+
 ---
 
 ## 7. Registries

@@ -1213,6 +1213,21 @@ export function usePlaybackSession(
 
       const prevPlan = planRef.current;
       const sessionId = plan.session_id ?? decision.session_id ?? sessionIdRef.current;
+      // The verified-inventory anchor in force *before* this adoption. A real
+      // (probed/verified) list already folded for this exact source must not be
+      // regressed to a declared/pending plan's list by a later replan — the
+      // replan may have been built before the probe persisted. Adoption is in
+      // place: the stream is untouched, and only the menus hold the real list.
+      const verifiedAnchor = lastVerifiedIdentityRef.current;
+      const planIsProvisional = isInventoryProvisional(
+        plan.inventory_status,
+        plan.inventory_provenance,
+      );
+      const keepVerifiedInventory =
+        planIsProvisional &&
+        verifiedAnchor !== null &&
+        verifiedAnchor.fileId === plan.effective_media_file_id &&
+        (verifiedAnchor.uri ?? null) === (plan.effective_virtual_uri ?? null);
       planAttemptIdRef.current = randomUUID();
       planRef.current = plan;
       sessionIdRef.current = sessionId ?? null;
@@ -1221,11 +1236,16 @@ export function usePlaybackSession(
       transitionSourceIdentity(plan.effective_media_file_id, plan.effective_virtual_uri ?? null);
       // A plan adopted with verified inventory seeds the verified-identity
       // anchor that same-source declared pushes must not downgrade.
-      if (isInventoryProvisional(plan.inventory_status, plan.inventory_provenance) === false) {
+      if (!planIsProvisional) {
         lastVerifiedIdentityRef.current = {
           fileId: plan.effective_media_file_id,
           uri: plan.effective_virtual_uri ?? null,
         };
+      } else if (keepVerifiedInventory) {
+        // Re-seed the anchor `transitionSourceIdentity` just cleared, so the
+        // preserved verified list also keeps suppressing later same-source
+        // declared pushes.
+        lastVerifiedIdentityRef.current = verifiedAnchor;
       }
       // A live plan means the dead session that forced a rebuild is behind us;
       // a replacement that landed on a new id clears the one-recovery guard so
@@ -1256,8 +1276,8 @@ export function usePlaybackSession(
         awaitingInitialPlayerPositionRef.current = plan.timeline.source_start_seconds > 0;
       }
 
-      setState((current) => ({
-        ...planToSessionState(
+      setState((current) => {
+        const next = planToSessionState(
           plan,
           sessionId ?? null,
           playbackAttemptIdRef.current ?? "",
@@ -1267,16 +1287,27 @@ export function usePlaybackSession(
           playbackPlayingRef.current,
           current.autoFallback,
           config,
-        ),
-        initialSubtitleErrorTitle:
+        );
+        if (keepVerifiedInventory) {
+          // In-place adoption: keep the real audio list and subtitle inventory
+          // the deferred probe already folded, instead of the incoming
+          // provisional plan's declared/stale ones. The plan object still names
+          // the stream; only the menus are held on the verified evidence.
+          next.planAudioTracks = current.planAudioTracks;
+          next.audioInventoryProvisional = current.audioInventoryProvisional;
+          next.subtitleUrls = current.subtitleUrls;
+          next.subtitleInventoryProvisional = current.subtitleInventoryProvisional;
+        }
+        next.initialSubtitleErrorTitle =
           initialSubtitleFailure === undefined
             ? current.initialSubtitleErrorTitle
-            : (initialSubtitleFailure?.title ?? null),
-        initialSubtitleError:
+            : (initialSubtitleFailure?.title ?? null);
+        next.initialSubtitleError =
           initialSubtitleFailure === undefined
             ? current.initialSubtitleError
-            : (initialSubtitleFailure?.message ?? null),
-      }));
+            : (initialSubtitleFailure?.message ?? null);
+        return next;
+      });
       reportEvent("plan_selected");
       return true;
     },
