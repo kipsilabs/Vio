@@ -27,9 +27,9 @@ func TestStartConfiguredTranscodeThrottler(t *testing.T) {
 		settings   throttleSettings
 		thresholds []int
 	}{
+		{name: "disabled when unset", settings: throttleSettings{}},
+		{name: "disabled when empty", settings: throttleSettings{"enable_transcode_throttle": ""}},
 		{name: "explicitly disabled", settings: throttleSettings{"enable_transcode_throttle": "false"}},
-		{name: "enabled by default when absent", settings: throttleSettings{}, thresholds: []int{300}},
-		{name: "enabled by default when empty", settings: throttleSettings{"enable_transcode_throttle": ""}, thresholds: []int{300}},
 		{name: "configured", settings: throttleSettings{"enable_transcode_throttle": "true", "transcode_throttle_seconds": "180"}, thresholds: []int{180}},
 		{name: "invalid threshold uses default", settings: throttleSettings{"enable_transcode_throttle": "true", "transcode_throttle_seconds": "invalid"}, thresholds: []int{300}},
 	}
@@ -56,9 +56,9 @@ func TestConfiguredTranscodeThrottleSeconds(t *testing.T) {
 		settings throttleSettings
 		want     int
 	}{
+		{name: "disabled when unset", settings: throttleSettings{}, want: 0},
+		{name: "disabled when empty", settings: throttleSettings{"enable_transcode_throttle": ""}, want: 0},
 		{name: "explicitly disabled", settings: throttleSettings{"enable_transcode_throttle": "false"}, want: 0},
-		{name: "enabled by default when absent", settings: throttleSettings{}, want: 300},
-		{name: "enabled by default when empty", settings: throttleSettings{"enable_transcode_throttle": ""}, want: 300},
 		{name: "configured", settings: throttleSettings{"enable_transcode_throttle": "true", "transcode_throttle_seconds": "180"}, want: 180},
 		{name: "positive value below executor minimum is clamped", settings: throttleSettings{"enable_transcode_throttle": "true", "transcode_throttle_seconds": "30"}, want: 60},
 		{name: "invalid threshold uses default", settings: throttleSettings{"enable_transcode_throttle": "true", "transcode_throttle_seconds": "invalid"}, want: 300},

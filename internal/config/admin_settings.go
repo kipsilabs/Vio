@@ -352,7 +352,7 @@ var adminSettingDefaults = map[string]string{
 	"playback.min_resume_threshold":                  "5",
 	"playback.max_virtual_failover_attempts":         "5",
 	Allow4KTranscodeSettingKey:                       "false",
-	"enable_transcode_throttle":                      "true",
+	"enable_transcode_throttle":                      "false",
 	"transcode_throttle_seconds":                     "300",
 
 	"audiobookshelf_compat.enabled":           "true",
