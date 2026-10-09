@@ -7,18 +7,94 @@ import {
   StaleApiRequestContextError,
 } from "@/api/client";
 
+/** A direct-download attempt the user must be told about, with a concrete reason. */
+export class DirectDownloadError extends Error {
+  /** The HTTP status that refused the attempt, or 0 for a non-HTTP failure. */
+  readonly status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = "DirectDownloadError";
+    this.status = status;
+  }
+}
+
+/** Plain-language reason for a refused direct-download response. */
+export function directDownloadErrorMessage(status: number): string {
+  switch (status) {
+    case 401:
+      return "Your session ended. Sign in again to download.";
+    case 403:
+      return "Downloads are not allowed for this account.";
+    case 404:
+      return "This file is no longer available to download.";
+    case 416:
+      return "The server could not read this file to download.";
+    case 503:
+      return "Downloads are temporarily unavailable. Try again.";
+    default:
+      return `Download could not be started (HTTP ${status}).`;
+  }
+}
+
+/**
+ * A preflighted direct-download link. The URL is the authenticated
+ * direct-download endpoint itself; the browser fetches it when the user clicks
+ * the save link, so there is no object URL to own or revoke.
+ */
+export interface PreparedDirectDownload {
+  /** The authenticated direct-download URL the explicit save link points at. */
+  readonly url: string;
+  /** Filename suggested by the server, or a safe fallback. */
+  readonly filename: string;
+}
+
+function decodeFilenamePart(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+/** A filesystem-safe filename from Content-Disposition, falling back to the caller's hint. */
+function filenameFromDisposition(header: string | null, hint?: string): string {
+  const match = header?.match(/filename\*?=(?:UTF-8''|")?([^";]+)/i);
+  const candidate = (match ? decodeFilenamePart(match[1]?.trim() ?? "") : (hint ?? ""))
+    .replace(/[\p{Cc}\\/]+/gu, "_")
+    .trim();
+  return candidate.length > 0 ? candidate : "download";
+}
+
+/** Whether a probe status authorizes the file (200 full body or 206 partial). */
+function probeAccepted(status: number): boolean {
+  return status === 200 || status === 206;
+}
+
 // Browser navigation cannot set headers. Retain the existing account-token
 // authority; do not imply that the selected profile/PIN travels in this URL.
-export async function launchDirectDownload(
+//
+// The ranged GET is a preflight, not delivery proof: it establishes that the
+// captured token is still authorized for this exact verb and URL so a refusal
+// surfaces as text instead of a silent navigation. The bytes are never fetched
+// here — the explicit save link's own navigation performs the transfer, with
+// real user activation behind it. Abort is threaded through the preflight and
+// its body consumption via `signal`; the transfer itself is browser-owned
+// navigation, so there is nothing for JS to abort or revoke on the save path.
+export async function prepareDirectDownload(
   fileId: number,
   isCurrent: () => boolean,
-): Promise<void> {
-  if (!Number.isSafeInteger(fileId) || fileId <= 0) throw new Error("Invalid file ID.");
+  signal: AbortSignal,
+  filenameHint?: string,
+): Promise<PreparedDirectDownload> {
+  if (!Number.isSafeInteger(fileId) || fileId <= 0)
+    throw new DirectDownloadError(0, "Invalid file ID.");
   const token = getAccessToken();
   const identity = captureSessionIdentity();
   const profile = captureProfileRequestContext();
   const requireCurrent = () => {
     if (
+      signal.aborted ||
       !token ||
       !isCurrent() ||
       !isSessionIdentityCurrent(identity) ||
@@ -28,22 +104,30 @@ export async function launchDirectDownload(
   };
   requireCurrent();
   const url = `/api/v2/direct-download?${new URLSearchParams({ file_id: String(fileId), token: token! })}`;
-  // One probe only: no refresh replay, token replacement or proxy URL invention.
-  let res: Response;
+
+  let probeRes: Response;
   try {
-    res = await fetch(url, { method: "HEAD", cache: "no-store" });
+    probeRes = await fetch(url, {
+      method: "GET",
+      headers: { Range: "bytes=0-0" },
+      cache: "no-store",
+      signal,
+    });
   } catch (error) {
-    // A rejected probe must not report into a replacement authority either.
+    // A rejected or aborted probe must not report into a replacement authority.
     requireCurrent();
     throw error;
   }
   requireCurrent();
-  if (res.status !== 200) throw new Error(`Download unavailable (${res.status}).`);
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.download = "";
-  anchor.referrerPolicy = "no-referrer";
-  // HEAD is only an observation. The browser GET independently reauthorizes;
-  // launch is not proof of successful transfer or durable local storage.
-  anchor.click();
+  if (!probeAccepted(probeRes.status)) {
+    throw new DirectDownloadError(probeRes.status, directDownloadErrorMessage(probeRes.status));
+  }
+  // Only the status and headers are needed. Cancel the one-byte probe body so
+  // the connection is released instead of left half-read; aborting `signal`
+  // while the probe was in flight cancels the transfer the same way.
+  void probeRes.body?.cancel().catch(() => undefined);
+  return {
+    url,
+    filename: filenameFromDisposition(probeRes.headers.get("Content-Disposition"), filenameHint),
+  };
 }
