@@ -228,6 +228,34 @@ type mapSettings map[string]string
 
 func (m mapSettings) Get(_ context.Context, key string) (string, error) { return m[key], nil }
 
+// TestTranscodeThrottleDefaultsOn verifies the admin UI default matches the
+// runtime reader: both resolve an unset or empty row to the shipped default
+// rather than to off, so the advertised default is what actually takes effect.
+func TestTranscodeThrottleDefaultsOn(t *testing.T) {
+	effective := EffectiveAdminSettings(nil)
+	if got := effective["enable_transcode_throttle"]; got != "true" {
+		t.Fatalf("enable_transcode_throttle default = %q, want true", got)
+	}
+	if got := effective["transcode_throttle_seconds"]; got != "300" {
+		t.Fatalf("transcode_throttle_seconds default = %q, want 300", got)
+	}
+}
+
+// TestTranscodeToneMapPoliciesDefaultOn verifies tone mapping ships enabled,
+// so a fresh install transcodes on capable hardware instead of shipping a
+// straight decode.
+func TestTranscodeToneMapPoliciesDefaultOn(t *testing.T) {
+	effective := EffectiveAdminSettings(nil)
+	for _, key := range []string{
+		PlaybackTranscodeHardwareToneMapSettingKey,
+		PlaybackTranscodeSoftwareToneMapSettingKey,
+	} {
+		if got := effective[key]; got != "true" {
+			t.Fatalf("%s default = %q, want true", key, got)
+		}
+	}
+}
+
 func normalizeEffectiveRuntimeDefaults(cfg *Config) {
 	if cfg.S3.Public.URLAuth == "" {
 		cfg.S3.Public.URLAuth = "presigned"
