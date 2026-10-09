@@ -57,8 +57,15 @@ func ConfiguredTranscodeThrottleSeconds(ctx context.Context, settings TranscodeT
 	if strings.EqualFold(strings.TrimSpace(enabled), "false") {
 		return 0
 	}
+	raw, err := settings.Get(ctx, "transcode_throttle_seconds")
+	if err != nil {
+		// The threshold read failed, so the intended forward-buffer duration is
+		// unknown. Fail closed like an enable-read failure rather than silently
+		// arming the 300-second default.
+		return 0
+	}
 	threshold := 300
-	if raw, err := settings.Get(ctx, "transcode_throttle_seconds"); err == nil && raw != "" {
+	if raw != "" {
 		if configured, parseErr := strconv.Atoi(raw); parseErr == nil && configured > 0 {
 			threshold = max(configured, minThresholdSeconds)
 		}
