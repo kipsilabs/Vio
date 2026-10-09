@@ -39,6 +39,22 @@ const virtualPlaybackPrefix = "virtual://"
 
 const maxVirtualPlaybackStreams = 50
 
+// virtualCandidateSinkBudget bounds one detached first-playback candidate
+// persist. Persisting the listing is best-effort metadata work behind the first
+// bytes, so it carries its own budget rather than inheriting the cold-path
+// deadline it was detached from.
+var virtualCandidateSinkBudget = 15 * time.Second
+
+// virtualCandidatePublishBudget bounds the versions_updated announce that
+// follows a successful first-playback candidate persist. The persist and the
+// publish are separate pieces of work: a slow-but-successful persist can spend
+// the whole sink budget, so the publish gets a fresh short context derived from
+// service shutdown rather than from the persist's context or the request.
+// Without that, a persist near its deadline would leave no time for the Redis
+// fan-out. It is a var so tests can shrink it, matching the other detached
+// budgets.
+var virtualCandidatePublishBudget = 5 * time.Second
+
 const (
 	defaultMaxVirtualFailoverAttempts = 5
 	virtualProbeBudget                = 15 * time.Second
@@ -732,6 +748,56 @@ type virtualPrefetchTask struct {
 // profile, must not be collapsed.
 func virtualPrefetchKey(contentID, neutralURI string, ownerInstallationID, userID int, profileID string) string {
 	return contentID + "\x00" + neutralURI + "\x00" + strconv.Itoa(ownerInstallationID) + "\x00" + strconv.Itoa(userID) + "\x00" + profileID
+}
+
+// spawnVirtualCandidateSink persists a freshly listed first-playback candidate
+// set in the background and, only when that persist succeeds, announces the new
+// version list on the same catalog event the Refresh List executor emits.
+//
+// The persist is admitted through the handler's bounded detached-work gate and
+// runs on a detached, budgeted context. Admission is non-blocking and
+// drop-on-exhaustion: on a saturated gate the sink is skipped entirely (logged
+// at debug) and no event is published, so a later first open of the title
+// reloads the list instead of being announced from work that never ran. The
+// event is deliberately gated on a successful persist so a client never reloads
+// a version list that was not written; a persist error is a no-op.
+func (h *PlaybackHandler) spawnVirtualCandidateSink(ctx context.Context, file *models.MediaFile, streams []VirtualPlaybackStream) {
+	if h == nil || h.VirtualPlaybackStreamSink == nil || file == nil || len(streams) == 0 {
+		return
+	}
+	sinkFn := h.VirtualPlaybackStreamSink
+	sinkFile := *file
+	contentID := file.ContentID
+	eventsHub := h.EventsHub
+	gate := h.detachedGate()
+	if !gate.tryAcquire() {
+		slog.DebugContext(ctx, "virtual playback stream sink skipped: detached worker budget exhausted",
+			"component", "api")
+		return
+	}
+	sinkCtx, sinkCancel := h.virtualDetachedContext(ctx, virtualCandidateSinkBudget)
+	go func() {
+		defer gate.release()
+		defer sinkCancel()
+		if err := sinkFn(sinkCtx, &sinkFile, streams); err != nil {
+			return
+		}
+		// The sink persisted the first-playback candidates: new rows are now
+		// selectable versions. Publish only after the write lands, matching the
+		// executor's post-persist ordering, so an open detail or watch page
+		// stops showing the seeded placeholder.
+		//
+		// The publish gets its own short context created here, after success,
+		// rather than reusing sinkCtx. A slow-but-successful persist can spend
+		// the whole sink budget, and a publish on the drained sinkCtx would then
+		// fan out locally (hub.go publishes local subscribers before the bus)
+		// while the Redis publish that refreshes the other API nodes fails. The
+		// fresh context is detached from request cancellation but stays parented
+		// to service shutdown, so it keeps the sink's lifecycle guarantees.
+		publishCtx, publishCancel := h.virtualDetachedContext(ctx, virtualCandidatePublishBudget)
+		defer publishCancel()
+		publishVirtualVersionsUpdatedEvent(publishCtx, nil, eventsHub, contentID)
+	}()
 }
 
 // PrefetchVirtualPlayback warms the metadata caches for up to
@@ -2228,23 +2294,12 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			// answering [] still accumulates toward the bound.
 			virtualRecoveryRelists.clear(virtualRecoveryRelistKey(virtualPlaybackNeutralKey(file.FilePath), file.VirtualOwnerInstallationID))
 			// A selected result= URI is still an active catalog row referenced by
-			// the playback attempt. Refresh metadata in memory, but do not replace
-			// the candidate set while this request is using that row.
+			// the playback attempt: its metadata is refreshed in memory. The
+			// just-listed candidate set is persisted separately, in the
+			// background, so a later open of this title sees the real version
+			// list instead of the seeded placeholder.
 			if noResult && h.VirtualPlaybackStreamSink != nil {
-				visible := visibleVirtualPlaybackStreams(streams)
-				sinkFn := h.VirtualPlaybackStreamSink
-				sinkFile := *file
-				if gate := h.detachedGate(); gate.tryAcquire() {
-					sinkCtx, sinkCancel := h.virtualDetachedContext(listCtx, 15*time.Second)
-					go func() {
-						defer gate.release()
-						defer sinkCancel()
-						_ = sinkFn(sinkCtx, &sinkFile, visible)
-					}()
-				} else {
-					slog.DebugContext(listCtx, "virtual playback stream sink skipped: detached worker budget exhausted",
-						"component", "api")
-				}
+				h.spawnVirtualCandidateSink(listCtx, file, visibleVirtualPlaybackStreams(streams))
 			}
 			filtered := filterVirtualPlaybackStreams(file, streams)
 			if h.BestResultCache != nil && len(filtered) > 0 {

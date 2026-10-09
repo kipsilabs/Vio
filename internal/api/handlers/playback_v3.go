@@ -6930,6 +6930,14 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 		if err := json.Unmarshal(lease.Response, &replay); err != nil {
 			return playback.DecisionResponseV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to decode the completed replan decision")
 		}
+		// The cached durable decision was minted for the surface that first
+		// completed it. A replay through a different surface must not re-emit
+		// v2-only contract additions (today delivery_change) on the frozen v1
+		// bridge: clear the marker on a response-local plan copy here, at the
+		// same response boundary the fresh v1 execution uses.
+		if !isNativeAPIV2(r.Context()) && replay.PlaybackPlan != nil {
+			replay.PlaybackPlan.DeliveryChange = nil
+		}
 		return replay, nil
 	}
 	leaseCompleted := false
