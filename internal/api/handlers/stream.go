@@ -1864,12 +1864,26 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 								handled = true
 							} else if healCleanup != nil {
 								healCleanup()
+								releaseInput = nil
 							}
 						} else if healCleanup != nil {
 							healCleanup()
+							releaseInput = nil
 						}
 					} else if healCleanup != nil {
 						healCleanup()
+						releaseInput = nil
+					}
+				}
+				if !handled {
+					// The cached retry above re-ran serveRemux, so re-read the
+					// abort: a stop or a client disconnect that landed during it
+					// ends recovery here instead of indicting a release that was
+					// never given a chance to deliver. Without this the retry
+					// marks the candidate failed and rotates away from a healthy
+					// release, which is what the guard above exists to prevent.
+					if isClientCancellation(r.Context(), remuxErr) || remuxStoppedServerSide() {
+						handled = true
 					}
 				}
 				if !handled {
