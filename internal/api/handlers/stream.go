@@ -2869,11 +2869,17 @@ func (h *StreamHandler) handleTransportStartFailure(ctx context.Context, session
 	// canceled request is never rewritten into a missing-file abort, and
 	// downgrade to debug; a timeout or provider error stays at WARN.
 	if isClientCancellation(ctx, err) {
-		// A transport cancel is liveness evidence: the viewer navigated off (or
-		// hls.js gave up). Record it on the session so a failure_recovery
-		// arriving shortly after is recognized as a zombie and does not run
-		// recovery to a terminal on a client that is already gone. Best-effort:
-		// a missing session or a manager without the seam changes nothing.
+		// A transport cancel is evidence about this one request: the viewer
+		// navigated off, or hls.js gave up. Record it scoped to the session's
+		// current route revision and binding generation. It is a diagnostic and
+		// route-fence, never proof the session died, so it cannot fence a live
+		// client's recovery (only a genuine stop does that). The narrow start
+		// hook is deliberate: an HLS fragment cancel is not marked because a
+		// fragment abort is exactly the transient hls.js retry that must stay
+		// recoverable, marking every fragment request would put a liveness read
+		// on the hot segment path, and the route scoping already keeps a cancel
+		// from a predecessor's request off the successor. Best-effort: a
+		// missing session or a manager without the seam changes nothing.
 		if marker, ok := h.sessionMgr.(interface {
 			MarkClientCanceled(sessionID string) error
 		}); ok {

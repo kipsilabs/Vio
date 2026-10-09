@@ -79,10 +79,10 @@ type SessionManagerInterface interface {
 	SetProgressPersistenceDisabled(sessionID string, disabled bool) error
 	StopSession(sessionID string) error
 	GetSession(sessionID string) (*playback.Session, error)
-	// MarkClientCanceled records liveness evidence that the client canceled a
-	// transport; ClearClientCanceled drops it. The v3 replan gates a
-	// failure_recovery on the absence of a recent cancel, so a zombie session
-	// never spends the adaptation budget on a terminal.
+	// MarkClientCanceled records route-scoped evidence that the client canceled
+	// a transport; ClearClientCanceled drops it. The v3 replan reports a cancel
+	// that still names the current route and drops a superseded one, but never
+	// fences a failure_recovery on the mark alone: only a genuine stop does.
 	MarkClientCanceled(sessionID string) error
 	ClearClientCanceled(sessionID string) error
 }

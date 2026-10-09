@@ -2600,6 +2600,13 @@ export function VideoPlayer({
             hls.on(Hls.Events.BUFFER_APPENDED, () => {
               if (destroyed) return;
               networkRecoveryAttemptsRef.current = 0;
+              // Observed progress is what re-arms the stale-generation budget:
+              // a refetch whose rebuilt playlist actually appended media
+              // recovered, so a later ordinary seek that hits a fence again gets
+              // its own recovery budget instead of inheriting an exhausted
+              // counter and falling through to a failure-recovery replan. Only
+              // consecutive fences without progress still exhaust the cap.
+              staleGenerationRecoveriesRef.current = 0;
               attemptAutoplayWhenReady();
             });
 

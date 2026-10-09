@@ -13,8 +13,11 @@ import "github.com/Silo-Server/silo-server/internal/models"
 // candidate URI — does not match the pin's identity and re-arms it from that
 // file's first read.
 //
-// Profile is 0 until a source has been verified; a zero never establishes a
-// pin, so an early row whose profile merely failed to probe does not lock the
+// Profile is 0 until a source has been verified and the pin still names the
+// file identity it was read from. The identity is carried even at profile zero
+// so that a move to an SDR file records the new bytes and disarms the previous
+// file's profile; the zero itself is never evidence and never applies to a
+// file, so an early row whose profile merely failed to probe does not lock the
 // session out of a later, genuine profile.
 type DVPinV3 struct {
 	FileID  int
@@ -34,11 +37,15 @@ func dvPinMatchesFileV3(pin DVPinV3, file *models.MediaFile) bool {
 }
 
 // PinDVPinV3 returns the pin to use for file given the session's current pin
-// and a freshly read profile. First-verified-wins for the same file identity;
-// otherwise the first positive profile read becomes the pin. A non-positive
-// profile or a nil file leaves the pin unchanged.
+// and a freshly read profile. First-verified-wins for the same file identity:
+// once a positive profile is pinned for a file, a later read of that same file
+// never lowers it. A different file identity always owns the pin outright,
+// even when the new file verified no profile — a move from a Dolby Vision file
+// to an SDR one must re-arm the pin to the SDR identity at profile zero, or the
+// old profile would keep describing bytes it never came from. A nil file
+// leaves the pin unchanged.
 func PinDVPinV3(pin DVPinV3, file *models.MediaFile, profile int) DVPinV3 {
-	if file == nil || profile <= 0 {
+	if file == nil {
 		return pin
 	}
 	if pin.FileID == file.ID && pin.Source == file.FilePath && pin.Profile > 0 {

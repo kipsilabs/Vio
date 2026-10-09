@@ -62,6 +62,7 @@ const hlsJS = vi.hoisted(() => ({
   startLoad: vi.fn(),
   loadSource: vi.fn(),
   errorHandler: null as null | ((event: unknown, data: unknown) => void),
+  bufferAppendedHandler: null as null | ((event: unknown, data?: unknown) => void),
 }));
 // Captures the onSourceChanged handlers the mocked subtitle hooks receive, so
 // tests can drive a subtitle_source_changed (409) signal from the outside.
@@ -145,6 +146,7 @@ vi.mock("hls.js", () => ({
 
     on(event: string, handler: (event: unknown, data: unknown) => void) {
       if (event === "error") hlsJS.errorHandler = handler;
+      if (event === "bufferAppended") hlsJS.bufferAppendedHandler = handler;
     }
     loadSource(url: string) {
       this.url = url;
@@ -3100,6 +3102,7 @@ describe("VideoPlayer stale generation recovery", () => {
     hlsJS.startLoad.mockClear();
     hlsJS.loadSource.mockClear();
     hlsJS.errorHandler = null;
+    hlsJS.bufferAppendedHandler = null;
     vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
     vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
     vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => {});
@@ -3188,6 +3191,37 @@ describe("VideoPlayer stale generation recovery", () => {
     // recovery path.
     expect(hlsJS.loadSource).toHaveBeenCalledTimes(2);
     expect(hlsJS.startLoad).toHaveBeenCalledTimes(1);
+  });
+
+  it("re-arms the stale budget on progress so three seek/recovery cycles each recover", async () => {
+    const onPlanFailure = vi.fn();
+    renderPlayer({
+      plan: hlsTranscodePlan(),
+      streamUrl: transcodeStreamUrl,
+      onPlanFailure,
+      shouldAutoPlay: false,
+    });
+    await waitFor(() => expect(hlsJS.errorHandler).toBeTypeOf("function"));
+    expect(hlsJS.bufferAppendedHandler).toBeTypeOf("function");
+    hlsJS.loadSource.mockClear();
+    hlsJS.startLoad.mockClear();
+
+    // Three separated seek/recovery cycles: each stale-sgen frag is followed by
+    // media reaching the buffer, so progress re-arms the budget. Without the
+    // reset the third cycle would inherit an exhausted counter and misroute
+    // into a failure-recovery replan.
+    for (let cycle = 0; cycle < 3; cycle++) {
+      act(() => {
+        hlsJS.errorHandler?.("error", staleSegfault());
+      });
+      act(() => {
+        hlsJS.bufferAppendedHandler?.("bufferAppended");
+      });
+    }
+
+    expect(hlsJS.loadSource).toHaveBeenCalledTimes(3);
+    expect(hlsJS.startLoad).not.toHaveBeenCalled();
+    expect(onPlanFailure).not.toHaveBeenCalled();
   });
 });
 

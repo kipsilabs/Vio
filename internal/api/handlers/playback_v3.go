@@ -6962,13 +6962,6 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 		if replanErr.reason == "session_expired" {
 			return playback.DecisionResponseV3{}, replanSessionNotFoundV3()
 		}
-		// A zombie failure recovery skipped on the liveness gate is not a
-		// terminal for the route: the client is gone, so there is nothing to
-		// recover and no decision to persist. Answer the same fast 404 a dead
-		// session gets, leaving the lease to the deferred non-terminal release.
-		if replanErr.reason == "session_canceled" {
-			return playback.DecisionResponseV3{}, replanSessionNotFoundV3()
-		}
 		response := playback.NewTerminalResponseV3(replanErr.reason, replanErr.message, replanErr.retryable)
 		encoded, _ := json.Marshal(response)
 		// The failed replan did not adopt the stated policy, so the terminal
@@ -8003,29 +7996,37 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	if !ok {
 		return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: "internal_error", message: "The live session manager does not support atomic replacement."}
 	}
-	// Zombie-recovery liveness gate. A transport cancel (the viewer navigated
-	// off, or hls.js gave up) is recorded on the session; a failure_recovery
-	// arriving shortly after is a zombie. Running it would exhaust the
-	// adaptation ladder and persist a terminal for a client that can never
-	// consume it, and would risk poisoning resume with a dead-session verdict.
-	// Only a failure recovery is gated: a user-intent replan is never a zombie
-	// (the client is plainly live to send it), and a cancel older than the
-	// window is treated as stale, so a genuinely live client that reconnects is
-	// never blocked. The attempt is left untouched on the skip, so a later
-	// genuine replan still works.
-	if failureRecoveryOperationV3(operation) && sessionClientCanceledRecentlyV3(session.ClientCanceledAt, time.Now()) {
-		slog.InfoContext(r.Context(), "playback failure recovery skipped for a canceled session",
+	// A transport cancel is evidence about one request, not a verdict on the
+	// session: the viewer may have navigated off, or hls.js may have given up
+	// and retried. It must never fence a live client's failure_recovery or
+	// answer it as a missing session — at this layer a live recovery is
+	// indistinguishable from a stale one, and running a superfluous recovery
+	// costs far less than retiring a healthy session. Keep the mark
+	// route-scoped so a predecessor's cancel cannot outlive its route, log it
+	// for diagnostics, and drop a superseded one. A genuine stop stays fenced
+	// by the session lookup above, which answers session_expired when the
+	// session is gone or stopped.
+	if failureRecoveryOperationV3(operation) &&
+		sessionClientCanceledRecentlyV3(session.ClientCanceled.At, time.Now()) {
+		currentRoute := session.ClientCancelNamesCurrentRoute()
+		outcome := "zombie_recovery_candidate"
+		if !currentRoute {
+			outcome = "zombie_recovery_stale"
+		}
+		slog.InfoContext(r.Context(), "playback failure recovery ran after a canceled transport",
 			logComponentKey, playbackLogValueV3,
-			"outcome", "zombie_recovery_skipped",
+			"outcome", outcome,
 			"session_id", record.SessionID,
 			"operation", string(operation),
 			"failure_classification", req.Failure.Classification,
-			"canceled_at", session.ClientCanceledAt.UTC().Format(time.RFC3339Nano),
+			"canceled_at", session.ClientCanceled.At.UTC().Format(time.RFC3339Nano),
+			"canceled_revision", session.ClientCanceled.StreamRevision,
+			"canceled_binding_generation", session.ClientCanceled.BindingGeneration,
 		)
-		return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{
-			reason:    "session_canceled",
-			message:   "The client canceled playback; recovery was not run for the ended session.",
-			retryable: true,
+		if !currentRoute {
+			// The mark names a route this session has already replaced. Drop it
+			// so a predecessor's cancel cannot colour a later read.
+			_ = h.sessionMgr.ClearClientCanceled(record.SessionID)
 		}
 	}
 	// An explicit virtual version pin is never substituted. A decode rejection
@@ -10959,16 +10960,15 @@ func failureRecoveryOperationV3(operation playback.ReplanOperationV3) bool {
 }
 
 // clientCanceledRecoveryWindow bounds how long after an observed transport
-// cancel a failure_recovery is treated as a zombie. Production saw the cancel
-// followed 11-22s later by the client's recovery; a wider window also covers a
-// client that retries its recovery a few times before giving up. A cancel older
-// than this is stale liveness evidence, so a genuinely live client that
-// reconnects is never permanently blocked.
+// cancel a failure_recovery that still names the same route is reported as a
+// zombie candidate. It only colours the diagnostic: a cancel is never proof the
+// session died, so it does not fence the recovery. The recovery path still
+// drops a mark a committed successor has superseded.
 const clientCanceledRecoveryWindow = 90 * time.Second
 
 // sessionClientCanceledRecentlyV3 reports whether a transport cancel was
-// observed for the session inside the zombie-recovery window. A zero cancel
-// time means no cancel was recorded.
+// observed for the session inside the diagnostic window. A zero cancel time
+// means no cancel was recorded.
 func sessionClientCanceledRecentlyV3(canceledAt, now time.Time) bool {
 	if canceledAt.IsZero() {
 		return false

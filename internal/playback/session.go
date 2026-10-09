@@ -29,6 +29,29 @@ const (
 	OutputProtocolHTTP    = "http"
 )
 
+// ClientCancelEvidence records when a transport serve observed the client
+// cancel the request, scoped to the route it was observed on. A cancel is
+// evidence about one request, never a verdict on the session: the viewer may
+// have navigated off, or hls.js may have given up and retried. The revision and
+// binding generation let a later reader tell a cancel for the current route
+// from a predecessor's stale one instead of treating the timestamp alone as
+// proof the session died. Zero At means no observed cancellation.
+type ClientCancelEvidence struct {
+	At                time.Time
+	StreamRevision    uint64
+	BindingGeneration uint64
+}
+
+// ClientCancelNamesCurrentRoute reports whether the recorded transport cancel
+// still names this session's current route. A newer stream revision or binding
+// generation means the cancel described a request the session has since
+// superseded, so it is evidence about a predecessor route, not the live one.
+func (s *Session) ClientCancelNamesCurrentRoute() bool {
+	return !s.ClientCanceled.At.IsZero() &&
+		s.ClientCanceled.StreamRevision == s.streamRevision &&
+		s.ClientCanceled.BindingGeneration == s.virtualSourceGeneration
+}
+
 // Session represents an active playback session.
 type Session struct {
 	ID                   string
@@ -176,15 +199,13 @@ type Session struct {
 
 	Position float64
 	IsPaused bool
-	// ClientCanceledAt records when a transport serve observed the client
-	// cancel the request (the viewer navigating away, or hls.js giving up). A
-	// failure_recovery arriving shortly after is a zombie: the client is gone,
-	// and running recovery would spend the adaptation budget on a terminal for
-	// a session that can never consume it. It is bounded by
-	// clientCanceledRecoveryWindow in the handler and cleared by a committed
-	// replacement plan, so a genuinely live client that reconnects is never
-	// blocked. Zero means no observed cancellation.
-	ClientCanceledAt time.Time
+	// ClientCanceled records the last transport cancel observed for this
+	// session, scoped to the route revision and binding generation it happened
+	// on. It is liveness evidence for one request, not a session verdict: the
+	// recovery path never uses it to fence a live client, only to recognise a
+	// cancel that a committed successor has already superseded. A committed
+	// replacement, a rollback, or a progress report clears it.
+	ClientCanceled ClientCancelEvidence
 	// StopReported marks a session a client reported stopped without an ID
 	// that could end it (#1454). It only hides the session from the live
 	// admin view: pause state and idle grace are untouched, so a stale stop
@@ -1214,9 +1235,8 @@ func (m *SessionManager) UpdateProgress(sessionID string, position float64, isPa
 	s.StopReported = false
 	// A fresh progress report is positive liveness evidence: the client is
 	// still talking to us, so any earlier transport cancel no longer describes
-	// it. This is what lets a genuine reconnect escape the zombie-recovery
-	// gate instead of being blocked by a stale cancel.
-	s.ClientCanceledAt = time.Time{}
+	// it.
+	s.ClientCanceled = ClientCancelEvidence{}
 	s.streamRevision++
 	m.touchSessionLocked(s)
 	return nil
@@ -1237,11 +1257,12 @@ func (m *SessionManager) MarkStopReported(sessionID string) error {
 }
 
 // MarkClientCanceled records that a transport serve observed the client cancel
-// the request (see Session.ClientCanceledAt). The mark is best-effort liveness
-// evidence: a failure_recovery arriving inside the recovery window is treated
-// as a zombie and does not run. A committed replacement plan, or a progress
-// report, clears it so a live client is never blocked. An unknown session is
-// ErrSessionNotFound, matching the other session mutators.
+// the request, scoped to the session's current route revision and binding
+// generation (see Session.ClientCanceled). The mark is best-effort liveness
+// evidence about that route only: a committed successor, a rollback, or a
+// progress report clears it, and the recovery path never treats it as proof the
+// session died. An unknown session is ErrSessionNotFound, matching the other
+// session mutators.
 func (m *SessionManager) MarkClientCanceled(sessionID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1249,13 +1270,17 @@ func (m *SessionManager) MarkClientCanceled(sessionID string) error {
 	if !ok {
 		return ErrSessionNotFound
 	}
-	s.ClientCanceledAt = time.Now()
+	s.ClientCanceled = ClientCancelEvidence{
+		At:                time.Now(),
+		StreamRevision:    s.streamRevision,
+		BindingGeneration: s.virtualSourceGeneration,
+	}
 	return nil
 }
 
-// ClearClientCanceled drops a session's client-canceled mark. A progress
-// report or a committed replacement plan calls it so a live client that
-// reconnects after a transient cancel is not held under the zombie gate.
+// ClearClientCanceled drops a session's client-canceled evidence. A progress
+// report, a committed replacement plan, or a rollback calls it so a live client
+// that reconnects after a transient cancel carries no stale evidence.
 func (m *SessionManager) ClearClientCanceled(sessionID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1263,7 +1288,7 @@ func (m *SessionManager) ClearClientCanceled(sessionID string) error {
 	if !ok {
 		return ErrSessionNotFound
 	}
-	s.ClientCanceledAt = time.Time{}
+	s.ClientCanceled = ClientCancelEvidence{}
 	return nil
 }
 
@@ -1543,7 +1568,11 @@ func restoreSessionStreamStateLocked(s *Session, state SessionStreamState) {
 	s.AudioTrackIndex = state.AudioTrackIndex
 	s.TranscodeAudio = state.TranscodeAudio
 	s.RemuxDVMode = state.RemuxDVMode
+	// The profile and its first-verified-wins pin are one fact; restoring the
+	// profile without the pin would leave the rollback applying the withdrawn
+	// successor's pin to the previous file's route.
 	s.DVProfile = state.DVProfile
+	s.DVProfilePin = state.DVProfilePin
 	s.ClientIP = state.ClientIP
 	s.ClientName = state.ClientName
 	s.ClientVersion = state.ClientVersion
@@ -1980,7 +2009,7 @@ func (m *SessionManager) applyReplacementLocked(
 	// an ID-less stop no longer applies, and an earlier transport cancel no
 	// longer describes this committed successor.
 	s.StopReported = false
-	s.ClientCanceledAt = time.Time{}
+	s.ClientCanceled = ClientCancelEvidence{}
 	applySessionStreamStateLocked(s, replacement.StreamState)
 	s.virtualSourceGeneration++
 	if replacement.PositionSeconds != nil {
@@ -2013,7 +2042,7 @@ func (m *SessionManager) RollbackReplacement(sessionID string, rollback SessionR
 	s.StopReported = false
 	// A rollback re-arms the previous route; the canceled mark belonged to the
 	// withdrawn successor, so it must not linger past the rollback.
-	s.ClientCanceledAt = time.Time{}
+	s.ClientCanceled = ClientCancelEvidence{}
 	restoreSessionStreamStateLocked(s, rollback.previousStreamState)
 	s.virtualSourceGeneration++
 	if rollback.restoreProgress {
@@ -2202,12 +2231,12 @@ func (m *SessionManager) TouchActivity(sessionID string) error {
 		return ErrSessionNotFound
 	}
 
-	// Any recorded activity (progress, an HLS manifest or segment request, a
-	// stream open/end, a control-socket frame) is positive liveness evidence:
-	// the client is still talking to us, so an earlier transport cancel no
-	// longer describes it. This is what keeps the zombie-recovery gate from
-	// blocking a live client after one transient canceled request.
-	s.ClientCanceledAt = time.Time{}
+	// Activity refreshes the idle deadline but deliberately does not clear the
+	// transport-cancel evidence: which request a cancel belonged to is not a
+	// property of "anything touched us since", and clearing on every HLS
+	// manifest or segment request made the evidence timing-dependent. The
+	// revision and binding generation it carries are what let a reader tell a
+	// current-route cancel from a predecessor's.
 	m.touchSessionLocked(s)
 	return nil
 }

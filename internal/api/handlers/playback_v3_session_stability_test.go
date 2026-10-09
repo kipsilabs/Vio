@@ -81,11 +81,11 @@ func postReplanRawV3(t *testing.T, handler *PlaybackHandler, sessionID string, r
 	return rr.Code, response
 }
 
-// Zombie recovery: a failure_recovery that arrives after the client canceled a
-// transport must not run recovery or persist a terminal on the dead session.
-// Production saw client_canceled followed 11-22s later by failure_recovery to
-// adaptation_exhausted, exhausting the budget for a client that was gone.
-func TestReplanFailureRecoverySkipsCanceledSession(t *testing.T) {
+// A live client that canceled one transport must still be able to recover: the
+// cancel is evidence about that request, not a verdict on the session. The
+// recovery runs and returns a plan instead of answering the healthy session
+// with the missing-session 404 that would retire it.
+func TestReplanFailureRecoveryAfterTransportCancelRuns(t *testing.T) {
 	handler, start, _ := sessionStabilityHandlerV3(t)
 	started := sessionStabilityStartV3(t, handler, start)
 	plan := started.PlaybackPlan
@@ -93,35 +93,94 @@ func TestReplanFailureRecoverySkipsCanceledSession(t *testing.T) {
 		t.Fatalf("fixture expected direct play, got %s", plan.Delivery)
 	}
 
-	// The transport observed the client cancel (a stream abort/navigate-away).
+	// The transport observed the client cancel (a transient abort/hls.js retry).
 	if err := handler.sessionMgr.MarkClientCanceled(started.SessionID); err != nil {
 		t.Fatalf("mark canceled: %v", err)
 	}
-	status, response := postReplanRawV3(t, handler, started.SessionID, sessionStabilityRecoveryV3(start, plan, "zombie-recovery-0001"))
-	if status != http.StatusNotFound {
-		t.Fatalf("canceled-session recovery status = %d, want 404 (body terminal=%#v)", status, response.Terminal)
+	status, response := postReplanRawV3(t, handler, started.SessionID, sessionStabilityRecoveryV3(start, plan, "live-cancel-recovery-0001"))
+	if status != http.StatusOK {
+		t.Fatalf("live cancel recovery status = %d, want 200 (body terminal=%#v)", status, response.Terminal)
 	}
-	if response.Terminal != nil {
-		t.Fatalf("zombie recovery returned a terminal: %#v", response.Terminal)
+	if response.Terminal != nil || response.PlaybackPlan == nil {
+		t.Fatalf("recovery after a transport cancel did not run: terminal=%#v", response.Terminal)
 	}
-	// The attempt must not have been stopped or terminalized: a later genuine
-	// replan on a live session still works.
+	// The attempt is still live: nothing was stopped or terminalized.
 	record, err := handler.PlanStoreV3.GetAttempt(t.Context(), started.SessionID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if record.StoppedAt != nil || record.CurrentPlanID != plan.PlanID {
-		t.Fatalf("zombie recovery mutated the attempt: stopped=%v plan=%q want %q", record.StoppedAt, record.CurrentPlanID, plan.PlanID)
+	if record.StoppedAt != nil {
+		t.Fatalf("recovery after a cancel stopped the attempt: %v", record.StoppedAt)
+	}
+}
+
+// A predecessor route's cancel must not outlive its route. Once a successor
+// commits, the mark is stale: the recovery runs, and the stale evidence is
+// dropped so it cannot colour a later read of the successor.
+func TestReplanFailureRecoveryIgnoresLatePredecessorCancel(t *testing.T) {
+	handler, start, _ := sessionStabilityHandlerV3(t)
+	started := sessionStabilityStartV3(t, handler, start)
+	plan := started.PlaybackPlan
+	if plan.Delivery != playback.DeliveryOriginalHTTPV3 {
+		t.Fatalf("fixture expected direct play, got %s", plan.Delivery)
 	}
 
-	// A genuine progress report is positive liveness evidence: clear the mark
-	// and the same recovery proceeds.
-	if err := handler.sessionMgr.ClearClientCanceled(started.SessionID); err != nil {
-		t.Fatalf("clear canceled: %v", err)
+	// The cancel is recorded on the current route, then a successor commits a
+	// new revision (the session's own route advanced past the canceled request).
+	if err := handler.sessionMgr.MarkClientCanceled(started.SessionID); err != nil {
+		t.Fatalf("mark canceled: %v", err)
 	}
-	recovered := postPlaybackReplanV3(t, handler, started.SessionID, sessionStabilityRecoveryV3(start, plan, "live-recovery-0002"))
-	if recovered.Terminal != nil || recovered.PlaybackPlan == nil {
-		t.Fatalf("live-session recovery did not run: terminal=%#v", recovered.Terminal)
+	if err := handler.sessionMgr.UpdateStreamState(started.SessionID, playback.SessionStreamState{
+		PlayMethod: playback.PlayDirect, BasePlayMethod: playback.PlayDirect,
+		TranscodeRouteSet: true, SubtitleTrackIndex: -1,
+	}); err != nil {
+		t.Fatalf("commit successor revision: %v", err)
+	}
+	session, err := handler.sessionMgr.GetSession(started.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.ClientCancelNamesCurrentRoute() {
+		t.Fatal("a cancel for the superseded route still names the current route")
+	}
+
+	status, response := postReplanRawV3(t, handler, started.SessionID, sessionStabilityRecoveryV3(start, plan, "successor-recovery-0002"))
+	if status != http.StatusOK {
+		t.Fatalf("successor recovery status = %d, want 200 (body terminal=%#v)", status, response.Terminal)
+	}
+	if response.Terminal != nil || response.PlaybackPlan == nil {
+		t.Fatalf("successor recovery did not run: terminal=%#v", response.Terminal)
+	}
+	// The predecessor's mark is gone, so it cannot gate or mislabel a later
+	// recovery on the successor.
+	session, err = handler.sessionMgr.GetSession(started.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !session.ClientCanceled.At.IsZero() {
+		t.Fatalf("stale predecessor cancel survived the successor recovery: %#v", session.ClientCanceled)
+	}
+}
+
+// Only a genuine stop fences recovery. A canceled transport does not; a stopped
+// session still answers the missing-session verdict the client retires on.
+func TestReplanFailureRecoveryAfterStopFences(t *testing.T) {
+	handler, start, _ := sessionStabilityHandlerV3(t)
+	started := sessionStabilityStartV3(t, handler, start)
+	plan := started.PlaybackPlan
+	if plan.Delivery != playback.DeliveryOriginalHTTPV3 {
+		t.Fatalf("fixture expected direct play, got %s", plan.Delivery)
+	}
+
+	if err := handler.sessionMgr.StopSession(started.SessionID); err != nil {
+		t.Fatalf("stop session: %v", err)
+	}
+	status, response := postReplanRawV3(t, handler, started.SessionID, sessionStabilityRecoveryV3(start, plan, "stopped-recovery-0003"))
+	if status != http.StatusNotFound {
+		t.Fatalf("stopped-session recovery status = %d, want 404 (body terminal=%#v)", status, response.Terminal)
+	}
+	if response.Terminal != nil {
+		t.Fatalf("stopped-session recovery returned a terminal: %#v", response.Terminal)
 	}
 }
 
