@@ -213,6 +213,19 @@ func TestChapterThumbnailSoftwareToneMapDefaultsDisabled(t *testing.T) {
 	}
 }
 
+// TestTranscodeThrottleDefaultsDisabled verifies throttling remains opt-in and
+// the admin UI default matches the runtime reader, which enables it only on an
+// explicit "true".
+func TestTranscodeThrottleDefaultsDisabled(t *testing.T) {
+	effective := EffectiveAdminSettings(nil)
+	if got := effective["enable_transcode_throttle"]; got != "false" {
+		t.Fatalf("enable_transcode_throttle default = %q, want false", got)
+	}
+	if got := effective["transcode_throttle_seconds"]; got != "300" {
+		t.Fatalf("transcode_throttle_seconds default = %q, want 300", got)
+	}
+}
+
 // TestTranscodeToneMapPoliciesDefaultDisabled verifies tone mapping remains opt-in.
 func TestTranscodeToneMapPoliciesDefaultDisabled(t *testing.T) {
 	effective := EffectiveAdminSettings(nil)

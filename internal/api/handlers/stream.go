@@ -1748,6 +1748,15 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 				_ = h.sessionMgr.EndTransport(sessionID)
 			}()
 		}
+		// A progressive remux is one long response whose FFmpeg is canceled only
+		// by this request's context. A server-initiated stop — StopSession, an
+		// admin kill, an idle reap — would otherwise leave it streaming a route
+		// the session manager has already withdrawn, so feed the session's
+		// transport-stop watch, together with the request context, into the
+		// remux abort. The request context also interrupts a response write
+		// blocked on a client that stopped reading.
+		remuxAbort, releaseRemuxAbort := watchProgressiveRemuxAbort(r.Context(), h.sessionMgr, sessionID)
+		defer releaseRemuxAbort()
 		seekSeconds := 0.0
 		if seekStr := r.URL.Query().Get("seek"); seekStr != "" {
 			if s, err := strconv.ParseFloat(seekStr, 64); err == nil && s >= 0 {
@@ -1777,6 +1786,12 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 				TargetAudioChannels:    session.TargetAudioChannels,
 				TargetAudioBitrateKbps: session.TargetAudioBitrateKbps,
 				TimingStart:            requestStart,
+				// The request context (client disconnect) and the session's
+				// transport-stop watch both end the response. Without this a
+				// session stop cannot withdraw a remux the client is still being
+				// fed; the request context alone misses a server-initiated stop
+				// whose client keeps reading.
+				Abort: remuxAbort,
 				// A pre-body start failure must leave the response
 				// uncommitted so the handler can fail over to a sibling
 				// candidate; the v2 writer locks the first >=400 status and
@@ -2856,6 +2871,75 @@ func (h *StreamHandler) abortPlaybackSession(ctx context.Context, session *playb
 	}
 	h.finalizeSessionAbort(ctx, session, true, "stream_abort")
 	markAttemptStoppedServerSide(ctx, h.PlanStoreV3, h.StreamDeny, session.ID)
+}
+
+// transportStopWatcher is the optional session-manager surface a progressive
+// remux uses to learn that its session was stopped. *playback.SessionManager
+// implements it; a minimal/test manager without it keeps the request-context
+// behavior, in which a server-initiated stop cannot reach the response.
+type transportStopWatcher interface {
+	WatchTransportStop(sessionID string) (<-chan struct{}, func())
+}
+
+// watchProgressiveRemuxAbort returns a channel closed when the request ends
+// (client disconnect or write failure) or the session is stopped server-side,
+// plus the release that unregisters the watch. The remux is a single long
+// response, so both signals must end it: the request context covers the client
+// leaving, and the transport-stop watch covers StopSession and an idle reap,
+// neither of which cancels an in-flight request whose client keeps reading.
+//
+// The helper only borrows the manager's watch; it never stops the session, so
+// a client disconnect remains distinct from a server stop.
+func watchProgressiveRemuxAbort(ctx context.Context, sessionMgr SessionManagerInterface, sessionID string) (<-chan struct{}, func()) {
+	abort := make(chan struct{})
+	// The abort channel closes at most once no matter which signal wins.
+	var once sync.Once
+	closer := func() { once.Do(func() { close(abort) }) }
+
+	// The request context ends the response on a client disconnect and, more
+	// sharply, interrupts a write blocked on a client that stopped reading —
+	// which the remux's own write loop cannot detect until the rolling deadline.
+	var stopOnRequestEnd func() bool
+	if ctx != nil {
+		stopOnRequestEnd = context.AfterFunc(ctx, closer)
+	}
+
+	watcher, ok := sessionMgr.(transportStopWatcher)
+	if !ok || sessionID == "" {
+		return abort, func() {
+			if stopOnRequestEnd != nil {
+				stopOnRequestEnd()
+			}
+		}
+	}
+	stop, release := watcher.WatchTransportStop(sessionID)
+	if stop == nil {
+		return abort, func() {
+			if stopOnRequestEnd != nil {
+				stopOnRequestEnd()
+			}
+			release()
+		}
+	}
+
+	quit := make(chan struct{})
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		select {
+		case <-stop:
+			closer()
+		case <-quit:
+		}
+	}()
+	return abort, func() {
+		if stopOnRequestEnd != nil {
+			stopOnRequestEnd()
+		}
+		close(quit)
+		<-finished
+		release()
+	}
 }
 
 func (h *StreamHandler) handleTransportStartFailure(ctx context.Context, session *playback.Session, file *models.MediaFile, err error) {
