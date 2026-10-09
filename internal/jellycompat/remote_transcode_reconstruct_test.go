@@ -1067,7 +1067,7 @@ func TestStartRemoteVideoToolboxToneMapUsesResolutionAwareBitrate(t *testing.T) 
 			}
 			writeJSON(w, http.StatusAccepted, transcodenode.TranscodeStartResponse{
 				HWAccel: request.HWAccel, ToneMapMode: request.ToneMapMode,
-				// Throttling is on by default; a real node echoes the policy.
+				// A real node echoes the requested policy.
 				ThrottleSeconds: request.ThrottleSeconds,
 			})
 		default:
@@ -1145,7 +1145,7 @@ func TestStartRemoteToneMapTimeoutFallsBackToSoftwareAfterCleanup(t *testing.T) 
 			}
 			writeJSON(w, http.StatusAccepted, transcodenode.TranscodeStartResponse{
 				HWAccel: request.HWAccel, ToneMapMode: request.ToneMapMode,
-				// Throttling is on by default; a real node echoes the policy.
+				// A real node echoes the requested policy.
 				ThrottleSeconds: request.ThrottleSeconds,
 			})
 		case r.Method == http.MethodDelete && r.URL.Path == "/transcode/upstream-1":
