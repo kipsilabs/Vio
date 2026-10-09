@@ -307,7 +307,7 @@ export default function PlaybackSettings() {
       setConfirmRemake(true);
       return;
     }
-    void form.save();
+    return form.save();
   };
   const chapterExecution =
     form.getValue("playback.chapter_thumbnail_execution") || IMAGE_EXECUTION_DEFAULT;
@@ -793,7 +793,9 @@ export default function PlaybackSettings() {
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction onClick={() => void form.save()}>Save</AlertDialogAction>
+            <AlertDialogAction onClick={() => void form.save().catch(() => {})}>
+              Save
+            </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>

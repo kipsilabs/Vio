@@ -2725,21 +2725,26 @@ func (s *MetadataService) mergeAndPersist(
 
 	// Persist per-source ratings. The item row does not carry them, so the
 	// merge above saw no stored sources and passed every reported one through
-	// (or none, under a FieldRating lock). The stored rows are merged by the
-	// write instead: fill-empty keeps each source already stored, and
-	// replace-unlocked overwrites the sources this refresh reported. Identify
-	// replaces the whole set, even with an empty one, because it keeps the
-	// content_id while changing the title: a source only the previous match
-	// reported would otherwise stay on the item for good. Like the rating
-	// columns, they are provider-invariant and written for every language.
+	// (or none, under a FieldRating lock); the chain's provider order already
+	// picked one entry per source. The stored rows are merged by the write
+	// instead. A manual or scheduled refresh overwrites the sources this
+	// refresh reported: scores and vote counts keep moving after release, and
+	// discovery rows rank by the TMDB count. The enrichment-only bulk pass
+	// carries one provider's answer, so it only fills sources the item lacks
+	// and never overwrites the chain's choice. Identify replaces the whole set,
+	// even with an empty one, because it keeps the content_id while changing
+	// the title: a source only the previous match reported would otherwise
+	// stay on the item for good. Like the rating columns, they are
+	// provider-invariant and written for every language.
 	if s.ratingSourceRepo != nil && !isFieldLocked(locked, FieldRating) {
 		sources := itemRatingSourcesFromResult(contentID, accumulator.RatingSources)
+		replace := mergeMode == MergeReplaceUnlocked || (req.Mode == ModeScheduledRefresh && !req.enrichmentOnly)
 		var err error
 		switch {
 		case req.Mode == ModeIdentify:
 			err = s.ratingSourceRepo.Replace(ctx, contentID, sources)
 		case len(sources) > 0:
-			err = s.ratingSourceRepo.Upsert(ctx, contentID, sources, mergeMode == MergeReplaceUnlocked)
+			err = s.ratingSourceRepo.Upsert(ctx, contentID, sources, replace)
 		}
 		if err != nil {
 			slog.WarnContext(ctx, "metadata: failed to store rating sources", "component", "metadata", "content_id", contentID, "error", err)

@@ -1577,9 +1577,36 @@
         ],
         "type": "object"
       },
+      "AdminAuditChange": {
+        "additionalProperties": false,
+        "properties": {
+          "after": {
+            "type": "string"
+          },
+          "before": {
+            "type": "string"
+          },
+          "field": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "field"
+        ],
+        "type": "object"
+      },
       "AdminAuditLog": {
         "additionalProperties": false,
         "properties": {
+          "action": {
+            "type": "string"
+          },
+          "changes": {
+            "items": {
+              "$ref": "#/components/schemas/AdminAuditChange"
+            },
+            "type": "array"
+          },
           "client_ip": {
             "type": "string"
           },
@@ -1617,6 +1644,12 @@
           "status_code": {
             "format": "int64",
             "type": "integer"
+          },
+          "target_id": {
+            "type": "string"
+          },
+          "target_type": {
+            "type": "string"
           },
           "timestamp": {
             "description": "RFC 3339 instant in UTC with millisecond precision",
@@ -8157,6 +8190,15 @@
             "description": "Whether the current principal may use the capability",
             "type": "boolean"
           },
+          "audit_actions": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "audit_change_details": {
+            "type": "boolean"
+          },
           "available": {
             "type": "boolean"
           },
@@ -8185,6 +8227,8 @@
           }
         },
         "required": [
+          "audit_change_details",
+          "audit_actions",
           "available",
           "protocol",
           "streams",
@@ -82359,6 +82403,43 @@
             }
           },
           {
+            "explode": false,
+            "in": "query",
+            "name": "action",
+            "schema": {
+              "maxLength": 64,
+              "type": "string"
+            }
+          },
+          {
+            "explode": false,
+            "in": "query",
+            "name": "target_type",
+            "schema": {
+              "maxLength": 64,
+              "type": "string"
+            }
+          },
+          {
+            "explode": false,
+            "in": "query",
+            "name": "target_id",
+            "schema": {
+              "maxLength": 64,
+              "type": "string"
+            }
+          },
+          {
+            "explode": false,
+            "in": "query",
+            "name": "actor_user_id",
+            "schema": {
+              "maxLength": 20,
+              "pattern": "^[1-9][0-9]*$",
+              "type": "string"
+            }
+          },
+          {
             "description": "Page size; default 50, maximum 200",
             "explode": false,
             "in": "query",
@@ -82596,6 +82677,43 @@
       "get": {
         "operationId": "connectAdminLogsSocket",
         "parameters": [
+          {
+            "description": "audit: domain action filter.",
+            "in": "query",
+            "name": "action",
+            "schema": {
+              "maxLength": 64,
+              "type": "string"
+            }
+          },
+          {
+            "description": "audit: acting account, including an impersonator.",
+            "in": "query",
+            "name": "actor_user_id",
+            "schema": {
+              "maxLength": 20,
+              "pattern": "^[1-9][0-9]*$",
+              "type": "string"
+            }
+          },
+          {
+            "description": "audit: affected entity type.",
+            "in": "query",
+            "name": "target_type",
+            "schema": {
+              "maxLength": 64,
+              "type": "string"
+            }
+          },
+          {
+            "description": "audit: affected entity identifier.",
+            "in": "query",
+            "name": "target_id",
+            "schema": {
+              "maxLength": 64,
+              "type": "string"
+            }
+          },
           {
             "description": "Offer silo.admin-logs.v2 followed by silo.ticket.\u003csingle-use-ticket\u003e.",
             "in": "header",

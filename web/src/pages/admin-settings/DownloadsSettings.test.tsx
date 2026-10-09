@@ -17,6 +17,10 @@ function makeForm(values: Record<string, string> = {}, dirty: string[] = []) {
   const dirtyKeys = new Set(dirty);
   return {
     isLoading: false,
+    isPending: false,
+    loadError: false,
+    loaded: true,
+    retryLoad: vi.fn(),
     getValue: (key: string) => values[key] ?? "",
     setValue: vi.fn(),
     isDirty: (key: string) => dirtyKeys.has(key),
@@ -149,4 +153,14 @@ describe("DownloadsSettings prepared file directory", () => {
 
     expect(lastForm().setValue).toHaveBeenCalledWith("download.artifact_dir", "");
   });
+});
+
+it("shows a failed read without editable defaults and permits retry", () => {
+  const form = { ...makeForm(), loaded: false, loadError: true };
+  useSettingsFormMock.mockReturnValue(form);
+  render(<DownloadsSettings />);
+  expect(screen.getByRole("alert")).toHaveTextContent("could not be loaded");
+  expect(screen.queryByLabelText("Per-user bandwidth")).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+  expect(form.retryLoad).toHaveBeenCalledOnce();
 });

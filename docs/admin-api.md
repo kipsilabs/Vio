@@ -3113,3 +3113,37 @@ out-of-range numeric query parameters instead of rejecting them. Those routes ar
 frozen: no feature work lands on them, and Silo 1.0 answers the whole `/api/v1`
 namespace with `410 Gone` and the `client_upgrade_required` problem code. Build
 against `/api/v2`.
+
+### Account and permission audit details (v2)
+
+Successful v2 administrator account and access-group mutations record an audit
+row in the mutation transaction. Actions are `user.created`, `user.updated`,
+`user.deleted`, `access_group.created`, `access_group.updated`, and
+`access_group.deleted`. `target_type` and `target_id` identify the affected
+entity; `user_id` identifies the authenticated subject, and a present
+`impersonator_user_id` identifies the acting administrator. Actor filters use
+`COALESCE(impersonator_user_id, user_id)`.
+
+`changes` lists changed allowlisted identity/policy fields. `before` and `after`
+are optional strings containing canonical JSON values: JSON null represents an
+unset account override, while an absent side represents creation/deletion.
+A password change includes only `{ "field": "password" }`; passwords, hashes,
+tokens, arbitrary request bodies and headers are excluded. Permission arrays
+show the exact prior and resulting membership. Rollbacks record no successful
+domain action, and a repeated identical policy write has no change details.
+
+Audit history and live streams accept `action`, `actor_user_id`, `target_type`,
+and `target_id` alongside existing filters. History cursors bind these filters.
+`GET /api/v2/admin/logs/ws/capabilities` advertises `audit_change_details` and
+`audit_actions`. Historical request rows continue to have no domain details.
+Live rows publish after commit; history remains authoritative if a frame is
+missed. Existing live delivery does not promise gap-free or late-commit traversal.
+The frozen v1 read/socket projections retain their previous fields.
+
+Audit detail index readiness: the additive migration creates metadata-only
+partitioned indexes for action and target filters. Primary API startup and
+`--migrate-only` build historical leaf indexes concurrently and attach them before
+reporting readiness. A failed or canceled build leaves startup incomplete and is
+safe to retry; ordinary request writers remain available on existing API nodes.
+Future partitions inherit the completed parent indexes. Proxy/transcode nodes do
+not run this schema maintenance.

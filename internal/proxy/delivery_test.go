@@ -50,6 +50,9 @@ func requestDelivery(t *testing.T, server *httptest.Server, method string, heade
 	}
 	_, _ = io.Copy(io.Discard, resp.Body)
 	_ = resp.Body.Close()
+	// Receiving the body can precede the server's final delivery callback.
+	// Close waits for the handler to finish before callers inspect its records.
+	server.Close()
 	return resp.StatusCode
 }
 

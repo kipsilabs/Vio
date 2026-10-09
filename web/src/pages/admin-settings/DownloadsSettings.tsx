@@ -5,6 +5,7 @@ import { LimitField } from "@/components/settings/LimitField";
 import { PathSettingField } from "@/components/settings/PathSettingField";
 import { SettingsPageHeader } from "@/components/settings/SettingsPageHeader";
 import { SettingsSubheading } from "@/components/settings/SettingsSubheading";
+import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useRestartKeys } from "@/hooks/useRestartKeys";
 import { useSettingsForm } from "@/hooks/useSettingsForm";
@@ -61,7 +62,7 @@ export default function DownloadsSettings() {
     form.getValue("playback.transcode_dir"),
   );
 
-  if (form.isLoading)
+  if (form.isPending)
     return (
       <div className="space-y-6" role="status" aria-label="Loading settings">
         <Skeleton className="h-8 w-40" />
@@ -72,6 +73,18 @@ export default function DownloadsSettings() {
         <span className="sr-only">Loading settings</span>
       </div>
     );
+
+  if (form.loadError && !form.loaded) {
+    return (
+      <div className="space-y-4">
+        <SettingsPageHeader title="Downloads" />
+        <p role="alert">Download settings could not be loaded. Retry before editing limits.</p>
+        <Button variant="outline" onClick={() => void form.retryLoad()}>
+          Retry
+        </Button>
+      </div>
+    );
+  }
 
   return (
     <div className="flex h-full flex-col">
@@ -187,6 +200,7 @@ export default function DownloadsSettings() {
         onSave={form.save}
         onDiscard={form.discard}
         isSaving={form.isSaving}
+        canSave={form.loaded}
       />
     </div>
   );

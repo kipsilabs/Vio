@@ -482,7 +482,10 @@ describe("Edit row", () => {
     const picker = await screen.findByRole("dialog", { name: "Change what this row shows" });
     await userEvent.click(within(picker).getByRole("button", { name: "Mood picks, Mind-bending" }));
     const form = await screen.findByRole("dialog", { name: "Edit row" });
-    expect(within(form).getByRole("radio", { name: "Mind-bending" })).toBeChecked();
+    const mindBending = within(form).getByRole("radio", { name: /^Mind-bending/ });
+    expect(mindBending).toBeChecked();
+    // The mood's card states its rule, from the server's preset description.
+    expect(mindBending).toHaveTextContent("Science Fiction or Mystery, rated 7.0+ on TMDB");
     await userEvent.click(within(form).getByRole("button", { name: "Save" }));
     await waitFor(() => expect(writes).toHaveLength(1));
     expect(writes[0]!.args.body).toMatchObject({

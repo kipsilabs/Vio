@@ -886,7 +886,7 @@ export default function AISettings() {
 
       <SaveBar
         dirtyCount={form.dirtyCount}
-        onSave={() => void save()}
+        onSave={save}
         onDiscard={discard}
         isSaving={form.isSaving}
       />
