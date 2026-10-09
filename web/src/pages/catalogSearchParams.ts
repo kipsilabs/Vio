@@ -243,6 +243,17 @@ export function buildCatalogQueryUpdateHref(state: CatalogSearchState, q: string
 }
 
 /**
+ * Deep link from the catalog's filter surface into the smart-collection
+ * editor: the query definition in the URL seeds the new collection's filters,
+ * and the wizard's preview shows what the saved collection would match.
+ */
+export function buildSaveAsSmartCollectionHref(state: CatalogSearchState): string {
+  const params = buildCatalogFilterSearchParams({ ...state, source: "query", q: undefined });
+  params.set("smart", "1");
+  return `/collections/new?${params.toString()}`;
+}
+
+/**
  * The search URL parameter holding the Request to add grid's page, so Back,
  * a reload, and a shared link return to it. Filter and query changes build
  * fresh params without it, which starts the grid over.
@@ -442,6 +453,14 @@ export function buildCatalogApiSearchParams(state: CatalogSearchState): URLSearc
   }
   if (state.query_definition.limit != null && state.query_definition.limit > 0) {
     params.set("query_limit", String(state.query_definition.limit));
+  }
+
+  // The parser defaults a missing top-level match to "all", so an "any"
+  // (OR across groups) pick must be written explicitly or it silently
+  // becomes AND on the next parse — in catalog navigation and in the
+  // smart-collection seed built from these params.
+  if (state.query_definition.match === "any") {
+    params.set("match", "any");
   }
 
   state.query_definition.groups.forEach((group, groupIndex) => {

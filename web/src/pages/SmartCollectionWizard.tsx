@@ -67,6 +67,8 @@ type UserModeProps = {
   mode: "user";
   etag?: string;
   collection: Collection | null;
+  /** Filters that seed a new collection, e.g. saved from the catalog filter surface. */
+  initialQueryDefinition?: QueryDefinition;
   onClose: () => void;
 };
 
@@ -87,18 +89,20 @@ export default function SmartCollectionWizard(wizard: SmartCollectionWizardProps
   const isEdit = wizard.collection !== null;
   const adminLibraryId = wizard.mode === "admin" ? wizard.initialLibraryId : null;
 
+  // Seed once per mounted collection. For create flows (no collection.id),
+  // initialLibraryId and initialQueryDefinition are the only seed signals —
+  // re-seed when they change so the draft reflects the URL.
+  const seedCollectionId = wizard.collection?.id ?? null;
+  const seedQueryDefinition = wizard.mode === "user" ? wizard.initialQueryDefinition : null;
   const initialDraft = useMemo(
     () => {
       if (wizard.mode === "user") {
-        return smartUserDraft(wizard.collection);
+        return smartUserDraft(wizard.collection, wizard.initialQueryDefinition);
       }
-      return toAdminCollectionBuilderValue(wizard.collection, wizard.initialLibraryId);
+      return smartAdminDraft(wizard.collection, wizard.initialLibraryId);
     },
-    // Seed once per mounted collection. For admin's create flow (no
-    // collection.id), initialLibraryId is the only seed signal — re-seed when
-    // it changes so library_ids reflects the URL.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [wizard.collection?.id ?? null, adminLibraryId],
+    [seedCollectionId, adminLibraryId, seedQueryDefinition],
   );
 
   const [draft, setDraft] = useState<CollectionBuilderValue>(initialDraft);
@@ -177,8 +181,30 @@ export default function SmartCollectionWizard(wizard: SmartCollectionWizardProps
   );
 }
 
-function smartUserDraft(collection: Collection | null): CollectionBuilderValue {
+function smartUserDraft(
+  collection: Collection | null,
+  initialQueryDefinition?: QueryDefinition,
+): CollectionBuilderValue {
   const value = toUserCollectionBuilderValue(collection);
+  const draft =
+    value.collection_type === "smart"
+      ? value
+      : createCollectionBuilderValue({ ...value, collection_type: "smart" });
+  if (collection || !initialQueryDefinition) {
+    return draft;
+  }
+  // A create seeded from the catalog starts from the viewer's current filters.
+  return createCollectionBuilderValue({ ...draft, query_definition: initialQueryDefinition });
+}
+
+// Admin create drafts start as manual in the shared builder helper; the wizard
+// only ever saves smart collections, so force the type when there is no
+// saved collection to copy it from.
+function smartAdminDraft(
+  collection: LibraryCollection | null,
+  initialLibraryId: number | null,
+): CollectionBuilderValue {
+  const value = toAdminCollectionBuilderValue(collection, initialLibraryId);
   return value.collection_type === "smart"
     ? value
     : createCollectionBuilderValue({ ...value, collection_type: "smart" });

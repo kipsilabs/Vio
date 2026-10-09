@@ -12,6 +12,7 @@ import CastCarousel from "@/components/CastCarousel";
 import { RequestToAddSection } from "@/components/RequestToAddSection";
 import { Button } from "@/components/ui/button";
 import CatalogFiltersPanel from "@/components/catalog/CatalogFiltersPanel";
+import SaveFiltersAsSmartCollection from "@/components/catalog/SaveFiltersAsSmartCollection";
 import SearchScopeChips from "@/components/catalog/SearchScopeChips";
 import { useCatalogWindow } from "@/hooks/queries/catalog";
 import { usePersonSearch } from "@/hooks/queries/personSearch";
@@ -478,6 +479,11 @@ function CatalogResults({
                   : allowPersonalizedOverlayControls
             }
           />
+
+          {/* Only a query source's filters are a portable query definition;
+              favorites, watchlist, history, and collection membership are not
+              expressible as smart-collection rules. */}
+          {state.source === "query" ? <SaveFiltersAsSmartCollection state={sortedState} /> : null}
 
           {isHistorySource && (
             <section className="surface-panel flex flex-col gap-3 rounded-2xl border-0 p-4 sm:flex-row sm:items-center sm:justify-between">
