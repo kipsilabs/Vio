@@ -1512,6 +1512,21 @@ export function usePlaybackSession(
       planTransportShownRef.current = false;
       endReconnect(true);
       const sessionId = plan.session_id ?? decision.session_id ?? sessionIdRef.current;
+      // The verified-inventory anchor in force *before* this adoption. A real
+      // (probed/verified) list already folded for this exact source must not be
+      // regressed to a declared/pending plan's list by a later replan — the
+      // replan may have been built before the probe persisted. Adoption is in
+      // place: the stream is untouched, and only the menus hold the real list.
+      const verifiedAnchor = lastVerifiedIdentityRef.current;
+      const planIsProvisional = isInventoryProvisional(
+        plan.inventory_status,
+        plan.inventory_provenance,
+      );
+      const keepVerifiedInventory =
+        planIsProvisional &&
+        verifiedAnchor !== null &&
+        verifiedAnchor.fileId === plan.effective_media_file_id &&
+        (verifiedAnchor.uri ?? null) === (plan.effective_virtual_uri ?? null);
       planAttemptIdRef.current = randomUUID();
       planRef.current = plan;
       sessionEndedRef.current = false;
@@ -1531,6 +1546,11 @@ export function usePlaybackSession(
           fileId: plan.effective_media_file_id,
           uri: plan.effective_virtual_uri ?? null,
         };
+      } else if (keepVerifiedInventory) {
+        // Re-seed the anchor `transitionSourceIdentity` just cleared, so the
+        // preserved verified list also keeps suppressing later same-source
+        // declared pushes.
+        lastVerifiedIdentityRef.current = verifiedAnchor;
       }
       if (plan.inventory_revision != null) {
         inventoryRevisionRef.current = plan.inventory_revision;
