@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -221,26 +222,72 @@ func TestItemRepo_GetByIDsWithAccess_CombinedClausesIndexCorrectly(t *testing.T)
 	}
 }
 
-// TestItemRepo_GetByExternalIDs_SingleQueryAcrossProviders pins the SQL shape
-// of buildGetByExternalIDsSQL: a single statement that ORs across the three
-// external-ID arrays plus a type filter, replacing the per-entry N×3
-// GetByExternalID fan-out in MDBList collection sync (audit 2026-05-01 §3.7).
+// TestItemRepo_GetByExternalIDs_SingleQueryAcrossProviders pins the structure
+// of buildGetByExternalIDsSQL: one statement that reads both the denormalized
+// media_items columns and media_item_provider_ids, keyed off every id array
+// with an `= ANY` predicate so a large list hashes instead of nested-looping
+// the catalog. Replaces the per-entry N×3 GetByExternalID fan-out in MDBList
+// collection sync (audit 2026-05-01 §3.7).
 func TestItemRepo_GetByExternalIDs_SingleQueryAcrossProviders(t *testing.T) {
 	repo := &ItemRepository{}
 	sql, args := repo.buildGetByExternalIDsSQL(ExternalIDBatch{
 		TMDBIDs: []string{"1", "2"}, IMDbIDs: []string{"tt1", "tt2"}, TVDBIDs: nil,
 	}, "movie")
-	if !strings.Contains(sql, "tmdb_id = ANY($1)") {
-		t.Fatalf("expected ANY tmdb; got %s", sql)
+	for _, want := range []string{
+		"tmdb_id = ANY($1)",
+		"imdb_id = ANY($2)",
+		"tvdb_id = ANY($3)",
+		"FROM media_item_provider_ids mip",
+		"JOIN media_items mi ON mi.content_id = mip.content_id",
+		"mip.item_type = $4",
+		"mi.type = $4",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("buildGetByExternalIDsSQL missing %q:\n%s", want, sql)
+		}
 	}
-	if !strings.Contains(sql, "imdb_id = ANY($2)") {
-		t.Fatalf("expected ANY imdb; got %s", sql)
+	if len(args) != 4 {
+		t.Fatalf("expected 4 args (tmdb, imdb, tvdb, type); got %v", args)
 	}
-	if !strings.Contains(sql, "type = $") {
-		t.Fatalf("expected type filter; got %s", sql)
+	// A join from the requested ids to the catalog is not sargable and
+	// nested-loops request × catalog, so it must not come back.
+	for _, disallowed := range []string{"JOIN unnest", "WITH requested"} {
+		if strings.Contains(sql, disallowed) {
+			t.Fatalf("buildGetByExternalIDsSQL regressed to a non-sargable join (%q):\n%s", disallowed, sql)
+		}
 	}
-	if len(args) < 3 {
-		t.Fatalf("expected at least 3 args (tmdb, imdb, type); got %d", len(args))
+}
+
+// TestItemRepo_GetByExternalIDs_MatchesSlugTMDB pins that both the column and
+// provider-table paths reduce a stored "id-slug" value to the same prefix
+// NormalizeTMDBID extracts, so a caller holding the bare numeric id resolves.
+// Behavioral coverage lives in TestGetByExternalIDsMatchesProviderTableAndSlugTMDBDB.
+func TestItemRepo_GetByExternalIDs_MatchesSlugTMDB(t *testing.T) {
+	repo := &ItemRepository{}
+	sql, _ := repo.buildGetByExternalIDsSQL(ExternalIDBatch{TMDBIDs: []string{"1931"}}, "movie")
+	if strings.Count(sql, "split_part(") < 2 {
+		t.Fatalf("expected the slug prefix predicate on both the column and provider paths:\n%s", sql)
+	}
+	if !strings.Contains(sql, "tmdb_id = ANY($1)") || !strings.Contains(sql, "mip.provider_id = ANY($1)") {
+		t.Fatalf("expected exact numeric matches retained:\n%s", sql)
+	}
+}
+
+// TestItemRepo_GetByExternalIDs_NormalizesRequestTMDB pins the request-side half
+// of the normalization: a caller-supplied slug is reduced to its numeric id
+// before binding, so both sides of the comparison use NormalizeTMDBID.
+func TestItemRepo_GetByExternalIDs_NormalizesRequestTMDB(t *testing.T) {
+	repo := &ItemRepository{}
+	_, args := repo.buildGetByExternalIDsSQL(ExternalIDBatch{
+		TMDBIDs: []string{"1931-some-slug", "206709", "tt0111161"},
+	}, "movie")
+	tmdbIDs, ok := args[0].([]string)
+	if !ok {
+		t.Fatalf("first arg is %T, want []string", args[0])
+	}
+	want := []string{"1931", "206709", "tt0111161"}
+	if !slices.Equal(tmdbIDs, want) {
+		t.Fatalf("normalized TMDB ids = %v, want %v", tmdbIDs, want)
 	}
 }
 

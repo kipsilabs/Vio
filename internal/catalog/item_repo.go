@@ -4195,17 +4195,65 @@ func (r *ItemRepository) GetByExternalIDs(ctx context.Context, batch ExternalIDB
 	return out, nil
 }
 
-// buildGetByExternalIDsSQL pins the exact SQL shape used by GetByExternalIDs:
-// a single statement that ORs across all three external-ID arrays plus a
-// type filter. The COALESCE wraps make scanning into string safe even when
-// the column is NULL (imdb_id/tmdb_id/tvdb_id are nullable text on
-// media_items per migration 001).
+// buildGetByExternalIDsSQL pins the SQL shape used by GetByExternalIDs: one
+// statement that matches any of the three external-ID arrays plus a type
+// filter, reading the same identity sources as LookupExternalIDs — the
+// denormalized media_items columns and the media_item_provider_ids table. A
+// provider-table-only id therefore resolves exactly like a column id.
+//
+// Every match is an `= ANY($n)` predicate, which Postgres hashes when the
+// array is large, so cost is linear in catalog size plus request size at both
+// a small list and the 100k-entry source cap. The earlier form joined each
+// requested id to the whole catalog with an OR across columns; that is not
+// sargable, so the planner nested-looped request × catalog and cross-joined
+// the provider table, taking ~100s for 500 ids.
+//
+// TMDB is matched against both its bare form and its "id-slug" URL form
+// ("1931-some-title"). Because split_part(value, '-', 1) is exactly the
+// identity NormalizeTMDBID extracts — the digits before the first '-' — the
+// slug form is matched by comparing that prefix to the same array; the numeric
+// prefix never bleeds across ids, so "19310" and "1931-some" never answer for
+// "1931". Request TMDB ids are run through NormalizeTMDBID before binding, so
+// both sides read the same way. Exact-match semantics are otherwise unchanged:
+// no title/year fallback, and the caller still applies its own library filter.
 func (r *ItemRepository) buildGetByExternalIDsSQL(batch ExternalIDBatch, itemType string) (string, []any) {
-	sql := `SELECT content_id, COALESCE(tmdb_id, ''), COALESCE(imdb_id, ''), COALESCE(tvdb_id, '')
-            FROM media_items
-            WHERE (tmdb_id = ANY($1) OR imdb_id = ANY($2) OR tvdb_id = ANY($3))
-              AND type = $4`
-	return sql, []any{batch.TMDBIDs, batch.IMDbIDs, batch.TVDBIDs, itemType}
+	sql := `
+		SELECT content_id,
+		       CASE WHEN tmdb_id = ANY($1) THEN tmdb_id
+		            WHEN tmdb_id LIKE '%-%' AND split_part(tmdb_id, '-', 1) = ANY($1) THEN split_part(tmdb_id, '-', 1)
+		            ELSE '' END,
+		       CASE WHEN imdb_id = ANY($2) THEN imdb_id ELSE '' END,
+		       CASE WHEN tvdb_id = ANY($3) THEN tvdb_id ELSE '' END
+		FROM media_items
+		WHERE type = $4
+		  AND (tmdb_id = ANY($1) OR imdb_id = ANY($2) OR tvdb_id = ANY($3)
+		       OR (tmdb_id LIKE '%-%' AND split_part(tmdb_id, '-', 1) = ANY($1)))
+		UNION ALL
+		SELECT mi.content_id,
+		       CASE WHEN mip.provider = 'tmdb'
+		            THEN CASE WHEN mip.provider_id = ANY($1) THEN mip.provider_id
+		                      ELSE split_part(mip.provider_id, '-', 1) END
+		            ELSE '' END,
+		       CASE WHEN mip.provider = 'imdb' THEN mip.provider_id ELSE '' END,
+		       CASE WHEN mip.provider = 'tvdb' THEN mip.provider_id ELSE '' END
+		FROM media_item_provider_ids mip
+		JOIN media_items mi ON mi.content_id = mip.content_id AND mi.type = $4
+		WHERE mip.item_type = $4
+		  AND ((mip.provider = 'tmdb' AND (mip.provider_id = ANY($1)
+		                                   OR (mip.provider_id LIKE '%-%' AND split_part(mip.provider_id, '-', 1) = ANY($1))))
+		    OR (mip.provider = 'imdb' AND mip.provider_id = ANY($2))
+		    OR (mip.provider = 'tvdb' AND mip.provider_id = ANY($3)))`
+	tmdbIDs := batch.TMDBIDs
+	if len(tmdbIDs) > 0 {
+		// Mirror the stored-side normalization on the request side. Callers
+		// hold canonical numeric ids, so this is normally a no-op.
+		normalized := make([]string, len(tmdbIDs))
+		for i, id := range tmdbIDs {
+			normalized[i] = NormalizeTMDBID(id)
+		}
+		tmdbIDs = normalized
+	}
+	return sql, []any{tmdbIDs, batch.IMDbIDs, batch.TVDBIDs, itemType}
 }
 
 // GetByTitleYearType finds a media item by exact title, year, and type match.
