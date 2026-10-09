@@ -899,6 +899,41 @@ func TestHandleDirectDownloadUnknownFileIsNotFound(t *testing.T) {
 	}
 }
 
+// A stale/unknown file_id, an access-filter refusal, and a non-original
+// format must reach the client as three distinct machine-readable codes so the
+// picker can refresh versions for the first instead of showing a dead end.
+func TestHandleDirectDownloadDistinguishesRefusalReasons(t *testing.T) {
+	cases := []struct {
+		name   string
+		err    error
+		status int
+		code   string
+	}{
+		{"unknown", fmt.Errorf("%w: %w", downloads.ErrFileUnavailable, catalog.ErrItemNotFound), http.StatusNotFound, "file_unavailable"},
+		{"denied", fmt.Errorf("%w: %w", downloads.ErrFileAccessDenied, catalog.ErrItemNotFound), http.StatusForbidden, "file_access_denied"},
+		{"format", downloads.ErrFormatUnavailable, http.StatusNotImplemented, "format_unavailable"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := NewDownloadHandler(&fakeDownloadService{directErr: tc.err})
+			rec := httptest.NewRecorder()
+			h.HandleDirectDownload(rec, downloadTestRequest(http.MethodGet, "/direct-download?file_id=42", nil, 7, "", ""))
+			if rec.Code != tc.status {
+				t.Fatalf("status = %d, want %d (body: %s)", rec.Code, tc.status, rec.Body.String())
+			}
+			var body struct {
+				Error string `json:"error"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatalf("decode body: %v (body: %s)", err, rec.Body.String())
+			}
+			if body.Error != tc.code {
+				t.Fatalf("code = %q, want %q", body.Error, tc.code)
+			}
+		})
+	}
+}
+
 func TestProxyPreflightCachesReachabilityByNodeAndPath(t *testing.T) {
 	requests := 0
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

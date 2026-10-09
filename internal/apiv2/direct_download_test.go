@@ -3,6 +3,7 @@ package apiv2
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -101,6 +102,29 @@ func TestDirectDownloadDelivery(t *testing.T) {
 		})
 	}
 }
+
+// The v2 byte adapter keys the Problem type off the v1 machine-readable code:
+// a stale file_id and an access refusal carry their own types instead of both
+// collapsing into the status-derived not_found / permission_denied.
+func TestDirectDownloadRefusalReasonsAreDistinct(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		kind ProblemType
+	}{
+		{"unavailable", fmt.Errorf("%w: %w", downloads.ErrFileUnavailable, catalogpkg.ErrItemNotFound), TypeFileUnavailable},
+		{"denied", fmt.Errorf("%w: %w", downloads.ErrFileAccessDenied, catalogpkg.ErrItemNotFound), TypeFileAccessDenied},
+		{"format", downloads.ErrFormatUnavailable, TypeFormatUnavailable},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &directDownloadFixture{err: tc.err}
+			h := directDownloadTestHandler(t, f)
+			res := do(t, h, "GET", Prefix+"/direct-download?file_id=42", "", viewerHeaders())
+			requireProblem(t, res, tc.kind)
+		})
+	}
+}
+
 func TestDirectDownloadPartialResponseAborts(t *testing.T) {
 	f := &directDownloadFixture{partial: true}
 	h := directDownloadTestHandler(t, f)

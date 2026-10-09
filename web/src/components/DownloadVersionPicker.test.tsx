@@ -27,6 +27,7 @@ function version(overrides: Partial<FileVersion>): FileVersion {
     file_size: overrides.file_size ?? 0,
     duration: overrides.duration ?? 0,
     bitrate: overrides.bitrate ?? 0,
+    release_name: overrides.release_name,
   };
 }
 
@@ -85,5 +86,40 @@ describe("DownloadVersionPicker", () => {
     );
 
     expect(screen.getByText("CBZ · 48 pages")).toBeTruthy();
+  });
+
+  it("labels each row with its release name so same-quality rows stay distinct", () => {
+    render(
+      <DownloadVersionPicker
+        open
+        onOpenChange={() => undefined}
+        versions={[
+          version({ file_id: 1, resolution: "1080p", release_name: "Alpha Release" }),
+          version({ file_id: 2, resolution: "1080p", release_name: "Beta Release" }),
+        ]}
+      />,
+    );
+
+    expect(screen.getByText("Alpha Release")).toBeTruthy();
+    expect(screen.getByText("Beta Release")).toBeTruthy();
+  });
+
+  it("highlights the caller's selected version with a visible marker", () => {
+    render(
+      <DownloadVersionPicker
+        open
+        onOpenChange={() => undefined}
+        selectedFileId={2}
+        versions={[
+          version({ file_id: 1, resolution: "1080p", release_name: "Alpha Release" }),
+          version({ file_id: 2, resolution: "2160p", release_name: "Beta Release" }),
+        ]}
+      />,
+    );
+
+    const selected = screen.getByRole("button", { name: /2160p/ });
+    expect(selected.getAttribute("aria-current")).toBe("true");
+    expect(screen.getByText("Playing")).toBeTruthy();
+    expect(screen.getByRole("button", { name: /1080p/ }).getAttribute("aria-current")).toBeNull();
   });
 });

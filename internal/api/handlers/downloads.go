@@ -862,6 +862,14 @@ func (h *DownloadHandler) writeDownloadError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusTooManyRequests, "download_quota_exceeded", "Download quota exceeded for this period")
 	case errors.Is(err, downloads.ErrNoDownloadableEpisodes):
 		writeError(w, http.StatusNotFound, "no_downloadable_episodes", "No downloadable episodes found")
+	// The direct-download resolver distinguishes a stale/unknown file_id from
+	// an access refusal so the client can tell a version that needs refreshing
+	// (re-fetch the item's versions) apart from a denied file (show the denial).
+	// Both wrap catalog.ErrItemNotFound and are matched before it.
+	case errors.Is(err, downloads.ErrFileUnavailable):
+		writeError(w, http.StatusNotFound, "file_unavailable", "This file is no longer available")
+	case errors.Is(err, downloads.ErrFileAccessDenied):
+		writeError(w, http.StatusForbidden, "file_access_denied", "You do not have access to this file")
 	case errors.Is(err, catalog.ErrItemNotFound):
 		writeError(w, http.StatusNotFound, "not_found", "Media item not found")
 	default:

@@ -76,10 +76,12 @@ export default function EbookContent({
   item,
   libraryId,
   showAdvisoryAge,
+  onStaleVersion,
 }: {
   item: ItemDetail & { type: "ebook" };
   libraryId?: number;
   showAdvisoryAge?: boolean;
+  onStaleVersion?: (fileId: number) => void;
 }) {
   useAmbientColor(item.poster_thumbhash);
   const { user } = useAuth();
@@ -239,6 +241,8 @@ export default function EbookContent({
         versions={item.versions}
         title={item.title}
         summaryBuilder={ebookVersionSummary}
+        selectedFileId={readVersion?.file_id}
+        onStaleVersion={onStaleVersion}
       />
     </div>
   );
