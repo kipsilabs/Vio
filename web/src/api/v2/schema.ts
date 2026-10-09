@@ -87233,7 +87233,7 @@ export interface operations {
           | "audiobook"
           | "ebook"
           | "manga";
-        /** @description Name prefix or fragment; empty lists the first people */
+        /** @description Name to match: each word must start a word of the name, case-insensitively, and only the first eight distinct words count; empty lists the first people */
         q?: string;
       };
       header: {

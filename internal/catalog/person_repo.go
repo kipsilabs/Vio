@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -607,29 +609,46 @@ func (r *PersonRepository) SearchAlphabetical(ctx context.Context, query string,
 
 // SearchScoped ranks exact names first and restricts people to credits in the
 // selected media scope and viewer access before applying the limit. Empty scope
-// includes accessible credits across all media types.
+// includes accessible credits across all media types. Every query word must
+// start a word of the name, so "hacks" finds "Lark Hackshaw" but not
+// "Chad Thackston", while a partial last word still serves typeahead.
 func (r *PersonRepository) SearchScoped(ctx context.Context, query string, limit int, mediaScope string, filter AccessFilter) ([]models.Person, error) {
 	return r.search(ctx, strings.TrimSpace(query), limit, mediaScope, filter, true)
 }
 
-// search runs a name search over the people the viewer can see. rankExact
-// puts exact name matches first, as v2 search does.
-func (r *PersonRepository) search(ctx context.Context, query string, limit int, mediaScope string, filter AccessFilter, rankExact bool) ([]models.Person, error) {
+// search runs a name search over the people the viewer can see. scoped
+// selects the v2 rules: word-start matching with exact names first. Without
+// it the query matches anywhere in the name, as the v1 bridge search does.
+func (r *PersonRepository) search(ctx context.Context, query string, limit int, mediaScope string, filter AccessFilter, scoped bool) ([]models.Person, error) {
 	if limit <= 0 {
 		limit = 20
 	}
-	args := []any{query, limit}
-	argIdx := 3
-	where := "name ILIKE '%' || $1 || '%' AND " + personCreditVisibleSQL("people.id", MediaScopeItemTypes(mediaScope), personCreditScope{}, filter, &args, &argIdx)
+	// The query binds only where the SQL reads it: Postgres cannot type an
+	// unreferenced parameter, which a scoped empty query would leave.
+	args := []any{limit}
+	argIdx := 2
+	var conditions []string
+	if scoped {
+		conditions = personNameWordStartConditions(query, &args, &argIdx)
+	} else {
+		conditions = []string{fmt.Sprintf("name ILIKE '%%' || $%d || '%%'", argIdx)}
+		args = append(args, query)
+		argIdx++
+	}
+	conditions = append(conditions, personCreditVisibleSQL("people.id", MediaScopeItemTypes(mediaScope), personCreditScope{}, filter, &args, &argIdx))
+	where := strings.Join(conditions, " AND ")
 	order := "name ASC, id ASC"
-	if rankExact && query != "" {
-		order = "(LOWER(name) = LOWER($1)) DESC, " + order
+	if scoped && query != "" {
+		// Words match however they are spaced, so a name equal to the query
+		// as typed or with its whitespace collapsed counts as exact.
+		order = fmt.Sprintf("(LOWER(name) IN (LOWER($%d), LOWER($%d))) DESC, ", argIdx, argIdx+1) + order
+		args = append(args, query, strings.Join(strings.Fields(query), " "))
 	}
 	rows, err := r.pool.Query(ctx, `
 		SELECT id, name, sort_name, bio, birth_date, death_date, birthplace, homepage,
 			photo_path, photo_source_path, photo_thumbhash, tmdb_id, imdb_id, tvdb_id, plex_guid, created_at, updated_at,
 			metadata_refresh_attempted_at
-		FROM people WHERE `+where+` ORDER BY `+order+` LIMIT $2`, args...,
+		FROM people WHERE `+where+` ORDER BY `+order+` LIMIT $1`, args...,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("search people: %w", err)
@@ -648,6 +667,46 @@ func (r *PersonRepository) search(ctx context.Context, query string, limit int, 
 		people = append(people, p)
 	}
 	return people, rows.Err()
+}
+
+// maxPersonSearchWords caps the distinct query words people search matches
+// on, so a long query cannot add predicates without bound.
+const maxPersonSearchWords = 8
+
+// personNameWordStartConditions matches people whose name has, for every
+// distinct whitespace-separated word of query, a word starting with it. A word
+// starts at the beginning of the name or after a character that is not a
+// letter or digit, so "luc" finds "Jean-Luc" and "brien" finds "O'Brien"; a
+// query word that opens with punctuation, like "'brien", carries its own
+// boundary. Each word also carries a substring ILIKE, which lets
+// idx_people_name_trgm narrow the rows the regex checks. Both predicates leave
+// case folding to the database: ~* folds one character at a time and Go's
+// lowercasing ignores the collation, so either would drop matches ILIKE keeps
+// (a name spelled "GROẞ" for "groß", a Turkish dotted I). An empty query adds
+// no conditions.
+func personNameWordStartConditions(query string, args *[]any, argIdx *int) []string {
+	var conditions []string
+	seen := map[string]bool{}
+	for _, word := range strings.Fields(query) {
+		// Only identical words repeat: case pairs depend on the collation.
+		if seen[word] {
+			continue
+		}
+		if len(seen) == maxPersonSearchWords {
+			break
+		}
+		seen[word] = true
+		pattern := escapeRegexLiteral(word)
+		if first, _ := utf8.DecodeRuneInString(word); unicode.IsLetter(first) || unicode.IsDigit(first) {
+			pattern = "(^|[^[:alnum:]])" + pattern
+		}
+		conditions = append(conditions,
+			fmt.Sprintf(`name ILIKE $%d ESCAPE '\'`, *argIdx),
+			fmt.Sprintf("LOWER(name) ~ LOWER($%d)", *argIdx+1))
+		*args = append(*args, "%"+escapeLikeLiteral(word)+"%", pattern)
+		*argIdx += 2
+	}
+	return conditions
 }
 
 // personCreditVisibleSQL renders an EXISTS predicate that holds when the person
