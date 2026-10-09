@@ -29,6 +29,29 @@ const (
 	OutputProtocolHTTP    = "http"
 )
 
+// ClientCancelEvidence records when a transport serve observed the client
+// cancel the request, scoped to the route it was observed on. A cancel is
+// evidence about one request, never a verdict on the session: the viewer may
+// have navigated off, or hls.js may have given up and retried. The revision and
+// binding generation let a later reader tell a cancel for the current route
+// from a predecessor's stale one instead of treating the timestamp alone as
+// proof the session died. Zero At means no observed cancellation.
+type ClientCancelEvidence struct {
+	At                time.Time
+	StreamRevision    uint64
+	BindingGeneration uint64
+}
+
+// ClientCancelNamesCurrentRoute reports whether the recorded transport cancel
+// still names this session's current route. A newer stream revision or binding
+// generation means the cancel described a request the session has since
+// superseded, so it is evidence about a predecessor route, not the live one.
+func (s *Session) ClientCancelNamesCurrentRoute() bool {
+	return !s.ClientCanceled.At.IsZero() &&
+		s.ClientCanceled.StreamRevision == s.streamRevision &&
+		s.ClientCanceled.BindingGeneration == s.virtualSourceGeneration
+}
+
 // Session represents an active playback session.
 type Session struct {
 	ID                   string
@@ -44,7 +67,15 @@ type Session struct {
 	// validated. Virtual catalog rows can carry empty video_tracks while the
 	// plan's probe has ground truth, so stream time must trust the session's
 	// profile over the re-derived file value.
-	DVProfile        int
+	DVProfile int
+	// DVProfilePin is the first-verified-wins Dolby Vision profile for the
+	// session's effective file. A replan re-reads the catalog row and can see a
+	// drifting dv_profile on bytes that never changed, so the pin freezes the
+	// value the start (or first replan) verified and every later replan reuses
+	// it. It is keyed by file id: a candidate-binding move to a different
+	// effective file re-arms the pin from that file's first read. Zero Profile
+	// means no pin.
+	DVProfilePin     DVPinV3
 	ClientIP         string // resolved client IP for the playback session
 	StreamLocation   string // local/remote policy classification fixed at playback negotiation
 	ClientName       string // reported playback client name, when available
@@ -168,6 +199,13 @@ type Session struct {
 
 	Position float64
 	IsPaused bool
+	// ClientCanceled records the last transport cancel observed for this
+	// session, scoped to the route revision and binding generation it happened
+	// on. It is liveness evidence for one request, not a session verdict: the
+	// recovery path never uses it to fence a live client, only to recognize a
+	// cancel that a committed successor has already superseded. A committed
+	// replacement, a rollback, or a progress report clears it.
+	ClientCanceled ClientCancelEvidence
 	// StopReported marks a session a client reported stopped without an ID
 	// that could end it (#1454). It only hides the session from the live
 	// admin view: pause state and idle grace are untouched, so a stale stop
@@ -217,12 +255,17 @@ type Session struct {
 // change after a session is created (audio track, client IP, transcode target,
 // and reported bitrate).
 type SessionStreamState struct {
-	PlayMethod                       PlayMethod
-	BasePlayMethod                   PlayMethod
-	AudioTrackIndex                  int
-	TranscodeAudio                   bool
-	RemuxDVMode                      RemuxDVMode
-	DVProfile                        int
+	PlayMethod      PlayMethod
+	BasePlayMethod  PlayMethod
+	AudioTrackIndex int
+	TranscodeAudio  bool
+	RemuxDVMode     RemuxDVMode
+	DVProfile       int
+	// DVProfilePin carries the session's first-verified-wins Dolby Vision pin
+	// across a stream-state snapshot. A full route-set commit merges it rather
+	// than replacing it, so a later replan that reads a drifted catalog value
+	// cannot overwrite the pinned profile.
+	DVProfilePin                     DVPinV3
 	ClientIP                         string
 	ClientName                       string
 	ClientVersion                    string
@@ -1190,6 +1233,10 @@ func (m *SessionManager) UpdateProgress(sessionID string, position float64, isPa
 	s.Position = position
 	s.IsPaused = isPaused
 	s.StopReported = false
+	// A fresh progress report is positive liveness evidence: the client is
+	// still talking to us, so any earlier transport cancel no longer describes
+	// it.
+	s.ClientCanceled = ClientCancelEvidence{}
 	s.streamRevision++
 	m.touchSessionLocked(s)
 	return nil
@@ -1206,6 +1253,42 @@ func (m *SessionManager) MarkStopReported(sessionID string) error {
 		return ErrSessionNotFound
 	}
 	s.StopReported = true
+	return nil
+}
+
+// MarkClientCanceled records that a transport serve observed the client cancel
+// the request, scoped to the session's current route revision and binding
+// generation (see Session.ClientCanceled). The mark is best-effort liveness
+// evidence about that route only: a committed successor, a rollback, or a
+// progress report clears it, and the recovery path never treats it as proof the
+// session died. An unknown session is ErrSessionNotFound, matching the other
+// session mutators.
+func (m *SessionManager) MarkClientCanceled(sessionID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		return ErrSessionNotFound
+	}
+	s.ClientCanceled = ClientCancelEvidence{
+		At:                time.Now(),
+		StreamRevision:    s.streamRevision,
+		BindingGeneration: s.virtualSourceGeneration,
+	}
+	return nil
+}
+
+// ClearClientCanceled drops a session's client-canceled evidence. A progress
+// report, a committed replacement plan, or a rollback calls it so a live client
+// that reconnects after a transient cancel carries no stale evidence.
+func (m *SessionManager) ClearClientCanceled(sessionID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		return ErrSessionNotFound
+	}
+	s.ClientCanceled = ClientCancelEvidence{}
 	return nil
 }
 
@@ -1265,6 +1348,27 @@ func (m *SessionManager) SetStreamLocation(sessionID, location string) error {
 	return nil
 }
 
+// mergeDVPinV3 folds an incoming DV pin into the session's current pin.
+// First-verified-wins for the same file identity (row id and source); a
+// snapshot naming a different file identity is authoritative and replaces the
+// pin (even a zero-profile snapshot, so a moved binding or a same-row release
+// rotation cannot leave a stale pin describing old bytes). A zero-profile
+// snapshot for the same identity is not evidence, so it never clears or lowers
+// an established pin, and a snapshot that carries no file id at all is ignored.
+func mergeDVPinV3(current, incoming DVPinV3) DVPinV3 {
+	sameIdentity := current.FileID == incoming.FileID && current.Source == incoming.Source
+	if incoming.FileID > 0 && !sameIdentity {
+		return incoming
+	}
+	if incoming.Profile <= 0 {
+		return current
+	}
+	if current.Profile <= 0 || !sameIdentity {
+		return incoming
+	}
+	return current
+}
+
 // applySessionStreamStateLocked applies a complete stream snapshot while the manager lock is held.
 func applySessionStreamStateLocked(s *Session, state SessionStreamState) {
 	if state.PlayMethod != "" {
@@ -1292,7 +1396,18 @@ func applySessionStreamStateLocked(s *Session, state SessionStreamState) {
 		// later remux request fails the profile check. Legacy partial updates
 		// never carry a mode and must not clobber one.
 		s.RemuxDVMode = state.RemuxDVMode
-		s.DVProfile = state.DVProfile
+		// First-verified-wins DV pinning: a full route snapshot may carry a
+		// drifted profile from a fresh probe of the same bytes. Keep the value
+		// the session already pinned for this file identity; a snapshot naming
+		// a different identity (a substitution, or a same-row virtual release
+		// rotation) owns the pin outright, even when it verified no profile, so
+		// the old file's profile never describes the new bytes.
+		s.DVProfilePin = mergeDVPinV3(s.DVProfilePin, state.DVProfilePin)
+		if s.DVProfilePin.Profile > 0 {
+			s.DVProfile = s.DVProfilePin.Profile
+		} else {
+			s.DVProfile = state.DVProfile
+		}
 	} else if state.RemuxDVMode != "" {
 		s.RemuxDVMode = state.RemuxDVMode
 		if state.DVProfile > 0 {
@@ -1394,6 +1509,7 @@ func snapshotSessionStreamStateLocked(s *Session) SessionStreamState {
 		TranscodeAudio:                   s.TranscodeAudio,
 		RemuxDVMode:                      s.RemuxDVMode,
 		DVProfile:                        s.DVProfile,
+		DVProfilePin:                     s.DVProfilePin,
 		ClientIP:                         s.ClientIP,
 		ClientName:                       s.ClientName,
 		ClientVersion:                    s.ClientVersion,
@@ -1452,7 +1568,11 @@ func restoreSessionStreamStateLocked(s *Session, state SessionStreamState) {
 	s.AudioTrackIndex = state.AudioTrackIndex
 	s.TranscodeAudio = state.TranscodeAudio
 	s.RemuxDVMode = state.RemuxDVMode
+	// The profile and its first-verified-wins pin are one fact; restoring the
+	// profile without the pin would leave the rollback applying the withdrawn
+	// successor's pin to the previous file's route.
 	s.DVProfile = state.DVProfile
+	s.DVProfilePin = state.DVProfilePin
 	s.ClientIP = state.ClientIP
 	s.ClientName = state.ClientName
 	s.ClientVersion = state.ClientVersion
@@ -1886,8 +2006,10 @@ func (m *SessionManager) applyReplacementLocked(
 
 	s.MediaFileID = replacement.EffectiveMediaFileID
 	// A replacement stream means the play is active again, so a stop mark from
-	// an ID-less stop no longer applies.
+	// an ID-less stop no longer applies, and an earlier transport cancel no
+	// longer describes this committed successor.
 	s.StopReported = false
+	s.ClientCanceled = ClientCancelEvidence{}
 	applySessionStreamStateLocked(s, replacement.StreamState)
 	s.virtualSourceGeneration++
 	if replacement.PositionSeconds != nil {
@@ -1918,6 +2040,9 @@ func (m *SessionManager) RollbackReplacement(sessionID string, rollback SessionR
 	s.MediaFileID = rollback.previousEffectiveMediaFileID
 	// Rolling back a replacement is still an active play, not a stopped one.
 	s.StopReported = false
+	// A rollback re-arms the previous route; the canceled mark belonged to the
+	// withdrawn successor, so it must not linger past the rollback.
+	s.ClientCanceled = ClientCancelEvidence{}
 	restoreSessionStreamStateLocked(s, rollback.previousStreamState)
 	s.virtualSourceGeneration++
 	if rollback.restoreProgress {
@@ -2106,6 +2231,12 @@ func (m *SessionManager) TouchActivity(sessionID string) error {
 		return ErrSessionNotFound
 	}
 
+	// Activity refreshes the idle deadline but deliberately does not clear the
+	// transport-cancel evidence: which request a cancel belonged to is not a
+	// property of "anything touched us since", and clearing on every HLS
+	// manifest or segment request made the evidence timing-dependent. The
+	// revision and binding generation it carries are what let a reader tell a
+	// current-route cancel from a predecessor's.
 	m.touchSessionLocked(s)
 	return nil
 }

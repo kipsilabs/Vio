@@ -1669,3 +1669,84 @@ func TestUpdateStreamStateClearsRemuxDVModeOnRouteSet(t *testing.T) {
 		t.Fatalf("RemuxDVMode after route-set update = %q, want cleared", got.RemuxDVMode)
 	}
 }
+
+// A transport cancel is scoped to the route it was observed on. Once the
+// session's own route revision moves, the mark names a predecessor and must be
+// distinguishable as stale; ordinary activity must not silently erase it, while
+// a progress report (positive liveness) does.
+func TestClientCancelEvidenceScopedToRouteRevision(t *testing.T) {
+	sm := playback.NewSessionManager(0, 0)
+	session, err := sm.StartSession(1, "profile-1", 42, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	if err := sm.MarkClientCanceled(session.ID); err != nil {
+		t.Fatalf("MarkClientCanceled: %v", err)
+	}
+	got, err := sm.GetSession(session.ID)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if got.ClientCanceled.At.IsZero() || !got.ClientCancelNamesCurrentRoute() {
+		t.Fatalf("fresh cancel = %#v, want evidence naming the current route", got.ClientCanceled)
+	}
+
+	if err := sm.UpdateStreamState(session.ID, playback.SessionStreamState{TranscodeRouteSet: true, SubtitleTrackIndex: -1}); err != nil {
+		t.Fatalf("UpdateStreamState: %v", err)
+	}
+	got, err = sm.GetSession(session.ID)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if got.ClientCancelNamesCurrentRoute() {
+		t.Fatalf("cancel for the superseded revision still names the current route: %#v", got.ClientCanceled)
+	}
+
+	// Activity refreshes the idle deadline but must not clear route-scoped
+	// evidence on its own; that timing dependence was the review finding.
+	if err := sm.TouchActivity(session.ID); err != nil {
+		t.Fatalf("TouchActivity: %v", err)
+	}
+	got, err = sm.GetSession(session.ID)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if got.ClientCanceled.At.IsZero() {
+		t.Fatal("TouchActivity cleared the route-scoped cancel evidence")
+	}
+
+	// A progress report is positive liveness and clears it.
+	if err := sm.UpdateProgress(session.ID, 1, false); err != nil {
+		t.Fatalf("UpdateProgress: %v", err)
+	}
+	got, err = sm.GetSession(session.ID)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if !got.ClientCanceled.At.IsZero() {
+		t.Fatalf("progress did not clear the cancel evidence: %#v", got.ClientCanceled)
+	}
+}
+
+// A candidate-binding move is a route change even when the stream revision is
+// otherwise untouched: the mark must not name the new binding.
+func TestClientCancelEvidenceScopedToBindingGeneration(t *testing.T) {
+	sm := playback.NewSessionManager(0, 0)
+	session, err := sm.StartSession(1, "profile-1", 42, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	if err := sm.MarkClientCanceled(session.ID); err != nil {
+		t.Fatalf("MarkClientCanceled: %v", err)
+	}
+	if err := sm.SetVirtualSource(session.ID, "virtual://movie/tt?result=B", 7); err != nil {
+		t.Fatalf("SetVirtualSource: %v", err)
+	}
+	got, err := sm.GetSession(session.ID)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if got.ClientCancelNamesCurrentRoute() {
+		t.Fatalf("cancel survived a binding move: %#v", got.ClientCanceled)
+	}
+}

@@ -1174,7 +1174,12 @@ func (m *TranscodeManager) RetireTranscodeSessionPredecessor(sessionID string, p
 		return
 	}
 	// Stop the process but leave the output directory for the overlap window.
-	_ = predecessor.CloseProcess()
+	// This stop must NOT advance the generation: a retained predecessor has to
+	// keep matching the exact sgen token its in-flight playlist was minted with,
+	// or every one-behind segment request is refused with 412 and the client
+	// loops on a dead URL (the switchover regression). CloseProcess would bump
+	// the generation and break that match.
+	_ = predecessor.CloseProcessRetained()
 	m.transcodeMu.Lock()
 	if m.shuttingDown {
 		m.transcodeMu.Unlock()

@@ -60,7 +60,9 @@ const hlsJS = vi.hoisted(() => ({
   supported: false,
   constructed: vi.fn(),
   startLoad: vi.fn(),
+  loadSource: vi.fn(),
   errorHandler: null as null | ((event: unknown, data: unknown) => void),
+  bufferAppendedHandler: null as null | ((event: unknown, data?: unknown) => void),
 }));
 // Captures the onSourceChanged handlers the mocked subtitle hooks receive, so
 // tests can drive a subtitle_source_changed (409) signal from the outside.
@@ -130,7 +132,10 @@ vi.mock("hls.js", () => ({
     static ErrorTypes = { NETWORK_ERROR: "networkError", MEDIA_ERROR: "mediaError" };
     static isSupported = () => hlsJS.supported;
 
-    config: { maxBufferLength?: number } | undefined;
+    config:
+      | { maxBufferLength?: number; startPosition?: number; maxBufferSize?: number }
+      | undefined;
+    url: string | null = null;
 
     constructor(config?: unknown) {
       hlsJS.constructed(config);
@@ -141,8 +146,12 @@ vi.mock("hls.js", () => ({
 
     on(event: string, handler: (event: unknown, data: unknown) => void) {
       if (event === "error") hlsJS.errorHandler = handler;
+      if (event === "bufferAppended") hlsJS.bufferAppendedHandler = handler;
     }
-    loadSource() {}
+    loadSource(url: string) {
+      this.url = url;
+      hlsJS.loadSource(url);
+    }
     attachMedia() {}
     startLoad() {
       hlsJS.startLoad();
@@ -3072,6 +3081,146 @@ describe("VideoPlayer decode failure recovery", () => {
     });
 
     expect(hlsJS.startLoad).toHaveBeenCalledTimes(1);
+    expect(onPlanFailure).not.toHaveBeenCalled();
+  });
+});
+
+// A segment URL carries an `sgen` token fenced to the FFmpeg incarnation that
+// produced the playlist. After a seek reanchor the session advances to a new
+// incarnation and the server refuses the old token with 412 instead of serving
+// wrong-generation bytes. Retrying that exact URL can never succeed: the client
+// must invalidate the cached playlist and fetch it again so the fresh manifest
+// rebuilds every segment URL with the current token. Retrying the dead URL is
+// the loop the prod evidence showed (three incarnations, client permanently one
+// behind, until failure_recovery terminally killed a healthy session).
+describe("VideoPlayer stale generation recovery", () => {
+  beforeEach(() => {
+    realtimeOptions.current = null;
+    controls.current = null;
+    hlsJS.supported = true;
+    hlsJS.constructed.mockClear();
+    hlsJS.startLoad.mockClear();
+    hlsJS.loadSource.mockClear();
+    hlsJS.errorHandler = null;
+    hlsJS.bufferAppendedHandler = null;
+    vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
+    vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
+    vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => {});
+    vi.spyOn(HTMLMediaElement.prototype, "canPlayType").mockReturnValue("");
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  function hlsTranscodePlan() {
+    return fixturePlanV3({
+      delivery: "server_transcode_hls",
+      stream: {
+        url: "/playback/transcode/session-1/master.m3u8",
+        protocol: "hls",
+        headers: {},
+        header_refresh: "none",
+      },
+    });
+  }
+
+  const transcodeStreamUrl = "/api/v1/playback/transcode/session-1/master.m3u8?token=token";
+
+  function staleSegfault() {
+    return {
+      fatal: true,
+      type: "networkError",
+      details: "fragLoadError",
+      frag: {
+        url: "/api/v2/playback/transcode/session-1/segment/seg_00007.m4s?sgen=stale:inc:0",
+      },
+      response: { code: 412, url: "/api/v2/playback/transcode/session-1/segment/seg_00007.m4s" },
+      networkDetails: { status: 412, headers: { get: () => null } },
+    };
+  }
+
+  it("refetches the playlist on a stale-sgen frag 412 instead of retrying the dead URL", async () => {
+    const onPlanFailure = vi.fn();
+    renderPlayer({
+      plan: hlsTranscodePlan(),
+      streamUrl: transcodeStreamUrl,
+      onPlanFailure,
+      shouldAutoPlay: false,
+    });
+    await waitFor(() => expect(hlsJS.errorHandler).toBeTypeOf("function"));
+    // Drop the initial loadSource so only the recovery refetch is observed.
+    hlsJS.loadSource.mockClear();
+
+    act(() => {
+      hlsJS.errorHandler?.("error", staleSegfault());
+    });
+
+    expect(hlsJS.loadSource).toHaveBeenCalledTimes(1);
+    // The playlist is reloaded, never the dead segment URL: hls.js builds the
+    // fresh manifest's segment URIs, so the next frag fetch carries the current
+    // sgen rather than the one the server just fenced.
+    expect(hlsJS.loadSource.mock.calls[0]?.[0]).toContain("master.m3u8");
+    expect(hlsJS.loadSource.mock.calls[0]?.[0]).not.toContain("segment/");
+    // The stale fence is not a transport failure: no network recovery, and it
+    // must not be escalated to a plan failure on its own.
+    expect(hlsJS.startLoad).not.toHaveBeenCalled();
+    expect(onPlanFailure).not.toHaveBeenCalled();
+  });
+
+  it("bounds consecutive stale-generation refetches and falls through to failure recovery", async () => {
+    const onPlanFailure = vi.fn();
+    renderPlayer({
+      plan: hlsTranscodePlan(),
+      streamUrl: transcodeStreamUrl,
+      onPlanFailure,
+      shouldAutoPlay: false,
+    });
+    await waitFor(() => expect(hlsJS.errorHandler).toBeTypeOf("function"));
+    hlsJS.loadSource.mockClear();
+
+    act(() => {
+      hlsJS.errorHandler?.("error", staleSegfault());
+      hlsJS.errorHandler?.("error", staleSegfault());
+      hlsJS.errorHandler?.("error", staleSegfault());
+    });
+
+    // Two refetches: each rebuilds the playlist; the third no longer loops on a
+    // session the server keeps re-keying, and falls through to the ordinary
+    // recovery path.
+    expect(hlsJS.loadSource).toHaveBeenCalledTimes(2);
+    expect(hlsJS.startLoad).toHaveBeenCalledTimes(1);
+  });
+
+  it("re-arms the stale budget on progress so three seek/recovery cycles each recover", async () => {
+    const onPlanFailure = vi.fn();
+    renderPlayer({
+      plan: hlsTranscodePlan(),
+      streamUrl: transcodeStreamUrl,
+      onPlanFailure,
+      shouldAutoPlay: false,
+    });
+    await waitFor(() => expect(hlsJS.errorHandler).toBeTypeOf("function"));
+    expect(hlsJS.bufferAppendedHandler).toBeTypeOf("function");
+    hlsJS.loadSource.mockClear();
+    hlsJS.startLoad.mockClear();
+
+    // Three separated seek/recovery cycles: each stale-sgen frag is followed by
+    // media reaching the buffer, so progress re-arms the budget. Without the
+    // reset the third cycle would inherit an exhausted counter and misroute
+    // into a failure-recovery replan.
+    for (let cycle = 0; cycle < 3; cycle++) {
+      act(() => {
+        hlsJS.errorHandler?.("error", staleSegfault());
+      });
+      act(() => {
+        hlsJS.bufferAppendedHandler?.("bufferAppended");
+      });
+    }
+
+    expect(hlsJS.loadSource).toHaveBeenCalledTimes(3);
+    expect(hlsJS.startLoad).not.toHaveBeenCalled();
     expect(onPlanFailure).not.toHaveBeenCalled();
   });
 });
