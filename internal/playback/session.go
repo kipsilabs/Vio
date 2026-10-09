@@ -202,7 +202,7 @@ type Session struct {
 	// ClientCanceled records the last transport cancel observed for this
 	// session, scoped to the route revision and binding generation it happened
 	// on. It is liveness evidence for one request, not a session verdict: the
-	// recovery path never uses it to fence a live client, only to recognise a
+	// recovery path never uses it to fence a live client, only to recognize a
 	// cancel that a committed successor has already superseded. A committed
 	// replacement, a rollback, or a progress report clears it.
 	ClientCanceled ClientCancelEvidence

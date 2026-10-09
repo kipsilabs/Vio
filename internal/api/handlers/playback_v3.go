@@ -8025,7 +8025,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		)
 		if !currentRoute {
 			// The mark names a route this session has already replaced. Drop it
-			// so a predecessor's cancel cannot colour a later read.
+			// so a predecessor's cancel cannot color a later read.
 			_ = h.sessionMgr.ClearClientCanceled(record.SessionID)
 		}
 	}
@@ -10961,7 +10961,7 @@ func failureRecoveryOperationV3(operation playback.ReplanOperationV3) bool {
 
 // clientCanceledRecoveryWindow bounds how long after an observed transport
 // cancel a failure_recovery that still names the same route is reported as a
-// zombie candidate. It only colours the diagnostic: a cancel is never proof the
+// zombie candidate. It only colors the diagnostic: a cancel is never proof the
 // session died, so it does not fence the recovery. The recovery path still
 // drops a mark a committed successor has superseded.
 const clientCanceledRecoveryWindow = 90 * time.Second

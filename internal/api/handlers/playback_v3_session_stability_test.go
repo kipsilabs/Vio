@@ -116,7 +116,7 @@ func TestReplanFailureRecoveryAfterTransportCancelRuns(t *testing.T) {
 
 // A predecessor route's cancel must not outlive its route. Once a successor
 // commits, the mark is stale: the recovery runs, and the stale evidence is
-// dropped so it cannot colour a later read of the successor.
+// dropped so it cannot color a later read of the successor.
 func TestReplanFailureRecoveryIgnoresLatePredecessorCancel(t *testing.T) {
 	handler, start, _ := sessionStabilityHandlerV3(t)
 	started := sessionStabilityStartV3(t, handler, start)
