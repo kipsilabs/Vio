@@ -17,8 +17,12 @@
 # Series air-date sort keys advance when a known episode airs.
 ./internal/catalog TestSeriesAirDatesFollowEpisodesAndCalendarDB
 
+# Section and Smart collection rule fields and operators compile to working SQL.
+./internal/catalog TestRuleFieldsFilterCatalogDB
+
 # Profile history and account/invitation persistence.
 ./internal/api/handlers TestEbookProgressEventsPostgres
+./internal/api/handlers TestRemoveHistoryHidesEpisodesWithoutLibraryFilePostgres
 ./internal/auth TestUserRepositoryUpdateAccessGroupIDDB
 ./internal/auth TestUserRepositoryUpdatePromotingToAdminClearsAccessGroupDB
 ./internal/auth TestUserRepositoryUpdateDemotingAdminAssignsDefaultAccessGroupDB
@@ -59,6 +63,9 @@
 # Verification delivery survives a lost persistence receipt with bounded retries.
 ./internal/notifications TestEmailVerificationDispatchRetriesUncertainSendOnceWithSameMessage
 ./internal/notifications TestEmailVerificationDispatchStopsAfterSecondUncertainty
+
+# Recommendation candidate scans stay within pgvector's hnsw.ef_search range.
+./internal/recommendations TestFindTasteProfileCandidatesWithGenresAboveEfSearchMaximumDB
 
 # Image cache jobs run again for artwork the target no longer holds.
 ./internal/metadata TestEnqueueRequeuesSucceededJobOnlyWhenAskedDB

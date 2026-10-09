@@ -73,9 +73,7 @@ let items: AdminCollection[];
 let observers: Array<{ callback: IntersectionObserverCallback; targets: Set<Element> }>;
 
 function rowOf(title: string): HTMLElement {
-  const row = screen
-    .getAllByRole("listitem")
-    .find((item) => within(item).queryByText(title, { exact: true }));
+  const row = screen.getByText(title, { exact: true }).closest("li");
   if (!row) throw new Error(`No row titled ${title}`);
   return row;
 }
@@ -756,7 +754,7 @@ describe("AdminCollections List peeks", () => {
   const peekCalls = () =>
     v2Recorder.callsOf("GET /api/v2/library/{id}/collections/{collection_id}/items");
 
-  it("reads only on-screen rows, at most four at a time, and not again within five minutes", async () => {
+  it("reads only on-screen rows, at most four at a time, in a large list", async () => {
     items = Array.from({ length: 200 }, (_, index) =>
       stored(`Collection ${String(index).padStart(3, "0")}`),
     );
@@ -776,18 +774,18 @@ describe("AdminCollections List peeks", () => {
         }),
     );
     const client = new QueryClient();
-    const { unmount } = renderPage("/admin/collections", client);
+    renderPage("/admin/collections", client);
     await screen.findByText("Collection 000");
     const onScreen = Array.from({ length: 8 }, (_, index) => `Collection 00${index}`);
     reveal(...onScreen);
 
     await waitFor(() => expect(peekCalls()).toHaveLength(PEEK_MAX_IN_FLIGHT));
-    while (answers.length > 0) {
+    for (let completed = 0; completed < onScreen.length; completed += 1) {
+      await waitFor(() => expect(answers.length).toBeGreaterThan(0));
       await act(async () => answers.shift()!());
-      await waitFor(() => undefined);
     }
+    await waitFor(() => expect(client.isFetching()).toBe(0));
     await waitFor(() => expect(peekCalls()).toHaveLength(8));
-    while (answers.length > 0) await act(async () => answers.shift()!());
     expect(most).toBeLessThanOrEqual(PEEK_MAX_IN_FLIGHT);
     expect(new Set(peekCalls().map((call) => call.path))).toEqual(
       new Set(
@@ -798,6 +796,20 @@ describe("AdminCollections List peeks", () => {
       ),
     );
     expect(peekCalls().every((call) => call.query?.limit === 3)).toBe(true);
+  });
+
+  it("does not read fresh peeks again when their rows remount within five minutes", async () => {
+    items = Array.from({ length: 8 }, (_, index) => stored(`Collection 00${index}`));
+    const onScreen = items.map((item) => item.title);
+    v2Recorder.answer("GET /api/v2/library/{id}/collections/{collection_id}/items", async () => ({
+      items: [{ content_id: "m1", title: "Past Lives", poster_url: "p.jpg" }],
+    }));
+    const client = new QueryClient();
+    const { unmount } = renderPage("/admin/collections", client);
+    await screen.findByText("Collection 000");
+    reveal(...onScreen);
+    await waitFor(() => expect(peekCalls()).toHaveLength(onScreen.length));
+    await waitFor(() => expect(client.isFetching()).toBe(0));
 
     // Back to the page within the stale time: the same rows on screen read nothing.
     unmount();

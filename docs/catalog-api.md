@@ -566,6 +566,47 @@ identity after any count or duration sort. Work grouping chooses the first
 accessible ebook/audiobook edition under the complete source order before applying
 the group cursor. A query cap limits source editions before grouping.
 
+### Rule fields and operators
+
+Catalog query rule groups, `custom_filter` sections, and Smart collections share
+one rule vocabulary (`queryFieldDefs` in `internal/catalog/query_definition.go`).
+Each rule is `{field, op, value}`; an operator a field does not list returns `422`,
+and so does a value of the wrong shape: a span not like `30d` or reaching back before
+PostgreSQL's earliest date (4714 BC), a non-numeric bound,
+a decade that is not a year from 10 on (decade 0 would catch every title with no
+year), a `title` value that is empty or not a string, or a
+`latest_episode_added` or `last_air_date` bound that is not a date (`2024-01-31`)
+or an RFC 3339 time.
+
+| Operators | Fields | Value |
+| --- | --- | --- |
+| `contains`, `not_contains`, `is`, `is_not`, `begins_with`, `ends_with` | `title` | string, compared ignoring case; `%` and `_` match literally |
+| `is`, `is_not` | `decade` | the decade's first year (`1990` matches 1990 to 1999) |
+| `gt`, `gte`, `lt`, `lte`, `between` | `runtime` (minutes), `rating_imdb`, `rating_tmdb`, `rating_rt_critic`, `rating_rt_audience` | number, or `[min, max]` for `between` |
+| `gt`, `lt`, `between`, `in_last`, `not_in_last` | `added_at`, `release_date`, `latest_episode_added`, `last_air_date` | ISO date, `[from, to]`, or a span such as `30d` (`h`, `d`, `w`, `m` for months, `y`) |
+
+`not_in_last` keeps titles whose date falls before the span; a title without the
+date matches neither `in_last` nor `not_in_last`, and a title with no runtime
+matches no `runtime` bound. `latest_episode_added` and `last_air_date` describe a
+show's newest episode, so movies never match them. An episode row never matches
+`latest_episode_added`, and in the `episode` scope `last_air_date` is the
+episode's own air date. Rules on `rating_rt_critic` and `rating_rt_audience`
+still apply when an administrator hides that rating source, so a saved collection
+keeps its members; the web editor only stops offering those fields.
+
+The personalized `last_watched` field also takes `not_in_last`. It counts only
+finished plays: a title the profile never finished counts as finished long ago,
+and a show's last watched date is its most recently finished episode.
+
+`GET /api/v2/catalog/search/capabilities` advertises `extended_query_rules: true`
+when the server accepts `title`, `decade`, `runtime`, the TMDB and Rotten
+Tomatoes ratings, `latest_episode_added`, `last_air_date`, the partial title
+operators, and `not_in_last`. Older servers answer those rules with `422`, so the
+web rule editor offers them only while the flag is true. `/api/v1` keeps its frozen
+rule vocabulary: its catalog requests (including `POST /api/v1/catalog/query`) and
+its section and collection saves and previews refuse those fields and
+`not_in_last` with the errors they gave before.
+
 ### Search continuation
 
 Text searches with a nonempty `q` and the default `query` source accept explicit
