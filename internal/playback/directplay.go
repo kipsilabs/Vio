@@ -34,7 +34,7 @@ var mediaMIMETypes = mimeTypesByExtension(map[string]string{
 	mimeVideoMP4V3:       ".mp4 .m4v .f4v",
 	mimeVideoMatroska:    ".mkv",
 	mimeVideoWebM:        ".webm",
-	"video/x-msvideo":    ".avi .divx",
+	mimeVideoMSVideoV3:   ".avi .divx",
 	"video/quicktime":    ".mov",
 	"video/3gpp":         ".3gp",
 	"video/3gpp2":        ".3g2",
@@ -96,7 +96,7 @@ func MimeFromContainer(container string) string {
 	case "mpegts", "mpeg-ts", "ts":
 		return "video/mp2t"
 	case "avi":
-		return "video/x-msvideo"
+		return mimeVideoMSVideoV3
 	default:
 		return "application/octet-stream"
 	}

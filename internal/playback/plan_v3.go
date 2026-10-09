@@ -42,6 +42,7 @@ const (
 	containerMKVV3                         = "mkv"
 	containerHLSV3                         = "hls"
 	mimeVideoMP4V3                         = "video/mp4"
+	mimeVideoMSVideoV3                     = "video/x-msvideo"
 	degradationAudioConvertedV3            = "audio_converted"
 	audioCodecAACV3                        = "aac"
 	codecCopyV3                            = "copy"

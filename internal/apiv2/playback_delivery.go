@@ -24,6 +24,7 @@ const (
 	playbackIntegerFormat = "int64"
 
 	playbackMediaBinary        = "application/octet-stream"
+	playbackMediaOperation     = "getPlaybackMedia"
 	playbackSegmentOperation   = "getPlaybackSegment"
 	playbackSubtitleOperation  = "getPlaybackSubtitle"
 	playbackSubtitleHead       = "headPlaybackSubtitle"
@@ -98,7 +99,7 @@ func registerPlaybackDelivery(reg *Registry) {
 		media                      []string
 		ranges                     bool
 	}{
-		{http.MethodGet, "/stream/{session_id}", "getPlaybackMedia", "media-bytes", handlers.Original, append(playback.MediaMIMETypes(), playbackMediaBinary, "multipart/byteranges"), true},
+		{http.MethodGet, "/stream/{session_id}", playbackMediaOperation, "media-bytes", handlers.Original, append(playback.MediaMIMETypes(), playbackMediaBinary, "multipart/byteranges"), true},
 		{http.MethodHead, "/stream/{session_id}", "headPlaybackMedia", "media-bytes", handlers.Original, nil, true},
 		{http.MethodGet, "/playback/transcode/{session_id}/master.m3u8", "getPlaybackManifest", "hls", handlers.Manifest, []string{"application/vnd.apple.mpegurl"}, false},
 		{http.MethodGet, "/playback/transcode/{session_id}/segment/{name}", playbackSegmentOperation, "hls", handlers.Segment, []string{"video/mp4", "video/mp2t", playbackMediaBinary, "multipart/byteranges"}, true},
