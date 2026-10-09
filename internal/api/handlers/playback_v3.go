@@ -7034,7 +7034,7 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 			if isRouteCapacityUnavailableError(err) {
 				return playback.DecisionResponseV3{}, playbackOperationError(http.StatusServiceUnavailable, string(noderouting.OutcomeCapacityUnavailable), "The playback route capacity is temporarily unavailable; retry shortly")
 			}
-			return playback.DecisionResponseV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", fmt.Sprintf("Failed to commit the live replacement session"))
+			return playback.DecisionResponseV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to commit the live replacement session")
 		}
 	}
 	if err := h.PlanStoreV3.CompleteReplan(r.Context(), sessionID, req.ReplanRequestID, lease.LeaseToken, record.CurrentReplanRequestID, encoded, updated); err != nil {
@@ -7405,6 +7405,9 @@ func (h *PlaybackHandler) evaluateReplanCandidateV3(
 	return h.evaluatePreparedReplanCandidateV3(r, session, record, req, baseStart, sourceFile, candidateFile, candidateProvenance, plannerRequestedFile, plannerSettings, plannerSettingsErr, attemptedKeys)
 }
 
+// subtitleTrackKindV3 is the ParseTrackIDV3 kind for subtitle selections.
+const subtitleTrackKindV3 = "subtitle"
+
 // evaluatePreparedReplanCandidateV3 is evaluateReplanCandidateV3 with the
 // candidate file already resolved. It exists so a subtitle degrade can re-plan
 // the session's own file in place: re-resolving the same virtual candidate
@@ -7448,7 +7451,7 @@ func (h *PlaybackHandler) evaluatePreparedReplanCandidateV3(
 	// virtual rows rotate releases under a fixed id, so they keep the
 	// evidence-anchored remap above.
 	subtitleRemapSource := remapSource
-	if selFileID, selKind, _, selOK := playback.ParseTrackIDV3(candidateStart.SubtitleTrackID); selOK && selKind == "subtitle" && selFileID == candidateFile.ID && !isVirtualPlaybackFile(candidateFile) {
+	if selFileID, selKind, _, selOK := playback.ParseTrackIDV3(candidateStart.SubtitleTrackID); selOK && selKind == subtitleTrackKindV3 && selFileID == candidateFile.ID && !isVirtualPlaybackFile(candidateFile) {
 		subtitleRemapSource = candidateFile
 	}
 	if _, err := h.remapSubtitleSelectionV3(r.Context(), subtitleRemapSource, candidateFile, &candidateStart); err != nil {
@@ -10250,16 +10253,6 @@ type alternateCandidateV3 struct {
 	toneMapErr error
 }
 
-// appendWarningOnceV3 adds warning unless one with the same code is already
-// present, so a subtitle dropped by both the version remap and the planner's
-// policy fallback is reported once.
-func appendWarningOnceV3(warnings []playback.DegradationWarningV3, warning playback.DegradationWarningV3) []playback.DegradationWarningV3 {
-	if slices.ContainsFunc(warnings, func(existing playback.DegradationWarningV3) bool { return existing.Code == warning.Code }) {
-		return warnings
-	}
-	return append(warnings, warning)
-}
-
 func replanAllowsAlternateFileV3(operation playback.ReplanOperationV3, qualityPreference string) bool {
 	switch operation {
 	case playback.ReplanOperationFailureRecoveryV3, playback.ReplanOperationQualityChangeV3, playback.ReplanOperationOutputChangeV3:
@@ -10833,7 +10826,7 @@ func remapAudioSelectionV3(source, target *models.MediaFile, request *playback.S
 		}
 		_, kind, ordinal, ok := playback.ParseTrackIDV3(request.AudioTrackID)
 		if !ok || kind != "audio" {
-			return errors.New("The selected audio track identity is invalid for the source file.")
+			return errors.New("selected audio track identity is invalid for the source file")
 		}
 		// A stale file identity (virtual candidate rotation) still carries a
 		// meaningful ordinal; the semantic remap below finds the equivalent
@@ -10934,8 +10927,8 @@ func (h *PlaybackHandler) remapSubtitleSelectionV3(ctx context.Context, source, 
 			return false, nil
 		}
 		_, kind, ordinal, ok := playback.ParseTrackIDV3(request.SubtitleTrackID)
-		if !ok || kind != "subtitle" {
-			return false, errors.New("The selected subtitle track identity is invalid for the source file.")
+		if !ok || kind != subtitleTrackKindV3 {
+			return false, errors.New("selected subtitle track identity is invalid for the source file")
 		}
 		// Stale identities from candidate rotation still carry a usable
 		// ordinal; the language/format matching below finds the equivalent

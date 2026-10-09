@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
 	"time"
 
@@ -54,7 +55,11 @@ func (s *redisSuppressor) ShouldScan(ctx context.Context, key, state string, ttl
 	ttlMillis := max(ttl.Milliseconds(), 1)
 	claimed, err := claimStateScript.Run(ctx, s.client, []string{suppressRedisKey(key)}, state, ttlMillis).Int()
 	if err != nil {
-		return true, nil // fail open: a Redis hiccup should not block scanning
+		// Fail open: a Redis hiccup should not block scanning, so the claim is
+		// given up rather than reported. The scanned state is still recorded
+		// by the scan itself.
+		slog.WarnContext(ctx, "autoscan suppression claim failed; scanning without it", "error", err)
+		return true, nil
 	}
 	return claimed == 1, nil
 }

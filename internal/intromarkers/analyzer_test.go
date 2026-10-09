@@ -622,7 +622,7 @@ func TestAnalyzeEpisodePersistsRefinedChromaprintSegment(t *testing.T) {
 		t.Fatalf("expected one refinement call for requested file, got %d", refiner.calls)
 	}
 	if summary.DialogueRefinementsAttempted != 1 || summary.DialogueRefinementsApplied != 1 {
-		t.Fatalf("expected one applied dialogue refinement, got attempted=%d applied=%d",
+		t.Fatalf("expected one applied dialog refinement, got attempted=%d applied=%d",
 			summary.DialogueRefinementsAttempted, summary.DialogueRefinementsApplied)
 	}
 	if len(repo.patches) != 1 {

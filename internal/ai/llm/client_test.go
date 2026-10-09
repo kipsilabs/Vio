@@ -26,7 +26,7 @@ func TestChatSuccessSendsAuthAndModel(t *testing.T) {
 		buf := make([]byte, 4096)
 		n, _ := r.Body.Read(buf)
 		gotBody = string(buf[:n])
-		w.Write([]byte(chatOK))
+		_, _ = w.Write([]byte(chatOK))
 	}))
 	defer srv.Close()
 
@@ -121,9 +121,9 @@ func TestTranscribeParsesSegmentsAndMultipart(t *testing.T) {
 			buf := make([]byte, 64)
 			n, _ := f.Read(buf)
 			gotFile = buf[:n]
-			f.Close()
+			_ = f.Close()
 		}
-		w.Write([]byte(verboseJSON))
+		_, _ = w.Write([]byte(verboseJSON))
 	}))
 	defer srv.Close()
 
@@ -180,7 +180,7 @@ func TestTranscribeOmitsVADFilterForStrictHostedEndpoints(t *testing.T) {
 func TestTranscribeParsesPerSegmentWords(t *testing.T) {
 	// speaches/faster-whisper shape: words nested inside each segment.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"language":"en","text":"hi there","segments":[
+		_, _ = w.Write([]byte(`{"language":"en","text":"hi there","segments":[
 			{"start":0.0,"end":3.0,"text":" hi there","words":[
 				{"start":0.2,"end":0.5,"word":" hi"},{"start":0.6,"end":1.0,"word":" there"}]}]}`))
 	}))
@@ -201,7 +201,7 @@ func TestTranscribeParsesPerSegmentWords(t *testing.T) {
 func TestTranscribeAttachesTopLevelWordsBySegmentTime(t *testing.T) {
 	// OpenAI shape: words in a top-level array, segments without words.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"language":"en","text":"hi there friend","segments":[
+		_, _ = w.Write([]byte(`{"language":"en","text":"hi there friend","segments":[
 			{"start":0.0,"end":1.5,"text":" hi there"},{"start":1.5,"end":3.0,"text":" friend"}],
 			"words":[{"start":0.2,"end":0.5,"word":"hi"},{"start":0.6,"end":1.0,"word":"there"},
 			{"start":1.8,"end":2.2,"word":"friend"}]}`))
@@ -224,7 +224,7 @@ func TestTranscribeAttachesTopLevelWordsBySegmentTime(t *testing.T) {
 
 func TestTranscribeEmptySegmentsIsNotAnError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"language":"english","text":"","segments":[]}`))
+		_, _ = w.Write([]byte(`{"language":"english","text":"","segments":[]}`))
 	}))
 	defer srv.Close()
 
@@ -288,7 +288,7 @@ func TestTranscribeRequiresConfig(t *testing.T) {
 func TestTranscribeChatOnlyGatewayGetsConfigHint(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte(`{"error":{"message":"invalid content-type: multipart/form-data","code":400}}`))
+		_, _ = w.Write([]byte(`{"error":{"message":"invalid content-type: multipart/form-data","code":400}}`))
 	}))
 	defer srv.Close()
 

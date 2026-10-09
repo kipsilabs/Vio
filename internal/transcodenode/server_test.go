@@ -3340,7 +3340,7 @@ func TestHandleStartUsesConfiguredHWDeviceList(t *testing.T) {
 	if session == nil {
 		t.Fatal("session was not registered")
 	}
-	defer session.CloseProcess()
+	defer func() { _ = session.CloseProcess() }()
 	if got := session.Opts().HWDevice; got != "/dev/dri/renderD888" {
 		t.Fatalf("session HWDevice = %q, want one concrete device from the configured list", got)
 	}

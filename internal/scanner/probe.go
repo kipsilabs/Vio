@@ -130,7 +130,8 @@ func ProbeFile(ctx context.Context, ffprobePath string, filePath string) (*Probe
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		processmetrics.Record(processmetrics.Probe, cmd.ProcessState, err, ctx.Err())
-		if exitErr, ok := err.(*exec.ExitError); ok && len(exitErr.Stderr) == 0 {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && len(exitErr.Stderr) == 0 {
 			exitErr.Stderr = stderr.Bytes()
 		}
 		// A producer may receive SIGPIPE after the bounded writer rejects its

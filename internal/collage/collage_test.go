@@ -35,7 +35,7 @@ func TestComposePoster_NoImages(t *testing.T) {
 
 func TestComposePoster_AllInvalid(t *testing.T) {
 	_, err := ComposePoster([][]byte{{0, 1, 2}, {3, 4, 5}})
-	if err != ErrNotEnoughImages {
+	if !errors.Is(err, ErrNotEnoughImages) {
 		t.Fatalf("expected ErrNotEnoughImages, got %v", err)
 	}
 }
