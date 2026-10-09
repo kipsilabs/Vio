@@ -40,12 +40,28 @@ class ResizeObserverStub {
 
 const catalogFilterParams = new URLSearchParams({
   source: "query",
+  q: "cruise", // text search — excluded from the structured-filter seed
   library_id: "3",
+  type: "movie", // media scope
+  match: "any", // top-level OR across groups
+  sort: "year",
+  order: "asc",
+  query_limit: "25",
+  request_page: "4", // pagination — excluded from the seed
   "groups[0][match]": "all",
   "groups[0][rules][0][field]": "genre",
   "groups[0][rules][0][op]": "contains",
   "groups[0][rules][0][value]": "Action",
+  "groups[1][match]": "all",
+  "groups[1][rules][0][field]": "year",
+  "groups[1][rules][0][op]": "gte",
+  "groups[1][rules][0][value]": "2000",
 });
+
+const seededGroups = [
+  { match: "all", rules: [{ field: "genre", op: "contains", value: "Action" }] },
+  { match: "all", rules: [{ field: "year", op: "gte", value: 2000 }] },
+];
 
 function seededHref() {
   return buildSaveAsSmartCollectionHref(parseCatalogSearchParams(catalogFilterParams));
@@ -86,12 +102,22 @@ beforeEach(() => {
 
 describe("save catalog filters as a smart collection", () => {
   it("round-trips the catalog filter state through the seed href", () => {
-    const parsed = parseCatalogSearchParams(new URLSearchParams(seededHref().split("?")[1]));
+    const href = seededHref();
+    const seedParams = new URLSearchParams(href.split("?")[1]);
+    const parsed = parseCatalogSearchParams(seedParams);
+
     expect(parsed.source).toBe("query");
+    // The structured filters survive whole: top-level match, groups,
+    // sort/order, limit, library, and media scope.
+    expect(parsed.query_definition.match).toBe("any");
+    expect(parsed.query_definition.groups).toEqual(seededGroups);
+    expect(parsed.query_definition.sort).toEqual({ field: "year", order: "asc" });
+    expect(parsed.query_definition.limit).toBe(25);
     expect(parsed.query_definition.library_ids).toEqual([3]);
-    expect(parsed.query_definition.groups).toEqual([
-      { match: "all", rules: [{ field: "genre", op: "contains", value: "Action" }] },
-    ]);
+    expect(parsed.query_definition.media_scope).toBe("movie");
+    // Text search and pagination are view state, not collection filters.
+    expect(seedParams.has("q")).toBe(false);
+    expect(seedParams.has("request_page")).toBe(false);
   });
 
   it("seeds the smart wizard with the current filters and saves via POST /api/v2/collections", async () => {
@@ -103,8 +129,9 @@ describe("save catalog filters as a smart collection", () => {
       expect.objectContaining({
         source: "query",
         query_definition: expect.objectContaining({
+          match: "any",
           library_ids: [3],
-          groups: [{ match: "all", rules: [{ field: "genre", op: "contains", value: "Action" }] }],
+          groups: seededGroups,
         }),
       }),
       expect.anything(),
@@ -125,8 +152,11 @@ describe("save catalog filters as a smart collection", () => {
         name: "Action shelf",
         collection_type: "smart",
         query_definition: expect.objectContaining({
+          match: "any",
           library_ids: [3],
-          groups: [{ match: "all", rules: [{ field: "genre", op: "contains", value: "Action" }] }],
+          media_scope: "movie",
+          limit: 25,
+          groups: seededGroups,
         }),
       },
     });

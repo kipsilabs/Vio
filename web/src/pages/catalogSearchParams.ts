@@ -455,6 +455,14 @@ export function buildCatalogApiSearchParams(state: CatalogSearchState): URLSearc
     params.set("query_limit", String(state.query_definition.limit));
   }
 
+  // The parser defaults a missing top-level match to "all", so an "any"
+  // (OR across groups) pick must be written explicitly or it silently
+  // becomes AND on the next parse — in catalog navigation and in the
+  // smart-collection seed built from these params.
+  if (state.query_definition.match === "any") {
+    params.set("match", "any");
+  }
+
   state.query_definition.groups.forEach((group, groupIndex) => {
     params.set(`groups[${groupIndex}][match]`, group.match);
     group.rules.forEach((rule, ruleIndex) => {
