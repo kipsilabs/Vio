@@ -1204,7 +1204,7 @@ func (w *signalingStreamWriter) Write(p []byte) (int, error) {
 }
 
 // blockingStreamWriter parks in Write until a past write deadline is set (what
-// RollingDeadlineWriter.Abort does) or the test releases it, modelling a client
+// RollingDeadlineWriter.Abort does) or the test releases it, modeling a client
 // that stopped reading. Its release is idempotent so a failed test's cleanup
 // unblocks the handler instead of leaking it.
 type blockingStreamWriter struct {
