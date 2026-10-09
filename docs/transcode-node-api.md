@@ -1,11 +1,14 @@
 # Transcode node throttle contract
 
 The API server resolves `enable_transcode_throttle` and
-`transcode_throttle_seconds` before starting remote HLS playback. The
-`POST /transcode/start` request carries `throttle_seconds`: zero disables
-throttling; a positive value sets the forward buffer in seconds. Configured
-positive values below 60 seconds are clamped to 60, and invalid configured
-values use the 300-second default. Negative request values return HTTP 400.
+`transcode_throttle_seconds` before starting remote HLS playback. Throttling is
+enabled by default: only an explicit `enable_transcode_throttle=false`, or a
+settings read failure, disables it, so a fresh install caps forward lookahead
+without opt-in while a store outage fails closed. The `POST /transcode/start`
+request carries `throttle_seconds`: zero disables throttling; a positive value
+sets the forward buffer in seconds. Configured positive values below 60 seconds
+are clamped to 60, and invalid configured values use the 300-second default.
+Negative request values return HTTP 400.
 
 The start response echoes `throttle_seconds` after arming the throttler.
 When throttling is enabled, the API rejects a missing or mismatched echo and
