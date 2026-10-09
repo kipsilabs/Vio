@@ -241,6 +241,15 @@ and `terminal.retryable: true`; mint a new attempt. Local direct and HLS media
 URLs in the plan are projected into the `/api/v2` namespace; the signed `st`
 query they carry is unchanged.
 
+A start that returns a playable decision registers the device the client
+declares in `X-Silo-Device-Id` (with the optional `X-Silo-Device-Name` and
+`X-Silo-Device-Platform`) for the acting profile and refreshes its
+`last_seen_at`, as described in the
+[device registry](settings-api.md#device-registry). The v1 start route reads the
+same headers. A refused start, or one that returns a terminal decision,
+registers nothing. These headers do not change the playback device that
+`X-Device-ID` names.
+
 Two terminal reasons describe a source without stream metadata.
 `source_metadata_incomplete` (`retryable: true`) means the file has not been
 probed yet, or its probe lacks a field a route needs; trying again after the

@@ -173018,6 +173018,42 @@
               ],
               "type": "string"
             }
+          },
+          {
+            "description": "The client's stable device identifier; a successful start records it in the profile's device registry (first 128 characters)",
+            "in": "header",
+            "name": "X-Silo-Device-Id",
+            "schema": {
+              "description": "The client's stable device identifier; a successful start records it in the profile's device registry (first 128 characters)",
+              "examples": [
+                "iphone-1"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional display name recorded on the device registry (first 120 characters)",
+            "in": "header",
+            "name": "X-Silo-Device-Name",
+            "schema": {
+              "description": "Optional display name recorded on the device registry (first 120 characters)",
+              "examples": [
+                "Living room"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional platform recorded on the device registry (first 40 characters)",
+            "in": "header",
+            "name": "X-Silo-Device-Platform",
+            "schema": {
+              "description": "Optional platform recorded on the device registry (first 40 characters)",
+              "examples": [
+                "iOS"
+              ],
+              "type": "string"
+            }
           }
         ],
         "requestBody": {

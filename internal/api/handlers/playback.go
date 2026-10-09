@@ -398,6 +398,7 @@ type PlaybackHandler struct {
 	VirtualContentFileLookup    VirtualContentFileLookup
 	VirtualEpisodeFileLookup    VirtualEpisodeFileLookup
 	StoreProvider               userstore.UserStoreProvider // optional; enables progress/history persistence
+	DeviceSightings             *DeviceSightings            // optional; registers the device that starts playback
 	WatchScrobbler              PlaybackWatchScrobbler
 	StableIdentityResolver      *watchstate.StableIdentityResolver
 	CompletionObserver          watchstate.CompletionObserver // optional; auto-removes watched items from the watchlist
@@ -411,6 +412,7 @@ type PlaybackHandler struct {
 	JWTSecret                   string                    // needed for signing stream tokens
 	StreamTelemetry             *streamtelemetry.Registry // local observation-only telemetry
 	StreamDeny                  *playback.StreamDeny
+
 	// InstallationID is diagnostics.ServerInstanceID; v2 playback mutations
 	// carry it and are refused when it differs. Empty leaves v2 unconfigured.
 	InstallationID string

@@ -50,6 +50,10 @@ The empty range retains manual provenance: provider lookups, local detection,
 rescans, and file-identity changes cannot restore it. An explicit manual set
 adds the kind again. Other marker kinds are unchanged.
 
+Manual writes require a Movie or Series library, including their mixed-library
+variants. Unsupported library kinds return `422 validation_failed` without
+changing markers, contributing them, or emitting a playback update.
+
 Local detection finds episode intros and end credits, and movie end credits on
 a best-effort basis: from chapters and the picture near the end, never intros.
 Some movies get no local credits, or credits that start late. It never replaces

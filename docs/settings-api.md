@@ -910,6 +910,30 @@ family so like-device preferences participate in resolution. Each response
 includes its source scope and source context; `client_family` is included for a
 family-scoped winner.
 
+### Device registry
+
+The device registry lists each device a profile uses, with its name, platform
+and `last_seen_at`. `GET /api/v2/devices` and the administrator device reads
+list it. The server registers the device named by `X-Silo-Device-Id`, with the
+optional `X-Silo-Device-Name` and `X-Silo-Device-Platform`, for the acting
+profile when the device:
+
+- resolves effective values (`GET` or `POST` of the effective route, v1 or v2);
+- starts playback (see [Playback API](playback-api.md#start));
+- writes one of its own `profile_device` values, or uses a legacy
+  device-setting route;
+- creates a download.
+
+A request that names another device with `device_id`, or another profile with
+`profile_id`, registers nothing: inspecting a device's settings does not show
+that the profile is using it. Settings and playback requests made in an
+administrator's view-as (impersonation) session register nothing either: the
+device is the administrator's, not the profile's. Settings and playback
+requests refresh a given profile and device at most once every five minutes per
+server process, so `last_seen_at` can trail actual use by that long. On those
+requests a failed registration is logged and does not fail the request, and the
+device's next request retries it.
+
 ### Admin projection
 
 Admin routes are mounted behind the normal acting-admin authorization:
