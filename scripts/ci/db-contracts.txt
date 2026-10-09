@@ -12,6 +12,9 @@
 ./internal/recommendations TestRecentCompletedItemIDsGroupsSeriesBeforeLimit
 ./internal/sections TestCompatibilityRecentlyAddedReturnsFlatDistinctSeries
 ./internal/scanner TestFileRepositoryPreservesFirstSeenScanProvenance
+./internal/scanner TestMatroskaTrackBackfillRecordsTrackNumbers
+./internal/scanner TestMatroskaTrackBackfillStopsOnStalledStorage
+./internal/scanner TestMatroskaTrackBackfillStopsOnIntermittentStalls
 ./migrations TestScanRunForeignKeysHaveLeadingIndexesDB
 
 # Series air-date sort keys advance when a known episode airs.

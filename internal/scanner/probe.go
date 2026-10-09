@@ -161,6 +161,7 @@ func ProbeFile(ctx context.Context, ffprobePath string, filePath string) (*Probe
 	}
 
 	probe := convertProbeData(&raw)
+	applyMatroskaSubtitleTrackIDs(ctx, filePath, probe)
 	if probe.Duration == 0 {
 		if frameRate, hasVideo := primaryVideoFrameRate(raw.Streams); hasVideo {
 			// A failed or empty packet scan must not discard the codec and
@@ -1044,7 +1045,7 @@ func detectContainer(formatName string) string {
 		p = strings.TrimSpace(p)
 		switch p {
 		case "matroska", "webm":
-			return "mkv"
+			return containerMKV
 		case "mov", "mp4", "m4a":
 			return "mp4"
 		case "avi":
