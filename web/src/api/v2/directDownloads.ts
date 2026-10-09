@@ -37,14 +37,16 @@ export function directDownloadErrorMessage(status: number): string {
   }
 }
 
-/** A fetched, save-ready download. The caller owns the object URL and disposes it. */
+/**
+ * A preflighted direct-download link. The URL is the authenticated
+ * direct-download endpoint itself; the browser fetches it when the user clicks
+ * the save link, so there is no object URL to own or revoke.
+ */
 export interface PreparedDirectDownload {
-  /** Same-origin blob URL holding the fetched file. */
+  /** The authenticated direct-download URL the explicit save link points at. */
   readonly url: string;
   /** Filename suggested by the server, or a safe fallback. */
   readonly filename: string;
-  /** Release the object URL once the save link is gone. */
-  dispose(): void;
 }
 
 function decodeFilenamePart(value: string): string {
@@ -72,15 +74,17 @@ function probeAccepted(status: number): boolean {
 // Browser navigation cannot set headers. Retain the existing account-token
 // authority; do not imply that the selected profile/PIN travels in this URL.
 //
-// Two requests, both awaited: a ranged GET is a preflight that fails fast when
-// the captured token is no longer authorized, and a full GET is the transfer
-// itself. Because the transfer is an awaited fetch, a refusal, network failure
-// or mid-stream drop is observable instead of vanishing behind a navigation.
-// The bytes come back as a blob object URL for an explicit user-clicked save,
-// so no inferred activation check can turn a slow probe into a false refusal.
+// The ranged GET is a preflight, not delivery proof: it establishes that the
+// captured token is still authorized for this exact verb and URL so a refusal
+// surfaces as text instead of a silent navigation. The bytes are never fetched
+// here — the explicit save link's own navigation performs the transfer, with
+// real user activation behind it. Abort is threaded through the preflight and
+// its body consumption via `signal`; the transfer itself is browser-owned
+// navigation, so there is nothing for JS to abort or revoke on the save path.
 export async function prepareDirectDownload(
   fileId: number,
   isCurrent: () => boolean,
+  signal: AbortSignal,
   filenameHint?: string,
 ): Promise<PreparedDirectDownload> {
   if (!Number.isSafeInteger(fileId) || fileId <= 0)
@@ -90,6 +94,7 @@ export async function prepareDirectDownload(
   const profile = captureProfileRequestContext();
   const requireCurrent = () => {
     if (
+      signal.aborted ||
       !token ||
       !isCurrent() ||
       !isSessionIdentityCurrent(identity) ||
@@ -100,54 +105,29 @@ export async function prepareDirectDownload(
   requireCurrent();
   const url = `/api/v2/direct-download?${new URLSearchParams({ file_id: String(fileId), token: token! })}`;
 
-  const probe = new AbortController();
   let probeRes: Response;
   try {
     probeRes = await fetch(url, {
       method: "GET",
       headers: { Range: "bytes=0-0" },
       cache: "no-store",
-      signal: probe.signal,
+      signal,
     });
   } catch (error) {
-    // A rejected probe must not report into a replacement authority either.
+    // A rejected or aborted probe must not report into a replacement authority.
     requireCurrent();
     throw error;
-  } finally {
-    // Only the status was needed; stop any body the probe started.
-    probe.abort();
   }
   requireCurrent();
   if (!probeAccepted(probeRes.status)) {
     throw new DirectDownloadError(probeRes.status, directDownloadErrorMessage(probeRes.status));
   }
-
-  let transferRes: Response;
-  try {
-    transferRes = await fetch(url, { method: "GET", cache: "no-store" });
-  } catch (error) {
-    requireCurrent();
-    throw error;
-  }
-  requireCurrent();
-  if (!transferRes.ok) {
-    throw new DirectDownloadError(
-      transferRes.status,
-      directDownloadErrorMessage(transferRes.status),
-    );
-  }
-  let blob: Blob;
-  try {
-    blob = await transferRes.blob();
-  } catch {
-    requireCurrent();
-    throw new DirectDownloadError(0, "The download stopped before it finished. Try again.");
-  }
-  requireCurrent();
-  const objectUrl = URL.createObjectURL(blob);
+  // Only the status and headers are needed. Cancel the one-byte probe body so
+  // the connection is released instead of left half-read; aborting `signal`
+  // while the probe was in flight cancels the transfer the same way.
+  void probeRes.body?.cancel().catch(() => undefined);
   return {
-    url: objectUrl,
-    filename: filenameFromDisposition(transferRes.headers.get("Content-Disposition"), filenameHint),
-    dispose: () => URL.revokeObjectURL(objectUrl),
+    url,
+    filename: filenameFromDisposition(probeRes.headers.get("Content-Disposition"), filenameHint),
   };
 }

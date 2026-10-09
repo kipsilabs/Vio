@@ -69,33 +69,30 @@ export default function DownloadVersionPicker({
   const denialReason = capabilityDenialReason(capability);
 
   const active = useRef<symbol | null>(null);
-  // The object URL must be released exactly once, whether the user saves it,
-  // closes the dialog, or switches files underneath it.
-  const preparedRef = useRef<PreparedDirectDownload | null>(null);
-  const releasePrepared = () => {
-    preparedRef.current?.dispose();
-    preparedRef.current = null;
-    setPrepared(null);
-  };
+  // One controller drives the in-flight preflight. Closing the dialog or
+  // replacing the file selection aborts it, so no probe outlives its intent.
+  const abortRef = useRef<AbortController | null>(null);
 
+  // A reopen or a versions replacement invalidates any in-flight probe and any
+  // prepared selection: rows become clickable again and no stale save link
+  // survives to be clicked against the wrong file.
   useLayoutEffect(() => {
+    abortRef.current?.abort();
+    abortRef.current = null;
     active.current = null;
+    setDownloading(null);
+    setPrepared(null);
     return () => {
+      abortRef.current?.abort();
+      abortRef.current = null;
       active.current = null;
     };
   }, [open, versions]);
 
-  useEffect(() => {
-    if (open) return;
-    preparedRef.current?.dispose();
-    preparedRef.current = null;
-    setPrepared(null);
-  }, [open]);
-
   useEffect(
     () => () => {
-      preparedRef.current?.dispose();
-      preparedRef.current = null;
+      abortRef.current?.abort();
+      abortRef.current = null;
     },
     [],
   );
@@ -104,34 +101,40 @@ export default function DownloadVersionPicker({
     if (active.current || !open || prepared) return;
     const attempt = Symbol();
     active.current = attempt;
+    const controller = new AbortController();
+    abortRef.current = controller;
     const isCurrent = () => active.current === attempt;
     setDownloading(version.file_id);
     try {
-      const download = await prepareDirectDownload(version.file_id, isCurrent, version.file_name);
-      if (isCurrent()) {
-        preparedRef.current?.dispose();
-        preparedRef.current = download;
-        setPrepared({ version, download });
-      } else {
-        download.dispose();
-      }
+      // Preflight only: probes with a ranged GET and resolves to the
+      // authenticated URL. The bytes move on the user's own click of the save
+      // link, not here.
+      const download = await prepareDirectDownload(
+        version.file_id,
+        isCurrent,
+        controller.signal,
+        version.file_name,
+      );
+      if (isCurrent()) setPrepared({ version, download });
     } catch (error) {
-      // A superseded attempt (profile switch, closed dialog) must not report
-      // into the replacement authority; every other failure toasts a reason.
+      // A superseded attempt (profile switch, closed dialog, replaced selection)
+      // must not report into the replacement authority; every other failure
+      // toasts a concrete reason.
       if (isCurrent() && !(error instanceof StaleApiRequestContextError))
         toast.error(downloadFailureMessage(error));
     } finally {
       if (isCurrent()) {
         active.current = null;
+        abortRef.current = null;
         setDownloading(null);
       }
     }
   };
 
   const handleSave = () => {
-    const selection = prepared;
-    if (!selection) return;
-    releasePrepared();
+    // The link's href is the authenticated direct-download URL, so the
+    // navigation outlives this click and there is nothing to revoke or dispose.
+    // Closing resets the selection; the in-flight probe, if any, is aborted.
     onOpenChange(false);
   };
 

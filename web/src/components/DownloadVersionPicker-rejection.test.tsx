@@ -21,8 +21,6 @@ beforeEach(() => {
   setAccessToken("original-account");
   setProfileId("original-profile");
   setProfileToken("original-pin");
-  vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:download");
-  vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
 });
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -33,7 +31,7 @@ afterEach(() => {
 });
 
 it.each(["account", "profile", "pin", "unchanged"])(
-  "fences a rejected actual probe for %s authority without replacing the picker",
+  "fences a rejected actual preflight for %s authority without replacing the picker",
   async (authority) => {
     let reject!: (error: Error) => void;
     const fetch = vi.fn(
@@ -65,28 +63,25 @@ it.each(["account", "profile", "pin", "unchanged"])(
   },
 );
 
-it("fences a late second request after an authority change with no save link", async () => {
-  let resolveTransfer!: (r: Response) => void;
+it("fences a late preflight after an authority change with no save link", async () => {
+  let resolveProbe!: (r: Response) => void;
   vi.stubGlobal(
     "fetch",
-    vi
-      .fn()
-      .mockResolvedValueOnce(new Response(null, { status: 206 }))
-      .mockImplementationOnce(
-        () =>
-          new Promise<Response>((r) => {
-            resolveTransfer = r;
-          }),
-      ),
+    vi.fn(
+      () =>
+        new Promise<Response>((r) => {
+          resolveProbe = r;
+        }),
+    ),
   );
   const close = vi.fn();
   render(<DownloadVersionPicker open onOpenChange={close} versions={versions} />);
   fireEvent.click(screen.getByRole("button", { name: /1080p/ }));
-  await vi.waitFor(() => expect(resolveTransfer).toBeDefined());
-  // The probe authorized the transfer; the profile changes before it lands.
+  await vi.waitFor(() => expect(resolveProbe).toBeDefined());
+  // The probe is still in flight; the profile changes before it lands.
   setProfileId("replacement-profile");
   await act(async () => {
-    resolveTransfer(new Response("bytes", { status: 200 }));
+    resolveProbe(new Response(null, { status: 206 }));
   });
   expect(screen.queryByRole("link", { name: /Save file/i })).toBeNull();
   expect(close).not.toHaveBeenCalled();
