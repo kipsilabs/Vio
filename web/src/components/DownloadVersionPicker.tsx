@@ -1,7 +1,8 @@
-import { useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Download, Loader2 } from "lucide-react";
 import { toast } from "sonner";
 import type { FileVersion } from "@/api/types";
+import { Button } from "@/components/ui/button";
 import {
   Dialog,
   DialogContent,
@@ -9,9 +10,15 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { formatFileSize } from "@/lib/mediaFormat";
 import { StaleApiRequestContextError } from "@/api/client";
-import { launchDirectDownload } from "@/api/v2/directDownloads";
+import {
+  DirectDownloadError,
+  prepareDirectDownload,
+  type PreparedDirectDownload,
+} from "@/api/v2/directDownloads";
+import { useDownloadCapability } from "@/hooks/queries/downloads";
 import { buildQualitySummary, sortByResolution } from "@/pages/ItemDetail/components/VersionFlyout";
 
 interface DownloadVersionPickerProps {
@@ -20,6 +27,27 @@ interface DownloadVersionPickerProps {
   versions: FileVersion[];
   title?: string;
   summaryBuilder?: (version: FileVersion) => string;
+}
+
+interface PreparedSelection {
+  version: FileVersion;
+  download: PreparedDirectDownload;
+}
+
+/** Why the server refuses downloads for this account, or null when it permits them. */
+function capabilityDenialReason(
+  capability: { enabled: boolean; allowed: boolean } | undefined,
+): string | null {
+  if (!capability) return null;
+  if (!capability.enabled) return "Downloads are turned off on this server.";
+  if (!capability.allowed) return "Downloads are not allowed for this account.";
+  return null;
+}
+
+/** A concrete, user-actionable reason for a failed download attempt. */
+function downloadFailureMessage(error: unknown): string {
+  if (error instanceof DirectDownloadError) return error.message;
+  return "Download could not be started. Check your connection and try again.";
 }
 
 export default function DownloadVersionPicker({
@@ -31,35 +59,91 @@ export default function DownloadVersionPicker({
 }: DownloadVersionPickerProps) {
   const sorted = sortByResolution(versions);
   const [downloading, setDownloading] = useState<number | null>(null);
+  const [prepared, setPrepared] = useState<PreparedSelection | null>(null);
+  const {
+    data: capability,
+    isLoading: capabilityLoading,
+    isError: capabilityError,
+    refetch: refetchCapability,
+  } = useDownloadCapability();
+  const denialReason = capabilityDenialReason(capability);
 
   const active = useRef<symbol | null>(null);
+  // One controller drives the in-flight preflight. Closing the dialog or
+  // replacing the file selection aborts it, so no probe outlives its intent.
+  const abortRef = useRef<AbortController | null>(null);
+
+  // A reopen or a versions replacement invalidates any in-flight probe and any
+  // prepared selection: rows become clickable again and no stale save link
+  // survives to be clicked against the wrong file.
   useLayoutEffect(() => {
+    abortRef.current?.abort();
+    abortRef.current = null;
     active.current = null;
     setDownloading(null);
+    setPrepared(null);
     return () => {
+      abortRef.current?.abort();
+      abortRef.current = null;
       active.current = null;
     };
   }, [open, versions]);
 
+  useEffect(
+    () => () => {
+      abortRef.current?.abort();
+      abortRef.current = null;
+    },
+    [],
+  );
+
   const handleDownload = async (version: FileVersion) => {
-    if (active.current || !open) return;
+    if (active.current || !open || prepared) return;
     const attempt = Symbol();
     active.current = attempt;
+    const controller = new AbortController();
+    abortRef.current = controller;
     const isCurrent = () => active.current === attempt;
     setDownloading(version.file_id);
     try {
-      await launchDirectDownload(version.file_id, isCurrent);
-      if (isCurrent()) onOpenChange(false);
+      // Preflight only: probes with a ranged GET and resolves to the
+      // authenticated URL. The bytes move on the user's own click of the save
+      // link, not here.
+      const download = await prepareDirectDownload(
+        version.file_id,
+        isCurrent,
+        controller.signal,
+        version.file_name,
+      );
+      if (isCurrent()) setPrepared({ version, download });
     } catch (error) {
+      // A superseded attempt (profile switch, closed dialog, replaced selection)
+      // must not report into the replacement authority; every other failure
+      // toasts a concrete reason.
       if (isCurrent() && !(error instanceof StaleApiRequestContextError))
-        toast.error("Download could not be started. Check access and try again.");
+        toast.error(downloadFailureMessage(error));
     } finally {
       if (isCurrent()) {
         active.current = null;
+        abortRef.current = null;
         setDownloading(null);
       }
     }
   };
+
+  const handleSave = () => {
+    // The link's href is the authenticated direct-download URL, so the
+    // navigation outlives this click and there is nothing to revoke or dispose.
+    // Closing resets the selection; the in-flight probe, if any, is aborted.
+    onOpenChange(false);
+  };
+
+  const rowsBlocked =
+    capabilityLoading ||
+    capabilityError ||
+    denialReason !== null ||
+    downloading !== null ||
+    prepared !== null;
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -71,34 +155,92 @@ export default function DownloadVersionPicker({
           </DialogDescription>
         </DialogHeader>
 
-        <div className="space-y-2">
-          {sorted.map((version) => {
-            const quality = summaryBuilder?.(version) || buildQualitySummary(version);
-            const size = summaryBuilder ? "" : formatFileSize(version.file_size);
+        {capabilityLoading && (
+          <p className="text-muted-foreground text-sm" role="status">
+            Checking download availability…
+          </p>
+        )}
 
-            return (
-              <button
-                key={version.file_id}
-                type="button"
-                onClick={() => handleDownload(version)}
-                disabled={downloading !== null}
-                className="border-border/50 bg-accent/30 hover:bg-accent/60 flex w-full items-center gap-3 rounded-xl border px-4 py-3 text-left transition-colors disabled:opacity-50"
+        {capabilityError && (
+          <div className="flex items-center justify-between gap-2" role="alert">
+            <p className="text-muted-foreground text-sm">
+              Couldn&#39;t check download availability.
+            </p>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => void refetchCapability()}
+            >
+              Retry
+            </Button>
+          </div>
+        )}
+
+        {denialReason && (
+          <p className="text-muted-foreground text-sm" role="status">
+            {denialReason}
+          </p>
+        )}
+
+        {prepared && (
+          <div className="border-border/50 bg-accent/30 space-y-2 rounded-xl border px-4 py-3">
+            <p className="text-foreground text-sm font-medium">Your file is ready.</p>
+            <Button asChild variant="default" size="sm">
+              <a
+                href={prepared.download.url}
+                download={prepared.download.filename}
+                onClick={handleSave}
               >
-                <span className="bg-primary/10 text-primary flex size-9 shrink-0 items-center justify-center rounded-full">
-                  {downloading === version.file_id ? (
-                    <Loader2 className="size-4 animate-spin" />
-                  ) : (
-                    <Download className="size-4" />
-                  )}
-                </span>
-                <span className="min-w-0 flex-1">
-                  <span className="text-foreground block text-sm font-medium">{quality}</span>
-                  {size && <span className="text-muted-foreground block text-xs">{size}</span>}
-                </span>
-              </button>
-            );
-          })}
-        </div>
+                <Download className="size-4" />
+                Save file
+              </a>
+            </Button>
+          </div>
+        )}
+
+        <TooltipProvider delayDuration={0}>
+          <div className="space-y-2">
+            {sorted.map((version) => {
+              const quality = summaryBuilder?.(version) || buildQualitySummary(version);
+              const size = summaryBuilder ? "" : formatFileSize(version.file_size);
+              const button = (
+                <button
+                  key={version.file_id}
+                  type="button"
+                  onClick={() => handleDownload(version)}
+                  disabled={rowsBlocked}
+                  className="border-border/50 bg-accent/30 hover:bg-accent/60 flex w-full items-center gap-3 rounded-xl border px-4 py-3 text-left transition-colors disabled:opacity-50"
+                >
+                  <span className="bg-primary/10 text-primary flex size-9 shrink-0 items-center justify-center rounded-full">
+                    {downloading === version.file_id ? (
+                      <Loader2 className="size-4 animate-spin" />
+                    ) : (
+                      <Download className="size-4" />
+                    )}
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="text-foreground block text-sm font-medium">{quality}</span>
+                    {size && <span className="text-muted-foreground block text-xs">{size}</span>}
+                  </span>
+                </button>
+              );
+
+              const tooltip =
+                denialReason ?? (capabilityError ? "Download availability is unknown." : null);
+              if (!tooltip) return button;
+
+              return (
+                <Tooltip key={version.file_id}>
+                  <TooltipTrigger asChild>
+                    <span className="block w-full cursor-not-allowed">{button}</span>
+                  </TooltipTrigger>
+                  <TooltipContent>{tooltip}</TooltipContent>
+                </Tooltip>
+              );
+            })}
+          </div>
+        </TooltipProvider>
 
         {sorted.length > 1 && (
           <p className="text-muted-foreground text-xs">Larger files require more storage space.</p>
