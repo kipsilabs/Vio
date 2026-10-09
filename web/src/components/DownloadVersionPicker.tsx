@@ -26,6 +26,8 @@ import {
   buildQualitySummary,
   sortByResolution,
 } from "@/pages/ItemDetail/components/VersionFlyout";
+import { isVersionUnavailable } from "@/pages/ItemDetail/components/versionAvailability";
+import { isVirtualFileVersion } from "@/pages/ItemDetail/components/versionFormatUtils";
 
 interface DownloadVersionPickerProps {
   open: boolean;
@@ -66,6 +68,19 @@ function capabilityDenialReason(
 function downloadFailureMessage(error: unknown): string {
   if (error instanceof DirectDownloadError) return error.message;
   return "Download could not be started. Check your connection and try again.";
+}
+
+/**
+ * The reason a direct download of this version can never succeed, or null when
+ * it can be offered. Both signals come from fields the item's versions already
+ * carry, so the dialog never offers a row the preflight is known to refuse: a
+ * virtual (provider-backed) version has no bytes on this host, and
+ * `available === false` is the catalog's own liveness verdict.
+ */
+function versionDownloadRefusal(version: FileVersion): string | null {
+  if (isVirtualFileVersion(version)) return "virtual";
+  if (isVersionUnavailable(version)) return "unavailable";
+  return null;
 }
 
 export default function DownloadVersionPicker({
@@ -175,6 +190,49 @@ export default function DownloadVersionPicker({
     downloading !== null ||
     prepared !== null;
 
+  // Build the display rows once, then split them three ways: offerable rows,
+  // rows whose refusal is knowable up front (kept out of the list so the
+  // dialog never presents a dead choice), and label-less placeholders that
+  // carry no quality, release identity, or size and are dropped.
+  const rows = sorted.map((version) => ({
+    version,
+    quality: summaryBuilder?.(version) || buildQualitySummary(version),
+    // A release name (or the pre-`release_name` edition) distinguishes two rows
+    // that share a quality summary. buildDetailLine is the same release/size/
+    // source line the item-page version picker and the in-player menu show, so
+    // the wording stays consistent.
+    detailLine: version.release_name || version.edition_raw ? buildDetailLine(version) : "",
+    // The detail line already carries the size; only fall back to the bare size
+    // when there is no release identity and no custom summary that states it.
+    size:
+      !(version.release_name || version.edition_raw) && !summaryBuilder
+        ? formatFileSize(version.file_size)
+        : "",
+    refusal: versionDownloadRefusal(version),
+  }));
+  const labeledRows = rows.filter(
+    (row) => row.quality.trim() !== "" || row.detailLine.trim() !== "" || row.size.trim() !== "",
+  );
+  const downloadableRows = labeledRows.filter((row) => row.refusal === null);
+  const blockedCount = labeledRows.length - downloadableRows.length;
+  const virtualBlockedCount = labeledRows.filter((row) => isVirtualFileVersion(row.version)).length;
+  const unavailableBlockedCount = blockedCount - virtualBlockedCount;
+
+  const virtualNote =
+    virtualBlockedCount === 0
+      ? null
+      : downloadableRows.length === 0
+        ? "This item's versions stream from a provider and can't be downloaded directly. Play it instead."
+        : `${virtualBlockedCount} virtual ${
+            virtualBlockedCount === 1 ? "version streams" : "versions stream"
+          } from a provider and ${virtualBlockedCount === 1 ? "isn't" : "aren't"} listed.`;
+  const unavailableNote =
+    unavailableBlockedCount === 0
+      ? null
+      : `${unavailableBlockedCount} ${
+          unavailableBlockedCount === 1 ? "version is" : "versions are"
+        } no longer available.`;
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-md">
@@ -235,20 +293,23 @@ export default function DownloadVersionPicker({
           </div>
         )}
 
+        {(virtualNote ||
+          unavailableNote ||
+          (downloadableRows.length === 0 && labeledRows.length === 0)) && (
+          <div className="space-y-1" role="status">
+            {virtualNote && <p className="text-muted-foreground text-sm">{virtualNote}</p>}
+            {unavailableNote && <p className="text-muted-foreground text-sm">{unavailableNote}</p>}
+            {downloadableRows.length === 0 && labeledRows.length === 0 && (
+              <p className="text-muted-foreground text-sm">
+                No downloadable files are available for this item.
+              </p>
+            )}
+          </div>
+        )}
+
         <TooltipProvider delayDuration={0}>
           <div className="space-y-2">
-            {sorted.map((version) => {
-              const quality = summaryBuilder?.(version) || buildQualitySummary(version);
-              // A release name (or the pre-`release_name` edition) distinguishes
-              // two rows that share a quality summary. buildDetailLine is the
-              // same release/size/source line the item-page version picker and
-              // the in-player menu show, so the wording stays consistent.
-              const detailLine =
-                version.release_name || version.edition_raw ? buildDetailLine(version) : "";
-              // The detail line already carries the size; only fall back to the
-              // bare size when there is no release identity and no custom
-              // summary that states it.
-              const size = !detailLine && !summaryBuilder ? formatFileSize(version.file_size) : "";
+            {downloadableRows.map(({ version, quality, detailLine, size }) => {
               const isSelected = selectedFileId != null && version.file_id === selectedFileId;
               const button = (
                 <button
@@ -304,7 +365,7 @@ export default function DownloadVersionPicker({
           </div>
         </TooltipProvider>
 
-        {sorted.length > 1 && (
+        {downloadableRows.length > 1 && (
           <p className="text-muted-foreground text-xs">Larger files require more storage space.</p>
         )}
       </DialogContent>
