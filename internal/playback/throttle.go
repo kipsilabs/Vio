@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -34,12 +35,18 @@ type TranscodeThrottleStarter interface {
 // duration. Zero means throttling is disabled. The resolved value can cross a
 // node boundary without giving the executor access to the API server's settings
 // store.
+//
+// Throttling is on by default: only an explicit "false" disables it. An absent
+// or empty row — the state of a fresh install, since none is seeded — must
+// therefore resolve to the default rather than to off, or the setting's
+// advertised default would never take effect at runtime (the reader sees the
+// raw store value, not the admin UI's effective default).
 func ConfiguredTranscodeThrottleSeconds(ctx context.Context, settings TranscodeThrottleSettings) int {
 	if settings == nil {
 		return 0
 	}
 	enabled, _ := settings.Get(ctx, "enable_transcode_throttle")
-	if enabled != "true" {
+	if strings.EqualFold(strings.TrimSpace(enabled), "false") {
 		return 0
 	}
 	threshold := 300

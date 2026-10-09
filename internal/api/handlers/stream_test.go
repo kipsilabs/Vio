@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1179,6 +1180,159 @@ func TestHandleStream_AudioOnlyRemuxServesAudioContentType(t *testing.T) {
 				t.Fatalf("Content-Type = %q, want %q", got, tc.wantContent)
 			}
 		})
+	}
+}
+
+// signalingStreamWriter reports the first response byte without buffering a
+// stream that never ends on its own.
+type signalingStreamWriter struct {
+	header http.Header
+	once   sync.Once
+	wrote  chan struct{}
+}
+
+func newSignalingStreamWriter() *signalingStreamWriter {
+	return &signalingStreamWriter{header: http.Header{}, wrote: make(chan struct{})}
+}
+
+func (w *signalingStreamWriter) Header() http.Header { return w.header }
+func (w *signalingStreamWriter) WriteHeader(int)     {}
+
+func (w *signalingStreamWriter) Write(p []byte) (int, error) {
+	w.once.Do(func() { close(w.wrote) })
+	return len(p), nil
+}
+
+// TestHandleStream_RemuxAbortsWhenSessionStopped covers the API-host progressive
+// remux: it is one long response whose FFmpeg belongs to the serving request, so
+// StopSession (an admin kill, an idle reap, a copy-safety withdrawal) can only
+// end it if the handler feeds the session's transport-stop watch into the remux
+// abort. Before that wiring only the client's own disconnect could end it, and
+// this test would hang to its timeout.
+func TestHandleStream_RemuxAbortsWhenSessionStopped(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "movie.mkv")
+	if err := os.WriteFile(source, []byte("video"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Capability probes answer at once; the remux invocation streams forever
+	// until the abort kills FFmpeg.
+	ffmpeg := filepath.Join(t.TempDir(), "ffmpeg")
+	script := "#!/bin/sh\n" +
+		"for arg in \"$@\"; do\n" +
+		"  if [ \"$arg\" = \"pipe:1\" ]; then while :; do printf '0123456789'; sleep 0.01; done; fi\n" +
+		"done\n" +
+		"exit 0\n"
+	if err := os.WriteFile(ffmpeg, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	file := &models.MediaFile{
+		ID:          42,
+		ContentID:   "movie-remux-stop",
+		FilePath:    source,
+		CodecVideo:  "h264",
+		VideoTracks: []models.VideoTrack{{Codec: "h264"}},
+	}
+	sessionMgr := playback.NewSessionManager(0, 0)
+	session, err := sessionMgr.StartSession(1, "profile-1", file.ID, playback.PlayRemux, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+
+	handler := NewStreamHandler(sessionMgr, testPlaybackFileResolver{file: file})
+	handler.PlaybackConfig = func() config.PlaybackConfig {
+		return config.PlaybackConfig{FFmpegPath: ffmpeg}
+	}
+
+	writer := newSignalingStreamWriter()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/stream/"+session.ID, nil)
+	req = req.WithContext(newAuthorizedPlaybackContext())
+	req = withPlaybackRouteParam(req, "session_id", session.ID)
+
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		handler.HandleStream(writer, req)
+	}()
+
+	select {
+	case <-writer.wrote:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the remux never delivered bytes")
+	}
+
+	if err := sessionMgr.StopSession(session.ID); err != nil {
+		t.Fatalf("StopSession: %v", err)
+	}
+
+	select {
+	case <-served:
+	case <-time.After(10 * time.Second):
+		t.Fatal("StopSession did not end an in-flight API-host remux")
+	}
+}
+
+// TestHandleStream_RemuxAbortsWhenRequestCanceled covers the other half of the
+// API-host remux abort: the request context must end the response when the
+// client goes away. A remux that outlived its request would keep encoding and
+// downloading the source.
+func TestHandleStream_RemuxAbortsWhenRequestCanceled(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "movie.mkv")
+	if err := os.WriteFile(source, []byte("video"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ffmpeg := filepath.Join(t.TempDir(), "ffmpeg")
+	script := "#!/bin/sh\n" +
+		"for arg in \"$@\"; do\n" +
+		"  if [ \"$arg\" = \"pipe:1\" ]; then while :; do printf '0123456789'; sleep 0.01; done; fi\n" +
+		"done\n" +
+		"exit 0\n"
+	if err := os.WriteFile(ffmpeg, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	file := &models.MediaFile{
+		ID:          42,
+		ContentID:   "movie-remux-cancel",
+		FilePath:    source,
+		CodecVideo:  "h264",
+		VideoTracks: []models.VideoTrack{{Codec: "h264"}},
+	}
+	sessionMgr := playback.NewSessionManager(0, 0)
+	session, err := sessionMgr.StartSession(1, "profile-1", file.ID, playback.PlayRemux, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+
+	handler := NewStreamHandler(sessionMgr, testPlaybackFileResolver{file: file})
+	handler.PlaybackConfig = func() config.PlaybackConfig {
+		return config.PlaybackConfig{FFmpegPath: ffmpeg}
+	}
+
+	ctx, cancel := context.WithCancel(newAuthorizedPlaybackContext())
+	writer := newSignalingStreamWriter()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/stream/"+session.ID, nil).WithContext(ctx)
+	req = withPlaybackRouteParam(req, "session_id", session.ID)
+
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		handler.HandleStream(writer, req)
+	}()
+
+	select {
+	case <-writer.wrote:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the remux never delivered bytes")
+	}
+
+	cancel()
+	select {
+	case <-served:
+	case <-time.After(10 * time.Second):
+		t.Fatal("request cancellation did not end an in-flight API-host remux")
 	}
 }
 

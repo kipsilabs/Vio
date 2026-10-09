@@ -213,6 +213,20 @@ func TestChapterThumbnailSoftwareToneMapDefaultsDisabled(t *testing.T) {
 	}
 }
 
+// TestTranscodeThrottleDefaultsEnabled verifies whole-file lookahead encoding
+// is capped out of the box. The reader treats an absent row as enabled, so the
+// admin default must say the same or the UI would describe a behavior the
+// runtime does not have.
+func TestTranscodeThrottleDefaultsEnabled(t *testing.T) {
+	effective := EffectiveAdminSettings(nil)
+	if got := effective["enable_transcode_throttle"]; got != "true" {
+		t.Fatalf("enable_transcode_throttle default = %q, want true", got)
+	}
+	if got := effective["transcode_throttle_seconds"]; got != "300" {
+		t.Fatalf("transcode_throttle_seconds default = %q, want 300", got)
+	}
+}
+
 // TestTranscodeToneMapPoliciesDefaultDisabled verifies tone mapping remains opt-in.
 func TestTranscodeToneMapPoliciesDefaultDisabled(t *testing.T) {
 	effective := EffectiveAdminSettings(nil)

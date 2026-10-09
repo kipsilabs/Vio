@@ -318,6 +318,9 @@ func TestEscalateRefusedProgressiveRemuxV3EscalatesCopyOnlyRemuxes(t *testing.T)
 			}
 			writeJSON(w, http.StatusAccepted, transcodenode.TranscodeStartResponse{
 				SessionID: start.SessionID, Status: "started", CopyFMP4RecipeVersion: start.CopyFMP4RecipeVersion,
+				// A real node echoes the throttle policy it armed; throttling is
+				// enabled by default, so this mock must confirm it too.
+				ThrottleSeconds: start.ThrottleSeconds,
 			})
 		default:
 			w.WriteHeader(http.StatusNoContent)
