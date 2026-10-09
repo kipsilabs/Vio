@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Silo-Server/silo-server/internal/cache"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/notifications"
 )
@@ -173,4 +174,231 @@ func TestFirstPlaybackCandidateSinkBudgetExhaustedSkipsQuietly(t *testing.T) {
 		t.Fatalf("a skipped sink still published %q", payload)
 	}
 	h.detachedGate().release()
+}
+
+// TestFirstPlaybackCandidateSinkPublishesOnlyAfterPersist is the sequencing
+// proof for the publish budget split: while the persist is still blocked no
+// event may be published, and releasing the persist lets the announce run. It
+// guards the "publish after success" ordering independently of the budget.
+func TestFirstPlaybackCandidateSinkPublishesOnlyAfterPersist(t *testing.T) {
+	bus := &recordingEventBus{}
+	hub := notifications.NewHub("first-play-sink-sequence", bus)
+
+	persistStarted := make(chan struct{})
+	releasePersist := make(chan struct{})
+	h := &PlaybackHandler{
+		EventsHub: hub.EventsHub(),
+		VirtualPlaybackStreamSink: func(context.Context, *models.MediaFile, []VirtualPlaybackStream) error {
+			close(persistStarted)
+			<-releasePersist
+			return nil
+		},
+	}
+	file := firstPlaySinkFile("movie-first-play-sink-sequence")
+
+	h.spawnVirtualCandidateSink(context.Background(), file, []VirtualPlaybackStream{{
+		URI: file.FilePath + "?result=c1", OwnerInstallationID: 5,
+	}})
+
+	select {
+	case <-persistStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first-playback sink never started its persist")
+	}
+	// The persist is blocked; the announce is gated on the write landing, so
+	// nothing may be on the bus yet. Poll the negative outcome instead of
+	// sleeping a fixed amount.
+	deadline := time.Now().Add(150 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if payload := recordingEventPayload(bus, "versions_updated"); payload != "" {
+			t.Fatalf("published %q before the persist returned", payload)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	close(releasePersist)
+	payload := waitForRecordingEvent(t, bus, 5*time.Second, "catalog.item.changed", "versions_updated", file.ContentID)
+	if !strings.Contains(payload, file.ContentID) {
+		t.Fatalf("event payload %q does not name the content", payload)
+	}
+}
+
+// ctxCapturingEventBus records the liveness of the context each publish used.
+// The hub fans out to local subscribers before the bus, so only the bus call
+// proves the Redis (cross-node) publish actually ran on a live context.
+type ctxCapturingEventBus struct {
+	mu       sync.Mutex
+	errs     []error
+	payloads []string
+	// waitForDone, when positive, makes Publish wait for ctx cancellation (up
+	// to that bound) before recording. Shutdown propagation through
+	// context.AfterFunc is asynchronous, so without this the assertion would be
+	// racy; with it, a shutdown-bound context is deterministically observed as
+	// canceled and a shutdown-detached one as live.
+	waitForDone time.Duration
+}
+
+func (b *ctxCapturingEventBus) Publish(ctx context.Context, _ string, event cache.Event) error {
+	if b.waitForDone > 0 {
+		select {
+		case <-ctx.Done():
+		case <-time.After(b.waitForDone):
+		}
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.errs = append(b.errs, ctx.Err())
+	b.payloads = append(b.payloads, event.Payload)
+	return nil
+}
+
+func (b *ctxCapturingEventBus) Subscribe(context.Context, string, cache.EventHandler) error {
+	return nil
+}
+func (b *ctxCapturingEventBus) Close() error { return nil }
+
+func (b *ctxCapturingEventBus) snapshot() ([]error, []string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]error(nil), b.errs...), append([]string(nil), b.payloads...)
+}
+
+// waitForCapturedPublish polls the capturing bus until it recorded a publish,
+// returning the context error it observed.
+func waitForCapturedPublish(t *testing.T, bus *ctxCapturingEventBus, timeout time.Duration) error {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		errs, payloads := bus.snapshot()
+		if len(payloads) > 0 {
+			return errs[0]
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no publish reached the bus within the wait window")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestFirstPlaybackCandidateSinkPublishSurvivesPersistDeadline is the
+// deadline-boundary proof for the Major finding: a persist that consumes its
+// whole sink budget but still succeeds must leave the follow-up publish a live
+// context, so the Redis fan-out that refreshes the other API nodes is not
+// skipped while the local node (fanned out first, inside the hub) refreshes.
+func TestFirstPlaybackCandidateSinkPublishSurvivesPersistDeadline(t *testing.T) {
+	previousBudget := virtualCandidateSinkBudget
+	virtualCandidateSinkBudget = 40 * time.Millisecond
+	t.Cleanup(func() { virtualCandidateSinkBudget = previousBudget })
+
+	bus := &ctxCapturingEventBus{}
+	hub := notifications.NewHub("first-play-sink-deadline", bus)
+
+	persistDone := make(chan struct{})
+	h := &PlaybackHandler{
+		EventsHub: hub.EventsHub(),
+		VirtualPlaybackStreamSink: func(ctx context.Context, _ *models.MediaFile, _ []VirtualPlaybackStream) error {
+			// Drain the entire sink budget, then succeed. The sink context is
+			// dead by the time this returns, which is exactly the boundary the
+			// publish must not inherit.
+			<-ctx.Done()
+			close(persistDone)
+			return nil
+		},
+	}
+	file := firstPlaySinkFile("movie-first-play-sink-deadline")
+
+	h.spawnVirtualCandidateSink(context.Background(), file, []VirtualPlaybackStream{{
+		URI: file.FilePath + "?result=c1", OwnerInstallationID: 5,
+	}})
+
+	select {
+	case <-persistDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the sink persist never reached its deadline")
+	}
+
+	if err := waitForCapturedPublish(t, bus, 5*time.Second); err != nil {
+		t.Fatalf("versions_updated published on a dead context after a budget-consuming persist: %v", err)
+	}
+	_, payloads := bus.snapshot()
+	if !strings.Contains(payloads[0], file.ContentID) {
+		t.Fatalf("event payload %q does not name the content", payloads[0])
+	}
+}
+
+// TestFirstPlaybackCandidateSinkPublishDetachesFromRequestCancel proves the
+// publish context is detached from the request/call-site cancellation: a caller
+// whose context is already canceled (browser gave up, client disconnected) must
+// still let the committed version-list invalidation reach the bus, the way the
+// pool reload survives request cancellation.
+func TestFirstPlaybackCandidateSinkPublishDetachesFromRequestCancel(t *testing.T) {
+	bus := &ctxCapturingEventBus{}
+	hub := notifications.NewHub("first-play-sink-request-cancel", bus)
+
+	h := &PlaybackHandler{
+		EventsHub: hub.EventsHub(),
+		VirtualPlaybackStreamSink: func(context.Context, *models.MediaFile, []VirtualPlaybackStream) error {
+			return nil
+		},
+	}
+	file := firstPlaySinkFile("movie-first-play-sink-request-cancel")
+	requestCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	h.spawnVirtualCandidateSink(requestCtx, file, []VirtualPlaybackStream{{
+		URI: file.FilePath + "?result=c1", OwnerInstallationID: 5,
+	}})
+
+	if err := waitForCapturedPublish(t, bus, 5*time.Second); err != nil {
+		t.Fatalf("versions_updated did not survive request cancellation: %v", err)
+	}
+	_, payloads := bus.snapshot()
+	if !strings.Contains(payloads[0], file.ContentID) {
+		t.Fatalf("event payload %q does not name the content", payloads[0])
+	}
+}
+
+// TestFirstPlaybackCandidateSinkPublishStopsAtShutdown covers the shutdown
+// side of the fresh publish context: the publish must stay parented to service
+// shutdown, so a service context canceled while the persist is in flight is
+// observed as canceled by the bus call and the Redis fan-out aborts rather than
+// outliving shutdown. The bus waits for cancellation to absorb the async
+// context.AfterFunc propagation before recording.
+func TestFirstPlaybackCandidateSinkPublishStopsAtShutdown(t *testing.T) {
+	serviceCtx, serviceCancel := context.WithCancel(context.Background())
+	bus := &ctxCapturingEventBus{waitForDone: 2 * time.Second}
+	hub := notifications.NewHub("first-play-sink-shutdown", bus)
+
+	persistStarted := make(chan struct{})
+	releasePersist := make(chan struct{})
+	h := &PlaybackHandler{
+		ServiceContext: serviceCtx,
+		EventsHub:      hub.EventsHub(),
+		VirtualPlaybackStreamSink: func(context.Context, *models.MediaFile, []VirtualPlaybackStream) error {
+			close(persistStarted)
+			<-releasePersist
+			return nil
+		},
+	}
+	file := firstPlaySinkFile("movie-first-play-sink-shutdown")
+
+	h.spawnVirtualCandidateSink(context.Background(), file, []VirtualPlaybackStream{{
+		URI: file.FilePath + "?result=c1", OwnerInstallationID: 5,
+	}})
+
+	select {
+	case <-persistStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first-playback sink never started its persist")
+	}
+
+	// Shut the service down while the persist is in flight, then let the
+	// persist succeed. The follow-up publish is bound to shutdown, so its bus
+	// call must observe a dead context.
+	serviceCancel()
+	close(releasePersist)
+
+	if err := waitForCapturedPublish(t, bus, 5*time.Second); err == nil {
+		t.Fatal("versions_updated reached the bus on a live context after service shutdown")
+	}
 }

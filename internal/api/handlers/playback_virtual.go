@@ -43,7 +43,17 @@ const maxVirtualPlaybackStreams = 50
 // persist. Persisting the listing is best-effort metadata work behind the first
 // bytes, so it carries its own budget rather than inheriting the cold-path
 // deadline it was detached from.
-const virtualCandidateSinkBudget = 15 * time.Second
+var virtualCandidateSinkBudget = 15 * time.Second
+
+// virtualCandidatePublishBudget bounds the versions_updated announce that
+// follows a successful first-playback candidate persist. The persist and the
+// publish are separate pieces of work: a slow-but-successful persist can spend
+// the whole sink budget, so the publish gets a fresh short context derived from
+// service shutdown rather than from the persist's context or the request.
+// Without that, a persist near its deadline would leave no time for the Redis
+// fan-out. It is a var so tests can shrink it, matching the other detached
+// budgets.
+var virtualCandidatePublishBudget = 5 * time.Second
 
 const (
 	defaultMaxVirtualFailoverAttempts = 5
@@ -776,7 +786,17 @@ func (h *PlaybackHandler) spawnVirtualCandidateSink(ctx context.Context, file *m
 		// selectable versions. Publish only after the write lands, matching the
 		// executor's post-persist ordering, so an open detail or watch page
 		// stops showing the seeded placeholder.
-		publishVirtualVersionsUpdatedEvent(sinkCtx, eventsHub, contentID)
+		//
+		// The publish gets its own short context created here, after success,
+		// rather than reusing sinkCtx. A slow-but-successful persist can spend
+		// the whole sink budget, and a publish on the drained sinkCtx would then
+		// fan out locally (hub.go publishes local subscribers before the bus)
+		// while the Redis publish that refreshes the other API nodes fails. The
+		// fresh context is detached from request cancellation but stays parented
+		// to service shutdown, so it keeps the sink's lifecycle guarantees.
+		publishCtx, publishCancel := h.virtualDetachedContext(ctx, virtualCandidatePublishBudget)
+		defer publishCancel()
+		publishVirtualVersionsUpdatedEvent(publishCtx, nil, eventsHub, contentID)
 	}()
 }
 

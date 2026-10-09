@@ -540,16 +540,21 @@ const virtualVersionsUpdatedEvent = "catalog.item.changed"
 // list changed, on the catalog channel. It is the single authority for the
 // event's channel, name, and payload shape; callers must not build their own
 // versions_updated payload or the two production paths would drift apart. A nil
-// hub or an empty content id publishes nothing.
-func publishVirtualVersionsUpdatedEvent(ctx context.Context, hub *events.Hub, contentID string) {
+// hub or an empty content id publishes nothing. A nil logger falls back to the
+// default logger, so call sites without a configured one (the playback sink)
+// keep logging.
+func publishVirtualVersionsUpdatedEvent(ctx context.Context, logger *slog.Logger, hub *events.Hub, contentID string) {
 	if hub == nil || strings.TrimSpace(contentID) == "" {
 		return
+	}
+	if logger == nil {
+		logger = slog.Default()
 	}
 	if err := hub.PublishJSON(ctx, events.ChannelCatalog, virtualVersionsUpdatedEvent, map[string]any{
 		contentIDKey: contentID,
 		"change":     "versions_updated",
 	}, events.PublishOptions{}); err != nil {
-		slog.WarnContext(ctx, "virtual versions_updated publish failed",
+		logger.WarnContext(ctx, "virtual versions_updated publish failed",
 			"component", "api", contentIDKey, contentID, "error", err)
 	}
 }
@@ -561,7 +566,7 @@ func (e *VirtualCandidatesRefreshExecutor) publishVersionsUpdated(ctx context.Co
 	if e == nil || e.Events == nil {
 		return
 	}
-	publishVirtualVersionsUpdatedEvent(ctx, e.Events.EventsHub(), contentID)
+	publishVirtualVersionsUpdatedEvent(ctx, e.logger(), e.Events.EventsHub(), contentID)
 }
 
 func (e *VirtualCandidatesRefreshExecutor) logger() *slog.Logger {
