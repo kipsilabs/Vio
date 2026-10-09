@@ -530,21 +530,38 @@ func indexerReleaseResults(rows []virtuallibrary.IndexerRelease) []adminjob.Inde
 	return out
 }
 
-func (e *VirtualCandidatesRefreshExecutor) publishVersionsUpdated(ctx context.Context, contentID string) {
-	if e.Events == nil {
+// virtualVersionsUpdatedEvent is the catalog event name every client listens
+// for to invalidate a title's version/quality list. The async Refresh List
+// executor and the first-playback candidate sink must publish byte-identical
+// events so one client subscription serves both paths.
+const virtualVersionsUpdatedEvent = "catalog.item.changed"
+
+// publishVirtualVersionsUpdatedEvent announces that a title's persisted version
+// list changed, on the catalog channel. It is the single authority for the
+// event's channel, name, and payload shape; callers must not build their own
+// versions_updated payload or the two production paths would drift apart. A nil
+// hub or an empty content id publishes nothing.
+func publishVirtualVersionsUpdatedEvent(ctx context.Context, hub *events.Hub, contentID string) {
+	if hub == nil || strings.TrimSpace(contentID) == "" {
 		return
 	}
-	hub := e.Events.EventsHub()
-	if hub == nil {
-		return
-	}
-	if err := hub.PublishJSON(ctx, events.ChannelCatalog, "catalog.item.changed", map[string]any{
+	if err := hub.PublishJSON(ctx, events.ChannelCatalog, virtualVersionsUpdatedEvent, map[string]any{
 		contentIDKey: contentID,
 		"change":     "versions_updated",
 	}, events.PublishOptions{}); err != nil {
-		e.logger().WarnContext(ctx, "virtual candidates refresh: failed to publish versions_updated",
+		slog.WarnContext(ctx, "virtual versions_updated publish failed",
 			"component", "api", contentIDKey, contentID, "error", err)
 	}
+}
+
+// publishVersionsUpdated emits the catalog invalidation the refresh executor
+// owns, through the shared event authority so it matches the first-playback
+// sink's event exactly.
+func (e *VirtualCandidatesRefreshExecutor) publishVersionsUpdated(ctx context.Context, contentID string) {
+	if e == nil || e.Events == nil {
+		return
+	}
+	publishVirtualVersionsUpdatedEvent(ctx, e.Events.EventsHub(), contentID)
 }
 
 func (e *VirtualCandidatesRefreshExecutor) logger() *slog.Logger {
