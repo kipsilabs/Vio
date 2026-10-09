@@ -28,6 +28,7 @@ function inferCollectionSourceType(collectionType?: string): CollectionSourceTyp
   if (collectionType === "mdblist") return "mdblist";
   if (collectionType === "tmdb") return "tmdb";
   if (collectionType === "trakt") return "trakt";
+  if (collectionType === "smart") return "smart";
   return "manual";
 }
 
@@ -72,6 +73,7 @@ export default function AdminCollectionEditor() {
 
   const sourceTypeTitles: Record<CollectionSourceType, string> = {
     manual: "New Manual Collection",
+    smart: "New Smart Collection",
     mdblist: "Import MDBList Collection",
     tmdb: "Import TMDB Collection",
     trakt: "Import Trakt Collection",
@@ -119,7 +121,8 @@ export default function AdminCollectionEditor() {
 
   // The wizard owns its own page chrome (back button, title, step indicator).
   // Short-circuit the legacy editor shell so we don't render nested headers.
-  const useWizard = collection && collection.collection_type === "smart";
+  // A create flow that picked the Smart tile lands here too, seeded empty.
+  const useWizard = collection ? collection.collection_type === "smart" : sourceType === "smart";
   if (useWizard) {
     return (
       <SmartCollectionWizard

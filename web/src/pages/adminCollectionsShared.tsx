@@ -41,7 +41,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Download, ListPlus, Sparkles, TrendingUp } from "lucide-react";
+import { Download, Filter, ListPlus, Sparkles, TrendingUp } from "lucide-react";
 import { SyncScheduleField } from "@/components/collections/SyncScheduleField";
 import { TMDBListURLField } from "@/components/collections/TMDBListURLField";
 import { isValidTMDBListURL, parseTMDBListID } from "@/lib/tmdbList";
@@ -703,7 +703,7 @@ export function CollectionForm({
   );
 }
 
-export type CollectionSourceType = "manual" | "mdblist" | "tmdb" | "trakt";
+export type CollectionSourceType = "manual" | "smart" | "mdblist" | "tmdb" | "trakt";
 
 export type CollectionSourcePick = CollectionSourceType | "templates";
 
@@ -740,6 +740,12 @@ export function SourceTypeSelector({
 
   options.push(
     { type: "manual", icon: ListPlus, label: "Manual", subtitle: "Curate items by hand" },
+    {
+      type: "smart",
+      icon: Filter,
+      label: "Smart",
+      subtitle: "Match titles with filters that stay up to date",
+    },
     { type: "mdblist", icon: Download, label: "MDBList", subtitle: "Sync from an MDBList URL" },
     {
       type: "tmdb",
@@ -752,7 +758,7 @@ export function SourceTypeSelector({
   return (
     <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
       {options
-        .filter((opt) => opt.type === "manual" || capabilities?.imports)
+        .filter((opt) => opt.type === "manual" || opt.type === "smart" || capabilities?.imports)
         .map((opt) => (
           <button
             key={opt.type}

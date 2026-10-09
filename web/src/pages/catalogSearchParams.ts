@@ -243,6 +243,17 @@ export function buildCatalogQueryUpdateHref(state: CatalogSearchState, q: string
 }
 
 /**
+ * Deep link from the catalog's filter surface into the smart-collection
+ * editor: the query definition in the URL seeds the new collection's filters,
+ * and the wizard's preview shows what the saved collection would match.
+ */
+export function buildSaveAsSmartCollectionHref(state: CatalogSearchState): string {
+  const params = buildCatalogFilterSearchParams({ ...state, source: "query", q: undefined });
+  params.set("smart", "1");
+  return `/collections/new?${params.toString()}`;
+}
+
+/**
  * The search URL parameter holding the Request to add grid's page, so Back,
  * a reload, and a shared link return to it. Filter and query changes build
  * fresh params without it, which starts the grid over.

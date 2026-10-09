@@ -1,6 +1,6 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import type { CollectionEditSnapshot } from "@/api/personalCollections";
-import { useNavigate, useParams } from "react-router";
+import { useNavigate, useParams, useSearchParams } from "react-router";
 
 import type { Collection, UserCollectionType } from "@/api/types";
 import { isNotFoundProblem } from "@/api/v2/request";
@@ -19,6 +19,7 @@ import SmartCollectionWizard from "./SmartCollectionWizard";
 import { useCurrentProfile } from "@/hooks/useCurrentProfile";
 import { UserCollectionForm, isCollectionReadOnly } from "./userCollectionsShared";
 import { ManualCollectionItemsEditor } from "@/components/collections/ManualCollectionItemsEditor";
+import { parseCatalogSearchParams } from "./catalogSearchParams";
 
 type ImportedType = Extract<UserCollectionType, "mdblist" | "tmdb" | "trakt">;
 const IMPORTED_TYPES = new Set<ImportedType>(["mdblist", "tmdb", "trakt"]);
@@ -31,9 +32,19 @@ function isImportedCollection(
 
 export default function CollectionEditor() {
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
   const { profile } = useCurrentProfile();
   const { data: capabilities } = useCollectionCapabilities();
   const { id } = useParams<{ id: string }>();
+  // "Save as smart collection" on the catalog lands here with the current
+  // filters in the URL; seed the wizard so the viewer starts from them.
+  const seededSmartFilters = useMemo(
+    () =>
+      !id && searchParams.get("smart") === "1"
+        ? parseCatalogSearchParams(searchParams).query_definition
+        : null,
+    [id, searchParams],
+  );
   const { data: collections = [] } = useCollections();
   const { data: fetched, isLoading, isFetching, error, refetch } = useCollectionEditSnapshot(id);
   const [snapshot, setSnapshot] = useState<CollectionEditSnapshot>();
@@ -93,6 +104,19 @@ export default function CollectionEditor() {
           onClose={() => navigate("/collections")}
         />
       </div>
+    );
+  }
+
+  // A create seeded from the catalog filter surface opens the smart wizard
+  // with those filters, skipping the manual/smart builder.
+  if (!collection && seededSmartFilters) {
+    return (
+      <SmartCollectionWizard
+        mode="user"
+        collection={null}
+        initialQueryDefinition={seededSmartFilters}
+        onClose={() => navigate("/collections")}
+      />
     );
   }
 
