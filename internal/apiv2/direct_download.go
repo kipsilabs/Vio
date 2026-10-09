@@ -166,7 +166,7 @@ func (w *directDownloadWriter) SetPlaybackProblemCode(code string) {
 // direct-download resolver writes file_unavailable (a stale/unknown file_id)
 // and file_access_denied (an access refusal) with statuses that the catalog
 // otherwise collapses onto not_found and permission_denied. The code is only
-// honoured when its declared status agrees with the response status, so a
+// honored when its declared status agrees with the response status, so a
 // mismatched handler can never mint a type whose status disagrees.
 func directDownloadProblemType(status int, code string) ProblemType {
 	switch status {
