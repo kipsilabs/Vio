@@ -6,6 +6,7 @@ import DownloadVersionPicker from "./DownloadVersionPicker";
 
 vi.mock("@/hooks/queries/downloads", () => ({
   buildDirectDownloadUrl: (fileId: number) => `/api/downloads/files/${fileId}`,
+  useDownloadCapability: () => ({ data: { enabled: true, allowed: true, download_allowed: true } }),
 }));
 
 function version(overrides: Partial<FileVersion>): FileVersion {

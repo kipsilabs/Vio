@@ -4,7 +4,13 @@ import { StaleApiRequestContextError } from "@/api/client";
 import type { FileVersion } from "@/api/types";
 import DownloadVersionPicker from "./DownloadVersionPicker";
 const mocks = vi.hoisted(() => ({ launch: vi.fn(), error: vi.fn() }));
-vi.mock("@/api/v2/directDownloads", () => ({ launchDirectDownload: mocks.launch }));
+vi.mock("@/api/v2/directDownloads", () => ({
+  launchDirectDownload: mocks.launch,
+  DirectDownloadError: class DirectDownloadError extends Error {},
+}));
+vi.mock("@/hooks/queries/downloads", () => ({
+  useDownloadCapability: () => ({ data: { enabled: true, allowed: true, download_allowed: true } }),
+}));
 vi.mock("sonner", () => ({ toast: { error: mocks.error } }));
 const versions = [{ file_id: 42, resolution: "1080p", file_size: 1024 } as FileVersion];
 beforeEach(() => {

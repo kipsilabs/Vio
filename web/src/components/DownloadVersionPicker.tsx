@@ -9,9 +9,11 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { formatFileSize } from "@/lib/mediaFormat";
 import { StaleApiRequestContextError } from "@/api/client";
-import { launchDirectDownload } from "@/api/v2/directDownloads";
+import { DirectDownloadError, launchDirectDownload } from "@/api/v2/directDownloads";
+import { useDownloadCapability } from "@/hooks/queries/downloads";
 import { buildQualitySummary, sortByResolution } from "@/pages/ItemDetail/components/VersionFlyout";
 
 interface DownloadVersionPickerProps {
@@ -20,6 +22,22 @@ interface DownloadVersionPickerProps {
   versions: FileVersion[];
   title?: string;
   summaryBuilder?: (version: FileVersion) => string;
+}
+
+/** Why the server refuses downloads for this account, or null when it permits them. */
+function capabilityDenialReason(
+  capability: { enabled: boolean; allowed: boolean } | undefined,
+): string | null {
+  if (!capability) return null;
+  if (!capability.enabled) return "Downloads are turned off on this server.";
+  if (!capability.allowed) return "Downloads are not allowed for this account.";
+  return null;
+}
+
+/** A concrete, user-actionable reason for a failed download attempt. */
+function downloadFailureMessage(error: unknown): string {
+  if (error instanceof DirectDownloadError) return error.message;
+  return "Download could not be started. Check your connection and try again.";
 }
 
 export default function DownloadVersionPicker({
@@ -31,6 +49,8 @@ export default function DownloadVersionPicker({
 }: DownloadVersionPickerProps) {
   const sorted = sortByResolution(versions);
   const [downloading, setDownloading] = useState<number | null>(null);
+  const { data: capability } = useDownloadCapability();
+  const denialReason = capabilityDenialReason(capability);
 
   const active = useRef<symbol | null>(null);
   useLayoutEffect(() => {
@@ -51,8 +71,10 @@ export default function DownloadVersionPicker({
       await launchDirectDownload(version.file_id, isCurrent);
       if (isCurrent()) onOpenChange(false);
     } catch (error) {
+      // A superseded attempt (profile switch, closed dialog) must not report
+      // into the replacement authority; every other failure toasts a reason.
       if (isCurrent() && !(error instanceof StaleApiRequestContextError))
-        toast.error("Download could not be started. Check access and try again.");
+        toast.error(downloadFailureMessage(error));
     } finally {
       if (isCurrent()) {
         active.current = null;
@@ -71,34 +93,47 @@ export default function DownloadVersionPicker({
           </DialogDescription>
         </DialogHeader>
 
-        <div className="space-y-2">
-          {sorted.map((version) => {
-            const quality = summaryBuilder?.(version) || buildQualitySummary(version);
-            const size = summaryBuilder ? "" : formatFileSize(version.file_size);
+        <TooltipProvider delayDuration={0}>
+          <div className="space-y-2">
+            {sorted.map((version) => {
+              const quality = summaryBuilder?.(version) || buildQualitySummary(version);
+              const size = summaryBuilder ? "" : formatFileSize(version.file_size);
+              const disabled = downloading !== null || denialReason !== null;
+              const button = (
+                <button
+                  key={version.file_id}
+                  type="button"
+                  onClick={() => handleDownload(version)}
+                  disabled={disabled}
+                  className="border-border/50 bg-accent/30 hover:bg-accent/60 flex w-full items-center gap-3 rounded-xl border px-4 py-3 text-left transition-colors disabled:opacity-50"
+                >
+                  <span className="bg-primary/10 text-primary flex size-9 shrink-0 items-center justify-center rounded-full">
+                    {downloading === version.file_id ? (
+                      <Loader2 className="size-4 animate-spin" />
+                    ) : (
+                      <Download className="size-4" />
+                    )}
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="text-foreground block text-sm font-medium">{quality}</span>
+                    {size && <span className="text-muted-foreground block text-xs">{size}</span>}
+                  </span>
+                </button>
+              );
 
-            return (
-              <button
-                key={version.file_id}
-                type="button"
-                onClick={() => handleDownload(version)}
-                disabled={downloading !== null}
-                className="border-border/50 bg-accent/30 hover:bg-accent/60 flex w-full items-center gap-3 rounded-xl border px-4 py-3 text-left transition-colors disabled:opacity-50"
-              >
-                <span className="bg-primary/10 text-primary flex size-9 shrink-0 items-center justify-center rounded-full">
-                  {downloading === version.file_id ? (
-                    <Loader2 className="size-4 animate-spin" />
-                  ) : (
-                    <Download className="size-4" />
-                  )}
-                </span>
-                <span className="min-w-0 flex-1">
-                  <span className="text-foreground block text-sm font-medium">{quality}</span>
-                  {size && <span className="text-muted-foreground block text-xs">{size}</span>}
-                </span>
-              </button>
-            );
-          })}
-        </div>
+              if (!denialReason) return button;
+
+              return (
+                <Tooltip key={version.file_id}>
+                  <TooltipTrigger asChild>
+                    <span className="block w-full cursor-not-allowed">{button}</span>
+                  </TooltipTrigger>
+                  <TooltipContent>{denialReason}</TooltipContent>
+                </Tooltip>
+              );
+            })}
+          </div>
+        </TooltipProvider>
 
         {sorted.length > 1 && (
           <p className="text-muted-foreground text-xs">Larger files require more storage space.</p>
