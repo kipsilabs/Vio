@@ -128,3 +128,134 @@ func TestGetByExternalIDsStillMissesUnknownAndWrongTypeDB(t *testing.T) {
 		t.Fatalf("movie id leaked into series lookup: %+v", wrongType)
 	}
 }
+
+// insertProviderID attaches one media_item_provider_ids row to an item.
+func insertProviderID(t *testing.T, f *providerAliasFixture, contentID, itemType, provider, providerID string) {
+	t.Helper()
+	if _, err := f.pool.Exec(t.Context(), `
+		INSERT INTO media_item_provider_ids (content_id, item_type, provider, provider_id)
+		VALUES ($1, $2, $3, $4)`, contentID, itemType, provider, providerID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestGetByExternalIDsProviderSlugAndWrongTypeDB pins the provider table as a
+// first-class identity source: a provider_id stored in TMDB's "id-slug" URL
+// form resolves against the bare numeric id a caller holds, and a provider row
+// typed for one media type never answers a lookup of another. Both are
+// provider-side cases the SQL-shape tests cannot exercise.
+func TestGetByExternalIDsProviderSlugAndWrongTypeDB(t *testing.T) {
+	f := newProviderAliasFixture(t)
+	ctx := t.Context()
+	base := uniqueReleaseSuffix(t)
+
+	// Provider-table-only TMDB id stored in slug form; the media_items column
+	// stays empty so only the provider path can find it.
+	slugBase := base + "31"
+	slugItem := f.item(t, "prov-slug", "movie", "", "", "", f.enabled)
+	insertProviderID(t, f, slugItem, "movie", "tmdb", slugBase+"-some-title")
+
+	// A series-typed provider row must not answer a movie lookup, but does
+	// answer a series lookup.
+	wrongBase := base + "41"
+	wrongItem := f.item(t, "prov-wrongtype", "series", "", "", "", f.enabled)
+	insertProviderID(t, f, wrongItem, "series", "tmdb", wrongBase)
+
+	got, err := f.repo.GetByExternalIDs(ctx, ExternalIDBatch{TMDBIDs: []string{slugBase}}, "movie")
+	if err != nil {
+		t.Fatalf("provider-slug movie lookup: %v", err)
+	}
+	if got.ByTMDB[slugBase] != slugItem {
+		t.Errorf("provider slug ByTMDB[%q] = %q, want %q", slugBase, got.ByTMDB[slugBase], slugItem)
+	}
+
+	miss, err := f.repo.GetByExternalIDs(ctx, ExternalIDBatch{TMDBIDs: []string{wrongBase}}, "movie")
+	if err != nil {
+		t.Fatalf("provider wrong-type movie lookup: %v", err)
+	}
+	if len(miss.ByTMDB) != 0 {
+		t.Fatalf("series-typed provider row leaked into movie lookup: %+v", miss)
+	}
+
+	hit, err := f.repo.GetByExternalIDs(ctx, ExternalIDBatch{TMDBIDs: []string{wrongBase}}, "series")
+	if err != nil {
+		t.Fatalf("series lookup by provider id: %v", err)
+	}
+	if hit.ByTMDB[wrongBase] != wrongItem {
+		t.Errorf("series ByTMDB[%q] = %q, want %q", wrongBase, hit.ByTMDB[wrongBase], wrongItem)
+	}
+}
+
+// TestGetByExternalIDsNumericBoundaryDB pins that an id is matched whole: the
+// numeric prefix of one id must not answer a longer id, and a longer id must
+// not answer the shorter one, on both the column and provider paths and across
+// the "id" vs "id-slug" forms.
+func TestGetByExternalIDsNumericBoundaryDB(t *testing.T) {
+	f := newProviderAliasFixture(t)
+	ctx := t.Context()
+	base := uniqueReleaseSuffix(t)
+
+	shortCol := base + "51"
+	shortID := f.item(t, "bound-short", "movie", shortCol, "", "", f.enabled)
+	longCol := base + "510"
+	longID := f.item(t, "bound-long", "movie", longCol, "", "", f.enabled)
+	slugCol := base + "52"
+	slugID := f.item(t, "bound-slug", "movie", slugCol+"-some-title", "", "", f.enabled)
+	slugLongCol := base + "520"
+	slugLongID := f.item(t, "bound-slug-long", "movie", slugLongCol, "", "", f.enabled)
+
+	provShortID := f.item(t, "bound-prov-short", "movie", "", "", "", f.enabled)
+	insertProviderID(t, f, provShortID, "movie", "tmdb", base+"61-some-title")
+	provLongID := f.item(t, "bound-prov-long", "movie", "", "", "", f.enabled)
+	insertProviderID(t, f, provLongID, "movie", "tmdb", base+"610-some-title")
+
+	// The bare short id answers only its own item; "510" is a different id.
+	short, err := f.repo.GetByExternalIDs(ctx, ExternalIDBatch{TMDBIDs: []string{shortCol}}, "movie")
+	if err != nil {
+		t.Fatalf("short lookup: %v", err)
+	}
+	if short.ByTMDB[shortCol] != shortID || len(short.ByTMDB) != 1 {
+		t.Fatalf("short id resolved to %+v, want only %q", short.ByTMDB, shortID)
+	}
+
+	// The longer id answers only its own item; it must not pick up "51".
+	long, err := f.repo.GetByExternalIDs(ctx, ExternalIDBatch{TMDBIDs: []string{longCol}}, "movie")
+	if err != nil {
+		t.Fatalf("long lookup: %v", err)
+	}
+	if long.ByTMDB[longCol] != longID || len(long.ByTMDB) != 1 {
+		t.Fatalf("long id resolved to %+v, want only %q", long.ByTMDB, longID)
+	}
+
+	// A slug whose base is "52" resolves for "52" but not for "520".
+	slug, err := f.repo.GetByExternalIDs(ctx, ExternalIDBatch{TMDBIDs: []string{slugCol}}, "movie")
+	if err != nil {
+		t.Fatalf("slug lookup: %v", err)
+	}
+	if slug.ByTMDB[slugCol] != slugID || len(slug.ByTMDB) != 1 {
+		t.Fatalf("slug base resolved to %+v, want only %q", slug.ByTMDB, slugID)
+	}
+	slugLong, err := f.repo.GetByExternalIDs(ctx, ExternalIDBatch{TMDBIDs: []string{slugLongCol}}, "movie")
+	if err != nil {
+		t.Fatalf("slug-long lookup: %v", err)
+	}
+	if slugLong.ByTMDB[slugLongCol] != slugLongID || len(slugLong.ByTMDB) != 1 {
+		t.Fatalf("longer slug base resolved to %+v, want only %q", slugLong.ByTMDB, slugLongID)
+	}
+
+	// Provider-side boundary: "61" answers only the "61-" slug, never "610-".
+	provShort, err := f.repo.GetByExternalIDs(ctx, ExternalIDBatch{TMDBIDs: []string{base + "61"}}, "movie")
+	if err != nil {
+		t.Fatalf("provider short lookup: %v", err)
+	}
+	if provShort.ByTMDB[base+"61"] != provShortID || len(provShort.ByTMDB) != 1 {
+		t.Fatalf("provider slug base resolved to %+v, want only %q", provShort.ByTMDB, provShortID)
+	}
+	provLong, err := f.repo.GetByExternalIDs(ctx, ExternalIDBatch{TMDBIDs: []string{base + "610"}}, "movie")
+	if err != nil {
+		t.Fatalf("provider long lookup: %v", err)
+	}
+	if provLong.ByTMDB[base+"610"] != provLongID || len(provLong.ByTMDB) != 1 {
+		t.Fatalf("provider longer slug base resolved to %+v, want only %q", provLong.ByTMDB, provLongID)
+	}
+}

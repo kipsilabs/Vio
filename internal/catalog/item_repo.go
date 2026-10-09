@@ -4198,55 +4198,51 @@ func (r *ItemRepository) GetByExternalIDs(ctx context.Context, batch ExternalIDB
 // buildGetByExternalIDsSQL pins the SQL shape used by GetByExternalIDs: one
 // statement that matches any of the three external-ID arrays plus a type
 // filter, reading the same identity sources as LookupExternalIDs — the
-// denormalized media_items columns and the media_item_provider_ids table.
+// denormalized media_items columns and the media_item_provider_ids table. A
+// provider-table-only id therefore resolves exactly like a column id.
 //
-// The requested ids are unnest'd once into a `requested` CTE, then matched in
-// two branches mirroring lookupExternalIDsSQL's direct_matches/provider_matches
-// split: direct matches against the columns, and provider matches against
-// media_item_provider_ids. A provider-table-only id therefore resolves exactly
-// like a column id.
+// Every match is an `= ANY($n)` predicate, which Postgres hashes when the
+// array is large, so cost is linear in catalog size plus request size at both
+// a small list and the 100k-entry source cap. The earlier form joined each
+// requested id to the whole catalog with an OR across columns; that is not
+// sargable, so the planner nested-looped request × catalog and cross-joined
+// the provider table, taking ~100s for 500 ids.
 //
-// TMDB is compared against both its bare form and its "id-slug" URL form
-// ("1931-some-title") on either side. The slug form is matched with the same
-// "id" or "id-…" predicate AttachTMDBID uses (provider_id_repo.go), so the
-// numeric prefix is the identity and a longer number such as "19310" never
-// matches "1931". Request TMDB ids are run through NormalizeTMDBID before
-// binding, so the comparison reads both sides the same way. Exact-match
-// semantics are otherwise unchanged: no title/year fallback, and the caller
-// still applies its own library filter.
+// TMDB is matched against both its bare form and its "id-slug" URL form
+// ("1931-some-title"). Because split_part(value, '-', 1) is exactly the
+// identity NormalizeTMDBID extracts — the digits before the first '-' — the
+// slug form is matched by comparing that prefix to the same array; the numeric
+// prefix never bleeds across ids, so "19310" and "1931-some" never answer for
+// "1931". Request TMDB ids are run through NormalizeTMDBID before binding, so
+// both sides read the same way. Exact-match semantics are otherwise unchanged:
+// no title/year fallback, and the caller still applies its own library filter.
 func (r *ItemRepository) buildGetByExternalIDsSQL(batch ExternalIDBatch, itemType string) (string, []any) {
 	sql := `
-		WITH requested(provider, provider_id) AS (
-			SELECT 'tmdb', * FROM unnest($1::text[])
-			UNION ALL
-			SELECT 'imdb', * FROM unnest($2::text[])
-			UNION ALL
-			SELECT 'tvdb', * FROM unnest($3::text[])
-		),
-		matches AS (
-			SELECT r.provider, r.provider_id, mi.content_id
-			FROM requested r
-			JOIN media_items mi
-			  ON mi.type = $4
-			 AND (
-				(r.provider = 'tmdb' AND mi.tmdb_id <> '' AND (mi.tmdb_id = r.provider_id OR mi.tmdb_id LIKE r.provider_id || '-%'))
-				OR (r.provider = 'imdb' AND mi.imdb_id <> '' AND mi.imdb_id = r.provider_id)
-				OR (r.provider = 'tvdb' AND mi.tvdb_id <> '' AND mi.tvdb_id = r.provider_id)
-			 )
-			UNION ALL
-			SELECT r.provider, r.provider_id, mi.content_id
-			FROM requested r
-			JOIN media_item_provider_ids mip
-			  ON mip.provider = r.provider
-			 AND mip.item_type = $4
-			 AND (mip.provider_id = r.provider_id OR (r.provider = 'tmdb' AND mip.provider_id LIKE r.provider_id || '-%'))
-			JOIN media_items mi ON mi.content_id = mip.content_id AND mi.type = $4
-		)
 		SELECT content_id,
-		       CASE WHEN provider = 'tmdb' THEN provider_id ELSE '' END,
-		       CASE WHEN provider = 'imdb' THEN provider_id ELSE '' END,
-		       CASE WHEN provider = 'tvdb' THEN provider_id ELSE '' END
-		FROM matches`
+		       CASE WHEN tmdb_id = ANY($1) THEN tmdb_id
+		            WHEN tmdb_id LIKE '%-%' AND split_part(tmdb_id, '-', 1) = ANY($1) THEN split_part(tmdb_id, '-', 1)
+		            ELSE '' END,
+		       CASE WHEN imdb_id = ANY($2) THEN imdb_id ELSE '' END,
+		       CASE WHEN tvdb_id = ANY($3) THEN tvdb_id ELSE '' END
+		FROM media_items
+		WHERE type = $4
+		  AND (tmdb_id = ANY($1) OR imdb_id = ANY($2) OR tvdb_id = ANY($3)
+		       OR (tmdb_id LIKE '%-%' AND split_part(tmdb_id, '-', 1) = ANY($1)))
+		UNION ALL
+		SELECT mi.content_id,
+		       CASE WHEN mip.provider = 'tmdb'
+		            THEN CASE WHEN mip.provider_id = ANY($1) THEN mip.provider_id
+		                      ELSE split_part(mip.provider_id, '-', 1) END
+		            ELSE '' END,
+		       CASE WHEN mip.provider = 'imdb' THEN mip.provider_id ELSE '' END,
+		       CASE WHEN mip.provider = 'tvdb' THEN mip.provider_id ELSE '' END
+		FROM media_item_provider_ids mip
+		JOIN media_items mi ON mi.content_id = mip.content_id AND mi.type = $4
+		WHERE mip.item_type = $4
+		  AND ((mip.provider = 'tmdb' AND (mip.provider_id = ANY($1)
+		                                   OR (mip.provider_id LIKE '%-%' AND split_part(mip.provider_id, '-', 1) = ANY($1))))
+		    OR (mip.provider = 'imdb' AND mip.provider_id = ANY($2))
+		    OR (mip.provider = 'tvdb' AND mip.provider_id = ANY($3)))`
 	tmdbIDs := batch.TMDBIDs
 	if len(tmdbIDs) > 0 {
 		// Mirror the stored-side normalization on the request side. Callers

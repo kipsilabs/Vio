@@ -222,25 +222,23 @@ func TestItemRepo_GetByIDsWithAccess_CombinedClausesIndexCorrectly(t *testing.T)
 	}
 }
 
-// TestItemRepo_GetByExternalIDs_SingleQueryAcrossProviders pins the SQL shape
-// of buildGetByExternalIDsSQL: a single statement that matches the three
-// external-ID arrays plus a type filter against both the denormalized
-// media_items columns and media_item_provider_ids, mirroring
-// lookupExternalIDsSQL's direct/provider split. Replaces the per-entry N×3
-// GetByExternalID fan-out in MDBList collection sync (audit 2026-05-01 §3.7).
+// TestItemRepo_GetByExternalIDs_SingleQueryAcrossProviders pins the structure
+// of buildGetByExternalIDsSQL: one statement that reads both the denormalized
+// media_items columns and media_item_provider_ids, keyed off every id array
+// with an `= ANY` predicate so a large list hashes instead of nested-looping
+// the catalog. Replaces the per-entry N×3 GetByExternalID fan-out in MDBList
+// collection sync (audit 2026-05-01 §3.7).
 func TestItemRepo_GetByExternalIDs_SingleQueryAcrossProviders(t *testing.T) {
 	repo := &ItemRepository{}
 	sql, args := repo.buildGetByExternalIDsSQL(ExternalIDBatch{
 		TMDBIDs: []string{"1", "2"}, IMDbIDs: []string{"tt1", "tt2"}, TVDBIDs: nil,
 	}, "movie")
 	for _, want := range []string{
-		"WITH requested(provider, provider_id) AS",
-		"unnest($1::text[])",
-		"unnest($2::text[])",
-		"unnest($3::text[])",
-		"JOIN media_items mi",
-		"JOIN media_item_provider_ids mip",
-		"mip.provider = r.provider",
+		"tmdb_id = ANY($1)",
+		"imdb_id = ANY($2)",
+		"tvdb_id = ANY($3)",
+		"FROM media_item_provider_ids mip",
+		"JOIN media_items mi ON mi.content_id = mip.content_id",
 		"mip.item_type = $4",
 		"mi.type = $4",
 	} {
@@ -251,19 +249,26 @@ func TestItemRepo_GetByExternalIDs_SingleQueryAcrossProviders(t *testing.T) {
 	if len(args) != 4 {
 		t.Fatalf("expected 4 args (tmdb, imdb, tvdb, type); got %v", args)
 	}
+	// A join from the requested ids to the catalog is not sargable and
+	// nested-loops request × catalog, so it must not come back.
+	for _, disallowed := range []string{"JOIN unnest", "WITH requested"} {
+		if strings.Contains(sql, disallowed) {
+			t.Fatalf("buildGetByExternalIDsSQL regressed to a non-sargable join (%q):\n%s", disallowed, sql)
+		}
+	}
 }
 
-// TestItemRepo_GetByExternalIDs_MatchesSlugTMDB pins that the matcher reads
-// media_items.tmdb_id and the provider table through the same "id" or "id-…"
-// rule AttachTMDBID uses, so a stored "id-slug" value resolves to the bare
-// numeric id a caller holds.
+// TestItemRepo_GetByExternalIDs_MatchesSlugTMDB pins that both the column and
+// provider-table paths reduce a stored "id-slug" value to the same prefix
+// NormalizeTMDBID extracts, so a caller holding the bare numeric id resolves.
+// Behavioral coverage lives in TestGetByExternalIDsMatchesProviderTableAndSlugTMDBDB.
 func TestItemRepo_GetByExternalIDs_MatchesSlugTMDB(t *testing.T) {
 	repo := &ItemRepository{}
 	sql, _ := repo.buildGetByExternalIDsSQL(ExternalIDBatch{TMDBIDs: []string{"1931"}}, "movie")
-	if strings.Count(sql, "LIKE r.provider_id || '-%'") != 2 {
-		t.Fatalf("expected the slug predicate on both the column and provider table:\n%s", sql)
+	if strings.Count(sql, "split_part(") < 2 {
+		t.Fatalf("expected the slug prefix predicate on both the column and provider paths:\n%s", sql)
 	}
-	if !strings.Contains(sql, "mi.tmdb_id = r.provider_id") || !strings.Contains(sql, "mip.provider_id = r.provider_id") {
+	if !strings.Contains(sql, "tmdb_id = ANY($1)") || !strings.Contains(sql, "mip.provider_id = ANY($1)") {
 		t.Fatalf("expected exact numeric matches retained:\n%s", sql)
 	}
 }
