@@ -345,7 +345,7 @@ func TestRestartSessionLockedRejectsChangedToneMapSourceWithoutStoppingLiveSessi
 	}
 	modified := info.ModTime()
 	ffmpegPath := filepath.Join(dir, "ffmpeg")
-	if err := os.WriteFile(ffmpegPath, []byte("#!/bin/sh\nsleep 30\n"), 0o755); err != nil {
+	if err := os.WriteFile(ffmpegPath, []byte("#!/bin/sh\nexec sleep 30\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	track := nodeToneMapTrack()
@@ -3340,7 +3340,7 @@ func TestHandleStartUsesConfiguredHWDeviceList(t *testing.T) {
 	if session == nil {
 		t.Fatal("session was not registered")
 	}
-	defer func() { _ = session.CloseProcess() }()
+	defer session.CloseProcess()
 	if got := session.Opts().HWDevice; got != "/dev/dri/renderD888" {
 		t.Fatalf("session HWDevice = %q, want one concrete device from the configured list", got)
 	}

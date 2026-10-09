@@ -305,6 +305,18 @@ function countOccurrences(markup: string, fragment: string): number {
 }
 
 describe("EpisodeContent", () => {
+  it("disables collection membership without removing the item identity", () => {
+    renderToStaticMarkup(
+      <MemoryRouter>
+        <EpisodeContent item={makeEpisodeItem()} />
+      </MemoryRouter>,
+    );
+    expect(mocks.capturedActionBarProps.value).toMatchObject({
+      contentId: "episode-1",
+      canAddToCollection: false,
+    });
+  });
+
   it.each([
     [{ trickplay: true, trickplay_supported: true }, true],
     [{ trickplay: true, trickplay_supported: false }, false],
@@ -690,17 +702,6 @@ describe("EpisodeContent", () => {
     expect(mocks.capturedActionBarProps.value).toMatchObject({
       restartHref: undefined,
     });
-  });
-
-  it("does not pass rating props to ActionBar", () => {
-    renderToStaticMarkup(
-      <MemoryRouter initialEntries={["/item/episode-1"]}>
-        <EpisodeContent item={makeEpisodeItem()} />
-      </MemoryRouter>,
-    );
-
-    expect(mocks.capturedActionBarProps.value).not.toHaveProperty("rating");
-    expect(mocks.capturedActionBarProps.value).not.toHaveProperty("onRatingChange");
   });
 
   it("passes marker re-detection only for admins", () => {

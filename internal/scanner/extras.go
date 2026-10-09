@@ -49,6 +49,12 @@ type extrasClassifier struct {
 	// of the scan pipeline.
 	libraryRoots []string
 	rootSet      map[string]bool
+	// walkRoots are the roots the walked path list covers. A title folder
+	// outside them (a subtree scan of the extras dir itself) has unknown
+	// contents, so its ownership is probed from the filesystem instead.
+	walkRoots []string
+	// probedOwners caches filesystem ownership probes by owner directory.
+	probedOwners map[string]bool
 	// dirFiles marks directories that directly contain a walked media file.
 	dirFiles map[string]bool
 	// dirFilesBelow marks directories with a walked media file exactly two
@@ -61,12 +67,15 @@ type extrasClassifier struct {
 	probeFS bool
 }
 
-// newExtrasClassifier builds a classifier from a scan's walked paths.
-func newExtrasClassifier(folderType string, libraryRoots []string, walkedPaths []string) *extrasClassifier {
+// newExtrasClassifier builds a classifier from the paths a scan walked under
+// walkRoots.
+func newExtrasClassifier(folderType string, libraryRoots, walkRoots, walkedPaths []string) *extrasClassifier {
 	c := &extrasClassifier{
 		folderType:    folderType,
 		libraryRoots:  libraryRoots,
 		rootSet:       walkRootSet(libraryRoots),
+		walkRoots:     walkRoots,
+		probedOwners:  make(map[string]bool),
 		dirFiles:      make(map[string]bool, len(walkedPaths)),
 		dirFilesBelow: make(map[string]bool, len(walkedPaths)),
 	}
@@ -137,20 +146,18 @@ func (c *extrasClassifier) classify(path string) (extraCandidate, bool) {
 }
 
 // titleDirOwns reports whether the matched supplemental directory is owned by
-// a title folder: the first non-supplemental ancestor must not be a library
-// root and must hold media of its own — directly for movie folders, or one
-// level down for series folders whose episodes live in season subfolders.
+// a title folder: the first non-supplemental ancestor must lie strictly inside
+// a library root and must hold media of its own — directly for movie folders,
+// or one level down for series folders whose episodes live in season
+// subfolders. A library root that is itself named like an extras dir
+// ("/media/shorts") has its owner above the library, which owns nothing.
 func (c *extrasClassifier) titleDirOwns(supplementalDir string) bool {
 	owner := firstNonSupplementalAncestor(supplementalDir)
-	if c.rootSet[owner] {
+	if c.rootSet[owner] || !pathWithinAnyRoot(owner, c.libraryRoots) {
 		return false
 	}
-	if c.probeFS {
-		depth := 1
-		if !librarykind.IsMovie(c.folderType) {
-			depth = 2
-		}
-		return c.dirHoldsMedia(owner, depth)
+	if c.probeFS || !pathWithinAnyRoot(owner, c.walkRoots) {
+		return c.probeOwner(owner)
 	}
 	if c.dirFiles[owner] {
 		return true
@@ -158,24 +165,74 @@ func (c *extrasClassifier) titleDirOwns(supplementalDir string) bool {
 	return !librarykind.IsMovie(c.folderType) && c.dirFilesBelow[owner]
 }
 
+// probeOwner reports from the filesystem whether owner holds media of its
+// own: directly for movie folders, or one level down for series folders. The
+// probe applies the library walk's skip and ignore rules, so it only counts
+// files a full scan would have walked.
+func (c *extrasClassifier) probeOwner(owner string) bool {
+	if owns, ok := c.probedOwners[owner]; ok {
+		return owns
+	}
+	depth := 1
+	if !librarykind.IsMovie(c.folderType) {
+		depth = 2
+	}
+	owns := false
+	if rules, ignored, err := scanRootIgnoreRules(owner, c.libraryRoots); err == nil && !ignored {
+		owns = c.dirHoldsMedia(owner, depth, rules)
+	}
+	if c.probedOwners != nil {
+		c.probedOwners[owner] = owns
+	}
+	return owns
+}
+
 // dirHoldsMedia is the probeFS counterpart of dirFiles/dirFilesBelow: it
-// reports whether dir holds a media file within depth levels, without
-// descending into convention-named subdirectories.
-func (c *extrasClassifier) dirHoldsMedia(dir string, depth int) bool {
+// reports whether dir holds a file the library walk (walkLogicalTree) would
+// collect within depth levels, without descending into convention-named
+// subdirectories.
+func (c *extrasClassifier) dirHoldsMedia(dir string, depth int, inherited []ignoreRules) bool {
+	mode := walkModeFor(c.folderType)
+	if isIgnoredDirectoryPath(dir) || (mode == walkModeMovie && shouldSkipMovieSupplementalDir(dir)) {
+		return false
+	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return false
 	}
-	mode := walkModeFor(c.folderType)
+	rules, skip := dirIgnoreRules(inherited, dir, dir, entries)
+	if skip {
+		return false
+	}
 	for _, entry := range entries {
-		if entry.IsDir() {
+		child := filepath.Join(dir, entry.Name())
+		if ignoreRulesMatch(rules, child, entry.IsDir()) {
+			continue
+		}
+		isDir := entry.IsDir()
+		if entry.Type()&os.ModeSymlink != 0 {
+			// The library walk follows directory symlinks, so a symlinked
+			// season folder holds the show's episodes too.
+			info, err := os.Stat(child)
+			if err != nil {
+				continue
+			}
+			isDir = info.IsDir()
+			if isDir && ignoreRulesMatch(rules, child, true) {
+				continue
+			}
+		}
+		if isDir {
 			if depth > 1 && extrasDirKinds[normalizeScannerDirLabel(entry.Name())] == "" &&
-				c.dirHoldsMedia(filepath.Join(dir, entry.Name()), depth-1) {
+				c.dirHoldsMedia(child, depth-1, rules) {
 				return true
 			}
 			continue
 		}
-		if mode.acceptsExt(strings.ToLower(filepath.Ext(entry.Name()))) {
+		if mode == walkModeMovie && shouldSkipMovieSupplementalFile(child) {
+			continue
+		}
+		if mode.acceptsPath(child) {
 			return true
 		}
 	}
@@ -207,11 +264,12 @@ func walkRootSet(roots []string) map[string]bool {
 	return set
 }
 
-// partitionExtraPaths splits walked paths into primary content and extras.
-// Primary paths feed the existing root/group inference and matching pipeline
-// untouched; extras are processed separately and never influence identity.
-func partitionExtraPaths(paths []string, folderType string, libraryRoots []string) ([]string, []extraCandidate) {
-	classifier := newExtrasClassifier(folderType, libraryRoots, paths)
+// partitionExtraPaths splits the paths walked under walkRoots into primary
+// content and extras. Primary paths feed the existing root/group inference and
+// matching pipeline untouched; extras are processed separately and never
+// influence identity.
+func partitionExtraPaths(paths []string, folderType string, libraryRoots, walkRoots []string) ([]string, []extraCandidate) {
+	classifier := newExtrasClassifier(folderType, libraryRoots, walkRoots, paths)
 	primary := paths[:0:0]
 	var extras []extraCandidate
 	for _, p := range paths {
@@ -254,6 +312,28 @@ func (s *Scanner) processExtraFiles(
 	// directly by a subtree scan must still bind its own extras.
 	rootSet := walkRootSet(folder.Paths)
 
+	// A late extra may already own a primary row from an earlier scan that
+	// imported it as its own (unmatched) item. Those rows would make the title
+	// folder look ambiguous to the parent lookup and defer the extra forever,
+	// so the lookup for each folder leaves out every extra in this batch that
+	// lies beneath it.
+	batchByLookupDir := make(map[string][]string)
+	for _, candidate := range extras {
+		batchByLookupDir[extraParentLookupDir(candidate)] = nil
+	}
+	for _, candidate := range extras {
+		for dir := filepath.Dir(candidate.Path); ; {
+			if _, ok := batchByLookupDir[dir]; ok {
+				batchByLookupDir[dir] = append(batchByLookupDir[dir], candidate.Path)
+			}
+			parent := filepath.Dir(dir)
+			if parent == dir {
+				break
+			}
+			dir = parent
+		}
+	}
+
 	for _, candidate := range extras {
 		if ctx.Err() != nil {
 			return stats
@@ -267,7 +347,8 @@ func (s *Scanner) processExtraFiles(
 		}
 
 		extraID := contentid.ForLocal(candidate.Path)
-		parentID, err := s.resolveExtraParent(ctx, folder.ID, candidate, rootSet)
+		parentID, err := s.resolveExtraParent(ctx, folder.ID, candidate, rootSet,
+			batchByLookupDir[extraParentLookupDir(candidate)])
 		if err != nil {
 			slog.WarnContext(ctx, "scanner: extra parent lookup failed", "component", "scanner", "path", candidate.Path, "error", err)
 			stats.Errors++
@@ -305,7 +386,7 @@ func (s *Scanner) processExtraFiles(
 		}
 
 		hints := s.gatherHints(candidate.Path)
-		probe, probeSource := s.probeFile(ctx, candidate.Path)
+		probe, probeSource, probeRejected := s.probeFile(ctx, candidate.Path)
 
 		mf := models.MediaFile{
 			MediaFolderID:  folder.ID,
@@ -317,6 +398,8 @@ func (s *Scanner) processExtraFiles(
 		}
 		if probe != nil {
 			applyProbeData(&mf, probe, probeSource)
+		} else if probeRejected {
+			markProbeRejected(&mf)
 		}
 		if mf.SubtitleTracks == nil {
 			mf.SubtitleTracks = []models.SubtitleTrack{}
@@ -362,14 +445,17 @@ func (s *Scanner) processExtraFiles(
 // first try the sibling primary file sharing their stem ("Movie A.mkv" for
 // "Movie A-trailer.mkv"), so flat multi-movie folders bind correctly, then
 // fall back to the unambiguous-directory rule. Library roots never bind.
+// excludePaths are extra files whose rows must not count toward the
+// directory's owners (see processExtraFiles).
 func (s *Scanner) resolveExtraParent(
 	ctx context.Context,
 	folderID int,
 	candidate extraCandidate,
 	rootSet map[string]bool,
+	excludePaths []string,
 ) (string, error) {
+	dir := extraParentLookupDir(candidate)
 	if candidate.SupplementalDir == "" {
-		dir := filepath.Dir(candidate.Path)
 		stem := strings.TrimSuffix(filepath.Base(candidate.Path), filepath.Ext(candidate.Path))
 		if idx := strings.LastIndexAny(stem, "-."); idx > 0 {
 			stem = strings.TrimSpace(stem[:idx])
@@ -383,16 +469,21 @@ func (s *Scanner) resolveExtraParent(
 				return parentID, nil
 			}
 		}
-		if rootSet[filepath.Clean(dir)] {
-			return "", nil
-		}
-		return s.fileRepo.FindUnambiguousParentContentIDForDir(ctx, folderID, dir)
 	}
-
-	parentDir := firstNonSupplementalAncestor(candidate.SupplementalDir)
-	if rootSet[filepath.Clean(parentDir)] {
-		// Supplemental dir sits at the library root — no single owner.
+	if rootSet[filepath.Clean(dir)] {
+		// The extra (or its supplemental dir) sits at the library root — no
+		// single owner.
 		return "", nil
 	}
-	return s.fileRepo.FindUnambiguousParentContentIDForDir(ctx, folderID, parentDir)
+	return s.fileRepo.FindUnambiguousParentContentIDForDir(ctx, folderID, dir, excludePaths)
+}
+
+// extraParentLookupDir is the directory whose single item owns the extra: the
+// title folder above a supplemental dir, or the file's own directory for a
+// suffix-classified extra.
+func extraParentLookupDir(candidate extraCandidate) string {
+	if candidate.SupplementalDir == "" {
+		return filepath.Dir(candidate.Path)
+	}
+	return firstNonSupplementalAncestor(candidate.SupplementalDir)
 }

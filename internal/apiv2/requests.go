@@ -379,15 +379,6 @@ const (
 
 const requestsTag = "requests"
 
-// requestOperationIDs lists the profile-scoped request operations; tests
-// check each documents the viewer-access headers.
-var requestOperationIDs = []string{
-	opCreateRequest, opListMyRequests, opGetRequest, opSearchRequestMedia, opGetRequestMediaDetail,
-	opListDiscoverSections, opGetDiscoverSection, opListDiscoverGenres, opListDiscoverNetworks, opListDiscoverStudios,
-	opBrowseDiscoverGenre, opBrowseDiscoverNetwork, opBrowseDiscoverStudio,
-	opFollowRequestMedia, opUnfollowRequestMedia,
-}
-
 func registerRequests(reg *Registry) {
 	cursors := NewCursors(reg.deps.CursorSecret)
 
@@ -990,4 +981,13 @@ func discoverBrowsePageOf(r *mediarequests.DiscoverBrowseResponse) DiscoverBrows
 		Kind: r.Kind, Slug: r.Slug, DisplayName: r.DisplayName, LogoURL: r.LogoURL, MediaType: string(r.MediaType),
 		Sort: r.Sort, Page: r.Page, TotalPages: r.TotalPages, Results: requestMediaResultsOf(r.Results),
 	}
+}
+
+// requestOperationIDs lists the profile-scoped request operations; tests
+// check each documents the viewer-access headers.
+var requestOperationIDs = []string{
+	opCreateRequest, opListMyRequests, opGetRequest, opSearchRequestMedia, opGetRequestMediaDetail,
+	opListDiscoverSections, opGetDiscoverSection, opListDiscoverGenres, opListDiscoverNetworks, opListDiscoverStudios,
+	opBrowseDiscoverGenre, opBrowseDiscoverNetwork, opBrowseDiscoverStudio,
+	opFollowRequestMedia, opUnfollowRequestMedia,
 }

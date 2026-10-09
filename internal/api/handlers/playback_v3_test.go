@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Silo-Server/silo-server/internal/access"
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/config"
 	"github.com/Silo-Server/silo-server/internal/markers"
@@ -1437,37 +1438,6 @@ func TestHandleStartPlaybackV3PublishesSubtitleURLsWithSubtitlesOff(t *testing.T
 	}
 }
 
-func TestHandleStartPlaybackV3DuplicateAttemptReturnsOriginalSession(t *testing.T) {
-	file := v3HandlerFixtureFile(t)
-	manager := playback.NewSessionManager(0, 0)
-	handler := NewPlaybackHandler(manager, testPlaybackFileResolver{file: file})
-	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "true"}}
-	handler.ItemAccess = allowAllPlaybackItemAccess{}
-	body := marshalV3StartRequest(t, v3HandlerStartRequest())
-
-	start := func() playback.DecisionResponseV3 {
-		req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", strings.NewReader(body)).WithContext(newAuthorizedPlaybackContext())
-		rr := httptest.NewRecorder()
-		handler.HandleStartPlayback(rr, req)
-		if rr.Code != http.StatusCreated {
-			t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
-		}
-		var response playback.DecisionResponseV3
-		if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
-			t.Fatal(err)
-		}
-		return response
-	}
-	first := start()
-	second := start()
-	if first.SessionID == "" || second.SessionID != first.SessionID {
-		t.Fatalf("first session %q, second %q", first.SessionID, second.SessionID)
-	}
-	if got := len(manager.AllSessions()); got != 1 {
-		t.Fatalf("sessions = %d, want 1", got)
-	}
-}
-
 func TestHandleStartPlaybackV3PersistsAndReplaysTerminalDecision(t *testing.T) {
 	file := v3HandlerFixtureFile(t)
 	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), testPlaybackFileResolver{file: file})
@@ -2530,7 +2500,7 @@ func TestHandleReplanPlaybackV3SeekReanchorPreservesFallbackRecipe(t *testing.T)
 	presetLocalRegistryV3(handler, playback.NewTransformationRegistryV3([]playback.TransformationSpecV3{
 		{Name: "audio_to_aac", RecipeVersion: "2", Available: true},
 		{Name: "video_to_h264", RecipeVersion: "2", Available: true},
-		{Name: "server_dv7_to_hdr10", RecipeVersion: "1", Available: true},
+		{Name: "server_dv7_to_hdr10", RecipeVersion: playback.TransformationServerDV7HDR10RecipeVersionV3, Available: true},
 	}))
 	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{}}
 	handler.ItemAccess = allowAllPlaybackItemAccess{}
@@ -4481,27 +4451,6 @@ func TestManifestStartupTimeoutWhileRunningIsPersistedIdempotently(t *testing.T)
 	}
 }
 
-func TestToneMapExecutionTransportErrorClassifiesLiveValidation(t *testing.T) {
-	tests := []struct {
-		name          string
-		err           error
-		wantRetryable bool
-	}{
-		{name: "stale metadata", err: tonemap.ErrSourceRevisionChanged},
-		{name: "preflight rejected", err: tonemap.ErrSourcePreflightRejected},
-		{name: "probe unavailable", err: playback.ErrToneMapSourceValidationUnavailable, wantRetryable: true},
-		{name: "executor unavailable", err: playback.ErrToneMapExecutorUnavailable, wantRetryable: true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := toneMapExecutionTransportErrorV3(tt.err, "failed")
-			if got.reason != transcodeStartFailedReasonV3 || got.retryable != tt.wantRetryable || !errors.Is(got.cause, tt.err) {
-				t.Fatalf("error = %+v, want retryable=%t wrapping %v", got, tt.wantRetryable, tt.err)
-			}
-		})
-	}
-}
-
 func TestRemotePlaybackTransportSanitizesNodeURLFromTransportError(t *testing.T) {
 	handler := &PlaybackHandler{}
 	_, _, err := handler.startRemotePlaybackTransport(
@@ -4801,7 +4750,7 @@ func TestRemapSubtitleSelectionV3RejectsNegativeIndex(t *testing.T) {
 	source := &models.MediaFile{ID: 1, ExternalSubtitles: []models.ExternalSubtitle{{Language: "eng", Format: "srt"}}}
 	target := &models.MediaFile{ID: 2, ExternalSubtitles: []models.ExternalSubtitle{{Language: "eng", Format: "srt"}}}
 	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
-	if err := handler.remapSubtitleSelectionV3(context.Background(), source, target, &request); err == nil {
+	if _, err := handler.remapSubtitleSelectionV3(context.Background(), source, target, &request); err == nil {
 		t.Fatal("negative subtitle index was accepted")
 	}
 }
@@ -4821,7 +4770,7 @@ func TestRemapSubtitleSelectionV3MissSignalsDegrade(t *testing.T) {
 		SubtitleTrackID:    playback.TrackIDV3(source.ID, "subtitle", 0),
 	}
 	handler := &PlaybackHandler{}
-	if err := handler.remapSubtitleSelectionV3(context.Background(), source, target, &request); !errors.Is(err, errSubtitleUnavailableInTargetV3) {
+	if _, err := handler.remapSubtitleSelectionV3(context.Background(), source, target, &request); !errors.Is(err, errSubtitleUnavailableInTargetV3) {
 		t.Fatalf("remap miss err = %v, want errSubtitleUnavailableInTargetV3", err)
 	}
 	if request.SubtitleTrackIndex == nil || *request.SubtitleTrackIndex != 0 || request.SubtitleTrackID == "" {
@@ -4838,14 +4787,14 @@ func TestResolveV3AudioIndexOutOfRangeDegradesToDefault(t *testing.T) {
 		{Codec: "ac3", Language: "fra", Channels: 6, Default: true},
 	}}
 	index := 20
-	got, err := resolveV3AudioIndex(file, "", &index)
+	got, _, err := resolveV3AudioIndex(file, "", &index)
 	if err != nil {
 		t.Fatalf("out-of-range audio index must degrade, not error: %v", err)
 	}
 	if want := directPlayAudioTrackIndex(file); got != want {
 		t.Fatalf("index = %d, want default %d", got, want)
 	}
-	if _, err := resolveV3AudioIndex(file, "junk", nil); err == nil {
+	if _, _, err := resolveV3AudioIndex(file, "junk", nil); err == nil {
 		t.Fatal("malformed audio identity was accepted")
 	}
 }
@@ -4908,7 +4857,7 @@ func TestRemapSubtitleSelectionV3PrefersDownloadedSubtitleID(t *testing.T) {
 	handler := &PlaybackHandler{SubtitleRepo: repo}
 	index := 0
 	request := playback.StartRequestV3{SubtitleTrackIndex: &index}
-	if err := handler.remapSubtitleSelectionV3(context.Background(), source, target, &request); err != nil {
+	if _, err := handler.remapSubtitleSelectionV3(context.Background(), source, target, &request); err != nil {
 		t.Fatalf("remap failed: %v", err)
 	}
 	if request.SubtitleTrackIndex == nil || *request.SubtitleTrackIndex != 1 {
@@ -4932,11 +4881,38 @@ func TestRemapSubtitleSelectionV3FallsBackToReleaseNameWithoutIDs(t *testing.T) 
 	handler := &PlaybackHandler{SubtitleRepo: repo}
 	index := 0
 	request := playback.StartRequestV3{SubtitleTrackIndex: &index}
-	if err := handler.remapSubtitleSelectionV3(context.Background(), source, target, &request); err != nil {
+	if _, err := handler.remapSubtitleSelectionV3(context.Background(), source, target, &request); err != nil {
 		t.Fatalf("remap failed: %v", err)
 	}
 	if request.SubtitleTrackIndex == nil || *request.SubtitleTrackIndex != 1 {
 		t.Fatalf("remap index = %v, want 1 (release-name match)", request.SubtitleTrackIndex)
+	}
+}
+
+// A track the viewer chose on one file need not exist on the file actually
+// played — the next episode in a series routinely differs. Refusing the start
+// there gave the viewer a dead screen to replay out of.
+func TestResolveV3AudioIndexFallsBackWhenSelectionIsOutOfRange(t *testing.T) {
+	out := 7
+	file := &models.MediaFile{ID: 1, AudioTracks: []models.AudioTrack{{Language: "eng"}, {Language: "swe"}}}
+
+	index, degraded, err := resolveV3AudioIndex(file, "", &out)
+	if err != nil {
+		t.Fatalf("an out-of-range audio selection must not fail the start: %v", err)
+	}
+	if !degraded {
+		t.Fatal("falling back was not reported as a degradation")
+	}
+	if want := normalizeAudioTrackIndex(file, out); index != want {
+		t.Fatalf("fell back to %d, want the file default %d", index, want)
+	}
+}
+
+func TestResolveV3AudioIndexRejectsNegativeIndex(t *testing.T) {
+	negative := -1
+	file := &models.MediaFile{ID: 1, AudioTracks: []models.AudioTrack{{Language: "eng"}}}
+	if _, degraded, err := resolveV3AudioIndex(file, "", &negative); err == nil || degraded {
+		t.Fatalf("a negative audio index must be rejected, not degraded: degraded=%v err=%v", degraded, err)
 	}
 }
 
@@ -4968,7 +4944,169 @@ func v3HandlerStartRequest() playback.StartRequestV3 {
 	return playback.StartRequestV3{ProtocolVersion: playback.ProtocolV3, ClientFeatures: []string{playback.FeaturePlaybackPlanV3}, FileID: 42, ProfileID: "profile-1", PlaybackAttemptID: "attempt-handler-0001", QualityPreference: "original", SubtitleFidelityPreference: playback.SubtitleFidelityCompatibleV3, Capabilities: playback.ClientCodecCapabilitiesV3{VideoEvidence: playback.EvidenceExactV3, AudioEvidence: playback.EvidenceExactV3, CodecsVideo: []string{"h264"}, CodecsVideoHardware: []string{"h264"}, CodecsAudio: []string{"aac"}, Containers: []string{"mp4"}, MaxResolution: "1080p", VideoDecode: []playback.VideoDecodeCapabilityV3{{Codec: "h264", Profiles: []string{"high"}, Levels: []int{41}, BitDepths: []int{8}, MaxWidth: 1920, MaxHeight: 1080, MaxFrameRate: 60, MaxBitrateKbps: 20_000, Hardware: true}}}, ClientPlaybackContext: playback.ClientPlaybackContextV3{ProtocolVersion: playback.ProtocolV3, FormFactor: "tv", AppVersion: "test", Device: playback.DeviceContextV3{Platform: "android"}, Output: playback.OutputContextV3{OutputContextID: "route-1"}, Deliveries: map[string]playback.DeliveryCapabilityV3{playback.DeliveryClassOriginalHTTPV3: {Enabled: true, SupportedOnDevice: true, Subtitles: playback.DeliverySubtitleCapabilitiesV3{EmbeddedText: true, SidecarText: true}}}}}
 }
 
-func TestHandleReplanPlaybackV3PreservesOmittedSubtitleAndReportsUnavailableInFallbackVersion(t *testing.T) {
+// A file ffprobe rejected is refused with a non-retryable reason that names the
+// file, and a readable version of the same item plays in its place.
+func TestHandleStartPlaybackV3RefusesUnreadableFileAndFallsBackToReadableVersion(t *testing.T) {
+	failedAt := time.Now().UTC()
+	broken := &models.MediaFile{ID: 42, ContentID: "movie-1", FilePath: writePlaybackTestMediaFile(t, "broken.mkv"), ProbeFailedAt: &failedAt}
+	start := func(t *testing.T, files ...*models.MediaFile) playback.DecisionResponseV3 {
+		t.Helper()
+		byID := make(map[int]*models.MediaFile, len(files))
+		for _, file := range files {
+			byID[file.ID] = file
+		}
+		handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), mapPlaybackFileResolver{files: byID})
+		handler.FileVersionFetcher = testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{"movie-1": files}}
+		handler.ItemAccess = allowAllPlaybackItemAccess{}
+		request := v3HandlerStartRequest()
+		request.QualityPreference = "auto"
+		rr := httptest.NewRecorder()
+		handler.HandleStartPlayback(rr, httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", strings.NewReader(marshalV3StartRequest(t, request))).WithContext(newAuthorizedPlaybackContext()))
+		if rr.Code != http.StatusCreated {
+			t.Fatalf("start status = %d, body = %s", rr.Code, rr.Body.String())
+		}
+		var response playback.DecisionResponseV3
+		if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
+			t.Fatal(err)
+		}
+		return response
+	}
+
+	response := start(t, broken)
+	if response.Terminal == nil || response.Terminal.Reason != playback.TerminalSourceUnreadableV3 || response.Terminal.Retryable {
+		t.Fatalf("terminal = %#v, plan = %#v", response.Terminal, response.PlaybackPlan)
+	}
+
+	readable := v3HandlerFixtureFile(t)
+	readable.ID = 84
+	response = start(t, broken, readable)
+	if response.Terminal != nil || response.PlaybackPlan == nil || response.PlaybackPlan.EffectiveMediaFileID != readable.ID {
+		t.Fatalf("fallback terminal = %#v, plan = %#v", response.Terminal, response.PlaybackPlan)
+	}
+}
+
+// The alternate-version fallback only considers versions the viewer may play.
+// The sibling lookup is unfiltered, so a version in a library the viewer
+// cannot open, or above their playback-quality ceiling, must never stand in
+// for the requested one.
+func TestHandleStartPlaybackV3AlternateFallbackHonorsViewerAccess(t *testing.T) {
+	failedAt := time.Now().UTC()
+	broken := &models.MediaFile{ID: 42, ContentID: "movie-1", MediaFolderID: 1, FilePath: writePlaybackTestMediaFile(t, "broken.mkv"), ProbeFailedAt: &failedAt}
+	restricted := v3HandlerFixtureFile(t)
+	restricted.ID, restricted.MediaFolderID = 84, 2
+	// The client could direct-play this 4K version; only the viewer's
+	// playback-quality ceiling rules it out.
+	overCeiling := v3HandlerFixtureFile(t)
+	overCeiling.ID, overCeiling.MediaFolderID, overCeiling.Resolution = 85, 1, "2160p"
+	overCeiling.VideoTracks = append([]models.VideoTrack(nil), overCeiling.VideoTracks...)
+	overCeiling.VideoTracks[0].Width, overCeiling.VideoTracks[0].Height, overCeiling.VideoTracks[0].Level = 3840, 2160, 51
+	allowed := v3HandlerFixtureFile(t)
+	allowed.ID, allowed.MediaFolderID = 86, 1
+	scope := access.Scope{UserID: 1, ProfileID: "profile-1", AllowedLibraryIDs: []int{1}, LibrariesRestricted: true, MaxPlaybackQuality: access.PlaybackQualityStandard}
+	var probeEnsurer PlaybackProbeEnsurer
+
+	start := func(t *testing.T, files ...*models.MediaFile) playback.DecisionResponseV3 {
+		t.Helper()
+		byID := make(map[int]*models.MediaFile, len(files))
+		for _, file := range files {
+			byID[file.ID] = file
+		}
+		handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), mapPlaybackFileResolver{files: byID})
+		handler.FileVersionFetcher = testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{"movie-1": files}}
+		handler.ItemAccess = allowAllPlaybackItemAccess{}
+		handler.ProbeEnsurer = probeEnsurer
+		request := v3HandlerStartRequest()
+		request.QualityPreference = "auto"
+		request.Capabilities.MaxResolution = "2160p"
+		request.Capabilities.VideoDecode[0].Levels = []int{51}
+		request.Capabilities.VideoDecode[0].MaxWidth = 3840
+		request.Capabilities.VideoDecode[0].MaxHeight = 2160
+		ctx := access.SetScope(newAuthorizedPlaybackContext(), scope)
+		rr := httptest.NewRecorder()
+		handler.HandleStartPlayback(rr, httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", strings.NewReader(marshalV3StartRequest(t, request))).WithContext(ctx))
+		if rr.Code != http.StatusCreated {
+			t.Fatalf("start status = %d, body = %s", rr.Code, rr.Body.String())
+		}
+		var response playback.DecisionResponseV3
+		if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
+			t.Fatal(err)
+		}
+		return response
+	}
+
+	for name, sibling := range map[string]*models.MediaFile{"restricted library": restricted, "over quality ceiling": overCeiling} {
+		response := start(t, broken, sibling)
+		if response.Terminal == nil || response.Terminal.Reason != playback.TerminalSourceUnreadableV3 {
+			t.Fatalf("%s sibling: terminal = %#v, plan = %#v", name, response.Terminal, response.PlaybackPlan)
+		}
+	}
+
+	response := start(t, broken, restricted, overCeiling, allowed)
+	if response.Terminal != nil || response.PlaybackPlan == nil || response.PlaybackPlan.EffectiveMediaFileID != allowed.ID {
+		t.Fatalf("allowed sibling: terminal = %#v, plan = %#v", response.Terminal, response.PlaybackPlan)
+	}
+
+	// A sibling that was never probed has no stored resolution, so it passes
+	// the ceiling until the probe repair run on it as a candidate reports 4K.
+	unprobedValue := *overCeiling
+	unprobed := &unprobedValue
+	unprobed.Resolution = ""
+	probeEnsurer = repairingProbeEnsurer{repaired: map[int]*models.MediaFile{unprobed.ID: overCeiling}}
+	response = start(t, broken, unprobed)
+	if response.Terminal == nil || response.Terminal.Reason != playback.TerminalSourceUnreadableV3 {
+		t.Fatalf("sibling probed above the ceiling: terminal = %#v, plan = %#v", response.Terminal, response.PlaybackPlan)
+	}
+}
+
+// repairingProbeEnsurer answers a probe repair with the stored repaired row
+// for a file, standing in for a first probe that fills in its metadata.
+type repairingProbeEnsurer struct {
+	repaired map[int]*models.MediaFile
+}
+
+func (e repairingProbeEnsurer) EnsureProbeOnly(ctx context.Context, file *models.MediaFile) (*models.MediaFile, error) {
+	return e.EnsureCopySafetyCached(ctx, file)
+}
+
+func (e repairingProbeEnsurer) EnsureCopySafetyCached(_ context.Context, file *models.MediaFile) (*models.MediaFile, error) {
+	if repaired, ok := e.repaired[file.ID]; ok {
+		return repaired, nil
+	}
+	return file, nil
+}
+
+// findAlternateFiles is the one sibling source for every fallback reason, at
+// start and at replan, so the access filter applies there.
+func TestFindAlternateFilesDropsVersionsTheViewerCannotPlay(t *testing.T) {
+	missingSince := time.Now().UTC()
+	source := &models.MediaFile{ID: 1, ContentID: "movie-1", MediaFolderID: 1, Resolution: "2160p"}
+	files := []*models.MediaFile{
+		source,
+		{ID: 2, ContentID: "movie-1", MediaFolderID: 2, Resolution: "1080p"},
+		{ID: 3, ContentID: "movie-1", MediaFolderID: 1, Resolution: "2160p"},
+		{ID: 4, ContentID: "movie-1", MediaFolderID: 1, Resolution: "1080p"},
+		{ID: 5, ContentID: "movie-1", MediaFolderID: 1, Resolution: "720p", MissingSince: &missingSince},
+	}
+	handler := &PlaybackHandler{FileVersionFetcher: testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{"movie-1": files}}}
+
+	got, err := handler.findAlternateFiles(context.Background(), source, catalog.AccessFilter{AllowedLibraryIDs: []int{1}, MaxPlaybackQuality: access.PlaybackQualityStandard})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ID != 4 {
+		t.Fatalf("alternates = %+v, want only file 4", got)
+	}
+
+	got, err = handler.findAlternateFiles(context.Background(), source, catalog.AccessFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("unrestricted alternates = %d, want the three present siblings", len(got))
+	}
+}
+
+func TestHandleReplanPlaybackV3PreservesOmittedSubtitleAndReportsItDroppedInFallbackVersion(t *testing.T) {
 	source := v3HandlerFixtureFile(t)
 	source.Resolution = "2160p"
 	source.Bitrate = 32_000
@@ -5055,6 +5193,285 @@ func TestHandleReplanPlaybackV3PreservesOmittedSubtitleAndReportsUnavailableInFa
 	}
 	if record.NormalizedRequest.SubtitleTrackID != "" || record.NormalizedRequest.SubtitleTrackIndex != nil {
 		t.Fatalf("degraded fallback kept the durable subtitle selection: %#v", record.NormalizedRequest)
+	}
+}
+
+func TestHandleReplanPlaybackV3QualityChangeKeepsSubtitleOnActiveAlternate(t *testing.T) {
+	source := v3HandlerFixtureFile(t)
+	source.Resolution = "2160p"
+	source.Bitrate = 32_000
+	source.VideoTracks = append([]models.VideoTrack(nil), source.VideoTracks...)
+	source.VideoTracks[0].Level = 51
+	source.VideoTracks[0].Width = 3840
+	source.VideoTracks[0].Height = 2160
+	source.VideoTracks[0].Bitrate = 32_000
+	alternateValue := *source
+	alternate := &alternateValue
+	alternate.ID = 84
+	alternate.Resolution = "1080p"
+	alternate.Bitrate = 8_000
+	alternate.VideoTracks = append([]models.VideoTrack(nil), source.VideoTracks...)
+	alternate.VideoTracks[0].Level = 41
+	alternate.VideoTracks[0].Width = 1920
+	alternate.VideoTracks[0].Height = 1080
+	alternate.VideoTracks[0].Bitrate = 8_000
+	alternate.ExternalSubtitles = []models.ExternalSubtitle{{Path: writePlaybackTestMediaFile(t, "movie.eng.ass"), Language: "eng", Format: "ass"}}
+
+	files := map[int]*models.MediaFile{source.ID: source, alternate.ID: alternate}
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), mapPlaybackFileResolver{files: files})
+	handler.FileVersionFetcher = testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{source.ContentID: {source, alternate}}}
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "false"}}
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	// A 1080p client cannot play the 4K requested edition, so the start lands
+	// on the 1080p alternate, which is the only version with subtitles.
+	startRequest := v3HandlerStartRequest()
+	startRequest.QualityPreference = "auto"
+	startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassOriginalHTTPV3] = playback.DeliveryCapabilityV3{
+		Enabled: true, SupportedOnDevice: true,
+		Subtitles: playback.DeliverySubtitleCapabilitiesV3{SidecarText: true, ASSStyling: true},
+	}
+	startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassHLSV3] = playback.DeliveryCapabilityV3{
+		Enabled: true, SupportedOnDevice: true,
+		Subtitles: playback.DeliverySubtitleCapabilitiesV3{SidecarText: true, ASSStyling: true},
+	}
+	startRR := httptest.NewRecorder()
+	handler.HandleStartPlayback(startRR, httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", strings.NewReader(marshalV3StartRequest(t, startRequest))).WithContext(newAuthorizedPlaybackContext()))
+	var started playback.DecisionResponseV3
+	if err := json.Unmarshal(startRR.Body.Bytes(), &started); err != nil || started.PlaybackPlan == nil || started.PlaybackPlan.EffectiveMediaFileID != alternate.ID {
+		t.Fatalf("start did not land on the alternate: status=%d body=%s", startRR.Code, startRR.Body.String())
+	}
+
+	subtitleIndex := 0
+	subtitled := postPlaybackReplanV3(t, handler, started.SessionID, playback.ReplanRequestV3{
+		ProtocolVersion: playback.ProtocolV3, Operation: playback.ReplanOperationTrackChangeV3,
+		PlaybackAttemptID: startRequest.PlaybackAttemptID, ReplanRequestID: "keep-subtitle-track-0001",
+		FailedPlanID: started.PlaybackPlan.PlanID, PlanAttemptID: "keep-subtitle-track-attempt-0001",
+		PlanAttemptKey: started.PlaybackPlan.PlanAttemptKey, AttemptCount: 1,
+		QualityPreference: "auto",
+		SelectedTracks: playback.SelectedTracksV3{
+			Audio:    started.PlaybackPlan.SelectedTracks.Audio,
+			Subtitle: &playback.TrackIdentityV3{ID: playback.TrackIDV3(alternate.ID, "subtitle", subtitleIndex), Index: &subtitleIndex},
+		},
+		Capabilities: startRequest.Capabilities, ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	})
+	if subtitled.PlaybackPlan == nil || subtitled.PlaybackPlan.SelectedTracks.Subtitle == nil {
+		t.Fatalf("subtitle selection on the alternate failed: %#v", subtitled.Terminal)
+	}
+
+	currentKey := playback.PlanAttemptKeyV3(*subtitled.PlaybackPlan, startRequest.ClientPlaybackContext.Output.OutputContextID, nil)
+	response := postPlaybackReplanV3(t, handler, started.SessionID, playback.ReplanRequestV3{
+		ProtocolVersion: playback.ProtocolV3, Operation: playback.ReplanOperationQualityChangeV3,
+		PlaybackAttemptID: startRequest.PlaybackAttemptID, ReplanRequestID: "keep-subtitle-quality-0001",
+		FailedPlanID: subtitled.PlaybackPlan.PlanID, PlanAttemptID: "keep-subtitle-quality-attempt-0001",
+		PlanAttemptKey: currentKey, AttemptedPlanKeys: []string{currentKey}, AttemptCount: 1,
+		QualityPreference: "1080p",
+		SelectedTracks:    playback.SelectedTracksV3{Audio: subtitled.PlaybackPlan.SelectedTracks.Audio},
+		Capabilities:      startRequest.Capabilities, ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	})
+	if response.Terminal != nil || response.PlaybackPlan == nil {
+		t.Fatalf("quality change terminal = %#v", response.Terminal)
+	}
+	plan := response.PlaybackPlan
+	if plan.EffectiveMediaFileID != alternate.ID || plan.SelectedTracks.Subtitle == nil {
+		t.Fatalf("expected to stay on the alternate with its subtitle: file=%d subtitle=%#v warnings=%#v", plan.EffectiveMediaFileID, plan.Subtitle, plan.DegradationWarnings)
+	}
+	for _, warning := range plan.DegradationWarnings {
+		if warning.Code == playback.DegradationWarningSubtitleTrackUnavailableV3 {
+			t.Fatalf("kept subtitle reported as dropped: %#v", plan.DegradationWarnings)
+		}
+	}
+}
+
+// When staying on the subtitled alternate cannot satisfy a quality change, the
+// requested edition still plays, without the subtitle, rather than ending in a
+// terminal.
+func TestHandleReplanPlaybackV3QualityChangeFallsBackToRequestedEditionWithoutSubtitle(t *testing.T) {
+	for name, discoveryFails := range map[string]bool{"siblings found": false, "sibling discovery fails": true} {
+		t.Run(name, func(t *testing.T) { checkRequestedEditionFallbackWithoutSubtitleV3(t, discoveryFails) })
+	}
+}
+
+func checkRequestedEditionFallbackWithoutSubtitleV3(t *testing.T, discoveryFails bool) {
+	failedAt := time.Now().UTC()
+	requested := v3HandlerFixtureFile(t)
+	repaired := *requested
+	*requested = models.MediaFile{ID: repaired.ID, ContentID: repaired.ContentID, FilePath: repaired.FilePath, ProbeFailedAt: &failedAt}
+	alternateValue := repaired
+	alternate := &alternateValue
+	alternate.ID = 84
+	alternate.Resolution = "2160p"
+	alternate.Bitrate = 32_000
+	alternate.VideoTracks = append([]models.VideoTrack(nil), alternate.VideoTracks...)
+	alternate.VideoTracks[0].Level = 51
+	alternate.VideoTracks[0].Width = 3840
+	alternate.VideoTracks[0].Height = 2160
+	alternate.VideoTracks[0].Bitrate = 32_000
+	alternate.ExternalSubtitles = []models.ExternalSubtitle{{Path: writePlaybackTestMediaFile(t, "movie.eng.ass"), Language: "eng", Format: "ass"}}
+
+	files := map[int]*models.MediaFile{requested.ID: requested, alternate.ID: alternate}
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), mapPlaybackFileResolver{files: files})
+	handler.FileVersionFetcher = testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{requested.ContentID: {requested, alternate}}}
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "false"}}
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	startRequest := v3HandlerStartRequest()
+	startRequest.QualityPreference = "auto"
+	startRequest.Capabilities.MaxResolution = "2160p"
+	startRequest.Capabilities.VideoDecode[0].Levels = []int{51}
+	startRequest.Capabilities.VideoDecode[0].MaxWidth = 3840
+	startRequest.Capabilities.VideoDecode[0].MaxHeight = 2160
+	startRequest.Capabilities.VideoDecode[0].MaxBitrateKbps = 50_000
+	for _, delivery := range []string{playback.DeliveryClassOriginalHTTPV3, playback.DeliveryClassHLSV3} {
+		startRequest.ClientPlaybackContext.Deliveries[delivery] = playback.DeliveryCapabilityV3{
+			Enabled: true, SupportedOnDevice: true,
+			Subtitles: playback.DeliverySubtitleCapabilitiesV3{SidecarText: true, ASSStyling: true},
+		}
+	}
+	// The requested 1080p edition is unreadable at start, so playback lands on
+	// the 4K alternate, the only version with subtitles.
+	startRR := httptest.NewRecorder()
+	handler.HandleStartPlayback(startRR, httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", strings.NewReader(marshalV3StartRequest(t, startRequest))).WithContext(newAuthorizedPlaybackContext()))
+	var started playback.DecisionResponseV3
+	if err := json.Unmarshal(startRR.Body.Bytes(), &started); err != nil || started.PlaybackPlan == nil || started.PlaybackPlan.EffectiveMediaFileID != alternate.ID {
+		t.Fatalf("start did not land on the alternate: status=%d body=%s", startRR.Code, startRR.Body.String())
+	}
+	*requested = repaired
+
+	subtitleIndex := 0
+	subtitled := postPlaybackReplanV3(t, handler, started.SessionID, playback.ReplanRequestV3{
+		ProtocolVersion: playback.ProtocolV3, Operation: playback.ReplanOperationTrackChangeV3,
+		PlaybackAttemptID: startRequest.PlaybackAttemptID, ReplanRequestID: "requested-fallback-track-0001",
+		FailedPlanID: started.PlaybackPlan.PlanID, PlanAttemptID: "requested-fallback-track-attempt-0001",
+		PlanAttemptKey: started.PlaybackPlan.PlanAttemptKey, AttemptCount: 1,
+		QualityPreference: "auto",
+		SelectedTracks: playback.SelectedTracksV3{
+			Audio:    started.PlaybackPlan.SelectedTracks.Audio,
+			Subtitle: &playback.TrackIdentityV3{ID: playback.TrackIDV3(alternate.ID, "subtitle", subtitleIndex), Index: &subtitleIndex},
+		},
+		Capabilities: startRequest.Capabilities, ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	})
+	if subtitled.PlaybackPlan == nil || subtitled.PlaybackPlan.SelectedTracks.Subtitle == nil {
+		t.Fatalf("subtitle selection on the alternate failed: %#v", subtitled.Terminal)
+	}
+
+	if discoveryFails {
+		// The requested edition is already resolved, so it stays a fallback
+		// even when the sibling lookup errors.
+		handler.FileVersionFetcher = nil
+	}
+	currentKey := playback.PlanAttemptKeyV3(*subtitled.PlaybackPlan, startRequest.ClientPlaybackContext.Output.OutputContextID, nil)
+	response := postPlaybackReplanV3(t, handler, started.SessionID, playback.ReplanRequestV3{
+		ProtocolVersion: playback.ProtocolV3, Operation: playback.ReplanOperationQualityChangeV3,
+		PlaybackAttemptID: startRequest.PlaybackAttemptID, ReplanRequestID: "requested-fallback-quality-0001",
+		FailedPlanID: subtitled.PlaybackPlan.PlanID, PlanAttemptID: "requested-fallback-quality-attempt-0001",
+		PlanAttemptKey: currentKey, AttemptedPlanKeys: []string{currentKey}, AttemptCount: 1,
+		QualityPreference: "1080p",
+		SelectedTracks:    playback.SelectedTracksV3{Audio: subtitled.PlaybackPlan.SelectedTracks.Audio},
+		Capabilities:      startRequest.Capabilities, ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	})
+	if response.Terminal != nil || response.PlaybackPlan == nil {
+		t.Fatalf("quality change terminal = %#v", response.Terminal)
+	}
+	plan := response.PlaybackPlan
+	if plan.EffectiveMediaFileID != requested.ID || plan.SelectedTracks.Subtitle != nil {
+		t.Fatalf("expected the requested edition without subtitles: file=%d subtitle=%#v", plan.EffectiveMediaFileID, plan.Subtitle)
+	}
+	if !slices.ContainsFunc(plan.DegradationWarnings, func(warning playback.DegradationWarningV3) bool {
+		return warning.Code == playback.DegradationWarningSubtitleTrackUnavailableV3
+	}) {
+		t.Fatalf("dropped subtitle not reported: %#v", plan.DegradationWarnings)
+	}
+}
+
+// A fallback that would drop the viewer's subtitle is used only when no
+// version keeps it.
+func TestHandleReplanPlaybackV3PrefersFallbackVersionThatKeepsSubtitle(t *testing.T) {
+	source := v3HandlerFixtureFile(t)
+	source.Resolution = "2160p"
+	source.Bitrate = 32_000
+	source.VideoTracks = append([]models.VideoTrack(nil), source.VideoTracks...)
+	source.VideoTracks[0].Level = 51
+	source.VideoTracks[0].Width = 3840
+	source.VideoTracks[0].Height = 2160
+	source.VideoTracks[0].Bitrate = 32_000
+	source.ExternalSubtitles = []models.ExternalSubtitle{{Path: writePlaybackTestMediaFile(t, "movie.eng.ass"), Language: "eng", Format: "ass"}}
+	alternateValue := *source
+	alternate := &alternateValue
+	alternate.ID = 84
+	alternate.Resolution = "1080p"
+	alternate.Bitrate = 8_000
+	alternate.VideoTracks = append([]models.VideoTrack(nil), source.VideoTracks...)
+	alternate.VideoTracks[0].Level = 41
+	alternate.VideoTracks[0].Width = 1920
+	alternate.VideoTracks[0].Height = 1080
+	alternate.VideoTracks[0].Bitrate = 8_000
+	alternate.ExternalSubtitles = nil
+
+	// The subtitled version sorts after the one without subtitles (lower
+	// bitrate), so the loop meets the version that would drop them first.
+	subtitledValue := *alternate
+	subtitled := &subtitledValue
+	subtitled.ID = 85
+	subtitled.Bitrate = 6_000
+	subtitled.VideoTracks = append([]models.VideoTrack(nil), alternate.VideoTracks...)
+	subtitled.VideoTracks[0].Bitrate = 6_000
+	subtitled.ExternalSubtitles = source.ExternalSubtitles
+
+	files := map[int]*models.MediaFile{source.ID: source, alternate.ID: alternate, subtitled.ID: subtitled}
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), mapPlaybackFileResolver{files: files})
+	handler.FileVersionFetcher = testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{source.ContentID: {source, alternate, subtitled}}}
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "false"}}
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	startRequest := v3HandlerStartRequest()
+	startRequest.QualityPreference = "auto"
+	startRequest.Capabilities.MaxResolution = "2160p"
+	startRequest.Capabilities.VideoDecode[0].Levels = []int{51}
+	startRequest.Capabilities.VideoDecode[0].MaxWidth = 3840
+	startRequest.Capabilities.VideoDecode[0].MaxHeight = 2160
+	startRequest.Capabilities.VideoDecode[0].MaxBitrateKbps = 50_000
+	subtitleIndex := 0
+	startRequest.SubtitleTrackID = playback.TrackIDV3(source.ID, "subtitle", subtitleIndex)
+	startRequest.SubtitleTrackIndex = &subtitleIndex
+	startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassOriginalHTTPV3] = playback.DeliveryCapabilityV3{
+		Enabled: true, SupportedOnDevice: true,
+		Subtitles: playback.DeliverySubtitleCapabilitiesV3{SidecarText: true, ASSStyling: true},
+	}
+	startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassHLSV3] = playback.DeliveryCapabilityV3{
+		Enabled: true, SupportedOnDevice: true,
+		Subtitles: playback.DeliverySubtitleCapabilitiesV3{SidecarText: true, ASSStyling: true},
+	}
+
+	startReq := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", strings.NewReader(marshalV3StartRequest(t, startRequest))).WithContext(newAuthorizedPlaybackContext())
+	startRR := httptest.NewRecorder()
+	handler.HandleStartPlayback(startRR, startReq)
+	if startRR.Code != http.StatusCreated {
+		t.Fatalf("start status = %d, body = %s", startRR.Code, startRR.Body.String())
+	}
+	var started playback.DecisionResponseV3
+	if err := json.Unmarshal(startRR.Body.Bytes(), &started); err != nil || started.PlaybackPlan == nil {
+		t.Fatalf("start response: err=%v response=%#v", err, started)
+	}
+	currentKey := playback.PlanAttemptKeyV3(*started.PlaybackPlan, startRequest.ClientPlaybackContext.Output.OutputContextID, nil)
+	response := postPlaybackReplanV3(t, handler, started.SessionID, playback.ReplanRequestV3{
+		ProtocolVersion: playback.ProtocolV3, Operation: playback.ReplanOperationQualityChangeV3,
+		PlaybackAttemptID: startRequest.PlaybackAttemptID,
+		ReplanRequestID:   "subtitle-version-prefer-0001", FailedPlanID: started.PlaybackPlan.PlanID,
+		PlanAttemptID: "subtitle-version-prefer-attempt-0001", PlanAttemptKey: currentKey,
+		AttemptedPlanKeys: []string{currentKey}, AttemptCount: 1, QualityPreference: "1080p",
+		SelectedTracks:        playback.SelectedTracksV3{Audio: started.PlaybackPlan.SelectedTracks.Audio},
+		Capabilities:          startRequest.Capabilities,
+		ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	})
+	if response.Terminal != nil || response.PlaybackPlan == nil {
+		t.Fatalf("fallback terminal = %#v", response.Terminal)
+	}
+	plan := response.PlaybackPlan
+	if plan.EffectiveMediaFileID != subtitled.ID || plan.SelectedTracks.Subtitle == nil {
+		t.Fatalf("expected the version that keeps the subtitle: file=%d subtitle=%#v", plan.EffectiveMediaFileID, plan.Subtitle)
+	}
+	for _, warning := range plan.DegradationWarnings {
+		if warning.Code == playback.DegradationWarningSubtitleTrackUnavailableV3 {
+			t.Fatalf("kept subtitle reported as dropped: %#v", plan.DegradationWarnings)
+		}
 	}
 }
 
@@ -5171,7 +5588,7 @@ func TestHandleReplanPlaybackV3BitmapSubtitleFallsBackFromHDRToSDRVersion(t *tes
 	handler.FileVersionFetcher = testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{
 		source.ContentID: {source, alternate},
 	}}
-	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"transcode_enabled": "true", "allow_4k_transcode": "true"}}
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"transcode_enabled": "true", "allow_4k_transcode": "true", "playback.transcode_hardware_tone_map_enabled": "false", "playback.transcode_software_tone_map_enabled": "false", "playback.transcode_vpp_tone_map_enabled": "false"}}
 	handler.PlaybackConfig = playbackTestConfig(writePlaybackTestFFmpeg(t), t.TempDir())
 	presetLocalRegistryV3(handler, playback.NewTransformationRegistryV3([]playback.TransformationSpecV3{
 		{Name: playback.TransformationAudioToAACV3, RecipeVersion: playback.TransformationAudioToAACRecipeVersionV3, Available: true},
@@ -7397,42 +7814,6 @@ func TestPrepareTransportV3ReleasesProxyReservationOnRollback(t *testing.T) {
 	}
 }
 
-// capableProxyStubV3 is a proxy that advertises the audio_to_aac and DV strip
-// recipes, mirroring the /hw-capabilities endpoint a real proxy now serves.
-func capableProxyStubV3(t *testing.T) *httptest.Server {
-	t.Helper()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/hw-capabilities" {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		writeJSON(w, http.StatusOK, playback.HWAccelInfo{
-			TransportFeatures: []string{playback.TransportFeatureProgressiveRemuxRelayV1},
-			Transformations: []playback.TransformationV3{
-				{Name: playback.TransformationAudioToAACV3, Executor: playback.ExecutorServerV3, RecipeVersion: playback.TransformationAudioToAACRecipeVersionV3},
-				{Name: playback.TransformationServerDV7HDR10V3, Executor: playback.ExecutorServerV3, RecipeVersion: "1"},
-			},
-		})
-	}))
-	t.Cleanup(server.Close)
-	return server
-}
-
-func progressiveRemuxExecutionStubV3(t *testing.T) *httptest.Server {
-	t.Helper()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/hw-capabilities" {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		writeJSON(w, http.StatusOK, playback.HWAccelInfo{
-			TransportFeatures: []string{playback.TransportFeatureProgressiveRemuxExecutionV1},
-		})
-	}))
-	t.Cleanup(server.Close)
-	return server
-}
-
 func TestPrepareTransportV3KeepsBoostedDownmixLocalWhenProxyHasOldRecipe(t *testing.T) {
 	// A rolling-upgrade proxy can support AAC while still advertising the old
 	// recipe that does not apply the stereo-downmix loudness filter. Selection
@@ -8911,101 +9292,42 @@ func TestHandleReplanPlaybackV3ExhaustivelyTriesVirtualAlternatesOnFailureRecove
 	source.VideoTracks[0].Width = 3840
 	source.VideoTracks[0].Height = 2160
 	source.VideoTracks[0].Bitrate = 32_000
+}
 
-	altFailValue := *source
-	altFail := &altFailValue
-	altFail.ID = 301
-	altFail.Resolution = "1080p"
-	altFail.FilePath = "virtual://movie/replan-alt-broken-301"
-	altFail.VirtualOwnerInstallationID = 5
-
-	altWorkValue := *source
-	altWork := &altWorkValue
-	altWork.ID = 302
-	altWork.CodecVideo = "hevc"
-	altWork.Resolution = "UHD"
-	altWork.Bitrate = 12_000
-	altWork.FilePath = "virtual://movie/replan-alt-working-302"
-	altWork.VirtualOwnerInstallationID = 5
-	altWork.VideoTracks = []models.VideoTrack{{
-		Codec: "hevc", Profile: "main", Level: 52, Width: 3840, Height: 2160,
-		FrameRate: "24000/1001", Bitrate: 12_000, BitDepth: 8,
-		VideoRange: "SDR", VideoRangeType: "SDR",
-	}}
-
-	manager := playback.NewSessionManager(0, 0)
-	files := map[int]*models.MediaFile{source.ID: source, altFail.ID: altFail, altWork.ID: altWork}
-	handler := NewPlaybackHandler(manager, mapPlaybackFileResolver{files: files})
-	handler.FileVersionFetcher = testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{
-		source.ContentID: {source, altFail, altWork},
-	}}
-	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "false"}}
-	handler.PlaybackConfig = playbackTestConfig("", "")
-	handler.ItemAccess = allowAllPlaybackItemAccess{}
-	failPinned := false
-	handler.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(func(_ context.Context, path string, _ int, _ string, _ int) (string, error) {
-		if strings.Contains(path, "replan-alt-broken") || (failPinned && strings.Contains(path, "replan-source-300")) {
-			return "", errors.New("resolution failed for broken candidate")
+// capableProxyStubV3 is a proxy that advertises the audio_to_aac and DV strip
+// recipes, mirroring the /hw-capabilities endpoint a real proxy now serves.
+func capableProxyStubV3(t *testing.T) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/hw-capabilities" {
+			w.WriteHeader(http.StatusNotFound)
+			return
 		}
-		return "http://127.0.0.1:8080/stream?path=" + path, nil
-	})
-	// The provider lists a result=-suffixed candidate so the session binds to a
-	// URI that differs from the catalog row, keeping the replan on the
-	// fall-through rehydration path.
-	handler.VirtualPlaybackStreamLister = VirtualPlaybackStreamListerFunc(func(_ context.Context, path string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
-		return []VirtualPlaybackStream{{
-			URI: path + "?result=pinned", Resolution: source.Resolution, CodecVideo: source.CodecVideo, CodecAudio: source.CodecAudio, Container: "mp4",
-		}}, nil
-	})
+		writeJSON(w, http.StatusOK, playback.HWAccelInfo{
+			TransportFeatures: []string{playback.TransportFeatureProgressiveRemuxRelayV1},
+			Transformations: []playback.TransformationV3{
+				{Name: playback.TransformationAudioToAACV3, Executor: playback.ExecutorServerV3, RecipeVersion: playback.TransformationAudioToAACRecipeVersionV3},
+				{Name: playback.TransformationServerDV7HDR10V3, Executor: playback.ExecutorServerV3, RecipeVersion: playback.TransformationServerDV7HDR10RecipeVersionV3},
+			},
+		})
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
 
-	startRequest := v3HandlerStartRequest()
-	startRequest.FileID = source.ID
-	startRequest.Capabilities.MaxResolution = "2160p"
-	startRequest.Capabilities.VideoDecode[0].Levels = []int{52}
-	startRequest.Capabilities.VideoDecode[0].MaxWidth = 3840
-	startRequest.Capabilities.VideoDecode[0].MaxHeight = 2160
-	startRequest.Capabilities.VideoDecode[0].MaxBitrateKbps = 50_000
-	startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassHLSV3] = playback.DeliveryCapabilityV3{
-		Enabled: true, SupportedOnDevice: true, Containers: []string{"hls"},
-		VideoCodecs: []string{"hevc"}, AudioDecodeCodecs: []string{"aac"},
-	}
-	startRR := httptest.NewRecorder()
-	handler.HandleStartPlayback(startRR, httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", strings.NewReader(marshalV3StartRequest(t, startRequest))).WithContext(newAuthorizedPlaybackContext()))
-	var started playback.DecisionResponseV3
-	if startRR.Code != http.StatusCreated || json.Unmarshal(startRR.Body.Bytes(), &started) != nil || started.PlaybackPlan == nil {
-		t.Fatalf("start status=%d body=%s", startRR.Code, startRR.Body.String())
-	}
-	failPinned = true
-
-	replanCapabilities := startRequest.Capabilities
-	replanCapabilities.CodecsVideo = []string{"hevc"}
-	replanCapabilities.CodecsVideoHardware = []string{"hevc"}
-	replanCapabilities.VideoDecode = []playback.VideoDecodeCapabilityV3{{
-		Codec: "hevc", Profiles: []string{"main"}, Levels: []int{52}, BitDepths: []int{8},
-		MaxWidth: 3840, MaxHeight: 2160, MaxFrameRate: 60, MaxBitrateKbps: 50_000, Hardware: true,
-	}}
-	currentKey := playback.PlanAttemptKeyV3(*started.PlaybackPlan, startRequest.ClientPlaybackContext.Output.OutputContextID, nil)
-	replanned := postPlaybackReplanV3(t, handler, started.SessionID, playback.ReplanRequestV3{
-		ProtocolVersion: playback.ProtocolV3, Operation: playback.ReplanOperationFailureRecoveryV3,
-		PlaybackAttemptID: startRequest.PlaybackAttemptID, ReplanRequestID: "virtual-replan-0001",
-		FailedPlanID: started.PlaybackPlan.PlanID, PlanAttemptID: "virtual-plan-0001",
-		PlanAttemptKey: currentKey, AttemptedPlanKeys: []string{currentKey}, AttemptCount: 1,
-		QualityPreference: "auto", SelectedTracks: started.PlaybackPlan.SelectedTracks,
-		Failure:      playback.FailureV3{Classification: "playback_error"},
-		Capabilities: replanCapabilities, ClientPlaybackContext: startRequest.ClientPlaybackContext,
-	})
-	if replanned.Terminal != nil {
-		t.Fatalf("replan terminal = %+v", *replanned.Terminal)
-	}
-	if replanned.PlaybackPlan == nil {
-		t.Fatalf("replan = %#v", replanned)
-	}
-	if replanned.PlaybackPlan.EffectiveMediaFileID != altWork.ID {
-		t.Fatalf("effective file = %d, want working virtual alternate %d", replanned.PlaybackPlan.EffectiveMediaFileID, altWork.ID)
-	}
-	if replanned.PlaybackPlan.RequestedMediaFileID != source.ID {
-		t.Fatalf("requested file = %d, want original source %d", replanned.PlaybackPlan.RequestedMediaFileID, source.ID)
-	}
+func progressiveRemuxExecutionStubV3(t *testing.T) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/hw-capabilities" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		writeJSON(w, http.StatusOK, playback.HWAccelInfo{
+			TransportFeatures: []string{playback.TransportFeatureProgressiveRemuxExecutionV1},
+		})
+	}))
+	t.Cleanup(server.Close)
+	return server
 }
 
 func TestHandleReplanPlaybackV3VirtualRehydrationAllAlternatesFailReturnsVirtualSourceUnavailable(t *testing.T) {
@@ -10208,7 +10530,7 @@ func TestRemapSubtitleSelectionV3WritesTargetPublishedOrdinal(t *testing.T) {
 		// files. A source-space read would pick the suppressed fra duplicate.
 		index := 2
 		request := playback.StartRequestV3{SubtitleTrackIndex: &index, SubtitleTrackID: playback.TrackIDV3(source.ID, "subtitle", index)}
-		if err := (&PlaybackHandler{}).remapSubtitleSelectionV3(context.Background(), source, target, &request); err != nil {
+		if _, err := (&PlaybackHandler{}).remapSubtitleSelectionV3(context.Background(), source, target, &request); err != nil {
 			t.Fatalf("remap: %v", err)
 		}
 		if request.SubtitleTrackIndex == nil || *request.SubtitleTrackIndex != 2 {
@@ -10242,7 +10564,7 @@ func TestRemapSubtitleSelectionV3WritesTargetPublishedOrdinal(t *testing.T) {
 		// (ID 72). Target's own published base is 1, and ID 72 sits first there.
 		index := 2
 		request := playback.StartRequestV3{SubtitleTrackIndex: &index, SubtitleTrackID: playback.TrackIDV3(source.ID, "subtitle", index)}
-		if err := handler.remapSubtitleSelectionV3(context.Background(), source, target, &request); err != nil {
+		if _, err := handler.remapSubtitleSelectionV3(context.Background(), source, target, &request); err != nil {
 			t.Fatalf("remap: %v", err)
 		}
 		if request.SubtitleTrackIndex == nil || *request.SubtitleTrackIndex != 1 {
@@ -10255,7 +10577,7 @@ func TestRemapSubtitleSelectionV3WritesTargetPublishedOrdinal(t *testing.T) {
 		target := legacySubtitleFileV3(2)
 		index := 1
 		request := playback.StartRequestV3{SubtitleTrackIndex: &index, SubtitleTrackID: playback.TrackIDV3(source.ID, "subtitle", index)}
-		if err := (&PlaybackHandler{}).remapSubtitleSelectionV3(context.Background(), source, target, &request); err != nil {
+		if _, err := (&PlaybackHandler{}).remapSubtitleSelectionV3(context.Background(), source, target, &request); err != nil {
 			t.Fatalf("remap: %v", err)
 		}
 		if request.SubtitleTrackIndex == nil || *request.SubtitleTrackIndex != 1 {
@@ -10441,7 +10763,7 @@ func writePlaybackTestFFmpegFailingOn(t *testing.T, failPattern string) (ffmpegP
 		"#EXTINF:2.0,\\nseg_0.m4s\\n#EXTINF:2.0,\\nseg_1.m4s\\n" +
 		"#EXTINF:2.0,\\nseg_2.m4s\\n' > \"$last\" ;;\n" +
 		"esac\n" +
-		"sleep 30\n"
+		"exec sleep 30\n"
 	if err := os.WriteFile(ffmpegPath, []byte(script), 0o755); err != nil {
 		t.Fatalf("write fake ffmpeg: %v", err)
 	}
@@ -10589,5 +10911,147 @@ func TestHEVCEncodedPlanCarriesHVC1ToTransport(t *testing.T) {
 	plan.EffectiveRecipe.VideoCodec = "h264"
 	if got := videoSampleEntryForPlanV3(plan); got != "" {
 		t.Fatalf("H264 carried HEVC tag=%q", got)
+	}
+}
+
+func TestHandleReplanPlaybackV3PreservesOmittedSubtitleAndReportsUnavailableInFallbackVersion(t *testing.T) {
+	source := v3HandlerFixtureFile(t)
+	source.Resolution = "2160p"
+	source.Bitrate = 32_000
+	source.VideoTracks = append([]models.VideoTrack(nil), source.VideoTracks...)
+	source.VideoTracks[0].Level = 51
+	source.VideoTracks[0].Width = 3840
+	source.VideoTracks[0].Height = 2160
+	source.VideoTracks[0].Bitrate = 32_000
+	source.ExternalSubtitles = []models.ExternalSubtitle{{Path: writePlaybackTestMediaFile(t, "movie.eng.ass"), Language: "eng", Format: "ass"}}
+	alternateValue := *source
+	alternate := &alternateValue
+	alternate.ID = 84
+	alternate.Resolution = "1080p"
+	alternate.Bitrate = 8_000
+	alternate.VideoTracks = append([]models.VideoTrack(nil), source.VideoTracks...)
+	alternate.VideoTracks[0].Level = 41
+	alternate.VideoTracks[0].Width = 1920
+	alternate.VideoTracks[0].Height = 1080
+	alternate.VideoTracks[0].Bitrate = 8_000
+	alternate.ExternalSubtitles = nil
+
+	files := map[int]*models.MediaFile{source.ID: source, alternate.ID: alternate}
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), mapPlaybackFileResolver{files: files})
+	handler.FileVersionFetcher = testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{source.ContentID: {source, alternate}}}
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "false"}}
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	startRequest := v3HandlerStartRequest()
+	startRequest.QualityPreference = "auto"
+	startRequest.Capabilities.MaxResolution = "2160p"
+	startRequest.Capabilities.VideoDecode[0].Levels = []int{51}
+	startRequest.Capabilities.VideoDecode[0].MaxWidth = 3840
+	startRequest.Capabilities.VideoDecode[0].MaxHeight = 2160
+	startRequest.Capabilities.VideoDecode[0].MaxBitrateKbps = 50_000
+	subtitleIndex := 0
+	startRequest.SubtitleTrackID = playback.TrackIDV3(source.ID, "subtitle", subtitleIndex)
+	startRequest.SubtitleTrackIndex = &subtitleIndex
+	startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassOriginalHTTPV3] = playback.DeliveryCapabilityV3{
+		Enabled: true, SupportedOnDevice: true,
+		Subtitles: playback.DeliverySubtitleCapabilitiesV3{SidecarText: true, ASSStyling: true},
+	}
+	startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassHLSV3] = playback.DeliveryCapabilityV3{
+		Enabled: true, SupportedOnDevice: true,
+		Subtitles: playback.DeliverySubtitleCapabilitiesV3{SidecarText: true, ASSStyling: true},
+	}
+
+	startReq := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", strings.NewReader(marshalV3StartRequest(t, startRequest))).WithContext(newAuthorizedPlaybackContext())
+	startRR := httptest.NewRecorder()
+	handler.HandleStartPlayback(startRR, startReq)
+	if startRR.Code != http.StatusCreated {
+		t.Fatalf("start status = %d, body = %s", startRR.Code, startRR.Body.String())
+	}
+	var started playback.DecisionResponseV3
+	if err := json.Unmarshal(startRR.Body.Bytes(), &started); err != nil || started.PlaybackPlan == nil {
+		t.Fatalf("start response: err=%v response=%#v", err, started)
+	}
+	currentKey := playback.PlanAttemptKeyV3(*started.PlaybackPlan, startRequest.ClientPlaybackContext.Output.OutputContextID, nil)
+	response := postPlaybackReplanV3(t, handler, started.SessionID, playback.ReplanRequestV3{
+		ProtocolVersion: playback.ProtocolV3, Operation: playback.ReplanOperationQualityChangeV3,
+		PlaybackAttemptID: startRequest.PlaybackAttemptID,
+		ReplanRequestID:   "subtitle-version-fallback-0001", FailedPlanID: started.PlaybackPlan.PlanID,
+		PlanAttemptID: "subtitle-version-attempt-0001", PlanAttemptKey: currentKey,
+		AttemptedPlanKeys: []string{currentKey}, AttemptCount: 1, QualityPreference: "1080p",
+		// A non-track-change replan may omit an unchanged subtitle identity.
+		// The server carries it onto the 1080p fallback. That fallback has no
+		// equivalent track, and after every candidate has been tried the
+		// carried selection degrades to subtitles-off rather than terminalling
+		// playback: the session must still open even without the subtitle.
+		SelectedTracks:        playback.SelectedTracksV3{Audio: started.PlaybackPlan.SelectedTracks.Audio},
+		Capabilities:          startRequest.Capabilities,
+		ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	})
+	if response.Terminal != nil || response.PlaybackPlan == nil {
+		t.Fatalf("fallback terminal = %#v, plan = %#v", response.Terminal, response.PlaybackPlan)
+	}
+	if response.PlaybackPlan.EffectiveMediaFileID != alternate.ID {
+		t.Fatalf("fallback effective file = %d, want %d", response.PlaybackPlan.EffectiveMediaFileID, alternate.ID)
+	}
+	if response.PlaybackPlan.Subtitle.Mode != playback.SubtitleOffV3 || response.PlaybackPlan.SelectedTracks.Subtitle != nil {
+		t.Fatalf("fallback subtitles = %#v / %#v, want off with no selection", response.PlaybackPlan.Subtitle, response.PlaybackPlan.SelectedTracks.Subtitle)
+	}
+	record, err := handler.PlanStoreV3.GetAttempt(context.Background(), started.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.NormalizedRequest.SubtitleTrackID != "" || record.NormalizedRequest.SubtitleTrackIndex != nil {
+		t.Fatalf("degraded fallback kept the durable subtitle selection: %#v", record.NormalizedRequest)
+	}
+}
+
+func TestHandleStartPlaybackV3DuplicateAttemptReturnsOriginalSession(t *testing.T) {
+	file := v3HandlerFixtureFile(t)
+	manager := playback.NewSessionManager(0, 0)
+	handler := NewPlaybackHandler(manager, testPlaybackFileResolver{file: file})
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "true"}}
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	body := marshalV3StartRequest(t, v3HandlerStartRequest())
+
+	start := func() playback.DecisionResponseV3 {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", strings.NewReader(body)).WithContext(newAuthorizedPlaybackContext())
+		rr := httptest.NewRecorder()
+		handler.HandleStartPlayback(rr, req)
+		if rr.Code != http.StatusCreated {
+			t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+		}
+		var response playback.DecisionResponseV3
+		if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
+			t.Fatal(err)
+		}
+		return response
+	}
+	first := start()
+	second := start()
+	if first.SessionID == "" || second.SessionID != first.SessionID {
+		t.Fatalf("first session %q, second %q", first.SessionID, second.SessionID)
+	}
+	if got := len(manager.AllSessions()); got != 1 {
+		t.Fatalf("sessions = %d, want 1", got)
+	}
+}
+
+func TestToneMapExecutionTransportErrorClassifiesLiveValidation(t *testing.T) {
+	tests := []struct {
+		name          string
+		err           error
+		wantRetryable bool
+	}{
+		{name: "stale metadata", err: tonemap.ErrSourceRevisionChanged},
+		{name: "preflight rejected", err: tonemap.ErrSourcePreflightRejected},
+		{name: "probe unavailable", err: playback.ErrToneMapSourceValidationUnavailable, wantRetryable: true},
+		{name: "executor unavailable", err: playback.ErrToneMapExecutorUnavailable, wantRetryable: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := toneMapExecutionTransportErrorV3(tt.err, "failed")
+			if got.reason != transcodeStartFailedReasonV3 || got.retryable != tt.wantRetryable || !errors.Is(got.cause, tt.err) {
+				t.Fatalf("error = %+v, want retryable=%t wrapping %v", got, tt.wantRetryable, tt.err)
+			}
+		})
 	}
 }

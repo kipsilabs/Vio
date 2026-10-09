@@ -659,8 +659,8 @@ func (h *LibraryCollectionHandler) SyncAdminCollection(ctx context.Context, id s
 	}
 	return h.service.SyncCollection(ctx, id)
 }
-func (h *LibraryCollectionHandler) ListAdminCollectionTemplates(ctx context.Context) (templates.BundleCatalog, error) {
-	return h.templateRegistry().BundleCatalog(), nil
+func (h *LibraryCollectionHandler) ListAdminCollectionTemplates(ctx context.Context) ([]templates.BundleWithTemplates, error) {
+	return h.templateRegistry().BundlesWithTemplates(), nil
 }
 func (h *LibraryCollectionHandler) ApplyAdminCollectionTemplate(ctx context.Context, id string, req AdminCollectionTemplateApply) (AdminCollectionTemplateResult, error) {
 	result, err := h.applyTemplateBundle(ctx, id, req, nil)
@@ -733,7 +733,7 @@ func (h *LibraryCollectionHandler) SetAdminCollectionArtworkSource(ctx context.C
 	if _, err := h.repo.GetByID(ctx, id); err != nil {
 		return err
 	}
-	data, err := downloadCollectionImageURL(ctx, h.httpClient, url)
+	data, err := downloadCollectionImageURL(adminCollectionImageContext(ctx), h.httpClient, url)
 	if err != nil {
 		return err
 	}

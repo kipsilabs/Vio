@@ -473,7 +473,6 @@ func (s *Service) executeRunWithClaim(run *Run, provider Provider, claim RunClai
 	}
 	if err := s.repo.completeRun(ctx, claim, summary); err != nil {
 		s.failClaim(ctx, claim, summary, err)
-		slog.Error("history import: failed to complete run", "run_id", run.ID, "error", err)
 		return
 	}
 	observation.Finish("success")
@@ -707,16 +706,6 @@ func IsNotFoundError(err error) bool {
 		errors.Is(err, ErrProfileNotFound) ||
 		errors.Is(err, ErrConnectSessionNotFound) ||
 		errors.Is(err, ErrPlexSessionNotFound)
-}
-
-func shouldWriteImportedProgress(record Record, localProgress *localProgressRow) bool {
-	if localProgress == nil {
-		return true
-	}
-	if record.UpdatedAt.IsZero() {
-		return false
-	}
-	return record.UpdatedAt.After(localProgress.UpdatedAt)
 }
 
 func toConnectServerResponses(servers []ConnectServer) []ConnectServerResponse {

@@ -11,6 +11,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/adminjob"
 	"github.com/Silo-Server/silo-server/internal/api/handlers"
 	catalogsvc "github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/collections/templates"
 	"github.com/Silo-Server/silo-server/internal/models"
 )
 
@@ -29,6 +30,16 @@ type fakeAdminCollections struct {
 	lastTMDB                                           handlers.AdminCollectionImportTMDB
 	lastTrakt                                          handlers.AdminCollectionImportTrakt
 	lastApply                                          handlers.AdminCollectionTemplateApply
+	bundles                                            []templates.BundleWithTemplates
+	bundleReads                                        int
+	catalog                                            *templates.Catalog
+	catalogReads                                       int
+	featureReads                                       int
+	listed                                             []handlers.AdminCollection
+	listReads, sectionReads, countReads                int
+	countedIDs                                         []string
+	sections                                           []handlers.AdminCollectionSection
+	rowCounts                                          map[string]handlers.AdminCollectionRowCount
 }
 
 func newFakeAdminCollections() *fakeAdminCollections {
@@ -297,6 +308,18 @@ func TestAdminCollectionSyncReportsMissingProviderAsUnavailable(t *testing.T) {
 	p := requireProblem(t, do(t, h, http.MethodPost, "/api/v2/admin/collections/c1/sync", "", bearer(adminToken)), TypeDependencyUnavailable)
 	if p.Detail != "The virtual playback provider is unavailable." {
 		t.Fatalf("detail = %q, want stable unavailable message", p.Detail)
+	}
+}
+
+// A smart collection follows its rules and has no list to fetch, so a sync
+// request for one is the same caller mistake and must not answer 500.
+func TestAdminCollectionSyncRejectsSmartCollection(t *testing.T) {
+	f := newFakeAdminCollections()
+	f.syncErr = catalogsvc.ErrLibraryCollectionSyncUnsupported
+	h := adminCollectionsTestHandler(t, f)
+	p := requireProblem(t, do(t, h, http.MethodPost, "/api/v2/admin/collections/c1/sync", "", bearer(adminToken)), TypeValidationFailed)
+	if strings.Contains(p.Detail, catalogsvc.ErrLibraryCollectionSyncUnsupported.Error()) {
+		t.Fatalf("leaked service diagnostic: %s", p.Detail)
 	}
 }
 

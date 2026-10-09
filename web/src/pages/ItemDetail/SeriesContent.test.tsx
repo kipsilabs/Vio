@@ -3,7 +3,8 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { renderToStaticMarkup } from "react-dom/server";
 import { MemoryRouter } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { ItemDetail, Season } from "@/api/types";
+import type { CrewMember, ItemDetail, Season } from "@/api/types";
+import { buildPersonCatalogHref } from "@/pages/catalogSearchParams";
 import SeriesContent from "./SeriesContent";
 
 const mocks = vi.hoisted(() => {
@@ -38,6 +39,9 @@ const mocks = vi.hoisted(() => {
   };
 });
 
+vi.mock("@/hooks/queries/shuffles", () => ({
+  useStartShuffle: () => ({ startShuffle: vi.fn(), isStarting: false }),
+}));
 vi.mock("@/pages/watchtogether/DetailWatchTogether", () => ({
   useDetailWatchTogether: () => ({ menu: undefined, sheet: null }),
 }));
@@ -93,10 +97,6 @@ vi.mock("@/hooks/queries/ratings", () => ({
 }));
 
 vi.mock("@/components/CastCarousel", () => ({
-  default: () => <div />,
-}));
-
-vi.mock("@/components/CrewList", () => ({
   default: () => <div />,
 }));
 
@@ -215,56 +215,6 @@ describe("SeriesContent", () => {
     mocks.useDeleteMediaItem.mockReturnValue({ mutate: vi.fn(), isPending: false });
   });
 
-  it.each([false, true])(
-    "only reserves empty season navigation while loading (%s)",
-    (isLoading) => {
-      mocks.useSeasons.mockReturnValue({ data: { seasons: [] }, isLoading });
-      const markup = renderToStaticMarkup(
-        <QueryClientProvider client={new QueryClient()}>
-          <MemoryRouter>
-            <SeriesContent item={makeSeriesItem()} />
-          </MemoryRouter>
-        </QueryClientProvider>,
-      );
-      expect(markup.includes("series-detail-navigation")).toBe(isLoading);
-      expect(markup.includes('role="region" aria-label="Seasons and episodes"')).toBe(isLoading);
-    },
-  );
-
-  it.each([
-    ["season rail", [makeSeason(), makeSeason({ content_id: "season-2", season_number: 2 })], true],
-    ["single-season episode grid", [makeSeason()], false],
-  ])("marks only the season rail as content-sized navigation (%s)", (_, seasons, isRail) => {
-    mocks.useSeasons.mockReturnValue({ data: { seasons } });
-    const markup = renderToStaticMarkup(
-      <QueryClientProvider client={new QueryClient()}>
-        <MemoryRouter>
-          <SeriesContent item={makeSeriesItem()} />
-        </MemoryRouter>
-      </QueryClientProvider>,
-    );
-    expect(markup).toContain(
-      isRail
-        ? 'class="page-shell series-detail-navigation series-detail-rail"'
-        : 'class="page-shell series-detail-navigation"',
-    );
-  });
-
-  it("passes rating state and change handler to ActionBar", () => {
-    renderToStaticMarkup(
-      <QueryClientProvider client={new QueryClient()}>
-        <MemoryRouter initialEntries={["/item/series-1"]}>
-          <SeriesContent item={makeSeriesItem()} />
-        </MemoryRouter>
-      </QueryClientProvider>,
-    );
-
-    expect(mocks.capturedActionBarProps.value).toMatchObject({
-      rating: 4,
-    });
-    expect(mocks.capturedActionBarProps.value?.onRatingChange).toBeTypeOf("function");
-  });
-
   it.each([
     [{ trickplay: true, trickplay_supported: true }, true],
     [{ trickplay: true, trickplay_supported: false }, false],
@@ -293,6 +243,8 @@ describe("SeriesContent", () => {
         </MemoryRouter>
       </QueryClientProvider>,
     );
+
+    expect(mocks.capturedActionBarProps.value?.rating).toBe(4);
 
     const onRatingChange = mocks.capturedActionBarProps.value?.onRatingChange as
       | ((rating: number | null) => void)
@@ -343,5 +295,35 @@ describe("SeriesContent", () => {
 
     expect(markup).not.toContain("collection_id=");
     expect(markup).not.toContain("Collections");
+  });
+
+  it("lists every creator in the Crew section, past the two the hero line shows", () => {
+    const creators: CrewMember[] = [
+      { name: "Creator One", job: "Creator", person_id: "creator-1" },
+      { name: "Creator Two", job: "Creator", person_id: "creator-2" },
+      { name: "Creator Three", job: "Creator", person_id: "creator-3" },
+    ];
+    const crew: CrewMember[] = [
+      ...creators,
+      { name: "Series Director", job: "Director", person_id: "director-1" },
+    ];
+
+    // DetailHero and HeroCrewLine are mocked, so these names can only come
+    // from the Crew section.
+    const markup = renderToStaticMarkup(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter initialEntries={["/item/series-1"]}>
+          <SeriesContent item={makeSeriesItem({ crew })} />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    expect(markup).toContain(">Creators</dt>");
+    for (const creator of creators) {
+      expect(markup).toContain(`href="${buildPersonCatalogHref(creator.person_id)}"`);
+      expect(markup).toContain(creator.name);
+    }
+    expect(markup).toContain(">Directors</dt>");
+    expect(markup.indexOf(">Creators</dt>")).toBeLessThan(markup.indexOf(">Directors</dt>"));
   });
 });

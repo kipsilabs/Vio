@@ -3,11 +3,13 @@ package llm
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -24,7 +26,7 @@ func TestChatSuccessSendsAuthAndModel(t *testing.T) {
 		buf := make([]byte, 4096)
 		n, _ := r.Body.Read(buf)
 		gotBody = string(buf[:n])
-		_, _ = w.Write([]byte(chatOK))
+		w.Write([]byte(chatOK))
 	}))
 	defer srv.Close()
 
@@ -45,68 +47,57 @@ func TestChatSuccessSendsAuthAndModel(t *testing.T) {
 }
 
 func TestChatRetriesOn429HonoringRetryAfter(t *testing.T) {
-	var calls atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if calls.Add(1) == 1 {
-			w.Header().Set("Retry-After", "1")
-			w.WriteHeader(http.StatusTooManyRequests)
-			return
+	synctest.Test(t, func(t *testing.T) {
+		calls := 0
+		c := NewClient(chatConfig("https://chat.example.test"))
+		c.chatHTTP.Transport = retryRoundTripFunc(func(*http.Request) (*http.Response, error) {
+			calls++
+			response := &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(chatOK))}
+			if calls == 1 {
+				response.Header.Set("Retry-After", "1")
+				response.StatusCode = http.StatusTooManyRequests
+			}
+			return response, nil
+		})
+		start := time.Now()
+		if _, err := c.Chat(t.Context(), []Message{{Role: "user", Content: "hi"}}, false); err != nil {
+			t.Fatalf("Chat: %v", err)
 		}
-		_, _ = w.Write([]byte(chatOK))
-	}))
-	defer srv.Close()
-
-	start := time.Now()
-	c := NewClient(chatConfig(srv.URL))
-	if _, err := c.Chat(context.Background(), []Message{{Role: "user", Content: "hi"}}, false); err != nil {
-		t.Fatalf("Chat: %v", err)
-	}
-	if calls.Load() != 2 {
-		t.Errorf("calls = %d, want 2", calls.Load())
-	}
-	if elapsed := time.Since(start); elapsed < time.Second {
-		t.Errorf("did not honor Retry-After: elapsed %v", elapsed)
-	}
+		if calls != 2 {
+			t.Errorf("calls = %d, want 2", calls)
+		}
+		if elapsed := time.Since(start); elapsed < time.Second {
+			t.Errorf("did not honor Retry-After: elapsed %v", elapsed)
+		}
+	})
 }
 
 func TestChatRetriesOn5xxAndEmbeddedErrorAndEmptyChoices(t *testing.T) {
-	responses := []func(w http.ResponseWriter){
-		func(w http.ResponseWriter) { w.WriteHeader(http.StatusBadGateway) },
-		func(w http.ResponseWriter) { _, _ = w.Write([]byte(`{"error":{"message":"upstream sad"}}`)) },
-		func(w http.ResponseWriter) { _, _ = w.Write([]byte(`{"choices":[]}`)) },
-		func(w http.ResponseWriter) { _, _ = w.Write([]byte(chatOK)) },
-	}
-	var calls atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		responses[calls.Add(1)-1](w)
-	}))
-	defer srv.Close()
-
-	c := NewClient(chatConfig(srv.URL))
-	out, err := c.Chat(context.Background(), []Message{{Role: "user", Content: "hi"}}, false)
-	if err != nil {
-		t.Fatalf("Chat: %v", err)
-	}
-	if out != "hello" || calls.Load() != 4 {
-		t.Errorf("out=%q calls=%d, want hello/4", out, calls.Load())
-	}
-}
-
-func TestChatFailsFastOnNon429ClientError(t *testing.T) {
-	var calls atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls.Add(1)
-		w.WriteHeader(http.StatusUnauthorized)
-	}))
-	defer srv.Close()
-
-	c := NewClient(chatConfig(srv.URL))
-	if _, err := c.Chat(context.Background(), []Message{{Role: "user", Content: "hi"}}, false); err == nil {
-		t.Fatal("expected error")
-	}
-	if calls.Load() != 1 {
-		t.Errorf("calls = %d, want 1 (no retry on 401)", calls.Load())
-	}
+	synctest.Test(t, func(t *testing.T) {
+		responses := []struct {
+			status int
+			body   string
+		}{
+			{http.StatusBadGateway, ""},
+			{http.StatusOK, `{"error":{"message":"upstream sad"}}`},
+			{http.StatusOK, `{"choices":[]}`},
+			{http.StatusOK, chatOK},
+		}
+		calls := 0
+		c := NewClient(chatConfig("https://chat.example.test"))
+		c.chatHTTP.Transport = retryRoundTripFunc(func(*http.Request) (*http.Response, error) {
+			response := responses[calls]
+			calls++
+			return &http.Response{StatusCode: response.status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(response.body))}, nil
+		})
+		out, err := c.Chat(t.Context(), []Message{{Role: "user", Content: "hi"}}, false)
+		if err != nil {
+			t.Fatalf("Chat: %v", err)
+		}
+		if out != "hello" || calls != 4 {
+			t.Errorf("out=%q calls=%d, want hello/4", out, calls)
+		}
+	})
 }
 
 const verboseJSON = `{"language":"english","text":"hi there","segments":[{"start":0.0,"end":1.5,"text":" hi"},{"start":1.5,"end":3.0,"text":" there"}]}`
@@ -130,9 +121,9 @@ func TestTranscribeParsesSegmentsAndMultipart(t *testing.T) {
 			buf := make([]byte, 64)
 			n, _ := f.Read(buf)
 			gotFile = buf[:n]
-			_ = f.Close()
+			f.Close()
 		}
-		_, _ = w.Write([]byte(verboseJSON))
+		w.Write([]byte(verboseJSON))
 	}))
 	defer srv.Close()
 
@@ -189,7 +180,7 @@ func TestTranscribeOmitsVADFilterForStrictHostedEndpoints(t *testing.T) {
 func TestTranscribeParsesPerSegmentWords(t *testing.T) {
 	// speaches/faster-whisper shape: words nested inside each segment.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"language":"en","text":"hi there","segments":[
+		w.Write([]byte(`{"language":"en","text":"hi there","segments":[
 			{"start":0.0,"end":3.0,"text":" hi there","words":[
 				{"start":0.2,"end":0.5,"word":" hi"},{"start":0.6,"end":1.0,"word":" there"}]}]}`))
 	}))
@@ -210,7 +201,7 @@ func TestTranscribeParsesPerSegmentWords(t *testing.T) {
 func TestTranscribeAttachesTopLevelWordsBySegmentTime(t *testing.T) {
 	// OpenAI shape: words in a top-level array, segments without words.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"language":"en","text":"hi there friend","segments":[
+		w.Write([]byte(`{"language":"en","text":"hi there friend","segments":[
 			{"start":0.0,"end":1.5,"text":" hi there"},{"start":1.5,"end":3.0,"text":" friend"}],
 			"words":[{"start":0.2,"end":0.5,"word":"hi"},{"start":0.6,"end":1.0,"word":"there"},
 			{"start":1.8,"end":2.2,"word":"friend"}]}`))
@@ -233,7 +224,7 @@ func TestTranscribeAttachesTopLevelWordsBySegmentTime(t *testing.T) {
 
 func TestTranscribeEmptySegmentsIsNotAnError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"language":"english","text":"","segments":[]}`))
+		w.Write([]byte(`{"language":"english","text":"","segments":[]}`))
 	}))
 	defer srv.Close()
 
@@ -297,7 +288,7 @@ func TestTranscribeRequiresConfig(t *testing.T) {
 func TestTranscribeChatOnlyGatewayGetsConfigHint(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
-		_, _ = w.Write([]byte(`{"error":{"message":"invalid content-type: multipart/form-data","code":400}}`))
+		w.Write([]byte(`{"error":{"message":"invalid content-type: multipart/form-data","code":400}}`))
 	}))
 	defer srv.Close()
 

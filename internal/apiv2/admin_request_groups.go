@@ -14,8 +14,6 @@ const (
 	opUpdateAdminRequestGroupLimit = "updateAdminRequestGroupLimit"
 )
 
-var adminRequestGroupOperationIDs = []string{opGetAdminRequestGroupLimit, opUpdateAdminRequestGroupLimit}
-
 // adminRequestGroups is the access-group slice of the request service.
 type adminRequestGroups interface {
 	GetGroupLimit(context.Context, mediarequests.Viewer, int64) (*mediarequests.GroupLimit, error)
@@ -136,3 +134,5 @@ func (reg *Registry) updateAdminRequestGroupLimit(ctx context.Context, in *Admin
 	}
 	return &AdminRequestGroupLimitOutput{ETag: adminRequestTag(ctx, "group-limit", string(in.GroupID), r.Revision).String(), Body: adminGroupLimitOf(r)}, nil
 }
+
+var adminRequestGroupOperationIDs = []string{opGetAdminRequestGroupLimit, opUpdateAdminRequestGroupLimit}

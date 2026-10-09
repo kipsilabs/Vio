@@ -253,37 +253,6 @@ func TestPushDeviceFCMTokenHashIsCaseSensitive(t *testing.T) {
 	}
 }
 
-func TestPushDeviceAPNsTokenEncryptionUsesRowAAD(t *testing.T) {
-	cipher := testPushCipher(t)
-	token := strings.Repeat("a", 64)
-	ciphertext, err := cipher.Encrypt(token, pushDeviceAPNsTokenAAD("row-1"))
-	if err != nil {
-		t.Fatalf("encrypt token: %v", err)
-	}
-	if ciphertext == token || strings.Contains(ciphertext, token) {
-		t.Fatalf("ciphertext exposes token: %q", ciphertext)
-	}
-	plaintext, err := cipher.Decrypt(ciphertext, pushDeviceAPNsTokenAAD("row-1"))
-	if err != nil {
-		t.Fatalf("decrypt token: %v", err)
-	}
-	if plaintext != token {
-		t.Fatalf("plaintext = %q, want token", plaintext)
-	}
-	if _, err := cipher.Decrypt(ciphertext, pushDeviceAPNsTokenAAD("row-2")); err == nil {
-		t.Fatalf("decrypt with wrong row AAD succeeded")
-	}
-	if got, want := apnsTokenHash(strings.ToUpper(token)), apnsTokenHash(token); got != want {
-		t.Fatalf("hash should be token-case agnostic: %q != %q", got, want)
-	}
-}
-
-// TestPushProviderMatchesDatabaseConstraint pins that the provider the insert
-// paths write is one the push_devices and push_delivery_attempts provider check
-// constraints accept. A drift here (the rebrand once made it "vio_relay") makes
-// every registration insert fail with SQLSTATE 23514, which the API reports as
-// a 500; normalizePushProvider turns an unknown value into the 400-class
-// ErrPushDeviceUnsupported instead.
 func TestPushProviderMatchesDatabaseConstraint(t *testing.T) {
 	provider, err := normalizePushProvider(PushProviderSiloRelay)
 	if err != nil || provider != PushProviderSiloRelay {
@@ -414,6 +383,15 @@ func TestPushDeviceRepositoryUpsertApplePreservesStableIDs(t *testing.T) {
 	}
 	if plaintext != registration.APNsToken {
 		t.Fatalf("rotated plaintext = %q", plaintext)
+	}
+	if strings.Contains(second.APNsTokenCiphertext, registration.APNsToken) {
+		t.Fatal("stored ciphertext exposes the token")
+	}
+	if _, err := cipher.Decrypt(second.APNsTokenCiphertext, pushDeviceAPNsTokenAAD(second.ID+"-other")); err == nil {
+		t.Fatal("stored token decrypted with another row's AAD")
+	}
+	if apnsTokenHash(strings.ToUpper(registration.APNsToken)) != second.APNsTokenHash {
+		t.Fatal("APNs token hash must ignore token case")
 	}
 	if !second.Enabled || second.PushMode != PushModeInAppOnly {
 		t.Fatalf("upsert did not re-enable/update mode: %+v", second)

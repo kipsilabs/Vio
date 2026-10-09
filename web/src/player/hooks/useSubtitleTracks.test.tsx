@@ -1,8 +1,8 @@
-import type { RefObject } from "react";
 import { act, renderHook, waitFor } from "@testing-library/react";
+import type { RefObject } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { useSubtitleTracks } from "./useSubtitleTracks";
 import type { PlayerSubtitleInfo } from "../types";
+import { useSubtitleTracks } from "./useSubtitleTracks";
 
 // jsdom implements neither addTextTrack nor VTTCue; provide minimal fakes
 // that keep the shapes the hook relies on (cues list, add/removeCue,
@@ -304,6 +304,55 @@ describe("useSubtitleTracks", () => {
     await waitFor(() => expect(createdTracks[1]!.cues.map((c) => c.text)).toEqual(["new"]));
     expect(createdTracks[1]!.cues[0]!.startTime).toBeCloseTo(12.3);
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps the current cues on screen while retimed ones load", async () => {
+    let answer: (value: unknown) => void = () => {};
+    fetchMock
+      .mockResolvedValueOnce(vttResponse("WEBVTT\n\n00:00:10.000 --> 00:00:12.000\nold\n\n"))
+      .mockReturnValueOnce(
+        new Promise((resolve) => {
+          answer = resolve;
+        }),
+      );
+    const states: string[] = [];
+    const videoRef = makeVideoRef(1);
+    const { rerender } = renderHook(
+      ({ revision }) =>
+        useSubtitleTracks(
+          videoRef,
+          [srtTrack],
+          1,
+          0,
+          0,
+          { current: 7200 },
+          { current: 0 },
+          undefined,
+          null,
+          0,
+          (state) => states.push(state),
+          undefined,
+          0,
+          revision,
+        ),
+      { initialProps: { revision: 0 } },
+    );
+    await waitFor(() => expect(createdTracks[0]?.cues.map((c) => c.text)).toEqual(["old"]));
+    states.length = 0;
+
+    rerender({ revision: 1 });
+    await waitFor(() => expect(createdTracks).toHaveLength(2));
+    // The retimed track starts with the old cues: nothing blinks, and the
+    // reload is not announced as loading.
+    expect(createdTracks[1]!.cues.map((c) => c.text)).toEqual(["old"]);
+    expect(states).toEqual(["refreshing"]);
+
+    await act(async () => {
+      answer(vttResponse("WEBVTT\n\n00:00:12.300 --> 00:00:14.300\nnew\n\n"));
+    });
+    await waitFor(() => expect(createdTracks[1]!.cues.map((c) => c.text)).toEqual(["new"]));
+    expect(states.at(-1)).toBe("ready");
+    expect(states).not.toContain("loading");
   });
 
   it("deduplicates restored cues newly visible after the origin moves backward", async () => {

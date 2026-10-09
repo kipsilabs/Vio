@@ -128,8 +128,6 @@ const (
 	opDeleteWatchlistTitle = "deleteWatchlistTitle"
 )
 
-var watchlistTitleOperationIDs = []string{opListWatchlistTitles, opAddWatchlistTitle, opDeleteWatchlistTitle}
-
 func registerWatchlistTitles(reg *Registry) {
 	cursors := NewCursors(reg.deps.CursorSecret)
 
@@ -446,3 +444,5 @@ func (reg *Registry) markInWatchlist(ctx context.Context, marks []watchlistMark)
 		*m.in = onTitles[watchlist.TitleKey{MediaType: m.mediaType, TMDBID: m.tmdbID}] || (m.itemID != "" && onItems[m.itemID])
 	}
 }
+
+var watchlistTitleOperationIDs = []string{opListWatchlistTitles, opAddWatchlistTitle, opDeleteWatchlistTitle}

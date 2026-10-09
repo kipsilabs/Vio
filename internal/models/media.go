@@ -168,6 +168,7 @@ type MediaFile struct {
 	// probed before a probe-shape change are re-probed once instead of being
 	// served forever with the legacy shape.
 	ProbeVersion     int
+	ProbeFailedAt    *time.Time // last local ffprobe rejected the file; cleared by a successful probe (see ProbeRejected)
 	MatchAttemptedAt *time.Time
 	MissingSince     *time.Time
 	// FailedAt marks a virtual candidate that produced no bytes at
@@ -343,6 +344,20 @@ func (f *MediaFile) AudioOnlyProbeFacts() AudioOnlyProbeFacts {
 // audio evidence keep genuine MJPEG video from being normalized away.
 func (f *MediaFile) HasLegacyAttachedPictureVideo() bool {
 	return f.AudioOnlyProbeFacts().HasLegacyAttachedPictureVideo()
+}
+
+// ProbeRejected reports whether ffprobe rejected this file and no usable
+// stream metadata exists for it: no successful probe has been recorded and
+// nothing describes a video or audio stream. Such a file cannot be played until
+// it is replaced, as opposed to a file that has simply not been probed yet.
+// Rows that still carry stream metadata from an earlier probe or an import are
+// not rejected, so a transient probe failure never hides a known-good source.
+func (f *MediaFile) ProbeRejected() bool {
+	if f == nil || f.ProbeFailedAt == nil || f.ProbeUpdatedAt != nil {
+		return false
+	}
+	return strings.TrimSpace(f.CodecVideo) == "" && strings.TrimSpace(f.CodecAudio) == "" &&
+		len(f.VideoTracks) == 0 && len(f.AudioTracks) == 0
 }
 
 // IsAudioOnly reports whether a probed file carries no playable video stream —
@@ -544,6 +559,8 @@ const (
 	PersonKindComposer  PersonKind = 6
 	PersonKindAuthor    PersonKind = 7
 	PersonKindNarrator  PersonKind = 8
+	// PersonKindCreator credits a series' creators, who are not its directors.
+	PersonKindCreator PersonKind = 9
 )
 
 // String returns the Jellyfin-compatible type string for this PersonKind.
@@ -565,6 +582,8 @@ func (k PersonKind) String() string {
 		return "Author"
 	case PersonKindNarrator:
 		return "Narrator"
+	case PersonKindCreator:
+		return "Creator"
 	default:
 		return "Unknown"
 	}
@@ -575,6 +594,8 @@ func PersonKindFromJob(job string) PersonKind {
 	switch strings.ToLower(strings.TrimSpace(job)) {
 	case "director":
 		return PersonKindDirector
+	case "creator":
+		return PersonKindCreator
 	case "writer", "screenplay", "story", "novel":
 		return PersonKindWriter
 	case "composer", "original music composer", "music":

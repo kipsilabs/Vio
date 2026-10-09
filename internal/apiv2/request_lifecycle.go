@@ -600,8 +600,6 @@ func watchProviderSyncRunOf(s watchsync.SyncRun) WatchProviderSyncRun {
 	}
 }
 
-var requestLifecycleOperationIDs = []string{"getRequestStatus", "cancelRequest", "listWatchProviders", opGetWatchProviderConnection, opGetWatchProviderSettings, opUpdateWatchProviderConnection, "deleteWatchProviderConnection", "startWatchProviderDeviceAuth", "pollWatchProviderDeviceAuth", "connectWatchProviderAPIKey", "triggerWatchProviderSync", "listWatchProviderSyncRuns"}
-
 // WatchProviderSummary shares configuration forms with plugin administration.
 type WatchProviderSummary struct {
 	Key                    string                    `json:"key"`
@@ -609,3 +607,5 @@ type WatchProviderSummary struct {
 	Capabilities           WatchProviderCapabilities `json:"capabilities"`
 	ConnectionConfigSchema []AdminPluginConfigSchema `json:"connection_config_schema,omitempty"`
 }
+
+var requestLifecycleOperationIDs = []string{"getRequestStatus", "cancelRequest", "listWatchProviders", opGetWatchProviderConnection, opGetWatchProviderSettings, opUpdateWatchProviderConnection, "deleteWatchProviderConnection", "startWatchProviderDeviceAuth", "pollWatchProviderDeviceAuth", "connectWatchProviderAPIKey", "triggerWatchProviderSync", "listWatchProviderSyncRuns"}

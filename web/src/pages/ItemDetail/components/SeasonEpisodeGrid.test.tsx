@@ -35,31 +35,45 @@ describe("SeasonEpisodeGrid", () => {
     capturedMenuProps.length = 0;
   });
 
-  it("enables the watched shortcut on episode cards", () => {
+  it("marks an episode only when none of its files can be read", () => {
+    const file = {
+      resolution: "",
+      codec_video: "",
+      hdr: false,
+      audio_channels: 0,
+      container: "",
+      file_size: 0,
+    };
+    const episode = (id: string, number: number, files: object[]) => ({
+      content_id: id,
+      season_number: 1,
+      episode_number: number,
+      title: `Episode title ${number}`,
+      overview: "",
+      air_date: null,
+      runtime: 0,
+      still_url: "",
+      still_thumbhash: "",
+      files: files as never,
+    });
     render(
       <MemoryRouter>
         <SeasonEpisodeGrid
           isLoading={false}
           episodes={[
-            {
-              content_id: "ep-1",
-              season_number: 1,
-              episode_number: 1,
-              title: "Pilot",
-              overview: "A beginning.",
-              air_date: null,
-              runtime: 42,
-              still_url: "",
-              still_thumbhash: "",
-              files: [],
-            },
+            episode("ep-3", 3, [{ ...file, file_id: 3, unreadable: true }]),
+            episode("ep-4", 4, [
+              { ...file, file_id: 4, unreadable: true },
+              { ...file, file_id: 5, resolution: "1080p" },
+            ]),
+            episode("ep-5", 5, [{ ...file, file_id: 6, resolution: "1080p" }]),
           ]}
         />
       </MemoryRouter>,
     );
 
     expect(capturedMenuProps[0]).toMatchObject({
-      contentId: "ep-1",
+      contentId: "ep-3",
       mediaType: "episode",
       userState: {
         played: false,
@@ -71,6 +85,13 @@ describe("SeasonEpisodeGrid", () => {
       hasPartialProgress: false,
       quickActionMode: "watched",
     });
+
+    // Only episode 3 has no readable version; episode 4 still plays its
+    // second file.
+    expect(screen.getAllByText("Damaged file")).toHaveLength(1);
+    const card = screen.getByText("Episode title 3").closest(".media-card");
+    expect(card).not.toBeNull();
+    expect(card).toHaveTextContent("Damaged file");
   });
 
   it("places the watched circle-check beside the episode label instead of over the artwork", () => {

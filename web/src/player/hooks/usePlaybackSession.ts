@@ -4,11 +4,13 @@ import type { PlayerConfig } from "../context/PlayerConfigContext";
 import { startPlaybackV2 } from "../start-v2";
 import { hasSequencedProgress, stopSequencedSession } from "../session-mutations";
 import {
+  CONNECTION_LOST_ERROR,
   describePlanTerminal,
   describePlaybackTransportError,
   isDeadPlaybackSessionError,
   type PlaybackPolicyErrorDescription,
 } from "../playback-errors";
+import { isTransientPlayerRequestError, PlayerFetchError } from "../player-fetch";
 import { useCodecDetection } from "./useCodecDetection";
 import {
   buildClientCapabilitiesV3,
@@ -144,7 +146,79 @@ interface PlaybackSessionState {
   retrying: boolean;
   initialSubtitleErrorTitle: string | null;
   initialSubtitleError: string | null;
+  /**
+   * Whether a stream that already played is connected to the server.
+   * `reconnecting` while the player retries after a mid-stream drop, `lost`
+   * once it gave up; `connectionError` then says why.
+   */
+  connectionStatus: PlaybackConnectionStatus;
+  connectionErrorTitle: string | null;
+  connectionError: string | null;
 }
+
+export type PlaybackConnectionStatus = "connected" | "reconnecting" | "lost";
+
+// Mid-stream reconnect backoff: 1s, 2s, 4s, 8s, then every 15s, for about two
+// and a quarter minutes in total before the player gives up and asks the
+// viewer. A cycle that starts within RECONNECT_STABLE_MS of the previous one
+// recovering continues that cycle's budget, so a server that answers the API
+// but drops every stream cannot keep the player retrying forever.
+export const RECONNECT_BASE_DELAY_MS = 1_000;
+export const RECONNECT_MAX_DELAY_MS = 15_000;
+export const RECONNECT_MAX_ATTEMPTS = 12;
+const RECONNECT_STABLE_MS = 30_000;
+
+/** Delay before reconnect attempt `attempt` (0-based). */
+export function reconnectDelayMs(attempt: number): number {
+  return Math.min(RECONNECT_MAX_DELAY_MS, RECONNECT_BASE_DELAY_MS * 2 ** Math.max(0, attempt));
+}
+
+/**
+ * Whether a failed reconnect request is worth repeating later: the server was
+ * unreachable or overloaded, or it asked for a retry. Anything else is its
+ * considered answer.
+ *
+ * `installation_changed` differs by step. A replan always carries the old
+ * session's installation, so repeating it cannot succeed; it falls through to
+ * a fresh start instead. A refused start has already dropped the cached
+ * capabilities, so the next start reads the new installation and can succeed.
+ */
+function isRetryableReconnectError(error: unknown, step: "replan" | "start"): boolean {
+  if (isTransientPlayerRequestError(error)) return true;
+  return (
+    error instanceof PlayerFetchError &&
+    (error.status === 408 ||
+      error.status === 429 ||
+      error.code === "replan_in_progress" ||
+      (step === "start" && error.code === "installation_changed"))
+  );
+}
+
+/**
+ * The tracks a reconnect's fresh start asks for: the ones the lost plan was
+ * playing. A burned-in subtitle is flagged so a refusal falls back to playing
+ * without it, as the initial start does for bitmap tracks.
+ */
+function reconnectTrackSelection(plan: PlanV3): {
+  audioIndex?: number;
+  subtitleIndex?: number;
+  subtitleBurnIn: boolean;
+} {
+  const subtitleIndex = plan.selected_tracks.subtitle?.index;
+  const subtitleBurnIn =
+    subtitleIndex !== undefined &&
+    (plan.subtitle.mode === "burn_in" ||
+      plan.subtitle.inventory.some(
+        (item) => item.combined_index === subtitleIndex && item.delivery === "burn_in_only",
+      ));
+  return { audioIndex: plan.selected_tracks.audio?.index, subtitleIndex, subtitleBurnIn };
+}
+
+type LoadSessionOutcome =
+  | { kind: "adopted" }
+  | { kind: "refused"; failure: PlaybackSessionErrorState }
+  | { kind: "failed"; error: unknown }
+  | { kind: "superseded" };
 
 interface PlaybackSessionErrorState {
   title: string;
@@ -466,6 +540,18 @@ export interface UsePlaybackSessionResult extends PlaybackSessionState {
    * non-failure `track_change` for the default-audio reconciliation reason.
    * Resolves to whether a replacement plan is now playing; the caller reports
    * that back as the command's result.
+   *
+   * A stream that already played lost its connection to the server. Retries
+   * with backoff until the server answers, then resumes at `positionSeconds`,
+   * playing again only when `resume` is set.
+   */
+  recoverConnection: (positionSeconds: number, resume: boolean) => void;
+  /** Starts a fresh reconnect cycle after the previous one gave up. */
+  retryConnection: () => void;
+  /**
+   * `failure_recovery` replan for a plan the *server* invalidated over the
+   * realtime `plan_invalidated` command. Resolves to whether a replacement plan
+   * is now playing; the caller reports that back as the command's result.
    */
   invalidatePlan: (planId: string, reason: string, currentPosition: number) => Promise<boolean>;
   /**
@@ -590,6 +676,7 @@ function mapSubtitleInventory(
     source: subtitleSourceOf(item.source),
     forced: item.forced,
     hearing_impaired: item.hearing_impaired,
+    sync_key: item.sync_key,
     url: item.url ? buildPlayerStreamUrl(config.apiBaseUrl, item.url, token) : "",
     font_bundle_url: item.font_bundle_url
       ? buildPlayerStreamUrl(config.apiBaseUrl, item.font_bundle_url, token)
@@ -723,6 +810,10 @@ function planToSessionState(
     retrying: false,
     initialSubtitleErrorTitle: null,
     initialSubtitleError: null,
+    // A plan was just handed out, so the server is reachable.
+    connectionStatus: "connected",
+    connectionErrorTitle: null,
+    connectionError: null,
   };
 }
 
@@ -746,8 +837,9 @@ function describeDecisionWithoutPlan(decision: DecisionResponseV3): PlaybackSess
 function describePlaybackSessionError(
   error: unknown,
   fallbackMessage: string,
+  phase: "start" | "update" = "start",
 ): PlaybackSessionErrorState {
-  const transportError = describePlaybackTransportError(error);
+  const transportError = describePlaybackTransportError(error, phase);
   if (transportError) {
     return transportError;
   }
@@ -838,6 +930,9 @@ export function usePlaybackSession(
     retrying: false,
     initialSubtitleErrorTitle: null,
     initialSubtitleError: null,
+    connectionStatus: "connected",
+    connectionErrorTitle: null,
+    connectionError: null,
   });
 
   const sessionIdRef = useRef<string | null>(null);
@@ -895,6 +990,12 @@ export function usePlaybackSession(
   const awaitingInitialPlayerPositionRef = useRef(false);
   const playbackPlayingRef = useRef(true);
   const playbackStartedRef = useRef(false);
+  // Whether the viewer means playback to run, as of the current plan. Until
+  // that plan's transport shows a frame, the reported transport state is the
+  // teardown of the old one or a startup that never got going, so the intent
+  // is the one the plan was adopted with.
+  const planAutoPlayRef = useRef(true);
+  const planTransportShownRef = useRef(false);
   const switchingRef = useRef(false);
   // Mirrors state.autoFallback so callbacks can read the armed state without
   // depending on the rendered value.
@@ -1011,7 +1112,11 @@ export function usePlaybackSession(
     mediaFileId: number | null;
   } | null>(null);
   const issueReplanRef = useRef<
-    (options: ReplanOptions, retireSessionOnRefusal?: boolean) => Promise<boolean>
+    (
+      options: ReplanOptions,
+      retireSessionOnRefusal?: boolean,
+      reconnect?: boolean,
+    ) => Promise<boolean>
   >(async () => false);
   // Latest-wins target for a reanchor dropped while a version switch owned the
   // session. The switch completion replays it against the settled plan so a
@@ -1027,6 +1132,22 @@ export function usePlaybackSession(
   // an effect — render-time ref writes are unsafe under concurrent React.
   const reanchorSeekRef = useRef<(positionSeconds: number) => Promise<boolean>>(async () => false);
   const qualityRef = useRef(qualityPreference?.trim() || "auto");
+  // The running mid-stream reconnect, if any. `generation` invalidates the
+  // timer and any request of a cycle that has ended, so nothing it started can
+  // act after the viewer left, a new start took over, or a plan was adopted.
+  const reconnectRef = useRef({
+    active: false,
+    generation: 0,
+    attempts: 0,
+    positionSeconds: 0,
+    resume: true,
+    timer: null as ReturnType<typeof setTimeout> | null,
+    recoveredAt: Number.NEGATIVE_INFINITY,
+  });
+  const runReconnectAttemptRef = useRef<(generation: number) => Promise<void>>(async () => {});
+  const beginReconnectRef = useRef<
+    (positionSeconds: number, resume: boolean, freshBudget: boolean) => void
+  >(() => {});
 
   useEffect(() => {
     stateRef.current = state;
@@ -1099,6 +1220,23 @@ export function usePlaybackSession(
       pendingSeekRef.current = null;
     }
     return scope;
+  }, []);
+
+  /**
+   * Ends the running reconnect cycle, if any. `recovered` records when a cycle
+   * got a plan back, so a stream that drops again right away continues that
+   * cycle's backoff and budget rather than starting over.
+   */
+  const endReconnect = useCallback((recovered: boolean) => {
+    const reconnect = reconnectRef.current;
+    if (!reconnect.active) return;
+    reconnect.active = false;
+    reconnect.generation += 1;
+    if (reconnect.timer !== null) {
+      clearTimeout(reconnect.timer);
+      reconnect.timer = null;
+    }
+    if (recovered) reconnect.recoveredAt = Date.now();
   }, []);
 
   const beginAdoption = useCallback((loadSequence: number) => {
@@ -1212,6 +1350,14 @@ export function usePlaybackSession(
       }
 
       const prevPlan = planRef.current;
+      // Any adopted plan proves the server is reachable and replaces the
+      // transport, so it also ends a reconnect in progress. The new transport
+      // plays only if the viewer was playing when the connection dropped; the
+      // element has been paused since, so its reported state says nothing.
+      if (reconnectRef.current.active) playbackPlayingRef.current = reconnectRef.current.resume;
+      planAutoPlayRef.current = playbackPlayingRef.current;
+      planTransportShownRef.current = false;
+      endReconnect(true);
       const sessionId = plan.session_id ?? decision.session_id ?? sessionIdRef.current;
       planAttemptIdRef.current = randomUUID();
       planRef.current = plan;
@@ -1280,7 +1426,7 @@ export function usePlaybackSession(
       reportEvent("plan_selected");
       return true;
     },
-    [config, reportEvent, transitionSourceIdentity],
+    [config, endReconnect, reportEvent, transitionSourceIdentity],
   );
 
   const requestStart = useCallback(
@@ -1293,6 +1439,7 @@ export function usePlaybackSession(
       carriedAudioTrackID: string | null,
       fileSelection: "auto" | "explicit",
       forceRelink?: boolean,
+      audioTrackIndex: number | null | undefined = explicitAudioTrackIndex,
     ): Promise<DecisionResponseV3> => {
       const body: StartRequestWithForceRelinkV3 = buildStartRequestV3({
         extraClientFeatures: VIDEO_CLIENT_FEATURES_V3,
@@ -1305,8 +1452,10 @@ export function usePlaybackSession(
         forceStartPosition,
         // A carried audio track (version switch) names the file-bound identity
         // explicitly; the mount-time ordinal is meaningless for the new file
-        // and must not be sent alongside it.
-        explicitAudioTrackIndex: carriedAudioTrackID ? null : explicitAudioTrackIndex,
+        // and must not be sent alongside it. An explicit per-call ordinal
+        // overrides the mount-time default when no carried identity is given.
+        explicitAudioTrackIndex:
+          carriedAudioTrackID != null ? null : (audioTrackIndex ?? explicitAudioTrackIndex),
         carriedAudioTrackID,
         fileSelection,
         forceRelink,
@@ -1417,6 +1566,8 @@ export function usePlaybackSession(
       fileSelection,
       forceRelink,
       intentAt,
+      reconnect = false,
+      tracks,
     }: {
       preferredFileId?: number;
       position: number;
@@ -1441,7 +1592,20 @@ export function usePlaybackSession(
       forceRelink?: boolean;
       /** When the viewer asked for this start, for its first_frame_ms. */
       intentAt: number | null;
-    }) => {
+      /** The start is a reconnect attempt, which must not cancel itself. */
+      reconnect?: boolean;
+      /**
+       * Track selection to start with instead of the initial request's, so a
+       * restarted session keeps what the viewer picked during playback. An
+       * absent `subtitleIndex` is an explicit "subtitles off": a start that
+       * names no subtitle track plays without one. `subtitleBurnIn` marks a
+       * track the server has to burn in, which gets the same retry without
+       * subtitles as a bitmap track at the initial start when it is refused.
+       */
+      tracks?: { audioIndex?: number; subtitleIndex?: number; subtitleBurnIn?: boolean };
+    }): Promise<LoadSessionOutcome> => {
+      // Any other start supersedes a running reconnect: it owns the session now.
+      if (!reconnect) endReconnect(false);
       const previousState = stateRef.current;
       const previousSessionId = sessionIdRef.current;
       // The session id comes from the ref, not the (possibly stale) state
@@ -1475,6 +1639,13 @@ export function usePlaybackSession(
         errorRetryable: hasExistingSession ? current.errorRetryable : false,
         initialSubtitleErrorTitle: hasExistingSession ? current.initialSubtitleErrorTitle : null,
         initialSubtitleError: hasExistingSession ? current.initialSubtitleError : null,
+        ...(reconnect
+          ? {}
+          : {
+              connectionStatus: "connected" as const,
+              connectionErrorTitle: null,
+              connectionError: null,
+            }),
       }));
 
       // A start begins a new attempt chain: fresh attempt id, empty loop guard.
@@ -1541,15 +1712,17 @@ export function usePlaybackSession(
             ? (carriedSubtitleTrackIndex ?? undefined)
             : initialSubtitleTrackIndexByFileId?.[selectedFileId];
 
+        const startAudioTrackIndex = tracks ? tracks.audioIndex : explicitAudioTrackIndex;
         const decision = await requestStart(
           selectedFileId,
           position,
           forceStartPosition,
           playbackAttemptId,
-          targetSubtitleIndex,
+          tracks ? tracks.subtitleIndex : targetSubtitleIndex,
           carriedAudioTrackId ?? null,
           fileSelection ?? "auto",
           forceRelink,
+          startAudioTrackIndex,
         );
 
         if (loadSequence !== loadSequenceRef.current) {
@@ -1559,7 +1732,7 @@ export function usePlaybackSession(
               // Best effort cleanup for stale session starts.
             });
           }
-          return;
+          return { kind: "superseded" };
         }
 
         let decisionToAdopt = decision;
@@ -1576,8 +1749,16 @@ export function usePlaybackSession(
         const requestedIsBitmap = requestedTrack?.codec
           ? isBitmapCodec(requestedTrack.codec)
           : false;
+        // Upstream's per-file bitmap fallback covers tracks the carried
+        // selection does not name.
+        const bitmapSubtitleTrackIndex = tracks
+          ? tracks.subtitleBurnIn
+            ? tracks.subtitleIndex
+            : undefined
+          : initialBitmapSubtitleTrackIndexByFileId?.[selectedFileId];
         const hasBitmapSubtitle =
           requestedIsBitmap ||
+          bitmapSubtitleTrackIndex !== undefined ||
           (carriedSubtitleTrackIndex === undefined &&
             initialBitmapSubtitleTrackIndexByFileId?.[selectedFileId] !== undefined);
         if (!decision.playback_plan && hasBitmapSubtitle) {
@@ -1603,6 +1784,7 @@ export function usePlaybackSession(
             carriedAudioTrackId ?? null,
             fileSelection ?? "auto",
             forceRelink,
+            startAudioTrackIndex,
           );
           if (!decisionToAdopt.playback_plan) {
             initialSubtitleFailure = null;
@@ -1620,7 +1802,7 @@ export function usePlaybackSession(
               // Best effort cleanup for a superseded start/replan chain.
             });
           }
-          return;
+          return { kind: "superseded" };
         }
 
         const adopted = adoptDecision(decisionToAdopt, initialSubtitleFailure);
@@ -1644,20 +1826,21 @@ export function usePlaybackSession(
             errorReason: previousState.errorReason,
             errorRetryable: previousState.errorRetryable,
           }));
-          return;
+          return { kind: "refused", failure: describeDecisionWithoutPlan(decisionToAdopt) };
         }
         if (!adopted) {
           retirePreviousSession();
-          return;
+          return { kind: "refused", failure: describeDecisionWithoutPlan(decisionToAdopt) };
         }
         if (adopted && previousSessionId && previousSessionId !== sessionIdRef.current) {
           void stopSession(previousSessionId).catch(() => {
             // Best effort — stale session will time out server-side.
           });
         }
+        return { kind: "adopted" };
       } catch (err) {
         if (loadSequence !== loadSequenceRef.current) {
-          return;
+          return { kind: "superseded" };
         }
 
         if (hasExistingSession && allowPreserveExistingSessionOnError) {
@@ -1671,11 +1854,12 @@ export function usePlaybackSession(
             replanningQuality: false,
             pendingSwitchFileId: null,
           }));
-          return;
+          return { kind: "failed", error: err };
         }
 
         const nextError = describePlaybackSessionError(err, initialErrorMessage);
         retirePreviousSession(nextError);
+        return { kind: "failed", error: err };
       } finally {
         endAdoption(loadSequence);
         // A push deferred while this start/replan owned the session has waited
@@ -1688,6 +1872,8 @@ export function usePlaybackSession(
       adoptDecision,
       beginAdoption,
       endAdoption,
+      endReconnect,
+      explicitAudioTrackIndex,
       initialBitmapSubtitleTrackIndexByFileId,
       initialSubtitleTrackIndexByFileId,
       requestStart,
@@ -1696,6 +1882,8 @@ export function usePlaybackSession(
       transitionSourceIdentity,
     ],
   );
+  const loadSessionRef = useRef(loadSession);
+  loadSessionRef.current = loadSession;
 
   useEffect(() => {
     if (!capabilitiesSettled) return;
@@ -1768,6 +1956,8 @@ export function usePlaybackSession(
       // instead of adopting it into an abandoned player.
       loadSequenceRef.current += 1;
       pendingSeekRef.current = null;
+      // A viewer who leaves while the player reconnects stops the retries.
+      endReconnect(false);
       const sid = sessionIdRef.current;
       if (!sid) return;
       // sendBeacon doesn't support DELETE, so the stop uses fetch keepalive.
@@ -1775,7 +1965,7 @@ export function usePlaybackSession(
         // Best effort: the session expires server-side.
       });
     };
-  }, [config]);
+  }, [config, endReconnect]);
 
   /**
    * Issues one replan and adopts whatever plan comes back.
@@ -1783,11 +1973,16 @@ export function usePlaybackSession(
    * Replans are serialized server-side behind a lease, so a second concurrent
    * request would earn a `409 replan_in_progress`; the in-flight guard here
    * means the client never asks for one.
+   *
+   * A `reconnect` replan is a reconnect attempt: a refusal is not adopted (the
+   * caller falls back to a fresh start) and a failed request is rethrown for
+   * the caller to classify instead of being surfaced as an error.
    */
   const replan = useCallback(
     async function issueReplan(
       options: ReplanOptions,
       retireSessionOnRefusal = false,
+      reconnect = false,
     ): Promise<boolean> {
       const plan = planRef.current;
       // Stamp the load sequence with the plan, at the same read. A version
@@ -1917,6 +2112,11 @@ export function usePlaybackSession(
         clientPlaybackContext,
       });
 
+      // Sampled now, not when the request fails: a transport that failed is
+      // torn down, and the pause that forces is not the viewer's.
+      const playIntent = planTransportShownRef.current
+        ? playbackPlayingRef.current
+        : planAutoPlayRef.current;
       replanInFlightRef.current = true;
       beginAdoption(loadSequence);
       const isQualityReplan =
@@ -1945,6 +2145,8 @@ export function usePlaybackSession(
           attemptedPlanKeysRef.current = [];
           attemptCountRef.current = 1;
         }
+
+        if (reconnect && !decision.playback_plan) return false;
 
         // Keep a refused-start subtitle pinned off across unrelated replans.
         // A successful explicit subtitle choice is the one action that clears
@@ -1981,6 +2183,9 @@ export function usePlaybackSession(
         // it answers the same way. Retire it and rebuild once from the position
         // and selections the dead plan held, so the viewer keeps watching
         // instead of being pinned to a session that no longer exists.
+        // A reconnect-mode replan rethrows so the reconnect cycle — not the
+        // error banner — owns the failure.
+        if (reconnect) throw err;
         const deadSession = isDeadPlaybackSessionError(err);
         if (deadSession && recoveredDeadSessionRef.current !== sessionId) {
           recoveredDeadSessionRef.current = sessionId;
@@ -2022,7 +2227,18 @@ export function usePlaybackSession(
           console.error("Failed to refresh playback output", err);
           return false;
         }
-        const nextError = describePlaybackSessionError(err, "Failed to update playback");
+        if (
+          isFailureRecovery &&
+          playbackStartedRef.current &&
+          isRetryableReconnectError(err, "replan")
+        ) {
+          // The stream broke and the server could not be reached to replace
+          // it: the connection failed, not necessarily the route. Reconnect
+          // rather than strand the viewer on an error.
+          beginReconnectRef.current(options.positionSeconds, playIntent, false);
+          return false;
+        }
+        const nextError = describePlaybackSessionError(err, "Failed to update playback", "update");
         setState((current) => ({
           ...current,
           replanning: false,
@@ -2219,6 +2435,9 @@ export function usePlaybackSession(
 
   const recoverFromFailure = useCallback(
     (failure: FailureV3, currentPosition: number) => {
+      // While the server is unreachable a transport failure says nothing about
+      // the route; the reconnect replaces the transport anyway.
+      if (reconnectRef.current.active) return;
       reportEvent("plan_failed", {
         failureClassification: failure.classification,
         ...(failure.message ? { diagnostics: { message: failure.message } } : {}),
@@ -2227,6 +2446,167 @@ export function usePlaybackSession(
     },
     [replan, reportEvent],
   );
+
+  // -- Mid-stream reconnect --
+  //
+  // A stream that already played and then lost the server has not failed its
+  // route, so this deliberately avoids `failure_recovery`, which would exclude
+  // the route and could push a direct-play viewer onto a transcode. Each
+  // attempt first asks for the current route again with a `track_change` that
+  // changes nothing (the server keeps the route eligible and answers with a
+  // fresh plan at the saved position). If the session did not survive — a
+  // server restart answers 404 — it starts a new session at the same position
+  // with the same tracks. Unreachable or overloaded answers back off; any
+  // adopted plan ends the cycle; the viewer leaving or another start cancels
+  // it.
+
+  const scheduleReconnectAttempt = useCallback((delayMs: number) => {
+    const reconnect = reconnectRef.current;
+    if (reconnect.timer !== null) clearTimeout(reconnect.timer);
+    const generation = reconnect.generation;
+    reconnect.timer = setTimeout(() => {
+      reconnect.timer = null;
+      void runReconnectAttemptRef.current(generation);
+    }, delayMs);
+  }, []);
+
+  const giveUpReconnect = useCallback(
+    (failure: PlaybackSessionErrorState) => {
+      endReconnect(false);
+      setState((current) => ({
+        ...current,
+        replacing: false,
+        replanning: false,
+        connectionStatus: "lost",
+        connectionErrorTitle: failure.title,
+        connectionError: failure.message,
+      }));
+    },
+    [endReconnect],
+  );
+
+  const beginReconnect = useCallback(
+    (positionSeconds: number, resume: boolean, freshBudget: boolean) => {
+      const reconnect = reconnectRef.current;
+      if (reconnect.active) return;
+      reconnect.active = true;
+      reconnect.generation += 1;
+      if (freshBudget || Date.now() - reconnect.recoveredAt >= RECONNECT_STABLE_MS) {
+        reconnect.attempts = 0;
+      }
+      reconnect.positionSeconds = Math.max(0, positionSeconds);
+      reconnect.resume = resume;
+      if (reconnect.attempts >= RECONNECT_MAX_ATTEMPTS) {
+        // The stream keeps dropping right after every recovery.
+        giveUpReconnect(CONNECTION_LOST_ERROR);
+        return;
+      }
+      setState((current) => ({
+        ...current,
+        connectionStatus: "reconnecting",
+        connectionErrorTitle: null,
+        connectionError: null,
+      }));
+      scheduleReconnectAttempt(freshBudget ? 0 : reconnectDelayMs(reconnect.attempts));
+    },
+    [giveUpReconnect, scheduleReconnectAttempt],
+  );
+  beginReconnectRef.current = beginReconnect;
+
+  runReconnectAttemptRef.current = async (generation: number) => {
+    const reconnect = reconnectRef.current;
+    const isCurrent = () => reconnect.active && reconnect.generation === generation;
+    if (!isCurrent()) return;
+    // One request at a time: a start or replan already talking to the server
+    // for this session decides first; check again once it has settled.
+    if (replanInFlightRef.current || adoptionsInFlightRef.current.has(loadSequenceRef.current)) {
+      scheduleReconnectAttempt(RECONNECT_BASE_DELAY_MS);
+      return;
+    }
+    reconnect.attempts += 1;
+    const retryLater = () => {
+      if (reconnect.attempts >= RECONNECT_MAX_ATTEMPTS) {
+        giveUpReconnect(CONNECTION_LOST_ERROR);
+        return;
+      }
+      scheduleReconnectAttempt(reconnectDelayMs(reconnect.attempts));
+    };
+    const positionSeconds = reconnect.positionSeconds;
+
+    if (planRef.current && sessionIdRef.current) {
+      try {
+        const adopted = await issueReplanRef.current(
+          { operation: "track_change", positionSeconds },
+          false,
+          true,
+        );
+        // An adopted plan has already ended the cycle.
+        if (adopted || !isCurrent()) return;
+      } catch (error) {
+        if (!isCurrent()) return;
+        if (isRetryableReconnectError(error, "replan")) {
+          retryLater();
+          return;
+        }
+        // Any other answer means the session is gone (a restart, an expiry);
+        // a fresh start at the same position is the authoritative check.
+      }
+    }
+
+    const plan = planRef.current;
+    const outcome = await loadSessionRef.current({
+      preferredFileId: plan?.effective_media_file_id ?? stateRef.current.mediaFileId ?? undefined,
+      position: positionSeconds,
+      forceStartPosition: true,
+      allowPreserveExistingSessionOnError: true,
+      replacementErrorMessage: "Failed to restart playback after the connection was lost",
+      initialErrorMessage: "Failed to restart playback",
+      intentAt: null,
+      reconnect: true,
+      // The plan's selection is the viewer's: the player replans every
+      // subtitle pick, sidecar or burned in, so the server's copy stays in
+      // step with what is on screen. No subtitle there means subtitles off.
+      tracks: plan ? reconnectTrackSelection(plan) : undefined,
+    });
+    if (!isCurrent()) return;
+    if (outcome.kind === "failed") {
+      if (isRetryableReconnectError(outcome.error, "start")) {
+        retryLater();
+        return;
+      }
+      giveUpReconnect(describePlaybackSessionError(outcome.error, CONNECTION_LOST_ERROR.message));
+      return;
+    }
+    if (outcome.kind === "refused") {
+      giveUpReconnect(outcome.failure);
+    }
+  };
+
+  const recoverConnection = useCallback(
+    (positionSeconds: number, resume: boolean) => {
+      // Only a stream that exists can lose its connection.
+      if (!planRef.current || !sessionIdRef.current) return;
+      beginReconnect(positionSeconds, resume, false);
+    },
+    [beginReconnect],
+  );
+
+  const retryConnection = useCallback(() => {
+    const reconnect = reconnectRef.current;
+    beginReconnect(reconnect.positionSeconds, reconnect.resume, true);
+  }, [beginReconnect]);
+
+  // Coming back online is the best moment to try again.
+  const reconnecting = state.connectionStatus === "reconnecting";
+  useEffect(() => {
+    if (!reconnecting) return;
+    const onOnline = () => {
+      const reconnect = reconnectRef.current;
+      if (reconnect.active && reconnect.timer !== null) scheduleReconnectAttempt(0);
+    };
+    window.addEventListener("online", onOnline);
+    return () => window.removeEventListener("online", onOnline);
+  }, [reconnecting, scheduleReconnectAttempt]);
 
   /**
    * Replans off a plan the server invalidated mid-playback.
@@ -2928,6 +3308,9 @@ export function usePlaybackSession(
   }, []);
 
   const reportFirstFrame = useCallback(() => {
+    // The current plan's transport is on screen: from here its reported state
+    // is the viewer's intent.
+    planTransportShownRef.current = true;
     const attempt = firstFrameRef.current;
     // Until a start's plan is adopted, the attempt id has already moved on and
     // the frame on screen belongs to the attempt being replaced.
@@ -3104,6 +3487,8 @@ export function usePlaybackSession(
     changeSubtitleTrack,
     changeQuality,
     recoverFromFailure,
+    recoverConnection,
+    retryConnection,
     invalidatePlan,
     reanchorSeek,
     refreshSubtitles,

@@ -261,6 +261,7 @@ export function catalogItemDetailFromV2(item: CatalogItemDetailV2): ItemDetail {
     themes: item.themes,
     content_id: item.content_id,
     play_content_id: item.play_content_id,
+    play_season_number: item.play_season_number,
     type: item.type as ItemDetail["type"],
     status: item.status ? (item.status as ItemDetail["status"]) : undefined,
     title: item.title,
@@ -349,6 +350,7 @@ function episodeFileFromV2(file: EpisodeFileV2): EpisodeFile {
     audio_channels: file.audio_channels ?? 0,
     container: file.container ?? "",
     file_size: file.file_size,
+    ...(file.unreadable ? { unreadable: true } : {}),
   };
 }
 

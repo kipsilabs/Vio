@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/subtitles"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary/stream"
 )
 
@@ -77,6 +78,10 @@ type SubtitleInventoryItemV3 struct {
 	// FontBundleURL is the attachment bundle needed to render an embedded
 	// ASS/SSA track with its authored typesetting.
 	FontBundleURL string `json:"font_bundle_url,omitempty"`
+	// SyncKey names the track to the subtitle sync operations. Present on
+	// external and downloaded tracks whose timing can be corrected (SRT,
+	// WebVTT, ASS, SSA); stable across sessions and inventory reordering.
+	SyncKey string `json:"sync_key,omitempty"`
 	// downloadedSubtitleID is deliberately not serialized: clients address the
 	// opaque session URL, while the server uses the row ID to make that URL
 	// stable across inventory reordering and seek reanchors.
@@ -94,60 +99,6 @@ type SubtitleInventoryItemV3 struct {
 	sourceCombinedIndexSet bool
 }
 
-// BuildSubtitleInventoryV3 is the single normative implementation of the
-// combined-ordinal ordering rule, and the only place in the server that
-// assigns subtitle ordinals.
-//
-// Ordinals are assigned across three consecutive ranges, in this order:
-//
-//	[0, len(ExternalSubtitles))                       external sidecar files
-//	[len(External), len(External)+len(SubtitleTracks)) embedded container tracks
-//	[that, +len(additional))                           downloaded/generated tracks
-//
-// The published CombinedIndex space is always dense and gap-free: each
-// surviving track takes the ordinal of its position in the published list
-// (0..n-1), and its TrackID encodes that same ordinal, so a client can map its
-// own track list positionally and track_id always agrees with combined_index.
-// A duplicate suppressed by the de-duplication below simply does not consume
-// an ordinal, and every later surviving track shifts down by one.
-//
-// Inside the server the underlying tracks still live in the source-space
-// ordinals described above; the published ordinal is a dense view of them.
-// BuildSubtitleInventoryV3 records the source ordinal on each item (unexported,
-// recovered by re-running the same de-duplication when a plan is restored from
-// JSON) so the stream handler's pinned identity and the selection resolver can
-// translate a published ordinal back to the real track. The pins the scoped URL
-// carries — external_subtitle_key, embedded_stream_index, downloaded_subtitle_id
-// — name the source track, not the published ordinal, which is why the route
-// still resolves the same track after a renumber.
-//
-// A track that cannot be delivered as a sidecar is still published — with
-// SubtitleDeliveryBurnInOnlyV3 and no URL — rather than omitted, so a client
-// never has to derive an ordinal by counting what it can render.
-//
-// Within each range the order is the source order: catalog order for
-// externals, container stream order for embedded tracks, and
-// ListDownloadedSubtitles' created_at order for downloaded ones. The published
-// order is therefore stable for as long as the file's track set is, which is
-// what makes the `file:{id}:subtitle:{published ordinal}` identity meaningful.
-//
-// Entries are collapsed only when they positively identify the same track: the
-// same source range, the same per-track identity (a sidecar's path, an
-// embedded track's authored title or container stream index, a downloaded
-// row's stable row ID) or the same non-empty base language, the same
-// normalized codec, and the same forced and hearing-impaired flags. Distinct
-// embedded tracks that share a base language but are different physical
-// streams — zh-Hans beside zh-Hant, two same-language rips, fr-FR beside fr-CA
-// without authored titles — carry different stream indexes and are therefore
-// all published. An entry with an unknown language and no other positive
-// identity is never suppressed, so several unknown-language tracks that merely
-// share a codec or flags are all published. The seen-set spans all three
-// ranges, so a duplicate later in the combined list de-duplicates against an
-// earlier one. Downloaded entries key on their stable row ID, so two distinct
-// downloads in one language are both kept, and a downloaded or AI subtitle is
-// never dropped merely because an embedded track shares its language (the
-// source range differs).
-//
 // The returned items carry no URLs; use SubtitleInventoryV3 once a session
 // exists.
 func BuildSubtitleInventoryV3(file *models.MediaFile, additional []SubtitleInventoryEntryV3) []SubtitleInventoryItemV3 {
@@ -163,9 +114,13 @@ func BuildSubtitleInventoryV3(file *models.MediaFile, additional []SubtitleInven
 		if subtitleInventoryDuplicateV3(seen, SubtitleSourceExternalV3, externalSubtitleIdentityV3(sub), sub.Format, sub.Language, sub.Forced, sub.HearingImpaired) {
 			continue
 		}
-		items = append(items, subtitleInventoryItemV3(file.ID, len(items), index, SubtitleSourceExternalV3, sub.Format,
+		item := subtitleInventoryItemV3(file.ID, len(items), index, SubtitleSourceExternalV3, sub.Format,
 			sub.Language, firstNonEmptySubtitleLabelV3(sub.Title, sub.EmbeddedTitle, filepath.Base(sub.Path), sub.Language),
-			sub.Forced, sub.Default, sub.HearingImpaired))
+			sub.Forced, sub.Default, sub.HearingImpaired)
+		if subtitles.SupportsRetime(subtitles.SubtitleFormat(sub.Format)) {
+			item.SyncKey = subtitles.ExternalSyncKey(sub.Path)
+		}
+		items = append(items, item)
 	}
 	for index, track := range file.SubtitleTracks {
 		if subtitleInventoryDuplicateV3(seen, SubtitleSourceEmbeddedV3, embeddedSubtitleIdentityV3(track), track.Codec, track.Language, track.Forced, track.HearingImpaired) {
@@ -195,106 +150,12 @@ func BuildSubtitleInventoryV3(file *models.MediaFile, additional []SubtitleInven
 			entry.Language, firstNonEmptySubtitleLabelV3(entry.Label, entry.Language),
 			entry.Forced, false, entry.HearingImpaired)
 		item.downloadedSubtitleID = entry.DownloadedSubtitleID
+		if source == SubtitleSourceDownloadedV3 && entry.DownloadedSubtitleID > 0 && subtitles.SupportsRetime(subtitles.SubtitleFormat(entry.Codec)) {
+			item.SyncKey = subtitles.StoredSyncKey(entry.DownloadedSubtitleID)
+		}
 		items = append(items, item)
 	}
 	return items
-}
-
-// subtitleInventoryDuplicateV3 records an inventory entry's de-duplication key
-// and reports whether an equivalent track was already seen.
-//
-// A bare alias — an entry carrying no per-track discriminator — collapses
-// against an earlier bare alias with the same base language: the legacy
-// regional-code/bare-base pair (EN-US beside ENG) describing one track. The
-// first spelling wins the published slot; the survivor keeps its own language
-// label and source ordinal.
-//
-// An entry carrying a per-track discriminator — the container stream index,
-// the authored title when the container names the track, the stable sidecar
-// path, or the downloaded row ID — collapses only against the exact same
-// discriminator: the same track described twice (a regional code and its bare
-// base for one stream index, a rescan that rewrote titles but renumbered
-// nothing, one download row listed twice). It never collapses against a bare
-// alias: the alias names no track, so it cannot prove it is this track.
-// Concretely: untitled zh-Hans beside zh-Hant, two same-language rips on
-// different stream indexes, two sidecars with different paths, two titled
-// tracks, and two distinct download rows are all published. Entries with no
-// language and no discriminator at all are never candidates, so
-// unknown-language tracks that merely share a codec or flags are all
-// published.
-//
-// The seen-set spans all three ranges, so a duplicate later in the combined
-// list de-duplicates against an earlier one.
-func subtitleInventoryDuplicateV3(seen map[string]struct{}, source, identity string, codec, language string, forced, hearingImpaired bool) bool {
-	base := stream.CanonicalLanguageBase(language)
-	if base == "" && identity == "" {
-		return false
-	}
-	// The alias key deliberately drops the discriminator: it is how two bare
-	// spellings of one track meet. The track key keeps it: it is how two
-	// physical tracks stay apart.
-	aliasKey := "alias\x00" + strings.Join([]string{
-		source,
-		normalizeCodecV3(codec),
-		base,
-		strconv.FormatBool(forced),
-		strconv.FormatBool(hearingImpaired),
-	}, "\x00")
-	if identity == "" {
-		// Bare alias: collapse only against an earlier bare alias for the
-		// same track (the second spelling). It never claims a track key, so
-		// a later physical track with the same language still publishes.
-		if _, ok := seen[aliasKey]; ok {
-			return true
-		}
-		seen[aliasKey] = struct{}{}
-		return false
-	}
-	trackKey := "track\x00" + identity + "\x00" + aliasKey
-	if _, ok := seen[trackKey]; ok {
-		// Exact same physical track seen before.
-		return true
-	}
-	seen[trackKey] = struct{}{}
-	return false
-}
-
-// externalSubtitleIdentityV3 returns a positive per-track discriminator for a
-// sidecar subtitle: its stable path. Two sidecars in the same language are
-// distinct physical tracks even when their codec and flags coincide; without
-// the path the second would collapse into the first and vanish from the menu.
-// A sidecar with no path carries no positive identity and keeps the legacy
-// language-keyed behavior.
-func externalSubtitleIdentityV3(sub models.ExternalSubtitle) string {
-	if path := strings.TrimSpace(sub.Path); path != "" {
-		return "path:" + path
-	}
-	return ""
-}
-
-// embeddedSubtitleIdentityV3 returns a positive per-track discriminator for an
-// embedded container subtitle, so genuinely distinct tracks survive the
-// inventory de-duplication while the same track described twice still collapses.
-//
-// The identity always carries the container stream index (SubtitleTrack.Index
-// — the ffprobe stream index; zero when the probe recorded none, in which
-// case two untitled zero-index tracks share a key exactly as before): two
-// streams at different indexes are different physical tracks even when they
-// share a title, codec, language, and flags.
-// The authored title (the raw embedded title, or the stored title when the
-// probe recorded one) is appended when the container names the track: two
-// entries for one stream that disagree only on title stay distinct, because a
-// title rewrite without renumbering is rarer than two same-language streams
-// sharing an index namespace, and merging on index alone would reintroduce
-// the over-collapse for titled tracks. Two untitled tracks that share a base
-// language (zh-Hans beside zh-Hant, or two same-language rips) therefore
-// differ by index and are both published; two same-titled tracks on different
-// indexes differ too.
-func embeddedSubtitleIdentityV3(track models.SubtitleTrack) string {
-	if title := strings.TrimSpace(firstNonEmptySubtitleLabelV3(track.EmbeddedTitle, track.Title)); title != "" {
-		return "stream:" + strconv.Itoa(track.Index) + "\x00title:" + title
-	}
-	return "stream:" + strconv.Itoa(track.Index)
 }
 
 // SubtitleInventoryV3 returns the combined-ordinal inventory with
@@ -385,61 +246,6 @@ func ScopeSubtitleInventoryV3(sessionID string, file *models.MediaFile, inventor
 	return items
 }
 
-// SubtitleInventoryOwnSourceIndexV3 maps a published combined ordinal to the
-// source-space ordinal of the file's own external or embedded track it names.
-// It reports false for an out-of-range ordinal or one that addresses a
-// downloaded entry (whose identity is a stable row ID, not a source slot). It
-// is the accessor a boundary that still indexes file.ExternalSubtitles or
-// file.SubtitleTracks directly must use to translate a dense published ordinal
-// back to the array slot its identity and extraction pins are built from.
-func SubtitleInventoryOwnSourceIndexV3(file *models.MediaFile, publishedIndex int) (int, bool) {
-	if file == nil || publishedIndex < 0 {
-		return 0, false
-	}
-	own := BuildSubtitleInventoryV3(file, nil)
-	if publishedIndex >= len(own) {
-		return 0, false
-	}
-	item := own[publishedIndex]
-	if !item.sourceCombinedIndexSet {
-		return 0, false
-	}
-	return item.sourceCombinedIndex, true
-}
-
-// SubtitleInventoryOwnPublishedIndexV3 is the inverse of
-// SubtitleInventoryOwnSourceIndexV3: it maps a source-space ordinal of the
-// file's own external or embedded track to the dense published combined ordinal
-// the client sees. It reports false for an out-of-range source ordinal, a
-// downloaded entry, or a track the de-duplication suppressed (which has no
-// published ordinal of its own). A caller that finds an equivalent target track
-// in the source arrays must translate it through this before writing an ordinal
-// a plan or client will interpret as published.
-func SubtitleInventoryOwnPublishedIndexV3(file *models.MediaFile, sourceIndex int) (int, bool) {
-	if file == nil || sourceIndex < 0 {
-		return 0, false
-	}
-	for _, item := range BuildSubtitleInventoryV3(file, nil) {
-		if item.sourceCombinedIndexSet && item.sourceCombinedIndex == sourceIndex {
-			return item.CombinedIndex, true
-		}
-	}
-	return 0, false
-}
-
-// subtitleInventorySourceIndexV3 maps a published combined ordinal to the
-// source-space ordinal of the track it names, including downloaded entries. It
-// rebuilds the same de-duplicated inventory the plan published, so the mapping
-// matches the client's view exactly.
-func subtitleInventorySourceIndexV3(file *models.MediaFile, additional []SubtitleInventoryEntryV3, publishedIndex int) (int, bool) {
-	for _, item := range BuildSubtitleInventoryV3(file, additional) {
-		if item.CombinedIndex == publishedIndex {
-			return item.sourceCombinedIndex, item.sourceCombinedIndexSet
-		}
-	}
-	return 0, false
-}
-
 // SubtitleInventoryNeedsDownloadedIdentityV3 reports whether an inventory was
 // decoded from its wire form and therefore lost the server-only row IDs needed
 // to mint stable downloaded-subtitle URLs. Freshly planned inventories retain
@@ -453,8 +259,7 @@ func SubtitleInventoryNeedsDownloadedIdentityV3(items []SubtitleInventoryItemV3)
 	return false
 }
 
-// SubtitleInventoryItemAtV3 finds the inventory entry at a published combined
-// ordinal.
+// SubtitleInventoryItemAtV3 finds the inventory entry at a combined ordinal.
 func SubtitleInventoryItemAtV3(items []SubtitleInventoryItemV3, combinedIndex int) (SubtitleInventoryItemV3, bool) {
 	for _, item := range items {
 		if item.CombinedIndex == combinedIndex {
@@ -594,4 +399,156 @@ func firstNonEmptySubtitleLabelV3(values ...string) string {
 		}
 	}
 	return ""
+}
+
+// subtitleInventoryDuplicateV3 records an inventory entry's de-duplication key
+// and reports whether an equivalent track was already seen.
+//
+// A bare alias — an entry carrying no per-track discriminator — collapses
+// against an earlier bare alias with the same base language: the legacy
+// regional-code/bare-base pair (EN-US beside ENG) describing one track. The
+// first spelling wins the published slot; the survivor keeps its own language
+// label and source ordinal.
+//
+// An entry carrying a per-track discriminator — the container stream index,
+// the authored title when the container names the track, the stable sidecar
+// path, or the downloaded row ID — collapses only against the exact same
+// discriminator: the same track described twice (a regional code and its bare
+// base for one stream index, a rescan that rewrote titles but renumbered
+// nothing, one download row listed twice). It never collapses against a bare
+// alias: the alias names no track, so it cannot prove it is this track.
+// Concretely: untitled zh-Hans beside zh-Hant, two same-language rips on
+// different stream indexes, two sidecars with different paths, two titled
+// tracks, and two distinct download rows are all published. Entries with no
+// language and no discriminator at all are never candidates, so
+// unknown-language tracks that merely share a codec or flags are all
+// published.
+//
+// The seen-set spans all three ranges, so a duplicate later in the combined
+// list de-duplicates against an earlier one.
+func subtitleInventoryDuplicateV3(seen map[string]struct{}, source, identity string, codec, language string, forced, hearingImpaired bool) bool {
+	base := stream.CanonicalLanguageBase(language)
+	if base == "" && identity == "" {
+		return false
+	}
+	// The alias key deliberately drops the discriminator: it is how two bare
+	// spellings of one track meet. The track key keeps it: it is how two
+	// physical tracks stay apart.
+	aliasKey := "alias\x00" + strings.Join([]string{
+		source,
+		normalizeCodecV3(codec),
+		base,
+		strconv.FormatBool(forced),
+		strconv.FormatBool(hearingImpaired),
+	}, "\x00")
+	if identity == "" {
+		// Bare alias: collapse only against an earlier bare alias for the
+		// same track (the second spelling). It never claims a track key, so
+		// a later physical track with the same language still publishes.
+		if _, ok := seen[aliasKey]; ok {
+			return true
+		}
+		seen[aliasKey] = struct{}{}
+		return false
+	}
+	trackKey := "track\x00" + identity + "\x00" + aliasKey
+	if _, ok := seen[trackKey]; ok {
+		// Exact same physical track seen before.
+		return true
+	}
+	seen[trackKey] = struct{}{}
+	return false
+}
+
+// externalSubtitleIdentityV3 returns a positive per-track discriminator for a
+// sidecar subtitle: its stable path. Two sidecars in the same language are
+// distinct physical tracks even when their codec and flags coincide; without
+// the path the second would collapse into the first and vanish from the menu.
+// A sidecar with no path carries no positive identity and keeps the legacy
+// language-keyed behavior.
+func externalSubtitleIdentityV3(sub models.ExternalSubtitle) string {
+	if path := strings.TrimSpace(sub.Path); path != "" {
+		return "path:" + path
+	}
+	return ""
+}
+
+// embeddedSubtitleIdentityV3 returns a positive per-track discriminator for an
+// embedded container subtitle, so genuinely distinct tracks survive the
+// inventory de-duplication while the same track described twice still collapses.
+//
+// The identity always carries the container stream index (SubtitleTrack.Index
+// — the ffprobe stream index; zero when the probe recorded none, in which
+// case two untitled zero-index tracks share a key exactly as before): two
+// streams at different indexes are different physical tracks even when they
+// share a title, codec, language, and flags.
+// The authored title (the raw embedded title, or the stored title when the
+// probe recorded one) is appended when the container names the track: two
+// entries for one stream that disagree only on title stay distinct, because a
+// title rewrite without renumbering is rarer than two same-language streams
+// sharing an index namespace, and merging on index alone would reintroduce
+// the over-collapse for titled tracks. Two untitled tracks that share a base
+// language (zh-Hans beside zh-Hant, or two same-language rips) therefore
+// differ by index and are both published; two same-titled tracks on different
+// indexes differ too.
+func embeddedSubtitleIdentityV3(track models.SubtitleTrack) string {
+	if title := strings.TrimSpace(firstNonEmptySubtitleLabelV3(track.EmbeddedTitle, track.Title)); title != "" {
+		return "stream:" + strconv.Itoa(track.Index) + "\x00title:" + title
+	}
+	return "stream:" + strconv.Itoa(track.Index)
+}
+
+// SubtitleInventoryOwnSourceIndexV3 maps a published combined ordinal to the
+// source-space ordinal of the file's own external or embedded track it names.
+// It reports false for an out-of-range ordinal or one that addresses a
+// downloaded entry (whose identity is a stable row ID, not a source slot). It
+// is the accessor a boundary that still indexes file.ExternalSubtitles or
+// file.SubtitleTracks directly must use to translate a dense published ordinal
+// back to the array slot its identity and extraction pins are built from.
+func SubtitleInventoryOwnSourceIndexV3(file *models.MediaFile, publishedIndex int) (int, bool) {
+	if file == nil || publishedIndex < 0 {
+		return 0, false
+	}
+	own := BuildSubtitleInventoryV3(file, nil)
+	if publishedIndex >= len(own) {
+		return 0, false
+	}
+	item := own[publishedIndex]
+	if !item.sourceCombinedIndexSet {
+		return 0, false
+	}
+	return item.sourceCombinedIndex, true
+}
+
+// SubtitleInventoryOwnPublishedIndexV3 is the inverse of
+// SubtitleInventoryOwnSourceIndexV3: it maps a source-space ordinal of the
+// file's own external or embedded track to the dense published combined ordinal
+// the client sees. It reports false for an out-of-range source ordinal, a
+// downloaded entry, or a track the de-duplication suppressed (which has no
+// published ordinal of its own). A caller that finds an equivalent target track
+// in the source arrays must translate it through this before writing an ordinal
+// a plan or client will interpret as published.
+func SubtitleInventoryOwnPublishedIndexV3(file *models.MediaFile, sourceIndex int) (int, bool) {
+	if file == nil || sourceIndex < 0 {
+		return 0, false
+	}
+	for _, item := range BuildSubtitleInventoryV3(file, nil) {
+		if item.sourceCombinedIndexSet && item.sourceCombinedIndex == sourceIndex {
+			return item.CombinedIndex, true
+		}
+	}
+	return 0, false
+}
+
+// subtitleInventorySourceIndexV3 maps a published combined ordinal to the
+// source-space ordinal of the track it names, including downloaded entries. It
+// rebuilds the same de-duplicated inventory the plan published, so the mapping
+// matches the client's view exactly.
+func subtitleInventorySourceIndexV3(file *models.MediaFile, additional []SubtitleInventoryEntryV3, publishedIndex int) (int, bool) {
+	for _, item := range BuildSubtitleInventoryV3(file, additional) {
+		if item.CombinedIndex == publishedIndex {
+			return item.sourceCombinedIndex, item.sourceCombinedIndexSet
+		}
+	}
+	return 0, false
 }

@@ -209,7 +209,9 @@ export function useASSSubtitles(
   isDetached: boolean,
   streamOriginSeconds: number,
   subtitleDelayMs: number,
-  onLoadState?: (state: "idle" | "loading" | "ready" | "error") => void,
+  // "refreshing" is a reload of the track on screen for new timing: its
+  // current events stay up meanwhile, so it is not announced as loading.
+  onLoadState?: (state: "idle" | "loading" | "refreshing" | "ready" | "error") => void,
   // Fired when the server answers the subtitle fetch with
   // `subtitle_source_changed` (409): a virtual release rotated under this plan
   // and every URL for the active track is stale. The caller must refresh the
@@ -223,7 +225,8 @@ export function useASSSubtitles(
   videoFit: VideoFitMode = "contain",
   coverCrop: CoverCrop = NO_COVER_CROP,
   // Bumped when the server retimed the active track behind an unchanged URL
-  // (subtitle sync or a timing reset); changing it reloads the track.
+  // (subtitle sync or a timing reset); changing it swaps the track's script
+  // in the running renderer.
   cueRevision = 0,
 ): { isActive: boolean } {
   const onLoadStateRef = useRef(onLoadState);

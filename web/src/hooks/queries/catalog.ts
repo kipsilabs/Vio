@@ -127,6 +127,31 @@ export async function fetchCatalogPage(
   };
 }
 
+/** The most items one `POST /api/v2/catalog/query` page may ask for (its `limit` maximum). */
+export const MAX_CATALOG_PAGE = 100;
+
+/**
+ * The items `state` lists, up to `max` (every one when `max` is omitted), read
+ * a page of at most `MAX_CATALOG_PAGE` at a time through the response cursor.
+ * Every page asks for the same `limit`: a cursor is bound to the one it was
+ * issued for, and a page may come back short with more to follow.
+ */
+export async function fetchCatalogItems(
+  state: CatalogSearchState,
+  options: { max?: number; signal?: AbortSignal } = {},
+): Promise<CatalogPage["items"]> {
+  const { max = Number.POSITIVE_INFINITY, signal } = options;
+  const limit = Math.min(MAX_CATALOG_PAGE, max);
+  const items: CatalogPage["items"] = [];
+  let cursor: string | undefined;
+  do {
+    const page = await fetchCatalogPage(state, limit, 0, { signal }, false, undefined, cursor);
+    items.push(...page.items);
+    cursor = page.has_more ? page.next_cursor : undefined;
+  } while (cursor && items.length < max);
+  return items.slice(0, max);
+}
+
 export async function fetchCatalogFilters(
   state: CatalogSearchState,
   options?: Pick<RequestInit, "signal">,
@@ -155,6 +180,8 @@ export type CatalogFacetName =
 
 export interface CatalogFacetSearchResponse {
   matches: string[];
+  /** The matches in the same order, each with its title count in scope. */
+  values: { value: string; count: number }[];
   has_more: boolean;
 }
 
@@ -436,6 +463,28 @@ export function useCatalogWindow(
       ]);
     },
   };
+}
+
+/**
+ * Whether a library holds any item at all, independent of the viewer's
+ * filters, search, and browse type. Reads one unfiltered item without a total
+ * so it stays cheap on large libraries; callers enable it only once their own
+ * view came back empty. It lives under the catalog list key for the library,
+ * so the catalog events a scan emits refresh it.
+ */
+export function useLibraryHasItems(libraryId: number, options: { enabled?: boolean } = {}) {
+  const state = createCatalogSearchState("query", {
+    library_id: libraryId,
+    query_definition: { ...createEmptyQueryDefinition(), library_ids: [libraryId] },
+  });
+  const limit = 1;
+  return useQuery({
+    queryKey: catalogKeys.list({ ...catalogParamsForKey(state, limit, false), offset: 0 }),
+    queryFn: ({ signal }) => fetchCatalogPage(state, limit, 0, { signal }, false),
+    select: (page: CatalogPage) => page.items.length > 0,
+    enabled: (options.enabled ?? true) && Number.isSafeInteger(libraryId) && libraryId > 0,
+    staleTime: 60 * 1000,
+  });
 }
 
 export function useCatalogFilters(

@@ -9,7 +9,7 @@ profile is not a server administrator.
 configuration, transactional default-profile creation, and access-group support.
 It also reports the account projections below that depend on optional services:
 `account_devices`, `watch_summary`, `account_downloads` (the downloads list, summary
-and series monitors) and `request_usage`. A read whose flag is false answers 503.
+and series monitors), `request_usage` and `profile_sections` (profile page layouts). A read whose flag is false answers 503.
 Unsupported services return a capability or dependency Problem Details response.
 The existing paginated account list remains at `GET /api/v2/admin/users`.
 
@@ -31,10 +31,13 @@ Audiobookshelf-compatible sessions, approved device sign-ins not yet collected,
 and its Jellyfin-compatible sessions) only when it sets a password or changes
 `enabled`. Access-group, permission and playback-quality changes keep the
 account signed in: they advance `access_policy_revision`, each request resolves
-the current policy, connected events sockets receive `access_changed` (see
-[realtime-api.md](realtime-api.md#access-changes)), and PIN-protected profiles
-must enter their PIN again. Library, stream-limit and download overrides never
-signed the account out and still do not.
+the current policy, and connected events sockets receive `access_changed` (see
+[realtime-api.md](realtime-api.md#access-changes)). Profile verification tokens
+stay valid: they are bound to each profile's own PIN, not to the account's
+policy (see
+[profile-verification-tokens.md](architecture/profile-verification-tokens.md)).
+Library, stream-limit and download overrides never signed the account out and
+still do not.
 
 A role change also keeps the account signed in, but admin checks trust the role
 in the access token, so the token must be replaced. Every request that presents
@@ -78,6 +81,21 @@ requires starting a new listing. Account capabilities advertise
 
 An identity lookup does not reserve an identity or authorize a change. Conditional
 account updates and database uniqueness remain authoritative at write time.
+
+## Policy defaults
+
+An account's unset policy field takes its access group's value. Admin accounts
+never belong to a group: their unset fields resolve to full access, the access
+the Owner has, and an override on an admin account still restricts it. A
+regular account with no group uses the built-in no-group values, which match
+full access except that server-prepared downloads
+(`download_transcode_allowed`) are off.
+
+`GET /api/v2/admin/users/policy-defaults` returns both layers, `admin` and
+`ungrouped`, in the shape of `effective_policy` without `permissions`, so
+clients show where a default comes from without keeping their own copy. The
+values come from the server build. Account capabilities advertise
+`policy_defaults`. Existing `admin:users` keys may use this read.
 
 ## Passwords
 
@@ -157,6 +175,10 @@ they:
 - create an administrator, promote an account to administrator, or invite one;
 - update, delete, or issue a password reset for another administrator or the
   Owner;
+- change an access-policy override on their own account (libraries, playback
+  quality, stream, transcode and bitrate limits, the transcode, download and
+  request switches). An update that re-sends the stored values is not a change;
+  other fields of their own account stay editable;
 - create an API key for another administrator or the Owner, or change or revoke
   one of their keys.
 
@@ -264,6 +286,36 @@ request service resolves it: `requests_enabled` (the server switch), `allowed`
 (false when the account's switch, group or approval mode blocks it), `unlimited`,
 `used`, `max_requests`, `window_days`, `window_start`, `remaining` and
 `auto_approve`. An unlimited account is not counted, so `used` is 0.
+
+### Profile page layouts
+
+An administrator can read and correct one profile's home or library page layout
+without impersonating the account. The routes take the same `scope` and
+`library_id` query and the same shapes as the profile's own `/api/v2/profile/sections`
+routes, so a client reuses its types and editor:
+
+| Route below `/api/v2/admin/users/{id}/profiles/{profile_id}` | Response |
+| --- | --- |
+| `GET /sections` | The profile's saved overrides (`listAdminUserProfileSectionOverrides`), as `listProfileSectionOverrides` |
+| `GET /sections/settings` | The page as the profile's layout orders it (`getAdminUserProfileSectionSettings`), as `getProfileSectionSettings` |
+| `PUT /sections` | Replaces the override set (`replaceAdminUserProfileSectionOverrides`); 204 |
+| `DELETE /sections` | Deletes the override set, so the profile follows the admin layout again (`resetAdminUserProfileSectionOverrides`); 204 |
+
+A profile that is not one of the account's answers 404, as does an unknown account
+or, for a library page, a library that does not exist or is disabled. The
+administrator's own library access does not limit which library pages they can address.
+Each write acts on that one profile; other profiles on the account and on the
+server keep their layouts. `PUT` runs the profile route's validation and recipe
+gate with the account's own role, not the administrator's: the profile re-saves
+its whole set on every change, so a section it could not save itself would make
+its later saves fail. The settings read applies no library-access
+filter: it lists every section the layout orders, including ones the account cannot
+currently see, so a full-replacement save keeps their positions.
+
+A write or reset for a profile other than the caller's acting profile logs the
+same structured audit record as an administrator's setting write (`settings changed
+for another profile`, identity only), with `setting_key` `profile_sections`, `scope`
+set to the page scope, and `library_id` for a library page. Account capabilities advertise `profile_sections`.
 
 ### Account downloads
 

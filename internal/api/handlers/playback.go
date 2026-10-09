@@ -68,14 +68,13 @@ type SessionManagerInterface interface {
 	BeginTransport(sessionID string) error
 	EndTransport(sessionID string) error
 	SetRemoteTransport(sessionID string, remote bool) error
-	SetEffectiveMediaFileID(sessionID string, fileID int) error
 	SetTranscodeNodeURL(sessionID, url string) error
 	SetTranscodeRoute(sessionID string, route playback.TranscodeRoute) error
 	ApplyReplacement(sessionID string, replacement playback.SessionReplacement) (playback.SessionReplacementRollback, error)
 	ApplyReplacementIfRoute(sessionID string, expected playback.TranscodeRoute, replacement playback.SessionReplacement) (playback.SessionReplacementRollback, bool, error)
 	RollbackReplacement(sessionID string, rollback playback.SessionReplacementRollback) error
-	SetWebSocket(sessionID string, connected bool) error
 	SetRealtimeConnection(sessionID string, connected bool) error
+	SetEffectiveMediaFileID(sessionID string, fileID int) error
 	SetProgressPersistenceDisabled(sessionID string, disabled bool) error
 	StopSession(sessionID string) error
 	GetSession(sessionID string) (*playback.Session, error)
@@ -1599,6 +1598,7 @@ func identityRecipeCard(s *playback.Session) playback.RecipeCard {
 	switch s.PlayMethod {
 	case playback.PlayRemux:
 		card = playback.NewRemuxRecipeCard(s.ID, s.UserID, s.ProfileID, s.MediaFileID, s.TranscodeAudio, s.AudioTrackIndex, s.RemuxDVMode)
+		card.RemuxResumeLeadingPictureDrop = s.RemuxResumeLeadingPictureDrop
 		card.TargetCodecAudio = s.TargetAudioCodec
 		card.TargetAudioChannels = s.TargetAudioChannels
 		card.TargetAudioBitrateKbps = s.TargetAudioBitrateKbps
@@ -3292,8 +3292,8 @@ func (h *PlaybackHandler) maybeStartThrottler(ctx context.Context, session *play
 // still accept one that direct-plays or remuxes without forbidden video
 // encoding.
 // Within each class it prefers SDR, then resolution, then bitrate.
-func (h *PlaybackHandler) findAlternateFile(ctx context.Context, source *models.MediaFile) (*models.MediaFile, error) {
-	candidates, err := h.findAlternateFiles(ctx, source, alternateOrdering{})
+func (h *PlaybackHandler) findAlternateFile(ctx context.Context, source *models.MediaFile, filter catalog.AccessFilter) (*models.MediaFile, error) {
+	candidates, err := h.findAlternateFiles(ctx, source, filter)
 	if err != nil || len(candidates) == 0 {
 		return nil, err
 	}
@@ -3327,10 +3327,22 @@ func alternateOrderingForClient(caps playback.ClientCodecCapabilitiesV3) alterna
 // findAlternateFiles returns every compatible edition/version candidate in
 // fallback order. Callers that plan candidates must keep trying after a
 // terminal: a lower-resolution candidate can still fail while a later 4K
-// candidate direct-plays or remuxes without forbidden video encoding. The
-// ordering prefers the client's declared ceiling when it is known, and the
-// conservative non-4K/SDR-first order otherwise.
-func (h *PlaybackHandler) findAlternateFiles(ctx context.Context, source *models.MediaFile, order alternateOrdering) ([]*models.MediaFile, error) {
+// candidate direct-plays or remuxes without forbidden video encoding.
+//
+// Only versions the viewer may play are returned: the per-file checks
+// loadAuthorizedFile applies to a requested file (library access and the
+// maximum playback quality), and present on disk. The sibling query itself is
+// unfiltered, and the requested file's authorization says nothing about which
+// library a sibling version lives in or how high its resolution is.
+func (h *PlaybackHandler) findAlternateFiles(ctx context.Context, source *models.MediaFile, filter catalog.AccessFilter) ([]*models.MediaFile, error) {
+	return h.findAlternateFilesOrdered(ctx, source, filter, alternateOrdering{})
+}
+
+// findAlternateFilesOrdered is findAlternateFiles with an explicit client
+// ceiling for version fallback ordering: Prefer4K/PreferHDR reverse the
+// 4K/HDR group direction. The zero value keeps the conservative
+// non-4K/SDR-first order and matches findAlternateFiles exactly.
+func (h *PlaybackHandler) findAlternateFilesOrdered(ctx context.Context, source *models.MediaFile, filter catalog.AccessFilter, order alternateOrdering) ([]*models.MediaFile, error) {
 	if h.FileVersionFetcher == nil {
 		return nil, fmt.Errorf("file version fetcher not configured")
 	}
@@ -3348,7 +3360,10 @@ func (h *PlaybackHandler) findAlternateFiles(ctx context.Context, source *models
 
 	candidates := make([]*models.MediaFile, 0, len(files))
 	for _, f := range files {
-		if f.ID == source.ID {
+		if f == nil || f.ID == source.ID {
+			continue
+		}
+		if f.MissingSince != nil || !catalog.FileAllowedByAccess(f, filter) {
 			continue
 		}
 		if source.EditionKey != "" && f.EditionKey != source.EditionKey {
@@ -3412,10 +3427,11 @@ func (h *PlaybackHandler) findAlternateFiles(ctx context.Context, source *models
 func (h *PlaybackHandler) virtualTransportAlternatesV3(
 	ctx context.Context,
 	source *models.MediaFile,
+	filter catalog.AccessFilter,
 	order alternateOrdering,
 	transient bool,
 ) ([]*models.MediaFile, error) {
-	alternates, err := h.findAlternateFiles(ctx, source, order)
+	alternates, err := h.findAlternateFilesOrdered(ctx, source, filter, order)
 	if err != nil || len(alternates) == 0 {
 		return nil, err
 	}

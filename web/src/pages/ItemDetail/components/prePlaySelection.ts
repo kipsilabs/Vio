@@ -52,12 +52,6 @@ function normalizeDownloadedLabel(subtitle: DownloadedSubtitle): string {
   return releaseName || provider || getLanguageName(subtitle.language?.trim() || "unknown");
 }
 
-export function formatSubtitleCandidateSummary(
-  row: Pick<VersionSubtitleInventoryRow, "languageLabel" | "forced" | "hearingImpaired">,
-): string {
-  return row.languageLabel;
-}
-
 export function inferSubtitleFlagsFromTitle(title: string | undefined): {
   forced: boolean;
   hearingImpaired: boolean;
@@ -245,7 +239,7 @@ export function buildPrePlaySubtitleCandidates(
           // would offset track resolution if ever sent as an ordinal.
           track_index: denseOrdinalFor(row),
         },
-        summary: formatSubtitleCandidateSummary(row),
+        summary: row.languageLabel,
       };
       all.push(candidate);
       return candidate;
@@ -270,7 +264,7 @@ export function buildPrePlaySubtitleCandidates(
         // Dense combined ordinal — see the built-in comment above.
         track_index: denseOrdinalFor(row),
       },
-      summary: formatSubtitleCandidateSummary(row),
+      summary: row.languageLabel,
     };
     all.push(candidate);
     return candidate;
