@@ -3,6 +3,7 @@ package apiv2
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -46,7 +47,7 @@ func directDownloadTestHandler(t *testing.T, f *directDownloadFixture) http.Hand
 	t.Helper()
 	deps, _ := catalogDeps(t)
 	h := handlers.NewDownloadHandler(f)
-	deps.DirectDownloads = &DirectDownloadHandlers{Original: http.HandlerFunc(h.HandleDirectDownload), Proxy: http.HandlerFunc(h.HandleDirectDownloadViaProxy)}
+	deps.DirectDownloads = &DirectDownloadHandlers{Original: http.HandlerFunc(h.HandleDirectDownloadV2), Proxy: http.HandlerFunc(h.HandleDirectDownloadViaProxyV2)}
 	return newTestHandler(t, deps)
 }
 func TestDirectDownloadDelivery(t *testing.T) {
@@ -101,6 +102,30 @@ func TestDirectDownloadDelivery(t *testing.T) {
 		})
 	}
 }
+
+// The v2 byte adapter keys the Problem type off the v1 machine-readable code:
+// a stale file_id and an access refusal carry their own types instead of both
+// collapsing into the status-derived not_found / permission_denied.
+func TestDirectDownloadRefusalReasonsAreDistinct(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		kind ProblemType
+	}{
+		{"unavailable", fmt.Errorf("%w: %w", downloads.ErrFileUnavailable, catalogpkg.ErrItemNotFound), TypeFileUnavailable},
+		{"denied", fmt.Errorf("%w: %w", downloads.ErrFileAccessDenied, catalogpkg.ErrItemNotFound), TypeFileAccessDenied},
+		{"format", downloads.ErrFormatUnavailable, TypeFormatUnavailable},
+		{"virtual", fmt.Errorf("%w: %w", downloads.ErrFormatUnavailable, catalogpkg.ErrItemNotFound), TypeFormatUnavailable},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &directDownloadFixture{err: tc.err}
+			h := directDownloadTestHandler(t, f)
+			res := do(t, h, "GET", Prefix+"/direct-download?file_id=42", "", viewerHeaders())
+			requireProblem(t, res, tc.kind)
+		})
+	}
+}
+
 func TestDirectDownloadPartialResponseAborts(t *testing.T) {
 	f := &directDownloadFixture{partial: true}
 	h := directDownloadTestHandler(t, f)
@@ -168,7 +193,7 @@ func TestDirectDownloadProxyAuthorityAndReservation(t *testing.T) {
 			const secret = "synthetic-direct-proxy-key"
 			legacy.SetProxyDelivery(planner, func() string { return secret })
 			deps, _ := catalogDeps(t)
-			deps.DirectDownloads = &DirectDownloadHandlers{Proxy: http.HandlerFunc(legacy.HandleDirectDownloadViaProxy)}
+			deps.DirectDownloads = &DirectDownloadHandlers{Proxy: http.HandlerFunc(legacy.HandleDirectDownloadViaProxyV2)}
 			h := newTestHandler(t, deps)
 			method := "GET"
 			if kind == "head" {

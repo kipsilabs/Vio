@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Download, Loader2 } from "lucide-react";
 import { toast } from "sonner";
 import type { FileVersion } from "@/api/types";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -15,11 +16,16 @@ import { formatFileSize } from "@/lib/mediaFormat";
 import { StaleApiRequestContextError } from "@/api/client";
 import {
   DirectDownloadError,
+  isStaleFileError,
   prepareDirectDownload,
   type PreparedDirectDownload,
 } from "@/api/v2/directDownloads";
 import { useDownloadCapability } from "@/hooks/queries/downloads";
-import { buildQualitySummary, sortByResolution } from "@/pages/ItemDetail/components/VersionFlyout";
+import {
+  buildDetailLine,
+  buildQualitySummary,
+  sortByResolution,
+} from "@/pages/ItemDetail/components/VersionFlyout";
 
 interface DownloadVersionPickerProps {
   open: boolean;
@@ -27,6 +33,18 @@ interface DownloadVersionPickerProps {
   versions: FileVersion[];
   title?: string;
   summaryBuilder?: (version: FileVersion) => string;
+  /**
+   * The file_id the item page currently has selected or playing. Its row gets
+   * a visible "Playing" marker so the download choice matches what is on
+   * screen. Omit when the caller has no active version.
+   */
+  selectedFileId?: number | null;
+  /**
+   * Called when a preflight reports the chosen file_id is stale (no longer
+   * resolves). The caller re-fetches the item's versions, the same refresh a
+   * `versions_updated` event triggers.
+   */
+  onStaleVersion?: (fileId: number) => void;
 }
 
 interface PreparedSelection {
@@ -56,10 +74,13 @@ export default function DownloadVersionPicker({
   versions,
   title,
   summaryBuilder,
+  selectedFileId,
+  onStaleVersion,
 }: DownloadVersionPickerProps) {
   const sorted = sortByResolution(versions);
   const [downloading, setDownloading] = useState<number | null>(null);
   const [prepared, setPrepared] = useState<PreparedSelection | null>(null);
+  const [refusalMessage, setRefusalMessage] = useState<string | null>(null);
   const {
     data: capability,
     isLoading: capabilityLoading,
@@ -82,6 +103,7 @@ export default function DownloadVersionPicker({
     active.current = null;
     setDownloading(null);
     setPrepared(null);
+    setRefusalMessage(null);
     return () => {
       abortRef.current?.abort();
       abortRef.current = null;
@@ -105,6 +127,7 @@ export default function DownloadVersionPicker({
     abortRef.current = controller;
     const isCurrent = () => active.current === attempt;
     setDownloading(version.file_id);
+    setRefusalMessage(null);
     try {
       // Preflight only: probes with a ranged GET and resolves to the
       // authenticated URL. The bytes move on the user's own click of the save
@@ -119,9 +142,16 @@ export default function DownloadVersionPicker({
     } catch (error) {
       // A superseded attempt (profile switch, closed dialog, replaced selection)
       // must not report into the replacement authority; every other failure
-      // toasts a concrete reason.
-      if (isCurrent() && !(error instanceof StaleApiRequestContextError))
-        toast.error(downloadFailureMessage(error));
+      // surfaces a concrete reason. A stale file_id also asks the caller to
+      // re-fetch the item's versions instead of leaving the user at a dead end.
+      if (isCurrent() && !(error instanceof StaleApiRequestContextError)) {
+        const message = downloadFailureMessage(error);
+        setRefusalMessage(message);
+        if (isStaleFileError(error)) {
+          onStaleVersion?.(version.file_id);
+        }
+        toast.error(message);
+      }
     } finally {
       if (isCurrent()) {
         active.current = null;
@@ -183,6 +213,12 @@ export default function DownloadVersionPicker({
           </p>
         )}
 
+        {refusalMessage && (
+          <p className="text-muted-foreground text-sm" role="status">
+            {refusalMessage}
+          </p>
+        )}
+
         {prepared && (
           <div className="border-border/50 bg-accent/30 space-y-2 rounded-xl border px-4 py-3">
             <p className="text-foreground text-sm font-medium">Your file is ready.</p>
@@ -203,14 +239,27 @@ export default function DownloadVersionPicker({
           <div className="space-y-2">
             {sorted.map((version) => {
               const quality = summaryBuilder?.(version) || buildQualitySummary(version);
-              const size = summaryBuilder ? "" : formatFileSize(version.file_size);
+              // A release name (or the pre-`release_name` edition) distinguishes
+              // two rows that share a quality summary. buildDetailLine is the
+              // same release/size/source line the item-page version picker and
+              // the in-player menu show, so the wording stays consistent.
+              const detailLine =
+                version.release_name || version.edition_raw ? buildDetailLine(version) : "";
+              // The detail line already carries the size; only fall back to the
+              // bare size when there is no release identity and no custom
+              // summary that states it.
+              const size = !detailLine && !summaryBuilder ? formatFileSize(version.file_size) : "";
+              const isSelected = selectedFileId != null && version.file_id === selectedFileId;
               const button = (
                 <button
                   key={version.file_id}
                   type="button"
                   onClick={() => handleDownload(version)}
                   disabled={rowsBlocked}
-                  className="border-border/50 bg-accent/30 hover:bg-accent/60 flex w-full items-center gap-3 rounded-xl border px-4 py-3 text-left transition-colors disabled:opacity-50"
+                  aria-current={isSelected ? "true" : undefined}
+                  className={`bg-accent/30 hover:bg-accent/60 flex w-full items-center gap-3 rounded-xl border px-4 py-3 text-left transition-colors disabled:opacity-50 ${
+                    isSelected ? "border-primary/60 bg-primary/5" : "border-border/50"
+                  }`}
                 >
                   <span className="bg-primary/10 text-primary flex size-9 shrink-0 items-center justify-center rounded-full">
                     {downloading === version.file_id ? (
@@ -220,7 +269,20 @@ export default function DownloadVersionPicker({
                     )}
                   </span>
                   <span className="min-w-0 flex-1">
-                    <span className="text-foreground block text-sm font-medium">{quality}</span>
+                    <span className="flex items-center gap-2">
+                      <span className="text-foreground block text-sm font-medium">{quality}</span>
+                      {isSelected && (
+                        <Badge
+                          variant="secondary"
+                          className="shrink-0 px-1.5 py-0 text-[10px] font-medium"
+                        >
+                          Playing
+                        </Badge>
+                      )}
+                    </span>
+                    {detailLine && (
+                      <span className="text-muted-foreground block text-xs">{detailLine}</span>
+                    )}
                     {size && <span className="text-muted-foreground block text-xs">{size}</span>}
                   </span>
                 </button>

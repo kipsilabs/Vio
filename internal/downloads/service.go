@@ -1029,16 +1029,40 @@ func (s *Service) ResolveDirectFile(ctx context.Context, userID, fileID int, for
 	}
 	file, err := s.fileRepo.GetByID(ctx, fileID)
 	if err != nil {
-		return nil, translateFileLookupError(err)
+		translated := translateFileLookupError(err)
+		if errors.Is(translated, catalog.ErrItemNotFound) {
+			// An unknown/deleted file_id is a stale version the picker still
+			// lists. Keep catalog.ErrItemNotFound in the chain so existing
+			// not-found callers are unaffected, and add the specific sentinel
+			// the direct-download surface keys its own problem code off.
+			return nil, fmt.Errorf("%w: %w", ErrFileUnavailable, catalog.ErrItemNotFound)
+		}
+		return nil, translated
 	}
 	if file == nil || file.MissingSince != nil {
-		return nil, catalog.ErrItemNotFound
+		return nil, fmt.Errorf("%w: %w", ErrFileUnavailable, catalog.ErrItemNotFound)
 	}
+	// Authorization runs before classification: an unauthorized virtual row
+	// must read as an access refusal, not as a format verdict that leaks the
+	// row's classification and produces the wrong copy. Both checks are on the
+	// content row, so they are independent of whether it carries local bytes.
 	if err := s.itemAccess.EnsureAccessible(ctx, file.ContentID, filter); err != nil {
+		if errors.Is(err, catalog.ErrItemNotFound) {
+			return nil, fmt.Errorf("%w: %w", ErrFileAccessDenied, catalog.ErrItemNotFound)
+		}
 		return nil, err
 	}
 	if !catalog.FileAllowedByAccess(file, filter) {
-		return nil, catalog.ErrItemNotFound
+		return nil, fmt.Errorf("%w: %w", ErrFileAccessDenied, catalog.ErrItemNotFound)
+	}
+	// A zero-storage virtual row carries a provider URI, not local bytes.
+	// Direct download exists to serve original files, so name the non-original
+	// reason instead of letting the file open fail as an anonymous not-found.
+	// It keeps catalog.ErrItemNotFound in the chain so the frozen v1 surface
+	// still answers with its historical 404/not_found; only the v2 adapter
+	// reads ErrFormatUnavailable to name the distinct refusal.
+	if isVirtualMediaFile(file) {
+		return nil, fmt.Errorf("%w: %w", ErrFormatUnavailable, catalog.ErrItemNotFound)
 	}
 	return &FileTarget{Path: file.FilePath, MediaFileID: file.ID, ProxyEligible: proxyDeliveryAllowed(cfg)}, nil
 }
@@ -1203,6 +1227,19 @@ func translateFileLookupError(err error) error {
 		return catalog.ErrItemNotFound
 	}
 	return fmt.Errorf("loading media file: %w", err)
+}
+
+// isVirtualMediaFile reports a zero-storage catalog row backed by a provider
+// URI (`virtual://…`) or marked with the virtual container. Such a row has no
+// local bytes for a direct download to serve.
+func isVirtualMediaFile(file *models.MediaFile) bool {
+	if file == nil {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(file.Container), "virtual") {
+		return true
+	}
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(file.FilePath)), "virtual://")
 }
 
 // resolveFile returns the requested file, or the profile's preferred version

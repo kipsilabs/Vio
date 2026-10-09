@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   BookOpen,
   Check,
@@ -121,6 +121,13 @@ function MangaRow({
   const [loadingVersions, setLoadingVersions] = useState(false);
   const canDownload = Boolean(user?.download_allowed);
 
+  // A stale file_id from the picker re-fetches this chapter's versions.
+  const refreshChapterVersions = useCallback(() => {
+    void fetchCatalogItemVersions(chapter.content_id)
+      .then((versions) => setDownloadVersions(versions))
+      .catch(() => undefined);
+  }, [chapter.content_id]);
+
   const handleDownload = async () => {
     if (loadingVersions) return;
     if (downloadVersions && downloadVersions.length > 0) {
@@ -235,6 +242,7 @@ function MangaRow({
           versions={downloadVersions}
           title={label}
           summaryBuilder={chapterVersionSummary}
+          onStaleVersion={refreshChapterVersions}
         />
       )}
     </div>

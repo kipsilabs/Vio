@@ -6,21 +6,38 @@ import {
   isSessionIdentityCurrent,
   StaleApiRequestContextError,
 } from "@/api/client";
+import { problemId } from "./problemId";
 
 /** A direct-download attempt the user must be told about, with a concrete reason. */
 export class DirectDownloadError extends Error {
   /** The HTTP status that refused the attempt, or 0 for a non-HTTP failure. */
   readonly status: number;
+  /**
+   * The v2 problem identifier (`file_unavailable`, `file_access_denied`, …)
+   * when the server answered with a Problem Details body; otherwise "". The
+   * identifier distinguishes a stale file_id, which needs a version refresh,
+   * from an access refusal, which needs the denial text.
+   */
+  readonly code: string;
 
-  constructor(status: number, message: string) {
+  constructor(status: number, message: string, code = "") {
     super(message);
     this.name = "DirectDownloadError";
     this.status = status;
+    this.code = code;
   }
 }
 
 /** Plain-language reason for a refused direct-download response. */
-export function directDownloadErrorMessage(status: number): string {
+export function directDownloadErrorMessage(status: number, code = ""): string {
+  switch (code) {
+    case "file_unavailable":
+      return "This version is no longer available. Refresh the list to see current versions.";
+    case "file_access_denied":
+      return "You do not have access to this file.";
+    case "format_unavailable":
+      return "This version can't be downloaded as a file. Play it instead.";
+  }
   switch (status) {
     case 401:
       return "Your session ended. Sign in again to download.";
@@ -35,6 +52,30 @@ export function directDownloadErrorMessage(status: number): string {
     default:
       return `Download could not be started (HTTP ${status}).`;
   }
+}
+
+/**
+ * Whether a refusal means the selected file_id no longer resolves, so the
+ * caller should re-fetch the item's versions instead of only toasting. A bare
+ * 404 on the direct-download URL has the same corrective action as the
+ * server's `file_unavailable` code.
+ */
+export function isStaleFileError(error: unknown): boolean {
+  return (
+    error instanceof DirectDownloadError &&
+    (error.code === "file_unavailable" || error.status === 404)
+  );
+}
+
+/** Reads the problem identifier out of a refusal body, or "" when it is absent. */
+async function probeProblemCode(res: Response): Promise<string> {
+  try {
+    const parsed = JSON.parse(await res.text()) as { type?: unknown };
+    if (typeof parsed?.type === "string") return problemId({ type: parsed.type });
+  } catch {
+    // A non-JSON body (a proxy error page, an empty body) carries no code.
+  }
+  return "";
 }
 
 /**
@@ -120,7 +161,13 @@ export async function prepareDirectDownload(
   }
   requireCurrent();
   if (!probeAccepted(probeRes.status)) {
-    throw new DirectDownloadError(probeRes.status, directDownloadErrorMessage(probeRes.status));
+    const code = await probeProblemCode(probeRes);
+    requireCurrent();
+    throw new DirectDownloadError(
+      probeRes.status,
+      directDownloadErrorMessage(probeRes.status, code),
+      code,
+    );
   }
   // Only the status and headers are needed. Cancel the one-byte probe body so
   // the connection is released instead of left half-read; aborting `signal`
