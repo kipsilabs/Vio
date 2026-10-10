@@ -168,7 +168,7 @@ func TestResolveVirtualTimingReportsRanStages(t *testing.T) {
 	}
 
 	var sum float64
-	for _, stage := range []string{"list_ms", "resolve_ms", "probe_ms", "fallback_ms"} {
+	for _, stage := range []string{"list_ms", "resolve_ms", "probe_ms", "track_discovery_ms", "fallback_ms"} {
 		if value, ok := entry[stage].(float64); ok {
 			sum += value
 		}

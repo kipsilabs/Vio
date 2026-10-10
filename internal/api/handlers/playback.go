@@ -310,6 +310,14 @@ func (f VirtualMediaDetailedResolverFunc) ResolveVirtualMediaDetailed(ctx contex
 type VirtualPlaybackSourceProber func(context.Context, string, *models.MediaFile) (*models.MediaFile, error)
 type VirtualPlaybackSourceProberWithHeaders func(context.Context, string, *models.MediaFile, map[string]string) (*models.MediaFile, error)
 
+// VirtualTrackEnumerator enumerates the audio and subtitle streams of an
+// already-resolved virtual source with a metadata-only ffprobe. It is the start
+// path's bounded fast track-discovery: unlike the full probe it does not scan
+// packets for duration, run the copy-safety or Dolby Vision probes, or persist
+// anything. The deferred ProbeVirtualSource remains the verifier. Nil disables
+// discovery and leaves the declared inventory path exactly as before.
+type VirtualTrackEnumerator func(context.Context, string, map[string]string) ([]models.AudioTrack, []models.SubtitleTrack, error)
+
 // VirtualProbeCacheLookup returns a completed probe from the virtual probe
 // cache without starting one. A nil result means no completed probe is
 // available. It lets the probe-failure damper recover evidence from a probe
@@ -477,6 +485,10 @@ type PlaybackHandler struct {
 	probeRefreshed   map[int]*playbackProbeRefresh
 	probeStartBudget time.Duration
 	probeRefreshWG   sync.WaitGroup
+	// trackDiscoveryBudget overrides the bounded wait the v2 deferred start
+	// allows the fast track-discovery before it falls back to declared
+	// inventory. Tests set it to keep the bound short.
+	trackDiscoveryBudget time.Duration
 	// CopySafetyRacer resolves an unknown H.264 copy-safety verdict behind an
 	// already-issued stream-copy plan. Optional: nil keeps unknown verdicts
 	// unknown and never withdraws a copy route.
@@ -554,9 +566,15 @@ type PlaybackHandler struct {
 	VirtualCandidateClearFailedMarker      func(ctx context.Context, fileID int, expectedFilePath string, observedFailedAt *time.Time) error
 	VirtualPlaybackSourceProber            VirtualPlaybackSourceProber
 	VirtualPlaybackSourceProberWithHeaders VirtualPlaybackSourceProberWithHeaders
-	VirtualProbeCacheLookup                VirtualProbeCacheLookup
-	BestResultCache                        *VirtualBestResultCache
-	VirtualFileSaver                       VirtualFileSaver
+	// VirtualTrackEnumerator, when wired, is the bounded fast track-discovery
+	// the v2 deferred start runs against the resolved provider URL before the
+	// cold plan is built, so the plan carries the real audio/subtitle stream
+	// table instead of the provider's declared label. Nil leaves the declared
+	// inventory path unchanged.
+	VirtualTrackEnumerator  VirtualTrackEnumerator
+	VirtualProbeCacheLookup VirtualProbeCacheLookup
+	BestResultCache         *VirtualBestResultCache
+	VirtualFileSaver        VirtualFileSaver
 	// VirtualFileMetadataSaver, when wired, is preferred over VirtualFileSaver
 	// by paths that must distinguish metadata persistence from identity
 	// adoption (stale fallback, evidence workers). Nil keeps legacy behavior.

@@ -1742,6 +1742,27 @@ func newChiRouter(deps Dependencies) chi.Router {
 			playbackHandler.VirtualPlaybackSourceProber = func(ctx context.Context, sourceURL string, file *models.MediaFile) (*models.MediaFile, error) {
 				return virtualSourceProberWithHeaders(ctx, sourceURL, file, nil)
 			}
+			// The start path's bounded fast track-discovery. It shares the
+			// probe's pinned-IP relay so ffprobe never resolves the provider's
+			// hostname independently of the SSRF policy, but runs a metadata-only
+			// stream enumeration instead of the full probe. See
+			// scanner.EnumerateVirtualSourceTracks.
+			playbackHandler.VirtualTrackEnumerator = func(ctx context.Context, sourceURL string, headers map[string]string) ([]models.AudioTrack, []models.SubtitleTrack, error) {
+				var relayURL string
+				var release func()
+				var relayErr error
+				insecureProbe := plugins.CoreVirtualPrivateStreamsAllowed(context.Background())
+				if insecureProbe {
+					relayURL, release, relayErr = remoteStreamRelay.RegisterInsecureWithHeaders(ctx, sourceURL, headers)
+				} else {
+					relayURL, release, relayErr = remoteStreamRelay.RegisterWithHeaders(ctx, sourceURL, headers)
+				}
+				if relayErr != nil {
+					return nil, nil, relayErr
+				}
+				defer release()
+				return scanner.EnumerateVirtualSourceTracks(ctx, ffprobePath, relayURL)
+			}
 			// Cache-only recovery for the probe-failure damper: a probe that
 			// outlived its caller's wait may have completed and landed here.
 			playbackHandler.VirtualProbeCacheLookup = func(sourceURL string, file *models.MediaFile) *models.MediaFile {

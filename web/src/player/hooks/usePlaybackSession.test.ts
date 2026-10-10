@@ -131,6 +131,7 @@ describe("buildStartRequestV3", () => {
       "default_audio_reconcile_response_v1",
       "source_committed_event_v1",
       "inventory_updated_event_v1",
+      "deferred_track_inventory_v1",
     ]);
     expect(buildStartRequestV3(startBase).client_features).toEqual(["playback_plan_v3"]);
   });
@@ -266,6 +267,7 @@ describe("buildReplanRequestV3", () => {
       "default_audio_reconcile_response_v1",
       "source_committed_event_v1",
       "inventory_updated_event_v1",
+      "deferred_track_inventory_v1",
     ]);
   });
 
