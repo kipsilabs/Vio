@@ -11,57 +11,62 @@ vi.mock("./SubtitleAppearancePanel", () => ({
   SubtitleAppearancePanel: () => null,
 }));
 
+function controlsProps(
+  markerEditAvailable: boolean,
+  overrides: Partial<ComponentProps<typeof PlayerControls>> = {},
+): ComponentProps<typeof PlayerControls> {
+  return {
+    visible: true,
+    playing: false,
+    currentTime: 0,
+    duration: 120,
+    buffered: null,
+    markerEditAvailable,
+    onToggleMarkerEdit: vi.fn(),
+    volume: 1,
+    muted: false,
+    isFullscreen: false,
+    videoFit: "contain",
+    onVideoFitToggle: vi.fn(),
+    subtitleTracks: [],
+    activeSubtitleIndex: null,
+    onSubtitleSelect: vi.fn(),
+    subtitleDelayMs: 0,
+    onSubtitleDelayChange: vi.fn(),
+    audioTracks: [],
+    activeAudioIndex: -1,
+    qualityOptions: [
+      {
+        id: "original",
+        label: "Original",
+        sublabel: "",
+        resolution: "1080p",
+        bitrateKbps: 0,
+        isOriginal: true,
+      },
+    ],
+    activeQualityId: "original",
+    isTranscoding: false,
+    qualityError: null,
+    onQualitySelect: vi.fn(),
+    showPlaybackInfo: false,
+    onTogglePlaybackInfo: vi.fn(),
+    onPlayPause: vi.fn(),
+    onSeek: vi.fn(),
+    onSkip: { back: vi.fn(), forward: vi.fn() },
+    skipSeconds: { back: 10, forward: 30 },
+    onVolumeChange: vi.fn(),
+    onMutedChange: vi.fn(),
+    onFullscreenToggle: vi.fn(),
+    ...overrides,
+  };
+}
+
 function renderControls(
   markerEditAvailable: boolean,
   overrides: Partial<ComponentProps<typeof PlayerControls>> = {},
 ) {
-  return render(
-    <PlayerControls
-      visible
-      playing={false}
-      currentTime={0}
-      duration={120}
-      buffered={null}
-      markerEditAvailable={markerEditAvailable}
-      onToggleMarkerEdit={vi.fn()}
-      volume={1}
-      muted={false}
-      isFullscreen={false}
-      videoFit="contain"
-      onVideoFitToggle={vi.fn()}
-      subtitleTracks={[]}
-      activeSubtitleIndex={null}
-      onSubtitleSelect={vi.fn()}
-      subtitleDelayMs={0}
-      onSubtitleDelayChange={vi.fn()}
-      audioTracks={[]}
-      activeAudioIndex={-1}
-      qualityOptions={[
-        {
-          id: "original",
-          label: "Original",
-          sublabel: "",
-          resolution: "1080p",
-          bitrateKbps: 0,
-          isOriginal: true,
-        },
-      ]}
-      activeQualityId="original"
-      isTranscoding={false}
-      qualityError={null}
-      onQualitySelect={vi.fn()}
-      showPlaybackInfo={false}
-      onTogglePlaybackInfo={vi.fn()}
-      onPlayPause={vi.fn()}
-      onSeek={vi.fn()}
-      onSkip={{ back: vi.fn(), forward: vi.fn() }}
-      skipSeconds={{ back: 10, forward: 30 }}
-      onVolumeChange={vi.fn()}
-      onMutedChange={vi.fn()}
-      onFullscreenToggle={vi.fn()}
-      {...overrides}
-    />,
-  );
+  return render(<PlayerControls {...controlsProps(markerEditAvailable, overrides)} />);
 }
 
 describe("PlayerControls", () => {
@@ -237,6 +242,48 @@ describe("PlayerControls", () => {
 
     expect(screen.getByRole("button", { name: "Audio tracks" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Enable captions" })).toBeDisabled();
+  });
+
+  // The cold-plan-to-verified-push transition: the menus derive from the
+  // session's track lists, so the same mounted controls grow an audio button and
+  // a populated subtitle list in place as soon as those lists arrive — no
+  // remount, no transport change.
+  it("mounts the audio button and subtitle list when the track lists arrive", () => {
+    const view = renderControls(false, {
+      onAudioSelect: vi.fn(),
+      mediaFileId: 8,
+      audioTracks: [],
+      subtitleTracks: [],
+    });
+    expect(screen.queryByRole("button", { name: "Audio tracks" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Enable captions" })).toBeInTheDocument();
+
+    view.rerender(
+      <PlayerControls
+        {...controlsProps(false, {
+          onAudioSelect: vi.fn(),
+          mediaFileId: 8,
+          audioTracks: [
+            { title: "English", codec: "eac3", channels: 6, default: true },
+            { title: "Spanish", codec: "ac3", channels: 2 },
+          ],
+          subtitleTracks: [
+            {
+              index: 0,
+              language: "en",
+              codec: "srt",
+              label: "English",
+              source: "embedded",
+              url: "/stream/session-1/subtitles/0.vtt",
+            },
+          ],
+        })}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Audio tracks" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Enable captions" }));
+    expect(screen.getByRole("menuitem", { name: /English/ })).toBeInTheDocument();
   });
 
   it("stops hidden compact transport buttons from taking clicks", () => {

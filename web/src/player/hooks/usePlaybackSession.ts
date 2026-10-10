@@ -353,8 +353,24 @@ function deferredIdentityIsAdmissible(
    */
   appliedPollNewer: SourceIdentity | null,
   outgoingSuperseded = false,
+  verifiedInventoryPush = false,
 ): boolean {
   if (!identityNamesSource(identity)) return false;
+
+  // A verified inventory revision is the server's own inventory for the live
+  // session. When it names the exact candidate the live source carries — at
+  // arrival or once the flush runs — the payload is not another source even
+  // when its catalog row differs from the plan's, so it folds in place. This is
+  // the same admission the direct path makes; without it, a verified push held
+  // behind a reconciliation replan would be refused at the flush and the menus
+  // a cold, empty plan never had would stay empty.
+  if (
+    verifiedInventoryPush &&
+    identity.uri != null &&
+    (identity.uri === outgoing.uri || identity.uri === applied.uri)
+  ) {
+    return true;
+  }
 
   // Whether the settled plan is a different adoption or the byte-for-byte
   // arrival plan. A refused plan still names the pre-rotation source, so its
@@ -2794,14 +2810,29 @@ export function usePlaybackSession(
       // No adoption in flight: a push that names another source than the player
       // is on is a stale delivery and is dropped. The synchronous mirror, not
       // the rendered state, is the live identity a rotation already committed.
-      if (
+      const payloadUri = payload.effective_virtual_uri ?? null;
+      const namesAnotherSource =
         (payload.effective_media_file_id != null &&
           liveIdentity.fileId != null &&
           payload.effective_media_file_id !== liveIdentity.fileId) ||
-        (payload.effective_virtual_uri != null &&
-          liveIdentity.uri != null &&
-          payload.effective_virtual_uri !== liveIdentity.uri)
-      ) {
+        (payloadUri != null && liveIdentity.uri != null && payloadUri !== liveIdentity.uri);
+      // A verified revision bound to the candidate the live source already names
+      // is this session's own probe evidence. Its `effective_media_file_id` can
+      // differ from the plan's when the cold plan committed before the probe
+      // materialized the candidate's catalog row; that row is the resolved
+      // identity for the same candidate, not another source. Admit it so the
+      // first real inventory mounts the menus in place — without this, a cold
+      // plan whose inventory is empty never gets a menu at all, because the one
+      // push that would create it is refused as stale. The declared/pending
+      // display states, the never-replan and no-reload guarantees, and every
+      // other stale-delivery guard are unchanged: only a `verified` revision for
+      // the exact live candidate crosses this gate.
+      const verifiedSameCandidate =
+        payload.inventory_status === "verified" &&
+        payloadUri != null &&
+        liveIdentity.uri != null &&
+        payloadUri === liveIdentity.uri;
+      if (namesAnotherSource && !verifiedSameCandidate) {
         return;
       }
       // A file-only push cannot be tied to a candidate. When the live source
@@ -2924,6 +2955,7 @@ export function usePlaybackSession(
           entry.kind === "source",
           appliedPollNewer,
           entry.kind === "source" && entry.outgoingFromDeferredSource,
+          entry.kind === "inventory" && entry.payload.inventory_status === "verified",
         )
       ) {
         handleRefusedPush(entry);
