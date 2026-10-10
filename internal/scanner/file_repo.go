@@ -17,7 +17,6 @@ import (
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/pathscope"
 	"github.com/Silo-Server/silo-server/internal/scanbatch"
-	"github.com/Silo-Server/silo-server/internal/virtuallibrary/stream"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -1388,7 +1387,7 @@ func (r *FileRepository) ReplaceVirtualCandidates(ctx context.Context, source *m
 		if err != nil {
 			return fmt.Errorf("marshal virtual candidate audio tracks: %w", err)
 		}
-		subtitleTracks, err := json.Marshal(languageSubtitleTracks(candidate.SubtitleLanguages))
+		subtitleTracks, err := json.Marshal(registrationSubtitleTracks(candidate.SubtitleLanguages))
 		if err != nil {
 			return fmt.Errorf("marshal virtual candidate subtitle tracks: %w", err)
 		}
@@ -1996,16 +1995,16 @@ func languageAudioTracks(languages []string) []models.AudioTrack {
 	return result
 }
 
-func languageSubtitleTracks(languages []string) []models.SubtitleTrack {
-	// Collapse language aliases onto one entry per base language so a re-list
-	// cannot persist two placeholder rows for the same language (for example
-	// "EN-US" and "ENG" from a release name).
-	deduped := stream.DedupeLanguageAliases(languages)
-	result := make([]models.SubtitleTrack, 0, len(deduped))
-	for _, language := range deduped {
-		result = append(result, models.SubtitleTrack{Language: language})
-	}
-	return result
+// registrationSubtitleTracks returns the embedded subtitle inventory a virtual
+// registration or candidate listing persists for a row. It is always empty:
+// declared subtitle languages are provider hints, not observed streams, and
+// persisting them as embedded tracks fabricates language-only rows (Codec="",
+// Index=0) that map to a phantom ffmpeg 0:s:N and make the row look like it
+// already carries subtitles, suppressing the search the hint is meant to
+// drive. Embedded subtitle inventory is owned by the probe; the declared
+// languages stay on the candidate stream as a search/display hint.
+func registrationSubtitleTracks([]string) []models.SubtitleTrack {
+	return []models.SubtitleTrack{}
 }
 
 // identityColumnDefaults normalizes the identity/grouping zero values the way

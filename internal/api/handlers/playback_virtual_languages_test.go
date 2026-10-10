@@ -1119,10 +1119,12 @@ func TestMergeVirtualCandidateTracksProbeFailureYieldsLabeledPerLanguageTracks(t
 	}
 }
 
-// No declared languages (all filtered): the single anonymous generic track is
-// the preserved fallback so a release without usable language metadata still
-// has a playable default.
-func TestMergeVirtualCandidateTracksProbeFailureWithoutLanguagesKeepsGenericTrack(t *testing.T) {
+// No declared languages (all filtered): the inventory stays empty. A
+// language-less anonymous track is never synthesized — it would make a
+// multi-stream release look like exactly one stream and pin the plan to index
+// 0, and the deferred probe (the real inventory) could not re-select it. The
+// cold plan reports pending instead.
+func TestMergeVirtualCandidateTracksProbeFailureWithoutLanguagesStaysEmpty(t *testing.T) {
 	probed := &models.MediaFile{Resolution: "2160p", CodecVideo: "hevc"}
 	candidate := VirtualPlaybackStream{
 		CodecAudio:     "aac",
@@ -1131,14 +1133,8 @@ func TestMergeVirtualCandidateTracksProbeFailureWithoutLanguagesKeepsGenericTrac
 
 	mergeVirtualCandidateTracks(probed, candidate)
 
-	if len(probed.AudioTracks) != 1 {
-		t.Fatalf("audio tracks = %#v, want exactly the one generic fallback", probed.AudioTracks)
-	}
-	if probed.AudioTracks[0].Language != "" {
-		t.Fatalf("generic track language = %q, want empty", probed.AudioTracks[0].Language)
-	}
-	if !probed.AudioTracks[0].Default {
-		t.Fatal("generic track should be marked default")
+	if len(probed.AudioTracks) != 0 {
+		t.Fatalf("audio tracks = %#v, want none (no language-less synthesis)", probed.AudioTracks)
 	}
 }
 

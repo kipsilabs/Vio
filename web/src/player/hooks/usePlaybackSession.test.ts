@@ -3562,6 +3562,138 @@ describe("usePlaybackSession server-invalidated plans", () => {
     unmount();
   });
 
+  // The deferred-inventory adoption: a cold virtual start commits a plan from
+  // declared audio metadata, the probe reorders the inventory so the preferred
+  // track lands at the same POSITIONAL index, and the verified revision then
+  // arrives. Both menus fill in without a client replan; the server withdraws
+  // the stale recipe and the client's replacement replan adopts the corrected
+  // plan. The replacement is transport-different even though the positional
+  // `selected_tracks.audio.index` is unchanged, because the executable stream
+  // ordinal moved — the element must reload, or the already-rebuilt session
+  // stream (which now muxes the corrected audio) is never read and playback
+  // stays silent until a stop/resume.
+  // The in-place adoption invariant: the deferred probe's real lists land
+  // while the cold-start plan is still provisional, and a later plan adoption
+  // (an output/quality refresh built before the probe persisted) must not
+  // regress the menus to the stale declared list. Nothing replans for the
+  // adoption, nothing reloads, and what is already playing keeps playing.
+  it("keeps the real deferred inventory in place when a later provisional plan is adopted", async () => {
+    const declaredAudio = [
+      { index: 1, language: "eng", codec: "aac", channels: 2, layout: "stereo", default: true },
+      { index: 3, language: "spa", codec: "eac3", channels: 6, layout: "5.1", default: false },
+    ];
+    // The probe found the preferred spa stream first in the verified order.
+    const verifiedAudio = [
+      { index: 3, language: "spa", codec: "eac3", channels: 6, layout: "5.1", default: true },
+      { index: 1, language: "eng", codec: "aac", channels: 2, layout: "stereo", default: false },
+    ];
+    const declaredPlan = fixturePlanV3({
+      inventory_status: "declared",
+      inventory_provenance: "pending",
+      tracks_pending: true,
+      audio_tracks: declaredAudio,
+      selected_tracks: { audio: { id: "file:7:audio:0", index: 0 } },
+    });
+    // A replan built before the probe persisted: provisional again, carrying
+    // the stale declared list rather than the real one.
+    const provisionalPlan = fixturePlanV3({
+      plan_id: "plan:2222222222222222",
+      plan_attempt_key: "v3:2222222222222222",
+      inventory_status: "declared",
+      inventory_provenance: "pending",
+      tracks_pending: true,
+      audio_tracks: declaredAudio,
+      selected_tracks: { audio: { id: "file:7:audio:0", index: 0 } },
+    });
+    const verifiedSubtitle = {
+      track_id: "file:7:subtitle:0",
+      combined_index: 0,
+      source: "embedded" as const,
+      codec: "subrip",
+      language: "eng",
+      forced: false,
+      default: false,
+      hearing_impaired: false,
+      delivery: "sidecar" as const,
+      url: "/stream/session-1/subtitles/0.vtt?file_id=7",
+    };
+    const replanBodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/playback/start")) {
+          return jsonResponse(
+            {
+              protocol_version: 3,
+              server_features: ["playback_plan_v3"],
+              outcome: "playable",
+              session_id: "session-1",
+              playback_plan: declaredPlan,
+            },
+            { status: 201 },
+          );
+        }
+        if (url.endsWith("/playback/session-1/replan")) {
+          replanBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+          return jsonResponse({
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: provisionalPlan,
+          });
+        }
+        if (url.endsWith("/playback/route-events")) {
+          return new Response(null, { status: 202 });
+        }
+        if (init?.method === "DELETE") {
+          return new Response(null, { status: 204 });
+        }
+        throw new Error(`Unexpected request: ${url}`);
+      }),
+    );
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe("plan:0123456789abcdef"));
+    expect(result.current.audioInventoryProvisional).toBe(true);
+    expect(result.current.transportRevision).toBe(1);
+
+    // The verified revision lands while the provisional plan is still playing:
+    // both menus fill in without a client replan and without a stream reload.
+    act(() =>
+      result.current.applyInventoryUpdate({
+        session_id: "session-1",
+        inventory_revision: "inv:1",
+        inventory_status: "verified",
+        effective_media_file_id: 7,
+        audio_tracks: verifiedAudio,
+        subtitle_inventory: [verifiedSubtitle],
+      }),
+    );
+    expect(replanBodies).toHaveLength(0);
+    expect(result.current.audioInventoryProvisional).toBe(false);
+    expect(result.current.planAudioTracks).toEqual(verifiedAudio);
+    expect(result.current.subtitleUrls).toHaveLength(1);
+
+    // A later provisional plan is adopted (vehicle: an ordinary track change).
+    // The real lists must survive it in place; the stream does not reload.
+    await act(async () => {
+      result.current.switchAudioTrack(1, 450);
+    });
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe("plan:2222222222222222"));
+    expect(replanBodies).toHaveLength(1);
+    expect(result.current.planAudioTracks).toEqual(verifiedAudio);
+    expect(result.current.audioInventoryProvisional).toBe(false);
+    expect(result.current.subtitleUrls).toHaveLength(1);
+    expect(result.current.transportRevision).toBe(1);
+
+    unmount();
+  });
+
   // The generic path is what a genuine route failure depends on, and it must not
   // have widened to swallow every reason while the audio path was carved out.
   it("keeps failure_recovery semantics for any other invalidation reason", async () => {

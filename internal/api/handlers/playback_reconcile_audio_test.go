@@ -135,6 +135,88 @@ func TestReconcileVerifiedDefaultAudioReordersToPreferredLanguage(t *testing.T) 
 
 func intPtrReconcile(v int) *int { return &v }
 
+// TestDeferredInventoryAdoptionPublishesRealTracksInPlace pins the server's
+// side of the in-place adoption invariant. When the deferred probe lands, the
+// real verified inventory is published to the live session as the adoption
+// source, and the server does NOT commit a replacement plan for it: what the
+// client is playing keeps playing, and its menus are updated from the push.
+func TestDeferredInventoryAdoptionPublishesRealTracksInPlace(t *testing.T) {
+	const fileID = 9101
+	manager := playback.NewSessionManager(0, 0)
+	session, err := manager.StartSession(1, "profile-1", fileID, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	probedAt := time.Now().UTC()
+	file := &models.MediaFile{
+		ID:             fileID,
+		ContentID:      "movie-adopt-in-place",
+		FilePath:       "/media/adopt-in-place.mkv",
+		ProbeUpdatedAt: &probedAt,
+		AudioTracks: []models.AudioTrack{
+			{Index: 1, Codec: "aac", Channels: 2, Language: "eng", Default: true},
+			{Index: 3, Codec: "eac3", Channels: 6, Language: "spa"},
+		},
+		SubtitleTracks: []models.SubtitleTrack{
+			{Index: 4, Codec: "subrip", Language: "eng", Default: true},
+		},
+	}
+	handler := NewPlaybackHandler(manager, testPlaybackFileResolver{file: file})
+	handler.RealtimeHub = playback.NewRealtimeHub()
+	if err := manager.SetRealtimeConnection(session.ID, true); err != nil {
+		t.Fatalf("SetRealtimeConnection: %v", err)
+	}
+	conn := &sourceCommittedTestConn{}
+	registration := handler.RealtimeHub.Register(session.ID, conn)
+	if registration == nil {
+		t.Fatal("expected a realtime registration")
+	}
+	defer handler.RealtimeHub.Unregister(registration)
+
+	record := reconcileIntent("spa", nil, nil)
+	record.SessionID = session.ID
+	record.RequestedMediaFileID = fileID
+	record.EffectiveMediaFileID = fileID
+	record.CurrentPlanID = "plan-in-place"
+	if err := handler.PlanStoreV3.SaveAttempt(context.Background(), *record); err != nil {
+		t.Fatalf("save attempt: %v", err)
+	}
+
+	handler.PublishInventoryUpdated(context.Background(), fileID)
+
+	if len(conn.messages) != 1 {
+		t.Fatalf("delivered %d events, want 1", len(conn.messages))
+	}
+	event, ok := conn.messages[0].(playback.EventEnvelope)
+	if !ok {
+		t.Fatalf("message type = %T, want playback.EventEnvelope", conn.messages[0])
+	}
+	if event.Name != playback.RealtimeEventInventoryUpdated {
+		t.Fatalf("event name = %q, want %q", event.Name, playback.RealtimeEventInventoryUpdated)
+	}
+	var payload playback.InventoryUpdatedPayload
+	if err := json.Unmarshal(event.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	if payload.InventoryStatus != string(ProbeProvenanceVerified) {
+		t.Fatalf("inventory status = %q, want verified", payload.InventoryStatus)
+	}
+	if len(payload.AudioTracks) != 2 || len(payload.SubtitleInventory) != 1 {
+		t.Fatalf("adopted inventory = %d audio / %d subtitle, want 2 / 1",
+			len(payload.AudioTracks), len(payload.SubtitleInventory))
+	}
+
+	// The publication is menu data: the plan the session is playing is not
+	// replaced, so nothing on the output restarts.
+	after, err := handler.PlanStoreV3.GetAttempt(context.Background(), session.ID)
+	if err != nil {
+		t.Fatalf("get attempt: %v", err)
+	}
+	if after.CurrentPlanID != "plan-in-place" {
+		t.Fatalf("adoption replaced the plan (%q), want it left in place", after.CurrentPlanID)
+	}
+}
+
 // reconcileCapabilities is the minimum client codec evidence a v3 replan body
 // must carry to be valid.
 func reconcileCapabilities() playback.ClientCodecCapabilitiesV3 {
