@@ -50,6 +50,7 @@ type scanStateFile struct {
 	MultiEpisodeEnd        int
 	ProbeSource            string
 	ProbeUpdatedAt         *time.Time
+	ProbeFailedAt          *time.Time
 	ProbeVersion           int
 	MissingSince           *time.Time
 	HasVideoTracks         bool
@@ -68,7 +69,7 @@ const scanStateColumns = `id, content_id, episode_id, extra_id,
 	edition_raw, edition_key, edition_confidence, edition_source,
 	presentation_kind, presentation_group_key, presentation_part_index,
 	multi_episode_start, multi_episode_end,
-	probe_source, probe_updated_at, probe_version, missing_since,
+	probe_source, probe_updated_at, probe_failed_at, probe_version, missing_since,
 	COALESCE(jsonb_typeof(video_tracks) = 'array' AND jsonb_array_length(video_tracks) > 0, FALSE) AS has_video_tracks,
 	COALESCE((
 		SELECT bool_or(lower(btrim(COALESCE(track->>'codec', ''))) NOT IN ('mjpeg', 'jpeg', 'png', 'webp', 'gif', 'bmp'))
@@ -145,6 +146,7 @@ func scanScanStateRow(row pgx.Row) (*scanStateFile, error) {
 		&multiEpisodeEnd,
 		&probeSource,
 		&state.ProbeUpdatedAt,
+		&state.ProbeFailedAt,
 		&probeVersion,
 		&state.MissingSince,
 		&state.HasVideoTracks,
@@ -280,11 +282,8 @@ func (r *FileRepository) GetScanStateByFolder(ctx context.Context, folderID int)
 // GetScanStateByFolderAndPathPrefix returns lightweight scan-state rows for a
 // folder subtree.
 func (r *FileRepository) GetScanStateByFolderAndPathPrefix(ctx context.Context, folderID int, pathPrefix string) ([]*scanStateFile, error) {
-	clauses, args := pathscope.RangeCoverageClauses("file_path", []string{pathPrefix}, 2)
-	query := `SELECT ` + scanStateColumns + ` FROM media_files
-		WHERE media_folder_id = $1 AND (` + strings.Join(clauses, " OR ") + `)
-		ORDER BY file_path ASC`
-	rows, err := r.pool.Query(ctx, query, append([]any{folderID}, args...)...)
+	query, args := folderPathPrefixQuery(scanStateColumns, folderID, pathPrefix)
+	rows, err := r.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("querying scan state by folder and path prefix: %w", err)
 	}
@@ -368,8 +367,9 @@ func scanStateFromMediaFile(file *models.MediaFile) *scanStateFile {
 		MultiEpisodeStart:      file.MultiEpisodeStart,
 		MultiEpisodeEnd:        file.MultiEpisodeEnd,
 		ProbeSource:            file.ProbeSource,
-		ProbeVersion:           file.ProbeVersion,
 		ProbeUpdatedAt:         file.ProbeUpdatedAt,
+		ProbeFailedAt:          file.ProbeFailedAt,
+		ProbeVersion:           file.ProbeVersion,
 		MissingSince:           file.MissingSince,
 		HasVideoTracks:         len(file.VideoTracks) > 0,
 		HasNonImageVideoTracks: probeFacts.HasNonImageVideoTracks,

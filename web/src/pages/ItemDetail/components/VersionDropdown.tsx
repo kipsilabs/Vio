@@ -199,7 +199,7 @@ function VersionDropdown({
             >
               <Layers3 className="size-3.5" />
               Edition
-              <span className="text-muted-foreground max-w-44 truncate text-[11px] font-normal sm:max-w-64">
+              <span className="text-muted-foreground max-w-44 truncate text-[0.6875rem] font-normal sm:max-w-64">
                 {selectedEdition.label}
               </span>
               <ChevronDown className="text-muted-foreground size-3" />
@@ -248,7 +248,7 @@ function VersionDropdown({
             >
               <Disc3 className="size-3.5" />
               Version
-              <span className="text-muted-foreground max-w-44 truncate text-[11px] font-normal sm:max-w-64">
+              <span className="text-muted-foreground max-w-44 truncate text-[0.6875rem] font-normal sm:max-w-64">
                 {activeVersion ? buildVersionTriggerSummary(activeVersion) : ""}
               </span>
               <ChevronDown className="text-muted-foreground size-3" />
@@ -298,7 +298,10 @@ function VersionDropdown({
                       <div className="flex items-center gap-2">
                         <span className="text-sm font-medium">{summary || "Video version"}</span>
                         {rangeLabel ? (
-                          <Badge variant="secondary" className="px-1.5 py-0 text-[10px] uppercase">
+                          <Badge
+                            variant="secondary"
+                            className="px-1.5 py-0 text-[0.625rem] uppercase"
+                          >
                             {rangeLabel}
                           </Badge>
                         ) : null}
@@ -308,8 +311,8 @@ function VersionDropdown({
                             title={health.title}
                             className={
                               health.tone === "danger"
-                                ? "border-red-500/30 bg-red-500/15 px-1.5 py-0 text-[10px] font-medium text-red-600 dark:text-red-300"
-                                : "border-amber-500/30 bg-amber-500/15 px-1.5 py-0 text-[10px] font-medium text-amber-600 dark:text-amber-300"
+                                ? "border-red-500/30 bg-red-500/15 px-1.5 py-0 text-[0.625rem] font-medium text-red-600 dark:text-red-300"
+                                : "border-amber-500/30 bg-amber-500/15 px-1.5 py-0 text-[0.625rem] font-medium text-amber-600 dark:text-amber-300"
                             }
                           >
                             {health.label}
@@ -318,7 +321,7 @@ function VersionDropdown({
                         {hasFormatScore(version.format_score) ? (
                           <Badge
                             variant="outline"
-                            className="text-muted-foreground bg-muted/40 px-1.5 py-0 font-mono text-[10px] font-medium"
+                            className="text-muted-foreground bg-muted/40 px-1.5 py-0 font-mono text-[0.625rem] font-medium"
                             title={formatScoreTitle(version.format_score, versionProfileLabel)}
                           >
                             {formatScoreBadgeLabel(version.format_score)}
@@ -330,7 +333,7 @@ function VersionDropdown({
                           <Badge
                             key={lang}
                             variant="outline"
-                            className="border-blue-500/20 bg-blue-500/10 px-1 py-0 text-[10px] font-medium text-blue-400"
+                            className="border-blue-500/20 bg-blue-500/10 px-1 py-0 text-[0.625rem] font-medium text-blue-400"
                           >
                             <span className="mr-0.5 opacity-70">🔊</span>
                             {lang}
@@ -346,7 +349,7 @@ function VersionDropdown({
                             <Badge
                               key={lang}
                               variant="outline"
-                              className="border-amber-500/20 bg-amber-500/10 px-1 py-0 text-[10px] font-medium text-amber-400"
+                              className="border-amber-500/20 bg-amber-500/10 px-1 py-0 text-[0.625rem] font-medium text-amber-400"
                             >
                               <span className="mr-0.5 opacity-70">CC</span>
                               {lang}
@@ -421,7 +424,9 @@ function VersionRefreshRow({ refreshing, cancelable, error, onPress }: VersionRe
       />
       <span className="flex min-w-0 flex-col">
         <span>{refreshing && cancelable ? "Cancel refresh" : "Refresh List"}</span>
-        {error ? <span className="text-destructive text-[10px] leading-tight">{error}</span> : null}
+        {error ? (
+          <span className="text-destructive text-[0.625rem] leading-tight">{error}</span>
+        ) : null}
       </span>
     </button>
   );

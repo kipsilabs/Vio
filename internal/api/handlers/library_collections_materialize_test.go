@@ -515,7 +515,7 @@ func TestHandleMaterializeAdminCollectionItem_RoutedAuthorization(t *testing.T) 
 				next.ServeHTTP(w, req.WithContext(reqCtx))
 			})
 		})
-		r.Use(apimw.RequireActingAdmin(primaryChecker))
+		r.Use(apimw.RequireActingAdmin(primaryChecker, nil))
 		r.Post("/{id}/materialize/{item_id}", handler.HandleMaterializeAdminCollectionItem)
 	})
 
@@ -663,7 +663,7 @@ func TestHandleRemoveAdminCollectionItem_Routed(t *testing.T) {
 				next.ServeHTTP(w, req.WithContext(reqCtx))
 			})
 		})
-		r.Use(apimw.RequireActingAdmin(primaryChecker))
+		r.Use(apimw.RequireActingAdmin(primaryChecker, nil))
 		r.Delete("/{id}/items/{item_id}", handler.HandleRemoveAdminCollectionItem)
 	})
 

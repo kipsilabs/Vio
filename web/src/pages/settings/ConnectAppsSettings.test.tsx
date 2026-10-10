@@ -197,6 +197,10 @@ describe("ConnectAppsSettings", () => {
 
     render();
 
+    expect(container.textContent).toContain("Every profile at a glance");
+    expect(container.textContent).toContain("rename to use from a Jellyfin app");
+    expect(container.textContent).not.toContain("johndoe#Movie #2");
+
     await click(findButton(container, "Movie #2"));
 
     expect(container.textContent).toContain("contains a #, which Jellyfin apps can't sign in with");
@@ -206,18 +210,6 @@ describe("ConnectAppsSettings", () => {
         (button) => button.getAttribute("aria-label") === "Copy Username",
       ),
     ).toBeUndefined();
-  });
-
-  it("keeps the page usable when no public compat address is configured", () => {
-    mocks.useCompatConnectInfo.mockReturnValue({
-      data: makeConnectInfo({ public_url: "" }),
-      isLoading: false,
-    });
-
-    render();
-
-    expect(container.textContent).toContain("No public address configured");
-    expect(container.textContent).toContain("johndoe#Doe Household");
   });
 
   it("reports a failed load instead of claiming compat is switched off", () => {
@@ -282,18 +274,5 @@ describe("ConnectAppsSettings", () => {
         (button) => button.getAttribute("aria-label") === "Copy Server",
       ),
     ).toBeUndefined();
-  });
-
-  it("does not list a #-bearing profile as a usable credential in the summary", () => {
-    mocks.useProfiles.mockReturnValue({
-      data: [makeProfile(), makeProfile({ id: "profile-2", name: "Movie #2" })],
-      isLoading: false,
-    });
-
-    render();
-
-    expect(container.textContent).toContain("Every profile at a glance");
-    expect(container.textContent).toContain("rename to use from a Jellyfin app");
-    expect(container.textContent).not.toContain("johndoe#Movie #2");
   });
 });

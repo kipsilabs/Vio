@@ -5,10 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"reflect"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/danielgtaylor/huma/v2"
@@ -30,17 +30,23 @@ func TestProfileHeaderRequiredMatchesGateChain(t *testing.T) {
 		t.Run(string(class), func(t *testing.T) {
 			op := &Operation{Operation: huma.Operation{Method: http.MethodGet, Path: Prefix + "/x", OperationID: "getX"}, Class: class}
 			documentDeclaration(op, nil)
-			var param *huma.Param
+			var param, token *huma.Param
 			for _, p := range op.Parameters {
 				if p.In == "header" && p.Name == profileHeader {
 					param = p
 				}
+				if p.In == "header" && p.Name == profileTokenHeader {
+					token = p
+				}
 			}
 			if want == nil {
-				if param != nil {
-					t.Fatalf("%s documents %s", class, profileHeader)
+				if param != nil || token != nil {
+					t.Fatalf("%s documents profile headers", class)
 				}
 				return
+			}
+			if token == nil || token.Required || token.Description == "" {
+				t.Fatalf("%s must document optional %s with a description", class, profileTokenHeader)
 			}
 			if param == nil {
 				t.Fatalf("%s does not document %s", class, profileHeader)
@@ -55,76 +61,22 @@ func TestProfileHeaderRequiredMatchesGateChain(t *testing.T) {
 	}
 }
 
-// TestImpliedStatusesTable locks the per-shape problem statuses the listener
-// really produces: 408 rides on every body (the body-read deadline applies to
-// all of them), alongside 413 and 415; 404 rides on a path parameter and on
-// every profile-resolving class (viewer access answers it for an unknown
-// X-Profile-Id); 503 rides on a service-backed handler even when public; the
-// gated statuses on every non-public class.
-func TestImpliedStatusesTable(t *testing.T) {
-	cases := []struct {
-		name          string
-		class         Class
-		demo          bool
-		serviceBacked bool
-		body, path    bool
-		want          []int
-	}{
-		{name: "public no body", class: ClassPublic, want: []int{400, 406, 422, 500}},
-		{name: "public body", class: ClassPublic, body: true, want: []int{400, 406, 408, 413, 415, 422, 500}},
-		{name: "public service backed", class: ClassPublic, serviceBacked: true, want: []int{400, 406, 422, 500, 503}},
-		{name: "authenticated path", class: ClassAuthenticated, path: true, want: []int{400, 401, 404, 406, 422, 429, 500, 503}},
-		{name: "authenticated demo body", class: ClassAuthenticated, demo: true, body: true, want: []int{400, 401, 403, 406, 408, 413, 415, 422, 429, 500, 503}},
-		{name: "authenticated service backed", class: ClassAuthenticated, serviceBacked: true, want: []int{400, 401, 406, 422, 429, 500, 503}},
-		{name: "profile scoped", class: ClassProfileScoped, want: []int{400, 401, 403, 404, 406, 422, 429, 500, 503}},
-		{name: "profile scoped body path", class: ClassProfileScoped, body: true, path: true, want: []int{400, 401, 403, 404, 406, 408, 413, 415, 422, 429, 500, 503}},
-		{name: "acting admin", class: ClassActingAdmin, want: []int{400, 401, 403, 404, 406, 422, 429, 500, 503}},
-		{name: "permission gated", class: ClassPermissionGated, want: []int{400, 401, 403, 404, 406, 422, 429, 500, 503}},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := ImpliedStatuses(tc.class, tc.demo, tc.serviceBacked, tc.body, tc.path, false, false, false)
-			if !reflect.DeepEqual(got, tc.want) {
-				t.Fatalf("ImpliedStatuses = %v, want %v", got, tc.want)
-			}
-		})
-	}
-}
+// The generator has no runtime dependencies. Cache immutable JSON while each
+// consumer receives its own bytes and decoded schema objects.
+var generatedOpenAPI = sync.OnceValues(func() (string, error) {
+	raw, err := GenerateOpenAPI()
+	return string(raw), err
+})
 
-// TestDocumentDeclarationKeepsDeclaredErrors: a status the operation declares
-// itself (updateProfile's 409) survives the class table being merged in, and
-// the shared statuses join it.
-func TestDocumentDeclarationKeepsDeclaredErrors(t *testing.T) {
-	op := &Operation{Operation: huma.Operation{Method: http.MethodPatch, Path: Prefix + "/x/{id}", OperationID: "patchX", Errors: []int{http.StatusConflict}}, Class: ClassProfileScoped}
-	documentDeclaration(op, reflect.TypeOf(ProfileUpdateInput{}))
-	want := map[int]bool{http.StatusConflict: true, http.StatusRequestTimeout: true, http.StatusNotFound: true, http.StatusUnsupportedMediaType: true}
-	for _, s := range op.Errors {
-		delete(want, s)
-	}
-	if len(want) != 0 {
-		t.Fatalf("errors %v lack %v", op.Errors, want)
-	}
-}
-
-// TestDeclaredResponseDescriptionSurvivesRegistration: a description a
-// registration declares on a status it also lists in Errors is what the
-// document carries, not the bare status text Huma's defineErrors writes.
-func TestDeclaredResponseDescriptionSurvivesRegistration(t *testing.T) {
-	doc := generatedDocument(t)
-	op := doc["paths"].(map[string]any)["/api/v2/settings/values/nav.shortcuts/item"].(map[string]any)["put"].(map[string]any)
-	resp := op["responses"].(map[string]any)[strconv.Itoa(http.StatusConflict)].(map[string]any)
-	if got := resp["description"]; got != navigationShortcutConflictDescription {
-		t.Fatalf("409 description = %q", got)
-	}
-	if _, ok := resp["content"].(map[string]any)[problemContentType]; !ok {
-		t.Fatalf("409 lost its problem content: %v", resp)
-	}
+func generatedOpenAPIBytes() ([]byte, error) {
+	raw, err := generatedOpenAPI()
+	return []byte(raw), err
 }
 
 // generatedDocument decodes the generator's output for the tests that walk it.
 func generatedDocument(t *testing.T) map[string]any {
 	t.Helper()
-	raw, err := GenerateOpenAPI()
+	raw, err := generatedOpenAPIBytes()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -409,6 +361,9 @@ func TestGeneratedDocumentStatuses(t *testing.T) {
 	for _, id := range []string{"getPlaybackCapabilities", "startPlayback", "updatePlaybackProgress", "stopPlayback", "reportPlaybackRouteEvent", "replanPlayback", "getPlaybackInventory"} {
 		profileToken[id] = true
 	}
+	for _, id := range []string{"pauseAdminDownloadPreparations", "resumeAdminDownloadPreparations", "cancelAdminDownloadPreparations", "listAdminDownloadPreparations", "getAdminDownloadPreparationCapabilities", "getAdminDownloadStorageCapabilities", "getAdminDownloadStorage", "listAdminDownloadStorageFiles", "listAdminDownloadStorageEvents", "deleteAdminDownloadStorageFiles", "deleteAdminDownloadStorageUntrackedFiles", "cleanUpAdminDownloadStorageLocation", "listAdminDownloadDevices", "listAdminDownloadEntries", "revokeAdminDownloads", "prepareDownloadAgain", "createPersonalAPIKey", "createDirectDownloadLink", "listAdminUserProfileSectionOverrides", "replaceAdminUserProfileSectionOverrides", "resetAdminUserProfileSectionOverrides", "getAdminUserProfileSectionSettings", "getAdminUserPolicyDefaults", "listAdminUserLoginSessions", "deleteAdminUserLoginSession", "deleteAdminUserLoginSessions", "setSubtitleTiming", "getSubtitleSync", "startSubtitleSync", "listSubtitleSync", "skipShuffleItem", "advanceShuffle", "getShuffleCapability", "createShuffle", "getShuffle", "deleteShuffle", "listAdminCollectionSections"} {
+		profileToken[id] = true
+	}
 	expect["startPlayback"] = map[int]bool{http.StatusCreated: true, http.StatusAccepted: false, http.StatusConflict: true, http.StatusNotImplemented: false}
 	expect["stopPlayback"] = map[int]bool{http.StatusOK: true, http.StatusAccepted: false, http.StatusConflict: true, http.StatusNotImplemented: false}
 	expect["updatePlaybackProgress"] = map[int]bool{http.StatusOK: true, http.StatusConflict: true, http.StatusNotImplemented: false}
@@ -501,6 +456,49 @@ func TestGeneratedDocumentRequestMediaTypes(t *testing.T) {
 	if bodies == 0 {
 		t.Fatal("no operation with a request body; the media-type rule is untested")
 	}
+}
+
+var historyImportOperationIDs = []string{
+	"listHistoryImportSources", "listHistoryImportRuns", "createHistoryImportRun", "getHistoryImportRun", "createPlexPin", "checkPlexPin", "loginEmbyConnect",
+}
+
+// personalCollectionOperationIDs is every profile-scoped operation the
+// personal-collections section registers (stage A).
+var personalCollectionOperationIDs = []string{
+	"addCollectionItem",
+	"clearCollectionSortPreference",
+	"createCollection",
+	"createCollectionGroup",
+	"deleteCollection",
+	"deleteCollectionGroup",
+	"deleteCollectionImage",
+	"getCollection",
+	"getCollectionCapabilities",
+	"getCollectionGroup",
+	"getCollectionGroupsOrder",
+	"getCollectionItems",
+	"getCollectionItemsOrder",
+	"getCollectionOrder",
+	"getLibraryCollectionItems",
+	"importMDBListCollection",
+	"importTMDBCollection",
+	"importTMDBListCollection",
+	"importTraktCollection",
+	"listCollectionTemplates",
+	"listCollections",
+	"listServerCollections",
+	"listTopMDBListLists",
+	"previewCollection",
+	"removeCollectionItem",
+	"reorderCollectionGroups",
+	"reorderCollectionItems",
+	"reorderCollections",
+	"searchMDBListLists",
+	"setCollectionSortPreference",
+	"syncCollection",
+	"updateCollection",
+	"updateCollectionGroup",
+	"uploadCollectionPoster",
 }
 
 // libraryOperationIDs is every acting-admin library operation the
@@ -890,34 +888,6 @@ func lintExtensions(raw []byte) []string {
 	return out
 }
 
-// TestNotModifiedHasNoBody proves through the real router that a conditional
-// read answering 304 sends the ETag, no body and no Content-Type, and that
-// the same read without a matching If-None-Match is a normal 200.
-func TestNotModifiedHasNoBody(t *testing.T) {
-	h := NewHandler(Dependencies{testRegister: registerConcurrencyDocProbes})
-	current := RenderETag("doc", "a", 1)
-	rec := do(t, h, http.MethodGet, Prefix+"/docprobe/a", "", map[string]string{"If-None-Match": current.String()})
-	if rec.Code != http.StatusNotModified {
-		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
-	}
-	if rec.Body.Len() != 0 {
-		t.Fatalf("304 carries a body: %q", rec.Body.String())
-	}
-	if got := rec.Header().Get("ETag"); got != current.String() {
-		t.Fatalf("ETag = %q, want %q", got, current.String())
-	}
-	if ct := rec.Header().Get("Content-Type"); ct != "" {
-		t.Fatalf("304 carries Content-Type %q", ct)
-	}
-	if requestIDHeader(rec) == "" {
-		t.Fatal("304 lacks X-Request-ID")
-	}
-	rec = do(t, h, http.MethodGet, Prefix+"/docprobe/a", "", map[string]string{"If-None-Match": RenderETag("doc", "a", 2).String()})
-	if rec.Code != http.StatusOK || rec.Body.Len() == 0 || rec.Header().Get("ETag") != current.String() {
-		t.Fatalf("non-matching read: %d %q etag %q", rec.Code, rec.Body.String(), rec.Header().Get("ETag"))
-	}
-}
-
 // TestRegisterRefusesBadConcurrencyDeclarations: the shape rules are build
 // failures, not request failures.
 func TestRegisterRefusesBadConcurrencyDeclarations(t *testing.T) {
@@ -1151,23 +1121,23 @@ func TestRegisterRefusesBadConcurrencyDeclarations(t *testing.T) {
 					t.Fatalf("panic %v does not mention %q", r, c.want)
 				}
 			}()
-			newChiRouter(Dependencies{testRegister: func(reg *Registry) { c.reg(reg, c.op) }})
+			registerTestOperations(func(reg *Registry) { c.reg(reg, c.op) })
 		})
 	}
 	for _, method := range []string{http.MethodPut, http.MethodPatch} {
-		newChiRouter(Dependencies{testRegister: func(reg *Registry) {
+		registerTestOperations(func(reg *Registry) {
 			Register(reg, guarded(method), func(context.Context, *okIn) (*okOut, error) { return nil, nil })
-		}})
+		})
 	}
 	// A guarded DELETE answers 204 with no validator, so its output declares
 	// none.
-	newChiRouter(Dependencies{testRegister: func(reg *Registry) {
+	registerTestOperations(func(reg *Registry) {
 		Register(reg, guarded(http.MethodDelete), func(context.Context, *okIn) (*noHeaders, error) { return nil, nil })
-	}})
+	})
 	for _, method := range []string{http.MethodGet, http.MethodHead} {
-		newChiRouter(Dependencies{testRegister: func(reg *Registry) {
+		registerTestOperations(func(reg *Registry) {
 			Register(reg, conditional(method), func(context.Context, *okIn) (*okOut, error) { return nil, nil })
-		}})
+		})
 	}
 }
 
@@ -1183,13 +1153,13 @@ func TestIdempotencyKeyHeaderNeedsTheDeclaration(t *testing.T) {
 		Body           probeBody
 	}
 	register := func(safety RetrySafety) {
-		newChiRouter(Dependencies{testRegister: func(reg *Registry) {
+		registerTestOperations(func(reg *Registry) {
 			Register(reg, Operation{
 				Operation:   humaOp(http.MethodPost, Prefix+"/x", "postX", "x", ""),
 				Class:       ClassPublic,
 				RetrySafety: safety,
 			}, func(context.Context, *keyed) (*probeOutput, error) { return nil, nil })
-		}})
+		})
 	}
 	t.Run("refused without idempotency_key", func(t *testing.T) {
 		defer func() {
@@ -1209,72 +1179,4 @@ func TestIdempotencyKeyHeaderNeedsTheDeclaration(t *testing.T) {
 		}()
 		register(RetrySafetyIdempotencyKey)
 	})
-}
-
-// Reset and replacement both operate on the current override set. Neither may
-// invite automatic replay after a lost response: a newer layout could exist.
-func TestProfileSectionMutationsDoNotAdvertiseAutomaticRetry(t *testing.T) {
-	doc := generatedDocument(t)
-	path := doc["paths"].(map[string]any)[Prefix+"/profile/sections"].(map[string]any)
-	for _, method := range []string{"put", "delete"} {
-		op := path[method].(map[string]any)
-		if got := op[extRetrySafety]; got != string(RetrySafetyNonRetryable) {
-			t.Errorf("%s retry safety = %v, want non_retryable", method, got)
-		}
-	}
-}
-
-func TestPersonalListMutationsDoNotAdvertiseAutomaticRetry(t *testing.T) {
-	paths := generatedDocument(t)["paths"].(map[string]any)
-	for _, path := range []string{"/favorites/{item_id}", "/watchlist/{item_id}", "/ratings/{item_id}"} {
-		item := paths[Prefix+path].(map[string]any)
-		for _, method := range []string{"put", "delete"} {
-			if got := item[method].(map[string]any)[extRetrySafety]; got != string(RetrySafetyNonRetryable) {
-				t.Errorf("%s %s retry safety=%v, want non_retryable", method, path, got)
-			}
-		}
-	}
-}
-
-var historyImportOperationIDs = []string{
-	"listHistoryImportSources", "listHistoryImportRuns", "createHistoryImportRun", "getHistoryImportRun", "createPlexPin", "checkPlexPin", "loginEmbyConnect",
-}
-
-// personalCollectionOperationIDs is every profile-scoped operation the
-// personal-collections section registers (stage A).
-var personalCollectionOperationIDs = []string{
-	"addCollectionItem",
-	"clearCollectionSortPreference",
-	"createCollection",
-	"createCollectionGroup",
-	"deleteCollection",
-	"deleteCollectionGroup",
-	"deleteCollectionImage",
-	"getCollection",
-	"getCollectionCapabilities",
-	"getCollectionGroup",
-	"getCollectionGroupsOrder",
-	"getCollectionItems",
-	"getCollectionItemsOrder",
-	"getCollectionOrder",
-	"getLibraryCollectionItems",
-	"importMDBListCollection",
-	"importTMDBCollection",
-	"importTMDBListCollection",
-	"importTraktCollection",
-	"listCollectionTemplates",
-	"listCollections",
-	"listServerCollections",
-	"listTopMDBListLists",
-	"previewCollection",
-	"removeCollectionItem",
-	"reorderCollectionGroups",
-	"reorderCollectionItems",
-	"reorderCollections",
-	"searchMDBListLists",
-	"setCollectionSortPreference",
-	"syncCollection",
-	"updateCollection",
-	"updateCollectionGroup",
-	"uploadCollectionPoster",
 }

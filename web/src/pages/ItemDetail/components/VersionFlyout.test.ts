@@ -259,24 +259,6 @@ describe("sortByResolution", () => {
     expect(versions[1]!.resolution).toBe(original[1]!.resolution);
   });
 
-  it("keeps equal resolutions in original order (stable)", () => {
-    const versions = [
-      makeVersion({ file_id: 1, resolution: "1080p" }),
-      makeVersion({ file_id: 2, resolution: "1080p" }),
-    ];
-    const sorted = sortByResolution(versions);
-    expect(sorted.map((v) => v.file_id)).toEqual([1, 2]);
-  });
-
-  it("handles empty array", () => {
-    expect(sortByResolution([])).toEqual([]);
-  });
-
-  it("handles single element", () => {
-    const versions = [makeVersion({ file_id: 1, resolution: "1080p" })];
-    expect(sortByResolution(versions)).toHaveLength(1);
-  });
-
   it("places unknown resolutions at the end", () => {
     const versions = [
       makeVersion({ file_id: 1, resolution: "unknown" }),

@@ -283,7 +283,11 @@ func TestQueuePersistedIntentRestartAndCapacity(t *testing.T) {
 			t.Fatalf("restart failed: %+v", got)
 		}
 	}
-	if fetched.Load() != 3 {
+	// Played, resumable, Continue Watching, and favorites each require a read,
+	// even when the source has no items. The resume row is read even with
+	// nothing resumable: a show between episodes has no resumable episode, and
+	// that row is the only place Emby says whether the show is hidden there.
+	if fetched.Load() != 4 {
 		t.Fatalf("upstream calls=%d", fetched.Load())
 	}
 }

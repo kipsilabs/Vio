@@ -27,21 +27,6 @@ import (
 	"github.com/Silo-Server/silo-server/internal/themesongs"
 )
 
-// videoExtensions is the set of file extensions recognized as media files.
-var videoExtensions = map[string]bool{
-	".mkv": true,
-	".mp4": true,
-	".avi": true,
-	".m4v": true,
-	".ts":  true,
-	".wmv": true,
-}
-
-// SupportsVideoFile reports whether the given path uses a recognized media extension.
-func SupportsVideoFile(filePath string) bool {
-	return videoExtensions[strings.ToLower(filepath.Ext(filePath))]
-}
-
 // ignoredDirNames is the set of directory names skipped during scanning.
 var ignoredDirNames = map[string]bool{
 	".recyclebin":  true,
@@ -165,6 +150,8 @@ type Scanner struct {
 	// emptying trash hard-deletes its row. Missing files are hidden from
 	// clients immediately; the grace only delays losing per-file state so a
 	// file that reappears (flapping mount, reverted upgrade) restores cheaply.
+	// Membership reconciliation also holds an orphaned item for as long, so a
+	// replacement file relinks to it (see catalog WithRemovalGrace).
 	fileRemovalGrace     time.Duration
 	markerFetcher        func(context.Context, string) *IntroCreditsMarkers
 	markerPrefix         markerPrefixCache
@@ -255,7 +242,7 @@ func NewScanner(fileRepo *FileRepository, ffprobePath string, artworkStore blobs
 		locationRepo:         NewObservedLocationRepository(fileRepo.Pool()),
 		groupLocationRepo:    NewGroupLocationRepository(fileRepo.Pool()),
 		folderRepo:           catalog.NewFolderRepository(fileRepo.Pool()),
-		libraryRepo:          catalog.NewLibraryItemRepository(fileRepo.Pool()),
+		libraryRepo:          catalog.NewLibraryItemRepository(fileRepo.Pool()).WithRemovalGrace(fileRemovalGrace),
 		episodeLibraryRepo:   catalog.NewEpisodeLibraryRepository(fileRepo.Pool()),
 		itemRepo:             catalog.NewItemRepository(fileRepo.Pool()),
 		personRepo:           catalog.NewPersonRepository(fileRepo.Pool()),
@@ -468,24 +455,34 @@ func walkModeFor(folderType string) walkMode {
 	}
 }
 
-// acceptsExt reports whether the given lowercased extension belongs to
-// the file types this walk mode is looking for.
-func (m walkMode) acceptsExt(ext string) bool {
+// acceptsPath reports whether the file at path belongs to the file types
+// this walk mode is looking for. Video modes need the full path, not just the
+// name: SupportsVideoFile rejects streams inside disc folder structures.
+func (m walkMode) acceptsPath(path string) bool {
 	switch m {
 	case walkModeAudiobook, walkModePodcast:
-		return audioExtensions[ext]
+		return SupportsAudioFile(path)
 	case walkModeEbook:
-		return ebookExtensions[ext]
+		return SupportsEbookFile(path)
 	default:
-		return videoExtensions[ext]
+		return SupportsVideoFile(path)
 	}
 }
 
-func (m walkMode) acceptsPath(path string) bool {
-	if m == walkModeEbook {
-		return SupportsEbookFile(path)
+// collectWalkFile appends path to filePaths when the walk mode accepts it.
+// Video walks log, at debug level, a video file they deliberately skip, so a
+// title missing from the catalog can be traced to the file.
+func (m walkMode) collectWalkFile(ctx context.Context, path string, filePaths *[]string) {
+	if m.acceptsPath(path) {
+		*filePaths = append(*filePaths, path)
+		return
 	}
-	return m.acceptsExt(strings.ToLower(filepath.Ext(path)))
+	if m != walkModeVideo && m != walkModeMovie {
+		return
+	}
+	if reason := unsupportedVideoFileReason(path); reason != "" {
+		slog.DebugContext(ctx, "scanner: skipped unsupported video file", "component", "scanner", "path", path, "reason", reason)
+	}
 }
 
 func canonicalWalkPath(path string) (string, error) {
@@ -595,9 +592,7 @@ func walkLogicalTree(
 		if mode == walkModeMovie && shouldSkipMovieSupplementalFile(logicalPath) {
 			return nil
 		}
-		if mode.acceptsPath(logicalPath) {
-			*filePaths = append(*filePaths, logicalPath)
-		}
+		mode.collectWalkFile(ctx, logicalPath, filePaths)
 		return nil
 	}
 
@@ -605,9 +600,7 @@ func walkLogicalTree(
 		if mode == walkModeMovie && shouldSkipMovieSupplementalFile(logicalPath) {
 			return nil
 		}
-		if mode.acceptsPath(logicalPath) {
-			*filePaths = append(*filePaths, logicalPath)
-		}
+		mode.collectWalkFile(ctx, logicalPath, filePaths)
 		return nil
 	}
 
@@ -686,9 +679,7 @@ func walkLogicalTree(
 			if mode == walkModeMovie && shouldSkipMovieSupplementalFile(logicalChild) {
 				continue
 			}
-			if mode.acceptsPath(entry.Name()) {
-				*filePaths = append(*filePaths, logicalChild)
-			}
+			mode.collectWalkFile(ctx, logicalChild, filePaths)
 			continue
 		}
 
@@ -703,9 +694,7 @@ func walkLogicalTree(
 		if mode == walkModeMovie && shouldSkipMovieSupplementalFile(logicalChild) {
 			continue
 		}
-		if mode.acceptsPath(entry.Name()) {
-			*filePaths = append(*filePaths, logicalChild)
-		}
+		mode.collectWalkFile(ctx, logicalChild, filePaths)
 	}
 
 	return nil
@@ -829,7 +818,7 @@ func (s *Scanner) scanPaths(
 	for _, p := range filePaths {
 		seenPaths[p] = true
 	}
-	primaryPaths, extraCandidates := partitionExtraPaths(filePaths, folder.Type, folder.Paths)
+	primaryPaths, extraCandidates := partitionExtraPaths(filePaths, folder.Type, folder.Paths, walkRoots)
 	rootOverrides, err := s.loadRootOverrides(ctx, folder.ID, reconcileRoots)
 	if err != nil {
 		return nil, fmt.Errorf("loading root overrides: %w", err)
@@ -1751,7 +1740,7 @@ func (s *Scanner) scanScope(
 	for _, p := range filePaths {
 		seenPaths[p] = true
 	}
-	primaryPaths, extraCandidates := partitionExtraPaths(filePaths, folder.Type, folder.Paths)
+	primaryPaths, extraCandidates := partitionExtraPaths(filePaths, folder.Type, folder.Paths, walkRoots)
 	rootOverrides, err := s.loadRootOverrides(ctx, folder.ID, reconcileRoots)
 	if err != nil {
 		return nil, fmt.Errorf("loading root overrides: %w", err)
@@ -2012,16 +2001,18 @@ func (s *Scanner) markMissingExcludingProtected(
 			result.MissingSkippedProtected++
 			continue
 		}
-		// Only mark as missing if not already marked.
-		if existing.MissingSince == nil {
-			if err := s.fileRepo.MarkMissing(ctx, existing.ID, now); err != nil {
-				slog.ErrorContext(ctx, "scanner: failed to mark file missing", "component", "scanner",
-					"path", existing.FilePath,
-					"error", err,
-				)
-				result.Errors++
-				continue
-			}
+		// A file already marked by an earlier scan is waiting out the removal
+		// grace period; it is not news to this scan, so it is not counted.
+		if existing.MissingSince != nil {
+			continue
+		}
+		if err := s.fileRepo.MarkMissing(ctx, existing.ID, now); err != nil {
+			slog.ErrorContext(ctx, "scanner: failed to mark file missing", "component", "scanner",
+				"path", existing.FilePath,
+				"error", err,
+			)
+			result.Errors++
+			continue
 		}
 		result.Missing++
 	}
@@ -2722,9 +2713,11 @@ func (s *Scanner) ScanFile(ctx context.Context, filePath string, folder *models.
 		}
 		return s.scanThemeSongs(ctx, folder, dir, true)
 	}
-	ext := strings.ToLower(filepath.Ext(cleanFile))
-	if !videoExtensions[ext] {
-		return fmt.Errorf("unrecognized video extension: %s", ext)
+	if !SupportsVideoFile(cleanFile) {
+		if reason := unsupportedVideoFileReason(cleanFile); reason != "" {
+			return fmt.Errorf("unsupported video file %s: %s", cleanFile, reason)
+		}
+		return fmt.Errorf("unrecognized video extension: %s", strings.ToLower(filepath.Ext(cleanFile)))
 	}
 	if handled, err := s.reconcileVanishedFileIfNeeded(ctx, folder, cleanFile); handled {
 		if err != nil {
@@ -3078,11 +3071,22 @@ func (s *Scanner) processFile(
 		fileHash := hints.FileHash
 
 		// Try to get probe data.
-		probe, probeSource := s.probeFile(ctx, filePath)
-		if shouldPreserveExistingProbeAfterProbeFailure(updateReasons, probe) {
+		probe, probeSource, probeRejected := s.probeFile(ctx, filePath)
+		rejectionStands := probeRejectionStands(existing, fileSize, fileModifiedAt)
+		if shouldPreserveExistingProbeAfterProbeFailure(updateReasons, probe, rejectionStands) {
+			if probeRejected {
+				// Nothing else about the row changes here, so the rejection
+				// is recorded on its own. The repository only marks rows with
+				// no successful probe, so valid metadata stays authoritative.
+				if err := s.fileRepo.MarkProbeFailed(ctx, existing.ID, fileSize, &fileModifiedAt); err != nil {
+					return 0, nil, fmt.Errorf("recording probe failure for file %s: %w", filePath, err)
+				}
+			}
 			// Leave the migrated row's probe_updated_at NULL so a later scan
-			// retries without replacing valid metadata with zero values.
-			if len(updateReasons) > 1 {
+			// retries without replacing valid metadata with zero values. A
+			// standing rejection has no probe_repair reason, so every reason
+			// it has is an identity or subtitle change to write.
+			if rejectionStands || len(updateReasons) > 1 {
 				mf := models.MediaFile{MediaFolderID: folder.ID, FilePath: filePath}
 				populateScanIdentity(&mf, filePath, folder.Type, assignment, groupAssignment, existing)
 				mf.ExternalSubtitles = externalSubtitleModels(loadExternalSubs())
@@ -3129,6 +3133,8 @@ func (s *Scanner) processFile(
 		// Apply probe data if available.
 		if probe != nil {
 			applyProbeData(&mf, probe, probeSource)
+		} else if probeRejected {
+			markProbeRejected(&mf)
 		}
 
 		if mf.SubtitleTracks == nil {
@@ -3170,7 +3176,7 @@ func (s *Scanner) processFile(
 	fileHash := hints.FileHash
 
 	// Try to get probe data.
-	probe, probeSource := s.probeFile(ctx, filePath)
+	probe, probeSource, probeRejected := s.probeFile(ctx, filePath)
 
 	// Detect external subtitles.
 	externalSubs = loadExternalSubs()
@@ -3197,6 +3203,8 @@ func (s *Scanner) processFile(
 	// Apply probe data if available.
 	if probe != nil {
 		applyProbeData(&mf, probe, probeSource)
+	} else if probeRejected {
+		markProbeRejected(&mf)
 	}
 
 	if mf.SubtitleTracks == nil {
@@ -3378,7 +3386,7 @@ func scanStateUpdateReasons(
 	if existing.MissingSince != nil {
 		reasons = append(reasons, "was_missing")
 	}
-	if canRepairProbe && needsCriticalProbeRepairScanState(existing) {
+	if scanStateNeedsProbeRepair(existing, fileSize, fileModifiedAt, canRepairProbe) {
 		reasons = append(reasons, "probe_repair")
 	}
 	if externalSubtitlesChecked {
@@ -3471,7 +3479,7 @@ func shouldSkipStableConfirmedScanState(
 	if existing.MissingSince != nil {
 		return false
 	}
-	if canRepairProbe && needsCriticalProbeRepairScanState(existing) {
+	if scanStateNeedsProbeRepair(existing, fileSize, fileModifiedAt, canRepairProbe) {
 		return false
 	}
 	if len(updateReasons) > 0 {
@@ -3559,6 +3567,28 @@ func normalizeFileModifiedAt(ts time.Time) time.Time {
 	return ts.UTC().Truncate(time.Microsecond)
 }
 
+// scanStateNeedsProbeRepair reports whether a scan should probe an unchanged
+// file again to fill in playback-critical metadata. ffprobe has already
+// rejected a file marked probe_failed_at that never probed successfully, and
+// the mark only stands while its size and modification time are the ones that
+// were probed, so probing the same bytes again would only fail again. Changed
+// bytes drop the mark and are probed as usual. Playback still probes a marked
+// file when it is played.
+func scanStateNeedsProbeRepair(existing *scanStateFile, fileSize int64, fileModifiedAt time.Time, canRepairProbe bool) bool {
+	if !canRepairProbe || probeRejectionStands(existing, fileSize, fileModifiedAt) {
+		return false
+	}
+	return needsCriticalProbeRepairScanState(existing)
+}
+
+// probeRejectionStands reports that ffprobe rejected the bytes the row still
+// describes: it is marked probe_failed_at, never probed successfully, and its
+// size and modification time match the file on disk.
+func probeRejectionStands(existing *scanStateFile, fileSize int64, fileModifiedAt time.Time) bool {
+	return existing != nil && existing.ProbeFailedAt != nil && existing.ProbeUpdatedAt == nil &&
+		existing.FileSize == fileSize && sameFileModifiedAt(existing.FileModifiedAt, fileModifiedAt)
+}
+
 func needsCriticalProbeRepairScanState(file *scanStateFile) bool {
 	if file == nil {
 		return true
@@ -3617,11 +3647,15 @@ func needsCriticalProbeRepairScanState(file *scanStateFile) bool {
 	return false
 }
 
-func shouldPreserveExistingProbeAfterProbeFailure(updateReasons []string, probe *ProbeData) bool {
+// shouldPreserveExistingProbeAfterProbeFailure reports whether a failed probe
+// must leave the row's stored probe metadata alone: the scan was there to
+// repair it, alongside at most identity and subtitle changes. A standing
+// rejection skips the repair reason but is the same case.
+func shouldPreserveExistingProbeAfterProbeFailure(updateReasons []string, probe *ProbeData, rejectionStands bool) bool {
 	if probe != nil || len(updateReasons) == 0 {
 		return false
 	}
-	foundRepair := false
+	foundRepair := rejectionStands
 	for _, reason := range updateReasons {
 		switch reason {
 		case "probe_repair":
@@ -4110,6 +4144,7 @@ func applyProbeData(mf *models.MediaFile, probe *ProbeData, probeSource string) 
 
 	now := time.Now().UTC()
 	mf.ProbeUpdatedAt = &now
+	mf.ProbeFailedAt = nil
 
 	videoTracks := make([]models.VideoTrack, len(probe.VideoTracks))
 	for i, vt := range probe.VideoTracks {
@@ -4219,18 +4254,31 @@ func (s *Scanner) gatherHints(filePath string) FileHints {
 	return hints
 }
 
-// probeFile attempts to get probe data by running local ffprobe.
-func (s *Scanner) probeFile(ctx context.Context, filePath string) (*ProbeData, string) {
-	if s.ffprobePath != "" {
-		probe, err := ProbeFile(ctx, s.ffprobePath, filePath)
-		if err != nil {
-			slog.WarnContext(ctx, "scanner: ffprobe failed", "component", "scanner", "path", filePath, "error", err)
-			return nil, "local"
-		}
-		return probe, "local"
-	}
+// probeSourceLocal is the media_files.probe_source of a probe this node ran.
+const probeSourceLocal = "local"
 
-	return nil, "local"
+// probeFile attempts to get probe data by running local ffprobe. rejected
+// reports that ffprobe ran and refused the file (see IsProbeRejection), as
+// opposed to no probe having run or one failing for reasons unrelated to the
+// file.
+func (s *Scanner) probeFile(ctx context.Context, filePath string) (probe *ProbeData, probeSource string, rejected bool) {
+	probeSource = probeSourceLocal
+	if s.ffprobePath == "" {
+		return nil, probeSource, false
+	}
+	probe, err := ProbeFile(ctx, s.ffprobePath, filePath)
+	if err != nil {
+		slog.WarnContext(ctx, "scanner: ffprobe failed", "component", "scanner", "path", filePath, "error", err)
+		return nil, probeSource, IsProbeRejection(ctx, filePath, err)
+	}
+	return probe, probeSource, false
+}
+
+// markProbeRejected records on a media file being written that ffprobe
+// refused it. applyProbeData clears the mark when a later probe succeeds.
+func markProbeRejected(mf *models.MediaFile) {
+	now := time.Now().UTC()
+	mf.ProbeFailedAt = &now
 }
 
 // fetchMarkers reads intro/credits markers for the given file hash from

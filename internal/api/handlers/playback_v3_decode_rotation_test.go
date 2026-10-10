@@ -186,9 +186,12 @@ func newDecodeRotationFixture(t *testing.T, opt decodeRotationOptions) *decodeRo
 	}))
 	handler.ItemAccess = allowAllPlaybackItemAccess{}
 	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{
-		"transcode_enabled":                      "true",
-		"allow_4k_transcode":                     "true",
-		"playback.max_virtual_failover_attempts": "3",
+		"transcode_enabled":                            "true",
+		"allow_4k_transcode":                           "true",
+		"playback.max_virtual_failover_attempts":       "3",
+		"playback.transcode_hardware_tone_map_enabled": "false",
+		"playback.transcode_software_tone_map_enabled": "false",
+		"playback.transcode_vpp_tone_map_enabled":      "false",
 	}}
 
 	f := &decodeRotationFixture{handler: handler, file: source, candidateIDs: opt.candidateIDs}

@@ -45,7 +45,7 @@ function CollectionChip({ collection }: { collection: ItemCollection }) {
         <MediaCardArtwork
           src={collection.poster_url}
           alt={collection.title}
-          fallbackLabel={collection.title}
+          mediaType="series"
           thumbhash={collection.poster_thumbhash}
           lazy
         />

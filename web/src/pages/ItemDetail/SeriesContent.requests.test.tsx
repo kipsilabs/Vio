@@ -255,7 +255,7 @@ describe("series page request budget and play target", () => {
     installServer({
       seasons: twoSeasonsInProgress,
       seriesPlayContentId: "s2e2",
-      progressPage: ["s2e2"],
+      progressPage: Array.from({ length: 20 }, (_, index) => `other-${index + 1}`),
     });
 
     await openSeriesPage();

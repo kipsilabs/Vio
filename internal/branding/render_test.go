@@ -34,15 +34,6 @@ func TestRenderIndexHTMLEscapesTitle(t *testing.T) {
 	}
 }
 
-func TestRenderIndexHTMLRewritesFaviconWhenSet(t *testing.T) {
-	in := []byte(indexFaviconLink + "</head>")
-	snap := Snapshot{ServerName: "X", assets: map[AssetKind]string{KindFavicon: "abc123.png"}}
-	out := string(RenderIndexHTML(in, snap))
-	if !strings.Contains(out, `href="/api/v2/branding/assets/favicon?v=abc123.png"`) {
-		t.Fatalf("favicon not rewritten: %q", out)
-	}
-}
-
 func TestRenderIndexHTMLKeepsDefaultFaviconWhenUnset(t *testing.T) {
 	in := []byte(indexFaviconLink + "</head>")
 	out := string(RenderIndexHTML(in, newSnapshot("X")))

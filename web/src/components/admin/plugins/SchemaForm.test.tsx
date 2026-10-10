@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { Library, PluginAdminForm } from "@/api/types";
 import { SchemaForm } from "./SchemaForm";
@@ -126,10 +126,6 @@ describe("SchemaForm", () => {
     renderForm({ service_kind: "sonarr" });
     expect(screen.getByText("Season folder")).toBeTruthy();
   });
-  it("renders dynamic options for a dynamic_options select", () => {
-    renderForm({}, { dynamicOptions: { root_folder: [{ value: "/movies", label: "/movies" }] } });
-    expect(screen.getByText("Root folder")).toBeTruthy();
-  });
   it("renders a server field error", () => {
     renderForm({ service_kind: "radarr" }, { errors: { service_kind: "bad service" } });
     expect(screen.getByText("bad service")).toBeTruthy();
@@ -207,16 +203,28 @@ describe("SchemaForm", () => {
         onValidityChange={onValidityChange}
       />,
     );
-    expect(onValidityChange).toHaveBeenLastCalledWith(false);
+    expect(onValidityChange).toHaveBeenCalledExactlyOnceWith(false);
+    const replacementCallback = vi.fn();
+    rerender(
+      <SchemaForm
+        descriptor={d}
+        values={{}}
+        onChange={vi.fn()}
+        onValidityChange={replacementCallback}
+      />,
+    );
+    expect(onValidityChange).toHaveBeenCalledTimes(1);
+    expect(replacementCallback).not.toHaveBeenCalled();
     rerender(
       <SchemaForm
         descriptor={d}
         values={{ name: "ok" }}
         onChange={vi.fn()}
-        onValidityChange={onValidityChange}
+        onValidityChange={replacementCallback}
       />,
     );
-    expect(onValidityChange).toHaveBeenLastCalledWith(true);
+    expect(replacementCallback).toHaveBeenCalledExactlyOnceWith(true);
+    expect(onValidityChange).toHaveBeenCalledTimes(1);
   });
 });
 

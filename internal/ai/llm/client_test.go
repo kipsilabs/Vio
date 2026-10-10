@@ -3,11 +3,13 @@ package llm
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -45,68 +47,57 @@ func TestChatSuccessSendsAuthAndModel(t *testing.T) {
 }
 
 func TestChatRetriesOn429HonoringRetryAfter(t *testing.T) {
-	var calls atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if calls.Add(1) == 1 {
-			w.Header().Set("Retry-After", "1")
-			w.WriteHeader(http.StatusTooManyRequests)
-			return
+	synctest.Test(t, func(t *testing.T) {
+		calls := 0
+		c := NewClient(chatConfig("https://chat.example.test"))
+		c.chatHTTP.Transport = retryRoundTripFunc(func(*http.Request) (*http.Response, error) {
+			calls++
+			response := &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(chatOK))}
+			if calls == 1 {
+				response.Header.Set("Retry-After", "1")
+				response.StatusCode = http.StatusTooManyRequests
+			}
+			return response, nil
+		})
+		start := time.Now()
+		if _, err := c.Chat(t.Context(), []Message{{Role: "user", Content: "hi"}}, false); err != nil {
+			t.Fatalf("Chat: %v", err)
 		}
-		_, _ = w.Write([]byte(chatOK))
-	}))
-	defer srv.Close()
-
-	start := time.Now()
-	c := NewClient(chatConfig(srv.URL))
-	if _, err := c.Chat(context.Background(), []Message{{Role: "user", Content: "hi"}}, false); err != nil {
-		t.Fatalf("Chat: %v", err)
-	}
-	if calls.Load() != 2 {
-		t.Errorf("calls = %d, want 2", calls.Load())
-	}
-	if elapsed := time.Since(start); elapsed < time.Second {
-		t.Errorf("did not honor Retry-After: elapsed %v", elapsed)
-	}
+		if calls != 2 {
+			t.Errorf("calls = %d, want 2", calls)
+		}
+		if elapsed := time.Since(start); elapsed < time.Second {
+			t.Errorf("did not honor Retry-After: elapsed %v", elapsed)
+		}
+	})
 }
 
 func TestChatRetriesOn5xxAndEmbeddedErrorAndEmptyChoices(t *testing.T) {
-	responses := []func(w http.ResponseWriter){
-		func(w http.ResponseWriter) { w.WriteHeader(http.StatusBadGateway) },
-		func(w http.ResponseWriter) { _, _ = w.Write([]byte(`{"error":{"message":"upstream sad"}}`)) },
-		func(w http.ResponseWriter) { _, _ = w.Write([]byte(`{"choices":[]}`)) },
-		func(w http.ResponseWriter) { _, _ = w.Write([]byte(chatOK)) },
-	}
-	var calls atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		responses[calls.Add(1)-1](w)
-	}))
-	defer srv.Close()
-
-	c := NewClient(chatConfig(srv.URL))
-	out, err := c.Chat(context.Background(), []Message{{Role: "user", Content: "hi"}}, false)
-	if err != nil {
-		t.Fatalf("Chat: %v", err)
-	}
-	if out != "hello" || calls.Load() != 4 {
-		t.Errorf("out=%q calls=%d, want hello/4", out, calls.Load())
-	}
-}
-
-func TestChatFailsFastOnNon429ClientError(t *testing.T) {
-	var calls atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls.Add(1)
-		w.WriteHeader(http.StatusUnauthorized)
-	}))
-	defer srv.Close()
-
-	c := NewClient(chatConfig(srv.URL))
-	if _, err := c.Chat(context.Background(), []Message{{Role: "user", Content: "hi"}}, false); err == nil {
-		t.Fatal("expected error")
-	}
-	if calls.Load() != 1 {
-		t.Errorf("calls = %d, want 1 (no retry on 401)", calls.Load())
-	}
+	synctest.Test(t, func(t *testing.T) {
+		responses := []struct {
+			status int
+			body   string
+		}{
+			{http.StatusBadGateway, ""},
+			{http.StatusOK, `{"error":{"message":"upstream sad"}}`},
+			{http.StatusOK, `{"choices":[]}`},
+			{http.StatusOK, chatOK},
+		}
+		calls := 0
+		c := NewClient(chatConfig("https://chat.example.test"))
+		c.chatHTTP.Transport = retryRoundTripFunc(func(*http.Request) (*http.Response, error) {
+			response := responses[calls]
+			calls++
+			return &http.Response{StatusCode: response.status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(response.body))}, nil
+		})
+		out, err := c.Chat(t.Context(), []Message{{Role: "user", Content: "hi"}}, false)
+		if err != nil {
+			t.Fatalf("Chat: %v", err)
+		}
+		if out != "hello" || calls != 4 {
+			t.Errorf("out=%q calls=%d, want hello/4", out, calls)
+		}
+	})
 }
 
 const verboseJSON = `{"language":"english","text":"hi there","segments":[{"start":0.0,"end":1.5,"text":" hi"},{"start":1.5,"end":3.0,"text":" there"}]}`

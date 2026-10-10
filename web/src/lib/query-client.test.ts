@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { v2Problem } from "@/api/v2/problems.test-support";
+import { V2TimeoutError } from "@/api/v2/request";
 import { queryClient } from "./query-client";
 
 function retry(): (failureCount: number, error: Error) => boolean {
@@ -29,5 +30,9 @@ describe("queryClient query retry", () => {
     const networkError = new Error("network down");
     expect(retry()(0, networkError)).toBe(true);
     expect(retry()(1, networkError)).toBe(false);
+  });
+
+  it("does not retry a read that already waited out its deadline", () => {
+    expect(retry()(0, new V2TimeoutError("listProfiles", 30_000))).toBe(false);
   });
 });

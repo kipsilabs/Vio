@@ -51,6 +51,9 @@ type RecipeCard struct {
 	// re-encode vs repackage).
 	TranscodeAudio bool        `json:"transcode_audio,omitempty"`
 	RemuxDVMode    RemuxDVMode `json:"remux_dv_mode,omitempty"`
+	// RemuxResumeLeadingPictureDrop restores the best-effort leading-picture
+	// drop for a seeked progressive remux after a restart.
+	RemuxResumeLeadingPictureDrop bool `json:"remux_resume_leading_picture_drop,omitempty"`
 
 	// Client metadata mirrored from the session so admin views (client label,
 	// Jellyfin pill) survive reconstruction. Carried only by stored cards —
@@ -388,6 +391,7 @@ func (c RecipeCard) ToClaims() streamtoken.Claims {
 		PlayMethod:                       playMethod,
 		TranscodeAudio:                   c.TranscodeAudio,
 		RemuxDVMode:                      string(c.RemuxDVMode),
+		RemuxResumeLeadingPictureDrop:    c.RemuxResumeLeadingPictureDrop,
 		TranscodeNode:                    c.TranscodeNodeURL,
 		TranscodeTransportID:             c.TranscodeTransportID,
 		RoutingNetworkProvider:           c.RoutingNetworkProvider,
@@ -406,7 +410,6 @@ func (c RecipeCard) ToClaims() streamtoken.Claims {
 		UserID:                           c.UserID,
 		ProfileID:                        c.ProfileID,
 		MediaFileID:                      c.MediaFileID,
-
 		OriginalStartedAtUnixNano: func() int64 {
 			if c.OriginalStartedAt.IsZero() {
 				return 0
@@ -495,6 +498,7 @@ func RecipeCardFromClaims(c *streamtoken.Claims) RecipeCard {
 		PlayMethod:                       method,
 		TranscodeAudio:                   c.TranscodeAudio,
 		RemuxDVMode:                      RemuxDVMode(c.RemuxDVMode),
+		RemuxResumeLeadingPictureDrop:    c.RemuxResumeLeadingPictureDrop,
 		InputPath:                        c.MediaPath,
 		OutputSubdir:                     c.OutputSubdir,
 		DVProfile:                        c.DVProfile,

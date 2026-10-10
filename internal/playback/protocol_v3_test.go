@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"os"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/tonemap"
@@ -34,7 +36,7 @@ func TestNativeServerFeaturesV3ExtendTheSharedList(t *testing.T) {
 	}
 }
 
-func TestServerFeaturesV3ReturnsCompleteIndependentSlices(t *testing.T) {
+func TestServerFeaturesV3ReturnsIndependentSlices(t *testing.T) {
 	first := ServerFeaturesV3()
 	second := ServerFeaturesV3()
 	expected := map[string]struct{}{
@@ -57,23 +59,17 @@ func TestServerFeaturesV3ReturnsCompleteIndependentSlices(t *testing.T) {
 		FeaturePlanSourceDurationV3:              {},
 		FeatureOutputDisplayEvidenceV3:           {},
 	}
-	if len(first) != len(expected) {
-		t.Fatalf("server features = %v, want %d entries", first, len(expected))
+	for feature := range expected {
+		if !HasFeatureV3(first, feature) {
+			t.Fatalf("server features omitted %q: %v", feature, first)
+		}
 	}
 	seen := make(map[string]struct{}, len(first))
 	for _, feature := range first {
-		if _, ok := expected[feature]; !ok {
-			t.Fatalf("server features contain unexpected %q: %v", feature, first)
-		}
 		if _, duplicate := seen[feature]; duplicate {
 			t.Fatalf("server features contain duplicate %q: %v", feature, first)
 		}
 		seen[feature] = struct{}{}
-	}
-	for feature := range expected {
-		if _, ok := seen[feature]; !ok {
-			t.Fatalf("server features omitted %q: %v", feature, first)
-		}
 	}
 
 	first[0] = "mutated"
@@ -551,6 +547,7 @@ func TestReplanRequestV3ValidationLeavesClientBuildChannelForMergedNormalization
 		Capabilities:          start.Capabilities,
 		ClientPlaybackContext: start.ClientPlaybackContext,
 	}
+	request.ClientPlaybackContext.AppVersion = "\x00" + strings.Repeat("δ", 70) + "\nignored"
 	rawBuild := strings.Repeat("build", 20) + "\x00ignored"
 	rawChannel := strings.Repeat("channel", 10) + "\x00ignored"
 	request.ClientPlaybackContext.AppBuild = rawBuild
@@ -576,6 +573,9 @@ func TestReplanRequestV3ValidationLeavesClientBuildChannelForMergedNormalization
 	if got, want := merged.ClientPlaybackContext.AppBuild, strings.Repeat("build", 12)+"buil"; got != want {
 		t.Fatalf("normalized app_build = %q, want %q", got, want)
 	}
+	if got, want := merged.ClientPlaybackContext.AppVersion, strings.Repeat("δ", 64); got != want {
+		t.Fatalf("merged normalized app_version = %q, want %q", got, want)
+	}
 	if got, want := merged.ClientPlaybackContext.AppChannel, strings.Repeat("channel", 4)+"chan"; got != want {
 		t.Fatalf("normalized app_channel = %q, want %q", got, want)
 	}
@@ -593,7 +593,9 @@ func TestStartRequestV3NormalizesUnicodeAppVersionAndStripsControls(t *testing.T
 	}
 }
 
-func TestReplanRequestV3NormalizesUnicodeAppVersionOnMergedStart(t *testing.T) {
+// Replan validation is structural: the raw app_version survives Validate and
+// the merged start still normalizes it.
+func TestReplanRequestV3LeavesAppVersionForMergedStartNormalization(t *testing.T) {
 	start := validStartRequestV3()
 	request := ReplanRequestV3{
 		ProtocolVersion:       ProtocolV3,
@@ -804,37 +806,6 @@ func TestReplanRequestV3RejectsInvalidNetworkAndTrackEvidence(t *testing.T) {
 	request.BandwidthEstimateKbps = &tooLow
 	if err := request.Validate(); err == nil {
 		t.Fatal("out-of-range bandwidth estimate was accepted")
-	}
-}
-
-func TestPlanAttemptKeyV3Fixture(t *testing.T) {
-	type fixture struct {
-		Name                 string   `json:"name"`
-		ServerPlanAttemptKey string   `json:"server_plan_attempt_key"`
-		ReplanEcho           string   `json:"replan_echo"`
-		AttemptedPlanKeys    []string `json:"attempted_plan_keys"`
-		ExpectedServerAction string   `json:"expected_server_action"`
-	}
-	body, err := os.ReadFile("testdata/protocol_v3/attempt_keys.json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var fixtures []fixture
-	if err := json.Unmarshal(body, &fixtures); err != nil {
-		t.Fatal(err)
-	}
-	for _, value := range fixtures {
-		t.Run(value.Name, func(t *testing.T) {
-			if value.ServerPlanAttemptKey == "" || value.ReplanEcho != value.ServerPlanAttemptKey {
-				t.Fatalf("opaque echo drifted: %#v", value)
-			}
-			if len(value.AttemptedPlanKeys) != 1 || value.AttemptedPlanKeys[0] != value.ServerPlanAttemptKey {
-				t.Fatalf("attempted plan keys do not echo the server token: %#v", value)
-			}
-			if value.ExpectedServerAction != "reject_already_attempted_plan" {
-				t.Fatalf("server action = %q", value.ExpectedServerAction)
-			}
-		})
 	}
 }
 
@@ -1580,6 +1551,56 @@ func TestPlanPlaybackV3RejectsTrulyIncompleteVideoMetadata(t *testing.T) {
 	result := PlanPlaybackV3(PlannerInputV3{Request: req, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0, Settings: PlannerSettingsV3{TranscodeEnabled: true, Allow4KTranscode: true}, Registry: testTransformationRegistryV3()})
 	if result.Terminal == nil || result.Terminal.Reason != "source_metadata_incomplete" {
 		t.Fatalf("result = %s", ExplainPlannerResultV3(result))
+	}
+}
+
+// A file the scanner stored without any stream metadata is either waiting for
+// its first probe or was rejected by ffprobe. Only the first is worth retrying.
+func TestPlanPlaybackV3SeparatesUnprobedFromUnreadableSources(t *testing.T) {
+	req := validStartRequestV3()
+	settings := PlannerSettingsV3{TranscodeEnabled: true, Allow4KTranscode: true}
+	bare := func() *models.MediaFile {
+		return &models.MediaFile{ID: 7, FilePath: "/library/show/S01E03.mkv", FileSize: 0, SubtitleTracks: []models.SubtitleTrack{}}
+	}
+
+	unprobed := bare()
+	result := PlanPlaybackV3(PlannerInputV3{Request: req, RequestedFile: unprobed, EffectiveFile: unprobed, AudioTrackIndex: 0, Settings: settings, Registry: testTransformationRegistryV3()})
+	if result.Terminal == nil || result.Terminal.Reason != "source_metadata_incomplete" || !result.Terminal.Retryable {
+		t.Fatalf("unprobed result = %s", ExplainPlannerResultV3(result))
+	}
+
+	failedAt := time.Date(2026, time.October, 2, 12, 1, 3, 0, time.UTC)
+	rejected := bare()
+	rejected.ProbeFailedAt = &failedAt
+	result = PlanPlaybackV3(PlannerInputV3{Request: req, RequestedFile: rejected, EffectiveFile: rejected, AudioTrackIndex: 0, Settings: settings, Registry: testTransformationRegistryV3()})
+	if result.Terminal == nil || result.Terminal.Reason != TerminalSourceUnreadableV3 || result.Terminal.Retryable {
+		t.Fatalf("rejected result = %s", ExplainPlannerResultV3(result))
+	}
+	if result.Terminal.Message != TerminalSourceUnreadableMessageV3 {
+		t.Fatalf("message = %q", result.Terminal.Message)
+	}
+
+	// The server bitrate cap renames refusals it causes; it must not claim
+	// an unreadable file.
+	result = PlanPlaybackV3(PlannerInputV3{Request: req, RequestedFile: rejected, EffectiveFile: rejected, AudioTrackIndex: 0, Settings: settings, Registry: testTransformationRegistryV3(), ServerBitrateCapKbps: 4000})
+	if result.Terminal == nil || result.Terminal.Reason != TerminalSourceUnreadableV3 {
+		t.Fatalf("capped rejected result = %s", ExplainPlannerResultV3(result))
+	}
+
+	// The effective file decides: a rejected requested file whose effective
+	// version is readable plans normally.
+	readable := detailedFixtureFileV3()
+	result = PlanPlaybackV3(PlannerInputV3{Request: req, RequestedFile: rejected, EffectiveFile: readable, AudioTrackIndex: 0, Settings: settings, Registry: testTransformationRegistryV3()})
+	if result.Terminal != nil && (result.Terminal.Reason == TerminalSourceUnreadableV3 || result.Terminal.Reason == "source_metadata_incomplete") {
+		t.Fatalf("readable effective file result = %s", ExplainPlannerResultV3(result))
+	}
+
+	// A stale failure mark never hides metadata from a successful probe.
+	probed := detailedFixtureFileV3()
+	probed.ProbeFailedAt = &failedAt
+	result = PlanPlaybackV3(PlannerInputV3{Request: req, RequestedFile: probed, EffectiveFile: probed, AudioTrackIndex: 0, Settings: settings, Registry: testTransformationRegistryV3()})
+	if result.Terminal != nil && (result.Terminal.Reason == TerminalSourceUnreadableV3 || result.Terminal.Reason == "source_metadata_incomplete") {
+		t.Fatalf("probed file with failure mark result = %s", ExplainPlannerResultV3(result))
 	}
 }
 
@@ -2810,52 +2831,6 @@ func TestPlanPlaybackV3TimelineChangePreservesRouteIdentity(t *testing.T) {
 	}
 }
 
-func TestPlanPlaybackV3DroppingFallbackHistoryReintroducesRejectedRoute(t *testing.T) {
-	file := detailedFixtureFileV3()
-	file.FilePath = "/media/movie.mp4"
-	file.Container = "mp4"
-	file.CodecVideo = "h264"
-	file.Resolution = "1080p"
-	file.Bitrate = 8_000
-	file.VideoTracks[0] = models.VideoTrack{Codec: "h264", Profile: "high", Level: 41, Width: 1920, Height: 1080, FrameRate: "24000/1001", Bitrate: 8_000, BitDepth: 8, VideoRange: "SDR", VideoRangeType: "SDR"}
-	request := validStartRequestV3()
-	request.Capabilities.CodecsVideo = []string{"h264"}
-	request.Capabilities.CodecsVideoHardware = []string{"h264"}
-	request.Capabilities.Containers = []string{"mp4"}
-	request.Capabilities.MaxResolution = "1080p"
-	request.Capabilities.VideoDecode = []VideoDecodeCapabilityV3{{Codec: "h264", Profiles: []string{"high"}, Levels: []int{41}, BitDepths: []int{8}, MaxWidth: 1920, MaxHeight: 1080, MaxFrameRate: 60, MaxBitrateKbps: 20_000, Hardware: true}}
-	input := PlannerInputV3{
-		Request: request, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0,
-		Settings: PlannerSettingsV3{TranscodeEnabled: true, Allow4KTranscode: true}, Registry: testTransformationRegistryV3(),
-	}
-	direct := PlanPlaybackV3(input)
-	if direct.Plan == nil || direct.Plan.Delivery != DeliveryOriginalHTTPV3 {
-		t.Fatalf("direct plan = %#v", direct)
-	}
-	input.AttemptedKeys = []string{PlanAttemptKeyV3(*direct.Plan, request.ClientPlaybackContext.Output.OutputContextID, nil)}
-	progressive := PlanPlaybackV3(input)
-	if progressive.Plan == nil || progressive.Plan.Delivery != DeliveryRemuxProgressiveV3 {
-		t.Fatalf("progressive fallback = %#v", progressive)
-	}
-	input.AttemptedKeys = append(input.AttemptedKeys, PlanAttemptKeyV3(*progressive.Plan, request.ClientPlaybackContext.Output.OutputContextID, nil))
-	hls := PlanPlaybackV3(input)
-	if hls.Plan == nil || hls.Plan.Delivery != DeliveryRemuxHLSV3 {
-		t.Fatalf("HLS fallback = %#v", hls)
-	}
-
-	seek := 321.25
-	input.Request.StartPosition = &seek
-	input.AttemptedKeys = nil // This is what the old seek-reanchor path did.
-	replanned := PlanPlaybackV3(input)
-	if replanned.Plan == nil || replanned.Plan.PlanID != direct.Plan.PlanID || replanned.Plan.PlanID == hls.Plan.PlanID {
-		t.Fatalf("dropped fallback history did not reproduce identity drift: direct=%#v hls=%#v replanned=%#v", direct.Plan, hls.Plan, replanned.Plan)
-	}
-	if replanned.Plan.Delivery != DeliveryOriginalHTTPV3 ||
-		replanned.Plan.Stream.Protocol != StreamHTTPProgressiveV3 || replanned.Plan.Stream.Container != "mp4" {
-		t.Fatalf("reintroduced route = %#v", replanned.Plan)
-	}
-}
-
 func TestPlanPlaybackV3AppliesDeliverySpecificCodecAndChannelLimits(t *testing.T) {
 	file := detailedFixtureFileV3()
 	file.FilePath = "/media/movie.mp4"
@@ -2986,7 +2961,7 @@ func TestPlanPlaybackV3AbandonsStripForAnUnstrippableSource(t *testing.T) {
 func TestPlanPlaybackV3ToneMapEscapeRequiresExecutableTranscode(t *testing.T) {
 	file := unstrippableProfile7FixtureV3()
 	registry := NewTransformationRegistryV3([]TransformationSpecV3{
-		{Name: TransformationServerDV7HDR10V3, RecipeVersion: "1", Available: true},
+		{Name: TransformationServerDV7HDR10V3, RecipeVersion: TransformationServerDV7HDR10RecipeVersionV3, Available: true},
 		{Name: TransformationVideoToH264V3, RecipeVersion: TransformationVideoToH264RecipeVersionV3, Available: true},
 		{Name: TransformationAudioToAACV3, RecipeVersion: TransformationAudioToAACRecipeVersionV3, Available: true},
 		{Name: TransformationHDRToSDRToneMapV3, RecipeVersion: TransformationHDRToSDRToneMapRecipeVersionV3, Available: true},
@@ -3197,114 +3172,6 @@ func TestCompoundRungQualityResultV3Scales8KToFourK(t *testing.T) {
 	}
 }
 
-func TestAvailableQualitiesV3CroppedSourceKeepsSameClassRungs(t *testing.T) {
-	source := SourceDescriptorV3{VideoCodec: "h264", Width: 1918, Height: 872, BitrateKbps: 10_858, DynamicRange: DynamicRangeSDRV3}
-	qualities := availableQualitiesV3(PlannerInputV3{
-		Request:  validStartRequestV3(),
-		Settings: PlannerSettingsV3{TranscodeEnabled: true},
-	}, source)
-	labels := make([]string, 0, len(qualities))
-	for _, quality := range qualities {
-		labels = append(labels, quality.Label)
-	}
-	want := []string{
-		QualityOriginalV3,
-		QualityRung1080pHighV3, QualityRung1080pMediumV3, QualityRung1080pLowV3,
-		QualityRung720pHighV3, QualityRung720pMediumV3, QualityRung720pLowV3,
-		"480p",
-	}
-	if !reflect.DeepEqual(labels, want) {
-		t.Fatalf("labels = %v, want %v", labels, want)
-	}
-}
-
-// A viewer whose account may not transcode is refused every rung at
-// admission, so the ladder must not offer them.
-func TestAvailableQualitiesV3ViewerTranscodeDisabledPublishesOriginalOnly(t *testing.T) {
-	source := SourceDescriptorV3{VideoCodec: "h264", Width: 1920, Height: 960, BitrateKbps: 10_852, DynamicRange: DynamicRangeSDRV3}
-	input := PlannerInputV3{
-		Request:  validStartRequestV3(),
-		Settings: PlannerSettingsV3{TranscodeEnabled: true},
-	}
-	if got := availableQualitiesV3(input, source); len(got) < 2 {
-		t.Fatalf("allowed viewer qualities = %#v, want the transcode ladder", got)
-	}
-
-	input.Settings.ViewerTranscodeDisabled = true
-	got := availableQualitiesV3(input, source)
-	if len(got) != 1 || got[0].Label != QualityOriginalV3 || !got[0].PreservesSource {
-		t.Fatalf("restricted viewer qualities = %#v, want original only", got)
-	}
-}
-
-func TestAvailableQualitiesV3UnknownSourceHeightPublishesNoFixedRungs(t *testing.T) {
-	request := validStartRequestV3()
-	qualities := availableQualitiesV3(PlannerInputV3{
-		Request:  request,
-		Settings: PlannerSettingsV3{TranscodeEnabled: true, Allow4KTranscode: true},
-	}, SourceDescriptorV3{VideoCodec: "h264", BitrateKbps: 8_000})
-	if len(qualities) != 1 || qualities[0].Label != QualityOriginalV3 || !qualities[0].PreservesSource {
-		t.Fatalf("unknown-height qualities = %#v, want original only", qualities)
-	}
-}
-
-// TestAvailableQualitiesV3KeepsDirectHDRPlanningCapabilityLazy verifies direct
-// HDR playback advertises configured lower-quality choices without probing an
-// executor until the user selects one.
-func TestAvailableQualitiesV3KeepsDirectHDRPlanningCapabilityLazy(t *testing.T) {
-	capabilityCalls := 0
-	input := PlannerInputV3{
-		Request:  validStartRequestV3(),
-		Settings: PlannerSettingsV3{TranscodeEnabled: true, Allow4KTranscode: true, SoftwareToneMapEnabled: true},
-		HLSRegistry: func() *TransformationRegistryV3 {
-			capabilityCalls++
-			return testTransformationRegistryV3()
-		},
-		HLSToneMapCapabilities: func() tonemap.Capabilities {
-			capabilityCalls++
-			return nil
-		},
-	}
-	source := SourceDescriptorV3{Width: 3840, Height: 2160, BitrateKbps: 80_000, DynamicRange: DynamicRangeHDR10V3}
-	if got := availableQualitiesV3(input, source); len(got) != 11 || got[0].Label != QualityOriginalV3 || got[1].Label != QualityRung2160pHighV3 {
-		t.Fatalf("direct HDR qualities = %#v, want original plus compound ladder", got)
-	}
-	if capabilityCalls != 0 {
-		t.Fatalf("direct HDR quality planning performed %d lazy capability lookups", capabilityCalls)
-	}
-
-	input.Settings.SoftwareToneMapEnabled = false
-	if got := availableQualitiesV3(input, source); len(got) != 1 || got[0].Label != QualityOriginalV3 {
-		t.Fatalf("disabled HDR tone-map qualities = %#v, want original only", got)
-	}
-	if capabilityCalls != 0 {
-		t.Fatalf("disabled HDR quality planning performed %d lazy capability lookups", capabilityCalls)
-	}
-}
-
-func TestAvailableQualitiesV3Cropped4KPublishesOnlyUsefulSameClassRungs(t *testing.T) {
-	input := PlannerInputV3{
-		Request:  validStartRequestV3(),
-		Settings: PlannerSettingsV3{TranscodeEnabled: true, Allow4KTranscode: true},
-	}
-	source := SourceDescriptorV3{Width: 3840, Height: 1540, BitrateKbps: 25_200}
-	qualities := availableQualitiesV3(input, source)
-	labels := make([]string, 0, len(qualities))
-	for _, quality := range qualities {
-		labels = append(labels, quality.Label)
-	}
-	want := []string{
-		QualityOriginalV3,
-		QualityRung2160pMediumV3, QualityRung2160pLowV3,
-		QualityRung1080pHighV3, QualityRung1080pMediumV3, QualityRung1080pLowV3,
-		QualityRung720pHighV3, QualityRung720pMediumV3, QualityRung720pLowV3,
-		"480p",
-	}
-	if !reflect.DeepEqual(labels, want) {
-		t.Fatalf("cropped 4K labels = %v, want %v", labels, want)
-	}
-}
-
 func audioOnlyFixtureFileV3() *models.MediaFile {
 	return &models.MediaFile{ID: 77, BaseType: "audiobook", FilePath: "/media/audiobook.m4b", Container: "mp4", CodecAudio: "aac", Bitrate: 128, AudioChannels: 2, Duration: 39_600, AudioTracks: []models.AudioTrack{{Codec: "aac", Channels: 2, Layout: "stereo"}}}
 }
@@ -3499,6 +3366,183 @@ func TestPlanPlaybackV3AndroidMedia3AudioConstraintsFallBackToAAC(t *testing.T) 
 			}
 			if result.TargetAudioChannels <= 0 || result.TargetAudioChannels > test.wantChannels {
 				t.Fatalf("target channels = %d, want <= %d", result.TargetAudioChannels, test.wantChannels)
+			}
+		})
+	}
+}
+
+// A decodable, HLS-native surround track that only exceeds the delivery's
+// channel ceiling needs an audio downmix, not a video transcode. The AAC
+// conversion runs on the remux route, so it stays available with transcoding
+// disabled.
+func TestPlanPlaybackV3ChannelCeilingAdaptsAudioAndCopiesVideo(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		codec        string
+		channels     int
+		layout       string
+		maxChannels  int
+		wantChannels int
+	}{
+		{name: "EAC3 5.1 to stereo", codec: "eac3", channels: 6, layout: "5.1(side)", maxChannels: 2, wantChannels: 2},
+		{name: "AC3 5.1 to stereo", codec: "ac3", channels: 6, layout: "5.1", maxChannels: 2, wantChannels: 2},
+		{name: "EAC3 7.1 to 5.1", codec: "eac3", channels: 8, layout: "7.1", maxChannels: 6, wantChannels: 6},
+	} {
+		for _, transcodeEnabled := range []bool{true, false} {
+			t.Run(test.name+"/transcode="+strconv.FormatBool(transcodeEnabled), func(t *testing.T) {
+				tracks := []models.AudioTrack{{Codec: test.codec, Channels: test.channels, Layout: test.layout, Default: true}}
+				file, request := androidMedia3FFmpegFixtureV3("tv", tracks, []string{"aac", test.codec}, test.maxChannels)
+				selectAndroidAudioTrackV3(&request, file.ID, 0)
+
+				result := PlanPlaybackV3(PlannerInputV3{
+					Request: request, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0,
+					Settings: PlannerSettingsV3{TranscodeEnabled: transcodeEnabled, Allow4KTranscode: true},
+					Registry: testTransformationRegistryV3(),
+				})
+				if result.Plan == nil || result.Plan.Delivery != DeliveryRemuxHLSV3 || result.PlayMethod != PlayRemux || result.TargetVideoCodec != codecCopyV3 {
+					t.Fatalf("channel-limited result = %s", ExplainPlannerResultV3(result))
+				}
+				if !result.TranscodeAudio || result.TargetAudioCodec != audioCodecAACV3 || result.TargetAudioChannels != test.wantChannels {
+					t.Fatalf("audio = transcode %t codec %q channels %d, want AAC %d", result.TranscodeAudio, result.TargetAudioCodec, result.TargetAudioChannels, test.wantChannels)
+				}
+				if names := SortedTransformationNamesV3(result.Plan.Transformations); len(names) != 1 || names[0] != TransformationAudioToAACV3 {
+					t.Fatalf("transformations = %v, want only %s", names, TransformationAudioToAACV3)
+				}
+			})
+		}
+	}
+}
+
+// Under a server bitrate cap the audio-only adaptation stays a video copy when
+// the source plus the AAC output provably fits, and otherwise needs the
+// budgeted transcode.
+func TestPlanPlaybackV3ChannelCeilingRemuxUnderServerBitrateCap(t *testing.T) {
+	tracks := []models.AudioTrack{{Codec: "eac3", Channels: 6, Layout: "5.1(side)", Default: true}}
+	file, request := androidMedia3FFmpegFixtureV3("tv", tracks, []string{"aac", "eac3"}, 2)
+	// The file total counts the E-AC-3 track the video track's rate omits.
+	file.VideoTracks[0].Bitrate = 11_000
+	selectAndroidAudioTrackV3(&request, file.ID, 0)
+	input := PlannerInputV3{
+		Request: request, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0,
+		Settings: PlannerSettingsV3{TranscodeEnabled: false}, Registry: testTransformationRegistryV3(),
+		ServerBitrateCapKbps: 12_200, // 12,000 kbps file total + 192 kbps stereo AAC
+	}
+	result := PlanPlaybackV3(input)
+	if result.Plan == nil || result.Plan.Delivery != DeliveryRemuxHLSV3 || result.TargetVideoCodec != codecCopyV3 || result.TargetAudioChannels != 2 {
+		t.Fatalf("fitting cap result = %s", ExplainPlannerResultV3(result))
+	}
+
+	input.ServerBitrateCapKbps = 12_100
+	input.Settings.TranscodeEnabled = true
+	result = PlanPlaybackV3(input)
+	if result.Plan == nil || result.PlayMethod != PlayTranscode {
+		t.Fatalf("tight cap result = %s, want budgeted transcode", ExplainPlannerResultV3(result))
+	}
+}
+
+// A zero ceiling means unset everywhere: before planning, in the AAC layout
+// choice, and in the finished-plan check.
+// The server folds a lower client bandwidth cap into the effective cap, so an
+// audio-converting remux has to fit that one, not only the administrator's.
+func TestPlanPlaybackV3ChannelCeilingRemuxHonorsLowerClientCap(t *testing.T) {
+	tracks := []models.AudioTrack{{Codec: "eac3", Channels: 6, Layout: "5.1(side)", Default: true}}
+	file, request := androidMedia3FFmpegFixtureV3("tv", tracks, []string{"aac", "eac3"}, 2)
+	file.VideoTracks[0].Bitrate = 11_000
+	selectAndroidAudioTrackV3(&request, file.ID, 0)
+	for _, test := range []struct {
+		name      string
+		clientCap int
+		want      PlayMethod
+	}{
+		{name: "client cap fits", clientCap: 12_200, want: PlayRemux},
+		{name: "client cap too tight", clientCap: 12_100, want: PlayTranscode},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := request
+			request.BandwidthCapKbps = &test.clientCap
+			result := PlanPlaybackV3(PlannerInputV3{
+				Request: request, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0,
+				Settings: PlannerSettingsV3{TranscodeEnabled: true}, Registry: testTransformationRegistryV3(),
+				ServerBitrateCapKbps: 20_000,
+			})
+			if result.Plan == nil || result.PlayMethod != test.want {
+				t.Fatalf("result = %s, want %s", ExplainPlannerResultV3(result), test.want)
+			}
+		})
+	}
+}
+
+// A conversion forced only by the channel ceiling must not end playback when
+// the remux executors lack AAC: the video transcode pool can still downmix.
+func TestPlanPlaybackV3ChannelCeilingFallsBackToTranscodeWithoutRemuxAAC(t *testing.T) {
+	tracks := []models.AudioTrack{{Codec: "eac3", Channels: 6, Layout: "5.1(side)", Default: true}}
+	file, request := androidMedia3FFmpegFixtureV3("tv", tracks, []string{"aac", "eac3"}, 2)
+	selectAndroidAudioTrackV3(&request, file.ID, 0)
+	noAAC := NewTransformationRegistryV3([]TransformationSpecV3{{Name: "video_to_h264", Available: true}})
+	result := PlanPlaybackV3(PlannerInputV3{
+		Request: request, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0,
+		Settings: PlannerSettingsV3{TranscodeEnabled: true}, Registry: noAAC,
+		ProgressiveRemuxRegistry: staticHLSRegistryV3(noAAC), HLSRemuxRegistry: staticHLSRegistryV3(noAAC),
+		HLSVideoRegistry: staticHLSRegistryV3(testTransformationRegistryV3()),
+	})
+	if result.Plan == nil || result.PlayMethod != PlayTranscode || result.TargetAudioChannels > 2 {
+		t.Fatalf("result = %s, want a stereo video transcode", ExplainPlannerResultV3(result))
+	}
+}
+
+func TestPlanPlaybackV3ZeroChannelCeilingIsUnset(t *testing.T) {
+	tracks := []models.AudioTrack{{Codec: "eac3", Channels: 6, Layout: "5.1(side)", Default: true}}
+	file, request := androidMedia3FFmpegFixtureV3("tv", tracks, []string{"aac", "eac3"}, 2)
+	for class, delivery := range request.ClientPlaybackContext.Deliveries {
+		zero := 0
+		delivery.MaxChannels = &zero
+		request.ClientPlaybackContext.Deliveries[class] = delivery
+	}
+	selectAndroidAudioTrackV3(&request, file.ID, 0)
+	result := PlanPlaybackV3(PlannerInputV3{
+		Request: request, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0,
+		Settings: PlannerSettingsV3{TranscodeEnabled: false}, Registry: testTransformationRegistryV3(),
+	})
+	if result.Plan == nil || result.Plan.Delivery != DeliveryOriginalHTTPV3 || result.PlayMethod != PlayDirect {
+		t.Fatalf("zero ceiling result = %s", ExplainPlannerResultV3(result))
+	}
+}
+
+func TestPlanPlaybackV3ProgressiveChannelCeilingAdaptsAudio(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		codec        string
+		channels     int
+		layout       string
+		decodable    bool
+		maxChannels  int
+		wantChannels int
+	}{
+		{name: "decodable EAC3 5.1 to stereo", codec: "eac3", channels: 6, layout: "5.1(side)", decodable: true, maxChannels: 2, wantChannels: 2},
+		{name: "undecodable DTS 7.1 to 5.1", codec: "dts", channels: 8, layout: "7.1", maxChannels: 6, wantChannels: 6},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			decode := []string{"aac"}
+			if test.decodable {
+				decode = append(decode, test.codec)
+			}
+			tracks := []models.AudioTrack{{Codec: test.codec, Channels: test.channels, Layout: test.layout, Default: true}}
+			file, request := androidMedia3FFmpegFixtureV3("mobile", tracks, decode, test.maxChannels)
+			request.Capabilities.Containers = append(request.Capabilities.Containers, "mp4")
+			progressive := request.ClientPlaybackContext.Deliveries[DeliveryClassProgressiveV3]
+			progressive.Enabled, progressive.SupportedOnDevice, progressive.FailureReason = true, true, ""
+			request.ClientPlaybackContext.Deliveries[DeliveryClassProgressiveV3] = progressive
+			selectAndroidAudioTrackV3(&request, file.ID, 0)
+
+			result := PlanPlaybackV3(PlannerInputV3{
+				Request: request, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0,
+				Settings: PlannerSettingsV3{TranscodeEnabled: false}, Registry: testTransformationRegistryV3(),
+			})
+			if result.Plan == nil || result.Plan.Delivery != DeliveryRemuxProgressiveV3 || result.PlayMethod != PlayRemux {
+				t.Fatalf("progressive result = %s", ExplainPlannerResultV3(result))
+			}
+			if !result.TranscodeAudio || result.TargetAudioCodec != audioCodecAACV3 || result.TargetAudioChannels != test.wantChannels {
+				t.Fatalf("audio = transcode %t codec %q channels %d, want AAC %d", result.TranscodeAudio, result.TargetAudioCodec, result.TargetAudioChannels, test.wantChannels)
 			}
 		})
 	}
@@ -4455,5 +4499,167 @@ func TestPlanV3EffectiveVirtualURIRoundTrip(t *testing.T) {
 	}
 	if bytes.Contains(encodedEmpty, []byte("virtual_source_revision")) {
 		t.Fatalf("empty plan serialized virtual_source_revision: %s", encodedEmpty)
+	}
+}
+
+func TestServerFeaturesV3ReturnsCompleteIndependentSlices(t *testing.T) {
+	first := ServerFeaturesV3()
+	second := ServerFeaturesV3()
+	expected := map[string]struct{}{
+		FeaturePlaybackPlanV3:                    {},
+		FeatureServerRemoteStreamBitratePolicyV3: {},
+		FeatureServerLocalStreamBitratePolicyV3:  {},
+		FeatureNeutralContractV3:                 {},
+		FeatureLayoutPassthrough:                 {},
+		FeatureEmbeddedSubtitlesV3:               {},
+		FeatureRouteDiagnostics:                  {},
+		FeatureDeviceQuirksV3:                    {},
+		FeatureSeekReanchorV3:                    {},
+		FeatureOutputChangeV3:                    {},
+		FeatureDirectStreamResumeV3:              {},
+		FeatureHeaderAuthenticatedMediaV3:        {},
+		FeatureAuthorizedMediaOriginsV3:          {},
+		FeatureSoftwareVideoDecodeV3:             {},
+		FeaturePlanInvalidatedV3:                 {},
+		FeatureDefaultAudioReconcileResponseV3:   {},
+		FeaturePlanSourceDurationV3:              {},
+		FeatureOutputDisplayEvidenceV3:           {},
+	}
+	if len(first) != len(expected) {
+		t.Fatalf("server features = %v, want %d entries", first, len(expected))
+	}
+	seen := make(map[string]struct{}, len(first))
+	for _, feature := range first {
+		if _, ok := expected[feature]; !ok {
+			t.Fatalf("server features contain unexpected %q: %v", feature, first)
+		}
+		if _, duplicate := seen[feature]; duplicate {
+			t.Fatalf("server features contain duplicate %q: %v", feature, first)
+		}
+		seen[feature] = struct{}{}
+	}
+	for feature := range expected {
+		if _, ok := seen[feature]; !ok {
+			t.Fatalf("server features omitted %q: %v", feature, first)
+		}
+	}
+
+	first[0] = "mutated"
+	if second[0] != FeaturePlaybackPlanV3 {
+		t.Fatalf("feature slices share backing storage: %v", second)
+	}
+}
+
+func TestReplanRequestV3NormalizesUnicodeAppVersionOnMergedStart(t *testing.T) {
+	start := validStartRequestV3()
+	request := ReplanRequestV3{
+		ProtocolVersion:       ProtocolV3,
+		PlaybackAttemptID:     start.PlaybackAttemptID,
+		ReplanRequestID:       "replan-client-version-0001",
+		FailedPlanID:          "plan:client-version-0001",
+		PlanAttemptID:         "plan-attempt-client-version-0001",
+		PlanAttemptKey:        "v3:0000000000000001",
+		AttemptCount:          1,
+		QualityPreference:     start.QualityPreference,
+		Failure:               FailureV3{Classification: "parser_failure"},
+		Capabilities:          start.Capabilities,
+		ClientPlaybackContext: start.ClientPlaybackContext,
+	}
+	rawVersion := "\x00" + strings.Repeat("δ", 70) + "\nignored"
+	request.ClientPlaybackContext.AppVersion = rawVersion
+
+	if err := request.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	if got := request.ClientPlaybackContext.AppVersion; got != rawVersion {
+		t.Fatalf("structural Validate rewrote app_version = %q, want raw %q", got, rawVersion)
+	}
+
+	merged := start
+	merged.Capabilities = request.Capabilities
+	merged.ClientPlaybackContext = request.ClientPlaybackContext
+	merged.ClientPlaybackContext.Deliveries = CloneDeliveryCapabilitiesV3(request.ClientPlaybackContext.Deliveries)
+	if _, err := merged.NormalizeAndValidate(); err != nil {
+		t.Fatalf("merged NormalizeAndValidate() error = %v", err)
+	}
+	if got, want := merged.ClientPlaybackContext.AppVersion, strings.Repeat("δ", 64); got != want {
+		t.Fatalf("normalized app_version = %q, want %q", got, want)
+	}
+}
+
+func TestPlanAttemptKeyV3Fixture(t *testing.T) {
+	type fixture struct {
+		Name                 string   `json:"name"`
+		ServerPlanAttemptKey string   `json:"server_plan_attempt_key"`
+		ReplanEcho           string   `json:"replan_echo"`
+		AttemptedPlanKeys    []string `json:"attempted_plan_keys"`
+		ExpectedServerAction string   `json:"expected_server_action"`
+	}
+	body, err := os.ReadFile("testdata/protocol_v3/attempt_keys.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixtures []fixture
+	if err := json.Unmarshal(body, &fixtures); err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range fixtures {
+		t.Run(value.Name, func(t *testing.T) {
+			if value.ServerPlanAttemptKey == "" || value.ReplanEcho != value.ServerPlanAttemptKey {
+				t.Fatalf("opaque echo drifted: %#v", value)
+			}
+			if len(value.AttemptedPlanKeys) != 1 || value.AttemptedPlanKeys[0] != value.ServerPlanAttemptKey {
+				t.Fatalf("attempted plan keys do not echo the server token: %#v", value)
+			}
+			if value.ExpectedServerAction != "reject_already_attempted_plan" {
+				t.Fatalf("server action = %q", value.ExpectedServerAction)
+			}
+		})
+	}
+}
+
+func TestPlanPlaybackV3DroppingFallbackHistoryReintroducesRejectedRoute(t *testing.T) {
+	file := detailedFixtureFileV3()
+	file.FilePath = "/media/movie.mp4"
+	file.Container = "mp4"
+	file.CodecVideo = "h264"
+	file.Resolution = "1080p"
+	file.Bitrate = 8_000
+	file.VideoTracks[0] = models.VideoTrack{Codec: "h264", Profile: "high", Level: 41, Width: 1920, Height: 1080, FrameRate: "24000/1001", Bitrate: 8_000, BitDepth: 8, VideoRange: "SDR", VideoRangeType: "SDR"}
+	request := validStartRequestV3()
+	request.Capabilities.CodecsVideo = []string{"h264"}
+	request.Capabilities.CodecsVideoHardware = []string{"h264"}
+	request.Capabilities.Containers = []string{"mp4"}
+	request.Capabilities.MaxResolution = "1080p"
+	request.Capabilities.VideoDecode = []VideoDecodeCapabilityV3{{Codec: "h264", Profiles: []string{"high"}, Levels: []int{41}, BitDepths: []int{8}, MaxWidth: 1920, MaxHeight: 1080, MaxFrameRate: 60, MaxBitrateKbps: 20_000, Hardware: true}}
+	input := PlannerInputV3{
+		Request: request, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0,
+		Settings: PlannerSettingsV3{TranscodeEnabled: true, Allow4KTranscode: true}, Registry: testTransformationRegistryV3(),
+	}
+	direct := PlanPlaybackV3(input)
+	if direct.Plan == nil || direct.Plan.Delivery != DeliveryOriginalHTTPV3 {
+		t.Fatalf("direct plan = %#v", direct)
+	}
+	input.AttemptedKeys = []string{PlanAttemptKeyV3(*direct.Plan, request.ClientPlaybackContext.Output.OutputContextID, nil)}
+	progressive := PlanPlaybackV3(input)
+	if progressive.Plan == nil || progressive.Plan.Delivery != DeliveryRemuxProgressiveV3 {
+		t.Fatalf("progressive fallback = %#v", progressive)
+	}
+	input.AttemptedKeys = append(input.AttemptedKeys, PlanAttemptKeyV3(*progressive.Plan, request.ClientPlaybackContext.Output.OutputContextID, nil))
+	hls := PlanPlaybackV3(input)
+	if hls.Plan == nil || hls.Plan.Delivery != DeliveryRemuxHLSV3 {
+		t.Fatalf("HLS fallback = %#v", hls)
+	}
+
+	seek := 321.25
+	input.Request.StartPosition = &seek
+	input.AttemptedKeys = nil // This is what the old seek-reanchor path did.
+	replanned := PlanPlaybackV3(input)
+	if replanned.Plan == nil || replanned.Plan.PlanID != direct.Plan.PlanID || replanned.Plan.PlanID == hls.Plan.PlanID {
+		t.Fatalf("dropped fallback history did not reproduce identity drift: direct=%#v hls=%#v replanned=%#v", direct.Plan, hls.Plan, replanned.Plan)
+	}
+	if replanned.Plan.Delivery != DeliveryOriginalHTTPV3 ||
+		replanned.Plan.Stream.Protocol != StreamHTTPProgressiveV3 || replanned.Plan.Stream.Container != "mp4" {
+		t.Fatalf("reintroduced route = %#v", replanned.Plan)
 	}
 }

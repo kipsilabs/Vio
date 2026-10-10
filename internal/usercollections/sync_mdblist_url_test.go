@@ -35,9 +35,9 @@ func TestFetchMDBListEntriesDoesNotDialPrivateHosts(t *testing.T) {
 	t.Parallel()
 
 	transport := &countingRoundTripper{}
-	svc := NewService(nil, nil, nil, &http.Client{Transport: transport}, slog.New(slog.DiscardHandler))
+	svc := NewService(nil, nil, nil, nil, &http.Client{Transport: transport}, slog.New(slog.DiscardHandler))
 
-	_, err := svc.fetchMDBListEntries(context.Background(), "http://127.0.0.1:8096/")
+	_, err := svc.fetchMDBListEntries(context.Background(), "http://127.0.0.1:8096/", 0)
 	if !errors.Is(err, collectionutil.ErrMDBListURL) {
 		t.Fatalf("fetchMDBListEntries(loopback) = %v, want ErrMDBListURL", err)
 	}
@@ -45,7 +45,7 @@ func TestFetchMDBListEntriesDoesNotDialPrivateHosts(t *testing.T) {
 		t.Fatalf("HTTP client was used %d times for a private URL", transport.hits.Load())
 	}
 
-	_, err = svc.fetchMDBListEntries(context.Background(), "http://169.254.169.254/latest/meta-data/")
+	_, err = svc.fetchMDBListEntries(context.Background(), "http://169.254.169.254/latest/meta-data/", 0)
 	if !errors.Is(err, collectionutil.ErrMDBListURL) {
 		t.Fatalf("fetchMDBListEntries(link-local) = %v, want ErrMDBListURL", err)
 	}
@@ -101,8 +101,8 @@ func TestFetchMDBListEntriesPagesPastDefaultTruncation(t *testing.T) {
 		}, nil
 	})
 
-	svc := NewService(nil, nil, nil, &http.Client{Transport: transport}, slog.New(slog.DiscardHandler))
-	entries, err := svc.fetchMDBListEntries(context.Background(), "https://mdblist.com/lists/alice/large/json")
+	svc := NewService(nil, nil, nil, nil, &http.Client{Transport: transport}, slog.New(slog.DiscardHandler))
+	entries, err := svc.fetchMDBListEntries(context.Background(), "https://mdblist.com/lists/alice/large/json", 0)
 	if err != nil {
 		t.Fatalf("fetchMDBListEntries: %v", err)
 	}

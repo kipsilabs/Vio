@@ -120,6 +120,21 @@ Removal can partially succeed before a 500. Deletion is naturally idempotent for
 the exact artifact and does not cancel preparation, remove another node's bytes,
 or revoke a native delivery grant. These descriptions change no worker behavior.
 
+`GET /downloads/artifacts` lists the node's prepared-download directory: a
+`downloadstorage.Listing` with the directory's measurement (`usage`, including
+`dir`) and one `{name, kind, bytes, mod_time}` per file, `kind` being `complete`,
+`partial`, or `other`. The API compares the names with its `download_artifacts`
+rows to find untracked files (see
+[prepared download storage](download-storage.md#reconciliation)). It requires the
+node bearer because it reveals the path. Only one listing runs at a time and the
+route waits at most 15 seconds for it; a second request, an unreadable directory, or
+a timeout answers plain-text `503`. A node that predates the route answers `404`,
+which the API reports as unable to reconcile. The listing only reads.
+
+The node's unauthenticated `/api/v1/health` also carries `artifacts`, the same
+measurement without `dir`, refreshed at most every five minutes. The API stores it in
+the node's `last_stats` (see [admin-api.md](../admin-api.md#last_stats)).
+
 Proxy subtitle and attached-font GET routes retain
 `/stream/subtitles/{token}/{track}` and its `/fonts` suffix. The inventory's
 `public` middleware class does not mean anonymous access: the handler verifies
@@ -165,6 +180,20 @@ Preparation follows request cancellation, but a lost response or cancellation
 does not establish that no bytes or receipt were published. This command is
 classified non-retryable; it supplies no durable cross-node admission or replay
 guarantee. These descriptions change no worker client, scheduler or runtime.
+
+The request's optional `log_session_id` (`download-prepare-<artifact id>`) labels
+the node's FFmpeg log lines with the durable job, so every attempt of one artifact
+reads as one stream in the operational logs. The node accepts only that shape and
+otherwise logs nothing; the field never affects bytes, so the execution fingerprint
+excludes it.
+
+`GET /downloads/prepare/{artifact_id}/progress` reads the in-memory progress of a
+prepare attempt running on the node: `encoded_seconds`, `duration_seconds`, and
+`speed` from FFmpeg's `-progress` stream. It requires node bearer authorization.
+An id with no encode in flight answers `running: false`, never 404, so the API
+treats 404 as a node that predates the operation and reports the attempt as unable
+to report progress. Readings are not durable and say nothing about a completed
+artifact; the API polls this operation only while its own prepare request is open.
 
 Proxy download GET and HEAD retain `/downloads/file/{token}`. Public outer
 middleware still requires a valid, expiring download token; playback tokens are

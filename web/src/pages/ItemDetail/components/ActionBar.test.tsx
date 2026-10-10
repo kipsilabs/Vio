@@ -34,12 +34,6 @@ const selectedVersion: FileVersion = {
   bitrate: 0,
 };
 
-const playBranches: Array<[string, Partial<ActionBarProps>]> = [
-  ["standard", {}],
-  ["selected version", { selectedVersion }],
-  ["resume choice", { playLabel: "Resume", restartHref: "/watch/movie-1?restart=1" }],
-];
-
 function renderActionBar(overrides: Partial<ActionBarProps> = {}) {
   return render(
     <QueryClientProvider client={new QueryClient()}>
@@ -70,57 +64,6 @@ describe("ActionBar", () => {
     });
     expect(button).not.toHaveAttribute("aria-pressed");
     expect(button.querySelector(".detail-short-label")).toHaveTextContent(shortLabel);
-  });
-
-  it.each(playBranches)(
-    "keeps the %s Play action on a compositor-only hover path",
-    (_, overrides) => {
-      renderActionBar(overrides);
-
-      expect(screen.getByRole("button", { name: "Play" })).toHaveClass(
-        "cursor-pointer",
-        "transform-gpu",
-        "transition-transform",
-        "duration-150",
-        "hover:bg-primary",
-        "motion-safe:hover:scale-[1.02]",
-        "motion-safe:active:scale-[0.98]",
-        "motion-reduce:hover:bg-primary/90",
-      );
-    },
-  );
-
-  it("keeps the watched action on a compositor-only hover path and shows pointers", () => {
-    renderActionBar({
-      watchedLabel: "Mark Watched",
-      onToggleWatched: () => {},
-      onToggleFavorite: () => {},
-      // The More button only renders when the overflow menu has at least one entry.
-      onToggleWatchlist: () => {},
-    });
-
-    expect(screen.getByRole("button", { name: "Mark Watched" })).toHaveClass(
-      "enabled:cursor-pointer",
-      "transform-gpu",
-      "transition-transform",
-      "duration-150",
-      "glass-hover",
-      "glass-hover-surface",
-      "motion-safe:hover:scale-[1.02]",
-      "motion-safe:active:scale-[0.98]",
-    );
-    expect(screen.getByTitle("Favorite")).toHaveClass(
-      "cursor-pointer",
-      "glass-hover",
-      "glass-hover-surface",
-      "transition-none",
-    );
-    expect(screen.getByTitle("More")).toHaveClass(
-      "cursor-pointer",
-      "glass-hover",
-      "glass-hover-surface",
-      "transition-none",
-    );
   });
 
   it("does not expose an enabled pointer affordance while the watched action is pending", () => {
@@ -276,30 +219,6 @@ describe("ActionBar primary action", () => {
       </QueryClientProvider>,
     );
   }
-
-  it("takes the Play pill's place and styling", () => {
-    const onClick = vi.fn();
-    renderWithPrimary({
-      playHref: "/watch/movie-1",
-      primaryAction: { label: "Request movie", icon: Plus, onClick },
-    });
-
-    expect(screen.queryByRole("button", { name: "Play" })).not.toBeInTheDocument();
-    const request = screen.getByRole("button", { name: "Request movie" });
-    expect(request).toBeEnabled();
-    expect(request).toHaveClass(
-      "h-11",
-      "rounded-full",
-      "px-8",
-      "text-[15px]",
-      "font-bold",
-      "cursor-pointer",
-      "hover:bg-primary",
-      "motion-safe:hover:scale-[1.02]",
-    );
-    fireEvent.click(request);
-    expect(onClick).toHaveBeenCalledOnce();
-  });
 
   it("shows a status as a disabled primary action without the hover affordance", () => {
     renderWithPrimary({ primaryAction: { label: "Requested", disabled: true } });

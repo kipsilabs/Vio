@@ -45,6 +45,13 @@ import {
 import { bumpHomeRefreshSignal } from "@/pages/homeSurfaceRefresh";
 import { createRealtimeQueryRefreshScheduler } from "@/components/realtimeQueryRefresh";
 import { adminSessionsKey } from "@/api/v2/adminSessionsCache";
+import {
+  adminDownloadPreparationsKey,
+  applyDownloadPreparationProgress,
+  isDownloadPreparationProgressEvent,
+  type AdminDownloadPreparationList,
+} from "@/api/v2/adminDownloadPreparations";
+import { adminDownloadStorageRootKey } from "@/api/v2/adminDownloadStorage";
 import { adminStatsKey } from "@/hooks/queries/admin/stats";
 import { useAuth } from "@/hooks/useAuth";
 import { useIsActingAdmin } from "@/hooks/useIsActingAdmin";
@@ -562,12 +569,34 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
     }
   }
 
+  /** Patches a progress reading into the cached list; false when a re-read is needed. */
+  function applyDownloadPreparationProgressToCache(
+    authority: ProfileRequestContextSnapshot | null,
+    event: Parameters<typeof applyDownloadPreparationProgress>[1],
+  ) {
+    const key = adminDownloadPreparationsKey(authority);
+    const cached = queryClient.getQueryData<AdminDownloadPreparationList>(key);
+    if (!cached) return true; // nothing is showing the list; nothing to refresh
+    const next = applyDownloadPreparationProgress(cached, event);
+    if (!next) return false;
+    queryClient.setQueryData(key, next);
+    return true;
+  }
+
   function handleSnapshot(
     message: EventsSnapshotMessage,
     refreshSessions: () => void,
     refreshQueries: (...filters: QueryFilters[]) => void,
+    refreshDownloadPreparations: () => void,
+    refreshDownloadStorage: () => void,
   ) {
     switch (message.channel) {
+      case "download_preparations":
+        // The channel sends no snapshot body; a (re)subscription means events
+        // may have been missed, so re-read the list and the storage views.
+        refreshDownloadPreparations();
+        refreshDownloadStorage();
+        break;
       case "jobs":
         if (Array.isArray(message.data)) {
           hydrateAdminJobSnapshot(queryClient, message.data as AdminJob[]);
@@ -670,8 +699,25 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
     realtimeAuthority: ProfileRequestContextSnapshot | null,
     refreshSessions: () => void,
     refreshQueries: (...filters: QueryFilters[]) => void,
+    refreshDownloadPreparations: () => void,
+    refreshDownloadStorage: () => void,
   ) {
     switch (message.channel) {
+      case "download_preparations":
+        if (message.event === "download_storage.changed") {
+          // Clean-up or a revoke changed what the storage views show.
+          refreshDownloadStorage();
+          break;
+        }
+        if (
+          message.event === "download_preparation.progress" &&
+          isDownloadPreparationProgressEvent(message.data) &&
+          applyDownloadPreparationProgressToCache(realtimeAuthority, message.data)
+        ) {
+          break;
+        }
+        refreshDownloadPreparations();
+        break;
       case "catalog":
         {
           const isItemChange = CATALOG_ITEM_CHANGED_EVENTS.has(message.event);
@@ -814,6 +860,14 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
         { queryKey: adminStatsKey(authority), exact: true },
       );
     };
+    const refreshDownloadPreparations = () => {
+      if (!authority.profileId) return;
+      adminRefresh.schedule({ queryKey: adminDownloadPreparationsKey(authority), exact: true });
+    };
+    const refreshDownloadStorage = () => {
+      if (!authority.profileId) return;
+      adminRefresh.schedule({ queryKey: adminDownloadStorageRootKey(authority) });
+    };
     let closedByEffect = false;
     let activeSocket: WebSocket | null = null;
 
@@ -940,10 +994,23 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
             return;
           }
           case "snapshot":
-            handleSnapshot(message, refreshSessions, adminRefresh.schedule);
+            handleSnapshot(
+              message,
+              refreshSessions,
+              adminRefresh.schedule,
+              refreshDownloadPreparations,
+              refreshDownloadStorage,
+            );
             return;
           case "event":
-            handleEvent(message, authority, refreshSessions, adminRefresh.schedule);
+            handleEvent(
+              message,
+              authority,
+              refreshSessions,
+              adminRefresh.schedule,
+              refreshDownloadPreparations,
+              refreshDownloadStorage,
+            );
             return;
           case "access_changed":
             handleAccessChanged();

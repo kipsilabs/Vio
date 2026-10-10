@@ -1,8 +1,8 @@
-import type { RefObject } from "react";
 import { act, renderHook, waitFor } from "@testing-library/react";
+import type { RefObject } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { useASSSubtitles } from "./useASSSubtitles";
 import type { PlayerSubtitleInfo, VideoFitMode } from "../types";
+import { useASSSubtitles } from "./useASSSubtitles";
 
 // Capture the options every JASSUB instance is constructed with, plus the
 // instances themselves so tests can observe later timeOffset updates.
@@ -34,8 +34,10 @@ vi.mock("jassub", () => {
     prescaleFactor = 1;
     prescaleHeightLimit = 1080;
     _canvas = document.createElement("canvas");
+    _video: HTMLVideoElement | undefined;
     constructor(opts: Record<string, unknown>) {
       constructorOpts.push(opts);
+      this._video = opts.video as HTMLVideoElement | undefined;
       this.timeOffset = (opts.timeOffset as number) ?? 0;
       instances.push(this);
     }
@@ -45,9 +47,17 @@ vi.mock("jassub", () => {
   return { default: MockJASSUB };
 });
 
+// A video showing a 1920×1080 stream; `setFrameSize(video, 0, 0)` empties it
+// the way a stream reload does.
+function setFrameSize(video: HTMLVideoElement, width: number, height: number) {
+  Object.defineProperty(video, "videoWidth", { configurable: true, value: width });
+  Object.defineProperty(video, "videoHeight", { configurable: true, value: height });
+}
+
 function makeVideoRef(readyState = 0): RefObject<HTMLVideoElement | null> {
   const video = document.createElement("video");
   Object.defineProperty(video, "readyState", { value: readyState, configurable: true });
+  setFrameSize(video, 1920, 1080);
   return { current: video };
 }
 
@@ -319,20 +329,72 @@ describe("useASSSubtitles time offset", () => {
     });
     expect(instances[0]!.resize).not.toHaveBeenCalled();
   });
+});
 
-  it("updates the live instance's timeOffset when the delay changes", async () => {
+describe("useASSSubtitles stream reload", () => {
+  // A seek reanchor reloads the stream behind the same <video> and moves the
+  // timeline offset. JASSUB resized while the element is empty draws nothing
+  // until its frame size changes, which a same-resolution stream never does.
+  async function renderReloadHook() {
     const videoRef = makeVideoRef();
-    const { rerender } = renderHook(
-      ({ delay }) => useASSSubtitles(videoRef, [germanTrack], 6, false, 30, delay),
-      { initialProps: { delay: 0 } },
+    const hook = renderHook(
+      ({ origin }) => useASSSubtitles(videoRef, [germanTrack], 6, false, origin, 0),
+      { initialProps: { origin: 900 } },
     );
-
     await waitFor(() => expect(instances).toHaveLength(1));
-    expect(instances[0]!.timeOffset).toBe(30);
+    await waitFor(() => expect(instances[0]!.resize).toHaveBeenCalled());
+    instances[0]!.resize.mockClear();
+    return { video: videoRef.current!, instance: instances[0]!, ...hook };
+  }
 
-    rerender({ delay: 2000 });
+  it("waits for the next stream's frame size before resizing", async () => {
+    const { video, instance, rerender } = await renderReloadHook();
 
-    await waitFor(() => expect(instances[0]!.timeOffset).toBe(28));
+    setFrameSize(video, 0, 0);
+    await act(async () => {
+      rerender({ origin: 0 });
+    });
+    expect(instance.timeOffset).toBe(0);
+    expect(instance.resize).not.toHaveBeenCalled();
+
+    setFrameSize(video, 1920, 1080);
+    await act(async () => {
+      video.dispatchEvent(new Event("loadedmetadata"));
+    });
+    expect(instance.resize).toHaveBeenCalledWith(true);
+  });
+
+  it("resizes when the frame size arrives after loadedmetadata", async () => {
+    const { video, instance } = await renderReloadHook();
+
+    setFrameSize(video, 0, 0);
+    await act(async () => {
+      video.dispatchEvent(new Event("loadedmetadata"));
+    });
+    expect(instance.resize).not.toHaveBeenCalled();
+
+    setFrameSize(video, 1920, 1080);
+    await act(async () => {
+      video.dispatchEvent(new Event("resize"));
+    });
+    expect(instance.resize).toHaveBeenCalledWith(true);
+  });
+
+  it("removes its video listeners when the track is torn down", async () => {
+    const videoRef = makeVideoRef();
+    const video = videoRef.current!;
+    const add = vi.spyOn(video, "addEventListener");
+    const remove = vi.spyOn(video, "removeEventListener");
+    const { unmount } = renderHook(() => useASSSubtitles(videoRef, [germanTrack], 6, false, 0, 0));
+    await waitFor(() => expect(instances).toHaveLength(1));
+    const added = add.mock.calls.filter(([type]) => type === "loadedmetadata" || type === "resize");
+    expect(added.map(([type]) => type).sort()).toEqual(["loadedmetadata", "resize"]);
+
+    unmount();
+
+    for (const [type, listener] of added) {
+      expect(remove).toHaveBeenCalledWith(type, listener);
+    }
   });
 });
 

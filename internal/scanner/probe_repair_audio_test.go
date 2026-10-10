@@ -295,3 +295,69 @@ func TestNeedsCriticalProbeRepairScanState_LegacyShortDurationRepairs(t *testing
 		t.Fatal("a short large video already reprobed by the fixed parser must not repair again")
 	}
 }
+
+// The probe_version gate is the MULTi backfill: rows the September migration
+// created carry version 0 with legacy track shapes, and only a successful
+// probe stamps the current version. An otherwise-complete version-0 file must
+// request repair so the backfill converges; the same file at the current
+// version must stay stable; version-0 virtual files stay exempt because their
+// track shape is provider-declared, never probed.
+func TestNeedsCriticalProbeRepairScanState_ProbeVersionGatesBackfill(t *testing.T) {
+	now := time.Now().UTC()
+	complete := func() *scanStateFile {
+		return &scanStateFile{
+			ProbeSource:    "local",
+			ProbeUpdatedAt: &now,
+			FileSize:       1_200_000_000,
+			Duration:       3600,
+			Container:      "mkv",
+			CodecVideo:     "h264",
+			CodecAudio:     "eac3",
+			Resolution:     "1080p",
+			HasVideoTracks: true,
+			HasAudioTracks: true,
+			HasChapters:    true,
+		}
+	}
+
+	legacy := complete()
+	legacy.ProbeVersion = 0
+	if !needsCriticalProbeRepairScanState(legacy) {
+		t.Fatal("an otherwise-complete version-0 file must request repair for the MULTi backfill")
+	}
+
+	current := complete()
+	current.ProbeVersion = probeVersion
+	if needsCriticalProbeRepairScanState(current) {
+		t.Fatal("an otherwise-complete file at the current probe version must not request repair")
+	}
+
+	virtual := complete()
+	virtual.ProbeVersion = 0
+	virtual.FilePath = "virtual://provider/release"
+	virtual.Container = "virtual"
+	if needsCriticalProbeRepairScanState(virtual) {
+		t.Fatal("a version-0 virtual file must stay exempt from probe repair")
+	}
+}
+
+// A standing probe rejection short-circuits repair before the version gate:
+// an unchanged file ffprobe already rejected must not be reprobed in the
+// background, even at version 0. Changed bytes drop the mark and repair.
+func TestScanStateNeedsProbeRepair_StandingRejectionSkipsVersionGate(t *testing.T) {
+	modifiedAt := time.Now().UTC().Truncate(time.Second)
+	failedAt := modifiedAt
+	rejected := &scanStateFile{
+		ProbeSource:    "local",
+		ProbeFailedAt:  &failedAt,
+		ProbeVersion:   0,
+		FileSize:       1024,
+		FileModifiedAt: &modifiedAt,
+	}
+	if scanStateNeedsProbeRepair(rejected, 1024, modifiedAt, true) {
+		t.Fatal("a standing rejection must skip background repair even at version 0")
+	}
+	if !scanStateNeedsProbeRepair(rejected, 2048, modifiedAt, true) {
+		t.Fatal("changed bytes must drop the rejection and repair")
+	}
+}

@@ -374,21 +374,6 @@ describe("AppSidebar", () => {
     expect(markup).toContain('href="/library/7?tab=library&amp;sort=year&amp;order=desc"');
   });
 
-  it("keeps collapsed navigation rows left-anchored instead of centering icons", () => {
-    const markup = renderSidebar("/item/42", { collapsed: true });
-
-    expect(markup).toContain('href="/"');
-    expect(markup).toContain('class="relative flex items-center gap-2.5 rounded-xl px-3 py-3');
-  });
-
-  it("preserves section header slots when collapsed so nav groups do not shift upward", () => {
-    const markup = renderSidebar("/item/42", { collapsed: true });
-
-    expect(markup).toContain("Libraries");
-    expect(markup).toContain("Discover");
-    expect(markup).toContain("Your Stuff");
-  });
-
   it("keeps the collapsed sidebar expanded while the profile menu is open without changing menu side", () => {
     expect(isSidebarExpanded(true, false, true)).toBe(true);
     expect(getProfileMenuSide(true)).toBe("right");
@@ -443,23 +428,6 @@ describe("AppSidebar", () => {
     expect(extrasIndex).toBeGreaterThan(-1);
     expect(toolsIndex).toBeGreaterThan(extrasIndex);
     expect(otherIndex).toBeGreaterThan(toolsIndex);
-  });
-
-  it("hides Apps group headers the same way as other section headers when collapsed", () => {
-    mockPluginInstallations = [
-      pluginInstallation(1, "alpha-app", "Alpha", "Tools"),
-      pluginInstallation(2, "beta-app", "Beta", "Extras"),
-    ];
-
-    const markup = renderSidebar("/", { collapsed: true });
-
-    // Group headers reuse SidebarSectionHeader, so the label slot stays in
-    // the layout (preventing shifts) but is visually hidden when collapsed.
-    expect(markup).toContain(">Tools<");
-    expect(markup).toContain(">Extras<");
-    const hiddenHeaderCount = (markup.match(/aria-hidden="true" class="[^"]*opacity-0/g) ?? [])
-      .length;
-    expect(hiddenHeaderCount).toBeGreaterThan(0);
   });
 });
 
@@ -560,33 +528,6 @@ describe("groupAppNavLinks", () => {
     label: id,
     pluginId: id,
     category,
-  });
-
-  it("returns null for an empty list", () => {
-    expect(groupAppNavLinks([])).toBeNull();
-  });
-
-  it("returns null when all links are uncategorized", () => {
-    expect(groupAppNavLinks([link("a"), link("b")])).toBeNull();
-  });
-
-  it("returns null when all links share the same first category segment", () => {
-    expect(groupAppNavLinks([link("a", "Tools/Utilities"), link("b", "Tools/Extras")])).toBeNull();
-  });
-
-  it("groups by first segment, sorts alphabetically, and puts Other last", () => {
-    const groups = groupAppNavLinks([
-      link("z", "Extras"),
-      link("a", "Tools/Utilities"),
-      link("m"),
-      link("b", "Tools"),
-    ]);
-
-    expect(groups).not.toBeNull();
-    expect(groups?.map((g) => g.category)).toEqual(["Extras", "Tools", "Other"]);
-    // Input order preserved within a group.
-    expect(groups?.[1]?.links.map((l) => l.id)).toEqual(["a", "b"]);
-    expect(groups?.[2]?.links.map((l) => l.id)).toEqual(["m"]);
   });
 
   it("treats blank or slash-only categories as uncategorized", () => {

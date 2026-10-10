@@ -27,10 +27,6 @@ const (
 	opUpdateRequestRouting     = "updateRequestRouting"
 )
 
-var adminRequestRouteOperationIDs = []string{opListRequestRoutes, opGetRequestRoute, opCreateRequestRoute,
-	opUpdateRequestRoute, opDeleteRequestRoute, opReorderRequestRoutes, opPreviewRequestRoute, opSearchRequestRouteTitles,
-	opGetRequestRouting, opUpdateRequestRouting}
-
 // adminRequestRoutes is the route administration slice of the request
 // service.
 type adminRequestRoutes interface {
@@ -529,3 +525,7 @@ func (reg *Registry) searchAdminRequestRouteTitles(ctx context.Context, in *Admi
 	}
 	return &AdminRequestRouteTitleCollectionOutput{Body: AdminRequestRouteTitleCollection{Collection: Paginated(items, "")}}, nil
 }
+
+var adminRequestRouteOperationIDs = []string{opListRequestRoutes, opGetRequestRoute, opCreateRequestRoute,
+	opUpdateRequestRoute, opDeleteRequestRoute, opReorderRequestRoutes, opPreviewRequestRoute, opSearchRequestRouteTitles,
+	opGetRequestRouting, opUpdateRequestRouting}
