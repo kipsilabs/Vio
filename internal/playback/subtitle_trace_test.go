@@ -149,16 +149,21 @@ func TestSubtitleTraceOutcomeForFailureAndCancellation(t *testing.T) {
 	t.Run("failure", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/subtitles/x.vtt", nil)
 		rec := httptest.NewRecorder()
+		// A tiny error body (7 bytes) must still be counted and marked failed,
+		// not folded into a bare duration.
 		entry := captureSubtitleTrace(t, "subtitle extract served", func() {
 			_, _ = cache.ServeExtractWithResult(rec, req, StreamExtractOpts{
 				InputPath: "virtual://movie/tt-trace-fail", CacheIdentity: "identity-fail", TrackIndex: 0, SourceCodec: "subrip",
 			}, func(_ context.Context, opts StreamExtractOpts) error {
-				_, _ = opts.Writer.Write([]byte("partial"))
+				_, _ = opts.Writer.Write([]byte("7 bytes"))
 				return context.DeadlineExceeded
 			})
 		})
 		if entry["outcome"] != SubtitleTraceOutcomeFailure {
 			t.Fatalf("outcome = %#v, want failure", entry["outcome"])
+		}
+		if entry["bytes"] != float64(len("7 bytes")) {
+			t.Fatalf("bytes = %#v, want %d for the tiny error body", entry["bytes"], len("7 bytes"))
 		}
 	})
 
