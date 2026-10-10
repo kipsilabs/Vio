@@ -170,6 +170,17 @@ export const FEATURE_SOURCE_COMMITTED_V3 = "source_committed_event_v1";
  */
 export const FEATURE_INVENTORY_UPDATED_V3 = "inventory_updated_event_v1";
 
+/**
+ * The client tolerates the deferred track-inventory start: the server may
+ * commit the transport on declared inventory, run a bounded fast track
+ * discovery before building the plan, and verify with the deferred probe
+ * afterwards. The client keeps its track menus in their loading state until
+ * the verified `inventory_updated` push arrives instead of treating pending
+ * inventory as final. Advertising it is what opts a start into the deferred
+ * path and its pre-plan discovery.
+ */
+export const FEATURE_DEFERRED_TRACK_INVENTORY_V3 = "deferred_track_inventory_v1";
+
 /** The `original` rung label, which always preserves the source. */
 export const QUALITY_ORIGINAL_V3 = "original";
 
