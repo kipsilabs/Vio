@@ -102,6 +102,10 @@ type Service struct {
 	cleanupVirtual          func(context.Context, Request) error
 	hasDefaultVirtualRouter func() bool
 	Now                     func() time.Time
+	// enrichAsync schedules the enrichment CreateRequest defers past the 201.
+	// Production leaves it nil to run the work on a goroutine detached from the
+	// request context; tests replace it to run the step explicitly.
+	enrichAsync func(func())
 }
 
 type DiscoverySection struct {
@@ -925,24 +929,17 @@ func (s *Service) CreateRequest(ctx context.Context, viewer Viewer, input Create
 	if err := s.ensureCreateAllowedByCeiling(ctx, viewer, normalized); err != nil {
 		return nil, err
 	}
-	tvdbLookupFailed := s.enrichExternalIDs(ctx, &normalized)
-
+	// The cheap local refusals run before any external call, so a bulk client
+	// retrying a title after a client-side timeout gets its 409 in
+	// milliseconds instead of after TMDB/TVDB round trips. The duplicate check
+	// runs before the TMDB read the next block may make.
 	matches, err := s.lookupPresence(ctx, normalized.MediaType, []PresenceCandidate{createPresenceCandidate(normalized)})
 	if err != nil {
 		return nil, err
 	}
 	match := matches[normalized.TMDBID]
-	if match.Available {
-		if normalized.MediaType == MediaTypeMovie || normalized.WholeSeries {
-			return nil, ErrAlreadyAvailable
-		}
-		more, err := s.moreSeasonsRequestable(ctx)
-		if err != nil {
-			return nil, err
-		}
-		if !more {
-			return nil, ErrAlreadyAvailable
-		}
+	if err := s.refuseUnavailable(ctx, normalized, match); err != nil {
+		return nil, err
 	}
 
 	active, err := s.store.ListActiveByTMDB(ctx, normalized.MediaType, []int{normalized.TMDBID})
@@ -953,39 +950,49 @@ func (s *Service) CreateRequest(ctx context.Context, viewer Viewer, input Create
 		return nil, ErrAlreadyRequested
 	}
 
-	// One TMDB detail read, after the cheap refusals, serves routing and the
-	// stored title: the server's copy of the title and year wins over the
-	// client's.
-	detail := s.requestDetail(ctx, normalized.MediaType, normalized.TMDBID)
-	if detail != nil {
-		if title := strings.TrimSpace(detail.Title); title != "" {
-			normalized.Title = title
+	// A series request cannot defer its TMDB read: its seasons are checked and
+	// defaulted from the title's season list, and the TVDB cross-reference TMDB
+	// supplies (directly or through a metadata provider) is what the router
+	// plugin needs. Both belong in the response and in a synchronous refusal.
+	// A v1 create also keeps the read: WholeSeries marks v1, whose frozen
+	// response must carry the server's title exactly as before. Only a v2
+	// movie defers the read past the 201: its display fields come from the
+	// client, and its routing facts and external IDs are backfilled by the
+	// enrichment step below.
+	enrichNow := normalized.MediaType == MediaTypeSeries || normalized.WholeSeries
+	var (
+		facts            RoutingFacts
+		tvdbLookupFailed bool
+	)
+	if enrichNow {
+		tvdbLookupFailed = s.enrichExternalIDs(ctx, &normalized)
+		// The TMDB lookup may have supplied the TVDB/IMDb IDs a series is
+		// matched in the library by. Re-check with them, so a series already
+		// present under its TVDB ID is refused rather than requested again.
+		if !match.Available {
+			hydrated, err := s.lookupPresence(ctx, normalized.MediaType, []PresenceCandidate{createPresenceCandidate(normalized)})
+			if err != nil {
+				return nil, err
+			}
+			if hm := hydrated[normalized.TMDBID]; hm.Available {
+				match = hm
+				if err := s.refuseUnavailable(ctx, normalized, match); err != nil {
+					return nil, err
+				}
+			}
 		}
-		if detail.Year > 0 {
-			year := detail.Year
-			normalized.Year = &year
+		detail := s.requestDetail(ctx, normalized.MediaType, normalized.TMDBID)
+		normalized = applyRequestDetail(normalized, detail)
+		facts = s.routingFacts(ctx, detail)
+		if !normalized.WholeSeries {
+			// A series partly in the library can still be requested for the
+			// seasons it is missing.
+			seasons, err := s.resolveRequestedSeasons(ctx, normalized.Seasons, detail, match)
+			if err != nil {
+				return nil, err
+			}
+			normalized.Seasons = seasons
 		}
-		// A caller without the display fields (a watchlist add keeps only
-		// its own snapshot) gets TMDB's; one that sent them keeps its own.
-		if normalized.Overview == "" {
-			normalized.Overview = strings.TrimSpace(detail.Overview)
-		}
-		if normalized.PosterPath == "" {
-			normalized.PosterPath = strings.TrimSpace(detail.PosterPath)
-		}
-		if normalized.BackdropPath == "" {
-			normalized.BackdropPath = strings.TrimSpace(detail.BackdropPath)
-		}
-	}
-	facts := s.routingFacts(ctx, detail)
-	if normalized.MediaType == MediaTypeSeries && !normalized.WholeSeries {
-		// A series partly in the library can still be requested for the
-		// seasons it is missing.
-		seasons, err := s.resolveRequestedSeasons(ctx, normalized.Seasons, detail, match)
-		if err != nil {
-			return nil, err
-		}
-		normalized.Seasons = seasons
 	}
 
 	policy, err := s.EffectivePolicy(ctx, viewer.UserID)
@@ -1045,11 +1052,65 @@ func (s *Service) CreateRequest(ctx context.Context, viewer Viewer, input Create
 		// Auto-approval is a real approval transition; channels subscribed to
 		// approvals see it alongside the submission.
 		s.notifyApproval(ctx, *req, ApprovalOriginPolicy)
-		req.externalIDsResolved = true
+		// Only a request enriched before the insert has its external IDs
+		// resolved; a deferred one lets the submission path resolve them, and
+		// records the lookup outcome the same way.
+		req.externalIDsResolved = enrichNow
 		req.tvdbLookupFailed = tvdbLookupFailed
-		return s.withLibraryContent(ctx, s.submitAfterCommit(ctx, *req, viewer)), nil
+		req = s.submitAfterCommit(ctx, *req, viewer)
+	}
+	if !enrichNow {
+		s.scheduleEnrichment(ctx, req.ID)
 	}
 	return s.withLibraryContent(ctx, req), nil
+}
+
+// refuseUnavailable applies the library-availability rule to a presence match:
+// a movie or a whole-series request is refused once the title is in the
+// library, and a series request only when no further season is requestable.
+// A match that is not available (or a series with seasons left) passes.
+func (s *Service) refuseUnavailable(ctx context.Context, input CreateRequestInput, match PresenceMatch) error {
+	if !match.Available {
+		return nil
+	}
+	if input.MediaType == MediaTypeMovie || input.WholeSeries {
+		return ErrAlreadyAvailable
+	}
+	more, err := s.moreSeasonsRequestable(ctx)
+	if err != nil {
+		return err
+	}
+	if !more {
+		return ErrAlreadyAvailable
+	}
+	return nil
+}
+
+// applyRequestDetail folds a TMDB detail into a create input: the server's
+// title and year replace the client's, and the display fields the caller
+// omitted are filled from TMDB. A nil detail (TMDB unreachable) changes
+// nothing.
+func applyRequestDetail(input CreateRequestInput, detail *tmdb.MediaDetail) CreateRequestInput {
+	if detail == nil {
+		return input
+	}
+	if title := strings.TrimSpace(detail.Title); title != "" {
+		input.Title = title
+	}
+	if detail.Year > 0 {
+		year := detail.Year
+		input.Year = &year
+	}
+	if input.Overview == "" {
+		input.Overview = strings.TrimSpace(detail.Overview)
+	}
+	if input.PosterPath == "" {
+		input.PosterPath = strings.TrimSpace(detail.PosterPath)
+	}
+	if input.BackdropPath == "" {
+		input.BackdropPath = strings.TrimSpace(detail.BackdropPath)
+	}
+	return input
 }
 
 func (s *Service) ListMine(ctx context.Context, viewer Viewer, filter ListFilter) ([]*Request, error) {
@@ -2158,6 +2219,96 @@ func (s *Service) enrichExternalIDs(ctx context.Context, input *CreateRequestInp
 		}
 	}
 	return tmdbFailed && input.MediaType == MediaTypeSeries && input.TVDBID == nil
+}
+
+// enrichmentTimeout bounds the deferred enrichment's external calls after the
+// request context is gone.
+const enrichmentTimeout = 2 * time.Minute
+
+// scheduleEnrichment runs a request's deferred TMDB enrichment after the 201.
+// It is best effort and detached from the request context: the durable request
+// row is the source of truth, so if the process dies mid-enrichment the
+// submission path backfills the routing facts (ensureRoutingFacts) and the
+// series path resolves the TVDB cross-reference again (ensureSeriesTVDBID).
+func (s *Service) scheduleEnrichment(ctx context.Context, id string) {
+	if id == "" {
+		return
+	}
+	base := context.WithoutCancel(ctx)
+	run := func() {
+		enrichCtx, cancel := context.WithTimeout(base, enrichmentTimeout)
+		defer cancel()
+		s.enrichRequest(enrichCtx, id)
+	}
+	if s.enrichAsync != nil {
+		s.enrichAsync(run)
+		return
+	}
+	go func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				slog.ErrorContext(base, "requests: deferred enrichment panicked", "component", "requests", "request_id", id, "panic", recovered)
+			}
+		}()
+		run()
+	}()
+}
+
+// enrichRequest is the deferred half of CreateRequest: it reads the title's
+// external IDs and routing facts from TMDB and writes them back to the row the
+// create already committed. A failure leaves the row as the create left it —
+// the facts uncaptured and the IDs unfilled — rather than storing an empty
+// snapshot that would read as captured, so submission and routing retry
+// through their backfill paths and the failure is not silently swallowed.
+func (s *Service) enrichRequest(ctx context.Context, id string) {
+	req, err := s.store.GetRequest(ctx, id)
+	if err != nil {
+		slog.WarnContext(ctx, "requests: deferred enrichment could not read the request", "component", "requests", "request_id", id, "err", err)
+		return
+	}
+	if req == nil || req.Outcome != OutcomeActive {
+		return
+	}
+	if req.RoutingFacts.Captured() && req.IMDbID != "" {
+		return
+	}
+	if req.IMDbID == "" {
+		input := CreateRequestInput{MediaType: req.MediaType, TMDBID: req.TMDBID, TVDBID: req.TVDBID}
+		if failed := s.enrichExternalIDs(ctx, &input); failed {
+			slog.WarnContext(ctx, "requests: deferred external-ID enrichment found no TVDB id for the series", "component", "requests", "request_id", id)
+		}
+		if strings.TrimSpace(input.IMDbID) != "" {
+			if _, err := s.store.SetExternalIDs(ctx, id, 0, input.IMDbID); err != nil {
+				slog.WarnContext(ctx, "requests: deferred enrichment could not store external ids", "component", "requests", "request_id", id, "err", err)
+			}
+		}
+	}
+	if req.RoutingFacts.Captured() {
+		return
+	}
+	detail := s.requestDetail(ctx, req.MediaType, req.TMDBID)
+	if detail == nil {
+		// TMDB unreachable: leave the facts uncaptured so submission/routing
+		// reads them again rather than routing on a title with no facts.
+		slog.WarnContext(ctx, "requests: deferred enrichment could not read the title from TMDB; routing will retry", "component", "requests", "request_id", id)
+		return
+	}
+	if req.Year == nil || req.Overview == "" || req.PosterPath == "" || req.BackdropPath == "" {
+		if _, err := s.store.FillRequestDisplay(ctx, id, detailYear(detail), detail.Overview, detail.PosterPath, detail.BackdropPath); err != nil {
+			slog.WarnContext(ctx, "requests: deferred enrichment could not fill the request display fields", "component", "requests", "request_id", id, "err", err)
+		}
+	}
+	if _, err := s.store.SetRoutingFacts(ctx, id, s.routingFacts(ctx, detail)); err != nil {
+		slog.WarnContext(ctx, "requests: deferred enrichment could not store routing facts", "component", "requests", "request_id", id, "err", err)
+	}
+}
+
+func detailYear(detail *tmdb.MediaDetail) *int {
+	if detail == nil || detail.Year <= 0 {
+		return nil
+	}
+	year := detail.Year
+	return &year
 }
 
 // ensureSeriesTVDBID looks up a series request's missing TVDB ID again right

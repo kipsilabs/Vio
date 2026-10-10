@@ -441,35 +441,41 @@ func TestWithdrawProfileWatchlistRequests(t *testing.T) {
 }
 
 // A watchlist add keeps only its own snapshot, without an overview or
-// backdrop; the request takes them from the TMDB detail it reads anyway, so
+// backdrop; the deferred enrichment then fills them from the TMDB detail, so
 // the admin queue shows the same artwork as for a direct request. A caller
-// that sent its own keeps them.
-func TestWatchlistRequestTakesDisplayFieldsFromTMDB(t *testing.T) {
+// that sent its own fields keeps them.
+func TestWatchlistRequestFillsDisplayFieldsFromTMDB(t *testing.T) {
 	store := newFakeStore()
 	store.settings.WatchlistRequests = true
 	store.trackActive = true
 	svc := newTestServiceWithTMDB(store, &fakeTMDBClient{detail: &tmdb.MediaDetail{
 		Title: "Heat", Year: 1995, Overview: "A heist.", PosterPath: "/poster.jpg", BackdropPath: "/backdrop.jpg",
 	}})
+	enrichment := &deferredEnrichment{}
+	svc.enrichAsync = enrichment.schedule
 	if _, err := svc.RequestFromWatchlist(context.Background(), testViewer(1), heatTitle()); err != nil {
 		t.Fatalf("RequestFromWatchlist: %v", err)
 	}
 	if len(store.created) != 1 {
 		t.Fatalf("created %d requests, want 1", len(store.created))
 	}
-	in := store.created[0].Input
-	if in.Overview != "A heist." || in.PosterPath != "/poster.jpg" || in.BackdropPath != "/backdrop.jpg" {
-		t.Fatalf("request input = %+v, want TMDB's overview, poster and backdrop", in)
+	enrichment.drain()
+	got := store.requests[store.created[0].ID]
+	if got.Overview != "A heist." || got.PosterPath != "/poster.jpg" || got.BackdropPath != "/backdrop.jpg" {
+		t.Fatalf("stored request = %+v, want TMDB's overview, poster and backdrop", got)
 	}
 
 	own := newFakeStore()
 	svc = newTestServiceWithTMDB(own, &fakeTMDBClient{detail: &tmdb.MediaDetail{Title: "Heat", Overview: "TMDB text", BackdropPath: "/tmdb.jpg"}})
+	enrichment = &deferredEnrichment{}
+	svc.enrichAsync = enrichment.schedule
 	if _, err := svc.CreateRequest(context.Background(), testViewer(1), CreateRequestInput{
 		MediaType: MediaTypeMovie, TMDBID: 949, Title: "Heat", Overview: "Client text", BackdropPath: "/client.jpg",
 	}); err != nil {
 		t.Fatalf("CreateRequest: %v", err)
 	}
-	if got := own.created[0].Input; got.Overview != "Client text" || got.BackdropPath != "/client.jpg" {
-		t.Fatalf("request input = %+v, want the caller's own fields kept", got)
+	enrichment.drain()
+	if got := own.requests[own.created[0].ID]; got.Overview != "Client text" || got.BackdropPath != "/client.jpg" {
+		t.Fatalf("stored request = %+v, want the caller's own fields kept", got)
 	}
 }

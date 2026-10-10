@@ -329,6 +329,82 @@ func (r *Resolver) fetchRequestID(ctx context.Context) string {
 	return reader(ctx)
 }
 
+// FetchReason names why a provider listing was performed, so a caller that
+// attributes startup cost can separate a genuine discovery (a cold or expired
+// cache miss) from an explicit user/forced refresh and from a background
+// stale-grace refresh. It never changes fetch behavior; it is observation only.
+type FetchReason string
+
+const (
+	// FetchReasonListing is a provider fetch on the ordinary read path: the
+	// cache had no servable entry for the key. It is the cold discovery a
+	// repeated start should be able to avoid once a resolution is reusable.
+	FetchReasonListing FetchReason = "listing"
+	// FetchReasonForced is a provider fetch that bypassed the fresh-serve floor,
+	// either an explicit user refresh/retry or a declared provider-outage
+	// re-list. It is a deliberate re-discovery, not a redundant one.
+	FetchReasonForced FetchReason = "forced"
+	// FetchReasonBackground is the stale-grace repopulation fetch. It runs off
+	// the request path and is not part of any single start's critical path.
+	FetchReasonBackground FetchReason = "background"
+)
+
+// ProviderFetchEvent reports one completed provider listing attempt. Duration
+// covers the whole attempt, including a failed one; Count is the number of
+// candidates the provider returned (0 on failure). CacheKey identifies the
+// listing without exposing the provider URL. Err is non-nil for a failed
+// attempt, so an observer can count failures separately from discovery.
+type ProviderFetchEvent struct {
+	CacheKey  string
+	Count     int
+	Reason    FetchReason
+	Duration  time.Duration
+	RequestID string
+	Err       error
+}
+
+// ProviderFetchObserver receives one event per provider listing attempt the
+// resolver performs under a context carrying it. It must be safe for
+// concurrent use: a resolver can run several fetches for one request (a cache
+// miss in listing plus a forced re-list in resolution) and background
+// refreshes across requests.
+type ProviderFetchObserver func(ProviderFetchEvent)
+
+type providerFetchObserverContextKey struct{}
+
+// WithProviderFetchObserver threads an observer into ctx for the provider
+// listings the resolver performs while serving that context. It is the
+// observability seam the startup path uses to attribute provider discovery
+// separately from candidate resolution and probing, without the resolver
+// knowing about HTTP or startup tracing. A nil observer leaves ctx untouched.
+func WithProviderFetchObserver(ctx context.Context, observer ProviderFetchObserver) context.Context {
+	if ctx == nil || observer == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, providerFetchObserverContextKey{}, observer)
+}
+
+// providerFetchObserverFromContext returns the observer threaded by the
+// caller, or nil when none is present.
+func providerFetchObserverFromContext(ctx context.Context) ProviderFetchObserver {
+	if ctx == nil {
+		return nil
+	}
+	observer, _ := ctx.Value(providerFetchObserverContextKey{}).(ProviderFetchObserver)
+	return observer
+}
+
+// reportProviderFetch notifies a threaded observer of one completed listing
+// attempt. It is a no-op without an observer, so the fetch path is unchanged
+// for callers that do not opt in.
+func reportProviderFetch(ctx context.Context, event ProviderFetchEvent) {
+	observer := providerFetchObserverFromContext(ctx)
+	if observer == nil {
+		return
+	}
+	observer(event)
+}
+
 // unreleasedError reports that tracked release metadata places the requested
 // movie or episode in the future. It is never surfaced as a playable
 // candidate: the host selects candidates by rank without consulting
@@ -1210,7 +1286,16 @@ func (r *Resolver) getCandidatesRaw(ctx context.Context, virtualPath string, for
 	// one provider fetch per listing, with every caller served its result. The
 	// join respects context cancellation, so a caller bounded by its own
 	// per-file budget still returns when that budget fires.
-	if wait := r.joinFlight(ctx, cacheKey, config, generation, mediaType, mediaID); wait != nil {
+	// A fetch on this path is a forced/refresh discovery when the caller asked
+	// for one; otherwise it is an ordinary listing miss. The reason is
+	// observation only: it travels with the shared flight and the direct
+	// attempt below so a fetch observer can separate real discovery from a
+	// deliberate re-list.
+	fetchReason := FetchReasonListing
+	if forceRefresh || bypassFloor {
+		fetchReason = FetchReasonForced
+	}
+	if wait := r.joinFlight(ctx, cacheKey, config, generation, mediaType, mediaID, fetchReason); wait != nil {
 		candidates, ok, err := r.awaitFlight(ctx, wait, cacheKey)
 		if err != nil {
 			// The joined flight failed. Surface its provider error instead of
@@ -1226,7 +1311,7 @@ func (r *Resolver) getCandidatesRaw(ctx context.Context, virtualPath string, for
 		// absent); fall through to our own attempt.
 	}
 
-	candidates, err := r.fetchProviderCandidates(ctx, config, generation, cacheKey, mediaType, mediaID)
+	candidates, err := r.fetchProviderCandidates(ctx, config, generation, cacheKey, mediaType, mediaID, fetchReason)
 	if err != nil {
 		if ctx.Err() == nil {
 			// A caller-canceled request is not the provider's state; recording
@@ -1328,7 +1413,7 @@ func (r *Resolver) awaitFlight(ctx context.Context, flight *candidateFlight, cac
 // request values (including the edge request id for the fetch log) while
 // carrying its own timeout, so a canceled caller does not kill the shared
 // fetch its waiters still need. Callers must NOT hold cacheMu.
-func (r *Resolver) joinFlight(ctx context.Context, cacheKey string, config Config, generation uint64, mediaType, mediaID string) *candidateFlight {
+func (r *Resolver) joinFlight(ctx context.Context, cacheKey string, config Config, generation uint64, mediaType, mediaID string, reason FetchReason) *candidateFlight {
 	r.cacheMu.Lock()
 	defer r.cacheMu.Unlock()
 	if r.refreshes == nil {
@@ -1358,7 +1443,7 @@ func (r *Resolver) joinFlight(ctx context.Context, cacheKey string, config Confi
 		}()
 		fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), syncFetchTimeout)
 		defer cancel()
-		_, err := r.fetchProviderCandidates(fetchCtx, config, generation, cacheKey, mediaType, mediaID)
+		_, err := r.fetchProviderCandidates(fetchCtx, config, generation, cacheKey, mediaType, mediaID, reason)
 		flight.err = err
 		if err != nil {
 			r.recordProviderFailure(cacheKey)
@@ -1396,7 +1481,7 @@ func (r *Resolver) startRefreshLocked(cacheKey string, generation uint64, config
 		}()
 		ctx, cancel := context.WithTimeout(context.Background(), backgroundRefreshTimeout)
 		defer cancel()
-		_, err := r.fetchProviderCandidates(ctx, config, generation, cacheKey, mediaType, mediaID)
+		_, err := r.fetchProviderCandidates(ctx, config, generation, cacheKey, mediaType, mediaID, FetchReasonBackground)
 		flight.err = err
 		if err != nil {
 			r.recordProviderFailure(cacheKey)
@@ -1409,9 +1494,21 @@ func (r *Resolver) startRefreshLocked(cacheKey string, generation uint64, config
 }
 
 // fetchProviderCandidates performs a synchronous streaming-provider lookup
-// and caches successful results. Provider URLs are never logged.
-func (r *Resolver) fetchProviderCandidates(ctx context.Context, config Config, generation uint64, cacheKey, mediaType, mediaID string) ([]StreamCandidate, error) {
+// and caches successful results. Provider URLs are never logged. reason names
+// the path that triggered the fetch for the fetch log and any threaded
+// ProviderFetchObserver; it does not change behavior.
+func (r *Resolver) fetchProviderCandidates(ctx context.Context, config Config, generation uint64, cacheKey, mediaType, mediaID string, reason FetchReason) (candidates []StreamCandidate, err error) {
 	started := time.Now()
+	// Report exactly one event per attempt, success or failure, so an observer
+	// counts real provider discovery rather than cache serves. The request id
+	// is read once here, before any early return.
+	event := ProviderFetchEvent{CacheKey: cacheKey, Reason: reason, RequestID: r.fetchRequestID(ctx)}
+	defer func() {
+		event.Count = len(candidates)
+		event.Duration = time.Since(started)
+		event.Err = err
+		reportProviderFetch(ctx, event)
+	}()
 	endpoint, err := streamEndpointWithPolicy(config.ManifestURL, mediaType, mediaID, config.AllowInsecure)
 	if err != nil {
 		return nil, err
@@ -1483,9 +1580,10 @@ func (r *Resolver) fetchProviderCandidates(ctx context.Context, config Config, g
 			"count", len(validCandidates),
 			"duration_ms", time.Since(started).Milliseconds(),
 			"cache_key", cacheKey,
+			"reason", string(reason),
 		}
-		if requestID := r.fetchRequestID(ctx); requestID != "" {
-			attrs = append(attrs, "request_id", requestID)
+		if event.RequestID != "" {
+			attrs = append(attrs, "request_id", event.RequestID)
 		}
 		logger.InfoContext(ctx, "provider candidates fetched", attrs...)
 	}

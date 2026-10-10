@@ -6,6 +6,8 @@ import (
 	"errors"
 	"testing"
 
+	chimw "github.com/go-chi/chi/v5/middleware"
+
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/subtitles"
 )
@@ -418,5 +420,37 @@ func TestSubtitleSyncUpdatedReachesEveryReplicaOnce(t *testing.T) {
 			payload.SyncKey != key || payload.SubtitleID != 0 || payload.Job.Phase != "analyzing" || *payload.Job.Progress != progress {
 			t.Fatalf("%s event %+v payload %+v err %v", name, event, payload, err)
 		}
+	}
+}
+
+// failingRealtimeConn fails every write with a non-NotFound error, so a notify
+// takes the delivery-failure path and emits its trace.
+type failingRealtimeConn struct{}
+
+func (failingRealtimeConn) WriteJSON(any) error { return errors.New("write failed") }
+
+// A translation notify delivers on a background context, but the caller's
+// request ID is threaded explicitly into sendTranslation, so a failed delivery
+// trace still joins the request that advanced the job.
+func TestTranslationTraceCarriesRequestID(t *testing.T) {
+	sessions := NewSessionManager(0, 0)
+	session, err := sessions.StartSession(7, "viewer", 42, PlayDirect, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hub := NewRealtimeHub()
+	reg := hub.Register(session.ID, failingRealtimeConn{})
+	defer hub.Unregister(reg)
+	notifier := NewSubtitleReadyNotifier(sessions, hub, nil)
+
+	ctx := context.WithValue(context.Background(), chimw.RequestIDKey, "req-translate-3")
+	entry := captureSubtitleTrace(t, "failed to deliver subtitle translation realtime event", func() {
+		notifier.TranslationFailed(ctx, session.ID, 42, 9, "ai:9", "failed")
+	})
+	if entry["request_id"] != "req-translate-3" {
+		t.Fatalf("request_id = %#v, want req-translate-3 (entry %#v)", entry["request_id"], entry)
+	}
+	if entry["phase"] != SubtitleTracePhaseNotify {
+		t.Fatalf("phase = %#v, want notify", entry["phase"])
 	}
 }

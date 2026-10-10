@@ -180,3 +180,32 @@ func TestResolveVirtualResumeNeutralRowStillLists(t *testing.T) {
 		t.Fatalf("provider lister called %d times, want 1 for a neutral row", listerCalls)
 	}
 }
+
+// Cross-node continuation: a resume's zero-discovery decision must be derived
+// from the durable catalog row, never from process-local sticky/best-result
+// state. Two independent handler instances — separate process state, as two API
+// nodes behind a load balancer — resuming the same durable row must both skip
+// provider discovery, and the second node never saw the first node's pin or
+// cache. This pins the no-process-local-state property for resume.
+func TestResolveVirtualResumeCrossNodeSkipsDiscoveryOnBothNodes(t *testing.T) {
+	expiresAt := time.Now().Add(3 * time.Hour)
+	for node := 1; node <= 2; node++ {
+		// A fresh row per node: nothing about the first node's in-memory state
+		// travels, only the persisted columns do.
+		file := withVirtualResumeVideoEvidence(virtualResumeRow("https://93.184.216.34/stream/token=stored", &expiresAt))
+		listerCalls, detailedCalls := 0, 0
+		h := virtualResumeHandler(&listerCalls, &detailedCalls, nil)
+
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil)
+		resolved, err := h.resolveVirtualPlaybackSource(req, file, "profile-1", true, nil, "", "", 0, false)
+		if err != nil {
+			t.Fatalf("node %d resolve: %v", node, err)
+		}
+		if listerCalls != 0 || detailedCalls != 0 {
+			t.Fatalf("node %d discovery: lister=%d detailed=%d, want 0/0", node, listerCalls, detailedCalls)
+		}
+		if resolved.URI != virtualResumeCandidate {
+			t.Fatalf("node %d resolved URI = %q, want the persisted %q", node, resolved.URI, virtualResumeCandidate)
+		}
+	}
+}

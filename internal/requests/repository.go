@@ -601,6 +601,34 @@ func (r *Repository) SetExternalIDs(ctx context.Context, id string, tvdbID int, 
 	return saved, nil
 }
 
+// FillRequestDisplay fills the display fields a deferred create left empty from
+// the title's TMDB detail. A field the client sent is kept, and the year only
+// fills when the row has none, so trust-then-verify never overwrites the
+// caller's copy. The title is required at create and is never touched.
+func (r *Repository) FillRequestDisplay(ctx context.Context, id string, year *int, overview, posterPath, backdropPath string) (*Request, error) {
+	var yearValue any
+	if year != nil && *year > 0 {
+		yearValue = *year
+	}
+	req, err := scanRequest(r.pool.QueryRow(ctx, `
+		UPDATE media_requests
+		SET year = COALESCE(year, $2),
+		    overview = CASE WHEN overview = '' THEN $3 ELSE overview END,
+		    poster_path = CASE WHEN poster_path = '' THEN $4 ELSE poster_path END,
+		    backdrop_path = CASE WHEN backdrop_path = '' THEN $5 ELSE backdrop_path END,
+		    updated_at = now()
+		WHERE id = $1
+		RETURNING `+requestColumns(), id, yearValue,
+		strings.TrimSpace(overview), strings.TrimSpace(posterPath), strings.TrimSpace(backdropPath)))
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("fill request display: %w", err)
+	}
+	return req, nil
+}
+
 func (r *Repository) ListMine(ctx context.Context, userID int, filter ListFilter) ([]*Request, error) {
 	sqlText, args := buildRequestListSQL("requested_by_user_id = $1", []any{userID}, filter)
 	return r.listRequests(ctx, sqlText, args)
