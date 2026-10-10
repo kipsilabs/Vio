@@ -56,6 +56,12 @@ function describeTerminalCopy(terminal: TerminalV3): { title: string; message: s
         message:
           "The file needed to play it can't be found right now. Go back and try another version if one is available.",
       };
+    case "source_unreadable":
+      return {
+        title: "This file can't be played",
+        message:
+          "Silo couldn't read this file. It appears to be empty or damaged. Replace the file, then rescan the library.",
+      };
     case "source_metadata_incomplete":
       return {
         title: "This file hasn't finished scanning",
@@ -183,13 +189,28 @@ export function isDeadPlaybackSessionError(error: unknown): boolean {
 }
 
 /**
+ * What the viewer is told when a stream that was already playing lost its
+ * connection to the server and the player could not get it back.
+ */
+export const CONNECTION_LOST_ERROR: PlaybackPolicyErrorDescription = {
+  title: "Connection lost",
+  message:
+    "Silo lost its connection to the server and couldn't reconnect. Check your connection, then try again to continue where you left off.",
+};
+
+/**
  * Describes the transport-level failures the v3 endpoints still express as HTTP
  * status codes, which are the ones about the *request* rather than the plan.
  * `426` is the one clients must render distinctly: it means this build is too
  * old for the server's protocol and no amount of retrying will help.
+ *
+ * `phase` says whether the request started playback or changed a stream that
+ * already plays, so a server error on a replan is not reported as a failure to
+ * start.
  */
 export function describePlaybackTransportError(
   error: unknown,
+  phase: "start" | "update" = "start",
 ): PlaybackPolicyErrorDescription | null {
   if (!(error instanceof PlayerFetchError)) {
     return null;
@@ -235,7 +256,10 @@ export function describePlaybackTransportError(
   if (error.status >= 500) {
     return {
       title: "Playback unavailable",
-      message: "Vio could not start playback right now. Please try again.",
+      message:
+        phase === "start"
+          ? "Vio could not start playback right now. Please try again."
+          : "Vio could not update playback right now. Please try again.",
     };
   }
 

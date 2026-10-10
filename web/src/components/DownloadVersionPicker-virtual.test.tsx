@@ -1,6 +1,7 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, expect, it, vi } from "vitest";
 import type { FileVersion } from "@/api/types";
+import { SaveCancelledError } from "@/api/v2/downloadPreparation";
 import DownloadVersionPicker from "./DownloadVersionPicker";
 
 const mocks = vi.hoisted(() => ({
@@ -105,6 +106,40 @@ it("saves a ready virtual download with the server's authority", async () => {
     fireEvent.click(save);
   });
   expect(mocks.save).toHaveBeenCalledWith("dl_2", "Movie.mp4");
+});
+
+it("stops polling and refuses when the per-entry read reports the row gone", async () => {
+  mocks.create.mockResolvedValue({ id: "dl_gone", status: "preparing" });
+  mocks.poll.mockResolvedValue(null);
+  await openVirtualPanel();
+
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: /Prepare download/i }));
+  });
+
+  await vi.waitFor(() =>
+    expect(mocks.toastError).toHaveBeenCalledWith(
+      "This download is no longer available. Prepare it again.",
+    ),
+  );
+  expect(screen.queryByText(/Preparing your download/i)).toBeNull();
+});
+
+it("stays silent and keeps the file ready when the save picker is cancelled", async () => {
+  mocks.create.mockResolvedValue({ id: "dl_cancel", status: "ready" });
+  mocks.save.mockRejectedValue(new SaveCancelledError());
+  await openVirtualPanel();
+
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: /Prepare download/i }));
+  });
+  const save = await screen.findByRole("button", { name: /Save file/i });
+  await act(async () => {
+    fireEvent.click(save);
+  });
+
+  expect(mocks.toastError).not.toHaveBeenCalled();
+  expect(screen.getByRole("button", { name: /Save file/i })).toBeInTheDocument();
 });
 
 it("cancels a preparing virtual download through delete", async () => {

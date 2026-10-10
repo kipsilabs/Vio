@@ -1,4 +1,5 @@
-import type { ReactNode } from "react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
+import DefaultArtwork from "@/components/DefaultArtwork";
 import ViewTransitionLink from "@/components/ViewTransitionLink";
 import MediaCarousel from "@/components/MediaCarousel";
 import { useCatalogItemDetail } from "@/hooks/queries/catalogRead";
@@ -6,7 +7,6 @@ import { isTerminalNotFoundError } from "@/hooks/queries/mediaSurfaceRefresh";
 import { useUICustomization } from "@/hooks/useUICustomization";
 import { carouselCardWidthClasses } from "@/lib/uiCustomization";
 import CardPlayOverlay from "@/components/CardPlayOverlay";
-import { useCallback, useEffect, useState } from "react";
 
 const MAX_MORE_LIKE_THIS_ITEMS = 12;
 
@@ -31,6 +31,8 @@ function RecommendationItemCard({
   onTerminalError,
 }: RecommendationItemCardProps) {
   const { data: item, error } = useCatalogItemDetail(itemId);
+  // Keyed by URL so a re-signed poster is tried again.
+  const [failedUrl, setFailedUrl] = useState<string | null>(null);
   // A 404 is terminal: the recommendation points at an item the catalog no
   // longer has. Report it so the grid unmounts this card, which lets the
   // query deactivate instead of polling a dead endpoint forever.
@@ -43,7 +45,6 @@ function RecommendationItemCard({
   if (terminal) {
     return null;
   }
-
   if (!item) {
     return (
       <div className={className}>
@@ -51,45 +52,45 @@ function RecommendationItemCard({
       </div>
     );
   }
-
   return (
-    <div className={className}>
-      <div className="group/card">
-        <div className="group/media relative">
-          <ViewTransitionLink to={`/item/${encodeURIComponent(itemId)}`} className="group block">
-            <div className="aspect-[2/3] overflow-hidden rounded-lg">
-              {item.poster_url ? (
-                <img
-                  src={item.poster_url}
-                  alt={item.title}
-                  loading="lazy"
-                  decoding="async"
-                  className="h-full w-full object-cover transition-transform group-hover:scale-105"
-                />
-              ) : (
-                <div className="bg-surface text-muted-foreground flex h-full items-center justify-center text-xs">
-                  {item.title}
-                </div>
-              )}
-            </div>
-          </ViewTransitionLink>
-          {item.play_content_id ? (
-            <CardPlayOverlay
-              contentId={item.play_content_id}
-              title={item.title}
-              type={item.type === "movie" ? "movie" : "episode"}
-            />
-          ) : null}
-        </div>
-        {showCaption ? (
-          <ViewTransitionLink
-            to={`/item/${encodeURIComponent(itemId)}`}
-            className="mt-1.5 block truncate text-sm font-medium hover:underline"
-          >
-            {item.title}
-          </ViewTransitionLink>
+    <div className={className ?? "group/card"}>
+      <div className="group/media relative">
+        <ViewTransitionLink
+          to={`/item/${encodeURIComponent(itemId)}`}
+          aria-label={item.title}
+          className="group block"
+        >
+          <div className="relative aspect-[2/3] overflow-hidden rounded-lg">
+            {item.poster_url && failedUrl !== item.poster_url ? (
+              <img
+                src={item.poster_url}
+                alt={item.title}
+                loading="lazy"
+                decoding="async"
+                onError={() => setFailedUrl(item.poster_url ?? null)}
+                className="h-full w-full object-cover transition-transform group-hover:scale-105"
+              />
+            ) : (
+              <DefaultArtwork mediaType={item.type} />
+            )}
+          </div>
+        </ViewTransitionLink>
+        {item.play_content_id ? (
+          <CardPlayOverlay
+            contentId={item.play_content_id}
+            title={item.title}
+            type={item.type === "movie" ? "movie" : "episode"}
+          />
         ) : null}
       </div>
+      {showCaption ? (
+        <ViewTransitionLink
+          to={`/item/${encodeURIComponent(itemId)}`}
+          className="mt-1.5 block truncate text-sm font-medium hover:underline"
+        >
+          {item.title}
+        </ViewTransitionLink>
+      ) : null}
     </div>
   );
 }
@@ -129,12 +130,11 @@ export function MoreLikeThisRow<T>({
 }
 
 export default function RecommendationGrid({ items, maxItems = 12 }: RecommendationGridProps) {
-  const [failedItemIds, setFailedItemIds] = useState<ReadonlySet<string>>(() => new Set());
-
+  const [failedItemIds, setFailedItemIds] = useState<Set<string>>(() => new Set());
   const handleTerminalError = useCallback((itemId: string) => {
-    setFailedItemIds((previous) => {
-      if (previous.has(itemId)) return previous;
-      const next = new Set(previous);
+    setFailedItemIds((prev) => {
+      if (prev.has(itemId)) return prev;
+      const next = new Set(prev);
       next.add(itemId);
       return next;
     });

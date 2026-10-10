@@ -225,7 +225,10 @@ func (s *DetailService) ProbedDurationsByEpisodeIDs(ctx context.Context, ids []s
 type ItemDetail struct {
 	ContentID     string `json:"content_id"`
 	PlayContentID string `json:"play_content_id,omitempty"`
-	Type          string `json:"type"`
+	// PlaySeasonNumber is the season of PlayContentID when it is an episode.
+	// The native v2 detail carries it; the frozen v1 detail does not.
+	PlaySeasonNumber *int   `json:"-"`
+	Type             string `json:"type"`
 
 	// Metadata (served inline from Postgres).
 	Title         string `json:"title"`
@@ -578,6 +581,11 @@ type FileVersion struct {
 	// when it has none. The v2 watch and Jellyfin views carry it; the frozen
 	// v1 view does not.
 	Trickplay *TrickplayGrid `json:"-"`
+	// Unreadable is models.MediaFile.ProbeRejected: ffprobe rejected the file
+	// and nothing usable is recorded for it, so it cannot play until it is
+	// replaced. Jellyfin PlaybackInfo leaves such versions out. Neither the v1
+	// nor the v2 view carries the flag.
+	Unreadable bool `json:"-"`
 }
 
 // SetMarkers refreshes the marker projection without rebuilding file metadata.
@@ -2327,7 +2335,7 @@ func (s *DetailService) buildMediaItemDetail(ctx context.Context, item *models.M
 		Crew:                       crewCredits,
 		Studios:                    item.Studios,
 		Networks:                   item.Networks,
-		Countries:                  item.Countries,
+		Countries:                  lang.UniqueCountries(item.Countries),
 		LockedFields:               item.LockedFields,
 		FirstAirDate:               item.FirstAirDate,
 		LastAirDate:                item.LastAirDate,
@@ -3657,7 +3665,7 @@ func (s *DetailService) effectiveSubtitleDefaults(
 		return defaults
 	}
 
-	rc := settingsresolve.Context{ProfileID: filter.ProfileID}
+	rc := settingsresolve.Context{ProfileID: filter.ProfileID, DeviceID: filter.DeviceID}
 	if libraryID := preferredPlayableLibraryID(files, filter.SelectedFileID); libraryID > 0 {
 		rc.LibraryIDs = []int{libraryID}
 	}
@@ -4475,6 +4483,7 @@ func (s *DetailService) buildPlaybackInfoWith(
 			Recap:          versionRecap,
 			Preview:        versionPreview,
 			MarkerSegments: models.EffectiveMarkerSegments(f),
+			Unreadable:     f.ProbeRejected(),
 		})
 
 		for _, sub := range f.SubtitleTracks {

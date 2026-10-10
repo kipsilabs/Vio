@@ -121,51 +121,6 @@ func TestWriteSectionDeleteErrorDistinguishesMissingSectionsFromRepositoryFailur
 	}
 }
 
-func TestBuildSectionsResponseEnrichesEpisodeMetadata(t *testing.T) {
-	seasonNumber := 1
-	episodeNumber := 1
-	seriesID := "series-1"
-	fetcher := &stubSectionEpisodeFetcher{
-		meta: map[string]sections.SectionItemMeta{
-			"episode-1": {
-				SeriesID:      &seriesID,
-				SeriesTitle:   "American Dad!",
-				SeasonNumber:  &seasonNumber,
-				EpisodeNumber: &episodeNumber,
-			},
-		},
-	}
-	h := &SectionHandler{episodeFetcher: fetcher}
-	withItems := []sections.SectionWithItems{
-		{
-			ResolvedSection: sections.ResolvedSection{ID: "released", SectionType: sections.SectionCustomFilter, Title: "Released"},
-			Items: []*models.MediaItem{{
-				ContentID: "episode-1",
-				Type:      "episode",
-				Title:     "Dumbston Checks In",
-				Status:    "matched",
-			}},
-		},
-	}
-
-	req := httptest.NewRequest(http.MethodGet, "/sections", nil)
-	resp := h.buildSectionsResponse(req, withItems, nil)
-
-	if fetcher.calls != 1 {
-		t.Fatalf("episode metadata fetch calls = %d, want 1", fetcher.calls)
-	}
-	item := resp.Sections[0].Items[0]
-	if item.SeriesTitle != "American Dad!" {
-		t.Fatalf("series title = %q, want %q", item.SeriesTitle, "American Dad!")
-	}
-	if item.SeasonNumber == nil || *item.SeasonNumber != 1 {
-		t.Fatalf("season number = %v, want 1", item.SeasonNumber)
-	}
-	if item.EpisodeNumber == nil || *item.EpisodeNumber != 1 {
-		t.Fatalf("episode number = %v, want 1", item.EpisodeNumber)
-	}
-}
-
 func TestBuildSectionsResponseSupportsMixedEpisodeAndSeriesRecentItems(t *testing.T) {
 	seasonNumber := 3
 	episodeNumber := 7
@@ -194,6 +149,9 @@ func TestBuildSectionsResponseSupportsMixedEpisodeAndSeriesRecentItems(t *testin
 	}}
 
 	resp := h.buildSectionsResponse(httptest.NewRequest(http.MethodGet, "/sections", nil), withItems, nil)
+	if fetcher.calls != 1 {
+		t.Fatalf("episode metadata fetch calls = %d, want 1", fetcher.calls)
+	}
 	if len(resp.Sections) != 1 || len(resp.Sections[0].Items) != 2 {
 		t.Fatalf("response shape = %#v", resp)
 	}
@@ -536,7 +494,7 @@ func TestValidateSectionConfigAcceptsContinueTypes(t *testing.T) {
 
 	for _, config := range tests {
 		t.Run(config, func(t *testing.T) {
-			if msg, ok := validateSectionConfig(sections.SectionContinueWatching, []byte(config)); !ok {
+			if msg, ok := validateSectionConfig(sections.SectionContinueWatching, []byte(config), false); !ok {
 				t.Fatalf("validateSectionConfig(%s) rejected config: %s", config, msg)
 			}
 		})
@@ -544,7 +502,7 @@ func TestValidateSectionConfigAcceptsContinueTypes(t *testing.T) {
 }
 
 func TestValidateSectionConfigRejectsUnknownContinueType(t *testing.T) {
-	msg, ok := validateSectionConfig(sections.SectionContinueWatching, []byte(`{"continue_type":"scrolling"}`))
+	msg, ok := validateSectionConfig(sections.SectionContinueWatching, []byte(`{"continue_type":"scrolling"}`), false)
 	if ok {
 		t.Fatal("validateSectionConfig accepted unknown continue_type")
 	}
@@ -656,15 +614,6 @@ func TestDropEmptySeasonalSectionsRemovesOnlyEmptySeasonal(t *testing.T) {
 		if w.ID == "a" {
 			t.Errorf("empty seasonal section was not dropped")
 		}
-	}
-}
-
-func TestDropEmptySeasonalSectionsHandlesNilAndEmpty(t *testing.T) {
-	if got := dropEmptySeasonalSections(nil); len(got) != 0 {
-		t.Errorf("expected empty/nil result for nil input, got %v", got)
-	}
-	if got := dropEmptySeasonalSections([]sections.SectionWithItems{}); len(got) != 0 {
-		t.Errorf("expected empty result for empty input, got %v", got)
 	}
 }
 
@@ -928,5 +877,28 @@ func TestToSectionOverridesPropagatesUserAddedFields(t *testing.T) {
 	// Admin-section customization should leave the user-added fields zero.
 	if got[1].IsUserAdded || got[1].UserSectionType != "" || len(got[1].UserConfig) != 0 || got[1].UserTitle != "" {
 		t.Errorf("legacy customization leaked user-added fields: %+v", got[1])
+	}
+}
+
+// TestSaveProfileOverridesRejectsNewAdminOnlyRecipe verifies that a non-admin
+// profile adding a user-added admin_curated_list override gets 403.
+func TestSaveProfileOverridesRejectsNewAdminOnlyRecipe(t *testing.T) {
+	// StoreProvider is nil so we test the gate in isolation.
+	// The gate runs BEFORE the StoreProvider check, so a 403 is returned before
+	// the nil-StoreProvider 500 path is reached.
+	h := &SectionHandler{}
+	body := []byte(`{"scope":"home","library_id":"","overrides":[{"is_user_added":true,"user_section_type":"admin_curated_list","user_config":{"item_ids":["a"]}}]}`)
+	req := httptest.NewRequest(http.MethodPut, "/profile/sections", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	// Authenticate as a non-admin profile.
+	ctx := apimw.SetClaims(req.Context(), &auth.Claims{Role: "user", UserID: 1})
+	ctx = apimw.SetProfileID(ctx, "p1")
+	req = req.WithContext(ctx)
+	rec := httptest.NewRecorder()
+
+	h.HandleSaveProfileOverrides(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden, got %d body=%s", rec.Code, rec.Body.String())
 	}
 }

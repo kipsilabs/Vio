@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router";
 import type { ItemDetail } from "@/api/types";
+import { useStartShuffle } from "@/hooks/queries/shuffles";
 import { useItemEpisodes } from "@/hooks/queries/episodes";
 import { prefetchVirtualPlayback } from "@/hooks/queries/catalogRead";
 import { useRefreshItemMetadata } from "@/hooks/queries/items";
@@ -33,6 +34,7 @@ export default function SeasonContent({ item }: { item: ItemDetail & { type: "se
   const { translating: overviewTranslating, onTranslate: onTranslateOverview } =
     useOnViewTranslation(item);
   const navigate = useNavigate();
+  const { startShuffle } = useStartShuffle();
   useAmbientColor(item.backdrop_thumbhash);
   const { user } = useAuth();
   const isAdmin = useIsActingAdmin();
@@ -146,6 +148,7 @@ export default function SeasonContent({ item }: { item: ItemDetail & { type: "se
               compactMobile
               item={item}
               contentId={item.content_id}
+              canAddToCollection={false}
               watchTogether={watchTogether.menu}
               playHref={firstEpisode ? `/watch/${firstEpisode.content_id}` : undefined}
               playLabel="Play First Episode"
@@ -164,6 +167,11 @@ export default function SeasonContent({ item }: { item: ItemDetail & { type: "se
               isAdmin={isAdmin}
               canCurateMetadata={canCurateMetadata}
               onEditMetadata={canCurateMetadata ? () => setEditOpen(true) : undefined}
+              onShuffle={
+                playableEpisodes.length > 1
+                  ? () => startShuffle({ kind: "season", id: item.content_id })
+                  : undefined
+              }
             />
           }
         />

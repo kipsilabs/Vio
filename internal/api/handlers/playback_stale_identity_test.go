@@ -52,7 +52,7 @@ func TestResolveV3AudioIndexAfterStaleDrop(t *testing.T) {
 		t.Fatal("expected staleness detection for rotated candidate")
 	}
 
-	index, err := resolveV3AudioIndex(newFile, "", nil)
+	index, _, err := resolveV3AudioIndex(newFile, "", nil)
 	if err != nil {
 		t.Fatalf("post-drop resolve err = %v", err)
 	}
@@ -61,7 +61,7 @@ func TestResolveV3AudioIndexAfterStaleDrop(t *testing.T) {
 	}
 
 	// A genuinely malformed identity still rejects.
-	if _, err := resolveV3AudioIndex(newFile, "garbage", nil); err == nil {
+	if _, _, err := resolveV3AudioIndex(newFile, "garbage", nil); err == nil {
 		t.Fatal("malformed identity must still error")
 	}
 }
@@ -108,14 +108,14 @@ func TestRemapSubtitleSelectionV3_ToleratesStaleSourceIdentity(t *testing.T) {
 	req := &playback.StartRequestV3{}
 	req.SubtitleTrackID = playback.TrackIDV3(424242, "subtitle", 0)
 
-	err := (&PlaybackHandler{}).remapSubtitleSelectionV3(context.Background(), source, target, req)
+	_, err := (&PlaybackHandler{}).remapSubtitleSelectionV3(context.Background(), source, target, req)
 	if err != nil {
 		t.Fatalf("remapSubtitleSelectionV3 err = %v, want nil", err)
 	}
 
 	malformed := &playback.StartRequestV3{}
 	malformed.SubtitleTrackID = "also-junk"
-	if err := (&PlaybackHandler{}).remapSubtitleSelectionV3(context.Background(), source, target, malformed); err == nil {
+	if _, err := (&PlaybackHandler{}).remapSubtitleSelectionV3(context.Background(), source, target, malformed); err == nil {
 		t.Fatal("malformed subtitle identity must still error")
 	}
 }

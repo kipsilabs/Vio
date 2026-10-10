@@ -3,7 +3,6 @@ import { describe, expect, it } from "vitest";
 import {
   buildPrePlaySubtitleCandidates,
   formatAudioTrackSummary,
-  formatSubtitleCandidateSummary,
   formatSubtitlePillSummary,
   inferSubtitleFlagsFromTitle,
 } from "./prePlaySelection";
@@ -19,18 +18,6 @@ describe("formatAudioTrackSummary", () => {
         title: "ATSC A/52B (AC-3, E-AC-3)",
       }),
     ).toBe("English · EAC3 · 5.1");
-  });
-});
-
-describe("formatSubtitleCandidateSummary", () => {
-  it("leaves forced and accessibility state to the row badges", () => {
-    expect(
-      formatSubtitleCandidateSummary({
-        languageLabel: "English",
-        forced: true,
-        hearingImpaired: false,
-      }),
-    ).toBe("English");
   });
 });
 

@@ -345,7 +345,7 @@ func TestRestartSessionLockedRejectsChangedToneMapSourceWithoutStoppingLiveSessi
 	}
 	modified := info.ModTime()
 	ffmpegPath := filepath.Join(dir, "ffmpeg")
-	if err := os.WriteFile(ffmpegPath, []byte("#!/bin/sh\nsleep 30\n"), 0o755); err != nil {
+	if err := os.WriteFile(ffmpegPath, []byte("#!/bin/sh\nexec sleep 30\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	track := nodeToneMapTrack()

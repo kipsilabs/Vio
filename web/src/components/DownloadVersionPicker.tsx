@@ -27,6 +27,7 @@ import {
   isDownloadPreparing,
   isDownloadRefused,
   savePreparedDownload,
+  SaveCancelledError,
   type PreparedDownloadEntry,
   type PreparedDownloadQuality,
 } from "@/api/v2/downloadPreparation";
@@ -204,7 +205,15 @@ export default function DownloadVersionPicker({
       } catch {
         return; // transient read failure: try again on the next tick
       }
-      if (!entry) return;
+      if (!entry) {
+        // A per-entry 404 means the row is gone, not that it rotated off a
+        // page: stop polling and report a terminal refusal.
+        const message = "This download is no longer available. Prepare it again.";
+        setRefusalMessage(message);
+        toast.error(message);
+        setPreparing(null);
+        return;
+      }
       if (entry.status === "ready") {
         setVirtualReady({ id: preparingId, filename: pendingFilenameRef.current });
         setPreparing(null);
@@ -331,6 +340,9 @@ export default function DownloadVersionPicker({
     try {
       await savePreparedDownload(virtualReady.id, virtualReady.filename);
     } catch (error) {
+      // Backing out of the browser's save picker is the user's choice, not a
+      // failure; the prepared copy stays ready to save again.
+      if (error instanceof SaveCancelledError) return;
       if (!(error instanceof StaleApiRequestContextError)) {
         const message = downloadPreparationErrorMessage(error);
         setRefusalMessage(message);

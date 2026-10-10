@@ -146,7 +146,9 @@ type Session struct {
 	PreferredAudioLanguage         string
 	SeriesAudioPreferenceSignature *userstore.AudioTrackSignature
 	SelectedAudioSignature         *userstore.AudioTrackSignature
-
+	// RemuxResumeLeadingPictureDrop freezes the planner's best-effort request
+	// to drop open-GOP leading pictures from a seeked progressive remux.
+	RemuxResumeLeadingPictureDrop bool
 	// RequireMediaAuthorization distinguishes v3 transports whose session ID is
 	// only a route (media requests must present an authenticated user) from
 	// legacy sessions whose ID doubles as a bearer credential. It is sticky for
@@ -337,6 +339,9 @@ type SessionStreamState struct {
 	PreferredAudioLanguage         string
 	SeriesAudioPreferenceSignature *userstore.AudioTrackSignature
 	SelectedAudioSignature         *userstore.AudioTrackSignature
+	// RemuxResumeLeadingPictureDrop freezes the planner's best-effort request
+	// to drop open-GOP leading pictures from a seeked progressive remux.
+	RemuxResumeLeadingPictureDrop bool
 
 	// Byte-affecting transcode recipe fields preserved so an offloaded restart
 	// (e.g. audio switch) can rebuild the exact same stream. SubtitleTrackIndex
@@ -508,6 +513,9 @@ type SessionManager struct {
 	finishHooks          []func(context.Context, *Session)
 	compatActivityReader SessionActivityReader
 	compatExpiryClaimer  SessionExpiryClaimer
+	// deliveryActivityReader reports media that another node served for a
+	// remote-transport session. See SetDeliveryActivityReader.
+	deliveryActivityReader SessionActivityReader
 	// transportStops holds the stop channels of media transports this replica
 	// is currently serving, keyed by session ID. See WatchTransportStop.
 	transportStops map[string]map[chan struct{}]struct{}
@@ -1408,6 +1416,7 @@ func applySessionStreamStateLocked(s *Session, state SessionStreamState) {
 		} else {
 			s.DVProfile = state.DVProfile
 		}
+		s.RemuxResumeLeadingPictureDrop = state.RemuxResumeLeadingPictureDrop
 	} else if state.RemuxDVMode != "" {
 		s.RemuxDVMode = state.RemuxDVMode
 		if state.DVProfile > 0 {
@@ -1510,6 +1519,7 @@ func snapshotSessionStreamStateLocked(s *Session) SessionStreamState {
 		RemuxDVMode:                      s.RemuxDVMode,
 		DVProfile:                        s.DVProfile,
 		DVProfilePin:                     s.DVProfilePin,
+		RemuxResumeLeadingPictureDrop:    s.RemuxResumeLeadingPictureDrop,
 		ClientIP:                         s.ClientIP,
 		ClientName:                       s.ClientName,
 		ClientVersion:                    s.ClientVersion,
@@ -1573,6 +1583,7 @@ func restoreSessionStreamStateLocked(s *Session, state SessionStreamState) {
 	// successor's pin to the previous file's route.
 	s.DVProfile = state.DVProfile
 	s.DVProfilePin = state.DVProfilePin
+	s.RemuxResumeLeadingPictureDrop = state.RemuxResumeLeadingPictureDrop
 	s.ClientIP = state.ClientIP
 	s.ClientName = state.ClientName
 	s.ClientVersion = state.ClientVersion
@@ -2153,7 +2164,9 @@ func (m *SessionManager) SetTranscodeRoute(sessionID string, route TranscodeRout
 }
 
 // SetEffectiveMediaFileID updates the currently delivered source file while
-// preserving the originally requested file selection.
+// preserving the originally requested file selection. Kept for the fork's
+// virtual rotation path (StreamHandler rebinds a session to the rotated
+// release row); upstream's test-prune pass removed it as unused upstream.
 func (m *SessionManager) SetEffectiveMediaFileID(sessionID string, fileID int) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -2167,21 +2180,6 @@ func (m *SessionManager) SetEffectiveMediaFileID(sessionID string, fileID int) e
 		s.MediaFileID = fileID
 	}
 	s.streamRevision++
-	m.touchSessionLocked(s)
-	return nil
-}
-
-// SetWebSocket marks whether a WebSocket liveness connection is active for a session.
-func (m *SessionManager) SetWebSocket(sessionID string, connected bool) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	s, ok := m.sessions[sessionID]
-	if !ok {
-		return ErrSessionNotFound
-	}
-
-	s.HasWebSocket = connected
 	m.touchSessionLocked(s)
 	return nil
 }
@@ -2677,6 +2675,7 @@ func (m *SessionManager) CleanStale() []*Session {
 // provided grace period. Sessions with an active media transport request are
 // preserved even if they have not emitted a recent heartbeat yet.
 func (m *SessionManager) CleanInactive(activeIdle, pausedIdle time.Duration) []*Session {
+	m.refreshDeliveryActivity(activeIdle, pausedIdle)
 	protected := m.refreshCompatActivity(activeIdle, pausedIdle)
 	m.mu.Lock()
 
@@ -2735,9 +2734,10 @@ func (m *SessionManager) countsTowardLimitsLocked(s *Session, now time.Time) boo
 // served by another node.
 //
 // A locally-served stream is held open by an in-flight transport request. A
-// proxy-served one has no such request here, so it is protected only by the
-// client's progress heartbeats — and a gap longer than the active grace would
-// reap it while media is still flowing. The windows are widened rather than
+// proxy-served one has no such request here, so it is protected by the
+// client's progress heartbeats and by the serving node's delivery records (see
+// SetDeliveryActivityReader) — and a gap in both longer than the active grace
+// would reap it while media is still flowing. The windows are widened rather than
 // made infinite: there is no absolute session lifetime cap in this manager, so
 // unconditional immunity would leak a session forever whenever a client
 // disappears without stopping. A client that has gone quiet for this long has

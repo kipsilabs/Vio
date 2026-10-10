@@ -15,10 +15,11 @@ import {
 import { useAdminUsers } from "@/hooks/queries/admin/users";
 import { useSettingsForm } from "@/hooks/useSettingsForm";
 import { activeSignInInstallation, BREAK_GLASS_REQUIRED_TEXT } from "@/lib/externalSignInAdmin";
+import { SaveBar } from "@/components/SaveBar";
 
 import { FieldGroup } from "./FieldGroup";
-import { SaveBar } from "./SaveBar";
 import { SettingField, SettingFieldStatus } from "./SettingField";
+import { NetworkSignInSection } from "./NetworkSignInSection";
 import { SignInProviderSlot } from "./SignInProviderSlot";
 import { useSignInProviderDrafts } from "./useSignInProviderDrafts";
 
@@ -178,6 +179,8 @@ export default function SignInSettings() {
             />
           </div>
         </FieldGroup>
+
+        <NetworkSignInSection installations={installations.data} />
 
         <FieldGroup label="Silo passwords" dirty={form.isDirty(LOCAL_LOGIN_KEY)}>
           <SettingField

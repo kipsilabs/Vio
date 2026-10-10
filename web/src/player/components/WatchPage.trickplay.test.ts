@@ -124,6 +124,9 @@ function playbackSession(
     retrying: false,
     initialSubtitleErrorTitle: null,
     initialSubtitleError: null,
+    connectionStatus: "connected",
+    connectionErrorTitle: null,
+    connectionError: null,
     switchVersion: vi.fn(),
     selectAutoVersion: vi.fn(),
     retryStart: vi.fn(),
@@ -131,6 +134,8 @@ function playbackSession(
     changeSubtitleTrack: vi.fn(),
     changeQuality: vi.fn(),
     recoverFromFailure: vi.fn(),
+    recoverConnection: vi.fn(),
+    retryConnection: vi.fn(),
     invalidatePlan: vi.fn().mockResolvedValue(true),
     reanchorSeek: vi.fn().mockResolvedValue(true),
     refreshSubtitles: vi.fn(),
@@ -228,9 +233,14 @@ it.each([
             { status, headers: { "Content-Type": "application/problem+json" } },
           ),
       );
+      vi.useFakeTimers();
       await act(async () => {
-        await client.refetchQueries({ queryKey: key });
+        const refetch = client.refetchQueries({ queryKey: key });
+        // Run the hook's real retry sequence without waiting out its backoff.
+        await vi.advanceTimersByTimeAsync(3_000);
+        await refetch;
       });
+      vi.useRealTimers();
       expect(client.getQueryState(key)?.status).toBe("error");
       expect(client.getQueryData(key)).toBe(cached);
       await waitFor(() =>
@@ -239,6 +249,7 @@ it.each([
     } finally {
       view.unmount();
       client.clear();
+      vi.useRealTimers();
       vi.unstubAllGlobals();
     }
   },

@@ -20,6 +20,9 @@ type SubtitlePolicyResultV3 struct {
 	Source               string
 	DownloadedSubtitleID int
 	Terminal             *TerminalV3
+	// Degraded reports that a positive selection could not be honored and
+	// the policy fell back to subtitles-off instead of refusing playback.
+	Degraded bool
 }
 
 // SubtitleInventoryEntryV3 is one subtitle track that exists for the file but
@@ -75,22 +78,16 @@ func ResolveSubtitlePolicyV3(file *models.MediaFile, request StartRequestV3, tra
 	}
 	entry, ok := subtitleEntryAtCombinedIndexV3(file, index, additional)
 	if !ok {
-		// An ordinal that no longer addresses a track on the effective file is
-		// stale — a carried selection from a richer version, or a track the
-		// effective edition simply does not have. There is no wire flag today
-		// separating a carried/auto-restored pick from an explicit in-request
-		// one (the client sends both as subtitle_track_index), so both degrade
-		// to subtitles-off rather than hard-failing the whole start. Playability
-		// wins: the session still opens and the viewer can re-pick from the
-		// menu, whereas a start terminal leaves them unable to play at all. The
-		// handler's identity remap tries language/format matching first; this
-		// covers the case it cannot. Log only for the original delivery class so
-		// the three per-plan policy resolutions emit one line, not three.
 		if deliveryClass == DeliveryClassOriginalHTTPV3 {
 			slog.Info("subtitle selection out of range for effective file; subtitles disabled",
 				"component", "playback", "file_id", file.ID, "subtitle_track_index", index)
 		}
-		return SubtitlePolicyResultV3{Decision: SubtitleDecisionV3{Mode: SubtitleOffV3}, SelectedIndex: -1, TransportIndex: -1}
+		return SubtitlePolicyResultV3{
+			Decision:       SubtitleDecisionV3{Mode: SubtitleOffV3},
+			SelectedIndex:  -1,
+			TransportIndex: -1,
+			Degraded:       true,
+		}
 	}
 	codec, source := entry.Codec, entry.Source
 	trackID := TrackIDV3(file.ID, "subtitle", index)

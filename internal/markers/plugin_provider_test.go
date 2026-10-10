@@ -38,6 +38,7 @@ func (f *fakePluginMarkerClient) GetMarkerProviderStats(context.Context, *plugin
 
 func TestPluginProviderFetchMapsAllSegments(t *testing.T) {
 	start10, end60 := 10.0, 60.0
+	negativeStart, endPastDuration := -1.0, 1801.0
 	creditsStart := 1700.0
 	previewStart := 1750.0
 	client := &fakePluginMarkerClient{fetchResp: &pluginv1.FetchMarkersResponse{Markers: []*pluginv1.MarkerSegment{
@@ -45,6 +46,8 @@ func TestPluginProviderFetchMapsAllSegments(t *testing.T) {
 		{Segment: "credits", StartSeconds: &creditsStart, Confidence: 0.9, SubmissionCount: 3},
 		{Segment: "recap", EndSeconds: &start10, Confidence: 0.7},
 		{Segment: "preview", StartSeconds: &previewStart, Confidence: 0.6},
+		{Segment: "intro", StartSeconds: &negativeStart},
+		{Segment: "intro", StartSeconds: &start10, EndSeconds: &endPastDuration},
 	}}}
 	provider, err := NewPluginProviderWithClientFactory(PluginProviderOptions{
 		InstallationID: 12,
@@ -85,7 +88,7 @@ func TestPluginProviderFetchMapsAllSegments(t *testing.T) {
 			t.Fatalf("marker provenance = %+v", marker)
 		}
 	}
-	if len(byKind) != 4 {
+	if len(res.Markers) != 4 || len(byKind) != 4 {
 		t.Fatalf("mapped %d markers, want 4: %+v", len(byKind), res.Markers)
 	}
 	if got := byKind[MarkerKindCredits]; got.End != 1800*time.Second {

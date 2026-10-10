@@ -268,6 +268,48 @@ func FetchMDBListJSONPaged[T any](ctx context.Context, client *http.Client, rawU
 	return entries, nil
 }
 
+// FetchMDBListJSON reads an MDBList list's public /json feed page by page.
+// A bare GET of that feed returns only its first 2000 entries; the feed
+// accepts limit and offset, so this requests pages until one comes back short.
+// maxEntries > 0 stops once that many entries are read; otherwise
+// MaxExplicitItemLimit applies. rawURL may be the list page or its /json form and
+// is validated with CanonicalMDBListURL before any request is made.
+func FetchMDBListJSON[T any](ctx context.Context, client *http.Client, rawURL string, maxEntries int) ([]T, error) {
+	listURL, err := CanonicalMDBListURL(rawURL)
+	if err != nil {
+		return nil, err
+	}
+	parsed, err := url.Parse(listURL)
+	if err != nil {
+		return nil, fmt.Errorf("parsing mdblist url: %w", err)
+	}
+	if maxEntries <= 0 || maxEntries > MaxExplicitItemLimit {
+		maxEntries = MaxExplicitItemLimit
+	}
+
+	var entries []T
+	for len(entries) < maxEntries {
+		pageSize := min(MDBListJSONPageSize, maxEntries-len(entries))
+		query := parsed.Query()
+		query.Set("limit", strconv.Itoa(pageSize))
+		query.Set("offset", strconv.Itoa(len(entries)))
+		parsed.RawQuery = query.Encode()
+
+		page, err := fetchMDBListJSONPage[T](ctx, client, parsed.String())
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, page...)
+		if len(page) < pageSize {
+			break
+		}
+	}
+	if len(entries) > maxEntries {
+		entries = entries[:maxEntries]
+	}
+	return entries, nil
+}
+
 // fetchMDBListJSONPage performs one bounded GET of a canonical /json URL and
 // decodes a single page.
 func fetchMDBListJSONPage[T any](ctx context.Context, client *http.Client, listURL string) ([]T, error) {

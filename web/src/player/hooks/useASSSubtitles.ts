@@ -161,6 +161,30 @@ function fillInset(content: string, videoFit: VideoFitMode, coverCrop: CoverCrop
 }
 
 /**
+ * Whether the renderer's video has a frame size to resize against. JASSUB
+ * sizes its canvas from the video's intrinsic size, which is 0×0 while a
+ * stream reload (seek reanchor, quality or audio switch) has emptied the
+ * element. Resizing then leaves libass drawing into a 0×0 frame, and JASSUB
+ * resizes again only when the frame size changes, which a reloaded stream at
+ * the same resolution never does.
+ */
+function hasFrameSize(instance: JASSUB): boolean {
+  const video = instance._video;
+  return !!video && video.videoWidth > 0 && video.videoHeight > 0;
+}
+
+/** Resizes and repaints the renderer once it is ready and has a frame size. */
+function repaintASS(instance: JASSUB, isCurrent: () => boolean): void {
+  void instance.ready
+    .then(() => {
+      if (isCurrent() && hasFrameSize(instance)) return instance.resize(true);
+    })
+    .catch((err) => {
+      if (isCurrent()) console.error("[useASSSubtitles] Unable to repaint subtitles:", err);
+    });
+}
+
+/**
  * Puts the canvas on the video's Fit/Fill crop, reloads the track with margins
  * that keep regular events inside the visible area, and repaints. JASSUB sizes
  * its canvas as if the video always used object-fit: contain, so Fill relies on
@@ -187,7 +211,7 @@ async function syncASSFill(
     fill.inset = inset;
     await instance.renderer.setTrack(applyASSMarginInset(fill.baseContent, inset));
   }
-  if (isCurrent()) await instance.resize(true);
+  if (isCurrent() && hasFrameSize(instance)) await instance.resize(true);
 }
 
 /**
@@ -209,7 +233,9 @@ export function useASSSubtitles(
   isDetached: boolean,
   streamOriginSeconds: number,
   subtitleDelayMs: number,
-  onLoadState?: (state: "idle" | "loading" | "ready" | "error") => void,
+  // "refreshing" is a reload of the track on screen for new timing: its
+  // current events stay up meanwhile, so it is not announced as loading.
+  onLoadState?: (state: "idle" | "loading" | "refreshing" | "ready" | "error") => void,
   // Fired when the server answers the subtitle fetch with
   // `subtitle_source_changed` (409): a virtual release rotated under this plan
   // and every URL for the active track is stale. The caller must refresh the
@@ -223,7 +249,8 @@ export function useASSSubtitles(
   videoFit: VideoFitMode = "contain",
   coverCrop: CoverCrop = NO_COVER_CROP,
   // Bumped when the server retimed the active track behind an unchanged URL
-  // (subtitle sync or a timing reset); changing it reloads the track.
+  // (subtitle sync or a timing reset); changing it swaps the track's script
+  // in the running renderer.
   cueRevision = 0,
 ): { isActive: boolean } {
   const onLoadStateRef = useRef(onLoadState);
@@ -293,6 +320,9 @@ export function useASSSubtitles(
     // Set when a seek cancels the in-flight attempt: the aborted request must
     // not count against the attempt budget, and the replacement restarts it.
     let supersededBySeek = false;
+    // Resizes skipped while a stream reload emptied the video are replayed
+    // here, once the next stream reports a frame size.
+    let stopResizeToStream: (() => void) | null = null;
 
     // Sliding-window state. The first window is anchored just behind the
     // playhead so the cue already on screen is included. `windowEnd` is
@@ -559,6 +589,16 @@ export function useASSSubtitles(
 
       const previous = jassubRef.current;
       jassubRef.current = instance;
+      // Resizes skipped while a stream reload emptied the video happen here,
+      // once the next stream has a frame size. Some browsers report that size
+      // after loadedmetadata, with a resize event.
+      const resizeToStream = () => repaintASS(instance, () => jassubRef.current === instance);
+      video.addEventListener("loadedmetadata", resizeToStream);
+      video.addEventListener("resize", resizeToStream);
+      stopResizeToStream = () => {
+        video.removeEventListener("loadedmetadata", resizeToStream);
+        video.removeEventListener("resize", resizeToStream);
+      };
       const fill: ASSFillState = {
         instance,
         baseContent: renderedSubContent,
@@ -739,6 +779,7 @@ export function useASSSubtitles(
       if (fontRefreshTimer !== null) clearTimeout(fontRefreshTimer);
       fontRefreshController?.abort();
       activeController?.abort();
+      stopResizeToStream?.();
       video.removeEventListener("timeupdate", maybeRefreshWindow);
       video.removeEventListener("seeking", maybeRefreshWindow);
       video.removeEventListener("seeked", maybeRefreshWindow);
@@ -763,15 +804,7 @@ export function useASSSubtitles(
     if (!instance || !activeUrl) return;
 
     instance.timeOffset = effectiveOffset;
-    void instance.ready
-      .then(() => {
-        if (jassubRef.current === instance) return instance.resize(true);
-      })
-      .catch((err) => {
-        if (jassubRef.current === instance) {
-          console.error("[useASSSubtitles] Unable to repaint subtitles:", err);
-        }
-      });
+    repaintASS(instance, () => jassubRef.current === instance);
   }, [effectiveOffset, activeUrl]);
 
   // Keep the canvas crop and the Fill margins in step with the video. A fit

@@ -327,8 +327,6 @@ func (failingSessionManager) EndTransport(string) error { return nil }
 
 func (failingSessionManager) SetRemoteTransport(string, bool) error { return nil }
 
-func (failingSessionManager) SetEffectiveMediaFileID(string, int) error { return nil }
-
 func (failingSessionManager) SetTranscodeNodeURL(string, string) error { return nil }
 func (failingSessionManager) SetTranscodeRoute(string, playback.TranscodeRoute) error {
 	return nil
@@ -343,9 +341,9 @@ func (failingSessionManager) RollbackReplacement(string, playback.SessionReplace
 	return nil
 }
 
-func (failingSessionManager) SetWebSocket(string, bool) error { return nil }
-
 func (failingSessionManager) SetRealtimeConnection(string, bool) error { return nil }
+
+func (failingSessionManager) SetEffectiveMediaFileID(string, int) error { return nil }
 
 func (failingSessionManager) SetProgressPersistenceDisabled(string, bool) error { return nil }
 
@@ -606,12 +604,13 @@ func writePlaybackTestFFmpegSleep(t *testing.T, sleepSeconds string) string {
 	t.Helper()
 
 	path := filepath.Join(t.TempDir(), "fake-ffmpeg.sh")
-	// A capped VAAPI start first runs one-frame rate-control smoke encodes
-	// into the null muxer; they succeed at once, as on a VBR-capable driver.
+	// Discovery and one-frame smoke commands finish immediately. Only a
+	// transport stays alive; exec keeps it one process so cancellation closes
+	// its pipes without waiting for an orphaned shell child.
 	script := "#!/bin/sh\n" +
 		"last=\"\"\n" +
 		"for arg in \"$@\"; do last=\"$arg\"; done\n" +
-		"case \" $* \" in *\" -rc_mode \"*\" -f null - \"*) exit 0 ;; esac\n" +
+		"case \" $* \" in *\" -bsfs \"*|*\" -encoders \"*|*\" -f null - \"*) exit 0 ;; esac\n" +
 		"case \"$last\" in\n" +
 		"  *.m3u8) out=\"$(dirname \"$last\")\"; mkdir -p \"$out\"; " +
 		"printf x > \"$out/init.mp4\"; printf x > \"$out/seg_0.m4s\"; " +
@@ -621,7 +620,7 @@ func writePlaybackTestFFmpegSleep(t *testing.T, sleepSeconds string) string {
 		"#EXTINF:2.0,\\nseg_0.m4s\\n#EXTINF:2.0,\\nseg_1.m4s\\n" +
 		"#EXTINF:2.0,\\nseg_2.m4s\\n' > \"$last\" ;;\n" +
 		"esac\n" +
-		"sleep " + sleepSeconds + "\n"
+		"exec sleep " + sleepSeconds + "\n"
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatalf("write fake ffmpeg: %v", err)
 	}
@@ -646,7 +645,7 @@ func writePlaybackTestFFmpegFailingAfterFirstStart(t *testing.T) string {
 		"#EXT-X-MEDIA-SEQUENCE:0\\n#EXT-X-MAP:URI=\"init.mp4\"\\n" +
 		"#EXTINF:2.0,\\nseg_0.m4s\\n#EXTINF:2.0,\\nseg_1.m4s\\n" +
 		"#EXTINF:2.0,\\nseg_2.m4s\\n' > \"$last\"\n" +
-		"sleep 30\n"
+		"exec sleep 30\n"
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatalf("write fail-after-first fake ffmpeg: %v", err)
 	}
@@ -667,7 +666,7 @@ func writePlaybackTestFFmpegNeverReady(t *testing.T) string {
 	t.Helper()
 
 	path := filepath.Join(t.TempDir(), "not-ready-ffmpeg.sh")
-	if err := os.WriteFile(path, []byte("#!/bin/sh\nsleep 30\n"), 0o755); err != nil {
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nexec sleep 30\n"), 0o755); err != nil {
 		t.Fatalf("write not-ready fake ffmpeg: %v", err)
 	}
 	return path
@@ -1510,7 +1509,7 @@ func TestFindAlternateFile_DoesNotCrossEdition(t *testing.T) {
 		},
 	}
 
-	alternate, err := handler.findAlternateFile(context.Background(), source)
+	alternate, err := handler.findAlternateFile(context.Background(), source, catalog.AccessFilter{})
 	if err != nil {
 		t.Fatalf("findAlternateFile: %v", err)
 	}
@@ -1546,7 +1545,7 @@ func TestFindAlternateFile_PrefersNon4KAcrossLabelsAndDimensions(t *testing.T) {
 		},
 	}
 
-	alternate, err := handler.findAlternateFile(context.Background(), source)
+	alternate, err := handler.findAlternateFile(context.Background(), source, catalog.AccessFilter{})
 	if err != nil {
 		t.Fatalf("findAlternateFile: %v", err)
 	}
@@ -1572,7 +1571,7 @@ func TestFindAlternateFile_Returns4KVersionWhenItIsTheOnlyAlternate(t *testing.T
 		},
 	}
 
-	alternate, err := handler.findAlternateFile(context.Background(), source)
+	alternate, err := handler.findAlternateFile(context.Background(), source, catalog.AccessFilter{})
 	if err != nil {
 		t.Fatalf("findAlternateFile: %v", err)
 	}
@@ -1729,7 +1728,7 @@ func TestFindAlternateFilesMultipleCandidates(t *testing.T) {
 		},
 	}
 
-	alternates, err := handler.findAlternateFiles(context.Background(), source, alternateOrdering{})
+	alternates, err := handler.findAlternateFilesOrdered(context.Background(), source, catalog.AccessFilter{}, alternateOrdering{})
 	if err != nil {
 		t.Fatalf("findAlternateFiles: %v", err)
 	}
@@ -1800,7 +1799,7 @@ func TestAlternateOrderingForClient(t *testing.T) {
 func TestFindAlternateFilesOrders4KFirstFor4KClient(t *testing.T) {
 	handler, source := alternateOrderingTestHandler()
 	order := alternateOrderingForClient(playback.ClientCodecCapabilitiesV3{MaxResolution: "2160p"})
-	alternates, err := handler.findAlternateFiles(context.Background(), source, order)
+	alternates, err := handler.findAlternateFilesOrdered(context.Background(), source, catalog.AccessFilter{}, order)
 	if err != nil {
 		t.Fatalf("findAlternateFiles: %v", err)
 	}
@@ -1813,7 +1812,7 @@ func TestFindAlternateFilesOrders4KFirstFor4KClient(t *testing.T) {
 func TestFindAlternateFilesKeepsNon4KFirstFor1080pClient(t *testing.T) {
 	handler, source := alternateOrderingTestHandler()
 	order := alternateOrderingForClient(playback.ClientCodecCapabilitiesV3{MaxResolution: "1080p"})
-	alternates, err := handler.findAlternateFiles(context.Background(), source, order)
+	alternates, err := handler.findAlternateFilesOrdered(context.Background(), source, catalog.AccessFilter{}, order)
 	if err != nil {
 		t.Fatalf("findAlternateFiles: %v", err)
 	}
@@ -1827,7 +1826,7 @@ func TestFindAlternateFilesKeepsNon4KFirstFor1080pClient(t *testing.T) {
 func TestFindAlternateFilesOrdersHDRFirstForHDRClient(t *testing.T) {
 	handler, source := alternateOrderingTestHandler()
 	order := alternateOrderingForClient(playback.ClientCodecCapabilitiesV3{MaxResolution: "2160p", HDR: true})
-	alternates, err := handler.findAlternateFiles(context.Background(), source, order)
+	alternates, err := handler.findAlternateFilesOrdered(context.Background(), source, catalog.AccessFilter{}, order)
 	if err != nil {
 		t.Fatalf("findAlternateFiles: %v", err)
 	}
@@ -1842,7 +1841,7 @@ func TestFindAlternateFilesDefaultOrderPreservesLegacy(t *testing.T) {
 	handler, source := alternateOrderingTestHandler()
 	// The zero ordering is what a device with no declared capability produces,
 	// and what the singular findAlternateFile path uses.
-	alternates, err := handler.findAlternateFiles(context.Background(), source, alternateOrdering{})
+	alternates, err := handler.findAlternateFilesOrdered(context.Background(), source, catalog.AccessFilter{}, alternateOrdering{})
 	if err != nil {
 		t.Fatalf("findAlternateFiles: %v", err)
 	}
@@ -1892,7 +1891,7 @@ func TestVirtualTransportAlternatesListsOnceAndBoundsTransient(t *testing.T) {
 	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
 	handler.FileVersionFetcher = fetcher
 
-	transient, err := handler.virtualTransportAlternatesV3(context.Background(), source, alternateOrdering{}, true)
+	transient, err := handler.virtualTransportAlternatesV3(context.Background(), source, catalog.AccessFilter{}, alternateOrdering{}, true)
 	if err != nil {
 		t.Fatalf("transient alternates: %v", err)
 	}
@@ -1904,7 +1903,7 @@ func TestVirtualTransportAlternatesListsOnceAndBoundsTransient(t *testing.T) {
 	}
 
 	fetcher.calls = 0
-	all, err := handler.virtualTransportAlternatesV3(context.Background(), source, alternateOrdering{}, false)
+	all, err := handler.virtualTransportAlternatesV3(context.Background(), source, catalog.AccessFilter{}, alternateOrdering{}, false)
 	if err != nil {
 		t.Fatalf("generic alternates: %v", err)
 	}

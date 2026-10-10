@@ -58,10 +58,14 @@ grep -q 'SecretField' web/src/pages/admin-settings/StreamingSettings.tsx \
   && pass "indexer SecretField rows" \
   || reject "indexer SecretField rows missing from StreamingSettings"
 
-# 6. New collections default virtual playback on.
-grep -q 'setVirtualPlayback] = useState(true)' web/src/pages/adminCollectionsShared.tsx \
-  && pass "virtual_playback add-flow defaults" \
-  || reject "virtual_playback add-flow defaults flipped off"
+# 6. New collections default virtual playback on at the creation API boundary
+# (resolveVirtualPlayback: nil means on). The old adminCollectionsShared add
+# forms were replaced by upstream's CollectionEditor revamp, which has no
+# toggle yet — the server default is what guarantees the behavior.
+grep -q 'func resolveVirtualPlayback(v \*bool) bool' internal/api/handlers/library_collections.go \
+  && grep -q 'if v == nil {' internal/api/handlers/library_collections.go \
+  && pass "virtual_playback creation default" \
+  || reject "virtual_playback creation default flipped off"
 
 # 7. Image build pipeline: BuildKit frontend pruning, unshadowed Go module layer caching, Go compiler cache persistence, single-runner manual frontend builds, and pinned base image versions (a floating tag bump silently invalidates the layer cache and the Go build cache).
 grep -Eq 'FROM node:22(\.[0-9]+){2}-slim AS node-base' Dockerfile \

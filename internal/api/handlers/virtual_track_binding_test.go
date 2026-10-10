@@ -143,7 +143,7 @@ func TestRemapSubtitleSelectionSameRowRotationUsesFingerprint(t *testing.T) {
 		SubtitleTrackIndex: &index,
 		SubtitleTrackID:    playback.TrackIDV3(source.ID, "subtitle", 0),
 	}
-	if err := (&PlaybackHandler{}).remapSubtitleSelectionV3(context.Background(), source, target, &request); err != nil {
+	if _, err := (&PlaybackHandler{}).remapSubtitleSelectionV3(context.Background(), source, target, &request); err != nil {
 		t.Fatalf("same-row remap: %v", err)
 	}
 	if request.SubtitleTrackIndex == nil || *request.SubtitleTrackIndex != 1 {
@@ -311,7 +311,7 @@ func TestRemapSubtitleSelectionSameRowUnchangedIsNoop(t *testing.T) {
 	target := &models.MediaFile{ID: 7, SubtitleTracks: append([]models.SubtitleTrack(nil), tracks...)}
 	index := 0
 	request := playback.StartRequestV3{SubtitleTrackIndex: &index, SubtitleTrackID: playback.TrackIDV3(7, "subtitle", 0)}
-	if err := (&PlaybackHandler{}).remapSubtitleSelectionV3(context.Background(), source, target, &request); err != nil {
+	if _, err := (&PlaybackHandler{}).remapSubtitleSelectionV3(context.Background(), source, target, &request); err != nil {
 		t.Fatalf("unchanged remap: %v", err)
 	}
 	if request.SubtitleTrackIndex == nil || *request.SubtitleTrackIndex != 0 {
@@ -586,7 +586,7 @@ func TestCapturedEmptyEvidenceDoesNotInventOldSelection(t *testing.T) {
 		SubtitleTrackIndex: &index,
 		SubtitleTrackID:    playback.TrackIDV3(row.ID, "subtitle", 0),
 	}
-	if err := handler.remapSubtitleSelectionV3(context.Background(), source, row, &request); err != nil {
+	if _, err := handler.remapSubtitleSelectionV3(context.Background(), source, row, &request); err != nil {
 		t.Fatalf("captured-empty subtitle remap: %v", err)
 	}
 	if request.SubtitleTrackIndex != nil || request.SubtitleTrackID != "" {

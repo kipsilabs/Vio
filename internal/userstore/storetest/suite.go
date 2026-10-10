@@ -15,18 +15,14 @@ import (
 	"github.com/Silo-Server/silo-server/internal/userstore"
 )
 
-// RunMarkWatchedBatch runs only the batch mark-watched conformance test. It is
-// exposed separately, like RunProgressSince, so each backend can pin the
-// series/season mark-watched path without the full suite.
+// RunMarkWatchedBatch checks series and season mark-watched behavior on each backend.
 func RunMarkWatchedBatch(t *testing.T, newStore func(t *testing.T) userstore.UserStore) {
 	t.Run("MarkWatchedBatch", func(t *testing.T) {
 		testMarkWatchedBatch(t, newStore)
 	})
 }
 
-// RunProgressSince runs only the offline-sync progress-reconciliation
-// conformance test (invariant 1). It is exposed separately so a backend can
-// exercise the offline-sync behavior without the full suite.
+// RunProgressSince checks offline-sync progress reconciliation and event ordering.
 func RunProgressSince(t *testing.T, newStore func(t *testing.T) userstore.UserStore) {
 	t.Run("DeltaCursor", func(t *testing.T) {
 		testProgressSince(t, newStore)
@@ -1619,6 +1615,7 @@ func testOnlineWriteAdvancesEventAt(t *testing.T, newStore func(t *testing.T) us
 // pushes a mark after a removal back into visibility, and a zero duration
 // leaves a known duration alone (jellycompat's mark-played supplies none).
 func testMarkWatchedBatch(t *testing.T, newStore func(t *testing.T) userstore.UserStore) {
+	const secondEpisodeID = "ep-2"
 	ctx := context.Background()
 	store := newStore(t)
 	if err := store.CreateProfile(ctx, userstore.Profile{ID: "p1", Name: "Test"}); err != nil {
@@ -1628,7 +1625,7 @@ func testMarkWatchedBatch(t *testing.T, newStore func(t *testing.T) userstore.Us
 	watchedAt := time.Date(2026, 5, 2, 9, 0, 0, 0, time.UTC)
 	targets := []userstore.MarkWatchedTarget{
 		{MediaItemID: "ep-1", DurationSeconds: 1200},
-		{MediaItemID: "ep-2", DurationSeconds: 1500},
+		{MediaItemID: secondEpisodeID, DurationSeconds: 1500},
 	}
 	entries := []userstore.WatchHistoryEntry{
 		{
@@ -1641,7 +1638,7 @@ func testMarkWatchedBatch(t *testing.T, newStore func(t *testing.T) userstore.Us
 		},
 		{
 			ProfileID:       "p1",
-			MediaItemID:     "ep-2",
+			MediaItemID:     secondEpisodeID,
 			WatchedAt:       watchedAt.Format(time.RFC3339),
 			DurationSeconds: 1500,
 			Completed:       true,
@@ -1690,7 +1687,7 @@ func testMarkWatchedBatch(t *testing.T, newStore func(t *testing.T) userstore.Us
 	for _, entry := range history {
 		counts[entry.MediaItemID]++
 	}
-	if counts["ep-1"] != 1 || counts["ep-2"] != 1 {
+	if counts["ep-1"] != 1 || counts[secondEpisodeID] != 1 {
 		t.Fatalf("history counts = %v, want exactly one row per target", counts)
 	}
 
@@ -1705,39 +1702,37 @@ func testMarkWatchedBatch(t *testing.T, newStore func(t *testing.T) userstore.Us
 		t.Fatalf("history after retry: %+v %v", history, err)
 	}
 
-	// A zero duration must not erase a duration the store already knows.
-	if _, err := userstore.MarkWatchedBatch(ctx, store, "p1",
-		[]userstore.MarkWatchedTarget{{MediaItemID: "ep-1"}},
+	// Start incomplete so the zero-duration mark must update the row.
+	if err := store.SetProgressAt(ctx, "p1", "known-duration", 120, 1200, false, watchedAt); err != nil {
+		t.Fatal(err)
+	}
+	marked, err := userstore.MarkWatchedBatch(ctx, store, "p1",
+		[]userstore.MarkWatchedTarget{{MediaItemID: "known-duration"}},
 		[]userstore.WatchHistoryEntry{{
-			ProfileID:   "p1",
-			MediaItemID: "ep-1",
-			WatchedAt:   watchedAt.Add(time.Hour).Format(time.RFC3339),
-			Completed:   true,
-			Source:      userstore.WatchHistorySourceJellycompat,
+			ProfileID: "p1", MediaItemID: "known-duration",
+			WatchedAt: watchedAt.Add(time.Hour).Format(time.RFC3339),
+			Completed: true, Source: userstore.WatchHistorySourceJellycompat,
 		}},
-	); err != nil {
-		t.Fatalf("MarkWatchedBatch(zero duration): %v", err)
+	)
+	if err != nil || len(marked) != 1 {
+		t.Fatalf("zero-duration mark: %+v %v", marked, err)
 	}
-	progress, err := store.GetProgress(ctx, "p1", "ep-1")
-	if err != nil || progress == nil {
-		t.Fatalf("GetProgress(ep-1 after zero-duration mark) = %+v (%v)", progress, err)
-	}
-	if progress.DurationSeconds != 1200 {
-		t.Fatalf("duration = %v, want 1200 — a zero-duration mark must not clear a known duration",
-			progress.DurationSeconds)
+	progress, err := store.GetProgress(ctx, "p1", "known-duration")
+	if err != nil || progress == nil || !progress.Completed || progress.PositionSeconds != 0 || progress.DurationSeconds != 1200 {
+		t.Fatalf("zero-duration mark must complete and preserve duration: %+v %v", progress, err)
 	}
 
 	// Marking watched after a history removal must land after the hidden
 	// watermark, otherwise the new mark is invisible.
 	removedAt := time.Date(2026, 5, 3, 9, 0, 0, 0, time.UTC)
-	if err := store.RemoveHistoryItems(ctx, "p1", []string{"ep-2"}, removedAt); err != nil {
+	if err := store.RemoveHistoryItems(ctx, "p1", []string{secondEpisodeID}, removedAt); err != nil {
 		t.Fatalf("RemoveHistoryItems(ep-2): %v", err)
 	}
 	remarked, err := userstore.MarkWatchedBatch(ctx, store, "p1",
-		[]userstore.MarkWatchedTarget{{MediaItemID: "ep-2", DurationSeconds: 1500}},
+		[]userstore.MarkWatchedTarget{{MediaItemID: secondEpisodeID, DurationSeconds: 1500}},
 		[]userstore.WatchHistoryEntry{{
 			ProfileID:       "p1",
-			MediaItemID:     "ep-2",
+			MediaItemID:     secondEpisodeID,
 			WatchedAt:       watchedAt.Format(time.RFC3339), // older than the removal
 			DurationSeconds: 1500,
 			Completed:       true,
@@ -1756,7 +1751,7 @@ func testMarkWatchedBatch(t *testing.T, newStore func(t *testing.T) userstore.Us
 	}
 	completed, err := store.ListCompletedHistoryItems(ctx, userstore.CompletedHistoryItemQuery{
 		ProfileID:    "p1",
-		MediaItemIDs: []string{"ep-2"},
+		MediaItemIDs: []string{secondEpisodeID},
 	})
 	if err != nil {
 		t.Fatalf("ListCompletedHistoryItems(ep-2): %v", err)
@@ -2081,12 +2076,11 @@ func testCollections(t *testing.T, newStore func(t *testing.T) userstore.UserSto
 	}
 
 	shared, err := store.CreateCollection(ctx, userstore.CreateCollectionInput{
-		CreatorProfileID:  "p1",
-		Name:              "Family Action",
-		CollectionType:    "smart",
-		IsShared:          true,
-		AllowedProfileIDs: []string{"p1", "p2"},
-		QueryDefinition:   `{"match":"all","groups":[]}`,
+		CreatorProfileID: "p1",
+		Name:             "Family Action",
+		CollectionType:   "smart",
+		IsShared:         true,
+		QueryDefinition:  `{"match":"all","groups":[]}`,
 	})
 	if err != nil {
 		t.Fatalf("CreateCollection(shared): %v", err)
@@ -2930,9 +2924,13 @@ func testPersonalListPage(t *testing.T, store userstore.UserStore,
 		{"p2", "m-z", base.Add(4 * time.Minute)},
 	}
 	for _, w := range writes {
-		if _, err := add(ctx, w.profile, w.id, w.at); err != nil {
-			t.Fatalf("add %s: %v", w.id, err)
+		if inserted, err := add(ctx, w.profile, w.id, w.at); err != nil || !inserted {
+			t.Fatalf("add %s: inserted=%v err=%v", w.id, inserted, err)
 		}
+	}
+	first := writes[0]
+	if inserted, err := add(ctx, first.profile, first.id, first.at); err != nil || inserted {
+		t.Fatalf("duplicate add: inserted=%v err=%v", inserted, err)
 	}
 	want := []string{listD, listC, listB, listA, listE}
 
@@ -3127,5 +3125,113 @@ func testProgressPage(t *testing.T, newStore func(t *testing.T) userstore.UserSt
 	}
 	if len(rest) != 5 || rest[0].MediaItemID != want[0] {
 		t.Fatalf("rest = %d rows, first %q", len(rest), rest[0].MediaItemID)
+	}
+}
+
+// RunCollectionSharing runs the personal collection visibility and owner-only
+// update conformance checks: a shared collection reaches every profile on the
+// login, a private one only its creator (#1615).
+func RunCollectionSharing(t *testing.T, newStore func(t *testing.T) userstore.UserStore) {
+	t.Run("CollectionSharing", func(t *testing.T) {
+		testCollectionSharing(t, newStore)
+	})
+}
+
+func sorted(ids []string) []string {
+	return slices.Sorted(slices.Values(ids))
+}
+
+func testCollectionSharing(t *testing.T, newStore func(t *testing.T) userstore.UserStore) {
+	ctx := context.Background()
+	store := newStore(t)
+
+	if err := store.CreateProfile(ctx, userstore.Profile{ID: "p1", Name: "Owner"}); err != nil {
+		t.Fatalf("CreateProfile(p1): %v", err)
+	}
+	if err := store.CreateProfile(ctx, userstore.Profile{ID: "p2", Name: "Viewer"}); err != nil {
+		t.Fatalf("CreateProfile(p2): %v", err)
+	}
+
+	shared, err := store.CreateCollection(ctx, userstore.CreateCollectionInput{
+		CreatorProfileID: "p1",
+		Name:             "Family Action",
+		CollectionType:   "smart",
+		IsShared:         true,
+		QueryDefinition:  `{"match":"all","groups":[]}`,
+	})
+	if err != nil {
+		t.Fatalf("CreateCollection(shared): %v", err)
+	}
+	private, err := store.CreateCollection(ctx, userstore.CreateCollectionInput{
+		CreatorProfileID: "p1",
+		Name:             "Just Mine",
+	})
+	if err != nil {
+		t.Fatalf("CreateCollection(private): %v", err)
+	}
+	theirs, err := store.CreateCollection(ctx, userstore.CreateCollectionInput{
+		CreatorProfileID: "p2",
+		Name:             "Viewer's Own",
+	})
+	if err != nil {
+		t.Fatalf("CreateCollection(theirs): %v", err)
+	}
+
+	// A profile created after the collection was shared still sees it.
+	if err := store.CreateProfile(ctx, userstore.Profile{ID: "p3", Name: "Added Later"}); err != nil {
+		t.Fatalf("CreateProfile(p3): %v", err)
+	}
+
+	listed := func(profileID string) []string {
+		t.Helper()
+		collections, err := store.ListCollections(ctx, profileID)
+		if err != nil {
+			t.Fatalf("ListCollections(%s): %v", profileID, err)
+		}
+		ids := make([]string, 0, len(collections))
+		for _, c := range collections {
+			if !c.VisibleTo(profileID) {
+				t.Fatalf("ListCollections(%s) returned %s, which VisibleTo rejects", profileID, c.ID)
+			}
+			ids = append(ids, c.ID)
+		}
+		return ids
+	}
+	// A shared collection reaches every profile on the login, including one
+	// that no allow list ever named; a private one stays with its creator.
+	// Each profile's own collections come first.
+	if got, want := listed("p2"), []string{theirs.ID, shared.ID}; !slices.Equal(got, want) {
+		t.Fatalf("ListCollections(p2) = %v, want %v", got, want)
+	}
+	if got, want := listed("p3"), []string{shared.ID}; !slices.Equal(got, want) {
+		t.Fatalf("ListCollections(p3) = %v, want %v", got, want)
+	}
+	if got, want := listed("p1"), []string{shared.ID, private.ID}; !slices.Equal(sorted(got), sorted(want)) {
+		t.Fatalf("ListCollections(p1) = %v, want %v", got, want)
+	}
+	if got, err := store.GetCollection(ctx, private.ID); err != nil || got.VisibleTo("p2") || !got.VisibleTo("p1") {
+		t.Fatalf("private collection visibility = %+v, %v; want only its creator", got, err)
+	}
+
+	rejectedName := "Not Allowed"
+	if err := store.UpdateCollection(ctx, userstore.UpdateCollectionInput{
+		ID:               shared.ID,
+		RequestProfileID: "p2",
+		Name:             &rejectedName,
+	}); err == nil {
+		t.Fatal("expected creator-only UpdateCollection rejection")
+	}
+
+	// Turning sharing off hides the collection from everyone but its creator.
+	notShared := false
+	if err := store.UpdateCollection(ctx, userstore.UpdateCollectionInput{
+		ID:               shared.ID,
+		RequestProfileID: "p1",
+		IsShared:         &notShared,
+	}); err != nil {
+		t.Fatalf("UpdateCollection(is_shared=false): %v", err)
+	}
+	if got := listed("p3"); len(got) != 0 {
+		t.Fatalf("ListCollections(p3) after unsharing = %v, want none", got)
 	}
 }

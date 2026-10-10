@@ -128,13 +128,13 @@ func (h *LibraryCollectionHandler) createAdminCollection(ctx context.Context, re
 	queryDefinition := defaultJSON(req.QueryDefinition)
 	if req.CollectionType == collectionTypeSmart {
 		var err error
-		queryDefinition, err = normalizeSmartCollectionQueryDefinitionJSON(queryDefinition, false, false)
+		queryDefinition, err = normalizeSmartCollectionQueryDefinitionJSON(queryDefinition, false, false, req.V1Rules)
 		if err != nil {
 			return none, apiError(http.StatusBadRequest, "bad_request", "Invalid query_definition")
 		}
 	} else if len(req.QueryDefinition) > 0 {
 		var err error
-		queryDefinition, err = normalizeQueryDefinitionJSON(queryDefinition, false, false)
+		queryDefinition, err = normalizeQueryDefinitionJSON(queryDefinition, false, false, req.V1Rules)
 		if err != nil {
 			return none, apiError(http.StatusBadRequest, "bad_request", "Invalid query_definition")
 		}
@@ -219,11 +219,18 @@ func (h *LibraryCollectionHandler) updateAdminCollection(ctx context.Context, co
 	if len(req.QueryDefinition) > 0 {
 		var err error
 		if req.CollectionType == nil || *req.CollectionType == collectionTypeSmart {
-			queryDefinition, err = normalizeSmartCollectionQueryDefinitionJSON(req.QueryDefinition, false, false)
+			queryDefinition, err = normalizeSmartCollectionQueryDefinitionJSON(req.QueryDefinition, false, false, req.V1Rules)
 		} else {
-			queryDefinition, err = normalizeQueryDefinitionJSON(req.QueryDefinition, false, false)
+			queryDefinition, err = normalizeQueryDefinitionJSON(req.QueryDefinition, false, false, req.V1Rules)
 		}
 		if err != nil {
+			return none, apiError(http.StatusBadRequest, "bad_request", "Invalid query_definition")
+		}
+	} else if req.V1Rules && req.CollectionType != nil && *req.CollectionType == collectionTypeSmart &&
+		existing.CollectionType != collectionTypeSmart && len(existing.QueryDefinition) > 0 {
+		// Switching to Smart activates the stored rules, so, as with a changed
+		// section definition, a v1 update must find them in its vocabulary.
+		if err := catalog.ValidateV1Rules(existing.QueryDefinition); err != nil {
 			return none, apiError(http.StatusBadRequest, "bad_request", "Invalid query_definition")
 		}
 	}
@@ -371,7 +378,7 @@ func (h *LibraryCollectionHandler) PreviewAdminCollection(ctx context.Context, r
 	}
 	var def catalog.QueryDefinition
 	if len(req.QueryDefinition) > 0 {
-		normalized, err := normalizeQueryDefinitionJSON(req.QueryDefinition, false, false)
+		normalized, err := normalizeQueryDefinitionJSON(req.QueryDefinition, false, false, req.V1Rules)
 		if err != nil {
 			return none, apiError(http.StatusBadRequest, "bad_request", "Invalid query_definition")
 		}
@@ -659,8 +666,8 @@ func (h *LibraryCollectionHandler) SyncAdminCollection(ctx context.Context, id s
 	}
 	return h.service.SyncCollection(ctx, id)
 }
-func (h *LibraryCollectionHandler) ListAdminCollectionTemplates(ctx context.Context) (templates.BundleCatalog, error) {
-	return h.templateRegistry().BundleCatalog(), nil
+func (h *LibraryCollectionHandler) ListAdminCollectionTemplates(ctx context.Context) ([]templates.BundleWithTemplates, error) {
+	return h.templateRegistry().BundlesWithTemplates(), nil
 }
 func (h *LibraryCollectionHandler) ApplyAdminCollectionTemplate(ctx context.Context, id string, req AdminCollectionTemplateApply) (AdminCollectionTemplateResult, error) {
 	result, err := h.applyTemplateBundle(ctx, id, req, nil)
@@ -733,7 +740,7 @@ func (h *LibraryCollectionHandler) SetAdminCollectionArtworkSource(ctx context.C
 	if _, err := h.repo.GetByID(ctx, id); err != nil {
 		return err
 	}
-	data, err := downloadCollectionImageURL(ctx, h.httpClient, url)
+	data, err := downloadCollectionImageURL(adminCollectionImageContext(ctx), h.httpClient, url)
 	if err != nil {
 		return err
 	}

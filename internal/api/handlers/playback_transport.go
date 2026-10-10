@@ -859,13 +859,20 @@ func (h *PlaybackHandler) ResolveVirtualTransportInput(ctx context.Context, virt
 // and relay registration as playback — never a second rotation or trust
 // implementation. The canonical row is read from file; the returned cleanup
 // releases the relay registration once the executor has finished reading.
-func (h *PlaybackHandler) ResolveVirtualDownloadInput(ctx context.Context, file *models.MediaFile, userID int, profileID string) (string, func(), error) {
+//
+// Preparation identity is the persisted catalog row, not the requester. The
+// row's virtual owner installation scopes the provider resolve and its durable
+// provider identity drives the same-release re-match, so every requester of the
+// same file resolves to the same input and shares one artifact. There is no
+// requesting session for a background preparation, so the session-bound
+// account/profile are the zero value; per-requester authorization is enforced
+// on the download row and its /file route, never here.
+func (h *PlaybackHandler) ResolveVirtualDownloadInput(ctx context.Context, file *models.MediaFile) (string, func(), error) {
 	if h == nil || file == nil {
 		return "", nil, errors.New("virtual download input resolver is unavailable")
 	}
-	ownerInstallationID := file.VirtualOwnerInstallationID
 	resolveCtx := virtualResolveContextWithPersistedIdentity(ctx, file)
-	res, cleanup, err := h.ResolveVirtualTransportInput(resolveCtx, file.FilePath, ownerInstallationID, userID, profileID)
+	res, cleanup, err := h.ResolveVirtualTransportInput(resolveCtx, file.FilePath, file.VirtualOwnerInstallationID, 0, "")
 	if err != nil {
 		return "", nil, err
 	}

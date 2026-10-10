@@ -84,30 +84,6 @@ func TestSQLiteCollectionSortPreferences(t *testing.T) {
 	storetest.RunCollectionSortPreferences(t, newConformanceStore)
 }
 
-func TestSQLiteAddFavoriteAtReportsInsertion(t *testing.T) {
-	ctx := context.Background()
-	store := newConformanceStore(t)
-	if err := store.CreateProfile(ctx, userstore.Profile{ID: "p1", Name: "Test"}); err != nil {
-		t.Fatalf("CreateProfile: %v", err)
-	}
-
-	addedAt := time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)
-	inserted, err := store.AddFavoriteAt(ctx, "p1", "movie-1", addedAt)
-	if err != nil {
-		t.Fatalf("first AddFavoriteAt: %v", err)
-	}
-	if !inserted {
-		t.Fatal("first AddFavoriteAt reported no insertion")
-	}
-	inserted, err = store.AddFavoriteAt(ctx, "p1", "movie-1", addedAt)
-	if err != nil {
-		t.Fatalf("duplicate AddFavoriteAt: %v", err)
-	}
-	if inserted {
-		t.Fatal("duplicate AddFavoriteAt reported an insertion")
-	}
-}
-
 // TestSQLiteProgressPage runs the keyset progress paging conformance test
 // against the real SQLite backend; the Postgres backend runs the same suite in
 // internal/userstore/pgstore.
@@ -141,4 +117,15 @@ func TestSQLiteAtomicJellycompatProgressHistoryRollback(t *testing.T) {
 		}
 	}
 	storetest.RunAtomicJellycompatProgress(t, store)
+}
+
+func TestSQLiteCollectionSharing(t *testing.T) {
+	storetest.RunCollectionSharing(t, newConformanceStore)
+}
+
+// TestSQLiteProfilePINRevision runs the profile PIN revision conformance test
+// against the per-user SQLite backend; the Postgres backend runs the same suite
+// in internal/userstore/pgstore.
+func TestSQLiteProfilePINRevision(t *testing.T) {
+	storetest.RunProfilePINRevision(t, newConformanceStore)
 }

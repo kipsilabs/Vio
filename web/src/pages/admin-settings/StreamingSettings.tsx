@@ -17,7 +17,7 @@ import { useRestartKeys } from "@/hooks/useRestartKeys";
 import { useSettingsForm } from "@/hooks/useSettingsForm";
 
 import { FieldGroup } from "./FieldGroup";
-import { SaveBar } from "./SaveBar";
+import { SaveBar } from "@/components/SaveBar";
 import { SettingField, SettingFieldStatus } from "./SettingField";
 
 const PROVIDER_KEYS = [

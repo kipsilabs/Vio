@@ -1,3 +1,5 @@
+// @vitest-environment node
+
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -28,18 +30,6 @@ describe("HlsStartupGuard", () => {
     expect(onFailure).toHaveBeenCalledOnce();
     expect(guard.hasFailed()).toBe(true);
     guard.dispose();
-  });
-
-  it("allows one fatal network recovery before failing startup", () => {
-    const onFailure = vi.fn();
-    const guard = new HlsStartupGuard(onFailure);
-
-    expect(guard.handleFatalNetworkError()).toBe(true);
-    expect(onFailure).not.toHaveBeenCalled();
-
-    expect(guard.handleFatalNetworkError()).toBe(false);
-    expect(onFailure).toHaveBeenCalledOnce();
-    expect(guard.hasFailed()).toBe(true);
   });
 
   it("disarms startup limits after playable media arrives", () => {

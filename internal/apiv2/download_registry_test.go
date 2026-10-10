@@ -38,6 +38,16 @@ func (f *fakeDownloadRegistry) ListPage(_ context.Context, user int, profile, de
 	f.limit = limit
 	return f.rows, f.err
 }
+func (f *fakeDownloadRegistry) Get(_ context.Context, user int, profile, device, id string) (*downloads.Download, error) {
+	f.user = user
+	f.profile = profile
+	f.device = device
+	f.id = id
+	if f.err != nil {
+		return nil, f.err
+	}
+	return &downloads.Download{ID: id, UserID: user, ProfileID: profile, DeviceID: device, ContentID: "movie", MediaFileID: 42, Status: downloads.StatusPreparing, Kind: downloads.KindQueued, CreatedAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}, nil
+}
 func (f *fakeDownloadRegistry) ReportStatus(_ context.Context, user int, profile, device, id string, event downloads.StatusEvent) (*downloads.Download, error) {
 	f.user = user
 	f.profile = profile
@@ -108,6 +118,35 @@ func TestDownloadRegistryTransport(t *testing.T) {
 		t.Fatalf("%+v %v", capability, err)
 	}
 }
+
+// A client tracking one preparation reads exactly that entry, so a rotation of
+// another device's page can never make the tracked row look gone.
+func TestDownloadRegistryGetEntry(t *testing.T) {
+	service := &fakeDownloadRegistry{}
+	deps := pilotDeps(nil, nil)
+	deps.Downloads = service
+	h := newTestHandler(t, deps)
+	viewer := with(with(bearer(memberToken), "X-Profile-Id", "p-owner"), "X-Vio-Device-Id", "device-one")
+
+	rec := do(t, h, "GET", Prefix+"/downloads/entry-7", "", viewer)
+	if rec.Code != 200 {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+	if service.id != "entry-7" || service.device != "device-one" || service.profile != "p-owner" {
+		t.Fatalf("service got %+v, want the path id and device scope", service)
+	}
+	var row DownloadEntry
+	if err := json.Unmarshal(rec.Body.Bytes(), &row); err != nil || row.ID != "entry-7" || row.Status != "preparing" {
+		t.Fatalf("%+v %v", row, err)
+	}
+
+	service.err = downloads.ErrNotFound
+	rec = do(t, h, "GET", Prefix+"/downloads/entry-7", "", viewer)
+	if rec.Code != 404 {
+		t.Fatalf("gone entry: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestDownloadRegistryCursorBoundary(t *testing.T) {
 	at := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	service := &fakeDownloadRegistry{rows: []*downloads.Download{{ID: "b", CreatedAt: at}, {ID: "a", CreatedAt: at}}}
@@ -139,5 +178,45 @@ func TestDownloadRegistryCursorBoundary(t *testing.T) {
 	rec = do(t, h, "GET", path, "", nil)
 	if rec.Code != 401 {
 		t.Fatalf("auth: %d", rec.Code)
+	}
+}
+
+func TestDownloadRegistryListsPreparationProgress(t *testing.T) {
+	at := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	progress, remaining := 0.35, 360
+	service := &fakeDownloadRegistry{rows: []*downloads.Download{
+		{ID: "running", ContentID: "series", EpisodeID: "e1", MediaFileID: 1, Status: downloads.StatusPreparing, CreatedAt: at,
+			Preparation: &downloads.PreparationStatus{State: downloads.PreparationRunning, Progress: &progress, RemainingSeconds: &remaining}},
+		{ID: "queued", ContentID: "series", EpisodeID: "e2", MediaFileID: 2, Status: downloads.StatusPreparing, CreatedAt: at,
+			Preparation: &downloads.PreparationStatus{State: downloads.PreparationQueued, QueuePosition: 3}},
+		{ID: "ready", ContentID: "series", EpisodeID: "e3", MediaFileID: 3, Status: downloads.StatusReady, CreatedAt: at},
+	}}
+	deps := pilotDeps(nil, nil)
+	deps.Downloads = service
+	h := newTestHandler(t, deps)
+	device := with(with(bearer(memberToken), "X-Profile-Id", "p-owner"), "X-Silo-Device-Id", "device-one")
+	rec := do(t, h, "GET", Prefix+"/downloads", "", device)
+	if rec.Code != 200 {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+	var page struct {
+		Items []map[string]json.RawMessage `json:"items"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &page); err != nil || len(page.Items) != 3 {
+		t.Fatalf("%v %s", err, rec.Body.String())
+	}
+	for i, want := range []string{
+		`{"state":"running","progress":0.35,"remaining_seconds":360}`,
+		`{"state":"queued","queue_position":3}`,
+		``,
+	} {
+		if got := string(page.Items[i]["preparation"]); got != want {
+			t.Fatalf("item %d preparation = %s, want %s", i, got, want)
+		}
+	}
+	rec = do(t, h, "GET", Prefix+"/capabilities/downloads", "", device)
+	var capability DownloadCapability
+	if err := json.Unmarshal(rec.Body.Bytes(), &capability); err != nil || !capability.PreparationProgress {
+		t.Fatalf("%+v %v", capability, err)
 	}
 }

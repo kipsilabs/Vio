@@ -41,7 +41,7 @@ func TestVirtualNonIndictingReplanKeepsPinnedCandidateAndStripsDV7(t *testing.T)
 	stubCopySeekAnchorV3(handler)
 	presetLocalRegistryV3(handler, playback.NewTransformationRegistryV3([]playback.TransformationSpecV3{
 		{Name: playback.TransformationAudioToAACV3, RecipeVersion: playback.TransformationAudioToAACRecipeVersionV3, Available: true},
-		{Name: playback.TransformationServerDV7HDR10V3, RecipeVersion: "1", Available: true},
+		{Name: playback.TransformationServerDV7HDR10V3, RecipeVersion: playback.TransformationServerDV7HDR10RecipeVersionV3, Available: true},
 	}))
 
 	pinnedURI := "virtual://movie/tt-dv7?result=pinned"

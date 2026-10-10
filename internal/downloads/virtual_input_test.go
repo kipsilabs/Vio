@@ -5,8 +5,10 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/Silo-Server/silo-server/internal/downloadprepare"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
+	"github.com/Silo-Server/silo-server/internal/tonemap"
 )
 
 type stubVirtualResolver struct {
@@ -16,7 +18,7 @@ type stubVirtualResolver struct {
 	calls     int
 }
 
-func (s *stubVirtualResolver) ResolveVirtualDownloadInput(_ context.Context, _ *models.MediaFile, _ int, _ string) (string, func(), error) {
+func (s *stubVirtualResolver) ResolveVirtualDownloadInput(_ context.Context, _ *models.MediaFile) (string, func(), error) {
 	s.calls++
 	return s.inputPath, s.cleanup, s.err
 }
@@ -110,10 +112,46 @@ func TestApplyVirtualInputWithoutResolverDefers(t *testing.T) {
 	}
 }
 
-func TestCancelPrepareIgnoresEmptyArtifact(t *testing.T) {
+// The frozen execution fingerprint of a virtual artifact is derived from the
+// durable canonical source identity, so a per-attempt relay URL rotation never
+// invalidates a healthy artifact while a real source change still does. This is
+// the invariant the hourly integrity probe and retries rely on.
+func TestArtifactExecutionFingerprintUsesCanonicalPathForVirtual(t *testing.T) {
+	canonical := "virtual://movie/tt1?result=a"
+	frozen := playback.TranscodeOpts{
+		InputPath: canonical, ToneMapPolicy: tonemap.PolicySoftwareOnly,
+		ToneMapMode: tonemap.ModeSoftware, ToneMapSourceKind: tonemap.SourcePQ,
+		ToneMapRecipeVersion:  playback.TransformationHDRToSDRToneMapRecipeVersionV3,
+		ToneMapSourceRevision: tonemap.SourceRevision{MediaFileID: 42, FileSize: 100},
+		TargetCodecVideo:      "h264", TargetCodecAudio: "aac",
+	}
+	a := &Artifact{ID: "art-fingerprint", ToneMapMode: tonemap.ModeSoftware}
+	a.ParamsHash = downloadprepare.NewRequest(a.ID, frozen).ExecutionFingerprint()
+	if a.ParamsHash == "" {
+		t.Fatal("frozen virtual fingerprint is empty")
+	}
+
+	// The resolver rewrites InputPath to a rotating relay URL but preserves the
+	// canonical identity; the frozen fingerprint must still match.
+	resolved := frozen
+	resolved.InputPath = "http://relay/attempt-2/token"
+	resolved.CanonicalInputPath = canonical
+	if !artifactExecutionFingerprintMatches(a, resolved) {
+		t.Fatal("relay rotation invalidated the frozen virtual fingerprint")
+	}
+
+	// A genuine source change must not match.
+	changed := resolved
+	changed.CanonicalInputPath = "virtual://movie/tt1?result=other-release"
+	if artifactExecutionFingerprintMatches(a, changed) {
+		t.Fatal("a different canonical source matched the frozen fingerprint")
+	}
+}
+
+func TestCancelAbandonedPrepareIgnoresEmptyArtifact(t *testing.T) {
 	// No repository is touched for an empty id, so this is safe on a zero-value
 	// manager with no database.
 	m := &ArtifactManager{}
-	m.CancelPrepare(context.Background(), "")
+	m.CancelAbandonedPrepare(context.Background(), "")
 	m.SetVirtualInputResolver(nil)
 }

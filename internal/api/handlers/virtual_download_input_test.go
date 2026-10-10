@@ -29,19 +29,24 @@ func TestResolveVirtualDownloadInputReusesPlaybackResolver(t *testing.T) {
 			defer func() { _ = relay.Close(context.Background()) }()
 
 			calls := 0
+			gotOwner := -1
 			h := &PlaybackHandler{
 				RemoteStreamRelay:   relay,
 				AllowPrivateStreams: func(int) bool { return true },
-				VirtualMediaResolver: VirtualMediaResolverFunc(func(context.Context, string, int, int, string) (string, error) {
+				VirtualMediaResolver: VirtualMediaResolverFunc(func(_ context.Context, _ string, ownerInstallationID, _ int, _ string) (string, error) {
 					calls++
+					gotOwner = ownerInstallationID
 					return tc.resolved, nil
 				}),
 			}
 			file := &models.MediaFile{ID: 7, Container: "virtual", FilePath: tc.path, VirtualOwnerInstallationID: tc.owner}
 
-			input, cleanup, err := h.ResolveVirtualDownloadInput(context.Background(), file, 1, "profile")
+			input, cleanup, err := h.ResolveVirtualDownloadInput(context.Background(), file)
 			if err != nil {
 				t.Fatalf("ResolveVirtualDownloadInput error = %v", err)
+			}
+			if gotOwner != tc.owner {
+				t.Fatalf("resolver owner installation = %d, want the persisted row owner %d", gotOwner, tc.owner)
 			}
 			if cleanup == nil {
 				t.Fatal("cleanup = nil, want a relay release")
@@ -71,14 +76,49 @@ func TestResolveVirtualDownloadInputRefusesUnresolvedSource(t *testing.T) {
 	}
 	file := &models.MediaFile{ID: 8, Container: "virtual", FilePath: "virtual://movie/tt404?result=dead"}
 
-	if _, _, err := h.ResolveVirtualDownloadInput(context.Background(), file, 1, "profile"); err == nil {
+	if _, _, err := h.ResolveVirtualDownloadInput(context.Background(), file); err == nil {
 		t.Fatal("ResolveVirtualDownloadInput error = nil, want refusal")
 	}
 }
 
 func TestResolveVirtualDownloadInputRejectsMissingFile(t *testing.T) {
 	h := &PlaybackHandler{}
-	if _, _, err := h.ResolveVirtualDownloadInput(context.Background(), nil, 1, "profile"); err == nil {
+	if _, _, err := h.ResolveVirtualDownloadInput(context.Background(), nil); err == nil {
 		t.Fatal("ResolveVirtualDownloadInput(nil) error = nil, want refusal")
+	}
+}
+
+// A preparation is identified by the persisted catalog row, not the caller. Two
+// requesters resolving the same virtual file must resolve against the same
+// durable identity (owner installation) with no requester-specific input.
+func TestResolveVirtualDownloadInputIsRequesterIndependent(t *testing.T) {
+	relay := remotestream.NewRelay()
+	defer func() { _ = relay.Close(context.Background()) }()
+
+	var owners []int
+	h := &PlaybackHandler{
+		RemoteStreamRelay:   relay,
+		AllowPrivateStreams: func(int) bool { return true },
+		VirtualMediaResolver: VirtualMediaResolverFunc(func(_ context.Context, _ string, ownerInstallationID, _ int, _ string) (string, error) {
+			owners = append(owners, ownerInstallationID)
+			return "http://relay/source.mp4", nil
+		}),
+	}
+	file := &models.MediaFile{
+		ID: 9, Container: "virtual", FilePath: "virtual://movie/tt9?result=shared",
+		VirtualOwnerInstallationID: 42,
+	}
+
+	for i := 0; i < 2; i++ {
+		_, cleanup, err := h.ResolveVirtualDownloadInput(context.Background(), file)
+		if err != nil {
+			t.Fatalf("resolve %d: %v", i, err)
+		}
+		if cleanup != nil {
+			cleanup()
+		}
+	}
+	if len(owners) != 2 || owners[0] != 42 || owners[1] != 42 {
+		t.Fatalf("resolver owners = %v, want both 42 (the persisted row owner)", owners)
 	}
 }

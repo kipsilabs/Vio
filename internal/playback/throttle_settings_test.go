@@ -2,6 +2,7 @@ package playback_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/Silo-Server/silo-server/internal/playback"
@@ -11,6 +12,12 @@ type throttleSettings map[string]string
 
 func (s throttleSettings) Get(_ context.Context, key string) (string, error) {
 	return s[key], nil
+}
+
+type failingThrottleSettings struct{}
+
+func (failingThrottleSettings) Get(context.Context, string) (string, error) {
+	return "", errors.New("settings store unavailable")
 }
 
 type recordingThrottleStarter struct {
@@ -24,12 +31,14 @@ func (s *recordingThrottleStarter) StartThrottler(threshold int) {
 func TestStartConfiguredTranscodeThrottler(t *testing.T) {
 	tests := []struct {
 		name       string
-		settings   throttleSettings
+		settings   playback.TranscodeThrottleSettings
 		thresholds []int
 	}{
-		{name: "disabled when unset", settings: throttleSettings{}},
-		{name: "disabled when empty", settings: throttleSettings{"enable_transcode_throttle": ""}},
-		{name: "explicitly disabled", settings: throttleSettings{"enable_transcode_throttle": "false"}},
+		{name: "unset uses the default", settings: throttleSettings{}, thresholds: []int{playback.DefaultTranscodeThrottleSeconds}},
+		{name: "empty uses the default", settings: throttleSettings{"enable_transcode_throttle": ""}, thresholds: []int{playback.DefaultTranscodeThrottleSeconds}},
+		{name: "unreadable setting disables", settings: failingThrottleSettings{}},
+		{name: "disabled", settings: throttleSettings{"enable_transcode_throttle": "false"}},
+		{name: "positive value below executor minimum is clamped", settings: throttleSettings{"enable_transcode_throttle": "true", "transcode_throttle_seconds": "30"}, thresholds: []int{60}},
 		{name: "configured", settings: throttleSettings{"enable_transcode_throttle": "true", "transcode_throttle_seconds": "180"}, thresholds: []int{180}},
 		{name: "invalid threshold uses default", settings: throttleSettings{"enable_transcode_throttle": "true", "transcode_throttle_seconds": "invalid"}, thresholds: []int{300}},
 	}
@@ -49,16 +58,16 @@ func TestStartConfiguredTranscodeThrottler(t *testing.T) {
 		})
 	}
 }
-
 func TestConfiguredTranscodeThrottleSeconds(t *testing.T) {
 	tests := []struct {
 		name     string
-		settings throttleSettings
+		settings playback.TranscodeThrottleSettings
 		want     int
 	}{
-		{name: "disabled when unset", settings: throttleSettings{}, want: 0},
-		{name: "disabled when empty", settings: throttleSettings{"enable_transcode_throttle": ""}, want: 0},
+		{name: "unset uses the default", settings: throttleSettings{}, want: playback.DefaultTranscodeThrottleSeconds},
+		{name: "empty uses the default", settings: throttleSettings{"enable_transcode_throttle": ""}, want: playback.DefaultTranscodeThrottleSeconds},
 		{name: "explicitly disabled", settings: throttleSettings{"enable_transcode_throttle": "false"}, want: 0},
+		{name: "unreadable setting disables", settings: failingThrottleSettings{}, want: 0},
 		{name: "configured", settings: throttleSettings{"enable_transcode_throttle": "true", "transcode_throttle_seconds": "180"}, want: 180},
 		{name: "positive value below executor minimum is clamped", settings: throttleSettings{"enable_transcode_throttle": "true", "transcode_throttle_seconds": "30"}, want: 60},
 		{name: "invalid threshold uses default", settings: throttleSettings{"enable_transcode_throttle": "true", "transcode_throttle_seconds": "invalid"}, want: 300},

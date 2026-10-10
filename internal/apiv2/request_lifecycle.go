@@ -411,6 +411,9 @@ func watchProviderProblem(err error) *Problem {
 	if watchsync.IsInvalidCredentialError(err) {
 		return NewProblem(TypeValidationFailed, "The watch provider rejected the supplied credential.")
 	}
+	if invalid, ok := errors.AsType[watchsync.InvalidConnectionInputError](err); ok {
+		return NewProblem(TypeValidationFailed, invalid.Message)
+	}
 	if watchsync.IsRetryableProviderError(err) {
 		return NewProblem(TypeDependencyUnavailable, "The watch provider is temporarily unavailable.")
 	}
@@ -600,8 +603,6 @@ func watchProviderSyncRunOf(s watchsync.SyncRun) WatchProviderSyncRun {
 	}
 }
 
-var requestLifecycleOperationIDs = []string{"getRequestStatus", "cancelRequest", "listWatchProviders", opGetWatchProviderConnection, opGetWatchProviderSettings, opUpdateWatchProviderConnection, "deleteWatchProviderConnection", "startWatchProviderDeviceAuth", "pollWatchProviderDeviceAuth", "connectWatchProviderAPIKey", "triggerWatchProviderSync", "listWatchProviderSyncRuns"}
-
 // WatchProviderSummary shares configuration forms with plugin administration.
 type WatchProviderSummary struct {
 	Key                    string                    `json:"key"`
@@ -609,3 +610,5 @@ type WatchProviderSummary struct {
 	Capabilities           WatchProviderCapabilities `json:"capabilities"`
 	ConnectionConfigSchema []AdminPluginConfigSchema `json:"connection_config_schema,omitempty"`
 }
+
+var requestLifecycleOperationIDs = []string{"getRequestStatus", "cancelRequest", "listWatchProviders", opGetWatchProviderConnection, opGetWatchProviderSettings, opUpdateWatchProviderConnection, "deleteWatchProviderConnection", "startWatchProviderDeviceAuth", "pollWatchProviderDeviceAuth", "connectWatchProviderAPIKey", "triggerWatchProviderSync", "listWatchProviderSyncRuns"}
