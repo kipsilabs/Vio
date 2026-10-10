@@ -104,6 +104,10 @@ type Store interface {
 	// and fills the IMDb ID when the row has none. An existing positive TVDB ID
 	// is kept; the TVDB ID the row holds afterwards is returned.
 	SetExternalIDs(ctx context.Context, id string, tvdbID int, imdbID string) (int, error)
+	// FillRequestDisplay fills the display fields a deferred create left empty
+	// from the title's TMDB detail, without replacing what the client sent. It
+	// is the deferred half of the detail read CreateRequest skips for a movie.
+	FillRequestDisplay(ctx context.Context, id string, year *int, overview, posterPath, backdropPath string) (*Request, error)
 	ListTargets(ctx context.Context, requestID string) ([]Target, error)
 	ListTargetsForRequests(ctx context.Context, requestIDs []string) (map[string][]Target, error)
 	CreateTarget(ctx context.Context, target Target) (Target, error)
