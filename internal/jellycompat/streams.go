@@ -1966,8 +1966,9 @@ const compatWarmTextSubtitlesTimeout = 10 * time.Second
 // background. Jellyfin Web requests a track only when the viewer selects it,
 // and the first extraction reads the whole source, which takes minutes for a
 // large remux on network storage; starting it with playback makes a later
-// switch instant.
-func (h *PlaybackHandler) warmCompatTextSubtitles(fileID int) {
+// switch instant. requestID is the triggering request's ID, captured before
+// the goroutine detaches so the warm's traces join that request.
+func (h *PlaybackHandler) warmCompatTextSubtitles(fileID int, requestID string) {
 	if h.SubtitleCache == nil || h.fileResolver == nil {
 		return
 	}
@@ -1978,7 +1979,7 @@ func (h *PlaybackHandler) warmCompatTextSubtitles(fileID int) {
 		if err != nil || file == nil {
 			return
 		}
-		h.SubtitleCache.WarmTextTracks(file.FilePath, compatTextSubtitleTracks(file), h.extractTextSubtitleBatch)
+		h.SubtitleCache.WarmTextTracks(file.FilePath, compatTextSubtitleTracks(file), h.extractTextSubtitleBatch, requestID)
 	}()
 }
 

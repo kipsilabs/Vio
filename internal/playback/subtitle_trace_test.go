@@ -196,7 +196,7 @@ func TestWarmTrackEmitsSubtitleTraceWithPhaseAndOutcome(t *testing.T) {
 		}, func(_ context.Context, opts StreamExtractOpts) error {
 			_, err := opts.Writer.Write([]byte("WEBVTT\n\n"))
 			return err
-		})
+		}, "")
 		<-done
 	})
 	if entry["phase"] != SubtitleTracePhaseWarm {
@@ -210,6 +210,28 @@ func TestWarmTrackEmitsSubtitleTraceWithPhaseAndOutcome(t *testing.T) {
 	}
 	if bytes, ok := entry["bytes"].(float64); !ok || bytes <= 0 {
 		t.Fatalf("bytes = %#v, want a positive measured count", entry["bytes"])
+	}
+}
+
+// A detached warm captures the triggering request's ID at its boundary, so its
+// trace joins that request even though the goroutine runs on a background
+// context that no longer carries the ID.
+func TestWarmTrackTraceCarriesRequestID(t *testing.T) {
+	cache := NewSubtitleCache(func() string { return t.TempDir() })
+	entry := captureSubtitleTrace(t, "subtitle cache warm finished", func() {
+		done := cache.WarmTrackInBackground(StreamExtractOpts{
+			InputPath: "virtual://movie/tt-warm-reqid", CacheIdentity: "identity-warm-reqid", TrackIndex: 0, SourceCodec: "subrip",
+		}, func(_ context.Context, opts StreamExtractOpts) error {
+			_, err := opts.Writer.Write([]byte("WEBVTT\n\n"))
+			return err
+		}, "req-warm-7")
+		<-done
+	})
+	if entry["request_id"] != "req-warm-7" {
+		t.Fatalf("request_id = %#v, want req-warm-7 (entry %#v)", entry["request_id"], entry)
+	}
+	if entry["phase"] != SubtitleTracePhaseWarm {
+		t.Fatalf("phase = %#v, want warm", entry["phase"])
 	}
 }
 

@@ -6462,7 +6462,7 @@ func (h *PlaybackHandler) warmVirtualSubtitlesV3(ctx context.Context, session *p
 		TrackIndex:    trackIndex,
 		SourceCodec:   tracks[trackIndex].Codec,
 		FFmpegPath:    h.playbackConfig().FFmpegPath,
-	}, playback.StreamExtractSubtitle)
+	}, playback.StreamExtractSubtitle, chimw.GetReqID(ctx))
 	// Release the relay registration exactly once, after the warm settled
 	// (ran, failed, or was skipped). The entry itself is also bounded by the
 	// relay's 24h lifetime, so a lost release never pins a slot forever.

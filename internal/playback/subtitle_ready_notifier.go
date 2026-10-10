@@ -281,14 +281,14 @@ func (n *SubtitleReadyNotifier) dispatchTimingChanged(ctx context.Context, chang
 
 // TranslationStarted tells one session a live translation has begun.
 func (n *SubtitleReadyNotifier) TranslationStarted(ctx context.Context, sessionID string, fileID int, jobID int64, trackKey, language, label string, totalCues int) {
-	n.sendTranslation(sessionID, fileID, func() (EventEnvelope, error) {
+	n.sendTranslation(subtitleTraceRequestID(ctx), sessionID, fileID, func() (EventEnvelope, error) {
 		return NewSubtitleTranslationStartedEvent(sessionID, fileID, jobID, trackKey, language, label, totalCues)
 	})
 }
 
 // TranslationCues pushes a batch of translated cues to one session.
 func (n *SubtitleReadyNotifier) TranslationCues(ctx context.Context, sessionID string, fileID int, jobID int64, trackKey string, cues []StreamCue, done, total int) {
-	n.sendTranslation(sessionID, fileID, func() (EventEnvelope, error) {
+	n.sendTranslation(subtitleTraceRequestID(ctx), sessionID, fileID, func() (EventEnvelope, error) {
 		return NewSubtitleTranslationCuesEvent(sessionID, fileID, jobID, trackKey, cues, done, total)
 	})
 }
@@ -296,14 +296,14 @@ func (n *SubtitleReadyNotifier) TranslationCues(ctx context.Context, sessionID s
 // TranslationCompleted tells one session a live translation finished.
 func (n *SubtitleReadyNotifier) TranslationCompleted(ctx context.Context, sessionID string, fileID int, jobID int64, trackKey string, subtitleID int, language, label string) {
 	track := n.resolveTrack(ctx, sessionID, fileID, downloadedTrack(subtitleID))
-	n.sendTranslation(sessionID, fileID, func() (EventEnvelope, error) {
+	n.sendTranslation(subtitleTraceRequestID(ctx), sessionID, fileID, func() (EventEnvelope, error) {
 		return NewSubtitleTranslationCompletedEvent(sessionID, fileID, jobID, trackKey, subtitleID, language, label, track)
 	})
 }
 
 // TranslationFailed tells one session a live translation failed.
 func (n *SubtitleReadyNotifier) TranslationFailed(ctx context.Context, sessionID string, fileID int, jobID int64, trackKey, message string) {
-	n.sendTranslation(sessionID, fileID, func() (EventEnvelope, error) {
+	n.sendTranslation(subtitleTraceRequestID(ctx), sessionID, fileID, func() (EventEnvelope, error) {
 		return NewSubtitleTranslationFailedEvent(sessionID, fileID, jobID, trackKey, message)
 	})
 }
@@ -357,20 +357,23 @@ func downloadedTrack(subtitleID int) func(SubtitleInventoryItemV3) bool {
 }
 
 // sendTranslation builds and delivers a translation event to a single session.
-func (n *SubtitleReadyNotifier) sendTranslation(sessionID string, fileID int, build func() (EventEnvelope, error)) {
+// requestID is the caller's request ID, captured at the exported boundary
+// because delivery runs on a background context; it is threaded into the
+// notify traces so they join the request that started or advanced the job.
+func (n *SubtitleReadyNotifier) sendTranslation(requestID, sessionID string, fileID int, build func() (EventEnvelope, error)) {
 	if n == nil || n.hub == nil || sessionID == "" || !n.translationSessionMatches(sessionID, fileID) {
 		return
 	}
 	event, err := build()
 	if err != nil {
 		slog.Log(context.Background(), slog.LevelWarn, "failed to encode subtitle translation realtime event",
-			subtitleTraceAttrs(context.Background(), "", SubtitleTracePhaseNotify, SubtitleTraceBytesUnknown, SubtitleTraceOutcomeEncodeFailed, -1,
+			subtitleTraceAttrsForRequest(requestID, "", SubtitleTracePhaseNotify, SubtitleTraceBytesUnknown, SubtitleTraceOutcomeEncodeFailed, -1,
 				"session_id", sessionID, "error", err)...)
 		return
 	}
 	if err := n.hub.Send(sessionID, event); err != nil && !errors.Is(err, ErrRealtimeConnectionNotFound) {
 		slog.Log(context.Background(), slog.LevelWarn, "failed to deliver subtitle translation realtime event",
-			subtitleTraceAttrs(context.Background(), "", SubtitleTracePhaseNotify, SubtitleTraceBytesUnknown, SubtitleTraceOutcomeDeliveryFailed, -1,
+			subtitleTraceAttrsForRequest(requestID, "", SubtitleTracePhaseNotify, SubtitleTraceBytesUnknown, SubtitleTraceOutcomeDeliveryFailed, -1,
 				"session_id", sessionID, "error", err)...)
 	}
 }

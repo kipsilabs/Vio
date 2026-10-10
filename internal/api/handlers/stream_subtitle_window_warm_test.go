@@ -192,7 +192,7 @@ func TestVirtualTextWindowCommittedEntrySkipsDriftProbe(t *testing.T) {
 		TrackIndex:    0,
 		SourceCodec:   "subrip",
 		FFmpegPath:    filepath.Join(dir, "ffmpeg"),
-	}, playback.StreamExtractSubtitle)
+	}, playback.StreamExtractSubtitle, "")
 	<-done
 	if !handler.SubtitleCache.HasCommittedTextEntry("unused", identity, 0, "subrip", "") {
 		t.Fatal("pre-warm did not commit the serve identity")
@@ -249,7 +249,7 @@ func TestVirtualTextWindowWarmKeysOnServeOrdinalAfterRemap(t *testing.T) {
 		SeekSeconds:     600,
 		DurationSeconds: 600,
 		FFmpegPath:      filepath.Join(dir, "ffmpeg"),
-	}, true)
+	}, true, "")
 	waitForCommittedTextEntry(t, handler.SubtitleCache, serveIdentity, remappedOrdinal, "subrip")
 
 	planIdentity := playback.VirtualSubtitleCacheIdentity(file.ID, virtualURI, 0)
@@ -278,7 +278,7 @@ func TestVirtualTextWindowWarmSkipsNonVirtual(t *testing.T) {
 		SeekSeconds:     100,
 		DurationSeconds: 600,
 		FFmpegPath:      filepath.Join(dir, "ffmpeg"),
-	}, false)
+	}, false, "")
 
 	if _, err := os.Stat(argsLog); !os.IsNotExist(err) {
 		t.Fatalf("no warm should run for a non-virtual request: %v", err)
@@ -382,7 +382,7 @@ func TestVirtualPGSWholeTrackFetchServesCommittedWholeTrack(t *testing.T) {
 		TrackIndex:    0,
 		SourceCodec:   "hdmv_pgs_subtitle",
 		FFmpegPath:    filepath.Join(dir, "ffmpeg"),
-	}, playback.StreamExtractSubtitle)
+	}, playback.StreamExtractSubtitle, "")
 	<-done
 	if !handler.SubtitleCache.HasCommittedEntry("unused", identity, 0, "hdmv_pgs_subtitle", "") {
 		t.Fatal("pre-warm did not commit the .sup artifact")
@@ -484,8 +484,8 @@ func TestVirtualTextWindowWarmResolveTimeoutReleasesSlot(t *testing.T) {
 	}
 
 	// Occupy both warm slots with resolvers that block until canceled.
-	handler.warmVirtualSubtitleAfterWindowMiss(file, session, optsFor(0), true)
-	handler.warmVirtualSubtitleAfterWindowMiss(file, session, optsFor(1), true)
+	handler.warmVirtualSubtitleAfterWindowMiss(file, session, optsFor(0), true, "")
+	handler.warmVirtualSubtitleAfterWindowMiss(file, session, optsFor(1), true, "")
 	for i := 0; i < 2; i++ {
 		select {
 		case <-entered:
@@ -495,7 +495,7 @@ func TestVirtualTextWindowWarmResolveTimeoutReleasesSlot(t *testing.T) {
 	}
 
 	// With both slots held, a third warm is dropped rather than queued.
-	handler.warmVirtualSubtitleAfterWindowMiss(file, session, optsFor(2), true)
+	handler.warmVirtualSubtitleAfterWindowMiss(file, session, optsFor(2), true, "")
 	if _, err := os.Stat(argsLog); !os.IsNotExist(err) {
 		t.Fatalf("a warm extracted while both slots were held: %v", err)
 	}
@@ -513,7 +513,7 @@ func TestVirtualTextWindowWarmResolveTimeoutReleasesSlot(t *testing.T) {
 	identity := playback.VirtualSubtitleCacheIdentity(file.ID, virtualURI, 2)
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		handler.warmVirtualSubtitleAfterWindowMiss(file, session, optsFor(2), true)
+		handler.warmVirtualSubtitleAfterWindowMiss(file, session, optsFor(2), true, "")
 		if handler.SubtitleCache.HasCommittedTextEntry("unused", identity, 2, "subrip", "") {
 			return
 		}
@@ -780,7 +780,7 @@ func TestVirtualWholeTrackTextFetchServesCommittedWholeTrack(t *testing.T) {
 		TrackIndex:    0,
 		SourceCodec:   "subrip",
 		FFmpegPath:    filepath.Join(dir, "ffmpeg"),
-	}, playback.StreamExtractSubtitle)
+	}, playback.StreamExtractSubtitle, "")
 	<-done
 	if !handler.SubtitleCache.HasCommittedTextEntry("unused", identity, 0, "subrip", "") {
 		t.Fatal("pre-warm did not commit the whole-track artifact")

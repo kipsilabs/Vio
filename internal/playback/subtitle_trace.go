@@ -49,7 +49,9 @@ const SubtitleTraceBytesUnknown = -1
 
 // subtitleTraceRequestID returns the API request ID the middleware stored, so a
 // subtitle trace joins the playback start or stream line that caused it. It is
-// empty for a detached warm and in tests, both of which have no request.
+// empty for a detached warm and in tests, both of which have no request. A
+// detached path that must still correlate captures the ID at its boundary and
+// passes it explicitly instead of relying on the context it detaches from.
 func subtitleTraceRequestID(ctx context.Context) string {
 	if ctx == nil {
 		return ""
@@ -62,9 +64,17 @@ func subtitleTraceRequestID(ctx context.Context) string {
 // outcome, and elapsed time. A field is omitted rather than emitted empty, so a
 // consumer never has to distinguish "unknown" from a real value.
 func subtitleTraceFields(ctx context.Context, codec, phase string, bytes int64, outcome string, elapsed time.Duration) []any {
+	return subtitleTraceFieldsForRequest(subtitleTraceRequestID(ctx), codec, phase, bytes, outcome, elapsed)
+}
+
+// subtitleTraceFieldsForRequest builds the same field set for a caller that
+// already captured the request ID but runs on a detached context — a background
+// warm or a translation notify — so its trace still joins the request that
+// spawned it. An empty ID is omitted exactly as an unknown context's is.
+func subtitleTraceFieldsForRequest(requestID, codec, phase string, bytes int64, outcome string, elapsed time.Duration) []any {
 	attrs := make([]any, 0, 14)
-	if id := subtitleTraceRequestID(ctx); id != "" {
-		attrs = append(attrs, "request_id", id)
+	if requestID != "" {
+		attrs = append(attrs, "request_id", requestID)
 	}
 	if codec != "" {
 		attrs = append(attrs, "codec", codec)
@@ -90,6 +100,14 @@ func subtitleTraceFields(ctx context.Context, codec, phase string, bytes int64, 
 // sloglint keeps the message constant.
 func subtitleTraceAttrs(ctx context.Context, codec, phase string, bytes int64, outcome string, elapsed time.Duration, extra ...any) []any {
 	attrs := subtitleTraceFields(ctx, codec, phase, bytes, outcome, elapsed)
+	return append(attrs, extra...)
+}
+
+// subtitleTraceAttrsForRequest is subtitleTraceAttrs for a detached path that
+// carries the request ID explicitly, so a warm or translation notify trace
+// stays joinable to its triggering request.
+func subtitleTraceAttrsForRequest(requestID, codec, phase string, bytes int64, outcome string, elapsed time.Duration, extra ...any) []any {
+	attrs := subtitleTraceFieldsForRequest(requestID, codec, phase, bytes, outcome, elapsed)
 	return append(attrs, extra...)
 }
 

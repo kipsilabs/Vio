@@ -476,7 +476,7 @@ func TestServeExtractTextWaitsForInFlightFillAndServesCommitted(t *testing.T) {
 		}
 		_, err := io.WriteString(o.Writer, "WARM TRACK")
 		return err
-	})
+	}, "")
 	<-started
 
 	clientDone := make(chan error, 1)
@@ -1376,11 +1376,11 @@ func TestWarmInBackgroundSemaphoreDrop(t *testing.T) {
 
 	// Occupy every warm slot (slots are acquired synchronously).
 	for track := 0; track < subtitleCacheWarmSlots; track++ {
-		c.WarmInBackground(supExtractOpts(source, track), extract)
+		c.WarmInBackground(supExtractOpts(source, track), extract, "")
 	}
 	// One more: dropped without reserving the track's in-flight slot.
 	overflow := subtitleCacheWarmSlots
-	c.WarmInBackground(supExtractOpts(source, overflow), extract)
+	c.WarmInBackground(supExtractOpts(source, overflow), extract, "")
 	if fill := c.BeginFill(source, overflow); fill == nil {
 		t.Fatal("dropped warm must not hold the in-flight slot")
 	} else {
@@ -1409,7 +1409,7 @@ func TestWarmInBackgroundSemaphoreDrop(t *testing.T) {
 	}
 
 	// With slots free again, the overflow track's warm goes through.
-	c.WarmInBackground(supExtractOpts(source, overflow), extract)
+	c.WarmInBackground(supExtractOpts(source, overflow), extract, "")
 	waitForCacheEntry(t, c, source, overflow)
 }
 
@@ -1427,7 +1427,7 @@ func TestWarmInBackgroundSkipsInFlightFill(t *testing.T) {
 		warmed <- struct{}{}
 		_, err := opts.Writer.Write([]byte("WARM"))
 		return err
-	})
+	}, "")
 
 	// The skipped warm must have released its slot synchronously: all
 	// subtitleCacheWarmSlots slots are still available.
@@ -1435,7 +1435,7 @@ func TestWarmInBackgroundSkipsInFlightFill(t *testing.T) {
 		c.WarmInBackground(supExtractOpts(source, track), func(_ context.Context, opts StreamExtractOpts) error {
 			_, err := opts.Writer.Write([]byte("FULL TRACK"))
 			return err
-		})
+		}, "")
 	}
 	for track := 1; track <= subtitleCacheWarmSlots; track++ {
 		waitForCacheEntry(t, c, source, track)
@@ -1756,7 +1756,7 @@ func TestWarmTrackInBackgroundFailedWarmCooldown(t *testing.T) {
 		mu.Unlock()
 		return errors.New("relay unavailable")
 	}
-	<-c.WarmTrackInBackground(opts, extract)
+	<-c.WarmTrackInBackground(opts, extract, "")
 	mu.Lock()
 	if calls != 1 {
 		t.Fatalf("first warm calls = %d, want 1", calls)
@@ -1764,7 +1764,7 @@ func TestWarmTrackInBackgroundFailedWarmCooldown(t *testing.T) {
 	mu.Unlock()
 
 	// Immediate retry: suppressed by the failure cooldown.
-	<-c.WarmTrackInBackground(opts, extract)
+	<-c.WarmTrackInBackground(opts, extract, "")
 	mu.Lock()
 	if calls != 1 {
 		t.Fatalf("immediate retry calls = %d, want still 1 (cooldown)", calls)
@@ -1781,7 +1781,7 @@ func TestWarmTrackInBackgroundFailedWarmCooldown(t *testing.T) {
 	guard.retryAt = time.Now().Add(-time.Second)
 	c.warmGuard[key] = guard
 	c.warmMu.Unlock()
-	<-c.WarmTrackInBackground(opts, extract)
+	<-c.WarmTrackInBackground(opts, extract, "")
 	mu.Lock()
 	if calls != 2 {
 		t.Fatalf("post-cooldown warm calls = %d, want 2", calls)
@@ -1817,7 +1817,7 @@ func TestWarmTrackInBackgroundCancellationReleasesSlot(t *testing.T) {
 	}
 	done := c.WarmTrackInBackground(opts, func(context.Context, StreamExtractOpts) error {
 		return context.Canceled
-	})
+	}, "")
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
@@ -1839,7 +1839,7 @@ func TestWarmTrackInBackgroundCancellationReleasesSlot(t *testing.T) {
 	<-c.WarmTrackInBackground(opts, func(context.Context, StreamExtractOpts) error {
 		calls++
 		return nil
-	})
+	}, "")
 	if calls != 0 {
 		t.Fatalf("immediate retry after cancellation ran %d times, want 0", calls)
 	}

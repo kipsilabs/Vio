@@ -24,6 +24,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/telemetry"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/Silo-Server/silo-server/internal/access"
 	"github.com/Silo-Server/silo-server/internal/catalog"
@@ -2601,7 +2602,7 @@ func (h *PlaybackHandler) HandlePlaybackInfo(w http.ResponseWriter, r *http.Requ
 		MediaSources:  sourceDTOs,
 	})
 	if played := compatLikelyPlayedSource(sources); played >= 0 && warmSubtitles[played] {
-		h.warmCompatTextSubtitles(sources[played].FileID)
+		h.warmCompatTextSubtitles(sources[played].FileID, middleware.GetReqID(r.Context()))
 	}
 }
 

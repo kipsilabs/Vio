@@ -167,10 +167,12 @@ func (c *SubtitleCache) lookupTextRendition(inputPath string, track TextSubtitle
 }
 
 // WarmTextTracks starts a detached batch extract of every uncached rendition
-// in tracks, so a later track selection is served from the cache. Like
-// WarmInBackground it takes a warm slot without blocking and is dropped when
-// every slot is busy. A nil receiver is a no-op.
-func (c *SubtitleCache) WarmTextTracks(inputPath string, tracks []TextSubtitleTrack, batch TextSubtitleBatchFunc) {
+// in tracks, so a later track selection is served from the cache. requestID is
+// the triggering request's ID, captured at the boundary because the detached
+// context no longer carries it; it is threaded into the warm's traces so they
+// join that request. Like WarmInBackground it takes a warm slot without
+// blocking and is dropped when every slot is busy. A nil receiver is a no-op.
+func (c *SubtitleCache) WarmTextTracks(inputPath string, tracks []TextSubtitleTrack, batch TextSubtitleBatchFunc, requestID string) {
 	if c == nil || batch == nil || len(tracks) == 0 {
 		return
 	}
@@ -192,12 +194,12 @@ func (c *SubtitleCache) WarmTextTracks(inputPath string, tracks []TextSubtitleTr
 		start := time.Now()
 		if err := commitTextFills(ctx, inputPath, fills, batch); err != nil {
 			slog.Log(ctx, slog.LevelWarn, "subtitle text warm failed",
-				subtitleTraceAttrs(ctx, "", SubtitleTracePhaseWarm, SubtitleTraceBytesUnknown, subtitleTraceOutcome(ctx, err), time.Since(start),
+				subtitleTraceAttrsForRequest(requestID, "", SubtitleTracePhaseWarm, SubtitleTraceBytesUnknown, subtitleTraceOutcome(ctx, err), time.Since(start),
 					"input", inputPath, "tracks", len(fills), "error", err)...)
 			return
 		}
 		slog.Log(ctx, slog.LevelInfo, "subtitle text warm finished",
-			subtitleTraceAttrs(ctx, "", SubtitleTracePhaseWarm, SubtitleTraceBytesUnknown, SubtitleTraceOutcomeCommitted, time.Since(start),
+			subtitleTraceAttrsForRequest(requestID, "", SubtitleTracePhaseWarm, SubtitleTraceBytesUnknown, SubtitleTraceOutcomeCommitted, time.Since(start),
 				"input", inputPath, "tracks", len(fills))...)
 	}()
 }
