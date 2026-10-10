@@ -33,6 +33,11 @@ const (
 	// metadata probe sees the same stream table playback does.
 	probeAnalyzeDuration = "10M" // 10 s (10,000,000 us)
 	probeSizeLimit       = "32M" // 32 MiB
+
+	// Flag spellings shared by the full probe and the bounded track
+	// enumeration so the two argv builders cannot drift apart.
+	probeAnalyzeDurationFlag = "-analyzeduration"
+	probeSizeFlag            = "-probesize"
 )
 
 var errFFprobeOutputTooLarge = fmt.Errorf("ffprobe output exceeds %d bytes", maxFFprobeOutputBytes)
@@ -107,8 +112,8 @@ func buildProbeArgs(filePath string) []string {
 		"-show_format",
 		"-show_streams",
 		"-show_chapters",
-		"-probesize", probeSizeLimit,
-		"-analyzeduration", probeAnalyzeDuration,
+		probeSizeFlag, probeSizeLimit,
+		probeAnalyzeDurationFlag, probeAnalyzeDuration,
 		filePath,
 	}
 }

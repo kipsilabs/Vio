@@ -22,8 +22,8 @@ func enumerateStreamsArgs(filePath string) []string {
 		"-v", "quiet",
 		"-print_format", "json",
 		"-show_streams",
-		"-probesize", probeSizeLimit,
-		"-analyzeduration", probeAnalyzeDuration,
+		probeSizeFlag, probeSizeLimit,
+		probeAnalyzeDurationFlag, probeAnalyzeDuration,
 		filePath,
 	}
 }
