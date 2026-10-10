@@ -311,10 +311,6 @@ type ExecutionSummary struct {
 	UnmatchedReasonCounts map[string]int
 }
 
-type localProgressRow struct {
-	UpdatedAt time.Time
-}
-
 // --- Admin types ---
 
 // ExternalUser is a user account on an external media server.

@@ -61,7 +61,36 @@ const (
 // Cluster, and the seek head's Tracks pointer when Tracks is stored later; it
 // never reads media data. Muxers write Tracks near the start, so on a typical
 // file this is a handful of small reads.
+//
+// When r fails a read, the error wraps r's error, so callers can tell storage
+// that failed from a file that is not Matroska; ErrNotMatroska and
+// ErrMatroskaTracksNotFound always describe the bytes read.
 func ReadMatroskaTracks(r io.ReaderAt, size int64) ([]MatroskaTrack, error) {
+	recorder := &readErrorRecorder{r: r}
+	tracks, err := readMatroskaTracks(recorder, size)
+	if err != nil && recorder.err != nil {
+		// A failed read can look like malformed input to the parser.
+		return nil, fmt.Errorf("mediaprobe: read Matroska file: %w", recorder.err)
+	}
+	return tracks, err
+}
+
+// readErrorRecorder keeps the first error its reader returns other than
+// io.EOF, which only marks the end of a short file.
+type readErrorRecorder struct {
+	r   io.ReaderAt
+	err error
+}
+
+func (rec *readErrorRecorder) ReadAt(p []byte, off int64) (int, error) {
+	n, err := rec.r.ReadAt(p, off)
+	if err != nil && !errors.Is(err, io.EOF) && rec.err == nil {
+		rec.err = err
+	}
+	return n, err
+}
+
+func readMatroskaTracks(r io.ReaderAt, size int64) ([]MatroskaTrack, error) {
 	id, dataSize, headerLen, err := readEBMLElementHeader(r, 0)
 	if err != nil || id != ebmlIDHeader {
 		return nil, ErrNotMatroska

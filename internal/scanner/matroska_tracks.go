@@ -242,6 +242,13 @@ func readMatroskaTracksFile(path string) ([]mediaprobe.MatroskaTrack, os.FileInf
 		return nil, nil, err
 	}
 	tracks, err := mediaprobe.ReadMatroskaTracks(f, info.Size())
+	// Stat again after the read: a file written while it was read reports its
+	// new size or mtime, so the caller sees it changed instead of trusting
+	// tracks read from a revision that no longer exists.
+	info, statErr := f.Stat()
+	if statErr != nil {
+		return nil, nil, statErr
+	}
 	return tracks, info, err
 }
 

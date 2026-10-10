@@ -25,9 +25,11 @@ type MatroskaTrackBackfiller interface {
 // clients can render them from the stream they direct play. Scans record the
 // ID themselves; this task covers files no scan has reprobed since.
 //
-// It runs at startup and finishes quickly once every file has its IDs. Every
-// API process runs the task manager, so an advisory lock keeps one pass
-// reading media across the cluster.
+// It runs at startup. It reads only files with a text subtitle track a client
+// could play by its track number, and each file once until the file or its
+// stored tracks change, so after the first pass it reads only new or changed
+// files. Every API process runs the task manager, so an advisory lock keeps
+// one pass reading media across the cluster.
 type BackfillMatroskaTrackNumbersTask struct {
 	backfiller MatroskaTrackBackfiller
 	lock       clusterLock
@@ -46,7 +48,7 @@ func (t *BackfillMatroskaTrackNumbersTask) Name() string {
 	return "Record Matroska Subtitle Track Numbers"
 }
 func (t *BackfillMatroskaTrackNumbersTask) Description() string {
-	return "Reads the track list of MKV files scanned before Silo recorded subtitle track numbers, so apps can show embedded subtitles without server extraction."
+	return "Reads the track list of MKV files with text subtitles scanned before Silo recorded subtitle track numbers, once per file, so apps can show embedded subtitles without server extraction."
 }
 func (t *BackfillMatroskaTrackNumbersTask) Category() taskmanager.TaskCategory {
 	return taskmanager.TaskCategoryLibrary

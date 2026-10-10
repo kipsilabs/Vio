@@ -156,3 +156,22 @@ func TestReadMatroskaTracksRefusesMoreEntriesThanFFmpeg(t *testing.T) {
 		}
 	}
 }
+
+type failingReaderAt struct{ err error }
+
+func (r failingReaderAt) ReadAt([]byte, int64) (int, error) { return 0, r.err }
+
+// A reader that fails is reported as its error, never as a file that is not
+// Matroska, so a caller can retry storage instead of recording the file.
+func TestReadMatroskaTracksReportsReaderErrors(t *testing.T) {
+	readErr := errors.New("input/output error")
+	_, err := ReadMatroskaTracks(failingReaderAt{err: readErr}, 1<<20)
+	if !errors.Is(err, readErr) || errors.Is(err, ErrNotMatroska) {
+		t.Fatalf("err = %v, want the reader's error and not ErrNotMatroska", err)
+	}
+
+	// Bytes that end early are the file's content, not a failed read.
+	if _, err := ReadMatroskaTracks(bytes.NewReader([]byte{0x1A, 0x45}), 2); !errors.Is(err, ErrNotMatroska) {
+		t.Fatalf("err = %v for a truncated header, want ErrNotMatroska", err)
+	}
+}

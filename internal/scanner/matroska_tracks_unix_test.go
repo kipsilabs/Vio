@@ -5,11 +5,14 @@ package scanner
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/Silo-Server/silo-server/internal/mediaprobe"
 )
 
 // Opening a FIFO with no writer blocks, the way a read on stalled network
@@ -77,5 +80,26 @@ func TestReadMatroskaTracksCapsStalledReads(t *testing.T) {
 	}
 	if tracks, _, err := readMatroskaTracks(context.Background(), "testdata/subtitles.mkv"); err != nil || len(tracks) != 4 {
 		t.Fatalf("read after recovery: %d tracks, err = %v", len(tracks), err)
+	}
+}
+
+// A read that storage fails is reported as the storage error, not as a file
+// that is not Matroska, so the backfill retries it instead of recording it.
+// Reading a directory fails the way a read on broken storage does.
+func TestReadMatroskaTracksReportsStorageReadErrors(t *testing.T) {
+	_, info, err := readMatroskaTracks(context.Background(), t.TempDir())
+	if info == nil {
+		t.Fatalf("info = nil (err %v), want the opened directory's", err)
+	}
+	if _, ok := errors.AsType[*fs.PathError](err); !ok {
+		t.Fatalf("err = %v, want the read's *fs.PathError", err)
+	}
+
+	path := filepath.Join(t.TempDir(), "not-matroska.mkv")
+	if err := os.WriteFile(path, []byte("RIFF\x00\x00\x00\x00AVI LIST"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := readMatroskaTracks(context.Background(), path); !errors.Is(err, mediaprobe.ErrNotMatroska) {
+		t.Fatalf("err = %v, want ErrNotMatroska for readable non-Matroska bytes", err)
 	}
 }
