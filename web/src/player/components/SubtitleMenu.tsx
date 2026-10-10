@@ -292,8 +292,13 @@ export function SubtitleMenu({
             {provisional && <ProvisionalTrackBadge />}
           </div>
           <div className="max-h-[60vh] overflow-y-auto py-1">
-            {failed && (
+            {failed && sortedTracks.length === 0 && (
               <div className="px-3 py-1 text-xs text-amber-300/80">Subtitle discovery failed</div>
+            )}
+            {failed && sortedTracks.length > 0 && (
+              <div className="px-3 py-1 text-xs text-white/50">
+                Showing available subtitles — discovery did not complete
+              </div>
             )}
             {!failed && (pending || provisional) && (
               <div className="flex items-center gap-2 px-3 py-1 text-xs text-white/50">

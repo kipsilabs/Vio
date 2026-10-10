@@ -114,7 +114,11 @@ membership, command-aware readiness, and ready/buffering/syncing member status.
 Every mutation body carries the `installation_id` the client read from
 capabilities. A different value is `409 installation_changed`: refresh
 capabilities and start a new attempt. There is no admission step and no
-per-account enrollment.
+per-account enrollment. `getPlaybackInventory` is the exception: it is a
+session-scoped read whose ownership is enforced against the stored live
+session (the attempt row is required but not an ownership check), so a stale
+`installation_id` (capabilities cached across a restart) still resolves the
+pending track inventory instead of 409-looping.
 
 ## Indexer releases
 

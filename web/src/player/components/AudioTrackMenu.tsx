@@ -200,8 +200,13 @@ export function AudioTrackMenu({
             <span className="text-xs font-medium tracking-wide text-white/50 uppercase">Audio</span>
             {provisional && <ProvisionalTrackBadge />}
           </div>
-          {failed && (
+          {failed && dedupedTracks.length === 0 && (
             <div className="px-3 py-1 text-xs text-amber-300/80">Track discovery failed</div>
+          )}
+          {failed && dedupedTracks.length > 0 && (
+            <div className="px-3 py-1 text-xs text-white/50">
+              Showing available tracks — discovery did not complete
+            </div>
           )}
           {!failed && (pending || provisional) && (
             <div className="flex items-center gap-2 px-3 py-1 text-xs text-white/50">

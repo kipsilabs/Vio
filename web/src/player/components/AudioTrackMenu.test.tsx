@@ -302,7 +302,7 @@ describe("AudioTrackMenu", () => {
       }),
     );
 
-    expect(screen.getByText("Track discovery failed")).toBeTruthy();
+    expect(screen.getByText("Showing available tracks — discovery did not complete")).toBeTruthy();
     expect(screen.getByText("English")).toBeTruthy();
   });
 

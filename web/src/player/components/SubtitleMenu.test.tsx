@@ -241,7 +241,9 @@ describe("SubtitleMenu", () => {
     );
     fireEvent.click(screen.getByRole("button", { name: /(Enable|Disable) captions/ }));
 
-    expect(screen.getByText("Subtitle discovery failed")).toBeTruthy();
+    expect(
+      screen.getByText("Showing available subtitles — discovery did not complete"),
+    ).toBeTruthy();
     expect(screen.getByText("English")).toBeTruthy();
   });
 });
