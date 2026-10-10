@@ -48,6 +48,7 @@ func TestScanStateCarriesProbeRejectionDB(t *testing.T) {
 		FileSize:       1_000,
 		FileModifiedAt: &modifiedAt,
 		ProbeFailedAt:  &rejectedAt,
+		ProbeVersion:   probeVersion,
 	}); err != nil {
 		t.Fatalf("seed rejected file: %v", err)
 	}
@@ -62,6 +63,9 @@ func TestScanStateCarriesProbeRejectionDB(t *testing.T) {
 	state := states[0]
 	if state.ProbeFailedAt == nil || state.ProbeUpdatedAt != nil {
 		t.Fatalf("scan state probe_failed_at = %v, probe_updated_at = %v, want a rejection and no probe", state.ProbeFailedAt, state.ProbeUpdatedAt)
+	}
+	if state.ProbeVersion != probeVersion {
+		t.Fatalf("scan state probe_version = %d, want %d", state.ProbeVersion, probeVersion)
 	}
 	reasons := scanStateUpdateReasons(state, 1_000, modifiedAt, nil, false, fileRootAssignment{}, fileGroupAssignment{}, "movies", true)
 	if testStringSliceContains(reasons, "probe_repair") {

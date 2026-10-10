@@ -3601,6 +3601,9 @@ func needsCriticalProbeRepairScanState(file *scanStateFile) bool {
 	if file.DVProvenanceCurrent != nil && !*file.DVProvenanceCurrent {
 		return true
 	}
+	if file.ProbeVersion < probeVersion {
+		return true
+	}
 	if strings.TrimSpace(file.ProbeSource) == "" || file.ProbeUpdatedAt == nil {
 		return true
 	}
