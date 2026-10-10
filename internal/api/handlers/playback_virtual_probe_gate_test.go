@@ -1595,6 +1595,7 @@ func TestTrackCodecPreferredOverCandidate(t *testing.T) {
 func TestMergeIdempotentAcrossRepeatedCandidates(t *testing.T) {
 	candidate := VirtualPlaybackStream{
 		Resolution: "1080p", CodecVideo: "h264", CodecAudio: "aac", Container: "mkv",
+		AudioLanguages: []string{"eng"},
 	}
 	file := &models.MediaFile{}
 

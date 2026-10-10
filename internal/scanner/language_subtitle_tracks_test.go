@@ -2,35 +2,24 @@ package scanner
 
 import "testing"
 
-// TestLanguageSubtitleTracksDeduplicatesAliases proves the persisted virtual
-// placeholder list keeps one row per base language even though the release
-// name carried both a regional code and its bare base ("EN-US" and "ENG").
-func TestLanguageSubtitleTracksDeduplicatesAliases(t *testing.T) {
-	tracks := languageSubtitleTracks([]string{"EN-US", "ENG", "FRE", "FR-CA", "SPA", "ES-419"})
-	if len(tracks) != 3 {
-		t.Fatalf("languageSubtitleTracks = %#v, want 3 tracks (one per base language)", tracks)
-	}
-	got := map[string]bool{}
-	for _, track := range tracks {
-		got[track.Language] = true
-	}
-	for _, want := range []string{"EN-US", "FR-CA", "ES-419"} {
-		if !got[want] {
-			t.Fatalf("languageSubtitleTracks = %#v, missing %q", tracks, want)
-		}
-	}
-	for _, dropped := range []string{"ENG", "FRE", "SPA"} {
-		if got[dropped] {
-			t.Fatalf("languageSubtitleTracks = %#v, kept redundant base code %q", tracks, dropped)
-		}
+// TestRegistrationSubtitleTracksDropsDeclaredLanguages pins the registration
+// invariant: declared subtitle languages are provider hints, not observed
+// streams, so a virtual registration or candidate listing persists zero
+// embedded subtitle tracks. Persisting them would fabricate language-only rows
+// (Codec="", Index=0) that map to a phantom ffmpeg 0:s:N and suppress the
+// subtitle search the hint is meant to drive.
+func TestRegistrationSubtitleTracksDropsDeclaredLanguages(t *testing.T) {
+	tracks := registrationSubtitleTracks([]string{"EN-US", "ENG", "FRE", "FR-CA", "SPA", "ES-419"})
+	if len(tracks) != 0 {
+		t.Fatalf("registrationSubtitleTracks = %#v, want no embedded subtitle tracks", tracks)
 	}
 }
 
-// TestLanguageSubtitleTracksEmptyStaysNonNil pins the JSONB shape: an empty
-// language list must marshal as [] rather than null.
-func TestLanguageSubtitleTracksEmptyStaysNonNil(t *testing.T) {
-	tracks := languageSubtitleTracks(nil)
+// TestRegistrationSubtitleTracksEmptyStaysNonNil pins the JSONB shape: the
+// persisted inventory must marshal as [] rather than null.
+func TestRegistrationSubtitleTracksEmptyStaysNonNil(t *testing.T) {
+	tracks := registrationSubtitleTracks(nil)
 	if tracks == nil || len(tracks) != 0 {
-		t.Fatalf("languageSubtitleTracks(nil) = %#v, want a non-nil empty slice", tracks)
+		t.Fatalf("registrationSubtitleTracks(nil) = %#v, want a non-nil empty slice", tracks)
 	}
 }

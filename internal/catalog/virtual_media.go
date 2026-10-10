@@ -19,7 +19,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Silo-Server/silo-server/internal/requestlock"
-	"github.com/Silo-Server/silo-server/internal/virtuallibrary/stream"
 )
 
 var ErrInvalidVirtualMedia = errors.New("invalid virtual media")
@@ -1833,6 +1832,19 @@ func dropVirtualSiblingRows(ctx context.Context, tx pgx.Tx, contentID, episodeID
 		contentID, episodeID, installationID, folderID, keepID, neutralURI, editionLabel)
 }
 
+// registrationSubtitleLanguages returns the declared subtitle languages a
+// virtual registration persists as embedded subtitle tracks. It is always
+// empty, and deliberately so: declared subtitle languages are provider hints
+// (they drive the background subtitle search and the version picker), not
+// observed streams. Writing them as embedded tracks fabricates language-only
+// rows with Codec="" and Index=0, which downstream maps to a phantom ffmpeg
+// 0:s:N and which make the row look like it already carries subtitles, so the
+// search the hint exists to drive never runs. Embedded subtitle inventory is
+// owned by the probe; registration persists none.
+func registrationSubtitleLanguages([]string) []string {
+	return nil
+}
+
 func upsertVirtualFileWithMeta(ctx context.Context, tx pgx.Tx, contentID, episodeID string, folderID, installationID int, uri string, duration int, in VirtualMedia) error {
 	if isUnplayableVirtualURI(uri) {
 		return nil
@@ -1849,9 +1861,13 @@ func upsertVirtualFileWithMeta(ctx context.Context, tx pgx.Tx, contentID, episod
 	if audioLangs == nil {
 		audioLangs = []string{}
 	}
-	// Collapse language aliases so one language never lands as two JSONB
-	// subtitle tracks, whatever order the caller supplied.
-	subLangs := stream.DedupeLanguageAliases(in.SubtitleLanguages)
+	// Declared subtitle languages are provider hints, not observed streams.
+	// Persisting them as embedded subtitle tracks fabricates language-only rows
+	// (Codec="", Index=0) that downstream maps to a phantom ffmpeg 0:s:N and
+	// that suppress the subtitle search the hint is meant to drive. Embedded
+	// subtitle inventory comes only from the probe, so registration persists
+	// none and the declared languages stay a candidate-level hint.
+	subLangs := registrationSubtitleLanguages(in.SubtitleLanguages)
 	if subLangs == nil {
 		subLangs = []string{}
 	}
@@ -1957,7 +1973,7 @@ func upsertVirtualFileVariant(ctx context.Context, tx pgx.Tx, contentID, episode
 	if audioLangs == nil {
 		audioLangs = []string{}
 	}
-	subLangs := stream.DedupeLanguageAliases(v.SubtitleLanguages)
+	subLangs := registrationSubtitleLanguages(v.SubtitleLanguages)
 	if subLangs == nil {
 		subLangs = []string{}
 	}
