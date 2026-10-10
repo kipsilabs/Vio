@@ -50,7 +50,7 @@ type scanStateFile struct {
 	MultiEpisodeEnd        int
 	ProbeSource            string
 	ProbeUpdatedAt         *time.Time
-	ProbeVersion           int
+	ProbeFailedAt          *time.Time
 	MissingSince           *time.Time
 	HasVideoTracks         bool
 	HasNonImageVideoTracks bool
@@ -68,7 +68,7 @@ const scanStateColumns = `id, content_id, episode_id, extra_id,
 	edition_raw, edition_key, edition_confidence, edition_source,
 	presentation_kind, presentation_group_key, presentation_part_index,
 	multi_episode_start, multi_episode_end,
-	probe_source, probe_updated_at, probe_version, missing_since,
+	probe_source, probe_updated_at, probe_failed_at, missing_since,
 	COALESCE(jsonb_typeof(video_tracks) = 'array' AND jsonb_array_length(video_tracks) > 0, FALSE) AS has_video_tracks,
 	COALESCE((
 		SELECT bool_or(lower(btrim(COALESCE(track->>'codec', ''))) NOT IN ('mjpeg', 'jpeg', 'png', 'webp', 'gif', 'bmp'))
@@ -107,7 +107,6 @@ func scanScanStateRow(row pgx.Row) (*scanStateFile, error) {
 	var presentationKind, presentationGroupKey *string
 	var presentationPartIndex, multiEpisodeStart, multiEpisodeEnd *int
 	var probeSource *string
-	var probeVersion int
 	var externalSubtitlePathsJSON []byte
 	var dvProvenanceCurrent bool
 
@@ -145,7 +144,7 @@ func scanScanStateRow(row pgx.Row) (*scanStateFile, error) {
 		&multiEpisodeEnd,
 		&probeSource,
 		&state.ProbeUpdatedAt,
-		&probeVersion,
+		&state.ProbeFailedAt,
 		&state.MissingSince,
 		&state.HasVideoTracks,
 		&state.HasNonImageVideoTracks,
@@ -240,7 +239,6 @@ func scanScanStateRow(row pgx.Row) (*scanStateFile, error) {
 	if probeSource != nil {
 		state.ProbeSource = *probeSource
 	}
-	state.ProbeVersion = probeVersion
 	if len(externalSubtitlePathsJSON) > 0 {
 		if err := json.Unmarshal(externalSubtitlePathsJSON, &state.ExternalSubtitlePaths); err != nil {
 			return nil, fmt.Errorf("unmarshaling external subtitle paths: %w", err)
@@ -365,8 +363,8 @@ func scanStateFromMediaFile(file *models.MediaFile) *scanStateFile {
 		MultiEpisodeStart:      file.MultiEpisodeStart,
 		MultiEpisodeEnd:        file.MultiEpisodeEnd,
 		ProbeSource:            file.ProbeSource,
-		ProbeVersion:           file.ProbeVersion,
 		ProbeUpdatedAt:         file.ProbeUpdatedAt,
+		ProbeFailedAt:          file.ProbeFailedAt,
 		MissingSince:           file.MissingSince,
 		HasVideoTracks:         len(file.VideoTracks) > 0,
 		HasNonImageVideoTracks: probeFacts.HasNonImageVideoTracks,

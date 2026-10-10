@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/Silo-Server/silo-server/internal/contentid"
 	"github.com/Silo-Server/silo-server/internal/librarykind"
@@ -377,10 +378,7 @@ func (s *Scanner) processExtraFiles(
 
 		fileModifiedAt := normalizeFileModifiedAt(info.ModTime())
 		existing := existingByPath[candidate.Path]
-		if existing != nil && existing.ExtraID == extraID &&
-			existing.FileSize == info.Size() &&
-			existing.FileModifiedAt != nil && existing.FileModifiedAt.Equal(fileModifiedAt) &&
-			existing.ProbeUpdatedAt != nil && existing.MissingSince == nil {
+		if extraFileUnchanged(existing, extraID, info.Size(), fileModifiedAt) {
 			stats.Unchanged++
 			continue
 		}
@@ -486,4 +484,15 @@ func extraParentLookupDir(candidate extraCandidate) string {
 		return filepath.Dir(candidate.Path)
 	}
 	return firstNonSupplementalAncestor(candidate.SupplementalDir)
+}
+
+// extraFileUnchanged reports whether an extra's row already describes the file
+// on disk, so a scan can leave it alone. A row ffprobe rejected for these same
+// bytes counts as unchanged too: probing them again would only fail again.
+func extraFileUnchanged(existing *scanStateFile, extraID string, fileSize int64, fileModifiedAt time.Time) bool {
+	return existing != nil && existing.ExtraID == extraID &&
+		existing.FileSize == fileSize &&
+		existing.FileModifiedAt != nil && existing.FileModifiedAt.Equal(fileModifiedAt) &&
+		(existing.ProbeUpdatedAt != nil || probeRejectionStands(existing, fileSize, fileModifiedAt)) &&
+		existing.MissingSince == nil
 }

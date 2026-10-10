@@ -16,6 +16,8 @@
 ./internal/scanner TestMatroskaTrackBackfillStopsOnStalledStorage
 ./internal/scanner TestMatroskaTrackBackfillStopsOnIntermittentStalls
 ./internal/scanner TestMatroskaTrackBackfillReadsEachFileOnce
+./internal/scanner TestScanStateCarriesProbeRejectionDB
+./internal/scanner TestRescanKeepsProbeFactsOfARejectedUnchangedFileDB
 ./migrations TestScanRunForeignKeysHaveLeadingIndexesDB
 
 # Series air-date sort keys advance when a known episode airs.
@@ -24,6 +26,9 @@
 # Section and Smart collection rule fields and operators compile to working SQL.
 ./internal/catalog TestRuleFieldsFilterCatalogDB
 ./internal/api/handlers TestCatalogProfileSectionsDB
+
+# Scan membership reconciliation retries a transaction Postgres aborts as a deadlock victim.
+./internal/catalog TestFolderMembershipReconciliationRetriesDeadlockDB
 
 # Profile history and account/invitation persistence.
 ./internal/api/handlers TestEbookProgressEventsPostgres
@@ -89,6 +94,9 @@
 ./internal/metadata TestArtworkRevisionGCBatchHealRechecksRetrackBetweenSurfaces
 ./internal/metadata TestArtworkRevisionGCRunRetainsPartialDeletionForHealing
 ./internal/metadata TestArtworkRevisionGCBatchRechecksOwnershipAndReferences
+./internal/metadata TestArtworkRevisionGCDormantSweep
+./internal/metadata TestArtworkRevisionGCDormantSweepCycles
+./internal/metadata TestArtworkRevisionGCDormantCycleEndsWhileRowsArrive
 
 # Persisted notification, request, marker and preview contracts.
 ./internal/markers TestPopulationSyncResumesAfterQuotaAcrossRuns
