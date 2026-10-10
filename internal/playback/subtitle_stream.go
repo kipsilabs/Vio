@@ -178,11 +178,10 @@ func StreamExtractSubtitle(ctx context.Context, opts StreamExtractOpts) error {
 	if outcome != SubtitleTraceOutcomeSuccess {
 		level = slog.LevelWarn
 	}
-	logSubtitleTrace(ctx, level, "subtitle stream extract finished",
-		opts.SourceCodec, subtitlePhaseForOutput(opts.SourceCodec, opts.TargetFormat),
-		counter.bytes, outcome, time.Since(start),
-		"track", opts.TrackIndex, "seek", opts.SeekSeconds, "ffmpeg_err", waitErr,
-	)
+	slog.Log(ctx, level, "subtitle stream extract finished",
+		subtitleTraceAttrs(ctx, opts.SourceCodec, subtitlePhaseForOutput(opts.SourceCodec, opts.TargetFormat),
+			counter.bytes, outcome, time.Since(start),
+			"track", opts.TrackIndex, "seek", opts.SeekSeconds, "ffmpeg_err", waitErr)...)
 
 	if ctx.Err() != nil {
 		return ctx.Err()

@@ -168,15 +168,15 @@ func (n *SubtitleReadyNotifier) SubtitleReady(ctx context.Context, mediaFileID, 
 		track := n.resolveTrack(ctx, session.ID, mediaFileID, downloadedTrack(subtitleID))
 		event, err := NewSubtitleReadyEvent(session.ID, mediaFileID, subtitleID, language, label, track)
 		if err != nil {
-			logSubtitleTrace(ctx, slog.LevelWarn, "failed to encode subtitle ready realtime event",
-				"", SubtitleTracePhaseNotify, SubtitleTraceBytesUnknown, SubtitleTraceOutcomeEncodeFailed, -1,
-				"session_id", session.ID, "file_id", mediaFileID, "subtitle_id", subtitleID, "error", err)
+			slog.Log(ctx, slog.LevelWarn, "failed to encode subtitle ready realtime event",
+				subtitleTraceAttrs(ctx, "", SubtitleTracePhaseNotify, SubtitleTraceBytesUnknown, SubtitleTraceOutcomeEncodeFailed, -1,
+					"session_id", session.ID, "file_id", mediaFileID, "subtitle_id", subtitleID, "error", err)...)
 			continue
 		}
 		if err := n.hub.Send(session.ID, event); err != nil && !errors.Is(err, ErrRealtimeConnectionNotFound) {
-			logSubtitleTrace(ctx, slog.LevelWarn, "failed to deliver subtitle ready realtime event",
-				"", SubtitleTracePhaseNotify, SubtitleTraceBytesUnknown, SubtitleTraceOutcomeDeliveryFailed, -1,
-				"session_id", session.ID, "file_id", mediaFileID, "subtitle_id", subtitleID, "error", err)
+			slog.Log(ctx, slog.LevelWarn, "failed to deliver subtitle ready realtime event",
+				subtitleTraceAttrs(ctx, "", SubtitleTracePhaseNotify, SubtitleTraceBytesUnknown, SubtitleTraceOutcomeDeliveryFailed, -1,
+					"session_id", session.ID, "file_id", mediaFileID, "subtitle_id", subtitleID, "error", err)...)
 		}
 	}
 }
@@ -239,15 +239,15 @@ func (n *SubtitleReadyNotifier) dispatchSyncUpdated(ctx context.Context, update 
 			Timing: update.Timing, Job: update.Job,
 		})
 		if err != nil {
-			logSubtitleTrace(ctx, slog.LevelWarn, "failed to encode subtitle sync realtime event",
-				"", SubtitleTracePhaseNotify, SubtitleTraceBytesUnknown, SubtitleTraceOutcomeEncodeFailed, -1,
-				"session_id", session.ID, "file_id", update.FileID, "sync_key", update.SyncKey, "error", err)
+			slog.Log(ctx, slog.LevelWarn, "failed to encode subtitle sync realtime event",
+				subtitleTraceAttrs(ctx, "", SubtitleTracePhaseNotify, SubtitleTraceBytesUnknown, SubtitleTraceOutcomeEncodeFailed, -1,
+					"session_id", session.ID, "file_id", update.FileID, "sync_key", update.SyncKey, "error", err)...)
 			continue
 		}
 		if err := n.hub.Send(session.ID, event); err != nil && !errors.Is(err, ErrRealtimeConnectionNotFound) {
-			logSubtitleTrace(ctx, slog.LevelWarn, "failed to deliver subtitle sync realtime event",
-				"", SubtitleTracePhaseNotify, SubtitleTraceBytesUnknown, SubtitleTraceOutcomeDeliveryFailed, -1,
-				"session_id", session.ID, "file_id", update.FileID, "sync_key", update.SyncKey, "error", err)
+			slog.Log(ctx, slog.LevelWarn, "failed to deliver subtitle sync realtime event",
+				subtitleTraceAttrs(ctx, "", SubtitleTracePhaseNotify, SubtitleTraceBytesUnknown, SubtitleTraceOutcomeDeliveryFailed, -1,
+					"session_id", session.ID, "file_id", update.FileID, "sync_key", update.SyncKey, "error", err)...)
 		}
 	}
 }
@@ -266,15 +266,15 @@ func (n *SubtitleReadyNotifier) dispatchTimingChanged(ctx context.Context, chang
 		})
 		event, err := NewSubtitleTimingChangedEvent(session.ID, change.fileID, change.subtitleID, change.syncKey, track)
 		if err != nil {
-			logSubtitleTrace(ctx, slog.LevelWarn, "failed to encode subtitle timing realtime event",
-				"", SubtitleTracePhaseNotify, SubtitleTraceBytesUnknown, SubtitleTraceOutcomeEncodeFailed, -1,
-				"session_id", session.ID, "file_id", change.fileID, "sync_key", change.syncKey, "error", err)
+			slog.Log(ctx, slog.LevelWarn, "failed to encode subtitle timing realtime event",
+				subtitleTraceAttrs(ctx, "", SubtitleTracePhaseNotify, SubtitleTraceBytesUnknown, SubtitleTraceOutcomeEncodeFailed, -1,
+					"session_id", session.ID, "file_id", change.fileID, "sync_key", change.syncKey, "error", err)...)
 			continue
 		}
 		if err := n.hub.Send(session.ID, event); err != nil && !errors.Is(err, ErrRealtimeConnectionNotFound) {
-			logSubtitleTrace(ctx, slog.LevelWarn, "failed to deliver subtitle timing realtime event",
-				"", SubtitleTracePhaseNotify, SubtitleTraceBytesUnknown, SubtitleTraceOutcomeDeliveryFailed, -1,
-				"session_id", session.ID, "file_id", change.fileID, "sync_key", change.syncKey, "error", err)
+			slog.Log(ctx, slog.LevelWarn, "failed to deliver subtitle timing realtime event",
+				subtitleTraceAttrs(ctx, "", SubtitleTracePhaseNotify, SubtitleTraceBytesUnknown, SubtitleTraceOutcomeDeliveryFailed, -1,
+					"session_id", session.ID, "file_id", change.fileID, "sync_key", change.syncKey, "error", err)...)
 		}
 	}
 }
@@ -320,23 +320,23 @@ func (n *SubtitleReadyNotifier) resolveTrack(ctx context.Context, sessionID stri
 	}
 	file, err := n.inventory.MediaFile(ctx, fileID)
 	if err != nil || file == nil {
-		logSubtitleTrace(ctx, slog.LevelWarn, "subtitle realtime event omits track identity",
-			"", SubtitleTracePhaseNotify, SubtitleTraceBytesUnknown, SubtitleTraceOutcomeSkipped, -1,
-			"file_id", fileID, "error", err)
+		slog.Log(ctx, slog.LevelWarn, "subtitle realtime event omits track identity",
+			subtitleTraceAttrs(ctx, "", SubtitleTracePhaseNotify, SubtitleTraceBytesUnknown, SubtitleTraceOutcomeSkipped, -1,
+				"file_id", fileID, "error", err)...)
 		return nil
 	}
 	additional, err := n.inventory.AdditionalSubtitles(ctx, file)
 	if err != nil {
-		logSubtitleTrace(ctx, slog.LevelWarn, "subtitle realtime event omits track identity",
-			"", SubtitleTracePhaseNotify, SubtitleTraceBytesUnknown, SubtitleTraceOutcomeSkipped, -1,
-			"file_id", fileID, "error", err)
+		slog.Log(ctx, slog.LevelWarn, "subtitle realtime event omits track identity",
+			subtitleTraceAttrs(ctx, "", SubtitleTracePhaseNotify, SubtitleTraceBytesUnknown, SubtitleTraceOutcomeSkipped, -1,
+				"file_id", fileID, "error", err)...)
 		return nil
 	}
 	features, err := n.inventory.SessionClientFeatures(ctx, sessionID)
 	if err != nil {
-		logSubtitleTrace(ctx, slog.LevelWarn, "subtitle realtime event omits track identity",
-			"", SubtitleTracePhaseNotify, SubtitleTraceBytesUnknown, SubtitleTraceOutcomeSkipped, -1,
-			"file_id", fileID, "error", err)
+		slog.Log(ctx, slog.LevelWarn, "subtitle realtime event omits track identity",
+			subtitleTraceAttrs(ctx, "", SubtitleTracePhaseNotify, SubtitleTraceBytesUnknown, SubtitleTraceOutcomeSkipped, -1,
+				"file_id", fileID, "error", err)...)
 		return nil
 	}
 	items := ScopeSubtitleInventoryV3(sessionID, file, BuildSubtitleInventoryV3(file, additional), features)
@@ -363,14 +363,14 @@ func (n *SubtitleReadyNotifier) sendTranslation(sessionID string, fileID int, bu
 	}
 	event, err := build()
 	if err != nil {
-		logSubtitleTrace(context.Background(), slog.LevelWarn, "failed to encode subtitle translation realtime event",
-			"", SubtitleTracePhaseNotify, SubtitleTraceBytesUnknown, SubtitleTraceOutcomeEncodeFailed, -1,
-			"session_id", sessionID, "error", err)
+		slog.Log(context.Background(), slog.LevelWarn, "failed to encode subtitle translation realtime event",
+			subtitleTraceAttrs(context.Background(), "", SubtitleTracePhaseNotify, SubtitleTraceBytesUnknown, SubtitleTraceOutcomeEncodeFailed, -1,
+				"session_id", sessionID, "error", err)...)
 		return
 	}
 	if err := n.hub.Send(sessionID, event); err != nil && !errors.Is(err, ErrRealtimeConnectionNotFound) {
-		logSubtitleTrace(context.Background(), slog.LevelWarn, "failed to deliver subtitle translation realtime event",
-			"", SubtitleTracePhaseNotify, SubtitleTraceBytesUnknown, SubtitleTraceOutcomeDeliveryFailed, -1,
-			"session_id", sessionID, "error", err)
+		slog.Log(context.Background(), slog.LevelWarn, "failed to deliver subtitle translation realtime event",
+			subtitleTraceAttrs(context.Background(), "", SubtitleTracePhaseNotify, SubtitleTraceBytesUnknown, SubtitleTraceOutcomeDeliveryFailed, -1,
+				"session_id", sessionID, "error", err)...)
 	}
 }

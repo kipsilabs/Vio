@@ -307,19 +307,19 @@ func (c *SubtitleCache) ServeExtractWithResult(w http.ResponseWriter, r *http.Re
 			fill.Discard()
 		} else if commitErr := fill.Commit(); commitErr != nil {
 			outcome = SubtitleTraceOutcomeCommitFailed
-			logSubtitleTrace(r.Context(), slog.LevelWarn, "subtitle cache commit failed",
-				opts.SourceCodec, SubtitleTracePhaseServe, counter.bytes, outcome, -1,
-				"track", opts.TrackIndex, "format", format, "error", commitErr)
+			slog.Log(r.Context(), slog.LevelWarn, "subtitle cache commit failed",
+				subtitleTraceAttrs(r.Context(), opts.SourceCodec, SubtitleTracePhaseServe, counter.bytes, outcome, -1,
+					"track", opts.TrackIndex, "format", format, "error", commitErr)...)
 		}
 	}
 	level := slog.LevelInfo
 	if outcome != SubtitleTraceOutcomeSuccess {
 		level = slog.LevelWarn
 	}
-	logSubtitleTrace(r.Context(), level, "subtitle extract served",
-		opts.SourceCodec, subtitlePhaseForOutput(opts.SourceCodec, opts.TargetFormat),
-		counter.bytes, outcome, time.Since(start),
-		"track", opts.TrackIndex, "format", format)
+	slog.Log(r.Context(), level, "subtitle extract served",
+		subtitleTraceAttrs(r.Context(), opts.SourceCodec, subtitlePhaseForOutput(opts.SourceCodec, opts.TargetFormat),
+			counter.bytes, outcome, time.Since(start),
+			"track", opts.TrackIndex, "format", format)...)
 	return result, err
 }
 
@@ -346,9 +346,9 @@ func (c *SubtitleCache) serveCached(w http.ResponseWriter, r *http.Request, opts
 	if info, statErr := cached.Stat(); statErr == nil {
 		size = info.Size()
 	}
-	logSubtitleTrace(r.Context(), slog.LevelDebug, "subtitle served from cache",
-		opts.SourceCodec, SubtitleTracePhaseServe, size, SubtitleTraceOutcomeCacheHit, -1,
-		"track", opts.TrackIndex, "format", format)
+	slog.Log(r.Context(), slog.LevelDebug, "subtitle served from cache",
+		subtitleTraceAttrs(r.Context(), opts.SourceCodec, SubtitleTracePhaseServe, size, SubtitleTraceOutcomeCacheHit, -1,
+			"track", opts.TrackIndex, "format", format)...)
 	w.Header().Set("Cache-Control", "private, no-cache")
 	http.ServeContent(w, r, "", modTime, cached)
 	return true
@@ -527,19 +527,19 @@ func (c *SubtitleCache) ServeSUPExtract(w http.ResponseWriter, r *http.Request, 
 			fill.Discard()
 		} else if commitErr := fill.Commit(); commitErr != nil {
 			outcome = SubtitleTraceOutcomeCommitFailed
-			logSubtitleTrace(r.Context(), slog.LevelWarn, "subtitle cache commit failed",
-				opts.SourceCodec, SubtitleTracePhaseServe, counter.bytes, outcome, -1,
-				"track", opts.TrackIndex, "error", commitErr)
+			slog.Log(r.Context(), slog.LevelWarn, "subtitle cache commit failed",
+				subtitleTraceAttrs(r.Context(), opts.SourceCodec, SubtitleTracePhaseServe, counter.bytes, outcome, -1,
+					"track", opts.TrackIndex, "error", commitErr)...)
 		}
 	}
 	level := slog.LevelInfo
 	if outcome != SubtitleTraceOutcomeSuccess {
 		level = slog.LevelWarn
 	}
-	logSubtitleTrace(r.Context(), level, "subtitle extract served",
-		opts.SourceCodec, subtitlePhaseForOutput(opts.SourceCodec, opts.TargetFormat),
-		counter.bytes, outcome, time.Since(start),
-		"track", opts.TrackIndex, "format", subtitleFormatSUP)
+	slog.Log(r.Context(), level, "subtitle extract served",
+		subtitleTraceAttrs(r.Context(), opts.SourceCodec, subtitlePhaseForOutput(opts.SourceCodec, opts.TargetFormat),
+			counter.bytes, outcome, time.Since(start),
+			"track", opts.TrackIndex, "format", subtitleFormatSUP)...)
 	return err
 }
 
@@ -557,9 +557,9 @@ func (c *SubtitleCache) serveSUPEntry(w http.ResponseWriter, r *http.Request, op
 	if info, statErr := cached.Stat(); statErr == nil {
 		size = info.Size()
 	}
-	logSubtitleTrace(r.Context(), slog.LevelDebug, "subtitle stream served from cache",
-		opts.SourceCodec, SubtitleTracePhaseServe, size, SubtitleTraceOutcomeCacheHit, -1,
-		"track", opts.TrackIndex, "format", subtitleFormatSUP)
+	slog.Log(r.Context(), slog.LevelDebug, "subtitle stream served from cache",
+		subtitleTraceAttrs(r.Context(), opts.SourceCodec, SubtitleTracePhaseServe, size, SubtitleTraceOutcomeCacheHit, -1,
+			"track", opts.TrackIndex, "format", subtitleFormatSUP)...)
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Cache-Control", "private, no-cache")
 	http.ServeContent(w, r, "", modTime, cached)
@@ -760,22 +760,22 @@ func (c *SubtitleCache) WarmInBackground(opts StreamExtractOpts, extract SUPExtr
 		if err := extract(ctx, opts); err != nil {
 			fill.Discard()
 			c.noteWarmOutcome(key, false, time.Now())
-			logSubtitleTrace(ctx, slog.LevelWarn, "subtitle cache warm failed",
-				opts.SourceCodec, SubtitleTracePhaseWarm, counter.bytes, subtitleTraceOutcome(ctx, err), time.Since(start),
-				"input", opts.InputPath, "track", opts.TrackIndex, "error", err)
+			slog.Log(ctx, slog.LevelWarn, "subtitle cache warm failed",
+				subtitleTraceAttrs(ctx, opts.SourceCodec, SubtitleTracePhaseWarm, counter.bytes, subtitleTraceOutcome(ctx, err), time.Since(start),
+					"input", opts.InputPath, "track", opts.TrackIndex, "error", err)...)
 			return
 		}
 		if err := fill.Commit(); err != nil {
 			c.noteWarmOutcome(key, false, time.Now())
-			logSubtitleTrace(ctx, slog.LevelWarn, "subtitle cache warm commit failed",
-				opts.SourceCodec, SubtitleTracePhaseWarm, counter.bytes, SubtitleTraceOutcomeCommitFailed, time.Since(start),
-				"input", opts.InputPath, "track", opts.TrackIndex, "error", err)
+			slog.Log(ctx, slog.LevelWarn, "subtitle cache warm commit failed",
+				subtitleTraceAttrs(ctx, opts.SourceCodec, SubtitleTracePhaseWarm, counter.bytes, SubtitleTraceOutcomeCommitFailed, time.Since(start),
+					"input", opts.InputPath, "track", opts.TrackIndex, "error", err)...)
 			return
 		}
 		c.noteWarmOutcome(key, true, time.Now())
-		logSubtitleTrace(ctx, slog.LevelInfo, "subtitle cache warm finished",
-			opts.SourceCodec, SubtitleTracePhaseWarm, counter.bytes, SubtitleTraceOutcomeCommitted, time.Since(start),
-			"input", opts.InputPath, "track", opts.TrackIndex)
+		slog.Log(ctx, slog.LevelInfo, "subtitle cache warm finished",
+			subtitleTraceAttrs(ctx, opts.SourceCodec, SubtitleTracePhaseWarm, counter.bytes, SubtitleTraceOutcomeCommitted, time.Since(start),
+				"input", opts.InputPath, "track", opts.TrackIndex)...)
 	}()
 }
 
@@ -860,22 +860,22 @@ func (c *SubtitleCache) WarmTrackInBackground(opts StreamExtractOpts, extract SU
 		if err := extract(ctx, opts); err != nil {
 			fill.Discard()
 			c.noteWarmOutcome(key, false, time.Now())
-			logSubtitleTrace(ctx, slog.LevelWarn, "subtitle cache warm failed",
-				opts.SourceCodec, SubtitleTracePhaseWarm, counter.bytes, subtitleTraceOutcome(ctx, err), time.Since(start),
-				"input", opts.InputPath, "track", opts.TrackIndex, "format", format, "error", err)
+			slog.Log(ctx, slog.LevelWarn, "subtitle cache warm failed",
+				subtitleTraceAttrs(ctx, opts.SourceCodec, SubtitleTracePhaseWarm, counter.bytes, subtitleTraceOutcome(ctx, err), time.Since(start),
+					"input", opts.InputPath, "track", opts.TrackIndex, "format", format, "error", err)...)
 			return
 		}
 		if err := fill.Commit(); err != nil {
 			c.noteWarmOutcome(key, false, time.Now())
-			logSubtitleTrace(ctx, slog.LevelWarn, "subtitle cache warm commit failed",
-				opts.SourceCodec, SubtitleTracePhaseWarm, counter.bytes, SubtitleTraceOutcomeCommitFailed, time.Since(start),
-				"input", opts.InputPath, "track", opts.TrackIndex, "format", format, "error", err)
+			slog.Log(ctx, slog.LevelWarn, "subtitle cache warm commit failed",
+				subtitleTraceAttrs(ctx, opts.SourceCodec, SubtitleTracePhaseWarm, counter.bytes, SubtitleTraceOutcomeCommitFailed, time.Since(start),
+					"input", opts.InputPath, "track", opts.TrackIndex, "format", format, "error", err)...)
 			return
 		}
 		c.noteWarmOutcome(key, true, time.Now())
-		logSubtitleTrace(ctx, slog.LevelInfo, "subtitle cache warm finished",
-			opts.SourceCodec, SubtitleTracePhaseWarm, counter.bytes, SubtitleTraceOutcomeCommitted, time.Since(start),
-			"input", opts.InputPath, "track", opts.TrackIndex, "format", format)
+		slog.Log(ctx, slog.LevelInfo, "subtitle cache warm finished",
+			subtitleTraceAttrs(ctx, opts.SourceCodec, SubtitleTracePhaseWarm, counter.bytes, SubtitleTraceOutcomeCommitted, time.Since(start),
+				"input", opts.InputPath, "track", opts.TrackIndex, "format", format)...)
 	}()
 	return done
 }
@@ -955,9 +955,9 @@ func (c *SubtitleCache) ExtractText(ctx context.Context, inputPath string, track
 		return nil, fmt.Errorf("unsupported cached subtitle format")
 	}
 	if data, ok := c.LookupText(inputPath, trackIndex, format); ok {
-		logSubtitleTrace(ctx, slog.LevelDebug, "subtitle text served from cache",
-			"", SubtitleTracePhaseServe, int64(len(data)), SubtitleTraceOutcomeCacheHit, -1,
-			"track", trackIndex, "format", format)
+		slog.Log(ctx, slog.LevelDebug, "subtitle text served from cache",
+			subtitleTraceAttrs(ctx, "", SubtitleTracePhaseServe, int64(len(data)), SubtitleTraceOutcomeCacheHit, -1,
+				"track", trackIndex, "format", format)...)
 		return data, nil
 	}
 	fill := c.beginFill(inputPath, "", trackIndex, format)
@@ -972,9 +972,9 @@ func (c *SubtitleCache) ExtractText(ctx context.Context, inputPath string, track
 		// Tee records cache write failures; its destination io.Discard cannot fail.
 		_, _ = fill.Tee(io.Discard).Write(data)
 		if err := fill.Commit(); err != nil {
-			logSubtitleTrace(ctx, slog.LevelWarn, "subtitle cache commit failed",
-				"", SubtitleTracePhaseWarm, int64(len(data)), SubtitleTraceOutcomeCommitFailed, -1,
-				"track", trackIndex, "format", format, "error", err)
+			slog.Log(ctx, slog.LevelWarn, "subtitle cache commit failed",
+				subtitleTraceAttrs(ctx, "", SubtitleTracePhaseWarm, int64(len(data)), SubtitleTraceOutcomeCommitFailed, -1,
+					"track", trackIndex, "format", format, "error", err)...)
 		}
 	}
 	return data, nil

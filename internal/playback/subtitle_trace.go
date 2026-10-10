@@ -3,7 +3,6 @@ package playback
 import (
 	"context"
 	"io"
-	"log/slog"
 	"net/http"
 	"time"
 
@@ -85,14 +84,13 @@ func subtitleTraceFields(ctx context.Context, codec, phase string, bytes int64, 
 	return attrs
 }
 
-// logSubtitleTrace emits one subtitle trace line. extra carries phase-specific
-// fields (track, seek, input, format, error, …) without disturbing the shared
-// set. It is the single seam every subtitle phase logs through, so the fields
-// cannot drift between the cache, the extract and the notifier.
-func logSubtitleTrace(ctx context.Context, level slog.Level, msg, codec, phase string, bytes int64, outcome string, elapsed time.Duration, extra ...any) {
+// subtitleTraceAttrs is the common field set plus any phase-specific fields.
+// Call sites pass it to a slog call whose message is a literal, so the fixed
+// field set cannot drift between the cache, the extract and the notifier while
+// sloglint keeps the message constant.
+func subtitleTraceAttrs(ctx context.Context, codec, phase string, bytes int64, outcome string, elapsed time.Duration, extra ...any) []any {
 	attrs := subtitleTraceFields(ctx, codec, phase, bytes, outcome, elapsed)
-	attrs = append(attrs, extra...)
-	slog.Log(ctx, level, msg, attrs...)
+	return append(attrs, extra...)
 }
 
 // subtitlePhaseForOutput names the phase an extract of codec runs under for the
@@ -102,7 +100,7 @@ func logSubtitleTrace(ctx context.Context, level slog.Level, msg, codec, phase s
 // so the trace can never disagree with what actually ran.
 func subtitlePhaseForOutput(codec, targetFormat string) string {
 	outCodec, _ := streamExtractOutput(codec, targetFormat)
-	if outCodec == "copy" {
+	if outCodec == codecCopyV3 {
 		return SubtitleTracePhaseFetch
 	}
 	return SubtitleTracePhaseConvert
