@@ -162,6 +162,81 @@ func TestVirtualPrepareIsRequesterScoped(t *testing.T) {
 	}
 }
 
+// TestVirtualPrepareSharedConsumerCompletesAfterOneAbort covers the shared
+// consumer contract end to end: profile A aborts its poll (the real client
+// DELETE path) while profile B still waits on the same job. The server-side
+// abandonment check must keep the job, and B must still receive the finished
+// artifact once it is ready — a client abort is not a server abort.
+func TestVirtualPrepareSharedConsumerCompletesAfterOneAbort(t *testing.T) {
+	vf := seedVirtualPrepareFixture(t)
+	f := vf.f
+	ctx := context.Background()
+
+	arepo := NewArtifactRepository(f.pool)
+	t.Cleanup(func() {
+		_, _ = f.pool.Exec(ctx, `DELETE FROM download_artifacts WHERE media_file_id = $1`, vf.virtualFileID)
+	})
+	artifact := newArtifact(t, vf.virtualFileID, fmt.Sprintf("hash-shared-%d", time.Now().UnixNano()))
+	if _, _, err := arepo.EnsureQueued(ctx, artifact); err != nil {
+		t.Fatalf("ensure virtual artifact: %v", err)
+	}
+
+	now := time.Now()
+	mkRow := func(profile, device string) string {
+		id := fmt.Sprintf("dl-shared-%d-%s", now.UnixNano(), profile)
+		if err := f.repo.Create(ctx, &Download{
+			ID: id, UserID: f.userID, ProfileID: profile, DeviceID: device,
+			MediaFileID: vf.virtualFileID, ContentID: f.contentID, Kind: KindQueued,
+			Status: StatusPreparing, Format: FormatOriginal, ArtifactID: artifact.ID,
+			CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create %s row: %v", profile, err)
+		}
+		return id
+	}
+	rowA := mkRow(f.profileA, f.deviceA)
+	rowB := mkRow(f.profileB, f.deviceB)
+
+	mgr := &ArtifactManager{repo: arepo}
+	svc := &Service{repo: f.repo, artifacts: mgr}
+
+	// Profile A aborts its poll through the real DELETE path: it deletes A's
+	// row and asks the pipeline to release an abandoned job. B still links the
+	// job, so the abandonment check must leave it running.
+	if err := svc.Delete(ctx, f.userID, f.profileA, f.deviceA, rowA); err != nil {
+		t.Fatalf("abort profile A: %v", err)
+	}
+	if _, err := arepo.GetByID(ctx, artifact.ID); err != nil {
+		t.Fatalf("one abort released the shared job B still waits on: %v", err)
+	}
+	if got, err := svc.Get(ctx, f.userID, f.profileB, f.deviceB, rowB); err != nil || got.Status != StatusPreparing {
+		t.Fatalf("profile B row after A's abort = %+v (%v), want preparing", got, err)
+	}
+
+	// The shared job finishes: B's still-live row is the one flipped to ready,
+	// and A's aborted row stays gone.
+	if _, err := arepo.ClaimNext(ctx, "worker-shared", time.Minute); err != nil {
+		t.Fatalf("claim shared artifact: %v", err)
+	}
+	if applied, err := arepo.MarkReady(ctx, artifact.ID, "worker-shared", artifact.OutputPath, 0, "", "", "", 4096, nil); err != nil || !applied {
+		t.Fatalf("MarkReady shared artifact = (%v, %v), want (true, nil)", applied, err)
+	}
+	flipped, err := f.repo.MarkLinkedDownloadsReady(ctx, artifact.ID, 4096)
+	if err != nil {
+		t.Fatalf("flip linked downloads: %v", err)
+	}
+	if len(flipped) != 1 || flipped[0].ID != rowB {
+		t.Fatalf("flipped = %+v, want exactly profile B's row", flipped)
+	}
+	got, err := svc.Get(ctx, f.userID, f.profileB, f.deviceB, rowB)
+	if err != nil || got.Status != StatusReady || got.FileSize != 4096 {
+		t.Fatalf("profile B finished row = %+v (%v), want ready size=4096", got, err)
+	}
+	if _, err := svc.Get(ctx, f.userID, f.profileA, f.deviceA, rowA); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("aborted profile A row err = %v, want ErrNotFound", err)
+	}
+}
+
 // TestCancelAbandonedPrepareStopsLocalAttempt covers the cancel-from-this-worker
 // half of the cancel-vs-attach race: an abandoned running job is deleted and the
 // attempt this replica runs is canceled at once. A worker on another replica has

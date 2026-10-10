@@ -217,6 +217,12 @@ func TestRequestExecutionFingerprintUsesCanonicalInputForVirtualTitles(t *testin
 	if got := changedQuality.ExecutionFingerprint(); got == want {
 		t.Fatal("a quality change did not change execution fingerprint")
 	}
+	// Selecting a different audio track is a different recipe, so it moves too.
+	changedTrack := base
+	changedTrack.AudioTrackIndex = 1
+	if got := changedTrack.ExecutionFingerprint(); got == want {
+		t.Fatal("a track change did not change execution fingerprint")
+	}
 
 	// A local file carries no canonical path and must be unaffected by the
 	// canonicalization: the same request with and without an (impossible)
