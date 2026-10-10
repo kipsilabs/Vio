@@ -51,6 +51,10 @@ interface SubtitleMenuProps {
    * evidence, so the menu says so instead of presenting every row as final.
    */
   provisional?: boolean;
+  /** True while the deferred track enumeration is still running. */
+  pending?: boolean;
+  /** True when track discovery terminally failed or timed out. */
+  failed?: boolean;
   /** Timing and sync state of the file's syncable tracks (stored and sidecar files). */
   subtitleSync?: SubtitleSync;
 }
@@ -86,6 +90,8 @@ export function SubtitleMenu({
   audioTracks,
   locked = false,
   provisional = false,
+  pending = false,
+  failed = false,
   subtitleSync,
 }: SubtitleMenuProps) {
   const [open, setOpen] = useState(false);
@@ -230,7 +236,8 @@ export function SubtitleMenu({
     items[nextIndex]?.focus();
   }, []);
 
-  if (tracks.length === 0 && !mediaFileId) return null;
+  if (tracks.length === 0 && !mediaFileId && !provisional && !pending && !failed && !menuOpen)
+    return null;
 
   let menuItemIndex = 0;
 
@@ -285,6 +292,23 @@ export function SubtitleMenu({
             {provisional && <ProvisionalTrackBadge />}
           </div>
           <div className="max-h-[60vh] overflow-y-auto py-1">
+            {failed && sortedTracks.length === 0 && (
+              <div className="px-3 py-1 text-xs text-amber-300/80">Subtitle discovery failed</div>
+            )}
+            {failed && sortedTracks.length > 0 && (
+              <div className="px-3 py-1 text-xs text-white/50">
+                Showing available subtitles — discovery did not complete
+              </div>
+            )}
+            {!failed && (pending || provisional) && (
+              <div className="flex items-center gap-2 px-3 py-1 text-xs text-white/50">
+                <span className="h-3 w-3 animate-spin rounded-full border border-white/20 border-t-white/80" />
+                <span>Discovering subtitles…</span>
+              </div>
+            )}
+            {sortedTracks.length === 0 && !failed && !pending && !provisional && (
+              <div className="px-3 py-2 text-xs text-white/40">No subtitles available</div>
+            )}
             {sortedTracks.map((track) => {
               const isActive = track.index === activeIndex;
               const languageName = getLanguageName(track.language);

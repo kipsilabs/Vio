@@ -170,6 +170,16 @@ export const FEATURE_SOURCE_COMMITTED_V3 = "source_committed_event_v1";
  */
 export const FEATURE_INVENTORY_UPDATED_V3 = "inventory_updated_event_v1";
 
+/**
+ * The client handles a plan that defers its full track enumeration: it reads
+ * `tracks_pending` and `inventory_url` on the plan and keeps the provisional
+ * menu until the follow-up `inventory_updated` push (or a poll of the inventory
+ * URL) lands. The server only marks plans provisional for a client that sends
+ * this token, and a reused attempt that crossed surfaces without it is
+ * rejected, so advertising it is a promise to keep the loading state.
+ */
+export const FEATURE_DEFERRED_TRACK_INVENTORY_V3 = "deferred_track_inventory_v1";
+
 /** The `original` rung label, which always preserves the source. */
 export const QUALITY_ORIGINAL_V3 = "original";
 
@@ -707,6 +717,28 @@ export interface PlanV3 {
    * stamp-derived `inventory_status`.
    */
   inventory_provenance?: string;
+  /**
+   * True when the plan's audio and subtitle inventory is deliberately
+   * provisional: the first-byte URL was handed back with the minimal recipe
+   * and the full enumeration is still being probed. The menus must stay in
+   * their loading state until the follow-up `inventory_updated` push (or a
+   * poll of `inventory_url`) replaces the provisional list. Only set on plans
+   * whose client negotiated the deferred track-inventory lifecycle; never
+   * changes selection or the executable recipe.
+   */
+  tracks_pending?: boolean;
+  /**
+   * Relative URL the client polls (with ETag/If-None-Match) for the refreshed
+   * audio and subtitle inventory without replanning. Present exactly when the
+   * plan defers its enumeration.
+   */
+  inventory_url?: string;
+  /**
+   * The opaque inventory revision the plan was built from. A client that polls
+   * `inventory_url` echoes it as an ETag; a 304 means the deferred probe has
+   * not landed yet.
+   */
+  inventory_revision?: string;
   /**
    * The catalog row the client asked for when the effective release differs
    * from it. Absent when the effective row is the requested one. It lets the

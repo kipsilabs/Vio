@@ -704,8 +704,83 @@ function WatchPagePlayer({
     [applyCommittedSource, refreshSubtitles],
   );
 
+  // Dedicated deferred-inventory polling loop for plans that promised enumeration
+  // on `inventory_url`: polls that endpoint directly with If-None-Match ETag.
   useEffect(() => {
-    if (!session.sessionId || !session.mediaFileId || session.loading || session.replacing) {
+    if (
+      !session.sessionId ||
+      !session.mediaFileId ||
+      session.loading ||
+      session.replacing ||
+      !session.inventoryPending ||
+      !session.inventoryUrl
+    ) {
+      return;
+    }
+
+    const sessionId = session.sessionId;
+    const inventoryUrl = session.inventoryUrl;
+    let cancelled = false;
+    let completedAttempts = 0;
+    let scheduledAttempts = 0;
+    let timer: number | null = null;
+    const deadline = Date.now() + INVENTORY_REFRESH_DEADLINE_MS;
+
+    const scheduleNextPoll = () => {
+      if (cancelled) return;
+      const current = sessionRef.current;
+      if (
+        current.sessionId !== sessionId ||
+        !current.inventoryPending ||
+        current.inventoryUrl !== inventoryUrl
+      ) {
+        return;
+      }
+      if (completedAttempts >= INVENTORY_REFRESH_MAX_ATTEMPTS || Date.now() >= deadline) {
+        sessionRef.current.markInventoryExhausted();
+        return;
+      }
+      const delay = inventoryPollDelayMs(scheduledAttempts, false);
+      if (delay === 0) return;
+      scheduledAttempts += 1;
+      timer = window.setTimeout(() => void poll(), delay);
+    };
+
+    const poll = async () => {
+      let done = false;
+      try {
+        done = await sessionRef.current.pollInventory();
+      } catch {
+        done = false;
+      }
+      if (cancelled) return;
+      completedAttempts += 1;
+      if (!done) scheduleNextPoll();
+    };
+
+    scheduleNextPoll();
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [
+    session.inventoryPending,
+    session.inventoryUrl,
+    session.loading,
+    session.mediaFileId,
+    session.replacing,
+    session.sessionId,
+  ]);
+
+  // Legacy catalog watch-detail poll for older plans that do not carry inventory_url.
+  useEffect(() => {
+    if (
+      !session.sessionId ||
+      !session.mediaFileId ||
+      session.loading ||
+      session.replacing ||
+      session.inventoryPending
+    ) {
       return;
     }
 
@@ -917,6 +992,7 @@ function WatchPagePlayer({
     refreshSubtitles,
     session.audioInventoryProvisional,
     session.effectiveVirtualUri,
+    session.inventoryPending,
     session.loading,
     session.mediaFileId,
     session.replacing,
@@ -1431,6 +1507,8 @@ function WatchPagePlayer({
         onAudioSelect={handleSwitchAudio}
         audioInventoryProvisional={session.audioInventoryProvisional}
         subtitleInventoryProvisional={session.subtitleInventoryProvisional}
+        inventoryPending={session.inventoryPending}
+        inventoryFailed={session.inventoryFailed}
         onSubtitleChanged={handleSubtitleChanged}
         onReturnFromPostRoll={onReturnFromPostRoll}
         watchTogetherRoomId={watchTogetherRoomId}

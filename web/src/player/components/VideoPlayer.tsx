@@ -324,6 +324,10 @@ interface VideoPlayerProps {
   audioInventoryProvisional?: boolean;
   /** True while the server's subtitle inventory is declared, not probed. */
   subtitleInventoryProvisional?: boolean;
+  /** True while deferred track enumeration is still running. */
+  inventoryPending?: boolean;
+  /** True when track discovery terminally failed or timed out. */
+  inventoryFailed?: boolean;
   onSubtitleChanged?: (index: number | null, inventoryTrack?: SubtitleInventoryItemV3) => void;
   onExit: (state?: PlaybackExitState) => void | Promise<void>;
   onMinimize?: (state?: PlaybackExitState) => void | Promise<void>;
@@ -517,6 +521,8 @@ export function VideoPlayer({
   onAudioSelect,
   audioInventoryProvisional = false,
   subtitleInventoryProvisional = false,
+  inventoryPending = false,
+  inventoryFailed = false,
   onSubtitleChanged,
   onExit,
   onMinimize,
@@ -4965,6 +4971,8 @@ export function VideoPlayer({
           onAudioSelect={onAudioSelect}
           trackMenusLocked={replacing || replanning}
           audioInventoryProvisional={audioInventoryProvisional}
+          inventoryPending={inventoryPending}
+          inventoryFailed={inventoryFailed}
           qualityOptions={qualityOptions}
           activeQualityId={activeQualityId}
           deliveredRecipe={plan.effective_recipe}

@@ -28,4 +28,16 @@ describe("isInventoryProvisional", () => {
     expect(isInventoryProvisional(undefined, undefined)).toBe(false);
     expect(isInventoryProvisional("", "")).toBe(false);
   });
+
+  it("treats tracks_pending as provisional even over verified stamp and provenance", () => {
+    expect(isInventoryProvisional("verified", "verified", true)).toBe(true);
+    expect(isInventoryProvisional("declared", "declared", true)).toBe(true);
+    expect(isInventoryProvisional(undefined, undefined, true)).toBe(true);
+  });
+
+  it("ignores an absent or false tracks_pending flag", () => {
+    expect(isInventoryProvisional("verified", "verified", false)).toBe(false);
+    expect(isInventoryProvisional("verified", "verified", undefined)).toBe(false);
+    expect(isInventoryProvisional("verified", "verified", null)).toBe(false);
+  });
 });

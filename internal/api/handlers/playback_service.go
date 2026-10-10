@@ -171,9 +171,16 @@ type PlaybackRouteEventCommand struct {
 	Event   playback.RouteEventV3
 }
 
-func (h *PlaybackHandler) validatePlaybackCaller(ctx context.Context, caller PlaybackCaller) error {
+func (h *PlaybackHandler) validatePlaybackViewer(ctx context.Context, caller PlaybackCaller) error {
 	if caller.UserID <= 0 || caller.UserID != apimw.GetUserID(ctx) || caller.ProfileID == "" || caller.ProfileID != apimw.GetProfileID(ctx) {
 		return playbackOperationError(http.StatusForbidden, "forbidden", "Playback identity does not match the authenticated profile")
+	}
+	return nil
+}
+
+func (h *PlaybackHandler) validatePlaybackCaller(ctx context.Context, caller PlaybackCaller) error {
+	if err := h.validatePlaybackViewer(ctx, caller); err != nil {
+		return err
 	}
 	if h.InstallationID == "" {
 		return playbackOperationError(http.StatusConflict, "capability_not_configured", "Playback installation identity is not configured")
@@ -859,8 +866,13 @@ func (h *PlaybackHandler) ReportRouteEventV2(ctx context.Context, caller Playbac
 }
 
 // GetPlaybackInventoryV2 returns the live audio and subtitle track inventory for an active session.
+// It is a session-scoped read, not a mutation: ownership is enforced against
+// the stored live session below (the attempt row is required but not an
+// ownership check), so a caller from a stale installation (e.g. capabilities
+// cached across a server restart) still resolves its pending track inventory
+// instead of 409-looping on installation_changed.
 func (h *PlaybackHandler) GetPlaybackInventoryV2(ctx context.Context, caller PlaybackCaller, sessionID string) (playback.PlaybackInventoryV3, error) {
-	if err := h.validatePlaybackCaller(ctx, caller); err != nil {
+	if err := h.validatePlaybackViewer(ctx, caller); err != nil {
 		return playback.PlaybackInventoryV3{}, err
 	}
 	if err := validatePlaybackSessionID(sessionID); err != nil {
