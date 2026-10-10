@@ -39,28 +39,32 @@ func virtualTraceFieldsToMap(t *testing.T, fields []any) map[string]any {
 // the displayed stage durations.
 func TestVirtualResolveTraceRanVersusZero(t *testing.T) {
 	trace := &virtualResolveTrace{
-		started: time.Now(),
-		list:    3 * time.Millisecond,
-		listRan: true,
-		resolve: time.Millisecond,
+		started:  time.Now(),
+		list:     3 * time.Millisecond,
+		listRan:  true,
+		fetch:    2 * time.Millisecond,
+		fetchRan: true,
+		resolve:  time.Millisecond,
 		// Ran, but below the millisecond resolution the field reports.
 		probe:      500 * time.Microsecond,
 		probeRan:   true,
 		resolveRan: true,
 	}
-	if got := trace.totalMS(); got != 4 {
-		t.Fatalf("totalMS = %d, want 4", got)
+	if got := trace.totalMS(); got != 6 {
+		t.Fatalf("totalMS = %d, want 6", got)
 	}
 
 	fields := virtualTraceFieldsToMap(t, trace.fields())
 	for key, want := range map[string]any{
 		"list_ran":    true,
 		"list_ms":     int64(3),
+		"fetch_ran":   true,
+		"fetch_ms":    int64(2),
 		"resolve_ran": true,
 		"resolve_ms":  int64(1),
 		"probe_ran":   true,
 		"probe_ms":    int64(0), // ran in under 1 ms, still a measurement
-		"total_ms":    int64(4),
+		"total_ms":    int64(6),
 	} {
 		if got := fields[key]; got != want {
 			t.Fatalf("%s = %#v, want %#v", key, got, want)
@@ -153,6 +157,17 @@ func TestResolveVirtualTimingReportsRanStages(t *testing.T) {
 	if entry["probe_ran"] != false {
 		t.Fatalf("probe_ran = %#v, want false on a deferred-probe start", entry["probe_ran"])
 	}
+	// This test drives a stub lister that never contacts the resolver, so it
+	// must report no provider discovery rather than a fabricated zero.
+	if entry["fetch_ran"] != false {
+		t.Fatalf("fetch_ran = %#v, want false when the lister never fetched", entry["fetch_ran"])
+	}
+	if calls, _ := entry["fetch_calls"].(float64); calls != 0 {
+		t.Fatalf("fetch_calls = %#v, want 0", entry["fetch_calls"])
+	}
+	if _, present := entry["fetch_ms"]; present {
+		t.Fatal("fetch_ms present for a stage that did not run")
+	}
 	if entry["fast_path"] != false {
 		t.Fatalf("fast_path = %#v, want false", entry["fast_path"])
 	}
@@ -168,7 +183,7 @@ func TestResolveVirtualTimingReportsRanStages(t *testing.T) {
 	}
 
 	var sum float64
-	for _, stage := range []string{"list_ms", "resolve_ms", "probe_ms", "fallback_ms"} {
+	for _, stage := range []string{"list_ms", "fetch_ms", "resolve_ms", "probe_ms", "fallback_ms"} {
 		if value, ok := entry[stage].(float64); ok {
 			sum += value
 		}
@@ -203,7 +218,7 @@ func TestResolveVirtualTimingFlagsFastPathWithoutRanStages(t *testing.T) {
 	if total, _ := entry["total_ms"].(float64); total != 0 {
 		t.Fatalf("total_ms = %#v, want 0", entry["total_ms"])
 	}
-	for _, stage := range []string{"list", "resolve", "probe", "fallback"} {
+	for _, stage := range []string{"list", "fetch", "resolve", "probe", "fallback"} {
 		if entry[stage+"_ran"] != false {
 			t.Fatalf("%s_ran = %#v, want false on the fast path", stage, entry[stage+"_ran"])
 		}

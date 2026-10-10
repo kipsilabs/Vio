@@ -1537,6 +1537,21 @@ type virtualResolveTrace struct {
 	list    time.Duration
 	listRan bool
 
+	// fetch is the provider discovery time the resolve actually paid: the sum
+	// of the provider listing attempts the resolver performed on this request's
+	// context. It is measured by the resolver's provider-fetch observer rather
+	// than inferred from the enclosing stage, and it is excluded from list and
+	// resolve so the stages below do not double-count the same wall time.
+	// fetchRan distinguishes "no discovery" from "discovery in under a
+	// millisecond", exactly like the other stages.
+	fetch    time.Duration
+	fetchRan bool
+	// fetchCalls counts the provider listing attempts this resolve performed.
+	// A repeated start with a reusable resolution reports zero; a concurrent
+	// start that shared another request's flight also reports zero because the
+	// observer only fires for a fetch this request's context initiated.
+	fetchCalls int
+
 	resolve    time.Duration
 	resolveRan bool
 
@@ -1564,9 +1579,12 @@ type virtualResolveTrace struct {
 
 // totalMS is the sum of the stage durations that ran, using the same rounded
 // millisecond values the per-stage fields report, so total_ms equals
-// list_ms+resolve_ms+probe_ms+fallback_ms exactly.
+// list_ms+fetch_ms+resolve_ms+probe_ms+fallback_ms exactly. fetch is a stage
+// carved out of list and resolve (the enclosing stages are recorded net of the
+// discovery they paid), so adding it does not double-count provider time.
 func (t *virtualResolveTrace) totalMS() int64 {
 	return t.list.Milliseconds() +
+		t.fetch.Milliseconds() +
 		t.resolve.Milliseconds() +
 		t.probe.Milliseconds() +
 		t.fallback.Milliseconds()
@@ -1609,6 +1627,7 @@ func (t *virtualResolveTrace) fieldsWithContext(ctx context.Context) []any {
 		"elapsed_ms", elapsedMS,
 		"total_ms", t.totalMS(), //nolint:goconst // log attribute key/value, kept inline for readability.
 		"candidates", t.candidates, //nolint:goconst // log attribute key/value, kept inline for readability.
+		"fetch_calls", t.fetchCalls,
 		"cache_hit", t.cached,
 		"listed", t.listed,
 		"fast_path", t.fastPath,
@@ -1623,6 +1642,7 @@ func (t *virtualResolveTrace) fieldsWithContext(ctx context.Context) []any {
 		d    time.Duration
 	}{
 		{"list", t.listRan, t.list},          //nolint:goconst // log attribute key/value, kept inline for readability.
+		{"fetch", t.fetchRan, t.fetch},       //nolint:goconst // log attribute key/value, kept inline for readability.
 		{"resolve", t.resolveRan, t.resolve}, //nolint:goconst // log attribute key/value, kept inline for readability.
 		{"probe", t.probeRan, t.probe},
 		{"fallback", t.fallbackRan, t.fallback},
@@ -1643,6 +1663,41 @@ func (t *virtualResolveTrace) log(ctx context.Context, file *models.MediaFile) {
 	attrs := []any{logComponentKey, "api", "content_id", file.ContentID} //nolint:goconst // log attribute key/value, kept inline for readability.
 	attrs = append(attrs, t.fieldsWithContext(ctx)...)
 	slog.InfoContext(ctx, "virtual resolve timing", attrs...)
+}
+
+// observeVirtualProviderFetches installs a provider-fetch observer on ctx and
+// returns it with a snapshot function reporting the discovery duration and
+// listing-attempt count observed so far. The observer fires only for fetches
+// this request's context initiated: a fetch served from the resolver cache, or
+// one this request merely waited on from another request's flight, reports
+// nothing. The snapshot delta lets the enclosing stage (listing or resolution)
+// report its wall time net of discovery, so the fetch stage names the provider
+// cost exactly once instead of hiding it under a probe or resolve label.
+func observeVirtualProviderFetches(ctx context.Context) (context.Context, func() (time.Duration, int)) {
+	var mu sync.Mutex
+	var total time.Duration
+	var calls int
+	ctx = resolver.WithProviderFetchObserver(ctx, func(ev resolver.ProviderFetchEvent) {
+		mu.Lock()
+		total += ev.Duration
+		calls++
+		mu.Unlock()
+	})
+	return ctx, func() (time.Duration, int) {
+		mu.Lock()
+		defer mu.Unlock()
+		return total, calls
+	}
+}
+
+// virtualStageNetElapsed is a stage's wall time minus the provider discovery
+// it paid, floored at zero so a late observer cannot make a stage negative.
+func virtualStageNetElapsed(start time.Time, discovery time.Duration) time.Duration {
+	elapsed := time.Since(start) - discovery
+	if elapsed < 0 {
+		return 0
+	}
+	return elapsed
 }
 
 // resolveVirtualPlaybackSource chooses a ranked provider-neutral result,
@@ -2134,6 +2189,11 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	// deliberately re-bases off r.Context() and is not bounded by this.
 	coldCtx, coldCancel := context.WithTimeout(r.Context(), virtualStartupBudget)
 	defer coldCancel()
+	// Attribute provider discovery to its own stage: the observer fires once per
+	// provider listing this cold path initiates, so the enclosing list/resolve
+	// stages can report their wall time net of discovery and a repeat start can
+	// show fetch_calls=0 instead of hiding the cost under a probe label.
+	coldCtx, fetchSnapshot := observeVirtualProviderFetches(coldCtx)
 	// Candidate selection (listing) must not be able to
 	// consume the resolve/probe attempt's budget. It runs under a staging
 	// deadline that stops at half the cold budget, reserving the other half for
@@ -2263,6 +2323,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		((exclusionPending || requestedRowUnusable) && !cachedListing)) && persistedResumeURI == "" && !emptySuppressed && h.VirtualPlaybackStreamLister != nil {
 		trace.listed = true
 		trace.listRan = true
+		fetchBeforeDur, fetchBeforeCalls := fetchSnapshot()
 		listStart := time.Now()
 		// Candidate listing is part of the startup critical path. Keep it
 		// bounded so the first-byte SLA cannot be defeated before resolution,
@@ -2274,6 +2335,9 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		streams, err := h.VirtualPlaybackStreamLister.ListVirtualPlaybackStreams(
 			listCtx, file.FilePath, userID, profileID, file.VirtualOwnerInstallationID,
 		)
+		listDiscovery, listCalls := fetchSnapshot()
+		listDiscovery -= fetchBeforeDur
+		listCalls -= fetchBeforeCalls
 		listAnswered := err == nil && len(streams) > 0
 		if listAnswered {
 			virtualEmptyListClear(emptyListKey)
@@ -2351,7 +2415,17 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			}
 		}
 		cancel()
-		trace.list = time.Since(listStart)
+		// Report the listing as its wall time net of the provider discovery it
+		// paid, and move that discovery into the fetch stage. A listing served
+		// entirely from the resolver cache contributes nothing here.
+		trace.list = virtualStageNetElapsed(listStart, listDiscovery)
+		if listDiscovery > 0 {
+			trace.fetch += listDiscovery
+			trace.fetchRan = true
+		}
+		if listCalls > 0 {
+			trace.fetchCalls += listCalls
+		}
 	}
 	maxAttempts := h.maxVirtualFailoverAttempts(r.Context())
 	if noResult {
@@ -2595,6 +2669,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		var resolvedIdentity virtualProbeIdentity
 		resolvedRematched := false
 		trace.resolveRan = true
+		resolveFetchBeforeDur, resolveFetchBeforeCalls := fetchSnapshot()
 		resolveStart := time.Now()
 		// probedCandidateID is the candidate this iteration asked the resolver
 		// for. A fresh-selection fall-through can return a different one; when
@@ -2688,7 +2763,17 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		} else {
 			resolveErr = errors.New("virtual playback resolver is not configured")
 		}
-		trace.resolve += time.Since(resolveStart)
+		resolveDiscovery, resolveCalls := fetchSnapshot()
+		resolveDiscovery -= resolveFetchBeforeDur
+		resolveCalls -= resolveFetchBeforeCalls
+		trace.resolve += virtualStageNetElapsed(resolveStart, resolveDiscovery)
+		if resolveDiscovery > 0 {
+			trace.fetch += resolveDiscovery
+			trace.fetchRan = true
+		}
+		if resolveCalls > 0 {
+			trace.fetchCalls += resolveCalls
+		}
 		if resolveErr != nil {
 			return nil, resolveErr
 		}
