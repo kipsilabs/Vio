@@ -280,6 +280,7 @@ func TestResolveResolutionlessMergesIntoBaseline(t *testing.T) {
 	lister := VirtualPlaybackStreamListerFunc(func(_ context.Context, _ string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
 		return []VirtualPlaybackStream{{
 			ID: "cand-merge", URI: uri, CodecVideo: "h264", CodecAudio: "aac", Container: "mkv",
+			AudioLanguages: []string{"eng"},
 		}}, nil
 	})
 	probeStarted := make(chan struct{})
@@ -343,6 +344,7 @@ func TestResolveVirtualProbeFailureBaselineForResolutionless(t *testing.T) {
 	lister := VirtualPlaybackStreamListerFunc(func(_ context.Context, _ string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
 		return []VirtualPlaybackStream{{
 			ID: "cand-baseline", URI: uri, CodecAudio: "aac", Container: "mkv",
+			AudioLanguages: []string{"eng"},
 		}}, nil
 	})
 	probeCalls := 0
