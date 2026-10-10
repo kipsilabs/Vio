@@ -154,8 +154,10 @@ func StreamExtractSubtitle(ctx context.Context, opts StreamExtractOpts) error {
 	}
 
 	// Copy stdout → writer with per-chunk flush so the browser receives
-	// cues as they're produced rather than at ffmpeg exit.
-	copyErr := copyAndFlush(opts.Writer, stdout)
+	// cues as they're produced rather than at ffmpeg exit. Count the bytes on
+	// the way through so the trace reports what actually moved.
+	counter := &subtitleCountingWriter{w: opts.Writer}
+	copyErr := copyAndFlush(counter, stdout)
 	if copyErr != nil {
 		// A failed response writer need not cancel the request context (for
 		// example, a write deadline). Stop the producer before waiting: it
@@ -164,11 +166,22 @@ func StreamExtractSubtitle(ctx context.Context, opts StreamExtractOpts) error {
 	}
 
 	waitErr := cmd.Wait()
-	slog.DebugContext(ctx, "subtitle stream extract finished", "component", "playback",
-		"track", opts.TrackIndex,
-		"seek", opts.SeekSeconds,
-		"elapsed_ms", time.Since(start).Milliseconds(),
-		"ffmpeg_err", waitErr,
+	var extractErr error
+	switch {
+	case waitErr != nil:
+		extractErr = waitErr
+	case copyErr != nil:
+		extractErr = copyErr
+	}
+	outcome := subtitleTraceOutcome(ctx, extractErr)
+	level := slog.LevelInfo
+	if outcome != SubtitleTraceOutcomeSuccess {
+		level = slog.LevelWarn
+	}
+	logSubtitleTrace(ctx, level, "subtitle stream extract finished",
+		opts.SourceCodec, subtitlePhaseForOutput(opts.SourceCodec, opts.TargetFormat),
+		counter.bytes, outcome, time.Since(start),
+		"track", opts.TrackIndex, "seek", opts.SeekSeconds, "ffmpeg_err", waitErr,
 	)
 
 	if ctx.Err() != nil {

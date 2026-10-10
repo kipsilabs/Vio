@@ -191,12 +191,14 @@ func (c *SubtitleCache) WarmTextTracks(inputPath string, tracks []TextSubtitleTr
 		defer cancel()
 		start := time.Now()
 		if err := commitTextFills(ctx, inputPath, fills, batch); err != nil {
-			slog.Warn("subtitle text warm failed", "input", inputPath, "tracks", len(fills),
-				"elapsed_ms", time.Since(start).Milliseconds(), "error", err)
+			logSubtitleTrace(ctx, slog.LevelWarn, "subtitle text warm failed",
+				"", SubtitleTracePhaseWarm, SubtitleTraceBytesUnknown, subtitleTraceOutcome(ctx, err), time.Since(start),
+				"input", inputPath, "tracks", len(fills), "error", err)
 			return
 		}
-		slog.Info("subtitle text warm finished", "input", inputPath, "tracks", len(fills),
-			"elapsed_ms", time.Since(start).Milliseconds())
+		logSubtitleTrace(ctx, slog.LevelInfo, "subtitle text warm finished",
+			"", SubtitleTracePhaseWarm, SubtitleTraceBytesUnknown, SubtitleTraceOutcomeCommitted, time.Since(start),
+			"input", inputPath, "tracks", len(fills))
 	}()
 }
 
@@ -241,7 +243,8 @@ func commitTextFills(ctx context.Context, inputPath string, fills []textFill, ba
 	}
 	for _, f := range fills {
 		if err := f.fill.Commit(); err != nil {
-			slog.WarnContext(ctx, "subtitle cache commit failed",
+			logSubtitleTrace(ctx, slog.LevelWarn, "subtitle cache commit failed",
+				"", SubtitleTracePhaseWarm, SubtitleTraceBytesUnknown, SubtitleTraceOutcomeCommitFailed, -1,
 				"input", inputPath, "track", f.track.Ordinal, "format", f.track.Format, "error", err)
 		}
 	}
