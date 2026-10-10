@@ -10,7 +10,11 @@ import {
   isDeadPlaybackSessionError,
   type PlaybackPolicyErrorDescription,
 } from "../playback-errors";
-import { isTransientPlayerRequestError, PlayerFetchError } from "../player-fetch";
+import {
+  isTransientPlayerRequestError,
+  PlayerFetchError,
+  playerFetchResponse,
+} from "../player-fetch";
 import { useCodecDetection } from "./useCodecDetection";
 import {
   buildClientCapabilitiesV3,
@@ -22,6 +26,7 @@ import { buildRouteEventV3 } from "../route-events-v3";
 import { reportSessionRouteEventV2 } from "../route-events-v2";
 import { replanV2 } from "../lifecycle-v2";
 import { takePlaybackIntent } from "../first-frame";
+import { playerV2Origin } from "../player-v2";
 import { buildPlayerStreamUrl } from "../stream-url";
 import { randomUUID } from "@/lib/uuid";
 import { matchSubtitleTrackAcrossVersions } from "../utils/subtitleSort";
@@ -67,6 +72,29 @@ interface PlaybackSessionState {
    * the quality menu — the client derives none of those itself any more.
    */
   plan: PlanV3 | null;
+  /**
+   * The live inventory revision folded into the menus, from the adopted plan
+   * or a later `inventory_updated` push. A poll of the plan's `inventory_url`
+   * echoes it as an ETag; a 304 means the deferred probe has not landed yet.
+   */
+  inventoryRevision: string | null;
+  /**
+   * The plan's inventory URL for a deferred enumeration, echoed from
+   * `playback_plan.inventory_url`. Present exactly when the plan defers.
+   */
+  inventoryUrl: string | null;
+  /**
+   * True while the deferred enumeration is still outstanding: the menus show
+   * their loading state. Cleared by a verified or failed terminal outcome
+   * (push or poll); never cleared by a 304 or a failed fetch.
+   */
+  inventoryPending: boolean;
+  /**
+   * True when probe discovery terminally failed or timed out: menus show an
+   * error state instead of spinning forever. Cleared if a verified revision
+   * arrives later.
+   */
+  inventoryFailed: boolean;
   /**
    * Bumped every time a new plan is adopted. Consumers key stream-reload
    * effects on it rather than on object identity.
@@ -610,6 +638,27 @@ export interface UsePlaybackSessionResult extends PlaybackSessionState {
     audioTracks: PlayerAudioTrack[],
   ) => void;
   /**
+   * The live deferred-inventory state for the adopted plan: the revision the
+   * menus were built from, the poll URL the plan promised, and whether the
+   * enumeration is still owed. The poll below reads it; pushes clear it.
+   */
+  inventoryRevision: string | null;
+  inventoryUrl: string | null;
+  inventoryPending: boolean;
+  inventoryFailed: boolean;
+  /**
+   * Marks deferred discovery exhausted after polling attempts or deadline
+   * time out, stopping the spinner and rendering an actionable failure state.
+   */
+  markInventoryExhausted: () => void;
+  /**
+   * Reads the session's live inventory from the plan's `inventory_url` with the
+   * folded revision as ETag. A 200 folds the verified (or failed) list through
+   * the same reducer the push path uses; a 304 leaves the loading state alone.
+   * Resolves true when the menus are no longer provisional.
+   */
+  pollInventory: () => Promise<boolean>;
+  /**
    * Adopts a live inventory revision from the realtime `inventory_updated`
    * event: the committed identity, its audio list, and the complete subtitle
    * inventory in one fold.
@@ -619,7 +668,7 @@ export interface UsePlaybackSessionResult extends PlaybackSessionState {
    * clears the provisional markers, and never bumps the plan or transport
    * revisions, so the stream keeps playing.
    */
-  applyInventoryUpdate: (payload: PlaybackInventoryUpdatedPayload) => void;
+  applyInventoryUpdate: (payload: PlaybackInventoryUpdatedPayload) => boolean;
   /** Keeps transport state current for output-capability replans. */
   updatePlaybackState: (positionSeconds: number, playing: boolean) => void;
   /**
@@ -778,17 +827,28 @@ function planToSessionState(
     playbackAttemptId,
     mediaFileId: plan.effective_media_file_id,
     effectiveVirtualUri: plan.effective_virtual_uri ?? null,
+    inventoryRevision: plan.inventory_revision ?? null,
+    inventoryUrl: plan.inventory_url ?? null,
+    // tracks_pending is the deferred signal: the enumeration is owed and the
+    // menus stay loading until a terminal outcome (push or poll) lands.
+    inventoryPending: plan.tracks_pending === true,
+    inventoryFailed: plan.inventory_status === "failed" || plan.inventory_provenance === "failed",
     initialPosition: plan.timeline.player_start_seconds,
     audioTrackIndex: plan.selected_tracks.audio?.index ?? 0,
     durationSeconds: plan.source.duration_seconds ?? null,
     planAudioTracks: plan.audio_tracks ?? [],
+    // tracks_pending is the explicit deferred signal and wins over the
+    // stamp/provenance fallback: the server sets it exactly when the plan's
+    // inventory is the provisional recipe and a follow-up is promised.
     audioInventoryProvisional: isInventoryProvisional(
       plan.inventory_status,
       plan.inventory_provenance,
+      plan.tracks_pending,
     ),
     subtitleInventoryProvisional: isInventoryProvisional(
       plan.inventory_status,
       plan.inventory_provenance,
+      plan.tracks_pending,
     ),
     subtitleUrls: mapSubtitleInventory(
       plan.subtitle.inventory,
@@ -908,6 +968,10 @@ export function usePlaybackSession(
     playbackAttemptId: null,
     mediaFileId: null,
     effectiveVirtualUri: null,
+    inventoryRevision: null,
+    inventoryUrl: null,
+    inventoryPending: false,
+    inventoryFailed: false,
     initialPosition: 0,
     audioTrackIndex: 0,
     durationSeconds: null,
@@ -1366,12 +1430,21 @@ export function usePlaybackSession(
       // landed is superseded by what the plan itself names.
       transitionSourceIdentity(plan.effective_media_file_id, plan.effective_virtual_uri ?? null);
       // A plan adopted with verified inventory seeds the verified-identity
-      // anchor that same-source declared pushes must not downgrade.
-      if (isInventoryProvisional(plan.inventory_status, plan.inventory_provenance) === false) {
+      // anchor that same-source declared pushes must not downgrade. A plan
+      // that still carries tracks_pending is provisional by definition, even
+      // if its stamp or provenance reads confident.
+      if (
+        plan.tracks_pending !== true &&
+        isInventoryProvisional(plan.inventory_status, plan.inventory_provenance) === false
+      ) {
         lastVerifiedIdentityRef.current = {
           fileId: plan.effective_media_file_id,
           uri: plan.effective_virtual_uri ?? null,
         };
+      }
+      if (plan.inventory_revision != null) {
+        inventoryRevisionRef.current = plan.inventory_revision;
+        syncRevisionScope().revisions.add(plan.inventory_revision);
       }
       // A live plan means the dead session that forced a rebuild is behind us;
       // a replacement that landed on a new id clears the one-recovery guard so
@@ -1402,8 +1475,8 @@ export function usePlaybackSession(
         awaitingInitialPlayerPositionRef.current = plan.timeline.source_start_seconds > 0;
       }
 
-      setState((current) => ({
-        ...planToSessionState(
+      setState((current) => {
+        const next = planToSessionState(
           plan,
           sessionId ?? null,
           playbackAttemptIdRef.current ?? "",
@@ -1413,20 +1486,64 @@ export function usePlaybackSession(
           playbackPlayingRef.current,
           current.autoFallback,
           config,
-        ),
-        initialSubtitleErrorTitle:
-          initialSubtitleFailure === undefined
-            ? current.initialSubtitleErrorTitle
-            : (initialSubtitleFailure?.title ?? null),
-        initialSubtitleError:
-          initialSubtitleFailure === undefined
-            ? current.initialSubtitleError
-            : (initialSubtitleFailure?.message ?? null),
-      }));
+        );
+        const verifiedAnchor = lastVerifiedIdentityRef.current;
+        const sameVerifiedSource =
+          verifiedAnchor !== null &&
+          verifiedAnchor.fileId === plan.effective_media_file_id &&
+          (verifiedAnchor.uri ?? null) === (plan.effective_virtual_uri ?? null);
+        const isIncomingPlanProvisional =
+          plan.tracks_pending === true ||
+          isInventoryProvisional(plan.inventory_status, plan.inventory_provenance);
+
+        if (sameVerifiedSource && isIncomingPlanProvisional) {
+          // This source was already verified in this session. A replan that
+          // echoes an earlier declared/pending plan must not downgrade the
+          // menus or restore a pending state.
+          next.audioInventoryProvisional = false;
+          next.subtitleInventoryProvisional = false;
+          next.inventoryPending = false;
+          next.inventoryFailed = false;
+          if (current.planAudioTracks.length > 0) {
+            next.planAudioTracks = current.planAudioTracks;
+          }
+          if (current.subtitleUrls.length > 0) {
+            next.subtitleUrls = current.subtitleUrls;
+          }
+          if (current.inventoryRevision != null) {
+            next.inventoryRevision = current.inventoryRevision;
+          }
+        } else if (plan.tracks_pending !== true) {
+          const confident =
+            plan.inventory_provenance === "verified" ||
+            (plan.inventory_provenance == null &&
+              plan.inventory_status != null &&
+              plan.inventory_status !== "declared");
+          if (confident && (current.inventoryPending || current.inventoryUrl != null)) {
+            next.inventoryPending = false;
+          } else if (!confident && current.inventoryPending) {
+            // Keep waiting: preserve the owed URL across a replan that omits
+            // it, so the poll below still knows where to read.
+            next.inventoryPending = true;
+            if (next.inventoryUrl == null) next.inventoryUrl = current.inventoryUrl;
+          }
+        }
+        return {
+          ...next,
+          initialSubtitleErrorTitle:
+            initialSubtitleFailure === undefined
+              ? current.initialSubtitleErrorTitle
+              : (initialSubtitleFailure?.title ?? null),
+          initialSubtitleError:
+            initialSubtitleFailure === undefined
+              ? current.initialSubtitleError
+              : (initialSubtitleFailure?.message ?? null),
+        };
+      });
       reportEvent("plan_selected");
       return true;
     },
-    [config, endReconnect, reportEvent, transitionSourceIdentity],
+    [config, endReconnect, reportEvent, syncRevisionScope, transitionSourceIdentity],
   );
 
   const requestStart = useCallback(
@@ -1516,6 +1633,10 @@ export function usePlaybackSession(
           sessionId: null,
           mediaFileId: null,
           effectiveVirtualUri: null,
+          inventoryRevision: null,
+          inventoryUrl: null,
+          inventoryPending: false,
+          inventoryFailed: false,
           initialPosition: 0,
           audioTrackIndex: 0,
           durationSeconds: null,
@@ -1673,6 +1794,10 @@ export function usePlaybackSession(
           playbackAttemptId,
           mediaFileId: null,
           effectiveVirtualUri: null,
+          inventoryRevision: null,
+          inventoryUrl: null,
+          inventoryPending: false,
+          inventoryFailed: false,
           initialPosition: 0,
           audioTrackIndex: 0,
           durationSeconds: null,
@@ -2403,6 +2528,10 @@ export function usePlaybackSession(
     (combinedIndex: number | null, currentPosition: number) => {
       const plan = planRef.current;
       if (!plan) return;
+      // A pick against a still-deferred inventory names a provisional slot:
+      // replan validation runs against the plan's declared list, and the
+      // server remaps or degrades there. The follow-up verified inventory
+      // replaces the menu without touching this selection.
       void replan({
         operation: "track_change",
         positionSeconds: currentPosition,
@@ -3071,10 +3200,24 @@ export function usePlaybackSession(
    * bumping the plan or transport revisions.
    */
   const foldInventoryUpdate = useCallback(
-    (payload: PlaybackInventoryUpdatedPayload) => {
+    (payload: PlaybackInventoryUpdatedPayload): boolean => {
       const scope = syncRevisionScope();
-      if (payload.inventory_revision != null && scope.revisions.has(payload.inventory_revision)) {
-        return;
+      const alreadyFolded =
+        payload.inventory_revision != null && scope.revisions.has(payload.inventory_revision);
+      const isTerminal =
+        payload.inventory_status === "verified" || payload.inventory_status === "failed";
+      if (alreadyFolded) {
+        // If the state is still pending or provisional, a redelivery of the terminal
+        // revision must re-fold its verified tracks and clear pending, not early-return.
+        const needsTerminalReconciliation =
+          isTerminal &&
+          (stateRef.current.inventoryPending ||
+            (payload.inventory_status === "verified" &&
+              (stateRef.current.audioInventoryProvisional ||
+                stateRef.current.subtitleInventoryProvisional)));
+        if (!needsTerminalReconciliation) {
+          return isTerminal;
+        }
       }
       const hasIdentity =
         payload.effective_media_file_id != null || payload.effective_virtual_uri != null;
@@ -3103,6 +3246,44 @@ export function usePlaybackSession(
         inventoryRevisionRef.current = payload.inventory_revision;
         scope.revisions.add(payload.inventory_revision);
       }
+      // A terminal outcome (verified or failed) ends the deferred loading
+      // state. The status values come from the session outcome the server
+      // stored with the probe result; anything else leaves the pending flag
+      // for the poll to resolve.
+      if (payload.inventory_status === "verified") {
+        const revision = payload.inventory_revision ?? null;
+        inventoryRevisionRef.current = revision;
+        setState((current) => {
+          const verifiedFileId = payload.effective_media_file_id ?? menuIdentityRef.current.fileId;
+          const verifiedUri = payload.effective_virtual_uri ?? menuIdentityRef.current.uri;
+          if (verifiedFileId != null) {
+            lastVerifiedIdentityRef.current = { fileId: verifiedFileId, uri: verifiedUri };
+          }
+          return {
+            ...current,
+            inventoryPending: false,
+            inventoryFailed: false,
+            inventoryRevision: revision,
+          };
+        });
+      } else if (payload.inventory_status === "failed") {
+        const revision = payload.inventory_revision ?? null;
+        inventoryRevisionRef.current = revision;
+        setState((current) => ({
+          ...current,
+          inventoryPending: false,
+          inventoryFailed: true,
+          inventoryRevision: revision,
+        }));
+      } else if (payload.inventory_revision != null) {
+        const revision = payload.inventory_revision;
+        setState((current) =>
+          current.inventoryRevision === revision
+            ? current
+            : { ...current, inventoryRevision: revision },
+        );
+      }
+      return true;
     },
     [applySubtitleInventory, foldCommittedSource, syncRevisionScope],
   );
@@ -3138,7 +3319,7 @@ export function usePlaybackSession(
       if (switchingRef.current || replanInFlightRef.current || current.replacing) {
         if (movedSource) pendingSwitchPositionRef.current = null;
         captureDeferredPush({ kind: "inventory", payload, identity });
-        return;
+        return false;
       }
       // No adoption in flight: a push that names another source than the player
       // is on is a stale delivery and is dropped. The synchronous mirror, not
@@ -3151,7 +3332,7 @@ export function usePlaybackSession(
           liveIdentity.uri != null &&
           payload.effective_virtual_uri !== liveIdentity.uri)
       ) {
-        return;
+        return false;
       }
       // A file-only push cannot be tied to a candidate. When the live source
       // already names a concrete candidate on that same file, the file alone is
@@ -3164,9 +3345,9 @@ export function usePlaybackSession(
         liveIdentity.uri != null &&
         payload.effective_media_file_id === liveIdentity.fileId
       ) {
-        return;
+        return false;
       }
-      foldInventoryUpdate(payload);
+      return foldInventoryUpdate(payload);
     },
     [captureDeferredPush, foldInventoryUpdate],
   );
@@ -3478,6 +3659,82 @@ export function usePlaybackSession(
     }
   }, [allowAlternateVersions, retryStart, setAutoFallback]);
 
+  /**
+   * Reads the session's live inventory from the plan's `inventory_url`.
+   *
+   * The folded revision rides as an ETag: a 200 carries the terminal
+   * (verified or failed) list and folds through the same reducer the push
+   * path uses, clearing the deferred loading state; a 304 means the probe
+   * has not landed yet and leaves everything alone. Any other outcome —
+   * network error, auth failure, missing URL — resolves false without
+   * touching the pending flag, so a flaky poll can never end the loading
+   * state on its own. Guards on the live session id so a response for a
+   * replaced session is dropped.
+   */
+  const pollInventory = useCallback(async (): Promise<boolean> => {
+    const plan = planRef.current;
+    const sessionId = sessionIdRef.current;
+    const url = plan?.inventory_url ?? stateRef.current.inventoryUrl;
+    if (!plan || !sessionId || !url) return false;
+    const revision =
+      inventoryRevisionRef.current ?? plan.inventory_revision ?? stateRef.current.inventoryRevision;
+    const headers: Record<string, string> = { Accept: "application/json" };
+    if (revision) headers["If-None-Match"] = revision;
+    let response: Response;
+    try {
+      response = await playerFetchResponse(config, `${playerV2Origin(config)}${url}`, {
+        headers: { ...headers, Accept: "application/json" },
+        signal: AbortSignal.timeout(10_000),
+      });
+    } catch {
+      return false;
+    }
+    if (response.status === 304) return false;
+    if (!response.ok) return false;
+    let body: unknown;
+    try {
+      body = await response.json();
+    } catch {
+      return false;
+    }
+    if (sessionIdRef.current !== sessionId || planRef.current !== plan) return false;
+    if (typeof body !== "object" || body === null) return false;
+    const record: Record<string, unknown> = body as Record<string, unknown>;
+    const payload = {
+      session_id: sessionId,
+      inventory_revision:
+        typeof record.inventory_revision === "string" ? record.inventory_revision : undefined,
+      inventory_status:
+        typeof record.inventory_status === "string" ? record.inventory_status : undefined,
+      audio_tracks: Array.isArray(record.audio_tracks) ? record.audio_tracks : undefined,
+      subtitle_inventory: Array.isArray(record.subtitle_inventory)
+        ? record.subtitle_inventory
+        : undefined,
+      effective_media_file_id:
+        typeof record.effective_media_file_id === "number"
+          ? record.effective_media_file_id
+          : undefined,
+      effective_virtual_uri:
+        typeof record.effective_virtual_uri === "string" ? record.effective_virtual_uri : undefined,
+      virtual_source_revision:
+        typeof record.virtual_source_revision === "string"
+          ? record.virtual_source_revision
+          : undefined,
+    } satisfies PlaybackInventoryUpdatedPayload;
+    const accepted = applyInventoryUpdate(payload);
+    return (
+      accepted && (payload.inventory_status === "verified" || payload.inventory_status === "failed")
+    );
+  }, [applyInventoryUpdate, config]);
+
+  const markInventoryExhausted = useCallback(() => {
+    setState((current) =>
+      current.inventoryPending
+        ? { ...current, inventoryPending: false, inventoryFailed: true }
+        : current,
+    );
+  }, []);
+
   return {
     ...state,
     switchVersion,
@@ -3492,6 +3749,8 @@ export function usePlaybackSession(
     invalidatePlan,
     reanchorSeek,
     refreshSubtitles,
+    pollInventory,
+    markInventoryExhausted,
     applySubtitleTrack,
     applyAudioInventory,
     applyCommittedSource,

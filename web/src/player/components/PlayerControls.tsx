@@ -80,6 +80,10 @@ interface PlayerControlsProps {
   onSubtitleDelayChange: (ms: number) => void;
   /** True while the server's subtitle inventory is declared, not probed. */
   subtitleInventoryProvisional?: boolean;
+  /** True while deferred track enumeration is still running. */
+  inventoryPending?: boolean;
+  /** True when track discovery terminally failed or timed out. */
+  inventoryFailed?: boolean;
   preferredSubtitleLanguage?: string | null;
   mediaFileId?: number;
   playerConfig?: PlayerConfig;
@@ -174,6 +178,8 @@ export function PlayerControls({
   subtitleDelayMs,
   onSubtitleDelayChange,
   subtitleInventoryProvisional = false,
+  inventoryPending = false,
+  inventoryFailed = false,
   preferredSubtitleLanguage,
   mediaFileId,
   playerConfig,
@@ -378,6 +384,8 @@ export function PlayerControls({
               delayMs={subtitleDelayMs}
               onDelayChange={onSubtitleDelayChange}
               provisional={subtitleInventoryProvisional}
+              pending={inventoryPending}
+              failed={inventoryFailed}
               mediaFileId={mediaFileId}
               playerConfig={playerConfig}
               onRefreshSubtitles={onRefreshSubtitles}
@@ -552,6 +560,8 @@ export function PlayerControls({
                   currentPosition={currentTime}
                   locked={trackMenusLocked}
                   provisional={audioInventoryProvisional}
+                  pending={inventoryPending}
+                  failed={inventoryFailed}
                 />
               )}
 
@@ -565,6 +575,8 @@ export function PlayerControls({
                 delayMs={subtitleDelayMs}
                 onDelayChange={onSubtitleDelayChange}
                 provisional={subtitleInventoryProvisional}
+                pending={inventoryPending}
+                failed={inventoryFailed}
                 mediaFileId={mediaFileId}
                 playerConfig={playerConfig}
                 onRefreshSubtitles={onRefreshSubtitles}
@@ -684,17 +696,21 @@ export function PlayerControls({
                 />
               </div>
             )}
-            {onAudioSelect && audioTracks.length > 0 && (
-              <OverflowAction
-                icon={<AudioLines className="h-5 w-5" />}
-                label="Audio tracks"
-                disabled={trackMenusLocked}
-                onClick={() => {
-                  setOverflowOpen(false);
-                  setAudioOpen(true);
-                }}
-              />
-            )}
+            {onAudioSelect &&
+              (audioTracks.length > 0 ||
+                audioInventoryProvisional ||
+                inventoryPending ||
+                inventoryFailed) && (
+                <OverflowAction
+                  icon={<AudioLines className="h-5 w-5" />}
+                  label="Audio tracks"
+                  disabled={trackMenusLocked}
+                  onClick={() => {
+                    setOverflowOpen(false);
+                    setAudioOpen(true);
+                  }}
+                />
+              )}
             {(chapters?.length ?? 0) > 0 && (
               <OverflowAction
                 icon={<ListVideo className="h-5 w-5" />}
@@ -758,6 +774,8 @@ export function PlayerControls({
           hideTrigger
           locked={trackMenusLocked}
           provisional={audioInventoryProvisional}
+          pending={inventoryPending}
+          failed={inventoryFailed}
         />
       )}
       {compactControls && (

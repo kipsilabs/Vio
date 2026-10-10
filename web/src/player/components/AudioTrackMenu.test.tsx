@@ -231,4 +231,112 @@ describe("AudioTrackMenu", () => {
 
     expect(screen.queryByText("Unverified")).toBeNull();
   });
+
+  it("shows discovery state when tracks are empty but inventory is provisional", () => {
+    render(
+      createElement(AudioTrackMenu, {
+        tracks: [],
+        activeIndex: 0,
+        onSelect: () => {},
+        currentPosition: 0,
+        open: true,
+        onOpenChange: () => {},
+        hideTrigger: false,
+        provisional: true,
+      }),
+    );
+
+    expect(screen.getByText("Discovering audio tracks…")).toBeTruthy();
+    expect(screen.getByText("Unverified")).toBeTruthy();
+  });
+
+  it("shows failure state when discovery failed and tracks are empty", () => {
+    render(
+      createElement(AudioTrackMenu, {
+        tracks: [],
+        activeIndex: 0,
+        onSelect: () => {},
+        currentPosition: 0,
+        open: true,
+        onOpenChange: () => {},
+        hideTrigger: false,
+        provisional: true,
+        failed: true,
+      }),
+    );
+
+    expect(screen.getByText("Track discovery failed")).toBeTruthy();
+    expect(screen.queryByText("Discovering audio tracks…")).toBeNull();
+  });
+
+  it("shows discovery banner even when declared tracks are present while provisional", () => {
+    render(
+      createElement(AudioTrackMenu, {
+        tracks: [{ title: "English", codec: "aac", channels: 2 }],
+        activeIndex: 0,
+        onSelect: () => {},
+        currentPosition: 0,
+        open: true,
+        onOpenChange: () => {},
+        hideTrigger: false,
+        provisional: true,
+      }),
+    );
+
+    expect(screen.getByText("Discovering audio tracks…")).toBeTruthy();
+    expect(screen.getByText("English")).toBeTruthy();
+  });
+
+  it("shows failure banner even when declared tracks are present", () => {
+    render(
+      createElement(AudioTrackMenu, {
+        tracks: [{ title: "English", codec: "aac", channels: 2 }],
+        activeIndex: 0,
+        onSelect: () => {},
+        currentPosition: 0,
+        open: true,
+        onOpenChange: () => {},
+        hideTrigger: false,
+        provisional: true,
+        failed: true,
+      }),
+    );
+
+    expect(screen.getByText("Track discovery failed")).toBeTruthy();
+    expect(screen.getByText("English")).toBeTruthy();
+  });
+
+  it("renders explicit empty state when tracks are empty and open while verified", () => {
+    render(
+      createElement(AudioTrackMenu, {
+        tracks: [],
+        activeIndex: 0,
+        onSelect: () => {},
+        currentPosition: 0,
+        open: true,
+        onOpenChange: () => {},
+        provisional: false,
+        failed: false,
+      }),
+    );
+
+    expect(screen.getByText("No audio tracks available")).toBeTruthy();
+  });
+
+  it("returns null when tracks are empty and closed while verified", () => {
+    const { container } = render(
+      createElement(AudioTrackMenu, {
+        tracks: [],
+        activeIndex: 0,
+        onSelect: () => {},
+        currentPosition: 0,
+        open: false,
+        onOpenChange: () => {},
+        provisional: false,
+        failed: false,
+      }),
+    );
+
+    expect(container.firstChild).toBeNull();
+  });
 });
