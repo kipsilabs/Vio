@@ -8131,9 +8131,49 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			// the session-bound candidate and its evidence is complete: that
 			// short-circuit would re-mount the exact release the decoder just
 			// rejected. Rotation must happen on the provider result id.
+			//
+			// A user selection operation — a track change or a seek reanchor —
+			// re-selects within the source the session is already serving and
+			// never substitutes the release. When the session holds a pinned
+			// virtual candidate that the catalog row still names, or whose
+			// plan-time inventory was captured on the session, carry that
+			// binding forward instead of re-listing. A fresh listing is keyed by
+			// per-listing provider result ids that churn for bytes that never
+			// changed, so it pays a multi-second resolve+probe and can hand back
+			// a different token the identity guard then refuses to adopt: the
+			// same-row track pick that silently did nothing.
+			//
+			// A row whose only relationship to the pin is a matching release
+			// under a different token, with no session evidence to describe the
+			// pinned bytes, still re-resolves: an offline pin then surfaces as
+			// source_unavailable through the existing rotation semantics instead
+			// of the replan planning against stale metadata. The release is
+			// never swapped silently.
+			carryPinnedCandidate := (trackChange || seekReanchor) &&
+				(candidateUnchanged || session.VirtualSubtitleEvidenceSet)
 			if candidateUnchanged && evidenceComplete && !virtualDecodeRotation {
 				currentEffectiveFile.FilePath = session.VirtualSourceURI
 				currentEffectiveFile.VirtualOwnerInstallationID = session.VirtualSourceOwnerInstallationID
+			} else if carryPinnedCandidate {
+				// Bind the session's pinned candidate and overlay the plan-time
+				// inventory captured with it, so the requested track selection
+				// resolves against the release the viewer is actually watching
+				// rather than a churned listing token. The row id and every
+				// transport field stay exactly as the plan named them.
+				carried := bindSessionVirtualSourceWithTracks(r.Context(), &pinnedFile, session, h.fileResolver)
+				carried.FilePath = session.VirtualSourceURI
+				carried.VirtualOwnerInstallationID = session.VirtualSourceOwnerInstallationID
+				// bindSessionVirtualSourceWithTracks overlays the plan-time
+				// subtitle inventory; audio evidence travels on the session
+				// too, and a track change must remap against the pinned
+				// release's audio list, not the churned row's.
+				if session.VirtualSubtitleEvidenceSet && len(session.VirtualAudioTracks) > 0 &&
+					virtualEvidenceMatchesBoundFile(carried, session) {
+					carriedCopy := *carried
+					carriedCopy.AudioTracks = session.VirtualAudioTracks
+					carried = &carriedCopy
+				}
+				currentEffectiveFile = carried
 			} else {
 				// The session-bound release is preferred so re-ranking cannot
 				// drift to a different provider candidate.
