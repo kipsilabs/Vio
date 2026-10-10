@@ -41,7 +41,7 @@ func requestIDReaderFromContext(ctx context.Context) string {
 // the candidates before dedup/classification/truncation.
 func fetchRaw(t *testing.T, r *Resolver) []StreamCandidate {
 	t.Helper()
-	got, err := r.fetchProviderCandidates(context.Background(), r.config, 0, "movie|tt1", "movie", "tt1")
+	got, err := r.fetchProviderCandidates(context.Background(), r.config, 0, "movie|tt1", "movie", "tt1", FetchReasonListing)
 	if err != nil {
 		t.Fatalf("fetchProviderCandidates: %v", err)
 	}
@@ -84,7 +84,7 @@ func TestFetchProviderCandidatesLogsRequestIDAndCacheKey(t *testing.T) {
 	r.SetRequestIDReader(requestIDReaderFromContext)
 
 	ctx := contextWithRequestID(context.Background(), "req-abc")
-	got, err := r.fetchProviderCandidates(ctx, r.config, 0, "movie|tt1", "movie", "tt1")
+	got, err := r.fetchProviderCandidates(ctx, r.config, 0, "movie|tt1", "movie", "tt1", FetchReasonListing)
 	if err != nil {
 		t.Fatalf("fetchProviderCandidates: %v", err)
 	}
@@ -92,7 +92,7 @@ func TestFetchProviderCandidatesLogsRequestIDAndCacheKey(t *testing.T) {
 		t.Fatalf("candidates = %d, want 1", len(got))
 	}
 	out := buf.String()
-	for _, want := range []string{"provider candidates fetched", "req-abc", "movie|tt1"} {
+	for _, want := range []string{"provider candidates fetched", "req-abc", "movie|tt1", "reason=listing"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("provider log %q missing %q", out, want)
 		}
@@ -112,7 +112,7 @@ func TestFetchProviderCandidatesOmitsRequestIDWithoutProvider(t *testing.T) {
 	var buf fetchLogBuffer
 	r.SetLogger(slog.New(slog.NewTextHandler(&buf, nil)))
 
-	if _, err := r.fetchProviderCandidates(context.Background(), r.config, 0, "movie|tt1", "movie", "tt1"); err != nil {
+	if _, err := r.fetchProviderCandidates(context.Background(), r.config, 0, "movie|tt1", "movie", "tt1", FetchReasonListing); err != nil {
 		t.Fatalf("fetchProviderCandidates: %v", err)
 	}
 	out := buf.String()
