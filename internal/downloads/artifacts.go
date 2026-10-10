@@ -247,10 +247,12 @@ func (m *ArtifactManager) SetVirtualInputResolver(resolver VirtualInputResolver)
 const PreparationAbandonedMessage = "The download was removed, so its preparation was stopped."
 
 // CancelAbandonedPrepare releases an artifact job whose last download row was
-// just deleted. The link re-check runs inside the deleting statement
-// (CancelAbandonedPreparations), so a request that attached since the caller
-// looked keeps the job: there is no window between "no live link" and the
-// delete, and a survivor is never aborted for another row's deletion.
+// just deleted. The link re-check runs inside the statement that deletes the
+// job (CancelAbandonedPreparations), after that job's row is locked, so a
+// request that attached since the caller looked keeps the job: the check and
+// the delete observe one snapshot, a link committed while the cancel waited
+// for the row is honored, and a survivor is never aborted for another row's
+// deletion.
 //
 // A job that is genuinely abandoned is deleted and any attempt this replica
 // runs is stopped at once; a running attempt on another replica stops at its

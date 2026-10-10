@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // virtualPrepareFixture is a managed fixture plus a provider-backed virtual file
@@ -274,6 +276,101 @@ func TestCancelAbandonedPrepareStopsLocalAttempt(t *testing.T) {
 	}
 	if _, err := arepo.GetByID(ctx, artifact.ID); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("abandoned running artifact still present: %v", err)
+	}
+}
+
+// TestCancelAbandonedPrepareSeesLinkAttachedWhileItWaited drives the real
+// register-vs-cancel interleaving the in-statement link check must survive. A
+// cancel blocks on the job's row lock; while it waits, a request attaches a live
+// download and commits; the released cancel must re-read the links under a
+// snapshot no older than the lock acquisition and keep the job, not abort the
+// request that just claimed it. A single-statement check-and-delete would decide
+// from the snapshot taken before the wait and delete the job.
+func TestCancelAbandonedPrepareSeesLinkAttachedWhileItWaited(t *testing.T) {
+	repo, pool, fileID := newArtifactTestRepo(t)
+	ctx := context.Background()
+
+	artifact := newArtifact(t, fileID, fmt.Sprintf("hash-attach-race-%d", time.Now().UnixNano()))
+	row, _, err := repo.EnsureQueued(ctx, artifact)
+	if err != nil {
+		t.Fatalf("ensure artifact: %v", err)
+	}
+	arepo := NewArtifactRepository(pool)
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, `DELETE FROM download_artifacts WHERE media_file_id = $1`, fileID)
+	})
+
+	// Hold the job's row lock so the cancel must wait before it can decide.
+	holder, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire lock connection: %v", err)
+	}
+	defer holder.Release()
+	tx, err := holder.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin lock transaction: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var holderPID int
+	if err := tx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&holderPID); err != nil {
+		t.Fatalf("read lock connection pid: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `SELECT id FROM download_artifacts WHERE id = $1 FOR UPDATE`, row.ID); err != nil {
+		t.Fatalf("lock artifact row: %v", err)
+	}
+
+	mgr := &ArtifactManager{repo: arepo}
+	canceled := make(chan struct{})
+	go func() {
+		defer close(canceled)
+		mgr.CancelAbandonedPrepare(ctx, row.ID)
+	}()
+
+	// Wait until the cancel is actually blocked on the row lock. Only then is
+	// its link-check snapshot older than the attach below, which is what makes
+	// this a regression test for the check-and-transition rather than a pass
+	// that merely ordered the attach first.
+	waitForBlockedBy(t, pool, holderPID)
+
+	// A request attaches a live download while the cancel waits, then commits.
+	linkRecoveryDownload(t, pool, fileID, row.ID, StatusPreparing)
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("release artifact lock: %v", err)
+	}
+	<-canceled
+
+	if _, err := repo.GetByID(ctx, row.ID); err != nil {
+		t.Fatalf("cancel aborted a job a request attached while it waited: %v", err)
+	}
+}
+
+// waitForBlockedBy blocks until some backend is waiting on a lock held by
+// blockerPID, so a test can order a concurrent commit after the cancel has taken
+// its statement snapshot. pg_blocking_pids covers every lock type (a row-lock
+// wait can block on a tuple or on a transaction id) and reads only columns
+// visible to every role, unlike pg_stat_activity's restricted query text. It
+// fails the test if no waiter appears within a bounded window rather than racing
+// on a fixed sleep.
+func waitForBlockedBy(t *testing.T, pool *pgxpool.Pool, blockerPID int) {
+	t.Helper()
+	ctx := context.Background()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var waiting int
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM pg_stat_activity a
+			 WHERE a.pid <> $1 AND $1 = ANY(pg_blocking_pids(a.pid))`,
+			blockerPID,
+		).Scan(&waiting); err != nil {
+			t.Fatalf("inspect blocked backends: %v", err)
+		}
+		if waiting > 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("cancel never blocked on the artifact row lock")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
