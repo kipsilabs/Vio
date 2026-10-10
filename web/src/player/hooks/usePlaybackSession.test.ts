@@ -5304,9 +5304,9 @@ describe("usePlaybackSession plan audio inventory", () => {
     expect(replanCalled).toBe(true);
 
     // Authority anchor preserves verified inventory and prevents downgrade to pending
-    expect(result.current.inventoryPending).toBe(true);
-    expect(result.current.audioInventoryProvisional).toBe(true);
-    expect(result.current.planAudioTracks).toHaveLength(1);
+    expect(result.current.inventoryPending).toBe(false);
+    expect(result.current.audioInventoryProvisional).toBe(false);
+    expect(result.current.planAudioTracks).toHaveLength(2);
 
     // Step 3: redelivery of inv:verified-1 terminal update reconciles successfully
     let accepted = false;
@@ -5339,6 +5339,113 @@ describe("usePlaybackSession plan audio inventory", () => {
 
     expect(pollAccepted).toBe(true);
     expect(result.current.inventoryPending).toBe(false);
+
+    unmount();
+  });
+
+  it("preserves verified-empty inventory across a stale replan declaring nonempty tracks", async () => {
+    let replanCalled = false;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3", "deferred_track_inventory_v1"],
+            outcome: "playable",
+            session_id: "session-empty-replan",
+            playback_plan: fixturePlanV3({
+              session_id: "session-empty-replan",
+              tracks_pending: true,
+              inventory_url: "/api/v2/playback/session-empty-replan/inventory",
+              inventory_revision: "inv:prov-empty",
+              effective_media_file_id: 7,
+              effective_virtual_uri: "virtual://movie/empty?result=e1",
+              audio_tracks: [
+                { codec: "aac", channels: 2, layout: "stereo", language: "eng", default: true },
+                { codec: "ac3", channels: 6, layout: "5.1", language: "spa", default: false },
+              ],
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/replan")) {
+        replanCalled = true;
+        // Stale replan echoes original declared nonempty tracks with tracks_pending
+        return jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "playable",
+          session_id: "session-empty-replan",
+          playback_plan: fixturePlanV3({
+            session_id: "session-empty-replan",
+            plan_id: "plan:empty-replan-1",
+            plan_attempt_key: "v3:empty-replan-1",
+            tracks_pending: true,
+            effective_media_file_id: 7,
+            effective_virtual_uri: "virtual://movie/empty?result=e1",
+            audio_tracks: [
+              { codec: "aac", channels: 2, layout: "stereo", language: "eng", default: true },
+              { codec: "ac3", channels: 6, layout: "5.1", language: "spa", default: false },
+            ],
+          }),
+        });
+      }
+      if (url.endsWith("/inventory")) {
+        return jsonResponse({
+          session_id: "session-empty-replan",
+          inventory_revision: "inv:verified-empty",
+          inventory_status: "verified",
+          effective_media_file_id: 7,
+          effective_virtual_uri: "virtual://movie/empty?result=e1",
+          audio_tracks: [],
+          subtitle_inventory: [],
+        });
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-empty-replan", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    // Step 1: probe lands, verified empty inventory update arrives
+    act(() => {
+      result.current.applyInventoryUpdate({
+        session_id: "session-empty-replan",
+        inventory_revision: "inv:verified-empty",
+        inventory_status: "verified",
+        effective_media_file_id: 7,
+        effective_virtual_uri: "virtual://movie/empty?result=e1",
+        audio_tracks: [],
+        subtitle_inventory: [],
+      });
+    });
+
+    expect(result.current.inventoryPending).toBe(false);
+    expect(result.current.audioInventoryProvisional).toBe(false);
+    expect(result.current.subtitleInventoryProvisional).toBe(false);
+    expect(result.current.planAudioTracks).toHaveLength(0);
+    expect(result.current.subtitleUrls).toHaveLength(0);
+
+    // Step 2: a replan occurs echoing the start attempt's declared nonempty tracks
+    await act(async () => {
+      await result.current.reanchorSeek(60);
+    });
+    expect(replanCalled).toBe(true);
+
+    // Verified empty inventory is preserved: declared tracks NOT restored, pending NOT restored
+    expect(result.current.planAudioTracks).toHaveLength(0);
+    expect(result.current.subtitleUrls).toHaveLength(0);
+    expect(result.current.inventoryPending).toBe(false);
+    expect(result.current.audioInventoryProvisional).toBe(false);
+    expect(result.current.subtitleInventoryProvisional).toBe(false);
 
     unmount();
   });

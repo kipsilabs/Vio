@@ -1069,6 +1069,7 @@ export function usePlaybackSession(
   // duplicate or stale revision as a no-op, so this gates repeat deliveries
   // without comparing plan identity (which a rotation can move).
   const inventoryRevisionRef = useRef<string | null>(null);
+  const inventoryPendingRef = useRef(false);
   // Identity-carrying pushes dropped while a start/switch/replan owns the
   // session. Applying them immediately would mutate the menus under the pending
   // replacement, but discarding them loses the only carrier of the incoming
@@ -1242,7 +1243,9 @@ export function usePlaybackSession(
       // A source rotation moves where the stream actually is; verified evidence
       // bound to the previous file/URI must not suppress inventory updates for
       // the new one.
-      lastVerifiedIdentityRef.current = null;
+      if (changed) {
+        lastVerifiedIdentityRef.current = null;
+      }
       return changed;
     },
     [],
@@ -1499,17 +1502,14 @@ export function usePlaybackSession(
         if (sameVerifiedSource && isIncomingPlanProvisional) {
           // This source was already verified in this session. A replan that
           // echoes an earlier declared/pending plan must not downgrade the
-          // menus or restore a pending state.
+          // menus or restore a pending state, and verified-empty inventories
+          // are preserved unconditionally against stale declared lists.
           next.audioInventoryProvisional = false;
           next.subtitleInventoryProvisional = false;
           next.inventoryPending = false;
           next.inventoryFailed = false;
-          if (current.planAudioTracks.length > 0) {
-            next.planAudioTracks = current.planAudioTracks;
-          }
-          if (current.subtitleUrls.length > 0) {
-            next.subtitleUrls = current.subtitleUrls;
-          }
+          next.planAudioTracks = current.planAudioTracks;
+          next.subtitleUrls = current.subtitleUrls;
           if (current.inventoryRevision != null) {
             next.inventoryRevision = current.inventoryRevision;
           }
@@ -1528,6 +1528,7 @@ export function usePlaybackSession(
             if (next.inventoryUrl == null) next.inventoryUrl = current.inventoryUrl;
           }
         }
+        inventoryPendingRef.current = next.inventoryPending;
         return {
           ...next,
           initialSubtitleErrorTitle:
@@ -1624,6 +1625,7 @@ export function usePlaybackSession(
       transitionSourceIdentity(null, null);
       pendingSeekRef.current = null;
       lastVerifiedIdentityRef.current = null;
+      inventoryPendingRef.current = false;
       setState((current) => {
         if (current.sessionId !== expectedSessionId) return current;
         return {
@@ -1786,6 +1788,7 @@ export function usePlaybackSession(
         planAttemptIdRef.current = randomUUID();
         deferredPushesRef.current = [];
         transitionSourceIdentity(null, null);
+        inventoryPendingRef.current = false;
         setState((current) => ({
           ...current,
           plan: null,
@@ -3251,6 +3254,7 @@ export function usePlaybackSession(
       // stored with the probe result; anything else leaves the pending flag
       // for the poll to resolve.
       if (payload.inventory_status === "verified") {
+        inventoryPendingRef.current = false;
         const revision = payload.inventory_revision ?? null;
         inventoryRevisionRef.current = revision;
         setState((current) => {
@@ -3267,6 +3271,7 @@ export function usePlaybackSession(
           };
         });
       } else if (payload.inventory_status === "failed") {
+        inventoryPendingRef.current = false;
         const revision = payload.inventory_revision ?? null;
         inventoryRevisionRef.current = revision;
         setState((current) => ({
@@ -3723,11 +3728,14 @@ export function usePlaybackSession(
     } satisfies PlaybackInventoryUpdatedPayload;
     const accepted = applyInventoryUpdate(payload);
     return (
-      accepted && (payload.inventory_status === "verified" || payload.inventory_status === "failed")
+      accepted &&
+      !inventoryPendingRef.current &&
+      (payload.inventory_status === "verified" || payload.inventory_status === "failed")
     );
   }, [applyInventoryUpdate, config]);
 
   const markInventoryExhausted = useCallback(() => {
+    inventoryPendingRef.current = false;
     setState((current) =>
       current.inventoryPending
         ? { ...current, inventoryPending: false, inventoryFailed: true }
