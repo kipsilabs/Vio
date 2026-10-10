@@ -225,6 +225,117 @@ func (t *playbackStartTimingsV3) log(ctx context.Context, attemptID string) {
 	slog.InfoContext(ctx, "protocol v3 start timing", attrs...)
 }
 
+// transportPhaseNamesV3 is the fixed, ordered phase set the transport commit is
+// split into. Ordering keeps the emitted attributes stable across requests so a
+// log processor can diff two starts field by field.
+var transportPhaseNamesV3 = []string{
+	"transport_anchor",
+	"transport_upstream",
+	"transport_queue",
+	"transport_route",
+	"transport_spawn",
+	"transport_readiness",
+	"transport_remote_ready",
+}
+
+// transportPhaseTimingsV3 accumulates the wall time of the transport-commit
+// sub-phases for one start request. It exists because the composite
+// session_transport_commit mark covers everything startPlannedPlaybackV3 does,
+// so a multi-second stall cannot be attributed to the anchor probe, the
+// upstream reopen, a serialized wait, FFmpeg spawn, or first-manifest readiness.
+// Each recorder observes only the span it names, so the phases never
+// double-count and sum to at most the commit's wall time.
+//
+// A mutex guards the map: transport preparation is synchronous on the start
+// path today, but a phase recorded from a detached helper (a warm, a retry)
+// must not race the reader.
+type transportPhaseTimingsV3 struct {
+	mu     sync.Mutex
+	phases map[string]time.Duration
+}
+
+type transportPhaseTimingsKeyV3 struct{}
+
+// withTransportPhaseTimingsV3 attaches a fresh phase recorder to ctx and
+// returns it. A second call replaces the recorder so a nested or retried start
+// measures its own commit rather than accumulating into an outer one.
+func withTransportPhaseTimingsV3(ctx context.Context) (context.Context, *transportPhaseTimingsV3) {
+	recorder := &transportPhaseTimingsV3{phases: make(map[string]time.Duration, len(transportPhaseNamesV3))}
+	return context.WithValue(ctx, transportPhaseTimingsKeyV3{}, recorder), recorder
+}
+
+// transportPhaseTimingsFromV3 returns the recorder attached by
+// withTransportPhaseTimingsV3, or nil when the caller did not install one. A nil
+// recorder makes every record a no-op, so uninstalled call sites pay nothing.
+func transportPhaseTimingsFromV3(ctx context.Context) *transportPhaseTimingsV3 {
+	if ctx == nil {
+		return nil
+	}
+	recorder, _ := ctx.Value(transportPhaseTimingsKeyV3{}).(*transportPhaseTimingsV3)
+	return recorder
+}
+
+// recordTransportPhaseV3 adds the wall time since start to the named phase on
+// the context's recorder. It is a no-op without an installed recorder.
+func recordTransportPhaseV3(ctx context.Context, phase string, start time.Time) {
+	recorder := transportPhaseTimingsFromV3(ctx)
+	if recorder == nil {
+		return
+	}
+	recorder.mu.Lock()
+	recorder.phases[phase] += time.Since(start)
+	recorder.mu.Unlock()
+}
+
+// addTransportPhaseDurationV3 adds an already-measured duration to the named
+// phase. It lets a caller record an enclosing span net of a span recorded inside
+// it (spawn inside the hw_accel=auto walk) so the phases never overlap.
+func addTransportPhaseDurationV3(ctx context.Context, phase string, d time.Duration) {
+	recorder := transportPhaseTimingsFromV3(ctx)
+	if recorder == nil {
+		return
+	}
+	if d < 0 {
+		d = 0
+	}
+	recorder.mu.Lock()
+	recorder.phases[phase] += d
+	recorder.mu.Unlock()
+}
+
+// transportPhaseDurationV3 reads the wall time accumulated for one phase on the
+// context's recorder, or zero without one. A caller uses it to subtract a span
+// recorded inside an enclosing one.
+func transportPhaseDurationV3(ctx context.Context, phase string) time.Duration {
+	recorder := transportPhaseTimingsFromV3(ctx)
+	if recorder == nil {
+		return 0
+	}
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	return recorder.phases[phase]
+}
+
+// observeTransportPhasesV3 appends every transport sub-phase to the start timing
+// line. It appends measured attributes directly rather than through mark, so a
+// sub-phase cannot disturb the delta the enclosing session_transport_commit mark
+// reports. A missing recorder (or an unmeasured phase) emits a zero, which reads
+// as "this start did not pay it" — the same shape the other timing fields use.
+func (t *playbackStartTimingsV3) observeTransportPhasesV3(recorder *transportPhaseTimingsV3) {
+	if t == nil || recorder == nil {
+		return
+	}
+	recorder.mu.Lock()
+	snapshot := make(map[string]time.Duration, len(recorder.phases))
+	for name, d := range recorder.phases {
+		snapshot[name] = d
+	}
+	recorder.mu.Unlock()
+	for _, name := range transportPhaseNamesV3 {
+		t.attrs = append(t.attrs, name+"_ms", snapshot[name].Milliseconds())
+	}
+}
+
 type playbackStartSideEffectsV3 struct {
 	session         playback.Session
 	file            models.MediaFile
@@ -2371,8 +2482,15 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		timings.mark("post_commit_probe_scheduled")
 		h.enqueueDeferredVirtualProbeV3(r.Context(), deferred)
 	}
-	response, statusErr := h.startPlannedPlaybackV3(r, userID, profileID, req, requestDigests, requestedFile, effectiveFile, audioIndex, virtualDecision, result, clientInfo, virtualDecision.substitutionReason)
+	// Split the composite commit measurement into attributable sub-phases: the
+	// transport prepare resolves the copy-video seek anchor, reopens the upstream
+	// virtual source, waits for a route/lifecycle slot, spawns FFmpeg, and waits
+	// for the first manifest. Recording each span on the start timing line names
+	// the responsible phase instead of leaving a multi-second bucket unexplained.
+	phasesCtx, phaseTimings := withTransportPhaseTimingsV3(r.Context())
+	response, statusErr := h.startPlannedPlaybackV3(r.WithContext(phasesCtx), userID, profileID, req, requestDigests, requestedFile, effectiveFile, audioIndex, virtualDecision, result, clientInfo, virtualDecision.substitutionReason)
 	timings.mark("session_transport_commit")
+	timings.observeTransportPhasesV3(phaseTimings)
 	if statusErr != nil {
 		// A decoder-rejected source is a candidate failure, not a route failure:
 		// rotate to the next provider release before any terminal. An explicit
@@ -3612,7 +3730,9 @@ func (h *PlaybackHandler) prepareTransportWithPolicyAndExclusionsV3(
 	// failure.
 	audioOnlyFailure := true
 	for attempts := 0; attempts < 32; attempts++ {
+		routeStart := time.Now()
 		decision := h.resolveHLSRouteWithPolicyV3(r.Context(), session, result, policy, proxyAllowed, excludedNodes, excludedShapes)
+		recordTransportPhaseV3(r.Context(), "transport_route", routeStart)
 		if !decision.Selected() {
 			if fallback, attempted, fallbackErr := h.prepareSoftwareToneMapFallbackWithPolicyV3(r, session, file, result, mode, policy); attempted {
 				if fallbackErr == nil {
@@ -3957,6 +4077,10 @@ func (h *PlaybackHandler) waitCopySeekAnchorBackoff(ctx context.Context, remaini
 }
 
 func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, session *playback.Session, file *models.MediaFile, result playback.PlannerResultV3) (preparedTimelineV3, *transportErrorV3) {
+	// The copy-video seek anchor is resolved here, before any route is selected
+	// or FFmpeg spawned. Attribute its cost to its own phase so a seek start's
+	// stall is not misread as route or spawn time.
+	defer recordTransportPhaseV3(ctx, "transport_anchor", time.Now())
 	if result.Plan == nil {
 		return preparedTimelineV3{}, nil
 	}
@@ -4302,7 +4426,9 @@ func (h *PlaybackHandler) prepareIdentityTransportV3(r *http.Request, session *p
 	if h.beforeIdentityLifecycleLockV3 != nil {
 		h.beforeIdentityLifecycleLockV3()
 	}
+	identityQueueStart := time.Now()
 	unlockLifecycle = h.tm.LockSessionLifecycle(session.ID)
+	recordTransportPhaseV3(r.Context(), "transport_queue", identityQueueStart)
 	// Accepted start/replan plans always carry their live session ID. Low-level
 	// transport tests deliberately omit it so they can exercise route assembly
 	// without reconstructing the surrounding request transaction.
@@ -5381,8 +5507,16 @@ type localTransportStartupFailureV3 struct {
 // returned so every caller gets the same startup cleanup behavior.
 func (h *PlaybackHandler) startReadyLocalPlaybackTransportV3(ctx context.Context, opts playback.TranscodeOpts) (*playback.TranscodeSession, *localTransportStartupFailureV3) {
 	startedAt := time.Now()
+	// Spawn is recorded net of the virtual upstream reopen it performs inline:
+	// resolving the session-bound provider URL to a relay registration is the
+	// "upstream reopen" phase, and counting it twice would make the two phases
+	// overlap. For a local file the resolve is a no-op and spawn keeps the whole
+	// span.
+	upstreamBefore := transportPhaseDurationV3(ctx, "transport_upstream")
 	ts, err := h.startLocalPlaybackTransport(ctx, opts)
 	spawnFinishedAt := time.Now()
+	addTransportPhaseDurationV3(ctx, "transport_spawn",
+		spawnFinishedAt.Sub(startedAt)-(transportPhaseDurationV3(ctx, "transport_upstream")-upstreamBefore))
 	if err != nil {
 		slog.InfoContext(ctx, "playback transport startup timing",
 			logComponentKey, playbackLogValueV3,
@@ -5404,6 +5538,7 @@ func (h *PlaybackHandler) startReadyLocalPlaybackTransportV3(ctx context.Context
 		return nil, &localTransportStartupFailureV3{cause: err, failedToStart: true}
 	}
 	if _, err := ts.WaitForManifestContext(ctx, playback.ManifestStartupTimeout); err != nil {
+		recordTransportPhaseV3(ctx, "transport_readiness", spawnFinishedAt)
 		slog.InfoContext(ctx, "playback transport startup timing",
 			logComponentKey, playbackLogValueV3,
 			requestIDLogKeyV3, chimw.GetReqID(ctx),
@@ -5422,6 +5557,7 @@ func (h *PlaybackHandler) startReadyLocalPlaybackTransportV3(ctx context.Context
 		_ = ts.Close()
 		return nil, failure
 	}
+	recordTransportPhaseV3(ctx, "transport_readiness", spawnFinishedAt)
 	slog.InfoContext(ctx, "playback transport startup timing",
 		logComponentKey, playbackLogValueV3,
 		requestIDLogKeyV3, chimw.GetReqID(ctx),
@@ -5464,13 +5600,24 @@ var localAutoStartupBudgetV3 = time.Duration(playback.MaxAutoTranscodeStartupAtt
 func (h *PlaybackHandler) startReadyAutoLocalPlaybackTransportV3(ctx context.Context, pipeline *playback.AutoTranscodePipeline) (*playback.TranscodeSession, *localTransportStartupFailureV3) {
 	startedAt := time.Now()
 	attempts := 0
+	spawnBefore := transportPhaseDurationV3(ctx, "transport_spawn")
 	ts, err := playback.StartReadyTranscode(ctx, pipeline, playback.TranscodeStartup{
 		Budget: localAutoStartupBudgetV3,
 		Start: func(ctx context.Context, opts playback.TranscodeOpts) (*playback.TranscodeSession, error) {
 			attempts++
-			return h.startLocalPlaybackTransport(ctx, opts)
+			upstreamBefore := transportPhaseDurationV3(ctx, "transport_upstream")
+			spawnStart := time.Now()
+			session, startErr := h.startLocalPlaybackTransport(ctx, opts)
+			upstreamDelta := transportPhaseDurationV3(ctx, "transport_upstream") - upstreamBefore
+			addTransportPhaseDurationV3(ctx, "transport_spawn", time.Since(spawnStart)-upstreamDelta)
+			return session, startErr
 		},
 	})
+	// The auto walk bounds spawn and per-attempt manifest readiness together.
+	// Readiness is the walk's wall time net of the (possibly multi-attempt) spawn
+	// time already recorded above, so the two phases stay disjoint.
+	spawnAfter := transportPhaseDurationV3(ctx, "transport_spawn")
+	addTransportPhaseDurationV3(ctx, "transport_readiness", time.Since(startedAt)-(spawnAfter-spawnBefore))
 	outcome := transportStartupReadyV3
 	var failure *localTransportStartupFailureV3
 	var startupErr *playback.TranscodeStartupError
@@ -5518,7 +5665,13 @@ func (h *PlaybackHandler) prepareLocalTransportV3(r *http.Request, session *play
 	}
 	sourceMetadata := sourceExecutionMetadataV3(file, result)
 	sourceProfile, sourceBitDepth := sourceVideoTranscodeFactsV3(file, result)
+	// Queue time is the wait for this session's lifecycle slot. It serializes
+	// every path that spawns FFmpeg into one output directory, so measuring it
+	// apart from spawn and readiness shows a start queued behind another writer
+	// instead of an unexplained delay.
+	queueStart := time.Now()
 	unlock := h.tm.LockSessionLifecycle(session.ID)
+	recordTransportPhaseV3(r.Context(), "transport_queue", queueStart)
 	opts := playback.TranscodeOpts{
 		InputPath:                        file.FilePath,
 		MediaFileID:                      file.ID,
@@ -5892,6 +6045,7 @@ func (h *PlaybackHandler) prepareRemoteTransportV3(r *http.Request, session *pla
 	}
 	inputPath := file.FilePath
 	var virtualCleanup func()
+	upstreamStart := time.Now()
 	if isVirtualPlaybackFile(file) || strings.HasPrefix(strings.ToLower(strings.TrimSpace(file.FilePath)), virtualPlaybackPrefix) {
 		ownerInstallationID := file.VirtualOwnerInstallationID
 		userID, profileID := 0, ""
@@ -5925,6 +6079,7 @@ func (h *PlaybackHandler) prepareRemoteTransportV3(r *http.Request, session *pla
 			virtualCleanup = cleanup
 		}
 	}
+	recordTransportPhaseV3(r.Context(), "transport_upstream", upstreamStart)
 	cleanupOnFailure := func() {
 		if virtualCleanup != nil {
 			virtualCleanup()
@@ -5954,6 +6109,7 @@ func (h *PlaybackHandler) prepareRemoteTransportV3(r *http.Request, session *pla
 	}
 	remoteStartAt := time.Now()
 	nodeResp, status, err := h.startRemotePlaybackTransport(r.Context(), node.URL, req)
+	recordTransportPhaseV3(r.Context(), "transport_remote_ready", remoteStartAt)
 	remoteOutcome := transportStartupReadyV3
 	if err != nil || status != http.StatusAccepted {
 		remoteOutcome = playbackRemoteOutcomeFailedV3
@@ -6060,7 +6216,9 @@ func (h *PlaybackHandler) prepareRemoteTransportV3(r *http.Request, session *pla
 	committed := false
 	previousNodeURL := session.TranscodeNodeURL
 	previousTransportID := remoteTransportID(session)
+	remoteQueueStart := time.Now()
 	unlock := h.tm.LockSessionLifecycle(session.ID)
+	recordTransportPhaseV3(r.Context(), "transport_queue", remoteQueueStart)
 	routingEgress := noderouting.EgressAPI
 	egressNodeID := 0
 	egressNodeURL := ""
