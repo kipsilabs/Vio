@@ -702,6 +702,14 @@ export interface PlanV3 {
    */
   inventory_provenance?: string;
   /**
+   * Whether the plan was served while track inventory was still pending the
+   * deferred real probe. Mirrors the server plan field; absent means the
+   * inventory is final. Clients use it to tell provisional plans (whose
+   * declared tracks must not overwrite already-folded verified inventory)
+   * from settled ones.
+   */
+  tracks_pending?: boolean;
+  /**
    * The catalog row the client asked for when the effective release differs
    * from it. Absent when the effective row is the requested one. It lets the
    * player render an honest substitution notice without first diffing ids.
