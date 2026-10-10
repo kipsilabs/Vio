@@ -5207,6 +5207,215 @@ describe("usePlaybackSession plan audio inventory", () => {
     expect(result.current.audioInventoryProvisional).toBe(false);
     unmount();
   });
+
+  // The cold plan for a virgin virtual release carries zero tracks (fast
+  // discovery timed out, the declared fallback is empty too) and commits before
+  // the background probe materializes the candidate's own catalog row. The
+  // verified push that follows is bound to the same candidate URI but names that
+  // later row, so its `effective_media_file_id` differs from the plan's. It is
+  // the server's own inventory for the live session, not another source: folding
+  // it in place mounts both track menus (the audio button and the subtitle list)
+  // without a replan, a row/file switch, or an element reload. Red before the
+  // guard learned to admit a verified revision for the exact live candidate.
+  it("mounts both menus from a verified push when the cold plan is empty", async () => {
+    const candidateUri = "virtual://movie/x?result=A";
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3({
+              inventory_status: "declared",
+              inventory_provenance: "pending",
+              effective_media_file_id: 7,
+              effective_virtual_uri: candidateUri,
+              audio_tracks: [],
+              subtitle: { mode: "off", inventory: [] },
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+    expect(result.current.planAudioTracks).toEqual([]);
+    expect(result.current.subtitleUrls).toEqual([]);
+    expect(result.current.audioInventoryProvisional).toBe(true);
+    expect(result.current.subtitleInventoryProvisional).toBe(true);
+    const planRevision = result.current.planRevision;
+    const transportRevision = result.current.transportRevision;
+    const streamUrl = result.current.streamUrl;
+
+    act(() =>
+      result.current.applyInventoryUpdate({
+        session_id: "session-1",
+        inventory_revision: "inv:1",
+        inventory_status: "verified",
+        // The candidate's own catalog row, materialized after the cold plan
+        // committed; the URI still names the live candidate.
+        effective_media_file_id: 8,
+        effective_virtual_uri: candidateUri,
+        audio_tracks: [
+          { codec: "eac3", channels: 6, layout: "5.1", language: "eng", default: true },
+          { codec: "ac3", channels: 2, layout: "stereo", language: "spa", default: false },
+        ],
+        subtitle_inventory: [
+          {
+            track_id: "file:8:subtitle:0",
+            combined_index: 0,
+            source: "embedded",
+            codec: "subrip",
+            language: "eng",
+            forced: false,
+            default: false,
+            hearing_impaired: false,
+            delivery: "sidecar",
+            url: "/stream/session-1/subtitles/0.vtt?file_id=8",
+          },
+        ],
+      }),
+    );
+
+    // Both menus are created from the verified push; the badge clears.
+    expect(result.current.planAudioTracks).toHaveLength(2);
+    expect(result.current.subtitleUrls).toHaveLength(1);
+    expect(result.current.subtitleUrls[0]?.language).toBe("eng");
+    expect(result.current.audioInventoryProvisional).toBe(false);
+    expect(result.current.subtitleInventoryProvisional).toBe(false);
+    // Menu data only: the same session keeps its stream, transport and plan.
+    expect(result.current.sessionId).toBe("session-1");
+    expect(result.current.planRevision).toBe(planRevision);
+    expect(result.current.transportRevision).toBe(transportRevision);
+    expect(result.current.streamUrl).toBe(streamUrl);
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).includes("/replan"))).toHaveLength(0);
+    unmount();
+  });
+
+  // The same cold-empty plan, but the verified push arrives while the
+  // default-audio reconciliation replan is in flight. The flush must still mount
+  // the menus from it: the push names the live candidate's URI, so its differing
+  // catalog row is the resolved identity, not a sibling. Red before the flush
+  // admitted a verified revision for the exact live candidate.
+  it("mounts both menus from a verified push deferred by a replan", async () => {
+    const candidateUri = "virtual://movie/x?result=A";
+    let releaseReplan: ((response: Response) => void) | undefined;
+    const heldReplan = new Promise<Response>((resolve) => {
+      releaseReplan = resolve;
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3({
+              inventory_status: "declared",
+              inventory_provenance: "pending",
+              effective_media_file_id: 7,
+              effective_virtual_uri: candidateUri,
+              audio_tracks: [],
+              subtitle: { mode: "off", inventory: [] },
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/session-1/replan")) return heldReplan;
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+    const transportRevision = result.current.transportRevision;
+
+    act(() => {
+      void result.current.refreshSubtitles(120);
+    });
+    await waitFor(() => expect(result.current.replanning).toBe(true));
+
+    act(() =>
+      result.current.applyInventoryUpdate({
+        session_id: "session-1",
+        inventory_revision: "inv:deferred-empty",
+        inventory_status: "verified",
+        effective_media_file_id: 8,
+        effective_virtual_uri: candidateUri,
+        audio_tracks: [
+          { codec: "eac3", channels: 6, layout: "5.1", language: "eng", default: true },
+          { codec: "ac3", channels: 2, layout: "stereo", language: "spa", default: false },
+        ],
+        subtitle_inventory: [
+          {
+            track_id: "file:8:subtitle:0",
+            combined_index: 0,
+            source: "embedded",
+            codec: "subrip",
+            language: "eng",
+            forced: false,
+            default: false,
+            hearing_impaired: false,
+            delivery: "sidecar",
+            url: "/stream/session-1/subtitles/0.vtt?file_id=8",
+          },
+        ],
+      }),
+    );
+
+    // The reconciliation replan settles on the same candidate with the stale
+    // (empty) declared list; the deferred verified push then mounts the menus.
+    await act(async () => {
+      releaseReplan?.(
+        jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "playable",
+          session_id: "session-1",
+          playback_plan: fixturePlanV3({
+            plan_id: "plan:deferred-empty",
+            plan_attempt_key: "v3:deferred-empty",
+            inventory_status: "declared",
+            inventory_provenance: "pending",
+            effective_media_file_id: 7,
+            effective_virtual_uri: candidateUri,
+            audio_tracks: [],
+            subtitle: { mode: "off", inventory: [] },
+          }),
+        }),
+      );
+      await heldReplan;
+    });
+
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe("plan:deferred-empty"));
+    expect(result.current.planAudioTracks).toHaveLength(2);
+    expect(result.current.subtitleUrls).toHaveLength(1);
+    expect(result.current.audioInventoryProvisional).toBe(false);
+    expect(result.current.subtitleInventoryProvisional).toBe(false);
+    expect(result.current.transportRevision).toBe(transportRevision);
+    expect(result.current.sessionId).toBe("session-1");
+    unmount();
+  });
 });
 
 describe("usePlaybackSession effective virtual source", () => {
