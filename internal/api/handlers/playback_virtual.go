@@ -1543,6 +1543,13 @@ type virtualResolveTrace struct {
 	probe    time.Duration
 	probeRan bool
 
+	// trackDiscovery is the bounded fast track-discovery the v2 deferred start
+	// runs before the plan is built. It is attributed separately from probe so a
+	// cold-start timing can tell the pre-plan stream enumeration apart from the
+	// synchronous verifier probe.
+	trackDiscovery    time.Duration
+	trackDiscoveryRan bool
+
 	fallback    time.Duration
 	fallbackRan bool
 
@@ -1564,11 +1571,12 @@ type virtualResolveTrace struct {
 
 // totalMS is the sum of the stage durations that ran, using the same rounded
 // millisecond values the per-stage fields report, so total_ms equals
-// list_ms+resolve_ms+probe_ms+fallback_ms exactly.
+// list_ms+resolve_ms+probe_ms+track_discovery_ms+fallback_ms exactly.
 func (t *virtualResolveTrace) totalMS() int64 {
 	return t.list.Milliseconds() +
 		t.resolve.Milliseconds() +
 		t.probe.Milliseconds() +
+		t.trackDiscovery.Milliseconds() +
 		t.fallback.Milliseconds()
 }
 
@@ -1625,6 +1633,7 @@ func (t *virtualResolveTrace) fieldsWithContext(ctx context.Context) []any {
 		{"list", t.listRan, t.list},          //nolint:goconst // log attribute key/value, kept inline for readability.
 		{"resolve", t.resolveRan, t.resolve}, //nolint:goconst // log attribute key/value, kept inline for readability.
 		{"probe", t.probeRan, t.probe},
+		{"track_discovery", t.trackDiscoveryRan, t.trackDiscovery},
 		{"fallback", t.fallbackRan, t.fallback},
 	} {
 		attrs = append(attrs, stage.name+"_ran", stage.ran)
@@ -2855,6 +2864,23 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			if !transient.HDR && cand.HDR != "" {
 				transient.HDR = true
 			}
+			// Bounded fast track-discovery, only on the v2 negotiated deferred
+			// start (deferProbePastCommit). The plan is built from the file this
+			// resolve returns, and the deferred probe below is scheduled past the
+			// transport commit, so without enumerating here a multi-stream release
+			// plans from the provider's declared label: one synthesized audio
+			// track and no subtitles. The discovery replaces those with the real
+			// audio/subtitle stream table when it lands inside its budget; on a
+			// timeout or failure it returns the file unchanged and the plan keeps
+			// the declared inventory exactly as before. It never persists and
+			// never replans: the deferred full probe remains the verifier and its
+			// arrival still only updates menus in place.
+			if options.deferProbePastCommit {
+				discoveryStart := time.Now()
+				trace.trackDiscoveryRan = true
+				transient = *h.discoverVirtualTracksFast(attemptCtx, &transient, streamURL, cand.RequestHeaders)
+				trace.trackDiscovery = time.Since(discoveryStart)
+			}
 			h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
 			// The ffprobe enumeration is deliberately not spawned inline on the
 			// fresh-start path: the resolve hands the probe to the start path,
@@ -3254,6 +3280,65 @@ func (h *PlaybackHandler) virtualExpectedRuntimeMinutes(ctx context.Context, fil
 		}
 	}
 	return expected
+}
+
+// virtualTrackDiscoveryBudgetDefault bounds the start-path fast track-discovery.
+// It reuses the same bounded wait the non-virtual start probe already allows
+// (playbackProbeStartBudgetDefault), so a virtual start is not asked to wait
+// longer for stream enumeration than a local/HTTP start waits for its probe.
+// The wait is a hard bound: past it the discovery is abandoned and the cold plan
+// keeps the declared inventory, exactly as before. It is a var so tests can
+// shrink it.
+var virtualTrackDiscoveryBudgetDefault = playbackProbeStartBudgetDefault
+
+// virtualTrackDiscoverySlots bounds concurrent start-path track enumerations
+// process-wide, mirroring virtualDeferredProbeWorkers. The discovery runs on the
+// request path, so a start that cannot take a slot serves the declared inventory
+// and does not wait: a fleet of simultaneous cold starts cannot fork an unbounded
+// number of ffprobes, and no start is delayed by contention. A saturated bound
+// therefore degrades to today's declared-inventory behavior, never to a slower
+// start.
+var virtualTrackDiscoverySlots = make(chan struct{}, virtualDeferredProbeWorkers)
+
+// discoverVirtualTracksFast runs the bounded fast track-discovery against an
+// already-resolved virtual source and folds the enumerated audio and subtitle
+// streams into the file the cold plan will read. It is best-effort by design:
+// the cold plan is built from the file this returns, so discovery can only ever
+// upgrade the inventory. When no enumerator is wired, when the source URL is
+// empty, when the process-wide enumeration budget is saturated, when the budget
+// lapses, or when the enumeration fails, the input file is returned unchanged and
+// the plan takes the declared inventory path exactly as today. It never persists
+// and never schedules a replan, so the deferred full probe remains the verifier
+// and inventory arrival still only updates menus in place; no row, file, or
+// route is switched when it lands.
+func (h *PlaybackHandler) discoverVirtualTracksFast(ctx context.Context, file *models.MediaFile, sourceURL string, headers map[string]string) *models.MediaFile {
+	if h == nil || file == nil || h.VirtualTrackEnumerator == nil || strings.TrimSpace(sourceURL) == "" {
+		return file
+	}
+	select {
+	case virtualTrackDiscoverySlots <- struct{}{}:
+		defer func() { <-virtualTrackDiscoverySlots }()
+	default:
+		slog.DebugContext(ctx, "virtual fast track discovery skipped: enumeration budget saturated",
+			"component", "api", "file_id", file.ID, "candidate_uri", sourceURL)
+		return file
+	}
+	budget := virtualTrackDiscoveryBudgetDefault
+	if h.trackDiscoveryBudget > 0 {
+		budget = h.trackDiscoveryBudget
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	audio, subtitles, err := h.VirtualTrackEnumerator(probeCtx, sourceURL, headers)
+	if err != nil {
+		slog.DebugContext(ctx, "virtual fast track discovery skipped; serving declared inventory",
+			"component", "api", "file_id", file.ID, "candidate_uri", sourceURL, "error", err)
+		return file
+	}
+	enumerated := *file
+	enumerated.AudioTracks = audio
+	enumerated.SubtitleTracks = subtitles
+	return &enumerated
 }
 
 // probeVirtualSourceAndPersist probes an already-resolved provider URL and

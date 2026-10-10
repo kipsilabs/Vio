@@ -116,39 +116,10 @@ func buildProbeArgs(filePath string) []string {
 // ProbeFile runs ffprobe on the given file and returns parsed ProbeData.
 // ffprobePath is the path to the ffprobe binary. filePath is the media file to probe.
 func ProbeFile(ctx context.Context, ffprobePath string, filePath string) (*ProbeData, error) {
-	cmd := exec.CommandContext(ctx, ffprobePath, buildProbeArgs(filePath)...)
-
-	output := &boundedProbeBuffer{limit: maxFFprobeOutputBytes}
-	cmd.Stdout = output
-	if err := cmd.Run(); err != nil {
-		processmetrics.Record(processmetrics.Probe, cmd.ProcessState, err, ctx.Err())
-		// A producer may receive SIGPIPE after the bounded writer rejects its
-		// output, so the process error can mask the writer's sentinel.
-		if output.overflow || errors.Is(err, errFFprobeOutputTooLarge) {
-			return nil, errFFprobeOutputTooLarge
-		}
-		return nil, fmt.Errorf("ffprobe failed for %s: %w", filePath, err)
+	probe, raw, err := runProbeFFprobe(ctx, ffprobePath, buildProbeArgs(filePath), filePath)
+	if err != nil {
+		return nil, err
 	}
-	// os/exec may report a successful process exit after its stdout copy
-	// goroutine consumed the Writer error. Keep an explicit overflow bit so a
-	// provider-controlled response can never fall through to JSON parsing.
-	if output.overflow {
-		return nil, errFFprobeOutputTooLarge
-	}
-	processmetrics.Record(processmetrics.Probe, cmd.ProcessState, nil, ctx.Err())
-
-	var raw ffprobeOutput
-	if err := json.Unmarshal(output.Bytes(), &raw); err != nil {
-		return nil, fmt.Errorf("ffprobe JSON parse failed for %s: %w", filePath, err)
-	}
-	if len(raw.Streams) > maxFFprobeStreams {
-		return nil, fmt.Errorf("ffprobe returned %d streams (maximum %d)", len(raw.Streams), maxFFprobeStreams)
-	}
-	if len(raw.Chapters) > maxFFprobeChapters {
-		return nil, fmt.Errorf("ffprobe returned %d chapters (maximum %d)", len(raw.Chapters), maxFFprobeChapters)
-	}
-
-	probe := convertProbeData(&raw)
 	if probe.Duration == 0 {
 		if frameRate, hasVideo := primaryVideoFrameRate(raw.Streams); hasVideo {
 			// A failed or empty packet scan must not discard the codec and
@@ -162,6 +133,48 @@ func ProbeFile(ctx context.Context, ffprobePath string, filePath string) (*Probe
 	}
 
 	return probe, nil
+}
+
+// runProbeFFprobe executes ffprobe with the given argv, enforcing the shared
+// output and stream caps, and returns the converted probe alongside the raw
+// stream table. The raw table is returned because the full probe still needs it
+// for its packet-scan duration fallback; a metadata-only caller ignores it.
+// Both the full probe and the bounded track enumeration share this one exec so
+// they can never drift on caps or parsing.
+func runProbeFFprobe(ctx context.Context, ffprobePath string, args []string, filePath string) (*ProbeData, *ffprobeOutput, error) {
+	cmd := exec.CommandContext(ctx, ffprobePath, args...)
+
+	output := &boundedProbeBuffer{limit: maxFFprobeOutputBytes}
+	cmd.Stdout = output
+	if err := cmd.Run(); err != nil {
+		processmetrics.Record(processmetrics.Probe, cmd.ProcessState, err, ctx.Err())
+		// A producer may receive SIGPIPE after the bounded writer rejects its
+		// output, so the process error can mask the writer's sentinel.
+		if output.overflow || errors.Is(err, errFFprobeOutputTooLarge) {
+			return nil, nil, errFFprobeOutputTooLarge
+		}
+		return nil, nil, fmt.Errorf("ffprobe failed for %s: %w", filePath, err)
+	}
+	// os/exec may report a successful process exit after its stdout copy
+	// goroutine consumed the Writer error. Keep an explicit overflow bit so a
+	// provider-controlled response can never fall through to JSON parsing.
+	if output.overflow {
+		return nil, nil, errFFprobeOutputTooLarge
+	}
+	processmetrics.Record(processmetrics.Probe, cmd.ProcessState, nil, ctx.Err())
+
+	var raw ffprobeOutput
+	if err := json.Unmarshal(output.Bytes(), &raw); err != nil {
+		return nil, nil, fmt.Errorf("ffprobe JSON parse failed for %s: %w", filePath, err)
+	}
+	if len(raw.Streams) > maxFFprobeStreams {
+		return nil, nil, fmt.Errorf("ffprobe returned %d streams (maximum %d)", len(raw.Streams), maxFFprobeStreams)
+	}
+	if len(raw.Chapters) > maxFFprobeChapters {
+		return nil, nil, fmt.Errorf("ffprobe returned %d chapters (maximum %d)", len(raw.Chapters), maxFFprobeChapters)
+	}
+
+	return convertProbeData(&raw), &raw, nil
 }
 
 // ProbePrimaryVideoTrack runs a bounded metadata-only FFprobe and returns the
