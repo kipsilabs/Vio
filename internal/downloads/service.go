@@ -1181,7 +1181,17 @@ func (s *Service) Delete(ctx context.Context, userID int, profileID, deviceID, d
 		if profileID == "" {
 			return ErrProfileRequired
 		}
-		return s.repo.DeleteManaged(ctx, downloadID, userID, profileID, deviceID)
+		// Capture the artifact link before the row is removed so deleting the
+		// last row that references an in-flight prepare can stop it.
+		artifactID := ""
+		if dl, err := s.repo.GetManagedByID(ctx, downloadID, userID, profileID, deviceID); err == nil {
+			artifactID = dl.ArtifactID
+		}
+		if err := s.repo.DeleteManaged(ctx, downloadID, userID, profileID, deviceID); err != nil {
+			return err
+		}
+		s.cancelArtifactPrepare(ctx, artifactID)
+		return nil
 	}
 
 	dl, err := s.repo.GetByID(ctx, downloadID)
@@ -1193,10 +1203,27 @@ func (s *Service) Delete(ctx context.Context, userID int, profileID, deviceID, d
 	}
 	switch dl.Status {
 	case StatusQueued, StatusDownloading:
-		return s.repo.CancelByID(ctx, downloadID, userID)
+		if err := s.repo.CancelByID(ctx, downloadID, userID); err != nil {
+			return err
+		}
 	default:
-		return s.repo.Delete(ctx, downloadID, userID)
+		if err := s.repo.Delete(ctx, downloadID, userID); err != nil {
+			return err
+		}
 	}
+	s.cancelArtifactPrepare(ctx, dl.ArtifactID)
+	return nil
+}
+
+// cancelArtifactPrepare asks the artifact pipeline to abort a running prepare
+// once no other download row links the artifact. Best-effort by design: a
+// shared/deduplicated job is left alone (see ArtifactManager.CancelPrepare),
+// and a lost race only delays the survivor until lease recovery.
+func (s *Service) cancelArtifactPrepare(ctx context.Context, artifactID string) {
+	if s.artifacts == nil || artifactID == "" {
+		return
+	}
+	s.artifacts.CancelPrepare(ctx, artifactID)
 }
 
 func (s *Service) resolveBulkQuality(requested string, _ *PolicyUser, _ config.DownloadConfig) (QualityDecision, error) {

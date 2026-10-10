@@ -126,6 +126,14 @@ func (r DownloadQualityResolver) sourceDecision(
 	artifactsAvailable bool,
 	deviceID string,
 ) (QualityDecision, error) {
+	// A provider-backed row has no local bytes to serve directly: the download
+	// file endpoint can only deliver a prepared artifact. Route it through the
+	// remux path even when the play method would otherwise be direct, so
+	// `original` on a virtual title prepares a compatible container instead of
+	// registering a row whose file request is known to fail.
+	if method == playback.PlayDirect && isVirtualMediaFile(file) {
+		method = playback.PlayRemux
+	}
 	switch method {
 	case playback.PlayDirect:
 		if err := r.ensureServedQualityAllowed(ctx, user, cfg, artifactsAvailable, file, deviceID); err != nil {

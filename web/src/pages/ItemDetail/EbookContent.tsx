@@ -243,6 +243,7 @@ export default function EbookContent({
         summaryBuilder={ebookVersionSummary}
         selectedFileId={readVersion?.file_id}
         onStaleVersion={onStaleVersion}
+        createTarget={{ contentId: item.content_id }}
       />
     </div>
   );

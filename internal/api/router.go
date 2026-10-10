@@ -1959,6 +1959,11 @@ func newChiRouter(deps Dependencies) chi.Router {
 				}
 				return relayURL, cleanup, nil
 			}
+			// Downloads prepare virtual titles through the same resolver rather
+			// than a second rotation/trust implementation.
+			if deps.ArtifactManager != nil {
+				deps.ArtifactManager.SetVirtualInputResolver(playbackHandler)
+			}
 		}
 
 		// Wire the optional node planner and JWT secret for node-aware stream URLs.
