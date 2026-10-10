@@ -6189,21 +6189,16 @@ func mergeVirtualCandidateTracks(probed *models.MediaFile, candidate VirtualPlay
 		}
 	}
 
-	// Synthesize audio tracks from the provider-declared languages when the
-	// probe left the inventory empty. A file with no resolution and no tracks
-	// cannot produce a routable plan, so language synthesis is gated on the
-	// caller supplying a resolution (declared, backfilled, or probed) — via
-	// the baseline or a real candidate value. Video track synthesis below
-	// follows the same gate so both inventories stay consistent.
+	// Fill the audio inventory from the provider-declared languages. A
+	// declaration labels the streams the probe already observed (or stands in
+	// for them before the probe runs), never a language-less anonymous track:
+	// an empty or marker-only declaration leaves the inventory empty so the
+	// cold plan reports pending instead of advertising a fabricated default
+	// the deferred probe would contradict. A fabricated single track made a
+	// multi-audio release look like exactly one stream, so the language policy
+	// could only ever select index 0 and the real inventory could not correct
+	// the selection (inventory adoption never replans).
 	mergeVirtualCandidateLanguages(probed, candidate)
-
-	if len(probed.AudioTracks) == 0 && probed.Resolution != "" {
-		probed.AudioTracks = []models.AudioTrack{{
-			Codec:    probed.CodecAudio,
-			Channels: channels,
-			Default:  true,
-		}}
-	}
 
 	// Fill audio channels and codec on existing tracks that lack them.
 	for i := range probed.AudioTracks {
@@ -6397,13 +6392,20 @@ func declaredVirtualAudioTracks(codecAudio string, languages []string, fallbackC
 	return probed.AudioTracks
 }
 
-// mergeVirtualCandidateLanguages appends provider-declared audio languages as
-// tracks when the probed inventory does not already carry them. Candidate
-// language lists come from the release metadata (e.g. ITA-ENG in a release
-// name), not from ffprobe, so tracks synthesized here are never authoritative —
-// a later probe fills real codec/channel evidence on top. Release-group markers
-// that are not real languages (e.g. MULTI, DUAL) are skipped so a bogus track
-// never appears in the player's picker.
+// mergeVirtualCandidateLanguages folds provider-declared audio languages into
+// the probed inventory. Candidate language lists come from release metadata
+// (e.g. ITA-ENG in a release name), not from ffprobe, so a track labeled here
+// is never authoritative — a later probe fills real codec/channel evidence on
+// top. Release-group markers that are not real languages (e.g. MULTI, DUAL) are
+// skipped so a bogus track never appears in the player's picker.
+//
+// When the probe left the inventory empty the declaration becomes the tracks.
+// When the probe observed streams but left them language-less (common on
+// HLS/DASH relays) the declaration labels those observed streams in place, in
+// declaration order, without changing the track count: the cold plan's language
+// policy can then select the preferred language instead of falling back to
+// index 0, and the deferred probe remains the verifier. An observed language is
+// never overwritten and no stream is fabricated beyond what the probe found.
 //
 // Provider-declared subtitle languages are deliberately NOT synthesized into
 // embedded tracks here: a synthesized SubtitleTrack carries a stream ordinal
@@ -6413,42 +6415,114 @@ func declaredVirtualAudioTracks(codecAudio string, languages []string, fallbackC
 // subtitle inventory comes only from the probe; provider subtitle hints stay on
 // the candidate stream for the picker and drive the background subtitle search.
 func mergeVirtualCandidateLanguages(probed *models.MediaFile, candidate VirtualPlaybackStream) {
-	if probed == nil || len(probed.AudioTracks) > 0 {
+	if probed == nil {
 		return
 	}
-	audioCodec := probed.CodecAudio
-	if audioCodec == "" {
-		audioCodec = candidate.CodecAudio
+	declared := normalizedVirtualAudioLanguages(candidate.AudioLanguages)
+	if len(declared) == 0 {
+		return
 	}
-	if audioCodec == "" {
-		audioCodec = "aac"
-	}
-	channels := inferChannelsFromCodec(audioCodec)
-	if len(candidate.AudioLanguages) > 0 {
-		existing := make(map[string]bool, len(candidate.AudioLanguages))
-		for _, candidateLang := range candidate.AudioLanguages {
-			candidateLang = strings.TrimSpace(candidateLang)
-			if candidateLang == "" || !isRealVirtualLanguageTag(candidateLang) {
-				continue
-			}
-			canonical := langpkg.CanonicalTag(candidateLang)
-			if canonical == "" {
-				canonical = virtualLanguageBaseSubtag(candidateLang)
-			}
-			if existing[canonical] {
-				continue
-			}
-			existing[canonical] = true
+	if len(probed.AudioTracks) == 0 {
+		audioCodec := probed.CodecAudio
+		if audioCodec == "" {
+			audioCodec = candidate.CodecAudio
+		}
+		if audioCodec == "" {
+			audioCodec = "aac"
+		}
+		channels := inferChannelsFromCodec(audioCodec)
+		for _, declaredLang := range declared {
 			probed.AudioTracks = append(probed.AudioTracks, models.AudioTrack{
-				// Synthesized tracks carry no real container stream index; the
-				// array position is the ordinal (audioStreamOrdinalV3 falls back
-				// to it when Index <= 0).
-				Language: candidateLang,
+				Language: declaredLang,
 				Codec:    audioCodec,
 				Channels: channels,
 			})
 		}
+		return
 	}
+	// A probed inventory already exists. An observed language is never
+	// overwritten, but a real stream the probe left without a language tag
+	// (common on HLS/DASH relays) is a gap the declaration fills in place, in
+	// declaration order. Filling instead of appending keeps the track count
+	// equal to the real stream count: a declaration may label an observed
+	// stream, it may never fabricate one, so the ordinal-to-stream mapping
+	// stays honest. Without this a multi-track cold plan whose tracks are all
+	// language-less falls back to index 0, and the deferred probe's real
+	// inventory can only correct the menus — never re-select the stream.
+	present := make(map[string]bool, len(probed.AudioTracks))
+	for i := range probed.AudioTracks {
+		for _, key := range virtualAudioTrackLanguageKeys(probed.AudioTracks[i]) {
+			present[key] = true
+		}
+	}
+	next := 0
+	for i := range probed.AudioTracks {
+		if next >= len(declared) {
+			break
+		}
+		if strings.TrimSpace(probed.AudioTracks[i].Language) != "" || len(probed.AudioTracks[i].Languages) > 0 {
+			continue
+		}
+		for next < len(declared) && present[virtualLanguageKey(declared[next])] {
+			next++
+		}
+		if next >= len(declared) {
+			break
+		}
+		probed.AudioTracks[i].Language = declared[next]
+		present[virtualLanguageKey(declared[next])] = true
+		next++
+	}
+}
+
+// normalizedVirtualAudioLanguages filters a provider declaration down to the
+// real languages it names, preserving declaration order and original spelling
+// while collapsing aliases onto one entry per language. Release markers such as
+// MULTI/DUAL are dropped so a bogus track never appears in the picker.
+func normalizedVirtualAudioLanguages(languages []string) []string {
+	out := make([]string, 0, len(languages))
+	seen := make(map[string]bool, len(languages))
+	for _, raw := range languages {
+		lang := strings.TrimSpace(raw)
+		if lang == "" || !isRealVirtualLanguageTag(lang) {
+			continue
+		}
+		key := virtualLanguageKey(lang)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, lang)
+	}
+	return out
+}
+
+// virtualLanguageKey canonicalizes a language token for dedup and presence
+// matching, falling back to its ISO base subtag when the tagger cannot parse
+// it, so probe-recorded codes and provider-declared codes compare on the same
+// key.
+func virtualLanguageKey(value string) string {
+	key := langpkg.CanonicalTag(value)
+	if key == "" {
+		key = virtualLanguageBaseSubtag(value)
+	}
+	return key
+}
+
+// virtualAudioTrackLanguageKeys returns every language a track carries, as
+// canonical keys: its primary code first, then its MULTI member list.
+func virtualAudioTrackLanguageKeys(track models.AudioTrack) []string {
+	keys := make([]string, 0, len(track.Languages)+1)
+	if strings.TrimSpace(track.Language) != "" {
+		keys = append(keys, virtualLanguageKey(track.Language))
+	}
+	for _, code := range track.Languages {
+		if strings.TrimSpace(code) == "" {
+			continue
+		}
+		keys = append(keys, virtualLanguageKey(code))
+	}
+	return keys
 }
 
 // virtualLanguageBaseSubtag canonicalizes a language token to its ISO base
