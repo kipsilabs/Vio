@@ -164,7 +164,7 @@ func TestVirtualPrepareIsRequesterScoped(t *testing.T) {
 
 // TestCancelAbandonedPrepareStopsLocalAttempt covers the cancel-from-this-worker
 // half of the cancel-vs-attach race: an abandoned running job is deleted and the
-// attempt this replica runs is cancelled at once. A worker on another replica has
+// attempt this replica runs is canceled at once. A worker on another replica has
 // no local attempt here and is stopped by the lease fence instead, which the
 // deleted row already guarantees.
 func TestCancelAbandonedPrepareStopsLocalAttempt(t *testing.T) {
@@ -188,13 +188,13 @@ func TestCancelAbandonedPrepareStopsLocalAttempt(t *testing.T) {
 	}
 
 	// This replica runs the attempt; the map is keyed by artifact id.
-	cancelled := false
-	cancel := func() { cancelled = true }
+	canceled := false
+	cancel := func() { canceled = true }
 	mgr := &ArtifactManager{repo: arepo, localAttempts: map[string]*localAttempt{artifact.ID: {cancel: cancel}}}
 
 	mgr.CancelAbandonedPrepare(ctx, artifact.ID)
 
-	if !cancelled {
+	if !canceled {
 		t.Fatal("abandoned running job did not cancel this replica's local attempt")
 	}
 	if _, err := arepo.GetByID(ctx, artifact.ID); !errors.Is(err, ErrNotFound) {
