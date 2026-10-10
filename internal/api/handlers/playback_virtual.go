@@ -4452,6 +4452,12 @@ func (h *PlaybackHandler) virtualProbeEvidenceArgsForRow(ctx context.Context, ca
 			"component", "api", "file_id", catalogFile.ID, "candidate_uri", resolvedPath,
 			"row_path", catalogFile.FilePath, "probe_source", catalogFile.ProbeSource,
 			"reason", virtualProbeRefusalCrossReleaseNoTarget)
+		// The catalog write is correctly blocked, but the playing session's
+		// menus must not stay empty: this probed candidate is the row's current
+		// listing, so surface its tracks to live sessions still pinned to the
+		// vanished candidate. Display only — the transport is never re-keyed,
+		// and no replan is issued.
+		h.publishOfferedReleaseInventory(ctx, catalogFile, resolvedPath, probed)
 		return models.VirtualFilePersistArgs{}, false
 	}
 	args := models.VirtualFilePersistArgs{

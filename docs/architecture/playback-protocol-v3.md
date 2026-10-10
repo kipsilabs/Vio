@@ -1435,6 +1435,43 @@ inventory for a source must also refuse to regress it to a declared or pending
 list when a later plan for the same source is adopted — a replan can have been
 built before the probe persisted, and the menus must stay on the real evidence.
 
+### 6.3 `inventory_updated_event_v1` — a vanished pin still offers the row's menu
+
+A row pinned to a concrete `?result=` candidate can have the provider renumber
+or drop that candidate mid-session. The transport keeps playing the already-open
+relay, and every rotation path correctly refuses to swap a different release into
+the playing row, so the track menus would otherwise stay empty until a
+stop/resume. When the refused evidence is the row's own current listing, the
+server pushes it as a display-only `inventory_updated` revision:
+
+```json
+{
+  "type": "event",
+  "session_id": "…",
+  "name": "inventory_updated",
+  "payload": {
+    "session_id": "…",
+    "inventory_revision": "inv:…",
+    "inventory_status": "verified",
+    "effective_media_file_id": 200,
+    "offered_virtual_uri": "virtual://movie/…?result=C",
+    "audio_tracks": [{"language": "eng", "codec": "eac3", "default": true}],
+    "subtitle_inventory": []
+  }
+}
+```
+
+`offered_virtual_uri` names the candidate the row offers now. The payload
+deliberately omits `effective_virtual_uri` and carries only the bound row in
+`effective_media_file_id`, so a client can never mistake the offer for the
+playing identity: the transport, session and plan revisions are untouched and no
+replan is issued. A client that ignores the field keeps its existing behavior
+(the file-only revision is dropped as ambiguous). The offered track lists are
+display data; selecting a track from the offered release must go through the
+explicit rotation/replan path, never an in-place switch. The server pushes it
+best-effort and does not gate it on a negotiated feature; the field is additive
+and absent on every ordinary read.
+
 ---
 
 ## 7. Registries

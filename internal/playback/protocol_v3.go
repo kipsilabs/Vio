@@ -1195,6 +1195,19 @@ type PlaybackInventoryV3 struct {
 	// inventory is declared rather than verified. Empty for a non-virtual
 	// source.
 	VirtualSourceRevision string `json:"virtual_source_revision,omitempty"`
+	// OfferedVirtualURI, when set, names a concrete candidate under the same
+	// neutral key that the row currently offers but the session's transport is
+	// NOT bound to: the pinned candidate vanished from the provider listing and
+	// the transport keeps playing it. The audio and subtitle lists describe that
+	// offered candidate, so a client can show what the row offers now. The bound
+	// candidate is deliberately not repeated: EffectiveVirtualURI stays empty
+	// and EffectiveMediaFileID is the row the session is bound to, so a consumer
+	// can never mistake the offer for the playing identity. It is display-only:
+	// selecting a track from the offered release must go through the explicit
+	// rotation/replan path, and a client that does not know this field falls
+	// back to the playing source's own inventory. Additive; absent on every
+	// ordinary read.
+	OfferedVirtualURI string `json:"offered_virtual_uri,omitempty"`
 }
 
 type inventoryRevisionEnvelope struct {

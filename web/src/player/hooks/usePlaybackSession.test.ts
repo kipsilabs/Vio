@@ -2340,6 +2340,168 @@ describe("usePlaybackSession version switches", () => {
     unmount();
   });
 
+  it("populates the track menus from an offered release without moving the transport", async () => {
+    const offeredAudio = [
+      { codec: "eac3", channels: 6, layout: "5.1", language: "eng", default: true },
+    ];
+    const offeredSubtitle: SubtitleInventoryItemV3 = {
+      track_id: "file:7:subtitle:4",
+      combined_index: 4,
+      source: "embedded",
+      codec: "subrip",
+      language: "eng",
+      forced: false,
+      default: false,
+      hearing_impaired: false,
+      delivery: "sidecar",
+      url: "/stream/session-1/subtitles/4.vtt?file_id=7",
+    };
+    let replanCalls = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3({
+              inventory_status: "declared",
+              effective_virtual_uri: "virtual://movie/x?result=8376",
+              audio_tracks: [],
+              subtitle: { mode: "off", inventory: [] },
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/replan")) {
+        replanCalls += 1;
+        throw new Error("an offered-release fold must not replan");
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+    const transportBefore = result.current.transportRevision;
+    const planRevisionBefore = result.current.planRevision;
+    const sessionBefore = result.current.sessionId;
+    expect(result.current.planAudioTracks).toEqual([]);
+
+    // The pinned candidate vanished: the server offers the row's current
+    // listing as display data keyed on the row, not on the playing candidate.
+    act(() =>
+      result.current.applyInventoryUpdate({
+        session_id: "session-1",
+        inventory_revision: "inv:offered-7398",
+        inventory_status: "verified",
+        effective_media_file_id: 7,
+        offered_virtual_uri: "virtual://movie/x?result=7398",
+        audio_tracks: offeredAudio,
+        subtitle_inventory: [offeredSubtitle],
+      }),
+    );
+
+    // The menus show what the row offers now...
+    expect(result.current.planAudioTracks).toEqual(offeredAudio);
+    expect(result.current.subtitleUrls).toHaveLength(1);
+    expect(result.current.subtitleUrls[0]?.language).toBe("eng");
+    expect(result.current.audioInventoryProvisional).toBe(false);
+    expect(result.current.subtitleInventoryProvisional).toBe(false);
+    // ...while the transport, session and revisions never move.
+    expect(result.current.effectiveVirtualUri).toBe("virtual://movie/x?result=8376");
+    expect(result.current.mediaFileId).toBe(7);
+    expect(result.current.transportRevision).toBe(transportBefore);
+    expect(result.current.planRevision).toBe(planRevisionBefore);
+    expect(result.current.sessionId).toBe(sessionBefore);
+    expect(replanCalls).toBe(0);
+    unmount();
+  });
+
+  it("routes a track picked from an offered release through the explicit replan", async () => {
+    const offeredAudio = [
+      { codec: "eac3", channels: 6, layout: "5.1", language: "eng", default: true },
+    ];
+    const replanBodies: Array<Record<string, unknown>> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3({
+              inventory_status: "declared",
+              effective_virtual_uri: "virtual://movie/x?result=8376",
+              audio_tracks: [],
+              subtitle: { mode: "off", inventory: [] },
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/replan")) {
+        replanBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        return jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "playable",
+          session_id: "session-1",
+          playback_plan: fixturePlanV3({
+            plan_id: "plan:offered-rotation",
+            plan_attempt_key: "v3:offered-rotation",
+          }),
+        });
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    act(() =>
+      result.current.applyInventoryUpdate({
+        session_id: "session-1",
+        inventory_revision: "inv:offered-7398",
+        inventory_status: "verified",
+        effective_media_file_id: 7,
+        offered_virtual_uri: "virtual://movie/x?result=7398",
+        audio_tracks: offeredAudio,
+        subtitle_inventory: [],
+      }),
+    );
+    act(() => result.current.switchAudioTrack(0, 42));
+
+    await waitFor(() => expect(replanBodies).toHaveLength(1));
+    // The pick belongs to a release the transport is not playing, so it is an
+    // explicit rotation/replan, never a silent in-place switch.
+    expect(replanBodies[0]).toMatchObject({
+      operation: "failure_recovery",
+      position_seconds: 42,
+    });
+    expect(replanBodies[0]?.failure).toMatchObject({
+      classification: "offered_release_track_selected",
+    });
+    expect(replanBodies.filter((body) => body.operation === "track_change")).toHaveLength(0);
+    unmount();
+  });
+
   it("folds a mid-switch seek into a chained switch without a competing replan", async () => {
     const startBodies: Array<{ file_id: number; start_position?: number }> = [];
     const replanBodies: Array<Record<string, unknown>> = [];

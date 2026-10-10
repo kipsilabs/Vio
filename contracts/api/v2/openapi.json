@@ -34953,6 +34953,9 @@
           "inventory_status": {
             "type": "string"
           },
+          "offered_virtual_uri": {
+            "type": "string"
+          },
           "session_id": {
             "type": "string"
           },
