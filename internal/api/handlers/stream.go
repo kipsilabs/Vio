@@ -3369,7 +3369,7 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 	// The windowed request just read the remote source and, by design,
 	// committed nothing. Populate the full-track cache so the next window hits
 	// the small artifact instead of re-demuxing the source.
-	h.warmVirtualSubtitleAfterWindowMiss(file, session, opts, virtualActive)
+	h.warmVirtualSubtitleAfterWindowMiss(file, session, opts, virtualActive, middleware.GetReqID(r.Context()))
 }
 
 // resolveCommittedTextSubtitleEntry resolves the committed full-track text
@@ -3410,7 +3410,7 @@ var virtualSubtitleWarmResolveTimeout = 2 * time.Minute
 // remote work and a stuck resolver cannot pin either: concurrent window misses
 // on the same serve identity resolve once and demux once, and the registration
 // is released exactly once when the warm settles.
-func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(file *models.MediaFile, session *playback.Session, opts playback.StreamExtractOpts, virtualActive bool) {
+func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(file *models.MediaFile, session *playback.Session, opts playback.StreamExtractOpts, virtualActive bool, requestID string) {
 	if h == nil || h.SubtitleCache == nil || file == nil || session == nil || !virtualActive {
 		return
 	}
@@ -3459,7 +3459,7 @@ func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(file *models.MediaFil
 			extractOpts.InputPath = resolved.URL
 			return playback.StreamExtractSubtitle(extractCtx, extractOpts)
 		}
-		<-h.SubtitleCache.WarmTrackInBackground(opts, extract)
+		<-h.SubtitleCache.WarmTrackInBackground(opts, extract, requestID)
 	}()
 }
 

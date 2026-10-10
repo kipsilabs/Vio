@@ -131,7 +131,7 @@ func TestExtractTextTracksRemembersAnEmptyRendition(t *testing.T) {
 	cache.WarmTextTracks(source, tracks, func(context.Context, string, []TextSubtitleOutput) error {
 		t.Error("warm demuxed a source whose renditions are all cached")
 		return nil
-	})
+	}, "")
 	if got, ok := cache.LookupText(source, 1, "srt"); !ok || string(got) != "track 1 srt" {
 		t.Fatalf("other track not cached: %q %t", got, ok)
 	}
@@ -166,7 +166,7 @@ func TestWarmTextTracksServesALaterRequestFromTheWarm(t *testing.T) {
 	cache.WarmTextTracks(source, tracks, func(ctx context.Context, input string, outputs []TextSubtitleOutput) error {
 		<-release
 		return warm(ctx, input, outputs)
-	})
+	}, "")
 
 	done := make(chan []byte, 1)
 	go func() {

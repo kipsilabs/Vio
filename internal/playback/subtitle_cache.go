@@ -213,6 +213,7 @@ func (c *SubtitleCache) ServeExtractWithResult(w http.ResponseWriter, r *http.Re
 	if err := r.Context().Err(); err != nil {
 		return ServeExtractResult{}, err
 	}
+	start := time.Now()
 	// Full demuxes can outlive the API listener's absolute write timeout.
 	// Reuse the media-stream deadline so progress continues while stalled
 	// connections still have a bounded write lifetime.
@@ -288,25 +289,37 @@ func (c *SubtitleCache) ServeExtractWithResult(w http.ResponseWriter, r *http.Re
 			}
 		}
 		if !result.ServedCommittedArtifact && !opts.DisableBackgroundWarm {
-			c.WarmTrackInBackground(opts, extract)
+			c.WarmTrackInBackground(opts, extract, subtitleTraceRequestID(r.Context()))
 		}
 	}
 
 	w.Header().Set("Cache-Control", "no-store")
-	var writer io.Writer = w
+	counter := &subtitleCountingWriter{w: w}
+	var writer io.Writer = counter
 	if fill != nil {
-		writer = fill.Tee(w)
+		writer = fill.Tee(counter)
 	}
 	opts.Writer = writer
 	err := extract(r.Context(), opts)
+	outcome := subtitleTraceOutcome(r.Context(), err)
 	if fill != nil {
 		if err != nil {
 			fill.Discard()
 		} else if commitErr := fill.Commit(); commitErr != nil {
-			slog.WarnContext(r.Context(), "subtitle cache commit failed",
-				"input", opts.InputPath, "track", opts.TrackIndex, "format", format, "error", commitErr)
+			outcome = SubtitleTraceOutcomeCommitFailed
+			slog.Log(r.Context(), slog.LevelWarn, "subtitle cache commit failed",
+				subtitleTraceAttrs(r.Context(), opts.SourceCodec, SubtitleTracePhaseServe, counter.bytes, outcome, -1,
+					"track", opts.TrackIndex, "format", format, "error", commitErr)...)
 		}
 	}
+	level := slog.LevelInfo
+	if outcome != SubtitleTraceOutcomeSuccess {
+		level = slog.LevelWarn
+	}
+	slog.Log(r.Context(), level, "subtitle extract served",
+		subtitleTraceAttrs(r.Context(), opts.SourceCodec, subtitlePhaseForOutput(opts.SourceCodec, opts.TargetFormat),
+			counter.bytes, outcome, time.Since(start),
+			"track", opts.TrackIndex, "format", format)...)
 	return result, err
 }
 
@@ -329,6 +342,13 @@ func (c *SubtitleCache) serveCached(w http.ResponseWriter, r *http.Request, opts
 		return false
 	}
 	defer func() { _ = cached.Close() }()
+	size := int64(SubtitleTraceBytesUnknown)
+	if info, statErr := cached.Stat(); statErr == nil {
+		size = info.Size()
+	}
+	slog.Log(r.Context(), slog.LevelDebug, "subtitle served from cache",
+		subtitleTraceAttrs(r.Context(), opts.SourceCodec, SubtitleTracePhaseServe, size, SubtitleTraceOutcomeCacheHit, -1,
+			"track", opts.TrackIndex, "format", format)...)
 	w.Header().Set("Cache-Control", "private, no-cache")
 	http.ServeContent(w, r, "", modTime, cached)
 	return true
@@ -466,6 +486,7 @@ func (c *SubtitleCache) ServeSUPExtract(w http.ResponseWriter, r *http.Request, 
 	if opts.AllowWindow {
 		return c.serveWindowedSUP(w, r, opts, extract)
 	}
+	start := time.Now()
 
 	if c.serveSUPEntry(w, r, opts) {
 		return nil
@@ -492,21 +513,33 @@ func (c *SubtitleCache) ServeSUPExtract(w http.ResponseWriter, r *http.Request, 
 
 	// BeginFill returns nil when no fill could be owned (cache unusable or a
 	// run of failed fills); this request then streams its own uncached extract.
-	var writer io.Writer = w
+	counter := &subtitleCountingWriter{w: w}
+	var writer io.Writer = counter
 	if fill != nil {
-		writer = fill.Tee(w)
+		writer = fill.Tee(counter)
 	}
 
 	opts.Writer = writer
 	err := extract(r.Context(), opts)
+	outcome := subtitleTraceOutcome(r.Context(), err)
 	if fill != nil {
 		if err != nil {
 			fill.Discard()
 		} else if commitErr := fill.Commit(); commitErr != nil {
-			slog.WarnContext(r.Context(), "subtitle cache commit failed",
-				"input", opts.InputPath, "track", opts.TrackIndex, "error", commitErr)
+			outcome = SubtitleTraceOutcomeCommitFailed
+			slog.Log(r.Context(), slog.LevelWarn, "subtitle cache commit failed",
+				subtitleTraceAttrs(r.Context(), opts.SourceCodec, SubtitleTracePhaseServe, counter.bytes, outcome, -1,
+					"track", opts.TrackIndex, "error", commitErr)...)
 		}
 	}
+	level := slog.LevelInfo
+	if outcome != SubtitleTraceOutcomeSuccess {
+		level = slog.LevelWarn
+	}
+	slog.Log(r.Context(), level, "subtitle extract served",
+		subtitleTraceAttrs(r.Context(), opts.SourceCodec, subtitlePhaseForOutput(opts.SourceCodec, opts.TargetFormat),
+			counter.bytes, outcome, time.Since(start),
+			"track", opts.TrackIndex, "format", subtitleFormatSUP)...)
 	return err
 }
 
@@ -520,8 +553,13 @@ func (c *SubtitleCache) serveSUPEntry(w http.ResponseWriter, r *http.Request, op
 		return false
 	}
 	defer func() { _ = cached.Close() }()
-	slog.DebugContext(r.Context(), "subtitle stream served from cache",
-		"input", opts.InputPath, "track", opts.TrackIndex)
+	size := int64(SubtitleTraceBytesUnknown)
+	if info, statErr := cached.Stat(); statErr == nil {
+		size = info.Size()
+	}
+	slog.Log(r.Context(), slog.LevelDebug, "subtitle stream served from cache",
+		subtitleTraceAttrs(r.Context(), opts.SourceCodec, SubtitleTracePhaseServe, size, SubtitleTraceOutcomeCacheHit, -1,
+			"track", opts.TrackIndex, "format", subtitleFormatSUP)...)
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Cache-Control", "private, no-cache")
 	http.ServeContent(w, r, "", modTime, cached)
@@ -542,7 +580,7 @@ func (c *SubtitleCache) serveWindowedSUP(w http.ResponseWriter, r *http.Request,
 		opts.InputPath = cachedPath
 		opts.InputIsExtractedSup = true
 	} else if !opts.DisableBackgroundWarm {
-		c.WarmInBackground(opts, extract)
+		c.WarmInBackground(opts, extract, subtitleTraceRequestID(r.Context()))
 	}
 
 	w.Header().Set("Content-Type", "application/octet-stream")
@@ -667,13 +705,16 @@ func (c *SubtitleCache) noteWarmOutcome(key string, success bool, now time.Time)
 // entry for opts' source+track, so future windowed requests can extract from
 // the small cached .sup instead of the original file. The warm runs on a
 // background context with a generous timeout — it must survive the request
-// that triggered it. BeginFill's in-flight coalescing guarantees at most one
-// fill per track (a concurrent client-driven fill wins and the warm is
-// skipped), and warmSem bounds warms server-wide: beyond the budget the warm
-// is dropped, not queued — the next windowed miss re-attempts it. A failed
-// warm puts the identity in a cooldown so repeated misses do not each spawn a
-// fresh full-track remote read. A nil receiver is a no-op.
-func (c *SubtitleCache) WarmInBackground(opts StreamExtractOpts, extract SUPExtractFunc) {
+// that triggered it. requestID is the triggering request's ID, captured at the
+// boundary because the detached context no longer carries it; it is threaded
+// into the warm's traces so they join that request. BeginFill's in-flight
+// coalescing guarantees at most one fill per track (a concurrent client-driven
+// fill wins and the warm is skipped), and warmSem bounds warms server-wide:
+// beyond the budget the warm is dropped, not queued — the next windowed miss
+// re-attempts it. A failed warm puts the identity in a cooldown so repeated
+// misses do not each spawn a fresh full-track remote read. A nil receiver is a
+// no-op.
+func (c *SubtitleCache) WarmInBackground(opts StreamExtractOpts, extract SUPExtractFunc, requestID string) {
 	if c == nil || extract == nil {
 		return
 	}
@@ -708,7 +749,8 @@ func (c *SubtitleCache) WarmInBackground(opts StreamExtractOpts, extract SUPExtr
 	opts.WindowRequested = false
 	opts.AllowWindow = false
 	opts.InputIsExtractedSup = false
-	opts.Writer = fill.Tee(io.Discard)
+	counter := &subtitleCountingWriter{w: fill.Tee(io.Discard)}
+	opts.Writer = counter
 
 	go func() {
 		defer func() { <-c.warmSem }()
@@ -721,21 +763,22 @@ func (c *SubtitleCache) WarmInBackground(opts StreamExtractOpts, extract SUPExtr
 		if err := extract(ctx, opts); err != nil {
 			fill.Discard()
 			c.noteWarmOutcome(key, false, time.Now())
-			slog.Warn("subtitle cache warm failed",
-				"input", opts.InputPath, "track", opts.TrackIndex,
-				"elapsed_ms", time.Since(start).Milliseconds(), "error", err)
+			slog.Log(ctx, slog.LevelWarn, "subtitle cache warm failed",
+				subtitleTraceAttrsForRequest(requestID, opts.SourceCodec, SubtitleTracePhaseWarm, counter.bytes, subtitleTraceOutcome(ctx, err), time.Since(start),
+					"input", opts.InputPath, "track", opts.TrackIndex, "error", err)...)
 			return
 		}
 		if err := fill.Commit(); err != nil {
 			c.noteWarmOutcome(key, false, time.Now())
-			slog.Warn("subtitle cache warm commit failed",
-				"input", opts.InputPath, "track", opts.TrackIndex, "error", err)
+			slog.Log(ctx, slog.LevelWarn, "subtitle cache warm commit failed",
+				subtitleTraceAttrsForRequest(requestID, opts.SourceCodec, SubtitleTracePhaseWarm, counter.bytes, SubtitleTraceOutcomeCommitFailed, time.Since(start),
+					"input", opts.InputPath, "track", opts.TrackIndex, "error", err)...)
 			return
 		}
 		c.noteWarmOutcome(key, true, time.Now())
-		slog.Info("subtitle cache warm finished",
-			"input", opts.InputPath, "track", opts.TrackIndex,
-			"elapsed_ms", time.Since(start).Milliseconds())
+		slog.Log(ctx, slog.LevelInfo, "subtitle cache warm finished",
+			subtitleTraceAttrsForRequest(requestID, opts.SourceCodec, SubtitleTracePhaseWarm, counter.bytes, SubtitleTraceOutcomeCommitted, time.Since(start),
+				"input", opts.InputPath, "track", opts.TrackIndex)...)
 	}()
 }
 
@@ -746,7 +789,10 @@ func (c *SubtitleCache) WarmInBackground(opts StreamExtractOpts, extract SUPExtr
 // when the warm finished (success or failure), and when it was skipped (warm
 // slots busy, another fill in flight, cache disabled, already cached, or the
 // identity is in its failure cooldown). Callers use it to release a
-// request-scoped relay registration the warm held open.
+// request-scoped relay registration the warm held open. requestID is the
+// triggering request's ID, captured at the boundary because the detached
+// context no longer carries it; it is threaded into the warm's traces so they
+// join that request.
 //
 // A warm whose extract fails is not retried immediately: noteWarmOutcome puts
 // the identity in an exponentially growing cooldown, so repeated windowed
@@ -757,7 +803,7 @@ func (c *SubtitleCache) WarmInBackground(opts StreamExtractOpts, extract SUPExtr
 // bucket as every other cache lookup: an entry committed under an
 // earlier bucket is not found by later lookups, so a warm that loses its
 // bucket race is simply re-kicked by the next windowed miss.
-func (c *SubtitleCache) WarmTrackInBackground(opts StreamExtractOpts, extract SUPExtractFunc) <-chan struct{} {
+func (c *SubtitleCache) WarmTrackInBackground(opts StreamExtractOpts, extract SUPExtractFunc, requestID string) <-chan struct{} {
 	done := make(chan struct{})
 	format := subtitleCacheFormat(opts.SourceCodec, opts.TargetFormat)
 	if c == nil || extract == nil || c.dir() == "" || format == "" {
@@ -805,7 +851,8 @@ func (c *SubtitleCache) WarmTrackInBackground(opts StreamExtractOpts, extract SU
 	opts.AllowWindow = false
 	opts.InputIsExtractedSup = false
 	opts.InputIsExtractedText = ""
-	opts.Writer = fill.Tee(io.Discard)
+	counter := &subtitleCountingWriter{w: fill.Tee(io.Discard)}
+	opts.Writer = counter
 
 	go func() {
 		defer close(done)
@@ -819,21 +866,22 @@ func (c *SubtitleCache) WarmTrackInBackground(opts StreamExtractOpts, extract SU
 		if err := extract(ctx, opts); err != nil {
 			fill.Discard()
 			c.noteWarmOutcome(key, false, time.Now())
-			slog.Warn("subtitle cache warm failed",
-				"input", opts.InputPath, "track", opts.TrackIndex, "format", format,
-				"elapsed_ms", time.Since(start).Milliseconds(), "error", err)
+			slog.Log(ctx, slog.LevelWarn, "subtitle cache warm failed",
+				subtitleTraceAttrsForRequest(requestID, opts.SourceCodec, SubtitleTracePhaseWarm, counter.bytes, subtitleTraceOutcome(ctx, err), time.Since(start),
+					"input", opts.InputPath, "track", opts.TrackIndex, "format", format, "error", err)...)
 			return
 		}
 		if err := fill.Commit(); err != nil {
 			c.noteWarmOutcome(key, false, time.Now())
-			slog.Warn("subtitle cache warm commit failed",
-				"input", opts.InputPath, "track", opts.TrackIndex, "error", err)
+			slog.Log(ctx, slog.LevelWarn, "subtitle cache warm commit failed",
+				subtitleTraceAttrsForRequest(requestID, opts.SourceCodec, SubtitleTracePhaseWarm, counter.bytes, SubtitleTraceOutcomeCommitFailed, time.Since(start),
+					"input", opts.InputPath, "track", opts.TrackIndex, "format", format, "error", err)...)
 			return
 		}
 		c.noteWarmOutcome(key, true, time.Now())
-		slog.Info("subtitle cache warm finished",
-			"input", opts.InputPath, "track", opts.TrackIndex, "format", format,
-			"elapsed_ms", time.Since(start).Milliseconds())
+		slog.Log(ctx, slog.LevelInfo, "subtitle cache warm finished",
+			subtitleTraceAttrsForRequest(requestID, opts.SourceCodec, SubtitleTracePhaseWarm, counter.bytes, SubtitleTraceOutcomeCommitted, time.Since(start),
+				"input", opts.InputPath, "track", opts.TrackIndex, "format", format)...)
 	}()
 	return done
 }
@@ -913,6 +961,9 @@ func (c *SubtitleCache) ExtractText(ctx context.Context, inputPath string, track
 		return nil, fmt.Errorf("unsupported cached subtitle format")
 	}
 	if data, ok := c.LookupText(inputPath, trackIndex, format); ok {
+		slog.Log(ctx, slog.LevelDebug, "subtitle text served from cache",
+			subtitleTraceAttrs(ctx, "", SubtitleTracePhaseServe, int64(len(data)), SubtitleTraceOutcomeCacheHit, -1,
+				"track", trackIndex, "format", format)...)
 		return data, nil
 	}
 	fill := c.beginFill(inputPath, "", trackIndex, format)
@@ -927,7 +978,9 @@ func (c *SubtitleCache) ExtractText(ctx context.Context, inputPath string, track
 		// Tee records cache write failures; its destination io.Discard cannot fail.
 		_, _ = fill.Tee(io.Discard).Write(data)
 		if err := fill.Commit(); err != nil {
-			slog.WarnContext(ctx, "subtitle cache commit failed", "error", err)
+			slog.Log(ctx, slog.LevelWarn, "subtitle cache commit failed",
+				subtitleTraceAttrs(ctx, "", SubtitleTracePhaseWarm, int64(len(data)), SubtitleTraceOutcomeCommitFailed, -1,
+					"track", trackIndex, "format", format, "error", err)...)
 		}
 	}
 	return data, nil
