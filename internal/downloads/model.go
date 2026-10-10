@@ -82,6 +82,17 @@ var (
 	// could not be reached. The asset may exist; the client should retry.
 	ErrAssetUnavailable  = errors.New("download asset is temporarily unavailable")
 	ErrFormatUnavailable = errors.New("requested download format is not available")
+	// ErrFileUnavailable means the requested media file_id no longer resolves:
+	// the row was deleted, replaced by virtual rotation, or marked missing.
+	// ResolveDirectFile wraps it with catalog.ErrItemNotFound so every existing
+	// not-found check still matches; the direct-download surface reads this
+	// sentinel to answer a stale version with its own code instead of a generic
+	// 404 so the client knows to refresh the version list.
+	ErrFileUnavailable = errors.New("requested media file is no longer available")
+	// ErrFileAccessDenied means the media file exists but the caller's access
+	// filter refuses it (library scope, maturity, or the profile's quality
+	// ceiling). Like ErrFileUnavailable it wraps catalog.ErrItemNotFound.
+	ErrFileAccessDenied = errors.New("requested media file is not accessible to this profile")
 	// ErrResponseCommitted reports a transfer failure after response headers
 	// were written. Handlers must not append an API error body, while service
 	// lifecycle code must still treat the transfer as incomplete.

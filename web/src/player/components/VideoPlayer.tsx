@@ -49,7 +49,12 @@ import type {
 import { PENDING_SEEK_HOLD_TIMEOUT_MS, resolvePendingSeekTime } from "../utils/pendingSeek";
 import { resolveVersionAudioLanguage } from "../utils/effectiveAudioLanguage";
 import { resolveEffectiveVersion } from "../utils/resolveEffectiveVersion";
-import { HlsStartupGuard } from "../utils/hlsStartupGuard";
+import {
+  HlsStartupGuard,
+  MAX_STALE_GENERATION_RECOVERIES,
+  isStaleGenerationError,
+  recoverFromStaleGeneration,
+} from "../utils/hlsStartupGuard";
 import { isSafariBrowserV3, resolveHLSEngineV3 } from "../utils/hlsEngine";
 import {
   hlsBufferPolicy,
@@ -548,6 +553,7 @@ export function VideoPlayer({
   const bufferPolicyRef = useRef(hlsBufferPolicy(0));
   const mediaRecoveryAttemptsRef = useRef(0);
   const networkRecoveryAttemptsRef = useRef(0);
+  const staleGenerationRecoveriesRef = useRef(0);
   const lastRecoveryRef = useRef(0);
   const reportedPlanFailureKeyRef = useRef<string | null>(null);
   // Whether the current transport has shown a frame. A network error after
@@ -2272,6 +2278,7 @@ export function VideoPlayer({
 
     mediaRecoveryAttemptsRef.current = 0;
     networkRecoveryAttemptsRef.current = 0;
+    staleGenerationRecoveriesRef.current = 0;
     setError(null);
     setAwaitingFirstFrame(true);
 
@@ -2585,6 +2592,31 @@ export function VideoPlayer({
                 return;
               }
 
+              // A stale-generation fence reaches hls.js as a fatal fragment
+              // network error carrying the server's 412. The failing segment URL
+              // was minted with an `sgen` token for an FFmpeg incarnation the
+              // server has since replaced (a seek reanchor or switchover), and
+              // the server refuses to serve another generation's bytes. Retrying
+              // that same URL can never succeed, so invalidate the cached
+              // playlist and fetch it again: the fresh manifest rebuilds every
+              // segment URL with the current token. This sits before the
+              // throttle/network-recovery budget because it is a deterministic
+              // redirect, not a transport failure.
+              if (data.type === Hls.ErrorTypes.NETWORK_ERROR && isStaleGenerationError(data)) {
+                if (
+                  hls &&
+                  staleGenerationRecoveriesRef.current < MAX_STALE_GENERATION_RECOVERIES &&
+                  recoverFromStaleGeneration(hls, video.currentTime)
+                ) {
+                  staleGenerationRecoveriesRef.current++;
+                  console.warn("[hls.js] Segment generation is stale; refetching playlist", {
+                    details: data.details,
+                    url: data.frag?.url ?? data.url,
+                  });
+                  return;
+                }
+              }
+
               const now = Date.now();
               if (now - lastRecoveryRef.current < 3000) return;
               lastRecoveryRef.current = now;
@@ -2656,6 +2688,13 @@ export function VideoPlayer({
             hls.on(Hls.Events.BUFFER_APPENDED, () => {
               if (destroyed) return;
               networkRecoveryAttemptsRef.current = 0;
+              // Observed progress is what re-arms the stale-generation budget:
+              // a refetch whose rebuilt playlist actually appended media
+              // recovered, so a later ordinary seek that hits a fence again gets
+              // its own recovery budget instead of inheriting an exhausted
+              // counter and falling through to a failure-recovery replan. Only
+              // consecutive fences without progress still exhaust the cap.
+              staleGenerationRecoveriesRef.current = 0;
               attemptAutoplayWhenReady();
             });
 

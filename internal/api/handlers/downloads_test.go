@@ -887,6 +887,77 @@ func TestHandleDirectDownloadUnknownFileIsNotFound(t *testing.T) {
 	}
 }
 
+// The frozen v1 direct-download routes keep their historical wire answers: a
+// stale/unknown file_id, an access-filter refusal, and a virtual row all
+// collapse to the same 404/not_found v1 has always returned. Only a
+// non-original format query, which never wrapped catalog.ErrItemNotFound, keeps
+// its pre-existing 501.
+func TestHandleDirectDownloadV1KeepsLegacyRefusalResponses(t *testing.T) {
+	cases := []struct {
+		name   string
+		err    error
+		status int
+		code   string
+	}{
+		{"unknown", fmt.Errorf("%w: %w", downloads.ErrFileUnavailable, catalog.ErrItemNotFound), http.StatusNotFound, "not_found"},
+		{"denied", fmt.Errorf("%w: %w", downloads.ErrFileAccessDenied, catalog.ErrItemNotFound), http.StatusNotFound, "not_found"},
+		{"virtual", fmt.Errorf("%w: %w", downloads.ErrFormatUnavailable, catalog.ErrItemNotFound), http.StatusNotFound, "not_found"},
+		{"format", downloads.ErrFormatUnavailable, http.StatusNotImplemented, "format_unavailable"},
+	}
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		for _, tc := range cases {
+			t.Run(tc.name+"_"+method, func(t *testing.T) {
+				h := NewDownloadHandler(&fakeDownloadService{directErr: tc.err})
+				rec := httptest.NewRecorder()
+				h.HandleDirectDownload(rec, downloadTestRequest(method, "/direct-download?file_id=42", nil, 7, "", ""))
+				assertDirectErrorCode(t, rec, tc.status, tc.code)
+			})
+		}
+	}
+}
+
+// The distinct refusal codes are additive on the v2 handler, where the byte
+// adapter maps them onto problem types. A stale file_id, an access refusal, and
+// a virtual row each stay distinguishable so the picker can refresh versions
+// for the first instead of showing a dead end.
+func TestHandleDirectDownloadV2ExposesDistinctRefusalCodes(t *testing.T) {
+	cases := []struct {
+		name   string
+		err    error
+		status int
+		code   string
+	}{
+		{"unknown", fmt.Errorf("%w: %w", downloads.ErrFileUnavailable, catalog.ErrItemNotFound), http.StatusNotFound, "file_unavailable"},
+		{"denied", fmt.Errorf("%w: %w", downloads.ErrFileAccessDenied, catalog.ErrItemNotFound), http.StatusForbidden, "file_access_denied"},
+		{"virtual", fmt.Errorf("%w: %w", downloads.ErrFormatUnavailable, catalog.ErrItemNotFound), http.StatusNotImplemented, "format_unavailable"},
+		{"format", downloads.ErrFormatUnavailable, http.StatusNotImplemented, "format_unavailable"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := NewDownloadHandler(&fakeDownloadService{directErr: tc.err})
+			rec := httptest.NewRecorder()
+			h.HandleDirectDownloadV2(rec, downloadTestRequest(http.MethodGet, "/direct-download?file_id=42", nil, 7, "", ""))
+			assertDirectErrorCode(t, rec, tc.status, tc.code)
+		})
+	}
+}
+
+func assertDirectErrorCode(t *testing.T, rec *httptest.ResponseRecorder, status int, code string) {
+	t.Helper()
+	if rec.Code != status {
+		t.Fatalf("status = %d, want %d (body: %s)", rec.Code, status, rec.Body.String())
+	}
+	var body struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode body: %v (body: %s)", err, rec.Body.String())
+	}
+	if body.Error != code {
+		t.Fatalf("code = %q, want %q", body.Error, code)
+	}
+}
+
 func TestProxyPreflightCachesReachabilityByNodeAndPath(t *testing.T) {
 	requests := 0
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

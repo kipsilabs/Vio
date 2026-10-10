@@ -214,6 +214,7 @@ export default function ItemDetail() {
         <MovieContent
           item={item as ItemDetail & { type: "movie" }}
           showAdvisoryAge={showAdvisoryAge}
+          onStaleVersion={() => void refetch()}
         />
       );
     case "series":
@@ -226,7 +227,12 @@ export default function ItemDetail() {
     case "season":
       return <SeasonContent item={item as ItemDetail & { type: "season" }} />;
     case "episode":
-      return <EpisodeContent item={item as ItemDetail & { type: "episode" }} />;
+      return (
+        <EpisodeContent
+          item={item as ItemDetail & { type: "episode" }}
+          onStaleVersion={() => void refetch()}
+        />
+      );
     case "audiobook":
       return (
         <AudiobookContent item={item as ItemDetail & { type: "audiobook" }} libraryId={libraryId} />
@@ -237,6 +243,7 @@ export default function ItemDetail() {
           item={item as ItemDetail & { type: "ebook" }}
           libraryId={libraryId}
           showAdvisoryAge={showAdvisoryAge}
+          onStaleVersion={() => void refetch()}
         />
       );
     case "manga":

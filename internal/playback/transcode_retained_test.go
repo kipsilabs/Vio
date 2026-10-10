@@ -55,6 +55,64 @@ func TestRetireTranscodeSessionPredecessorKeepsSegmentServable(t *testing.T) {
 	}
 }
 
+// TestRetireTranscodeSessionPredecessorPreservesGenerationToken proves the
+// retained predecessor keeps the exact sgen token its in-flight playlist was
+// minted with. Retiring stops the process, and if that stop advanced the
+// generation the published token would no longer match: every one-behind
+// segment request would be refused with 412 and the client would loop on a dead
+// URL instead of being served the predecessor's already-produced bytes. This is
+// the switchover regression the retained overlap exists to prevent.
+func TestRetireTranscodeSessionPredecessorPreservesGenerationToken(t *testing.T) {
+	m := NewTranscodeManager()
+	dir := filepath.Join(t.TempDir(), "gen-old")
+	old := readyRetainedSession(t, dir)
+	// The token a manifest builder put on the client's in-flight segment URLs
+	// before the switch.
+	publishedToken := old.GenerationToken()
+	if publishedToken == "" {
+		t.Fatal("setup: predecessor has no generation token")
+	}
+
+	m.RetireTranscodeSessionPredecessor("s1", old, RetainedGenerationRetention)
+
+	retained := m.GetRetainedTranscodeSession("s1")
+	if retained != old {
+		t.Fatalf("retained generation = %v, want the displaced predecessor", retained)
+	}
+	if !retained.MatchesGenerationToken(publishedToken) {
+		t.Fatalf("retained predecessor no longer matches the published token %q; a tokened one-behind request would 412", publishedToken)
+	}
+	// A tokened read of the predecessor's own segment succeeds, so the segment
+	// and manifest fences agree on what the retained generation owns.
+	lease, err := retained.OpenSegmentForGeneration("seg_00000.ts", publishedToken)
+	if err != nil {
+		t.Fatalf("retained predecessor refused its own published token: %v", err)
+	}
+	_ = lease.Close()
+}
+
+// TestRetireTranscodeSessionPredecessorRetiresTokenAfterReplacement proves a
+// second switch does not leave the first, now-closed predecessor answerable:
+// only the most recently displaced bytes stay servable, and its token is the
+// one the retained generation matches.
+func TestRetireTranscodeSessionPredecessorRetiresTokenAfterReplacement(t *testing.T) {
+	m := NewTranscodeManager()
+	first := readyRetainedSession(t, filepath.Join(t.TempDir(), "gen-first"))
+	firstToken := first.GenerationToken()
+	second := readyRetainedSession(t, filepath.Join(t.TempDir(), "gen-second"))
+
+	m.RetireTranscodeSessionPredecessor("s1", first, RetainedGenerationRetention)
+	m.RetireTranscodeSessionPredecessor("s1", second, RetainedGenerationRetention)
+
+	retained := m.GetRetainedTranscodeSession("s1")
+	if retained != second {
+		t.Fatalf("retained generation = %v, want the newest predecessor", retained)
+	}
+	if retained.MatchesGenerationToken(firstToken) {
+		t.Fatal("the replaced predecessor's token still matches the retained generation")
+	}
+}
+
 // TestRetainedGenerationExpires proves the overlap is bounded: once the
 // retention window lapses, the retained entry is reaped (and its directory
 // removed) on read, so a stale generation cannot be served forever.

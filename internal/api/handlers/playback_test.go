@@ -351,6 +351,10 @@ func (failingSessionManager) StopSession(string) error { return nil }
 
 func (failingSessionManager) GetSession(string) (*playback.Session, error) { return nil, nil }
 
+func (failingSessionManager) MarkClientCanceled(string) error { return nil }
+
+func (failingSessionManager) ClearClientCanceled(string) error { return nil }
+
 func newPlaybackTestStore(t *testing.T) userstore.UserStore {
 	t.Helper()
 

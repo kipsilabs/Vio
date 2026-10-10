@@ -50,9 +50,11 @@ import { useDetailWatchTogether } from "@/pages/watchtogether/DetailWatchTogethe
 export default function MovieContent({
   item,
   showAdvisoryAge,
+  onStaleVersion,
 }: {
   item: ItemDetail & { type: "movie" };
   showAdvisoryAge?: boolean;
+  onStaleVersion?: (fileId: number) => void;
 }) {
   const { translating: overviewTranslating, onTranslate: onTranslateOverview } =
     useOnViewTranslation(item);
@@ -420,6 +422,8 @@ export default function MovieContent({
             onOpenChange={setDownloadOpen}
             versions={item.versions}
             title={title}
+            selectedFileId={selectedVersion?.file_id}
+            onStaleVersion={onStaleVersion}
           />
           <SubtitleSearchDialog
             open={subtitleSearchOpen}

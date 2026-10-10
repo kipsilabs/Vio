@@ -157,7 +157,7 @@ func registerDirectDownloads(reg *Registry) {
 		if route.proxy {
 			responses["307"] = &huma.Response{Description: "Authorized target on the selected proxy; short-lived signed URL. Not a receipt for successful transfer.", Headers: map[string]*huma.Param{jobLocationHeader: {Schema: &huma.Schema{Type: huma.TypeString}}}}
 		}
-		for _, status := range []int{400, 404, 409, 412, 416, 422, 500, 503} {
+		for _, status := range []int{400, 403, 404, 409, 412, 416, 422, 500, 501, 503} {
 			responses[strconv.Itoa(status)] = &huma.Response{Description: http.StatusText(status), Content: map[string]*huma.MediaType{problemContentType: {Schema: reg.api.OpenAPI().Components.Schemas.Schema(reflect.TypeFor[Problem](), true, "")}}}
 		}
 		responses["416"].Headers = map[string]*huma.Param{directContentRange: {Schema: &huma.Schema{Type: huma.TypeString}}}
@@ -223,13 +223,50 @@ func urlParseDirectQuery(r *http.Request) (url.Values, *Problem) {
 // This adapter is independent of the held playback executor/runtime transport.
 type directDownloadWriter struct {
 	http.ResponseWriter
-	request *http.Request
-	inner   *streamResponseWriter
+	request     *http.Request
+	inner       *streamResponseWriter
+	problemCode string
+}
+
+// SetPlaybackProblemCode captures the v1 machine-readable code for the next
+// pre-body WriteHeader. writeError discards its JSON body in favor of a
+// Problem envelope keyed on status; without the code, a stale file_id and any
+// other 404 would both read `not_found`. It is a no-op after commitment.
+func (w *directDownloadWriter) SetPlaybackProblemCode(code string) {
+	if w.problemCode == "" {
+		w.problemCode = code
+	}
+}
+
+// directDownloadProblemType maps a pre-body failure onto the catalog. The
+// direct-download resolver writes file_unavailable (a stale/unknown file_id)
+// and file_access_denied (an access refusal) with statuses that the catalog
+// otherwise collapses onto not_found and permission_denied. The code is only
+// honored when its declared status agrees with the response status, so a
+// mismatched handler can never mint a type whose status disagrees.
+func directDownloadProblemType(status int, code string) ProblemType {
+	switch status {
+	case http.StatusNotFound:
+		if code == TypeFileUnavailable.ID {
+			return TypeFileUnavailable
+		}
+	case http.StatusForbidden:
+		if code == TypeFileAccessDenied.ID {
+			return TypeFileAccessDenied
+		}
+	case http.StatusNotImplemented:
+		if code == TypeFormatUnavailable.ID {
+			return TypeFormatUnavailable
+		}
+	}
+	return TypeForStatus(status)
 }
 
 func (w *directDownloadWriter) transport() *streamResponseWriter {
 	if w.inner == nil {
-		w.inner = &streamResponseWriter{ResponseWriter: w.ResponseWriter, request: w.request, problemType: TypeForStatus, redactHeaders: []string{directContentLength, directContentType, directDisposition, directContentEncoding, jobLocationHeader, etagField, directLastModified}}
+		w.inner = &streamResponseWriter{ResponseWriter: w.ResponseWriter, request: w.request, problemType: func(status int) ProblemType {
+			return directDownloadProblemType(status, w.problemCode)
+		}, redactHeaders: []string{directContentLength, directContentType, directDisposition, directContentEncoding, jobLocationHeader, etagField, directLastModified}}
 	}
 	return w.inner
 }

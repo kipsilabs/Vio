@@ -6252,6 +6252,7 @@ func (h *PlaybackHandler) v3SessionStreamState(ctx context.Context, session *pla
 		TranscodeAudio:                result.TranscodeAudio,
 		RemuxDVMode:                   remuxDVModeForPlanV3(result.Plan),
 		DVProfile:                     planDVProfileV3(result.Plan),
+		DVProfilePin:                  playback.PinDVPinV3(playback.DVPinV3{}, file, planDVProfileV3(result.Plan)),
 		RemuxResumeLeadingPictureDrop: result.RemuxResumeLeadingPictureDrop,
 		TranscodeHWAccel:              transport.hwAccel,
 		ToneMapMode:                   transport.toneMapMode,
@@ -8098,6 +8099,39 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	if !ok {
 		return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: "internal_error", message: "The live session manager does not support atomic replacement."}
 	}
+	// A transport cancel is evidence about one request, not a verdict on the
+	// session: the viewer may have navigated off, or hls.js may have given up
+	// and retried. It must never fence a live client's failure_recovery or
+	// answer it as a missing session — at this layer a live recovery is
+	// indistinguishable from a stale one, and running a superfluous recovery
+	// costs far less than retiring a healthy session. Keep the mark
+	// route-scoped so a predecessor's cancel cannot outlive its route, log it
+	// for diagnostics, and drop a superseded one. A genuine stop stays fenced
+	// by the session lookup above, which answers session_expired when the
+	// session is gone or stopped.
+	if failureRecoveryOperationV3(operation) &&
+		sessionClientCanceledRecentlyV3(session.ClientCanceled.At, time.Now()) {
+		currentRoute := session.ClientCancelNamesCurrentRoute()
+		outcome := "zombie_recovery_candidate"
+		if !currentRoute {
+			outcome = "zombie_recovery_stale"
+		}
+		slog.InfoContext(r.Context(), "playback failure recovery ran after a canceled transport",
+			logComponentKey, playbackLogValueV3,
+			"outcome", outcome,
+			"session_id", record.SessionID,
+			"operation", string(operation),
+			"failure_classification", req.Failure.Classification,
+			"canceled_at", session.ClientCanceled.At.UTC().Format(time.RFC3339Nano),
+			"canceled_revision", session.ClientCanceled.StreamRevision,
+			"canceled_binding_generation", session.ClientCanceled.BindingGeneration,
+		)
+		if !currentRoute {
+			// The mark names a route this session has already replaced. Drop it
+			// so a predecessor's cancel cannot color a later read.
+			_ = h.sessionMgr.ClearClientCanceled(record.SessionID)
+		}
+	}
 	// An explicit virtual version pin is never substituted. A decode rejection
 	// on it terminalls immediately with the version-list hint so the viewer can
 	// pick another release; rotation is reserved for auto selections.
@@ -8325,6 +8359,11 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	} else {
 		currentEffectiveFile = h.ensurePlaybackProbe(r.Context(), currentEffectiveFile)
 	}
+	// Freeze the session's first-verified Dolby Vision profile onto the freshly
+	// read effective file before planning. A replan re-reads the catalog row and
+	// can see a drifted dv_profile on bytes that never changed; the pin keeps
+	// route selection stable for the session without touching catalog state.
+	applyDVPinToEffectiveFileV3(session, currentEffectiveFile)
 	if virtualRehydrationFailed && operation != playback.ReplanOperationFailureRecoveryV3 {
 		return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{
 			reason: "virtual_source_unavailable", message: "The virtual source could not be refreshed for playback.", retryable: true, cause: virtualRehydrationErr,
@@ -8671,7 +8710,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				// and the viewer can repeat the change.
 				return playback.DecisionResponseV3{}, *record, nil, subtitleArtifactErrorV3("Downloaded subtitles are temporarily unavailable.", inventoryErr)
 			}
-			result, toneMapCapabilityErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: start, RequestedFile: plannerRequestedFile, EffectiveFile: effectiveFile, ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), AudioTrackIndex: audioIndex, Settings: plannerSettings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: attemptedKeys, AdditionalSubtitles: additional, ForceSoftwareVideoDecode: forceSoftwareDecode, DecodeAttemptDetail: decodeAttemptDetail, InventoryProvenance: string(replanVirtualProvenance)})
+			result, toneMapCapabilityErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: start, RequestedFile: plannerRequestedFile, EffectiveFile: effectiveFile, ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), AudioTrackIndex: audioIndex, Settings: plannerSettings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: attemptedKeys, AdditionalSubtitles: additional, ForceSoftwareVideoDecode: forceSoftwareDecode, DecodeAttemptDetail: decodeAttemptDetail, StickyDelivery: replanStickyDeliveryV3(operation, record.CurrentPlan.Delivery), InventoryProvenance: string(replanVirtualProvenance)})
 			clampPlannerTargetResolution(&result, effectiveFile)
 			reportDetourSubtitleDrop()
 		}
@@ -8691,7 +8730,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			if err != nil {
 				return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: trackUnavailableReasonV3, message: err.Error()}
 			}
-			result, toneMapCapabilityErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: start, RequestedFile: plannerRequestedFile, EffectiveFile: effectiveFile, ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), AudioTrackIndex: audioIndex, Settings: plannerSettings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: attemptedKeys, AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), effectiveFile), ForceSoftwareVideoDecode: forceSoftwareDecode, DecodeAttemptDetail: decodeAttemptDetail})
+			result, toneMapCapabilityErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: start, RequestedFile: plannerRequestedFile, EffectiveFile: effectiveFile, ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), AudioTrackIndex: audioIndex, Settings: plannerSettings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: attemptedKeys, AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), effectiveFile), ForceSoftwareVideoDecode: forceSoftwareDecode, DecodeAttemptDetail: decodeAttemptDetail, StickyDelivery: replanStickyDeliveryV3(operation, record.CurrentPlan.Delivery)})
 			clampPlannerTargetResolution(&result, effectiveFile)
 
 		}
@@ -9030,6 +9069,15 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			"play_method_changed", deliveryChange.PlayMethodChanged,
 		)
 	}
+	// Record the delivery-stickiness decision beside the swap marker: a replan
+	// with no failure behind it prefers the running pipeline (see
+	// replanStickyDeliveryV3), so operators can tell a deliberate keep from a
+	// swap that never happened to occur. delivery_sticky is true only when the
+	// planner had to retry to keep the class; sticky_delivery names the class.
+	replanLogAttrs = append(replanLogAttrs, "delivery_sticky", result.StickyDeliveryKept)
+	if result.StickyDeliveryKept {
+		replanLogAttrs = append(replanLogAttrs, "sticky_delivery", result.Plan.Delivery)
+	}
 	slog.InfoContext(r.Context(), "playback replan decided", append(replanLogAttrs, clientInfo.LogAttrs()...)...)
 	mode = headerAuthenticatedMediaV3(start.ClientFeatures)
 	_, reservationHeld = h.sessionMgr.(replacementReservationCancellerV3)
@@ -9272,6 +9320,25 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	}
 	reservationHandedOff = true
 	return response, updated, &transport, nil
+}
+
+// replanStickyDeliveryV3 decides whether a replan should prefer to keep the
+// delivery the session is already serving. Stickiness is a user-intent backstop,
+// not a failure-recovery policy: a failure recovery (or its seek-scoped variant)
+// carries an explicit verdict about the current route and must remain free to
+// move. Every other operation — track, quality, output, seek reanchor, and the
+// automatic audio correction — has no failure behind it, so re-deriving the
+// delivery from scratch can only thrash the pipeline. The returned value is the
+// current delivery for those operations; the planner keeps it only when it
+// genuinely can still serve the request, and a principled switch (burn-in,
+// forced encode, quality ladder) still wins.
+func replanStickyDeliveryV3(operation playback.ReplanOperationV3, current playback.DeliveryV3) playback.DeliveryV3 {
+	switch operation {
+	case playback.ReplanOperationFailureRecoveryV3, playback.ReplanOperationSeekFailureRecoveryV3:
+		return ""
+	default:
+		return current
+	}
 }
 
 // deliveryChangeV3 builds the additive mid-session delivery-swap marker, or
@@ -11145,11 +11212,36 @@ func failureClassificationKeyV3(classification string) string {
 // delivery with an explicit transport-failure classification — the moment
 // the attempt learns, durably, that the delivery failed.
 func failureRecoveryAbandonedDeliveryV3(operation playback.ReplanOperationV3, failureClassification string) bool {
-	if operation != playback.ReplanOperationFailureRecoveryV3 &&
-		operation != playback.ReplanOperationSeekFailureRecoveryV3 {
+	if !failureRecoveryOperationV3(operation) {
 		return false
 	}
 	return transportFailureClassificationsV3[failureClassificationKeyV3(failureClassification)]
+}
+
+// failureRecoveryOperationV3 reports whether operation is a failure recovery or
+// its seek-scoped variant: a replan that exists because the current route
+// failed, as opposed to a user-intent change or an automatic correction.
+func failureRecoveryOperationV3(operation playback.ReplanOperationV3) bool {
+	return operation == playback.ReplanOperationFailureRecoveryV3 ||
+		operation == playback.ReplanOperationSeekFailureRecoveryV3
+}
+
+// clientCanceledRecoveryWindow bounds how long after an observed transport
+// cancel a failure_recovery that still names the same route is reported as a
+// zombie candidate. It only colors the diagnostic: a cancel is never proof the
+// session died, so it does not fence the recovery. The recovery path still
+// drops a mark a committed successor has superseded.
+const clientCanceledRecoveryWindow = 90 * time.Second
+
+// sessionClientCanceledRecentlyV3 reports whether a transport cancel was
+// observed for the session inside the diagnostic window. A zero cancel time
+// means no cancel was recorded.
+func sessionClientCanceledRecentlyV3(canceledAt, now time.Time) bool {
+	if canceledAt.IsZero() {
+		return false
+	}
+	age := now.Sub(canceledAt)
+	return age >= 0 && age <= clientCanceledRecoveryWindow
 }
 
 // planHasVideoEncodeV3 reports whether a plan carries a real video encode.
@@ -11806,6 +11898,21 @@ func planDVProfileV3(plan *playback.PlanV3) int {
 // the plan names: executors validate that version against what they advertise
 // before starting, and a node that predates the chain rejects it, so a plan
 // frozen at an older recipe fails rather than copying Dolby Vision unstripped.
+
+// applyDVPinToEffectiveFileV3 overwrites a freshly loaded effective media
+// file's Dolby Vision profile with the session's first-verified-wins pin when
+// the pin names that same file. A replan re-reads the catalog row and can see
+// a drifting dv_profile on bytes that never changed; pinning the planner's
+// input keeps route selection stable for the session without touching catalog
+// state (the file is a per-request load). The pin never crosses files, so a
+// substitution or candidate rotation still plans from the new file's own read.
+func applyDVPinToEffectiveFileV3(session *playback.Session, file *models.MediaFile) {
+	if session == nil || file == nil {
+		return
+	}
+	playback.ApplyDVPinToFileV3(file, session.DVProfilePin)
+}
+
 func videoBitstreamFilterForPlanV3(plan *playback.PlanV3) string {
 	if plan == nil {
 		return ""

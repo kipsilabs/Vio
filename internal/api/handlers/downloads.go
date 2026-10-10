@@ -512,19 +512,33 @@ func (h *DownloadHandler) writeDownloadFileError(w http.ResponseWriter, r *http.
 	}
 }
 
-// HandleDirectDownload handles GET /direct-download?file_id=N. A legacy
-// format=original query is accepted, but direct downloads remain original-only.
+// HandleDirectDownload handles the frozen v1 GET/HEAD /direct-download?file_id=N.
+// A legacy format=original query is accepted, but direct downloads remain
+// original-only. v1 keeps its historical refusal wire answers; the distinct
+// refusal codes are exposed only by HandleDirectDownloadV2.
 func (h *DownloadHandler) HandleDirectDownload(w http.ResponseWriter, r *http.Request) {
-	h.handleDirectDownload(w, r, false)
+	h.handleDirectDownload(w, r, false, false)
+}
+
+// HandleDirectDownloadV2 serves GET/HEAD /api/v2/direct-download. It exposes
+// the resolver's distinct refusal reasons, which the v2 byte adapter maps onto
+// problem types.
+func (h *DownloadHandler) HandleDirectDownloadV2(w http.ResponseWriter, r *http.Request) {
+	h.handleDirectDownload(w, r, false, true)
 }
 
 // HandleDirectDownloadViaProxy serves the additive proxy-aware direct-download
 // route while the established endpoint retains its 200/206 response contract.
 func (h *DownloadHandler) HandleDirectDownloadViaProxy(w http.ResponseWriter, r *http.Request) {
-	h.handleDirectDownload(w, r, true)
+	h.handleDirectDownload(w, r, true, false)
 }
 
-func (h *DownloadHandler) handleDirectDownload(w http.ResponseWriter, r *http.Request, delegate bool) {
+// HandleDirectDownloadViaProxyV2 serves GET/HEAD /api/v2/direct-download-proxy.
+func (h *DownloadHandler) HandleDirectDownloadViaProxyV2(w http.ResponseWriter, r *http.Request) {
+	h.handleDirectDownload(w, r, true, true)
+}
+
+func (h *DownloadHandler) handleDirectDownload(w http.ResponseWriter, r *http.Request, delegate, v2 bool) {
 	userID := apimw.GetUserID(r.Context())
 	if userID == 0 {
 		writeError(w, http.StatusUnauthorized, "unauthorized", "Authentication required")
@@ -545,7 +559,7 @@ func (h *DownloadHandler) handleDirectDownload(w http.ResponseWriter, r *http.Re
 	filter := requestAccessFilter(r)
 	if delegate {
 		if handled, redirectErr := h.redirectDirectDownload(r.Context(), w, r, userID, fileID, r.URL.Query().Get("format"), filter); redirectErr != nil {
-			h.writeDownloadError(w, redirectErr)
+			h.writeDirectDownloadError(w, redirectErr, v2)
 			return
 		} else if handled {
 			return
@@ -559,7 +573,7 @@ func (h *DownloadHandler) handleDirectDownload(w http.ResponseWriter, r *http.Re
 	// instead of truncating the body at 120 s.
 	sw := httpstream.NewRollingDeadlineWriter(w)
 	if err := h.svc.ServeDirect(serveCtx, sw, r, userID, fileID, r.URL.Query().Get("format"), filter); err != nil {
-		h.writeDownloadError(w, err)
+		h.writeDirectDownloadError(w, err, v2)
 		return
 	}
 }
@@ -918,4 +932,43 @@ func (h *DownloadHandler) writeDownloadError(w http.ResponseWriter, err error) {
 		slog.Error("download operation failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to process download")
 	}
+}
+
+// writeDirectDownloadError maps a direct-download refusal. The distinct refusal
+// reasons are additive on /api/v2 only: the frozen v1 GET/HEAD routes keep
+// their historical not_found wire answer, so the version split lives here at
+// the handler layer. Everything else defers to the shared mapping, which owns
+// the pre-existing codes (including a non-original format query, which reads as
+// format_unavailable on both versions because it never wrapped
+// catalog.ErrItemNotFound).
+func (h *DownloadHandler) writeDirectDownloadError(w http.ResponseWriter, err error, v2 bool) {
+	if v2 {
+		switch {
+		// The direct-download resolver distinguishes a stale/unknown file_id
+		// from an access refusal so the client can tell a version that needs
+		// refreshing (re-fetch the item's versions) apart from a denied file
+		// (show the denial). Both wrap catalog.ErrItemNotFound, so they are
+		// matched before the shared not-found fallback below.
+		case errors.Is(err, downloads.ErrFileUnavailable):
+			writeError(w, http.StatusNotFound, "file_unavailable", "This file is no longer available")
+			return
+		case errors.Is(err, downloads.ErrFileAccessDenied):
+			writeError(w, http.StatusForbidden, "file_access_denied", "You do not have access to this file")
+			return
+		case errors.Is(err, downloads.ErrFormatUnavailable):
+			writeError(w, http.StatusNotImplemented, "format_unavailable", "This download format is not available yet")
+			return
+		}
+		h.writeDownloadError(w, err)
+		return
+	}
+	// Frozen v1. A refusal that keeps catalog.ErrItemNotFound in its chain — a
+	// stale file_id, an access refusal, or a virtual row — keeps the historical
+	// 404/not_found. The mapping is checked before the shared format case
+	// because a virtual row carries both sentinels.
+	if errors.Is(err, catalog.ErrItemNotFound) {
+		writeError(w, http.StatusNotFound, "not_found", "Media item not found")
+		return
+	}
+	h.writeDownloadError(w, err)
 }

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { setAccessToken, setProfileId, setProfileToken } from "@/api/client";
-import { DirectDownloadError, prepareDirectDownload } from "./directDownloads";
+import { DirectDownloadError, isStaleFileError, prepareDirectDownload } from "./directDownloads";
 
 const URL_PATH = "/api/v2/direct-download?file_id=42&token=original-account-token";
 
@@ -137,5 +137,59 @@ describe("direct download preflight", () => {
     ).rejects.toThrow();
     expect(fetch).toHaveBeenCalledTimes(1);
     expect(createObjectURL).not.toHaveBeenCalled();
+  });
+
+  it("carries the problem code and a refresh prompt for a stale file_id", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            type: "https://siloserver.org/docs/api/v2/problems/file_unavailable",
+            title: "File unavailable",
+            status: 404,
+            detail: "This file is no longer available",
+          }),
+          { status: 404, headers: { "Content-Type": "application/problem+json" } },
+        ),
+      ),
+    );
+    const pending = prepareDirectDownload(42, () => true, new AbortController().signal);
+    await expect(pending).rejects.toMatchObject({
+      status: 404,
+      code: "file_unavailable",
+      message: "This version is no longer available. Refresh the list to see current versions.",
+    });
+  });
+
+  it("keeps the denial text for a file-level access refusal", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            type: "https://siloserver.org/docs/api/v2/problems/file_access_denied",
+            title: "File access denied",
+            status: 403,
+          }),
+          { status: 403, headers: { "Content-Type": "application/problem+json" } },
+        ),
+      ),
+    );
+    await expect(
+      prepareDirectDownload(42, () => true, new AbortController().signal),
+    ).rejects.toMatchObject({
+      status: 403,
+      code: "file_access_denied",
+      message: "You do not have access to this file.",
+    });
+  });
+
+  it("classifies a stale refusal as needing a version refresh and a denial as not", () => {
+    expect(isStaleFileError(new DirectDownloadError(404, "x", "file_unavailable"))).toBe(true);
+    // A bare 404 on the direct URL has the same corrective action.
+    expect(isStaleFileError(new DirectDownloadError(404, "x"))).toBe(true);
+    expect(isStaleFileError(new DirectDownloadError(403, "x", "file_access_denied"))).toBe(false);
+    expect(isStaleFileError(new Error("network"))).toBe(false);
   });
 });

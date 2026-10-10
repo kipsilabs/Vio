@@ -3675,13 +3675,36 @@ func (s *TranscodeSession) Close() error {
 // place. It is used when another session owns the same output directory (e.g. a
 // concurrent reconstruct race loser): tearing down this duplicate must not wipe
 // the segments and init.mp4 the winning session is actively serving.
+//
+// It advances the numeric generation, so a token minted before the stop no
+// longer matches. Callers that are keeping the directory servable as a retained
+// switchover predecessor must use CloseProcessRetained instead.
 func (s *TranscodeSession) CloseProcess() error {
 	return s.shutdown(false)
 }
 
+// CloseProcessRetained stops the process but keeps the output directory and the
+// generation identity intact. A retained switchover predecessor must keep
+// serving the exact sgen token its in-flight playlist was minted with; advancing
+// the generation here would make every one-behind segment request a 412, which
+// is the bug this method exists to avoid. Only the retained-overlap path may use
+// it: every other stop advances the generation so a stopped session's stale
+// timeline is fenced out.
+func (s *TranscodeSession) CloseProcessRetained() error {
+	return s.shutdownProcess(false, false)
+}
+
 // shutdown kills the ffmpeg process and, when removeOutput is true, removes the
-// temporary output directory.
+// temporary output directory. It advances the numeric generation.
 func (s *TranscodeSession) shutdown(removeOutput bool) error {
+	return s.shutdownProcess(removeOutput, true)
+}
+
+// shutdownProcess kills the ffmpeg process and, when removeOutput is true,
+// removes the temporary output directory. bumpGeneration is false only for the
+// retained switchover path, which must preserve the predecessor's published
+// generation token (see CloseProcessRetained).
+func (s *TranscodeSession) shutdownProcess(removeOutput, bumpGeneration bool) error {
 	s.StopThrottler()
 	// Cancel the context to kill the process (no mutex needed for cancel).
 	if s.cancel != nil {
@@ -3711,7 +3734,9 @@ func (s *TranscodeSession) shutdown(removeOutput bool) error {
 			s.opts.InputCleanup()
 		}
 	})
-	s.segmentGeneration++
+	if bumpGeneration {
+		s.segmentGeneration++
+	}
 	s.segmentPruneRunning = false
 
 	// Clean up temporary directory.

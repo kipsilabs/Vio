@@ -56,7 +56,13 @@ import {
   useEpisodeReleaseCapability,
 } from "@/hooks/queries/episodeRelease";
 
-export default function EpisodeContent({ item }: { item: ItemDetail & { type: "episode" } }) {
+export default function EpisodeContent({
+  item,
+  onStaleVersion,
+}: {
+  item: ItemDetail & { type: "episode" };
+  onStaleVersion?: (fileId: number) => void;
+}) {
   const { translating: overviewTranslating, onTranslate: onTranslateOverview } =
     useOnViewTranslation(item);
   const navigate = useNavigate();
@@ -502,6 +508,8 @@ export default function EpisodeContent({ item }: { item: ItemDetail & { type: "e
         onOpenChange={setDownloadOpen}
         versions={item.versions ?? []}
         title={title}
+        selectedFileId={selectedVersion?.file_id}
+        onStaleVersion={onStaleVersion}
       />
       <SubtitleSearchDialog
         open={subtitleSearchOpen}
