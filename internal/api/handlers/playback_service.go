@@ -1512,6 +1512,148 @@ func (h *PlaybackHandler) refusedProbeInventoryFile(ctx context.Context, session
 	return &override
 }
 
+// sameRowDifferentCandidate reports whether two virtual URIs name different
+// concrete candidates under the same provider-neutral row key. It is the exact
+// condition for offering a row's current listing to a session whose pinned
+// candidate is a different result of that row.
+func sameRowDifferentCandidate(bound, offered string) bool {
+	bound, offered = strings.TrimSpace(bound), strings.TrimSpace(offered)
+	if bound == "" || offered == "" {
+		return false
+	}
+	if virtualPlaybackNeutralKey(bound) != virtualPlaybackNeutralKey(offered) {
+		return false
+	}
+	return !sameVirtualCandidate(bound, offered)
+}
+
+// publishOfferedReleaseInventory serves the current same-row listing's probed
+// track inventory to every live session still bound to a different candidate
+// under the same neutral key. It is the menu-only answer to a vanished session
+// pin: the provider dropped the pinned ?result= id, the session's transport
+// keeps playing the already-open relay, and every rotation path correctly
+// refuses to swap a different release into the playing row. Nothing then
+// refreshed the menus, so they stayed empty until a stop/resume. The offered
+// candidate's probed tracks are surfaced for display, keyed on the session's
+// own playing identity, so a client never re-keys the transport.
+//
+// The evidence itself was refused a catalog write (the row cannot adopt a
+// different release), and this never writes to the catalog either: it is an
+// in-memory, best-effort push. A session that is not virtual, is not on the
+// same neutral key, is already serving the offered candidate, or has no
+// realtime connection is skipped. It returns how many sessions received the
+// event.
+func (h *PlaybackHandler) publishOfferedReleaseInventory(ctx context.Context, row *models.MediaFile, offeredURI string, probed *models.MediaFile) int {
+	if h == nil || h.RealtimeHub == nil || row == nil || row.ID <= 0 || probed == nil || strings.TrimSpace(offeredURI) == "" {
+		return 0
+	}
+	if len(probed.AudioTracks) == 0 && len(probed.SubtitleTracks) == 0 {
+		// Nothing to show: an empty offered list would only clear a menu the
+		// session may already hold. Leave the menus to the existing paths.
+		return 0
+	}
+	lookup, ok := h.sessionMgr.(mediaFileSessionLookup)
+	if !ok {
+		return 0
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	publishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), inventoryUpdatedPublishBudget)
+	defer cancel()
+	notified := 0
+	for _, session := range lookup.GetSessionsByMediaFileID(row.ID) {
+		if session == nil || session.ID == "" || !session.HasRealtimeConnection {
+			continue
+		}
+		if _, result := h.publishOfferedReleaseInventoryToSession(publishCtx, session, offeredURI, probed); result == inventoryPublishDelivered {
+			notified++
+		}
+	}
+	if notified > 0 {
+		slog.InfoContext(ctx, "virtual offered-release inventory served to live session without a catalog write",
+			"component", "api", "file_id", row.ID, "offered_uri", offeredURI, "sessions_notified", notified)
+	}
+	return notified
+}
+
+// publishOfferedReleaseInventoryToSession delivers one offered-release menu
+// push to a single session. It re-reads the live binding under the same
+// per-session lock the ordinary inventory publisher uses, so a rotation that
+// landed while the caller enumerated sessions is observed and the offered data
+// is dropped rather than delivered against a binding that already moved. The
+// payload carries the session's bound row and leaves effective_virtual_uri
+// empty, so folding it cannot move the transport.
+func (h *PlaybackHandler) publishOfferedReleaseInventoryToSession(ctx context.Context, session *playback.Session, offeredURI string, probed *models.MediaFile) (string, inventoryPublishResult) {
+	release := h.progressSideEffectLock(session.ID)
+	defer release()
+	live, err := h.sessionMgr.GetSession(session.ID)
+	if err != nil || live == nil {
+		return "", inventoryPublishObsolete
+	}
+	if !live.HasRealtimeConnection {
+		return "", inventoryPublishObsolete
+	}
+	if !sameRowDifferentCandidate(live.VirtualSourceURI, offeredURI) {
+		// The session already serves the offered candidate, or moved to
+		// another row entirely: the display data is stale.
+		return "", inventoryPublishObsolete
+	}
+	inventory := h.buildOfferedReleaseInventory(live, offeredURI, probed)
+	event, err := playback.NewInventoryUpdatedEvent(live.ID, inventory)
+	if err != nil {
+		slog.WarnContext(ctx, "failed to encode offered-release realtime event",
+			"component", "playback", "session", live.ID, "error", err)
+		return inventory.InventoryRevision, inventoryPublishRetryable
+	}
+	if err := h.RealtimeHub.Send(live.ID, event); err != nil {
+		if !errors.Is(err, playback.ErrRealtimeConnectionNotFound) {
+			slog.WarnContext(ctx, "failed to deliver offered-release realtime event",
+				"component", "playback", "session", live.ID, "error", err)
+			return inventory.InventoryRevision, inventoryPublishRetryable
+		}
+		return inventory.InventoryRevision, inventoryPublishObsolete
+	}
+	return inventory.InventoryRevision, inventoryPublishDelivered
+}
+
+// buildOfferedReleaseInventory shapes the offered candidate's probed tracks as
+// a display-only live-inventory payload keyed on the session's bound row.
+// effective_virtual_uri is deliberately left empty so no consumer mistakes the
+// offer for the playing identity; the offered candidate travels only as
+// OfferedVirtualURI. The revision is keyed on the offered URI so it is distinct
+// from the playing source's own revision and the client's revision gate folds
+// it exactly once.
+func (h *PlaybackHandler) buildOfferedReleaseInventory(session *playback.Session, offeredURI string, probed *models.MediaFile) playback.PlaybackInventoryV3 {
+	audioTracks := playback.AudioInventoryV3(probed)
+	if audioTracks == nil {
+		audioTracks = []playback.AudioInventoryItemV3{}
+	}
+	subtitleInventory := playback.BuildSubtitleInventoryV3(probed, nil)
+	if subtitleInventory == nil {
+		subtitleInventory = []playback.SubtitleInventoryItemV3{}
+	}
+	status := string(ProbeProvenanceVerified)
+	revision := playback.ComputeInventoryRevisionV3(status, audioTracks, subtitleInventory, playback.InventorySourceIdentityV3{
+		EffectiveMediaFileID:  session.MediaFileID,
+		EffectiveVirtualURI:   offeredURI,
+		VirtualSourceRevision: session.VirtualSourceRevision,
+	})
+	return playback.PlaybackInventoryV3{
+		SessionID:            session.ID,
+		InventoryRevision:    revision,
+		InventoryStatus:      status,
+		AudioTracks:          audioTracks,
+		SubtitleInventory:    subtitleInventory,
+		EffectiveMediaFileID: session.MediaFileID,
+		// The offered release is deliberately not named as the bound candidate:
+		// effective_virtual_uri stays empty so no consumer mistakes the offer
+		// for the playing identity. The bound candidate travels only as the
+		// session's own binding, which a client already holds.
+		OfferedVirtualURI: offeredURI,
+	}
+}
+
 // virtualSourceGenerationReader is the optional session-manager capability the
 // inventory publisher fences on. A manager that does not expose it (a minimal
 // test manager) keeps the prior best-effort behavior.

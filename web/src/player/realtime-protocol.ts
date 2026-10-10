@@ -232,6 +232,16 @@ export interface PlaybackInventoryUpdatedPayload {
   /** The provider-neutral candidate URI the session is bound to. */
   effective_virtual_uri?: string;
   virtual_source_revision?: string;
+  /**
+   * A concrete candidate under the same row that the session is *not* bound
+   * to, set when the pinned candidate vanished from the provider listing and
+   * the transport keeps playing it. `audio_tracks` and `subtitle_inventory`
+   * then describe that offered candidate so the menus show what the row offers
+   * now. The payload names only the bound row in `effective_media_file_id` and
+   * leaves `effective_virtual_uri` empty, so folding it never re-keys the
+   * transport or replans. Display-only; absent on an ordinary revision.
+   */
+  offered_virtual_uri?: string;
 }
 
 export interface PlaybackRealtimeEventEnvelopeBase {
@@ -567,6 +577,7 @@ function isInventoryUpdatedPayload(value: unknown): value is PlaybackInventoryUp
     isOptionalString(value.inventory_status) &&
     isOptionalString(value.effective_virtual_uri) &&
     isOptionalString(value.virtual_source_revision) &&
+    isOptionalString(value.offered_virtual_uri) &&
     isOptionalNumber(value.effective_media_file_id) &&
     (value.audio_tracks === undefined || Array.isArray(value.audio_tracks)) &&
     (value.subtitle_inventory === undefined ||

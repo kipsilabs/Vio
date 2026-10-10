@@ -882,6 +882,13 @@ export function usePlaybackSession(
     fileId: state.mediaFileId,
     uri: state.effectiveVirtualUri,
   });
+  // The offered candidate the menus are currently displaying for a row whose
+  // pinned release vanished from the provider listing, or null. It is a
+  // display-only overlay: the plan identity, session id and transport revision
+  // never move for it, so it must be read synchronously (a menu selection can
+  // land in the same tick as the fold) and cleared whenever the transport's own
+  // source identity actually changes.
+  const offeredVirtualUriRef = useRef<string | null>(null);
   const activeRequestKeyRef = useRef<string | null>(null);
   const activeCapabilityRequestKeyRef = useRef<string | null>(null);
   const playbackPositionRef = useRef(initialPosition);
@@ -1058,6 +1065,9 @@ export function usePlaybackSession(
       // bound to the previous file/URI must not suppress inventory updates for
       // the new one.
       lastVerifiedIdentityRef.current = null;
+      // A real identity move retires any display-only offered release: the
+      // transport is now somewhere else, so the old offer is stale.
+      if (changed) offeredVirtualUriRef.current = null;
       return changed;
     },
     [],
@@ -1095,8 +1105,10 @@ export function usePlaybackSession(
       scope.generation = loadSequenceRef.current;
       scope.revisions.clear();
       // A new load generation also abandons any remembered mid-switch seek: it
-      // belongs to the session this generation replaces.
+      // belongs to the session this generation replaces. A display-only offered
+      // release belongs to that same superseded transport too.
       pendingSeekRef.current = null;
+      offeredVirtualUriRef.current = null;
     }
     return scope;
   }, []);
@@ -2155,6 +2167,22 @@ export function usePlaybackSession(
     (index: number, currentPosition: number) => {
       const plan = planRef.current;
       if (!plan) return;
+      if (offeredVirtualUriRef.current) {
+        // The menus are showing a release the row offers now, not the one the
+        // transport plays. Folding that pick into the playing release would be
+        // a silent switch, so take the explicit rotation/replan path: the
+        // server owns the release change and the position is carried across.
+        void replan({
+          operation: "failure_recovery",
+          positionSeconds: currentPosition,
+          failure: {
+            classification: "offered_release_track_selected",
+            message:
+              "The current release is no longer listed; switching to the release this row offers.",
+          },
+        });
+        return;
+      }
       // The menu renders the probed inventory `applyAudioInventory` may have
       // replaced, whose ordering a probe repair can change. Carry the plan's
       // canonical identity for the picked track — matched by signature, then
@@ -2187,6 +2215,21 @@ export function usePlaybackSession(
     (combinedIndex: number | null, currentPosition: number) => {
       const plan = planRef.current;
       if (!plan) return;
+      if (offeredVirtualUriRef.current) {
+        // Same rule as the audio menu: a subtitle from the offered release
+        // must not be applied to the playing release, so route to the explicit
+        // rotation/replan path instead of a silent switch.
+        void replan({
+          operation: "failure_recovery",
+          positionSeconds: currentPosition,
+          failure: {
+            classification: "offered_release_track_selected",
+            message:
+              "The current release is no longer listed; switching to the release this row offers.",
+          },
+        });
+        return;
+      }
       void replan({
         operation: "track_change",
         positionSeconds: currentPosition,
@@ -2681,6 +2724,57 @@ export function usePlaybackSession(
   );
 
   /**
+   * Folds a display-only offered-release revision into the menus.
+   *
+   * When the session's pinned candidate vanishes from the provider listing but
+   * the transport keeps playing it, the server offers the row's current
+   * listing here. The payload carries only the bound row in
+   * `effective_media_file_id` and leaves `effective_virtual_uri` empty, so
+   * nothing re-keys the transport, while `audio_tracks` and
+   * `subtitle_inventory` describe the release the row offers now. The fold
+   * replaces the rendered track lists and subtitle URLs, records the offered
+   * candidate for the menu selection guard, and records the revision. It
+   * deliberately leaves `plan.effective_media_file_id`,
+   * `plan.effective_virtual_uri`, `mediaFileId`, `transportRevision` and the
+   * session id untouched, and never calls replan or reloads the element.
+   */
+  const foldOfferedInventory = useCallback(
+    (payload: PlaybackInventoryUpdatedPayload, offeredUri: string) => {
+      const scope = syncRevisionScope();
+      if (payload.inventory_revision != null && scope.revisions.has(payload.inventory_revision)) {
+        return;
+      }
+      const plan = planRef.current;
+      if (!plan) return;
+      const audioTracks = (payload.audio_tracks ?? []).map((track) => ({ ...track }));
+      const subtitleInventory = payload.subtitle_inventory ?? [];
+      const nextPlan: PlanV3 = {
+        ...plan,
+        // The playing identity is deliberately preserved: this is menu data for
+        // another release, never for the served one.
+        subtitle: { ...plan.subtitle, inventory: subtitleInventory },
+      };
+      planRef.current = nextPlan;
+      offeredVirtualUriRef.current = offeredUri;
+      setState((current) => ({
+        ...current,
+        plan: nextPlan,
+        planAudioTracks: audioTracks,
+        // The offered lists are the probe's own evidence for the row's current
+        // listing, so the menus are no longer "loading".
+        audioInventoryProvisional: false,
+        subtitleInventoryProvisional: false,
+        subtitleUrls: mapSubtitleInventory(subtitleInventory, plan.effective_media_file_id, config),
+      }));
+      if (payload.inventory_revision != null) {
+        inventoryRevisionRef.current = payload.inventory_revision;
+        scope.revisions.add(payload.inventory_revision);
+      }
+    },
+    [config, syncRevisionScope],
+  );
+
+  /**
    * The shared inventory fold used by both a direct push and the deferred
    * flush.
    *
@@ -2692,6 +2786,15 @@ export function usePlaybackSession(
    */
   const foldInventoryUpdate = useCallback(
     (payload: PlaybackInventoryUpdatedPayload) => {
+      // A display-only offered release is a different animal: it carries
+      // another release's tracks under the session's row id, so it must never
+      // go through the identity-carrying fold. Route it to the menu-only fold
+      // and return.
+      const offeredUri = payload.offered_virtual_uri?.trim() ?? "";
+      if (offeredUri) {
+        foldOfferedInventory(payload, offeredUri);
+        return;
+      }
       const scope = syncRevisionScope();
       if (payload.inventory_revision != null && scope.revisions.has(payload.inventory_revision)) {
         return;
@@ -2724,7 +2827,7 @@ export function usePlaybackSession(
         scope.revisions.add(payload.inventory_revision);
       }
     },
-    [applySubtitleInventory, foldCommittedSource, syncRevisionScope],
+    [applySubtitleInventory, foldCommittedSource, foldOfferedInventory, syncRevisionScope],
   );
 
   /**
@@ -2758,6 +2861,23 @@ export function usePlaybackSession(
       if (switchingRef.current || replanInFlightRef.current || current.replacing) {
         if (movedSource) pendingSwitchPositionRef.current = null;
         captureDeferredPush({ kind: "inventory", payload, identity });
+        return;
+      }
+      // A display-only offered-release revision carries another release's
+      // tracks under the session's bound row id and deliberately names no
+      // candidate. Admit it when it names the same row on screen and genuinely
+      // offers a candidate other than the one playing; the fold is display-only
+      // and never moves identity. A packet whose row has moved, or that names
+      // the playing candidate, is stale and dropped.
+      const offeredUri = payload.offered_virtual_uri?.trim() ?? "";
+      if (offeredUri) {
+        const sameRow =
+          payload.effective_media_file_id == null ||
+          liveIdentity.fileId == null ||
+          payload.effective_media_file_id === liveIdentity.fileId;
+        if (sameRow && offeredUri !== liveIdentity.uri) {
+          foldInventoryUpdate(payload);
+        }
         return;
       }
       // No adoption in flight: a push that names another source than the player
@@ -2878,6 +2998,24 @@ export function usePlaybackSession(
       // only against state older than it: a poll that folded a candidate after
       // this entry was queued is external and newer and still vetoes the commit.
       // See deferredIdentityIsAdmissible.
+      // A display-only offered release is admitted on its own terms at the
+      // flush too: it names the same row and a candidate other than the settled
+      // plan's, and folding it can only repaint the menus. The identity-aware
+      // admission below is for pushes that carry a source identity, which an
+      // offer deliberately does not.
+      if (entry.kind === "inventory") {
+        const offeredUri = entry.payload.offered_virtual_uri?.trim() ?? "";
+        if (offeredUri) {
+          const sameRow =
+            entry.payload.effective_media_file_id == null ||
+            plan.effective_media_file_id == null ||
+            entry.payload.effective_media_file_id === plan.effective_media_file_id;
+          if (sameRow && offeredUri !== (plan.effective_virtual_uri ?? null)) {
+            foldInventoryUpdate(entry.payload);
+          }
+          continue;
+        }
+      }
       const pollApplied = lastPollAppliedRef.current;
       const appliedPollNewer =
         pollApplied != null && pollApplied.clock > entry.arrivalTransitionClock
