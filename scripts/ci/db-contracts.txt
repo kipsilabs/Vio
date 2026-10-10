@@ -23,6 +23,7 @@
 
 # Section and Smart collection rule fields and operators compile to working SQL.
 ./internal/catalog TestRuleFieldsFilterCatalogDB
+./internal/api/handlers TestCatalogProfileSectionsDB
 
 # Profile history and account/invitation persistence.
 ./internal/api/handlers TestEbookProgressEventsPostgres
@@ -158,3 +159,6 @@
 # discovery rows rank by in step with the 'tmdb' source.
 ./internal/catalog TestRatingSourceRepositoryUpsertPostgres
 ./internal/catalog TestRatingSourceRepositorySyncsTMDBVotesPostgres
+
+# Watch-provider events carry catalog titles to plugins.
+./internal/watchsync TestGetMediaTitlesDB

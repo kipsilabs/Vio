@@ -82,7 +82,14 @@ carry real language identity instead of being collapsed to a single code.
 `include_technical` is true (the default). A MULTi track satisfies the
 audio-language browse filter for any of its `languages[]` codes, not just its
 primary `language`.
-## People search
+
+## Section browsing
+
+Catalog reads with `source=section` resolve the row on the acting profile's
+`home` or `library` page. This includes personal rows and the profile's overrides
+to server rows. Paging uses that effective row's configuration. A row hidden or
+removed by the profile, a row belonging to another profile, or a row in an
+inaccessible library answers `404`, as an unknown section does.## People search
 
 `GET /api/v2/catalog/people` (`listPeople`) accepts a name query in `q` and
 `limit` from 1 to 100 (default 20). Each whitespace-separated word of `q` must

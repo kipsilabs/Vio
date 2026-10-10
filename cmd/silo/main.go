@@ -3280,6 +3280,15 @@ func main() {
 				}
 				_ = deps.EventsHub.PublishJSON(ctx, evt.ChannelDownloadPreparations, event.Name, payload, evt.PublishOptions{AdminOnly: true})
 			})
+			if deps.NodeRepo != nil {
+				artifactMgr.SetStorageNodes(deps.NodeRepo)
+			}
+			artifactMgr.SetStorageNotifier(func(ctx context.Context) {
+				if deps.EventsHub == nil {
+					return
+				}
+				_ = deps.EventsHub.PublishJSON(ctx, evt.ChannelDownloadPreparations, "download_storage.changed", map[string]any{}, evt.PublishOptions{AdminOnly: true})
+			})
 			encodeTask := tasks.NewEncodeDownloadArtifactsTask(artifactMgr)
 			artifactMgr.SetKick(func() { _ = taskMgr.RunTask(appCtx, encodeTask.Key()) })
 			taskMgr.Register(encodeTask)

@@ -4419,6 +4419,10 @@ export interface StreamNode {
   hw_accel_override?: string | null;
   /** Comma-separated render device paths pinned to this node; null inherits. */
   hw_device_override?: string | null;
+  /** This node's own prepared-download directory; absent when inherited. */
+  download_artifact_dir_override?: string | null;
+  /** This node's own prepared-download budget in bytes (0 for none); absent when inherited. */
+  download_artifact_max_bytes_override?: number | null;
   /**
    * Human-readable note describing how this node's hardware got worse at the
    * last capability refetch: a backend that used to pass its probe and now
@@ -4455,6 +4459,10 @@ export interface UpdateNodeRequest {
   // empty string) restores inheritance of the cluster-wide playback setting.
   hw_accel_override?: string | null;
   hw_device_override?: string | null;
+  // Same convention: null restores the inherited directory or budget. The
+  // directory applies when the node restarts.
+  download_artifact_dir_override?: string | null;
+  download_artifact_max_bytes_override?: number | null;
 }
 
 export interface CheckNodeResponse {

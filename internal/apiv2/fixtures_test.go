@@ -1761,7 +1761,8 @@ func fixtureCases() []fixtureCase {
 	cases = append(cases, adminCollectionRowFixtureCases()...)
 	cases = append(cases, adminCollectionCapabilityFixtureCases()...)
 	cases = append(cases, personalCollectionContainsFixtureCases()...)
-	return append(cases, loginSessionFixtureCases()...)
+	cases = append(cases, loginSessionFixtureCases()...)
+	return append(cases, adminDownloadStorageFixtureCases()...)
 }
 
 // personalCollectionContainsFixtureCases pin the collection list marked for
@@ -2001,6 +2002,9 @@ func fixtureDeps() Dependencies {
 	deps.AdminPlaybackSessions = new(fakeAdminPlaybackSessions)
 	deps.AdminDownloadPreparations = new(fakeAdminDownloadPreparations)
 	deps.AdminDownloadPreparationControls = new(fakeAdminDownloadPreparationControls)
+	deps.AdminDownloadStorage = new(fakeAdminDownloadStorage)
+	deps.AdminDownloadDevices = new(fakeAdminDownloadDevices)
+	deps.DownloadPrepareAgain = fakeDownloadPrepareAgain{}
 	deps.AdminDevices = new(fakeAdminDevices)
 	deps.Invitations = fixtureInvitations()
 	deps.PasswordResets = fixturePasswordResets()

@@ -419,6 +419,8 @@ var adminSettingDefaults = map[string]string{
 	DownloadLocalTranscodeFallbackSettingKey: "true",
 	"download.max_concurrent_prepares":       "2",
 	"download.artifact_max_bytes":            "0",
+	DownloadArtifactCacheHoursSettingKey:     "72",
+	DownloadArtifactDiskCeilingSettingKey:    "85",
 
 	"policy.editor_enabled":                 "false",
 	"policy.eval_timeout_ms":                "100",
@@ -774,6 +776,10 @@ func NormalizeAdminSetting(key, raw string) (string, error) {
 	case "download.max_concurrent_per_user", "download.max_per_period",
 		"download.max_concurrent_prepares", "download.artifact_max_bytes":
 		return normalizeAdminInt64(key, value, 0, math.MaxInt64)
+	case DownloadArtifactCacheHoursSettingKey:
+		return normalizeAdminInt(key, value, 0, MaxDownloadArtifactCacheHours)
+	case DownloadArtifactDiskCeilingSettingKey:
+		return normalizeAdminInt(key, value, MinDownloadArtifactDiskCeilingPercent, MaxDownloadArtifactDiskCeilingPercent)
 	case "policy.decision_log_scope_sample_rate", "policy.decision_log_retention_days":
 		return normalizeAdminInt(key, value, 1, math.MaxInt32)
 	case "policy.eval_timeout_ms":

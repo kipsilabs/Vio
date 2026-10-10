@@ -797,6 +797,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 	var itemsHandler *handlers.ItemsHandler
 	var catalogResourceHandler *handlers.CatalogResourceHandler
 	var catalogHandler *handlers.CatalogHandler
+	var catalogResolver *catalog.CatalogResolver
 	var shuffleService *shuffle.Service
 	var literaryWorkHandler *handlers.LiteraryWorkHandler
 	var peopleHandler *handlers.PeopleHandler
@@ -974,7 +975,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 
 		catalogResourceHandler = handlers.NewCatalogResourceHandler(itemsHandler)
 		catalogResourceHandler.SetWatchlistPromoter(watchlistTitles)
-		catalogResolver := catalog.NewCatalogResolver(browseRepo, itemRepo).
+		catalogResolver = catalog.NewCatalogResolver(browseRepo, itemRepo).
 			WithEpisodeRepository(episodeRepo).
 			WithUserStoreProvider(deps.UserStoreProvider).
 			WithSearchProvider(catalogSearchService.Provider()).
@@ -2609,6 +2610,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 		}
 		sections.InstallRecipeDelegate(sectionFetcher)
 		sectionHandler = handlers.NewSectionHandler(sectionRepo, sectionFetcher)
+		catalogResolver.WithSectionResolver(sectionHandler)
 		if deps.TrendingRefresher != nil {
 			sectionHandler.TrendingRefresher = deps.TrendingRefresher
 		}
@@ -3147,6 +3149,8 @@ func newChiRouter(deps Dependencies) chi.Router {
 		v2deps.DownloadSubscriptionSync = downloadSvc
 		v2deps.DownloadCreation = downloadSvc
 		v2deps.AdminAccountDownloads = downloadSvc
+		v2deps.AdminDownloadDevices = downloadSvc
+		v2deps.DownloadPrepareAgain = downloadSvc
 	}
 	if ebookReaderHandler != nil {
 		v2deps.EbookProgress = ebookReaderHandler
@@ -3323,6 +3327,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 		if deps.DB != nil && deps.ArtifactManager != nil {
 			v2deps.AdminDownloadPreparations = downloads.NewPreparationReader(deps.DB, profileNamesByUser(deps.UserStoreProvider))
 			v2deps.AdminDownloadPreparationControls = deps.ArtifactManager
+			v2deps.AdminDownloadStorage = deps.ArtifactManager
 		}
 		if adminPlaybackControlHandler != nil {
 			v2deps.AdminPlaybackCommands = adminPlaybackControlHandler

@@ -157,12 +157,13 @@ type previewExecutor interface {
 }
 
 type CatalogResolver struct {
-	browseRepo     *BrowseRepository
-	itemRepo       *ItemRepository
-	episodeRepo    *EpisodeRepository
-	searchProvider CatalogSearchProvider
-	storeProvider  userstore.UserStoreProvider
-	facets         facetFetcher
+	browseRepo      *BrowseRepository
+	itemRepo        *ItemRepository
+	episodeRepo     *EpisodeRepository
+	searchProvider  CatalogSearchProvider
+	storeProvider   userstore.UserStoreProvider
+	sectionResolver SectionResolver
+	facets          facetFetcher
 	// previewExecutorForScope, when non-nil, is used by previewQuerySource
 	// instead of the default queryExecutorForScope. Tests inject a stub here
 	// to observe how many times the executor is asked for a result page.
@@ -207,6 +208,27 @@ func (r *CatalogResolver) WithUserStoreProvider(provider userstore.UserStoreProv
 		return nil
 	}
 	r.storeProvider = provider
+	return r
+}
+
+// SectionDefinition is a row after the acting profile's overrides are applied.
+type SectionDefinition struct {
+	SectionType string
+	Title       string
+	ItemLimit   int
+	Config      json.RawMessage
+}
+
+// SectionResolver shares the page's visibility and configuration with catalog
+// paging, including rows that exist only in the profile's settings.
+type SectionResolver interface {
+	ResolveCatalogSection(context.Context, CatalogRequest) (SectionDefinition, error)
+}
+
+func (r *CatalogResolver) WithSectionResolver(resolver SectionResolver) *CatalogResolver {
+	if r != nil {
+		r.sectionResolver = resolver
+	}
 	return r
 }
 
@@ -2004,6 +2026,38 @@ func defaultCatalogLibrarySection(libraryID int, sectionID string) (catalogPageS
 
 func (r *CatalogResolver) loadCatalogSection(ctx context.Context, req CatalogRequest) (catalogPageSection, error) {
 	var section catalogPageSection
+	if r.sectionResolver != nil {
+		definition, err := r.sectionResolver.ResolveCatalogSection(ctx, req)
+		if err != nil {
+			return section, err
+		}
+		section = catalogPageSection{ID: req.SectionID, Scope: req.Scope,
+			SectionType: definition.SectionType, Title: definition.Title,
+			ItemLimit: definition.ItemLimit, Config: definition.Config}
+		if req.Scope == "library" {
+			section.LibraryID = new(req.LibraryID)
+		}
+	} else {
+		var err error
+		section, err = r.loadStoredCatalogSection(ctx, req)
+		if err != nil {
+			return section, err
+		}
+	}
+	var collectionCfg struct {
+		LibraryCollectionID string `json:"library_collection_id"`
+		UserCollectionID    string `json:"user_collection_id"`
+	}
+	if len(section.Config) > 0 {
+		_ = json.Unmarshal(section.Config, &collectionCfg)
+	}
+	section.CollectionID = collectionCfg.LibraryCollectionID
+	section.UserCollectionID = collectionCfg.UserCollectionID
+	return section, nil
+}
+
+func (r *CatalogResolver) loadStoredCatalogSection(ctx context.Context, req CatalogRequest) (catalogPageSection, error) {
+	var section catalogPageSection
 	query := `
 		SELECT id, scope, library_id, section_type, title, item_limit, config
 		FROM page_sections
@@ -2038,15 +2092,6 @@ func (r *CatalogResolver) loadCatalogSection(ctx context.Context, req CatalogReq
 		return catalogPageSection{}, err
 	}
 
-	var collectionCfg struct {
-		LibraryCollectionID string `json:"library_collection_id"`
-		UserCollectionID    string `json:"user_collection_id"`
-	}
-	if len(section.Config) > 0 {
-		_ = json.Unmarshal(section.Config, &collectionCfg)
-	}
-	section.CollectionID = collectionCfg.LibraryCollectionID
-	section.UserCollectionID = collectionCfg.UserCollectionID
 	return section, nil
 }
 

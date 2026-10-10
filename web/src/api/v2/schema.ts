@@ -1248,6 +1248,40 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/api/v2/admin/downloads/devices": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /** List every device that holds managed downloads, across accounts. */
+    get: operations["listAdminDownloadDevices"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v2/admin/downloads/entries": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /** List managed device downloads across accounts, newest first, optionally for one account, profile, device or status. */
+    get: operations["listAdminDownloadEntries"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   "/api/v2/admin/downloads/preparations": {
     parameters: {
       query?: never;
@@ -1327,6 +1361,142 @@ export interface paths {
     put?: never;
     /** Resume paused offline-download preparation jobs. Each job returns to the queue at its original position, or waits out a pending retry backoff. */
     post: operations["resumeAdminDownloadPreparations"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v2/admin/downloads/revoke": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /** Revoke device downloads. The Silo app deletes each copy the next time the device syncs and confirms by deleting the download. The server stops serving the file at once. A revoked episode is excluded from its series monitor; a preparation only revoked downloads waited on is canceled. */
+    post: operations["revokeAdminDownloads"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v2/admin/downloads/storage": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /** Read prepared-download storage at the server and every transcode node: what is on disk, what Silo's records say, budgets, and files nothing accounts for. */
+    get: operations["getAdminDownloadStorage"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v2/admin/downloads/storage/capabilities": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /** Discover the admin view of prepared-download storage. */
+    get: operations["getAdminDownloadStorageCapabilities"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v2/admin/downloads/storage/events": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /** Read the prepared-file clean-up and device revocation history, newest first. A row is one batch (a maintenance pass or an administrator action) at one location for one reason and account. */
+    get: operations["listAdminDownloadStorageEvents"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v2/admin/downloads/storage/files": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /** List prepared download files with what they are, where they are, and who they serve. */
+    get: operations["listAdminDownloadStorageFiles"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v2/admin/downloads/storage/files/delete": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /** Delete prepared download files. Devices that finished keep their copies. A file a download is waiting on or fetching is refused unless include_in_use is set; then it is deleted and prepared again. */
+    post: operations["deleteAdminDownloadStorageFiles"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v2/admin/downloads/storage/locations/{location}/cleanup": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /** Run prepared-file clean-up at one location now: expire files past their cache period and enforce the budget and disk ceiling. */
+    post: operations["cleanUpAdminDownloadStorageLocation"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v2/admin/downloads/storage/locations/{location}/untracked/delete": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /** List one location's prepared-file directory now and delete the files no prepared-file record accounts for and that nothing has written to for an hour. Only files named like Silo's prepared files are considered. */
+    post: operations["deleteAdminDownloadStorageUntrackedFiles"];
     delete?: never;
     options?: never;
     head?: never;
@@ -7363,6 +7533,26 @@ export interface paths {
     get: operations["getDownloadManifest"];
     put?: never;
     post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v2/downloads/{id}/prepare": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /**
+     * Prepare a finished download's file again after the server cleaned up its copy; the entry returns to preparing and becomes ready like a new download.
+     * @description Use after the file route answers 409 prepared_file_expired. The revision does not change: the recipe is the same. An entry whose file is still on the server, an original-quality entry, or one already preparing returns unchanged.
+     */
+    post: operations["prepareDownloadAgain"];
     delete?: never;
     options?: never;
     head?: never;
@@ -13824,6 +14014,138 @@ export interface components {
       /** Format: double */
       used_gb: number;
     };
+    AdminDownloadDevice: {
+      /**
+       * Format: int64
+       * @description Size of the finished copies
+       */
+      bytes_on_device: number;
+      /**
+       * Format: int64
+       * @description Downloads that are not revoked
+       */
+      copies: number;
+      device_id: string;
+      device_name: string;
+      /** Format: int64 */
+      failed: number;
+      /** Format: int64 */
+      finished: number;
+      /**
+       * Format: date-time
+       * @description Last registry sync or download request
+       */
+      last_seen_at?: string;
+      /**
+       * Format: int64
+       * @description Active series monitors
+       */
+      monitors: number;
+      platform: string;
+      /**
+       * @description Opaque identifier
+       * @example 1
+       */
+      profile_id: string;
+      profile_name: string;
+      /**
+       * Format: int64
+       * @description Revoked and waiting for the device to delete its copy
+       */
+      revoked: number;
+      /** @description Not seen within stale_device_days */
+      stale: boolean;
+      /**
+       * @description Opaque identifier
+       * @example 1
+       */
+      user_id: string;
+      username: string;
+      /**
+       * Format: int64
+       * @description Preparing, ready or downloading
+       */
+      waiting: number;
+    };
+    AdminDownloadEntry: {
+      /**
+       * @description Opaque identifier
+       * @example 1
+       */
+      batch_id?: string;
+      /**
+       * Format: date-time
+       * @description RFC 3339 instant in UTC with millisecond precision, or null
+       */
+      completed_at: string | null;
+      /** @description Movie, or the series for an episode */
+      content_id: string;
+      /**
+       * Format: date-time
+       * @description RFC 3339 instant in UTC with millisecond precision
+       */
+      created_at: string;
+      delivery_format: string;
+      device_id: string;
+      device_name: string;
+      effective_quality: string;
+      /** @description Null unless episode_id resolves to a catalog episode */
+      episode: {
+        /** Format: int64 */
+        episode_number: number;
+        /** Format: int64 */
+        season_number: number;
+        /** @description Empty when unknown */
+        title: string;
+      } | null;
+      episode_id?: string;
+      /** Format: int64 */
+      file_size: number;
+      /**
+       * @description Opaque identifier
+       * @example 1
+       */
+      id: string;
+      /** @description Where its prepared file is: server or node:<id>; absent when it has none */
+      location?: string;
+      location_name?: string;
+      /** @description Catalog type of content_id (movie, series, …); empty when unknown */
+      media_type: string;
+      /**
+       * @description Opaque identifier
+       * @example 1
+       */
+      profile_id: string;
+      quality: string;
+      /**
+       * Format: date-time
+       * @description RFC 3339 instant in UTC with millisecond precision
+       */
+      revoked_at?: string;
+      revoked_reason?: string;
+      /** @description preparing, ready, downloading, completed, failed or revoked. More values may be added */
+      status: string;
+      /**
+       * Format: date-time
+       * @description Latest accepted client status report; null when the app never reported
+       */
+      status_event_at: string | null;
+      /** Format: int64 */
+      target_bitrate_kbps: number;
+      /** @description Catalog title of content_id; empty when the item left the catalog */
+      title: string;
+      /**
+       * Format: date-time
+       * @description RFC 3339 instant in UTC with millisecond precision
+       */
+      updated_at: string;
+      /**
+       * @description Opaque identifier
+       * @example 1
+       */
+      user_id: string;
+      username: string;
+    };
     AdminDownloadPreparation: {
       /** Format: int64 */
       attempts: number;
@@ -14046,6 +14368,388 @@ export interface components {
        * @example 1
        */
       node_id?: string;
+    };
+    AdminDownloadRevokeInputBody: {
+      device_id?: string;
+      /** @description Download ids to revoke. Leave empty with user_id, profile_id and device_id to revoke everything on one device. */
+      ids?: string[];
+      /** @description Whole-device revoke only: also pause the device's series monitors */
+      pause_monitors?: boolean;
+      profile_id?: string;
+      /** @description Kept in the clean-up history */
+      reason?: string;
+      user_id?: string;
+    };
+    AdminDownloadRevokeOutputBody: {
+      /**
+       * Format: int64
+       * @description Size of the revoked copies the device had finished downloading
+       */
+      bytes: number;
+      /** @description The revoked downloads */
+      download_ids: string[];
+      /** Format: int64 */
+      paused_monitors: number;
+      /**
+       * Format: int64
+       * @description Downloads newly revoked; already revoked ones are not counted
+       */
+      revoked: number;
+    };
+    AdminDownloadStorage: {
+      /**
+       * Format: int64
+       * @description How long a prepared file nothing is waiting on stays after its last use
+       */
+      cache_hours: number;
+      /**
+       * Format: int64
+       * @description download.artifact_max_bytes, the budget at every location without its own; 0 means none
+       */
+      default_budget_bytes: number;
+      /**
+       * Format: int64
+       * @description Filesystem fill at which clean-up deletes cached files early
+       */
+      disk_ceiling_percent: number;
+      /**
+       * Format: int64
+       * @description Bytes clean-up and administrators removed from the server and nodes in the last 30 days
+       */
+      freed_last_30_days_bytes: number;
+      /** @description The server first, then transcode nodes by name */
+      locations: components["schemas"]["AdminDownloadStorageLocation"][];
+      /**
+       * Format: int64
+       * @description Unfinished preparation jobs (see the preparation queue)
+       */
+      preparing_jobs: number;
+      /**
+       * Format: int64
+       * @description Devices not seen for this long are counted as stale
+       */
+      stale_device_days: number;
+    };
+    AdminDownloadStorageCapabilitiesOutputBody: {
+      /** @description Whether the current principal may use the capability */
+      allowed: boolean;
+      available: boolean;
+      /** @description Device copies can be listed */
+      devices: boolean;
+      /** @description Admin realtime channel carrying download_storage.changed */
+      realtime_channel: string;
+      /** @description Opaque revision of this document */
+      revision: string;
+      /** @description Device copies can be revoked */
+      revocation: boolean;
+      /**
+       * @description Support and configuration state, not health
+       * @enum {string}
+       */
+      state: "available" | "disabled" | "not_configured" | "unsupported";
+    };
+    AdminDownloadStorageCleanupOutputBody: {
+      /**
+       * Format: int64
+       * @description Bytes this run deleted. 0 when nothing was due or another replica was already cleaning up.
+       */
+      freed_bytes: number;
+    };
+    AdminDownloadStorageDeleteInputBody: {
+      /** @description Prepared file ids. A repeated id is reported once. */
+      ids: string[];
+      /** @description Also delete files a download is waiting on or fetching. Each such file is queued to be prepared again and those downloads wait for the new copy. */
+      include_in_use?: boolean;
+    };
+    AdminDownloadStorageDeleteOutputBody: {
+      /** @description One result per distinct requested id, in request order */
+      results: components["schemas"]["AdminDownloadStorageDeleteResult"][];
+    };
+    AdminDownloadStorageDeleteResult: {
+      /** Format: int64 */
+      bytes: number;
+      id: string;
+      /**
+       * @description deleted: the file is gone; finished devices keep their copies. requeued: it was in use; it was deleted and queued to be prepared again. in_use: refused because a download is waiting on or fetching it (set include_in_use to delete it anyway) or it was used in the last minute. not_found: no such prepared file. not_ready: it is still being prepared, failed, or was already deleted. failed: an error stopped this file's delete; the others went on. A file left on disk is reported as untracked.
+       * @enum {string}
+       */
+      outcome: "deleted" | "requeued" | "in_use" | "not_found" | "not_ready" | "failed";
+    };
+    AdminDownloadStorageEvent: {
+      /** @description Whose device a revocation or removal concerned */
+      account?: components["schemas"]["AdminDownloadStorageUser"];
+      /** @description The administrator; absent for automatic clean-up */
+      actor?: components["schemas"]["AdminDownloadStorageUser"];
+      /** Format: int64 */
+      bytes: number;
+      /**
+       * Format: int64
+       * @description Files or downloads the batch touched
+       */
+      count: number;
+      /** @description The administrator's reason, or a note such as a file count */
+      detail?: string;
+      /** @description Opaque row id: one batch at one location for one reason and account */
+      id: string;
+      /** @description server, node:<id>, or device */
+      location: string;
+      /** @description Node or device name */
+      location_name: string;
+      /**
+       * Format: date-time
+       * @description RFC 3339 instant in UTC with millisecond precision
+       */
+      occurred_at: string;
+      /** @description cache_expired, budget, disk_ceiling, admin_delete, untracked, missing, revoked or device_removed. More values may be added. */
+      reason: string;
+      /** @description The first catalog titles it touched */
+      titles: string[];
+    };
+    AdminDownloadStorageFile: {
+      audio_codec: string;
+      /** Format: int64 */
+      bitrate_kbps?: number;
+      /** Format: int64 */
+      bytes: number;
+      container: string;
+      /** @description The movie, or the series an episode belongs to */
+      content_id?: string;
+      /**
+       * Format: date-time
+       * @description RFC 3339 instant in UTC with millisecond precision
+       */
+      created_at: string;
+      /** Format: int64 */
+      downloading: number;
+      episode_id?: string;
+      /** Format: int64 */
+      episode_number?: number;
+      episode_title?: string;
+      /**
+       * Format: date-time
+       * @description When a cached file's cache period ends
+       */
+      expires_at?: string;
+      /**
+       * Format: int64
+       * @description Devices that already hold their copy
+       */
+      finished: number;
+      /** @enum {string} */
+      format: "remux" | "transcode";
+      /**
+       * @description Prepared file id (the preparation job id)
+       * @example 1
+       */
+      id: string;
+      /**
+       * Format: date-time
+       * @description Last served, linked, or finished by a device
+       */
+      last_used_at: string;
+      /**
+       * @description Opaque identifier
+       * @example 1
+       */
+      library_id?: string;
+      /** @description server, or node:<id> */
+      location: string;
+      location_name: string;
+      /**
+       * @description Opaque identifier
+       * @example 1
+       */
+      media_file_id: string;
+      media_type: string;
+      /** @description The longest-unseen device a stale waiting download belongs to */
+      oldest_waiting?: components["schemas"]["AdminDownloadWaitingDevice"];
+      resolution?: string;
+      /** Format: int64 */
+      season_number?: number;
+      /**
+       * Format: int64
+       * @description Waiting downloads on devices not seen within stale_device_days
+       */
+      stale_waiting: number;
+      /**
+       * @description in_use: a download is waiting on or fetching it. cached: nothing is; it is deleted when expires_at passes. expired: its bytes were deleted; finished devices keep their copies.
+       * @enum {string}
+       */
+      state: "in_use" | "cached" | "expired";
+      /** @description Catalog title; empty when the item left the catalog */
+      title: string;
+      /** @description Target video codec, or copy for a remux */
+      video_codec: string;
+      /**
+       * Format: int64
+       * @description Downloads that have not started fetching it
+       */
+      waiting: number;
+      /** Format: int64 */
+      year?: number;
+    };
+    AdminDownloadStorageLocation: {
+      /**
+       * Format: int64
+       * @description Storage budget for prepared files here; 0 means none
+       */
+      budget_bytes: number;
+      /** @enum {string} */
+      budget_source: "setting" | "override" | "none";
+      /** Format: int64 */
+      cached_bytes: number;
+      /**
+       * Format: int64
+       * @description Files nothing is waiting on; deleted when their cache period ends
+       */
+      cached_files: number;
+      /**
+       * Format: int64
+       * @description Node files queued for deletion and not yet deleted
+       */
+      cleanup_backlog: number;
+      /** @description Directory of prepared files. For a node, the one it was last listed in, which is the one it uses; before its first listing, the configured one, or empty when that is the default. */
+      dir?: string;
+      /**
+       * @description Where the configured directory comes from. default: the built-in location. setting: download.artifact_dir. override: this node's own directory.
+       * @enum {string}
+       */
+      dir_source: "default" | "setting" | "override";
+      enabled: boolean;
+      /** Format: int64 */
+      in_use_bytes: number;
+      /**
+       * Format: int64
+       * @description Files a download is waiting on or fetching, by Silo's records
+       */
+      in_use_files: number;
+      /** @description server, or node:<id> */
+      key: string;
+      /** @enum {string} */
+      kind: "server" | "node";
+      /**
+       * Format: date-time
+       * @description RFC 3339 instant in UTC with millisecond precision
+       */
+      last_health_check?: string;
+      name: string;
+      /**
+       * @description Opaque identifier
+       * @example 1
+       */
+      node_id?: string;
+      /** @description The server, or an enabled node whose last health check succeeded */
+      online: boolean;
+      /** @description A node's configured directory when it differs from the one it was last listed in. The node moves to it when it restarts; files are not moved. */
+      pending_dir?: string;
+      /**
+       * Format: date-time
+       * @description RFC 3339 instant in UTC with millisecond precision
+       */
+      reconciled_at?: string;
+      /** @description API replicas report different directories or filesystems for the server's prepared files; they should share one volume */
+      replicas_disagree: boolean;
+      /**
+       * Format: int64
+       * @description In-use bytes kept only for devices not seen within stale_device_days
+       */
+      stale_waiting_bytes: number;
+      /** @description Over its budget or the disk ceiling with nothing left to free. A full node gets no new preparations; while the server is full, jobs that would be prepared on it wait. */
+      storage_full: boolean;
+      /** Format: int64 */
+      untracked_bytes: number;
+      /**
+       * Format: int64
+       * @description Files on disk that no prepared-file record accounts for, at the last reconciliation
+       */
+      untracked_files: number;
+      /** @description Latest measurement of the files on disk; absent until one is reported */
+      usage?: components["schemas"]["AdminDownloadStorageUsage"];
+      /**
+       * Format: int64
+       * @description Downloads waiting on or fetching files here
+       */
+      waiting_downloads: number;
+    };
+    AdminDownloadStorageUntrackedOutputBody: {
+      /** Format: int64 */
+      bytes: number;
+      /**
+       * Format: int64
+       * @description Untracked files that could not be deleted, for example on a read-only directory; they stay untracked
+       */
+      failed_files: number;
+      /**
+       * Format: int64
+       * @description Untracked files deleted
+       */
+      files: number;
+    };
+    AdminDownloadStorageUsage: {
+      /**
+       * Format: int64
+       * @description Size of the finished prepared files
+       */
+      bytes: number;
+      /** @description Files here do not survive a restart (tmpfs) or a container recreation (the container's overlay layer) */
+      ephemeral: boolean;
+      /** @description Why the last measurement failed */
+      error?: string;
+      /**
+       * Format: int64
+       * @description Finished prepared files
+       */
+      files: number;
+      /**
+       * Format: int64
+       * @description Capacity of that filesystem available to Silo; 0 when unknown
+       */
+      fs_total_bytes: number;
+      /** @description ext4, xfs, tmpfs, overlay, nfs and so on; empty when unknown */
+      fs_type?: string;
+      /**
+       * Format: int64
+       * @description Bytes used on the filesystem the directory is on, as df counts them
+       */
+      fs_used_bytes: number;
+      /**
+       * Format: date-time
+       * @description RFC 3339 instant in UTC with millisecond precision
+       */
+      measured_at: string;
+      /**
+       * Format: int64
+       * @description Receipts and other small files
+       */
+      other_bytes: number;
+      /** Format: int64 */
+      partial_bytes: number;
+      /**
+       * Format: int64
+       * @description Files an encode is writing, or left behind
+       */
+      partial_files: number;
+      /** @description The directory is on the same filesystem as the transcode scratch directory */
+      shares_scratch: boolean;
+      /** @description The last measurement did not finish or failed; the numbers are older */
+      stale: boolean;
+    };
+    AdminDownloadStorageUser: {
+      /**
+       * @description Opaque identifier
+       * @example 1
+       */
+      id: string;
+      username: string;
+    };
+    AdminDownloadWaitingDevice: {
+      device_name: string;
+      /**
+       * Format: date-time
+       * @description RFC 3339 instant in UTC with millisecond precision
+       */
+      last_seen_at?: string;
+      username: string;
     };
     AdminEmailTestInputBody: {
       to: string;
@@ -15136,6 +15840,13 @@ export interface components {
        * @description RFC 3339 instant in UTC with millisecond precision
        */
       created_at: string;
+      /** @description This node's own prepared-download directory; absent when inherited. */
+      download_artifact_dir_override?: string;
+      /**
+       * Format: int64
+       * @description This node's own prepared-download budget in bytes (0 for none); absent when inherited.
+       */
+      download_artifact_max_bytes_override?: number;
       /** Format: int64 */
       egress_kbps: number;
       enabled: boolean;
@@ -15287,6 +15998,13 @@ export interface components {
       undecodable: number;
     };
     AdminNodeUpdateBody: {
+      /** @description Absolute directory for this transcode node's prepared download files. Null or empty restores the inherited directory: download.artifact_dir, or when that is blank, download-artifacts inside the node's transcode directory. Applies when the node restarts. */
+      download_artifact_dir_override?: string | null;
+      /**
+       * Format: int64
+       * @description Storage budget in bytes for this node's prepared download files; 0 means no budget. Null or -1 restores download.artifact_max_bytes.
+       */
+      download_artifact_max_bytes_override?: number | null;
       enabled?: boolean;
       group?: string;
       hw_accel_override?: string | null;
@@ -20182,6 +20900,30 @@ export interface components {
       /** @description Cursor state; absent for bounded unpaginated collections */
       page?: components["schemas"]["PageInfo"];
     };
+    CollectionAdminDownloadDevice: {
+      /** @description The page's items; empty, never null */
+      items: components["schemas"]["AdminDownloadDevice"][];
+      /** @description Cursor state; absent for bounded unpaginated collections */
+      page?: components["schemas"]["PageInfo"];
+    };
+    CollectionAdminDownloadEntry: {
+      /** @description The page's items; empty, never null */
+      items: components["schemas"]["AdminDownloadEntry"][];
+      /** @description Cursor state; absent for bounded unpaginated collections */
+      page?: components["schemas"]["PageInfo"];
+    };
+    CollectionAdminDownloadStorageEvent: {
+      /** @description The page's items; empty, never null */
+      items: components["schemas"]["AdminDownloadStorageEvent"][];
+      /** @description Cursor state; absent for bounded unpaginated collections */
+      page?: components["schemas"]["PageInfo"];
+    };
+    CollectionAdminDownloadStorageFile: {
+      /** @description The page's items; empty, never null */
+      items: components["schemas"]["AdminDownloadStorageFile"][];
+      /** @description Cursor state; absent for bounded unpaginated collections */
+      page?: components["schemas"]["PageInfo"];
+    };
     CollectionAdminHistoryImportMapping: {
       /** @description The page's items; empty, never null */
       items: components["schemas"]["AdminHistoryImportMapping"][];
@@ -21414,11 +22156,13 @@ export interface components {
       monitoring_modes: string[];
       ordered_status: boolean;
       preparation_progress: boolean;
+      prepare_again: boolean;
       proxy_delivery: boolean;
       quality_options: components["schemas"]["DownloadQualityOption"][];
       quality_presets: string[];
       /** @description Opaque revision of this document */
       revision: string;
+      revoked_removes_local: boolean;
       season_download: boolean;
       series_monitoring: boolean;
       /**
@@ -43642,6 +44386,237 @@ export interface operations {
       };
     };
   };
+  listAdminDownloadDevices: {
+    parameters: {
+      query?: {
+        cursor?: string;
+        /** @description Page size; default 50, maximum 200 */
+        limit?: number;
+        platform?: string;
+        /** @description Account, profile or device name */
+        q?: string;
+        /** @description last_seen: longest unseen first. size: most bytes on the device first. */
+        sort?: "last_seen" | "size";
+        /** @description Only devices not seen within stale_device_days */
+        stale?: boolean;
+      };
+      header?: {
+        /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
+        "X-Profile-Id"?: string;
+        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
+        "X-Profile-Token"?: string;
+      };
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description OK */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["CollectionAdminDownloadDevice"];
+        };
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unauthorized */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Forbidden */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Found */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Acceptable */
+      406: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unprocessable Entity */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Too Many Requests */
+      429: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  listAdminDownloadEntries: {
+    parameters: {
+      query?: {
+        cursor?: string;
+        device_id?: string;
+        /** @description Page size; default 50, maximum 200 */
+        limit?: number;
+        profile_id?: string;
+        status?: string;
+        user_id?: string;
+      };
+      header?: {
+        /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
+        "X-Profile-Id"?: string;
+        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
+        "X-Profile-Token"?: string;
+      };
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description OK */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["CollectionAdminDownloadEntry"];
+        };
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unauthorized */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Forbidden */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Found */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Acceptable */
+      406: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unprocessable Entity */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Too Many Requests */
+      429: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
   listAdminDownloadPreparations: {
     parameters: {
       query?: {
@@ -44249,6 +45224,974 @@ export interface operations {
       };
       /** @description Unsupported Media Type */
       415: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unprocessable Entity */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Too Many Requests */
+      429: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  revokeAdminDownloads: {
+    parameters: {
+      query?: never;
+      header?: {
+        /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
+        "X-Profile-Id"?: string;
+        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
+        "X-Profile-Token"?: string;
+      };
+      path?: never;
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["AdminDownloadRevokeInputBody"];
+      };
+    };
+    responses: {
+      /** @description OK */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["AdminDownloadRevokeOutputBody"];
+        };
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unauthorized */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Forbidden */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Found */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Acceptable */
+      406: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Request Timeout */
+      408: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Request Entity Too Large */
+      413: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unsupported Media Type */
+      415: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unprocessable Entity */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Too Many Requests */
+      429: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  getAdminDownloadStorage: {
+    parameters: {
+      query?: never;
+      header?: {
+        /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
+        "X-Profile-Id"?: string;
+        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
+        "X-Profile-Token"?: string;
+      };
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description OK */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["AdminDownloadStorage"];
+        };
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unauthorized */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Forbidden */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Found */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Acceptable */
+      406: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unprocessable Entity */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Too Many Requests */
+      429: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  getAdminDownloadStorageCapabilities: {
+    parameters: {
+      query?: never;
+      header?: {
+        /** @description Optional first precondition, evaluated before If-None-Match: a tag that does not match the current representation is 412 precondition_failed. */
+        "If-Match"?: string;
+        "If-None-Match"?: string;
+        /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
+        "X-Profile-Id"?: string;
+        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
+        "X-Profile-Token"?: string;
+      };
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description OK */
+      200: {
+        headers: {
+          "Cache-Control"?: string;
+          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
+          ETag?: string;
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["AdminDownloadStorageCapabilitiesOutputBody"];
+        };
+      };
+      /** @description The representation named by If-None-Match is current; no body. */
+      304: {
+        headers: {
+          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
+          ETag?: string;
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unauthorized */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Forbidden */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Found */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Acceptable */
+      406: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Precondition Failed */
+      412: {
+        headers: {
+          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
+          ETag?: string;
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unprocessable Entity */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Too Many Requests */
+      429: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  listAdminDownloadStorageEvents: {
+    parameters: {
+      query?: {
+        cursor?: string;
+        /** @description Only the last N days; 0 for all kept history (90 days) */
+        days?: number;
+        /** @description Page size; default 50, maximum 200 */
+        limit?: number;
+        location?: string;
+        /** @description Only this reason */
+        reason?: string;
+      };
+      header?: {
+        /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
+        "X-Profile-Id"?: string;
+        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
+        "X-Profile-Token"?: string;
+      };
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description OK */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["CollectionAdminDownloadStorageEvent"];
+        };
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unauthorized */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Forbidden */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Found */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Acceptable */
+      406: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unprocessable Entity */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Too Many Requests */
+      429: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  listAdminDownloadStorageFiles: {
+    parameters: {
+      query?: {
+        /** @description Opaque cursor from page.next_cursor */
+        cursor?: string;
+        /** @description Only files of this format */
+        format?: "remux" | "transcode" | "";
+        /** @description Only files from this library */
+        library_id?: string;
+        /** @description Page size; default 50, maximum 200 */
+        limit?: number;
+        /** @description Only files at this location */
+        location?: string;
+        /** @description Title search */
+        q?: string;
+        /** @description size: largest first. last_used: least recently used first. created: newest first. */
+        sort?: "size" | "last_used" | "created";
+        /** @description Only files in this state; ready files by default */
+        state?: "in_use" | "cached" | "expired" | "";
+      };
+      header?: {
+        /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
+        "X-Profile-Id"?: string;
+        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
+        "X-Profile-Token"?: string;
+      };
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description OK */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["CollectionAdminDownloadStorageFile"];
+        };
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unauthorized */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Forbidden */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Found */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Acceptable */
+      406: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unprocessable Entity */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Too Many Requests */
+      429: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  deleteAdminDownloadStorageFiles: {
+    parameters: {
+      query?: never;
+      header?: {
+        /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
+        "X-Profile-Id"?: string;
+        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
+        "X-Profile-Token"?: string;
+      };
+      path?: never;
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["AdminDownloadStorageDeleteInputBody"];
+      };
+    };
+    responses: {
+      /** @description OK */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["AdminDownloadStorageDeleteOutputBody"];
+        };
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unauthorized */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Forbidden */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Found */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Acceptable */
+      406: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Request Timeout */
+      408: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Request Entity Too Large */
+      413: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unsupported Media Type */
+      415: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unprocessable Entity */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Too Many Requests */
+      429: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  cleanUpAdminDownloadStorageLocation: {
+    parameters: {
+      query?: never;
+      header?: {
+        /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
+        "X-Profile-Id"?: string;
+        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
+        "X-Profile-Token"?: string;
+      };
+      path: {
+        /** @description server, or node:<id> */
+        location: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description OK */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["AdminDownloadStorageCleanupOutputBody"];
+        };
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unauthorized */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Forbidden */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Found */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Acceptable */
+      406: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unprocessable Entity */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Too Many Requests */
+      429: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  deleteAdminDownloadStorageUntrackedFiles: {
+    parameters: {
+      query?: never;
+      header?: {
+        /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
+        "X-Profile-Id"?: string;
+        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
+        "X-Profile-Token"?: string;
+      };
+      path: {
+        /** @description server, or node:<id> */
+        location: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description OK */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["AdminDownloadStorageUntrackedOutputBody"];
+        };
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unauthorized */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Forbidden */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Found */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Acceptable */
+      406: {
         headers: {
           [name: string]: unknown;
         };
@@ -96859,6 +98802,133 @@ export interface operations {
       };
       /** @description Internal Server Error */
       500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  prepareDownloadAgain: {
+    parameters: {
+      query?: never;
+      header: {
+        /** @description The household profile acting for this request; it must belong to the authenticated account. */
+        "X-Profile-Id": string;
+        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
+        "X-Profile-Token"?: string;
+        "X-Silo-Device-Id": string;
+      };
+      path: {
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description OK */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DownloadEntry"];
+        };
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unauthorized */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Forbidden */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Found */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Acceptable */
+      406: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Conflict */
+      409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unprocessable Entity */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Too Many Requests */
+      429: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Implemented */
+      501: {
         headers: {
           [name: string]: unknown;
         };

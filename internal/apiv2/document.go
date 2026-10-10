@@ -727,6 +727,7 @@ func registerAll(reg *Registry) {
 	registerAdminDevices(reg)
 	registerAdminPlaybackSessions(reg)
 	registerAdminDownloadPreparations(reg)
+	registerAdminDownloadStorage(reg)
 	registerAdminPlaybackCommands(reg)
 	registerAdminPlaybackTerminate(reg)
 	registerAdminNodeSessions(reg)

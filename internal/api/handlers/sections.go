@@ -554,6 +554,25 @@ func (h *SectionHandler) HandleLibrarySectionItems(w http.ResponseWriter, r *htt
 	writeJSON(w, http.StatusOK, homeSectionItemsResponse{Section: section})
 }
 
+// loadProfileSectionOverrides fails closed so a settings outage cannot restore
+// a hidden row or replace the profile's chosen collection with the server row.
+func (h *SectionHandler) loadProfileSectionOverrides(ctx context.Context, userID int, profileID, scope, libraryID string) ([]sections.ProfileSectionOverride, error) {
+	if h.StoreProvider == nil || profileID == "" {
+		return nil, nil
+	}
+	store, err := h.StoreProvider.ForUser(ctx, userID)
+	if err != nil {
+		slog.ErrorContext(ctx, "accessing user store for profile sections", "component", "api", "scope", scope, "error", err)
+		return nil, err
+	}
+	overrides, err := store.ListSectionOverrides(ctx, profileID, scope, libraryID)
+	if err != nil {
+		slog.ErrorContext(ctx, "loading profile section overrides", "component", "api", "scope", scope, "error", err)
+		return nil, err
+	}
+	return toSectionOverrides(overrides), nil
+}
+
 func (h *SectionHandler) loadResolvedHomeSections(ctx context.Context) ([]sections.ResolvedSection, []int, catalog.AccessFilter, string, error) {
 	profileID := apimw.GetProfileID(ctx)
 	userID := apimw.GetUserID(ctx)
@@ -571,13 +590,9 @@ func (h *SectionHandler) loadResolvedHomeSections(ctx context.Context) ([]sectio
 		}
 	}
 
-	var overrides []sections.ProfileSectionOverride
-	if h.StoreProvider != nil && profileID != "" {
-		store, storeErr := h.StoreProvider.ForUser(ctx, userID)
-		if storeErr == nil {
-			userOverrides, _ := store.ListSectionOverrides(ctx, profileID, "home", "")
-			overrides = toSectionOverrides(userOverrides)
-		}
+	overrides, err := h.loadProfileSectionOverrides(ctx, userID, profileID, adminSectionScopeHome, "")
+	if err != nil {
+		return nil, nil, catalog.AccessFilter{}, profileID, err
 	}
 
 	resolved := sections.Resolve(adminSections, overrides)
@@ -636,14 +651,9 @@ func (h *SectionHandler) loadResolvedLibrarySections(ctx context.Context, librar
 		}
 	}
 
-	var overrides []sections.ProfileSectionOverride
-	if h.StoreProvider != nil && profileID != "" {
-		store, storeErr := h.StoreProvider.ForUser(ctx, userID)
-		if storeErr == nil {
-			libStr := strconv.Itoa(libraryID)
-			userOverrides, _ := store.ListSectionOverrides(ctx, profileID, "library", libStr)
-			overrides = toSectionOverrides(userOverrides)
-		}
+	overrides, err := h.loadProfileSectionOverrides(ctx, userID, profileID, adminSectionScopeLibrary, strconv.Itoa(libraryID))
+	if err != nil {
+		return nil, catalog.AccessFilter{}, profileID, err
 	}
 
 	resolved := sections.Resolve(adminSections, overrides)
