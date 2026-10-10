@@ -1817,7 +1817,40 @@ func newTestServiceWithTMDB(store *fakeStore, tmdbClient *fakeTMDBClient) *Servi
 	service := NewService(store, tmdbClient, &fakePresence{})
 	service.Now = func() time.Time { return time.Date(2026, 5, 24, 12, 0, 0, 0, time.UTC) }
 	service.SetUserRepository(requestUserRepo{})
+	// A create defers its TMDB enrichment past the 201. Tests that need the
+	// result run it explicitly through a deferredEnrichment; the default drops
+	// it so no goroutine races a test.
+	service.enrichAsync = func(func()) {}
 	return service
+}
+
+// deferredEnrichment collects the enrichment CreateRequest schedules past the
+// 201 so a test can run it deterministically instead of racing a goroutine.
+type deferredEnrichment struct {
+	mu   sync.Mutex
+	runs []func()
+}
+
+func (d *deferredEnrichment) schedule(run func()) {
+	d.mu.Lock()
+	d.runs = append(d.runs, run)
+	d.mu.Unlock()
+}
+
+func (d *deferredEnrichment) drain() {
+	d.mu.Lock()
+	runs := d.runs
+	d.runs = nil
+	d.mu.Unlock()
+	for _, run := range runs {
+		run()
+	}
+}
+
+func (d *deferredEnrichment) pending() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return len(d.runs)
 }
 
 // requestUserRepo stands in for the account loader. The default account is
@@ -2018,6 +2051,10 @@ func (f *fakeStore) CreateRequest(_ context.Context, input CreateRequestRecord) 
 		TVDBID:               input.Input.TVDBID,
 		IMDbID:               input.Input.IMDbID,
 		Title:                input.Input.Title,
+		Year:                 input.Input.Year,
+		Overview:             input.Input.Overview,
+		PosterPath:           input.Input.PosterPath,
+		BackdropPath:         input.Input.BackdropPath,
 		Status:               input.Status,
 		Outcome:              input.Outcome,
 		IsAnime:              input.IsAnime,
@@ -2142,6 +2179,30 @@ func (f *fakeStore) SetExternalIDs(_ context.Context, id string, tvdbID int, imd
 		req.IMDbID = imdbID
 	}
 	return *req.TVDBID, nil
+}
+
+func (f *fakeStore) FillRequestDisplay(_ context.Context, id string, year *int, overview, posterPath, backdropPath string) (*Request, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	req := f.lookupLocked(id)
+	if req == nil {
+		return nil, ErrNotFound
+	}
+	if req.Year == nil && year != nil && *year > 0 {
+		v := *year
+		req.Year = &v
+	}
+	if req.Overview == "" {
+		req.Overview = overview
+	}
+	if req.PosterPath == "" {
+		req.PosterPath = posterPath
+	}
+	if req.BackdropPath == "" {
+		req.BackdropPath = backdropPath
+	}
+	copy := *req
+	return &copy, nil
 }
 
 func (f *fakeStore) MarkFulfilledNotified(_ context.Context, id string) (bool, error) {
@@ -3126,6 +3187,7 @@ type fakeTMDBClient struct {
 	externalIDCalls   []int
 	detail            *tmdb.MediaDetail
 	detailErr         error
+	detailCalls       int
 	discoverPage      *tmdb.MediaPage
 	discoverErr       error
 	searchMediaType   string
@@ -3168,7 +3230,18 @@ func (f *fakeTMDBClient) GetExternalIDs(_ context.Context, _ string, id int) (*t
 }
 
 func (f *fakeTMDBClient) GetMediaDetail(context.Context, string, int) (*tmdb.MediaDetail, error) {
+	f.mu.Lock()
+	f.detailCalls++
+	f.mu.Unlock()
 	return f.detail, f.detailErr
+}
+
+// externalCalls reports the TMDB calls the fake served, for tests that pin
+// that a create made none.
+func (f *fakeTMDBClient) externalCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.externalIDCalls) + f.detailCalls
 }
 
 // certTMDBClient layers GetCertification onto fakeTMDBClient so a service

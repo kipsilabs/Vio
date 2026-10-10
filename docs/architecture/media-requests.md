@@ -25,13 +25,26 @@ request's state.
 
 ## Routing facts
 
-Creating a request reads the title's TMDB detail once, after the cheap refusals
-(a movie already in the library, a title already requested). The server's copy of the title and
-year replaces the client's, and a snapshot of what routing can match on is
-stored with the request as `routing_facts`: TMDB genre, keyword, network and
-company IDs, original language, origin countries, year, rating, and whether
-it is anime. IDs rather than names, because names follow the configured TMDB
-language.
+Creating a request runs the cheap local refusals first — a title already in the
+library, a title already requested — before any external call, so a bulk client
+retrying a title after a client-side timeout gets its `409` without paying
+TMDB/TVDB round trips. The duplicate check reads only the TMDB ID the client
+supplied, and runs before the TMDB read below.
+
+A v2 movie request then returns its `201` from the client's own title, year,
+overview and poster, and reads the title's TMDB detail afterwards, in a
+best-effort step detached from the request: the external IDs and the routing
+facts it derives are written back to the committed row. A series request cannot
+defer the read: its seasons are checked and defaulted from TMDB's season list,
+and the TVDB cross-reference TMDB supplies (directly or through a metadata
+provider) is what the router plugin needs, so both are resolved before the
+insert and belong in the response. A v1 create keeps the synchronous read too,
+so its frozen response carries the server's title exactly as before.
+
+The routing facts are a snapshot of what routing can match on, stored with the
+request as `routing_facts`: TMDB genre, keyword, network and company IDs,
+original language, origin countries, year, rating, and whether it is anime. IDs
+rather than names, because names follow the configured TMDB language.
 
 Anime means Japanese animation (`internal/requests/anime.go`). TMDB's anime
 keyword alone misses about one anime series in eight and one film in three, so
@@ -55,7 +68,10 @@ scale; so does a title rated only "NR" in the US. The parental-control path
 keeps to the US rating.
 
 When TMDB cannot answer, the request is still created from the client's copy,
-and the facts stay uncaptured until routing fetches them.
+and the facts stay uncaptured until routing fetches them. The deferred step
+records nothing on a failed read rather than an empty snapshot, so submission
+and routing retry through their backfill paths instead of routing on a title
+with no facts.
 
 ## Routing
 

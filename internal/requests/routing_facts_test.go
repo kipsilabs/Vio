@@ -9,7 +9,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/metadata/tmdb"
 )
 
-func TestCreateRequestCapturesRoutingFactsAndServerTitle(t *testing.T) {
+func TestCreateRequestDefersRoutingFactsAndKeepsClientTitle(t *testing.T) {
 	store := newFakeStore()
 	tmdbClient := &fakeTMDBClient{detail: &tmdb.MediaDetail{
 		MediaType: "movie", ID: 129, Title: "Spirited Away", Year: 2001,
@@ -17,6 +17,8 @@ func TestCreateRequestCapturesRoutingFactsAndServerTitle(t *testing.T) {
 		OriginCountries: []string{"JP"}, CompanyIDs: []int{10342},
 	}}
 	svc := newTestServiceWithTMDB(store, tmdbClient)
+	enrichment := &deferredEnrichment{}
+	svc.enrichAsync = enrichment.schedule
 
 	req, err := svc.CreateRequest(context.Background(), testViewer(1), CreateRequestInput{
 		MediaType: MediaTypeMovie, TMDBID: 129, Title: "spirited away (client copy)",
@@ -24,13 +26,24 @@ func TestCreateRequestCapturesRoutingFactsAndServerTitle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateRequest: %v", err)
 	}
-	if req.Title != "Spirited Away" || store.created[0].Input.Year == nil || *store.created[0].Input.Year != 2001 {
-		t.Fatalf("title/year = %q/%v, want the server's TMDB copy", req.Title, store.created[0].Input.Year)
+	// The 201 carries the client's title and no TMDB facts: the read is deferred.
+	if req.Title != "spirited away (client copy)" || store.created[0].Facts.Captured() {
+		t.Fatalf("title = %q facts = %+v, want the client's title and uncaptured facts", req.Title, store.created[0].Facts)
 	}
-	facts := store.created[0].Facts
-	if !facts.Captured() || !facts.Anime || !req.IsAnime || facts.OriginalLanguage != "ja" || facts.Year != 2001 ||
+	if enrichment.pending() != 1 {
+		t.Fatalf("deferred enrichment pending = %d, want 1", enrichment.pending())
+	}
+
+	enrichment.drain()
+
+	facts := store.factsSet[req.ID]
+	if !facts.Captured() || !facts.Anime || facts.OriginalLanguage != "ja" || facts.Year != 2001 ||
 		!slices.Equal(facts.GenreIDs, []int{16, 14}) || !slices.Equal(facts.CompanyIDs, []int{10342}) {
 		t.Fatalf("facts = %+v, want the TMDB snapshot", facts)
+	}
+	got := store.requests[req.ID]
+	if !got.IsAnime || got.Year == nil || *got.Year != 2001 {
+		t.Fatalf("stored request = %+v, want the fetched anime flag and year", got)
 	}
 }
 
