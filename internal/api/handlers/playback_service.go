@@ -482,32 +482,44 @@ func latestAcceptedSampleV2(ctx context.Context, store playback.ProgressStoreV3,
 // user-store write is last-write-wins, so two replicas can finish in the
 // opposite order to the row: sequence 1 lands on replica A after sequence 2
 // landed on replica B. A process-local lock cannot order that, so the row is
-// the guard instead. The writers run for the row's latest sample, then the
-// row is read again; if it moved while they ran, the newer sample is written
-// on top. Whoever writes last therefore writes the latest: a later sample's
-// writer either ran after this caller's final check or was the one that moved
-// the row, and it finishes with the same check.
+// the guard instead. The writers run for the admitted sample, then the row is
+// read again; if it moved while they ran, the newer sample is written on top.
+// Whoever writes last therefore writes the latest: a later sample's writer
+// either ran after this caller's final check or was the one that moved the row,
+// and it finishes with the same check.
 func (h *PlaybackHandler) persistProgressV2(ctx context.Context, store playback.ProgressStoreV3, record *playback.AttemptRecordV3, sessionID string, sample playback.ProgressSampleV3) {
-	// Within one replica the passes are serialized per session so two local
-	// writers cannot interleave inside a pass.
-	unlock := h.progressSideEffectLock(sessionID)
+	// Acquire with the request context: a progress write that has already hit
+	// the client's deadline must not queue behind another writer. The row CAS
+	// already committed, so an abandoned acquire is safe — the client's retry of
+	// the same sequence replays and re-runs the side effects.
+	unlock, acquired := h.progressSideEffectLockContext(ctx, sessionID)
+	if !acquired {
+		return
+	}
 	defer unlock()
+	// The caller sequenced sample on the row (ApplyProgressV2 admitted it), so
+	// the first pass writes that sample directly rather than re-reading the row
+	// to learn what it just committed: on the common case where the row has not
+	// moved, the extra read doubled this path's store round trips. The read after
+	// each write is what still leaves the side effects at the row's latest sample.
 	target := sample
-	for pass := 0; ; pass++ {
+	for pass := 0; pass < maxProgressWritePassesV2; pass++ {
+		if ctx.Err() != nil {
+			// The client aborted. The row is committed, so the retry replays and
+			// re-runs the writers; do not keep writing under a cancelled context.
+			return
+		}
+		h.writeProgressSideEffectsV2(ctx, record, sessionID, target)
 		latest, ok := latestAcceptedSampleV2(ctx, store, sessionID, target)
 		if !ok {
 			return
 		}
-		if pass > 0 && latest == target {
-			return
-		}
-		if pass == maxProgressWritePassesV2 {
-			slog.WarnContext(ctx, "playback progress side effects trail the attempt row", "component", "api", "session", sessionID, "playback_session_id", sessionID, "sequence", latest.Sequence)
+		if latest == target {
 			return
 		}
 		target = latest
-		h.writeProgressSideEffectsV2(ctx, record, sessionID, target)
 	}
+	slog.WarnContext(ctx, "playback progress side effects trail the attempt row", "component", "api", "session", sessionID, "playback_session_id", sessionID, "sequence", target.Sequence)
 }
 
 // writeProgressSideEffectsV2 applies one sample to the live session when this
@@ -529,49 +541,99 @@ func (h *PlaybackHandler) writeProgressSideEffectsV2(ctx context.Context, record
 	h.persistProgress(ctx, h.attemptSessionV2(ctx, record, sample.Position, sample.IsPaused))
 }
 
-// progressSideEffectLockEntry is one session's progress side-effect lock plus a
-// reference count of the callers currently holding or waiting for it.
-type progressSideEffectLockEntry struct {
-	mu   sync.Mutex
+// sessionSideEffectLockEntry is one session's side-effect lock plus a reference
+// count of the callers currently holding or waiting for it. The lock is a
+// capacity-1 channel rather than a sync.Mutex so an acquire can be abandoned
+// when the caller's context ends: a request already past its deadline must not
+// keep waiting on another writer.
+type sessionSideEffectLockEntry struct {
+	sem  chan struct{}
 	refs int
 }
 
-// progressSideEffectLock serializes per-session handler side effects (v2
-// progress persistence and inventory-updated publishes) for one session.
+func newSessionSideEffectLockEntry() *sessionSideEffectLockEntry {
+	return &sessionSideEffectLockEntry{sem: make(chan struct{}, 1)}
+}
+
+// acquireSessionSideEffectLock acquires the per-session side-effect lock held in
+// locks and reports whether it was acquired before ctx ended.
 //
-// The entry is reference-counted: the first acquire creates it, and the unlock
+// The entry is reference-counted: the first acquire creates it, and the release
 // closure deletes it only when the last in-flight holder releases. The map is
-// therefore bounded by concurrently running progress writers, not by the number
-// of sessions the process has served, and an entry is never deleted while any
-// caller still holds or is waiting on its mutex — deleting a held mutex would
-// let a later caller create a second one for the same session and run side
-// effects concurrently, which is exactly what this lock prevents.
-func (h *PlaybackHandler) progressSideEffectLock(sessionID string) func() {
-	if h == nil || sessionID == "" {
-		return func() {}
+// therefore bounded by concurrently running side effects, not by the number of
+// sessions the process has served, and an entry is never deleted while any
+// caller still holds or is waiting on its lock — deleting a held lock would let
+// a later caller create a second one for the same session and run side effects
+// concurrently, which is exactly what this lock prevents. A cancelled acquire
+// drops its reference without ever taking the lock.
+func acquireSessionSideEffectLock(ctx context.Context, mu *sync.Mutex, locks *map[string]*sessionSideEffectLockEntry, sessionID string) (func(), bool) {
+	if sessionID == "" {
+		return func() {}, true
 	}
-	h.progressSideEffectLocksMu.Lock()
-	if h.progressSideEffectLocks == nil {
-		h.progressSideEffectLocks = make(map[string]*progressSideEffectLockEntry)
+	mu.Lock()
+	if *locks == nil {
+		*locks = make(map[string]*sessionSideEffectLockEntry)
 	}
-	entry := h.progressSideEffectLocks[sessionID]
+	entry := (*locks)[sessionID]
 	if entry == nil {
-		entry = &progressSideEffectLockEntry{}
-		h.progressSideEffectLocks[sessionID] = entry
+		entry = newSessionSideEffectLockEntry()
+		(*locks)[sessionID] = entry
 	}
 	entry.refs++
-	h.progressSideEffectLocksMu.Unlock()
+	mu.Unlock()
 
-	entry.mu.Lock()
-	return func() {
-		entry.mu.Unlock()
-		h.progressSideEffectLocksMu.Lock()
+	release := func() {
+		<-entry.sem
+		mu.Lock()
 		entry.refs--
 		if entry.refs <= 0 {
-			delete(h.progressSideEffectLocks, sessionID)
+			delete(*locks, sessionID)
 		}
-		h.progressSideEffectLocksMu.Unlock()
+		mu.Unlock()
 	}
+	select {
+	case entry.sem <- struct{}{}:
+		return release, true
+	case <-ctx.Done():
+		mu.Lock()
+		entry.refs--
+		if entry.refs <= 0 {
+			delete(*locks, sessionID)
+		}
+		mu.Unlock()
+		return func() {}, false
+	}
+}
+
+// progressSideEffectLock serializes v2 progress side effects for one session.
+// It blocks until the lock is free; use progressSideEffectLockContext on a
+// request path, where an aborted client must be able to stop waiting.
+func (h *PlaybackHandler) progressSideEffectLock(sessionID string) func() {
+	release, _ := h.progressSideEffectLockContext(context.Background(), sessionID)
+	return release
+}
+
+// progressSideEffectLockContext acquires the per-session progress side-effect
+// lock, giving up when ctx ends first. The bool result reports the acquisition.
+func (h *PlaybackHandler) progressSideEffectLockContext(ctx context.Context, sessionID string) (func(), bool) {
+	if h == nil {
+		return func() {}, true
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return acquireSessionSideEffectLock(ctx, &h.progressSideEffectLocksMu, &h.progressSideEffectLocks, sessionID)
+}
+
+// inventoryPublishLock serializes inventory_updated pushes for one session.
+// Inventory pushes are background work under their own publish budget, so they
+// take their lock with a background context and never cancel an acquire.
+func (h *PlaybackHandler) inventoryPublishLock(sessionID string) func() {
+	if h == nil {
+		return func() {}
+	}
+	release, _ := acquireSessionSideEffectLock(context.Background(), &h.inventoryPublishLocksMu, &h.inventoryPublishLocks, sessionID)
+	return release
 }
 
 // forgetProgressSideEffectLock drops the per-session state once the attempt is
@@ -1597,11 +1659,12 @@ func (h *PlaybackHandler) sessionWithSourceGeneration(sessionID string) (*playba
 func (h *PlaybackHandler) publishInventoryUpdatedToSession(ctx context.Context, session *playback.Session, probedFileID int, candidateURI string, probed *models.MediaFile) (string, inventoryPublishResult) {
 	// Two background probes (a start-path repair and a virtual-evidence worker)
 	// can publish for the same session concurrently. Serialize the build and
-	// the send under the session's per-session lock so an older build cannot be
-	// delivered after a newer one for the same source identity: the revision is
-	// a content digest, so a replayed older revision is otherwise
-	// indistinguishable from a fresh state at the receiver.
-	release := h.progressSideEffectLock(session.ID)
+	// the send under the session's inventory-publish lock so an older build
+	// cannot be delivered after a newer one for the same source identity: the
+	// revision is a content digest, so a replayed older revision is otherwise
+	// indistinguishable from a fresh state at the receiver. This is a separate
+	// lock from the progress side-effect lock; see inventoryPublishLocks.
+	release := h.inventoryPublishLock(session.ID)
 	defer release()
 	// The caller enumerated sessions before the lock was held, so the snapshot
 	// it passed can already name a superseded source binding. Re-read the live
