@@ -4,10 +4,103 @@ import (
 	"context"
 	"net/url"
 	"testing"
+	"time"
 
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
 )
+
+// The serve overlay must carry the session's plan-time audio inventory with the
+// subtitle inventory. The bound row here is a placeholder with no audio of its
+// own; before the fix the overlay applied subtitles only, so the serve and
+// inventory paths lost the audio the plan had captured and served an empty menu.
+func TestBindVirtualSourceCarriesAudioEvidenceLikeSubtitles(t *testing.T) {
+	uri := "virtual://movie/tt-audio?result=cand-a"
+	boundFile := &models.MediaFile{ID: 88, FilePath: uri}
+	session := &playback.Session{
+		ID:                            "sess-audio",
+		VirtualSourceURI:              uri,
+		VirtualSubtitleEvidenceSet:    true,
+		VirtualSubtitleEvidenceURI:    uri,
+		VirtualSubtitleEvidenceFileID: 88,
+		VirtualAudioTracks:            []models.AudioTrack{{Index: 1, Codec: "eac3", Channels: 6, Language: "jpn"}},
+	}
+
+	bound := bindSessionVirtualSourceWithTracks(context.Background(), boundFile, session, nil)
+	if len(bound.AudioTracks) != 1 || bound.AudioTracks[0].Language != "jpn" {
+		t.Fatalf("carried audio evidence was not applied: %+v", bound.AudioTracks)
+	}
+}
+
+// Audio evidence anchored at a different candidate than the bound file must be
+// discarded exactly like subtitle evidence. The bound row's own audio is kept,
+// never the previous release's inventory.
+func TestBindVirtualSourceDiscardsForeignCandidateAudioEvidence(t *testing.T) {
+	boundFile := &models.MediaFile{
+		ID:          77,
+		FilePath:    "virtual://movie/tt1?result=candidate-b",
+		AudioTracks: []models.AudioTrack{{Index: 1, Codec: "aac", Language: "eng"}},
+	}
+	session := &playback.Session{
+		ID:                         "sess",
+		VirtualSourceURI:           boundFile.FilePath,
+		VirtualSubtitleEvidenceSet: true,
+		VirtualSubtitleEvidenceURI: "virtual://movie/tt1?result=candidate-a",
+		VirtualAudioTracks:         []models.AudioTrack{{Index: 1, Codec: "aac", Language: "fra"}},
+	}
+
+	bound := bindSessionVirtualSourceWithTracks(context.Background(), boundFile, session, nil)
+	if len(bound.AudioTracks) != 1 || bound.AudioTracks[0].Language != "eng" {
+		t.Fatalf("foreign candidate audio evidence was applied: %+v", bound.AudioTracks)
+	}
+}
+
+// A deferred plan carries its declared audio without a probe stamp. When the
+// bound file is a placeholder for a release no catalog row names, the serve
+// overlay must still describe the plan's audio instead of an empty menu, while
+// never downgrading a probed row or crossing onto a rotated candidate.
+func TestBindVirtualSourceCarriesDeclaredAudioOnPlaceholder(t *testing.T) {
+	uri := "virtual://movie/tt-placeholder?result=cand-1"
+	placeholder := &models.MediaFile{ID: 99, FilePath: uri}
+	session := &playback.Session{
+		ID:               "sess-placeholder",
+		MediaFileID:      99,
+		VirtualSourceURI: uri,
+		// No probe evidence: the deferred probe has not stamped the row.
+		VirtualAudioTracks: []models.AudioTrack{{Index: 1, Codec: "eac3", Channels: 6, Language: "jpn"}},
+	}
+	bound := bindSessionVirtualSourceWithTracks(context.Background(), placeholder, session, nil)
+	if len(bound.AudioTracks) != 1 || bound.AudioTracks[0].Language != "jpn" {
+		t.Fatalf("declared audio was not carried onto the placeholder: %+v", bound.AudioTracks)
+	}
+
+	// A probed row is never downgraded: its own verified audio wins.
+	probedAt := time.Now().UTC()
+	probedRow := &models.MediaFile{
+		ID: 99, FilePath: uri,
+		AudioTracks:    []models.AudioTrack{{Index: 3, Codec: "truehd", Channels: 8, Language: "eng"}},
+		ProbeUpdatedAt: &probedAt,
+	}
+	bound = bindSessionVirtualSourceWithTracks(context.Background(), probedRow, session, nil)
+	if len(bound.AudioTracks) != 1 || bound.AudioTracks[0].Codec != "truehd" {
+		t.Fatalf("verified row audio was downgraded to declared: %+v", bound.AudioTracks)
+	}
+
+	// A rotated binding must not carry the previous candidate's audio.
+	rotatedURI := "virtual://movie/tt-placeholder?result=cand-2"
+	rotated := &playback.Session{
+		ID:                         "sess-rotated",
+		MediaFileID:                99,
+		VirtualSourceURI:           rotatedURI,
+		VirtualSubtitleEvidenceURI: uri,
+		VirtualAudioTracks:         []models.AudioTrack{{Index: 1, Codec: "eac3", Language: "jpn"}},
+	}
+	otherPlaceholder := &models.MediaFile{ID: 99, FilePath: rotatedURI}
+	bound = bindSessionVirtualSourceWithTracks(context.Background(), otherPlaceholder, rotated, nil)
+	if len(bound.AudioTracks) != 0 {
+		t.Fatalf("rotated binding carried the previous candidate's audio: %+v", bound.AudioTracks)
+	}
+}
 
 // bindSessionVirtualSourceWithTracks must only apply carried session evidence
 // when it provably belongs to the candidate being served. When the evidence

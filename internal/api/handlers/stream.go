@@ -883,6 +883,28 @@ func bindSessionVirtualSourceWithTracks(ctx context.Context, file *models.MediaF
 		boundCopy := *bound
 		boundCopy.SubtitleTracks = session.VirtualSubtitleTracks
 		boundCopy.ExternalSubtitles = session.VirtualExternalSubtitles
+		// Audio evidence travels with the subtitle evidence. The catalog row is
+		// mutable and the bound file may be a placeholder for a release no row
+		// names, so the audio inventory captured at plan time is as
+		// authoritative as the subtitle inventory; serving the bound file's own
+		// audio instead would drop a menu the plan already promised. Captured-
+		// empty audio is genuine evidence, so an empty slice is applied too, not
+		// treated as absent.
+		boundCopy.AudioTracks = session.VirtualAudioTracks
+		return &boundCopy
+	}
+
+	// No probe-authoritative evidence applies. When the bound file carries no
+	// committed probe stamp — the placeholder built for a release no catalog row
+	// names, or a virtual row the deferred write did not reach — the plan-time
+	// audio inventory the session captured is the only menu the plan promised.
+	// Apply it, but only while it still belongs to the bound candidate: a
+	// rotation onto a different release must not carry the previous release's
+	// audio, and a probed row must never be downgraded from verified to declared.
+	if bound.ProbeUpdatedAt == nil && session.VirtualAudioTracks != nil &&
+		virtualEvidenceMatchesBoundFile(bound, session) {
+		boundCopy := *bound
+		boundCopy.AudioTracks = session.VirtualAudioTracks
 		return &boundCopy
 	}
 

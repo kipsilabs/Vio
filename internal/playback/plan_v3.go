@@ -2066,7 +2066,12 @@ func AudioInventoryV3(file *models.MediaFile) []AudioInventoryItemV3 {
 
 func audioInventoryV3(file *models.MediaFile) []AudioInventoryItemV3 {
 	if file == nil || len(file.AudioTracks) == 0 {
-		return nil
+		// Return an empty, non-nil slice: audio_tracks has no omitempty on
+		// PlaybackInventoryV3, so a nil slice would serialize as null and a
+		// client could not tell an enumerated-empty release from a source the
+		// server never probed. The realtime push already normalized nil to [],
+		// and the inventory endpoint must match that shape.
+		return []AudioInventoryItemV3{}
 	}
 	items := make([]AudioInventoryItemV3, len(file.AudioTracks))
 	for i, track := range file.AudioTracks {
