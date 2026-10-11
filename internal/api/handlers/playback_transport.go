@@ -379,9 +379,13 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 		// just indicted that candidate (attempt > 0 with a failed id). Declare
 		// it explicitly so the resolver may serve a sibling; a neutral first
 		// attempt, or a failure that identified no candidate, keeps refusing.
-		resolvedMedia, cleanup, resolveErr := h.resolveVirtualInputURI(
-			resolveStartupCtx, targetURI, ownerInstallationID, userID, profileID, attempt > 0, failedCandidateIDs, preferredID, attempt > 0 && len(failedCandidateIDs) > 0,
-		)
+		resolvedMedia, cleanup, resolveErr := func() (ResolvedVirtualMedia, func(), error) {
+			resolveStart := time.Now()
+			defer recordTransportPhaseV3(ctx, "transport_upstream", resolveStart)
+			return h.resolveVirtualInputURI(
+				resolveStartupCtx, targetURI, ownerInstallationID, userID, profileID, attempt > 0, failedCandidateIDs, preferredID, attempt > 0 && len(failedCandidateIDs) > 0,
+			)
+		}()
 		if resolveErr != nil {
 			lastErr = resolveErr
 			// A pending release (AltMount actively fetching) is never
