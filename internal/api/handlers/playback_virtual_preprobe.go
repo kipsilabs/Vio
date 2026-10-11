@@ -53,6 +53,22 @@ const (
 	// bounded retry set and a worker re-admits it when it next drains, so the
 	// request path never probes inline.
 	virtualDeferredProbeQueueSize = 64
+	// virtualProbeConvergenceSlack is the extra time the convergence watchdog
+	// allows past the probe's own budget before it terminally fails a still-
+	// pending deferred probe. It covers the durable evidence write
+	// (virtualEvidencePersistBudget) and the outcome/publish handoff, and it is
+	// deliberately generous so the watchdog only ever fires for a lifecycle no
+	// worker will finish — never for a probe that is merely slow.
+	virtualProbeConvergenceSlack = 10 * time.Second
+	// virtualProbeWatchdogInterval is the convergence watchdog's scan cadence.
+	// The bound itself is what guarantees convergence; the cadence only bounds
+	// how late after the bound the failure is observed, so a short interval adds
+	// nothing but a finer guarantee.
+	virtualProbeWatchdogInterval = 1 * time.Second
+	// virtualProbeWatchdogPageSize bounds one scan. A full page is fine: the
+	// next tick scans again, and every failed session drops out of the pending
+	// set, so the scan converges even when more sessions are pending than fit.
+	virtualProbeWatchdogPageSize = 128
 )
 
 // Probe lifecycle outcomes recorded on a session via SetVirtualProbeOutcome. They
@@ -99,6 +115,106 @@ func (h *PlaybackHandler) startDeferredProbeWorkers() {
 			}()
 		}
 	})
+	h.startDeferredProbeWatchdog()
+}
+
+// probeConvergenceBound is the documented maximum time a cold-start deferred
+// probe may remain pending before the convergence watchdog terminally fails it.
+// It is the probe's own budget plus a fixed slack for the durable evidence write
+// and the outcome/publish handoff. The probe budget is a var so tests can shrink
+// the whole bound; a handler-level override replaces it entirely.
+func (h *PlaybackHandler) probeConvergenceBound() time.Duration {
+	if h != nil && h.probeConvergenceOverride > 0 {
+		return h.probeConvergenceOverride
+	}
+	return virtualBackgroundProbeBudget + virtualProbeConvergenceSlack
+}
+
+// probeWatchdogCadence is the effective scan interval, honoring a test override.
+func (h *PlaybackHandler) probeWatchdogCadence() time.Duration {
+	if h != nil && h.probeWatchdogIntervalOverride > 0 {
+		return h.probeWatchdogIntervalOverride
+	}
+	return virtualProbeWatchdogInterval
+}
+
+// startDeferredProbeWatchdog lazily starts the single convergence watchdog. It
+// is tied to the service context so it exits at shutdown and never leaks.
+func (h *PlaybackHandler) startDeferredProbeWatchdog() {
+	if h == nil {
+		return
+	}
+	h.deferredProbeWatchdogOnce.Do(func() {
+		go h.runDeferredProbeWatchdog()
+	})
+}
+
+// runDeferredProbeWatchdog scans for deferred probes that have stayed pending
+// past the convergence bound and terminally fails them. It is the guarantee
+// that the pending state is bounded: every other lifecycle path can only end a
+// probe that a worker actually runs or sheds, so a probe whose worker hangs (a
+// provider that ignores its context) or that keeps re-parking behind a
+// permanently saturated gate would otherwise stay pending for the session's
+// whole life. A failure write is followed by the same terminal-notification
+// publish every other failed outcome uses, so the push and the poll agree and a
+// client leaves its loading state either way.
+func (h *PlaybackHandler) runDeferredProbeWatchdog() {
+	base := h.ServiceContext
+	if base == nil {
+		base = context.Background()
+	}
+	ticker := time.NewTicker(h.probeWatchdogCadence())
+	defer ticker.Stop()
+	for {
+		select {
+		case <-base.Done():
+			return
+		case <-ticker.C:
+			h.failOverdueDeferredProbes(time.Now().Add(-h.probeConvergenceBound()))
+		}
+	}
+}
+
+// failOverdueDeferredProbes fails every session whose deferred probe is still
+// pending and was armed at or before cutoff, then parks the terminal
+// notification for the dispatcher to deliver. The failure is written as a
+// compare-and-swap from pending only, so a probe that verifies between the scan
+// and the write is never overwritten, and a rotation that moved the binding is
+// left to its own lifecycle. It is exported to the package for the watchdog
+// ticker and is directly callable in tests with an explicit cutoff, which keeps
+// the bound assertion deterministic instead of wall-clock dependent.
+func (h *PlaybackHandler) failOverdueDeferredProbes(cutoff time.Time) {
+	if h == nil || h.sessionMgr == nil {
+		return
+	}
+	reader, ok := h.sessionMgr.(interface {
+		VirtualProbePendingSessions(time.Time, int) []playback.VirtualProbeTerminalSession
+	})
+	if !ok {
+		return
+	}
+	failer, ok := h.sessionMgr.(interface {
+		FailVirtualProbeIfPendingIfGeneration(string, uint64, time.Time) (bool, error)
+	})
+	if !ok {
+		return
+	}
+	for _, pending := range reader.VirtualProbePendingSessions(cutoff, virtualProbeWatchdogPageSize) {
+		if pending.SessionID == "" || pending.FileID <= 0 {
+			continue
+		}
+		applied, err := failer.FailVirtualProbeIfPendingIfGeneration(pending.SessionID, pending.Generation, cutoff)
+		if err != nil || !applied {
+			// The session ended, rotated, or reached a terminal outcome between
+			// the scan and the write. Nothing is owed: the newer state owns the
+			// lifecycle.
+			continue
+		}
+		slog.Warn("deferred virtual probe exceeded the convergence bound; marking inventory failed",
+			"component", "api", "session", pending.SessionID, "file_id", pending.FileID,
+			"generation", pending.Generation, "bound", h.probeConvergenceBound())
+		h.parkDeferredProbePublish(pending.SessionID, pending.FileID, pending.Generation)
+	}
 }
 
 // deferredProbeKey identifies one outstanding deferred probe so a re-admitted

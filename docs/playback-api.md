@@ -74,6 +74,12 @@ error, an unreadable evidence write, or a saturated worker pool that could not
 admit the probe — and the client must leave the loading state and keep the
 provisional menu it already holds. A failed upgrade never changes the stream or
 the executable audio selection; a viewer who picked an audio track keeps it.
+The pending state is bounded: the server tracks when each deferred probe was
+armed and terminally fails one that has not reached a terminal outcome within
+the convergence bound — the probe's own budget plus a fixed slack for the
+evidence write and the publish handoff. `pending` is therefore never permanent,
+even when a provider ignores cancellation or the probe pool stays saturated; the
+client always receives `verified` or `failed` in the original session.
 When the durable evidence write commits a verified inventory whose order differs
 from the declared one, the server replays the attempt's persisted audio
 selection intent against it (the same default-audio reconciliation the

@@ -802,6 +802,20 @@ type PlaybackHandler struct {
 	// map after any wake.
 	deferredPublishDone chan struct{}
 
+	// deferredProbeWatchdogOnce guards the lazy start of the deferred-probe
+	// convergence watchdog (see startDeferredProbeWatchdog). It fails a session
+	// whose deferred probe has stayed pending past the convergence bound, so
+	// the pending state is always bounded.
+	deferredProbeWatchdogOnce sync.Once
+	// probeConvergenceOverride, when positive, replaces the production
+	// convergence bound so a test can observe the watchdog without waiting the
+	// full bound. Zero uses virtualBackgroundProbeBudget plus the slack.
+	probeConvergenceOverride time.Duration
+	// probeWatchdogIntervalOverride, when positive, replaces the production
+	// scan cadence so a test can drive the watchdog quickly. Zero uses
+	// virtualProbeWatchdogInterval.
+	probeWatchdogIntervalOverride time.Duration
+
 	// prefetchOnce guards the lazy prefetch worker pool. Prefetch work is
 	// admitted into a bounded queue (prefetchQueue) before any goroutine
 	// handles it, deduplicated by source+profile equivalence key
