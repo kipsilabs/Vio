@@ -147,7 +147,7 @@ jobs:
       # from scratch on every run, which was most of the old job's time.
       - name: Restore the golangci-lint binary
         id: golangci-lint-binary
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/go/bin/golangci-lint
           key: golangci-lint-binary-${{ runner.os }}-${{ env.GOLANGCI_LINT_VERSION }}-${{ hashFiles('go.mod') }}
@@ -160,7 +160,7 @@ jobs:
       # one analysis cache instead of each saving a copy no other PR can read.
       - name: Restore the golangci-lint analysis cache
         if: github.event_name == 'pull_request'
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: ~/.cache/golangci-lint
           key: golangci-lint-cache-${{ runner.os }}-${{ env.GOLANGCI_LINT_VERSION }}-${{ github.sha }}
@@ -169,7 +169,7 @@ jobs:
 
       - name: Restore and save the golangci-lint analysis cache
         if: github.event_name != 'pull_request'
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/golangci-lint
           key: golangci-lint-cache-${{ runner.os }}-${{ env.GOLANGCI_LINT_VERSION }}-${{ github.sha }}
@@ -432,7 +432,7 @@ jobs:
       # serves the download when the binary cache misses.
       - name: Restore golangci-lint
         id: golangci
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/bin/golangci-lint
           key: golangci-lint-${{ runner.os }}-${{ env.GOLANGCI_LINT_VERSION }}-${{ steps.gover.outputs.v }}
@@ -492,7 +492,7 @@ jobs:
 
       - name: Restore golangci-lint
         id: golangci
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/bin/golangci-lint
           key: golangci-lint-${{ runner.os }}-${{ env.GOLANGCI_LINT_VERSION }}-${{ steps.gover.outputs.v }}
@@ -514,7 +514,7 @@ jobs:
       # it also picks up what go-lint writes; saved only on a push to main.
       - name: Restore the golangci-lint analysis cache
         if: github.event_name == 'pull_request'
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: ~/.cache/golangci-lint
           key: golangci-lint-cache-router-${{ runner.os }}-${{ env.GOLANGCI_LINT_VERSION }}-${{ github.sha }}
@@ -524,7 +524,7 @@ jobs:
 
       - name: Restore and save the golangci-lint analysis cache
         if: github.event_name != 'pull_request'
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/golangci-lint
           key: golangci-lint-cache-router-${{ runner.os }}-${{ env.GOLANGCI_LINT_VERSION }}-${{ github.sha }}

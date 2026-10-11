@@ -191,7 +191,7 @@ jobs:
         name: Restore the libvips packages
         if: runner.environment == 'github-hosted'
         id: libvips-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: ${{ runner.temp }}/libvips-debs/*.deb
           key: ${{ steps.libvips-cache-key.outputs.key }}
@@ -276,7 +276,7 @@ jobs:
       - &libvips-save
         name: Save the libvips packages
         if: runner.environment == 'github-hosted' && github.event_name != 'pull_request' && steps.libvips-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: ${{ runner.temp }}/libvips-debs/*.deb
           key: ${{ steps.libvips-cache.outputs.cache-primary-key }}
@@ -289,7 +289,7 @@ jobs:
       - name: Restore the golangci-lint binary
         if: runner.environment == 'github-hosted'
         id: golangci-lint-binary
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/go/bin/golangci-lint
           key: golangci-lint-binary-${{ runner.os }}-${{ env.GOLANGCI_LINT_VERSION }}-${{ hashFiles('go.mod') }}
@@ -313,7 +313,7 @@ jobs:
 
       - name: Restore the golangci-lint analysis cache
         if: runner.environment == 'github-hosted' && github.event_name == 'pull_request'
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: ~/.cache/golangci-lint
           key: golangci-lint-cache-${{ runner.os }}-${{ env.GOLANGCI_LINT_VERSION }}-${{ github.sha }}
@@ -322,7 +322,7 @@ jobs:
 
       - name: Restore and save the golangci-lint analysis cache
         if: runner.environment == 'github-hosted' && github.event_name != 'pull_request'
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/golangci-lint
           key: golangci-lint-cache-${{ runner.os }}-${{ env.GOLANGCI_LINT_VERSION }}-${{ github.sha }}
@@ -657,7 +657,7 @@ jobs:
 
       - name: Restore the web check cache
         if: matrix.part == 'checks' && runner.environment == 'github-hosted' && github.event_name == 'pull_request'
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: ${{ steps.web-cache.outputs.path }}
           key: web-checks-${{ runner.os }}-${{ hashFiles('web/pnpm-lock.yaml', 'web/eslint.config.*', 'web/.prettierrc*', 'web/.prettierignore', 'web/prettier.config.*', 'web/tailwind.config.*') }}-${{ github.sha }}
@@ -665,7 +665,7 @@ jobs:
 
       - name: Restore and save the web check cache
         if: matrix.part == 'checks' && runner.environment == 'github-hosted' && github.event_name != 'pull_request'
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ steps.web-cache.outputs.path }}
           key: web-checks-${{ runner.os }}-${{ hashFiles('web/pnpm-lock.yaml', 'web/eslint.config.*', 'web/.prettierrc*', 'web/.prettierignore', 'web/prettier.config.*', 'web/tailwind.config.*') }}-${{ github.sha }}
@@ -687,7 +687,7 @@ jobs:
 
       - name: Restore the TypeScript cache
         if: matrix.part == 'build' && runner.environment == 'github-hosted' && github.event_name == 'pull_request'
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: ${{ runner.temp }}/silo-tsc
           key: tsc-${{ runner.os }}-${{ github.sha }}
@@ -695,7 +695,7 @@ jobs:
 
       - name: Restore and save the TypeScript cache
         if: matrix.part == 'build' && runner.environment == 'github-hosted' && github.event_name != 'pull_request'
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ runner.temp }}/silo-tsc
           key: tsc-${{ runner.os }}-${{ github.sha }}
