@@ -1378,6 +1378,13 @@ func applyResolvedIdentity(transient *models.MediaFile, id virtualProbeIdentity)
 	}
 }
 
+func virtualFileHasPlayableDeclaredMetadata(file *models.MediaFile) bool {
+	if file == nil {
+		return false
+	}
+	return file.Resolution != "" && file.CodecVideo != "" && file.CodecAudio != "" && canSkipProbeForContainer(file.Container)
+}
+
 // shouldListVirtualPlaybackCandidates reports whether the resolver must ask
 // the provider for a candidate list. A pinned result= URI with complete
 // probed evidence normally skips the round-trip. forceRelist overrides that so
@@ -2273,7 +2280,16 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	// It is computed here because the durable-resume derivation below needs it
 	// before the listing gate.
 	persistedResultURI := parsed != nil && strings.TrimSpace(parsed.Query().Get("result")) != ""
-	needsCandidateMetadata := !completeVirtualVideoEvidenceV3(file) || !completeVirtualAudioEvidenceV3(file) || !completeVirtualContainerEvidenceV3(file)
+	// A stale row whose stored evidence cannot be trusted must be probed even
+	// when it looks complete on its cached metadata; the probe gate makes this
+	// decision on its own so this declaration does not need that input.
+	needsProbeVerification := file == nil || file.ProbeUpdatedAt == nil
+	needsCandidateMetadata := (!noResult && !virtualFileHasPlayableDeclaredMetadata(file)) ||
+		(noResult && (!completeVirtualVideoEvidenceV3(file) || !completeVirtualAudioEvidenceV3(file) || !completeVirtualContainerEvidenceV3(file)))
+	// A concrete ?result= candidate with sufficient declared metadata
+	// already names the candidate to serve: it does not need the provider
+	// list. Probe verification (real inventory) arrives via the declared
+	// fast path below, not via the listing gate.
 	deviceCaps, hasCaps := h.requestDeviceCapabilities(r)
 	fingerprint := ""
 	if hasCaps {
@@ -2297,7 +2313,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	persistedResumeURI := ""
 	var persistedResumeStored ResolvedVirtualMedia
 	persistedResumeState := virtualStoredURLMissing
-	if persistedResultURI && (needsCandidateMetadata || file.ProbeUpdatedAt == nil) &&
+	if persistedResultURI && needsProbeVerification &&
 		len(excludedCandidateIDs) == 0 &&
 		(allowFailed || !virtualCandidateVerdictActive(file.FailedAt, time.Now())) {
 		// A usable stored URL always keeps the persisted candidate. An
@@ -2377,7 +2393,11 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		slog.DebugContext(r.Context(), "virtual playback list suppressed: provider answered empty inside window",
 			"component", "api", "content_id", file.ContentID, "file_id", file.ID)
 	}
-	if (shouldListVirtualPlaybackCandidates(noResult, needsCandidateMetadata && !cachedListing, forceRelist) ||
+	// An explicit concrete candidate with sufficient declared metadata names
+	// the candidate to serve; skipping the provider list is what makes the
+	// declared fast path below instant.
+	declaredCandidateComplete := !noResult && virtualFileHasPlayableDeclaredMetadata(file)
+	if (shouldListVirtualPlaybackCandidates(noResult, needsCandidateMetadata && !cachedListing && !declaredCandidateComplete, forceRelist) ||
 		((exclusionPending || requestedRowUnusable) && !cachedListing)) && persistedResumeURI == "" && !emptySuppressed && h.VirtualPlaybackStreamLister != nil {
 		trace.listed = true
 		trace.listRan = true
@@ -2505,7 +2525,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	// has to rotate — the very cascade this preference exists to avoid. A row
 	// the planner can route (complete evidence) keeps the existing noResult-
 	// only behavior, so this only ever promotes a probed sibling over a stub.
-	if (noResult || needsCandidateMetadata) && !options.sessionBound && !options.explicitSelection && len(candidates) > 1 {
+	if (noResult || needsProbeVerification) && !options.sessionBound && !options.explicitSelection && len(candidates) > 1 {
 		candidates = h.preferProbedVirtualCandidates(stagingCtx, candidates, file, file.VirtualOwnerInstallationID)
 	}
 	if len(candidates) > maxAttempts {
@@ -3045,7 +3065,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 							defer bgCancel()
 							h.probeVirtualSourceAndPersist(bgCtx, stickyKey, file, streamURL, probeTransient, probeCand, expectedRuntimeMinutes, oid)
 						}()
-					} else {
+					} else if !skipProbe {
 						h.probeVirtualCandidateForegroundFallback(r.Context(), stickyKey, file, streamURL, probeTransient, probeCand, expectedRuntimeMinutes, oid)
 					}
 				}
@@ -3096,6 +3116,34 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
 			return withResolvedCandidate(&resolvedVirtualPlaybackSource{
 				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenanceFailed, ResolutionAssumed: resolutionAssumed,
+			}, resolvedIdentity, resolvedRematched), nil
+		}
+		if skipProbe && !substituted && !virtualProbeFailures.recent(probeKey) {
+			if transient.Resolution == "" {
+				transient.Resolution = cand.Resolution
+			}
+			resolutionAssumed := transient.Resolution == ""
+			if resolutionAssumed {
+				transient.Resolution = transcodeResolution1080p
+			}
+			mergeVirtualCandidateTracks(&transient, cand)
+			if !transient.HDR && cand.HDR != "" {
+				transient.HDR = true
+			}
+			h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
+			probeBgFile := cloneVirtualProbeTransient(transient)
+			probeBgFile.Duration = 0
+			probeBgCand := cand
+			if gate := h.detachedGate(); gate.tryAcquire() {
+				bgCtx, bgCancel := h.virtualDetachedContext(r.Context(), virtualBackgroundProbeBudget)
+				go func() {
+					defer gate.release()
+					defer bgCancel()
+					h.probeVirtualSourceAndPersist(bgCtx, stickyKey, file, streamURL, probeBgFile, probeBgCand, h.virtualExpectedRuntimeMinutes(r.Context(), file), oid)
+				}()
+			}
+			return withResolvedCandidate(&resolvedVirtualPlaybackSource{
+				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenanceDeclared, ResolutionAssumed: resolutionAssumed,
 			}, resolvedIdentity, resolvedRematched), nil
 		}
 		if virtualProbeFailures.recent(probeKey) {

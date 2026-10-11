@@ -563,18 +563,29 @@ func TestResolveVirtualProbeFailureDamperSkipsRepeatProbe(t *testing.T) {
 		}, nil)
 
 	for call := 0; call < 2; call++ {
+		if call == 1 {
+			// Wait for the first call's background probe to record the
+			// failure before the second call: the damper must be armed.
+			deadline := time.Now().Add(5 * time.Second)
+			for virtualProbeFailures.count(key) < 1 {
+				if time.Now().After(deadline) {
+					t.Fatal("first background probe failure was never recorded")
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		}
 		req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil)
 		file := *stored
 		resolved, err := h.resolveVirtualPlaybackSource(req, &file, "profile-1", false, nil, "", "", 0, false)
 		if err != nil {
 			t.Fatalf("call %d: resolveVirtualPlaybackSource error: %v", call, err)
 		}
-		if resolved.Provenance != ProbeProvenanceFailed {
-			t.Fatalf("call %d: provenance=%q, want failed declared fallback", call, resolved.Provenance)
+		if resolved.Provenance != ProbeProvenanceDeclared {
+			t.Fatalf("call %d: provenance=%q, want declared instant response (probe runs detached)", call, resolved.Provenance)
 		}
 	}
 	if probeCalls != 1 {
-		t.Fatalf("prober called %d times across two replans, want 1 after the failure damper engages", probeCalls)
+		t.Fatalf("prober called %d times across two starts, want 1 after the failure damper engages", probeCalls)
 	}
 }
 
@@ -609,11 +620,13 @@ func TestResolveVirtualProbeSuccessClearsFailureMarker(t *testing.T) {
 			return f, nil
 		}, nil)
 
-	// Seed a stale failure so the clear path is exercised after the probe.
+	// Seed a failure so the clear path is exercised after the probe. The marker
+	// uses the production TTL (future expiry) so recent() is true; the instant
+	// path probes around it in the background, and the success clears it.
 	virtualProbeFailures.mu.Lock()
 	virtualProbeFailures.marks[key] = virtualProbeFailureMark{
 		ttl:       virtualProbeFailureTTL,
-		expiresAt: time.Now().Add(-time.Minute),
+		expiresAt: time.Now().Add(time.Minute),
 	}
 	virtualProbeFailures.mu.Unlock()
 
@@ -623,14 +636,20 @@ func TestResolveVirtualProbeSuccessClearsFailureMarker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveVirtualPlaybackSource error: %v", err)
 	}
-	if resolved.Provenance != ProbeProvenanceVerified {
-		t.Fatalf("provenance=%q, want verified", resolved.Provenance)
+	if resolved.Provenance != ProbeProvenanceDeclared {
+		t.Fatalf("provenance=%q, want declared instant response", resolved.Provenance)
+	}
+	// The background probe runs detached: wait for the success to clear the
+	// seeded stale failure marker.
+	deadline := time.Now().Add(5 * time.Second)
+	for virtualProbeFailures.recent(key) {
+		if time.Now().After(deadline) {
+			t.Fatal("stale failure marker survived a successful background probe")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	if probeCalls != 1 {
 		t.Fatalf("prober called %d times, want 1", probeCalls)
-	}
-	if virtualProbeFailures.recent(key) {
-		t.Fatal("failure marker survived a successful probe")
 	}
 }
 
@@ -1150,8 +1169,19 @@ func TestResolveVirtualProbeDamperIsolatesCandidates(t *testing.T) {
 			return nil, errors.New("probe A failed")
 		}, nil)
 	resolvedA := resolve(hA, resolveVirtualDamperFile(owner, 910, uriA))
-	if probeACalls != 1 || resolvedA.Provenance != ProbeProvenanceFailed {
-		t.Fatalf("candidate A: probeCalls=%d provenance=%q, want 1/failed", probeACalls, resolvedA.Provenance)
+	if resolvedA.Provenance != ProbeProvenanceDeclared {
+		t.Fatalf("candidate A: provenance=%q, want declared instant response", resolvedA.Provenance)
+	}
+	// Wait for the detached background probe to record the failure for A.
+	deadlineA := time.Now().Add(5 * time.Second)
+	for !virtualProbeFailures.recent(virtualProbeFailureKey(uriA, owner)) {
+		if time.Now().After(deadlineA) {
+			t.Fatal("background probe failure for A was never recorded")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if probeACalls != 1 {
+		t.Fatalf("candidate A: probeCalls=%d, want 1", probeACalls)
 	}
 
 	// Candidate B under the same neutral path must still be probed.
@@ -1165,11 +1195,17 @@ func TestResolveVirtualProbeDamperIsolatesCandidates(t *testing.T) {
 			return f, nil
 		}, nil)
 	resolvedB := resolve(hB, resolveVirtualDamperFile(owner, 911, uriB))
-	if probeBCalls != 1 {
-		t.Fatalf("candidate B probeCalls=%d, want 1: a failure for candidate A damped candidate B", probeBCalls)
+	if resolvedB.Provenance != ProbeProvenanceDeclared {
+		t.Fatalf("candidate B provenance=%q, want declared instant response", resolvedB.Provenance)
 	}
-	if resolvedB.Provenance != ProbeProvenanceVerified {
-		t.Fatalf("candidate B provenance=%q, want verified", resolvedB.Provenance)
+	// Candidate B under the same neutral path must still be probed in the
+	// background: a failure for A must not damp B.
+	deadlineB := time.Now().Add(5 * time.Second)
+	for probeBCalls < 1 {
+		if time.Now().After(deadlineB) {
+			t.Fatal("candidate B was never probed in the background: failure for A damped B")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -1195,8 +1231,16 @@ func TestResolveVirtualProbeDamperIsolatesOwners(t *testing.T) {
 			probeCalls5++
 			return nil, errors.New("probe owner 5 failed")
 		}, nil)
-	if resolved := resolve(h5, 5); probeCalls5 != 1 || resolved.Provenance != ProbeProvenanceFailed {
-		t.Fatalf("owner 5: probeCalls=%d provenance=%q, want 1/failed", probeCalls5, resolved.Provenance)
+	resolved5 := resolve(h5, 5)
+	if resolved5.Provenance != ProbeProvenanceDeclared {
+		t.Fatalf("owner 5: provenance=%q, want declared instant response", resolved5.Provenance)
+	}
+	deadline5 := time.Now().Add(5 * time.Second)
+	for probeCalls5 < 1 {
+		if time.Now().After(deadline5) {
+			t.Fatal("owner 5 background probe never ran")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	// Owner 6 must probe the same candidate independently.
@@ -1210,11 +1254,17 @@ func TestResolveVirtualProbeDamperIsolatesOwners(t *testing.T) {
 			return f, nil
 		}, nil)
 	resolved6 := resolve(h6, 6)
-	if probeCalls6 != 1 {
-		t.Fatalf("owner 6 probeCalls=%d, want 1: owner 5's failure damped owner 6", probeCalls6)
+	if resolved6.Provenance != ProbeProvenanceDeclared {
+		t.Fatalf("owner 6 provenance=%q, want declared instant response", resolved6.Provenance)
 	}
-	if resolved6.Provenance != ProbeProvenanceVerified {
-		t.Fatalf("owner 6 provenance=%q, want verified", resolved6.Provenance)
+	// Owner 6 must probe the same candidate independently in the background:
+	// owner 5's failure must not damp owner 6.
+	deadline6 := time.Now().Add(5 * time.Second)
+	for probeCalls6 < 1 {
+		if time.Now().After(deadline6) {
+			t.Fatal("owner 6 was never probed in the background: owner 5's failure damped owner 6")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
