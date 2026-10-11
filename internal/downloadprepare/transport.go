@@ -73,8 +73,17 @@ var (
 // transcode node supplies its own FFmpeg path, hardware mode, device list, and
 // output path. ArtifactID is an opaque handle, never a caller-selected path.
 type Request struct {
-	ArtifactID                 string                 `json:"artifact_id"`
-	InputPath                  string                 `json:"input_path"`
+	ArtifactID string `json:"artifact_id"`
+	// InputPath is the concrete source the node opens. For a virtual title it is
+	// a short-lived relay URL that rotates between attempts.
+	InputPath string `json:"input_path"`
+	// CanonicalInputPath is the durable source identity a virtual title was
+	// resolved from (`virtual://...`). It is empty for a local file, whose
+	// InputPath is already durable. The execution fingerprint is derived from
+	// this value when present, so rotating a relay URL never changes the recipe
+	// while a real source or quality change still does. The node never opens it;
+	// it exists to keep the frozen fingerprint canonical on both sides.
+	CanonicalInputPath         string                 `json:"canonical_input_path,omitempty"`
 	SourceVideoCodec           string                 `json:"source_video_codec,omitempty"`
 	SourceVideoProfile         string                 `json:"source_video_profile,omitempty"`
 	SourceVideoBitDepth        int                    `json:"source_video_bit_depth,omitempty"`
@@ -248,10 +257,18 @@ func (r Request) ValidToneMapAttestation() bool {
 }
 
 // ExecutionFingerprint identifies every transported byte-affecting field while
-// deliberately excluding the idempotency handle.
+// deliberately excluding the idempotency handle. A virtual title's transient
+// relay URL is replaced by its canonical source identity before hashing, so the
+// fingerprint is stable across relay rotation and identical on the API host and
+// the transcode node (see CanonicalInputPath). A local file has no canonical
+// path and hashes exactly as before.
 func (r Request) ExecutionFingerprint() string {
 	r.ArtifactID = ""
 	r.LogSessionID = ""
+	if r.CanonicalInputPath != "" {
+		r.InputPath = r.CanonicalInputPath
+	}
+	r.CanonicalInputPath = ""
 	data, err := json.Marshal(r)
 	if err != nil {
 		return ""
@@ -266,6 +283,7 @@ func NewRequest(artifactID string, opts playback.TranscodeOpts) Request {
 	request := Request{
 		ArtifactID:                 artifactID,
 		InputPath:                  opts.InputPath,
+		CanonicalInputPath:         opts.CanonicalInputPath,
 		SourceVideoCodec:           opts.SourceVideoCodec,
 		SourceVideoProfile:         opts.SourceVideoProfile,
 		SourceVideoBitDepth:        opts.SourceVideoBitDepth,
@@ -306,6 +324,7 @@ func NewRequest(artifactID string, opts playback.TranscodeOpts) Request {
 func (r Request) TranscodeOpts(ffmpegPath, hwAccel, hwDevice string, sink playback.FFmpegLogSink) playback.TranscodeOpts {
 	return playback.TranscodeOpts{
 		InputPath:                  r.InputPath,
+		CanonicalInputPath:         r.CanonicalInputPath,
 		SourceVideoCodec:           r.SourceVideoCodec,
 		SourceVideoProfile:         r.SourceVideoProfile,
 		SourceVideoBitDepth:        r.SourceVideoBitDepth,

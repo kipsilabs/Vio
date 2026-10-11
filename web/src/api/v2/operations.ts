@@ -345,6 +345,7 @@ export const v2Operations = {
   "GET /api/v2/downloads/batches/{batch_id}/manifests": "listDownloadBatchManifests",
   "GET /api/v2/downloads/subscriptions": "listDownloadSubscriptions",
   "GET /api/v2/downloads/subscriptions/{id}": "getDownloadSubscription",
+  "GET /api/v2/downloads/{id}": "getDownload",
   "GET /api/v2/downloads/{id}/artwork/{kind}": "getDownloadArtwork",
   "GET /api/v2/downloads/{id}/file": "downloadFile",
   "GET /api/v2/downloads/{id}/file-proxy": "downloadFileViaProxy",

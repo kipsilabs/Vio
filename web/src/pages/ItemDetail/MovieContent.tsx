@@ -424,6 +424,7 @@ export default function MovieContent({
             title={title}
             selectedFileId={selectedVersion?.file_id}
             onStaleVersion={onStaleVersion}
+            createTarget={{ contentId: item.content_id }}
           />
           <SubtitleSearchDialog
             open={subtitleSearchOpen}

@@ -56,6 +56,26 @@ type EncodePreparer interface {
 	PrepareFile(ctx context.Context, artifactID string, opts playback.TranscodeOpts, outputPath string) (PreparedArtifact, error)
 }
 
+// VirtualInputResolver turns a provider-backed (`virtual://`) catalog row into
+// a concrete transport input for artifact preparation. The production
+// implementation is the playback virtual-transport resolver, so downloads
+// share its stored-URL-first, trust-window, provider-outage-retry and
+// same-release-rematch behavior and never mint a second rotation or trust
+// policy. The returned cleanup releases the relay registration and must run
+// once the executor has finished reading the input.
+//
+// A preparation is identified by the persisted catalog row alone. The row's
+// virtual owner installation and durable provider identity (video hash, source
+// GUID, release name/size) authorize the provider resolve, so every requester
+// of the same file resolves to the same input and shares the one artifact. The
+// requester's account and profile are deliberately not parameters here: they
+// gate the download row and the bytes it serves, never the shared job. Passing
+// a requester would make a shared preparation depend on whoever happened to
+// create it first, which is exactly the identity confusion this seam avoids.
+type VirtualInputResolver interface {
+	ResolveVirtualDownloadInput(ctx context.Context, file *models.MediaFile) (inputPath string, cleanup func(), err error)
+}
+
 type playbackPreparer struct{}
 
 // PrepareFile produces one finalized local download artifact.
@@ -109,6 +129,7 @@ type ArtifactManager struct {
 
 	mu             sync.Mutex
 	kick           func()
+	virtualInput   VirtualInputResolver
 	prepNotify     PreparationNotifier
 	ffmpegLogs     playback.FFmpegLogSink
 	lastDiskSweep  time.Time
@@ -199,6 +220,114 @@ func NewArtifactManager(
 		gated.SetStorageGate(m.NodeStorageFull)
 	}
 	return m
+}
+
+// SetVirtualInputResolver wires the playback virtual-transport resolver used to
+// turn a provider-backed media file into a playable prepare input. When unset,
+// a virtual artifact job is deferred under a bounded retry instead of handing
+// an unresolvable `virtual://` path to FFmpeg or a transcode node.
+//
+// Wiring happens with the API router, which can start after the startup
+// recovery sweep. A drain is triggered here so a job deferred before wiring is
+// picked up at once rather than waiting out its retry backoff.
+func (m *ArtifactManager) SetVirtualInputResolver(resolver VirtualInputResolver) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.virtualInput = resolver
+	m.mu.Unlock()
+	if resolver != nil {
+		m.triggerDrain()
+	}
+}
+
+// PreparationAbandonedMessage is recorded on a download whose job was released
+// because the last row referring to it was deleted.
+const PreparationAbandonedMessage = "The download was removed, so its preparation was stopped."
+
+// CancelAbandonedPrepare releases an artifact job whose last download row was
+// just deleted. The link re-check runs inside the statement that deletes the
+// job (CancelAbandonedPreparations), after that job's row is locked, so a
+// request that attached since the caller looked keeps the job: the check and
+// the delete observe one snapshot, a link committed while the cancel waited
+// for the row is honored, and a survivor is never aborted for another row's
+// deletion.
+//
+// A job that is genuinely abandoned is deleted and any attempt this replica
+// runs is stopped at once; a running attempt on another replica stops at its
+// next heartbeat, which the delete's lease fence already turned away. No
+// consumer waits for lease expiry: a row whose artifact is gone fails through
+// ConfirmArtifactLink or reconciliation with an actionable status.
+func (m *ArtifactManager) CancelAbandonedPrepare(ctx context.Context, artifactID string) {
+	if m == nil || artifactID == "" || m.repo == nil {
+		return
+	}
+	canceled, failed, err := m.repo.CancelAbandonedPreparations(ctx, []string{artifactID}, PreparationAbandonedMessage)
+	if err != nil {
+		slog.WarnContext(ctx, "releasing an abandoned download preparation failed", "component", "downloads", "artifact_id", artifactID, "error", err)
+		return
+	}
+	if len(canceled) == 0 {
+		return
+	}
+	m.stopLocalAttempts(canceled)
+	for _, d := range failed {
+		m.publish(ctx, d)
+	}
+	for _, c := range canceled {
+		m.notifyPreparationChanged(ctx, c.ID)
+	}
+	slog.InfoContext(ctx, "aborted preparation for a deleted download row", "component", "downloads", "artifact_id", artifactID)
+}
+
+// errVirtualInputResolverPending reports that a virtual artifact job reached the
+// executor before the playback resolver was wired. The router wires it, and the
+// startup recovery sweep can run first, so the job is retried under the same
+// bounded backoff as any other attempt instead of handing FFmpeg a bare
+// `virtual://` path. SetVirtualInputResolver drains immediately once wired, so
+// the normal startup ordering costs at most one backoff.
+var errVirtualInputResolverPending = errors.New("virtual input resolver is not available yet")
+
+// virtualResolverPendingMessage is the download-facing reason while a virtual
+// job waits for the resolver to be wired. It must stay actionable: the job
+// retries automatically, and after artifactMaxAttempts the linked downloads
+// fail with this message rather than sitting in "preparing" forever.
+const virtualResolverPendingMessage = "The provider connection is still starting; the download will retry automatically."
+
+// applyVirtualInput resolves a provider-backed source to a concrete prepare
+// input and rewrites opts accordingly. It returns the relay cleanup the caller
+// must run once the executor is finished; for a non-virtual file it is a no-op.
+// The canonical `virtual://` path is preserved on CanonicalInputPath, and the
+// execution fingerprint is derived from that durable identity rather than the
+// per-attempt relay URL, so a relay rotation never invalidates a healthy
+// artifact.
+func (m *ArtifactManager) applyVirtualInput(ctx context.Context, file *models.MediaFile, opts *playback.TranscodeOpts) (func(), error) {
+	if file == nil || opts == nil || !isVirtualMediaFile(file) {
+		return nil, nil
+	}
+	m.mu.Lock()
+	resolver := m.virtualInput
+	m.mu.Unlock()
+	if resolver == nil {
+		return nil, errVirtualInputResolverPending
+	}
+	inputPath, cleanup, err := resolver.ResolveVirtualDownloadInput(ctx, file)
+	if err != nil {
+		if cleanup != nil {
+			cleanup()
+		}
+		return nil, fmt.Errorf("resolve virtual prepare input: %w", err)
+	}
+	if strings.TrimSpace(inputPath) == "" {
+		if cleanup != nil {
+			cleanup()
+		}
+		return nil, errors.New("virtual media resolved to an empty prepare input")
+	}
+	opts.CanonicalInputPath = file.FilePath
+	opts.InputPath = inputPath
+	return cleanup, nil
 }
 
 // SetSettingsReader supplies live admin settings used when a prepared
@@ -954,6 +1083,25 @@ func (m *ArtifactManager) encodeOne(ctx context.Context, a *Artifact) {
 		m.failJob(ctx, a, "frozen execution recipe no longer matches source metadata")
 		return
 	}
+	virtualCleanup, err := m.applyVirtualInput(ctx, file, &opts)
+	if err != nil {
+		if errors.Is(err, errVirtualInputResolverPending) {
+			// The resolver is wired with the API router, which may start after
+			// the startup recovery sweep. Retry under the same bounded backoff
+			// as any other attempt: a wired resolver drains at once, and a
+			// resolver that never becomes usable fails the job with an
+			// actionable message once attempts are exhausted instead of
+			// leaving the download "preparing" forever.
+			slog.InfoContext(ctx, "virtual prepare input resolver not yet available; retrying artifact", "component", "downloads", "artifact_id", a.ID)
+			m.failJob(ctx, a, virtualResolverPendingMessage)
+			return
+		}
+		m.failJob(ctx, a, err.Error())
+		return
+	}
+	if virtualCleanup != nil {
+		defer virtualCleanup()
+	}
 	// Each lease attempt owns a distinct node-local object. A worker that loses
 	// the readiness fence can therefore queue its object for deletion without
 	// racing the replacement worker's output on the same node.
@@ -997,6 +1145,8 @@ func (m *ArtifactManager) encodeOne(ctx context.Context, a *Artifact) {
 	}
 
 	remoteFieldsPresent := prepared.OriginNodeID != 0 || prepared.OriginNodeURL != "" || prepared.OriginNodeGroup != "" || prepared.OriginArtifactID != ""
+	// The fingerprint is computed from opts.CanonicalInputPath when set, so a
+	// relay rotation during prepare never invalidates the frozen recipe.
 	if !artifactExecutionFingerprintMatches(a, opts) {
 		m.cleanupRejectedPrepared(ctx, a.ID, prepared)
 		m.failJob(ctx, a, "frozen execution recipe changed before commit")

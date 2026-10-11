@@ -510,6 +510,10 @@ export default function EpisodeContent({
         title={title}
         selectedFileId={selectedVersion?.file_id}
         onStaleVersion={onStaleVersion}
+        createTarget={{
+          contentId: item.series_id ?? item.content_id,
+          episodeId: item.content_id,
+        }}
       />
       <SubtitleSearchDialog
         open={subtitleSearchOpen}

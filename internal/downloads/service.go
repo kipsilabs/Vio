@@ -1341,12 +1341,16 @@ func (s *Service) Delete(ctx context.Context, userID int, profileID, deviceID, d
 			return ErrProfileRequired
 		}
 		// Read first only to tell admin listeners which preparation lost a
-		// requester; DeleteManaged remains the authorization and the write.
+		// requester and which artifact link to release; DeleteManaged remains
+		// the authorization and the write.
 		before, _ := s.repo.GetByID(ctx, downloadID)
 		if err := s.repo.DeleteManaged(ctx, downloadID, userID, profileID, deviceID); err != nil {
 			return err
 		}
 		s.notifyPreparationRequesters(ctx, before)
+		if before != nil {
+			s.cancelArtifactPrepare(ctx, before.ArtifactID)
+		}
 		return nil
 	}
 
@@ -1365,8 +1369,21 @@ func (s *Service) Delete(ctx context.Context, userID int, profileID, deviceID, d
 	}
 	if err == nil {
 		s.notifyPreparationRequesters(ctx, dl)
+		s.cancelArtifactPrepare(ctx, dl.ArtifactID)
 	}
 	return err
+}
+
+// cancelArtifactPrepare asks the artifact pipeline to release a prepare job
+// that no download row links any more. It is deliberately not a blind abort:
+// see ArtifactManager.CancelAbandonedPrepare, which re-checks the link inside
+// the deleting transaction so a request that attached since the caller looked
+// keeps the job and is never left waiting on lease expiry.
+func (s *Service) cancelArtifactPrepare(ctx context.Context, artifactID string) {
+	if s.artifacts == nil || artifactID == "" {
+		return
+	}
+	s.artifacts.CancelAbandonedPrepare(ctx, artifactID)
 }
 
 // bulkQuality validates a season/series request's quality. Only a native

@@ -243,6 +243,7 @@ function MangaRow({
           title={label}
           summaryBuilder={chapterVersionSummary}
           onStaleVersion={refreshChapterVersions}
+          createTarget={{ contentId: chapter.content_id }}
         />
       )}
     </div>

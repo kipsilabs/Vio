@@ -1216,6 +1216,15 @@ files or existing download rows.
    `updated_at` to report `downloading` on start and `completed` on finish.
 8. Play the local media file using the stored manifest.
 
+A version whose bytes are provider-backed (a `virtual://` media file, reported by
+the catalog as container `virtual`) has no local file on the API host. Requesting
+`original` quality for such a version still returns a `preparing` row: the server
+resolves the provider source through the playback virtual-transport path and
+prepares a compatible artifact, then serves it from
+`GET /api/v2/downloads/{id}/file` like any prepared file. There is no
+direct-download route for a virtual version, so a client must create a download
+and wait for `ready` rather than offering the source directly.
+
 ### 9.2 Offline to online
 
 1. While offline, queue `{media_item_id, position_ms, duration_ms, updated_at}` locally.
