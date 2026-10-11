@@ -316,14 +316,14 @@ func transportPhaseDurationV3(ctx context.Context, phase string) time.Duration {
 	return recorder.phases[phase]
 }
 
-// observeTransportPhasesV3 appends every transport sub-phase to the start timing
-// line. It appends measured attributes directly rather than through mark, so a
-// sub-phase cannot disturb the delta the enclosing session_transport_commit mark
-// reports. A missing recorder (or an unmeasured phase) emits a zero, which reads
-// as "this start did not pay it" — the same shape the other timing fields use.
-func (t *playbackStartTimingsV3) observeTransportPhasesV3(recorder *transportPhaseTimingsV3) {
-	if t == nil || recorder == nil {
-		return
+// transportPhaseAttrsV3 snapshots a recorder and returns the ordered phase
+// attributes every transport phase line emits. A missing recorder (or an
+// unmeasured phase) emits a zero, which reads as "this attempt did not pay it" —
+// the same shape the other timing fields use. Shared by the composite start line
+// and the separate retry line so both carry the same phase set in the same order.
+func transportPhaseAttrsV3(recorder *transportPhaseTimingsV3) []any {
+	if recorder == nil {
+		return nil
 	}
 	recorder.mu.Lock()
 	snapshot := make(map[string]time.Duration, len(recorder.phases))
@@ -331,9 +331,42 @@ func (t *playbackStartTimingsV3) observeTransportPhasesV3(recorder *transportPha
 		snapshot[name] = d
 	}
 	recorder.mu.Unlock()
+	attrs := make([]any, 0, 2*len(transportPhaseNamesV3))
 	for _, name := range transportPhaseNamesV3 {
-		t.attrs = append(t.attrs, name+"_ms", snapshot[name].Milliseconds())
+		attrs = append(attrs, name+"_ms", snapshot[name].Milliseconds())
 	}
+	return attrs
+}
+
+// observeTransportPhasesV3 appends every transport sub-phase to the start timing
+// line. It appends measured attributes directly rather than through mark, so a
+// sub-phase cannot disturb the delta the enclosing session_transport_commit mark
+// reports.
+func (t *playbackStartTimingsV3) observeTransportPhasesV3(recorder *transportPhaseTimingsV3) {
+	if t == nil {
+		return
+	}
+	t.attrs = append(t.attrs, transportPhaseAttrsV3(recorder)...)
+}
+
+// logTransportRetryPhasesV3 emits a separate timing line for a retried start
+// attempt: the same-release transient retry or an alternate-candidate walk. The
+// retry is a second commit with its own phases, so it is logged on its own line
+// with a distinct message instead of folding into the request's composite start
+// line. It appends nothing to the composite timings, so no field on that line
+// moves. This is additive observation only: no behavior or wire change.
+func logTransportRetryPhasesV3(ctx context.Context, attemptID string, started time.Time, recorder *transportPhaseTimingsV3) {
+	if recorder == nil {
+		return
+	}
+	attrs := []any{
+		logComponentKey, playbackLogValueV3,
+		requestIDLogKeyV3, chimw.GetReqID(ctx),
+		"playback_attempt_id", attemptID,
+		"total_ms", time.Since(started).Milliseconds(),
+	}
+	attrs = append(attrs, transportPhaseAttrsV3(recorder)...)
+	slog.InfoContext(ctx, "protocol v3 start retry timing", attrs...)
 }
 
 type playbackStartSideEffectsV3 struct {
@@ -2526,7 +2559,15 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 			// entry so the retry presents new bytes instead of replaying the
 			// registration whose upstream just failed.
 			if retriedResponse, retried := h.recoverVirtualTransportSameReleaseV3(r.Context(), playback.IsTransientProviderError(statusErr.cause), func(retryCtx context.Context) (playback.DecisionResponseV3, *transportErrorV3) {
-				return h.startPlannedPlaybackV3(r.WithContext(retryCtx), userID, profileID, req, requestDigests, requestedFile, effectiveFile, audioIndex, virtualDecision, result, clientInfo)
+				// The same-release retry is a second commit with its own
+				// phases. Install a fresh recorder on the retry context and
+				// emit its phase line separately, so the retry is attributable
+				// without disturbing the first attempt's composite line.
+				retryPhasesCtx, retryRecorder := withTransportPhaseTimingsV3(retryCtx)
+				retryStartedAt := time.Now()
+				retryResponse, retryStatusErr := h.startPlannedPlaybackV3(r.WithContext(retryPhasesCtx), userID, profileID, req, requestDigests, requestedFile, effectiveFile, audioIndex, virtualDecision, result, clientInfo)
+				logTransportRetryPhasesV3(r.Context(), req.PlaybackAttemptID, retryStartedAt, retryRecorder)
+				return retryResponse, retryStatusErr
 			}); retried {
 				// The retry committed a transport for the same deferred plan, so
 				// run the enumeration it still promises before returning.
@@ -2571,7 +2612,15 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 							// A transport failure moved the release: name the
 							// requested row and the cause on the plan.
 							alternateDecision.substitutionReason = substitutionReasonTransportFailedV3
-							if alternateResponse, alternateStatusErr := h.startPlannedPlaybackV3(r, userID, profileID, alternateRequest, requestDigests, requestedFile, alternate, alternateAudio, alternateDecision, alternateResult, clientInfo, alternateDecision.substitutionReason); alternateStatusErr == nil {
+							// The alternate is a second commit with its own
+							// phases: install a fresh recorder and emit its
+							// phase line separately, so the walk is
+							// attributable too.
+							alternatePhasesCtx, alternateRecorder := withTransportPhaseTimingsV3(r.Context())
+							alternateStartedAt := time.Now()
+							alternateResponse, alternateStatusErr := h.startPlannedPlaybackV3(r.WithContext(alternatePhasesCtx), userID, profileID, alternateRequest, requestDigests, requestedFile, alternate, alternateAudio, alternateDecision, alternateResult, clientInfo, alternateDecision.substitutionReason)
+							logTransportRetryPhasesV3(r.Context(), req.PlaybackAttemptID, alternateStartedAt, alternateRecorder)
+							if alternateStatusErr == nil {
 								return alternateResponse, nil
 							}
 						}
