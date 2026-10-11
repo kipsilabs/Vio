@@ -1455,7 +1455,6 @@ func newChiRouter(deps Dependencies) chi.Router {
 							},
 							Store:    store,
 							Searcher: deps.VirtualLibraryService,
-							Enricher: playbackHandler,
 							Events:   deps.RealtimeHub,
 						}
 						virtualRefreshJobs = &handlers.VirtualCandidatesRefreshJobService{

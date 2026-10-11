@@ -22,9 +22,6 @@ const (
 	// deliberately smaller than one provider request: the search is best-effort
 	// and degrades to an altmount-only result rather than holding the job.
 	virtualIndexerSearchBudget = 10 * time.Second
-	// virtualEnrichmentBudget bounds the whole probe pass. Every new candidate
-	// is attempted before the job completes unless this deadline fires first.
-	virtualEnrichmentBudget = 4 * time.Minute
 	// contentIDKey is the shared log/serialization key for a content id. It is
 	// also the JSON field name every catalog event carries.
 	contentIDKey = "content_id"
@@ -213,18 +210,18 @@ type IndexerReleaseSearcher interface {
 	SearchMonitoredReleases(ctx context.Context, item virtuallibrary.MonitoredMedia, episode *virtuallibrary.VirtualEpisode) ([]virtuallibrary.SearchItem, error)
 }
 
-// VirtualCandidateEnricher probes a batch of freshly persisted candidates and
-// returns how many were attempted. Implemented by *PlaybackHandler.
-type VirtualCandidateEnricher interface {
-	EnrichVirtualCandidates(ctx context.Context, contentID, episodeID string, userID int, profileID string, streams []VirtualPlaybackStream) int
-}
-
 // VirtualCandidatesRefreshExecutor runs the asynchronous refresh pipeline:
 // provider re-list and persist first (fatal on failure), then a best-effort
 // indexer search whose failure degrades to an altmount-only result, then a
-// best-effort probe pass over the new candidates, then a cleanup pass that
-// prunes dead candidates the fresh listing no longer offers, and finally a
-// catalog invalidation so every client reloads the version list.
+// cleanup pass that prunes dead candidates the fresh listing no longer offers,
+// and finally a catalog invalidation so every client reloads the version list.
+//
+// The refresh is list-only by design: it never opens a candidate's media URL
+// (no ffprobe, no anchor probe, no range fetch). Touching a ProviderURL can
+// activate the provider (an AltMount Stremio link starts fetching on first
+// access), so bulk-probing every listed candidate would turn one refresh into
+// N downloads and hammer the indexer. Verified track inventory arrives with an
+// explicit Play of one candidate instead.
 type VirtualCandidatesRefreshExecutor struct {
 	// Refresh performs step (a): force-list and persist the provider candidates.
 	Refresh *VirtualCandidatesRefreshService
@@ -246,8 +243,6 @@ type VirtualCandidatesRefreshExecutor struct {
 	Store *virtuallibrary.IndexerReleaseStore
 	// Searcher is the on-demand Prowlarr lookup (step b). Nil skips the search.
 	Searcher IndexerReleaseSearcher
-	// Enricher probes the new candidates (step d). Nil skips enrichment.
-	Enricher VirtualCandidateEnricher
 	// Events publishes the catalog invalidation (step e). Nil skips it.
 	Events *notifications.Hub
 	Logger *slog.Logger
@@ -271,8 +266,8 @@ type VirtualCandidatePruner interface {
 
 // Execute runs the pipeline. It returns an error only for a non-degradable
 // failure: a provider listing that could not be persisted. A provider-state
-// refresh, indexer search, probe failure, or candidate prune is a warning,
-// never a failed job.
+// refresh, indexer search, or candidate prune is a warning, never a failed
+// job.
 func (e *VirtualCandidatesRefreshExecutor) Execute(ctx context.Context, req adminjob.VirtualCandidatesRefreshRequest, progress func(current, total int, message string)) (*adminjob.VirtualCandidatesRefreshResult, error) {
 	if e == nil || e.Refresh == nil {
 		return nil, errors.New("virtual candidates refresh executor is not configured")
@@ -283,7 +278,7 @@ func (e *VirtualCandidatesRefreshExecutor) Execute(ctx context.Context, req admi
 			progress(current, total, message)
 		}
 	}
-	const totalSteps = 6
+	const totalSteps = 5
 
 	// Force the provider's authoritative completed/failed snapshot current
 	// before the listing. Classification runs on every serve, so a stale
@@ -342,16 +337,11 @@ func (e *VirtualCandidatesRefreshExecutor) Execute(ctx context.Context, req admi
 		}
 	}
 
-	report(4, totalSteps, "Enriching provider candidates")
-	if e.Enricher != nil && len(streams) > 0 {
-		result.Enriched = e.Enricher.EnrichVirtualCandidates(ctx, req.ContentID, req.EpisodeID, req.UserID, req.ProfileID, streams)
-	}
-
 	// Prune after persistence: a row the fresh listing dropped is now provably
 	// absent, so the only question left is whether it is dead and unprotected.
 	// A prune failure is cleanup-only and must not fail an otherwise good
 	// refresh; the next run retries it.
-	report(5, totalSteps, "Pruning dead candidates")
+	report(4, totalSteps, "Pruning dead candidates")
 	if e.Pruner != nil {
 		pruned, pruneErr := e.Pruner.PruneDeadAbsentCandidates(ctx, req.ContentID, req.EpisodeID, sources, streams)
 		if pruneErr != nil {

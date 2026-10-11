@@ -3,8 +3,11 @@ package handlers
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -29,19 +32,6 @@ func (f *fakeIndexerSearcher) SearchMonitoredReleases(context.Context, virtualli
 		return nil, f.err
 	}
 	return f.releases, nil
-}
-
-// fakeCandidateEnricher records the batch it was handed.
-type fakeCandidateEnricher struct {
-	calls   int
-	streams int
-	result  int
-}
-
-func (f *fakeCandidateEnricher) EnrichVirtualCandidates(_ context.Context, _, _ string, _ int, _ string, streams []VirtualPlaybackStream) int {
-	f.calls++
-	f.streams = len(streams)
-	return f.result
 }
 
 // fakeSearchRelease builds one usenet SearchItem for the executor tests.
@@ -74,11 +64,11 @@ func refreshJobSource(contentID string) *models.MediaFile {
 	}
 }
 
-func refreshJobExecutor(store *virtuallibrary.IndexerReleaseStore, listErr error, searcher IndexerReleaseSearcher, enricher VirtualCandidateEnricher) *VirtualCandidatesRefreshExecutor {
-	return refreshJobExecutorFor(store, listErr, searcher, enricher, "movie:x")
+func refreshJobExecutor(store *virtuallibrary.IndexerReleaseStore, listErr error, searcher IndexerReleaseSearcher) *VirtualCandidatesRefreshExecutor {
+	return refreshJobExecutorFor(store, listErr, searcher, "movie:x")
 }
 
-func refreshJobExecutorFor(store *virtuallibrary.IndexerReleaseStore, listErr error, searcher IndexerReleaseSearcher, enricher VirtualCandidateEnricher, sourceContentID string) *VirtualCandidatesRefreshExecutor {
+func refreshJobExecutorFor(store *virtuallibrary.IndexerReleaseStore, listErr error, searcher IndexerReleaseSearcher, sourceContentID string) *VirtualCandidatesRefreshExecutor {
 	source := refreshJobSource(sourceContentID)
 	return &VirtualCandidatesRefreshExecutor{
 		Refresh: &VirtualCandidatesRefreshService{
@@ -95,15 +85,14 @@ func refreshJobExecutorFor(store *virtuallibrary.IndexerReleaseStore, listErr er
 		},
 		Store:    store,
 		Searcher: searcher,
-		Enricher: enricher,
 	}
 }
 
-// TestRefreshJobPipelinePersistsIndexerReleasesAndEnriches covers the happy
-// path: the provider is re-listed, the indexer search is filtered to usenet and
-// deduped against the provider listing, the new rows are persisted, and the new
-// candidates are enriched.
-func TestRefreshJobPipelinePersistsIndexerReleasesAndEnriches(t *testing.T) {
+// TestRefreshJobPipelinePersistsIndexerReleases covers the happy path: the
+// provider is re-listed, the indexer search is filtered to usenet and deduped
+// against the provider listing, and the new rows are persisted. The refresh is
+// list-only: no candidate media URL is opened and result.Enriched stays 0.
+func TestRefreshJobPipelinePersistsIndexerReleases(t *testing.T) {
 	store := refreshJobTestStore(t)
 	contentID := "movie:job-happy"
 	searcher := &fakeIndexerSearcher{releases: []virtuallibrary.SearchItem{
@@ -114,8 +103,7 @@ func TestRefreshJobPipelinePersistsIndexerReleasesAndEnriches(t *testing.T) {
 		// Dropped: torrent protocol is not enqueueable via altmount.
 		{GUID: "tor", Title: "Heat.1995.1080p.BluRay.x264-TOR", Size: 9_000_000_000, Protocol: "torrent", DownloadURL: "magnet:x"},
 	}}
-	enricher := &fakeCandidateEnricher{result: 1}
-	executor := refreshJobExecutorFor(store, nil, searcher, enricher, contentID)
+	executor := refreshJobExecutorFor(store, nil, searcher, contentID)
 	t.Cleanup(func() { _, _ = store.PruneExpiredIndexerReleases(context.Background()) })
 
 	result, err := executor.Execute(t.Context(), adminjob.VirtualCandidatesRefreshRequest{
@@ -124,7 +112,7 @@ func TestRefreshJobPipelinePersistsIndexerReleasesAndEnriches(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
-	if !result.IndexerSearchOK || result.IndexerReleases != 1 || result.Enriched != 1 {
+	if !result.IndexerSearchOK || result.IndexerReleases != 1 || result.Enriched != 0 {
 		t.Fatalf("result = %+v", result)
 	}
 	if len(result.Releases) != 1 || !strings.Contains(result.Releases[0].Title, "2160p") {
@@ -144,8 +132,52 @@ func TestRefreshJobPipelinePersistsIndexerReleasesAndEnriches(t *testing.T) {
 	if len(list) != 1 || list[0].GUID != "new" {
 		t.Fatalf("persisted rows = %+v", list)
 	}
-	if enricher.calls != 1 {
-		t.Fatalf("enricher calls = %d", enricher.calls)
+}
+
+// TestRefreshJobIsListOnly proves the refresh never opens a candidate media
+// URL. The listing serves ProviderURLs that hit a counting HTTP server; any
+// ffprobe, anchor probe, or range fetch would register a request. Execute must
+// complete with zero media requests and Enriched 0. (Enriched is kept at 0 for
+// wire compatibility; see VirtualCandidatesRefreshResult.)
+func TestRefreshJobIsListOnly(t *testing.T) {
+	store := refreshJobTestStore(t)
+	contentID := "movie:job-no-probe"
+	var mediaRequests atomic.Int64
+	mediaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mediaRequests.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(mediaServer.Close)
+	source := refreshJobSource(contentID)
+	providerURL := mediaServer.URL + "/stream/candidate.mkv"
+	executor := &VirtualCandidatesRefreshExecutor{
+		Refresh: &VirtualCandidatesRefreshService{
+			ListFresh: VirtualPlaybackStreamListerFunc(func(_ context.Context, path string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
+				return []VirtualPlaybackStream{{
+					ID: "c1", URI: path + "?result=c1",
+					Label: "Heat 1995 1080p WEB-DL x264-GRP", FileSize: 4_000_000_000,
+					ProviderURL: providerURL,
+				}}, nil
+			}),
+			Persist: func(context.Context, *models.MediaFile, []VirtualPlaybackStream) error { return nil },
+			ContentFiles: func(context.Context, string) ([]*models.MediaFile, error) {
+				return []*models.MediaFile{source}, nil
+			},
+		},
+		Store:    store,
+		Searcher: &fakeIndexerSearcher{},
+	}
+	result, err := executor.Execute(t.Context(), adminjob.VirtualCandidatesRefreshRequest{
+		ContentID: contentID, MediaFolderID: 2, Title: "Heat",
+	}, nil)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if result.Enriched != 0 {
+		t.Fatalf("Enriched = %d, want 0: refresh must not probe candidates", result.Enriched)
+	}
+	if got := mediaRequests.Load(); got != 0 {
+		t.Fatalf("media requests = %d, want 0: refresh must not open a candidate media URL", got)
 	}
 }
 
@@ -156,7 +188,7 @@ func TestRefreshJobIndexerFailureCompletesAltmountOnly(t *testing.T) {
 	store := refreshJobTestStore(t)
 	searcher := &fakeIndexerSearcher{err: errors.New("indexer offline")}
 	contentID := "movie:job-indexer-fail"
-	executor := refreshJobExecutorFor(store, nil, searcher, nil, contentID)
+	executor := refreshJobExecutorFor(store, nil, searcher, contentID)
 
 	result, err := executor.Execute(t.Context(), adminjob.VirtualCandidatesRefreshRequest{
 		ContentID: "movie:job-indexer-fail", MediaFolderID: 2, Title: "Heat",
@@ -176,7 +208,7 @@ func TestRefreshJobIndexerFailureCompletesAltmountOnly(t *testing.T) {
 // one fatal stage.
 func TestRefreshJobProviderFailureFails(t *testing.T) {
 	store := refreshJobTestStore(t)
-	executor := refreshJobExecutorFor(store, errors.New("provider offline"), nil, nil, "movie:job-provider-fail")
+	executor := refreshJobExecutorFor(store, errors.New("provider offline"), nil, "movie:job-provider-fail")
 	_, err := executor.Execute(t.Context(), adminjob.VirtualCandidatesRefreshRequest{
 		ContentID: "movie:job-provider-fail", MediaFolderID: 2, Title: "Heat",
 	}, nil)
@@ -195,7 +227,7 @@ func TestRefreshJobPublishesVersionsUpdated(t *testing.T) {
 	store := refreshJobTestStore(t)
 	bus := &recordingEventBus{}
 	hub := notifications.NewHub("test", bus)
-	executor := refreshJobExecutor(store, nil, nil, nil)
+	executor := refreshJobExecutor(store, nil, nil)
 	executor.Events = hub
 	contentID := "movie:job-event"
 	if _, err := executor.Execute(t.Context(), adminjob.VirtualCandidatesRefreshRequest{
@@ -225,58 +257,9 @@ func recordingEventPayload(bus *recordingEventBus, needle string) string {
 	return ""
 }
 
-// TestEnrichVirtualCandidatesProbesEveryCandidate proves the enrichment pass
-// attempts every persisted candidate and persists the probe evidence, and that
-// a probe failure on one candidate does not stop the others.
-func TestEnrichVirtualCandidatesProbesEveryCandidate(t *testing.T) {
-	rows := map[string]*models.MediaFile{
-		"virtual://movie/x?result=a": {ID: 11, ContentID: "movie:x", FilePath: "virtual://movie/x?result=a", MediaFolderID: 2, Container: virtualURIScheme, VirtualOwnerInstallationID: 5},
-		"virtual://movie/x?result=b": {ID: 12, ContentID: "movie:x", FilePath: "virtual://movie/x?result=b", MediaFolderID: 2, Container: virtualURIScheme, VirtualOwnerInstallationID: 5},
-	}
-	probes := 0
-	saved := make([]models.VirtualFilePersistArgs, 0)
-	h := &PlaybackHandler{
-		VirtualFileLookup: func(ctx context.Context, path string) (*models.MediaFile, error) {
-			if row, ok := rows[path]; ok {
-				return row, nil
-			}
-			return nil, errors.New("not found")
-		},
-		VirtualPlaybackSourceProberWithHeaders: func(_ context.Context, _ string, file *models.MediaFile, _ map[string]string) (*models.MediaFile, error) {
-			probes++
-			if file.FilePath == "virtual://movie/x?result=b" {
-				return nil, errors.New("probe failed")
-			}
-			probed := *file
-			probed.Resolution = "2160p"
-			probed.CodecVideo = "hevc"
-			probed.VideoTracks = []models.VideoTrack{{Codec: "hevc"}}
-			return &probed, nil
-		},
-		VirtualFileSaver: func(_ context.Context, args models.VirtualFilePersistArgs) (int64, error) {
-			saved = append(saved, args)
-			return 1, nil
-		},
-	}
-	streams := []VirtualPlaybackStream{
-		{URI: "virtual://movie/x?result=a", ProviderURL: "https://provider.example/a", Resolution: "2160p", OwnerInstallationID: 5},
-		{URI: "virtual://movie/x?result=b", ProviderURL: "https://provider.example/b", OwnerInstallationID: 5},
-	}
-	enriched := h.EnrichVirtualCandidates(context.Background(), "movie:x", "", 1, "p", streams)
-	if probes != 2 {
-		t.Fatalf("probes = %d, want every candidate attempted", probes)
-	}
-	if enriched != 1 {
-		t.Fatalf("enriched = %d, want the one successful probe", enriched)
-	}
-	if len(saved) != 1 || saved[0].FileID != 11 || !saved[0].StampProbe {
-		t.Fatalf("saved = %+v", saved)
-	}
-}
-
 func TestRefreshJobWithoutEventHubCompletes(t *testing.T) {
 	store := refreshJobTestStore(t)
-	executor := refreshJobExecutor(store, nil, nil, nil)
+	executor := refreshJobExecutor(store, nil, nil)
 	if _, err := executor.Execute(t.Context(), adminjob.VirtualCandidatesRefreshRequest{
 		ContentID: "movie:job-no-hub", MediaFolderID: 2, Title: "Heat",
 	}, nil); err != nil {
@@ -326,7 +309,7 @@ func TestRefreshJobForcesProviderStateAndPrunes(t *testing.T) {
 	store := refreshJobTestStore(t)
 	refresher := &fakeProviderStateRefresher{}
 	pruner := &fakeCandidatePruner{pruned: 3}
-	executor := refreshJobExecutorFor(store, nil, nil, nil, "movie:job-prune")
+	executor := refreshJobExecutorFor(store, nil, nil, "movie:job-prune")
 	executor.ProviderRefresher = refresher
 	executor.Pruner = pruner
 
@@ -372,7 +355,7 @@ func TestRefreshJobForcesProviderStateAndPrunes(t *testing.T) {
 func TestRefreshJobProviderStateFailureIsNonFatal(t *testing.T) {
 	store := refreshJobTestStore(t)
 	refresher := &fakeProviderStateRefresher{err: errors.New("altmount offline")}
-	executor := refreshJobExecutorFor(store, nil, nil, nil, "movie:job-refresh-state-fail")
+	executor := refreshJobExecutorFor(store, nil, nil, "movie:job-refresh-state-fail")
 	executor.ProviderRefresher = refresher
 	executor.Pruner = &fakeCandidatePruner{pruned: 1}
 
@@ -392,7 +375,7 @@ func TestRefreshJobProviderStateFailureIsNonFatal(t *testing.T) {
 func TestRefreshJobPruneFailureIsNonFatal(t *testing.T) {
 	store := refreshJobTestStore(t)
 	pruner := &fakeCandidatePruner{err: errors.New("delete failed")}
-	executor := refreshJobExecutorFor(store, nil, nil, nil, "movie:job-prune-fail")
+	executor := refreshJobExecutorFor(store, nil, nil, "movie:job-prune-fail")
 	executor.Pruner = pruner
 
 	result, err := executor.Execute(t.Context(), adminjob.VirtualCandidatesRefreshRequest{
@@ -418,7 +401,7 @@ func TestRefreshJobCapsPersistedBatch(t *testing.T) {
 			int64(1_000_000+i),
 		))
 	}
-	executor := refreshJobExecutor(store, nil, &fakeIndexerSearcher{releases: releases}, nil)
+	executor := refreshJobExecutor(store, nil, &fakeIndexerSearcher{releases: releases})
 	t.Cleanup(func() { _, _ = store.PruneExpiredIndexerReleases(context.Background()) })
 	result, err := executor.Execute(t.Context(), adminjob.VirtualCandidatesRefreshRequest{
 		ContentID: "movie:job-cap", MediaFolderID: 2, Title: "Some Movie",

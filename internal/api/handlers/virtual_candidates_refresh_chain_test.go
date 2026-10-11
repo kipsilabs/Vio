@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -69,15 +68,15 @@ func waitForJobTerminal(t *testing.T, repo *adminjob.Repository, id string, time
 	}
 }
 
-// TestVirtualCandidatesRefreshEndToEndCarriesTracksIndexerReleasesAndEvent is
+// TestVirtualCandidatesRefreshEndToEndCarriesListIndexerReleasesAndEvent is
 // the whole-chain proof: a Refresh List job runs through the real adminjob
 // runner and the real executor pipeline (provider re-list and DB persist →
-// indexer search → dedup → indexer-release upsert → enrichment persist →
-// completion event) against the real catalog projections. It asserts the watch
-// detail's version list carries the probed audio/subtitle tracks, the
-// indexer-release projection carries the new release, the versions_updated event
-// fired exactly once, and the one-active-job lock is held while running and
-// released after completion.
+// indexer search → dedup → indexer-release upsert → completion event) against
+// the real catalog projections. It asserts the watch detail's version list
+// carries the provider-declared candidate, the indexer-release projection
+// carries the new release, the versions_updated event fired exactly once, and
+// the one-active-job lock is held while running and released after completion.
+// The refresh is list-only: no candidate media URL is opened (no prober wired).
 func TestVirtualCandidatesRefreshEndToEndCarriesTracksIndexerReleasesAndEvent(t *testing.T) {
 	pool := virtualMetadataUpdateTestPool(t)
 	ctx := t.Context()
@@ -177,44 +176,10 @@ func TestVirtualCandidatesRefreshEndToEndCarriesTracksIndexerReleasesAndEvent(t 
 		EpisodeFiles: fileRepo.GetByEpisodeID,
 	}
 
-	// The prober returns BOTH audio and subtitle tracks, so enrichment has real
-	// inventory to persist (the provider declaration carried none).
-	probedAudio := models.AudioTrack{Language: "eng", Codec: "eac3", Channels: 6, Default: true}
-	probedSubtitle := models.SubtitleTrack{Index: 3, Language: "eng", Codec: "subrip"}
-	playback := &PlaybackHandler{
-		VirtualFileLookup: func(lookupCtx context.Context, path string) (*models.MediaFile, error) {
-			file, err := fileRepo.GetByPath(lookupCtx, path)
-			if err != nil && errors.Is(err, scanner.ErrFileNotFound) {
-				return nil, ErrVirtualCandidateNotFound
-			}
-			return file, err
-		},
-		VirtualCandidateFileLookup: func(lookupCtx context.Context, path, cid, eid string, oid int) (*models.MediaFile, error) {
-			file, err := fileRepo.GetVirtualCandidateByNeutralPath(lookupCtx, path, cid, eid, oid)
-			if err != nil && errors.Is(err, scanner.ErrFileNotFound) {
-				return nil, ErrVirtualCandidateNotFound
-			}
-			return file, err
-		},
-		VirtualFileSaver: func(saveCtx context.Context, args models.VirtualFilePersistArgs) (int64, error) {
-			return ExecVirtualFileMetadataUpdate(saveCtx, pool, args)
-		},
-		VirtualFileMetadataSaver: func(saveCtx context.Context, args models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error) {
-			return ExecVirtualFileMetadataUpdateResult(saveCtx, pool, args)
-		},
-		VirtualPlaybackSourceProberWithHeaders: func(_ context.Context, _ string, file *models.MediaFile, _ map[string]string) (*models.MediaFile, error) {
-			probed := *file
-			probed.Resolution = "2160p"
-			probed.CodecVideo = "hevc"
-			probed.CodecAudio = "eac3"
-			probed.Container = "mkv"
-			probed.Duration = 5400
-			probed.VideoTracks = []models.VideoTrack{{Codec: "hevc", Profile: "main 10", Width: 3840, Height: 2160, BitDepth: 10, VideoRange: "SDR", VideoRangeType: "SDR"}}
-			probed.AudioTracks = []models.AudioTrack{probedAudio}
-			probed.SubtitleTracks = []models.SubtitleTrack{probedSubtitle}
-			return &probed, nil
-		},
-	}
+	// The refresh is list-only: the version list carries the provider-declared
+	// candidate metadata, and verified track inventory arrives with an explicit
+	// Play of one candidate.
+	_ = fileRepo
 
 	searcher := &fakeIndexerSearcher{releases: []virtuallibrary.SearchItem{
 		// Deduped: same release name and size as the provider listing.
@@ -229,7 +194,6 @@ func TestVirtualCandidatesRefreshEndToEndCarriesTracksIndexerReleasesAndEvent(t 
 		Refresh:  refreshSvc,
 		Store:    store,
 		Searcher: searcher,
-		Enricher: playback,
 		Events:   hub,
 	}
 
@@ -296,15 +260,15 @@ func TestVirtualCandidatesRefreshEndToEndCarriesTracksIndexerReleasesAndEvent(t 
 		t.Fatalf("job failed: status=%s message=%s error=%s", completed.Status, completed.Message, completed.ErrorMessage)
 	}
 
-	// The completion event fires exactly once, after persistence and enrichment,
-	// as catalog.item.changed carrying change=versions_updated for the item.
+	// The completion event fires exactly once, after persistence, as
+	// catalog.item.changed carrying change=versions_updated for the item.
 	if n := recordingEventCount(bus, "catalog.item.changed", "versions_updated", contentID); n != 1 {
 		all := recordingEventPayloads(bus)
 		t.Fatalf("catalog.item.changed/versions_updated for %s fired %d times, want 1; payloads=%v", contentID, n, all)
 	}
 
-	// --- The watch detail's version list carries the refreshed version WITH
-	// the probed track inventory ---
+	// --- The watch detail's version list carries the refreshed version with
+	// the provider-declared metadata (list-only: no probe ran) ---
 	detailSvc := catalog.NewDetailService(
 		catalog.NewItemRepository(pool),
 		catalog.NewEpisodeRepository(pool),
@@ -330,17 +294,8 @@ func TestVirtualCandidatesRefreshEndToEndCarriesTracksIndexerReleasesAndEvent(t 
 		}
 		t.Fatalf("refreshed candidate %q missing from watch versions %v", candidateURI, paths)
 	}
-	if len(candidateVersion.AudioTracks) == 0 {
-		t.Fatalf("watch version %q carries no audio tracks after enrichment", candidateURI)
-	}
-	if got := candidateVersion.AudioTracks[0]; got.Language != "eng" || got.Codec != "eac3" {
-		t.Fatalf("watch audio track = %+v, want language eng codec eac3", got)
-	}
-	if len(candidateVersion.SubtitleTracks) == 0 {
-		t.Fatalf("watch version %q carries no subtitle tracks after enrichment", candidateURI)
-	}
-	if got := candidateVersion.SubtitleTracks[0]; got.Language != "eng" || got.Codec != "subrip" {
-		t.Fatalf("watch subtitle track = %+v, want language eng codec subrip", got)
+	if candidateVersion.Resolution != "2160p" || candidateVersion.CodecVideo != "hevc" || candidateVersion.CodecAudio != "eac3" {
+		t.Fatalf("watch version = %+v, want the provider-declared 2160p/hevc/eac3", candidateVersion)
 	}
 
 	// --- The indexer-release projection that feeds apiv2's indexer_releases ---
