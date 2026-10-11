@@ -766,6 +766,77 @@ func TestResolveCopySeekAnchorSkipsProbeWhenCallerBudgetExpired(t *testing.T) {
 	awaitCopySeekProbeFlight(t, copySeekAnchorFlightKey(copySeekAnchorSourceKey(ResolveFFmpegPath("ffmpeg"), "virtual://movie/expired", 2), 120))
 }
 
+// TestLookupCachedCopySeekAnchorServesProvenIntervalWithoutProbe proves the lazy
+// lookup the transport timeline uses answers only from an interval a prior probe
+// already proved, and never starts a probe itself. A position strictly inside
+// the interval reuses the anchor; the exact observed boundary (the interval's
+// exclusive upper bound), a position past the interval, an unobserved source,
+// and an empty identity all miss so the caller falls through to a fresh probe.
+func TestLookupCachedCopySeekAnchorServesProvenIntervalWithoutProbe(t *testing.T) {
+	var calls int
+	resetCopySeekAnchorCache(t, nil, func(_ context.Context, _ string, _ string, requested float64, segmentDuration int) (float64, int, error) {
+		calls++
+		keyframe := math.Floor(requested/5) * 5
+		return keyframe, int(keyframe / float64(segmentDuration)), nil
+	})
+	ctx := context.Background()
+	// Prove the open interval (120, 121) for this source.
+	if _, _, err := ResolveCopySeekAnchorForSource(ctx, "ffmpeg", "virtual://movie/lazy", "http://relay/lazy", 121, 2); err != nil {
+		t.Fatalf("seed probe: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("seed probe calls = %d, want 1", calls)
+	}
+
+	anchor, segment, ok := LookupCachedCopySeekAnchor("ffmpeg", "virtual://movie/lazy", 120.5, 2)
+	if !ok || anchor != 120 || segment != 60 {
+		t.Fatalf("proven-interval lookup = (%v, %d, %v), want (120, 60, true)", anchor, segment, ok)
+	}
+	if calls != 1 {
+		t.Fatalf("the lazy lookup started a probe: calls = %d, want 1", calls)
+	}
+
+	if _, _, ok := LookupCachedCopySeekAnchor("ffmpeg", "virtual://movie/lazy", 121, 2); ok {
+		t.Fatal("the exact observed boundary was served from cache; it must re-probe")
+	}
+	if _, _, ok := LookupCachedCopySeekAnchor("ffmpeg", "virtual://movie/lazy", 121.5, 2); ok {
+		t.Fatal("a position past the proven interval was served from cache")
+	}
+	if _, _, ok := LookupCachedCopySeekAnchor("ffmpeg", "virtual://movie/other", 120.5, 2); ok {
+		t.Fatal("an unobserved source identity was served from cache")
+	}
+	if _, _, ok := LookupCachedCopySeekAnchor("ffmpeg", "  ", 120.5, 2); ok {
+		t.Fatal("an empty source identity was served from cache")
+	}
+	if _, _, ok := LookupCachedCopySeekAnchor("ffmpeg", "virtual://movie/lazy", 0, 2); ok {
+		t.Fatal("a non-positive position was served from cache")
+	}
+	if calls != 1 {
+		t.Fatalf("a miss started a probe: calls = %d, want 1", calls)
+	}
+}
+
+// TestLookupCachedCopySeekAnchorMissesAfterExpiry proves the lazy lookup never
+// serves an expired anchor, so the transport timeline falls through to a fresh
+// probe once the TTL lapses.
+func TestLookupCachedCopySeekAnchorMissesAfterExpiry(t *testing.T) {
+	now := time.Unix(2_000, 0)
+	resetCopySeekAnchorCache(t, func() time.Time { return now }, func(_ context.Context, _ string, _ string, requested float64, _ int) (float64, int, error) {
+		return requested - 1, 0, nil
+	})
+	ctx := context.Background()
+	if _, _, err := ResolveCopySeekAnchorForSource(ctx, "ffmpeg", "virtual://movie/lazy-ttl", "http://relay/ttl", 90, 2); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok := LookupCachedCopySeekAnchor("ffmpeg", "virtual://movie/lazy-ttl", 89.5, 2); !ok {
+		t.Fatal("a fresh anchor was not served from cache")
+	}
+	now = now.Add(copySeekAnchorCacheTTL + time.Second)
+	if _, _, ok := LookupCachedCopySeekAnchor("ffmpeg", "virtual://movie/lazy-ttl", 89.5, 2); ok {
+		t.Fatal("an expired anchor was served from cache")
+	}
+}
+
 // TestTransientProviderCauseClassifiesUpstream5xx pins the provider-error
 // classifier: an ffmpeg failure whose stderr names an upstream 5xx is a
 // transient provider error a caller should back off and retry, while a decoder
@@ -799,4 +870,70 @@ func TestTransientProviderCauseClassifiesUpstream5xx(t *testing.T) {
 			}
 		})
 	}
+}
+
+// BenchmarkCopySeekAnchorResolveVersusLookup measures the wall time the
+// transport timeline pays for one copy-video seek anchor, before and after the
+// lazy cache path. "cold-probe" spawns the real FFmpeg observation on a fresh
+// source identity, so every iteration pays the miss path; "lazy-lookup" serves
+// the same position from the shared cache after one probe, so every iteration
+// pays the hit path. The difference is the work a proven cache hit removes from
+// the transport_anchor phase.
+//
+// It is a fixture measurement, not a deployment number: it excludes the
+// provider/relay reopen that precedes a cold virtual probe, which depends on the
+// live provider. Run it with:
+//
+//	go test -run '^$' -bench BenchmarkCopySeekAnchorResolveVersusLookup -benchtime 5x ./internal/playback/
+//
+// It skips when FFmpeg or its HEVC encoder is unavailable, like the real-FFmpeg
+// integration tests.
+func BenchmarkCopySeekAnchorResolveVersusLookup(b *testing.B) {
+	ffmpegPath, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		b.Skip("ffmpeg is not installed")
+	}
+	encoders, err := exec.Command(ffmpegPath, "-hide_banner", "-encoders").CombinedOutput()
+	if err != nil || !strings.Contains(string(encoders), "libx265") {
+		b.Skip("ffmpeg does not provide libx265")
+	}
+	sourcePath := filepath.Join(b.TempDir(), "long-gop-hevc.mkv")
+	encodeCtx, cancelEncode := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancelEncode()
+	encode := exec.CommandContext(encodeCtx, ffmpegPath,
+		"-hide_banner", "-loglevel", "error",
+		"-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24",
+		"-t", "22",
+		"-c:v", "libx265", "-preset", "ultrafast",
+		"-x265-params", "keyint=240:min-keyint=240:scenecut=0:log-level=error:pools=1:frame-threads=1",
+		"-an", "-y", sourcePath,
+	)
+	if output, err := encode.CombinedOutput(); err != nil {
+		b.Fatalf("generate long-GOP HEVC fixture: %v\n%s", err, output)
+	}
+
+	b.Run("cold-probe", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			// A unique identity per iteration forces a cache miss, so each
+			// iteration pays the full FFmpeg probe the lazy path avoids.
+			identity := fmt.Sprintf("bench://cold/%d", i)
+			if _, _, err := ResolveCopySeekAnchorForSource(context.Background(), ffmpegPath, identity, sourcePath, 18.261, 2); err != nil {
+				b.Fatalf("cold probe: %v", err)
+			}
+		}
+	})
+	b.Run("lazy-lookup", func(b *testing.B) {
+		const identity = "bench://lazy"
+		if _, _, err := ResolveCopySeekAnchorForSource(context.Background(), ffmpegPath, identity, sourcePath, 18.261, 2); err != nil {
+			b.Fatalf("seed probe: %v", err)
+		}
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			// 18.0 lies strictly inside the interval the seed probe proved
+			// (anchor 10, exclusive upper bound 18.261), so this is a hit.
+			if _, _, ok := LookupCachedCopySeekAnchor(ffmpegPath, identity, 18.0, 2); !ok {
+				b.Fatal("lazy lookup missed a proven interval")
+			}
+		}
+	})
 }
