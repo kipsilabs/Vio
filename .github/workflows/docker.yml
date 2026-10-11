@@ -158,7 +158,7 @@ jobs:
           PLATFORM: ${{ matrix.platform }}
 
       - name: Download validated frontend bundle
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         if: github.event_name == 'workflow_run'
         with:
           name: frontend-dist-${{ github.event.workflow_run.head_sha || github.sha }}
@@ -167,7 +167,7 @@ jobs:
           run-id: ${{ github.event.workflow_run.id }}
 
       - name: Download frontend bundle for manual builds
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         if: github.event_name == 'workflow_dispatch' || github.event_name == 'release'
         with:
           name: frontend-dist-${{ github.sha }}
@@ -182,10 +182,10 @@ jobs:
 
       - name: Set up Docker Buildx
         id: buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Cache Go build cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         # Cache-service flakiness must not fail the image build.
         continue-on-error: true
         with:
@@ -210,7 +210,7 @@ jobs:
             }
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -218,7 +218,7 @@ jobs:
 
       - name: Extract metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           labels: |
@@ -228,7 +228,7 @@ jobs:
 
       - name: Build and push by digest
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           # Attestations are never read by the digest + manifest-merge flow, so skip
           # generating them: cheaper builds and a smaller cache-to upload.
@@ -273,17 +273,17 @@ jobs:
         run: echo "IMAGE_LC=${IMAGE_NAME,,}" >> "$GITHUB_ENV"
 
       - name: Download digests
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: ${{ runner.temp }}/digests
           pattern: digests-*
           merge-multiple: true
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -291,7 +291,7 @@ jobs:
 
       - name: Extract metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_LC }}
           tags: |

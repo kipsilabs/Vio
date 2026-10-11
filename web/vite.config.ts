@@ -172,6 +172,29 @@ function moveManifestOutOfDist(): Plugin {
   };
 }
 
+// jassub 2.5.6 still references `new URL('./default.woff2', import.meta.url)`
+// for its built-in Liberation Sans default, but no longer publishes that file
+// (see the note above the vendored font in src/player/hooks/useASSSubtitles.ts).
+// The app always passes its own `liberation sans` through `availableFonts`, so
+// the branch is dead, yet Vite's asset plugin still tries to resolve the file
+// and warns on every production build. The @vite-ignore comment is the
+// suppression Vite's own warning names: it leaves the expression untouched for
+// runtime instead of failing to resolve it at build time.
+function ignoreUnresolvableJassubFont(): Plugin {
+  return {
+    name: "jassub-default-font-vite-ignore",
+    enforce: "pre",
+    apply: "build",
+    transform(code, id) {
+      if (!id.includes("jassub") || !code.includes("default.woff2")) return;
+      return code.replace(
+        /(new\s+URL\(\s*)(['"])(\.\/default\.woff2)\2(\s*,\s*import\.meta\.url\s*\))/g,
+        "$1/* @vite-ignore */$2$3$2$4",
+      );
+    },
+  };
+}
+
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), "");
   const apiProxyTarget = env.VITE_API_PROXY_TARGET || "http://localhost:8090";
@@ -202,6 +225,7 @@ export default defineConfig(({ mode }) => {
 
   return {
     plugins: [
+      ignoreUnresolvableJassubFont(),
       react(),
       tailwindcss(),
       themeBootScript(),
