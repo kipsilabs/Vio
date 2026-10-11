@@ -3118,7 +3118,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenanceFailed, ResolutionAssumed: resolutionAssumed,
 			}, resolvedIdentity, resolvedRematched), nil
 		}
-		if skipProbe && !substituted && !virtualProbeFailures.recent(probeKey) {
+		if skipProbe && !substituted {
 			if transient.Resolution == "" {
 				transient.Resolution = cand.Resolution
 			}
@@ -3131,16 +3131,25 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				transient.HDR = true
 			}
 			h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
-			probeBgFile := cloneVirtualProbeTransient(transient)
-			probeBgFile.Duration = 0
-			probeBgCand := cand
-			if gate := h.detachedGate(); gate.tryAcquire() {
-				bgCtx, bgCancel := h.virtualDetachedContext(r.Context(), virtualBackgroundProbeBudget)
-				go func() {
-					defer gate.release()
-					defer bgCancel()
-					h.probeVirtualSourceAndPersist(bgCtx, stickyKey, file, streamURL, probeBgFile, probeBgCand, h.virtualExpectedRuntimeMinutes(r.Context(), file), oid)
-				}()
+			if virtualProbeFailures.recent(probeKey) {
+				// Damper armed: a recent failure already consumed the probe
+				// budget. No new probe is admitted; try cache-only recovery
+				// and serve declared metadata immediately.
+				syncProbeFile := cloneVirtualProbeTransient(transient)
+				syncProbeFile.Duration = 0
+				h.recoverVirtualProbeFromCache(attemptCtx, file, streamURL, syncProbeFile, cand, oid)
+			} else {
+				probeBgFile := cloneVirtualProbeTransient(transient)
+				probeBgFile.Duration = 0
+				probeBgCand := cand
+				if gate := h.detachedGate(); gate.tryAcquire() {
+					bgCtx, bgCancel := h.virtualDetachedContext(r.Context(), virtualBackgroundProbeBudget)
+					go func() {
+						defer gate.release()
+						defer bgCancel()
+						h.probeVirtualSourceAndPersist(bgCtx, stickyKey, file, streamURL, probeBgFile, probeBgCand, h.virtualExpectedRuntimeMinutes(r.Context(), file), oid)
+					}()
+				}
 			}
 			return withResolvedCandidate(&resolvedVirtualPlaybackSource{
 				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenanceDeclared, ResolutionAssumed: resolutionAssumed,

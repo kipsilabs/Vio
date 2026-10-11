@@ -620,13 +620,13 @@ func TestResolveVirtualProbeSuccessClearsFailureMarker(t *testing.T) {
 			return f, nil
 		}, nil)
 
-	// Seed a failure so the clear path is exercised after the probe. The marker
-	// uses the production TTL (future expiry) so recent() is true; the instant
-	// path probes around it in the background, and the success clears it.
+	// Seed a stale (expired) failure so the clear path is exercised without
+	// arming the damper: recent() is false, so the instant path admits the
+	// background probe, and the success leaves no live marker behind.
 	virtualProbeFailures.mu.Lock()
 	virtualProbeFailures.marks[key] = virtualProbeFailureMark{
 		ttl:       virtualProbeFailureTTL,
-		expiresAt: time.Now().Add(time.Minute),
+		expiresAt: time.Now().Add(-time.Minute),
 	}
 	virtualProbeFailures.mu.Unlock()
 
@@ -639,14 +639,17 @@ func TestResolveVirtualProbeSuccessClearsFailureMarker(t *testing.T) {
 	if resolved.Provenance != ProbeProvenanceDeclared {
 		t.Fatalf("provenance=%q, want declared instant response", resolved.Provenance)
 	}
-	// The background probe runs detached: wait for the success to clear the
-	// seeded stale failure marker.
+	// The background probe runs detached: wait for it to complete, then the
+	// seeded stale marker must be gone and no live failure may remain.
 	deadline := time.Now().Add(5 * time.Second)
-	for virtualProbeFailures.recent(key) {
+	for probeCalls < 1 {
 		if time.Now().After(deadline) {
-			t.Fatal("stale failure marker survived a successful background probe")
+			t.Fatal("background probe never ran")
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+	if virtualProbeFailures.recent(key) {
+		t.Fatal("stale failure marker survived a successful background probe")
 	}
 	if probeCalls != 1 {
 		t.Fatalf("prober called %d times, want 1", probeCalls)
