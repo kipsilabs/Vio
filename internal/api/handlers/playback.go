@@ -2082,9 +2082,14 @@ func (h *PlaybackHandler) finalizeSessionStopWithResult(ctx context.Context, ses
 	if h == nil || session == nil || session.ID == "" {
 		return watchstate.PlaybackStopResult{}
 	}
+	// Cancel and await the session's start side effects under their own bounded
+	// budget before taking the durable-write budget. The wait can run as long as
+	// playbackStartSideEffectsTimeoutV3, so ordering it after teardownContext (as
+	// this did) could leave the history write and synced-session delete below
+	// with an already-expired context.
+	h.cancelPlaybackStartSideEffectsV3(ctx, session.ID)
 	ctx, cancel := teardownContext(ctx)
 	defer cancel()
-	h.cancelPlaybackStartSideEffectsV3(ctx, session.ID)
 	// The session is gone: a terminal inventory notification parked behind a
 	// full detached gate would re-publish against a session ID the manager no
 	// longer knows, so discard it rather than let the drain retry a dead session.
@@ -2155,9 +2160,11 @@ func (h *PlaybackHandler) finalizeSessionAbort(ctx context.Context, session *pla
 	if h == nil || session == nil || session.ID == "" {
 		return
 	}
+	// Same split as finalizeSessionStopWithResult: settle the start side effects
+	// under their own budget, then take a fresh budget for the durable writes.
+	h.cancelPlaybackStartSideEffectsV3(ctx, session.ID)
 	ctx, cancel := teardownContext(ctx)
 	defer cancel()
-	h.cancelPlaybackStartSideEffectsV3(ctx, session.ID)
 
 	if h.WatchScrobbler != nil && h.fileResolver != nil {
 		if file, err := h.loadFileByPreferredID(ctx, requestedMediaFileID(session), session.MediaFileID); err == nil && file != nil {

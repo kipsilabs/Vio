@@ -741,18 +741,26 @@ const stopFinalizationLease = 30 * time.Second
 
 // finalizeStopV2 claims finalization, runs the stop side effects, and records
 // the finalized receipt. When the claim is lost the stored receipt is returned
-// unchanged. The request cannot fail from here: the receipt is already durable.
+// unchanged. The stop is already committed on the attempt row by the time this
+// runs, so the finalization is detached from the request: a client cancel right
+// after the commit must not skip the claim, the cleanup, or the receipt write,
+// any of which would leave the stop open to a later replay.
 func (h *PlaybackHandler) finalizeStopV2(ctx context.Context, store playback.ProgressStoreV3, record *playback.AttemptRecordV3, sessionID string, receipt playback.StopReceiptV3) playback.StopReceiptV3 {
-	claimed, err := store.ClaimStopFinalization(ctx, sessionID, time.Now().Add(stopFinalizationLease))
+	// One detached budget covers the claim and the durable side effects; the
+	// caller's request context no longer bounds them.
+	finalCtx, cancelFinal := teardownContext(ctx)
+	defer cancelFinal()
+	claimed, err := store.ClaimStopFinalization(finalCtx, sessionID, time.Now().Add(stopFinalizationLease))
 	if err != nil {
-		slog.WarnContext(ctx, "failed to claim playback stop finalization", "component", "api", "session", sessionID, "playback_session_id", sessionID, "error", err)
+		slog.WarnContext(finalCtx, "failed to claim playback stop finalization", "component", "api", "session", sessionID, "playback_session_id", sessionID, "error", err)
 		return receipt
 	}
 	if !claimed {
-		// Another caller holds the lease. Wait for it to finish, or for its
-		// lease to lapse and take over, bounded by the request context. The
-		// receipt is re-read each round so the lease judged is the one the
-		// store holds now, not the one read before the winner claimed.
+		// Another caller holds the lease. This caller has no durable work of its
+		// own yet, so it waits only while the client is still connected, or until
+		// the detached ceiling lapses. The receipt is re-read each round so the
+		// lease judged is the one the store holds now, not the one read before
+		// the winner claimed.
 		for {
 			if replay, _, err := store.StopAttempt(ctx, sessionID, receipt.StopID, nil); err == nil {
 				if replay.Finalized {
@@ -761,7 +769,7 @@ func (h *PlaybackHandler) finalizeStopV2(ctx context.Context, store playback.Pro
 				receipt = replay
 			}
 			if !receipt.FinalizingUntil.IsZero() && !time.Now().Before(receipt.FinalizingUntil) {
-				claimed, err = store.ClaimStopFinalization(ctx, sessionID, time.Now().Add(stopFinalizationLease))
+				claimed, err = store.ClaimStopFinalization(finalCtx, sessionID, time.Now().Add(stopFinalizationLease))
 				if err == nil && claimed {
 					break
 				}
@@ -771,14 +779,22 @@ func (h *PlaybackHandler) finalizeStopV2(ctx context.Context, store playback.Pro
 			case <-ctx.Done():
 				timer.Stop()
 				return receipt
+			case <-finalCtx.Done():
+				timer.Stop()
+				return receipt
 			case <-timer.C:
 			}
 		}
 	}
-	receipt.HistoryID = h.finishStopV2(ctx, record, sessionID, receipt.Accepted)
+	receipt.HistoryID = h.finishStopV2(finalCtx, record, sessionID, receipt.Accepted)
 	receipt.Finalized = true
-	if err := store.RecordStopReceipt(ctx, sessionID, receipt); err != nil {
-		slog.WarnContext(ctx, "failed to record playback stop receipt", "component", "api", "session", sessionID, "playback_session_id", sessionID, "error", err)
+	// finishStopV2 runs the cleanup, which takes its own detached budget and can
+	// outlast the one above. Persist the receipt under a fresh bound of its own
+	// so a slow cleanup cannot leave it unwritten and the stop replayable.
+	receiptCtx, cancelReceipt := teardownContext(finalCtx)
+	defer cancelReceipt()
+	if err := store.RecordStopReceipt(receiptCtx, sessionID, receipt); err != nil {
+		slog.WarnContext(receiptCtx, "failed to record playback stop receipt", "component", "api", "session", sessionID, "playback_session_id", sessionID, "error", err)
 	}
 	return receipt
 }
@@ -789,11 +805,9 @@ func (h *PlaybackHandler) finalizeStopV2(ctx context.Context, store playback.Pro
 // session synthesized from the attempt row otherwise. The deny marker is
 // written in both cases. It returns the watch-history id when one was made.
 func (h *PlaybackHandler) finishStopV2(ctx context.Context, record *playback.AttemptRecordV3, sessionID string, accepted *playback.ProgressSampleV3) string {
-	// Detached and bounded for the same reason as the other teardown paths:
-	// the stop is already durable by the time this runs, so a canceled request
-	// must not skip the deny marker, the final position, or the history writer.
-	ctx, cancel := teardownContext(ctx)
-	defer cancel()
+	// The sole caller, finalizeStopV2, passes an already-detached, bounded
+	// context, so the deny marker, the final position, and the history writer run
+	// on the finalization budget instead of resetting another.
 	h.StreamDeny.Deny(ctx, sessionID)
 	position, paused := 0.0, false
 	if accepted != nil {

@@ -6,7 +6,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"testing/synctest"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
@@ -224,4 +227,181 @@ func TestProgressiveRemuxAbortStillEndsOnRequestCancel(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("abort did not close after the request context was canceled")
 	}
+}
+
+// cancelOnStopCommitProgressStore simulates a client that cancels its stop
+// request at the instant the stop commit lands, and records the context each
+// later durable step of the finalization saw. A memory store ignores the
+// context, so a wrapper is the only way a test can tell a detached
+// finalization from one that inherited the canceled request.
+type cancelOnStopCommitProgressStore struct {
+	*playback.MemoryPlanStoreV3
+	cancel           context.CancelFunc
+	stopCtxErr       error
+	claimCtxErr      error
+	receiptCtxErr    error
+	receiptFinalized bool
+}
+
+func (s *cancelOnStopCommitProgressStore) StopAttempt(
+	ctx context.Context, sessionID, stopID string, final *playback.ProgressSampleV3,
+) (playback.StopReceiptV3, bool, error) {
+	receipt, first, err := s.MemoryPlanStoreV3.StopAttempt(ctx, sessionID, stopID, final)
+	if err == nil {
+		s.stopCtxErr = ctx.Err()
+		if first && s.cancel != nil {
+			s.cancel()
+		}
+	}
+	return receipt, first, err
+}
+
+func (s *cancelOnStopCommitProgressStore) ClaimStopFinalization(
+	ctx context.Context, sessionID string, leaseUntil time.Time,
+) (bool, error) {
+	s.claimCtxErr = ctx.Err()
+	return s.MemoryPlanStoreV3.ClaimStopFinalization(ctx, sessionID, leaseUntil)
+}
+
+func (s *cancelOnStopCommitProgressStore) RecordStopReceipt(
+	ctx context.Context, sessionID string, receipt playback.StopReceiptV3,
+) error {
+	s.receiptCtxErr = ctx.Err()
+	s.receiptFinalized = receipt.Finalized
+	return s.MemoryPlanStoreV3.RecordStopReceipt(ctx, sessionID, receipt)
+}
+
+// cancelOnCleanupAdminStore cancels the client's request while the teardown
+// cleanup runs, and still records the synced-session delete when the detached
+// cleanup context is live.
+type cancelOnCleanupAdminStore struct {
+	cancel     context.CancelFunc
+	canceledAt int
+	deleted    map[string]bool
+}
+
+func (s *cancelOnCleanupAdminStore) RecordHistory(context.Context, AdminPlaybackHistoryEntry) error {
+	return nil
+}
+
+func (s *cancelOnCleanupAdminStore) DeleteSession(ctx context.Context, sessionID string) error {
+	if s.cancel != nil {
+		s.cancel()
+		s.canceledAt++
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if s.deleted == nil {
+		s.deleted = make(map[string]bool)
+	}
+	s.deleted[sessionID] = true
+	return nil
+}
+
+func newTeardownStopFixture(t *testing.T) (*playbackServiceFixture, *cancelOnStopCommitProgressStore, context.Context, context.CancelFunc) {
+	t.Helper()
+	f := newPlaybackServiceFixture(t)
+	reqCtx, cancelReq := context.WithCancel(f.ctx)
+	store := &cancelOnStopCommitProgressStore{
+		MemoryPlanStoreV3: f.handler.PlanStoreV3.(*playback.MemoryPlanStoreV3),
+		cancel:            cancelReq,
+	}
+	f.handler.PlanStoreV3 = store
+	return f, store, reqCtx, cancelReq
+}
+
+// A client that cancels immediately after its stop commit must still get the
+// full finalization: the claim, the cleanup, and the receipt write all run
+// detached from the canceled request. Otherwise the stop stays unfinalized and
+// a later replay redoes it.
+func TestStopFinalizationDetachesClaimAndReceiptFromCanceledRequest(t *testing.T) {
+	f, store, reqCtx, cancelReq := newTeardownStopFixture(t)
+	defer cancelReq()
+	stopID := uuid.NewString()
+	view, err := f.handler.StopPlaybackV2(reqCtx, f.caller, f.session.ID, PlaybackStopCommand{StopID: stopID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.stopCtxErr != nil {
+		t.Fatalf("stop commit ran on a canceled context: %v", store.stopCtxErr)
+	}
+	if store.claimCtxErr != nil {
+		t.Fatalf("finalization claim ran on the canceled request context: %v", store.claimCtxErr)
+	}
+	if store.receiptCtxErr != nil {
+		t.Fatalf("receipt write ran on the canceled request context: %v", store.receiptCtxErr)
+	}
+	if !store.receiptFinalized {
+		t.Fatal("receipt was not finalized")
+	}
+	if view.Outcome != PlaybackOutcomeStopped {
+		t.Fatalf("view = %+v", view)
+	}
+	if _, err := f.manager.GetSession(f.session.ID); !errors.Is(err, playback.ErrSessionNotFound) {
+		t.Fatalf("cleanup did not tear the session down: %v", err)
+	}
+}
+
+// A client that cancels while the detached cleanup is still running must not
+// skip the receipt write: the receipt is persisted under a fresh detached
+// bound, so the stop cannot be replayed as unfinished.
+func TestStopFinalizationPersistsReceiptWhenClientCancelsDuringCleanup(t *testing.T) {
+	f, store, reqCtx, cancelReq := newTeardownStopFixture(t)
+	defer cancelReq()
+	admin := &cancelOnCleanupAdminStore{cancel: cancelReq}
+	f.handler.AdminStore = admin
+
+	view, err := f.handler.StopPlaybackV2(reqCtx, f.caller, f.session.ID, PlaybackStopCommand{StopID: uuid.NewString()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if admin.canceledAt == 0 {
+		t.Fatal("precondition: cleanup never canceled the request")
+	}
+	if !admin.deleted[f.session.ID] {
+		t.Fatal("cleanup did not delete the synced session")
+	}
+	if store.receiptCtxErr != nil {
+		t.Fatalf("receipt write ran on the canceled request context: %v", store.receiptCtxErr)
+	}
+	if !store.receiptFinalized {
+		t.Fatal("receipt was not finalized after a cancel during cleanup")
+	}
+	if view.Outcome != PlaybackOutcomeStopped {
+		t.Fatalf("view = %+v", view)
+	}
+}
+
+// The start-effect wait can run the whole playbackStartSideEffectsTimeoutV3.
+// The history write and synced-session delete must still run on a durable
+// budget that starts once the effect has settled, not one that expired while
+// waiting for it.
+func TestStopTeardownDurableWritesSurviveSlowStartEffect(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		manager := playback.NewSessionManager(0, 0)
+		file := &models.MediaFile{ID: 91, FilePath: "/media/movie.mkv", FileSize: 1}
+		session, err := manager.StartSession(1, "profile-1", file.ID, playback.PlayDirect, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		adminStore := &cancelSensitiveAdminStore{}
+		h := NewPlaybackHandler(manager, testPlaybackFileResolver{file: file})
+		h.AdminStore = adminStore
+		// A start effect that has begun but never settles until canceled: the
+		// teardown's wait blocks the full timeout before the durable writes.
+		state := &playbackStartSideEffectsStateV3{
+			ctx:     context.Background(),
+			cancel:  func() {},
+			done:    make(chan struct{}),
+			started: true,
+		}
+		h.v3StartEffectsPending = map[string]*playbackStartSideEffectsStateV3{session.ID: state}
+
+		h.finalizeSessionStopWithResult(context.Background(), session, false, "", true)
+
+		if !adminStore.deleted[session.ID] {
+			t.Fatalf("durable session delete did not run after a slow start effect (calls=%d)", adminStore.deleteCalls)
+		}
+	})
 }
