@@ -246,6 +246,15 @@ func (t *playbackStartTimingsV3) log(ctx context.Context, attemptID string) {
 	slog.InfoContext(ctx, "protocol v3 start timing", attrs...)
 }
 
+// The phases added after the original split, named as constants so their
+// repeated use at the recorder call sites stays a single source of truth.
+const (
+	transportPhasePersistV3    = "transport_persist"
+	transportPhaseAuthorityV3  = "transport_authority"
+	transportPhaseCapabilityV3 = "transport_capability"
+	transportPhaseManifestV3   = "transport_manifest"
+)
+
 // transportPhaseNamesV3 is the fixed, ordered phase set the transport commit is
 // split into. Ordering keeps the emitted attributes stable across requests so a
 // log processor can diff two starts field by field.
@@ -257,6 +266,14 @@ var transportPhaseNamesV3 = []string{
 	"transport_spawn",
 	"transport_readiness",
 	"transport_remote_ready",
+	// The durable-write, authority-write, capability-probe, and manifest-poll
+	// spans below were left dark by the original split: they are on the start
+	// critical path but no phase named them. Appended after the original set so
+	// the existing fields keep their position and a log processor can diff.
+	transportPhasePersistV3,
+	transportPhaseAuthorityV3,
+	transportPhaseCapabilityV3,
+	transportPhaseManifestV3,
 }
 
 // transportPhaseTimingsV3 accumulates the wall time of the transport-commit
@@ -322,6 +339,18 @@ func addTransportPhaseDurationV3(ctx context.Context, phase string, d time.Durat
 	recorder.mu.Lock()
 	recorder.phases[phase] += d
 	recorder.mu.Unlock()
+}
+
+// recordTransportPhaseNetOfV3 records the wall time since start under outer,
+// net of any time inner accumulated during the same span. A caller passes the
+// inner total it read before the span began so the enclosing phase stays
+// disjoint from the phase that names work it performed inline. The subtraction
+// floors at zero (addTransportPhaseDurationV3 clamps a negative duration), so a
+// clock or ordering surprise degrades to the full outer span rather than a
+// nonsensical negative millisecond.
+func recordTransportPhaseNetOfV3(ctx context.Context, outer string, start time.Time, inner string, innerBefore time.Duration) {
+	innerDelta := transportPhaseDurationV3(ctx, inner) - innerBefore
+	addTransportPhaseDurationV3(ctx, outer, time.Since(start)-innerDelta)
 }
 
 // transportPhaseDurationV3 reads the wall time accumulated for one phase on the
@@ -620,6 +649,12 @@ func (h *PlaybackHandler) localToneMapCapabilitiesCachedV3(ctx context.Context) 
 }
 
 func (h *PlaybackHandler) localToneMapCapabilitiesForTransportV3(ctx context.Context) (tonemap.Capabilities, error) {
+	// The transport-time local tone-map probe is a hardware walk that can take
+	// seconds on a cold device set. It was uncovered by the original split, so
+	// name it as its own capability phase on the request recorder. The startup
+	// warmup calls the cached variant on a context without a recorder and is
+	// unaffected.
+	defer recordTransportPhaseV3(ctx, transportPhaseCapabilityV3, time.Now())
 	probeCtx, cancel := context.WithTimeout(ctx, h.localToneMapProbeTimeoutV3())
 	defer cancel()
 	return h.localToneMapCapabilitiesV3(probeCtx)
@@ -753,6 +788,11 @@ func (h *PlaybackHandler) lookupRemoteTransformationsV3(ctx context.Context, nod
 // lookupRemoteCapabilitiesV3 fetches and jointly caches a node's transformation
 // and tone-map inventory, optionally reusing short-lived fetch failures.
 func (h *PlaybackHandler) lookupRemoteCapabilitiesV3(ctx context.Context, nodeURL string, honorCachedFailure bool) (v3NodeCapabilityCache, error) {
+	// A remote capability read is a node round-trip on the start path that the
+	// original split left dark. Record it as its own phase wherever the request
+	// carries a recorder; a background refresh or warmup runs on a context
+	// without one, so it pays nothing and stays out of the request's phases.
+	defer recordTransportPhaseV3(ctx, transportPhaseCapabilityV3, time.Now())
 	// Canonical here and in RefreshNodeCapabilitiesV3, which are the two ways
 	// into these maps; everything below is reached from one of them and so is
 	// already keyed the same way.
@@ -3576,12 +3616,20 @@ func (h *PlaybackHandler) startPlannedPlaybackV3(r *http.Request, userID int, pr
 		slog.WarnContext(r.Context(), "protocol v3 start: audio selection intent not recorded on the session",
 			"component", "api", "session", session.ID, "error", err)
 	}
+	// The durable session-state and attempt writes are on the start critical
+	// path but were uncovered by the original phase split: session creation and
+	// the attempt record are what session_transport_commit measured without
+	// naming. Time both writes as one persist phase, recording exactly once on
+	// each exit path so the two durable writes are never double-counted.
+	persistStart := time.Now()
 	if err := h.updateV3SessionState(r.Context(), session, effectiveFile, result, transport, mode); err != nil {
+		recordTransportPhaseV3(r.Context(), transportPhasePersistV3, persistStart)
 		transport.rollback()
 		abort()
 		return playback.DecisionResponseV3{}, &transportErrorV3{reason: "internal_error", message: "Failed to commit the live playback session.", cause: err}
 	}
 	if err := h.PlanStoreV3.SaveAttempt(r.Context(), record); err != nil {
+		recordTransportPhaseV3(r.Context(), transportPhasePersistV3, persistStart)
 		transport.rollback()
 		abort()
 		if errors.Is(err, playback.ErrPlaybackAttemptExistsV3) || errors.Is(err, playback.ErrIdempotencyKeyReusedV3) {
@@ -3604,6 +3652,7 @@ func (h *PlaybackHandler) startPlannedPlaybackV3(r *http.Request, userID int, pr
 		}
 		return playback.DecisionResponseV3{}, &transportErrorV3{reason: "internal_error", message: "Failed to persist the playback plan.", cause: err}
 	}
+	recordTransportPhaseV3(r.Context(), transportPhasePersistV3, persistStart)
 	if commitErr := transport.commit(); commitErr != nil {
 		abort()
 		return playback.DecisionResponseV3{}, commitErr
@@ -3850,9 +3899,15 @@ func (h *PlaybackHandler) prepareTransportWithPolicyAndExclusionsV3(
 			slog.WarnContext(r.Context(), "protocol v3 transport route loop reached time budget", logComponentKey, playbackLogValueV3, "elapsed_ms", time.Since(loopStartedAt).Milliseconds(), "attempts", attempts)
 			break
 		}
+		// The route resolver fans out per-node capability lookups to build its
+		// eligibility predicate, and those record transport_capability inside
+		// this span. Record route net of that delta so the two phases stay
+		// disjoint: the node probes are named as capability, the pure routing
+		// decision as route.
 		routeStart := time.Now()
+		capabilityBefore := transportPhaseDurationV3(r.Context(), transportPhaseCapabilityV3)
 		decision := h.resolveHLSRouteWithPolicyV3(r.Context(), session, result, policy, proxyAllowed, excludedNodes, excludedShapes)
-		recordTransportPhaseV3(r.Context(), "transport_route", routeStart)
+		recordTransportPhaseNetOfV3(r.Context(), "transport_route", routeStart, transportPhaseCapabilityV3, capabilityBefore)
 		if !decision.Selected() {
 			if canRetrySoftwareToneMapV3(result) {
 				if fallback, attempted, fallbackErr := h.prepareSoftwareToneMapFallbackWithPolicyV3(r, session, file, result, mode, policy); attempted {
@@ -4899,6 +4954,12 @@ func (h *PlaybackHandler) putProxyGrantV3(ctx context.Context, sessionID string,
 	if h.ProxyGrantStore == nil || !h.ProxyGrantStore.Enabled() || sessionID == "" {
 		return nil, false
 	}
+	// The proxy grant is this session's egress authority: a durable store
+	// round-trip on the start path that the original split did not name. Record
+	// it as the authority phase. grantManifestURLV3 stores through here, so its
+	// write is covered by this same span rather than wrapped again. A disabled
+	// store returns before this, so a no-op never inflates the phase.
+	defer recordTransportPhaseV3(ctx, transportPhaseAuthorityV3, time.Now())
 	prior, hadPrior := h.ProxyGrantStore.Get(ctx, sessionID)
 	if !hadPrior {
 		prior = nil
@@ -4978,6 +5039,11 @@ func (h *PlaybackHandler) putRequiredNodeRecipeV3(ctx context.Context, transport
 	if h == nil || h.NodeRecipeStore == nil || !h.NodeRecipeStore.Enabled() || transportID == "" {
 		return errors.New("node recipe store unavailable")
 	}
+	// The required node recipe is route admission, so this durable write is on
+	// the start path and uncovered by the original split. Record it as the
+	// authority phase. An unavailable store returns before this, so the failed
+	// admission is not charged to the phase.
+	defer recordTransportPhaseV3(ctx, transportPhaseAuthorityV3, time.Now())
 	putCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), nodeRecipeWriteTimeoutV3)
 	defer cancel()
 	return h.NodeRecipeStore.Put(putCtx, transportID, card)
@@ -5672,16 +5738,21 @@ type localTransportStartupFailureV3 struct {
 // returned so every caller gets the same startup cleanup behavior.
 func (h *PlaybackHandler) startReadyLocalPlaybackTransportV3(ctx context.Context, opts playback.TranscodeOpts) (*playback.TranscodeSession, *localTransportStartupFailureV3) {
 	startedAt := time.Now()
-	// Spawn is recorded net of the virtual upstream reopen it performs inline:
-	// resolving the session-bound provider URL to a relay registration is the
-	// "upstream reopen" phase, and counting it twice would make the two phases
-	// overlap. For a local file the resolve is a no-op and spawn keeps the whole
-	// span.
+	// Spawn is recorded net of the virtual upstream reopen and the virtual
+	// transport's inline manifest wait, both of which the launch performs
+	// before it returns: resolving the session-bound provider URL to a relay
+	// registration is the "upstream reopen" phase, and awaiting the first
+	// manifest is the "manifest" phase, so counting either twice would make the
+	// phases overlap. For a local file both are no-ops and spawn keeps the
+	// whole span.
 	upstreamBefore := transportPhaseDurationV3(ctx, "transport_upstream")
+	manifestBefore := transportPhaseDurationV3(ctx, transportPhaseManifestV3)
 	ts, err := h.startLocalPlaybackTransport(ctx, opts)
 	spawnFinishedAt := time.Now()
 	addTransportPhaseDurationV3(ctx, "transport_spawn",
-		spawnFinishedAt.Sub(startedAt)-(transportPhaseDurationV3(ctx, "transport_upstream")-upstreamBefore))
+		spawnFinishedAt.Sub(startedAt)-
+			(transportPhaseDurationV3(ctx, "transport_upstream")-upstreamBefore)-
+			(transportPhaseDurationV3(ctx, transportPhaseManifestV3)-manifestBefore))
 	if err != nil {
 		slog.InfoContext(ctx, "playback transport startup timing",
 			logComponentKey, playbackLogValueV3,
@@ -5702,7 +5773,13 @@ func (h *PlaybackHandler) startReadyLocalPlaybackTransportV3(ctx context.Context
 		}
 		return nil, &localTransportStartupFailureV3{cause: err, failedToStart: true}
 	}
-	if _, err := ts.WaitForManifestContext(ctx, playback.ManifestStartupTimeout); err != nil {
+	// The local first-manifest wait is this request's readiness phase. Report
+	// how many poll iterations it ran too: the duration says how long the
+	// client waited, and the count separates a manifest that appeared promptly
+	// from one that rode the deadline out. The count is additive log
+	// observation; the wait and its result are unchanged.
+	_, manifestPolls, manifestErr := ts.WaitForManifestContextPolls(ctx, playback.ManifestStartupTimeout)
+	if manifestErr != nil {
 		recordTransportPhaseV3(ctx, "transport_readiness", spawnFinishedAt)
 		slog.InfoContext(ctx, "playback transport startup timing",
 			logComponentKey, playbackLogValueV3,
@@ -5711,11 +5788,12 @@ func (h *PlaybackHandler) startReadyLocalPlaybackTransportV3(ctx context.Context
 			"session", opts.SessionID,
 			"spawn_ms", spawnFinishedAt.Sub(startedAt).Milliseconds(),
 			"manifest_wait_ms", time.Since(spawnFinishedAt).Milliseconds(),
+			"manifest_polls", manifestPolls,
 			"total_ms", time.Since(startedAt).Milliseconds(),
 			"outcome", "readiness_failed",
 		)
 		failure := &localTransportStartupFailureV3{
-			cause:        err,
+			cause:        manifestErr,
 			wasRunning:   ts.IsRunning(),
 			failedDevice: ts.Opts().HWDevice,
 		}
@@ -5730,6 +5808,7 @@ func (h *PlaybackHandler) startReadyLocalPlaybackTransportV3(ctx context.Context
 		"session", opts.SessionID,
 		"spawn_ms", spawnFinishedAt.Sub(startedAt).Milliseconds(),
 		"manifest_wait_ms", time.Since(spawnFinishedAt).Milliseconds(),
+		"manifest_polls", manifestPolls,
 		"total_ms", time.Since(startedAt).Milliseconds(),
 		"outcome", transportStartupReadyV3,
 	)
@@ -5771,10 +5850,12 @@ func (h *PlaybackHandler) startReadyAutoLocalPlaybackTransportV3(ctx context.Con
 		Start: func(ctx context.Context, opts playback.TranscodeOpts) (*playback.TranscodeSession, error) {
 			attempts++
 			upstreamBefore := transportPhaseDurationV3(ctx, "transport_upstream")
+			manifestBefore := transportPhaseDurationV3(ctx, transportPhaseManifestV3)
 			spawnStart := time.Now()
 			session, startErr := h.startLocalPlaybackTransport(ctx, opts)
 			upstreamDelta := transportPhaseDurationV3(ctx, "transport_upstream") - upstreamBefore
-			addTransportPhaseDurationV3(ctx, "transport_spawn", time.Since(spawnStart)-upstreamDelta)
+			manifestDelta := transportPhaseDurationV3(ctx, transportPhaseManifestV3) - manifestBefore
+			addTransportPhaseDurationV3(ctx, "transport_spawn", time.Since(spawnStart)-upstreamDelta-manifestDelta)
 			return session, startErr
 		},
 	})
