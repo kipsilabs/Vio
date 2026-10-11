@@ -98,7 +98,7 @@ else
 fi
 
 grep -q 'frontend-dist-' .github/workflows/docker.yml \
-  && grep -q 'actions/download-artifact@v4' .github/workflows/docker.yml \
+  && grep -Eq 'actions/download-artifact@v[0-9]+' .github/workflows/docker.yml \
   && pass "docker workflow deduplicated manual frontend builds" \
   || reject "docker workflow missing deduplicated manual frontend build artifact handoff"
 
