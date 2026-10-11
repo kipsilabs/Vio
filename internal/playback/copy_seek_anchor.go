@@ -437,6 +437,44 @@ func ResolveCopySeekAnchorForSource(
 	}
 }
 
+// LookupCachedCopySeekAnchor answers a copy-video seek from the shared anchor
+// cache without resolving a probe input. It applies exactly the same
+// proven-interval rules as ResolveCopySeekAnchorForSource's fast path: it
+// returns true only when requestedSeekSeconds lies strictly inside an interval
+// a prior probe already covered (anchor < requested < maxRequested), so the
+// exact observed boundary and any unproven position still probe.
+//
+// It exists so a caller that would otherwise resolve a pinned relay URL before
+// probing can skip that reopen entirely when the anchor is already proven: a
+// cache hit needs no bytes to read. sourceIdentity is the same stable identity
+// ResolveCopySeekAnchorForSource keys on; an empty identity cannot be answered
+// without probing and returns false, so the caller falls through to a probe. The
+// anchor is never resolved across a different source identity or segment
+// duration.
+func LookupCachedCopySeekAnchor(
+	ffmpegPath string,
+	sourceIdentity string,
+	requestedSeekSeconds float64,
+	segmentDuration int,
+) (float64, int, bool) {
+	if requestedSeekSeconds <= 0 {
+		return 0, 0, false
+	}
+	identity := strings.TrimSpace(sourceIdentity)
+	if identity == "" {
+		return 0, 0, false
+	}
+	if segmentDuration <= 0 {
+		segmentDuration = DefaultSegmentDuration
+	}
+	sourceKey := copySeekAnchorSourceKey(ResolveFFmpegPath(ffmpegPath), identity, segmentDuration)
+	anchor, ok := copySeekAnchors.lookup(sourceKey, requestedSeekSeconds)
+	if !ok {
+		return 0, 0, false
+	}
+	return anchor.seconds, anchor.segment, true
+}
+
 // copySeekProbeTimeoutFor derives one probe's timeout from the caller's
 // remaining deadline. The probe must not outlive the request by a full probe
 // timeout: a resumed session's provider re-list can consume most of the replan
@@ -475,6 +513,14 @@ func resolveCopySeekAnchor(
 	cmd := exec.CommandContext(ctx, ffmpegPath,
 		"-v", "error",
 		"-fflags", "+genpts+fastseek",
+		// The probe must observe the packet the remux transport will actually
+		// copy, so its demuxer caps match the transport's (see
+		// buildRemuxArgsWithLeadingPictureDropV3: probesize 5000000,
+		// analyzeduration 3000000). A probe-scoped reduction was considered as a
+		// #279 latency lever and rejected: a smaller probe can select a
+		// different stream or seek point than the muxer, so the returned anchor
+		// would no longer be the copied packet's timestamp and copy-seek
+		// frame-exactness would be lost.
 		"-analyzeduration", "3000000",
 		"-probesize", "5000000",
 		"-ss", fmt.Sprintf("%.3f", requestedSeekSeconds),

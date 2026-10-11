@@ -4125,6 +4125,27 @@ func (h *PlaybackHandler) waitCopySeekAnchorBackoff(ctx context.Context, remaini
 	}
 }
 
+// lookupCachedCopySeekAnchorV3 answers a remux copy seek from the shared anchor
+// cache without resolving the source, so a proven cache hit skips the eager
+// pinned-relay reopen and the FFmpeg probe. It returns true only for a position
+// strictly inside an interval a prior probe already proved; the exact observed
+// boundary and any unproven position fall through to a fresh probe, so seek
+// accuracy is unchanged. A test that installs its own probe seam
+// (copySeekAnchor) without a lookup seam owns the whole anchor path, so the
+// process-wide cache is bypassed there and the injected probe still runs.
+func (h *PlaybackHandler) lookupCachedCopySeekAnchorV3(ffmpegPath, sourceIdentity string, requestedSeekSeconds float64, segmentDuration int) (float64, int, bool) {
+	if h == nil {
+		return 0, 0, false
+	}
+	if h.copySeekAnchorLookup != nil {
+		return h.copySeekAnchorLookup(ffmpegPath, sourceIdentity, requestedSeekSeconds, segmentDuration)
+	}
+	if h.copySeekAnchor != nil {
+		return 0, 0, false
+	}
+	return playback.LookupCachedCopySeekAnchor(ffmpegPath, sourceIdentity, requestedSeekSeconds, segmentDuration)
+}
+
 func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, session *playback.Session, file *models.MediaFile, result playback.PlannerResultV3) (preparedTimelineV3, *transportErrorV3) {
 	// The copy-video seek anchor is resolved here, before any route is selected
 	// or FFmpeg spawned. Attribute its cost to its own phase so a seek start's
@@ -4148,6 +4169,24 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 		if requested > 0 {
 			if file == nil || strings.TrimSpace(file.FilePath) == "" {
 				return preparedTimelineV3{}, &transportErrorV3{reason: transcodeStartFailedReasonV3, message: "Failed to resolve remux seek position.", retryable: true, cause: errors.New("copy seek anchor requires a media file path")}
+			}
+			// The stable source identity is the un-resolved file path: for a
+			// virtual file that is the provider-neutral URI, identical across
+			// concurrent starts even though each start pins its own relay URL.
+			// Cache and singleflight key on it so identical probes coalesce
+			// and survive across requests.
+			sourceIdentity := file.FilePath
+			ffmpegPath := h.playbackConfig().FFmpegPath
+			// A prior probe may already have proven this position's keyframe.
+			// The pinned-relay resolve and the FFmpeg probe below are then pure
+			// overhead: a cache hit needs no bytes to read. Consult the cache
+			// first and, on a proven hit, skip the eager relay reopen entirely.
+			// Only a position strictly inside a probed interval answers (the
+			// exact observed boundary still re-probes), so seek accuracy is
+			// unchanged.
+			if cachedOrigin, cachedSegment, ok := h.lookupCachedCopySeekAnchorV3(ffmpegPath, sourceIdentity, requested, playback.DefaultSegmentDuration); ok {
+				configureCopyRemuxTimelineV3(result.Plan, cachedOrigin)
+				return preparedTimelineV3{seekSeconds: requested, streamOriginSeconds: cachedOrigin, startSegmentNumber: cachedSegment, copySeekAnchorResolved: true}, nil
 			}
 			// Virtual sources are provider-neutral URIs, not FFmpeg inputs.
 			// Resolve the candidate to a pinned-IP relay URL — the same
@@ -4213,18 +4252,11 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 					refreshCancel()
 				}
 			}
-			// The stable source identity is the un-resolved file path: for a
-			// virtual file that is the provider-neutral URI, identical across
-			// concurrent starts even though each start pins its own relay URL.
-			// Cache and singleflight key on it so identical probes coalesce
-			// and survive across requests.
-			sourceIdentity := file.FilePath
-			ffmpegPath := h.playbackConfig().FFmpegPath
 			probeAnchor := func(probeCtx context.Context) (float64, int, error) {
 				if h.copySeekAnchor != nil {
-					return h.copySeekAnchor(probeCtx, ffmpegPath, anchorInput, requested, 2)
+					return h.copySeekAnchor(probeCtx, ffmpegPath, anchorInput, requested, playback.DefaultSegmentDuration)
 				}
-				return playback.ResolveCopySeekAnchorForSource(probeCtx, ffmpegPath, sourceIdentity, anchorInput, requested, 2)
+				return playback.ResolveCopySeekAnchorForSource(probeCtx, ffmpegPath, sourceIdentity, anchorInput, requested, playback.DefaultSegmentDuration)
 			}
 			// Virtual upstreams occasionally serve a range request slowly
 			// enough to blow the anchor probe budget. One bounded retry

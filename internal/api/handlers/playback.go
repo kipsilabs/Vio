@@ -572,6 +572,12 @@ type PlaybackHandler struct {
 	PlaybackConfig func() config.PlaybackConfig
 	FFmpegLogSink  playback.FFmpegLogSink
 	copySeekAnchor copySeekAnchorResolver
+	// copySeekAnchorLookup is a test seam for the lazy copy-video seek-anchor
+	// cache lookup that lets a proven cache hit skip the eager pinned-relay
+	// reopen. Nil uses the process-wide anchor cache. A test that installs
+	// copySeekAnchor without this seam owns the whole anchor path, so the
+	// process-wide cache is bypassed and its injected probe still runs.
+	copySeekAnchorLookup func(ffmpegPath string, sourceIdentity string, requestedSeekSeconds float64, segmentDuration int) (float64, int, bool)
 	// copySeekAnchorBackoff is a test seam for the bounded pause before
 	// retrying the same candidate after a transient provider (upstream 5xx)
 	// anchor failure. Nil uses the real timer wait.
