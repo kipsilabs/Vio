@@ -2031,17 +2031,12 @@ func (h *PlaybackHandler) unionVirtualRotationExclusionsWithRecord(transient []s
 	return merged
 }
 
-// rotationRejectionChain returns the durable exclusion candidate ids recorded
-// under the anchor's identity, or nil when no chain exists. The chain is kept
-// on the in-memory attempt record so a replan can union it without a store
-// round-trip; the store remains the durable writer.
-func (h *PlaybackHandler) rotationRejectionChain(row *models.MediaFile, identity virtuallibrary.PersistedCandidateIdentity) []string {
-	return h.rotationRejectionChainWithRecord(row, identity, nil)
-}
-
-// rotationRejectionChainWithRecord is rotationRejectionChain with the caller's
-// live attempt record threaded through. A nil record falls back to the
-// file-path store lookup for callers that own no attempt.
+// rotationRejectionChainWithRecord returns the durable exclusion candidate
+// ids recorded under the anchor's identity, or nil when no chain exists.
+// The chain is read from the caller's live attempt record when one is
+// threaded through (replan rehydration); a nil record falls back to a
+// file-path store lookup for callers that own no attempt. The store remains
+// the durable writer.
 func (h *PlaybackHandler) rotationRejectionChainWithRecord(row *models.MediaFile, identity virtuallibrary.PersistedCandidateIdentity, record *playback.AttemptRecordV3) []string {
 	if h == nil || h.PlanStoreV3 == nil {
 		return nil
