@@ -116,6 +116,13 @@ type Session struct {
 	// so an inventory reader can distinguish an unfinished probe from one that
 	// terminally failed and let the client leave its loading state either way.
 	VirtualProbeOutcome string
+	// virtualProbeArmedAt is the instant the deferred probe lifecycle for the
+	// current binding generation entered pending. It bounds the pending state:
+	// the handler's convergence watchdog fails a session whose pending outcome
+	// has been outstanding past the bound, so a probe no worker will finish can
+	// never leave a client waiting forever. Zero means no deferred lifecycle is
+	// outstanding (empty, verified, or failed).
+	virtualProbeArmedAt time.Time
 	// VirtualSubtitleEvidenceURI names the provider-neutral candidate the
 	// evidence above was captured for. It is the provenance anchor: evidence
 	// may only be applied to a file bound to the same candidate, and a
@@ -1463,6 +1470,7 @@ func applySessionStreamStateLocked(s *Session, state SessionStreamState) {
 		// binding. A fresh-start resolve re-arms it to pending at spawn time.
 		if state.VirtualSourceOwnershipSet {
 			s.VirtualProbeOutcome = ""
+			s.virtualProbeArmedAt = time.Time{}
 		}
 		if state.VirtualSubtitleEvidenceSet {
 			s.VirtualSubtitleTracks = state.VirtualSubtitleTracks
@@ -1682,6 +1690,7 @@ func (m *SessionManager) setVirtualSourceLocked(s *Session, virtualURI string, o
 	// A binding move starts a fresh probe lifecycle: whatever outcome the
 	// previous candidate's deferred probe reached says nothing about this one.
 	s.VirtualProbeOutcome = ""
+	s.virtualProbeArmedAt = time.Time{}
 	s.VirtualSourceURI = trimmed
 	s.VirtualSourceOwnerInstallationID = ownerInstallationID
 	s.streamRevision++
@@ -1716,8 +1725,23 @@ func (m *SessionManager) SetVirtualProbeOutcome(sessionID, outcome string) error
 	if !ok {
 		return ErrSessionNotFound
 	}
-	s.VirtualProbeOutcome = outcome
+	setVirtualProbeOutcomeLocked(s, outcome)
 	return nil
+}
+
+// setVirtualProbeOutcomeLocked writes the deferred-probe outcome and keeps the
+// convergence timestamp in step: entering pending stamps the armed instant,
+// and any other value (verified, failed, empty) clears it. Caller holds m.mu.
+func setVirtualProbeOutcomeLocked(s *Session, outcome string) {
+	if s == nil {
+		return
+	}
+	s.VirtualProbeOutcome = outcome
+	if outcome == VirtualProbeOutcomePending {
+		s.virtualProbeArmedAt = time.Now()
+		return
+	}
+	s.virtualProbeArmedAt = time.Time{}
 }
 
 // SetVirtualProbeOutcomeIfGeneration records a deferred probe's outcome on the
@@ -1745,7 +1769,7 @@ func (m *SessionManager) SetVirtualProbeOutcomeIfGeneration(sessionID string, ge
 	if s.virtualSourceGeneration != generation {
 		return false, nil
 	}
-	s.VirtualProbeOutcome = outcome
+	setVirtualProbeOutcomeLocked(s, outcome)
 	return true, nil
 }
 
@@ -1773,7 +1797,73 @@ func (m *SessionManager) ArmVirtualProbePendingIfGeneration(sessionID string, ge
 		// duplicate admission owns nothing and must not restart it.
 		return false, nil
 	}
-	s.VirtualProbeOutcome = VirtualProbeOutcomePending
+	setVirtualProbeOutcomeLocked(s, VirtualProbeOutcomePending)
+	return true, nil
+}
+
+// VirtualProbePendingSessions returns up to limit live sessions whose deferred
+// probe is still pending and was armed at or before cutoff. It is the read side
+// of the convergence watchdog: a session listed here has been waiting longer
+// than the caller's bound without reaching a terminal outcome, and the caller
+// fails it so a client can leave the loading state. A session that already
+// reached verified or failed, or was never armed, is not returned. The read
+// holds the session lock but stops at limit, so the snapshot is always bounded
+// regardless of fleet size; an empty outcome (no deferred lifecycle) and a
+// future armed time are both skipped.
+func (m *SessionManager) VirtualProbePendingSessions(cutoff time.Time, limit int) []VirtualProbeTerminalSession {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if limit <= 0 {
+		return nil
+	}
+	var result []VirtualProbeTerminalSession
+	for _, s := range m.sessions {
+		if len(result) >= limit {
+			break
+		}
+		if s.VirtualProbeOutcome != VirtualProbeOutcomePending {
+			continue
+		}
+		if s.virtualProbeArmedAt.IsZero() || s.virtualProbeArmedAt.After(cutoff) {
+			continue
+		}
+		fileID := s.MediaFileID
+		if fileID <= 0 {
+			fileID = s.RequestedMediaFileID
+		}
+		result = append(result, VirtualProbeTerminalSession{SessionID: s.ID, FileID: fileID, Generation: s.virtualSourceGeneration})
+	}
+	return result
+}
+
+// FailVirtualProbeIfPendingIfGeneration terminally fails a deferred probe
+// lifecycle that is still pending and was armed at or before cutoff, only while
+// the binding is still the generation the probe was admitted against. It is the
+// convergence watchdog's compare-and-swap: it fires from pending to failed and
+// from no other outcome, so it can never overwrite a verdict a probe worker
+// already recorded (verified or failed), and a rotation that landed while the
+// probe was outstanding leaves the replacement binding to its own lifecycle. It
+// reports whether the failure write landed. An unknown session reports
+// ErrSessionNotFound and writes nothing.
+func (m *SessionManager) FailVirtualProbeIfPendingIfGeneration(sessionID string, generation uint64, cutoff time.Time) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		return false, ErrSessionNotFound
+	}
+	if s.virtualSourceGeneration != generation {
+		return false, nil
+	}
+	if s.VirtualProbeOutcome != VirtualProbeOutcomePending {
+		return false, nil
+	}
+	if s.virtualProbeArmedAt.IsZero() || s.virtualProbeArmedAt.After(cutoff) {
+		return false, nil
+	}
+	setVirtualProbeOutcomeLocked(s, VirtualProbeOutcomeFailed)
 	return true, nil
 }
 
