@@ -2052,6 +2052,26 @@ func (h *PlaybackHandler) touchSessionActivity(sessionID string) {
 	}
 }
 
+// sessionTeardownTimeout bounds a detached session teardown. The local live
+// session is removed first, so the durable half (synced-session row, attempt
+// stop, deny marker, history) must finish even when the request that triggered
+// the teardown is already gone; otherwise a client-canceled stream — a track
+// switch aborts the old transport and replans — can leave the session stranded:
+// gone locally but live on every other replica and in the client's hands.
+const sessionTeardownTimeout = 15 * time.Second
+
+// teardownContext detaches durable session teardown from the request that
+// triggered it. A teardown path reached from a canceled request must still
+// complete its durable writes; the request's logging and tracing values are
+// kept, its cancellation is dropped, and a wedged store is bounded rather than
+// leaking the goroutine.
+func teardownContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithTimeout(context.WithoutCancel(ctx), sessionTeardownTimeout)
+}
+
 func (h *PlaybackHandler) finalizeSessionStop(ctx context.Context, session *playback.Session, syncNow bool, syncReason string, userInitiated bool) {
 	h.finalizeSessionStopWithResult(ctx, session, syncNow, syncReason, userInitiated)
 }
@@ -2062,9 +2082,8 @@ func (h *PlaybackHandler) finalizeSessionStopWithResult(ctx context.Context, ses
 	if h == nil || session == nil || session.ID == "" {
 		return watchstate.PlaybackStopResult{}
 	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	ctx, cancel := teardownContext(ctx)
+	defer cancel()
 	h.cancelPlaybackStartSideEffectsV3(ctx, session.ID)
 	// The session is gone: a terminal inventory notification parked behind a
 	// full detached gate would re-publish against a session ID the manager no
@@ -2136,9 +2155,8 @@ func (h *PlaybackHandler) finalizeSessionAbort(ctx context.Context, session *pla
 	if h == nil || session == nil || session.ID == "" {
 		return
 	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	ctx, cancel := teardownContext(ctx)
+	defer cancel()
 	h.cancelPlaybackStartSideEffectsV3(ctx, session.ID)
 
 	if h.WatchScrobbler != nil && h.fileResolver != nil {

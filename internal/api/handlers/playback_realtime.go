@@ -30,6 +30,13 @@ func (h *PlaybackHandler) stopPlaybackSessionWithResult(ctx context.Context, ses
 	if h == nil || session == nil || session.ID == "" {
 		return watchstate.PlaybackStopResult{}, playback.ErrSessionNotFound
 	}
+	// A stop is a teardown: once the live session is removed, the durable half
+	// (authority, transport cancel, deny marker, history) must finish even if
+	// the request that issued the stop is gone. A client that drops the
+	// connection right after its stop, or a canceled DELETE, must not leave a
+	// half-stopped session.
+	ctx, cancelStop := teardownContext(ctx)
+	defer cancelStop()
 	// Replacement preparation holds this lifecycle lock until its new live
 	// session state and durable plan are committed (or rolled back). Wait for
 	// that boundary, then reload the route: callers commonly hold a copy taken

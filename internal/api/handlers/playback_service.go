@@ -789,6 +789,11 @@ func (h *PlaybackHandler) finalizeStopV2(ctx context.Context, store playback.Pro
 // session synthesized from the attempt row otherwise. The deny marker is
 // written in both cases. It returns the watch-history id when one was made.
 func (h *PlaybackHandler) finishStopV2(ctx context.Context, record *playback.AttemptRecordV3, sessionID string, accepted *playback.ProgressSampleV3) string {
+	// Detached and bounded for the same reason as the other teardown paths:
+	// the stop is already durable by the time this runs, so a canceled request
+	// must not skip the deny marker, the final position, or the history writer.
+	ctx, cancel := teardownContext(ctx)
+	defer cancel()
 	h.StreamDeny.Deny(ctx, sessionID)
 	position, paused := 0.0, false
 	if accepted != nil {
@@ -1840,6 +1845,12 @@ func markAttemptStoppedServerSide(ctx context.Context, planStore playback.PlanSt
 	if sessionID == "" {
 		return
 	}
+	// Detached and bounded: a teardown reached from a canceled request (a
+	// client-canceled transport) must still stop the attempt row and write the
+	// deny marker, or the session is stranded half-dead — gone locally but
+	// replayable and still held by the client.
+	ctx, cancel := teardownContext(ctx)
+	defer cancel()
 	deny.Deny(ctx, sessionID)
 	store, ok := planStore.(playback.ProgressStoreV3)
 	if !ok {
