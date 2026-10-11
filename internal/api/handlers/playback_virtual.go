@@ -1937,6 +1937,149 @@ func rehydratedMatchesPersistedIdentity(resolved resolvedVirtualPlaybackSource, 
 	return want != "" && want == got
 }
 
+// virtualRotationExclusionIdentity returns the durable provider identity the
+// rotation-rejection memory is scoped by: the anchor row's own identity when it
+// carries one, otherwise the zero identity. A zero identity means no chain —
+// the rejection memory is per-row durable evidence and only meaningful while
+// the row's identity is stable.
+func virtualRotationExclusionIdentity(row *models.MediaFile) virtuallibrary.PersistedCandidateIdentity {
+	identity, _ := persistedVirtualIdentity(row)
+	return identity
+}
+
+// recordVirtualRotationRefusal durably remembers one rotated candidate that the
+// same-release assertion rejected, so a later replan's rotation retry excludes
+// it instead of replaying the identical substitution. The exclusion is keyed by
+// the anchor's neutral source and the durable identity it was recorded under;
+// the write is best-effort — a store failure degrades to the prior one-shot
+// retry, not a resolve failure.
+func (h *PlaybackHandler) recordVirtualRotationRefusal(ctx context.Context, row *models.MediaFile, candidateID string, identity virtuallibrary.PersistedCandidateIdentity) {
+	h.recordVirtualRotationRefusalWithRecord(ctx, row, candidateID, identity, nil)
+}
+
+// recordVirtualRotationRefusalWithRecord is recordVirtualRotationRefusal with
+// the caller's live attempt record threaded through. The plan store is keyed
+// by session id, not file path, so callers that own the attempt (replan
+// rehydration) pass it directly; other callers pass nil and fall back to a
+// file-path lookup that misses. The revision compare-and-set runs against the
+// committed chain so concurrent replans converge on the union.
+func (h *PlaybackHandler) recordVirtualRotationRefusalWithRecord(ctx context.Context, row *models.MediaFile, candidateID string, identity virtuallibrary.PersistedCandidateIdentity, record *playback.AttemptRecordV3) {
+	if h == nil || row == nil || candidateID == "" || identity == (virtuallibrary.PersistedCandidateIdentity{}) {
+		return
+	}
+	store := h.recoveryStateStoreV3()
+	if store == nil {
+		return
+	}
+	var attempt *playback.AttemptRecordV3
+	if record != nil {
+		attempt = record
+	} else {
+		lookedUp, getErr := h.PlanStoreV3.GetAttempt(ctx, row.FilePath)
+		if getErr != nil || lookedUp == nil {
+			// Without an attempt row there is nowhere durable to record
+			// the refusal, so degrade to the prior one-shot retry.
+			return
+		}
+		attempt = lookedUp
+	}
+	releaseID := resolver.PersistedDedupKey(identity.VideoHash, identity.GUID, identity.ReleaseName, identity.ReleaseSize)
+	exclusion := playback.RecoveryExclusionV3{
+		ProviderSource: virtualPlaybackNeutralKey(row.FilePath),
+		CandidateID:    candidateID,
+		ReleaseID:      releaseID,
+		FileID:         row.ID,
+	}
+	// Reuse the bounded conflict-retry union so concurrent replans converge
+	// instead of dropping all but the first refusal. On a caller-owned record
+	// the merged chain is written back so the union read sees it.
+	merged, appendErr := h.appendRecoveryExclusionsV3(ctx, attempt, []playback.RecoveryExclusionV3{exclusion})
+	if appendErr != nil {
+		slog.WarnContext(ctx, "virtual rotation refusal could not be persisted",
+			"component", "api", "session_anchor", row.FilePath,
+			"status", "rotation_refusal_unpersisted", "new_candidate_id", candidateID,
+			"error", appendErr)
+		return
+	}
+	attempt.RecoveryState = merged
+}
+
+// unionVirtualRotationExclusions merges the caller's transient exclusion list
+// with the durable rotation-rejection chain recorded under the same anchor
+// identity, so each replan retry excludes every candidate the same-release
+// assertion already refused. The result is never written back to the attempt:
+// the chain grows only through an actual refusal. A changed anchor identity
+// yields the transient list unchanged.
+func (h *PlaybackHandler) unionVirtualRotationExclusions(transient []string, row *models.MediaFile, identity virtuallibrary.PersistedCandidateIdentity) []string {
+	return h.unionVirtualRotationExclusionsWithRecord(transient, row, identity, nil)
+}
+
+// unionVirtualRotationExclusionsWithRecord is unionVirtualRotationExclusions
+// with the caller's live attempt record threaded through, so the chain is
+// read from the record the replan owns instead of a file-path store lookup
+// (the plan store is keyed by session id, not file path).
+func (h *PlaybackHandler) unionVirtualRotationExclusionsWithRecord(transient []string, row *models.MediaFile, identity virtuallibrary.PersistedCandidateIdentity, record *playback.AttemptRecordV3) []string {
+	if h == nil || row == nil || identity == (virtuallibrary.PersistedCandidateIdentity{}) {
+		return transient
+	}
+	merged := append([]string(nil), transient...)
+	for _, exclusion := range h.rotationRejectionChainWithRecord(row, identity, record) {
+		if !containsStringExactV3(merged, exclusion) {
+			merged = append(merged, exclusion)
+		}
+	}
+	return merged
+}
+
+// rotationRejectionChain returns the durable exclusion candidate ids recorded
+// under the anchor's identity, or nil when no chain exists. The chain is kept
+// on the in-memory attempt record so a replan can union it without a store
+// round-trip; the store remains the durable writer.
+func (h *PlaybackHandler) rotationRejectionChain(row *models.MediaFile, identity virtuallibrary.PersistedCandidateIdentity) []string {
+	return h.rotationRejectionChainWithRecord(row, identity, nil)
+}
+
+// rotationRejectionChainWithRecord is rotationRejectionChain with the caller's
+// live attempt record threaded through. A nil record falls back to the
+// file-path store lookup for callers that own no attempt.
+func (h *PlaybackHandler) rotationRejectionChainWithRecord(row *models.MediaFile, identity virtuallibrary.PersistedCandidateIdentity, record *playback.AttemptRecordV3) []string {
+	if h == nil || h.PlanStoreV3 == nil {
+		return nil
+	}
+	var attempt *playback.AttemptRecordV3
+	if record != nil {
+		attempt = record
+	} else {
+		var err error
+		attempt, err = h.PlanStoreV3.GetAttempt(context.Background(), row.FilePath)
+		if err != nil || attempt == nil {
+			return nil
+		}
+	}
+	source := virtualPlaybackNeutralKey(row.FilePath)
+	releaseID := resolver.PersistedDedupKey(identity.VideoHash, identity.GUID, identity.ReleaseName, identity.ReleaseSize)
+	var chain []string
+	for _, exclusion := range attempt.RecoveryState.Exclusions {
+		// The chain is identity-gated: only exclusions recorded under the
+		// anchor's CURRENT durable identity (and, when rows collide on a
+		// candidate, the current row) union into the retry. A row whose
+		// identity changed since a refusal was recorded yields nothing, so a
+		// changed inventory invalidates the rejection memory instead of
+		// suppressing a candidate that has since become the bound release.
+		if exclusion.ProviderSource != source {
+			continue
+		}
+		if releaseID == "" || exclusion.ReleaseID != releaseID {
+			continue
+		}
+		if row.ID > 0 && exclusion.FileID > 0 && exclusion.FileID != row.ID {
+			continue
+		}
+		chain = append(chain, exclusion.CandidateID)
+	}
+	return chain
+}
+
 // resolveRehydratedVirtualSourceV3 resolves the session-bound virtual source for
 // a replan rehydration. When the pinned candidate is absent from the provider's
 // current list the resolver refuses with ErrSessionBoundCandidateAbsent; this
@@ -1945,6 +2088,17 @@ func rehydratedMatchesPersistedIdentity(resolved resolvedVirtualPlaybackSource, 
 // binding. The retry is narrowly scoped to that cause: a generic provider or
 // resolve failure is returned unchanged, and a caller that already declared
 // rotation is never retried.
+//
+// A refusal of a rotated candidate is persisted into the attempt's recovery
+// exclusion chain (see recordVirtualRotationRefusal), keyed by the anchor's
+// neutral source and durable identity. The next replan's retry unions that
+// chain into its exclusion list, so each incompatible candidate is tried at
+// most once under the current inventory: the retry either finds a fresh
+// candidate, exhausts the listing and keeps the original absent cause, or hits
+// the live-candidate attempt bound without replaying an already-refused one.
+// A changed anchor identity yields no chain, so a changed inventory
+// invalidates the rejection memory rather than suppressing a candidate that
+// has since become the bound release.
 func (h *PlaybackHandler) resolveRehydratedVirtualSourceV3(
 	r *http.Request,
 	pinnedFile *models.MediaFile,
@@ -1955,6 +2109,27 @@ func (h *PlaybackHandler) resolveRehydratedVirtualSourceV3(
 	bandwidthCapKbps int,
 	opts virtualResolveOptionsV3,
 ) (resolvedVirtualPlaybackSource, error) {
+	return h.resolveRehydratedVirtualSourceWithAttemptV3(r, pinnedFile, profileID, excludedCandidateIDs, preferredCandidateID, qualityPreference, bandwidthCapKbps, opts, nil)
+}
+
+// resolveRehydratedVirtualSourceWithAttemptV3 is resolveRehydratedVirtualSourceV3
+// with the caller's live attempt record threaded through, so a rotation refusal
+// is recorded on the attempt the replan owns instead of re-looking it up by
+// file path (the plan store is keyed by session id, not file path). A nil
+// record degrades to the file-path lookup for callers that own no attempt.
+func (h *PlaybackHandler) resolveRehydratedVirtualSourceWithAttemptV3(
+	r *http.Request,
+	pinnedFile *models.MediaFile,
+	profileID string,
+	excludedCandidateIDs []string,
+	preferredCandidateID string,
+	qualityPreference string,
+	bandwidthCapKbps int,
+	opts virtualResolveOptionsV3,
+	record *playback.AttemptRecordV3,
+) (resolvedVirtualPlaybackSource, error) {
+	chainIdentity := virtualRotationExclusionIdentity(pinnedFile)
+	excludedCandidateIDs = h.unionVirtualRotationExclusionsWithRecord(excludedCandidateIDs, pinnedFile, chainIdentity, record)
 	resolved, err := h.resolveVirtualPlaybackSource(r, pinnedFile, profileID, false, excludedCandidateIDs, preferredCandidateID, qualityPreference, bandwidthCapKbps, false, opts)
 	if err == nil || opts.rotateCandidates || !isRehydratedVirtualSourceRotatableV3(err) {
 		return resolved, err
@@ -1989,6 +2164,7 @@ func (h *PlaybackHandler) resolveRehydratedVirtualSourceV3(
 			"component", "api", "session_anchor", pinnedFile.FilePath,
 			"status", "rotation_refused", "old_candidate_id", virtualResultCandidateID(pinnedFile.FilePath),
 			"new_candidate_id", virtualResultCandidateID(rotated.URI))
+		h.recordVirtualRotationRefusalWithRecord(r.Context(), pinnedFile, virtualResultCandidateID(rotated.URI), chainIdentity, record)
 		return resolved, err
 	}
 	slog.InfoContext(r.Context(), "virtual replan rotated an absent session-bound candidate",
@@ -2039,9 +2215,17 @@ func (h *PlaybackHandler) resolveVirtualAnchorURIWithRotationV3(
 	session *playback.Session,
 	file *models.MediaFile,
 ) (ResolvedVirtualMedia, func(), error) {
+	// Scope note: this path owns no attempt record, so it neither reads nor
+	// persists the rotation-rejection chain — the lookup below and the
+	// refusal record both degrade to the prior one-shot retry. The durable
+	// chain is a replan-rehydration mechanism; transport-anchor churn stays
+	// at one rotation attempt per call, and a later replan records its own
+	// refusal when it retries.
+	chainIdentity := virtualRotationExclusionIdentity(file)
+	excluded := h.unionVirtualRotationExclusions(nil, file, chainIdentity)
 	resolved, cleanup, err := h.resolveVirtualInputURI(
 		ctx, file.FilePath, file.VirtualOwnerInstallationID,
-		session.UserID, session.ProfileID, false, nil, "",
+		session.UserID, session.ProfileID, false, excluded, "",
 	)
 	if err == nil || (!virtualProviderListingOutage(err) && !errors.Is(err, ErrVirtualCandidateMarkedFailed)) {
 		return resolved, cleanup, err
@@ -2053,9 +2237,8 @@ func (h *PlaybackHandler) resolveVirtualAnchorURIWithRotationV3(
 	// provider recovers with the same id.
 	releaseIndicted := errors.Is(err, virtuallibrary.ErrSessionBoundCandidateAbsent) ||
 		errors.Is(err, ErrVirtualCandidateMarkedFailed)
-	var excluded []string
-	if releaseIndicted && pinnedID != "" {
-		excluded = []string{pinnedID}
+	if releaseIndicted && pinnedID != "" && !containsStringExactV3(excluded, pinnedID) {
+		excluded = append(excluded, pinnedID)
 	}
 	// Thread the durable identity explicitly: the retry relists (forceRefresh),
 	// so the stored-row lookup that normally carries the identity is bypassed. A
@@ -2085,6 +2268,7 @@ func (h *PlaybackHandler) resolveVirtualAnchorURIWithRotationV3(
 			"component", "api", "session_anchor", file.FilePath,
 			"status", "rotation_refused", "old_candidate_id", pinnedID,
 			"new_candidate_id", virtualResultCandidateID(rotated.URI))
+		h.recordVirtualRotationRefusal(ctx, file, virtualResultCandidateID(rotated.URI), chainIdentity)
 		return ResolvedVirtualMedia{}, nil, err
 	}
 	slog.InfoContext(ctx, "virtual transport anchor re-resolved the session-bound candidate",
@@ -2102,6 +2286,12 @@ func (h *PlaybackHandler) resolveVirtualAnchorURIWithRotationV3(
 // accepted: like resolveVirtualAnchorURIWithRotationV3 it refuses a silent
 // swap to a different release, so the anchored bytes stay the planned
 // release under a new result id.
+//
+// Scope note: this path owns no attempt record, so it neither reads nor
+// persists the rotation-rejection chain — the union below and the refusal
+// record both degrade to the prior one-shot retry. The durable chain is a
+// replan-rehydration mechanism; a refusal here keeps the original cause and
+// a later replan records its own refusal when it retries.
 func (h *PlaybackHandler) resolveVirtualAnchorURIExcludingFailedV3(
 	ctx context.Context,
 	session *playback.Session,
@@ -2114,10 +2304,12 @@ func (h *PlaybackHandler) resolveVirtualAnchorURIExcludingFailedV3(
 	// Thread the durable identity explicitly, mirroring the absent-pin
 	// rotation: the retry relists, so the stored-row lookup that normally
 	// carries the identity is bypassed.
+	chainIdentity := virtualRotationExclusionIdentity(file)
+	excluded := h.unionVirtualRotationExclusions([]string{excludeResultID}, file, chainIdentity)
 	retryCtx := virtualResolveContextWithPersistedIdentity(ctx, file)
 	rotated, rotatedCleanup, rotateErr := h.resolveVirtualInputURI(
 		retryCtx, file.FilePath, file.VirtualOwnerInstallationID,
-		session.UserID, session.ProfileID, true, []string{excludeResultID}, "", true,
+		session.UserID, session.ProfileID, true, excluded, "", true,
 	)
 	if rotateErr != nil {
 		return rotated, rotatedCleanup, rotateErr
@@ -2130,6 +2322,7 @@ func (h *PlaybackHandler) resolveVirtualAnchorURIExcludingFailedV3(
 			"component", "api", "session_anchor", file.FilePath,
 			"status", "rotation_refused", "excluded_candidate_id", excludeResultID,
 			"new_candidate_id", virtualResultCandidateID(rotated.URI))
+		h.recordVirtualRotationRefusal(ctx, file, virtualResultCandidateID(rotated.URI), chainIdentity)
 		return ResolvedVirtualMedia{}, nil, errors.New("virtual anchor rotation found no same-identity alternate")
 	}
 	slog.InfoContext(ctx, "virtual transport anchor rotated past a failed candidate",

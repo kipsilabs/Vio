@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -1925,7 +1926,7 @@ func TestPrepareTransportV3ClassifiesExhaustedRemoteLiveValidation(t *testing.T)
 			)
 			if transportErr == nil || transportErr.reason != transcodeStartFailedReasonV3 || transportErr.retryable != tt.wantRetryable ||
 				(tt.wantCause != nil && !errors.Is(transportErr.cause, tt.wantCause)) ||
-				(tt.wantCause == nil && transportErr.cause != nil) {
+				(tt.wantCause == nil && transportErr.cause != nil && !strings.Contains(transportErr.cause.Error(), fmt.Sprintf("node returned status %d", tt.status))) {
 				t.Fatalf("transport error = %#v, want retryable=%t wrapping %v", transportErr, tt.wantRetryable, tt.wantCause)
 			}
 		})

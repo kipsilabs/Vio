@@ -9,6 +9,11 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/Silo-Server/silo-server/internal/nodepool"
+	"github.com/Silo-Server/silo-server/internal/playback"
+	"github.com/Silo-Server/silo-server/internal/tonemap"
+	"github.com/Silo-Server/silo-server/internal/transcodenode"
 )
 
 // A capability lookup overtaken by an invalidation was handing the caller the
@@ -126,4 +131,162 @@ func TestRefreshNodeCapabilitiesKeepsTheLearnedProbeBudget(t *testing.T) {
 	// so the background goroutine does not outlive the test that started it.
 	release()
 	waitForCachedNodeCapabilitiesV3(t, handler, node.URL)
+}
+
+// TestPrepareTransportV3SkipsNodeMissingToneMapSupports verifies that a plan
+// whose frozen tone map requires hardware PQ only routes to a node that
+// advertises that exact Supports mode and kind, never to a sibling that
+// advertises the transformation but only supports software PQ.
+func TestPrepareTransportV3SkipsNodeMissingToneMapSupports(t *testing.T) {
+	requiredTransformations := []playback.TransformationV3{
+		{Name: playback.TransformationVideoToH264V3, Executor: playback.ExecutorServerV3, RecipeVersion: playback.TransformationVideoToH264RecipeVersionV3},
+		{Name: playback.TransformationAudioToAACV3, Executor: playback.ExecutorServerV3, RecipeVersion: playback.TransformationAudioToAACRecipeVersionV3},
+		{Name: playback.TransformationHDRToSDRToneMapV3, Executor: playback.ExecutorServerV3, RecipeVersion: playback.TransformationHDRToSDRToneMapRecipeVersionV3},
+	}
+	// hwNode advertises hardware PQ; swNode advertises only software PQ.
+	hwNode := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/hw-capabilities":
+			writeJSON(w, http.StatusOK, playback.HWAccelInfo{
+				Transformations: requiredTransformations,
+				ToneMapCapabilities: tonemap.Capabilities{{
+					Mode: tonemap.ModeHardware, Backend: tonemap.BackendQSV, Filter: tonemap.HardwareFilterOpenCL,
+					SourceKinds: []tonemap.SourceKind{tonemap.SourcePQ},
+				}},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/transcode/start":
+			var request transcodenode.TranscodeStartRequest
+			_ = json.NewDecoder(r.Body).Decode(&request)
+			writeJSON(w, http.StatusAccepted, transcodenode.TranscodeStartResponse{
+				SessionID: request.SessionID, Status: "started", ToneMapMode: request.ToneMapMode,
+			})
+		case r.Method == http.MethodDelete:
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer hwNode.Close()
+	swNode := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/hw-capabilities":
+			writeJSON(w, http.StatusOK, playback.HWAccelInfo{
+				Transformations: requiredTransformations,
+				ToneMapCapabilities: tonemap.Capabilities{{
+					Mode: tonemap.ModeSoftware, Backend: tonemap.BackendSoftware, Filter: tonemap.SoftwareFilterBT2390,
+					SourceKinds: []tonemap.SourceKind{tonemap.SourcePQ},
+				}},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/transcode/start":
+			var request transcodenode.TranscodeStartRequest
+			_ = json.NewDecoder(r.Body).Decode(&request)
+			writeJSON(w, http.StatusAccepted, transcodenode.TranscodeStartResponse{
+				SessionID: request.SessionID, Status: "started", ToneMapMode: request.ToneMapMode,
+			})
+		case r.Method == http.MethodDelete:
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer swNode.Close()
+
+	transcodes := nodepool.NewTranscodePool()
+	transcodes.SetNodes([]*nodepool.Node{
+		{URL: swNode.URL, Enabled: true, Healthy: true},
+		{URL: hwNode.URL, Enabled: true, Healthy: true},
+	})
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	handler.JWTSecret = "test-secret"
+	handler.NodePlanner = nodepool.NewPlanner(nodepool.NewProxyPool(), transcodes)
+	requireWorkerRoutingV3(handler)
+	file := stableToneMapTransportFileV3(t)
+	result := playback.PlannerResultV3{
+		Plan: &playback.PlanV3{
+			PlanID: "plan:hw-only", Delivery: playback.DeliveryTranscodeHLSV3,
+			Transformations: requiredTransformations,
+		},
+		PlayMethod: playback.PlayTranscode, TargetVideoCodec: "h264", TargetAudioCodec: "aac",
+		ToneMapPolicy: tonemap.PolicyHardwareOnly, ToneMapMode: tonemap.ModeHardware, ToneMapSourceKind: tonemap.SourcePQ,
+	}
+	transport, transportErr := handler.prepareTransportV3(
+		httptest.NewRequest(http.MethodPost, "/", nil),
+		&playback.Session{ID: "session-hw-only", UserID: 7, ProfileID: "profile-1"},
+		file, result, mediaAuthModeV3{},
+	)
+	if transportErr != nil || transport.nodeURL != hwNode.URL {
+		t.Fatalf("transport = %+v error = %v, want hwNode", transport, transportErr)
+	}
+	transport.rollback()
+}
+
+// TestPrepareTransportV3FallsBackToSoftwareWhenHWNodeLacksCapability verifies
+// that a hardware-only plan whose selected node lacks hardware PQ falls back to
+// a software-capable node, and that the fallback is attempted exactly once.
+func TestPrepareTransportV3FallsBackToSoftwareWhenHWNodeLacksCapability(t *testing.T) {
+	requiredTransformations := []playback.TransformationV3{
+		{Name: playback.TransformationVideoToH264V3, Executor: playback.ExecutorServerV3, RecipeVersion: playback.TransformationVideoToH264RecipeVersionV3},
+		{Name: playback.TransformationAudioToAACV3, Executor: playback.ExecutorServerV3, RecipeVersion: playback.TransformationAudioToAACRecipeVersionV3},
+		{Name: playback.TransformationHDRToSDRToneMapV3, Executor: playback.ExecutorServerV3, RecipeVersion: playback.TransformationHDRToSDRToneMapRecipeVersionV3},
+	}
+	newNode := func(capability tonemap.Capability) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodGet && r.URL.Path == "/hw-capabilities":
+				writeJSON(w, http.StatusOK, playback.HWAccelInfo{
+					Transformations:     requiredTransformations,
+					ToneMapCapabilities: tonemap.Capabilities{capability},
+				})
+			case r.Method == http.MethodPost && r.URL.Path == "/transcode/start":
+				var request transcodenode.TranscodeStartRequest
+				_ = json.NewDecoder(r.Body).Decode(&request)
+				writeJSON(w, http.StatusAccepted, transcodenode.TranscodeStartResponse{
+					SessionID: request.SessionID, Status: "started", ToneMapMode: request.ToneMapMode,
+				})
+			case r.Method == http.MethodDelete:
+				w.WriteHeader(http.StatusNoContent)
+			default:
+				w.WriteHeader(http.StatusNotFound)
+			}
+		}))
+	}
+	// hardware node without PQ support; software node with PQ support.
+	hwNode := newNode(tonemap.Capability{
+		Mode: tonemap.ModeHardware, Backend: tonemap.BackendQSV, Filter: tonemap.HardwareFilterOpenCL,
+		SourceKinds: []tonemap.SourceKind{tonemap.SourceSDRBT709},
+	})
+	defer hwNode.Close()
+	swNode := newNode(tonemap.Capability{
+		Mode: tonemap.ModeSoftware, Backend: tonemap.BackendSoftware, Filter: tonemap.SoftwareFilterBT2390,
+		SourceKinds: []tonemap.SourceKind{tonemap.SourcePQ},
+	})
+	defer swNode.Close()
+
+	transcodes := nodepool.NewTranscodePool()
+	transcodes.SetNodes([]*nodepool.Node{
+		{URL: hwNode.URL, Enabled: true, Healthy: true},
+		{URL: swNode.URL, Enabled: true, Healthy: true},
+	})
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	handler.JWTSecret = "test-secret"
+	handler.NodePlanner = nodepool.NewPlanner(nodepool.NewProxyPool(), transcodes)
+	requireWorkerRoutingV3(handler)
+	file := stableToneMapTransportFileV3(t)
+	result := playback.PlannerResultV3{
+		Plan: &playback.PlanV3{
+			PlanID: "plan:hw-fallback", Delivery: playback.DeliveryTranscodeHLSV3,
+			Transformations: requiredTransformations,
+		},
+		PlayMethod: playback.PlayTranscode, TargetVideoCodec: "h264", TargetAudioCodec: "aac",
+		ToneMapPolicy: tonemap.PolicyHardwareThenSoftware, ToneMapMode: tonemap.ModeHardware, ToneMapSourceKind: tonemap.SourcePQ,
+	}
+	transport, transportErr := handler.prepareTransportV3(
+		httptest.NewRequest(http.MethodPost, "/", nil),
+		&playback.Session{ID: "session-hw-fallback", UserID: 7, ProfileID: "profile-1"},
+		file, result, mediaAuthModeV3{},
+	)
+	if transportErr != nil || transport.nodeURL != swNode.URL || transport.toneMapMode != tonemap.ModeSoftware {
+		t.Fatalf("transport = %+v error = %v, want software node fallback", transport, transportErr)
+	}
+	transport.rollback()
 }

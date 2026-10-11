@@ -639,3 +639,186 @@ func TestResolveVirtualAnchorURIExcludingFailedRefusesDifferentRelease(t *testin
 		t.Fatal("expected a refusal when rotation resolves a different release")
 	}
 }
+
+// TestResolveRehydratedVirtualSourceSkipsPreviouslyRefusedCandidate proves the
+// rotation-rejection chain: a candidate the same-release assertion already
+// refused under the anchor's durable identity is excluded from the next
+// replan's rotation retry, so each incompatible candidate is tried at most
+// once per inventory generation instead of replaying the identical
+// substitution. A changed anchor identity invalidates the chain. The second
+// half reloads the attempt from the shared store through a second handler to
+// prove the chain survives a durable reload, not just same-record reuse.
+func TestResolveRehydratedVirtualSourceSkipsPreviouslyRefusedCandidate(t *testing.T) {
+	const (
+		neutralURI = "virtual://movie/tt-replan-refused-chain"
+		pinnedURI  = neutralURI + "?result=pinned"
+		badURI     = neutralURI + "?result=bad"
+		goodURI    = neutralURI + "?result=good"
+	)
+	file := &models.MediaFile{
+		ID: 12, ContentID: "movie-replan-refused-chain", FilePath: pinnedURI,
+		VirtualOwnerInstallationID: 5, ProviderVideoHash: "hash-a", ProviderReleaseName: "Movie.2024",
+	}
+	newHandler := func() (*PlaybackHandler, *[][]string) {
+		h := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+		h.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(func(context.Context, string, int, string, int) (string, error) {
+			return "http://127.0.0.1:9/unused", nil
+		})
+		var excluded [][]string
+		h.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(ctx context.Context, _ string, _ int, _ int, _ string, _ bool, excludedCandidateIDs []string, _ string) (ResolvedVirtualMedia, error) {
+			excluded = append(excluded, append([]string(nil), excludedCandidateIDs...))
+			if !VirtualCandidateRotationAllowed(ctx) {
+				return ResolvedVirtualMedia{}, absentSessionPinError("pinned")
+			}
+			// First rotation resolves the incompatible release; the second
+			// must skip it and land on the compatible one. The resolver
+			// honors exclusions, so a replayed refusal is observable.
+			for _, id := range excludedCandidateIDs {
+				if id == "bad" {
+					return ResolvedVirtualMedia{
+						URL: "http://127.0.0.1:9/good", URI: goodURI, CandidateID: "good",
+						IdentityRematched: true, ProviderVideoHash: "hash-a", ProviderReleaseName: "Movie.2024",
+					}, nil
+				}
+			}
+			return ResolvedVirtualMedia{
+				URL: "http://127.0.0.1:9/bad", URI: badURI, CandidateID: "bad",
+				ProviderVideoHash: "hash-b", ProviderReleaseName: "Movie.2024.OTHER",
+			}, nil
+		})
+		return h, &excluded
+	}
+
+	// First replan: rotation resolves the incompatible release and is refused.
+	// Seed a live attempt so the refusal has a durable row to record on.
+	manager := playback.NewSessionManager(0, 0)
+	session, err := manager.StartSession(1, "profile-1", file.ID, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	h2, _ := newHandler()
+	h2.sessionMgr = manager
+	r := httptest.NewRequest(http.MethodPost, "/api/v1/playback/replan", nil).WithContext(newAuthorizedPlaybackContext())
+	record := playback.AttemptRecordV3{
+		SessionID: session.ID, UserID: 1, ProfileID: "profile-1",
+		RequestedMediaFileID: file.ID, EffectiveMediaFileID: file.ID,
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	if err := h2.PlanStoreV3.SaveAttempt(context.Background(), record); err != nil {
+		t.Fatalf("SaveAttempt: %v", err)
+	}
+	if _, err := h2.resolveRehydratedVirtualSourceWithAttemptV3(r, file, "profile-1", nil, "pinned", "auto", 0, virtualResolveOptionsV3{sessionBound: true, sessionAnchorURI: pinnedURI}, &record); !errors.Is(err, virtuallibrary.ErrSessionBoundCandidateAbsent) {
+		t.Fatalf("first replan err = %v, want the original absent-pin refusal", err)
+	}
+	// The chain now holds the refused candidate under the anchor identity.
+	chain := h2.rotationRejectionChainWithRecord(file, virtualRotationExclusionIdentity(file), &record)
+	if len(chain) != 1 || chain[0] != "bad" {
+		t.Fatalf("rejection chain = %v, want [bad]", chain)
+	}
+
+	// Second replan: reload the attempt from the shared store through a
+	// second handler sharing that store, proving the chain survives a
+	// durable reload rather than same-record reuse. Swap in a fresh
+	// resolver that captures exclusions.
+	hSecond, _ := newHandler()
+	hSecond.PlanStoreV3 = h2.PlanStoreV3
+	reloaded, reloadErr := hSecond.PlanStoreV3.GetAttempt(context.Background(), session.ID)
+	if reloadErr != nil || reloaded == nil {
+		t.Fatalf("reload attempt: %v", reloadErr)
+	}
+	var excluded [][]string
+	hSecond.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(ctx context.Context, _ string, _ int, _ int, _ string, _ bool, excludedCandidateIDs []string, _ string) (ResolvedVirtualMedia, error) {
+		excluded = append(excluded, append([]string(nil), excludedCandidateIDs...))
+		if !VirtualCandidateRotationAllowed(ctx) {
+			return ResolvedVirtualMedia{}, absentSessionPinError("pinned")
+		}
+		for _, id := range excludedCandidateIDs {
+			if id == "bad" {
+				return ResolvedVirtualMedia{
+					URL: "http://127.0.0.1:9/good", URI: goodURI, CandidateID: "good",
+					IdentityRematched: true, ProviderVideoHash: "hash-a", ProviderReleaseName: "Movie.2024",
+				}, nil
+			}
+		}
+		return ResolvedVirtualMedia{
+			URL: "http://127.0.0.1:9/bad", URI: badURI, CandidateID: "bad",
+			ProviderVideoHash: "hash-b", ProviderReleaseName: "Movie.2024.OTHER",
+		}, nil
+	})
+	r2 := httptest.NewRequest(http.MethodPost, "/api/v1/playback/replan", nil).WithContext(newAuthorizedPlaybackContext())
+	resolved, err := hSecond.resolveRehydratedVirtualSourceWithAttemptV3(r2, file, "profile-1", nil, "pinned", "auto", 0, virtualResolveOptionsV3{sessionBound: true, sessionAnchorURI: pinnedURI}, reloaded)
+	if err != nil {
+		t.Fatalf("second replan err = %v, want the compatible rotation", err)
+	}
+	if got := virtualResultCandidateID(resolved.URI); got != "good" {
+		t.Fatalf("resolved candidate = %q, want good", got)
+	}
+	found := false
+	for _, list := range excluded {
+		if containsStringExactV3(list, "bad") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("retry exclusions never contained the refused candidate: %v", excluded)
+	}
+
+	// Concurrent refusals converge through the bounded revision-conflict
+	// retry: two handlers hold independently loaded copies at the SAME
+	// revision; the first append advances the committed revision, so the
+	// second's append hits ErrRecoveryRevisionConflictV3 and must re-read
+	// and retry the union rather than drop its refusal. A reload then shows
+	// both. Deterministic interleaving (no goroutines needed): load both
+	// copies before either appends.
+	hThird, _ := newHandler()
+	hThird.PlanStoreV3 = h2.PlanStoreV3
+	hFourth, _ := newHandler()
+	hFourth.PlanStoreV3 = h2.PlanStoreV3
+	copyA, copyAErr := hThird.PlanStoreV3.GetAttempt(context.Background(), session.ID)
+	if copyAErr != nil || copyA == nil {
+		t.Fatalf("reload copy A: %v", copyAErr)
+	}
+	copyB, copyBErr := hFourth.PlanStoreV3.GetAttempt(context.Background(), session.ID)
+	if copyBErr != nil || copyB == nil {
+		t.Fatalf("reload copy B: %v", copyBErr)
+	}
+	if copyA.RecoveryRevision != copyB.RecoveryRevision {
+		t.Fatalf("copies disagree at load: %d vs %d", copyA.RecoveryRevision, copyB.RecoveryRevision)
+	}
+	// Sanity: the second replan above wrote through the shared store, so
+	// both copies observe the post-second-replan revision (not zero).
+	loadedRevision := copyA.RecoveryRevision
+	if loadedRevision == 0 {
+		t.Fatalf("copies loaded at revision 0, want the post-replan chain revision")
+	}
+	hThird.recordVirtualRotationRefusalWithRecord(context.Background(), file, "ugly", virtualRotationExclusionIdentity(file), copyA)
+	if copyB.RecoveryRevision != loadedRevision {
+		t.Fatalf("copy B revision moved without an append: %d vs %d", copyB.RecoveryRevision, loadedRevision)
+	}
+	hFourth.recordVirtualRotationRefusalWithRecord(context.Background(), file, "hideous", virtualRotationExclusionIdentity(file), copyB)
+	// The stale copy's append conflicted and retried against the newer
+	// committed revision; copy B converged through the retry while copy A
+	// (already committed) stays one behind — convergence is proven by the
+	// final reload below, not by the two caller copies agreeing.
+	// (appendRecoveryExclusionsV3 writes the converged revision back onto
+	// the caller's record, so copyB catches up to copyA plus its own write.)
+	if copyB.RecoveryRevision <= loadedRevision {
+		t.Fatalf("stale copy revision did not advance: %d vs loaded %d", copyB.RecoveryRevision, loadedRevision)
+	}
+	final, finalErr := hSecond.PlanStoreV3.GetAttempt(context.Background(), session.ID)
+	if finalErr != nil || final == nil {
+		t.Fatalf("reload final: %v", finalErr)
+	}
+	finalChain := hSecond.rotationRejectionChainWithRecord(file, virtualRotationExclusionIdentity(file), final)
+	want := map[string]bool{"bad": false, "ugly": false, "hideous": false}
+	for _, id := range finalChain {
+		if _, ok := want[id]; ok {
+			want[id] = true
+		}
+	}
+	for seenID, seen := range want {
+		if !seen {
+			t.Fatalf("converged chain = %v, want [bad ugly hideous] in any order (missing %s)", finalChain, seenID)
+		}
+	}
+}

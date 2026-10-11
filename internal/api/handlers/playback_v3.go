@@ -64,6 +64,15 @@ const (
 	// a retry without this margin would spend the caller's last budget and fail
 	// with the caller deadline instead of the probe error.
 	copySeekProbeRetryMargin = 5 * time.Second
+	// maxHLSRouteAttemptLoopV3 bounds the transport route-selection loop. Without
+	// it, a chain of fast-failing remote candidates (e.g. HTTP 500 from a node
+	// missing a recipe) can spend 32 × (remote timeout + local spawn) inside
+	// session_transport_commit, far beyond what a client start or replan lease
+	// tolerates. This is an admission check between attempts, not a hard
+	// overall deadline: an in-flight prepareLocalTransportV3 or
+	// prepareRemoteTransportV3 call still runs under its own context, and a
+	// software tone-map fallback starts under the same budget remainder.
+	maxHLSRouteAttemptLoopV3 = 90 * time.Second
 	// copySeekAnchorTransientBackoff is the bounded pause before re-probing the
 	// same candidate after an upstream 5xx. The provider is already failing, so
 	// an immediate second probe hammers it; the pause is short enough to still
@@ -1755,6 +1764,9 @@ func (h *PlaybackHandler) transcodeEligibilityV3(ctx context.Context, result pla
 				continue
 			}
 			if validateAdvertisedTransformationsV3(result.Plan, entry.transformations) != nil {
+				continue
+			}
+			if err := validateToneMapExecutorV3(result, entry.toneMapCapabilities); err != nil {
 				continue
 			}
 			capable[nodeURL] = struct{}{}
@@ -3778,16 +3790,23 @@ func (h *PlaybackHandler) prepareTransportWithPolicyAndExclusionsV3(
 	// audio outcome. A single non-audio failure makes the exhaustion a route
 	// failure.
 	audioOnlyFailure := true
+	loopStartedAt := time.Now()
 	for attempts := 0; attempts < 32; attempts++ {
+		if time.Since(loopStartedAt) >= maxHLSRouteAttemptLoopV3 {
+			slog.WarnContext(r.Context(), "protocol v3 transport route loop reached time budget", logComponentKey, playbackLogValueV3, "elapsed_ms", time.Since(loopStartedAt).Milliseconds(), "attempts", attempts)
+			break
+		}
 		routeStart := time.Now()
 		decision := h.resolveHLSRouteWithPolicyV3(r.Context(), session, result, policy, proxyAllowed, excludedNodes, excludedShapes)
 		recordTransportPhaseV3(r.Context(), "transport_route", routeStart)
 		if !decision.Selected() {
-			if fallback, attempted, fallbackErr := h.prepareSoftwareToneMapFallbackWithPolicyV3(r, session, file, result, mode, policy); attempted {
-				if fallbackErr == nil {
-					return fallback, nil
+			if canRetrySoftwareToneMapV3(result) {
+				if fallback, attempted, fallbackErr := h.prepareSoftwareToneMapFallbackWithPolicyV3(r, session, file, result, mode, policy); attempted {
+					if fallbackErr == nil {
+						return fallback, nil
+					}
+					return fallback, combineTransportErrorsV3(lastErr, fallbackErr)
 				}
-				return fallback, combineTransportErrorsV3(lastErr, fallbackErr)
 			}
 			if lastErr != nil {
 				return preparedTransportV3{}, lastErr
@@ -3854,6 +3873,17 @@ func (h *PlaybackHandler) prepareTransportWithPolicyAndExclusionsV3(
 			excludedNodes[nodeURL] = struct{}{}
 			audioOnlyFailure = false
 			lastErr = combineTransportErrorsV3(lastErr, &transportErrorV3{reason: routeCapabilityUnavailableReasonV3, message: "No available worker can execute the selected playback recipe.", retryable: true, cause: capabilityErr})
+			if canRetrySoftwareToneMapV3(result) {
+				if fallback, attempted, fallbackErr := h.prepareSoftwareToneMapFallbackWithPolicyV3(r, session, file, result, mode, policy); attempted {
+					if fallbackErr == nil {
+						return fallback, nil
+					}
+					return fallback, combineTransportErrorsV3(lastErr, fallbackErr)
+				}
+			}
+			if r.Context().Err() != nil {
+				return preparedTransportV3{}, lastErr
+			}
 			continue
 		}
 
@@ -6222,7 +6252,7 @@ func (h *PlaybackHandler) prepareRemoteTransportV3(r *http.Request, session *pla
 	if status != http.StatusAccepted {
 		cleanupOnFailure()
 		h.tm.StopRemoteTranscode(transportID, node.URL)
-		return preparedTransportV3{}, &transportErrorV3{reason: transcodeStartFailedReasonV3, message: "The selected transcode node rejected the playback transport.", retryable: true}
+		return preparedTransportV3{}, &transportErrorV3{reason: transcodeStartFailedReasonV3, message: "The selected transcode node rejected the playback transport.", retryable: true, cause: fmt.Errorf("node returned status %d", status)}
 	}
 	if err := transcodenode.ValidateAudioRecipeAttestation(req, nodeResp); err != nil {
 		cleanupOnFailure()
@@ -8612,7 +8642,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				// The terminal-driven alternate-file hunt below is separately
 				// gated by the negotiated fallback policy, so a failed
 				// rehydration never silently swaps in a sibling version.
-				resolved, resolveErr := h.resolveRehydratedVirtualSourceV3(r, &pinnedFile, record.ProfileID, excludedCandidateIDs, preferredCandidateID, start.QualityPreference, intOrZeroHandlerV3(start.BandwidthCapKbps), virtualResolveOptionsV3{allowFailedCandidate: false, rotateCandidates: virtualDecodeRotation, sessionBound: true, sessionAnchorURI: session.VirtualSourceURI, bypassProviderFloor: true})
+				resolved, resolveErr := h.resolveRehydratedVirtualSourceWithAttemptV3(r, &pinnedFile, record.ProfileID, excludedCandidateIDs, preferredCandidateID, start.QualityPreference, intOrZeroHandlerV3(start.BandwidthCapKbps), virtualResolveOptionsV3{allowFailedCandidate: false, rotateCandidates: virtualDecodeRotation, sessionBound: true, sessionAnchorURI: session.VirtualSourceURI, bypassProviderFloor: true}, record)
 				if resolveErr != nil {
 					slog.WarnContext(r.Context(), "virtual playback rehydration failed", "component", "api", "session_id", record.SessionID, "file_id", currentEffectiveFile.ID, "owner_installation_id", session.VirtualSourceOwnerInstallationID, "error", logredact.SanitizeURLError(resolveErr))
 					virtualRehydrationFailed = true
@@ -11702,9 +11732,10 @@ func (h *PlaybackHandler) appendRecoveryExclusionsV3(ctx context.Context, record
 	revision := record.RecoveryRevision
 	var lastErr error
 	for attempt := 0; attempt < recoveryAppendMaxAttempts; attempt++ {
-		merged, _, err := store.AppendRecoveryExclusions(ctx, record.SessionID, revision, exclusions)
+		merged, newRevision, err := store.AppendRecoveryExclusions(ctx, record.SessionID, revision, exclusions)
 		if err == nil {
 			record.RecoveryState = merged
+			record.RecoveryRevision = newRevision
 			return merged, nil
 		}
 		if !errors.Is(err, playback.ErrRecoveryRevisionConflictV3) {

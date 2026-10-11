@@ -311,6 +311,13 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 		if pinnedID != "" {
 			excluded = []string{pinnedID}
 		}
+		// Scope note: restart paths own no attempt record, so this union
+		// and the refusal record below both degrade to the prior one-shot
+		// retry. The durable chain is a replan-rehydration mechanism (see
+		// resolveRehydratedVirtualSourceWithAttemptV3); a restart refusal
+		// keeps the original cause and a later replan records its own.
+		chainIdentity := virtualRotationExclusionIdentity(file)
+		excluded = h.unionVirtualRotationExclusions(excluded, file, chainIdentity)
 		retryCtx := virtualResolveContextWithPersistedIdentity(refreshCtx, file)
 		rotated, rotatedCleanup, rotateErr := h.resolveVirtualInputURI(
 			retryCtx, canonicalPath, ownerInstallationID,
@@ -328,6 +335,7 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 				"component", "api", "session_anchor", canonicalPath,
 				"status", "rotation_refused", "old_candidate_id", pinnedID,
 				"new_candidate_id", virtualResultCandidateID(rotated.URI))
+			h.recordVirtualRotationRefusal(refreshCtx, file, virtualResultCandidateID(rotated.URI), chainIdentity)
 			pin.clearIfVersion(pinnedVersion)
 			return "", nil, err
 		}
@@ -830,6 +838,11 @@ func (h *PlaybackHandler) ResolveVirtualTransportInput(ctx context.Context, virt
 	if pinnedID != "" {
 		excluded = []string{pinnedID}
 	}
+	// Scope note: no attempt is owned here, so the union and the refusal
+	// record below both degrade to the prior one-shot retry (see restart
+	// path above).
+	chainIdentity := virtualRotationExclusionIdentity(file)
+	excluded = h.unionVirtualRotationExclusions(excluded, file, chainIdentity)
 	retryCtx := virtualResolveContextWithPersistedIdentity(ctx, file)
 	rotated, rotatedCleanup, rotateErr := h.resolveVirtualInputURI(
 		retryCtx, virtualURI, ownerInstallationID, userID, profileID, true, excluded, "", true,
@@ -845,6 +858,7 @@ func (h *PlaybackHandler) ResolveVirtualTransportInput(ctx context.Context, virt
 			"component", "api", "session_anchor", virtualURI,
 			"status", "rotation_refused", "old_candidate_id", pinnedID,
 			"new_candidate_id", virtualResultCandidateID(rotated.URI))
+		h.recordVirtualRotationRefusal(ctx, file, virtualResultCandidateID(rotated.URI), chainIdentity)
 		return resolved, cleanup, err
 	}
 	if cleanup != nil {
