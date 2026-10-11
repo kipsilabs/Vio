@@ -55,10 +55,11 @@ func execVirtualStampUpdate(t *testing.T, pool *pgxpool.Pool, rowID int, expecte
 	return stamped
 }
 
-// A metadata-only write that lands codec-bearing audio inventory must stamp the
-// row: real tracks may never persist alongside a NULL probe_updated_at, or the
-// probe gate treats the row as never-probed forever.
-func TestVirtualFileMetadataUpdateStampsCodecInventoryWithoutStampFlag(t *testing.T) {
+// A metadata-only write that lands probe-observed audio inventory (a container
+// stream index) must stamp the row: real tracks may never persist alongside a
+// NULL probe_updated_at, or the probe gate treats the row as never-probed
+// forever.
+func TestVirtualFileMetadataUpdateStampsProbeObservedInventoryWithoutStampFlag(t *testing.T) {
 	pool := virtualMetadataUpdateTestPool(t)
 	const folderID, ownerID = 994341, 7101
 	seedVirtualMetadataUpdateFolder(t, pool, folderID, ownerID)
@@ -67,9 +68,29 @@ func TestVirtualFileMetadataUpdateStampsCodecInventoryWithoutStampFlag(t *testin
 	rowID, updatedAt, probeUpdatedAt := virtualStampFixtureRow(t, pool, "movie-tt-stamp-codec", path, "virtual", folderID, ownerID)
 
 	stamped := execVirtualStampUpdate(t, pool, rowID, path, updatedAt, probeUpdatedAt, ownerID, folderID,
-		`[{"codec":"aac","channels":2,"language":"eng"}]`, `[]`, false, false)
+		`[{"index":1,"codec":"aac","channels":2,"language":"eng"}]`, `[]`, false, false)
 	if stamped == nil {
-		t.Fatal("codec-bearing audio persisted with probe_updated_at NULL")
+		t.Fatal("probe-observed audio persisted with probe_updated_at NULL")
+	}
+}
+
+// A metadata-only write of synthesized declared tracks (codec, no container
+// stream index) must not stamp the row: it is a hint, not probe evidence, and
+// the row has to stay probe-eligible. This is the regression the arming fix
+// depends on: stamping here would let the next start take the P0 fast path and
+// never run the probe.
+func TestVirtualFileMetadataUpdateKeepsNullForSynthesizedCodecTracks(t *testing.T) {
+	pool := virtualMetadataUpdateTestPool(t)
+	const folderID, ownerID = 994345, 7105
+	seedVirtualMetadataUpdateFolder(t, pool, folderID, ownerID)
+
+	path := "virtual://movie/tt-stamp-synth?result=cand"
+	rowID, updatedAt, probeUpdatedAt := virtualStampFixtureRow(t, pool, "movie-tt-stamp-synth", path, "virtual", folderID, ownerID)
+
+	stamped := execVirtualStampUpdate(t, pool, rowID, path, updatedAt, probeUpdatedAt, ownerID, folderID,
+		`[{"codec":"aac","channels":2,"language":"eng"}]`, `[{"codec":"subrip","language":"eng"}]`, false, false)
+	if stamped != nil {
+		t.Fatalf("synthesized declared tracks stamped probe_updated_at = %v, want NULL", stamped)
 	}
 }
 
@@ -93,8 +114,8 @@ func TestVirtualFileMetadataUpdatePreservesNullForHintOnlyInventory(t *testing.T
 
 // ClearProbe is independent of the stamp coupling: an explicit clear (a release
 // swap invalidating the evidence) nulls the stamp even when the write carries
-// codec-bearing inventory.
-func TestVirtualFileMetadataUpdateClearProbeWinsOverCodecCoupling(t *testing.T) {
+// probe-observed inventory.
+func TestVirtualFileMetadataUpdateClearProbeWinsOverProbeEvidenceCoupling(t *testing.T) {
 	pool := virtualMetadataUpdateTestPool(t)
 	const folderID, ownerID = 994343, 7103
 	seedVirtualMetadataUpdateFolder(t, pool, folderID, ownerID)
@@ -103,7 +124,7 @@ func TestVirtualFileMetadataUpdateClearProbeWinsOverCodecCoupling(t *testing.T) 
 	rowID, updatedAt, probeUpdatedAt := virtualStampFixtureRow(t, pool, "movie-tt-stamp-clear", path, "virtual", folderID, ownerID)
 
 	stamped := execVirtualStampUpdate(t, pool, rowID, path, updatedAt, probeUpdatedAt, ownerID, folderID,
-		`[{"codec":"aac","channels":2,"language":"eng"}]`, `[]`, false, true)
+		`[{"index":1,"codec":"aac","channels":2,"language":"eng"}]`, `[]`, false, true)
 	if stamped != nil {
 		t.Fatalf("ClearProbe left probe_updated_at = %v, want NULL", stamped)
 	}
@@ -120,7 +141,7 @@ func TestVirtualFileMetadataUpdateCollectionRowKeepsOwnStamp(t *testing.T) {
 	rowID, updatedAt, probeUpdatedAt := virtualStampFixtureRow(t, pool, "movie-tt-stamp-collection", path, "virtual_collection", folderID, ownerID)
 
 	stamped := execVirtualStampUpdate(t, pool, rowID, path, updatedAt, probeUpdatedAt, ownerID, folderID,
-		`[{"codec":"aac","channels":2,"language":"eng"}]`, `[]`, false, false)
+		`[{"index":1,"codec":"aac","channels":2,"language":"eng"}]`, `[]`, false, false)
 	if stamped != nil {
 		t.Fatalf("collection row stamped probe_updated_at = %v, want its own (NULL) stamp preserved", stamped)
 	}

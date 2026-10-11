@@ -3942,10 +3942,11 @@ const (
 // converge to probed evidence instead of re-probing on every start.
 //
 // The stamp is coupled to the inventory written: when audio_tracks or
-// subtitle_tracks carry a codec-bearing (non-hint) entry, the row is stamped
-// even on a write that did not ask for it, so real inventory never persists
-// alongside a NULL probe_updated_at. Language-only hint entries (provider
-// registration) do not trigger it, ClearProbe still clears the stamp, and a
+// subtitle_tracks carry a probe-observed entry (a container stream index),
+// the row is stamped even on a write that did not ask for it, so real
+// inventory never persists alongside a NULL probe_updated_at. Synthesized
+// declared tracks carry a codec but no stream index, so they do not trigger
+// it: ClearProbe still clears the stamp, the row stays probe-eligible, and a
 // collection-owned row still preserves its own.
 //
 // Path adoption is skipped when a sibling row (same virtual owner and library)
@@ -4073,15 +4074,17 @@ UPDATE media_files SET
     WHEN NOT $13::boolean THEN probe_source
     ELSE 'virtual'
   END,
-  -- The stamp is coupled to the inventory being written: a codec-bearing
-  -- audio/subtitle entry is real (probed) inventory, and a row may never carry
-  -- it alongside an unstamped (NULL) probe timestamp. Without the coupling a
-  -- metadata-only writer (a stored-URL refresh, an adoption that clears the
-  -- stamp) could persist real tracks while preserving a NULL stamp, and the
-  -- probe gate would then treat the row as never-probed forever. Provider
-  -- registration writes language-only hint entries (no codec), so a hint-only
-  -- write still preserves the previous stamp. ClearProbe still clears, and a
-  -- collection-owned row still preserves its own stamp, both as before.
+  -- The stamp is coupled to the inventory being written: a probe-observed
+  -- audio/subtitle entry (its container stream index, which only ffprobe
+  -- records) is real inventory, and a row may never carry it alongside an
+  -- unstamped (NULL) probe timestamp. Without the coupling a metadata-only
+  -- writer (a stored-URL refresh) could persist real tracks while preserving a
+  -- NULL stamp, and the probe gate would then treat the row as never-probed
+  -- forever. A synthesized or declared track carries a codec but no stream
+  -- index, so a hint-only write still preserves the previous stamp and the row
+  -- stays probe-eligible. ClearProbe still clears, and a collection-owned row
+  -- still preserves its own stamp, both as before. The predicate matches
+  -- virtualTrackInventoryCarriesProbeEvidence: a positive integer index.
   probe_updated_at = CASE
     WHEN probe_source = 'virtual_collection' THEN probe_updated_at
     WHEN $31::boolean THEN NULL
@@ -4090,13 +4093,13 @@ UPDATE media_files SET
         SELECT 1 FROM jsonb_array_elements(
           CASE WHEN jsonb_typeof($2::jsonb) = 'array' THEN $2::jsonb ELSE '[]'::jsonb END
         ) AS audio_entry(entry)
-        WHERE COALESCE(NULLIF(entry->>'codec', ''), '') <> ''
+        WHERE (entry->>'index') ~ '^[1-9][0-9]*$'
       )
       OR EXISTS (
         SELECT 1 FROM jsonb_array_elements(
           CASE WHEN jsonb_typeof($3::jsonb) = 'array' THEN $3::jsonb ELSE '[]'::jsonb END
         ) AS subtitle_entry(entry)
-        WHERE COALESCE(NULLIF(entry->>'codec', ''), '') <> ''
+        WHERE (entry->>'index') ~ '^[1-9][0-9]*$'
       )
     ) THEN probe_updated_at
     ELSE GREATEST(clock_timestamp(), probe_updated_at + interval '1 microsecond')
@@ -4698,13 +4701,15 @@ func (h *PlaybackHandler) virtualProbeEvidenceArgsForRow(ctx context.Context, ca
 		HDR:              probed.HDR,
 		Bitrate:          probed.Bitrate,
 		Duration:         probed.Duration,
-		// A codec-bearing audio/subtitle entry is real inventory, so the write
-		// must carry the probe stamp even when the caller asked for a
-		// metadata-only write. Otherwise the row persists real tracks with a
-		// NULL probe timestamp and the probe gate re-probes it forever (the
-		// discovery wiring break). The SQL applies the same coupling as a guard
+		// A probe-observed audio/subtitle entry (a container stream index) is
+		// real inventory, so the write must carry the probe stamp even when the
+		// caller asked for a metadata-only write. Otherwise the row persists
+		// real tracks with a NULL probe timestamp and the probe gate re-probes
+		// it forever (the discovery wiring break). A synthesized or declared
+		// track has no stream index, so it does not force the stamp and the row
+		// stays probe-eligible. The SQL applies the same predicate as a guard
 		// for the writers that build their args directly.
-		StampProbe:     stampProbe || virtualTrackInventoryCarriesCodec(probed.AudioTracks, probed.SubtitleTracks),
+		StampProbe:     stampProbe || virtualTrackInventoryCarriesProbeEvidence(probed.AudioTracks, probed.SubtitleTracks),
 		UpdatedAt:      snap.UpdatedAt,
 		ProbeUpdatedAt: snap.ProbeUpdatedAt,
 		// The row's own identity, for the release-replacement gate when this
@@ -7102,20 +7107,22 @@ func marshalTracksJSON(tracks any) []byte {
 	return data
 }
 
-// virtualTrackInventoryCarriesCodec reports whether an audio/subtitle inventory
-// holds at least one codec-bearing (non-hint) entry. Provider registration
-// writes language-only placeholder entries with no codec; a real probe fills in
-// a codec for every track. The presence of a codec is therefore the signal that
-// the inventory is real evidence, which is what couples the probe stamp to the
-// write (see VirtualFileMetadataUpdateSQL).
-func virtualTrackInventoryCarriesCodec(audio []models.AudioTrack, subtitles []models.SubtitleTrack) bool {
+// virtualTrackInventoryCarriesProbeEvidence reports whether an audio or
+// subtitle inventory holds at least one probe-observed entry: a track with a
+// real container stream index, which only ffprobe records. Provider
+// registration and declared-track synthesis (mergeVirtualCandidateLanguages,
+// declaredVirtualAudioTracks) write language/codec/channel placeholders with no
+// stream index, so they are hints and must not force the stamp even though they
+// carry a codec. A probed track that ffprobe numbered 0 keeps its NULL stamp and
+// is still probed on the next start, so the predicate never over-stamps.
+func virtualTrackInventoryCarriesProbeEvidence(audio []models.AudioTrack, subtitles []models.SubtitleTrack) bool {
 	for _, track := range audio {
-		if strings.TrimSpace(track.Codec) != "" {
+		if track.Index > 0 {
 			return true
 		}
 	}
 	for _, track := range subtitles {
-		if strings.TrimSpace(track.Codec) != "" {
+		if track.Index > 0 {
 			return true
 		}
 	}

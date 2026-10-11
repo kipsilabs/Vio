@@ -145,7 +145,7 @@ func TestVirtualFileMetadataUpdateSQLShape(t *testing.T) {
 	// duplicated without an accompanying arg change is caught. Reuse is
 	// intentional (e.g. $16/$17 fence the sibling, verdict and CAS clauses;
 	// $2/$3 appear once in the SET, once in the audio_channels derivation, and
-	// once each in the codec-bearing probe-stamp coupling).
+	// once each in the probe-evidence stamp coupling).
 	wantCounts := map[int]int{
 		1: 1, 2: 5, 3: 3, 4: 1, 5: 1, 6: 1, 7: 1, 8: 1, 9: 1, 10: 2,
 		11: 1, 12: 2, 13: 2, 14: 1, 15: 1, 16: 8, 17: 8, 18: 13, 19: 6,

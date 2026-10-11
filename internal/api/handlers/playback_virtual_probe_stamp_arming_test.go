@@ -13,12 +13,12 @@ import (
 	"github.com/Silo-Server/silo-server/internal/models"
 )
 
-// TestVirtualProbeEvidenceArgsStampCoupledToCodecInventory pins the args-level
-// half of the stamp coupling: a write carrying a codec-bearing audio or
-// subtitle entry forces StampProbe even when the caller asked for a
-// metadata-only write, while a language-only hint inventory leaves the flag
-// untouched (so a NULL stamp is preserved).
-func TestVirtualProbeEvidenceArgsStampCoupledToCodecInventory(t *testing.T) {
+// TestVirtualProbeEvidenceArgsStampOnlyForProbeEvidence pins the args-level half
+// of the stamp coupling: a write carrying probe-observed inventory (a track with
+// a container stream index) forces StampProbe even when the caller asked for a
+// metadata-only write, while synthesized declared tracks (codec, no index) and
+// language-only hints leave the flag untouched so a NULL stamp is preserved.
+func TestVirtualProbeEvidenceArgsStampOnlyForProbeEvidence(t *testing.T) {
 	const candidateURI = "virtual://movie/tt-coupling?result=cand"
 	row := &models.MediaFile{
 		ID:                         41,
@@ -35,14 +35,21 @@ func TestVirtualProbeEvidenceArgsStampCoupledToCodecInventory(t *testing.T) {
 		want   bool
 	}{
 		{
-			name:   "codec-bearing audio forces the stamp",
-			probed: &models.MediaFile{AudioTracks: []models.AudioTrack{{Codec: "aac", Channels: 2, Language: "eng"}}},
+			name:   "probe-observed audio forces the stamp",
+			probed: &models.MediaFile{AudioTracks: []models.AudioTrack{{Index: 1, Codec: "aac", Channels: 2, Language: "eng"}}},
 			want:   true,
 		},
 		{
-			name:   "codec-bearing subtitle forces the stamp",
-			probed: &models.MediaFile{SubtitleTracks: []models.SubtitleTrack{{Codec: "subrip", Language: "eng"}}},
+			name:   "probe-observed subtitle forces the stamp",
+			probed: &models.MediaFile{SubtitleTracks: []models.SubtitleTrack{{Index: 3, Codec: "subrip", Language: "eng"}}},
 			want:   true,
+		},
+		{
+			// The reviewer regression: synthesis carries a codec but no stream
+			// index, so it is a declared hint, not probe evidence.
+			name:   "synthesized declared audio does not force the stamp",
+			probed: &models.MediaFile{AudioTracks: declaredVirtualAudioTracks("aac", []string{"eng", "deu"}, "")},
+			want:   false,
 		},
 		{
 			name: "language-only hint inventory preserves the unstamped state",
