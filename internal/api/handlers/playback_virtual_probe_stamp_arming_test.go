@@ -2,9 +2,11 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -228,5 +230,109 @@ func TestAlreadyStampedDirectPlayStartDoesNotArmDeferredProbe(t *testing.T) {
 	}
 	if resolved.DeferredProbe != nil {
 		t.Fatal("already-stamped row armed a deferred probe; it must not be re-probed")
+	}
+}
+
+// TestNonNegotiatingStartStillArmsDeferredProbe is the all-clients acceptance: a
+// fresh start from a client that never negotiated deferred_track_inventory_v1
+// and does not consume realtime or the inventory poll still arms the deferred
+// probe and stamps the row, so its next play reads verified inventory. This
+// covers the Silo clients and any non-web consumer that never opted into the
+// deferred lifecycle.
+func TestNonNegotiatingStartStillArmsDeferredProbe(t *testing.T) {
+	const candidateURI = "virtual://movie/tt-stamp-nonneg?result=cand-nn"
+	fx := newDeferredLifecycleFixture(t, 774, candidateURI)
+	// The attempt negotiated neither the client token nor the server feature.
+	fx.saveAttemptWithoutNegotiation(t)
+	fx.handler.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(
+		func(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
+			t.Fatal("the durable-resume fast path must not fall back to the provider resolver")
+			return "", nil
+		})
+	fx.handler.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(
+		func(_ context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+			t.Fatal("a stamped row must take the P0 fast path on the next play")
+			return ResolvedVirtualMedia{}, nil
+		})
+
+	// The saver models the real statement: the write carries probed tracks and
+	// StampProbe, so the row ends this session stamped and the next resolve sees
+	// complete evidence plus a stamp.
+	var saved models.VirtualFilePersistArgs
+	var savedMu sync.Mutex
+
+	expiresAt := time.Now().Add(3 * time.Hour)
+	file := withVirtualResumeVideoEvidence(&models.MediaFile{
+		ID:                         774,
+		ContentID:                  "movie-tt-stamp-nonneg",
+		FilePath:                   candidateURI,
+		Container:                  "virtual",
+		VirtualOwnerInstallationID: 5,
+		ResolvedURL:                "https://93.184.216.34/stream/token=stored",
+		ResolvedURLExpiresAt:       &expiresAt,
+	})
+
+	fx.handler.VirtualFileMetadataSaver = func(_ context.Context, args models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error) {
+		savedMu.Lock()
+		saved = args
+		savedMu.Unlock()
+		var audio []models.AudioTrack
+		if err := json.Unmarshal(args.AudioTracks, &audio); err != nil {
+			return VirtualFileMetadataUpdateResult{}, err
+		}
+		// Apply the committed write the way the real statement does: probed
+		// inventory plus a stamp, so this row is verified for the next play.
+		stamp := time.Now()
+		file.AudioTracks = audio
+		file.CodecAudio = "eac3"
+		file.Container = "mkv"
+		file.ProbeUpdatedAt = &stamp
+		return VirtualFileMetadataUpdateResult{MetadataUpdated: true, RowsAffected: 1}, nil
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/playback/start", nil)
+	resolved, err := fx.handler.resolveVirtualPlaybackSource(req, file, "profile-1", true, nil, "", "", 0, false)
+	if err != nil {
+		t.Fatalf("resolveVirtualPlaybackSource error: %v", err)
+	}
+	deferred := resolved.DeferredProbe
+	if deferred == nil {
+		t.Fatal("a non-negotiating start armed no deferred probe; the row would never be stamped")
+	}
+	deferred.sessionID = fx.session.ID
+	fx.handler.enqueueDeferredVirtualProbeV3(context.Background(), deferred)
+	close(fx.releaseProbe)
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		live, getErr := fx.manager.GetSession(fx.session.ID)
+		if getErr == nil && live.VirtualProbeOutcome == probeOutcomeVerified {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("non-negotiating session outcome never reached verified (last: %v)", live)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	savedMu.Lock()
+	got := saved
+	savedMu.Unlock()
+	if !got.StampProbe {
+		t.Fatal("the deferred write for a non-negotiating start did not request the stamp")
+	}
+	if file.ProbeUpdatedAt == nil {
+		t.Fatal("the row was not stamped, so the next play would still report pending")
+	}
+
+	// Next play: the stamped, complete row must take the P0 fast path and arm no
+	// worker. A second deferred probe here would mean the non-negotiating start
+	// failed to converge.
+	next, err := fx.handler.resolveVirtualPlaybackSource(req, file, "profile-1", true, nil, "", "", 0, false)
+	if err != nil {
+		t.Fatalf("second resolve error: %v", err)
+	}
+	if next.DeferredProbe != nil {
+		t.Fatal("the next play on a stamped row re-armed a probe")
 	}
 }
