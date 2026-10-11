@@ -152,4 +152,98 @@ describe("SubtitleMenu", () => {
 
     expect(screen.queryByText("Unverified")).toBeNull();
   });
+
+  it("shows discovery state when subtitle tracks are empty but inventory is provisional", () => {
+    render(
+      createElement(SubtitleMenu, {
+        tracks: [],
+        activeIndex: null,
+        onSelect: () => {},
+        delayMs: 0,
+        onDelayChange: () => {},
+        mediaFileId: 42,
+        provisional: true,
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /(Enable|Disable) captions/ }));
+
+    expect(screen.getByText("Discovering subtitles…")).toBeTruthy();
+    expect(screen.getByText("Unverified")).toBeTruthy();
+  });
+
+  it("shows explicit empty state when verified with no subtitles", () => {
+    render(
+      createElement(SubtitleMenu, {
+        tracks: [],
+        activeIndex: null,
+        onSelect: () => {},
+        delayMs: 0,
+        onDelayChange: () => {},
+        mediaFileId: 42,
+        provisional: false,
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /(Enable|Disable) captions/ }));
+
+    expect(screen.getByText("No subtitles available")).toBeTruthy();
+    expect(screen.queryByText("Discovering subtitles…")).toBeNull();
+  });
+
+  it("shows failure state when discovery failed and subtitle tracks are empty", () => {
+    render(
+      createElement(SubtitleMenu, {
+        tracks: [],
+        activeIndex: null,
+        onSelect: () => {},
+        delayMs: 0,
+        onDelayChange: () => {},
+        mediaFileId: 42,
+        provisional: true,
+        failed: true,
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /(Enable|Disable) captions/ }));
+
+    expect(screen.getByText("Subtitle discovery failed")).toBeTruthy();
+    expect(screen.queryByText("Discovering subtitles…")).toBeNull();
+  });
+
+  it("shows discovery banner even when declared tracks are present while provisional", () => {
+    render(
+      createElement(SubtitleMenu, {
+        tracks: [subtitleTrack()],
+        activeIndex: null,
+        onSelect: () => {},
+        delayMs: 0,
+        onDelayChange: () => {},
+        mediaFileId: 42,
+        provisional: true,
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /(Enable|Disable) captions/ }));
+
+    expect(screen.getByText("Discovering subtitles…")).toBeTruthy();
+    expect(screen.getByText("English")).toBeTruthy();
+  });
+
+  it("shows failure banner even when declared tracks are present", () => {
+    render(
+      createElement(SubtitleMenu, {
+        tracks: [subtitleTrack()],
+        activeIndex: null,
+        onSelect: () => {},
+        delayMs: 0,
+        onDelayChange: () => {},
+        mediaFileId: 42,
+        provisional: true,
+        failed: true,
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /(Enable|Disable) captions/ }));
+
+    expect(
+      screen.getByText("Showing available subtitles — discovery did not complete"),
+    ).toBeTruthy();
+    expect(screen.getByText("English")).toBeTruthy();
+  });
 });

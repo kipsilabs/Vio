@@ -45,7 +45,14 @@ func newPlaybackServiceFixture(t *testing.T) *playbackServiceFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler := NewPlaybackHandler(manager)
+	probedAt := time.Now()
+	handler := NewPlaybackHandler(manager, testPlaybackFileResolver{file: &models.MediaFile{
+		ID:             100,
+		ContentID:      "movie-service-fixture",
+		FilePath:       "/media/fixture.mkv",
+		ProbeUpdatedAt: &probedAt,
+		AudioTracks:    []models.AudioTrack{{Index: 1, Codec: "aac", Channels: 2, Language: "eng", Default: true}},
+	}})
 	handler.InstallationID = serviceInstallation
 	record := playback.AttemptRecordV3{
 		PlaybackAttemptID:    uuid.NewString(),
@@ -149,6 +156,45 @@ func TestPlaybackMutationsV2RefuseOtherInstallation(t *testing.T) {
 	foreign := f.caller
 	foreign.UserID = 2
 	_, err = f.handler.ApplyProgressV2(f.ctx, foreign, f.session.ID, PlaybackProgressCommand{Sequence: 1, Position: 10})
+	assertPlaybackOperationError(t, err, http.StatusForbidden, "forbidden")
+}
+
+// TestPlaybackInventoryV2AllowsStaleInstallation is the session-scoped-read
+// regression: the live inventory endpoint enforces the authenticated viewer
+// and the stored live session ownership, but not the installation gate
+// mutations require. A caller whose capabilities predate a server restart
+// (stale or empty installation id) still resolves its pending track inventory
+// instead of 409-looping on installation_changed; a foreign account or profile
+// is still refused, including with a stale installation id.
+func TestPlaybackInventoryV2AllowsStaleInstallation(t *testing.T) {
+	f := newPlaybackServiceFixture(t)
+	stale := f.caller
+	stale.InstallationID = serviceOtherInstallation
+	inv, err := f.handler.GetPlaybackInventoryV2(f.ctx, stale, f.session.ID)
+	if err != nil {
+		t.Fatalf("stale installation inventory: %v", err)
+	}
+	if inv.SessionID != f.session.ID || len(inv.AudioTracks) != 1 {
+		t.Fatalf("stale installation inventory = %+v, want session %s with 1 audio track", inv, f.session.ID)
+	}
+	empty := f.caller
+	empty.InstallationID = ""
+	if _, err := f.handler.GetPlaybackInventoryV2(f.ctx, empty, f.session.ID); err != nil {
+		t.Fatalf("empty installation inventory: %v", err)
+	}
+	// Another account under its own authenticated context cannot read the session.
+	otherAccount := context.Background()
+	otherAccount = apimw.SetClaims(otherAccount, &auth.Claims{UserID: 2, Role: "user", TokenType: auth.TokenTypeAccess})
+	otherAccount = apimw.SetProfileID(otherAccount, "profile-2")
+	otherCaller := PlaybackCaller{UserID: 2, ProfileID: "profile-2", InstallationID: serviceOtherInstallation}
+	_, err = f.handler.GetPlaybackInventoryV2(otherAccount, otherCaller, f.session.ID)
+	assertPlaybackOperationError(t, err, http.StatusForbidden, "forbidden")
+	// Another profile on the same account cannot read the session either.
+	otherProfile := context.Background()
+	otherProfile = apimw.SetClaims(otherProfile, &auth.Claims{UserID: 1, Role: "user", TokenType: auth.TokenTypeAccess})
+	otherProfile = apimw.SetProfileID(otherProfile, "profile-2")
+	otherProfileCaller := PlaybackCaller{UserID: 1, ProfileID: "profile-2", InstallationID: serviceOtherInstallation}
+	_, err = f.handler.GetPlaybackInventoryV2(otherProfile, otherProfileCaller, f.session.ID)
 	assertPlaybackOperationError(t, err, http.StatusForbidden, "forbidden")
 }
 

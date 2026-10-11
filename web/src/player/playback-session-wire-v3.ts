@@ -1,5 +1,6 @@
 import {
   FEATURE_DEFAULT_AUDIO_RECONCILE_RESPONSE_V3,
+  FEATURE_DEFERRED_TRACK_INVENTORY_V3,
   FEATURE_INVENTORY_UPDATED_V3,
   FEATURE_PLAN_INVALIDATED_V3,
   FEATURE_PLAYBACK_PLAN_V3,
@@ -50,6 +51,11 @@ export const VIDEO_CLIENT_FEATURES_V3 = [
   FEATURE_DEFAULT_AUDIO_RECONCILE_RESPONSE_V3,
   FEATURE_SOURCE_COMMITTED_V3,
   FEATURE_INVENTORY_UPDATED_V3,
+  // A deferred plan marks tracks_pending and promises a follow-up: the menus
+  // must stay in their loading state until inventory_updated (or the inventory
+  // poll) replaces the provisional list. Without this token the server keeps
+  // the synchronous path and never marks a plan pending.
+  FEATURE_DEFERRED_TRACK_INVENTORY_V3,
 ];
 
 /**

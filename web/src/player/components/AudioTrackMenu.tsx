@@ -30,6 +30,14 @@ interface AudioTrackMenuProps {
    * evidence, so the menu says so instead of presenting every row as final.
    */
   provisional?: boolean;
+  /**
+   * True while the deferred track enumeration is still running.
+   */
+  pending?: boolean;
+  /**
+   * True when track discovery terminally failed or timed out.
+   */
+  failed?: boolean;
 }
 
 /**
@@ -78,6 +86,8 @@ export function AudioTrackMenu({
   hideTrigger = false,
   locked = false,
   provisional = false,
+  pending = false,
+  failed = false,
 }: AudioTrackMenuProps) {
   const [uncontrolledOpen, setUncontrolledOpen] = useState(false);
   const rawOpen = controlledOpen ?? uncontrolledOpen;
@@ -154,7 +164,7 @@ export function AudioTrackMenu({
     items[nextIndex]?.focus();
   }, []);
 
-  if (tracks.length === 0) return null;
+  if (tracks.length === 0 && !provisional && !pending && !failed && !open) return null;
 
   // Probed inventories can repeat the same stream at several container
   // indexes; the menu shows one row per distinct descriptor. The retained
@@ -190,6 +200,23 @@ export function AudioTrackMenu({
             <span className="text-xs font-medium tracking-wide text-white/50 uppercase">Audio</span>
             {provisional && <ProvisionalTrackBadge />}
           </div>
+          {failed && dedupedTracks.length === 0 && (
+            <div className="px-3 py-1 text-xs text-amber-300/80">Track discovery failed</div>
+          )}
+          {failed && dedupedTracks.length > 0 && (
+            <div className="px-3 py-1 text-xs text-white/50">
+              Showing available tracks — discovery did not complete
+            </div>
+          )}
+          {!failed && (pending || provisional) && (
+            <div className="flex items-center gap-2 px-3 py-1 text-xs text-white/50">
+              <span className="h-3 w-3 animate-spin rounded-full border border-white/20 border-t-white/80" />
+              <span>Discovering audio tracks…</span>
+            </div>
+          )}
+          {dedupedTracks.length === 0 && !failed && !pending && !provisional && (
+            <div className="px-3 py-2 text-xs text-white/40">No audio tracks available</div>
+          )}
           {dedupedTracks.map(({ track, index }) => {
             const descriptor = describeTrack(track, index);
             const isActive = index === activeIndex;
