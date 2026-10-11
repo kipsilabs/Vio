@@ -2793,11 +2793,25 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 					transient.HDR = true
 				}
 				h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
+				// The row has no probe stamp (it is exactly why this fast path
+				// ran with incomplete evidence), so a provisional plan alone
+				// would leave the inventory pending forever. Arm the
+				// post-commit probe on the row's own stored URL: the client
+				// still gets its URL immediately, and the worker resolves the
+				// pending inventory to verified or failed with
+				// inventory_updated. An already-stamped row skips this because
+				// the P0 fast path above owns it.
+				probeCand := cand
+				if len(persistedResumeStored.RequestHeaders) > 0 {
+					probeCand.RequestHeaders = cloneHeaderMap(persistedResumeStored.RequestHeaders)
+				}
+				deferred := h.virtualDeferredProbeForUnstampedRow(attemptCtx, stickyKey, file, persistedResumeStored.URL, probeCand, oid)
 				return &resolvedVirtualPlaybackSource{
 					URL: "", URI: cand.URI, OwnerID: oid, File: &transient,
 					ProbeSucceeded: false, Provenance: ProbeProvenancePending,
 					// Unranked: this path skipped the candidate list.
 					CandidateRank: -1, CandidateCount: -1,
+					DeferredProbe: deferred,
 				}, nil
 			}
 		}
@@ -3927,6 +3941,13 @@ const (
 // probe (stampProbe=true) still stamps probe_updated_at so collection rows
 // converge to probed evidence instead of re-probing on every start.
 //
+// The stamp is coupled to the inventory written: when audio_tracks or
+// subtitle_tracks carry a codec-bearing (non-hint) entry, the row is stamped
+// even on a write that did not ask for it, so real inventory never persists
+// alongside a NULL probe_updated_at. Language-only hint entries (provider
+// registration) do not trigger it, ClearProbe still clears the stamp, and a
+// collection-owned row still preserves its own.
+//
 // Path adoption is skipped when a sibling row (same virtual owner and library)
 // already owns the target path, and when the candidate's own verdict is failed.
 // When RequireAdopt is requested, the whole write is atomic with that fence: the
@@ -4052,10 +4073,32 @@ UPDATE media_files SET
     WHEN NOT $13::boolean THEN probe_source
     ELSE 'virtual'
   END,
+  -- The stamp is coupled to the inventory being written: a codec-bearing
+  -- audio/subtitle entry is real (probed) inventory, and a row may never carry
+  -- it alongside an unstamped (NULL) probe timestamp. Without the coupling a
+  -- metadata-only writer (a stored-URL refresh, an adoption that clears the
+  -- stamp) could persist real tracks while preserving a NULL stamp, and the
+  -- probe gate would then treat the row as never-probed forever. Provider
+  -- registration writes language-only hint entries (no codec), so a hint-only
+  -- write still preserves the previous stamp. ClearProbe still clears, and a
+  -- collection-owned row still preserves its own stamp, both as before.
   probe_updated_at = CASE
     WHEN probe_source = 'virtual_collection' THEN probe_updated_at
     WHEN $31::boolean THEN NULL
-    WHEN NOT $13::boolean THEN probe_updated_at
+    WHEN NOT $13::boolean AND NOT (
+      EXISTS (
+        SELECT 1 FROM jsonb_array_elements(
+          CASE WHEN jsonb_typeof($2::jsonb) = 'array' THEN $2::jsonb ELSE '[]'::jsonb END
+        ) AS audio_entry(entry)
+        WHERE COALESCE(NULLIF(entry->>'codec', ''), '') <> ''
+      )
+      OR EXISTS (
+        SELECT 1 FROM jsonb_array_elements(
+          CASE WHEN jsonb_typeof($3::jsonb) = 'array' THEN $3::jsonb ELSE '[]'::jsonb END
+        ) AS subtitle_entry(entry)
+        WHERE COALESCE(NULLIF(entry->>'codec', ''), '') <> ''
+      )
+    ) THEN probe_updated_at
     ELSE GREATEST(clock_timestamp(), probe_updated_at + interval '1 microsecond')
   END,
   updated_at       = GREATEST(clock_timestamp(), updated_at + interval '1 microsecond')
@@ -4655,9 +4698,15 @@ func (h *PlaybackHandler) virtualProbeEvidenceArgsForRow(ctx context.Context, ca
 		HDR:              probed.HDR,
 		Bitrate:          probed.Bitrate,
 		Duration:         probed.Duration,
-		StampProbe:       stampProbe,
-		UpdatedAt:        snap.UpdatedAt,
-		ProbeUpdatedAt:   snap.ProbeUpdatedAt,
+		// A codec-bearing audio/subtitle entry is real inventory, so the write
+		// must carry the probe stamp even when the caller asked for a
+		// metadata-only write. Otherwise the row persists real tracks with a
+		// NULL probe timestamp and the probe gate re-probes it forever (the
+		// discovery wiring break). The SQL applies the same coupling as a guard
+		// for the writers that build their args directly.
+		StampProbe:     stampProbe || virtualTrackInventoryCarriesCodec(probed.AudioTracks, probed.SubtitleTracks),
+		UpdatedAt:      snap.UpdatedAt,
+		ProbeUpdatedAt: snap.ProbeUpdatedAt,
 		// The row's own identity, for the release-replacement gate when this
 		// write adopts a cross-release candidate path. The probe path carries no
 		// candidate identity, so an adopted cross-release write replaces the
@@ -6212,6 +6261,51 @@ func allowDeferredProbe(deferProbe bool) bool {
 	return deferProbe
 }
 
+// virtualDeferredProbeForUnstampedRow builds the post-commit probe for a virtual
+// row that has never been probed (no probe stamp), so a start that serves the
+// row provisionally still hands the start path a worker to run after the
+// transport commits. Without it a direct-play validated start could serve a
+// codec-populated, unstamped row and arm no worker at all: the inventory
+// reported pending would never resolve to verified or failed, and only the
+// convergence watchdog would end it. It returns nil when a probe cannot run:
+// the row already carries a stamp, no prober is configured, or the resolved URL
+// is empty (nothing to enumerate). Value copies are captured now so a later
+// mutation of the request's file cannot change what is probed.
+func (h *PlaybackHandler) virtualDeferredProbeForUnstampedRow(
+	ctx context.Context,
+	stickyKey string,
+	file *models.MediaFile,
+	streamURL string,
+	cand VirtualPlaybackStream,
+	oid int,
+) *virtualDeferredProbeV3 {
+	if h == nil || file == nil {
+		return nil
+	}
+	if file.ProbeUpdatedAt != nil {
+		return nil
+	}
+	if h.VirtualPlaybackSourceProber == nil && h.VirtualPlaybackSourceProberWithHeaders == nil {
+		return nil
+	}
+	if strings.TrimSpace(streamURL) == "" {
+		return nil
+	}
+	probeTransient := cloneVirtualProbeTransient(*file)
+	// Zero the duration so the deferred probe measures the empirical duration
+	// instead of inheriting the catalog value.
+	probeTransient.Duration = 0
+	return &virtualDeferredProbeV3{
+		stickyKey:              stickyKey,
+		file:                   file,
+		streamURL:              streamURL,
+		probeTransient:         &probeTransient,
+		cand:                   cand,
+		expectedRuntimeMinutes: h.virtualExpectedRuntimeMinutes(ctx, file),
+		ownerID:                oid,
+	}
+}
+
 // mergeVirtualCandidateTracks supplements probed virtual file tracks with
 // metadata from the provider candidate. ffprobe may not always detect
 // language tags, codecs, or dimensions on remote streams (especially HLS
@@ -7006,6 +7100,26 @@ func marshalTracksJSON(tracks any) []byte {
 		return []byte("[]")
 	}
 	return data
+}
+
+// virtualTrackInventoryCarriesCodec reports whether an audio/subtitle inventory
+// holds at least one codec-bearing (non-hint) entry. Provider registration
+// writes language-only placeholder entries with no codec; a real probe fills in
+// a codec for every track. The presence of a codec is therefore the signal that
+// the inventory is real evidence, which is what couples the probe stamp to the
+// write (see VirtualFileMetadataUpdateSQL).
+func virtualTrackInventoryCarriesCodec(audio []models.AudioTrack, subtitles []models.SubtitleTrack) bool {
+	for _, track := range audio {
+		if strings.TrimSpace(track.Codec) != "" {
+			return true
+		}
+	}
+	for _, track := range subtitles {
+		if strings.TrimSpace(track.Codec) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // sanitizeTrackSlice ensures the value is a slice/array, not a scalar.

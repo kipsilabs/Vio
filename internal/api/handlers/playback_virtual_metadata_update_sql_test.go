@@ -143,9 +143,11 @@ func TestVirtualFileMetadataUpdateSQLShape(t *testing.T) {
 
 	// Pin the expected multiplicity so a placeholder that is dropped or
 	// duplicated without an accompanying arg change is caught. Reuse is
-	// intentional (e.g. $16/$17 fence the sibling, verdict and CAS clauses).
+	// intentional (e.g. $16/$17 fence the sibling, verdict and CAS clauses;
+	// $2/$3 appear once in the SET, once in the audio_channels derivation, and
+	// once each in the codec-bearing probe-stamp coupling).
 	wantCounts := map[int]int{
-		1: 1, 2: 3, 3: 1, 4: 1, 5: 1, 6: 1, 7: 1, 8: 1, 9: 1, 10: 2,
+		1: 1, 2: 5, 3: 3, 4: 1, 5: 1, 6: 1, 7: 1, 8: 1, 9: 1, 10: 2,
 		11: 1, 12: 2, 13: 2, 14: 1, 15: 1, 16: 8, 17: 8, 18: 13, 19: 6,
 		20: 2, 21: 2, 22: 1, 23: 4, 24: 1, 25: 2, 26: 2, 27: 2, 28: 2, 29: 2,
 		30: 8, 31: 2, 32: 2,

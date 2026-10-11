@@ -2507,7 +2507,13 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	// plan provisional now, before the transport commit and before the attempt
 	// record is written, so an idempotent replay of this attempt republishes the
 	// same provisional truth instead of appearing fully probed.
-	if resolved.DeferredProbe != nil && result.Plan != nil {
+	if resolved.DeferredProbe != nil && result.Plan != nil && h.deferTrackInventoryNegotiatedV3(r, req) {
+		// tracks_pending is part of the deferred_track_inventory_v1 lifecycle,
+		// so it is only advertised to a surface/client that negotiated it. An
+		// unstamped row now arms a deferred probe even without negotiation (the
+		// worker must still resolve the pending state), but the frozen /api/v1
+		// contract and a v2 client that did not advertise the feature must not
+		// grow the flag: they keep the byte-for-byte response they had before.
 		result.Plan.TracksPending = true
 	}
 	// enqueueDeferredPostCommitProbe runs the fresh-start resolve's deferred
