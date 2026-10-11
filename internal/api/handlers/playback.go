@@ -425,16 +425,24 @@ type PlaybackHandler struct {
 	// WatchTogetherAvailable is set when the room service and authenticated
 	// socket are wired, so capability discovery reflects their dependencies.
 	WatchTogetherAvailable bool
-	// progressSideEffectLocks serializes per-session handler side effects (v2
-	// progress persistence and inventory-updated publishes; see persistProgressV2
-	// and publishInventoryUpdatedToSession). It is reference-counted and bounded:
-	// the entry is created on the first acquire for a session and deleted when the
-	// last in-flight holder releases, so the map tracks concurrent writers rather
-	// than every session the process has ever served. progressSideEffectLocksMu
-	// guards the map and each entry's refcount; the entry's own mutex is the
-	// per-session side-effect lock.
-	progressSideEffectLocks   map[string]*progressSideEffectLockEntry
+	// progressSideEffectLocks serializes v2 progress side effects per session
+	// (see persistProgressV2). It is reference-counted and bounded: the entry is
+	// created on the first acquire for a session and deleted when the last
+	// in-flight holder releases, so the map tracks concurrent writers rather than
+	// every session the process has ever served. progressSideEffectLocksMu guards
+	// the map and each entry's refcount; the entry's own semaphore is the
+	// per-session lock.
+	progressSideEffectLocks   map[string]*sessionSideEffectLockEntry
 	progressSideEffectLocksMu sync.Mutex
+	// inventoryPublishLocks serializes inventory_updated pushes per session (see
+	// publishInventoryUpdatedToSession). It is deliberately a separate lock set
+	// from progressSideEffectLocks: an inventory push holds its lock across a
+	// plan-store read, the catalog/inventory build and a synchronous realtime
+	// write, so sharing the lock would make every progress write for the session
+	// queue behind the whole push. Same refcounted, self-evicting shape as
+	// progressSideEffectLocks.
+	inventoryPublishLocks   map[string]*sessionSideEffectLockEntry
+	inventoryPublishLocksMu sync.Mutex
 	// virtualDeliveryCleared records playback sessions whose first fully
 	// delivered HLS/transcode segment already recorded delivery evidence and
 	// cleared the candidate's failed mark. One entry per served session keeps a

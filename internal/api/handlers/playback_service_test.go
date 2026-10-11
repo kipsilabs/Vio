@@ -855,3 +855,109 @@ func TestForgetProgressSideEffectLockClearsDeliveryFlag(t *testing.T) {
 		t.Fatal("delivery flag survived session end")
 	}
 }
+
+// TestProgressWriteNotBlockedByInventoryPublish: an inventory_updated push holds
+// its per-session lock across a plan-store read, the catalog/inventory build and
+// a synchronous realtime write. A progress write for the same session must not
+// queue behind that work. Before the two lock sets were split they shared one
+// lock, and a progress write waited for the whole push — which is what put the
+// progress endpoint past the client's 5s deadline in production.
+func TestProgressWriteNotBlockedByInventoryPublish(t *testing.T) {
+	f := newPlaybackServiceFixture(t)
+	// Stand in for an in-flight inventory push: hold the lock
+	// publishInventoryUpdatedToSession takes for the whole build and send.
+	releaseInventory := f.handler.inventoryPublishLock(f.session.ID)
+	defer releaseInventory()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := f.handler.ApplyProgressV2(f.ctx, f.caller, f.session.ID, PlaybackProgressCommand{Sequence: 1, Position: 60})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("progress write: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("progress write blocked behind the inventory publish lock")
+	}
+}
+
+// TestProgressWriteAbandonsLockWhenContextEnds: a progress write that reaches the
+// per-session lock while another writer holds it must stop when the request
+// context ends instead of keeping the request open past the client's deadline.
+// The row CAS has already committed, so returning without the side effects is
+// safe: the client's retry replays and re-runs them.
+func TestProgressWriteAbandonsLockWhenContextEnds(t *testing.T) {
+	f := newPlaybackServiceFixture(t)
+	// Hold the progress lock as a slow in-flight writer would.
+	release := f.handler.progressSideEffectLock(f.session.ID)
+	defer release()
+
+	ctx, cancel := context.WithCancel(f.ctx)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := f.handler.ApplyProgressV2(ctx, f.caller, f.session.ID, PlaybackProgressCommand{Sequence: 1, Position: 60})
+		done <- err
+	}()
+
+	// The write sequences the sample on the row before it reaches the lock, so
+	// the committed sequence is the signal that it is now waiting on the held
+	// lock rather than still in the store.
+	deadline := time.Now().Add(time.Second)
+	for {
+		record, err := f.handler.PlanStoreV3.GetAttempt(context.Background(), f.session.ID)
+		if err == nil && record.LastSequence == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("precondition: sample was not sequenced on the row")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("progress write: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("progress write did not stop when the request context ended")
+	}
+}
+
+// TestInventoryPublishLockSerializesPerSession: after the lock split, inventory
+// pushes for one session still run one at a time, so an older build cannot be
+// delivered after a newer one, and the inventory lock set is independent of the
+// progress lock set.
+func TestInventoryPublishLockSerializesPerSession(t *testing.T) {
+	h := &PlaybackHandler{}
+	first := h.inventoryPublishLock("session-inventory")
+
+	acquired := make(chan struct{})
+	go func() {
+		release := h.inventoryPublishLock("session-inventory")
+		close(acquired)
+		release()
+	}()
+	select {
+	case <-acquired:
+		t.Fatal("second inventory publish acquired while the first was held")
+	case <-time.After(50 * time.Millisecond):
+	}
+	first()
+	select {
+	case <-acquired:
+	case <-time.After(time.Second):
+		t.Fatal("second inventory publish did not acquire after the first released")
+	}
+	h.progressSideEffectLocksMu.Lock()
+	progressLocks := len(h.progressSideEffectLocks)
+	h.progressSideEffectLocksMu.Unlock()
+	if progressLocks != 0 {
+		t.Fatalf("inventory push populated the progress lock set: %d entries", progressLocks)
+	}
+}
