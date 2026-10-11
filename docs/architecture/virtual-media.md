@@ -33,6 +33,25 @@ authorization, and playback.
    durable plans, or transcode recipes.
 5. The resolver runs at playback time so signed upstream URLs are not persisted.
 
+### Verified inventory requires a complete enumeration
+
+A virtual file's `verified` inventory status means the playback probe enumerated
+the whole stream table, not that it returned something. `scanner.ProbeVirtualSource`
+flags a partial enumeration (`scanner.ErrVirtualProbePartial`) when a successful
+ffprobe result describes video but no audio: every provider movie or episode
+carries audio, so a video-only table is a truncated read (a relay partial
+response, an analysis-budget cut-off, or an early return), not a video-only file.
+An empty subtitle set is a valid complete answer; only the missing audio stream
+marks a partial read.
+
+A partial probe is not a verdict about the candidate's bytes. The resolve serves
+the candidate's provisional plan at `pending` without consuming the probe-failure
+budget or releasing the sticky pin, and the deferred lifecycle records no outcome
+and publishes nothing. The session stays `pending` until a later complete probe
+verifies it or the convergence watchdog fails it at the bound. Synthesized or
+hint-only tracks (container index <= 0) never satisfy completeness and never stamp
+`probe_updated_at`; persisted probe evidence requires a real stream index.
+
 ## Indexer-only releases
 
 A title can exist at the indexers before the streaming provider has cached it.

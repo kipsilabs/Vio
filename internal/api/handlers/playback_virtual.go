@@ -260,9 +260,12 @@ func (c *virtualProbeFailureCache) count(key string) int {
 // virtualProbeVerdictUnknown reports whether an error leaves the candidate's
 // health unknown rather than condemning it: the caller's outer budget fired or
 // the request was canceled while the probe was still running under its own
-// timeout. The probe may yet complete in the cache, so this must not unpin.
+// timeout, or the probe returned only a partial enumeration. The probe may yet
+// complete in the cache, so this must not unpin.
 func virtualProbeVerdictUnknown(err error) bool {
-	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
+	return errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, scanner.ErrVirtualProbePartial)
 }
 
 func (c *virtualProbeFailureCache) clear(key string) {
@@ -1282,6 +1285,7 @@ type ProbeProvenance string
 const (
 	ProbeProvenanceDeclared ProbeProvenance = "declared"
 	ProbeProvenancePending  ProbeProvenance = "pending"
+	ProbeProvenancePartial  ProbeProvenance = "partial"
 	ProbeProvenanceVerified ProbeProvenance = "verified"
 	ProbeProvenanceFailed   ProbeProvenance = "failed"
 )
@@ -3077,11 +3081,17 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			}, resolvedIdentity, resolvedRematched), nil
 		}
 		probeKey := virtualProbeFailureKey(cand.URI, oid)
-		declaredFallback := func() (*resolvedVirtualPlaybackSource, error) {
-			// Resolution precedence: stored evidence wins; otherwise adopt
-			// the candidate's declared label; only when both are absent is
-			// the 1080p baseline assumed. Only the last case marks
-			// ResolutionAssumed, so a declared 2160p is never clobbered.
+		// mergeDeclaredFallback backfills the candidate's declared metadata onto
+		// the transient plan file and returns the resolved source under the given
+		// provenance. Resolution precedence: stored evidence wins; otherwise
+		// adopt the candidate's declared label; only when both are absent is the
+		// 1080p baseline assumed. Only the last case marks ResolutionAssumed, so a
+		// declared 2160p is never clobbered.
+		//
+		// A partial enumeration reuses it with pending provenance: the candidate's
+		// bytes are not condemned, it keeps playing on its provisional plan, and no
+		// probe evidence is published.
+		mergeDeclaredFallback := func(provenance ProbeProvenance) (*resolvedVirtualPlaybackSource, error) {
 			if transient.Resolution == "" {
 				transient.Resolution = cand.Resolution
 			}
@@ -3095,8 +3105,11 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			}
 			h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
 			return withResolvedCandidate(&resolvedVirtualPlaybackSource{
-				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenanceFailed, ResolutionAssumed: resolutionAssumed,
+				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: provenance, ResolutionAssumed: resolutionAssumed,
 			}, resolvedIdentity, resolvedRematched), nil
+		}
+		declaredFallback := func() (*resolvedVirtualPlaybackSource, error) {
+			return mergeDeclaredFallback(ProbeProvenanceFailed)
 		}
 		if virtualProbeFailures.recent(probeKey) {
 			// A recent probe failure already consumed the probe budget. A
@@ -3146,6 +3159,15 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		trace.probe += time.Since(probeStart)
 		probeCancel()
 		if probeErr != nil || probed == nil {
+			if errors.Is(probeErr, scanner.ErrVirtualProbePartial) {
+				// The enumeration is incomplete, not the candidate invalid: hold
+				// the source pending (non-verified) without consuming the failure
+				// budget or releasing the pin. Nothing is persisted or published as
+				// verified; a later complete probe verifies it.
+				slog.DebugContext(r.Context(), "virtual stream probe enumeration incomplete; holding inventory pending",
+					"component", "api", "candidate_uri", cand.URI, "error", probeErr)
+				return mergeDeclaredFallback(ProbeProvenancePending)
+			}
 			virtualProbeFailures.mark(probeKey)
 			slog.DebugContext(r.Context(), "virtual stream probe timed out or failed; using candidate metadata", "component", "api", "candidate_uri", cand.URI, "error", probeErr)
 			return declaredFallback()
@@ -3468,6 +3490,18 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 		return "", 0
 	}
 	if probeErr != nil || probed == nil {
+		if errors.Is(probeErr, scanner.ErrVirtualProbePartial) {
+			// The probe completed but enumerated only part of the stream
+			// table. That is not a verdict about the candidate's bytes, so do
+			// not mark the failure damper or release the pin. Hold the session
+			// pending (non-verified) instead of returning verified: the
+			// convergence watchdog fails it at the bound if no complete probe
+			// lands first, and a later complete probe verifies it. Nothing is
+			// persisted, so the row keeps its previous evidence and stamp.
+			slog.WarnContext(bgCtx, "virtual probe enumeration incomplete; holding inventory pending",
+				"component", "api", "candidate_uri", probeCand.URI, "file_id", catalogFile.ID)
+			return probeOutcomePartial, 0
+		}
 		virtualProbeFailures.mark(probeKey)
 		slog.WarnContext(bgCtx, "background virtual stream probe failed", "component", "api", "candidate_uri", probeCand.URI, "error", probeErr)
 		// A context error (outer budget fired, request canceled) means the

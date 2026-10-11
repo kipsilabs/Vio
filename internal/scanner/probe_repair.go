@@ -235,6 +235,50 @@ func (r copySafetyResult) matches(file *models.MediaFile) bool {
 // rejection; every other probe error leaves the verdict unknown or repeated.
 var ErrVirtualProbeNoTracks = errors.New("virtual probe returned no audio or video streams")
 
+// ErrVirtualProbePartial reports that ffprobe exited successfully against a
+// virtual source but enumerated only part of its track table. A relay that
+// serves a partial byte range, an analysis budget that lapses, or an early
+// return can leave ffprobe with a parseable stream list that is missing whole
+// stream kinds: the production signature is an audiovisual source that comes
+// back with video and subtitles but no audio track at all. Such a result is not
+// a verdict about the candidate's bytes, so callers must hold it at pending (or
+// fail it after a bound) and must never publish it as verified.
+var ErrVirtualProbePartial = errors.New("virtual probe returned an incomplete stream enumeration")
+
+// virtualProbeEnumerationPartial reports whether a successful ffprobe result
+// enumerated only part of a virtual source's streams. The stream table is
+// complete when every stream kind the container carries was read; the one
+// structural gap ffprobe can leave behind is a missing audio track on an
+// audiovisual file, because every provider movie or episode carries audio and
+// ffprobe reads video first. A probe that found any stream but no audio is a
+// partial read, not a video-only file.
+//
+// A subtitle set is complete whether it holds tracks or is empty: provider
+// content is commonly delivered without embedded subtitles, so an empty
+// subtitle inventory is a valid closed answer and is deliberately not a signal
+// here. Enumerated tracks must carry a real container stream index; ffprobe
+// numbers every stream it sees, so a track without one (index < 0) did not come
+// from the container's stream table either.
+func virtualProbeEnumerationPartial(probe *ProbeData) bool {
+	if probe == nil {
+		return false
+	}
+	if len(probe.VideoTracks) > 0 && len(probe.AudioTracks) == 0 {
+		return true
+	}
+	for _, track := range probe.AudioTracks {
+		if track.Index < 0 {
+			return true
+		}
+	}
+	for _, track := range probe.SubtitleTracks {
+		if track.Index < 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // ProbeVirtualSource probes a virtual (plugin-provided) stream for playback
 // metadata without letting the provider's signed URL replace the canonical
 // virtual URI on the resulting row.
@@ -253,6 +297,14 @@ func ProbeVirtualSource(
 	}
 	if probe == nil || (len(probe.AudioTracks) == 0 && len(probe.VideoTracks) == 0) {
 		return file, ErrVirtualProbeNoTracks
+	}
+	if virtualProbeEnumerationPartial(probe) {
+		// The enumeration is incomplete, so the result must not be persisted,
+		// stamped, or published as verified. Returning the original file keeps
+		// the caller's row unchanged; the distinct sentinel lets the playback
+		// handler tell a partial read (retry / hold pending) from a definitive
+		// content rejection.
+		return file, ErrVirtualProbePartial
 	}
 	updated := *file
 	applyProbeData(&updated, probe, "virtual")
