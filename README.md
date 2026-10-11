@@ -80,6 +80,25 @@ Existing library data is preserved when upgrading.
   </tr>
 </table>
 
+### Stremio, requests, and collections
+
+- **Stremio & Virtual Library (core streaming)** — paste a Stremio addon
+  manifest URL (for example Torrentio with Real-Debrid, AllDebrid,
+  Premiumize, or Torbox) in **Admin › Settings › Streaming** and Vio resolves
+  direct debrid HTTP streams into native playback — no local files needed.
+  See the [Stremio integration guide](docs/wiki/admin/stremio-integration.md).
+- **Built-in media requests** — household members request missing movies and
+  series from Discover or the title page; approved requests fulfill through
+  the built-in Virtual Library router or external Sonarr/Radarr servers.
+  See [Media requests](docs/wiki/admin/media-requests.md), including the
+  [automatic Virtual Library fallback](docs/wiki/admin/media-requests.md#automatic-virtual-library-fallback)
+  and [requesting an indexer release](docs/wiki/admin/stremio-integration.md#request-a-title-versus-request-an-indexer-release).
+- **Dynamic collections** — smart queries, per-profile personal collections
+  with household sharing, and scheduled syncs from TMDB, Trakt, or MDBList,
+  plus a one-click template gallery and bundles. See
+  [Collections](docs/wiki/admin/collections-guide.md) and the existing
+  [Collection templates](docs/wiki/admin/collection-templates.md) reference.
+
 ## Quick start
 
 Requires Docker Compose 2.24 or newer. The default stack runs Vio Server,
@@ -123,6 +142,12 @@ defines each tag and the SemVer contract.
 ## Documentation
 
 - [Documentation index](docs/wiki/index.md) — user and operator guides
+  (also published to the [manual](https://siloserver.org/docs)):
+  - [Deploy with Docker](docs/wiki/deployment/docker.md)
+  - [Stremio integration](docs/wiki/admin/stremio-integration.md)
+  - [Media requests](docs/wiki/admin/media-requests.md)
+  - [Collections](docs/wiki/admin/collections-guide.md)
+  - [Collection templates](docs/wiki/admin/collection-templates.md)
 - [Silo to Vio migration](docs/silo-to-vio-migration.md) — Phase 1 cutover for Silo installs
 - [Development guide](DEVELOPMENT.md) — source setup, builds, tests, migrations
 - [Settings API](docs/settings-api.md), [Downloads API](docs/downloads-api.md), and [Apple Push Display Token](docs/notifications-push-api.md) — client contracts
