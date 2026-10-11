@@ -506,7 +506,7 @@ func (h *PlaybackHandler) persistProgressV2(ctx context.Context, store playback.
 	for pass := 0; pass < maxProgressWritePassesV2; pass++ {
 		if ctx.Err() != nil {
 			// The client aborted. The row is committed, so the retry replays and
-			// re-runs the writers; do not keep writing under a cancelled context.
+			// re-runs the writers; do not keep writing under a canceled context.
 			return
 		}
 		h.writeProgressSideEffectsV2(ctx, record, sessionID, target)
@@ -564,7 +564,7 @@ func newSessionSideEffectLockEntry() *sessionSideEffectLockEntry {
 // sessions the process has served, and an entry is never deleted while any
 // caller still holds or is waiting on its lock — deleting a held lock would let
 // a later caller create a second one for the same session and run side effects
-// concurrently, which is exactly what this lock prevents. A cancelled acquire
+// concurrently, which is exactly what this lock prevents. A canceled acquire
 // drops its reference without ever taking the lock.
 func acquireSessionSideEffectLock(ctx context.Context, mu *sync.Mutex, locks *map[string]*sessionSideEffectLockEntry, sessionID string) (func(), bool) {
 	if sessionID == "" {
