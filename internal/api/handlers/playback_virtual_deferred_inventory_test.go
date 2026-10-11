@@ -668,3 +668,224 @@ func TestDeferredProbeOutcomeFencedByCandidateBinding(t *testing.T) {
 		t.Fatal("binding fence accepted a probe for the superseded candidate")
 	}
 }
+
+// TestVerifiedInventoryServesEmptyAudioAsArrayNotNull pins the endpoint
+// contract that produced the reported null. A verified row whose probe
+// enumerated no audio tracks must serialize audio_tracks as [], never null. A
+// client cannot tell null from "not enumerated", so a null kept an empty audio
+// menu on a finished, verified inventory. The inventory_updated push already
+// coerced nil to []; the GET endpoint did not.
+func TestVerifiedInventoryServesEmptyAudioAsArrayNotNull(t *testing.T) {
+	const fileID = 8110
+	uri := "virtual://movie/tt-empty-audio?result=cand-1"
+	probedAt := time.Now().UTC()
+	row := models.MediaFile{
+		ID:                         fileID,
+		ContentID:                  "movie-empty-audio",
+		FilePath:                   uri,
+		VirtualOwnerInstallationID: 5,
+		AudioTracks:                []models.AudioTrack{},
+		ProbeUpdatedAt:             &probedAt,
+	}
+	manager := playback.NewSessionManager(0, 0)
+	session, err := manager.StartSession(1, "profile-1", fileID, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	if err := manager.SetVirtualSource(session.ID, uri, 5); err != nil {
+		t.Fatalf("SetVirtualSource: %v", err)
+	}
+	resolver := &syncPlaybackFileResolver{file: row}
+	handler := NewPlaybackHandler(manager, resolver)
+	handler.InstallationID = "test-install"
+	serviceCtx, serviceCancel := context.WithCancel(context.Background())
+	handler.ServiceContext = serviceCtx
+	t.Cleanup(serviceCancel)
+	if err := handler.PlanStoreV3.SaveAttempt(context.Background(), playback.AttemptRecordV3{
+		PlaybackAttemptID: "attempt-empty-audio", SessionID: session.ID, UserID: 1, ProfileID: "profile-1",
+		RequestedMediaFileID: fileID, EffectiveMediaFileID: fileID, ExpiresAt: time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("SaveAttempt: %v", err)
+	}
+
+	inventory, err := handler.GetPlaybackInventoryV2(newAuthorizedPlaybackContext(), PlaybackCaller{UserID: 1, ProfileID: "profile-1", InstallationID: "test-install"}, session.ID)
+	if err != nil {
+		t.Fatalf("GetPlaybackInventoryV2: %v", err)
+	}
+	if inventory.InventoryStatus != string(ProbeProvenanceVerified) {
+		t.Fatalf("inventory status = %q, want verified", inventory.InventoryStatus)
+	}
+	if inventory.AudioTracks == nil {
+		t.Fatal("verified inventory AudioTracks is nil; want an empty slice (JSON [])")
+	}
+	raw, err := json.Marshal(inventory)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	var decoded map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	if got := string(decoded["audio_tracks"]); got != "[]" {
+		t.Fatalf("audio_tracks = %s, want []", got)
+	}
+}
+
+// TestDeferredProbeCommitsAudioAndPollServesIt is the deferred-persistence
+// regression: a deferred probe that enumerates audio must commit that audio to
+// the catalog row it writes (not only its subtitle inventory), and a later
+// inventory poll must serve it. It guards the deferred path against committing
+// or serving an audio-free menu for a release whose probe enumerated tracks.
+func TestDeferredProbeCommitsAudioAndPollServesIt(t *testing.T) {
+	source := v3HandlerFixtureFile(t)
+	source.ID = 712
+	source.ContentID = "movie-deferred-audio-712"
+	source.FilePath = "virtual://movie/tt-deferred-audio-712?result=cand-1"
+	source.VirtualOwnerInstallationID = 5
+	source.ProbeUpdatedAt = nil
+	source.AudioTracks = nil
+
+	manager := playback.NewSessionManager(0, 0)
+	resolver := &syncPlaybackFileResolver{file: *source}
+	handler := NewPlaybackHandler(manager, resolver)
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "true"}}
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	handler.PlaybackConfig = playbackTestConfig("", "")
+	handler.RealtimeHub = playback.NewRealtimeHub()
+	handler.InstallationID = "test-install"
+	stubCopySeekAnchorV3(handler)
+
+	handler.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(func(_ context.Context, path string, _ int, _ string, _ int) (string, error) {
+		return "http://127.0.0.1:8080/stream?path=" + path, nil
+	})
+	handler.VirtualPlaybackSourceProber = func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
+		f.AudioTracks = []models.AudioTrack{{Codec: "eac3", Channels: 6, Language: "jpn", Default: true}}
+		f.CodecAudio = "eac3"
+		return f, nil
+	}
+	probedAt := time.Now().UTC()
+	var savedAudio []models.AudioTrack
+	handler.VirtualFileMetadataSaver = func(_ context.Context, args models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error) {
+		if err := json.Unmarshal(args.AudioTracks, &savedAudio); err != nil {
+			return VirtualFileMetadataUpdateResult{}, err
+		}
+		audio := append([]models.AudioTrack(nil), savedAudio...)
+		resolver.update(func(f *models.MediaFile) {
+			f.AudioTracks = audio
+			f.CodecAudio = args.CodecAudio
+			f.ProbeUpdatedAt = &probedAt
+		})
+		return VirtualFileMetadataUpdateResult{MetadataUpdated: true, RowsAffected: 1}, nil
+	}
+
+	start := startV3PlaybackV2ForHandlerTest(t, handler, func() playback.StartRequestV3 {
+		request := v3HandlerStartRequest()
+		request.FileID = source.ID
+		request.QualityPreference = "original"
+		request.ClientFeatures = append(request.ClientFeatures, playback.FeatureDeferredTrackInventoryV3)
+		return request
+	}())
+	if start.PlaybackPlan == nil {
+		t.Fatal("start returned no playback plan")
+	}
+	t.Cleanup(func() { handler.tm.CloseTranscodeSession(start.SessionID, "") })
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		inventory, err := handler.GetPlaybackInventoryV2(newAuthorizedPlaybackContext(), PlaybackCaller{UserID: 1, ProfileID: "profile-1", InstallationID: "test-install"}, start.SessionID)
+		if err != nil {
+			t.Fatalf("GetPlaybackInventoryV2: %v", err)
+		}
+		if inventory.InventoryStatus == string(ProbeProvenanceVerified) {
+			if len(savedAudio) != 1 || savedAudio[0].Language != "jpn" {
+				t.Fatalf("deferred probe committed audio = %+v, want the probed jpn track", savedAudio)
+			}
+			if len(inventory.AudioTracks) != 1 || inventory.AudioTracks[0].Language != "jpn" {
+				t.Fatalf("verified poll audio = %+v, want the committed jpn track", inventory.AudioTracks)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("inventory poll status = %q, want verified", inventory.InventoryStatus)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestPlaceholderInventoryServesCarriedAudio is the reported-shape regression:
+// a collection-owned virtual row keeps its neutral path, so no catalog row names
+// the bound candidate URI and the inventory resolves through the placeholder.
+// The session's plan-time audio must still reach the poll, as it already does
+// for subtitles, instead of an empty or null menu. A verified outcome is
+// attached because the deferred probe committed, so the served inventory must
+// stay truthful: declared but enumerated, never null.
+func TestPlaceholderInventoryServesCarriedAudio(t *testing.T) {
+	const rowID = 8111
+	const declaredLang = "jpn"
+	candidateURI := "virtual://show/tt-placeholder/s4e3?result=cand-1"
+	probedAt := time.Now().UTC()
+	row := models.MediaFile{
+		ID:                         rowID,
+		ContentID:                  "movie-placeholder-audio",
+		FilePath:                   "virtual://show/tt-placeholder/s4e3",
+		VirtualOwnerInstallationID: 5,
+		AudioTracks:                []models.AudioTrack{{Index: 3, Codec: "truehd", Channels: 8, Language: "eng"}},
+		ProbeUpdatedAt:             &probedAt,
+	}
+	manager := playback.NewSessionManager(0, 0)
+	session, err := manager.StartSession(1, "profile-1", rowID, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	if err := manager.SetVirtualSource(session.ID, candidateURI, 5); err != nil {
+		t.Fatalf("SetVirtualSource: %v", err)
+	}
+	// A deferred plan retains the declared audio and its anchor even without a
+	// probe stamp; the outcome is written later when the deferred probe lands.
+	if err := manager.UpdateStreamState(session.ID, playback.SessionStreamState{
+		VirtualSourceSet:              true,
+		VirtualSourceOwnershipSet:     true,
+		VirtualSourceURI:              candidateURI,
+		VirtualSubtitleEvidenceSet:    false,
+		VirtualAudioTracks:            []models.AudioTrack{{Index: 1, Codec: "eac3", Channels: 6, Language: declaredLang}},
+		VirtualSubtitleEvidenceURI:    candidateURI,
+		VirtualSubtitleEvidenceFileID: rowID,
+	}); err != nil {
+		t.Fatalf("UpdateStreamState: %v", err)
+	}
+	if err := manager.SetVirtualProbeOutcome(session.ID, probeOutcomeVerified); err != nil {
+		t.Fatalf("SetVirtualProbeOutcome: %v", err)
+	}
+
+	resolver := &syncPlaybackFileResolver{file: row}
+	handler := NewPlaybackHandler(manager, resolver)
+	handler.InstallationID = "test-install"
+	serviceCtx, serviceCancel := context.WithCancel(context.Background())
+	handler.ServiceContext = serviceCtx
+	t.Cleanup(serviceCancel)
+	if err := handler.PlanStoreV3.SaveAttempt(context.Background(), playback.AttemptRecordV3{
+		PlaybackAttemptID: "attempt-placeholder-audio", SessionID: session.ID, UserID: 1, ProfileID: "profile-1",
+		RequestedMediaFileID: rowID, EffectiveMediaFileID: rowID, ExpiresAt: time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("SaveAttempt: %v", err)
+	}
+
+	inventory, err := handler.GetPlaybackInventoryV2(newAuthorizedPlaybackContext(), PlaybackCaller{UserID: 1, ProfileID: "profile-1", InstallationID: "test-install"}, session.ID)
+	if err != nil {
+		t.Fatalf("GetPlaybackInventoryV2: %v", err)
+	}
+	if len(inventory.AudioTracks) != 1 || inventory.AudioTracks[0].Language != declaredLang {
+		t.Fatalf("polled audio = %+v, want the carried %s inventory", inventory.AudioTracks, declaredLang)
+	}
+	raw, err := json.Marshal(inventory)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	var decoded map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	if got := string(decoded["audio_tracks"]); got == "null" {
+		t.Fatal("polled inventory serialized audio_tracks null")
+	}
+}

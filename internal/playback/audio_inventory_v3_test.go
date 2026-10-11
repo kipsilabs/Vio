@@ -53,11 +53,13 @@ func TestAudioInventoryV3CarriesCanonicalSelectionOrdinal(t *testing.T) {
 		}
 	}
 
-	// A nil or track-less file publishes no inventory rather than a stray entry.
-	if got := audioInventoryV3(nil); got != nil {
-		t.Fatalf("audioInventoryV3(nil) = %#v, want nil", got)
+	// A nil or track-less file publishes an empty inventory, never nil: the
+	// wire field has no omitempty, so nil would serialize as null and read as
+	// "not enumerated". An empty slice keeps verified meaning enumerated-empty.
+	if got := audioInventoryV3(nil); got == nil || len(got) != 0 {
+		t.Fatalf("audioInventoryV3(nil) = %#v, want an empty non-nil slice", got)
 	}
-	if got := audioInventoryV3(&models.MediaFile{ID: 1}); got != nil {
-		t.Fatalf("audioInventoryV3(no tracks) = %#v, want nil", got)
+	if got := audioInventoryV3(&models.MediaFile{ID: 1}); got == nil || len(got) != 0 {
+		t.Fatalf("audioInventoryV3(no tracks) = %#v, want an empty non-nil slice", got)
 	}
 }

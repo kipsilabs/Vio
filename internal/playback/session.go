@@ -1481,11 +1481,27 @@ func applySessionStreamStateLocked(s *Session, state SessionStreamState) {
 			// when they carry evidence, so they keep their historical shape.
 			s.VirtualSubtitleTracks = nil
 			s.VirtualExternalSubtitles = nil
-			s.VirtualAudioTracks = nil
-			s.VirtualSubtitleEvidenceURI = ""
-			s.VirtualSubtitleEvidenceFileID = 0
 			s.VirtualSourceRevision = ""
 			s.VirtualSubtitleEvidenceSet = false
+			if strings.TrimSpace(state.VirtualSourceURI) != "" {
+				// Audio is carried independently of the probe-evidence flag.
+				// Declared audio tracks are a legitimate placeholder (the
+				// planner synthesizes and serves them), so a virtual binding
+				// keeps the plan-time inventory for the serve overlay even
+				// before a probe stamps the row. The provenance anchor is kept
+				// with it: the same candidate URI plus row id let the overlay
+				// reject the inventory once a rotation moves the binding, which
+				// is what keeps a declared menu from crossing releases.
+				s.VirtualAudioTracks = state.VirtualAudioTracks
+				s.VirtualSubtitleEvidenceURI = state.VirtualSubtitleEvidenceURI
+				s.VirtualSubtitleEvidenceFileID = state.VirtualSubtitleEvidenceFileID
+			} else {
+				// A non-virtual effective file clears any previous virtual
+				// inventory and its anchor.
+				s.VirtualAudioTracks = nil
+				s.VirtualSubtitleEvidenceURI = ""
+				s.VirtualSubtitleEvidenceFileID = 0
+			}
 		}
 	}
 	s.SubtitleTrackIndex = state.SubtitleTrackIndex
@@ -1628,10 +1644,20 @@ func restoreSessionStreamStateLocked(s *Session, state SessionStreamState) {
 	} else {
 		s.VirtualSubtitleTracks = nil
 		s.VirtualExternalSubtitles = nil
-		s.VirtualAudioTracks = nil
-		s.VirtualSubtitleEvidenceURI = ""
-		s.VirtualSubtitleEvidenceFileID = 0
 		s.VirtualSubtitleEvidenceSet = false
+		// Mirror applySessionStreamStateLocked: a virtual binding keeps its
+		// plan-time audio inventory and provenance anchor across a rollback
+		// even without a probe stamp, so the serve overlay can still describe
+		// the release without crossing onto another candidate.
+		if strings.TrimSpace(state.VirtualSourceURI) != "" {
+			s.VirtualAudioTracks = state.VirtualAudioTracks
+			s.VirtualSubtitleEvidenceURI = state.VirtualSubtitleEvidenceURI
+			s.VirtualSubtitleEvidenceFileID = state.VirtualSubtitleEvidenceFileID
+		} else {
+			s.VirtualAudioTracks = nil
+			s.VirtualSubtitleEvidenceURI = ""
+			s.VirtualSubtitleEvidenceFileID = 0
+		}
 	}
 	s.SubtitleTrackIndex = state.SubtitleTrackIndex
 	s.SubtitleBurnIn = state.SubtitleBurnIn
