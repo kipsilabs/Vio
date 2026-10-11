@@ -4395,7 +4395,7 @@ func (h *PlaybackHandler) virtualProbeEvidenceArgs(ctx context.Context, catalogF
 // left to the SQL fence) rather than adopting bytes whose owner is unknown. The
 // refusal is logged with the concrete cause, never a lumped bucket.
 func (h *PlaybackHandler) virtualProbeEvidenceRotateTarget(ctx context.Context, catalogFile *models.MediaFile, resolvedPath string, probed *models.MediaFile) (*models.MediaFile, *models.MediaFile, bool) {
-	if !virtualProbeEvidenceRequiresAdoption(catalogFile, resolvedPath) {
+	if virtualProbeEvidenceSharesRowRelease(catalogFile, resolvedPath, probed) {
 		return catalogFile, probed, true
 	}
 	ownerRow, ownerErr := h.virtualPathOwnerRow(ctx, catalogFile, resolvedPath, catalogFile.VirtualOwnerInstallationID, catalogFile.MediaFolderID)
@@ -4475,6 +4475,32 @@ func virtualSiblingOwnerSharesRelease(a, b *models.MediaFile) bool {
 	return shared
 }
 
+// virtualProbeEvidenceSharesRowRelease reports whether probe evidence for a
+// candidate belongs to the row's own release. The exact and provider-neutral
+// ownership checks (virtualCandidateRowVerified) decide the common case; a
+// provider that renumbered its per-listing result ids surfaces the same release
+// under a new concrete id, which the row's durable identity proves is the same
+// release. Such a churned candidate is the row's own evidence and is written
+// against the row's pinned path rather than requiring a fenced cross-release
+// adoption of the new token. A genuinely different release shares no tier, so
+// it keeps the existing cross-release path.
+func virtualProbeEvidenceSharesRowRelease(row *models.MediaFile, candidateURI string, probed *models.MediaFile) bool {
+	if row == nil {
+		return false
+	}
+	if virtualCandidateRowVerified(row, candidateURI) {
+		return true
+	}
+	if probed == nil {
+		return false
+	}
+	_, shared := resolver.PersistedIdentitiesMatch(
+		resolver.NewPersistedIdentityTiers(row.ProviderVideoHash, row.ProviderGUID, row.ProviderReleaseName, row.ProviderReleaseSize),
+		resolver.NewPersistedIdentityTiers(probed.ProviderVideoHash, probed.ProviderGUID, probed.ProviderReleaseName, probed.ProviderReleaseSize),
+	)
+	return shared
+}
+
 // virtualProbeEvidenceArgsForRow builds the catalog write for one probe result
 // against the row the evidence belongs to. It returns false when the write must
 // be refused: a cross-release candidate the row cannot adopt (a collection-owned
@@ -4494,8 +4520,19 @@ func (h *PlaybackHandler) virtualProbeEvidenceArgsForRow(ctx context.Context, ca
 	// only with RequireAdopt set, so the SQL fence accepts or refuses the whole
 	// write atomically. The same-release cases stay metadata-only: the row
 	// carries the candidate's exact identity, or the provider-neutral identity
-	// with no concrete pick (a neutral row owns every candidate in its release).
-	crossRelease := virtualProbeEvidenceRequiresAdoption(catalogFile, resolvedPath)
+	// with no concrete pick (a neutral row owns every candidate in its release),
+	// or the row's durable identity proves a provider-renumbered candidate is the
+	// same release under a new listing token.
+	crossRelease := !virtualProbeEvidenceSharesRowRelease(catalogFile, resolvedPath, probed)
+	// Adopt against the session pin: when the row already carries a concrete
+	// ?result= pick and only durable identity ties the resolved churned token to
+	// it, keep the row's concrete path and write the evidence metadata-only
+	// rather than moving the row onto the new token. A neutral row has no pin to
+	// carry and still adopts the resolved concrete candidate, matching the
+	// pre-existing pick.
+	if !crossRelease && adoptPath != "" && !virtualCandidateRowVerified(catalogFile, resolvedPath) {
+		adoptPath = ""
+	}
 	if crossRelease && adoptPath == "" {
 		// A collection-owned row is never rewritten (the collection sync would
 		// reconcile the adopted path away), so there is no adoption target to

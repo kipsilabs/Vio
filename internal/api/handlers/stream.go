@@ -654,13 +654,32 @@ func (h *StreamHandler) handoffVirtualSessionToCachedWithSnapshot(ctx context.Co
 		return ResolvedVirtualMedia{}, nil, false, err
 	}
 	if !sameVirtualReleaseCandidate(pinnedID, resolved.CandidateID) {
-		if cleanup != nil {
-			cleanup()
-		}
-		if pinnedID == "" || resolved.CandidateID == "" {
+		if pinnedID == "" {
+			if cleanup != nil {
+				cleanup()
+			}
 			return ResolvedVirtualMedia{}, nil, false, fmt.Errorf("cache handoff cannot verify the pinned release: pinned candidate %q, resolved candidate %q; refusing an unverifiable handoff", pinnedID, resolved.CandidateID)
 		}
-		return ResolvedVirtualMedia{}, nil, false, fmt.Errorf("cache handoff resolved candidate %q for pinned candidate %q; refusing a release swap", resolved.CandidateID, pinnedID)
+		// A provider that renumbers its per-listing result ids names the same
+		// release under a new concrete candidate. That is not a release swap:
+		// carry the session pin forward and rebind the session to the pinned
+		// candidate, never the churned listing token. A resolve that shares no
+		// durable identity with the pin, or that names no candidate at all, is
+		// still refused so a cache handoff can never silently switch releases.
+		if !resolved.IdentityRematched && !resolvedMatchesPersistedIdentity(resolved, file) {
+			if cleanup != nil {
+				cleanup()
+			}
+			if resolved.CandidateID == "" {
+				return ResolvedVirtualMedia{}, nil, false, fmt.Errorf("cache handoff cannot verify the pinned release: pinned candidate %q, resolved candidate %q; refusing an unverifiable handoff", pinnedID, resolved.CandidateID)
+			}
+			return ResolvedVirtualMedia{}, nil, false, fmt.Errorf("cache handoff resolved candidate %q for pinned candidate %q; refusing a release swap", resolved.CandidateID, pinnedID)
+		}
+		// Adopt against the session pin: keep the candidate the session is
+		// actually serving. The cached bytes are the same release, so the
+		// provider-neutral pin remains the binding identity.
+		resolved.URI = file.FilePath
+		resolved.CandidateID = pinnedID
 	}
 	if !h.commitHandoffVirtualSessionSource(ctx, session.ID, snap, snapSet, resolved) {
 		if cleanup != nil {
