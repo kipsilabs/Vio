@@ -231,7 +231,7 @@ func TestConsumerProbeTemporaryFailureNeverStampsVideoCandidate(t *testing.T) {
 			file := &models.MediaFile{ID: 801, ContentID: "series-tt", EpisodeID: "ep-1", FilePath: uri, VirtualOwnerInstallationID: 5}
 			cand := VirtualPlaybackStream{ID: "cand-1", URI: uri}
 
-			h.probeVirtualSourceAndPersist(context.Background(), stickyKey, file, "http://provider.example/stream", *file, cand, 45, 5)
+			h.probeVirtualSourceAndPersist(context.Background(), stickyKey, file, "http://provider.example/stream", *file, cand, noCandidateIdentity, 45, 5)
 
 			if stamped != 0 {
 				t.Fatalf("status %s: probe failure stamped the video candidate %d times, want 0", tc.name, stamped)

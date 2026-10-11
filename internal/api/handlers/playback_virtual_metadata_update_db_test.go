@@ -289,13 +289,13 @@ func TestVirtualMetadataUpdateRecoversEvidenceAfterTransientTimeout(t *testing.T
 	cand := VirtualPlaybackStream{ID: "cand-a", URI: candidatePath}
 
 	// The transient timeout marks the damper but must not stamp the row.
-	h.probeVirtualSourceAndPersist(ctx, "sticky-recover", stored, "http://provider.example/stream", *stored, cand, 90, ownerID)
+	h.probeVirtualSourceAndPersist(ctx, "sticky-recover", stored, "http://provider.example/stream", *stored, cand, noCandidateIdentity, 90, ownerID)
 	if got := virtualProbeFailures.count(failureKey); got == 0 {
 		t.Fatal("transient timeout did not mark the probe failure damper")
 	}
 
 	// The completed inner probe is now available; recovery persists it.
-	if !h.recoverVirtualProbeFromCache(ctx, stored, "http://provider.example/stream", *stored, cand, ownerID) {
+	if !h.recoverVirtualProbeFromCache(ctx, stored, "http://provider.example/stream", *stored, cand, noCandidateIdentity, ownerID) {
 		t.Fatal("cache-only recovery did not use the completed probe")
 	}
 	if cacheLookups != 1 {

@@ -119,7 +119,7 @@ func TestPersistProbeEvidenceRotatesToSiblingOwnerRow(t *testing.T) {
 	h.VirtualFileMetadataSaver = saver.save
 	h.VirtualFileSaver = func(context.Context, models.VirtualFilePersistArgs) (int64, error) { return 1, nil }
 
-	h.persistVirtualProbeEvidence(context.Background(), pinnedRow, ownerURI, probedDualAudioFile(), true, true)
+	h.persistVirtualProbeEvidence(context.Background(), pinnedRow, ownerURI, probedDualAudioFile(), noCandidateIdentity, true, true)
 	h.stopVirtualEvidence()
 
 	calls := saver.recorded()
@@ -217,7 +217,7 @@ func TestPersistProbeEvidenceRotationPublishesVerifiedInventory(t *testing.T) {
 	h.VirtualFileMetadataSaver = saver.save
 	h.VirtualFileSaver = func(context.Context, models.VirtualFilePersistArgs) (int64, error) { return 1, nil }
 
-	h.persistVirtualProbeEvidence(context.Background(), pinnedRow, ownerURI, probedDualAudioFile(), true, false)
+	h.persistVirtualProbeEvidence(context.Background(), pinnedRow, ownerURI, probedDualAudioFile(), noCandidateIdentity, true, false)
 	h.stopVirtualEvidence()
 
 	// The write landed on the owner row.
@@ -272,7 +272,7 @@ func TestPersistProbeEvidenceRotationGuardRefusalKeepsOldBehavior(t *testing.T) 
 		VirtualFileSaver:         func(context.Context, models.VirtualFilePersistArgs) (int64, error) { return 1, nil },
 	}
 
-	h.persistVirtualProbeEvidence(context.Background(), pinnedRow, uri, probedDualAudioFile(), true, true)
+	h.persistVirtualProbeEvidence(context.Background(), pinnedRow, uri, probedDualAudioFile(), noCandidateIdentity, true, true)
 	h.stopVirtualEvidence()
 
 	if calls := saver.recorded(); len(calls) != 0 {
@@ -389,7 +389,7 @@ func TestPersistProbeEvidenceRetriesAfterPathNotFound(t *testing.T) {
 	h.VirtualFileMetadataSaver = saver.save
 	h.VirtualFileSaver = func(context.Context, models.VirtualFilePersistArgs) (int64, error) { return 1, nil }
 
-	h.persistVirtualProbeEvidence(context.Background(), pinnedRow, candURI, probedDualAudioFile(), true, true)
+	h.persistVirtualProbeEvidence(context.Background(), pinnedRow, candURI, probedDualAudioFile(), noCandidateIdentity, true, true)
 	h.stopVirtualEvidence()
 
 	calls := saver.recorded()
@@ -452,7 +452,7 @@ func TestPersistProbeEvidenceRefusedOwnershipServesLiveSessionInMemory(t *testin
 	h.VirtualFileMetadataSaver = saver.save
 	h.VirtualFileSaver = func(context.Context, models.VirtualFilePersistArgs) (int64, error) { return 1, nil }
 
-	h.persistVirtualProbeEvidence(context.Background(), pinnedRow, candURI, probedDualAudioFile(), true, true)
+	h.persistVirtualProbeEvidence(context.Background(), pinnedRow, candURI, probedDualAudioFile(), noCandidateIdentity, true, true)
 	h.stopVirtualEvidence()
 
 	if calls := saver.recorded(); len(calls) != 0 {
@@ -536,7 +536,7 @@ func TestPersistProbeEvidenceRotationDeliveryLoggedOnce(t *testing.T) {
 	h.VirtualFileMetadataSaver = saver.save
 	h.VirtualFileSaver = func(context.Context, models.VirtualFilePersistArgs) (int64, error) { return 1, nil }
 
-	h.persistVirtualProbeEvidence(context.Background(), pinnedRow, ownerURI, probedDualAudioFile(), true, false)
+	h.persistVirtualProbeEvidence(context.Background(), pinnedRow, ownerURI, probedDualAudioFile(), noCandidateIdentity, true, false)
 	h.stopVirtualEvidence()
 
 	if len(conn.messages) != 1 {

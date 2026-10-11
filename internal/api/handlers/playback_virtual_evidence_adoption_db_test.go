@@ -105,7 +105,7 @@ func TestPersistProbeEvidenceCollectionRowRefusesCrossReleaseBeforeEnqueue(t *te
 	crossHandler := newHandler(&crossCaptured)
 	t.Cleanup(crossHandler.StopVirtualEvidence)
 	probedCross := &models.MediaFile{FilePath: crossRelease, Resolution: "1080p"}
-	crossHandler.persistVirtualProbeEvidence(context.Background(), collectionRow(), crossRelease, probedCross, true, false)
+	crossHandler.persistVirtualProbeEvidence(context.Background(), collectionRow(), crossRelease, probedCross, noCandidateIdentity, true, false)
 	crossHandler.StopVirtualEvidence()
 
 	if len(crossCaptured) != 0 {
@@ -128,7 +128,7 @@ func TestPersistProbeEvidenceCollectionRowRefusesCrossReleaseBeforeEnqueue(t *te
 	ownHandler := newHandler(&ownCaptured)
 	t.Cleanup(ownHandler.StopVirtualEvidence)
 	probedOwn := &models.MediaFile{FilePath: ownRelease, Resolution: "1080p"}
-	ownHandler.persistVirtualProbeEvidence(context.Background(), collectionRow(), ownRelease, probedOwn, true, false)
+	ownHandler.persistVirtualProbeEvidence(context.Background(), collectionRow(), ownRelease, probedOwn, noCandidateIdentity, true, false)
 	ownHandler.StopVirtualEvidence()
 
 	if len(ownCaptured) != 1 {

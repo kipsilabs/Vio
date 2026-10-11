@@ -654,7 +654,12 @@ func (h *StreamHandler) handoffVirtualSessionToCachedWithSnapshot(ctx context.Co
 		return ResolvedVirtualMedia{}, nil, false, err
 	}
 	if !sameVirtualReleaseCandidate(pinnedID, resolved.CandidateID) {
-		if pinnedID == "" {
+		// An empty resolved candidate names no release at all, so it can never
+		// be carried: refuse it explicitly before the identity checks. A pin
+		// (pinnedID) is equally unverifiable, and this refusal must not be
+		// reachable via a successful IdentityRematched or durable-identity
+		// match, which prove a release only when a candidate was returned.
+		if pinnedID == "" || resolved.CandidateID == "" {
 			if cleanup != nil {
 				cleanup()
 			}
@@ -664,14 +669,11 @@ func (h *StreamHandler) handoffVirtualSessionToCachedWithSnapshot(ctx context.Co
 		// release under a new concrete candidate. That is not a release swap:
 		// carry the session pin forward and rebind the session to the pinned
 		// candidate, never the churned listing token. A resolve that shares no
-		// durable identity with the pin, or that names no candidate at all, is
-		// still refused so a cache handoff can never silently switch releases.
+		// durable identity with the pin is still refused so a cache handoff can
+		// never silently switch releases.
 		if !resolved.IdentityRematched && !resolvedMatchesPersistedIdentity(resolved, file) {
 			if cleanup != nil {
 				cleanup()
-			}
-			if resolved.CandidateID == "" {
-				return ResolvedVirtualMedia{}, nil, false, fmt.Errorf("cache handoff cannot verify the pinned release: pinned candidate %q, resolved candidate %q; refusing an unverifiable handoff", pinnedID, resolved.CandidateID)
 			}
 			return ResolvedVirtualMedia{}, nil, false, fmt.Errorf("cache handoff resolved candidate %q for pinned candidate %q; refusing a release swap", resolved.CandidateID, pinnedID)
 		}
