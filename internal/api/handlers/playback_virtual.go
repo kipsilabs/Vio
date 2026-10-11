@@ -1222,7 +1222,12 @@ type VirtualPlaybackStream struct {
 	FrameRate           string            `json:"frame_rate,omitempty"`
 	AudioLanguages      []string          `json:"audio_languages,omitempty"`
 	SubtitleLanguages   []string          `json:"subtitle_languages,omitempty"`
+	AudioChannels       string            `json:"audio_channels,omitempty"`
 	HasAtmos            bool              `json:"has_atmos,omitempty"`
+	Is10Bit             bool              `json:"is_10bit,omitempty"`
+	IsMultiAudio        bool              `json:"is_multi_audio,omitempty"`
+	VisualTags          []string          `json:"visual_tags,omitempty"`
+	AudioTags           []string          `json:"audio_tags,omitempty"`
 	QualityScore        int               `json:"quality_score,omitempty"`
 	RequestHeaders      map[string]string `json:"-"`
 	OwnerInstallationID int               `json:"-"`

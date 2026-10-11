@@ -448,6 +448,49 @@ func TestParseStreamDetailsDottedSeparators(t *testing.T) {
 	}
 }
 
+// TestParseStreamDetailsHybridDVAndHDR verifies independent detection of Dolby
+// Vision and HDR10/HDR10+/HLG so hybrid releases retain both visual tags.
+func TestParseStreamDetailsHybridDVAndHDR(t *testing.T) {
+	hybrid := &StreamCandidate{Name: "Movie.1995.2160p.UHD.Remux.DV.HDR10.TrueHD.Atmos.7.1-GRP"}
+	ParseStreamDetails(hybrid)
+	if hybrid.HDR != "dv" {
+		t.Fatalf("hybrid HDR = %q, want dv", hybrid.HDR)
+	}
+	hasDV, hasHDR10 := false, false
+	for _, tag := range hybrid.VisualTags {
+		if tag == "dv" {
+			hasDV = true
+		}
+		if tag == "hdr10" {
+			hasHDR10 = true
+		}
+	}
+	if !hasDV || !hasHDR10 {
+		t.Fatalf("hybrid VisualTags = %v, want both dv and hdr10", hybrid.VisualTags)
+	}
+	if hybrid.CodecAudio != "truehd" || !hybrid.HasAtmos || hybrid.AudioChannels != "7.1" {
+		t.Fatalf("hybrid audio = (%s, atmos=%v, channels=%s), want (truehd, true, 7.1)", hybrid.CodecAudio, hybrid.HasAtmos, hybrid.AudioChannels)
+	}
+
+	doviPlus := &StreamCandidate{Name: "Movie.2024.2160p.DoVi.HDR10Plus.HEVC-GRP"}
+	ParseStreamDetails(doviPlus)
+	if doviPlus.HDR != "dv" {
+		t.Fatalf("doviPlus HDR = %q, want dv", doviPlus.HDR)
+	}
+	hasDV, hasHDR10Plus := false, false
+	for _, tag := range doviPlus.VisualTags {
+		if tag == "dv" {
+			hasDV = true
+		}
+		if tag == "hdr10+" {
+			hasHDR10Plus = true
+		}
+	}
+	if !hasDV || !hasHDR10Plus {
+		t.Fatalf("doviPlus VisualTags = %v, want both dv and hdr10+", doviPlus.VisualTags)
+	}
+}
+
 // TestCandidateLanguageMatchRankPrecedence pins the full chain the issue
 // scopes: exact (0) beats bare (1) beats regional variant (2) beats MULTi
 // flag (3), through both ranking and final selection. A French preference

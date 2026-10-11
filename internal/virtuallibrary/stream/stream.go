@@ -17,7 +17,7 @@ import (
 var streamSizePattern = regexp.MustCompile(`(?i)\b\d+(?:\.\d+)?\s*(?:TB|GB|MB)\b`)
 var languagePattern = regexp.MustCompile(`(?i)\b(?:eng|en|fra|fre|fr|deu|ger|de|ita|es|spa|jpn|kor|zho|chi|por|rus|ara)\b`)
 var (
-	dolbyVisionPattern = regexp.MustCompile(`(?i)(?:\bdolby[ ._-]*vision\b|\bdv\b)`)
+	dolbyVisionPattern = regexp.MustCompile(`(?i)(?:\bdolby[ ._-]*vision\b|\bdv\b|\bdovi\b)`)
 	atmosPattern       = regexp.MustCompile(`(?i)\batmos\b`)
 	trueHDPattern      = regexp.MustCompile(`(?i)(?:\btrue[ ._-]*hd\b|\bthd\b)`)
 	dtsHDPattern       = regexp.MustCompile(`(?i)\bdts[ ._-]*hd\b`)
@@ -242,22 +242,38 @@ func parseStreamDetailsWithTitle(s *StreamCandidate, itemTitle string) {
 		}
 	}
 
-	// HDR & Visual Tags
-	if strings.Contains(fullText, "hdr10+") {
-		s.HDR = "hdr10+"
-		s.VisualTags = append(s.VisualTags, "hdr10+")
-	} else if strings.Contains(fullText, "hdr10") {
-		s.HDR = "hdr10"
-		s.VisualTags = append(s.VisualTags, "hdr10")
-	} else if dolbyVisionPattern.MatchString(fullText) {
-		s.HDR = "dv"
+	// HDR & Visual Tags: detect DV and HDR10/HDR10+/HLG independently so hybrid
+	// releases (e.g. DV HDR10, DV HDR10+) retain both visual tags.
+	hasDV := dolbyVisionPattern.MatchString(fullText)
+	hasHDR10Plus := strings.Contains(fullText, "hdr10+") || strings.Contains(fullText, "hdr10plus") || strings.Contains(fullText, "hdr10-plus") || strings.Contains(fullText, "hdr10_plus")
+	hasHDR10 := !hasHDR10Plus && strings.Contains(fullText, "hdr10")
+	hasHLG := strings.Contains(fullText, "hlg")
+	hasHDR := !hasHDR10Plus && !hasHDR10 && strings.Contains(fullText, "hdr")
+
+	if hasDV {
 		s.VisualTags = append(s.VisualTags, "dv")
-	} else if strings.Contains(fullText, "hdr") {
-		s.HDR = "hdr"
+	}
+	if hasHDR10Plus {
+		s.VisualTags = append(s.VisualTags, "hdr10+")
+	} else if hasHDR10 {
+		s.VisualTags = append(s.VisualTags, "hdr10")
+	} else if hasHDR {
 		s.VisualTags = append(s.VisualTags, "hdr")
 	}
-	if strings.Contains(fullText, "hlg") {
+	if hasHLG {
 		s.VisualTags = append(s.VisualTags, "hlg")
+	}
+
+	if hasDV {
+		s.HDR = "dv"
+	} else if hasHDR10Plus {
+		s.HDR = "hdr10+"
+	} else if hasHDR10 {
+		s.HDR = "hdr10"
+	} else if hasHLG {
+		s.HDR = "hlg"
+	} else if hasHDR {
+		s.HDR = "hdr"
 	}
 	if tenBitPattern.MatchString(fullText) {
 		s.Is10Bit = true
