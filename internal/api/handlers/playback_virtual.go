@@ -3325,6 +3325,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		probeCtx, probeCancel := context.WithTimeout(attemptCtx, virtualProbeBudget)
 		trace.probeRan = true
 		probeStart := time.Now()
+		forwardVirtualCandidateDeclaredAudio(&syncProbeFile, cand)
 		probed, probeErr := h.probeVirtualSource(probeCtx, streamURL, &syncProbeFile, cand.RequestHeaders)
 		trace.probe += time.Since(probeStart)
 		probeCancel()
@@ -3647,6 +3648,14 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 	fence func() bool,
 ) (string, int) {
 	probeKey := virtualProbeFailureKey(probeCand.URI, ownerInstallationID)
+	// Carry the served candidate's declared audio onto the probe input before
+	// the enumeration. The background/rotation paths build probeTransient from
+	// the catalog row alone, so without this the completeness gate in
+	// scanner.ProbeVirtualSource cannot see that the item carries audio and a
+	// video-with-subtitles-but-no-audio result would be persisted and published
+	// as verified. It is a no-op for the deferred and declared paths, whose
+	// probe input the resolve already merged the candidate onto.
+	forwardVirtualCandidateDeclaredAudio(&probeTransient, probeCand)
 	probeCtx, probeCancel := context.WithTimeout(bgCtx, virtualBackgroundProbeBudget)
 	probed, probeErr := h.probeVirtualSource(probeCtx, probeURL, &probeTransient, probeCand.RequestHeaders)
 	probeCancel()
@@ -4822,6 +4831,7 @@ func (h *PlaybackHandler) probeVirtualCandidateForegroundFallback(
 	// still land if the client has already disconnected.
 	probeCtx, probeCancel := context.WithTimeout(context.WithoutCancel(requestCtx), virtualEvidenceFallbackBudget)
 	defer probeCancel()
+	forwardVirtualCandidateDeclaredAudio(&probeTransient, probeCand)
 	probed, probeErr := h.probeVirtualSource(probeCtx, probeURL, &probeTransient, probeCand.RequestHeaders)
 	if probeErr != nil || probed == nil {
 		// A short-budget fallback timeout leaves the verdict unknown: do not
@@ -6025,6 +6035,7 @@ func (h *PlaybackHandler) resolveVirtualCandidateSource(
 		return &resolved, nil
 	}
 	probeCtx, probeCancel := context.WithTimeout(ctx, virtualProbeBudget)
+	forwardVirtualCandidateDeclaredAudio(&transient, candidate)
 	probed, probeErr := h.probeVirtualSource(probeCtx, streamURL, &transient, candidate.RequestHeaders)
 	probeCancel()
 	if probeErr != nil || probed == nil {
@@ -6585,6 +6596,46 @@ func mergeVirtualCandidateTracks(probed *models.MediaFile, candidate VirtualPlay
 		if !hasDefault {
 			probed.AudioTracks[0].Default = true
 		}
+	}
+}
+
+// forwardVirtualCandidateDeclaredAudio copies a served candidate's declared
+// audio evidence onto the file handed to the prober, so
+// scanner.ProbeVirtualSource can tell a partial enumeration from a genuinely
+// video-only source.
+//
+// The probe input on the background/rotation and fallback paths is the catalog
+// row alone (or a thin probe transient), which can carry no audio declaration
+// even when the candidate the session resolved does — a provider that reports
+// audio languages without a codec, or a fresh alternate-version row whose
+// synthetic tracks have not landed. With no expected-audio signal,
+// scanner.virtualSourceExpectsAudio reports false and the prober accepts a
+// video-with-subtitles-but-no-audio result as complete; the session then
+// publishes that partial menu as verified. Forwarding the declaration closes
+// that path.
+//
+// It forwards only what the candidate carries and never infers audio from a
+// resolution, so a video-only candidate that declares no audio stays a valid,
+// complete enumeration. The synthesized track carries no container index, and
+// applyProbeData replaces the whole audio slice on a complete probe, so the
+// forwarded declaration never survives into persisted probe evidence.
+func forwardVirtualCandidateDeclaredAudio(file *models.MediaFile, cand VirtualPlaybackStream) {
+	if file == nil {
+		return
+	}
+	declaredCodec := strings.TrimSpace(cand.CodecAudio)
+	if strings.TrimSpace(file.CodecAudio) == "" && declaredCodec != "" {
+		file.CodecAudio = declaredCodec
+	}
+	if len(file.AudioTracks) > 0 {
+		return
+	}
+	for _, lang := range cand.AudioLanguages {
+		lang = strings.TrimSpace(lang)
+		if lang == "" || !isRealVirtualLanguageTag(lang) {
+			continue
+		}
+		file.AudioTracks = append(file.AudioTracks, models.AudioTrack{Language: lang, Codec: declaredCodec})
 	}
 }
 

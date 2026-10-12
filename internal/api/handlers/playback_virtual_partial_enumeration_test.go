@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -170,6 +171,117 @@ func TestBackgroundProbePartialEnumerationHasBoundedStreak(t *testing.T) {
 	}
 	if !virtualProbeFailures.recent(probeKey) {
 		t.Fatalf("a %d-attempt partial streak did not arm the failure damper", virtualProbePartialRepeatThreshold)
+	}
+}
+
+// gateAwareThinProber mirrors scanner.ProbeVirtualSource's completeness gate for
+// a video-with-subtitles-but-no-audio enumeration: the result is partial exactly
+// when the probe input carries the expected-audio signal. Otherwise the thin
+// enumeration is a "complete" answer, which is what the production build did
+// before the gate existed.
+func gateAwareThinProber() (VirtualPlaybackSourceProber, *int) {
+	calls := new(int)
+	return func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
+		expectAudio := strings.TrimSpace(f.CodecAudio) != "" || len(f.AudioTracks) > 0
+		if expectAudio {
+			return nil, scanner.ErrVirtualProbePartial
+		}
+		out := *f
+		out.VideoTracks = []models.VideoTrack{{Codec: "hevc", Width: 3840, Height: 2160}}
+		out.SubtitleTracks = []models.SubtitleTrack{{Index: 2, Codec: "ass", Language: "fr"}}
+		*calls++
+		return &out, nil
+	}, calls
+}
+
+// TestBackgroundProbeForwardsCandidateAudioBeforeGate pins the
+// four-second-thin-verify timeline at its verified-setting site. A session is
+// bound to a candidate that declares audio, but the background/rotation probe
+// input is the catalog row alone (no audio declaration). scanner.ProbeVirtualSource
+// can only judge a video-with-subtitles-but-no-audio enumeration partial when the
+// probe input carries the item's expected audio; before the fix the handler
+// forwarded none, the gate missed, and the thin enumeration was persisted and
+// reported verified. The probe helper behaves exactly like the real gate, so a
+// non-partial outcome here is the bug.
+func TestBackgroundProbeForwardsCandidateAudioBeforeGate(t *testing.T) {
+	prober, thinCompletions := gateAwareThinProber()
+	writes := 0
+	h := &PlaybackHandler{
+		VirtualPlaybackSourceProber: prober,
+		VirtualFileMetadataSaver: func(context.Context, models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error) {
+			writes++
+			return VirtualFileMetadataUpdateResult{MetadataUpdated: true, RowsAffected: 1}, nil
+		},
+	}
+
+	cand := VirtualPlaybackStream{
+		ID: "cand-1", URI: "virtual://movie/tt-thin?result=cand-1",
+		CodecAudio: "aac", AudioLanguages: []string{"FRE"},
+	}
+	probeKey := virtualProbeFailureKey(cand.URI, 5)
+	virtualProbeFailures.clear(probeKey)
+	virtualProbeFailures.clearPartial(probeKey)
+	t.Cleanup(func() {
+		virtualProbeFailures.clear(probeKey)
+		virtualProbeFailures.clearPartial(probeKey)
+	})
+
+	file := &models.MediaFile{ID: 941, FilePath: cand.URI, VirtualOwnerInstallationID: 5}
+	// The probe input the rotation/background path builds: the catalog row alone.
+	rowOnly := models.MediaFile{ID: 941, FilePath: cand.URI}
+
+	outcome := h.probeVirtualSourceAndPersist(context.Background(), "sticky-thin", file, "http://127.0.0.1/x", rowOnly, cand, 0, 5)
+	if outcome != probeOutcomePartial {
+		t.Fatalf("outcome = %q, want partial: a candidate that declares audio must not verify a video-without-audio enumeration", outcome)
+	}
+	if *thinCompletions != 0 {
+		t.Fatalf("the gate missed the declared audio: %d thin enumeration(s) accepted as complete", *thinCompletions)
+	}
+	if writes != 0 {
+		t.Fatalf("thin enumeration wrote evidence %d time(s), want 0", writes)
+	}
+	if virtualProbeFailures.recent(probeKey) {
+		t.Fatal("a single partial enumeration armed the failure damper")
+	}
+}
+
+// TestResolveVirtualPlaybackSyncForwardsCandidateAudioBeforeGate pins the
+// synchronous-resolve half of the same hole: the sync probe transient is built
+// before the candidate's declared metadata is merged, so a candidate that
+// declares audio only through its language list reaches the prober without an
+// audio signal. The gate-aware prober returns the real gate's verdict, so the
+// resolve must hold the source pending instead of adopting a thin verified
+// inventory.
+func TestResolveVirtualPlaybackSyncForwardsCandidateAudioBeforeGate(t *testing.T) {
+	stored := provenanceResolveRow()
+	prober, thinCompletions := gateAwareThinProber()
+	h := virtualProvenanceResolution(stored, prober)
+	h.VirtualPlaybackStreamLister = VirtualPlaybackStreamListerFunc(func(_ context.Context, _ string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
+		return []VirtualPlaybackStream{{
+			ID: "cand-1", URI: stored.FilePath,
+			Resolution: "1080p", CodecVideo: "h264", Container: "mkv",
+			AudioLanguages: []string{"FRE"},
+		}}, nil
+	})
+	probeKey := virtualProbeFailureKey(stored.FilePath, stored.VirtualOwnerInstallationID)
+	virtualProbeFailures.clear(probeKey)
+	t.Cleanup(func() { virtualProbeFailures.clear(probeKey) })
+
+	resolved, err := h.resolveVirtualPlaybackSource(provenanceResolveRequest(), stored, "profile-1", false, nil, "", "", 0, false)
+	if err != nil {
+		t.Fatalf("resolveVirtualPlaybackSource error: %v", err)
+	}
+	if resolved.Provenance != ProbeProvenancePending {
+		t.Fatalf("provenance = %q, want pending after a partial enumeration", resolved.Provenance)
+	}
+	if resolved.ProbeSucceeded {
+		t.Fatal("a partial enumeration must not report a successful probe")
+	}
+	if *thinCompletions != 0 {
+		t.Fatalf("the gate missed the declared audio: %d thin enumeration(s) accepted as complete", *thinCompletions)
+	}
+	if got := virtualProbeFailures.count(probeKey); got != 0 {
+		t.Fatalf("partial enumeration consumed the probe-failure budget (%d marks)", got)
 	}
 }
 

@@ -44,10 +44,15 @@ when the item's own declared metadata (an audio codec or declared audio track)
 says the source carries audio: then a video-and-no-audio table is a truncated
 read (a relay partial response, an analysis-budget cut-off, or an early return),
 not a video-only file. An item that declares no audio may legitimately enumerate
-video only, and that result is complete. An empty subtitle set is a valid
-complete answer; it is never a partial signal. Finding one audio track does not
-by itself prove the rest of the table was read, so the probe result is not
-allowed to be its own completeness oracle.
+video only, and that result is complete. The declaration the probe is judged
+against is carried onto the probe input: the catalog row's own metadata, and,
+on the paths that probe a row alone (the serve-layer rotation probe, the
+stale-source fallback, and the transport fallback), the served candidate's
+provider-declared audio codec or languages, so a row whose synthetic tracks have
+not landed cannot hide the item's audio and let a thin enumeration verify. An
+empty subtitle set is a valid complete answer; it is never a partial signal.
+Finding one audio track does not by itself prove the rest of the table was read,
+so the probe result is not allowed to be its own completeness oracle.
 
 A partial probe is not a verdict about the candidate's bytes. The resolve serves
 the candidate's provisional plan at `pending` without consuming the probe-failure
