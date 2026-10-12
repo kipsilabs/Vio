@@ -786,8 +786,10 @@ func stopHistoryIDV2(stopID string) string {
 // so a later replay re-runs the idempotent writers to repair the session rather
 // than treat a half-torn stop as done.
 func (h *PlaybackHandler) finalizeStopV2(ctx context.Context, store playback.ProgressStoreV3, record *playback.AttemptRecordV3, sessionID string, receipt playback.StopReceiptV3) playback.StopReceiptV3 {
-	// The caller's request context no longer bounds the durable side effects,
-	// but its deadline, if any, still narrows this budget.
+	// The caller's request context no longer bounds the durable side effects, and
+	// neither does its deadline: a request that already timed out is exactly the
+	// case this exists for. The finalization takes its own fresh budget, which a
+	// nested detached teardown below can only narrow further.
 	finalCtx, cancelFinal := detachedWithin(ctx, stopFinalizationBudget)
 	defer cancelFinal()
 	claimed, err := store.ClaimStopFinalization(finalCtx, sessionID, time.Now().Add(stopFinalizationLease))
