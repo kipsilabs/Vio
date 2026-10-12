@@ -3044,6 +3044,35 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			allowDefer = false
 		}
 		if allowDefer {
+			// Deferral guard: the deferred probe only runs after transport
+			// commit, so merged metadata that cannot support a validated
+			// route would terminal source_metadata_incomplete before the
+			// probe ever runs (the bench Citizen Vigilante shape: stored URL,
+			// empty tracks, fast ~50ms failure with no probe). Evaluate the
+			// merged transient below; when it is route-plannable the
+			// deferred path serves it immediately, otherwise fall through to
+			// the bounded synchronous cache-first probe, which fills the row
+			// in before the planner sees it. Damper admission is preserved:
+			// a recent failure still takes the cache-only path.
+			merged := cloneVirtualProbeTransient(transient)
+			if merged.Resolution == "" {
+				merged.Resolution = cand.Resolution
+			}
+			// No 1080p assumption here: the assumed baseline would make
+			// the merge synthesize bitrate/codecs/tracks (all gated on
+			// hasResolution) and render every row plannable-by-construction,
+			// defeating the guard. Only stored + candidate evidence counts;
+			// the deferred block below still applies the baseline for the
+			// rows that pass.
+			mergeVirtualCandidateTracks(&merged, cand)
+			if !merged.HDR && cand.HDR != "" {
+				merged.HDR = true
+			}
+			if !virtualMergedSupportsValidatedRoute(&merged) {
+				allowDefer = false
+			}
+		}
+		if allowDefer {
 			h.pinVirtualStickyAt(stickyKey, cand.URI, generation)
 			// Resolution precedence: stored evidence wins; otherwise adopt
 			// the candidate's declared label; only when both are absent is
@@ -6895,6 +6924,23 @@ func canSkipProbeForContainer(container string) bool {
 		}
 	}
 	return false
+}
+
+// virtualMergedSupportsValidatedRoute reports whether merged candidate
+// metadata can support a validated planner route, mirroring the deferred
+// path's own preconditions: audio-only rows need audio evidence only, while
+// video rows need planner-grade video evidence plus audio and container
+// evidence. It is the deferral guard's predicate: defer the probe past
+// commit only when the merged transient is route-plannable, otherwise run
+// the bounded synchronous probe before the planner sees the row.
+func virtualMergedSupportsValidatedRoute(file *models.MediaFile) bool {
+	if file == nil {
+		return false
+	}
+	if file.IsAudioOnly() {
+		return completeVirtualAudioEvidenceV3(file)
+	}
+	return completeVirtualVideoEvidenceV3(file) && completeVirtualAudioEvidenceV3(file) && completeVirtualContainerEvidenceV3(file)
 }
 
 // completeVirtualVideoEvidenceV3 reports whether a virtual file carries the

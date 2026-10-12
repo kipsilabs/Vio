@@ -158,6 +158,60 @@ func TestResolveProbesUnprobedVirtualRowDespiteCandidateDeclarations(t *testing.
 	}
 }
 
+// A stored-URL row with empty video metadata must not defer its probe past
+// the transport commit: the deferred probe would never run because the
+// planner terminals source_metadata_incomplete first (the bench Citizen
+// Vigilante shape: ~50ms failure, no probe). The guard falls through to the
+// bounded synchronous cache-first probe below, so the row is filled in
+// before the planner sees it. Damper admission is preserved.
+func TestResolveVirtualDeferralGuardProbesUnplannableMergedMetadata(t *testing.T) {
+	uri := "virtual://movie/tt-defer-guard?result=cand-1"
+	stored := &models.MediaFile{
+		ID:                         400,
+		ContentID:                  "movie-1",
+		FilePath:                   uri,
+		Container:                  "virtual",
+		ProbeUpdatedAt:             nil,
+		VirtualOwnerInstallationID: 5,
+	}
+	// The candidate declares a container but no codecs or resolution: the
+	// merged transient cannot support a validated route.
+	lister := VirtualPlaybackStreamListerFunc(func(_ context.Context, _ string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
+		return []VirtualPlaybackStream{{
+			ID: "cand-guard", URI: uri, Container: "mkv",
+		}}, nil
+	})
+	probeCalls := 0
+	h := virtualProbeGateCandidateHandler(stored, lister,
+		func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
+			probeCalls++
+			f.VideoTracks = []models.VideoTrack{{Codec: "h264", Width: 1920, Height: 1080, FrameRate: "24", BitDepth: 8, Bitrate: 10_000}}
+			f.AudioTracks = []models.AudioTrack{{Codec: "aac", Channels: 2, Language: "eng"}}
+			f.CodecVideo, f.CodecAudio, f.Resolution, f.Container = "h264", "aac", "1080p", "mkv"
+			f.Bitrate = 10_000
+			return f, nil
+		}, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil)
+	file := *stored
+	resolved, err := h.resolveVirtualPlaybackSource(req, &file, "profile-1", true, nil, "", "", 0, false)
+	if err != nil {
+		t.Fatalf("resolveVirtualPlaybackSource error: %v", err)
+	}
+	// The guard routes to the synchronous probe: verified provenance with the
+	// probe's real inventory, not a pending deferred plan that the planner
+	// would terminal before the probe runs.
+	if resolved.Provenance != ProbeProvenanceVerified || !resolved.ProbeSucceeded {
+		t.Fatalf("provenance=%q succeeded=%v, want verified/true after the guard's sync probe", resolved.Provenance, resolved.ProbeSucceeded)
+	}
+	if probeCalls != 1 {
+		t.Fatalf("prober called %d times, want exactly 1 synchronous probe", probeCalls)
+	}
+	if resolved.File == nil || len(resolved.File.VideoTracks) == 0 || resolved.File.VideoTracks[0].Codec != "h264" {
+		t.Fatalf("resolved video tracks = %#v, want probed h264 inventory", resolved.File)
+	}
+}
+
 // A row that already carries a probe stamp and complete evidence keeps the fast
 // skipProbe path: no provider round-trip and no re-probe on every play.
 func TestResolveSkipsProbeForAlreadyProbedVirtualRow(t *testing.T) {
