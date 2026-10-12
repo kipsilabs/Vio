@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/models"
-	"github.com/Silo-Server/silo-server/internal/virtuallibrary/resolver"
 )
 
 // Bounded evidence-adoption refusals.
@@ -216,33 +215,6 @@ func virtualAdoptionRefusalKeyForArgs(args models.VirtualFilePersistArgs) string
 // have already refused enough consecutive adoptions to treat the pin as stale.
 func virtualAdoptionRefusalBoundReached(args models.VirtualFilePersistArgs) bool {
 	return virtualAdoptionRefusals.count(virtualAdoptionRefusalKeyForArgs(args)) >= virtualAdoptionRefusalBound
-}
-
-// virtualCandidateSharesPersistedIdentity reports whether a probed candidate
-// provably carries the same release as the pinned row, judged by the resolver's
-// explicit resolved-candidate evidence rather than the transient file's
-// Provider* fields. Those fields are seeded from the requested row (the resolve
-// clones the pinned row) and are only filled where empty, so a substituted
-// candidate can inherit the pin's identity and make an inherited equality look
-// like a same-release proof. The resolver's explicit evidence is set only from
-// the resolver's own answer (see applyResolvedIdentity), so a missing or
-// identity-less side is not proof and a candidate whose bytes cannot be tied to
-// the pin stays foreign.
-func virtualCandidateSharesPersistedIdentity(pinned, candidate *models.MediaFile) bool {
-	if pinned == nil || candidate == nil || candidate.ResolvedCandidate == nil {
-		return false
-	}
-	pinnedTiers := resolver.NewPersistedIdentityTiers(
-		pinned.ProviderVideoHash, pinned.ProviderGUID, pinned.ProviderReleaseName, pinned.ProviderReleaseSize,
-	)
-	candidateTiers := resolver.NewPersistedIdentityTiers(
-		candidate.ResolvedCandidate.VideoHash,
-		candidate.ResolvedCandidate.GUID,
-		candidate.ResolvedCandidate.ReleaseName,
-		candidate.ResolvedCandidate.ReleaseSize,
-	)
-	_, shared := resolver.PersistedIdentitiesMatch(pinnedTiers, candidateTiers)
-	return shared
 }
 
 // markVirtualAdoptionTerminalRefusal installs the durable, cross-replica terminal

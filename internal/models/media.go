@@ -205,29 +205,9 @@ type MediaFile struct {
 	// header-authenticated URL is usable when served from the catalog instead
 	// of a fresh listing. Nil means the row carries no headers.
 	ProviderRequestHeaders map[string]string `json:"-"`
-	// ResolvedCandidate is the durable identity of the candidate a virtual
-	// resolver actually returned for this probe, set only from the resolver's
-	// own evidence (see applyResolvedIdentity) and never persisted. It exists
-	// because the Provider* fields above are seeded from the requested catalog
-	// row and only filled where empty, so a substituted candidate can inherit
-	// the pin's identity; that inherited equality is not proof of what was
-	// served. A nil value means the resolver supplied no explicit identity, so
-	// it must never be treated as same-release evidence.
-	ResolvedCandidate  *ResolvedCandidateIdentity `json:"-"`
-	FirstSeenScanRunID string
-	CreatedAt          time.Time
-	UpdatedAt          time.Time
-}
-
-// ResolvedCandidateIdentity is the durable provider identity of the candidate a
-// virtual resolve actually returned, in the same tier order as the dedup key
-// (video hash, source GUID, release name + size). It is runtime-only evidence
-// carried on a transient MediaFile: see MediaFile.ResolvedCandidate.
-type ResolvedCandidateIdentity struct {
-	VideoHash   string
-	GUID        string
-	ReleaseName string
-	ReleaseSize int64
+	FirstSeenScanRunID     string
+	CreatedAt              time.Time
+	UpdatedAt              time.Time
 }
 
 // MediaChapter represents a single media chapter derived from embedded file metadata.
@@ -1009,14 +989,6 @@ type VirtualFilePersistArgs struct {
 	// inventory or probe stamp. Metadata-only evidence writers leave this false
 	// so a skipped adoption is not an error and the metadata still lands.
 	RequireAdopt bool
-	// SameReleaseEvidence records that the caller proved, from the resolver's
-	// explicit resolved-candidate evidence, that the validated candidate is the
-	// pinned row's own release renumbered. It is the permission for a
-	// metadata-only evidence write after a required adoption was refused; it is
-	// deliberately separate from RequireAdopt, which governs identity adoption and
-	// the failed-verdict fence. A writer that sets it must also clear AdoptPath, so
-	// the permission can never adopt a path and bypass that fence.
-	SameReleaseEvidence bool
 	// AllowFailedVerdict is the explicit-retry policy. When true, an active
 	// failed_at stamp on the validated identity does not block adoption; the
 	// caller has deliberately asked to retry a known-bad candidate. The

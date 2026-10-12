@@ -10,6 +10,7 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
+	"github.com/Silo-Server/silo-server/internal/virtuallibrary/resolver"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -29,72 +30,41 @@ func adoptionBoundTestRow(id int, hash string) *models.MediaFile {
 	}
 }
 
-// TestVirtualAdoptionRefusalBoundRotatesSameRelease proves the bounded stale-pin
-// rotation: after the refusal bound is reached for a row and pin, a probed
-// candidate whose resolver-resolved identity provably carries the pin's own
-// release is written metadata-only against the pinned row instead of retrying
-// the fenced adoption that keeps matching no row. Pre-fix the write stays fenced
-// forever.
-func TestVirtualAdoptionRefusalBoundRotatesSameRelease(t *testing.T) {
+// TestVirtualAdoptionRefusalBoundSameReleaseIsNotTerminal proves the bound does
+// not fire for a same-release renumber: when the resolver's explicit identity
+// proves the candidate is the row's own release, the write is metadata-only and
+// never reaches the terminal branch, however many refusals are on record.
+func TestVirtualAdoptionRefusalBoundSameReleaseIsNotTerminal(t *testing.T) {
 	row := adoptionBoundTestRow(5031897, "9d8e-hash")
 	candidate := "virtual://series/tt39087958/1/1?profile=4K+Dolby+Vision&result=165c86960fd10b80f54ecf9c"
-	probed := &models.MediaFile{
-		// The resolver's explicit evidence, not the transient's inherited
-		// Provider* fields, is what proves the release.
-		ResolvedCandidate: &models.ResolvedCandidateIdentity{VideoHash: "9d8e-hash"},
-		AudioTracks:       []models.AudioTrack{{Codec: "aac", Channels: 2}},
-	}
-	h := &PlaybackHandler{
-		VirtualFileMetadataSaver: func(context.Context, models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error) {
-			return VirtualFileMetadataUpdateResult{RowsAffected: 1, MetadataUpdated: true}, nil
-		},
-	}
+	probed := &models.MediaFile{AudioTracks: []models.AudioTrack{{Codec: "aac", Channels: 2}}}
+	h := &PlaybackHandler{}
 	key := virtualAdoptionRefusalKey(row.ID, row.FilePath)
 	virtualAdoptionRefusals.clear(key)
 	t.Cleanup(func() { virtualAdoptionRefusals.clear(key) })
-
-	before, ok := h.virtualProbeEvidenceArgsForRow(context.Background(), row, candidate, probed, true)
-	if !ok {
-		t.Fatal("args builder refused the write outright")
-	}
-	if !before.RequireAdopt {
-		t.Fatalf("before the bound a cross-release write must stay fenced: %+v", before)
-	}
-
-	for i := 0; i < virtualAdoptionRefusalBound; i++ {
+	for i := 0; i < virtualAdoptionRefusalBound*2; i++ {
 		virtualAdoptionRefusals.mark(key)
 	}
-	if got := virtualAdoptionRefusals.count(key); got < virtualAdoptionRefusalBound {
-		t.Fatalf("refusal marks = %d, want at least %d", got, virtualAdoptionRefusalBound)
-	}
-
-	after, ok := h.virtualProbeEvidenceArgsForRow(context.Background(), row, candidate, probed, true)
+	args, ok := h.virtualProbeEvidenceArgsForRow(context.Background(), row, candidate, probed,
+		resolver.NewPersistedIdentityTiers("9d8e-hash", "", "", 0), true)
 	if !ok {
-		t.Fatal("args builder refused the same-release re-pin")
+		t.Fatal("same-release renumber was refused outright")
 	}
-	if after.RequireAdopt {
-		t.Fatalf("same-release candidate stayed fenced past the refusal bound: %+v", after)
+	if args.RequireAdopt {
+		t.Fatalf("same-release renumber was fenced: %+v", args)
 	}
-	if !after.SameReleaseEvidence {
-		t.Fatalf("same-release fallback did not record the evidence permission: %+v", after)
-	}
-	if after.AdoptPath != "" {
-		t.Fatalf("same-release fallback retained an adoption path %q; it must clear AdoptPath so it cannot adopt", after.AdoptPath)
-	}
-	if after.ExpectedFilePath != row.FilePath {
-		t.Fatalf("same-release fallback moved the expected path: %q", after.ExpectedFilePath)
-	}
-	if after.ExpectedProviderVideoHash != row.ProviderVideoHash {
-		t.Fatalf("re-pin dropped the row identity: %q", after.ExpectedProviderVideoHash)
+	if args.RefusalReason == virtualProbeRefusalAdoptionBoundExhausted {
+		t.Fatalf("same-release renumber was named terminal: %+v", args)
 	}
 }
 
-// TestVirtualAdoptionRefusalBoundInheritedIdentityStaysFenced is the #300/#306
-// boundary for blocker 1: the transient's Provider* tiers are seeded from the
-// requested row and only filled where empty, so a substituted candidate can
-// inherit the pin's identity. An inherited equality must never be accepted as a
-// same-release proof; only the resolver's explicit resolved-candidate evidence
-// counts. With no explicit evidence the candidate stays foreign and fenced.
+// TestVirtualAdoptionRefusalBoundInheritedIdentityStaysFenced is the blocker-1
+// boundary: the transient's Provider* tiers are seeded from the requested row
+// and only filled where empty, so a substituted candidate can inherit the pin's
+// identity. An inherited equality on the probed file must never prove a release;
+// only the resolver's explicit identity passed as `candidate` counts. With no
+// explicit evidence the candidate stays foreign and fenced, and past the bound the
+// refusal is named terminal.
 func TestVirtualAdoptionRefusalBoundInheritedIdentityStaysFenced(t *testing.T) {
 	row := adoptionBoundTestRow(5031903, "pin-hash")
 	candidate := "virtual://series/tt39087958/1/1?profile=4K+Dolby+Vision&result=substituted"
@@ -104,7 +74,6 @@ func TestVirtualAdoptionRefusalBoundInheritedIdentityStaysFenced(t *testing.T) {
 		ProviderVideoHash:   row.ProviderVideoHash,
 		ProviderReleaseName: row.ProviderReleaseName,
 		ProviderReleaseSize: row.ProviderReleaseSize,
-		// No ResolvedCandidate: the resolver supplied no explicit identity.
 	}
 	h := &PlaybackHandler{}
 	key := virtualAdoptionRefusalKey(row.ID, row.FilePath)
@@ -113,15 +82,13 @@ func TestVirtualAdoptionRefusalBoundInheritedIdentityStaysFenced(t *testing.T) {
 	for i := 0; i < virtualAdoptionRefusalBound; i++ {
 		virtualAdoptionRefusals.mark(key)
 	}
-	args, ok := h.virtualProbeEvidenceArgsForRow(context.Background(), row, candidate, probed, true)
+	args, ok := h.virtualProbeEvidenceArgsForRow(context.Background(), row, candidate, probed,
+		resolver.PersistedIdentityTiers{}, true)
 	if !ok {
 		t.Fatal("args builder refused before the SQL fence could")
 	}
 	if !args.RequireAdopt {
 		t.Fatalf("inherited identity disabled the adoption fence: %+v", args)
-	}
-	if args.SameReleaseEvidence {
-		t.Fatalf("inherited identity was accepted as same-release proof: %+v", args)
 	}
 	if args.RefusalReason != virtualProbeRefusalAdoptionBoundExhausted {
 		t.Fatalf("refusal reason = %q, want terminal %q", args.RefusalReason, virtualProbeRefusalAdoptionBoundExhausted)
@@ -129,14 +96,12 @@ func TestVirtualAdoptionRefusalBoundInheritedIdentityStaysFenced(t *testing.T) {
 }
 
 // TestVirtualAdoptionRefusalBoundExplicitForeignIdentityStaysFenced proves the
-// resolver's explicit evidence is still checked for agreement: a candidate whose
+// resolver's explicit identity is still checked for agreement: a candidate whose
 // resolved identity shares no tier with the pin is foreign even past the bound.
 func TestVirtualAdoptionRefusalBoundExplicitForeignIdentityStaysFenced(t *testing.T) {
 	row := adoptionBoundTestRow(5031904, "pin-hash")
 	candidate := "virtual://series/tt39087958/1/1?profile=4K+Dolby+Vision&result=foreign-explicit"
-	probed := &models.MediaFile{
-		ResolvedCandidate: &models.ResolvedCandidateIdentity{VideoHash: "different-hash"},
-	}
+	probed := &models.MediaFile{}
 	h := &PlaybackHandler{}
 	key := virtualAdoptionRefusalKey(row.ID, row.FilePath)
 	virtualAdoptionRefusals.clear(key)
@@ -144,52 +109,13 @@ func TestVirtualAdoptionRefusalBoundExplicitForeignIdentityStaysFenced(t *testin
 	for i := 0; i < virtualAdoptionRefusalBound; i++ {
 		virtualAdoptionRefusals.mark(key)
 	}
-	args, ok := h.virtualProbeEvidenceArgsForRow(context.Background(), row, candidate, probed, true)
+	args, ok := h.virtualProbeEvidenceArgsForRow(context.Background(), row, candidate, probed,
+		resolver.NewPersistedIdentityTiers("different-hash", "", "", 0), true)
 	if !ok {
 		t.Fatal("args builder refused before the SQL fence could")
 	}
 	if !args.RequireAdopt {
 		t.Fatalf("explicitly foreign candidate disabled the fence: %+v", args)
-	}
-}
-
-// TestVirtualAdoptionRefusalBoundKeepsFailedVerdictFence proves verdict
-// enforcement survives the same-release permission: a candidate the resolver
-// ties to the pin's release but that carries a live failed verdict must not be
-// stamped as the pin's verified evidence, so the permission is denied and the
-// write stays fenced.
-func TestVirtualAdoptionRefusalBoundKeepsFailedVerdictFence(t *testing.T) {
-	row := adoptionBoundTestRow(5031905, "pin-hash")
-	candidate := "virtual://series/tt39087958/1/1?profile=4K+Dolby+Vision&result=dead-same-release"
-	probed := &models.MediaFile{
-		ResolvedCandidate: &models.ResolvedCandidateIdentity{VideoHash: "pin-hash"},
-	}
-	failedAt := time.Now().UTC()
-	failedRow := &models.MediaFile{
-		ID: 5031906, ContentID: row.ContentID, EpisodeID: row.EpisodeID, FilePath: candidate,
-		MediaFolderID: row.MediaFolderID, VirtualOwnerInstallationID: row.VirtualOwnerInstallationID,
-		ProviderVideoHash: "pin-hash", FailedAt: &failedAt,
-	}
-	h := &PlaybackHandler{
-		VirtualFileLookup: func(context.Context, string) (*models.MediaFile, error) {
-			return failedRow, nil
-		},
-	}
-	key := virtualAdoptionRefusalKey(row.ID, row.FilePath)
-	virtualAdoptionRefusals.clear(key)
-	t.Cleanup(func() { virtualAdoptionRefusals.clear(key) })
-	for i := 0; i < virtualAdoptionRefusalBound; i++ {
-		virtualAdoptionRefusals.mark(key)
-	}
-	args, ok := h.virtualProbeEvidenceArgsForRow(context.Background(), row, candidate, probed, true)
-	if !ok {
-		t.Fatal("args builder refused before the SQL fence could")
-	}
-	if !args.RequireAdopt {
-		t.Fatalf("a live failed verdict did not keep the candidate fenced: %+v", args)
-	}
-	if args.SameReleaseEvidence {
-		t.Fatalf("a live failed verdict was bypassed by the same-release permission: %+v", args)
 	}
 }
 
@@ -216,7 +142,7 @@ func TestVirtualAdoptionRefusalBoundForeignStaysFenced(t *testing.T) {
 	for i := 0; i < virtualAdoptionRefusalBound; i++ {
 		virtualAdoptionRefusals.mark(key)
 	}
-	args, ok := h.virtualProbeEvidenceArgsForRow(context.Background(), row, candidate, probed, true)
+	args, ok := h.virtualProbeEvidenceArgsForRow(context.Background(), row, candidate, probed, resolver.NewPersistedIdentityTiers("foreign-hash", "", "", 0), true)
 	if !ok {
 		t.Fatal("args builder refused the foreign write before the SQL fence could")
 	}
@@ -261,14 +187,14 @@ func TestVirtualAdoptionRefusalBoundRotatesSameReleaseOwnerRow(t *testing.T) {
 	t.Cleanup(func() { virtualAdoptionRefusals.clear(key) })
 
 	// Before the bound the duplicate-sibling guard refuses and returns no write.
-	if row, _, ok := h.virtualProbeEvidenceRotateTarget(context.Background(), pinnedRow, ownerURI, probedDualAudioFile()); ok {
+	if row, _, ok := h.virtualProbeEvidenceRotateTarget(context.Background(), pinnedRow, ownerURI, probedDualAudioFile(), resolver.PersistedIdentityTiers{}); ok {
 		t.Fatalf("duplicate same-release sibling rotated before the bound: %+v", row)
 	}
 
 	for i := 0; i < virtualAdoptionRefusalBound-1; i++ {
 		virtualAdoptionRefusals.mark(key)
 	}
-	rotated, evidence, ok := h.virtualProbeEvidenceRotateTarget(context.Background(), pinnedRow, ownerURI, probedDualAudioFile())
+	rotated, evidence, ok := h.virtualProbeEvidenceRotateTarget(context.Background(), pinnedRow, ownerURI, probedDualAudioFile(), resolver.PersistedIdentityTiers{})
 	if !ok {
 		t.Fatalf("bounded rotation still refused: consecutive refusals = %d", virtualAdoptionRefusals.count(key))
 	}
@@ -335,7 +261,7 @@ func TestVirtualAdoptionRefusalBoundLeavesSameReleasePathAlone(t *testing.T) {
 	}
 	t.Cleanup(func() { virtualAdoptionRefusals.clear(virtualAdoptionRefusalKey(row.ID, row.FilePath)) })
 
-	args, ok := h.virtualProbeEvidenceArgsForRow(context.Background(), row, uri, probed, true)
+	args, ok := h.virtualProbeEvidenceArgsForRow(context.Background(), row, uri, probed, resolver.PersistedIdentityTiers{}, true)
 	if !ok {
 		t.Fatal("same-path write was refused")
 	}
@@ -550,7 +476,7 @@ func TestAdoptionBoundForeignTerminalLogIsActionable(t *testing.T) {
 	for i := 0; i < virtualAdoptionRefusalBound; i++ {
 		virtualAdoptionRefusals.mark(key)
 	}
-	if _, ok := h.virtualProbeEvidenceArgsForRow(context.Background(), row, candidate, probed, true); !ok {
+	if _, ok := h.virtualProbeEvidenceArgsForRow(context.Background(), row, candidate, probed, resolver.PersistedIdentityTiers{}, true); !ok {
 		t.Fatal("args builder refused before the terminal could be named")
 	}
 	if !strings.Contains(logs.String(), virtualProbeRefusalAdoptionBoundExhausted) {
