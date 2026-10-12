@@ -84,13 +84,14 @@ const (
 	virtualProbeFailureRepeatThreshold = 2
 	// virtualProbePartialRepeatThreshold is the number of consecutive
 	// incomplete enumerations for one candidate before the non-negotiated
-	// background path stops re-probing and settles on the candidate's declared
-	// metadata. The negotiated path arms a convergence watchdog that fails the
-	// pending lifecycle at its own bound; the non-negotiated background path has
-	// no session lifecycle to fail, so this streak is its bound. A single
-	// partial read is never penalized (the pin is kept and the failure damper
-	// is not consumed); only a persistent streak settles the resolve so a
-	// truncated provider cannot keep a start pending for the session's life.
+	// paths stop re-probing and settle on the candidate's declared metadata.
+	// The negotiated path arms a convergence watchdog that fails the pending
+	// lifecycle at its own bound; the non-negotiated background path and the
+	// synchronous resolve have no session lifecycle to fail, so this streak is
+	// their bound. A single partial read is never penalized (the pin is kept
+	// and the failure damper is not consumed); only a persistent streak settles
+	// the resolve so a truncated provider cannot keep a start pending for the
+	// session's life.
 	virtualProbePartialRepeatThreshold = 2
 	// virtualProbeFailureMaxEntries caps the process-wide probe-failure damper.
 	// A live marker is a candidate still inside its backoff window; a
@@ -282,8 +283,8 @@ func virtualProbePartialKey(key string) string {
 
 // bumpPartial records one more incomplete enumeration for a candidate and
 // returns the new consecutive streak length. It is the bound side of the
-// non-negotiated background path, which has no convergence watchdog to fail a
-// stuck pending lifecycle.
+// non-negotiated paths (the background probe and the synchronous resolve),
+// which have no convergence watchdog to fail a stuck pending lifecycle.
 func (c *virtualProbeFailureCache) bumpPartial(key string) int {
 	partialKey := virtualProbePartialKey(key)
 	if partialKey == "" {
@@ -1387,6 +1388,16 @@ type resolvedVirtualPlaybackSource struct {
 	// spawns the probe the moment the URL exists. Nil for a resolve that probed
 	// synchronously or had nothing to probe.
 	DeferredProbe *virtualDeferredProbeV3
+	// IncompleteEnumeration marks a resolved source that settled on the
+	// candidate's declared metadata because its synchronous probe returned a
+	// structurally incomplete enumeration (scanner.ErrVirtualProbePartial)
+	// rather than a verdict about the bytes. The candidate keeps its pin and
+	// the failure damper is not consumed, but the resolve does not scan
+	// trailing candidates for a verified sibling: an unknown-verdict candidate
+	// is never substituted. The caller returns the declared disposition
+	// immediately, exactly as it does for a pending deferred lifecycle. The
+	// retry across starts is bounded by the incomplete-enumeration streak.
+	IncompleteEnumeration bool
 }
 
 // virtualProbeIdentity is the durable provider identity of the candidate a
@@ -3331,13 +3342,31 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		probeCancel()
 		if probeErr != nil || probed == nil {
 			if errors.Is(probeErr, scanner.ErrVirtualProbePartial) {
-				// The enumeration is incomplete, not the candidate invalid: hold
-				// the source pending (non-verified) without consuming the failure
-				// budget or releasing the pin. Nothing is persisted or published as
-				// verified; a later complete probe verifies it.
-				slog.DebugContext(r.Context(), "virtual stream probe enumeration incomplete; holding inventory pending",
+				// The enumeration is incomplete, not the candidate invalid: the
+				// candidate keeps its pin and the failure damper is not consumed,
+				// and nothing is persisted or published as verified. This
+				// synchronous path runs before the session exists, so it has no
+				// deferred lifecycle for the convergence watchdog to close;
+				// returning pending here would leave the start with no path to a
+				// terminal state. Settle on the candidate's declared metadata
+				// (non-verified) instead, and bound the retry with the same
+				// incomplete-enumeration streak the non-negotiated background
+				// path uses: once the streak repeats, the failure damper arms so
+				// later starts stop re-probing and reuse the declared disposition
+				// rather than holding a start pending for the session's life.
+				if virtualProbeFailures.bumpPartial(probeKey) >= virtualProbePartialRepeatThreshold {
+					virtualProbeFailures.mark(probeKey)
+					slog.WarnContext(r.Context(), "virtual stream probe enumeration still incomplete; settling on declared metadata",
+						"component", "api", "candidate_uri", cand.URI, "file_id", file.ID,
+						"attempts", virtualProbePartialRepeatThreshold)
+				}
+				slog.DebugContext(r.Context(), "virtual stream probe enumeration incomplete; serving declared metadata",
 					"component", "api", "candidate_uri", cand.URI, "error", probeErr)
-				return mergeDeclaredFallback(ProbeProvenancePending)
+				resolved, err := mergeDeclaredFallback(ProbeProvenanceDeclared)
+				if resolved != nil {
+					resolved.IncompleteEnumeration = true
+				}
+				return resolved, err
 			}
 			virtualProbeFailures.mark(probeKey)
 			slog.DebugContext(r.Context(), "virtual stream probe timed out or failed; using candidate metadata", "component", "api", "candidate_uri", cand.URI, "error", probeErr)
@@ -3408,10 +3437,13 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		// verified sibling, but every extra iteration pays a full provider
 		// resolve RPC (a plugin round-trip, seconds each) whose work the
 		// loop then throws away — the final return is this same first
-		// usable source anyway. Declared results (no prober) fall through
-		// to the finalization block below so they still get the runtime
-		// check, evidence persist, and sticky pin.
-		if result.Provenance == ProbeProvenancePending {
+		// usable source anyway. An incomplete-enumeration result settled on
+		// declared metadata for the same reason and must not be substituted:
+		// the candidate's bytes were never condemned, so a sibling is not a
+		// valid replacement. Declared results (no prober) fall through to the
+		// finalization block below so they still get the runtime check,
+		// evidence persist, and sticky pin.
+		if result.Provenance == ProbeProvenancePending || result.IncompleteEnumeration {
 			result.CandidateRank = i
 			result.CandidateCount = len(candidates)
 			return *result, nil

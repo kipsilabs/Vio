@@ -11,22 +11,30 @@ import (
 	"github.com/Silo-Server/silo-server/internal/scanner"
 )
 
-// TestResolveVirtualPlaybackSourcePartialEnumerationHoldsPending pins the
+// TestResolveVirtualPlaybackSourcePartialEnumerationSettlesDeclared pins the
 // synchronous resolve: a probe that returns an incomplete stream table
 // (scanner.ErrVirtualProbePartial) is not a verdict about the candidate's bytes,
-// so the resolve must report pending (non-verified) and must not consume the
-// probe-failure budget. Reporting failed here would condemn and rotate a
-// candidate whose bytes were never measured to be bad.
+// so the resolve must not consume the probe-failure budget and must not release
+// the pin. This synchronous path has no deferred session lifecycle, so pending
+// would never reach a terminal state; the resolve instead settles on the
+// candidate's declared metadata (non-verified) immediately, and the
+// incomplete-enumeration streak bounds re-probing across starts. Reporting
+// failed here would condemn and rotate a candidate whose bytes were never
+// measured to be bad.
 //
 // The candidate deliberately declares no audio: a candidate with complete
 // declared metadata takes the instant declared-evidence start above this probe
 // instead, so an incomplete-declaration candidate is what exercises the
 // synchronous probe path.
-func TestResolveVirtualPlaybackSourcePartialEnumerationHoldsPending(t *testing.T) {
+func TestResolveVirtualPlaybackSourcePartialEnumerationSettlesDeclared(t *testing.T) {
 	stored := provenanceResolveRow()
 	probeKey := virtualProbeFailureKey(stored.FilePath, stored.VirtualOwnerInstallationID)
 	virtualProbeFailures.clear(probeKey)
-	t.Cleanup(func() { virtualProbeFailures.clear(probeKey) })
+	virtualProbeFailures.clearPartial(probeKey)
+	t.Cleanup(func() {
+		virtualProbeFailures.clear(probeKey)
+		virtualProbeFailures.clearPartial(probeKey)
+	})
 
 	h := virtualProvenanceResolution(stored, func(_ context.Context, _ string, _ *models.MediaFile) (*models.MediaFile, error) {
 		return nil, scanner.ErrVirtualProbePartial
@@ -42,14 +50,70 @@ func TestResolveVirtualPlaybackSourcePartialEnumerationHoldsPending(t *testing.T
 	if err != nil {
 		t.Fatalf("resolveVirtualPlaybackSource error: %v", err)
 	}
-	if resolved.Provenance != ProbeProvenancePending {
-		t.Fatalf("provenance = %q, want pending after a partial enumeration", resolved.Provenance)
+	if resolved.Provenance != ProbeProvenanceDeclared {
+		t.Fatalf("provenance = %q, want declared (terminal non-verified) after a partial enumeration", resolved.Provenance)
+	}
+	if !resolved.IncompleteEnumeration {
+		t.Fatal("a partial enumeration must be marked as an incomplete-enumeration settlement")
 	}
 	if resolved.ProbeSucceeded {
 		t.Fatal("a partial enumeration must not report a successful probe")
 	}
 	if got := virtualProbeFailures.count(probeKey); got != 0 {
 		t.Fatalf("partial enumeration consumed the probe-failure budget (%d marks)", got)
+	}
+	if virtualProbeFailures.recent(probeKey) {
+		t.Fatal("a single partial enumeration armed the failure damper")
+	}
+}
+
+// TestSyncProbePartialEnumerationHasBoundedStreak pins the synchronous resolve's
+// bound. That path has no session lifecycle for the convergence watchdog to
+// fail, so a persistent partial must arm the failure damper after a repeated
+// streak; only then do later starts stop re-probing and reuse the declared
+// disposition instead of holding a start pending forever.
+func TestSyncProbePartialEnumerationHasBoundedStreak(t *testing.T) {
+	stored := provenanceResolveRow()
+	probeKey := virtualProbeFailureKey(stored.FilePath, stored.VirtualOwnerInstallationID)
+	virtualProbeFailures.clear(probeKey)
+	virtualProbeFailures.clearPartial(probeKey)
+	t.Cleanup(func() {
+		virtualProbeFailures.clear(probeKey)
+		virtualProbeFailures.clearPartial(probeKey)
+	})
+
+	proberCalls := 0
+	h := virtualProvenanceResolution(stored, func(_ context.Context, _ string, _ *models.MediaFile) (*models.MediaFile, error) {
+		proberCalls++
+		return nil, scanner.ErrVirtualProbePartial
+	})
+	h.VirtualPlaybackStreamLister = VirtualPlaybackStreamListerFunc(func(_ context.Context, _ string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
+		return []VirtualPlaybackStream{{
+			ID: "cand-1", URI: stored.FilePath,
+			Resolution: "1080p", CodecVideo: "h264", Container: "mkv",
+		}}, nil
+	})
+
+	for i := 0; i < virtualProbePartialRepeatThreshold; i++ {
+		resolved, err := h.resolveVirtualPlaybackSource(provenanceResolveRequest(), stored, "profile-1", false, nil, "", "", 0, false)
+		if err != nil {
+			t.Fatalf("resolve %d error: %v", i, err)
+		}
+		if resolved.Provenance != ProbeProvenanceDeclared {
+			t.Fatalf("resolve %d provenance = %q, want declared", i, resolved.Provenance)
+		}
+	}
+	if !virtualProbeFailures.recent(probeKey) {
+		t.Fatalf("a %d-attempt sync partial streak did not arm the failure damper", virtualProbePartialRepeatThreshold)
+	}
+	// The bound: once the streak arms the damper, later starts take the
+	// damper's cache-only recovery path and never re-probe.
+	before := proberCalls
+	if _, err := h.resolveVirtualPlaybackSource(provenanceResolveRequest(), stored, "profile-1", false, nil, "", "", 0, false); err != nil {
+		t.Fatalf("post-bound resolve error: %v", err)
+	}
+	if proberCalls != before {
+		t.Fatalf("sync prober ran %d more time(s) after the bound; want 0", proberCalls-before)
 	}
 }
 
@@ -251,8 +315,8 @@ func TestBackgroundProbeForwardsCandidateAudioBeforeGate(t *testing.T) {
 // before the candidate's declared metadata is merged, so a candidate that
 // declares audio only through its language list reaches the prober without an
 // audio signal. The gate-aware prober returns the real gate's verdict, so the
-// resolve must hold the source pending instead of adopting a thin verified
-// inventory.
+// resolve must settle on declared metadata (non-verified) instead of adopting a
+// thin verified inventory.
 func TestResolveVirtualPlaybackSyncForwardsCandidateAudioBeforeGate(t *testing.T) {
 	stored := provenanceResolveRow()
 	prober, thinCompletions := gateAwareThinProber()
@@ -266,14 +330,18 @@ func TestResolveVirtualPlaybackSyncForwardsCandidateAudioBeforeGate(t *testing.T
 	})
 	probeKey := virtualProbeFailureKey(stored.FilePath, stored.VirtualOwnerInstallationID)
 	virtualProbeFailures.clear(probeKey)
-	t.Cleanup(func() { virtualProbeFailures.clear(probeKey) })
+	virtualProbeFailures.clearPartial(probeKey)
+	t.Cleanup(func() {
+		virtualProbeFailures.clear(probeKey)
+		virtualProbeFailures.clearPartial(probeKey)
+	})
 
 	resolved, err := h.resolveVirtualPlaybackSource(provenanceResolveRequest(), stored, "profile-1", false, nil, "", "", 0, false)
 	if err != nil {
 		t.Fatalf("resolveVirtualPlaybackSource error: %v", err)
 	}
-	if resolved.Provenance != ProbeProvenancePending {
-		t.Fatalf("provenance = %q, want pending after a partial enumeration", resolved.Provenance)
+	if resolved.Provenance != ProbeProvenanceDeclared {
+		t.Fatalf("provenance = %q, want declared (terminal non-verified) after a partial enumeration", resolved.Provenance)
 	}
 	if resolved.ProbeSucceeded {
 		t.Fatal("a partial enumeration must not report a successful probe")
