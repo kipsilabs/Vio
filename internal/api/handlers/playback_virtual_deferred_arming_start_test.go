@@ -68,14 +68,26 @@ func TestDurableResumeUnstampedStartArmsProbeOnEverySurface(t *testing.T) {
 			}
 			stamped := make(chan struct{})
 			var stampOnce sync.Once
+			// The saver records whether the deferred write asked for the probe
+			// stamp and only stamps the row when it did. A fake saver that stamps
+			// unconditionally would hide a write that dropped its explicit
+			// successful-probe provenance; asserting the flag keeps this
+			// all-surface acceptance test honest about what the worker sent.
+			var stampRequested bool
+			var stampMu sync.Mutex
 			handler.VirtualFileMetadataSaver = func(_ context.Context, args models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error) {
 				var audio []models.AudioTrack
 				if err := json.Unmarshal(args.AudioTracks, &audio); err != nil {
 					return VirtualFileMetadataUpdateResult{}, err
 				}
+				stampMu.Lock()
+				stampRequested = args.StampProbe
+				stampMu.Unlock()
 				resolver.update(func(f *models.MediaFile) {
 					f.AudioTracks = audio
-					f.ProbeUpdatedAt = &probedAt
+					if args.StampProbe {
+						f.ProbeUpdatedAt = &probedAt
+					}
 				})
 				stampOnce.Do(func() { close(stamped) })
 				return VirtualFileMetadataUpdateResult{MetadataUpdated: true, RowsAffected: 1}, nil
@@ -109,6 +121,12 @@ func TestDurableResumeUnstampedStartArmsProbeOnEverySurface(t *testing.T) {
 			case <-stamped:
 			case <-time.After(2 * time.Second):
 				t.Fatal("post-commit probe did not stamp the row")
+			}
+			stampMu.Lock()
+			gotStamp := stampRequested
+			stampMu.Unlock()
+			if !gotStamp {
+				t.Fatal("deferred probe write did not request the probe stamp")
 			}
 		})
 	}

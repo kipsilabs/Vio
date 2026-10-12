@@ -413,3 +413,119 @@ func TestDurableResumeDamperDeclinesWorkerAndServesDeclared(t *testing.T) {
 		t.Fatal("damper-armed durable resume probed despite the failure backoff")
 	}
 }
+
+// TestDurableResumeDamperRecoversWarmCachedProbe is the warm-cache half of the
+// damper wiring that TestDurableResumeDamperDeclinesWorkerAndServesDeclared
+// covers cold: when the damper is armed but a completed inner probe has already
+// landed in the probe cache, the cache-only recovery persists that evidence and
+// stamps the row. The session still reports declared (no worker is admitted
+// while the budget is spent), but the row converges to verified inventory
+// instead of waiting for the backoff to lapse, so the next play takes the P0
+// fast path.
+func TestDurableResumeDamperRecoversWarmCachedProbe(t *testing.T) {
+	const candidateURI = "virtual://movie/tt-stamp-damper-warm?result=cand-dw"
+	fx := newDeferredLifecycleFixture(t, 776, candidateURI)
+	fx.saveAttempt(t)
+	fx.handler.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(
+		func(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
+			t.Fatal("the durable-resume fast path must not fall back to the provider resolver")
+			return "", nil
+		})
+	// The worker must not be admitted while the damper is armed; the recovery
+	// has to come from the cache alone.
+	probeCalled := false
+	fx.handler.VirtualPlaybackSourceProber = func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
+		probeCalled = true
+		return f, nil
+	}
+	// A completed inner probe for the persisted URL is available in the cache.
+	var cacheLookups int
+	fx.handler.VirtualProbeCacheLookup = func(_ string, file *models.MediaFile) *models.MediaFile {
+		cacheLookups++
+		return &models.MediaFile{
+			FilePath:                   file.FilePath,
+			VirtualOwnerInstallationID: file.VirtualOwnerInstallationID,
+			CodecAudio:                 "eac3",
+			Container:                  "mkv",
+			AudioTracks:                []models.AudioTrack{{Index: 1, Codec: "eac3", Channels: 6, Language: "eng"}},
+		}
+	}
+	// The recovered evidence must be persisted as a successful-probe write: the
+	// cached probe measured the bytes, so it is real inventory and must carry the
+	// stamp. VirtualFileSaver admits the write into the bounded evidence buffer;
+	// VirtualFileMetadataSaver is the write the worker runs.
+	var saved models.VirtualFilePersistArgs
+	var savedMu sync.Mutex
+	fx.handler.VirtualFileSaver = func(_ context.Context, _ models.VirtualFilePersistArgs) (int64, error) {
+		return 1, nil
+	}
+	fx.handler.VirtualFileMetadataSaver = func(_ context.Context, args models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error) {
+		savedMu.Lock()
+		saved = args
+		savedMu.Unlock()
+		return VirtualFileMetadataUpdateResult{MetadataUpdated: true, RowsAffected: 1}, nil
+	}
+	// Arm the damper for this candidate before the start; the durable resume
+	// must share the declared fast path's admission decision.
+	key := virtualProbeFailureKey(candidateURI, 5)
+	virtualProbeFailures.mark(key)
+	t.Cleanup(func() { virtualProbeFailures.clear(key) })
+
+	expiresAt := time.Now().Add(3 * time.Hour)
+	file := withVirtualResumeVideoEvidence(&models.MediaFile{
+		ID:                         776,
+		ContentID:                  "movie-tt-stamp-damper-warm",
+		FilePath:                   candidateURI,
+		Container:                  "virtual",
+		VirtualOwnerInstallationID: 5,
+		ResolvedURL:                "https://93.184.216.34/stream/token=stored",
+		ResolvedURLExpiresAt:       &expiresAt,
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/playback/start", nil)
+	resolved, err := fx.handler.resolveVirtualPlaybackSource(req, file, "profile-1", true, nil, "", "", 0, false)
+	if err != nil {
+		t.Fatalf("resolveVirtualPlaybackSource error: %v", err)
+	}
+	if resolved.Provenance != ProbeProvenanceDeclared {
+		t.Fatalf("provenance = %q, want declared (no worker will resolve a pending state)", resolved.Provenance)
+	}
+	if resolved.DeferredProbe != nil {
+		t.Fatal("damper-armed durable resume armed a worker; the probe budget was already spent")
+	}
+	if probeCalled {
+		t.Fatal("damper-armed durable resume probed despite the failure backoff")
+	}
+	if cacheLookups != 1 {
+		t.Fatalf("cache lookups = %d, want the recovery to consult the warm cache once", cacheLookups)
+	}
+	if virtualProbeFailures.count(key) != 0 {
+		t.Fatal("warm-cache recovery did not clear the failure damper")
+	}
+
+	// The recovery enqueues into the bounded evidence buffer; wait on the write
+	// rather than sleeping a fixed duration.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		savedMu.Lock()
+		got := saved
+		savedMu.Unlock()
+		if got.FileID != 0 {
+			if !got.StampProbe {
+				t.Fatal("recovered cache evidence was persisted without requesting the probe stamp")
+			}
+			var audio []models.AudioTrack
+			if err := json.Unmarshal(got.AudioTracks, &audio); err != nil {
+				t.Fatalf("saved audio tracks: %v", err)
+			}
+			if len(audio) != 1 || audio[0].Codec != "eac3" {
+				t.Fatalf("saved audio tracks = %#v, want the cached eac3 track", audio)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("warm-cache recovery never persisted the cached probe evidence")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
