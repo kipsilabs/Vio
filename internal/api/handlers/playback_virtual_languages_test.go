@@ -292,6 +292,86 @@ func TestMergeVirtualCandidateTracksKeepsDepthOnlyObservedRange(t *testing.T) {
 	}
 }
 
+// TestMergeVirtualCandidateTracksCorroboratedHDRTypeFillsUnknownDepth is the
+// Citizen Kane regression: a probe that corroborated an HDR range type
+// (HDR10/HLG/DOVI) but left bit depth unknown (0) gains the codec/range
+// default depth (10) rather than terminaling source_metadata_incomplete.
+// The range type is itself subtype evidence of ≥10-bit samples (BT.2020 /
+// ST 2084 pipelines cannot be 8-bit). An observed 8-bit depth stays kept;
+// only unknown (0) is filled, and no range string, profile, or DV field is
+// recomputed on this branch.
+func TestMergeVirtualCandidateTracksCorroboratedHDRTypeFillsUnknownDepth(t *testing.T) {
+	probed := &models.MediaFile{
+		Resolution: "2160p",
+		CodecVideo: "hevc",
+		VideoTracks: []models.VideoTrack{{
+			Codec: "hevc", Width: 3840, Height: 2160, FrameRate: "24",
+			VideoRangeType: "HDR10",
+		}},
+	}
+
+	mergeVirtualCandidateTracks(probed, VirtualPlaybackStream{
+		Resolution: "2160p", CodecVideo: "hevc", Container: "mkv",
+	})
+
+	vt := probed.VideoTracks[0]
+	if vt.BitDepth != 10 {
+		t.Fatalf("corroborated HDR10 track depth = %d, want 10", vt.BitDepth)
+	}
+	if vt.VideoRangeType != "HDR10" {
+		t.Fatalf("range type changed: %#v", vt)
+	}
+	if !completeVirtualVideoEvidenceV3(probed) {
+		t.Fatalf("merged row still incomplete: %#v", probed)
+	}
+}
+
+// TestMergeVirtualCandidateTracksCorroboratedHDRTypeWithoutReleaseLabel pins
+// the @oracle B- catch: the depth fill must derive from the track's own
+// observed range type, not the outer candidate flags. A corroborated HDR10
+// track on an SDR-labeled release (no HDR text, 1080p so no resolution
+// fallback) still resolves 10-bit; the outer flags alone would return 8.
+func TestMergeVirtualCandidateTracksCorroboratedHDRTypeWithoutReleaseLabel(t *testing.T) {
+	probed := &models.MediaFile{
+		Resolution: "1080p",
+		CodecVideo: "hevc",
+		VideoTracks: []models.VideoTrack{{
+			Codec: "hevc", Width: 1920, Height: 1080, FrameRate: "24",
+			VideoRangeType: "HDR10",
+		}},
+	}
+
+	mergeVirtualCandidateTracks(probed, VirtualPlaybackStream{
+		Resolution: "1080p", CodecVideo: "hevc", CodecAudio: "aac", Container: "mkv",
+	})
+
+	if got := probed.VideoTracks[0].BitDepth; got != 10 {
+		t.Fatalf("HDR10 track without release label depth = %d, want 10", got)
+	}
+}
+
+// TestMergeVirtualCandidateTracksKeepsObserved8BitDepth pins the other half:
+// an explicitly observed 8-bit depth is observed evidence and is kept, even
+// on a corroborated HDR-type track. Only unknown (0) depth is filled.
+func TestMergeVirtualCandidateTracksKeepsObserved8BitDepth(t *testing.T) {
+	probed := &models.MediaFile{
+		Resolution: "1080p",
+		CodecVideo: "h264",
+		VideoTracks: []models.VideoTrack{{
+			Codec: "h264", Width: 1920, Height: 1080, FrameRate: "24",
+			BitDepth: 8, VideoRangeType: "HDR10",
+		}},
+	}
+
+	mergeVirtualCandidateTracks(probed, VirtualPlaybackStream{
+		Resolution: "1080p", CodecVideo: "h264", Container: "mkv",
+	})
+
+	if got := probed.VideoTracks[0].BitDepth; got != 8 {
+		t.Fatalf("observed 8-bit depth overwritten: got %d", got)
+	}
+}
+
 // TestMergeVirtualCandidateTracksKeepsObservedRangeType is the range-type
 // half: an empty range string with an observed HLG range type is observed
 // subtype evidence. A DV declaration must not overwrite the type with DOVI.

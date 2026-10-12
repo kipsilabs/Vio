@@ -6448,13 +6448,22 @@ func mergeVirtualCandidateTracks(probed *models.MediaFile, candidate VirtualPlay
 			// evaluation — never the first track's): keep it. The candidate
 			// may still fill dimensional gaps (width/height/frame-rate) via
 			// the `<= 0`/`== ""` guards below, which never overwrite — but no
-			// profile, level, bit depth, DV field, or range string is
-			// recomputed from the candidate's HDR/DV labels. A bare range
-			// string with no supporting evidence stays repaintable (the
-			// stale-SDR repair below), so only corroborated ranges take this
-			// branch. Flipping a probed range here is what persisted
-			// misinformation that drove wrong direct-play, DV, and tone-map
-			// routes.
+			// profile, level, DV field, or range string is recomputed from
+			// the candidate's HDR/DV labels. A bare range string with no
+			// supporting evidence stays repaintable (the stale-SDR repair
+			// below), so only corroborated ranges take this branch. Flipping
+			// a probed range here is what persisted misinformation that drove
+			// wrong direct-play, DV, and tone-map routes.
+			//
+			// Bit depth is the exception to the no-recompute rule: an
+			// observed range TYPE (HDR10/HLG/DOVI) is itself subtype evidence
+			// that the stream carries ≥10-bit samples (BT.2020/ST 2084
+			// pipelines cannot be 8-bit), so a corroborated HDR-type track
+			// with unknown depth (0) is filled from the codec/range default
+			// rather than left at 0 to terminal source_metadata_incomplete.
+			// An observed 8-bit depth is still kept: depth is observed
+			// evidence even with an empty range string, and only the
+			// explicit HDR/DV/profile upgrade below may lift it.
 			if probed.VideoTracks[i].Width <= 0 {
 				probed.VideoTracks[i].Width = resolutionWidth(probed.Resolution)
 			}
@@ -6463,6 +6472,22 @@ func mergeVirtualCandidateTracks(probed *models.MediaFile, candidate VirtualPlay
 			}
 			if probed.VideoTracks[i].FrameRate == "" {
 				probed.VideoTracks[i].FrameRate = defaultVirtualFrameRate(candidate.FrameRate)
+			}
+			if probed.VideoTracks[i].BitDepth <= 0 {
+				// Derive HDR/DV status from the track's own observed
+				// evidence, not the outer candidate flags: a corroborated
+				// HDR-type track on an SDR-labeled release (no HDR text in
+				// the release name, top-level flag false) must still resolve
+				// 10-bit. The outer flags alone would return depth 8 for a
+				// 1080p hevc track and violate the BT.2020/ST 2084 floor.
+				track := probed.VideoTracks[i]
+				trackIsDV := track.DVProfile > 0 || track.DolbyVision != "" || track.DVConfigPresent || track.DVBLPresent ||
+					strings.HasPrefix(strings.ToLower(track.VideoRangeType), "dovi")
+				trackIsHDR := trackIsDV || track.HDR10Plus || strings.EqualFold(track.VideoRange, "hdr") ||
+					(!strings.EqualFold(track.VideoRangeType, "sdr") && strings.TrimSpace(track.VideoRangeType) != "")
+				if _, _, trackDepth := defaultVirtualVideoProfileAndLevel(track.Codec, isHDR || trackIsHDR, isDV || trackIsDV, probed.Resolution); trackDepth > 0 {
+					probed.VideoTracks[i].BitDepth = trackDepth
+				}
 			}
 			continue
 		}
