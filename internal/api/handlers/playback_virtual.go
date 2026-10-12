@@ -4283,9 +4283,13 @@ func ExecVirtualFileMetadataUpdateResult(ctx context.Context, db VirtualFileMeta
 		sStr = "[]"
 	}
 	verdictMaxAgeSeconds := virtualFailedVerdictMaxAge.Seconds()
-	// The verdict fence is only meaningful where the caller needs a confirmed
-	// adoption (RequireAdopt) and has not asked for an explicit retry.
-	fenceVerdict := args.RequireAdopt && !args.AllowFailedVerdict
+	// The verdict fence is enforced wherever a write commits on the strength of
+	// a validated candidate identity: a required adoption, or the same-release
+	// evidence permission that stands in for one. The caller has already
+	// re-checked the candidate's verdict in-process before granting that
+	// permission, so this is defense in depth: it keeps a future caller from
+	// setting SameReleaseEvidence with an AdoptPath and skipping the fence.
+	fenceVerdict := (args.RequireAdopt || args.SameReleaseEvidence) && !args.AllowFailedVerdict
 	exec := func(adoptPath string) (string, error) {
 		neutralPath := ""
 		if adoptPath != "" {

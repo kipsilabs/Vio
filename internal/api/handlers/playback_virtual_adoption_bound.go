@@ -218,13 +218,6 @@ func virtualAdoptionRefusalBoundReached(args models.VirtualFilePersistArgs) bool
 	return virtualAdoptionRefusals.count(virtualAdoptionRefusalKeyForArgs(args)) >= virtualAdoptionRefusalBound
 }
 
-// virtualAdoptionRefusalBoundReachedFor reports the bound for a row and pin that
-// is about to be evaluated before any VirtualFilePersistArgs exists (the
-// rotation-target check).
-func virtualAdoptionRefusalBoundReachedFor(fileID int, expectedPath string) bool {
-	return virtualAdoptionRefusals.count(virtualAdoptionRefusalKey(fileID, expectedPath)) >= virtualAdoptionRefusalBound
-}
-
 // virtualCandidateSharesPersistedIdentity reports whether a probed candidate
 // provably carries the same release as the pinned row, judged by the resolver's
 // explicit resolved-candidate evidence rather than the transient file's
