@@ -101,6 +101,38 @@ func (s *Service) RecordPlaybackStop(
 	hints userstore.VersionHints,
 	thresholds userstore.ProgressThresholds,
 ) (PlaybackStopResult, error) {
+	return s.recordPlaybackStop(ctx, userID, profileID, targetID, duration, position, watchedAt, hints, thresholds, "")
+}
+
+// RecordPlaybackStopWithHistoryID is RecordPlaybackStop with a caller-chosen
+// history row ID. The ID names the play: a stop that is retried after a partial
+// failure reports AlreadyRecorded and adds no second row, so the retry can
+// safely re-run the cleanup. The final position and version hints are written
+// on every call — both are idempotent — and a repeat of an already-recorded row
+// still returns that row's id.
+func (s *Service) RecordPlaybackStopWithHistoryID(
+	ctx context.Context,
+	userID int,
+	profileID, targetID string,
+	duration, position float64,
+	watchedAt time.Time,
+	hints userstore.VersionHints,
+	thresholds userstore.ProgressThresholds,
+	historyID string,
+) (PlaybackStopResult, error) {
+	return s.recordPlaybackStop(ctx, userID, profileID, targetID, duration, position, watchedAt, hints, thresholds, historyID)
+}
+
+func (s *Service) recordPlaybackStop(
+	ctx context.Context,
+	userID int,
+	profileID, targetID string,
+	duration, position float64,
+	watchedAt time.Time,
+	hints userstore.VersionHints,
+	thresholds userstore.ProgressThresholds,
+	historyID string,
+) (PlaybackStopResult, error) {
 	result := PlaybackStopResult{
 		MediaItemID:          targetID,
 		DurationSeconds:      duration,
@@ -126,7 +158,9 @@ func (s *Service) RecordPlaybackStop(
 			return result, err
 		}
 	}
-	historyID := uuid.NewString()
+	if historyID == "" {
+		historyID = uuid.NewString()
+	}
 	entry := userstore.WatchHistoryEntry{
 		ID:              historyID,
 		ProfileID:       profileID,
@@ -138,6 +172,13 @@ func (s *Service) RecordPlaybackStop(
 	}
 	s.applyStableIdentity(ctx, &entry)
 	entry, err = userstore.AddVisibleHistory(ctx, store, entry)
+	if errors.Is(err, userstore.ErrHistoryEntryExists) {
+		// The play is already recorded under this id. Report it as such and
+		// change nothing, so a retried stop cannot add a duplicate row.
+		result.AlreadyRecorded = true
+		result.HistoryID = historyID
+		return result, nil
+	}
 	if err != nil {
 		return result, err
 	}

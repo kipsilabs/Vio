@@ -136,12 +136,23 @@ type TranscodeManager struct {
 	lifecycleLocks map[string]*lifecycleLock
 }
 
-// lifecycleLock is a refcounted per-session mutex. The refcount lets the manager
+// lifecycleLock is a refcounted per-session lock. The refcount lets the manager
 // drop the map entry once no path holds or waits on it, so the map does not grow
 // unbounded across the lifetime of a long-running server.
+//
+// The lock is a one-slot channel rather than a sync.Mutex so a waiter can give
+// up on a deadline: a stop finalization fenced by a lease must not block past it
+// behind an unrelated holder and then run teardown after another replica has
+// taken the work over. newLifecycleLock seeds the single token.
 type lifecycleLock struct {
-	mu   sync.Mutex
-	refs int
+	token chan struct{}
+	refs  int
+}
+
+func newLifecycleLock() *lifecycleLock {
+	lk := &lifecycleLock{token: make(chan struct{}, 1)}
+	lk.token <- struct{}{}
+	return lk
 }
 
 // NewTranscodeManager returns a manager with its internal maps initialized. The
@@ -301,28 +312,55 @@ func (m *TranscodeManager) CancelRemoteTranscode(ctx context.Context, sessionID,
 // lock is refcounted: the map entry is dropped once the last holder/waiter
 // releases, so the map stays bounded.
 func (m *TranscodeManager) LockSessionLifecycle(sessionID string) func() {
+	unlock, _ := m.lockSessionLifecycle(context.Background(), sessionID)
+	return unlock
+}
+
+// LockSessionLifecycleContext is LockSessionLifecycle bounded by ctx: it returns
+// ctx.Err() instead of blocking once the context ends. Teardown paths that must
+// finish inside a lease use it so a holder they cannot outlast makes them give
+// up rather than start work after the deadline.
+func (m *TranscodeManager) LockSessionLifecycleContext(ctx context.Context, sessionID string) (func(), error) {
+	return m.lockSessionLifecycle(ctx, sessionID)
+}
+
+func (m *TranscodeManager) lockSessionLifecycle(ctx context.Context, sessionID string) (func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	m.lifecycleMu.Lock()
 	if m.lifecycleLocks == nil {
 		m.lifecycleLocks = make(map[string]*lifecycleLock)
 	}
 	lk := m.lifecycleLocks[sessionID]
 	if lk == nil {
-		lk = &lifecycleLock{}
+		lk = newLifecycleLock()
 		m.lifecycleLocks[sessionID] = lk
 	}
 	lk.refs++
 	m.lifecycleMu.Unlock()
 
-	lk.mu.Lock()
-	return func() {
-		lk.mu.Unlock()
-		m.lifecycleMu.Lock()
-		lk.refs--
-		if lk.refs == 0 {
-			delete(m.lifecycleLocks, sessionID)
-		}
-		m.lifecycleMu.Unlock()
+	select {
+	case <-lk.token:
+	case <-ctx.Done():
+		// The ref taken above is released, but the lock is never held: a waiter
+		// that gave up does not own the critical section.
+		m.releaseLifecycleLock(sessionID, lk)
+		return nil, ctx.Err()
 	}
+	return func() {
+		lk.token <- struct{}{}
+		m.releaseLifecycleLock(sessionID, lk)
+	}, nil
+}
+
+func (m *TranscodeManager) releaseLifecycleLock(sessionID string, lk *lifecycleLock) {
+	m.lifecycleMu.Lock()
+	lk.refs--
+	if lk.refs == 0 {
+		delete(m.lifecycleLocks, sessionID)
+	}
+	m.lifecycleMu.Unlock()
 }
 
 // RestartSessionLocked re-spawns ts under the per-session lifecycle lock so a

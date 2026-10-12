@@ -1290,7 +1290,7 @@ func TestPersistStopAndHistory_SkipsZeroProgressStops(t *testing.T) {
 		ProfileID:   "profile-1",
 		MediaFileID: 42,
 		Position:    0,
-	})
+	}, "")
 
 	progress, err := store.GetProgress(context.Background(), "profile-1", "movie-1")
 	if err != nil {
@@ -1328,7 +1328,7 @@ func TestPersistStopAndHistory_PersistsPositiveProgressStops(t *testing.T) {
 		ProfileID:   "profile-1",
 		MediaFileID: 42,
 		Position:    240,
-	})
+	}, "")
 
 	progress, err := store.GetProgress(context.Background(), "profile-1", "movie-1")
 	if err != nil {
@@ -1347,6 +1347,54 @@ func TestPersistStopAndHistory_PersistsPositiveProgressStops(t *testing.T) {
 	}
 	if history[0].Source != userstore.WatchHistorySourcePlayback {
 		t.Fatalf("history source = %q, want %q", history[0].Source, userstore.WatchHistorySourcePlayback)
+	}
+}
+
+// A retried stop reuses the history row the first attempt recorded, so the
+// replay repairs the rest of the cleanup without adding a second row for one
+// stop. The native rule still records a fresh row per stop when no prior id is
+// supplied (a session resumed after expiry under the same id).
+func TestPersistStopAndHistory_RetryReusesTheRecordedRow(t *testing.T) {
+	store := newPlaybackTestStore(t)
+	file := &models.MediaFile{
+		ID:         42,
+		ContentID:  "movie-1",
+		FilePath:   "/media/movie.mkv",
+		Resolution: "1080p",
+		Duration:   3600,
+	}
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), testPlaybackFileResolver{file: file})
+	handler.StoreProvider = testUserStoreProvider{store: store}
+	session := &playback.Session{
+		ID:          "session-retry",
+		UserID:      1,
+		ProfileID:   "profile-1",
+		MediaFileID: 42,
+		Position:    240,
+	}
+
+	first, err := handler.persistStopAndHistory(context.Background(), session, "")
+	if err != nil {
+		t.Fatalf("first stop: %v", err)
+	}
+	if first.HistoryID == "" || first.AlreadyRecorded {
+		t.Fatalf("first stop result = %+v, want a fresh recorded row", first)
+	}
+
+	retry, err := handler.persistStopAndHistory(context.Background(), session, first.HistoryID)
+	if err != nil {
+		t.Fatalf("retried stop: %v", err)
+	}
+	if !retry.AlreadyRecorded || retry.HistoryID != first.HistoryID {
+		t.Fatalf("retried stop result = %+v, want AlreadyRecorded under %s", retry, first.HistoryID)
+	}
+
+	history, err := store.ListHistory(context.Background(), "profile-1", 10, 0)
+	if err != nil {
+		t.Fatalf("list history: %v", err)
+	}
+	if len(history) != 1 {
+		t.Fatalf("history len = %d, want 1: a retried stop duplicated the row", len(history))
 	}
 }
 
@@ -1462,7 +1510,7 @@ func TestPersistStopAndHistoryRecordsEffectiveVirtualCandidate(t *testing.T) {
 		RequestedMediaFileID: requested.ID,
 		VirtualSourceURI:     candidate.FilePath,
 		Position:             240,
-	})
+	}, "")
 
 	progress, err := store.GetProgress(context.Background(), "profile-1", "movie-1")
 	if err != nil {

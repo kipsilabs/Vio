@@ -399,7 +399,7 @@ func TestStopTeardownDurableWritesSurviveSlowStartEffect(t *testing.T) {
 		}
 		h.v3StartEffectsPending = map[string]*playbackStartSideEffectsStateV3{session.ID: state}
 
-		h.finalizeSessionStopWithResult(context.Background(), session, false, "", true)
+		h.finalizeSessionStopWithResult(context.Background(), session, false, "", true, "")
 
 		if !adminStore.deleted[session.ID] {
 			t.Fatalf("durable session delete did not run after a slow start effect (calls=%d)", adminStore.deleteCalls)
@@ -437,35 +437,74 @@ func (s *leaseObservingStore) RecordStopReceipt(ctx context.Context, sessionID s
 	return err
 }
 
-// wedgedCleanupAdminStore blocks the synced-session delete until its teardown
-// context ends, the way a slow or wedged durable store would, and signals when
-// it has entered the block.
-type wedgedCleanupAdminStore struct {
+// stagedCleanupAdminStore models the synced-session delete of the stop cleanup.
+// While failing it blocks until its teardown context ends and returns that
+// error, standing in for a wedged durable store; otherwise it succeeds after an
+// optional delay and records the delete. It signals when the delete was first
+// entered.
+type stagedCleanupAdminStore struct {
+	failing     bool
+	delay       time.Duration
 	entered     chan struct{}
 	enteredOnce sync.Once
+	mu          sync.Mutex
+	deleted     map[string]bool
 }
 
-func (s *wedgedCleanupAdminStore) RecordHistory(context.Context, AdminPlaybackHistoryEntry) error {
+func (s *stagedCleanupAdminStore) RecordHistory(context.Context, AdminPlaybackHistoryEntry) error {
 	return nil
 }
 
-func (s *wedgedCleanupAdminStore) DeleteSession(ctx context.Context, sessionID string) error {
+func (s *stagedCleanupAdminStore) DeleteSession(ctx context.Context, sessionID string) error {
 	s.enteredOnce.Do(func() { close(s.entered) })
-	<-ctx.Done()
-	return ctx.Err()
+	s.mu.Lock()
+	failing, delay := s.failing, s.delay
+	s.mu.Unlock()
+	if delay > 0 {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	if failing {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	s.mu.Lock()
+	if s.deleted == nil {
+		s.deleted = make(map[string]bool)
+	}
+	s.deleted[sessionID] = true
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *stagedCleanupAdminStore) repair() {
+	s.mu.Lock()
+	s.failing = false
+	s.mu.Unlock()
+}
+
+func (s *stagedCleanupAdminStore) deletedSession(sessionID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.deleted[sessionID]
 }
 
 // A claimed finalization must finish inside its single end-to-end budget, below
-// the lease, even when a start effect holds the wait open and the cleanup then
-// wedges. Nested fresh budgets used to stack past the lease, letting a
-// concurrent replay reclaim the claim while the winner was still writing; here
-// the replay must stay a replay and the winner must finalize once, in budget.
+// the lease, even when a start effect holds the wait open and the cleanup is
+// slow. Nested fresh budgets used to stack past the lease, letting a concurrent
+// replay reclaim the claim while the winner was still writing; here the replay
+// must stay a replay and the winner must finalize once, in budget.
 func TestStopFinalizationSlowCleanupStaysInsideLease(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		f := newPlaybackServiceFixture(t)
 		store := &leaseObservingStore{MemoryPlanStoreV3: f.handler.PlanStoreV3.(*playback.MemoryPlanStoreV3)}
 		f.handler.PlanStoreV3 = store
-		admin := &wedgedCleanupAdminStore{entered: make(chan struct{})}
+		admin := &stagedCleanupAdminStore{delay: 5 * time.Second, entered: make(chan struct{})}
 		f.handler.AdminStore = admin
 
 		// A start effect that holds the cancel-wait open for 8s, so the durable
@@ -493,7 +532,7 @@ func TestStopFinalizationSlowCleanupStaysInsideLease(t *testing.T) {
 			view, err := f.handler.StopPlaybackV2(newAuthorizedPlaybackContext(), f.caller, f.session.ID, PlaybackStopCommand{StopID: uuid.NewString()})
 			firstDone <- stopResult{view, err}
 		}()
-		// Only start the racing replay once the winner is inside its wedged
+		// Only start the racing replay once the winner is inside its slow
 		// cleanup, so the two finalizations overlap for real.
 		<-admin.entered
 		replayDone := make(chan stopResult, 1)
@@ -536,6 +575,114 @@ func TestStopFinalizationSlowCleanupStaysInsideLease(t *testing.T) {
 		if _, err := f.manager.GetSession(f.session.ID); !errors.Is(err, playback.ErrSessionNotFound) {
 			t.Fatalf("winner did not tear the session down: %v", err)
 		}
+	})
+}
+
+// A cleanup that fails must not finalize the stop. The receipt stays
+// unfinalized and its claim is released, so a replay re-runs the idempotent
+// writers and repairs the rows the first attempt stranded instead of the stop
+// being pinned complete over a still-present synced session.
+func TestStopFinalizationFailedCleanupStaysReplayable(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := newPlaybackServiceFixture(t)
+		store := &leaseObservingStore{MemoryPlanStoreV3: f.handler.PlanStoreV3.(*playback.MemoryPlanStoreV3)}
+		f.handler.PlanStoreV3 = store
+		admin := &stagedCleanupAdminStore{failing: true, entered: make(chan struct{})}
+		f.handler.AdminStore = admin
+
+		start := time.Now()
+		first, err := f.handler.StopPlaybackV2(f.ctx, f.caller, f.session.ID, PlaybackStopCommand{StopID: uuid.NewString()})
+		elapsed := time.Since(start)
+		if err != nil || first.Outcome != PlaybackOutcomeStopped {
+			t.Fatalf("winner stop = %+v, %v", first, err)
+		}
+		if elapsed > stopFinalizationBudget {
+			t.Fatalf("failed cleanup ran %v, past the %v end-to-end budget", elapsed, stopFinalizationBudget)
+		}
+		select {
+		case <-admin.entered:
+		default:
+			t.Fatal("precondition: cleanup never reached the synced-session delete")
+		}
+		store.mu.Lock()
+		claims, writes := store.claimsWon, store.finalizedWrites
+		store.mu.Unlock()
+		if claims != 1 || writes != 0 {
+			t.Fatalf("failed cleanup claimed %d, finalized %d, want 1 and 0", claims, writes)
+		}
+		if receipt, _, _ := store.StopAttempt(context.Background(), f.session.ID, uuid.NewString(), nil); receipt.Finalized {
+			t.Fatalf("a failed cleanup finalized the receipt: %+v", receipt)
+		}
+		if admin.deletedSession(f.session.ID) {
+			t.Fatal("a failed cleanup reported the synced session deleted")
+		}
+
+		// Repair the durable store: the replay must pick the released claim back
+		// up and finish the cleanup.
+		admin.repair()
+		second, err := f.handler.StopPlaybackV2(f.ctx, f.caller, f.session.ID, PlaybackStopCommand{StopID: uuid.NewString()})
+		if err != nil || second.Outcome != PlaybackOutcomeReplayed {
+			t.Fatalf("repairing replay = %+v, %v", second, err)
+		}
+		if !admin.deletedSession(f.session.ID) {
+			t.Fatal("the replay did not delete the stranded synced session")
+		}
+		store.mu.Lock()
+		claims, writes = store.claimsWon, store.finalizedWrites
+		store.mu.Unlock()
+		if claims != 2 || writes != 1 {
+			t.Fatalf("after repair claimed %d, finalized %d, want 2 and 1", claims, writes)
+		}
+		if receipt, _, _ := store.StopAttempt(context.Background(), f.session.ID, uuid.NewString(), nil); !receipt.Finalized {
+			t.Fatalf("the repaired stop is not finalized: %+v", receipt)
+		}
+	})
+}
+
+// The stop finalization waits for the per-session lifecycle lock a replacement
+// preparation may hold. That wait is bounded by the finalization deadline: a
+// finalizer blocked past its lease could otherwise start teardown after another
+// replica took the stop over. Here the holder outlasts the deadline, so the
+// expired teardown is rejected and nothing is torn down or finalized.
+func TestStopFinalizationLifecycleWaitBoundedByDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := newPlaybackServiceFixture(t)
+		store := &leaseObservingStore{MemoryPlanStoreV3: f.handler.PlanStoreV3.(*playback.MemoryPlanStoreV3)}
+		f.handler.PlanStoreV3 = store
+		admin := &cancelSensitiveAdminStore{}
+		f.handler.AdminStore = admin
+
+		// The replacement holds the lifecycle lock for longer than the stop's
+		// finalization deadline.
+		unlock := f.handler.tm.LockSessionLifecycle(f.session.ID)
+		holderDone := make(chan struct{})
+		go func() {
+			time.Sleep(6 * time.Second)
+			unlock()
+			close(holderDone)
+		}()
+
+		reqCtx, cancel := context.WithTimeout(f.ctx, 5*time.Second)
+		defer cancel()
+		start := time.Now()
+		view, err := f.handler.StopPlaybackV2(reqCtx, f.caller, f.session.ID, PlaybackStopCommand{StopID: uuid.NewString()})
+		elapsed := time.Since(start)
+		if err != nil || view.Outcome != PlaybackOutcomeStopped {
+			t.Fatalf("stop = %+v, %v", view, err)
+		}
+		if elapsed >= 5*time.Second {
+			t.Fatalf("stop waited %v for the lifecycle lock, past its finalization deadline", elapsed)
+		}
+		if _, err := f.manager.GetSession(f.session.ID); err != nil {
+			t.Fatalf("an expired teardown ran once the lock was free: %v", err)
+		}
+		if admin.deleteCalls != 0 {
+			t.Fatalf("expired teardown deleted the synced session %d times", admin.deleteCalls)
+		}
+		if receipt, _, _ := store.StopAttempt(context.Background(), f.session.ID, uuid.NewString(), nil); receipt.Finalized {
+			t.Fatalf("expired finalization marked the stop complete: %+v", receipt)
+		}
+		<-holderDone
 	})
 }
 
