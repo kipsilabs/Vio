@@ -132,6 +132,7 @@ const (
 	virtualEvidenceLogKeyFileID    = "file_id"
 	virtualEvidenceLogKeyAttempts  = "attempts"
 	virtualEvidenceLogKeyError     = "error"
+	virtualEvidenceLogKeyReason    = "reason"
 	virtualEvidenceLogValueAPI     = "api"
 )
 
