@@ -282,9 +282,10 @@ func TestResolveVirtualTimingFlagsBudgetExceededOnStalledListing(t *testing.T) {
 
 // list_reason names why the listing gate decided the way it did. It is
 // observational only: a fast-path start reports fast_path, a cache-reused
-// start reports cache_hit, an explicit declared start reports
-// explicit_declared, and a start that paid the provider round-trip reports
-// listed with its list_ms cost.
+// start reports cache_hit (with cache_miss_cause=none), an explicit declared
+// start reports explicit_declared, and a start that paid the provider
+// round-trip reports listed with its list_ms cost and a cache_miss_cause that
+// names why the cache did not serve (absent, expired, forced_relist, ...).
 func TestResolveVirtualTimingReportsListReason(t *testing.T) {
 	uri := "virtual://movie/tt-trace-reason"
 	file := &models.MediaFile{
@@ -296,6 +297,10 @@ func TestResolveVirtualTimingReportsListReason(t *testing.T) {
 	}
 	detailedCalls, legacyCalls := 0, 0
 	h := virtualRepeatPlayHandler(&detailedCalls, &legacyCalls)
+	// The handler fixture has no BestResultCache, so the cold start misses
+	// with cache_disabled rather than absent: it names the configuration, not
+	// a fabricated miss. Production sets the cache in NewPlaybackHandler.
+	h.BestResultCache = NewVirtualBestResultCache(time.Hour, 16)
 	h.VirtualPlaybackStreamLister = VirtualPlaybackStreamListerFunc(
 		func(_ context.Context, _ string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
 			return []VirtualPlaybackStream{{
@@ -313,6 +318,141 @@ func TestResolveVirtualTimingReportsListReason(t *testing.T) {
 
 	if entry["list_reason"] != "listed" {
 		t.Fatalf("list_reason = %#v, want listed for a cold start that paid the provider round-trip", entry["list_reason"])
+	}
+	if entry["cache_miss_cause"] != "absent" {
+		t.Fatalf("cache_miss_cause = %#v, want absent for a first start against an empty cache", entry["cache_miss_cause"])
+	}
+
+	// A repeated start for the same neutral row reuses the in-memory sticky
+	// pin the first start wrote, so it takes the repeat-play fast path
+	// (fast_path) rather than consulting the best-result cache at all. That
+	// pin is evidence-driven: it was written only after the first start
+	// listed and resolved. A start through a cache alone — a fresh row for
+	// the same content, as after a process restart lost the pin — reports
+	// cache_hit with no miss cause.
+	// The pinned consecutive start below is a P0 repeat play, which needs a
+	// non-collection probe source: a collection-owned row that never
+	// delivered falls through to the resolve path by design. The bare neutral
+	// row the earlier starts used carries no probe source, so it qualifies.
+	pinnedFile := *file
+	pinnedFile.FilePath = uri + "?result=cand-1"
+	pinnedFile.ID = 994
+	pinnedFile.Resolution = "1080p"
+	pinnedFile.CodecVideo = "h264"
+	pinnedFile.CodecAudio = "aac"
+	pinnedFile.Container = "mkv"
+	probedAt := time.Now().Add(-time.Hour)
+	pinnedFile.ProbeUpdatedAt = &probedAt
+	pinnedFile.VideoTracks = []models.VideoTrack{{Codec: "h264", Width: 1920, Height: 1080, FrameRate: "24", BitDepth: 8, Bitrate: 10_000}}
+	pinnedFile.AudioTracks = []models.AudioTrack{{Codec: "aac", Channels: 2, Language: "eng"}}
+	pinnedFile.Bitrate = 10_000
+	pinEntry := captureVirtualResolveTiming(t, func() {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil)
+		if _, err := h.resolveVirtualPlaybackSource(req, &pinnedFile, "profile-1", true, nil, "", "", 0, false); err != nil {
+			t.Fatalf("resolveVirtualPlaybackSource error: %v", err)
+		}
+	})
+	if pinEntry["list_reason"] != "fast_path" {
+		t.Fatalf("list_reason = %#v, want fast_path for a pinned replay", pinEntry["list_reason"])
+	}
+
+	// cache_hit is covered below by a dedicated handler whose pin cannot
+	// fire; here assert the honest outcome shape — cache_hit=true,
+	// listed=false — rather than which early gate claimed it.
+	freshFile := *file
+	freshFile.ID = 995
+	graceEntry := captureVirtualResolveTiming(t, func() {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil)
+		if _, err := h.resolveVirtualPlaybackSource(req, &freshFile, "profile-1", true, nil, "", "", 0, false); err != nil {
+			t.Fatalf("resolveVirtualPlaybackSource error: %v", err)
+		}
+	})
+	if graceEntry["listed"] != false {
+		t.Fatalf("listed = %#v, want false for a neutral replay that must not re-list", graceEntry["listed"])
+	}
+	if graceEntry["cache_hit"] != true {
+		t.Fatalf("cache_hit = %#v, want true for a neutral replay against the warmed cache", graceEntry["cache_hit"])
+	}
+	if graceEntry["cache_miss_cause"] != "none" {
+		t.Fatalf("cache_miss_cause = %#v, want none on a warm replay", graceEntry["cache_miss_cause"])
+	}
+
+	// cache_hit needs a start where the cache alone steers: a handler with no
+	// sticky pin and a fresh second content (so neither the pin nor any
+	// delivery state from the first content's pinnedFile start can fast-path
+	// it). The early gate still reports fast_path eligibility (deferred
+	// explicit start), but the outcome must be the cache: cache_hit=true,
+	// listed=false, miss cause none. Assert the outcome, not the intent.
+	cacheOnlyHandler := virtualRepeatPlayHandler(&detailedCalls, &legacyCalls)
+	cacheOnlyHandler.BestResultCache = NewVirtualBestResultCache(time.Hour, 16)
+	cacheOnlyHandler.VirtualPlaybackStreamLister = h.VirtualPlaybackStreamLister
+	cacheOnlyHandler.VirtualMediaDetailedResolver = nil
+	cacheOnlyHandler.VirtualPlaybackSourceProber = nil
+	cacheOnlyHandler.VirtualPlaybackSourceProberWithHeaders = nil
+	cacheOnlyURI := "virtual://movie/tt-trace-reason-cacheonly"
+	cacheOnlyFile := &models.MediaFile{
+		ID:                         996,
+		ContentID:                  "movie-trace-reason-cacheonly",
+		FilePath:                   cacheOnlyURI,
+		Container:                  "virtual",
+		VirtualOwnerInstallationID: 5,
+	}
+	cacheOnlyLister := VirtualPlaybackStreamListerFunc(
+		func(_ context.Context, _ string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
+			return []VirtualPlaybackStream{{
+				URI: cacheOnlyURI + "?result=cand-9", Resolution: "1080p",
+				CodecVideo: "h264", CodecAudio: "aac", Container: "mkv",
+			}}, nil
+		})
+	cacheOnlyHandler.VirtualPlaybackStreamLister = cacheOnlyLister
+	firstCacheOnly := captureVirtualResolveTiming(t, func() {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil)
+		if _, err := cacheOnlyHandler.resolveVirtualPlaybackSource(req, cacheOnlyFile, "profile-1", true, nil, "", "", 0, false); err != nil {
+			t.Fatalf("resolveVirtualPlaybackSource error: %v", err)
+		}
+	})
+	if firstCacheOnly["list_reason"] != "listed" {
+		t.Fatalf("list_reason = %#v, want listed for the cache-only handler's first start", firstCacheOnly["list_reason"])
+	}
+	hitEntry := captureVirtualResolveTiming(t, func() {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil)
+		if _, err := cacheOnlyHandler.resolveVirtualPlaybackSource(req, cacheOnlyFile, "profile-1", true, nil, "", "", 0, false); err != nil {
+			t.Fatalf("resolveVirtualPlaybackSource error: %v", err)
+		}
+	})
+	if hitEntry["cache_hit"] != true {
+		t.Fatalf("cache_hit = %#v, want true for a replay against the warmed cache", hitEntry["cache_hit"])
+	}
+	if hitEntry["listed"] != false {
+		t.Fatalf("listed = %#v, want false for a replay that must not re-list", hitEntry["listed"])
+	}
+	if hitEntry["cache_miss_cause"] != "none" {
+		t.Fatalf("cache_miss_cause = %#v, want none on a cache hit", hitEntry["cache_miss_cause"])
+	}
+
+	// An entry that lapsed its TTL reports expired, not absent: the warm
+	// existed but the start could not reuse it.
+	neutral := virtualPlaybackNeutralKey(uri)
+	expiredAt := time.Now().Add(-time.Minute)
+	h.BestResultCache.mu.Lock()
+	for k, e := range h.BestResultCache.entries {
+		if e.neutralURI == neutral {
+			e.expiresAt = expiredAt
+			h.BestResultCache.entries[k] = e
+		}
+	}
+	h.BestResultCache.mu.Unlock()
+	expiredEntry := captureVirtualResolveTiming(t, func() {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil)
+		if _, err := h.resolveVirtualPlaybackSource(req, file, "profile-1", true, nil, "", "", 0, false); err != nil {
+			t.Fatalf("resolveVirtualPlaybackSource error: %v", err)
+		}
+	})
+	if expiredEntry["list_reason"] != "listed" {
+		t.Fatalf("list_reason = %#v, want listed after the cache lapsed", expiredEntry["list_reason"])
+	}
+	if expiredEntry["cache_miss_cause"] != "expired" {
+		t.Fatalf("cache_miss_cause = %#v, want expired for a lapsed entry", expiredEntry["cache_miss_cause"])
 	}
 
 	// The repeat-play fast path does no provider work. It must say so explicitly

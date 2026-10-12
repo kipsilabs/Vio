@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
 	"github.com/Silo-Server/silo-server/internal/auth"
 	"github.com/Silo-Server/silo-server/internal/models"
@@ -298,5 +300,84 @@ func TestPrefetchRejectionsAreObservable(t *testing.T) {
 	close(release)
 	if !strings.Contains(logs.String(), "prefetch rejected") {
 		t.Fatalf("overload rejection was not logged: %s", logs.String())
+	}
+}
+
+// TestPrefetchOutcomeMetricsAreObservable pins that every admission and
+// completion outcome lands on the prefetch metric with a bounded label. The
+// production drops are Debug logs, invisible at the default Info level; the
+// metric is what sizes the convertible share from /metrics without scraping.
+func TestPrefetchOutcomeMetricsAreObservable(t *testing.T) {
+	outcomeSamples := func() map[string]float64 {
+		families, err := prometheus.DefaultGatherer.Gather()
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := map[string]float64{}
+		for _, family := range families {
+			if family.GetName() != "silo_virtual_prefetch_outcomes_total" {
+				continue
+			}
+			for _, metric := range family.GetMetric() {
+				for _, label := range metric.GetLabel() {
+					if label.GetName() == "outcome" {
+						got[label.GetValue()] = metric.GetCounter().GetValue()
+					}
+				}
+			}
+		}
+		return got
+	}
+
+	// Duplicate: the same source/profile admitted twice collapses to one list.
+	dupRelease := make(chan struct{})
+	h := &PlaybackHandler{BestResultCache: NewVirtualBestResultCache(time.Hour, 16),
+		VirtualPlaybackStreamLister: VirtualPlaybackStreamListerFunc(func(_ context.Context, _ string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
+			<-dupRelease
+			return nil, nil
+		}),
+	}
+	ctx := prefetchTestContext(7)
+	dup := prefetchTestFile(7001, "virtual://movie/metric-dup?result=r")
+	h.PrefetchVirtualPlayback(ctx, []*models.MediaFile{dup}, "profile-1")
+	h.PrefetchVirtualPlayback(ctx, []*models.MediaFile{dup}, "profile-1")
+	close(dupRelease)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		got := outcomeSamples()
+		if got[virtualPrefetchDuplicate] > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no duplicate outcome observed: %v", got)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Completed: a prefetch whose provider answers warms the cache.
+	h2 := &PlaybackHandler{BestResultCache: NewVirtualBestResultCache(time.Hour, 16),
+		VirtualPlaybackStreamLister: VirtualPlaybackStreamListerFunc(func(_ context.Context, path string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
+			return []VirtualPlaybackStream{{
+				URI: path + "?result=done", Resolution: "1080p",
+				CodecVideo: "h264", CodecAudio: "aac", Container: "mkv",
+			}}, nil
+		}),
+	}
+	warm := prefetchTestFile(7002, "virtual://movie/metric-done")
+	h2.PrefetchVirtualPlayback(ctx, []*models.MediaFile{warm}, "profile-1")
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		got := outcomeSamples()
+		if got[virtualPrefetchCompleted] > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no completed outcome observed: %v", got)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	key := bestResultCacheKey("movie-prefetch", virtualPlaybackNeutralKey("virtual://movie/metric-done"), 5)
+	if cached := h2.BestResultCache.get(key, time.Now()); len(cached) == 0 {
+		t.Fatal("completed prefetch did not warm the best-result cache")
 	}
 }

@@ -652,6 +652,7 @@ func (h *ItemsHandler) prefetchVirtualFileIDs(ctx context.Context, fileIDs []int
 	// for an already-warming file. Keys live only for the load window.
 	admitKey := virtualPrefetchFileAdmitKey(fileIDs, profileID)
 	if _, loaded := h.virtualPrefetchInflight.LoadOrStore(admitKey, struct{}{}); loaded {
+		observeVirtualPrefetchOutcome(virtualPrefetchFileCollapsed)
 		return
 	}
 	// Shed when saturated: speculative work must never queue without bound.
@@ -665,6 +666,7 @@ func (h *ItemsHandler) prefetchVirtualFileIDs(ctx context.Context, fileIDs []int
 	case sem <- struct{}{}:
 	default:
 		h.virtualPrefetchInflight.Delete(admitKey)
+		observeVirtualPrefetchOutcome(virtualPrefetchLoadSaturated)
 		return
 	}
 	prefetcher := h.virtualPrefetcher

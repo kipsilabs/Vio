@@ -889,6 +889,7 @@ func (h *PlaybackHandler) PrefetchVirtualPlayback(ctx context.Context, files []*
 			h.releaseVirtualPrefetch(key)
 			slog.DebugContext(ctx, "virtual playback prefetch rejected: pending queue full",
 				"component", "api", "queue_size", virtualPrefetchQueueSize)
+			observeVirtualPrefetchOutcome(virtualPrefetchQueueFull)
 		}
 	}
 }
@@ -916,20 +917,24 @@ func (h *PlaybackHandler) admitVirtualPrefetch(key string) bool {
 	h.prefetchMu.Lock()
 	defer h.prefetchMu.Unlock()
 	if h.prefetchStopped {
+		observeVirtualPrefetchOutcome(virtualPrefetchShutdown)
 		return false
 	}
 	if h.prefetchInFlight == nil {
 		h.prefetchInFlight = make(map[string]struct{})
 	}
 	if _, dup := h.prefetchInFlight[key]; dup {
+		observeVirtualPrefetchOutcome(virtualPrefetchDuplicate)
 		return false
 	}
 	if len(h.prefetchInFlight) >= virtualPrefetchQueueSize+virtualPrefetchWorkers {
 		slog.Debug("virtual playback prefetch rejected: in-flight set full",
 			"component", "api", "bound", virtualPrefetchQueueSize+virtualPrefetchWorkers)
+		observeVirtualPrefetchOutcome(virtualPrefetchInflightFull)
 		return false
 	}
 	h.prefetchInFlight[key] = struct{}{}
+	observeVirtualPrefetchOutcome(virtualPrefetchAdmitted)
 	return true
 }
 
@@ -981,12 +986,14 @@ func (h *PlaybackHandler) prefetchOne(task virtualPrefetchTask) {
 	if !gate.tryAcquire() {
 		slog.Debug("virtual playback prefetch skipped: detached worker budget exhausted",
 			"component", "api")
+		observeVirtualPrefetchOutcome(virtualPrefetchGateExhausted)
 		return
 	}
 	defer gate.release()
 	prefetchCtx, cancel := h.virtualDetachedContext(h.ServiceContext, virtualPlaybackPrefetchBudget)
 	defer cancel()
 	if prefetchCtx.Err() != nil {
+		observeVirtualPrefetchOutcome(virtualPrefetchContextDone)
 		return
 	}
 	// Listing warms the shared resolver candidate cache and stores the
@@ -1016,7 +1023,12 @@ func (h *PlaybackHandler) warmVirtualPlaybackListing(ctx context.Context, file *
 		return
 	}
 	streams, err := h.VirtualPlaybackStreamLister.ListVirtualPlaybackStreams(ctx, neutralURI, userID, profileID, file.VirtualOwnerInstallationID)
-	if err != nil || len(streams) == 0 {
+	if err != nil {
+		observeVirtualPrefetchOutcome(virtualPrefetchListError)
+		return
+	}
+	if len(streams) == 0 {
+		observeVirtualPrefetchOutcome(virtualPrefetchEmpty)
 		return
 	}
 	if len(streams) > maxVirtualPlaybackStreams {
@@ -1028,6 +1040,7 @@ func (h *PlaybackHandler) warmVirtualPlaybackListing(ctx context.Context, file *
 	base.FilePath = neutralURI
 	filtered := filterVirtualPlaybackStreams(&base, streams)
 	if len(filtered) == 0 {
+		observeVirtualPrefetchOutcome(virtualPrefetchFilteredEmpty)
 		return
 	}
 	h.BestResultCache.setWithDetailsAt(
@@ -1035,6 +1048,7 @@ func (h *PlaybackHandler) warmVirtualPlaybackListing(ctx context.Context, file *
 		file.ContentID, neutralURI, file.VirtualOwnerInstallationID,
 		filtered, time.Now(), generation,
 	)
+	observeVirtualPrefetchOutcome(virtualPrefetchCompleted)
 }
 
 func (h *PlaybackHandler) maxVirtualFailoverAttempts(ctx context.Context) int {
@@ -1051,6 +1065,26 @@ func (h *PlaybackHandler) maxVirtualFailoverAttempts(ctx context.Context) int {
 		}
 	}
 	return defaultMaxVirtualFailoverAttempts
+}
+
+// neutralFallbackCacheCause falls back to the device-neutral best-result
+// entry when the fingerprinted lookup missed. It returns the streams to serve
+// (possibly empty) and the miss cause to report. When both lookups miss it
+// joins the causes so an absent device entry is not hidden behind a neutral
+// one; when the neutral entry hits the cause is empty (no miss to explain).
+// Observational only; callers decide nothing off the result.
+func (h *PlaybackHandler) neutralFallbackCacheCause(cached []VirtualPlaybackStream, cause string, file *models.MediaFile, neutralURI string) ([]VirtualPlaybackStream, string) {
+	neutralCached, neutralCause := h.BestResultCache.getWithCause(bestResultCacheKey(file.ContentID, neutralURI, file.VirtualOwnerInstallationID), time.Now())
+	if len(neutralCached) > 0 {
+		return neutralCached, ""
+	}
+	if cause != "" && neutralCause != "" {
+		return nil, cause + "+neutral_" + neutralCause
+	}
+	if neutralCause != "" {
+		return nil, neutralCause
+	}
+	return nil, cause
 }
 
 const (
@@ -1109,13 +1143,29 @@ func NewVirtualBestResultCache(ttl time.Duration, maxEntries int) *VirtualBestRe
 }
 
 func (c *VirtualBestResultCache) get(key string, now time.Time) []VirtualPlaybackStream {
+	streams, _ := c.getWithCause(key, now)
+	return streams
+}
+
+// getWithCause is get plus the miss cause a caller needs to size the
+// convertible share of cold starts: it distinguishes "no entry at all" from
+// "an entry that lapsed its TTL". Observational only; callers decide nothing
+// off the cause. A nil cache reports cache_disabled rather than a fabricated
+// hit or miss.
+func (c *VirtualBestResultCache) getWithCause(key string, now time.Time) ([]VirtualPlaybackStream, string) {
+	if c == nil {
+		return nil, "cache_disabled"
+	}
 	c.mu.RLock()
 	entry, ok := c.entries[key]
 	c.mu.RUnlock()
-	if !ok || now.After(entry.expiresAt) {
-		return nil
+	if !ok {
+		return nil, "absent"
 	}
-	return append([]VirtualPlaybackStream(nil), entry.streams...)
+	if now.After(entry.expiresAt) {
+		return nil, "expired"
+	}
+	return append([]VirtualPlaybackStream(nil), entry.streams...), ""
 }
 
 // Clear drops every cached result. Called on plugin lifecycle changes when
@@ -1546,14 +1596,36 @@ type virtualResolveTrace struct {
 	candidates int
 	// listReason names why the listing gate decided the way it did. It is
 	// observational only and never gates control flow. Values:
-	//   fast_path (repeat/durable/delivery-grace path, no list possible),
+	//   fast_path (the repeat-play fast path was eligible at gate time:
+	//     deferred start, explicit candidate, no relist, no exclusions),
 	//   cache_hit (best-result cache reused, list skipped),
 	//   resumed (durable-resume hit, list skipped like a cache hit),
 	//   explicit_declared (explicit ?result= with declared metadata, instant path),
 	//   empty_suppressed (provider answered empty inside the window),
 	//   listed (provider round-trip ran; see the *_ms stages for cost),
-	//   unknown (any other shape; never invent a more specific cause).
+	//   unknown (no early gate claimed the start; a late fast path inside the
+	//     attempt loop may still have skipped the provider — see fast_path —
+	//     and any other shape stays unknown rather than a fabricated cause).
+	//
+	// fast_path eligibility is intent, not outcome: a start can be
+	// fast-path-eligible at the gate, reuse the cache (cache_hit=true), and
+	// still take the delivery-grace fast path in the attempt loop. The
+	// outcome fields (fast_path, cache_hit, listed) always describe what
+	// ran; list_reason describes which early gate claimed the start.
 	listReason string
+	// cacheMissCause sizes the convertible share of "listed" starts: why the
+	// best-result cache did not serve this start. It is observational only and
+	// never gates control flow. Values are bounded:
+	//   none (the start did not list; no miss to explain),
+	//   absent (no cache entry for either the fingerprinted or neutral key),
+	//   expired (an entry existed but was past its TTL),
+	//   forced_relist (an explicit relist bypassed a usable cache),
+	//   exclusion_or_unusable (an exclusion or failed-verdict rotation
+	//     required a fresh list past the cache),
+	//   explicit (an explicit ?result= row never consults the neutral cache),
+	//   cache_disabled (no BestResultCache configured),
+	//   unknown (any other shape).
+	cacheMissCause string
 }
 
 // totalMS is the sum of the stage durations that ran, using the same rounded
@@ -1611,6 +1683,7 @@ func (t *virtualResolveTrace) fieldsWithContext(ctx context.Context) []any {
 		"listed", t.listed,
 		"fast_path", t.fastPath,
 		"list_reason", t.listReason,
+		"cache_miss_cause", t.cacheMissCause,
 	}
 	if t.budgetRan {
 		attrs = append(attrs, "budget_ms", t.budgetMS)
@@ -1640,6 +1713,7 @@ func (t *virtualResolveTrace) log(ctx context.Context, file *models.MediaFile) {
 		return
 	}
 	t.finishBudget()
+	observeVirtualResolveListReason(t.listReason, t.cacheMissCause)
 	attrs := []any{logComponentKey, "api", "content_id", file.ContentID} //nolint:goconst // log attribute key/value, kept inline for readability.
 	attrs = append(attrs, t.fieldsWithContext(ctx)...)
 	slog.InfoContext(ctx, "virtual resolve timing", attrs...)
@@ -2446,28 +2520,39 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	// successful play of this content may have a cached result= URI that
 	// lets us skip the entire list+resolve+probe sequence on replay.
 	cachedListing := false
-	if noResult && h.BestResultCache != nil {
-		neutralURI := virtualPlaybackNeutralKey(file.FilePath)
-		cacheKey := bestResultCacheKey(file.ContentID, neutralURI, file.VirtualOwnerInstallationID, fingerprint)
-		cached := h.BestResultCache.get(cacheKey, time.Now())
-		if len(cached) == 0 && fingerprint != "" {
-			// A listing warmed without a device fingerprint (the bounded
-			// prefetch path) is still the filtered, device-neutral candidate
-			// set; only the ranking below is device-specific, so fall back to
-			// it rather than paying the provider list again on this device's
-			// first click.
-			cached = h.BestResultCache.get(bestResultCacheKey(file.ContentID, neutralURI, file.VirtualOwnerInstallationID), time.Now())
+	trace.cacheMissCause = "none" //nolint:goconst // trace cause vocabulary, kept inline for readability.
+	if noResult {
+		if h.BestResultCache == nil {
+			trace.cacheMissCause = "cache_disabled" //nolint:goconst // trace cause vocabulary, kept inline for readability.
+		} else {
+			neutralURI := virtualPlaybackNeutralKey(file.FilePath)
+			cacheKey := bestResultCacheKey(file.ContentID, neutralURI, file.VirtualOwnerInstallationID, fingerprint)
+			cached, cause := h.BestResultCache.getWithCause(cacheKey, time.Now())
+			if len(cached) == 0 && fingerprint != "" {
+				// A listing warmed without a device fingerprint (the bounded
+				// prefetch path) is still the filtered, device-neutral candidate
+				// set; only the ranking below is device-specific, so fall back to
+				// it rather than paying the provider list again on this device's
+				// first click.
+				cached, cause = h.neutralFallbackCacheCause(cached, cause, file, neutralURI)
+			}
+			if len(cached) == 0 && cause != "" {
+				trace.cacheMissCause = cause
+			}
+			if len(cached) > 0 {
+				// Cache holds the filtered, device-neutral candidate list; rank it
+				// for this device so a TV and a phone pick their own best stream
+				// without another provider round-trip, then keep rejected streams
+				// behind accepted ones.
+				candidates = h.finalizeVirtualCandidateOrder(r, cached, qualityPreference, bandwidthCapKbps)
+				noResult = false // treated as if file already had a result=
+				cachedListing = len(candidates) > 0
+				trace.cached = cachedListing
+				trace.cacheMissCause = "none" //nolint:goconst // trace cause vocabulary, kept inline for readability.
+			}
 		}
-		if len(cached) > 0 {
-			// Cache holds the filtered, device-neutral candidate list; rank it
-			// for this device so a TV and a phone pick their own best stream
-			// without another provider round-trip, then keep rejected streams
-			// behind accepted ones.
-			candidates = h.finalizeVirtualCandidateOrder(r, cached, qualityPreference, bandwidthCapKbps)
-			noResult = false // treated as if file already had a result=
-			cachedListing = len(candidates) > 0
-			trace.cached = cachedListing
-		}
+	} else {
+		trace.cacheMissCause = "explicit" //nolint:goconst // trace cause vocabulary, kept inline for readability.
 	}
 	// A valid cached listing already carries the candidate metadata the list
 	// call exists to fetch, so it does not need the provider round-trip even
@@ -2504,6 +2589,14 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	// the way it did so a day of timing lines can size the convertible share
 	// (starts that listed but could have reused a fresh cache) without
 	// guessing. Unknown stays unknown rather than a fabricated miss cause.
+	//
+	// The pre-list switch records intent (fast-path eligible, cache reused,
+	// resumed, declared, suppressed); the listing gate below overwrites it
+	// with "listed" when the provider round-trip actually runs. A later fast
+	// path that skips the provider without an early cache/resume/declared
+	// hit (durable-resume inside the attempt loop, delivery grace) keeps the
+	// pre-list "unknown": the outcome is fast (fast_path=true, listed=false)
+	// even though no early gate predicted it.
 	switch {
 	case fastPathGateEligible(deferProbe, forceRelist, noResult, excludedCandidateIDs):
 		trace.listReason = "fast_path"
@@ -2515,8 +2608,6 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		trace.listReason = "explicit_declared"
 	case emptySuppressed:
 		trace.listReason = "empty_suppressed"
-	case trace.listed:
-		trace.listReason = "listed"
 	default:
 		trace.listReason = "unknown"
 	}
@@ -2525,6 +2616,23 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		trace.listed = true
 		trace.listReason = "listed"
 		trace.listRan = true
+		// The gate listed, so name why the cache did not serve. A miss cause
+		// already recorded above stands; otherwise attribute the bypass: an
+		// explicit relist honored the caller's force flag, an
+		// exclusion/unusable rotation had to refresh past the cache, and an
+		// explicit ?result= row never consults it. Unknown stays unknown.
+		if trace.cacheMissCause == "none" || trace.cacheMissCause == "" {
+			switch {
+			case forceRelist:
+				trace.cacheMissCause = "forced_relist"
+			case exclusionPending || requestedRowUnusable:
+				trace.cacheMissCause = "exclusion_or_unusable"
+			case !noResult:
+				trace.cacheMissCause = "explicit"
+			default:
+				trace.cacheMissCause = "unknown"
+			}
+		}
 		fetchBeforeDur, fetchBeforeCalls := fetchSnapshot()
 		listStart := time.Now()
 		// Candidate listing is part of the startup critical path. Keep it

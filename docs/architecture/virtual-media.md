@@ -109,6 +109,38 @@ The refresh is list-only: it never opens a candidate's media URL, so no
 candidate is probed, played, or downloaded by the refresh itself. Verified
 track inventory arrives when the viewer explicitly plays one candidate.
 
+### Cold-start attribution (list_reason + cache_miss_cause)
+
+Every `resolveVirtualPlaybackSource` emits a `virtual resolve timing` line
+with two observational fields (never control flow) that size the convertible
+share of cold starts — starts that paid the provider round-trip but could
+have reused a warm cache:
+
+- `list_reason`: which early gate claimed the start (`fast_path`,
+  `cache_hit`, `resumed`, `explicit_declared`, `empty_suppressed`,
+  `listed`, `unknown`). `fast_path` is eligibility (intent), not outcome: a
+  start can be fast-path-eligible at the gate yet reuse the cache
+  (`cache_hit=true`) and take a late fast path in the attempt loop. The
+  outcome fields (`fast_path`, `cache_hit`, `listed`) always describe what
+  ran. A late fast path with no early gate (durable-resume inside the
+  attempt loop, delivery grace) keeps `unknown` with `fast_path=true`.
+- `cache_miss_cause`: why the best-result cache did not serve a `listed`
+  start (`absent` = no entry, `expired` = lapsed TTL, `forced_relist`,
+  `exclusion_or_unusable`, `explicit`, `cache_disabled`). Non-listing starts
+  report `none`.
+
+The same dimensions are on `/metrics` as
+`silo_virtual_resolve_list_reason_total{list_reason,cache_miss_cause}`, and
+prefetch admission/drop/completion as
+`silo_virtual_prefetch_outcomes_total{outcome}` (the per-drop slog lines are
+Debug, invisible at the default Info level). Labels are bounded: no content
+IDs, URIs, or user identity. A day of the resolve series tells whether the
+next win is prefetch coverage (`absent` dominant), cache TTL (`expired`
+dominant), or forced work (`forced_relist`/exclusion dominant) — the bench
+cannot answer that from latency alone. Prefetch itself stays list-only by
+design (see `prefetchOne`): it warms the resolver and best-result caches and
+never touches a candidate's media URL.
+
 ## Library picker schema formats
 
 Config schemas can declare properties that should be chosen from libraries rather
