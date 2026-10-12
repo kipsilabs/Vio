@@ -51,7 +51,7 @@ func TestPersistVirtualProbeEvidenceForegroundFallsBackWhenBufferRejected(t *tes
 	t.Cleanup(h.stopVirtualEvidence)
 
 	file := &models.MediaFile{ID: 501, ContentID: "movie-fallback", FilePath: "virtual://movie/tt-fallback", ProbeSource: "virtual"}
-	h.persistVirtualProbeEvidence(context.Background(), file, "virtual://movie/tt-fallback?result=cand", fallbackProbedFile(), true, true)
+	h.persistVirtualProbeEvidence(context.Background(), file, "virtual://movie/tt-fallback?result=cand", fallbackProbedFile(), noCandidateIdentity, true, true)
 
 	calls := saver.recorded()
 	if len(calls) != 1 {
@@ -78,7 +78,7 @@ func TestPersistVirtualProbeEvidenceBackgroundNeverFallsBack(t *testing.T) {
 	t.Cleanup(h.stopVirtualEvidence)
 
 	file := &models.MediaFile{ID: 502, ContentID: "movie-bg-fallback", FilePath: "virtual://movie/tt-bg", ProbeSource: "virtual"}
-	h.persistVirtualProbeEvidence(context.Background(), file, "virtual://movie/tt-bg?result=cand", fallbackProbedFile(), true, false)
+	h.persistVirtualProbeEvidence(context.Background(), file, "virtual://movie/tt-bg?result=cand", fallbackProbedFile(), noCandidateIdentity, true, false)
 
 	if calls := saver.recorded(); len(calls) != 0 {
 		t.Fatalf("background candidate triggered %d direct fallback write(s), want 0", len(calls))

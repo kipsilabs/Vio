@@ -23,6 +23,7 @@ type virtualDeferredProbeV3 struct {
 	streamURL              string
 	probeTransient         *models.MediaFile
 	cand                   VirtualPlaybackStream
+	candidate              virtualProbeIdentity
 	expectedRuntimeMinutes int
 	ownerID                int
 	// sessionID is the live session the deferred plan was committed to. It is
@@ -504,7 +505,7 @@ func (h *PlaybackHandler) runDeferredVirtualProbe(deferred *virtualDeferredProbe
 	}
 	bgCtx, bgCancel := h.virtualDetachedContext(h.ServiceContext, virtualBackgroundProbeBudget)
 	defer bgCancel()
-	outcome, verifiedFileID := h.probeVirtualSourceAndPersistWith(bgCtx, deferred.stickyKey, deferred.file, deferred.streamURL, *deferred.probeTransient, deferred.cand, deferred.expectedRuntimeMinutes, deferred.ownerID, true, h.deferredProbeBindingIntact(deferred))
+	outcome, verifiedFileID := h.probeVirtualSourceAndPersistWith(bgCtx, deferred.stickyKey, deferred.file, deferred.streamURL, *deferred.probeTransient, deferred.cand, deferred.candidate.tiers(), deferred.expectedRuntimeMinutes, deferred.ownerID, true, h.deferredProbeBindingIntact(deferred))
 	// The probe is done with the shared gate: release this worker's slot before
 	// the terminal outcome write and publish so a saturated gate is not held by
 	// catalog/realtime fan-out that carries its own budget. Parked terminal

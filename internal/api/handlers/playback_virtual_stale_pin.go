@@ -266,7 +266,12 @@ func (h *PlaybackHandler) recoverStaleIdentityLessPinV3(
 		// (no AdoptPath) stamps the verified inventory in place without moving
 		// any file_path. Pass the owner row so the shared builder cannot fall
 		// back to adopting onto a different row.
-		h.persistVirtualProbeEvidence(ctx, ownerRow, resolution.uri, resolution.file, true, true)
+		h.persistVirtualProbeEvidence(ctx, ownerRow, resolution.uri, resolution.file, virtualProbeIdentity{
+			VideoHash:   resolution.providerVideoHash,
+			GUID:        resolution.providerGUID,
+			ReleaseName: resolution.providerReleaseName,
+			ReleaseSize: resolution.providerReleaseSize,
+		}.tiers(), true, true)
 	}
 	slog.InfoContext(ctx, "virtual stale-pin recovery re-pinned an identity-less candidate in memory",
 		"component", "api", "file_id", file.ID, "old_candidate_id", pinnedID,
