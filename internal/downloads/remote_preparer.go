@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
 	"slices"
 	"strings"
 	"sync"
@@ -146,8 +148,45 @@ func (p *NodeAwarePreparer) prepareLocally(ctx context.Context, artifactID strin
 	return p.local.PrepareFile(ctx, artifactID, opts, outputPath)
 }
 
+// isLoopbackPrepareInput reports whether a prepare input is a URL that only
+// this host can open. It matches the playback relay's concrete address shape:
+// an http(s) URL whose host is localhost or a loopback IP (the relay binds
+// 127.0.0.1). A blank input, an ordinary filesystem path (which a node
+// resolves through the media mount it shares), and a routable host — including
+// a private-network API address a node can reach — are all node-reachable and
+// return false.
+func isLoopbackPrepareInput(inputPath string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(inputPath))
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+		return false
+	}
+	host := parsed.Hostname()
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
 // PrepareFile routes an artifact job to a compatible node or allowed local fallback.
 func (p *NodeAwarePreparer) PrepareFile(ctx context.Context, artifactID string, opts playback.TranscodeOpts, outputPath string) (PreparedArtifact, error) {
+	// A provider-backed (virtual) title resolves to the playback relay, an
+	// in-process listener bound to 127.0.0.1:0 on this host. No transcode node
+	// can reach that address: a node handed the URL would open it against its
+	// own loopback interface and fetch nothing. Constrain such a job to local
+	// execution here, at the one place a node URL is ever built, rather than
+	// send an unreachable input. There is no authenticated node-reachable
+	// transport for the relay yet; if one lands, it belongs alongside this
+	// decision.
+	if isLoopbackPrepareInput(opts.InputPath) {
+		if !p.LocalFallbackAllowed(ctx) {
+			return PreparedArtifact{}, errors.New("a provider-backed download can only be prepared on the API host, where local download transcoding is disabled")
+		}
+		slog.InfoContext(ctx, "download prepare input is only reachable from this host; preparing locally", "component", "downloads", "artifact_id", artifactID)
+		return p.prepareLocally(ctx, artifactID, opts, outputPath)
+	}
 	cfg := p.config()
 	jwtSecret := ""
 	if cfg != nil {

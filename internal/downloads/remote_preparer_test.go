@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -53,6 +54,7 @@ type recordingRemotePreparer struct {
 	request   downloadprepare.Request
 	deleted   string
 	deleteURL string
+	calls     int
 }
 
 type nilCandidatePlanner struct {
@@ -102,6 +104,7 @@ func (p *nilCandidatePlanner) TranscodeNode(int) (*nodepool.Node, bool) {
 }
 
 func (p *recordingRemotePreparer) Prepare(_ context.Context, nodeURL, secret string, req downloadprepare.Request) (downloadprepare.Result, error) {
+	p.calls++
 	p.nodeURL, p.secret, p.request = nodeURL, secret, req
 	return downloadprepare.Result{ArtifactID: req.ArtifactID, FileSize: 1234, ExecutionFingerprint: req.ExecutionFingerprint()}, nil
 }
@@ -976,6 +979,156 @@ func TestNodeAwarePreparerFallsBackLocallyWithoutNodeCredentials(t *testing.T) {
 	}
 	if local.calls != 1 {
 		t.Fatalf("local calls = %d, want 1", local.calls)
+	}
+}
+
+// A provider-backed title resolves to the API host's loopback relay. A separate
+// transcode node cannot reach that listener — it would open the URL against its
+// own loopback interface — so the job must never carry it. The relay URL below
+// comes from a real listener bound exactly as the production relay binds
+// (127.0.0.1:0), so this is the address shape a node would actually be handed.
+func TestRemotePrepareNeverSendsLoopbackURL(t *testing.T) {
+	relay := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer relay.Close()
+	if !isLoopbackPrepareInput(relay.URL + "/source/token") {
+		t.Fatalf("a real loopback listener URL %q must be treated as node-unreachable", relay.URL)
+	}
+
+	pool := nodepool.NewTranscodePool()
+	pool.SetNodes([]*nodepool.Node{{ID: 31, URL: "http://transcode-node", Enabled: true, Healthy: true}})
+	local := &recordingEncodePreparer{}
+	cfg := &config.Config{}
+	cfg.Auth.JWTSecret = "secret"
+	p := NewNodeAwarePreparer(local, nodepool.NewPlanner(nodepool.NewProxyPool(), pool), func() *config.Config { return cfg })
+	remote := &recordingRemotePreparer{}
+	p.remote = remote
+
+	opts := playback.TranscodeOpts{
+		InputPath:          relay.URL + "/source/token",
+		CanonicalInputPath: "virtual://movie/tt1?result=a",
+	}
+	prepared, err := p.PrepareFile(context.Background(), "artifact-loopback", opts, "/artifacts/job.mp4")
+	if err != nil {
+		t.Fatalf("PrepareFile() error = %v, want local preparation", err)
+	}
+	if remote.calls != 0 {
+		t.Fatalf("remote preparer called %d times with input %q; a loopback URL must never reach a node", remote.calls, remote.request.InputPath)
+	}
+	if isLoopbackPrepareInput(remote.request.InputPath) {
+		t.Fatalf("loopback URL %q reached the remote node", remote.request.InputPath)
+	}
+	if local.calls != 1 || prepared.OutputPath != "/artifacts/job.mp4" || prepared.Remote() {
+		t.Fatalf("prepared=%+v local calls=%d, want one local artifact", prepared, local.calls)
+	}
+}
+
+// A reachable input still dispatches to a node, so the loopback constraint does
+// not disable pooled preparation for sources a node can fetch.
+func TestRemotePrepareStillDispatchesReachableInput(t *testing.T) {
+	pool := nodepool.NewTranscodePool()
+	pool.SetNodes([]*nodepool.Node{{ID: 32, URL: "http://transcode-node", Enabled: true, Healthy: true}})
+	local := &recordingEncodePreparer{}
+	cfg := &config.Config{}
+	cfg.Auth.JWTSecret = "secret"
+	p := NewNodeAwarePreparer(local, nodepool.NewPlanner(nodepool.NewProxyPool(), pool), func() *config.Config { return cfg })
+	remote := &recordingRemotePreparer{}
+	p.remote = remote
+
+	opts := playback.TranscodeOpts{
+		InputPath:          "http://api.internal:9443/source/token",
+		CanonicalInputPath: "virtual://movie/tt1?result=a",
+	}
+	if _, err := p.PrepareFile(context.Background(), "artifact-reachable", opts, "/artifacts/job.mkv"); err != nil {
+		t.Fatalf("PrepareFile() error = %v", err)
+	}
+	if remote.calls != 1 || local.calls != 0 {
+		t.Fatalf("remote calls=%d local calls=%d, want the node to prepare a reachable input", remote.calls, local.calls)
+	}
+	if remote.request.InputPath != "http://api.internal:9443/source/token" {
+		t.Fatalf("node input = %q, want the reachable URL unchanged", remote.request.InputPath)
+	}
+}
+
+// A loopback job is refused, not silently misrouted, when the operator has
+// disabled API-host transcoding: no other executor can reach the input.
+func TestRemotePrepareLoopbackRefusedWhenLocalFallbackDisabled(t *testing.T) {
+	pool := nodepool.NewTranscodePool()
+	pool.SetNodes([]*nodepool.Node{{ID: 33, URL: "http://transcode-node", Enabled: true, Healthy: true}})
+	local := &recordingEncodePreparer{}
+	cfg := &config.Config{}
+	cfg.Auth.JWTSecret = "secret"
+	p := NewNodeAwarePreparer(local, nodepool.NewPlanner(nodepool.NewProxyPool(), pool), func() *config.Config { return cfg })
+	p.remote = &recordingRemotePreparer{}
+	p.settings = staticDownloadSettings{config.DownloadLocalTranscodeFallbackSettingKey: "false"}
+
+	opts := playback.TranscodeOpts{
+		InputPath:          "http://127.0.0.1:9000/source/token",
+		CanonicalInputPath: "virtual://movie/tt1?result=a",
+	}
+	_, err := p.PrepareFile(context.Background(), "artifact-loopback-off", opts, "/artifacts/job.mp4")
+	if err == nil || !strings.Contains(err.Error(), "API host") {
+		t.Fatalf("error = %v, want an explicit API-host requirement", err)
+	}
+	if local.calls != 0 {
+		t.Fatalf("local calls = %d, want 0: local fallback is disabled", local.calls)
+	}
+}
+
+func TestIsLoopbackPrepareInput(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		want  bool
+	}{
+		{"relay ipv4", "http://127.0.0.1:54321/source/token", true},
+		{"relay ipv4 loopback range", "http://127.0.0.2:1/source", true},
+		{"relay ipv6", "http://[::1]:8080/source", true},
+		{"relay localhost", "http://localhost:9000/source", true},
+		{"relay localhost mixed case", "http://LocalHost/source", true},
+		{"relay https", "https://127.0.0.1/source", true},
+		{"local filesystem path", "/media/library/movie.mkv", false},
+		{"empty", "", false},
+		{"public host", "https://api.example.com/source", false},
+		{"private but node-reachable host", "http://10.0.0.7:8080/source", false},
+		{"canonical virtual path", "virtual://movie/tt1?result=a", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isLoopbackPrepareInput(tc.input); got != tc.want {
+				t.Fatalf("isLoopbackPrepareInput(%q) = %v, want %v", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
+// The classifier must agree with the addresses real interfaces carry: a
+// loopback interface address is node-unreachable and any other local address is
+// reachable. A machine with no non-loopback address skips the reachable half.
+func TestIsLoopbackPrepareInputMatchesRealInterfaces(t *testing.T) {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		t.Skipf("net.InterfaceAddrs unavailable: %v", err)
+	}
+	checkedReachable := false
+	for _, addr := range addrs {
+		ipnet, ok := addr.(*net.IPNet)
+		if !ok || ipnet.IP.IsLinkLocalUnicast() {
+			continue
+		}
+		input := "http://" + net.JoinHostPort(ipnet.IP.String(), "8080") + "/source"
+		if ipnet.IP.IsLoopback() {
+			if !isLoopbackPrepareInput(input) {
+				t.Fatalf("loopback interface address %q classified reachable", input)
+			}
+			continue
+		}
+		if isLoopbackPrepareInput(input) {
+			t.Fatalf("non-loopback interface address %q classified unreachable", input)
+		}
+		checkedReachable = true
+	}
+	if !checkedReachable {
+		t.Log("no non-loopback interface address available; reachable classification not exercised")
 	}
 }
 
