@@ -86,11 +86,12 @@ func TestPersistVirtualProbeEvidenceBackgroundNeverFallsBack(t *testing.T) {
 }
 
 // TestResolveVirtualPlaybackSourceForegroundFallbackOnDetachedGateExhaustion
-// proves an exhausted detached-probe gate no longer leaves the foreground
-// candidate unprobed: the start path probes it synchronously under a short
-// budget and persists the evidence directly.
+// proves an exhausted detached-probe gate leaves the foreground response
+// unaffected: the declared-evidence instant path returns the playable URL
+// immediately and the gate contention never blocks the start. The probe is
+// retried on a later play when a gate slot frees.
 func TestResolveVirtualPlaybackSourceForegroundFallbackOnDetachedGateExhaustion(t *testing.T) {
-	logs := captureHandlerLogs(t)
+	_ = captureHandlerLogs(t)
 	saver := &fallbackEvidenceSaver{}
 	const candidateURI = "virtual://movie/tt-gate-fallback?result=cand-1"
 
@@ -127,14 +128,13 @@ func TestResolveVirtualPlaybackSourceForegroundFallbackOnDetachedGateExhaustion(
 	if resolved.File == nil {
 		t.Fatalf("resolved source = %#v, want a file", resolved)
 	}
-	calls := saver.recorded()
-	if len(calls) != 1 {
-		t.Fatalf("gate-exhaustion fallback writes = %d, want exactly 1", len(calls))
+	if resolved.URL == "" {
+		t.Fatal("instant declared resolve must still return a playable URL under gate exhaustion")
 	}
-	if calls[0].FileID != 503 {
-		t.Fatalf("fallback write file_id = %d, want 503", calls[0].FileID)
+	if resolved.Provenance != ProbeProvenanceDeclared && resolved.Provenance != ProbeProvenancePending {
+		t.Fatalf("provenance = %q, want declared/pending instant response under gate exhaustion", resolved.Provenance)
 	}
-	if !strings.Contains(logs.String(), "foreground fallback after detached gate exhaustion") {
-		t.Fatalf("gate-exhaustion fallback was not logged:\n%s", logs.String())
+	if calls := saver.recorded(); len(calls) != 0 {
+		t.Fatalf("gate-exhaustion triggered %d synchronous write(s), want 0 (probe is shed, never blocking)", len(calls))
 	}
 }

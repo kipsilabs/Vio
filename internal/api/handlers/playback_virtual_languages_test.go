@@ -1239,18 +1239,22 @@ func TestMergeVirtualCandidateLanguagesHintsStayOnCandidate(t *testing.T) {
 // resolver's needsCandidateMetadata gate is false and only force_relist can
 // make it list again.
 func completeEvidenceVirtualMovieFile(path string) *models.MediaFile {
+	probedAt := time.Now().Add(-time.Hour)
 	return &models.MediaFile{
 		ID:         30,
 		ContentID:  "movie-1",
 		FilePath:   path,
 		Container:  "mkv",
 		CodecVideo: "h264",
+		CodecAudio: "aac",
 		Resolution: "1080p",
 		Bitrate:    10_000,
 		VideoTracks: []models.VideoTrack{{
 			Codec: "h264", Width: 1920, Height: 1080, FrameRate: "24000/1001", BitDepth: 8, Bitrate: 10_000,
 		}},
-		AudioTracks: []models.AudioTrack{{Codec: "aac", Channels: 2}},
+		AudioTracks:                []models.AudioTrack{{Codec: "aac", Channels: 2}},
+		ProbeUpdatedAt:             &probedAt,
+		VirtualOwnerInstallationID: 5,
 	}
 }
 
@@ -1303,7 +1307,9 @@ func TestResolveVirtualPlaybackSourceForceRelistListsAndKeepsPin(t *testing.T) {
 // Without force_relist, a pinned result= row with complete evidence must skip
 // the provider listing entirely — the behavior force_relist exists to override.
 func TestResolveVirtualPlaybackSourceCompleteEvidenceSkipsListerWithoutForceRelist(t *testing.T) {
-	pinned := VirtualPlaybackStream{ID: "pin", URI: "virtual://movie/1?result=pin", Resolution: "1080p", CodecVideo: "h264"}
+	// With resolved+complete declared metadata plus a probe stamp, the
+	// provider listing is skipped; a probe already ran so nothing is pending.
+	pinned := VirtualPlaybackStream{ID: "pin", URI: "virtual://movie/1?result=pin", Resolution: "1080p", CodecVideo: "h264", CodecAudio: "aac", Container: "mkv"}
 
 	listCalls := 0
 	h := &PlaybackHandler{
@@ -1327,7 +1333,7 @@ func TestResolveVirtualPlaybackSourceCompleteEvidenceSkipsListerWithoutForceReli
 		t.Fatalf("resolveVirtualPlaybackSource error: %v", err)
 	}
 	if listCalls != 0 {
-		t.Fatalf("lister calls = %d, want 0 for complete evidence without forceRelist", listCalls)
+		t.Fatalf("lister calls = %d, want 0 for probed complete evidence without forceRelist", listCalls)
 	}
 	if resolved.URI != pinned.URI {
 		t.Fatalf("resolved URI = %q, want pinned %q", resolved.URI, pinned.URI)

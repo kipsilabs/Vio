@@ -178,11 +178,13 @@ own). The pipeline runs, in order:
 3. filter to usenet releases the provider does not already list (the dedup set
    includes badge-confirmed and cached streams), cap the batch, and persist
    them;
-4. probe the newly persisted candidates so their subtitle and audio tracks are
-   present; best effort and bounded, every new candidate is attempted before
-   the job completes and the count is recorded;
-5. publish `catalog.item.changed` with `{content_id, change: "versions_updated"}`
+4. publish `catalog.item.changed` with `{content_id, change: "versions_updated"}`
    on the catalog channel so every client invalidates the version list.
+
+The refresh is list-only: it never opens a candidate's media URL (no ffprobe,
+no seek-anchor probe, no range fetch). Opening a provider media URL can
+activate the provider, so verified audio/subtitle track inventory arrives with
+an explicit Play of one candidate instead of during the refresh.
 
 The completed job result carries the retained `indexer_releases` list in the
 same wire shape the watch detail uses. The synchronous behavior this endpoint

@@ -49,9 +49,13 @@ row by its opaque id, uses the stored URL, and never accepts or returns a URL,
 preventing SSRF primitives. `MarkIndexerReleaseQueued` is the domain identity
 that makes a repeated request idempotent. The refresh is a durable `adminjob`
 job owned by the requesting user; the provider re-list is the only fatal stage,
-while indexer search and candidate probing degrade to warnings. A completed
+while indexer search degrades to warnings. A completed
 refresh publishes `catalog.item.changed` with `change: "versions_updated"` so
 clients invalidate the version list.
+
+The refresh is list-only: it never opens a candidate's media URL, so no
+candidate is probed, played, or downloaded by the refresh itself. Verified
+track inventory arrives when the viewer explicitly plays one candidate.
 
 ## Library picker schema formats
 

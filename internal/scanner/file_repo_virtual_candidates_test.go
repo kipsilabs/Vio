@@ -2,6 +2,7 @@ package scanner
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"testing"
@@ -1708,6 +1709,380 @@ func TestPruneDeadAbsentVirtualCandidatesHonorsRetention(t *testing.T) {
 	for name, id := range map[string]int{"delivered": delivered, "in-window": inWindow, "last-played": lastPlayed, "live-attempt": liveAttempt} {
 		if !exists(id) {
 			t.Fatalf("%s row was pruned despite its retention rule", name)
+		}
+	}
+}
+
+// TestReplaceVirtualCandidatesSyntheticTracksAndVerifiedPreservation proves
+// that listing an unprobed candidate persists rich synthetic video/audio tracks
+// and audio channels without stamping probe_updated_at, and that a later
+// re-list preserves verified ffprobe tracks and technical scalars on a row
+// that has already been probed.
+func TestReplaceVirtualCandidatesSyntheticTracksAndVerifiedPreservation(t *testing.T) {
+	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("SILO_TEST_DATABASE_URL is not set")
+	}
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect test database: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	suffix := time.Now().UnixNano()
+	contentID := fmt.Sprintf("virtual-synth-test-%d", suffix)
+	basePath := fmt.Sprintf("virtual://movie/synth-%d", suffix)
+	candidatePath := basePath + "?result=c1"
+
+	var folderID int
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO media_folders(type,name,enabled)
+		VALUES('movies',$1,true) RETURNING id`, fmt.Sprintf("Synth Folder %d", suffix)).Scan(&folderID); err != nil {
+		t.Fatalf("seed folder: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, `DELETE FROM media_files WHERE content_id=$1`, contentID)
+		_, _ = pool.Exec(ctx, `DELETE FROM media_folders WHERE id=$1`, folderID)
+	})
+
+	source := &models.MediaFile{
+		ContentID:                  contentID,
+		FilePath:                   basePath,
+		MediaFolderID:              folderID,
+		VirtualOwnerInstallationID: 5,
+	}
+
+	repo := NewFileRepository(pool)
+
+	// Step 1: ReplaceVirtualCandidates with rich unprobed candidate metadata.
+	// Explicit 7.1 declaration, labeled DV profile 8, and 10-bit tag.
+	cand := VirtualCandidate{
+		URI:                 candidatePath,
+		Label:               "Heat.1995.2160p.UHD.Remux.DV.Profile.8.HDR10.TrueHD.Atmos.7.1.10bit-GRP",
+		Resolution:          "2160p",
+		CodecVideo:          "hevc",
+		CodecAudio:          "truehd",
+		HDR:                 "dv",
+		VisualTags:          []string{"dv", "hdr10", "10bit"},
+		AudioChannels:       "7.1",
+		HasAtmos:            true,
+		Is10Bit:             true,
+		AudioLanguages:      []string{"eng"},
+		OwnerInstallationID: 5,
+		FileSize:            50_000_000_000,
+	}
+	if err := repo.ReplaceVirtualCandidates(ctx, source, []VirtualCandidate{cand}); err != nil {
+		t.Fatalf("ReplaceVirtualCandidates: %v", err)
+	}
+
+	var (
+		rowID          int
+		probeUpdatedAt *time.Time
+		audioChannels  *int
+		bitrate        *int
+		container      string
+		videoTracks    []models.VideoTrack
+		audioTracks    []models.AudioTrack
+		resolution     string
+		codecVideo     string
+		codecAudio     string
+	)
+	var videoTracksRaw, audioTracksRaw []byte
+	if err := pool.QueryRow(ctx, `
+		SELECT id, probe_updated_at, audio_channels, video_tracks, audio_tracks, resolution, codec_video, codec_audio
+		FROM media_files WHERE content_id=$1 AND file_path=$2`, contentID, candidatePath).
+		Scan(&rowID, &probeUpdatedAt, &audioChannels, &videoTracksRaw, &audioTracksRaw, &resolution, &codecVideo, &codecAudio); err != nil {
+		t.Fatalf("read synthetic row: %v", err)
+	}
+
+	if probeUpdatedAt != nil {
+		t.Fatalf("probe_updated_at = %v, want NULL for unprobed candidate", probeUpdatedAt)
+	}
+	if audioChannels == nil || *audioChannels != 8 {
+		t.Fatalf("audio_channels = %v, want 8 (7.1)", audioChannels)
+	}
+	if resolution != "2160p" || codecVideo != "hevc" || codecAudio != "truehd" {
+		t.Fatalf("scalars = (%s, %s, %s), want (2160p, hevc, truehd)", resolution, codecVideo, codecAudio)
+	}
+	if err := json.Unmarshal(videoTracksRaw, &videoTracks); err != nil {
+		t.Fatalf("unmarshal video_tracks: %v", err)
+	}
+	if len(videoTracks) != 1 {
+		t.Fatalf("video_tracks count = %d, want 1", len(videoTracks))
+	}
+	vt := videoTracks[0]
+	if vt.VideoRangeType != "DOVIWithHDR10" || vt.DVProfile != 8 || vt.BitDepth != 10 || vt.Codec != "hevc" {
+		t.Fatalf("video track = %+v, want DOVIWithHDR10 / profile 8 / 10-bit / hevc", vt)
+	}
+
+	if err := json.Unmarshal(audioTracksRaw, &audioTracks); err != nil {
+		t.Fatalf("unmarshal audio_tracks: %v", err)
+	}
+	if len(audioTracks) != 1 {
+		t.Fatalf("audio_tracks count = %d, want 1", len(audioTracks))
+	}
+	at := audioTracks[0]
+	if at.Language != "eng" || at.Codec != "truehd" || at.Channels != 8 || at.Title != "Dolby Atmos" {
+		t.Fatalf("audio track = %+v, want eng / truehd / 8ch / Dolby Atmos", at)
+	}
+
+	// Step 2: Simulate playback verified ffprobe landing on this row.
+	verifiedProbeTime := time.Now().UTC().Truncate(time.Second)
+	verifiedVideo := `[{"codec":"h264","width":1920,"height":1080,"video_range_type":"SDR"}]`
+	verifiedAudio := `[{"codec":"aac","channels":2,"language":"fra"}]`
+	verifiedBitrate := 12345
+	verifiedContainer := "matroska"
+	if _, err := pool.Exec(ctx, `
+		UPDATE media_files
+		SET probe_updated_at=$1, resolution='1080p', codec_video='h264', codec_audio='aac', audio_channels=2, hdr=false,
+		    bitrate=$2, container=$3,
+		    video_tracks=$4::jsonb, audio_tracks=$5::jsonb
+		WHERE id=$6`, verifiedProbeTime, verifiedBitrate, verifiedContainer, verifiedVideo, verifiedAudio, rowID); err != nil {
+		t.Fatalf("simulate verified probe: %v", err)
+	}
+
+	// Step 3: A later re-list must preserve verified ffprobe tracks and technical scalars!
+	relistedCand := VirtualCandidate{
+		URI:                 candidatePath,
+		Label:               "Heat.1995.2160p.UHD.Remux.DV.Profile.8.HDR10.TrueHD.Atmos.7.1.10bit-GRP",
+		Resolution:          "2160p",
+		CodecVideo:          "hevc",
+		CodecAudio:          "truehd",
+		HDR:                 "dv",
+		VisualTags:          []string{"dv", "hdr10", "10bit"},
+		AudioChannels:       "7.1",
+		HasAtmos:            true,
+		Is10Bit:             true,
+		AudioLanguages:      []string{"eng"},
+		OwnerInstallationID: 5,
+		FileSize:            50_000_000_000,
+	}
+	if err := repo.ReplaceVirtualCandidates(ctx, source, []VirtualCandidate{relistedCand}); err != nil {
+		t.Fatalf("re-list ReplaceVirtualCandidates: %v", err)
+	}
+
+	if err := pool.QueryRow(ctx, `
+		SELECT probe_updated_at, audio_channels, video_tracks, audio_tracks, resolution, codec_video, codec_audio, bitrate, container
+		FROM media_files WHERE id=$1`, rowID).
+		Scan(&probeUpdatedAt, &audioChannels, &videoTracksRaw, &audioTracksRaw, &resolution, &codecVideo, &codecAudio, &bitrate, &container); err != nil {
+		t.Fatalf("read re-listed row: %v", err)
+	}
+
+	if probeUpdatedAt == nil || !probeUpdatedAt.Equal(verifiedProbeTime) {
+		t.Fatalf("probe_updated_at = %v, want verified probe time %v preserved", probeUpdatedAt, verifiedProbeTime)
+	}
+	if resolution != "1080p" || codecVideo != "h264" || codecAudio != "aac" {
+		t.Fatalf("verified technical scalars overwritten: (%s, %s, %s), want (1080p, h264, aac)", resolution, codecVideo, codecAudio)
+	}
+	if audioChannels == nil || *audioChannels != 2 {
+		t.Fatalf("audio_channels = %v, want verified 2", audioChannels)
+	}
+	var preservedVideo []models.VideoTrack
+	if err := json.Unmarshal(videoTracksRaw, &preservedVideo); err != nil || len(preservedVideo) != 1 || preservedVideo[0].Codec != "h264" {
+		t.Fatalf("verified video_tracks overwritten: %s", videoTracksRaw)
+	}
+	var preservedAudio []models.AudioTrack
+	if err := json.Unmarshal(audioTracksRaw, &preservedAudio); err != nil || len(preservedAudio) != 1 || preservedAudio[0].Codec != "aac" {
+		t.Fatalf("verified audio_tracks overwritten: %s", audioTracksRaw)
+	}
+	if bitrate == nil || *bitrate != verifiedBitrate {
+		t.Fatalf("verified bitrate overwritten: %v, want %d", bitrate, verifiedBitrate)
+	}
+	if container != verifiedContainer {
+		t.Fatalf("verified container overwritten: %q, want %q", container, verifiedContainer)
+	}
+}
+
+// TestReplaceVirtualCandidatesDoesNotInventTracks verifies no technical facts
+// are invented: mono channels, unknown channels/codecs, DV without profile, and
+// 4k SDR must NOT gain extra data.
+func TestReplaceVirtualCandidatesDoesNotInventTracks(t *testing.T) {
+	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("SILO_TEST_DATABASE_URL is not set")
+	}
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect test database: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	suffix := time.Now().UnixNano()
+	contentID := fmt.Sprintf("virtual-noinven-test-%d", suffix)
+	basePath := fmt.Sprintf("virtual://movie/noinven-%d", suffix)
+
+	var folderID int
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO media_folders(type,name,enabled)
+		VALUES('movies',$1,true) RETURNING id`, fmt.Sprintf("NoInvent Folder %d", suffix)).Scan(&folderID); err != nil {
+		t.Fatalf("seed folder: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, `DELETE FROM media_files WHERE content_id=$1`, contentID)
+		_, _ = pool.Exec(ctx, `DELETE FROM media_folders WHERE id=$1`, folderID)
+	})
+
+	source := &models.MediaFile{
+		ContentID:                  contentID,
+		FilePath:                   basePath,
+		MediaFolderID:              folderID,
+		VirtualOwnerInstallationID: 5,
+	}
+
+	repo := NewFileRepository(pool)
+
+	// Case 1: Mono channels, unknown video codec, DV without profile, 4k SDR.
+	cands := []VirtualCandidate{
+		{
+			URI:                 basePath + "?result=mono",
+			Label:               "Movie.2024.WEB-DL.1080p.AAC.1.0-GRP",
+			Resolution:          "1080p",
+			CodecVideo:          "",
+			CodecAudio:          "aac",
+			AudioChannels:       "1.0",
+			OwnerInstallationID: 5,
+			FileSize:            2_000_000_000,
+		},
+		{
+			URI:                 basePath + "?result=unknown",
+			Label:               "Movie.2024.HDTV.TrueHD.Atmos-GRP",
+			CodecVideo:          "",
+			CodecAudio:          "truehd",
+			AudioChannels:       "",
+			HasAtmos:            true,
+			OwnerInstallationID: 5,
+			FileSize:            3_000_000_000,
+		},
+		{
+			URI:                 basePath + "?result=dvnodeclared",
+			Label:               "Movie.2023.2160p.DV.WEB-DL-GRP",
+			Resolution:          "2160p",
+			CodecVideo:          "hevc",
+			CodecAudio:          "eac3",
+			HDR:                 "dv",
+			VisualTags:          []string{"dv"},
+			OwnerInstallationID: 5,
+			FileSize:            12_000_000_000,
+		},
+		{
+			URI:                 basePath + "?result=4ksdr",
+			Label:               "Movie.2022.2160p.HDTV.h264-GRP",
+			Resolution:          "2160p",
+			CodecVideo:          "h264",
+			CodecAudio:          "aac",
+			OwnerInstallationID: 5,
+			FileSize:            10_000_000_000,
+		},
+	}
+	if err := repo.ReplaceVirtualCandidates(ctx, source, cands); err != nil {
+		t.Fatalf("ReplaceVirtualCandidates: %v", err)
+	}
+
+	type rowData struct {
+		audioChannels *int
+		videoTracks   []models.VideoTrack
+		audioTracks   []models.AudioTrack
+	}
+	read := func(path string) (rowData, []byte, []byte) {
+		var out rowData
+		var vtRaw, atRaw []byte
+		if err := pool.QueryRow(ctx, `
+			SELECT audio_channels, video_tracks, audio_tracks
+			FROM media_files WHERE content_id=$1 AND file_path=$2`, contentID, path).
+			Scan(&out.audioChannels, &vtRaw, &atRaw); err != nil {
+			t.Fatalf("read row %s: %v", path, err)
+		}
+		if err := json.Unmarshal(vtRaw, &out.videoTracks); err != nil {
+			t.Fatalf("unmarshal video tracks %s: %v", path, err)
+		}
+		if err := json.Unmarshal(atRaw, &out.audioTracks); err != nil {
+			t.Fatalf("unmarshal audio tracks %s: %v", path, err)
+		}
+		return out, vtRaw, atRaw
+	}
+
+	// Case 1: 1.0 → 1, not stereo or surround. Unknown codec stays empty.
+	mono, _, _ := read(basePath + "?result=mono")
+	if mono.audioChannels == nil || *mono.audioChannels != 1 {
+		t.Fatalf("mono audio_channels = %v, want 1", mono.audioChannels)
+	}
+	if len(mono.audioTracks) != 1 || mono.audioTracks[0].Channels != 1 {
+		t.Fatalf("mono tracks = %+v, want 1ch", mono.audioTracks)
+	}
+	if len(mono.videoTracks) != 1 || mono.videoTracks[0].Codec != "" {
+		t.Fatalf("mono video track = %+v, want empty (unknown) codec", mono.videoTracks)
+	}
+
+	// Case 2: Atmos without channel declaration → NULL (unknown), title retained, codec preserved.
+	unknown, _, _ := read(basePath + "?result=unknown")
+	if unknown.audioChannels != nil {
+		t.Fatalf("unknown audio_channels = %v, want NULL (unknown)", *unknown.audioChannels)
+	}
+	if len(unknown.audioTracks) != 1 || unknown.audioTracks[0].Channels != 0 || unknown.audioTracks[0].Codec != "truehd" {
+		t.Fatalf("unknown tracks = %+v, want 0ch / truehd", unknown.audioTracks)
+	}
+	if unknown.audioTracks[0].Title != "Dolby Atmos" {
+		t.Fatalf("unknown audio title = %q, want Dolby Atmos", unknown.audioTracks[0].Title)
+	}
+
+	// Case 3: DV without profile → DolbyVision tag, no fabricated profile.
+	dvonly, _, _ := read(basePath + "?result=dvnodeclared")
+	if len(dvonly.videoTracks) != 1 {
+		t.Fatalf("dv video tracks = %+v, want 1", dvonly.videoTracks)
+	}
+	vt := dvonly.videoTracks[0]
+	if vt.VideoRangeType != "DOVI" || vt.DolbyVision != "Dolby Vision" {
+		t.Fatalf("dv video track = %+v, want DOVI", vt)
+	}
+	if vt.DVProfile != 0 {
+		t.Fatalf("dv profile = %d, want 0 (no fabricated profile)", vt.DVProfile)
+	}
+	if vt.BitDepth != 0 {
+		t.Fatalf("dv bit depth = %d, want 0 (no 10-bit evidence)", vt.BitDepth)
+	}
+
+	// Case 4: 4k SDR h264 → SDR type, unknown bit depth.
+	sdr, _, _ := read(basePath + "?result=4ksdr")
+	if len(sdr.videoTracks) != 1 {
+		t.Fatalf("sdr video tracks = %+v, want 1", sdr.videoTracks)
+	}
+	vtSDR := sdr.videoTracks[0]
+	if vtSDR.VideoRangeType != "SDR" {
+		t.Fatalf("sdr video track = %+v, want SDR", vtSDR)
+	}
+	if vtSDR.BitDepth != 0 {
+		t.Fatalf("sdr bit depth = %d, want 0 (no bit-depth evidence)", vtSDR.BitDepth)
+	}
+	if vtSDR.Codec != "h264" {
+		t.Fatalf("sdr codec = %q, want h264", vtSDR.Codec)
+	}
+}
+
+// TestExtractDeclaredDVProfileBoundary pins token boundaries: "profile 80"
+// and "dv80" must not match profile 8.
+func TestExtractDeclaredDVProfileBoundary(t *testing.T) {
+	for _, label := range []string{
+		"Movie.2024.2160p.DV.Profile.80-GRP",
+		"Movie.2024.2160p.DV.Profile 80-GRP",
+		"Movie.2024.2160p.DV80-GRP",
+		"Movie.2024.2160p.DOVI80-GRP",
+	} {
+		if got := extractDeclaredDVProfile(label); got != 0 {
+			t.Fatalf("extractDeclaredDVProfile(%q) = %d, want 0", label, got)
+		}
+	}
+	for _, tc := range []struct {
+		label string
+		want  int
+	}{
+		{"Movie.2024.2160p.DV.Profile.8-GRP", 8},
+		{"Movie.2024.2160p.DV8-GRP", 8},
+		{"Movie.2024.2160p.Profile.7-GRP", 7},
+	} {
+		if got := extractDeclaredDVProfile(tc.label); got != tc.want {
+			t.Fatalf("extractDeclaredDVProfile(%q) = %d, want %d", tc.label, got, tc.want)
 		}
 	}
 }

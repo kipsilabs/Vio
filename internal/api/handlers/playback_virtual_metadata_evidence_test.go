@@ -113,8 +113,13 @@ func TestResolveVirtualResumeIncompleteMetadataFallsThroughToProbe(t *testing.T)
 	if detailedCalls != 1 {
 		t.Fatalf("detailed resolver called %d times, want 1: the unprobed row must resolve rather than resume blind", detailedCalls)
 	}
-	if resolved.Provenance == ProbeProvenanceVerified {
-		t.Fatalf("unexpected synchronous verified provenance; want the deferred resolve path")
+	// The deferral guard routes unplannable merged metadata to the bounded
+	// synchronous cache-first probe: the row is filled in before the planner
+	// sees it, so this resolve returns the probe's verified inventory rather
+	// than a pending deferred plan the planner would terminal. The probe ran
+	// synchronously on the start path.
+	if resolved.Provenance != ProbeProvenanceVerified || !resolved.ProbeSucceeded {
+		t.Fatalf("provenance=%q succeeded=%v, want verified/true after the guard's sync probe", resolved.Provenance, resolved.ProbeSucceeded)
 	}
 	select {
 	case <-probed:

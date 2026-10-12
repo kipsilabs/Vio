@@ -1318,6 +1318,11 @@ type VirtualCandidate struct {
 	Bitrate             int
 	AudioLanguages      []string
 	SubtitleLanguages   []string
+	AudioChannels       string
+	HasAtmos            bool
+	Is10Bit             bool
+	IsMultiAudio        bool
+	VisualTags          []string
 	// ResolvedURL is the candidate's provider stream URL, persisted so a later
 	// phase can reuse it. It is purely additive to URI. ResolvedURLExpiresAt
 	// is the URL's parsed expiry (nil when unparseable).
@@ -1401,13 +1406,22 @@ func (r *FileRepository) ReplaceVirtualCandidates(ctx context.Context, source *m
 		if fileSize < 0 {
 			fileSize = 0
 		}
-		audioTracks, err := json.Marshal(languageAudioTracks(candidate.AudioLanguages))
+		audioTracks, err := json.Marshal(syntheticAudioTracks(candidate))
 		if err != nil {
 			return fmt.Errorf("marshal virtual candidate audio tracks: %w", err)
 		}
 		subtitleTracks, err := json.Marshal(languageSubtitleTracks(candidate.SubtitleLanguages))
 		if err != nil {
 			return fmt.Errorf("marshal virtual candidate subtitle tracks: %w", err)
+		}
+		videoTracks, err := json.Marshal(syntheticVideoTracks(candidate))
+		if err != nil {
+			return fmt.Errorf("marshal virtual candidate video tracks: %w", err)
+		}
+		audioChannels := virtualChannelsCount(candidate.AudioChannels)
+		bitrate := candidate.Bitrate
+		if bitrate < 0 {
+			bitrate = 0
 		}
 		// The expiry belongs to the URL it was parsed from. A candidate with
 		// no URL must not carry an orphan expiry into the row; the update
@@ -1434,19 +1448,19 @@ func (r *FileRepository) ReplaceVirtualCandidates(ctx context.Context, source *m
 			-- migration 20260908140000_cleanup_virtual_release_metadata.sql.
 			INSERT INTO media_files (
 				content_id, episode_id, media_folder_id, file_path, file_size,
-				resolution, codec_video, codec_audio, hdr, container, bitrate,
-				edition_raw, release_name, release_group, audio_tracks, subtitle_tracks, probe_source,
+				resolution, codec_video, codec_audio, audio_channels, hdr, container, bitrate,
+				edition_raw, release_name, release_group, audio_tracks, subtitle_tracks, video_tracks, probe_source,
 				probe_updated_at, virtual_owner_installation_id,
 				resolved_url, resolved_url_expires_at,
 				provider_video_hash, provider_guid, provider_release_name, provider_release_size,
 				provider_request_headers
 			) VALUES (
 				$1, NULLIF($2,''), $3, $4, $5,
-				NULLIF($6,''), NULLIF($7,''), NULLIF($8,''), $9, 'virtual',
-				NULLIF($10,0), $11, '', '', $12, $13, 'virtual', NULL, $14,
-				NULLIF($15,''), $16,
-				NULLIF($17,''), NULLIF($18,''), NULLIF($19,''), NULLIF($20::bigint,0),
-				$21
+				NULLIF($6,''), NULLIF($7,''), NULLIF($8,''), NULLIF($9,0), $10, 'virtual',
+				NULLIF($11,0), $12, '', '', $13, $14, $15, 'virtual', NULL, $16,
+				NULLIF($17,''), $18,
+				NULLIF($19,''), NULLIF($20,''), NULLIF($21,''), NULLIF($22::bigint,0),
+				$23
 			)
 			ON CONFLICT (file_path, virtual_owner_installation_id, media_folder_id)
 				WHERE virtual_owner_installation_id IS NOT NULL
@@ -1455,17 +1469,49 @@ func (r *FileRepository) ReplaceVirtualCandidates(ctx context.Context, source *m
 				episode_id=EXCLUDED.episode_id,
 				media_folder_id=EXCLUDED.media_folder_id,
 				file_size=EXCLUDED.file_size,
-				resolution=EXCLUDED.resolution,
-				codec_video=EXCLUDED.codec_video,
-				codec_audio=EXCLUDED.codec_audio,
-				hdr=EXCLUDED.hdr,
-				container='virtual',
-				bitrate=EXCLUDED.bitrate,
+				resolution = CASE
+					WHEN media_files.probe_updated_at IS NOT NULL THEN media_files.resolution
+					ELSE EXCLUDED.resolution
+				END,
+				codec_video = CASE
+					WHEN media_files.probe_updated_at IS NOT NULL THEN media_files.codec_video
+					ELSE EXCLUDED.codec_video
+				END,
+				codec_audio = CASE
+					WHEN media_files.probe_updated_at IS NOT NULL THEN media_files.codec_audio
+					ELSE EXCLUDED.codec_audio
+				END,
+				audio_channels = CASE
+					WHEN media_files.probe_updated_at IS NOT NULL THEN media_files.audio_channels
+					ELSE EXCLUDED.audio_channels
+				END,
+				hdr = CASE
+					WHEN media_files.probe_updated_at IS NOT NULL THEN media_files.hdr
+					ELSE EXCLUDED.hdr
+				END,
+				container = CASE
+					WHEN media_files.probe_updated_at IS NOT NULL THEN media_files.container
+					ELSE 'virtual'
+				END,
+				bitrate = CASE
+					WHEN media_files.probe_updated_at IS NOT NULL THEN media_files.bitrate
+					ELSE EXCLUDED.bitrate
+				END,
 				edition_raw=EXCLUDED.edition_raw,
 				release_name='',
 				release_group='',
-				audio_tracks=EXCLUDED.audio_tracks,
-				subtitle_tracks=EXCLUDED.subtitle_tracks,
+				audio_tracks = CASE
+					WHEN media_files.probe_updated_at IS NOT NULL THEN media_files.audio_tracks
+					ELSE EXCLUDED.audio_tracks
+				END,
+				subtitle_tracks = CASE
+					WHEN media_files.probe_updated_at IS NOT NULL THEN media_files.subtitle_tracks
+					ELSE EXCLUDED.subtitle_tracks
+				END,
+				video_tracks = CASE
+					WHEN media_files.probe_updated_at IS NOT NULL THEN media_files.video_tracks
+					ELSE EXCLUDED.video_tracks
+				END,
 				probe_source='virtual',
 				-- A re-list that no longer reports a provider URL must not
 				-- erase the last resolved one; only a newer successful
@@ -1512,8 +1558,8 @@ func (r *FileRepository) ReplaceVirtualCandidates(ctx context.Context, source *m
 			RETURNING id`,
 			source.ContentID, source.EpisodeID, source.MediaFolderID, candidate.URI,
 			fileSize, candidate.Resolution, candidate.CodecVideo,
-			candidate.CodecAudio, candidate.HDR != "", candidate.Bitrate,
-			candidate.Label, audioTracks, subtitleTracks,
+			candidate.CodecAudio, audioChannels, candidate.HDR != "", bitrate,
+			candidate.Label, audioTracks, subtitleTracks, videoTracks,
 			ownerInstallationID,
 			candidate.ResolvedURL, resolvedURLExpiresAt,
 			candidate.ProviderVideoHash, candidate.ProviderGUID,
@@ -2001,6 +2047,238 @@ func virtualCandidateSelection(raw string) bool {
 		return false
 	}
 	return strings.TrimSpace(parsed.Query().Get("result")) != ""
+}
+
+const (
+	virtualResolution2160p = "2160p"
+	videoRangeHDR          = "HDR"
+)
+
+func virtualResolutionDimensions(resolution string) (int, int) {
+	switch strings.ToLower(strings.TrimSpace(resolution)) {
+	case "4320p", "8k":
+		return 7680, 4320
+	case virtualResolution2160p, "4k", "uhd":
+		return 3840, 2160
+	case "1080p", "1080i":
+		return 1920, 1080
+	case "720p":
+		return 1280, 720
+	case "480p", "sd":
+		return 720, 480
+	default:
+		return 0, 0
+	}
+}
+
+func virtualChannelsCount(ch string) int {
+	ch = strings.TrimSpace(ch)
+	switch {
+	case strings.HasPrefix(ch, "7.1"):
+		return 8
+	case strings.HasPrefix(ch, "5.1"):
+		return 6
+	case strings.HasPrefix(ch, "2.0") || ch == "2":
+		return 2
+	case strings.HasPrefix(ch, "1.0") || ch == "1":
+		return 1
+	default:
+		return 0
+	}
+}
+
+func extractDeclaredDVProfile(label string) int {
+	lower := strings.ToLower(label)
+	// "dv"/"dovi" followed by digit: "dv8" -> 8, "dovi7" -> 7. A trailing
+	// digit boundary prevents "dv80" from matching profile 8.
+	for _, p := range []struct {
+		prefix  string
+		profile int
+	}{
+		{"dv8", 8},
+		{"dv7", 7},
+		{"dv5", 5},
+		{"dovi8", 8},
+		{"dovi7", 7},
+		{"dovi5", 5},
+	} {
+		if idx := strings.Index(lower, p.prefix); idx >= 0 {
+			next := lower[idx+len(p.prefix):]
+			if next == "" || next[0] < '0' || next[0] > '9' {
+				return p.profile
+			}
+		}
+	}
+	// "profile 8"/"profile.8" with a digit boundary: "profile 80" must not
+	// match profile 8 (a "." separator like "Profile.8.HDR10" is fine).
+	for _, p := range []struct {
+		prefix  string
+		profile int
+	}{
+		{"profile 8", 8},
+		{"profile.8", 8},
+		{"profile 7", 7},
+		{"profile.7", 7},
+		{"profile 5", 5},
+		{"profile.5", 5},
+	} {
+		if idx := strings.Index(lower, p.prefix); idx >= 0 {
+			next := lower[idx+len(p.prefix):]
+			if next == "" || !isASCIIDigitVirtual(next[0]) {
+				return p.profile
+			}
+		}
+	}
+	return 0
+}
+
+func isASCIIDigitVirtual(b byte) bool { return b >= '0' && b <= '9' }
+
+func syntheticVideoTracks(candidate VirtualCandidate) []models.VideoTrack {
+	if candidate.Resolution == "" && candidate.CodecVideo == "" && candidate.HDR == "" && len(candidate.VisualTags) == 0 {
+		return []models.VideoTrack{}
+	}
+
+	videoCodec := strings.TrimSpace(candidate.CodecVideo)
+	width, height := virtualResolutionDimensions(candidate.Resolution)
+	bitDepth := 0
+	if candidate.Is10Bit {
+		bitDepth = 10
+	}
+
+	hasDV := false
+	hasHDR10Plus := false
+	hasHDR10 := false
+	hasHLG := false
+	hasGenericHDR := false
+
+	for _, tag := range candidate.VisualTags {
+		switch strings.ToLower(tag) {
+		case "dv":
+			hasDV = true
+		case "hdr10+":
+			hasHDR10Plus = true
+		case "hdr10":
+			hasHDR10 = true
+		case "hlg":
+			hasHLG = true
+		case "hdr":
+			hasGenericHDR = true
+		}
+	}
+	if !hasDV && strings.EqualFold(candidate.HDR, "dv") {
+		hasDV = true
+	}
+	if !hasHDR10Plus && strings.EqualFold(candidate.HDR, "hdr10+") {
+		hasHDR10Plus = true
+	}
+	if !hasHDR10 && strings.EqualFold(candidate.HDR, "hdr10") {
+		hasHDR10 = true
+	}
+	if !hasHLG && strings.EqualFold(candidate.HDR, "hlg") {
+		hasHLG = true
+	}
+	if !hasGenericHDR && strings.EqualFold(candidate.HDR, "hdr") {
+		hasGenericHDR = true
+	}
+
+	videoRange := "SDR"
+	videoRangeType := "SDR"
+	dvProfile := 0
+	dolbyVision := ""
+
+	if hasDV {
+		videoRange = "DolbyVision"
+		dolbyVision = "Dolby Vision"
+		dvProfile = extractDeclaredDVProfile(candidate.Label)
+		if hasHDR10Plus {
+			videoRangeType = "DOVIWithHDR10Plus"
+		} else if hasHDR10 {
+			videoRangeType = "DOVIWithHDR10"
+		} else if hasHLG {
+			videoRangeType = "DOVIWithHLG"
+		} else {
+			videoRangeType = "DOVI"
+		}
+	} else if hasHDR10Plus {
+		videoRange = videoRangeHDR
+		videoRangeType = "HDR10Plus"
+	} else if hasHDR10 {
+		videoRange = videoRangeHDR
+		videoRangeType = "HDR10"
+	} else if hasHLG {
+		videoRange = videoRangeHDR
+		videoRangeType = "HLG"
+	} else if hasGenericHDR {
+		videoRange = videoRangeHDR
+		videoRangeType = videoRangeHDR
+	}
+
+	bitrate := candidate.Bitrate
+	if bitrate <= 0 {
+		bitrate = 0
+	}
+	frameRate := ""
+
+	vt := models.VideoTrack{
+		Codec:          videoCodec,
+		Width:          width,
+		Height:         height,
+		BitDepth:       bitDepth,
+		FrameRate:      frameRate,
+		Bitrate:        bitrate,
+		VideoRange:     videoRange,
+		VideoRangeType: videoRangeType,
+		DVProfile:      dvProfile,
+		DolbyVision:    dolbyVision,
+		HDR10Plus:      hasHDR10Plus,
+	}
+	return []models.VideoTrack{vt}
+}
+
+func syntheticAudioTracks(candidate VirtualCandidate) []models.AudioTrack {
+	codec := strings.TrimSpace(candidate.CodecAudio)
+	channels := virtualChannelsCount(candidate.AudioChannels)
+
+	languages := candidate.AudioLanguages
+	if len(languages) == 0 {
+		if codec != "" || candidate.Resolution != "" {
+			t := models.AudioTrack{
+				Index:    -1,
+				Codec:    codec,
+				Channels: channels,
+				Default:  true,
+			}
+			if candidate.HasAtmos {
+				t.Title = "Dolby Atmos"
+			}
+			return []models.AudioTrack{t}
+		}
+		return []models.AudioTrack{}
+	}
+
+	result := make([]models.AudioTrack, 0, len(languages))
+	for i, lang := range languages {
+		lang = strings.TrimSpace(lang)
+		if lang == "" {
+			continue
+		}
+		t := models.AudioTrack{
+			Index:    -1,
+			Language: lang,
+			Codec:    codec,
+			Channels: channels,
+			Default:  i == 0,
+		}
+		if candidate.IsMultiAudio {
+			t.Languages = languages
+		}
+		if candidate.HasAtmos {
+			t.Title = "Dolby Atmos"
+		}
+		result = append(result, t)
+	}
+	return result
 }
 
 func languageAudioTracks(languages []string) []models.AudioTrack {

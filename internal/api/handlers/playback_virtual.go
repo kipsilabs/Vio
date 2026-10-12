@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"math"
 	"net/http"
@@ -60,16 +59,6 @@ const (
 	virtualProbeBudget                = 15 * time.Second
 	maxVirtualPlaybackPrefetchFiles   = 2
 	virtualPlaybackPrefetchBudget     = 20 * time.Second
-	// virtualAnchorWarmSeekSeconds is the early source position a prefetch
-	// probes to populate the copy-video seek-anchor cache. A prefetch request
-	// carries file IDs, not a resume position, so it warms an early GOP: the
-	// expensive probe is paid off the critical path and a first seek near the
-	// start is a cache hit. A deep seek later still re-probes.
-	virtualAnchorWarmSeekSeconds = 30.0
-	// virtualFirstBytesWarmBytes is the opening range a prefetch fetches from
-	// the resolved relay so the provider/CDN connection, DNS resolution, and
-	// first chunk are warm when the viewer clicks play.
-	virtualFirstBytesWarmBytes = 512 << 10
 	// virtualPrefetchQueueSize bounds pending prefetch work: how many distinct
 	// source/profile prefetches may wait for a worker. virtualPrefetchWorkers
 	// bounds active work. Together they bound the dedup map, whose entries exist
@@ -931,9 +920,16 @@ func (h *PlaybackHandler) runVirtualPrefetchWorker() {
 	}
 }
 
-// prefetchOne runs one admitted task: listing plus resolver warm, under its own
+// prefetchOne runs one admitted task: listing warm only, under its own
 // budget and the service lifecycle, gated by the aggregate detached gate so a
 // prefetch burst cannot exceed the shared bound. It never pins sticky evidence.
+//
+// The prefetch is list-only by design: it warms the shared resolver candidate
+// cache and the handler best-result cache, and never touches a candidate's
+// media URL (no resolve, no anchor probe, no range fetch, no ffprobe). Opening
+// a ProviderURL can activate the provider (an AltMount Stremio link starts
+// fetching on first access), so any bytes-touching warm must wait for an
+// explicit Play of one candidate.
 func (h *PlaybackHandler) prefetchOne(task virtualPrefetchTask) {
 	gate := h.detachedGate()
 	if !gate.tryAcquire() {
@@ -949,70 +945,8 @@ func (h *PlaybackHandler) prefetchOne(task virtualPrefetchTask) {
 	}
 	// Listing warms the shared resolver candidate cache and stores the
 	// device-neutral candidate set in the handler cache, so the first click
-	// skips the provider round-trip. The resolve below is then served from the
-	// resolver cache. Both are best-effort and metadata-only.
+	// skips the provider round-trip. Metadata-only; no media URL is opened.
 	h.warmVirtualPlaybackListing(prefetchCtx, &task.file, task.neutralURI, task.userID, task.profileID, task.generation)
-	if h.VirtualPlaybackResolver != nil {
-		_, _ = h.VirtualPlaybackResolver.ResolveVirtualPlayback(
-			prefetchCtx, task.neutralURI, task.userID, task.profileID, task.file.VirtualOwnerInstallationID,
-		)
-	}
-	// Anchor and first-byte warm: resolve the relay input once and probe the
-	// seek anchor plus fetch the opening range, so the first play does not pay
-	// the probe and cold-connection cost on its critical path. Best-effort.
-	h.warmVirtualAnchor(prefetchCtx, &task.file, task.userID, task.profileID)
-
-	// Opportunistic pre-probe: when a prober is configured and the top-ranked
-	// candidate has no real probe evidence yet, probe it under the prefetch
-	// budget so audio and subtitle inventories are persisted to the catalog
-	// before the viewer clicks play.
-	if (h.VirtualPlaybackSourceProber != nil || h.VirtualPlaybackSourceProberWithHeaders != nil) && h.BestResultCache != nil {
-		cacheKey := bestResultCacheKey(task.file.ContentID, task.neutralURI, task.file.VirtualOwnerInstallationID)
-		cached := h.BestResultCache.get(cacheKey, time.Now())
-		if len(cached) > 0 && cached[0].URI != "" && !h.virtualCandidateHasProbeEvidence(prefetchCtx, cached[0].URI, &task.file, task.file.VirtualOwnerInstallationID) {
-			topCand := cached[0]
-			var streamURL string
-			var reqHeaders map[string]string
-			ownerID := task.file.VirtualOwnerInstallationID
-			if h.VirtualMediaDetailedResolver != nil {
-				res, err := h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
-					prefetchCtx, topCand.URI, task.file.VirtualOwnerInstallationID, task.userID, task.profileID, false, nil, "",
-				)
-				if err != nil {
-					return
-				}
-				// Speculative pre-probe requires strict identity verification:
-				// the resolved candidate URI must strictly match topCand.URI
-				// (and matching candidate ID when known). Never proceed on an
-				// empty URI or a resolver-substituted candidate (dedup keeper,
-				// sibling), which would persist release B's probe on release A.
-				if res.URI != topCand.URI || (res.CandidateID != "" && topCand.ID != "" && res.CandidateID != topCand.ID) {
-					return
-				}
-				// Owner consistency check: speculative pre-probing must not drift
-				// across plugin installations. Only accept matching owner or 0.
-				if res.OwnerID > 0 && task.file.VirtualOwnerInstallationID > 0 && res.OwnerID != task.file.VirtualOwnerInstallationID {
-					return
-				}
-				streamURL = res.URL
-				// Authoritative cloned header snapshot from resolver only:
-				// do not leak or retain unverified cached candidate headers.
-				reqHeaders = cloneHeaderMap(res.RequestHeaders)
-				if res.OwnerID > 0 {
-					ownerID = res.OwnerID
-				}
-			}
-			if streamURL != "" {
-				probeTransient := cloneVirtualProbeTransient(task.file)
-				probeTransient.FilePath = topCand.URI
-				probeTransient.VirtualOwnerInstallationID = ownerID
-				boundCand := topCand
-				boundCand.RequestHeaders = reqHeaders
-				boundCand.OwnerInstallationID = ownerID
-				h.probeVirtualSourceAndPersist(prefetchCtx, "", &task.file, streamURL, probeTransient, boundCand, h.virtualExpectedRuntimeMinutes(prefetchCtx, &task.file), ownerID)
-			}
-		}
-	}
 }
 
 // warmVirtualPlaybackListing lists provider candidates once and stores the
@@ -1055,75 +989,6 @@ func (h *PlaybackHandler) warmVirtualPlaybackListing(ctx context.Context, file *
 		file.ContentID, neutralURI, file.VirtualOwnerInstallationID,
 		filtered, time.Now(), generation,
 	)
-}
-
-// warmVirtualAnchor resolves the candidate's relay input and probes one
-// copy-video seek anchor, so a seek shortly after play is served from the
-// shared anchor cache instead of paying a synchronous FFmpeg probe. A prefetch
-// request has no resume position, so it warms an early GOP;
-// warmVirtualFirstBytes below covers the from-zero start path. Best-effort: a
-// missing resolver/relay, an expired context, or a probe failure is ignored.
-func (h *PlaybackHandler) warmVirtualAnchor(ctx context.Context, file *models.MediaFile, userID int, profileID string) {
-	if h == nil || file == nil || h.RemoteStreamRelay == nil {
-		return
-	}
-	if h.VirtualMediaResolver == nil && h.VirtualMediaDetailedResolver == nil {
-		return
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if ctx.Err() != nil {
-		return
-	}
-	res, cleanup, err := h.resolveVirtualInputURI(ctx, file.FilePath, file.VirtualOwnerInstallationID, userID, profileID, false, nil, "")
-	if err != nil {
-		return
-	}
-	defer func() {
-		if cleanup != nil {
-			cleanup()
-		}
-	}()
-	h.warmVirtualFirstBytes(ctx, res.URL)
-	// A stored URL that has already lapsed cannot seed a useful anchor; renew it
-	// in the background for the next play instead of probing a dead token.
-	if virtualResolvedURLExpired(res.ExpiresAt, time.Now()) {
-		h.fireExpiredVirtualRefresh(ctx, file, file.VirtualOwnerInstallationID, userID, profileID, res.ExpiresAt)
-		return
-	}
-	ffmpegPath := h.playbackConfig().FFmpegPath
-	requested := virtualAnchorWarmSeekSeconds
-	probe := func(probeCtx context.Context) (float64, int, error) {
-		if h.copySeekAnchor != nil {
-			return h.copySeekAnchor(probeCtx, ffmpegPath, res.URL, requested, playback.DefaultSegmentDuration)
-		}
-		return playback.ResolveCopySeekAnchorForSource(probeCtx, ffmpegPath, file.FilePath, res.URL, requested, playback.DefaultSegmentDuration)
-	}
-	if _, _, probeErr := probe(ctx); probeErr != nil {
-		slog.DebugContext(ctx, "virtual prefetch anchor warm skipped",
-			"component", "api", "file_id", file.ID, "virtual_uri", file.FilePath, "error", probeErr)
-	}
-}
-
-// warmVirtualFirstBytes fetches the opening range of the resolved relay URL so
-// the provider connection, DNS resolution, and first chunk are warm before
-// playback. The body is discarded; a non-HTTP URL or any error is ignored.
-func (h *PlaybackHandler) warmVirtualFirstBytes(ctx context.Context, rawURL string) {
-	if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(rawURL)), "http") {
-		return
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
-	if err != nil {
-		return
-	}
-	req.Header.Set("Range", fmt.Sprintf("bytes=0-%d", virtualFirstBytesWarmBytes-1))
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return
-	}
-	defer func() { _ = resp.Body.Close() }()
-	_, _ = io.CopyN(io.Discard, resp.Body, virtualFirstBytesWarmBytes)
 }
 
 func (h *PlaybackHandler) maxVirtualFailoverAttempts(ctx context.Context) int {
@@ -1357,7 +1222,12 @@ type VirtualPlaybackStream struct {
 	FrameRate           string            `json:"frame_rate,omitempty"`
 	AudioLanguages      []string          `json:"audio_languages,omitempty"`
 	SubtitleLanguages   []string          `json:"subtitle_languages,omitempty"`
+	AudioChannels       string            `json:"audio_channels,omitempty"`
 	HasAtmos            bool              `json:"has_atmos,omitempty"`
+	Is10Bit             bool              `json:"is_10bit,omitempty"`
+	IsMultiAudio        bool              `json:"is_multi_audio,omitempty"`
+	VisualTags          []string          `json:"visual_tags,omitempty"`
+	AudioTags           []string          `json:"audio_tags,omitempty"`
 	QualityScore        int               `json:"quality_score,omitempty"`
 	RequestHeaders      map[string]string `json:"-"`
 	OwnerInstallationID int               `json:"-"`
@@ -1508,6 +1378,23 @@ func applyResolvedIdentity(transient *models.MediaFile, id virtualProbeIdentity)
 	}
 }
 
+func virtualFileHasPlayableDeclaredMetadata(file *models.MediaFile) bool {
+	if file == nil {
+		return false
+	}
+	return file.Resolution != "" && file.CodecVideo != "" && file.CodecAudio != "" && canSkipProbeForContainer(file.Container)
+}
+
+// fastPathGateEligible reports whether the repeat-play fast paths below can
+// apply at all: they are gated on the deferred start branch with no forced
+// relist, an explicit candidate, and no exclusions. It is a coarse,
+// observational-only input to the list_reason trace field: a start that is
+// ineligible here may still take a fast path later (durable resume,
+// delivery grace), so the field records intent, not outcome.
+func fastPathGateEligible(deferProbe, forceRelist, noResult bool, excludedCandidateIDs []string) bool {
+	return deferProbe && !forceRelist && !noResult && len(excludedCandidateIDs) == 0
+}
+
 // shouldListVirtualPlaybackCandidates reports whether the resolver must ask
 // the provider for a candidate list. A pinned result= URI with complete
 // probed evidence normally skips the round-trip. forceRelist overrides that so
@@ -1575,6 +1462,16 @@ type virtualResolveTrace struct {
 	cached     bool
 	listed     bool
 	candidates int
+	// listReason names why the listing gate decided the way it did. It is
+	// observational only and never gates control flow. Values:
+	//   fast_path (repeat/durable/delivery-grace path, no list possible),
+	//   cache_hit (best-result cache reused, list skipped),
+	//   resumed (durable-resume hit, list skipped like a cache hit),
+	//   explicit_declared (explicit ?result= with declared metadata, instant path),
+	//   empty_suppressed (provider answered empty inside the window),
+	//   listed (provider round-trip ran; see the *_ms stages for cost),
+	//   unknown (any other shape; never invent a more specific cause).
+	listReason string
 }
 
 // totalMS is the sum of the stage durations that ran, using the same rounded
@@ -1631,6 +1528,7 @@ func (t *virtualResolveTrace) fieldsWithContext(ctx context.Context) []any {
 		"cache_hit", t.cached,
 		"listed", t.listed,
 		"fast_path", t.fastPath,
+		"list_reason", t.listReason,
 	}
 	if t.budgetRan {
 		attrs = append(attrs, "budget_ms", t.budgetMS)
@@ -2403,7 +2301,16 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	// It is computed here because the durable-resume derivation below needs it
 	// before the listing gate.
 	persistedResultURI := parsed != nil && strings.TrimSpace(parsed.Query().Get("result")) != ""
-	needsCandidateMetadata := !completeVirtualVideoEvidenceV3(file) || !completeVirtualAudioEvidenceV3(file) || !completeVirtualContainerEvidenceV3(file)
+	// A stale row whose stored evidence cannot be trusted must be probed even
+	// when it looks complete on its cached metadata; the probe gate makes this
+	// decision on its own so this declaration does not need that input.
+	needsProbeVerification := file == nil || file.ProbeUpdatedAt == nil
+	needsCandidateMetadata := (!noResult && !virtualFileHasPlayableDeclaredMetadata(file)) ||
+		(noResult && (!completeVirtualVideoEvidenceV3(file) || !completeVirtualAudioEvidenceV3(file) || !completeVirtualContainerEvidenceV3(file)))
+	// A concrete ?result= candidate with sufficient declared metadata
+	// already names the candidate to serve: it does not need the provider
+	// list. Probe verification (real inventory) arrives via the declared
+	// fast path below, not via the listing gate.
 	deviceCaps, hasCaps := h.requestDeviceCapabilities(r)
 	fingerprint := ""
 	if hasCaps {
@@ -2427,7 +2334,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	persistedResumeURI := ""
 	var persistedResumeStored ResolvedVirtualMedia
 	persistedResumeState := virtualStoredURLMissing
-	if persistedResultURI && (needsCandidateMetadata || file.ProbeUpdatedAt == nil) &&
+	if persistedResultURI && needsProbeVerification &&
 		len(excludedCandidateIDs) == 0 &&
 		(allowFailed || !virtualCandidateVerdictActive(file.FailedAt, time.Now())) {
 		// A usable stored URL always keeps the persisted candidate. An
@@ -2507,9 +2414,34 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		slog.DebugContext(r.Context(), "virtual playback list suppressed: provider answered empty inside window",
 			"component", "api", "content_id", file.ContentID, "file_id", file.ID)
 	}
-	if (shouldListVirtualPlaybackCandidates(noResult, needsCandidateMetadata && !cachedListing, forceRelist) ||
+	// An explicit concrete candidate with sufficient declared metadata names
+	// the candidate to serve; skipping the provider list is what makes the
+	// declared fast path below instant.
+	declaredCandidateComplete := !noResult && virtualFileHasPlayableDeclaredMetadata(file)
+	// listReason is observational only: it names why the gate below decided
+	// the way it did so a day of timing lines can size the convertible share
+	// (starts that listed but could have reused a fresh cache) without
+	// guessing. Unknown stays unknown rather than a fabricated miss cause.
+	switch {
+	case fastPathGateEligible(deferProbe, forceRelist, noResult, excludedCandidateIDs):
+		trace.listReason = "fast_path"
+	case cachedListing:
+		trace.listReason = "cache_hit"
+	case persistedResumeURI != "":
+		trace.listReason = "resumed"
+	case declaredCandidateComplete:
+		trace.listReason = "explicit_declared"
+	case emptySuppressed:
+		trace.listReason = "empty_suppressed"
+	case trace.listed:
+		trace.listReason = "listed"
+	default:
+		trace.listReason = "unknown"
+	}
+	if (shouldListVirtualPlaybackCandidates(noResult, needsCandidateMetadata && !cachedListing && !declaredCandidateComplete, forceRelist) ||
 		((exclusionPending || requestedRowUnusable) && !cachedListing)) && persistedResumeURI == "" && !emptySuppressed && h.VirtualPlaybackStreamLister != nil {
 		trace.listed = true
+		trace.listReason = "listed"
 		trace.listRan = true
 		fetchBeforeDur, fetchBeforeCalls := fetchSnapshot()
 		listStart := time.Now()
@@ -2635,7 +2567,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	// has to rotate — the very cascade this preference exists to avoid. A row
 	// the planner can route (complete evidence) keeps the existing noResult-
 	// only behavior, so this only ever promotes a probed sibling over a stub.
-	if (noResult || needsCandidateMetadata) && !options.sessionBound && !options.explicitSelection && len(candidates) > 1 {
+	if (noResult || needsProbeVerification) && !options.sessionBound && !options.explicitSelection && len(candidates) > 1 {
 		candidates = h.preferProbedVirtualCandidates(stagingCtx, candidates, file, file.VirtualOwnerInstallationID)
 	}
 	if len(candidates) > maxAttempts {
@@ -3126,6 +3058,35 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			allowDefer = false
 		}
 		if allowDefer {
+			// Deferral guard: the deferred probe only runs after transport
+			// commit, so merged metadata that cannot support a validated
+			// route would terminal source_metadata_incomplete before the
+			// probe ever runs (the bench Citizen Vigilante shape: stored URL,
+			// empty tracks, fast ~50ms failure with no probe). Evaluate the
+			// merged transient below; when it is route-plannable the
+			// deferred path serves it immediately, otherwise fall through to
+			// the bounded synchronous cache-first probe, which fills the row
+			// in before the planner sees it. Damper admission is preserved:
+			// a recent failure still takes the cache-only path.
+			merged := cloneVirtualProbeTransient(transient)
+			if merged.Resolution == "" {
+				merged.Resolution = cand.Resolution
+			}
+			// No 1080p assumption here: the assumed baseline would make
+			// the merge synthesize bitrate/codecs/tracks (all gated on
+			// hasResolution) and render every row plannable-by-construction,
+			// defeating the guard. Only stored + candidate evidence counts;
+			// the deferred block below still applies the baseline for the
+			// rows that pass.
+			mergeVirtualCandidateTracks(&merged, cand)
+			if !merged.HDR && cand.HDR != "" {
+				merged.HDR = true
+			}
+			if !virtualMergedSupportsValidatedRoute(&merged) {
+				allowDefer = false
+			}
+		}
+		if allowDefer {
 			h.pinVirtualStickyAt(stickyKey, cand.URI, generation)
 			// Resolution precedence: stored evidence wins; otherwise adopt
 			// the candidate's declared label; only when both are absent is
@@ -3189,7 +3150,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 							defer bgCancel()
 							h.probeVirtualSourceAndPersist(bgCtx, stickyKey, file, streamURL, probeTransient, probeCand, expectedRuntimeMinutes, oid)
 						}()
-					} else {
+					} else if !skipProbe {
 						h.probeVirtualCandidateForegroundFallback(r.Context(), stickyKey, file, streamURL, probeTransient, probeCand, expectedRuntimeMinutes, oid)
 					}
 				}
@@ -3240,6 +3201,43 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
 			return withResolvedCandidate(&resolvedVirtualPlaybackSource{
 				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenanceFailed, ResolutionAssumed: resolutionAssumed,
+			}, resolvedIdentity, resolvedRematched), nil
+		}
+		if skipProbe && !substituted {
+			if transient.Resolution == "" {
+				transient.Resolution = cand.Resolution
+			}
+			resolutionAssumed := transient.Resolution == ""
+			if resolutionAssumed {
+				transient.Resolution = transcodeResolution1080p
+			}
+			mergeVirtualCandidateTracks(&transient, cand)
+			if !transient.HDR && cand.HDR != "" {
+				transient.HDR = true
+			}
+			h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
+			if virtualProbeFailures.recent(probeKey) {
+				// Damper armed: a recent failure already consumed the probe
+				// budget. No new probe is admitted; try cache-only recovery
+				// and serve declared metadata immediately.
+				syncProbeFile := cloneVirtualProbeTransient(transient)
+				syncProbeFile.Duration = 0
+				h.recoverVirtualProbeFromCache(attemptCtx, file, streamURL, syncProbeFile, cand, oid)
+			} else {
+				probeBgFile := cloneVirtualProbeTransient(transient)
+				probeBgFile.Duration = 0
+				probeBgCand := cand
+				if gate := h.detachedGate(); gate.tryAcquire() {
+					bgCtx, bgCancel := h.virtualDetachedContext(r.Context(), virtualBackgroundProbeBudget)
+					go func() {
+						defer gate.release()
+						defer bgCancel()
+						h.probeVirtualSourceAndPersist(bgCtx, stickyKey, file, streamURL, probeBgFile, probeBgCand, h.virtualExpectedRuntimeMinutes(r.Context(), file), oid)
+					}()
+				}
+			}
+			return withResolvedCandidate(&resolvedVirtualPlaybackSource{
+				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenanceDeclared, ResolutionAssumed: resolutionAssumed,
 			}, resolvedIdentity, resolvedRematched), nil
 		}
 		if virtualProbeFailures.recent(probeKey) {
@@ -7025,6 +7023,23 @@ func canSkipProbeForContainer(container string) bool {
 		}
 	}
 	return false
+}
+
+// virtualMergedSupportsValidatedRoute reports whether merged candidate
+// metadata can support a validated planner route, mirroring the deferred
+// path's own preconditions: audio-only rows need audio evidence only, while
+// video rows need planner-grade video evidence plus audio and container
+// evidence. It is the deferral guard's predicate: defer the probe past
+// commit only when the merged transient is route-plannable, otherwise run
+// the bounded synchronous probe before the planner sees the row.
+func virtualMergedSupportsValidatedRoute(file *models.MediaFile) bool {
+	if file == nil {
+		return false
+	}
+	if file.IsAudioOnly() {
+		return completeVirtualAudioEvidenceV3(file)
+	}
+	return completeVirtualVideoEvidenceV3(file) && completeVirtualAudioEvidenceV3(file) && completeVirtualContainerEvidenceV3(file)
 }
 
 // completeVirtualVideoEvidenceV3 reports whether a virtual file carries the

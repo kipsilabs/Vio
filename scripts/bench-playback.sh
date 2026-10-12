@@ -15,6 +15,14 @@ set -euo pipefail
 # Env vars:
 #   SILO_SERVER   — base URL  (default: http://localhost:8090)
 #   SILO_API_KEY  — API key   (required; no default is committed)
+#   BENCH_DIAG_DIR — directory for terminal-response diagnostics
+#                   (default: ./bench-diagnostics-<timestamp>)
+#
+# Terminal diagnosis: every cold start whose outcome is not "playable" has
+# its raw start-response JSON copied to BENCH_DIAG_DIR and its terminal +
+# plan fields extracted (terminal.message disambiguates the five
+# adaptation_unavailable branches in internal/playback/plan_v3.go, which
+# share one reason). Phase 5 prints the per-file diagnosis.
 #
 # Settings are also read from .silo-dev.env when present (the same file
 # scripts/silo-dev reads). Never put the API key on the command line.
@@ -31,6 +39,9 @@ fi
 
 WARM_REPS=${1:-20}
 COOLDOWN=${2:-35}
+DIAG_DIR="${BENCH_DIAG_DIR:-./bench-diagnostics-$(date +%Y%m%d-%H%M%S)}"
+mkdir -p "$DIAG_DIR"
+echo "  Diagnostics: $DIAG_DIR (raw responses for non-playable cold starts)"
 SERVER="${SILO_SERVER:-http://localhost:8090}"
 API_KEY="${SILO_API_KEY:-}"
 if [[ -z "$API_KEY" ]]; then
@@ -231,6 +242,7 @@ COLD_TTFB=()
 COLD_TOTAL=()
 COLD_OUTCOME=()
 COLD_SESSION=()
+COLD_DIAG=()
 
 for i in "${!FILES[@]}"; do
   fid="${FILES[$i]}"
@@ -257,9 +269,43 @@ for i in "${!FILES[@]}"; do
   COLD_OUTCOME+=("$outcome")
   COLD_SESSION+=("$sid")
 
-  if [[ -n "$reason" ]]; then
+  if [[ "$outcome" != "playable" ]]; then
+    # Terminal diagnosis: keep the raw response and extract the fields that
+    # disambiguate the branch. terminal.message (not reason) names which of
+    # the five adaptation_unavailable branches fired; the plan fields name
+    # the rejected source/recipe. Never logs tokens or signed URLs.
+    diag_file="$DIAG_DIR/cold-${fid}.json"
+    cp "$TMPDIR/resp-cold-${fid}-${attempt}.json" "$diag_file" 2>/dev/null || true
+    diag_summary=$(python3 - "$diag_file" <<'PYEOF' 2>/dev/null || echo "diag_unavailable"
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    print("diag_unavailable"); sys.exit(0)
+t = d.get("terminal") or {}
+plan = d.get("playback_plan") or {}
+sel = plan.get("selected_tracks") or {}
+src = plan.get("source") or {}
+out = [
+    "terminal_reason=" + str(t.get("reason", "")),
+    "terminal_message=" + str(t.get("message", ""))[:160],
+    "delivery=" + str(plan.get("delivery", "")),
+    "decision=" + str(plan.get("decision_reason", "")),
+    "video=" + str(src.get("video_codec", "")) + "/" + str(src.get("video_range", "")) + "/" + str(src.get("container", "")),
+    "audio=" + str(src.get("audio_codec", "")) + "/" + str(src.get("audio_channels", "")),
+]
+print(" | ".join(out))
+PYEOF
+)
+    COLD_DIAG+=("$diag_summary")
+    printf "ttfb=%6sms  total=%6sms  %s (%s)\n" "$ttfb_ms" "$total_ms" "$outcome" "$reason"
+    printf "    ↳ diag: %s\n" "$diag_summary"
+    printf "    ↳ raw:  %s\n" "$diag_file"
+  elif [[ -n "$reason" ]]; then
+    COLD_DIAG+=("")
     printf "ttfb=%6sms  total=%6sms  %s (%s)\n" "$ttfb_ms" "$total_ms" "$outcome" "$reason"
   else
+    COLD_DIAG+=("")
     printf "ttfb=%6sms  total=%6sms  %s\n" "$ttfb_ms" "$total_ms" "$outcome"
   fi
 
@@ -441,4 +487,24 @@ printf "    %-20s %s\n" "playable" "$(for o in "${COLD_OUTCOME[@]}"; do [[ "$o" 
 printf "    %-20s %s\n" "adaptation_unavailable" "$(for o in "${COLD_OUTCOME[@]}"; do [[ "$o" == "adaptation_unavailable" ]] && echo x; done | wc -l | xargs)/$NFILES"
 printf "    %-20s %s\n" "error" "$(for o in "${COLD_OUTCOME[@]}"; do [[ "$o" == "error" ]] && echo x; done | wc -l | xargs)/$NFILES"
 echo ""
+# ── Phase 5: Terminal diagnosis ────────────────────────────────────────────
+nonplay=0
+for o in "${COLD_OUTCOME[@]}"; do [[ "$o" != "playable" ]] && nonplay=$((nonplay+1)); done
+if [[ $nonplay -gt 0 ]]; then
+  echo "  ── Terminal diagnosis ($nonplay non-playable cold start) ──"
+  echo ""
+  for i in "${!FILES[@]}"; do
+    outcome="${COLD_OUTCOME[$i]}"
+    [[ "$outcome" == "playable" ]] && continue
+    printf "  [%s] %s (%s)\n" "${FILES[$i]}" "${TITLES[$i]}" "$outcome"
+    printf "    %s\n" "${COLD_DIAG[$i]}"
+    printf "    raw: %s/cold-%s.json\n" "$DIAG_DIR" "${FILES[$i]}"
+  done
+  echo ""
+  echo "  Raw responses in $DIAG_DIR — attach terminal_message + plan fields"
+  echo "  when filing the fix; branch map: plan_v3.go:904 (route-exhausted),"
+  echo "  :1017 (audio-source), :1059 (progressive-audio-recipe),"
+  echo "  :1394/:1407 (HLS-recipe)."
+  echo ""
+fi
 echo "═══════════════════════════════════════════════════════════════════════════"

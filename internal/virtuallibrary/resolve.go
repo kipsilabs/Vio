@@ -250,6 +250,11 @@ type PlaybackStream struct {
 	OwnerInstallationID int
 	Visible             bool
 	VisibilitySpecified bool
+	AudioChannels       string
+	Is10Bit             bool
+	IsMultiAudio        bool
+	VisualTags          []string
+	AudioTags           []string
 	// ProviderURL, ProviderVideoHash, ProviderGUID and ProviderReleaseName
 	// carry the candidate's durable provider identity to the persistence path
 	// (ReplaceVirtualCandidates), which stores them on the candidate row.
@@ -970,6 +975,11 @@ func (s *Service) playbackStreamsFrom(ctx context.Context, virtualPath string, c
 			OwnerInstallationID: 0,
 			Visible:             true,
 			VisibilitySpecified: true,
+			AudioChannels:       c.AudioChannels,
+			Is10Bit:             c.Is10Bit,
+			IsMultiAudio:        c.IsMultiAudio,
+			VisualTags:          c.VisualTags,
+			AudioTags:           c.AudioTags,
 			ProviderURL:         c.URL,
 			ProviderVideoHash:   stream.CandidateVideoHash(c),
 			ProviderGUID:        c.SourceGUID,

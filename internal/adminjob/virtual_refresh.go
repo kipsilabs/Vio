@@ -7,8 +7,8 @@ import (
 
 // JobTypeVirtualCandidatesRefresh is the asynchronous "Refresh List" job: it
 // re-lists a virtual item's provider candidates, searches the indexers for
-// releases the provider does not have, persists those indexer-only rows, and
-// enriches the newly persisted candidates with probed track inventory.
+// releases the provider does not have, and persists those indexer-only rows.
+// The refresh is list-only: it never opens a candidate media URL.
 const JobTypeVirtualCandidatesRefresh = "virtual_candidates_refresh"
 
 // virtualCandidatesRefreshTimeout bounds one refresh job. The pipeline spends

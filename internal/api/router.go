@@ -1399,6 +1399,9 @@ func newChiRouter(deps Dependencies) chi.Router {
 							CodecVideo: stream.CodecVideo, CodecAudio: stream.CodecAudio,
 							HDR: stream.HDR, FileSize: stream.FileSize, Bitrate: stream.Bitrate,
 							AudioLanguages: stream.AudioLanguages, SubtitleLanguages: stream.SubtitleLanguages,
+							AudioChannels: stream.AudioChannels, HasAtmos: stream.HasAtmos,
+							Is10Bit: stream.Is10Bit, IsMultiAudio: stream.IsMultiAudio,
+							VisualTags:             stream.VisualTags,
 							ResolvedURL:            stream.ProviderURL,
 							ResolvedURLExpiresAt:   stream.ProviderExpiresAt,
 							ProviderVideoHash:      stream.ProviderVideoHash,
@@ -1455,7 +1458,6 @@ func newChiRouter(deps Dependencies) chi.Router {
 							},
 							Store:    store,
 							Searcher: deps.VirtualLibraryService,
-							Enricher: playbackHandler,
 							Events:   deps.RealtimeHub,
 						}
 						virtualRefreshJobs = &handlers.VirtualCandidatesRefreshJobService{
