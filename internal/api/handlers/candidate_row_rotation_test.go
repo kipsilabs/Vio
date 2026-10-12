@@ -41,7 +41,7 @@ func TestRotateTargetRefusesDuplicateSiblingRow(t *testing.T) {
 		fileResolver: byPathPlaybackFileResolver{byPath: map[string]*models.MediaFile{duplicateURI: duplicate}},
 	}
 
-	identityRow, evidence, ok := h.virtualProbeEvidenceRotateTarget(context.Background(), requested, duplicateURI, probed)
+	identityRow, evidence, ok := h.virtualProbeEvidenceRotateTarget(context.Background(), requested, duplicateURI, probed, noCandidateIdentity)
 	if ok {
 		t.Fatal("duplicate-sibling rotation was accepted; the duplicate row would be repainted")
 	}
@@ -80,7 +80,7 @@ func TestRotateTargetStillRotatesDistinctRelease(t *testing.T) {
 		fileResolver: byPathPlaybackFileResolver{byPath: map[string]*models.MediaFile{ownerURI: owner}},
 	}
 
-	identityRow, evidence, ok := h.virtualProbeEvidenceRotateTarget(context.Background(), requested, ownerURI, probed)
+	identityRow, evidence, ok := h.virtualProbeEvidenceRotateTarget(context.Background(), requested, ownerURI, probed, noCandidateIdentity)
 	if !ok {
 		t.Fatal("distinct-release rotation was refused")
 	}
@@ -130,7 +130,7 @@ func TestRotateTargetRefusesMixedTierDuplicateRow(t *testing.T) {
 		fileResolver: byPathPlaybackFileResolver{byPath: map[string]*models.MediaFile{ownerURI: owner}},
 	}
 
-	identityRow, evidence, ok := h.virtualProbeEvidenceRotateTarget(context.Background(), requested, ownerURI, probed)
+	identityRow, evidence, ok := h.virtualProbeEvidenceRotateTarget(context.Background(), requested, ownerURI, probed, noCandidateIdentity)
 	if ok {
 		t.Fatal("mixed-tier duplicate rotation was accepted; a strongest-tier key missed the duplicate")
 	}

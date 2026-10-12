@@ -122,7 +122,7 @@ func TestVirtualProbeEvidenceSameReleaseStaysMetadataOnly(t *testing.T) {
 	probeTransient.FilePath = candidateURI
 	cand := VirtualPlaybackStream{ID: "same", URI: candidateURI, Resolution: "2160p"}
 
-	h.probeVirtualSourceAndPersist(ctx, "sticky-same-release", row, "http://provider.example/same", probeTransient, cand, 90, ownerID)
+	h.probeVirtualSourceAndPersist(ctx, "sticky-same-release", row, "http://provider.example/same", probeTransient, cand, noCandidateIdentity, 90, ownerID)
 	h.StopVirtualEvidence()
 
 	argsMu.Lock()
@@ -233,7 +233,7 @@ func TestVirtualProbeEvidenceCrossReleaseRefusedKeepsOriginalRowByteIdentical(t 
 	probeTransient.FilePath = siblingURI
 	cand := VirtualPlaybackStream{ID: "sibling", URI: siblingURI, Resolution: "2160p"}
 
-	h.probeVirtualSourceAndPersist(ctx, "sticky-cross-release", original, "http://provider.example/cross", probeTransient, cand, 90, ownerID)
+	h.probeVirtualSourceAndPersist(ctx, "sticky-cross-release", original, "http://provider.example/cross", probeTransient, cand, noCandidateIdentity, 90, ownerID)
 	h.StopVirtualEvidence()
 
 	after := readVirtualRowJSON(t, pool, originalID)

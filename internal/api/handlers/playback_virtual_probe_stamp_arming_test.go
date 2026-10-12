@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/virtuallibrary/resolver"
 )
 
 // TestVirtualProbeEvidenceArgsStampFollowsExplicitProvenance pins that
@@ -84,7 +85,7 @@ func TestVirtualProbeEvidenceArgsStampFollowsExplicitProvenance(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			args, ok := h.virtualProbeEvidenceArgsForRow(context.Background(), row, candidateURI, tc.probed, tc.stamp)
+			args, ok := h.virtualProbeEvidenceArgsForRow(context.Background(), row, candidateURI, tc.probed, resolver.PersistedIdentityTiers{}, tc.stamp)
 			if !ok {
 				t.Fatal("args builder refused the write")
 			}
