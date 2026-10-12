@@ -13,16 +13,19 @@ import (
 	"github.com/Silo-Server/silo-server/internal/models"
 )
 
-// TestVirtualProbeEvidenceArgsStampOnlyForProbeEvidence pins the args-level half
-// of the stamp coupling: a write carrying probe-observed inventory (a track with
-// a container stream index) forces StampProbe even when the caller asked for a
-// metadata-only write, while synthesized declared tracks (codec, no index) and
-// language-only hints leave the flag untouched so a NULL stamp is preserved.
-func TestVirtualProbeEvidenceArgsStampOnlyForProbeEvidence(t *testing.T) {
-	const candidateURI = "virtual://movie/tt-coupling?result=cand"
+// TestVirtualProbeEvidenceArgsStampFollowsExplicitProvenance pins that
+// StampProbe is the explicit successful-probe flag, never a function of the
+// inventory shape. A metadata-only write that carries probe-observed-looking
+// tracks still preserves the row's stamp (stampProbe false), so the row is not
+// advanced from tracks the write merely copied, and an ffprobe track numbered 0
+// is not special-cased. A write from a probe that succeeded stamps regardless
+// of the inventory it carries. This is the corrected design: index or codec
+// positivity no longer controls the stamp.
+func TestVirtualProbeEvidenceArgsStampFollowsExplicitProvenance(t *testing.T) {
+	const candidateURI = "virtual://movie/tt-provenance?result=cand"
 	row := &models.MediaFile{
 		ID:                         41,
-		ContentID:                  "movie-tt-coupling",
+		ContentID:                  "movie-tt-provenance",
 		FilePath:                   candidateURI,
 		Container:                  "virtual",
 		VirtualOwnerInstallationID: 5,
@@ -32,42 +35,56 @@ func TestVirtualProbeEvidenceArgsStampOnlyForProbeEvidence(t *testing.T) {
 	cases := []struct {
 		name   string
 		probed *models.MediaFile
+		stamp  bool
 		want   bool
 	}{
 		{
-			name:   "probe-observed audio forces the stamp",
+			name:   "metadata-only write of probe-observed audio preserves the stamp",
 			probed: &models.MediaFile{AudioTracks: []models.AudioTrack{{Index: 1, Codec: "aac", Channels: 2, Language: "eng"}}},
-			want:   true,
-		},
-		{
-			name:   "probe-observed subtitle forces the stamp",
-			probed: &models.MediaFile{SubtitleTracks: []models.SubtitleTrack{{Index: 3, Codec: "subrip", Language: "eng"}}},
-			want:   true,
-		},
-		{
-			// The reviewer regression: synthesis carries a codec but no stream
-			// index, so it is a declared hint, not probe evidence.
-			name:   "synthesized declared audio does not force the stamp",
-			probed: &models.MediaFile{AudioTracks: declaredVirtualAudioTracks("aac", []string{"eng", "deu"}, "")},
+			stamp:  false,
 			want:   false,
 		},
 		{
-			name: "language-only hint inventory preserves the unstamped state",
+			// ffprobe numbers some streams 0; a metadata-only write must not
+			// treat a valid index-0 track as probe evidence either.
+			name:   "metadata-only write of a valid index-0 track preserves the stamp",
+			probed: &models.MediaFile{AudioTracks: []models.AudioTrack{{Index: 0, Codec: "aac", Channels: 2, Language: "eng"}}},
+			stamp:  false,
+			want:   false,
+		},
+		{
+			name:   "metadata-only write of synthesized declared audio preserves the stamp",
+			probed: &models.MediaFile{AudioTracks: declaredVirtualAudioTracks("aac", []string{"eng", "deu"}, "")},
+			stamp:  false,
+			want:   false,
+		},
+		{
+			name: "metadata-only write of hint-only inventory preserves the stamp",
 			probed: &models.MediaFile{
 				AudioTracks:    []models.AudioTrack{{Language: "eng"}},
 				SubtitleTracks: []models.SubtitleTrack{{Language: "eng"}},
 			},
-			want: false,
+			stamp: false,
+			want:  false,
 		},
 		{
-			name:   "empty inventory preserves the unstamped state",
+			name:   "successful probe stamps probe-observed audio",
+			probed: &models.MediaFile{AudioTracks: []models.AudioTrack{{Index: 1, Codec: "aac", Channels: 2, Language: "eng"}}},
+			stamp:  true,
+			want:   true,
+		},
+		{
+			// A successful probe that enumerated no tracks still commits its
+			// verdict; the stamp follows provenance, not inventory shape.
+			name:   "successful probe stamps an empty inventory too",
 			probed: &models.MediaFile{},
-			want:   false,
+			stamp:  true,
+			want:   true,
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			args, ok := h.virtualProbeEvidenceArgsForRow(context.Background(), row, candidateURI, tc.probed, false)
+			args, ok := h.virtualProbeEvidenceArgsForRow(context.Background(), row, candidateURI, tc.probed, tc.stamp)
 			if !ok {
 				t.Fatal("args builder refused the write")
 			}
@@ -341,5 +358,58 @@ func TestNonNegotiatingStartStillArmsDeferredProbe(t *testing.T) {
 	}
 	if next.DeferredProbe != nil {
 		t.Fatal("the next play on a stamped row re-armed a probe")
+	}
+}
+
+// TestDurableResumeDamperDeclinesWorkerAndServesDeclared is the damper half of
+// the arming wiring: an unstamped durable resume whose candidate already carries
+// a recent probe failure does not admit a worker (the budget was already spent)
+// and reports declared, not pending, so no session waits on a resolution nothing
+// will deliver. The cache-only recovery still runs; a cold cache leaves the row
+// for a later attempt once the damper lapses.
+func TestDurableResumeDamperDeclinesWorkerAndServesDeclared(t *testing.T) {
+	const candidateURI = "virtual://movie/tt-stamp-damper?result=cand-damper"
+	fx := newDeferredLifecycleFixture(t, 775, candidateURI)
+	fx.saveAttempt(t)
+	fx.handler.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(
+		func(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
+			t.Fatal("the durable-resume fast path must not fall back to the provider resolver")
+			return "", nil
+		})
+	probeCalled := false
+	fx.handler.VirtualPlaybackSourceProber = func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
+		probeCalled = true
+		return f, nil
+	}
+	// Arm the damper for this candidate before the start; the durable resume
+	// must share the declared fast path's admission decision.
+	key := virtualProbeFailureKey(candidateURI, 5)
+	virtualProbeFailures.mark(key)
+	t.Cleanup(func() { virtualProbeFailures.clear(key) })
+
+	expiresAt := time.Now().Add(3 * time.Hour)
+	file := withVirtualResumeVideoEvidence(&models.MediaFile{
+		ID:                         775,
+		ContentID:                  "movie-tt-stamp-damper",
+		FilePath:                   candidateURI,
+		Container:                  "virtual",
+		VirtualOwnerInstallationID: 5,
+		ResolvedURL:                "https://93.184.216.34/stream/token=stored",
+		ResolvedURLExpiresAt:       &expiresAt,
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/playback/start", nil)
+	resolved, err := fx.handler.resolveVirtualPlaybackSource(req, file, "profile-1", true, nil, "", "", 0, false)
+	if err != nil {
+		t.Fatalf("resolveVirtualPlaybackSource error: %v", err)
+	}
+	if resolved.Provenance != ProbeProvenanceDeclared {
+		t.Fatalf("provenance = %q, want declared (no worker will resolve a pending state)", resolved.Provenance)
+	}
+	if resolved.DeferredProbe != nil {
+		t.Fatal("damper-armed durable resume armed a worker; the probe budget was already spent")
+	}
+	if probeCalled {
+		t.Fatal("damper-armed durable resume probed despite the failure backoff")
 	}
 }

@@ -2737,10 +2737,19 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				if len(persistedResumeStored.RequestHeaders) > 0 {
 					probeCand.RequestHeaders = cloneHeaderMap(persistedResumeStored.RequestHeaders)
 				}
-				deferred := h.virtualDeferredProbeForUnstampedRow(attemptCtx, stickyKey, file, persistedResumeStored.URL, probeCand, oid)
+				deferred, damperDeclined := h.virtualDeferredProbeForUnstampedRow(attemptCtx, stickyKey, file, persistedResumeStored.URL, probeCand, oid)
+				// The probe-failure damper shares its admission decision with
+				// the declared fast path: a recent failure declines the worker
+				// and the cache-only recovery runs instead. No worker resolves
+				// the pending state then, so the plan is declared rather than
+				// pending; a fresh probe is retried once the damper lapses.
+				provenance := ProbeProvenancePending
+				if damperDeclined {
+					provenance = ProbeProvenanceDeclared
+				}
 				return &resolvedVirtualPlaybackSource{
 					URL: "", URI: cand.URI, OwnerID: oid, File: &transient,
-					ProbeSucceeded: false, Provenance: ProbeProvenancePending,
+					ProbeSucceeded: false, Provenance: provenance,
 					// Unranked: this path skipped the candidate list.
 					CandidateRank: -1, CandidateCount: -1,
 					DeferredProbe: deferred,
@@ -3939,14 +3948,6 @@ const (
 // probe (stampProbe=true) still stamps probe_updated_at so collection rows
 // converge to probed evidence instead of re-probing on every start.
 //
-// The stamp is coupled to the inventory written: when audio_tracks or
-// subtitle_tracks carry a probe-observed entry (a container stream index),
-// the row is stamped even on a write that did not ask for it, so real
-// inventory never persists alongside a NULL probe_updated_at. Synthesized
-// declared tracks carry a codec but no stream index, so they do not trigger
-// it: ClearProbe still clears the stamp, the row stays probe-eligible, and a
-// collection-owned row still preserves its own.
-//
 // Path adoption is skipped when a sibling row (same virtual owner and library)
 // already owns the target path, and when the candidate's own verdict is failed.
 // When RequireAdopt is requested, the whole write is atomic with that fence: the
@@ -4072,34 +4073,18 @@ UPDATE media_files SET
     WHEN NOT $13::boolean THEN probe_source
     ELSE 'virtual'
   END,
-  -- The stamp is coupled to the inventory being written: a probe-observed
-  -- audio/subtitle entry (its container stream index, which only ffprobe
-  -- records) is real inventory, and a row may never carry it alongside an
-  -- unstamped (NULL) probe timestamp. Without the coupling a metadata-only
-  -- writer (a stored-URL refresh) could persist real tracks while preserving a
-  -- NULL stamp, and the probe gate would then treat the row as never-probed
-  -- forever. A synthesized or declared track carries a codec but no stream
-  -- index, so a hint-only write still preserves the previous stamp and the row
-  -- stays probe-eligible. ClearProbe still clears, and a collection-owned row
-  -- still preserves its own stamp, both as before. The predicate matches
-  -- virtualTrackInventoryCarriesProbeEvidence: a positive integer index.
+  -- The stamp is controlled by explicit successful-probe provenance: the
+  -- caller sets the stamp flag only when the evidence it writes came from a
+  -- probe that succeeded (a fresh probe, a cache hit, or the durable deferred
+  -- write). It is never reconstructed from inventory shape, so a metadata-only
+  -- write (a stored-URL refresh, a rematch adoption) leaves the flag false and
+  -- preserves the existing stamp rather than advancing it from tracks it merely
+  -- copied. ClearProbe still clears, and a collection-owned row still preserves
+  -- its own stamp.
   probe_updated_at = CASE
     WHEN probe_source = 'virtual_collection' THEN probe_updated_at
     WHEN $31::boolean THEN NULL
-    WHEN NOT $13::boolean AND NOT (
-      EXISTS (
-        SELECT 1 FROM jsonb_array_elements(
-          CASE WHEN jsonb_typeof($2::jsonb) = 'array' THEN $2::jsonb ELSE '[]'::jsonb END
-        ) AS audio_entry(entry)
-        WHERE (entry->>'index') ~ '^[1-9][0-9]*$'
-      )
-      OR EXISTS (
-        SELECT 1 FROM jsonb_array_elements(
-          CASE WHEN jsonb_typeof($3::jsonb) = 'array' THEN $3::jsonb ELSE '[]'::jsonb END
-        ) AS subtitle_entry(entry)
-        WHERE (entry->>'index') ~ '^[1-9][0-9]*$'
-      )
-    ) THEN probe_updated_at
+    WHEN NOT $13::boolean THEN probe_updated_at
     ELSE GREATEST(clock_timestamp(), probe_updated_at + interval '1 microsecond')
   END,
   updated_at       = GREATEST(clock_timestamp(), updated_at + interval '1 microsecond')
@@ -4699,15 +4684,13 @@ func (h *PlaybackHandler) virtualProbeEvidenceArgsForRow(ctx context.Context, ca
 		HDR:              probed.HDR,
 		Bitrate:          probed.Bitrate,
 		Duration:         probed.Duration,
-		// A probe-observed audio/subtitle entry (a container stream index) is
-		// real inventory, so the write must carry the probe stamp even when the
-		// caller asked for a metadata-only write. Otherwise the row persists
-		// real tracks with a NULL probe timestamp and the probe gate re-probes
-		// it forever (the discovery wiring break). A synthesized or declared
-		// track has no stream index, so it does not force the stamp and the row
-		// stays probe-eligible. The SQL applies the same predicate as a guard
-		// for the writers that build their args directly.
-		StampProbe:     stampProbe || virtualTrackInventoryCarriesProbeEvidence(probed.AudioTracks, probed.SubtitleTracks),
+		// StampProbe is controlled by explicit successful-probe provenance: the
+		// caller passes true only when the evidence it writes came from a probe
+		// that succeeded (a fresh probe, a cache hit, or the durable deferred
+		// write). It is never inferred from inventory shape, so a metadata-only
+		// copy of existing tracks preserves the row's stamp instead of
+		// advancing it from tracks it did not measure.
+		StampProbe:     stampProbe,
 		UpdatedAt:      snap.UpdatedAt,
 		ProbeUpdatedAt: snap.ProbeUpdatedAt,
 		// The row's own identity, for the release-replacement gate when this
@@ -6264,16 +6247,26 @@ func allowDeferredProbe(deferProbe bool) bool {
 	return deferProbe
 }
 
-// virtualDeferredProbeForUnstampedRow builds the post-commit probe for a virtual
-// row that has never been probed (no probe stamp), so a start that serves the
-// row provisionally still hands the start path a worker to run after the
-// transport commits. Without it a direct-play validated start could serve a
-// codec-populated, unstamped row and arm no worker at all: the inventory
-// reported pending would never resolve to verified or failed, and only the
-// convergence watchdog would end it. It returns nil when a probe cannot run:
-// the row already carries a stamp, no prober is configured, or the resolved URL
-// is empty (nothing to enumerate). Value copies are captured now so a later
-// mutation of the request's file cannot change what is probed.
+// virtualDeferredProbeForUnstampedRow decides and builds the post-commit probe
+// for a virtual row that has never been probed (no probe stamp), so a start
+// that serves the row provisionally still hands the start path a worker to run
+// after the transport commits. Without it a direct-play validated start could
+// serve a codec-populated, unstamped row and arm no worker at all: the
+// inventory reported pending would never resolve to verified or failed, and
+// only the convergence watchdog would end it.
+//
+// Admission shares the declared fast path's probe-failure damper: when a recent
+// failure already consumed this candidate's probe budget the worker is not
+// admitted (declined=true). The cache-only recovery still runs, because an
+// inner probe may have completed after an outer timeout and landed its
+// evidence; the caller then serves declared metadata with no pending lifecycle
+// instead of promising a resolution no worker will deliver. Otherwise the probe
+// is returned (declined=false).
+//
+// It declines without a probe when the row already carries a stamp, no prober
+// is configured, or the resolved URL is empty (nothing to enumerate). Value
+// copies are captured now so a later mutation of the request's file cannot
+// change what is probed.
 func (h *PlaybackHandler) virtualDeferredProbeForUnstampedRow(
 	ctx context.Context,
 	stickyKey string,
@@ -6281,23 +6274,32 @@ func (h *PlaybackHandler) virtualDeferredProbeForUnstampedRow(
 	streamURL string,
 	cand VirtualPlaybackStream,
 	oid int,
-) *virtualDeferredProbeV3 {
+) (*virtualDeferredProbeV3, bool) {
 	if h == nil || file == nil {
-		return nil
+		return nil, false
 	}
 	if file.ProbeUpdatedAt != nil {
-		return nil
+		return nil, false
 	}
 	if h.VirtualPlaybackSourceProber == nil && h.VirtualPlaybackSourceProberWithHeaders == nil {
-		return nil
+		return nil, false
 	}
 	if strings.TrimSpace(streamURL) == "" {
-		return nil
+		return nil, false
 	}
 	probeTransient := cloneVirtualProbeTransient(*file)
 	// Zero the duration so the deferred probe measures the empirical duration
 	// instead of inheriting the catalog value.
 	probeTransient.Duration = 0
+	if virtualProbeFailures.recent(virtualProbeFailureKey(cand.URI, oid)) {
+		// Damper armed: a recent failure already consumed the probe budget, so
+		// no worker is admitted. An inner probe may still have completed and
+		// landed in the cache, so recover it before declining; the caller
+		// serves declared metadata rather than a pending state nothing will
+		// resolve.
+		h.recoverVirtualProbeFromCache(ctx, file, streamURL, probeTransient, cand, oid)
+		return nil, true
+	}
 	return &virtualDeferredProbeV3{
 		stickyKey:              stickyKey,
 		file:                   file,
@@ -6306,7 +6308,7 @@ func (h *PlaybackHandler) virtualDeferredProbeForUnstampedRow(
 		cand:                   cand,
 		expectedRuntimeMinutes: h.virtualExpectedRuntimeMinutes(ctx, file),
 		ownerID:                oid,
-	}
+	}, false
 }
 
 // mergeVirtualCandidateTracks supplements probed virtual file tracks with
@@ -7120,28 +7122,6 @@ func marshalTracksJSON(tracks any) []byte {
 		return []byte("[]")
 	}
 	return data
-}
-
-// virtualTrackInventoryCarriesProbeEvidence reports whether an audio or
-// subtitle inventory holds at least one probe-observed entry: a track with a
-// real container stream index, which only ffprobe records. Provider
-// registration and declared-track synthesis (mergeVirtualCandidateLanguages,
-// declaredVirtualAudioTracks) write language/codec/channel placeholders with no
-// stream index, so they are hints and must not force the stamp even though they
-// carry a codec. A probed track that ffprobe numbered 0 keeps its NULL stamp and
-// is still probed on the next start, so the predicate never over-stamps.
-func virtualTrackInventoryCarriesProbeEvidence(audio []models.AudioTrack, subtitles []models.SubtitleTrack) bool {
-	for _, track := range audio {
-		if track.Index > 0 {
-			return true
-		}
-	}
-	for _, track := range subtitles {
-		if track.Index > 0 {
-			return true
-		}
-	}
-	return false
 }
 
 // sanitizeTrackSlice ensures the value is a slice/array, not a scalar.
