@@ -2472,6 +2472,14 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	}
 	// A refused progressive remux is escalated before the decision is logged or
 	// a session is opened, so the logged route is the one that will actually run.
+	//
+	// The mark below isolates the escalation helper itself. Everything between
+	// the planning mark and here — the subtitle/audio in-place degrades and
+	// the alternate-version hunt with its per-alternate resolves — is
+	// post-plan recovery, measured by the preceding mark: without that split
+	// a 13s recovery walk (Citizen Vigilante: three ~3.2s forced re-lists)
+	// misattributes onto the escalation helper, which is usually ~0ms.
+	timings.mark("post_plan_recovery")
 	escalated, escalateErr := h.escalateRefusedProgressiveRemuxV3(r.Context(), headerAuthenticatedMediaV3(req.ClientFeatures),
 		func() playback.PlannerInputV3 {
 			input := h.plannerInputV3(r.Context(), req, requestedFile, effectiveFile, audioIndex, nil, resolutionProvenance)

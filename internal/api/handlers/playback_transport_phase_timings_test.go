@@ -72,6 +72,52 @@ func TestTransportPhaseTimingsSplitTheCommit(t *testing.T) {
 	}
 }
 
+// TestStartTimingsSplitPostPlanRecovery pins the Citizen Vigilante
+// attribution fix: the post_plan_recovery mark isolates the
+// subtitle/audio-degrade + alternate-hunt window from the remux-escalation
+// helper, so a 13s recovery walk cannot misattribute onto an ~0ms
+// escalation. Both marks must exist on the line, in order, with the
+// recovery delta holding the window and the escalation delta near zero when
+// the helper early-returns.
+func TestStartTimingsSplitPostPlanRecovery(t *testing.T) {
+	timings := newPlaybackStartTimingsV3()
+	timings.mark("planning")
+	time.Sleep(2 * time.Millisecond)
+	timings.mark("post_plan_recovery")
+	timings.mark("remux_escalation")
+
+	attrs := phaseAttrs(t, timings)
+	recovery, ok := attrs["post_plan_recovery_ms"]
+	if !ok {
+		t.Fatalf("post_plan_recovery_ms missing; attrs=%v", attrs)
+	}
+	if _, ok := attrs["remux_escalation_ms"]; !ok {
+		t.Fatalf("remux_escalation_ms missing; attrs=%v", attrs)
+	}
+	if got := recovery.(int64); got < 1 {
+		t.Fatalf("post_plan_recovery_ms = %d, want >= 1 (the window must hold the recovery walk)", got)
+	}
+	// Order: planning, then recovery, then escalation. The flat slice keeps
+	// insertion order, so the recovery key must sit between the other two.
+	var planningIdx, recoveryIdx, escalationIdx = -1, -1, -1
+	for i := 0; i < len(timings.attrs); i += 2 {
+		switch timings.attrs[i] {
+		case "planning_ms":
+			planningIdx = i
+		case "post_plan_recovery_ms":
+			recoveryIdx = i
+		case "remux_escalation_ms":
+			escalationIdx = i
+		}
+	}
+	if planningIdx < 0 || recoveryIdx < 0 || escalationIdx < 0 {
+		t.Fatalf("marks out of order: planning=%d recovery=%d escalation=%d", planningIdx, recoveryIdx, escalationIdx)
+	}
+	if planningIdx > recoveryIdx || recoveryIdx > escalationIdx {
+		t.Fatalf("marks out of order: planning=%d recovery=%d escalation=%d", planningIdx, recoveryIdx, escalationIdx)
+	}
+}
+
 // TestTransportPhaseTimingsRequireARecorder pins that recording without an
 // installed recorder is a no-op, so an uninstalled path pays nothing and cannot
 // panic.
