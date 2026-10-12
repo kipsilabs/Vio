@@ -62,6 +62,68 @@ func TestVirtualProbeCacheReusesRotatingCredentialsForExactResult(t *testing.T) 
 	}
 }
 
+// TestVirtualProbeCacheSeparatesExpectedAudioExpectations pins the completeness
+// gate against a cache replay. A video-with-subtitles-but-no-audio enumeration
+// is a complete answer for an item that declares no audio, so it is cached; it
+// is a partial read for an item that declares audio, so that expectation must
+// re-run the real probe (and see the gate's ErrVirtualProbePartial) instead of
+// being served the thin entry. Without the expected-audio signal in the key the
+// second probe returns the first result as verified and the gate never runs.
+func TestVirtualProbeCacheSeparatesExpectedAudioExpectations(t *testing.T) {
+	cache := NewVirtualProbeCache(time.Minute, 8)
+	base := &models.MediaFile{ID: 7, FilePath: "virtual://movie/tt7?result=stable-result", VirtualOwnerInstallationID: 9}
+	thin := &models.MediaFile{
+		ID:             base.ID,
+		FilePath:       base.FilePath,
+		VideoTracks:    []models.VideoTrack{{Codec: "hevc"}},
+		SubtitleTracks: []models.SubtitleTrack{{Index: 2, Codec: "ass", Language: "fre"}},
+	}
+	var videoOnlyCalls atomic.Int32
+	if _, err := cache.Probe(context.Background(), "https://provider.example/video.mkv?token=one", base, func(_ context.Context, _ string, _ *models.MediaFile) (*models.MediaFile, error) {
+		videoOnlyCalls.Add(1)
+		return cloneVirtualProbeFile(thin), nil
+	}); err != nil {
+		t.Fatalf("video-only probe: %v", err)
+	}
+	if videoOnlyCalls.Load() != 1 {
+		t.Fatalf("video-only probe calls=%d, want 1", videoOnlyCalls.Load())
+	}
+
+	declared := cloneVirtualProbeFile(base)
+	declared.CodecAudio = "eac3"
+	var declaredCalls atomic.Int32
+	_, err := cache.Probe(context.Background(), "https://provider.example/video.mkv?token=two", declared, func(_ context.Context, _ string, _ *models.MediaFile) (*models.MediaFile, error) {
+		declaredCalls.Add(1)
+		return nil, ErrVirtualProbePartial
+	})
+	if declaredCalls.Load() != 1 {
+		t.Fatalf("declared-audio probe calls=%d, want 1: the cache replayed the video-only result and bypassed the gate", declaredCalls.Load())
+	}
+	if !errors.Is(err, ErrVirtualProbePartial) {
+		t.Fatalf("declared-audio probe error = %v, want ErrVirtualProbePartial", err)
+	}
+
+	// The same expectation still reuses its own entry, so fast startup is not
+	// traded away for the gate: a complete declared-audio probe is measured once
+	// and served from cache afterwards.
+	var repeatCalls atomic.Int32
+	complete := cloneVirtualProbeFile(thin)
+	complete.AudioTracks = []models.AudioTrack{{Index: 1, Codec: "eac3", Channels: 6}}
+	reprobe := func(_ context.Context, _ string, _ *models.MediaFile) (*models.MediaFile, error) {
+		repeatCalls.Add(1)
+		return cloneVirtualProbeFile(complete), nil
+	}
+	if _, err := cache.Probe(context.Background(), "https://provider.example/video.mkv?token=three", declared, reprobe); err != nil {
+		t.Fatalf("declared probe: %v", err)
+	}
+	if _, err := cache.Probe(context.Background(), "https://provider.example/video.mkv?token=four", declared, reprobe); err != nil {
+		t.Fatalf("repeat declared probe: %v", err)
+	}
+	if repeatCalls.Load() != 1 {
+		t.Fatalf("declared-audio probe calls=%d, want 1 for the same expectation (cache disabled fast startup)", repeatCalls.Load())
+	}
+}
+
 func TestVirtualProbeCacheIsBounded(t *testing.T) {
 	cache := NewVirtualProbeCache(time.Minute, 2)
 	probe := func(_ context.Context, _ string, input *models.MediaFile) (*models.MediaFile, error) {

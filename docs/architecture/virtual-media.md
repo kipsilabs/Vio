@@ -54,6 +54,14 @@ empty subtitle set is a valid complete answer; it is never a partial signal.
 Finding one audio track does not by itself prove the rest of the table was read,
 so the probe result is not allowed to be its own completeness oracle.
 
+The completeness gate only holds if it actually runs. The playback probe cache
+(`scanner.VirtualProbeCache`) is keyed on the expected-audio signal as well as
+the source, so a result measured under a video-only expectation is never replayed
+to a probe that expects audio. Without that, a thin enumeration cached for a
+video-only input would be served to an audio-declaring row — and the cache-only
+recovery path (`virtualProbeFromCache`) would persist it as verified — while the
+gate never saw it.
+
 A partial probe is not a verdict about the candidate's bytes. The resolve serves
 the candidate's provisional plan at `pending` without consuming the probe-failure
 budget or releasing the sticky pin, and the deferred lifecycle records no outcome

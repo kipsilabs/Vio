@@ -179,7 +179,16 @@ func virtualProbeCacheKey(sourceURL string, file *models.MediaFile) string {
 			streamIdentity = providerURL.String()
 		}
 	}
-	digest := sha256.Sum256([]byte(strconv.Itoa(fileID) + "\x00" + strconv.Itoa(ownerID) + "\x00" + canonical + "\x00" + streamIdentity))
+	// The completeness gate's verdict depends on the input's expected-audio
+	// signal: a video-without-audio enumeration is complete for an item that
+	// declares no audio and partial for one that does. A cached result measured
+	// under one expectation must therefore never be replayed to a probe under
+	// the other, or a thin enumeration cached for a video-only input would be
+	// served — and, through the cache-only recovery path, persisted as verified —
+	// to a row that declares audio without the gate ever seeing it. Fold the
+	// signal into the key so both expectations re-run the real probe.
+	expectAudio := virtualSourceExpectsAudio(file)
+	digest := sha256.Sum256([]byte(strconv.Itoa(fileID) + "\x00" + strconv.Itoa(ownerID) + "\x00" + canonical + "\x00" + streamIdentity + "\x00" + strconv.FormatBool(expectAudio)))
 	return hex.EncodeToString(digest[:])
 }
 

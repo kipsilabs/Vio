@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -306,6 +307,81 @@ func TestDeferredProbeCompleteEnumerationVerifies(t *testing.T) {
 	)
 	if outcome != probeOutcomeVerified {
 		t.Fatalf("outcome = %q, want verified for a complete enumeration", outcome)
+	}
+	if verifiedFileID != fx.session.MediaFileID {
+		t.Fatalf("verifiedFileID = %d, want the committed row %d", verifiedFileID, fx.session.MediaFileID)
+	}
+	if got := fx.saverCallCount(); got != 1 {
+		t.Fatalf("complete probe committed %d evidence writes, want 1", got)
+	}
+}
+
+// TestDeferredProbeDeclaredAudioHoldsPendingUntilProbed pins the four-second
+// thin-verify timeline against the real enumerator. The row declares FRE audio,
+// so a probe that returns video and one forced French subtitle but no audio is a
+// partial read: the deferred probe must hold the session pending, write no
+// evidence, and arm no failure damper. Only a later enumeration that actually
+// carries probed audio verifies.
+func TestDeferredProbeDeclaredAudioHoldsPendingUntilProbed(t *testing.T) {
+	const uri = "virtual://series/tt-declared-audio?result=cand-1"
+	fx := newDeferredLifecycleFixture(t, 953, uri)
+	probeKey := virtualProbeFailureKey(uri, 5)
+	virtualProbeFailures.clear(probeKey)
+	virtualProbeFailures.clearPartial(probeKey)
+	t.Cleanup(func() {
+		virtualProbeFailures.clear(probeKey)
+		virtualProbeFailures.clearPartial(probeKey)
+	})
+
+	ffprobe := filepath.Join(t.TempDir(), "ffprobe")
+	writeExecutableScript(t, ffprobe, "#!/bin/sh\nprintf '%s' '{\"format\":{\"format_name\":\"matroska\",\"duration\":\"3600\"},\"streams\":[{\"index\":0,\"codec_name\":\"hevc\",\"codec_type\":\"video\",\"width\":1920,\"height\":1080},{\"index\":3,\"codec_name\":\"ass\",\"codec_type\":\"subtitle\",\"disposition\":{\"forced\":1},\"tags\":{\"language\":\"fre\"}}]}'\n")
+	fx.handler.VirtualPlaybackSourceProber = func(ctx context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
+		return scanner.ProbeVirtualSource(ctx, ffprobe, "", "http://127.0.0.1/source", f, nil)
+	}
+
+	// The deferred probe input is the row (declared FRE audio), as the start path
+	// builds it before enqueuing the probe.
+	declared := *fx.source
+	declared.FilePath = uri
+	declared.CodecAudio = "aac"
+	declared.AudioTracks = []models.AudioTrack{{Index: -1, Language: "FRE", Codec: "aac", Channels: 2, Default: true}}
+
+	pending := fx.job(uri)
+	pending.cand.AudioLanguages = []string{"FRE"}
+	pending.probeTransient = &declared
+	outcome, verifiedFileID := fx.handler.probeVirtualSourceAndPersistWith(
+		context.Background(),
+		pending.stickyKey, pending.file, pending.streamURL,
+		*pending.probeTransient, pending.cand, pending.expectedRuntimeMinutes, pending.ownerID,
+		true, nil,
+	)
+	if outcome != probeOutcomePartial {
+		t.Fatalf("outcome = %q, want partial: declared audio must not verify a video-without-audio enumeration", outcome)
+	}
+	if verifiedFileID != 0 {
+		t.Fatalf("verifiedFileID = %d, want 0: a partial probe commits nothing", verifiedFileID)
+	}
+	if got := fx.saverCallCount(); got != 0 {
+		t.Fatalf("partial probe attempted %d evidence writes, want 0", got)
+	}
+	if virtualProbeFailures.recent(probeKey) {
+		t.Fatal("a partial enumeration armed the failure damper")
+	}
+
+	// The audio lands on a later enumeration: the same row now verifies, so the
+	// hold is a retry state, not a terminal failure.
+	writeExecutableScript(t, ffprobe, "#!/bin/sh\nprintf '%s' '{\"format\":{\"format_name\":\"matroska\",\"duration\":\"3600\"},\"streams\":[{\"index\":0,\"codec_name\":\"hevc\",\"codec_type\":\"video\",\"width\":1920,\"height\":1080},{\"index\":1,\"codec_name\":\"eac3\",\"codec_type\":\"audio\",\"channels\":6,\"tags\":{\"language\":\"fre\"}},{\"index\":3,\"codec_name\":\"ass\",\"codec_type\":\"subtitle\",\"disposition\":{\"forced\":1},\"tags\":{\"language\":\"fre\"}}]}'\n")
+	verified := fx.job(uri)
+	verified.cand.AudioLanguages = []string{"FRE"}
+	verified.probeTransient = &declared
+	outcome, verifiedFileID = fx.handler.probeVirtualSourceAndPersistWith(
+		context.Background(),
+		verified.stickyKey, verified.file, verified.streamURL,
+		*verified.probeTransient, verified.cand, verified.expectedRuntimeMinutes, verified.ownerID,
+		true, nil,
+	)
+	if outcome != probeOutcomeVerified {
+		t.Fatalf("outcome = %q, want verified once probed audio lands", outcome)
 	}
 	if verifiedFileID != fx.session.MediaFileID {
 		t.Fatalf("verifiedFileID = %d, want the committed row %d", verifiedFileID, fx.session.MediaFileID)
