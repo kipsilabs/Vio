@@ -172,14 +172,21 @@ func isLoopbackPrepareInput(inputPath string) bool {
 
 // PrepareFile routes an artifact job to a compatible node or allowed local fallback.
 func (p *NodeAwarePreparer) PrepareFile(ctx context.Context, artifactID string, opts playback.TranscodeOpts, outputPath string) (PreparedArtifact, error) {
-	// A provider-backed (virtual) title resolves to the playback relay, an
-	// in-process listener bound to 127.0.0.1:0 on this host. No transcode node
-	// can reach that address: a node handed the URL would open it against its
-	// own loopback interface and fetch nothing. Constrain such a job to local
-	// execution here, at the one place a node URL is ever built, rather than
-	// send an unreachable input. There is no authenticated node-reachable
-	// transport for the relay yet; if one lands, it belongs alongside this
-	// decision.
+	// A provider-backed (virtual) download resolves its input through
+	// ResolveVirtualDownloadInput, which returns the playback relay
+	// registration: an in-process listener bound to 127.0.0.1:0 on this host.
+	// That concrete address is node-unreachable — a node handed it would open
+	// its own loopback interface and fetch nothing — so such a job is confined
+	// to API-host execution here, at the one place a node URL is ever built.
+	//
+	// This is a property of the loopback registration, not a blanket ban on
+	// remote relay preparation. The fork already dispatches node-reachable relay
+	// URLs (the `/source/<token>/...` shape transcodenode's path authorizer
+	// approves) to pooled worker nodes; a prepare input with that reachable
+	// shape is not loopback and falls through to the dispatch path below
+	// unchanged. Should the download path ever hand us a node-reachable relay
+	// URL, the ordinary route below already carries it, so no separate
+	// transport is required for remote preparation.
 	if isLoopbackPrepareInput(opts.InputPath) {
 		if !p.LocalFallbackAllowed(ctx) {
 			return PreparedArtifact{}, errors.New("a provider-backed download can only be prepared on the API host, where local download transcoding is disabled")

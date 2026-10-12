@@ -1049,6 +1049,36 @@ func TestRemotePrepareStillDispatchesReachableInput(t *testing.T) {
 	}
 }
 
+// A relay URL on a node-reachable host is not the loopback registration shape:
+// it carries the same `/source/<token>/...` path the transcode node path
+// authorizer approves, so it must dispatch to a worker node rather than be
+// forced local. This reuses the fork's remote relay dispatch for download
+// preparation, so only the loopback registration is API-host-only.
+func TestRemotePrepareDispatchesNodeReachableRelayURL(t *testing.T) {
+	pool := nodepool.NewTranscodePool()
+	pool.SetNodes([]*nodepool.Node{{ID: 34, URL: "http://transcode-node", Enabled: true, Healthy: true}})
+	local := &recordingEncodePreparer{}
+	cfg := &config.Config{}
+	cfg.Auth.JWTSecret = "secret"
+	p := NewNodeAwarePreparer(local, nodepool.NewPlanner(nodepool.NewProxyPool(), pool), func() *config.Config { return cfg })
+	remote := &recordingRemotePreparer{}
+	p.remote = remote
+
+	opts := playback.TranscodeOpts{
+		InputPath:          "http://api.internal:9443/source/abc123/Movie.mp4",
+		CanonicalInputPath: "virtual://movie/tt1?result=a",
+	}
+	if _, err := p.PrepareFile(context.Background(), "artifact-relay-reachable", opts, "/artifacts/job.mp4"); err != nil {
+		t.Fatalf("PrepareFile() error = %v", err)
+	}
+	if remote.calls != 1 || local.calls != 0 {
+		t.Fatalf("remote calls=%d local calls=%d, want a node-reachable relay URL dispatched remotely", remote.calls, local.calls)
+	}
+	if remote.request.InputPath != "http://api.internal:9443/source/abc123/Movie.mp4" {
+		t.Fatalf("node input = %q, want the node-reachable relay URL unchanged", remote.request.InputPath)
+	}
+}
+
 // A loopback job is refused, not silently misrouted, when the operator has
 // disabled API-host transcoding: no other executor can reach the input.
 func TestRemotePrepareLoopbackRefusedWhenLocalFallbackDisabled(t *testing.T) {

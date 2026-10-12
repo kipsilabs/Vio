@@ -268,3 +268,139 @@ it("repopulates the list when the versions refresh", async () => {
   expect(screen.queryByRole("button", { name: /Prepare download/i })).toBeNull();
   expect(screen.getByRole("button", { name: /1080p/ })).toBeEnabled();
 });
+
+it("ignores a poll response that lands after the preparation is cancelled", async () => {
+  mocks.create.mockResolvedValue({ id: "dl_late_cancel", status: "preparing" });
+  let resolvePoll: (entry: unknown) => void = () => undefined;
+  mocks.poll.mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        resolvePoll = resolve;
+      }),
+  );
+  await openVirtualPanel();
+
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: /Prepare download/i }));
+  });
+  await vi.waitFor(() => expect(mocks.poll).toHaveBeenCalled());
+
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: /^Cancel$/i }));
+  });
+  expect(mocks.remove).toHaveBeenCalledWith("dl_late_cancel");
+  expect(screen.queryByText(/Preparing your download/i)).toBeNull();
+
+  // The read was still in flight when the user cancelled; its late reply must
+  // not restore readiness over the cancel.
+  await act(async () => {
+    resolvePoll({ id: "dl_late_cancel", status: "ready" });
+  });
+
+  expect(screen.queryByRole("button", { name: /Save file/i })).toBeNull();
+  expect(screen.queryByText(/Preparing your download/i)).toBeNull();
+  expect(mocks.toastError).not.toHaveBeenCalled();
+});
+
+it("ignores a poll response that lands after the versions refresh", async () => {
+  mocks.create.mockResolvedValue({ id: "dl_late_refresh", status: "preparing" });
+  let resolvePoll: (entry: unknown) => void = () => undefined;
+  mocks.poll.mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        resolvePoll = resolve;
+      }),
+  );
+  const { rerender } = render(
+    <DownloadVersionPicker
+      open
+      onOpenChange={() => undefined}
+      versions={[virtualMovie]}
+      createTarget={createTarget}
+    />,
+  );
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: /1080p/ }));
+  });
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: /Prepare download/i }));
+  });
+  await vi.waitFor(() => expect(mocks.poll).toHaveBeenCalled());
+
+  const refreshed = {
+    ...virtualMovie,
+    file_id: 77,
+    file_path: "virtual://movie/tt1?result=b",
+  } as FileVersion;
+  await act(async () => {
+    rerender(
+      <DownloadVersionPicker
+        open
+        onOpenChange={() => undefined}
+        versions={[refreshed]}
+        createTarget={createTarget}
+      />,
+    );
+  });
+  expect(screen.queryByText(/Preparing your download/i)).toBeNull();
+
+  // The refresh reset the panel; the superseded read's reply must not reopen
+  // readiness against the new file list.
+  await act(async () => {
+    resolvePoll({ id: "dl_late_refresh", status: "ready" });
+  });
+
+  expect(screen.queryByRole("button", { name: /Save file/i })).toBeNull();
+  expect(screen.getByRole("button", { name: /1080p/ })).toBeEnabled();
+  expect(mocks.toastError).not.toHaveBeenCalled();
+});
+
+it("serializes poll reads so a slow response is not overtaken", async () => {
+  vi.useFakeTimers();
+  try {
+    mocks.create.mockResolvedValue({ id: "dl_serial", status: "preparing" });
+    const resolvers: Array<(entry: unknown) => void> = [];
+    mocks.poll.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolvers.push(resolve);
+        }),
+    );
+    render(
+      <DownloadVersionPicker
+        open
+        onOpenChange={() => undefined}
+        versions={[virtualMovie]}
+        createTarget={createTarget}
+      />,
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /1080p/ }));
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Prepare download/i }));
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(mocks.poll).toHaveBeenCalledTimes(1);
+
+    // Time passes while the first read is still open: no second read stacks up.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(6000);
+    });
+    expect(mocks.poll).toHaveBeenCalledTimes(1);
+
+    // Settling the first read schedules exactly one follow-up.
+    await act(async () => {
+      resolvers[0]?.({ id: "dl_serial", status: "preparing" });
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000);
+    });
+    expect(mocks.poll).toHaveBeenCalledTimes(2);
+  } finally {
+    vi.useRealTimers();
+  }
+});

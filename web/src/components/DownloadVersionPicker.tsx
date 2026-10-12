@@ -159,11 +159,16 @@ export default function DownloadVersionPicker({
   // The chosen version's name, retained so a later poll can suggest it as the
   // saved filename when the server does not provide one.
   const pendingFilenameRef = useRef("");
+  // Fences every polling state update. Opening, closing, a versions refresh,
+  // cancelling, or a terminal poll result advances it, so a read that resolves
+  // after the action cannot restore obsolete readiness or a refusal.
+  const pollGeneration = useRef(0);
 
   // A reopen or a versions replacement invalidates any in-flight work and any
   // prepared selection: rows become clickable again and no stale save link
   // survives to be clicked against the wrong file.
   useLayoutEffect(() => {
+    pollGeneration.current += 1;
     abortRef.current?.abort();
     abortRef.current = null;
     prepareAbortRef.current?.abort();
@@ -179,6 +184,7 @@ export default function DownloadVersionPicker({
     setPreparing(null);
     setVirtualReady(null);
     return () => {
+      pollGeneration.current += 1;
       abortRef.current?.abort();
       abortRef.current = null;
       prepareAbortRef.current?.abort();
@@ -199,18 +205,27 @@ export default function DownloadVersionPicker({
 
   // Poll a preparing virtual download until the artifact is ready or refused.
   // The effect is keyed on the download id so a status update on the row does
-  // not restart the interval.
+  // not restart the poll. Reads are serialized: the next tick is scheduled only
+  // after the previous read settles, so a slow response is never overtaken by a
+  // later one. Every update is fenced by the generation captured when the poll
+  // started, so a reply that lands after a cancel, a refresh, a reopen, or a
+  // terminal result is dropped instead of restoring obsolete state.
   const preparingId = preparing?.id ?? null;
   useEffect(() => {
     if (!preparingId) return;
+    const generation = ++pollGeneration.current;
     const controller = new AbortController();
-    const poll = async () => {
+    const isCurrent = () => pollGeneration.current === generation && !controller.signal.aborted;
+    let timer: number | undefined;
+    async function poll(): Promise<void> {
       let entry: PreparedDownloadEntry | null = null;
       try {
         entry = await getPreparedDownload(preparingId, controller.signal);
       } catch {
-        return; // transient read failure: try again on the next tick
+        if (isCurrent()) timer = window.setTimeout(() => void poll(), 2000);
+        return;
       }
+      if (!isCurrent()) return;
       if (!entry) {
         // A per-entry 404 means the row is gone, not that it rotated off a
         // page: stop polling and report a terminal refusal.
@@ -234,13 +249,14 @@ export default function DownloadVersionPicker({
         setRefusalMessage(message);
         toast.error(message);
         setPreparing(null);
+        return;
       }
-    };
-    const timer = window.setInterval(() => void poll(), 2000);
+      timer = window.setTimeout(() => void poll(), 2000);
+    }
     void poll();
     return () => {
       controller.abort();
-      window.clearInterval(timer);
+      if (timer !== undefined) window.clearTimeout(timer);
     };
   }, [preparingId]);
 
@@ -339,6 +355,9 @@ export default function DownloadVersionPicker({
 
   const handleCancelPrepare = async () => {
     const id = preparing?.id;
+    // Fence any read already in flight before the row is removed, so a response
+    // that resolves after the cancel cannot restore readiness or a refusal.
+    pollGeneration.current += 1;
     setPreparing(null);
     if (!id) return;
     try {
