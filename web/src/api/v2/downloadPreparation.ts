@@ -272,7 +272,14 @@ export async function readBoundedSaveBlob(
     }
     chunks.push(value);
   }
-  return new Blob(chunks);
+  // Merge into one buffer so the Blob is a single, well-typed part.
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new Blob([merged]);
 }
 
 /** The user cancelled the browser's save picker; this is not an error to report. */
