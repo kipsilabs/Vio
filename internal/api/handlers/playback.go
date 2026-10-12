@@ -1892,8 +1892,14 @@ func (h *PlaybackHandler) persistStopAndHistory(ctx context.Context, session *pl
 	}
 
 	file, err := h.progressPersistenceFile(ctx, session)
+	if err != nil {
+		// The row this stop belongs to could not be resolved, so the history
+		// write did not run. Report it so the v2 finalization leaves the stop
+		// replayable instead of marking a missing history row complete.
+		return watchstate.PlaybackStopResult{}, err
+	}
 	targetID := playbackProgressTarget(file)
-	if err != nil || targetID == "" {
+	if targetID == "" {
 		return watchstate.PlaybackStopResult{}, nil
 	}
 
@@ -2115,7 +2121,7 @@ func cancelOnEither(primary, secondary context.Context) (context.Context, contex
 }
 
 func (h *PlaybackHandler) finalizeSessionStop(ctx context.Context, session *playback.Session, syncNow bool, syncReason string, userInitiated bool) {
-	h.finalizeSessionStopWithResult(ctx, session, syncNow, syncReason, userInitiated, "")
+	_, _ = h.finalizeSessionStopWithResult(ctx, session, syncNow, syncReason, userInitiated, "")
 }
 
 // finalizeSessionStopWithResult is finalizeSessionStop reporting the history
@@ -2289,7 +2295,7 @@ func (h *PlaybackHandler) handleFinishedSession(ctx context.Context, session *pl
 		ctx = context.Background()
 	}
 	// Clients often drop the connection right after reporting a stop.
-	h.recordStopHistory(context.WithoutCancel(ctx), session, "")
+	_, _ = h.recordStopHistory(context.WithoutCancel(ctx), session, "")
 }
 
 func playbackProgressTarget(file *models.MediaFile) string {

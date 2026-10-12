@@ -399,7 +399,7 @@ func TestStopTeardownDurableWritesSurviveSlowStartEffect(t *testing.T) {
 		}
 		h.v3StartEffectsPending = map[string]*playbackStartSideEffectsStateV3{session.ID: state}
 
-		h.finalizeSessionStopWithResult(context.Background(), session, false, "", true, "")
+		_, _ = h.finalizeSessionStopWithResult(context.Background(), session, false, "", true, "")
 
 		if !adminStore.deleted[session.ID] {
 			t.Fatalf("durable session delete did not run after a slow start effect (calls=%d)", adminStore.deleteCalls)
