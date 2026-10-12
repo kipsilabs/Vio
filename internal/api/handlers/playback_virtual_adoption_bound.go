@@ -232,10 +232,10 @@ func (h *PlaybackHandler) markVirtualAdoptionTerminalRefusal(ctx context.Context
 	if err := h.VirtualCandidateFailMarker(ctx, row.ID, row.FilePath, row.FailedAt); err != nil {
 		slog.WarnContext(ctx, "virtual adoption terminal refusal was not persisted; the row keeps its own failed_at state",
 			"component", "api", "file_id", row.ID, "candidate_path", row.FilePath,
-			"reason", reason, virtualEvidenceLogKeyError, err)
+			virtualEvidenceLogKeyReason, reason, virtualEvidenceLogKeyError, err)
 		return false
 	}
 	slog.ErrorContext(ctx, "virtual adoption terminal refusal persisted",
-		"component", "api", "file_id", row.ID, "candidate_path", row.FilePath, "reason", reason)
+		"component", "api", "file_id", row.ID, "candidate_path", row.FilePath, virtualEvidenceLogKeyReason, reason)
 	return true
 }

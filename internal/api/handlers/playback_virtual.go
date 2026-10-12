@@ -4356,7 +4356,7 @@ func ExecVirtualFileMetadataUpdateResult(ctx context.Context, db VirtualFileMeta
 				slog.WarnContext(ctx, "virtual probe evidence persist refused: required identity adoption matched no row",
 					"component", "api", "file_id", args.FileID, "adopt_path", args.AdoptPath,
 					"expected_path", args.ExpectedFilePath,
-					"reason", reason, "consecutive_refusals", refusals,
+					virtualEvidenceLogKeyReason, reason, "consecutive_refusals", refusals,
 					"refusal_bound", virtualAdoptionRefusalBound,
 					"bound_reached", refusals >= virtualAdoptionRefusalBound)
 				return VirtualFileMetadataUpdateResult{}, fmt.Errorf("%w: candidate %s was not adopted", errVirtualAdoptIdentityNotPersisted, args.AdoptPath)
@@ -4586,7 +4586,7 @@ func (h *PlaybackHandler) virtualProbeEvidenceRotateTarget(ctx context.Context, 
 		attrs := []any{
 			"component", "api", "file_id", catalogFile.ID, "candidate_uri", resolvedPath,
 			"row_path", catalogFile.FilePath, "probe_source", catalogFile.ProbeSource,
-			"reason", virtualProbeRefusalOwnerLookupFailed, virtualEvidenceLogKeyError, ownerErr,
+			virtualEvidenceLogKeyReason, virtualProbeRefusalOwnerLookupFailed, virtualEvidenceLogKeyError, ownerErr,
 			"consecutive_refusals", refusals, "refusal_bound", virtualAdoptionRefusalBound,
 		}
 		if refusals >= virtualAdoptionRefusalBound {
@@ -4627,12 +4627,12 @@ func (h *PlaybackHandler) virtualProbeEvidenceRotateTarget(ctx context.Context, 
 				slog.InfoContext(ctx, "virtual probe evidence rotation to same-release owner row after bounded refusals",
 					"component", "api", "requested_file_id", catalogFile.ID, "owner_file_id", ownerRow.ID,
 					"candidate_uri", resolvedPath, "consecutive_refusals", refusals,
-					"reason", "sibling_owner_same_release_bound_rotation")
+					virtualEvidenceLogKeyReason, "sibling_owner_same_release_bound_rotation")
 				return rotated, rotated, true
 			}
 			slog.WarnContext(ctx, "virtual probe evidence rotation refused: sibling owner row is a duplicate of the same release",
 				"component", "api", "requested_file_id", catalogFile.ID, "owner_file_id", ownerRow.ID,
-				"candidate_uri", resolvedPath, "reason", "sibling_owner_same_release",
+				"candidate_uri", resolvedPath, virtualEvidenceLogKeyReason, "sibling_owner_same_release",
 				"consecutive_refusals", refusals, "refusal_bound", virtualAdoptionRefusalBound)
 			h.publishRefusedProbeInventory(ctx, catalogFile.ID, resolvedPath, probed)
 			return nil, nil, false
@@ -4802,7 +4802,7 @@ func (h *PlaybackHandler) virtualProbeEvidenceArgsForRow(ctx context.Context, ca
 			slog.ErrorContext(ctx, "virtual probe evidence adoption refusal bound reached and the candidate is not the pinned release; refusing terminally",
 				"component", "api", "file_id", catalogFile.ID, "adopt_path", adoptPath,
 				"expected_path", expectedPath, "candidate_uri", resolvedPath,
-				"reason", virtualProbeRefusalAdoptionBoundExhausted)
+				virtualEvidenceLogKeyReason, virtualProbeRefusalAdoptionBoundExhausted)
 			h.markVirtualAdoptionTerminalRefusal(ctx, catalogFile, virtualProbeRefusalAdoptionBoundExhausted)
 		}
 	}
