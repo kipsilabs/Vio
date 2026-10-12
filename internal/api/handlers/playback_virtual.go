@@ -1385,6 +1385,16 @@ func virtualFileHasPlayableDeclaredMetadata(file *models.MediaFile) bool {
 	return file.Resolution != "" && file.CodecVideo != "" && file.CodecAudio != "" && canSkipProbeForContainer(file.Container)
 }
 
+// fastPathGateEligible reports whether the repeat-play fast paths below can
+// apply at all: they are gated on the deferred start branch with no forced
+// relist, an explicit candidate, and no exclusions. It is a coarse,
+// observational-only input to the list_reason trace field: a start that is
+// ineligible here may still take a fast path later (durable resume,
+// delivery grace), so the field records intent, not outcome.
+func fastPathGateEligible(deferProbe, forceRelist, noResult bool, excludedCandidateIDs []string) bool {
+	return deferProbe && !forceRelist && !noResult && len(excludedCandidateIDs) == 0
+}
+
 // shouldListVirtualPlaybackCandidates reports whether the resolver must ask
 // the provider for a candidate list. A pinned result= URI with complete
 // probed evidence normally skips the round-trip. forceRelist overrides that so
@@ -1452,6 +1462,16 @@ type virtualResolveTrace struct {
 	cached     bool
 	listed     bool
 	candidates int
+	// listReason names why the listing gate decided the way it did. It is
+	// observational only and never gates control flow. Values:
+	//   fast_path (repeat/durable/delivery-grace path, no list possible),
+	//   cache_hit (best-result cache reused, list skipped),
+	//   resumed (durable-resume hit, list skipped like a cache hit),
+	//   explicit_declared (explicit ?result= with declared metadata, instant path),
+	//   empty_suppressed (provider answered empty inside the window),
+	//   listed (provider round-trip ran; see the *_ms stages for cost),
+	//   unknown (any other shape; never invent a more specific cause).
+	listReason string
 }
 
 // totalMS is the sum of the stage durations that ran, using the same rounded
@@ -1508,6 +1528,7 @@ func (t *virtualResolveTrace) fieldsWithContext(ctx context.Context) []any {
 		"cache_hit", t.cached,
 		"listed", t.listed,
 		"fast_path", t.fastPath,
+		"list_reason", t.listReason,
 	}
 	if t.budgetRan {
 		attrs = append(attrs, "budget_ms", t.budgetMS)
@@ -2397,9 +2418,30 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	// the candidate to serve; skipping the provider list is what makes the
 	// declared fast path below instant.
 	declaredCandidateComplete := !noResult && virtualFileHasPlayableDeclaredMetadata(file)
+	// listReason is observational only: it names why the gate below decided
+	// the way it did so a day of timing lines can size the convertible share
+	// (starts that listed but could have reused a fresh cache) without
+	// guessing. Unknown stays unknown rather than a fabricated miss cause.
+	switch {
+	case fastPathGateEligible(deferProbe, forceRelist, noResult, excludedCandidateIDs):
+		trace.listReason = "fast_path"
+	case cachedListing:
+		trace.listReason = "cache_hit"
+	case persistedResumeURI != "":
+		trace.listReason = "resumed"
+	case declaredCandidateComplete:
+		trace.listReason = "explicit_declared"
+	case emptySuppressed:
+		trace.listReason = "empty_suppressed"
+	case trace.listed:
+		trace.listReason = "listed"
+	default:
+		trace.listReason = "unknown"
+	}
 	if (shouldListVirtualPlaybackCandidates(noResult, needsCandidateMetadata && !cachedListing && !declaredCandidateComplete, forceRelist) ||
 		((exclusionPending || requestedRowUnusable) && !cachedListing)) && persistedResumeURI == "" && !emptySuppressed && h.VirtualPlaybackStreamLister != nil {
 		trace.listed = true
+		trace.listReason = "listed"
 		trace.listRan = true
 		fetchBeforeDur, fetchBeforeCalls := fetchSnapshot()
 		listStart := time.Now()
