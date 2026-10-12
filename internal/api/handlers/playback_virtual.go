@@ -3159,6 +3159,16 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			if h.VirtualPlaybackSourceProber != nil || h.VirtualPlaybackSourceProberWithHeaders != nil {
 				probeKey := virtualProbeFailureKey(cand.URI, oid)
 				probeTransient := cloneVirtualProbeTransient(transient)
+				// Carry the served candidate's declared audio onto the deferred
+				// probe input at the clone, before it can reach the probe-cache
+				// key or the completeness gate. The clone is built from the plan
+				// transient, whose synthesized inventory can be language-only and
+				// carry no probed audio even when the candidate declares audio; a
+				// video-with-subtitles-but-no-audio enumeration would then be
+				// accepted as complete and published as verified. The shared probe
+				// tail forwards the declaration again, but doing it here keeps the
+				// deferred job self-describing at the one seam it is built.
+				forwardVirtualCandidateDeclaredAudio(&probeTransient, cand)
 				// Zero the duration so the deferred probe measures the
 				// empirical duration instead of inheriting the catalog value.
 				probeTransient.Duration = 0
@@ -3685,8 +3695,10 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 	// the catalog row alone, so without this the completeness gate in
 	// scanner.ProbeVirtualSource cannot see that the item carries audio and a
 	// video-with-subtitles-but-no-audio result would be persisted and published
-	// as verified. It is a no-op for the deferred and declared paths, whose
-	// probe input the resolve already merged the candidate onto.
+	// as verified. The deferred job forwards the declaration onto its probe
+	// input when it is built, so here the call is the backstop for any caller
+	// whose probe input is the catalog row rather than the merged plan
+	// transient.
 	forwardVirtualCandidateDeclaredAudio(&probeTransient, probeCand)
 	probeCtx, probeCancel := context.WithTimeout(bgCtx, virtualBackgroundProbeBudget)
 	probed, probeErr := h.probeVirtualSource(probeCtx, probeURL, &probeTransient, probeCand.RequestHeaders)
