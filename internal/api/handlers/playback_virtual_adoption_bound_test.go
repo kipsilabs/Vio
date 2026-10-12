@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -30,14 +31,17 @@ func adoptionBoundTestRow(id int, hash string) *models.MediaFile {
 
 // TestVirtualAdoptionRefusalBoundRotatesSameRelease proves the bounded stale-pin
 // rotation: after the refusal bound is reached for a row and pin, a probed
-// candidate that provably carries the pin's own release identity is written
-// metadata-only against the pinned row instead of retrying the fenced adoption
-// that keeps matching no row. Pre-fix the write stays fenced forever.
+// candidate whose resolver-resolved identity provably carries the pin's own
+// release is written metadata-only against the pinned row instead of retrying
+// the fenced adoption that keeps matching no row. Pre-fix the write stays fenced
+// forever.
 func TestVirtualAdoptionRefusalBoundRotatesSameRelease(t *testing.T) {
 	row := adoptionBoundTestRow(5031897, "9d8e-hash")
 	candidate := "virtual://series/tt39087958/1/1?profile=4K+Dolby+Vision&result=165c86960fd10b80f54ecf9c"
 	probed := &models.MediaFile{
-		ProviderVideoHash: "9d8e-hash",
+		// The resolver's explicit evidence, not the transient's inherited
+		// Provider* fields, is what proves the release.
+		ResolvedCandidate: &models.ResolvedCandidateIdentity{VideoHash: "9d8e-hash"},
 		AudioTracks:       []models.AudioTrack{{Codec: "aac", Channels: 2}},
 	}
 	h := &PlaybackHandler{
@@ -71,11 +75,121 @@ func TestVirtualAdoptionRefusalBoundRotatesSameRelease(t *testing.T) {
 	if after.RequireAdopt {
 		t.Fatalf("same-release candidate stayed fenced past the refusal bound: %+v", after)
 	}
-	if after.AdoptPath != candidate {
-		t.Fatalf("re-pin lost the live candidate path: AdoptPath = %q, want %q", after.AdoptPath, candidate)
+	if !after.SameReleaseEvidence {
+		t.Fatalf("same-release fallback did not record the evidence permission: %+v", after)
+	}
+	if after.AdoptPath != "" {
+		t.Fatalf("same-release fallback retained an adoption path %q; it must clear AdoptPath so it cannot adopt", after.AdoptPath)
+	}
+	if after.ExpectedFilePath != row.FilePath {
+		t.Fatalf("same-release fallback moved the expected path: %q", after.ExpectedFilePath)
 	}
 	if after.ExpectedProviderVideoHash != row.ProviderVideoHash {
 		t.Fatalf("re-pin dropped the row identity: %q", after.ExpectedProviderVideoHash)
+	}
+}
+
+// TestVirtualAdoptionRefusalBoundInheritedIdentityStaysFenced is the #300/#306
+// boundary for blocker 1: the transient's Provider* tiers are seeded from the
+// requested row and only filled where empty, so a substituted candidate can
+// inherit the pin's identity. An inherited equality must never be accepted as a
+// same-release proof; only the resolver's explicit resolved-candidate evidence
+// counts. With no explicit evidence the candidate stays foreign and fenced.
+func TestVirtualAdoptionRefusalBoundInheritedIdentityStaysFenced(t *testing.T) {
+	row := adoptionBoundTestRow(5031903, "pin-hash")
+	candidate := "virtual://series/tt39087958/1/1?profile=4K+Dolby+Vision&result=substituted"
+	probed := &models.MediaFile{
+		// Inherited from the requested row: identical to the pin, and precisely
+		// the value that must not prove a release.
+		ProviderVideoHash:   row.ProviderVideoHash,
+		ProviderReleaseName: row.ProviderReleaseName,
+		ProviderReleaseSize: row.ProviderReleaseSize,
+		// No ResolvedCandidate: the resolver supplied no explicit identity.
+	}
+	h := &PlaybackHandler{}
+	key := virtualAdoptionRefusalKey(row.ID, row.FilePath)
+	virtualAdoptionRefusals.clear(key)
+	t.Cleanup(func() { virtualAdoptionRefusals.clear(key) })
+	for i := 0; i < virtualAdoptionRefusalBound; i++ {
+		virtualAdoptionRefusals.mark(key)
+	}
+	args, ok := h.virtualProbeEvidenceArgsForRow(context.Background(), row, candidate, probed, true)
+	if !ok {
+		t.Fatal("args builder refused before the SQL fence could")
+	}
+	if !args.RequireAdopt {
+		t.Fatalf("inherited identity disabled the adoption fence: %+v", args)
+	}
+	if args.SameReleaseEvidence {
+		t.Fatalf("inherited identity was accepted as same-release proof: %+v", args)
+	}
+	if args.RefusalReason != virtualProbeRefusalAdoptionBoundExhausted {
+		t.Fatalf("refusal reason = %q, want terminal %q", args.RefusalReason, virtualProbeRefusalAdoptionBoundExhausted)
+	}
+}
+
+// TestVirtualAdoptionRefusalBoundExplicitForeignIdentityStaysFenced proves the
+// resolver's explicit evidence is still checked for agreement: a candidate whose
+// resolved identity shares no tier with the pin is foreign even past the bound.
+func TestVirtualAdoptionRefusalBoundExplicitForeignIdentityStaysFenced(t *testing.T) {
+	row := adoptionBoundTestRow(5031904, "pin-hash")
+	candidate := "virtual://series/tt39087958/1/1?profile=4K+Dolby+Vision&result=foreign-explicit"
+	probed := &models.MediaFile{
+		ResolvedCandidate: &models.ResolvedCandidateIdentity{VideoHash: "different-hash"},
+	}
+	h := &PlaybackHandler{}
+	key := virtualAdoptionRefusalKey(row.ID, row.FilePath)
+	virtualAdoptionRefusals.clear(key)
+	t.Cleanup(func() { virtualAdoptionRefusals.clear(key) })
+	for i := 0; i < virtualAdoptionRefusalBound; i++ {
+		virtualAdoptionRefusals.mark(key)
+	}
+	args, ok := h.virtualProbeEvidenceArgsForRow(context.Background(), row, candidate, probed, true)
+	if !ok {
+		t.Fatal("args builder refused before the SQL fence could")
+	}
+	if !args.RequireAdopt {
+		t.Fatalf("explicitly foreign candidate disabled the fence: %+v", args)
+	}
+}
+
+// TestVirtualAdoptionRefusalBoundKeepsFailedVerdictFence proves verdict
+// enforcement survives the same-release permission: a candidate the resolver
+// ties to the pin's release but that carries a live failed verdict must not be
+// stamped as the pin's verified evidence, so the permission is denied and the
+// write stays fenced.
+func TestVirtualAdoptionRefusalBoundKeepsFailedVerdictFence(t *testing.T) {
+	row := adoptionBoundTestRow(5031905, "pin-hash")
+	candidate := "virtual://series/tt39087958/1/1?profile=4K+Dolby+Vision&result=dead-same-release"
+	probed := &models.MediaFile{
+		ResolvedCandidate: &models.ResolvedCandidateIdentity{VideoHash: "pin-hash"},
+	}
+	failedAt := time.Now().UTC()
+	failedRow := &models.MediaFile{
+		ID: 5031906, ContentID: row.ContentID, EpisodeID: row.EpisodeID, FilePath: candidate,
+		MediaFolderID: row.MediaFolderID, VirtualOwnerInstallationID: row.VirtualOwnerInstallationID,
+		ProviderVideoHash: "pin-hash", FailedAt: &failedAt,
+	}
+	h := &PlaybackHandler{
+		VirtualFileLookup: func(context.Context, string) (*models.MediaFile, error) {
+			return failedRow, nil
+		},
+	}
+	key := virtualAdoptionRefusalKey(row.ID, row.FilePath)
+	virtualAdoptionRefusals.clear(key)
+	t.Cleanup(func() { virtualAdoptionRefusals.clear(key) })
+	for i := 0; i < virtualAdoptionRefusalBound; i++ {
+		virtualAdoptionRefusals.mark(key)
+	}
+	args, ok := h.virtualProbeEvidenceArgsForRow(context.Background(), row, candidate, probed, true)
+	if !ok {
+		t.Fatal("args builder refused before the SQL fence could")
+	}
+	if !args.RequireAdopt {
+		t.Fatalf("a live failed verdict did not keep the candidate fenced: %+v", args)
+	}
+	if args.SameReleaseEvidence {
+		t.Fatalf("a live failed verdict was bypassed by the same-release permission: %+v", args)
 	}
 }
 
@@ -262,6 +376,72 @@ func TestVirtualAdoptionRefusalTrackerCountsAndResets(t *testing.T) {
 	now = now.Add(virtualAdoptionRefusalTTL + time.Second)
 	if got := cache.count(key); got != 0 {
 		t.Fatalf("expired count = %d, want 0", got)
+	}
+}
+
+// TestVirtualAdoptionRefusalTrackerEnforcesMaxEntries proves the cap is a hard
+// limit, not an expiry hint: inserting far more distinct live keys than the
+// capacity must leave the map at or below capacity instead of growing past it.
+// The pre-fix code pruned only expired marks and inserted regardless.
+func TestVirtualAdoptionRefusalTrackerEnforcesMaxEntries(t *testing.T) {
+	const capacity = 4
+	now := time.Now()
+	cache := &virtualAdoptionRefusalCache{
+		marks:      map[string]virtualAdoptionRefusalMark{},
+		now:        func() time.Time { return now },
+		maxEntries: capacity,
+	}
+	for i := 0; i < capacity*10; i++ {
+		cache.mark(strconv.Itoa(i) + "\x00pin")
+	}
+	cache.mu.Lock()
+	live := len(cache.marks)
+	cache.mu.Unlock()
+	if live > capacity {
+		t.Fatalf("live refusal marks = %d, want at most %d", live, capacity)
+	}
+	if live == 0 {
+		t.Fatal("every mark was evicted; the most recent refusal was lost")
+	}
+	// The most recently marked key must still be present and counted.
+	last := strconv.Itoa(capacity*10-1) + "\x00pin"
+	if got := cache.count(last); got != 1 {
+		t.Fatalf("most recent key count = %d, want 1", got)
+	}
+}
+
+// TestVirtualAdoptionTerminalRefusalPersistsMarker proves the terminal branch
+// installs durable refusal state instead of only logging: the handler stamps the
+// row's failed_at verdict through the existing fenced marker so a later resolve
+// on any replica skips the row and the retry loop stops.
+func TestVirtualAdoptionTerminalRefusalPersistsMarker(t *testing.T) {
+	row := adoptionBoundTestRow(5031907, "row-hash")
+	var gotID int
+	var gotPath string
+	var gotObserved *time.Time
+	h := &PlaybackHandler{
+		VirtualCandidateFailMarker: func(_ context.Context, fileID int, expectedFilePath string, observedFailedAt *time.Time) error {
+			gotID, gotPath, gotObserved = fileID, expectedFilePath, observedFailedAt
+			return nil
+		},
+	}
+	if !h.markVirtualAdoptionTerminalRefusal(context.Background(), row, virtualProbeRefusalAdoptionBoundExhausted) {
+		t.Fatal("terminal refusal did not install the durable marker")
+	}
+	if gotID != row.ID || gotPath != row.FilePath || gotObserved != row.FailedAt {
+		t.Fatalf("marker called with (%d, %q, %v), want (%d, %q, %v)", gotID, gotPath, gotObserved, row.ID, row.FilePath, row.FailedAt)
+	}
+}
+
+// TestVirtualAdoptionTerminalRefusalMissingMarkerIsNotAnError proves the durable
+// install degrades safely when no marker is wired: it reports no install rather
+// than panicking, so a deployment without the fail marker keeps the prior
+// behavior (the in-memory count still bounds the trigger).
+func TestVirtualAdoptionTerminalRefusalMissingMarkerIsNotAnError(t *testing.T) {
+	row := adoptionBoundTestRow(5031908, "row-hash")
+	h := &PlaybackHandler{}
+	if h.markVirtualAdoptionTerminalRefusal(context.Background(), row, virtualProbeRefusalAdoptionBoundExhausted) {
+		t.Fatal("terminal refusal reported a durable install with no marker wired")
 	}
 }
 

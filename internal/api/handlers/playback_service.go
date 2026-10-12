@@ -1360,6 +1360,14 @@ func (h *PlaybackHandler) probeRotatedVirtualCandidate(ctx context.Context, sess
 	if resolved.URI != "" {
 		probeTransient.FilePath = resolved.URI
 	}
+	// Carry the resolver's explicit candidate identity so the bounded
+	// same-release fallback can distinguish a renumbered pin from a substitute.
+	applyResolvedIdentity(&probeTransient, virtualProbeIdentity{
+		VideoHash:   resolved.ProviderVideoHash,
+		GUID:        resolved.ProviderGUID,
+		ReleaseName: resolved.ProviderReleaseName,
+		ReleaseSize: resolved.ProviderReleaseSize,
+	})
 	h.probeVirtualSourceAndPersist(
 		ctx,
 		bestResultCacheKey(liveFile.ContentID, virtualPlaybackNeutralKey(live.VirtualSourceURI), live.VirtualSourceOwnerInstallationID),

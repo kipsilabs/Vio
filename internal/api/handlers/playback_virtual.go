@@ -1360,9 +1360,25 @@ type virtualProbeIdentity struct {
 // the file being served and persisted. It fills empty tiers only, never
 // overwriting stored identity, so a legacy row gains re-match capability
 // without risking a cross-release overwrite.
+//
+// It also records the resolver's explicit evidence on ResolvedCandidate,
+// overwriting it every time: unlike the fill-empty Provider* tiers (which a
+// transient seeded from the requested row can inherit rather than resolve), this
+// field is only ever set from the resolver's own answer and is nil when the
+// resolver supplied none. It is the sanctioned same-release proof.
 func applyResolvedIdentity(transient *models.MediaFile, id virtualProbeIdentity) {
 	if transient == nil {
 		return
+	}
+	if id.VideoHash != "" || id.GUID != "" || id.ReleaseName != "" || id.ReleaseSize > 0 {
+		transient.ResolvedCandidate = &models.ResolvedCandidateIdentity{
+			VideoHash:   id.VideoHash,
+			GUID:        id.GUID,
+			ReleaseName: id.ReleaseName,
+			ReleaseSize: id.ReleaseSize,
+		}
+	} else {
+		transient.ResolvedCandidate = nil
 	}
 	if transient.ProviderVideoHash == "" {
 		transient.ProviderVideoHash = id.VideoHash
@@ -3811,6 +3827,7 @@ func (h *PlaybackHandler) revalidateVirtualCandidateBackground(
 
 		var streamURL string
 		var resolveErr error
+		var resolvedIdentity virtualProbeIdentity
 		if h.VirtualMediaDetailedResolver != nil {
 			res, err := h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
 				bgCtx, cand.URI, oid, userID, profileID, false, nil, "",
@@ -3820,6 +3837,12 @@ func (h *PlaybackHandler) revalidateVirtualCandidateBackground(
 			} else {
 				streamURL = res.URL
 				cand.RequestHeaders = cloneHeaderMap(res.RequestHeaders)
+				resolvedIdentity = virtualProbeIdentity{
+					VideoHash:   res.ProviderVideoHash,
+					GUID:        res.ProviderGUID,
+					ReleaseName: res.ProviderReleaseName,
+					ReleaseSize: res.ProviderReleaseSize,
+				}
 				if res.URI != "" {
 					cand.URI = res.URI
 				}
@@ -3875,6 +3898,9 @@ func (h *PlaybackHandler) revalidateVirtualCandidateBackground(
 		}
 		probeTransient.FilePath = cand.URI
 		probeTransient.VirtualOwnerInstallationID = oid
+		// Carry the resolver's explicit evidence so the bounded same-release
+		// fallback can tell a renumbered pin from a substituted candidate.
+		applyResolvedIdentity(&probeTransient, resolvedIdentity)
 		if virtualProbeFailures.recent(virtualProbeFailureKey(cand.URI, oid)) {
 			// The damper would skip the probe, but a completed inner probe may
 			// already be cached. Recover it so the row is not left unprobed.
@@ -4557,6 +4583,10 @@ func (h *PlaybackHandler) virtualProbeEvidenceRotateTarget(ctx context.Context, 
 				"terminal_reason", virtualProbeRefusalAdoptionBoundExhausted)
 			slog.ErrorContext(ctx, "virtual probe evidence refused: candidate path ownership is unknown past the refusal bound; reporting a terminal inventory failure",
 				attrs...)
+			// A log line does not stop the loop, and the process-local count does
+			// not survive a restart or span replicas. Record the durable terminal
+			// refusal so every later resolve skips this row.
+			h.markVirtualAdoptionTerminalRefusal(ctx, catalogFile, virtualProbeRefusalOwnerLookupFailed)
 		} else {
 			slog.WarnContext(ctx, "virtual probe evidence refused: candidate path ownership is unknown", attrs...)
 		}
@@ -4711,29 +4741,57 @@ func (h *PlaybackHandler) virtualProbeEvidenceArgsForRow(ctx context.Context, ca
 		args.RefusalReason = h.virtualProbeEvidenceRefusalReason(ctx, catalogFile, resolvedPath)
 		// Bounded refusal. Once this row and pin have refused enough consecutive
 		// adoptions to treat the pin as stale, stop retrying the same fenced
-		// write. If the probed bytes provably carry the pin's own release
-		// identity, the refusals are a same-release renumber: the write becomes
-		// metadata-only against the pinned row, which lands the measured tracks
-		// and the probe stamp, so the row stops re-probing and the session can
-		// verify. A candidate that cannot be tied to the pin stays foreign: the
-		// fence is kept and the refusal is named terminal rather than looping.
+		// write. Same-release evidence permission is a distinct decision from
+		// adoption/verdict enforcement: it requires the resolver's explicit
+		// resolved-candidate identity to prove the candidate is the pin's own
+		// release and a live re-check that the candidate carries no failed
+		// verdict. When granted, the write clears AdoptPath and lands the
+		// measured tracks and probe stamp metadata-only on the pinned row, so it
+		// can never adopt a candidate path or drop the failed-candidate fence.
+		// A candidate that cannot be tied to the pin by resolver evidence stays
+		// foreign: the fence is kept, the refusal is named terminal, and a durable
+		// terminal refusal is recorded so later attempts (any replica) are skipped.
 		if virtualAdoptionRefusalBoundReached(args) {
-			if virtualCandidateSharesPersistedIdentity(catalogFile, probed) {
+			if h.virtualSameReleaseEvidencePermitted(ctx, catalogFile, probed, resolvedPath) {
+				args.AdoptPath = ""
 				args.RequireAdopt = false
-				slog.InfoContext(ctx, "virtual probe evidence adoption refusal bound reached; re-pinning the same-release candidate metadata-only against the stale pin",
-					"component", "api", "file_id", catalogFile.ID, "adopt_path", adoptPath,
-					"expected_path", expectedPath, "candidate_uri", resolvedPath,
+				args.SameReleaseEvidence = true
+				slog.InfoContext(ctx, "virtual probe evidence adoption refusal bound reached; writing the same-release candidate metadata-only against the stale pin",
+					"component", "api", "file_id", catalogFile.ID, "candidate_uri", resolvedPath,
+					"expected_path", expectedPath,
 					"reason", "adoption_refusal_bound_same_release_repin")
 			} else {
 				args.RefusalReason = virtualProbeRefusalAdoptionBoundExhausted
-				slog.ErrorContext(ctx, "virtual probe evidence adoption refusal bound reached and the candidate is not the pinned release; refusing terminally",
+				slog.ErrorContext(ctx, "virtual probe evidence adoption refusal bound reached and the candidate is not provably the pinned release; refusing terminally",
 					"component", "api", "file_id", catalogFile.ID, "adopt_path", adoptPath,
 					"expected_path", expectedPath, "candidate_uri", resolvedPath,
 					"reason", virtualProbeRefusalAdoptionBoundExhausted)
+				h.markVirtualAdoptionTerminalRefusal(ctx, catalogFile, virtualProbeRefusalAdoptionBoundExhausted)
 			}
 		}
 	}
 	return args, true
+}
+
+// virtualSameReleaseEvidencePermitted reports whether the bounded fallback may
+// write a refused candidate's evidence metadata-only against the pinned row.
+// Two independent proofs are required: the resolver's explicit
+// resolved-candidate evidence must tie the probed bytes to the pin's own release
+// (never the transient's inheritable Provider* fields), and the candidate must
+// carry no live failed verdict. The second check keeps verdict enforcement in
+// force even though adoption is not attempted: a candidate known to produce no
+// bytes or to be undecodable must not be stamped as the pin's verified evidence.
+// The verdict check fails closed on a lookup error.
+func (h *PlaybackHandler) virtualSameReleaseEvidencePermitted(ctx context.Context, pinned *models.MediaFile, candidate *models.MediaFile, resolvedPath string) bool {
+	if !virtualCandidateSharesPersistedIdentity(pinned, candidate) {
+		return false
+	}
+	if err := h.virtualCandidateVerdictError(ctx, resolvedPath, pinned, pinned.VirtualOwnerInstallationID, false); err != nil {
+		slog.InfoContext(ctx, "virtual probe evidence same-release permission denied: candidate verdict is not clear",
+			"component", "api", "file_id", catalogFileIDOrZero(pinned), "candidate_uri", resolvedPath, "error", err)
+		return false
+	}
+	return true
 }
 
 // virtualProbeEvidenceRefusalReason classifies a required adoption that is

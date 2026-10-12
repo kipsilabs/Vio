@@ -1,6 +1,8 @@
 package handlers
 
 import (
+	"context"
+	"log/slog"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,11 +28,18 @@ import (
 //
 //   - rotates the evidence onto the catalog row that already owns the live
 //     candidate path when the two rows provably carry the same release, or
-//     writes it metadata-only against the pinned row when the probed bytes
-//     provably carry the pin's own release identity; either lands a real stamp,
-//     so the session can verify and a later start stops re-probing; or
-//   - leaves a genuinely foreign release fenced and reports an actionable
-//     terminal instead of looping.
+//     writes it metadata-only against the pinned row when the resolver's own
+//     resolved-candidate evidence proves the pin's release; either lands a real
+//     stamp, so the session can verify and a later start stops re-probing; or
+//   - leaves a genuinely foreign release fenced, records a durable terminal
+//     refusal, and reports an actionable terminal instead of looping.
+//
+// The per-replica count is only the trigger that reaches the bound. The
+// disposition it produces is durable and cross-replica: the same-release
+// metadata write persists a real probe stamp on the row, and the terminal
+// refusal stamps the row's failed_at verdict through the existing fenced
+// marker, so a restarted process or a different replica's resolve gate skips
+// the row instead of repeating the refusal.
 //
 // The bound is deliberately small. The refusals it counts are per row and pin,
 // so unrelated rows never share a count, and a refusal stream for one row cannot
@@ -49,8 +58,9 @@ const (
 	// not permanently treated as stale.
 	virtualAdoptionRefusalTTL = 10 * time.Minute
 	// virtualAdoptionRefusalMaxEntries caps the process-wide map. Refusals are
-	// bounded in practice by the rows currently failing to adopt; the cap keeps a
-	// pathological provider from growing the map without bound.
+	// bounded in practice by the rows currently failing to adopt; the cap is
+	// enforced, not merely advertised, so a pathological provider cannot grow the
+	// map without bound.
 	virtualAdoptionRefusalMaxEntries = 4096
 	// virtualProbeRefusalAdoptionBoundExhausted names a required adoption refused
 	// virtualAdoptionRefusalBound or more consecutive times for one row and pin,
@@ -70,11 +80,13 @@ type virtualAdoptionRefusalMark struct {
 // a row and pin. It is package-level because the handler is shared across
 // requests and the count must survive a session close and the later resume that
 // repeats the same refusal; the small map is bounded and expires idle entries.
-// now is injectable for tests and defaults to time.Now.
+// now is injectable for tests and defaults to time.Now; maxEntries overrides the
+// default cap for tests that prove the enforcement.
 type virtualAdoptionRefusalCache struct {
-	mu    sync.Mutex
-	marks map[string]virtualAdoptionRefusalMark
-	now   func() time.Time
+	mu         sync.Mutex
+	marks      map[string]virtualAdoptionRefusalMark
+	now        func() time.Time
+	maxEntries int
 }
 
 func (c *virtualAdoptionRefusalCache) clock() time.Time {
@@ -84,9 +96,21 @@ func (c *virtualAdoptionRefusalCache) clock() time.Time {
 	return time.Now()
 }
 
+// capacity is the hard cap on live marks. It falls back to the default constant
+// so a zero-value cache (and the package-wide instance) is still bounded.
+func (c *virtualAdoptionRefusalCache) capacity() int {
+	if c != nil && c.maxEntries > 0 {
+		return c.maxEntries
+	}
+	return virtualAdoptionRefusalMaxEntries
+}
+
 // mark records one more consecutive refusal for key and returns the new count.
 // An expired mark restarts the count, so a refusal stream separated by more than
-// the TTL does not accumulate.
+// the TTL does not accumulate. The map never exceeds capacity: expired marks are
+// dropped first, and if every mark is live the soonest-expiring one is evicted to
+// make room, so a burst of distinct rows cannot grow the map past the advertised
+// maximum.
 func (c *virtualAdoptionRefusalCache) mark(key string) int {
 	if c == nil || key == "" {
 		return 0
@@ -97,8 +121,14 @@ func (c *virtualAdoptionRefusalCache) mark(key string) int {
 		c.marks = make(map[string]virtualAdoptionRefusalMark)
 	}
 	now := c.clock()
-	if len(c.marks) >= virtualAdoptionRefusalMaxEntries {
+	capacity := c.capacity()
+	if len(c.marks) >= capacity {
 		c.pruneLocked(now)
+	}
+	if _, exists := c.marks[key]; !exists {
+		for len(c.marks) >= capacity {
+			c.evictSoonestLocked()
+		}
 	}
 	count := 1
 	if prev, ok := c.marks[key]; ok && now.Before(prev.expiresAt) {
@@ -146,6 +176,21 @@ func (c *virtualAdoptionRefusalCache) pruneLocked(now time.Time) {
 	}
 }
 
+// evictSoonestLocked drops the live mark closest to expiry so a new key always
+// fits under the hard cap. Caller holds c.mu and must guarantee len(c.marks) > 0.
+func (c *virtualAdoptionRefusalCache) evictSoonestLocked() {
+	oldestKey := ""
+	var oldest time.Time
+	for k, mark := range c.marks {
+		if oldestKey == "" || mark.expiresAt.Before(oldest) {
+			oldestKey, oldest = k, mark.expiresAt
+		}
+	}
+	if oldestKey != "" {
+		delete(c.marks, oldestKey)
+	}
+}
+
 // virtualAdoptionRefusals is the process-wide bounded refusal counter. Tests may
 // clear entries directly.
 var virtualAdoptionRefusals = &virtualAdoptionRefusalCache{marks: make(map[string]virtualAdoptionRefusalMark)}
@@ -181,24 +226,51 @@ func virtualAdoptionRefusalBoundReachedFor(fileID int, expectedPath string) bool
 }
 
 // virtualCandidateSharesPersistedIdentity reports whether a probed candidate
-// provably carries the same release as the pinned row, judged by the same
-// symmetric durable-identity tiers used for sibling rows. Both sides must carry
-// a non-empty tier and one must agree; an identity-less side is not proof, so a
-// candidate whose bytes cannot be tied to the pin stays foreign.
-//
-// The probed file carries the candidate's durable identity when the resolver
-// annotated the served transient (see applyResolvedIdentity), which is the
-// normal case for a renumbered same-release candidate.
+// provably carries the same release as the pinned row, judged by the resolver's
+// explicit resolved-candidate evidence rather than the transient file's
+// Provider* fields. Those fields are seeded from the requested row (the resolve
+// clones the pinned row) and are only filled where empty, so a substituted
+// candidate can inherit the pin's identity and make an inherited equality look
+// like a same-release proof. The resolver's explicit evidence is set only from
+// the resolver's own answer (see applyResolvedIdentity), so a missing or
+// identity-less side is not proof and a candidate whose bytes cannot be tied to
+// the pin stays foreign.
 func virtualCandidateSharesPersistedIdentity(pinned, candidate *models.MediaFile) bool {
-	if pinned == nil || candidate == nil {
+	if pinned == nil || candidate == nil || candidate.ResolvedCandidate == nil {
 		return false
 	}
 	pinnedTiers := resolver.NewPersistedIdentityTiers(
 		pinned.ProviderVideoHash, pinned.ProviderGUID, pinned.ProviderReleaseName, pinned.ProviderReleaseSize,
 	)
 	candidateTiers := resolver.NewPersistedIdentityTiers(
-		candidate.ProviderVideoHash, candidate.ProviderGUID, candidate.ProviderReleaseName, candidate.ProviderReleaseSize,
+		candidate.ResolvedCandidate.VideoHash,
+		candidate.ResolvedCandidate.GUID,
+		candidate.ResolvedCandidate.ReleaseName,
+		candidate.ResolvedCandidate.ReleaseSize,
 	)
 	_, shared := resolver.PersistedIdentitiesMatch(pinnedTiers, candidateTiers)
 	return shared
+}
+
+// markVirtualAdoptionTerminalRefusal installs the durable, cross-replica terminal
+// refusal for a row whose pinned adoption has been refused
+// virtualAdoptionRefusalBound times without a candidate the resolver can tie to
+// the pin. It stamps the row's failed_at verdict through the same fenced marker
+// the transport-failure path uses, so every replica's resolve and probe gate
+// skips the row and a restarted process does not restart the loop. The
+// in-process count is only the trigger; this durable stamp is what actually stops
+// subsequent attempts. It returns whether a marker was installed.
+func (h *PlaybackHandler) markVirtualAdoptionTerminalRefusal(ctx context.Context, row *models.MediaFile, reason string) bool {
+	if h == nil || row == nil || row.ID <= 0 || h.VirtualCandidateFailMarker == nil {
+		return false
+	}
+	if err := h.VirtualCandidateFailMarker(ctx, row.ID, row.FilePath, row.FailedAt); err != nil {
+		slog.WarnContext(ctx, "virtual adoption terminal refusal was not persisted; the row keeps its own failed_at state",
+			"component", "api", "file_id", row.ID, "candidate_path", row.FilePath,
+			"reason", reason, "error", err)
+		return false
+	}
+	slog.ErrorContext(ctx, "virtual adoption terminal refusal persisted",
+		"component", "api", "file_id", row.ID, "candidate_path", row.FilePath, "reason", reason)
+	return true
 }
