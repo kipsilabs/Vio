@@ -318,9 +318,14 @@ func TestVirtualFileMetadataUpdatePersistsProbeStamp(t *testing.T) {
 }
 
 // A resolution-less stored row whose lister returns a resolution-less
-// candidate must still synthesize the 1080p
-// baseline through the candidate-merge gate: the immediate plan keeps the
-// synthesized tracks and defers the real probe to the background.
+// candidate probes synchronously to fill the row before the planner sees
+// it. The deferral guard routes this shape to the sync probe: without any
+// resolution the merged metadata cannot support a validated route, and
+// deferring would terminal source_metadata_incomplete before the
+// post-commit probe runs (the bench Citizen Vigilante shape). The probe's
+// verified inventory lands on the served file; the fixture probe returns
+// 1080p so the served resolution matches the probed bytes, not an assumed
+// baseline.
 func TestResolveResolutionlessMergesIntoBaseline(t *testing.T) {
 	uri := "virtual://movie/tt-merge-baseline?result=cand-1"
 	stored := &models.MediaFile{
@@ -337,11 +342,11 @@ func TestResolveResolutionlessMergesIntoBaseline(t *testing.T) {
 		}}, nil
 	})
 	probeStarted := make(chan struct{})
+	_ = probeStarted
 	var probeCalls int32
 	h := virtualProbeGateCandidateHandler(stored, lister,
 		func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
 			atomic.AddInt32(&probeCalls, 1)
-			close(probeStarted)
 			<-time.After(50 * time.Millisecond)
 			f.VideoTracks = []models.VideoTrack{{Codec: "h264", Width: 1920, Height: 1080, FrameRate: "24"}}
 			f.AudioTracks = []models.AudioTrack{{Codec: "aac", Channels: 2, Language: "eng"}}
@@ -355,8 +360,11 @@ func TestResolveResolutionlessMergesIntoBaseline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveVirtualPlaybackSource error: %v", err)
 	}
-	if resolved.Provenance != ProbeProvenancePending {
-		t.Fatalf("provenance=%q, want pending deferred probe", resolved.Provenance)
+	// The deferral guard routes resolution-less merges to the synchronous
+	// probe: verified provenance with the probe's real inventory on the
+	// response, not a pending deferred plan the planner would terminal.
+	if resolved.Provenance != ProbeProvenanceVerified || !resolved.ProbeSucceeded {
+		t.Fatalf("provenance=%q succeeded=%v, want verified/true after the guard's sync probe", resolved.Provenance, resolved.ProbeSucceeded)
 	}
 	if resolved.File == nil || resolved.File.Resolution != "1080p" {
 		t.Fatalf("resolution=%v, want 1080p baseline", resolved.File)
@@ -367,13 +375,8 @@ func TestResolveResolutionlessMergesIntoBaseline(t *testing.T) {
 		t.Fatalf("baseline must carry complete evidence: %#v", resolved.File)
 	}
 
-	select {
-	case <-probeStarted:
-	case <-time.After(2 * time.Second):
-		t.Fatal("real probe was not launched in the background")
-	}
 	if probeCalls := atomic.LoadInt32(&probeCalls); probeCalls != 1 {
-		t.Fatalf("prober called %d times, want 1 background probe", probeCalls)
+		t.Fatalf("prober called %d times, want 1 synchronous probe", probeCalls)
 	}
 }
 
@@ -1449,6 +1452,12 @@ func TestPreferProbedCandidateOverUnprobedStub(t *testing.T) {
 }
 
 func TestPreferProbedNeverJumpsRejectedGroup(t *testing.T) {
+	// This ordering test requires an accepted candidate eligible for
+	// immediate selection: the stub declares its release profile so the
+	// accepted/rejected group partition (not probe availability) decides
+	// the order. A bare-URI stub takes ResolutionAssumed and falls out of
+	// the immediate-selection finalization, which is a separate policy
+	// question from group jumping.
 	probedAt := time.Now().Add(-time.Hour)
 	probedURI := "virtual://movie/tt-probe-gate?result=cand-probed"
 	stubURI := "virtual://movie/tt-probe-gate?result=cand-stub"
@@ -1476,7 +1485,7 @@ func TestPreferProbedNeverJumpsRejectedGroup(t *testing.T) {
 	byURI := map[string]*models.MediaFile{probedURI: probedRow, stubURI: stubRow}
 	lister := VirtualPlaybackStreamListerFunc(func(_ context.Context, _ string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
 		return []VirtualPlaybackStream{
-			{ID: "cand-stub", URI: stubURI},
+			{ID: "cand-stub", URI: stubURI, Resolution: "2160p", CodecVideo: "hevc", CodecAudio: "dts", Container: "mkv"},
 			{ID: "cand-probed", URI: probedURI, Resolution: "2160p", CodecVideo: "hevc", CodecAudio: "dts", Container: "mkv", Rejected: true},
 		}, nil
 	})
