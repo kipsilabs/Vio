@@ -25,10 +25,11 @@ func (h *PlaybackHandler) stopPlaybackSession(ctx context.Context, session *play
 }
 
 // stopPlaybackSessionWithResult is stopPlaybackSession reporting the history
-// writer's result, which the v2 stop receipt carries. priorHistoryID is the
-// history row a previous attempt of this same stop already wrote, reused so a
-// v2 retry does not add a second row.
-func (h *PlaybackHandler) stopPlaybackSessionWithResult(ctx context.Context, session *playback.Session, userInitiated bool, priorHistoryID string) (watchstate.PlaybackStopResult, error) {
+// writer's result, which the v2 stop receipt carries. historyID is the row this
+// stop must write, derived from the durable stop identity, so a v2 retry reuses
+// it instead of adding a second row; empty means this path has no durable stop
+// identity and the writer mints a fresh row per stop.
+func (h *PlaybackHandler) stopPlaybackSessionWithResult(ctx context.Context, session *playback.Session, userInitiated bool, historyID string) (watchstate.PlaybackStopResult, error) {
 	if h == nil || session == nil || session.ID == "" {
 		return watchstate.PlaybackStopResult{}, playback.ErrSessionNotFound
 	}
@@ -85,7 +86,7 @@ func (h *PlaybackHandler) stopPlaybackSessionWithResult(ctx context.Context, ses
 	}
 	// Report whether the durable stop finished; the v2 finalization finalizes
 	// the receipt only on success.
-	return h.finalizeSessionStopWithResult(ctx, session, true, "stop", userInitiated, priorHistoryID)
+	return h.finalizeSessionStopWithResult(ctx, session, true, "stop", userInitiated, historyID)
 }
 
 func (h *PlaybackHandler) stopPlaybackSessionByID(ctx context.Context, sessionID string, userInitiated bool) error {

@@ -1878,12 +1878,13 @@ func (h *PlaybackHandler) persistProgress(ctx context.Context, session *playback
 // completed; its callers log the failure and, on the v2 stop path, leave the
 // finalization open for a retry rather than mark a half-written stop complete.
 //
-// priorHistoryID is the row a previous attempt of the same stop already wrote,
-// recorded in the stop receipt; the retry reuses it so it cannot add a second
-// row for one stop. Empty means this is the first attempt and a fresh row is
-// minted, which the native rule requires: a session resumed after expiry under
-// the same id records each stretch separately.
-func (h *PlaybackHandler) persistStopAndHistory(ctx context.Context, session *playback.Session, priorHistoryID string) (watchstate.PlaybackStopResult, error) {
+// historyID is the row to record. The v2 stop path derives it from the durable
+// stop identity before the insert, so a stop replayed after a crash between the
+// insert and the receipt derives the same row and records nothing new. Empty
+// means the caller has no durable stop identity and a fresh row is minted, which
+// the native rule requires: a session resumed after expiry under the same id
+// records each stretch separately.
+func (h *PlaybackHandler) persistStopAndHistory(ctx context.Context, session *playback.Session, historyID string) (watchstate.PlaybackStopResult, error) {
 	if h.StoreProvider == nil || h.fileResolver == nil {
 		return watchstate.PlaybackStopResult{}, nil
 	}
@@ -1918,13 +1919,13 @@ func (h *PlaybackHandler) persistStopAndHistory(ctx context.Context, session *pl
 	}
 	var result watchstate.PlaybackStopResult
 	if session.IsJellyfinCompat {
-		historyID := priorHistoryID
-		if historyID == "" {
-			historyID = compatPlayHistoryID(session.ID)
+		rowID := historyID
+		if rowID == "" {
+			rowID = compatPlayHistoryID(session.ID)
 		}
-		result, err = watchSvc.RecordPlaybackStopOnce(ctx, session.UserID, session.ProfileID, targetID, duration, session.Position, stoppedAt, hints, thresholds, historyID)
+		result, err = watchSvc.RecordPlaybackStopOnce(ctx, session.UserID, session.ProfileID, targetID, duration, session.Position, stoppedAt, hints, thresholds, rowID)
 	} else {
-		result, err = watchSvc.RecordPlaybackStopWithHistoryID(ctx, session.UserID, session.ProfileID, targetID, duration, session.Position, stoppedAt, hints, thresholds, priorHistoryID)
+		result, err = watchSvc.RecordPlaybackStopWithHistoryID(ctx, session.UserID, session.ProfileID, targetID, duration, session.Position, stoppedAt, hints, thresholds, historyID)
 	}
 	if err != nil {
 		slog.ErrorContext(ctx, "failed to persist playback stop", "component", "api", "session", session.ID, "error", err)
@@ -2083,28 +2084,50 @@ const sessionTeardownTimeout = 15 * time.Second
 // kept, its cancellation is dropped, and a wedged store is bounded rather than
 // leaking the goroutine.
 //
-// The detached budget never reaches past a deadline the caller already carries.
-// The v2 stop finalization hands its single end-to-end deadline down through the
-// nested teardown and finalize calls; without the cap every nested
-// teardownContext would reset to a fresh full timeout and the finalization could
-// outlive the lease that fences it against a concurrent replay.
+// The detached budget never reaches past an enclosing detached budget. The v2
+// stop finalization hands its single end-to-end deadline down through the nested
+// teardown and finalize calls; without the cap every nested teardownContext
+// would reset to a fresh full timeout and the finalization could outlive the
+// lease that fences it against a concurrent replay.
 func teardownContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	return detachedWithin(ctx, sessionTeardownTimeout)
 }
 
+// detachedDeadlineKey marks a context whose deadline was established by
+// detachedWithin — an internally-established teardown budget — as distinct from
+// a deadline the caller's request happened to carry. Only a marked, enclosing
+// budget narrows a nested detach.
+type detachedDeadlineKey struct{}
+
 // detachedWithin builds a context that survives cancellation of base (keeping
-// its logging and tracing values) but is bounded by budget and by any earlier
-// deadline base already carries, whichever is narrower. A detach nested inside
-// another bounded section therefore cannot extend past it.
+// its logging and tracing values) and is bounded by budget. A detach nested
+// inside another detached section is additionally clamped to that section's
+// deadline, so it cannot outlive the single end-to-end budget that fences a v2
+// stop finalization against a concurrent replay.
+//
+// A deadline the caller's request carries is deliberately dropped, even one
+// already in the past: a timeout- or cancel-triggered teardown is exactly the
+// case this exists for, and inheriting an expired request deadline would hand it
+// a context that is canceled the moment it is created, skipping the durable
+// writes. Only an enclosing detached budget (marked here) is inherited.
 func detachedWithin(base context.Context, budget time.Duration) (context.Context, context.CancelFunc) {
 	if base == nil {
 		base = context.Background()
 	}
 	deadline := time.Now().Add(budget)
-	if inherited, ok := base.Deadline(); ok && inherited.Before(deadline) {
+	if inherited, ok := base.Deadline(); ok && isDetachedDeadline(base) && inherited.Before(deadline) {
 		deadline = inherited
 	}
-	return context.WithDeadline(context.WithoutCancel(base), deadline)
+	ctx, cancel := context.WithDeadline(context.WithoutCancel(base), deadline)
+	return context.WithValue(ctx, detachedDeadlineKey{}, deadline), cancel
+}
+
+// isDetachedDeadline reports whether ctx carries a deadline established by an
+// enclosing detachedWithin call. Values survive the wrapper contexts
+// (WithDeadline, WithCancel) that a finalization layers over the detach, so the
+// marker is visible to every nested detach.
+func isDetachedDeadline(ctx context.Context) bool {
+	return ctx != nil && ctx.Value(detachedDeadlineKey{}) != nil
 }
 
 // cancelOnEither returns a context that is done when either parent is done and
@@ -2129,9 +2152,10 @@ func (h *PlaybackHandler) finalizeSessionStop(ctx context.Context, session *play
 // step of the stop completed. A non-nil error means the stop is not finished:
 // the v2 finalization must leave the receipt unfinalized so a replay can redo
 // the writers (all idempotent) instead of pinning a half-torn session as done.
-// priorHistoryID is the history row a previous attempt of this same stop already
-// wrote, reused so the retry cannot add a second row.
-func (h *PlaybackHandler) finalizeSessionStopWithResult(ctx context.Context, session *playback.Session, syncNow bool, syncReason string, userInitiated bool, priorHistoryID string) (watchstate.PlaybackStopResult, error) {
+// historyID is the row this stop must write, derived from the durable stop
+// identity, so the retry cannot add a second row; empty means this path has no
+// durable stop identity and mints a fresh row per stop.
+func (h *PlaybackHandler) finalizeSessionStopWithResult(ctx context.Context, session *playback.Session, syncNow bool, syncReason string, userInitiated bool, historyID string) (watchstate.PlaybackStopResult, error) {
 	if h == nil || session == nil || session.ID == "" {
 		return watchstate.PlaybackStopResult{}, nil
 	}
@@ -2148,7 +2172,7 @@ func (h *PlaybackHandler) finalizeSessionStopWithResult(ctx context.Context, ses
 	// longer knows, so discard it rather than let the drain retry a dead session.
 	h.dropDeferredPublish(session.ID)
 
-	stopResult, historyErr := h.recordStopHistory(ctx, session, priorHistoryID)
+	stopResult, historyErr := h.recordStopHistory(ctx, session, historyID)
 	if h.WatchScrobbler != nil {
 		if event, ok := h.scrobbleEventForStoppedSession(ctx, session, stopResult); ok && (userInitiated || stopResult.Completed) {
 			if err := h.WatchScrobbler.ScrobbleStop(ctx, event); err != nil {
@@ -2183,9 +2207,8 @@ func (h *PlaybackHandler) finalizeSessionStopWithResult(ctx context.Context, ses
 // recordStopHistory writes a stopped session to watch history and the admin
 // playback log. The admin log keeps one row per session. It reports whether the
 // watch-history write completed; the admin-log write stays best effort.
-// priorHistoryID is the history row a previous attempt of this same stop already
-// wrote (see persistStopAndHistory).
-func (h *PlaybackHandler) recordStopHistory(ctx context.Context, session *playback.Session, priorHistoryID string) (watchstate.PlaybackStopResult, error) {
+// historyID is the row this stop must write (see persistStopAndHistory).
+func (h *PlaybackHandler) recordStopHistory(ctx context.Context, session *playback.Session, historyID string) (watchstate.PlaybackStopResult, error) {
 	// A Jellyfin session copy without a position never saw the play's
 	// progress: a start that failed to route, or a replica that only served
 	// media while another replica took the reports. It must not record the
@@ -2193,7 +2216,7 @@ func (h *PlaybackHandler) recordStopHistory(ctx context.Context, session *playba
 	if session.IsJellyfinCompat && session.Position <= 0 {
 		return watchstate.PlaybackStopResult{}, nil
 	}
-	result, err := h.persistStopAndHistory(ctx, session, priorHistoryID)
+	result, err := h.persistStopAndHistory(ctx, session, historyID)
 	if entry, buildErr := h.buildAdminHistoryEntry(ctx, session); buildErr != nil {
 		slog.ErrorContext(ctx, "failed to build admin history", "component", "api", "session", session.ID, "error", buildErr)
 	} else if entry != nil && h.AdminStore != nil {

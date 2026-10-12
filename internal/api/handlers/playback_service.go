@@ -752,6 +752,23 @@ const stopFinalizationBudget = 20 * time.Second
 // stop could be left with no receipt and a later replay would redo the writers.
 const stopFinalizationReceiptGrace = 3 * time.Second
 
+// nativeStopHistoryNamespace derives a v2 stop's watch-history row ID from its
+// durable stop identity, the same way compatPlayHistoryNamespace does for a
+// Jellyfin session.
+var nativeStopHistoryNamespace = uuid.MustParse("6f1b4d2a-9c37-4c58-8a10-7e5b3d9f20c4")
+
+// stopHistoryIDV2 names the watch-history row of a v2 stop. It is derived from
+// the durable stop identity the attempt row already carries rather than minted
+// at write time, so the key exists before the history row is inserted. A crash
+// or receipt-write failure between that insert and RecordStopReceipt leaves the
+// row's HistoryID unset; a later replay derives the same key and AddVisibleHistory
+// reports the row already exists instead of adding a second one for one stop.
+// Deriving per stop, not per session, preserves the native rule that a session
+// resumed under the same id records each stretch separately.
+func stopHistoryIDV2(stopID string) string {
+	return uuid.NewSHA1(nativeStopHistoryNamespace, []byte(stopID)).String()
+}
+
 // finalizeStopV2 claims finalization, runs the stop side effects, and records
 // the finalized receipt. When the claim is lost the stored receipt is returned
 // unchanged. The stop is already committed on the attempt row by the time this
@@ -812,6 +829,15 @@ func (h *PlaybackHandler) finalizeStopV2(ctx context.Context, store playback.Pro
 			}
 		}
 	}
+	// The watch-history row is derived from the durable stop identity before the
+	// history writer runs, never read back from the receipt afterward: a crash
+	// between the insert and RecordStopReceipt must leave a replay deriving the
+	// same row instead of minting a second one. A receipt that already carries
+	// the id (a previous attempt recorded it) is used as is.
+	historyID := receipt.HistoryID
+	if historyID == "" {
+		historyID = stopHistoryIDV2(receipt.StopID)
+	}
 	// The cleanup runs inside the budget but may not consume the receipt's
 	// reserved slice. finishStopV2's nested teardowns clamp to this deadline, so
 	// a slow cleanup cannot push the receipt past the shared budget and leave the
@@ -819,8 +845,8 @@ func (h *PlaybackHandler) finalizeStopV2(ctx context.Context, store playback.Pro
 	finalDeadline, _ := finalCtx.Deadline()
 	cleanupCtx, cancelCleanup := context.WithDeadline(finalCtx, finalDeadline.Add(-stopFinalizationReceiptGrace))
 	defer cancelCleanup()
-	historyID, cleanupErr := h.finishStopV2(cleanupCtx, record, sessionID, receipt.Accepted, receipt.HistoryID)
-	receipt.HistoryID = historyID
+	writtenHistoryID, cleanupErr := h.finishStopV2(cleanupCtx, record, sessionID, receipt.Accepted, historyID)
+	receipt.HistoryID = writtenHistoryID
 	// A cleanup that did not finish leaves the stop replayable: the receipt is
 	// stored unfinalized so a later replay re-runs the idempotent writers rather
 	// than pin a half-torn session as done. Storing it also releases this claim,
@@ -852,12 +878,13 @@ func (h *PlaybackHandler) finalizeStopV2(ctx context.Context, store playback.Pro
 // written in both cases. It returns the watch-history id when one was made and
 // a non-nil error when any durable step did not complete.
 //
-// priorHistoryID is the history row a previous attempt of this same stop already
-// wrote, recorded in the stop receipt. It is reused so a retry cannot add a
-// second row; every other step is naturally idempotent (progress, deny marker,
-// synced-session delete, proxy grant). The finalization therefore finalizes the
-// receipt only when this returns nil.
-func (h *PlaybackHandler) finishStopV2(ctx context.Context, record *playback.AttemptRecordV3, sessionID string, accepted *playback.ProgressSampleV3, priorHistoryID string) (string, error) {
+// historyID is the row this stop must write, derived from the durable stop
+// identity (or reused from a prior attempt's receipt); every writer it reaches
+// dedupes on it, so a retry cannot add a second row. Every other step is
+// naturally idempotent (progress, deny marker, synced-session delete, proxy
+// grant). The finalization therefore finalizes the receipt only when this
+// returns nil.
+func (h *PlaybackHandler) finishStopV2(ctx context.Context, record *playback.AttemptRecordV3, sessionID string, accepted *playback.ProgressSampleV3, historyID string) (string, error) {
 	// The sole caller, finalizeStopV2, passes an already-detached, bounded
 	// context, so the deny marker, the final position, and the history writer run
 	// on the finalization budget instead of resetting another.
@@ -878,7 +905,7 @@ func (h *PlaybackHandler) finishStopV2(ctx context.Context, record *playback.Att
 				slog.WarnContext(ctx, "failed to apply final playback position", "component", "api", "session", sessionID, "playback_session_id", sessionID, "error", err)
 			}
 		}
-		result, err := h.stopPlaybackSessionWithResult(ctx, session, true, priorHistoryID)
+		result, err := h.stopPlaybackSessionWithResult(ctx, session, true, historyID)
 		if err == nil {
 			return result.HistoryID, nil
 		}
@@ -893,7 +920,7 @@ func (h *PlaybackHandler) finishStopV2(ctx context.Context, record *playback.Att
 		// the shared rows are cleaned up.
 	}
 	synthesized := h.attemptSessionV2(ctx, record, position, paused)
-	result, err := h.persistStopAndHistory(ctx, synthesized, priorHistoryID)
+	result, err := h.persistStopAndHistory(ctx, synthesized, historyID)
 	if err != nil {
 		return "", err
 	}

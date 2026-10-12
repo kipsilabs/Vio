@@ -91,6 +91,77 @@ func TestStreamAbortTeardownCompletesUnderCanceledContext(t *testing.T) {
 	}
 }
 
+// expiredDeadlinePlaybackContext is a request whose deadline has already passed:
+// the timeout case, where the request is done but the teardown it triggered must
+// still run. The context records a past deadline; detachedWithin must ignore it.
+func expiredDeadlinePlaybackContext() context.Context {
+	ctx, cancel := context.WithDeadline(newAuthorizedPlaybackContext(), time.Now().Add(-time.Second))
+	cancel()
+	return ctx
+}
+
+// detachedWithin must not inherit an already-expired request deadline: doing so
+// would hand a timeout-triggered teardown a context that is canceled at birth.
+// It takes a fresh budget instead. Only an enclosing detached budget narrows it.
+func TestDetachedWithinIgnoresExpiredRequestDeadline(t *testing.T) {
+	ctx, cancel := detachedWithin(expiredDeadlinePlaybackContext(), time.Minute)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		t.Fatalf("detached context was already done: %v", err)
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok || !deadline.After(time.Now()) {
+		t.Fatalf("deadline = %v, ok = %v, want a fresh future budget", deadline, ok)
+	}
+}
+
+// A detach nested inside another detached budget is clamped to it, so a v2 stop
+// finalization's nested teardowns cannot reset a fresh full timeout and outlive
+// the lease that fences the finalization.
+func TestDetachedWithinClampsToEnclosingDetachedBudget(t *testing.T) {
+	outer, cancelOuter := detachedWithin(context.Background(), 50*time.Millisecond)
+	defer cancelOuter()
+	outerDeadline, ok := outer.Deadline()
+	if !ok {
+		t.Fatal("outer detached context has no deadline")
+	}
+
+	inner, cancelInner := detachedWithin(outer, time.Hour)
+	defer cancelInner()
+	innerDeadline, ok := inner.Deadline()
+	if !ok {
+		t.Fatal("inner detached context has no deadline")
+	}
+	if !innerDeadline.Equal(outerDeadline) {
+		t.Fatalf("nested deadline = %v, want the enclosing %v", innerDeadline, outerDeadline)
+	}
+}
+
+// An already-expired request deadline is the common timeout case, not just the
+// canceled case above. The teardown it triggers must still complete its durable
+// writes on a fresh budget; otherwise the synced-session delete runs on an
+// already-canceled context and the session is stranded.
+func TestStreamAbortTeardownCompletesUnderExpiredRequestDeadline(t *testing.T) {
+	manager := playback.NewSessionManager(0, 0)
+	file := &models.MediaFile{ID: 4030317, FilePath: "/media/movie.mkv", FileSize: 1}
+	session, err := manager.StartSession(1, "profile-1", file.ID, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adminStore := &cancelSensitiveAdminStore{}
+	h := NewStreamHandler(manager, testPlaybackFileResolver{file: file})
+	h.AdminStore = adminStore
+
+	h.abortPlaybackSession(expiredDeadlinePlaybackContext(), session)
+
+	if !adminStore.deleted[session.ID] {
+		t.Fatalf("durable session delete did not complete under an expired deadline (calls=%d)", adminStore.deleteCalls)
+	}
+	if _, err := manager.GetSession(session.ID); !errors.Is(err, playback.ErrSessionNotFound) {
+		t.Fatalf("session still live after abort: err=%v", err)
+	}
+}
+
 // The expired-attempt stop and its deny marker are durable teardown too. A
 // canceled request context must not skip the attempt stop.
 func TestMarkAttemptStoppedServerSideDetachesFromCanceledContext(t *testing.T) {
@@ -640,11 +711,14 @@ func TestStopFinalizationFailedCleanupStaysReplayable(t *testing.T) {
 }
 
 // The stop finalization waits for the per-session lifecycle lock a replacement
-// preparation may hold. That wait is bounded by the finalization deadline: a
-// finalizer blocked past its lease could otherwise start teardown after another
-// replica took the stop over. Here the holder outlasts the deadline, so the
-// expired teardown is rejected and nothing is torn down or finalized.
-func TestStopFinalizationLifecycleWaitBoundedByDeadline(t *testing.T) {
+// preparation may hold. That wait is bounded by the finalization's own budget,
+// not by the request that triggered it: an already-expired request deadline must
+// not become the teardown's deadline, or a timeout-triggered stop would skip its
+// durable writes entirely. A finalizer blocked past its lease is a different
+// problem, and the budget stays below the lease so it cannot start teardown after
+// another replica took the stop over. Here the holder outlasts the budget, so the
+// wait ends on the budget and nothing is torn down or finalized.
+func TestStopFinalizationLifecycleWaitBoundedByBudgetNotRequestDeadline(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		f := newPlaybackServiceFixture(t)
 		store := &leaseObservingStore{MemoryPlanStoreV3: f.handler.PlanStoreV3.(*playback.MemoryPlanStoreV3)}
@@ -652,26 +726,31 @@ func TestStopFinalizationLifecycleWaitBoundedByDeadline(t *testing.T) {
 		admin := &cancelSensitiveAdminStore{}
 		f.handler.AdminStore = admin
 
-		// The replacement holds the lifecycle lock for longer than the stop's
-		// finalization deadline.
+		// The replacement holds the lifecycle lock past the finalization budget.
 		unlock := f.handler.tm.LockSessionLifecycle(f.session.ID)
 		holderDone := make(chan struct{})
 		go func() {
-			time.Sleep(6 * time.Second)
+			time.Sleep(25 * time.Second)
 			unlock()
 			close(holderDone)
 		}()
 
-		reqCtx, cancel := context.WithTimeout(f.ctx, 5*time.Second)
-		defer cancel()
+		// The request is already past its deadline: the teardown must take its
+		// own budget rather than inherit the expired one.
 		start := time.Now()
-		view, err := f.handler.StopPlaybackV2(reqCtx, f.caller, f.session.ID, PlaybackStopCommand{StopID: uuid.NewString()})
+		view, err := f.handler.StopPlaybackV2(expiredDeadlinePlaybackContext(), f.caller, f.session.ID, PlaybackStopCommand{StopID: uuid.NewString()})
 		elapsed := time.Since(start)
 		if err != nil || view.Outcome != PlaybackOutcomeStopped {
 			t.Fatalf("stop = %+v, %v", view, err)
 		}
-		if elapsed >= 5*time.Second {
-			t.Fatalf("stop waited %v for the lifecycle lock, past its finalization deadline", elapsed)
+		if elapsed < 10*time.Second {
+			t.Fatalf("stop waited only %v for the lifecycle lock, so it inherited the expired request deadline", elapsed)
+		}
+		if elapsed > stopFinalizationBudget {
+			t.Fatalf("stop waited %v for the lifecycle lock, past the %v finalization budget", elapsed, stopFinalizationBudget)
+		}
+		if elapsed >= stopFinalizationLease {
+			t.Fatalf("stop ran %v, not inside the %v lease", elapsed, stopFinalizationLease)
 		}
 		if _, err := f.manager.GetSession(f.session.ID); err != nil {
 			t.Fatalf("an expired teardown ran once the lock was free: %v", err)
@@ -751,6 +830,77 @@ func TestStopReplayPollingIsBoundedByFinalizationDeadline(t *testing.T) {
 		}
 		if _, err := f.manager.GetSession(f.session.ID); err != nil {
 			t.Fatalf("a replay that lost the claim must not tear the session down: %v", err)
+		}
+	})
+}
+
+// failFinalizedReceiptOnce drops the first finalized receipt write, standing in
+// for a crash between the watch-history insert and RecordStopReceipt. The durable
+// attempt row keeps the stop id, so the replay must derive the same history row
+// rather than mint a second one.
+type failFinalizedReceiptOnce struct {
+	*playback.MemoryPlanStoreV3
+	mu     sync.Mutex
+	failed bool
+}
+
+func (s *failFinalizedReceiptOnce) RecordStopReceipt(ctx context.Context, sessionID string, receipt playback.StopReceiptV3) error {
+	s.mu.Lock()
+	fail := receipt.Finalized && !s.failed
+	if fail {
+		s.failed = true
+	}
+	s.mu.Unlock()
+	if fail {
+		return errors.New("simulated crash before the receipt write")
+	}
+	return s.MemoryPlanStoreV3.RecordStopReceipt(ctx, sessionID, receipt)
+}
+
+// A crash between the watch-history insert and the receipt write must not let a
+// replay mint a second history row for one stop. The history key is derived from
+// the durable stop id before the insert, so the replay derives the same row and
+// AddVisibleHistory reports it already exists instead of duplicating the play.
+func TestStopReplayAfterLostReceiptReusesHistoryRow(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := newPlaybackServiceFixture(t)
+		userStore := newPlaybackTestStore(t)
+		f.handler.StoreProvider = testUserStoreProvider{store: userStore}
+		store := &failFinalizedReceiptOnce{MemoryPlanStoreV3: f.handler.PlanStoreV3.(*playback.MemoryPlanStoreV3)}
+		f.handler.PlanStoreV3 = store
+
+		final := 120.0
+		first, err := f.handler.StopPlaybackV2(f.ctx, f.caller, f.session.ID, PlaybackStopCommand{StopID: uuid.NewString(), Sequence: 1, Position: &final})
+		if err != nil || first.Outcome != PlaybackOutcomeStopped {
+			t.Fatalf("first stop = %+v, %v", first, err)
+		}
+		if first.HistoryID == "" {
+			t.Fatal("first stop recorded no history id")
+		}
+		history, err := userStore.ListHistory(context.Background(), "profile-1", 10, 0)
+		if err != nil {
+			t.Fatalf("ListHistory: %v", err)
+		}
+		if len(history) != 1 {
+			t.Fatalf("history after the lost receipt = %d rows, want 1", len(history))
+		}
+
+		// A crash left the finalization claim behind; past its lease a replay may
+		// reclaim it and must reuse the same history row.
+		time.Sleep(stopFinalizationLease + time.Second)
+		second, err := f.handler.StopPlaybackV2(f.ctx, f.caller, f.session.ID, PlaybackStopCommand{StopID: uuid.NewString()})
+		if err != nil || second.Outcome != PlaybackOutcomeReplayed {
+			t.Fatalf("replayed stop = %+v, %v", second, err)
+		}
+		if second.HistoryID != first.HistoryID {
+			t.Fatalf("replay history id = %q, want %q: the stop re-minted the history row", second.HistoryID, first.HistoryID)
+		}
+		history, err = userStore.ListHistory(context.Background(), "profile-1", 10, 0)
+		if err != nil {
+			t.Fatalf("ListHistory: %v", err)
+		}
+		if len(history) != 1 {
+			t.Fatalf("history after replay = %d rows, want 1: a replay duplicated the stop", len(history))
 		}
 	})
 }
