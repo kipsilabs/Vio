@@ -9,6 +9,7 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/scanner"
+	"github.com/Silo-Server/silo-server/internal/virtuallibrary/resolver"
 )
 
 // TestResolveVirtualPlaybackSourcePartialEnumerationSettlesDeclared pins the
@@ -143,7 +144,7 @@ func TestDeferredProbePartialEnumerationStaysPending(t *testing.T) {
 	outcome, verifiedFileID := fx.handler.probeVirtualSourceAndPersistWith(
 		context.Background(),
 		deferred.stickyKey, deferred.file, deferred.streamURL,
-		*deferred.probeTransient, deferred.cand, deferred.expectedRuntimeMinutes, deferred.ownerID,
+		*deferred.probeTransient, deferred.cand, resolver.PersistedIdentityTiers{}, deferred.expectedRuntimeMinutes, deferred.ownerID,
 		true, nil,
 	)
 	if outcome != probeOutcomePartial {
@@ -216,7 +217,7 @@ func TestBackgroundProbePartialEnumerationHasBoundedStreak(t *testing.T) {
 	transient := models.MediaFile{ID: 940, FilePath: cand.URI}
 
 	run := func() string {
-		return h.probeVirtualSourceAndPersist(context.Background(), "sticky-key", file, "http://127.0.0.1/x", transient, cand, 0, 5)
+		return h.probeVirtualSourceAndPersist(context.Background(), "sticky-key", file, "http://127.0.0.1/x", transient, cand, resolver.PersistedIdentityTiers{}, 0, 5)
 	}
 
 	// The first partial is an incomplete read, not a verdict about the bytes.
@@ -295,7 +296,7 @@ func TestBackgroundProbeForwardsCandidateAudioBeforeGate(t *testing.T) {
 	// The probe input the rotation/background path builds: the catalog row alone.
 	rowOnly := models.MediaFile{ID: 941, FilePath: cand.URI}
 
-	outcome := h.probeVirtualSourceAndPersist(context.Background(), "sticky-thin", file, "http://127.0.0.1/x", rowOnly, cand, 0, 5)
+	outcome := h.probeVirtualSourceAndPersist(context.Background(), "sticky-thin", file, "http://127.0.0.1/x", rowOnly, cand, resolver.PersistedIdentityTiers{}, 0, 5)
 	if outcome != probeOutcomePartial {
 		t.Fatalf("outcome = %q, want partial: a candidate that declares audio must not verify a video-without-audio enumeration", outcome)
 	}
@@ -370,7 +371,7 @@ func TestDeferredProbeCompleteEnumerationVerifies(t *testing.T) {
 	outcome, verifiedFileID := fx.handler.probeVirtualSourceAndPersistWith(
 		context.Background(),
 		deferred.stickyKey, deferred.file, deferred.streamURL,
-		*deferred.probeTransient, deferred.cand, deferred.expectedRuntimeMinutes, deferred.ownerID,
+		*deferred.probeTransient, deferred.cand, resolver.PersistedIdentityTiers{}, deferred.expectedRuntimeMinutes, deferred.ownerID,
 		true, nil,
 	)
 	if outcome != probeOutcomeVerified {
@@ -420,7 +421,7 @@ func TestDeferredProbeDeclaredAudioHoldsPendingUntilProbed(t *testing.T) {
 	outcome, verifiedFileID := fx.handler.probeVirtualSourceAndPersistWith(
 		context.Background(),
 		pending.stickyKey, pending.file, pending.streamURL,
-		*pending.probeTransient, pending.cand, pending.expectedRuntimeMinutes, pending.ownerID,
+		*pending.probeTransient, pending.cand, resolver.PersistedIdentityTiers{}, pending.expectedRuntimeMinutes, pending.ownerID,
 		true, nil,
 	)
 	if outcome != probeOutcomePartial {
@@ -445,7 +446,7 @@ func TestDeferredProbeDeclaredAudioHoldsPendingUntilProbed(t *testing.T) {
 	outcome, verifiedFileID = fx.handler.probeVirtualSourceAndPersistWith(
 		context.Background(),
 		verified.stickyKey, verified.file, verified.streamURL,
-		*verified.probeTransient, verified.cand, verified.expectedRuntimeMinutes, verified.ownerID,
+		*verified.probeTransient, verified.cand, resolver.PersistedIdentityTiers{}, verified.expectedRuntimeMinutes, verified.ownerID,
 		true, nil,
 	)
 	if outcome != probeOutcomeVerified {
