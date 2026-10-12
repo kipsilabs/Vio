@@ -400,21 +400,23 @@ func TestResolveCopySeekAnchorForSourceReusesProvenInterval(t *testing.T) {
 	if anchor, segment := resolve(121); anchor != 120 || segment != 60 {
 		t.Fatalf("first anchor = %v segment = %d; want 120, 60", anchor, segment)
 	}
-	// The exact probed position is the interval's exclusive upper bound, so it
-	// re-probes instead of reusing the packet the first probe observed.
+	// An exact repeat of the probed position reuses: FFmpeg observed 121
+	// yield 120, so the inclusive upper bound (anchor, maxRequested] serves
+	// it. Only a request exactly on the anchor keyframe stays unproven
+	// (Matroska pre-roll).
 	if anchor, _ := resolve(121); anchor != 120 {
-		t.Fatalf("boundary anchor = %v; want its own 120", anchor)
+		t.Fatalf("repeat anchor = %v; want cached 120", anchor)
 	}
-	if calls != 2 {
-		t.Fatalf("probe calls = %d, want 2 (the probed boundary is exclusive)", calls)
+	if calls != 1 {
+		t.Fatalf("probe calls = %d, want 1 (an exact repeat must hit the cache)", calls)
 	}
 	// 120.5 is strictly inside the interval the 121 probe proved, so it reuses
 	// 120.
 	if anchor, _ := resolve(120.5); anchor != 120 {
 		t.Fatalf("proven-interval anchor = %v; want cached 120", anchor)
 	}
-	if calls != 2 {
-		t.Fatalf("probe calls = %d, want 2 (120.5 is inside the proven interval)", calls)
+	if calls != 1 {
+		t.Fatalf("probe calls = %d, want 1 (120.5 is inside the proven interval)", calls)
 	}
 	// 121.5 is past the proven interval, so it probes rather than assuming the
 	// GOP continues; the fixture still resolves it to 120 and extends the
@@ -422,15 +424,15 @@ func TestResolveCopySeekAnchorForSourceReusesProvenInterval(t *testing.T) {
 	if anchor, _ := resolve(121.5); anchor != 120 {
 		t.Fatalf("anchor for 121.5 = %v; want its own 120", anchor)
 	}
-	if calls != 3 {
-		t.Fatalf("probe calls = %d, want 3 (121.5 is past the proven interval)", calls)
+	if calls != 2 {
+		t.Fatalf("probe calls = %d, want 2 (121.5 is past the proven interval)", calls)
 	}
 	// 121.2 now falls inside the extended interval and reuses 120.
 	if anchor, _ := resolve(121.2); anchor != 120 {
 		t.Fatalf("extended-interval anchor = %v; want cached 120", anchor)
 	}
-	if calls != 3 {
-		t.Fatalf("probe calls = %d, want 3 (the extended interval is reused)", calls)
+	if calls != 2 {
+		t.Fatalf("probe calls = %d, want 2 (the extended interval is reused)", calls)
 	}
 }
 
@@ -768,10 +770,11 @@ func TestResolveCopySeekAnchorSkipsProbeWhenCallerBudgetExpired(t *testing.T) {
 
 // TestLookupCachedCopySeekAnchorServesProvenIntervalWithoutProbe proves the lazy
 // lookup the transport timeline uses answers only from an interval a prior probe
-// already proved, and never starts a probe itself. A position strictly inside
-// the interval reuses the anchor; the exact observed boundary (the interval's
-// exclusive upper bound), a position past the interval, an unobserved source,
-// and an empty identity all miss so the caller falls through to a fresh probe.
+// already proved, and never starts a probe itself. A position inside the
+// interval — including an exact repeat of the probed request — reuses the
+// anchor; a request on the anchor keyframe, a position past the interval, an
+// unobserved source, and an empty identity all miss so the caller falls
+// through to a fresh probe.
 func TestLookupCachedCopySeekAnchorServesProvenIntervalWithoutProbe(t *testing.T) {
 	var calls int
 	resetCopySeekAnchorCache(t, nil, func(_ context.Context, _ string, _ string, requested float64, segmentDuration int) (float64, int, error) {
@@ -780,7 +783,7 @@ func TestLookupCachedCopySeekAnchorServesProvenIntervalWithoutProbe(t *testing.T
 		return keyframe, int(keyframe / float64(segmentDuration)), nil
 	})
 	ctx := context.Background()
-	// Prove the open interval (120, 121) for this source.
+	// Prove the interval (120, 121] for this source.
 	if _, _, err := ResolveCopySeekAnchorForSource(ctx, "ffmpeg", "virtual://movie/lazy", "http://relay/lazy", 121, 2); err != nil {
 		t.Fatalf("seed probe: %v", err)
 	}
@@ -796,8 +799,8 @@ func TestLookupCachedCopySeekAnchorServesProvenIntervalWithoutProbe(t *testing.T
 		t.Fatalf("the lazy lookup started a probe: calls = %d, want 1", calls)
 	}
 
-	if _, _, ok := LookupCachedCopySeekAnchor("ffmpeg", "virtual://movie/lazy", 121, 2); ok {
-		t.Fatal("the exact observed boundary was served from cache; it must re-probe")
+	if _, _, ok := LookupCachedCopySeekAnchor("ffmpeg", "virtual://movie/lazy", 121, 2); !ok {
+		t.Fatal("an exact repeat of the probed request missed the cache; it must reuse")
 	}
 	if _, _, ok := LookupCachedCopySeekAnchor("ffmpeg", "virtual://movie/lazy", 121.5, 2); ok {
 		t.Fatal("a position past the proven interval was served from cache")
@@ -929,8 +932,8 @@ func BenchmarkCopySeekAnchorResolveVersusLookup(b *testing.B) {
 		}
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
-			// 18.0 lies strictly inside the interval the seed probe proved
-			// (anchor 10, exclusive upper bound 18.261), so this is a hit.
+			// 18.0 lies inside the interval the seed probe proved
+			// (anchor 10, inclusive upper bound 18.261), so this is a hit.
 			if _, _, ok := LookupCachedCopySeekAnchor(ffmpegPath, identity, 18.0, 2); !ok {
 				b.Fatal("lazy lookup missed a proven interval")
 			}

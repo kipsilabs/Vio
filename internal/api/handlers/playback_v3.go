@@ -4211,9 +4211,9 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 			// The pinned-relay resolve and the FFmpeg probe below are then pure
 			// overhead: a cache hit needs no bytes to read. Consult the cache
 			// first and, on a proven hit, skip the eager relay reopen entirely.
-			// Only a position strictly inside a probed interval answers (the
-			// exact observed boundary still re-probes), so seek accuracy is
-			// unchanged.
+			// A position inside a probed interval answers, including an exact
+			// repeat of the probed request; only a request on the anchor
+			// keyframe still re-probes, so seek accuracy is unchanged.
 			if cachedOrigin, cachedSegment, ok := h.lookupCachedCopySeekAnchorV3(ffmpegPath, sourceIdentity, requested, playback.DefaultSegmentDuration); ok {
 				configureCopyRemuxTimelineV3(result.Plan, cachedOrigin)
 				return preparedTimelineV3{seekSeconds: requested, streamOriginSeconds: cachedOrigin, startSegmentNumber: cachedSegment, copySeekAnchorResolved: true}, nil
