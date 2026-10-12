@@ -1,7 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { setAccessToken, setProfileId, setProfileToken } from "@/api/client";
 import {
+  BUFFERED_SAVE_LIMIT_BYTES,
+  canSavePreparedDownload,
   getPreparedDownload,
+  readBoundedSaveBlob,
   savePreparedDownload,
   SaveCancelledError,
   type PreparedDownloadEntry,
@@ -179,5 +182,57 @@ describe("savePreparedDownload", () => {
     await expect(savePreparedDownload("dl-1", "Movie.mp4")).rejects.toThrow(
       /expired or no longer available/i,
     );
+  });
+
+  it("refuses to buffer a file larger than the browser budget", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(new Uint8Array([1, 2]), {
+          status: 200,
+          headers: { "Content-Length": String(BUFFERED_SAVE_LIMIT_BYTES + 1) },
+        }),
+      ),
+    );
+    const createObjectURL = vi.spyOn(URL, "createObjectURL").mockImplementation(() => "blob:saved");
+
+    await expect(savePreparedDownload("dl-1", "Movie.mp4")).rejects.toThrow(/too large/i);
+    expect(createObjectURL).not.toHaveBeenCalled();
+  });
+});
+
+describe("readBoundedSaveBlob", () => {
+  it("reads a body within the budget into a blob", async () => {
+    const blob = await readBoundedSaveBlob(
+      new Response(new Uint8Array([1, 2, 3, 4])),
+      undefined,
+      8,
+    );
+    expect(blob.size).toBe(4);
+  });
+
+  it("refuses an oversized advertised body before reading it", async () => {
+    const res = new Response("small fixture", {
+      headers: { "Content-Length": "9" },
+    });
+    await expect(readBoundedSaveBlob(res, undefined, 8)).rejects.toThrow(/too large/i);
+  });
+
+  it("enforces the budget on the body when the advertised length is absent or understated", async () => {
+    await expect(
+      readBoundedSaveBlob(new Response(new Uint8Array([1, 2])), undefined, 1),
+    ).rejects.toThrow(/too large/i);
+  });
+});
+
+describe("canSavePreparedDownload", () => {
+  it("caps an over-budget file only when the browser cannot stream", () => {
+    expect((window as { showSaveFilePicker?: unknown }).showSaveFilePicker).toBeUndefined();
+    expect(canSavePreparedDownload(BUFFERED_SAVE_LIMIT_BYTES + 1)).toBe(false);
+    expect(canSavePreparedDownload(BUFFERED_SAVE_LIMIT_BYTES)).toBe(true);
+    expect(canSavePreparedDownload(undefined)).toBe(true);
+
+    vi.stubGlobal("showSaveFilePicker", vi.fn());
+    expect(canSavePreparedDownload(BUFFERED_SAVE_LIMIT_BYTES + 1)).toBe(true);
   });
 });

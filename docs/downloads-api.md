@@ -1221,9 +1221,12 @@ the catalog as container `virtual`) has no local file on the API host. Requestin
 `original` quality for such a version still returns a `preparing` row: the server
 resolves the provider source through the playback virtual-transport path and
 prepares a compatible artifact, then serves it from
-`GET /api/v2/downloads/{id}/file` like any prepared file. There is no
-direct-download route for a virtual version, so a client must create a download
-and wait for `ready` rather than offering the source directly.
+`GET /api/v2/downloads/{id}/file` like any prepared file. The provider source is
+reached through a relay that listens only on the API host's loopback interface,
+so a provider-backed download is always prepared on the API host; it never runs
+on a transcode node. There is no direct-download route for a virtual version, so
+a client must create a download and wait for `ready` rather than offering the
+source directly.
 
 ### 9.2 Offline to online
 

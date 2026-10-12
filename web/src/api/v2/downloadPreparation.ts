@@ -1,4 +1,5 @@
 import {
+  API_BLOB_MAX_BYTES,
   captureProfileRequestContext,
   fetchWithSession,
   isProfileRequestContextCurrent,
@@ -129,6 +130,34 @@ export async function getPreparedDownload(
 export type PreparedDownloadSave = "streamed" | "buffered";
 
 /**
+ * The most a browser without the streaming save picker may buffer in memory.
+ * Safari, Firefox, and every mobile browser must hold the whole prepared file
+ * as a Blob before handing it to the download manager, so a multi-gigabyte
+ * title can exhaust the tab. This reuses the codebase's single browser-blob
+ * budget (see API_BLOB_MAX_BYTES); a file past it is refused with a reason that
+ * points at a transport that can stream.
+ */
+export const BUFFERED_SAVE_LIMIT_BYTES = API_BLOB_MAX_BYTES;
+
+/** The user-facing reason a buffered save is refused for being too large. */
+export const BUFFERED_SAVE_TOO_LARGE_MESSAGE =
+  "This file is too large to save in this browser. Open Silo in Chrome or Edge to stream large downloads, or use the Silo app.";
+
+/**
+ * Whether this browser can save a prepared file of the given size. A browser
+ * that streams to a user-chosen file has no size limit; one that must buffer
+ * is capped. An unknown size is allowed through so the fetch itself enforces
+ * the cap once Content-Length is known.
+ */
+export function canSavePreparedDownload(fileSizeBytes?: number): boolean {
+  if (supportsStreamingSave()) return true;
+  if (typeof fileSizeBytes !== "number" || !Number.isFinite(fileSizeBytes) || fileSizeBytes <= 0) {
+    return true;
+  }
+  return fileSizeBytes <= BUFFERED_SAVE_LIMIT_BYTES;
+}
+
+/**
  * Fetches the prepared file with the session's authority and saves it without
  * ever holding the whole file in memory when the browser can stream to disk.
  *
@@ -136,8 +165,9 @@ export type PreparedDownloadSave = "streamed" | "buffered";
  * under the existing auth model and then either streamed through the browser's
  * file-system picker (Chromium: memory stays bounded regardless of title size)
  * or, where that API is absent, buffered as a blob for a browser-managed object
- * URL save. A user who cancels the picker throws SaveCancelledError so the
- * caller can stay silent.
+ * URL save. The buffered path is capped at BUFFERED_SAVE_LIMIT_BYTES and refuses
+ * a larger file with an actionable reason rather than risk the tab. A user who
+ * cancels the picker throws SaveCancelledError so the caller can stay silent.
  */
 export async function savePreparedDownload(
   downloadId: string,
@@ -192,12 +222,57 @@ export async function savePreparedDownload(
   if (!res.ok) {
     throw new DownloadPreparationError(preparedFileRefusalMessage(res.status));
   }
-  const blob = await res.blob();
+  const blob = await readBoundedSaveBlob(res, signal);
   requireCurrent(snapshot);
   const filename =
     filenameFromDisposition(res.headers.get("Content-Disposition")) || filenameHint || "download";
   triggerBlobSave(blob, filename);
   return "buffered";
+}
+
+/**
+ * Reads an authorized response body into a Blob without exceeding limitBytes.
+ * Content-Length is checked first, so an over-budget file is refused before any
+ * bytes are buffered; the streaming cap then enforces the same bound when the
+ * header is absent or understates the body. Exported so the bound is testable;
+ * production callers use the default browser budget.
+ */
+export async function readBoundedSaveBlob(
+  res: Response,
+  signal?: AbortSignal,
+  limitBytes: number = BUFFERED_SAVE_LIMIT_BYTES,
+): Promise<Blob> {
+  const declared = Number(res.headers.get("Content-Length"));
+  if (Number.isFinite(declared) && declared > limitBytes) {
+    await res.body?.cancel().catch(() => undefined);
+    throw new DownloadPreparationError(BUFFERED_SAVE_TOO_LARGE_MESSAGE);
+  }
+  const reader = res.body?.getReader();
+  if (!reader) {
+    const buffer = await res.arrayBuffer();
+    if (buffer.byteLength > limitBytes) {
+      throw new DownloadPreparationError(BUFFERED_SAVE_TOO_LARGE_MESSAGE);
+    }
+    return new Blob([buffer]);
+  }
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    if (signal?.aborted) {
+      await reader.cancel().catch(() => undefined);
+      throw new DOMException("save aborted", "AbortError");
+    }
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+    total += value.byteLength;
+    if (total > limitBytes) {
+      await reader.cancel().catch(() => undefined);
+      throw new DownloadPreparationError(BUFFERED_SAVE_TOO_LARGE_MESSAGE);
+    }
+    chunks.push(value);
+  }
+  return new Blob(chunks);
 }
 
 /** The user cancelled the browser's save picker; this is not an error to report. */

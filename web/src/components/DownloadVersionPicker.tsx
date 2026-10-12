@@ -21,6 +21,8 @@ import {
   type PreparedDirectDownload,
 } from "@/api/v2/directDownloads";
 import {
+  BUFFERED_SAVE_TOO_LARGE_MESSAGE,
+  canSavePreparedDownload,
   createPreparedDownload,
   downloadPreparationErrorMessage,
   getPreparedDownload,
@@ -132,7 +134,11 @@ export default function DownloadVersionPicker({
   const [virtualQuality, setVirtualQuality] = useState<PreparedDownloadQuality>("original");
   const [submitting, setSubmitting] = useState(false);
   const [preparing, setPreparing] = useState<PendingVirtualDownload | null>(null);
-  const [virtualReady, setVirtualReady] = useState<{ id: string; filename: string } | null>(null);
+  const [virtualReady, setVirtualReady] = useState<{
+    id: string;
+    filename: string;
+    fileSize?: number;
+  } | null>(null);
   const {
     data: capability,
     isLoading: capabilityLoading,
@@ -215,7 +221,11 @@ export default function DownloadVersionPicker({
         return;
       }
       if (entry.status === "ready") {
-        setVirtualReady({ id: preparingId, filename: pendingFilenameRef.current });
+        setVirtualReady({
+          id: preparingId,
+          filename: pendingFilenameRef.current,
+          fileSize: entry.file_size,
+        });
         setPreparing(null);
         return;
       }
@@ -300,7 +310,11 @@ export default function DownloadVersionPicker({
       if (!isCurrent()) return;
       setVirtualSelection(null);
       if (entry.status === "ready") {
-        setVirtualReady({ id: String(entry.id), filename: version.file_name ?? "" });
+        setVirtualReady({
+          id: String(entry.id),
+          filename: version.file_name ?? "",
+          fileSize: entry.file_size,
+        });
       } else if (isDownloadPreparing(entry.status)) {
         setPreparing({ id: String(entry.id), status: entry.status });
       } else {
@@ -337,6 +351,13 @@ export default function DownloadVersionPicker({
 
   const handleSavePrepared = async () => {
     if (!virtualReady) return;
+    // A browser that must buffer refuses an over-budget file. Say why up front
+    // rather than spend a round-trip on a fetch that can only fail.
+    if (!canSavePreparedDownload(virtualReady.fileSize)) {
+      setRefusalMessage(BUFFERED_SAVE_TOO_LARGE_MESSAGE);
+      toast.error(BUFFERED_SAVE_TOO_LARGE_MESSAGE);
+      return;
+    }
     try {
       await savePreparedDownload(virtualReady.id, virtualReady.filename);
     } catch (error) {
@@ -550,10 +571,16 @@ export default function DownloadVersionPicker({
         {virtualReady && (
           <div className="border-border/50 bg-accent/30 space-y-2 rounded-xl border px-4 py-3">
             <p className="text-foreground text-sm font-medium">Your file is ready.</p>
+            {!canSavePreparedDownload(virtualReady.fileSize) && (
+              <p className="text-muted-foreground text-xs" role="status">
+                {BUFFERED_SAVE_TOO_LARGE_MESSAGE}
+              </p>
+            )}
             <Button
               type="button"
               variant="default"
               size="sm"
+              disabled={!canSavePreparedDownload(virtualReady.fileSize)}
               onClick={() => void handleSavePrepared()}
             >
               <Download className="size-4" />

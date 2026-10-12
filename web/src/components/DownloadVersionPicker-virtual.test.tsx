@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, expect, it, vi } from "vitest";
 import type { FileVersion } from "@/api/types";
-import { SaveCancelledError } from "@/api/v2/downloadPreparation";
+import { SaveCancelledError, BUFFERED_SAVE_LIMIT_BYTES } from "@/api/v2/downloadPreparation";
 import DownloadVersionPicker from "./DownloadVersionPicker";
 
 const mocks = vi.hoisted(() => ({
@@ -140,6 +140,22 @@ it("stays silent and keeps the file ready when the save picker is cancelled", as
 
   expect(mocks.toastError).not.toHaveBeenCalled();
   expect(screen.getByRole("button", { name: /Save file/i })).toBeInTheDocument();
+});
+
+it("communicates an over-budget file the browser cannot stream", async () => {
+  mocks.create.mockResolvedValue({
+    id: "dl_big",
+    status: "ready",
+    file_size: BUFFERED_SAVE_LIMIT_BYTES + 1,
+  });
+  await openVirtualPanel();
+
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: /Prepare download/i }));
+  });
+
+  expect(screen.getByText(/too large to save in this browser/i)).toBeVisible();
+  expect(screen.getByRole("button", { name: /Save file/i })).toBeDisabled();
 });
 
 it("cancels a preparing virtual download through delete", async () => {
