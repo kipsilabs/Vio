@@ -38,17 +38,27 @@ authorization, and playback.
 A virtual file's `verified` inventory status means the playback probe enumerated
 the whole stream table, not that it returned something. `scanner.ProbeVirtualSource`
 flags a partial enumeration (`scanner.ErrVirtualProbePartial`) when a successful
-ffprobe result describes video but no audio: every provider movie or episode
-carries audio, so a video-only table is a truncated read (a relay partial
-response, an analysis-budget cut-off, or an early return), not a video-only file.
-An empty subtitle set is a valid complete answer; only the missing audio stream
-marks a partial read.
+ffprobe result describes video but no audio **for an item that declared audio**.
+Video-only sources exist, so a missing audio stream is only an incomplete read
+when the item's own declared metadata (an audio codec or declared audio track)
+says the source carries audio: then a video-and-no-audio table is a truncated
+read (a relay partial response, an analysis-budget cut-off, or an early return),
+not a video-only file. An item that declares no audio may legitimately enumerate
+video only, and that result is complete. An empty subtitle set is a valid
+complete answer; it is never a partial signal. Finding one audio track does not
+by itself prove the rest of the table was read, so the probe result is not
+allowed to be its own completeness oracle.
 
 A partial probe is not a verdict about the candidate's bytes. The resolve serves
 the candidate's provisional plan at `pending` without consuming the probe-failure
 budget or releasing the sticky pin, and the deferred lifecycle records no outcome
-and publishes nothing. The session stays `pending` until a later complete probe
-verifies it or the convergence watchdog fails it at the bound. Synthesized or
+and publishes nothing. On the negotiated deferred path the session stays `pending`
+until a later complete probe verifies it or the convergence watchdog fails it at
+the bound. The non-negotiated background path has no session lifecycle for the
+watchdog to fail, so its bound is a repeated-incomplete-enumeration streak: a
+single partial is never penalized (the pin is kept and the failure damper stays
+clear), and only a persistent streak arms the failure damper so the resolve stops
+re-probing and settles on the candidate's declared metadata. Synthesized or
 hint-only tracks (container index <= 0) never satisfy completeness and never stamp
 `probe_updated_at`; persisted probe evidence requires a real stream index.
 

@@ -15,6 +15,11 @@ import (
 // so the resolve must report pending (non-verified) and must not consume the
 // probe-failure budget. Reporting failed here would condemn and rotate a
 // candidate whose bytes were never measured to be bad.
+//
+// The candidate deliberately declares no audio: a candidate with complete
+// declared metadata takes the instant declared-evidence start above this probe
+// instead, so an incomplete-declaration candidate is what exercises the
+// synchronous probe path.
 func TestResolveVirtualPlaybackSourcePartialEnumerationHoldsPending(t *testing.T) {
 	stored := provenanceResolveRow()
 	probeKey := virtualProbeFailureKey(stored.FilePath, stored.VirtualOwnerInstallationID)
@@ -23,6 +28,12 @@ func TestResolveVirtualPlaybackSourcePartialEnumerationHoldsPending(t *testing.T
 
 	h := virtualProvenanceResolution(stored, func(_ context.Context, _ string, _ *models.MediaFile) (*models.MediaFile, error) {
 		return nil, scanner.ErrVirtualProbePartial
+	})
+	h.VirtualPlaybackStreamLister = VirtualPlaybackStreamListerFunc(func(_ context.Context, _ string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
+		return []VirtualPlaybackStream{{
+			ID: "cand-1", URI: stored.FilePath,
+			Resolution: "1080p", CodecVideo: "h264", Container: "mkv",
+		}}, nil
 	})
 
 	resolved, err := h.resolveVirtualPlaybackSource(provenanceResolveRequest(), stored, "profile-1", false, nil, "", "", 0, false)
@@ -110,6 +121,55 @@ func TestDeferredProbePartialEnumerationStaysPending(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("the watchdog never published the failed terminal state")
+	}
+}
+
+// TestBackgroundProbePartialEnumerationHasBoundedStreak pins the
+// non-negotiated background path's bound. That path has no session lifecycle
+// for the convergence watchdog to fail, so a partial enumeration must be
+// bounded by a repeated-attempt streak: a single partial is not a verdict (the
+// pin is kept and the failure damper stays clear), but a persistent streak arms
+// the failure damper so the resolve stops re-probing and settles on the
+// candidate's declared metadata instead of staying pending forever.
+func TestBackgroundProbePartialEnumerationHasBoundedStreak(t *testing.T) {
+	probeKey := virtualProbeFailureKey("virtual://movie/tt-bounded?result=cand-1", 5)
+	virtualProbeFailures.clear(probeKey)
+	virtualProbeFailures.clearPartial(probeKey)
+	t.Cleanup(func() {
+		virtualProbeFailures.clear(probeKey)
+		virtualProbeFailures.clearPartial(probeKey)
+	})
+
+	h := &PlaybackHandler{
+		VirtualPlaybackSourceProber: func(_ context.Context, _ string, _ *models.MediaFile) (*models.MediaFile, error) {
+			return nil, scanner.ErrVirtualProbePartial
+		},
+	}
+	cand := VirtualPlaybackStream{ID: "cand-1", URI: "virtual://movie/tt-bounded?result=cand-1"}
+	file := &models.MediaFile{ID: 940, FilePath: cand.URI, VirtualOwnerInstallationID: 5}
+	transient := models.MediaFile{ID: 940, FilePath: cand.URI}
+
+	run := func() string {
+		return h.probeVirtualSourceAndPersist(context.Background(), "sticky-key", file, "http://127.0.0.1/x", transient, cand, 0, 5)
+	}
+
+	// The first partial is an incomplete read, not a verdict about the bytes.
+	if outcome := run(); outcome != probeOutcomePartial {
+		t.Fatalf("outcome = %q, want partial", outcome)
+	}
+	if virtualProbeFailures.recent(probeKey) {
+		t.Fatal("a single partial enumeration armed the failure damper")
+	}
+
+	// The streak reaches the bound: the damper arms so the non-negotiated
+	// background path cannot re-probe an incomplete source forever.
+	for i := 1; i < virtualProbePartialRepeatThreshold; i++ {
+		if outcome := run(); outcome != probeOutcomePartial {
+			t.Fatalf("attempt %d outcome = %q, want partial", i+1, outcome)
+		}
+	}
+	if !virtualProbeFailures.recent(probeKey) {
+		t.Fatalf("a %d-attempt partial streak did not arm the failure damper", virtualProbePartialRepeatThreshold)
 	}
 }
 

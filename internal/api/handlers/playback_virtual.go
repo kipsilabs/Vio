@@ -82,6 +82,16 @@ const (
 	// unknown; only a repeat is treated as evidence it should stop steering
 	// starts.
 	virtualProbeFailureRepeatThreshold = 2
+	// virtualProbePartialRepeatThreshold is the number of consecutive
+	// incomplete enumerations for one candidate before the non-negotiated
+	// background path stops re-probing and settles on the candidate's declared
+	// metadata. The negotiated path arms a convergence watchdog that fails the
+	// pending lifecycle at its own bound; the non-negotiated background path has
+	// no session lifecycle to fail, so this streak is its bound. A single
+	// partial read is never penalized (the pin is kept and the failure damper
+	// is not consumed); only a persistent streak settles the resolve so a
+	// truncated provider cannot keep a start pending for the session's life.
+	virtualProbePartialRepeatThreshold = 2
 	// virtualProbeFailureMaxEntries caps the process-wide probe-failure damper.
 	// A live marker is a candidate still inside its backoff window; a
 	// long-lived server that probes many distinct candidates would otherwise
@@ -255,6 +265,38 @@ func (c *virtualProbeFailureCache) count(key string) int {
 		c.pruneExpiredLocked(now)
 	}
 	return mark.failures
+}
+
+// virtualProbePartialKey namespaces the incomplete-enumeration streak for a
+// candidate. It is separate from the candidate's failure key on purpose: a
+// partial read must never arm the probe-failure damper (recent/count) by
+// itself, because it is not a verdict about the candidate's bytes. Keeping the
+// streak under its own key lets the counter bound a persistent streak without
+// suppressing the probe the failure damper gates.
+func virtualProbePartialKey(key string) string {
+	if key == "" {
+		return ""
+	}
+	return key + "\x00incomplete"
+}
+
+// bumpPartial records one more incomplete enumeration for a candidate and
+// returns the new consecutive streak length. It is the bound side of the
+// non-negotiated background path, which has no convergence watchdog to fail a
+// stuck pending lifecycle.
+func (c *virtualProbeFailureCache) bumpPartial(key string) int {
+	partialKey := virtualProbePartialKey(key)
+	if partialKey == "" {
+		return 0
+	}
+	c.mark(partialKey)
+	return c.count(partialKey)
+}
+
+// clearPartial drops a candidate's incomplete-enumeration streak. It is called
+// once a complete enumeration lands so a later partial starts a fresh streak.
+func (c *virtualProbeFailureCache) clearPartial(key string) {
+	c.clear(virtualProbePartialKey(key))
 }
 
 // virtualProbeVerdictUnknown reports whether an error leaves the candidate's
@@ -1382,6 +1424,23 @@ func applyResolvedIdentity(transient *models.MediaFile, id virtualProbeIdentity)
 	}
 }
 
+func virtualFileHasPlayableDeclaredMetadata(file *models.MediaFile) bool {
+	if file == nil {
+		return false
+	}
+	return file.Resolution != "" && file.CodecVideo != "" && file.CodecAudio != "" && canSkipProbeForContainer(file.Container)
+}
+
+// fastPathGateEligible reports whether the repeat-play fast paths below can
+// apply at all: they are gated on the deferred start branch with no forced
+// relist, an explicit candidate, and no exclusions. It is a coarse,
+// observational-only input to the list_reason trace field: a start that is
+// ineligible here may still take a fast path later (durable resume,
+// delivery grace), so the field records intent, not outcome.
+func fastPathGateEligible(deferProbe, forceRelist, noResult bool, excludedCandidateIDs []string) bool {
+	return deferProbe && !forceRelist && !noResult && len(excludedCandidateIDs) == 0
+}
+
 // shouldListVirtualPlaybackCandidates reports whether the resolver must ask
 // the provider for a candidate list. A pinned result= URI with complete
 // probed evidence normally skips the round-trip. forceRelist overrides that so
@@ -1449,6 +1508,16 @@ type virtualResolveTrace struct {
 	cached     bool
 	listed     bool
 	candidates int
+	// listReason names why the listing gate decided the way it did. It is
+	// observational only and never gates control flow. Values:
+	//   fast_path (repeat/durable/delivery-grace path, no list possible),
+	//   cache_hit (best-result cache reused, list skipped),
+	//   resumed (durable-resume hit, list skipped like a cache hit),
+	//   explicit_declared (explicit ?result= with declared metadata, instant path),
+	//   empty_suppressed (provider answered empty inside the window),
+	//   listed (provider round-trip ran; see the *_ms stages for cost),
+	//   unknown (any other shape; never invent a more specific cause).
+	listReason string
 }
 
 // totalMS is the sum of the stage durations that ran, using the same rounded
@@ -1505,6 +1574,7 @@ func (t *virtualResolveTrace) fieldsWithContext(ctx context.Context) []any {
 		"cache_hit", t.cached,
 		"listed", t.listed,
 		"fast_path", t.fastPath,
+		"list_reason", t.listReason,
 	}
 	if t.budgetRan {
 		attrs = append(attrs, "budget_ms", t.budgetMS)
@@ -2277,7 +2347,16 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	// It is computed here because the durable-resume derivation below needs it
 	// before the listing gate.
 	persistedResultURI := parsed != nil && strings.TrimSpace(parsed.Query().Get("result")) != ""
-	needsCandidateMetadata := !completeVirtualVideoEvidenceV3(file) || !completeVirtualAudioEvidenceV3(file) || !completeVirtualContainerEvidenceV3(file)
+	// A stale row whose stored evidence cannot be trusted must be probed even
+	// when it looks complete on its cached metadata; the probe gate makes this
+	// decision on its own so this declaration does not need that input.
+	needsProbeVerification := file == nil || file.ProbeUpdatedAt == nil
+	needsCandidateMetadata := (!noResult && !virtualFileHasPlayableDeclaredMetadata(file)) ||
+		(noResult && (!completeVirtualVideoEvidenceV3(file) || !completeVirtualAudioEvidenceV3(file) || !completeVirtualContainerEvidenceV3(file)))
+	// A concrete ?result= candidate with sufficient declared metadata
+	// already names the candidate to serve: it does not need the provider
+	// list. Probe verification (real inventory) arrives via the declared
+	// fast path below, not via the listing gate.
 	deviceCaps, hasCaps := h.requestDeviceCapabilities(r)
 	fingerprint := ""
 	if hasCaps {
@@ -2301,7 +2380,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	persistedResumeURI := ""
 	var persistedResumeStored ResolvedVirtualMedia
 	persistedResumeState := virtualStoredURLMissing
-	if persistedResultURI && (needsCandidateMetadata || file.ProbeUpdatedAt == nil) &&
+	if persistedResultURI && needsProbeVerification &&
 		len(excludedCandidateIDs) == 0 &&
 		(allowFailed || !virtualCandidateVerdictActive(file.FailedAt, time.Now())) {
 		// A usable stored URL always keeps the persisted candidate. An
@@ -2381,9 +2460,34 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		slog.DebugContext(r.Context(), "virtual playback list suppressed: provider answered empty inside window",
 			"component", "api", "content_id", file.ContentID, "file_id", file.ID)
 	}
-	if (shouldListVirtualPlaybackCandidates(noResult, needsCandidateMetadata && !cachedListing, forceRelist) ||
+	// An explicit concrete candidate with sufficient declared metadata names
+	// the candidate to serve; skipping the provider list is what makes the
+	// declared fast path below instant.
+	declaredCandidateComplete := !noResult && virtualFileHasPlayableDeclaredMetadata(file)
+	// listReason is observational only: it names why the gate below decided
+	// the way it did so a day of timing lines can size the convertible share
+	// (starts that listed but could have reused a fresh cache) without
+	// guessing. Unknown stays unknown rather than a fabricated miss cause.
+	switch {
+	case fastPathGateEligible(deferProbe, forceRelist, noResult, excludedCandidateIDs):
+		trace.listReason = "fast_path"
+	case cachedListing:
+		trace.listReason = "cache_hit"
+	case persistedResumeURI != "":
+		trace.listReason = "resumed"
+	case declaredCandidateComplete:
+		trace.listReason = "explicit_declared"
+	case emptySuppressed:
+		trace.listReason = "empty_suppressed"
+	case trace.listed:
+		trace.listReason = "listed"
+	default:
+		trace.listReason = "unknown"
+	}
+	if (shouldListVirtualPlaybackCandidates(noResult, needsCandidateMetadata && !cachedListing && !declaredCandidateComplete, forceRelist) ||
 		((exclusionPending || requestedRowUnusable) && !cachedListing)) && persistedResumeURI == "" && !emptySuppressed && h.VirtualPlaybackStreamLister != nil {
 		trace.listed = true
+		trace.listReason = "listed"
 		trace.listRan = true
 		fetchBeforeDur, fetchBeforeCalls := fetchSnapshot()
 		listStart := time.Now()
@@ -2509,7 +2613,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	// has to rotate — the very cascade this preference exists to avoid. A row
 	// the planner can route (complete evidence) keeps the existing noResult-
 	// only behavior, so this only ever promotes a probed sibling over a stub.
-	if (noResult || needsCandidateMetadata) && !options.sessionBound && !options.explicitSelection && len(candidates) > 1 {
+	if (noResult || needsProbeVerification) && !options.sessionBound && !options.explicitSelection && len(candidates) > 1 {
 		candidates = h.preferProbedVirtualCandidates(stagingCtx, candidates, file, file.VirtualOwnerInstallationID)
 	}
 	if len(candidates) > maxAttempts {
@@ -2986,6 +3090,35 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			allowDefer = false
 		}
 		if allowDefer {
+			// Deferral guard: the deferred probe only runs after transport
+			// commit, so merged metadata that cannot support a validated
+			// route would terminal source_metadata_incomplete before the
+			// probe ever runs (the bench Citizen Vigilante shape: stored URL,
+			// empty tracks, fast ~50ms failure with no probe). Evaluate the
+			// merged transient below; when it is route-plannable the
+			// deferred path serves it immediately, otherwise fall through to
+			// the bounded synchronous cache-first probe, which fills the row
+			// in before the planner sees it. Damper admission is preserved:
+			// a recent failure still takes the cache-only path.
+			merged := cloneVirtualProbeTransient(transient)
+			if merged.Resolution == "" {
+				merged.Resolution = cand.Resolution
+			}
+			// No 1080p assumption here: the assumed baseline would make
+			// the merge synthesize bitrate/codecs/tracks (all gated on
+			// hasResolution) and render every row plannable-by-construction,
+			// defeating the guard. Only stored + candidate evidence counts;
+			// the deferred block below still applies the baseline for the
+			// rows that pass.
+			mergeVirtualCandidateTracks(&merged, cand)
+			if !merged.HDR && cand.HDR != "" {
+				merged.HDR = true
+			}
+			if !virtualMergedSupportsValidatedRoute(&merged) {
+				allowDefer = false
+			}
+		}
+		if allowDefer {
 			h.pinVirtualStickyAt(stickyKey, cand.URI, generation)
 			// Resolution precedence: stored evidence wins; otherwise adopt
 			// the candidate's declared label; only when both are absent is
@@ -3049,7 +3182,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 							defer bgCancel()
 							h.probeVirtualSourceAndPersist(bgCtx, stickyKey, file, streamURL, probeTransient, probeCand, expectedRuntimeMinutes, oid)
 						}()
-					} else {
+					} else if !skipProbe {
 						h.probeVirtualCandidateForegroundFallback(r.Context(), stickyKey, file, streamURL, probeTransient, probeCand, expectedRuntimeMinutes, oid)
 					}
 				}
@@ -3110,6 +3243,43 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		}
 		declaredFallback := func() (*resolvedVirtualPlaybackSource, error) {
 			return mergeDeclaredFallback(ProbeProvenanceFailed)
+		}
+		if skipProbe && !substituted {
+			if transient.Resolution == "" {
+				transient.Resolution = cand.Resolution
+			}
+			resolutionAssumed := transient.Resolution == ""
+			if resolutionAssumed {
+				transient.Resolution = transcodeResolution1080p
+			}
+			mergeVirtualCandidateTracks(&transient, cand)
+			if !transient.HDR && cand.HDR != "" {
+				transient.HDR = true
+			}
+			h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
+			if virtualProbeFailures.recent(probeKey) {
+				// Damper armed: a recent failure already consumed the probe
+				// budget. No new probe is admitted; try cache-only recovery
+				// and serve declared metadata immediately.
+				syncProbeFile := cloneVirtualProbeTransient(transient)
+				syncProbeFile.Duration = 0
+				h.recoverVirtualProbeFromCache(attemptCtx, file, streamURL, syncProbeFile, cand, oid)
+			} else {
+				probeBgFile := cloneVirtualProbeTransient(transient)
+				probeBgFile.Duration = 0
+				probeBgCand := cand
+				if gate := h.detachedGate(); gate.tryAcquire() {
+					bgCtx, bgCancel := h.virtualDetachedContext(r.Context(), virtualBackgroundProbeBudget)
+					go func() {
+						defer gate.release()
+						defer bgCancel()
+						h.probeVirtualSourceAndPersist(bgCtx, stickyKey, file, streamURL, probeBgFile, probeBgCand, h.virtualExpectedRuntimeMinutes(r.Context(), file), oid)
+					}()
+				}
+			}
+			return withResolvedCandidate(&resolvedVirtualPlaybackSource{
+				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenanceDeclared, ResolutionAssumed: resolutionAssumed,
+			}, resolvedIdentity, resolvedRematched), nil
 		}
 		if virtualProbeFailures.recent(probeKey) {
 			// A recent probe failure already consumed the probe budget. A
@@ -3493,11 +3663,22 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 		if errors.Is(probeErr, scanner.ErrVirtualProbePartial) {
 			// The probe completed but enumerated only part of the stream
 			// table. That is not a verdict about the candidate's bytes, so do
-			// not mark the failure damper or release the pin. Hold the session
-			// pending (non-verified) instead of returning verified: the
-			// convergence watchdog fails it at the bound if no complete probe
-			// lands first, and a later complete probe verifies it. Nothing is
-			// persisted, so the row keeps its previous evidence and stamp.
+			// not mark the failure damper or release the pin. The negotiated
+			// path holds the session pending (non-verified) and lets the
+			// convergence watchdog fail it at the bound; the non-negotiated
+			// background path has no session watchdog, so its bound is the
+			// incomplete-enumeration streak: once it repeats, the failure
+			// damper is armed so the resolve stops re-probing and settles on
+			// the candidate's declared metadata instead of staying pending
+			// forever. Nothing is persisted either way, so the row keeps its
+			// previous evidence and stamp.
+			if !durableEvidence &&
+				virtualProbeFailures.bumpPartial(probeKey) >= virtualProbePartialRepeatThreshold {
+				virtualProbeFailures.mark(probeKey)
+				slog.WarnContext(bgCtx, "virtual probe enumeration still incomplete after repeated attempts; settling on declared metadata",
+					"component", "api", "candidate_uri", probeCand.URI, "file_id", catalogFile.ID,
+					"attempts", virtualProbePartialRepeatThreshold)
+			}
 			slog.WarnContext(bgCtx, "virtual probe enumeration incomplete; holding inventory pending",
 				"component", "api", "candidate_uri", probeCand.URI, "file_id", catalogFile.ID)
 			return probeOutcomePartial, 0
@@ -3524,6 +3705,7 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 		return probeOutcomeFailed, 0
 	}
 	virtualProbeFailures.clear(probeKey)
+	virtualProbeFailures.clearPartial(probeKey)
 	if probeTransient.ID > 0 {
 		probed.ID = probeTransient.ID
 		probed.MediaFolderID = probeTransient.MediaFolderID
@@ -6830,6 +7012,23 @@ func canSkipProbeForContainer(container string) bool {
 		}
 	}
 	return false
+}
+
+// virtualMergedSupportsValidatedRoute reports whether merged candidate
+// metadata can support a validated planner route, mirroring the deferred
+// path's own preconditions: audio-only rows need audio evidence only, while
+// video rows need planner-grade video evidence plus audio and container
+// evidence. It is the deferral guard's predicate: defer the probe past
+// commit only when the merged transient is route-plannable, otherwise run
+// the bounded synchronous probe before the planner sees the row.
+func virtualMergedSupportsValidatedRoute(file *models.MediaFile) bool {
+	if file == nil {
+		return false
+	}
+	if file.IsAudioOnly() {
+		return completeVirtualAudioEvidenceV3(file)
+	}
+	return completeVirtualVideoEvidenceV3(file) && completeVirtualAudioEvidenceV3(file) && completeVirtualContainerEvidenceV3(file)
 }
 
 // completeVirtualVideoEvidenceV3 reports whether a virtual file carries the

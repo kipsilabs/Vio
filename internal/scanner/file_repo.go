@@ -1419,6 +1419,10 @@ func (r *FileRepository) ReplaceVirtualCandidates(ctx context.Context, source *m
 			return fmt.Errorf("marshal virtual candidate video tracks: %w", err)
 		}
 		audioChannels := virtualChannelsCount(candidate.AudioChannels)
+		bitrate := candidate.Bitrate
+		if bitrate < 0 {
+			bitrate = 0
+		}
 		// The expiry belongs to the URL it was parsed from. A candidate with
 		// no URL must not carry an orphan expiry into the row; the update
 		// below clears the stored expiry whenever a new URL replaces the old
@@ -1554,7 +1558,7 @@ func (r *FileRepository) ReplaceVirtualCandidates(ctx context.Context, source *m
 			RETURNING id`,
 			source.ContentID, source.EpisodeID, source.MediaFolderID, candidate.URI,
 			fileSize, candidate.Resolution, candidate.CodecVideo,
-			candidate.CodecAudio, audioChannels, candidate.HDR != "", candidate.Bitrate,
+			candidate.CodecAudio, audioChannels, candidate.HDR != "", bitrate,
 			candidate.Label, audioTracks, subtitleTracks, videoTracks,
 			ownerInstallationID,
 			candidate.ResolvedURL, resolvedURLExpiresAt,
@@ -2210,11 +2214,19 @@ func syntheticVideoTracks(candidate VirtualCandidate) []models.VideoTrack {
 		videoRangeType = videoRangeHDR
 	}
 
+	bitrate := candidate.Bitrate
+	if bitrate <= 0 {
+		bitrate = 0
+	}
+	frameRate := ""
+
 	vt := models.VideoTrack{
 		Codec:          videoCodec,
 		Width:          width,
 		Height:         height,
 		BitDepth:       bitDepth,
+		FrameRate:      frameRate,
+		Bitrate:        bitrate,
 		VideoRange:     videoRange,
 		VideoRangeType: videoRangeType,
 		DVProfile:      dvProfile,

@@ -245,13 +245,35 @@ var ErrVirtualProbeNoTracks = errors.New("virtual probe returned no audio or vid
 // fail it after a bound) and must never publish it as verified.
 var ErrVirtualProbePartial = errors.New("virtual probe returned an incomplete stream enumeration")
 
+// virtualSourceExpectsAudio reports whether the item's own declared metadata
+// says the source carries audio. It is the expected-audio evidence a partial
+// read is judged against: video-only sources exist, so a video stream with no
+// audio is only an incomplete enumeration when something independent of the
+// probe declared audio for this item. A row that declares no audio codec and
+// holds no declared audio tracks is not expected to enumerate one, and a
+// video-only probe of it is a valid complete answer.
+//
+// The expectation is deliberately read from the row being probed, not from a
+// single observed track: finding one audio track does not prove the rest of
+// the table was read, so the probe result cannot be its own completeness
+// oracle.
+func virtualSourceExpectsAudio(file *models.MediaFile) bool {
+	if file == nil {
+		return false
+	}
+	if strings.TrimSpace(file.CodecAudio) != "" {
+		return true
+	}
+	return len(file.AudioTracks) > 0
+}
+
 // virtualProbeEnumerationPartial reports whether a successful ffprobe result
 // enumerated only part of a virtual source's streams. The stream table is
 // complete when every stream kind the container carries was read; the one
-// structural gap ffprobe can leave behind is a missing audio track on an
-// audiovisual file, because every provider movie or episode carries audio and
-// ffprobe reads video first. A probe that found any stream but no audio is a
-// partial read, not a video-only file.
+// structural gap ffprobe can leave behind is a missing audio track on a file
+// the item declared to carry audio, because ffprobe reads video first. A
+// video-only result is a partial read only when expectAudio says the item
+// carries audio; a genuinely video-only source is a complete answer.
 //
 // A subtitle set is complete whether it holds tracks or is empty: provider
 // content is commonly delivered without embedded subtitles, so an empty
@@ -259,11 +281,11 @@ var ErrVirtualProbePartial = errors.New("virtual probe returned an incomplete st
 // here. Enumerated tracks must carry a real container stream index; ffprobe
 // numbers every stream it sees, so a track without one (index < 0) did not come
 // from the container's stream table either.
-func virtualProbeEnumerationPartial(probe *ProbeData) bool {
+func virtualProbeEnumerationPartial(probe *ProbeData, expectAudio bool) bool {
 	if probe == nil {
 		return false
 	}
-	if len(probe.VideoTracks) > 0 && len(probe.AudioTracks) == 0 {
+	if expectAudio && len(probe.VideoTracks) > 0 && len(probe.AudioTracks) == 0 {
 		return true
 	}
 	for _, track := range probe.AudioTracks {
@@ -298,7 +320,7 @@ func ProbeVirtualSource(
 	if probe == nil || (len(probe.AudioTracks) == 0 && len(probe.VideoTracks) == 0) {
 		return file, ErrVirtualProbeNoTracks
 	}
-	if virtualProbeEnumerationPartial(probe) {
+	if virtualProbeEnumerationPartial(probe, virtualSourceExpectsAudio(file)) {
 		// The enumeration is incomplete, so the result must not be persisted,
 		// stamped, or published as verified. Returning the original file keeps
 		// the caller's row unchanged; the distinct sentinel lets the playback

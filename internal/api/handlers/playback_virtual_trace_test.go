@@ -280,6 +280,56 @@ func TestResolveVirtualTimingFlagsBudgetExceededOnStalledListing(t *testing.T) {
 	}
 }
 
+// list_reason names why the listing gate decided the way it did. It is
+// observational only: a fast-path start reports fast_path, a cache-reused
+// start reports cache_hit, an explicit declared start reports
+// explicit_declared, and a start that paid the provider round-trip reports
+// listed with its list_ms cost.
+func TestResolveVirtualTimingReportsListReason(t *testing.T) {
+	uri := "virtual://movie/tt-trace-reason"
+	file := &models.MediaFile{
+		ID:                         993,
+		ContentID:                  "movie-trace-reason",
+		FilePath:                   uri,
+		Container:                  "virtual",
+		VirtualOwnerInstallationID: 5,
+	}
+	detailedCalls, legacyCalls := 0, 0
+	h := virtualRepeatPlayHandler(&detailedCalls, &legacyCalls)
+	h.VirtualPlaybackStreamLister = VirtualPlaybackStreamListerFunc(
+		func(_ context.Context, _ string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
+			return []VirtualPlaybackStream{{
+				URI: uri + "?result=cand-1", Resolution: "1080p",
+				CodecVideo: "h264", CodecAudio: "aac", Container: "mkv",
+			}}, nil
+		})
+
+	entry := captureVirtualResolveTiming(t, func() {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil)
+		if _, err := h.resolveVirtualPlaybackSource(req, file, "profile-1", true, nil, "", "", 0, false); err != nil {
+			t.Fatalf("resolveVirtualPlaybackSource error: %v", err)
+		}
+	})
+
+	if entry["list_reason"] != "listed" {
+		t.Fatalf("list_reason = %#v, want listed for a cold start that paid the provider round-trip", entry["list_reason"])
+	}
+
+	// The repeat-play fast path does no provider work. It must say so explicitly
+	// (fast_path=true, every stage *_ran=false, no *_ms field, total_ms=0) instead
+	// of emitting an all-zero line that could be misread as a measurement.
+	fastFile := virtualRepeatPlayFile("virtual://movie/tt-trace-reason-fast?result=cand-1")
+	fastEntry := captureVirtualResolveTiming(t, func() {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil)
+		if _, err := h.resolveVirtualPlaybackSource(req, fastFile, "profile-1", true, nil, "", "", 0, false); err != nil {
+			t.Fatalf("resolveVirtualPlaybackSource error: %v", err)
+		}
+	})
+	if fastEntry["list_reason"] != "fast_path" {
+		t.Fatalf("list_reason = %#v, want fast_path for a repeat-play start that skipped the provider", fastEntry["list_reason"])
+	}
+}
+
 // A healthy cold start stays inside the budget: budget_exceeded=false and the
 // elapsed time fits the budget it ran under.
 func TestResolveVirtualTimingBudgetHoldsOnHealthyStart(t *testing.T) {
