@@ -74,10 +74,14 @@ func virtualResumeStickyKey(file *models.MediaFile) string {
 
 // A resume after a restart (fresh handler, cold caches) whose row still owns an
 // unexpired persisted URL and planner-grade video evidence must take the
-// deferred fast path: no provider listing and no provider resolve, the row's
+// stored-URL fast path: no provider listing and no provider resolve, the row's
 // own candidate is served, and the sticky pin is re-derived from the durable
-// row instead of being lost with the old process. A row without that evidence
-// is covered by TestResolveVirtualResumeIncompleteMetadataFallsThroughToProbe.
+// row instead of being lost with the old process. This handler configures no
+// prober, so no worker can be admitted and the start serves declared metadata
+// with no pending lifecycle; when a prober is present the same path arms a
+// deferred probe (see TestDurableResumeArmsDeferredProbeForUnstampedRow). A row
+// without that evidence is covered by
+// TestResolveVirtualResumeIncompleteMetadataFallsThroughToProbe.
 func TestResolveVirtualResumeFromPersistedRowSkipsListingAndRepins(t *testing.T) {
 	expiresAt := time.Now().Add(3 * time.Hour)
 	file := withVirtualResumeVideoEvidence(virtualResumeRow("https://93.184.216.34/stream/token=stored", &expiresAt))
@@ -102,8 +106,11 @@ func TestResolveVirtualResumeFromPersistedRowSkipsListingAndRepins(t *testing.T)
 	if resolved.File == nil || resolved.File.FilePath != virtualResumeCandidate {
 		t.Fatalf("resolved file = %#v, want the persisted candidate", resolved.File)
 	}
-	if resolved.Provenance != ProbeProvenancePending || resolved.ProbeSucceeded {
-		t.Fatalf("provenance=%q succeeded=%v, want pending/false", resolved.Provenance, resolved.ProbeSucceeded)
+	if resolved.Provenance != ProbeProvenanceDeclared || resolved.ProbeSucceeded {
+		t.Fatalf("provenance=%q succeeded=%v, want declared/false with no prober to resolve a pending state", resolved.Provenance, resolved.ProbeSucceeded)
+	}
+	if resolved.DeferredProbe != nil {
+		t.Fatal("a handler with no prober armed a deferred probe no worker could run")
 	}
 	if got := h.peekVirtualSticky(virtualResumeStickyKey(file)); got != virtualResumeCandidate {
 		t.Fatalf("sticky pin = %q, want it re-derived as %q", got, virtualResumeCandidate)

@@ -2915,11 +2915,38 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 					transient.HDR = true
 				}
 				h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
+				// The row has no probe stamp (it is exactly why this fast path
+				// ran with incomplete evidence), so a provisional plan alone
+				// would leave the inventory pending forever. Arm the
+				// post-commit probe on the row's own stored URL: the client
+				// still gets its URL immediately, and the worker resolves the
+				// pending inventory to verified or failed with
+				// inventory_updated. An already-stamped row skips this because
+				// the P0 fast path above owns it.
+				probeCand := cand
+				if len(persistedResumeStored.RequestHeaders) > 0 {
+					probeCand.RequestHeaders = cloneHeaderMap(persistedResumeStored.RequestHeaders)
+				}
+				deferred := h.virtualDeferredProbeForUnstampedRow(attemptCtx, stickyKey, file, persistedResumeStored.URL, probeCand, oid)
+				// Pending is a promise that a worker will resolve the row, so
+				// provenance follows the worker itself: only an admitted
+				// deferred probe is pending. Every decline (the row already
+				// carries a stamp, no prober is configured, the stored URL is
+				// empty, or the probe-failure damper is armed) serves declared
+				// metadata instead of a pending state nothing will resolve.
+				// The damper shares its admission decision with the declared
+				// fast path and runs the cache-only recovery; a fresh probe is
+				// retried once the damper lapses.
+				provenance := ProbeProvenanceDeclared
+				if deferred != nil {
+					provenance = ProbeProvenancePending
+				}
 				return &resolvedVirtualPlaybackSource{
 					URL: "", URI: cand.URI, OwnerID: oid, File: &transient,
-					ProbeSucceeded: false, Provenance: ProbeProvenancePending,
+					ProbeSucceeded: false, Provenance: provenance,
 					// Unranked: this path skipped the candidate list.
 					CandidateRank: -1, CandidateCount: -1,
+					DeferredProbe: deferred,
 				}, nil
 			}
 		}
@@ -4337,6 +4364,14 @@ UPDATE media_files SET
     WHEN NOT $13::boolean THEN probe_source
     ELSE 'virtual'
   END,
+  -- The stamp is controlled by explicit successful-probe provenance: the
+  -- caller sets the stamp flag only when the evidence it writes came from a
+  -- probe that succeeded (a fresh probe, a cache hit, or the durable deferred
+  -- write). It is never reconstructed from inventory shape, so a metadata-only
+  -- write (a stored-URL refresh, a rematch adoption) leaves the flag false and
+  -- preserves the existing stamp rather than advancing it from tracks it merely
+  -- copied. ClearProbe still clears, and a collection-owned row still preserves
+  -- its own stamp.
   probe_updated_at = CASE
     WHEN probe_source = 'virtual_collection' THEN probe_updated_at
     WHEN $31::boolean THEN NULL
@@ -4980,9 +5015,15 @@ func (h *PlaybackHandler) virtualProbeEvidenceArgsForRow(ctx context.Context, ca
 		HDR:              probed.HDR,
 		Bitrate:          probed.Bitrate,
 		Duration:         probed.Duration,
-		StampProbe:       stampProbe,
-		UpdatedAt:        snap.UpdatedAt,
-		ProbeUpdatedAt:   snap.ProbeUpdatedAt,
+		// StampProbe is controlled by explicit successful-probe provenance: the
+		// caller passes true only when the evidence it writes came from a probe
+		// that succeeded (a fresh probe, a cache hit, or the durable deferred
+		// write). It is never inferred from inventory shape, so a metadata-only
+		// copy of existing tracks preserves the row's stamp instead of
+		// advancing it from tracks it did not measure.
+		StampProbe:     stampProbe,
+		UpdatedAt:      snap.UpdatedAt,
+		ProbeUpdatedAt: snap.ProbeUpdatedAt,
 		// The row's own identity, for the release-replacement gate when this
 		// write adopts a cross-release candidate path. The probe path carries no
 		// candidate identity, so an adopted cross-release write replaces the
@@ -6538,6 +6579,75 @@ func (h *PlaybackHandler) maybeTriggerSubtitleSearch(
 // background. It follows the caller's deferProbe flag exactly.
 func allowDeferredProbe(deferProbe bool) bool {
 	return deferProbe
+}
+
+// virtualDeferredProbeForUnstampedRow decides and builds the post-commit probe
+// for a virtual row that has never been probed (no probe stamp), so a start
+// that serves the row provisionally still hands the start path a worker to run
+// after the transport commits. Without it a direct-play validated start could
+// serve a codec-populated, unstamped row and arm no worker at all: the
+// inventory reported pending would never resolve to verified or failed, and
+// only the convergence watchdog would end it.
+//
+// The returned probe is the only signal that a worker will run: a nil return
+// means no worker was admitted, so the caller must serve declared metadata with
+// no pending lifecycle rather than promise a resolution nothing will deliver.
+// Admission shares the declared fast path's probe-failure damper: when a recent
+// failure already consumed this candidate's probe budget the worker is not
+// admitted. The cache-only recovery still runs, because an inner probe may have
+// completed after an outer timeout and landed its evidence.
+//
+// It returns nil when the row already carries a stamp, no prober is configured,
+// or the resolved URL is empty (nothing to enumerate). Value copies are captured
+// now so a later mutation of the request's file cannot change what is probed.
+func (h *PlaybackHandler) virtualDeferredProbeForUnstampedRow(
+	ctx context.Context,
+	stickyKey string,
+	file *models.MediaFile,
+	streamURL string,
+	cand VirtualPlaybackStream,
+	oid int,
+) *virtualDeferredProbeV3 {
+	if h == nil || file == nil {
+		return nil
+	}
+	if file.ProbeUpdatedAt != nil {
+		return nil
+	}
+	if h.VirtualPlaybackSourceProber == nil && h.VirtualPlaybackSourceProberWithHeaders == nil {
+		return nil
+	}
+	if strings.TrimSpace(streamURL) == "" {
+		return nil
+	}
+	probeTransient := cloneVirtualProbeTransient(*file)
+	// Zero the duration so the deferred probe measures the empirical duration
+	// instead of inheriting the catalog value.
+	probeTransient.Duration = 0
+	if virtualProbeFailures.recent(virtualProbeFailureKey(cand.URI, oid)) {
+		// Damper armed: a recent failure already consumed the probe budget, so
+		// no worker is admitted. An inner probe may still have completed and
+		// landed in the cache, so recover it before declining; the caller
+		// serves declared metadata rather than a pending state nothing will
+		// resolve.
+		//
+		// No fresh resolver identity exists on this fast path: the row owns the
+		// persisted candidate and the provider was never listed or resolved, so
+		// the release decision rests on the row's verified ownership (the zero
+		// tiers contribute nothing to the shared-tier check) rather than an
+		// identity invented from the row's own tiers.
+		h.recoverVirtualProbeFromCache(ctx, file, streamURL, probeTransient, cand, resolver.PersistedIdentityTiers{}, oid)
+		return nil
+	}
+	return &virtualDeferredProbeV3{
+		stickyKey:              stickyKey,
+		file:                   file,
+		streamURL:              streamURL,
+		probeTransient:         &probeTransient,
+		cand:                   cand,
+		expectedRuntimeMinutes: h.virtualExpectedRuntimeMinutes(ctx, file),
+		ownerID:                oid,
+	}
 }
 
 // mergeVirtualCandidateTracks supplements probed virtual file tracks with
