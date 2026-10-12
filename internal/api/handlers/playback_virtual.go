@@ -3826,6 +3826,18 @@ func catalogFileIDOrZero(file *models.MediaFile) int {
 // audio-switch or version-switch replan — and persists it with a fresh stamp so
 // the row stops being probed on every start. The failure damper is cleared on a
 // hit, exactly like the transient-timeout recovery it generalizes.
+//
+// The candidate's declared audio is forwarded onto the lookup input before the
+// cache is consulted. The cache key folds in the completeness gate's
+// expected-audio signal (see virtualProbeCacheKey), and the caller's probe input
+// is often the catalog row or a thin transient built before the served
+// candidate's declared metadata was merged — so a row that carries no audio
+// metadata would otherwise look up the video-only key, retrieve a thin
+// video-without-audio enumeration cached under that expectation, and the caller
+// would merge synthesized candidate audio onto it and report it verified. Doing
+// the forward here, at the one seam every cache-first caller shares, is what
+// makes the key partitioning effective: the lookup key then matches the
+// expectation the real probe would have used.
 func (h *PlaybackHandler) virtualProbeFromCache(
 	ctx context.Context,
 	catalogFile *models.MediaFile,
@@ -3837,6 +3849,7 @@ func (h *PlaybackHandler) virtualProbeFromCache(
 	if h == nil || h.VirtualProbeCacheLookup == nil || catalogFile == nil {
 		return nil
 	}
+	forwardVirtualCandidateDeclaredAudio(&probeFile, probeCand)
 	probed := h.VirtualProbeCacheLookup(sourceURL, &probeFile)
 	if probed == nil {
 		return nil
