@@ -109,16 +109,19 @@ type ProgressStoreV3 interface {
 	// returns first=true with the accepted sample. Every later call, with any
 	// stop id, returns the stored receipt with first=false.
 	StopAttempt(ctx context.Context, sessionID, stopID string, final *ProgressSampleV3) (StopReceiptV3, bool, error)
-	// RecordStopReceipt stores the completed receipt (history id, accepted
-	// sample) on a stopped row after the stop writer has run, so replayed
-	// stops return what the first one produced.
+	// RecordStopReceipt stores the receipt (history id, accepted sample,
+	// finalization flag) on a stopped row after the stop writer has run, so
+	// replayed stops return what the first one produced. It also releases the
+	// caller's finalization claim: a finalized receipt completes the stop, and
+	// an unfinalized one reports a cleanup that did not finish, leaving the row
+	// reclaimable so a later replay can retry the idempotent writers.
 	RecordStopReceipt(ctx context.Context, sessionID string, receipt StopReceiptV3) error
 	// ClaimStopFinalization is a compare-and-set on the receipt's Finalizing
 	// flag. Exactly one caller wins the claim on a stopped, unfinalized row
-	// and runs the non-idempotent writers (history, scrobbles); every other
-	// caller returns false and replays the stored receipt as is. A claim is
-	// released by RecordStopReceipt with Finalized set, or by a later
-	// ClaimStopFinalization once the claim's lease has passed.
+	// and runs the writers; every other caller returns false and replays the
+	// stored receipt as is. A claim is released by RecordStopReceipt (finalized
+	// or not), or by a later ClaimStopFinalization once the claim's lease has
+	// passed.
 	ClaimStopFinalization(ctx context.Context, sessionID string, leaseUntil time.Time) (bool, error)
 }
 
@@ -1001,9 +1004,10 @@ func (s *MemoryPlanStoreV3) RecordStopReceipt(_ context.Context, sessionID strin
 	if stored, ok := s.stopReceipts[sessionID]; !ok || stored.StopID != receipt.StopID {
 		return ErrSessionNotFound
 	}
-	if receipt.Finalized {
-		receipt.FinalizingUntil = time.Time{}
-	}
+	// Any receipt write ends the writer's claim: a finalized write completes the
+	// stop, and an unfinalized one reports a cleanup that did not finish and
+	// releases the claim so a later replay can retry it.
+	receipt.FinalizingUntil = time.Time{}
 	s.stopReceipts[sessionID] = receipt
 	return nil
 }

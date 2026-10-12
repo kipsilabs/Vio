@@ -20,23 +20,46 @@ type playbackCommandRecord struct {
 // teardown such as an ffmpeg-exit cleanup, where the card is kept so the client
 // can reconstruct.
 func (h *PlaybackHandler) stopPlaybackSession(ctx context.Context, session *playback.Session, userInitiated bool) error {
-	_, err := h.stopPlaybackSessionWithResult(ctx, session, userInitiated)
+	_, err := h.stopPlaybackSessionWithResult(ctx, session, userInitiated, "")
 	return err
 }
 
 // stopPlaybackSessionWithResult is stopPlaybackSession reporting the history
-// writer's result, which the v2 stop receipt carries.
-func (h *PlaybackHandler) stopPlaybackSessionWithResult(ctx context.Context, session *playback.Session, userInitiated bool) (watchstate.PlaybackStopResult, error) {
+// writer's result, which the v2 stop receipt carries. historyID is the row this
+// stop must write, derived from the durable stop identity, so a v2 retry reuses
+// it instead of adding a second row; empty means this path has no durable stop
+// identity and the writer mints a fresh row per stop.
+func (h *PlaybackHandler) stopPlaybackSessionWithResult(ctx context.Context, session *playback.Session, userInitiated bool, historyID string) (watchstate.PlaybackStopResult, error) {
 	if h == nil || session == nil || session.ID == "" {
 		return watchstate.PlaybackStopResult{}, playback.ErrSessionNotFound
 	}
+	// A stop is a teardown: once the live session is removed, the durable half
+	// (authority, transport cancel, deny marker, history) must finish even if
+	// the request that issued the stop is gone. A client that drops the
+	// connection right after its stop, or a canceled DELETE, must not leave a
+	// half-stopped session.
+	ctx, cancelStop := teardownContext(ctx)
+	defer cancelStop()
 	// Replacement preparation holds this lifecycle lock until its new live
 	// session state and durable plan are committed (or rolled back). Wait for
 	// that boundary, then reload the route: callers commonly hold a copy taken
 	// before the replacement started, and deleting authority from that stale
 	// copy would leave the successor transport playable after a successful stop.
-	unlock := h.tm.LockSessionLifecycle(session.ID)
+	//
+	// The wait is bounded by the teardown deadline. A finalization under a v2
+	// stop holds a lease another replica may take over once it lapses; blocking
+	// on the holder past the deadline and then starting teardown would resume
+	// work the store has already handed to someone else. Give up instead.
+	unlock, err := h.tm.LockSessionLifecycleContext(ctx, session.ID)
+	if err != nil {
+		return watchstate.PlaybackStopResult{}, fmt.Errorf("wait for session lifecycle: %w", err)
+	}
 	defer unlock()
+	// The wait may have consumed the budget at the instant the lock became
+	// available. Do not begin a teardown that cannot finish inside it.
+	if err := ctx.Err(); err != nil {
+		return watchstate.PlaybackStopResult{}, err
+	}
 	current, err := h.sessionMgr.GetSession(session.ID)
 	if err != nil {
 		return watchstate.PlaybackStopResult{}, err
@@ -61,7 +84,9 @@ func (h *PlaybackHandler) stopPlaybackSessionWithResult(ctx context.Context, ses
 		// every replica, not just the live entry here.
 		h.StreamDeny.Deny(ctx, session.ID)
 	}
-	return h.finalizeSessionStopWithResult(ctx, session, true, "stop", userInitiated), nil
+	// Report whether the durable stop finished; the v2 finalization finalizes
+	// the receipt only on success.
+	return h.finalizeSessionStopWithResult(ctx, session, true, "stop", userInitiated, historyID)
 }
 
 func (h *PlaybackHandler) stopPlaybackSessionByID(ctx context.Context, sessionID string, userInitiated bool) error {

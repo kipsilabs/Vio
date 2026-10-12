@@ -3697,7 +3697,10 @@ func (h *PlaybackHandler) waitForPlaybackStartSideEffectsV3(ctx context.Context,
 	if state == nil {
 		return
 	}
-	waitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), playbackStartSideEffectsTimeoutV3)
+	// Detached from the request's cancel but clamped to any enclosing deadline:
+	// under the v2 stop finalization this wait must not reset past the one
+	// end-to-end budget that keeps the whole finalization inside its lease.
+	waitCtx, cancel := detachedWithin(ctx, playbackStartSideEffectsTimeoutV3)
 	defer cancel()
 	select {
 	case <-state.done:
@@ -3726,7 +3729,9 @@ func (h *PlaybackHandler) cancelPlaybackStartSideEffectsV3(ctx context.Context, 
 	if !started {
 		return
 	}
-	waitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), playbackStartSideEffectsTimeoutV3)
+	// Same detached, clamped budget as waitForPlaybackStartSideEffectsV3: the
+	// unwind may not run past an enclosing finalization deadline.
+	waitCtx, cancel := detachedWithin(ctx, playbackStartSideEffectsTimeoutV3)
 	defer cancel()
 	select {
 	case <-done:

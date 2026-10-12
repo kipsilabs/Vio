@@ -134,6 +134,49 @@ func TestRecordPlaybackStopAddsMovieIdentity(t *testing.T) {
 	}
 }
 
+// RecordPlaybackStopWithHistoryID is the idempotent writer a retried v2 stop
+// relies on: two calls naming the same play write one history row, and the
+// second reports AlreadyRecorded under the same id rather than adding a
+// duplicate.
+func TestRecordPlaybackStopWithHistoryIDRecordsOnce(t *testing.T) {
+	store, db := newTestUserStore(t)
+	defer func() { _ = db.Close() }()
+
+	service := NewService(testStoreProvider{store: store})
+	const historyID = "11111111-2222-4333-8444-555555555555"
+	watchedAt := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
+
+	first, err := service.RecordPlaybackStopWithHistoryID(
+		context.Background(), 1, "profile-1", "movie-1", 7200, 7200, watchedAt,
+		userstore.VersionHints{}, userstore.ProgressThresholds{}, historyID,
+	)
+	if err != nil {
+		t.Fatalf("first stop: %v", err)
+	}
+	if !first.Completed || first.AlreadyRecorded || first.HistoryID != historyID {
+		t.Fatalf("first stop result = %+v", first)
+	}
+
+	second, err := service.RecordPlaybackStopWithHistoryID(
+		context.Background(), 1, "profile-1", "movie-1", 7200, 7200, watchedAt,
+		userstore.VersionHints{}, userstore.ProgressThresholds{}, historyID,
+	)
+	if err != nil {
+		t.Fatalf("retried stop: %v", err)
+	}
+	if !second.AlreadyRecorded || second.HistoryID != historyID {
+		t.Fatalf("retried stop result = %+v, want AlreadyRecorded under %s", second, historyID)
+	}
+
+	history, err := store.ListHistory(context.Background(), "profile-1", 10, 0)
+	if err != nil {
+		t.Fatalf("ListHistory: %v", err)
+	}
+	if len(history) != 1 {
+		t.Fatalf("history len = %d, want 1: a retried stop duplicated the play", len(history))
+	}
+}
+
 func TestManualMarkWatchedAddsEpisodeIdentity(t *testing.T) {
 	store, db := newTestUserStore(t)
 	defer func() { _ = db.Close() }()

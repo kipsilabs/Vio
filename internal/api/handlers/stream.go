@@ -1395,9 +1395,18 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 		}
 		// A canceled lookup is the viewer going away mid-start, not a broken
 		// catalog row: answer 204 without failing the session so it reads as
-		// a cancel in logs and metrics, never a 500.
+		// a cancel in logs and metrics, never a 500. It is also not a stop —
+		// a track switch aborts the old stream and replans the same session —
+		// so record the cancel as route-scoped evidence and keep the session
+		// live. Stopping or denying it here would strand the session the
+		// client still holds: the follow-up replan and the reconnected stream
+		// would answer a terminal 404/410 for a session the viewer still owns.
 		if isClientCancellation(r.Context(), err) {
-			h.abortPlaybackSession(r.Context(), session)
+			if marker, ok := h.sessionMgr.(interface {
+				MarkClientCanceled(sessionID string) error
+			}); ok {
+				_ = marker.MarkClientCanceled(session.ID)
+			}
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
@@ -2929,9 +2938,8 @@ func (h *StreamHandler) finalizeSessionAbort(ctx context.Context, session *playb
 	if h == nil || session == nil || session.ID == "" {
 		return
 	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	ctx, cancel := teardownContext(ctx)
+	defer cancel()
 
 	if h.AdminStore != nil {
 		if err := h.AdminStore.DeleteSession(ctx, session.ID); err != nil {

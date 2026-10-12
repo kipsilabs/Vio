@@ -715,6 +715,10 @@ func (s *Postgres) RecordStopReceipt(ctx context.Context, sessionID string, rece
 	if _, err := uuid.Parse(receipt.StopID); err != nil {
 		return playback.ErrInvalidStopIDV3
 	}
+	// The write replaces stop_receipt wholesale, so it also ends the caller's
+	// finalization claim: the caller passes FinalizingUntil zero. A finalized
+	// receipt completes the stop; an unfinalized one reports a cleanup that did
+	// not finish and leaves the row reclaimable for a retry.
 	receiptJSON, err := json.Marshal(receipt)
 	if err != nil {
 		return err

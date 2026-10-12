@@ -672,6 +672,53 @@ func TestLockSessionLifecycle_MutualExclusionAndCleanup(t *testing.T) {
 	}
 }
 
+// LockSessionLifecycleContext gives up on the wait when its context ends, so a
+// teardown fenced by a lease never blocks past it behind an unrelated holder and
+// then runs after another replica has taken the work over.
+func TestLockSessionLifecycleContextGivesUpOnDeadline(t *testing.T) {
+	m := NewTranscodeManager()
+	const sessionID = "ctx-bounded"
+	unlock := m.LockSessionLifecycle(sessionID)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	release, err := m.LockSessionLifecycleContext(ctx, sessionID)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want context.DeadlineExceeded", err)
+	}
+	if release != nil {
+		t.Fatal("a timed-out acquire returned a release func")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("waited %v, expected the deadline to release the wait", elapsed)
+	}
+	// The timed-out waiter must not leak a ref: the holder's ref remains and the
+	// entry drains once it releases.
+	m.lifecycleMu.Lock()
+	refs := 0
+	if lk := m.lifecycleLocks[sessionID]; lk != nil {
+		refs = lk.refs
+	}
+	m.lifecycleMu.Unlock()
+	if refs != 1 {
+		t.Fatalf("lifecycle refs after a timed-out waiter = %d, want 1", refs)
+	}
+	unlock()
+
+	release, err = m.LockSessionLifecycleContext(context.Background(), sessionID)
+	if err != nil {
+		t.Fatalf("acquire after release: %v", err)
+	}
+	release()
+	m.lifecycleMu.Lock()
+	n := len(m.lifecycleLocks)
+	m.lifecycleMu.Unlock()
+	if n != 0 {
+		t.Fatalf("lifecycle lock map = %d entries, want 0", n)
+	}
+}
+
 func TestReconstructTranscodeWalksAutoPipelineInSameOutputDir(t *testing.T) {
 	transcodeDir := t.TempDir()
 	m := NewTranscodeManager()

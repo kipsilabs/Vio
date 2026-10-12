@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math"
 	"net/http"
@@ -739,56 +740,162 @@ func (h *PlaybackHandler) StopPlaybackV2(ctx context.Context, caller PlaybackCal
 // another replay may take it over.
 const stopFinalizationLease = 30 * time.Second
 
+// stopFinalizationBudget is the single end-to-end bound for one claimed
+// finalization: the claim, the side effects, and the receipt all finish inside
+// it. It sits well below stopFinalizationLease so a slow run cannot still be
+// writing when another replica may reclaim the claim.
+const stopFinalizationBudget = 20 * time.Second
+
+// stopFinalizationReceiptGrace is reserved out of stopFinalizationBudget for the
+// receipt write. The cleanup runs on budget-minus-grace, so a cleanup that uses
+// its whole share still leaves the receipt a live context; otherwise a finalized
+// stop could be left with no receipt and a later replay would redo the writers.
+const stopFinalizationReceiptGrace = 3 * time.Second
+
+// nativeStopHistoryNamespace derives a v2 stop's watch-history row ID from its
+// durable stop identity, the same way compatPlayHistoryNamespace does for a
+// Jellyfin session.
+var nativeStopHistoryNamespace = uuid.MustParse("6f1b4d2a-9c37-4c58-8a10-7e5b3d9f20c4")
+
+// stopHistoryIDV2 names the watch-history row of a v2 stop. It is derived from
+// the durable stop identity the attempt row already carries rather than minted
+// at write time, so the key exists before the history row is inserted. A crash
+// or receipt-write failure between that insert and RecordStopReceipt leaves the
+// row's HistoryID unset; a later replay derives the same key and AddVisibleHistory
+// reports the row already exists instead of adding a second one for one stop.
+// Deriving per stop, not per session, preserves the native rule that a session
+// resumed under the same id records each stretch separately.
+func stopHistoryIDV2(stopID string) string {
+	return uuid.NewSHA1(nativeStopHistoryNamespace, []byte(stopID)).String()
+}
+
 // finalizeStopV2 claims finalization, runs the stop side effects, and records
 // the finalized receipt. When the claim is lost the stored receipt is returned
-// unchanged. The request cannot fail from here: the receipt is already durable.
+// unchanged. The stop is already committed on the attempt row by the time this
+// runs, so the finalization is detached from the request: a client cancel right
+// after the commit must not skip the claim, the cleanup, or the receipt write,
+// any of which would leave the stop open to a later replay.
+//
+// One end-to-end budget covers the claim, the cleanup, and the receipt, and it
+// is strictly below stopFinalizationLease. Every nested teardown below inherits
+// this deadline instead of resetting a fresh one, so the worker cannot still be
+// running the writers when another replica may reclaim the claim.
+//
+// The receipt is finalized only when the cleanup reports success. A cleanup
+// that fails or times out stores the receipt unfinalized (releasing the claim),
+// so a later replay re-runs the idempotent writers to repair the session rather
+// than treat a half-torn stop as done.
 func (h *PlaybackHandler) finalizeStopV2(ctx context.Context, store playback.ProgressStoreV3, record *playback.AttemptRecordV3, sessionID string, receipt playback.StopReceiptV3) playback.StopReceiptV3 {
-	claimed, err := store.ClaimStopFinalization(ctx, sessionID, time.Now().Add(stopFinalizationLease))
+	// The caller's request context no longer bounds the durable side effects, and
+	// neither does its deadline: a request that already timed out is exactly the
+	// case this exists for. The finalization takes its own fresh budget, which a
+	// nested detached teardown below can only narrow further.
+	finalCtx, cancelFinal := detachedWithin(ctx, stopFinalizationBudget)
+	defer cancelFinal()
+	claimed, err := store.ClaimStopFinalization(finalCtx, sessionID, time.Now().Add(stopFinalizationLease))
 	if err != nil {
-		slog.WarnContext(ctx, "failed to claim playback stop finalization", "component", "api", "session", sessionID, "playback_session_id", sessionID, "error", err)
+		slog.WarnContext(finalCtx, "failed to claim playback stop finalization", "component", "api", "session", sessionID, "playback_session_id", sessionID, "error", err)
 		return receipt
 	}
 	if !claimed {
-		// Another caller holds the lease. Wait for it to finish, or for its
-		// lease to lapse and take over, bounded by the request context. The
-		// receipt is re-read each round so the lease judged is the one the
-		// store holds now, not the one read before the winner claimed.
+		// Another caller holds the lease. This caller has no durable work of its
+		// own yet, so it waits only while the client is still connected, or until
+		// the detached ceiling lapses. The receipt is re-read each round so the
+		// lease judged is the one the store holds now, not the one read before
+		// the winner claimed.
+		//
+		// The poll context ends on the earlier of the request cancellation and
+		// the finalization deadline, so a store call that blocks does not escape
+		// the detached ceiling just because the request context is still live.
+		pollCtx, cancelPoll := cancelOnEither(finalCtx, ctx)
+		defer cancelPoll()
 		for {
-			if replay, _, err := store.StopAttempt(ctx, sessionID, receipt.StopID, nil); err == nil {
+			if replay, _, err := store.StopAttempt(pollCtx, sessionID, receipt.StopID, nil); err == nil {
 				if replay.Finalized {
 					return replay
 				}
 				receipt = replay
 			}
 			if !receipt.FinalizingUntil.IsZero() && !time.Now().Before(receipt.FinalizingUntil) {
-				claimed, err = store.ClaimStopFinalization(ctx, sessionID, time.Now().Add(stopFinalizationLease))
+				claimed, err = store.ClaimStopFinalization(pollCtx, sessionID, time.Now().Add(stopFinalizationLease))
 				if err == nil && claimed {
 					break
 				}
 			}
 			timer := time.NewTimer(25 * time.Millisecond)
 			select {
-			case <-ctx.Done():
+			case <-pollCtx.Done():
 				timer.Stop()
 				return receipt
 			case <-timer.C:
 			}
 		}
 	}
-	receipt.HistoryID = h.finishStopV2(ctx, record, sessionID, receipt.Accepted)
+	// The watch-history row is derived from the durable stop identity before the
+	// history writer runs, never read back from the receipt afterward: a crash
+	// between the insert and RecordStopReceipt must leave a replay deriving the
+	// same row instead of minting a second one. A receipt that already carries
+	// the id (a previous attempt recorded it) is used as is.
+	historyID := receipt.HistoryID
+	if historyID == "" {
+		historyID = stopHistoryIDV2(receipt.StopID)
+	}
+	// The cleanup runs inside the budget but may not consume the receipt's
+	// reserved slice. finishStopV2's nested teardowns clamp to this deadline, so
+	// a slow cleanup cannot push the receipt past the shared budget and leave the
+	// stop replayable.
+	finalDeadline, _ := finalCtx.Deadline()
+	cleanupCtx, cancelCleanup := context.WithDeadline(finalCtx, finalDeadline.Add(-stopFinalizationReceiptGrace))
+	defer cancelCleanup()
+	writtenHistoryID, cleanupErr := h.finishStopV2(cleanupCtx, record, sessionID, receipt.Accepted, historyID)
+	receipt.HistoryID = writtenHistoryID
+	// A cleanup that did not finish leaves the stop replayable: the receipt is
+	// stored unfinalized so a later replay re-runs the idempotent writers rather
+	// than pin a half-torn session as done. Storing it also releases this claim,
+	// so the retry is not blocked for the whole lease.
+	if cleanupErr != nil {
+		slog.WarnContext(finalCtx, "playback stop cleanup incomplete; leaving the stop replayable",
+			"component", "api", "session", sessionID, "playback_session_id", sessionID, "error", cleanupErr)
+		receipt.FinalizingUntil = time.Time{}
+		if err := store.RecordStopReceipt(finalCtx, sessionID, receipt); err != nil {
+			slog.WarnContext(finalCtx, "failed to release playback stop finalization", "component", "api", "session", sessionID, "playback_session_id", sessionID, "error", err)
+		}
+		return receipt
+	}
 	receipt.Finalized = true
-	if err := store.RecordStopReceipt(ctx, sessionID, receipt); err != nil {
-		slog.WarnContext(ctx, "failed to record playback stop receipt", "component", "api", "session", sessionID, "playback_session_id", sessionID, "error", err)
+	// The receipt lands on the remaining budget. It is intentionally not given a
+	// fresh detached bound: extending past the shared deadline would let a slow
+	// cleanup outlive the lease the claim is fenced by.
+	receipt.FinalizingUntil = time.Time{}
+	if err := store.RecordStopReceipt(finalCtx, sessionID, receipt); err != nil {
+		slog.WarnContext(finalCtx, "failed to record playback stop receipt", "component", "api", "session", sessionID, "playback_session_id", sessionID, "error", err)
 	}
 	return receipt
 }
 
-// finishStopV2 runs the v1 stop side effects for the winning stop: the
+// finishStopV2 runs the v2 stop side effects for the winning stop: the
 // session stop + transcode teardown when this replica holds the session (its
 // finalizer runs the history writer), the history writer directly from a
 // session synthesized from the attempt row otherwise. The deny marker is
-// written in both cases. It returns the watch-history id when one was made.
-func (h *PlaybackHandler) finishStopV2(ctx context.Context, record *playback.AttemptRecordV3, sessionID string, accepted *playback.ProgressSampleV3) string {
+// written in both cases. It returns the watch-history id when one was made and
+// a non-nil error when any durable step did not complete.
+//
+// historyID is the row this stop must write, derived from the durable stop
+// identity (or reused from a prior attempt's receipt); every writer it reaches
+// dedupes on it, so a retry cannot add a second row. Every other step is
+// naturally idempotent (progress, deny marker, synced-session delete, proxy
+// grant). The finalization therefore finalizes the receipt only when this
+// returns nil.
+func (h *PlaybackHandler) finishStopV2(ctx context.Context, record *playback.AttemptRecordV3, sessionID string, accepted *playback.ProgressSampleV3, historyID string) (string, error) {
+	// The sole caller, finalizeStopV2, passes an already-detached, bounded
+	// context, so the deny marker, the final position, and the history writer run
+	// on the finalization budget instead of resetting another.
+	if err := ctx.Err(); err != nil {
+		// The budget ended while the claim or an earlier step ran. Starting the
+		// teardown now would run it after the lease another replica may take
+		// over; reject it.
+		return "", err
+	}
 	h.StreamDeny.Deny(ctx, sessionID)
 	position, paused := 0.0, false
 	if accepted != nil {
@@ -800,18 +907,35 @@ func (h *PlaybackHandler) finishStopV2(ctx context.Context, record *playback.Att
 				slog.WarnContext(ctx, "failed to apply final playback position", "component", "api", "session", sessionID, "playback_session_id", sessionID, "error", err)
 			}
 		}
-		result, err := h.stopPlaybackSessionWithResult(ctx, session, true)
+		result, err := h.stopPlaybackSessionWithResult(ctx, session, true, historyID)
 		if err == nil {
-			return result.HistoryID
+			return result.HistoryID, nil
 		}
 		if !errors.Is(err, playback.ErrSessionNotFound) {
-			slog.WarnContext(ctx, "failed to stop playback session", "component", "api", "session", sessionID, "playback_session_id", sessionID, "error", err)
-			return ""
+			// The local stop did not finish: its durable writes (the history row
+			// and the synced-session delete) are incomplete. Keep the history id
+			// the writer did produce and leave the stop open for a retry.
+			return result.HistoryID, err
 		}
 		// Lost the race with another stop of the live session; fall through to
-		// the row-synthesized writer so the final sample is still recorded.
+		// the row-synthesized writers so the final sample is still recorded and
+		// the shared rows are cleaned up.
 	}
-	return h.persistStopAndHistory(ctx, h.attemptSessionV2(ctx, record, position, paused)).HistoryID
+	synthesized := h.attemptSessionV2(ctx, record, position, paused)
+	result, err := h.persistStopAndHistory(ctx, synthesized, historyID)
+	if err != nil {
+		return "", err
+	}
+	// The synced-session row lives in a store shared by every replica, so a
+	// replica that does not hold the live session still deletes it. This is the
+	// step a retried stop exists to repair.
+	if h.AdminStore != nil {
+		if err := h.AdminStore.DeleteSession(ctx, sessionID); err != nil {
+			return result.HistoryID, fmt.Errorf("delete synced session: %w", err)
+		}
+	}
+	h.deleteProxyGrantV3(ctx, sessionID)
+	return result.HistoryID, nil
 }
 
 // attemptSessionV2 synthesizes the session the v1 writers read when this
@@ -1846,6 +1970,12 @@ func markAttemptStoppedServerSide(ctx context.Context, planStore playback.PlanSt
 	if sessionID == "" {
 		return
 	}
+	// Detached and bounded: a teardown reached from a canceled request (a
+	// client-canceled transport) must still stop the attempt row and write the
+	// deny marker, or the session is stranded half-dead — gone locally but
+	// replayable and still held by the client.
+	ctx, cancel := teardownContext(ctx)
+	defer cancel()
 	deny.Deny(ctx, sessionID)
 	store, ok := planStore.(playback.ProgressStoreV3)
 	if !ok {
