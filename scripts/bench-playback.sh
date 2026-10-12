@@ -40,6 +40,10 @@ fi
 WARM_REPS=${1:-20}
 COOLDOWN=${2:-35}
 DIAG_DIR="${BENCH_DIAG_DIR:-./bench-diagnostics-$(date +%Y%m%d-%H%M%S)}"
+if [[ "$DIAG_DIR" != /tmp/* && "$DIAG_DIR" != "$HOME/.cache/"* ]]; then
+  printf 'bench-playback: refusing to write diagnostics to %s (set BENCH_DIAG_DIR under /tmp or ~/.cache to keep raw responses out of the repo).\n' "$DIAG_DIR" >&2
+  exit 2
+fi
 mkdir -p "$DIAG_DIR"
 echo "  Diagnostics: $DIAG_DIR (raw responses for non-playable cold starts)"
 SERVER="${SILO_SERVER:-http://localhost:8090}"
