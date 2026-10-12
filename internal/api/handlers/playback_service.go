@@ -1372,6 +1372,12 @@ func (h *PlaybackHandler) probeRotatedVirtualCandidate(ctx context.Context, sess
 		ctx,
 		bestResultCacheKey(liveFile.ContentID, virtualPlaybackNeutralKey(live.VirtualSourceURI), live.VirtualSourceOwnerInstallationID),
 		liveFile, resolved.URL, probeTransient, probeCand,
+		virtualProbeIdentity{
+			VideoHash:   resolved.ProviderVideoHash,
+			GUID:        resolved.ProviderGUID,
+			ReleaseName: resolved.ProviderReleaseName,
+			ReleaseSize: resolved.ProviderReleaseSize,
+		}.tiers(),
 		h.virtualExpectedRuntimeMinutes(ctx, liveFile), live.VirtualSourceOwnerInstallationID,
 		generationFence,
 	)

@@ -1394,6 +1394,31 @@ func applyResolvedIdentity(transient *models.MediaFile, id virtualProbeIdentity)
 	}
 }
 
+// tiers splits the resolver's reported candidate identity into the comparison
+// tiers SharedTier consumes. It is the bridge from the resolver's own evidence
+// about what it served to the release-continuity decision, which must never be
+// read off the served transient (that file is seeded from the requested row; see
+// withResolvedCandidate).
+func (id virtualProbeIdentity) tiers() resolver.PersistedIdentityTiers {
+	return resolver.NewPersistedIdentityTiers(id.VideoHash, id.GUID, id.ReleaseName, id.ReleaseSize)
+}
+
+// resolvedSourceIdentity returns the resolver's own report of the candidate it
+// returned, captured on the resolved source by withResolvedCandidate. An empty
+// identity means the resolver proved nothing about the served bytes, which the
+// release-continuity checks treat as a refusal rather than a match.
+func resolvedSourceIdentity(src *resolvedVirtualPlaybackSource) virtualProbeIdentity {
+	if src == nil {
+		return virtualProbeIdentity{}
+	}
+	return virtualProbeIdentity{
+		VideoHash:   src.ProviderVideoHash,
+		GUID:        src.ProviderGUID,
+		ReleaseName: src.ProviderReleaseName,
+		ReleaseSize: src.ProviderReleaseSize,
+	}
+}
+
 func virtualFileHasPlayableDeclaredMetadata(file *models.MediaFile) bool {
 	if file == nil {
 		return false
@@ -3127,7 +3152,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 					// cache, so try a cache-only recovery before falling back
 					// to declared metadata; otherwise the row stays unprobed
 					// until the damper lapses.
-					h.recoverVirtualProbeFromCache(r.Context(), file, streamURL, probeTransient, cand, oid)
+					h.recoverVirtualProbeFromCache(r.Context(), file, streamURL, probeTransient, cand, resolvedIdentity.tiers(), oid)
 					return withResolvedCandidate(&resolvedVirtualPlaybackSource{
 						URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenanceDeclared, ResolutionAssumed: resolutionAssumed,
 					}, resolvedIdentity, resolvedRematched), nil
@@ -3139,6 +3164,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 						streamURL:              streamURL,
 						probeTransient:         &probeTransient,
 						cand:                   cand,
+						candidate:              resolvedIdentity,
 						expectedRuntimeMinutes: h.virtualExpectedRuntimeMinutes(r.Context(), file),
 						ownerID:                oid,
 					}
@@ -3150,10 +3176,10 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 						go func() {
 							defer gate.release()
 							defer bgCancel()
-							h.probeVirtualSourceAndPersist(bgCtx, stickyKey, file, streamURL, probeTransient, probeCand, expectedRuntimeMinutes, oid)
+							h.probeVirtualSourceAndPersist(bgCtx, stickyKey, file, streamURL, probeTransient, probeCand, resolvedIdentity.tiers(), expectedRuntimeMinutes, oid)
 						}()
 					} else if !skipProbe {
-						h.probeVirtualCandidateForegroundFallback(r.Context(), stickyKey, file, streamURL, probeTransient, probeCand, expectedRuntimeMinutes, oid)
+						h.probeVirtualCandidateForegroundFallback(r.Context(), stickyKey, file, streamURL, probeTransient, probeCand, resolvedIdentity.tiers(), expectedRuntimeMinutes, oid)
 					}
 				}
 			}
@@ -3224,7 +3250,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				// and serve declared metadata immediately.
 				syncProbeFile := cloneVirtualProbeTransient(transient)
 				syncProbeFile.Duration = 0
-				h.recoverVirtualProbeFromCache(attemptCtx, file, streamURL, syncProbeFile, cand, oid)
+				h.recoverVirtualProbeFromCache(attemptCtx, file, streamURL, syncProbeFile, cand, resolvedIdentity.tiers(), oid)
 			} else {
 				probeBgFile := cloneVirtualProbeTransient(transient)
 				probeBgFile.Duration = 0
@@ -3234,7 +3260,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 					go func() {
 						defer gate.release()
 						defer bgCancel()
-						h.probeVirtualSourceAndPersist(bgCtx, stickyKey, file, streamURL, probeBgFile, probeBgCand, h.virtualExpectedRuntimeMinutes(r.Context(), file), oid)
+						h.probeVirtualSourceAndPersist(bgCtx, stickyKey, file, streamURL, probeBgFile, probeBgCand, resolvedIdentity.tiers(), h.virtualExpectedRuntimeMinutes(r.Context(), file), oid)
 					}()
 				}
 			}
@@ -3248,7 +3274,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			// settling for the candidate-declared metadata.
 			syncProbeFile := cloneVirtualProbeTransient(transient)
 			syncProbeFile.Duration = 0
-			h.recoverVirtualProbeFromCache(attemptCtx, file, streamURL, syncProbeFile, cand, oid)
+			h.recoverVirtualProbeFromCache(attemptCtx, file, streamURL, syncProbeFile, cand, resolvedIdentity.tiers(), oid)
 			return declaredFallback()
 		}
 		// Cache-first probe. The probe cache is keyed on the canonical candidate
@@ -3267,7 +3293,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		// instead of inheriting the catalog value.
 		syncProbeFile.Duration = 0
 		if !substituted {
-			if cached := h.virtualProbeFromCache(attemptCtx, file, streamURL, syncProbeFile, cand, oid); cached != nil {
+			if cached := h.virtualProbeFromCache(attemptCtx, file, streamURL, syncProbeFile, cand, resolvedIdentity.tiers(), oid); cached != nil {
 				trace.probeRan = true
 				if transient.ID > 0 {
 					cached.ID = transient.ID
@@ -3396,7 +3422,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			// Persist probed audio/subtitle tracks back to the DB so
 			// the watch detail and player UI show track options on
 			// subsequent views without re-probing.
-			h.persistVirtualProbeEvidence(r.Context(), file, result.File.FilePath, result.File, result.Provenance == ProbeProvenanceVerified, true)
+			h.persistVirtualProbeEvidence(r.Context(), file, result.File.FilePath, result.File, resolvedSourceIdentity(result).tiers(), result.Provenance == ProbeProvenanceVerified, true)
 			// The filtered candidate list is already cached device-neutrally
 			// above (and ranked for this device), so replays skip the provider
 			// round-trip and re-rank for the requesting device. Pin this URI
@@ -3425,7 +3451,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			}
 		}
 		if firstResolved.Provenance == ProbeProvenanceVerified {
-			h.persistVirtualProbeEvidence(r.Context(), file, firstResolved.File.FilePath, firstResolved.File, true, true)
+			h.persistVirtualProbeEvidence(r.Context(), file, firstResolved.File.FilePath, firstResolved.File, resolvedSourceIdentity(firstResolved).tiers(), true, true)
 		}
 		// The rank/count were set where this result was produced; a
 		// fast-path result that skipped ranking keeps its unknown (-1).
@@ -3564,6 +3590,7 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersist(
 	probeURL string,
 	probeTransient models.MediaFile,
 	probeCand VirtualPlaybackStream,
+	candidate resolver.PersistedIdentityTiers,
 	expectedRuntimeMinutes int,
 	ownerInstallationID int,
 	fence ...func() bool,
@@ -3572,7 +3599,7 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersist(
 	if len(fence) > 0 {
 		bindingFence = fence[0]
 	}
-	outcome, _ := h.probeVirtualSourceAndPersistWith(bgCtx, stickyKey, catalogFile, probeURL, probeTransient, probeCand, expectedRuntimeMinutes, ownerInstallationID, false, bindingFence)
+	outcome, _ := h.probeVirtualSourceAndPersistWith(bgCtx, stickyKey, catalogFile, probeURL, probeTransient, probeCand, candidate, expectedRuntimeMinutes, ownerInstallationID, false, bindingFence)
 	return outcome
 }
 
@@ -3593,6 +3620,7 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 	probeURL string,
 	probeTransient models.MediaFile,
 	probeCand VirtualPlaybackStream,
+	candidate resolver.PersistedIdentityTiers,
 	expectedRuntimeMinutes int,
 	ownerInstallationID int,
 	durableEvidence bool,
@@ -3650,7 +3678,7 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 		// as verified. committedFileID is the row the write actually targeted: a
 		// rotation can move it off catalogFile, and the caller's post-commit
 		// default-audio reconciliation must run against the owner row.
-		committed, committedFileID := h.persistVirtualProbeEvidenceDurable(bgCtx, catalogFile, probeCand.URI, probed, true)
+		committed, committedFileID := h.persistVirtualProbeEvidenceDurable(bgCtx, catalogFile, probeCand.URI, probed, candidate, true)
 		if !committed {
 			slog.WarnContext(bgCtx, "deferred virtual probe evidence write did not commit; reporting failed",
 				"component", "api", "candidate_uri", probeCand.URI, "file_id", catalogFile.ID)
@@ -3665,7 +3693,7 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 		// recipe keeps the preferred language.
 		return probeOutcomeVerified, committedFileID
 	}
-	h.persistVirtualProbeEvidence(bgCtx, catalogFile, probeCand.URI, probed, true, false)
+	h.persistVirtualProbeEvidence(bgCtx, catalogFile, probeCand.URI, probed, candidate, true, false)
 	return probeOutcomeVerified, 0
 }
 
@@ -3690,8 +3718,8 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 // therefore readable from the catalog row, together with the row the write
 // actually targeted (a rotation can move it off catalogFile), so the caller can
 // run the post-commit default-audio reconciliation against the owner row.
-func (h *PlaybackHandler) persistVirtualProbeEvidenceDurable(ctx context.Context, catalogFile *models.MediaFile, resolvedPath string, probed *models.MediaFile, stampProbe bool) (bool, int) {
-	args, _, ok := h.virtualProbeEvidenceArgs(ctx, catalogFile, resolvedPath, probed, stampProbe)
+func (h *PlaybackHandler) persistVirtualProbeEvidenceDurable(ctx context.Context, catalogFile *models.MediaFile, resolvedPath string, probed *models.MediaFile, candidate resolver.PersistedIdentityTiers, stampProbe bool) (bool, int) {
+	args, _, ok := h.virtualProbeEvidenceArgs(ctx, catalogFile, resolvedPath, probed, candidate, stampProbe)
 	if !ok {
 		slog.WarnContext(ctx, "durable virtual probe evidence write refused before execution",
 			"component", "api", "file_id", catalogFileIDOrZero(catalogFile), "candidate_uri", resolvedPath)
@@ -3751,6 +3779,7 @@ func (h *PlaybackHandler) virtualProbeFromCache(
 	sourceURL string,
 	probeFile models.MediaFile,
 	probeCand VirtualPlaybackStream,
+	candidate resolver.PersistedIdentityTiers,
 	ownerInstallationID int,
 ) *models.MediaFile {
 	if h == nil || h.VirtualProbeCacheLookup == nil || catalogFile == nil {
@@ -3769,7 +3798,7 @@ func (h *PlaybackHandler) virtualProbeFromCache(
 		probed.Duration = probeFile.Duration
 	}
 	mergeVirtualCandidateTracks(probed, probeCand)
-	h.persistVirtualProbeEvidence(ctx, catalogFile, probeCand.URI, probed, true, false)
+	h.persistVirtualProbeEvidence(ctx, catalogFile, probeCand.URI, probed, candidate, true, false)
 	return probed
 }
 
@@ -3786,9 +3815,10 @@ func (h *PlaybackHandler) recoverVirtualProbeFromCache(
 	sourceURL string,
 	probeFile models.MediaFile,
 	probeCand VirtualPlaybackStream,
+	candidate resolver.PersistedIdentityTiers,
 	ownerInstallationID int,
 ) bool {
-	return h.virtualProbeFromCache(ctx, catalogFile, sourceURL, probeFile, probeCand, ownerInstallationID) != nil
+	return h.virtualProbeFromCache(ctx, catalogFile, sourceURL, probeFile, probeCand, candidate, ownerInstallationID) != nil
 }
 
 // revalidateVirtualCandidateBackground resolves the provider URL for a
@@ -3904,10 +3934,10 @@ func (h *PlaybackHandler) revalidateVirtualCandidateBackground(
 		if virtualProbeFailures.recent(virtualProbeFailureKey(cand.URI, oid)) {
 			// The damper would skip the probe, but a completed inner probe may
 			// already be cached. Recover it so the row is not left unprobed.
-			h.recoverVirtualProbeFromCache(bgCtx, file, streamURL, probeTransient, cand, oid)
+			h.recoverVirtualProbeFromCache(bgCtx, file, streamURL, probeTransient, cand, resolvedIdentity.tiers(), oid)
 			return
 		}
-		h.probeVirtualSourceAndPersist(bgCtx, stickyKey, file, streamURL, probeTransient, cand, h.virtualExpectedRuntimeMinutes(bgCtx, file), oid)
+		h.probeVirtualSourceAndPersist(bgCtx, stickyKey, file, streamURL, probeTransient, cand, resolvedIdentity.tiers(), h.virtualExpectedRuntimeMinutes(bgCtx, file), oid)
 	}()
 }
 
@@ -4499,8 +4529,8 @@ func (h *PlaybackHandler) persistVirtualMetadataBounded(ctx context.Context, sna
 // leave the row permanently unprobed and force the slow list+probe path on
 // every later play. Background and speculative callers pass false and are never
 // written directly, so the fallback cannot amplify load.
-func (h *PlaybackHandler) persistVirtualProbeEvidence(ctx context.Context, catalogFile *models.MediaFile, resolvedPath string, probed *models.MediaFile, stampProbe, foreground bool) {
-	args, originFileID, ok := h.virtualProbeEvidenceArgs(ctx, catalogFile, resolvedPath, probed, stampProbe)
+func (h *PlaybackHandler) persistVirtualProbeEvidence(ctx context.Context, catalogFile *models.MediaFile, resolvedPath string, probed *models.MediaFile, candidate resolver.PersistedIdentityTiers, stampProbe, foreground bool) {
+	args, originFileID, ok := h.virtualProbeEvidenceArgs(ctx, catalogFile, resolvedPath, probed, candidate, stampProbe)
 	if !ok {
 		return
 	}
@@ -4532,15 +4562,15 @@ func (h *PlaybackHandler) persistVirtualProbeEvidence(ctx context.Context, catal
 // background-probe fix: a probed candidate URI whose path already belongs to an
 // alternate-version row must bind the evidence to the version that actually
 // plays, not be dropped onto the pinned row forever.
-func (h *PlaybackHandler) virtualProbeEvidenceArgs(ctx context.Context, catalogFile *models.MediaFile, resolvedPath string, probed *models.MediaFile, stampProbe bool) (models.VirtualFilePersistArgs, int, bool) {
+func (h *PlaybackHandler) virtualProbeEvidenceArgs(ctx context.Context, catalogFile *models.MediaFile, resolvedPath string, probed *models.MediaFile, candidate resolver.PersistedIdentityTiers, stampProbe bool) (models.VirtualFilePersistArgs, int, bool) {
 	if h == nil || (h.VirtualFileSaver == nil && h.VirtualFileMetadataSaver == nil) || catalogFile == nil || probed == nil || catalogFile.ID <= 0 {
 		return models.VirtualFilePersistArgs{}, 0, false
 	}
-	identityRow, evidence, ok := h.virtualProbeEvidenceRotateTarget(ctx, catalogFile, resolvedPath, probed)
+	identityRow, evidence, ok := h.virtualProbeEvidenceRotateTarget(ctx, catalogFile, resolvedPath, probed, candidate)
 	if !ok {
 		return models.VirtualFilePersistArgs{}, 0, false
 	}
-	args, ok := h.virtualProbeEvidenceArgsForRow(ctx, identityRow, resolvedPath, evidence, stampProbe)
+	args, ok := h.virtualProbeEvidenceArgsForRow(ctx, identityRow, resolvedPath, evidence, candidate, stampProbe)
 	if !ok {
 		return models.VirtualFilePersistArgs{}, 0, false
 	}
@@ -4563,8 +4593,8 @@ func (h *PlaybackHandler) virtualProbeEvidenceArgs(ctx context.Context, catalogF
 // holds, keeps the previous behavior: the write is refused (or classified and
 // left to the SQL fence) rather than adopting bytes whose owner is unknown. The
 // refusal is logged with the concrete cause, never a lumped bucket.
-func (h *PlaybackHandler) virtualProbeEvidenceRotateTarget(ctx context.Context, catalogFile *models.MediaFile, resolvedPath string, probed *models.MediaFile) (*models.MediaFile, *models.MediaFile, bool) {
-	if !virtualProbeEvidenceRequiresAdoption(catalogFile, resolvedPath) {
+func (h *PlaybackHandler) virtualProbeEvidenceRotateTarget(ctx context.Context, catalogFile *models.MediaFile, resolvedPath string, probed *models.MediaFile, candidate resolver.PersistedIdentityTiers) (*models.MediaFile, *models.MediaFile, bool) {
+	if virtualProbeEvidenceSharesRowRelease(catalogFile, resolvedPath, candidate) {
 		return catalogFile, probed, true
 	}
 	ownerRow, ownerErr := h.virtualPathOwnerRow(ctx, catalogFile, resolvedPath, catalogFile.VirtualOwnerInstallationID, catalogFile.MediaFolderID)
@@ -4675,11 +4705,40 @@ func virtualSiblingOwnerSharesRelease(a, b *models.MediaFile) bool {
 	return shared
 }
 
+// virtualProbeEvidenceSharesRowRelease reports whether probe evidence for a
+// candidate belongs to the row's own release. The exact and provider-neutral
+// ownership checks (virtualCandidateRowVerified) decide the common case; a
+// provider that renumbered its per-listing result ids surfaces the same release
+// under a new concrete id, which a comparison of the row's durable identity
+// against the identity the resolver reported proves is the same release. Such a
+// churned candidate is the row's own evidence and is written against the row's
+// pinned path rather than requiring a fenced cross-release adoption of the new
+// token. A genuinely different release shares no tier, so it keeps the existing
+// cross-release path.
+//
+// The candidate identity is the resolver's own result, never the probed
+// transient: that file is seeded from the requested row and would echo the row's
+// tiers back as false proof (see withResolvedCandidate). The comparison is the
+// asymmetric SharedTier with the row as the authoritative persisted selection, so
+// a stronger tier the row carries but the candidate cannot corroborate is a veto
+// (a missing hash is not neutral), and the name tier cannot match on size alone.
+func virtualProbeEvidenceSharesRowRelease(row *models.MediaFile, candidateURI string, candidate resolver.PersistedIdentityTiers) bool {
+	if row == nil {
+		return false
+	}
+	if virtualCandidateRowVerified(row, candidateURI) {
+		return true
+	}
+	rowTiers := resolver.NewPersistedIdentityTiers(row.ProviderVideoHash, row.ProviderGUID, row.ProviderReleaseName, row.ProviderReleaseSize)
+	_, shared := rowTiers.SharedTier(candidate)
+	return shared
+}
+
 // virtualProbeEvidenceArgsForRow builds the catalog write for one probe result
 // against the row the evidence belongs to. It returns false when the write must
 // be refused: a cross-release candidate the row cannot adopt (a collection-owned
 // row with no adoption target).
-func (h *PlaybackHandler) virtualProbeEvidenceArgsForRow(ctx context.Context, catalogFile *models.MediaFile, resolvedPath string, probed *models.MediaFile, stampProbe bool) (models.VirtualFilePersistArgs, bool) {
+func (h *PlaybackHandler) virtualProbeEvidenceArgsForRow(ctx context.Context, catalogFile *models.MediaFile, resolvedPath string, probed *models.MediaFile, candidate resolver.PersistedIdentityTiers, stampProbe bool) (models.VirtualFilePersistArgs, bool) {
 	snap := snapshotVirtualRow(catalogFile)
 	expectedPath := catalogFile.FilePath
 	adoptPath := ""
@@ -4694,8 +4753,19 @@ func (h *PlaybackHandler) virtualProbeEvidenceArgsForRow(ctx context.Context, ca
 	// only with RequireAdopt set, so the SQL fence accepts or refuses the whole
 	// write atomically. The same-release cases stay metadata-only: the row
 	// carries the candidate's exact identity, or the provider-neutral identity
-	// with no concrete pick (a neutral row owns every candidate in its release).
-	crossRelease := virtualProbeEvidenceRequiresAdoption(catalogFile, resolvedPath)
+	// with no concrete pick (a neutral row owns every candidate in its release),
+	// or the row's durable identity proves a provider-renumbered candidate is the
+	// same release under a new listing token.
+	crossRelease := !virtualProbeEvidenceSharesRowRelease(catalogFile, resolvedPath, candidate)
+	// Adopt against the session pin: when the row already carries a concrete
+	// ?result= pick and only durable identity ties the resolved churned token to
+	// it, keep the row's concrete path and write the evidence metadata-only
+	// rather than moving the row onto the new token. A neutral row has no pin to
+	// carry and still adopts the resolved concrete candidate, matching the
+	// pre-existing pick.
+	if !crossRelease && adoptPath != "" && !virtualCandidateRowVerified(catalogFile, resolvedPath) {
+		adoptPath = ""
+	}
 	if crossRelease && adoptPath == "" {
 		// A collection-owned row is never rewritten (the collection sync would
 		// reconcile the adopted path away), so there is no adoption target to
@@ -4841,6 +4911,7 @@ func (h *PlaybackHandler) probeVirtualCandidateForegroundFallback(
 	probeURL string,
 	probeTransient models.MediaFile,
 	probeCand VirtualPlaybackStream,
+	candidate resolver.PersistedIdentityTiers,
 	expectedRuntimeMinutes int,
 	ownerInstallationID int,
 ) {
@@ -4880,7 +4951,7 @@ func (h *PlaybackHandler) probeVirtualCandidateForegroundFallback(
 		probed.Duration = probeTransient.Duration
 	}
 	mergeVirtualCandidateTracks(probed, probeCand)
-	args, _, ok := h.virtualProbeEvidenceArgs(requestCtx, catalogFile, probeCand.URI, probed, true)
+	args, _, ok := h.virtualProbeEvidenceArgs(requestCtx, catalogFile, probeCand.URI, probed, candidate, true)
 	if !ok {
 		return
 	}
@@ -6045,7 +6116,7 @@ func (h *PlaybackHandler) resolveVirtualCandidateSource(
 	// second synchronous ffprobe. The cache key strips the provider query, so a
 	// renumbered ?result= or rotated credential still hits the same release's
 	// cached bytes evidence.
-	if cached := h.virtualProbeFromCache(ctx, file, streamURL, transient, candidate, ownerID); cached != nil {
+	if cached := h.virtualProbeFromCache(ctx, file, streamURL, transient, candidate, resolvedSourceIdentity(&resolved).tiers(), ownerID); cached != nil {
 		resolved.File = cached
 		resolved.ProbeSucceeded = true
 		resolved.Provenance = ProbeProvenanceVerified

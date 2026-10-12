@@ -45,7 +45,7 @@ func TestBackgroundProbeTransientTimeoutDoesNotUnpinActivePin(t *testing.T) {
 	file := &models.MediaFile{ID: 501, ContentID: "series-tt", EpisodeID: "ep-1", FilePath: uri, VirtualOwnerInstallationID: 5}
 	cand := VirtualPlaybackStream{ID: "cand-1", URI: uri}
 
-	h.probeVirtualSourceAndPersist(context.Background(), stickyKey, file, "http://provider.example/stream", *file, cand, 45, 5)
+	h.probeVirtualSourceAndPersist(context.Background(), stickyKey, file, "http://provider.example/stream", *file, cand, noCandidateIdentity, 45, 5)
 
 	if got := h.peekVirtualSticky(stickyKey); got != uri {
 		t.Fatalf("transient timeout released the active pin: got %q, want %q", got, uri)
@@ -77,7 +77,7 @@ func TestBackgroundProbeContextErrorDoesNotMarkDefinitiveFailure(t *testing.T) {
 	file := &models.MediaFile{ID: 502, ContentID: "series-tt", EpisodeID: "ep-1", FilePath: uri, VirtualOwnerInstallationID: 5}
 	cand := VirtualPlaybackStream{ID: "cand-1", URI: uri}
 
-	h.probeVirtualSourceAndPersist(context.Background(), stickyKey, file, "http://provider.example/stream", *file, cand, 0, 5)
+	h.probeVirtualSourceAndPersist(context.Background(), stickyKey, file, "http://provider.example/stream", *file, cand, noCandidateIdentity, 0, 5)
 	if got := h.peekVirtualSticky(stickyKey); got != uri {
 		t.Fatalf("first context error released the pin: got %q, want %q", got, uri)
 	}
@@ -85,7 +85,7 @@ func TestBackgroundProbeContextErrorDoesNotMarkDefinitiveFailure(t *testing.T) {
 		t.Fatalf("first context error counted %d failures, want fewer than %d", got, virtualProbeFailureRepeatThreshold)
 	}
 
-	h.probeVirtualSourceAndPersist(context.Background(), stickyKey, file, "http://provider.example/stream", *file, cand, 0, 5)
+	h.probeVirtualSourceAndPersist(context.Background(), stickyKey, file, "http://provider.example/stream", *file, cand, noCandidateIdentity, 0, 5)
 	if got := h.peekVirtualSticky(stickyKey); got != "" {
 		t.Fatalf("second consecutive context error kept the pin: %q", got)
 	}

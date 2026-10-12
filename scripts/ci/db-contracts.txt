@@ -170,3 +170,8 @@
 
 # Watch-provider events carry catalog titles to plugins.
 ./internal/watchsync TestGetMediaTitlesDB
+
+# A foreign-substitution probe write is classified cross-release from the
+# resolver's identity (a missing or conflicting stronger tier is not neutral) and
+# the SQL adoption fence refuses it, leaving the original row byte-identical.
+./internal/api/handlers TestForeignSubstitutionProbeWriteStaysFenced
