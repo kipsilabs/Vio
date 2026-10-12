@@ -4579,7 +4579,7 @@ func (h *PlaybackHandler) virtualProbeEvidenceRotateTarget(ctx context.Context, 
 		attrs := []any{
 			"component", "api", "file_id", catalogFile.ID, "candidate_uri", resolvedPath,
 			"row_path", catalogFile.FilePath, "probe_source", catalogFile.ProbeSource,
-			"reason", virtualProbeRefusalOwnerLookupFailed, "error", ownerErr,
+			"reason", virtualProbeRefusalOwnerLookupFailed, virtualEvidenceLogKeyError, ownerErr,
 			"consecutive_refusals", refusals, "refusal_bound", virtualAdoptionRefusalBound,
 		}
 		if refusals >= virtualAdoptionRefusalBound {

@@ -463,7 +463,7 @@ func (adoptionBoundNoRow) Scan(...any) error { return pgx.ErrNoRows }
 type adoptionBoundAdoptingDB struct{ path string }
 
 func (d adoptionBoundAdoptingDB) QueryRow(context.Context, string, ...any) pgx.Row {
-	return adoptionBoundPathRow{path: d.path}
+	return adoptionBoundPathRow(d)
 }
 
 type adoptionBoundPathRow struct{ path string }
