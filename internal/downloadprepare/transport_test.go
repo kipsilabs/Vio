@@ -174,6 +174,91 @@ func TestRequestExecutionFingerprintBindsRecipeButNotArtifactHandle(t *testing.T
 	}
 }
 
+// A virtual title's relay URL rotates between attempts while its durable source
+// identity does not. The execution fingerprint must follow the canonical path,
+// so a rotation never invalidates a healthy artifact, while a real source or
+// quality change still does. A local file (no canonical path) hashes exactly as
+// before, so its fingerprints do not move.
+func TestRequestExecutionFingerprintUsesCanonicalInputForVirtualTitles(t *testing.T) {
+	canonical := "virtual://movie/tt1234?result=abc"
+	base := Request{
+		InputPath: "http://relay/attempt-1/token", CanonicalInputPath: canonical,
+		TargetCodecVideo: "h264", TargetCodecAudio: "aac", AudioTrackIndex: 0,
+	}
+	want := base.ExecutionFingerprint()
+	if want == "" {
+		t.Fatal("ExecutionFingerprint() is empty")
+	}
+
+	// The relay URL rotates: the fingerprint must not move.
+	rotated := base
+	rotated.InputPath = "http://relay/attempt-2/other-token"
+	if got := rotated.ExecutionFingerprint(); got != want {
+		t.Fatalf("relay rotation changed execution fingerprint: %q != %q", got, want)
+	}
+
+	// Canonical path set with the relay as the input hashes the same as the
+	// canonical path itself, so the node and the API agree whichever form each
+	// side holds.
+	canonicalOnly := Request{InputPath: canonical, TargetCodecVideo: "h264", TargetCodecAudio: "aac", AudioTrackIndex: 0}
+	if got := canonicalOnly.ExecutionFingerprint(); got != want {
+		t.Fatalf("canonical-only fingerprint = %q, want %q", got, want)
+	}
+
+	// A real source change still moves the fingerprint.
+	changedSource := base
+	changedSource.CanonicalInputPath = "virtual://movie/tt1234?result=different-release"
+	if got := changedSource.ExecutionFingerprint(); got == want {
+		t.Fatal("a different canonical source did not change execution fingerprint")
+	}
+	// A real quality change still moves it too.
+	changedQuality := base
+	changedQuality.TargetResolution = "720p"
+	if got := changedQuality.ExecutionFingerprint(); got == want {
+		t.Fatal("a quality change did not change execution fingerprint")
+	}
+	// Selecting a different audio track is a different recipe, so it moves too.
+	changedTrack := base
+	changedTrack.AudioTrackIndex = 1
+	if got := changedTrack.ExecutionFingerprint(); got == want {
+		t.Fatal("a track change did not change execution fingerprint")
+	}
+
+	// A local file carries no canonical path and must be unaffected by the
+	// canonicalization: the same request with and without an (impossible)
+	// canonical field is identical, and changing its input moves it.
+	local := Request{InputPath: "/media/movie.mkv", TargetCodecVideo: "h264", TargetCodecAudio: "aac", AudioTrackIndex: 0}
+	if local.CanonicalInputPath != "" {
+		t.Fatal("local request unexpectedly carries a canonical path")
+	}
+	movedLocal := local
+	movedLocal.InputPath = "/media/other.mkv"
+	if local.ExecutionFingerprint() == movedLocal.ExecutionFingerprint() {
+		t.Fatal("a local input change did not change execution fingerprint")
+	}
+}
+
+// The transport round-trip keeps the canonical path, so a node reconstructing
+// options from the request attests the same fingerprint the API froze.
+func TestRequestTranscodeOptsCarriesCanonicalInput(t *testing.T) {
+	req := NewRequest("art-1", playback.TranscodeOpts{
+		InputPath: "http://relay/attempt-1/token", CanonicalInputPath: "virtual://movie/tt9?result=z",
+	})
+	if req.CanonicalInputPath != "virtual://movie/tt9?result=z" {
+		t.Fatalf("NewRequest canonical = %q, want the durable identity", req.CanonicalInputPath)
+	}
+	roundTrip := req.TranscodeOpts("/usr/bin/ffmpeg", "none", "", nil)
+	if roundTrip.InputPath != "http://relay/attempt-1/token" {
+		t.Fatalf("round-trip InputPath = %q, want the concrete relay", roundTrip.InputPath)
+	}
+	if roundTrip.CanonicalInputPath != "virtual://movie/tt9?result=z" {
+		t.Fatalf("round-trip CanonicalInputPath = %q, want the durable identity", roundTrip.CanonicalInputPath)
+	}
+	if got, want := NewRequest("art-1", roundTrip).ExecutionFingerprint(), req.ExecutionFingerprint(); got != want {
+		t.Fatalf("round-trip fingerprint = %q, want %q", got, want)
+	}
+}
+
 func TestRequestStereoDownmixBoostRequested(t *testing.T) {
 	for _, test := range []struct {
 		name string

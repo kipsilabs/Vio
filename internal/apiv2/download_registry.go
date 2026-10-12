@@ -14,6 +14,7 @@ import (
 type DownloadRegistryService interface {
 	Capability(context.Context, int) (downloads.Capability, error)
 	ListPage(context.Context, int, string, string, *downloads.RegistryPosition, int) ([]*downloads.Download, error)
+	Get(context.Context, int, string, string, string) (*downloads.Download, error)
 	ReportStatus(context.Context, int, string, string, string, downloads.StatusEvent) (*downloads.Download, error)
 	Delete(context.Context, int, string, string, string) error
 }
@@ -65,6 +66,10 @@ type DownloadStatusInput struct {
 	Body     DownloadStatusBody
 }
 type DownloadDeleteInput struct {
+	ID       string `path:"id" minLength:"1"`
+	DeviceID string `header:"X-Vio-Device-Id" maxLength:"128"`
+}
+type DownloadGetInput struct {
 	ID       string `path:"id" minLength:"1"`
 	DeviceID string `header:"X-Vio-Device-Id" maxLength:"128"`
 }
@@ -129,6 +134,12 @@ func registerDownloadRegistry(reg *Registry) {
 	Register(reg, Operation{Operation: humaOp(http.MethodGet, Prefix+"/downloads", "listDownloads", "downloads", "Page device-managed downloads or account ephemeral downloads."), Class: ClassProfileScoped, ServiceBacked: true}, func(ctx context.Context, in *DownloadRegistryInput) (*DownloadRegistryOutput, error) {
 		return reg.listDownloads(ctx, cursors, in)
 	})
+	// One entry by id, so a client tracking a preparation does not have to find
+	// its row in a page that another device's activity can rotate out from under
+	// it. Same profile/device scoping as the list it complements.
+	get := Operation{Operation: humaOp(http.MethodGet, Prefix+"/downloads/{id}", "getDownload", "downloads", "Read one device-managed download, or one of the account's ephemeral downloads."), Class: ClassProfileScoped, ServiceBacked: true}
+	get.Errors = []int{404}
+	Register(reg, get, reg.getDownload)
 	op := Operation{Operation: humaOp(http.MethodPatch, Prefix+"/downloads/{id}", "reportDownloadStatus", "downloads", "Record a revision-bound local status event; older or equal events return current state."), Class: ClassProfileScoped, ServiceBacked: true, RetrySafety: RetrySafetyDomainIdentity}
 	op.MaxBodyBytes = 4096
 	op.Errors = []int{409}
@@ -242,6 +253,20 @@ func (reg *Registry) listDownloads(ctx context.Context, cursors *Cursors, in *Do
 		items = append(items, downloadEntryOf(row))
 	}
 	return &DownloadRegistryOutput{Body: Paginated(items, next)}, nil
+}
+func (reg *Registry) getDownload(ctx context.Context, in *DownloadGetInput) (*DownloadEntryOutput, error) {
+	if reg.deps.Downloads == nil {
+		return nil, unavailable("downloads")
+	}
+	user, profile, p := viewerIdentity(ctx)
+	if p != nil {
+		return nil, p
+	}
+	row, err := reg.deps.Downloads.Get(ctx, user, profile, in.DeviceID, in.ID)
+	if err != nil {
+		return nil, downloadProblem(err)
+	}
+	return &DownloadEntryOutput{Body: downloadEntryOf(row)}, nil
 }
 func (reg *Registry) reportDownloadStatus(ctx context.Context, in *DownloadStatusInput) (*DownloadEntryOutput, error) {
 	if reg.deps.Downloads == nil {

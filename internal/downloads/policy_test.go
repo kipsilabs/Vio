@@ -56,6 +56,16 @@ func TestDownloadQualityResolverResolve(t *testing.T) {
 			FrameRate: "60/1", Bitrate: 55_000, BitDepth: 10,
 		}},
 	}
+	// A provider-backed row has no local bytes; any download quality must
+	// prepare an artifact rather than offering the unservable original.
+	virtualFile := &models.MediaFile{
+		ID:         6,
+		CodecVideo: "h264",
+		CodecAudio: "aac",
+		Container:  "virtual",
+		Resolution: "1080p",
+		FilePath:   "virtual://movie/tt1?result=a",
+	}
 	caps := playback.ClientCapabilities{
 		CodecsVideo: []string{"h264"},
 		CodecsAudio: []string{"aac"},
@@ -208,6 +218,33 @@ func TestDownloadQualityResolverResolve(t *testing.T) {
 			transcodeEnabled: true,
 			userTranscode:    true,
 			wantErr:          ErrQualityUnavailable,
+		},
+		{
+			name:               "virtual original prepares a remux artifact even without caps",
+			requested:          QualityOriginal,
+			file:               virtualFile,
+			artifactsAvailable: true,
+			wantFormat:         FormatRemux,
+			wantQuality:        QualityOriginal,
+			wantEffective:      QualityOriginal,
+		},
+		{
+			name:      "virtual download without an artifact pipeline is unavailable",
+			requested: QualityOriginal,
+			file:      virtualFile,
+			wantErr:   ErrQualityUnavailable,
+		},
+		{
+			name:               "virtual preset resolves to a transcode target",
+			requested:          Quality5Mbps,
+			file:               virtualFile,
+			transcodeEnabled:   true,
+			userTranscode:      true,
+			artifactsAvailable: true,
+			wantFormat:         FormatTranscode,
+			wantQuality:        Quality5Mbps,
+			wantEffective:      Quality5Mbps,
+			wantBitrate:        5000,
 		},
 	}
 

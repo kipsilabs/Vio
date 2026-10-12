@@ -191,6 +191,7 @@ func TestGeneratedDocumentStatuses(t *testing.T) {
 		"getDownloadSubtitle":          true,
 
 		"listDownloads":                  true,
+		"getDownload":                    true,
 		"reportDownloadStatus":           true,
 		"deleteDownload":                 true,
 		"getDownloadCapability":          true,

@@ -552,6 +552,70 @@ func TestArtifactMarkFencedByOwner(t *testing.T) {
 	}
 }
 
+// TestArtifactWorkerLossVersusCompletionRace fixes the race between a worker
+// that lost its lease and one that may already have committed. The first half
+// proves heartbeat loss stops work: once the job is stolen, the old owner's
+// heartbeat and its late MarkReady are both refused, so it cannot overwrite the
+// replacement. The second half proves completion wins once committed: the
+// result the current owner committed stands and a stale duplicate write cannot
+// replace the locator that already won.
+func TestArtifactWorkerLossVersusCompletionRace(t *testing.T) {
+	repo, pool, fileID := newArtifactTestRepo(t)
+	ctx := context.Background()
+
+	row, _, err := repo.EnsureQueued(ctx, newArtifact(t, fileID, "hash-race"))
+	if err != nil {
+		t.Fatalf("EnsureQueued: %v", err)
+	}
+	if _, err := repo.ClaimNext(ctx, "worker-a", time.Minute); err != nil {
+		t.Fatalf("worker-a claim: %v", err)
+	}
+	// While worker-a holds the lease its heartbeat succeeds.
+	if ok, err := repo.Heartbeat(ctx, row.ID, "worker-a", time.Minute); err != nil || !ok {
+		t.Fatalf("Heartbeat(worker-a) = (%v, %v), want (true, nil)", ok, err)
+	}
+
+	// It stops heartbeating and its lease lapses; another worker reclaims the
+	// job. This is the loss the heartbeat loop must observe.
+	if _, err := pool.Exec(ctx, `UPDATE download_artifacts SET lease_expires_at = now() - interval '1 minute' WHERE id = $1`, row.ID); err != nil {
+		t.Fatalf("expire worker-a lease: %v", err)
+	}
+	stolen, err := repo.ClaimNext(ctx, "worker-b", time.Minute)
+	if err != nil || stolen.ID != row.ID {
+		t.Fatalf("worker-b reclaim = (%+v, %v), want the job", stolen, err)
+	}
+
+	// worker-a now sees the lease is gone and its late completion is fenced
+	// out: it must abort the encode and not flip links.
+	if ok, err := repo.Heartbeat(ctx, row.ID, "worker-a", time.Minute); err != nil || ok {
+		t.Fatalf("Heartbeat(worker-a after loss) = (%v, %v), want (false, nil)", ok, err)
+	}
+	if applied, err := repo.MarkReady(ctx, row.ID, "worker-a", "/tmp/stale.mp4", 0, "", "", "", 111, nil); err != nil || applied {
+		t.Fatalf("MarkReady(worker-a after loss) = (%v, %v), want (false, nil)", applied, err)
+	}
+	mid, err := repo.GetByID(ctx, row.ID)
+	if err != nil || mid.Status != ArtifactRunning {
+		t.Fatalf("row after fenced stale write = (%s, %v), want running owned by worker-b", mid.Status, err)
+	}
+
+	// Completion wins: the current owner commits and its result stands.
+	if applied, err := repo.MarkReady(ctx, row.ID, "worker-b", "/tmp/winner.mp4", 0, "", "", "", 222, nil); err != nil || !applied {
+		t.Fatalf("MarkReady(worker-b) = (%v, %v), want (true, nil)", applied, err)
+	}
+	done, err := repo.GetByID(ctx, row.ID)
+	if err != nil || done.Status != ArtifactReady || done.FileSize != 222 || done.OutputPath != "/tmp/winner.mp4" {
+		t.Fatalf("committed row = (%+v, %v), want ready winner.mp4 size=222", done, err)
+	}
+	// A stale duplicate of the committed result cannot replace it.
+	if applied, err := repo.MarkReady(ctx, row.ID, "worker-a", "/tmp/stale.mp4", 0, "", "", "", 111, nil); err != nil || applied {
+		t.Fatalf("MarkReady(stale duplicate after commit) = (%v, %v), want (false, nil)", applied, err)
+	}
+	final, err := repo.GetByID(ctx, row.ID)
+	if err != nil || final.FileSize != 222 || final.OutputPath != "/tmp/winner.mp4" {
+		t.Fatalf("row after stale duplicate = (%+v, %v), want the committed winner", final, err)
+	}
+}
+
 func TestArtifactRemoteLocatorRoundTripsAndRequeueClearsIt(t *testing.T) {
 	repo, pool, fileID := newArtifactTestRepo(t)
 	ctx := context.Background()

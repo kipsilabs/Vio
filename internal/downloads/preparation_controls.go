@@ -131,23 +131,50 @@ func (r *ArtifactRepository) ResumePreparations(ctx context.Context, ids []strin
 // preparing and fails the downloads still waiting on them with errMsg, in one
 // transaction. It returns the deleted jobs and the downloads it failed.
 func (r *ArtifactRepository) CancelPreparations(ctx context.Context, ids []string, errMsg string) ([]stoppedArtifact, []*Download, error) {
-	return r.cancelPreparations(ctx, ids, errMsg, "")
+	return r.cancelPreparations(ctx, ids, errMsg, false, "")
 }
 
 // CancelAbandonedPreparations is CancelPreparations for jobs no live download
-// refers to any more. The check runs in the statement that deletes the job,
-// so a download that linked the job since the caller looked keeps it.
+// refers to any more. The link check runs in the statement that deletes the
+// job, and the candidate rows are locked in the statement before it, so a
+// download that linked the job while the cancel waited for those locks keeps
+// it: the check-and-delete re-reads the links under a snapshot no older than
+// the lock acquisition, not the one the caller started with.
 func (r *ArtifactRepository) CancelAbandonedPreparations(ctx context.Context, ids []string, errMsg string) ([]stoppedArtifact, []*Download, error) {
-	return r.cancelPreparations(ctx, ids, errMsg,
+	return r.cancelPreparations(ctx, ids, errMsg, true,
 		` AND NOT EXISTS (SELECT 1 FROM downloads d WHERE d.artifact_id = download_artifacts.id AND `+liveLinkPredicate+`)`)
 }
 
-func (r *ArtifactRepository) cancelPreparations(ctx context.Context, ids []string, errMsg, filter string) ([]stoppedArtifact, []*Download, error) {
+func (r *ArtifactRepository) cancelPreparations(ctx context.Context, ids []string, errMsg string, lockBeforeLinkCheck bool, filter string) ([]stoppedArtifact, []*Download, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return nil, nil, fmt.Errorf("beginning preparation cancel: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	// Lock the candidate jobs first when the delete re-checks the live links.
+	// The re-check runs in its own statement, so it takes a READ COMMITTED
+	// snapshot after this lock wait: a download that committed a link while we
+	// waited is seen, and a job a request has just claimed is not aborted. A
+	// single statement would decide from the snapshot taken before the wait.
+	if lockBeforeLinkCheck {
+		locked, err := tx.Query(ctx,
+			`SELECT id FROM download_artifacts WHERE id = ANY($1) AND `+preparingArtifactPredicate+` FOR UPDATE`, ids)
+		if err != nil {
+			return nil, nil, fmt.Errorf("locking preparations for abandonment check: %w", err)
+		}
+		for locked.Next() {
+			var id string
+			if err := locked.Scan(&id); err != nil {
+				locked.Close()
+				return nil, nil, fmt.Errorf("locking preparations for abandonment check: %w", err)
+			}
+		}
+		scanErr := locked.Err()
+		locked.Close()
+		if scanErr != nil {
+			return nil, nil, fmt.Errorf("locking preparations for abandonment check: %w", scanErr)
+		}
+	}
 	rows, err := tx.Query(ctx,
 		`WITH target AS (
 		     SELECT id, status IN `+runningArtifactStatuses+` AS running

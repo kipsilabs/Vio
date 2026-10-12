@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
 	"slices"
 	"strings"
 	"sync"
@@ -146,8 +148,52 @@ func (p *NodeAwarePreparer) prepareLocally(ctx context.Context, artifactID strin
 	return p.local.PrepareFile(ctx, artifactID, opts, outputPath)
 }
 
+// isLoopbackPrepareInput reports whether a prepare input is a URL that only
+// this host can open. It matches the playback relay's concrete address shape:
+// an http(s) URL whose host is localhost or a loopback IP (the relay binds
+// 127.0.0.1). A blank input, an ordinary filesystem path (which a node
+// resolves through the media mount it shares), and a routable host — including
+// a private-network API address a node can reach — are all node-reachable and
+// return false.
+func isLoopbackPrepareInput(inputPath string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(inputPath))
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+		return false
+	}
+	host := parsed.Hostname()
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
 // PrepareFile routes an artifact job to a compatible node or allowed local fallback.
 func (p *NodeAwarePreparer) PrepareFile(ctx context.Context, artifactID string, opts playback.TranscodeOpts, outputPath string) (PreparedArtifact, error) {
+	// A provider-backed (virtual) download resolves its input through
+	// ResolveVirtualDownloadInput, which returns the playback relay
+	// registration: an in-process listener bound to 127.0.0.1:0 on this host.
+	// That concrete address is node-unreachable — a node handed it would open
+	// its own loopback interface and fetch nothing — so such a job is confined
+	// to API-host execution here, at the one place a node URL is ever built.
+	//
+	// This is a property of the loopback registration, not a blanket ban on
+	// remote relay preparation. The fork already dispatches node-reachable relay
+	// URLs (the `/source/<token>/...` shape transcodenode's path authorizer
+	// approves) to pooled worker nodes; a prepare input with that reachable
+	// shape is not loopback and falls through to the dispatch path below
+	// unchanged. Should the download path ever hand us a node-reachable relay
+	// URL, the ordinary route below already carries it, so no separate
+	// transport is required for remote preparation.
+	if isLoopbackPrepareInput(opts.InputPath) {
+		if !p.LocalFallbackAllowed(ctx) {
+			return PreparedArtifact{}, errors.New("a provider-backed download can only be prepared on the API host, where local download transcoding is disabled")
+		}
+		slog.InfoContext(ctx, "download prepare input is only reachable from this host; preparing locally", "component", "downloads", "artifact_id", artifactID)
+		return p.prepareLocally(ctx, artifactID, opts, outputPath)
+	}
 	cfg := p.config()
 	jwtSecret := ""
 	if cfg != nil {

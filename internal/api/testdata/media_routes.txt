@@ -549,6 +549,7 @@ DELETE /api/v2/downloads/subscriptions/{id}	non-media
 GET /api/v2/downloads/subscriptions/{id}	non-media
 PATCH /api/v2/downloads/subscriptions/{id}	non-media
 DELETE /api/v2/downloads/{id}	non-media
+GET /api/v2/downloads/{id}	non-media
 PATCH /api/v2/downloads/{id}	non-media
 GET /api/v2/downloads/{id}/artwork/{kind}	non-media
 GET /api/v2/downloads/{id}/file	non-media
@@ -1823,6 +1824,7 @@ DELETE /api/v2/downloads/subscriptions/{id}	non-media
 GET /api/v2/downloads/subscriptions/{id}	non-media
 PATCH /api/v2/downloads/subscriptions/{id}	non-media
 DELETE /api/v2/downloads/{id}	non-media
+GET /api/v2/downloads/{id}	non-media
 PATCH /api/v2/downloads/{id}	non-media
 GET /api/v2/downloads/{id}/artwork/{kind}	non-media
 GET /api/v2/downloads/{id}/file	non-media
