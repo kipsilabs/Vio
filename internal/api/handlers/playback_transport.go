@@ -3,16 +3,19 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"reflect"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	chimw "github.com/go-chi/chi/v5/middleware"
@@ -1091,6 +1094,11 @@ func (h *PlaybackHandler) startRemotePlaybackTransport(ctx context.Context, node
 	if err != nil {
 		return transcodenode.TranscodeStartResponse{}, 0, err
 	}
+	// Capture the pool's recovery epoch at admission: if this start later
+	// fails, SuppressNode refuses completions admitted before a healthy
+	// recovery in between, so a stale in-flight failure cannot re-suppress
+	// a node the sweep just cleared.
+	admittedEpoch := h.transcodeRecoveryEpoch(nodeURL)
 	requestCtx, cancel := context.WithTimeout(ctx, h.remotePlaybackTransportTimeout(nodeURL, request))
 	defer cancel()
 	httpRequest, err := http.NewRequestWithContext(requestCtx, http.MethodPost, nodepool.NodeEndpoint(nodeURL, "/transcode/start"), bytes.NewReader(body))
@@ -1101,6 +1109,7 @@ func (h *PlaybackHandler) startRemotePlaybackTransport(ctx context.Context, node
 	httpRequest.Header.Set("Authorization", "Bearer "+h.JWTSecret)
 	response, err := telemetry.DoTrustedNode(http.DefaultClient, httpRequest, "transcode_start")
 	if err != nil {
+		h.suppressUnhealthyTranscodeNode(nodeURL, admittedEpoch, ctx, err)
 		return transcodenode.TranscodeStartResponse{}, 0, logredact.SanitizeURLError(err)
 	}
 	defer func() { _ = response.Body.Close() }()
@@ -1108,13 +1117,19 @@ func (h *PlaybackHandler) startRemotePlaybackTransport(ctx context.Context, node
 		// Drain the (small) error body so the transport can reuse the
 		// connection instead of tearing it down on every failed start.
 		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
-		if request.ToneMapMode != "" {
-			if validationErr := transcodenode.ToneMapExecutionErrorForResponse(
-				response.StatusCode,
-				response.Header.Get(transcodenode.ToneMapExecutionErrorHeader),
-			); validationErr != nil {
-				return transcodenode.TranscodeStartResponse{}, response.StatusCode, validationErr
-			}
+		if request.ToneMapMode == "" {
+			// Typed tone-map execution rejections (source revision,
+			// validation, preflight, executor) describe the content or
+			// recipe, not the node — even when carried by a 5xx status.
+			// Only an unclassified 5xx suppresses.
+			h.suppressUnhealthyTranscodeNodeStatus(nodeURL, admittedEpoch, response.StatusCode)
+		} else if validationErr := transcodenode.ToneMapExecutionErrorForResponse(
+			response.StatusCode,
+			response.Header.Get(transcodenode.ToneMapExecutionErrorHeader),
+		); validationErr == nil {
+			h.suppressUnhealthyTranscodeNodeStatus(nodeURL, admittedEpoch, response.StatusCode)
+		} else {
+			return transcodenode.TranscodeStartResponse{}, response.StatusCode, validationErr
 		}
 		return transcodenode.TranscodeStartResponse{}, response.StatusCode, nil
 	}
@@ -1126,10 +1141,34 @@ func (h *PlaybackHandler) startRemotePlaybackTransport(ctx context.Context, node
 		if errors.Is(err, io.EOF) && request.ToneMapMode == "" {
 			return transcodenode.TranscodeStartResponse{}, response.StatusCode, nil
 		}
+		// The decode reads the network body: a deadline or connection failure
+		// after headers is a transport failure (the node never delivered a
+		// usable answer), not a local parse issue. Parent cancellation stays
+		// exempt via the ctx check inside the helper. EOF, UnexpectedEOF, and
+		// syntax errors are treated as local framing outcomes: the node
+		// delivered bytes that do not parse. This is conservative — a
+		// connection cut mid-body surfacing solely as UnexpectedEOF also goes
+		// unsuppressed — but a bare framing error never proves transport
+		// failure, and only classified timeout/connection errors suppress.
+		if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) && !isJSONSyntaxError(err) {
+			h.suppressUnhealthyTranscodeNode(nodeURL, admittedEpoch, ctx, err)
+		}
 		slog.WarnContext(ctx, "remote transcode start response decode failed", "component", "api", "node", logredact.SanitizeURL(nodeURL), "error", err)
 		return transcodenode.TranscodeStartResponse{}, response.StatusCode, fmt.Errorf("decode remote transcode start response: %w", err)
 	}
 	return result, response.StatusCode, nil
+}
+
+// isJSONSyntaxError reports whether err is a JSON framing failure rather than
+// a transport failure: the node delivered its full answer and the bytes do
+// not parse. Those never suppress.
+func isJSONSyntaxError(err error) bool {
+	var syntax *json.SyntaxError
+	if errors.As(err, &syntax) {
+		return true
+	}
+	var unmarshalType *json.UnmarshalTypeError
+	return errors.As(err, &unmarshalType)
 }
 
 func (h *PlaybackHandler) remotePlaybackTransportTimeout(nodeURL string, request transcodenode.TranscodeStartRequest) time.Duration {
@@ -1166,6 +1205,126 @@ func (h *PlaybackHandler) remotePlaybackTransportTimeout(nodeURL string, request
 func remoteAutoFallbackPossibleV3(request transcodenode.TranscodeStartRequest) bool {
 	return strings.EqualFold(strings.TrimSpace(request.HWAccel), "auto") &&
 		!strings.EqualFold(strings.TrimSpace(request.TargetCodecVideo), "copy")
+}
+
+// suppressUnhealthyTranscodeNode records a transport-level remote-start
+// failure (connection/DNS/TLS error, or the caller-side timeout firing while
+// the parent context is still live) against the node's pool, so the next
+// start skips it for a short cooldown instead of re-paying a full readiness
+// timeout. Parent cancellation or deadline is not node evidence: when ctx is
+// already done the failure tells us nothing about the node, so it is never
+// recorded. admittedEpoch is the pool recovery epoch captured when this start
+// was admitted: a stale failure from before a healthy recovery cannot
+// re-suppress. Only TranscodePool-backed planners observe suppression; stub
+// and static planners in tests are unaffected.
+func (h *PlaybackHandler) suppressUnhealthyTranscodeNode(nodeURL string, admittedEpoch uint64, ctx context.Context, err error) {
+	if err == nil || strings.TrimSpace(nodeURL) == "" {
+		return
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return
+	}
+	if isTransportTimeoutError(err) {
+		// A client-side timeout (url.Error, bare context.DeadlineExceeded,
+		// or any net.Error timeout) with a live parent means the node never
+		// answered inside the readiness budget: genuine unhealth evidence.
+		// Body reads surface bare DeadlineExceeded without a url wrapper,
+		// so the check must not require *url.Error.
+		h.suppressTranscodeNode(nodeURL, admittedEpoch)
+		return
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		var dnsErr *net.DNSError
+		if errors.As(err, &dnsErr) {
+			h.suppressTranscodeNode(nodeURL, admittedEpoch)
+			return
+		}
+		var authorityErr *tls.CertificateVerificationError
+		if errors.As(err, &authorityErr) {
+			h.suppressTranscodeNode(nodeURL, admittedEpoch)
+			return
+		}
+		var opErr *net.OpError
+		if errors.As(err, &opErr) {
+			h.suppressTranscodeNode(nodeURL, admittedEpoch)
+			return
+		}
+		return
+	}
+	var sysErr syscall.Errno
+	if errors.As(err, &sysErr) {
+		h.suppressTranscodeNode(nodeURL, admittedEpoch)
+	}
+}
+
+// isTransportTimeoutError reports whether err is a client-side timeout as
+// opposed to parent cancellation (checked separately by the caller). It
+// unwraps three shapes: *url.Error with Timeout(), a bare
+// context.DeadlineExceeded from a body read after headers, and any net.Error
+// with Timeout() true. Body reads do not wrap in url.Error, so requiring
+// the wrapper would miss stalled-body timeouts.
+func isTransportTimeoutError(err error) bool {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) && urlErr.Timeout() {
+		return true
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+// suppressUnhealthyTranscodeNodeStatus records an HTTP 5xx from a remote
+// start. 4xx is configuration/authentication the node will keep refusing;
+// source-validation, recipe, and attestation rejections (even when carried
+// by a 5xx status) describe the content or recipe, not the node. Callers
+// classify before invoking: this helper only gates on the 5xx class.
+// admittedEpoch is the recovery epoch at admission (see above).
+func (h *PlaybackHandler) suppressUnhealthyTranscodeNodeStatus(nodeURL string, admittedEpoch uint64, status int) {
+	if status < 500 || status > 599 || strings.TrimSpace(nodeURL) == "" {
+		return
+	}
+	h.suppressTranscodeNode(nodeURL, admittedEpoch)
+}
+
+// suppressTranscodeNode fans the suppression out to the TranscodePool behind
+// the planner when one is reachable. The planner seam (SessionPlanner) does
+// not expose the pool, so this resolves the *nodepool.Planner behind the
+// interface when present and no-ops otherwise (stub/static test planners,
+// nil planner). Local execution never consults the pool, so it is unaffected.
+func (h *PlaybackHandler) suppressTranscodeNode(nodeURL string, admittedEpoch uint64) {
+	if h == nil || h.NodePlanner == nil {
+		return
+	}
+	planner, ok := h.NodePlanner.(*nodepool.Planner)
+	if !ok || planner == nil {
+		return
+	}
+	pool := planner.TranscodePoolForSuppression()
+	if pool == nil {
+		return
+	}
+	pool.SuppressNode(nodeURL, admittedEpoch, 0)
+}
+
+// transcodeRecoveryEpoch captures the pool's recovery epoch for nodeURL at
+// dispatch time. Pass it through the failure classifiers so a healthy sweep
+// that lands mid-start rejects the stale failure.
+func (h *PlaybackHandler) transcodeRecoveryEpoch(nodeURL string) uint64 {
+	if h == nil || h.NodePlanner == nil {
+		return 0
+	}
+	planner, ok := h.NodePlanner.(*nodepool.Planner)
+	if !ok || planner == nil {
+		return 0
+	}
+	pool := planner.TranscodePoolForSuppression()
+	if pool == nil {
+		return 0
+	}
+	return pool.RecoveryEpoch(nodeURL)
 }
 
 func fetchRemoteTranscodeCapabilities(ctx context.Context, nodeURL, jwtSecret string) (playback.HWAccelInfo, error) {

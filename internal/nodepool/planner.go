@@ -143,6 +143,17 @@ func (p *Planner) PlanSession(sessionID, currentTranscodeURL string, needsTransc
 	return p.PlanSessionWith(sessionID, currentTranscodeURL, needsTranscode, estBitrateKbps, nil)
 }
 
+// TranscodePoolForSuppression exposes the transcode pool for failure
+// suppression reporting. Handlers resolve the concrete *Planner behind the
+// SessionPlanner seam to report failed remote starts; the pool itself owns
+// the cooldown state. Nil-safe: a nil planner or nil pool reports nil.
+func (p *Planner) TranscodePoolForSuppression() *TranscodePool {
+	if p == nil {
+		return nil
+	}
+	return p.transcodes
+}
+
 // TranscodeNode returns the current pool record for a persistent node id. It
 // lets durable artifact locators follow an administrator-edited node URL/group.
 func (p *Planner) TranscodeNode(nodeID int) (*Node, bool) {
@@ -486,6 +497,9 @@ func (p *Planner) ReserveTranscodeWorkWith(workID string, eligible func(*Node) b
 		if node == nil || !node.Enabled || !node.Healthy || !p.underCap(node, now) {
 			continue
 		}
+		if p.transcodes.suppressedAt(node.URL, now) {
+			continue
+		}
 		if eligible != nil && !eligible(node) {
 			continue
 		}
@@ -509,6 +523,7 @@ func (p *Planner) ReserveTranscodeWorkWith(workID string, eligible func(*Node) b
 
 // TranscodeWorkAvailableWith reports whether a healthy, under-cap transcode
 // node satisfies eligible without creating a provisional reservation.
+// Suppressed nodes (recent failed remote start, cooldown live) do not count.
 func (p *Planner) TranscodeWorkAvailableWith(eligible func(*Node) bool) bool {
 	if p == nil || p.transcodes == nil {
 		return false
@@ -518,6 +533,9 @@ func (p *Planner) TranscodeWorkAvailableWith(eligible func(*Node) bool) bool {
 	now := p.now()
 	for _, node := range p.transcodes.Nodes() {
 		if node == nil || !node.Enabled || !node.Healthy || !p.underCap(node, now) {
+			continue
+		}
+		if p.transcodes.suppressedAt(node.URL, now) {
 			continue
 		}
 		if eligible == nil || eligible(node) {
@@ -807,6 +825,9 @@ func (p *Planner) pickLocalEgressTranscode(transcodes, pool []*Node, groupHealth
 // keep the historical behavior.
 func (p *Planner) transcodeEligible(n *Node, proxies []*Node, groupHealthy map[string]bool, estKbps int, now time.Time) bool {
 	if !n.Healthy || !n.Enabled || !p.underCap(n, now) {
+		return false
+	}
+	if p.transcodes != nil && p.transcodes.suppressedAt(n.URL, now) {
 		return false
 	}
 	if n.Group == nil {

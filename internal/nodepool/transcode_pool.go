@@ -2,8 +2,10 @@ package nodepool
 
 import (
 	"encoding/json"
+	"math/rand/v2"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/netaccess"
@@ -14,6 +16,54 @@ import (
 type TranscodePool struct {
 	nodes []*Node
 	mu    sync.RWMutex
+	// suppressed marks nodes that recently failed a remote start, keyed by
+	// normalized URL. A suppressed node is skipped by Acquire until its
+	// cooldown lapses or a healthy sweep clears it. It never flips
+	// Node.Healthy: the health sweep stays the authority on node health,
+	// and suppression is purely a latency mitigation so the next start does
+	// not re-pay a full readiness timeout against a node that just 500'd.
+	// Process-local by construction: each API replica suppresses from its
+	// own observed failures. Entries are bounded (one per node URL) and
+	// pruned on SetNodes and on SuppressNode writes.
+	suppressed map[string]suppressedNode
+	// recovered tracks the per-URL recovery epoch independently of the
+	// suppression entry: ApplyHealth bumps it on every healthy result, and
+	// SuppressNode refuses completions admitted before the latest recovery.
+	// Without this, deleting the suppression entry on recovery would leave
+	// no record that a recovery happened, and a stale in-flight failure
+	// could re-suppress the just-recovered node. Bounded like suppressed
+	// (one entry per URL) and pruned together with it.
+	recovered map[string]uint64
+	now       func() time.Time
+}
+
+// suppressedNode is one cooldown entry: the recovery epoch observed when it
+// tripped, and its expiry.
+type suppressedNode struct {
+	epoch     uint64
+	expiresAt time.Time
+}
+
+// transcodeSuppressCooldown bounds how long one failed remote start keeps a
+// node out of selection. One failure already cost the full readiness timeout
+// (~35s, or ~8s observed on fast 500s); the next start must not re-pay it.
+// The sweep (30s) clears suppression early on a healthy result, so the
+// cooldown only binds a node the sweep has not yet re-validated. Jitter is
+// applied per trip at the call site so replicas do not reopen in lockstep.
+const transcodeSuppressCooldown = 15 * time.Second
+
+// transcodeSuppressEpoch is the process-wide monotonic recovery epoch for
+// suppression entries. ApplyHealth bumps it on every healthy result and
+// records it per URL; SuppressNode refuses completions admitted before the
+// latest recovery for that URL, so a stale in-flight failure cannot
+// re-suppress a node the sweep just cleared.
+var transcodeSuppressEpoch atomic.Uint64
+
+func (p *TranscodePool) poolClock() time.Time {
+	if p != nil && p.now != nil {
+		return p.now()
+	}
+	return time.Now()
 }
 
 // NewTranscodePool creates an empty transcode pool.
@@ -37,17 +87,28 @@ func (p *TranscodePool) SetNodes(nodes []*Node) {
 		}
 	}
 	p.nodes = nodes
+	p.pruneSuppressedLocked(p.poolClock())
 }
 
 // Acquire returns the healthy node with the fewest active jobs.
-// Returns nil if no healthy nodes are available.
+// Returns nil if no healthy nodes are available. Nodes inside a suppression
+// cooldown (a recent failed remote start this process observed) are skipped
+// so the next start does not re-pay a full readiness timeout; the cooldown
+// lapses on its own and a healthy sweep clears it early.
 func (p *TranscodePool) Acquire() *Node {
+	if p == nil {
+		return nil
+	}
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
+	now := p.poolClock()
 	var best *Node
 	for _, n := range p.nodes {
 		if !n.Healthy || !n.Enabled {
+			continue
+		}
+		if p.suppressedLocked(n.URL, now) {
 			continue
 		}
 		if best == nil || n.ActiveJobs < best.ActiveJobs {
@@ -55,6 +116,126 @@ func (p *TranscodePool) Acquire() *Node {
 		}
 	}
 	return best
+}
+
+// suppressedLocked reports whether url is inside a live suppression window.
+// Caller holds at least p.mu.RLock. Expired entries stay in the map until the
+// next write-side prune: Acquire is a hot read path shared with capacity
+// routing, and deleting under RLock would force a full write lock per start.
+// The map holds at most one entry per node URL, so the garbage is bounded;
+// SetNodes, SuppressNode, and ApplyHealth all prune on write.
+func (p *TranscodePool) suppressedLocked(url string, now time.Time) bool {
+	if p == nil || len(p.suppressed) == 0 {
+		return false
+	}
+	entry, ok := p.suppressed[normalizeNodeURL(url)]
+	if !ok {
+		return false
+	}
+	if !now.Before(entry.expiresAt) {
+		return false
+	}
+	return true
+}
+
+// pruneSuppressedLocked drops lapsed windows and entries for nodes no longer
+// in the pool, plus recovery epochs for removed nodes. Caller holds p.mu
+// (write). Only write paths prune: read paths (Acquire, suppressedAt) never
+// mutate, so -race stays clean on the hot path and both maps stay bounded at
+// one entry per node URL regardless.
+func (p *TranscodePool) pruneSuppressedLocked(now time.Time) {
+	live := make(map[string]struct{}, len(p.nodes))
+	for _, n := range p.nodes {
+		if n != nil {
+			live[normalizeNodeURL(n.URL)] = struct{}{}
+		}
+	}
+	for url, entry := range p.suppressed {
+		if _, ok := live[url]; !ok || !now.Before(entry.expiresAt) {
+			delete(p.suppressed, url)
+		}
+	}
+	for url := range p.recovered {
+		if _, ok := live[url]; !ok {
+			delete(p.recovered, url)
+		}
+	}
+}
+
+// SuppressNode records a failed remote start against nodeURL, keeping it out
+// of Acquire for a short jittered cooldown. Only genuine transport failures
+// qualify: HTTP 5xx, connection/DNS/TLS errors, or the caller-side transport
+// timeout firing while its parent context is still live. Parent cancellation,
+// 4xx, virtual-input resolution, recipe/attestation, and typed source
+// validation failures must never call this — they are not evidence the node
+// is sick. A stale completion (admitted before the latest healthy recovery
+// for this URL) cannot re-arm: pass the recovery epoch observed when the
+// start was admitted via RecoveryEpoch, or admit with the current epoch for
+// an unconditional trip.
+func (p *TranscodePool) SuppressNode(nodeURL string, admittedEpoch uint64, cooldown time.Duration) {
+	if p == nil || strings.TrimSpace(nodeURL) == "" {
+		return
+	}
+	if cooldown <= 0 {
+		cooldown = transcodeSuppressCooldown
+	}
+	// Independent jitter per trip so replicas that failed together do not
+	// reopen in lockstep and thunder the recovering node.
+	jitter := time.Duration(rand.Int64N(int64(5 * time.Second)))
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	key := normalizeNodeURL(nodeURL)
+	if p.suppressed == nil {
+		p.suppressed = make(map[string]suppressedNode)
+	}
+	now := p.poolClock()
+	if epoch, ok := p.recovered[key]; ok && epoch > admittedEpoch {
+		return
+	}
+	p.pruneSuppressedLocked(now)
+	p.suppressed[key] = suppressedNode{
+		epoch:     admittedEpoch,
+		expiresAt: now.Add(cooldown + jitter),
+	}
+}
+
+// RecoveryEpoch captures the current recovery epoch for nodeURL. Call it when
+// a remote start is admitted; pass the value to SuppressNode if that start
+// later fails, so a healthy recovery in between rejects the stale failure.
+func (p *TranscodePool) RecoveryEpoch(nodeURL string) uint64 {
+	if p == nil {
+		return 0
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.recovered[normalizeNodeURL(nodeURL)]
+}
+
+// suppressedAt reports whether url is inside a live suppression window at
+// now. The planner calls it with its own clock so fake-clock tests control
+// both sides. SuppressedForTest (wall clock) remains the tests-only helper.
+func (p *TranscodePool) suppressedAt(url string, now time.Time) bool {
+	if p == nil {
+		return false
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.suppressedLocked(url, now)
+}
+
+// SuppressedForTest reports whether url is currently suppressed. Tests only.
+func (p *TranscodePool) SuppressedForTest(url string) bool {
+	return p.suppressedAt(url, p.poolClock())
+}
+
+// ClearSuppressionForTest drops one suppression entry. Tests only.
+func (p *TranscodePool) ClearSuppressionForTest(url string) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.suppressed, normalizeNodeURL(url))
 }
 
 // FindByURL returns the node with the given URL, or nil if not found.
@@ -87,11 +268,27 @@ func (p *TranscodePool) Nodes() []*Node {
 }
 
 // ApplyHealth records a health check result by swapping the node for an
-// updated copy, keeping published *Node values immutable.
+// updated copy, keeping published *Node values immutable. A healthy result
+// clears any suppression the pool holds for the node: the sweep is the
+// authority on node health, and a node it just validated must serve
+// immediately rather than wait out a cooldown. The per-URL recovery epoch
+// bumps so a stale in-flight failure (admitted before this recovery)
+// cannot re-arm it via SuppressNode. An unhealthy result keeps ordinary
+// health exclusion; suppression entries are left alone because Acquire
+// already skips unhealthy nodes.
 func (p *TranscodePool) ApplyHealth(id int, checkedURL string, healthy bool, activeJobs, egressKbps int, advertisedHash string, lastStats []byte, networkAccess netaccess.NodeNetworkAccess, checkedAt time.Time) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	applyNodeHealth(p.nodes, id, checkedURL, healthy, activeJobs, egressKbps, advertisedHash, lastStats, networkAccess, checkedAt)
+	if healthy {
+		key := normalizeNodeURL(checkedURL)
+		delete(p.suppressed, key)
+		if p.recovered == nil {
+			p.recovered = make(map[string]uint64)
+		}
+		p.recovered[key] = transcodeSuppressEpoch.Add(1)
+		p.pruneSuppressedLocked(p.poolClock())
+	}
 }
 
 // ApplyCapabilities records a freshly fetched capability report by swapping the
