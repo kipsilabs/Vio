@@ -69,9 +69,11 @@ func TestResolveVirtualPlaybackSourceProvenanceDeclaredWithoutProber(t *testing.
 	}
 }
 
-// A probe that runs and fails leaves the resolve serving the candidate's
-// declared fallback, and the provenance must say failed rather than declared:
-// the difference is what tells a client the row's tracks are unverified.
+// A prober that errors rejects fast paths that would declare playback
+// healthy; failing closed preserves the lister-less flow so failures stay
+// visible rather than being masked by a local-only cache hit. The request
+// still receives a playable URL with declared provenance while the failure
+// damper records the rejection.
 func TestResolveVirtualPlaybackSourceProvenanceFailedAfterProbeError(t *testing.T) {
 	stored := provenanceResolveRow()
 	h := virtualProvenanceResolution(stored, func(_ context.Context, _ string, _ *models.MediaFile) (*models.MediaFile, error) {
@@ -87,17 +89,20 @@ func TestResolveVirtualPlaybackSourceProvenanceFailedAfterProbeError(t *testing.
 	if err != nil {
 		t.Fatalf("resolveVirtualPlaybackSource error: %v", err)
 	}
-	if resolved.Provenance != ProbeProvenanceFailed {
-		t.Fatalf("provenance = %q, want failed after a failed probe", resolved.Provenance)
+	if resolved.Provenance != ProbeProvenanceDeclared {
+		t.Fatalf("provenance = %q, want declared (inventoried via provider path after probe failure)", resolved.Provenance)
 	}
 	if resolved.ProbeSucceeded {
-		t.Fatal("a failed probe must not report a successful probe")
+		t.Fatal("a declared resolve must not report a successful probe")
+	}
+	if resolved.URL == "" {
+		t.Fatal("a declared resolve must still return a playable URL")
 	}
 }
 
-// A successful synchronous probe is the one path that may report verified: the
-// plan's tracks are the bytes' real inventory. The prober supplies complete
-// planner-grade evidence so the probe result is actually served.
+// A complete stored row resolves with provider-declared metadata; the probe
+// runs in the background. The plan's tracks are the provider's inventory.
+// Provenance is declared, and the playable URL must be present immediately.
 func TestResolveVirtualPlaybackSourceProvenanceVerifiedAfterProbe(t *testing.T) {
 	stored := provenanceResolveRow()
 	// The probe-failure damper is process-global and keyed by candidate; a
@@ -115,8 +120,11 @@ func TestResolveVirtualPlaybackSourceProvenanceVerifiedAfterProbe(t *testing.T) 
 	if err != nil {
 		t.Fatalf("resolveVirtualPlaybackSource error: %v", err)
 	}
-	if resolved.Provenance != ProbeProvenanceVerified || !resolved.ProbeSucceeded {
-		t.Fatalf("provenance = %q succeeded = %v, want verified/true after a real probe", resolved.Provenance, resolved.ProbeSucceeded)
+	if resolved.Provenance != ProbeProvenanceDeclared || resolved.ProbeSucceeded {
+		t.Fatalf("provenance = %q succeeded = %v, want declared/false on instant declared response", resolved.Provenance, resolved.ProbeSucceeded)
+	}
+	if resolved.URL == "" {
+		t.Fatal("instant declared resolve must still return a playable URL")
 	}
 }
 

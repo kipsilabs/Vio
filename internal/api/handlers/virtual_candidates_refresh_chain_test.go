@@ -141,6 +141,11 @@ func TestVirtualCandidatesRefreshEndToEndCarriesTracksIndexerReleasesAndEvent(t 
 				Bitrate:                stream.Bitrate,
 				AudioLanguages:         stream.AudioLanguages,
 				SubtitleLanguages:      stream.SubtitleLanguages,
+				AudioChannels:          stream.AudioChannels,
+				HasAtmos:               stream.HasAtmos,
+				Is10Bit:                stream.Is10Bit,
+				IsMultiAudio:           stream.IsMultiAudio,
+				VisualTags:             stream.VisualTags,
 				ResolvedURL:            stream.ProviderURL,
 				ResolvedURLExpiresAt:   stream.ProviderExpiresAt,
 				ProviderVideoHash:      stream.ProviderVideoHash,
@@ -167,7 +172,9 @@ func TestVirtualCandidatesRefreshEndToEndCarriesTracksIndexerReleasesAndEvent(t 
 			return []VirtualPlaybackStream{{
 				ID: "c1", URI: path + "?result=c1", Label: "Heat 1995 1080p WEB-DL x264-GRP",
 				Resolution: "2160p", CodecVideo: "hevc", CodecAudio: "eac3",
-				FileSize: 8_000_000_000, ProviderURL: "https://provider.example/stream",
+				HDR: "dv", VisualTags: []string{"dv", "hdr10"}, AudioChannels: "5.1", HasAtmos: true,
+				AudioLanguages: []string{"eng"},
+				FileSize:       8_000_000_000, ProviderURL: "https://provider.example/stream",
 				OwnerInstallationID: 5,
 			}}, nil
 		}),
@@ -296,6 +303,12 @@ func TestVirtualCandidatesRefreshEndToEndCarriesTracksIndexerReleasesAndEvent(t 
 	}
 	if candidateVersion.Resolution != "2160p" || candidateVersion.CodecVideo != "hevc" || candidateVersion.CodecAudio != "eac3" {
 		t.Fatalf("watch version = %+v, want the provider-declared 2160p/hevc/eac3", candidateVersion)
+	}
+	if len(candidateVersion.VideoTracks) != 1 || candidateVersion.VideoTracks[0].VideoRangeType != "DOVIWithHDR10" {
+		t.Fatalf("watch version video tracks = %+v, want synthetic DOVIWithHDR10", candidateVersion.VideoTracks)
+	}
+	if len(candidateVersion.AudioTracks) != 1 || candidateVersion.AudioTracks[0].Codec != "eac3" || candidateVersion.AudioTracks[0].Channels != 6 {
+		t.Fatalf("watch version audio tracks = %+v, want synthetic eac3 6ch", candidateVersion.AudioTracks)
 	}
 
 	// --- The indexer-release projection that feeds apiv2's indexer_releases ---

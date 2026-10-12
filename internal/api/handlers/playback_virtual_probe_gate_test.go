@@ -158,6 +158,60 @@ func TestResolveProbesUnprobedVirtualRowDespiteCandidateDeclarations(t *testing.
 	}
 }
 
+// A stored-URL row with empty video metadata must not defer its probe past
+// the transport commit: the deferred probe would never run because the
+// planner terminals source_metadata_incomplete first (the bench Citizen
+// Vigilante shape: ~50ms failure, no probe). The guard falls through to the
+// bounded synchronous cache-first probe below, so the row is filled in
+// before the planner sees it. Damper admission is preserved.
+func TestResolveVirtualDeferralGuardProbesUnplannableMergedMetadata(t *testing.T) {
+	uri := "virtual://movie/tt-defer-guard?result=cand-1"
+	stored := &models.MediaFile{
+		ID:                         400,
+		ContentID:                  "movie-1",
+		FilePath:                   uri,
+		Container:                  "virtual",
+		ProbeUpdatedAt:             nil,
+		VirtualOwnerInstallationID: 5,
+	}
+	// The candidate declares a container but no codecs or resolution: the
+	// merged transient cannot support a validated route.
+	lister := VirtualPlaybackStreamListerFunc(func(_ context.Context, _ string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
+		return []VirtualPlaybackStream{{
+			ID: "cand-guard", URI: uri, Container: "mkv",
+		}}, nil
+	})
+	probeCalls := 0
+	h := virtualProbeGateCandidateHandler(stored, lister,
+		func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
+			probeCalls++
+			f.VideoTracks = []models.VideoTrack{{Codec: "h264", Width: 1920, Height: 1080, FrameRate: "24", BitDepth: 8, Bitrate: 10_000}}
+			f.AudioTracks = []models.AudioTrack{{Codec: "aac", Channels: 2, Language: "eng"}}
+			f.CodecVideo, f.CodecAudio, f.Resolution, f.Container = "h264", "aac", "1080p", "mkv"
+			f.Bitrate = 10_000
+			return f, nil
+		}, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil)
+	file := *stored
+	resolved, err := h.resolveVirtualPlaybackSource(req, &file, "profile-1", true, nil, "", "", 0, false)
+	if err != nil {
+		t.Fatalf("resolveVirtualPlaybackSource error: %v", err)
+	}
+	// The guard routes to the synchronous probe: verified provenance with the
+	// probe's real inventory, not a pending deferred plan that the planner
+	// would terminal before the probe runs.
+	if resolved.Provenance != ProbeProvenanceVerified || !resolved.ProbeSucceeded {
+		t.Fatalf("provenance=%q succeeded=%v, want verified/true after the guard's sync probe", resolved.Provenance, resolved.ProbeSucceeded)
+	}
+	if probeCalls != 1 {
+		t.Fatalf("prober called %d times, want exactly 1 synchronous probe", probeCalls)
+	}
+	if resolved.File == nil || len(resolved.File.VideoTracks) == 0 || resolved.File.VideoTracks[0].Codec != "h264" {
+		t.Fatalf("resolved video tracks = %#v, want probed h264 inventory", resolved.File)
+	}
+}
+
 // A row that already carries a probe stamp and complete evidence keeps the fast
 // skipProbe path: no provider round-trip and no re-probe on every play.
 func TestResolveSkipsProbeForAlreadyProbedVirtualRow(t *testing.T) {
@@ -264,9 +318,14 @@ func TestVirtualFileMetadataUpdatePersistsProbeStamp(t *testing.T) {
 }
 
 // A resolution-less stored row whose lister returns a resolution-less
-// candidate must still synthesize the 1080p
-// baseline through the candidate-merge gate: the immediate plan keeps the
-// synthesized tracks and defers the real probe to the background.
+// candidate probes synchronously to fill the row before the planner sees
+// it. The deferral guard routes this shape to the sync probe: without any
+// resolution the merged metadata cannot support a validated route, and
+// deferring would terminal source_metadata_incomplete before the
+// post-commit probe runs (the bench Citizen Vigilante shape). The probe's
+// verified inventory lands on the served file; the fixture probe returns
+// 1080p so the served resolution matches the probed bytes, not an assumed
+// baseline.
 func TestResolveResolutionlessMergesIntoBaseline(t *testing.T) {
 	uri := "virtual://movie/tt-merge-baseline?result=cand-1"
 	stored := &models.MediaFile{
@@ -283,11 +342,11 @@ func TestResolveResolutionlessMergesIntoBaseline(t *testing.T) {
 		}}, nil
 	})
 	probeStarted := make(chan struct{})
+	_ = probeStarted
 	var probeCalls int32
 	h := virtualProbeGateCandidateHandler(stored, lister,
 		func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
 			atomic.AddInt32(&probeCalls, 1)
-			close(probeStarted)
 			<-time.After(50 * time.Millisecond)
 			f.VideoTracks = []models.VideoTrack{{Codec: "h264", Width: 1920, Height: 1080, FrameRate: "24"}}
 			f.AudioTracks = []models.AudioTrack{{Codec: "aac", Channels: 2, Language: "eng"}}
@@ -301,8 +360,11 @@ func TestResolveResolutionlessMergesIntoBaseline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveVirtualPlaybackSource error: %v", err)
 	}
-	if resolved.Provenance != ProbeProvenancePending {
-		t.Fatalf("provenance=%q, want pending deferred probe", resolved.Provenance)
+	// The deferral guard routes resolution-less merges to the synchronous
+	// probe: verified provenance with the probe's real inventory on the
+	// response, not a pending deferred plan the planner would terminal.
+	if resolved.Provenance != ProbeProvenanceVerified || !resolved.ProbeSucceeded {
+		t.Fatalf("provenance=%q succeeded=%v, want verified/true after the guard's sync probe", resolved.Provenance, resolved.ProbeSucceeded)
 	}
 	if resolved.File == nil || resolved.File.Resolution != "1080p" {
 		t.Fatalf("resolution=%v, want 1080p baseline", resolved.File)
@@ -313,13 +375,8 @@ func TestResolveResolutionlessMergesIntoBaseline(t *testing.T) {
 		t.Fatalf("baseline must carry complete evidence: %#v", resolved.File)
 	}
 
-	select {
-	case <-probeStarted:
-	case <-time.After(2 * time.Second):
-		t.Fatal("real probe was not launched in the background")
-	}
 	if probeCalls := atomic.LoadInt32(&probeCalls); probeCalls != 1 {
-		t.Fatalf("prober called %d times, want 1 background probe", probeCalls)
+		t.Fatalf("prober called %d times, want 1 synchronous probe", probeCalls)
 	}
 }
 
@@ -563,18 +620,29 @@ func TestResolveVirtualProbeFailureDamperSkipsRepeatProbe(t *testing.T) {
 		}, nil)
 
 	for call := 0; call < 2; call++ {
+		if call == 1 {
+			// Wait for the first call's background probe to record the
+			// failure before the second call: the damper must be armed.
+			deadline := time.Now().Add(5 * time.Second)
+			for virtualProbeFailures.count(key) < 1 {
+				if time.Now().After(deadline) {
+					t.Fatal("first background probe failure was never recorded")
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		}
 		req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil)
 		file := *stored
 		resolved, err := h.resolveVirtualPlaybackSource(req, &file, "profile-1", false, nil, "", "", 0, false)
 		if err != nil {
 			t.Fatalf("call %d: resolveVirtualPlaybackSource error: %v", call, err)
 		}
-		if resolved.Provenance != ProbeProvenanceFailed {
-			t.Fatalf("call %d: provenance=%q, want failed declared fallback", call, resolved.Provenance)
+		if resolved.Provenance != ProbeProvenanceDeclared {
+			t.Fatalf("call %d: provenance=%q, want declared instant response (probe runs detached)", call, resolved.Provenance)
 		}
 	}
 	if probeCalls != 1 {
-		t.Fatalf("prober called %d times across two replans, want 1 after the failure damper engages", probeCalls)
+		t.Fatalf("prober called %d times across two starts, want 1 after the failure damper engages", probeCalls)
 	}
 }
 
@@ -609,7 +677,9 @@ func TestResolveVirtualProbeSuccessClearsFailureMarker(t *testing.T) {
 			return f, nil
 		}, nil)
 
-	// Seed a stale failure so the clear path is exercised after the probe.
+	// Seed a stale (expired) failure so the clear path is exercised without
+	// arming the damper: recent() is false, so the instant path admits the
+	// background probe, and the success leaves no live marker behind.
 	virtualProbeFailures.mu.Lock()
 	virtualProbeFailures.marks[key] = virtualProbeFailureMark{
 		ttl:       virtualProbeFailureTTL,
@@ -623,14 +693,23 @@ func TestResolveVirtualProbeSuccessClearsFailureMarker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveVirtualPlaybackSource error: %v", err)
 	}
-	if resolved.Provenance != ProbeProvenanceVerified {
-		t.Fatalf("provenance=%q, want verified", resolved.Provenance)
+	if resolved.Provenance != ProbeProvenanceDeclared {
+		t.Fatalf("provenance=%q, want declared instant response", resolved.Provenance)
+	}
+	// The background probe runs detached: wait for it to complete, then the
+	// seeded stale marker must be gone and no live failure may remain.
+	deadline := time.Now().Add(5 * time.Second)
+	for probeCalls < 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("background probe never ran")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if virtualProbeFailures.recent(key) {
+		t.Fatal("stale failure marker survived a successful background probe")
 	}
 	if probeCalls != 1 {
 		t.Fatalf("prober called %d times, want 1", probeCalls)
-	}
-	if virtualProbeFailures.recent(key) {
-		t.Fatal("failure marker survived a successful probe")
 	}
 }
 
@@ -1150,8 +1229,19 @@ func TestResolveVirtualProbeDamperIsolatesCandidates(t *testing.T) {
 			return nil, errors.New("probe A failed")
 		}, nil)
 	resolvedA := resolve(hA, resolveVirtualDamperFile(owner, 910, uriA))
-	if probeACalls != 1 || resolvedA.Provenance != ProbeProvenanceFailed {
-		t.Fatalf("candidate A: probeCalls=%d provenance=%q, want 1/failed", probeACalls, resolvedA.Provenance)
+	if resolvedA.Provenance != ProbeProvenanceDeclared {
+		t.Fatalf("candidate A: provenance=%q, want declared instant response", resolvedA.Provenance)
+	}
+	// Wait for the detached background probe to record the failure for A.
+	deadlineA := time.Now().Add(5 * time.Second)
+	for !virtualProbeFailures.recent(virtualProbeFailureKey(uriA, owner)) {
+		if time.Now().After(deadlineA) {
+			t.Fatal("background probe failure for A was never recorded")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if probeACalls != 1 {
+		t.Fatalf("candidate A: probeCalls=%d, want 1", probeACalls)
 	}
 
 	// Candidate B under the same neutral path must still be probed.
@@ -1165,11 +1255,17 @@ func TestResolveVirtualProbeDamperIsolatesCandidates(t *testing.T) {
 			return f, nil
 		}, nil)
 	resolvedB := resolve(hB, resolveVirtualDamperFile(owner, 911, uriB))
-	if probeBCalls != 1 {
-		t.Fatalf("candidate B probeCalls=%d, want 1: a failure for candidate A damped candidate B", probeBCalls)
+	if resolvedB.Provenance != ProbeProvenanceDeclared {
+		t.Fatalf("candidate B provenance=%q, want declared instant response", resolvedB.Provenance)
 	}
-	if resolvedB.Provenance != ProbeProvenanceVerified {
-		t.Fatalf("candidate B provenance=%q, want verified", resolvedB.Provenance)
+	// Candidate B under the same neutral path must still be probed in the
+	// background: a failure for A must not damp B.
+	deadlineB := time.Now().Add(5 * time.Second)
+	for probeBCalls < 1 {
+		if time.Now().After(deadlineB) {
+			t.Fatal("candidate B was never probed in the background: failure for A damped B")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -1195,8 +1291,16 @@ func TestResolveVirtualProbeDamperIsolatesOwners(t *testing.T) {
 			probeCalls5++
 			return nil, errors.New("probe owner 5 failed")
 		}, nil)
-	if resolved := resolve(h5, 5); probeCalls5 != 1 || resolved.Provenance != ProbeProvenanceFailed {
-		t.Fatalf("owner 5: probeCalls=%d provenance=%q, want 1/failed", probeCalls5, resolved.Provenance)
+	resolved5 := resolve(h5, 5)
+	if resolved5.Provenance != ProbeProvenanceDeclared {
+		t.Fatalf("owner 5: provenance=%q, want declared instant response", resolved5.Provenance)
+	}
+	deadline5 := time.Now().Add(5 * time.Second)
+	for probeCalls5 < 1 {
+		if time.Now().After(deadline5) {
+			t.Fatal("owner 5 background probe never ran")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	// Owner 6 must probe the same candidate independently.
@@ -1210,11 +1314,17 @@ func TestResolveVirtualProbeDamperIsolatesOwners(t *testing.T) {
 			return f, nil
 		}, nil)
 	resolved6 := resolve(h6, 6)
-	if probeCalls6 != 1 {
-		t.Fatalf("owner 6 probeCalls=%d, want 1: owner 5's failure damped owner 6", probeCalls6)
+	if resolved6.Provenance != ProbeProvenanceDeclared {
+		t.Fatalf("owner 6 provenance=%q, want declared instant response", resolved6.Provenance)
 	}
-	if resolved6.Provenance != ProbeProvenanceVerified {
-		t.Fatalf("owner 6 provenance=%q, want verified", resolved6.Provenance)
+	// Owner 6 must probe the same candidate independently in the background:
+	// owner 5's failure must not damp owner 6.
+	deadline6 := time.Now().Add(5 * time.Second)
+	for probeCalls6 < 1 {
+		if time.Now().After(deadline6) {
+			t.Fatal("owner 6 was never probed in the background: owner 5's failure damped owner 6")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -1342,6 +1452,12 @@ func TestPreferProbedCandidateOverUnprobedStub(t *testing.T) {
 }
 
 func TestPreferProbedNeverJumpsRejectedGroup(t *testing.T) {
+	// This ordering test requires an accepted candidate eligible for
+	// immediate selection: the stub declares its release profile so the
+	// accepted/rejected group partition (not probe availability) decides
+	// the order. A bare-URI stub takes ResolutionAssumed and falls out of
+	// the immediate-selection finalization, which is a separate policy
+	// question from group jumping.
 	probedAt := time.Now().Add(-time.Hour)
 	probedURI := "virtual://movie/tt-probe-gate?result=cand-probed"
 	stubURI := "virtual://movie/tt-probe-gate?result=cand-stub"
@@ -1369,7 +1485,7 @@ func TestPreferProbedNeverJumpsRejectedGroup(t *testing.T) {
 	byURI := map[string]*models.MediaFile{probedURI: probedRow, stubURI: stubRow}
 	lister := VirtualPlaybackStreamListerFunc(func(_ context.Context, _ string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
 		return []VirtualPlaybackStream{
-			{ID: "cand-stub", URI: stubURI},
+			{ID: "cand-stub", URI: stubURI, Resolution: "2160p", CodecVideo: "hevc", CodecAudio: "dts", Container: "mkv"},
 			{ID: "cand-probed", URI: probedURI, Resolution: "2160p", CodecVideo: "hevc", CodecAudio: "dts", Container: "mkv", Rejected: true},
 		}, nil
 	})
