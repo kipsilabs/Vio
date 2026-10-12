@@ -2762,15 +2762,19 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				if len(persistedResumeStored.RequestHeaders) > 0 {
 					probeCand.RequestHeaders = cloneHeaderMap(persistedResumeStored.RequestHeaders)
 				}
-				deferred, damperDeclined := h.virtualDeferredProbeForUnstampedRow(attemptCtx, stickyKey, file, persistedResumeStored.URL, probeCand, oid)
-				// The probe-failure damper shares its admission decision with
-				// the declared fast path: a recent failure declines the worker
-				// and the cache-only recovery runs instead. No worker resolves
-				// the pending state then, so the plan is declared rather than
-				// pending; a fresh probe is retried once the damper lapses.
-				provenance := ProbeProvenancePending
-				if damperDeclined {
-					provenance = ProbeProvenanceDeclared
+				deferred := h.virtualDeferredProbeForUnstampedRow(attemptCtx, stickyKey, file, persistedResumeStored.URL, probeCand, oid)
+				// Pending is a promise that a worker will resolve the row, so
+				// provenance follows the worker itself: only an admitted
+				// deferred probe is pending. Every decline (the row already
+				// carries a stamp, no prober is configured, the stored URL is
+				// empty, or the probe-failure damper is armed) serves declared
+				// metadata instead of a pending state nothing will resolve.
+				// The damper shares its admission decision with the declared
+				// fast path and runs the cache-only recovery; a fresh probe is
+				// retried once the damper lapses.
+				provenance := ProbeProvenanceDeclared
+				if deferred != nil {
+					provenance = ProbeProvenancePending
 				}
 				return &resolvedVirtualPlaybackSource{
 					URL: "", URI: cand.URI, OwnerID: oid, File: &transient,
@@ -6333,18 +6337,17 @@ func allowDeferredProbe(deferProbe bool) bool {
 // inventory reported pending would never resolve to verified or failed, and
 // only the convergence watchdog would end it.
 //
+// The returned probe is the only signal that a worker will run: a nil return
+// means no worker was admitted, so the caller must serve declared metadata with
+// no pending lifecycle rather than promise a resolution nothing will deliver.
 // Admission shares the declared fast path's probe-failure damper: when a recent
 // failure already consumed this candidate's probe budget the worker is not
-// admitted (declined=true). The cache-only recovery still runs, because an
-// inner probe may have completed after an outer timeout and landed its
-// evidence; the caller then serves declared metadata with no pending lifecycle
-// instead of promising a resolution no worker will deliver. Otherwise the probe
-// is returned (declined=false).
+// admitted. The cache-only recovery still runs, because an inner probe may have
+// completed after an outer timeout and landed its evidence.
 //
-// It declines without a probe when the row already carries a stamp, no prober
-// is configured, or the resolved URL is empty (nothing to enumerate). Value
-// copies are captured now so a later mutation of the request's file cannot
-// change what is probed.
+// It returns nil when the row already carries a stamp, no prober is configured,
+// or the resolved URL is empty (nothing to enumerate). Value copies are captured
+// now so a later mutation of the request's file cannot change what is probed.
 func (h *PlaybackHandler) virtualDeferredProbeForUnstampedRow(
 	ctx context.Context,
 	stickyKey string,
@@ -6352,18 +6355,18 @@ func (h *PlaybackHandler) virtualDeferredProbeForUnstampedRow(
 	streamURL string,
 	cand VirtualPlaybackStream,
 	oid int,
-) (*virtualDeferredProbeV3, bool) {
+) *virtualDeferredProbeV3 {
 	if h == nil || file == nil {
-		return nil, false
+		return nil
 	}
 	if file.ProbeUpdatedAt != nil {
-		return nil, false
+		return nil
 	}
 	if h.VirtualPlaybackSourceProber == nil && h.VirtualPlaybackSourceProberWithHeaders == nil {
-		return nil, false
+		return nil
 	}
 	if strings.TrimSpace(streamURL) == "" {
-		return nil, false
+		return nil
 	}
 	probeTransient := cloneVirtualProbeTransient(*file)
 	// Zero the duration so the deferred probe measures the empirical duration
@@ -6382,7 +6385,7 @@ func (h *PlaybackHandler) virtualDeferredProbeForUnstampedRow(
 		// tiers contribute nothing to the shared-tier check) rather than an
 		// identity invented from the row's own tiers.
 		h.recoverVirtualProbeFromCache(ctx, file, streamURL, probeTransient, cand, resolver.PersistedIdentityTiers{}, oid)
-		return nil, true
+		return nil
 	}
 	return &virtualDeferredProbeV3{
 		stickyKey:              stickyKey,
@@ -6392,7 +6395,7 @@ func (h *PlaybackHandler) virtualDeferredProbeForUnstampedRow(
 		cand:                   cand,
 		expectedRuntimeMinutes: h.virtualExpectedRuntimeMinutes(ctx, file),
 		ownerID:                oid,
-	}, false
+	}
 }
 
 // mergeVirtualCandidateTracks supplements probed virtual file tracks with

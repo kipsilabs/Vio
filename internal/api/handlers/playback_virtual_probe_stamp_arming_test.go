@@ -530,3 +530,86 @@ func TestDurableResumeDamperRecoversWarmCachedProbe(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 }
+
+// TestUnstampedStoredURLStartWithoutAWorkerServesDeclared pins that pending is
+// only promised when a deferred worker is actually admitted. The durable-resume
+// fast path can run for an unstamped row whose stored URL cannot back a probe:
+// no prober is configured, or the trusted-but-expired stored URL yields an
+// empty value. In both cases no worker exists to resolve a pending state, so
+// the start must serve declared metadata with no pending lifecycle instead of
+// leaving the session waiting on a resolution nothing will ever deliver.
+func TestUnstampedStoredURLStartWithoutAWorkerServesDeclared(t *testing.T) {
+	const candidateURI = "virtual://movie/tt-stamp-noworker?result=cand-nw"
+
+	cases := []struct {
+		name string
+		// configure adjusts the fixture and the row before the start. Both
+		// cases leave the durable-resume fast path intact, so the resolve must
+		// not fall back to the provider: the fatal resolver below proves it.
+		configure func(fx *deferredLifecycleFixture, file *models.MediaFile)
+	}{
+		{
+			name: "no prober is configured",
+			configure: func(fx *deferredLifecycleFixture, _ *models.MediaFile) {
+				fx.handler.VirtualPlaybackSourceProber = nil
+				fx.handler.VirtualPlaybackSourceProberWithHeaders = nil
+			},
+		},
+		{
+			name: "trusted but expired stored URL yields an empty probe input",
+			configure: func(fx *deferredLifecycleFixture, file *models.MediaFile) {
+				// Expired inside the trust window: the row still owns its
+				// candidate and the durable-resume fast path binds it, but the
+				// stored URL is refused and no URL reaches the probe.
+				expiredAt := time.Now().Add(-time.Hour)
+				file.ResolvedURLExpiresAt = &expiredAt
+				file.UpdatedAt = time.Now()
+				fx.handler.VirtualCandidateTrustWindow = func() time.Duration { return 24 * time.Hour }
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newDeferredLifecycleFixture(t, 777, candidateURI)
+			fx.saveAttempt(t)
+			fx.handler.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(
+				func(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
+					t.Fatal("the durable-resume fast path must not fall back to the provider resolver")
+					return "", nil
+				})
+			probeCalled := false
+			fx.handler.VirtualPlaybackSourceProber = func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
+				probeCalled = true
+				return f, nil
+			}
+
+			expiresAt := time.Now().Add(3 * time.Hour)
+			file := withVirtualResumeVideoEvidence(&models.MediaFile{
+				ID:                         777,
+				ContentID:                  "movie-tt-stamp-noworker",
+				FilePath:                   candidateURI,
+				Container:                  "virtual",
+				VirtualOwnerInstallationID: 5,
+				ResolvedURL:                "https://93.184.216.34/stream/token=stored",
+				ResolvedURLExpiresAt:       &expiresAt,
+			})
+			tc.configure(fx, file)
+
+			req := httptest.NewRequest(http.MethodPost, "/api/v2/playback/start", nil)
+			resolved, err := fx.handler.resolveVirtualPlaybackSource(req, file, "profile-1", true, nil, "", "", 0, false)
+			if err != nil {
+				t.Fatalf("resolveVirtualPlaybackSource error: %v", err)
+			}
+			if resolved.Provenance != ProbeProvenanceDeclared {
+				t.Fatalf("provenance = %q, want declared (no worker can resolve a pending state)", resolved.Provenance)
+			}
+			if resolved.DeferredProbe != nil {
+				t.Fatal("the start armed a deferred probe although no worker could be admitted")
+			}
+			if probeCalled {
+				t.Fatal("the start probed although no deferred worker was admitted")
+			}
+		})
+	}
+}
