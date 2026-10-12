@@ -28,9 +28,11 @@ import (
 //   - rotates the evidence onto the catalog row that already owns the live
 //     candidate path when the two rows provably carry the same release, landing
 //     a real stamp so the session can verify; or
-//   - leaves a genuinely foreign or unanswerable candidate fenced, records a
-//     durable terminal refusal, and reports an actionable terminal instead of
-//     looping.
+//   - leaves a genuinely foreign candidate fenced, records a durable terminal
+//     refusal, and reports an actionable terminal instead of looping.
+//
+// An ownership-lookup failure is not a refusal: it is a recoverable
+// infrastructure error that is never counted and never installs the terminal.
 //
 // A same-release renumber never reaches the bound: the resolver's own reported
 // identity proves the row's release in virtualProbeEvidenceSharesRowRelease, so
