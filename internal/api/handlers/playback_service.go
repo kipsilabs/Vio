@@ -739,16 +739,34 @@ func (h *PlaybackHandler) StopPlaybackV2(ctx context.Context, caller PlaybackCal
 // another replay may take it over.
 const stopFinalizationLease = 30 * time.Second
 
+// stopFinalizationBudget is the single end-to-end bound for one claimed
+// finalization: the claim, the side effects, and the receipt all finish inside
+// it. It sits well below stopFinalizationLease so a slow run cannot still be
+// writing when another replica may reclaim the claim.
+const stopFinalizationBudget = 20 * time.Second
+
+// stopFinalizationReceiptGrace is reserved out of stopFinalizationBudget for the
+// receipt write. The cleanup runs on budget-minus-grace, so a cleanup that uses
+// its whole share still leaves the receipt a live context; otherwise a finalized
+// stop could be left with no receipt and a later replay would redo the writers.
+const stopFinalizationReceiptGrace = 3 * time.Second
+
 // finalizeStopV2 claims finalization, runs the stop side effects, and records
 // the finalized receipt. When the claim is lost the stored receipt is returned
 // unchanged. The stop is already committed on the attempt row by the time this
 // runs, so the finalization is detached from the request: a client cancel right
 // after the commit must not skip the claim, the cleanup, or the receipt write,
 // any of which would leave the stop open to a later replay.
+//
+// One end-to-end budget covers the claim, the cleanup, and the receipt, and it
+// is strictly below stopFinalizationLease. Every nested teardown below inherits
+// this deadline instead of resetting a fresh one, so the worker cannot still be
+// running the non-idempotent writers when another replica may reclaim the
+// claim.
 func (h *PlaybackHandler) finalizeStopV2(ctx context.Context, store playback.ProgressStoreV3, record *playback.AttemptRecordV3, sessionID string, receipt playback.StopReceiptV3) playback.StopReceiptV3 {
-	// One detached budget covers the claim and the durable side effects; the
-	// caller's request context no longer bounds them.
-	finalCtx, cancelFinal := teardownContext(ctx)
+	// The caller's request context no longer bounds the durable side effects,
+	// but its deadline, if any, still narrows this budget.
+	finalCtx, cancelFinal := detachedWithin(ctx, stopFinalizationBudget)
 	defer cancelFinal()
 	claimed, err := store.ClaimStopFinalization(finalCtx, sessionID, time.Now().Add(stopFinalizationLease))
 	if err != nil {
@@ -761,40 +779,48 @@ func (h *PlaybackHandler) finalizeStopV2(ctx context.Context, store playback.Pro
 		// the detached ceiling lapses. The receipt is re-read each round so the
 		// lease judged is the one the store holds now, not the one read before
 		// the winner claimed.
+		//
+		// The poll context ends on the earlier of the request cancellation and
+		// the finalization deadline, so a store call that blocks does not escape
+		// the detached ceiling just because the request context is still live.
+		pollCtx, cancelPoll := cancelOnEither(finalCtx, ctx)
+		defer cancelPoll()
 		for {
-			if replay, _, err := store.StopAttempt(ctx, sessionID, receipt.StopID, nil); err == nil {
+			if replay, _, err := store.StopAttempt(pollCtx, sessionID, receipt.StopID, nil); err == nil {
 				if replay.Finalized {
 					return replay
 				}
 				receipt = replay
 			}
 			if !receipt.FinalizingUntil.IsZero() && !time.Now().Before(receipt.FinalizingUntil) {
-				claimed, err = store.ClaimStopFinalization(finalCtx, sessionID, time.Now().Add(stopFinalizationLease))
+				claimed, err = store.ClaimStopFinalization(pollCtx, sessionID, time.Now().Add(stopFinalizationLease))
 				if err == nil && claimed {
 					break
 				}
 			}
 			timer := time.NewTimer(25 * time.Millisecond)
 			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return receipt
-			case <-finalCtx.Done():
+			case <-pollCtx.Done():
 				timer.Stop()
 				return receipt
 			case <-timer.C:
 			}
 		}
 	}
-	receipt.HistoryID = h.finishStopV2(finalCtx, record, sessionID, receipt.Accepted)
+	// The cleanup runs inside the budget but may not consume the receipt's
+	// reserved slice. finishStopV2's nested teardowns clamp to this deadline, so
+	// a slow cleanup cannot push the receipt past the shared budget and leave the
+	// stop replayable.
+	finalDeadline, _ := finalCtx.Deadline()
+	cleanupCtx, cancelCleanup := context.WithDeadline(finalCtx, finalDeadline.Add(-stopFinalizationReceiptGrace))
+	defer cancelCleanup()
+	receipt.HistoryID = h.finishStopV2(cleanupCtx, record, sessionID, receipt.Accepted)
 	receipt.Finalized = true
-	// finishStopV2 runs the cleanup, which takes its own detached budget and can
-	// outlast the one above. Persist the receipt under a fresh bound of its own
-	// so a slow cleanup cannot leave it unwritten and the stop replayable.
-	receiptCtx, cancelReceipt := teardownContext(finalCtx)
-	defer cancelReceipt()
-	if err := store.RecordStopReceipt(receiptCtx, sessionID, receipt); err != nil {
-		slog.WarnContext(receiptCtx, "failed to record playback stop receipt", "component", "api", "session", sessionID, "playback_session_id", sessionID, "error", err)
+	// The receipt lands on the remaining budget. It is intentionally not given a
+	// fresh detached bound: extending past the shared deadline would let a slow
+	// cleanup outlive the lease the claim is fenced by.
+	if err := store.RecordStopReceipt(finalCtx, sessionID, receipt); err != nil {
+		slog.WarnContext(finalCtx, "failed to record playback stop receipt", "component", "api", "session", sessionID, "playback_session_id", sessionID, "error", err)
 	}
 	return receipt
 }

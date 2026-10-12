@@ -2065,11 +2065,42 @@ const sessionTeardownTimeout = 15 * time.Second
 // complete its durable writes; the request's logging and tracing values are
 // kept, its cancellation is dropped, and a wedged store is bounded rather than
 // leaking the goroutine.
+//
+// The detached budget never reaches past a deadline the caller already carries.
+// The v2 stop finalization hands its single end-to-end deadline down through the
+// nested teardown and finalize calls; without the cap every nested
+// teardownContext would reset to a fresh full timeout and the finalization could
+// outlive the lease that fences it against a concurrent replay.
 func teardownContext(ctx context.Context) (context.Context, context.CancelFunc) {
-	if ctx == nil {
-		ctx = context.Background()
+	return detachedWithin(ctx, sessionTeardownTimeout)
+}
+
+// detachedWithin builds a context that survives cancellation of base (keeping
+// its logging and tracing values) but is bounded by budget and by any earlier
+// deadline base already carries, whichever is narrower. A detach nested inside
+// another bounded section therefore cannot extend past it.
+func detachedWithin(base context.Context, budget time.Duration) (context.Context, context.CancelFunc) {
+	if base == nil {
+		base = context.Background()
 	}
-	return context.WithTimeout(context.WithoutCancel(ctx), sessionTeardownTimeout)
+	deadline := time.Now().Add(budget)
+	if inherited, ok := base.Deadline(); ok && inherited.Before(deadline) {
+		deadline = inherited
+	}
+	return context.WithDeadline(context.WithoutCancel(base), deadline)
+}
+
+// cancelOnEither returns a context that is done when either parent is done and
+// keeps the earlier of their deadlines. It bounds a store call by both the
+// client's request cancellation and an enclosing detached deadline, so a
+// blocked call cannot outrun the ceiling while the request is still live.
+func cancelOnEither(primary, secondary context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(primary)
+	stop := context.AfterFunc(secondary, cancel)
+	return ctx, func() {
+		stop()
+		cancel()
+	}
 }
 
 func (h *PlaybackHandler) finalizeSessionStop(ctx context.Context, session *playback.Session, syncNow bool, syncReason string, userInitiated bool) {

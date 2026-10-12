@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -402,6 +403,207 @@ func TestStopTeardownDurableWritesSurviveSlowStartEffect(t *testing.T) {
 
 		if !adminStore.deleted[session.ID] {
 			t.Fatalf("durable session delete did not run after a slow start effect (calls=%d)", adminStore.deleteCalls)
+		}
+	})
+}
+
+// leaseObservingStore counts the finalization claims won and the receipts that
+// actually reached the store, so a test can prove exactly one finalization ran
+// even when a replay races the winner.
+type leaseObservingStore struct {
+	*playback.MemoryPlanStoreV3
+	mu              sync.Mutex
+	claimsWon       int
+	finalizedWrites int
+}
+
+func (s *leaseObservingStore) ClaimStopFinalization(ctx context.Context, sessionID string, leaseUntil time.Time) (bool, error) {
+	won, err := s.MemoryPlanStoreV3.ClaimStopFinalization(ctx, sessionID, leaseUntil)
+	if won {
+		s.mu.Lock()
+		s.claimsWon++
+		s.mu.Unlock()
+	}
+	return won, err
+}
+
+func (s *leaseObservingStore) RecordStopReceipt(ctx context.Context, sessionID string, receipt playback.StopReceiptV3) error {
+	err := s.MemoryPlanStoreV3.RecordStopReceipt(ctx, sessionID, receipt)
+	if err == nil && receipt.Finalized {
+		s.mu.Lock()
+		s.finalizedWrites++
+		s.mu.Unlock()
+	}
+	return err
+}
+
+// wedgedCleanupAdminStore blocks the synced-session delete until its teardown
+// context ends, the way a slow or wedged durable store would, and signals when
+// it has entered the block.
+type wedgedCleanupAdminStore struct {
+	entered     chan struct{}
+	enteredOnce sync.Once
+}
+
+func (s *wedgedCleanupAdminStore) RecordHistory(context.Context, AdminPlaybackHistoryEntry) error {
+	return nil
+}
+
+func (s *wedgedCleanupAdminStore) DeleteSession(ctx context.Context, sessionID string) error {
+	s.enteredOnce.Do(func() { close(s.entered) })
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// A claimed finalization must finish inside its single end-to-end budget, below
+// the lease, even when a start effect holds the wait open and the cleanup then
+// wedges. Nested fresh budgets used to stack past the lease, letting a
+// concurrent replay reclaim the claim while the winner was still writing; here
+// the replay must stay a replay and the winner must finalize once, in budget.
+func TestStopFinalizationSlowCleanupStaysInsideLease(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := newPlaybackServiceFixture(t)
+		store := &leaseObservingStore{MemoryPlanStoreV3: f.handler.PlanStoreV3.(*playback.MemoryPlanStoreV3)}
+		f.handler.PlanStoreV3 = store
+		admin := &wedgedCleanupAdminStore{entered: make(chan struct{})}
+		f.handler.AdminStore = admin
+
+		// A start effect that holds the cancel-wait open for 8s, so the durable
+		// cleanup only starts after the wait releases and must then finish inside
+		// the same budget rather than a fresh one.
+		state := &playbackStartSideEffectsStateV3{
+			ctx:     context.Background(),
+			cancel:  func() {},
+			done:    make(chan struct{}),
+			started: true,
+		}
+		f.handler.v3StartEffectsPending = map[string]*playbackStartSideEffectsStateV3{f.session.ID: state}
+		go func() {
+			time.Sleep(8 * time.Second)
+			close(state.done)
+		}()
+
+		type stopResult struct {
+			view PlaybackMutationView
+			err  error
+		}
+		start := time.Now()
+		firstDone := make(chan stopResult, 1)
+		go func() {
+			view, err := f.handler.StopPlaybackV2(newAuthorizedPlaybackContext(), f.caller, f.session.ID, PlaybackStopCommand{StopID: uuid.NewString()})
+			firstDone <- stopResult{view, err}
+		}()
+		// Only start the racing replay once the winner is inside its wedged
+		// cleanup, so the two finalizations overlap for real.
+		<-admin.entered
+		replayDone := make(chan stopResult, 1)
+		go func() {
+			view, err := f.handler.StopPlaybackV2(newAuthorizedPlaybackContext(), f.caller, f.session.ID, PlaybackStopCommand{StopID: uuid.NewString()})
+			replayDone <- stopResult{view, err}
+		}()
+
+		first := <-firstDone
+		replay := <-replayDone
+		elapsed := time.Since(start)
+
+		if first.err != nil {
+			t.Fatalf("winner stop failed: %v", first.err)
+		}
+		if first.view.Outcome != PlaybackOutcomeStopped {
+			t.Fatalf("winner outcome = %v, want stopped", first.view.Outcome)
+		}
+		if replay.err != nil {
+			t.Fatalf("replay stop failed: %v", replay.err)
+		}
+		if replay.view.Outcome != PlaybackOutcomeReplayed {
+			t.Fatalf("replay outcome = %v, want replayed", replay.view.Outcome)
+		}
+		store.mu.Lock()
+		claims, writes := store.claimsWon, store.finalizedWrites
+		store.mu.Unlock()
+		if claims != 1 {
+			t.Fatalf("finalization claimed %d times, want exactly 1: a replay must not take over a live lease", claims)
+		}
+		if writes != 1 {
+			t.Fatalf("receipt finalized %d times, want exactly 1: writers interleaved", writes)
+		}
+		if elapsed > stopFinalizationBudget {
+			t.Fatalf("finalization ran %v, past the %v end-to-end budget", elapsed, stopFinalizationBudget)
+		}
+		if elapsed >= stopFinalizationLease {
+			t.Fatalf("finalization ran %v, not safely inside the %v lease", elapsed, stopFinalizationLease)
+		}
+		if _, err := f.manager.GetSession(f.session.ID); !errors.Is(err, playback.ErrSessionNotFound) {
+			t.Fatalf("winner did not tear the session down: %v", err)
+		}
+	})
+}
+
+// blockingPollStore blocks the store call the replay polling loop makes, and
+// records that it was entered. It embeds the memory store so it still satisfies
+// every plan/progress method.
+type blockingPollStore struct {
+	*playback.MemoryPlanStoreV3
+	mu          sync.Mutex
+	stopCalls   int
+	blockAfter  int
+	blocked     chan struct{}
+	enteredOnce sync.Once
+}
+
+func (s *blockingPollStore) StopAttempt(
+	ctx context.Context, sessionID, stopID string, final *playback.ProgressSampleV3,
+) (playback.StopReceiptV3, bool, error) {
+	s.mu.Lock()
+	s.stopCalls++
+	call := s.stopCalls
+	s.mu.Unlock()
+	if s.blockAfter > 0 && call > s.blockAfter {
+		s.enteredOnce.Do(func() { close(s.blocked) })
+		<-ctx.Done()
+		return playback.StopReceiptV3{}, false, ctx.Err()
+	}
+	return s.MemoryPlanStoreV3.StopAttempt(ctx, sessionID, stopID, final)
+}
+
+// A replay that loses the claim polls the stored receipt. If the request
+// context is still live, a blocked store call must not outrun the detached
+// finalization deadline: the poll is bounded by both. Without the finalization
+// bound the call would hang on the never-canceled request until the test
+// deadlocks.
+func TestStopReplayPollingIsBoundedByFinalizationDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := newPlaybackServiceFixture(t)
+		base := f.handler.PlanStoreV3.(*playback.MemoryPlanStoreV3)
+		if _, _, err := base.StopAttempt(context.Background(), f.session.ID, uuid.NewString(), nil); err != nil {
+			t.Fatal(err)
+		}
+		if won, err := base.ClaimStopFinalization(context.Background(), f.session.ID, time.Now().Add(time.Minute)); err != nil || !won {
+			t.Fatalf("seed claim: %v %v", won, err)
+		}
+		store := &blockingPollStore{MemoryPlanStoreV3: base, blockAfter: 1, blocked: make(chan struct{})}
+		f.handler.PlanStoreV3 = store
+
+		start := time.Now()
+		view, err := f.handler.StopPlaybackV2(f.ctx, f.caller, f.session.ID, PlaybackStopCommand{StopID: uuid.NewString()})
+		elapsed := time.Since(start)
+
+		if err != nil || view.Outcome != PlaybackOutcomeReplayed {
+			t.Fatalf("replay = %+v, %v", view, err)
+		}
+		select {
+		case <-store.blocked:
+		default:
+			t.Fatal("precondition: the replay poll never entered the blocked store call")
+		}
+		if elapsed > stopFinalizationBudget {
+			t.Fatalf("replay poll ran %v, past the %v finalization deadline", elapsed, stopFinalizationBudget)
+		}
+		if elapsed >= stopFinalizationLease {
+			t.Fatalf("replay poll ran %v, not inside the %v lease", elapsed, stopFinalizationLease)
+		}
+		if _, err := f.manager.GetSession(f.session.ID); err != nil {
+			t.Fatalf("a replay that lost the claim must not tear the session down: %v", err)
 		}
 	})
 }
