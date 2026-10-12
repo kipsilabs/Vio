@@ -4315,10 +4315,13 @@ func ExecVirtualFileMetadataUpdateResult(ctx context.Context, db VirtualFileMeta
 				if reason == "" {
 					reason = virtualProbeRefusalUnclassified
 				}
+				refusals := virtualAdoptionRefusals.mark(virtualAdoptionRefusalKeyForArgs(args))
 				slog.WarnContext(ctx, "virtual probe evidence persist refused: required identity adoption matched no row",
 					"component", "api", "file_id", args.FileID, "adopt_path", args.AdoptPath,
 					"expected_path", args.ExpectedFilePath,
-					"reason", reason)
+					"reason", reason, "consecutive_refusals", refusals,
+					"refusal_bound", virtualAdoptionRefusalBound,
+					"bound_reached", refusals >= virtualAdoptionRefusalBound)
 				return VirtualFileMetadataUpdateResult{}, fmt.Errorf("%w: candidate %s was not adopted", errVirtualAdoptIdentityNotPersisted, args.AdoptPath)
 			}
 			return VirtualFileMetadataUpdateResult{}, nil
@@ -4329,6 +4332,9 @@ func ExecVirtualFileMetadataUpdateResult(ctx context.Context, db VirtualFileMeta
 			// substitute the catalog row does not own.
 			return VirtualFileMetadataUpdateResult{}, fmt.Errorf("%w: candidate %s persisted as %q", errVirtualAdoptIdentityNotPersisted, args.AdoptPath, persistedPath)
 		}
+		// The write landed. Any consecutive-refusal count for this row and pin is
+		// stale: the row now carries evidence, so the bound resets.
+		virtualAdoptionRefusals.clear(virtualAdoptionRefusalKeyForArgs(args))
 		return VirtualFileMetadataUpdateResult{
 			RowsAffected:    1,
 			MetadataUpdated: true,
@@ -4534,11 +4540,26 @@ func (h *PlaybackHandler) virtualProbeEvidenceRotateTarget(ctx context.Context, 
 	ownerRow, ownerErr := h.virtualPathOwnerRow(ctx, catalogFile, resolvedPath, catalogFile.VirtualOwnerInstallationID, catalogFile.MediaFolderID)
 	if ownerErr != nil {
 		// An unanswered ownership question is not safe absence: fail closed
-		// rather than adopt or stamp bytes whose owner is unknown.
-		slog.WarnContext(ctx, "virtual probe evidence refused: candidate path ownership is unknown",
+		// rather than adopt or stamp bytes whose owner is unknown. Count the
+		// refusal so repeated unknown-ownership failures reach the same bound as
+		// every other refusal; past the bound the write stays refused, but the
+		// log names it an actionable terminal instead of a transient retry.
+		refusalKey := virtualAdoptionRefusalKey(catalogFile.ID, catalogFile.FilePath)
+		refusals := virtualAdoptionRefusals.mark(refusalKey)
+		attrs := []any{
 			"component", "api", "file_id", catalogFile.ID, "candidate_uri", resolvedPath,
 			"row_path", catalogFile.FilePath, "probe_source", catalogFile.ProbeSource,
-			"reason", virtualProbeRefusalOwnerLookupFailed, "error", ownerErr)
+			"reason", virtualProbeRefusalOwnerLookupFailed, "error", ownerErr,
+			"consecutive_refusals", refusals, "refusal_bound", virtualAdoptionRefusalBound,
+		}
+		if refusals >= virtualAdoptionRefusalBound {
+			attrs = append(attrs, "terminal", true,
+				"terminal_reason", virtualProbeRefusalAdoptionBoundExhausted)
+			slog.ErrorContext(ctx, "virtual probe evidence refused: candidate path ownership is unknown past the refusal bound; reporting a terminal inventory failure",
+				attrs...)
+		} else {
+			slog.WarnContext(ctx, "virtual probe evidence refused: candidate path ownership is unknown", attrs...)
+		}
 		// The catalog write is correctly blocked, but the live session must not
 		// stay stale: serve the probed tracks in memory to sessions bound to
 		// this row's exact candidate. The publish is best-effort and writes
@@ -4552,14 +4573,26 @@ func (h *PlaybackHandler) virtualProbeEvidenceRotateTarget(ctx context.Context, 
 			// neutral keys. Rotating here would overlay the requested row's
 			// probed inventory onto its duplicate sibling (and, on the reverse
 			// probe, the sibling's onto the requested row): exactly the silent
-			// cross-row contamination this guard exists to stop. Refuse the
-			// write outright — a metadata write on the requested row would be
-			// refused by the SQL sibling fence anyway — and serve the probed
-			// tracks in memory only to sessions bound to the requested row id,
-			// so the playing menu stays live while no sibling row is repainted.
+			// cross-row contamination this guard exists to stop. The refusal is
+			// safe, but it is also unbounded: a duplicate row whose pin never
+			// adopts keeps serving provisional evidence forever. Count it, and
+			// after the bound rotate the evidence onto the owning row anyway —
+			// both rows provably carry the same release, so the probed bytes are
+			// that release's bytes and no foreign inventory crosses rows.
+			refusalKey := virtualAdoptionRefusalKey(catalogFile.ID, catalogFile.FilePath)
+			refusals := virtualAdoptionRefusals.mark(refusalKey)
+			if refusals >= virtualAdoptionRefusalBound {
+				rotated := rotateVirtualSourceToOwnerRow(probed, ownerRow, resolvedPath)
+				slog.InfoContext(ctx, "virtual probe evidence rotation to same-release owner row after bounded refusals",
+					"component", "api", "requested_file_id", catalogFile.ID, "owner_file_id", ownerRow.ID,
+					"candidate_uri", resolvedPath, "consecutive_refusals", refusals,
+					"reason", "sibling_owner_same_release_bound_rotation")
+				return rotated, rotated, true
+			}
 			slog.WarnContext(ctx, "virtual probe evidence rotation refused: sibling owner row is a duplicate of the same release",
 				"component", "api", "requested_file_id", catalogFile.ID, "owner_file_id", ownerRow.ID,
-				"candidate_uri", resolvedPath, "reason", "sibling_owner_same_release")
+				"candidate_uri", resolvedPath, "reason", "sibling_owner_same_release",
+				"consecutive_refusals", refusals, "refusal_bound", virtualAdoptionRefusalBound)
 			h.publishRefusedProbeInventory(ctx, catalogFile.ID, resolvedPath, probed)
 			return nil, nil, false
 		}
@@ -4676,6 +4709,29 @@ func (h *PlaybackHandler) virtualProbeEvidenceArgsForRow(ctx context.Context, ca
 	}
 	if crossRelease {
 		args.RefusalReason = h.virtualProbeEvidenceRefusalReason(ctx, catalogFile, resolvedPath)
+		// Bounded refusal. Once this row and pin have refused enough consecutive
+		// adoptions to treat the pin as stale, stop retrying the same fenced
+		// write. If the probed bytes provably carry the pin's own release
+		// identity, the refusals are a same-release renumber: the write becomes
+		// metadata-only against the pinned row, which lands the measured tracks
+		// and the probe stamp, so the row stops re-probing and the session can
+		// verify. A candidate that cannot be tied to the pin stays foreign: the
+		// fence is kept and the refusal is named terminal rather than looping.
+		if virtualAdoptionRefusalBoundReached(args) {
+			if virtualCandidateSharesPersistedIdentity(catalogFile, probed) {
+				args.RequireAdopt = false
+				slog.InfoContext(ctx, "virtual probe evidence adoption refusal bound reached; re-pinning the same-release candidate metadata-only against the stale pin",
+					"component", "api", "file_id", catalogFile.ID, "adopt_path", adoptPath,
+					"expected_path", expectedPath, "candidate_uri", resolvedPath,
+					"reason", "adoption_refusal_bound_same_release_repin")
+			} else {
+				args.RefusalReason = virtualProbeRefusalAdoptionBoundExhausted
+				slog.ErrorContext(ctx, "virtual probe evidence adoption refusal bound reached and the candidate is not the pinned release; refusing terminally",
+					"component", "api", "file_id", catalogFile.ID, "adopt_path", adoptPath,
+					"expected_path", expectedPath, "candidate_uri", resolvedPath,
+					"reason", virtualProbeRefusalAdoptionBoundExhausted)
+			}
+		}
 	}
 	return args, true
 }
