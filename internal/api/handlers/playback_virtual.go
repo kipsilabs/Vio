@@ -82,6 +82,17 @@ const (
 	// unknown; only a repeat is treated as evidence it should stop steering
 	// starts.
 	virtualProbeFailureRepeatThreshold = 2
+	// virtualProbePartialRepeatThreshold is the number of consecutive
+	// incomplete enumerations for one candidate before the non-negotiated
+	// paths stop re-probing and settle on the candidate's declared metadata.
+	// The negotiated path arms a convergence watchdog that fails the pending
+	// lifecycle at its own bound; the non-negotiated background path and the
+	// synchronous resolve have no session lifecycle to fail, so this streak is
+	// their bound. A single partial read is never penalized (the pin is kept
+	// and the failure damper is not consumed); only a persistent streak settles
+	// the resolve so a truncated provider cannot keep a start pending for the
+	// session's life.
+	virtualProbePartialRepeatThreshold = 2
 	// virtualProbeFailureMaxEntries caps the process-wide probe-failure damper.
 	// A live marker is a candidate still inside its backoff window; a
 	// long-lived server that probes many distinct candidates would otherwise
@@ -257,12 +268,47 @@ func (c *virtualProbeFailureCache) count(key string) int {
 	return mark.failures
 }
 
+// virtualProbePartialKey namespaces the incomplete-enumeration streak for a
+// candidate. It is separate from the candidate's failure key on purpose: a
+// partial read must never arm the probe-failure damper (recent/count) by
+// itself, because it is not a verdict about the candidate's bytes. Keeping the
+// streak under its own key lets the counter bound a persistent streak without
+// suppressing the probe the failure damper gates.
+func virtualProbePartialKey(key string) string {
+	if key == "" {
+		return ""
+	}
+	return key + "\x00incomplete"
+}
+
+// bumpPartial records one more incomplete enumeration for a candidate and
+// returns the new consecutive streak length. It is the bound side of the
+// non-negotiated paths (the background probe and the synchronous resolve),
+// which have no convergence watchdog to fail a stuck pending lifecycle.
+func (c *virtualProbeFailureCache) bumpPartial(key string) int {
+	partialKey := virtualProbePartialKey(key)
+	if partialKey == "" {
+		return 0
+	}
+	c.mark(partialKey)
+	return c.count(partialKey)
+}
+
+// clearPartial drops a candidate's incomplete-enumeration streak. It is called
+// once a complete enumeration lands so a later partial starts a fresh streak.
+func (c *virtualProbeFailureCache) clearPartial(key string) {
+	c.clear(virtualProbePartialKey(key))
+}
+
 // virtualProbeVerdictUnknown reports whether an error leaves the candidate's
 // health unknown rather than condemning it: the caller's outer budget fired or
 // the request was canceled while the probe was still running under its own
-// timeout. The probe may yet complete in the cache, so this must not unpin.
+// timeout, or the probe returned only a partial enumeration. The probe may yet
+// complete in the cache, so this must not unpin.
 func virtualProbeVerdictUnknown(err error) bool {
-	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
+	return errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, scanner.ErrVirtualProbePartial)
 }
 
 func (c *virtualProbeFailureCache) clear(key string) {
@@ -1282,6 +1328,7 @@ type ProbeProvenance string
 const (
 	ProbeProvenanceDeclared ProbeProvenance = "declared"
 	ProbeProvenancePending  ProbeProvenance = "pending"
+	ProbeProvenancePartial  ProbeProvenance = "partial"
 	ProbeProvenanceVerified ProbeProvenance = "verified"
 	ProbeProvenanceFailed   ProbeProvenance = "failed"
 )
@@ -1341,6 +1388,16 @@ type resolvedVirtualPlaybackSource struct {
 	// spawns the probe the moment the URL exists. Nil for a resolve that probed
 	// synchronously or had nothing to probe.
 	DeferredProbe *virtualDeferredProbeV3
+	// IncompleteEnumeration marks a resolved source that settled on the
+	// candidate's declared metadata because its synchronous probe returned a
+	// structurally incomplete enumeration (scanner.ErrVirtualProbePartial)
+	// rather than a verdict about the bytes. The candidate keeps its pin and
+	// the failure damper is not consumed, but the resolve does not scan
+	// trailing candidates for a verified sibling: an unknown-verdict candidate
+	// is never substituted. The caller returns the declared disposition
+	// immediately, exactly as it does for a pending deferred lifecycle. The
+	// retry across starts is bounded by the incomplete-enumeration streak.
+	IncompleteEnumeration bool
 }
 
 // virtualProbeIdentity is the durable provider identity of the candidate a
@@ -3194,11 +3251,17 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			}, resolvedIdentity, resolvedRematched), nil
 		}
 		probeKey := virtualProbeFailureKey(cand.URI, oid)
-		declaredFallback := func() (*resolvedVirtualPlaybackSource, error) {
-			// Resolution precedence: stored evidence wins; otherwise adopt
-			// the candidate's declared label; only when both are absent is
-			// the 1080p baseline assumed. Only the last case marks
-			// ResolutionAssumed, so a declared 2160p is never clobbered.
+		// mergeDeclaredFallback backfills the candidate's declared metadata onto
+		// the transient plan file and returns the resolved source under the given
+		// provenance. Resolution precedence: stored evidence wins; otherwise
+		// adopt the candidate's declared label; only when both are absent is the
+		// 1080p baseline assumed. Only the last case marks ResolutionAssumed, so a
+		// declared 2160p is never clobbered.
+		//
+		// A partial enumeration reuses it with pending provenance: the candidate's
+		// bytes are not condemned, it keeps playing on its provisional plan, and no
+		// probe evidence is published.
+		mergeDeclaredFallback := func(provenance ProbeProvenance) (*resolvedVirtualPlaybackSource, error) {
 			if transient.Resolution == "" {
 				transient.Resolution = cand.Resolution
 			}
@@ -3212,8 +3275,11 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			}
 			h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
 			return withResolvedCandidate(&resolvedVirtualPlaybackSource{
-				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenanceFailed, ResolutionAssumed: resolutionAssumed,
+				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: provenance, ResolutionAssumed: resolutionAssumed,
 			}, resolvedIdentity, resolvedRematched), nil
+		}
+		declaredFallback := func() (*resolvedVirtualPlaybackSource, error) {
+			return mergeDeclaredFallback(ProbeProvenanceFailed)
 		}
 		if skipProbe && !substituted {
 			if transient.Resolution == "" {
@@ -3296,10 +3362,38 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		probeCtx, probeCancel := context.WithTimeout(attemptCtx, virtualProbeBudget)
 		trace.probeRan = true
 		probeStart := time.Now()
+		forwardVirtualCandidateDeclaredAudio(&syncProbeFile, cand)
 		probed, probeErr := h.probeVirtualSource(probeCtx, streamURL, &syncProbeFile, cand.RequestHeaders)
 		trace.probe += time.Since(probeStart)
 		probeCancel()
 		if probeErr != nil || probed == nil {
+			if errors.Is(probeErr, scanner.ErrVirtualProbePartial) {
+				// The enumeration is incomplete, not the candidate invalid: the
+				// candidate keeps its pin and the failure damper is not consumed,
+				// and nothing is persisted or published as verified. This
+				// synchronous path runs before the session exists, so it has no
+				// deferred lifecycle for the convergence watchdog to close;
+				// returning pending here would leave the start with no path to a
+				// terminal state. Settle on the candidate's declared metadata
+				// (non-verified) instead, and bound the retry with the same
+				// incomplete-enumeration streak the non-negotiated background
+				// path uses: once the streak repeats, the failure damper arms so
+				// later starts stop re-probing and reuse the declared disposition
+				// rather than holding a start pending for the session's life.
+				if virtualProbeFailures.bumpPartial(probeKey) >= virtualProbePartialRepeatThreshold {
+					virtualProbeFailures.mark(probeKey)
+					slog.WarnContext(r.Context(), "virtual stream probe enumeration still incomplete; settling on declared metadata",
+						"component", "api", "candidate_uri", cand.URI, "file_id", file.ID,
+						"attempts", virtualProbePartialRepeatThreshold)
+				}
+				slog.DebugContext(r.Context(), "virtual stream probe enumeration incomplete; serving declared metadata",
+					"component", "api", "candidate_uri", cand.URI, "error", probeErr)
+				resolved, err := mergeDeclaredFallback(ProbeProvenanceDeclared)
+				if resolved != nil {
+					resolved.IncompleteEnumeration = true
+				}
+				return resolved, err
+			}
 			virtualProbeFailures.mark(probeKey)
 			slog.DebugContext(r.Context(), "virtual stream probe timed out or failed; using candidate metadata", "component", "api", "candidate_uri", cand.URI, "error", probeErr)
 			return declaredFallback()
@@ -3369,10 +3463,13 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		// verified sibling, but every extra iteration pays a full provider
 		// resolve RPC (a plugin round-trip, seconds each) whose work the
 		// loop then throws away — the final return is this same first
-		// usable source anyway. Declared results (no prober) fall through
-		// to the finalization block below so they still get the runtime
-		// check, evidence persist, and sticky pin.
-		if result.Provenance == ProbeProvenancePending {
+		// usable source anyway. An incomplete-enumeration result settled on
+		// declared metadata for the same reason and must not be substituted:
+		// the candidate's bytes were never condemned, so a sibling is not a
+		// valid replacement. Declared results (no prober) fall through to the
+		// finalization block below so they still get the runtime check,
+		// evidence persist, and sticky pin.
+		if result.Provenance == ProbeProvenancePending || result.IncompleteEnumeration {
 			result.CandidateRank = i
 			result.CandidateCount = len(candidates)
 			return *result, nil
@@ -3611,6 +3708,14 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 	fence func() bool,
 ) (string, int) {
 	probeKey := virtualProbeFailureKey(probeCand.URI, ownerInstallationID)
+	// Carry the served candidate's declared audio onto the probe input before
+	// the enumeration. The background/rotation paths build probeTransient from
+	// the catalog row alone, so without this the completeness gate in
+	// scanner.ProbeVirtualSource cannot see that the item carries audio and a
+	// video-with-subtitles-but-no-audio result would be persisted and published
+	// as verified. It is a no-op for the deferred and declared paths, whose
+	// probe input the resolve already merged the candidate onto.
+	forwardVirtualCandidateDeclaredAudio(&probeTransient, probeCand)
 	probeCtx, probeCancel := context.WithTimeout(bgCtx, virtualBackgroundProbeBudget)
 	probed, probeErr := h.probeVirtualSource(probeCtx, probeURL, &probeTransient, probeCand.RequestHeaders)
 	probeCancel()
@@ -3624,6 +3729,29 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 		return "", 0
 	}
 	if probeErr != nil || probed == nil {
+		if errors.Is(probeErr, scanner.ErrVirtualProbePartial) {
+			// The probe completed but enumerated only part of the stream
+			// table. That is not a verdict about the candidate's bytes, so do
+			// not mark the failure damper or release the pin. The negotiated
+			// path holds the session pending (non-verified) and lets the
+			// convergence watchdog fail it at the bound; the non-negotiated
+			// background path has no session watchdog, so its bound is the
+			// incomplete-enumeration streak: once it repeats, the failure
+			// damper is armed so the resolve stops re-probing and settles on
+			// the candidate's declared metadata instead of staying pending
+			// forever. Nothing is persisted either way, so the row keeps its
+			// previous evidence and stamp.
+			if !durableEvidence &&
+				virtualProbeFailures.bumpPartial(probeKey) >= virtualProbePartialRepeatThreshold {
+				virtualProbeFailures.mark(probeKey)
+				slog.WarnContext(bgCtx, "virtual probe enumeration still incomplete after repeated attempts; settling on declared metadata",
+					"component", "api", "candidate_uri", probeCand.URI, "file_id", catalogFile.ID,
+					"attempts", virtualProbePartialRepeatThreshold)
+			}
+			slog.WarnContext(bgCtx, "virtual probe enumeration incomplete; holding inventory pending",
+				"component", "api", "candidate_uri", probeCand.URI, "file_id", catalogFile.ID)
+			return probeOutcomePartial, 0
+		}
 		virtualProbeFailures.mark(probeKey)
 		slog.WarnContext(bgCtx, "background virtual stream probe failed", "component", "api", "candidate_uri", probeCand.URI, "error", probeErr)
 		// A context error (outer budget fired, request canceled) means the
@@ -3646,6 +3774,7 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 		return probeOutcomeFailed, 0
 	}
 	virtualProbeFailures.clear(probeKey)
+	virtualProbeFailures.clearPartial(probeKey)
 	if probeTransient.ID > 0 {
 		probed.ID = probeTransient.ID
 		probed.MediaFolderID = probeTransient.MediaFolderID
@@ -3757,6 +3886,18 @@ func catalogFileIDOrZero(file *models.MediaFile) int {
 // audio-switch or version-switch replan — and persists it with a fresh stamp so
 // the row stops being probed on every start. The failure damper is cleared on a
 // hit, exactly like the transient-timeout recovery it generalizes.
+//
+// The candidate's declared audio is forwarded onto the lookup input before the
+// cache is consulted. The cache key folds in the completeness gate's
+// expected-audio signal (see virtualProbeCacheKey), and the caller's probe input
+// is often the catalog row or a thin transient built before the served
+// candidate's declared metadata was merged — so a row that carries no audio
+// metadata would otherwise look up the video-only key, retrieve a thin
+// video-without-audio enumeration cached under that expectation, and the caller
+// would merge synthesized candidate audio onto it and report it verified. Doing
+// the forward here, at the one seam every cache-first caller shares, is what
+// makes the key partitioning effective: the lookup key then matches the
+// expectation the real probe would have used.
 func (h *PlaybackHandler) virtualProbeFromCache(
 	ctx context.Context,
 	catalogFile *models.MediaFile,
@@ -3769,6 +3910,7 @@ func (h *PlaybackHandler) virtualProbeFromCache(
 	if h == nil || h.VirtualProbeCacheLookup == nil || catalogFile == nil {
 		return nil
 	}
+	forwardVirtualCandidateDeclaredAudio(&probeFile, probeCand)
 	probed := h.VirtualProbeCacheLookup(sourceURL, &probeFile)
 	if probed == nil {
 		return nil
@@ -4812,6 +4954,7 @@ func (h *PlaybackHandler) probeVirtualCandidateForegroundFallback(
 	// still land if the client has already disconnected.
 	probeCtx, probeCancel := context.WithTimeout(context.WithoutCancel(requestCtx), virtualEvidenceFallbackBudget)
 	defer probeCancel()
+	forwardVirtualCandidateDeclaredAudio(&probeTransient, probeCand)
 	probed, probeErr := h.probeVirtualSource(probeCtx, probeURL, &probeTransient, probeCand.RequestHeaders)
 	if probeErr != nil || probed == nil {
 		// A short-budget fallback timeout leaves the verdict unknown: do not
@@ -6015,6 +6158,7 @@ func (h *PlaybackHandler) resolveVirtualCandidateSource(
 		return &resolved, nil
 	}
 	probeCtx, probeCancel := context.WithTimeout(ctx, virtualProbeBudget)
+	forwardVirtualCandidateDeclaredAudio(&transient, candidate)
 	probed, probeErr := h.probeVirtualSource(probeCtx, streamURL, &transient, candidate.RequestHeaders)
 	probeCancel()
 	if probeErr != nil || probed == nil {
@@ -6600,6 +6744,46 @@ func mergeVirtualCandidateTracks(probed *models.MediaFile, candidate VirtualPlay
 		if !hasDefault {
 			probed.AudioTracks[0].Default = true
 		}
+	}
+}
+
+// forwardVirtualCandidateDeclaredAudio copies a served candidate's declared
+// audio evidence onto the file handed to the prober, so
+// scanner.ProbeVirtualSource can tell a partial enumeration from a genuinely
+// video-only source.
+//
+// The probe input on the background/rotation and fallback paths is the catalog
+// row alone (or a thin probe transient), which can carry no audio declaration
+// even when the candidate the session resolved does — a provider that reports
+// audio languages without a codec, or a fresh alternate-version row whose
+// synthetic tracks have not landed. With no expected-audio signal,
+// scanner.virtualSourceExpectsAudio reports false and the prober accepts a
+// video-with-subtitles-but-no-audio result as complete; the session then
+// publishes that partial menu as verified. Forwarding the declaration closes
+// that path.
+//
+// It forwards only what the candidate carries and never infers audio from a
+// resolution, so a video-only candidate that declares no audio stays a valid,
+// complete enumeration. The synthesized track carries no container index, and
+// applyProbeData replaces the whole audio slice on a complete probe, so the
+// forwarded declaration never survives into persisted probe evidence.
+func forwardVirtualCandidateDeclaredAudio(file *models.MediaFile, cand VirtualPlaybackStream) {
+	if file == nil {
+		return
+	}
+	declaredCodec := strings.TrimSpace(cand.CodecAudio)
+	if strings.TrimSpace(file.CodecAudio) == "" && declaredCodec != "" {
+		file.CodecAudio = declaredCodec
+	}
+	if len(file.AudioTracks) > 0 {
+		return
+	}
+	for _, lang := range cand.AudioLanguages {
+		lang = strings.TrimSpace(lang)
+		if lang == "" || !isRealVirtualLanguageTag(lang) {
+			continue
+		}
+		file.AudioTracks = append(file.AudioTracks, models.AudioTrack{Language: lang, Codec: declaredCodec})
 	}
 }
 

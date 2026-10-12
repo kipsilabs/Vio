@@ -641,15 +641,20 @@ func (h *PlaybackHandler) probeVirtualFallbackSource(ctx context.Context, resolv
 		probeFile.MediaFolderID = file.MediaFolderID
 		probeFile.VirtualOwnerInstallationID = file.VirtualOwnerInstallationID
 	}
-	probed, err := h.probeVirtualSource(probeCtx, resolved.URL, &probeFile, resolved.RequestHeaders)
-	if err != nil || probed == nil {
-		return nil
-	}
 	probeCand := VirtualPlaybackStream{
 		URI:               resolved.URI,
 		CodecAudio:        resolved.CodecAudio,
 		AudioLanguages:    resolved.AudioLanguages,
 		SubtitleLanguages: resolved.SubtitleLanguages,
+	}
+	// The probe input here is an otherwise empty transient, so carry the
+	// resolved candidate's declared audio onto it: without the declaration the
+	// completeness gate cannot tell a partial enumeration from a video-only
+	// source and a video-without-audio result would be treated as complete.
+	forwardVirtualCandidateDeclaredAudio(&probeFile, probeCand)
+	probed, err := h.probeVirtualSource(probeCtx, resolved.URL, &probeFile, resolved.RequestHeaders)
+	if err != nil || probed == nil {
+		return nil
 	}
 	mergeVirtualCandidateTracks(probed, probeCand)
 	return probed

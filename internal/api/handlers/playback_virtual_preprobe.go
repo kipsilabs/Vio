@@ -81,6 +81,14 @@ const (
 	probeOutcomePending  = playback.VirtualProbeOutcomePending
 	probeOutcomeVerified = playback.VirtualProbeOutcomeVerified
 	probeOutcomeFailed   = playback.VirtualProbeOutcomeFailed
+	// probeOutcomePartial is the internal, non-wire disposition of a deferred
+	// probe whose enumeration was incomplete (scanner.ErrVirtualProbePartial).
+	// It is deliberately never written to the session: the session stays
+	// pending, so the client keeps its provisional menu until a complete probe
+	// verifies it or the convergence watchdog fails it at the bound. Returning
+	// it instead of verified is what stops a partial stream table from being
+	// published as a final inventory.
+	probeOutcomePartial = string(ProbeProvenancePartial)
 )
 
 // virtualProbeOutcomeWriter is the session-manager capability that records a
@@ -537,6 +545,15 @@ func (h *PlaybackHandler) runDeferredVirtualProbe(deferred *virtualDeferredProbe
 			// fan-out runs detached and must not spend this worker's gate slot.
 			h.publishDeferredProbeInventory(deferred)
 		}
+	case probeOutcomePartial:
+		// The enumeration was structurally incomplete, so the probe returned
+		// no verdict about the candidate's bytes. The session stays armed
+		// pending (non-verified): a partial inventory is never written to the
+		// session and never published as verified. The convergence watchdog
+		// fails the still-pending lifecycle at the bound if no complete probe
+		// lands first.
+		slog.Warn("deferred virtual probe enumeration incomplete; inventory stays pending",
+			"component", "api", "session", deferred.sessionID, "candidate_uri", deferred.cand.URI)
 	default:
 		// The binding moved under the probe; the new binding owns its own
 		// lifecycle, so no outcome is written.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/Silo-Server/silo-server/internal/models"
@@ -90,6 +91,88 @@ func TestResolveVirtualPlaybackSourceServesFreshProbeCacheEntry(t *testing.T) {
 	}
 	if detailedCalls == 0 {
 		t.Fatal("the provider resolve did not run: the cache short-circuits the probe, not the resolve")
+	}
+}
+
+// TestResolveVirtualPlaybackCacheLookupForwardsCandidateAudio pins the
+// cache-only half of the completeness gate. The synchronous probe input is
+// built from the catalog row, which can carry no audio metadata even when the
+// served candidate declares audio through its language list. The probe cache is
+// keyed on the expected-audio signal, so a lookup that ran before the
+// candidate's declaration was forwarded would take the video-only key,
+// retrieve a thin video-without-audio enumeration cached under that
+// expectation, merge synthesized candidate audio onto it, and report verified
+// while the gate never saw the item's audio. The shared cache helper must
+// forward the candidate's declared audio before consulting the cache; a
+// no-audio lookup here means the fix regressed.
+func TestResolveVirtualPlaybackCacheLookupForwardsCandidateAudio(t *testing.T) {
+	stored := provenanceResolveRow()
+	probeKey := virtualProbeFailureKey(stored.FilePath, stored.VirtualOwnerInstallationID)
+	virtualProbeFailures.clear(probeKey)
+	virtualProbeFailures.clearPartial(probeKey)
+	t.Cleanup(func() {
+		virtualProbeFailures.clear(probeKey)
+		virtualProbeFailures.clearPartial(probeKey)
+	})
+
+	sawAudioExpectation := false
+	cacheHits := 0
+	proberCalls := 0
+	h := virtualProvenanceResolution(stored, func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
+		proberCalls++
+		f.VideoTracks = []models.VideoTrack{{Codec: "h264", Width: 1920, Height: 1080}}
+		f.AudioTracks = []models.AudioTrack{{Codec: "aac", Channels: 2, Language: "fre"}}
+		f.SubtitleTracks = []models.SubtitleTrack{{Index: 2, Codec: "ass", Language: "fre"}}
+		f.CodecVideo, f.CodecAudio, f.Resolution, f.Container = "h264", "aac", "1080p", "mkv"
+		return f, nil
+	})
+	// The candidate declares audio only through its language list; the stored
+	// row carries none.
+	h.VirtualPlaybackStreamLister = VirtualPlaybackStreamListerFunc(func(_ context.Context, _ string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
+		return []VirtualPlaybackStream{{
+			ID: "cand-1", URI: stored.FilePath,
+			Resolution: "1080p", CodecVideo: "h264", Container: "mkv",
+			AudioLanguages: []string{"FRE"},
+		}}, nil
+	})
+	h.VirtualProbeCacheLookup = func(_ string, probeFile *models.MediaFile) *models.MediaFile {
+		sawAudioExpectation = strings.TrimSpace(probeFile.CodecAudio) != "" || len(probeFile.AudioTracks) > 0
+		if sawAudioExpectation {
+			// A thin video-only enumeration is only ever cached under the
+			// video-only expectation, so an audio-expecting lookup misses.
+			return nil
+		}
+		cacheHits++
+		return &models.MediaFile{
+			FilePath: probeFile.FilePath,
+			VideoTracks: []models.VideoTrack{
+				{Codec: "h264", Width: 3840, Height: 2160},
+			},
+			SubtitleTracks: []models.SubtitleTrack{{Index: 2, Codec: "ass", Language: "fre"}},
+			Resolution:     "2160p",
+			CodecVideo:     "h264",
+			Container:      "mkv",
+		}
+	}
+
+	resolved, err := h.resolveVirtualPlaybackSource(provenanceResolveRequest(), stored, "profile-1", false, nil, "", "", 0, false)
+	if err != nil {
+		t.Fatalf("resolveVirtualPlaybackSource error: %v", err)
+	}
+	if !sawAudioExpectation {
+		t.Fatal("the cache lookup ran before the candidate's declared audio was forwarded")
+	}
+	if cacheHits != 0 {
+		t.Fatalf("the video-only cache entry was served %d time(s); the lookup must take the audio expectation's key", cacheHits)
+	}
+	if proberCalls != 1 {
+		t.Fatalf("synchronous prober calls = %d, want 1: the audio-expecting lookup must miss and fall through", proberCalls)
+	}
+	if resolved.Provenance != ProbeProvenanceVerified {
+		t.Fatalf("provenance = %q, want verified from the real audio-bearing probe", resolved.Provenance)
+	}
+	if resolved.File == nil || len(resolved.File.AudioTracks) == 0 {
+		t.Fatalf("resolved file = %#v, want the real probe's audio inventory", resolved.File)
 	}
 }
 

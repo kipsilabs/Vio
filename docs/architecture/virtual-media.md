@@ -33,6 +33,58 @@ authorization, and playback.
    durable plans, or transcode recipes.
 5. The resolver runs at playback time so signed upstream URLs are not persisted.
 
+### Verified inventory requires a complete enumeration
+
+A virtual file's `verified` inventory status means the playback probe returned
+an inventory that passes the completeness gate, not merely that the probe
+returned something. The gate detects one specific structural gap:
+`scanner.ProbeVirtualSource` flags a partial enumeration
+(`scanner.ErrVirtualProbePartial`) when a successful ffprobe result describes
+video but no audio **for an item that declared audio**. It does not prove the
+whole stream table was read — a source can still omit a track the probe never
+enumerated — it refuses to call an obviously truncated read complete.
+Video-only sources exist, so a missing audio stream is only an incomplete read
+when the item's own declared metadata (an audio codec or declared audio track)
+says the source carries audio: then a video-and-no-audio table is a truncated
+read (a relay partial response, an analysis-budget cut-off, or an early return),
+not a video-only file. An item that declares no audio may legitimately enumerate
+video only, and that result is complete. The declaration the probe is judged
+against is carried onto the probe input: the catalog row's own metadata, and,
+on the paths that probe a row alone (the serve-layer rotation probe, the
+stale-source fallback, and the transport fallback), the served candidate's
+provider-declared audio codec or languages, so a row whose synthetic tracks have
+not landed cannot hide the item's audio and let a thin enumeration verify. An
+empty subtitle set is a valid complete answer; it is never a partial signal.
+Finding one audio track does not by itself prove the rest of the table was read,
+so the probe result is not allowed to be its own completeness oracle.
+
+The completeness gate only holds if it actually runs. The playback probe cache
+(`scanner.VirtualProbeCache`) is keyed on the expected-audio signal as well as
+the source, so a result measured under a video-only expectation is never replayed
+to a probe that expects audio. The shared cache-lookup helper
+(`virtualProbeFromCache`) forwards the served candidate's declared audio onto the
+lookup input before consulting the cache, so a caller that built its probe input
+from a row with no audio metadata still looks the cache up under the
+expectation the real probe would have used. Without that, a thin enumeration
+cached for a video-only input would be served to an audio-declaring row — and
+the cache-only recovery path would merge synthesized audio onto it and persist
+it as verified — while the gate never saw it.
+
+A partial probe is not a verdict about the candidate's bytes. The resolve serves
+the candidate without consuming the probe-failure budget or releasing the sticky
+pin, and the deferred lifecycle records no outcome and publishes nothing. On the
+negotiated deferred path the session stays `pending` until a later complete probe
+verifies it or the convergence watchdog fails it at the bound. The
+non-negotiated paths have no session lifecycle for the watchdog to fail, so they
+do not return `pending`: the background probe keeps its own repeated-attempt
+streak, and the synchronous resolve settles immediately on the candidate's
+declared metadata (non-verified). For both, a single partial is never penalized
+(the pin is kept and the failure damper stays clear), and only a persistent
+streak arms the failure damper so the resolve stops re-probing and reuses the
+declared disposition. Synthesized or hint-only tracks (container index < 0) never
+satisfy completeness and never stamp `probe_updated_at`; persisted probe evidence
+requires a real stream index.
+
 ## Indexer-only releases
 
 A title can exist at the indexers before the streaming provider has cached it.
