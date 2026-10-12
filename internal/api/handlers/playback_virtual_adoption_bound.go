@@ -26,19 +26,22 @@ import (
 // retrying the same fenced adoption and instead:
 //
 //   - rotates the evidence onto the catalog row that already owns the live
-//     candidate path when the two rows provably carry the same release, or
-//     writes it metadata-only against the pinned row when the resolver's own
-//     resolved-candidate evidence proves the pin's release; either lands a real
-//     stamp, so the session can verify and a later start stops re-probing; or
-//   - leaves a genuinely foreign release fenced, records a durable terminal
-//     refusal, and reports an actionable terminal instead of looping.
+//     candidate path when the two rows provably carry the same release, landing
+//     a real stamp so the session can verify; or
+//   - leaves a genuinely foreign or unanswerable candidate fenced, records a
+//     durable terminal refusal, and reports an actionable terminal instead of
+//     looping.
+//
+// A same-release renumber never reaches the bound: the resolver's own reported
+// identity proves the row's release in virtualProbeEvidenceSharesRowRelease, so
+// the write is metadata-only against the pin before any refusal is counted.
 //
 // The per-replica count is only the trigger that reaches the bound. The
-// disposition it produces is durable and cross-replica: the same-release
-// metadata write persists a real probe stamp on the row, and the terminal
-// refusal stamps the row's failed_at verdict through the existing fenced
-// marker, so a restarted process or a different replica's resolve gate skips
-// the row instead of repeating the refusal.
+// disposition it produces is durable and cross-replica: a bounded same-release
+// rotation persists a real probe stamp on the owner row, and the terminal
+// refusal stamps the row's failed_at verdict through the existing fenced marker,
+// so a restarted process or a different replica's resolve gate skips the row
+// instead of repeating the refusal.
 //
 // The bound is deliberately small. The refusals it counts are per row and pin,
 // so unrelated rows never share a count, and a refusal stream for one row cannot
