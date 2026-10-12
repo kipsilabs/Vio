@@ -36,12 +36,19 @@ import (
 // identity proves the row's release in virtualProbeEvidenceSharesRowRelease, so
 // the write is metadata-only against the pin before any refusal is counted.
 //
-// The per-replica count is only the trigger that reaches the bound. The
-// disposition it produces is durable and cross-replica: a bounded same-release
-// rotation persists a real probe stamp on the owner row, and the terminal
-// refusal stamps the row's failed_at verdict through the existing fenced marker,
-// so a restarted process or a different replica's resolve gate skips the row
-// instead of repeating the refusal.
+// The count is durable and cluster-wide (VirtualAdoptionRefusalStore), so a
+// restarted process or a different replica continues the same count instead of
+// restarting at zero; the durable terminal decision is therefore reached
+// regardless of which replica served the earlier refusals. The disposition it
+// produces is durable too: a bounded same-release rotation persists a real probe
+// stamp on the owner row, and the terminal refusal stamps the row's failed_at
+// verdict through the existing fenced marker, so every replica's resolve gate
+// skips the row instead of repeating the refusal.
+//
+// An ownership-store lookup failure is deliberately NOT a refusal: it is a
+// recoverable infrastructure error that must never advance this count or install
+// the terminal verdict, so a database outage cannot condemn healthy content. See
+// virtualProbeEvidenceRotateTarget.
 //
 // The bound is deliberately small. The refusals it counts are per row and pin,
 // so unrelated rows never share a count, and a refusal stream for one row cannot
@@ -59,10 +66,9 @@ const (
 	// death loop spans, and short enough that a row whose provider recovers is
 	// not permanently treated as stale.
 	virtualAdoptionRefusalTTL = 10 * time.Minute
-	// virtualAdoptionRefusalMaxEntries caps the process-wide map. Refusals are
-	// bounded in practice by the rows currently failing to adopt; the cap is
-	// enforced, not merely advertised, so a pathological provider cannot grow the
-	// map without bound.
+	// virtualAdoptionRefusalMaxEntries caps the in-memory fallback map used when
+	// no durable store is wired (tests and non-database deployments). The durable
+	// store bounds itself with a TTL and an expired-row sweep.
 	virtualAdoptionRefusalMaxEntries = 4096
 	// virtualProbeRefusalAdoptionBoundExhausted names a required adoption refused
 	// virtualAdoptionRefusalBound or more consecutive times for one row and pin,
@@ -70,7 +76,39 @@ const (
 	// the write carries so an operator sees an exhausted refusal rather than
 	// another transient miss. The SQL fence itself is unchanged.
 	virtualProbeRefusalAdoptionBoundExhausted = "adoption_refusal_bound_exhausted"
+
+	// virtualOwnerLookupBackoffTTL is how long a failed ownership lookup backs
+	// off before the next probe re-asks the store. It is short: a database outage
+	// that clears quickly resumes immediately after the window, and the backoff
+	// never records durable failure.
+	virtualOwnerLookupBackoffTTL = 30 * time.Second
+	// virtualOwnerLookupBackoffMaxEntries caps the in-memory owner-lookup backoff
+	// map so a pathological store outage cannot grow it without bound.
+	virtualOwnerLookupBackoffMaxEntries = 4096
 )
+
+// VirtualAdoptionRefusalStore is the durable, cluster-wide consecutive-refusal
+// state behind the bounded adoption decision. The production implementation is
+// the scanner's Postgres-backed FileRepository (an atomic ON CONFLICT upsert
+// with a TTL, plus a fenced clear on success); the in-memory
+// virtualAdoptionRefusalCache is the fallback for tests and for callers that
+// run without a database.
+//
+// Every method reports a store error rather than a decision: a caller must
+// treat an error as a recoverable infrastructure failure, never as a refusal and
+// never as a reached bound.
+type VirtualAdoptionRefusalStore interface {
+	// RecordVirtualAdoptionRefusal atomically increments the live consecutive
+	// count for one row and pinned path and returns the new count. An entry older
+	// than ttl restarts at one.
+	RecordVirtualAdoptionRefusal(ctx context.Context, fileID int, expectedPath string, ttl time.Duration) (int, error)
+	// ClearVirtualAdoptionRefusal drops the mark after a write landed, resetting
+	// the bound. A missing mark is not an error.
+	ClearVirtualAdoptionRefusal(ctx context.Context, fileID int, expectedPath string) error
+	// CountVirtualAdoptionRefusal returns the live count without incrementing it,
+	// so a caller can decide whether the bound was reached.
+	CountVirtualAdoptionRefusal(ctx context.Context, fileID int, expectedPath string) (int, error)
+}
 
 // virtualAdoptionRefusalMark is one row/pin's consecutive-refusal state.
 type virtualAdoptionRefusalMark struct {
@@ -79,10 +117,8 @@ type virtualAdoptionRefusalMark struct {
 }
 
 // virtualAdoptionRefusalCache counts consecutive evidence-adoption refusals for
-// a row and pin. It is package-level because the handler is shared across
-// requests and the count must survive a session close and the later resume that
-// repeats the same refusal; the small map is bounded and expires idle entries.
-// now is injectable for tests and defaults to time.Now; maxEntries overrides the
+// a row and pin. It is the in-memory fallback store: bounded and expiring. now
+// is injectable for tests and defaults to time.Now; maxEntries overrides the
 // default cap for tests that prove the enforcement.
 type virtualAdoptionRefusalCache struct {
 	mu         sync.Mutex
@@ -107,15 +143,24 @@ func (c *virtualAdoptionRefusalCache) capacity() int {
 	return virtualAdoptionRefusalMaxEntries
 }
 
-// mark records one more consecutive refusal for key and returns the new count.
-// An expired mark restarts the count, so a refusal stream separated by more than
-// the TTL does not accumulate. The map never exceeds capacity: expired marks are
-// dropped first, and if every mark is live the soonest-expiring one is evicted to
-// make room, so a burst of distinct rows cannot grow the map past the advertised
-// maximum.
+// mark records one more consecutive refusal for key with the default TTL and
+// returns the new count.
 func (c *virtualAdoptionRefusalCache) mark(key string) int {
+	return c.markTTL(key, virtualAdoptionRefusalTTL)
+}
+
+// markTTL records one more consecutive refusal for key and returns the new
+// count. An expired mark restarts the count, so a refusal stream separated by
+// more than ttl does not accumulate. The map never exceeds capacity: expired
+// marks are dropped first, and if every mark is live the soonest-expiring one is
+// evicted to make room, so a burst of distinct rows cannot grow the map past the
+// advertised maximum.
+func (c *virtualAdoptionRefusalCache) markTTL(key string, ttl time.Duration) int {
 	if c == nil || key == "" {
 		return 0
+	}
+	if ttl <= 0 {
+		ttl = virtualAdoptionRefusalTTL
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -136,7 +181,7 @@ func (c *virtualAdoptionRefusalCache) mark(key string) int {
 	if prev, ok := c.marks[key]; ok && now.Before(prev.expiresAt) {
 		count = prev.count + 1
 	}
-	c.marks[key] = virtualAdoptionRefusalMark{count: count, expiresAt: now.Add(virtualAdoptionRefusalTTL)}
+	c.marks[key] = virtualAdoptionRefusalMark{count: count, expiresAt: now.Add(ttl)}
 	return count
 }
 
@@ -169,6 +214,25 @@ func (c *virtualAdoptionRefusalCache) clear(key string) {
 	delete(c.marks, key)
 }
 
+// RecordVirtualAdoptionRefusal implements VirtualAdoptionRefusalStore for the
+// in-memory fallback.
+func (c *virtualAdoptionRefusalCache) RecordVirtualAdoptionRefusal(_ context.Context, fileID int, expectedPath string, ttl time.Duration) (int, error) {
+	return c.markTTL(virtualAdoptionRefusalKey(fileID, expectedPath), ttl), nil
+}
+
+// ClearVirtualAdoptionRefusal implements VirtualAdoptionRefusalStore for the
+// in-memory fallback.
+func (c *virtualAdoptionRefusalCache) ClearVirtualAdoptionRefusal(_ context.Context, fileID int, expectedPath string) error {
+	c.clear(virtualAdoptionRefusalKey(fileID, expectedPath))
+	return nil
+}
+
+// CountVirtualAdoptionRefusal implements VirtualAdoptionRefusalStore for the
+// in-memory fallback.
+func (c *virtualAdoptionRefusalCache) CountVirtualAdoptionRefusal(_ context.Context, fileID int, expectedPath string) (int, error) {
+	return c.count(virtualAdoptionRefusalKey(fileID, expectedPath)), nil
+}
+
 // pruneLocked drops expired marks. Caller holds c.mu.
 func (c *virtualAdoptionRefusalCache) pruneLocked(now time.Time) {
 	for k, mark := range c.marks {
@@ -193,9 +257,19 @@ func (c *virtualAdoptionRefusalCache) evictSoonestLocked() {
 	}
 }
 
-// virtualAdoptionRefusals is the process-wide bounded refusal counter. Tests may
-// clear entries directly.
+// virtualAdoptionRefusals is the process-wide in-memory fallback store: it
+// backs the saver path and tests when no durable store is wired. Tests may clear
+// entries directly.
 var virtualAdoptionRefusals = &virtualAdoptionRefusalCache{marks: make(map[string]virtualAdoptionRefusalMark)}
+
+// adoptionRefusalStore returns the handler's durable store, or the in-memory
+// fallback when none is wired.
+func (h *PlaybackHandler) adoptionRefusalStore() VirtualAdoptionRefusalStore {
+	if h != nil && h.VirtualAdoptionRefusalStore != nil {
+		return h.VirtualAdoptionRefusalStore
+	}
+	return virtualAdoptionRefusals
+}
 
 // virtualAdoptionRefusalKey names one row and pin for the refusal bound. The
 // expected path is the pin the row carried when the adoption was requested, so a
@@ -214,10 +288,75 @@ func virtualAdoptionRefusalKeyForArgs(args models.VirtualFilePersistArgs) string
 	return virtualAdoptionRefusalKey(args.FileID, args.ExpectedFilePath)
 }
 
-// virtualAdoptionRefusalBoundReached reports whether this write's row and pin
-// have already refused enough consecutive adoptions to treat the pin as stale.
-func virtualAdoptionRefusalBoundReached(args models.VirtualFilePersistArgs) bool {
-	return virtualAdoptionRefusals.count(virtualAdoptionRefusalKeyForArgs(args)) >= virtualAdoptionRefusalBound
+// recordAdoptionRefusalStore records one consecutive refusal for a row and pin
+// through store and returns the new count. A store error is a recoverable
+// infrastructure failure: it is logged and reported as an unknown count (zero),
+// never as a reached bound, so a database outage neither advances nor resets the
+// durable decision.
+func recordAdoptionRefusalStore(ctx context.Context, store VirtualAdoptionRefusalStore, fileID int, expectedPath string) int {
+	if store == nil {
+		store = virtualAdoptionRefusals
+	}
+	if fileID <= 0 || strings.TrimSpace(expectedPath) == "" {
+		return 0
+	}
+	count, err := store.RecordVirtualAdoptionRefusal(ctx, fileID, expectedPath, virtualAdoptionRefusalTTL)
+	if err != nil {
+		slog.WarnContext(ctx, "virtual adoption refusal count was not recorded; treating the store error as recoverable, not as a refusal",
+			"component", "api", "file_id", fileID, "expected_path", expectedPath, virtualEvidenceLogKeyError, err)
+		return 0
+	}
+	return count
+}
+
+// clearAdoptionRefusalStore drops the refusal mark for a row and pin after a
+// write landed. Best-effort: a store error is logged and retried by the next
+// successful write, which clears the mark again.
+func clearAdoptionRefusalStore(ctx context.Context, store VirtualAdoptionRefusalStore, fileID int, expectedPath string) {
+	if store == nil {
+		store = virtualAdoptionRefusals
+	}
+	if fileID <= 0 || strings.TrimSpace(expectedPath) == "" {
+		return
+	}
+	if err := store.ClearVirtualAdoptionRefusal(ctx, fileID, expectedPath); err != nil {
+		slog.WarnContext(ctx, "virtual adoption refusal mark was not cleared after a successful write",
+			"component", "api", "file_id", fileID, "expected_path", expectedPath, virtualEvidenceLogKeyError, err)
+	}
+}
+
+// countAdoptionRefusalStore returns the live refusal count for a row and pin, or
+// -1 when the store could not be read. The negative sentinel lets a caller
+// distinguish "no refusals" from "unknown" so a store error never reads as a
+// reached bound.
+func countAdoptionRefusalStore(ctx context.Context, store VirtualAdoptionRefusalStore, fileID int, expectedPath string) int {
+	if store == nil {
+		store = virtualAdoptionRefusals
+	}
+	if fileID <= 0 || strings.TrimSpace(expectedPath) == "" {
+		return 0
+	}
+	count, err := store.CountVirtualAdoptionRefusal(ctx, fileID, expectedPath)
+	if err != nil {
+		slog.WarnContext(ctx, "virtual adoption refusal count could not be read; not treating the bound as reached",
+			"component", "api", "file_id", fileID, "expected_path", expectedPath, virtualEvidenceLogKeyError, err)
+		return -1
+	}
+	return count
+}
+
+// adoptionRefusalBoundReached reports whether this write's row and pin have
+// already refused enough consecutive adoptions to treat the pin as stale. A
+// store error is not a reached bound.
+func (h *PlaybackHandler) adoptionRefusalBoundReached(ctx context.Context, args models.VirtualFilePersistArgs) bool {
+	count := countAdoptionRefusalStore(ctx, h.adoptionRefusalStore(), args.FileID, args.ExpectedFilePath)
+	return count >= virtualAdoptionRefusalBound
+}
+
+// adoptionRefusalStoreCount records one refusal for a row and pin through the
+// handler's durable store and returns the new count.
+func (h *PlaybackHandler) adoptionRefusalStoreCount(ctx context.Context, fileID int, expectedPath string) int {
+	return recordAdoptionRefusalStore(ctx, h.adoptionRefusalStore(), fileID, expectedPath)
 }
 
 // markVirtualAdoptionTerminalRefusal installs the durable, cross-replica terminal
@@ -225,8 +364,8 @@ func virtualAdoptionRefusalBoundReached(args models.VirtualFilePersistArgs) bool
 // virtualAdoptionRefusalBound times without a candidate the resolver can tie to
 // the pin. It stamps the row's failed_at verdict through the same fenced marker
 // the transport-failure path uses, so every replica's resolve and probe gate
-// skips the row and a restarted process does not restart the loop. The
-// in-process count is only the trigger; this durable stamp is what actually stops
+// skips the row and a restarted process does not restart the loop. The durable
+// count is only the trigger; this durable stamp is what actually stops
 // subsequent attempts. It returns whether a marker was installed.
 func (h *PlaybackHandler) markVirtualAdoptionTerminalRefusal(ctx context.Context, row *models.MediaFile, reason string) bool {
 	if h == nil || row == nil || row.ID <= 0 || h.VirtualCandidateFailMarker == nil {
@@ -241,4 +380,127 @@ func (h *PlaybackHandler) markVirtualAdoptionTerminalRefusal(ctx context.Context
 	slog.ErrorContext(ctx, "virtual adoption terminal refusal persisted",
 		"component", "api", "file_id", row.ID, "candidate_path", row.FilePath, virtualEvidenceLogKeyReason, reason)
 	return true
+}
+
+// virtualOwnerLookupBackoff is a bounded, expiring, in-memory marker set for
+// failed path-ownership lookups. It backs off the ownership question after a
+// store error so a database outage does not re-hit the store on every probe, and
+// it NEVER records durable failure: the marker expires on its own, a successful
+// lookup clears it immediately, and nothing about it feeds the adoption-refusal
+// bound or the failed_at verdict.
+type virtualOwnerLookupBackoff struct {
+	mu         sync.Mutex
+	marks      map[string]time.Time
+	now        func() time.Time
+	ttl        time.Duration
+	maxEntries int
+}
+
+func (c *virtualOwnerLookupBackoff) clock() time.Time {
+	if c != nil && c.now != nil {
+		return c.now()
+	}
+	return time.Now()
+}
+
+func (c *virtualOwnerLookupBackoff) window() time.Duration {
+	if c != nil && c.ttl > 0 {
+		return c.ttl
+	}
+	return virtualOwnerLookupBackoffTTL
+}
+
+func (c *virtualOwnerLookupBackoff) capacity() int {
+	if c != nil && c.maxEntries > 0 {
+		return c.maxEntries
+	}
+	return virtualOwnerLookupBackoffMaxEntries
+}
+
+// recent reports whether key is inside its backoff window. An expired mark is
+// dropped on read.
+func (c *virtualOwnerLookupBackoff) recent(key string) bool {
+	if c == nil || key == "" {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	expiresAt, ok := c.marks[key]
+	if !ok {
+		return false
+	}
+	if !c.clock().Before(expiresAt) {
+		delete(c.marks, key)
+		return false
+	}
+	return true
+}
+
+// mark starts (or restarts) key's backoff window.
+func (c *virtualOwnerLookupBackoff) mark(key string) {
+	if c == nil || key == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.marks == nil {
+		c.marks = make(map[string]time.Time)
+	}
+	now := c.clock()
+	capacity := c.capacity()
+	for len(c.marks) >= capacity {
+		if !c.pruneExpiredLocked(now) {
+			c.evictSoonestLocked()
+		}
+	}
+	c.marks[key] = now.Add(c.window())
+}
+
+// clear ends key's backoff window after a successful lookup.
+func (c *virtualOwnerLookupBackoff) clear(key string) {
+	if c == nil || key == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.marks, key)
+}
+
+// pruneExpiredLocked drops expired marks and reports whether it removed any.
+func (c *virtualOwnerLookupBackoff) pruneExpiredLocked(now time.Time) bool {
+	removed := false
+	for k, expiresAt := range c.marks {
+		if !now.Before(expiresAt) {
+			delete(c.marks, k)
+			removed = true
+		}
+	}
+	return removed
+}
+
+// evictSoonestLocked drops the mark closest to expiry. Caller holds c.mu.
+func (c *virtualOwnerLookupBackoff) evictSoonestLocked() {
+	victim := ""
+	var victimAt time.Time
+	for k, expiresAt := range c.marks {
+		if victim == "" || expiresAt.Before(victimAt) {
+			victim, victimAt = k, expiresAt
+		}
+	}
+	if victim != "" {
+		delete(c.marks, victim)
+	}
+}
+
+// virtualOwnerLookups is the process-wide owner-lookup backoff. Tests may
+// override its clock or TTL.
+var virtualOwnerLookups = &virtualOwnerLookupBackoff{marks: make(map[string]time.Time)}
+
+// virtualOwnerLookupBackoffKey names one row and candidate path for the
+// recoverable ownership-lookup backoff.
+func virtualOwnerLookupBackoffKey(fileID int, candidateURI string) string {
+	if fileID <= 0 {
+		return ""
+	}
+	return strconv.Itoa(fileID) + "\x00" + strings.TrimSpace(candidateURI)
 }
