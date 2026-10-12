@@ -214,13 +214,14 @@ export default function DownloadVersionPicker({
   useEffect(() => {
     if (!preparingId) return;
     const generation = ++pollGeneration.current;
+    const downloadId = preparingId;
     const controller = new AbortController();
     const isCurrent = () => pollGeneration.current === generation && !controller.signal.aborted;
     let timer: number | undefined;
     async function poll(): Promise<void> {
       let entry: PreparedDownloadEntry | null = null;
       try {
-        entry = await getPreparedDownload(preparingId, controller.signal);
+        entry = await getPreparedDownload(downloadId, controller.signal);
       } catch {
         if (isCurrent()) timer = window.setTimeout(() => void poll(), 2000);
         return;
@@ -237,7 +238,7 @@ export default function DownloadVersionPicker({
       }
       if (entry.status === "ready") {
         setVirtualReady({
-          id: preparingId,
+          id: downloadId,
           filename: pendingFilenameRef.current,
           fileSize: entry.file_size,
         });
