@@ -570,9 +570,15 @@ type PlaybackHandler struct {
 	// by paths that must distinguish metadata persistence from identity
 	// adoption (stale fallback, evidence workers). Nil keeps legacy behavior.
 	VirtualFileMetadataSaver VirtualFileMetadataSaver
-	VirtualSubtitleSearcher  SubtitleSearchTrigger
-	SubtitleSearchInFlight   *sync.Map
-	DeviceCapabilitySource   DeviceCapabilityProfileSource
+	// VirtualAdoptionRefusalStore is the durable, cluster-wide consecutive
+	// evidence-adoption refusal counter behind the bounded-adoption decision.
+	// When nil the in-memory fallback is used (tests, non-database deployments);
+	// production wires the scanner's Postgres-backed store so a restart or a
+	// different replica continues the same count.
+	VirtualAdoptionRefusalStore VirtualAdoptionRefusalStore
+	VirtualSubtitleSearcher     SubtitleSearchTrigger
+	SubtitleSearchInFlight      *sync.Map
+	DeviceCapabilitySource      DeviceCapabilityProfileSource
 	// PlaybackConfig returns the current playback config (ffmpeg path,
 	// hwaccel, transcode dir). Wired to the live config in integrated mode
 	// so admin changes apply to newly started transcodes. Read it through

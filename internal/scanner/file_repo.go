@@ -2041,6 +2041,105 @@ func (r *FileRepository) MarkVirtualCandidateRecovered(ctx context.Context, file
 	return err
 }
 
+// recordVirtualAdoptionRefusalSQL atomically increments the consecutive-refusal
+// count for one (file, pinned path). The CASE restarts the count when the
+// previous mark has expired, so a refusal stream separated by more than the TTL
+// does not accumulate; the ON CONFLICT upsert makes the increment safe under
+// concurrent replicas.
+const recordVirtualAdoptionRefusalSQL = `
+	INSERT INTO virtual_adoption_refusals (file_id, expected_path, refusal_count, expires_at)
+	VALUES ($1, $2, 1, now() + ($3 * interval '1 second'))
+	ON CONFLICT (file_id, expected_path) DO UPDATE
+	SET refusal_count = CASE
+	        WHEN virtual_adoption_refusals.expires_at > now()
+	        THEN virtual_adoption_refusals.refusal_count + 1
+	        ELSE 1
+	    END,
+	    expires_at = now() + ($3 * interval '1 second')
+	RETURNING refusal_count
+`
+
+// sweepVirtualAdoptionRefusalsSQL deletes a bounded batch of expired marks so
+// the table cannot retain refusal state past its window. It is best-effort and
+// intentionally bounded: the sweep runs alongside the rare refusal write, not as
+// a table-wide scan.
+const sweepVirtualAdoptionRefusalsSQL = `
+	DELETE FROM virtual_adoption_refusals
+	WHERE ctid IN (
+	    SELECT ctid FROM virtual_adoption_refusals
+	    WHERE expires_at <= now()
+	    LIMIT $1
+	)
+`
+
+// virtualAdoptionRefusalSweepBatch caps how many expired marks one refusal write
+// reclaims.
+const virtualAdoptionRefusalSweepBatch = 512
+
+// RecordVirtualAdoptionRefusal atomically increments the durable
+// consecutive-refusal count for one virtual row and pinned path and returns the
+// new count. It is the cross-replica trigger that reaches the bounded-refusal
+// decision: a restarted process or a different replica continues the same count
+// instead of restarting at zero, so the durable terminal decision is reached
+// regardless of which replica served the earlier refusals. An entry older than
+// ttl is treated as absent and restarts at one, so a provider that recovers is
+// not permanently treated as stale.
+//
+// It returns the current database error unchanged; callers must treat a store
+// error as a recoverable infrastructure failure, never as a refusal.
+func (r *FileRepository) RecordVirtualAdoptionRefusal(ctx context.Context, fileID int, expectedPath string, ttl time.Duration) (int, error) {
+	if r == nil || r.pool == nil {
+		return 0, errors.New("file repository is not configured")
+	}
+	if fileID <= 0 || strings.TrimSpace(expectedPath) == "" || ttl <= 0 {
+		return 0, nil
+	}
+	var count int
+	if err := r.pool.QueryRow(ctx, recordVirtualAdoptionRefusalSQL, fileID, expectedPath, ttl.Seconds()).Scan(&count); err != nil {
+		return 0, err
+	}
+	// Bounded, best-effort reclamation of expired marks; a failure here changes
+	// nothing about the count just recorded.
+	_, _ = r.pool.Exec(ctx, sweepVirtualAdoptionRefusalsSQL, virtualAdoptionRefusalSweepBatch)
+	return count, nil
+}
+
+// ClearVirtualAdoptionRefusal drops the durable refusal mark for one row and
+// pinned path after a write landed, so the bound resets on success. A missing
+// row is not an error.
+func (r *FileRepository) ClearVirtualAdoptionRefusal(ctx context.Context, fileID int, expectedPath string) error {
+	if r == nil || r.pool == nil {
+		return errors.New("file repository is not configured")
+	}
+	if fileID <= 0 || strings.TrimSpace(expectedPath) == "" {
+		return nil
+	}
+	_, err := r.pool.Exec(ctx, `DELETE FROM virtual_adoption_refusals WHERE file_id = $1 AND expected_path = $2`, fileID, expectedPath)
+	return err
+}
+
+// CountVirtualAdoptionRefusal returns the live durable consecutive-refusal count
+// for one row and pinned path, or zero when no live mark exists. It never
+// increments, so a caller can decide whether the bound was reached without
+// itself advancing the count.
+func (r *FileRepository) CountVirtualAdoptionRefusal(ctx context.Context, fileID int, expectedPath string) (int, error) {
+	if r == nil || r.pool == nil {
+		return 0, errors.New("file repository is not configured")
+	}
+	if fileID <= 0 || strings.TrimSpace(expectedPath) == "" {
+		return 0, nil
+	}
+	var count int
+	err := r.pool.QueryRow(ctx, `SELECT refusal_count FROM virtual_adoption_refusals WHERE file_id = $1 AND expected_path = $2 AND expires_at > now()`, fileID, expectedPath).Scan(&count)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
 func virtualCandidateSelection(raw string) bool {
 	parsed, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil {

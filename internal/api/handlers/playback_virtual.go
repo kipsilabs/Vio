@@ -4552,6 +4552,22 @@ type VirtualFileMetadataUpdateResult struct {
 // QueryRow consumes the full result stream before Scan returns, so a terminal
 // database error cannot hide behind an already-read row.
 func ExecVirtualFileMetadataUpdateResult(ctx context.Context, db VirtualFileMetadataDB, args models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error) {
+	return execVirtualFileMetadataUpdateResult(ctx, db, args, virtualAdoptionRefusals)
+}
+
+// ExecVirtualFileMetadataUpdateResultWithRefusals is
+// ExecVirtualFileMetadataUpdateResult with an explicit durable refusal store, so
+// production wiring records the consecutive refusal through the cluster-wide
+// store instead of the in-memory fallback.
+func ExecVirtualFileMetadataUpdateResultWithRefusals(ctx context.Context, db VirtualFileMetadataDB, args models.VirtualFilePersistArgs, store VirtualAdoptionRefusalStore) (VirtualFileMetadataUpdateResult, error) {
+	return execVirtualFileMetadataUpdateResult(ctx, db, args, store)
+}
+
+// execVirtualFileMetadataUpdateResult is the shared implementation behind
+// ExecVirtualFileMetadataUpdateResult and its WithRefusals variant. store is the
+// refusal counter that records a refused required adoption and clears on
+// success; nil falls back to the in-memory store.
+func execVirtualFileMetadataUpdateResult(ctx context.Context, db VirtualFileMetadataDB, args models.VirtualFilePersistArgs, store VirtualAdoptionRefusalStore) (VirtualFileMetadataUpdateResult, error) {
 	if db == nil {
 		return VirtualFileMetadataUpdateResult{}, nil
 	}
@@ -4637,10 +4653,13 @@ func ExecVirtualFileMetadataUpdateResult(ctx context.Context, db VirtualFileMeta
 				if reason == "" {
 					reason = virtualProbeRefusalUnclassified
 				}
+				refusals := recordAdoptionRefusalStore(ctx, store, args.FileID, args.ExpectedFilePath)
 				slog.WarnContext(ctx, "virtual probe evidence persist refused: required identity adoption matched no row",
 					"component", "api", "file_id", args.FileID, "adopt_path", args.AdoptPath,
 					"expected_path", args.ExpectedFilePath,
-					"reason", reason)
+					virtualEvidenceLogKeyReason, reason, "consecutive_refusals", refusals,
+					"refusal_bound", virtualAdoptionRefusalBound,
+					"bound_reached", refusals >= virtualAdoptionRefusalBound)
 				return VirtualFileMetadataUpdateResult{}, fmt.Errorf("%w: candidate %s was not adopted", errVirtualAdoptIdentityNotPersisted, args.AdoptPath)
 			}
 			return VirtualFileMetadataUpdateResult{}, nil
@@ -4651,6 +4670,9 @@ func ExecVirtualFileMetadataUpdateResult(ctx context.Context, db VirtualFileMeta
 			// substitute the catalog row does not own.
 			return VirtualFileMetadataUpdateResult{}, fmt.Errorf("%w: candidate %s persisted as %q", errVirtualAdoptIdentityNotPersisted, args.AdoptPath, persistedPath)
 		}
+		// The write landed. Any consecutive-refusal count for this row and pin is
+		// stale: the row now carries evidence, so the bound resets.
+		clearAdoptionRefusalStore(ctx, store, args.FileID, args.ExpectedFilePath)
 		return VirtualFileMetadataUpdateResult{
 			RowsAffected:    1,
 			MetadataUpdated: true,
@@ -4682,6 +4704,13 @@ func ExecVirtualFileMetadataUpdateResult(ctx context.Context, db VirtualFileMeta
 		// The metadata-only retry also missed the CAS fence.
 		return VirtualFileMetadataUpdateResult{}, nil
 	}
+	// The retry wrote fresh evidence on the current row (it deliberately did not
+	// adopt the requested identity). The row now carries evidence, so any
+	// consecutive-refusal count for this row and pin is stale and must be
+	// cleared exactly as the ordinary success path does; otherwise a later
+	// unrelated refusal would inherit the pre-success count and reach the
+	// terminal threshold prematurely.
+	clearAdoptionRefusalStore(ctx, store, args.FileID, args.ExpectedFilePath)
 	return VirtualFileMetadataUpdateResult{
 		RowsAffected:    1,
 		MetadataUpdated: true,
@@ -4691,7 +4720,16 @@ func ExecVirtualFileMetadataUpdateResult(ctx context.Context, db VirtualFileMeta
 
 // ExecVirtualFileMetadataUpdate preserves the historical row-count contract.
 func ExecVirtualFileMetadataUpdate(ctx context.Context, db VirtualFileMetadataDB, args models.VirtualFilePersistArgs) (int64, error) {
-	result, err := ExecVirtualFileMetadataUpdateResult(ctx, db, args)
+	return execVirtualFileMetadataUpdateRows(ExecVirtualFileMetadataUpdateResult(ctx, db, args))
+}
+
+// ExecVirtualFileMetadataUpdateWithRefusals is ExecVirtualFileMetadataUpdate
+// with an explicit durable refusal store.
+func ExecVirtualFileMetadataUpdateWithRefusals(ctx context.Context, db VirtualFileMetadataDB, args models.VirtualFilePersistArgs, store VirtualAdoptionRefusalStore) (int64, error) {
+	return execVirtualFileMetadataUpdateRows(ExecVirtualFileMetadataUpdateResultWithRefusals(ctx, db, args, store))
+}
+
+func execVirtualFileMetadataUpdateRows(result VirtualFileMetadataUpdateResult, err error) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
@@ -4845,22 +4883,47 @@ func (h *PlaybackHandler) virtualProbeEvidenceArgs(ctx context.Context, catalogF
 // The owner question goes through virtualPathOwnerRow and nothing else: the
 // guard asserts ContentID, EpisodeID, owner installation, library and the exact
 // concrete path, and fails closed on a lookup error or an incomplete row. A
-// guard error, or a refusal to name an owner for a path a sibling actually
-// holds, keeps the previous behavior: the write is refused (or classified and
-// left to the SQL fence) rather than adopting bytes whose owner is unknown. The
-// refusal is logged with the concrete cause, never a lumped bucket.
+// lookup error is an infrastructure failure, not an identity verdict: it backs
+// the ownership question off for a short window and never advances the
+// adoption-refusal bound, so a database outage cannot condemn healthy content.
+// A refusal to name an owner for a path a sibling actually holds keeps the
+// previous behavior: the write is refused (or classified and left to the SQL
+// fence) rather than adopting bytes whose owner is unknown. Every refusal is
+// logged with the concrete cause, never a lumped bucket.
 func (h *PlaybackHandler) virtualProbeEvidenceRotateTarget(ctx context.Context, catalogFile *models.MediaFile, resolvedPath string, probed *models.MediaFile, candidate resolver.PersistedIdentityTiers) (*models.MediaFile, *models.MediaFile, bool) {
 	if virtualProbeEvidenceSharesRowRelease(catalogFile, resolvedPath, candidate) {
 		return catalogFile, probed, true
 	}
+	backoffKey := virtualOwnerLookupBackoffKey(catalogFile.ID, resolvedPath)
+	if virtualOwnerLookups.recent(backoffKey) {
+		// A previous ownership lookup failed and its short backoff is still
+		// active: skip re-asking a failing store on every probe. The write stays
+		// fenced and the live session is served in memory. The window lapses on
+		// its own and a later successful lookup clears it, so nothing here is
+		// durable and nothing condemns the row.
+		slog.DebugContext(ctx, "virtual probe evidence: path ownership lookup is backing off after a store failure",
+			"component", "api", "file_id", catalogFile.ID, "candidate_uri", resolvedPath)
+		h.publishRefusedProbeInventory(ctx, catalogFile.ID, resolvedPath, probed)
+		return nil, nil, false
+	}
 	ownerRow, ownerErr := h.virtualPathOwnerRow(ctx, catalogFile, resolvedPath, catalogFile.VirtualOwnerInstallationID, catalogFile.MediaFolderID)
 	if ownerErr != nil {
 		// An unanswered ownership question is not safe absence: fail closed
-		// rather than adopt or stamp bytes whose owner is unknown.
-		slog.WarnContext(ctx, "virtual probe evidence refused: candidate path ownership is unknown",
+		// rather than adopt or stamp bytes whose owner is unknown. But the store
+		// could not answer, which is an infrastructure failure, not an identity
+		// verdict: it must never advance the adoption-refusal bound or install
+		// the durable terminal failed_at verdict, or a database outage would
+		// suppress healthy content. Back the ownership question off for a short
+		// window and serve the live session in memory; the next probe after the
+		// window re-asks.
+		virtualOwnerLookups.mark(backoffKey)
+		slog.WarnContext(ctx, "virtual probe evidence refused: candidate path ownership lookup failed; backing off without counting",
 			"component", "api", "file_id", catalogFile.ID, "candidate_uri", resolvedPath,
 			"row_path", catalogFile.FilePath, "probe_source", catalogFile.ProbeSource,
-			"reason", virtualProbeRefusalOwnerLookupFailed, "error", ownerErr)
+			virtualEvidenceLogKeyReason, virtualProbeRefusalOwnerLookupFailed,
+			virtualEvidenceLogKeyError, ownerErr,
+			"backoff_seconds", virtualOwnerLookups.window().Seconds(),
+			"terminal", false)
 		// The catalog write is correctly blocked, but the live session must not
 		// stay stale: serve the probed tracks in memory to sessions bound to
 		// this row's exact candidate. The publish is best-effort and writes
@@ -4868,20 +4931,34 @@ func (h *PlaybackHandler) virtualProbeEvidenceRotateTarget(ctx context.Context, 
 		h.publishRefusedProbeInventory(ctx, catalogFile.ID, resolvedPath, probed)
 		return nil, nil, false
 	}
+	// The lookup answered: any prior backoff for this row and candidate path is
+	// stale.
+	virtualOwnerLookups.clear(backoffKey)
 	if ownerRow != nil && ownerRow.ID != catalogFile.ID {
 		if virtualSiblingOwnerSharesRelease(catalogFile, ownerRow) {
 			// Duplicate catalog rows for one release share candidate URIs and
 			// neutral keys. Rotating here would overlay the requested row's
 			// probed inventory onto its duplicate sibling (and, on the reverse
 			// probe, the sibling's onto the requested row): exactly the silent
-			// cross-row contamination this guard exists to stop. Refuse the
-			// write outright — a metadata write on the requested row would be
-			// refused by the SQL sibling fence anyway — and serve the probed
-			// tracks in memory only to sessions bound to the requested row id,
-			// so the playing menu stays live while no sibling row is repainted.
+			// cross-row contamination this guard exists to stop. The refusal is
+			// safe, but it is also unbounded: a duplicate row whose pin never
+			// adopts keeps serving provisional evidence forever. Count it, and
+			// after the bound rotate the evidence onto the owning row anyway —
+			// both rows provably carry the same release, so the probed bytes are
+			// that release's bytes and no foreign inventory crosses rows.
+			refusals := h.adoptionRefusalStoreCount(ctx, catalogFile.ID, catalogFile.FilePath)
+			if refusals >= virtualAdoptionRefusalBound {
+				rotated := rotateVirtualSourceToOwnerRow(probed, ownerRow, resolvedPath)
+				slog.InfoContext(ctx, "virtual probe evidence rotation to same-release owner row after bounded refusals",
+					"component", "api", "requested_file_id", catalogFile.ID, "owner_file_id", ownerRow.ID,
+					"candidate_uri", resolvedPath, "consecutive_refusals", refusals,
+					virtualEvidenceLogKeyReason, "sibling_owner_same_release_bound_rotation")
+				return rotated, rotated, true
+			}
 			slog.WarnContext(ctx, "virtual probe evidence rotation refused: sibling owner row is a duplicate of the same release",
 				"component", "api", "requested_file_id", catalogFile.ID, "owner_file_id", ownerRow.ID,
-				"candidate_uri", resolvedPath, "reason", "sibling_owner_same_release")
+				"candidate_uri", resolvedPath, virtualEvidenceLogKeyReason, "sibling_owner_same_release",
+				"consecutive_refusals", refusals, "refusal_bound", virtualAdoptionRefusalBound)
 			h.publishRefusedProbeInventory(ctx, catalogFile.ID, resolvedPath, probed)
 			return nil, nil, false
 		}
@@ -5044,6 +5121,21 @@ func (h *PlaybackHandler) virtualProbeEvidenceArgsForRow(ctx context.Context, ca
 	}
 	if crossRelease {
 		args.RefusalReason = h.virtualProbeEvidenceRefusalReason(ctx, catalogFile, resolvedPath)
+		// Bounded refusal. A genuinely foreign release can never be adopted or
+		// folded in, so retrying the same fenced write forever only loops. Once
+		// this row and pin have refused the bound, name the exhausted refusal and
+		// install durable terminal state so later attempts on any replica are
+		// skipped instead of repeating the write. (A same-release renumber never
+		// reaches here: virtualProbeEvidenceSharesRowRelease already diverted it to
+		// a metadata-only write proven by the resolver's own identity.)
+		if h.adoptionRefusalBoundReached(ctx, args) {
+			args.RefusalReason = virtualProbeRefusalAdoptionBoundExhausted
+			slog.ErrorContext(ctx, "virtual probe evidence adoption refusal bound reached and the candidate is not the pinned release; refusing terminally",
+				"component", "api", "file_id", catalogFile.ID, "adopt_path", adoptPath,
+				"expected_path", expectedPath, "candidate_uri", resolvedPath,
+				virtualEvidenceLogKeyReason, virtualProbeRefusalAdoptionBoundExhausted)
+			h.markVirtualAdoptionTerminalRefusal(ctx, catalogFile, virtualProbeRefusalAdoptionBoundExhausted)
+		}
 	}
 	return args, true
 }

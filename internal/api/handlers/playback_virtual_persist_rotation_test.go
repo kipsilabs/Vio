@@ -408,7 +408,8 @@ func TestPersistProbeEvidenceRetriesAfterPathNotFound(t *testing.T) {
 // fail-closed fallback: when the ownership lookup genuinely cannot be answered,
 // the catalog write stays blocked but the live session bound to the requested
 // row's candidate still receives the probed tracks in memory, so the menu does
-// not stay stale.
+// not stay stale. The inventory status must stay the session's real one: a
+// refused, unpersisted probe cannot be labeled verified.
 func TestPersistProbeEvidenceRefusedOwnershipServesLiveSessionInMemory(t *testing.T) {
 	logs := captureHandlerLogs(t)
 	const (
@@ -475,8 +476,8 @@ func TestPersistProbeEvidenceRefusedOwnershipServesLiveSessionInMemory(t *testin
 	if err := json.Unmarshal(event.Payload, &payload); err != nil {
 		t.Fatalf("unmarshal payload: %v", err)
 	}
-	if payload.InventoryStatus != string(ProbeProvenanceVerified) {
-		t.Fatalf("inventory status = %q, want verified", payload.InventoryStatus)
+	if payload.InventoryStatus == string(ProbeProvenanceVerified) {
+		t.Fatalf("inventory status = %q, want the session's real status: a refused, unpersisted probe must not be verified", payload.InventoryStatus)
 	}
 	if len(payload.AudioTracks) != 2 {
 		t.Fatalf("payload audio tracks = %#v, want the probed dual audio inventory", payload.AudioTracks)
