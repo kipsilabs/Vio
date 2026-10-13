@@ -200,10 +200,15 @@ export function AudioTrackMenu({
             <span className="text-xs font-medium tracking-wide text-white/50 uppercase">Audio</span>
             {provisional && <ProvisionalTrackBadge />}
           </div>
-          {failed && dedupedTracks.length === 0 && (
+          {/* The failure notice only qualifies a still-unverified list. A menu
+              that already renders confident probe evidence (verified push or a
+              catalog/plan list) is not a failed discovery, so a timed-out poll
+              must never draw "discovery did not complete" above a correct,
+              populated list. `provisional` is the menu's own evidence state. */}
+          {failed && provisional && dedupedTracks.length === 0 && (
             <div className="px-3 py-1 text-xs text-amber-300/80">Track discovery failed</div>
           )}
-          {failed && dedupedTracks.length > 0 && (
+          {failed && provisional && dedupedTracks.length > 0 && (
             <div className="px-3 py-1 text-xs text-white/50">
               Showing available tracks — discovery did not complete
             </div>
@@ -214,7 +219,7 @@ export function AudioTrackMenu({
               <span>Discovering audio tracks…</span>
             </div>
           )}
-          {dedupedTracks.length === 0 && !failed && !pending && !provisional && (
+          {dedupedTracks.length === 0 && !pending && !provisional && (
             <div className="px-3 py-2 text-xs text-white/40">No audio tracks available</div>
           )}
           {dedupedTracks.map(({ track, index }) => {
