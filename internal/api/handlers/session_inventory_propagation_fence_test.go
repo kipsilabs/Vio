@@ -612,6 +612,45 @@ func TestDeferredProbePropagationTransientBoundReadRecovers(t *testing.T) {
 	}
 }
 
+// TestDeferredProbeFailureWriteFencedOnRowOnlyMutation is the failure-write
+// analogue of the row-id-mutation case: when the propagation refuses the
+// committed inventory and a row-only move lands while the release-continuity read
+// runs, the terminal failed write must be fenced on the full binding. A
+// generation-only fence would stamp the old probe's failure onto the changed
+// binding.
+func TestDeferredProbeFailureWriteFencedOnRowOnlyMutation(t *testing.T) {
+	canonicalIdentity := virtualProbeIdentity{VideoHash: "hash-canonical", ReleaseName: "Movie.2024.1080p.WEB-DL.x264", ReleaseSize: 8_000_000_000}
+	pinnedIdentity := virtualProbeIdentity{VideoHash: "hash-pinned", ReleaseName: "Movie.2024.1080p.WEB-DL.x264", ReleaseSize: 8_000_000_000}
+	// Conflicting identities make the release-continuity check refuse.
+	fx := setupCanonicalCollectionFixture(t, canonicalIdentity, pinnedIdentity)
+	canonicalProbeWithVerifiedWrite(t, fx)
+
+	deferred := readmitDeferredProbe(t, fx.handler, canonicalCollectionProbe(fx.session, *fx.canonicalRow, canonicalIdentity))
+
+	fx.handler.fileResolver = &rowIDMutatingResolver{
+		inner:  fx.resolver,
+		readID: canonicalPinnedRowID,
+		mutate: func() {
+			if err := fx.manager.SetEffectiveMediaFileID(fx.session.ID, canonicalCollectionRowID); err != nil {
+				t.Errorf("SetEffectiveMediaFileID: %v", err)
+			}
+		},
+	}
+
+	fx.handler.runDeferredVirtualProbe(deferred)
+
+	live, err := fx.manager.GetSession(fx.session.ID)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if live.MediaFileID != canonicalCollectionRowID {
+		t.Fatalf("effective row = %d, want the mutated row %d", live.MediaFileID, canonicalCollectionRowID)
+	}
+	if live.VirtualProbeOutcome == probeOutcomeFailed {
+		t.Fatal("a row-only move during the release-continuity read let the old probe's failure land on the changed binding")
+	}
+}
+
 // transportOrdinalForTrack is the audio-only stream ordinal a bound list assigns
 // to a chosen language's first track, mirroring what the transport hands ffmpeg
 // as 0:a:N.

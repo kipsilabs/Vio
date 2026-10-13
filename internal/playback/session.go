@@ -1815,6 +1815,31 @@ func (m *SessionManager) SetVirtualProbeOutcomeIfGeneration(sessionID string, ge
 	return true, nil
 }
 
+// SetVirtualProbeOutcomeIfBinding records a deferred probe's outcome only while
+// the session's candidate binding still matches the full snapshot the probe was
+// admitted against: generation, virtual URI, owner installation, and effective
+// row. It is the stronger form of SetVirtualProbeOutcomeIfGeneration, needed
+// because SetEffectiveMediaFileID can move a session's effective row without
+// advancing the generation, so a generation-only fence would stamp the old
+// probe's verdict - verified or failed - onto the changed binding. A zero field
+// in expected is not asserted, so a caller that captured only a generation keeps
+// the generation-only behavior. It returns applied=false when the binding moved,
+// and an unknown session reports ErrSessionNotFound and writes nothing.
+func (m *SessionManager) SetVirtualProbeOutcomeIfBinding(sessionID string, expected VirtualSourceBindingSnapshot, outcome string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		return false, ErrSessionNotFound
+	}
+	if !s.matchesVirtualBindingLocked(expected) {
+		return false, nil
+	}
+	setVirtualProbeOutcomeLocked(s, outcome)
+	return true, nil
+}
+
 // SetVirtualProbeVerifiedInventoryIfGeneration atomically records a deferred
 // probe's verified outcome AND replaces the live session's carried virtual
 // inventory with the tracks the probe just committed, under one generation-fenced

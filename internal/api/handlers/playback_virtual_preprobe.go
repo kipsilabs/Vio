@@ -110,6 +110,17 @@ type virtualProbeOutcomeWriter interface {
 	SetVirtualProbeOutcomeIfGeneration(sessionID string, generation uint64, outcome string) (bool, error)
 }
 
+// virtualProbeOutcomeBindingWriter is the stronger outcome-writer capability
+// that fences the terminal verdict on the whole candidate binding, not just its
+// generation, through the same predicate the verified-inventory writer uses. It
+// exists because SetEffectiveMediaFileID moves the session's effective row
+// without advancing virtualSourceGeneration, so a generation-only failure write
+// could stamp the old probe's verdict onto the changed binding. The propagation
+// prefers this form when the manager supplies it.
+type virtualProbeOutcomeBindingWriter interface {
+	SetVirtualProbeOutcomeIfBinding(sessionID string, expected playback.VirtualSourceBindingSnapshot, outcome string) (bool, error)
+}
+
 // virtualProbeInventoryWriter is the session-manager capability that atomically
 // records a deferred probe's verified outcome AND replaces the live session's
 // carried virtual inventory with the exact tracks the probe committed, fenced on
@@ -448,18 +459,47 @@ func (h *PlaybackHandler) setVirtualProbeOutcomeIfGeneration(sessionID string, g
 	return applied
 }
 
+// setVirtualProbeOutcomeIfBinding records a deferred probe's terminal outcome
+// while the session's full candidate binding still matches the snapshot the
+// probe was admitted against. It prefers the full-binding writer so a row-only
+// move that does not advance the generation is rejected rather than stamping the
+// old probe's verdict onto the changed binding, and falls back to the
+// generation-only CAS for a manager that cannot supply one. It reports whether
+// the write landed, so the caller publishes a terminal notification only for the
+// binding that actually carries the verdict.
+func (h *PlaybackHandler) setVirtualProbeOutcomeIfBinding(sessionID string, binding playback.VirtualSourceBindingSnapshot, outcome string) bool {
+	if h == nil || sessionID == "" || h.sessionMgr == nil {
+		return false
+	}
+	if writer, ok := h.sessionMgr.(virtualProbeOutcomeBindingWriter); ok {
+		applied, err := writer.SetVirtualProbeOutcomeIfBinding(sessionID, binding, outcome)
+		if err != nil {
+			if !errors.Is(err, playback.ErrSessionNotFound) {
+				slog.Warn("failed to record virtual probe outcome", "component", "api", "session", sessionID, "outcome", outcome, "error", err)
+			}
+			return false
+		}
+		if !applied {
+			slog.Info("virtual probe outcome dropped: candidate binding moved before outcome storage",
+				"component", "api", "session", sessionID, "outcome", outcome, "generation", binding.Generation)
+		}
+		return applied
+	}
+	return h.setVirtualProbeOutcomeIfGeneration(sessionID, binding.Generation, outcome)
+}
+
 // shedDeferredVirtualProbe terminally fails a probe that could not run: the
 // session outcome is marked failed and the failure published off the request
 // path, so a client watching either the push or the poll leaves its loading
-// state. The fence on the retained binding generation ensures the shed probe's
-// failure is not written onto a replacement binding that never had this probe
+// state. The fence on the retained full binding ensures the shed probe's failure
+// is not written onto a replacement binding that never had this probe
 // outstanding; when the CAS rejects the outcome the binding moved, so the
 // failure is not published either — the new binding owns its own lifecycle.
 func (h *PlaybackHandler) shedDeferredVirtualProbe(deferred *virtualDeferredProbeV3) {
 	if h == nil || deferred == nil {
 		return
 	}
-	if !h.setVirtualProbeOutcomeIfGeneration(deferred.sessionID, deferred.bindingGeneration, probeOutcomeFailed) {
+	if !h.setVirtualProbeOutcomeIfBinding(deferred.sessionID, deferred.binding, probeOutcomeFailed) {
 		return
 	}
 	h.publishDeferredProbeInventory(deferred)
@@ -607,7 +647,7 @@ func (h *PlaybackHandler) runDeferredVirtualProbe(deferred *virtualDeferredProbe
 		case probeInventoryApplied:
 			h.publishDeferredProbeInventory(deferred)
 		case probeInventoryRefused:
-			if h.setVirtualProbeOutcomeIfGeneration(deferred.sessionID, deferred.bindingGeneration, probeOutcomeFailed) {
+			if h.setVirtualProbeOutcomeIfBinding(deferred.sessionID, deferred.binding, probeOutcomeFailed) {
 				h.publishDeferredProbeInventory(deferred)
 			}
 		case probeInventoryUnprovable:
@@ -616,7 +656,7 @@ func (h *PlaybackHandler) runDeferredVirtualProbe(deferred *virtualDeferredProbe
 			// watching the poll or the push leaves its loading state rather than
 			// staying pending until the convergence watchdog; the carried
 			// provisional overlay is untouched and a replan re-resolves.
-			if h.setVirtualProbeOutcomeIfGeneration(deferred.sessionID, deferred.bindingGeneration, probeOutcomeFailed) {
+			if h.setVirtualProbeOutcomeIfBinding(deferred.sessionID, deferred.binding, probeOutcomeFailed) {
 				h.publishDeferredProbeInventory(deferred)
 			}
 		case probeInventorySuperseded:
@@ -632,7 +672,7 @@ func (h *PlaybackHandler) runDeferredVirtualProbe(deferred *virtualDeferredProbe
 		// terminal write CASes on the admitted generation; a rotation that landed
 		// while the probe ran makes the CAS reject the verdict, and then nothing
 		// is published — the replacement binding owns its own lifecycle.
-		if h.setVirtualProbeOutcomeIfGeneration(deferred.sessionID, deferred.bindingGeneration, outcome) {
+		if h.setVirtualProbeOutcomeIfBinding(deferred.sessionID, deferred.binding, outcome) {
 			h.publishDeferredProbeInventory(deferred)
 		}
 	case probeOutcomePartial:
