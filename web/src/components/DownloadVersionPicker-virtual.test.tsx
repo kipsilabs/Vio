@@ -1,7 +1,11 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, expect, it, vi } from "vitest";
 import type { FileVersion } from "@/api/types";
-import { SaveCancelledError, BUFFERED_SAVE_LIMIT_BYTES } from "@/api/v2/downloadPreparation";
+import {
+  SaveCancelledError,
+  BUFFERED_SAVE_LIMIT_BYTES,
+  DownloadPreparationError,
+} from "@/api/v2/downloadPreparation";
 import DownloadVersionPicker from "./DownloadVersionPicker";
 
 const mocks = vi.hoisted(() => ({
@@ -184,6 +188,22 @@ it("toasts a concrete reason when preparation is refused", async () => {
   });
   expect(mocks.toastError).toHaveBeenCalledWith(
     "Download could not be prepared. Check your connection and try again.",
+  );
+});
+
+it("shows the reconciliation reason when a managed conflict cannot be resolved", async () => {
+  mocks.create.mockRejectedValue(
+    new DownloadPreparationError(
+      "This download changed on the server. Reopen the download picker and try again.",
+    ),
+  );
+  await openVirtualPanel();
+
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: /Prepare download/i }));
+  });
+  expect(mocks.toastError).toHaveBeenCalledWith(
+    "This download changed on the server. Reopen the download picker and try again.",
   );
 });
 
