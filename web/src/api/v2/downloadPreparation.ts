@@ -6,6 +6,7 @@ import {
   StaleApiRequestContextError,
   type ProfileRequestContextSnapshot,
 } from "@/api/client";
+import { findManagedEntry, listDownloads } from "./downloadRegistry";
 import { V2ProblemError, v2, type V2Result } from "./request";
 
 /** A download row created by `POST /api/v2/downloads`, as the create response returns it. */
@@ -65,6 +66,14 @@ export class DownloadPreparationError extends Error {
  * returned row is `preparing` until the artifact exists, then `ready`. The
  * server picks the version from `mediaFileId` and applies the requested quality
  * through the same policy and capability caps playback uses.
+ *
+ * A managed single download must carry `expected_revision` whenever the device
+ * header is present (the web client always sends one): zero asserts no managed
+ * entry exists yet. When this device already owns an entry for the title the
+ * server answers 409, and the exact registry entry is read back and replaced
+ * with its own id and revision. A second conflict means the entry changed
+ * between the read and the retry; that is reported as an actionable refusal
+ * rather than retried again.
  */
 export async function createPreparedDownload(
   input: {
@@ -79,12 +88,67 @@ export async function createPreparedDownload(
     throw new DownloadPreparationError("Invalid file ID.");
   }
   const snapshot = requireSnapshot();
+  try {
+    return await postPreparedDownload(snapshot, input, undefined, signal);
+  } catch (error) {
+    // A 409 is the managed entry already existing; reconcile and retry once
+    // with the exact entry. Every other refusal is the caller's to report.
+    if (!isManagedEntryConflict(error)) throw error;
+  }
+  requireCurrent(snapshot);
+  const existing = findManagedEntry(await listDownloads(signal), input);
+  requireCurrent(snapshot);
+  if (!existing) {
+    throw new DownloadPreparationError(
+      "A download for this title already exists. Reopen the download picker and try again.",
+    );
+  }
+  try {
+    return await postPreparedDownload(
+      snapshot,
+      input,
+      { id: existing.id, revision: existing.revision },
+      signal,
+    );
+  } catch (error) {
+    if (isManagedEntryConflict(error)) {
+      throw new DownloadPreparationError(
+        "This download changed on the server. Reopen the download picker and try again.",
+      );
+    }
+    throw error;
+  }
+}
+
+/** Whether a create refusal is the managed-entry guard conflict (HTTP 409). */
+function isManagedEntryConflict(error: unknown): boolean {
+  return error instanceof V2ProblemError && error.status === 409;
+}
+
+/**
+ * Sends one create request. A guard replaces the named entry; without one the
+ * request asserts a fresh entry with revision zero. The body always carries
+ * `expected_revision`, as a managed single download requires.
+ */
+async function postPreparedDownload(
+  snapshot: ProfileRequestContextSnapshot,
+  input: {
+    contentId: string;
+    episodeId?: string;
+    mediaFileId: number;
+    quality: PreparedDownloadQuality;
+  },
+  guard: { id: string; revision: number } | undefined,
+  signal?: AbortSignal,
+): Promise<PreparedDownloadEntry> {
   const result = await v2("POST /api/v2/downloads", {
     body: {
       content_id: input.contentId,
       episode_id: input.episodeId || undefined,
       media_file_id: String(input.mediaFileId),
       quality: input.quality,
+      expected_revision: guard ? guard.revision : 0,
+      expected_download_id: guard?.id,
     },
     profileContext: snapshot,
     signal,

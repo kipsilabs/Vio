@@ -3,6 +3,8 @@ import { setAccessToken, setProfileId, setProfileToken } from "@/api/client";
 import {
   BUFFERED_SAVE_LIMIT_BYTES,
   canSavePreparedDownload,
+  createPreparedDownload,
+  DownloadPreparationError,
   getPreparedDownload,
   readBoundedSaveBlob,
   savePreparedDownload,
@@ -52,6 +54,121 @@ afterEach(() => {
   setAccessToken(null);
   setProfileId(null);
   setProfileToken(null);
+});
+
+describe("createPreparedDownload", () => {
+  const created = (items: PreparedDownloadEntry[]) =>
+    jsonResponse({ items, skipped: [], page: { has_more: false } }, 202);
+  const registry = (items: PreparedDownloadEntry[]) =>
+    jsonResponse({ items, page: { has_more: false } });
+
+  it("sends expected_revision zero for a fresh managed single download", async () => {
+    const fetch = vi.fn().mockResolvedValue(created([entry]));
+    vi.stubGlobal("fetch", fetch);
+
+    const got = await createPreparedDownload({
+      contentId: "mv_1",
+      mediaFileId: 42,
+      quality: "original",
+    });
+
+    expect(got).toMatchObject({ id: "dl-1" });
+    expect(fetch).toHaveBeenCalledTimes(1);
+    const [url, init] = fetch.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/v2/downloads");
+    expect(init.method).toBe("POST");
+    const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+    expect(body).toMatchObject({ content_id: "mv_1", media_file_id: "42", expected_revision: 0 });
+    // Revision zero asserts absence, so it must not name an entry.
+    expect(body.expected_download_id).toBeUndefined();
+  });
+
+  it("reconciles a conflict and retries with the existing entry's id and revision", async () => {
+    const existing = { ...entry, id: "dl-9", revision: 3 };
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(problemResponse(409))
+      .mockResolvedValueOnce(registry([existing]))
+      .mockResolvedValueOnce(created([{ ...entry, id: "dl-9", revision: 4 }]));
+    vi.stubGlobal("fetch", fetch);
+
+    const got = await createPreparedDownload({
+      contentId: "mv_1",
+      mediaFileId: 42,
+      quality: "original",
+    });
+
+    expect(got.id).toBe("dl-9");
+    expect(fetch).toHaveBeenCalledTimes(3);
+    const [listUrl] = fetch.mock.calls[1] as [string];
+    expect(listUrl).toBe("/api/v2/downloads");
+    const retry = fetch.mock.calls[2] as [string, RequestInit];
+    const body = JSON.parse(String(retry[1].body)) as Record<string, unknown>;
+    expect(body).toMatchObject({ expected_revision: 3, expected_download_id: "dl-9" });
+  });
+
+  it("reports an actionable refusal when the entry changes before the retry lands", async () => {
+    const existing = { ...entry, id: "dl-9", revision: 3 };
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(problemResponse(409))
+      .mockResolvedValueOnce(registry([existing]))
+      .mockResolvedValueOnce(problemResponse(409));
+    vi.stubGlobal("fetch", fetch);
+
+    const attempt = createPreparedDownload({
+      contentId: "mv_1",
+      mediaFileId: 42,
+      quality: "original",
+    });
+    await expect(attempt).rejects.toBeInstanceOf(DownloadPreparationError);
+    await expect(attempt).rejects.toThrow(/changed on the server/i);
+  });
+
+  it("matches a conflict to an episode entry by series and episode identity", async () => {
+    const existing = {
+      ...entry,
+      id: "dl-ep",
+      content_id: "sr_9",
+      episode_id: "ep_1",
+      revision: 2,
+    };
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(problemResponse(409))
+      .mockResolvedValueOnce(registry([existing]))
+      .mockResolvedValueOnce(created([{ ...existing, revision: 3 }]));
+    vi.stubGlobal("fetch", fetch);
+
+    await createPreparedDownload({
+      contentId: "sr_9",
+      episodeId: "ep_1",
+      mediaFileId: 43,
+      quality: "original",
+    });
+
+    const retry = fetch.mock.calls[2] as [string, RequestInit];
+    const body = JSON.parse(String(retry[1].body)) as Record<string, unknown>;
+    expect(body).toMatchObject({
+      content_id: "sr_9",
+      episode_id: "ep_1",
+      media_file_id: "43",
+      expected_revision: 2,
+      expected_download_id: "dl-ep",
+    });
+  });
+
+  it("refuses with a clear reason when the conflict has no matching entry", async () => {
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(problemResponse(409))
+      .mockResolvedValueOnce(registry([{ ...entry, id: "dl-other", content_id: "mv_other" }]));
+    vi.stubGlobal("fetch", fetch);
+
+    await expect(
+      createPreparedDownload({ contentId: "mv_1", mediaFileId: 42, quality: "original" }),
+    ).rejects.toThrow(/already exists/i);
+  });
 });
 
 describe("getPreparedDownload", () => {
