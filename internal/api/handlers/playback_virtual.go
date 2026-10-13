@@ -4736,10 +4736,13 @@ func (h *PlaybackHandler) virtualProbeEvidenceRotateTarget(ctx context.Context, 
 			// probe, the sibling's onto the requested row): exactly the silent
 			// cross-row contamination this guard exists to stop. The refusal is
 			// safe, but it is also unbounded: a duplicate row whose pin never
-			// adopts keeps serving provisional evidence forever. Count it, and
-			// after the bound rotate the evidence onto the owning row anyway —
-			// both rows provably carry the same release, so the probed bytes are
-			// that release's bytes and no foreign inventory crosses rows.
+			// adopts keeps serving provisional evidence forever. Count it under
+			// the media_files row lock (with the durable store), and after the
+			// bound rotate the evidence onto the owning row anyway — both rows
+			// provably carry the same release, so the probed bytes are that
+			// release's bytes and no foreign inventory crosses rows. Taking the
+			// row lock first keeps this increment serialized with the evidence
+			// writes and clears on the same row instead of racing them.
 			refusals := h.adoptionRefusalStoreCount(ctx, catalogFile.ID, catalogFile.FilePath)
 			if refusals >= virtualAdoptionRefusalBound {
 				rotated := rotateVirtualSourceToOwnerRow(probed, ownerRow, resolvedPath)
