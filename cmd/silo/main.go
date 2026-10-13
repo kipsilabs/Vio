@@ -3909,17 +3909,18 @@ func main() {
 			compatDeps.VirtualSourceProber = func(ctx context.Context, sourceURL string, file *models.MediaFile) (*models.MediaFile, error) {
 				return compatVirtualSourceProberWithHeaders(ctx, sourceURL, file, nil)
 			}
+			compatAdoptionRefusalStore := scanner.NewFileRepository(deps.DB)
 			compatDeps.VirtualFileSaver = func(ctx context.Context, args models.VirtualFilePersistArgs) (int64, error) {
 				if deps.DB == nil {
 					return 0, nil
 				}
-				return handlers.ExecVirtualFileMetadataUpdate(ctx, deps.DB, args)
+				return handlers.ExecVirtualFileMetadataUpdateWithRefusals(ctx, deps.DB, args, compatAdoptionRefusalStore)
 			}
 			compatDeps.VirtualFileMetadataSaver = func(ctx context.Context, args models.VirtualFilePersistArgs) (jellycompat.VirtualFileMetadataUpdateResult, error) {
 				if deps.DB == nil {
 					return jellycompat.VirtualFileMetadataUpdateResult{}, nil
 				}
-				result, err := handlers.ExecVirtualFileMetadataUpdateResult(ctx, deps.DB, args)
+				result, err := handlers.ExecVirtualFileMetadataUpdateResultWithRefusals(ctx, deps.DB, args, compatAdoptionRefusalStore)
 				return jellycompat.VirtualFileMetadataUpdateResult{
 					RowsAffected:    result.RowsAffected,
 					MetadataUpdated: result.MetadataUpdated,

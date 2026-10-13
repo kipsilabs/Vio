@@ -163,6 +163,12 @@ type MediaFile struct {
 	MultiplePPSScanMtime *time.Time `json:"-"`
 	ProbeSource          string     // arrs, local
 	ProbeUpdatedAt       *time.Time
+	// RefusedProbeEvidence marks an in-memory inventory override assembled from a
+	// probe whose catalog write was refused. The tracks are real measured
+	// evidence, but no durable write committed them, so no reader may report the
+	// override as verified. It is never persisted and never serialized: catalog
+	// rows loaded from storage leave it false.
+	RefusedProbeEvidence bool `json:"-"`
 	// ProbeVersion is the schema version of the probe-derived columns
 	// (audio/subtitle track shape, track languages). Scans bump it so rows
 	// probed before a probe-shape change are re-probed once instead of being
