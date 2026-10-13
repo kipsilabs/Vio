@@ -256,6 +256,38 @@ func TestRehydratedIdentityLegacyRowServesStoredURL(t *testing.T) {
 	}
 }
 
+// TestVirtualResolveContextPersistedTrustIdentitylessEvidence pins the handler
+// trust predicate: an identity-less row with transport evidence (a recorded
+// delivery) inside the window is trusted so a delisted pin is refused with the
+// trust sentinel and re-served from its stored evidence rather than rotated; a
+// row with no evidence, or outside the window, is not trusted.
+func TestVirtualResolveContextPersistedTrustIdentitylessEvidence(t *testing.T) {
+	now := time.Now()
+	window := 720 * time.Hour
+	delivered := now.Add(-time.Minute)
+	identityless := &models.MediaFile{ID: 701, UpdatedAt: delivered, LastDeliveredAt: &delivered}
+	ctx := virtualResolveContextWithPersistedTrust(context.Background(), identityless, now, window)
+	if !virtuallibrary.PersistedCandidateTrusted(ctx) {
+		t.Fatal("an identity-less row with a recorded delivery inside the window must be trusted")
+	}
+	if _, ok := virtuallibrary.PersistedCandidateIdentityFromContext(ctx); ok {
+		t.Fatal("an identity-less row must not thread a durable identity")
+	}
+
+	bare := &models.MediaFile{ID: 702, UpdatedAt: now}
+	if virtuallibrary.PersistedCandidateTrusted(virtualResolveContextWithPersistedTrust(context.Background(), bare, now, window)) {
+		t.Fatal("a row with no transport evidence must not be trusted")
+	}
+
+	outside := &models.MediaFile{
+		ID: 703, UpdatedAt: now.Add(-2 * time.Hour),
+		ResolvedURL: "https://93.184.216.34/stream/x", ResolvedURLExpiresAt: &delivered,
+	}
+	if virtuallibrary.PersistedCandidateTrusted(virtualResolveContextWithPersistedTrust(context.Background(), outside, now, time.Hour)) {
+		t.Fatal("a row outside the window must not be trusted")
+	}
+}
+
 // TestRehydratedIdentityDifferentReleaseStillRefused proves the recovered
 // identity never weakens the invariant: when the owning row's release is
 // re-listed under a genuinely different release, the rotation is still refused
