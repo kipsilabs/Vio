@@ -285,9 +285,11 @@ func TestServe_AutoExactUriEvidenceMatchesWhenAnchoredAtResult(t *testing.T) {
 // selection space is the verified inventory the probe committed to the result
 // row, so a remux ordinal the client selects against the two-audio stream names
 // a real stream instead of a phantom second track over the thin plan-time list.
+// The plan-time declared selection is not re-identifiable in the verified list,
+// so the session records a server-enforced invalid selection instead of a stale
+// position that would name whichever verified track now occupies slot 0.
 func TestRemuxOrdinal_AutoUsesVerifiedTwoAudio(t *testing.T) {
 	fx := setupAutoResultFixture(t, true)
-	ordinalBefore := fx.session.AudioTrackIndex
 
 	runAutoDeferredProbe(t, fx)
 
@@ -298,8 +300,9 @@ func TestRemuxOrdinal_AutoUsesVerifiedTwoAudio(t *testing.T) {
 	if len(live.VirtualAudioTracks) != 2 {
 		t.Fatalf("session carried audio = %+v, want the verified 2-track list the stream really has", live.VirtualAudioTracks)
 	}
-	if live.AudioTrackIndex != ordinalBefore {
-		t.Fatalf("transport ordinal moved from %d to %d; the overlay update must not renumber the committed selection", ordinalBefore, live.AudioTrackIndex)
+	if !live.VirtualAudioSelectionInvalid || live.AudioTrackIndex != -1 {
+		t.Fatalf("session audio index = %d (invalid=%v), want the invalid sentinel -1: the committed plan-time track is not in the verified inventory",
+			live.AudioTrackIndex, live.VirtualAudioSelectionInvalid)
 	}
 	// The verified list is what the inventory endpoint serves, so a client that
 	// selects the second audio stream (0:a:1) names the real stream.

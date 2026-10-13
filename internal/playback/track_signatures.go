@@ -106,12 +106,14 @@ func trackStringEqual(a, b string) bool {
 // onto a different stream when the verified list reorders or trims the plan-time
 // list. It matches by absolute container stream index first (the probe's
 // recorded position, stable across a reorder), then by the persisted track
-// signature, then by language and codec.
+// signature, then by language, codec, and the transport-relevant channel facts.
 //
-// It returns -1 when the selected track cannot be re-identified — a genuinely
-// removed stream. The caller then leaves the selection untouched: withdrawing
-// the plan for a vanished track is the reconciliation path's correction, not a
-// silent renumber onto whichever track now occupies the old position.
+// It returns -1 when the selected track cannot be uniquely re-identified - a
+// genuinely removed stream, or one whose weak language/codec fallback matches
+// more than one track (distinct commentary or layout tracks of the same
+// language). The caller then records a server-enforced invalid selection rather
+// than leaving the plan-time position in place to name whichever track now
+// occupies it.
 func remapAudioSelectionIndex(prev []models.AudioTrack, selectedIndex int, next []models.AudioTrack) int {
 	if selectedIndex < 0 || selectedIndex >= len(prev) {
 		return -1
@@ -130,12 +132,25 @@ func remapAudioSelectionIndex(prev []models.AudioTrack, selectedIndex int, next 
 	if idx := findExactAudioTrack(next, AudioTrackSignatureFromTrack(selected)); idx >= 0 {
 		return idx
 	}
+	// The weak fallback is deliberately transport-fact matched and unique-only:
+	// language and codec alone can substitute a distinct commentary or layout
+	// track of the same language, which would point the running mux at the wrong
+	// stream. Two matches are ambiguous and no match means the stream is gone;
+	// both are -1, never a positional guess.
+	match := -1
 	for i, track := range next {
-		if trackStringEqual(track.Language, selected.Language) && trackStringEqual(track.Codec, selected.Codec) {
-			return i
+		if !(trackStringEqual(track.Language, selected.Language) && trackStringEqual(track.Codec, selected.Codec)) {
+			continue
 		}
+		if track.Channels != selected.Channels || !trackStringEqual(track.Layout, selected.Layout) {
+			continue
+		}
+		if match >= 0 {
+			return -1
+		}
+		match = i
 	}
-	return -1
+	return match
 }
 
 // audioInventoryProbed reports whether an audio inventory came from a real

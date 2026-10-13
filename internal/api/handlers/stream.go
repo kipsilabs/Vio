@@ -1598,6 +1598,17 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 	}
 	file = bindSessionVirtualSourceWithTracks(r.Context(), file, session, h.fileResolver)
 
+	// A verified overlay may have replaced the carried audio list with one that
+	// no longer contains the committed selection. The session records that as an
+	// invalid selection and the remux fails closed rather than derive an ordinal
+	// from a stale position and mux whichever stream now occupies it; the client
+	// replans and re-selects. Direct play needs no gate (the client demuxes the
+	// bytes), and a transcode start reads the plan's own selected index.
+	if session.PlayMethod == playback.PlayRemux && isVirtualPlaybackFile(file) && session.VirtualAudioSelectionInvalid {
+		writeVirtualAudioSelectionInvalid(w)
+		return
+	}
+
 	// Capture the delivered identity and observed health state at transport
 	// start: the delivered candidate is the path the transport will serve
 	// (retained by the session even if the row rotates mid-stream), and the
@@ -3927,6 +3938,18 @@ func clearSubtitleCoverageHeaders(h http.Header) {
 	}
 	h.Del(playback.SubtitleCoverageHeader)
 	h.Del(playback.SubtitleWindowedHeader)
+}
+
+// writeVirtualAudioSelectionInvalid answers a retryable 409 when a virtual
+// session's committed audio selection is no longer present in the inventory a
+// deferred probe verified. The session marks the selection invalid rather than
+// keeping a stale positional index that now names another track, so the
+// transport must fail closed instead of muxing whatever stream occupies the old
+// slot; the client replans and re-selects. Retryable 4xx, never a 500 or an
+// ambiguous partial stream, matching the subtitle rotation response.
+func writeVirtualAudioSelectionInvalid(w http.ResponseWriter) {
+	writeError(w, http.StatusConflict, "audio_selection_invalid",
+		"The selected audio track is no longer available; replan and choose another")
 }
 
 // writeSubtitleSourceChanged answers a clean retryable 4xx when a virtual

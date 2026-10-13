@@ -267,7 +267,6 @@ func TestPinnedSessionReceivesCanonicalCollectionEvidenceViaOverlay(t *testing.T
 	if len(before.AudioTracks) != 1 || len(before.SubtitleInventory) != 0 {
 		t.Fatalf("provisional inventory = %d audio / %d subtitles, want the captured 1/0 overlay", len(before.AudioTracks), len(before.SubtitleInventory))
 	}
-	ordinalBefore := fx.session.AudioTrackIndex
 
 	deferred := readmitDeferredProbe(t, fx.handler, canonicalCollectionProbe(fx.session, *fx.canonicalRow, identity))
 	fx.handler.runDeferredVirtualProbe(deferred)
@@ -303,8 +302,12 @@ func TestPinnedSessionReceivesCanonicalCollectionEvidenceViaOverlay(t *testing.T
 	if len(live.VirtualAudioTracks) != 2 {
 		t.Fatalf("session carried audio = %+v, want the propagated verified 2 tracks", live.VirtualAudioTracks)
 	}
-	if live.AudioTrackIndex != ordinalBefore {
-		t.Fatalf("transport ordinal moved from %d to %d; the overlay update must not renumber the selection", ordinalBefore, live.AudioTrackIndex)
+	// The plan-time declared track is not re-identifiable in the verified
+	// inventory, so the session records a server-enforced invalid selection:
+	// no position survives to name whichever verified track now occupies the
+	// old slot.
+	if !live.VirtualAudioSelectionInvalid || live.AudioTrackIndex != -1 {
+		t.Fatalf("session audio index = %d (invalid=%v), want the invalid sentinel -1", live.AudioTrackIndex, live.VirtualAudioSelectionInvalid)
 	}
 	pinnedRow, err := fx.resolver.GetByID(context.Background(), canonicalPinnedRowID)
 	if err != nil || pinnedRow == nil {

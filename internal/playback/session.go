@@ -101,6 +101,14 @@ type Session struct {
 	// so the selection remap needs the plan-time audio inventory to compare
 	// against and remap from.
 	VirtualAudioTracks []models.AudioTrack
+	// VirtualAudioSelectionInvalid records that the session's committed audio
+	// selection could not be re-identified in the verified inventory a deferred
+	// probe replaced the carried overlay with. A vanished or ambiguous selection
+	// is a server-enforced invalid selection: no positional index survives to
+	// name whichever track now occupies the old slot, and the transport fails
+	// closed so the client replans and re-selects. Cleared when a new selection
+	// is committed or the candidate binding moves.
+	VirtualAudioSelectionInvalid bool
 	// VirtualSourceRevision is the opaque media-generation revision the planner
 	// published for this session's virtual candidate (PlanV3.VirtualSourceRevision).
 	// A candidate binding move clears it (see SetVirtualSource), so a non-empty
@@ -1319,6 +1327,7 @@ func (m *SessionManager) UpdateAudioTrack(sessionID string, audioTrackIndex int,
 	}
 
 	s.AudioTrackIndex = audioTrackIndex
+	s.VirtualAudioSelectionInvalid = false
 	s.BasePlayMethod = method
 	if s.PlayMethod != PlayTranscode || method == PlayTranscode {
 		s.PlayMethod = method
@@ -1393,6 +1402,10 @@ func applySessionStreamStateLocked(s *Session, state SessionStreamState) {
 		s.BasePlayMethod = state.BasePlayMethod
 	}
 	s.AudioTrackIndex = state.AudioTrackIndex
+	// A newly applied stream state carries a fresh selection; any invalid-selection
+	// marker from a previous verified overlay is superseded (the index above
+	// replaces it unconditionally, matching the legacy partial-update behavior).
+	s.VirtualAudioSelectionInvalid = false
 	if state.TranscodeRouteSet {
 		s.OutputContainer = state.OutputContainer
 		s.OutputProtocol = state.OutputProtocol
@@ -1717,6 +1730,9 @@ func (m *SessionManager) setVirtualSourceLocked(s *Session, virtualURI string, o
 	// previous candidate's deferred probe reached says nothing about this one.
 	s.VirtualProbeOutcome = ""
 	s.virtualProbeArmedAt = time.Time{}
+	// The invalid-selection marker belongs to the previous candidate's verified
+	// inventory; the replacement binding re-plans and re-probes.
+	s.VirtualAudioSelectionInvalid = false
 	s.VirtualSourceURI = trimmed
 	s.VirtualSourceOwnerInstallationID = ownerInstallationID
 	s.streamRevision++
@@ -1864,8 +1880,19 @@ func (m *SessionManager) SetVirtualProbeVerifiedInventoryIfBinding(sessionID str
 	// the array position untouched when the verified list reorders it would point
 	// the next remux at a different stream. Remapping to the same track keeps the
 	// derived ordinal naming the stream the running mux was started against.
+	//
+	// A selection that cannot be re-identified - the track vanished, or the weak
+	// fallback is ambiguous (duplicate-language/layout tracks) - is recorded as a
+	// server-enforced invalid selection instead of an unchanged position that now
+	// names a different track. The transport fails closed on that flag and the
+	// client replans; the default-audio reconcile that ran before this write
+	// against the plan-time selection has already issued the correction.
 	if remapped := remapAudioSelectionIndex(s.VirtualAudioTracks, s.AudioTrackIndex, audio); remapped >= 0 {
 		s.AudioTrackIndex = remapped
+		s.VirtualAudioSelectionInvalid = false
+	} else if s.AudioTrackIndex >= 0 && s.AudioTrackIndex < len(s.VirtualAudioTracks) {
+		s.AudioTrackIndex = -1
+		s.VirtualAudioSelectionInvalid = true
 	}
 	s.VirtualAudioTracks = audio
 	s.VirtualSubtitleTracks = subtitles
