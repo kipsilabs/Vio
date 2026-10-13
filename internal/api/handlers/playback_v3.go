@@ -8540,8 +8540,20 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			// source_unavailable through the existing rotation semantics
 			// instead of the replan planning against stale metadata. The
 			// release is never swapped silently.
-			carryPinnedCandidate := (trackChange || seekReanchor) && strings.TrimSpace(session.VirtualSourceURI) != "" &&
-				(candidateUnchanged || session.VirtualSubtitleEvidenceSet)
+			carryPinnedCandidate := (trackChange || seekReanchor) && !virtualDecodeRotation &&
+				strings.TrimSpace(session.VirtualSourceURI) != "" &&
+				(candidateUnchanged || session.VirtualSubtitleEvidenceSet ||
+					// The catalog row can be the provider-neutral profile while the
+					// session pin is a concrete pick under it (the provider churns
+					// the per-listing result id for bytes that never changed). A
+					// user-intent replan must still carry that pin — re-listing
+					// pays a multi-second round-trip to hand back a token the
+					// identity guard then refuses to adopt. The pin must be
+					// describable from the session's carried evidence, or the
+					// relist path stays in charge so an offline pin surfaces as
+					// source_unavailable rather than planning against a stub.
+					(virtualPinnedProfileRowV3(session, currentEffectiveFile) &&
+						sessionCarriesVirtualEvidenceV3(session)))
 			if candidateUnchanged && evidenceComplete && !virtualDecodeRotation {
 				currentEffectiveFile.FilePath = session.VirtualSourceURI
 				currentEffectiveFile.VirtualOwnerInstallationID = session.VirtualSourceOwnerInstallationID
@@ -11258,6 +11270,49 @@ func virtualCandidateRotationRecordedV3(session *playback.Session, effectiveFile
 		return false
 	}
 	return session.VirtualSubtitleEvidenceSet && !virtualEvidenceMatchesBoundFile(effectiveFile, session)
+}
+
+// virtualPinnedProfileRowV3 reports whether the catalog row a replan loaded is
+// the provider-neutral counterpart of the session's pinned concrete candidate:
+// the same profile/release path, with the row carrying no concrete "result="
+// pick while the session pin names one. The provider mints and churns the
+// per-listing result id for bytes that never changed, so on a session serving a
+// concrete pick the reloaded catalog row can be the provider-neutral profile row
+// while the session stays bound to the concrete candidate. A user-intent replan
+// (track change or seek) must carry that pin instead of re-listing: requiring
+// result-id equality would reject the very binding the session is serving.
+func virtualPinnedProfileRowV3(session *playback.Session, row *models.MediaFile) bool {
+	if session == nil || row == nil {
+		return false
+	}
+	pinned := strings.TrimSpace(session.VirtualSourceURI)
+	rowPath := strings.TrimSpace(row.FilePath)
+	if pinned == "" || rowPath == "" {
+		return false
+	}
+	// The session pin must be the concrete candidate; the loaded row must be its
+	// provider-neutral profile, not another concrete pick. A different concrete
+	// result is a release substitution candidate and must keep re-resolving.
+	if virtualResultCandidateID(pinned) == "" || virtualResultCandidateID(rowPath) != "" {
+		return false
+	}
+	return virtualPlaybackNeutralKey(rowPath) == virtualPlaybackNeutralKey(pinned)
+}
+
+// sessionCarriesVirtualEvidenceV3 reports whether the session holds any
+// plan-time description of its pinned virtual bytes — probed/declared subtitle
+// or audio inventory, or the evidence provenance that anchors it. Carrying a
+// pin without any of these would plan against an undescribed release; the
+// caller then re-resolves so an offline pin surfaces through the existing
+// rotation semantics.
+func sessionCarriesVirtualEvidenceV3(session *playback.Session) bool {
+	if session == nil {
+		return false
+	}
+	return session.VirtualSubtitleEvidenceSet ||
+		len(session.VirtualAudioTracks) > 0 ||
+		len(session.VirtualSubtitleTracks) > 0 ||
+		strings.TrimSpace(session.VirtualSubtitleEvidenceURI) != ""
 }
 
 // planVirtualSourceRevisionV3 returns the opaque virtual-source revision the
