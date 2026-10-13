@@ -80,6 +80,25 @@ func TestRemapAudioSelectionIndexDuplicateSignatureFailsClosed(t *testing.T) {
 	}
 }
 
+// TestRemapAudioSelectionIndexAmbiguousExactMatchFailsClosed pins the ambiguity
+// guard against canonicalized language tags. Two verified tracks whose language
+// tags ("en" and "eng") canonicalize to the same language match the synthesized
+// selection equally well, so the exact lookup is ambiguous. The conservative
+// fallback compares raw strings and would admit exactly one of them (the raw
+// "en"), silently hiding the ambiguity and moving the transport onto a stream
+// the exact matcher refused to choose. An ambiguous exact match must therefore
+// return -1 without consulting the fallback.
+func TestRemapAudioSelectionIndexAmbiguousExactMatchFailsClosed(t *testing.T) {
+	plan := []models.AudioTrack{{Index: 0, Language: "en", Codec: "aac", Channels: 2, Layout: "stereo"}}
+	verified := []models.AudioTrack{
+		{Index: 0, Language: "en", Codec: "aac", Channels: 2, Layout: "stereo"},
+		{Index: 0, Language: "eng", Codec: "aac", Channels: 2, Layout: "stereo"},
+	}
+	if got := remapAudioSelectionIndex(plan, 0, verified); got != -1 {
+		t.Fatalf("remapped position = %d, want -1: en/eng are canonically equal, so the exact match is ambiguous and must not fall through to the raw-string fallback", got)
+	}
+}
+
 // TestRemapAudioSelectionIndexUniqueSignatureMatches pins the positive
 // exact-signature path: one verified track carries the selected track's full
 // signature (including its known title), so it is re-identified.

@@ -71,6 +71,21 @@ func TestDeferredProbeOverlayRemovedOrAmbiguousCommittedAudioFailsClosed(t *test
 			},
 			wantCarried: 2,
 		},
+		{
+			name: "canonically-equal distinct language tags are ambiguous",
+			plan: []models.AudioTrack{
+				{Index: 0, Language: "en", Codec: "aac", Channels: 2, Layout: "stereo"},
+			},
+			committed: 0,
+			// "en" and "eng" canonicalize to the same language, so the full
+			// signature ties exactly; the raw-string fallback would admit
+			// only "en" and silently hide the tie.
+			verified: []models.AudioTrack{
+				{Index: 0, Language: "en", Codec: "aac", Channels: 2, Layout: "stereo"},
+				{Index: 0, Language: "eng", Codec: "aac", Channels: 2, Layout: "stereo"},
+			},
+			wantCarried: 2,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

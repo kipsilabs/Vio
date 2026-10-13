@@ -116,9 +116,10 @@ func trackStringEqual(a, b string) bool {
 //
 // It returns -1 when the selected track cannot be uniquely re-identified: a
 // stream that is genuinely gone, a previously-trustworthy absolute index that is
-// absent, duplicate signatures, or an ambiguous fallback. The caller then
-// records a server-enforced invalid selection rather than leaving the plan-time
-// position in place to name whichever track now occupies it.
+// absent, a full-signature match that ties because several candidates are
+// canonically equivalent (e.g. "en" and "eng"), or an ambiguous fallback. The
+// caller then records a server-enforced invalid selection rather than leaving
+// the plan-time position in place to name whichever track now occupies it.
 func remapAudioSelectionIndex(prev []models.AudioTrack, selectedIndex int, next []models.AudioTrack) int {
 	if selectedIndex < 0 || selectedIndex >= len(prev) {
 		return -1
@@ -138,9 +139,17 @@ func remapAudioSelectionIndex(prev []models.AudioTrack, selectedIndex int, next 
 		}
 		return -1
 	}
-	// A unique full-signature match is the next strongest identity.
-	if idx := uniqueExactAudioTrack(next, AudioTrackSignatureFromTrack(selected)); idx >= 0 {
+	// A unique full-signature match is the next strongest identity. Ambiguity
+	// must fail closed here, before the fallback: the exact matcher canonicalizes
+	// language tags while the fallback compares raw strings, so an exact tie
+	// between e.g. "en" and "eng" would leave the fallback admitting the single
+	// raw-string match and silently hide the ambiguity instead of refusing to
+	// choose.
+	switch idx, match := matchExactAudioTrack(next, AudioTrackSignatureFromTrack(selected)); match {
+	case audioExactUnique:
 		return idx
+	case audioExactAmbiguous:
+		return -1
 	}
 	// Conservative fallback: transport-fact matched, unique-only, and never a
 	// candidate that contradicts a known identity fact. Two matches are
@@ -165,16 +174,36 @@ func remapAudioSelectionIndex(prev []models.AudioTrack, selectedIndex int, next 
 	return match
 }
 
-// uniqueExactAudioTrack returns the position in tracks that uniquely matches sig
+// audioExactMatch classifies the outcome of a full-signature lookup so the
+// caller can tell "no candidate matched" (safe to try the conservative
+// fallback) apart from "several candidates tied at the best language rank"
+// (ambiguous, must fail closed without consulting the weaker fallback).
+type audioExactMatch int
+
+const (
+	// audioExactAbsent means no candidate matched the full signature.
+	audioExactAbsent audioExactMatch = iota
+	// audioExactUnique means exactly one candidate matched at the best
+	// language rank.
+	audioExactUnique
+	// audioExactAmbiguous means several candidates tied at the best language
+	// rank, so no single stream can be re-identified.
+	audioExactAmbiguous
+)
+
+// matchExactAudioTrack returns the position in tracks that uniquely matches sig
 // by full signature (title, embedded title, codec, layout, channels, and MULTi
-// language multiset) at the best regional language rank. Unlike
-// findExactAudioTrack — which picks the first best-ranked match for preference
-// selection — it requires the best-ranked match to be unique, so an overlay
-// remap fails closed on duplicate signatures instead of selecting an arbitrary
-// track. It returns -1 when nothing matches or when the best rank is shared.
-func uniqueExactAudioTrack(tracks []models.AudioTrack, sig *userstore.AudioTrackSignature) int {
+// language multiset) at the best regional language rank, together with how the
+// lookup resolved. Unlike findExactAudioTrack — which picks the first
+// best-ranked match for preference selection — it requires the best-ranked match
+// to be unique, so an overlay remap fails closed on duplicate signatures instead
+// of selecting an arbitrary track. An absent match and an ambiguous one are
+// distinct outcomes: the caller may fall back only when nothing matched, because
+// the fallback's raw-string language comparison can admit one of an exactly-tied
+// set and hide the ambiguity.
+func matchExactAudioTrack(tracks []models.AudioTrack, sig *userstore.AudioTrackSignature) (int, audioExactMatch) {
 	if sig == nil || sig.IsZero() {
-		return -1
+		return -1, audioExactAbsent
 	}
 	best, bestRank, count := -1, lang.RankScriptConflict+1, 0
 	for i, track := range tracks {
@@ -192,10 +221,14 @@ func uniqueExactAudioTrack(tracks []models.AudioTrack, sig *userstore.AudioTrack
 			count++
 		}
 	}
-	if count == 1 {
-		return best
+	switch count {
+	case 0:
+		return -1, audioExactAbsent
+	case 1:
+		return best, audioExactUnique
+	default:
+		return -1, audioExactAmbiguous
 	}
-	return -1
 }
 
 // audioIdentityConflicts reports whether a candidate track contradicts a known
