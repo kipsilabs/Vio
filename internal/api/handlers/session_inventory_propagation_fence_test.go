@@ -481,6 +481,137 @@ func TestDeferredProbeExplicitSelectionPreservedAcrossOverlaySwap(t *testing.T) 
 	}
 }
 
+// flakyBoundRowResolver fails the bound row's read for the first `remaining`
+// reads, then delegates. It models a transient catalog read failure that clears
+// within the propagation retry bound.
+type flakyBoundRowResolver struct {
+	inner     FilePathResolver
+	failID    int
+	err       error
+	remaining int
+}
+
+func (r *flakyBoundRowResolver) GetByID(ctx context.Context, id int) (*models.MediaFile, error) {
+	if id == r.failID && r.remaining > 0 {
+		r.remaining--
+		return nil, r.err
+	}
+	return r.inner.GetByID(ctx, id)
+}
+
+func (r *flakyBoundRowResolver) GetByPath(ctx context.Context, path string) (*models.MediaFile, error) {
+	if pr, ok := r.inner.(interface {
+		GetByPath(context.Context, string) (*models.MediaFile, error)
+	}); ok {
+		return pr.GetByPath(ctx, path)
+	}
+	return nil, errors.New("no path resolver")
+}
+
+// canonicalProbeWithVerifiedWrite wires a successful prober and durable write on
+// the canonical fixture, so a test can drive the full deferred worker path.
+func canonicalProbeWithVerifiedWrite(t *testing.T, fx *canonicalCollectionFixture) {
+	t.Helper()
+	probedAt := time.Now().UTC()
+	fx.handler.VirtualPlaybackSourceProber = func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
+		f.AudioTracks = verifiedCanonicalAudio()
+		f.SubtitleTracks = verifiedCanonicalSubtitles()
+		f.CodecAudio = "eac3"
+		return f, nil
+	}
+	fx.handler.VirtualFileMetadataSaver = func(_ context.Context, args models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error) {
+		var audio []models.AudioTrack
+		if err := json.Unmarshal(args.AudioTracks, &audio); err != nil {
+			return VirtualFileMetadataUpdateResult{}, err
+		}
+		var subs []models.SubtitleTrack
+		if len(args.SubtitleTracks) > 0 {
+			if err := json.Unmarshal(args.SubtitleTracks, &subs); err != nil {
+				return VirtualFileMetadataUpdateResult{}, err
+			}
+		}
+		fx.resolver.update(args.FileID, func(f *models.MediaFile) {
+			f.AudioTracks = audio
+			f.SubtitleTracks = subs
+			f.CodecAudio = args.CodecAudio
+			f.ProbeUpdatedAt = &probedAt
+		})
+		return VirtualFileMetadataUpdateResult{MetadataUpdated: true, RowsAffected: 1}, nil
+	}
+}
+
+// TestDeferredProbePropagationExhaustedBoundReadFailsTerminally is the
+// persistent/deadline regression for the third P2 item: when the bound-row read
+// that proves release continuity fails through the whole retry bound (here with
+// a deadline), the session must not be left pending. The probe committed, but
+// the binding terminally fails so a client watching the poll or the push leaves
+// its loading state; the carried provisional overlay is untouched.
+func TestDeferredProbePropagationExhaustedBoundReadFailsTerminally(t *testing.T) {
+	identity := canonicalCollectionIdentity()
+	fx := setupCanonicalCollectionFixture(t, identity, identity)
+	canonicalProbeWithVerifiedWrite(t, fx)
+	fx.handler.fileResolver = &faultingBoundRowResolver{
+		inner:  fx.resolver,
+		failID: canonicalPinnedRowID,
+		err:    context.DeadlineExceeded,
+	}
+
+	deferred := readmitDeferredProbe(t, fx.handler, canonicalCollectionProbe(fx.session, *fx.canonicalRow, identity))
+	fx.handler.runDeferredVirtualProbe(deferred)
+
+	live, err := fx.manager.GetSession(fx.session.ID)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if live.VirtualProbeOutcome != probeOutcomeFailed {
+		t.Fatalf("exhausted bound reads left outcome %q, want the terminal failed so the client leaves loading", live.VirtualProbeOutcome)
+	}
+	if len(live.VirtualAudioTracks) != 1 || live.VirtualAudioTracks[0].Language != "jpn" {
+		t.Fatalf("carried audio = %+v, want the untouched provisional overlay", live.VirtualAudioTracks)
+	}
+	// The catalog outage is over: the poll must now report a terminal failed
+	// status so the client leaves loading instead of staying pending.
+	fx.handler.fileResolver = fx.resolver
+	inventory, err := fx.handler.GetPlaybackInventoryV2(newAuthorizedPlaybackContext(),
+		PlaybackCaller{UserID: 1, ProfileID: "profile-1", InstallationID: "test-install"}, fx.session.ID)
+	if err != nil {
+		t.Fatalf("GetPlaybackInventoryV2: %v", err)
+	}
+	if inventory.InventoryStatus != string(ProbeProvenanceFailed) {
+		t.Fatalf("polled inventory status = %q, want failed", inventory.InventoryStatus)
+	}
+}
+
+// TestDeferredProbePropagationTransientBoundReadRecovers is the transient case:
+// a bound-row read that fails once and then succeeds within the retry bound must
+// still propagate the committed inventory and record verified, never a terminal
+// failure.
+func TestDeferredProbePropagationTransientBoundReadRecovers(t *testing.T) {
+	identity := canonicalCollectionIdentity()
+	fx := setupCanonicalCollectionFixture(t, identity, identity)
+	canonicalProbeWithVerifiedWrite(t, fx)
+	fx.handler.fileResolver = &flakyBoundRowResolver{
+		inner:     fx.resolver,
+		failID:    canonicalPinnedRowID,
+		err:       errors.New("catalog unavailable"),
+		remaining: 1,
+	}
+
+	deferred := readmitDeferredProbe(t, fx.handler, canonicalCollectionProbe(fx.session, *fx.canonicalRow, identity))
+	fx.handler.runDeferredVirtualProbe(deferred)
+
+	live, err := fx.manager.GetSession(fx.session.ID)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if live.VirtualProbeOutcome != probeOutcomeVerified {
+		t.Fatalf("transient read failure left outcome %q, want verified after recovery", live.VirtualProbeOutcome)
+	}
+	if len(live.VirtualAudioTracks) != len(verifiedCanonicalAudio()) {
+		t.Fatalf("carried audio = %+v, want the committed verified inventory", live.VirtualAudioTracks)
+	}
+}
+
 // transportOrdinalForTrack is the audio-only stream ordinal a bound list assigns
 // to a chosen language's first track, mirroring what the transport hands ffmpeg
 // as 0:a:N.

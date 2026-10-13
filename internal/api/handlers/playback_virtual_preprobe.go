@@ -610,6 +610,15 @@ func (h *PlaybackHandler) runDeferredVirtualProbe(deferred *virtualDeferredProbe
 			if h.setVirtualProbeOutcomeIfGeneration(deferred.sessionID, deferred.bindingGeneration, probeOutcomeFailed) {
 				h.publishDeferredProbeInventory(deferred)
 			}
+		case probeInventoryUnprovable:
+			// The probe committed but release continuity could not be proven
+			// within the retry bound. Fail the binding terminally so a client
+			// watching the poll or the push leaves its loading state rather than
+			// staying pending until the convergence watchdog; the carried
+			// provisional overlay is untouched and a replan re-resolves.
+			if h.setVirtualProbeOutcomeIfGeneration(deferred.sessionID, deferred.bindingGeneration, probeOutcomeFailed) {
+				h.publishDeferredProbeInventory(deferred)
+			}
 		case probeInventorySuperseded:
 			// The binding rotated, the session carries no overlay capability, or
 			// a transient identity read never cleared; nothing is owed to this
@@ -660,6 +669,13 @@ const (
 	// carries no identity to confirm: the session fails closed instead of
 	// serving the committed inventory as verified.
 	probeInventoryRefused
+	// probeInventoryUnprovable means the committed inventory is in hand but the
+	// bound-row read that proves release continuity stayed unreadable through the
+	// whole retry bound. The session must leave its pending state rather than
+	// freeze: it terminally fails closed, exactly like a provable mismatch, and
+	// the client can replan. Distinct from refused so the log names a read
+	// exhaustion, not a proven different release.
+	probeInventoryUnprovable
 )
 
 // probePropagationAttempts bounds the fresh-context retries of a recoverable
@@ -709,8 +725,11 @@ func (h *PlaybackHandler) propagateVerifiedProbeInventory(deferred *virtualDefer
 			}
 			if retryable {
 				// Still unreadable after the retry bound: never publish verified
-				// over an inventory we could not prove belongs to this binding.
-				return probeInventorySuperseded
+				// over an inventory we could not prove belongs to this binding,
+				// but do not leave the session pending either. The caller records
+				// a fenced terminal failure so the client leaves its loading
+				// state instead of freezing until the convergence watchdog.
+				return probeInventoryUnprovable
 			}
 			return probeInventoryRefused
 		}
