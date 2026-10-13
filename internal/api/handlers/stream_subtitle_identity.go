@@ -298,7 +298,7 @@ func (h *StreamHandler) resolveSubtitleSourceRequest(
 	// it yields unavailable rather than reinterpreting an ordinal against the
 	// replacement.
 	if isVirtualPlaybackFile(bound) && session.VirtualSubtitleEvidenceSet &&
-		!virtualEvidenceMatchesBoundFile(bound, session) {
+		!virtualEvidenceMatchesBoundFile(ctx, bound, session, h.fileResolver) {
 		// The evidence file shares the bound file's row id, so the edition
 		// shortcut would discard the remap entirely. Call the remapper: this
 		// is exactly the same-row rotation case it exists for.
@@ -353,7 +353,7 @@ func (h *StreamHandler) resolveSubtitleSourceRequest(
 		return h.resolveDownloadedSubtitle(ctx, bound, pin)
 	}
 	if isVirtualPlaybackFile(bound) && session.VirtualSubtitleEvidenceSet &&
-		virtualEvidenceMatchesBoundFile(bound, session) &&
+		virtualEvidenceMatchesBoundFile(ctx, bound, session, h.fileResolver) &&
 		!hasApplicableSubtitleEvidence(session, query) {
 		return nil, 0, errSubtitleIdentityUnavailable
 	}

@@ -605,6 +605,17 @@ func (h *PlaybackHandler) commitVerifiedProbeInventoryToSession(ctx context.Cont
 			"component", "api", "session", deferred.sessionID, "file_id", verifiedFileID, "error", err)
 		return
 	}
+	// Fail closed on a cross-release commit. The committed row is not always the
+	// row the session serves: a canonical collection probe commits the release's
+	// evidence onto the neutral row while the session is bound to a result-pinned
+	// sibling. That is only acceptable when the two rows provably name one
+	// release, so a stale or sibling-release commit never replaces the carried
+	// overlay (and every remap that reads it) with another release's inventory.
+	if !h.committedProbeMatchesSessionBinding(ctx, deferred.sessionID, verified) {
+		slog.WarnContext(ctx, "verified probe inventory not propagated: committed row is a different release than the session binding",
+			"component", "api", "session", deferred.sessionID, "file_id", verifiedFileID)
+		return
+	}
 	applied, err := writer.CommitVirtualProbeTracksIfGeneration(
 		deferred.sessionID, deferred.bindingGeneration, verifiedProbeInventoryRevision(verified),
 		verified.AudioTracks, verified.SubtitleTracks, verified.ExternalSubtitles,
@@ -618,6 +629,33 @@ func (h *PlaybackHandler) commitVerifiedProbeInventoryToSession(ctx context.Cont
 		slog.DebugContext(ctx, "verified probe inventory propagation dropped: candidate binding moved",
 			"component", "api", "session", deferred.sessionID, "file_id", verifiedFileID, "generation", deferred.bindingGeneration)
 	}
+}
+
+// committedProbeMatchesSessionBinding reports whether the row a deferred probe
+// just committed describes the release the live session is bound to, so its
+// tracks may replace the session's carried overlay. A commit onto the session's
+// own row always matches. A commit onto a different row (the canonical
+// collection sibling) matches only when the two rows provably name one release;
+// an unreadable binding, an unreadable bound row, or a shared-tier failure all
+// fail closed.
+func (h *PlaybackHandler) committedProbeMatchesSessionBinding(ctx context.Context, sessionID string, verified *models.MediaFile) bool {
+	if h == nil || h.fileResolver == nil || h.sessionMgr == nil || verified == nil {
+		return false
+	}
+	live, err := h.sessionMgr.GetSession(sessionID)
+	if err != nil || live == nil {
+		return false
+	}
+	if live.MediaFileID <= 0 || live.MediaFileID == verified.ID {
+		// The committed row is the session's own effective row; there is no
+		// cross-row release question to answer.
+		return true
+	}
+	bound, err := h.fileResolver.GetByID(ctx, live.MediaFileID)
+	if err != nil || bound == nil {
+		return false
+	}
+	return boundRowSharesRelease(bound, verified)
 }
 
 // verifiedProbeInventoryRevision names the verified inventory generation a

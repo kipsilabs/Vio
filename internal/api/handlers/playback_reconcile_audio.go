@@ -225,7 +225,7 @@ func (h *PlaybackHandler) reconcileAutoAudioSelection(ctx context.Context, sessi
 		h.recordAudioReconcileDecision(ctx, live.ID, generation, playback.AudioReconcileEntryV3{Generation: generation, SessionID: live.ID, Decision: playback.AudioReconcileRefused})
 		return
 	}
-	if !virtualEvidenceMatchesBoundFile(verified, live) {
+	if !virtualEvidenceMatchesBoundFile(ctx, verified, live, h.fileResolver) {
 		// Source rotation (or a sibling-row write) means this evidence is
 		// stale for the bound session: refuse, and surface the still-valid
 		// tracks in memory only, exactly like the refused-write path.
@@ -1284,7 +1284,7 @@ func (h *PlaybackHandler) verifyExplicitAudioSelection(ctx context.Context, sess
 	if err != nil || live == nil {
 		return
 	}
-	if !virtualEvidenceMatchesBoundFile(verified, live) {
+	if !virtualEvidenceMatchesBoundFile(ctx, verified, live, h.fileResolver) {
 		return
 	}
 	var record *playback.AttemptRecordV3

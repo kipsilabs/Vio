@@ -1283,7 +1283,7 @@ func (h *PlaybackHandler) PublishSourceCommitted(ctx context.Context, sessionID 
 	// no longer names the live effective row is never probed or persisted.
 	if h.fileResolver != nil && session.VirtualSourceURI != "" {
 		if file, loadErr := h.fileResolver.GetByID(ctx, session.MediaFileID); loadErr == nil && file != nil &&
-			virtualCandidateRotationRecordedV3(session, file) {
+			virtualCandidateRotationRecordedV3(ctx, session, file, h.fileResolver) {
 			h.refreshRotatedVirtualCandidateBackground(ctx, session, generation, file)
 		}
 	}
