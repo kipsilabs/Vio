@@ -103,6 +103,87 @@ func TestLogVirtualStreamFailureDowngradesClientCancellation(t *testing.T) {
 // the sibling, not the pin; a resolve failure that never served one reports
 // both identities honestly (pin set, delivered empty).
 func TestLogVirtualStreamFailureCarriesSessionAndCandidate(t *testing.T) {
+	capture := func(t *testing.T, fn func()) map[string]any {
+		t.Helper()
+		var buf bytes.Buffer
+		previous := slog.Default()
+		slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+		t.Cleanup(func() { slog.SetDefault(previous) })
+
+		fn()
+
+		for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+			if line == "" {
+				continue
+			}
+			var entry map[string]any
+			if err := json.Unmarshal([]byte(line), &entry); err != nil {
+				continue
+			}
+			if entry["msg"] == "virtual stream rotation outcome" {
+				return entry
+			}
+		}
+		t.Fatalf("no virtual stream rotation outcome line captured; log was:\n%s", buf.String())
+		return nil
+	}
+
+	file := &models.MediaFile{ID: 7, FilePath: "virtual://movie/tt14538850?result=cand-9"}
+
+	// A sibling that served: rotation_served names it, served=true.
+	entry := capture(t, func() {
+		logVirtualRotationOutcome(context.Background(), "session-9", file, "cand-9",
+			ResolvedVirtualMedia{URI: "virtual://movie/tt14538850?result=cand-4", CandidateID: "cand-4"}, nil, true, nil)
+	})
+	if entry["status"] != "rotation_served" {
+		t.Fatalf("status = %#v, want rotation_served", entry["status"])
+	}
+	if entry["refreshed_candidate_id"] != "cand-4" {
+		t.Fatalf("refreshed_candidate_id = %#v, want cand-4 (the sibling, not the pin)", entry["refreshed_candidate_id"])
+	}
+	if entry["failed_candidate_id"] != "cand-9" {
+		t.Fatalf("failed_candidate_id = %#v, want cand-9", entry["failed_candidate_id"])
+	}
+	if entry["served"] != true {
+		t.Fatalf("served = %#v, want true", entry["served"])
+	}
+	if entry["session"] != "session-9" || entry["playback_session_id"] != "session-9" {
+		t.Fatalf("join keys = %#v/%#v, want session-9", entry["session"], entry["playback_session_id"])
+	}
+
+	// A sibling that also failed: rotation_sibling_failed with the attempt's error.
+	entry = capture(t, func() {
+		logVirtualRotationOutcome(context.Background(), "session-9", file, "cand-9",
+			ResolvedVirtualMedia{URI: "virtual://movie/tt14538850?result=cand-4", CandidateID: "cand-4"}, nil, false, errors.New("relay returned HTTP 502"))
+	})
+	if entry["status"] != "rotation_sibling_failed" {
+		t.Fatalf("status = %#v, want rotation_sibling_failed", entry["status"])
+	}
+
+	// A resolve failure: rotation_resolve_failed, distinct from a sibling failure.
+	entry = capture(t, func() {
+		logVirtualRotationOutcome(context.Background(), "session-9", file, "cand-9",
+			ResolvedVirtualMedia{}, errors.New("no streams available from provider"), false, nil)
+	})
+	if entry["status"] != "rotation_resolve_failed" {
+		t.Fatalf("status = %#v, want rotation_resolve_failed", entry["status"])
+	}
+
+	// A guard refusal: rotation_guard_refused, distinct from both.
+	entry = capture(t, func() {
+		logVirtualRotationOutcome(context.Background(), "session-9", file, "",
+			ResolvedVirtualMedia{URI: "virtual://movie/tt14538850?result=cand-9", CandidateID: "cand-9"}, nil, false, nil)
+	})
+	if entry["status"] != "rotation_guard_refused" {
+		t.Fatalf("status = %#v, want rotation_guard_refused", entry["status"])
+	}
+}
+
+// The rotation outcome line names the recovery half of the join: which
+// candidate the retry resolved and whether that attempt delivered. A sibling
+// that also failed is distinguishable from a rotation that never ran, and a
+// guard refusal is distinguishable from both.
+func TestLogVirtualRotationOutcomeNamesRecovery(t *testing.T) {
 	capture := func(t *testing.T, file *models.MediaFile, err error, delivered ...string) map[string]any {
 		t.Helper()
 		var buf bytes.Buffer

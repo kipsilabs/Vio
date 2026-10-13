@@ -1111,6 +1111,48 @@ func virtualProxyDisposition(ctx context.Context, proxyErr error, statusCode int
 	return virtualProxyDispositionFailedOpen
 }
 
+// logVirtualRotationOutcome records the serve-layer rotation's recovery
+// outcome: which candidate the retry resolved and whether that attempt then
+// delivered bytes. The first-attempt proxy verdict (logVirtualProxyVerdict)
+// names the failure; this line names the recovery, so a later
+// virtual_stream_unavailable is a join, not forensics. Provider URLs never
+// appear here: only provider-neutral virtual URIs. A rotation whose sibling
+// also failed logs served=false with that attempt's error; a guard refusal
+// logs served=false with the refusal reason. Client cancellation stays
+// debug; a genuine recovery outcome keeps its level (INFO on delivery,
+// WARN otherwise) so it stays visible in the operational log.
+func logVirtualRotationOutcome(ctx context.Context, sessionID string, file *models.MediaFile, failedCandidateID string, refreshed ResolvedVirtualMedia, refreshErr error, served bool, serveErr error) {
+	pinnedID := virtualCandidateID(file)
+	attrs := []any{
+		logComponentKey, "api", //nolint:goconst // log attribute key/value, kept inline for readability.
+		virtualVerdictLogKeySession, sessionID,
+		virtualVerdictLogKeyPlaybackSession, sessionID,
+		"pinned_candidate_id", pinnedID,
+		"failed_candidate_id", failedCandidateID,
+		"refreshed_candidate_id", refreshed.CandidateID,
+		"refreshed_uri", refreshed.URI,
+		"served", served,
+	}
+	if file != nil {
+		attrs = append(attrs, "file_id", file.ID)
+	}
+	switch {
+	case refreshErr != nil:
+		attrs = append(attrs, "status", "rotation_resolve_failed", "error", logredact.SanitizeURLError(refreshErr))
+		slog.WarnContext(ctx, "virtual stream rotation outcome", attrs...)
+	case !served:
+		if serveErr != nil {
+			attrs = append(attrs, "status", "rotation_sibling_failed", "error", logredact.SanitizeURLError(serveErr))
+		} else {
+			attrs = append(attrs, "status", "rotation_guard_refused")
+		}
+		slog.WarnContext(ctx, "virtual stream rotation outcome", attrs...)
+	default:
+		attrs = append(attrs, "status", "rotation_served")
+		slog.InfoContext(ctx, "virtual stream rotation outcome", attrs...)
+	}
+}
+
 // logVirtualProxyVerdict records the first-attempt serve verdict of a failed
 // direct-play proxy: the session, the pinned candidate, the candidate the
 // attempt served, and the disposition above. The delivered candidate id is the
@@ -1120,15 +1162,12 @@ func virtualProxyDisposition(ctx context.Context, proxyErr error, statusCode int
 // never appear here: only provider-neutral virtual URIs. Client cancellation
 // logs at debug; a genuine failure keeps its WARN so it stays visible in the
 // operational log. The verdict is first-attempt classification, not the final
-// recovery outcome: a later heal or rotation can still serve the request.
+// recovery outcome: a later heal or rotation can still serve the request (see
+// logVirtualRotationOutcome for that half of the join).
 //
 // The attribute keys are the verdict's join contract (session,
 // playback_session_id, candidate ids, disposition), pinned by
-// TestLogVirtualProxyVerdictCarriesJoinKeys. Provider URLs never appear
-// here: only provider-neutral virtual URIs. Client cancellation logs at
-// debug; a genuine failure keeps its WARN so it stays visible in the
-// operational log. The verdict is first-attempt classification, not the final
-// recovery outcome: a later heal or rotation can still serve the request.
+// TestLogVirtualProxyVerdictCarriesJoinKeys.
 func logVirtualProxyVerdict(ctx context.Context, sessionID string, file *models.MediaFile, deliveredPath, disposition string, proxyErr error) {
 	pinnedID := virtualCandidateID(file)
 	deliveredID := virtualResultCandidateID(deliveredPath)
@@ -1752,6 +1791,7 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 									refreshCleanup()
 								}
 								lastProxyErr = fmt.Errorf("refreshed candidate %q does not match pinned candidate %q", refreshedMedia.CandidateID, expectedCandidateID)
+								logVirtualRotationOutcome(r.Context(), sessionID, file, failedID, refreshedMedia, nil, false, lastProxyErr)
 							} else {
 								// Release any adopted registration first: the
 								// same-release retry above may hold one, and
@@ -1779,9 +1819,25 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 										relayTemporary = false
 										relayNotFound = false
 										proxy.ServeHTTP(streamWriter, r)
+										// Name the recovery: which sibling the
+										// retry resolved and whether it
+										// delivered. Without this the
+										// first-attempt verdict is the only
+										// evidence and a sibling that also
+										// failed is indistinguishable from a
+										// rotation that never ran.
+										logVirtualRotationOutcome(r.Context(), sessionID, file, failedID, refreshedMedia, nil,
+											lastProxyErr == nil && virtualCandidateDeliveryEvidence(streamWriter.StatusCode(), streamWriter.BytesWritten()), lastProxyErr)
+									} else {
+										logVirtualRotationOutcome(r.Context(), sessionID, file, failedID, refreshedMedia, nil, false,
+											fmt.Errorf("refreshed candidate target %q is not the local relay", refreshedURL.Host))
 									}
+								} else {
+									logVirtualRotationOutcome(r.Context(), sessionID, file, failedID, refreshedMedia, nil, false, parseErr)
 								}
 							}
+						} else {
+							logVirtualRotationOutcome(r.Context(), sessionID, file, failedID, ResolvedVirtualMedia{}, refreshErr, false, nil)
 						}
 					}
 				}
