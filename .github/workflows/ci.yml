@@ -399,6 +399,14 @@ jobs:
       - name: Test Jellyfin detail preferences against Postgres
         run: go test -race -count=1 -run '^TestCompatDetailServiceResolvesViewerSubtitleDefaultsPostgres$' ./cmd/silo/
 
+      # The bounded-adoption refusal reconciliation commits the evidence write,
+      # the exact-pin clear and the terminal decision in one transaction, so its
+      # proofs need a real database: the clear cannot be interrupted between the
+      # two statements and a concurrent evidence write wins over a stale
+      # terminal. testdb re-migrates a disposable clone of silo_test.
+      - name: Test bounded adoption refusal reconciliation against Postgres
+        run: go test -race -count=1 -run '^(TestVirtualAdoption.*DB|TestVirtualAdoptionRefusalStoreDB.*)$' ./internal/api/handlers/
+
   lint:
     name: Go lint (changed lines)
     runs-on: ubuntu-latest
