@@ -350,23 +350,23 @@ func virtualResolvedURLExpired(expiresAt time.Time, now time.Time) bool {
 }
 
 // virtualResolveContextWithPersistedTrust threads the row's durable identity
-// and, when the row is inside the trust window, marks the resolve as allowed to
-// keep trusting that persisted same-identity candidate even when the provider's
-// current list omits it. Trust requires durable identity plus transport
-// evidence: a stored resolved_url means the row resolved at least once, and a
+// and, when the row is inside the trust window and carries transport evidence,
+// marks the resolve as allowed to keep trusting that persisted candidate even
+// when the provider's current list omits it. Trust requires transport evidence:
+// a stored resolved_url means the row resolved at least once, and a
 // last_delivered_at means it actually delivered bytes. A row that delivered
 // before persisted URLs existed carries no URL but does carry a delivery stamp,
-// so it can still be trusted: the resolver re-identifies the same candidate by
-// its durable identity instead of by a stored URL, and never serves a sibling.
-// A row with no identity, no URL and no delivery stamp has no persisted
-// candidate to prefer and keeps the pre-window refusal/rotation behavior. A zero
-// window likewise leaves the context untouched.
+// so it can still be trusted. Durable identity is threaded when present so a
+// renumbered same-release candidate is re-matched, but it is not required for
+// trust: an identity-less row with transport evidence is still the viewer's
+// selection, so a delisted pin is refused with the trust sentinel instead of the
+// rotation sentinel and the handler re-serves its stored URL rather than
+// rotating to a sibling. A row with no URL and no delivery stamp has no
+// persisted candidate to prefer and keeps the pre-window refusal/rotation
+// behavior. A zero window likewise leaves the context untouched.
 func virtualResolveContextWithPersistedTrust(ctx context.Context, row *models.MediaFile, now time.Time, window time.Duration) context.Context {
 	ctx = virtualResolveContextWithPersistedIdentity(ctx, row)
 	if row == nil {
-		return ctx
-	}
-	if _, ok := persistedVirtualIdentity(row); !ok {
 		return ctx
 	}
 	if strings.TrimSpace(row.ResolvedURL) == "" && row.LastDeliveredAt == nil {

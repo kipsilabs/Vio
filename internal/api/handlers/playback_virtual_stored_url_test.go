@@ -679,10 +679,13 @@ func TestVirtualResolveContextTrustsDeliveredURLLessRow(t *testing.T) {
 	}
 }
 
-// TestVirtualResolveContextRejectsURLLessRowWithoutIdentity proves trust still
-// requires the row's own durable identity: a URL-less row with no identity is
-// never trusted, so no sibling can be pinned to it.
-func TestVirtualResolveContextRejectsURLLessRowWithoutIdentity(t *testing.T) {
+// TestVirtualResolveContextTrustsIdentitylessDeliveredRow proves the trust
+// predicate accepts an identity-less row that carries transport evidence (a
+// recorded delivery) inside the window. It is still the viewer's selection, so a
+// delisted pin must refuse a sibling and re-serve the stored evidence rather than
+// rotate; durable identity only adds the ability to re-match a renumbered same
+// release on top of that.
+func TestVirtualResolveContextTrustsIdentitylessDeliveredRow(t *testing.T) {
 	const pinned = "virtual://movie/tt-urlless-noid?result=cand-a"
 	now := time.Now()
 	row := &models.MediaFile{
@@ -692,8 +695,31 @@ func TestVirtualResolveContextRejectsURLLessRowWithoutIdentity(t *testing.T) {
 		LastDeliveredAt: &now,
 	}
 	ctx := virtualResolveContextWithPersistedTrust(context.Background(), row, now, 720*time.Hour)
+	if !virtuallibrary.PersistedCandidateTrusted(ctx) {
+		t.Fatal("a delivered row inside the window must be trusted even without a durable identity")
+	}
+	if _, ok := virtuallibrary.PersistedCandidateIdentityFromContext(ctx); ok {
+		t.Fatal("an identity-less row must not thread a durable identity")
+	}
+}
+
+// TestVirtualResolveContextRejectsRowWithoutTransportEvidence proves trust still
+// requires transport evidence: a row that never resolved and never delivered has
+// no persisted candidate to prefer, so it keeps the pre-window refusal/rotation
+// behavior even when the window is open.
+func TestVirtualResolveContextRejectsRowWithoutTransportEvidence(t *testing.T) {
+	const pinned = "virtual://movie/tt-no-evidence?result=cand-a"
+	now := time.Now()
+	row := &models.MediaFile{
+		ID:                  105,
+		FilePath:            pinned,
+		UpdatedAt:           now,
+		ProviderVideoHash:   "hash-a",
+		ProviderReleaseName: "Movie.2024.1080p",
+	}
+	ctx := virtualResolveContextWithPersistedTrust(context.Background(), row, now, 720*time.Hour)
 	if virtuallibrary.PersistedCandidateTrusted(ctx) {
-		t.Fatal("a URL-less row without identity must never be trusted")
+		t.Fatal("a row with no stored URL and no delivery stamp must never be trusted")
 	}
 }
 
