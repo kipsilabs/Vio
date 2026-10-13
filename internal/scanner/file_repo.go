@@ -1924,12 +1924,16 @@ const VirtualCandidateDeliveryGrace = 7 * 24 * time.Hour
 // virtualCandidateFailureGracePredicate is the SQL predicate the transport
 // failed_at stamp applies: known-good rows inside the delivery grace are
 // skipped, while rows that never delivered (or whose last delivery is stale)
-// stamp as before. It consumes the query's next placeholder as the grace in
-// seconds. The decode-rejection stamp deliberately omits this clause: bytes
-// that cannot be decoded are unplayable regardless of delivery evidence. The
-// transport no-bytes marker in NewRouter delegates here (MarkVirtualCandidateFailed),
-// so this predicate is the single definition of the rule.
-const virtualCandidateFailureGracePredicate = `(last_delivered_at IS NULL OR last_delivered_at < NOW() - make_interval(secs => $4))`
+// stamp as before. gracePlaceholder is the 1-based index of the query
+// placeholder that carries the grace in seconds, so the one rule can be embedded
+// in statements whose placeholders differ. The decode-rejection stamp
+// deliberately omits this clause: bytes that cannot be decoded are unplayable
+// regardless of delivery evidence. The transport no-bytes marker in NewRouter
+// delegates here (MarkVirtualCandidateFailed), so this predicate is the single
+// definition of the rule.
+func virtualCandidateFailureGracePredicate(gracePlaceholder int) string {
+	return fmt.Sprintf(`(last_delivered_at IS NULL OR last_delivered_at < NOW() - make_interval(secs => $%d))`, gracePlaceholder)
+}
 
 // MarkVirtualCandidateFailed stamps a virtual candidate row as known-bad after
 // a transport produced no bytes (corrupted NZB, dead provider URL). The
@@ -1988,7 +1992,7 @@ func (r *FileRepository) markVirtualCandidateFailed(ctx context.Context, fileID 
 	args := []any{fileID, expectedFilePath, observedFailedAt}
 	if applyGrace {
 		query += `
-		  AND ` + virtualCandidateFailureGracePredicate
+		  AND ` + virtualCandidateFailureGracePredicate(4)
 		args = append(args, VirtualCandidateDeliveryGrace.Seconds())
 	}
 	_, err := r.pool.Exec(ctx, query, args...)
@@ -2039,6 +2043,269 @@ func (r *FileRepository) MarkVirtualCandidateRecovered(ctx context.Context, file
 	}
 	_, err := r.pool.Exec(ctx, `UPDATE media_files SET failed_at = NULL, last_delivered_at = NOW(), updated_at = NOW() WHERE id = $1 AND file_path = $2 AND failed_at IS NOT DISTINCT FROM $3 AND (container = 'virtual' OR file_path LIKE 'virtual://%')`, fileID, deliveredFilePath, observedFailedAt)
 	return err
+}
+
+// recordVirtualAdoptionRefusalSQL atomically increments the consecutive-refusal
+// count for one (file, pinned path). The CASE restarts the count when the
+// previous mark has expired, so a refusal stream separated by more than the TTL
+// does not accumulate; the ON CONFLICT upsert makes the increment safe under
+// concurrent replicas.
+const recordVirtualAdoptionRefusalSQL = `
+	INSERT INTO virtual_adoption_refusals (file_id, expected_path, refusal_count, expires_at)
+	VALUES ($1, $2, 1, now() + ($3 * interval '1 second'))
+	ON CONFLICT (file_id, expected_path) DO UPDATE
+	SET refusal_count = CASE
+	        WHEN virtual_adoption_refusals.expires_at > now()
+	        THEN virtual_adoption_refusals.refusal_count + 1
+	        ELSE 1
+	    END,
+	    expires_at = now() + ($3 * interval '1 second')
+	RETURNING refusal_count
+`
+
+// sweepVirtualAdoptionRefusalsSQL deletes a bounded batch of expired marks so
+// the table cannot retain refusal state past its window. It is best-effort and
+// intentionally bounded: the sweep runs alongside the rare refusal write, not as
+// a table-wide scan.
+const sweepVirtualAdoptionRefusalsSQL = `
+	DELETE FROM virtual_adoption_refusals
+	WHERE ctid IN (
+	    SELECT ctid FROM virtual_adoption_refusals
+	    WHERE expires_at <= now()
+	    LIMIT $1
+	)
+`
+
+// virtualAdoptionRefusalSweepBatch caps how many expired marks one refusal write
+// reclaims.
+const virtualAdoptionRefusalSweepBatch = 512
+
+// RecordVirtualAdoptionRefusal atomically increments the durable
+// consecutive-refusal count for one virtual row and pinned path and returns the
+// new count. It is the cross-replica trigger that reaches the bounded-refusal
+// decision: a restarted process or a different replica continues the same count
+// instead of restarting at zero, so the durable terminal decision is reached
+// regardless of which replica served the earlier refusals. An entry older than
+// ttl is treated as absent and restarts at one, so a provider that recovers is
+// not permanently treated as stale.
+//
+// It returns the current database error unchanged; callers must treat a store
+// error as a recoverable infrastructure failure, never as a refusal.
+func (r *FileRepository) RecordVirtualAdoptionRefusal(ctx context.Context, fileID int, expectedPath string, ttl time.Duration) (int, error) {
+	if r == nil || r.pool == nil {
+		return 0, errors.New("file repository is not configured")
+	}
+	if fileID <= 0 || strings.TrimSpace(expectedPath) == "" || ttl <= 0 {
+		return 0, nil
+	}
+	var count int
+	if err := r.pool.QueryRow(ctx, recordVirtualAdoptionRefusalSQL, fileID, expectedPath, ttl.Seconds()).Scan(&count); err != nil {
+		return 0, err
+	}
+	// Bounded, best-effort reclamation of expired marks; a failure here changes
+	// nothing about the count just recorded.
+	_, _ = r.pool.Exec(ctx, sweepVirtualAdoptionRefusalsSQL, virtualAdoptionRefusalSweepBatch)
+	return count, nil
+}
+
+// ClearVirtualAdoptionRefusal drops the durable refusal mark for one row and
+// pinned path after a write landed, so the bound resets on success. A missing
+// row is not an error.
+func (r *FileRepository) ClearVirtualAdoptionRefusal(ctx context.Context, fileID int, expectedPath string) error {
+	if r == nil || r.pool == nil {
+		return errors.New("file repository is not configured")
+	}
+	if fileID <= 0 || strings.TrimSpace(expectedPath) == "" {
+		return nil
+	}
+	_, err := r.pool.Exec(ctx, `DELETE FROM virtual_adoption_refusals WHERE file_id = $1 AND expected_path = $2`, fileID, expectedPath)
+	return err
+}
+
+// CountVirtualAdoptionRefusal returns the live durable consecutive-refusal count
+// for one row and pinned path, or zero when no live mark exists. It never
+// increments, so a caller can decide whether the bound was reached without
+// itself advancing the count.
+func (r *FileRepository) CountVirtualAdoptionRefusal(ctx context.Context, fileID int, expectedPath string) (int, error) {
+	if r == nil || r.pool == nil {
+		return 0, errors.New("file repository is not configured")
+	}
+	if fileID <= 0 || strings.TrimSpace(expectedPath) == "" {
+		return 0, nil
+	}
+	var count int
+	err := r.pool.QueryRow(ctx, `SELECT refusal_count FROM virtual_adoption_refusals WHERE file_id = $1 AND expected_path = $2 AND expires_at > now()`, fileID, expectedPath).Scan(&count)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+// RecordVirtualAdoptionRefusalTx is RecordVirtualAdoptionRefusal bound to the
+// caller's transaction, so the increment commits atomically with the evidence
+// write or terminal decision it belongs to. The atomic upsert and TTL semantics
+// are identical to the pool variant; the expired-row sweep is deliberately not
+// run here (it would acquire a second pooled connection while the transaction is
+// open). The caller runs SweepVirtualAdoptionRefusals best-effort after commit.
+func (r *FileRepository) RecordVirtualAdoptionRefusalTx(ctx context.Context, tx pgx.Tx, fileID int, expectedPath string, ttl time.Duration) (int, error) {
+	if r == nil || tx == nil {
+		return 0, errors.New("file repository is not configured")
+	}
+	if fileID <= 0 || strings.TrimSpace(expectedPath) == "" || ttl <= 0 {
+		return 0, nil
+	}
+	var count int
+	if err := tx.QueryRow(ctx, recordVirtualAdoptionRefusalSQL, fileID, expectedPath, ttl.Seconds()).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+// lockVirtualAdoptionRowSQL takes the media_files row lock the locked refusal
+// recorder serializes on. It is the same lock the transactional evidence saver
+// takes first, so every replica reconciles one row in the same order
+// (media_files before virtual_adoption_refusals) and cannot deadlock.
+const lockVirtualAdoptionRowSQL = `SELECT id FROM media_files WHERE id = $1 FOR UPDATE`
+
+// RecordVirtualAdoptionRefusalLocked records one consecutive refusal for a
+// virtual row and pinned path under the media_files row lock, so a refusal
+// increment taken outside the evidence transaction (the same-release sibling
+// rotation trigger) serializes on the same row-first order as the evidence write
+// and its clear. It reports the live count read under that lock, so a bound
+// decision cannot rest on a count a concurrent evidence write or clear has
+// already invalidated. A missing row is a no-op: there is nothing to count
+// against, and a refusal row for a vanished file would only fail its foreign
+// key. The expired-row sweep runs best-effort after commit.
+func (r *FileRepository) RecordVirtualAdoptionRefusalLocked(ctx context.Context, fileID int, expectedPath string, ttl time.Duration) (int, error) {
+	if r == nil || r.pool == nil {
+		return 0, errors.New("file repository is not configured")
+	}
+	if fileID <= 0 || strings.TrimSpace(expectedPath) == "" || ttl <= 0 {
+		return 0, nil
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("begin adoption refusal transaction: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(context.Background())
+		}
+	}()
+
+	var lockedID int
+	lockErr := tx.QueryRow(ctx, lockVirtualAdoptionRowSQL, fileID).Scan(&lockedID)
+	if errors.Is(lockErr, pgx.ErrNoRows) {
+		return 0, nil
+	}
+	if lockErr != nil {
+		return 0, fmt.Errorf("lock virtual row for adoption refusal: %w", lockErr)
+	}
+
+	count, err := r.RecordVirtualAdoptionRefusalTx(ctx, tx, fileID, expectedPath, ttl)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("commit adoption refusal transaction: %w", err)
+	}
+	committed = true
+	_, _ = r.pool.Exec(ctx, sweepVirtualAdoptionRefusalsSQL, virtualAdoptionRefusalSweepBatch)
+	return count, nil
+}
+
+// ClearVirtualAdoptionRefusalTx is ClearVirtualAdoptionRefusal bound to the
+// caller's transaction, so a successful evidence write and the exact-pin clear
+// commit together. A cancel or database interruption can therefore never leave a
+// cleared write behind a still-live threshold, or a live threshold behind a
+// committed write.
+func (r *FileRepository) ClearVirtualAdoptionRefusalTx(ctx context.Context, tx pgx.Tx, fileID int, expectedPath string) error {
+	if r == nil || tx == nil {
+		return errors.New("file repository is not configured")
+	}
+	if fileID <= 0 || strings.TrimSpace(expectedPath) == "" {
+		return nil
+	}
+	_, err := tx.Exec(ctx, `DELETE FROM virtual_adoption_refusals WHERE file_id = $1 AND expected_path = $2`, fileID, expectedPath)
+	return err
+}
+
+// SweepVirtualAdoptionRefusals runs the bounded, best-effort reclamation of
+// expired refusal marks. The transactional record path hands the sweep to the
+// caller's post-commit step so the sweep never holds a second connection inside
+// the transaction; a failure changes nothing about any recorded count.
+func (r *FileRepository) SweepVirtualAdoptionRefusals(ctx context.Context) error {
+	if r == nil || r.pool == nil {
+		return errors.New("file repository is not configured")
+	}
+	_, err := r.pool.Exec(ctx, sweepVirtualAdoptionRefusalsSQL, virtualAdoptionRefusalSweepBatch)
+	return err
+}
+
+// virtualAdoptionTerminalRefusalSQL stamps the durable terminal refusal for a
+// row whose pinned adoption the bounded decision has exhausted. It is fenced on
+// the candidate identity AND the evidence revision the decision observed: the
+// row is only stamped while it still describes the exact candidate and still
+// carries the updated_at/probe_updated_at the decision was taken from. A newer
+// evidence write that advanced the row therefore wins over a stale terminal
+// instead of being condemned by it. The transport delivery grace is applied like
+// MarkVirtualCandidateFailed, so a release that recently delivered is not
+// terminally fenced by refusals alone.
+var virtualAdoptionTerminalRefusalSQL = `
+	UPDATE media_files SET failed_at = NOW(), updated_at = NOW()
+	WHERE id = $1
+	  AND file_path = $2
+	  AND failed_at IS NOT DISTINCT FROM $3
+	  AND updated_at = $4
+	  AND probe_updated_at IS NOT DISTINCT FROM $5
+	  AND (container = 'virtual' OR file_path LIKE 'virtual://%')
+	  AND ` + virtualCandidateFailureGracePredicate(6) + `
+	RETURNING id
+`
+
+// markVirtualAdoptionTerminalRefusal is the shared terminal stamp behind the
+// pool and transaction entry points. q is the pool or the caller's transaction;
+// it reports whether a marker was installed. A stale revision (a newer evidence
+// write committed since the decision) makes the stamp a no-op rather than a
+// stale terminal.
+func (r *FileRepository) markVirtualAdoptionTerminalRefusal(ctx context.Context, q fileQueryer, fileID int, expectedFilePath string, observedFailedAt *time.Time, observedUpdatedAt time.Time, observedProbeUpdatedAt *time.Time) (bool, error) {
+	if r == nil || q == nil {
+		return false, errors.New("file repository is not configured")
+	}
+	if fileID <= 0 || strings.TrimSpace(expectedFilePath) == "" {
+		return false, nil
+	}
+	var id int
+	err := q.QueryRow(ctx, virtualAdoptionTerminalRefusalSQL,
+		fileID, expectedFilePath, observedFailedAt, observedUpdatedAt, observedProbeUpdatedAt,
+		VirtualCandidateDeliveryGrace.Seconds()).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// MarkVirtualAdoptionTerminalRefusal installs the revision-fenced terminal
+// refusal outside a transaction. It is the non-transactional fast path a caller
+// uses when it can pre-empt the write (the args builder); the authoritative
+// decision runs inside the evidence transaction.
+func (r *FileRepository) MarkVirtualAdoptionTerminalRefusal(ctx context.Context, fileID int, expectedFilePath string, observedFailedAt *time.Time, observedUpdatedAt time.Time, observedProbeUpdatedAt *time.Time) (bool, error) {
+	return r.markVirtualAdoptionTerminalRefusal(ctx, r.pool, fileID, expectedFilePath, observedFailedAt, observedUpdatedAt, observedProbeUpdatedAt)
+}
+
+// MarkVirtualAdoptionTerminalRefusalTx is MarkVirtualAdoptionTerminalRefusal
+// bound to the caller's transaction, so the terminal verdict commits with the
+// refusal count that reached the bound and is serialized on the same row lock as
+// the evidence write.
+func (r *FileRepository) MarkVirtualAdoptionTerminalRefusalTx(ctx context.Context, tx pgx.Tx, fileID int, expectedFilePath string, observedFailedAt *time.Time, observedUpdatedAt time.Time, observedProbeUpdatedAt *time.Time) (bool, error) {
+	return r.markVirtualAdoptionTerminalRefusal(ctx, tx, fileID, expectedFilePath, observedFailedAt, observedUpdatedAt, observedProbeUpdatedAt)
 }
 
 func virtualCandidateSelection(raw string) bool {

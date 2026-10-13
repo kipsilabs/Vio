@@ -1728,17 +1728,24 @@ func newChiRouter(deps Dependencies) chi.Router {
 			// the release the provider just dropped. An empty provider listing
 			// is not a dead verdict and is never stamped.
 			playbackHandler.VirtualCandidateFailMarker = scanner.NewFileRepository(deps.DB).MarkVirtualCandidateFailed
+			// Durable, cluster-wide consecutive-refusal state behind the bounded
+			// evidence-adoption decision. One store instance serves both the
+			// handler's rotate-target trigger and the shared SQL savers' refusal
+			// recording, so a restart or a different replica continues the same
+			// count.
+			adoptionRefusalStore := scanner.NewFileRepository(deps.DB)
+			playbackHandler.VirtualAdoptionRefusalStore = adoptionRefusalStore
 			playbackHandler.VirtualFileSaver = func(ctx context.Context, args models.VirtualFilePersistArgs) (int64, error) {
 				if deps.DB == nil {
 					return 0, nil
 				}
-				return handlers.ExecVirtualFileMetadataUpdate(ctx, deps.DB, args)
+				return handlers.ExecVirtualFileMetadataUpdateWithRefusals(ctx, deps.DB, args, adoptionRefusalStore)
 			}
 			playbackHandler.VirtualFileMetadataSaver = func(ctx context.Context, args models.VirtualFilePersistArgs) (handlers.VirtualFileMetadataUpdateResult, error) {
 				if deps.DB == nil {
 					return handlers.VirtualFileMetadataUpdateResult{}, nil
 				}
-				return handlers.ExecVirtualFileMetadataUpdateResult(ctx, deps.DB, args)
+				return handlers.ExecVirtualFileMetadataUpdateResultWithRefusals(ctx, deps.DB, args, adoptionRefusalStore)
 			}
 			if streamHandler != nil {
 				// The serve layer refreshes an expired stored URL through the
