@@ -100,6 +100,13 @@ const (
 	// alternate-version hunts must not treat it as a video/policy trigger.
 	audioAdaptationFailedReasonV3 = "audio_adaptation_failed"
 	seekRestorationPlayerV3       = "player_position"
+	// virtualSourceUnavailableReasonV3 and replanVirtualInputTimeoutReasonV3 are
+	// the retryable replan failure reasons that describe a virtual-source stall —
+	// the provider did not answer, or the pinned candidate is absent — rather
+	// than a verdict on the session. A terminal carrying one of these must
+	// survive a concurrent stop instead of collapsing to a not-found.
+	virtualSourceUnavailableReasonV3  = "virtual_source_unavailable"
+	replanVirtualInputTimeoutReasonV3 = "replan_virtual_input_timeout"
 	// candidateSourceDecodeRejectedReasonV3 is the internal transport reason for
 	// a local generation whose decoder already rejected the source. It is never
 	// a client terminal: the start/replan rotation loop consumes it to substitute
@@ -7459,7 +7466,7 @@ func replanSessionNotFoundV3() *PlaybackOperationError {
 // stop, because the stall — not the stop — is what the replan observed.
 func virtualSourceStallTerminalV3(reason string) bool {
 	switch reason {
-	case "virtual_source_unavailable", "replan_virtual_input_timeout":
+	case virtualSourceUnavailableReasonV3, replanVirtualInputTimeoutReasonV3:
 		return true
 	default:
 		return false
