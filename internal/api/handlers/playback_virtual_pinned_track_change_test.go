@@ -38,6 +38,13 @@ func newPinnedTrackChangeFixture(t *testing.T, churnedResultToken string) *pinne
 		{Index: 0, Codec: "aac", Channels: 2, Layout: "stereo", Language: "eng", Default: true},
 		{Index: 1, Codec: "aac", Channels: 2, Layout: "stereo", Language: "spa"},
 	}
+	// Two embedded subtitle tracks so a subtitle switch has a real target. The
+	// provider churns their per-listing result id too; a subtitle switch on the
+	// pinned session must carry the same release rather than re-list.
+	source.SubtitleTracks = []models.SubtitleTrack{
+		{Index: 0, Codec: "subrip", Language: "eng"},
+		{Index: 1, Codec: "subrip", Language: "spa"},
+	}
 	probedAt := time.Now().Add(-time.Hour)
 	source.ProbeUpdatedAt = &probedAt
 	pinnedURI := withVirtualResultKey(source.FilePath, "pinned")

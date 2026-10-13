@@ -100,6 +100,13 @@ const (
 	// alternate-version hunts must not treat it as a video/policy trigger.
 	audioAdaptationFailedReasonV3 = "audio_adaptation_failed"
 	seekRestorationPlayerV3       = "player_position"
+	// virtualSourceUnavailableReasonV3 and replanVirtualInputTimeoutReasonV3 are
+	// the retryable replan failure reasons that describe a virtual-source stall —
+	// the provider did not answer, or the pinned candidate is absent — rather
+	// than a verdict on the session. A terminal carrying one of these must
+	// survive a concurrent stop instead of collapsing to a not-found.
+	virtualSourceUnavailableReasonV3  = "virtual_source_unavailable"
+	replanVirtualInputTimeoutReasonV3 = "replan_virtual_input_timeout"
 	// candidateSourceDecodeRejectedReasonV3 is the internal transport reason for
 	// a local generation whose decoder already rejected the source. It is never
 	// a client terminal: the start/replan rotation loop consumes it to substitute
@@ -7354,6 +7361,19 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 		terminalRecord.CurrentReplanRequestID = req.ReplanRequestID
 		if err := h.PlanStoreV3.CompleteReplan(r.Context(), sessionID, req.ReplanRequestID, lease.LeaseToken, record.CurrentReplanRequestID, encoded, terminalRecord); err != nil {
 			if errors.Is(err, playback.ErrAttemptStoppedV3) {
+				// A stop landed on the attempt while this replan ran. A stop
+				// verdict persisted as a 200 terminal is a response the web
+				// client does not rebuild from, so the fast 404 is the right
+				// answer for a session-expired/stop terminal. A provider stall
+				// is not a stop verdict: the replan computed its own retryable
+				// virtual-source terminal, and answering 404 collapses that
+				// into "session gone", forcing every client to tear down and
+				// re-resume. Return the terminal the replan already produced so
+				// the retryable virtual-source signal survives the concurrent
+				// stop; the durable attempt is fenced, so nothing is persisted.
+				if virtualSourceStallTerminalV3(replanErr.reason) {
+					return response, nil
+				}
 				return playback.DecisionResponseV3{}, replanSessionNotFoundV3()
 			}
 			if errors.Is(err, playback.ErrReplanSupersededV3) {
@@ -7436,6 +7456,21 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 // adapter maps its status to the not-found problem.
 func replanSessionNotFoundV3() *PlaybackOperationError {
 	return playbackOperationError(http.StatusNotFound, playbackSessionNotFoundErrorCode, "Playback session not found")
+}
+
+// virtualSourceStallTerminalV3 reports whether a replan failure reason is a
+// retryable virtual-source stall rather than a verdict on the session. These
+// reasons are the resolver's honest "the provider did not answer / the pinned
+// candidate is absent" outcome; a client rebuilds a plan or retries from them.
+// They must not be collapsed into playback_session_not_found by a concurrent
+// stop, because the stall — not the stop — is what the replan observed.
+func virtualSourceStallTerminalV3(reason string) bool {
+	switch reason {
+	case virtualSourceUnavailableReasonV3, replanVirtualInputTimeoutReasonV3:
+		return true
+	default:
+		return false
+	}
 }
 
 // isRouteCapacityUnavailableError reports whether an error names route-capacity
@@ -8540,8 +8575,20 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			// source_unavailable through the existing rotation semantics
 			// instead of the replan planning against stale metadata. The
 			// release is never swapped silently.
-			carryPinnedCandidate := (trackChange || seekReanchor) && strings.TrimSpace(session.VirtualSourceURI) != "" &&
-				(candidateUnchanged || session.VirtualSubtitleEvidenceSet)
+			carryPinnedCandidate := (trackChange || seekReanchor) && !virtualDecodeRotation &&
+				strings.TrimSpace(session.VirtualSourceURI) != "" &&
+				(candidateUnchanged || session.VirtualSubtitleEvidenceSet ||
+					// The catalog row can be the provider-neutral profile while the
+					// session pin is a concrete pick under it (the provider churns
+					// the per-listing result id for bytes that never changed). A
+					// user-intent replan must still carry that pin — re-listing
+					// pays a multi-second round-trip to hand back a token the
+					// identity guard then refuses to adopt. The pin must be
+					// describable from the session's carried evidence, or the
+					// relist path stays in charge so an offline pin surfaces as
+					// source_unavailable rather than planning against a stub.
+					(virtualPinnedProfileRowV3(session, currentEffectiveFile) &&
+						sessionCarriesVirtualEvidenceV3(session)))
 			if candidateUnchanged && evidenceComplete && !virtualDecodeRotation {
 				currentEffectiveFile.FilePath = session.VirtualSourceURI
 				currentEffectiveFile.VirtualOwnerInstallationID = session.VirtualSourceOwnerInstallationID
@@ -11258,6 +11305,53 @@ func virtualCandidateRotationRecordedV3(ctx context.Context, session *playback.S
 		return false
 	}
 	return session.VirtualSubtitleEvidenceSet && !virtualEvidenceMatchesBoundFile(ctx, effectiveFile, session, fileResolver)
+}
+
+// virtualPinnedProfileRowV3 reports whether the catalog row a replan loaded is
+// the provider-neutral counterpart of the session's pinned concrete candidate:
+// the same profile/release path, with the row carrying no concrete "result="
+// pick while the session pin names one. The provider mints and churns the
+// per-listing result id for bytes that never changed, so on a session serving a
+// concrete pick the reloaded catalog row can be the provider-neutral profile row
+// while the session stays bound to the concrete candidate. A user-intent replan
+// (track change or seek) must carry that pin instead of re-listing: requiring
+// result-id equality would reject the very binding the session is serving.
+func virtualPinnedProfileRowV3(session *playback.Session, row *models.MediaFile) bool {
+	if session == nil || row == nil {
+		return false
+	}
+	pinned := strings.TrimSpace(session.VirtualSourceURI)
+	rowPath := strings.TrimSpace(row.FilePath)
+	if pinned == "" || rowPath == "" {
+		return false
+	}
+	// The session pin must be the concrete candidate; the loaded row must be its
+	// provider-neutral profile, not another concrete pick. A different concrete
+	// result is a release substitution candidate and must keep re-resolving.
+	if virtualResultCandidateID(pinned) == "" || virtualResultCandidateID(rowPath) != "" {
+		return false
+	}
+	return virtualPlaybackNeutralKey(rowPath) == virtualPlaybackNeutralKey(pinned)
+}
+
+// sessionCarriesVirtualEvidenceV3 reports whether the session holds
+// probe-authoritative evidence, or the provenance anchor a cleared evidence set
+// leaves behind, describing its pinned virtual bytes. A cleared evidence set
+// (a full v3 state write after a plan whose effective row was unprobed) keeps
+// the evidence URI/file id while dropping the flag, so the anchor is the durable
+// signal that the session once proved these bytes. Provider-declared audio
+// tracks alone do not qualify: a session that merely resolved a concrete
+// candidate without probing it must still re-resolve, so an offline pin
+// surfaces through the rotation semantics instead of planning against a stub.
+func sessionCarriesVirtualEvidenceV3(session *playback.Session) bool {
+	if session == nil {
+		return false
+	}
+	if session.VirtualSubtitleEvidenceSet {
+		return true
+	}
+	return strings.TrimSpace(session.VirtualSubtitleEvidenceURI) != "" ||
+		session.VirtualSubtitleEvidenceFileID > 0
 }
 
 // planVirtualSourceRevisionV3 returns the opaque virtual-source revision the

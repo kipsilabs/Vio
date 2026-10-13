@@ -9649,6 +9649,7 @@ func TestHandleReplanPlaybackV3VirtualRehydrationSeekRecoveryPinsCurrentVersion(
 	failPinned = true
 
 	currentKey := playback.PlanAttemptKeyV3(*started.PlaybackPlan, startRequest.ClientPlaybackContext.Output.OutputContextID, nil)
+	pinnedURI := source.FilePath + "?result=pinned"
 	for _, op := range []playback.ReplanOperationV3{playback.ReplanOperationSeekReanchorV3, playback.ReplanOperationSeekFailureRecoveryV3} {
 		failure := playback.FailureV3{Classification: "playback_error"}
 		if op == playback.ReplanOperationSeekReanchorV3 {
@@ -9672,8 +9673,34 @@ func TestHandleReplanPlaybackV3VirtualRehydrationSeekRecoveryPinsCurrentVersion(
 			ClientPlaybackContext: startRequest.ClientPlaybackContext,
 		}
 		response := postPlaybackReplanV3(t, handler, started.SessionID, replanReq)
+		if op == playback.ReplanOperationSeekReanchorV3 {
+			// A seek reanchor carries the session's pinned candidate: the
+			// provider is never re-listed, so an offline pin cannot be detected
+			// here. The replan must still pin the current version — no
+			// substitution to the sibling edition — instead of terminalling or
+			// swapping the release.
+			if response.Terminal != nil {
+				t.Fatalf("seek reanchor should have carried the pinned candidate, got terminal=%#v", response.Terminal)
+			}
+			if response.PlaybackPlan == nil {
+				t.Fatalf("seek reanchor produced no plan: %#v", response)
+			}
+			if response.PlaybackPlan.EffectiveMediaFileID != source.ID {
+				t.Fatalf("seek reanchor effective file = %d, want the pinned current version %d", response.PlaybackPlan.EffectiveMediaFileID, source.ID)
+			}
+			if response.PlaybackPlan.EffectiveVirtualURI != pinnedURI {
+				t.Fatalf("seek reanchor effective virtual URI = %q, want the pinned candidate %q", response.PlaybackPlan.EffectiveVirtualURI, pinnedURI)
+			}
+			if response.PlaybackPlan.SubstitutedFromFileID != 0 {
+				t.Fatalf("seek reanchor substituted the release from file %d", response.PlaybackPlan.SubstitutedFromFileID)
+			}
+			continue
+		}
+		// A seek failure recovery is not a user-intent operation: it still
+		// re-resolves, and an offline pin surfaces as a retryable source
+		// terminal rather than a silent release swap.
 		if response.Terminal == nil || (response.Terminal.Reason != "virtual_source_unavailable" && response.Terminal.Reason != "source_unavailable") {
-			t.Fatalf("seek operation %q should have produced source unavailable terminal, got reason=%q terminal=%#v", op, response.Terminal.Reason, response.Terminal)
+			t.Fatalf("seek operation %q should have produced source unavailable terminal, got terminal=%#v", op, response.Terminal)
 		}
 	}
 }
