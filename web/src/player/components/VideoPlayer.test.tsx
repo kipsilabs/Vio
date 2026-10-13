@@ -2371,6 +2371,36 @@ describe("VideoPlayer plan failure recovery", () => {
     expect(screen.queryByText("Unrelated replan error.")).not.toBeInTheDocument();
   });
 
+  it("recovers a virtual remux whose transport answers 409 audio_selection_invalid", async () => {
+    // The audio-selection 409 is a transport response the media element cannot
+    // surface as a body: a progressive remux is loaded through `src`, so the
+    // element reports a source-not-supported load failure. The player must route
+    // it into plan recovery (a fresh failure_recovery replan) instead of a
+    // dead-end error, so the client re-selects on the re-probed inventory.
+    const onPlanFailure = vi.fn();
+    const virtualRemuxPlan = fixturePlanV3({
+      delivery: "server_remux_progressive",
+      stream: {
+        url: "/stream/session-1",
+        protocol: "http_progressive",
+        headers: {},
+        header_refresh: "none",
+      },
+    });
+    const { container } = renderPlayer({ plan: virtualRemuxPlan, onPlanFailure });
+    const video = container.querySelector("video");
+    if (!video) throw new Error("expected video element");
+
+    Object.defineProperty(video, "error", {
+      configurable: true,
+      value: { code: 4, message: "The selected audio track is no longer available" },
+    });
+    fireEvent.error(video);
+
+    expect(onPlanFailure).toHaveBeenCalledOnce();
+    expect(onPlanFailure.mock.calls[0]?.[0]).toMatchObject({ classification: "decoder_error" });
+  });
+
   it("re-arms the plan failure guard after a transient recovery request failure", async () => {
     const onPlanFailure = vi.fn();
     const { container, rerenderPlayer } = renderPlayer({ onPlanFailure });

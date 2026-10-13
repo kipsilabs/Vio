@@ -16,10 +16,11 @@ import (
 
 // TestDeferredProbeOverlayRemovedOrAmbiguousCommittedAudioFailsClosed is the
 // removed/ambiguous-audio regression for the real deferred-probe path: when the
-// committed selection is absent from the verified inventory, or two verified
-// tracks are indistinguishable by language, codec, channels, and layout, the
-// session must record a server-enforced invalid selection whose derived remux
-// ordinal is -1 - never a stale position that now names a different track.
+// committed selection is absent from the verified inventory, or the identity is
+// ambiguous (duplicate signatures, or a same-transport track with a conflicting
+// known title), the session must record a server-enforced invalid selection and
+// the transport must answer a retryable 409 - never mux whichever track now
+// occupies the old array position.
 func TestDeferredProbeOverlayRemovedOrAmbiguousCommittedAudioFailsClosed(t *testing.T) {
 	cases := []struct {
 		name        string
@@ -29,7 +30,7 @@ func TestDeferredProbeOverlayRemovedOrAmbiguousCommittedAudioFailsClosed(t *test
 		wantCarried int
 	}{
 		{
-			name: "committed track removed",
+			name: "committed track removed by absent probed index",
 			plan: []models.AudioTrack{
 				{Index: 1, Language: "en", Codec: "aac", Channels: 2, Layout: "stereo"},
 				{Index: 3, Language: "pt", Codec: "eac3", Channels: 6, Layout: "5.1"},
@@ -39,7 +40,27 @@ func TestDeferredProbeOverlayRemovedOrAmbiguousCommittedAudioFailsClosed(t *test
 			wantCarried: 1,
 		},
 		{
-			name: "duplicate-language tracks are ambiguous",
+			name: "removed commentary with retained main of identical transport facts",
+			plan: []models.AudioTrack{
+				{Index: 0, Language: "en", Codec: "eac3", Channels: 6, Layout: "5.1", Title: "Commentary"},
+			},
+			committed: 0,
+			// Same language, codec, channels, and layout as the selected
+			// commentary, but a conflicting known title: a different stream.
+			verified:    []models.AudioTrack{{Index: 0, Language: "en", Codec: "eac3", Channels: 6, Layout: "5.1", Title: "Main"}},
+			wantCarried: 1,
+		},
+		{
+			name: "duplicate signatures are ambiguous",
+			plan: []models.AudioTrack{
+				{Index: 0, Language: "en", Codec: "eac3", Channels: 6, Layout: "5.1"},
+			},
+			committed:   0,
+			verified:    []models.AudioTrack{{Index: 0, Language: "en", Codec: "eac3", Channels: 6, Layout: "5.1"}, {Index: 0, Language: "en", Codec: "eac3", Channels: 6, Layout: "5.1"}},
+			wantCarried: 2,
+		},
+		{
+			name: "duplicate-language distinct-title tracks are ambiguous",
 			plan: []models.AudioTrack{
 				{Index: 0, Language: "en", Codec: "eac3", Channels: 6, Layout: "5.1", Title: "Director"},
 			},
@@ -128,14 +149,46 @@ func TestDeferredProbeOverlayRemovedOrAmbiguousCommittedAudioFailsClosed(t *test
 			if got := audioStreamOrdinalV3(bound, live.AudioTrackIndex); got != -1 {
 				t.Fatalf("remux ordinal after an invalid selection = %d, want -1 (no silent substitution)", got)
 			}
+
+			// The real transport gate fails closed instead of muxing the wrong
+			// stream.
+			assertStreamAudioSelectionRejected(t, manager, resolver, session.ID, candidateURI)
 		})
 	}
 }
 
+// assertStreamAudioSelectionRejected drives the real HandleStream entry point
+// and asserts the invalid audio selection answers a retryable 409 with the
+// audio_selection_invalid code.
+func assertStreamAudioSelectionRejected(t *testing.T, manager *playback.SessionManager, resolver FilePathResolver, sessionID, candidateURI string) {
+	t.Helper()
+	handler := NewStreamHandler(manager, resolver)
+	handler.AllowPrivateStreams = func(int) bool { return true }
+	handler.VirtualCandidateTrustWindow = func() time.Duration { return 720 * time.Hour }
+	handler.PlaybackConfig = func() config.PlaybackConfig {
+		return config.PlaybackConfig{FFmpegPath: "/does/not/matter"}
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/stream/"+sessionID, nil)
+	req = req.WithContext(newAuthorizedPlaybackContext())
+	req = withPlaybackRouteParam(req, "session_id", sessionID)
+
+	handler.HandleStream(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 for an invalid audio selection (body %s)", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "audio_selection_invalid") {
+		t.Fatalf("body = %s, want the audio_selection_invalid problem code", rec.Body.String())
+	}
+}
+
 // TestHandleStream_VirtualRemuxInvalidAudioSelectionFailsClosed drives the real
-// HandleStream entry point: a virtual remux session whose committed audio
-// selection vanished must answer a retryable 409 and never spawn a remux that
-// would mux whichever stream occupies the old array position.
+// HandleStream entry point through the overlay write directly: a virtual remux
+// session whose committed audio selection vanished must answer a retryable 409
+// and never spawn a remux that would mux whichever stream occupies the old array
+// position.
 func TestHandleStream_VirtualRemuxInvalidAudioSelectionFailsClosed(t *testing.T) {
 	relay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("video"))
@@ -198,24 +251,140 @@ func TestHandleStream_VirtualRemuxInvalidAudioSelectionFailsClosed(t *testing.T)
 		t.Fatal("fixture did not mark the invalid selection")
 	}
 
-	handler := NewStreamHandler(manager, testPlaybackFileResolver{file: file})
-	handler.AllowPrivateStreams = func(int) bool { return true }
-	handler.VirtualCandidateTrustWindow = func() time.Duration { return 720 * time.Hour }
-	handler.PlaybackConfig = func() config.PlaybackConfig {
-		return config.PlaybackConfig{FFmpegPath: "/does/not/matter"}
+	assertStreamAudioSelectionRejected(t, manager, testPlaybackFileResolver{file: file}, session.ID, pinned)
+}
+
+// TestVirtualAudioSelectionInvalidClearsOnClientRecovery is the recovery half:
+// the retryable 409 is only useful if the client's next commit recovers. The
+// v3 replan commits the replanned selection through UpdateAudioTrack (the same
+// seam HandleReplanPlaybackV3 uses), which must clear the invalid-selection
+// marker and leave a valid, in-range selection whose derived remux ordinal names
+// a real stream.
+func TestVirtualAudioSelectionInvalidClearsOnClientRecovery(t *testing.T) {
+	candidateURI := "virtual://movie/tt-recovery?result=cand-1"
+	manager := playback.NewSessionManager(0, 0)
+	session, err := manager.StartSession(1, "profile-1", 5273001, playback.PlayRemux, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	if err := manager.SetVirtualSource(session.ID, candidateURI, 5); err != nil {
+		t.Fatalf("SetVirtualSource: %v", err)
+	}
+	plan := []models.AudioTrack{
+		{Index: 1, Language: "en", Codec: "aac", Channels: 2, Layout: "stereo"},
+		{Index: 3, Language: "pt", Codec: "eac3", Channels: 6, Layout: "5.1"},
+	}
+	if err := manager.UpdateStreamState(session.ID, playback.SessionStreamState{
+		AudioTrackIndex:               1, // pt
+		VirtualSourceSet:              true,
+		VirtualSourceOwnershipSet:     true,
+		VirtualSourceURI:              candidateURI,
+		VirtualSubtitleEvidenceSet:    true,
+		VirtualAudioTracks:            plan,
+		VirtualSubtitleEvidenceURI:    candidateURI,
+		VirtualSubtitleEvidenceFileID: session.MediaFileID,
+	}); err != nil {
+		t.Fatalf("UpdateStreamState: %v", err)
+	}
+	binding, err := manager.VirtualSourceBinding(session.ID)
+	if err != nil {
+		t.Fatalf("VirtualSourceBinding: %v", err)
+	}
+	// The verified overlay drops pt, so the selection is invalid and the
+	// transport gate would answer 409.
+	verified := []models.AudioTrack{{Index: 1, Language: "en", Codec: "aac", Channels: 2, Layout: "stereo"}}
+	if applied, err := manager.SetVirtualProbeVerifiedInventoryIfBinding(session.ID, binding, "rev", verified, nil, nil); err != nil || !applied {
+		t.Fatalf("SetVirtualProbeVerifiedInventoryIfBinding = %v, %v; want applied", applied, err)
+	}
+	invalid, err := manager.GetSession(session.ID)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if !invalid.VirtualAudioSelectionInvalid || invalid.AudioTrackIndex != -1 {
+		t.Fatalf("fixture not invalid: index=%d invalid=%v", invalid.AudioTrackIndex, invalid.VirtualAudioSelectionInvalid)
 	}
 
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/stream/"+session.ID, nil)
-	req = req.WithContext(newAuthorizedPlaybackContext())
-	req = withPlaybackRouteParam(req, "session_id", session.ID)
-
-	handler.HandleStream(rec, req)
-
-	if rec.Code != http.StatusConflict {
-		t.Fatalf("status = %d, want 409 for an invalid audio selection (body %s)", rec.Code, rec.Body.String())
+	// The client's recovery replan commits a fresh, valid selection.
+	if err := manager.UpdateAudioTrack(session.ID, 0, playback.PlayRemux); err != nil {
+		t.Fatalf("UpdateAudioTrack: %v", err)
 	}
-	if !strings.Contains(rec.Body.String(), "audio_selection_invalid") {
-		t.Fatalf("body = %s, want the audio_selection_invalid problem code", rec.Body.String())
+	recovered, err := manager.GetSession(session.ID)
+	if err != nil {
+		t.Fatalf("GetSession after recovery: %v", err)
+	}
+	if recovered.VirtualAudioSelectionInvalid {
+		t.Fatal("a recovery commit did not clear the invalid-selection marker")
+	}
+	if recovered.AudioTrackIndex != 0 {
+		t.Fatalf("recovered audio index = %d, want 0", recovered.AudioTrackIndex)
+	}
+	if got := playback.AudioStreamOrdinal(recovered.VirtualAudioTracks, recovered.AudioTrackIndex); got != 0 {
+		t.Fatalf("recovered remux ordinal = %d, want 0 (the en stream)", got)
+	}
+}
+
+// TestVirtualAudioSelectionInvalidClearsOnStreamStateCommit covers the other
+// replan commit seam: a full route commit (applySessionStreamStateLocked, the
+// v3SessionStreamState path) also clears the invalid-selection marker and
+// installs the committed selection.
+func TestVirtualAudioSelectionInvalidClearsOnStreamStateCommit(t *testing.T) {
+	candidateURI := "virtual://movie/tt-recovery-state?result=cand-1"
+	manager := playback.NewSessionManager(0, 0)
+	session, err := manager.StartSession(1, "profile-1", 5273002, playback.PlayRemux, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	if err := manager.SetVirtualSource(session.ID, candidateURI, 5); err != nil {
+		t.Fatalf("SetVirtualSource: %v", err)
+	}
+	plan := []models.AudioTrack{
+		{Index: 1, Language: "en", Codec: "aac", Channels: 2, Layout: "stereo"},
+		{Index: 3, Language: "pt", Codec: "eac3", Channels: 6, Layout: "5.1"},
+	}
+	if err := manager.UpdateStreamState(session.ID, playback.SessionStreamState{
+		AudioTrackIndex:               1,
+		VirtualSourceSet:              true,
+		VirtualSourceOwnershipSet:     true,
+		VirtualSourceURI:              candidateURI,
+		VirtualSubtitleEvidenceSet:    true,
+		VirtualAudioTracks:            plan,
+		VirtualSubtitleEvidenceURI:    candidateURI,
+		VirtualSubtitleEvidenceFileID: session.MediaFileID,
+	}); err != nil {
+		t.Fatalf("UpdateStreamState: %v", err)
+	}
+	binding, err := manager.VirtualSourceBinding(session.ID)
+	if err != nil {
+		t.Fatalf("VirtualSourceBinding: %v", err)
+	}
+	verified := []models.AudioTrack{{Index: 1, Language: "en", Codec: "aac", Channels: 2, Layout: "stereo"}}
+	if applied, err := manager.SetVirtualProbeVerifiedInventoryIfBinding(session.ID, binding, "rev", verified, nil, nil); err != nil || !applied {
+		t.Fatalf("SetVirtualProbeVerifiedInventoryIfBinding = %v, %v; want applied", applied, err)
+	}
+	if invalid, _ := manager.GetSession(session.ID); !invalid.VirtualAudioSelectionInvalid {
+		t.Fatal("fixture not invalid")
+	}
+
+	// The full route commit (the v3 replan's stream-state apply) clears it.
+	if err := manager.UpdateStreamState(session.ID, playback.SessionStreamState{
+		AudioTrackIndex:               0,
+		VirtualSourceOwnershipSet:     true,
+		VirtualSourceURI:              candidateURI,
+		VirtualSubtitleEvidenceSet:    true,
+		VirtualAudioTracks:            verified,
+		VirtualSubtitleEvidenceURI:    candidateURI,
+		VirtualSubtitleEvidenceFileID: session.MediaFileID,
+	}); err != nil {
+		t.Fatalf("UpdateStreamState recovery: %v", err)
+	}
+	recovered, err := manager.GetSession(session.ID)
+	if err != nil {
+		t.Fatalf("GetSession after recovery: %v", err)
+	}
+	if recovered.VirtualAudioSelectionInvalid {
+		t.Fatal("a route commit did not clear the invalid-selection marker")
+	}
+	if recovered.AudioTrackIndex != 0 {
+		t.Fatalf("recovered audio index = %d, want 0", recovered.AudioTrackIndex)
 	}
 }
