@@ -305,13 +305,13 @@ export function SubtitleMenu({
                 Showing available subtitles — discovery did not complete
               </div>
             )}
-            {!failed && (pending || provisional) && (
+            {!failed && provisional && (
               <div className="flex items-center gap-2 px-3 py-1 text-xs text-white/50">
                 <span className="h-3 w-3 animate-spin rounded-full border border-white/20 border-t-white/80" />
                 <span>Discovering subtitles…</span>
               </div>
             )}
-            {sortedTracks.length === 0 && !pending && !provisional && (
+            {sortedTracks.length === 0 && !provisional && (
               <div className="px-3 py-2 text-xs text-white/40">No subtitles available</div>
             )}
             {sortedTracks.map((track) => {

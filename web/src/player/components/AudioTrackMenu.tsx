@@ -213,13 +213,13 @@ export function AudioTrackMenu({
               Showing available tracks — discovery did not complete
             </div>
           )}
-          {!failed && (pending || provisional) && (
+          {!failed && provisional && (
             <div className="flex items-center gap-2 px-3 py-1 text-xs text-white/50">
               <span className="h-3 w-3 animate-spin rounded-full border border-white/20 border-t-white/80" />
               <span>Discovering audio tracks…</span>
             </div>
           )}
-          {dedupedTracks.length === 0 && !pending && !provisional && (
+          {dedupedTracks.length === 0 && !provisional && (
             <div className="px-3 py-2 text-xs text-white/40">No audio tracks available</div>
           )}
           {dedupedTracks.map(({ track, index }) => {
