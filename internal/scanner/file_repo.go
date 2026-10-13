@@ -2164,6 +2164,60 @@ func (r *FileRepository) RecordVirtualAdoptionRefusalTx(ctx context.Context, tx 
 	return count, nil
 }
 
+// lockVirtualAdoptionRowSQL takes the media_files row lock the locked refusal
+// recorder serializes on. It is the same lock the transactional evidence saver
+// takes first, so every replica reconciles one row in the same order
+// (media_files before virtual_adoption_refusals) and cannot deadlock.
+const lockVirtualAdoptionRowSQL = `SELECT id FROM media_files WHERE id = $1 FOR UPDATE`
+
+// RecordVirtualAdoptionRefusalLocked records one consecutive refusal for a
+// virtual row and pinned path under the media_files row lock, so a refusal
+// increment taken outside the evidence transaction (the same-release sibling
+// rotation trigger) serializes on the same row-first order as the evidence write
+// and its clear. It reports the live count read under that lock, so a bound
+// decision cannot rest on a count a concurrent evidence write or clear has
+// already invalidated. A missing row is a no-op: there is nothing to count
+// against, and a refusal row for a vanished file would only fail its foreign
+// key. The expired-row sweep runs best-effort after commit.
+func (r *FileRepository) RecordVirtualAdoptionRefusalLocked(ctx context.Context, fileID int, expectedPath string, ttl time.Duration) (int, error) {
+	if r == nil || r.pool == nil {
+		return 0, errors.New("file repository is not configured")
+	}
+	if fileID <= 0 || strings.TrimSpace(expectedPath) == "" || ttl <= 0 {
+		return 0, nil
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("begin adoption refusal transaction: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(context.Background())
+		}
+	}()
+
+	var lockedID int
+	lockErr := tx.QueryRow(ctx, lockVirtualAdoptionRowSQL, fileID).Scan(&lockedID)
+	if errors.Is(lockErr, pgx.ErrNoRows) {
+		return 0, nil
+	}
+	if lockErr != nil {
+		return 0, fmt.Errorf("lock virtual row for adoption refusal: %w", lockErr)
+	}
+
+	count, err := r.RecordVirtualAdoptionRefusalTx(ctx, tx, fileID, expectedPath, ttl)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("commit adoption refusal transaction: %w", err)
+	}
+	committed = true
+	_, _ = r.pool.Exec(ctx, sweepVirtualAdoptionRefusalsSQL, virtualAdoptionRefusalSweepBatch)
+	return count, nil
+}
+
 // ClearVirtualAdoptionRefusalTx is ClearVirtualAdoptionRefusal bound to the
 // caller's transaction, so a successful evidence write and the exact-pin clear
 // commit together. A cancel or database interruption can therefore never leave a

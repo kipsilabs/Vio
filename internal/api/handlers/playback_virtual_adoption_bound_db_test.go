@@ -146,12 +146,15 @@ func TestVirtualAdoptionTerminalRefusalStopsRetriesDB(t *testing.T) {
 		MediaFolderID: folderID, VirtualOwnerInstallationID: ownerID,
 		UpdatedAt: updatedAt, ProbeUpdatedAt: probeUpdatedAt,
 	}
-	h := &PlaybackHandler{
-		VirtualCandidateFailMarker: scanner.NewFileRepository(pool).MarkVirtualCandidateFailed,
-	}
+	h := &PlaybackHandler{}
 	// A stale in-memory counter is irrelevant: the bound already fired, so the
-	// terminal install is what must durably stop retries.
-	if !h.markVirtualAdoptionTerminalRefusal(ctx, row, virtualProbeRefusalAdoptionBoundExhausted) {
+	// terminal install is what must durably stop retries. The stamp is installed
+	// by the store's revision-fenced method, the same one the transactional
+	// refusal reconciliation calls with its own transaction.
+	repo := scanner.NewFileRepository(pool)
+	if stamped, err := repo.MarkVirtualAdoptionTerminalRefusal(ctx, row.ID, row.FilePath, row.FailedAt, row.UpdatedAt, row.ProbeUpdatedAt); err != nil {
+		t.Fatalf("terminal refusal stamp: %v", err)
+	} else if !stamped {
 		t.Fatal("terminal refusal did not install the durable marker")
 	}
 

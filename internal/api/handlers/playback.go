@@ -576,16 +576,9 @@ type PlaybackHandler struct {
 	// production wires the scanner's Postgres-backed store so a restart or a
 	// different replica continues the same count.
 	VirtualAdoptionRefusalStore VirtualAdoptionRefusalStore
-	// VirtualAdoptionTerminalMarker is the revision-fenced durable terminal
-	// stamp the bounded-adoption decision installs when it pre-empts a write
-	// outside the evidence transaction. It is preferred over
-	// VirtualCandidateFailMarker when wired: the stamp is gated on the observed
-	// updated_at/probe_updated_at, so a newer evidence write that advanced the
-	// row wins over a stale terminal. Nil falls back to VirtualCandidateFailMarker.
-	VirtualAdoptionTerminalMarker VirtualAdoptionTerminalMarker
-	VirtualSubtitleSearcher       SubtitleSearchTrigger
-	SubtitleSearchInFlight        *sync.Map
-	DeviceCapabilitySource        DeviceCapabilityProfileSource
+	VirtualSubtitleSearcher     SubtitleSearchTrigger
+	SubtitleSearchInFlight      *sync.Map
+	DeviceCapabilitySource      DeviceCapabilityProfileSource
 	// PlaybackConfig returns the current playback config (ffmpeg path,
 	// hwaccel, transcode dir). Wired to the live config in integrated mode
 	// so admin changes apply to newly started transcodes. Read it through

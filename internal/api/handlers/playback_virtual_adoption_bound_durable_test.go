@@ -148,9 +148,9 @@ func TestVirtualAdoptionRefusalDurableStoreRestartPreservesCount(t *testing.T) {
 
 // TestVirtualAdoptionRefusalStoreOutageDoesNotCondemn proves a refusal-store
 // outage is a recoverable infrastructure failure, not an identity verdict: the
-// write stays refused, but the count is not advanced, the bound is not reached,
-// and no terminal failed_at verdict is installed. Once the store answers again,
-// refusals accumulate normally and the terminal is named.
+// write stays refused, but the count is not advanced and the bound is not
+// reached. Once the store answers again, refusals accumulate normally toward the
+// bound the transactional reconciliation decides from.
 func TestVirtualAdoptionRefusalStoreOutageDoesNotCondemn(t *testing.T) {
 	ctx := context.Background()
 	store := newFakeAdoptionRefusalStore()
@@ -167,14 +167,7 @@ func TestVirtualAdoptionRefusalStoreOutageDoesNotCondemn(t *testing.T) {
 		AdoptPath:        candidate,
 		RequireAdopt:     true,
 	}
-	terminalInstalls := 0
-	h := &PlaybackHandler{
-		VirtualAdoptionRefusalStore: store,
-		VirtualCandidateFailMarker: func(context.Context, int, string, *time.Time) error {
-			terminalInstalls++
-			return nil
-		},
-	}
+	h := &PlaybackHandler{VirtualAdoptionRefusalStore: store}
 
 	// The saver keeps refusing the write; the outage must not be counted.
 	for i := 0; i < virtualAdoptionRefusalBound*2; i++ {
@@ -189,17 +182,14 @@ func TestVirtualAdoptionRefusalStoreOutageDoesNotCondemn(t *testing.T) {
 		t.Fatal("a store outage read as a reached bound")
 	}
 
-	// The args builder must not name a terminal or install the marker from a
-	// store it cannot read.
+	// The args builder must fence the write regardless of the unreadable count;
+	// the terminal decision belongs to the transactional reconciliation, not to
+	// the args builder.
 	if _, ok := h.virtualProbeEvidenceArgsForRow(ctx, row, candidate, probed, foreignIdentity, true); !ok {
 		t.Fatal("the args builder refused before the SQL fence could")
 	}
-	if terminalInstalls != 0 {
-		t.Fatalf("a store outage installed %d terminal verdicts, want 0", terminalInstalls)
-	}
 
-	// Recovery: the store answers, refusals accumulate to the bound, and the
-	// already-fenced write is named terminal.
+	// Recovery: the store answers and the refusals accumulate to the bound.
 	store.recordErr = nil
 	store.countErr = nil
 	for i := 0; i < virtualAdoptionRefusalBound; i++ {
@@ -207,15 +197,15 @@ func TestVirtualAdoptionRefusalStoreOutageDoesNotCondemn(t *testing.T) {
 			t.Fatal("refused adoption reported success")
 		}
 	}
+	if got := countAdoptionRefusalStore(ctx, store, row.ID, row.FilePath); got != virtualAdoptionRefusalBound {
+		t.Fatalf("recovered refusal count = %d, want %d", got, virtualAdoptionRefusalBound)
+	}
 	recovered, ok := h.virtualProbeEvidenceArgsForRow(ctx, row, candidate, probed, foreignIdentity, true)
 	if !ok {
 		t.Fatal("the args builder refused after the store recovered")
 	}
-	if recovered.RefusalReason != virtualProbeRefusalAdoptionBoundExhausted {
-		t.Fatalf("recovered refusal reason = %q, want terminal %q", recovered.RefusalReason, virtualProbeRefusalAdoptionBoundExhausted)
-	}
-	if terminalInstalls == 0 {
-		t.Fatal("the recovered store did not allow the terminal verdict to install")
+	if !recovered.RequireAdopt {
+		t.Fatalf("recovered write lost its adoption fence: %+v", recovered)
 	}
 }
 

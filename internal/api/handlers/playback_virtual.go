@@ -4909,21 +4909,11 @@ func (h *PlaybackHandler) virtualProbeEvidenceArgsForRow(ctx context.Context, ca
 	}
 	if crossRelease {
 		args.RefusalReason = h.virtualProbeEvidenceRefusalReason(ctx, catalogFile, resolvedPath)
-		// Bounded refusal. A genuinely foreign release can never be adopted or
-		// folded in, so retrying the same fenced write forever only loops. Once
-		// this row and pin have refused the bound, name the exhausted refusal and
-		// install durable terminal state so later attempts on any replica are
-		// skipped instead of repeating the write. (A same-release renumber never
-		// reaches here: virtualProbeEvidenceSharesRowRelease already diverted it to
-		// a metadata-only write proven by the resolver's own identity.)
-		if h.adoptionRefusalBoundReached(ctx, args) {
-			args.RefusalReason = virtualProbeRefusalAdoptionBoundExhausted
-			slog.ErrorContext(ctx, "virtual probe evidence adoption refusal bound reached and the candidate is not the pinned release; refusing terminally",
-				"component", "api", "file_id", catalogFile.ID, "adopt_path", adoptPath,
-				"expected_path", expectedPath, "candidate_uri", resolvedPath,
-				virtualEvidenceLogKeyReason, virtualProbeRefusalAdoptionBoundExhausted)
-			h.markVirtualAdoptionTerminalRefusal(ctx, catalogFile, virtualProbeRefusalAdoptionBoundExhausted)
-		}
+		// The terminal decision is deliberately NOT made here. The refusal
+		// reconciliation owns it: the saver records the increment and installs
+		// the terminal from the live count, under the row lock and fenced on the
+		// observed evidence revision (see txVirtualAdoptionRefusal). A count read
+		// out here would race the evidence writes and clears that invalidate it.
 	}
 	return args, true
 }

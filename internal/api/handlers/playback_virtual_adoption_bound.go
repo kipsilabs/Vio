@@ -54,9 +54,19 @@ import (
 // clear with it, so a cancel between the two can never leave a stale threshold
 // live; the count is re-read in-transaction before the terminal decision; and
 // the terminal stamp is fenced on the observed evidence revision, so a newer
-// evidence write that advanced the row wins over a stale terminal. The
-// in-memory fallback and a store without transaction support keep the previous
-// best-effort path, where no cross-process window exists.
+// evidence write that advanced the row wins over a stale terminal. Only a
+// required adoption that matched no row enters that refusal reconciliation: an
+// ordinary metadata CAS miss is a plain no-op and never counts. The same-release
+// sibling rotation trigger takes the matching row lock before it increments
+// (RecordVirtualAdoptionRefusalLocked), so it, too, serializes on the row.
+//
+// The in-memory fallback and a store without transaction support keep the
+// previous best-effort increment and, because no transaction exists to make the
+// count and the revision-fenced stamp atomic, they do not install the durable
+// terminal: a deployment without a real database has no durable catalog to
+// condemn. A non-transactional database that does carry the durable store keeps
+// the best-effort increment for the rotate trigger; the production write path
+// always has the transaction.
 //
 // An ownership-store lookup failure is deliberately NOT a refusal: it is a
 // recoverable infrastructure error that must never advance this count or install
@@ -123,14 +133,17 @@ type VirtualAdoptionRefusalStore interface {
 	CountVirtualAdoptionRefusal(ctx context.Context, fileID int, expectedPath string) (int, error)
 }
 
-// VirtualAdoptionTerminalMarker is the revision-fenced durable terminal stamp
-// the bounded decision installs when it pre-empts a write (the args builder, or
-// any caller outside the evidence transaction). It reports whether the stamp
-// landed: false means the row no longer carried the observed evidence revision
-// (updated_at/probe_updated_at), so a newer evidence write won the race and the
-// stale terminal must not condemn it. A nil marker keeps the legacy
-// path+failed_at fence through VirtualCandidateFailMarker.
-type VirtualAdoptionTerminalMarker func(ctx context.Context, fileID int, expectedFilePath string, observedFailedAt *time.Time, observedUpdatedAt time.Time, observedProbeUpdatedAt *time.Time) (bool, error)
+// VirtualAdoptionRefusalLockedStore records one consecutive refusal under the
+// media_files row lock, so a refusal increment taken outside the evidence
+// transaction (the same-release sibling rotation trigger) serializes on the same
+// row-first order every replica uses for the evidence write. It reports the live
+// count taken under that lock, so a bound decision cannot rest on a count a
+// concurrent evidence write or clear has already invalidated. The durable
+// Postgres store implements it; a store that does not keeps the previous
+// best-effort increment.
+type VirtualAdoptionRefusalLockedStore interface {
+	RecordVirtualAdoptionRefusalLocked(ctx context.Context, fileID int, expectedPath string, ttl time.Duration) (int, error)
+}
 
 // virtualAdoptionRefusalMark is one row/pin's consecutive-refusal state.
 type virtualAdoptionRefusalMark struct {
@@ -376,59 +389,25 @@ func (h *PlaybackHandler) adoptionRefusalBoundReached(ctx context.Context, args 
 }
 
 // adoptionRefusalStoreCount records one refusal for a row and pin through the
-// handler's durable store and returns the new count.
+// handler's durable store and returns the new count. When the store can take the
+// row lock (the durable Postgres store) the increment is serialized on the same
+// media_files row the evidence write locks, so a concurrent successful write or
+// clear cannot invalidate the count this decision is made from.
 func (h *PlaybackHandler) adoptionRefusalStoreCount(ctx context.Context, fileID int, expectedPath string) int {
-	return recordAdoptionRefusalStore(ctx, h.adoptionRefusalStore(), fileID, expectedPath)
-}
-
-// markVirtualAdoptionTerminalRefusal installs the durable, cross-replica terminal
-// refusal for a row whose pinned adoption has been refused
-// virtualAdoptionRefusalBound times without a candidate the resolver can tie to
-// the pin. It stamps the row's failed_at verdict through the same fenced marker
-// the transport-failure path uses, so every replica's resolve and probe gate
-// skips the row and a restarted process does not restart the loop. The durable
-// count is only the trigger; this durable stamp is what actually stops
-// subsequent attempts. It returns whether a marker was installed.
-//
-// When the revision-fenced marker is wired (production) the stamp is also gated
-// on the observed evidence revision: a concurrent successful write that advanced
-// the row's updated_at/probe_updated_at wins over this stale terminal instead of
-// being condemned by it. The legacy VirtualCandidateFailMarker fallback keeps the
-// previous identity+failed_at fence for callers that wire no fenced marker.
-func (h *PlaybackHandler) markVirtualAdoptionTerminalRefusal(ctx context.Context, row *models.MediaFile, reason string) bool {
-	if h == nil || row == nil || row.ID <= 0 {
-		return false
+	store := h.adoptionRefusalStore()
+	if fileID <= 0 || strings.TrimSpace(expectedPath) == "" {
+		return 0
 	}
-	if h.VirtualAdoptionTerminalMarker != nil {
-		stamped, err := h.VirtualAdoptionTerminalMarker(ctx, row.ID, row.FilePath, row.FailedAt, row.UpdatedAt, row.ProbeUpdatedAt)
+	if locked, ok := store.(VirtualAdoptionRefusalLockedStore); ok {
+		count, err := locked.RecordVirtualAdoptionRefusalLocked(ctx, fileID, expectedPath, virtualAdoptionRefusalTTL)
 		if err != nil {
-			slog.WarnContext(ctx, "virtual adoption terminal refusal was not persisted; the row keeps its own failed_at state",
-				"component", "api", "file_id", row.ID, "candidate_path", row.FilePath,
-				virtualEvidenceLogKeyReason, reason, virtualEvidenceLogKeyError, err)
-			return false
+			slog.WarnContext(ctx, "virtual adoption refusal count was not recorded; treating the store error as recoverable, not as a refusal",
+				"component", "api", "file_id", fileID, "expected_path", expectedPath, virtualEvidenceLogKeyError, err)
+			return 0
 		}
-		if !stamped {
-			slog.InfoContext(ctx, "virtual adoption terminal refusal superseded by a newer evidence write; not stamping",
-				"component", "api", "file_id", row.ID, "candidate_path", row.FilePath,
-				virtualEvidenceLogKeyReason, reason)
-			return false
-		}
-		slog.ErrorContext(ctx, "virtual adoption terminal refusal persisted",
-			"component", "api", "file_id", row.ID, "candidate_path", row.FilePath, virtualEvidenceLogKeyReason, reason)
-		return true
+		return count
 	}
-	if h.VirtualCandidateFailMarker == nil {
-		return false
-	}
-	if err := h.VirtualCandidateFailMarker(ctx, row.ID, row.FilePath, row.FailedAt); err != nil {
-		slog.WarnContext(ctx, "virtual adoption terminal refusal was not persisted; the row keeps its own failed_at state",
-			"component", "api", "file_id", row.ID, "candidate_path", row.FilePath,
-			virtualEvidenceLogKeyReason, reason, virtualEvidenceLogKeyError, err)
-		return false
-	}
-	slog.ErrorContext(ctx, "virtual adoption terminal refusal persisted",
-		"component", "api", "file_id", row.ID, "candidate_path", row.FilePath, virtualEvidenceLogKeyReason, reason)
-	return true
+	return recordAdoptionRefusalStore(ctx, store, fileID, expectedPath)
 }
 
 // virtualOwnerLookupBackoff is a bounded, expiring, in-memory marker set for

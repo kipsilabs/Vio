@@ -1735,10 +1735,6 @@ func newChiRouter(deps Dependencies) chi.Router {
 			// count.
 			adoptionRefusalStore := scanner.NewFileRepository(deps.DB)
 			playbackHandler.VirtualAdoptionRefusalStore = adoptionRefusalStore
-			// The bounded-adoption decision pre-empts a write through the
-			// revision-fenced terminal stamp, so a stale decision cannot
-			// condemn a row a newer evidence write already advanced.
-			playbackHandler.VirtualAdoptionTerminalMarker = adoptionRefusalStore.MarkVirtualAdoptionTerminalRefusal
 			playbackHandler.VirtualFileSaver = func(ctx context.Context, args models.VirtualFilePersistArgs) (int64, error) {
 				if deps.DB == nil {
 					return 0, nil

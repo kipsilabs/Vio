@@ -90,8 +90,11 @@ func TestVirtualAdoptionRefusalBoundInheritedIdentityStaysFenced(t *testing.T) {
 	if !args.RequireAdopt {
 		t.Fatalf("inherited identity disabled the adoption fence: %+v", args)
 	}
-	if args.RefusalReason != virtualProbeRefusalAdoptionBoundExhausted {
-		t.Fatalf("refusal reason = %q, want terminal %q", args.RefusalReason, virtualProbeRefusalAdoptionBoundExhausted)
+	// The stored count no longer decides anything here: the terminal decision
+	// belongs to the transactional refusal reconciliation, so the args builder
+	// must not name the exhausted disposition on its own.
+	if args.RefusalReason == virtualProbeRefusalAdoptionBoundExhausted {
+		t.Fatalf("args builder made the terminal decision itself: %+v", args)
 	}
 }
 
@@ -149,8 +152,11 @@ func TestVirtualAdoptionRefusalBoundForeignStaysFenced(t *testing.T) {
 	if !args.RequireAdopt {
 		t.Fatalf("foreign release lost its adoption fence: %+v", args)
 	}
-	if args.RefusalReason != virtualProbeRefusalAdoptionBoundExhausted {
-		t.Fatalf("foreign refusal reason = %q, want the terminal %q", args.RefusalReason, virtualProbeRefusalAdoptionBoundExhausted)
+	// The terminal disposition is decided by the transactional reconciliation,
+	// not here: past the bound the args builder still only builds the fenced
+	// write.
+	if args.RefusalReason == virtualProbeRefusalAdoptionBoundExhausted {
+		t.Fatalf("args builder made the terminal decision itself: %+v", args)
 	}
 }
 
@@ -412,40 +418,11 @@ func TestVirtualAdoptionRefusalTrackerEnforcesMaxEntries(t *testing.T) {
 	}
 }
 
-// TestVirtualAdoptionTerminalRefusalPersistsMarker proves the terminal branch
-// installs durable refusal state instead of only logging: the handler stamps the
-// row's failed_at verdict through the existing fenced marker so a later resolve
-// on any replica skips the row and the retry loop stops.
-func TestVirtualAdoptionTerminalRefusalPersistsMarker(t *testing.T) {
-	row := adoptionBoundTestRow(5031907, "row-hash")
-	var gotID int
-	var gotPath string
-	var gotObserved *time.Time
-	h := &PlaybackHandler{
-		VirtualCandidateFailMarker: func(_ context.Context, fileID int, expectedFilePath string, observedFailedAt *time.Time) error {
-			gotID, gotPath, gotObserved = fileID, expectedFilePath, observedFailedAt
-			return nil
-		},
-	}
-	if !h.markVirtualAdoptionTerminalRefusal(context.Background(), row, virtualProbeRefusalAdoptionBoundExhausted) {
-		t.Fatal("terminal refusal did not install the durable marker")
-	}
-	if gotID != row.ID || gotPath != row.FilePath || gotObserved != row.FailedAt {
-		t.Fatalf("marker called with (%d, %q, %v), want (%d, %q, %v)", gotID, gotPath, gotObserved, row.ID, row.FilePath, row.FailedAt)
-	}
-}
-
-// TestVirtualAdoptionTerminalRefusalMissingMarkerIsNotAnError proves the durable
-// install degrades safely when no marker is wired: it reports no install rather
-// than panicking, so a deployment without the fail marker keeps the prior
-// behavior (the in-memory count still bounds the trigger).
-func TestVirtualAdoptionTerminalRefusalMissingMarkerIsNotAnError(t *testing.T) {
-	row := adoptionBoundTestRow(5031908, "row-hash")
-	h := &PlaybackHandler{}
-	if h.markVirtualAdoptionTerminalRefusal(context.Background(), row, virtualProbeRefusalAdoptionBoundExhausted) {
-		t.Fatal("terminal refusal reported a durable install with no marker wired")
-	}
-}
+// TestVirtualAdoptionTerminalRefusalPersistsMarker was removed with the
+// pre-emptive terminal decision: the terminal is now installed by the
+// transactional refusal reconciliation (see txVirtualAdoptionRefusal), and its
+// durable, revision-fenced stamp is exercised against the real schema in
+// playback_virtual_adoption_bound_db_test.go.
 
 // adoptionBoundRefusingDB is a fake VirtualFileMetadataDB that makes every
 // required adoption match no row, so ExecVirtualFileMetadataUpdateResult takes
