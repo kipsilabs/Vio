@@ -141,7 +141,7 @@ func TestDeferredProbePartialEnumerationStaysPending(t *testing.T) {
 		t.Fatal("admission rejected the fresh job")
 	}
 
-	outcome, verifiedFileID := fx.handler.probeVirtualSourceAndPersistWith(
+	outcome, committed := fx.handler.probeVirtualSourceAndPersistWith(
 		context.Background(),
 		deferred.stickyKey, deferred.file, deferred.streamURL,
 		*deferred.probeTransient, deferred.cand, resolver.PersistedIdentityTiers{}, deferred.expectedRuntimeMinutes, deferred.ownerID,
@@ -150,8 +150,8 @@ func TestDeferredProbePartialEnumerationStaysPending(t *testing.T) {
 	if outcome != probeOutcomePartial {
 		t.Fatalf("outcome = %q, want partial for an incomplete enumeration", outcome)
 	}
-	if verifiedFileID != 0 {
-		t.Fatalf("verifiedFileID = %d, want 0: a partial probe commits nothing", verifiedFileID)
+	if committed.committed() {
+		t.Fatalf("committed.row = %d, want no commit: a partial probe commits nothing", committed.fileID)
 	}
 	if got := fx.saverCallCount(); got != 0 {
 		t.Fatalf("partial probe attempted %d evidence writes, want 0", got)
@@ -368,7 +368,7 @@ func TestDeferredProbeCompleteEnumerationVerifies(t *testing.T) {
 	// and subtitle inventory.
 	close(fx.releaseProbe)
 
-	outcome, verifiedFileID := fx.handler.probeVirtualSourceAndPersistWith(
+	outcome, committed := fx.handler.probeVirtualSourceAndPersistWith(
 		context.Background(),
 		deferred.stickyKey, deferred.file, deferred.streamURL,
 		*deferred.probeTransient, deferred.cand, resolver.PersistedIdentityTiers{}, deferred.expectedRuntimeMinutes, deferred.ownerID,
@@ -377,8 +377,8 @@ func TestDeferredProbeCompleteEnumerationVerifies(t *testing.T) {
 	if outcome != probeOutcomeVerified {
 		t.Fatalf("outcome = %q, want verified for a complete enumeration", outcome)
 	}
-	if verifiedFileID != fx.session.MediaFileID {
-		t.Fatalf("verifiedFileID = %d, want the committed row %d", verifiedFileID, fx.session.MediaFileID)
+	if committed.fileID != fx.session.MediaFileID {
+		t.Fatalf("committed.row = %d, want the committed row %d", committed.fileID, fx.session.MediaFileID)
 	}
 	if got := fx.saverCallCount(); got != 1 {
 		t.Fatalf("complete probe committed %d evidence writes, want 1", got)
@@ -418,7 +418,7 @@ func TestDeferredProbeDeclaredAudioHoldsPendingUntilProbed(t *testing.T) {
 	pending := fx.job(uri)
 	pending.cand.AudioLanguages = []string{"FRE"}
 	pending.probeTransient = &declared
-	outcome, verifiedFileID := fx.handler.probeVirtualSourceAndPersistWith(
+	outcome, committed := fx.handler.probeVirtualSourceAndPersistWith(
 		context.Background(),
 		pending.stickyKey, pending.file, pending.streamURL,
 		*pending.probeTransient, pending.cand, resolver.PersistedIdentityTiers{}, pending.expectedRuntimeMinutes, pending.ownerID,
@@ -427,8 +427,8 @@ func TestDeferredProbeDeclaredAudioHoldsPendingUntilProbed(t *testing.T) {
 	if outcome != probeOutcomePartial {
 		t.Fatalf("outcome = %q, want partial: declared audio must not verify a video-without-audio enumeration", outcome)
 	}
-	if verifiedFileID != 0 {
-		t.Fatalf("verifiedFileID = %d, want 0: a partial probe commits nothing", verifiedFileID)
+	if committed.committed() {
+		t.Fatalf("committed.row = %d, want no commit: a partial probe commits nothing", committed.fileID)
 	}
 	if got := fx.saverCallCount(); got != 0 {
 		t.Fatalf("partial probe attempted %d evidence writes, want 0", got)
@@ -443,7 +443,7 @@ func TestDeferredProbeDeclaredAudioHoldsPendingUntilProbed(t *testing.T) {
 	verified := fx.job(uri)
 	verified.cand.AudioLanguages = []string{"FRE"}
 	verified.probeTransient = &declared
-	outcome, verifiedFileID = fx.handler.probeVirtualSourceAndPersistWith(
+	outcome, committed = fx.handler.probeVirtualSourceAndPersistWith(
 		context.Background(),
 		verified.stickyKey, verified.file, verified.streamURL,
 		*verified.probeTransient, verified.cand, resolver.PersistedIdentityTiers{}, verified.expectedRuntimeMinutes, verified.ownerID,
@@ -452,8 +452,8 @@ func TestDeferredProbeDeclaredAudioHoldsPendingUntilProbed(t *testing.T) {
 	if outcome != probeOutcomeVerified {
 		t.Fatalf("outcome = %q, want verified once probed audio lands", outcome)
 	}
-	if verifiedFileID != fx.session.MediaFileID {
-		t.Fatalf("verifiedFileID = %d, want the committed row %d", verifiedFileID, fx.session.MediaFileID)
+	if committed.fileID != fx.session.MediaFileID {
+		t.Fatalf("committed.row = %d, want the committed row %d", committed.fileID, fx.session.MediaFileID)
 	}
 	if got := fx.saverCallCount(); got != 1 {
 		t.Fatalf("complete probe committed %d evidence writes, want 1", got)

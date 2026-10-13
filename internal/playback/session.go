@@ -1799,15 +1799,22 @@ func (m *SessionManager) SetVirtualProbeOutcomeIfGeneration(sessionID string, ge
 	return true, nil
 }
 
-// CommitVirtualProbeTracksIfGeneration replaces a live session's carried virtual
-// inventory with the tracks a deferred probe just committed to the bound
-// candidate's row, without moving the binding. It is the propagation half of
-// same-session verified inventory: the serve bind deliberately keeps serving the
-// session's carried inventory (the list the transport was started and muxed
-// against), so the verified truth reaches the menu by updating that carried
-// inventory rather than by swapping the row's tracks in on every read. A row
-// overlay would publish a selection ordinal space the transport never used and
-// silence fast starts.
+// SetVirtualProbeVerifiedInventoryIfGeneration atomically records a deferred
+// probe's verified outcome AND replaces the live session's carried virtual
+// inventory with the tracks the probe just committed, under one generation-fenced
+// critical section. It is the propagation half of same-session verified
+// inventory: the serve bind deliberately keeps serving the session's carried
+// inventory (the list the transport was started and muxed against), so the
+// verified truth reaches the menu by updating that carried inventory rather than
+// by swapping the row's tracks in on every read. A row overlay would publish a
+// selection ordinal space the transport never used and silence fast starts.
+//
+// The outcome and the inventory move together on purpose. Recording verified in
+// a separate write would let a poll observe the verified status while the menu
+// still carried the provisional plan-time list — the exact transient the
+// propagation exists to close. A write that reports applied has therefore already
+// published both; a write that reports not-applied (a rotation moved the
+// generation) has changed neither.
 //
 // The candidate provenance anchor (URI, row id, evidence-set flag) is left
 // untouched: the committed tracks describe the same bound candidate the plan
@@ -1815,9 +1822,7 @@ func (m *SessionManager) SetVirtualProbeOutcomeIfGeneration(sessionID string, ge
 // VirtualSourceRevision so the inventory revision and its ETag move on the
 // verified commit and the client's conditional poll stops returning 304;
 // streamRevision advances so in-memory snapshot readers observe the change too.
-// The write is fenced on the binding generation, so a probe that finishes after
-// a rotation cannot stamp its verdict onto the replacement binding.
-func (m *SessionManager) CommitVirtualProbeTracksIfGeneration(sessionID string, generation uint64, revision string, audio []models.AudioTrack, subtitles []models.SubtitleTrack, external []models.ExternalSubtitle) (bool, error) {
+func (m *SessionManager) SetVirtualProbeVerifiedInventoryIfGeneration(sessionID string, generation uint64, revision string, audio []models.AudioTrack, subtitles []models.SubtitleTrack, external []models.ExternalSubtitle) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -1833,6 +1838,7 @@ func (m *SessionManager) CommitVirtualProbeTracksIfGeneration(sessionID string, 
 	s.VirtualExternalSubtitles = external
 	s.VirtualSubtitleEvidenceSet = true
 	s.VirtualSourceRevision = revision
+	setVirtualProbeOutcomeLocked(s, VirtualProbeOutcomeVerified)
 	s.streamRevision++
 	m.touchSessionLocked(s)
 	return true, nil
