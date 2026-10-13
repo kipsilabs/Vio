@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
+	"github.com/Silo-Server/silo-server/internal/virtuallibrary/resolver"
 )
 
 // virtualDeferredProbeV3 is a probe scheduled to run after the transport commit
@@ -40,6 +42,14 @@ type virtualDeferredProbeV3 struct {
 	// double) leaves it zero; the conditional write is still the only outcome
 	// path, so such a job simply never passes a fence against a real manager.
 	bindingGeneration uint64
+	// binding is the full candidate-binding snapshot captured at admission
+	// alongside bindingGeneration. The verified-inventory propagation CASes on
+	// it, so a row-id-only mutation (SetEffectiveMediaFileID moves the effective
+	// row without bumping the generation) between the release-continuity check
+	// and the commit cannot land the probe's inventory on a changed binding. A
+	// manager that cannot supply a snapshot leaves it zero; the CAS then falls
+	// back to the generation-only fence.
+	binding playback.VirtualSourceBindingSnapshot
 }
 
 const (
@@ -98,6 +108,62 @@ const (
 // the replacement binding, so there is deliberately no unconditional fallback.
 type virtualProbeOutcomeWriter interface {
 	SetVirtualProbeOutcomeIfGeneration(sessionID string, generation uint64, outcome string) (bool, error)
+}
+
+// virtualProbeOutcomeBindingWriter is the stronger outcome-writer capability
+// that fences the terminal verdict on the whole candidate binding, not just its
+// generation, through the same predicate the verified-inventory writer uses. It
+// exists because SetEffectiveMediaFileID moves the session's effective row
+// without advancing virtualSourceGeneration, so a generation-only failure write
+// could stamp the old probe's verdict onto the changed binding. The propagation
+// prefers this form when the manager supplies it.
+type virtualProbeOutcomeBindingWriter interface {
+	SetVirtualProbeOutcomeIfBinding(sessionID string, expected playback.VirtualSourceBindingSnapshot, outcome string) (bool, error)
+}
+
+// virtualProbeInventoryWriter is the session-manager capability that atomically
+// records a deferred probe's verified outcome AND replaces the live session's
+// carried virtual inventory with the exact tracks the probe committed, fenced on
+// the binding generation. It is how verified truth reaches the same session
+// without the serve bind swapping in the row's tracks, which would publish a
+// selection ordinal space the transport never muxed against. The outcome and the
+// inventory move in one write because a poll that observed verified status over
+// the unchanged provisional list is the transient this propagation exists to
+// close.
+type virtualProbeInventoryWriter interface {
+	SetVirtualProbeVerifiedInventoryIfGeneration(sessionID string, generation uint64, revision string, audio []models.AudioTrack, subtitles []models.SubtitleTrack, external []models.ExternalSubtitle) (bool, error)
+}
+
+// virtualProbeInventoryBindingWriter is the stronger inventory-writer capability
+// that fences the verified-inventory commit on the whole candidate binding, not
+// just its generation. It exists because SetEffectiveMediaFileID can move the
+// session's effective row without advancing virtualSourceGeneration, so a
+// generation-only commit could mark the old row's inventory verified onto a
+// changed binding. The propagation prefers this form when the manager supplies
+// it and falls back to the generation form for a manager that cannot.
+type virtualProbeInventoryBindingWriter interface {
+	SetVirtualProbeVerifiedInventoryIfBinding(sessionID string, expected playback.VirtualSourceBindingSnapshot, revision string, audio []models.AudioTrack, subtitles []models.SubtitleTrack, external []models.ExternalSubtitle) (bool, error)
+}
+
+// virtualCommittedProbeInventory is the exact inventory a deferred probe's
+// durable evidence write committed, carried forward from the write itself rather
+// than reread from the catalog row. The row is mutable: an in-place adoption
+// between the write and a reread can replace its tracks and path with another
+// release's while the binding generation is unchanged, so the committed tracks
+// and the release identity the probe wrote are the only trustworthy record of
+// what the probe verified.
+type virtualCommittedProbeInventory struct {
+	fileID       int
+	candidateURI string
+	identity     resolver.PersistedIdentityTiers
+	audio        []models.AudioTrack
+	subtitles    []models.SubtitleTrack
+	external     []models.ExternalSubtitle
+}
+
+// committed reports whether the carrier names a real committed catalog row.
+func (inv virtualCommittedProbeInventory) committed() bool {
+	return inv.fileID > 0
 }
 
 // startDeferredProbeWorkers lazily starts the fixed post-commit probe pool. The
@@ -337,6 +403,7 @@ func (h *PlaybackHandler) armDeferredProbePending(ctx context.Context, deferred 
 		return false
 	}
 	deferred.bindingGeneration = binding.Generation
+	deferred.binding = binding
 	if armer, ok := h.sessionMgr.(virtualProbePendingArmer); ok {
 		// Exclusive ownership: arm only from empty, so a duplicate start cannot
 		// restart a lifecycle the winner already armed or completed. A manager
@@ -392,18 +459,47 @@ func (h *PlaybackHandler) setVirtualProbeOutcomeIfGeneration(sessionID string, g
 	return applied
 }
 
+// setVirtualProbeOutcomeIfBinding records a deferred probe's terminal outcome
+// while the session's full candidate binding still matches the snapshot the
+// probe was admitted against. It prefers the full-binding writer so a row-only
+// move that does not advance the generation is rejected rather than stamping the
+// old probe's verdict onto the changed binding, and falls back to the
+// generation-only CAS for a manager that cannot supply one. It reports whether
+// the write landed, so the caller publishes a terminal notification only for the
+// binding that actually carries the verdict.
+func (h *PlaybackHandler) setVirtualProbeOutcomeIfBinding(sessionID string, binding playback.VirtualSourceBindingSnapshot, outcome string) bool {
+	if h == nil || sessionID == "" || h.sessionMgr == nil {
+		return false
+	}
+	if writer, ok := h.sessionMgr.(virtualProbeOutcomeBindingWriter); ok {
+		applied, err := writer.SetVirtualProbeOutcomeIfBinding(sessionID, binding, outcome)
+		if err != nil {
+			if !errors.Is(err, playback.ErrSessionNotFound) {
+				slog.Warn("failed to record virtual probe outcome", "component", "api", "session", sessionID, "outcome", outcome, "error", err)
+			}
+			return false
+		}
+		if !applied {
+			slog.Info("virtual probe outcome dropped: candidate binding moved before outcome storage",
+				"component", "api", "session", sessionID, "outcome", outcome, "generation", binding.Generation)
+		}
+		return applied
+	}
+	return h.setVirtualProbeOutcomeIfGeneration(sessionID, binding.Generation, outcome)
+}
+
 // shedDeferredVirtualProbe terminally fails a probe that could not run: the
 // session outcome is marked failed and the failure published off the request
 // path, so a client watching either the push or the poll leaves its loading
-// state. The fence on the retained binding generation ensures the shed probe's
-// failure is not written onto a replacement binding that never had this probe
+// state. The fence on the retained full binding ensures the shed probe's failure
+// is not written onto a replacement binding that never had this probe
 // outstanding; when the CAS rejects the outcome the binding moved, so the
 // failure is not published either — the new binding owns its own lifecycle.
 func (h *PlaybackHandler) shedDeferredVirtualProbe(deferred *virtualDeferredProbeV3) {
 	if h == nil || deferred == nil {
 		return
 	}
-	if !h.setVirtualProbeOutcomeIfGeneration(deferred.sessionID, deferred.bindingGeneration, probeOutcomeFailed) {
+	if !h.setVirtualProbeOutcomeIfBinding(deferred.sessionID, deferred.binding, probeOutcomeFailed) {
 		return
 	}
 	h.publishDeferredProbeInventory(deferred)
@@ -513,36 +609,70 @@ func (h *PlaybackHandler) runDeferredVirtualProbe(deferred *virtualDeferredProbe
 	}
 	bgCtx, bgCancel := h.virtualDetachedContext(h.ServiceContext, virtualBackgroundProbeBudget)
 	defer bgCancel()
-	outcome, verifiedFileID := h.probeVirtualSourceAndPersistWith(bgCtx, deferred.stickyKey, deferred.file, deferred.streamURL, *deferred.probeTransient, deferred.cand, deferred.candidate.tiers(), deferred.expectedRuntimeMinutes, deferred.ownerID, true, h.deferredProbeBindingIntact(deferred))
+	outcome, committed := h.probeVirtualSourceAndPersistWith(bgCtx, deferred.stickyKey, deferred.file, deferred.streamURL, *deferred.probeTransient, deferred.cand, deferred.candidate.tiers(), deferred.expectedRuntimeMinutes, deferred.ownerID, true, h.deferredProbeBindingIntact(deferred))
 	// The probe is done with the shared gate: release this worker's slot before
 	// the terminal outcome write and publish so a saturated gate is not held by
 	// catalog/realtime fan-out that carries its own budget. Parked terminal
 	// notifications need no drain call here — the dispatcher owns wakeups and
 	// re-checks its map on its own signal and backstop ticker.
 	gate.release()
-	// The durable write committed verified evidence on verifiedFileID; run the
-	// shared cold-start default-audio reconciliation against that owner row (a
-	// rotation can move it off deferred.file), with the gate released so its own
-	// catalog/session sweep is not charged to this worker's slot. The probe's
-	// binding fence already refuses a superseded verdict, and the reconcile
-	// sweep re-checks the committed row before issuing any correction.
-	if outcome == probeOutcomeVerified && verifiedFileID > 0 {
-		h.reconcileVerifiedDefaultAudio(context.Background(), verifiedFileID)
+	// The durable write committed verified evidence on committed.fileID; run the
+	// shared cold-start default-audio reconciliation against the exact inventory
+	// that write produced — never a reread of the mutable row — with the gate
+	// released so its own catalog/session sweep is not charged to this worker's
+	// slot. It runs BEFORE the overlay is updated so it compares the plan-time
+	// selection against the verified inventory, exactly as the direct and queued
+	// evidence paths do. The probe's binding fence already refuses a superseded
+	// verdict, and the committed carrier is the record of what was written, so an
+	// in-place adoption between the write and this reconcile cannot substitute
+	// another release's tracks into the decision.
+	if outcome == probeOutcomeVerified && committed.committed() {
+		h.reconcileVerifiedDefaultAudioFromCommitted(context.Background(), committed)
 	}
 	switch outcome {
-	case probeOutcomeVerified, probeOutcomeFailed:
+	case probeOutcomeVerified:
+		// Propagate the committed inventory into the session's carried overlay
+		// and record the verified outcome in the SAME generation-fenced write,
+		// so a poll can never observe verified status over the unchanged
+		// provisional menu. Only a landed propagation is published as verified;
+		// a binding that moved owns its own lifecycle, and a committed inventory
+		// that provably belongs to another release fails the session closed
+		// rather than painting the provisional menu as verified.
+		//
+		// This deliberately does not go through the generic terminal write: the
+		// verified outcome is inseparable from the inventory that backs it, and
+		// a recoverable propagation read is retried on a fresh bounded context
+		// inside propagateVerifiedProbeInventory.
+		switch h.propagateVerifiedProbeInventory(deferred, committed) {
+		case probeInventoryApplied:
+			h.publishDeferredProbeInventory(deferred)
+		case probeInventoryRefused:
+			if h.setVirtualProbeOutcomeIfBinding(deferred.sessionID, deferred.binding, probeOutcomeFailed) {
+				h.publishDeferredProbeInventory(deferred)
+			}
+		case probeInventoryUnprovable:
+			// The probe committed but release continuity could not be proven
+			// within the retry bound. Fail the binding terminally so a client
+			// watching the poll or the push leaves its loading state rather than
+			// staying pending until the convergence watchdog; the carried
+			// provisional overlay is untouched and a replan re-resolves.
+			if h.setVirtualProbeOutcomeIfBinding(deferred.sessionID, deferred.binding, probeOutcomeFailed) {
+				h.publishDeferredProbeInventory(deferred)
+			}
+		case probeInventorySuperseded:
+			// The binding rotated, the session carries no overlay capability, or
+			// a transient identity read never cleared; nothing is owed to this
+			// generation and no verified status is published.
+		}
+	case probeOutcomeFailed:
 		// probeVirtualSourceAndPersist has already attempted the durable
 		// evidence write (it either landed or terminally failed), so the session
-		// outcome can now record whether the verified menu is readable or the
-		// enumeration terminally failed. The poll and the push then agree and a
-		// client can leave its loading state. The terminal write CASes on the
-		// admitted generation; a rotation that landed while the probe ran makes
-		// the CAS reject the verdict, and then nothing is published — the
-		// replacement binding owns its own lifecycle.
-		if h.setVirtualProbeOutcomeIfGeneration(deferred.sessionID, deferred.bindingGeneration, outcome) {
-			// Publish after the outcome write so a push-driven client never
-			// receives an event whose status the session does not yet carry. The
-			// fan-out runs detached and must not spend this worker's gate slot.
+		// outcome can now record that the enumeration terminally failed. The poll
+		// and the push then agree and a client can leave its loading state. The
+		// terminal write CASes on the admitted generation; a rotation that landed
+		// while the probe ran makes the CAS reject the verdict, and then nothing
+		// is published — the replacement binding owns its own lifecycle.
+		if h.setVirtualProbeOutcomeIfBinding(deferred.sessionID, deferred.binding, outcome) {
 			h.publishDeferredProbeInventory(deferred)
 		}
 	case probeOutcomePartial:
@@ -560,6 +690,205 @@ func (h *PlaybackHandler) runDeferredVirtualProbe(deferred *virtualDeferredProbe
 	}
 	// A parked probe may be waiting on the retry set; wake a worker to drain it.
 	h.signalDeferredProbeRetry()
+}
+
+// probeInventoryDisposition is the outcome of propagating a deferred probe's
+// committed inventory into the live session overlay.
+type probeInventoryDisposition int
+
+const (
+	// probeInventoryApplied means the verified outcome and the committed
+	// inventory landed on the session in one fenced write.
+	probeInventoryApplied probeInventoryDisposition = iota
+	// probeInventorySuperseded means the binding rotated (or the session cannot
+	// carry an overlay, or a transient identity read never cleared); nothing is
+	// owed to this generation and no verified status is published.
+	probeInventorySuperseded
+	// probeInventoryRefused means the committed inventory provably belongs to a
+	// different release than the session binding, or an invalid binding id
+	// carries no identity to confirm: the session fails closed instead of
+	// serving the committed inventory as verified.
+	probeInventoryRefused
+	// probeInventoryUnprovable means the committed inventory is in hand but the
+	// bound-row read that proves release continuity stayed unreadable through the
+	// whole retry bound. The session must leave its pending state rather than
+	// freeze: it terminally fails closed, exactly like a provable mismatch, and
+	// the client can replan. Distinct from refused so the log names a read
+	// exhaustion, not a proven different release.
+	probeInventoryUnprovable
+)
+
+// probePropagationAttempts bounds the fresh-context retries of a recoverable
+// propagation decision. The retried step is a catalog read of the session's
+// bound row used to prove release continuity; the committed inventory itself is
+// already in hand, so a transient read failure is retried, never converted into
+// a verified publish.
+const probePropagationAttempts = 2
+
+// propagateVerifiedProbeInventory commits the exact inventory a deferred probe
+// wrote into the live session's carried overlay AND records the verified outcome
+// in one generation-fenced write. It never rereads the committed row: the
+// carried inventory is the record of what was written, so an in-place adoption
+// between the write and this propagation cannot substitute another release's
+// tracks. It returns whether the write landed, was refused as a different
+// release, or was superseded by a rotation; a recoverable catalog read while
+// proving the bound release is retried on a fresh bounded context.
+//
+// Transport coherence: replacing the carried list does not rebuild a running
+// mux, and none is owed. The transport's audio selector is an audio-only
+// ordinal (0:a:N) derived from container stream indices, not array position, so
+// an array reorder alone leaves the committed stream's ordinal unchanged and the
+// running mux keeps playing the same stream. When a removal shifts that ordinal,
+// the shared default-audio reconcile — which runs before this write against the
+// plan-time selection, as the direct and queued evidence paths do — issues the
+// correction that points 0:a:N back at the committed track. An explicit viewer
+// selection is preserved by its track identity and is never overridden. This
+// write therefore deliberately leaves the session's committed array position
+// untouched; renumbering it here would change the ordinal space the running mux
+// was started against.
+func (h *PlaybackHandler) propagateVerifiedProbeInventory(deferred *virtualDeferredProbeV3, committed virtualCommittedProbeInventory) probeInventoryDisposition {
+	if h == nil || deferred == nil || deferred.sessionID == "" || !committed.committed() {
+		return probeInventorySuperseded
+	}
+	writer, ok := h.sessionMgr.(virtualProbeInventoryWriter)
+	if !ok {
+		return probeInventorySuperseded
+	}
+	revision := verifiedProbeInventoryRevision(committed)
+	for attempt := 0; attempt < probePropagationAttempts; attempt++ {
+		match, retryable := h.committedProbeMatchesSessionBinding(deferred, committed)
+		if !match {
+			if retryable && attempt < probePropagationAttempts-1 {
+				// A transient catalog read of the bound row: retry on a fresh
+				// bounded context instead of treating the failure as a refusal.
+				continue
+			}
+			if retryable {
+				// Still unreadable after the retry bound: never publish verified
+				// over an inventory we could not prove belongs to this binding,
+				// but do not leave the session pending either. The caller records
+				// a fenced terminal failure so the client leaves its loading
+				// state instead of freezing until the convergence watchdog.
+				return probeInventoryUnprovable
+			}
+			return probeInventoryRefused
+		}
+		// Prefer the full-binding CAS when the manager supplies one: it fences
+		// the effective row id too, so a row-id-only mutation between the
+		// release-continuity check and this write is rejected rather than
+		// committing the validated row's inventory onto the changed binding.
+		// The generation-only writer remains the fallback for managers that
+		// carry no binding snapshot.
+		var applied bool
+		var err error
+		if bw, ok := h.sessionMgr.(virtualProbeInventoryBindingWriter); ok {
+			applied, err = bw.SetVirtualProbeVerifiedInventoryIfBinding(
+				deferred.sessionID, deferred.binding, revision,
+				committed.audio, committed.subtitles, committed.external,
+			)
+		} else {
+			applied, err = writer.SetVirtualProbeVerifiedInventoryIfGeneration(
+				deferred.sessionID, deferred.bindingGeneration, revision,
+				committed.audio, committed.subtitles, committed.external,
+			)
+		}
+		if err != nil {
+			if errors.Is(err, playback.ErrSessionNotFound) {
+				return probeInventorySuperseded
+			}
+			if attempt < probePropagationAttempts-1 {
+				continue
+			}
+			slog.Warn("verified probe inventory not propagated",
+				"component", "api", "session", deferred.sessionID, "file_id", committed.fileID, "error", err)
+			return probeInventorySuperseded
+		}
+		if !applied {
+			slog.Debug("verified probe inventory propagation dropped: candidate binding moved",
+				"component", "api", "session", deferred.sessionID, "file_id", committed.fileID, "generation", deferred.bindingGeneration)
+			return probeInventorySuperseded
+		}
+		return probeInventoryApplied
+	}
+	return probeInventorySuperseded
+}
+
+// committedProbeMatchesSessionBinding reports whether the inventory a deferred
+// probe committed may replace the live session's carried overlay. It fences on
+// the session's current candidate binding and on the committed release identity
+// the probe itself wrote, and it never rereads the committed row: the carried
+// inventory is the record of what was written, so an in-place adoption between
+// the write and this check cannot supply another release's tracks.
+//
+// The candidate URI is asserted explicitly even though the generation CAS
+// already proves it, because SetEffectiveMediaFileID moves the session's
+// effective row id without advancing the generation, so a row-id-only mutation
+// must not let a superseded candidate's inventory through. An unknown effective
+// row id (<= 0) carries no identity to confirm and is rejected.
+//
+// retryable reports that the decision could not be made because the catalog read
+// of the session's bound row failed; the caller retries it on a fresh bounded
+// context rather than treating a transient read failure as a refusal.
+func (h *PlaybackHandler) committedProbeMatchesSessionBinding(deferred *virtualDeferredProbeV3, committed virtualCommittedProbeInventory) (match bool, retryable bool) {
+	if h == nil || h.sessionMgr == nil || deferred == nil || !committed.committed() {
+		return false, false
+	}
+	live, err := h.sessionMgr.GetSession(deferred.sessionID)
+	if err != nil || live == nil {
+		return false, false
+	}
+	if !sameVirtualCandidate(strings.TrimSpace(live.VirtualSourceURI), deferred.cand.URI) {
+		return false, false
+	}
+	if live.MediaFileID <= 0 {
+		// An unknown effective row carries no identity to confirm; never trust
+		// it, whatever the committed row id names.
+		return false, false
+	}
+	if live.MediaFileID == committed.fileID {
+		// The committed row is the session's own effective row: the probe
+		// committed onto exactly the row the session serves. The release identity
+		// is carried from that same commit, so no cross-row question remains.
+		return true, false
+	}
+	if h.fileResolver == nil {
+		return false, false
+	}
+	ctx, cancel := h.virtualDetachedContext(h.ServiceContext, virtualEvidencePersistBudget)
+	defer cancel()
+	bound, err := h.fileResolver.GetByID(ctx, live.MediaFileID)
+	if err != nil {
+		return false, true
+	}
+	if bound == nil {
+		return false, false
+	}
+	return boundIdentitySharesRelease(bound, committed.identity), false
+}
+
+// boundIdentitySharesRelease reports whether the bound row's durable provider
+// identity and a committed release identity prove one release, using the
+// asymmetric SharedTier with the bound row authoritative: a stronger stored tier
+// the committed identity cannot corroborate is a veto, and an identity whose
+// tiers are all empty never matches, so an unprovable pairing fails closed.
+func boundIdentitySharesRelease(bound *models.MediaFile, committed resolver.PersistedIdentityTiers) bool {
+	if bound == nil {
+		return false
+	}
+	boundTiers := resolver.NewPersistedIdentityTiers(bound.ProviderVideoHash, bound.ProviderGUID, bound.ProviderReleaseName, bound.ProviderReleaseSize)
+	_, shared := boundTiers.SharedTier(committed)
+	return shared
+}
+
+// verifiedProbeInventoryRevision names the verified inventory generation a
+// committed deferred probe just produced, derived from the committed tracks so
+// the served revision moves on a genuine new inventory and the client's
+// conditional poll stops returning 304. It is deliberately keyed on the carried
+// inventory, not a reread of the row's stamp: the tracks are what the session
+// now serves, and the value is opaque exactly like the plan-time revision it
+// replaces.
+func verifiedProbeInventoryRevision(committed virtualCommittedProbeInventory) string {
+	return reconcileGenerationV3(&models.MediaFile{AudioTracks: committed.audio})
 }
 
 // deferredProbeBindingCurrent reports whether the session is still bound to the

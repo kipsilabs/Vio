@@ -3137,6 +3137,26 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			virtualCandidateVerdictActive(file.FailedAt, time.Now()) {
 			return nil, fmt.Errorf("%w: candidate %s is marked failed", ErrVirtualCandidateMarkedFailed, cand.URI)
 		}
+		// A concrete ?result= candidate is served by the catalog row that owns
+		// its exact URI, never by the provider-neutral sibling the neutral
+		// fallback returns first (the lowest-id row sharing the neutral key).
+		// An explicit pick of the same candidate serves that owner row
+		// directly; an auto start must land on the same row, or the plan's
+		// effective identity and evidence anchor would name the neutral
+		// sibling while the transport streams the concrete candidate. The
+		// owner lookup is the same exact-path resolution the deferred-probe
+		// rotation uses, so the plan and the probe cannot disagree about the
+		// row the bytes belong to. Only the seeded transient stays for a
+		// genuinely neutral candidate (no ?result=), whose own row is the
+		// requested one. The owner row then passes the same failed-verdict gate
+		// below, so a concrete pick of an indicted row is still skipped.
+		if virtualResultCandidateID(cand.URI) != "" &&
+			(dbFile == nil || strings.TrimSpace(dbFile.FilePath) != strings.TrimSpace(cand.URI)) {
+			if ownerRow, capable, ownerErr := h.virtualPathLookupRow(attemptCtx, cand.URI); capable && ownerErr == nil && ownerRow != nil {
+				dbFile = ownerRow
+				dbFound = true
+			}
+		}
 		if dbFound {
 			// Auto-pick skips candidates whose catalog row is marked failed
 			// (a transport produced no bytes, or the decoder rejected the
@@ -3163,6 +3183,13 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			transient.FilePath = cand.URI
 			transient.VirtualOwnerInstallationID = oid
 		}
+		// resolvedOwnsCandidate records whether the served transient is the
+		// catalog row that owns the exact concrete candidate URI. The deferred
+		// probe is bound to that row so its durable evidence write lands on the
+		// same row the session will serve; a neutral candidate keeps the
+		// requested row.
+		resolvedOwnsCandidate := dbFound && dbFile != nil &&
+			strings.TrimSpace(dbFile.FilePath) == strings.TrimSpace(cand.URI)
 		// Carry the resolved candidate's durable identity on the served file
 		// so the probe-evidence adoption persists the identity of the bytes
 		// being adopted. Fill-empty-only: stored tiers are never overwritten.
@@ -3319,6 +3346,19 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			if h.VirtualPlaybackSourceProber != nil || h.VirtualPlaybackSourceProberWithHeaders != nil {
 				probeKey := virtualProbeFailureKey(cand.URI, oid)
 				probeTransient := cloneVirtualProbeTransient(transient)
+				// Bind the post-commit probe to the row the plan actually
+				// serves. When the resolved candidate's exact owner row is
+				// served, its evidence write must stamp that row: the session
+				// is bound to it (effective id and evidence anchor), so probing
+				// the requested neutral sibling instead would stamp a row the
+				// session never serves and the generation-fenced overlay
+				// propagation would refuse, freezing the menus on the
+				// provisional inventory for the whole session. A genuinely
+				// neutral candidate keeps the requested row, which is its own.
+				probeCatalogFile := file
+				if resolvedOwnsCandidate {
+					probeCatalogFile = &transient
+				}
 				// Zero the duration so the deferred probe measures the
 				// empirical duration instead of inheriting the catalog value.
 				probeTransient.Duration = 0
@@ -3328,7 +3368,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 					// cache, so try a cache-only recovery before falling back
 					// to declared metadata; otherwise the row stays unprobed
 					// until the damper lapses.
-					h.recoverVirtualProbeFromCache(r.Context(), file, streamURL, probeTransient, cand, resolvedIdentity.tiers(), oid)
+					h.recoverVirtualProbeFromCache(r.Context(), probeCatalogFile, streamURL, probeTransient, cand, resolvedIdentity.tiers(), oid)
 					return withResolvedCandidate(&resolvedVirtualPlaybackSource{
 						URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenanceDeclared, ResolutionAssumed: resolutionAssumed,
 					}, resolvedIdentity, resolvedRematched), nil
@@ -3336,7 +3376,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				if options.deferProbePastCommit {
 					deferred = &virtualDeferredProbeV3{
 						stickyKey:              stickyKey,
-						file:                   file,
+						file:                   probeCatalogFile,
 						streamURL:              streamURL,
 						probeTransient:         &probeTransient,
 						cand:                   cand,
@@ -3352,10 +3392,10 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 						go func() {
 							defer gate.release()
 							defer bgCancel()
-							h.probeVirtualSourceAndPersist(bgCtx, stickyKey, file, streamURL, probeTransient, probeCand, resolvedIdentity.tiers(), expectedRuntimeMinutes, oid)
+							h.probeVirtualSourceAndPersist(bgCtx, stickyKey, probeCatalogFile, streamURL, probeTransient, probeCand, resolvedIdentity.tiers(), expectedRuntimeMinutes, oid)
 						}()
 					} else if !skipProbe {
-						h.probeVirtualCandidateForegroundFallback(r.Context(), stickyKey, file, streamURL, probeTransient, probeCand, resolvedIdentity.tiers(), expectedRuntimeMinutes, oid)
+						h.probeVirtualCandidateForegroundFallback(r.Context(), stickyKey, probeCatalogFile, streamURL, probeTransient, probeCand, resolvedIdentity.tiers(), expectedRuntimeMinutes, oid)
 					}
 				}
 			}
@@ -3841,7 +3881,7 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 	ownerInstallationID int,
 	durableEvidence bool,
 	fence func() bool,
-) (string, int) {
+) (string, virtualCommittedProbeInventory) {
 	probeKey := virtualProbeFailureKey(probeCand.URI, ownerInstallationID)
 	// Carry the served candidate's declared audio onto the probe input before
 	// the enumeration. The background/rotation paths build probeTransient from
@@ -3861,7 +3901,7 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 	if fence != nil && !fence() {
 		slog.InfoContext(bgCtx, "virtual probe evidence dropped: candidate binding moved during the probe",
 			"component", "api", "candidate_uri", probeCand.URI, "file_id", catalogFile.ID)
-		return "", 0
+		return "", virtualCommittedProbeInventory{}
 	}
 	if probeErr != nil || probed == nil {
 		if errors.Is(probeErr, scanner.ErrVirtualProbePartial) {
@@ -3885,7 +3925,7 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 			}
 			slog.WarnContext(bgCtx, "virtual probe enumeration incomplete; holding inventory pending",
 				"component", "api", "candidate_uri", probeCand.URI, "file_id", catalogFile.ID)
-			return probeOutcomePartial, 0
+			return probeOutcomePartial, virtualCommittedProbeInventory{}
 		}
 		virtualProbeFailures.mark(probeKey)
 		slog.WarnContext(bgCtx, "background virtual stream probe failed", "component", "api", "candidate_uri", probeCand.URI, "error", probeErr)
@@ -3898,7 +3938,7 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 			virtualProbeFailures.count(probeKey) >= virtualProbeFailureRepeatThreshold {
 			h.unpinVirtualSticky(stickyKey, probeCand.URI)
 		}
-		return probeOutcomeFailed, 0
+		return probeOutcomeFailed, virtualCommittedProbeInventory{}
 	}
 	if !virtualRuntimePlausible(probed.Duration, expectedRuntimeMinutes) {
 		virtualProbeFailures.mark(probeKey)
@@ -3906,7 +3946,7 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 			"component", "api", "candidate_uri", probeCand.URI, "file_id", catalogFile.ID,
 			"probed_duration_seconds", probed.Duration, "expected_runtime_minutes", expectedRuntimeMinutes)
 		h.unpinVirtualSticky(stickyKey, probeCand.URI)
-		return probeOutcomeFailed, 0
+		return probeOutcomeFailed, virtualCommittedProbeInventory{}
 	}
 	virtualProbeFailures.clear(probeKey)
 	virtualProbeFailures.clearPartial(probeKey)
@@ -3923,26 +3963,27 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 		// durable write committed the enumerated tracks onto the row the
 		// inventory poll reads. A rejected or failed write is a terminal failed
 		// outcome so the client leaves loading instead of showing a stale menu
-		// as verified. committedFileID is the row the write actually targeted: a
-		// rotation can move it off catalogFile, and the caller's post-commit
-		// default-audio reconciliation must run against the owner row.
-		committed, committedFileID := h.persistVirtualProbeEvidenceDurable(bgCtx, catalogFile, probeCand.URI, probed, candidate, true)
+		// as verified. The returned carrier is the exact committed inventory
+		// (tracks + release identity + row), captured from the write arguments
+		// rather than reread: the row is mutable, and the caller propagates it
+		// into the session overlay under the binding-generation fence.
+		committedInv, committed := h.persistVirtualProbeEvidenceDurable(bgCtx, catalogFile, probeCand.URI, probed, candidate, true)
 		if !committed {
 			slog.WarnContext(bgCtx, "deferred virtual probe evidence write did not commit; reporting failed",
 				"component", "api", "candidate_uri", probeCand.URI, "file_id", catalogFile.ID)
-			return probeOutcomeFailed, 0
+			return probeOutcomeFailed, virtualCommittedProbeInventory{}
 		}
 		// The durable write committed a verified inventory for a session whose
 		// committed recipe was built from declared metadata, so a reorder can
 		// leave the executable default-audio selection on the wrong language.
 		// The caller runs the shared reconcileVerifiedDefaultAudio hook against
-		// the returned owner row after it releases the shared gate, exactly as
+		// the committed owner row after it releases the shared gate, exactly as
 		// the direct and queued evidence paths do, so a deferred session's
 		// recipe keeps the preferred language.
-		return probeOutcomeVerified, committedFileID
+		return probeOutcomeVerified, committedInv
 	}
 	h.persistVirtualProbeEvidence(bgCtx, catalogFile, probeCand.URI, probed, candidate, true, false)
-	return probeOutcomeVerified, 0
+	return probeOutcomeVerified, virtualCommittedProbeInventory{}
 }
 
 // persistVirtualProbeEvidenceDurable performs one synchronous, durable evidence
@@ -3962,16 +4003,21 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 // reports how many rows matched, so it is treated as committed when it affected
 // at least one row and as not-committed otherwise — it cannot distinguish a CAS
 // miss (superseded snapshot) from a plain no-op, but a zero-row write is never
-// reported verified. It returns whether the probe evidence is committed and
-// therefore readable from the catalog row, together with the row the write
-// actually targeted (a rotation can move it off catalogFile), so the caller can
-// run the post-commit default-audio reconciliation against the owner row.
-func (h *PlaybackHandler) persistVirtualProbeEvidenceDurable(ctx context.Context, catalogFile *models.MediaFile, resolvedPath string, probed *models.MediaFile, candidate resolver.PersistedIdentityTiers, stampProbe bool) (bool, int) {
+// reported verified.
+//
+// On a commit it returns the exact inventory the write produced — the tracks,
+// the row, the candidate URI and the release identity that was written — carried
+// forward from the write arguments rather than reread from the row. The row is
+// mutable, so a reread could observe an in-place adoption that replaced its
+// tracks with another release's while the binding generation was unchanged; the
+// caller propagates the carried inventory under its own generation fence and must
+// never trust a reread.
+func (h *PlaybackHandler) persistVirtualProbeEvidenceDurable(ctx context.Context, catalogFile *models.MediaFile, resolvedPath string, probed *models.MediaFile, candidate resolver.PersistedIdentityTiers, stampProbe bool) (virtualCommittedProbeInventory, bool) {
 	args, _, ok := h.virtualProbeEvidenceArgs(ctx, catalogFile, resolvedPath, probed, candidate, stampProbe)
 	if !ok {
 		slog.WarnContext(ctx, "durable virtual probe evidence write refused before execution",
 			"component", "api", "file_id", catalogFileIDOrZero(catalogFile), "candidate_uri", resolvedPath)
-		return false, 0
+		return virtualCommittedProbeInventory{}, false
 	}
 	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), virtualEvidencePersistBudget)
 	defer cancel()
@@ -3980,28 +4026,55 @@ func (h *PlaybackHandler) persistVirtualProbeEvidenceDurable(ctx context.Context
 		if err != nil {
 			slog.WarnContext(ctx, "durable virtual probe evidence write failed",
 				"component", "api", "file_id", args.FileID, "error", err)
-			return false, 0
+			return virtualCommittedProbeInventory{}, false
 		}
 		if result.MetadataUpdated {
-			return true, args.FileID
+			return committedProbeInventoryFromWrite(args, resolvedPath, candidate, probed), true
 		}
 		// A CAS miss is the expected outcome when a newer writer already
 		// committed the row; the evidence this probe enumerated is then
 		// superseded and must not be reported verified.
 		slog.WarnContext(ctx, "durable virtual probe evidence write matched no row (superseded snapshot)",
 			"component", "api", "file_id", args.FileID, "candidate_uri", resolvedPath)
-		return false, 0
+		return virtualCommittedProbeInventory{}, false
 	}
 	if h.VirtualFileSaver == nil {
-		return false, 0
+		return virtualCommittedProbeInventory{}, false
 	}
 	rows, err := h.VirtualFileSaver(writeCtx, args)
 	if err != nil {
 		slog.WarnContext(ctx, "durable virtual probe evidence write failed",
 			"component", "api", "file_id", args.FileID, "error", err)
-		return false, 0
+		return virtualCommittedProbeInventory{}, false
 	}
-	return rows > 0, args.FileID
+	if rows <= 0 {
+		return virtualCommittedProbeInventory{}, false
+	}
+	return committedProbeInventoryFromWrite(args, resolvedPath, candidate, probed), true
+}
+
+// committedProbeInventoryFromWrite captures the exact inventory a successful
+// durable evidence write committed, from the write arguments and the probed
+// evidence rather than a reread of the row. The release identity is the row's
+// stored identity when the write was metadata-only (the row keeps what it had)
+// and the resolved candidate's identity when the write required an adoption that
+// replaces the stored transport set as a unit.
+func committedProbeInventoryFromWrite(args models.VirtualFilePersistArgs, resolvedPath string, candidate resolver.PersistedIdentityTiers, probed *models.MediaFile) virtualCommittedProbeInventory {
+	identity := resolver.NewPersistedIdentityTiers(args.ExpectedProviderVideoHash, args.ExpectedProviderGUID, args.ExpectedProviderReleaseName, args.ExpectedProviderReleaseSize)
+	if args.RequireAdopt && args.AdoptPath != "" {
+		identity = candidate
+	}
+	inv := virtualCommittedProbeInventory{
+		fileID:       args.FileID,
+		candidateURI: resolvedPath,
+		identity:     identity,
+	}
+	if probed != nil {
+		inv.audio = append([]models.AudioTrack(nil), probed.AudioTracks...)
+		inv.subtitles = append([]models.SubtitleTrack(nil), probed.SubtitleTracks...)
+		inv.external = append([]models.ExternalSubtitle(nil), probed.ExternalSubtitles...)
+	}
+	return inv
 }
 
 // catalogFileIDOrZero is a nil-safe file id for a log attribute.
@@ -5849,10 +5922,20 @@ func virtualCandidateIDExcluded(candidateURI string, excluded []string) bool {
 // with a nil error is a genuine not-found and the only safe absence; a row
 // without a usable id is treated as an unanswered lookup, not absence.
 func (h *PlaybackHandler) virtualPathOwnerRow(ctx context.Context, file *models.MediaFile, candidateURI string, ownerID, libraryID int) (*models.MediaFile, error) {
-	if h == nil || file == nil || strings.TrimSpace(candidateURI) == "" {
+	if h == nil {
 		return nil, nil
 	}
-	row, capable, err := h.virtualPathLookupRow(ctx, candidateURI)
+	return virtualPathOwnerRowFor(ctx, h.fileResolver, file, candidateURI, ownerID, libraryID)
+}
+
+// virtualPathOwnerRowFor is the resolver-parameterized form of
+// virtualPathOwnerRow, so the StreamHandler serve path can apply the same
+// ownership assertion the PlaybackHandler paths use.
+func virtualPathOwnerRowFor(ctx context.Context, resolver FilePathResolver, file *models.MediaFile, candidateURI string, ownerID, libraryID int) (*models.MediaFile, error) {
+	if file == nil || strings.TrimSpace(candidateURI) == "" {
+		return nil, nil
+	}
+	row, capable, err := virtualPathLookupRowFor(ctx, resolver, candidateURI)
 	if !capable || err != nil || row == nil {
 		return nil, err
 	}
@@ -5869,6 +5952,86 @@ func (h *PlaybackHandler) virtualPathOwnerRow(ctx context.Context, file *models.
 		return nil, nil
 	}
 	return row, nil
+}
+
+// reanchorLateVirtualOwnerRow upgrades a live virtual session still pinned to a
+// provider-neutral row onto the concrete ?result= owner row of its bound
+// candidate, once that row appears. It returns the row to serve (the owner row
+// when adopted, otherwise the input file) and the session as the caller should
+// re-read it.
+//
+// A first-ever auto start resolves a concrete candidate before its catalog row
+// exists, so the session keeps the release's neutral sibling; the deferred probe
+// stamps that sibling and the session carries a verified overlay anchored to it.
+// When the owner row materializes later in the same session, the serve and
+// inventory binds resolve it by exact path, but the session's effective row and
+// evidence anchor still name the neutral sibling, so the verified overlay is
+// rejected as a different candidate and the menus freeze. Moving both onto the
+// owner row keeps the overlay applying.
+//
+// The adoption is fully fenced: it only fires for an actually-neutral effective
+// row (a row that already names any concrete ?result= pick is its own owner, or
+// a different concrete release, and is never swapped), it captures the whole
+// candidate binding before the owner-row lookup, and it CASes that snapshot -
+// generation, virtual URI, owner, and effective row - in one critical section.
+// The session manager also refuses the move while the deferred-probe lifecycle
+// is pending, so a row-only move cannot strand an outstanding probe. A rejected
+// CAS returns the input file: a rejected adoption is never served as if it had
+// landed.
+func reanchorLateVirtualOwnerRow(ctx context.Context, resolver FilePathResolver, sessionMgr SessionManagerInterface, file *models.MediaFile, session *playback.Session, candidateURI string) (*models.MediaFile, *playback.Session) {
+	if file == nil || session == nil || sessionMgr == nil || !isVirtualPlaybackFile(file) {
+		return file, session
+	}
+	candidateURI = strings.TrimSpace(candidateURI)
+	if candidateURI == "" || virtualResultCandidateID(candidateURI) == "" {
+		return file, session
+	}
+	// Only a genuinely neutral effective row is upgraded. A row that already
+	// names a concrete ?result= pick is its own owner (or a different concrete
+	// release); adopting another concrete row over it would silently swap the
+	// release the viewer is bound to.
+	if virtualResultCandidateID(file.FilePath) != "" {
+		return file, session
+	}
+	bindingReader, ok := sessionMgr.(interface {
+		VirtualSourceBinding(sessionID string) (playback.VirtualSourceBindingSnapshot, error)
+	})
+	if !ok {
+		return file, session
+	}
+	// Capture the full binding before the owner-row lookup: the lookup is an
+	// arbitrary catalog round trip, and a rotation that lands during it must make
+	// the CAS reject rather than bless a stale adoption.
+	binding, err := bindingReader.VirtualSourceBinding(session.ID)
+	if err != nil {
+		return file, session
+	}
+	if binding.EffectiveMediaFileID != file.ID || strings.TrimSpace(binding.VirtualURI) != candidateURI {
+		// The row we hold is not the session's bound effective row, or the
+		// binding already moved on from the candidate the caller named.
+		return file, session
+	}
+	owner, err := virtualPathOwnerRowFor(ctx, resolver, file, candidateURI, file.VirtualOwnerInstallationID, file.MediaFolderID)
+	if err != nil || owner == nil || owner.ID <= 0 || owner.ID == file.ID {
+		return file, session
+	}
+	reanchorer, ok := sessionMgr.(interface {
+		ReanchorVirtualEffectiveRow(sessionID string, expected playback.VirtualSourceBindingSnapshot, rowID int, evidenceURI string) (bool, error)
+	})
+	if !ok {
+		return file, session
+	}
+	applied, err := reanchorer.ReanchorVirtualEffectiveRow(session.ID, binding, owner.ID, candidateURI)
+	if err != nil || !applied {
+		// A rejected CAS (a rotation, a row-only move, or a pending probe
+		// lifecycle) means the session did not move: return the input file so a
+		// rejected adoption is never served as if it had landed.
+		return file, session
+	}
+	if refreshed, err := sessionMgr.GetSession(session.ID); err == nil && refreshed != nil {
+		session = refreshed
+	}
+	return owner, session
 }
 
 // virtualPathLookupRow is the raw exact-path lookup behind virtualPathOwnerRow
@@ -5891,10 +6054,19 @@ func (h *PlaybackHandler) virtualPathOwnerRow(ctx context.Context, file *models.
 // ErrVirtualCandidateNotFound, and a bare scanner.ErrFileNotFound is equally
 // absent.
 func (h *PlaybackHandler) virtualPathLookupRow(ctx context.Context, candidateURI string) (row *models.MediaFile, capable bool, err error) {
-	if h == nil || strings.TrimSpace(candidateURI) == "" {
+	if h == nil {
 		return nil, false, nil
 	}
-	pathResolver, ok := h.fileResolver.(interface {
+	return virtualPathLookupRowFor(ctx, h.fileResolver, candidateURI)
+}
+
+// virtualPathLookupRowFor is the resolver-parameterized form of
+// virtualPathLookupRow.
+func virtualPathLookupRowFor(ctx context.Context, resolver FilePathResolver, candidateURI string) (row *models.MediaFile, capable bool, err error) {
+	if strings.TrimSpace(candidateURI) == "" {
+		return nil, false, nil
+	}
+	pathResolver, ok := resolver.(interface {
 		GetByPath(context.Context, string) (*models.MediaFile, error)
 	})
 	if !ok {
