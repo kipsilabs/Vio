@@ -242,6 +242,82 @@ func TestRefusedProbeInventoryNeverReportsVerified(t *testing.T) {
 	}
 }
 
+// TestRefusedProbeInventoryStampedBaseRowStaysDeclared covers the stamped base
+// row the earlier test missed: a refused probe replaces the base row's tracks,
+// so the row's old committed stamp no longer describes them. The override must
+// drop that stamp and report declared, not verified.
+func TestRefusedProbeInventoryStampedBaseRowStaysDeclared(t *testing.T) {
+	candidateURI := "virtual://series/tt39087958/1/1?result=stamped-base"
+	probedAt := time.Now()
+	row := &models.MediaFile{
+		ID: 5031930, ContentID: "episode-tvdb-471090-1-1", FilePath: candidateURI,
+		// The base row already carries committed probe evidence.
+		ProbeUpdatedAt: &probedAt,
+	}
+	probed := &models.MediaFile{
+		AudioTracks:    []models.AudioTrack{{Codec: "aac", Channels: 2}},
+		SubtitleTracks: []models.SubtitleTrack{{Index: 1, Codec: "subrip", Language: "ko", Forced: true}},
+	}
+	h := NewPlaybackHandler(playback.NewSessionManager(0, 0), mapPlaybackFileResolver{
+		files: map[int]*models.MediaFile{row.ID: row},
+	})
+	session := &playback.Session{ID: "s-stamped", MediaFileID: row.ID, VirtualSourceURI: candidateURI}
+
+	override := h.refusedProbeInventoryFile(context.Background(), session, row.ID, candidateURI, probed)
+	if override == nil {
+		t.Fatal("refused evidence was not served in memory at all")
+	}
+	if override.ProbeUpdatedAt != nil {
+		t.Fatalf("refused override kept the base row's probe stamp %v", override.ProbeUpdatedAt)
+	}
+	if !override.RefusedProbeEvidence {
+		t.Fatal("refused override is not marked as uncommitted evidence")
+	}
+	inventory, err := h.playbackInventoryForFileV3(context.Background(), session, nil, override, candidateURI)
+	if err != nil {
+		t.Fatalf("build inventory: %v", err)
+	}
+	if inventory.InventoryStatus != string(ProbeProvenanceDeclared) {
+		t.Fatalf("stamped base row reported refused evidence as inventory_status=%q, want declared", inventory.InventoryStatus)
+	}
+}
+
+// TestRefusedProbeInventoryVerifiedSessionStaysDeclared covers the other half:
+// a session that previously recorded a verified probe outcome must not lend that
+// verdict to refused foreign evidence for a different source. Verified means a
+// durable write adopted this identity, which the refusal did not, so the override
+// stays declared.
+func TestRefusedProbeInventoryVerifiedSessionStaysDeclared(t *testing.T) {
+	candidateURI := "virtual://series/tt39087958/1/1?result=verified-then-refused"
+	row := &models.MediaFile{
+		ID: 5031931, ContentID: "episode-tvdb-471090-1-1", FilePath: candidateURI,
+		// No ProbeUpdatedAt: the refusal is the only evidence for this candidate.
+	}
+	probed := &models.MediaFile{
+		AudioTracks:    []models.AudioTrack{{Codec: "eac3", Channels: 6}},
+		SubtitleTracks: []models.SubtitleTrack{{Index: 1, Codec: "subrip", Language: "en"}},
+	}
+	h := NewPlaybackHandler(playback.NewSessionManager(0, 0), mapPlaybackFileResolver{
+		files: map[int]*models.MediaFile{row.ID: row},
+	})
+	session := &playback.Session{
+		ID: "s-verified", MediaFileID: row.ID, VirtualSourceURI: candidateURI,
+		VirtualProbeOutcome: playback.VirtualProbeOutcomeVerified,
+	}
+
+	override := h.refusedProbeInventoryFile(context.Background(), session, row.ID, candidateURI, probed)
+	if override == nil {
+		t.Fatal("refused evidence was not served in memory at all")
+	}
+	inventory, err := h.playbackInventoryForFileV3(context.Background(), session, nil, override, candidateURI)
+	if err != nil {
+		t.Fatalf("build inventory: %v", err)
+	}
+	if inventory.InventoryStatus != string(ProbeProvenanceDeclared) {
+		t.Fatalf("previously verified session reported refused foreign evidence as inventory_status=%q, want declared", inventory.InventoryStatus)
+	}
+}
+
 // TestVirtualAdoptionRefusalBoundLeavesSameReleasePathAlone is the happy-path
 // guard: a row that already owns the candidate's exact path is never gated on an
 // adoption and never consults the refusal bound, so the ordinary same-release

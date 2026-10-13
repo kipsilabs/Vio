@@ -1037,9 +1037,15 @@ func (h *PlaybackHandler) playbackInventoryForFileV3(ctx context.Context, sessio
 	subtitleInventory := playback.ScopeSubtitleInventoryV3(session.ID, file, playback.BuildSubtitleInventoryV3(file, additional), clientFeatures)
 
 	status := string(ProbeProvenanceDeclared)
-	if file != nil && file.ProbeUpdatedAt != nil {
+	switch {
+	case file != nil && file.RefusedProbeEvidence:
+		// Refused, unpersisted evidence: measured tracks that no durable write
+		// committed. The override is reported declared no matter what stamp the
+		// base row carried or what outcome a previous probe left on the session,
+		// so a refused override can never be read as verified.
+	case file != nil && file.ProbeUpdatedAt != nil:
 		status = string(ProbeProvenanceVerified)
-	} else {
+	default:
 		// No probe stamp on the effective row. A deferred full-track
 		// enumeration may be outstanding, may have committed its evidence
 		// without a stamp, or may have terminally failed; the session carries
@@ -1559,9 +1565,10 @@ func (h *PlaybackHandler) publishRefusedProbeInventory(ctx context.Context, file
 // effective catalog row when the session is bound to the exact candidate the
 // probe ran against. It returns nil when there is no override to apply, so the
 // caller keeps the committed catalog inventory. The returned file keeps the
-// row's id and the row's own probe stamp (the catalog is not written), so the
-// built inventory reports the row's real status: a refused, unpersisted probe
-// must not be labeled verified.
+// row's id but drops its probe stamp and carries an explicit
+// RefusedProbeEvidence marker, so the built inventory reports a refused,
+// unpersisted probe as declared and never as verified, regardless of the base
+// row's stamp or a previous session probe outcome.
 //
 // probedFileID is the catalog row the probe was captured for. Duplicate rows for
 // one release share candidate URIs, so the URI match alone would paint the
@@ -1600,8 +1607,13 @@ func (h *PlaybackHandler) refusedProbeInventoryFile(ctx context.Context, session
 	// was refused, so the session must not report them as verified. Verified
 	// means the row carries committed evidence (a probe stamp) or a durable write
 	// adopted the identity; fabricating a stamp here would label unpersisted
-	// evidence verified. The base row's own stamp is preserved, and the session's
-	// deferred-probe outcome continues to govern the loading state.
+	// evidence verified. The base row's own stamp described the base row's
+	// tracks, which these replace, so it is dropped rather than carried. The
+	// explicit RefusedProbeEvidence marker is what keeps the status nonverified
+	// even when the base row was already stamped or the session previously
+	// recorded a verified probe outcome.
+	override.ProbeUpdatedAt = nil
+	override.RefusedProbeEvidence = true
 	return &override
 }
 
@@ -1713,10 +1725,10 @@ func (h *PlaybackHandler) publishInventoryUpdatedToSession(ctx context.Context, 
 		// Refused (unwritten) evidence for the exact release this session is
 		// bound to: serve the probed tracks in memory. The catalog row is
 		// untouched, so the effective identity stays the row's own id and the
-		// client's revision gate still sees a new revision. The status stays the
-		// row's real one (usually declared or the session's pending outcome); the
-		// override is delivered anyway so a live menu receives the measured
-		// tracks without claiming they were persisted as verified.
+		// client's revision gate still sees a new revision. The status is
+		// declared: the override carries an explicit uncommitted marker, so the
+		// live menu receives the measured tracks without claiming they were
+		// persisted as verified.
 		inventory, err = h.playbackInventoryForFileV3(ctx, live, record, override, candidateURI)
 	} else {
 		inventory, err = h.playbackInventoryForSession(ctx, live, record)
