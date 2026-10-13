@@ -25,6 +25,26 @@ func TestRemapAudioSelectionIndexReidentifiesCommittedTrack(t *testing.T) {
 	}
 }
 
+// TestRemapAudioSelectionIndexMissingProbedIndexFailsClosed pins that a
+// previously-trustworthy absolute index is the strongest identity: when the
+// selected stream's probed index is absent, the remap fails closed even if a
+// different-index candidate carries identical transport facts. A renumbered
+// stream is a different stream, and no weaker match may stand in.
+func TestRemapAudioSelectionIndexMissingProbedIndexFailsClosed(t *testing.T) {
+	plan := []models.AudioTrack{
+		{Index: 1, Language: "en", Codec: "aac", Channels: 2, Layout: "stereo"},
+		{Index: 3, Language: "pt", Codec: "eac3", Channels: 6, Layout: "5.1"},
+	}
+	// The pt stream is present by facts but its container index moved 3 -> 4.
+	verified := []models.AudioTrack{
+		{Index: 1, Language: "en", Codec: "aac", Channels: 2, Layout: "stereo"},
+		{Index: 4, Language: "pt", Codec: "eac3", Channels: 6, Layout: "5.1"},
+	}
+	if got := remapAudioSelectionIndex(plan, 1, verified); got != -1 {
+		t.Fatalf("remapped position = %d, want -1; a missing probed index must not fall through to another index", got)
+	}
+}
+
 // TestRemapAudioSelectionIndexRemovalReturnsInvalid pins the removed case: a
 // committed stream that is absent from the verified inventory has no position to
 // return, and the caller must see -1 rather than the old position naming another
@@ -42,47 +62,112 @@ func TestRemapAudioSelectionIndexRemovalReturnsInvalid(t *testing.T) {
 	}
 }
 
-// TestRemapAudioSelectionIndexWeakFallbackIsUniqueAndTransportMatched pins the
-// language/codec fallback: it must not substitute a distinct track of the same
-// language. A unique transport-fact match is accepted; an ambiguous set (two
-// tracks sharing language, codec, channels, and layout) is invalid, and a track
-// whose layout differs is never a substitute.
-func TestRemapAudioSelectionIndexWeakFallbackIsUniqueAndTransportMatched(t *testing.T) {
-	// The committed track's title differs from every verified track, so the
-	// exact-signature match misses and the weak fallback decides.
-	committed := models.AudioTrack{Index: 0, Language: "en", Codec: "aac", Channels: 2, Layout: "stereo", Title: "Director"}
+// TestRemapAudioSelectionIndexDuplicateSignatureFailsClosed pins the
+// exact-signature ambiguity guard: two verified tracks that match the selected
+// signature equally well make the identity ambiguous, and the remap must fail
+// closed instead of picking one arbitrarily. This is the path that bypassed the
+// unique-only fallback.
+func TestRemapAudioSelectionIndexDuplicateSignatureFailsClosed(t *testing.T) {
+	// A synthesized plan-time list: every Index is 0, so only the signature can
+	// identify the stream.
+	plan := []models.AudioTrack{{Index: 0, Language: "en", Codec: "aac", Channels: 2, Layout: "stereo"}}
+	verified := []models.AudioTrack{
+		{Index: 0, Language: "en", Codec: "aac", Channels: 2, Layout: "stereo"},
+		{Index: 1, Language: "en", Codec: "aac", Channels: 2, Layout: "stereo"},
+	}
+	if got := remapAudioSelectionIndex(plan, 0, verified); got != -1 {
+		t.Fatalf("remapped position = %d, want -1 for a duplicate signature", got)
+	}
+}
 
-	t.Run("unique transport match", func(t *testing.T) {
-		verified := []models.AudioTrack{
-			{Index: 0, Language: "en", Codec: "aac", Channels: 2, Layout: "stereo", Title: "Main"},
-		}
-		if got := remapAudioSelectionIndex([]models.AudioTrack{committed}, 0, verified); got != 0 {
-			t.Fatalf("remapped position = %d, want the unique transport-matched track 0", got)
-		}
-	})
+// TestRemapAudioSelectionIndexUniqueSignatureMatches pins the positive
+// exact-signature path: one verified track carries the selected track's full
+// signature (including its known title), so it is re-identified.
+func TestRemapAudioSelectionIndexUniqueSignatureMatches(t *testing.T) {
+	plan := []models.AudioTrack{
+		{Index: 0, Language: "en", Codec: "eac3", Channels: 6, Layout: "5.1", Title: "Director"},
+		{Index: 0, Language: "en", Codec: "aac", Channels: 2, Layout: "stereo", Title: "Commentary"},
+	}
+	verified := []models.AudioTrack{
+		{Index: 2, Language: "en", Codec: "aac", Channels: 2, Layout: "stereo", Title: "Commentary"},
+		{Index: 4, Language: "en", Codec: "eac3", Channels: 6, Layout: "5.1", Title: "Director"},
+	}
+	if got := remapAudioSelectionIndex(plan, 0, verified); got != 1 {
+		t.Fatalf("remapped position = %d, want 1 (the Director track)", got)
+	}
+}
 
-	t.Run("ambiguous same-language tracks are invalid", func(t *testing.T) {
-		// Two tracks indistinguishable by language, codec, channels, and
-		// layout: picking either could mux the wrong stream, so the identity is
-		// invalid rather than a positional guess.
-		verified := []models.AudioTrack{
-			{Index: 0, Language: "en", Codec: "aac", Channels: 2, Layout: "stereo", Title: "Commentary"},
-			{Index: 0, Language: "en", Codec: "aac", Channels: 2, Layout: "stereo", Title: "Descriptive"},
-		}
-		if got := remapAudioSelectionIndex([]models.AudioTrack{committed}, 0, verified); got != -1 {
-			t.Fatalf("remapped position = %d, want -1 for an ambiguous same-language set", got)
-		}
-	})
+// TestRemapAudioSelectionIndexFallbackRejectsConflictingIdentity pins the
+// conservative fallback: when the exact signature misses, a candidate may only
+// stand in if it agrees with every known identity fact. A conflicting title,
+// embedded title, or MULTi language set is a different stream and is rejected,
+// even when it is the only transport-fact match.
+func TestRemapAudioSelectionIndexFallbackRejectsConflictingIdentity(t *testing.T) {
+	base := models.AudioTrack{Index: 0, Language: "en", Codec: "aac", Channels: 2, Layout: "stereo"}
 
-	t.Run("different layout is not a substitute", func(t *testing.T) {
-		verified := []models.AudioTrack{
-			{Index: 0, Language: "en", Codec: "aac", Channels: 2, Layout: "stereo", Title: "Main"},
-		}
-		committed51 := committed
-		committed51.Layout = "5.1"
-		committed51.Channels = 6
-		if got := remapAudioSelectionIndex([]models.AudioTrack{committed51}, 0, verified); got != -1 {
-			t.Fatalf("remapped position = %d, want -1; a different layout is a different stream", got)
-		}
-	})
+	cases := []struct {
+		name      string
+		selected  models.AudioTrack
+		verified  []models.AudioTrack
+		wantIndex int
+	}{
+		{
+			name:      "conflicting known title is rejected",
+			selected:  withTitle(base, "Director"),
+			verified:  []models.AudioTrack{withTitle(base, "Main")},
+			wantIndex: -1,
+		},
+		{
+			name:      "conflicting embedded title is rejected",
+			selected:  withEmbeddedTitle(base, "Director"),
+			verified:  []models.AudioTrack{withEmbeddedTitle(base, "Main")},
+			wantIndex: -1,
+		},
+		{
+			name:      "conflicting language set is rejected",
+			selected:  withLanguages(base, "en", "fr"),
+			verified:  []models.AudioTrack{withLanguages(base, "en", "de")},
+			wantIndex: -1,
+		},
+		{
+			name:      "unknown selected title is not a conflict",
+			selected:  base,
+			verified:  []models.AudioTrack{withTitle(base, "Main")},
+			wantIndex: 0,
+		},
+		{
+			name:      "ambiguous non-conflicting set is invalid",
+			selected:  base,
+			verified:  []models.AudioTrack{withTitle(base, "Main"), withTitle(base, "Descriptive")},
+			wantIndex: -1,
+		},
+		{
+			name:      "different layout is not a substitute",
+			selected:  models.AudioTrack{Index: 0, Language: "en", Codec: "aac", Channels: 6, Layout: "5.1", Title: "Director"},
+			verified:  []models.AudioTrack{base},
+			wantIndex: -1,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := remapAudioSelectionIndex([]models.AudioTrack{tc.selected}, 0, tc.verified); got != tc.wantIndex {
+				t.Fatalf("remapped position = %d, want %d (selected %+v, verified %+v)", got, tc.wantIndex, tc.selected, tc.verified)
+			}
+		})
+	}
+}
+
+func withTitle(track models.AudioTrack, title string) models.AudioTrack {
+	track.Title = title
+	return track
+}
+
+func withEmbeddedTitle(track models.AudioTrack, title string) models.AudioTrack {
+	track.EmbeddedTitle = title
+	return track
+}
+
+func withLanguages(track models.AudioTrack, languages ...string) models.AudioTrack {
+	track.Languages = languages
+	return track
 }
