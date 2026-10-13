@@ -257,21 +257,31 @@ func TestRehydratedIdentityLegacyRowServesStoredURL(t *testing.T) {
 }
 
 // TestVirtualResolveContextPersistedTrustIdentitylessEvidence pins the handler
-// trust predicate: an identity-less row with transport evidence (a recorded
-// delivery) inside the window is trusted so a delisted pin is refused with the
-// trust sentinel and re-served from its stored evidence rather than rotated; a
-// row with no evidence, or outside the window, is not trusted.
+// trust predicate: an identity-less row is trusted only when it carries a
+// stored URL that can actually be served (non-empty and unexpired) inside the
+// window. A delivery stamp alone proves bytes flowed once, not that a URL can
+// be served now, so it must not claim resumability; a row with no servable
+// evidence, or outside the window, is not trusted.
 func TestVirtualResolveContextPersistedTrustIdentitylessEvidence(t *testing.T) {
 	now := time.Now()
 	window := 720 * time.Hour
 	delivered := now.Add(-time.Minute)
+	future := now.Add(time.Hour)
 	identityless := &models.MediaFile{ID: 701, UpdatedAt: delivered, LastDeliveredAt: &delivered}
 	ctx := virtualResolveContextWithPersistedTrust(context.Background(), identityless, now, window)
-	if !virtuallibrary.PersistedCandidateTrusted(ctx) {
-		t.Fatal("an identity-less row with a recorded delivery inside the window must be trusted")
+	if virtuallibrary.PersistedCandidateTrusted(ctx) {
+		t.Fatal("a delivery stamp alone must not claim resumability")
 	}
 	if _, ok := virtuallibrary.PersistedCandidateIdentityFromContext(ctx); ok {
 		t.Fatal("an identity-less row must not thread a durable identity")
+	}
+
+	usable := &models.MediaFile{
+		ID: 704, UpdatedAt: delivered,
+		ResolvedURL: "https://93.184.216.34/stream/x", ResolvedURLExpiresAt: &future,
+	}
+	if !virtuallibrary.PersistedCandidateTrusted(virtualResolveContextWithPersistedTrust(context.Background(), usable, now, window)) {
+		t.Fatal("an identity-less row with a usable stored URL inside the window must be trusted")
 	}
 
 	bare := &models.MediaFile{ID: 702, UpdatedAt: now}
