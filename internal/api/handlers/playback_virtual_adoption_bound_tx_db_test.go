@@ -560,14 +560,17 @@ func TestVirtualAdoptionRefusalLockedRecorderCancelsUnderContentionDB(t *testing
 		t.Fatalf("blocker lock: %v", err)
 	}
 
-	waitCtx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+	waitCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
 		_, err := repo.RecordVirtualAdoptionRefusalLocked(waitCtx, id, path, virtualAdoptionRefusalTTL)
 		done <- err
 	}()
+	// Wait until the recorder is provably queued behind the held lock, then
+	// cancel: the abort is deterministic, not a race with a timer.
 	waitForAdoptionLockWaiter(t, pool, blockerPID)
+	cancel()
 	if err := <-done; err == nil {
 		t.Fatal("a cancelled row-lock wait reported success")
 	} else if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
