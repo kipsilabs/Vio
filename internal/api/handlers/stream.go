@@ -889,8 +889,17 @@ func bindSessionVirtualSourceWithTracks(ctx context.Context, file *models.MediaF
 	// row's later-populated inventory would serve a track the client never
 	// selected. Absent evidence (the flag unset) is the only case with nothing
 	// to apply, and the only case the live row may speak for.
-	hasEvidence := session.VirtualSubtitleEvidenceSet
-	evidenceRejected := hasEvidence && !virtualEvidenceMatchesBoundFile(bound, session)
+	//
+	// Carried evidence is only authoritative while the bound row is unverified.
+	// A deferred probe can commit the release's real tracks to the row after the
+	// plan captured its provisional inventory; once the row is stamped, its
+	// committed tracks are the truth the menus must follow. Applying the stale
+	// overlay over a probed row would mask the verified inventory for the rest of
+	// the session and leave the inventory revision unchanged, so the client's
+	// conditional poll would keep returning 304. This mirrors the audio-only
+	// branch below, which already refuses to downgrade a probed row to declared.
+	evidenceSet := session.VirtualSubtitleEvidenceSet
+	evidenceRejected := evidenceSet && !virtualEvidenceMatchesBoundFile(bound, session)
 	if evidenceRejected {
 		slog.WarnContext(ctx, "virtual session track evidence belongs to a different candidate; using the bound file's tracks",
 			"component", "api",
@@ -898,9 +907,8 @@ func bindSessionVirtualSourceWithTracks(ctx context.Context, file *models.MediaF
 			"file_id", file.ID,
 			"evidence_uri", session.VirtualSubtitleEvidenceURI,
 			"file_path", bound.FilePath)
-		hasEvidence = false
 	}
-	if hasEvidence {
+	if evidenceSet && !evidenceRejected && bound.ProbeUpdatedAt == nil {
 		boundCopy := *bound
 		boundCopy.SubtitleTracks = session.VirtualSubtitleTracks
 		boundCopy.ExternalSubtitles = session.VirtualExternalSubtitles
