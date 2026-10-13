@@ -219,10 +219,11 @@ func virtualResolveContextWithPersistedIdentity(ctx context.Context, row *models
 // candidate's own row does. This is the lookup that recovers that evidence from
 // the row that actually owned it at ingest time.
 //
-// Ownership is asserted on the exact path plus this content and episode, never
-// on a path collision alone: a provider renumbers result ids per listing, so
-// binding to another episode's or another content's row would anchor the session
-// on bytes the viewer never selected. A lookup that cannot run, a not-found, or
+// Ownership is asserted on the exact path plus a non-empty matching content id
+// and episode, never on a path collision alone: a provider renumbers result ids
+// per listing, so binding to another episode's or another content's row would
+// anchor the session on bytes the viewer never selected. A missing content id
+// proves nothing and is not a match. A lookup that cannot run, a not-found, or
 // an incomplete row yields nil, so the caller keeps the row in hand unchanged.
 func (h *PlaybackHandler) owningSessionBoundCandidateRow(ctx context.Context, file *models.MediaFile) *models.MediaFile {
 	if h == nil || file == nil {
