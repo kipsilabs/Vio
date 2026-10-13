@@ -2372,12 +2372,17 @@ describe("VideoPlayer plan failure recovery", () => {
   });
 
   it("recovers a virtual remux whose transport answers 409 audio_selection_invalid", async () => {
-    // The audio-selection 409 is a transport response the media element cannot
-    // surface as a body: a progressive remux is loaded through `src`, so the
-    // element reports a source-not-supported load failure. The player must route
-    // it into plan recovery (a fresh failure_recovery replan) instead of a
-    // dead-end error, so the client re-selects on the re-probed inventory.
+    // The transport answers the progressive remux request with 409
+    // audio_selection_invalid, which a media element cannot surface as a body:
+    // the load fails with a source-not-supported MediaError. The server-side
+    // code and body assertion lives in the Go handler test
+    // (TestDeferredProbeOverlayRemovedOrAmbiguousCommittedAudioFailsClosed →
+    // assertStreamAudioSelectionRejected); the client contract exercised here is
+    // that the load failure routes into plan recovery (a fresh failure_recovery
+    // replan), not a dead-end error or a reconnect, so the client re-selects on
+    // the re-probed inventory.
     const onPlanFailure = vi.fn();
+    const onConnectionLost = vi.fn();
     const virtualRemuxPlan = fixturePlanV3({
       delivery: "server_remux_progressive",
       stream: {
@@ -2387,7 +2392,7 @@ describe("VideoPlayer plan failure recovery", () => {
         header_refresh: "none",
       },
     });
-    const { container } = renderPlayer({ plan: virtualRemuxPlan, onPlanFailure });
+    const { container } = renderPlayer({ plan: virtualRemuxPlan, onPlanFailure, onConnectionLost });
     const video = container.querySelector("video");
     if (!video) throw new Error("expected video element");
 
@@ -2398,7 +2403,16 @@ describe("VideoPlayer plan failure recovery", () => {
     fireEvent.error(video);
 
     expect(onPlanFailure).toHaveBeenCalledOnce();
-    expect(onPlanFailure.mock.calls[0]?.[0]).toMatchObject({ classification: "decoder_error" });
+    expect(onPlanFailure.mock.calls[0]?.[0]).toMatchObject({
+      classification: "decoder_error",
+      message: "The selected audio track is no longer available",
+    });
+    // A rejected audio selection is a route failure, not a dropped connection:
+    // the reconnect path must not swallow it.
+    expect(onConnectionLost).not.toHaveBeenCalled();
+    // Recovery is taken instead of a dead-end error surface.
+    await act(async () => Promise.resolve());
+    expect(screen.queryByText(/Playback error:/)).not.toBeInTheDocument();
   });
 
   it("re-arms the plan failure guard after a transient recovery request failure", async () => {
