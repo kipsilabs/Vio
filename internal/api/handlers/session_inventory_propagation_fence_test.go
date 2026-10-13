@@ -269,6 +269,83 @@ func TestDeferredProbePropagationRotationBetweenFenceAndCommitFenced(t *testing.
 	}
 }
 
+// rowIDMutatingResolver mutates the session's effective row id the first time
+// the bound row is read — the last validation step before the fenced session
+// write — without moving the binding generation. It models a
+// SetEffectiveMediaFileID row-id-only rotation landing between validate and
+// commit, which a generation-only fence cannot see.
+type rowIDMutatingResolver struct {
+	inner   FilePathResolver
+	readID  int
+	mutate  func()
+	mutated bool
+}
+
+func (r *rowIDMutatingResolver) GetByID(ctx context.Context, id int) (*models.MediaFile, error) {
+	if id == r.readID && !r.mutated {
+		r.mutated = true
+		r.mutate()
+	}
+	return r.inner.GetByID(ctx, id)
+}
+
+func (r *rowIDMutatingResolver) GetByPath(ctx context.Context, path string) (*models.MediaFile, error) {
+	if pr, ok := r.inner.(interface {
+		GetByPath(context.Context, string) (*models.MediaFile, error)
+	}); ok {
+		return pr.GetByPath(ctx, path)
+	}
+	return nil, errors.New("no path resolver")
+}
+
+// TestDeferredProbePropagationRowIDMutationBetweenFenceAndCommitFenced is the
+// row-id-only mutation regression: the fence validates the session's bound row,
+// then SetEffectiveMediaFileID moves the effective row without advancing the
+// binding generation, and only then does the propagation commit. The commit must
+// reject the validated inventory rather than mark it verified onto the changed
+// binding, so the full-binding CAS compares the effective row id and not just
+// the generation.
+func TestDeferredProbePropagationRowIDMutationBetweenFenceAndCommitFenced(t *testing.T) {
+	identity := canonicalCollectionIdentity()
+	fx := setupCanonicalCollectionFixture(t, identity, identity)
+
+	committed := virtualCommittedProbeInventory{
+		fileID:       canonicalCollectionRowID,
+		candidateURI: canonicalPinnedURI,
+		identity:     identity.tiers(),
+		audio:        verifiedCanonicalAudio(),
+		subtitles:    verifiedCanonicalSubtitles(),
+	}
+	deferred := readmitDeferredProbe(t, fx.handler, canonicalCollectionProbe(fx.session, *fx.canonicalRow, identity))
+
+	fx.handler.fileResolver = &rowIDMutatingResolver{
+		inner:  fx.resolver,
+		readID: canonicalPinnedRowID,
+		mutate: func() {
+			if err := fx.manager.SetEffectiveMediaFileID(fx.session.ID, canonicalCollectionRowID); err != nil {
+				t.Errorf("SetEffectiveMediaFileID: %v", err)
+			}
+		},
+	}
+
+	if disp := fx.handler.propagateVerifiedProbeInventory(deferred, committed); disp != probeInventorySuperseded {
+		t.Fatalf("propagation disposition = %d, want superseded after a row-id-only mutation before commit", disp)
+	}
+	live, err := fx.manager.GetSession(fx.session.ID)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if live.MediaFileID != canonicalCollectionRowID {
+		t.Fatalf("effective row = %d, want the mutated row %d", live.MediaFileID, canonicalCollectionRowID)
+	}
+	if live.VirtualProbeOutcome == probeOutcomeVerified {
+		t.Fatalf("row-id mutation let the probe commit a verified outcome onto the changed binding")
+	}
+	if len(live.VirtualAudioTracks) != 1 || live.VirtualAudioTracks[0].Language != "jpn" {
+		t.Fatalf("carried audio = %+v, want the untouched plan-time overlay", live.VirtualAudioTracks)
+	}
+}
+
 // transportOrdinalForTrack is the audio-only stream ordinal a bound list assigns
 // to a chosen language's first track, mirroring what the transport hands ffmpeg
 // as 0:a:N.

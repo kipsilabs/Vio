@@ -1823,6 +1823,31 @@ func (m *SessionManager) SetVirtualProbeOutcomeIfGeneration(sessionID string, ge
 // verified commit and the client's conditional poll stops returning 304;
 // streamRevision advances so in-memory snapshot readers observe the change too.
 func (m *SessionManager) SetVirtualProbeVerifiedInventoryIfGeneration(sessionID string, generation uint64, revision string, audio []models.AudioTrack, subtitles []models.SubtitleTrack, external []models.ExternalSubtitle) (bool, error) {
+	// Generation-only is the binding CAS with an empty expectation: the zero
+	// snapshot fences on the generation and nothing else, preserving this
+	// method's historical contract for callers that hold no binding snapshot.
+	return m.SetVirtualProbeVerifiedInventoryIfBinding(sessionID, VirtualSourceBindingSnapshot{Generation: generation}, revision, audio, subtitles, external)
+}
+
+// SetVirtualProbeVerifiedInventoryIfBinding is the full-binding form of
+// SetVirtualProbeVerifiedInventoryIfGeneration. It records a deferred probe's
+// verified outcome AND replaces the live session's carried virtual inventory
+// under one critical section, but only while the session's candidate binding
+// still matches the expectation in every dimension the snapshot captured —
+// generation, virtual URI, owner installation, and effective media file row.
+//
+// The effective-row dimension is the reason this form exists. A binding move
+// bumps virtualSourceGeneration, but SetEffectiveMediaFileID can point a session
+// at a rotated release row without touching the generation; a generation-only
+// fence would then let a probe that validated the old row commit the old row's
+// inventory onto the changed binding. Comparing the captured row id atomically
+// closes that window: a row-id-only mutation between the validate and the commit
+// makes the CAS reject rather than mislabel the new binding's inventory.
+//
+// A zero field in expected is not asserted: EffectiveMediaFileID <= 0, an empty
+// VirtualURI and a zero OwnerInstallationID each leave that dimension unfenced,
+// so a caller that captured only the generation keeps the prior behavior.
+func (m *SessionManager) SetVirtualProbeVerifiedInventoryIfBinding(sessionID string, expected VirtualSourceBindingSnapshot, revision string, audio []models.AudioTrack, subtitles []models.SubtitleTrack, external []models.ExternalSubtitle) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -1830,7 +1855,7 @@ func (m *SessionManager) SetVirtualProbeVerifiedInventoryIfGeneration(sessionID 
 	if !ok {
 		return false, ErrSessionNotFound
 	}
-	if s.virtualSourceGeneration != generation {
+	if !s.matchesVirtualBindingLocked(expected) {
 		return false, nil
 	}
 	s.VirtualAudioTracks = audio
@@ -1842,6 +1867,35 @@ func (m *SessionManager) SetVirtualProbeVerifiedInventoryIfGeneration(sessionID 
 	s.streamRevision++
 	m.touchSessionLocked(s)
 	return true, nil
+}
+
+// matchesVirtualBindingLocked reports whether the session still carries the
+// exact binding an expectation snapshot captured. Zero-valued expectation fields
+// are not asserted, so the empty snapshot is a generation-only fence. Caller
+// holds m.mu.
+func (s *Session) matchesVirtualBindingLocked(expected VirtualSourceBindingSnapshot) bool {
+	if s == nil {
+		return false
+	}
+	if s.virtualSourceGeneration != expected.Generation {
+		return false
+	}
+	if expected.VirtualURI != "" && !sameVirtualSourceURI(s.VirtualSourceURI, expected.VirtualURI) {
+		return false
+	}
+	if expected.OwnerInstallationID != 0 && s.VirtualSourceOwnerInstallationID != expected.OwnerInstallationID {
+		return false
+	}
+	if expected.EffectiveMediaFileID > 0 && s.MediaFileID != expected.EffectiveMediaFileID {
+		return false
+	}
+	return true
+}
+
+// sameVirtualSourceURI compares two candidate binding URIs modulo surrounding
+// whitespace, the same equality every binding snapshot assertion uses.
+func sameVirtualSourceURI(a, b string) bool {
+	return strings.TrimSpace(a) == strings.TrimSpace(b)
 }
 
 // ArmVirtualProbePendingIfGeneration transitions a binding generation's probe

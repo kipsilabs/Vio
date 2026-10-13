@@ -42,6 +42,14 @@ type virtualDeferredProbeV3 struct {
 	// double) leaves it zero; the conditional write is still the only outcome
 	// path, so such a job simply never passes a fence against a real manager.
 	bindingGeneration uint64
+	// binding is the full candidate-binding snapshot captured at admission
+	// alongside bindingGeneration. The verified-inventory propagation CASes on
+	// it, so a row-id-only mutation (SetEffectiveMediaFileID moves the effective
+	// row without bumping the generation) between the release-continuity check
+	// and the commit cannot land the probe's inventory on a changed binding. A
+	// manager that cannot supply a snapshot leaves it zero; the CAS then falls
+	// back to the generation-only fence.
+	binding playback.VirtualSourceBindingSnapshot
 }
 
 const (
@@ -113,6 +121,17 @@ type virtualProbeOutcomeWriter interface {
 // close.
 type virtualProbeInventoryWriter interface {
 	SetVirtualProbeVerifiedInventoryIfGeneration(sessionID string, generation uint64, revision string, audio []models.AudioTrack, subtitles []models.SubtitleTrack, external []models.ExternalSubtitle) (bool, error)
+}
+
+// virtualProbeInventoryBindingWriter is the stronger inventory-writer capability
+// that fences the verified-inventory commit on the whole candidate binding, not
+// just its generation. It exists because SetEffectiveMediaFileID can move the
+// session's effective row without advancing virtualSourceGeneration, so a
+// generation-only commit could mark the old row's inventory verified onto a
+// changed binding. The propagation prefers this form when the manager supplies
+// it and falls back to the generation form for a manager that cannot.
+type virtualProbeInventoryBindingWriter interface {
+	SetVirtualProbeVerifiedInventoryIfBinding(sessionID string, expected playback.VirtualSourceBindingSnapshot, revision string, audio []models.AudioTrack, subtitles []models.SubtitleTrack, external []models.ExternalSubtitle) (bool, error)
 }
 
 // virtualCommittedProbeInventory is the exact inventory a deferred probe's
@@ -373,6 +392,7 @@ func (h *PlaybackHandler) armDeferredProbePending(ctx context.Context, deferred 
 		return false
 	}
 	deferred.bindingGeneration = binding.Generation
+	deferred.binding = binding
 	if armer, ok := h.sessionMgr.(virtualProbePendingArmer); ok {
 		// Exclusive ownership: arm only from empty, so a duplicate start cannot
 		// restart a lifecycle the winner already armed or completed. A manager
@@ -692,10 +712,25 @@ func (h *PlaybackHandler) propagateVerifiedProbeInventory(deferred *virtualDefer
 			}
 			return probeInventoryRefused
 		}
-		applied, err := writer.SetVirtualProbeVerifiedInventoryIfGeneration(
-			deferred.sessionID, deferred.bindingGeneration, revision,
-			committed.audio, committed.subtitles, committed.external,
-		)
+		// Prefer the full-binding CAS when the manager supplies one: it fences
+		// the effective row id too, so a row-id-only mutation between the
+		// release-continuity check and this write is rejected rather than
+		// committing the validated row's inventory onto the changed binding.
+		// The generation-only writer remains the fallback for managers that
+		// carry no binding snapshot.
+		var applied bool
+		var err error
+		if bw, ok := h.sessionMgr.(virtualProbeInventoryBindingWriter); ok {
+			applied, err = bw.SetVirtualProbeVerifiedInventoryIfBinding(
+				deferred.sessionID, deferred.binding, revision,
+				committed.audio, committed.subtitles, committed.external,
+			)
+		} else {
+			applied, err = writer.SetVirtualProbeVerifiedInventoryIfGeneration(
+				deferred.sessionID, deferred.bindingGeneration, revision,
+				committed.audio, committed.subtitles, committed.external,
+			)
+		}
 		if err != nil {
 			if errors.Is(err, playback.ErrSessionNotFound) {
 				return probeInventorySuperseded
