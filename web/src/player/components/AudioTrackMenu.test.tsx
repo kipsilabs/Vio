@@ -306,6 +306,71 @@ describe("AudioTrackMenu", () => {
     expect(screen.getByText("English")).toBeTruthy();
   });
 
+  it("does not claim discovery failed above a verified, populated list", () => {
+    // Regression: a timed-out poll sets `failed` while a plan/catalog refresh
+    // has already supplied the confident, correct list. The failure notice must
+    // not qualify a verified list.
+    render(
+      createElement(AudioTrackMenu, {
+        tracks: [{ title: "English", codec: "eac3", channels: 2 }],
+        activeIndex: 0,
+        onSelect: () => {},
+        currentPosition: 0,
+        open: true,
+        onOpenChange: () => {},
+        hideTrigger: false,
+        provisional: false,
+        failed: true,
+      }),
+    );
+
+    expect(screen.queryByText("Showing available tracks — discovery did not complete")).toBeNull();
+    expect(screen.queryByText("Track discovery failed")).toBeNull();
+    expect(screen.queryByText("Discovering audio tracks…")).toBeNull();
+    expect(screen.getByText("English")).toBeTruthy();
+  });
+
+  it("shows the empty state, not a failure, for a verified empty list with a stale failed flag", () => {
+    render(
+      createElement(AudioTrackMenu, {
+        tracks: [],
+        activeIndex: 0,
+        onSelect: () => {},
+        currentPosition: 0,
+        open: true,
+        onOpenChange: () => {},
+        hideTrigger: false,
+        provisional: false,
+        failed: true,
+      }),
+    );
+
+    expect(screen.getByText("No audio tracks available")).toBeTruthy();
+    expect(screen.queryByText("Track discovery failed")).toBeNull();
+  });
+
+  it("does not show the discovery spinner over a verified list while the poll is still owed", () => {
+    // A refreshed plan can supply the confident list while the deferred poll
+    // is still pending; `pending` alone must not claim discovery in that state.
+    render(
+      createElement(AudioTrackMenu, {
+        tracks: [{ title: "English", codec: "eac3", channels: 2 }],
+        activeIndex: 0,
+        onSelect: () => {},
+        currentPosition: 0,
+        open: true,
+        onOpenChange: () => {},
+        hideTrigger: false,
+        provisional: false,
+        pending: true,
+      }),
+    );
+
+    expect(screen.queryByText("Discovering audio tracks…")).toBeNull();
+    expect(screen.queryByText("Unverified")).toBeNull();
+    expect(screen.getByText("English")).toBeTruthy();
+  });
+
   it("renders explicit empty state when tracks are empty and open while verified", () => {
     render(
       createElement(AudioTrackMenu, {

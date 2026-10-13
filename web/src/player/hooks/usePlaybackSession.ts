@@ -2924,6 +2924,9 @@ export function usePlaybackSession(
             // the menu stays marked rather than claiming a verified empty
             // inventory.
             audioInventoryProvisional: tracks.length === 0,
+            // Positive probe evidence for the new source supersedes a failure
+            // marker the previous source's timed-out discovery left behind.
+            inventoryFailed: tracks.length === 0 ? current.inventoryFailed : false,
           };
         }
         // Same identity: only a strictly richer list (or the first probe
@@ -2937,8 +2940,11 @@ export function usePlaybackSession(
           ...current,
           planAudioTracks: tracks.map((track) => ({ ...track })),
           // Catalog tracks are probe-persisted, so a non-empty fold is the
-          // probed evidence the provisional marker was waiting for.
+          // probed evidence the provisional marker was waiting for. It also
+          // ends a discovery-failure marker from an earlier timed-out poll:
+          // the list is no longer missing tracks to discover.
           audioInventoryProvisional: false,
+          inventoryFailed: false,
         };
       });
     },
@@ -3736,11 +3742,21 @@ export function usePlaybackSession(
 
   const markInventoryExhausted = useCallback(() => {
     inventoryPendingRef.current = false;
-    setState((current) =>
-      current.inventoryPending
-        ? { ...current, inventoryPending: false, inventoryFailed: true }
-        : current,
-    );
+    setState((current) => {
+      if (!current.inventoryPending) {
+        // Nothing was pending; a later call must not resurrect a failure over
+        // menus that already render confident probe evidence.
+        return current;
+      }
+      // The attempt budget is spent. That is only a *failure* while a menu is
+      // still showing declared/loading tracks; once positive probe evidence
+      // (a verified push, a refreshed plan, or a catalog list) has resolved the
+      // inventory, a timed-out poll is moot and must not re-arm the
+      // "discovery did not complete" notice above a correct list.
+      const discoveryStillMissing =
+        current.audioInventoryProvisional || current.subtitleInventoryProvisional;
+      return { ...current, inventoryPending: false, inventoryFailed: discoveryStillMissing };
+    });
   }, []);
 
   return {
