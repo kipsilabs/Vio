@@ -364,20 +364,20 @@ func TestVirtualCandidateRotationRecordedDetectsRecordedMove(t *testing.T) {
 		VirtualSubtitleEvidenceURI: "virtual://movie/tt-row?result=candidate-a",
 		VirtualAudioTracks:         append([]models.AudioTrack(nil), tracks...),
 	}
-	if !virtualCandidateRotationRecordedV3(session, row) {
+	if !virtualCandidateRotationRecordedV3(context.Background(), session, row, nil) {
 		t.Fatal("a recorded candidate move was not detected")
 	}
 
 	// Once the planner re-probes, the revision is set and the guard stops firing.
 	session.VirtualSourceRevision = "rev-b"
 	session.VirtualSubtitleEvidenceURI = uri
-	if virtualCandidateRotationRecordedV3(session, row) {
+	if virtualCandidateRotationRecordedV3(context.Background(), session, row, nil) {
 		t.Fatal("a re-probed candidate was still treated as a recorded rotation")
 	}
 
 	// A non-virtual effective file has no candidate rotation to record.
 	local := &models.MediaFile{ID: 7, FilePath: "/media/local.mkv"}
-	if virtualCandidateRotationRecordedV3(session, local) {
+	if virtualCandidateRotationRecordedV3(context.Background(), session, local, nil) {
 		t.Fatal("a local file reported a virtual candidate rotation")
 	}
 }
@@ -393,7 +393,7 @@ func TestVirtualCandidateRotationRecordedIgnoresSameCandidate(t *testing.T) {
 		VirtualSubtitleEvidenceSet: true,
 		VirtualSubtitleEvidenceURI: uri,
 	}
-	if virtualCandidateRotationRecordedV3(session, row) {
+	if virtualCandidateRotationRecordedV3(context.Background(), session, row, nil) {
 		t.Fatal("an unchanged candidate was treated as a recorded rotation")
 	}
 }

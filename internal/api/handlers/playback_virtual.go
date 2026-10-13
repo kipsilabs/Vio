@@ -3137,6 +3137,26 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			virtualCandidateVerdictActive(file.FailedAt, time.Now()) {
 			return nil, fmt.Errorf("%w: candidate %s is marked failed", ErrVirtualCandidateMarkedFailed, cand.URI)
 		}
+		// A concrete ?result= candidate is served by the catalog row that owns
+		// its exact URI, never by the provider-neutral sibling the neutral
+		// fallback returns first (the lowest-id row sharing the neutral key).
+		// An explicit pick of the same candidate serves that owner row
+		// directly; an auto start must land on the same row, or the plan's
+		// effective identity and evidence anchor would name the neutral
+		// sibling while the transport streams the concrete candidate. The
+		// owner lookup is the same exact-path resolution the deferred-probe
+		// rotation uses, so the plan and the probe cannot disagree about the
+		// row the bytes belong to. Only the seeded transient stays for a
+		// genuinely neutral candidate (no ?result=), whose own row is the
+		// requested one. The owner row then passes the same failed-verdict gate
+		// below, so a concrete pick of an indicted row is still skipped.
+		if virtualResultCandidateID(cand.URI) != "" &&
+			(dbFile == nil || strings.TrimSpace(dbFile.FilePath) != strings.TrimSpace(cand.URI)) {
+			if ownerRow, capable, ownerErr := h.virtualPathLookupRow(attemptCtx, cand.URI); capable && ownerErr == nil && ownerRow != nil {
+				dbFile = ownerRow
+				dbFound = true
+			}
+		}
 		if dbFound {
 			// Auto-pick skips candidates whose catalog row is marked failed
 			// (a transport produced no bytes, or the decoder rejected the
@@ -3163,6 +3183,13 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			transient.FilePath = cand.URI
 			transient.VirtualOwnerInstallationID = oid
 		}
+		// resolvedOwnsCandidate records whether the served transient is the
+		// catalog row that owns the exact concrete candidate URI. The deferred
+		// probe is bound to that row so its durable evidence write lands on the
+		// same row the session will serve; a neutral candidate keeps the
+		// requested row.
+		resolvedOwnsCandidate := dbFound && dbFile != nil &&
+			strings.TrimSpace(dbFile.FilePath) == strings.TrimSpace(cand.URI)
 		// Carry the resolved candidate's durable identity on the served file
 		// so the probe-evidence adoption persists the identity of the bytes
 		// being adopted. Fill-empty-only: stored tiers are never overwritten.
@@ -3319,6 +3346,19 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			if h.VirtualPlaybackSourceProber != nil || h.VirtualPlaybackSourceProberWithHeaders != nil {
 				probeKey := virtualProbeFailureKey(cand.URI, oid)
 				probeTransient := cloneVirtualProbeTransient(transient)
+				// Bind the post-commit probe to the row the plan actually
+				// serves. When the resolved candidate's exact owner row is
+				// served, its evidence write must stamp that row: the session
+				// is bound to it (effective id and evidence anchor), so probing
+				// the requested neutral sibling instead would stamp a row the
+				// session never serves and the generation-fenced overlay
+				// propagation would refuse, freezing the menus on the
+				// provisional inventory for the whole session. A genuinely
+				// neutral candidate keeps the requested row, which is its own.
+				probeCatalogFile := file
+				if resolvedOwnsCandidate {
+					probeCatalogFile = &transient
+				}
 				// Zero the duration so the deferred probe measures the
 				// empirical duration instead of inheriting the catalog value.
 				probeTransient.Duration = 0
@@ -3328,7 +3368,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 					// cache, so try a cache-only recovery before falling back
 					// to declared metadata; otherwise the row stays unprobed
 					// until the damper lapses.
-					h.recoverVirtualProbeFromCache(r.Context(), file, streamURL, probeTransient, cand, resolvedIdentity.tiers(), oid)
+					h.recoverVirtualProbeFromCache(r.Context(), probeCatalogFile, streamURL, probeTransient, cand, resolvedIdentity.tiers(), oid)
 					return withResolvedCandidate(&resolvedVirtualPlaybackSource{
 						URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenanceDeclared, ResolutionAssumed: resolutionAssumed,
 					}, resolvedIdentity, resolvedRematched), nil
@@ -3336,7 +3376,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				if options.deferProbePastCommit {
 					deferred = &virtualDeferredProbeV3{
 						stickyKey:              stickyKey,
-						file:                   file,
+						file:                   probeCatalogFile,
 						streamURL:              streamURL,
 						probeTransient:         &probeTransient,
 						cand:                   cand,
@@ -3352,10 +3392,10 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 						go func() {
 							defer gate.release()
 							defer bgCancel()
-							h.probeVirtualSourceAndPersist(bgCtx, stickyKey, file, streamURL, probeTransient, probeCand, resolvedIdentity.tiers(), expectedRuntimeMinutes, oid)
+							h.probeVirtualSourceAndPersist(bgCtx, stickyKey, probeCatalogFile, streamURL, probeTransient, probeCand, resolvedIdentity.tiers(), expectedRuntimeMinutes, oid)
 						}()
 					} else if !skipProbe {
-						h.probeVirtualCandidateForegroundFallback(r.Context(), stickyKey, file, streamURL, probeTransient, probeCand, resolvedIdentity.tiers(), expectedRuntimeMinutes, oid)
+						h.probeVirtualCandidateForegroundFallback(r.Context(), stickyKey, probeCatalogFile, streamURL, probeTransient, probeCand, resolvedIdentity.tiers(), expectedRuntimeMinutes, oid)
 					}
 				}
 			}

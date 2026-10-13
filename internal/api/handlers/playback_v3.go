@@ -8559,7 +8559,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				// too, and a track change must remap against the pinned
 				// release's audio list, not the churned row's.
 				if session.VirtualSubtitleEvidenceSet && len(session.VirtualAudioTracks) > 0 &&
-					virtualEvidenceMatchesBoundFile(carried, session) {
+					virtualEvidenceMatchesBoundFile(r.Context(), carried, session, h.fileResolver) {
 					carriedCopy := *carried
 					carriedCopy.AudioTracks = session.VirtualAudioTracks
 					carried = &carriedCopy
@@ -8895,7 +8895,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			// rotation (a moved revision) whose tracks happen to compare equal.
 			if currentEffectiveFile.ID != effectiveFile.ID ||
 				!sameMediaInventoryV3(remapSource, effectiveFile) ||
-				virtualCandidateRotationRecordedV3(session, currentEffectiveFile) {
+				virtualCandidateRotationRecordedV3(r.Context(), session, currentEffectiveFile, h.fileResolver) {
 				candidateStart := start
 				remapErr := remapAudioSelectionV3(remapSource, effectiveFile, &candidateStart)
 				if remapErr == nil && (candidateStart.SubtitleTrackIndex != nil || candidateStart.SubtitleTrackID != "") {
@@ -11250,14 +11250,14 @@ func (h *PlaybackHandler) replanRemapSourceV3(effectiveFile *models.MediaFile, s
 // id/inventory comparison alone must not treat the selection as unchanged. This
 // is the signal the fingerprint cannot provide; it fires only on a recorded
 // rotation, so an ordinary same-file replan is unaffected.
-func virtualCandidateRotationRecordedV3(session *playback.Session, effectiveFile *models.MediaFile) bool {
+func virtualCandidateRotationRecordedV3(ctx context.Context, session *playback.Session, effectiveFile *models.MediaFile, fileResolver FilePathResolver) bool {
 	if session == nil || effectiveFile == nil || !isVirtualPlaybackFile(effectiveFile) {
 		return false
 	}
 	if session.VirtualSourceRevision != "" || session.VirtualSourceURI == "" {
 		return false
 	}
-	return session.VirtualSubtitleEvidenceSet && !virtualEvidenceMatchesBoundFile(effectiveFile, session)
+	return session.VirtualSubtitleEvidenceSet && !virtualEvidenceMatchesBoundFile(ctx, effectiveFile, session, fileResolver)
 }
 
 // planVirtualSourceRevisionV3 returns the opaque virtual-source revision the
