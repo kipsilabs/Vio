@@ -1226,6 +1226,14 @@ func (h *PlaybackHandler) inventoryEffectiveFile(ctx context.Context, file *mode
 			base = row
 		}
 	}
+	// Late owner-row adoption: a first-ever auto start can pin the session to a
+	// provider-neutral row before the concrete result row exists. When that row
+	// appears later, move the session onto it and re-anchor its evidence so the
+	// verified overlay is served instead of rejected as a different candidate.
+	if adopted, refreshed := reanchorLateVirtualOwnerRow(ctx, h.fileResolver, h.sessionMgr, file, session, candidateURI); adopted != nil && adopted.ID != file.ID {
+		base = adopted
+		session = refreshed
+	}
 	if base == file && strings.TrimSpace(file.FilePath) != candidateURI {
 		// No row names the bound release. Do not serve the loaded row's
 		// inventory under the bound identity.

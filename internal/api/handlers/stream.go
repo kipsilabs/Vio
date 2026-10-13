@@ -1585,10 +1585,18 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Bind to the session's planned virtual URI when available: the catalog
-	// row's path is mutable (candidate rotation), but the session captured
-	// the exact URI that was resolved and probed during planning.
-	file = bindSessionVirtualSource(file, session)
+	// Adopt the concrete owner row of the bound candidate when it has appeared
+	// since the plan, then bind to the session's planned virtual URI: the
+	// catalog row's path is mutable (candidate rotation), but the session
+	// captured the exact URI that was resolved and probed during planning. The
+	// tracks bind is used so the session's carried overlay travels with the row,
+	// exactly as the inventory bind does — a session adopted onto the owner row
+	// must keep serving the verified inventory it verified, not the owner row's
+	// thinner declared list.
+	if adopted, refreshed := reanchorLateVirtualOwnerRow(r.Context(), h.fileResolver, h.sessionMgr, file, session, session.VirtualSourceURI); adopted != nil {
+		file, session = adopted, refreshed
+	}
+	file = bindSessionVirtualSourceWithTracks(r.Context(), file, session, h.fileResolver)
 
 	// Capture the delivered identity and observed health state at transport
 	// start: the delivered candidate is the path the transport will serve

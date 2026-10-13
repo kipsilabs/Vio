@@ -2408,6 +2408,51 @@ func (m *SessionManager) SetEffectiveMediaFileID(sessionID string, fileID int) e
 	return nil
 }
 
+// ReanchorVirtualEffectiveRow atomically points a live virtual session at the
+// concrete catalog row that owns its bound candidate and re-anchors its carried
+// track evidence to that row, but only while the binding generation still
+// matches and the effective row is still the one the caller observed.
+//
+// It is the late-owner adoption for a first-ever auto start: the concrete
+// ?result= row did not exist when the plan resolved, so the session kept the
+// release's provider-neutral sibling, and the deferred probe stamped that
+// sibling. When the owner row materializes later in the same session, the serve
+// and inventory binds resolve it by exact path, but the session's effective row
+// and evidence anchor still name the neutral sibling, so the verified overlay is
+// rejected as a different candidate and the menus freeze. Moving both the
+// effective row and the evidence row id to the owner keeps the overlay applying.
+//
+// The evidence URI is set to the bound candidate URI the caller resolved, so
+// the anchor names the exact row the session now serves. A zero expectedRowID
+// does not assert the current row; a rowID <= 0 or equal to the current row is a
+// no-op. An unknown session reports ErrSessionNotFound.
+func (m *SessionManager) ReanchorVirtualEffectiveRow(sessionID string, expectedGeneration uint64, expectedRowID, rowID int, evidenceURI string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		return false, ErrSessionNotFound
+	}
+	if s.virtualSourceGeneration != expectedGeneration {
+		return false, nil
+	}
+	if expectedRowID > 0 && s.MediaFileID != expectedRowID {
+		return false, nil
+	}
+	if rowID <= 0 || s.MediaFileID == rowID {
+		return false, nil
+	}
+	s.MediaFileID = rowID
+	s.VirtualSubtitleEvidenceFileID = rowID
+	if trimmed := strings.TrimSpace(evidenceURI); trimmed != "" {
+		s.VirtualSubtitleEvidenceURI = trimmed
+	}
+	s.streamRevision++
+	m.touchSessionLocked(s)
+	return true, nil
+}
+
 // SetRealtimeConnection marks whether a realtime control connection is active for a session.
 func (m *SessionManager) SetRealtimeConnection(sessionID string, connected bool) error {
 	m.mu.Lock()

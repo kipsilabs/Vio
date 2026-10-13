@@ -5758,10 +5758,20 @@ func virtualCandidateIDExcluded(candidateURI string, excluded []string) bool {
 // with a nil error is a genuine not-found and the only safe absence; a row
 // without a usable id is treated as an unanswered lookup, not absence.
 func (h *PlaybackHandler) virtualPathOwnerRow(ctx context.Context, file *models.MediaFile, candidateURI string, ownerID, libraryID int) (*models.MediaFile, error) {
-	if h == nil || file == nil || strings.TrimSpace(candidateURI) == "" {
+	if h == nil {
 		return nil, nil
 	}
-	row, capable, err := h.virtualPathLookupRow(ctx, candidateURI)
+	return virtualPathOwnerRowFor(ctx, h.fileResolver, file, candidateURI, ownerID, libraryID)
+}
+
+// virtualPathOwnerRowFor is the resolver-parameterized form of
+// virtualPathOwnerRow, so the StreamHandler serve path can apply the same
+// ownership assertion the PlaybackHandler paths use.
+func virtualPathOwnerRowFor(ctx context.Context, resolver FilePathResolver, file *models.MediaFile, candidateURI string, ownerID, libraryID int) (*models.MediaFile, error) {
+	if file == nil || strings.TrimSpace(candidateURI) == "" {
+		return nil, nil
+	}
+	row, capable, err := virtualPathLookupRowFor(ctx, resolver, candidateURI)
 	if !capable || err != nil || row == nil {
 		return nil, err
 	}
@@ -5778,6 +5788,67 @@ func (h *PlaybackHandler) virtualPathOwnerRow(ctx context.Context, file *models.
 		return nil, nil
 	}
 	return row, nil
+}
+
+// reanchorLateVirtualOwnerRow upgrades a live virtual session still pinned to a
+// provider-neutral row onto the concrete ?result= owner row of its bound
+// candidate, once that row appears. It returns the row to serve (the owner row
+// when adopted, otherwise the input file) and the session as the caller should
+// re-read it.
+//
+// A first-ever auto start resolves a concrete candidate before its catalog row
+// exists, so the session keeps the release's neutral sibling; the deferred probe
+// stamps that sibling and the session carries a verified overlay anchored to it.
+// When the owner row materializes later in the same session, the serve and
+// inventory binds resolve it by exact path, but the session's effective row and
+// evidence anchor still name the neutral sibling, so the verified overlay is
+// rejected as a different candidate and the menus freeze. Moving both onto the
+// owner row keeps the overlay applying.
+//
+// The adoption is fenced and no-ops for every other shape: a genuinely neutral
+// candidate (no ?result=), a session already on the owner row, a row that does
+// not verifiably own the exact candidate URI, and a session whose binding
+// generation moved since the caller read it.
+func reanchorLateVirtualOwnerRow(ctx context.Context, resolver FilePathResolver, sessionMgr SessionManagerInterface, file *models.MediaFile, session *playback.Session, candidateURI string) (*models.MediaFile, *playback.Session) {
+	if file == nil || session == nil || sessionMgr == nil || !isVirtualPlaybackFile(file) {
+		return file, session
+	}
+	candidateURI = strings.TrimSpace(candidateURI)
+	if candidateURI == "" || virtualResultCandidateID(candidateURI) == "" {
+		return file, session
+	}
+	// Only a still-neutral effective row is upgraded: a row that already names
+	// the concrete candidate (or a concrete candidate at all) is its own owner.
+	if sameVirtualReleaseIdentity(file.FilePath, candidateURI) {
+		return file, session
+	}
+	owner, err := virtualPathOwnerRowFor(ctx, resolver, file, candidateURI, file.VirtualOwnerInstallationID, file.MediaFolderID)
+	if err != nil || owner == nil || owner.ID <= 0 || owner.ID == file.ID {
+		return file, session
+	}
+	reanchorer, ok := sessionMgr.(interface {
+		ReanchorVirtualEffectiveRow(sessionID string, expectedGeneration uint64, expectedRowID, rowID int, evidenceURI string) (bool, error)
+	})
+	if !ok {
+		return file, session
+	}
+	genReader, ok := sessionMgr.(interface {
+		VirtualSourceGeneration(sessionID string) (uint64, error)
+	})
+	if !ok {
+		return file, session
+	}
+	gen, err := genReader.VirtualSourceGeneration(session.ID)
+	if err != nil {
+		return file, session
+	}
+	if _, err := reanchorer.ReanchorVirtualEffectiveRow(session.ID, gen, file.ID, owner.ID, candidateURI); err != nil {
+		return file, session
+	}
+	if refreshed, err := sessionMgr.GetSession(session.ID); err == nil && refreshed != nil {
+		session = refreshed
+	}
+	return owner, session
 }
 
 // virtualPathLookupRow is the raw exact-path lookup behind virtualPathOwnerRow
@@ -5800,10 +5871,19 @@ func (h *PlaybackHandler) virtualPathOwnerRow(ctx context.Context, file *models.
 // ErrVirtualCandidateNotFound, and a bare scanner.ErrFileNotFound is equally
 // absent.
 func (h *PlaybackHandler) virtualPathLookupRow(ctx context.Context, candidateURI string) (row *models.MediaFile, capable bool, err error) {
-	if h == nil || strings.TrimSpace(candidateURI) == "" {
+	if h == nil {
 		return nil, false, nil
 	}
-	pathResolver, ok := h.fileResolver.(interface {
+	return virtualPathLookupRowFor(ctx, h.fileResolver, candidateURI)
+}
+
+// virtualPathLookupRowFor is the resolver-parameterized form of
+// virtualPathLookupRow.
+func virtualPathLookupRowFor(ctx context.Context, resolver FilePathResolver, candidateURI string) (row *models.MediaFile, capable bool, err error) {
+	if strings.TrimSpace(candidateURI) == "" {
+		return nil, false, nil
+	}
+	pathResolver, ok := resolver.(interface {
 		GetByPath(context.Context, string) (*models.MediaFile, error)
 	})
 	if !ok {

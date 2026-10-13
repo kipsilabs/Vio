@@ -316,6 +316,159 @@ func TestRemuxOrdinal_AutoUsesVerifiedTwoAudio(t *testing.T) {
 	}
 }
 
+// TestAutoStartAdoptsResultRowThatAppearsAfterResolve reproduces the production
+// first-ever-play shape that the resolve-time anchor fix could not cover: the
+// concrete result row does not exist yet when the auto resolve runs, so the
+// session is pinned to the provider-neutral collection row and the deferred
+// probe stamps that row. The result row materializes later in the same session
+// (the collection sync). The serve/inventory bind resolves it by exact path, but
+// the session's effective row and evidence anchor still name the neutral
+// sibling, so before the fix the verified overlay is rejected as a different
+// candidate and the menu serves the owner row's thin declared list. The late
+// adoption must move the session onto the owner row and serve the verified
+// inventory.
+func TestAutoStartAdoptsResultRowThatAppearsAfterResolve(t *testing.T) {
+	collection, result := autoResultRows()
+	planAudio := []models.AudioTrack{{Index: 0, Codec: "eac3", Channels: 6, Language: "jpn", Default: true}}
+	verifiedAudio, verifiedSubs := verifiedCanonicalAudio(), verifiedCanonicalSubtitles()
+
+	// Only the neutral collection row exists at resolve time.
+	rows := newCanonicalCollectionResolver(collection)
+	manager := playback.NewSessionManager(0, 0)
+	handler := NewPlaybackHandler(manager, rows)
+	handler.InstallationID = "test-install"
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "true"}}
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	serviceCtx, serviceCancel := context.WithCancel(context.Background())
+	handler.ServiceContext = serviceCtx
+	t.Cleanup(serviceCancel)
+
+	handler.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(func(_ context.Context, path string, _ int, _ string, _ int) (string, error) {
+		return "http://127.0.0.1:8080/stream?path=" + path, nil
+	})
+	handler.VirtualCandidateFileLookup = func(ctx context.Context, path, _ string, _ string, _ int) (*models.MediaFile, error) {
+		return rows.GetByPath(ctx, path)
+	}
+	handler.VirtualFileLookup = func(ctx context.Context, path string) (*models.MediaFile, error) {
+		return rows.GetByPath(ctx, path)
+	}
+	handler.VirtualPlaybackStreamLister = VirtualPlaybackStreamListerFunc(func(_ context.Context, _ string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
+		return []VirtualPlaybackStream{{
+			ID: "8f847c6", URI: autoResultURI, Resolution: "2160p",
+			CodecVideo: "h264", CodecAudio: "eac3", Container: "mkv",
+		}}, nil
+	})
+	handler.VirtualPlaybackSourceProber = func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
+		f.AudioTracks = verifiedAudio
+		f.SubtitleTracks = verifiedSubs
+		f.CodecAudio = "eac3"
+		return f, nil
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil)
+	resolved, err := handler.resolveVirtualPlaybackSource(req, &collection, "profile-1", true, nil, "", "", 0, false,
+		virtualResolveOptionsV3{deferProbePastCommit: true})
+	if err != nil {
+		t.Fatalf("resolveVirtualPlaybackSource: %v", err)
+	}
+	if resolved.File == nil || resolved.File.ID != collection.ID {
+		t.Fatalf("resolve effective row = %v, want the neutral collection row %d before the owner exists", resolved.File, collection.ID)
+	}
+	if resolved.DeferredProbe == nil {
+		t.Fatal("resolve returned no deferred probe")
+	}
+
+	session, err := manager.StartSession(1, "profile-1", resolved.File.ID, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	if err := manager.SetVirtualSource(session.ID, resolved.URI, resolved.OwnerID); err != nil {
+		t.Fatalf("SetVirtualSource: %v", err)
+	}
+	if err := manager.UpdateStreamState(session.ID, playback.SessionStreamState{
+		VirtualSourceSet:              true,
+		VirtualSourceOwnershipSet:     true,
+		VirtualSourceURI:              resolved.URI,
+		VirtualSourceRevision:         "planrev",
+		VirtualSubtitleEvidenceSet:    true,
+		VirtualSubtitleEvidenceURI:    resolved.File.FilePath,
+		VirtualSubtitleEvidenceFileID: resolved.File.ID,
+		VirtualAudioTracks:            planAudio,
+	}); err != nil {
+		t.Fatalf("UpdateStreamState: %v", err)
+	}
+	if err := handler.PlanStoreV3.SaveAttempt(context.Background(), playback.AttemptRecordV3{
+		PlaybackAttemptID: "attempt-late-owner", SessionID: session.ID, UserID: 1, ProfileID: "profile-1",
+		RequestedMediaFileID: collection.ID, EffectiveMediaFileID: resolved.File.ID, ExpiresAt: time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("SaveAttempt: %v", err)
+	}
+	resolved.DeferredProbe.sessionID = session.ID
+
+	probedAt := time.Now().UTC()
+	handler.VirtualFileMetadataSaver = func(_ context.Context, args models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error) {
+		var audio []models.AudioTrack
+		if err := json.Unmarshal(args.AudioTracks, &audio); err != nil {
+			return VirtualFileMetadataUpdateResult{}, err
+		}
+		var subs []models.SubtitleTrack
+		if len(args.SubtitleTracks) > 0 {
+			if err := json.Unmarshal(args.SubtitleTracks, &subs); err != nil {
+				return VirtualFileMetadataUpdateResult{}, err
+			}
+		}
+		rows.update(args.FileID, func(f *models.MediaFile) {
+			f.AudioTracks = audio
+			f.SubtitleTracks = subs
+			f.CodecAudio = args.CodecAudio
+			f.ProbeUpdatedAt = &probedAt
+		})
+		return VirtualFileMetadataUpdateResult{MetadataUpdated: true, RowsAffected: 1}, nil
+	}
+
+	deferred := readmitDeferredProbe(t, handler, resolved.DeferredProbe)
+	handler.runDeferredVirtualProbe(deferred)
+
+	// The collection sync materializes the concrete result row after the probe
+	// committed to the neutral sibling.
+	rows.mu.Lock()
+	rows.rows[result.ID] = result
+	rows.mu.Unlock()
+
+	inventory, err := handler.GetPlaybackInventoryV2(newAuthorizedPlaybackContext(),
+		PlaybackCaller{UserID: 1, ProfileID: "profile-1", InstallationID: "test-install"}, session.ID)
+	if err != nil {
+		t.Fatalf("GetPlaybackInventoryV2: %v", err)
+	}
+	if inventory.EffectiveMediaFileID != result.ID {
+		t.Fatalf("effective media file id = %d, want the materialized result row %d", inventory.EffectiveMediaFileID, result.ID)
+	}
+	if len(inventory.AudioTracks) != len(verifiedAudio) {
+		t.Fatalf("served audio = %+v, want the committed verified %d tracks, not the owner row's thin declared list", inventory.AudioTracks, len(verifiedAudio))
+	}
+	if inventory.InventoryStatus != string(ProbeProvenanceVerified) {
+		t.Fatalf("inventory status = %q, want verified", inventory.InventoryStatus)
+	}
+
+	live, err := manager.GetSession(session.ID)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if live.MediaFileID != result.ID || live.VirtualSubtitleEvidenceFileID != result.ID {
+		t.Fatalf("session anchor = effective %d / evidence %d, want the result row %d for both", live.MediaFileID, live.VirtualSubtitleEvidenceFileID, result.ID)
+	}
+
+	// The transport bind resolves the same verified stream after the adoption.
+	boundRow, err := rows.GetByID(context.Background(), live.MediaFileID)
+	if err != nil || boundRow == nil {
+		t.Fatalf("GetByID(bound): %v", err)
+	}
+	bound := bindSessionVirtualSourceWithTracks(context.Background(), boundRow, live, rows)
+	if len(bound.AudioTracks) != len(verifiedAudio) {
+		t.Fatalf("transport bind audio = %+v, want the verified overlay", bound.AudioTracks)
+	}
+}
+
 // TestNeutralCollectionEvidenceVersusDifferentResultRowStillRefused keeps the
 // fail-closed half of the identity gate: a neutral collection row with no
 // durable identity must not be accepted as the same release as a different
