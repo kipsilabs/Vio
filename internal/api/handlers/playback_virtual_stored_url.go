@@ -253,13 +253,26 @@ func (h *PlaybackHandler) owningSessionBoundCandidateRow(ctx context.Context, fi
 	if strings.TrimSpace(row.FilePath) != candidateURI {
 		return nil
 	}
-	if file.ContentID != "" && row.ContentID != file.ContentID {
+	// Ownership is proven by the concrete path plus this content and episode. An
+	// empty content id proves nothing, so it must not let a path collision stand
+	// in for ownership.
+	if file.ContentID == "" || row.ContentID != file.ContentID {
 		return nil
 	}
 	if row.EpisodeID != file.EpisodeID {
 		return nil
 	}
 	return row
+}
+
+// persistedIdentityCompatible reports whether two durable identities describe
+// the same release under the resolver's precedence (video hash, then source
+// GUID, then normalized release name plus exact size). Two rows with
+// incompatible identities describe different releases, so their evidence must
+// never be combined.
+func persistedIdentityCompatible(a, b virtuallibrary.PersistedCandidateIdentity) bool {
+	return resolver.PersistedDedupKey(a.VideoHash, a.GUID, a.ReleaseName, a.ReleaseSize) ==
+		resolver.PersistedDedupKey(b.VideoHash, b.GUID, b.ReleaseName, b.ReleaseSize)
 }
 
 // enrichSessionBoundCandidateIdentity overlays the durable provider identity and
@@ -274,14 +287,24 @@ func (h *PlaybackHandler) owningSessionBoundCandidateRow(ctx context.Context, fi
 // identity and the resolver refuses the absent pin as unprovable (the observed
 // has_identity=false refusal).
 //
-// The overlay is deliberately narrow and additive: only the durable identity
-// tiers, the stored-URL columns, the stored request headers and the row's
-// updated-at (which the trust window measures) are copied, and only where file
-// lacks them. Track inventory, verdicts, ownership and every other field stay
-// exactly as the caller's row carried them, so this cannot move a verdict, a
-// session binding or a release identity. The exact-path and content/episode
-// ownership check makes the copied tier the bound candidate's own evidence, so
-// no release swap is possible.
+// The overlay is evidence-coherent, not field-by-field. The owning row's
+// durable identity and its transport evidence (the stored URL, its expiry and
+// its request headers, which travel with the URL as a unit) are imported from
+// the same row, so the release the resolver re-matches and the bytes the caller
+// serves always share a provenance. Contradictory identities are refused
+// outright: if both rows carry a durable identity and they disagree, they
+// describe different releases, so neither row's evidence is combined with the
+// other's and the caller's row is returned unchanged. An identity is never
+// attached to a stored URL of unknown provenance, and a stored URL is never
+// imported without a matching identity when the anchor already carries one. The
+// owning row's updated_at (which the trust window measures) is copied only
+// together with its URL, so a row whose transport evidence was not imported
+// cannot advance the trust clock on the anchor's older evidence.
+//
+// The exact-path, content and episode ownership check makes the copied evidence
+// the bound candidate's own, so no release swap is possible. Track inventory,
+// verdicts, ownership and every other field stay exactly as the caller's row
+// carried them.
 //
 // A row that already carries both identity and a stored URL is returned
 // unchanged with no lookup, so the common warm path pays nothing.
@@ -289,9 +312,10 @@ func (h *PlaybackHandler) enrichSessionBoundCandidateIdentity(ctx context.Contex
 	if h == nil || file == nil {
 		return file
 	}
-	_, hasIdentity := persistedVirtualIdentity(file)
-	needsIdentity := !hasIdentity
-	needsURL := strings.TrimSpace(file.ResolvedURL) == ""
+	anchorIdentity, anchorHasIdentity := persistedVirtualIdentity(file)
+	anchorHasURL := strings.TrimSpace(file.ResolvedURL) != ""
+	needsIdentity := !anchorHasIdentity
+	needsURL := !anchorHasURL
 	if !needsIdentity && !needsURL {
 		return file
 	}
@@ -299,24 +323,54 @@ func (h *PlaybackHandler) enrichSessionBoundCandidateIdentity(ctx context.Contex
 	if row == nil {
 		return file
 	}
+	rowIdentity, rowHasIdentity := persistedVirtualIdentity(row)
+	rowHasURL := strings.TrimSpace(row.ResolvedURL) != ""
+
+	// Contradictory identities: the two rows describe different releases. Never
+	// mix one row's identity with the other's transport evidence.
+	if anchorHasIdentity && rowHasIdentity && !persistedIdentityCompatible(anchorIdentity, rowIdentity) {
+		return file
+	}
+
+	importIdentity := needsIdentity && rowHasIdentity
+	importURL := needsURL && rowHasURL
+
+	// Adopting the owning row's identity while the anchor keeps its own URL
+	// would pair an identity with transport evidence of another provenance.
+	// Replace that URL with the owning row's same-provenance URL when it has
+	// one; otherwise the identity cannot be adopted.
+	if importIdentity && anchorHasURL {
+		if rowHasURL {
+			importURL = true
+		} else {
+			importIdentity = false
+		}
+	}
+	// The converse: a URL imported while the anchor keeps an identity the owning
+	// row does not supply has no proven provenance.
+	if importURL && anchorHasIdentity && !rowHasIdentity {
+		importURL = false
+	}
+	if !importIdentity && !importURL {
+		return file
+	}
+
 	enriched := *file
-	if needsIdentity {
+	if importIdentity {
 		enriched.ProviderVideoHash = row.ProviderVideoHash
 		enriched.ProviderGUID = row.ProviderGUID
 		enriched.ProviderReleaseName = row.ProviderReleaseName
 		enriched.ProviderReleaseSize = row.ProviderReleaseSize
 	}
-	if needsURL {
+	if importURL {
 		enriched.ResolvedURL = row.ResolvedURL
 		enriched.ResolvedURLExpiresAt = row.ResolvedURLExpiresAt
-		enriched.ProviderRequestHeaders = row.ProviderRequestHeaders
-	}
-	if !row.UpdatedAt.IsZero() {
-		enriched.UpdatedAt = row.UpdatedAt
-	}
-	if _, ok := persistedVirtualIdentity(&enriched); !ok && strings.TrimSpace(enriched.ResolvedURL) == "" {
-		// The owning row carried nothing to add; keep the caller's row.
-		return file
+		enriched.ProviderRequestHeaders = cloneHeaderMap(row.ProviderRequestHeaders)
+		// Freshness provenance travels with the transport evidence: only the
+		// row that supplied the URL may advance the trust-window clock.
+		if !row.UpdatedAt.IsZero() {
+			enriched.UpdatedAt = row.UpdatedAt
+		}
 	}
 	return &enriched
 }
@@ -350,33 +404,81 @@ func virtualResolvedURLExpired(expiresAt time.Time, now time.Time) bool {
 }
 
 // virtualResolveContextWithPersistedTrust threads the row's durable identity
-// and, when the row is inside the trust window and carries transport evidence,
-// marks the resolve as allowed to keep trusting that persisted candidate even
-// when the provider's current list omits it. Trust requires transport evidence:
-// a stored resolved_url means the row resolved at least once, and a
-// last_delivered_at means it actually delivered bytes. A row that delivered
-// before persisted URLs existed carries no URL but does carry a delivery stamp,
-// so it can still be trusted. Durable identity is threaded when present so a
-// renumbered same-release candidate is re-matched, but it is not required for
-// trust: an identity-less row with transport evidence is still the viewer's
-// selection, so a delisted pin is refused with the trust sentinel instead of the
-// rotation sentinel and the handler re-serves its stored URL rather than
-// rotating to a sibling. A row with no URL and no delivery stamp has no
-// persisted candidate to prefer and keeps the pre-window refusal/rotation
-// behavior. A zero window likewise leaves the context untouched.
+// and, when the row is inside the trust window and carries evidence that can
+// back a re-serve, marks the resolve as allowed to keep trusting that persisted
+// candidate even when the provider's current list omits it.
+//
+// A durable identity can back a re-serve: the resolver re-identifies the same
+// release under a new result id, and a stored URL or a recorded delivery is its
+// transport proof. Without an identity there is no re-match, so the only usable
+// support is a stored URL that can actually be served now — non-empty and
+// unexpired. A delivery stamp alone proves bytes flowed once, not that a URL can
+// be served, and an expired or empty URL cannot be served, so neither claims
+// resumability. Trust alone never substitutes a sibling: a delisted pin is
+// refused with the trust sentinel and the handler re-serves its stored URL via
+// recoverTrustedStoredVirtualURL, or fails boundedly. A row with no resumable
+// evidence keeps the pre-window refusal/rotation behavior. A zero window
+// likewise leaves the context untouched.
 func virtualResolveContextWithPersistedTrust(ctx context.Context, row *models.MediaFile, now time.Time, window time.Duration) context.Context {
 	ctx = virtualResolveContextWithPersistedIdentity(ctx, row)
 	if row == nil {
 		return ctx
 	}
-	if strings.TrimSpace(row.ResolvedURL) == "" && row.LastDeliveredAt == nil {
-		// No transport evidence at all: never resolved and never delivered.
+	if !virtualPersistedCandidateHasResumableEvidence(row, now) {
 		return ctx
 	}
 	if virtualCandidateWithinStoreWindow(row, now, window) {
 		ctx = virtuallibrary.WithPersistedCandidateTrust(ctx, true)
 	}
 	return ctx
+}
+
+// virtualPersistedCandidateHasResumableEvidence reports whether a row's
+// persisted state can back a trusted re-serve. A durable identity does (the
+// resolver re-identifies the same release by identity, with a stored URL or a
+// recorded delivery as the transport proof). Without an identity there is no
+// re-match, so the only usable support is a stored URL that can be served now:
+// present and unexpired. A delivery stamp alone and an expired or empty URL do
+// not claim resumability.
+func virtualPersistedCandidateHasResumableEvidence(row *models.MediaFile, now time.Time) bool {
+	if row == nil {
+		return false
+	}
+	if _, ok := persistedVirtualIdentity(row); ok {
+		return strings.TrimSpace(row.ResolvedURL) != "" || row.LastDeliveredAt != nil
+	}
+	if strings.TrimSpace(row.ResolvedURL) == "" {
+		return false
+	}
+	return !virtualStoredURLNeedsSignedRefresh(row, now)
+}
+
+// recoverTrustedStoredVirtualURL is the absent-pin companion of the trust gate:
+// when the resolver reports the pinned candidate absent from the provider list
+// but the request was trusted, it re-serves the row's own validated stored URL
+// so a trusted-but-pinless session recovers the same release without a provider
+// round-trip. Same-release is enforced by sameVirtualReleaseIdentity and by
+// evaluateStoredVirtualURLCandidate's exact-path ownership check, so this never
+// substitutes a sibling. It reports false when the row carries no usable URL;
+// the caller then fails boundedly with the original sentinel.
+func (h *PlaybackHandler) recoverTrustedStoredVirtualURL(
+	ctx context.Context,
+	file *models.MediaFile,
+	pinnedURI string,
+	ownerInstallationID int,
+) (ResolvedVirtualMedia, bool) {
+	if h == nil || file == nil || !sameVirtualReleaseIdentity(file.FilePath, pinnedURI) {
+		return ResolvedVirtualMedia{}, false
+	}
+	usable, state := evaluateStoredVirtualURLCandidate(
+		ctx, pinnedURI, file,
+		h.storedVirtualURLAllowInsecure(file, ownerInstallationID), time.Now(),
+		h.virtualCandidateTrustWindow(),
+	)
+	if state != virtualStoredURLUsable || strings.TrimSpace(usable.URL) == "" {
+		return ResolvedVirtualMedia{}, false
+	}
+	return usable, true
 }
 
 // adoptRematchedVirtualResolution adopts the new result= identity the resolver
