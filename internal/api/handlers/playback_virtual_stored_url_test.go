@@ -679,13 +679,12 @@ func TestVirtualResolveContextTrustsDeliveredURLLessRow(t *testing.T) {
 	}
 }
 
-// TestVirtualResolveContextTrustsIdentitylessDeliveredRow proves the trust
-// predicate accepts an identity-less row that carries transport evidence (a
-// recorded delivery) inside the window. It is still the viewer's selection, so a
-// delisted pin must refuse a sibling and re-serve the stored evidence rather than
-// rotate; durable identity only adds the ability to re-match a renumbered same
-// release on top of that.
-func TestVirtualResolveContextTrustsIdentitylessDeliveredRow(t *testing.T) {
+// TestVirtualResolveContextURLLessIdentitylessDeliveryNotTrusted pins the
+// boundary of the relaxed trust predicate: an identity-less row that only
+// recorded a delivery (no stored URL) is not trusted, because there is no
+// transport evidence to re-serve. Durable identity or a usable stored URL is
+// required; a delivery stamp alone must not claim resumability.
+func TestVirtualResolveContextURLLessIdentitylessDeliveryNotTrusted(t *testing.T) {
 	const pinned = "virtual://movie/tt-urlless-noid?result=cand-a"
 	now := time.Now()
 	row := &models.MediaFile{
@@ -695,8 +694,8 @@ func TestVirtualResolveContextTrustsIdentitylessDeliveredRow(t *testing.T) {
 		LastDeliveredAt: &now,
 	}
 	ctx := virtualResolveContextWithPersistedTrust(context.Background(), row, now, 720*time.Hour)
-	if !virtuallibrary.PersistedCandidateTrusted(ctx) {
-		t.Fatal("a delivered row inside the window must be trusted even without a durable identity")
+	if virtuallibrary.PersistedCandidateTrusted(ctx) {
+		t.Fatal("an identity-less row with only a delivery stamp must not be trusted")
 	}
 	if _, ok := virtuallibrary.PersistedCandidateIdentityFromContext(ctx); ok {
 		t.Fatal("an identity-less row must not thread a durable identity")
