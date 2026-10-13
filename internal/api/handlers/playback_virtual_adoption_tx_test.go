@@ -442,45 +442,54 @@ func containsSQL(execs []string, want string) bool {
 	return false
 }
 
-// TestMarkVirtualAdoptionTerminalRefusalPrefersRevisionFence proves the
-// pre-emptive terminal uses the revision-fenced marker when it is wired and
-// reports a superseded stamp (a newer evidence write advanced the row) as no
-// install. The observed revision it forwards is the row's snapshot.
-func TestMarkVirtualAdoptionTerminalRefusalPrefersRevisionFence(t *testing.T) {
-	row := adoptionBoundTestRow(5040009, "row-hash")
-	row.UpdatedAt = time.Unix(1_700_000_500, 0)
-	legacyCalls := 0
-	var gotUpdated time.Time
-	fencedResult := false
-	h := &PlaybackHandler{
-		VirtualCandidateFailMarker: func(context.Context, int, string, *time.Time) error {
-			legacyCalls++
-			return nil
-		},
-		VirtualAdoptionTerminalMarker: func(_ context.Context, fileID int, expectedFilePath string, _ *time.Time, observedUpdatedAt time.Time, _ *time.Time) (bool, error) {
-			if fileID != row.ID || expectedFilePath != row.FilePath {
-				t.Errorf("fenced marker called with (%d, %q), want (%d, %q)", fileID, expectedFilePath, row.ID, row.FilePath)
+// TestVirtualAdoptionTxNonRequiredZeroRowIsNotARefusal is the blocker-1
+// regression: only a required adoption that matched no row is a refusal. An
+// ordinary metadata CAS miss (no RequireAdopt, or an empty adopt path) must not
+// increment the exact-pin counter or install a terminal, or a clear followed by
+// an ordinary miss replenishes the count and a neutral-owner non-required write
+// can terminal against a current revision.
+func TestVirtualAdoptionTxNonRequiredZeroRowIsNotARefusal(t *testing.T) {
+	ctx := context.Background()
+	cases := []struct {
+		name   string
+		fileID int
+		adopt  string
+	}{
+		{"empty-adopt-path", 5040101, ""},
+		{"best-effort-adopt-path", 5040102, "virtual://series/tt1/1/1?result=best-effort"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			args := txAdoptionArgs(tc.fileID, "virtual://series/tt1/1/1?result=pinned", tc.adopt)
+			args.RequireAdopt = false
+			tx := &fakeAdoptionTx{rowFor: func(sql string, _ ...any) pgx.Row {
+				if sql == lockVirtualFileRowSQL {
+					return scriptedRow{id: tc.fileID}
+				}
+				return scriptedRow{err: pgx.ErrNoRows}
+			}}
+			db := &fakeTxBeginner{tx: tx}
+			store := newFakeAdoptionTxStore()
+			key := store.key(tc.fileID, args.ExpectedFilePath)
+			store.counts[key] = virtualAdoptionRefusalBound
+			store.terminalStamped = true
+
+			result, err := ExecVirtualFileMetadataUpdateResultWithRefusals(ctx, db, args, store)
+			if err != nil {
+				t.Fatalf("non-required zero-row miss returned an error: %v", err)
 			}
-			gotUpdated = observedUpdatedAt
-			return fencedResult, nil
-		},
-	}
-
-	if h.markVirtualAdoptionTerminalRefusal(context.Background(), row, virtualProbeRefusalAdoptionBoundExhausted) {
-		t.Fatal("a superseded terminal reported a durable install")
-	}
-	if legacyCalls != 0 {
-		t.Fatalf("the legacy marker ran %d times despite the fenced marker being wired", legacyCalls)
-	}
-	if !gotUpdated.Equal(row.UpdatedAt) {
-		t.Fatalf("observed revision = %v, want the row snapshot %v", gotUpdated, row.UpdatedAt)
-	}
-
-	fencedResult = true
-	if !h.markVirtualAdoptionTerminalRefusal(context.Background(), row, virtualProbeRefusalAdoptionBoundExhausted) {
-		t.Fatal("an installed fenced terminal reported no install")
-	}
-	if legacyCalls != 0 {
-		t.Fatal("the legacy marker ran on the installed path")
+			if result.MetadataUpdated || result.RowsAffected != 0 || result.IdentityAdopted {
+				t.Fatalf("result = %+v, want a plain no-op", result)
+			}
+			if store.terminalCalls != 0 {
+				t.Fatalf("an ordinary zero-row miss installed %d terminals, want 0", store.terminalCalls)
+			}
+			if got := store.counts[key]; got != virtualAdoptionRefusalBound {
+				t.Fatalf("refusal count = %d, want the pre-existing %d (an ordinary miss must not increment)", got, virtualAdoptionRefusalBound)
+			}
+			if tx.committed {
+				t.Fatal("an ordinary zero-row miss committed a refusal transaction")
+			}
+		})
 	}
 }

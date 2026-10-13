@@ -96,6 +96,16 @@ func execVirtualFileMetadataUpdateResultTx(ctx context.Context, db VirtualFileMe
 	persistedPath, writeErr := statement.run(ctx, tx, args, args.AdoptPath)
 	if writeErr == nil {
 		if persistedPath == "" {
+			// Only a required adoption that matched no row is a refusal. An
+			// ordinary metadata CAS miss is not: counting it would replenish
+			// the exact-pin threshold after a clear, so a neutral-owner
+			// non-required write could later terminal against a current
+			// revision. This mirrors the guard in
+			// execVirtualFileMetadataUpdateResultUntx; a zero-row non-required
+			// write is a plain no-op (the transaction rolls back).
+			if !args.RequireAdopt || args.AdoptPath == "" {
+				return VirtualFileMetadataUpdateResult{}, nil
+			}
 			return txVirtualAdoptionRefusal(ctx, tx, store, args, &committed)
 		}
 		if args.RequireAdopt && args.AdoptPath != "" && persistedPath != args.AdoptPath {
@@ -185,9 +195,11 @@ func txVirtualAdoptionRefusal(ctx context.Context, tx pgx.Tx, store VirtualAdopt
 	}
 	if refusals >= virtualAdoptionRefusalBound {
 		// The in-transaction count is the authority, not the caller's earlier
-		// read. The stamp is fenced on the observed evidence revision, so an
+		// read. Name the disposition from that count and stamp the durable
+		// terminal; the stamp is fenced on the observed evidence revision, so an
 		// evidence write that advanced the row after this decision was taken
 		// wins over the stale terminal.
+		reason = virtualProbeRefusalAdoptionBoundExhausted
 		stamped, stampErr := store.MarkVirtualAdoptionTerminalRefusalTx(ctx, tx, args.FileID, args.ExpectedFilePath, nil, args.UpdatedAt, args.ProbeUpdatedAt)
 		if stampErr != nil {
 			slog.WarnContext(ctx, "virtual adoption terminal refusal was not persisted; the row keeps its own failed_at state",
