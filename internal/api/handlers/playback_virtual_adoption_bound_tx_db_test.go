@@ -572,9 +572,9 @@ func TestVirtualAdoptionRefusalLockedRecorderCancelsUnderContentionDB(t *testing
 	waitForAdoptionLockWaiter(t, pool, blockerPID)
 	cancel()
 	if err := <-done; err == nil {
-		t.Fatal("a cancelled row-lock wait reported success")
+		t.Fatal("a canceled row-lock wait reported success")
 	} else if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
-		t.Fatalf("cancelled recorder error = %v, want a context cancellation", err)
+		t.Fatalf("canceled recorder error = %v, want a context cancellation", err)
 	}
 	if err := blocker.Rollback(ctx); err != nil {
 		t.Fatalf("release blocker: %v", err)
@@ -584,12 +584,12 @@ func TestVirtualAdoptionRefusalLockedRecorderCancelsUnderContentionDB(t *testing
 		t.Fatalf("count: %v", err)
 	}
 	if count != 0 {
-		t.Fatalf("refusal count = %d, want the cancelled increment rolled back", count)
+		t.Fatalf("refusal count = %d, want the canceled increment rolled back", count)
 	}
 }
 
 // cancelClearRefusalStore cancels the caller's context when the exact-pin clear
-// runs, modelling a cancellation between the evidence statement and the clear.
+// runs, modeling a cancellation between the evidence statement and the clear.
 type cancelClearRefusalStore struct {
 	*scanner.FileRepository
 	cancel context.CancelFunc
@@ -602,7 +602,7 @@ func (s cancelClearRefusalStore) ClearVirtualAdoptionRefusalTx(context.Context, 
 
 // TestVirtualAdoptionRefusalClearCancellationRollsBackEvidenceDB proves a
 // cancellation at the evidence/clear boundary rolls the whole transaction back:
-// the row's evidence and the refusal mark are both untouched, so a cancelled
+// the row's evidence and the refusal mark are both untouched, so a canceled
 // write can never commit evidence behind a still-live threshold.
 func TestVirtualAdoptionRefusalClearCancellationRollsBackEvidenceDB(t *testing.T) {
 	pool := virtualMetadataUpdateTestPool(t)
@@ -621,7 +621,7 @@ func TestVirtualAdoptionRefusalClearCancellationRollsBackEvidenceDB(t *testing.T
 	defer cancel()
 	args := adoptionSuccessArgs(id, path, ownerID, folderID, updatedAt, probeUpdatedAt)
 	if _, err := ExecVirtualFileMetadataUpdateResultWithRefusals(writeCtx, pool, args, cancelClearRefusalStore{FileRepository: repo, cancel: cancel}); err == nil {
-		t.Fatal("a cancelled clear reported a committed write")
+		t.Fatal("a canceled clear reported a committed write")
 	}
 	var resolution string
 	if err := pool.QueryRow(context.Background(), `SELECT COALESCE(resolution, '') FROM media_files WHERE id = $1`, id).Scan(&resolution); err != nil {

@@ -405,7 +405,7 @@ type lockedCountingStore struct {
 
 func (s *lockedCountingStore) RecordVirtualAdoptionRefusalLocked(ctx context.Context, fileID int, expectedPath string, ttl time.Duration) (int, error) {
 	s.lockedCalls++
-	return s.fakeAdoptionRefusalStore.RecordVirtualAdoptionRefusal(ctx, fileID, expectedPath, ttl)
+	return s.RecordVirtualAdoptionRefusal(ctx, fileID, expectedPath, ttl)
 }
 
 // TestVirtualAdoptionRefusalSiblingIncrementUsesRowFirstRecorder proves the
