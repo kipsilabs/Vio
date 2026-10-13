@@ -655,6 +655,19 @@ const probePropagationAttempts = 2
 // tracks. It returns whether the write landed, was refused as a different
 // release, or was superseded by a rotation; a recoverable catalog read while
 // proving the bound release is retried on a fresh bounded context.
+//
+// Transport coherence: replacing the carried list does not rebuild a running
+// mux, and none is owed. The transport's audio selector is an audio-only
+// ordinal (0:a:N) derived from container stream indices, not array position, so
+// an array reorder alone leaves the committed stream's ordinal unchanged and the
+// running mux keeps playing the same stream. When a removal shifts that ordinal,
+// the shared default-audio reconcile — which runs before this write against the
+// plan-time selection, as the direct and queued evidence paths do — issues the
+// correction that points 0:a:N back at the committed track. An explicit viewer
+// selection is preserved by its track identity and is never overridden. This
+// write therefore deliberately leaves the session's committed array position
+// untouched; renumbering it here would change the ordinal space the running mux
+// was started against.
 func (h *PlaybackHandler) propagateVerifiedProbeInventory(deferred *virtualDeferredProbeV3, committed virtualCommittedProbeInventory) probeInventoryDisposition {
 	if h == nil || deferred == nil || deferred.sessionID == "" || !committed.committed() {
 		return probeInventorySuperseded
