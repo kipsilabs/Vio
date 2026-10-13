@@ -5805,10 +5805,15 @@ func virtualPathOwnerRowFor(ctx context.Context, resolver FilePathResolver, file
 // rejected as a different candidate and the menus freeze. Moving both onto the
 // owner row keeps the overlay applying.
 //
-// The adoption is fenced and no-ops for every other shape: a genuinely neutral
-// candidate (no ?result=), a session already on the owner row, a row that does
-// not verifiably own the exact candidate URI, and a session whose binding
-// generation moved since the caller read it.
+// The adoption is fully fenced: it only fires for an actually-neutral effective
+// row (a row that already names any concrete ?result= pick is its own owner, or
+// a different concrete release, and is never swapped), it captures the whole
+// candidate binding before the owner-row lookup, and it CASes that snapshot -
+// generation, virtual URI, owner, and effective row - in one critical section.
+// The session manager also refuses the move while the deferred-probe lifecycle
+// is pending, so a row-only move cannot strand an outstanding probe. A rejected
+// CAS returns the input file: a rejected adoption is never served as if it had
+// landed.
 func reanchorLateVirtualOwnerRow(ctx context.Context, resolver FilePathResolver, sessionMgr SessionManagerInterface, file *models.MediaFile, session *playback.Session, candidateURI string) (*models.MediaFile, *playback.Session) {
 	if file == nil || session == nil || sessionMgr == nil || !isVirtualPlaybackFile(file) {
 		return file, session
@@ -5817,9 +5822,29 @@ func reanchorLateVirtualOwnerRow(ctx context.Context, resolver FilePathResolver,
 	if candidateURI == "" || virtualResultCandidateID(candidateURI) == "" {
 		return file, session
 	}
-	// Only a still-neutral effective row is upgraded: a row that already names
-	// the concrete candidate (or a concrete candidate at all) is its own owner.
-	if sameVirtualReleaseIdentity(file.FilePath, candidateURI) {
+	// Only a genuinely neutral effective row is upgraded. A row that already
+	// names a concrete ?result= pick is its own owner (or a different concrete
+	// release); adopting another concrete row over it would silently swap the
+	// release the viewer is bound to.
+	if virtualResultCandidateID(file.FilePath) != "" {
+		return file, session
+	}
+	bindingReader, ok := sessionMgr.(interface {
+		VirtualSourceBinding(sessionID string) (playback.VirtualSourceBindingSnapshot, error)
+	})
+	if !ok {
+		return file, session
+	}
+	// Capture the full binding before the owner-row lookup: the lookup is an
+	// arbitrary catalog round trip, and a rotation that lands during it must make
+	// the CAS reject rather than bless a stale adoption.
+	binding, err := bindingReader.VirtualSourceBinding(session.ID)
+	if err != nil {
+		return file, session
+	}
+	if binding.EffectiveMediaFileID != file.ID || strings.TrimSpace(binding.VirtualURI) != candidateURI {
+		// The row we hold is not the session's bound effective row, or the
+		// binding already moved on from the candidate the caller named.
 		return file, session
 	}
 	owner, err := virtualPathOwnerRowFor(ctx, resolver, file, candidateURI, file.VirtualOwnerInstallationID, file.MediaFolderID)
@@ -5827,22 +5852,16 @@ func reanchorLateVirtualOwnerRow(ctx context.Context, resolver FilePathResolver,
 		return file, session
 	}
 	reanchorer, ok := sessionMgr.(interface {
-		ReanchorVirtualEffectiveRow(sessionID string, expectedGeneration uint64, expectedRowID, rowID int, evidenceURI string) (bool, error)
+		ReanchorVirtualEffectiveRow(sessionID string, expected playback.VirtualSourceBindingSnapshot, rowID int, evidenceURI string) (bool, error)
 	})
 	if !ok {
 		return file, session
 	}
-	genReader, ok := sessionMgr.(interface {
-		VirtualSourceGeneration(sessionID string) (uint64, error)
-	})
-	if !ok {
-		return file, session
-	}
-	gen, err := genReader.VirtualSourceGeneration(session.ID)
-	if err != nil {
-		return file, session
-	}
-	if _, err := reanchorer.ReanchorVirtualEffectiveRow(session.ID, gen, file.ID, owner.ID, candidateURI); err != nil {
+	applied, err := reanchorer.ReanchorVirtualEffectiveRow(session.ID, binding, owner.ID, candidateURI)
+	if err != nil || !applied {
+		// A rejected CAS (a rotation, a row-only move, or a pending probe
+		// lifecycle) means the session did not move: return the input file so a
+		// rejected adoption is never served as if it had landed.
 		return file, session
 	}
 	if refreshed, err := sessionMgr.GetSession(session.ID); err == nil && refreshed != nil {

@@ -2410,8 +2410,8 @@ func (m *SessionManager) SetEffectiveMediaFileID(sessionID string, fileID int) e
 
 // ReanchorVirtualEffectiveRow atomically points a live virtual session at the
 // concrete catalog row that owns its bound candidate and re-anchors its carried
-// track evidence to that row, but only while the binding generation still
-// matches and the effective row is still the one the caller observed.
+// track evidence to that row, but only while the full candidate binding still
+// matches the snapshot the caller captured before it resolved the owner row.
 //
 // It is the late-owner adoption for a first-ever auto start: the concrete
 // ?result= row did not exist when the plan resolved, so the session kept the
@@ -2422,11 +2422,27 @@ func (m *SessionManager) SetEffectiveMediaFileID(sessionID string, fileID int) e
 // rejected as a different candidate and the menus freeze. Moving both the
 // effective row and the evidence row id to the owner keeps the overlay applying.
 //
+// The expectation fences every binding dimension at once - generation, virtual
+// URI, owner installation, and effective row - through the same predicate the
+// verified-inventory CAS uses. A rotation that lands while the caller is
+// resolving the owner row bumps the generation, and a row-only move changes the
+// effective row; either makes the CAS reject rather than bless a stale adoption.
+//
+// The deferred-probe lifecycle must not be pending. A row-only move that lands
+// while a probe is outstanding would make that probe's full-binding propagation
+// CAS reject and strand the pending outcome until the convergence watchdog, with
+// no replacement probe owning it. Deferring the adoption until the lifecycle
+// reaches a terminal outcome keeps the probe's binding valid so its verified
+// inventory lands, and the adoption then applies on the next serve or inventory
+// bind. The probe is bounded, so the deferral is temporary by construction.
+//
 // The evidence URI is set to the bound candidate URI the caller resolved, so
-// the anchor names the exact row the session now serves. A zero expectedRowID
-// does not assert the current row; a rowID <= 0 or equal to the current row is a
-// no-op. An unknown session reports ErrSessionNotFound.
-func (m *SessionManager) ReanchorVirtualEffectiveRow(sessionID string, expectedGeneration uint64, expectedRowID, rowID int, evidenceURI string) (bool, error) {
+// the anchor names the exact row the session now serves. A zero field in
+// expected is not asserted (mirroring matchesVirtualBindingLocked), so a caller
+// that captured only a generation keeps the legacy behavior; a rowID <= 0 or
+// equal to the current row is a no-op. An unknown session reports
+// ErrSessionNotFound.
+func (m *SessionManager) ReanchorVirtualEffectiveRow(sessionID string, expected VirtualSourceBindingSnapshot, rowID int, evidenceURI string) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -2434,10 +2450,10 @@ func (m *SessionManager) ReanchorVirtualEffectiveRow(sessionID string, expectedG
 	if !ok {
 		return false, ErrSessionNotFound
 	}
-	if s.virtualSourceGeneration != expectedGeneration {
+	if !s.matchesVirtualBindingLocked(expected) {
 		return false, nil
 	}
-	if expectedRowID > 0 && s.MediaFileID != expectedRowID {
+	if s.VirtualProbeOutcome == VirtualProbeOutcomePending {
 		return false, nil
 	}
 	if rowID <= 0 || s.MediaFileID == rowID {
