@@ -2177,6 +2177,13 @@ func (h *PlaybackHandler) resolveRehydratedVirtualSourceWithAttemptV3(
 	opts virtualResolveOptionsV3,
 	record *playback.AttemptRecordV3,
 ) (resolvedVirtualPlaybackSource, error) {
+	// The session anchor file is the row the plan was built against, but the
+	// session can bind a concrete ?result= candidate whose own catalog row is
+	// the one carrying the durable identity. Capture that identity up front so
+	// the rotation-exclusion chain, the retry context and the same-release
+	// assertion below all judge the release the session is actually serving
+	// rather than an identity-less placeholder.
+	pinnedFile = h.enrichSessionBoundCandidateIdentity(r.Context(), pinnedFile)
 	chainIdentity := virtualRotationExclusionIdentity(pinnedFile)
 	excludedCandidateIDs = h.unionVirtualRotationExclusionsWithRecord(excludedCandidateIDs, pinnedFile, chainIdentity, record)
 	resolved, err := h.resolveVirtualPlaybackSource(r, pinnedFile, profileID, false, excludedCandidateIDs, preferredCandidateID, qualityPreference, bandwidthCapKbps, false, opts)
@@ -2194,7 +2201,10 @@ func (h *PlaybackHandler) resolveRehydratedVirtualSourceWithAttemptV3(
 	// renumbered same-release candidate rather than mistake it for a sibling.
 	// A row with no durable identity is unchanged and the assertion below then
 	// refuses any rotation it cannot prove is the same release, exactly as the
-	// transport anchor does.
+	// transport anchor does. The identity is captured from the row that owns the
+	// session's concrete candidate when the anchor row in hand is the
+	// provider-neutral placeholder, so the retry and the assertion below judge
+	// the same release the session is actually serving.
 	retryReq := r.WithContext(virtualResolveContextWithPersistedIdentity(r.Context(), pinnedFile))
 	rotated, rotateErr := h.resolveVirtualPlaybackSource(retryReq, pinnedFile, profileID, false, excludedCandidateIDs, preferredCandidateID, qualityPreference, bandwidthCapKbps, true, rotatedOpts)
 	if rotateErr != nil {
@@ -2394,6 +2404,18 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	}
 	if h.VirtualPlaybackResolver == nil {
 		return resolvedVirtualPlaybackSource{}, errors.New("virtual playback resolver is not configured")
+	}
+	// A pinned resolve (a session binding or an explicit version pick) must
+	// thread the durable identity of the candidate it is bound to, but the row
+	// in hand can be the provider-neutral placeholder the session was requested
+	// through while the session anchors a concrete ?result= candidate. Overlay
+	// that owning row's identity and stored URL so a provider re-list that
+	// renumbers the same release is re-matched instead of refused as an
+	// identity-less dead pin. Only pinned resolves opt in, mirroring the
+	// identity threading on the resolver call below; an auto selection is left
+	// untouched and keeps its fallback.
+	if options.sessionBound || options.explicitSelection {
+		file = h.enrichSessionBoundCandidateIdentity(r.Context(), file)
 	}
 	// A recovery bypass re-lists the provider past its failure floor. Bound it
 	// with the same per-provider damper the stale fallback uses, so repeated
@@ -3112,7 +3134,25 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			trace.fetchCalls += resolveCalls
 		}
 		if resolveErr != nil {
-			return nil, resolveErr
+			// The trusted-absent sentinel means the provider re-list dropped a
+			// candidate the viewer is still bound to. Recover the same release
+			// from the row's own validated stored URL before giving up; when no
+			// usable URL exists the resolve fails boundedly here, and the
+			// candidate loop never substitutes a sibling.
+			if errors.Is(resolveErr, virtuallibrary.ErrPersistedCandidateTrusted) {
+				if recovered, ok := h.recoverTrustedStoredVirtualURL(attemptCtx, file, requestedURI, oid); ok {
+					streamURL = recovered.URL
+					cand.RequestHeaders = cloneHeaderMap(recovered.RequestHeaders)
+					oid = effectiveVirtualOwner(recovered.OwnerID, oid)
+					slog.InfoContext(attemptCtx, "virtual playback: recovered a trusted pinless candidate from its stored URL",
+						"component", "api", "file_id", file.ID, "candidate_uri", requestedURI,
+						"candidate_id", probedCandidateID, "status", "recovered_stored_url")
+					resolveErr = nil
+				}
+			}
+			if resolveErr != nil {
+				return nil, resolveErr
+			}
 		}
 		// URL syntax and SSRF validation happen in the provider service and
 		// again when the relay opens the source. Do not perform a blocking body
