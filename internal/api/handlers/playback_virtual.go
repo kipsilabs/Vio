@@ -4458,6 +4458,40 @@ type VirtualFileMetadataDB interface {
 	QueryRow(ctx context.Context, sql string, arguments ...any) pgx.Row
 }
 
+// VirtualFileMetadataTxBeginner is the transaction surface a real database
+// exposes so the evidence write and the exact-pin refusal reconciliation commit
+// atomically. *pgxpool.Pool satisfies it; the in-memory and fake databases of
+// the unit tests deliberately do not, and fall back to the best-effort path.
+type VirtualFileMetadataTxBeginner interface {
+	Begin(ctx context.Context) (pgx.Tx, error)
+}
+
+// VirtualAdoptionRefusalTxStore is the transaction-aware refusal store: the
+// durable Postgres store records, clears and terminally stamps refusal state on
+// the caller's transaction, so the counter, the terminal verdict and the
+// evidence write they belong to all commit or roll back together. A store that
+// does not implement it keeps the previous best-effort path.
+type VirtualAdoptionRefusalTxStore interface {
+	// RecordVirtualAdoptionRefusalTx atomically increments the live consecutive
+	// count for one row and pinned path on the transaction and returns it.
+	RecordVirtualAdoptionRefusalTx(ctx context.Context, tx pgx.Tx, fileID int, expectedPath string, ttl time.Duration) (int, error)
+	// ClearVirtualAdoptionRefusalTx drops the exact-pin mark on the transaction
+	// after a write landed, so the clear commits with that write.
+	ClearVirtualAdoptionRefusalTx(ctx context.Context, tx pgx.Tx, fileID int, expectedPath string) error
+	// MarkVirtualAdoptionTerminalRefusalTx stamps the durable terminal verdict
+	// on the transaction, fenced on the candidate identity and the observed
+	// evidence revision. It reports whether the stamp landed.
+	MarkVirtualAdoptionTerminalRefusalTx(ctx context.Context, tx pgx.Tx, fileID int, expectedFilePath string, observedFailedAt *time.Time, observedUpdatedAt time.Time, observedProbeUpdatedAt *time.Time) (bool, error)
+}
+
+// VirtualAdoptionRefusalSweeper is the optional post-commit expiry sweep. The
+// non-transactional refusal record sweeps inline; the transactional path runs
+// this after the transaction commits so the sweep never holds a second pooled
+// connection while the transaction is open.
+type VirtualAdoptionRefusalSweeper interface {
+	SweepVirtualAdoptionRefusals(ctx context.Context) error
+}
+
 // virtualPersistAdoptionReplacesTransport reports whether a required adoption
 // moves the row to a different release, in which case the stored transport set
 // (resolved URL and expiry, durable identity tiers, request headers) must be
@@ -4552,23 +4586,53 @@ type VirtualFileMetadataUpdateResult struct {
 // QueryRow consumes the full result stream before Scan returns, so a terminal
 // database error cannot hide behind an already-read row.
 func ExecVirtualFileMetadataUpdateResult(ctx context.Context, db VirtualFileMetadataDB, args models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error) {
+	return execVirtualFileMetadataUpdateResult(ctx, db, args, virtualAdoptionRefusals)
+}
+
+// ExecVirtualFileMetadataUpdateResultWithRefusals is
+// ExecVirtualFileMetadataUpdateResult with an explicit durable refusal store, so
+// production wiring records the consecutive refusal through the cluster-wide
+// store instead of the in-memory fallback.
+func ExecVirtualFileMetadataUpdateResultWithRefusals(ctx context.Context, db VirtualFileMetadataDB, args models.VirtualFilePersistArgs, store VirtualAdoptionRefusalStore) (VirtualFileMetadataUpdateResult, error) {
+	return execVirtualFileMetadataUpdateResult(ctx, db, args, store)
+}
+
+// execVirtualFileMetadataUpdateResult is the shared implementation behind
+// ExecVirtualFileMetadataUpdateResult and its WithRefusals variant. store is the
+// refusal counter that records a refused required adoption and clears on
+// success; nil falls back to the in-memory store.
+func execVirtualFileMetadataUpdateResult(ctx context.Context, db VirtualFileMetadataDB, args models.VirtualFilePersistArgs, store VirtualAdoptionRefusalStore) (VirtualFileMetadataUpdateResult, error) {
 	if db == nil {
 		return VirtualFileMetadataUpdateResult{}, nil
 	}
+	// A real database and the durable refusal store together commit the
+	// evidence write and the exact-pin refusal reconciliation in one
+	// transaction. The in-memory fallback (tests, non-database deployments) has
+	// no cross-process window to close and stays on the best-effort path, as does
+	// a database that cannot begin a transaction.
+	if txDB, ok := db.(VirtualFileMetadataTxBeginner); ok {
+		if txStore, ok := store.(VirtualAdoptionRefusalTxStore); ok {
+			return execVirtualFileMetadataUpdateResultTx(ctx, txDB, txStore, args)
+		}
+	}
+	return execVirtualFileMetadataUpdateResultUntx(ctx, db, args, store)
+}
+
+// virtualMetadataStatement holds the precomputed argument pieces the saver
+// shares between its transactional and non-transactional paths, so both run the
+// identical VirtualFileMetadataUpdateSQL with identical fences.
+type virtualMetadataStatement struct {
+	videoJSON                  string
+	audioJSON                  string
+	subtitleJSON               string
+	providerRequestHeadersJSON any
+	fenceVerdict               bool
+}
+
+func newVirtualMetadataStatement(args models.VirtualFilePersistArgs) (virtualMetadataStatement, error) {
 	vStr := string(args.VideoTracks)
 	if vStr == "" || vStr == jsonNullLiteral {
 		vStr = "[]"
-	}
-	// A nil/empty header map is passed as nil so the SQL COALESCE preserves the
-	// stored set; serializeJSONB would do the same, but marshal here so the
-	// argument shape stays a single jsonb placeholder.
-	var providerRequestHeadersJSON any
-	if len(args.ProviderRequestHeaders) > 0 {
-		encoded, marshalErr := json.Marshal(args.ProviderRequestHeaders)
-		if marshalErr != nil {
-			return VirtualFileMetadataUpdateResult{}, fmt.Errorf("marshal provider request headers: %w", marshalErr)
-		}
-		providerRequestHeadersJSON = encoded
 	}
 	aStr := string(args.AudioTracks)
 	if aStr == "" || aStr == jsonNullLiteral {
@@ -4578,51 +4642,82 @@ func ExecVirtualFileMetadataUpdateResult(ctx context.Context, db VirtualFileMeta
 	if sStr == "" || sStr == jsonNullLiteral {
 		sStr = "[]"
 	}
-	verdictMaxAgeSeconds := virtualFailedVerdictMaxAge.Seconds()
-	// The verdict fence is only meaningful where the caller needs a confirmed
-	// adoption (RequireAdopt) and has not asked for an explicit retry.
-	fenceVerdict := args.RequireAdopt && !args.AllowFailedVerdict
-	exec := func(adoptPath string) (string, error) {
-		neutralPath := ""
-		if adoptPath != "" {
-			neutralPath = virtualPlaybackNeutralKey(adoptPath)
+	// A nil/empty header map is passed as nil so the SQL COALESCE preserves the
+	// stored set; serializeJSONB would do the same, but marshal here so the
+	// argument shape stays a single jsonb placeholder.
+	var providerRequestHeadersJSON any
+	if len(args.ProviderRequestHeaders) > 0 {
+		encoded, marshalErr := json.Marshal(args.ProviderRequestHeaders)
+		if marshalErr != nil {
+			return virtualMetadataStatement{}, fmt.Errorf("marshal provider request headers: %w", marshalErr)
 		}
-		// The atomic guard only applies when the caller needs a confirmed
-		// adoption; the metadata-only retry clears adoptPath and therefore
-		// writes evidence on the row's current path as before.
-		requireAdoption := args.RequireAdopt && adoptPath != ""
-		// A required adoption of a different release replaces the stored
-		// transport fields as a set ($30): an omitted identity tier, URL or
-		// header set belongs to the release the row is leaving and must not
-		// survive under the new path. The release test is the durable identity,
-		// not the item-level neutral key: the ordinary replacement
-		// virtual://movie/tt100?result=a -> ?result=b shares a neutral key, so a
-		// key comparison would preserve A's fields under B. A metadata-only
-		// retry (adoptPath cleared) and a proven same-release adoption keep the
-		// preserve-on-omission behavior.
-		replaceIdentity := requireAdoption && virtualPersistAdoptionReplacesTransport(args, adoptPath)
-		var persistedPath string
-		err := db.QueryRow(ctx, VirtualFileMetadataUpdateSQL,
-			vStr, aStr, sStr, args.Resolution, args.CodecVideo, args.CodecAudio, args.Container, args.HDR, args.Bitrate, args.Duration,
-			args.FileID, args.ExpectedFilePath, args.StampProbe,
-			args.UpdatedAt, args.ProbeUpdatedAt, args.OwnerID, args.LibraryID, adoptPath,
-			neutralPath, verdictMaxAgeSeconds, fenceVerdict, requireAdoption,
-			args.ResolvedURL, args.ResolvedURLExpiresAt,
-			args.ProviderVideoHash, args.ProviderGUID, args.ProviderReleaseName, args.ProviderReleaseSize,
-			providerRequestHeadersJSON, replaceIdentity, args.ClearProbe,
-			args.ReconcileCollectionVariant,
-		).Scan(&persistedPath)
-		if errors.Is(err, pgx.ErrNoRows) {
-			// No row matched the CAS fence: a stale snapshot, reported as a
-			// zero-row miss by the caller.
-			return "", nil
-		}
-		if err != nil {
-			return "", err
-		}
-		return persistedPath, nil
+		providerRequestHeadersJSON = encoded
 	}
-	persistedPath, err := exec(args.AdoptPath)
+	return virtualMetadataStatement{
+		videoJSON:                  vStr,
+		audioJSON:                  aStr,
+		subtitleJSON:               sStr,
+		providerRequestHeadersJSON: providerRequestHeadersJSON,
+		// The verdict fence is only meaningful where the caller needs a
+		// confirmed adoption (RequireAdopt) and has not asked for an explicit
+		// retry.
+		fenceVerdict: args.RequireAdopt && !args.AllowFailedVerdict,
+	}, nil
+}
+
+// run executes VirtualFileMetadataUpdateSQL for one attempt against db, which is
+// a pool or an open transaction. adoptPath is the path this attempt nominates
+// (empty on the metadata-only retry). A pgx.ErrNoRows is reported as an empty
+// persisted path (a CAS/fence miss); any other error is returned unchanged.
+func (s virtualMetadataStatement) run(ctx context.Context, db VirtualFileMetadataDB, args models.VirtualFilePersistArgs, adoptPath string) (string, error) {
+	neutralPath := ""
+	if adoptPath != "" {
+		neutralPath = virtualPlaybackNeutralKey(adoptPath)
+	}
+	// The atomic guard only applies when the caller needs a confirmed adoption;
+	// the metadata-only retry clears adoptPath and therefore writes evidence on
+	// the row's current path as before.
+	requireAdoption := args.RequireAdopt && adoptPath != ""
+	// A required adoption of a different release replaces the stored transport
+	// fields as a set ($30): an omitted identity tier, URL or header set belongs
+	// to the release the row is leaving and must not survive under the new path.
+	// The release test is the durable identity, not the item-level neutral key:
+	// the ordinary replacement virtual://movie/tt100?result=a -> ?result=b shares
+	// a neutral key, so a key comparison would preserve A's fields under B. A
+	// metadata-only retry (adoptPath cleared) and a proven same-release adoption
+	// keep the preserve-on-omission behavior.
+	replaceIdentity := requireAdoption && virtualPersistAdoptionReplacesTransport(args, adoptPath)
+	var persistedPath string
+	err := db.QueryRow(ctx, VirtualFileMetadataUpdateSQL,
+		s.videoJSON, s.audioJSON, s.subtitleJSON, args.Resolution, args.CodecVideo, args.CodecAudio, args.Container, args.HDR, args.Bitrate, args.Duration,
+		args.FileID, args.ExpectedFilePath, args.StampProbe,
+		args.UpdatedAt, args.ProbeUpdatedAt, args.OwnerID, args.LibraryID, adoptPath,
+		neutralPath, virtualFailedVerdictMaxAge.Seconds(), s.fenceVerdict, requireAdoption,
+		args.ResolvedURL, args.ResolvedURLExpiresAt,
+		args.ProviderVideoHash, args.ProviderGUID, args.ProviderReleaseName, args.ProviderReleaseSize,
+		s.providerRequestHeadersJSON, replaceIdentity, args.ClearProbe,
+		args.ReconcileCollectionVariant,
+	).Scan(&persistedPath)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// No row matched the CAS fence: a stale snapshot, reported as a
+		// zero-row miss by the caller.
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return persistedPath, nil
+}
+
+// execVirtualFileMetadataUpdateResultUntx is the best-effort saver used when no
+// transaction is available. The exact-pin clear is a separate post-write call;
+// see execVirtualFileMetadataUpdateResultTx for the atomic production path.
+func execVirtualFileMetadataUpdateResultUntx(ctx context.Context, db VirtualFileMetadataDB, args models.VirtualFilePersistArgs, store VirtualAdoptionRefusalStore) (VirtualFileMetadataUpdateResult, error) {
+	statement, err := newVirtualMetadataStatement(args)
+	if err != nil {
+		return VirtualFileMetadataUpdateResult{}, err
+	}
+	persistedPath, err := statement.run(ctx, db, args, args.AdoptPath)
 	if err == nil {
 		if persistedPath == "" {
 			if args.RequireAdopt && args.AdoptPath != "" {
@@ -4637,10 +4732,13 @@ func ExecVirtualFileMetadataUpdateResult(ctx context.Context, db VirtualFileMeta
 				if reason == "" {
 					reason = virtualProbeRefusalUnclassified
 				}
+				refusals := recordAdoptionRefusalStore(ctx, store, args.FileID, args.ExpectedFilePath)
 				slog.WarnContext(ctx, "virtual probe evidence persist refused: required identity adoption matched no row",
 					"component", "api", "file_id", args.FileID, "adopt_path", args.AdoptPath,
 					"expected_path", args.ExpectedFilePath,
-					"reason", reason)
+					virtualEvidenceLogKeyReason, reason, "consecutive_refusals", refusals,
+					"refusal_bound", virtualAdoptionRefusalBound,
+					"bound_reached", refusals >= virtualAdoptionRefusalBound)
 				return VirtualFileMetadataUpdateResult{}, fmt.Errorf("%w: candidate %s was not adopted", errVirtualAdoptIdentityNotPersisted, args.AdoptPath)
 			}
 			return VirtualFileMetadataUpdateResult{}, nil
@@ -4651,6 +4749,9 @@ func ExecVirtualFileMetadataUpdateResult(ctx context.Context, db VirtualFileMeta
 			// substitute the catalog row does not own.
 			return VirtualFileMetadataUpdateResult{}, fmt.Errorf("%w: candidate %s persisted as %q", errVirtualAdoptIdentityNotPersisted, args.AdoptPath, persistedPath)
 		}
+		// The write landed. Any consecutive-refusal count for this row and pin is
+		// stale: the row now carries evidence, so the bound resets.
+		clearAdoptionRefusalStore(ctx, store, args.FileID, args.ExpectedFilePath)
 		return VirtualFileMetadataUpdateResult{
 			RowsAffected:    1,
 			MetadataUpdated: true,
@@ -4674,7 +4775,7 @@ func ExecVirtualFileMetadataUpdateResult(ctx context.Context, db VirtualFileMeta
 	// The retry deliberately retains evidence on the current row, but it did
 	// not adopt the requested identity. Callers must not treat this as an
 	// adoption success (metadata-only retries are not identity proof).
-	retryPath, retryErr := exec("")
+	retryPath, retryErr := statement.run(ctx, db, args, "")
 	if retryErr != nil {
 		return VirtualFileMetadataUpdateResult{}, retryErr
 	}
@@ -4682,6 +4783,13 @@ func ExecVirtualFileMetadataUpdateResult(ctx context.Context, db VirtualFileMeta
 		// The metadata-only retry also missed the CAS fence.
 		return VirtualFileMetadataUpdateResult{}, nil
 	}
+	// The retry wrote fresh evidence on the current row (it deliberately did not
+	// adopt the requested identity). The row now carries evidence, so any
+	// consecutive-refusal count for this row and pin is stale and must be
+	// cleared exactly as the ordinary success path does; otherwise a later
+	// unrelated refusal would inherit the pre-success count and reach the
+	// terminal threshold prematurely.
+	clearAdoptionRefusalStore(ctx, store, args.FileID, args.ExpectedFilePath)
 	return VirtualFileMetadataUpdateResult{
 		RowsAffected:    1,
 		MetadataUpdated: true,
@@ -4691,7 +4799,16 @@ func ExecVirtualFileMetadataUpdateResult(ctx context.Context, db VirtualFileMeta
 
 // ExecVirtualFileMetadataUpdate preserves the historical row-count contract.
 func ExecVirtualFileMetadataUpdate(ctx context.Context, db VirtualFileMetadataDB, args models.VirtualFilePersistArgs) (int64, error) {
-	result, err := ExecVirtualFileMetadataUpdateResult(ctx, db, args)
+	return execVirtualFileMetadataUpdateRows(ExecVirtualFileMetadataUpdateResult(ctx, db, args))
+}
+
+// ExecVirtualFileMetadataUpdateWithRefusals is ExecVirtualFileMetadataUpdate
+// with an explicit durable refusal store.
+func ExecVirtualFileMetadataUpdateWithRefusals(ctx context.Context, db VirtualFileMetadataDB, args models.VirtualFilePersistArgs, store VirtualAdoptionRefusalStore) (int64, error) {
+	return execVirtualFileMetadataUpdateRows(ExecVirtualFileMetadataUpdateResultWithRefusals(ctx, db, args, store))
+}
+
+func execVirtualFileMetadataUpdateRows(result VirtualFileMetadataUpdateResult, err error) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
@@ -4845,22 +4962,47 @@ func (h *PlaybackHandler) virtualProbeEvidenceArgs(ctx context.Context, catalogF
 // The owner question goes through virtualPathOwnerRow and nothing else: the
 // guard asserts ContentID, EpisodeID, owner installation, library and the exact
 // concrete path, and fails closed on a lookup error or an incomplete row. A
-// guard error, or a refusal to name an owner for a path a sibling actually
-// holds, keeps the previous behavior: the write is refused (or classified and
-// left to the SQL fence) rather than adopting bytes whose owner is unknown. The
-// refusal is logged with the concrete cause, never a lumped bucket.
+// lookup error is an infrastructure failure, not an identity verdict: it backs
+// the ownership question off for a short window and never advances the
+// adoption-refusal bound, so a database outage cannot condemn healthy content.
+// A refusal to name an owner for a path a sibling actually holds keeps the
+// previous behavior: the write is refused (or classified and left to the SQL
+// fence) rather than adopting bytes whose owner is unknown. Every refusal is
+// logged with the concrete cause, never a lumped bucket.
 func (h *PlaybackHandler) virtualProbeEvidenceRotateTarget(ctx context.Context, catalogFile *models.MediaFile, resolvedPath string, probed *models.MediaFile, candidate resolver.PersistedIdentityTiers) (*models.MediaFile, *models.MediaFile, bool) {
 	if virtualProbeEvidenceSharesRowRelease(catalogFile, resolvedPath, candidate) {
 		return catalogFile, probed, true
 	}
+	backoffKey := virtualOwnerLookupBackoffKey(catalogFile.ID, resolvedPath)
+	if virtualOwnerLookups.recent(backoffKey) {
+		// A previous ownership lookup failed and its short backoff is still
+		// active: skip re-asking a failing store on every probe. The write stays
+		// fenced and the live session is served in memory. The window lapses on
+		// its own and a later successful lookup clears it, so nothing here is
+		// durable and nothing condemns the row.
+		slog.DebugContext(ctx, "virtual probe evidence: path ownership lookup is backing off after a store failure",
+			"component", "api", "file_id", catalogFile.ID, "candidate_uri", resolvedPath)
+		h.publishRefusedProbeInventory(ctx, catalogFile.ID, resolvedPath, probed)
+		return nil, nil, false
+	}
 	ownerRow, ownerErr := h.virtualPathOwnerRow(ctx, catalogFile, resolvedPath, catalogFile.VirtualOwnerInstallationID, catalogFile.MediaFolderID)
 	if ownerErr != nil {
 		// An unanswered ownership question is not safe absence: fail closed
-		// rather than adopt or stamp bytes whose owner is unknown.
-		slog.WarnContext(ctx, "virtual probe evidence refused: candidate path ownership is unknown",
+		// rather than adopt or stamp bytes whose owner is unknown. But the store
+		// could not answer, which is an infrastructure failure, not an identity
+		// verdict: it must never advance the adoption-refusal bound or install
+		// the durable terminal failed_at verdict, or a database outage would
+		// suppress healthy content. Back the ownership question off for a short
+		// window and serve the live session in memory; the next probe after the
+		// window re-asks.
+		virtualOwnerLookups.mark(backoffKey)
+		slog.WarnContext(ctx, "virtual probe evidence refused: candidate path ownership lookup failed; backing off without counting",
 			"component", "api", "file_id", catalogFile.ID, "candidate_uri", resolvedPath,
 			"row_path", catalogFile.FilePath, "probe_source", catalogFile.ProbeSource,
-			"reason", virtualProbeRefusalOwnerLookupFailed, "error", ownerErr)
+			virtualEvidenceLogKeyReason, virtualProbeRefusalOwnerLookupFailed,
+			virtualEvidenceLogKeyError, ownerErr,
+			"backoff_seconds", virtualOwnerLookups.window().Seconds(),
+			"terminal", false)
 		// The catalog write is correctly blocked, but the live session must not
 		// stay stale: serve the probed tracks in memory to sessions bound to
 		// this row's exact candidate. The publish is best-effort and writes
@@ -4868,20 +5010,37 @@ func (h *PlaybackHandler) virtualProbeEvidenceRotateTarget(ctx context.Context, 
 		h.publishRefusedProbeInventory(ctx, catalogFile.ID, resolvedPath, probed)
 		return nil, nil, false
 	}
+	// The lookup answered: any prior backoff for this row and candidate path is
+	// stale.
+	virtualOwnerLookups.clear(backoffKey)
 	if ownerRow != nil && ownerRow.ID != catalogFile.ID {
 		if virtualSiblingOwnerSharesRelease(catalogFile, ownerRow) {
 			// Duplicate catalog rows for one release share candidate URIs and
 			// neutral keys. Rotating here would overlay the requested row's
 			// probed inventory onto its duplicate sibling (and, on the reverse
 			// probe, the sibling's onto the requested row): exactly the silent
-			// cross-row contamination this guard exists to stop. Refuse the
-			// write outright — a metadata write on the requested row would be
-			// refused by the SQL sibling fence anyway — and serve the probed
-			// tracks in memory only to sessions bound to the requested row id,
-			// so the playing menu stays live while no sibling row is repainted.
+			// cross-row contamination this guard exists to stop. The refusal is
+			// safe, but it is also unbounded: a duplicate row whose pin never
+			// adopts keeps serving provisional evidence forever. Count it under
+			// the media_files row lock (with the durable store), and after the
+			// bound rotate the evidence onto the owning row anyway — both rows
+			// provably carry the same release, so the probed bytes are that
+			// release's bytes and no foreign inventory crosses rows. Taking the
+			// row lock first keeps this increment serialized with the evidence
+			// writes and clears on the same row instead of racing them.
+			refusals := h.adoptionRefusalStoreCount(ctx, catalogFile.ID, catalogFile.FilePath)
+			if refusals >= virtualAdoptionRefusalBound {
+				rotated := rotateVirtualSourceToOwnerRow(probed, ownerRow, resolvedPath)
+				slog.InfoContext(ctx, "virtual probe evidence rotation to same-release owner row after bounded refusals",
+					"component", "api", "requested_file_id", catalogFile.ID, "owner_file_id", ownerRow.ID,
+					"candidate_uri", resolvedPath, "consecutive_refusals", refusals,
+					virtualEvidenceLogKeyReason, "sibling_owner_same_release_bound_rotation")
+				return rotated, rotated, true
+			}
 			slog.WarnContext(ctx, "virtual probe evidence rotation refused: sibling owner row is a duplicate of the same release",
 				"component", "api", "requested_file_id", catalogFile.ID, "owner_file_id", ownerRow.ID,
-				"candidate_uri", resolvedPath, "reason", "sibling_owner_same_release")
+				"candidate_uri", resolvedPath, virtualEvidenceLogKeyReason, "sibling_owner_same_release",
+				"consecutive_refusals", refusals, "refusal_bound", virtualAdoptionRefusalBound)
 			h.publishRefusedProbeInventory(ctx, catalogFile.ID, resolvedPath, probed)
 			return nil, nil, false
 		}
@@ -5044,6 +5203,11 @@ func (h *PlaybackHandler) virtualProbeEvidenceArgsForRow(ctx context.Context, ca
 	}
 	if crossRelease {
 		args.RefusalReason = h.virtualProbeEvidenceRefusalReason(ctx, catalogFile, resolvedPath)
+		// The terminal decision is deliberately NOT made here. The refusal
+		// reconciliation owns it: the saver records the increment and installs
+		// the terminal from the live count, under the row lock and fenced on the
+		// observed evidence revision (see txVirtualAdoptionRefusal). A count read
+		// out here would race the evidence writes and clears that invalidate it.
 	}
 	return args, true
 }
