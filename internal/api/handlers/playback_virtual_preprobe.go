@@ -577,15 +577,17 @@ func (h *PlaybackHandler) runDeferredVirtualProbe(deferred *virtualDeferredProbe
 	// re-checks its map on its own signal and backstop ticker.
 	gate.release()
 	// The durable write committed verified evidence on committed.fileID; run the
-	// shared cold-start default-audio reconciliation against that owner row (a
-	// rotation can move it off deferred.file), with the gate released so its own
-	// catalog/session sweep is not charged to this worker's slot. It runs BEFORE
-	// the overlay is updated so it compares the plan-time selection against the
-	// verified inventory, exactly as the direct and queued evidence paths do.
-	// The probe's binding fence already refuses a superseded verdict, and the
-	// reconcile sweep re-checks the committed row before issuing any correction.
+	// shared cold-start default-audio reconciliation against the exact inventory
+	// that write produced — never a reread of the mutable row — with the gate
+	// released so its own catalog/session sweep is not charged to this worker's
+	// slot. It runs BEFORE the overlay is updated so it compares the plan-time
+	// selection against the verified inventory, exactly as the direct and queued
+	// evidence paths do. The probe's binding fence already refuses a superseded
+	// verdict, and the committed carrier is the record of what was written, so an
+	// in-place adoption between the write and this reconcile cannot substitute
+	// another release's tracks into the decision.
 	if outcome == probeOutcomeVerified && committed.committed() {
-		h.reconcileVerifiedDefaultAudio(context.Background(), committed.fileID)
+		h.reconcileVerifiedDefaultAudioFromCommitted(context.Background(), committed)
 	}
 	switch outcome {
 	case probeOutcomeVerified:

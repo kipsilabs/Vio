@@ -346,6 +346,141 @@ func TestDeferredProbePropagationRowIDMutationBetweenFenceAndCommitFenced(t *tes
 	}
 }
 
+// TestDeferredProbeExplicitSelectionPreservedAcrossOverlaySwap is the explicit
+// viewer-selection case: a reorder must not move the viewer's chosen track, the
+// remux selector must keep naming its stream, and the reconcile must record a
+// no-op rather than override the explicit choice.
+func TestDeferredProbeExplicitSelectionPreservedAcrossOverlaySwap(t *testing.T) {
+	const fileID = 5272911
+	candidateURI := "virtual://movie/tt-explicit-overlay?result=cand-1"
+	planTime := []models.AudioTrack{
+		{Index: 1, Language: "en", Codec: "aac", Channels: 2, Layout: "stereo"},
+		{Index: 5, Language: "de", Codec: "eac3", Channels: 6, Layout: "5.1"},
+		{Index: 3, Language: "pt", Codec: "eac3", Channels: 6, Layout: "5.1"},
+	}
+	// The verified list reorders de from position 1 to position 0.
+	verified := []models.AudioTrack{
+		{Index: 5, Language: "de", Codec: "eac3", Channels: 6, Layout: "5.1"},
+		{Index: 1, Language: "en", Codec: "aac", Channels: 2, Layout: "stereo"},
+		{Index: 3, Language: "pt", Codec: "eac3", Channels: 6, Layout: "5.1"},
+	}
+	const explicitIndex = 1 // de in planTime
+	deSignature := playback.AudioTrackSignatureFromTrack(planTime[explicitIndex])
+
+	source := &models.MediaFile{
+		ID: fileID, ContentID: "movie-explicit-overlay", FilePath: candidateURI, Container: "virtual",
+		CodecVideo: "h264", Resolution: "1080p", Duration: 3600, VirtualOwnerInstallationID: 5,
+		VideoTracks: []models.VideoTrack{{Codec: "h264", Width: 1920, Height: 1080, BitDepth: 8}},
+		AudioTracks: planTime,
+	}
+	manager := playback.NewSessionManager(0, 0)
+	session, err := manager.StartSession(1, "profile-1", fileID, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	if err := manager.SetVirtualSource(session.ID, candidateURI, 5); err != nil {
+		t.Fatalf("SetVirtualSource: %v", err)
+	}
+	if err := manager.UpdateStreamState(session.ID, playback.SessionStreamState{
+		AudioTrackIndex:               explicitIndex,
+		VirtualSourceURI:              candidateURI,
+		VirtualSourceSet:              true,
+		VirtualSubtitleEvidenceSet:    true,
+		VirtualAudioTracks:            planTime,
+		VirtualSubtitleEvidenceURI:    candidateURI,
+		VirtualSubtitleEvidenceFileID: fileID,
+		SelectionOriginSet:            true,
+		SelectionOrigin:               SelectionOriginExplicit,
+		SelectedAudioSignature:        deSignature,
+	}); err != nil {
+		t.Fatalf("UpdateStreamState: %v", err)
+	}
+	resolver := &syncPlaybackFileResolver{file: *source}
+	handler := NewPlaybackHandler(manager, resolver)
+	handler.RealtimeHub = playback.NewRealtimeHub()
+	handler.InstallationID = "test-install"
+	serviceCtx, serviceCancel := context.WithCancel(context.Background())
+	handler.ServiceContext = serviceCtx
+	t.Cleanup(serviceCancel)
+
+	probedAt := time.Now().UTC()
+	handler.VirtualPlaybackSourceProber = func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
+		f.AudioTracks = verified
+		f.CodecAudio = "eac3"
+		return f, nil
+	}
+	handler.VirtualFileMetadataSaver = func(_ context.Context, args models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error) {
+		var audio []models.AudioTrack
+		if err := json.Unmarshal(args.AudioTracks, &audio); err != nil {
+			return VirtualFileMetadataUpdateResult{}, err
+		}
+		resolver.update(func(f *models.MediaFile) {
+			f.AudioTracks = audio
+			f.CodecAudio = args.CodecAudio
+			f.ProbeUpdatedAt = &probedAt
+		})
+		return VirtualFileMetadataUpdateResult{MetadataUpdated: true, RowsAffected: 1}, nil
+	}
+	record := playback.AttemptRecordV3{
+		PlaybackAttemptID:      "attempt-explicit-overlay",
+		SessionID:              session.ID,
+		UserID:                 1,
+		ProfileID:              "profile-1",
+		RequestedMediaFileID:   fileID,
+		EffectiveMediaFileID:   fileID,
+		ExpiresAt:              time.Now().Add(time.Hour),
+		CurrentPlanID:          "plan-explicit-overlay",
+		SelectionOrigin:        SelectionOriginExplicit,
+		SelectedAudioSignature: deSignature,
+		NormalizedRequest: playback.StartRequestV3{
+			ClientFeatures: []string{playback.FeaturePlanInvalidatedV3, playback.FeatureDefaultAudioReconcileResponseV3},
+			Capabilities:   reconcileCapabilities(),
+		},
+	}
+	record.CurrentPlan.SelectedTracks.Audio = &playback.TrackIdentityV3{
+		ID:    playback.TrackIDV3(fileID, "audio", explicitIndex),
+		Index: intPtrReconcile(explicitIndex),
+	}
+	record.CurrentPlan.PlanAttemptKey = "v3:plan-explicit-overlay:a:b"
+	if err := handler.PlanStoreV3.SaveAttempt(context.Background(), record); err != nil {
+		t.Fatalf("SaveAttempt: %v", err)
+	}
+
+	deferred := readmitDeferredProbe(t, handler, deferredOverflowProbe(session, candidateURI))
+	handler.runDeferredVirtualProbe(deferred)
+
+	live, err := manager.GetSession(session.ID)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if live.AudioTrackIndex < 0 || live.AudioTrackIndex >= len(live.VirtualAudioTracks) {
+		t.Fatalf("session audio index %d out of range for verified %+v", live.AudioTrackIndex, live.VirtualAudioTracks)
+	}
+	if got := live.VirtualAudioTracks[live.AudioTrackIndex].Language; got != "de" {
+		t.Fatalf("session audio index now names %q, want the explicit de track; verified = %+v", got, live.VirtualAudioTracks)
+	}
+	// The running mux's stream ordinal is unchanged: de keeps 0:a:2.
+	planBound := &models.MediaFile{AudioTracks: planTime}
+	_, committedOrdinal := transportOrdinalForTrack(t, planBound, "de")
+	boundRow, err := resolver.GetByID(context.Background(), live.MediaFileID)
+	if err != nil || boundRow == nil {
+		t.Fatalf("GetByID(bound): %v", err)
+	}
+	bound := bindSessionVirtualSourceWithTracks(context.Background(), boundRow, live, resolver)
+	if got := audioStreamOrdinalV3(bound, live.AudioTrackIndex); got != committedOrdinal {
+		t.Fatalf("explicit selection moved the remux stream to 0:a:%d, want 0:a:%d", got, committedOrdinal)
+	}
+	after, err := handler.PlanStoreV3.GetAttempt(context.Background(), session.ID)
+	if err != nil {
+		t.Fatalf("GetAttempt: %v", err)
+	}
+	generation := reconcileGenerationV3(&models.MediaFile{AudioTracks: verified})
+	entry := playback.FindAudioReconcileEntry(after.AudioReconcileLedger, generation, session.ID)
+	if entry != nil && entry.Decision == playback.AudioReconcileInvalidated {
+		t.Fatalf("reconcile overrode an explicit selection that survived the reorder: %#v", entry)
+	}
+}
+
 // transportOrdinalForTrack is the audio-only stream ordinal a bound list assigns
 // to a chosen language's first track, mirroring what the transport hands ffmpeg
 // as 0:a:N.
@@ -512,13 +647,18 @@ func TestDeferredProbeOverlayTransportOrdinalCoherentAfterReorderAndRemoval(t *t
 			if err != nil {
 				t.Fatalf("GetSession: %v", err)
 			}
-			// The overlay write carries the verified list and does not renumber
-			// the committed selection.
+			// The overlay write carries the verified list and preserves the
+			// selected track's identity: the session's index must name the same
+			// committed track (pt) in the NEW list, so the transport's derived
+			// 0:a:N still names the committed stream.
 			if len(live.VirtualAudioTracks) != len(tc.verified) {
 				t.Fatalf("carried audio = %+v, want the verified list", live.VirtualAudioTracks)
 			}
-			if live.AudioTrackIndex != tc.committed {
-				t.Fatalf("overlay write renumbered the committed selection from %d to %d", tc.committed, live.AudioTrackIndex)
+			if live.AudioTrackIndex < 0 || live.AudioTrackIndex >= len(live.VirtualAudioTracks) {
+				t.Fatalf("session audio index %d out of range for verified %+v", live.AudioTrackIndex, live.VirtualAudioTracks)
+			}
+			if got := live.VirtualAudioTracks[live.AudioTrackIndex].Language; got != "pt" {
+				t.Fatalf("session audio index now names %q, want the committed pt track; verified = %+v", got, live.VirtualAudioTracks)
 			}
 			boundRow, err := resolver.GetByID(context.Background(), live.MediaFileID)
 			if err != nil || boundRow == nil {
@@ -529,15 +669,25 @@ func TestDeferredProbeOverlayTransportOrdinalCoherentAfterReorderAndRemoval(t *t
 				t.Fatalf("serve bind audio = %+v, want the verified overlay", bound.AudioTracks)
 			}
 
+			// The real remux selector: production hands ffmpeg
+			// audioStreamOrdinalV3(file, session.AudioTrackIndex). After the
+			// swap it must still name the committed pt stream; a removal that
+			// shifts its ordinal is the reconciliation's correction, handled
+			// below.
 			planBound := &models.MediaFile{AudioTracks: tc.planTime}
 			_, committedOrdinal := transportOrdinalForTrack(t, planBound, "pt")
 			_, verifiedOrdinal := transportOrdinalForTrack(t, bound, "pt")
+			if got := audioStreamOrdinalV3(bound, live.AudioTrackIndex); got != verifiedOrdinal {
+				t.Fatalf("remux selects 0:a:%d after the overlay swap, want the committed pt stream 0:a:%d", got, verifiedOrdinal)
+			}
 
 			after, err := handler.PlanStoreV3.GetAttempt(context.Background(), session.ID)
 			if err != nil {
 				t.Fatalf("GetAttempt: %v", err)
 			}
-			generation := reconcileGenerationV3(&models.MediaFile{ProbeUpdatedAt: &probedAt})
+			// The deferred reconcile now decides against the exact committed
+			// carrier, so its generation is the committed inventory's fingerprint.
+			generation := reconcileGenerationV3(&models.MediaFile{AudioTracks: tc.verified})
 			entry := playback.FindAudioReconcileEntry(after.AudioReconcileLedger, generation, session.ID)
 
 			if !tc.wantInvalidated {

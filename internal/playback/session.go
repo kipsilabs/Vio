@@ -1858,6 +1858,15 @@ func (m *SessionManager) SetVirtualProbeVerifiedInventoryIfBinding(sessionID str
 	if !s.matchesVirtualBindingLocked(expected) {
 		return false, nil
 	}
+	// Preserve the selected track's identity across the overlay swap before the
+	// list is replaced. The transport derives its audio-only ordinal from the
+	// selected track's position in this list (audioStreamOrdinalV3), so leaving
+	// the array position untouched when the verified list reorders it would point
+	// the next remux at a different stream. Remapping to the same track keeps the
+	// derived ordinal naming the stream the running mux was started against.
+	if remapped := remapAudioSelectionIndex(s.VirtualAudioTracks, s.AudioTrackIndex, audio); remapped >= 0 {
+		s.AudioTrackIndex = remapped
+	}
 	s.VirtualAudioTracks = audio
 	s.VirtualSubtitleTracks = subtitles
 	s.VirtualExternalSubtitles = external
