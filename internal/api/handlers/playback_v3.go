@@ -8596,7 +8596,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 					// offline pin surfaces as source_unavailable through the
 					// existing rotation semantics instead of planning against a
 					// stub. The release is never swapped silently.
-					(sessionProvenanceMatchesPinnedRowV3(session, currentEffectiveFile) &&
+					(sessionProvenanceMatchesPinnedRowV3(r.Context(), session, currentEffectiveFile, h.fileResolver) &&
 						(session.VirtualSubtitleEvidenceSet ||
 							virtualPinnedProfileRowV3(session, currentEffectiveFile))))
 			if candidateUnchanged && evidenceComplete && !virtualDecodeRotation {
@@ -11384,13 +11384,13 @@ func sessionHasVirtualProvenanceV3(session *playback.Session) bool {
 // Legacy exceptions mirror virtualEvidenceMatchesBoundFile: a session that
 // predates the evidence URI still matches on its virtual source URI (the pin),
 // and a session with no known evidence row id falls back to URI-only matching.
-func sessionProvenanceMatchesPinnedRowV3(session *playback.Session, row *models.MediaFile) bool {
+func sessionProvenanceMatchesPinnedRowV3(ctx context.Context, session *playback.Session, row *models.MediaFile, fileResolver FilePathResolver) bool {
 	if !sessionHasVirtualProvenanceV3(session) || row == nil {
 		return false
 	}
 	bound := *row
 	bound.FilePath = session.VirtualSourceURI
-	return virtualEvidenceMatchesBoundFile(&bound, session)
+	return virtualEvidenceMatchesBoundFile(ctx, &bound, session, fileResolver)
 }
 
 // planVirtualSourceRevisionV3 returns the opaque virtual-source revision the

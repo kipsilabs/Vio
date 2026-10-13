@@ -258,7 +258,7 @@ func TestSessionProvenanceMatchesPinnedRowV3RequiresApplicableProvenance(t *test
 		VirtualSubtitleEvidenceURI:    pinned,
 		VirtualSubtitleEvidenceFileID: 720,
 	}
-	if !sessionProvenanceMatchesPinnedRowV3(applicable, row) {
+	if !sessionProvenanceMatchesPinnedRowV3(context.Background(), applicable, row, nil) {
 		t.Fatal("provenance that names the pin and the bound row was rejected")
 	}
 
@@ -270,14 +270,14 @@ func TestSessionProvenanceMatchesPinnedRowV3RequiresApplicableProvenance(t *test
 		VirtualSubtitleEvidenceURI:    neutral + "?result=previous",
 		VirtualSubtitleEvidenceFileID: 720,
 	}
-	if sessionProvenanceMatchesPinnedRowV3(stale, row) {
+	if sessionProvenanceMatchesPinnedRowV3(context.Background(), stale, row, nil) {
 		t.Fatal("provenance for a previous candidate was admitted for the pin")
 	}
 
 	// Legacy: a probe-evidence flag with no anchor still matches on the pin, and
 	// the unknown row id falls back to URI-only matching.
 	legacy := &playback.Session{VirtualSourceURI: pinned, VirtualSubtitleEvidenceSet: true}
-	if !sessionProvenanceMatchesPinnedRowV3(legacy, row) {
+	if !sessionProvenanceMatchesPinnedRowV3(context.Background(), legacy, row, nil) {
 		t.Fatal("legacy flag-only provenance did not fall back to the pin anchor")
 	}
 
@@ -288,14 +288,14 @@ func TestSessionProvenanceMatchesPinnedRowV3RequiresApplicableProvenance(t *test
 		VirtualSubtitleEvidenceURI:    pinned,
 		VirtualSubtitleEvidenceFileID: 999,
 	}
-	if sessionProvenanceMatchesPinnedRowV3(otherRow, row) {
+	if sessionProvenanceMatchesPinnedRowV3(context.Background(), otherRow, row, nil) {
 		t.Fatal("provenance captured from another row was admitted for this row")
 	}
 
-	if sessionProvenanceMatchesPinnedRowV3(&playback.Session{VirtualSourceURI: pinned}, row) {
+	if sessionProvenanceMatchesPinnedRowV3(context.Background(), &playback.Session{VirtualSourceURI: pinned}, row, nil) {
 		t.Fatal("a session with no provenance reported applicable evidence")
 	}
-	if sessionProvenanceMatchesPinnedRowV3(applicable, nil) {
+	if sessionProvenanceMatchesPinnedRowV3(context.Background(), applicable, nil, nil) {
 		t.Fatal("a nil row reported applicable evidence")
 	}
 }
@@ -320,11 +320,11 @@ func TestVirtualProfileScopeTwoSiblingsShareOneProfile(t *testing.T) {
 	}
 	// Scope cannot tell the siblings apart. Only the pin's own evidence can, so a
 	// sibling's evidence is not applicable to the pin's profile row.
-	if sessionProvenanceMatchesPinnedRowV3(&playback.Session{
+	if sessionProvenanceMatchesPinnedRowV3(context.Background(), &playback.Session{
 		VirtualSourceURI:              first,
 		VirtualSubtitleEvidenceURI:    second,
 		VirtualSubtitleEvidenceFileID: 1,
-	}, &models.MediaFile{ID: 1, FilePath: neutral}) {
+	}, &models.MediaFile{ID: 1, FilePath: neutral}, nil) {
 		t.Fatal("a sibling's evidence was admitted for the pin")
 	}
 }
