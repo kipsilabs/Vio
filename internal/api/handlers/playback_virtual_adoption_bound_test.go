@@ -515,22 +515,28 @@ func TestVirtualAdoptionRefusalKeyDistinguishesPins(t *testing.T) {
 }
 
 // TestAdoptionBoundForeignTerminalLogIsActionable proves the terminal is
-// observable: a foreign candidate past the bound names the exhausted refusal so
-// an operator sees a terminal disposition rather than a transient miss.
+// observable: a foreign candidate past the bound makes the transactional
+// refusal reconciliation name the exhausted disposition, so an operator sees a
+// terminal rather than a transient miss.
 func TestAdoptionBoundForeignTerminalLogIsActionable(t *testing.T) {
 	logs := captureHandlerLogs(t)
 	row := adoptionBoundTestRow(5031900, "row-hash")
 	candidate := "virtual://series/tt39087958/1/1?profile=4K+Dolby+Vision&result=foreign"
-	probed := &models.MediaFile{ProviderVideoHash: "other-hash"}
-	h := &PlaybackHandler{}
-	key := virtualAdoptionRefusalKey(row.ID, row.FilePath)
-	virtualAdoptionRefusals.clear(key)
-	t.Cleanup(func() { virtualAdoptionRefusals.clear(key) })
-	for i := 0; i < virtualAdoptionRefusalBound; i++ {
-		virtualAdoptionRefusals.mark(key)
-	}
-	if _, ok := h.virtualProbeEvidenceArgsForRow(context.Background(), row, candidate, probed, resolver.PersistedIdentityTiers{}, true); !ok {
-		t.Fatal("args builder refused before the terminal could be named")
+	args := txAdoptionArgs(row.ID, row.FilePath, candidate)
+	tx := &fakeAdoptionTx{rowFor: func(sql string, _ ...any) pgx.Row {
+		if sql == lockVirtualFileRowSQL {
+			return scriptedRow{id: row.ID}
+		}
+		return scriptedRow{err: pgx.ErrNoRows}
+	}}
+	db := &fakeTxBeginner{tx: tx}
+	store := newFakeAdoptionTxStore()
+	// One short of the bound, so this refused adoption reaches it and names the
+	// terminal from the in-transaction count.
+	store.counts[store.key(row.ID, row.FilePath)] = virtualAdoptionRefusalBound - 1
+	store.terminalStamped = true
+	if _, err := ExecVirtualFileMetadataUpdateResultWithRefusals(context.Background(), db, args, store); err == nil {
+		t.Fatal("refused adoption reported success")
 	}
 	if !strings.Contains(logs.String(), virtualProbeRefusalAdoptionBoundExhausted) {
 		t.Fatalf("terminal refusal reason not logged:\n%s", logs.String())
