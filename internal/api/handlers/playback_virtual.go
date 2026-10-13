@@ -3134,7 +3134,25 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			trace.fetchCalls += resolveCalls
 		}
 		if resolveErr != nil {
-			return nil, resolveErr
+			// The trusted-absent sentinel means the provider re-list dropped a
+			// candidate the viewer is still bound to. Recover the same release
+			// from the row's own validated stored URL before giving up; when no
+			// usable URL exists the resolve fails boundedly here, and the
+			// candidate loop never substitutes a sibling.
+			if errors.Is(resolveErr, virtuallibrary.ErrPersistedCandidateTrusted) {
+				if recovered, ok := h.recoverTrustedStoredVirtualURL(attemptCtx, file, requestedURI, oid); ok {
+					streamURL = recovered.URL
+					cand.RequestHeaders = cloneHeaderMap(recovered.RequestHeaders)
+					oid = effectiveVirtualOwner(recovered.OwnerID, oid)
+					slog.InfoContext(attemptCtx, "virtual playback: recovered a trusted pinless candidate from its stored URL",
+						"component", "api", "file_id", file.ID, "candidate_uri", requestedURI,
+						"candidate_id", probedCandidateID, "status", "recovered_stored_url")
+					resolveErr = nil
+				}
+			}
+			if resolveErr != nil {
+				return nil, resolveErr
+			}
 		}
 		// URL syntax and SSRF validation happen in the provider service and
 		// again when the relay opens the source. Do not perform a blocking body

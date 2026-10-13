@@ -105,14 +105,15 @@ type persistedCandidateTrustContextKey struct{}
 // WithPersistedCandidateTrust marks a resolve as allowed to keep trusting the
 // persisted candidate even when the provider's current list omits it. The caller
 // sets it only when the catalog row is inside the configured candidate store
-// window (see virtual_library.candidate_store_hours) and carries transport
-// evidence (a stored URL or a recorded delivery), and the resolve is for a
-// release the viewer is bound to (a session binding or an explicit version
-// pick). It is paired with WithPersistedCandidateIdentity when the row has a
-// durable identity so the resolver can re-identify the same release under a new
-// result id; an identity-less trusted row cannot be re-matched, but it is still
-// the viewer's selection, so a trusted resolve treats the pin like a session
-// binding — rematch by identity when possible or refuse, never substitute.
+// window (see virtual_library.candidate_store_hours) and carries evidence that
+// can back a re-serve, and the resolve is for a release the viewer is bound to
+// (a session binding or an explicit version pick). It is paired with
+// WithPersistedCandidateIdentity when the row has a durable identity so the
+// resolver can re-identify the same release under a new result id. An
+// identity-less row cannot be re-matched here, so the caller sets the flag only
+// when the row's own stored URL can be served (present and unexpired) and the
+// handler recovers it; a trusted resolve treats the pin like a session binding —
+// rematch by identity when possible or refuse, never substitute.
 func WithPersistedCandidateTrust(ctx context.Context, trusted bool) context.Context {
 	if ctx == nil || !trusted {
 		return ctx
@@ -442,15 +443,16 @@ var ErrSessionBoundCandidateAbsent = fmt.Errorf("session-bound candidate absent 
 
 // ErrPersistedCandidateTrusted reports that a session-bound pin was absent from
 // the provider's current list, but the request declared the persisted candidate
-// as trusted (the catalog row carries transport evidence and is still inside the
+// as trusted (the catalog row carries resumable evidence and is still inside the
 // candidate store window). The row may or may not carry a durable identity: an
-// identity-less trusted row cannot be re-matched here, but the handler still
-// holds its stored URL, so the recovery is re-serving that URL. It is the
-// deliberate relaxation of the re-list-truth policy: callers must NOT rotate on
-// it, because the persisted candidate is still the viewer's selection. It is
-// distinct from ErrSessionBoundCandidateAbsent precisely so the serve layer and
-// the failure-replan rehydration keep their rotation-on-absent behavior outside
-// the window or for a row with no transport evidence.
+// identity-less trusted row cannot be re-matched here, but the caller declared a
+// usable stored URL (present and unexpired), so the handler recovers by
+// re-serving that URL. It is the deliberate relaxation of the re-list-truth
+// policy: callers must NOT rotate on it, because the persisted candidate is
+// still the viewer's selection. It is distinct from
+// ErrSessionBoundCandidateAbsent precisely so the serve layer and the
+// failure-replan rehydration keep their rotation-on-absent behavior outside the
+// window or for a row with no resumable evidence.
 var ErrPersistedCandidateTrusted = fmt.Errorf("persisted virtual candidate is inside the trust window")
 
 // ErrProviderPending reports that the only viable candidate is a release
@@ -496,7 +498,7 @@ var ErrProviderPending = fmt.Errorf("virtual playback provider release is still 
 //     substitution is allowed or the resolve is not pinned; a pinned dead pin
 //     with substitution disallowed is refused, and when the caller also
 //     declared the persisted candidate as trusted (WithPersistedCandidateTrust,
-//     transport evidence inside the candidate store window) the refusal carries
+//     resumable evidence inside the candidate store window) the refusal carries
 //     ErrPersistedCandidateTrusted instead of ErrSessionBoundCandidateAbsent so
 //     callers do not rotate to a sibling.
 //     A pinned resolve is a session binding or an explicitly selected
@@ -783,10 +785,10 @@ func (s *Service) ResolveDetailed(
 		}
 		if persistedCandidateTrustFromContext(ctx) {
 			// The caller declared the persisted candidate as the viewer's own
-			// selection with transport evidence inside the store window. Whether
+			// selection with resumable evidence inside the store window. Whether
 			// or not the row carries a durable identity, the resolver must not
 			// substitute a sibling: an identity-less trusted row cannot be
-			// re-matched here, but the handler still holds its stored URL, so the
+			// re-matched here, but the caller declared a usable stored URL, so the
 			// recovery is re-serving that URL — never a release swap. Signal the
 			// trust sentinel rather than the rotation sentinel so callers do not
 			// rotate away from the viewer's selection.
