@@ -112,6 +112,15 @@ type VirtualAdoptionRefusalStore interface {
 	CountVirtualAdoptionRefusal(ctx context.Context, fileID int, expectedPath string) (int, error)
 }
 
+// VirtualAdoptionTerminalMarker is the revision-fenced durable terminal stamp
+// the bounded decision installs when it pre-empts a write (the args builder, or
+// any caller outside the evidence transaction). It reports whether the stamp
+// landed: false means the row no longer carried the observed evidence revision
+// (updated_at/probe_updated_at), so a newer evidence write won the race and the
+// stale terminal must not condemn it. A nil marker keeps the legacy
+// path+failed_at fence through VirtualCandidateFailMarker.
+type VirtualAdoptionTerminalMarker func(ctx context.Context, fileID int, expectedFilePath string, observedFailedAt *time.Time, observedUpdatedAt time.Time, observedProbeUpdatedAt *time.Time) (bool, error)
+
 // virtualAdoptionRefusalMark is one row/pin's consecutive-refusal state.
 type virtualAdoptionRefusalMark struct {
 	count     int
@@ -369,8 +378,35 @@ func (h *PlaybackHandler) adoptionRefusalStoreCount(ctx context.Context, fileID 
 // skips the row and a restarted process does not restart the loop. The durable
 // count is only the trigger; this durable stamp is what actually stops
 // subsequent attempts. It returns whether a marker was installed.
+//
+// When the revision-fenced marker is wired (production) the stamp is also gated
+// on the observed evidence revision: a concurrent successful write that advanced
+// the row's updated_at/probe_updated_at wins over this stale terminal instead of
+// being condemned by it. The legacy VirtualCandidateFailMarker fallback keeps the
+// previous identity+failed_at fence for callers that wire no fenced marker.
 func (h *PlaybackHandler) markVirtualAdoptionTerminalRefusal(ctx context.Context, row *models.MediaFile, reason string) bool {
-	if h == nil || row == nil || row.ID <= 0 || h.VirtualCandidateFailMarker == nil {
+	if h == nil || row == nil || row.ID <= 0 {
+		return false
+	}
+	if h.VirtualAdoptionTerminalMarker != nil {
+		stamped, err := h.VirtualAdoptionTerminalMarker(ctx, row.ID, row.FilePath, row.FailedAt, row.UpdatedAt, row.ProbeUpdatedAt)
+		if err != nil {
+			slog.WarnContext(ctx, "virtual adoption terminal refusal was not persisted; the row keeps its own failed_at state",
+				"component", "api", "file_id", row.ID, "candidate_path", row.FilePath,
+				virtualEvidenceLogKeyReason, reason, virtualEvidenceLogKeyError, err)
+			return false
+		}
+		if !stamped {
+			slog.InfoContext(ctx, "virtual adoption terminal refusal superseded by a newer evidence write; not stamping",
+				"component", "api", "file_id", row.ID, "candidate_path", row.FilePath,
+				virtualEvidenceLogKeyReason, reason)
+			return false
+		}
+		slog.ErrorContext(ctx, "virtual adoption terminal refusal persisted",
+			"component", "api", "file_id", row.ID, "candidate_path", row.FilePath, virtualEvidenceLogKeyReason, reason)
+		return true
+	}
+	if h.VirtualCandidateFailMarker == nil {
 		return false
 	}
 	if err := h.VirtualCandidateFailMarker(ctx, row.ID, row.FilePath, row.FailedAt); err != nil {

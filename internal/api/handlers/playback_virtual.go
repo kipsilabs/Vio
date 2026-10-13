@@ -4173,6 +4173,40 @@ type VirtualFileMetadataDB interface {
 	QueryRow(ctx context.Context, sql string, arguments ...any) pgx.Row
 }
 
+// VirtualFileMetadataTxBeginner is the transaction surface a real database
+// exposes so the evidence write and the exact-pin refusal reconciliation commit
+// atomically. *pgxpool.Pool satisfies it; the in-memory and fake databases of
+// the unit tests deliberately do not, and fall back to the best-effort path.
+type VirtualFileMetadataTxBeginner interface {
+	Begin(ctx context.Context) (pgx.Tx, error)
+}
+
+// VirtualAdoptionRefusalTxStore is the transaction-aware refusal store: the
+// durable Postgres store records, clears and terminally stamps refusal state on
+// the caller's transaction, so the counter, the terminal verdict and the
+// evidence write they belong to all commit or roll back together. A store that
+// does not implement it keeps the previous best-effort path.
+type VirtualAdoptionRefusalTxStore interface {
+	// RecordVirtualAdoptionRefusalTx atomically increments the live consecutive
+	// count for one row and pinned path on the transaction and returns it.
+	RecordVirtualAdoptionRefusalTx(ctx context.Context, tx pgx.Tx, fileID int, expectedPath string, ttl time.Duration) (int, error)
+	// ClearVirtualAdoptionRefusalTx drops the exact-pin mark on the transaction
+	// after a write landed, so the clear commits with that write.
+	ClearVirtualAdoptionRefusalTx(ctx context.Context, tx pgx.Tx, fileID int, expectedPath string) error
+	// MarkVirtualAdoptionTerminalRefusalTx stamps the durable terminal verdict
+	// on the transaction, fenced on the candidate identity and the observed
+	// evidence revision. It reports whether the stamp landed.
+	MarkVirtualAdoptionTerminalRefusalTx(ctx context.Context, tx pgx.Tx, fileID int, expectedFilePath string, observedFailedAt *time.Time, observedUpdatedAt time.Time, observedProbeUpdatedAt *time.Time) (bool, error)
+}
+
+// VirtualAdoptionRefusalSweeper is the optional post-commit expiry sweep. The
+// non-transactional refusal record sweeps inline; the transactional path runs
+// this after the transaction commits so the sweep never holds a second pooled
+// connection while the transaction is open.
+type VirtualAdoptionRefusalSweeper interface {
+	SweepVirtualAdoptionRefusals(ctx context.Context) error
+}
+
 // virtualPersistAdoptionReplacesTransport reports whether a required adoption
 // moves the row to a different release, in which case the stored transport set
 // (resolved URL and expiry, durable identity tiers, request headers) must be
@@ -4286,20 +4320,34 @@ func execVirtualFileMetadataUpdateResult(ctx context.Context, db VirtualFileMeta
 	if db == nil {
 		return VirtualFileMetadataUpdateResult{}, nil
 	}
+	// A real database and the durable refusal store together commit the
+	// evidence write and the exact-pin refusal reconciliation in one
+	// transaction. The in-memory fallback (tests, non-database deployments) has
+	// no cross-process window to close and stays on the best-effort path, as does
+	// a database that cannot begin a transaction.
+	if txDB, ok := db.(VirtualFileMetadataTxBeginner); ok {
+		if txStore, ok := store.(VirtualAdoptionRefusalTxStore); ok {
+			return execVirtualFileMetadataUpdateResultTx(ctx, txDB, txStore, args)
+		}
+	}
+	return execVirtualFileMetadataUpdateResultUntx(ctx, db, args, store)
+}
+
+// virtualMetadataStatement holds the precomputed argument pieces the saver
+// shares between its transactional and non-transactional paths, so both run the
+// identical VirtualFileMetadataUpdateSQL with identical fences.
+type virtualMetadataStatement struct {
+	videoJSON                  string
+	audioJSON                  string
+	subtitleJSON               string
+	providerRequestHeadersJSON any
+	fenceVerdict               bool
+}
+
+func newVirtualMetadataStatement(args models.VirtualFilePersistArgs) (virtualMetadataStatement, error) {
 	vStr := string(args.VideoTracks)
 	if vStr == "" || vStr == jsonNullLiteral {
 		vStr = "[]"
-	}
-	// A nil/empty header map is passed as nil so the SQL COALESCE preserves the
-	// stored set; serializeJSONB would do the same, but marshal here so the
-	// argument shape stays a single jsonb placeholder.
-	var providerRequestHeadersJSON any
-	if len(args.ProviderRequestHeaders) > 0 {
-		encoded, marshalErr := json.Marshal(args.ProviderRequestHeaders)
-		if marshalErr != nil {
-			return VirtualFileMetadataUpdateResult{}, fmt.Errorf("marshal provider request headers: %w", marshalErr)
-		}
-		providerRequestHeadersJSON = encoded
 	}
 	aStr := string(args.AudioTracks)
 	if aStr == "" || aStr == jsonNullLiteral {
@@ -4309,51 +4357,82 @@ func execVirtualFileMetadataUpdateResult(ctx context.Context, db VirtualFileMeta
 	if sStr == "" || sStr == jsonNullLiteral {
 		sStr = "[]"
 	}
-	verdictMaxAgeSeconds := virtualFailedVerdictMaxAge.Seconds()
-	// The verdict fence is only meaningful where the caller needs a confirmed
-	// adoption (RequireAdopt) and has not asked for an explicit retry.
-	fenceVerdict := args.RequireAdopt && !args.AllowFailedVerdict
-	exec := func(adoptPath string) (string, error) {
-		neutralPath := ""
-		if adoptPath != "" {
-			neutralPath = virtualPlaybackNeutralKey(adoptPath)
+	// A nil/empty header map is passed as nil so the SQL COALESCE preserves the
+	// stored set; serializeJSONB would do the same, but marshal here so the
+	// argument shape stays a single jsonb placeholder.
+	var providerRequestHeadersJSON any
+	if len(args.ProviderRequestHeaders) > 0 {
+		encoded, marshalErr := json.Marshal(args.ProviderRequestHeaders)
+		if marshalErr != nil {
+			return virtualMetadataStatement{}, fmt.Errorf("marshal provider request headers: %w", marshalErr)
 		}
-		// The atomic guard only applies when the caller needs a confirmed
-		// adoption; the metadata-only retry clears adoptPath and therefore
-		// writes evidence on the row's current path as before.
-		requireAdoption := args.RequireAdopt && adoptPath != ""
-		// A required adoption of a different release replaces the stored
-		// transport fields as a set ($30): an omitted identity tier, URL or
-		// header set belongs to the release the row is leaving and must not
-		// survive under the new path. The release test is the durable identity,
-		// not the item-level neutral key: the ordinary replacement
-		// virtual://movie/tt100?result=a -> ?result=b shares a neutral key, so a
-		// key comparison would preserve A's fields under B. A metadata-only
-		// retry (adoptPath cleared) and a proven same-release adoption keep the
-		// preserve-on-omission behavior.
-		replaceIdentity := requireAdoption && virtualPersistAdoptionReplacesTransport(args, adoptPath)
-		var persistedPath string
-		err := db.QueryRow(ctx, VirtualFileMetadataUpdateSQL,
-			vStr, aStr, sStr, args.Resolution, args.CodecVideo, args.CodecAudio, args.Container, args.HDR, args.Bitrate, args.Duration,
-			args.FileID, args.ExpectedFilePath, args.StampProbe,
-			args.UpdatedAt, args.ProbeUpdatedAt, args.OwnerID, args.LibraryID, adoptPath,
-			neutralPath, verdictMaxAgeSeconds, fenceVerdict, requireAdoption,
-			args.ResolvedURL, args.ResolvedURLExpiresAt,
-			args.ProviderVideoHash, args.ProviderGUID, args.ProviderReleaseName, args.ProviderReleaseSize,
-			providerRequestHeadersJSON, replaceIdentity, args.ClearProbe,
-			args.ReconcileCollectionVariant,
-		).Scan(&persistedPath)
-		if errors.Is(err, pgx.ErrNoRows) {
-			// No row matched the CAS fence: a stale snapshot, reported as a
-			// zero-row miss by the caller.
-			return "", nil
-		}
-		if err != nil {
-			return "", err
-		}
-		return persistedPath, nil
+		providerRequestHeadersJSON = encoded
 	}
-	persistedPath, err := exec(args.AdoptPath)
+	return virtualMetadataStatement{
+		videoJSON:                  vStr,
+		audioJSON:                  aStr,
+		subtitleJSON:               sStr,
+		providerRequestHeadersJSON: providerRequestHeadersJSON,
+		// The verdict fence is only meaningful where the caller needs a
+		// confirmed adoption (RequireAdopt) and has not asked for an explicit
+		// retry.
+		fenceVerdict: args.RequireAdopt && !args.AllowFailedVerdict,
+	}, nil
+}
+
+// run executes VirtualFileMetadataUpdateSQL for one attempt against db, which is
+// a pool or an open transaction. adoptPath is the path this attempt nominates
+// (empty on the metadata-only retry). A pgx.ErrNoRows is reported as an empty
+// persisted path (a CAS/fence miss); any other error is returned unchanged.
+func (s virtualMetadataStatement) run(ctx context.Context, db VirtualFileMetadataDB, args models.VirtualFilePersistArgs, adoptPath string) (string, error) {
+	neutralPath := ""
+	if adoptPath != "" {
+		neutralPath = virtualPlaybackNeutralKey(adoptPath)
+	}
+	// The atomic guard only applies when the caller needs a confirmed adoption;
+	// the metadata-only retry clears adoptPath and therefore writes evidence on
+	// the row's current path as before.
+	requireAdoption := args.RequireAdopt && adoptPath != ""
+	// A required adoption of a different release replaces the stored transport
+	// fields as a set ($30): an omitted identity tier, URL or header set belongs
+	// to the release the row is leaving and must not survive under the new path.
+	// The release test is the durable identity, not the item-level neutral key:
+	// the ordinary replacement virtual://movie/tt100?result=a -> ?result=b shares
+	// a neutral key, so a key comparison would preserve A's fields under B. A
+	// metadata-only retry (adoptPath cleared) and a proven same-release adoption
+	// keep the preserve-on-omission behavior.
+	replaceIdentity := requireAdoption && virtualPersistAdoptionReplacesTransport(args, adoptPath)
+	var persistedPath string
+	err := db.QueryRow(ctx, VirtualFileMetadataUpdateSQL,
+		s.videoJSON, s.audioJSON, s.subtitleJSON, args.Resolution, args.CodecVideo, args.CodecAudio, args.Container, args.HDR, args.Bitrate, args.Duration,
+		args.FileID, args.ExpectedFilePath, args.StampProbe,
+		args.UpdatedAt, args.ProbeUpdatedAt, args.OwnerID, args.LibraryID, adoptPath,
+		neutralPath, virtualFailedVerdictMaxAge.Seconds(), s.fenceVerdict, requireAdoption,
+		args.ResolvedURL, args.ResolvedURLExpiresAt,
+		args.ProviderVideoHash, args.ProviderGUID, args.ProviderReleaseName, args.ProviderReleaseSize,
+		s.providerRequestHeadersJSON, replaceIdentity, args.ClearProbe,
+		args.ReconcileCollectionVariant,
+	).Scan(&persistedPath)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// No row matched the CAS fence: a stale snapshot, reported as a
+		// zero-row miss by the caller.
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return persistedPath, nil
+}
+
+// execVirtualFileMetadataUpdateResultUntx is the best-effort saver used when no
+// transaction is available. The exact-pin clear is a separate post-write call;
+// see execVirtualFileMetadataUpdateResultTx for the atomic production path.
+func execVirtualFileMetadataUpdateResultUntx(ctx context.Context, db VirtualFileMetadataDB, args models.VirtualFilePersistArgs, store VirtualAdoptionRefusalStore) (VirtualFileMetadataUpdateResult, error) {
+	statement, err := newVirtualMetadataStatement(args)
+	if err != nil {
+		return VirtualFileMetadataUpdateResult{}, err
+	}
+	persistedPath, err := statement.run(ctx, db, args, args.AdoptPath)
 	if err == nil {
 		if persistedPath == "" {
 			if args.RequireAdopt && args.AdoptPath != "" {
@@ -4411,7 +4490,7 @@ func execVirtualFileMetadataUpdateResult(ctx context.Context, db VirtualFileMeta
 	// The retry deliberately retains evidence on the current row, but it did
 	// not adopt the requested identity. Callers must not treat this as an
 	// adoption success (metadata-only retries are not identity proof).
-	retryPath, retryErr := exec("")
+	retryPath, retryErr := statement.run(ctx, db, args, "")
 	if retryErr != nil {
 		return VirtualFileMetadataUpdateResult{}, retryErr
 	}
