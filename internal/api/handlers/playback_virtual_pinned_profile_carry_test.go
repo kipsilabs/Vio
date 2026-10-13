@@ -1,6 +1,9 @@
 package handlers
 
 import (
+	"context"
+	"net/http"
+	"sync"
 	"testing"
 
 	"github.com/Silo-Server/silo-server/internal/models"
@@ -20,12 +23,12 @@ func (fx *pinnedTrackChangeFixture) churnCatalogRowToProfile() {
 	fx.files[fx.source.ID] = &neutral
 }
 
-// dropSessionSubtitleEvidence clears only the probe-evidence flag that would take
-// the existing same-row carry shortcut, while keeping the plan-time audio
-// inventory the session carries. A provider-declared (unprobed) plan commits in
-// exactly this shape: the pin is describable from the carried tracks, but the
-// flag is clear. The reloaded profile row still carries the embedded subtitle
-// inventory, so a subtitle switch has a real target.
+// dropSessionSubtitleEvidence models the state a full v3 stream-state write
+// leaves after a plan whose effective row was unprobed: the probe-evidence flag
+// that would take the existing same-row carry shortcut is cleared, while the
+// provenance anchor (the evidence URI and row id) and the plan-time audio
+// inventory survive. That is the prod shape — the session once proved a
+// concrete candidate, then a state write dropped the flag but kept the anchor.
 func (fx *pinnedTrackChangeFixture) dropSessionSubtitleEvidence(t *testing.T) {
 	t.Helper()
 	session, err := fx.manager.GetSession(fx.started.SessionID)
@@ -33,12 +36,19 @@ func (fx *pinnedTrackChangeFixture) dropSessionSubtitleEvidence(t *testing.T) {
 		t.Fatalf("GetSession: %v", err)
 	}
 	audio := append([]models.AudioTrack(nil), session.VirtualAudioTracks...)
+	evidenceURI := session.VirtualSubtitleEvidenceURI
+	evidenceFileID := session.VirtualSubtitleEvidenceFileID
+	if evidenceURI == "" || evidenceFileID == 0 {
+		t.Fatalf("fixture precondition: session carried no evidence anchor (%q, %d)", evidenceURI, evidenceFileID)
+	}
 	if err := fx.manager.UpdateStreamState(fx.started.SessionID, playback.SessionStreamState{
-		VirtualSourceURI:          fx.pinnedURI,
-		VirtualSourceSet:          true,
-		VirtualSourceOwnershipSet: true,
-		VirtualAudioTracks:        audio,
-		SubtitleTrackIndex:        -1,
+		VirtualSourceURI:              fx.pinnedURI,
+		VirtualSourceSet:              true,
+		VirtualSourceOwnershipSet:     true,
+		VirtualAudioTracks:            audio,
+		VirtualSubtitleEvidenceURI:    evidenceURI,
+		VirtualSubtitleEvidenceFileID: evidenceFileID,
+		SubtitleTrackIndex:            -1,
 	}); err != nil {
 		t.Fatalf("clear session subtitle evidence: %v", err)
 	}
@@ -49,8 +59,8 @@ func (fx *pinnedTrackChangeFixture) dropSessionSubtitleEvidence(t *testing.T) {
 	if session.VirtualSubtitleEvidenceSet {
 		t.Fatal("subtitle evidence flag still set; the regression shape needs it clear")
 	}
-	if len(session.VirtualAudioTracks) == 0 {
-		t.Fatal("session carries no audio evidence; nothing for the pin to describe")
+	if session.VirtualSubtitleEvidenceURI == "" || session.VirtualSubtitleEvidenceFileID == 0 {
+		t.Fatal("the cleared state did not keep the evidence provenance anchor")
 	}
 }
 
@@ -215,10 +225,55 @@ func TestVirtualPinnedProfileRowV3RecognizesProfileNotSiblingRelease(t *testing.
 	if sessionCarriesVirtualEvidenceV3(nil) || sessionCarriesVirtualEvidenceV3(&playback.Session{}) {
 		t.Fatal("a session with no carried evidence reported evidence")
 	}
-	if !sessionCarriesVirtualEvidenceV3(&playback.Session{VirtualAudioTracks: []models.AudioTrack{{Codec: "aac"}}}) {
-		t.Fatal("carried audio inventory was not recognized as evidence")
+	if sessionCarriesVirtualEvidenceV3(&playback.Session{VirtualAudioTracks: []models.AudioTrack{{Codec: "aac"}}}) {
+		t.Fatal("provider-declared audio alone was treated as evidence")
 	}
 	if !sessionCarriesVirtualEvidenceV3(&playback.Session{VirtualSubtitleEvidenceSet: true}) {
 		t.Fatal("the probe-evidence flag was not recognized as evidence")
+	}
+	if !sessionCarriesVirtualEvidenceV3(&playback.Session{VirtualSubtitleEvidenceURI: "virtual://movie/tt?result=a"}) {
+		t.Fatal("the evidence provenance anchor was not recognized as evidence")
+	}
+	if !sessionCarriesVirtualEvidenceV3(&playback.Session{VirtualSubtitleEvidenceFileID: 4912232}) {
+		t.Fatal("the evidence provenance row id was not recognized as evidence")
+	}
+}
+
+// A client stop that lands while a virtual re-resolve is stalled must not
+// collapse the replan's own retryable provider-stall terminal into
+// playback_session_not_found. The stall — not the stop — is what the replan
+// observed, so the client keeps the retryable virtual_source_unavailable signal
+// instead of being told the session is gone and forced to tear down and
+// re-resume.
+func TestReplanVirtualSourceStallSurvivesConcurrentStop(t *testing.T) {
+	fx := newPinnedTrackChangeFixture(t, "churned")
+	// No carried evidence, so the pin cannot be carried and the rehydration
+	// re-resolves — the prod shape whose resolve stalls on the provider.
+	fx.discardPinnedEvidence(t)
+	fx.churnCatalogRowToStub("churned")
+
+	var stopOnce sync.Once
+	fx.handler.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(ctx context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+		// The client's stop arrives while the provider resolve is in flight.
+		stopOnce.Do(func() {
+			_ = fx.manager.StopSession(fx.started.SessionID)
+			fx.handler.markAttemptStoppedServerSide(context.Background(), fx.started.SessionID)
+		})
+		if !VirtualCandidateRotationAllowed(ctx) {
+			return ResolvedVirtualMedia{}, absentSessionPinError("pinned")
+		}
+		siblingURI := withVirtualResultKey(virtualPlaybackNeutralKey(fx.source.FilePath), "other-release")
+		return ResolvedVirtualMedia{URL: "http://127.0.0.1:9/stream", URI: siblingURI, CandidateID: "other-release", ProviderGUID: "other-release-guid"}, nil
+	})
+
+	status, response := postReplanRawV3(t, fx.handler, fx.started.SessionID, fx.trackChangeRequest(1, "pinned-stall-concurrent-stop-0001"))
+	if status != http.StatusOK {
+		t.Fatalf("replan status = %d, want the retryable virtual-source 200 terminal; body = %+v", status, response)
+	}
+	if response.Terminal == nil || response.Terminal.Reason != "virtual_source_unavailable" {
+		t.Fatalf("terminal = %#v, want the retryable virtual_source_unavailable terminal", response.Terminal)
+	}
+	if !response.Terminal.Retryable {
+		t.Fatalf("virtual-source stall terminal is not retryable: %#v", response.Terminal)
 	}
 }

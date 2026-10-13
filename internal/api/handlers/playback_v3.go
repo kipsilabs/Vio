@@ -7354,6 +7354,19 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 		terminalRecord.CurrentReplanRequestID = req.ReplanRequestID
 		if err := h.PlanStoreV3.CompleteReplan(r.Context(), sessionID, req.ReplanRequestID, lease.LeaseToken, record.CurrentReplanRequestID, encoded, terminalRecord); err != nil {
 			if errors.Is(err, playback.ErrAttemptStoppedV3) {
+				// A stop landed on the attempt while this replan ran. A stop
+				// verdict persisted as a 200 terminal is a response the web
+				// client does not rebuild from, so the fast 404 is the right
+				// answer for a session-expired/stop terminal. A provider stall
+				// is not a stop verdict: the replan computed its own retryable
+				// virtual-source terminal, and answering 404 collapses that
+				// into "session gone", forcing every client to tear down and
+				// re-resume. Return the terminal the replan already produced so
+				// the retryable virtual-source signal survives the concurrent
+				// stop; the durable attempt is fenced, so nothing is persisted.
+				if virtualSourceStallTerminalV3(replanErr.reason) {
+					return response, nil
+				}
 				return playback.DecisionResponseV3{}, replanSessionNotFoundV3()
 			}
 			if errors.Is(err, playback.ErrReplanSupersededV3) {
@@ -7436,6 +7449,21 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 // adapter maps its status to the not-found problem.
 func replanSessionNotFoundV3() *PlaybackOperationError {
 	return playbackOperationError(http.StatusNotFound, playbackSessionNotFoundErrorCode, "Playback session not found")
+}
+
+// virtualSourceStallTerminalV3 reports whether a replan failure reason is a
+// retryable virtual-source stall rather than a verdict on the session. These
+// reasons are the resolver's honest "the provider did not answer / the pinned
+// candidate is absent" outcome; a client rebuilds a plan or retries from them.
+// They must not be collapsed into playback_session_not_found by a concurrent
+// stop, because the stall — not the stop — is what the replan observed.
+func virtualSourceStallTerminalV3(reason string) bool {
+	switch reason {
+	case "virtual_source_unavailable", "replan_virtual_input_timeout":
+		return true
+	default:
+		return false
+	}
 }
 
 // isRouteCapacityUnavailableError reports whether an error names route-capacity
@@ -11299,20 +11327,24 @@ func virtualPinnedProfileRowV3(session *playback.Session, row *models.MediaFile)
 	return virtualPlaybackNeutralKey(rowPath) == virtualPlaybackNeutralKey(pinned)
 }
 
-// sessionCarriesVirtualEvidenceV3 reports whether the session holds any
-// plan-time description of its pinned virtual bytes — probed/declared subtitle
-// or audio inventory, or the evidence provenance that anchors it. Carrying a
-// pin without any of these would plan against an undescribed release; the
-// caller then re-resolves so an offline pin surfaces through the existing
-// rotation semantics.
+// sessionCarriesVirtualEvidenceV3 reports whether the session holds
+// probe-authoritative evidence, or the provenance anchor a cleared evidence set
+// leaves behind, describing its pinned virtual bytes. A cleared evidence set
+// (a full v3 state write after a plan whose effective row was unprobed) keeps
+// the evidence URI/file id while dropping the flag, so the anchor is the durable
+// signal that the session once proved these bytes. Provider-declared audio
+// tracks alone do not qualify: a session that merely resolved a concrete
+// candidate without probing it must still re-resolve, so an offline pin
+// surfaces through the rotation semantics instead of planning against a stub.
 func sessionCarriesVirtualEvidenceV3(session *playback.Session) bool {
 	if session == nil {
 		return false
 	}
-	return session.VirtualSubtitleEvidenceSet ||
-		len(session.VirtualAudioTracks) > 0 ||
-		len(session.VirtualSubtitleTracks) > 0 ||
-		strings.TrimSpace(session.VirtualSubtitleEvidenceURI) != ""
+	if session.VirtualSubtitleEvidenceSet {
+		return true
+	}
+	return strings.TrimSpace(session.VirtualSubtitleEvidenceURI) != "" ||
+		session.VirtualSubtitleEvidenceFileID > 0
 }
 
 // planVirtualSourceRevisionV3 returns the opaque virtual-source revision the
