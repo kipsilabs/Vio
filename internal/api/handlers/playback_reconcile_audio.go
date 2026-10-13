@@ -109,6 +109,57 @@ func (h *PlaybackHandler) reconcileSessionDefaultAudio(ctx context.Context, sess
 	}
 }
 
+// reconcileVerifiedDefaultAudioFromCommitted is the committed-carrier form of
+// reconcileVerifiedDefaultAudio. It replays each live session bound to the row a
+// durable probe write just committed against the exact inventory that write
+// produced, rather than rereading the mutable row: an in-place adoption between
+// the write and this reconcile would otherwise let another release's tracks
+// steer the audio decision. The carrier's release identity and candidate URI are
+// carried onto the synthetic verified row so the same bound-release checks the
+// reread path applies still run.
+func (h *PlaybackHandler) reconcileVerifiedDefaultAudioFromCommitted(ctx context.Context, committed virtualCommittedProbeInventory) {
+	if h == nil || h.sessionMgr == nil || !committed.committed() || len(committed.audio) == 0 {
+		return
+	}
+	lookup, ok := h.sessionMgr.(mediaFileSessionLookup)
+	if !ok {
+		return
+	}
+	deadlineCtx, cancel := context.WithTimeout(ctx, reconcileProbeBudgetV3)
+	defer cancel()
+	verified := &models.MediaFile{
+		ID:                  committed.fileID,
+		FilePath:            committed.candidateURI,
+		AudioTracks:         committed.audio,
+		ProviderVideoHash:   committed.identity.VideoHash,
+		ProviderGUID:        committed.identity.GUID,
+		ProviderReleaseName: committed.identity.ReleaseName,
+		ProviderReleaseSize: committed.identity.ReleaseSize,
+	}
+	for _, session := range lookup.GetSessionsByMediaFileID(committed.fileID) {
+		if session == nil || session.ID == "" {
+			continue
+		}
+		h.reconcileSessionDefaultAudioFromInventory(deadlineCtx, session, committed.fileID, verified)
+	}
+}
+
+// reconcileSessionDefaultAudioFromInventory reconciles one live session against
+// a caller-supplied verified inventory, dispatching on the persisted selection
+// intent exactly like reconcileSessionDefaultAudio but never rereading the row.
+func (h *PlaybackHandler) reconcileSessionDefaultAudioFromInventory(ctx context.Context, session *playback.Session, fileID int, verified *models.MediaFile) {
+	intent := h.audioSelectionIntentForSession(ctx, session)
+	switch intent.origin {
+	case SelectionOriginExplicit:
+		h.verifyExplicitAudioSelectionForInventory(ctx, session, intent, fileID, verified)
+	case SelectionOriginAuto:
+		h.reconcileAutoAudioSelectionForInventory(ctx, session, intent, fileID, verified)
+	default:
+		slog.DebugContext(ctx, "default audio reconciliation skipped: no selection intent",
+			"component", "api", "session", session.ID, "file_id", fileID)
+	}
+}
+
 // audioSelectionIntent is the persisted intent a session started with.
 type audioSelectionIntent struct {
 	origin           string
@@ -171,12 +222,13 @@ func (h *PlaybackHandler) audioSelectionIntentForSession(ctx context.Context, se
 // re-evaluated — a retried probe write or a second replica replays the stored
 // decision instead of minting a second event — so heartbeats and duplicate
 // evidence commits converge rather than emitting unbounded invalidations.
+// reconcileAutoAudioSelection rereads the committed row and reconciles the
+// session's automatic audio selection against it. It is the row-reading wrapper
+// for callers that hold only a file id; the deferred-probe path uses
+// reconcileAutoAudioSelectionForInventory with the exact committed carrier so a
+// concurrent in-place adoption cannot substitute another release's tracks.
 func (h *PlaybackHandler) reconcileAutoAudioSelection(ctx context.Context, session *playback.Session, intent audioSelectionIntent, fileID int) {
 	if h == nil || h.fileResolver == nil || h.PlanStoreV3 == nil {
-		return
-	}
-	live, err := h.sessionMgr.GetSession(session.ID)
-	if err != nil || live == nil {
 		return
 	}
 	verified, err := h.fileResolver.GetByID(ctx, fileID)
@@ -187,6 +239,20 @@ func (h *PlaybackHandler) reconcileAutoAudioSelection(ctx context.Context, sessi
 		// Gate on verified probe provenance before any session work: a
 		// declared (never probed) row is exactly what the client already
 		// holds, so reconciling against it would only churn.
+		return
+	}
+	h.reconcileAutoAudioSelectionForInventory(ctx, session, intent, fileID, verified)
+}
+
+// reconcileAutoAudioSelectionForInventory is the carrier form: the verified
+// inventory is supplied by the caller rather than reread, so the decision is
+// taken against the exact tracks a durable write committed.
+func (h *PlaybackHandler) reconcileAutoAudioSelectionForInventory(ctx context.Context, session *playback.Session, intent audioSelectionIntent, fileID int, verified *models.MediaFile) {
+	if h == nil || h.PlanStoreV3 == nil || verified == nil || len(verified.AudioTracks) == 0 {
+		return
+	}
+	live, err := h.sessionMgr.GetSession(session.ID)
+	if err != nil || live == nil {
 		return
 	}
 	generation := reconcileGenerationV3(verified)
@@ -225,7 +291,7 @@ func (h *PlaybackHandler) reconcileAutoAudioSelection(ctx context.Context, sessi
 		h.recordAudioReconcileDecision(ctx, live.ID, generation, playback.AudioReconcileEntryV3{Generation: generation, SessionID: live.ID, Decision: playback.AudioReconcileRefused})
 		return
 	}
-	if !virtualEvidenceMatchesBoundFile(verified, live) {
+	if !virtualEvidenceMatchesBoundFile(ctx, verified, live, h.fileResolver) {
 		// Source rotation (or a sibling-row write) means this evidence is
 		// stale for the bound session: refuse, and surface the still-valid
 		// tracks in memory only, exactly like the refused-write path.
@@ -1269,6 +1335,10 @@ func (h *PlaybackHandler) recordAudioReconcileAnnouncement(ctx context.Context, 
 // push (or the next inventory poll) shows the verified list without the
 // track, and its picker drops the unplayable entry exactly as it does for any
 // other inventory revision. No new client surface is required.
+// verifyExplicitAudioSelection rereads the committed row and verifies the
+// viewer's explicit selection still exists in it. The carrier form
+// (verifyExplicitAudioSelectionForInventory) is used by the deferred-probe path,
+// where the exact committed inventory is already in hand.
 func (h *PlaybackHandler) verifyExplicitAudioSelection(ctx context.Context, session *playback.Session, intent audioSelectionIntent, fileID int) {
 	if h == nil || h.fileResolver == nil {
 		return
@@ -1280,11 +1350,18 @@ func (h *PlaybackHandler) verifyExplicitAudioSelection(ctx context.Context, sess
 	if !reconcileProbeVerifiedV3(verified) {
 		return
 	}
+	h.verifyExplicitAudioSelectionForInventory(ctx, session, intent, fileID, verified)
+}
+
+func (h *PlaybackHandler) verifyExplicitAudioSelectionForInventory(ctx context.Context, session *playback.Session, intent audioSelectionIntent, fileID int, verified *models.MediaFile) {
+	if h == nil || verified == nil || len(verified.AudioTracks) == 0 {
+		return
+	}
 	live, err := h.sessionMgr.GetSession(session.ID)
 	if err != nil || live == nil {
 		return
 	}
-	if !virtualEvidenceMatchesBoundFile(verified, live) {
+	if !virtualEvidenceMatchesBoundFile(ctx, verified, live, h.fileResolver) {
 		return
 	}
 	var record *playback.AttemptRecordV3

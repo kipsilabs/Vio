@@ -1799,6 +1799,114 @@ func (m *SessionManager) SetVirtualProbeOutcomeIfGeneration(sessionID string, ge
 	return true, nil
 }
 
+// SetVirtualProbeVerifiedInventoryIfGeneration atomically records a deferred
+// probe's verified outcome AND replaces the live session's carried virtual
+// inventory with the tracks the probe just committed, under one generation-fenced
+// critical section. It is the propagation half of same-session verified
+// inventory: the serve bind deliberately keeps serving the session's carried
+// inventory (the list the transport was started and muxed against), so the
+// verified truth reaches the menu by updating that carried inventory rather than
+// by swapping the row's tracks in on every read. A row overlay would publish a
+// selection ordinal space the transport never used and silence fast starts.
+//
+// The outcome and the inventory move together on purpose. Recording verified in
+// a separate write would let a poll observe the verified status while the menu
+// still carried the provisional plan-time list — the exact transient the
+// propagation exists to close. A write that reports applied has therefore already
+// published both; a write that reports not-applied (a rotation moved the
+// generation) has changed neither.
+//
+// The candidate provenance anchor (URI, row id, evidence-set flag) is left
+// untouched: the committed tracks describe the same bound candidate the plan
+// captured, so the anchor still names them. revision replaces
+// VirtualSourceRevision so the inventory revision and its ETag move on the
+// verified commit and the client's conditional poll stops returning 304;
+// streamRevision advances so in-memory snapshot readers observe the change too.
+func (m *SessionManager) SetVirtualProbeVerifiedInventoryIfGeneration(sessionID string, generation uint64, revision string, audio []models.AudioTrack, subtitles []models.SubtitleTrack, external []models.ExternalSubtitle) (bool, error) {
+	// Generation-only is the binding CAS with an empty expectation: the zero
+	// snapshot fences on the generation and nothing else, preserving this
+	// method's historical contract for callers that hold no binding snapshot.
+	return m.SetVirtualProbeVerifiedInventoryIfBinding(sessionID, VirtualSourceBindingSnapshot{Generation: generation}, revision, audio, subtitles, external)
+}
+
+// SetVirtualProbeVerifiedInventoryIfBinding is the full-binding form of
+// SetVirtualProbeVerifiedInventoryIfGeneration. It records a deferred probe's
+// verified outcome AND replaces the live session's carried virtual inventory
+// under one critical section, but only while the session's candidate binding
+// still matches the expectation in every dimension the snapshot captured —
+// generation, virtual URI, owner installation, and effective media file row.
+//
+// The effective-row dimension is the reason this form exists. A binding move
+// bumps virtualSourceGeneration, but SetEffectiveMediaFileID can point a session
+// at a rotated release row without touching the generation; a generation-only
+// fence would then let a probe that validated the old row commit the old row's
+// inventory onto the changed binding. Comparing the captured row id atomically
+// closes that window: a row-id-only mutation between the validate and the commit
+// makes the CAS reject rather than mislabel the new binding's inventory.
+//
+// A zero field in expected is not asserted: EffectiveMediaFileID <= 0, an empty
+// VirtualURI and a zero OwnerInstallationID each leave that dimension unfenced,
+// so a caller that captured only the generation keeps the prior behavior.
+func (m *SessionManager) SetVirtualProbeVerifiedInventoryIfBinding(sessionID string, expected VirtualSourceBindingSnapshot, revision string, audio []models.AudioTrack, subtitles []models.SubtitleTrack, external []models.ExternalSubtitle) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		return false, ErrSessionNotFound
+	}
+	if !s.matchesVirtualBindingLocked(expected) {
+		return false, nil
+	}
+	// Preserve the selected track's identity across the overlay swap before the
+	// list is replaced. The transport derives its audio-only ordinal from the
+	// selected track's position in this list (audioStreamOrdinalV3), so leaving
+	// the array position untouched when the verified list reorders it would point
+	// the next remux at a different stream. Remapping to the same track keeps the
+	// derived ordinal naming the stream the running mux was started against.
+	if remapped := remapAudioSelectionIndex(s.VirtualAudioTracks, s.AudioTrackIndex, audio); remapped >= 0 {
+		s.AudioTrackIndex = remapped
+	}
+	s.VirtualAudioTracks = audio
+	s.VirtualSubtitleTracks = subtitles
+	s.VirtualExternalSubtitles = external
+	s.VirtualSubtitleEvidenceSet = true
+	s.VirtualSourceRevision = revision
+	setVirtualProbeOutcomeLocked(s, VirtualProbeOutcomeVerified)
+	s.streamRevision++
+	m.touchSessionLocked(s)
+	return true, nil
+}
+
+// matchesVirtualBindingLocked reports whether the session still carries the
+// exact binding an expectation snapshot captured. Zero-valued expectation fields
+// are not asserted, so the empty snapshot is a generation-only fence. Caller
+// holds m.mu.
+func (s *Session) matchesVirtualBindingLocked(expected VirtualSourceBindingSnapshot) bool {
+	if s == nil {
+		return false
+	}
+	if s.virtualSourceGeneration != expected.Generation {
+		return false
+	}
+	if expected.VirtualURI != "" && !sameVirtualSourceURI(s.VirtualSourceURI, expected.VirtualURI) {
+		return false
+	}
+	if expected.OwnerInstallationID != 0 && s.VirtualSourceOwnerInstallationID != expected.OwnerInstallationID {
+		return false
+	}
+	if expected.EffectiveMediaFileID > 0 && s.MediaFileID != expected.EffectiveMediaFileID {
+		return false
+	}
+	return true
+}
+
+// sameVirtualSourceURI compares two candidate binding URIs modulo surrounding
+// whitespace, the same equality every binding snapshot assertion uses.
+func sameVirtualSourceURI(a, b string) bool {
+	return strings.TrimSpace(a) == strings.TrimSpace(b)
+}
+
 // ArmVirtualProbePendingIfGeneration transitions a binding generation's probe
 // outcome from empty to pending, and only from empty. It is the exclusive
 // ownership fence for deferred-probe admission: a duplicate start whose
@@ -2298,6 +2406,51 @@ func (m *SessionManager) SetEffectiveMediaFileID(sessionID string, fileID int) e
 	s.streamRevision++
 	m.touchSessionLocked(s)
 	return nil
+}
+
+// ReanchorVirtualEffectiveRow atomically points a live virtual session at the
+// concrete catalog row that owns its bound candidate and re-anchors its carried
+// track evidence to that row, but only while the binding generation still
+// matches and the effective row is still the one the caller observed.
+//
+// It is the late-owner adoption for a first-ever auto start: the concrete
+// ?result= row did not exist when the plan resolved, so the session kept the
+// release's provider-neutral sibling, and the deferred probe stamped that
+// sibling. When the owner row materializes later in the same session, the serve
+// and inventory binds resolve it by exact path, but the session's effective row
+// and evidence anchor still name the neutral sibling, so the verified overlay is
+// rejected as a different candidate and the menus freeze. Moving both the
+// effective row and the evidence row id to the owner keeps the overlay applying.
+//
+// The evidence URI is set to the bound candidate URI the caller resolved, so
+// the anchor names the exact row the session now serves. A zero expectedRowID
+// does not assert the current row; a rowID <= 0 or equal to the current row is a
+// no-op. An unknown session reports ErrSessionNotFound.
+func (m *SessionManager) ReanchorVirtualEffectiveRow(sessionID string, expectedGeneration uint64, expectedRowID, rowID int, evidenceURI string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		return false, ErrSessionNotFound
+	}
+	if s.virtualSourceGeneration != expectedGeneration {
+		return false, nil
+	}
+	if expectedRowID > 0 && s.MediaFileID != expectedRowID {
+		return false, nil
+	}
+	if rowID <= 0 || s.MediaFileID == rowID {
+		return false, nil
+	}
+	s.MediaFileID = rowID
+	s.VirtualSubtitleEvidenceFileID = rowID
+	if trimmed := strings.TrimSpace(evidenceURI); trimmed != "" {
+		s.VirtualSubtitleEvidenceURI = trimmed
+	}
+	s.streamRevision++
+	m.touchSessionLocked(s)
+	return true, nil
 }
 
 // SetRealtimeConnection marks whether a realtime control connection is active for a session.

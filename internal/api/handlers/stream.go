@@ -33,6 +33,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/subtitles"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary/altmount"
+	"github.com/Silo-Server/silo-server/internal/virtuallibrary/resolver"
 )
 
 const (
@@ -889,8 +890,20 @@ func bindSessionVirtualSourceWithTracks(ctx context.Context, file *models.MediaF
 	// row's later-populated inventory would serve a track the client never
 	// selected. Absent evidence (the flag unset) is the only case with nothing
 	// to apply, and the only case the live row may speak for.
-	hasEvidence := session.VirtualSubtitleEvidenceSet
-	evidenceRejected := hasEvidence && !virtualEvidenceMatchesBoundFile(bound, session)
+	//
+	// The carried inventory is authoritative for the whole session, verified
+	// row or not. This same bind feeds the serve path (the transport muxes the
+	// audio stream the session selected) and the inventory endpoint, so both
+	// must read the one list the plan committed to: swapping in the row's tracks
+	// here would publish a selection_index/ordinal space the transport was never
+	// muxed against, and a fast start would play silence. When a deferred probe
+	// commits the release's real tracks, the truth reaches the session itself
+	// (the probe worker replaces this carried inventory and advances the source
+	// revision) rather than being swapped in on read; that keeps the menu and
+	// the transport coherent and breaks the client's 304. Evidence for a
+	// different candidate is still rejected outright.
+	evidenceSet := session.VirtualSubtitleEvidenceSet
+	evidenceRejected := evidenceSet && !virtualEvidenceMatchesBoundFile(ctx, bound, session, resolver)
 	if evidenceRejected {
 		slog.WarnContext(ctx, "virtual session track evidence belongs to a different candidate; using the bound file's tracks",
 			"component", "api",
@@ -898,9 +911,8 @@ func bindSessionVirtualSourceWithTracks(ctx context.Context, file *models.MediaF
 			"file_id", file.ID,
 			"evidence_uri", session.VirtualSubtitleEvidenceURI,
 			"file_path", bound.FilePath)
-		hasEvidence = false
 	}
-	if hasEvidence {
+	if evidenceSet && !evidenceRejected {
 		boundCopy := *bound
 		boundCopy.SubtitleTracks = session.VirtualSubtitleTracks
 		boundCopy.ExternalSubtitles = session.VirtualExternalSubtitles
@@ -923,7 +935,7 @@ func bindSessionVirtualSourceWithTracks(ctx context.Context, file *models.MediaF
 	// rotation onto a different release must not carry the previous release's
 	// audio, and a probed row must never be downgraded from verified to declared.
 	if bound.ProbeUpdatedAt == nil && session.VirtualAudioTracks != nil &&
-		virtualEvidenceMatchesBoundFile(bound, session) {
+		virtualEvidenceMatchesBoundFile(ctx, bound, session, resolver) {
 		boundCopy := *bound
 		boundCopy.AudioTracks = session.VirtualAudioTracks
 		return &boundCopy
@@ -991,14 +1003,18 @@ func bindSessionVirtualSourceWithTracks(ctx context.Context, file *models.MediaF
 // to sibling row B, and an unknown bound row (id 0) carries no identity to
 // confirm. A zero evidence row id (a legacy or reconstructed session) falls
 // back to URI-only matching, preserving the historical behavior.
-func virtualEvidenceMatchesBoundFile(bound *models.MediaFile, session *playback.Session) bool {
+//
+// One further case is admitted: the canonical collection variant. A
+// result-pinned session can carry evidence anchored at the release's
+// provider-neutral collection path while its bound row names the concrete
+// ?result= sibling actually served. Those two paths differ only by the result
+// id, so sameVirtualCandidate rejects them even though they can name one
+// release. That pairing is accepted only when the neutral keys agree and the
+// two rows' durable provider identities prove a shared release (see
+// canonicalCollectionEvidenceMatchesBoundRow); empty or conflicting tiers fail
+// closed.
+func virtualEvidenceMatchesBoundFile(ctx context.Context, bound *models.MediaFile, session *playback.Session, fileResolver FilePathResolver) bool {
 	if session == nil || bound == nil {
-		return false
-	}
-	// Known evidence-row identity is enforced on both URI paths: the bound row
-	// must be the exact row the evidence was captured from. An unknown bound row
-	// (id 0) cannot be confirmed and is rejected rather than trusted.
-	if evidenceID := session.VirtualSubtitleEvidenceFileID; evidenceID > 0 && bound.ID != evidenceID {
 		return false
 	}
 	// The candidate URI applies even on a matching row: a row adopted in place
@@ -1013,7 +1029,103 @@ func virtualEvidenceMatchesBoundFile(bound *models.MediaFile, session *playback.
 	if evidenceURI == "" {
 		return false
 	}
+	if virtualEvidenceAnchorsBoundRow(bound, session, evidenceURI) {
+		return true
+	}
+	return canonicalCollectionEvidenceMatchesBoundRow(ctx, bound, session, fileResolver, evidenceURI)
+}
+
+// virtualEvidenceAnchorsBoundRow is the historical provenance match: the bound
+// row must be the exact row the evidence was captured from and the evidence URI
+// must still name that row's candidate. A known evidence-row identity is
+// enforced even when the URI agrees, so an unknown bound row (id 0) carries no
+// identity to confirm and a sibling row that merely shares the candidate URI
+// never inherits the evidence.
+func virtualEvidenceAnchorsBoundRow(bound *models.MediaFile, session *playback.Session, evidenceURI string) bool {
+	if evidenceID := session.VirtualSubtitleEvidenceFileID; evidenceID > 0 && bound.ID != evidenceID {
+		return false
+	}
 	return sameVirtualCandidate(evidenceURI, bound.FilePath)
+}
+
+// canonicalCollectionEvidenceMatchesBoundRow reports whether evidence anchored
+// at a provider-neutral collection path describes the same release as the
+// result-pinned row the session is bound to. The collection variant materializes
+// a neutral row for a release while the transport can pin a concrete ?result=
+// sibling of it, so the session carries the neutral anchor and the serve path
+// must still recognize the release rather than rejecting the verified tracks
+// for the whole session.
+//
+// The gate is deliberately narrow, because the neutral key alone does not prove
+// a release: every candidate of one content shares the base path and differs
+// only in the result id, so two genuinely different releases of the same episode
+// share a neutral key. Recognition therefore requires all three of: the evidence
+// names the neutral path, the bound row names a concrete result-pinned sibling
+// with the same neutral key, and the two rows' durable provider identities share
+// a non-empty tier. Empty or conflicting tiers fail closed, so an identity-less
+// or cross-release collection row is never accepted.
+func canonicalCollectionEvidenceMatchesBoundRow(ctx context.Context, bound *models.MediaFile, session *playback.Session, fileResolver FilePathResolver, evidenceURI string) bool {
+	boundPath := strings.TrimSpace(bound.FilePath)
+	if virtualResultCandidateID(evidenceURI) != "" || virtualResultCandidateID(boundPath) == "" {
+		return false
+	}
+	if virtualPlaybackNeutralKey(evidenceURI) != virtualPlaybackNeutralKey(boundPath) {
+		return false
+	}
+	evidence := canonicalEvidenceReleaseRow(ctx, session, fileResolver, evidenceURI)
+	if evidence == nil || evidence.ID == bound.ID {
+		// No distinct collection row to prove the release against: comparing a
+		// row with itself is not proof, so an unresolvable or self-named anchor
+		// fails closed.
+		return false
+	}
+	return boundRowSharesRelease(bound, evidence)
+}
+
+// canonicalEvidenceReleaseRow resolves the catalog row that owns the session's
+// neutral evidence anchor. The evidence row id is tried first and is trusted
+// only when it still names the neutral path; a stale id (or a legacy session
+// carrying none) falls back to an exact path lookup. A resolver without
+// GetByPath cannot answer, and the caller then fails closed rather than reading
+// an identity off the bound row.
+func canonicalEvidenceReleaseRow(ctx context.Context, session *playback.Session, fileResolver FilePathResolver, evidenceURI string) *models.MediaFile {
+	if fileResolver == nil || evidenceURI == "" {
+		return nil
+	}
+	if evidenceID := session.VirtualSubtitleEvidenceFileID; evidenceID > 0 {
+		if row, err := fileResolver.GetByID(ctx, evidenceID); err == nil && row != nil && row.ID == evidenceID {
+			path := strings.TrimSpace(row.FilePath)
+			if virtualResultCandidateID(path) == "" && virtualPlaybackNeutralKey(path) == virtualPlaybackNeutralKey(evidenceURI) {
+				return row
+			}
+		}
+	}
+	pathResolver, ok := fileResolver.(interface {
+		GetByPath(context.Context, string) (*models.MediaFile, error)
+	})
+	if !ok {
+		return nil
+	}
+	if row, err := pathResolver.GetByPath(ctx, evidenceURI); err == nil && row != nil && row.ID > 0 {
+		return row
+	}
+	return nil
+}
+
+// boundRowSharesRelease reports whether a result-pinned bound row and the row a
+// neutral evidence anchor names describe one release, judged by their durable
+// provider identity. The bound row is the viewer's persisted selection and the
+// evidence row is the fresh claim, so the asymmetric SharedTier is used: a
+// stronger stored tier the evidence cannot corroborate is a veto, and an
+// identity whose tiers are all empty never matches.
+func boundRowSharesRelease(bound, evidence *models.MediaFile) bool {
+	if bound == nil || evidence == nil {
+		return false
+	}
+	boundTiers := resolver.NewPersistedIdentityTiers(bound.ProviderVideoHash, bound.ProviderGUID, bound.ProviderReleaseName, bound.ProviderReleaseSize)
+	evidenceTiers := resolver.NewPersistedIdentityTiers(evidence.ProviderVideoHash, evidence.ProviderGUID, evidence.ProviderReleaseName, evidence.ProviderReleaseSize)
+	_, shared := boundTiers.SharedTier(evidenceTiers)
+	return shared
 }
 
 // sameVirtualCandidate reports whether two provider-neutral virtual paths name
@@ -1473,10 +1585,18 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Bind to the session's planned virtual URI when available: the catalog
-	// row's path is mutable (candidate rotation), but the session captured
-	// the exact URI that was resolved and probed during planning.
-	file = bindSessionVirtualSource(file, session)
+	// Adopt the concrete owner row of the bound candidate when it has appeared
+	// since the plan, then bind to the session's planned virtual URI: the
+	// catalog row's path is mutable (candidate rotation), but the session
+	// captured the exact URI that was resolved and probed during planning. The
+	// tracks bind is used so the session's carried overlay travels with the row,
+	// exactly as the inventory bind does — a session adopted onto the owner row
+	// must keep serving the verified inventory it verified, not the owner row's
+	// thinner declared list.
+	if adopted, refreshed := reanchorLateVirtualOwnerRow(r.Context(), h.fileResolver, h.sessionMgr, file, session, session.VirtualSourceURI); adopted != nil {
+		file, session = adopted, refreshed
+	}
+	file = bindSessionVirtualSourceWithTracks(r.Context(), file, session, h.fileResolver)
 
 	// Capture the delivered identity and observed health state at transport
 	// start: the delivered candidate is the path the transport will serve
@@ -2181,7 +2301,7 @@ func (h *StreamHandler) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 	// different candidate than the session is bound to (the serve layer
 	// rotated without updating the evidence) — in that case the plan ordinal
 	// is untrustworthy against every candidate on hand.
-	evidenceTrusted := session.VirtualSubtitleEvidenceSet && virtualEvidenceMatchesBoundFile(file, session)
+	evidenceTrusted := session.VirtualSubtitleEvidenceSet && virtualEvidenceMatchesBoundFile(r.Context(), file, session, h.fileResolver)
 	driftSuspected := isVirtualPlaybackFile(file) &&
 		session.VirtualSourceURI != "" &&
 		session.VirtualSubtitleEvidenceSet &&

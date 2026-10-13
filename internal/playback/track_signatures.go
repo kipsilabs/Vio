@@ -99,3 +99,54 @@ func languagesEqualMultiset(a, b []string) bool {
 func trackStringEqual(a, b string) bool {
 	return strings.EqualFold(strings.TrimSpace(a), strings.TrimSpace(b))
 }
+
+// remapAudioSelectionIndex returns the position in next that names the same
+// audio track the session had selected at prev[selectedIndex], so replacing the
+// carried inventory cannot silently move the transport's derived 0:a:N ordinal
+// onto a different stream when the verified list reorders or trims the plan-time
+// list. It matches by absolute container stream index first (the probe's
+// recorded position, stable across a reorder), then by the persisted track
+// signature, then by language and codec.
+//
+// It returns -1 when the selected track cannot be re-identified — a genuinely
+// removed stream. The caller then leaves the selection untouched: withdrawing
+// the plan for a vanished track is the reconciliation path's correction, not a
+// silent renumber onto whichever track now occupies the old position.
+func remapAudioSelectionIndex(prev []models.AudioTrack, selectedIndex int, next []models.AudioTrack) int {
+	if selectedIndex < 0 || selectedIndex >= len(prev) {
+		return -1
+	}
+	selected := prev[selectedIndex]
+	// Absolute stream index is only meaningful in a probed inventory; a
+	// synthesized virtual list carries Index 0 for every track, where matching
+	// on it would collide every track.
+	if audioInventoryProbed(prev) && selected.Index >= 0 {
+		for i, track := range next {
+			if track.Index == selected.Index {
+				return i
+			}
+		}
+	}
+	if idx := findExactAudioTrack(next, AudioTrackSignatureFromTrack(selected)); idx >= 0 {
+		return idx
+	}
+	for i, track := range next {
+		if trackStringEqual(track.Language, selected.Language) && trackStringEqual(track.Codec, selected.Codec) {
+			return i
+		}
+	}
+	return -1
+}
+
+// audioInventoryProbed reports whether an audio inventory came from a real
+// probe: any track carrying a positive absolute container stream index. It
+// mirrors the classification playback.AudioStreamOrdinal uses, so the two index
+// domains never disagree about which mapping applies.
+func audioInventoryProbed(tracks []models.AudioTrack) bool {
+	for _, track := range tracks {
+		if track.Index > 0 {
+			return true
+		}
+	}
+	return false
+}
