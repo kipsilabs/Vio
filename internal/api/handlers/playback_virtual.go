@@ -4419,6 +4419,13 @@ func execVirtualFileMetadataUpdateResult(ctx context.Context, db VirtualFileMeta
 		// The metadata-only retry also missed the CAS fence.
 		return VirtualFileMetadataUpdateResult{}, nil
 	}
+	// The retry wrote fresh evidence on the current row (it deliberately did not
+	// adopt the requested identity). The row now carries evidence, so any
+	// consecutive-refusal count for this row and pin is stale and must be
+	// cleared exactly as the ordinary success path does; otherwise a later
+	// unrelated refusal would inherit the pre-success count and reach the
+	// terminal threshold prematurely.
+	clearAdoptionRefusalStore(ctx, store, args.FileID, args.ExpectedFilePath)
 	return VirtualFileMetadataUpdateResult{
 		RowsAffected:    1,
 		MetadataUpdated: true,

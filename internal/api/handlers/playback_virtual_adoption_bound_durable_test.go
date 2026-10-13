@@ -10,6 +10,8 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary/resolver"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // fakeAdoptionRefusalStore is a shared, deterministic stand-in for the durable
@@ -312,5 +314,93 @@ func TestVirtualProbeEvidenceOwnerLookupBackoffRecovers(t *testing.T) {
 	}
 	if virtualOwnerLookups.recent(backoffKey) {
 		t.Fatal("a successful lookup did not clear the backoff window")
+	}
+}
+
+// adoptionBoundCollidingRetryDB models the unique-path collision that forces a
+// metadata-only retry: the first adoption write fails with Postgres
+// unique-violation 23505, and the retry (with no adopt path) writes evidence on
+// the row's current path and reports it as persisted.
+type adoptionBoundCollidingRetryDB struct {
+	calls int
+}
+
+func (d *adoptionBoundCollidingRetryDB) QueryRow(context.Context, string, ...any) pgx.Row {
+	d.calls++
+	if d.calls == 1 {
+		return adoptionBoundScanErrorRow{err: &pgconn.PgError{Code: "23505"}}
+	}
+	return adoptionBoundScanStringRow{path: "virtual://retained-pin"}
+}
+
+type adoptionBoundScanErrorRow struct{ err error }
+
+func (r adoptionBoundScanErrorRow) Scan(...any) error { return r.err }
+
+type adoptionBoundScanStringRow struct{ path string }
+
+func (r adoptionBoundScanStringRow) Scan(dest ...any) error {
+	if len(dest) > 0 {
+		if out, ok := dest[0].(*string); ok {
+			*out = r.path
+		}
+	}
+	return nil
+}
+
+// TestVirtualAdoptionMetadataOnlyRetryClearsRefusalCount proves the clear-on-
+// success path also covers the metadata-only retry after an adoption uniqueness
+// collision. The retry writes evidence without adopting the requested identity,
+// so the row now carries evidence and its pre-success refusals are stale: the
+// next unrelated refusal must start at one instead of inheriting the old count
+// and reaching the terminal threshold prematurely.
+func TestVirtualAdoptionMetadataOnlyRetryClearsRefusalCount(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeAdoptionRefusalStore()
+	row := adoptionBoundTestRow(5031935, "retry-hash")
+	args := models.VirtualFilePersistArgs{
+		FileID:           row.ID,
+		ExpectedFilePath: row.FilePath,
+		AdoptPath:        "virtual://series/tt39087958/1/1?profile=4K+Dolby+Vision&result=collides",
+		// The caller wants the metadata write but does not require the adoption,
+		// so a unique-path collision falls into the retry path rather than being
+		// refused outright.
+		RequireAdopt: false,
+	}
+	// A populated durable counter left by an earlier refusal stream.
+	for i := 0; i < virtualAdoptionRefusalBound; i++ {
+		if _, err := store.RecordVirtualAdoptionRefusal(ctx, row.ID, row.FilePath, virtualAdoptionRefusalTTL); err != nil {
+			t.Fatalf("seed refusal: %v", err)
+		}
+	}
+
+	db := &adoptionBoundCollidingRetryDB{}
+	result, err := ExecVirtualFileMetadataUpdateResultWithRefusals(ctx, db, args, store)
+	if err != nil {
+		t.Fatalf("metadata-only retry failed: %v", err)
+	}
+	if !result.MetadataUpdated || result.IdentityAdopted {
+		t.Fatalf("retry result = %+v, want a metadata update without adoption", result)
+	}
+	if got := countAdoptionRefusalStore(ctx, store, row.ID, row.FilePath); got != 0 {
+		t.Fatalf("refusal count after the metadata-only retry = %d, want 0", got)
+	}
+
+	// The next refusal is a fresh stream: one, not the terminal bound.
+	refusing := models.VirtualFilePersistArgs{
+		FileID:           row.ID,
+		ExpectedFilePath: row.FilePath,
+		AdoptPath:        "virtual://series/tt39087958/1/1?profile=4K+Dolby+Vision&result=next",
+		RequireAdopt:     true,
+	}
+	if _, err := ExecVirtualFileMetadataUpdateResultWithRefusals(ctx, adoptionBoundRefusingDB{}, refusing, store); err == nil {
+		t.Fatal("refused adoption reported success")
+	}
+	if got := countAdoptionRefusalStore(ctx, store, row.ID, row.FilePath); got != 1 {
+		t.Fatalf("next refusal count = %d, want 1", got)
+	}
+	h := &PlaybackHandler{VirtualAdoptionRefusalStore: store}
+	if h.adoptionRefusalBoundReached(ctx, refusing) {
+		t.Fatal("the next refusal reached the terminal bound from a pre-success count")
 	}
 }
