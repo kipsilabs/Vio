@@ -1032,6 +1032,18 @@ func sameVirtualCandidate(a, b string) bool {
 	if aID == "" || bID == "" || aID != bID {
 		return false
 	}
+	return sameVirtualProfileScope(a, b)
+}
+
+// sameVirtualProfileScope reports whether two virtual paths share a
+// provider-neutral profile scope: the same scheme/host/path and quality profile
+// with the concrete per-listing "result=" pick removed. Scope equality is not
+// release identity — a provider can mint several concrete result picks
+// (siblings) under one profile — so it must never be used alone to conclude two
+// paths are the same release. Callers that need release identity pair it with a
+// concrete result-id equality (sameVirtualCandidate) or with the session's
+// pinned, probe-authoritative evidence.
+func sameVirtualProfileScope(a, b string) bool {
 	return virtualPlaybackNeutralKey(a) == virtualPlaybackNeutralKey(b)
 }
 

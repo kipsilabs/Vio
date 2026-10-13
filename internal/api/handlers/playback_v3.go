@@ -8577,18 +8577,28 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			// release is never swapped silently.
 			carryPinnedCandidate := (trackChange || seekReanchor) && !virtualDecodeRotation &&
 				strings.TrimSpace(session.VirtualSourceURI) != "" &&
-				(candidateUnchanged || session.VirtualSubtitleEvidenceSet ||
-					// The catalog row can be the provider-neutral profile while the
-					// session pin is a concrete pick under it (the provider churns
-					// the per-listing result id for bytes that never changed). A
-					// user-intent replan must still carry that pin — re-listing
-					// pays a multi-second round-trip to hand back a token the
-					// identity guard then refuses to adopt. The pin must be
-					// describable from the session's carried evidence, or the
-					// relist path stays in charge so an offline pin surfaces as
-					// source_unavailable rather than planning against a stub.
-					(virtualPinnedProfileRowV3(session, currentEffectiveFile) &&
-						sessionCarriesVirtualEvidenceV3(session)))
+				(candidateUnchanged ||
+					// A user-intent replan keeps the session's pinned candidate
+					// when the reloaded row is the pin's own row under a churned
+					// per-listing token (the probe-evidence flag) or that
+					// profile's provider-neutral row (virtualPinnedProfileRowV3),
+					// AND the session's retained provenance actually describes
+					// the pin and the row being bound. The provider churns the
+					// per-listing result id for bytes that never changed, so a
+					// re-listing pays a multi-second round-trip to hand back a
+					// token the identity guard then refuses to adopt. Admission
+					// is provenance-checked, not presence-checked: a stop, a
+					// binding move, or a rotation can leave the anchor naming the
+					// previous candidate, and trusting it would bypass resolution
+					// while the binder, which rejects the mismatch, cannot supply
+					// trustworthy inventory. A row whose only relationship to the
+					// pin is a different release keeps re-resolving, so an
+					// offline pin surfaces as source_unavailable through the
+					// existing rotation semantics instead of planning against a
+					// stub. The release is never swapped silently.
+					(sessionProvenanceMatchesPinnedRowV3(session, currentEffectiveFile) &&
+						(session.VirtualSubtitleEvidenceSet ||
+							virtualPinnedProfileRowV3(session, currentEffectiveFile))))
 			if candidateUnchanged && evidenceComplete && !virtualDecodeRotation {
 				currentEffectiveFile.FilePath = session.VirtualSourceURI
 				currentEffectiveFile.VirtualOwnerInstallationID = session.VirtualSourceOwnerInstallationID
@@ -11308,14 +11318,21 @@ func virtualCandidateRotationRecordedV3(session *playback.Session, effectiveFile
 }
 
 // virtualPinnedProfileRowV3 reports whether the catalog row a replan loaded is
-// the provider-neutral counterpart of the session's pinned concrete candidate:
-// the same profile/release path, with the row carrying no concrete "result="
-// pick while the session pin names one. The provider mints and churns the
-// per-listing result id for bytes that never changed, so on a session serving a
-// concrete pick the reloaded catalog row can be the provider-neutral profile row
-// while the session stays bound to the concrete candidate. A user-intent replan
-// (track change or seek) must carry that pin instead of re-listing: requiring
-// result-id equality would reject the very binding the session is serving.
+// the provider-neutral profile row of the session's pinned concrete candidate:
+// the session pin carries a concrete "result=" pick while the row carries none,
+// and the two share a provider-neutral profile scope (sameVirtualProfileScope).
+//
+// The provider mints and churns the per-listing result id for bytes that never
+// changed, so on a session serving a concrete pick the reloaded catalog row can
+// be the provider-neutral profile row while the session stays bound to the
+// concrete candidate. A user-intent replan (track change or seek) must carry
+// that pin instead of re-listing: requiring result-id equality would reject the
+// very binding the session is serving.
+//
+// Profile-scope equality does not identify the release: several concrete sibling
+// picks can share one profile. This predicate only establishes that the row is
+// the pin's profile; whether the carry is trustworthy rests on the session's
+// pinned evidence (sessionProvenanceMatchesPinnedRowV3), never on scope equality.
 func virtualPinnedProfileRowV3(session *playback.Session, row *models.MediaFile) bool {
 	if session == nil || row == nil {
 		return false
@@ -11331,27 +11348,49 @@ func virtualPinnedProfileRowV3(session *playback.Session, row *models.MediaFile)
 	if virtualResultCandidateID(pinned) == "" || virtualResultCandidateID(rowPath) != "" {
 		return false
 	}
-	return virtualPlaybackNeutralKey(rowPath) == virtualPlaybackNeutralKey(pinned)
+	return sameVirtualProfileScope(rowPath, pinned)
 }
 
-// sessionCarriesVirtualEvidenceV3 reports whether the session holds
-// probe-authoritative evidence, or the provenance anchor a cleared evidence set
-// leaves behind, describing its pinned virtual bytes. A cleared evidence set
-// (a full v3 state write after a plan whose effective row was unprobed) keeps
-// the evidence URI/file id while dropping the flag, so the anchor is the durable
-// signal that the session once proved these bytes. Provider-declared audio
-// tracks alone do not qualify: a session that merely resolved a concrete
-// candidate without probing it must still re-resolve, so an offline pin
-// surfaces through the rotation semantics instead of planning against a stub.
-func sessionCarriesVirtualEvidenceV3(session *playback.Session) bool {
+// sessionHasVirtualProvenanceV3 reports whether the session holds any provenance
+// describing its pinned virtual bytes: the probe-evidence flag, the evidence
+// URI, or the evidence row id. It says nothing about whether that provenance
+// still describes the current pin; sessionProvenanceMatchesPinnedRowV3 decides
+// that. Provider-declared audio tracks alone do not qualify: a session that
+// merely resolved a concrete candidate without probing it must still re-resolve,
+// so an offline pin surfaces through the rotation semantics instead of planning
+// against a stub.
+func sessionHasVirtualProvenanceV3(session *playback.Session) bool {
 	if session == nil {
 		return false
 	}
-	if session.VirtualSubtitleEvidenceSet {
-		return true
-	}
-	return strings.TrimSpace(session.VirtualSubtitleEvidenceURI) != "" ||
+	return session.VirtualSubtitleEvidenceSet ||
+		strings.TrimSpace(session.VirtualSubtitleEvidenceURI) != "" ||
 		session.VirtualSubtitleEvidenceFileID > 0
+}
+
+// sessionProvenanceMatchesPinnedRowV3 reports whether the session's retained
+// provenance actually describes the candidate the session is pinned to and the
+// catalog row a replan would bind for it.
+//
+// Presence is not enough. A binding move (SetVirtualSource) or a provider
+// rotation leaves the evidence flag and its URI/row-id anchor naming the
+// previous candidate, so accepting any nonempty anchor lets the carry bypass
+// resolution while bindSessionVirtualSourceWithTracks — which rejects mismatched
+// provenance — cannot supply trustworthy inventory. The retained provenance is
+// therefore evaluated exactly as that binder will: the row keeps its catalog id
+// but names the session's pinned candidate, and the evidence row id (when known)
+// must be that row while the evidence URI must name the pinned candidate.
+//
+// Legacy exceptions mirror virtualEvidenceMatchesBoundFile: a session that
+// predates the evidence URI still matches on its virtual source URI (the pin),
+// and a session with no known evidence row id falls back to URI-only matching.
+func sessionProvenanceMatchesPinnedRowV3(session *playback.Session, row *models.MediaFile) bool {
+	if !sessionHasVirtualProvenanceV3(session) || row == nil {
+		return false
+	}
+	bound := *row
+	bound.FilePath = session.VirtualSourceURI
+	return virtualEvidenceMatchesBoundFile(&bound, session)
 }
 
 // planVirtualSourceRevisionV3 returns the opaque virtual-source revision the
