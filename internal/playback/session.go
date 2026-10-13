@@ -1838,6 +1838,7 @@ func (m *SessionManager) CommitVirtualProbeTracksIfGeneration(sessionID string, 
 	return true, nil
 }
 
+// ArmVirtualProbePendingIfGeneration transitions a binding generation's probe
 // outcome from empty to pending, and only from empty. It is the exclusive
 // ownership fence for deferred-probe admission: a duplicate start whose
 // SaveAttempt lost the CAS adopts the winner's session and re-enters the start
