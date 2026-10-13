@@ -169,8 +169,8 @@ func TestEnrichSessionBoundCandidateIdentityDoesNotBorrowFreshnessWithoutURL(t *
 
 // TestOwningSessionBoundCandidateRowLookupParity proves both lookup
 // implementations (the injected VirtualFileLookup and the path resolver) assert
-// the same ownership: a matching content id recovers the row, and an anchor
-// with no content id proves nothing and is refused.
+// the same ownership: a matching content id recovers the row, an anchor with no
+// content id proves nothing and is refused, and a lookup failure fails closed.
 func TestOwningSessionBoundCandidateRowLookupParity(t *testing.T) {
 	const pinnedURI = "virtual://movie/tt-parity?result=cand-a"
 	owner := &models.MediaFile{
@@ -195,6 +195,37 @@ func TestOwningSessionBoundCandidateRowLookupParity(t *testing.T) {
 			}
 		})
 	}
+
+	// A lookup that cannot run fails closed: no row means no overlay, and the
+	// caller keeps its own row.
+	failing := &models.MediaFile{ID: 683, ContentID: "movie-parity", EpisodeID: "ep-1", FilePath: pinnedURI, MediaFolderID: 7}
+	for _, tc := range []struct {
+		name string
+		h    *PlaybackHandler
+	}{
+		{"injected lookup error", &PlaybackHandler{VirtualFileLookup: func(context.Context, string) (*models.MediaFile, error) {
+			return nil, errors.New("lookup unavailable")
+		}}},
+		{"path resolver error", &PlaybackHandler{fileResolver: erroringPathResolver{}}},
+		{"path resolver not found", &PlaybackHandler{fileResolver: &churnIdentityFileResolver{}}},
+		{"no resolver", &PlaybackHandler{}},
+	} {
+		if got := tc.h.owningSessionBoundCandidateRow(context.Background(), failing); got != nil {
+			t.Fatalf("%s: expected nil (fail closed), got %#v", tc.name, got)
+		}
+	}
+}
+
+// erroringPathResolver is a path resolver whose lookups fail, for the
+// fail-closed parity cases.
+type erroringPathResolver struct{}
+
+func (erroringPathResolver) GetByID(context.Context, int) (*models.MediaFile, error) {
+	return nil, errors.New("lookup unavailable")
+}
+
+func (erroringPathResolver) GetByPath(context.Context, string) (*models.MediaFile, error) {
+	return nil, errors.New("lookup unavailable")
 }
 
 // --- Trust gate ------------------------------------------------------------
