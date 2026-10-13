@@ -291,4 +291,26 @@ describe("SubtitleMenu", () => {
     expect(screen.getByText("No subtitles available")).toBeTruthy();
     expect(screen.queryByText("Subtitle discovery failed")).toBeNull();
   });
+
+  it("does not show the discovery spinner over a verified list while the poll is still owed", () => {
+    // A refreshed plan can supply the confident list while the deferred poll
+    // is still pending; `pending` alone must not claim discovery in that state.
+    render(
+      createElement(SubtitleMenu, {
+        tracks: [subtitleTrack()],
+        activeIndex: null,
+        onSelect: () => {},
+        delayMs: 0,
+        onDelayChange: () => {},
+        mediaFileId: 42,
+        provisional: false,
+        pending: true,
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /(Enable|Disable) captions/ }));
+
+    expect(screen.queryByText("Discovering subtitles…")).toBeNull();
+    expect(screen.queryByText("Unverified")).toBeNull();
+    expect(screen.getByText("English")).toBeTruthy();
+  });
 });

@@ -349,6 +349,28 @@ describe("AudioTrackMenu", () => {
     expect(screen.queryByText("Track discovery failed")).toBeNull();
   });
 
+  it("does not show the discovery spinner over a verified list while the poll is still owed", () => {
+    // A refreshed plan can supply the confident list while the deferred poll
+    // is still pending; `pending` alone must not claim discovery in that state.
+    render(
+      createElement(AudioTrackMenu, {
+        tracks: [{ title: "English", codec: "eac3", channels: 2 }],
+        activeIndex: 0,
+        onSelect: () => {},
+        currentPosition: 0,
+        open: true,
+        onOpenChange: () => {},
+        hideTrigger: false,
+        provisional: false,
+        pending: true,
+      }),
+    );
+
+    expect(screen.queryByText("Discovering audio tracks…")).toBeNull();
+    expect(screen.queryByText("Unverified")).toBeNull();
+    expect(screen.getByText("English")).toBeTruthy();
+  });
+
   it("renders explicit empty state when tracks are empty and open while verified", () => {
     render(
       createElement(AudioTrackMenu, {
