@@ -394,3 +394,35 @@ func TestVirtualAdoptionMetadataOnlyRetryClearsRefusalCount(t *testing.T) {
 		t.Fatal("the next refusal reached the terminal bound from a pre-success count")
 	}
 }
+
+// lockedCountingStore implements VirtualAdoptionRefusalLockedStore and delegates
+// to the shared fake, so a test can observe whether the handler took the
+// row-first recorder or the lock-free record.
+type lockedCountingStore struct {
+	*fakeAdoptionRefusalStore
+	lockedCalls int
+}
+
+func (s *lockedCountingStore) RecordVirtualAdoptionRefusalLocked(ctx context.Context, fileID int, expectedPath string, ttl time.Duration) (int, error) {
+	s.lockedCalls++
+	return s.fakeAdoptionRefusalStore.RecordVirtualAdoptionRefusal(ctx, fileID, expectedPath, ttl)
+}
+
+// TestVirtualAdoptionRefusalSiblingIncrementUsesRowFirstRecorder proves the
+// same-release sibling rotation takes the media_files row lock for its refusal
+// increment when the store can provide it, instead of the lock-free record that
+// raced the evidence writes and clears.
+func TestVirtualAdoptionRefusalSiblingIncrementUsesRowFirstRecorder(t *testing.T) {
+	ctx := context.Background()
+	store := &lockedCountingStore{fakeAdoptionRefusalStore: newFakeAdoptionRefusalStore()}
+	h := &PlaybackHandler{VirtualAdoptionRefusalStore: store}
+	if got := h.adoptionRefusalStoreCount(ctx, 5041001, "virtual://pinned"); got != 1 {
+		t.Fatalf("count = %d, want 1", got)
+	}
+	if store.lockedCalls != 1 {
+		t.Fatalf("row-first recorder calls = %d, want 1", store.lockedCalls)
+	}
+	if store.records != 1 {
+		t.Fatalf("lock-free record calls = %d, want the increment to use the locked recorder", store.records)
+	}
+}
