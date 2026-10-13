@@ -133,7 +133,9 @@ func TestDeferredProbeRunsDefaultAudioReconciliation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetAttempt: %v", err)
 	}
-	generation := reconcileGenerationV3(&models.MediaFile{ProbeUpdatedAt: &probedAt})
+	// The reconcile now decides against the exact committed carrier, so the
+	// ledger generation is the committed inventory's fingerprint.
+	generation := reconcileGenerationV3(&models.MediaFile{AudioTracks: verifiedAudio})
 	entry := playback.FindAudioReconcileEntry(after.AudioReconcileLedger, generation, session.ID)
 	if entry == nil {
 		t.Fatalf("deferred durable write did not run default-audio reconciliation (ledger = %#v)", after.AudioReconcileLedger)
@@ -143,6 +145,21 @@ func TestDeferredProbeRunsDefaultAudioReconciliation(t *testing.T) {
 	}
 	if entry.AudioIndex == nil || *entry.AudioIndex != 0 {
 		t.Fatalf("corrected audio index = %v, want 0 (pt at its verified position)", entry.AudioIndex)
+	}
+	// The overlay swap preserves the selected track's identity: the session's
+	// index names pt in the verified list, so the remux selector still resolves
+	// the pt stream rather than whatever moved into the old position.
+	live, err := manager.GetSession(session.ID)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	// The session's committed executable stream is the declared en (planTime[0],
+	// container index 1); the overlay swap must keep the index naming that same
+	// stream rather than the position that moved into the old slot.
+	if live.AudioTrackIndex < 0 || live.AudioTrackIndex >= len(live.VirtualAudioTracks) ||
+		live.VirtualAudioTracks[live.AudioTrackIndex].Index != planTime[0].Index {
+		t.Fatalf("session audio selection = index %d of %+v, want the committed en stream (container index %d)",
+			live.AudioTrackIndex, live.VirtualAudioTracks, planTime[0].Index)
 	}
 }
 
@@ -254,7 +271,7 @@ func TestDeferredProbeReconcilePreservesExplicitSelection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetAttempt: %v", err)
 	}
-	generation := reconcileGenerationV3(&models.MediaFile{ProbeUpdatedAt: &probedAt})
+	generation := reconcileGenerationV3(&models.MediaFile{AudioTracks: verifiedAudio})
 	if entry := playback.FindAudioReconcileEntry(after.AudioReconcileLedger, generation, session.ID); entry != nil && entry.Decision == playback.AudioReconcileInvalidated {
 		t.Fatalf("explicit selection was overridden by the deferred reconcile hook: %#v", entry)
 	}
@@ -262,7 +279,15 @@ func TestDeferredProbeReconcilePreservesExplicitSelection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetSession: %v", err)
 	}
-	if live.AudioTrackIndex != 1 {
-		t.Fatalf("explicit audio index moved to %d, want the viewer's 1", live.AudioTrackIndex)
+	// Identity, not raw position: the viewer chose de, and after the reorder the
+	// session's index must still name de so the remux selector resolves its
+	// stream instead of the track that moved into the old slot.
+	if live.AudioTrackIndex < 0 || live.AudioTrackIndex >= len(live.VirtualAudioTracks) ||
+		live.VirtualAudioTracks[live.AudioTrackIndex].Language != "de" {
+		t.Fatalf("explicit selection = index %d of %+v, want the viewer's de track", live.AudioTrackIndex, live.VirtualAudioTracks)
+	}
+	planOrdinal := playback.AudioStreamOrdinal(planTime, 1)
+	if got := audioStreamOrdinalV3(&models.MediaFile{AudioTracks: live.VirtualAudioTracks}, live.AudioTrackIndex); got != planOrdinal {
+		t.Fatalf("explicit selection moved the remux stream to 0:a:%d, want 0:a:%d", got, planOrdinal)
 	}
 }

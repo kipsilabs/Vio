@@ -403,7 +403,7 @@ func TestReconcileSourceRotationRefusesStaleEvidence(t *testing.T) {
 		VirtualSubtitleEvidenceSet:    true,
 		VirtualSourceRevision:         "rev-old",
 	}
-	if virtualEvidenceMatchesBoundFile(file, session) {
+	if virtualEvidenceMatchesBoundFile(context.Background(), file, session, nil) {
 		t.Fatal("rotated candidate URI must not match the bound evidence")
 	}
 }
