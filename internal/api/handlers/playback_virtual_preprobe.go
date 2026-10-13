@@ -100,6 +100,15 @@ type virtualProbeOutcomeWriter interface {
 	SetVirtualProbeOutcomeIfGeneration(sessionID string, generation uint64, outcome string) (bool, error)
 }
 
+// virtualProbeInventoryWriter is the session-manager capability that replaces a
+// live session's carried virtual inventory with the tracks a deferred probe just
+// committed, fenced on the binding generation. It is how verified truth reaches
+// the same session without the serve bind swapping in the row's tracks, which
+// would publish a selection ordinal space the transport never muxed against.
+type virtualProbeInventoryWriter interface {
+	CommitVirtualProbeTracksIfGeneration(sessionID string, generation uint64, revision string, audio []models.AudioTrack, subtitles []models.SubtitleTrack, external []models.ExternalSubtitle) (bool, error)
+}
+
 // startDeferredProbeWorkers lazily starts the fixed post-commit probe pool. The
 // pool is bounded, so enqueuing a probe never spawns a goroutine per request.
 func (h *PlaybackHandler) startDeferredProbeWorkers() {
@@ -540,6 +549,16 @@ func (h *PlaybackHandler) runDeferredVirtualProbe(deferred *virtualDeferredProbe
 		// the CAS reject the verdict, and then nothing is published — the
 		// replacement binding owns its own lifecycle.
 		if h.setVirtualProbeOutcomeIfGeneration(deferred.sessionID, deferred.bindingGeneration, outcome) {
+			if outcome == probeOutcomeVerified && verifiedFileID > 0 {
+				// Propagate the committed inventory into the session's carried
+				// overlay, so the same session's inventory endpoint serves the
+				// verified truth (and a new revision that breaks 304) while the
+				// serve bind keeps reading the one list the transport was muxed
+				// against. The alternative — swapping the row's tracks in on
+				// every read — publishes a different ordinal space and silences
+				// fast starts and resumes.
+				h.commitVerifiedProbeInventoryToSession(bgCtx, deferred, verifiedFileID)
+			}
 			// Publish after the outcome write so a push-driven client never
 			// receives an event whose status the session does not yet carry. The
 			// fan-out runs detached and must not spend this worker's gate slot.
@@ -560,6 +579,55 @@ func (h *PlaybackHandler) runDeferredVirtualProbe(deferred *virtualDeferredProbe
 	}
 	// A parked probe may be waiting on the retry set; wake a worker to drain it.
 	h.signalDeferredProbeRetry()
+}
+
+// commitVerifiedProbeInventoryToSession propagates the tracks a deferred probe
+// just committed into the live session's carried overlay. The serve bind keeps
+// reading the session's carried inventory for both the transport map and the
+// inventory endpoint, so the verified truth has to land on the session itself:
+// replacing the row's tracks in on read would publish a selection ordinal space
+// the transport never muxed against and silence fast starts and resumes.
+//
+// It runs after the probe's terminal outcome is recorded and is fenced on the
+// admitted binding generation, so a probe superseded by a rotation can never
+// stamp the replacement binding's inventory.
+func (h *PlaybackHandler) commitVerifiedProbeInventoryToSession(ctx context.Context, deferred *virtualDeferredProbeV3, verifiedFileID int) {
+	if h == nil || h.sessionMgr == nil || deferred == nil || deferred.sessionID == "" || verifiedFileID <= 0 {
+		return
+	}
+	writer, ok := h.sessionMgr.(virtualProbeInventoryWriter)
+	if !ok {
+		return
+	}
+	verified, err := h.fileResolver.GetByID(ctx, verifiedFileID)
+	if err != nil || verified == nil {
+		slog.WarnContext(ctx, "verified probe inventory not propagated: committed row unreadable",
+			"component", "api", "session", deferred.sessionID, "file_id", verifiedFileID, "error", err)
+		return
+	}
+	applied, err := writer.CommitVirtualProbeTracksIfGeneration(
+		deferred.sessionID, deferred.bindingGeneration, verifiedProbeInventoryRevision(verified),
+		verified.AudioTracks, verified.SubtitleTracks, verified.ExternalSubtitles,
+	)
+	if err != nil {
+		slog.WarnContext(ctx, "verified probe inventory not propagated",
+			"component", "api", "session", deferred.sessionID, "file_id", verifiedFileID, "error", err)
+		return
+	}
+	if !applied {
+		slog.DebugContext(ctx, "verified probe inventory propagation dropped: candidate binding moved",
+			"component", "api", "session", deferred.sessionID, "file_id", verifiedFileID, "generation", deferred.bindingGeneration)
+	}
+}
+
+// verifiedProbeInventoryRevision names the verified inventory generation a
+// committed deferred probe just produced. It is derived from the committed row's
+// probe stamp (or its audio fingerprint when unstamped), so the served revision
+// moves on a genuine new inventory and the client's conditional poll stops
+// returning 304. The value is opaque, exactly like the plan-time revision it
+// replaces.
+func verifiedProbeInventoryRevision(verified *models.MediaFile) string {
+	return reconcileGenerationV3(verified)
 }
 
 // deferredProbeBindingCurrent reports whether the session is still bound to the

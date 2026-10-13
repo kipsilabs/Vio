@@ -1799,7 +1799,45 @@ func (m *SessionManager) SetVirtualProbeOutcomeIfGeneration(sessionID string, ge
 	return true, nil
 }
 
-// ArmVirtualProbePendingIfGeneration transitions a binding generation's probe
+// CommitVirtualProbeTracksIfGeneration replaces a live session's carried virtual
+// inventory with the tracks a deferred probe just committed to the bound
+// candidate's row, without moving the binding. It is the propagation half of
+// same-session verified inventory: the serve bind deliberately keeps serving the
+// session's carried inventory (the list the transport was started and muxed
+// against), so the verified truth reaches the menu by updating that carried
+// inventory rather than by swapping the row's tracks in on every read. A row
+// overlay would publish a selection ordinal space the transport never used and
+// silence fast starts.
+//
+// The candidate provenance anchor (URI, row id, evidence-set flag) is left
+// untouched: the committed tracks describe the same bound candidate the plan
+// captured, so the anchor still names them. revision replaces
+// VirtualSourceRevision so the inventory revision and its ETag move on the
+// verified commit and the client's conditional poll stops returning 304;
+// streamRevision advances so in-memory snapshot readers observe the change too.
+// The write is fenced on the binding generation, so a probe that finishes after
+// a rotation cannot stamp its verdict onto the replacement binding.
+func (m *SessionManager) CommitVirtualProbeTracksIfGeneration(sessionID string, generation uint64, revision string, audio []models.AudioTrack, subtitles []models.SubtitleTrack, external []models.ExternalSubtitle) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		return false, ErrSessionNotFound
+	}
+	if s.virtualSourceGeneration != generation {
+		return false, nil
+	}
+	s.VirtualAudioTracks = audio
+	s.VirtualSubtitleTracks = subtitles
+	s.VirtualExternalSubtitles = external
+	s.VirtualSubtitleEvidenceSet = true
+	s.VirtualSourceRevision = revision
+	s.streamRevision++
+	m.touchSessionLocked(s)
+	return true, nil
+}
+
 // outcome from empty to pending, and only from empty. It is the exclusive
 // ownership fence for deferred-probe admission: a duplicate start whose
 // SaveAttempt lost the CAS adopts the winner's session and re-enters the start

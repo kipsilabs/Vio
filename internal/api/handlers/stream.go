@@ -890,14 +890,17 @@ func bindSessionVirtualSourceWithTracks(ctx context.Context, file *models.MediaF
 	// selected. Absent evidence (the flag unset) is the only case with nothing
 	// to apply, and the only case the live row may speak for.
 	//
-	// Carried evidence is only authoritative while the bound row is unverified.
-	// A deferred probe can commit the release's real tracks to the row after the
-	// plan captured its provisional inventory; once the row is stamped, its
-	// committed tracks are the truth the menus must follow. Applying the stale
-	// overlay over a probed row would mask the verified inventory for the rest of
-	// the session and leave the inventory revision unchanged, so the client's
-	// conditional poll would keep returning 304. This mirrors the audio-only
-	// branch below, which already refuses to downgrade a probed row to declared.
+	// The carried inventory is authoritative for the whole session, verified
+	// row or not. This same bind feeds the serve path (the transport muxes the
+	// audio stream the session selected) and the inventory endpoint, so both
+	// must read the one list the plan committed to: swapping in the row's tracks
+	// here would publish a selection_index/ordinal space the transport was never
+	// muxed against, and a fast start would play silence. When a deferred probe
+	// commits the release's real tracks, the truth reaches the session itself
+	// (the probe worker replaces this carried inventory and advances the source
+	// revision) rather than being swapped in on read; that keeps the menu and
+	// the transport coherent and breaks the client's 304. Evidence for a
+	// different candidate is still rejected outright.
 	evidenceSet := session.VirtualSubtitleEvidenceSet
 	evidenceRejected := evidenceSet && !virtualEvidenceMatchesBoundFile(bound, session)
 	if evidenceRejected {
@@ -908,7 +911,7 @@ func bindSessionVirtualSourceWithTracks(ctx context.Context, file *models.MediaF
 			"evidence_uri", session.VirtualSubtitleEvidenceURI,
 			"file_path", bound.FilePath)
 	}
-	if evidenceSet && !evidenceRejected && bound.ProbeUpdatedAt == nil {
+	if evidenceSet && !evidenceRejected {
 		boundCopy := *bound
 		boundCopy.SubtitleTracks = session.VirtualSubtitleTracks
 		boundCopy.ExternalSubtitles = session.VirtualExternalSubtitles
