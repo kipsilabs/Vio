@@ -139,7 +139,7 @@ func remapAudioSelectionIndex(prev []models.AudioTrack, selectedIndex int, next 
 	// both are -1, never a positional guess.
 	match := -1
 	for i, track := range next {
-		if !(trackStringEqual(track.Language, selected.Language) && trackStringEqual(track.Codec, selected.Codec)) {
+		if !trackStringEqual(track.Language, selected.Language) || !trackStringEqual(track.Codec, selected.Codec) {
 			continue
 		}
 		if track.Channels != selected.Channels || !trackStringEqual(track.Layout, selected.Layout) {

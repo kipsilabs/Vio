@@ -613,7 +613,7 @@ func TestDeferredProbePropagationTransientBoundReadRecovers(t *testing.T) {
 }
 
 // TestDeferredProbeFailureWriteFencedOnRowOnlyMutation is the failure-write
-// analogue of the row-id-mutation case: when the propagation refuses the
+// analog of the row-id-mutation case: when the propagation refuses the
 // committed inventory and a row-only move lands while the release-continuity read
 // runs, the terminal failed write must be fenced on the full binding. A
 // generation-only fence would stamp the old probe's failure onto the changed
