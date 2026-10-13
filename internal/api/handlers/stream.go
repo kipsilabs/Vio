@@ -2134,7 +2134,7 @@ func (h *StreamHandler) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fileID, err := subtitleSourceFileID(r, session)
+	fileID, err := h.acceptedSubtitleSourceFileID(r.Context(), r.URL.Query().Get("file_id"), session)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
@@ -2497,6 +2497,40 @@ func subtitleSourceFile(raw string, session *playback.Session) (int, error) {
 	return fileID, nil
 }
 
+// acceptedSubtitleSourceFileID is subtitleSourceFileID with the virtual-session
+// window widened. A virtual session's subtitle URLs embed the effective file id
+// its inventory advertised, which for an adopted provider candidate is that
+// candidate's catalog row — not the session's provider-neutral row. The strict
+// session.MediaFileID/RequestedMediaFileID window therefore rejects the very URL
+// the session published. Accept a row when it names the session's bound
+// candidate; every other unrelated row still fails closed.
+func (h *StreamHandler) acceptedSubtitleSourceFileID(ctx context.Context, raw string, session *playback.Session) (int, error) {
+	fileID, err := subtitleSourceFile(raw, session)
+	if err == nil {
+		return fileID, nil
+	}
+	raw = strings.TrimSpace(raw)
+	if session == nil || raw == "" || h == nil || h.fileResolver == nil {
+		return 0, err
+	}
+	candidateURI := strings.TrimSpace(session.VirtualSourceURI)
+	if candidateURI == "" {
+		return 0, err
+	}
+	requested, convErr := strconv.Atoi(raw)
+	if convErr != nil || requested <= 0 {
+		return 0, err
+	}
+	row, lookupErr := h.fileResolver.GetByID(ctx, requested)
+	if lookupErr != nil || row == nil {
+		return 0, err
+	}
+	if !isVirtualPlaybackFile(row) || !sameVirtualCandidate(candidateURI, row.FilePath) {
+		return 0, err
+	}
+	return requested, nil
+}
+
 // SubtitleFontRequest identifies the session and frozen subtitle inventory
 // selection. Query preserves repeated identity parameters so validation cannot
 // silently choose one of conflicting stream pins.
@@ -2537,7 +2571,7 @@ func (h *StreamHandler) SubtitleFonts(ctx context.Context, in SubtitleFontReques
 	}
 	attachPlaybackSession(ctx, session, claims)
 
-	fileID, err := subtitleSourceFile(in.Query.Get("file_id"), session)
+	fileID, err := h.acceptedSubtitleSourceFileID(ctx, in.Query.Get("file_id"), session)
 	if err != nil {
 		return nil, false, apiError(http.StatusBadRequest, "bad_request", err.Error())
 	}
@@ -2724,7 +2758,7 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	fileID, err := subtitleSourceFileID(r, session)
+	fileID, err := h.acceptedSubtitleSourceFileID(r.Context(), r.URL.Query().Get("file_id"), session)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
