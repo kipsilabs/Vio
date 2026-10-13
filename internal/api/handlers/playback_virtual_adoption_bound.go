@@ -47,6 +47,17 @@ import (
 // verdict through the existing fenced marker, so every replica's resolve gate
 // skips the row instead of repeating the refusal.
 //
+// When a real database and the durable store are wired the evidence write, the
+// exact-pin clear, the refusal increment and the terminal decision all run in
+// one transaction, serialized on the row being reconciled (see
+// execVirtualFileMetadataUpdateResultTx). A successful write always commits its
+// clear with it, so a cancel between the two can never leave a stale threshold
+// live; the count is re-read in-transaction before the terminal decision; and
+// the terminal stamp is fenced on the observed evidence revision, so a newer
+// evidence write that advanced the row wins over a stale terminal. The
+// in-memory fallback and a store without transaction support keep the previous
+// best-effort path, where no cross-process window exists.
+//
 // An ownership-store lookup failure is deliberately NOT a refusal: it is a
 // recoverable infrastructure error that must never advance this count or install
 // the terminal verdict, so a database outage cannot condemn healthy content. See
