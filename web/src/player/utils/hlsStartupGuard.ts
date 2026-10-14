@@ -113,6 +113,18 @@ export interface StaleGenerationRecoveryHost {
 }
 
 /**
+ * Reports whether an hls.js error ended the manifest load rather than a
+ * fragment or media load. hls.js names manifest-scoped failures with a
+ * `manifest` prefix (`manifestLoadError`, `manifestLoadTimeOut`,
+ * `manifestParsingError`, …) and settles the manifest request either way. A
+ * fragment error carries its own `fragLoadError` detail and does not mean a
+ * concurrent manifest load finished, so it must not release the coalescer.
+ */
+export function isManifestLoadError(carrier: { details?: unknown } | null | undefined): boolean {
+  return typeof carrier?.details === "string" && carrier.details.startsWith("manifest");
+}
+
+/**
  * Recovers hls.js from the server's stale-generation fence on a segment URL.
  *
  * The failing segment URI carried an `sgen` token minted against an FFmpeg
@@ -125,18 +137,91 @@ export interface StaleGenerationRecoveryHost {
  * caller is expected to have bounded the number of refetches so a pathological
  * session still reaches the ordinary failure path.
  *
+ * `requestLoad`, when supplied, is how the caller serializes the refetch
+ * against any manifest load already in flight (see `ManifestLoadCoalescer`);
+ * the refetch then lands after the in-flight load instead of racing it. Without
+ * it the refetch calls `host.loadSource` directly, which is what the recovery's
+ * unit tests exercise.
+ *
  * Returns false when there is no playlist URL to refetch, so the caller can fall
  * through to the ordinary failure recovery instead of stalling.
  */
 export function recoverFromStaleGeneration(
   host: StaleGenerationRecoveryHost,
   resumePositionSeconds: number,
+  requestLoad?: (url: string) => void,
 ): boolean {
   const playlistUrl = host.url;
   if (!playlistUrl) return false;
   if (Number.isFinite(resumePositionSeconds) && resumePositionSeconds > 0) {
     host.config.startPosition = resumePositionSeconds;
   }
-  host.loadSource(playlistUrl);
+  if (requestLoad) {
+    requestLoad(playlistUrl);
+  } else {
+    host.loadSource(playlistUrl);
+  }
   return true;
+}
+
+/**
+ * Serializes the manifest (re)loads one hls.js transport issues.
+ *
+ * `hls.js`'s `loadSource()` restarts the manifest fetch, and the player can
+ * raise it from three places that overlap: the transport init, the not-ready
+ * pollback, and the stale-generation recovery. When a request lands while an
+ * earlier manifest load is still in flight — a stale-generation fence on a
+ * segment is independent of the manifest request hls.js already has open —
+ * issuing `loadSource()` again leaves two concurrent requests for the same
+ * playlist: the fresh one supersedes the old, and the abandoned request is held
+ * to completion. That is the paired manifest load in the playback HAR, where
+ * one copy shows a long `receive` the server never produced.
+ *
+ * The coalescer keys off hls.js's own manifest lifecycle: the player calls
+ * `begin` on `MANIFEST_LOADING` and `settle` on `MANIFEST_LOADED` or a
+ * manifest-scoped fatal error, and routes every manifest load through
+ * `request`. A request raised while one is in flight is remembered and replayed
+ * once, after the in-flight load settles, so the recovery still happens without
+ * a second concurrent request.
+ */
+export class ManifestLoadCoalescer {
+  private inFlightUrl: string | null = null;
+  private pendingUrl: string | null = null;
+
+  constructor(private readonly load: (url: string) => void) {}
+
+  /** Marks the start of an hls.js manifest load (`MANIFEST_LOADING`). */
+  begin(url: string): void {
+    this.inFlightUrl = url;
+  }
+
+  /** Marks the end of an hls.js manifest load (`MANIFEST_LOADED` or a fatal manifest error). */
+  settle(): void {
+    const pending = this.pendingUrl;
+    if (this.inFlightUrl === null && pending === null) return;
+    this.inFlightUrl = null;
+    this.pendingUrl = null;
+    if (pending !== null) {
+      this.start(pending);
+    }
+  }
+
+  /**
+   * Issues a manifest load, or queues it behind the one already in flight.
+   * Returns true when the request was started immediately, false when it was
+   * coalesced into the in-flight load.
+   */
+  request(url: string): boolean {
+    if (this.inFlightUrl !== null) {
+      this.pendingUrl = url;
+      return false;
+    }
+    this.start(url);
+    return true;
+  }
+
+  private start(url: string): void {
+    this.inFlightUrl = url;
+    this.load(url);
+  }
 }
