@@ -5867,6 +5867,105 @@ describe("usePlaybackSession plan audio inventory", () => {
     unmount();
   });
 
+  it("marks a legacy declared inventory failed when its poll is exhausted", async () => {
+    // An older server declares the inventory without deferring it: no
+    // inventory_url and no tracks_pending. The legacy catalog poll owns the
+    // retry, so the menus are provisional while `inventoryPending` stays false.
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-legacy-exhaust",
+            playback_plan: fixturePlanV3({
+              session_id: "session-legacy-exhaust",
+              inventory_status: "declared",
+              audio_tracks: [
+                { codec: "aac", channels: 2, layout: "stereo", language: "eng", default: true },
+              ],
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-legacy-exhaust", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    expect(result.current.inventoryUrl).toBeNull();
+    expect(result.current.inventoryPending).toBe(false);
+    expect(result.current.audioInventoryProvisional).toBe(true);
+    expect(result.current.inventoryFailed).toBe(false);
+
+    act(() => {
+      result.current.markInventoryExhausted();
+    });
+
+    // The spent budget is a terminal failure for the still-declared menu, not
+    // an indefinite "Discovering…".
+    expect(result.current.inventoryFailed).toBe(true);
+
+    unmount();
+  });
+
+  it("never labels a verified legacy inventory failed when its poll is exhausted", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-legacy-verified",
+            playback_plan: fixturePlanV3({
+              session_id: "session-legacy-verified",
+              inventory_status: "verified",
+              inventory_provenance: "verified",
+              audio_tracks: [
+                { codec: "aac", channels: 2, layout: "stereo", language: "eng", default: true },
+              ],
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-legacy-verified", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    expect(result.current.audioInventoryProvisional).toBe(false);
+
+    act(() => {
+      result.current.markInventoryExhausted();
+    });
+
+    // A confident list is not a failed discovery; the exhausted budget is moot.
+    expect(result.current.inventoryFailed).toBe(false);
+    expect(result.current.planAudioTracks).toHaveLength(1);
+
+    unmount();
+  });
+
   it("upgrades a declared inventory with a shorter verified list", async () => {
     const declared = [
       { codec: "eac3", channels: 6, layout: "5.1", language: "eng", default: true },
