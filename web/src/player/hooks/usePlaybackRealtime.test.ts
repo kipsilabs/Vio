@@ -1,6 +1,7 @@
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { createElement } from "react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { V2ProblemError } from "@/api/v2/request";
 import { PlayerConfigProvider, type PlayerConfig } from "../context/PlayerConfigContext";
 import { usePlaybackRealtime } from "./usePlaybackRealtime";
 
@@ -73,9 +74,17 @@ it("opens only installation-bound v2 control without a URL credential", async ()
     "silo.ticket.ticket",
   ]);
 });
-it.each([404, 503, 403])("never opens bridge control after ticket failure %s", async (status) => {
+it.each([503, 403])("never opens bridge control after ticket failure %s", async (status) => {
   vi.useFakeTimers();
-  mocks.mint.mockRejectedValue(new Error(String(status)));
+  mocks.mint.mockRejectedValue(
+    new V2ProblemError("createPlaybackControlSocketTicket", {
+      type: `https://siloserver.org/docs/api/v2/problems/${status === 403 ? "permission_denied" : "unavailable"}`,
+      title: "Refused",
+      status,
+      detail: "Refused.",
+      instance: "/api/v2/playback/sessions/session/control/ws-ticket",
+    }),
+  );
   const onCommand = vi.fn();
   const { result } = renderHook(() => usePlaybackRealtime({ sessionId: "session", onCommand }), {
     wrapper,
@@ -87,6 +96,114 @@ it.each([404, 503, 403])("never opens bridge control after ticket failure %s", a
   expect(Socket.instances).toHaveLength(0);
   expect(result.current.connectionState).toBe("disconnected");
   expect(onCommand).not.toHaveBeenCalled();
+});
+
+it("stops reconnecting and reports the session gone when the ticket mint answers 404", async () => {
+  vi.useFakeTimers();
+  mocks.mint.mockRejectedValue(
+    new V2ProblemError("createPlaybackControlSocketTicket", {
+      type: "https://siloserver.org/docs/api/v2/problems/not_found",
+      title: "Not found",
+      status: 404,
+      detail: "Playback session not found.",
+      instance: "/api/v2/playback/sessions/session/control/ws-ticket",
+    }),
+  );
+  const onSessionLost = vi.fn();
+  const { result } = renderHook(
+    () => usePlaybackRealtime({ sessionId: "session", onCommand: vi.fn(), onSessionLost }),
+    { wrapper },
+  );
+  // Well past the capped reconnect delay: a 404 must not keep minting.
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(60_000);
+  });
+  expect(mocks.mint).toHaveBeenCalledTimes(1);
+  expect(Socket.instances).toHaveLength(0);
+  expect(result.current.connectionState).toBe("disconnected");
+  expect(onSessionLost).toHaveBeenCalledTimes(1);
+});
+
+it("ignores a gone answer for a session the player replaced before it landed", async () => {
+  vi.useFakeTimers();
+  const pending = new Map<string, { reject: (error: unknown) => void }>();
+  mocks.mint.mockImplementation((sessionId: string) => {
+    let reject!: (error: unknown) => void;
+    const promise = new Promise<never>((_resolve, rej) => {
+      reject = rej;
+    });
+    pending.set(sessionId, { reject });
+    return promise;
+  });
+  const lostA = vi.fn();
+  const lostB = vi.fn();
+  const { rerender } = renderHook(
+    ({ id, onLost }: { id: string; onLost: () => void }) =>
+      usePlaybackRealtime({ sessionId: id, onCommand: vi.fn(), onSessionLost: onLost }),
+    { wrapper, initialProps: { id: "session-a", onLost: lostA } },
+  );
+  await act(async () => {
+    await Promise.resolve();
+  });
+  expect(mocks.mint).toHaveBeenNthCalledWith(1, "session-a", "install", authority);
+
+  // The player moves on to a new session; session A's loop is disposed.
+  rerender({ id: "session-b", onLost: lostB });
+  await act(async () => {
+    await Promise.resolve();
+  });
+  expect(mocks.mint).toHaveBeenCalledTimes(2);
+
+  // Session A answers 404 only after B replaced it. It belongs to the old id
+  // and must not report against B, nor schedule a retry behind it.
+  await act(async () => {
+    pending.get("session-a")?.reject(
+      new V2ProblemError("createPlaybackControlSocketTicket", {
+        type: "https://siloserver.org/docs/api/v2/problems/not_found",
+        title: "Not found",
+        status: 404,
+        detail: "Playback session not found.",
+        instance: "/api/v2/playback/sessions/session-a/control/ws-ticket",
+      }),
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+
+  expect(lostA).not.toHaveBeenCalled();
+  expect(lostB).not.toHaveBeenCalled();
+  expect(mocks.mint).toHaveBeenCalledTimes(2);
+  expect(Socket.instances).toHaveLength(0);
+});
+
+it("leaves no reconnect timer armed once the session is gone", async () => {
+  vi.useFakeTimers();
+  mocks.mint.mockRejectedValue(
+    new V2ProblemError("createPlaybackControlSocketTicket", {
+      type: "https://siloserver.org/docs/api/v2/problems/not_found",
+      title: "Not found",
+      status: 404,
+      detail: "Playback session not found.",
+      instance: "/api/v2/playback/sessions/session/control/ws-ticket",
+    }),
+  );
+  const onSessionLost = vi.fn();
+  renderHook(
+    () => usePlaybackRealtime({ sessionId: "session", onCommand: vi.fn(), onSessionLost }),
+    { wrapper },
+  );
+  await act(async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+  expect(onSessionLost).toHaveBeenCalledTimes(1);
+  expect(vi.getTimerCount()).toBe(0);
+
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(60_000);
+  });
+  expect(mocks.mint).toHaveBeenCalledTimes(1);
+  expect(onSessionLost).toHaveBeenCalledTimes(1);
 });
 
 it.each(["stop", "terminate", "server_restarting"])(
