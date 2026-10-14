@@ -69,17 +69,39 @@ func TestResolveDetailedTrustWindowRefusesToSubstitute(t *testing.T) {
 	}
 }
 
-// TestResolveDetailedTrustWindowRequiresIdentity proves the trusted flag alone
-// never changes behavior: without a durable identity the row cannot be proven
-// to be the requested release, so today's rotation sentinel is preserved.
-func TestResolveDetailedTrustWindowRequiresIdentity(t *testing.T) {
+// TestResolveDetailedTrustedRowWithoutIdentityStillRefusesSubstitution proves
+// the trusted flag is honored even without a durable identity: an identity-less
+// row with transport evidence (which is what the handler requires before it sets
+// the flag) is still the viewer's selection, so the resolver must signal the
+// trust sentinel, not the rotation sentinel, and let the handler re-serve its
+// stored URL. Trust alone never substitutes a sibling.
+func TestResolveDetailedTrustedRowWithoutIdentityStillRefusesSubstitution(t *testing.T) {
 	server := trustWindowProvider(t)
 	svc := trustWindowService(t, server.URL+"/manifest.json")
 
 	ctx := virtuallibrary.WithPersistedCandidateTrust(context.Background(), true)
 	_, err := svc.ResolveDetailed(ctx, "virtual://movie/tt100?result=absentrelease", false, nil, "", true, false)
+	if !errors.Is(err, virtuallibrary.ErrPersistedCandidateTrusted) {
+		t.Fatalf("err = %v, want ErrPersistedCandidateTrusted", err)
+	}
+	if errors.Is(err, virtuallibrary.ErrSessionBoundCandidateAbsent) {
+		t.Fatal("a trusted identity-less row must not carry the rotation sentinel")
+	}
+}
+
+// TestResolveDetailedUntrustedIdentitylessStillRotates proves the boundary of
+// the relaxation: an identity-less row WITHOUT the trusted flag keeps today's
+// rotation sentinel, so callers outside the window still rotate as before.
+func TestResolveDetailedUntrustedIdentitylessStillRotates(t *testing.T) {
+	server := trustWindowProvider(t)
+	svc := trustWindowService(t, server.URL+"/manifest.json")
+
+	_, err := svc.ResolveDetailed(context.Background(), "virtual://movie/tt100?result=absentrelease", false, nil, "", true, false)
 	if !errors.Is(err, virtuallibrary.ErrSessionBoundCandidateAbsent) {
 		t.Fatalf("err = %v, want ErrSessionBoundCandidateAbsent", err)
+	}
+	if errors.Is(err, virtuallibrary.ErrPersistedCandidateTrusted) {
+		t.Fatal("an untrusted identity-less row must not carry the trust sentinel")
 	}
 }
 

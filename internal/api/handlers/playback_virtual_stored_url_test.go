@@ -679,10 +679,12 @@ func TestVirtualResolveContextTrustsDeliveredURLLessRow(t *testing.T) {
 	}
 }
 
-// TestVirtualResolveContextRejectsURLLessRowWithoutIdentity proves trust still
-// requires the row's own durable identity: a URL-less row with no identity is
-// never trusted, so no sibling can be pinned to it.
-func TestVirtualResolveContextRejectsURLLessRowWithoutIdentity(t *testing.T) {
+// TestVirtualResolveContextURLLessIdentitylessDeliveryNotTrusted pins the
+// boundary of the relaxed trust predicate: an identity-less row that only
+// recorded a delivery (no stored URL) is not trusted, because there is no
+// transport evidence to re-serve. Durable identity or a usable stored URL is
+// required; a delivery stamp alone must not claim resumability.
+func TestVirtualResolveContextURLLessIdentitylessDeliveryNotTrusted(t *testing.T) {
 	const pinned = "virtual://movie/tt-urlless-noid?result=cand-a"
 	now := time.Now()
 	row := &models.MediaFile{
@@ -693,7 +695,30 @@ func TestVirtualResolveContextRejectsURLLessRowWithoutIdentity(t *testing.T) {
 	}
 	ctx := virtualResolveContextWithPersistedTrust(context.Background(), row, now, 720*time.Hour)
 	if virtuallibrary.PersistedCandidateTrusted(ctx) {
-		t.Fatal("a URL-less row without identity must never be trusted")
+		t.Fatal("an identity-less row with only a delivery stamp must not be trusted")
+	}
+	if _, ok := virtuallibrary.PersistedCandidateIdentityFromContext(ctx); ok {
+		t.Fatal("an identity-less row must not thread a durable identity")
+	}
+}
+
+// TestVirtualResolveContextRejectsRowWithoutTransportEvidence proves trust still
+// requires transport evidence: a row that never resolved and never delivered has
+// no persisted candidate to prefer, so it keeps the pre-window refusal/rotation
+// behavior even when the window is open.
+func TestVirtualResolveContextRejectsRowWithoutTransportEvidence(t *testing.T) {
+	const pinned = "virtual://movie/tt-no-evidence?result=cand-a"
+	now := time.Now()
+	row := &models.MediaFile{
+		ID:                  105,
+		FilePath:            pinned,
+		UpdatedAt:           now,
+		ProviderVideoHash:   "hash-a",
+		ProviderReleaseName: "Movie.2024.1080p",
+	}
+	ctx := virtualResolveContextWithPersistedTrust(context.Background(), row, now, 720*time.Hour)
+	if virtuallibrary.PersistedCandidateTrusted(ctx) {
+		t.Fatal("a row with no stored URL and no delivery stamp must never be trusted")
 	}
 }
 
@@ -787,4 +812,12 @@ func TestResolveVirtualInputURLLessDeliveredRowCarriesTrust(t *testing.T) {
 	if len(sawTrust) != 1 || sawTrust[0] {
 		t.Fatalf("outside the window the resolve trust flag = %v, want [false]", sawTrust)
 	}
+}
+
+// TestStoredUrl provides an umbrella runner matching -run 'StoredUrl'.
+func TestStoredUrl(t *testing.T) {
+	t.Run("EvaluateStoredVirtualURLCandidateTrustWindow", TestEvaluateStoredVirtualURLCandidateTrustWindow)
+	t.Run("ResolveVirtualInputUsesStoredURLWithoutListing", TestResolveVirtualInputUsesStoredURLWithoutListing)
+	t.Run("StreamResolveVirtualInputUsesStoredURLWithoutListing", TestStreamResolveVirtualInputUsesStoredURLWithoutListing)
+	t.Run("FallbackServesPersistedCandidateWithinTrustWindow", TestFallbackServesPersistedCandidateWithinTrustWindow)
 }
