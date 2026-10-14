@@ -138,9 +138,10 @@ func (h *PlaybackHandler) resolvePreferredSubtitleSelectionV3(
 // selectPreferredSubtitleV3 picks the inventory entry the stored preference
 // names: an exact track signature when one is stored, otherwise the closest
 // language match. Ties break toward a non-forced track and then toward the
-// published inventory order, which is the order the client renders. Forced
-// tracks are eligible only when the preference asks for forced subtitles or no
-// non-forced match exists.
+// published inventory order, which is the order the client renders. A forced
+// track is selected only when the preference opts into forced subtitles;
+// otherwise the selection is left to the client rather than silently swapping
+// in a different deliverable.
 func selectPreferredSubtitleV3(
 	inventory []playback.SubtitleInventoryItemV3,
 	prefs playbackSubtitlePreferenceV3,
@@ -152,7 +153,7 @@ func selectPreferredSubtitleV3(
 		}
 	}
 	preferred := strings.TrimSpace(prefs.Language)
-	if preferred == "" {
+	if !prefs.HasLanguage || preferred == "" {
 		return playback.SubtitleInventoryItemV3{}, false
 	}
 	bestIndex := -1
@@ -174,7 +175,7 @@ func selectPreferredSubtitleV3(
 		return playback.SubtitleInventoryItemV3{}, false
 	}
 	item := inventory[bestIndex]
-	if item.Forced && !prefs.ShowForced {
+	if item.Forced && (!prefs.HasShowForced || !prefs.ShowForced) {
 		// A forced track is a different deliverable from the full track and is
 		// only selected when the preference opts in. Without a non-forced
 		// match, fall through rather than silently forcing a different subtitle.
