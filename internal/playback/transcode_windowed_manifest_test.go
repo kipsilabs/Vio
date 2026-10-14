@@ -182,13 +182,13 @@ func TestBuildPlaybackManifestWindowsALongEncodedTranscode(t *testing.T) {
 		"#EXT-X-GAP",
 		"#EXT-X-DEFINE:NAME=\"vio_query\"",
 		"segment/seg_00410.ts", // 500 - backSegments(90)
-		"segment/seg_00544.ts", // 500 + aheadSegments(45) - 1
+		"segment/seg_00559.ts", // 500 + aheadSegments(60) - 1
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("windowed manifest missing %q:\n%s", want, text)
 		}
 	}
-	for _, unwanted := range []string{"seg_00000.ts", "seg_00409.ts", "seg_00545.ts"} {
+	for _, unwanted := range []string{"seg_00000.ts", "seg_00409.ts", "seg_00560.ts"} {
 		if strings.Contains(text, unwanted) {
 			t.Fatalf("windowed manifest unexpectedly listed %s:\n%s", unwanted, text)
 		}
@@ -261,7 +261,7 @@ func TestSyntheticManifestWindowClampsToTheTitleAndStartSegment(t *testing.T) {
 			segCount: 1000,
 			progress: SegmentProgress{ProducedHead: 400, StartSegmentNumber: 0, LastRequestedSegment: 500},
 			wantFrom: 410,
-			wantTo:   545,
+			wantTo:   560,
 		},
 		{
 			// The throttler lets FFmpeg run hundreds of seconds ahead of the
@@ -271,7 +271,7 @@ func TestSyntheticManifestWindowClampsToTheTitleAndStartSegment(t *testing.T) {
 			segCount: 1000,
 			progress: SegmentProgress{ProducedHead: 900, StartSegmentNumber: 0, LastRequestedSegment: 500},
 			wantFrom: 410,
-			wantTo:   545,
+			wantTo:   560,
 		},
 		{
 			name:     "window never runs past the title",
@@ -285,7 +285,7 @@ func TestSyntheticManifestWindowClampsToTheTitleAndStartSegment(t *testing.T) {
 			segCount: 1000,
 			progress: SegmentProgress{ProducedHead: -1, StartSegmentNumber: 500, LastRequestedSegment: 500},
 			wantFrom: 410,
-			wantTo:   545,
+			wantTo:   560,
 		},
 	}
 	for _, tt := range tests {

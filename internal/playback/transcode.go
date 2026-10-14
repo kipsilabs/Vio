@@ -441,9 +441,15 @@ const (
 	// the window edge still contains the playhead.
 	syntheticManifestWindowBackSegments = 90
 	// syntheticManifestWindowAheadSegments reaches past the client's furthest
-	// fetched segment, so hls.js can refill a full forward buffer from the new
-	// window before it needs to reload again.
-	syntheticManifestWindowAheadSegments = 45
+	// fetched segment so hls.js can refill a full forward buffer from the new
+	// window before it needs to reload again. Reloading a window is a full hls.js
+	// MediaSource reset that drops the buffer and re-downloads from the playhead
+	// (the client refetches a VOD playlist itself, see
+	// web/src/player/utils/hlsWindowedManifest.ts), so the ahead margin is sized
+	// to the client's forward-buffer ceiling: 60 two-second segments = 120 s.
+	// A shorter margin would make the client hit the next window edge with its
+	// buffer only partly refilled, resetting again sooner.
+	syntheticManifestWindowAheadSegments = 60
 	// syntheticManifestWindowCapacity is the largest whole-title playlist that
 	// is served unwindowed. Below it the legacy full VOD manifest is cheaper to
 	// reason about and is unchanged.
