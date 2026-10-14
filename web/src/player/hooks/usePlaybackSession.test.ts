@@ -8883,6 +8883,27 @@ describe("usePlaybackSession mid-stream reconnect", () => {
     unmount();
   });
 
+  it("enters the lost state when the server says the session is gone and nothing played", async () => {
+    const harness = reconnectHarness({ replan: () => unreachable() });
+    const rendered = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(rendered.result.current.planRevision).toBe(1));
+
+    // A session-scoped call (ticket mint, progress) answered 404 before the
+    // first frame: there is no played stream for the reconnect to reposition,
+    // so the player goes straight to the terminal state.
+    act(() => rendered.result.current.reportSessionLost());
+
+    expect(rendered.result.current.connectionStatus).toBe("lost");
+    expect(rendered.result.current.connectionErrorTitle).toBe("Connection lost");
+    expect(harness.replanBodies).toHaveLength(0);
+    expect(harness.startBodies).toHaveLength(1);
+
+    rendered.unmount();
+  });
+
   it("starts a new session when the server's installation changed", async () => {
     let restarts = 0;
     const harness = reconnectHarness({
