@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/artworkkey"
+	"github.com/Silo-Server/silo-server/internal/artworkurl"
 	"github.com/Silo-Server/silo-server/internal/blobstore"
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/collage"
@@ -399,22 +400,25 @@ type collectionCollageComposer struct {
 	prefix     string
 	store      blobstore.Store
 	posters    itemPosterSigner
+	signer     *artworkurl.Signer
 	httpClient *http.Client
 }
 
 // NewPersonalCollectionCollageGenerator composes personal collection
 // collages and stores them beside their uploaded posters. It returns nil
 // when artwork storage or poster signing is not configured, which leaves
-// personal collections without collages. A nil httpClient uses
+// personal collections without collages. signer is the artwork URL signer, so
+// a source behind local storage can be read from the store directly; a nil
+// signer leaves every source to the HTTP fetch. A nil httpClient uses
 // newCollectionImageClient.
-func NewPersonalCollectionCollageGenerator(store blobstore.Store, posters itemPosterSigner, httpClient *http.Client) catalog.CollageGenerator {
+func NewPersonalCollectionCollageGenerator(store blobstore.Store, posters itemPosterSigner, signer *artworkurl.Signer, httpClient *http.Client) catalog.CollageGenerator {
 	if store == nil || posters == nil {
 		return nil
 	}
 	if httpClient == nil {
 		httpClient = newCollectionImageClient()
 	}
-	return collectionCollageComposer{prefix: userCollectionImagePrefix, store: store, posters: posters, httpClient: httpClient}
+	return collectionCollageComposer{prefix: userCollectionImagePrefix, store: store, posters: posters, signer: signer, httpClient: httpClient}
 }
 
 // ComposeCollectionCollage fetches the source posters, composes them and
@@ -471,12 +475,17 @@ func (c collectionCollageComposer) CollectionCollagePath(collectionID, key strin
 	return artworkkey.Original(collectionCollageDir(c.prefix, collectionID), key, ".webp")
 }
 
-// fetchImage downloads an image from a resolved URL. The URL is a catalog
-// title's poster as the server resolved it, usually from its own artwork
-// storage, which may be on the local network; no request supplies it. The
-// fetch is therefore trusted with the local network, and netguard still
-// refuses blocked addresses.
+// fetchImage reads one source image from a resolved URL. A URL that names an
+// object in this server's own artwork storage -- the root-relative signed route
+// a local backend issues -- is read straight from the store, so the build needs
+// no reachable server route and no base URL. Any other URL, such as a presigned
+// or public S3 URL, is fetched over HTTP. The URL is a catalog title's poster as
+// the server resolved it; no request supplies it, so the fetch is trusted with
+// the local network and netguard still refuses blocked addresses.
 func (c collectionCollageComposer) fetchImage(ctx context.Context, imageURL string) ([]byte, error) {
+	if key, ok := c.storedArtworkKey(imageURL); ok {
+		return c.readStoredImage(ctx, key)
+	}
 	if c.httpClient == nil {
 		return nil, errors.New("collage downloads have no HTTP client")
 	}
@@ -493,4 +502,31 @@ func (c collectionCollageComposer) fetchImage(ctx context.Context, imageURL stri
 		return nil, fmt.Errorf("image fetch returned status %d", resp.StatusCode)
 	}
 	return io.ReadAll(io.LimitReader(resp.Body, collectionImageMaxBytes))
+}
+
+// storedArtworkKey maps a resolved URL to the artwork store key it names when
+// the signer minted it, so a local-storage source can be read without a
+// request. An absolute URL, such as a presigned or public S3 URL, does not
+// match and falls through to the HTTP fetch.
+func (c collectionCollageComposer) storedArtworkKey(imageURL string) (string, bool) {
+	if c.signer == nil {
+		return "", false
+	}
+	return c.signer.SignedKey(imageURL, time.Now())
+}
+
+// readStoredImage reads a source image's bytes from the artwork store.
+func (c collectionCollageComposer) readStoredImage(ctx context.Context, key string) ([]byte, error) {
+	if c.store == nil {
+		return nil, errors.New("collage artwork storage is not configured")
+	}
+	body, info, err := c.store.Get(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = body.Close() }()
+	if info.Size > collectionImageMaxBytes {
+		return nil, fmt.Errorf("stored image is %d bytes, over the %d byte limit", info.Size, collectionImageMaxBytes)
+	}
+	return io.ReadAll(io.LimitReader(body, collectionImageMaxBytes))
 }
