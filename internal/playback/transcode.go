@@ -2808,16 +2808,15 @@ func (s *TranscodeSession) generateSyntheticPlaybackManifest(segPrefix, rawQuery
 }
 
 // syntheticManifestWindow picks the segment window served around the client's
-// furthest fetched segment. The anchor is the greatest of the produced head,
-// the last segment the client fetched, and the session's start segment: the
-// produced head covers a window requested before any segment download, the last
-// fetched segment tracks the client as it buffers forward, and the start
-// segment keeps the initial window on a resume.
+// furthest fetched segment. The anchor is the last segment the client fetched
+// (or the session's start segment before any download), never the produced head:
+// the throttler lets FFmpeg run a configured margin (300 s by default) ahead of
+// the client, and anchoring on the produced head would push the window's start
+// past the playhead and stall playback. The window instead advances with the
+// client's own buffer, and the encoder catches up on demand as segments are
+// requested.
 func syntheticManifestWindow(segCount int, progress SegmentProgress) (int, int) {
 	anchor := progress.LastRequestedSegment
-	if progress.ProducedHead > anchor {
-		anchor = progress.ProducedHead
-	}
 	if anchor < progress.StartSegmentNumber {
 		anchor = progress.StartSegmentNumber
 	}

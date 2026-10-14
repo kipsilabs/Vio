@@ -263,6 +263,16 @@ func TestSyntheticManifestWindowClampsToTheTitleAndStartSegment(t *testing.T) {
 			wantTo:   545,
 		},
 		{
+			// The throttler lets FFmpeg run hundreds of seconds ahead of the
+			// client; the window must follow the client, not the produced head,
+			// or its start would land past the playhead.
+			name:     "produced head racing ahead does not move the window off the playhead",
+			segCount: 1000,
+			progress: SegmentProgress{ProducedHead: 900, StartSegmentNumber: 0, LastRequestedSegment: 500},
+			wantFrom: 410,
+			wantTo:   545,
+		},
+		{
 			name:     "window never runs past the title",
 			segCount: 500,
 			progress: SegmentProgress{ProducedHead: 499, StartSegmentNumber: 0, LastRequestedSegment: 499},
