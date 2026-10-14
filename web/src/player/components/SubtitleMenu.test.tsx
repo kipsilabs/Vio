@@ -246,4 +246,71 @@ describe("SubtitleMenu", () => {
     ).toBeTruthy();
     expect(screen.getByText("English")).toBeTruthy();
   });
+
+  it("does not claim discovery failed above a verified, populated list", () => {
+    // Regression: a timed-out poll sets `failed` while a plan/catalog refresh
+    // has already supplied the confident, correct list. The failure notice must
+    // not qualify a verified list.
+    render(
+      createElement(SubtitleMenu, {
+        tracks: [subtitleTrack()],
+        activeIndex: null,
+        onSelect: () => {},
+        delayMs: 0,
+        onDelayChange: () => {},
+        mediaFileId: 42,
+        provisional: false,
+        failed: true,
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /(Enable|Disable) captions/ }));
+
+    expect(
+      screen.queryByText("Showing available subtitles — discovery did not complete"),
+    ).toBeNull();
+    expect(screen.queryByText("Subtitle discovery failed")).toBeNull();
+    expect(screen.queryByText("Discovering subtitles…")).toBeNull();
+    expect(screen.getByText("English")).toBeTruthy();
+  });
+
+  it("shows the empty state, not a failure, for a verified empty list with a stale failed flag", () => {
+    render(
+      createElement(SubtitleMenu, {
+        tracks: [],
+        activeIndex: null,
+        onSelect: () => {},
+        delayMs: 0,
+        onDelayChange: () => {},
+        mediaFileId: 42,
+        provisional: false,
+        failed: true,
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /(Enable|Disable) captions/ }));
+
+    expect(screen.getByText("No subtitles available")).toBeTruthy();
+    expect(screen.queryByText("Subtitle discovery failed")).toBeNull();
+  });
+
+  it("does not show the discovery spinner over a verified list while the poll is still owed", () => {
+    // A refreshed plan can supply the confident list while the deferred poll
+    // is still pending; `pending` alone must not claim discovery in that state.
+    render(
+      createElement(SubtitleMenu, {
+        tracks: [subtitleTrack()],
+        activeIndex: null,
+        onSelect: () => {},
+        delayMs: 0,
+        onDelayChange: () => {},
+        mediaFileId: 42,
+        provisional: false,
+        pending: true,
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /(Enable|Disable) captions/ }));
+
+    expect(screen.queryByText("Discovering subtitles…")).toBeNull();
+    expect(screen.queryByText("Unverified")).toBeNull();
+    expect(screen.getByText("English")).toBeTruthy();
+  });
 });

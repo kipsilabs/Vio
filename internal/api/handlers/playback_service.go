@@ -1130,7 +1130,7 @@ func (h *PlaybackHandler) playbackInventoryForSession(ctx context.Context, sessi
 			candidateURI = strings.TrimSpace(file.FilePath)
 		}
 		effectiveVirtualURI = candidateURI
-		file = h.inventoryEffectiveFile(ctx, file, session, candidateURI)
+		file = h.inventoryEffectiveFile(ctx, file, session, record, candidateURI)
 	}
 
 	return h.playbackInventoryForFileV3(ctx, session, record, file, effectiveVirtualURI)
@@ -1213,13 +1213,19 @@ func (h *PlaybackHandler) playbackInventoryForFileV3(ctx context.Context, sessio
 }
 
 // inventoryEffectiveFile resolves the catalog row whose inventory describes the
-// release the session is actually bound to. The bound candidate URI wins: when
-// a row names it, that row speaks for the release (probed evidence if present,
-// its own declared metadata otherwise). Plan-time evidence is overlaid only
-// when it still matches that bound release. When no row names the bound release
-// and the loaded row is a different one, an identity-only copy with no tracks is
-// returned, so the previous release's inventory is never shown for it.
-func (h *PlaybackHandler) inventoryEffectiveFile(ctx context.Context, file *models.MediaFile, session *playback.Session, candidateURI string) *models.MediaFile {
+// release the session is actually bound to. The row the caller already holds
+// wins when it names the bound candidate URI: it is the row the plan committed
+// to and the session's carried evidence is anchored to, whereas an exact-path
+// lookup can return any one of several duplicate catalog rows stored for the
+// same URI, and swapping to such a duplicate would reject the session's own
+// verified evidence by row id. Only when the held row does not name the bound
+// release is the release re-resolved, first from the plan's committed effective
+// row (deterministic) and otherwise from the catalog path lookup. Plan-time
+// evidence is overlaid only when it still matches that bound release. When no
+// row names the bound release and the loaded row is a different one, an
+// identity-only copy with no tracks is returned, so the previous release's
+// inventory is never shown for it.
+func (h *PlaybackHandler) inventoryEffectiveFile(ctx context.Context, file *models.MediaFile, session *playback.Session, record *playback.AttemptRecordV3, candidateURI string) *models.MediaFile {
 	if file == nil {
 		return nil
 	}
@@ -1227,9 +1233,20 @@ func (h *PlaybackHandler) inventoryEffectiveFile(ctx context.Context, file *mode
 		return bindSessionVirtualSourceWithTracks(ctx, file, session, h.fileResolver)
 	}
 	base := file
-	if h.VirtualFileLookup != nil {
-		if row, err := h.VirtualFileLookup(ctx, candidateURI); err == nil && row != nil {
-			base = row
+	if !virtualRowNamesCandidate(file, candidateURI) {
+		// The held row does not name the bound release. The plan's committed
+		// effective row is tried first: it is the row the transport and the
+		// deferred probe committed to, and unlike a path lookup it cannot land
+		// on a duplicate sibling of the same URI.
+		if record != nil && record.EffectiveMediaFileID > 0 && record.EffectiveMediaFileID != file.ID {
+			if planned, err := h.fileResolver.GetByID(ctx, record.EffectiveMediaFileID); err == nil && virtualRowNamesCandidate(planned, candidateURI) {
+				base = planned
+			}
+		}
+		if base == file && h.VirtualFileLookup != nil {
+			if row, err := h.VirtualFileLookup(ctx, candidateURI); err == nil && row != nil && virtualRowNamesCandidate(row, candidateURI) {
+				base = row
+			}
 		}
 	}
 	// Late owner-row adoption: a first-ever auto start can pin the session to a
@@ -1240,10 +1257,10 @@ func (h *PlaybackHandler) inventoryEffectiveFile(ctx context.Context, file *mode
 		base = adopted
 		session = refreshed
 	}
-	if base == file && strings.TrimSpace(file.FilePath) != candidateURI {
+	if !virtualRowNamesCandidate(base, candidateURI) {
 		// No row names the bound release. Do not serve the loaded row's
 		// inventory under the bound identity.
-		placeholder := *file
+		placeholder := *base
 		placeholder.FilePath = candidateURI
 		placeholder.AudioTracks = nil
 		placeholder.SubtitleTracks = nil
@@ -1252,6 +1269,18 @@ func (h *PlaybackHandler) inventoryEffectiveFile(ctx context.Context, file *mode
 		base = &placeholder
 	}
 	return bindSessionVirtualSourceWithTracks(ctx, base, session, h.fileResolver)
+}
+
+// virtualRowNamesCandidate reports whether a catalog row's stored path names the
+// bound candidate URI. Duplicate catalog rows for one release share the same
+// path, so an exact-path lookup can return a different row than the one the plan
+// committed to or the session carries evidence for; caller code uses this to
+// keep the row it already holds instead of swapping in an arbitrary duplicate.
+func virtualRowNamesCandidate(file *models.MediaFile, candidateURI string) bool {
+	if file == nil {
+		return false
+	}
+	return sameVirtualCandidate(file.FilePath, candidateURI)
 }
 
 // PublishSourceCommitted pushes the effective version and its declared
