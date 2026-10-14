@@ -172,16 +172,34 @@ type audioSelectionIntent struct {
 // audioSelectionIntentForSession reads the durable intent: the attempt
 // record first (it survives session-manager rebuilds), then the live
 // session mirror for reconnects before the record is reachable.
+//
+// The attempt read is retried once inside the caller's reconcile budget. A
+// probe commit racing attempt visibility can make the row momentarily read as
+// having no intent; a single-read verdict of "no selection intent" would skip a
+// reconcilable generation and leave the declared or wrong language pinned. The
+// retry only runs while no intent has been seen, and the live session mirror
+// remains the fallback either way.
 func (h *PlaybackHandler) audioSelectionIntentForSession(ctx context.Context, session *playback.Session) audioSelectionIntent {
 	var intent audioSelectionIntent
-	if h != nil && h.PlanStoreV3 != nil {
-		if record, err := h.PlanStoreV3.GetAttempt(ctx, session.ID); err == nil && record != nil {
-			intent.origin = strings.TrimSpace(record.SelectionOrigin)
-			intent.preferredLang = strings.TrimSpace(record.PreferredAudioLanguage)
-			intent.seriesSignature = record.SeriesAudioPreferenceSignature
-			intent.selectedOverride = record.SelectedAudioSignature
+	if h != nil && h.PlanStoreV3 != nil && session != nil {
+		for attempt := 0; attempt < audioSelectionIntentReadAttempts; attempt++ {
+			record, err := h.PlanStoreV3.GetAttempt(ctx, session.ID)
+			if err == nil && record != nil {
+				intent.origin = strings.TrimSpace(record.SelectionOrigin)
+				intent.preferredLang = strings.TrimSpace(record.PreferredAudioLanguage)
+				intent.seriesSignature = record.SeriesAudioPreferenceSignature
+				intent.selectedOverride = record.SelectedAudioSignature
+				if intent.origin != "" {
+					break
+				}
+			}
+			if attempt+1 >= audioSelectionIntentReadAttempts || !waitReconcileIntentRetry(ctx) {
+				break
+			}
 		}
-		_ = ctx
+	}
+	if session == nil {
+		return intent
 	}
 	if intent.origin == "" {
 		intent.origin = strings.TrimSpace(session.SelectionOrigin)
@@ -202,6 +220,39 @@ func (h *PlaybackHandler) audioSelectionIntentForSession(ctx context.Context, se
 		}
 	}
 	return intent
+}
+
+const (
+	// audioSelectionIntentReadAttempts bounds the durable-intent read: one
+	// attempt plus a single retry for a racing probe commit. More would widen
+	// the reconcile latency for every session that legitimately carries no
+	// intent (legacy records), which never resolves.
+	audioSelectionIntentReadAttempts = 2
+	// audioSelectionIntentRetryDelay separates the retry from the first read.
+	// It is far inside reconcileProbeBudgetV3 (10s), so the retry can never push
+	// one evaluation past its bound.
+	audioSelectionIntentRetryDelay = 25 * time.Millisecond
+)
+
+// waitReconcileIntentRetry pauses before the intent-read retry, honoring the
+// caller's reconcile deadline. It reports false when the context is already
+// done, so the caller stops retrying and falls through to the live session
+// mirror rather than blocking past the bound.
+func waitReconcileIntentRetry(ctx context.Context) bool {
+	if ctx == nil {
+		return true
+	}
+	if ctx.Err() != nil {
+		return false
+	}
+	timer := time.NewTimer(audioSelectionIntentRetryDelay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 // reconcileAutoAudioSelection re-runs SelectAudioTrack against the verified
