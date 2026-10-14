@@ -2924,9 +2924,15 @@ export function usePlaybackSession(
             // the menu stays marked rather than claiming a verified empty
             // inventory.
             audioInventoryProvisional: tracks.length === 0,
-            // Positive probe evidence for the new source supersedes a failure
-            // marker the previous source's timed-out discovery left behind.
-            inventoryFailed: tracks.length === 0 ? current.inventoryFailed : false,
+            // Positive probe evidence for the new source resolves the audio
+            // side of a failure marker the previous source's timed-out
+            // discovery left behind, but the marker survives while subtitles
+            // are still provisional so the subtitle menu keeps its terminal
+            // notice instead of restarting its spinner.
+            inventoryFailed:
+              tracks.length === 0 || current.subtitleInventoryProvisional
+                ? current.inventoryFailed
+                : false,
           };
         }
         // Same identity: only a strictly richer list (or the first probe
@@ -2940,11 +2946,15 @@ export function usePlaybackSession(
           ...current,
           planAudioTracks: tracks.map((track) => ({ ...track })),
           // Catalog tracks are probe-persisted, so a non-empty fold is the
-          // probed evidence the provisional marker was waiting for. It also
-          // ends a discovery-failure marker from an earlier timed-out poll:
-          // the list is no longer missing tracks to discover.
+          // probed evidence the provisional marker was waiting for. It only
+          // ends a discovery-failure marker for the audio side: subtitles have
+          // their own provisional evidence state, and a failure must survive an
+          // audio-only recovery so the subtitle menu keeps its terminal notice
+          // instead of falling back to an indefinite spinner. The audio menu
+          // already ignores the shared flag once its own inventory is
+          // confident, so gating only here needs no per-menu state.
           audioInventoryProvisional: false,
-          inventoryFailed: false,
+          inventoryFailed: current.subtitleInventoryProvisional ? current.inventoryFailed : false,
         };
       });
     },

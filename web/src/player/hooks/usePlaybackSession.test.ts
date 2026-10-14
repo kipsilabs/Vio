@@ -5297,7 +5297,7 @@ describe("usePlaybackSession plan audio inventory", () => {
     unmount();
   });
 
-  it("clears a discovery-failure marker when a catalog list later supplies the tracks", async () => {
+  it("keeps a discovery-failure marker for provisional subtitles after an audio-only recovery", async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       if (url.endsWith("/playback/start")) {
@@ -5335,13 +5335,19 @@ describe("usePlaybackSession plan audio inventory", () => {
     );
     await waitFor(() => expect(result.current.plan).not.toBeNull());
 
+    // Both menus start provisional, so the exhausted poll is a failure.
     act(() => {
       result.current.markInventoryExhausted();
     });
     expect(result.current.inventoryFailed).toBe(true);
 
-    // A late catalog read of the effective row is positive probe evidence: it
-    // ends both the provisional marker and the failure marker.
+    // An audio-only catalog fold supplies probe evidence for the audio menu but
+    // resolves nothing for subtitles. The audio menu renders its confident list
+    // (its failure banner is gated on its own provisional flag), while the
+    // shared marker must survive so the still-provisional subtitle menu keeps
+    // its terminal failure notice instead of falling back to an indefinite
+    // spinner. A later markInventoryExhausted is a no-op (pending is false), so
+    // clearing here cannot be recovered.
     act(() => {
       result.current.applyAudioInventory(
         [
@@ -5353,8 +5359,163 @@ describe("usePlaybackSession plan audio inventory", () => {
     });
 
     expect(result.current.audioInventoryProvisional).toBe(false);
-    expect(result.current.inventoryFailed).toBe(false);
+    expect(result.current.subtitleInventoryProvisional).toBe(true);
+    expect(result.current.inventoryFailed).toBe(true);
     expect(result.current.planAudioTracks).toHaveLength(2);
+
+    // A later verified full-inventory push resolves the remaining provisional
+    // menu and clears the shared marker.
+    act(() =>
+      result.current.applyInventoryUpdate({
+        session_id: "session-late-evidence",
+        inventory_status: "verified",
+        inventory_revision: "inv:verified-after-audio",
+        effective_media_file_id: 7,
+        audio_tracks: [
+          { codec: "eac3", channels: 2, layout: "stereo", language: "en", default: true },
+          { codec: "eac3", channels: 2, layout: "stereo", language: "ja", default: false },
+        ],
+        subtitle_inventory: [
+          fixtureSubtitleInventoryItemV3({ track_id: "file:7:subtitle:0", combined_index: 0 }),
+        ],
+      }),
+    );
+
+    expect(result.current.audioInventoryProvisional).toBe(false);
+    expect(result.current.subtitleInventoryProvisional).toBe(false);
+    expect(result.current.inventoryFailed).toBe(false);
+
+    unmount();
+  });
+
+  it("keeps an audio-only recovery's failure marker across a same-identity follow-up fold", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3", "deferred_track_inventory_v1"],
+            outcome: "playable",
+            session_id: "session-late-evidence-repeat",
+            playback_plan: fixturePlanV3({
+              session_id: "session-late-evidence-repeat",
+              tracks_pending: true,
+              inventory_url: "/api/v2/playback/session-late-evidence-repeat/inventory",
+              inventory_revision: "inv:prov-1",
+              inventory_status: "declared",
+              inventory_provenance: "pending",
+              effective_media_file_id: 7,
+              audio_tracks: [
+                { codec: "aac", channels: 2, layout: "stereo", language: "eng", default: true },
+              ],
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-late-evidence-repeat", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    act(() => {
+      result.current.markInventoryExhausted();
+    });
+    expect(result.current.inventoryFailed).toBe(true);
+
+    // A same-identity audio fold resolves the audio side but must preserve the
+    // shared failure while subtitles are still provisional; a second
+    // same-identity fold (e.g. a richer catalog read) must not clear it either.
+    const audioFold = [
+      { codec: "eac3", channels: 2, layout: "stereo", language: "en", default: true },
+      { codec: "eac3", channels: 2, layout: "stereo", language: "ja", default: false },
+    ];
+    act(() => {
+      result.current.applyAudioInventory(audioFold, 7);
+    });
+    expect(result.current.audioInventoryProvisional).toBe(false);
+    expect(result.current.subtitleInventoryProvisional).toBe(true);
+    expect(result.current.inventoryFailed).toBe(true);
+
+    act(() => {
+      result.current.applyAudioInventory(
+        [
+          ...audioFold,
+          { codec: "eac3", channels: 6, layout: "5.1", language: "de", default: false },
+        ],
+        7,
+      );
+    });
+    expect(result.current.subtitleInventoryProvisional).toBe(true);
+    expect(result.current.inventoryFailed).toBe(true);
+
+    unmount();
+  });
+
+  it("keeps an audio recovery's failure marker when the fold moves to another file", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3", "deferred_track_inventory_v1"],
+            outcome: "playable",
+            session_id: "session-late-evidence-rotation",
+            playback_plan: fixturePlanV3({
+              session_id: "session-late-evidence-rotation",
+              tracks_pending: true,
+              inventory_url: "/api/v2/playback/session-late-evidence-rotation/inventory",
+              inventory_revision: "inv:prov-1",
+              inventory_status: "declared",
+              inventory_provenance: "pending",
+              effective_media_file_id: 7,
+              audio_tracks: [
+                { codec: "aac", channels: 2, layout: "stereo", language: "eng", default: true },
+              ],
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-late-evidence-rotation", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    act(() => {
+      result.current.markInventoryExhausted();
+    });
+    expect(result.current.inventoryFailed).toBe(true);
+
+    // A changed-identity fold carries positive audio evidence for the new
+    // source, but the subtitle inventory is still provisional, so the shared
+    // failure marker must survive for the subtitle menu.
+    act(() => {
+      result.current.applyAudioInventory(
+        [{ codec: "eac3", channels: 2, layout: "stereo", language: "en", default: true }],
+        8,
+      );
+    });
+
+    expect(result.current.audioInventoryProvisional).toBe(false);
+    expect(result.current.subtitleInventoryProvisional).toBe(true);
+    expect(result.current.inventoryFailed).toBe(true);
 
     unmount();
   });

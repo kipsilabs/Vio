@@ -1244,7 +1244,7 @@ func (h *PlaybackHandler) inventoryEffectiveFile(ctx context.Context, file *mode
 			}
 		}
 		if base == file && h.VirtualFileLookup != nil {
-			if row, err := h.VirtualFileLookup(ctx, candidateURI); err == nil && row != nil {
+			if row, err := h.VirtualFileLookup(ctx, candidateURI); err == nil && row != nil && virtualRowNamesCandidate(row, candidateURI) {
 				base = row
 			}
 		}
@@ -1257,10 +1257,10 @@ func (h *PlaybackHandler) inventoryEffectiveFile(ctx context.Context, file *mode
 		base = adopted
 		session = refreshed
 	}
-	if base == file && strings.TrimSpace(file.FilePath) != candidateURI {
+	if !virtualRowNamesCandidate(base, candidateURI) {
 		// No row names the bound release. Do not serve the loaded row's
 		// inventory under the bound identity.
-		placeholder := *file
+		placeholder := *base
 		placeholder.FilePath = candidateURI
 		placeholder.AudioTracks = nil
 		placeholder.SubtitleTracks = nil

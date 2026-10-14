@@ -178,12 +178,12 @@ func (fx *duplicateInventoryFixture) inventory(t *testing.T) playback.PlaybackIn
 	return inventory
 }
 
-// TestSessionInventoryResolvesPlanRowOverUnprobedDuplicate is the production
+// TestSessionInventoryDuplicateResolvesPlanRowOverUnprobedDuplicate is the production
 // shape: the plan committed (and the probe wrote to) row 4912237, but an
 // exact-path lookup resolves the unprobed duplicate 5382723 for the same
 // candidate URI. The inventory must serve the committed probed row: effective
 // 4912237 with its verified inventory, never the duplicate's declared list.
-func TestSessionInventoryResolvesPlanRowOverUnprobedDuplicate(t *testing.T) {
+func TestSessionInventoryDuplicateResolvesPlanRowOverUnprobedDuplicate(t *testing.T) {
 	fx := setupDuplicateInventoryFixture(t, true)
 
 	inventory := fx.inventory(t)
@@ -203,12 +203,12 @@ func TestSessionInventoryResolvesPlanRowOverUnprobedDuplicate(t *testing.T) {
 	}
 }
 
-// TestSessionInventoryTransitionsToVerifiedWhenProbeLandsOnPlanRow pins the
+// TestSessionInventoryDuplicateTransitionsToVerifiedWhenProbeLandsOnPlanRow pins the
 // terminal transition the client waits for: with the committed row still
 // unprobed and its deferred probe outstanding, the poll is pending; once the
 // probe lands on that row, the same poll is verified. Throughout, the effective
 // row stays the committed row and never the duplicate the path lookup resolves.
-func TestSessionInventoryTransitionsToVerifiedWhenProbeLandsOnPlanRow(t *testing.T) {
+func TestSessionInventoryDuplicateTransitionsToVerifiedWhenProbeLandsOnPlanRow(t *testing.T) {
 	fx := setupDuplicateInventoryFixture(t, false)
 	if err := fx.manager.SetVirtualProbeOutcome(fx.session.ID, probeOutcomePending); err != nil {
 		t.Fatalf("SetVirtualProbeOutcome: %v", err)
@@ -259,12 +259,12 @@ func TestSessionInventoryTransitionsToVerifiedWhenProbeLandsOnPlanRow(t *testing
 	}
 }
 
-// TestSessionInventoryKeepsRefusingDifferentReleaseEvidence keeps the
+// TestSessionInventoryDuplicateKeepsRefusingDifferentReleaseEvidence keeps the
 // fail-closed half: when the session is bound to a genuinely different candidate
 // whose row does not name the probed row's release, the probed row's verified
 // inventory must not be served under the bound identity. The resolution must not
 // adopt another release's row just because a plan/evidence row exists.
-func TestSessionInventoryKeepsRefusingDifferentReleaseEvidence(t *testing.T) {
+func TestSessionInventoryDuplicateKeepsRefusingDifferentReleaseEvidence(t *testing.T) {
 	fx := setupDuplicateInventoryFixture(t, true)
 
 	// Rebind the session to a different concrete candidate whose row exists and
@@ -303,5 +303,195 @@ func TestSessionInventoryKeepsRefusingDifferentReleaseEvidence(t *testing.T) {
 	}
 	if len(inventory.AudioTracks) == len(duplicateProbedAudio()) {
 		t.Fatalf("served the probed release's %d tracks for a different bound release", len(duplicateProbedAudio()))
+	}
+}
+
+// TestSessionInventoryDuplicatePreservesProbedHeldRowForSemanticallyEquivalentCandidate
+// tests that a probed held row whose FilePath is semantically equivalent (but
+// not byte-identical) to the session's candidate URI retains its identity,
+// verified status, and probed audio/subtitle inventory when no carried evidence
+// or probe outcome is present.
+func TestSessionInventoryDuplicatePreservesProbedHeldRowForSemanticallyEquivalentCandidate(t *testing.T) {
+	probedRow, _ := duplicateInventoryRows(true)
+	// Equivalent URI uses %20 instead of + for query escaping; sameVirtualCandidate
+	// considers them equivalent releases, but literal string equality fails.
+	equivalentURI := "virtual://series/tt26743760/2/20?profile=4K%20Dolby%20Vision&result=b5950ed2eb640feafff4e925"
+
+	resolver := &duplicateRowResolver{
+		byID:   map[int]models.MediaFile{probedRow.ID: probedRow},
+		byPath: map[string]int{dupCandidateURI: probedRow.ID},
+	}
+
+	manager := playback.NewSessionManager(0, 0)
+	session, err := manager.StartSession(1, "profile-1", probedRow.ID, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	// Bound to equivalent URI; no carried evidence, no probe outcome.
+	if err := manager.SetVirtualSource(session.ID, equivalentURI, 5); err != nil {
+		t.Fatalf("SetVirtualSource: %v", err)
+	}
+
+	handler := NewPlaybackHandler(manager, resolver)
+	handler.InstallationID = "test-install"
+	handler.VirtualFileLookup = resolver.GetByPath
+	if err := handler.PlanStoreV3.SaveAttempt(context.Background(), playback.AttemptRecordV3{
+		PlaybackAttemptID: "attempt-equiv", SessionID: session.ID, UserID: 1, ProfileID: "profile-1",
+		RequestedMediaFileID: probedRow.ID, EffectiveMediaFileID: probedRow.ID, ExpiresAt: time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("SaveAttempt: %v", err)
+	}
+
+	inventory, err := handler.GetPlaybackInventoryV2(newAuthorizedPlaybackContext(),
+		PlaybackCaller{UserID: 1, ProfileID: "profile-1", InstallationID: "test-install"}, session.ID)
+	if err != nil {
+		t.Fatalf("GetPlaybackInventoryV2: %v", err)
+	}
+
+	if inventory.EffectiveMediaFileID != probedRow.ID {
+		t.Fatalf("effective media file id = %d, want held row %d", inventory.EffectiveMediaFileID, probedRow.ID)
+	}
+	if inventory.InventoryStatus != string(ProbeProvenanceVerified) {
+		t.Fatalf("inventory status = %q, want verified", inventory.InventoryStatus)
+	}
+	if len(inventory.AudioTracks) != len(duplicateProbedAudio()) {
+		t.Fatalf("served audio tracks = %d, want %d", len(inventory.AudioTracks), len(duplicateProbedAudio()))
+	}
+	if len(inventory.SubtitleInventory) == 0 {
+		t.Fatal("served no subtitles for semantically equivalent probed row")
+	}
+}
+
+// TestSessionInventoryDuplicateCommittedPlanRowWinsOverUnprobedDuplicateWhenHeldRowStale
+// covers direct fallback: the session's held row is stale (names old candidate),
+// the committed plan row names the live candidate, and path lookup returns an
+// unprobed duplicate -> the committed plan row must win.
+func TestSessionInventoryDuplicateCommittedPlanRowWinsOverUnprobedDuplicateWhenHeldRowStale(t *testing.T) {
+	probedRow, unprobedDuplicate := duplicateInventoryRows(true)
+	staleHeldRow := models.MediaFile{
+		ID: dupOtherRowID, ContentID: "episode-dup", FilePath: dupOtherURI,
+		Container: "virtual", VirtualOwnerInstallationID: 5,
+		AudioTracks: []models.AudioTrack{{Index: 0, Codec: "aac", Channels: 2, Language: "eng", Default: true}},
+	}
+
+	resolver := &duplicateRowResolver{
+		byID: map[int]models.MediaFile{
+			staleHeldRow.ID:      staleHeldRow,
+			probedRow.ID:         probedRow,
+			unprobedDuplicate.ID: unprobedDuplicate,
+		},
+		byPath: map[string]int{
+			dupCandidateURI: unprobedDuplicate.ID, // Path lookup returns the unprobed duplicate
+			dupOtherURI:     staleHeldRow.ID,
+		},
+	}
+
+	manager := playback.NewSessionManager(0, 0)
+	// Session held row is the stale row (dupOtherRowID).
+	session, err := manager.StartSession(1, "profile-1", staleHeldRow.ID, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	// Session virtual source names live candidate (dupCandidateURI).
+	if err := manager.SetVirtualSource(session.ID, dupCandidateURI, 5); err != nil {
+		t.Fatalf("SetVirtualSource: %v", err)
+	}
+
+	handler := NewPlaybackHandler(manager, resolver)
+	handler.InstallationID = "test-install"
+	handler.VirtualFileLookup = resolver.GetByPath
+
+	// The committed plan attempt names the probed row (probedRow.ID).
+	if err := handler.PlanStoreV3.SaveAttempt(context.Background(), playback.AttemptRecordV3{
+		PlaybackAttemptID: "attempt-plan-fallback", SessionID: session.ID, UserID: 1, ProfileID: "profile-1",
+		RequestedMediaFileID: staleHeldRow.ID, EffectiveMediaFileID: probedRow.ID, ExpiresAt: time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("SaveAttempt: %v", err)
+	}
+
+	inventory, err := handler.GetPlaybackInventoryV2(newAuthorizedPlaybackContext(),
+		PlaybackCaller{UserID: 1, ProfileID: "profile-1", InstallationID: "test-install"}, session.ID)
+	if err != nil {
+		t.Fatalf("GetPlaybackInventoryV2: %v", err)
+	}
+
+	if inventory.EffectiveMediaFileID != probedRow.ID {
+		t.Fatalf("effective media file id = %d, want committed plan row %d (not duplicate %d or stale %d)",
+			inventory.EffectiveMediaFileID, probedRow.ID, unprobedDuplicate.ID, staleHeldRow.ID)
+	}
+	if inventory.InventoryStatus != string(ProbeProvenanceVerified) {
+		t.Fatalf("inventory status = %q, want verified", inventory.InventoryStatus)
+	}
+	if len(inventory.AudioTracks) != len(duplicateProbedAudio()) {
+		t.Fatalf("served audio tracks = %d, want %d", len(inventory.AudioTracks), len(duplicateProbedAudio()))
+	}
+	if len(inventory.SubtitleInventory) == 0 {
+		t.Fatal("served no subtitles for committed plan row")
+	}
+}
+
+// TestSessionInventoryDuplicatePathLookupWinsWhenHeldRowAndPlanRowBothStale
+// covers direct fallback: held row and committed plan row both name an old
+// candidate, and only the path lookup names the live release -> lookup wins.
+func TestSessionInventoryDuplicatePathLookupWinsWhenHeldRowAndPlanRowBothStale(t *testing.T) {
+	liveLookupRow, _ := duplicateInventoryRows(true)
+	staleHeldRow := models.MediaFile{
+		ID: dupOtherRowID, ContentID: "episode-dup", FilePath: dupOtherURI,
+		Container: "virtual", VirtualOwnerInstallationID: 5,
+		AudioTracks: []models.AudioTrack{{Index: 0, Codec: "aac", Channels: 2, Language: "eng", Default: true}},
+	}
+
+	resolver := &duplicateRowResolver{
+		byID: map[int]models.MediaFile{
+			staleHeldRow.ID:  staleHeldRow,
+			liveLookupRow.ID: liveLookupRow,
+		},
+		byPath: map[string]int{
+			dupCandidateURI: liveLookupRow.ID, // Path lookup names live candidate
+			dupOtherURI:     staleHeldRow.ID,
+		},
+	}
+
+	manager := playback.NewSessionManager(0, 0)
+	// Held row is stale.
+	session, err := manager.StartSession(1, "profile-1", staleHeldRow.ID, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	// Bound to live release candidate.
+	if err := manager.SetVirtualSource(session.ID, dupCandidateURI, 5); err != nil {
+		t.Fatalf("SetVirtualSource: %v", err)
+	}
+
+	handler := NewPlaybackHandler(manager, resolver)
+	handler.InstallationID = "test-install"
+	handler.VirtualFileLookup = resolver.GetByPath
+
+	// Committed plan row is also stale (names staleHeldRow.ID, which has dupOtherURI).
+	if err := handler.PlanStoreV3.SaveAttempt(context.Background(), playback.AttemptRecordV3{
+		PlaybackAttemptID: "attempt-lookup-fallback", SessionID: session.ID, UserID: 1, ProfileID: "profile-1",
+		RequestedMediaFileID: staleHeldRow.ID, EffectiveMediaFileID: staleHeldRow.ID, ExpiresAt: time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("SaveAttempt: %v", err)
+	}
+
+	inventory, err := handler.GetPlaybackInventoryV2(newAuthorizedPlaybackContext(),
+		PlaybackCaller{UserID: 1, ProfileID: "profile-1", InstallationID: "test-install"}, session.ID)
+	if err != nil {
+		t.Fatalf("GetPlaybackInventoryV2: %v", err)
+	}
+
+	if inventory.EffectiveMediaFileID != liveLookupRow.ID {
+		t.Fatalf("effective media file id = %d, want path lookup row %d (not stale %d)",
+			inventory.EffectiveMediaFileID, liveLookupRow.ID, staleHeldRow.ID)
+	}
+	if inventory.InventoryStatus != string(ProbeProvenanceVerified) {
+		t.Fatalf("inventory status = %q, want verified", inventory.InventoryStatus)
+	}
+	if len(inventory.AudioTracks) != len(duplicateProbedAudio()) {
+		t.Fatalf("served audio tracks = %d, want %d", len(inventory.AudioTracks), len(duplicateProbedAudio()))
+	}
+	if len(inventory.SubtitleInventory) == 0 {
+		t.Fatal("served no subtitles for path lookup row")
 	}
 }
