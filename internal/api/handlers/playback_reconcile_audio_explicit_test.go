@@ -269,6 +269,77 @@ func TestVerifyExplicitAudioSelectionGenuineAbsenceDoesNotTerminate(t *testing.T
 	}
 }
 
+// TestVerifyExplicitAudioSelectionGenuineAbsenceStaysRecoverable carries the
+// genuinely-absent case one step further than the termination check: the
+// refusal is durable for observability, the session survives with its committed
+// selection intact, and when the verified overlay replaces the carried
+// inventory it cannot re-identify the vanished stream and fails closed. That
+// fail-closed marker is not a dead end: the client's own recovery replan commits
+// a fresh selection and clears it, so playback is re-resolved rather than left
+// stalled or unhandled.
+func TestVerifyExplicitAudioSelectionGenuineAbsenceStaysRecoverable(t *testing.T) {
+	verified := &models.MediaFile{
+		ID:       7,
+		FilePath: "virtual://episode/partial-signature",
+		AudioTracks: []models.AudioTrack{{
+			Index: 0, Language: "en", Codec: "eac3", Channels: 2, Layout: "stereo",
+		}},
+		ProbeUpdatedAt: probeStampPtr(t),
+	}
+	f := newExplicitReconcileFixture(t, verified)
+	after := f.verify(t)
+
+	entry := playback.FindAudioReconcileEntry(after.AudioReconcileLedger, reconcileGenerationV3(verified), f.session.ID)
+	if entry == nil || entry.Decision != playback.AudioReconcileRefused {
+		t.Fatalf("a genuinely absent explicit selection must record a durable refusal, got %+v", entry)
+	}
+	for _, event := range f.drainRouteEvents() {
+		if event.Event == playback.RouteEventTerminalV3 {
+			t.Fatalf("a genuine absence must not hard-terminate a live stream: %+v", event)
+		}
+	}
+
+	// The refusal path is observability-only: the session still exists and its
+	// committed selection keeps serving, not stranded at a dead index.
+	manager, ok := f.handler.sessionMgr.(*playback.SessionManager)
+	if !ok {
+		t.Fatal("handler session manager is not a *playback.SessionManager")
+	}
+	live := reconcileLiveSession(t, f.handler, f.session.ID)
+	if live.AudioTrackIndex != 0 || live.VirtualAudioSelectionInvalid {
+		t.Fatalf("the refusal path must leave the committed selection serving: index=%d invalid=%v",
+			live.AudioTrackIndex, live.VirtualAudioSelectionInvalid)
+	}
+
+	// Applying the verified overlay cannot re-identify the vanished selection,
+	// so it fails closed (index -1, invalid marker set).
+	binding, err := manager.VirtualSourceBinding(live.ID)
+	if err != nil {
+		t.Fatalf("virtual source binding: %v", err)
+	}
+	applied, err := manager.SetVirtualProbeVerifiedInventoryIfBinding(
+		live.ID, binding, "rev-verified-absence", verified.AudioTracks, nil, nil)
+	if err != nil || !applied {
+		t.Fatalf("verified overlay write: applied=%v err=%v", applied, err)
+	}
+	live = reconcileLiveSession(t, f.handler, f.session.ID)
+	if live.AudioTrackIndex != -1 || !live.VirtualAudioSelectionInvalid {
+		t.Fatalf("an unreidentifiable verified overlay must fail closed: index=%d invalid=%v",
+			live.AudioTrackIndex, live.VirtualAudioSelectionInvalid)
+	}
+
+	// The client's own recovery replan commits a fresh selection and clears the
+	// marker: that is what proves the session is recoverable, not stuck.
+	if err := manager.UpdateAudioTrack(live.ID, 0, playback.PlayDirect); err != nil {
+		t.Fatalf("recovery replan update: %v", err)
+	}
+	live = reconcileLiveSession(t, f.handler, f.session.ID)
+	if live.AudioTrackIndex != 0 || live.VirtualAudioSelectionInvalid {
+		t.Fatalf("client recovery must clear the fail-closed marker: index=%d invalid=%v",
+			live.AudioTrackIndex, live.VirtualAudioSelectionInvalid)
+	}
+}
+
 func probeStampPtr(t *testing.T) *time.Time {
 	t.Helper()
 	return &invalidationProbeStamp

@@ -233,3 +233,88 @@ func TestClientAudioSignatureMatchesTrackWildcards(t *testing.T) {
 		t.Fatal("a nil or zero signature carries no constraint")
 	}
 }
+
+// TestClientAudioSignatureMatchesTrackLanguage pins the language member against
+// MULTi lists and regional/canonical spellings. A signature language the client
+// actually named must be found as the track's primary Language or as any MULTi
+// member, compared with the strict matcher's canonical/regional rank logic, while
+// a genuinely different language or a conflicting script still refutes.
+func TestClientAudioSignatureMatchesTrackLanguage(t *testing.T) {
+	cases := []struct {
+		name  string
+		track models.AudioTrack
+		sig   *userstore.AudioTrackSignature
+		want  bool
+	}{
+		{
+			name:  "multilist carries the signature language",
+			track: models.AudioTrack{Language: "mul", Languages: []string{"de", "en"}, Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Language: "en", Codec: "aac", Channels: 2},
+			want:  true,
+		},
+		{
+			name:  "regional track carries a bare signature language",
+			track: models.AudioTrack{Language: "en-US", Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Language: "en", Codec: "aac", Channels: 2},
+			want:  true,
+		},
+		{
+			name:  "bare track carries a regional signature language",
+			track: models.AudioTrack{Language: "en", Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Language: "en-US", Codec: "aac", Channels: 2},
+			want:  true,
+		},
+		{
+			name:  "canonical ISO alias matches",
+			track: models.AudioTrack{Language: "eng", Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Language: "en", Codec: "aac", Channels: 2},
+			want:  true,
+		},
+		{
+			name:  "case and surrounding space variants match",
+			track: models.AudioTrack{Language: "en", Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Language: "  EN  ", Codec: "aac", Channels: 2},
+			want:  true,
+		},
+		{
+			name:  "a different language still refutes",
+			track: models.AudioTrack{Language: "en", Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Language: "de", Codec: "aac", Channels: 2},
+			want:  false,
+		},
+		{
+			name:  "a MULTi list without the signature language still refutes",
+			track: models.AudioTrack{Language: "mul", Languages: []string{"de", "fr"}, Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Language: "en", Codec: "aac", Channels: 2},
+			want:  false,
+		},
+		{
+			name:  "a conflicting script still refutes",
+			track: models.AudioTrack{Language: "zh-Hant", Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Language: "zh-Hans", Codec: "aac", Channels: 2},
+			want:  false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ClientAudioSignatureMatchesTrack(tc.track, tc.sig); got != tc.want {
+				t.Fatalf("ClientAudioSignatureMatchesTrack(%+v, %+v) = %v, want %v", tc.track, tc.sig, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestClientAudioSignatureMatchesTrackStrictMatchersUntouched pins that the
+// non-refutation predicate did not relax probe-derived re-identification: a
+// remap whose only candidates tie because "en" and "eng" are canonically equal
+// still fails closed.
+func TestClientAudioSignatureMatchesTrackStrictMatchersUntouched(t *testing.T) {
+	plan := []models.AudioTrack{{Index: 0, Language: "en", Codec: "aac", Channels: 2}}
+	verified := []models.AudioTrack{
+		{Index: 0, Language: "en", Codec: "aac", Channels: 2},
+		{Index: 0, Language: "eng", Codec: "aac", Channels: 2},
+	}
+	if got := remapAudioSelectionIndex(plan, 0, verified); got != -1 {
+		t.Fatalf("remapped position = %d, want -1: probe-derived re-identification must stay fail-closed", got)
+	}
+}

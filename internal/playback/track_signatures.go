@@ -29,23 +29,30 @@ func AudioTrackSignatureFromTrack(track models.AudioTrack) *userstore.AudioTrack
 
 // ClientAudioSignatureMatchesTrack reports whether an audio track signature a
 // client named (or the start-time snapshot persisted) is consistent with one
-// probed track. Unlike the strict track-vs-track comparison
-// (audioTrackMatchesSignature, matchExactAudioTrack), every member the caller
-// left empty is a wildcard: /api/v2 documents each AudioTrackSignature member
-// as optional and absent as equal to its zero value, so a signature that names
-// only codec and channels still identifies a probed track that also reports a
-// language, title, layout and default flag.
+// probed track. It is a NON-REFUTATION predicate for a presence check, never a
+// selector: it returns false only when a member the signature actually carried
+// provably conflicts with the track, and true otherwise.
 //
-// A probed track with no identifying fields at all (a provider placeholder, or
-// a row that carries only a synthetic index and default flag) has nothing to
-// compare, so it cannot refute the selection: the caller must treat the
-// inventory as uninformative rather than absent. A fully populated signature
-// reduces to the same member-by-member equality a strict comparison makes.
+// Every member the caller left empty is a wildcard: /api/v2 documents each
+// AudioTrackSignature member as optional and absent as equal to its zero
+// value, so a signature that names only codec and channels still identifies a
+// probed track that also reports a language, title, layout and default flag. A
+// probed track with no identifying fields at all (a provider placeholder, or a
+// row that carries only a synthetic index and default flag) has nothing to
+// compare, so it cannot refute the selection either. A fully populated
+// signature reduces to the same member-by-member equality a strict comparison
+// makes.
 //
-// This is deliberately a separate entry point: the exact matchers still fail
-// closed on ambiguity for probe-derived re-identification (see
-// remapAudioSelectionIndex), while a client/start signature is only ever
-// checked for presence, never used to pick among several streams.
+// Because a partial signature and a placeholder track both match, a true result
+// is NOT proof of identity: this predicate must never be used to positively
+// authorize an unknown track or to pick among several streams. Callers use it
+// only to answer "is the committed selection still present anywhere in this
+// inventory" and keep serving the track the plan already committed.
+//
+// Probe-derived re-identification stays on the strict matchers
+// (audioTrackMatchesSignature, matchExactAudioTrack, remapAudioSelectionIndex),
+// which fail closed on ambiguity. This is deliberately a separate entry point:
+// it never feeds those matchers, and they never call it.
 func ClientAudioSignatureMatchesTrack(track models.AudioTrack, sig *userstore.AudioTrackSignature) bool {
 	if sig == nil || sig.IsZero() {
 		return true
@@ -54,7 +61,14 @@ func ClientAudioSignatureMatchesTrack(track models.AudioTrack, sig *userstore.Au
 	if candidate == nil {
 		return true
 	}
-	if sig.Language != "" && !trackStringEqual(sig.Language, candidate.Language) {
+	// A stated signature language must be carried by the track, as its primary
+	// Language or as any member of its MULTi Languages list, under the same
+	// canonical/regional rank logic the strict matcher uses: "en" matches
+	// "en-US" and the canonical "eng", a bare/placeholder track token stays
+	// neutral rather than matching, and a conflicting script or a different
+	// language still refutes. Regional tags are not conflated by a raw-string
+	// comparison here; langMatchRank's rank ordering does the discrimination.
+	if sig.Language != "" && !trackHasLanguage(track, sig.Language) {
 		return false
 	}
 	if sig.Title != "" && !trackStringEqual(sig.Title, candidate.Title) {
