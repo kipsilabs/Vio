@@ -10,6 +10,7 @@ import {
   playbackControlSocketURL,
 } from "@/api/v2/playbackControlSocket";
 import { usePlayerConfig } from "../context/PlayerConfigContext";
+import { isPlaybackSessionGoneError } from "../playback-errors";
 import { playerV2Origin } from "../player-v2";
 import { sessionInstallation } from "../session-mutations";
 import {
@@ -34,6 +35,12 @@ interface UsePlaybackRealtimeOptions {
    * announce a command it would only reject.
    */
   supportedCommands?: PlaybackCommandName[];
+  /**
+   * Reports that the session no longer exists on the server (the ticket mint
+   * answered 404/410). The control lane stops reconnecting; the player runs its
+   * one recovery or surfaces the lost state.
+   */
+  onSessionLost?: () => void;
 }
 
 interface UsePlaybackRealtimeResult {
@@ -47,12 +54,14 @@ export function usePlaybackRealtime({
   onCommand,
   onEvent,
   supportedCommands,
+  onSessionLost,
 }: UsePlaybackRealtimeOptions): UsePlaybackRealtimeResult {
   const config = usePlayerConfig();
   const [connectionState, setConnectionState] = useState<ConnectionState>("disconnected");
   const onCommandRef = useRef(onCommand);
   const onEventRef = useRef(onEvent);
   const supportedCommandsRef = useRef(supportedCommands);
+  const onSessionLostRef = useRef(onSessionLost);
   const seenCommandsRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
@@ -66,6 +75,10 @@ export function usePlaybackRealtime({
   useEffect(() => {
     onEventRef.current = onEvent;
   }, [onEvent]);
+
+  useEffect(() => {
+    onSessionLostRef.current = onSessionLost;
+  }, [onSessionLost]);
 
   useEffect(() => {
     if (!sessionId) {
@@ -202,6 +215,16 @@ export function usePlaybackRealtime({
             // The account or profile changed underneath this player; nothing
             // this browser can mint is valid for the session any more.
             setConnectionState("disconnected");
+            return;
+          }
+          if (isPlaybackSessionGoneError(error)) {
+            // The session no longer exists server-side (a restart, expiry, or
+            // terminate). Retrying the mint can never succeed, so the loop
+            // stops; the player runs its one recovery or surfaces the lost
+            // state. A later session id re-runs this effect and resets.
+            terminated = true;
+            setConnectionState("disconnected");
+            onSessionLostRef.current?.();
             return;
           }
           // A refused mint (403 non-owner, 409 installation mismatch) is

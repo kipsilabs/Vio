@@ -577,6 +577,11 @@ export interface UsePlaybackSessionResult extends PlaybackSessionState {
   /** Starts a fresh reconnect cycle after the previous one gave up. */
   retryConnection: () => void;
   /**
+   * Enters the lost state for a session the server no longer has when the
+   * reconnect cannot run (no played stream to reposition).
+   */
+  reportSessionLost: () => void;
+  /**
    * `failure_recovery` replan for a plan the *server* invalidated over the
    * realtime `plan_invalidated` command. Resolves to whether a replacement plan
    * is now playing; the caller reports that back as the command's result.
@@ -2728,6 +2733,16 @@ export function usePlaybackSession(
     beginReconnect(reconnect.positionSeconds, reconnect.resume, true);
   }, [beginReconnect]);
 
+  /**
+   * Enters the lost state for a session the server has already answered that
+   * it no longer has, when the reconnect cannot run (nothing has played yet,
+   * so there is no position or transport to rebuild). Whenever a played stream
+   * exists, the reconnect is the one recovery and runs instead.
+   */
+  const reportSessionLost = useCallback(() => {
+    giveUpReconnect(CONNECTION_LOST_ERROR);
+  }, [giveUpReconnect]);
+
   // Coming back online is the best moment to try again.
   const reconnecting = state.connectionStatus === "reconnecting";
   useEffect(() => {
@@ -3780,6 +3795,7 @@ export function usePlaybackSession(
     recoverFromFailure,
     recoverConnection,
     retryConnection,
+    reportSessionLost,
     invalidatePlan,
     reanchorSeek,
     refreshSubtitles,
