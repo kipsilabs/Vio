@@ -3194,8 +3194,19 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		if virtualResultCandidateID(cand.URI) != "" &&
 			(dbFile == nil || strings.TrimSpace(dbFile.FilePath) != strings.TrimSpace(cand.URI)) {
 			if ownerRow, capable, ownerErr := h.virtualPathLookupRow(attemptCtx, cand.URI); capable && ownerErr == nil && ownerRow != nil {
-				dbFile = ownerRow
-				dbFound = true
+				anchorIdentity, anchorHasIdentity := persistedVirtualIdentity(file)
+				rowIdentity, rowHasIdentity := persistedVirtualIdentity(ownerRow)
+				anchorHasURL := strings.TrimSpace(file.ResolvedURL) != ""
+				admissible := true
+				if anchorHasIdentity && rowHasIdentity && !persistedIdentityCompatible(anchorIdentity, rowIdentity) {
+					admissible = false
+				} else if anchorHasURL && !anchorHasIdentity && rowHasIdentity {
+					admissible = false
+				}
+				if admissible {
+					dbFile = ownerRow
+					dbFound = true
+				}
 			}
 		}
 		if dbFound {
