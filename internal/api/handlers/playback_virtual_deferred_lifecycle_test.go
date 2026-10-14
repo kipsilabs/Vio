@@ -1622,10 +1622,33 @@ func TestDeferredProbeRotationDuringPersistenceFenced(t *testing.T) {
 // TestDeferredProbeABAStaleGenerationFenced is the point-2d regression: a
 // session that rotates A→B→A yields a different generation for the second A
 // binding, so a job armed against the first A must still be treated as stale —
-// the worker's pre-probe fence drops it, no probe runs, and the second A
-// binding's outcome is not overwritten.
+// the worker's pre-probe fence drops it before the remote enumeration and it
+// writes nothing.
+//
+// As with the mid-flight A→B→A case, the pinned invariant is that the superseded
+// job runs nothing and writes nothing; it is not that the second A binding stays
+// un-enumerated. The drop admits a FRESH replacement for the current A binding
+// (see scheduleDroppedProbeReplacement), and that replacement legitimately probes
+// and records verified against the second A generation. Only one probe runs — the
+// superseded first-A job never reaches the enumeration — and exactly one durable
+// write lands, against the current binding.
 func TestDeferredProbeABAStaleGenerationFenced(t *testing.T) {
 	fx := newDeferredLifecycleFixture(t, 905, "virtual://movie/tt-aba?result=a")
+	fx.saveAttempt(t)
+	conn := fx.registerPush(t)
+
+	var probeMu sync.Mutex
+	probeCalls := 0
+	fx.handler.VirtualPlaybackSourceProber = func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
+		probeMu.Lock()
+		probeCalls++
+		probeMu.Unlock()
+		f.AudioTracks = fx.probedAudio
+		f.SubtitleTracks = fx.probedSubs
+		f.CodecAudio = "eac3"
+		return f, nil
+	}
+
 	first := fx.job("virtual://movie/tt-aba?result=a")
 	if !fx.handler.armDeferredProbePending(context.Background(), first) {
 		t.Fatal("admission rejected the first A job as stale")
@@ -1644,29 +1667,44 @@ func TestDeferredProbeABAStaleGenerationFenced(t *testing.T) {
 	if secondGen == firstGen {
 		t.Fatalf("A→B→A did not change the binding generation: first=%d second=%d", firstGen, secondGen)
 	}
-	// The first job's retained generation is stale: the worker's fence must
-	// drop it even though the candidate URI matches the second A binding.
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		fx.handler.runDeferredVirtualProbe(first)
-	}()
+	// The first job's retained generation is stale: the worker's pre-probe fence
+	// drops it before the remote enumeration and hands the current binding a
+	// replacement job with its own lifecycle.
+	fx.handler.runDeferredVirtualProbe(first)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		live, err := fx.manager.GetSession(fx.session.ID)
+		if err == nil && live.VirtualProbeOutcome == playback.VirtualProbeOutcomeVerified {
+			break
+		}
+		if time.Now().After(deadline) {
+			got := ""
+			if live2, err := fx.manager.GetSession(fx.session.ID); err == nil {
+				got = live2.VirtualProbeOutcome
+			}
+			t.Fatalf("session outcome = %q, want verified from the pre-probe replacement", got)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	// The superseded first-A job never wrote: exactly one durable write landed,
+	// from the replacement, against the current A generation.
+	if calls := fx.saverCallCount(); calls != 1 {
+		t.Fatalf("durable evidence writes = %d, want 1 (only the replacement persists; the superseded job writes nothing)", calls)
+	}
+	probeMu.Lock()
+	calls := probeCalls
+	probeMu.Unlock()
+	if calls != 1 {
+		t.Fatalf("probe invocations = %d, want 1 (the superseded first-A job must not probe)", calls)
+	}
 	select {
-	case <-done:
+	case event := <-conn.ch:
+		if event.payload.InventoryStatus != string(ProbeProvenanceVerified) {
+			t.Fatalf("published inventory status = %q, want verified from the replacement", event.payload.InventoryStatus)
+		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("A→B→A stale job did not return promptly")
-	}
-	select {
-	case <-fx.probeStarted:
-		t.Fatal("probe ran for the superseded first-A binding")
-	case <-time.After(100 * time.Millisecond):
-	}
-	live, err := fx.manager.GetSession(fx.session.ID)
-	if err != nil {
-		t.Fatalf("GetSession: %v", err)
-	}
-	if live.VirtualProbeOutcome != "" {
-		t.Fatalf("A→B→A stale job wrote outcome %q; want empty", live.VirtualProbeOutcome)
+		t.Fatal("no inventory_updated push for the replacement's verified binding")
 	}
 }
 
@@ -2079,6 +2117,94 @@ func TestDeferredProbeMidFlightSameURIDifferentOwnerNoReplacement(t *testing.T) 
 	}
 	if live.VirtualProbeOutcome != "" {
 		t.Fatalf("session outcome = %q, want empty (no lifecycle admitted for the different owner)", live.VirtualProbeOutcome)
+	}
+}
+
+// TestDeferredProbeQueuedBindingMovedBeforeProbeAdmitsReplacement covers the
+// pre-probe shed path: a job that was armed and then queued behind the pool finds
+// the binding moved when it finally reaches the pre-probe fence, so it is dropped
+// without writing. The current binding carries no probe of its own (the move
+// cleared the outcome), so the shed must hand it a fresh replacement exactly as the
+// post-probe fence does; otherwise the session serves its provisional declared
+// inventory until a later start or the convergence watchdog. The re-bind keeps the
+// same candidate and owner (a generation-only move), so the replacement may reuse
+// the dropped input and its own lifecycle must drive the session to verified.
+func TestDeferredProbeQueuedBindingMovedBeforeProbeAdmitsReplacement(t *testing.T) {
+	const uri = "virtual://movie/tt-queued-moved?result=a"
+	fx := newDeferredLifecycleFixture(t, 917, uri)
+	fx.saveAttempt(t)
+	conn := fx.registerPush(t)
+
+	var probeMu sync.Mutex
+	probeCalls := 0
+	fx.handler.VirtualPlaybackSourceProber = func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
+		probeMu.Lock()
+		probeCalls++
+		probeMu.Unlock()
+		f.AudioTracks = fx.probedAudio
+		f.SubtitleTracks = fx.probedSubs
+		f.CodecAudio = "eac3"
+		return f, nil
+	}
+
+	// Arm the job, then move the binding (same candidate and owner) before the
+	// job reaches its pre-probe fence; the move clears the pending mark.
+	deferred := fx.job(uri)
+	if !fx.handler.armDeferredProbePending(context.Background(), deferred) {
+		t.Fatal("admission rejected the queued job as stale")
+	}
+	firstGen := deferred.bindingGeneration
+	if err := fx.manager.SetVirtualSource(fx.session.ID, uri, 5); err != nil {
+		t.Fatalf("SetVirtualSource re-bind: %v", err)
+	}
+	movedGen, err := fx.manager.VirtualSourceGeneration(fx.session.ID)
+	if err != nil {
+		t.Fatalf("VirtualSourceGeneration: %v", err)
+	}
+	if movedGen == firstGen {
+		t.Fatalf("re-bind did not advance the generation: first=%d moved=%d", firstGen, movedGen)
+	}
+
+	// The worker reaches the pre-probe fence, sheds the superseded job, and must
+	// admit a replacement for the current binding.
+	fx.handler.runDeferredVirtualProbe(deferred)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		live, err := fx.manager.GetSession(fx.session.ID)
+		if err == nil && live.VirtualProbeOutcome == playback.VirtualProbeOutcomeVerified {
+			break
+		}
+		if time.Now().After(deadline) {
+			got := ""
+			if live2, err := fx.manager.GetSession(fx.session.ID); err == nil {
+				got = live2.VirtualProbeOutcome
+			}
+			t.Fatalf("session outcome = %q, want verified from the pre-probe replacement", got)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	inventory := fx.pollInventory(t)
+	if len(inventory.AudioTracks) != 2 || inventory.AudioTracks[1].Codec != "eac3" {
+		t.Fatalf("inventory audio = %#v, want the replacement's probed menu", inventory.AudioTracks)
+	}
+	if calls := fx.saverCallCount(); calls != 1 {
+		t.Fatalf("durable evidence writes = %d, want 1 (the replacement persists)", calls)
+	}
+	probeMu.Lock()
+	calls := probeCalls
+	probeMu.Unlock()
+	if calls != 1 {
+		t.Fatalf("probe invocations = %d, want 1 (only the pre-probe replacement runs)", calls)
+	}
+	select {
+	case event := <-conn.ch:
+		if event.payload.InventoryStatus != string(ProbeProvenanceVerified) {
+			t.Fatalf("published inventory status = %q, want verified from the replacement", event.payload.InventoryStatus)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no inventory_updated push for the pre-probe replacement's verified binding")
 	}
 }
 
