@@ -98,6 +98,7 @@ export function useWatchProgress(
   useEffect(() => {
     if (!sessionId) return;
     skipCleanupReportRef.current = false;
+    let disposed = false;
 
     const stopPolling = () => {
       if (intervalRef.current) clearInterval(intervalRef.current);
@@ -108,7 +109,9 @@ export function useWatchProgress(
       reportProgress().catch((error: unknown) => {
         // Every other failure is best effort — a transient sample failure must
         // not disrupt playback. A session that no longer exists is terminal:
-        // stop polling and hand the player its one report.
+        // stop polling and hand the player its one report. A sample from a
+        // session this effect has already left belongs to the old id.
+        if (disposed) return;
         if (isPlaybackSessionGoneError(error)) {
           stopPolling();
           onSessionLostRef.current?.();
@@ -117,6 +120,7 @@ export function useWatchProgress(
     }, 10_000);
 
     return () => {
+      disposed = true;
       stopPolling();
 
       if (skipCleanupReportRef.current) return;
