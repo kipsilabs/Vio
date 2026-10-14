@@ -1,6 +1,7 @@
 package playback
 
 import (
+	"errors"
 	"testing"
 	"time"
 )
@@ -102,7 +103,7 @@ func TestArmVirtualProbeReplacementOnlyForUnOwnedCurrentBinding(t *testing.T) {
 	}
 
 	// An unknown session writes nothing and reports absence.
-	if _, applied, err := m.ArmVirtualProbeReplacementForCurrentBinding("missing", candidateURI, 5); err != ErrSessionNotFound || applied {
+	if _, applied, err := m.ArmVirtualProbeReplacementForCurrentBinding("missing", candidateURI, 5); !errors.Is(err, ErrSessionNotFound) || applied {
 		t.Fatalf("unknown-session replacement = (_, %v, %v), want (false, ErrSessionNotFound)", applied, err)
 	}
 }
