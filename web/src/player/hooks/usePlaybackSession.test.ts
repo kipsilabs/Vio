@@ -5966,6 +5966,150 @@ describe("usePlaybackSession plan audio inventory", () => {
     unmount();
   });
 
+  it("keeps a legacy inventory verified when the exhausted poll fires after the probe lands", async () => {
+    // A late-arriving verified list resolves both menus while the legacy poll is
+    // still scheduled. The stale exhaustion callback must read that current
+    // state and stay a no-op rather than overwrite the confident list.
+    const verifiedAudio = [
+      { codec: "eac3", channels: 6, layout: "5.1", language: "en", default: true },
+    ];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-legacy-stale-exhaust",
+            playback_plan: fixturePlanV3({
+              session_id: "session-legacy-stale-exhaust",
+              inventory_status: "declared",
+              audio_tracks: [
+                { codec: "aac", channels: 2, layout: "stereo", language: "eng", default: true },
+              ],
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-legacy-stale-exhaust", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    expect(result.current.audioInventoryProvisional).toBe(true);
+    expect(result.current.subtitleInventoryProvisional).toBe(true);
+
+    // The probe lands and both menus turn confident before the budget runs out.
+    act(() =>
+      result.current.applyInventoryUpdate({
+        session_id: "session-legacy-stale-exhaust",
+        inventory_status: "verified",
+        inventory_revision: "inv:legacy-late-verified",
+        effective_media_file_id: 7,
+        audio_tracks: verifiedAudio,
+        subtitle_inventory: [
+          fixtureSubtitleInventoryItemV3({ track_id: "file:7:subtitle:0", combined_index: 0 }),
+        ],
+      }),
+    );
+
+    expect(result.current.audioInventoryProvisional).toBe(false);
+    expect(result.current.subtitleInventoryProvisional).toBe(false);
+    expect(result.current.inventoryFailed).toBe(false);
+
+    act(() => {
+      result.current.markInventoryExhausted();
+    });
+
+    // The exhausted budget observed a verified inventory, so it must not
+    // resurrect a failure or disturb the confident lists.
+    expect(result.current.inventoryPending).toBe(false);
+    expect(result.current.inventoryFailed).toBe(false);
+    expect(result.current.audioInventoryProvisional).toBe(false);
+    expect(result.current.subtitleInventoryProvisional).toBe(false);
+    expect(result.current.planAudioTracks).toEqual(verifiedAudio);
+
+    unmount();
+  });
+
+  it("clears a legacy inventory exhaustion failure when a verified list arrives late", async () => {
+    // The poll budget runs out first: a still-declared menu is a terminal
+    // failure. The probe then lands afterwards, and the failure must clear so it
+    // never masks the verified list.
+    const verifiedAudio = [
+      { codec: "eac3", channels: 6, layout: "5.1", language: "en", default: true },
+    ];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-legacy-late-verified",
+            playback_plan: fixturePlanV3({
+              session_id: "session-legacy-late-verified",
+              inventory_status: "declared",
+              audio_tracks: [
+                { codec: "aac", channels: 2, layout: "stereo", language: "eng", default: true },
+              ],
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-legacy-late-verified", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    act(() => {
+      result.current.markInventoryExhausted();
+    });
+    expect(result.current.inventoryPending).toBe(false);
+    expect(result.current.inventoryFailed).toBe(true);
+
+    act(() =>
+      result.current.applyInventoryUpdate({
+        session_id: "session-legacy-late-verified",
+        inventory_status: "verified",
+        inventory_revision: "inv:legacy-verified-after-exhaust",
+        effective_media_file_id: 7,
+        audio_tracks: verifiedAudio,
+        subtitle_inventory: [
+          fixtureSubtitleInventoryItemV3({ track_id: "file:7:subtitle:0", combined_index: 0 }),
+        ],
+      }),
+    );
+
+    // Positive probe evidence clears the exhausted-budget marker; the verified
+    // list is the menu the viewer sees.
+    expect(result.current.inventoryPending).toBe(false);
+    expect(result.current.inventoryFailed).toBe(false);
+    expect(result.current.audioInventoryProvisional).toBe(false);
+    expect(result.current.subtitleInventoryProvisional).toBe(false);
+    expect(result.current.planAudioTracks).toEqual(verifiedAudio);
+
+    unmount();
+  });
+
   it("upgrades a declared inventory with a shorter verified list", async () => {
     const declared = [
       { codec: "eac3", channels: 6, layout: "5.1", language: "eng", default: true },
