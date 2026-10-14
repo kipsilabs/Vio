@@ -38,6 +38,13 @@ func newPinnedTrackChangeFixture(t *testing.T, churnedResultToken string) *pinne
 		{Index: 0, Codec: "aac", Channels: 2, Layout: "stereo", Language: "eng", Default: true},
 		{Index: 1, Codec: "aac", Channels: 2, Layout: "stereo", Language: "spa"},
 	}
+	// Two embedded subtitle tracks so a subtitle switch has a real target. The
+	// provider churns their per-listing result id too; a subtitle switch on the
+	// pinned session must carry the same release rather than re-list.
+	source.SubtitleTracks = []models.SubtitleTrack{
+		{Index: 0, Codec: "subrip", Language: "eng"},
+		{Index: 1, Codec: "subrip", Language: "spa"},
+	}
 	probedAt := time.Now().Add(-time.Hour)
 	source.ProbeUpdatedAt = &probedAt
 	pinnedURI := withVirtualResultKey(source.FilePath, "pinned")
@@ -144,6 +151,61 @@ func (fx *pinnedTrackChangeFixture) discardPinnedEvidence(t *testing.T) {
 		SubtitleTrackIndex:        -1,
 	}); err != nil {
 		t.Fatalf("clear session evidence: %v", err)
+	}
+}
+
+// setSessionEvidenceAnchor rewrites the session's provenance anchor without
+// touching the binding, so a test can model a stale anchor (a previous binding
+// move) or an evidence row id that no longer matches the row being bound. The
+// probe-evidence flag is left clear, the shape a full v3 state write produces.
+func (fx *pinnedTrackChangeFixture) setSessionEvidenceAnchor(t *testing.T, evidenceURI string, evidenceFileID int) {
+	t.Helper()
+	session, err := fx.manager.GetSession(fx.started.SessionID)
+	if err != nil || session == nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	audio := append([]models.AudioTrack(nil), session.VirtualAudioTracks...)
+	if err := fx.manager.UpdateStreamState(fx.started.SessionID, playback.SessionStreamState{
+		VirtualSourceURI:              fx.pinnedURI,
+		VirtualSourceSet:              true,
+		VirtualSourceOwnershipSet:     true,
+		VirtualAudioTracks:            audio,
+		VirtualSubtitleEvidenceURI:    evidenceURI,
+		VirtualSubtitleEvidenceFileID: evidenceFileID,
+		SubtitleTrackIndex:            -1,
+	}); err != nil {
+		t.Fatalf("rewrite session evidence anchor: %v", err)
+	}
+	session, err = fx.manager.GetSession(fx.started.SessionID)
+	if err != nil || session == nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if session.VirtualSubtitleEvidenceSet {
+		t.Fatal("the anchor rewrite left the probe-evidence flag set")
+	}
+	if session.VirtualSubtitleEvidenceURI != evidenceURI || session.VirtualSubtitleEvidenceFileID != evidenceFileID {
+		t.Fatalf("anchor rewrite did not land: uri=%q id=%d", session.VirtualSubtitleEvidenceURI, session.VirtualSubtitleEvidenceFileID)
+	}
+}
+
+// failureRecoveryRequest builds a failure_recovery replan request against the
+// fixture's started session.
+func (fx *pinnedTrackChangeFixture) failureRecoveryRequest(requestID string) playback.ReplanRequestV3 {
+	return playback.ReplanRequestV3{
+		ProtocolVersion:       playback.ProtocolV3,
+		Operation:             playback.ReplanOperationFailureRecoveryV3,
+		PlaybackAttemptID:     fx.start.PlaybackAttemptID,
+		ReplanRequestID:       requestID,
+		FailedPlanID:          fx.started.PlaybackPlan.PlanID,
+		PlanAttemptID:         requestID + "-plan",
+		PlanAttemptKey:        fx.started.PlaybackPlan.PlanAttemptKey,
+		AttemptCount:          1,
+		PositionSeconds:       30,
+		QualityPreference:     "auto",
+		SelectedTracks:        fx.started.PlaybackPlan.SelectedTracks,
+		Failure:               playback.FailureV3{Classification: "playback_error"},
+		Capabilities:          fx.start.Capabilities,
+		ClientPlaybackContext: fx.start.ClientPlaybackContext,
 	}
 }
 
