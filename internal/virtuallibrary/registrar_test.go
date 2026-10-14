@@ -104,6 +104,42 @@ func TestMonitoredEpisodePayloadKeepsMalformedEpisodesForValidation(t *testing.T
 	}
 }
 
+// TestMonitoredEpisodePayloadTrimsProviderWhitespace reproduces the issue where
+// metadata providers return episode titles (and overviews, stills) with leading
+// or trailing whitespace. The catalog's virtual-media validator rejects such
+// values with "episodes[N].title must not have surrounding whitespace", which
+// aborted the whole series registration. The registrar builder is the boundary
+// that must clean provider data before it reaches the strict validator.
+func TestMonitoredEpisodePayloadTrimsProviderWhitespace(t *testing.T) {
+	item := monitor.MonitoredMedia{
+		Key:       "series:tt100",
+		MediaType: "series",
+		IMDbID:    "tt100",
+		Episodes: []monitor.VirtualEpisode{
+			{
+				Season:    1,
+				Episode:   1,
+				Title:     "  Chapter One  ",
+				Overview:  "\tFirst episode\n",
+				Thumbnail: "  https://img.example/ep1.jpg  ",
+			},
+		},
+	}
+	payload := monitoredEpisodePayload(item)
+	if len(payload) != 1 {
+		t.Fatalf("payload episodes = %d, want 1", len(payload))
+	}
+	if got := payload[0].Title; got != "Chapter One" {
+		t.Fatalf("episode title = %q, want %q (provider whitespace must be trimmed before validation)", got, "Chapter One")
+	}
+	if got := payload[0].Overview; got != "First episode" {
+		t.Fatalf("episode overview = %q, want %q", got, "First episode")
+	}
+	if got := payload[0].StillPath; got != "https://img.example/ep1.jpg" {
+		t.Fatalf("episode still path = %q, want %q", got, "https://img.example/ep1.jpg")
+	}
+}
+
 func TestCatalogMonitorRegistrarEpisodeMapping(t *testing.T) {
 	// Verify that Register accurately maps all monitoredMedia fields including episodes
 	item := monitor.MonitoredMedia{
