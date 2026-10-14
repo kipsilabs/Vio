@@ -30,6 +30,22 @@ describe("withWindowedHlsManifest", () => {
     );
     expect(withWindowedHlsManifest("", true)).toBe("");
   });
+
+  it("recognizes an existing opt-in by its query key, not a substring", () => {
+    // The parameter's text appearing inside another value is not the opt-in.
+    expect(withWindowedHlsManifest("/x/master.m3u8?redirect=hls_window=1", true)).toBe(
+      "/x/master.m3u8?redirect=hls_window=1&hls_window=1",
+    );
+    // A key with a blank value is the opt-in too (the server reads blank as
+    // enabled), so it is left untouched.
+    expect(withWindowedHlsManifest("/x/master.m3u8?a=1&hls_window", true)).toBe(
+      "/x/master.m3u8?a=1&hls_window",
+    );
+    // Only a whole key matches: a longer key is not the parameter.
+    expect(withWindowedHlsManifest("/x/master.m3u8?hls_windowed=1", true)).toBe(
+      "/x/master.m3u8?hls_windowed=1&hls_window=1",
+    );
+  });
 });
 
 describe("servedHlsWindow", () => {
@@ -107,8 +123,11 @@ describe("hlsTargetWithinServedWindow", () => {
     expect(hlsTargetWithinServedWindow(window, 600)).toBe(false);
   });
 
-  it("allows any target when no window is known", () => {
-    expect(hlsTargetWithinServedWindow(null, 0)).toBe(true);
-    expect(hlsTargetWithinServedWindow(null, 10_000)).toBe(true);
+  it("refuses any target while the served window is unknown", () => {
+    // Before the first LEVEL_LOADED there is no window to prove a target is
+    // listed, so an unbuffered seek must reanchor rather than risk a silent
+    // skip over the omitted gap prefix.
+    expect(hlsTargetWithinServedWindow(null, 0)).toBe(false);
+    expect(hlsTargetWithinServedWindow(null, 10_000)).toBe(false);
   });
 });

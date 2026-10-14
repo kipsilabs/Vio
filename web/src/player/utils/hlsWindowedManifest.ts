@@ -21,7 +21,18 @@
 /** Opt-in query parameter that asks the server for the bounded manifest. */
 export const WINDOWED_MANIFEST_QUERY_PARAM = "hls_window";
 
-/** Fetch the next window once the playhead is this close to the window edge. */
+/**
+ * Fetch the next window once the playhead is this close to the window edge.
+ *
+ * The refetch is a full hls.js MediaSource reset, so this margin does not buy
+ * re-download time: the buffer is dropped the moment the refetch fires and the
+ * gap the viewer sees is the first refetched segment's fetch latency, not this
+ * number. What the margin must guarantee is only that the reset starts before
+ * the element reaches `#EXT-X-ENDLIST` and reports a (premature) end. Twenty
+ * seconds is ten default segments — far more than the one segment the resume
+ * needs even on a slow link — while staying small enough that the window is not
+ * refetched more often than necessary, since every refetch resets the buffer.
+ */
 export const WINDOWED_MANIFEST_RELOAD_AHEAD_SECONDS = 20;
 
 /** Minimum gap between window refetches, so a stalled refill cannot spin. */
@@ -37,11 +48,22 @@ export const SERVED_WINDOW_BOUNDS_SLACK_SECONDS = 0.5;
 /**
  * Adds the windowed-manifest opt-in to an HLS stream URL. The parameter is
  * additive and idempotent; an empty URL is returned untouched.
+ *
+ * Idempotence is decided on the parsed query, not on a substring of the whole
+ * URL: a URL whose *value* merely contains the parameter's text (or whose
+ * query uses the key with a blank value, which the server also reads as the
+ * opt-in) must not be mistaken for one already carrying it.
  */
 export function withWindowedHlsManifest(url: string, enabled: boolean): string {
   if (!enabled || url === "") return url;
-  if (url.includes(`${WINDOWED_MANIFEST_QUERY_PARAM}=1`)) return url;
-  return `${url}${url.includes("?") ? "&" : "?"}${WINDOWED_MANIFEST_QUERY_PARAM}=1`;
+  const queryStart = url.indexOf("?");
+  if (queryStart >= 0) {
+    for (const part of url.slice(queryStart + 1).split("&")) {
+      const key = part.split("=", 1)[0];
+      if (key === WINDOWED_MANIFEST_QUERY_PARAM) return url;
+    }
+  }
+  return `${url}${queryStart >= 0 ? "&" : "?"}${WINDOWED_MANIFEST_QUERY_PARAM}=1`;
 }
 
 /** The slice of hls.js's level details this module reads. */
@@ -83,6 +105,14 @@ export function servedHlsWindow(
  * Whether the playlist has run out ahead of the playhead and needs to be
  * refetched. A live playlist is reloaded by hls.js itself, and a window that
  * reaches the media end is the normal end of playback.
+ *
+ * `mediaDurationSeconds` is the plan's `source.duration_seconds`, the same
+ * `file.Duration` the server uses for the transcode session's total runtime. So
+ * the final window's edge reaches it and the `+ 1` slack only absorbs the float
+ * sums of the EXTINF entries; the two values are not independent estimates. A
+ * caller that needs to defend against a future divergence between the two can
+ * additionally refuse to refetch a window that a previous refetch did not
+ * extend (see the player's window-reload guard).
  */
 export function shouldAdvanceHlsWindow(
   window: ServedHlsWindow | null,
@@ -101,12 +131,21 @@ export function shouldAdvanceHlsWindow(
  * gap prefix and cannot be loaded; a target past the window's end is not listed
  * at all. Both must reanchor, even though the plan may report
  * `can_seek_anywhere` for its whole-title manifest.
+ *
+ * An unknown window (null, before the first `LEVEL_LOADED` publishes one) is
+ * treated as *not* locally serveable: the player cannot yet tell whether the
+ * target lies in the omitted gap prefix, and a native seek there would be
+ * silently skipped forward by hls.js rather than reporting a miss. The
+ * conservative result routes the seek through the reanchor path, which is
+ * correct for a windowed manifest and merely costs a replan for the brief
+ * startup interval on any other HLS route. A genuinely buffered target never
+ * reaches this function — the caller checks the element's buffer first.
  */
 export function hlsTargetWithinServedWindow(
   window: ServedHlsWindow | null,
   targetSeconds: number,
 ): boolean {
-  if (!window) return true;
+  if (!window) return false;
   return (
     targetSeconds >= window.start - SERVED_WINDOW_BOUNDS_SLACK_SECONDS &&
     targetSeconds <= window.end + SERVED_WINDOW_BOUNDS_SLACK_SECONDS

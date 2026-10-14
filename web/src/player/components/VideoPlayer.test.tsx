@@ -12,6 +12,7 @@ import type {
 import type { PlayerSubtitleInfo, VideoFitMode } from "../types";
 import { HLS_DEFAULT_MAX_BUFFER_SIZE_BYTES } from "../utils/bufferPolicy";
 import { HLS_STARTUP_TIMEOUT_MS } from "../utils/hlsStartupGuard";
+import { WINDOWED_MANIFEST_RELOAD_MIN_INTERVAL_MS } from "../utils/hlsWindowedManifest";
 import { PENDING_SEEK_HOLD_TIMEOUT_MS } from "../utils/pendingSeek";
 import {
   buildQualitySummary,
@@ -3156,6 +3157,81 @@ describe("VideoPlayer HLS buffer policy", () => {
     fireEvent.pause(video);
     expect(effectiveForwardBufferSeconds(config, levelBitrateBps)).toBe(30);
   });
+
+  it("reanchors an unbuffered seek before the first window is published", async () => {
+    const onReanchorSeek = vi.fn(() => true);
+    const { container } = renderPlayer({ plan: hlsPlan(), onReanchorSeek, shouldAutoPlay: false });
+    await waitFor(() => expect(hlsJS.constructed).toHaveBeenCalledOnce());
+    const video = container.querySelector("video");
+    if (!video) throw new Error("expected video element");
+
+    // No levelLoaded yet, so the served window is unknown. A target that is not
+    // already buffered cannot be trusted as locally serveable: it may fall in
+    // the omitted gap prefix, where hls.js would silently skip it forward.
+    act(() => controls.current!.onSeek(100));
+
+    expect(onReanchorSeek).toHaveBeenCalledWith(100);
+    expect(video.currentTime).not.toBe(100);
+  });
+
+  it("resumes playback after a premature windowed end", async () => {
+    const onEnded = vi.fn();
+    const { container } = renderPlayer({ plan: hlsPlan(), shouldAutoPlay: false, onEnded });
+    await waitFor(() => expect(hlsJS.constructed).toHaveBeenCalledOnce());
+    const video = container.querySelector("video");
+    if (!video) throw new Error("expected video element");
+
+    // The playlist ends at 470 s while the title runs to 3600 s.
+    hlsJS.latest!.emit("levelLoaded", {
+      details: { live: false, edge: 470, fragments: [{ gap: true, start: 0 }, { start: 400 }] },
+    });
+    hlsJS.loadSource.mockClear();
+    const play = vi.mocked(HTMLMediaElement.prototype.play);
+    play.mockClear();
+
+    act(() => {
+      fireEvent.ended(video);
+    });
+
+    // The end was a window edge, not the title's: refetch and keep playing.
+    expect(hlsJS.loadSource).toHaveBeenCalledTimes(1);
+    expect(play).toHaveBeenCalledTimes(1);
+    expect(onEnded).not.toHaveBeenCalled();
+  });
+
+  it("stops refetching a window the server cannot extend", async () => {
+    const { container } = renderPlayer({ plan: hlsPlan(), shouldAutoPlay: false });
+    await waitFor(() => expect(hlsJS.constructed).toHaveBeenCalledOnce());
+    const video = container.querySelector("video");
+    if (!video) throw new Error("expected video element");
+
+    hlsJS.latest!.emit("levelLoaded", {
+      details: { live: false, edge: 470, fragments: [{ gap: true, start: 0 }, { start: 400 }] },
+    });
+    hlsJS.loadSource.mockClear();
+    Object.defineProperty(video, "paused", { configurable: true, get: () => false });
+    Object.defineProperty(video, "seeking", { configurable: true, get: () => false });
+
+    const base = Date.now();
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(base);
+    video.currentTime = 455;
+    fireEvent.timeUpdate(video);
+    expect(hlsJS.loadSource).toHaveBeenCalledTimes(1);
+
+    // The refetch returns the same final window: the plan's 3600 s runtime
+    // exceeds the manifest's own end, but the server has no more media to list.
+    hlsJS.latest!.emit("levelLoaded", {
+      details: { live: false, edge: 470, fragments: [{ gap: true, start: 0 }, { start: 400 }] },
+    });
+
+    // Past the cool-down the advance would fire again if it did not notice the
+    // window never grew. It must not loop the full MediaSource reset.
+    nowSpy.mockReturnValue(base + WINDOWED_MANIFEST_RELOAD_MIN_INTERVAL_MS + 1);
+    video.currentTime = 465;
+    fireEvent.timeUpdate(video);
+
+    expect(hlsJS.loadSource).toHaveBeenCalledTimes(1);
+  });
 });
 
 // The server's decode verdict is a 422 on the manifest, which hls.js raises as
@@ -3329,6 +3405,38 @@ describe("VideoPlayer stale generation recovery", () => {
     // must not be escalated to a plan failure on its own.
     expect(hlsJS.startLoad).not.toHaveBeenCalled();
     expect(onPlanFailure).not.toHaveBeenCalled();
+  });
+
+  it("does not follow a stale-sgen refetch with an immediate window advance", async () => {
+    const { container } = renderPlayer({
+      plan: hlsTranscodePlan(),
+      streamUrl: transcodeStreamUrl,
+      shouldAutoPlay: false,
+    });
+    await waitFor(() => expect(hlsJS.errorHandler).toBeTypeOf("function"));
+    const video = container.querySelector("video");
+    if (!video) throw new Error("expected video element");
+
+    // A windowed playlist whose listed window ends at 470 s of a 3600 s title.
+    hlsJS.latest!.emit("levelLoaded", {
+      details: { live: false, edge: 470, fragments: [{ gap: true, start: 0 }, { start: 400 }] },
+    });
+    hlsJS.loadSource.mockClear();
+
+    act(() => {
+      hlsJS.errorHandler?.("error", staleSegfault());
+    });
+    expect(hlsJS.loadSource).toHaveBeenCalledTimes(1);
+
+    // A timeupdate arrives before the refetched LEVEL_LOADED republishes the
+    // window, with the playhead near the old edge. Both recoveries reset the
+    // MediaSource, so the shared cool-down must suppress the second one.
+    Object.defineProperty(video, "paused", { configurable: true, get: () => false });
+    Object.defineProperty(video, "seeking", { configurable: true, get: () => false });
+    video.currentTime = 455;
+    fireEvent.timeUpdate(video);
+
+    expect(hlsJS.loadSource).toHaveBeenCalledTimes(1);
   });
 
   it("bounds consecutive stale-generation refetches and falls through to failure recovery", async () => {
