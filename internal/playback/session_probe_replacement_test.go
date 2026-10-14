@@ -10,9 +10,10 @@ import (
 // binding, and only when that binding carries no live lifecycle of its own: an
 // absent mark, or a stale one left by a row-only move that never advanced the
 // generation. A live pending (a worker will land it), a terminal verdict, a
-// candidate the caller cannot probe, and an unknown session are all refused
-// without a write, so a replacement never double-arms or clobbers a reached
-// outcome.
+// candidate the caller cannot probe, the same candidate under a DIFFERENT owner,
+// and an unknown session are all refused without a write, so a replacement never
+// double-arms, clobbers a reached outcome, or reuses input resolved for another
+// source.
 func TestArmVirtualProbeReplacementOnlyForUnOwnedCurrentBinding(t *testing.T) {
 	m := NewSessionManager(0, 0)
 	session, err := m.StartSession(1, "profile-1", 1, PlayDirect, false)
@@ -26,12 +27,19 @@ func TestArmVirtualProbeReplacementOnlyForUnOwnedCurrentBinding(t *testing.T) {
 
 	// A different candidate may never be armed: a replacement built from the
 	// dropped probe's input cannot describe it.
-	if binding, applied, err := m.ArmVirtualProbeReplacementForCurrentBinding(session.ID, "virtual://movie/tt-other?result=cand-2"); err != nil || applied {
+	if binding, applied, err := m.ArmVirtualProbeReplacementForCurrentBinding(session.ID, "virtual://movie/tt-other?result=cand-2", 5); err != nil || applied {
 		t.Fatalf("candidate-mismatch arm = (%#v, %v, %v), want (_, false, nil)", binding, applied, err)
 	}
 
+	// The same candidate served by a different owner is a different source behind
+	// the candidate URI: the dropped job's input was resolved for another
+	// installation, so it cannot describe the current binding and must not arm.
+	if binding, applied, err := m.ArmVirtualProbeReplacementForCurrentBinding(session.ID, candidateURI, 9); err != nil || applied {
+		t.Fatalf("owner-mismatch arm = (%#v, %v, %v), want (_, false, nil)", binding, applied, err)
+	}
+
 	// No mark at all: the current binding has no probe, so the replacement owns it.
-	binding, applied, err := m.ArmVirtualProbeReplacementForCurrentBinding(session.ID, candidateURI)
+	binding, applied, err := m.ArmVirtualProbeReplacementForCurrentBinding(session.ID, candidateURI, 5)
 	if err != nil || !applied {
 		t.Fatalf("unarmed replacement = (%#v, %v, %v), want (_, true, nil)", binding, applied, err)
 	}
@@ -39,7 +47,7 @@ func TestArmVirtualProbeReplacementOnlyForUnOwnedCurrentBinding(t *testing.T) {
 		t.Fatalf("armed binding = %#v, want the current generation and effective row", binding)
 	}
 	// The armed mark is live: a second replacement attempt must not duplicate it.
-	if _, applied, err := m.ArmVirtualProbeReplacementForCurrentBinding(session.ID, candidateURI); err != nil || applied {
+	if _, applied, err := m.ArmVirtualProbeReplacementForCurrentBinding(session.ID, candidateURI, 5); err != nil || applied {
 		t.Fatalf("live-pending re-arm = (_, %v, %v), want (false, nil)", applied, err)
 	}
 
@@ -62,7 +70,7 @@ func TestArmVirtualProbeReplacementOnlyForUnOwnedCurrentBinding(t *testing.T) {
 	} else if live.VirtualProbeOutcome != VirtualProbeOutcomePending {
 		t.Fatalf("outcome = %q, want pending still recorded", live.VirtualProbeOutcome)
 	}
-	rearmed, applied, err := m.ArmVirtualProbeReplacementForCurrentBinding(session.ID, candidateURI)
+	rearmed, applied, err := m.ArmVirtualProbeReplacementForCurrentBinding(session.ID, candidateURI, 5)
 	if err != nil || !applied {
 		t.Fatalf("stale replacement = (%#v, %v, %v), want (_, true, nil)", rearmed, applied, err)
 	}
@@ -70,7 +78,7 @@ func TestArmVirtualProbeReplacementOnlyForUnOwnedCurrentBinding(t *testing.T) {
 		t.Fatalf("replacement armed the wrong row: %#v, want row 2", rearmed)
 	}
 	// The replacement is now the live owner: a further attempt is refused.
-	if _, applied, err := m.ArmVirtualProbeReplacementForCurrentBinding(session.ID, candidateURI); err != nil || applied {
+	if _, applied, err := m.ArmVirtualProbeReplacementForCurrentBinding(session.ID, candidateURI, 5); err != nil || applied {
 		t.Fatalf("post-replacement re-arm = (_, %v, %v), want (false, nil)", applied, err)
 	}
 	// It is visible to the convergence watchdog, so it is not stranded.
@@ -82,7 +90,7 @@ func TestArmVirtualProbeReplacementOnlyForUnOwnedCurrentBinding(t *testing.T) {
 	if _, err := m.SetVirtualProbeOutcomeIfGeneration(session.ID, rearmed.Generation, VirtualProbeOutcomeVerified); err != nil {
 		t.Fatalf("SetVirtualProbeOutcomeIfGeneration: %v", err)
 	}
-	if _, applied, err := m.ArmVirtualProbeReplacementForCurrentBinding(session.ID, candidateURI); err != nil || applied {
+	if _, applied, err := m.ArmVirtualProbeReplacementForCurrentBinding(session.ID, candidateURI, 5); err != nil || applied {
 		t.Fatalf("terminal replacement = (_, %v, %v), want (false, nil)", applied, err)
 	}
 	live, err := m.GetSession(session.ID)
@@ -94,7 +102,7 @@ func TestArmVirtualProbeReplacementOnlyForUnOwnedCurrentBinding(t *testing.T) {
 	}
 
 	// An unknown session writes nothing and reports absence.
-	if _, applied, err := m.ArmVirtualProbeReplacementForCurrentBinding("missing", candidateURI); err != ErrSessionNotFound || applied {
+	if _, applied, err := m.ArmVirtualProbeReplacementForCurrentBinding("missing", candidateURI, 5); err != ErrSessionNotFound || applied {
 		t.Fatalf("unknown-session replacement = (_, %v, %v), want (false, ErrSessionNotFound)", applied, err)
 	}
 }
@@ -114,7 +122,7 @@ func TestArmVirtualProbeReplacementRefusedAcrossRotation(t *testing.T) {
 	if err := m.SetVirtualSource(session.ID, firstURI, 5); err != nil {
 		t.Fatalf("SetVirtualSource: %v", err)
 	}
-	if _, applied, err := m.ArmVirtualProbeReplacementForCurrentBinding(session.ID, firstURI); err != nil || !applied {
+	if _, applied, err := m.ArmVirtualProbeReplacementForCurrentBinding(session.ID, firstURI, 5); err != nil || !applied {
 		t.Fatalf("initial arm = (_, %v, %v), want (true, nil)", applied, err)
 	}
 	// Rotate away: the first candidate is superseded and its mark is cleared.
@@ -129,11 +137,11 @@ func TestArmVirtualProbeReplacementRefusedAcrossRotation(t *testing.T) {
 		t.Fatalf("rotation left outcome %q, want cleared", live.VirtualProbeOutcome)
 	}
 	// The dropped candidate can no longer be re-armed.
-	if _, applied, err := m.ArmVirtualProbeReplacementForCurrentBinding(session.ID, firstURI); err != nil || applied {
+	if _, applied, err := m.ArmVirtualProbeReplacementForCurrentBinding(session.ID, firstURI, 5); err != nil || applied {
 		t.Fatalf("superseded replacement = (_, %v, %v), want (false, nil)", applied, err)
 	}
 	// The current candidate can.
-	if _, applied, err := m.ArmVirtualProbeReplacementForCurrentBinding(session.ID, "virtual://movie/tt-rot-b?result=cand-b"); err != nil || !applied {
+	if _, applied, err := m.ArmVirtualProbeReplacementForCurrentBinding(session.ID, "virtual://movie/tt-rot-b?result=cand-b", 5); err != nil || !applied {
 		t.Fatalf("current replacement = (_, %v, %v), want (true, nil)", applied, err)
 	}
 }

@@ -1900,6 +1900,188 @@ func TestDeferredProbeReplacementAdmittedForMovedBinding(t *testing.T) {
 	}
 }
 
+// TestDeferredProbeMidFlightDifferentCandidateNoReplacement is the negative half
+// of the dropped-probe recovery: when the session rotates mid-probe to a
+// DIFFERENT candidate, the dropped job's input (stream URL and headers) describes
+// the superseded release, so no replacement may be admitted for the new one. The
+// fresh resolve that produced the rotated binding owns its URL and headers; a
+// replacement built from the dropped input would probe the wrong bytes and stamp
+// them onto the new binding. The dropped job writes nothing, no replacement runs,
+// and the rotated binding is left to the lifecycle the rotation itself owns (empty
+// outcome here, never a fabricated verified/failed verdict).
+func TestDeferredProbeMidFlightDifferentCandidateNoReplacement(t *testing.T) {
+	fx := newDeferredLifecycleFixture(t, 915, "virtual://movie/tt-mid-other?result=a")
+	fx.saveAttempt(t)
+
+	var probeMu sync.Mutex
+	probeCalls := 0
+	probeTwo := make(chan struct{})
+	var twoOnce sync.Once
+	fx.handler.VirtualPlaybackSourceProber = func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
+		probeMu.Lock()
+		probeCalls++
+		call := probeCalls
+		probeMu.Unlock()
+		if call == 2 {
+			twoOnce.Do(func() { close(probeTwo) })
+		}
+		fx.probeOnce.Do(func() { close(fx.probeStarted) })
+		<-fx.releaseProbe
+		f.AudioTracks = fx.probedAudio
+		f.CodecAudio = "eac3"
+		return f, nil
+	}
+
+	first := fx.job("virtual://movie/tt-mid-other?result=a")
+	if !fx.handler.armDeferredProbePending(context.Background(), first) {
+		t.Fatal("admission rejected the first job as stale")
+	}
+	firstGen := first.bindingGeneration
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		fx.handler.runDeferredVirtualProbe(first)
+	}()
+	select {
+	case <-fx.probeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("deferred post-commit probe was not scheduled")
+	}
+	// Rotate to a genuinely different candidate while the probe is in flight.
+	if err := fx.manager.SetVirtualSource(fx.session.ID, "virtual://movie/tt-mid-other?result=b", 5); err != nil {
+		t.Fatalf("SetVirtualSource B: %v", err)
+	}
+	rotatedGen, err := fx.manager.VirtualSourceGeneration(fx.session.ID)
+	if err != nil {
+		t.Fatalf("VirtualSourceGeneration: %v", err)
+	}
+	if rotatedGen == firstGen {
+		t.Fatalf("rotation did not advance the generation: first=%d rotated=%d", firstGen, rotatedGen)
+	}
+
+	close(fx.releaseProbe)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not finish after the probe released")
+	}
+
+	// A replacement, if wrongly admitted, would run a second probe shortly after
+	// the first returns. Give it that window before asserting the refusal.
+	select {
+	case <-probeTwo:
+		t.Fatal("a replacement probe ran for a different candidate URI")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	if calls := fx.saverCallCount(); calls != 0 {
+		t.Fatalf("durable evidence writes = %d, want 0 (the dropped job and any replacement must not write)", calls)
+	}
+	probeMu.Lock()
+	calls := probeCalls
+	probeMu.Unlock()
+	if calls != 1 {
+		t.Fatalf("probe invocations = %d, want 1 (no replacement for a different candidate)", calls)
+	}
+	live, err := fx.manager.GetSession(fx.session.ID)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if live.VirtualProbeOutcome != "" {
+		t.Fatalf("session outcome = %q, want empty (no lifecycle admitted for the rotated candidate)", live.VirtualProbeOutcome)
+	}
+}
+
+// TestDeferredProbeMidFlightSameURIDifferentOwnerNoReplacement covers the owner
+// half of the replacement fence: the candidate URI is unchanged, but the session
+// is now bound to a different owner installation. The dropped job's probe input
+// (stream URL and headers) was resolved for the old owner, so a replacement built
+// from it would probe another source's bytes and stamp them onto the new binding.
+// It must be refused: no second probe, no durable write, and no fabricated
+// outcome on the rotated binding.
+func TestDeferredProbeMidFlightSameURIDifferentOwnerNoReplacement(t *testing.T) {
+	const uri = "virtual://movie/tt-mid-owner?result=a"
+	fx := newDeferredLifecycleFixture(t, 916, uri)
+	fx.saveAttempt(t)
+
+	var probeMu sync.Mutex
+	probeCalls := 0
+	probeTwo := make(chan struct{})
+	var twoOnce sync.Once
+	fx.handler.VirtualPlaybackSourceProber = func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
+		probeMu.Lock()
+		probeCalls++
+		call := probeCalls
+		probeMu.Unlock()
+		if call == 2 {
+			twoOnce.Do(func() { close(probeTwo) })
+		}
+		fx.probeOnce.Do(func() { close(fx.probeStarted) })
+		<-fx.releaseProbe
+		f.AudioTracks = fx.probedAudio
+		f.CodecAudio = "eac3"
+		return f, nil
+	}
+
+	first := fx.job(uri)
+	if !fx.handler.armDeferredProbePending(context.Background(), first) {
+		t.Fatal("admission rejected the first job as stale")
+	}
+	firstGen := first.bindingGeneration
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		fx.handler.runDeferredVirtualProbe(first)
+	}()
+	select {
+	case <-fx.probeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("deferred post-commit probe was not scheduled")
+	}
+	// Same candidate, different owner installation: the generation advances and
+	// the owner moves, so the dropped input no longer describes the binding.
+	if err := fx.manager.SetVirtualSource(fx.session.ID, uri, 9); err != nil {
+		t.Fatalf("SetVirtualSource owner 9: %v", err)
+	}
+	moved, err := fx.manager.VirtualSourceBinding(fx.session.ID)
+	if err != nil {
+		t.Fatalf("VirtualSourceBinding: %v", err)
+	}
+	if moved.Generation == firstGen || moved.OwnerInstallationID != 9 {
+		t.Fatalf("owner move binding = %#v, want a new generation and owner 9", moved)
+	}
+
+	close(fx.releaseProbe)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not finish after the probe released")
+	}
+	select {
+	case <-probeTwo:
+		t.Fatal("a replacement probe ran after a same-URI owner move")
+	case <-time.After(200 * time.Millisecond):
+	}
+	if calls := fx.saverCallCount(); calls != 0 {
+		t.Fatalf("durable evidence writes = %d, want 0 (no replacement for a different owner)", calls)
+	}
+	probeMu.Lock()
+	calls := probeCalls
+	probeMu.Unlock()
+	if calls != 1 {
+		t.Fatalf("probe invocations = %d, want 1 (no replacement after an owner move)", calls)
+	}
+	live, err := fx.manager.GetSession(fx.session.ID)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if live.VirtualProbeOutcome != "" {
+		t.Fatalf("session outcome = %q, want empty (no lifecycle admitted for the different owner)", live.VirtualProbeOutcome)
+	}
+}
+
 // TestDeferredProbeQueuedTeardownNoWork is the point-3 regression: a queued
 // job whose session is torn down before the worker picks it up must exit
 // without remote work and without writes. The teardown is the manager's

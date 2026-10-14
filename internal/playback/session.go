@@ -139,6 +139,12 @@ type Session struct {
 	// generation (see SetEffectiveMediaFileID). A stale pending no worker's fence
 	// can land, so the current binding owes a fresh probe; a live pending already
 	// has one and must not be duplicated.
+	//
+	// It is in-memory only, not persisted with the session. A session
+	// reconstructed after a restart carries the zero snapshot, so any pending mark
+	// on it reads as stale and a replacement may be admitted (the pre-restart
+	// worker is gone, so that is correct, not merely safe); the convergence
+	// watchdog still bounds a pending mark no worker lands.
 	virtualProbeArmedBinding VirtualSourceBindingSnapshot
 	// VirtualSubtitleEvidenceURI names the provider-neutral candidate the
 	// evidence above was captured for. It is the provenance anchor: evidence
@@ -2148,6 +2154,15 @@ func (m *SessionManager) VirtualSourceBinding(sessionID string) (VirtualSourceBi
 //   - the session's current candidate is not candidateURI, so a replacement built
 //     from the dropped probe's input cannot describe the current binding and must
 //     not be admitted; or
+//   - ownerInstallationID is non-zero and the current binding carries a different
+//     owner. The replacement reuses the dropped job's probe input (stream URL and
+//     request headers), which was resolved for one owner installation. A same-URI
+//     owner move is a different source behind the same candidate: the input is
+//     stale and the fresh resolve that produced the new binding is the only safe
+//     source of its URL and headers, so no replacement is admitted. The effective
+//     row is deliberately NOT fenced here: the replacement re-resolves the row it
+//     writes (see replacementCatalogRow), and a row-only move that keeps the
+//     candidate and owner serves the same bytes, so only the write target moves; or
 //   - the current binding already carries a LIVE pending probe (a worker will land
 //     it) or a terminal outcome (verified or failed), so nothing is owed.
 //
@@ -2156,7 +2171,7 @@ func (m *SessionManager) VirtualSourceBinding(sessionID string) (VirtualSourceBi
 // against. Because the pending record captures the current binding, the
 // replacement job fences on that binding and the dropped job can never write
 // against it. An unknown session reports ErrSessionNotFound and writes nothing.
-func (m *SessionManager) ArmVirtualProbeReplacementForCurrentBinding(sessionID, candidateURI string) (VirtualSourceBindingSnapshot, bool, error) {
+func (m *SessionManager) ArmVirtualProbeReplacementForCurrentBinding(sessionID, candidateURI string, ownerInstallationID int) (VirtualSourceBindingSnapshot, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -2166,6 +2181,12 @@ func (m *SessionManager) ArmVirtualProbeReplacementForCurrentBinding(sessionID, 
 	}
 	binding := s.virtualBindingSnapshotLocked()
 	if !sameVirtualSourceURI(binding.VirtualURI, candidateURI) {
+		return binding, false, nil
+	}
+	if ownerInstallationID != 0 && binding.OwnerInstallationID != ownerInstallationID {
+		// The dropped job's input was resolved for a different owner
+		// installation; reusing it would probe another source's bytes and stamp
+		// them onto this binding's row.
 		return binding, false, nil
 	}
 	if s.virtualProbePendingIsLiveLocked() {
