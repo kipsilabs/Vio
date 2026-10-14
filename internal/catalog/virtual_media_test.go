@@ -212,6 +212,29 @@ func TestValidateVirtualMediaEnforcesCardinalityAndStringBounds(t *testing.T) {
 	})
 }
 
+// TestValidateVirtualMediaRejectsSurroundingWhitespace pins the validator's
+// strictness for provider-derived string fields. The validator deliberately
+// does not trim: values with leading or trailing whitespace stay rejected, and
+// the monitor registrar is responsible for cleaning provider data before it
+// reaches this boundary. See internal/virtuallibrary/registrar.go.
+func TestValidateVirtualMediaRejectsSurroundingWhitespace(t *testing.T) {
+	for name, mutate := range map[string]func(*VirtualMedia){
+		"episode title":    func(in *VirtualMedia) { in.Episodes[0].Title = "  Chapter One  " },
+		"episode overview": func(in *VirtualMedia) { in.Episodes[0].Overview = " First episode " },
+		"episode still":    func(in *VirtualMedia) { in.Episodes[0].StillPath = " /img/ep1.jpg " },
+		"series title":     func(in *VirtualMedia) { in.Title = " Dateline " },
+	} {
+		t.Run(name, func(t *testing.T) {
+			input := validVirtualSeries()
+			mutate(&input)
+			err := validateVirtualMedia(input)
+			if !errors.Is(err, ErrInvalidVirtualMedia) || !strings.Contains(err.Error(), "must not have surrounding whitespace") {
+				t.Fatalf("error = %v, want surrounding-whitespace rejection", err)
+			}
+		})
+	}
+}
+
 func TestValidateVirtualMediaRejectsDuplicateURIs(t *testing.T) {
 	input := validVirtualMovie()
 	input.VirtualURI = ""
