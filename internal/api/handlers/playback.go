@@ -1,6 +1,8 @@
 package handlers
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -2811,11 +2813,62 @@ func (h *PlaybackHandler) HandleGetTranscodeManifest(w http.ResponseWriter, r *h
 		return
 	}
 
+	writeTranscodeManifestResponse(w, r, manifest)
+}
+
+// writeTranscodeManifestResponse emits an HLS playlist body. A full VOD
+// playlist repeats the same long segment-URI template for every entry, so the
+// uncompressed body is 140 KB or more and every reload pays for it. When the
+// client advertises gzip we compress the identical bytes and mark the response
+// so a shared cache keeps the variants apart; the no-store/Pragma semantics and
+// Content-Type are unchanged, so a client that does not accept gzip still gets
+// the byte-for-byte playlist it always did.
+func writeTranscodeManifestResponse(w http.ResponseWriter, r *http.Request, manifest []byte) {
 	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 	w.Header().Set("Cache-Control", "no-store, max-age=0")
 	w.Header().Set("Pragma", "no-cache")
+	// Advertise the encoding negotiation even when this particular request did
+	// not ask for gzip, so a cache never serves one variant under the other's key.
+	w.Header().Set("Vary", "Accept-Encoding")
+	if r != nil && acceptsGzipEncoding(r.Header.Get("Accept-Encoding")) {
+		var buf bytes.Buffer
+		gz := gzip.NewWriter(&buf)
+		if _, err := gz.Write(manifest); err == nil {
+			if err := gz.Close(); err == nil {
+				w.Header().Set("Content-Encoding", "gzip")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write(buf.Bytes())
+				return
+			}
+		}
+		// Compression failed mid-stream with nothing written yet; fall through
+		// and serve the identical identity body rather than a broken response.
+	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(manifest)
+}
+
+// acceptsGzipEncoding reports whether an Accept-Encoding header lists gzip
+// with a non-zero quality, honoring an explicit q=0 refusal so a client that
+// disabled gzip is not sent an encoding it rejected.
+func acceptsGzipEncoding(header string) bool {
+	for _, part := range strings.Split(header, ",") {
+		fields := strings.Split(strings.TrimSpace(part), ";")
+		if len(fields) == 0 || !strings.EqualFold(strings.TrimSpace(fields[0]), "gzip") {
+			continue
+		}
+		for _, param := range fields[1:] {
+			param = strings.TrimSpace(param)
+			if len(param) < 2 || !strings.EqualFold(param[:2], "q=") {
+				continue
+			}
+			if q, err := strconv.ParseFloat(strings.TrimSpace(param[2:]), 64); err == nil && q == 0 {
+				return false
+			}
+		}
+		return true
+	}
+	return false
 }
 
 func writePlaybackToneMapExecutionError(w http.ResponseWriter, err error) bool {
