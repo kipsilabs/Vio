@@ -1,7 +1,12 @@
 package handlers
 
 import (
+	"context"
+	"strings"
 	"testing"
+
+	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/playback"
 )
 
 // A cold-start track change on a session whose catalog row has not been probed
@@ -34,5 +39,33 @@ func TestReplanTrackChangeCarriesValidatedVideoEvidenceForUnprobedRow(t *testing
 	}
 	if fx.listCalls != 0 || fx.detailCalls != 0 || fx.probeCalls != 0 {
 		t.Fatalf("track change re-listed/resolved/probed the provider: list=%d detail=%d probe=%d", fx.listCalls, fx.detailCalls, fx.probeCalls)
+	}
+}
+
+// The fail-closed placeholder an empty inventory is served as must be
+// observable: when no catalog row names the bound candidate, the placeholder
+// decision is logged with the held row id, the bound candidate URI, and the row
+// id the placeholder was built from, so an operator can correlate an empty
+// menu with the reason it is empty.
+func TestInventoryEffectiveFileLogsFailClosedPlaceholder(t *testing.T) {
+	logs := captureHandlerLogs(t)
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	file := &models.MediaFile{ID: 900, FilePath: "virtual://movie/tt-placeholder?result=other", Container: "virtual"}
+
+	got := handler.inventoryEffectiveFile(context.Background(), file, &playback.Session{}, nil, "virtual://movie/tt-placeholder?result=bound")
+	if got == nil {
+		t.Fatal("inventoryEffectiveFile returned nil")
+	}
+	if len(got.AudioTracks) != 0 || len(got.SubtitleTracks) != 0 {
+		t.Fatalf("placeholder served tracks: audio=%+v subtitles=%+v", got.AudioTracks, got.SubtitleTracks)
+	}
+	out := logs.String()
+	if !strings.Contains(out, "virtual inventory serving fail-closed placeholder") {
+		t.Fatalf("placeholder decision was not logged:\n%s", out)
+	}
+	for _, want := range []string{`"file_id":900`, `"base_id":900`, `"candidate_uri":"virtual://movie/tt-placeholder?result=bound"`} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("placeholder log missing %s:\n%s", want, out)
+		}
 	}
 }
