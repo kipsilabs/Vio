@@ -261,6 +261,12 @@ interface VideoPlayerProps {
   onConnectionLost?: (positionSeconds: number, resume: boolean) => void;
   /** Starts another reconnect after the session gave up. */
   onRetryConnection?: () => void;
+  /**
+   * A session-scoped call answered that the session is gone and there is no
+   * played stream for the reconnect to reposition, so the caller enters the
+   * lost state directly.
+   */
+  onSessionLost?: () => void;
   /** The session's mid-stream connection state. */
   connectionStatus?: PlaybackConnectionStatus;
   /** Why reconnecting gave up, while `connectionStatus` is `lost`. */
@@ -488,6 +494,7 @@ export function VideoPlayer({
   onPlanFailure,
   onConnectionLost,
   onRetryConnection,
+  onSessionLost,
   connectionStatus = "connected",
   connectionErrorTitle = null,
   connectionError = null,
@@ -851,6 +858,33 @@ export function VideoPlayer({
   // never tears the transport down.
   const reportConnectionLostRef = useRef(reportConnectionLost);
   reportConnectionLostRef.current = reportConnectionLost;
+
+  const onSessionLostRef = useRef(onSessionLost);
+  onSessionLostRef.current = onSessionLost;
+
+  /**
+   * Both the control-socket ticket mint and the progress sampler can answer
+   * that the session is gone in the same tick. React batches the reconnect
+   * state change, so `connectionStatusRef` cannot separate them on its own:
+   * report a given session's disappearance once. A fresh `connected` status
+   * re-arms it, since a recovery that lands can drop again later.
+   */
+  const sessionGoneReportedRef = useRef(false);
+  useEffect(() => {
+    if (connectionStatus === "connected") sessionGoneReportedRef.current = false;
+  }, [connectionStatus]);
+
+  /**
+   * A session-scoped call (the control-socket ticket mint or a progress
+   * sample) answered that the session no longer exists. Route it through the
+   * one recovery the player has — the reconnect restarts at the same position
+   * — and fall through to the lost state when nothing has played to reposition.
+   */
+  const handleSessionGone = useCallback(() => {
+    if (sessionGoneReportedRef.current) return;
+    sessionGoneReportedRef.current = true;
+    if (!reportConnectionLostRef.current()) onSessionLostRef.current?.();
+  }, []);
 
   // While the session reconnects, nothing plays: the element is paused (so
   // progress reports say so), and hls.js stops hammering the server. The
@@ -1526,7 +1560,12 @@ export function VideoPlayer({
   useMediaSkipHandlers(displayMode !== "postroll", skipActions.back, skipActions.forward);
 
   // -- Watch progress reporting --
-  const flushWatchProgress = useWatchProgress(sessionId, videoRef, timelineOffsetRef);
+  const flushWatchProgress = useWatchProgress(
+    sessionId,
+    videoRef,
+    timelineOffsetRef,
+    handleSessionGone,
+  );
 
   const buildExitState = useCallback((): PlaybackExitState => {
     const video = videoRef.current;
@@ -4458,6 +4497,7 @@ export function VideoPlayer({
     onCommand: executeRealtimeCommand,
     onEvent: handleRealtimeEvent,
     supportedCommands: VIDEO_PLAYBACK_COMMANDS,
+    onSessionLost: handleSessionGone,
   });
 
   useEffect(() => {

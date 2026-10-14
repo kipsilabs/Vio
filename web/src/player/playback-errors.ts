@@ -1,4 +1,5 @@
 import { PlayerFetchError } from "./player-fetch";
+import { V2ProblemError } from "@/api/v2/request";
 import type { TerminalV3 } from "./protocol-v3";
 
 export interface PlaybackPolicyErrorDescription {
@@ -186,6 +187,29 @@ export function isDeadPlaybackSessionError(error: unknown): boolean {
     error.code === "playback_session_ended" ||
     error.status === 401
   );
+}
+
+/**
+ * Whether a session-scoped call was answered that the playback session no
+ * longer exists. Unlike `isDeadPlaybackSessionError`, this covers the v2
+ * handshake and progress calls, where the adapter renders the shared
+ * `playback_session_not_found` reason as the catalog's plain `not_found`
+ * problem: on those calls a 404 *is* the session being gone, because neither
+ * can produce any other 404. A retried mint or progress sample for a dead
+ * session id can never succeed.
+ *
+ * `410 Gone` is the session-ended answer the bridge can still send. A
+ * transport-level 404 (a proxy's HTML error page) is deliberately excluded:
+ * only a contract problem or a typed player error counts.
+ */
+export function isPlaybackSessionGoneError(error: unknown): boolean {
+  if (error instanceof PlayerFetchError) {
+    return error.status === 404 || error.status === 410;
+  }
+  if (error instanceof V2ProblemError) {
+    return error.status === 404 || error.status === 410;
+  }
+  return false;
 }
 
 /**
