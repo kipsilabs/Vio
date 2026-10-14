@@ -863,12 +863,26 @@ export function VideoPlayer({
   onSessionLostRef.current = onSessionLost;
 
   /**
+   * Both the control-socket ticket mint and the progress sampler can answer
+   * that the session is gone in the same tick. React batches the reconnect
+   * state change, so `connectionStatusRef` cannot separate them on its own:
+   * report a given session's disappearance once. A fresh `connected` status
+   * re-arms it, since a recovery that lands can drop again later.
+   */
+  const sessionGoneReportedRef = useRef(false);
+  useEffect(() => {
+    if (connectionStatus === "connected") sessionGoneReportedRef.current = false;
+  }, [connectionStatus]);
+
+  /**
    * A session-scoped call (the control-socket ticket mint or a progress
    * sample) answered that the session no longer exists. Route it through the
    * one recovery the player has — the reconnect restarts at the same position
    * — and fall through to the lost state when nothing has played to reposition.
    */
   const handleSessionGone = useCallback(() => {
+    if (sessionGoneReportedRef.current) return;
+    sessionGoneReportedRef.current = true;
     if (!reportConnectionLostRef.current()) onSessionLostRef.current?.();
   }, []);
 

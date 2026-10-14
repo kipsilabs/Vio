@@ -107,6 +107,18 @@ export function usePlaybackRealtime({
       attempt += 1;
       reconnectTimer = window.setTimeout(connect, delay);
     };
+    /**
+     * Ends the loop for good. A terminal answer (an administrator terminate or
+     * a session the server no longer has) must leave no reconnect scheduled,
+     * so a backoff timer already armed does not fire behind it.
+     */
+    const terminate = () => {
+      terminated = true;
+      if (reconnectTimer !== null) {
+        window.clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+    };
 
     const attach = (opened: WebSocket) => {
       socket = opened;
@@ -148,7 +160,7 @@ export function usePlaybackRealtime({
         seenCommandsRef.current.add(command.command_id);
         if (command.name === "terminate" && command.issued_by?.kind === "admin") {
           // An administrator ended the session; there is nothing to reconnect to.
-          terminated = true;
+          terminate();
         }
 
         if (socket.readyState === WebSocket.OPEN) {
@@ -222,7 +234,7 @@ export function usePlaybackRealtime({
             // terminate). Retrying the mint can never succeed, so the loop
             // stops; the player runs its one recovery or surfaces the lost
             // state. A later session id re-runs this effect and resets.
-            terminated = true;
+            terminate();
             setConnectionState("disconnected");
             onSessionLostRef.current?.();
             return;
