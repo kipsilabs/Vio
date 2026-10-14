@@ -275,9 +275,16 @@ type SessionStreamState struct {
 	PlayMethod      PlayMethod
 	BasePlayMethod  PlayMethod
 	AudioTrackIndex int
-	TranscodeAudio  bool
-	RemuxDVMode     RemuxDVMode
-	DVProfile       int
+	// VirtualAudioSelectionInvalid carries the server-enforced invalid-audio
+	// marker across a stream-state snapshot so a replacement rollback can
+	// restore it. Forward application (applySessionStreamStateLocked) still
+	// clears the marker unconditionally: a newly applied stream state carries
+	// a fresh selection that supersedes it. Only the rollback restore path
+	// copies this field back.
+	VirtualAudioSelectionInvalid bool
+	TranscodeAudio               bool
+	RemuxDVMode                  RemuxDVMode
+	DVProfile                    int
 	// DVProfilePin carries the session's first-verified-wins Dolby Vision pin
 	// across a stream-state snapshot. A full route-set commit merges it rather
 	// than replacing it, so a later replan that reads a drifted catalog value
@@ -1552,6 +1559,7 @@ func snapshotSessionStreamStateLocked(s *Session) SessionStreamState {
 		PlayMethod:                       s.PlayMethod,
 		BasePlayMethod:                   s.BasePlayMethod,
 		AudioTrackIndex:                  s.AudioTrackIndex,
+		VirtualAudioSelectionInvalid:     s.VirtualAudioSelectionInvalid,
 		TranscodeAudio:                   s.TranscodeAudio,
 		RemuxDVMode:                      s.RemuxDVMode,
 		DVProfile:                        s.DVProfile,
@@ -1613,6 +1621,12 @@ func restoreSessionStreamStateLocked(s *Session, state SessionStreamState) {
 	s.PlayMethod = state.PlayMethod
 	s.BasePlayMethod = state.BasePlayMethod
 	s.AudioTrackIndex = state.AudioTrackIndex
+	// A rollback restores the previous invalid-selection marker outright: the
+	// forward-apply path clears it because a replacement carries a fresh
+	// selection, but rolling the replacement back must resurrect the previous
+	// verdict, or the serve path would derive an ordinal from the -1 sentinel
+	// (mapped to 0:a:0) and mux the wrong track.
+	s.VirtualAudioSelectionInvalid = state.VirtualAudioSelectionInvalid
 	s.TranscodeAudio = state.TranscodeAudio
 	s.RemuxDVMode = state.RemuxDVMode
 	// The profile and its first-verified-wins pin are one fact; restoring the

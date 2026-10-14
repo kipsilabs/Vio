@@ -742,10 +742,13 @@ const probePropagationAttempts = 2
 // the shared default-audio reconcile — which runs before this write against the
 // plan-time selection, as the direct and queued evidence paths do — issues the
 // correction that points 0:a:N back at the committed track. An explicit viewer
-// selection is preserved by its track identity and is never overridden. This
-// write therefore deliberately leaves the session's committed array position
-// untouched; renumbering it here would change the ordinal space the running mux
-// was started against.
+// selection is preserved by its track identity and is never overridden.
+// A selection that cannot be re-identified (removed or ambiguous) is recorded
+// on the session as an invalid selection (index -1 plus the marker) by the
+// inventory writer this function delegates to: the commit lands in the same
+// generation-fenced write, not here. A follow-up removal of that text-only
+// shortcut would misdescribe the fail-closed behavior the tests pin, so keep
+// the two paths described together.
 func (h *PlaybackHandler) propagateVerifiedProbeInventory(deferred *virtualDeferredProbeV3, committed virtualCommittedProbeInventory) probeInventoryDisposition {
 	if h == nil || deferred == nil || deferred.sessionID == "" || !committed.committed() {
 		return probeInventorySuperseded
