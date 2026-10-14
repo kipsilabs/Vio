@@ -23,7 +23,13 @@ const realtimeOptions = vi.hoisted(() => ({
   current: null as null | {
     onEvent?: (event: PlaybackRealtimeEventEnvelope) => void;
     onCommand: (command: PlaybackRealtimeCommandEnvelope) => Promise<void> | void;
+    onSessionLost?: () => void;
   },
+}));
+// Captures the progress sampler's gone-session callback, the other lane the
+// player funnels through its one recovery.
+const progressOptions = vi.hoisted(() => ({
+  current: null as null | { onSessionLost?: () => void },
 }));
 const controls = vi.hoisted(() => ({
   current: null as null | {
@@ -83,7 +89,10 @@ vi.mock("../hooks/usePlaybackRealtime", () => ({
   }),
 }));
 vi.mock("../hooks/useWatchProgress", () => ({
-  useWatchProgress: () => vi.fn().mockResolvedValue(undefined),
+  useWatchProgress: (...args: unknown[]) => {
+    progressOptions.current = { onSessionLost: args[3] as (() => void) | undefined };
+    return vi.fn().mockResolvedValue(undefined);
+  },
 }));
 const keyboardShortcuts = vi.hoisted(() => ({
   toggleCaptions: null as (() => void) | null,
@@ -5692,6 +5701,7 @@ describe("VideoPlayer controls auto-hide", () => {
 describe("VideoPlayer lost connection", () => {
   beforeEach(() => {
     realtimeOptions.current = null;
+    progressOptions.current = null;
     controls.current = null;
     hlsJS.supported = false;
     hlsJS.constructed.mockClear();
@@ -5733,6 +5743,66 @@ describe("VideoPlayer lost connection", () => {
     expect(onConnectionLost).toHaveBeenCalledExactlyOnceWith(1_200, true);
     expect(onPlanFailure).not.toHaveBeenCalled();
     expect(screen.queryByText("Go Back")).not.toBeInTheDocument();
+  });
+
+  it("routes one gone session through both lanes on a stream that played", () => {
+    const onConnectionLost = vi.fn();
+    const onSessionLost = vi.fn();
+    const { container } = renderPlayer({ onConnectionLost, onSessionLost });
+    const video = container.querySelector("video");
+    if (!video) throw new Error("expected video element");
+    fireFrameTimeUpdate(video);
+    Object.defineProperty(video, "paused", { configurable: true, value: false });
+
+    // The control-socket mint and the progress sampler both answer that the
+    // session is gone, in the same tick, before React commits the reconnect.
+    act(() => {
+      realtimeOptions.current?.onSessionLost?.();
+      progressOptions.current?.onSessionLost?.();
+    });
+
+    expect(onConnectionLost).toHaveBeenCalledExactlyOnceWith(0, true);
+    expect(onSessionLost).not.toHaveBeenCalled();
+  });
+
+  it("reports a gone session once when nothing played and both lanes answer", () => {
+    const onConnectionLost = vi.fn();
+    const onSessionLost = vi.fn();
+    renderPlayer({ onConnectionLost, onSessionLost });
+
+    // No frame has played, so the reconnect has no position to restart from
+    // and the player goes straight to the lost state — once, not twice.
+    act(() => {
+      realtimeOptions.current?.onSessionLost?.();
+      progressOptions.current?.onSessionLost?.();
+    });
+
+    expect(onSessionLost).toHaveBeenCalledOnce();
+    expect(onConnectionLost).not.toHaveBeenCalled();
+  });
+
+  it("reports a later gone session after a reconnect landed", () => {
+    const onConnectionLost = vi.fn();
+    const onSessionLost = vi.fn();
+    const { container, rerenderPlayer } = renderPlayer({ onConnectionLost, onSessionLost });
+    const video = container.querySelector("video");
+    if (!video) throw new Error("expected video element");
+    fireFrameTimeUpdate(video);
+    Object.defineProperty(video, "paused", { configurable: true, value: false });
+
+    act(() => realtimeOptions.current?.onSessionLost?.());
+    expect(onConnectionLost).toHaveBeenCalledOnce();
+
+    // The reconnect runs, then a fresh transport reconnects: the report re-arms
+    // so a later drop is not swallowed by the first one.
+    rerenderPlayer({ connectionStatus: "reconnecting" });
+    act(() => progressOptions.current?.onSessionLost?.());
+    expect(onConnectionLost).toHaveBeenCalledOnce();
+
+    rerenderPlayer({ connectionStatus: "connected" });
+    act(() => progressOptions.current?.onSessionLost?.());
+    expect(onConnectionLost).toHaveBeenCalledTimes(2);
+    expect(onSessionLost).not.toHaveBeenCalled();
   });
 
   it("sends a replacement transport's network error before its first frame to route recovery", () => {
