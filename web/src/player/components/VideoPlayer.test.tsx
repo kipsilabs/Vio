@@ -131,6 +131,7 @@ vi.mock("hls.js", () => ({
     static Events = {
       ERROR: "error",
       MANIFEST_PARSED: "manifestParsed",
+      LEVEL_LOADED: "levelLoaded",
       BUFFER_APPENDED: "bufferAppended",
     };
     static ErrorTypes = { NETWORK_ERROR: "networkError", MEDIA_ERROR: "mediaError" };
@@ -2986,6 +2987,52 @@ describe("VideoPlayer HLS buffer policy", () => {
     await waitFor(() => expect(hlsJS.constructed).toHaveBeenCalledOnce());
 
     expect(recordedConfig().startFragPrefetch).toBe(true);
+  });
+
+  it("reanchors a seek into the omitted prefix of a windowed manifest", async () => {
+    const onReanchorSeek = vi.fn(() => true);
+    const { container } = renderPlayer({ plan: hlsPlan(), onReanchorSeek, shouldAutoPlay: false });
+    await waitFor(() => expect(hlsJS.constructed).toHaveBeenCalledOnce());
+    const video = container.querySelector("video");
+    if (!video) throw new Error("expected video element");
+
+    // A windowed synthetic playlist: everything below 400 s is an EXT-X-GAP
+    // placeholder, so a target there is inside the element's seekable range but
+    // has no real segment to load. hls.js would silently skip forward to the
+    // window start; the player must reanchor instead.
+    hlsJS.latest!.emit("levelLoaded", {
+      details: {
+        live: false,
+        edge: 470,
+        fragments: [{ gap: true, start: 0 }, { start: 400 }, { start: 402 }],
+      },
+    });
+
+    act(() => controls.current!.onSeek(100));
+
+    expect(onReanchorSeek).toHaveBeenCalledWith(100);
+    expect(video.currentTime).not.toBe(100);
+  });
+
+  it("keeps a seek inside the served window local", async () => {
+    const onReanchorSeek = vi.fn(() => true);
+    const { container } = renderPlayer({ plan: hlsPlan(), onReanchorSeek, shouldAutoPlay: false });
+    await waitFor(() => expect(hlsJS.constructed).toHaveBeenCalledOnce());
+    const video = container.querySelector("video");
+    if (!video) throw new Error("expected video element");
+
+    hlsJS.latest!.emit("levelLoaded", {
+      details: {
+        live: false,
+        edge: 470,
+        fragments: [{ gap: true, start: 0 }, { start: 400 }, { start: 402 }],
+      },
+    });
+
+    act(() => controls.current!.onSeek(450));
+
+    expect(onReanchorSeek).not.toHaveBeenCalled();
+    expect(video.currentTime).toBe(450);
   });
 
   it("retargets the forward prefetch between stable play and seeking or pause", async () => {
