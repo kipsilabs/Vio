@@ -104,6 +104,89 @@ func TestMonitoredEpisodePayloadKeepsMalformedEpisodesForValidation(t *testing.T
 	}
 }
 
+// TestMonitoredEpisodePayloadTrimsProviderWhitespace reproduces the issue where
+// metadata providers return episode titles (and overviews, stills) with leading
+// or trailing whitespace. The catalog's virtual-media validator rejects such
+// values with "episodes[N].title must not have surrounding whitespace", which
+// aborted the whole series registration. The registrar builder is the boundary
+// that must clean provider data before it reaches the strict validator.
+func TestMonitoredEpisodePayloadTrimsProviderWhitespace(t *testing.T) {
+	item := monitor.MonitoredMedia{
+		Key:       "series:tt100",
+		MediaType: "series",
+		IMDbID:    "tt100",
+		Episodes: []monitor.VirtualEpisode{
+			{
+				Season:    1,
+				Episode:   1,
+				Title:     "  Chapter One  ",
+				Overview:  "\tFirst episode\n",
+				Thumbnail: "  https://img.example/ep1.jpg  ",
+			},
+		},
+	}
+	payload := monitoredEpisodePayload(item)
+	if len(payload) != 1 {
+		t.Fatalf("payload episodes = %d, want 1", len(payload))
+	}
+	if got := payload[0].Title; got != "Chapter One" {
+		t.Fatalf("episode title = %q, want %q (provider whitespace must be trimmed before validation)", got, "Chapter One")
+	}
+	if got := payload[0].Overview; got != "First episode" {
+		t.Fatalf("episode overview = %q, want %q", got, "First episode")
+	}
+	if got := payload[0].StillPath; got != "https://img.example/ep1.jpg" {
+		t.Fatalf("episode still path = %q, want %q", got, "https://img.example/ep1.jpg")
+	}
+}
+
+// TestVirtualMediaRegistrationTrimsProviderWhitespace covers the series- and
+// movie-level fields the registrar maps from provider data. All of them are
+// subject to the same strict catalog validator, so the builder trims them
+// before validation instead of letting one padded title fail the request.
+func TestVirtualMediaRegistrationTrimsProviderWhitespace(t *testing.T) {
+	item := monitor.MonitoredMedia{
+		Key:       "series:tt100",
+		MediaType: "series",
+		IMDbID:    "tt100",
+		Title:     "  Dateline  ",
+		Overview:  "\tLong-running newsmagazine. \n",
+		Poster:    "  https://img.example/poster.jpg  ",
+		Backdrop:  "  https://img.example/backdrop.jpg  ",
+		Genres:    []string{"  Drama  ", "Crime"},
+		SourceKey: "  request:series:tt100  ",
+		Episodes: []monitor.VirtualEpisode{
+			{Season: 1, Episode: 1, Title: "  Chapter One  "},
+		},
+	}
+	in := virtualMediaRegistration(item, "2")
+
+	if in.Title != "Dateline" {
+		t.Fatalf("title = %q, want %q", in.Title, "Dateline")
+	}
+	if in.Overview != "Long-running newsmagazine." {
+		t.Fatalf("overview = %q, want %q", in.Overview, "Long-running newsmagazine.")
+	}
+	if in.PosterPath != "https://img.example/poster.jpg" {
+		t.Fatalf("poster path = %q", in.PosterPath)
+	}
+	if in.BackdropPath != "https://img.example/backdrop.jpg" {
+		t.Fatalf("backdrop path = %q", in.BackdropPath)
+	}
+	if len(in.Genres) != 2 || in.Genres[0] != "Drama" || in.Genres[1] != "Crime" {
+		t.Fatalf("genres = %#v, want [Drama Crime]", in.Genres)
+	}
+	if in.Source != "request:series:tt100" {
+		t.Fatalf("source = %q", in.Source)
+	}
+	if len(in.Episodes) != 1 || in.Episodes[0].Title != "Chapter One" {
+		t.Fatalf("episodes = %#v, want trimmed title Chapter One", in.Episodes)
+	}
+	if in.LibraryID != "2" {
+		t.Fatalf("library id = %q, want 2", in.LibraryID)
+	}
+}
+
 func TestCatalogMonitorRegistrarEpisodeMapping(t *testing.T) {
 	// Verify that Register accurately maps all monitoredMedia fields including episodes
 	item := monitor.MonitoredMedia{
