@@ -3768,11 +3768,6 @@ export function usePlaybackSession(
   const markInventoryExhausted = useCallback(() => {
     inventoryPendingRef.current = false;
     setState((current) => {
-      if (!current.inventoryPending) {
-        // Nothing was pending; a later call must not resurrect a failure over
-        // menus that already render confident probe evidence.
-        return current;
-      }
       // The attempt budget is spent. That is only a *failure* while a menu is
       // still showing declared/loading tracks; once positive probe evidence
       // (a verified push, a refreshed plan, or a catalog list) has resolved the
@@ -3780,6 +3775,14 @@ export function usePlaybackSession(
       // "discovery did not complete" notice above a correct list.
       const discoveryStillMissing =
         current.audioInventoryProvisional || current.subtitleInventoryProvisional;
+      // Nothing to mark: no deferred poll owed and every menu already renders
+      // confident probe evidence. A later call must not resurrect a failure
+      // over that evidence. The legacy catalog poll reaches here with
+      // `inventoryPending` false but a still-declared menu, and that exhausted
+      // budget must read as a failure rather than an indefinite "Discovering…".
+      if (!current.inventoryPending && !discoveryStillMissing) {
+        return current;
+      }
       return { ...current, inventoryPending: false, inventoryFailed: discoveryStillMissing };
     });
   }, []);
