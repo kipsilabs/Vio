@@ -26,25 +26,25 @@ func TestVirtualEvidenceMatchesBoundFileRequiresRowID(t *testing.T) {
 		VirtualSubtitleEvidenceURI:    uri,
 		VirtualSubtitleEvidenceFileID: 12,
 	}
-	if !virtualEvidenceMatchesBoundFile(bound, sameRow) {
+	if !virtualEvidenceMatchesBoundFile(context.Background(), bound, sameRow, nil) {
 		t.Fatal("evidence captured from the bound row did not match")
 	}
 
 	siblingRow := *sameRow
 	siblingRow.VirtualSubtitleEvidenceFileID = 11
-	if virtualEvidenceMatchesBoundFile(bound, &siblingRow) {
+	if virtualEvidenceMatchesBoundFile(context.Background(), bound, &siblingRow, nil) {
 		t.Fatal("evidence from sibling row 11 matched bound row 12 sharing the same candidate URI")
 	}
 
 	legacy := *sameRow
 	legacy.VirtualSubtitleEvidenceFileID = 0
-	if !virtualEvidenceMatchesBoundFile(bound, &legacy) {
+	if !virtualEvidenceMatchesBoundFile(context.Background(), bound, &legacy, nil) {
 		t.Fatal("legacy evidence with no row id lost its URI-only match")
 	}
 
 	foreignURI := *sameRow
 	foreignURI.VirtualSubtitleEvidenceURI = "virtual://movie/dup?result=b"
-	if virtualEvidenceMatchesBoundFile(bound, &foreignURI) {
+	if virtualEvidenceMatchesBoundFile(context.Background(), bound, &foreignURI, nil) {
 		t.Fatal("evidence anchored at a different candidate matched")
 	}
 }
@@ -63,13 +63,13 @@ func TestVirtualEvidenceMatchesBoundFileEnforcesRowIDWithoutEvidenceURI(t *testi
 		VirtualSubtitleEvidenceSet:    true,
 		VirtualSubtitleEvidenceFileID: 11,
 	}
-	if virtualEvidenceMatchesBoundFile(bound, mismatchedRow) {
+	if virtualEvidenceMatchesBoundFile(context.Background(), bound, mismatchedRow, nil) {
 		t.Fatal("mismatched evidence row 11 matched bound row 12 through the URI-only fallback")
 	}
 
 	sameRow := *mismatchedRow
 	sameRow.VirtualSubtitleEvidenceFileID = 12
-	if !virtualEvidenceMatchesBoundFile(bound, &sameRow) {
+	if !virtualEvidenceMatchesBoundFile(context.Background(), bound, &sameRow, nil) {
 		t.Fatal("same-row evidence without an evidence URI lost its URI-only match")
 	}
 }
@@ -88,13 +88,13 @@ func TestVirtualEvidenceMatchesBoundFileRejectsUnknownBoundRow(t *testing.T) {
 		VirtualSubtitleEvidenceURI:    uri,
 		VirtualSubtitleEvidenceFileID: 12,
 	}
-	if virtualEvidenceMatchesBoundFile(unknownBound, known) {
+	if virtualEvidenceMatchesBoundFile(context.Background(), unknownBound, known, nil) {
 		t.Fatal("known evidence row 12 matched an unknown bound row")
 	}
 
 	legacy := *known
 	legacy.VirtualSubtitleEvidenceFileID = 0
-	if !virtualEvidenceMatchesBoundFile(unknownBound, &legacy) {
+	if !virtualEvidenceMatchesBoundFile(context.Background(), unknownBound, &legacy, nil) {
 		t.Fatal("legacy evidence without a row id lost its URI-only match")
 	}
 }
@@ -325,7 +325,7 @@ func TestProbeRotatedVirtualCandidateRefreshesReplacement(t *testing.T) {
 		ID: 42, ContentID: "movie-post-rot", FilePath: newURI,
 		Container: "virtual", VirtualOwnerInstallationID: 5,
 	}
-	if !virtualCandidateRotationRecordedV3(rotated, file) {
+	if !virtualCandidateRotationRecordedV3(context.Background(), rotated, file, nil) {
 		t.Fatal("rotation was not recorded")
 	}
 
@@ -562,7 +562,7 @@ func TestProbeRotatedVirtualCandidateRaceDoesNotPersistStaleEvidence(t *testing.
 			if live.VirtualSourceURI != uriB {
 				t.Fatalf("binding = %q, want the newer rotation %q", live.VirtualSourceURI, uriB)
 			}
-			if virtualEvidenceMatchesBoundFile(&models.MediaFile{ID: fileB.ID, FilePath: uriB, Container: "virtual"}, live) {
+			if virtualEvidenceMatchesBoundFile(context.Background(), &models.MediaFile{ID: fileB.ID, FilePath: uriB, Container: "virtual"}, live, nil) {
 				t.Fatal("stale evidence still matched the newer binding: a superseded rotation authorized stale tracks")
 			}
 		})
