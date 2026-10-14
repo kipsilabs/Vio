@@ -5,6 +5,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   HLS_STARTUP_TIMEOUT_MS,
   HlsStartupGuard,
+  ManifestLoadCoalescer,
+  isManifestLoadError,
   isStaleGenerationError,
   recoverFromStaleGeneration,
 } from "./hlsStartupGuard";
@@ -118,5 +120,79 @@ describe("recoverFromStaleGeneration", () => {
 
     expect(recoverFromStaleGeneration(host, 12)).toBe(false);
     expect(host.loadSource).not.toHaveBeenCalled();
+  });
+});
+
+describe("isManifestLoadError", () => {
+  it("recognizes hls.js's manifest-scoped failures", () => {
+    for (const details of ["manifestLoadError", "manifestLoadTimeOut", "manifestParsingError"]) {
+      expect(isManifestLoadError({ details })).toBe(true);
+    }
+  });
+
+  it("leaves a fragment error holding the in-flight manifest load", () => {
+    expect(isManifestLoadError({ details: "fragLoadError" })).toBe(false);
+    expect(isManifestLoadError({ details: "bufferAppendError" })).toBe(false);
+    expect(isManifestLoadError(null)).toBe(false);
+    expect(isManifestLoadError({})).toBe(false);
+  });
+});
+
+describe("ManifestLoadCoalescer", () => {
+  it("does not open a second concurrent manifest load while one is in flight", () => {
+    const requests: string[] = [];
+    const coalescer = new ManifestLoadCoalescer((url) => requests.push(url));
+
+    // hls.js marks the transport's own manifest load in flight through its
+    // MANIFEST_LOADING event; the player's request during it is queued.
+    coalescer.begin("/master.m3u8");
+    expect(coalescer.request("/master.m3u8")).toBe(false);
+    expect(requests).toEqual([]);
+
+    // The in-flight load settles, and the queued refetch runs exactly once.
+    coalescer.settle();
+    expect(requests).toEqual(["/master.m3u8"]);
+  });
+
+  it("coalesces a stale-generation refetch behind the manifest load already open", () => {
+    const requests: string[] = [];
+    const coalescer = new ManifestLoadCoalescer((url) => requests.push(url));
+    const host = {
+      url: "/api/v2/playback/transcode/session-1/master.m3u8?st=jwt",
+      config: {} as { startPosition?: number },
+      loadSource: vi.fn(),
+    };
+
+    // The transport started its manifest load and hls.js is still fetching it.
+    coalescer.request(host.url);
+    expect(requests).toEqual([host.url]);
+
+    // A stale-generation fence arrives while it is in flight. The recovery
+    // records the refetch instead of issuing a second concurrent request.
+    expect(recoverFromStaleGeneration(host, 42.5, (url) => coalescer.request(url))).toBe(true);
+    expect(requests).toEqual([host.url]);
+    // The direct loadSource path is bypassed in favour of the coalescer.
+    expect(host.loadSource).not.toHaveBeenCalled();
+
+    // Releasing the in-flight load replays the refetch once.
+    coalescer.settle();
+    expect(requests).toEqual([host.url, host.url]);
+    // It still resumes where the viewer is.
+    expect(host.config.startPosition).toBe(42.5);
+  });
+
+  it("runs one queued refetch after a burst of stale fences", () => {
+    const requests: string[] = [];
+    const coalescer = new ManifestLoadCoalescer((url) => requests.push(url));
+
+    coalescer.begin("/master.m3u8");
+    coalescer.request("/master.m3u8");
+    coalescer.request("/master.m3u8");
+    coalescer.request("/master.m3u8");
+    expect(requests).toEqual([]);
+
+    coalescer.settle();
+    // The in-flight load is the freshest request; only one refetch follows it.
+    expect(requests).toEqual(["/master.m3u8"]);
   });
 });

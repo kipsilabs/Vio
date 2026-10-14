@@ -52,6 +52,8 @@ import { resolveEffectiveVersion } from "../utils/resolveEffectiveVersion";
 import {
   HlsStartupGuard,
   MAX_STALE_GENERATION_RECOVERIES,
+  ManifestLoadCoalescer,
+  isManifestLoadError,
   isStaleGenerationError,
   recoverFromStaleGeneration,
 } from "../utils/hlsStartupGuard";
@@ -2525,8 +2527,31 @@ export function VideoPlayer({
               },
             });
 
+            // One manifest load at a time. The transport init, the not-ready
+            // pollback and the stale-generation recovery each call loadSource,
+            // and a stale-generation fence on a segment is independent of the
+            // manifest request hls.js already has open: without serializing
+            // them, that recovery opens a second concurrent request for the same
+            // playlist and the superseded one is held to completion — the paired
+            // manifest load whose `receive` the server never produced. The
+            // coalescer keys off hls.js's manifest lifecycle and replays a
+            // superseded request once the in-flight load settles.
+            const manifestLoads = new ManifestLoadCoalescer((url) => hls?.loadSource(url));
+            hls.on(Hls.Events.MANIFEST_LOADING, () => {
+              manifestLoads.begin(hls?.url ?? "");
+            });
+            hls.on(Hls.Events.MANIFEST_LOADED, () => {
+              manifestLoads.settle();
+            });
+
             hls.on(Hls.Events.ERROR, (_event, data) => {
               if (!data.fatal || destroyed) return;
+
+              // A fatal manifest error ends the manifest request hls.js had
+              // open. A fragment error does not, so the coalescer keeps holding
+              // that in-flight load through a stale-generation fence and queues
+              // the refetch behind it instead of racing it.
+              if (isManifestLoadError(data)) manifestLoads.settle();
 
               console.error("[hls.js] Fatal error:", {
                 type: data.type,
@@ -2560,12 +2585,18 @@ export function VideoPlayer({
                   const retryAfter = manifestRetryAfterMs(data);
                   const instance = hls;
                   const manifestUrl = instance?.url ?? data.frag?.url ?? data.url;
+                  // A pollback is a manifest reload like any other: replace any
+                  // timer still pending so a superseded retry cannot fire a
+                  // second, overlapping loadSource.
+                  if (manifestPollbackRef.current !== undefined) {
+                    window.clearTimeout(manifestPollbackRef.current);
+                  }
                   const timer = window.setTimeout(() => {
                     if (destroyed) return;
                     if (hlsStartupGuardRef.current?.isStarting() !== true) return;
                     if (hlsRef.current !== instance) return;
                     if (manifestUrl == null) return;
-                    instance?.loadSource(manifestUrl);
+                    manifestLoads.request(manifestUrl);
                   }, retryAfter);
                   manifestPollbackRef.current = timer;
                   return;
@@ -2612,7 +2643,9 @@ export function VideoPlayer({
                 if (
                   hls &&
                   staleGenerationRecoveriesRef.current < MAX_STALE_GENERATION_RECOVERIES &&
-                  recoverFromStaleGeneration(hls, video.currentTime)
+                  recoverFromStaleGeneration(hls, video.currentTime, (url) =>
+                    manifestLoads.request(url),
+                  )
                 ) {
                   staleGenerationRecoveriesRef.current++;
                   console.warn("[hls.js] Segment generation is stale; refetching playlist", {
@@ -2704,7 +2737,7 @@ export function VideoPlayer({
               attemptAutoplayWhenReady();
             });
 
-            hls.loadSource(effectiveStreamUrl);
+            manifestLoads.request(effectiveStreamUrl);
             hls.attachMedia(video);
             hlsRef.current = hls;
           } else {
