@@ -348,3 +348,14 @@ func TestRehydratedIdentityDifferentReleaseStillRefused(t *testing.T) {
 		t.Fatalf("resolved candidate = %q, want no accepted rotation", got)
 	}
 }
+
+// TestChurnIdentity provides an umbrella runner matching -run 'ChurnIdentity'.
+func TestChurnIdentity(t *testing.T) {
+	t.Run("EnrichSessionBoundCandidateIdentityRecoversOwningRow", TestEnrichSessionBoundCandidateIdentityRecoversOwningRow)
+	t.Run("EnrichSessionBoundCandidateIdentityRefusesForeignRow", TestEnrichSessionBoundCandidateIdentityRefusesForeignRow)
+	t.Run("EnrichSessionBoundCandidateIdentityNoopsWhenComplete", TestEnrichSessionBoundCandidateIdentityNoopsWhenComplete)
+	t.Run("RehydratedIdentityCapturedFromOwningCandidateRow", TestRehydratedIdentityCapturedFromOwningCandidateRow)
+	t.Run("RehydratedIdentityLegacyRowServesStoredURL", TestRehydratedIdentityLegacyRowServesStoredURL)
+	t.Run("VirtualResolveContextPersistedTrustIdentitylessEvidence", TestVirtualResolveContextPersistedTrustIdentitylessEvidence)
+	t.Run("RehydratedIdentityDifferentReleaseStillRefused", TestRehydratedIdentityDifferentReleaseStillRefused)
+}

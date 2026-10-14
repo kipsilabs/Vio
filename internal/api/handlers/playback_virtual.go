@@ -3069,7 +3069,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			// a trust that would suppress its fallback.
 			candidateCtx := attemptCtx
 			if sameVirtualReleaseIdentity(file.FilePath, cand.URI) && (options.sessionBound || explicitSelection) {
-				candidateCtx = virtualResolveContextWithPersistedTrust(attemptCtx, file, time.Now(), h.virtualCandidateTrustWindow())
+				candidateCtx = virtualResolveContextWithPersistedTrust(attemptCtx, file, time.Now(), h.virtualCandidateTrustWindow(), h.storedVirtualURLAllowInsecure(file, oid))
 			}
 			res, err := h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
 				candidateCtx, cand.URI, oid, userID, profileID, providerRelist, excludedCandidateIDs, preferredCandidateID,
@@ -3144,6 +3144,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 					streamURL = recovered.URL
 					cand.RequestHeaders = cloneHeaderMap(recovered.RequestHeaders)
 					oid = effectiveVirtualOwner(recovered.OwnerID, oid)
+					servedPersisted = true
 					slog.InfoContext(attemptCtx, "virtual playback: recovered a trusted pinless candidate from its stored URL",
 						"component", "api", "file_id", file.ID, "candidate_uri", requestedURI,
 						"candidate_id", probedCandidateID, "status", "recovered_stored_url")
@@ -6608,7 +6609,7 @@ func (h *PlaybackHandler) resolveVirtualCandidateSource(
 		candidateCtx := ctx
 		if sameVirtualReleaseIdentity(file.FilePath, candidate.URI) {
 			candidateCtx = virtualResolveContextWithPersistedTrust(
-				ctx, file, time.Now(), h.virtualCandidateTrustWindow(),
+				ctx, file, time.Now(), h.virtualCandidateTrustWindow(), h.storedVirtualURLAllowInsecure(file, ownerID),
 			)
 		}
 		res, err := h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(

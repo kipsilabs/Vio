@@ -42,12 +42,14 @@ func TestEnrichSessionBoundCandidateIdentityRejectsContradictoryIdentity(t *test
 	}
 }
 
-// TestEnrichSessionBoundCandidateIdentityCoLocatesIdentityAndURL proves the
-// other mixed direction: an anchor that carries a stored URL but no identity
-// must not receive a foreign identity over its own URL. The owning row's
-// identity and URL travel together, so the URL is replaced with the
-// same-provenance one.
-func TestEnrichSessionBoundCandidateIdentityCoLocatesIdentityAndURL(t *testing.T) {
+// TestEnrichSessionBoundCandidateIdentityPreservesAnchorTransportOnTokenReuse
+// proves that an identity-less anchor carrying its own transport URL (URL-A)
+// does not have its transport replaced or foreign identity adopted when the
+// catalog row lookup for the same candidate URI returns identity-B and URL-B.
+// Without durable identity on the anchor, historical same-release binding is
+// unproven (a provider can reuse tokens for different releases), so anchor
+// transport must be preserved and release B neither served nor adopted.
+func TestEnrichSessionBoundCandidateIdentityPreservesAnchorTransportOnTokenReuse(t *testing.T) {
 	const pinnedURI = "virtual://movie/tt-colocate?result=cand-a"
 	anchor := &models.MediaFile{
 		ID: 662, ContentID: "movie-colocate", EpisodeID: "ep-1", FilePath: pinnedURI, MediaFolderID: 7,
@@ -61,14 +63,63 @@ func TestEnrichSessionBoundCandidateIdentityCoLocatesIdentityAndURL(t *testing.T
 	h := &PlaybackHandler{fileResolver: &churnIdentityFileResolver{byPath: map[string]*models.MediaFile{pinnedURI: owner}}}
 
 	got := h.enrichSessionBoundCandidateIdentity(context.Background(), anchor)
-	if got == anchor {
-		t.Fatal("enrichment dropped the owning row's identity and URL")
+	if got != anchor {
+		t.Fatalf("token reuse replaced anchor: got URL %q identity %q, want anchor unchanged (URL-A preserved, B neither served nor adopted)",
+			got.ResolvedURL, got.ProviderReleaseName)
 	}
-	if got.ProviderReleaseName != owner.ProviderReleaseName || got.ProviderReleaseSize != owner.ProviderReleaseSize {
-		t.Fatalf("identity = %q/%d, want the owning row's", got.ProviderReleaseName, got.ProviderReleaseSize)
+	if got.ResolvedURL != "https://93.184.216.34/stream/token=anchor" {
+		t.Fatalf("URL = %q, want anchor's URL-A preserved", got.ResolvedURL)
 	}
-	if got.ResolvedURL != owner.ResolvedURL {
-		t.Fatalf("URL = %q, want the owning row's %q (identity and URL must share provenance)", got.ResolvedURL, owner.ResolvedURL)
+	if got.ProviderReleaseName != "" {
+		t.Fatalf("identity = %q, want empty (release B not adopted)", got.ProviderReleaseName)
+	}
+}
+
+// TestTokenReuseRegressionPreservesAnchorTransportNeitherServesNorAdoptsB proves
+// the handler-level token-reuse invariant: an identity-less anchor with URL-A
+// whose exact path matches an owning row with identity-B and URL-B preserves
+// URL-A during playback resolution: URL-B is not served, and identity-B is not
+// adopted onto the served file or resolution.
+func TestTokenReuseRegressionPreservesAnchorTransportNeitherServesNorAdoptsB(t *testing.T) {
+	const pinnedURI = "virtual://movie/tt-reuse-handler?result=cand-a"
+	now := time.Now()
+	future := now.Add(time.Hour)
+	anchor := &models.MediaFile{
+		ID: 860, ContentID: "movie-reuse-handler", EpisodeID: "ep-1", FilePath: pinnedURI, MediaFolderID: 7,
+		Container: "virtual", UpdatedAt: now,
+		ResolvedURL:          "https://93.184.216.34/stream/token=anchor",
+		ResolvedURLExpiresAt: &future,
+	}
+	owner := &models.MediaFile{
+		ID: 861, ContentID: "movie-reuse-handler", EpisodeID: "ep-1", FilePath: pinnedURI, MediaFolderID: 7,
+		Container: "virtual", UpdatedAt: now,
+		ProviderReleaseName:  "Movie.2024.1080p.OTHER",
+		ProviderReleaseSize:  9_000_000_000,
+		ResolvedURL:          "https://93.184.216.34/stream/token=owner",
+		ResolvedURLExpiresAt: &future,
+		ProbeUpdatedAt:       timePtr(now),
+	}
+	h := &PlaybackHandler{
+		fileResolver:                &churnIdentityFileResolver{byPath: map[string]*models.MediaFile{pinnedURI: owner}},
+		VirtualCandidateTrustWindow: func() time.Duration { return 720 * time.Hour },
+		VirtualPlaybackResolver: VirtualPlaybackResolverFunc(func(context.Context, string, int, string, int) (string, error) {
+			return "https://93.184.216.34/legacy", nil
+		}),
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil)
+	resolved, err := h.resolveVirtualPlaybackSource(req, anchor, "profile-1", true, nil, "", "", 0, false,
+		virtualResolveOptionsV3{explicitSelection: true})
+	if err != nil {
+		t.Fatalf("resolve error: %v", err)
+	}
+	if resolved.URL != "https://93.184.216.34/stream/token=anchor" {
+		t.Fatalf("served URL = %q, want anchor's URL-A (owner URL-B must not be served)", resolved.URL)
+	}
+	if resolved.ProviderReleaseName == owner.ProviderReleaseName {
+		t.Fatalf("resolved identity = %q, want empty (owner identity B must not be adopted)", resolved.ProviderReleaseName)
+	}
+	if resolved.File != nil && resolved.File.ProviderReleaseName == owner.ProviderReleaseName {
+		t.Fatalf("served file identity = %q, want empty (owner identity B must not be adopted)", resolved.File.ProviderReleaseName)
 	}
 }
 
@@ -167,6 +218,39 @@ func TestEnrichSessionBoundCandidateIdentityDoesNotBorrowFreshnessWithoutURL(t *
 	}
 }
 
+// TestEnrichSessionBoundCandidateIdentityZeroOwnerTimestampDisablesTrust proves
+// importing a URL from an owner with a zero UpdatedAt copies that zero timestamp
+// unconditionally rather than inheriting the anchor's newer freshness. Zero
+// disables trust down-stream, ensuring a row with unknown freshness cannot gain
+// an open candidate store window.
+func TestEnrichSessionBoundCandidateIdentityZeroOwnerTimestampDisablesTrust(t *testing.T) {
+	const pinnedURI = "virtual://movie/tt-zero-freshness?result=cand-a"
+	recent := time.Now()
+	future := recent.Add(time.Hour)
+	anchor := &models.MediaFile{
+		ID: 672, ContentID: "movie-zero", EpisodeID: "ep-1", FilePath: pinnedURI, MediaFolderID: 7,
+		ProviderReleaseName: "Movie.2024.1080p.WEB-DL", ProviderReleaseSize: 8_000_000_000,
+		UpdatedAt: recent,
+	}
+	owner := &models.MediaFile{
+		ID: 673, ContentID: "movie-zero", EpisodeID: "ep-1", FilePath: pinnedURI, MediaFolderID: 7,
+		ProviderReleaseName: "Movie.2024.1080p.WEB-DL", ProviderReleaseSize: 8_000_000_000,
+		ResolvedURL:          "https://93.184.216.34/stream/token=owner",
+		ResolvedURLExpiresAt: &future,
+		UpdatedAt:            time.Time{}, // zero timestamp
+	}
+	h := &PlaybackHandler{fileResolver: &churnIdentityFileResolver{byPath: map[string]*models.MediaFile{pinnedURI: owner}}}
+
+	got := h.enrichSessionBoundCandidateIdentity(context.Background(), anchor)
+	if !got.UpdatedAt.IsZero() {
+		t.Fatalf("enriched updated_at = %v, want zero (supplier timestamp copied unconditionally)", got.UpdatedAt)
+	}
+	ctx := virtualResolveContextWithPersistedTrust(context.Background(), got, recent, 720*time.Hour)
+	if virtuallibrary.PersistedCandidateTrusted(ctx) {
+		t.Fatal("zero updated_at must disable trust, not inherit anchor freshness")
+	}
+}
+
 // TestOwningSessionBoundCandidateRowLookupParity proves both lookup
 // implementations (the injected VirtualFileLookup and the path resolver) assert
 // the same ownership: a matching content id recovers the row, an anchor with no
@@ -245,44 +329,170 @@ func TestVirtualResolveContextIdentitylessTrustRequiresUsableStoredURL(t *testin
 	const usableURL = "https://93.184.216.34/stream/token=stored"
 
 	tests := []struct {
-		name      string
-		row       *models.MediaFile
-		wantTrust bool
+		name          string
+		row           *models.MediaFile
+		window        time.Duration
+		allowInsecure bool
+		wantTrust     bool
 	}{
 		{
 			name:      "delivery stamp alone is not resumable evidence",
 			row:       &models.MediaFile{ID: 710, UpdatedAt: recent, LastDeliveredAt: &recent},
+			window:    window,
 			wantTrust: false,
 		},
 		{
 			name:      "empty URL with a delivery stamp is not trusted",
 			row:       &models.MediaFile{ID: 711, UpdatedAt: recent, LastDeliveredAt: &recent, ResolvedURL: "  "},
+			window:    window,
 			wantTrust: false,
 		},
 		{
 			name:      "expired URL is not trusted",
 			row:       &models.MediaFile{ID: 712, UpdatedAt: recent, ResolvedURL: usableURL, ResolvedURLExpiresAt: &expired},
+			window:    window,
 			wantTrust: false,
 		},
 		{
 			name:      "usable URL is trusted",
 			row:       &models.MediaFile{ID: 713, UpdatedAt: recent, ResolvedURL: usableURL, ResolvedURLExpiresAt: &future},
+			window:    window,
 			wantTrust: true,
 		},
 		{
 			name:      "usable URL outside the window is not trusted",
 			row:       &models.MediaFile{ID: 714, UpdatedAt: now.Add(-60 * 24 * time.Hour), ResolvedURL: usableURL, ResolvedURLExpiresAt: &future},
+			window:    window,
+			wantTrust: false,
+		},
+		{
+			name:      "malformed URL is not trusted for identity-less row",
+			row:       &models.MediaFile{ID: 715, UpdatedAt: recent, ResolvedURL: "http://bad url with spaces", ResolvedURLExpiresAt: &future},
+			window:    window,
+			wantTrust: false,
+		},
+		{
+			name:      "unsupported scheme is not trusted for identity-less row",
+			row:       &models.MediaFile{ID: 716, UpdatedAt: recent, ResolvedURL: "ftp://93.184.216.34/stream", ResolvedURLExpiresAt: &future},
+			window:    window,
+			wantTrust: false,
+		},
+		{
+			name:          "disallowed private IP is not trusted when private streams forbidden",
+			row:           &models.MediaFile{ID: 717, UpdatedAt: recent, ResolvedURL: "http://127.0.0.1/stream", ResolvedURLExpiresAt: &future},
+			window:        window,
+			allowInsecure: false,
+			wantTrust:     false,
+		},
+		{
+			name:          "private IP is trusted when private streams allowed",
+			row:           &models.MediaFile{ID: 718, UpdatedAt: recent, ResolvedURL: "http://127.0.0.1/stream", ResolvedURLExpiresAt: &future},
+			window:        window,
+			allowInsecure: true,
+			wantTrust:     true,
+		},
+		{
+			name:      "exact expiry timestamp is not trusted (expired)",
+			row:       &models.MediaFile{ID: 719, UpdatedAt: recent, ResolvedURL: usableURL, ResolvedURLExpiresAt: &now},
+			window:    window,
+			wantTrust: false,
+		},
+		{
+			name:      "one nanosecond before expiry is trusted",
+			row:       &models.MediaFile{ID: 720, UpdatedAt: recent, ResolvedURL: usableURL, ResolvedURLExpiresAt: timePtr(now.Add(time.Nanosecond))},
+			window:    window,
+			wantTrust: true,
+		},
+		{
+			name:      "one nanosecond after expiry is not trusted",
+			row:       &models.MediaFile{ID: 721, UpdatedAt: recent, ResolvedURL: usableURL, ResolvedURLExpiresAt: timePtr(now.Add(-time.Nanosecond))},
+			window:    window,
+			wantTrust: false,
+		},
+		{
+			name:      "exact window boundary is trusted",
+			row:       &models.MediaFile{ID: 722, UpdatedAt: now.Add(-window), ResolvedURL: usableURL, ResolvedURLExpiresAt: &future},
+			window:    window,
+			wantTrust: true,
+		},
+		{
+			name:      "one nanosecond past window boundary is not trusted",
+			row:       &models.MediaFile{ID: 723, UpdatedAt: now.Add(-window).Add(-time.Nanosecond), ResolvedURL: usableURL, ResolvedURLExpiresAt: &future},
+			window:    window,
+			wantTrust: false,
+		},
+		{
+			name:      "zero window disables trust",
+			row:       &models.MediaFile{ID: 724, UpdatedAt: recent, ResolvedURL: usableURL, ResolvedURLExpiresAt: &future},
+			window:    0,
+			wantTrust: false,
+		},
+		// Identity-backed rows retain trust through unusable transport
+		{
+			name: "identity-backed retains trust through malformed URL",
+			row: &models.MediaFile{
+				ID: 725, UpdatedAt: recent, ResolvedURL: "http://bad url with spaces", ResolvedURLExpiresAt: &future,
+				ProviderReleaseName: "Movie.2024", ProviderReleaseSize: 8_000_000_000,
+			},
+			window:    window,
+			wantTrust: true,
+		},
+		{
+			name: "identity-backed retains trust through unsupported scheme",
+			row: &models.MediaFile{
+				ID: 726, UpdatedAt: recent, ResolvedURL: "ftp://93.184.216.34/stream", ResolvedURLExpiresAt: &future,
+				ProviderReleaseName: "Movie.2024", ProviderReleaseSize: 8_000_000_000,
+			},
+			window:    window,
+			wantTrust: true,
+		},
+		{
+			name: "identity-backed retains trust through disallowed private URL",
+			row: &models.MediaFile{
+				ID: 727, UpdatedAt: recent, ResolvedURL: "http://127.0.0.1/stream", ResolvedURLExpiresAt: &future,
+				ProviderReleaseName: "Movie.2024", ProviderReleaseSize: 8_000_000_000,
+			},
+			window:        window,
+			allowInsecure: false,
+			wantTrust:     true,
+		},
+		{
+			name: "identity-backed retains trust through expired URL inside window",
+			row: &models.MediaFile{
+				ID: 728, UpdatedAt: recent, ResolvedURL: usableURL, ResolvedURLExpiresAt: &expired,
+				ProviderReleaseName: "Movie.2024", ProviderReleaseSize: 8_000_000_000,
+			},
+			window:    window,
+			wantTrust: true,
+		},
+		{
+			name: "identity-backed retains trust with delivery stamp alone inside window",
+			row: &models.MediaFile{
+				ID: 729, UpdatedAt: recent, LastDeliveredAt: &recent,
+				ProviderReleaseName: "Movie.2024", ProviderReleaseSize: 8_000_000_000,
+			},
+			window:    window,
+			wantTrust: true,
+		},
+		{
+			name: "identity-backed outside window is not trusted",
+			row: &models.MediaFile{
+				ID: 730, UpdatedAt: now.Add(-60 * 24 * time.Hour), ResolvedURL: usableURL, ResolvedURLExpiresAt: &future,
+				ProviderReleaseName: "Movie.2024", ProviderReleaseSize: 8_000_000_000,
+			},
+			window:    window,
 			wantTrust: false,
 		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx := virtualResolveContextWithPersistedTrust(context.Background(), tc.row, now, window)
+			ctx := virtualResolveContextWithPersistedTrust(context.Background(), tc.row, now, tc.window, tc.allowInsecure)
 			if got := virtuallibrary.PersistedCandidateTrusted(ctx); got != tc.wantTrust {
 				t.Fatalf("trust = %v, want %v", got, tc.wantTrust)
 			}
-			if _, ok := virtuallibrary.PersistedCandidateIdentityFromContext(ctx); ok {
-				t.Fatal("an identity-less row must never thread a durable identity")
+			_, hasIdentity := persistedVirtualIdentity(tc.row)
+			if _, ok := virtuallibrary.PersistedCandidateIdentityFromContext(ctx); ok != hasIdentity {
+				t.Fatalf("threaded identity = %v, want %v", ok, hasIdentity)
 			}
 		})
 	}
@@ -453,4 +663,76 @@ func TestIdentitylessDeliveredOnlyRowIsNotTrusted(t *testing.T) {
 	if sawTrust {
 		t.Fatal("a delivery stamp alone must not thread persisted-candidate trust")
 	}
+}
+
+// TestRecoveredStoredURLDoesNotClearFailureVerdict proves that recovering a
+// trusted stored URL after ErrPersistedCandidateTrusted is treated as
+// persisted-URL serving, not fresh provider liveness evidence. Therefore, an
+// active failure verdict (failed_at) on the row must NOT be cleared, both when
+// probe succeeds and when probe fails.
+func TestRecoveredStoredURLDoesNotClearFailureVerdict(t *testing.T) {
+	for _, probeSucceeds := range []bool{true, false} {
+		name := "probe succeeds"
+		if !probeSucceeds {
+			name = "probe fails"
+		}
+		t.Run(name, func(t *testing.T) {
+			now := time.Now()
+			future := now.Add(time.Hour)
+			failedAt := now.Add(-time.Minute)
+			file := pinlessIdentitylessRow("https://93.184.216.34/stream/token=stored", &future)
+			file.FailedAt = &failedAt
+
+			verdictClears := 0
+			h := &PlaybackHandler{
+				VirtualCandidateTrustWindow: func() time.Duration { return 720 * time.Hour },
+				VirtualCandidateClearFailedMarker: func(_ context.Context, _ int, _ string, _ *time.Time) error {
+					verdictClears++
+					return nil
+				},
+				VirtualPlaybackResolver: VirtualPlaybackResolverFunc(
+					func(context.Context, string, int, string, int) (string, error) {
+						return "https://93.184.216.34/legacy", nil
+					}),
+				VirtualMediaDetailedResolver: VirtualMediaDetailedResolverFunc(func(ctx context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+					return ResolvedVirtualMedia{}, fmt.Errorf("trusted persisted virtual candidate is absent: %w", virtuallibrary.ErrPersistedCandidateTrusted)
+				}),
+			}
+			if probeSucceeds {
+				h.VirtualPlaybackSourceProber = func(context.Context, string, *models.MediaFile) (*models.MediaFile, error) {
+					res := *file
+					res.ProbeUpdatedAt = &now
+					return &res, nil
+				}
+			} else {
+				h.VirtualPlaybackSourceProber = func(context.Context, string, *models.MediaFile) (*models.MediaFile, error) {
+					return nil, errors.New("probe connection refused")
+				}
+			}
+
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil)
+			resolved, err := h.resolveVirtualPlaybackSource(req, file, "profile-1", false, nil, "", "", 0, false,
+				virtualResolveOptionsV3{explicitSelection: true, allowFailedCandidate: true})
+			if err != nil && probeSucceeds {
+				t.Fatalf("resolve error: %v", err)
+			}
+			if probeSucceeds && resolved.URL != file.ResolvedURL {
+				t.Fatalf("resolved URL = %q, want stored URL %q", resolved.URL, file.ResolvedURL)
+			}
+			if verdictClears != 0 {
+				t.Fatalf("verdict clears = %d, want 0 (recovered stored URL is not liveness evidence)", verdictClears)
+			}
+		})
+	}
+}
+
+// TestTrustRecovery provides an umbrella runner matching -run 'TrustRecovery'.
+func TestTrustRecovery(t *testing.T) {
+	t.Run("PreservesAnchorTransportOnTokenReuse", TestEnrichSessionBoundCandidateIdentityPreservesAnchorTransportOnTokenReuse)
+	t.Run("TokenReuseRegressionPreservesAnchorTransportNeitherServesNorAdoptsB", TestTokenReuseRegressionPreservesAnchorTransportNeitherServesNorAdoptsB)
+	t.Run("ZeroOwnerTimestampDisablesTrust", TestEnrichSessionBoundCandidateIdentityZeroOwnerTimestampDisablesTrust)
+	t.Run("IdentitylessTrustRequiresUsableStoredURL", TestVirtualResolveContextIdentitylessTrustRequiresUsableStoredURL)
+	t.Run("AbsentPinRecoversUsableStoredURL", TestAbsentPinRecoversUsableStoredURL)
+	t.Run("AbsentPinWithoutUsableStoredURLFailsBoundedly", TestAbsentPinWithoutUsableStoredURLFailsBoundedly)
+	t.Run("RecoveredStoredURLDoesNotClearFailureVerdict", TestRecoveredStoredURLDoesNotClearFailureVerdict)
 }

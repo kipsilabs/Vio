@@ -955,7 +955,7 @@ func (h *PlaybackHandler) resolveVirtualInputURI(
 	if h.VirtualFileLookup != nil {
 		if row, lookupErr := h.VirtualFileLookup(ctx, virtualURI); lookupErr == nil && row != nil {
 			storedRow = row
-			ctx = virtualResolveContextWithPersistedTrust(ctx, row, time.Now(), h.virtualCandidateTrustWindow())
+			ctx = virtualResolveContextWithPersistedTrust(ctx, row, time.Now(), h.virtualCandidateTrustWindow(), h.storedVirtualURLAllowInsecure(row, ownerInstallationID))
 		}
 	}
 	var storedExpiredRow *models.MediaFile

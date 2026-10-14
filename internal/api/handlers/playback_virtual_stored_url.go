@@ -160,6 +160,15 @@ func (h *PlaybackHandler) storedVirtualURLAllowInsecure(row *models.MediaFile, o
 	return h.AllowPrivateStreams(effectiveVirtualOwner(row.VirtualOwnerInstallationID, ownerInstallationID))
 }
 
+// storedVirtualURLAllowInsecure is the StreamHandler counterpart of the playback
+// handler's allow_private_streams reader.
+func (h *StreamHandler) storedVirtualURLAllowInsecure(row *models.MediaFile, ownerInstallationID int) bool {
+	if h == nil || h.AllowPrivateStreams == nil || row == nil {
+		return false
+	}
+	return h.AllowPrivateStreams(effectiveVirtualOwner(row.VirtualOwnerInstallationID, ownerInstallationID))
+}
+
 // persistedVirtualIdentity snapshots a catalog row's durable provider identity
 // for the same-release re-match. It reports false for a legacy row whose
 // identity columns are all NULL, so those keep today's dead-pin behavior with
@@ -336,16 +345,14 @@ func (h *PlaybackHandler) enrichSessionBoundCandidateIdentity(ctx context.Contex
 	importIdentity := needsIdentity && rowHasIdentity
 	importURL := needsURL && rowHasURL
 
-	// Adopting the owning row's identity while the anchor keeps its own URL
-	// would pair an identity with transport evidence of another provenance.
-	// Replace that URL with the owning row's same-provenance URL when it has
-	// one; otherwise the identity cannot be adopted.
-	if importIdentity && anchorHasURL {
-		if rowHasURL {
-			importURL = true
-		} else {
-			importIdentity = false
-		}
+	// An anchor that already carries a stored URL without a durable identity
+	// cannot prove that the owning row describes the same historical release.
+	// On token reuse the owning row may describe a different release under the
+	// same result token. Preserve the anchor's own transport and refuse to adopt
+	// the owning row's identity or URL.
+	if anchorHasURL && !anchorHasIdentity {
+		importIdentity = false
+		importURL = false
 	}
 	// The converse: a URL imported while the anchor keeps an identity the owning
 	// row does not supply has no proven provenance.
@@ -368,10 +375,9 @@ func (h *PlaybackHandler) enrichSessionBoundCandidateIdentity(ctx context.Contex
 		enriched.ResolvedURLExpiresAt = row.ResolvedURLExpiresAt
 		enriched.ProviderRequestHeaders = cloneHeaderMap(row.ProviderRequestHeaders)
 		// Freshness provenance travels with the transport evidence: only the
-		// row that supplied the URL may advance the trust-window clock.
-		if !row.UpdatedAt.IsZero() {
-			enriched.UpdatedAt = row.UpdatedAt
-		}
+		// row that supplied the URL may advance the trust-window clock. A zero
+		// timestamp on the supplier is copied unconditionally and disables trust.
+		enriched.UpdatedAt = row.UpdatedAt
 	}
 	return &enriched
 }
@@ -412,20 +418,25 @@ func virtualResolvedURLExpired(expiresAt time.Time, now time.Time) bool {
 // A durable identity can back a re-serve: the resolver re-identifies the same
 // release under a new result id, and a stored URL or a recorded delivery is its
 // transport proof. Without an identity there is no re-match, so the only usable
-// support is a stored URL that can actually be served now — non-empty and
-// unexpired. A delivery stamp alone proves bytes flowed once, not that a URL can
-// be served, and an expired or empty URL cannot be served, so neither claims
-// resumability. Trust alone never substitutes a sibling: a delisted pin is
-// refused with the trust sentinel and the handler re-serves its stored URL via
-// recoverTrustedStoredVirtualURL, or fails boundedly. A row with no resumable
-// evidence keeps the pre-window refusal/rotation behavior. A zero window
-// likewise leaves the context untouched.
-func virtualResolveContextWithPersistedTrust(ctx context.Context, row *models.MediaFile, now time.Time, window time.Duration) context.Context {
+// support is a stored URL that can actually be served now — non-empty,
+// unexpired, and structurally/SSRF-valid under the same policy recovery applies.
+// A delivery stamp alone proves bytes flowed once, not that a URL can be
+// served, and an expired, empty, or policy-rejected URL cannot be served, so
+// neither claims resumability. Trust alone never substitutes a sibling: a
+// delisted pin is refused with the trust sentinel and the handler re-serves its
+// stored URL via recoverTrustedStoredVirtualURL, or fails boundedly. A row with
+// no resumable evidence keeps the pre-window refusal/rotation behavior. A zero
+// window likewise leaves the context untouched.
+func virtualResolveContextWithPersistedTrust(ctx context.Context, row *models.MediaFile, now time.Time, window time.Duration, allowInsecure ...bool) context.Context {
 	ctx = virtualResolveContextWithPersistedIdentity(ctx, row)
 	if row == nil {
 		return ctx
 	}
-	if !virtualPersistedCandidateHasResumableEvidence(row, now) {
+	insecure := false
+	if len(allowInsecure) > 0 {
+		insecure = allowInsecure[0]
+	}
+	if !virtualPersistedCandidateHasResumableEvidence(ctx, row, now, insecure) {
 		return ctx
 	}
 	if virtualCandidateWithinStoreWindow(row, now, window) {
@@ -437,21 +448,31 @@ func virtualResolveContextWithPersistedTrust(ctx context.Context, row *models.Me
 // virtualPersistedCandidateHasResumableEvidence reports whether a row's
 // persisted state can back a trusted re-serve. A durable identity does (the
 // resolver re-identifies the same release by identity, with a stored URL or a
-// recorded delivery as the transport proof). Without an identity there is no
-// re-match, so the only usable support is a stored URL that can be served now:
-// present and unexpired. A delivery stamp alone and an expired or empty URL do
-// not claim resumability.
-func virtualPersistedCandidateHasResumableEvidence(row *models.MediaFile, now time.Time) bool {
+// recorded delivery as the transport proof; an identity-backed row may retain
+// trust through unusable transport because the provider listing re-resolves it).
+// Without an identity there is no re-match, so the only usable support is a
+// stored URL that can actually be served now: present, unexpired, and passing
+// the same stream URL validation and private-stream policy that recovery applies.
+// A delivery stamp alone and an expired, empty, malformed, or policy-rejected
+// URL do not claim resumability.
+func virtualPersistedCandidateHasResumableEvidence(ctx context.Context, row *models.MediaFile, now time.Time, allowInsecure bool) bool {
 	if row == nil {
 		return false
 	}
 	if _, ok := persistedVirtualIdentity(row); ok {
 		return strings.TrimSpace(row.ResolvedURL) != "" || row.LastDeliveredAt != nil
 	}
-	if strings.TrimSpace(row.ResolvedURL) == "" {
+	storedURL := strings.TrimSpace(row.ResolvedURL)
+	if storedURL == "" {
 		return false
 	}
-	return !virtualStoredURLNeedsSignedRefresh(row, now)
+	if virtualStoredURLNeedsSignedRefresh(row, now) {
+		return false
+	}
+	if _, err := virtuallibrary.ValidateProviderStreamURL(ctx, storedURL, allowInsecure); err != nil {
+		return false
+	}
+	return true
 }
 
 // recoverTrustedStoredVirtualURL is the absent-pin companion of the trust gate:

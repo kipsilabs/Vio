@@ -813,3 +813,11 @@ func TestResolveVirtualInputURLLessDeliveredRowCarriesTrust(t *testing.T) {
 		t.Fatalf("outside the window the resolve trust flag = %v, want [false]", sawTrust)
 	}
 }
+
+// TestStoredUrl provides an umbrella runner matching -run 'StoredUrl'.
+func TestStoredUrl(t *testing.T) {
+	t.Run("EvaluateStoredVirtualURLCandidateTrustWindow", TestEvaluateStoredVirtualURLCandidateTrustWindow)
+	t.Run("ResolveVirtualInputUsesStoredURLWithoutListing", TestResolveVirtualInputUsesStoredURLWithoutListing)
+	t.Run("StreamResolveVirtualInputUsesStoredURLWithoutListing", TestStreamResolveVirtualInputUsesStoredURLWithoutListing)
+	t.Run("FallbackServesPersistedCandidateWithinTrustWindow", TestFallbackServesPersistedCandidateWithinTrustWindow)
+}

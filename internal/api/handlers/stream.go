@@ -1387,7 +1387,7 @@ func (h *StreamHandler) resolveVirtualInputURIExcluding(
 	// re-match needs; a row with none (legacy) is left untouched. Inside the
 	// trust window the row is also marked trusted so a delisted same-identity
 	// candidate is not reported as absent (which would rotate to a sibling).
-	ctx = virtualResolveContextWithPersistedTrust(ctx, file, time.Now(), h.virtualStoredURLTrustWindow())
+	ctx = virtualResolveContextWithPersistedTrust(ctx, file, time.Now(), h.virtualStoredURLTrustWindow(), h.storedVirtualURLAllowInsecure(file, file.VirtualOwnerInstallationID))
 	if resolved.URL == "" {
 		if h.VirtualMediaDetailedResolver != nil {
 			// The caller declares whether excluding the candidate indicted the
