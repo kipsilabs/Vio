@@ -571,11 +571,11 @@ export function VideoPlayer({
   const lastRecoveryRef = useRef(0);
   // Windowed synthetic transcode manifest state. `servedHlsWindowRef` is the
   // media window the loaded playlist can actually serve (null until its level
-  // details arrive, or while a refetch is in flight); the player refetches the
-  // manifest near the window edge and reanchors a seek that falls outside it.
+  // details arrive); the player refetches the manifest near the window edge and
+  // reanchors a seek that falls outside it. `windowReloadAtRef` rate-limits the
+  // refetch, which hls.js would not perform on its own for a VOD playlist.
   const servedHlsWindowRef = useRef<ServedHlsWindow | null>(null);
   const windowReloadAtRef = useRef(0);
-  const windowReloadPendingRef = useRef(false);
   const reportedPlanFailureKeyRef = useRef<string | null>(null);
   // Whether the current transport has shown a frame. A network error after
   // that is a lost connection, not a route that cannot play. Reset whenever
@@ -2748,7 +2748,6 @@ export function VideoPlayer({
             // window that spans the whole title, so neither matters for it.
             hls.on(Hls.Events.LEVEL_LOADED, (_event, data) => {
               if (destroyed) return;
-              windowReloadPendingRef.current = false;
               servedHlsWindowRef.current = servedHlsWindow(data.details);
             });
 
@@ -2766,7 +2765,6 @@ export function VideoPlayer({
             });
 
             servedHlsWindowRef.current = null;
-            windowReloadPendingRef.current = false;
             hls.loadSource(hlsStreamUrl);
             hls.attachMedia(video);
             hlsRef.current = hls;
@@ -2877,18 +2875,17 @@ export function VideoPlayer({
     // Refetches the manifest around the playhead once the listed window runs
     // out. The server recomputes the window from the client's buffered position,
     // and the playlist keeps the absolute media timeline, so resuming at
-    // `video.currentTime` lands on the same media second. A short cool-down and
-    // a pending flag keep a stalled refill from spinning; the next level-loaded
-    // event clears the flag and republishes the window.
+    // `video.currentTime` lands on the same media second. A cool-down between
+    // refetches keeps a stalled refill from spinning; the next level-loaded event
+    // republishes the window.
     const reloadHlsWindow = (): boolean => {
       const hls = hlsRef.current;
-      if (!hls || windowReloadPendingRef.current) return false;
+      if (!hls) return false;
       const playlistUrl = hls.url;
       if (!playlistUrl) return false;
       const now = Date.now();
       if (now - windowReloadAtRef.current < WINDOWED_MANIFEST_RELOAD_MIN_INTERVAL_MS) return false;
       windowReloadAtRef.current = now;
-      windowReloadPendingRef.current = true;
       hls.config.startPosition = video.currentTime;
       hls.loadSource(playlistUrl);
       return true;

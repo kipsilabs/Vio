@@ -3035,6 +3035,33 @@ describe("VideoPlayer HLS buffer policy", () => {
     expect(video.currentTime).toBe(450);
   });
 
+  it("refetches a windowed manifest as the playhead nears its edge", async () => {
+    const { container } = renderPlayer({ plan: hlsPlan(), shouldAutoPlay: false });
+    await waitFor(() => expect(hlsJS.constructed).toHaveBeenCalledOnce());
+    const video = container.querySelector("video");
+    if (!video) throw new Error("expected video element");
+
+    // The playlist ends at 470 s but the title runs to 3600 s, so the element
+    // will stop at the edge unless the player fetches a fresh window.
+    hlsJS.latest!.emit("levelLoaded", {
+      details: {
+        live: false,
+        edge: 470,
+        fragments: [{ gap: true, start: 0 }, { start: 400 }, { start: 402 }],
+      },
+    });
+    hlsJS.loadSource.mockClear();
+    Object.defineProperty(video, "paused", { configurable: true, get: () => false });
+    Object.defineProperty(video, "seeking", { configurable: true, get: () => false });
+    video.currentTime = 455;
+
+    fireEvent.timeUpdate(video);
+
+    expect(hlsJS.loadSource).toHaveBeenCalledTimes(1);
+    expect(hlsJS.loadSource).toHaveBeenCalledWith(hlsJS.latest!.url);
+    expect(hlsJS.latest!.config?.startPosition).toBe(455);
+  });
+
   it("retargets the forward prefetch between stable play and seeking or pause", async () => {
     const { container } = renderPlayer({ plan: hlsPlan() });
     await waitFor(() => expect(hlsJS.constructed).toHaveBeenCalledOnce());
