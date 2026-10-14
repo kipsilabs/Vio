@@ -28,6 +28,13 @@ export const WINDOWED_MANIFEST_RELOAD_AHEAD_SECONDS = 20;
 export const WINDOWED_MANIFEST_RELOAD_MIN_INTERVAL_MS = 10_000;
 
 /**
+ * Slack, in seconds, on the served window's bounds when deciding whether a seek
+ * target is locally serveable. It absorbs the float arithmetic in EXTINF sums
+ * without admitting a genuinely out-of-window target.
+ */
+export const SERVED_WINDOW_BOUNDS_SLACK_SECONDS = 0.5;
+
+/**
  * Adds the windowed-manifest opt-in to an HLS stream URL. The parameter is
  * additive and idempotent; an empty URL is returned untouched.
  */
@@ -89,14 +96,19 @@ export function shouldAdvanceHlsWindow(
 }
 
 /**
- * Whether a native seek target can be served locally. A target below the served
- * window's start is inside the playlist's seekable range only because of the gap
- * prefix, and cannot be loaded: it must reanchor.
+ * Whether a seek target can be served locally. A target below the served
+ * window's start is inside the playlist's seekable range only because of the
+ * gap prefix and cannot be loaded; a target past the window's end is not listed
+ * at all. Both must reanchor, even though the plan may report
+ * `can_seek_anywhere` for its whole-title manifest.
  */
 export function hlsTargetWithinServedWindow(
   window: ServedHlsWindow | null,
   targetSeconds: number,
 ): boolean {
   if (!window) return true;
-  return targetSeconds >= window.start;
+  return (
+    targetSeconds >= window.start - SERVED_WINDOW_BOUNDS_SLACK_SECONDS &&
+    targetSeconds <= window.end + SERVED_WINDOW_BOUNDS_SLACK_SECONDS
+  );
 }

@@ -90,10 +90,11 @@ describe("shouldAdvanceHlsWindow", () => {
 });
 
 describe("hlsTargetWithinServedWindow", () => {
-  it("allows a target at or after the served window start", () => {
+  it("allows a target inside the served window", () => {
     const window = { start: 400, end: 470, live: false };
     expect(hlsTargetWithinServedWindow(window, 400)).toBe(true);
-    expect(hlsTargetWithinServedWindow(window, 900)).toBe(true);
+    expect(hlsTargetWithinServedWindow(window, 450)).toBe(true);
+    expect(hlsTargetWithinServedWindow(window, 470)).toBe(true);
   });
 
   it("refuses a target inside the omitted gap prefix", () => {
@@ -101,7 +102,13 @@ describe("hlsTargetWithinServedWindow", () => {
     expect(hlsTargetWithinServedWindow(window, 399)).toBe(false);
   });
 
+  it("refuses a forward target past the listed window", () => {
+    const window = { start: 400, end: 470, live: false };
+    expect(hlsTargetWithinServedWindow(window, 600)).toBe(false);
+  });
+
   it("allows any target when no window is known", () => {
     expect(hlsTargetWithinServedWindow(null, 0)).toBe(true);
+    expect(hlsTargetWithinServedWindow(null, 10_000)).toBe(true);
   });
 });

@@ -3014,6 +3014,27 @@ describe("VideoPlayer HLS buffer policy", () => {
     expect(video.currentTime).not.toBe(100);
   });
 
+  it("reanchors a forward seek past the listed window", async () => {
+    const onReanchorSeek = vi.fn(() => true);
+    const { container } = renderPlayer({ plan: hlsPlan(), onReanchorSeek, shouldAutoPlay: false });
+    await waitFor(() => expect(hlsJS.constructed).toHaveBeenCalledOnce());
+    const video = container.querySelector("video");
+    if (!video) throw new Error("expected video element");
+
+    hlsJS.latest!.emit("levelLoaded", {
+      details: {
+        live: false,
+        edge: 470,
+        fragments: [{ gap: true, start: 0 }, { start: 400 }, { start: 402 }],
+      },
+    });
+
+    act(() => controls.current!.onSeek(900));
+
+    expect(onReanchorSeek).toHaveBeenCalledWith(900);
+    expect(video.currentTime).not.toBe(900);
+  });
+
   it("keeps a seek inside the served window local", async () => {
     const onReanchorSeek = vi.fn(() => true);
     const { container } = renderPlayer({ plan: hlsPlan(), onReanchorSeek, shouldAutoPlay: false });
