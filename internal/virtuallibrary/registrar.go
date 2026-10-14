@@ -69,26 +69,49 @@ func (r *catalogMonitorRegistrar) Register(ctx context.Context, item monitor.Mon
 		libraryIDStr = strconv.Itoa(folderID)
 	}
 
-	in := catalog.VirtualMedia{
+	_, err := r.registrar.Upsert(ctx, virtualMediaRegistration(item, libraryIDStr))
+	return err
+}
+
+// virtualMediaRegistration maps a monitored item onto the catalog payload.
+//
+// Metadata providers can return surrounding whitespace in titles, overviews,
+// artwork paths, and genres. The catalog validator rejects those values
+// (ErrInvalidVirtualMedia, "must not have surrounding whitespace"), so clean
+// them here — the boundary between provider data and the strict validator —
+// instead of relaxing validation.
+func virtualMediaRegistration(item monitor.MonitoredMedia, libraryID string) catalog.VirtualMedia {
+	return catalog.VirtualMedia{
 		MediaType:      item.MediaType,
-		LibraryID:      libraryIDStr,
+		LibraryID:      libraryID,
 		IMDbID:         item.IMDbID,
 		TMDBID:         item.TMDBID,
 		TVDBID:         item.TVDBID,
-		Title:          item.Title,
+		Title:          strings.TrimSpace(item.Title),
 		Year:           int(item.Year),
-		Overview:       item.Overview,
-		PosterPath:     item.Poster,
-		BackdropPath:   item.Backdrop,
-		Genres:         item.Genres,
+		Overview:       strings.TrimSpace(item.Overview),
+		PosterPath:     strings.TrimSpace(item.Poster),
+		BackdropPath:   strings.TrimSpace(item.Backdrop),
+		Genres:         trimVirtualStrings(item.Genres),
 		RuntimeMinutes: item.Runtime,
-		Source:         item.SourceKey,
+		Source:         strings.TrimSpace(item.SourceKey),
 		VirtualURI:     virtualURIForMonitored(item),
 		Episodes:       monitoredEpisodePayload(item),
 		Variants:       make([]catalog.VirtualMediaVariant, 0),
 	}
-	_, err := r.registrar.Upsert(ctx, in)
-	return err
+}
+
+// trimVirtualStrings trims each element while preserving nil-vs-empty so the
+// payload shape is unchanged for callers that distinguish the two.
+func trimVirtualStrings(values []string) []string {
+	if values == nil {
+		return nil
+	}
+	trimmed := make([]string, len(values))
+	for i, value := range values {
+		trimmed[i] = strings.TrimSpace(value)
+	}
+	return trimmed
 }
 
 // monitoredEpisodePayload maps monitor episodes onto the catalog payload.
@@ -98,6 +121,10 @@ func (r *catalogMonitorRegistrar) Register(ctx context.Context, item monitor.Mon
 // a single special must not fail the whole series registration, so specials are
 // omitted here. Genuinely malformed input (a negative season, a missing field)
 // is intentionally preserved so catalog validation still rejects it.
+//
+// Provider text fields are trimmed here for the same reason as the series-level
+// fields in virtualMediaRegistration: the catalog validator rejects surrounding
+// whitespace and must stay strict.
 func monitoredEpisodePayload(item monitor.MonitoredMedia) []catalog.VirtualEpisode {
 	episodes := make([]catalog.VirtualEpisode, 0, len(item.Episodes))
 	for _, episode := range item.Episodes {
@@ -107,9 +134,9 @@ func monitoredEpisodePayload(item monitor.MonitoredMedia) []catalog.VirtualEpiso
 		episodes = append(episodes, catalog.VirtualEpisode{
 			SeasonNumber:   episode.Season,
 			EpisodeNumber:  episode.Episode,
-			Title:          episode.Title,
-			Overview:       episode.Overview,
-			StillPath:      episode.Thumbnail,
+			Title:          strings.TrimSpace(episode.Title),
+			Overview:       strings.TrimSpace(episode.Overview),
+			StillPath:      strings.TrimSpace(episode.Thumbnail),
 			AirDate:        episode.Released,
 			RuntimeMinutes: episode.Runtime,
 			VirtualURI:     virtualEpisodeURI(item, episode),
