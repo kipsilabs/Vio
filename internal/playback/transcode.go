@@ -450,9 +450,11 @@ const (
 	syntheticManifestWindowCapacity = syntheticManifestWindowBackSegments + syntheticManifestWindowAheadSegments
 	// syntheticManifestMaxGapEntries bounds the number of EXT-X-GAP entries
 	// that carry the omitted prefix. Each covers an equal slice of the prefix,
-	// so a longer title grows the advertised target duration rather than the
-	// entry count.
-	syntheticManifestMaxGapEntries = 128
+	// so a longer title grows each gap's EXTINF (and the advertised target
+	// duration) rather than the entry count. Only an hls.js client consumes a
+	// windowed playlist, and hls.js does not read the target duration of a VOD
+	// playlist, so a coarse gap run is cheaper than a fine one.
+	syntheticManifestMaxGapEntries = 32
 )
 
 // Large synthetic playlists used to repeat the full access and reconstruction

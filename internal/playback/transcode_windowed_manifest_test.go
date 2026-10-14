@@ -1,6 +1,7 @@
 package playback
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -67,7 +68,7 @@ func TestGenerateWindowedManifestCarriesAbsoluteTimelineWithGapPrefix(t *testing
 	if strings.Contains(got, "seg_00140.ts") {
 		t.Fatalf("windowed manifest listed a segment after the window:\n%s", got)
 	}
-	if prefix := manifestGapPrefixSeconds(t, got); prefix != 200 {
+	if prefix := manifestGapPrefixSeconds(t, got); math.Abs(prefix-200) > 0.01 {
 		t.Fatalf("gap prefix = %v s, want 200 (windowStart * segmentDuration)", prefix)
 	}
 	if len(got) >= 16*1024 {
@@ -94,7 +95,7 @@ func TestGenerateWindowedManifestBoundsGapEntriesForALongTitle(t *testing.T) {
 	if gaps > syntheticManifestMaxGapEntries {
 		t.Fatalf("gap entries = %d, want at most %d", gaps, syntheticManifestMaxGapEntries)
 	}
-	if prefix := manifestGapPrefixSeconds(t, got); prefix != 17000*2 {
+	if prefix := manifestGapPrefixSeconds(t, got); math.Abs(prefix-17000*2) > 0.01 {
 		t.Fatalf("gap prefix = %v s, want %d", prefix, 17000*2)
 	}
 	if len(got) > 24*1024 {
