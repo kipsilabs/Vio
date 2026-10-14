@@ -21,13 +21,21 @@ const controls = vi.hoisted(() => ({
 const hlsJS = vi.hoisted(() => ({
   latest: null as null | { emit: (event: string, data: unknown) => void },
 }));
+// Captures the progress sampler's gone-session callback so a test can drive a
+// mid-stream eviction the way the real sampler reports one.
+const progressOptions = vi.hoisted(() => ({
+  current: null as null | { onSessionLost?: () => void },
+}));
 
 vi.mock("sonner", () => ({ toast: { error: vi.fn(), success: vi.fn(), message: vi.fn() } }));
 vi.mock("../hooks/usePlaybackRealtime", () => ({
   usePlaybackRealtime: () => ({ connectionState: "connected" }),
 }));
 vi.mock("../hooks/useWatchProgress", () => ({
-  useWatchProgress: () => vi.fn().mockResolvedValue(undefined),
+  useWatchProgress: (...args: unknown[]) => {
+    progressOptions.current = { onSessionLost: args[3] as (() => void) | undefined };
+    return vi.fn().mockResolvedValue(undefined);
+  },
 }));
 vi.mock("../hooks/useKeyboardShortcuts", () => ({ useKeyboardShortcuts: vi.fn() }));
 vi.mock("../hooks/useSubtitleTracks", () => ({ useSubtitleTracks: () => [] }));
@@ -265,6 +273,7 @@ beforeEach(() => {
   sessionRef.current = null;
   controls.current = null;
   hlsJS.latest = null;
+  progressOptions.current = null;
   vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
   vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
   vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => {});
@@ -449,5 +458,38 @@ describe("VideoPlayer with the playback session: reconnect", () => {
     expect(sessionRef.current?.connectionStatus).toBe("connected");
     expect(sessionRef.current?.error).toBeNull();
     expect(sessionRef.current?.initialSubtitleErrorTitle).toBe("That subtitle track can't be used");
+  });
+
+  it("restarts a mid-stream eviction at the current position", async () => {
+    const requests = stubServer({
+      start: (_body, count) =>
+        count === 1
+          ? jsonResponse(playable("session-1", directPlan()), 201)
+          : jsonResponse(
+              playable(
+                "session-2",
+                directPlan({ session_id: "session-2", plan_id: "plan:session-2" }),
+              ),
+              201,
+            ),
+      // The old session is gone: the reconnect's replan cannot succeed, so it
+      // falls through to a fresh start.
+      replan: () => jsonResponse({ error: "playback_session_not_found" }, 404),
+    });
+
+    renderHarness();
+    const video = await startWatching();
+
+    // The server evicts the session while the viewer is at 321.5s.
+    video.currentTime = 321.5;
+    act(() => progressOptions.current?.onSessionLost?.());
+
+    await waitFor(() => expect(sessionRef.current?.sessionId).toBe("session-2"), {
+      timeout: 4_000,
+    });
+    // The restart preserves the viewer's place, and playback resumes.
+    expect(requests.starts[1]?.start_position).toBe(321.5);
+    expect(sessionRef.current?.connectionStatus).toBe("connected");
+    expect(sessionRef.current?.shouldAutoPlay).toBe(true);
   });
 });

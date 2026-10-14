@@ -77,3 +77,63 @@ it("keeps polling through a transient progress failure", async () => {
   expect(mocks.send).toHaveBeenCalledTimes(3);
   expect(onSessionLost).not.toHaveBeenCalled();
 });
+
+it("ignores a gone answer from a session the effect has left", async () => {
+  vi.useFakeTimers();
+  let rejectA: ((error: unknown) => void) | undefined;
+  mocks.send.mockImplementationOnce(
+    () =>
+      new Promise((_resolve, reject) => {
+        rejectA = reject;
+      }),
+  );
+  const lostA = vi.fn();
+  const lostB = vi.fn();
+  const { rerender } = renderHook(
+    ({ id, onLost }: { id: string; onLost: () => void }) =>
+      useWatchProgress(id, videoRef, undefined, onLost),
+    { wrapper, initialProps: { id: "session-a", onLost: lostA } },
+  );
+
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(10_000);
+  });
+  expect(mocks.send).toHaveBeenCalledTimes(1);
+
+  // The player moves on to a new session; the old sampler is disposed.
+  rerender({ id: "session-b", onLost: lostB });
+  await act(async () => {
+    await Promise.resolve();
+  });
+
+  // Session A's sample answers 404 only after B replaced it.
+  await act(async () => {
+    rejectA?.(new PlayerFetchError(404, "Playback session not found.", "not_found"));
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+
+  expect(lostA).not.toHaveBeenCalled();
+  expect(lostB).not.toHaveBeenCalled();
+});
+
+it("leaves no interval armed once progress answers the session is gone", async () => {
+  vi.useFakeTimers();
+  mocks.send.mockRejectedValue(
+    new PlayerFetchError(404, "Playback session not found.", "not_found"),
+  );
+  const onSessionLost = vi.fn();
+  renderHook(() => useWatchProgress("session", videoRef, undefined, onSessionLost), { wrapper });
+
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(10_000);
+  });
+  expect(onSessionLost).toHaveBeenCalledTimes(1);
+  expect(vi.getTimerCount()).toBe(0);
+
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(60_000);
+  });
+  expect(mocks.send).toHaveBeenCalledTimes(1);
+  expect(onSessionLost).toHaveBeenCalledTimes(1);
+});
