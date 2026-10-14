@@ -1423,33 +1423,19 @@ export function VideoPlayer({
       }
 
       // A windowed transcode playlist is seekable across the whole media
-      // timeline, but its omitted prefix is only EXT-X-GAP placeholders. A
-      // target there is inside `video.seekable` yet has no real segment to load,
-      // and hls.js would silently skip forward to the window start. Route it
-      // through the reanchor path like any other out-of-window target.
+      // timeline, but its omitted prefix is only EXT-X-GAP placeholders and its
+      // end is short of the title. A target in either region has no real segment
+      // to load — hls.js would silently skip forward to the window start or stall
+      // at the end — so it is treated as an out-of-window target and routed
+      // through the reanchor path below.
       const servedWindow = servedHlsWindowRef.current;
-      if (isHlsStream && !hlsTargetWithinServedWindow(servedWindow, nativeSeconds)) {
-        if (!onReanchorSeek) return false;
-        rememberPendingSeek(seconds);
-        setCurrentTime(seconds);
-        const accepted = onReanchorSeek(seconds);
-        if (typeof accepted === "boolean") {
-          if (!accepted) releasePendingSeek(seconds);
-          return accepted;
-        }
-        return accepted.then(
-          (ok) => {
-            if (!ok) releasePendingSeek(seconds);
-            return ok;
-          },
-          (error: unknown) => {
-            releasePendingSeek(seconds);
-            throw error;
-          },
-        );
-      }
+      const outsideServedWindow =
+        isHlsStream && !hlsTargetWithinServedWindow(servedWindow, nativeSeconds);
 
-      if (canSeekAnywhere || isNativePositionInRanges(video.seekable, nativeSeconds)) {
+      if (
+        !outsideServedWindow &&
+        (canSeekAnywhere || isNativePositionInRanges(video.seekable, nativeSeconds))
+      ) {
         rememberPendingSeek(seconds);
         setCurrentTime(seconds);
         if (isHlsStream) video.currentTime = nativeSeconds;

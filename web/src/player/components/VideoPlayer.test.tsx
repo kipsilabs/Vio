@@ -64,7 +64,11 @@ const hlsJS = vi.hoisted(() => ({
   loadSource: vi.fn(),
   errorHandler: null as null | ((event: unknown, data: unknown) => void),
   stopLoad: vi.fn(),
-  latest: null as null | { emit: (event: string, data: unknown) => void },
+  latest: null as null | {
+    emit: (event: string, data: unknown) => void;
+    url: string | null;
+    config?: { maxBufferLength?: number; startPosition?: number; maxBufferSize?: number };
+  },
   bufferAppendedHandler: null as null | ((event: unknown, data?: unknown) => void),
 }));
 // Captures the onSourceChanged handlers the mocked subtitle hooks receive, so
