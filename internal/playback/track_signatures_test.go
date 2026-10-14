@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/userstore"
 )
 
 // TestRemapAudioSelectionIndexReidentifiesCommittedTrack pins the overlay-swap
@@ -189,4 +190,46 @@ func withEmbeddedTitle(track models.AudioTrack, title string) models.AudioTrack 
 func withLanguages(track models.AudioTrack, languages ...string) models.AudioTrack {
 	track.Languages = languages
 	return track
+}
+
+// TestClientAudioSignatureMatchesTrackWildcards pins the presence-check
+// semantics: a client/start signature constrains only the members it actually
+// carried, so a partial snapshot matches a richer probed track instead of being
+// falsely reported gone. The strict re-identification matchers are separate and
+// keep failing closed (see the remap tests above).
+func TestClientAudioSignatureMatchesTrackWildcards(t *testing.T) {
+	rich := models.AudioTrack{
+		Index: 0, Language: "ja", Codec: "aac", Channels: 2, Layout: "stereo",
+		Title: "[Erai-raws]_AAC_CR", EmbeddedTitle: "[Erai-raws]_AAC_CR", Default: true,
+	}
+	partial := &userstore.AudioTrackSignature{Codec: "aac", Channels: 2}
+	if !ClientAudioSignatureMatchesTrack(rich, partial) {
+		t.Fatal("a codec+channels signature must match a richer track that agrees on both")
+	}
+	// Every named member still has to agree.
+	for name, sig := range map[string]*userstore.AudioTrackSignature{
+		"wrong codec":      {Codec: "eac3", Channels: 2},
+		"wrong channels":   {Codec: "aac", Channels: 6},
+		"wrong language":   {Language: "en", Codec: "aac", Channels: 2},
+		"wrong layout":     {Codec: "aac", Channels: 2, Layout: "5.1"},
+		"wrong title":      {Codec: "aac", Channels: 2, Title: "commentary"},
+		"wrong multi list": {Codec: "aac", Channels: 2, Languages: []string{"en"}},
+	} {
+		if ClientAudioSignatureMatchesTrack(rich, sig) {
+			t.Fatalf("%s must not match the probed track", name)
+		}
+	}
+	// A fully populated signature reduces to strict member equality.
+	if !ClientAudioSignatureMatchesTrack(rich, AudioTrackSignatureFromTrack(rich)) {
+		t.Fatal("the track's own full signature must match it")
+	}
+	// A placeholder track (index/default only) has nothing comparable and must
+	// not refute the selection.
+	placeholder := models.AudioTrack{Index: -1, Default: true}
+	if !ClientAudioSignatureMatchesTrack(placeholder, partial) {
+		t.Fatal("a placeholder track must never refute a selection")
+	}
+	if !ClientAudioSignatureMatchesTrack(rich, nil) || !ClientAudioSignatureMatchesTrack(rich, &userstore.AudioTrackSignature{}) {
+		t.Fatal("a nil or zero signature carries no constraint")
+	}
 }

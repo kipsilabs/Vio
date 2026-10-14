@@ -27,6 +27,57 @@ func AudioTrackSignatureFromTrack(track models.AudioTrack) *userstore.AudioTrack
 	return sig
 }
 
+// ClientAudioSignatureMatchesTrack reports whether an audio track signature a
+// client named (or the start-time snapshot persisted) is consistent with one
+// probed track. Unlike the strict track-vs-track comparison
+// (audioTrackMatchesSignature, matchExactAudioTrack), every member the caller
+// left empty is a wildcard: /api/v2 documents each AudioTrackSignature member
+// as optional and absent as equal to its zero value, so a signature that names
+// only codec and channels still identifies a probed track that also reports a
+// language, title, layout and default flag.
+//
+// A probed track with no identifying fields at all (a provider placeholder, or
+// a row that carries only a synthetic index and default flag) has nothing to
+// compare, so it cannot refute the selection: the caller must treat the
+// inventory as uninformative rather than absent. A fully populated signature
+// reduces to the same member-by-member equality a strict comparison makes.
+//
+// This is deliberately a separate entry point: the exact matchers still fail
+// closed on ambiguity for probe-derived re-identification (see
+// remapAudioSelectionIndex), while a client/start signature is only ever
+// checked for presence, never used to pick among several streams.
+func ClientAudioSignatureMatchesTrack(track models.AudioTrack, sig *userstore.AudioTrackSignature) bool {
+	if sig == nil || sig.IsZero() {
+		return true
+	}
+	candidate := AudioTrackSignatureFromTrack(track)
+	if candidate == nil {
+		return true
+	}
+	if sig.Language != "" && !trackStringEqual(sig.Language, candidate.Language) {
+		return false
+	}
+	if sig.Title != "" && !trackStringEqual(sig.Title, candidate.Title) {
+		return false
+	}
+	if sig.EmbeddedTitle != "" && !trackStringEqual(sig.EmbeddedTitle, candidate.EmbeddedTitle) {
+		return false
+	}
+	if sig.Codec != "" && !trackStringEqual(sig.Codec, candidate.Codec) {
+		return false
+	}
+	if sig.Layout != "" && !trackStringEqual(sig.Layout, candidate.Layout) {
+		return false
+	}
+	if sig.Channels != 0 && sig.Channels != candidate.Channels {
+		return false
+	}
+	if len(sig.Languages) > 0 && !languagesEqualMultiset(sortedLanguages(sig.Languages), candidate.Languages) {
+		return false
+	}
+	return true
+}
+
 // sortedLanguages returns a sorted, canonicalized copy of a track's MULTi
 // language list so signatures compare as multisets regardless of the order a
 // container listed them in. Empty/undecodable entries are dropped.
