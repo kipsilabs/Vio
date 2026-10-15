@@ -267,6 +267,13 @@ interface VideoPlayerProps {
    * lost state directly.
    */
   onSessionLost?: () => void;
+  /**
+   * A session-scoped call answered that the session is gone while a reconnect
+   * was already running. The reconnect is the recovery, but the server has
+   * confirmed the session it is rebuilding no longer exists, so run its next
+   * attempt now instead of waiting out the backoff.
+   */
+  onExpediteReconnect?: () => void;
   /** The session's mid-stream connection state. */
   connectionStatus?: PlaybackConnectionStatus;
   /** Why reconnecting gave up, while `connectionStatus` is `lost`. */
@@ -495,6 +502,7 @@ export function VideoPlayer({
   onConnectionLost,
   onRetryConnection,
   onSessionLost,
+  onExpediteReconnect,
   connectionStatus = "connected",
   connectionErrorTitle = null,
   connectionError = null,
@@ -861,15 +869,22 @@ export function VideoPlayer({
 
   const onSessionLostRef = useRef(onSessionLost);
   onSessionLostRef.current = onSessionLost;
+  const onExpediteReconnectRef = useRef(onExpediteReconnect);
+  onExpediteReconnectRef.current = onExpediteReconnect;
 
   /**
    * Both the control-socket ticket mint and the progress sampler can answer
    * that the session is gone in the same tick. React batches the reconnect
    * state change, so `connectionStatusRef` cannot separate them on its own:
    * report a given session's disappearance once. A fresh `connected` status
-   * re-arms it, since a recovery that lands can drop again later.
+   * re-arms it, since a recovery that lands can drop again later, and a new
+   * session id re-arms it unconditionally — it is a different session whose
+   * disappearance must be reported even when the status never left `connected`.
    */
   const sessionGoneReportedRef = useRef(false);
+  useEffect(() => {
+    sessionGoneReportedRef.current = false;
+  }, [sessionId]);
   useEffect(() => {
     if (connectionStatus === "connected") sessionGoneReportedRef.current = false;
   }, [connectionStatus]);
@@ -879,11 +894,20 @@ export function VideoPlayer({
    * sample) answered that the session no longer exists. Route it through the
    * one recovery the player has — the reconnect restarts at the same position
    * — and fall through to the lost state when nothing has played to reposition.
+   *
+   * A reconnect may already be running from an earlier network drop. The
+   * server has now confirmed the session it is rebuilding is gone, so run its
+   * next attempt immediately instead of waiting out the backoff: the attempt
+   * that follows replaces the dead session with a fresh start.
    */
   const handleSessionGone = useCallback(() => {
     if (sessionGoneReportedRef.current) return;
     sessionGoneReportedRef.current = true;
-    if (!reportConnectionLostRef.current()) onSessionLostRef.current?.();
+    if (reportConnectionLostRef.current()) {
+      if (connectionStatusRef.current === "reconnecting") onExpediteReconnectRef.current?.();
+      return;
+    }
+    onSessionLostRef.current?.();
   }, []);
 
   // While the session reconnects, nothing plays: the element is paused (so

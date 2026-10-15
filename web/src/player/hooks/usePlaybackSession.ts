@@ -577,6 +577,12 @@ export interface UsePlaybackSessionResult extends PlaybackSessionState {
   /** Starts a fresh reconnect cycle after the previous one gave up. */
   retryConnection: () => void;
   /**
+   * Runs the reconnect's next attempt immediately when a session-scoped call
+   * confirmed the session it is rebuilding is gone. No-op unless a reconnect
+   * is active with its backoff timer armed.
+   */
+  expediteReconnect: () => void;
+  /**
    * Enters the lost state for a session the server no longer has when the
    * reconnect cannot run (no played stream to reposition).
    */
@@ -2734,6 +2740,18 @@ export function usePlaybackSession(
   }, [beginReconnect]);
 
   /**
+   * A session-scoped call confirmed the session the reconnect is rebuilding is
+   * gone. The reconnect replaces a dead session with a fresh start, so run its
+   * pending attempt now rather than letting the viewer wait out the backoff.
+   * Only a timer-armed cycle is nudged: an attempt already in flight is
+   * already doing the work, and there is nothing to hurry.
+   */
+  const expediteReconnect = useCallback(() => {
+    const reconnect = reconnectRef.current;
+    if (reconnect.active && reconnect.timer !== null) scheduleReconnectAttempt(0);
+  }, [scheduleReconnectAttempt]);
+
+  /**
    * Enters the lost state for a session the server has already answered that
    * it no longer has, when the reconnect cannot run (nothing has played yet,
    * so there is no position or transport to rebuild). Whenever a played stream
@@ -3795,6 +3813,7 @@ export function usePlaybackSession(
     recoverFromFailure,
     recoverConnection,
     retryConnection,
+    expediteReconnect,
     reportSessionLost,
     invalidatePlan,
     reanchorSeek,

@@ -8904,6 +8904,27 @@ describe("usePlaybackSession mid-stream reconnect", () => {
     rendered.unmount();
   });
 
+  it("runs the reconnect's pending attempt immediately when a gone session is reported", async () => {
+    const harness = reconnectHarness({ replan: () => unreachable() });
+    const { result, unmount } = await startPlaying();
+
+    // A network drop starts the reconnect and arms its first backoff.
+    act(() => result.current.recoverConnection(100, true));
+    expect(result.current.connectionStatus).toBe("reconnecting");
+    expect(harness.replanBodies).toHaveLength(0);
+
+    // A session-scoped call answers that the session is gone while the backoff
+    // is still armed. The reconnect replaces a dead session with a fresh start,
+    // so its next attempt must run now rather than wait out the delay.
+    act(() => result.current.expediteReconnect());
+    await advance(0);
+
+    expect(harness.replanBodies).toHaveLength(1);
+    expect(result.current.connectionStatus).toBe("reconnecting");
+
+    unmount();
+  });
+
   it("starts a new session when the server's installation changed", async () => {
     let restarts = 0;
     const harness = reconnectHarness({

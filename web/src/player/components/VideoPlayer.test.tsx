@@ -5805,6 +5805,49 @@ describe("VideoPlayer lost connection", () => {
     expect(onSessionLost).not.toHaveBeenCalled();
   });
 
+  it("re-arms the gone report when the session id changes", () => {
+    const onConnectionLost = vi.fn();
+    const onSessionLost = vi.fn();
+    const { rerenderPlayer } = renderPlayer({ onConnectionLost, onSessionLost });
+
+    // Nothing played, so the first gone report goes straight to the lost state.
+    act(() => realtimeOptions.current?.onSessionLost?.());
+    expect(onSessionLost).toHaveBeenCalledOnce();
+
+    // A new session id is a different session: its disappearance must report
+    // even though the connection status prop never left "connected".
+    rerenderPlayer({ sessionId: "session-2" });
+    act(() => realtimeOptions.current?.onSessionLost?.());
+
+    expect(onSessionLost).toHaveBeenCalledTimes(2);
+  });
+
+  it("expedites a reconnect already in flight when the session is gone", () => {
+    const onConnectionLost = vi.fn();
+    const onExpediteReconnect = vi.fn();
+    const onSessionLost = vi.fn();
+    const { container, rerenderPlayer } = renderPlayer({
+      onConnectionLost,
+      onExpediteReconnect,
+      onSessionLost,
+    });
+    const video = container.querySelector("video");
+    if (!video) throw new Error("expected video element");
+    fireFrameTimeUpdate(video);
+    Object.defineProperty(video, "paused", { configurable: true, value: false });
+
+    // A network drop already started the reconnect; no session-gone report has
+    // run yet, so the latch is still armed.
+    rerenderPlayer({ connectionStatus: "reconnecting" });
+    act(() => progressOptions.current?.onSessionLost?.());
+
+    // The reconnect is the recovery, so it is not restarted, but a dead session
+    // must not make the viewer wait out the backoff.
+    expect(onConnectionLost).not.toHaveBeenCalled();
+    expect(onExpediteReconnect).toHaveBeenCalledOnce();
+    expect(onSessionLost).not.toHaveBeenCalled();
+  });
+
   it("sends a replacement transport's network error before its first frame to route recovery", () => {
     const onConnectionLost = vi.fn();
     const onPlanFailure = vi.fn();
