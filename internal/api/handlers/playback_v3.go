@@ -8628,7 +8628,10 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				// re-selects within the release already playing. The running
 				// plan's validated source descriptor is the carried probe
 				// evidence for exactly these bytes, so prefer it over the
-				// unprobed row. Only gaps are filled.
+				// unprobed row. Only gaps are filled. The provenance gate that
+				// admitted carryPinnedCandidate is what makes the descriptor
+				// current for these bytes; the carry itself can only compare
+				// row ids, never bytes.
 				carried = carryValidatedVirtualVideoEvidenceV3(carried, record.CurrentPlan.Source)
 				currentEffectiveFile = carried
 			} else {
@@ -11370,9 +11373,21 @@ func virtualPinnedProfileRowV3(session *playback.Session, row *models.MediaFile)
 // source_metadata_incomplete on metadata the running plan already validated —
 // the menu click and the unbuffered seek that appear inert. The plan's source
 // descriptor is the carried probe evidence for exactly these bytes, so it is
-// preferred over the unprobed row. Only gaps are filled, and only when the
-// descriptor names the same row, so a row that already carries complete
-// evidence (or a descriptor for another row) is left untouched.
+// preferred over the unprobed row.
+//
+// Caller contract (precondition): the caller must already have established
+// against the session's retained provenance that the descriptor describes the
+// bytes this row now binds — see sessionProvenanceMatchesPinnedRowV3 and the
+// carryPinnedCandidate gate. Identity here is only the descriptor's
+// MediaFileID: a virtual catalog row can be re-probed in place under the same
+// id for different bytes, so row-id equality does not by itself prove the
+// descriptor is current. This function trusts the caller's provenance gate and
+// must never be invoked on a row whose staleness has not been ruled out.
+//
+// Only gaps are filled, and only when the descriptor names the same row and
+// agrees on the codec, so a row that already carries complete evidence, a
+// descriptor for another row, or a row whose declared codec conflicts with the
+// descriptor is left untouched.
 func carryValidatedVirtualVideoEvidenceV3(file *models.MediaFile, source playback.SourceDescriptorV3) *models.MediaFile {
 	if file == nil || !isVirtualPlaybackFile(file) {
 		return file
@@ -11385,6 +11400,14 @@ func carryValidatedVirtualVideoEvidenceV3(file *models.MediaFile, source playbac
 		source.FrameRate <= 0 || source.BitrateKbps <= 0 {
 		return file
 	}
+	// Never mix a row's declared codec with descriptor evidence for a different
+	// one. A row that declares h264 while the running plan validated hevc must
+	// not receive the descriptor's geometry: that is franken-evidence the
+	// planner would route against. Agreement uses the planner's own
+	// normalization, so "h265"/"hevc" and "h264"/"avc" compare equal.
+	if !virtualCodecAgreesV3(file, source.VideoCodec) {
+		return file
+	}
 	carried := *file
 	if carried.CodecVideo == "" {
 		carried.CodecVideo = source.VideoCodec
@@ -11395,15 +11418,83 @@ func carryValidatedVirtualVideoEvidenceV3(file *models.MediaFile, source playbac
 		}
 	}
 	if carried.Bitrate == 0 {
+		// MediaFile.Bitrate is the probe's kbps figure (scanner/probe.go stores
+		// ffprobe bit_rate/1000), the same unit as
+		// SourceDescriptorV3.BitrateKbps, so the assignment is unit-preserving.
 		carried.Bitrate = source.BitrateKbps
 	}
 	if len(carried.VideoTracks) == 0 {
 		carried.VideoTracks = []models.VideoTrack{virtualVideoTrackFromDescriptorV3(source)}
 		return &carried
 	}
-	track := &carried.VideoTracks[0]
+	// The existing-track path fills the exact same field set the empty-track
+	// reconstruction does — both call fillVirtualVideoTrackFromDescriptorV3 —
+	// so a partial row is never left reading copy-safe on a source the running
+	// plan proved is not.
+	fillVirtualVideoTrackFromDescriptorV3(&carried.VideoTracks[0], source)
+	return &carried
+}
+
+// virtualCodecAgreesV3 reports whether every video-codec spelling the row
+// already declares agrees with the descriptor's codec under the planner's
+// normalization. An absent declaration is a gap and agrees by construction.
+func virtualCodecAgreesV3(file *models.MediaFile, sourceCodec string) bool {
+	if file == nil || strings.TrimSpace(sourceCodec) == "" {
+		return false
+	}
+	if declared := strings.TrimSpace(file.CodecVideo); declared != "" &&
+		!playback.CodecsAgreeV3(declared, sourceCodec) {
+		return false
+	}
+	if len(file.VideoTracks) > 0 {
+		if declared := strings.TrimSpace(file.VideoTracks[0].Codec); declared != "" &&
+			!playback.CodecsAgreeV3(declared, sourceCodec) {
+			return false
+		}
+	}
+	return true
+}
+
+// virtualVideoTrackFromDescriptorV3 reconstructs the primary video track the
+// running plan validated from its source descriptor. It builds an empty track
+// and fills it through fillVirtualVideoTrackFromDescriptorV3, so the
+// reconstruction and the in-place top-up of a partial row cover exactly the
+// same field set: the fields the planner reads for route selection (codec,
+// profile, level, bit depth, dimensions, frame rate, bitrate, color range, and
+// the dynamic-range classification via the range-type text, with the DV profile
+// carried explicitly) plus the aggregated copy-safety verdict. The session's DV
+// pin is applied after the carry and re-overwrites the profile for a pinned
+// row, so the two never disagree.
+func virtualVideoTrackFromDescriptorV3(source playback.SourceDescriptorV3) models.VideoTrack {
+	var track models.VideoTrack
+	fillVirtualVideoTrackFromDescriptorV3(&track, source)
+	return track
+}
+
+// fillVirtualVideoTrackFromDescriptorV3 top-fills every gap in track from the
+// descriptor the running plan validated. It is the single field list shared by
+// the empty-track reconstruction and the existing-track top-up: a field the
+// planner reads is either filled from the descriptor here or deliberately
+// absent, never filled by one caller but not the other.
+//
+// A field that already carries a row value is left as-is; the carry only tops
+// up the unprobed metadata a fresh listing row dropped and never overwrites
+// evidence the row already has. The one deliberate exception is VideoCopyUnsafe,
+// an aggregated runtime verdict that must propagate whenever the running plan
+// proved it: reading it false would let a route the plan already disqualified as
+// copy-unsafe look copy-safe.
+func fillVirtualVideoTrackFromDescriptorV3(track *models.VideoTrack, source playback.SourceDescriptorV3) {
+	if track == nil {
+		return
+	}
 	if track.Codec == "" {
 		track.Codec = source.VideoCodec
+	}
+	if track.Profile == "" {
+		track.Profile = source.VideoProfile
+	}
+	if track.Level == 0 {
+		track.Level = source.VideoLevel
 	}
 	if track.BitDepth == 0 {
 		track.BitDepth = source.BitDepth
@@ -11418,50 +11509,46 @@ func carryValidatedVirtualVideoEvidenceV3(file *models.MediaFile, source playbac
 		track.FrameRate = strconv.FormatFloat(source.FrameRate, 'f', -1, 64)
 	}
 	if track.Bitrate == 0 {
+		// VideoTrack.Bitrate is the probe's kbps figure (scanner/probe.go
+		// stores ffprobe bit_rate/1000), the same unit as
+		// SourceDescriptorV3.BitrateKbps, so the assignment is unit-preserving.
 		track.Bitrate = source.BitrateKbps
 	}
-	return &carried
-}
-
-// virtualVideoTrackFromDescriptorV3 reconstructs the primary video track the
-// running plan validated from its source descriptor. It is deliberately
-// lossless for the fields the planner reads for route selection: codec,
-// profile, level, bit depth, dimensions, frame rate, bitrate, color range, and
-// the dynamic-range classification (via the range-type text, with the DV
-// profile carried explicitly). The session's DV pin is applied after the carry
-// and re-overwrites the profile for a pinned row, so the two never disagree.
-func virtualVideoTrackFromDescriptorV3(source playback.SourceDescriptorV3) models.VideoTrack {
-	track := models.VideoTrack{
-		Codec:          source.VideoCodec,
-		Profile:        source.VideoProfile,
-		Level:          source.VideoLevel,
-		BitDepth:       source.BitDepth,
-		Width:          source.Width,
-		Height:         source.Height,
-		FrameRate:      strconv.FormatFloat(source.FrameRate, 'f', -1, 64),
-		Bitrate:        source.BitrateKbps,
-		ColorRange:     source.ColorRange,
-		HDR10Plus:      source.HDR10Plus,
-		VideoRangeType: source.DynamicRange,
+	if strings.TrimSpace(track.ColorRange) == "" {
+		track.ColorRange = source.ColorRange
 	}
-	if source.DVProfile > 0 {
+	if !track.HDR10Plus {
+		track.HDR10Plus = source.HDR10Plus
+	}
+	if strings.TrimSpace(track.VideoRangeType) == "" {
+		track.VideoRangeType = source.DynamicRange
+	}
+	if track.DVProfile == 0 {
 		track.DVProfile = source.DVProfile
+	}
+	if track.DVLevel == 0 {
 		track.DVLevel = source.DVLevel
+	}
+	if track.DVBLCompatID == 0 {
 		track.DVBLCompatID = source.DVBLCompatID
-		// The descriptor carries a single aggregated base-layer provenance
-		// flag. Reproduce it only when it was proven; an unproven profile keeps
-		// the three presence booleans false so the route resolution fails
-		// closed instead of inventing a compatible base layer.
-		if source.DVBaseLayerProven {
-			track.DVConfigPresent = true
-			track.DVBLCompatIDPresent = true
-			track.DVBLPresent = true
+	}
+	// The descriptor carries a single aggregated base-layer provenance flag.
+	// Reproduce it only when it was proven; an unproven profile keeps the three
+	// presence booleans false so the route resolution fails closed instead of
+	// inventing a compatible base layer.
+	if source.DVBaseLayerProven {
+		track.DVConfigPresent = true
+		track.DVBLCompatIDPresent = true
+		track.DVBLPresent = true
+	}
+	if strings.TrimSpace(track.DVEnhancementLayer) == "" {
+		if layer := strings.TrimSpace(string(source.DVEnhancementLayer)); layer != "" {
+			track.DVEnhancementLayer = layer
 		}
 	}
-	if layer := strings.TrimSpace(string(source.DVEnhancementLayer)); layer != "" {
-		track.DVEnhancementLayer = layer
+	if source.VideoCopyUnsafe {
+		track.VideoCopyUnsafe = true
 	}
-	return track
 }
 
 // virtualFrameRateV3 parses a stored frame-rate string the same way the planner

@@ -173,12 +173,13 @@ type audioSelectionIntent struct {
 // record first (it survives session-manager rebuilds), then the live
 // session mirror for reconnects before the record is reachable.
 //
-// The attempt read is retried once inside the caller's reconcile budget. A
-// probe commit racing attempt visibility can make the row momentarily read as
-// having no intent; a single-read verdict of "no selection intent" would skip a
-// reconcilable generation and leave the declared or wrong language pinned. The
-// retry only runs while no intent has been seen, and the live session mirror
-// remains the fallback either way.
+// The attempt read is retried once inside the caller's reconcile budget, but
+// only on the race shape: an error or an absent record, the window in which a
+// probe commit has not yet made the row visible. A readable record is
+// definitive even when it declares no intent — a legacy no-intent row must not
+// be taxed with a retry and a delay on every reconcile — and a persistent read
+// error is bounded to the same attempts before the live session mirror takes
+// over.
 func (h *PlaybackHandler) audioSelectionIntentForSession(ctx context.Context, session *playback.Session) audioSelectionIntent {
 	var intent audioSelectionIntent
 	if h != nil && h.PlanStoreV3 != nil && session != nil {
@@ -189,9 +190,7 @@ func (h *PlaybackHandler) audioSelectionIntentForSession(ctx context.Context, se
 				intent.preferredLang = strings.TrimSpace(record.PreferredAudioLanguage)
 				intent.seriesSignature = record.SeriesAudioPreferenceSignature
 				intent.selectedOverride = record.SelectedAudioSignature
-				if intent.origin != "" {
-					break
-				}
+				break
 			}
 			if attempt+1 >= audioSelectionIntentReadAttempts || !waitReconcileIntentRetry(ctx) {
 				break
@@ -235,12 +234,12 @@ const (
 )
 
 // waitReconcileIntentRetry pauses before the intent-read retry, honoring the
-// caller's reconcile deadline. It reports false when the context is already
-// done, so the caller stops retrying and falls through to the live session
-// mirror rather than blocking past the bound.
+// caller's reconcile deadline. It reports false when there is no context to
+// bound the wait or the context is already done, so the caller falls through to
+// the live session mirror rather than blocking past the bound.
 func waitReconcileIntentRetry(ctx context.Context) bool {
 	if ctx == nil {
-		return true
+		return false
 	}
 	if ctx.Err() != nil {
 		return false
