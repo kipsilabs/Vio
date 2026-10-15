@@ -141,3 +141,196 @@ func TestFarSeekBeyondProducedWindowAnswersStaleGenerationImmediately(t *testing
 		t.Fatalf("post-restart body = %q, want the restarted generation's bytes", second.Body.String())
 	}
 }
+
+// startFarSeekHandlerSession starts a fake transcode, waits for its initial
+// segments, and registers it with a handler wired to resolve the test file.
+func startFarSeekHandlerSession(t *testing.T, sessionID, ffmpegPath, outputDir string, opts playback.TranscodeOpts) (*PlaybackHandler, *playback.TranscodeSession) {
+	t.Helper()
+	opts.SessionID = sessionID
+	opts.OutputDir = outputDir
+	opts.FFmpegPath = ffmpegPath
+	transcodeSession, err := playback.StartTranscode(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("StartTranscode: %v", err)
+	}
+	t.Cleanup(func() { _ = transcodeSession.Close() })
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, statErr := os.Stat(filepath.Join(outputDir, "seg_2.m4s")); statErr == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("fake transcode never produced the initial segments")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	sessions := playback.NewSessionManager(0, 0)
+	sessions.RegisterReconstructed(&playback.Session{
+		ID:          sessionID,
+		UserID:      1,
+		MediaFileID: 91,
+		PlayMethod:  playback.PlayTranscode,
+	})
+	handler := NewPlaybackHandler(sessions)
+	handler.TranscodeManager().RegisterTranscodeSession(sessionID, transcodeSession)
+	handler.fileResolver = mapPlaybackFileResolver{files: map[int]*models.MediaFile{
+		91: {ID: 91, FilePath: "/media/movie.mkv", Container: "mkv"},
+	}}
+	return handler, transcodeSession
+}
+
+func farSeekServe(t *testing.T, handler *PlaybackHandler, sessionID, segmentName string) *httptest.ResponseRecorder {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	handler.HandleGetTranscodeSegment(rec, playbackTestRequest(
+		http.MethodGet,
+		"/api/v1/playback/transcode/"+sessionID+"/segment/"+segmentName,
+		nil,
+		map[string]string{"session_id": sessionID, "name": segmentName},
+	))
+	return rec
+}
+
+// TestFarSeekAsyncRestartRotatesGeneration pins that the detached far-seek
+// restart actually rotates the generation token, which is why the triggering
+// request cannot be held for the restart's bytes.
+func TestFarSeekAsyncRestartRotatesGeneration(t *testing.T) {
+	outputDir := t.TempDir()
+	handler, transcodeSession := startFarSeekHandlerSession(t, "farseek-rotate", writePlaybackTestFFmpegFarSeek(t), outputDir, playback.TranscodeOpts{
+		InputPath:          "/media/movie.mkv",
+		TargetCodecVideo:   "h264",
+		TargetCodecAudio:   "aac",
+		SegmentDuration:    2,
+		AudioTrackIndex:    -1,
+		SubtitleTrackIndex: -1,
+		TotalDuration:      1200,
+	})
+
+	const segmentName = "seg_00452.m4s"
+	before := transcodeSession.GenerationToken()
+	if first := farSeekServe(t, handler, "farseek-rotate", segmentName); first.Code != http.StatusPreconditionFailed {
+		t.Fatalf("far-seek status = %d body=%q, want 412 before the restart", first.Code, first.Body.String())
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, statErr := os.Stat(filepath.Join(outputDir, segmentName)); statErr == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("asynchronous seek restart never produced the requested segment")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if after := transcodeSession.GenerationToken(); after == before {
+		t.Fatalf("generation token = %q, want it to rotate across the restart", after)
+	}
+	if transcodeSession.MatchesGenerationToken(before) {
+		t.Fatal("the pre-restart generation token still matched after the restart")
+	}
+}
+
+// TestFarSeekCopyModeStaysSynchronous proves a copy-mode far seek is not
+// answered with the async stale-generation verdict: copy target resolution
+// reads the live manifest under the lifecycle lock and can legitimately report
+// an unresolved target, which stays a retryable 404 on the synchronous path.
+func TestFarSeekCopyModeStaysSynchronous(t *testing.T) {
+	outputDir := t.TempDir()
+	handler, _ := startFarSeekHandlerSession(t, "copy-far-seek", writePlaybackTestFFmpegFarSeek(t), outputDir, playback.TranscodeOpts{
+		InputPath:          "/media/movie.mkv",
+		TargetCodecVideo:   "copy",
+		TargetCodecAudio:   "copy",
+		SegmentDuration:    2,
+		AudioTrackIndex:    -1,
+		SubtitleTrackIndex: -1,
+	})
+
+	const segmentName = "seg_00452.m4s"
+	rec := farSeekServe(t, handler, "copy-far-seek", segmentName)
+	if rec.Code == http.StatusPreconditionFailed || strings.Contains(rec.Body.String(), "stale_generation") {
+		t.Fatalf("copy-mode far seek took the async verdict: %d %q", rec.Code, rec.Body.String())
+	}
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("copy-mode far seek status = %d body=%q, want 404 for an unresolved synchronous target", rec.Code, rec.Body.String())
+	}
+}
+
+// writePlaybackTestFFmpegFarSeekDemux writes a fake ffmpeg that stamps the
+// session's source candidate as demux-failed on start (three video-scoped
+// "Error during demuxing" lines) and then produces the same short manifest as
+// writePlaybackTestFFmpegFarSeek.
+func writePlaybackTestFFmpegFarSeekDemux(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "fake-ffmpeg-farseek-demux.sh")
+	script := "#!/bin/sh\n" +
+		"i=0\n" +
+		"while [ $i -lt 3 ]; do echo 'Error during demuxing: vist#0:0' 1>&2; i=$((i+1)); done\n" +
+		"last=\"\"\n" +
+		"for arg in \"$@\"; do last=\"$arg\"; done\n" +
+		"case \" $* \" in *\" -bsfs \"*|*\" -encoders \"*|*\" -f null - \"*) exit 0 ;; esac\n" +
+		"case \"$last\" in\n" +
+		"  *.m3u8) out=\"$(dirname \"$last\")\"; mkdir -p \"$out\"; " +
+		"printf x > \"$out/init.mp4\"; printf x > \"$out/seg_0.m4s\"; " +
+		"printf x > \"$out/seg_1.m4s\"; printf x > \"$out/seg_2.m4s\"; " +
+		"printf '#EXTM3U\\n#EXT-X-VERSION:7\\n#EXT-X-TARGETDURATION:2\\n" +
+		"#EXT-X-MEDIA-SEQUENCE:0\\n#EXT-X-MAP:URI=\"init.mp4\"\\n" +
+		"#EXTINF:2.0,\\nseg_0.m4s\\n#EXTINF:2.0,\\nseg_1.m4s\\n" +
+		"#EXTINF:2.0,\\nseg_2.m4s\\n' > \"$last\" ;;\n" +
+		"esac\n" +
+		"exec sleep 30\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake ffmpeg: %v", err)
+	}
+	return path
+}
+
+// TestFarSeekAsyncFailureDoesNotStaleGenerationLoop pins the poison-latch: a
+// far-seek on an already demux-stamped session answers stale_generation once,
+// and the next request surfaces the terminal demux verdict instead of
+// scheduling another restart and returning stale_generation again.
+func TestFarSeekAsyncFailureDoesNotStaleGenerationLoop(t *testing.T) {
+	outputDir := t.TempDir()
+	handler, transcodeSession := startFarSeekHandlerSession(t, "farseek-demux", writePlaybackTestFFmpegFarSeekDemux(t), outputDir, playback.TranscodeOpts{
+		InputPath:          "/media/movie.mkv",
+		TargetCodecVideo:   "h264",
+		TargetCodecAudio:   "aac",
+		SegmentDuration:    2,
+		AudioTrackIndex:    -1,
+		SubtitleTrackIndex: -1,
+		TotalDuration:      1200,
+	})
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !transcodeSession.IsDemuxFailed() {
+		if time.Now().After(deadline) {
+			t.Fatal("session never stamped its source candidate demux-failed")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	const segmentName = "seg_00452.m4s"
+	if first := farSeekServe(t, handler, "farseek-demux", segmentName); first.Code != http.StatusPreconditionFailed {
+		t.Fatalf("first far-seek status = %d body=%q, want 412", first.Code, first.Body.String())
+	}
+
+	// The latch is recorded by the detached worker; wait for the observable
+	// verdict before the retry, mirroring a client that reloads the manifest
+	// after the 412.
+	deadline = time.Now().Add(5 * time.Second)
+	for transcodeSession.AsyncRestartFailure() == nil {
+		if time.Now().After(deadline) {
+			t.Fatal("the detached restart never latched its demux verdict")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	second := farSeekServe(t, handler, "farseek-demux", segmentName)
+	if second.Code == http.StatusPreconditionFailed || strings.Contains(second.Body.String(), "stale_generation") {
+		t.Fatalf("second request looped on stale_generation: %d %q", second.Code, second.Body.String())
+	}
+	if second.Code != http.StatusNotFound {
+		t.Fatalf("second request status = %d body=%q, want the terminal demux verdict (404)", second.Code, second.Body.String())
+	}
+}

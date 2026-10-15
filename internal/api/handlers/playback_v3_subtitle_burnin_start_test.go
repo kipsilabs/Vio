@@ -172,3 +172,139 @@ func TestSelectPreferredSubtitleV3(t *testing.T) {
 		}
 	})
 }
+
+// TestSelectPreferredSubtitleV3FallsBackToNonForcedMatch pins the forced
+// fallback: a forced track can outrank an available non-forced one (an exact
+// forced tag beats a regional non-forced variant), and the selection must land
+// on the non-forced match rather than be abandoned.
+func TestSelectPreferredSubtitleV3FallsBackToNonForcedMatch(t *testing.T) {
+	inventory := []playback.SubtitleInventoryItemV3{
+		{CombinedIndex: 0, Source: "embedded", Codec: "subrip", Language: "fr-CA"},
+		{CombinedIndex: 1, Source: "embedded", Codec: "hdmv_pgs_subtitle", Language: "fr", Forced: true},
+	}
+	item, ok := selectPreferredSubtitleV3(inventory, playbackSubtitlePreferenceV3{Language: "fr", HasLanguage: true}, nil)
+	if !ok || item.CombinedIndex != 0 {
+		t.Fatalf("selection = (%+v, %v), want the non-forced regional match at combined index 0", item, ok)
+	}
+}
+
+func seedPlaybackSubtitlePreferenceV3(t *testing.T, store userstore.UserStore, key string, value any) {
+	t.Helper()
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.UpsertSettingValue(context.Background(), userstore.SettingIdentity{
+		Key: key, Scope: settingscontract.ScopeProfile, ProfileID: "profile-1",
+	}, encoded); err != nil {
+		t.Fatalf("seed %s: %v", key, err)
+	}
+}
+
+func subtitleResolverHandlerV3(t *testing.T, store userstore.UserStore, file *models.MediaFile) *PlaybackHandler {
+	t.Helper()
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), testPlaybackFileResolver{file: file})
+	handler.StoreProvider = testUserStoreProvider{store: store}
+	return handler
+}
+
+// TestResolvePreferredSubtitleSelectionV3StoredOffSelectsNothing pins that a
+// stored off mode leaves an omitted selection to the client: turning subtitles
+// on is scoped to the "always" mode.
+func TestResolvePreferredSubtitleSelectionV3StoredOffSelectsNothing(t *testing.T) {
+	store := newPlaybackTestStore(t)
+	seedPlaybackSubtitlePreferenceV3(t, store, settingskeys.PlaybackSubtitleLanguage, "eng")
+	seedPlaybackSubtitlePreferenceV3(t, store, settingskeys.PlaybackSubtitleMode, "off")
+	file := subtitleBurnInFixtureFileV3(t)
+
+	if _, ok := subtitleResolverHandlerV3(t, store, file).resolvePreferredSubtitleSelectionV3(context.Background(), 1, "profile-1", "", file, nil); ok {
+		t.Fatal("a stored off mode must not resolve a subtitle selection on omission")
+	}
+}
+
+// TestResolvePreferredSubtitleSelectionV3StoredAlwaysSelectsTrack pins the
+// intended behavior change: an omitted selection resolves to the stored track
+// when the profile's mode is "always".
+func TestResolvePreferredSubtitleSelectionV3StoredAlwaysSelectsTrack(t *testing.T) {
+	store := newPlaybackTestStore(t)
+	seedPlaybackSubtitlePreferenceV3(t, store, settingskeys.PlaybackSubtitleLanguage, "eng")
+	seedPlaybackSubtitlePreferenceV3(t, store, settingskeys.PlaybackSubtitleMode, "always")
+	file := subtitleBurnInFixtureFileV3(t)
+
+	index, ok := subtitleResolverHandlerV3(t, store, file).resolvePreferredSubtitleSelectionV3(context.Background(), 1, "profile-1", "", file, nil)
+	if !ok || index != 0 {
+		t.Fatalf("resolved selection = (%d, %v), want the embedded track at combined index 0", index, ok)
+	}
+}
+
+// TestStartExplicitSubtitleIndexWinsOverStoredAlways pins that a named client
+// selection is never overridden by the stored "always" mode. The stored mode
+// would tie-break to the first English track (the text track at index 0); the
+// explicit index selects the bitmap PGS track at index 1, which forces burn-in.
+func TestStartExplicitSubtitleIndexWinsOverStoredAlways(t *testing.T) {
+	store := newPlaybackTestStore(t)
+	seedPlaybackSubtitlePreferenceV3(t, store, settingskeys.PlaybackSubtitleLanguage, "eng")
+	seedPlaybackSubtitlePreferenceV3(t, store, settingskeys.PlaybackSubtitleMode, "always")
+
+	file := subtitleBurnInFixtureFileV3(t)
+	file.SubtitleTracks = []models.SubtitleTrack{
+		{Index: 3, Language: "eng", Codec: "subrip"},
+		{Index: 4, Language: "eng", Codec: "hdmv_pgs_subtitle"},
+	}
+
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), testPlaybackFileResolver{file: file})
+	handler.StoreProvider = testUserStoreProvider{store: store}
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{
+		config.Allow4KTranscodeSettingKey:          "true",
+		config.PlaybackAllowHEVCEncodingSettingKey: "true",
+	}}
+	handler.PlaybackConfig = func() config.PlaybackConfig {
+		return config.PlaybackConfig{
+			FFmpegPath:       writePlaybackTestFFmpeg(t),
+			TranscodeDir:     t.TempDir(),
+			TranscodeEnabled: true,
+			HWAccel:          "qsv",
+		}
+	}
+	presetLocalRegistryV3(handler, playback.NewTransformationRegistryV3([]playback.TransformationSpecV3{
+		{Name: playback.TransformationAudioToAACV3, RecipeVersion: playback.TransformationAudioToAACRecipeVersionV3, Available: true},
+		{Name: playback.TransformationVideoToH264V3, RecipeVersion: playback.TransformationVideoToH264RecipeVersionV3, Available: true},
+		{Name: playback.TransformationVideoToHEVCV3, RecipeVersion: playback.TransformationVideoToHEVCRecipeVersionV3, Available: true},
+	}))
+
+	start := v3HandlerStartRequest()
+	caps := start.Capabilities
+	caps.CodecsVideo = []string{"h264", "hevc"}
+	caps.CodecsVideoHardware = []string{"h264", "hevc"}
+	caps.Containers = []string{"mp4", "mkv"}
+	start.Capabilities = caps
+	start.ClientPlaybackContext.Deliveries[playback.DeliveryClassOriginalHTTPV3] = playback.DeliveryCapabilityV3{
+		Enabled: true, SupportedOnDevice: true, VideoCodecs: []string{"h264"},
+		Subtitles: playback.DeliverySubtitleCapabilitiesV3{EmbeddedText: true, SidecarText: true},
+	}
+	start.ClientPlaybackContext.Deliveries[playback.DeliveryClassHLSV3] = playback.DeliveryCapabilityV3{
+		Enabled: true, SupportedOnDevice: true,
+		Containers:        []string{"hls"},
+		VideoCodecs:       []string{"h264", "hevc"},
+		AudioDecodeCodecs: []string{"aac"},
+		Subtitles:         playback.DeliverySubtitleCapabilitiesV3{EmbeddedText: true, SidecarText: true},
+	}
+	const explicit = 1
+	start.SubtitleTrackIndex = intPtrPlaybackV3(explicit)
+	start.SubtitleTrackID = playback.TrackIDV3(file.ID, "subtitle", explicit)
+
+	started := startV3PlaybackV2ForHandlerTest(t, handler, start)
+	plan := started.PlaybackPlan
+	if plan == nil {
+		t.Fatalf("no plan: terminal=%#v", started.Terminal)
+	}
+	if plan.SelectedTracks.Subtitle == nil || plan.SelectedTracks.Subtitle.Index == nil || *plan.SelectedTracks.Subtitle.Index != explicit {
+		t.Fatalf("selected subtitle = %#v, want the explicit index %d", plan.SelectedTracks.Subtitle, explicit)
+	}
+	if plan.Subtitle.Mode != playback.SubtitleBurnInV3 {
+		t.Fatalf("subtitle mode = %q, want burn-in for the explicitly selected bitmap track", plan.Subtitle.Mode)
+	}
+}
+
+func intPtrPlaybackV3(v int) *int { return &v }

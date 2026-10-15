@@ -96,6 +96,11 @@ func TestTranscodeManifestResponseIdentityWithoutGzip(t *testing.T) {
 		if !bytes.Equal(rec.Body.Bytes(), manifest) {
 			t.Fatalf("accept=%q body changed; got %q", accept, rec.Body.String())
 		}
+		// Vary must be advertised on the identity variant too, so a cache never
+		// keys the gzip and identity bodies together.
+		if got := rec.Header().Get("Vary"); !strings.Contains(got, "Accept-Encoding") {
+			t.Fatalf("accept=%q Vary = %q, want Accept-Encoding", accept, got)
+		}
 	}
 }
 
@@ -112,6 +117,10 @@ func TestAcceptsGzipEncoding(t *testing.T) {
 		{"deflate, gzip;q=0.8", true},
 		{"gzip;q=0", false},
 		{"GZIP", true},
+		{"GZIP;Q=0", false},
+		{" gzip ; q=0 ", false},
+		{"gzip;q=0.0", false},
+		{"gzip;q=0.000 , deflate", false},
 		{"br", false},
 		{"identity", false},
 	}
