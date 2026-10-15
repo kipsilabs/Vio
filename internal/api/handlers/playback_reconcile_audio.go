@@ -1323,22 +1323,18 @@ func (h *PlaybackHandler) recordAudioReconcileAnnouncement(ctx context.Context, 
 	}
 }
 
-// verifyExplicitAudioSelection checks that an explicit viewer selection still
-// exists in the verified inventory. It never overrides: a vanished track
-// surfaces a terminal diagnostic (route event + log) so the viewer learns the
-// selection is gone instead of hearing a silently substituted track.
-//
-// The event stays diagnostic-only: it names the attempt and plan for
-// attribution but changes no attempt or plan state, so the stranded session
-// keeps playing its committed route. The player learns of a genuine
-// disappearance through the channel it already watches — the inventory_updated
-// push (or the next inventory poll) shows the verified list without the
-// track, and its picker drops the unplayable entry exactly as it does for any
-// other inventory revision. No new client surface is required.
 // verifyExplicitAudioSelection rereads the committed row and verifies the
 // viewer's explicit selection still exists in it. The carrier form
 // (verifyExplicitAudioSelectionForInventory) is used by the deferred-probe path,
 // where the exact committed inventory is already in hand.
+//
+// It never overrides the viewer's choice. A genuinely absent selection is
+// recorded for observability and nothing more: a durable refused ledger entry
+// (via AudioReconcileStoreV3) plus a Warn log. The committed selection keeps
+// serving rather than being silently substituted or hard-terminated. If the
+// verified overlay cannot re-identify the selection it marks the session
+// fail-closed (VirtualAudioSelectionInvalid), the transport then answers a
+// retryable 409, and the client's own failure/recovery replan re-resolves.
 func (h *PlaybackHandler) verifyExplicitAudioSelection(ctx context.Context, session *playback.Session, intent audioSelectionIntent, fileID int) {
 	if h == nil || h.fileResolver == nil {
 		return
@@ -1379,23 +1375,18 @@ func (h *PlaybackHandler) verifyExplicitAudioSelectionForInventory(ctx context.C
 		h.recordAudioReconcileDecision(ctx, live.ID, generation, playback.AudioReconcileEntryV3{Decision: playback.AudioReconcileNoop})
 		return
 	}
+	// A genuinely absent explicit selection is recorded for observability and
+	// nothing more. This check runs against a live stream, and the exact
+	// transport was already committed from the plan: a probe that no longer
+	// lists the chosen signature is not by itself proof that the bytes cannot
+	// flow, and hard-terminating here drops a healthy stream whenever the
+	// probe is richer, sparser or differently ordered than the start-time
+	// snapshot. The viewer's explicit choice is never auto-overridden, so the
+	// correction is not ours to force; the client's own failure and replan
+	// path (or the executor's own error) owns the genuinely unplayable case.
 	slog.WarnContext(ctx, "explicit audio selection missing from the verified inventory",
 		"component", "api", "session", live.ID, "file_id", fileID, "audio_index", committedAudioTrackIndexV3(record, live))
 	h.recordAudioReconcileDecision(ctx, live.ID, generation, playback.AudioReconcileEntryV3{Decision: playback.AudioReconcileRefused})
-	if record != nil {
-		h.enqueueRouteEventV3(playback.RouteEventRecordV3{
-			RouteEventV3: playback.RouteEventV3{
-				ProtocolVersion:   playback.ProtocolV3,
-				PlaybackAttemptID: record.PlaybackAttemptID,
-				SessionID:         live.ID,
-				PlanID:            record.CurrentPlanID,
-				Event:             playback.RouteEventTerminalV3,
-				OutputContextID:   record.NormalizedRequest.ClientPlaybackContext.Output.OutputContextID,
-			},
-			UserID:    live.UserID,
-			ProfileID: live.ProfileID,
-		})
-	}
 }
 
 // explicitAudioSelectionPresent reports whether the committed explicit
@@ -1403,13 +1394,22 @@ func (h *PlaybackHandler) verifyExplicitAudioSelectionForInventory(ctx context.C
 // index first (the common unchanged case), then a full signature scan so a
 // reordered-but-present track is not falsely reported missing. A nil or zero
 // signature means start predates signatures: index presence alone decides.
+//
+// Matching is wildcard-aware because the committed signature is often partial:
+// it is snapshotted from the start-time track (declared metadata, or a probe
+// that reported fewer fields), so members the snapshot never carried must not
+// be allowed to refute a fuller probed track. The exact matchers stay strict
+// for probe-derived re-identification.
+//
+// This is a presence check only: a match is never used to pick a stream, just
+// to decide whether the committed selection is still represented.
 func explicitAudioSelectionPresent(tracks []models.AudioTrack, committedIndex int, selected *userstore.AudioTrackSignature) bool {
 	if track, ok := audioTrackAtCommittedIndex(tracks, committedIndex); ok {
-		if selected == nil || selected.IsZero() || audioTrackSignatureEqual(track, *selected) {
+		if selected == nil || selected.IsZero() || playback.ClientAudioSignatureMatchesTrack(track, selected) {
 			return true
 		}
 		for _, candidate := range tracks {
-			if audioTrackSignatureEqual(candidate, *selected) {
+			if playback.ClientAudioSignatureMatchesTrack(candidate, selected) {
 				return true
 			}
 		}
@@ -1419,7 +1419,7 @@ func explicitAudioSelectionPresent(tracks []models.AudioTrack, committedIndex in
 		return false
 	}
 	for _, candidate := range tracks {
-		if audioTrackSignatureEqual(candidate, *selected) {
+		if playback.ClientAudioSignatureMatchesTrack(candidate, selected) {
 			return true
 		}
 	}
