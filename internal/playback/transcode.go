@@ -407,6 +407,14 @@ type SegmentRecoveryDecision struct {
 	Progress         SegmentProgress
 }
 
+// SegmentRecoveryFarSeekReason is the decision reason for a request whose
+// segment lies past the produced window and cannot be reached by waiting on the
+// active encode (an arbitrary seek, not the next sequential fragment). The
+// recovery is a seek restart, and because any restart rotates the generation,
+// the request that triggers it must be answered with the stale-generation
+// verdict rather than held for bytes its own generation fence will refuse.
+const SegmentRecoveryFarSeekReason = "request_beyond_produced_window"
+
 // defaultSegmentDuration is the segment length when not specified. Short
 // segments (2s) allow the player to start quickly while still maintaining
 // efficient HTTP delivery. This matches the approach used by Plex.
@@ -3461,7 +3469,7 @@ func (s *TranscodeSession) SegmentRecoveryDecision(segNum int, now time.Time) Se
 			decision.RestartOnTimeout = false
 			decision.Reason = "near_produced_head"
 		} else {
-			decision.Reason = "request_beyond_produced_window"
+			decision.Reason = SegmentRecoveryFarSeekReason
 		}
 	case progress.ProducedHead >= progress.StartSegmentNumber && now.Sub(progress.LastProducedAt) > staleProducedWindow(progress.SegmentDuration):
 		decision.Reason = "produced_output_stale"

@@ -502,6 +502,33 @@ func (s *Server) restartSegmentLocked(
 	return session.RestartSegment(ctx, segNum)
 }
 
+// restartSegmentAsync runs restartSegmentLocked on its own goroutine so a
+// far-seek segment request is not held for the whole restart. The restart
+// rotates the generation, so the triggering request's token can never serve the
+// bytes it produces; the handler answers the stale-generation verdict at once
+// and this worker makes the next request on the new generation succeed. The
+// context is detached from the request so a client disconnect after the verdict
+// does not cancel the restart the next request depends on.
+func (s *Server) restartSegmentAsync(sessionID string, session *playback.TranscodeSession, segNum int) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), restartSegmentAsyncTimeout)
+		defer cancel()
+		target, ok, err := s.restartSegmentLocked(ctx, sessionID, session, segNum)
+		switch {
+		case err != nil && !errors.Is(err, playback.ErrManifestNotReady):
+			slog.Warn("restart transcode node at missing segment (async)", "component", "transcodenode", "error", err, "segment", segNum, "session", sessionID)
+		case ok:
+			slog.Info("transcode node seek restart", "component", "transcodenode", "segment", segNum,
+				"seek_seconds", target.SeekSeconds, "stream_origin_seconds", target.StreamOriginSeconds,
+				"resolved_start_segment", target.StartSegmentNumber, "session", sessionID)
+		}
+	}()
+}
+
+// restartSegmentAsyncTimeout bounds one detached seek restart on the node so a
+// wedged resolver cannot leak the goroutine forever.
+const restartSegmentAsyncTimeout = 2 * time.Minute
+
 // NewServer creates a new transcode server.
 func playbackHWAccel(value string) bool {
 	switch strings.ToLower(strings.TrimSpace(value)) {
@@ -2748,39 +2775,59 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 			}
 
 			if err != nil && err == playback.ErrSegmentNotFound && decision.RestartOnTimeout {
-				target, ok, restartErr := s.restartSegmentLocked(
-					r.Context(),
-					sessionID,
-					session,
-					segNum,
-				)
-				if restartErr != nil && !errors.Is(restartErr, playback.ErrManifestNotReady) {
-					slog.ErrorContext(r.Context(), "restart transcode node at missing segment", "component", "transcodenode", "error", restartErr, "segment", name, "session", sessionID, "playback_session_id", sessionID)
-				}
-
-				if restartErr != nil {
-					err = restartErr
-				} else if ok {
-					slog.InfoContext(r.Context(), "transcode node seek restart", "component", "transcodenode",
+				// A far seek past the produced window is recovered by a seek
+				// restart that rotates the generation, so this request's token
+				// can never serve its bytes. Restart detached and answer the
+				// stale-generation verdict now instead of holding the player on
+				// a lease the final fence would refuse. Copy-mode stays
+				// synchronous: its target resolution reads the live manifest.
+				if decision.Reason == playback.SegmentRecoveryFarSeekReason && !session.IsCopyVideo() {
+					slog.InfoContext(r.Context(), "transcode node seek restart scheduled", "component", "transcodenode",
 						"segment", name,
 						"requested_segment", segNum,
 						"produced_head", decision.Progress.ProducedHead,
-						"last_requested_segment", decision.Progress.LastRequestedSegment,
 						"start_segment_number", decision.Progress.StartSegmentNumber,
-						"last_produced_age_ms", lastProducedAgeMS,
-						"wait_timeout_ms", decision.WaitTimeout.Milliseconds(),
 						"reason", decision.Reason,
-						"seek_seconds", target.SeekSeconds,
-						"stream_origin_seconds", target.StreamOriginSeconds,
-						"resolved_start_segment", target.StartSegmentNumber,
 						"session", sessionID,
 						"playback_session_id", sessionID,
 					)
+					s.restartSegmentAsync(sessionID, session, segNum)
+					err = playback.ErrStaleSegmentGeneration
+				} else {
+					target, ok, restartErr := s.restartSegmentLocked(
+						r.Context(),
+						sessionID,
+						session,
+						segNum,
+					)
+					if restartErr != nil && !errors.Is(restartErr, playback.ErrManifestNotReady) {
+						slog.ErrorContext(r.Context(), "restart transcode node at missing segment", "component", "transcodenode", "error", restartErr, "segment", name, "session", sessionID, "playback_session_id", sessionID)
+					}
 
-					segmentLease, err = session.WaitForOpenSegment(name, 30*time.Second)
-				}
-				if !ok && restartErr == nil && session.IsCopyVideo() {
-					err = playback.ErrSegmentNotFound
+					if restartErr != nil {
+						err = restartErr
+					} else if ok {
+						slog.InfoContext(r.Context(), "transcode node seek restart", "component", "transcodenode",
+							"segment", name,
+							"requested_segment", segNum,
+							"produced_head", decision.Progress.ProducedHead,
+							"last_requested_segment", decision.Progress.LastRequestedSegment,
+							"start_segment_number", decision.Progress.StartSegmentNumber,
+							"last_produced_age_ms", lastProducedAgeMS,
+							"wait_timeout_ms", decision.WaitTimeout.Milliseconds(),
+							"reason", decision.Reason,
+							"seek_seconds", target.SeekSeconds,
+							"stream_origin_seconds", target.StreamOriginSeconds,
+							"resolved_start_segment", target.StartSegmentNumber,
+							"session", sessionID,
+							"playback_session_id", sessionID,
+						)
+
+						segmentLease, err = session.WaitForOpenSegment(name, 30*time.Second)
+					}
+					if !ok && restartErr == nil && session.IsCopyVideo() {
+						err = playback.ErrSegmentNotFound
+					}
 				}
 			}
 		} else if session.IsRunning() {

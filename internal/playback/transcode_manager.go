@@ -398,6 +398,37 @@ func (m *TranscodeManager) RestartSegmentLocked(
 	return target, ok, err
 }
 
+// restartSegmentAsyncTimeout bounds one detached seek restart so a wedged
+// resolver cannot leak the goroutine forever.
+const restartSegmentAsyncTimeout = 2 * time.Minute
+
+// RestartSegmentAsync runs RestartSegmentLocked on its own goroutine so the
+// segment request that triggered a far-seek recovery is not held for the whole
+// restart. The generation rotates on restart, so the triggering request's token
+// can never serve the bytes the restart produces (the generation fence would
+// refuse them); the caller answers it the stale-generation verdict immediately
+// and this worker makes the next request on the new generation succeed. The
+// context is detached from the request so a client that disconnects after the
+// verdict does not cancel the restart the next request depends on.
+func (m *TranscodeManager) RestartSegmentAsync(sessionID string, ts *TranscodeSession, segNum int) {
+	if m == nil || ts == nil {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), restartSegmentAsyncTimeout)
+		defer cancel()
+		target, ok, err := m.RestartSegmentLocked(ctx, sessionID, ts, segNum)
+		switch {
+		case err != nil && !errors.Is(err, ErrManifestNotReady):
+			slog.Warn("restart transcode at missing segment (async)", "component", "playback", "error", err, "segment", segNum, "session", sessionID)
+		case ok:
+			slog.Info("transcode seek restart", "component", "playback", "segment", segNum,
+				"seek_seconds", target.SeekSeconds, "stream_origin_seconds", target.StreamOriginSeconds,
+				"resolved_start_segment", target.StartSegmentNumber, "session", sessionID)
+		}
+	}()
+}
+
 func (m *TranscodeManager) restartSessionLocked(sessionID string, ts *TranscodeSession, restart func() error) error {
 	unlock := m.LockSessionLifecycle(sessionID)
 	defer unlock()
