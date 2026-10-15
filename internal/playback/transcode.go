@@ -431,6 +431,46 @@ const DefaultSegmentDuration = defaultSegmentDuration
 // 100,000-second limit; shorter fragments reach the same bound sooner.
 const maxSyntheticManifestSegments = 50_000
 
+// Synthetic-transcode windowing.
+//
+// An encoded transcode's playlist is synthetic: it names segments FFmpeg has
+// not produced yet, and the segment route restarts the encoder when the client
+// asks for one. Emitting the whole title made every reload of that playlist
+// ~144 KB for a feature (3,600 two-second entries) even though hls.js only ever
+// fetches a minute or two past the playhead, and the client reloads the
+// playlist repeatedly across a session. The window bounds the playlist to the
+// client's furthest fetched segment plus a forward margin, while a bounded run
+// of #EXT-X-GAP entries carries the omitted prefix so the listed segments keep
+// their absolute media times (see GenerateWindowedManifest).
+const (
+	// syntheticManifestWindowBackSegments reaches behind the client's furthest
+	// fetched segment. It must exceed the client's forward buffer (at most
+	// 120 s, see web/src/player/utils/bufferPolicy.ts) so a reload triggered at
+	// the window edge still contains the playhead.
+	syntheticManifestWindowBackSegments = 90
+	// syntheticManifestWindowAheadSegments reaches past the client's furthest
+	// fetched segment so hls.js can refill a full forward buffer from the new
+	// window before it needs to reload again. Reloading a window is a full hls.js
+	// MediaSource reset that drops the buffer and re-downloads from the playhead
+	// (the client refetches a VOD playlist itself, see
+	// web/src/player/utils/hlsWindowedManifest.ts), so the ahead margin is sized
+	// to the client's forward-buffer ceiling: 60 two-second segments = 120 s.
+	// A shorter margin would make the client hit the next window edge with its
+	// buffer only partly refilled, resetting again sooner.
+	syntheticManifestWindowAheadSegments = 60
+	// syntheticManifestWindowCapacity is the largest whole-title playlist that
+	// is served unwindowed. Below it the legacy full VOD manifest is cheaper to
+	// reason about and is unchanged.
+	syntheticManifestWindowCapacity = syntheticManifestWindowBackSegments + syntheticManifestWindowAheadSegments
+	// syntheticManifestMaxGapEntries bounds the number of EXT-X-GAP entries
+	// that carry the omitted prefix. Each covers an equal slice of the prefix,
+	// so a longer title grows each gap's EXTINF (and the advertised target
+	// duration) rather than the entry count. Only an hls.js client consumes a
+	// windowed playlist, and hls.js does not read the target duration of a VOD
+	// playlist, so a coarse gap run is cheaper than a fine one.
+	syntheticManifestMaxGapEntries = 32
+)
+
 // Large synthetic playlists used to repeat the full access and reconstruction
 // query on every segment URI. For a feature-length title that turns a small
 // index into several megabytes of duplicate JWT text, delaying both transfer
@@ -2748,7 +2788,67 @@ func (s *TranscodeSession) buildPlaybackManifest(segPrefix, rawQuery string) ([]
 		return RewriteManifestPaths(manifest, segPrefix, rawQuery)
 	}
 
-	return s.GenerateFullManifest(segPrefix, rawQuery), nil
+	return s.generateSyntheticPlaybackManifest(segPrefix, rawQuery), nil
+}
+
+// generateSyntheticPlaybackManifest returns the synthetic playlist for an
+// encoded transcode: the legacy whole-title VOD manifest unless the client has
+// opted into windowing and the title is long enough to need one.
+//
+// Windowing is decided per request from the session's segment progress, so a
+// short title keeps its full manifest and an opted-in client's window tracks the
+// segment it has actually buffered to. The client never has to negotiate the
+// window itself: a windowed playlist keeps the absolute media timeline (via its
+// gap prefix), so the seek mapping it already has stays valid.
+func (s *TranscodeSession) generateSyntheticPlaybackManifest(segPrefix, rawQuery string) []byte {
+	opts := s.Opts()
+	segDur := opts.SegmentDuration
+	if segDur <= 0 {
+		segDur = defaultSegmentDuration
+	}
+	totalDur := opts.TotalDuration
+	if totalDur <= 0 {
+		totalDur = float64(segDur)
+	}
+	segCount := int(math.Ceil(totalDur / float64(segDur)))
+	if segCount < 1 {
+		segCount = 1
+	}
+	if !windowedManifestRequested(rawQuery) || segCount <= syntheticManifestWindowCapacity {
+		return s.GenerateFullManifest(segPrefix, rawQuery)
+	}
+
+	progress := s.SegmentProgress(time.Now())
+	windowStart, windowEnd := syntheticManifestWindow(segCount, progress)
+	return s.GenerateWindowedManifest(segPrefix, rawQuery, windowStart, windowEnd)
+}
+
+// syntheticManifestWindow picks the segment window served around the client's
+// furthest fetched segment. The anchor is the last segment the client fetched
+// (or the session's start segment before any download), never the produced head:
+// the throttler lets FFmpeg run a configured margin (300 s by default) ahead of
+// the client, and anchoring on the produced head would push the window's start
+// past the playhead and stall playback. The window instead advances with the
+// client's own buffer, and the encoder catches up on demand as segments are
+// requested.
+func syntheticManifestWindow(segCount int, progress SegmentProgress) (int, int) {
+	anchor := progress.LastRequestedSegment
+	if anchor < progress.StartSegmentNumber {
+		anchor = progress.StartSegmentNumber
+	}
+
+	start := anchor - syntheticManifestWindowBackSegments
+	if start < 0 {
+		start = 0
+	}
+	end := anchor + syntheticManifestWindowAheadSegments
+	if end < start+1 {
+		end = start + 1
+	}
+	if end > segCount {
+		end = segCount
+	}
+	return start, end
 }
 
 // stabilizeCopyHLSRemountTimeline marks a bounded copy-HLS playlist as an
@@ -3506,7 +3606,7 @@ func (s *TranscodeSession) GenerateFullManifest(segPrefix, rawQuery string) []by
 		segCount = 1
 	}
 
-	queryDefinition, suffix, queryVersion := syntheticManifestQuery(segCount, rawQuery)
+	queryDefinition, suffix, queryVersion := syntheticManifestQuery(segCount, rawQuery, false)
 
 	segExt := hlsSegmentExtension(opts)
 	hlsVersion := 3
@@ -3551,14 +3651,184 @@ func (s *TranscodeSession) GenerateFullManifest(segPrefix, rawQuery string) []by
 	return buf.Bytes()
 }
 
-func syntheticManifestQuery(segmentCount int, rawQuery string) (definition, suffix string, minVersion int) {
+// WindowedManifestQueryParam opts a client into the bounded synthetic manifest
+// described by GenerateWindowedManifest. Only a client that reloads the playlist
+// as it approaches the window edge — and reanchors a seek that falls outside the
+// listed window — can play a bounded playlist to the end and seek accurately, so
+// windowing is opt-in: every other client keeps the whole-title VOD manifest it
+// already knows how to seek. The parameter is additive on the manifest URL; a
+// short title ignores it, because the whole playlist already fits the window.
+const WindowedManifestQueryParam = "hls_window"
+
+func windowedManifestRequested(rawQuery string) bool {
+	if rawQuery == "" {
+		return false
+	}
+	for _, part := range strings.Split(rawQuery, "&") {
+		key, value, _ := strings.Cut(part, "=")
+		if key != WindowedManifestQueryParam {
+			continue
+		}
+		if decoded, err := url.QueryUnescape(value); err == nil {
+			value = decoded
+		}
+		return value == "" || (value != "0" && !strings.EqualFold(value, "false"))
+	}
+	return false
+}
+
+// GenerateWindowedManifest renders a bounded, VOD synthetic playlist that lists
+// only segments [windowStart, windowEnd) of the full title, preceded by a
+// bounded run of #EXT-X-GAP entries that carries the omitted prefix.
+//
+// Why a gap prefix instead of EXT-X-MEDIA-SEQUENCE, PDT, or hls.js's
+// timelineOffset config:
+//
+//   - HLS times are relative to the first listed segment. hls.js assigns each
+//     fragment `start = playlistOffset + config.timelineOffset`, where
+//     playlistOffset is the sum of the preceding EXTINF durations. It does NOT
+//     derive the timeline from EXT-X-MEDIA-SEQUENCE or EXT-X-PROGRAM-DATE-TIME,
+//     so a window beginning at segment W would otherwise play at time zero and
+//     every seek would map to the wrong media position.
+//   - hls.js's timelineOffset config would shift the whole playlist onto the
+//     media timeline, but it requires the client to already know the window
+//     start in seconds, which it cannot know before fetching the manifest —
+//     a chicken-and-egg the server would have to break with a wire change.
+//   - A leading EXT-X-GAP run contributes its EXTINF durations to the timeline
+//     without being fetched (hls.js rejects gap fragments and skips to the next
+//     real one), so the first real segment lands on its true absolute media
+//     time with no client math. The manifest stays VOD with a finite duration,
+//     avoiding the live-edge projection and infinite-duration hazards of an
+//     EVENT/sliding playlist.
+//
+// The gap run is bounded by syntheticManifestMaxGapEntries: a longer omitted
+// prefix grows each gap's EXTINF (and the advertised target duration) rather
+// than the payload. Segments after windowEnd are not listed at all; the client
+// re-windows from the current playhead when it approaches the window edge, and
+// seeks outside the window route through the session's seek-reanchor path.
+func (s *TranscodeSession) GenerateWindowedManifest(segPrefix, rawQuery string, windowStart, windowEnd int) []byte {
+	opts := s.Opts()
+	totalDur := opts.TotalDuration
+	segDur := opts.SegmentDuration
+	if segDur <= 0 {
+		segDur = defaultSegmentDuration
+	}
+	if totalDur <= 0 {
+		totalDur = float64(segDur)
+	}
+	segCount := int(math.Ceil(totalDur / float64(segDur)))
+	if segCount < 1 {
+		segCount = 1
+	}
+	if windowStart < 0 {
+		windowStart = 0
+	}
+	if windowStart > segCount-1 {
+		windowStart = segCount - 1
+	}
+	if windowEnd <= windowStart {
+		windowEnd = windowStart + 1
+	}
+	if windowEnd > segCount {
+		windowEnd = segCount
+	}
+
+	segExt := hlsSegmentExtension(opts)
+	hlsVersion := 3
+	if segExt == ".m4s" {
+		hlsVersion = 7
+	}
+
+	queryDefinition, suffix, queryVersion := syntheticManifestQuery(windowEnd-windowStart, rawQuery, true)
+	if queryVersion > hlsVersion {
+		hlsVersion = queryVersion
+	}
+
+	// The omitted prefix is windowStart segments of nominal length. Split it
+	// into at most syntheticManifestMaxGapEntries equal EXT-X-GAP entries.
+	gapPrefixSeconds := float64(windowStart) * float64(segDur)
+	gapCount := 0
+	if gapPrefixSeconds > 0 {
+		gapChunkSeconds := float64(segDur)
+		if needed := math.Ceil(gapPrefixSeconds / float64(syntheticManifestMaxGapEntries)); needed > gapChunkSeconds {
+			gapChunkSeconds = needed
+		}
+		gapCount = int(math.Ceil(gapPrefixSeconds / gapChunkSeconds))
+	}
+
+	// Target duration is the maximum EXTINF rounded up. A frame-accurate GOP can
+	// slightly exceed the nominal segment length, and an aggregated gap entry
+	// can be much longer, so both are covered.
+	targetDuration := segDur + 1
+	if gapCount > 0 {
+		longestGap := int(math.Ceil(gapPrefixSeconds / float64(gapCount)))
+		if longestGap+1 > targetDuration {
+			targetDuration = longestGap + 1
+		}
+	}
+
+	var buf bytes.Buffer
+	buf.WriteString("#EXTM3U\n")
+	fmt.Fprintf(&buf, "#EXT-X-VERSION:%d\n", hlsVersion)
+	buf.WriteString(queryDefinition)
+	fmt.Fprintf(&buf, "#EXT-X-TARGETDURATION:%d\n", targetDuration)
+	buf.WriteString("#EXT-X-MEDIA-SEQUENCE:0\n")
+	buf.WriteString("#EXT-X-PLAYLIST-TYPE:VOD\n")
+
+	if segExt == ".m4s" {
+		fmt.Fprintf(&buf, "#EXT-X-MAP:URI=\"%sinit.mp4%s\"\n", segPrefix, suffix)
+	}
+
+	if gapCount > 0 {
+		gapURI := segPrefix + "window_gap" + segExt + suffix
+		written := 0.0
+		for i := range gapCount {
+			dur := gapPrefixSeconds / float64(gapCount)
+			if i == gapCount-1 {
+				dur = gapPrefixSeconds - written
+			}
+			written += dur
+			buf.WriteString("#EXT-X-GAP\n")
+			fmt.Fprintf(&buf, "#EXTINF:%.6f,\n", dur)
+			buf.WriteString(gapURI)
+			buf.WriteByte('\n')
+		}
+	}
+
+	for i := windowStart; i < windowEnd; i++ {
+		dur := float64(segDur)
+		if i == segCount-1 {
+			// Last segment covers the remainder.
+			dur = totalDur - float64(i)*float64(segDur)
+			if dur <= 0 {
+				dur = float64(segDur)
+			}
+		}
+		fmt.Fprintf(&buf, "#EXTINF:%.6f,\n", dur)
+		fmt.Fprintf(&buf, "%sseg_%05d%s%s\n", segPrefix, i, segExt, suffix)
+	}
+
+	buf.WriteString("#EXT-X-ENDLIST\n")
+	return buf.Bytes()
+}
+
+// syntheticManifestQuery decides how the segment URIs carry the access and
+// reconstruction query. A long query is written once into an EXT-X-DEFINE and
+// substituted per segment; that is a large win for a windowed playlist, whose
+// entry count is deliberately small but whose per-URI query (access token plus
+// the generation token) is not. forceCompact skips the byte-threshold heuristic
+// so a window always compacts, whatever its size.
+func syntheticManifestQuery(segmentCount int, rawQuery string, forceCompact bool) (definition, suffix string, minVersion int) {
 	if rawQuery == "" {
 		return "", "", 0
 	}
 	legacySuffix := "?" + rawQuery
 	variableSuffix := "?{$" + manifestQueryVariable + "}"
 	savingsPerSegment := len(legacySuffix) - len(variableSuffix)
-	if savingsPerSegment <= 0 || int64(segmentCount)*int64(savingsPerSegment) < minManifestQuerySubstitutionSavings || strings.ContainsAny(rawQuery, "\"\r\n") {
+	if savingsPerSegment <= 0 || strings.ContainsAny(rawQuery, "\"\r\n") {
+		return "", legacySuffix, 0
+	}
+	if !forceCompact && int64(segmentCount)*int64(savingsPerSegment) < minManifestQuerySubstitutionSavings {
 		return "", legacySuffix, 0
 	}
 	definition = fmt.Sprintf("#EXT-X-DEFINE:NAME=\"%s\",VALUE=\"%s\"\n", manifestQueryVariable, rawQuery)
