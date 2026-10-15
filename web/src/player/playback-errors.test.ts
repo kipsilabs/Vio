@@ -4,8 +4,10 @@ import {
   describePlanTerminal,
   describePlaybackTransportError,
   isDeadPlaybackSessionError,
+  isPlaybackSessionGoneError,
 } from "./playback-errors";
 import { PlayerFetchError } from "./player-fetch";
+import { V2ProblemError, V2TransportError } from "@/api/v2/request";
 
 describe("describePlanTerminal", () => {
   it("describes disabled video transcoding", () => {
@@ -301,5 +303,73 @@ describe("isDeadPlaybackSessionError", () => {
     ).toBe(false);
     expect(isDeadPlaybackSessionError(new PlayerFetchError(500, "Server error"))).toBe(false);
     expect(isDeadPlaybackSessionError(new Error("boom"))).toBe(false);
+  });
+});
+
+describe("isPlaybackSessionGoneError", () => {
+  it("rejects a proxy's untyped 404 whose HTML body has no problem code", () => {
+    // `mutationFetch` throws this for any non-2xx: an HTML proxy page parses
+    // to no problem, so the code is undefined. It is a transport failure, not
+    // the session being gone, and must stay on the retry path.
+    expect(
+      isPlaybackSessionGoneError(
+        new PlayerFetchError(404, "Not Found", undefined, "<html>404 Not Found</html>"),
+      ),
+    ).toBe(false);
+    expect(isPlaybackSessionGoneError(new PlayerFetchError(404, "Not Found"))).toBe(false);
+  });
+
+  it("accepts the problem codes the server sends for a gone session", () => {
+    // `not_found` is what the v2 progress adapter renders `session_not_found`
+    // as; the longer names are the v1/bridge and stopped-session forms.
+    expect(
+      isPlaybackSessionGoneError(
+        new PlayerFetchError(404, "Playback session not found", "not_found"),
+      ),
+    ).toBe(true);
+    expect(
+      isPlaybackSessionGoneError(
+        new PlayerFetchError(404, "Playback session not found", "session_not_found"),
+      ),
+    ).toBe(true);
+    expect(
+      isPlaybackSessionGoneError(
+        new PlayerFetchError(404, "Playback session not found", "playback_session_not_found"),
+      ),
+    ).toBe(true);
+    expect(
+      isPlaybackSessionGoneError(
+        new PlayerFetchError(410, "Playback session has ended", "playback_session_ended"),
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects a typed player error that names some other failure", () => {
+    expect(
+      isPlaybackSessionGoneError(new PlayerFetchError(404, "Source missing", "source_missing")),
+    ).toBe(false);
+    expect(
+      isPlaybackSessionGoneError(new PlayerFetchError(503, "Server busy", "unavailable")),
+    ).toBe(false);
+  });
+
+  it("accepts a v2 problem 404/410 and rejects everything untyped", () => {
+    const problem = (status: number) =>
+      new V2ProblemError("op", {
+        type: "https://siloserver.org/docs/api/v2/problems/not_found",
+        title: "Not found",
+        status,
+        detail: "Playback session not found.",
+        instance: "/api/v2/playback/session-1/progress",
+      });
+
+    expect(isPlaybackSessionGoneError(problem(404))).toBe(true);
+    expect(isPlaybackSessionGoneError(problem(410))).toBe(true);
+    // A proxy's non-problem body is a `V2TransportError`, never the session.
+    expect(isPlaybackSessionGoneError(new V2TransportError("op", 404, "not a problem"))).toBe(
+      false,
+    );
+    expect(isPlaybackSessionGoneError(new Error("404"))).toBe(false);
+    expect(isPlaybackSessionGoneError(null)).toBe(false);
   });
 });
