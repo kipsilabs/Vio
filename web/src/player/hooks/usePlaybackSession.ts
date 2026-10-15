@@ -649,8 +649,20 @@ export interface UsePlaybackSessionResult extends PlaybackSessionState {
   /**
    * Marks deferred discovery exhausted after polling attempts or deadline
    * time out, stopping the spinner and rendering an actionable failure state.
+   * Only a still-declared menu is marked; a call that names another
+   * `sessionId`/`mediaFileId` than the live session is a stale timer and is
+   * ignored.
    */
-  markInventoryExhausted: () => void;
+  markInventoryExhausted: (expected?: {
+    sessionId?: string | null;
+    mediaFileId?: number | null;
+  }) => void;
+  /**
+   * Clears a terminal discovery-failure marker when a fresh poll round takes
+   * over, so the menus show "Discovering…" while a fallback is retrying rather
+   * than a terminal notice beside an active retry.
+   */
+  markInventoryRetrying: () => void;
   /**
    * Reads the session's live inventory from the plan's `inventory_url` with the
    * folded revision as ETag. A 200 folds the verified (or failed) list through
@@ -3750,26 +3762,54 @@ export function usePlaybackSession(
     );
   }, [applyInventoryUpdate, config]);
 
-  const markInventoryExhausted = useCallback(() => {
-    inventoryPendingRef.current = false;
-    setState((current) => {
+  const markInventoryExhausted = useCallback(
+    (expected?: { sessionId?: string | null; mediaFileId?: number | null }) => {
+      // A timer armed for one session (or file) must not mark a replacement.
+      // This mirrors the deferred poll's identity guard: the call site passes
+      // the identity it polled for, and a mismatch is a stale callback.
+      if (
+        expected &&
+        (expected.sessionId !== sessionIdRef.current ||
+          expected.mediaFileId !== stateRef.current.mediaFileId)
+      ) {
+        return;
+      }
       // The attempt budget is spent. That is only a *failure* while a menu is
       // still showing declared/loading tracks; once positive probe evidence
       // (a verified push, a refreshed plan, or a catalog list) has resolved the
-      // inventory, a timed-out poll is moot and must not re-arm the
-      // "discovery did not complete" notice above a correct list.
-      const discoveryStillMissing =
-        current.audioInventoryProvisional || current.subtitleInventoryProvisional;
-      // Nothing to mark: no deferred poll owed and every menu already renders
-      // confident probe evidence. A later call must not resurrect a failure
-      // over that evidence. The legacy catalog poll reaches here with
-      // `inventoryPending` false but a still-declared menu, and that exhausted
-      // budget must read as a failure rather than an indefinite "Discovering…".
-      if (!current.inventoryPending && !discoveryStillMissing) {
-        return current;
+      // inventory, a spent budget is moot and must not re-arm the "discovery
+      // did not complete" notice above a correct list. Returning without
+      // touching the ref also leaves a deferred round that is still
+      // legitimately owed over confident menus in place.
+      const current = stateRef.current;
+      if (!current.audioInventoryProvisional && !current.subtitleInventoryProvisional) {
+        return;
       }
-      return { ...current, inventoryPending: false, inventoryFailed: discoveryStillMissing };
-    });
+      inventoryPendingRef.current = false;
+      setState((latest) => {
+        if (!latest.audioInventoryProvisional && !latest.subtitleInventoryProvisional) {
+          return latest;
+        }
+        return { ...latest, inventoryPending: false, inventoryFailed: true };
+      });
+    },
+    [],
+  );
+
+  /**
+   * Hands the discovery badge back to a fresh poll round.
+   *
+   * A deferred round that exhausted can be followed by the catalog fallback
+   * (WatchPage's legacy poll) still looking for probe evidence. Clearing the
+   * terminal marker here keeps the menus on "Discovering…" while that retry is
+   * actually in flight; the retry's own exhausted budget re-marks the failure.
+   * Without this, the terminal "discovery did not complete" notice would sit
+   * beside an active retry.
+   */
+  const markInventoryRetrying = useCallback(() => {
+    setState((current) =>
+      current.inventoryFailed ? { ...current, inventoryFailed: false } : current,
+    );
   }, []);
 
   return {
@@ -3788,6 +3828,7 @@ export function usePlaybackSession(
     refreshSubtitles,
     pollInventory,
     markInventoryExhausted,
+    markInventoryRetrying,
     applySubtitleTrack,
     applyAudioInventory,
     applyCommittedSource,
