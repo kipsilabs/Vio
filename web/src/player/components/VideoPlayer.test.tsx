@@ -72,6 +72,10 @@ const hlsJS = vi.hoisted(() => ({
   stopLoad: vi.fn(),
   latest: null as null | { emit: (event: string, data: unknown) => void },
   bufferAppendedHandler: null as null | ((event: unknown, data?: unknown) => void),
+  // When true, a mocked loadSource emits MANIFEST_LOADING but not
+  // MANIFEST_LOADED, so the player's manifest load stays in flight. Tests use
+  // it to drive a request that lands while a manifest load is open.
+  holdManifestLoad: false,
 }));
 // Captures the onSourceChanged handlers the mocked subtitle hooks receive, so
 // tests can drive a subtitle_source_changed (409) signal from the outside.
@@ -139,6 +143,8 @@ vi.mock("hls.js", () => ({
   default: class MockHls {
     static Events = {
       ERROR: "error",
+      MANIFEST_LOADING: "hlsManifestLoading",
+      MANIFEST_LOADED: "hlsManifestLoaded",
       MANIFEST_PARSED: "manifestParsed",
       BUFFER_APPENDED: "bufferAppended",
     };
@@ -167,7 +173,9 @@ vi.mock("hls.js", () => ({
     }
     loadSource(url: string) {
       this.url = url;
+      this.emit("hlsManifestLoading", { url });
       hlsJS.loadSource(url);
+      if (!hlsJS.holdManifestLoad) this.emit("hlsManifestLoaded", { url });
     }
     emit(event: string, data: unknown) {
       this.handlers.get(event)?.(event, data);
@@ -3175,6 +3183,7 @@ describe("VideoPlayer stale generation recovery", () => {
     hlsJS.loadSource.mockClear();
     hlsJS.errorHandler = null;
     hlsJS.bufferAppendedHandler = null;
+    hlsJS.holdManifestLoad = false;
     vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
     vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
     vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => {});
@@ -3294,6 +3303,38 @@ describe("VideoPlayer stale generation recovery", () => {
     expect(hlsJS.loadSource).toHaveBeenCalledTimes(3);
     expect(hlsJS.startLoad).not.toHaveBeenCalled();
     expect(onPlanFailure).not.toHaveBeenCalled();
+  });
+
+  it("coalesces a stale-generation refetch raised during an in-flight manifest load", async () => {
+    // The manifest request the transport already has open does not settle, so a
+    // stale-generation fence on a segment arrives while it is still in flight.
+    hlsJS.holdManifestLoad = true;
+    const onPlanFailure = vi.fn();
+    renderPlayer({
+      plan: hlsTranscodePlan(),
+      streamUrl: transcodeStreamUrl,
+      onPlanFailure,
+      shouldAutoPlay: false,
+    });
+    await waitFor(() => expect(hlsJS.errorHandler).toBeTypeOf("function"));
+    // The initial manifest load is open; only the recovery refetch is observed.
+    hlsJS.loadSource.mockClear();
+
+    act(() => {
+      hlsJS.errorHandler?.("error", staleSegfault());
+    });
+
+    // No second concurrent manifest request: the refetch is queued behind the
+    // in-flight load instead of racing it.
+    expect(hlsJS.loadSource).not.toHaveBeenCalled();
+    expect(onPlanFailure).not.toHaveBeenCalled();
+
+    // Once the in-flight load settles, the queued refetch runs exactly once.
+    act(() => {
+      hlsJS.latest?.emit("hlsManifestLoaded", { url: transcodeStreamUrl });
+    });
+    expect(hlsJS.loadSource).toHaveBeenCalledTimes(1);
+    expect(hlsJS.loadSource.mock.calls[0]?.[0]).toContain("master.m3u8");
   });
 });
 
