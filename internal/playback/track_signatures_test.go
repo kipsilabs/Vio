@@ -318,3 +318,86 @@ func TestClientAudioSignatureMatchesTrackStrictMatchersUntouched(t *testing.T) {
 		t.Fatalf("remapped position = %d, want -1: probe-derived re-identification must stay fail-closed", got)
 	}
 }
+
+// TestClientAudioSignatureMatchesTrackLanguagesMembership pins the Languages
+// member as a per-member membership test rather than an exact multiset: a
+// snapshot that enumerated only some of a probed track's MULTi languages is not
+// refuted by the fuller demux, while a stated member the track does not carry
+// (including a different explicit region) still refutes.
+func TestClientAudioSignatureMatchesTrackLanguagesMembership(t *testing.T) {
+	cases := []struct {
+		name  string
+		track models.AudioTrack
+		sig   *userstore.AudioTrackSignature
+		want  bool
+	}{
+		{
+			name:  "a partial stated list is carried by the fuller probed list",
+			track: models.AudioTrack{Language: "mul", Languages: []string{"en", "de"}, Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Codec: "aac", Channels: 2, Languages: []string{"en"}},
+			want:  true,
+		},
+		{
+			name:  "every stated member of a matching list is carried",
+			track: models.AudioTrack{Language: "mul", Languages: []string{"de", "en"}, Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Codec: "aac", Channels: 2, Languages: []string{"en", "de"}},
+			want:  true,
+		},
+		{
+			name:  "a stated member absent from the track refutes",
+			track: models.AudioTrack{Language: "mul", Languages: []string{"en", "de"}, Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Codec: "aac", Channels: 2, Languages: []string{"fr"}},
+			want:  false,
+		},
+		{
+			name:  "a stated member partially absent refutes",
+			track: models.AudioTrack{Language: "mul", Languages: []string{"en", "de"}, Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Codec: "aac", Channels: 2, Languages: []string{"en", "fr"}},
+			want:  false,
+		},
+		{
+			name:  "a bare stated member is carried by a regional variant",
+			track: models.AudioTrack{Language: "mul", Languages: []string{"en-US"}, Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Codec: "aac", Channels: 2, Languages: []string{"en"}},
+			want:  true,
+		},
+		{
+			name:  "a stated explicit region is carried by a bare track tag",
+			track: models.AudioTrack{Language: "mul", Languages: []string{"en"}, Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Codec: "aac", Channels: 2, Languages: []string{"en-US"}},
+			want:  true,
+		},
+		{
+			name:  "a stated explicit region is not carried by a different region",
+			track: models.AudioTrack{Language: "en-GB", Languages: []string{"en-GB"}, Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Codec: "aac", Channels: 2, Languages: []string{"en-US"}},
+			want:  false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ClientAudioSignatureMatchesTrack(tc.track, tc.sig); got != tc.want {
+				t.Fatalf("ClientAudioSignatureMatchesTrack(%+v, %+v) = %v, want %v", tc.track, tc.sig, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestClientAudioSignatureMatchesTrackDefaultOnlyIsOverLenient pins the
+// documented over-leniency: the signature's Default flag is never compared, so a
+// signature that carries Default and no other member constrains nothing and
+// matches every track. That is acceptable only because this predicate answers a
+// presence question and is never a selector, so an under-constrained positive
+// cannot move a transport onto the wrong stream.
+func TestClientAudioSignatureMatchesTrackDefaultOnlyIsOverLenient(t *testing.T) {
+	sig := &userstore.AudioTrackSignature{Default: true}
+	for _, track := range []models.AudioTrack{
+		{Index: 0, Language: "en", Codec: "aac", Channels: 2},
+		{Index: 1, Language: "de", Codec: "eac3", Channels: 6, Layout: "5.1", Default: true},
+		{Index: -1, Default: true},
+	} {
+		if !ClientAudioSignatureMatchesTrack(track, sig) {
+			t.Fatalf("a Default-only signature must not refute track %+v", track)
+		}
+	}
+}
