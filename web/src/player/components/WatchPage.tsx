@@ -832,6 +832,12 @@ function WatchPagePlayer({
       // verified on its own. The badge and the server's declared state stay put
       // until an authoritative payload carries `inventory_status: "verified"`.
       if (completedAttempts >= INVENTORY_REFRESH_MAX_ATTEMPTS || Date.now() >= deadline) {
+        // Same contract as the deferred `inventory_url` poll: an exhausted
+        // budget on a still-declared menu is a terminal failure, not an
+        // indefinite "Discovering…". `markInventoryExhausted` only sets the
+        // failure while a menu is still provisional, so a verified list is
+        // never mislabeled.
+        sessionRef.current.markInventoryExhausted();
         return;
       }
       scheduledAttempts += 1;

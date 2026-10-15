@@ -2184,6 +2184,65 @@ describe("WatchPage live inventory refresh", () => {
     expect(fetchWatchDetailMock).not.toHaveBeenCalled();
   });
 
+  it("marks the legacy catalog poll exhausted when its budget runs out", async () => {
+    const markInventoryExhausted = vi.fn();
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        mediaFileId: 7,
+        planAudioTracks: richerAudioTracks,
+        audioInventoryProvisional: true,
+        subtitleUrls: [],
+        subtitleInventoryProvisional: true,
+        inventoryUrl: null,
+        inventoryPending: false,
+        markInventoryExhausted,
+      }),
+    );
+    // The catalog never gains probe evidence, so the legacy poll spends its
+    // whole attempt budget looking. No `inventory_url` means the deferred poll
+    // never runs; this is the older-server path.
+    fetchWatchDetailMock.mockResolvedValue({
+      versions: [{ ...virtualVersion, audio_tracks: [], subtitle_tracks: [] }],
+    });
+
+    render(createElement(WatchPage, { ...watchPageProps, versions: [virtualVersion] }));
+
+    expect(markInventoryExhausted).not.toHaveBeenCalled();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(INVENTORY_REFRESH_INTERVAL_MS * 10);
+    });
+
+    expect(fetchWatchDetailMock).toHaveBeenCalledTimes(5);
+    // The exhausted budget must read as a terminal failure rather than leaving
+    // the menus on an indefinite "Discovering…".
+    expect(markInventoryExhausted).toHaveBeenCalled();
+  });
+
+  it("does not mark the legacy poll failed once a verified list is present", async () => {
+    const markInventoryExhausted = vi.fn();
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        mediaFileId: 7,
+        planAudioTracks: richerAudioTracks,
+        subtitleUrls: [planSubtitle],
+        inventoryUrl: null,
+        inventoryPending: false,
+        markInventoryExhausted,
+      }),
+    );
+
+    render(createElement(WatchPage, { ...watchPageProps, versions: [virtualVersion] }));
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000);
+    });
+
+    // A confident list never starts the legacy poll, so nothing is exhausted.
+    expect(fetchWatchDetailMock).not.toHaveBeenCalled();
+    expect(markInventoryExhausted).not.toHaveBeenCalled();
+  });
+
   it("retains a still-declared badge when the poll's reads stay empty", async () => {
     const applyInventoryUpdate = vi.fn();
     playbackSessionMock.mockReturnValue(
