@@ -5288,7 +5288,11 @@ describe("usePlaybackSession plan audio inventory", () => {
       result.current.markInventoryExhausted();
     });
 
-    expect(result.current.inventoryPending).toBe(false);
+    // The menus already render confident probe evidence, so the spent budget
+    // is moot: it must not re-arm the failure notice, and it must not clear the
+    // deferred round that is still legitimately owed (a fresh round must not be
+    // killed by a stale exhaustion).
+    expect(result.current.inventoryPending).toBe(true);
     expect(result.current.inventoryFailed).toBe(false);
     // The confident list is untouched.
     expect(result.current.planAudioTracks).toHaveLength(2);
@@ -6106,6 +6110,244 @@ describe("usePlaybackSession plan audio inventory", () => {
     expect(result.current.audioInventoryProvisional).toBe(false);
     expect(result.current.subtitleInventoryProvisional).toBe(false);
     expect(result.current.planAudioTracks).toEqual(verifiedAudio);
+
+    unmount();
+  });
+
+  it("ignores an exhaustion that names a replaced session or file", async () => {
+    // A timer armed for one session (or file) can fire after the player has
+    // moved on. The expected identity passed with the call must drop it rather
+    // than mark the live session's menus failed.
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3", "deferred_track_inventory_v1"],
+            outcome: "playable",
+            session_id: "session-guard",
+            playback_plan: fixturePlanV3({
+              session_id: "session-guard",
+              tracks_pending: true,
+              inventory_url: "/api/v2/playback/session-guard/inventory",
+              inventory_status: "declared",
+              inventory_provenance: "pending",
+              effective_media_file_id: 7,
+              audio_tracks: [
+                { codec: "aac", channels: 2, layout: "stereo", language: "eng", default: true },
+              ],
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-guard", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    expect(result.current.inventoryPending).toBe(true);
+    expect(result.current.inventoryFailed).toBe(false);
+
+    // A stale session id is dropped.
+    act(() => {
+      result.current.markInventoryExhausted({ sessionId: "session-replaced", mediaFileId: 7 });
+    });
+    expect(result.current.inventoryFailed).toBe(false);
+    expect(result.current.inventoryPending).toBe(true);
+
+    // A stale file id is dropped too.
+    act(() => {
+      result.current.markInventoryExhausted({ sessionId: "session-guard", mediaFileId: 99 });
+    });
+    expect(result.current.inventoryFailed).toBe(false);
+    expect(result.current.inventoryPending).toBe(true);
+
+    // The live identity marks the exhausted budget failed.
+    act(() => {
+      result.current.markInventoryExhausted({ sessionId: "session-guard", mediaFileId: 7 });
+    });
+    expect(result.current.inventoryFailed).toBe(true);
+    expect(result.current.inventoryPending).toBe(false);
+
+    unmount();
+  });
+
+  it("marks a sub-less file failed while its subtitle inventory is still declared", async () => {
+    // A declared plan with no subtitles: probe evidence for the audio menu can
+    // land, but the empty subtitle list is still declared metadata. An exhausted
+    // budget is then a discovery failure, because an unprobed or failed probe
+    // also serves an empty list — only a verified-empty inventory is the
+    // confident sub-less state.
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-sub-less",
+            playback_plan: fixturePlanV3({
+              session_id: "session-sub-less",
+              inventory_status: "declared",
+              effective_media_file_id: 7,
+              audio_tracks: [
+                { codec: "aac", channels: 2, layout: "stereo", language: "eng", default: true },
+              ],
+              subtitle: { mode: "off", inventory: [] },
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-sub-less", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    expect(result.current.audioInventoryProvisional).toBe(true);
+    expect(result.current.subtitleInventoryProvisional).toBe(true);
+    expect(result.current.subtitleUrls).toHaveLength(0);
+
+    // The catalog poll supplies probe evidence for the audio menu only.
+    act(() => {
+      result.current.applyAudioInventory(
+        [
+          { codec: "eac3", channels: 2, layout: "stereo", language: "en", default: true },
+          { codec: "eac3", channels: 2, layout: "stereo", language: "ja", default: false },
+        ],
+        7,
+      );
+    });
+
+    expect(result.current.audioInventoryProvisional).toBe(false);
+    expect(result.current.subtitleInventoryProvisional).toBe(true);
+
+    act(() => {
+      result.current.markInventoryExhausted();
+    });
+
+    // The confident audio list does not rescue the still-declared, empty
+    // subtitle menu: the exhausted budget is the terminal failure.
+    expect(result.current.inventoryFailed).toBe(true);
+    expect(result.current.subtitleInventoryProvisional).toBe(true);
+    expect(result.current.planAudioTracks).toHaveLength(2);
+
+    unmount();
+  });
+
+  it("does not stick the failure badge when a replan is in flight at exhaustion", async () => {
+    // The deferred poll budget can expire while a replan is still resolving.
+    // The stale failure must not outlive the replan: its confident inventory is
+    // adopted and the badge clears over it.
+    const verifiedAudio = [
+      { codec: "eac3", channels: 6, layout: "5.1", language: "en", default: true },
+    ];
+    const verifiedSubtitles = [
+      fixtureSubtitleInventoryItemV3({ track_id: "file:7:subtitle:0", combined_index: 0 }),
+    ];
+    let resolveReplan: ((response: Response) => void) | null = null;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3", "deferred_track_inventory_v1"],
+            outcome: "playable",
+            session_id: "session-replan-exhaust",
+            playback_plan: fixturePlanV3({
+              session_id: "session-replan-exhaust",
+              tracks_pending: true,
+              inventory_url: "/api/v2/playback/session-replan-exhaust/inventory",
+              inventory_status: "declared",
+              inventory_provenance: "pending",
+              effective_media_file_id: 7,
+              audio_tracks: [
+                { codec: "aac", channels: 2, layout: "stereo", language: "eng", default: true },
+              ],
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/replan")) {
+        return new Promise<Response>((resolve) => {
+          resolveReplan = resolve;
+        });
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-replan-exhaust", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    expect(result.current.audioInventoryProvisional).toBe(true);
+    expect(result.current.subtitleInventoryProvisional).toBe(true);
+
+    let pendingReplan: Promise<boolean> | undefined;
+    await act(async () => {
+      pendingReplan = result.current.reanchorSeek(120);
+    });
+    // The replan mock resolves its dynamic import before issuing the fetch, so
+    // the pending response resolver is attached a microtask later.
+    expect(resolveReplan).not.toBeNull();
+
+    // The budget expires while the replan is still resolving.
+    act(() => {
+      result.current.markInventoryExhausted();
+    });
+    expect(result.current.inventoryFailed).toBe(true);
+
+    await act(async () => {
+      resolveReplan?.(
+        jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "playable",
+          session_id: "session-replan-exhaust",
+          playback_plan: fixturePlanV3({
+            session_id: "session-replan-exhaust",
+            plan_id: "plan:replan-confident",
+            plan_attempt_key: "v3:replan-confident",
+            inventory_url: "/api/v2/playback/session-replan-exhaust/inventory",
+            effective_media_file_id: 7,
+            audio_tracks: verifiedAudio,
+            subtitle: { mode: "off", inventory: verifiedSubtitles },
+          }),
+        }),
+      );
+      await pendingReplan;
+    });
+
+    // The replan's result is adopted and the stale failure badge does not stick.
+    expect(result.current.inventoryFailed).toBe(false);
+    expect(result.current.audioInventoryProvisional).toBe(false);
+    expect(result.current.subtitleInventoryProvisional).toBe(false);
+    expect(result.current.planAudioTracks).toEqual(verifiedAudio);
+    expect(result.current.subtitleUrls).toHaveLength(1);
 
     unmount();
   });
