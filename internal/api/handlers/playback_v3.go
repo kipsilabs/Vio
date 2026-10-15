@@ -8621,6 +8621,15 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 					carriedCopy.AudioTracks = session.VirtualAudioTracks
 					carried = &carriedCopy
 				}
+				// The catalog row may be a fresh listing row the provider has
+				// never let the probe stamp: it carries no bit depth, frame
+				// rate, or bitrate, and planning against it would terminal
+				// source_metadata_incomplete on a user-intent replan that
+				// re-selects within the release already playing. The running
+				// plan's validated source descriptor is the carried probe
+				// evidence for exactly these bytes, so prefer it over the
+				// unprobed row. Only gaps are filled.
+				carried = carryValidatedVirtualVideoEvidenceV3(carried, record.CurrentPlan.Source)
 				currentEffectiveFile = carried
 			} else {
 				// The session-bound release is preferred so re-ranking cannot
@@ -11349,6 +11358,130 @@ func virtualPinnedProfileRowV3(session *playback.Session, row *models.MediaFile)
 		return false
 	}
 	return sameVirtualProfileScope(rowPath, pinned)
+}
+
+// carryValidatedVirtualVideoEvidenceV3 tops up a carried pinned candidate's
+// planner-grade video evidence from the source descriptor the running plan
+// validated. A user-intent replan (track_change or seek_reanchor) re-selects
+// within the release already playing, and the carry predicate has already
+// proven the session's pinned evidence describes these bytes. When the reloaded
+// catalog row is a fresh listing row the provider never let the probe stamp, it
+// has no bit depth, frame rate, or bitrate and planning it would terminal
+// source_metadata_incomplete on metadata the running plan already validated —
+// the menu click and the unbuffered seek that appear inert. The plan's source
+// descriptor is the carried probe evidence for exactly these bytes, so it is
+// preferred over the unprobed row. Only gaps are filled, and only when the
+// descriptor names the same row, so a row that already carries complete
+// evidence (or a descriptor for another row) is left untouched.
+func carryValidatedVirtualVideoEvidenceV3(file *models.MediaFile, source playback.SourceDescriptorV3) *models.MediaFile {
+	if file == nil || !isVirtualPlaybackFile(file) {
+		return file
+	}
+	if completeVirtualVideoEvidenceV3(file) {
+		return file
+	}
+	if source.MediaFileID != file.ID || source.VideoCodec == "" ||
+		source.BitDepth <= 0 || source.Width <= 0 || source.Height <= 0 ||
+		source.FrameRate <= 0 || source.BitrateKbps <= 0 {
+		return file
+	}
+	carried := *file
+	if carried.CodecVideo == "" {
+		carried.CodecVideo = source.VideoCodec
+	}
+	if carried.Container == "" || strings.EqualFold(carried.Container, "virtual") {
+		if source.Container != "" {
+			carried.Container = source.Container
+		}
+	}
+	if carried.Bitrate == 0 {
+		carried.Bitrate = source.BitrateKbps
+	}
+	if len(carried.VideoTracks) == 0 {
+		carried.VideoTracks = []models.VideoTrack{virtualVideoTrackFromDescriptorV3(source)}
+		return &carried
+	}
+	track := &carried.VideoTracks[0]
+	if track.Codec == "" {
+		track.Codec = source.VideoCodec
+	}
+	if track.BitDepth == 0 {
+		track.BitDepth = source.BitDepth
+	}
+	if track.Width == 0 {
+		track.Width = source.Width
+	}
+	if track.Height == 0 {
+		track.Height = source.Height
+	}
+	if virtualFrameRateV3(track.FrameRate) <= 0 {
+		track.FrameRate = strconv.FormatFloat(source.FrameRate, 'f', -1, 64)
+	}
+	if track.Bitrate == 0 {
+		track.Bitrate = source.BitrateKbps
+	}
+	return &carried
+}
+
+// virtualVideoTrackFromDescriptorV3 reconstructs the primary video track the
+// running plan validated from its source descriptor. It is deliberately
+// lossless for the fields the planner reads for route selection: codec,
+// profile, level, bit depth, dimensions, frame rate, bitrate, color range, and
+// the dynamic-range classification (via the range-type text, with the DV
+// profile carried explicitly). The session's DV pin is applied after the carry
+// and re-overwrites the profile for a pinned row, so the two never disagree.
+func virtualVideoTrackFromDescriptorV3(source playback.SourceDescriptorV3) models.VideoTrack {
+	track := models.VideoTrack{
+		Codec:          source.VideoCodec,
+		Profile:        source.VideoProfile,
+		Level:          source.VideoLevel,
+		BitDepth:       source.BitDepth,
+		Width:          source.Width,
+		Height:         source.Height,
+		FrameRate:      strconv.FormatFloat(source.FrameRate, 'f', -1, 64),
+		Bitrate:        source.BitrateKbps,
+		ColorRange:     source.ColorRange,
+		HDR10Plus:      source.HDR10Plus,
+		VideoRangeType: source.DynamicRange,
+	}
+	if source.DVProfile > 0 {
+		track.DVProfile = source.DVProfile
+		track.DVLevel = source.DVLevel
+		track.DVBLCompatID = source.DVBLCompatID
+		// The descriptor carries a single aggregated base-layer provenance
+		// flag. Reproduce it only when it was proven; an unproven profile keeps
+		// the three presence booleans false so the route resolution fails
+		// closed instead of inventing a compatible base layer.
+		if source.DVBaseLayerProven {
+			track.DVConfigPresent = true
+			track.DVBLCompatIDPresent = true
+			track.DVBLPresent = true
+		}
+	}
+	if layer := strings.TrimSpace(string(source.DVEnhancementLayer)); layer != "" {
+		track.DVEnhancementLayer = layer
+	}
+	return track
+}
+
+// virtualFrameRateV3 parses a stored frame-rate string the same way the planner
+// does, without importing the playback parser into the handler: the "N/D" and
+// decimal forms both feed routeVideoMetadataCompleteV3, and a synthesized value
+// must round-trip through that parser.
+func virtualFrameRateV3(value string) float64 {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if parts := strings.Split(value, "/"); len(parts) == 2 {
+		n, nErr := strconv.ParseFloat(parts[0], 64)
+		d, dErr := strconv.ParseFloat(parts[1], 64)
+		if nErr == nil && dErr == nil && d != 0 {
+			return n / d
+		}
+	}
+	v, _ := strconv.ParseFloat(value, 64)
+	return v
 }
 
 // sessionHasVirtualProvenanceV3 reports whether the session holds any provenance
