@@ -99,6 +99,12 @@ export function usePlaybackRealtime({
     let attempt = 0;
     let socket: WebSocket | null = null;
     let reconnectTimer: number | null = null;
+    // Whether a ticket has been minted for this session. A session-scoped 404
+    // on the very first mint may be a replica that has not seen the row a start
+    // just wrote, so the first failure gets one bounded retry; after a ticket
+    // exists, a 404 is terminal.
+    let mintSucceeded = false;
+    let sessionGoneRetryUsed = false;
 
     let terminated = false;
     const scheduleReconnect = () => {
@@ -209,7 +215,8 @@ export function usePlaybackRealtime({
 
       void mintPlaybackControlSocketTicket(sessionId, installationId, authority)
         .then((ticket) => {
-          if (disposed || !authorityActive()) return;
+          if (disposed || terminated || !authorityActive()) return;
+          mintSucceeded = true;
           try {
             attach(
               new WebSocket(
@@ -233,7 +240,16 @@ export function usePlaybackRealtime({
             // The session no longer exists server-side (a restart, expiry, or
             // terminate). Retrying the mint can never succeed, so the loop
             // stops; the player runs its one recovery or surfaces the lost
-            // state. A later session id re-runs this effect and resets.
+            // state. A later session id re-runs this effect and resets. The
+            // first mint is the exception: a start may have just written the
+            // row and this mint can race a replica that has not seen it, so
+            // one retry is allowed before the loss is called terminal.
+            if (!mintSucceeded && !sessionGoneRetryUsed) {
+              sessionGoneRetryUsed = true;
+              setConnectionState("disconnected");
+              scheduleReconnect();
+              return;
+            }
             terminate();
             setConnectionState("disconnected");
             onSessionLostRef.current?.();
