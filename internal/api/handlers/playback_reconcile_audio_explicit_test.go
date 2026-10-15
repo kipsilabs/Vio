@@ -340,6 +340,72 @@ func TestVerifyExplicitAudioSelectionGenuineAbsenceStaysRecoverable(t *testing.T
 	}
 }
 
+// TestReconcileVerifiedDefaultAudioFromCommittedEmptyInventoryRefusesExplicit
+// pins the verified-empty-inventory case: a durable probe write that committed
+// a VERIFIED inventory with zero audio tracks is ground truth that the file
+// carries no audio, so the committed explicit selection cannot be present. The
+// reconcile sweep must still evaluate the session and record the refusal (plus
+// a Warn) for observability, without emitting a terminal route event, and the
+// verified-empty overlay application must remain the fail-closed half of the
+// chain that re-resolves the stream.
+func TestReconcileVerifiedDefaultAudioFromCommittedEmptyInventoryRefusesExplicit(t *testing.T) {
+	verified := &models.MediaFile{
+		ID:             7,
+		FilePath:       "virtual://episode/partial-signature",
+		AudioTracks:    []models.AudioTrack{{Index: 0, Language: "ja", Codec: "aac", Channels: 2, Layout: "stereo"}},
+		ProbeUpdatedAt: probeStampPtr(t),
+	}
+	f := newExplicitReconcileFixture(t, verified)
+	// The committed carrier carries no audio: the probe enumerated zero tracks.
+	committed := virtualCommittedProbeInventory{
+		fileID:       verified.ID,
+		candidateURI: verified.FilePath,
+	}
+	f.handler.reconcileVerifiedDefaultAudioFromCommitted(context.Background(), committed)
+
+	after, err := f.handler.PlanStoreV3.GetAttempt(context.Background(), f.session.ID)
+	if err != nil {
+		t.Fatalf("get attempt after reconcile: %v", err)
+	}
+	// The synthetic verified row carries no probe stamp, so the generation is the
+	// empty-inventory track fingerprint — the same key this helper derives for a
+	// row with no probe stamp and no audio tracks.
+	generation := reconcileGenerationV3(&models.MediaFile{})
+	entry := playback.FindAudioReconcileEntry(after.AudioReconcileLedger, generation, f.session.ID)
+	if entry == nil || entry.Decision != playback.AudioReconcileRefused {
+		t.Fatalf("a verified-empty inventory must record the explicit refusal, got %+v", entry)
+	}
+	for _, event := range f.drainRouteEvents() {
+		if event.Event == playback.RouteEventTerminalV3 {
+			t.Fatalf("a verified-empty inventory must not hard-terminate the stream: %+v", event)
+		}
+	}
+
+	// The refusal is observability-only; the overlay fail-closed chain still
+	// applies. Applying the verified-empty overlay cannot re-identify the
+	// committed selection, so the session is marked fail-closed and the client's
+	// own recovery replan re-resolves rather than the transport drifting onto
+	// another track.
+	manager, ok := f.handler.sessionMgr.(*playback.SessionManager)
+	if !ok {
+		t.Fatal("handler session manager is not a *playback.SessionManager")
+	}
+	live := reconcileLiveSession(t, f.handler, f.session.ID)
+	binding, err := manager.VirtualSourceBinding(live.ID)
+	if err != nil {
+		t.Fatalf("virtual source binding: %v", err)
+	}
+	applied, err := manager.SetVirtualProbeVerifiedInventoryIfBinding(live.ID, binding, "rev-verified-empty", nil, nil, nil)
+	if err != nil || !applied {
+		t.Fatalf("verified-empty overlay write: applied=%v err=%v", applied, err)
+	}
+	live = reconcileLiveSession(t, f.handler, f.session.ID)
+	if live.AudioTrackIndex != -1 || !live.VirtualAudioSelectionInvalid {
+		t.Fatalf("a verified-empty overlay must fail closed: index=%d invalid=%v",
+			live.AudioTrackIndex, live.VirtualAudioSelectionInvalid)
+	}
+}
+
 func probeStampPtr(t *testing.T) *time.Time {
 	t.Helper()
 	return &invalidationProbeStamp

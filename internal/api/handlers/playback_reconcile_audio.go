@@ -118,9 +118,16 @@ func (h *PlaybackHandler) reconcileSessionDefaultAudio(ctx context.Context, sess
 // carried onto the synthetic verified row so the same bound-release checks the
 // reread path applies still run.
 func (h *PlaybackHandler) reconcileVerifiedDefaultAudioFromCommitted(ctx context.Context, committed virtualCommittedProbeInventory) {
-	if h == nil || h.sessionMgr == nil || !committed.committed() || len(committed.audio) == 0 {
+	if h == nil || h.sessionMgr == nil || !committed.committed() {
 		return
 	}
+	// A verified inventory with zero audio tracks is still evaluated: the
+	// ground truth it commits is that the file carries no audio, so an explicit
+	// selection cannot be present and must be recorded (refused + Warn, never a
+	// terminal), exactly as a populated inventory with the selection missing
+	// does. The automatic path no-ops on an empty inventory because there is
+	// nothing to select; skipping the sweep here would instead leave an explicit
+	// selection with no durable record.
 	lookup, ok := h.sessionMgr.(mediaFileSessionLookup)
 	if !ok {
 		return
@@ -1340,7 +1347,7 @@ func (h *PlaybackHandler) verifyExplicitAudioSelection(ctx context.Context, sess
 		return
 	}
 	verified, err := h.fileResolver.GetByID(ctx, fileID)
-	if err != nil || verified == nil || len(verified.AudioTracks) == 0 {
+	if err != nil || verified == nil {
 		return
 	}
 	if !reconcileProbeVerifiedV3(verified) {
@@ -1350,9 +1357,13 @@ func (h *PlaybackHandler) verifyExplicitAudioSelection(ctx context.Context, sess
 }
 
 func (h *PlaybackHandler) verifyExplicitAudioSelectionForInventory(ctx context.Context, session *playback.Session, intent audioSelectionIntent, fileID int, verified *models.MediaFile) {
-	if h == nil || verified == nil || len(verified.AudioTracks) == 0 {
+	if h == nil || verified == nil {
 		return
 	}
+	// An empty verified inventory is not skipped: zero audio tracks is a
+	// positive verdict that the selection is absent (explicitAudioSelectionPresent
+	// finds no candidate in it), so the refusal below is recorded. Only a nil
+	// carrier leaves nothing to verify.
 	live, err := h.sessionMgr.GetSession(session.ID)
 	if err != nil || live == nil {
 		return
