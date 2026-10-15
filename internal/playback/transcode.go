@@ -296,6 +296,20 @@ type TranscodeSession struct {
 	demuxErrorCount  int
 	lastDemuxErrorAt time.Time
 	demuxStamped     bool
+	// asyncRestartErr latches the terminal failure of a detached far-seek
+	// restart. The worker that scheduled the restart answers its own request
+	// with stale_generation unconditionally, so without the latch a dead source
+	// (demux stamp, decoder rejection, resolve/validation failure) would present
+	// as a second stale_generation on the retry and burn the client's recovery
+	// budget before the ordinary failure path. The next segment request surfaces
+	// this verdict instead; the next successful restart clears it. Guarded by mu.
+	asyncRestartErr error
+	// lifecycleAlive, when non-nil, reports whether this session is still the
+	// live mapped session. The manager installs it around a restart so the
+	// restart cannot re-spawn ffmpeg for a session a concurrent stop already
+	// unregistered. Nil means "not managed here" and is treated as alive.
+	// Guarded by mu.
+	lifecycleAlive func() bool
 	// Decoder-verdict lifecycle. Each ffmpeg generation moves observing ->
 	// suspected -> confirmed independently. decodeErrorCount counts decoder
 	// failure lines within the current decay window and lastDecodeErrorAt
@@ -406,6 +420,14 @@ type SegmentRecoveryDecision struct {
 	Reason           string
 	Progress         SegmentProgress
 }
+
+// SegmentRecoveryFarSeekReason is the decision reason for a request whose
+// segment lies past the produced window and cannot be reached by waiting on the
+// active encode (an arbitrary seek, not the next sequential fragment). The
+// recovery is a seek restart, and because any restart rotates the generation,
+// the request that triggers it must be answered with the stale-generation
+// verdict rather than held for bytes its own generation fence will refuse.
+const SegmentRecoveryFarSeekReason = "request_beyond_produced_window"
 
 // defaultSegmentDuration is the segment length when not specified. Short
 // segments (2s) allow the player to start quickly while still maintaining
@@ -3461,7 +3483,7 @@ func (s *TranscodeSession) SegmentRecoveryDecision(segNum int, now time.Time) Se
 			decision.RestartOnTimeout = false
 			decision.Reason = "near_produced_head"
 		} else {
-			decision.Reason = "request_beyond_produced_window"
+			decision.Reason = SegmentRecoveryFarSeekReason
 		}
 	case progress.ProducedHead >= progress.StartSegmentNumber && now.Sub(progress.LastProducedAt) > staleProducedWindow(progress.SegmentDuration):
 		decision.Reason = "produced_output_stale"
@@ -4209,6 +4231,20 @@ func (s *TranscodeSession) restart(
 	// As in StartTranscode, stamp the generation before the process can write.
 	inheritedManifest := statManifest(opts.OutputDir)
 	startedAt := time.Now()
+	// A concurrent stop can unregister this session between the manager's
+	// guarded check and this respawn. Re-check under no session lock right
+	// before spawning so a closed session is not rebuilt at all.
+	if !s.lifecycleAliveNow() {
+		cancel()
+		releaseHWDevice()
+		s.mu.Lock()
+		flight.err = ErrSessionSuperseded
+		s.restarting = nil
+		s.waitErr = ErrSessionSuperseded
+		s.mu.Unlock()
+		close(flight.done)
+		return ErrSessionSuperseded
+	}
 	if err := cmd.Start(); err != nil {
 		processmetrics.Record(processmetrics.Transcode, nil, err, ctx.Err())
 		cancel()
@@ -4233,6 +4269,10 @@ func (s *TranscodeSession) restart(
 	s.runningRecipe = nextRecipe
 	s.running = true
 	s.restarting = nil
+	// A successful replacement generation supersedes any latched failure from a
+	// prior detached restart: the segment request path must not keep answering
+	// the old verdict for a session that is producing again.
+	s.asyncRestartErr = nil
 	s.stdinPipe = stdinPipe
 	s.lastRequestedSegment = startSegment
 	s.lastCompletedSegment = startSegment - 1
@@ -4247,6 +4287,18 @@ func (s *TranscodeSession) restart(
 	close(flight.done)
 
 	go s.monitorFFmpeg(ctx, cmd, s.done, releaseHWDevice)
+
+	// Re-check after spawning: a stop that unregistered the session while this
+	// process was starting already closed the previous one, so it would not have
+	// killed this replacement. Stop it and wait for the reap so no ffmpeg
+	// survives the close.
+	if !s.lifecycleAliveNow() {
+		cancel()
+		if done := s.Done(); done != nil {
+			<-done
+		}
+		return ErrSessionSuperseded
+	}
 
 	if hook != nil {
 		hook(ctx)
@@ -5674,6 +5726,63 @@ func (s *TranscodeSession) IsDemuxFailed() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.demuxStamped
+}
+
+// RecordAsyncRestartFailure latches a terminal detached-restart failure so the
+// next segment request answers the real verdict rather than scheduling another
+// restart and returning stale_generation a second time. The first failure wins:
+// a later failure from a restart racing the same dead generation is not more
+// specific, and keeping the earliest preserves the cause the client can act on.
+func (s *TranscodeSession) RecordAsyncRestartFailure(err error) {
+	if s == nil || err == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.asyncRestartErr == nil {
+		s.asyncRestartErr = err
+	}
+	s.mu.Unlock()
+}
+
+// AsyncRestartFailure returns the latched terminal failure of a detached
+// far-seek restart, or nil when none is pending. Segment handlers consult it
+// before their recovery machinery so a dead generation surfaces its own verdict
+// instead of a second stale_generation.
+func (s *TranscodeSession) AsyncRestartFailure() error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.asyncRestartErr
+}
+
+// setLifecycleLiveness installs the predicate restart consults to confirm this
+// session is still the live mapped one. The manager sets it while holding the
+// per-session lifecycle lock, so only one restart observes it at a time, and
+// clears it when the restart returns. Nil means the session is not managed and
+// is treated as alive.
+func (s *TranscodeSession) setLifecycleLiveness(fn func() bool) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.lifecycleAlive = fn
+	s.mu.Unlock()
+}
+
+// lifecycleAliveNow reports whether the installed liveness predicate still
+// accepts this session. It copies the predicate under mu and calls it after
+// releasing mu, so the predicate may take other locks (the manager's map lock)
+// without a lock-order inversion.
+func (s *TranscodeSession) lifecycleAliveNow() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	fn := s.lifecycleAlive
+	s.mu.Unlock()
+	return fn == nil || fn()
 }
 
 // notifyDemuxFailure invokes the wiring callback exactly once, off the stderr

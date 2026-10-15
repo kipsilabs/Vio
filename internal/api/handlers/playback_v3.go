@@ -2238,6 +2238,22 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	// three together and could not say which one consumed the budget.
 	effectiveSubtitles := subtitleInventoryFor(effectiveFile)
 	timings.mark("subtitle_inventory")
+	// Apply the profile's stored "always" subtitle mode before planning so the
+	// first plan carries the burn-in requirement: a bitmap subtitle that must be
+	// burned in forces the burn-in video codec, and discovering that only after
+	// the first FFmpeg start costs a second plan and a second spawn. Any named
+	// selection is never overridden; an omitted selection defers to the stored
+	// mode, so for an "always" profile an omitted start field turns subtitles on
+	// where it previously left them off. (The v3 start wire has no explicit-off
+	// encoding: subtitle_track_index is >= 0, so omission is the only way to
+	// express "no selection".)
+	if req.SubtitleTrackID == "" && req.SubtitleTrackIndex == nil {
+		if subtitleIndex, ok := h.resolvePreferredSubtitleSelectionV3(r.Context(), userID, profileID, deviceID, effectiveFile, effectiveSubtitles); ok {
+			indexCopy := subtitleIndex
+			req.SubtitleTrackIndex = &indexCopy
+		}
+	}
+	timings.mark("subtitle_selection")
 	transformationRegistry := h.transformationRegistryV3(r.Context())
 	dvrpuStrippable := h.lazyDVRPUStrippableV3(r.Context(), effectiveFile)
 	timings.mark("transform_registry")
