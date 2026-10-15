@@ -1449,6 +1449,7 @@ function WatchPagePlayer({
         onPlanFailure={session.recoverFromFailure}
         onConnectionLost={session.recoverConnection}
         onRetryConnection={session.retryConnection}
+        onSessionLost={session.reportSessionLost}
         connectionStatus={session.connectionStatus}
         connectionErrorTitle={session.connectionErrorTitle}
         connectionError={session.connectionError}
