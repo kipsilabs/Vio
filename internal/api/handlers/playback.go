@@ -2927,7 +2927,11 @@ func writePlaybackDecodeError(w http.ResponseWriter) {
 // treats as a dead generation. Everything else is an unexpected server error.
 func writePlaybackSegmentError(w http.ResponseWriter, err error) {
 	switch {
-	case errors.Is(err, playback.ErrSegmentNotFound), errors.Is(err, playback.ErrTranscodeFailed):
+	case errors.Is(err, playback.ErrSegmentNotFound), errors.Is(err, playback.ErrTranscodeFailed),
+		errors.Is(err, playback.ErrVirtualSourceDemuxFailed):
+		// A demux-stamped virtual source can never produce this segment, so it
+		// is terminal for the route exactly like a stopped process; the client
+		// replans against another candidate rather than retrying.
 		writeError(w, http.StatusNotFound, "not_found", "Segment not found")
 	case errors.Is(err, playback.ErrStaleSegmentGeneration):
 		// The URL named a generation that is no longer live and has no retained
@@ -3072,6 +3076,19 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 		return
 	}
 
+	// A detached far-seek restart that failed without rotating the generation
+	// latches its verdict here. Answer it instead of entering the recovery path
+	// again: the retry would schedule another restart on the same dead source
+	// and return stale_generation, so the client would spend its recovery
+	// budget before reaching the ordinary failure path.
+	if restartErr := transcodeSession.AsyncRestartFailure(); restartErr != nil {
+		if writePlaybackToneMapExecutionError(w, restartErr) {
+			return
+		}
+		writePlaybackSegmentError(w, restartErr)
+		return
+	}
+
 	segmentName := chi.URLParam(r, "name")
 	requestedGeneration := strings.TrimSpace(r.URL.Query().Get(playback.GenerationQueryParam))
 	// servedSession is the generation the returned lease came from: the live
@@ -3189,16 +3206,19 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 			if err != nil && errors.Is(err, playback.ErrSegmentNotFound) && decision.RestartOnTimeout {
 				// A far seek past the produced window is recovered by a seek
 				// restart, and any restart rotates the generation. Holding this
-				// request for the restart's bytes is pure latency: the final
-				// generation fence would refuse them anyway, and the player sits
-				// waiting on a segment the server already knows it will not serve
-				// from this generation. The restart is an encode-level operation,
-				// so trigger it detached from the request and answer the
-				// stale-generation verdict now; the client reloads the manifest,
-				// adopts the new generation, and the segment is served once
-				// produced. Copy-mode sessions stay on the synchronous path: their
-				// target resolution reads the live manifest under the lifecycle
-				// lock and can legitimately report an unresolved target.
+				// request for the restart's bytes is pure latency: a request that
+				// named the old generation is refused by the final fence, and a
+				// tokenless request would otherwise be served bytes from a
+				// restart it never addressed. Either way the player sits waiting
+				// on a segment the server already knows it cannot serve under
+				// this request's generation. The restart is an encode-level
+				// operation, so trigger it detached from the request and answer
+				// the stale-generation verdict now; the client reloads the
+				// manifest, adopts the new generation, and the segment is served
+				// once produced. Copy-mode sessions stay on the synchronous path:
+				// their target resolution reads the live manifest under the
+				// lifecycle lock and can legitimately report an unresolved
+				// target.
 				if decision.Reason == playback.SegmentRecoveryFarSeekReason && !transcodeSession.IsCopyVideo() {
 					slog.InfoContext(r.Context(), "transcode seek restart scheduled", "component", "api",
 						"segment", segmentName,

@@ -515,8 +515,17 @@ func (s *Server) restartSegmentAsync(sessionID string, session *playback.Transco
 		defer cancel()
 		target, ok, err := s.restartSegmentLocked(ctx, sessionID, session, segNum)
 		switch {
+		case errors.Is(err, playback.ErrSessionSuperseded):
+			// Routine teardown: the session was stopped or replaced while the
+			// seek restart waited, so nothing was re-spawned.
+			slog.Debug("restart transcode node at missing segment skipped, session superseded (async)",
+				"component", "transcodenode", "segment", segNum, "session", sessionID)
 		case err != nil && !errors.Is(err, playback.ErrManifestNotReady):
 			slog.Warn("restart transcode node at missing segment (async)", "component", "transcodenode", "error", err, "segment", segNum, "session", sessionID)
+			// The scheduled restart never rotated the generation it promised, so
+			// latch the verdict: the next segment request must answer the real
+			// failure instead of stale_generation a second time.
+			session.RecordAsyncRestartFailure(err)
 		case ok:
 			slog.Info("transcode node seek restart", "component", "transcodenode", "segment", segNum,
 				"seek_seconds", target.SeekSeconds, "stream_origin_seconds", target.StreamOriginSeconds,
@@ -2710,6 +2719,22 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A detached far-seek restart that failed without rotating the generation
+	// latches its verdict; answer it instead of scheduling a second restart that
+	// would return stale_generation again.
+	if restartErr := session.AsyncRestartFailure(); restartErr != nil {
+		if isToneMapRecipeError(restartErr) {
+			writeToneMapRecipeError(w, restartErr)
+			return
+		}
+		if errors.Is(restartErr, playback.ErrStaleSegmentGeneration) {
+			http.Error(w, "segment generation is stale", http.StatusPreconditionFailed)
+			return
+		}
+		http.Error(w, "segment not found", http.StatusNotFound)
+		return
+	}
+
 	segmentName := name
 	requestedGeneration := strings.TrimSpace(r.URL.Query().Get(playback.GenerationQueryParam))
 	segmentLease, err := session.OpenSegmentForGeneration(segmentName, requestedGeneration)
@@ -2779,8 +2804,10 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 				// restart that rotates the generation, so this request's token
 				// can never serve its bytes. Restart detached and answer the
 				// stale-generation verdict now instead of holding the player on
-				// a lease the final fence would refuse. Copy-mode stays
-				// synchronous: its target resolution reads the live manifest.
+				// a lease the final fence would refuse (or, for a tokenless
+				// request, would serve from a restart it never addressed).
+				// Copy-mode stays synchronous: its target resolution reads the
+				// live manifest.
 				if decision.Reason == playback.SegmentRecoveryFarSeekReason && !session.IsCopyVideo() {
 					slog.InfoContext(r.Context(), "transcode node seek restart scheduled", "component", "transcodenode",
 						"segment", name,

@@ -158,7 +158,12 @@ func selectPreferredSubtitleV3(
 	}
 	bestIndex := -1
 	bestRank := -1
-	bestForced := false
+	// Track the best non-forced match separately: a forced track can outrank an
+	// available non-forced one (an exact forced tag beats a regional non-forced
+	// variant), and without the fallback the whole selection is abandoned even
+	// though a legitimate non-forced deliverable exists.
+	bestNonForcedIndex := -1
+	bestNonForcedRank := -1
 	for i, item := range inventory {
 		rank := subtitleLanguageRankV3(item.Language, preferred)
 		if rank < 0 || rank >= lang.RankScriptConflict {
@@ -167,8 +172,11 @@ func selectPreferredSubtitleV3(
 		forced := item.Forced
 		if bestIndex < 0 ||
 			rank < bestRank ||
-			(rank == bestRank && bestForced && !forced) {
-			bestIndex, bestRank, bestForced = i, rank, forced
+			(rank == bestRank && inventory[bestIndex].Forced && !forced) {
+			bestIndex, bestRank = i, rank
+		}
+		if !forced && (bestNonForcedIndex < 0 || rank < bestNonForcedRank) {
+			bestNonForcedIndex, bestNonForcedRank = i, rank
 		}
 	}
 	if bestIndex < 0 {
@@ -177,8 +185,12 @@ func selectPreferredSubtitleV3(
 	item := inventory[bestIndex]
 	if item.Forced && (!prefs.HasShowForced || !prefs.ShowForced) {
 		// A forced track is a different deliverable from the full track and is
-		// only selected when the preference opts in. Without a non-forced
-		// match, fall through rather than silently forcing a different subtitle.
+		// only selected when the preference opts in. Fall back to the closest
+		// non-forced match rather than silently forcing a different subtitle or
+		// abandoning a selectable one.
+		if bestNonForcedIndex >= 0 {
+			return inventory[bestNonForcedIndex], true
+		}
 		return playback.SubtitleInventoryItemV3{}, false
 	}
 	return item, true
