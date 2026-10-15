@@ -11523,23 +11523,29 @@ func fillVirtualVideoTrackFromDescriptorV3(track *models.VideoTrack, source play
 	if strings.TrimSpace(track.VideoRangeType) == "" {
 		track.VideoRangeType = source.DynamicRange
 	}
-	if track.DVProfile == 0 {
-		track.DVProfile = source.DVProfile
-	}
-	if track.DVLevel == 0 {
-		track.DVLevel = source.DVLevel
-	}
-	if track.DVBLCompatID == 0 {
-		track.DVBLCompatID = source.DVBLCompatID
-	}
-	// The descriptor carries a single aggregated base-layer provenance flag.
-	// Reproduce it only when it was proven; an unproven profile keeps the three
-	// presence booleans false so the route resolution fails closed instead of
-	// inventing a compatible base layer.
-	if source.DVBaseLayerProven {
-		track.DVConfigPresent = true
-		track.DVBLCompatIDPresent = true
-		track.DVBLPresent = true
+	// A DV base-layer provenance without a profile is not a DV classification
+	// the route resolver can trust, so the whole DV block is gated on the
+	// descriptor naming a profile — the same fail-closed posture the previous
+	// reconstruction used. Within that, each sub-field is a gap fill.
+	if source.DVProfile > 0 {
+		if track.DVProfile == 0 {
+			track.DVProfile = source.DVProfile
+		}
+		if track.DVLevel == 0 {
+			track.DVLevel = source.DVLevel
+		}
+		if track.DVBLCompatID == 0 {
+			track.DVBLCompatID = source.DVBLCompatID
+		}
+		// The descriptor carries a single aggregated base-layer provenance
+		// flag. Reproduce it only when it was proven; an unproven profile keeps
+		// the three presence booleans false so the route resolution fails
+		// closed instead of inventing a compatible base layer.
+		if source.DVBaseLayerProven {
+			track.DVConfigPresent = true
+			track.DVBLCompatIDPresent = true
+			track.DVBLPresent = true
+		}
 	}
 	if strings.TrimSpace(track.DVEnhancementLayer) == "" {
 		if layer := strings.TrimSpace(string(source.DVEnhancementLayer)); layer != "" {

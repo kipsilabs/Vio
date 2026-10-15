@@ -159,8 +159,32 @@ func TestCarryValidatedVirtualVideoEvidenceV3FillsExistingPartialTrack(t *testin
 	}
 }
 
-// A row that already declares a different codec must not receive the
-// descriptor's evidence: mixing a declared h264 with an hevc descriptor is
+// A descriptor that proves a DV base layer but names no DV profile must not
+// produce DV provenance flags on the carried track: a profileless descriptor is
+// not a DV classification the route resolver can trust, so the carry keeps the
+// three presence booleans false and fails closed.
+func TestCarryValidatedVirtualVideoEvidenceV3DoesNotInventDVWithoutProfile(t *testing.T) {
+	descriptor := validatedVideoDescriptorV3()
+	descriptor.DVProfile = 0
+	descriptor.DVLevel = 0
+	descriptor.DVBLCompatID = 0
+
+	file := virtualCarryRowV3()
+	got := carryValidatedVirtualVideoEvidenceV3(file, descriptor)
+	if got == file {
+		t.Fatal("carry left the unprobed row untouched")
+	}
+	track := got.VideoTracks[0]
+	if track.DVProfile != 0 || track.DVLevel != 0 || track.DVBLCompatID != 0 ||
+		track.DVConfigPresent || track.DVBLCompatIDPresent || track.DVBLPresent {
+		t.Fatalf("carry invented DV classification from a profileless descriptor: %+v", track)
+	}
+	if track.VideoRangeType != playback.DynamicRangeDolbyVisionV3 {
+		t.Fatalf("video range type = %q, want the descriptor's dynamic range", track.VideoRangeType)
+	}
+}
+
+// A row that already declares a different codec must not receive the// descriptor's evidence: mixing a declared h264 with an hevc descriptor is
 // franken-evidence the planner would route against. Normalized agreement
 // ("h264"/"avc") must still carry.
 func TestCarryValidatedVirtualVideoEvidenceV3RefusesCodecDisagreement(t *testing.T) {
