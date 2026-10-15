@@ -302,6 +302,25 @@ func deferredProbeKey(deferred *virtualDeferredProbeV3) string {
 	return deferred.sessionID + "\x00" + deferred.cand.URI
 }
 
+// parkDeferredProbeRetryLocked records a probe in the bounded retry set, keeping
+// the entry that belongs to the newest binding generation when two probes for the
+// same session and candidate are both under overflow pressure. The set is keyed by
+// session and candidate URI, so the map can hold only one of them; the older job's
+// fence is already stale by the time it would run, and letting it displace the
+// newer job would lose a lifecycle that could still land and force a redundant
+// replacement, so the newer generation wins. Caller holds deferredProbeMu.
+func (h *PlaybackHandler) parkDeferredProbeRetryLocked(deferred *virtualDeferredProbeV3) {
+	if h == nil || deferred == nil {
+		return
+	}
+	key := deferredProbeKey(deferred)
+	if existing, ok := h.deferredProbeRetry[key]; ok && existing != nil &&
+		existing.bindingGeneration > deferred.bindingGeneration {
+		return
+	}
+	h.deferredProbeRetry[key] = deferred
+}
+
 // enqueueDeferredVirtualProbeV3 admits one deferred probe into the bounded pool.
 // It never blocks and never probes on the request path. Admission first captures
 // the session's candidate binding — identity and generation in one manager read
@@ -333,6 +352,21 @@ func (h *PlaybackHandler) enqueueDeferredVirtualProbeV3(ctx context.Context, def
 		// job is dropped without an outcome write.
 		return
 	}
+	h.admitArmedDeferredProbe(ctx, deferred)
+}
+
+// admitArmedDeferredProbe hands an already-armed probe (its pending mark is on
+// the session's current binding) to the bounded worker pool. It never blocks:
+// the queue is tried first, and a full queue parks the probe in the bounded retry
+// set for a worker to re-admit. Only when the retry set is full too is the probe
+// shed terminally, so a saturated pool ends the client's loading state instead of
+// leaving the probe unrun. Both the ordinary start-path admission and the
+// dropped-probe replacement share it, so every admitted job has exactly the same
+// overflow contract.
+func (h *PlaybackHandler) admitArmedDeferredProbe(ctx context.Context, deferred *virtualDeferredProbeV3) {
+	if h == nil || deferred == nil {
+		return
+	}
 	select {
 	case h.deferredProbeQueue <- deferred:
 		return
@@ -352,9 +386,90 @@ func (h *PlaybackHandler) enqueueDeferredVirtualProbeV3(ctx context.Context, def
 		h.shedDeferredVirtualProbe(deferred)
 		return
 	}
-	h.deferredProbeRetry[deferredProbeKey(deferred)] = deferred
+	h.parkDeferredProbeRetryLocked(deferred)
 	h.deferredProbeMu.Unlock()
 	h.signalDeferredProbeRetry()
+}
+
+// scheduleDroppedProbeReplacement recovers the deferred probe a binding fence
+// dropped. A probe admitted for a binding the session has since left is dropped
+// without writing (see runDeferredVirtualProbe's default arm), which is correct —
+// but if the session's replacement binding carries no lifecycle of its own, it
+// would otherwise serve its provisional declared inventory un-enumerated until a
+// later start or the convergence watchdog. This admits a FRESH replacement job for
+// the current binding so it gets its own complete lifecycle.
+//
+// It is deliberately conservative. The replacement can only reuse the dropped
+// job's probe input when the session's current candidate AND owner installation are
+// the ones that input describes; if the session rotated to a different release, or
+// the same candidate is now served by a different owner, the input is stale and the
+// fresh resolve that produced the new binding (the serve-layer rotation) is the only
+// safe source of its URL and headers, so no replacement is admitted here rather than
+// probing the wrong bytes. The manager call re-checks the candidate and owner
+// atomically, so a rotation landing between this decision and the arm refuses the
+// replacement instead of stranding a pending mark no worker owns.
+//
+// The replacement is a new job with its own lifecycle: its pending mark, probe
+// fence, and terminal outcome all describe the current binding generation, so the
+// dropped job can never write against it.
+func (h *PlaybackHandler) scheduleDroppedProbeReplacement(ctx context.Context, dropped *virtualDeferredProbeV3) {
+	if h == nil || dropped == nil || dropped.sessionID == "" || dropped.file == nil {
+		return
+	}
+	armer, ok := h.sessionMgr.(virtualProbeReplacementArmer)
+	if !ok {
+		return
+	}
+	// The input's owner is the installation the dropped probe was resolved for; a
+	// zero captured on the job falls back to the admission binding's owner.
+	ownerID := dropped.ownerID
+	if ownerID == 0 {
+		ownerID = dropped.binding.OwnerInstallationID
+	}
+	binding, armed, err := armer.ArmVirtualProbeReplacementForCurrentBinding(dropped.sessionID, dropped.cand.URI, ownerID)
+	if err != nil || !armed {
+		return
+	}
+	h.startDeferredProbeWorkers()
+	replacement := *dropped
+	replacement.binding = binding
+	replacement.bindingGeneration = binding.Generation
+	if row := h.replacementCatalogRow(ctx, binding, dropped.file); row != nil {
+		replacement.file = row
+	}
+	admitCtx, cancel := h.virtualDetachedContext(ctx, virtualEvidencePersistBudget)
+	defer cancel()
+	slog.InfoContext(admitCtx, "deferred virtual post-commit probe dropped by the binding fence; admitting a replacement for the current binding",
+		"component", "api", "session", dropped.sessionID, "candidate_uri", dropped.cand.URI,
+		"generation", binding.Generation)
+	h.admitArmedDeferredProbe(admitCtx, &replacement)
+}
+
+// replacementCatalogRow resolves the catalog row the replacement probe must write
+// its evidence onto: the session's current effective row. A row-only binding move
+// (SetEffectiveMediaFileID) leaves the candidate URI unchanged but points the
+// session at a new row, so writing the dropped job's old row would leave the
+// served row un-stamped. When the effective row cannot be read, the dropped job's
+// row is still used rather than dropping the replacement — the alternative is a
+// stranded pending mark the convergence watchdog must fail — but the fallback is
+// logged with both row ids so the miss is visible.
+func (h *PlaybackHandler) replacementCatalogRow(ctx context.Context, binding playback.VirtualSourceBindingSnapshot, fallback *models.MediaFile) *models.MediaFile {
+	if h == nil || h.fileResolver == nil || binding.EffectiveMediaFileID <= 0 {
+		return fallback
+	}
+	if fallback != nil && fallback.ID == binding.EffectiveMediaFileID {
+		return fallback
+	}
+	readCtx, cancel := h.virtualDetachedContext(ctx, virtualEvidencePersistBudget)
+	defer cancel()
+	row, err := h.fileResolver.GetByID(readCtx, binding.EffectiveMediaFileID)
+	if err == nil && row != nil && row.ID > 0 {
+		return row
+	}
+	slog.WarnContext(readCtx, "deferred virtual probe replacement could not resolve the current effective row; falling back to the dropped row",
+		"component", "api", "effective_file_id", binding.EffectiveMediaFileID,
+		"dropped_file_id", catalogFileIDOrZero(fallback), "error", err)
+	return fallback
 }
 
 // virtualProbePendingArmer is the session-manager capability that transitions a
@@ -364,6 +479,16 @@ func (h *PlaybackHandler) enqueueDeferredVirtualProbeV3(ctx context.Context, def
 // or terminal.
 type virtualProbePendingArmer interface {
 	ArmVirtualProbePendingIfGeneration(sessionID string, generation uint64) (bool, error)
+}
+
+// virtualProbeReplacementArmer is the session-manager capability that recovers a
+// deferred probe a binding fence dropped. It re-arms the pending mark for the
+// session's current candidate binding only when that binding carries no live
+// lifecycle of its own and its candidate and owner are the ones the replacement can
+// probe, so the fresh job fences on the current binding and the dropped job can
+// never write against it.
+type virtualProbeReplacementArmer interface {
+	ArmVirtualProbeReplacementForCurrentBinding(sessionID, candidateURI string, ownerInstallationID int) (playback.VirtualSourceBindingSnapshot, bool, error)
 }
 
 // armDeferredProbePending captures the session's candidate binding and marks the
@@ -586,7 +711,7 @@ func (h *PlaybackHandler) runDeferredVirtualProbe(deferred *virtualDeferredProbe
 		}
 		h.deferredProbeMu.Lock()
 		if len(h.deferredProbeRetry) < virtualDeferredProbeQueueSize {
-			h.deferredProbeRetry[deferredProbeKey(deferred)] = deferred
+			h.parkDeferredProbeRetryLocked(deferred)
 			h.deferredProbeMu.Unlock()
 			h.signalDeferredProbeRetry()
 			return
@@ -599,11 +724,16 @@ func (h *PlaybackHandler) runDeferredVirtualProbe(deferred *virtualDeferredProbe
 	}
 	if !h.deferredProbeBindingCurrent(deferred) {
 		gate.release()
-		// The binding moved while the probe waited for a slot; the replacement
-		// binding owns its own lifecycle, so shed without an outcome write or a
-		// publish instead of paying a remote ffprobe for a superseded candidate.
+		// The binding moved while the probe waited for a slot; this job's input
+		// describes a binding the session has left, so it sheds without an outcome
+		// write or a publish. If the current binding carries no probe of its own it
+		// still owes one, so try to admit a replacement for it exactly as the
+		// post-probe fence does; the arm's own candidate/owner/liveness checks
+		// refuse when the session rotated to a binding this job's input cannot
+		// describe.
 		slog.Debug("deferred virtual post-commit probe shed before probing: candidate binding moved while parked",
 			"component", "api", "session", deferred.sessionID, "candidate_uri", deferred.cand.URI)
+		h.scheduleDroppedProbeReplacement(waitCtx, deferred)
 		h.signalDeferredProbeRetry()
 		return
 	}
@@ -685,8 +815,12 @@ func (h *PlaybackHandler) runDeferredVirtualProbe(deferred *virtualDeferredProbe
 		slog.Warn("deferred virtual probe enumeration incomplete; inventory stays pending",
 			"component", "api", "session", deferred.sessionID, "candidate_uri", deferred.cand.URI)
 	default:
-		// The binding moved under the probe; the new binding owns its own
-		// lifecycle, so no outcome is written.
+		// The binding moved under the probe, so this job's verdict describes a
+		// binding the session no longer serves and it writes nothing. The
+		// replacement binding owns its own lifecycle: admit a fresh probe for it
+		// when it reused no live one, so it is not left un-enumerated. The dropped
+		// job's own lifecycle stays untouched.
+		h.scheduleDroppedProbeReplacement(bgCtx, deferred)
 	}
 	// A parked probe may be waiting on the retry set; wake a worker to drain it.
 	h.signalDeferredProbeRetry()
