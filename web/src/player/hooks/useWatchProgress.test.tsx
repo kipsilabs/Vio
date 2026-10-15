@@ -137,3 +137,42 @@ it("leaves no interval armed once progress answers the session is gone", async (
   expect(mocks.send).toHaveBeenCalledTimes(1);
   expect(onSessionLost).toHaveBeenCalledTimes(1);
 });
+
+it("keeps polling when a progress 404 is a proxy page with no problem code", async () => {
+  vi.useFakeTimers();
+  // `mutationFetch` types every non-2xx response, but an HTML proxy 404 parses
+  // to no problem: the code is undefined. It must not stop progress polling.
+  mocks.send.mockRejectedValue(
+    new PlayerFetchError(404, "Not Found", undefined, "<html>404 Not Found</html>"),
+  );
+  const onSessionLost = vi.fn();
+  renderHook(() => useWatchProgress("session", videoRef, undefined, onSessionLost), { wrapper });
+
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(30_000);
+  });
+  expect(mocks.send).toHaveBeenCalledTimes(3);
+  expect(onSessionLost).not.toHaveBeenCalled();
+});
+
+it("does not send a final keepalive to a session that is gone", async () => {
+  vi.useFakeTimers();
+  mocks.send.mockRejectedValue(
+    new PlayerFetchError(404, "Playback session not found.", "not_found"),
+  );
+  const onSessionLost = vi.fn();
+  const { unmount } = renderHook(
+    () => useWatchProgress("session", videoRef, undefined, onSessionLost),
+    { wrapper },
+  );
+
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(10_000);
+  });
+  expect(onSessionLost).toHaveBeenCalledTimes(1);
+  expect(mocks.send).toHaveBeenCalledTimes(1);
+
+  // Unmounting must not fire the cleanup's keepalive report at a dead session.
+  act(() => unmount());
+  expect(mocks.send).toHaveBeenCalledTimes(1);
+});

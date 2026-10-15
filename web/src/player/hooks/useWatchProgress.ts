@@ -114,6 +114,9 @@ export function useWatchProgress(
         if (disposed) return;
         if (isPlaybackSessionGoneError(error)) {
           stopPolling();
+          // The session row is gone, so the cleanup's final keepalive would
+          // only be answered 404. Skip it.
+          skipCleanupReportRef.current = true;
           onSessionLostRef.current?.();
         }
       });
