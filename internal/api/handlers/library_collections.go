@@ -39,14 +39,18 @@ import (
 )
 
 type LibraryCollectionHandler struct {
-	repo                  *catalog.LibraryCollectionRepository
-	service               *catalog.LibraryCollectionService
-	itemRepo              *catalog.ItemRepository
-	Executor              *catalog.QueryExecutor
-	detailSvc             *catalog.DetailService
-	httpClient            *http.Client
-	ArtworkStore          blobstore.Store
-	ArtworkResolver       artworkurl.Resolver
+	repo            *catalog.LibraryCollectionRepository
+	service         *catalog.LibraryCollectionService
+	itemRepo        *catalog.ItemRepository
+	Executor        *catalog.QueryExecutor
+	detailSvc       *catalog.DetailService
+	httpClient      *http.Client
+	ArtworkStore    blobstore.Store
+	ArtworkResolver artworkurl.Resolver
+	// ArtworkSigner maps a local-storage signed route back to its store key,
+	// so a collage reads its sources from the store instead of requesting the
+	// server's own route.
+	ArtworkSigner         *artworkurl.Signer
 	FrontendFS            fs.FS
 	SectionRepo           *sections.Repository
 	UserCollectionPool    *pgxpool.Pool
@@ -203,7 +207,7 @@ func (h *LibraryCollectionHandler) CollectionCollagePath(collectionID, key strin
 }
 
 func (h *LibraryCollectionHandler) collageComposer() collectionCollageComposer {
-	return collectionCollageComposer{prefix: adminCollectionImagePrefix, store: h.ArtworkStore, posters: h.detailSvc, httpClient: h.httpClient}
+	return collectionCollageComposer{prefix: adminCollectionImagePrefix, store: h.ArtworkStore, posters: h.detailSvc, signer: h.ArtworkSigner, httpClient: h.httpClient}
 }
 
 type libraryCollectionResponse struct {
