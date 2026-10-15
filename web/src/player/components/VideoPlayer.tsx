@@ -2278,6 +2278,10 @@ export function VideoPlayer({
 
     let hls: HlsType | null = null;
     let destroyed = false;
+    // The manifest coalescer lives inside the async init below, but teardown
+    // must be able to release it: keep a handle here so the cleanup can abandon
+    // a load the effect is tearing down.
+    let activeManifestLoads: ManifestLoadCoalescer | null = null;
     let playbackStarted = false;
     let autoplayInFlight = false;
     let autoplayAttempts = 0;
@@ -2536,9 +2540,16 @@ export function VideoPlayer({
             // manifest load whose `receive` the server never produced. The
             // coalescer keys off hls.js's manifest lifecycle and replays a
             // superseded request once the in-flight load settles.
-            const manifestLoads = new ManifestLoadCoalescer((url) => hls?.loadSource(url));
-            hls.on(Hls.Events.MANIFEST_LOADING, () => {
-              manifestLoads.begin(hls?.url ?? "");
+            const manifestLoads = new ManifestLoadCoalescer((url) => {
+              // A replay can land after the transport was torn down (a decode
+              // replan destroys the instance without setting `destroyed`), so
+              // never hand a load to a destroyed or replaced instance.
+              if (destroyed || hls === null) return;
+              hls.loadSource(url);
+            });
+            activeManifestLoads = manifestLoads;
+            hls.on(Hls.Events.MANIFEST_LOADING, (_event, data: { url?: string }) => {
+              manifestLoads.begin(data?.url ?? hls?.url ?? "");
             });
             hls.on(Hls.Events.MANIFEST_LOADED, () => {
               manifestLoads.settle();
@@ -2618,8 +2629,10 @@ export function VideoPlayer({
                 if (!reportCurrentPlanFailure(decodeFailure())) {
                   setError("Playback failed. This release could not be decoded.");
                 }
+                manifestLoads.abandon();
                 hls?.destroy();
                 hlsRef.current = null;
+                hls = null;
                 return;
               }
 
@@ -2640,19 +2653,28 @@ export function VideoPlayer({
               // throttle/network-recovery budget because it is a deterministic
               // redirect, not a transport failure.
               if (data.type === Hls.ErrorTypes.NETWORK_ERROR && isStaleGenerationError(data)) {
-                if (
-                  hls &&
-                  staleGenerationRecoveriesRef.current < MAX_STALE_GENERATION_RECOVERIES &&
-                  recoverFromStaleGeneration(hls, video.currentTime, (url) =>
-                    manifestLoads.request(url),
-                  )
-                ) {
-                  staleGenerationRecoveriesRef.current++;
-                  console.warn("[hls.js] Segment generation is stale; refetching playlist", {
-                    details: data.details,
-                    url: data.frag?.url ?? data.url,
-                  });
-                  return;
+                if (hls && staleGenerationRecoveriesRef.current < MAX_STALE_GENERATION_RECOVERIES) {
+                  let refetchStarted = false;
+                  const recovered = recoverFromStaleGeneration(
+                    hls,
+                    video.currentTime,
+                    (url, applyResume) => {
+                      refetchStarted = manifestLoads.request(url, applyResume);
+                    },
+                  );
+                  if (recovered) {
+                    // Only a refetch that actually starts consumes the budget.
+                    // One coalesced behind a manifest load already in flight
+                    // replays when that load settles, so counting each fence
+                    // while it waits would exhaust the cap without a single
+                    // refetch.
+                    if (refetchStarted) staleGenerationRecoveriesRef.current++;
+                    console.warn("[hls.js] Segment generation is stale; refetching playlist", {
+                      details: data.details,
+                      url: data.frag?.url ?? data.url,
+                    });
+                    return;
+                  }
                 }
               }
 
@@ -2660,12 +2682,21 @@ export function VideoPlayer({
               if (now - lastRecoveryRef.current < 3000) return;
               lastRecoveryRef.current = now;
 
+              // Every fatal error here tore the manifest load down: hls.js
+              // stops the request it had open without a manifest-scoped event
+              // (`MANIFEST_LOADED` or a `manifest*` error). Release the
+              // coalescer's in-flight slot — replaying any queued recovery —
+              // before recovering or destroying, so a later request cannot
+              // queue behind a load that will never settle. The handled
+              // branches above (not-ready poll-back, decode replan,
+              // stale-generation refetch) return early and keep their slot.
               if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
                 const canRecoverStartup =
                   hlsStartupGuardRef.current?.handleFatalNetworkError() ?? true;
                 if (canRecoverStartup && networkRecoveryAttemptsRef.current < 3) {
                   networkRecoveryAttemptsRef.current++;
                   console.warn("[hls.js] Fatal network error, attempting recovery...");
+                  manifestLoads.settle();
                   hls?.startLoad();
                 } else {
                   console.error(
@@ -2679,15 +2710,19 @@ export function VideoPlayer({
                   ) {
                     setError("Playback failed. Please try again.");
                   }
+                  manifestLoads.abandon();
                   hls?.destroy();
                   hlsRef.current = null;
+                  hls = null;
                 }
               } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
                 if (mediaRecoveryAttemptsRef.current === 0) {
                   console.warn("[hls.js] Fatal media error, attempting recovery...");
+                  manifestLoads.settle();
                   hls?.recoverMediaError();
                 } else if (mediaRecoveryAttemptsRef.current === 1) {
                   console.warn("[hls.js] Fatal media error (2nd), swapping audio codec...");
+                  manifestLoads.settle();
                   hls?.swapAudioCodec();
                   hls?.recoverMediaError();
                 } else {
@@ -2700,8 +2735,10 @@ export function VideoPlayer({
                   ) {
                     setError("Playback failed. Please try again.");
                   }
+                  manifestLoads.abandon();
                   hls?.destroy();
                   hlsRef.current = null;
+                  hls = null;
                 }
                 mediaRecoveryAttemptsRef.current++;
               } else {
@@ -2714,8 +2751,10 @@ export function VideoPlayer({
                 ) {
                   setError("Playback failed. Please try again.");
                 }
+                manifestLoads.abandon();
                 hls?.destroy();
                 hlsRef.current = null;
+                hls = null;
               }
             });
 
@@ -2778,6 +2817,7 @@ export function VideoPlayer({
 
     return () => {
       destroyed = true;
+      activeManifestLoads?.abandon();
       cleanupStartupListeners();
       if (manifestPollbackRef.current !== undefined) {
         window.clearTimeout(manifestPollbackRef.current);
@@ -2786,6 +2826,7 @@ export function VideoPlayer({
       if (hls) {
         hls.destroy();
         hlsRef.current = null;
+        hls = null;
       }
       // Flush the video element's internal buffers so pre-downloaded
       // segments from a previous quality level don't play through

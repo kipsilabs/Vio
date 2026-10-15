@@ -143,22 +143,31 @@ export function isManifestLoadError(carrier: { details?: unknown } | null | unde
  * it the refetch calls `host.loadSource` directly, which is what the recovery's
  * unit tests exercise.
  *
- * Returns false when there is no playlist URL to refetch, so the caller can fall
- * through to the ordinary failure recovery instead of stalling.
+ * The resume position is set through the `beforeStart` hook the recovery hands
+ * to `requestLoad`, so it lands when the refetch actually starts — immediately,
+ * or when a queued refetch replays. Setting it up front would mutate a load
+ * that is already in flight, whose autostart position has already been read.
+ *
+ * Returns true when a recovery was accepted (started now or queued behind an
+ * in-flight load), and false when there is no playlist URL to refetch, so the
+ * caller can fall through to the ordinary failure recovery instead of stalling.
  */
 export function recoverFromStaleGeneration(
   host: StaleGenerationRecoveryHost,
   resumePositionSeconds: number,
-  requestLoad?: (url: string) => void,
+  requestLoad?: (url: string, beforeStart: () => void) => void,
 ): boolean {
   const playlistUrl = host.url;
   if (!playlistUrl) return false;
-  if (Number.isFinite(resumePositionSeconds) && resumePositionSeconds > 0) {
-    host.config.startPosition = resumePositionSeconds;
-  }
+  const applyResume = () => {
+    if (Number.isFinite(resumePositionSeconds) && resumePositionSeconds > 0) {
+      host.config.startPosition = resumePositionSeconds;
+    }
+  };
   if (requestLoad) {
-    requestLoad(playlistUrl);
+    requestLoad(playlistUrl, applyResume);
   } else {
+    applyResume();
     host.loadSource(playlistUrl);
   }
   return true;
@@ -183,40 +192,73 @@ export function recoverFromStaleGeneration(
  * `request`. A request raised while one is in flight is remembered and replayed
  * once, after the in-flight load settles, so the recovery still happens without
  * a second concurrent request.
+ *
+ * An in-flight load is only ever released by hls.js's own manifest events, so a
+ * transport that hls.js abandons without those events (a decode replan or an
+ * exhausted recovery that destroys it) must call `abandon`; otherwise the slot
+ * stays set with no load open and every later `request` queues behind a load
+ * that will never settle.
  */
 export class ManifestLoadCoalescer {
   private inFlightUrl: string | null = null;
-  private pendingUrl: string | null = null;
+  private pending: (() => void) | null = null;
 
   constructor(private readonly load: (url: string) => void) {}
 
-  /** Marks the start of an hls.js manifest load (`MANIFEST_LOADING`). */
+  /**
+   * Marks the start of an hls.js manifest load (`MANIFEST_LOADING`). An empty
+   * URL names no load, so it is ignored rather than marking the coalescer busy
+   * with a load that has no URL to settle against.
+   *
+   * A `begin` for a URL other than the one the coalescer has in flight is a
+   * load the coalescer did not issue (the window-edge refetch). That newer load
+   * supersedes any queued recovery, which would otherwise replay after it; drop
+   * the queued one and adopt the newer load as in flight.
+   */
   begin(url: string): void {
+    if (url === "") return;
+    if (this.pending !== null && url !== this.inFlightUrl) {
+      this.pending = null;
+    }
     this.inFlightUrl = url;
   }
 
   /** Marks the end of an hls.js manifest load (`MANIFEST_LOADED` or a fatal manifest error). */
   settle(): void {
-    const pending = this.pendingUrl;
+    const pending = this.pending;
     if (this.inFlightUrl === null && pending === null) return;
     this.inFlightUrl = null;
-    this.pendingUrl = null;
-    if (pending !== null) {
-      this.start(pending);
-    }
+    this.pending = null;
+    pending?.();
+  }
+
+  /**
+   * Releases the in-flight and queued loads without replaying either. A
+   * torn-down transport calls this so a destroyed instance cannot hold a queued
+   * recovery behind a load that will never settle.
+   */
+  abandon(): void {
+    this.inFlightUrl = null;
+    this.pending = null;
   }
 
   /**
    * Issues a manifest load, or queues it behind the one already in flight.
-   * Returns true when the request was started immediately, false when it was
-   * coalesced into the in-flight load.
+   * `beforeStart`, when supplied, runs when the load actually starts — now, or
+   * when a queued load replays — so a recovery's resume position cannot shift a
+   * load that is already in flight. Returns true when the request started
+   * immediately, false when it was coalesced into the in-flight load.
    */
-  request(url: string): boolean {
+  request(url: string, beforeStart?: () => void): boolean {
+    const run = () => {
+      beforeStart?.();
+      this.start(url);
+    };
     if (this.inFlightUrl !== null) {
-      this.pendingUrl = url;
+      this.pending = run;
       return false;
     }
-    this.start(url);
+    run();
     return true;
   }
 

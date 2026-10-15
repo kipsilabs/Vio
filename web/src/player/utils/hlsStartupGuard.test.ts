@@ -169,10 +169,17 @@ describe("ManifestLoadCoalescer", () => {
 
     // A stale-generation fence arrives while it is in flight. The recovery
     // records the refetch instead of issuing a second concurrent request.
-    expect(recoverFromStaleGeneration(host, 42.5, (url) => coalescer.request(url))).toBe(true);
+    expect(
+      recoverFromStaleGeneration(host, 42.5, (url, applyResume) =>
+        coalescer.request(url, applyResume),
+      ),
+    ).toBe(true);
     expect(requests).toEqual([host.url]);
     // The direct loadSource path is bypassed in favour of the coalescer.
     expect(host.loadSource).not.toHaveBeenCalled();
+    // The resume position is not applied yet: mutating it now would shift the
+    // manifest load already in flight.
+    expect(host.config.startPosition).toBeUndefined();
 
     // Releasing the in-flight load replays the refetch once.
     coalescer.settle();
@@ -194,5 +201,74 @@ describe("ManifestLoadCoalescer", () => {
     coalescer.settle();
     // The in-flight load is the freshest request; only one refetch follows it.
     expect(requests).toEqual(["/master.m3u8"]);
+  });
+
+  it("ignores an empty MANIFEST_LOADING URL instead of marking itself busy", () => {
+    const requests: string[] = [];
+    const coalescer = new ManifestLoadCoalescer((url) => requests.push(url));
+
+    // hls.js can raise MANIFEST_LOADING before it exposes the source URL. An
+    // empty URL names no load to settle, so it must not block a later request.
+    coalescer.begin("");
+    expect(coalescer.request("/master.m3u8")).toBe(true);
+    expect(requests).toEqual(["/master.m3u8"]);
+  });
+
+  it("runs the queued load's beforeStart hook only when it replays", () => {
+    const order: string[] = [];
+    const coalescer = new ManifestLoadCoalescer((url) => order.push(`load:${url}`));
+
+    coalescer.begin("/master.m3u8");
+    coalescer.request("/refetch.m3u8", () => order.push("resume"));
+    // The hook waits for the load: applying it now would shift the load already
+    // in flight.
+    expect(order).toEqual([]);
+
+    coalescer.settle();
+    expect(order).toEqual(["resume", "load:/refetch.m3u8"]);
+  });
+
+  it("releases a queued recovery when a fatal error abandons the load", () => {
+    const requests: string[] = [];
+    const coalescer = new ManifestLoadCoalescer((url) => requests.push(url));
+
+    // A manifest load is held and a recovery queues behind it.
+    coalescer.begin("/master.m3u8");
+    expect(coalescer.request("/refetch.m3u8")).toBe(false);
+    expect(requests).toEqual([]);
+
+    // A fatal non-manifest error tears the load down without a manifest event,
+    // so the transport abandons it. A later request must start, not queue
+    // behind a load that will never settle.
+    coalescer.abandon();
+    expect(coalescer.request("/recovered.m3u8")).toBe(true);
+    expect(requests).toEqual(["/recovered.m3u8"]);
+  });
+
+  it("drops a queued recovery when an out-of-band load supersedes it", () => {
+    const requests: string[] = [];
+    const coalescer = new ManifestLoadCoalescer((url) => requests.push(url));
+
+    // A manifest load is held and a stale-generation refetch queues behind it.
+    coalescer.begin("/initial.m3u8");
+    expect(coalescer.request("/recovery.m3u8")).toBe(false);
+
+    // The window-edge refetch issues its own loadSource; hls.js raises
+    // MANIFEST_LOADING for that newer URL. It supersedes the queued recovery,
+    // which must not replay after it.
+    coalescer.begin("/edge.m3u8");
+    coalescer.settle();
+    expect(requests).toEqual([]);
+  });
+
+  it("replays a queued refetch exactly once across duplicate MANIFEST_LOADED events", () => {
+    const requests: string[] = [];
+    const coalescer = new ManifestLoadCoalescer((url) => requests.push(url));
+
+    coalescer.begin("/master.m3u8");
+    coalescer.request("/refetch.m3u8");
+    coalescer.settle();
+    coalescer.settle();
+    expect(requests).toEqual(["/refetch.m3u8"]);
   });
 });

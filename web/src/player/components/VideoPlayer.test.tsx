@@ -64,7 +64,10 @@ const hlsJS = vi.hoisted(() => ({
   loadSource: vi.fn(),
   errorHandler: null as null | ((event: unknown, data: unknown) => void),
   stopLoad: vi.fn(),
-  latest: null as null | { emit: (event: string, data: unknown) => void },
+  latest: null as null | {
+    emit: (event: string, data: unknown) => void;
+    loadSource: (url: string) => void;
+  },
   bufferAppendedHandler: null as null | ((event: unknown, data?: unknown) => void),
   // When true, a mocked loadSource emits MANIFEST_LOADING but not
   // MANIFEST_LOADED, so the player's manifest load stays in flight. Tests use
@@ -3326,6 +3329,177 @@ describe("VideoPlayer stale generation recovery", () => {
     });
     expect(hlsJS.loadSource).toHaveBeenCalledTimes(1);
     expect(hlsJS.loadSource.mock.calls[0]?.[0]).toContain("master.m3u8");
+  });
+
+  it("releases the held manifest load a fatal fragment error tore down", async () => {
+    // The transport's initial manifest load never settles; a fatal fragment
+    // error then stops hls.js's loading pipeline without a manifest event.
+    hlsJS.holdManifestLoad = true;
+    const onPlanFailure = vi.fn();
+    renderPlayer({
+      plan: hlsTranscodePlan(),
+      streamUrl: transcodeStreamUrl,
+      onPlanFailure,
+      shouldAutoPlay: false,
+    });
+    await waitFor(() => expect(hlsJS.errorHandler).toBeTypeOf("function"));
+    hlsJS.loadSource.mockClear();
+    hlsJS.startLoad.mockClear();
+
+    act(() => {
+      hlsJS.errorHandler?.("error", {
+        fatal: true,
+        type: "networkError",
+        details: "fragLoadError",
+        frag: { url: "/api/v2/playback/transcode/session-1/segment/seg_00007.m4s?sgen=live" },
+        response: {
+          code: 500,
+          url: "/api/v2/playback/transcode/session-1/segment/seg_00007.m4s",
+        },
+        networkDetails: { status: 500, headers: { get: () => null } },
+      });
+    });
+    // The ordinary network recovery took over.
+    expect(hlsJS.startLoad).toHaveBeenCalledTimes(1);
+    expect(onPlanFailure).not.toHaveBeenCalled();
+
+    // The next stale-generation fence must refetch now; it cannot queue behind
+    // the manifest load the fatal error abandoned.
+    act(() => {
+      hlsJS.errorHandler?.("error", staleSegfault());
+    });
+    expect(hlsJS.loadSource).toHaveBeenCalledTimes(1);
+    expect(hlsJS.loadSource.mock.calls[0]?.[0]).toContain("master.m3u8");
+  });
+
+  it("does not replay a queued refetch into the instance a decode replan destroyed", async () => {
+    hlsJS.holdManifestLoad = true;
+    const onPlanFailure = vi.fn();
+    renderPlayer({
+      plan: hlsTranscodePlan(),
+      streamUrl: transcodeStreamUrl,
+      onPlanFailure,
+      shouldAutoPlay: false,
+    });
+    await waitFor(() => expect(hlsJS.errorHandler).toBeTypeOf("function"));
+    hlsJS.loadSource.mockClear();
+
+    // A stale-generation refetch queues behind the held manifest load.
+    act(() => {
+      hlsJS.errorHandler?.("error", staleSegfault());
+    });
+    expect(hlsJS.loadSource).not.toHaveBeenCalled();
+
+    // A decode verdict on a fragment destroys the transport. It is not a
+    // manifest-scoped error, so nothing settles the held load.
+    act(() => {
+      hlsJS.errorHandler?.("error", {
+        fatal: true,
+        type: "networkError",
+        details: "fragLoadError",
+        frag: { url: "/api/v2/playback/transcode/session-1/segment/seg_00008.m4s" },
+        response: { code: 422, data: { code: "decode_failed" } },
+        networkDetails: { status: 422, headers: { get: () => null } },
+      });
+    });
+    expect(onPlanFailure).toHaveBeenCalledTimes(1);
+
+    // A late MANIFEST_LOADED must not replay the queued refetch into the
+    // destroyed instance.
+    act(() => {
+      hlsJS.latest?.emit("hlsManifestLoaded", { url: transcodeStreamUrl });
+    });
+    expect(hlsJS.loadSource).not.toHaveBeenCalled();
+  });
+
+  it("drops a queued refetch when a window-edge refetch supersedes it", async () => {
+    hlsJS.holdManifestLoad = true;
+    renderPlayer({
+      plan: hlsTranscodePlan(),
+      streamUrl: transcodeStreamUrl,
+      shouldAutoPlay: false,
+    });
+    await waitFor(() => expect(hlsJS.errorHandler).toBeTypeOf("function"));
+    hlsJS.loadSource.mockClear();
+
+    // A stale-generation refetch queues behind the held manifest load.
+    act(() => {
+      hlsJS.errorHandler?.("error", staleSegfault());
+    });
+    expect(hlsJS.loadSource).not.toHaveBeenCalled();
+
+    // The window-edge refetch issues its own loadSource for a newer URL.
+    act(() => {
+      hlsJS.latest?.loadSource("/api/v2/playback/transcode/session-1/master.m3u8?edge=1");
+    });
+    expect(hlsJS.loadSource).toHaveBeenCalledTimes(1);
+
+    // Settling the newer load must not replay the superseded recovery, which
+    // would be a third redundant load resumed at a stale position.
+    act(() => {
+      hlsJS.latest?.emit("hlsManifestLoaded", { url: transcodeStreamUrl });
+    });
+    expect(hlsJS.loadSource).toHaveBeenCalledTimes(1);
+  });
+
+  it("replays one refetch across duplicate MANIFEST_LOADED events", async () => {
+    hlsJS.holdManifestLoad = true;
+    renderPlayer({
+      plan: hlsTranscodePlan(),
+      streamUrl: transcodeStreamUrl,
+      shouldAutoPlay: false,
+    });
+    await waitFor(() => expect(hlsJS.errorHandler).toBeTypeOf("function"));
+    hlsJS.loadSource.mockClear();
+
+    act(() => {
+      hlsJS.errorHandler?.("error", staleSegfault());
+    });
+    act(() => {
+      hlsJS.latest?.emit("hlsManifestLoaded", { url: transcodeStreamUrl });
+      hlsJS.latest?.emit("hlsManifestLoaded", { url: transcodeStreamUrl });
+    });
+    expect(hlsJS.loadSource).toHaveBeenCalledTimes(1);
+  });
+
+  it("collapses consecutive not-ready pollbacks into one manifest reload", async () => {
+    const onPlanFailure = vi.fn();
+    renderPlayer({
+      plan: hlsTranscodePlan(),
+      streamUrl: transcodeStreamUrl,
+      onPlanFailure,
+      shouldAutoPlay: false,
+    });
+    await waitFor(() => expect(hlsJS.errorHandler).toBeTypeOf("function"));
+    hlsJS.loadSource.mockClear();
+
+    const notReady = () => ({
+      fatal: true,
+      type: "networkError",
+      details: "manifestLoadError",
+      url: "/api/v2/playback/transcode/session-1/master.m3u8",
+      response: { code: 503, data: { code: "not_ready_retry" } },
+      networkDetails: { status: 503, headers: { get: () => null } },
+    });
+
+    vi.useFakeTimers();
+    try {
+      act(() => {
+        hlsJS.errorHandler?.("error", notReady());
+        hlsJS.errorHandler?.("error", notReady());
+      });
+      // Each pollback replaces the previous timer: nothing loads yet.
+      expect(hlsJS.loadSource).not.toHaveBeenCalled();
+
+      act(() => {
+        vi.advanceTimersByTime(2000);
+      });
+      // One pending timer fires one reload.
+      expect(hlsJS.loadSource).toHaveBeenCalledTimes(1);
+      expect(onPlanFailure).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
