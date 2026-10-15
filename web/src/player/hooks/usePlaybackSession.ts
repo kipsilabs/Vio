@@ -577,6 +577,17 @@ export interface UsePlaybackSessionResult extends PlaybackSessionState {
   /** Starts a fresh reconnect cycle after the previous one gave up. */
   retryConnection: () => void;
   /**
+   * Runs the reconnect's next attempt immediately when a session-scoped call
+   * confirmed the session it is rebuilding is gone. No-op unless a reconnect
+   * is active with its backoff timer armed.
+   */
+  expediteReconnect: () => void;
+  /**
+   * Enters the lost state for a session the server no longer has when the
+   * reconnect cannot run (no played stream to reposition).
+   */
+  reportSessionLost: () => void;
+  /**
    * `failure_recovery` replan for a plan the *server* invalidated over the
    * realtime `plan_invalidated` command. Resolves to whether a replacement plan
    * is now playing; the caller reports that back as the command's result.
@@ -2728,6 +2739,28 @@ export function usePlaybackSession(
     beginReconnect(reconnect.positionSeconds, reconnect.resume, true);
   }, [beginReconnect]);
 
+  /**
+   * A session-scoped call confirmed the session the reconnect is rebuilding is
+   * gone. The reconnect replaces a dead session with a fresh start, so run its
+   * pending attempt now rather than letting the viewer wait out the backoff.
+   * Only a timer-armed cycle is nudged: an attempt already in flight is
+   * already doing the work, and there is nothing to hurry.
+   */
+  const expediteReconnect = useCallback(() => {
+    const reconnect = reconnectRef.current;
+    if (reconnect.active && reconnect.timer !== null) scheduleReconnectAttempt(0);
+  }, [scheduleReconnectAttempt]);
+
+  /**
+   * Enters the lost state for a session the server has already answered that
+   * it no longer has, when the reconnect cannot run (nothing has played yet,
+   * so there is no position or transport to rebuild). Whenever a played stream
+   * exists, the reconnect is the one recovery and runs instead.
+   */
+  const reportSessionLost = useCallback(() => {
+    giveUpReconnect(CONNECTION_LOST_ERROR);
+  }, [giveUpReconnect]);
+
   // Coming back online is the best moment to try again.
   const reconnecting = state.connectionStatus === "reconnecting";
   useEffect(() => {
@@ -3780,6 +3813,8 @@ export function usePlaybackSession(
     recoverFromFailure,
     recoverConnection,
     retryConnection,
+    expediteReconnect,
+    reportSessionLost,
     invalidatePlan,
     reanchorSeek,
     refreshSubtitles,

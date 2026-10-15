@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef } from "react";
 import { usePlayerConfig } from "../context/PlayerConfigContext";
+import { isPlaybackSessionGoneError } from "../playback-errors";
 import {
   sendSessionProgress,
   observeSessionProgress,
@@ -13,6 +14,11 @@ import { toMediaTime } from "../utils/mediaTimeline";
  * An optional streamOriginRef maps player-local time back onto the original
  * media timeline for restarted HLS sessions.
  *
+ * A progress sample answered 404/410 means the session no longer exists
+ * server-side; `onSessionLost` is reported once and polling stops, so the
+ * player is not nudged every interval forever. The one recovery or lost UI
+ * behind it is the caller's.
+ *
  * On cleanup (player unmount), sends one final progress report with
  * keepalive so the backend records the last known position even when
  * the user seeks and closes quickly.
@@ -21,12 +27,18 @@ export function useWatchProgress(
   sessionId: string | null,
   videoRef: React.RefObject<HTMLVideoElement | null>,
   streamOriginRef?: React.RefObject<number>,
+  onSessionLost?: () => void,
 ) {
   const config = usePlayerConfig();
   const configRef = useRef(config);
   configRef.current = config;
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const skipCleanupReportRef = useRef(false);
+  const onSessionLostRef = useRef(onSessionLost);
+
+  useEffect(() => {
+    onSessionLostRef.current = onSessionLost;
+  }, [onSessionLost]);
 
   const getProgressSnapshot = useCallback(() => {
     const video = videoRef.current;
@@ -86,16 +98,33 @@ export function useWatchProgress(
   useEffect(() => {
     if (!sessionId) return;
     skipCleanupReportRef.current = false;
+    let disposed = false;
+
+    const stopPolling = () => {
+      if (intervalRef.current) clearInterval(intervalRef.current);
+      intervalRef.current = null;
+    };
 
     intervalRef.current = setInterval(() => {
-      reportProgress().catch(() => {
-        // Best effort — don't disrupt playback on progress report failure.
+      reportProgress().catch((error: unknown) => {
+        // Every other failure is best effort — a transient sample failure must
+        // not disrupt playback. A session that no longer exists is terminal:
+        // stop polling and hand the player its one report. A sample from a
+        // session this effect has already left belongs to the old id.
+        if (disposed) return;
+        if (isPlaybackSessionGoneError(error)) {
+          stopPolling();
+          // The session row is gone, so the cleanup's final keepalive would
+          // only be answered 404. Skip it.
+          skipCleanupReportRef.current = true;
+          onSessionLostRef.current?.();
+        }
       });
     }, 10_000);
 
     return () => {
-      if (intervalRef.current) clearInterval(intervalRef.current);
-      intervalRef.current = null;
+      disposed = true;
+      stopPolling();
 
       if (skipCleanupReportRef.current) return;
 
