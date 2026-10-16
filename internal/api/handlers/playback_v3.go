@@ -11491,6 +11491,16 @@ func virtualVideoTrackFromDescriptorV3(source playback.SourceDescriptorV3) model
 	return track
 }
 
+// Probe range tokens the tonemap classifier understands, named once so the
+// descriptor mapping does not repeat literals the package uses elsewhere.
+const (
+	videoRangeTokenDOVI      = "DOVI"
+	videoRangeTokenHDR10Plus = "HDR10Plus"
+	videoRangeTokenHLG       = "HLG"
+	videoRangeTokenHDR10     = "HDR10"
+	videoRangeTokenSDR       = "SDR"
+)
+
 // virtualVideoRangeTypeFromDescriptorV3 maps the running plan's normalized
 // dynamic-range label onto the row range token tonemap classifies from, so a
 // carried row's SourceDescriptorFromFileV3 round-trips to the same label. The
@@ -11501,15 +11511,15 @@ func virtualVideoTrackFromDescriptorV3(source playback.SourceDescriptorV3) model
 func virtualVideoRangeTypeFromDescriptorV3(source playback.SourceDescriptorV3) string {
 	switch source.DynamicRange {
 	case playback.DynamicRangeDolbyVisionV3:
-		return "DOVI"
+		return videoRangeTokenDOVI
 	case playback.DynamicRangeHDR10PlusV3:
-		return "HDR10Plus"
+		return videoRangeTokenHDR10Plus
 	case playback.DynamicRangeHLGV3:
-		return "HLG"
+		return videoRangeTokenHLG
 	case playback.DynamicRangeHDR10V3:
-		return "HDR10"
+		return videoRangeTokenHDR10
 	case playback.DynamicRangeSDRV3:
-		return "SDR"
+		return videoRangeTokenSDR
 	default:
 		// Unknown HDR (and any unrecognized label) stays unclassifiable; the
 		// file-level HDR flag carries the "unknown" grade.
