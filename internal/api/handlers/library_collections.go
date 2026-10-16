@@ -50,7 +50,10 @@ type LibraryCollectionHandler struct {
 	// ArtworkSigner maps a local-storage signed route back to its store key,
 	// so a collage reads its sources from the store instead of requesting the
 	// server's own route.
-	ArtworkSigner         *artworkurl.Signer
+	ArtworkSigner *artworkurl.Signer
+	// ArtworkRepair queues regeneration of a collage source missing from local
+	// storage; nil skips that.
+	ArtworkRepair         ArtworkRepairEnqueuer
 	FrontendFS            fs.FS
 	SectionRepo           *sections.Repository
 	UserCollectionPool    *pgxpool.Pool
@@ -207,7 +210,7 @@ func (h *LibraryCollectionHandler) CollectionCollagePath(collectionID, key strin
 }
 
 func (h *LibraryCollectionHandler) collageComposer() collectionCollageComposer {
-	return collectionCollageComposer{prefix: adminCollectionImagePrefix, store: h.ArtworkStore, posters: h.detailSvc, signer: h.ArtworkSigner, httpClient: h.httpClient}
+	return collectionCollageComposer{prefix: adminCollectionImagePrefix, store: h.ArtworkStore, posters: h.detailSvc, signer: h.ArtworkSigner, repair: h.ArtworkRepair, httpClient: h.httpClient}
 }
 
 type libraryCollectionResponse struct {

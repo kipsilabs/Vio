@@ -391,6 +391,12 @@ func removeCollectionImageVariants(
 	return nil
 }
 
+// ArtworkRepairEnqueuer queues regeneration of a cached artwork revision that
+// is missing from the store, as the signed artwork route does.
+type ArtworkRepairEnqueuer interface {
+	EnqueueArtworkRepair(ctx context.Context, keys []string, priority int) (int, error)
+}
+
 // collectionCollageComposer composes collection collages from title posters
 // and stores them under one artwork prefix (catalog.CollageGenerator). Each
 // collage is stored in the collection's collage directory with its key as the
@@ -401,6 +407,7 @@ type collectionCollageComposer struct {
 	store      blobstore.Store
 	posters    itemPosterSigner
 	signer     *artworkurl.Signer
+	repair     ArtworkRepairEnqueuer
 	httpClient *http.Client
 }
 
@@ -409,16 +416,17 @@ type collectionCollageComposer struct {
 // when artwork storage or poster signing is not configured, which leaves
 // personal collections without collages. signer is the artwork URL signer, so
 // a source behind local storage can be read from the store directly; a nil
-// signer leaves every source to the HTTP fetch. A nil httpClient uses
-// newCollectionImageClient.
-func NewPersonalCollectionCollageGenerator(store blobstore.Store, posters itemPosterSigner, signer *artworkurl.Signer, httpClient *http.Client) catalog.CollageGenerator {
+// signer leaves every source to the HTTP fetch. repair queues regeneration of
+// a missing revisioned source, as the signed artwork route does; a nil repair
+// skips that. A nil httpClient uses newCollectionImageClient.
+func NewPersonalCollectionCollageGenerator(store blobstore.Store, posters itemPosterSigner, signer *artworkurl.Signer, repair ArtworkRepairEnqueuer, httpClient *http.Client) catalog.CollageGenerator {
 	if store == nil || posters == nil {
 		return nil
 	}
 	if httpClient == nil {
 		httpClient = newCollectionImageClient()
 	}
-	return collectionCollageComposer{prefix: userCollectionImagePrefix, store: store, posters: posters, signer: signer, httpClient: httpClient}
+	return collectionCollageComposer{prefix: userCollectionImagePrefix, store: store, posters: posters, signer: signer, repair: repair, httpClient: httpClient}
 }
 
 // ComposeCollectionCollage fetches the source posters, composes them and
@@ -564,6 +572,12 @@ func (c collectionCollageComposer) readStoredImage(ctx context.Context, key stri
 	}
 	body, info, err := c.store.Get(ctx, key)
 	if err != nil {
+		// A missing revisioned source is queued for regeneration, as the
+		// signed artwork route does: the build fails now, and a later read
+		// retries it once the object is rebuilt.
+		if errors.Is(err, blobstore.ErrNotFound) && c.repair != nil && artworkkey.Revision(key) != "" {
+			_, _ = c.repair.EnqueueArtworkRepair(ctx, []string{artworkkey.OriginalOf(key)}, 1)
+		}
 		return nil, err
 	}
 	defer func() { _ = body.Close() }()
