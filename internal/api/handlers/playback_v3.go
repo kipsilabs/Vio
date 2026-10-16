@@ -2238,6 +2238,22 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	// three together and could not say which one consumed the budget.
 	effectiveSubtitles := subtitleInventoryFor(effectiveFile)
 	timings.mark("subtitle_inventory")
+	// Apply the profile's stored "always" subtitle mode before planning so the
+	// first plan carries the burn-in requirement: a bitmap subtitle that must be
+	// burned in forces the burn-in video codec, and discovering that only after
+	// the first FFmpeg start costs a second plan and a second spawn. Any named
+	// selection is never overridden; an omitted selection defers to the stored
+	// mode, so for an "always" profile an omitted start field turns subtitles on
+	// where it previously left them off. An explicit off (subtitle_track_index
+	// = -1) is a named intent too: it skips this and plans subtitles off for
+	// one start without changing the stored mode.
+	if req.SubtitleTrackID == "" && req.SubtitleTrackIndex == nil {
+		if subtitleIndex, ok := h.resolvePreferredSubtitleSelectionV3(r.Context(), userID, profileID, deviceID, effectiveFile, effectiveSubtitles); ok {
+			indexCopy := subtitleIndex
+			req.SubtitleTrackIndex = &indexCopy
+		}
+	}
+	timings.mark("subtitle_selection")
 	transformationRegistry := h.transformationRegistryV3(r.Context())
 	dvrpuStrippable := h.lazyDVRPUStrippableV3(r.Context(), effectiveFile)
 	timings.mark("transform_registry")
@@ -11770,6 +11786,13 @@ var errSubtitleUnavailableInTargetV3 = errors.New("no equivalent subtitle track 
 
 func (h *PlaybackHandler) remapSubtitleSelectionV3(ctx context.Context, source, target *models.MediaFile, request *playback.StartRequestV3) (bool, error) {
 	if request == nil || source == nil || target == nil {
+		return false, nil
+	}
+	// Explicit off (subtitle_track_index = -1) names no track, so there is
+	// nothing to remap and the intent must survive a version change: a client
+	// that asked for subtitles off stays off rather than having the negative
+	// sentinel reinterpreted against the target's inventory.
+	if request.SubtitleTrackIndex != nil && *request.SubtitleTrackIndex == playback.SubtitleTrackOffIndexV3 {
 		return false, nil
 	}
 	// A same-id pairing is only a no-op when the subtitle inventory is
