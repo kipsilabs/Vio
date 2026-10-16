@@ -2500,3 +2500,275 @@ func TestDeferredProbeFailedPushFailsClosedOnStoreError(t *testing.T) {
 	fx.handler.PlanStoreV3 = healthy
 	fx.pollInventoryStatus(t, string(ProbeProvenanceFailed))
 }
+
+// idKeyedPlaybackFileResolver resolves rows by id and reports an error for any
+// id it does not hold, modeling a catalog read that cannot produce the row a
+// binding now points at.
+type idKeyedPlaybackFileResolver struct {
+	rows map[int]*models.MediaFile
+}
+
+func (r idKeyedPlaybackFileResolver) GetByID(_ context.Context, id int) (*models.MediaFile, error) {
+	if row, ok := r.rows[id]; ok && row != nil {
+		return row, nil
+	}
+	return nil, errors.New("catalog row not found")
+}
+
+// TestDeferredProbeReplacementShedsWhenEffectiveRowUnresolved is the stale-row
+// regression: when the replacement's current effective row cannot be resolved,
+// the dropped job's superseded row must NOT be used as a fallback. The
+// replacement fences against the new binding, so writing through the old file
+// would stamp evidence onto a row the session no longer serves while leaving the
+// served row un-stamped. The replacement is shed instead: no probe runs, no
+// evidence is written, and the session never reports a false verified status.
+func TestDeferredProbeReplacementShedsWhenEffectiveRowUnresolved(t *testing.T) {
+	const uri = "virtual://movie/tt-shed-unresolved?result=a"
+	manager := playback.NewSessionManager(0, 0)
+	session, err := manager.StartSession(1, "profile-1", 700, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	if err := manager.SetVirtualSource(session.ID, uri, 5); err != nil {
+		t.Fatalf("SetVirtualSource: %v", err)
+	}
+	// A row-only move leaves the generation and candidate unchanged but points
+	// the session at a row the resolver cannot produce.
+	if err := manager.SetEffectiveMediaFileID(session.ID, 701); err != nil {
+		t.Fatalf("SetEffectiveMediaFileID: %v", err)
+	}
+
+	rowA := &models.MediaFile{
+		ID: 700, ContentID: "movie-shed", FilePath: uri, VirtualOwnerInstallationID: 5,
+		AudioTracks: []models.AudioTrack{{Codec: "aac", Channels: 2, Language: "eng", Default: true}},
+	}
+	handler := NewPlaybackHandler(manager, idKeyedPlaybackFileResolver{rows: map[int]*models.MediaFile{700: rowA}})
+	handler.RealtimeHub = playback.NewRealtimeHub()
+	handler.InstallationID = "test-install"
+	serviceCtx, serviceCancel := context.WithCancel(context.Background())
+	handler.ServiceContext = serviceCtx
+	t.Cleanup(serviceCancel)
+
+	var mu sync.Mutex
+	probeCalls, saverCalls := 0, 0
+	handler.VirtualPlaybackSourceProber = func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
+		mu.Lock()
+		probeCalls++
+		mu.Unlock()
+		return f, nil
+	}
+	handler.VirtualFileMetadataSaver = func(_ context.Context, _ models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error) {
+		mu.Lock()
+		saverCalls++
+		mu.Unlock()
+		return VirtualFileMetadataUpdateResult{MetadataUpdated: true, RowsAffected: 1}, nil
+	}
+
+	dropped := &virtualDeferredProbeV3{
+		stickyKey:      "sticky-shed",
+		file:           &models.MediaFile{ID: 700},
+		streamURL:      "http://provider.example/stream",
+		probeTransient: &models.MediaFile{ID: 700},
+		cand:           VirtualPlaybackStream{ID: "cand-1", URI: uri},
+		ownerID:        5,
+		sessionID:      session.ID,
+	}
+	handler.scheduleDroppedProbeReplacement(context.Background(), dropped)
+
+	mu.Lock()
+	gotProbes, gotSavers := probeCalls, saverCalls
+	mu.Unlock()
+	if gotProbes != 0 || gotSavers != 0 {
+		t.Fatalf("probe/saver calls = %d/%d, want 0/0: an unresolved effective row must not be probed or stamped", gotProbes, gotSavers)
+	}
+	live, err := manager.GetSession(session.ID)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if live.VirtualProbeOutcome == probeOutcomeVerified {
+		t.Fatal("outcome = verified on an unresolved effective row; want no false verified status")
+	}
+	if live.VirtualProbeOutcome != probeOutcomeFailed {
+		t.Fatalf("outcome = %q, want the shed terminal failure", live.VirtualProbeOutcome)
+	}
+}
+
+// rowMoveAfterBindingReadManager reproduces the admission interleaving where
+// SetEffectiveMediaFileID moves the effective row between the admission binding
+// read and the pending arm, without advancing the generation. The read returns
+// the pre-move binding, so admission must record THAT binding as the pending
+// mark's owner rather than the row the move left behind.
+type rowMoveAfterBindingReadManager struct {
+	*playback.SessionManager
+	moveTo int
+	once   sync.Once
+}
+
+func (m *rowMoveAfterBindingReadManager) VirtualSourceBinding(sessionID string) (playback.VirtualSourceBindingSnapshot, error) {
+	binding, err := m.SessionManager.VirtualSourceBinding(sessionID)
+	m.once.Do(func() { _ = m.SetEffectiveMediaFileID(sessionID, m.moveTo) })
+	return binding, err
+}
+
+// TestDeferredProbeAdmissionRecordsScheduledBindingAcrossRowMove is the
+// unowned-pending regression: a row-only move between the admission read and the
+// arm must not leave the pending mark looking live for a row no worker will land
+// on. Recording the scheduled binding keeps the mark stale for the moved row, so
+// recovery can arm the row the session now serves; recording the moved row would
+// refuse the replacement and strand the client until the convergence watchdog.
+func TestDeferredProbeAdmissionRecordsScheduledBindingAcrossRowMove(t *testing.T) {
+	const uri = "virtual://movie/tt-admit-row-move?result=a"
+	fx := newDeferredLifecycleFixture(t, 730, uri)
+	barrier := &rowMoveAfterBindingReadManager{SessionManager: fx.manager, moveTo: 731}
+	fx.handler.sessionMgr = barrier
+
+	deferred := fx.job(uri)
+	if !fx.handler.armDeferredProbePending(context.Background(), deferred) {
+		t.Fatal("admission rejected the pre-move job as stale")
+	}
+	if deferred.binding.EffectiveMediaFileID != 730 {
+		t.Fatalf("admitted binding row = %d, want the scheduled row 730", deferred.binding.EffectiveMediaFileID)
+	}
+	// The moved row carries no live lifecycle of its own, so recovery must be able
+	// to own it. A pending mark recorded against the moved row would look live and
+	// refuse this arm.
+	binding, applied, err := fx.manager.ArmVirtualProbeReplacementForCurrentBinding(fx.session.ID, uri, 5)
+	if err != nil || !applied {
+		t.Fatalf("recovery arm for the moved row = (_, %v, %v), want applied", applied, err)
+	}
+	if binding.EffectiveMediaFileID != 731 {
+		t.Fatalf("replacement armed row %d, want the moved row 731", binding.EffectiveMediaFileID)
+	}
+}
+
+// TestDeferredProbeRowMoveDuringPersistenceAdmitsReplacement is the
+// move-after-the-post-probe-check regression for the failed-terminal-CAS window:
+// a row-only move lands while the durable write is blocked, so the write commits
+// the old row and the terminal CAS against the admitted binding fails. The moved
+// row must get its own replacement probe instead of being served un-enumerated.
+func TestDeferredProbeRowMoveDuringPersistenceAdmitsReplacement(t *testing.T) {
+	const uri = "virtual://movie/tt-row-move-persist?result=a"
+	fx := newDeferredLifecycleFixture(t, 740, uri)
+	fx.saveAttempt(t)
+	fx.handler.fileResolver = idKeyedPlaybackFileResolver{rows: map[int]*models.MediaFile{
+		740: {ID: 740, ContentID: "movie-row-move", FilePath: uri, VirtualOwnerInstallationID: 5},
+		741: {ID: 741, ContentID: "movie-row-move", FilePath: uri, VirtualOwnerInstallationID: 5},
+	}}
+
+	var probeMu sync.Mutex
+	probeCalls := 0
+	fx.handler.VirtualPlaybackSourceProber = func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
+		probeMu.Lock()
+		probeCalls++
+		probeMu.Unlock()
+		f.AudioTracks = fx.probedAudio
+		f.SubtitleTracks = fx.probedSubs
+		f.CodecAudio = "eac3"
+		return f, nil
+	}
+
+	saveStarted := make(chan struct{})
+	releaseSave := make(chan struct{})
+	var saveOnce sync.Once
+	fx.setSaverOverride(func() (VirtualFileMetadataUpdateResult, error) {
+		saveOnce.Do(func() { close(saveStarted) })
+		<-releaseSave
+		return VirtualFileMetadataUpdateResult{MetadataUpdated: true, RowsAffected: 1}, nil
+	})
+
+	deferred := fx.job(uri)
+	if !fx.handler.armDeferredProbePending(context.Background(), deferred) {
+		t.Fatal("admission rejected the persistence job as stale")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		fx.handler.runDeferredVirtualProbe(deferred)
+	}()
+	close(fx.releaseProbe)
+	select {
+	case <-saveStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("durable write was not attempted")
+	}
+	// Row-only move while the durable write is blocked: the post-probe fence has
+	// already passed (generation and candidate unchanged), so the committed row is
+	// the old one and the terminal CAS against the admitted binding fails.
+	if err := fx.manager.SetEffectiveMediaFileID(fx.session.ID, 741); err != nil {
+		t.Fatalf("SetEffectiveMediaFileID: %v", err)
+	}
+	close(releaseSave)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not finish after the write released")
+	}
+	// The moved row must receive a replacement probe. Without recovery the
+	// superseded job writes nothing to the moved row and only one probe ever runs.
+	waitDeferredCondition(t, func() bool {
+		probeMu.Lock()
+		defer probeMu.Unlock()
+		return probeCalls >= 2
+	}, "replacement probe for the row moved during persistence")
+}
+
+// bindingMoveDuringReconcileManager lands a same-candidate generation move on the
+// reconciliation step's session lookup, modeling a binding that moves after the
+// durable write commits but before the verdict is propagated.
+type bindingMoveDuringReconcileManager struct {
+	*playback.SessionManager
+	move func()
+	once sync.Once
+}
+
+func (m *bindingMoveDuringReconcileManager) GetSessionsByMediaFileID(fileID int) []*playback.Session {
+	m.once.Do(func() {
+		if m.move != nil {
+			m.move()
+		}
+	})
+	return m.SessionManager.GetSessionsByMediaFileID(fileID)
+}
+
+// TestDeferredProbeBindingMoveDuringReconciliationAdmitsReplacement is the
+// move-after-the-post-probe-check regression for the superseded window: the
+// binding moves after the durable write commits, so the propagation CAS rejects
+// the verdict as superseded. The moved generation must still get its own
+// replacement probe rather than being left un-enumerated.
+func TestDeferredProbeBindingMoveDuringReconciliationAdmitsReplacement(t *testing.T) {
+	const uri = "virtual://movie/tt-move-reconcile?result=a"
+	fx := newDeferredLifecycleFixture(t, 750, uri)
+	fx.saveAttempt(t)
+
+	var probeMu sync.Mutex
+	probeCalls := 0
+	fx.handler.VirtualPlaybackSourceProber = func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
+		probeMu.Lock()
+		probeCalls++
+		probeMu.Unlock()
+		f.AudioTracks = fx.probedAudio
+		f.SubtitleTracks = fx.probedSubs
+		f.CodecAudio = "eac3"
+		return f, nil
+	}
+	// Same candidate, new generation: the committed verdict passes the
+	// post-probe fence but is then superseded by the terminal CAS.
+	fx.handler.sessionMgr = &bindingMoveDuringReconcileManager{
+		SessionManager: fx.manager,
+		move:           func() { _ = fx.manager.SetVirtualSource(fx.session.ID, uri, 5) },
+	}
+
+	deferred := fx.job(uri)
+	if !fx.handler.armDeferredProbePending(context.Background(), deferred) {
+		t.Fatal("admission rejected the reconciliation job as stale")
+	}
+	close(fx.releaseProbe)
+	fx.handler.runDeferredVirtualProbe(deferred)
+
+	waitDeferredCondition(t, func() bool {
+		probeMu.Lock()
+		defer probeMu.Unlock()
+		return probeCalls >= 2
+	}, "replacement probe for the binding moved during reconciliation")
+}

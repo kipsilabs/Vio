@@ -434,9 +434,24 @@ func (h *PlaybackHandler) scheduleDroppedProbeReplacement(ctx context.Context, d
 	replacement := *dropped
 	replacement.binding = binding
 	replacement.bindingGeneration = binding.Generation
-	if row := h.replacementCatalogRow(ctx, binding, dropped.file); row != nil {
-		replacement.file = row
+	row := h.replacementCatalogRow(ctx, binding, dropped.file)
+	if row == nil {
+		// The session's current effective row cannot be resolved, so the
+		// replacement has no row it can prove is the one the session serves.
+		// Admitting it would fence against the new binding while writing through
+		// the dropped job's superseded file — a stale-row write that leaves the
+		// served row un-stamped. Shed it instead: the pending mark the arm just
+		// wrote is failed terminally and published, so the client leaves its
+		// loading state instead of waiting for the convergence watchdog. The
+		// known effective id scopes the failure push to the served row.
+		replacement.file = &models.MediaFile{ID: binding.EffectiveMediaFileID}
+		slog.WarnContext(ctx, "deferred virtual probe replacement shed: current effective row unresolved",
+			"component", "api", "session", dropped.sessionID, "candidate_uri", dropped.cand.URI,
+			"effective_file_id", binding.EffectiveMediaFileID, "generation", binding.Generation)
+		h.shedDeferredVirtualProbe(&replacement)
+		return
 	}
+	replacement.file = row
 	admitCtx, cancel := h.virtualDetachedContext(ctx, virtualEvidencePersistBudget)
 	defer cancel()
 	slog.InfoContext(admitCtx, "deferred virtual post-commit probe dropped by the binding fence; admitting a replacement for the current binding",
@@ -449,16 +464,18 @@ func (h *PlaybackHandler) scheduleDroppedProbeReplacement(ctx context.Context, d
 // its evidence onto: the session's current effective row. A row-only binding move
 // (SetEffectiveMediaFileID) leaves the candidate URI unchanged but points the
 // session at a new row, so writing the dropped job's old row would leave the
-// served row un-stamped. When the effective row cannot be read, the dropped job's
-// row is still used rather than dropping the replacement — the alternative is a
-// stranded pending mark the convergence watchdog must fail — but the fallback is
-// logged with both row ids so the miss is visible.
+// served row un-stamped. It returns nil when the effective row cannot be
+// resolved, so the caller sheds the replacement instead of falling back to the
+// superseded row: writing stale evidence onto the row the session no longer
+// serves is worse than dropping the replacement, and the arm's pending mark is
+// then failed terminally rather than stranded. The miss is logged with both row
+// ids so it is visible.
 func (h *PlaybackHandler) replacementCatalogRow(ctx context.Context, binding playback.VirtualSourceBindingSnapshot, fallback *models.MediaFile) *models.MediaFile {
-	if h == nil || h.fileResolver == nil || binding.EffectiveMediaFileID <= 0 {
+	if fallback != nil && binding.EffectiveMediaFileID > 0 && fallback.ID == binding.EffectiveMediaFileID {
 		return fallback
 	}
-	if fallback != nil && fallback.ID == binding.EffectiveMediaFileID {
-		return fallback
+	if h == nil || h.fileResolver == nil || binding.EffectiveMediaFileID <= 0 {
+		return nil
 	}
 	readCtx, cancel := h.virtualDetachedContext(ctx, virtualEvidencePersistBudget)
 	defer cancel()
@@ -466,10 +483,10 @@ func (h *PlaybackHandler) replacementCatalogRow(ctx context.Context, binding pla
 	if err == nil && row != nil && row.ID > 0 {
 		return row
 	}
-	slog.WarnContext(readCtx, "deferred virtual probe replacement could not resolve the current effective row; falling back to the dropped row",
+	slog.WarnContext(readCtx, "deferred virtual probe replacement could not resolve the current effective row; shedding the replacement instead of writing the superseded row",
 		"component", "api", "effective_file_id", binding.EffectiveMediaFileID,
 		"dropped_file_id", catalogFileIDOrZero(fallback), "error", err)
-	return fallback
+	return nil
 }
 
 // virtualProbePendingArmer is the session-manager capability that transitions a
@@ -479,6 +496,18 @@ func (h *PlaybackHandler) replacementCatalogRow(ctx context.Context, binding pla
 // or terminal.
 type virtualProbePendingArmer interface {
 	ArmVirtualProbePendingIfGeneration(sessionID string, generation uint64) (bool, error)
+}
+
+// virtualProbePendingBindingArmer is the stronger admission fence: it arms the
+// pending mark for the exact binding snapshot the job was scheduled against and
+// records that snapshot as the mark's owner, rather than the session's binding at
+// write time. It exists because SetEffectiveMediaFileID moves a session's
+// effective row without advancing the generation, so a move landing between the
+// admission read and the generation-only arm would record the moved row as the
+// armed binding, make the stale mark look live, and block the replacement that
+// owns the moved row. The handler prefers this form when the manager supplies it.
+type virtualProbePendingBindingArmer interface {
+	ArmVirtualProbePendingIfBinding(sessionID string, expected playback.VirtualSourceBindingSnapshot) (bool, error)
 }
 
 // virtualProbeReplacementArmer is the session-manager capability that recovers a
@@ -529,6 +558,24 @@ func (h *PlaybackHandler) armDeferredProbePending(ctx context.Context, deferred 
 	}
 	deferred.bindingGeneration = binding.Generation
 	deferred.binding = binding
+	if armer, ok := h.sessionMgr.(virtualProbePendingBindingArmer); ok {
+		// Prefer the full-binding arm: it records the binding the job was
+		// scheduled against, so a row-only move that lands between the read
+		// above and this write cannot make the pending mark look live for a row
+		// no worker will land on.
+		applied, armErr := armer.ArmVirtualProbePendingIfBinding(deferred.sessionID, binding)
+		if armErr != nil {
+			slog.DebugContext(ctx, "deferred virtual post-commit probe dropped: pending mark not applied",
+				"component", "api", "session", deferred.sessionID, "candidate_uri", deferred.cand.URI, "error", armErr)
+			return false
+		}
+		if !applied {
+			slog.DebugContext(ctx, "deferred virtual post-commit probe dropped: lifecycle already armed or terminal for the binding",
+				"component", "api", "session", deferred.sessionID, "candidate_uri", deferred.cand.URI, "generation", binding.Generation)
+			return false
+		}
+		return true
+	}
 	if armer, ok := h.sessionMgr.(virtualProbePendingArmer); ok {
 		// Exclusive ownership: arm only from empty, so a duplicate start cannot
 		// restart a lifecycle the winner already armed or completed. A manager
@@ -779,6 +826,12 @@ func (h *PlaybackHandler) runDeferredVirtualProbe(deferred *virtualDeferredProbe
 		case probeInventoryRefused:
 			if h.setVirtualProbeOutcomeIfBinding(deferred.sessionID, deferred.binding, probeOutcomeFailed) {
 				h.publishDeferredProbeInventory(deferred)
+			} else {
+				// The terminal CAS was rejected because the binding moved after
+				// the post-probe check landed this verdict. The current binding
+				// carries no lifecycle of its own, so recover it exactly as the
+				// default fence does.
+				h.scheduleDroppedProbeReplacement(bgCtx, deferred)
 			}
 		case probeInventoryUnprovable:
 			// The probe committed but release continuity could not be proven
@@ -788,11 +841,22 @@ func (h *PlaybackHandler) runDeferredVirtualProbe(deferred *virtualDeferredProbe
 			// provisional overlay is untouched and a replan re-resolves.
 			if h.setVirtualProbeOutcomeIfBinding(deferred.sessionID, deferred.binding, probeOutcomeFailed) {
 				h.publishDeferredProbeInventory(deferred)
+			} else {
+				// Same as refused: the binding moved, so the current binding
+				// owes a probe of its own.
+				h.scheduleDroppedProbeReplacement(bgCtx, deferred)
 			}
 		case probeInventorySuperseded:
 			// The binding rotated, the session carries no overlay capability, or
 			// a transient identity read never cleared; nothing is owed to this
-			// generation and no verified status is published.
+			// generation and no verified status is published. A move during
+			// persistence or reconciliation lands here (the post-probe check runs
+			// before the blocking write), so if the current binding carries no
+			// live lifecycle of its own, admit a fresh replacement for it exactly
+			// as the default fence does. The arm's liveness check makes this a
+			// no-op when a live probe already owns the binding, so it converges
+			// instead of re-probing.
+			h.scheduleDroppedProbeReplacement(bgCtx, deferred)
 		}
 	case probeOutcomeFailed:
 		// probeVirtualSourceAndPersist has already attempted the durable
@@ -800,10 +864,13 @@ func (h *PlaybackHandler) runDeferredVirtualProbe(deferred *virtualDeferredProbe
 		// outcome can now record that the enumeration terminally failed. The poll
 		// and the push then agree and a client can leave its loading state. The
 		// terminal write CASes on the admitted generation; a rotation that landed
-		// while the probe ran makes the CAS reject the verdict, and then nothing
-		// is published — the replacement binding owns its own lifecycle.
+		// while the probe ran makes the CAS reject the verdict, so nothing is
+		// published — the replacement binding owns its own lifecycle, and the
+		// recovery arm gives it a fresh probe when it has none.
 		if h.setVirtualProbeOutcomeIfBinding(deferred.sessionID, deferred.binding, outcome) {
 			h.publishDeferredProbeInventory(deferred)
+		} else {
+			h.scheduleDroppedProbeReplacement(bgCtx, deferred)
 		}
 	case probeOutcomePartial:
 		// The enumeration was structurally incomplete, so the probe returned

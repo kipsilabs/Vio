@@ -1812,12 +1812,27 @@ func setVirtualProbeOutcomeLocked(s *Session, outcome string) {
 	}
 	s.VirtualProbeOutcome = outcome
 	if outcome == VirtualProbeOutcomePending {
-		s.virtualProbeArmedAt = time.Now()
-		s.virtualProbeArmedBinding = s.virtualBindingSnapshotLocked()
+		setVirtualProbePendingForBindingLocked(s, s.virtualBindingSnapshotLocked())
 		return
 	}
 	s.virtualProbeArmedAt = time.Time{}
 	s.virtualProbeArmedBinding = VirtualSourceBindingSnapshot{}
+}
+
+// setVirtualProbePendingForBindingLocked enters the pending outcome and records
+// the binding the mark belongs to, supplied by the caller rather than reread from
+// the session. Admission uses it to record the binding the job was SCHEDULED for:
+// if SetEffectiveMediaFileID moves the effective row between the caller's
+// binding read and this write, recording the session's current row would make the
+// stale mark look live and block the replacement that owns the row the session
+// now serves. Both writes are one step under the session lock. Caller holds m.mu.
+func setVirtualProbePendingForBindingLocked(s *Session, armed VirtualSourceBindingSnapshot) {
+	if s == nil {
+		return
+	}
+	s.VirtualProbeOutcome = VirtualProbeOutcomePending
+	s.virtualProbeArmedAt = time.Now()
+	s.virtualProbeArmedBinding = armed
 }
 
 // SetVirtualProbeOutcomeIfGeneration records a deferred probe's outcome on the
@@ -2018,6 +2033,39 @@ func (m *SessionManager) ArmVirtualProbePendingIfGeneration(sessionID string, ge
 		return false, nil
 	}
 	setVirtualProbeOutcomeLocked(s, VirtualProbeOutcomePending)
+	return true, nil
+}
+
+// ArmVirtualProbePendingIfBinding transitions a binding generation's probe
+// outcome from empty to pending, and only from empty, exactly like
+// ArmVirtualProbePendingIfGeneration — with one difference that closes a
+// row-only-move window. The armed-binding record is the caller's captured
+// snapshot rather than the session's binding at write time. SetEffectiveMediaFileID
+// moves a session's effective row without advancing the generation, so if it
+// lands between the caller's binding read and this write, recording the current
+// row would leave the pending mark looking LIVE for a binding no worker owns and
+// block the replacement that could recover it. Recording the scheduled binding
+// keeps the mark stale (or live) according to what the queued job will actually
+// fence on, so recovery can hand the moved row a fresh lifecycle. It returns
+// false for an unknown session, a moved generation, or an already set outcome
+// (armed, verified, failed), so the caller drops the duplicate job unchanged.
+func (m *SessionManager) ArmVirtualProbePendingIfBinding(sessionID string, expected VirtualSourceBindingSnapshot) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		return false, ErrSessionNotFound
+	}
+	if s.virtualSourceGeneration != expected.Generation {
+		return false, nil
+	}
+	if s.VirtualProbeOutcome != "" {
+		// The lifecycle is already armed or terminal for this binding: a
+		// duplicate admission owns nothing and must not restart it.
+		return false, nil
+	}
+	setVirtualProbePendingForBindingLocked(s, expected)
 	return true, nil
 }
 
