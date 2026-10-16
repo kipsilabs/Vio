@@ -24,7 +24,9 @@
       "last_scanned_at": "2026-01-02T03:04:05.678Z",
       "scan_warning_code": "empty_root",
       "scan_warning_message": "Root is empty",
-      "scan_warning_at": "2026-01-02T03:04:05.678Z"
+      "scan_warning_at": "2026-01-02T03:04:05.678Z",
+      "watched_threshold": null,
+      "min_resume_threshold": null
     },
     {
       "id": "2",
@@ -50,7 +52,9 @@
       "last_scanned_at": "2026-01-02T03:04:05.678Z",
       "scan_warning_code": "empty_root",
       "scan_warning_message": "Root is empty",
-      "scan_warning_at": "2026-01-02T03:04:05.678Z"
+      "scan_warning_at": "2026-01-02T03:04:05.678Z",
+      "watched_threshold": null,
+      "min_resume_threshold": null
     }
   ]
 }

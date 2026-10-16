@@ -220,6 +220,10 @@ type createLibraryRequest struct {
 	RealtimeMonitoring *bool `json:"-"`
 	// TrickplayEnabled is set only by the v2 createLibrary operation.
 	TrickplayEnabled bool `json:"-"`
+	// WatchedThreshold and MinResumeThreshold override the server progress
+	// thresholds for this library. Omitted means inherit the server setting.
+	WatchedThreshold   *int `json:"watched_threshold,omitempty"`
+	MinResumeThreshold *int `json:"min_resume_threshold,omitempty"`
 }
 
 // updateLibraryRequest represents the JSON body for PUT /libraries/{id}.
@@ -240,6 +244,13 @@ type updateLibraryRequest struct {
 	RealtimeMonitoring *bool `json:"-"`
 	// TrickplayEnabled is set only by the v2 updateLibrary operation.
 	TrickplayEnabled *bool `json:"-"`
+	// WatchedThreshold and MinResumeThreshold are nullable percent overrides:
+	// an absent member leaves the stored override unchanged, an explicit null
+	// clears it (inherit the server setting), and a number in range sets it.
+	// Both the frozen v1 JSON decode and the v2 operation preserve the three
+	// states.
+	WatchedThreshold   optionalNullableInt `json:"watched_threshold,omitempty"`
+	MinResumeThreshold optionalNullableInt `json:"min_resume_threshold,omitempty"`
 }
 
 // affectsTrickplay reports whether the update can change which of the
@@ -303,6 +314,11 @@ type libraryResponse struct {
 	// view only.
 	TrickplayEnabled   bool `json:"-"`
 	TrickplaySupported bool `json:"-"`
+	// WatchedThreshold and MinResumeThreshold are the library's percent
+	// overrides of the server progress thresholds; null inherits the server
+	// setting.
+	WatchedThreshold   *int `json:"watched_threshold"`
+	MinResumeThreshold *int `json:"min_resume_threshold"`
 }
 
 type libraryMountCheckRootResponse struct {
@@ -444,6 +460,8 @@ func toLibraryResponse(f *models.MediaFolder) libraryResponse {
 		ScanWarningAt:              f.ScanWarningAt,
 		RealtimeMonitoring:         f.RealtimeMonitoring,
 		TrickplayEnabled:           f.TrickplayEnabled,
+		WatchedThreshold:           f.WatchedThreshold,
+		MinResumeThreshold:         f.MinResumeThreshold,
 	}
 }
 

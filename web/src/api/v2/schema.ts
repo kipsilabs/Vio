@@ -23953,6 +23953,12 @@ export interface components {
        * @example en
        */
       metadata_language: string;
+      /**
+       * Format: int64
+       * @description Per-library percent floor below which progress is discarded; null inherits playback.min_resume_threshold (default 5)
+       * @example 10
+       */
+      min_resume_threshold: number | null;
       /** @example Movies */
       name: string;
       /**
@@ -24009,6 +24015,12 @@ export interface components {
        * @example movies
        */
       type: string;
+      /**
+       * Format: int64
+       * @description Per-library percent at which an item is marked watched; null inherits playback.watched_threshold (default 90)
+       * @example 80
+       */
+      watched_threshold: number | null;
     };
     LibraryCapabilities: {
       /** @description Whether the current principal may use the capability */
@@ -24117,6 +24129,12 @@ export interface components {
        * @example en
        */
       metadata_language?: string;
+      /**
+       * Format: int64
+       * @description Per-library percent floor below which progress is discarded; omitted or null inherits playback.min_resume_threshold (default 5)
+       * @example 10
+       */
+      min_resume_threshold?: number | null;
       /** @example Movies */
       name: string;
       /**
@@ -24148,6 +24166,12 @@ export interface components {
        * @example movies
        */
       type: string;
+      /**
+       * Format: int64
+       * @description Per-library percent at which an item is marked watched; omitted or null inherits playback.watched_threshold (default 90)
+       * @example 80
+       */
+      watched_threshold?: number | null;
     };
     LibraryDeletionJobResult: {
       /** Format: int64 */
@@ -24471,6 +24495,12 @@ export interface components {
        * @example en
        */
       metadata_language?: string;
+      /**
+       * Format: int64
+       * @description Per-library percent floor below which progress is discarded; null clears the override and inherits playback.min_resume_threshold (default 5)
+       * @example 10
+       */
+      min_resume_threshold?: number | null;
       /** @example Movies */
       name?: string;
       /**
@@ -24499,6 +24529,12 @@ export interface components {
       trickplay_enabled?: boolean;
       /** @example movies */
       type?: string;
+      /**
+       * Format: int64
+       * @description Per-library percent at which an item is marked watched; null clears the override and inherits playback.watched_threshold (default 90)
+       * @example 80
+       */
+      watched_threshold?: number | null;
     };
     LiteraryWork: {
       /** @description Empty, never null */

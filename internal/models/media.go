@@ -41,6 +41,12 @@ type MediaFolder struct {
 	ScanWarningAt         *time.Time
 	AllowEmptyCleanupOnce bool
 	SortOrder             int
+	// WatchedThreshold and MinResumeThreshold are per-library percent overrides
+	// of the server playback.watched_threshold and
+	// playback.min_resume_threshold settings. nil inherits the server setting;
+	// userstore.ResolveProgressThresholds keeps the resolved pair consistent.
+	WatchedThreshold   *int
+	MinResumeThreshold *int
 }
 
 // VirtualProvenance is the explicit origin discriminator for virtual media.

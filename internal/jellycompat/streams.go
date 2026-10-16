@@ -2705,7 +2705,13 @@ func (h *PlaybackHandler) handlePlaybackReport(w http.ResponseWriter, r *http.Re
 					break
 				}
 			}
-			completed, err := userstore.UpdateProgressReportingCompletion(r.Context(), store, session.ProfileID, playSession.ItemID, positionSeconds, duration, h.playbackThresholds(r.Context()))
+			// The report may omit MediaSourceId; fall back to the play's first
+			// source so the library's threshold overrides still apply.
+			source := findMediaSource(playSession, req.MediaSourceID)
+			if source == nil {
+				source = firstMediaSource(playSession)
+			}
+			completed, err := userstore.UpdateProgressReportingCompletion(r.Context(), store, session.ProfileID, playSession.ItemID, positionSeconds, duration, h.playbackThresholdsForSource(r.Context(), source))
 			if err == nil && completed {
 				refreshTasteProfile = true
 			}

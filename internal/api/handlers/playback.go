@@ -475,7 +475,11 @@ type PlaybackHandler struct {
 	virtualStickyPins  map[string]virtualStickyPin
 	ExtraLookup        PlaybackExtraLookup // optional; resolves extras files to their parent item
 	OriginalLangLookup PlaybackOriginalLanguageLookup
-	SettingsRepo       PlaybackSettingsReader     // optional; reads server settings (e.g., allow_4k_transcode)
+	SettingsRepo       PlaybackSettingsReader // optional; reads server settings (e.g., allow_4k_transcode)
+	// ThresholdLookup resolves per-library watched / min-resume progress
+	// threshold overrides. nil means every library inherits the server
+	// settings.
+	ThresholdLookup    userstore.LibraryProgressThresholdLookup
 	FileVersionFetcher PlaybackFileVersionFetcher // optional; queries sibling file versions for 4K guard
 	ProbeEnsurer       PlaybackProbeEnsurer       // optional; repairs missing probe metadata on demand
 	// probeRefreshed memoizes start-path probe refreshes by file id so a burst
@@ -988,24 +992,31 @@ func (h *PlaybackHandler) CleanupOrphanedTranscodes() (int, error) {
 	return h.tm.CleanupOrphanedTranscodes()
 }
 
-// playbackThresholds reads the playback.watched_threshold and
-// playback.min_resume_threshold settings. Zero values mean "use defaults".
-func (h *PlaybackHandler) playbackThresholds(ctx context.Context) userstore.ProgressThresholds {
-	if h.SettingsRepo == nil {
-		return userstore.ProgressThresholds{}
-	}
-	var t userstore.ProgressThresholds
-	if v, _ := h.SettingsRepo.Get(ctx, "playback.watched_threshold"); v != "" {
-		if pct, err := strconv.Atoi(v); err == nil && pct > 0 {
-			t.WatchedPct = pct
+// playbackThresholds resolves the effective watched / min-resume thresholds for
+// a media file's library: the library's stored override wins, a nil override
+// inherits the server settings, and defaults apply when nothing is set. A nil
+// file (or a nil/zero folder) resolves the server settings alone.
+func (h *PlaybackHandler) playbackThresholds(ctx context.Context, file *models.MediaFile) userstore.ProgressThresholds {
+	global := userstore.ProgressThresholds{}
+	if h.SettingsRepo != nil {
+		if v, _ := h.SettingsRepo.Get(ctx, "playback.watched_threshold"); v != "" {
+			if pct, err := strconv.Atoi(v); err == nil && pct > 0 {
+				global.WatchedPct = pct
+			}
+		}
+		if v, _ := h.SettingsRepo.Get(ctx, "playback.min_resume_threshold"); v != "" {
+			if pct, err := strconv.Atoi(v); err == nil && pct > 0 {
+				global.MinResumePct = pct
+			}
 		}
 	}
-	if v, _ := h.SettingsRepo.Get(ctx, "playback.min_resume_threshold"); v != "" {
-		if pct, err := strconv.Atoi(v); err == nil && pct > 0 {
-			t.MinResumePct = pct
+	var overrides userstore.LibraryProgressThresholdOverrides
+	if file != nil && file.MediaFolderID > 0 && h.ThresholdLookup != nil {
+		if o, err := h.ThresholdLookup.ProgressThresholdOverrides(ctx, file.MediaFolderID); err == nil {
+			overrides = o
 		}
 	}
-	return t
+	return userstore.ResolveProgressThresholds(global, overrides)
 }
 
 // --- Request/Response types ---
@@ -1858,7 +1869,7 @@ func (h *PlaybackHandler) persistProgress(ctx context.Context, session *playback
 	}
 
 	duration := float64(file.Duration)
-	completed, err := userstore.UpdateProgressReportingCompletion(ctx, store, session.ProfileID, targetID, session.Position, duration, h.playbackThresholds(ctx))
+	completed, err := userstore.UpdateProgressReportingCompletion(ctx, store, session.ProfileID, targetID, session.Position, duration, h.playbackThresholds(ctx, file))
 	if err != nil {
 		slog.ErrorContext(ctx, "failed to persist progress", "component", "api", "session", session.ID, "error", err)
 	} else if completed {
@@ -1911,7 +1922,7 @@ func (h *PlaybackHandler) persistStopAndHistory(ctx context.Context, session *pl
 	}
 
 	duration := float64(file.Duration)
-	thresholds := h.playbackThresholds(ctx)
+	thresholds := h.playbackThresholds(ctx, file)
 	watchSvc := watchstate.NewService(h.StoreProvider).
 		WithStableIdentityResolver(h.StableIdentityResolver).
 		WithCompletionObserver(h.CompletionObserver)
@@ -2025,7 +2036,7 @@ func (h *PlaybackHandler) buildAdminHistoryEntry(
 	if file != nil {
 		duration := float64(file.Duration)
 		durationPtr = &duration
-		if duration > 0 && session.Position/duration > userstore.WatchedFraction(h.playbackThresholds(ctx).WatchedPct) {
+		if duration > 0 && session.Position/duration > userstore.WatchedFraction(h.playbackThresholds(ctx, file).WatchedPct) {
 			completed = true
 		}
 	}

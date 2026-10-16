@@ -146,6 +146,9 @@ func NewRouter(deps Dependencies) chi.Router {
 		}
 	}
 	playbackHandler := NewPlaybackHandler(deps.Config, deps.ContentService, deps.IDCodec, deps.DeviceProfiles, deps.PlaybackStore, deps.SessionMgr, deps.FileResolver, deps.UserStoreProvider)
+	if deps.FolderRepo != nil {
+		playbackHandler.ThresholdLookup = deps.FolderRepo
+	}
 	// Persist the capability profile Jellyfin clients report so native
 	// candidate ranking can be device-aware. The persister resolves the
 	// session's native user through the shared store provider; without a

@@ -87,7 +87,7 @@ func (h *PlaybackHandler) compatScrobbleEvent(
 	}
 	completed := false
 	if action == compatScrobbleStop && duration > 0 {
-		_, completed, _ = userstore.ResolveProgressState(position, duration, h.playbackThresholds(scrobbleCtx))
+		_, completed, _ = userstore.ResolveProgressState(position, duration, h.playbackThresholdsForSource(scrobbleCtx, source))
 	}
 	event := watchsync.ResolveScrobbleIdentity(scrobbleCtx, h.StableIdentityResolver, watchsync.ScrobbleEvent{
 		PlaybackSessionID: upstreamSession.ID,

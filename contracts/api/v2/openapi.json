@@ -31451,6 +31451,17 @@
             ],
             "type": "string"
           },
+          "min_resume_threshold": {
+            "description": "Per-library percent floor below which progress is discarded; null inherits playback.min_resume_threshold (default 5)",
+            "examples": [
+              10
+            ],
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "name": {
             "examples": [
               "Movies"
@@ -31538,6 +31549,17 @@
               "movies"
             ],
             "type": "string"
+          },
+          "watched_threshold": {
+            "description": "Per-library percent at which an item is marked watched; null inherits playback.watched_threshold (default 90)",
+            "examples": [
+              80
+            ],
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
         "required": [
@@ -31555,7 +31577,9 @@
           "trickplay_supported",
           "trailer_kinds",
           "realtime_monitoring",
-          "sort_order"
+          "sort_order",
+          "watched_threshold",
+          "min_resume_threshold"
         ],
         "type": "object"
       },
@@ -31820,6 +31844,17 @@
             ],
             "type": "string"
           },
+          "min_resume_threshold": {
+            "description": "Per-library percent floor below which progress is discarded; omitted or null inherits playback.min_resume_threshold (default 5)",
+            "examples": [
+              10
+            ],
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "name": {
             "examples": [
               "Movies"
@@ -31873,6 +31908,17 @@
             ],
             "minLength": 1,
             "type": "string"
+          },
+          "watched_threshold": {
+            "description": "Per-library percent at which an item is marked watched; omitted or null inherits playback.watched_threshold (default 90)",
+            "examples": [
+              80
+            ],
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
         "required": [
@@ -32613,6 +32659,17 @@
             ],
             "type": "string"
           },
+          "min_resume_threshold": {
+            "description": "Per-library percent floor below which progress is discarded; null clears the override and inherits playback.min_resume_threshold (default 5)",
+            "examples": [
+              10
+            ],
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "name": {
             "examples": [
               "Movies"
@@ -32665,6 +32722,17 @@
             ],
             "minLength": 1,
             "type": "string"
+          },
+          "watched_threshold": {
+            "description": "Per-library percent at which an item is marked watched; null clears the override and inherits playback.watched_threshold (default 90)",
+            "examples": [
+              80
+            ],
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
         "type": "object"

@@ -1183,6 +1183,10 @@ func newChiRouter(deps Dependencies) chi.Router {
 		}
 		if deps.DB != nil {
 			progressHandler.LibraryLookup = catalog.NewLibraryItemRepository(deps.DB)
+			progressHandler.FolderLookup = &handlers.PoolFolderLookup{Pool: deps.DB}
+		}
+		if deps.FolderRepo != nil {
+			progressHandler.ThresholdLookup = deps.FolderRepo
 		}
 		collectionHandler = handlers.NewCollectionHandler(deps.UserStoreProvider)
 		if deps.DB != nil {
@@ -2066,6 +2070,9 @@ func newChiRouter(deps Dependencies) chi.Router {
 		playbackHandler.ChapterThumbnailQueuer = deps.ChapterThumbnailQueuer
 		if settingsRepo != nil {
 			playbackHandler.SettingsRepo = settingsRepo
+		}
+		if deps.FolderRepo != nil {
+			playbackHandler.ThresholdLookup = deps.FolderRepo
 		}
 		if deps.FileRepo != nil {
 			playbackHandler.FileVersionFetcher = deps.FileRepo

@@ -68,6 +68,30 @@ type StaleMediaIDView = staleMediaIDResponse
 // UnmatchedItemView is one catalog item awaiting a metadata match.
 type UnmatchedItemView = unmatchedItemResponse
 
+// validateLibraryThresholds enforces the server-setting percent ranges on a
+// library's progress-threshold overrides: watched 1-100, min-resume 1-99. A nil
+// override means "inherit" and is always valid; whether the pair is internally
+// consistent is the resolver's job, not a request error.
+func validateLibraryThresholds(watched, minResume *int) error {
+	if watched != nil && (*watched < 1 || *watched > 100) {
+		return fieldError("watched_threshold", "watched_threshold must be between 1 and 100")
+	}
+	if minResume != nil && (*minResume < 1 || *minResume > 99) {
+		return fieldError("min_resume_threshold", "min_resume_threshold must be between 1 and 99")
+	}
+	return nil
+}
+
+// optionalIntField carries the tri-state of a nullable admin percent override
+// into the repository input: unset stays unset, set-with-nil clears, and
+// set-with-a-value stores an override.
+func optionalIntField(f optionalNullableInt) models.Optional[int] {
+	if !f.Set() {
+		return models.Optional[int]{}
+	}
+	return models.Optional[int]{Set: true, Value: f.Value()}
+}
+
 // ListLibraries answers every library with its presigned poster URL.
 func (h *LibraryHandler) ListLibraries(ctx context.Context) ([]LibraryView, error) {
 	folders, err := h.folderRepo.List(ctx)
@@ -102,6 +126,9 @@ func (h *LibraryHandler) CreateLibrary(ctx context.Context, req LibraryCreateReq
 	if req.TrickplayEnabled && h.ArtworkStore == nil {
 		return LibraryView{}, fieldError("trickplay_enabled", "Seek previews require configured artwork storage")
 	}
+	if err := validateLibraryThresholds(req.WatchedThreshold, req.MinResumeThreshold); err != nil {
+		return LibraryView{}, err
+	}
 
 	folder, err := h.folderRepo.Create(ctx, catalog.CreateFolderInput{
 		Paths:                    req.Paths,
@@ -113,6 +140,8 @@ func (h *LibraryHandler) CreateLibrary(ctx context.Context, req LibraryCreateReq
 		TrailerKinds:             req.TrailerKinds,
 		RealtimeMonitoring:       req.RealtimeMonitoring,
 		TrickplayEnabled:         req.TrickplayEnabled,
+		WatchedThreshold:         req.WatchedThreshold,
+		MinResumeThreshold:       req.MinResumeThreshold,
 	})
 	if err != nil {
 		if errors.Is(err, catalog.ErrDuplicatePath) {
@@ -189,6 +218,9 @@ func (h *LibraryHandler) UpdateLibrary(ctx context.Context, id, userID int, req 
 	if req.TrickplayEnabled != nil && *req.TrickplayEnabled && h.ArtworkStore == nil {
 		return LibraryView{}, fieldError("trickplay_enabled", "Seek previews require configured artwork storage")
 	}
+	if err := validateLibraryThresholds(req.WatchedThreshold.Value(), req.MinResumeThreshold.Value()); err != nil {
+		return LibraryView{}, err
+	}
 
 	// Fetch the folder before updating so we can detect path changes.
 	oldFolder, err := h.folderRepo.GetByID(ctx, id)
@@ -212,6 +244,8 @@ func (h *LibraryHandler) UpdateLibrary(ctx context.Context, id, userID int, req 
 		TrailerKinds:             req.TrailerKinds,
 		RealtimeMonitoring:       req.RealtimeMonitoring,
 		TrickplayEnabled:         req.TrickplayEnabled,
+		WatchedThreshold:         optionalIntField(req.WatchedThreshold),
+		MinResumeThreshold:       optionalIntField(req.MinResumeThreshold),
 	})
 	if err != nil {
 		if errors.Is(err, catalog.ErrFolderNotFound) {

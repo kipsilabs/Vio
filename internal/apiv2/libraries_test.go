@@ -488,6 +488,75 @@ func TestLibraryRealtimeMonitoring(t *testing.T) {
 	}
 }
 
+func TestLibraryProgressThresholds(t *testing.T) {
+	deps, fake := libraryDeps(t)
+	h := newTestHandler(t, deps)
+
+	// Create carries explicit overrides to the seam.
+	rec := do(t, h, http.MethodPost, "/api/v2/libraries", `{"paths":["/media/x"],"type":"movies","name":"X","watched_threshold":80,"min_resume_threshold":10}`, bearer(adminToken))
+	if rec.Code != 201 {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+	if fake.lastCreate.WatchedThreshold == nil || *fake.lastCreate.WatchedThreshold != 80 {
+		t.Fatalf("watched_threshold = %v, want 80", fake.lastCreate.WatchedThreshold)
+	}
+	if fake.lastCreate.MinResumeThreshold == nil || *fake.lastCreate.MinResumeThreshold != 10 {
+		t.Fatalf("min_resume_threshold = %v, want 10", fake.lastCreate.MinResumeThreshold)
+	}
+	// The nullable response members are present even when null.
+	var body map[string]json.RawMessage
+	decodeJSON(t, rec.Body, &body)
+	if string(body["watched_threshold"]) != "null" || string(body["min_resume_threshold"]) != "null" {
+		t.Fatalf("created thresholds = %s/%s, want null", body["watched_threshold"], body["min_resume_threshold"])
+	}
+
+	// Omitted on create reaches the seam as nil (inherit).
+	if rec := do(t, h, http.MethodPost, "/api/v2/libraries", `{"paths":["/media/y"],"type":"movies","name":"Y"}`, bearer(adminToken)); rec.Code != 201 {
+		t.Fatal(rec.Body.String())
+	}
+	if fake.lastCreate.WatchedThreshold != nil || fake.lastCreate.MinResumeThreshold != nil {
+		t.Fatalf("omitted create thresholds = %v/%v, want nil", fake.lastCreate.WatchedThreshold, fake.lastCreate.MinResumeThreshold)
+	}
+
+	// PATCH with numbers sets both overrides.
+	rec = do(t, h, http.MethodPatch, "/api/v2/libraries/1", `{"watched_threshold":75,"min_resume_threshold":15}`, bearer(adminToken))
+	if rec.Code != 200 {
+		t.Fatal(rec.Body.String())
+	}
+	if !fake.lastUpdate.WatchedThreshold.Set() || fake.lastUpdate.WatchedThreshold.Value() == nil || *fake.lastUpdate.WatchedThreshold.Value() != 75 {
+		t.Fatalf("update watched_threshold = %+v, want set 75", fake.lastUpdate.WatchedThreshold)
+	}
+	if !fake.lastUpdate.MinResumeThreshold.Set() || fake.lastUpdate.MinResumeThreshold.Value() == nil || *fake.lastUpdate.MinResumeThreshold.Value() != 15 {
+		t.Fatalf("update min_resume_threshold = %+v, want set 15", fake.lastUpdate.MinResumeThreshold)
+	}
+
+	// PATCH with explicit null clears: the seam sees set with a nil value.
+	rec = do(t, h, http.MethodPatch, "/api/v2/libraries/1", `{"watched_threshold":null,"min_resume_threshold":null}`, bearer(adminToken))
+	if rec.Code != 200 {
+		t.Fatal(rec.Body.String())
+	}
+	if !fake.lastUpdate.WatchedThreshold.Set() || fake.lastUpdate.WatchedThreshold.Value() != nil {
+		t.Fatalf("cleared watched_threshold = %+v, want set with nil", fake.lastUpdate.WatchedThreshold)
+	}
+	if !fake.lastUpdate.MinResumeThreshold.Set() || fake.lastUpdate.MinResumeThreshold.Value() != nil {
+		t.Fatalf("cleared min_resume_threshold = %+v, want set with nil", fake.lastUpdate.MinResumeThreshold)
+	}
+
+	// PATCH omitting them leaves the overrides unchanged at the seam.
+	if rec := do(t, h, http.MethodPatch, "/api/v2/libraries/1", `{"name":"Films"}`, bearer(adminToken)); rec.Code != 200 {
+		t.Fatal(rec.Body.String())
+	}
+	if fake.lastUpdate.WatchedThreshold.Set() || fake.lastUpdate.MinResumeThreshold.Set() {
+		t.Fatalf("omitted update thresholds = %+v/%+v, want unset", fake.lastUpdate.WatchedThreshold, fake.lastUpdate.MinResumeThreshold)
+	}
+
+	// Every other member still refuses null.
+	p := requireProblem(t, do(t, h, http.MethodPatch, "/api/v2/libraries/1", `{"name":null}`, bearer(adminToken)), TypeValidationFailed)
+	if len(p.Errors) != 1 || p.Errors[0].Location != "body.name" {
+		t.Fatalf("errors = %+v", p.Errors)
+	}
+}
+
 func TestDeleteLibrary(t *testing.T) {
 	deps, fake := libraryDeps(t)
 	h := newTestHandler(t, deps)

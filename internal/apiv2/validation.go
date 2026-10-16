@@ -27,3 +27,16 @@ func rejectNonNullableNulls(raw []byte, nullable map[string]bool) *Problem {
 	slices.SortFunc(errs, func(a, b ProblemError) int { return cmp.Compare(a.Location, b.Location) })
 	return NewProblem(TypeValidationFailed, "The request did not pass validation; see errors.").WithErrors(errs...)
 }
+
+// rawBodyHasMember reports whether a request document carries the named member
+// at all. The decoder turns an explicit null and an omitted pointer member into
+// the same nil value, so this distinguishes "clear it" from "leave it alone"
+// for the members that admit null.
+func rawBodyHasMember(raw []byte, name string) bool {
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &members); err != nil {
+		return false
+	}
+	_, ok := members[name]
+	return ok
+}

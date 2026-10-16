@@ -13,6 +13,7 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/artworkkey"
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/userstore"
 )
 
 // Retry parameters for transient serialization/deadlock failures. They are
@@ -105,6 +106,10 @@ type CreateFolderInput struct {
 	// RealtimeMonitoring is the library's real-time monitoring switch; nil
 	// means on.
 	RealtimeMonitoring *bool
+	// WatchedThreshold and MinResumeThreshold are optional percent overrides
+	// of the server progress thresholds. nil inherits the server setting.
+	WatchedThreshold   *int
+	MinResumeThreshold *int
 }
 
 // FolderReorderEntry carries a folder ID and its new sort position.
@@ -129,6 +134,11 @@ type UpdateFolderInput struct {
 	// RealtimeMonitoring is nil on the frozen /api/v1 update path, which
 	// never sets it, so the column stays unchanged there.
 	RealtimeMonitoring *bool
+	// WatchedThreshold and MinResumeThreshold are tri-state percent overrides:
+	// unset leaves the column alone, set with a nil value clears it to NULL
+	// (inherit the server setting), set with a value stores an override.
+	WatchedThreshold   models.Optional[int]
+	MinResumeThreshold models.Optional[int]
 }
 
 // FolderRepository provides CRUD operations for the media_folders table.
@@ -194,7 +204,7 @@ func normalizeTrailerKindsInput(kinds []string) []string {
 // folderColumns is the list of columns returned by all SELECT queries.
 // Kept in one place so scanFolder stays in sync.
 const folderColumns = `id, type, name, enabled, metadata_language, auto_translate_metadata, chapter_thumbnails_enabled, intro_detection_enabled, trickplay_enabled, realtime_monitoring, trailer_kinds, poster_path, last_scanned_at,
-	scan_warning_code, scan_warning_message, scan_warning_at, allow_empty_cleanup_once, sort_order`
+	scan_warning_code, scan_warning_message, scan_warning_at, allow_empty_cleanup_once, sort_order, watched_threshold, min_resume_threshold`
 
 // scanFolder scans a single row into a *models.MediaFolder.
 func scanFolder(row pgx.Row) (*models.MediaFolder, error) {
@@ -219,6 +229,8 @@ func scanFolder(row pgx.Row) (*models.MediaFolder, error) {
 		&f.ScanWarningAt,
 		&f.AllowEmptyCleanupOnce,
 		&f.SortOrder,
+		&f.WatchedThreshold,
+		&f.MinResumeThreshold,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -255,6 +267,8 @@ func scanFolders(rows pgx.Rows) ([]*models.MediaFolder, error) {
 			&f.ScanWarningAt,
 			&f.AllowEmptyCleanupOnce,
 			&f.SortOrder,
+			&f.WatchedThreshold,
+			&f.MinResumeThreshold,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scanning folder row: %w", err)
@@ -328,8 +342,8 @@ func (r *FolderRepository) Create(ctx context.Context, input CreateFolderInput) 
 		realtimeMonitoring = *input.RealtimeMonitoring
 	}
 
-	query := `INSERT INTO media_folders (type, name, metadata_language, chapter_thumbnails_enabled, intro_detection_enabled, realtime_monitoring, trailer_kinds, trickplay_enabled, sort_order)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, (SELECT COALESCE(MAX(sort_order), 0) + 1 FROM media_folders))
+	query := `INSERT INTO media_folders (type, name, metadata_language, chapter_thumbnails_enabled, intro_detection_enabled, realtime_monitoring, trailer_kinds, trickplay_enabled, sort_order, watched_threshold, min_resume_threshold)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, (SELECT COALESCE(MAX(sort_order), 0) + 1 FROM media_folders), $9, $10)
 		RETURNING ` + folderColumns
 
 	row := tx.QueryRow(ctx, query,
@@ -341,6 +355,8 @@ func (r *FolderRepository) Create(ctx context.Context, input CreateFolderInput) 
 		realtimeMonitoring,
 		trailerKinds,
 		input.TrickplayEnabled,
+		input.WatchedThreshold,
+		input.MinResumeThreshold,
 	)
 
 	folder, err := scanFolder(row)
@@ -385,6 +401,25 @@ func (r *FolderRepository) GetByID(ctx context.Context, id int) (*models.MediaFo
 		return nil, fmt.Errorf("loading paths for folder %d: %w", id, err)
 	}
 	return folder, nil
+}
+
+// ProgressThresholdOverrides returns one library's stored watched / min-resume
+// threshold overrides, the input to userstore.ResolveProgressThresholds. A
+// missing folder row yields zero overrides (inherit the server settings) rather
+// than an error, so a deleted library cannot fail a progress write.
+func (r *FolderRepository) ProgressThresholdOverrides(ctx context.Context, folderID int) (userstore.LibraryProgressThresholdOverrides, error) {
+	var overrides userstore.LibraryProgressThresholdOverrides
+	err := r.pool.QueryRow(ctx,
+		`SELECT watched_threshold, min_resume_threshold FROM media_folders WHERE id = $1`,
+		folderID,
+	).Scan(&overrides.WatchedPct, &overrides.MinResumePct)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return userstore.LibraryProgressThresholdOverrides{}, nil
+	}
+	if err != nil {
+		return userstore.LibraryProgressThresholdOverrides{}, fmt.Errorf("loading progress threshold overrides for folder %d: %w", folderID, err)
+	}
+	return overrides, nil
 }
 
 // List returns all media folders ordered by ID ascending.
@@ -530,6 +565,16 @@ func (r *FolderRepository) Update(ctx context.Context, id int, input UpdateFolde
 	if input.RealtimeMonitoring != nil {
 		setClauses = append(setClauses, fmt.Sprintf("realtime_monitoring = $%d", argIndex))
 		args = append(args, *input.RealtimeMonitoring)
+		argIndex++
+	}
+	if input.WatchedThreshold.Set {
+		setClauses = append(setClauses, fmt.Sprintf("watched_threshold = $%d", argIndex))
+		args = append(args, input.WatchedThreshold.Value)
+		argIndex++
+	}
+	if input.MinResumeThreshold.Set {
+		setClauses = append(setClauses, fmt.Sprintf("min_resume_threshold = $%d", argIndex))
+		args = append(args, input.MinResumeThreshold.Value)
 		argIndex++
 	}
 	if len(setClauses) > 0 {

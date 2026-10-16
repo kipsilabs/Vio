@@ -60,6 +60,13 @@ type ProgressHandler struct {
 	EventsHub               *evt.Hub
 	profileStaler           ProfileStaler
 	profileRefreshRequester ProfileRefreshRequester
+	// FolderLookup maps a content item to its library folder so a sync batch
+	// can apply per-library threshold overrides. nil means every item inherits
+	// the server settings.
+	FolderLookup MatchFolderLookup
+	// ThresholdLookup resolves a library folder's threshold overrides. nil
+	// means every item inherits the server settings.
+	ThresholdLookup userstore.LibraryProgressThresholdLookup
 }
 
 // NewProgressHandler creates a new ProgressHandler.
@@ -446,18 +453,37 @@ func (h *ProgressHandler) SyncProgress(ctx context.Context, userID int, profileI
 			return nil, apiError(http.StatusServiceUnavailable, "unavailable", "Catalog access is unavailable")
 		}
 	}
-	var thresholds userstore.ProgressThresholds
+	var global userstore.ProgressThresholds
 	if h.SettingsRepo != nil {
 		if v, _ := h.SettingsRepo.Get(ctx, "playback.watched_threshold"); v != "" {
 			if pct, err := strconv.Atoi(v); err == nil && pct > 0 {
-				thresholds.WatchedPct = pct
+				global.WatchedPct = pct
 			}
 		}
 		if v, _ := h.SettingsRepo.Get(ctx, "playback.min_resume_threshold"); v != "" {
 			if pct, err := strconv.Atoi(v); err == nil && pct > 0 {
-				thresholds.MinResumePct = pct
+				global.MinResumePct = pct
 			}
 		}
+	}
+	// Resolve the library threshold overrides once per folder per batch: a large
+	// offline sync touches many items but usually few libraries.
+	overridesByFolder := map[int]userstore.LibraryProgressThresholdOverrides{}
+	thresholdsFor := func(contentID string) userstore.ProgressThresholds {
+		var overrides userstore.LibraryProgressThresholdOverrides
+		if h.FolderLookup != nil && h.ThresholdLookup != nil && contentID != "" {
+			if folderID, err := h.FolderLookup.GetFolderIDForItem(ctx, contentID); err == nil && folderID > 0 {
+				o, ok := overridesByFolder[folderID]
+				if !ok {
+					if fetched, fetchErr := h.ThresholdLookup.ProgressThresholdOverrides(ctx, folderID); fetchErr == nil {
+						o = fetched
+					}
+					overridesByFolder[folderID] = o
+				}
+				overrides = o
+			}
+		}
+		return userstore.ResolveProgressThresholds(global, overrides)
 	}
 
 	results := make([]syncProgressResultItem, 0, len(updates))
@@ -488,6 +514,7 @@ func (h *ProgressHandler) SyncProgress(ctx context.Context, userID int, profileI
 			continue
 		}
 
+		thresholds := thresholdsFor(item.MediaItemID)
 		var updateErr error
 		switch {
 		case item.UpdatedAt != nil:

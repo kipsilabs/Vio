@@ -310,14 +310,18 @@ type virtualSourceSetter interface {
 }
 
 type PlaybackHandler struct {
-	cfg                     *config.Config
-	content                 ContentService
-	codec                   *ResourceIDCodec
-	deviceProfiles          *DeviceProfileStore
-	playbackStore           CompatPlaybackStore
-	sessionMgr              SessionManagerInterface
-	fileResolver            FilePathResolver
-	storeProvider           userstore.UserStoreProvider
+	cfg            *config.Config
+	content        ContentService
+	codec          *ResourceIDCodec
+	deviceProfiles *DeviceProfileStore
+	playbackStore  CompatPlaybackStore
+	sessionMgr     SessionManagerInterface
+	fileResolver   FilePathResolver
+	storeProvider  userstore.UserStoreProvider
+	// ThresholdLookup resolves per-library watched / min-resume progress
+	// threshold overrides. nil means every library inherits the server
+	// settings.
+	ThresholdLookup         userstore.LibraryProgressThresholdLookup
 	ScopeResolver           ScopeResolver
 	NodePlanner             nodepool.SessionPlanner
 	JWTSecret               string
@@ -434,24 +438,44 @@ type recipeNodePutter interface {
 	Delete(ctx context.Context, sessionID string) error
 }
 
-// playbackThresholds reads the playback.watched_threshold and
-// playback.min_resume_threshold settings. Zero values mean "use defaults".
-func (h *PlaybackHandler) playbackThresholds(ctx context.Context) userstore.ProgressThresholds {
-	if h.SettingsRepo == nil {
-		return userstore.ProgressThresholds{}
-	}
-	var t userstore.ProgressThresholds
-	if v, _ := h.SettingsRepo.Get(ctx, "playback.watched_threshold"); v != "" {
-		if pct, err := strconv.Atoi(v); err == nil && pct > 0 {
-			t.WatchedPct = pct
+// playbackThresholds resolves the effective watched / min-resume thresholds for
+// a media file's library: the library's stored override wins, a nil override
+// inherits the server settings, and defaults apply when nothing is set. A nil
+// file resolves the server settings alone.
+func (h *PlaybackHandler) playbackThresholds(ctx context.Context, file *models.MediaFile) userstore.ProgressThresholds {
+	global := userstore.ProgressThresholds{}
+	if h.SettingsRepo != nil {
+		if v, _ := h.SettingsRepo.Get(ctx, "playback.watched_threshold"); v != "" {
+			if pct, err := strconv.Atoi(v); err == nil && pct > 0 {
+				global.WatchedPct = pct
+			}
+		}
+		if v, _ := h.SettingsRepo.Get(ctx, "playback.min_resume_threshold"); v != "" {
+			if pct, err := strconv.Atoi(v); err == nil && pct > 0 {
+				global.MinResumePct = pct
+			}
 		}
 	}
-	if v, _ := h.SettingsRepo.Get(ctx, "playback.min_resume_threshold"); v != "" {
-		if pct, err := strconv.Atoi(v); err == nil && pct > 0 {
-			t.MinResumePct = pct
+	var overrides userstore.LibraryProgressThresholdOverrides
+	if file != nil && file.MediaFolderID > 0 && h.ThresholdLookup != nil {
+		if o, err := h.ThresholdLookup.ProgressThresholdOverrides(ctx, file.MediaFolderID); err == nil {
+			overrides = o
 		}
 	}
-	return t
+	return userstore.ResolveProgressThresholds(global, overrides)
+}
+
+// playbackThresholdsForSource resolves the effective thresholds for the library
+// that owns a compat media source's file. A source whose file cannot be
+// resolved (or that carries no file id) falls back to the server settings.
+func (h *PlaybackHandler) playbackThresholdsForSource(ctx context.Context, source *PlaybackMediaSource) userstore.ProgressThresholds {
+	var file *models.MediaFile
+	if source != nil && source.FileID > 0 && h.fileResolver != nil {
+		if resolved, err := h.fileResolver.GetByID(ctx, source.FileID); err == nil {
+			file = resolved
+		}
+	}
+	return h.playbackThresholds(ctx, file)
 }
 
 var errTranscode4KDisallowed = errors.New("4k video transcode disallowed by server settings")
