@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -219,12 +220,30 @@ func TestComposeCollectionCollageMissingLocalArtworkFails(t *testing.T) {
 	}
 }
 
-// recordingArtworkRepair records the keys a collage build queues for repair.
-type recordingArtworkRepair struct{ keys []string }
+// recordingArtworkRepair records the keys a collage build queues for repair,
+// and how many times it was asked at all, so a negative gate can tell "never
+// called" apart from "called with nothing".
+type recordingArtworkRepair struct {
+	calls int
+	keys  []string
+}
 
 func (r *recordingArtworkRepair) EnqueueArtworkRepair(_ context.Context, keys []string, _ int) (int, error) {
+	r.calls++
 	r.keys = append(r.keys, keys...)
 	return len(keys), nil
+}
+
+// failingArtworkStore is an in-memory store whose Get always fails with a
+// non-ErrNotFound error, modeling a storage outage. Every other method is the
+// in-memory fake's.
+type failingArtworkStore struct {
+	*blobstoretest.Memory
+	err error
+}
+
+func (s *failingArtworkStore) Get(context.Context, string) (io.ReadCloser, blobstore.ObjectInfo, error) {
+	return nil, blobstore.ObjectInfo{}, s.err
 }
 
 // A local source that names a missing revisioned object is queued for
@@ -254,6 +273,70 @@ func TestComposeCollectionCollageMissingLocalArtworkQueuesRepair(t *testing.T) {
 	}
 	if want := "collection-images/missing/poster/original.cccc.jpg"; len(repair.keys) != 1 || repair.keys[0] != want {
 		t.Fatalf("queued repair keys = %v, want [%s]", repair.keys, want)
+	}
+	if repair.calls != 1 {
+		t.Fatalf("EnqueueArtworkRepair calls = %d, want 1", repair.calls)
+	}
+}
+
+// A local source whose key carries no content revision -- a legacy fixed key --
+// is never queued for repair: the repair path regenerates revisioned objects,
+// so an unrevisioned miss has nothing to enqueue.
+func TestComposeCollectionCollageMissingUnrevisionedSourceSkipsRepair(t *testing.T) {
+	ctx := t.Context()
+	signer := artworkurl.NewSigner("collage-local-artwork-test-secret", time.Hour)
+	repair := &recordingArtworkRepair{}
+
+	src := "movies/missing/poster.jpg"
+	key := "collection-images/missing/poster/original.jpg"
+	gen := collectionCollageComposer{
+		prefix: adminCollectionImagePrefix,
+		store:  blobstoretest.New(),
+		posters: localArtworkPosters{
+			signer: signer,
+			keys:   map[string]string{src: key},
+		},
+		signer:     signer,
+		repair:     repair,
+		httpClient: newCollectionImageClient(),
+	}
+
+	if _, _, err := gen.ComposeCollectionCollage(ctx, "c1", "0123456789abcdef", []string{src}); !errors.Is(err, blobstore.ErrNotFound) {
+		t.Fatalf("compose with a missing unrevisioned source = %v, want ErrNotFound", err)
+	}
+	if repair.calls != 0 {
+		t.Fatalf("EnqueueArtworkRepair calls = %d, want none for an unrevisioned miss", repair.calls)
+	}
+}
+
+// A storage failure that is not a missing object is a fault, not a lost
+// revision: queueing a repair would hide the outage behind regeneration, so the
+// build fails without enqueueing.
+func TestComposeCollectionCollageStorageErrorSkipsRepair(t *testing.T) {
+	ctx := t.Context()
+	signer := artworkurl.NewSigner("collage-local-artwork-test-secret", time.Hour)
+	repair := &recordingArtworkRepair{}
+	storageErr := errors.New("artwork storage unavailable")
+
+	src := "movies/missing/poster.jpg"
+	key := collageSourceKey("cccc", "missing")
+	gen := collectionCollageComposer{
+		prefix: adminCollectionImagePrefix,
+		store:  &failingArtworkStore{Memory: blobstoretest.New(), err: storageErr},
+		posters: localArtworkPosters{
+			signer: signer,
+			keys:   map[string]string{src: key},
+		},
+		signer:     signer,
+		repair:     repair,
+		httpClient: newCollectionImageClient(),
+	}
+
+	if _, _, err := gen.ComposeCollectionCollage(ctx, "c1", "0123456789abcdef", []string{src}); !errors.Is(err, storageErr) {
+		t.Fatalf("compose with a storage failure = %v, want %v", err, storageErr)
+	}
+	if repair.calls != 0 {
+		t.Fatalf("EnqueueArtworkRepair calls = %d, want none for a storage failure", repair.calls)
 	}
 }
 
