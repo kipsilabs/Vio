@@ -70,30 +70,27 @@ describe("ActionBar", () => {
     "virtual://series/tt123/1/2",
     "virtual://series/tvdb/393159/3/1",
     "virtual://series/tmdb/202555/1/2?profile=1080p",
-  ])(
-    "discovers %s before Play and refreshes the version queries",
-    async (filePath) => {
-      discoveryMocks.capability.mockResolvedValue({ discover_before_playback: true });
-      let finish!: () => void;
-      discoveryMocks.discover.mockImplementation(
-        () =>
-          new Promise<void>((resolve) => {
-            finish = resolve;
-          }),
-      );
-      const invalidate = vi.spyOn(QueryClient.prototype, "invalidateQueries");
-      const version = { ...selectedVersion, file_path: filePath };
-      renderActionBar({ contentId: "media-1", versions: [version], selectedVersion: version });
-      expect(await screen.findByText("Finding versions")).toBeInTheDocument();
-      expect(screen.getByRole("button", { name: "Play" })).toBeEnabled();
-      expect(discoveryMocks.discover).toHaveBeenCalledWith("media-1", expect.any(AbortSignal));
-      expect(startPlayback).not.toHaveBeenCalled();
-      await act(async () => finish());
-      await waitFor(() => expect(invalidate).toHaveBeenCalledTimes(2));
-      expect(screen.queryByText("Finding versions")).not.toBeInTheDocument();
-      invalidate.mockRestore();
-    },
-  );
+  ])("discovers %s before Play and refreshes the version queries", async (filePath) => {
+    discoveryMocks.capability.mockResolvedValue({ discover_before_playback: true });
+    let finish!: () => void;
+    discoveryMocks.discover.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const invalidate = vi.spyOn(QueryClient.prototype, "invalidateQueries");
+    const version = { ...selectedVersion, file_path: filePath };
+    renderActionBar({ contentId: "media-1", versions: [version], selectedVersion: version });
+    expect(await screen.findByText("Finding versions")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Play" })).toBeEnabled();
+    expect(discoveryMocks.discover).toHaveBeenCalledWith("media-1", expect.any(AbortSignal));
+    expect(startPlayback).not.toHaveBeenCalled();
+    await act(async () => finish());
+    await waitFor(() => expect(invalidate).toHaveBeenCalledTimes(2));
+    expect(screen.queryByText("Finding versions")).not.toBeInTheDocument();
+    invalidate.mockRestore();
+  });
 
   it("keeps playback-time discovery when the option is off", async () => {
     discoveryMocks.capability.mockResolvedValue({ discover_before_playback: false });

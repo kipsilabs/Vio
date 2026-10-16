@@ -637,6 +637,7 @@ PUT /api/v2/markers/files/{file_id}	non-media
 DELETE /api/v2/markers/files/{file_id}/{segment}	non-media
 GET /api/v2/markers/items/{item_id}	non-media
 PUT /api/v2/markers/items/{item_id}	non-media
+POST /api/v2/media/{media_id}/virtual-candidates:discover	non-media
 POST /api/v2/media/{media_id}/virtual-candidates:refresh	non-media
 POST /api/v2/media/{media_id}/virtual-candidates:refresh/cancel	non-media
 POST /api/v2/media/{media_id}/virtual-releases/{release_id}:request	non-media
@@ -1912,6 +1913,7 @@ PUT /api/v2/markers/files/{file_id}	non-media
 DELETE /api/v2/markers/files/{file_id}/{segment}	non-media
 GET /api/v2/markers/items/{item_id}	non-media
 PUT /api/v2/markers/items/{item_id}	non-media
+POST /api/v2/media/{media_id}/virtual-candidates:discover	non-media
 POST /api/v2/media/{media_id}/virtual-candidates:refresh	non-media
 POST /api/v2/media/{media_id}/virtual-candidates:refresh/cancel	non-media
 POST /api/v2/media/{media_id}/virtual-releases/{release_id}:request	non-media
