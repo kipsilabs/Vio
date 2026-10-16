@@ -182,7 +182,7 @@ func TestFarSeekSignedGenerationRecoversWithinBudget(t *testing.T) {
 	// 2. Reload the manifest immediately; it must answer without waiting for the
 	// detached restart, then advertise the replacement generation. One reload is
 	// one recovery, well inside the two-consecutive-recovery budget.
-	replacementToken := ""
+	var replacementToken string
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		manifestRec := httptest.NewRecorder()
