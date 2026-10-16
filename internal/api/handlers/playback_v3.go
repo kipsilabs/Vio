@@ -8575,30 +8575,38 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			// source_unavailable through the existing rotation semantics
 			// instead of the replan planning against stale metadata. The
 			// release is never swapped silently.
+			//
+			// pinnedRowProvenance is the one evaluation of "the session's
+			// retained evidence describes the pinned row". Every admission path
+			// reads it, including the candidateUnchanged shortcut: a same-row
+			// binding move can leave the reloaded row naming the new pin while
+			// the running plan's descriptor still describes the previous
+			// candidate, and row-id equality alone cannot tell that apart from a
+			// same-release re-plan. sessionProvenanceMatchesPinnedRowV3 is the
+			// authority for that judgement.
+			pinnedRowProvenance := sessionProvenanceMatchesPinnedRowV3(r.Context(), session, currentEffectiveFile, h.fileResolver)
 			carryPinnedCandidate := (trackChange || seekReanchor) && !virtualDecodeRotation &&
 				strings.TrimSpace(session.VirtualSourceURI) != "" &&
+				pinnedRowProvenance &&
+				// A user-intent replan keeps the session's pinned candidate when
+				// the reloaded row is the pin's own row under a churned
+				// per-listing token (the probe-evidence flag) or that profile's
+				// provider-neutral row (virtualPinnedProfileRowV3). The provider
+				// churns the per-listing result id for bytes that never changed,
+				// so a re-listing pays a multi-second round-trip to hand back a
+				// token the identity guard then refuses to adopt. Admission is
+				// provenance-checked, not presence-checked: a stop, a binding
+				// move, or a rotation can leave the anchor naming the previous
+				// candidate, and trusting it would bypass resolution while the
+				// binder, which rejects the mismatch, cannot supply trustworthy
+				// inventory. A row whose only relationship to the pin is a
+				// different release keeps re-resolving, so an offline pin
+				// surfaces as source_unavailable through the existing rotation
+				// semantics instead of planning against a stub. The release is
+				// never swapped silently.
 				(candidateUnchanged ||
-					// A user-intent replan keeps the session's pinned candidate
-					// when the reloaded row is the pin's own row under a churned
-					// per-listing token (the probe-evidence flag) or that
-					// profile's provider-neutral row (virtualPinnedProfileRowV3),
-					// AND the session's retained provenance actually describes
-					// the pin and the row being bound. The provider churns the
-					// per-listing result id for bytes that never changed, so a
-					// re-listing pays a multi-second round-trip to hand back a
-					// token the identity guard then refuses to adopt. Admission
-					// is provenance-checked, not presence-checked: a stop, a
-					// binding move, or a rotation can leave the anchor naming the
-					// previous candidate, and trusting it would bypass resolution
-					// while the binder, which rejects the mismatch, cannot supply
-					// trustworthy inventory. A row whose only relationship to the
-					// pin is a different release keeps re-resolving, so an
-					// offline pin surfaces as source_unavailable through the
-					// existing rotation semantics instead of planning against a
-					// stub. The release is never swapped silently.
-					(sessionProvenanceMatchesPinnedRowV3(r.Context(), session, currentEffectiveFile, h.fileResolver) &&
-						(session.VirtualSubtitleEvidenceSet ||
-							virtualPinnedProfileRowV3(session, currentEffectiveFile))))
+					session.VirtualSubtitleEvidenceSet ||
+					virtualPinnedProfileRowV3(session, currentEffectiveFile))
 			if candidateUnchanged && evidenceComplete && !virtualDecodeRotation {
 				currentEffectiveFile.FilePath = session.VirtualSourceURI
 				currentEffectiveFile.VirtualOwnerInstallationID = session.VirtualSourceOwnerInstallationID
@@ -11409,6 +11417,10 @@ func carryValidatedVirtualVideoEvidenceV3(file *models.MediaFile, source playbac
 		return file
 	}
 	carried := *file
+	// Clone the video-track slice before the in-place top-up below. A shallow
+	// struct copy shares the backing array, so writing carried.VideoTracks[0]
+	// would mutate the caller's inventory and race any other reader of it.
+	carried.VideoTracks = append([]models.VideoTrack(nil), file.VideoTracks...)
 	if carried.CodecVideo == "" {
 		carried.CodecVideo = source.VideoCodec
 	}
@@ -11422,6 +11434,14 @@ func carryValidatedVirtualVideoEvidenceV3(file *models.MediaFile, source playbac
 		// ffprobe bit_rate/1000), the same unit as
 		// SourceDescriptorV3.BitrateKbps, so the assignment is unit-preserving.
 		carried.Bitrate = source.BitrateKbps
+	}
+	if source.DynamicRange == playback.DynamicRangeHDRUnknownV3 {
+		// Unknown HDR carries no classifying range text: tonemap's classifier
+		// promotes any "hdr"-bearing VideoRangeType to HDR10, so the unknown
+		// grade survives only through the file-level HDR flag with no range text
+		// to classify. Setting it keeps the carried row's descriptor equal to
+		// the running plan's.
+		carried.HDR = true
 	}
 	if len(carried.VideoTracks) == 0 {
 		carried.VideoTracks = []models.VideoTrack{virtualVideoTrackFromDescriptorV3(source)}
@@ -11469,6 +11489,32 @@ func virtualVideoTrackFromDescriptorV3(source playback.SourceDescriptorV3) model
 	var track models.VideoTrack
 	fillVirtualVideoTrackFromDescriptorV3(&track, source)
 	return track
+}
+
+// virtualVideoRangeTypeFromDescriptorV3 maps the running plan's normalized
+// dynamic-range label onto the row range token tonemap classifies from, so a
+// carried row's SourceDescriptorFromFileV3 round-trips to the same label. The
+// tokens mirror the probe's own vocabulary (mediaprobe.videoRangeType): "DOVI"
+// is the token tonemap recognizes as Dolby Vision — the label "dolby_vision"
+// contains no "dovi", so it would classify as SDR — and unknown HDR maps to no
+// token at all, because any "hdr"-bearing text is promoted to HDR10.
+func virtualVideoRangeTypeFromDescriptorV3(source playback.SourceDescriptorV3) string {
+	switch source.DynamicRange {
+	case playback.DynamicRangeDolbyVisionV3:
+		return "DOVI"
+	case playback.DynamicRangeHDR10PlusV3:
+		return "HDR10Plus"
+	case playback.DynamicRangeHLGV3:
+		return "HLG"
+	case playback.DynamicRangeHDR10V3:
+		return "HDR10"
+	case playback.DynamicRangeSDRV3:
+		return "SDR"
+	default:
+		// Unknown HDR (and any unrecognized label) stays unclassifiable; the
+		// file-level HDR flag carries the "unknown" grade.
+		return ""
+	}
 }
 
 // fillVirtualVideoTrackFromDescriptorV3 top-fills every gap in track from the
@@ -11521,7 +11567,7 @@ func fillVirtualVideoTrackFromDescriptorV3(track *models.VideoTrack, source play
 		track.HDR10Plus = source.HDR10Plus
 	}
 	if strings.TrimSpace(track.VideoRangeType) == "" {
-		track.VideoRangeType = source.DynamicRange
+		track.VideoRangeType = virtualVideoRangeTypeFromDescriptorV3(source)
 	}
 	// A DV base-layer provenance without a profile is not a DV classification
 	// the route resolver can trust, so the whole DV block is gated on the
@@ -11534,7 +11580,12 @@ func fillVirtualVideoTrackFromDescriptorV3(track *models.VideoTrack, source play
 		if track.DVLevel == 0 {
 			track.DVLevel = source.DVLevel
 		}
-		if track.DVBLCompatID == 0 {
+		if track.DVBLCompatID == 0 && !track.DVBLCompatIDPresent {
+			// Zero is a meaningful compatibility id — tonemap deliberately
+			// returns no safe base for it — so a row that already knows it is
+			// zero keeps it. Only a missing field may be filled: matching codecs
+			// alone does not establish that the row's profile and compatibility
+			// agree with the descriptor's.
 			track.DVBLCompatID = source.DVBLCompatID
 		}
 		// The descriptor carries a single aggregated base-layer provenance

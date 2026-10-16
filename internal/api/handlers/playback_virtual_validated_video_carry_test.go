@@ -107,7 +107,7 @@ func TestCarryValidatedVirtualVideoEvidenceV3FillsEmptyTrackIncludingCopySafety(
 	if track.Codec != "hevc" || track.Profile != "main10" || track.Level != 153 ||
 		track.BitDepth != 10 || track.Width != 3840 || track.Height != 2160 ||
 		track.Bitrate != 15_000 || track.ColorRange != "tv" || !track.HDR10Plus ||
-		track.VideoRangeType != playback.DynamicRangeDolbyVisionV3 {
+		track.VideoRangeType != "DOVI" {
 		t.Fatalf("reconstructed track = %+v, want the descriptor's planner fields", track)
 	}
 	if math.Abs(virtualFrameRateV3(track.FrameRate)-descriptor.FrameRate) > 1e-6 {
@@ -148,7 +148,7 @@ func TestCarryValidatedVirtualVideoEvidenceV3FillsExistingPartialTrack(t *testin
 	if track.Profile != "main10" || track.Level != 153 || track.BitDepth != 10 ||
 		track.Width != 3840 || track.Height != 2160 || track.Bitrate != 15_000 ||
 		track.ColorRange != "tv" || !track.HDR10Plus ||
-		track.VideoRangeType != playback.DynamicRangeDolbyVisionV3 {
+		track.VideoRangeType != "DOVI" {
 		t.Fatalf("partial track = %+v, want the same planner fields as the empty-track fill", track)
 	}
 	if !track.VideoCopyUnsafe {
@@ -179,7 +179,7 @@ func TestCarryValidatedVirtualVideoEvidenceV3DoesNotInventDVWithoutProfile(t *te
 		track.DVConfigPresent || track.DVBLCompatIDPresent || track.DVBLPresent {
 		t.Fatalf("carry invented DV classification from a profileless descriptor: %+v", track)
 	}
-	if track.VideoRangeType != playback.DynamicRangeDolbyVisionV3 {
+	if track.VideoRangeType != "DOVI" {
 		t.Fatalf("video range type = %q, want the descriptor's dynamic range", track.VideoRangeType)
 	}
 }
@@ -277,5 +277,157 @@ func TestCarryValidatedVirtualVideoEvidenceV3BitrateUnitRoundTrip(t *testing.T) 
 	}
 	if recovered := playback.SourceDescriptorFromFileV3(got, -1); recovered.BitrateKbps != 5_673 {
 		t.Fatalf("bitrate round-trip = %d, want 5673", recovered.BitrateKbps)
+	}
+}
+
+// The carry must not touch the row it is handed. A shallow struct copy shares
+// VideoTracks' backing array, so topping up the first element in place would
+// rewrite the caller's inventory — and race any other reader of it. The carry
+// clones the slice before the first write.
+func TestCarryValidatedVirtualVideoEvidenceV3DoesNotMutateInputRow(t *testing.T) {
+	file := virtualCarryRowV3()
+	file.CodecVideo = "hevc"
+	file.VideoTracks = []models.VideoTrack{{Codec: "hevc"}}
+	before := file.VideoTracks[0]
+	inputSlice := file.VideoTracks
+
+	descriptor := validatedVideoDescriptorV3()
+	got := carryValidatedVirtualVideoEvidenceV3(file, descriptor)
+	if got == file {
+		t.Fatal("carry left a partial-track virtual row untouched")
+	}
+	if file.VideoTracks[0] != before {
+		t.Fatalf("carry mutated the input row's video track: %+v -> %+v", before, file.VideoTracks[0])
+	}
+	if len(inputSlice) != 1 || inputSlice[0] != before {
+		t.Fatalf("carry mutated the input row's video-track backing array: %+v", inputSlice)
+	}
+	if &file.VideoTracks[0] == &got.VideoTracks[0] {
+		t.Fatal("carry reused the input row's video-track backing array for the returned row")
+	}
+	if got.VideoTracks[0].BitDepth != 10 {
+		t.Fatalf("returned track bit depth = %d, want the descriptor's 10", got.VideoTracks[0].BitDepth)
+	}
+}
+
+// assertVideoDescriptorRoundTripV3 compares every planner-facing source field
+// the carry reconstructs, so a carry that drops or reclassifies one is visible.
+func assertVideoDescriptorRoundTripV3(t *testing.T, in, out playback.SourceDescriptorV3) {
+	t.Helper()
+	if out.VideoCodec != in.VideoCodec || out.VideoProfile != in.VideoProfile ||
+		out.VideoLevel != in.VideoLevel || out.BitDepth != in.BitDepth ||
+		out.Width != in.Width || out.Height != in.Height ||
+		math.Abs(out.FrameRate-in.FrameRate) > 1e-6 ||
+		out.BitrateKbps != in.BitrateKbps || out.ColorRange != in.ColorRange ||
+		out.DynamicRange != in.DynamicRange || out.HDR10Plus != in.HDR10Plus ||
+		out.DVProfile != in.DVProfile || out.DVLevel != in.DVLevel ||
+		out.DVBLCompatID != in.DVBLCompatID || out.DVBaseLayerProven != in.DVBaseLayerProven ||
+		out.DVEnhancementLayer != in.DVEnhancementLayer || out.VideoCopyUnsafe != in.VideoCopyUnsafe {
+		t.Fatalf("descriptor did not round-trip:\n in = %+v\nout = %+v", in, out)
+	}
+}
+
+// The carried row must classify to the same dynamic range the running plan
+// validated. Assigning the normalized label straight to VideoRangeType did not
+// round-trip: "dolby_vision" has no "dovi" token so profileless DV fell to SDR,
+// and "hdr_unknown" carries "hdr" so it was promoted to HDR10. This drives the
+// descriptor in through the real builder and asserts descriptor-in equals
+// descriptor-out for every grade.
+func TestCarryValidatedVirtualVideoEvidenceV3DynamicRangeRoundTrip(t *testing.T) {
+	baseRow := func() *models.MediaFile {
+		return &models.MediaFile{
+			ID: 720, FilePath: "virtual://movie/tt-range", Container: "mkv",
+			CodecVideo: "hevc", Bitrate: 15_000,
+			VideoTracks: []models.VideoTrack{{
+				Codec: "hevc", Profile: "main10", Level: 153, BitDepth: 10,
+				Width: 3840, Height: 2160, FrameRate: "24000/1001", Bitrate: 15_000,
+				ColorRange: "tv",
+			}},
+		}
+	}
+	rangeRow := func(rangeType string) *models.MediaFile {
+		file := baseRow()
+		file.VideoTracks[0].VideoRangeType = rangeType
+		return file
+	}
+	unknownHDRRow := func() *models.MediaFile {
+		file := baseRow()
+		file.HDR = true
+		return file
+	}
+	hdr10PlusRow := func() *models.MediaFile {
+		file := baseRow()
+		file.VideoTracks[0].HDR10Plus = true
+		return file
+	}
+	// A profileless DV source carries only the "DOVI" range label: no profile
+	// and no base-layer provenance, the shape whose dynamic range was lost.
+	profilelessDVRow := func() *models.MediaFile {
+		return rangeRow("DOVI")
+	}
+	// A profiled DV source carries the config record, and the compatibility id
+	// may be an explicit zero.
+	dvRow := func(compatID int) *models.MediaFile {
+		file := rangeRow("DOVIWithHDR10")
+		track := &file.VideoTracks[0]
+		track.DVProfile = 8
+		track.DVLevel = 6
+		track.DVBLCompatID = compatID
+		track.DVConfigPresent = true
+		track.DVBLCompatIDPresent = true
+		track.DVBLPresent = true
+		return file
+	}
+
+	cases := []struct {
+		name string
+		row  *models.MediaFile
+	}{
+		{name: "sdr", row: rangeRow("SDR")},
+		{name: "hdr10", row: rangeRow("HDR10")},
+		{name: "hdr10_plus", row: hdr10PlusRow()},
+		{name: "hlg", row: rangeRow("HLG")},
+		{name: "unknown_hdr", row: unknownHDRRow()},
+		{name: "dv_profileless", row: profilelessDVRow()},
+		{name: "dv_compat_one", row: dvRow(1)},
+		{name: "dv_compat_zero", row: dvRow(0)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			descriptorIn := playback.SourceDescriptorFromFileV3(tc.row, -1)
+			stub := virtualCarryRowV3()
+			got := carryValidatedVirtualVideoEvidenceV3(stub, descriptorIn)
+			if got == stub {
+				t.Fatalf("carry left the unprobed row untouched for %s", tc.name)
+			}
+			descriptorOut := playback.SourceDescriptorFromFileV3(got, -1)
+			assertVideoDescriptorRoundTripV3(t, descriptorIn, descriptorOut)
+		})
+	}
+}
+
+// A row that already knows its Dolby compatibility id is zero keeps it: zero is
+// a meaningful value tonemap deliberately refuses to resolve, not a missing
+// field, and matching codecs alone does not establish that the row's profile
+// and compatibility agree with the descriptor's.
+func TestCarryValidatedVirtualVideoEvidenceV3PreservesKnownZeroCompatID(t *testing.T) {
+	file := virtualCarryRowV3()
+	file.VideoTracks = []models.VideoTrack{{
+		Codec: "hevc", DVBLCompatID: 0, DVBLCompatIDPresent: true,
+	}}
+	descriptor := validatedVideoDescriptorV3()
+	descriptor.DVProfile = 7
+	descriptor.DVBLCompatID = 6
+	descriptor.DVBaseLayerProven = true
+
+	got := carryValidatedVirtualVideoEvidenceV3(file, descriptor)
+	if got == file {
+		t.Fatal("carry left the partial-track virtual row untouched")
+	}
+	if got.VideoTracks[0].DVBLCompatID != 0 {
+		t.Fatalf("known zero compatibility id = %d, want it preserved", got.VideoTracks[0].DVBLCompatID)
+	}
+	if got.VideoTracks[0].DVProfile != 7 {
+		t.Fatalf("profile = %d, want the missing profile filled from the descriptor", got.VideoTracks[0].DVProfile)
 	}
 }
