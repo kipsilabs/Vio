@@ -916,6 +916,9 @@ export interface FileVersion {
   /** Custom-format score the server's virtual ranking assigned this candidate.
    *  Absent for local files and elsewhere unscored rows. */
   format_score?: number;
+  /** Names of the enabled, non-rejecting custom formats the ranking matched
+   *  on this candidate, best score first. Absent when the row is unscored. */
+  matched_formats?: string[];
   /** Liveness for virtual versions. Absent means available/unknown; false
    *  means the version is currently unavailable (e.g. the provider no longer
    *  serves it). Populated by the catalog versions/check endpoint. */

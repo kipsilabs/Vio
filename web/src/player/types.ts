@@ -47,6 +47,9 @@ export interface PlayerFileVersion {
   /** Custom-format score the server ranked this candidate with; absent when
    *  the version is unscored (a local file, or no ranking ran). */
   format_score?: number;
+  /** Names of the enabled, non-rejecting custom formats the ranking matched
+   *  on this candidate, best score first. Absent when the row is unscored. */
+  matched_formats?: string[];
   failed?: boolean;
   /**
    * The catalog's liveness verdict for this version, stamped from the server's
