@@ -5289,10 +5289,10 @@ describe("usePlaybackSession plan audio inventory", () => {
     });
 
     // The menus already render confident probe evidence, so the spent budget
-    // is moot: it must not re-arm the failure notice, and it must not clear the
-    // deferred round that is still legitimately owed (a fresh round must not be
-    // killed by a stale exhaustion).
-    expect(result.current.inventoryPending).toBe(true);
+    // is moot: it must not re-arm the failure notice. Nothing is owed — the
+    // exhausted round scheduled no successor — so the pending flag clears too
+    // rather than leaving discovery reading as in flight with no poll running.
+    expect(result.current.inventoryPending).toBe(false);
     expect(result.current.inventoryFailed).toBe(false);
     // The confident list is untouched.
     expect(result.current.planAudioTracks).toHaveLength(2);
@@ -6177,6 +6177,74 @@ describe("usePlaybackSession plan audio inventory", () => {
     });
     expect(result.current.inventoryFailed).toBe(true);
     expect(result.current.inventoryPending).toBe(false);
+
+    unmount();
+  });
+
+  it("drops an exhaustion for the old identity when a replacement is queued in the same batch", async () => {
+    // A replacement push can be queued before React commits it, so the refs
+    // still name the replaced file when the exhausted timer fires. The identity
+    // check must run against the state the updater transitions — the queued
+    // replacement — not those stale refs, or it would label the replacement's
+    // provisional menu failed.
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3", "deferred_track_inventory_v1"],
+            outcome: "playable",
+            session_id: "session-batch-exhaust",
+            playback_plan: fixturePlanV3({
+              session_id: "session-batch-exhaust",
+              tracks_pending: true,
+              inventory_url: "/api/v2/playback/session-batch-exhaust/inventory",
+              inventory_status: "declared",
+              inventory_provenance: "pending",
+              effective_media_file_id: 7,
+              audio_tracks: [
+                { codec: "aac", channels: 2, layout: "stereo", language: "eng", default: true },
+              ],
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-batch-exhaust", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    expect(result.current.inventoryPending).toBe(true);
+    expect(result.current.audioInventoryProvisional).toBe(true);
+
+    act(() => {
+      // Queue the replacement file's declared inventory, then exhaust with the
+      // replaced file's identity before React commits the replacement.
+      result.current.applyCommittedSource(
+        { effectiveMediaFileId: 8, inventoryStatus: "declared" },
+        [{ codec: "eac3", channels: 6, layout: "5.1", language: "en", default: true }],
+      );
+      result.current.markInventoryExhausted({
+        sessionId: "session-batch-exhaust",
+        mediaFileId: 7,
+      });
+    });
+
+    // The stale timer named file 7; the queued replacement is file 8 and stays
+    // provisional, neither failed nor pending with no round scheduled.
+    expect(result.current.mediaFileId).toBe(8);
+    expect(result.current.inventoryFailed).toBe(false);
+    expect(result.current.audioInventoryProvisional).toBe(true);
+    expect(result.current.inventoryPending).toBe(true);
 
     unmount();
   });

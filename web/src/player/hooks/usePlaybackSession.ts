@@ -649,9 +649,10 @@ export interface UsePlaybackSessionResult extends PlaybackSessionState {
   /**
    * Marks deferred discovery exhausted after polling attempts or deadline
    * time out, stopping the spinner and rendering an actionable failure state.
-   * Only a still-declared menu is marked; a call that names another
-   * `sessionId`/`mediaFileId` than the live session is a stale timer and is
-   * ignored.
+   * Only a still-declared menu is marked; a confident inventory instead clears
+   * the pending flag, since no round is scheduled after exhaustion. A call that
+   * names another `sessionId`/`mediaFileId` than the live session is a stale
+   * timer and is ignored.
    */
   markInventoryExhausted: (expected?: {
     sessionId?: string | null;
@@ -3764,31 +3765,28 @@ export function usePlaybackSession(
 
   const markInventoryExhausted = useCallback(
     (expected?: { sessionId?: string | null; mediaFileId?: number | null }) => {
-      // A timer armed for one session (or file) must not mark a replacement.
-      // This mirrors the deferred poll's identity guard: the call site passes
-      // the identity it polled for, and a mismatch is a stale callback.
-      if (
-        expected &&
-        (expected.sessionId !== sessionIdRef.current ||
-          expected.mediaFileId !== stateRef.current.mediaFileId)
-      ) {
-        return;
-      }
-      // The attempt budget is spent. That is only a *failure* while a menu is
-      // still showing declared/loading tracks; once positive probe evidence
-      // (a verified push, a refreshed plan, or a catalog list) has resolved the
-      // inventory, a spent budget is moot and must not re-arm the "discovery
-      // did not complete" notice above a correct list. Returning without
-      // touching the ref also leaves a deferred round that is still
-      // legitimately owed over confident menus in place.
-      const current = stateRef.current;
-      if (!current.audioInventoryProvisional && !current.subtitleInventoryProvisional) {
-        return;
-      }
-      inventoryPendingRef.current = false;
+      // The identity is checked against the state this updater transitions, not
+      // the refs: a replacement plan can already be queued when a stale timer
+      // fires, so the rendered refs would still name the replaced session and
+      // mark its replacement failed. This mirrors the deferred poll's identity
+      // guard, with the queued update as the authority.
       setState((latest) => {
-        if (!latest.audioInventoryProvisional && !latest.subtitleInventoryProvisional) {
+        if (
+          expected &&
+          (expected.sessionId !== latest.sessionId || expected.mediaFileId !== latest.mediaFileId)
+        ) {
           return latest;
+        }
+        inventoryPendingRef.current = false;
+        // The attempt budget is spent. That is only a *failure* while a menu is
+        // still showing declared/loading tracks; once positive probe evidence
+        // (a verified push, a refreshed plan, or a catalog list) has resolved
+        // the inventory, the spent budget is moot and must not re-arm the
+        // "discovery did not complete" notice above a correct list. Nothing is
+        // owed then — no round is scheduled after exhaustion — so the pending
+        // flag must not outlive it and read as discovery still in flight.
+        if (!latest.audioInventoryProvisional && !latest.subtitleInventoryProvisional) {
+          return latest.inventoryPending ? { ...latest, inventoryPending: false } : latest;
         }
         return { ...latest, inventoryPending: false, inventoryFailed: true };
       });
