@@ -31,7 +31,7 @@ func virtualCandidateScoreSource(service virtualCandidateLister) catalog.Virtual
 	if service == nil {
 		return nil
 	}
-	return func(ctx context.Context, _ string, files []*models.MediaFile) map[int]int {
+	return func(ctx context.Context, _ string, files []*models.MediaFile) map[int]catalog.VirtualCandidateScore {
 		neutral := virtualNeutralSourcePath(files)
 		if neutral == "" {
 			return nil
@@ -40,23 +40,26 @@ func virtualCandidateScoreSource(service virtualCandidateLister) catalog.Virtual
 		if err != nil || len(streams) == 0 {
 			return nil
 		}
-		scoreByURI := make(map[string]int, len(streams))
+		byURI := make(map[string]catalog.VirtualCandidateScore, len(streams))
 		for _, stream := range streams {
-			// Zero is the unscored/neutral sum; the wire field is omitted for
-			// it, so it must not be recorded as a real score.
+			// Zero is the unscored/neutral sum; the wire fields are omitted
+			// for it, so it must not be recorded as a real score.
 			if stream.QualityScore != 0 {
-				scoreByURI[stream.URI] = stream.QualityScore
+				byURI[stream.URI] = catalog.VirtualCandidateScore{
+					Score:          stream.QualityScore,
+					MatchedFormats: stream.MatchedFormats,
+				}
 			}
 		}
-		if len(scoreByURI) == 0 {
+		if len(byURI) == 0 {
 			return nil
 		}
-		scores := make(map[int]int, len(files))
+		scores := make(map[int]catalog.VirtualCandidateScore, len(files))
 		for _, file := range files {
 			if file == nil {
 				continue
 			}
-			if score, ok := scoreByURI[file.FilePath]; ok {
+			if score, ok := byURI[file.FilePath]; ok {
 				scores[file.ID] = score
 			}
 		}
