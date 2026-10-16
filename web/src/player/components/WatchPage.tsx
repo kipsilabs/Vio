@@ -719,6 +719,7 @@ function WatchPagePlayer({
     }
 
     const sessionId = session.sessionId;
+    const mediaFileId = session.mediaFileId;
     const inventoryUrl = session.inventoryUrl;
     let cancelled = false;
     let completedAttempts = 0;
@@ -729,15 +730,22 @@ function WatchPagePlayer({
     const scheduleNextPoll = () => {
       if (cancelled) return;
       const current = sessionRef.current;
+      // Mirror the legacy catalog poll's identity guard: a deferred round armed
+      // for one session (or file) must not mark a replacement, and the deferred
+      // round owns a different `inventory_url` when a fresh one re-arms. The live
+      // ref is read here rather than trusted from the closure.
       if (
         current.sessionId !== sessionId ||
+        current.mediaFileId !== mediaFileId ||
         !current.inventoryPending ||
         current.inventoryUrl !== inventoryUrl
       ) {
         return;
       }
       if (completedAttempts >= INVENTORY_REFRESH_MAX_ATTEMPTS || Date.now() >= deadline) {
-        sessionRef.current.markInventoryExhausted();
+        // The expected identity lets the shared guard drop a stale timer whose
+        // round was replaced after this callback was armed but before it fired.
+        sessionRef.current.markInventoryExhausted({ sessionId, mediaFileId });
         return;
       }
       const delay = inventoryPollDelayMs(scheduledAttempts, false);

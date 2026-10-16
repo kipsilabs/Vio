@@ -2378,6 +2378,62 @@ describe("WatchPage live inventory refresh", () => {
     });
   });
 
+  it("arms deferred exhaustion with the live session identity across a replacement", async () => {
+    const markFirst = vi.fn();
+    const markSecond = vi.fn();
+    const provisionalDeferred = {
+      planAudioTracks: richerAudioTracks,
+      audioInventoryProvisional: true,
+      subtitleUrls: [],
+      subtitleInventoryProvisional: true,
+      inventoryPending: true,
+      pollInventory: vi.fn().mockResolvedValue(false),
+    };
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        mediaFileId: 7,
+        sessionId: "session-1",
+        inventoryUrl: "/api/v2/playback/session-1/inventory",
+        markInventoryExhausted: markFirst,
+        ...provisionalDeferred,
+      }),
+    );
+
+    const { rerender } = render(
+      createElement(WatchPage, { ...watchPageProps, versions: [virtualVersion] }),
+    );
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    expect(markFirst).not.toHaveBeenCalled();
+
+    // The player replaces the session while the deferred timer is armed. The
+    // replaced round is dropped; the fresh round's exhaustion names its own
+    // identity so the shared guard can drop a stale timer.
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        mediaFileId: 8,
+        sessionId: "session-2",
+        inventoryUrl: "/api/v2/playback/session-2/inventory",
+        markInventoryExhausted: markSecond,
+        ...provisionalDeferred,
+      }),
+    );
+    rerender(createElement(WatchPage, { ...watchPageProps, versions: [virtualVersion] }));
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000);
+    });
+
+    expect(markFirst).not.toHaveBeenCalled();
+    expect(markSecond).toHaveBeenCalled();
+    expect(markSecond.mock.calls.at(-1)?.[0]).toEqual({
+      sessionId: "session-2",
+      mediaFileId: 8,
+    });
+  });
+
   it("retains a still-declared badge when the poll's reads stay empty", async () => {
     const applyInventoryUpdate = vi.fn();
     playbackSessionMock.mockReturnValue(
