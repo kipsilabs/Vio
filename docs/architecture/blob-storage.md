@@ -436,10 +436,15 @@ URLs are issued fresh on every resolve, and public URLs never change.
 Local storage publishes each object with an atomic rename, and direct S3 reads
 see an object as soon as its upload returns, so catalog responses resolve the
 manifest key they hold and a missing object answers 404 and enqueues repair.
-Only external delivery (a public or token-authenticated read endpoint in front
-of S3) can lag behind a write. That configuration alone runs the
-`verify_artwork_delivery` task and consults the verified-keys manifest when
-choosing which variant to advertise.
+A collection collage reads its source posters from the same store and enqueues
+the same repair when a source variant is missing, so every API node must see one
+assets store. A local `artwork.local_path` is a shared root; a node with its own
+root cannot see the variant another node repaired and enqueues the repair again.
+A succeeded repair becomes eligible again, so a permanently missing source is
+repaired on each miss rather than once. Only external delivery (a public or
+token-authenticated read endpoint in front of S3) can lag behind a write. That
+configuration alone runs the `verify_artwork_delivery` task and consults the
+verified-keys manifest when choosing which variant to advertise.
 
 A verdict is scoped to the delivery configuration and is current only until
 the revision is published again. Publication records exact keys only after
