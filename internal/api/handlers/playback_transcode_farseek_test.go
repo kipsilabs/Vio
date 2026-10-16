@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -140,6 +141,118 @@ func TestFarSeekBeyondProducedWindowAnswersStaleGenerationImmediately(t *testing
 	if second.Body.String() != "far-seek-bytes" {
 		t.Fatalf("post-restart body = %q, want the restarted generation's bytes", second.Body.String())
 	}
+}
+
+// TestFarSeekSignedGenerationRecoversWithinBudget drives the client recovery
+// contract the web player depends on: a request signed with the generation it
+// holds (sgen) gets the 412 stale-generation verdict immediately, the manifest
+// reloads at once, and the replacement init and segment are servable under the
+// generation the reload advertises — inside the two-consecutive-recovery budget
+// from #323. The existing immediate-verdict test waits for output on disk and
+// omits sgen, so it never exercises the reload-then-serve handoff.
+func TestFarSeekSignedGenerationRecoversWithinBudget(t *testing.T) {
+	outputDir := t.TempDir()
+	const sessionID = "farseek-sgen"
+	handler, transcodeSession := startFarSeekHandlerSession(t, sessionID, writePlaybackTestFFmpegFarSeek(t), outputDir, playback.TranscodeOpts{
+		InputPath:          "/media/movie.mkv",
+		TargetCodecVideo:   "h264",
+		TargetCodecAudio:   "aac",
+		SegmentDuration:    2,
+		AudioTrackIndex:    -1,
+		SubtitleTrackIndex: -1,
+		TotalDuration:      1200,
+	})
+
+	const segmentName = "seg_00452.m4s"
+	staleToken := transcodeSession.GenerationToken()
+
+	// 1. The signed segment request is answered the stale verdict at once. This
+	// is the recovery the client counts against its budget.
+	first := httptest.NewRecorder()
+	handler.HandleGetTranscodeSegment(first, playbackTestRequest(
+		http.MethodGet,
+		"/api/v1/playback/transcode/"+sessionID+"/segment/"+segmentName+"?sgen="+url.QueryEscape(staleToken),
+		nil,
+		map[string]string{"session_id": sessionID, "name": segmentName},
+	))
+	if first.Code != http.StatusPreconditionFailed || !strings.Contains(first.Body.String(), "stale_generation") {
+		t.Fatalf("signed far-seek status = %d body=%q, want %d stale_generation", first.Code, first.Body.String(), http.StatusPreconditionFailed)
+	}
+
+	// 2. Reload the manifest immediately; it must answer without waiting for the
+	// detached restart, then advertise the replacement generation. One reload is
+	// one recovery, well inside the two-consecutive-recovery budget.
+	replacementToken := ""
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		manifestRec := httptest.NewRecorder()
+		handler.HandleGetTranscodeManifest(manifestRec, playbackTestRequest(
+			http.MethodGet,
+			"/api/v1/playback/transcode/"+sessionID+"/master.m3u8",
+			nil,
+			map[string]string{"session_id": sessionID},
+		))
+		if manifestRec.Code != http.StatusOK {
+			t.Fatalf("manifest reload status = %d body=%q, want 200 immediately after the verdict", manifestRec.Code, manifestRec.Body.String())
+		}
+		if token := manifestGenerationToken(t, manifestRec.Body.Bytes()); token != "" && token != staleToken {
+			replacementToken = token
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the manifest never advertised a replacement generation within the recovery budget")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if transcodeSession.MatchesGenerationToken(staleToken) {
+		t.Fatal("the stale generation token still matched the replacement manifest")
+	}
+
+	// 3. The replacement generation serves both the init segment and the sought
+	// segment under the token the reload advertised.
+	initRec := httptest.NewRecorder()
+	handler.HandleGetTranscodeSegment(initRec, playbackTestRequest(
+		http.MethodGet,
+		"/api/v1/playback/transcode/"+sessionID+"/segment/init.mp4?sgen="+url.QueryEscape(replacementToken),
+		nil,
+		map[string]string{"session_id": sessionID, "name": "init.mp4"},
+	))
+	if initRec.Code != http.StatusOK {
+		t.Fatalf("replacement init status = %d body=%q, want 200", initRec.Code, initRec.Body.String())
+	}
+
+	segRec := httptest.NewRecorder()
+	handler.HandleGetTranscodeSegment(segRec, playbackTestRequest(
+		http.MethodGet,
+		"/api/v1/playback/transcode/"+sessionID+"/segment/"+segmentName+"?sgen="+url.QueryEscape(replacementToken),
+		nil,
+		map[string]string{"session_id": sessionID, "name": segmentName},
+	))
+	if segRec.Code != http.StatusOK || segRec.Body.String() != "far-seek-bytes" {
+		t.Fatalf("replacement segment status = %d body=%q, want 200 far-seek-bytes", segRec.Code, segRec.Body.String())
+	}
+}
+
+// manifestGenerationToken extracts the sgen token from an HLS manifest body, or
+// "" when the manifest carries none.
+func manifestGenerationToken(t *testing.T, body []byte) string {
+	t.Helper()
+	for _, line := range strings.Split(string(body), "\n") {
+		i := strings.Index(line, "sgen=")
+		if i < 0 {
+			continue
+		}
+		raw := line[i+len("sgen="):]
+		if j := strings.IndexAny(raw, "&\"\r "); j >= 0 {
+			raw = raw[:j]
+		}
+		token, err := url.QueryUnescape(raw)
+		if err != nil {
+			t.Fatalf("unescape sgen %q: %v", raw, err)
+		}
+		return token
+	}
+	return ""
 }
 
 // startFarSeekHandlerSession starts a fake transcode, waits for its initial

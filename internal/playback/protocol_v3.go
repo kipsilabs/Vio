@@ -656,6 +656,13 @@ type ClientPlaybackContextV3 struct {
 	Deliveries map[string]DeliveryCapabilityV3 `json:"deliveries"`
 }
 
+// SubtitleTrackOffIndexV3 is the explicit-off sentinel for
+// StartRequestV3.SubtitleTrackIndex: a one-off subtitle-free start that overrides
+// a stored "always" mode. Omission (nil) stays "no selection intent" and is
+// never read as off. The playback runtime already treats any negative index as
+// "no subtitles".
+const SubtitleTrackOffIndexV3 = -1
+
 type StartRequestV3 struct {
 	ProtocolVersion   int      `json:"protocol_version"`
 	ClientFeatures    []string `json:"client_features"`
@@ -1916,11 +1923,24 @@ func validateTrackPairV3(fileID int, kind, id string, index *int) error {
 	if len(id) > 128 {
 		return fmt.Errorf("%s_track_id exceeds supported size", kind)
 	}
-	if index != nil && (*index < 0 || *index > 10_000) {
-		return fmt.Errorf("%s_track_index is invalid", kind)
+	// A subtitle index of -1 is the additive explicit-off encoding: a one-off
+	// subtitle-free start even when the profile's stored mode is "always".
+	// Omission (nil) stays "no selection intent" and must never be read as off.
+	// Audio has no off sentinel.
+	if index != nil {
+		if *index > 10_000 {
+			return fmt.Errorf("%s_track_index is invalid", kind)
+		}
+		if *index < 0 && !(kind == "subtitle" && *index == SubtitleTrackOffIndexV3) {
+			return fmt.Errorf("%s_track_index is invalid", kind)
+		}
 	}
 	if id == "" || index == nil {
 		return nil
+	}
+	if *index < 0 {
+		// Explicit off names no track, so a paired identity would disagree.
+		return fmt.Errorf("%s_track_id and explicit off cannot be combined", kind)
 	}
 	want := TrackIDV3(fileID, kind, *index)
 	if id != want {

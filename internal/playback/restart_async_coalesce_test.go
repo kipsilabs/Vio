@@ -157,6 +157,40 @@ func TestRestartSegmentAsyncConvergesWhenTargetArrivesMidRestart(t *testing.T) {
 	}
 }
 
+// TestRestartSegmentAsyncAppliesTargetArrivingAtCompletion pins the completion
+// window. The worker reads whether the coalesced target moved and then leaves the
+// loop; a request landing between that read and the entry's removal used to find
+// the entry still present, record its target, and return without starting a
+// worker, after which the exiting worker deleted the entry — the newest target
+// was never applied. The hook fires after the atomic completion check, when the
+// entry is already gone, so the late request must start a fresh worker and its
+// target must be the final applied seek.
+func TestRestartSegmentAsyncAppliesTargetArrivingAtCompletion(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "seeks.log")
+	m := NewTranscodeManager()
+	s := newAsyncRestartTestSession(t, logPath)
+	const sid = "sess-async"
+	m.RegisterTranscodeSession(sid, s)
+	t.Cleanup(func() { _ = s.Close() })
+
+	// The first worker exits at segment 10 (seek 20.000); enqueue the late
+	// target exactly in its completion window. Once guards the second worker's
+	// own completion from enqueueing again.
+	var once sync.Once
+	m.asyncRestartFinishHook = func() {
+		once.Do(func() { m.RestartSegmentAsync(sid, s, 20) })
+	}
+
+	m.RestartSegmentAsync(sid, s, 10)
+
+	waitAsyncRestartsDrained(t, m, sid)
+	// The final applied seek must be the late target. The first restart's stub
+	// can be killed before its shell writes its argument, so only the last is
+	// asserted; under the old check-then-delete the late target was dropped and
+	// ffmpeg was left at segment 10 (seek 20.000).
+	waitSeekLogLast(t, logPath, "40.000")
+}
+
 // TestRestartSegmentAsyncLatchesTerminalFailure pins the poison-latch: a
 // detached restart refused by a dead source records its verdict so the next
 // segment request can surface the real failure instead of a second

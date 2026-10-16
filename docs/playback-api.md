@@ -257,10 +257,11 @@ When the profile's stored `playback.subtitle_mode` is `always`, an omitted
 `subtitle_track_id` / `subtitle_track_index` on start resolves to the stored
 preference's track before planning, so subtitles are on — and a bitmap track
 forces the burn-in video codec — on the first plan rather than after a
-reconciliation replan. The v3 start wire has no explicit-off encoding
-(`subtitle_track_index` is `>= 0`), so omission is the only way to express "no
-selection". A named track is never overridden; a stored mode other than
-`always` (including the off state) leaves the selection to the client on
+reconciliation replan. `subtitle_track_index: -1` is the explicit-off encoding:
+it requests a one-off subtitle-free start without changing the stored mode, and
+overrides `always`. Omission (the field absent) remains "no selection intent"
+and is never read as off; a named track is never overridden; a stored mode other
+than `always` (including the off state) leaves the selection to the client on
 omission.
 
 A start that returns a playable decision registers the device the client

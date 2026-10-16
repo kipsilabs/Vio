@@ -198,8 +198,14 @@ func selectPreferredSubtitleV3(
 
 // matchSubtitleSignatureV3 finds the inventory entry a stored per-series track
 // signature names, matching only the traits the signature actually carries.
+// Language is ranked rather than required to be equal, but a script conflict is
+// rejected exactly as the language branch of selectPreferredSubtitleV3 rejects
+// it: a positive lang.RankScriptConflict (e.g. zh-Hans against zh-Hant) is not a
+// compatible match, and the exact tag is preferred over a regional variant.
 func matchSubtitleSignatureV3(inventory []playback.SubtitleInventoryItemV3, signature *userstore.SubtitleTrackSignature) (playback.SubtitleInventoryItemV3, bool) {
-	for _, item := range inventory {
+	bestIndex := -1
+	bestRank := -1
+	for i, item := range inventory {
 		if signature.Source != "" && !strings.EqualFold(item.Source, signature.Source) {
 			continue
 		}
@@ -215,12 +221,21 @@ func matchSubtitleSignatureV3(inventory []playback.SubtitleInventoryItemV3, sign
 		if signature.HearingImpaired != item.HearingImpaired {
 			continue
 		}
-		if signature.Language != "" && subtitleLanguageRankV3(item.Language, signature.Language) < 0 {
+		if signature.Language == "" {
+			return item, true
+		}
+		rank := subtitleLanguageRankV3(item.Language, signature.Language)
+		if rank < 0 || rank >= lang.RankScriptConflict {
 			continue
 		}
-		return item, true
+		if bestIndex < 0 || rank < bestRank {
+			bestIndex, bestRank = i, rank
+		}
 	}
-	return playback.SubtitleInventoryItemV3{}, false
+	if bestIndex < 0 {
+		return playback.SubtitleInventoryItemV3{}, false
+	}
+	return inventory[bestIndex], true
 }
 
 // subtitleLanguageRankV3 ranks a track language against the preference, or -1

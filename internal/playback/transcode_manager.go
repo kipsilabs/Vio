@@ -141,6 +141,13 @@ type TranscodeManager struct {
 	// newest target instead of racing to be the last writer.
 	asyncRestartMu sync.Mutex
 	asyncRestarts  map[string]*pendingAsyncRestart
+
+	// asyncRestartFinishHook, when non-nil, runs once the coalescing worker has
+	// atomically decided to leave its loop but before it returns. A test uses it
+	// to inject a request in the completion window, where a late target must
+	// start a fresh worker rather than update an entry that is being removed.
+	// Production leaves it nil.
+	asyncRestartFinishHook func()
 }
 
 // lifecycleLock is a refcounted per-session lock. The refcount lets the manager
@@ -474,6 +481,14 @@ func (m *TranscodeManager) RestartSegmentAsync(sessionID string, ts *TranscodeSe
 // runAsyncRestart applies far-seek restarts until the coalesced target stops
 // moving. A newer target arriving mid-restart makes the loop run once more, so
 // the final applied position is the last one the player asked for.
+//
+// The decision to leave the loop and the removal of the coalescing entry happen
+// in one critical section (see tryFinishAsyncRestart). If they did not, a
+// request landing after the "did the target move?" read but before the removal
+// would find the entry still present, record its target, and return without a
+// worker — and the exiting worker would then delete the entry, dropping the
+// newest target. Under one lock the request either lands before the read (the
+// worker loops onto it) or after the removal (it starts a fresh worker).
 func (m *TranscodeManager) runAsyncRestart(sessionID string, pending *pendingAsyncRestart) {
 	defer func() {
 		m.asyncRestartMu.Lock()
@@ -505,13 +520,34 @@ func (m *TranscodeManager) runAsyncRestart(sessionID string, pending *pendingAsy
 		if err != nil {
 			return
 		}
-		pending.mu.Lock()
-		advanced := pending.segNum != applied
-		pending.mu.Unlock()
-		if !advanced {
+		if m.tryFinishAsyncRestart(sessionID, pending, applied) {
+			if m.asyncRestartFinishHook != nil {
+				m.asyncRestartFinishHook()
+			}
 			return
 		}
 	}
+}
+
+// tryFinishAsyncRestart atomically ends the coalescing worker when no newer
+// target arrived while it applied applied. It returns true when the worker
+// should leave the loop, having removed its entry under asyncRestartMu so a
+// request landing immediately after this check starts a fresh worker instead of
+// updating an entry about to be deleted. It returns false when the coalesced
+// target moved, so the caller loops and applies it.
+func (m *TranscodeManager) tryFinishAsyncRestart(sessionID string, pending *pendingAsyncRestart, applied int) bool {
+	m.asyncRestartMu.Lock()
+	defer m.asyncRestartMu.Unlock()
+	pending.mu.Lock()
+	advanced := pending.segNum != applied
+	pending.mu.Unlock()
+	if advanced {
+		return false
+	}
+	if m.asyncRestarts[sessionID] == pending {
+		delete(m.asyncRestarts, sessionID)
+	}
+	return true
 }
 
 func (m *TranscodeManager) recordAsyncRestartOutcome(sessionID string, ts *TranscodeSession, segNum int, target SegmentRecoveryTarget, ok bool, err error) {

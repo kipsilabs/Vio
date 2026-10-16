@@ -4663,3 +4663,37 @@ func TestPlanPlaybackV3DroppingFallbackHistoryReintroducesRejectedRoute(t *testi
 		t.Fatalf("reintroduced route = %#v", replanned.Plan)
 	}
 }
+
+// TestNormalizeAndValidateV3ExplicitSubtitleOff pins the additive explicit-off
+// encoding: subtitle_track_index = -1 is accepted and names no track, while
+// omission stays "no selection intent". Other negatives and the same sentinel
+// on audio remain invalid, and an off index cannot be paired with an identity.
+func TestNormalizeAndValidateV3ExplicitSubtitleOff(t *testing.T) {
+	off := -1
+	req := validStartRequestV3()
+	req.SubtitleTrackIndex = &off
+	if _, err := req.NormalizeAndValidate(); err != nil {
+		t.Fatalf("explicit subtitle off rejected: %v", err)
+	}
+
+	req = validStartRequestV3()
+	req.SubtitleTrackIndex = &off
+	req.SubtitleTrackID = TrackIDV3(req.FileID, "subtitle", 0)
+	if _, err := req.NormalizeAndValidate(); err == nil {
+		t.Fatal("explicit off combined with a subtitle identity was accepted")
+	}
+
+	req = validStartRequestV3()
+	audioOff := -1
+	req.AudioTrackIndex = &audioOff
+	if _, err := req.NormalizeAndValidate(); err == nil {
+		t.Fatal("negative audio index was accepted")
+	}
+
+	req = validStartRequestV3()
+	minusTwo := -2
+	req.SubtitleTrackIndex = &minusTwo
+	if _, err := req.NormalizeAndValidate(); err == nil {
+		t.Fatal("subtitle index -2 was accepted")
+	}
+}

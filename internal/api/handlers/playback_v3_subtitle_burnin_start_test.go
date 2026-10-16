@@ -308,3 +308,100 @@ func TestStartExplicitSubtitleIndexWinsOverStoredAlways(t *testing.T) {
 }
 
 func intPtrPlaybackV3(v int) *int { return &v }
+
+// TestMatchSubtitleSignatureV3RejectsScriptConflict pins that a stored
+// per-series signature prefers the exact language tag and never accepts an
+// equal-language track in a conflicting script. A zh-Hant track listed before
+// the stored zh-Hans one must not win merely because its language ranks as
+// "compatible": RankScriptConflict is a rejection, exactly as in the language
+// branch of selectPreferredSubtitleV3.
+func TestMatchSubtitleSignatureV3RejectsScriptConflict(t *testing.T) {
+	inventory := []playback.SubtitleInventoryItemV3{
+		{CombinedIndex: 0, Source: "embedded", Codec: "subrip", Language: "zh-Hant"},
+		{CombinedIndex: 1, Source: "embedded", Codec: "subrip", Language: "zh-Hans"},
+	}
+	signature := &userstore.SubtitleTrackSignature{Source: "embedded", Codec: "subrip", Language: "zh-Hans"}
+
+	item, ok := matchSubtitleSignatureV3(inventory, signature)
+	if !ok || item.CombinedIndex != 1 {
+		t.Fatalf("signature match = (%+v, %v), want the exact zh-Hans track at combined index 1", item, ok)
+	}
+
+	// Only the conflicting script exists: the signature must match nothing
+	// rather than fall onto the wrong script.
+	conflictOnly := []playback.SubtitleInventoryItemV3{
+		{CombinedIndex: 0, Source: "embedded", Codec: "subrip", Language: "zh-Hant"},
+	}
+	if item, ok := matchSubtitleSignatureV3(conflictOnly, signature); ok {
+		t.Fatalf("signature match = (%+v, %v), want no match across a script conflict", item, ok)
+	}
+}
+
+// TestStartExplicitSubtitleOffWinsOverStoredAlways pins the additive explicit
+// off: subtitle_track_index = -1 on start overrides a stored "always" mode for
+// one start. It selects no subtitle and never burns one in, distinct from
+// omission, which still auto-selects under "always".
+func TestStartExplicitSubtitleOffWinsOverStoredAlways(t *testing.T) {
+	store := newPlaybackTestStore(t)
+	seedPlaybackSubtitlePreferenceV3(t, store, settingskeys.PlaybackSubtitleLanguage, "eng")
+	seedPlaybackSubtitlePreferenceV3(t, store, settingskeys.PlaybackSubtitleMode, "always")
+
+	// The stored mode would select the bitmap PGS track and force burn-in; the
+	// explicit off must prevent both.
+	file := subtitleBurnInFixtureFileV3(t)
+
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), testPlaybackFileResolver{file: file})
+	handler.StoreProvider = testUserStoreProvider{store: store}
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{
+		config.Allow4KTranscodeSettingKey:          "true",
+		config.PlaybackAllowHEVCEncodingSettingKey: "true",
+	}}
+	handler.PlaybackConfig = func() config.PlaybackConfig {
+		return config.PlaybackConfig{
+			FFmpegPath:       writePlaybackTestFFmpeg(t),
+			TranscodeDir:     t.TempDir(),
+			TranscodeEnabled: true,
+			HWAccel:          "qsv",
+		}
+	}
+	presetLocalRegistryV3(handler, playback.NewTransformationRegistryV3([]playback.TransformationSpecV3{
+		{Name: playback.TransformationAudioToAACV3, RecipeVersion: playback.TransformationAudioToAACRecipeVersionV3, Available: true},
+		{Name: playback.TransformationVideoToH264V3, RecipeVersion: playback.TransformationVideoToH264RecipeVersionV3, Available: true},
+		{Name: playback.TransformationVideoToHEVCV3, RecipeVersion: playback.TransformationVideoToHEVCRecipeVersionV3, Available: true},
+	}))
+
+	start := v3HandlerStartRequest()
+	caps := start.Capabilities
+	caps.CodecsVideo = []string{"h264", "hevc"}
+	caps.CodecsVideoHardware = []string{"h264", "hevc"}
+	caps.Containers = []string{"mp4", "mkv"}
+	start.Capabilities = caps
+	start.ClientPlaybackContext.Deliveries[playback.DeliveryClassOriginalHTTPV3] = playback.DeliveryCapabilityV3{
+		Enabled: true, SupportedOnDevice: true, VideoCodecs: []string{"h264"},
+		Subtitles: playback.DeliverySubtitleCapabilitiesV3{EmbeddedText: true, SidecarText: true},
+	}
+	start.ClientPlaybackContext.Deliveries[playback.DeliveryClassHLSV3] = playback.DeliveryCapabilityV3{
+		Enabled: true, SupportedOnDevice: true,
+		Containers:        []string{"hls"},
+		VideoCodecs:       []string{"h264", "hevc"},
+		AudioDecodeCodecs: []string{"aac"},
+		Subtitles:         playback.DeliverySubtitleCapabilitiesV3{EmbeddedText: true, SidecarText: true},
+	}
+	start.SubtitleTrackIndex = intPtrPlaybackV3(-1)
+
+	started := startV3PlaybackV2ForHandlerTest(t, handler, start)
+	plan := started.PlaybackPlan
+	if plan == nil {
+		t.Fatalf("no plan: terminal=%#v", started.Terminal)
+	}
+	if plan.SelectedTracks.Subtitle != nil {
+		t.Fatalf("selected subtitle = %#v, want none under explicit off", plan.SelectedTracks.Subtitle)
+	}
+	if plan.Subtitle.Mode != playback.SubtitleOffV3 {
+		t.Fatalf("subtitle mode = %q, want %q under explicit off", plan.Subtitle.Mode, playback.SubtitleOffV3)
+	}
+	if plan.EffectiveRecipe.VideoCodec != "" && plan.DecisionReason == "subtitle_burn_in_required" {
+		t.Fatalf("explicit off still forced burn-in: reason=%q codec=%q", plan.DecisionReason, plan.EffectiveRecipe.VideoCodec)
+	}
+}

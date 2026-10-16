@@ -346,6 +346,14 @@ type Server struct {
 	lifecycleMu    sync.Mutex
 	lifecycleLocks map[string]*sessionLifecycleLock
 
+	// asyncRestartMu guards asyncRestarts, the per-session coalesced far-seek
+	// restart workers. Each entry records the latest requested segment so two
+	// far-seeks landing on the same session converge on one restart at the
+	// newest target instead of serializing through the lifecycle lock in
+	// arrival order (where the older target could win).
+	asyncRestartMu sync.Mutex
+	asyncRestarts  map[string]*pendingNodeAsyncRestart
+
 	// recipeStore is the control-plane recipe store consulted when a forwarded
 	// token carries no recipe (the jellycompat node hop). Nil disables that path.
 	recipeStore recipeStore
@@ -491,6 +499,20 @@ func (s *Server) restartSegmentLocked(
 	session *playback.TranscodeSession,
 	segNum int,
 ) (playback.SegmentRecoveryTarget, bool, error) {
+	return s.restartSegmentLockedWithTarget(ctx, sessionID, session, func() int { return segNum })
+}
+
+// restartSegmentLockedWithTarget is restartSegmentLocked with the segment read
+// inside the lifecycle critical section. The coalescing worker uses it so two
+// queued far-seeks collapse onto the target that is current when the lock is
+// actually held, instead of the one that was current when the goroutine
+// started.
+func (s *Server) restartSegmentLockedWithTarget(
+	ctx context.Context,
+	sessionID string,
+	session *playback.TranscodeSession,
+	segNum func() int,
+) (playback.SegmentRecoveryTarget, bool, error) {
 	unlock := s.lockSessionLifecycle(sessionID)
 	defer unlock()
 	s.mu.RLock()
@@ -499,7 +521,18 @@ func (s *Server) restartSegmentLocked(
 	if !ok || live != session {
 		return playback.SegmentRecoveryTarget{}, false, playback.ErrSessionSuperseded
 	}
-	return session.RestartSegment(ctx, segNum)
+	return session.RestartSegment(ctx, segNum())
+}
+
+// pendingNodeAsyncRestart coalesces the detached far-seek restarts for one
+// node session. A request that arrives while a restart runs records the newest
+// segment here instead of starting a competing worker, so the running worker
+// re-reads the target after each restart and converges on the latest request.
+type pendingNodeAsyncRestart struct {
+	session *playback.TranscodeSession
+	// mu guards segNum, the latest requested segment.
+	mu     sync.Mutex
+	segNum int
 }
 
 // restartSegmentAsync runs restartSegmentLocked on its own goroutine so a
@@ -509,29 +542,122 @@ func (s *Server) restartSegmentLocked(
 // and this worker makes the next request on the new generation succeed. The
 // context is detached from the request so a client disconnect after the verdict
 // does not cancel the restart the next request depends on.
+//
+// Concurrent far-seeks to different positions on one session coalesce onto a
+// single worker that ends at the latest requested segment, so a burst of seeks
+// cannot leave ffmpeg parked at an older position than the player's last one.
+// This mirrors the control plane's TranscodeManager.RestartSegmentAsync.
 func (s *Server) restartSegmentAsync(sessionID string, session *playback.TranscodeSession, segNum int) {
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), restartSegmentAsyncTimeout)
-		defer cancel()
-		target, ok, err := s.restartSegmentLocked(ctx, sessionID, session, segNum)
-		switch {
-		case errors.Is(err, playback.ErrSessionSuperseded):
-			// Routine teardown: the session was stopped or replaced while the
-			// seek restart waited, so nothing was re-spawned.
-			slog.Debug("restart transcode node at missing segment skipped, session superseded (async)",
-				"component", "transcodenode", "segment", segNum, "session", sessionID)
-		case err != nil && !errors.Is(err, playback.ErrManifestNotReady):
-			slog.Warn("restart transcode node at missing segment (async)", "component", "transcodenode", "error", err, "segment", segNum, "session", sessionID)
-			// The scheduled restart never rotated the generation it promised, so
-			// latch the verdict: the next segment request must answer the real
-			// failure instead of stale_generation a second time.
-			session.RecordAsyncRestartFailure(err)
-		case ok:
-			slog.Info("transcode node seek restart", "component", "transcodenode", "segment", segNum,
-				"seek_seconds", target.SeekSeconds, "stream_origin_seconds", target.StreamOriginSeconds,
-				"resolved_start_segment", target.StartSegmentNumber, "session", sessionID)
+	if session == nil {
+		return
+	}
+	s.asyncRestartMu.Lock()
+	if s.asyncRestarts == nil {
+		s.asyncRestarts = make(map[string]*pendingNodeAsyncRestart)
+	}
+	if pending := s.asyncRestarts[sessionID]; pending != nil && pending.session == session {
+		// A restart for this session is already running: record the newest
+		// target and let the worker converge on it.
+		pending.mu.Lock()
+		pending.segNum = segNum
+		pending.mu.Unlock()
+		s.asyncRestartMu.Unlock()
+		return
+	}
+	pending := &pendingNodeAsyncRestart{session: session, segNum: segNum}
+	s.asyncRestarts[sessionID] = pending
+	s.asyncRestartMu.Unlock()
+
+	go s.runRestartSegmentAsync(sessionID, pending)
+}
+
+// runRestartSegmentAsync applies far-seek restarts until the coalesced target
+// stops moving. The decision to leave the loop and the removal of the
+// coalescing entry happen in one critical section (see
+// finishNodeAsyncRestart), so a request landing after the "did the target
+// move?" read but before the removal cannot record a target into an entry that
+// the exiting worker is about to delete.
+func (s *Server) runRestartSegmentAsync(sessionID string, pending *pendingNodeAsyncRestart) {
+	defer func() {
+		s.asyncRestartMu.Lock()
+		if s.asyncRestarts[sessionID] == pending {
+			delete(s.asyncRestarts, sessionID)
 		}
+		s.asyncRestartMu.Unlock()
 	}()
+	for {
+		applied := 0
+		nextTarget := func() int {
+			pending.mu.Lock()
+			defer pending.mu.Unlock()
+			applied = pending.segNum
+			return applied
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), restartSegmentAsyncTimeout)
+		target, ok, err := s.restartSegmentLockedWithTarget(ctx, sessionID, pending.session, nextTarget)
+		cancel()
+		s.recordRestartSegmentOutcome(sessionID, pending.session, applied, target, ok, err)
+
+		// A terminal failure cannot be fixed by a different target on the same
+		// dead generation, so stop rather than loop; the latched verdict is what
+		// the next request answers.
+		if err != nil {
+			return
+		}
+		if s.finishNodeAsyncRestart(sessionID, pending, applied) {
+			return
+		}
+	}
+}
+
+// finishNodeAsyncRestart atomically ends the node's coalescing worker when no
+// newer target arrived while it applied applied. It returns true when the
+// worker should leave the loop, having removed its entry under asyncRestartMu so
+// a request landing immediately after this check starts a fresh worker.
+func (s *Server) finishNodeAsyncRestart(sessionID string, pending *pendingNodeAsyncRestart, applied int) bool {
+	s.asyncRestartMu.Lock()
+	defer s.asyncRestartMu.Unlock()
+	pending.mu.Lock()
+	advanced := pending.segNum != applied
+	pending.mu.Unlock()
+	if advanced {
+		return false
+	}
+	if s.asyncRestarts[sessionID] == pending {
+		delete(s.asyncRestarts, sessionID)
+	}
+	return true
+}
+
+// recordRestartSegmentOutcome logs one coalesced seek restart and latches a
+// terminal failure so the next request surfaces the real verdict instead of a
+// second stale_generation.
+func (s *Server) recordRestartSegmentOutcome(
+	sessionID string,
+	session *playback.TranscodeSession,
+	segNum int,
+	target playback.SegmentRecoveryTarget,
+	ok bool,
+	err error,
+) {
+	switch {
+	case errors.Is(err, playback.ErrSessionSuperseded):
+		// Routine teardown: the session was stopped or replaced while the
+		// seek restart waited, so nothing was re-spawned.
+		slog.Debug("restart transcode node at missing segment skipped, session superseded (async)",
+			"component", "transcodenode", "segment", segNum, "session", sessionID)
+	case err != nil && !errors.Is(err, playback.ErrManifestNotReady):
+		slog.Warn("restart transcode node at missing segment (async)", "component", "transcodenode", "error", err, "segment", segNum, "session", sessionID)
+		// The scheduled restart never rotated the generation it promised, so
+		// latch the verdict: the next segment request must answer the real
+		// failure instead of stale_generation a second time.
+		session.RecordAsyncRestartFailure(err)
+	case ok:
+		slog.Info("transcode node seek restart", "component", "transcodenode", "segment", segNum,
+			"seek_seconds", target.SeekSeconds, "stream_origin_seconds", target.StreamOriginSeconds,
+			"resolved_start_segment", target.StartSegmentNumber, "session", sessionID)
+	}
 }
 
 // restartSegmentAsyncTimeout bounds one detached seek restart on the node so a
