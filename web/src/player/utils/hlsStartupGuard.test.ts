@@ -331,20 +331,53 @@ describe("ManifestLoadCoalescer", () => {
     expect(requests).toEqual(["/queued.m3u8"]);
   });
 
-  it("ignores a completion that names no recorded load", () => {
+  it("ignores an unattributable completion while a superseded load is tracked", () => {
     const requests: string[] = [];
     const coalescer = new ManifestLoadCoalescer((url) => requests.push(url));
 
+    // Two loads are tracked, so the newer one is in flight. A completion that
+    // names neither cannot be attributed to the in-flight load — it could be a
+    // redirect of the superseded load — so it must not settle the newer slot.
     coalescer.begin("/master.m3u8");
+    coalescer.begin("/edge.m3u8");
     expect(coalescer.request("/refetch.m3u8")).toBe(false);
 
-    // A completion for a URL this coalescer never began cannot be attributed to
-    // the load in flight, so it must not settle it.
-    coalescer.settleFor("/other.m3u8");
+    coalescer.settleFor("/redirected.m3u8");
     expect(requests).toEqual([]);
 
-    // The load's own completion still settles it and runs the queued request.
-    coalescer.settleFor("/master.m3u8");
+    // The in-flight load's own completion still settles it and runs the queued
+    // request.
+    coalescer.settleFor("/edge.m3u8");
+    expect(requests).toEqual(["/refetch.m3u8"]);
+  });
+
+  it("settles a redirected manifest so the next request starts instead of queueing", () => {
+    const requests: string[] = [];
+    const coalescer = new ManifestLoadCoalescer((url) => requests.push(url));
+
+    // The load begins under the source URL but hls.js follows an HTTP redirect
+    // and reports the loader's response URL on completion.
+    coalescer.begin("/source.m3u8");
+    coalescer.settleFor("/redirected.m3u8");
+
+    // The redirect completion settled the load it actually finished, so the
+    // coalescer is idle: the next request starts instead of queueing forever
+    // behind a load that already completed.
+    expect(coalescer.request("/next.m3u8")).toBe(true);
+    expect(requests).toEqual(["/next.m3u8"]);
+  });
+
+  it("replays a queued refetch when a redirect renames the completed manifest", () => {
+    const requests: string[] = [];
+    const coalescer = new ManifestLoadCoalescer((url) => requests.push(url));
+
+    coalescer.begin("/source.m3u8");
+    expect(coalescer.request("/refetch.m3u8")).toBe(false);
+    expect(requests).toEqual([]);
+
+    // The completion names the redirect target, not the source the load began
+    // under; it still settles that load and runs the queued refetch once.
+    coalescer.settleFor("/redirected.m3u8");
     expect(requests).toEqual(["/refetch.m3u8"]);
   });
 

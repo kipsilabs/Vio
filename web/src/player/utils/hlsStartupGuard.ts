@@ -213,6 +213,17 @@ export class ManifestLoadCoalescer {
    * Tokens for the loads `begin` adopted, keyed by their normalized URL, so a
    * completion can be matched to the load it finished rather than to whichever
    * load happens to be in flight when the completion arrives.
+   *
+   * A superseded load's entry is deliberately retained after a newer load takes
+   * the slot: if that older load still reports a completion, its URL must stay
+   * attributable so the completion is dropped as stale (see `settle`) instead
+   * of falling through the redirect settlement in `settleFor` and clearing the
+   * newer load. Entries are removed when each URL's completion arrives, when
+   * the URL is the in-flight one that settles, or on `abandon`; a load hls.js
+   * aborted emits no completion, so its entry can outlive it. That leaves one
+   * small entry per distinct manifest URL begun since the last `abandon`, which
+   * is bounded in practice — small, and tiny next to the media buffers — so the
+   * retention is intentional rather than capped.
    */
   private loadsByUrl = new Map<string, number>();
 
@@ -279,13 +290,47 @@ export class ManifestLoadCoalescer {
    * for a load a newer one superseded names that older load and is dropped,
    * instead of being mistaken for the load now in flight. hls.js reports the
    * loader's absolute response URL, which normalization maps to the same key as
-   * the source URL it began under. A completion naming no recorded load is
-   * ignored, so it cannot clear a slot it does not own.
+   * the source URL it began under.
+   *
+   * A completion can also name no recorded load. That is what an HTTP redirect
+   * produces: `MANIFEST_LOADING` carries the source URL the load began under,
+   * while `MANIFEST_LOADED` carries the loader's response URL, which a redirect
+   * replaces. Such a completion is still that load's own and must settle it,
+   * or the coalescer stays busy and queues every later request behind a load
+   * that already finished; `settleRedirected` decides when it is safe to treat
+   * it that way.
    */
   settleFor(url: string): void {
     const token = this.loadsByUrl.get(normalizeManifestUrl(url));
-    if (token === undefined) return;
+    if (token === undefined) {
+      this.settleRedirected();
+      return;
+    }
     this.settle(token);
+  }
+
+  /**
+   * Settles the in-flight load when a completion names no tracked URL yet can
+   * only describe that load.
+   *
+   * The guard is what keeps a stale completion from being mistaken for a
+   * redirected one. It settles only when `loadsByUrl` holds exactly one entry
+   * and that entry is the in-flight load's own begin, so the completion is the
+   * next manifest event after that begin. A superseded load keeps its own
+   * entry, so a completion that could name it (a redirect of an aborted load)
+   * is not treated as this load's; a newer `begin` adds an entry, so a
+   * completion that could belong to it is not either. Tokens are unique and
+   * increasing, so matching the single entry's token to `inFlightToken` proves
+   * the entry came from the begin that adopted the in-flight load. Without the
+   * guard, any unattributable completion would settle whichever load is in
+   * flight, reopening the cross-URL stale-completion hole `settleFor` closes.
+   */
+  private settleRedirected(): void {
+    if (this.inFlightUrl === null || this.loadsByUrl.size !== 1) return;
+    for (const tracked of this.loadsByUrl.values()) {
+      if (tracked !== this.inFlightToken) return;
+    }
+    this.settle(this.inFlightToken);
   }
 
   /**

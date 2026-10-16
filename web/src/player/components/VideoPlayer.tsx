@@ -2538,7 +2538,11 @@ export function VideoPlayer({
             // the player's own manifest loads land in sequence rather than both
             // opening a fetch. A completion is matched to the load it finished
             // by the manifest URL the event carries, so a late completion for a
-            // superseded load cannot clear the slot the current one holds.
+            // superseded load at a different URL cannot clear the slot the
+            // current one holds. A duplicate completion for the same URL is not
+            // distinguished by URL: the protection there is hls.js's contract,
+            // which aborts a superseded request and removes its callbacks so a
+            // superseded load yields at most the one completion it owes.
             const manifestLoads = new ManifestLoadCoalescer((url) => {
               // A replay can land after the transport was torn down (a decode
               // replan destroys the instance without setting `destroyed`), so
