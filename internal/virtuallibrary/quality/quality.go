@@ -814,6 +814,49 @@ func RejectingFormatNames(candidate stream.StreamCandidate, formats []CustomForm
 	return names
 }
 
+// MatchedFormatNames returns the names of the enabled, non-rejecting custom
+// formats whose pattern matches a candidate. A rejecting rule (an explicit
+// Reject flag or a score at/below the discard line) is left out, matching
+// CustomFormatScore's verdict that such a candidate scores zero. The result is
+// ordered score-descending then name-ascending, so the presentation is
+// deterministic regardless of the configured rule order. It is a display-only
+// projection; CustomFormatScore stays the scoring authority and unchanged.
+func MatchedFormatNames(candidate stream.StreamCandidate, formats []CustomFormat) []string {
+	text := customFormatMatchText(candidate)
+	type matchedFormat struct {
+		name  string
+		score int
+	}
+	var matches []matchedFormat
+	for _, format := range formats {
+		if !format.IsEnabled() || !formatMatchesText(format, text) {
+			continue
+		}
+		if format.Reject || format.Score <= discardScoreThreshold {
+			continue
+		}
+		name := strings.TrimSpace(format.Name)
+		if name == "" {
+			continue
+		}
+		matches = append(matches, matchedFormat{name: name, score: format.Score})
+	}
+	if len(matches) == 0 {
+		return nil
+	}
+	sort.SliceStable(matches, func(i, j int) bool {
+		if matches[i].score != matches[j].score {
+			return matches[i].score > matches[j].score
+		}
+		return matches[i].name < matches[j].name
+	})
+	names := make([]string, len(matches))
+	for i, m := range matches {
+		names[i] = m.name
+	}
+	return names
+}
+
 // compileFormatRegex compiles a custom-format regex case-insensitively,
 // mirroring AltMount's regexcache (which prefixes (?i) unless present) so
 // ported TRaSH patterns match release titles regardless of case.

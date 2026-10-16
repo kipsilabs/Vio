@@ -48220,6 +48220,13 @@
             },
             "type": "array"
           },
+          "matched_formats": {
+            "description": "Names of the enabled, non-rejecting custom formats the ranking matched on this candidate, best score first, then name; absent when the row is unscored or matched none",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "multi_episode_end": {
             "format": "int64",
             "type": "integer"
