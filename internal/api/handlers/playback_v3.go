@@ -8607,7 +8607,24 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				(candidateUnchanged ||
 					session.VirtualSubtitleEvidenceSet ||
 					virtualPinnedProfileRowV3(session, currentEffectiveFile))
-			if candidateUnchanged && evidenceComplete && !virtualDecodeRotation {
+			// A seek reanchor replays the frozen recipe verbatim, so the bytes
+			// it continues are the running plan's candidate, not the session's
+			// pin. When the pin has moved since the plan was committed, binding
+			// the pin would pair the replayed descriptor and recipe with a
+			// different release's bytes — the franken-evidence the carry gate
+			// exists to refuse. Bind the plan's own candidate instead, and do it
+			// ahead of the same-row shortcuts so the effective file, the
+			// replayed plan, and the transport all describe one release.
+			seekReanchorCandidate := ""
+			if seekReanchor && record.FrozenRecipe.ValidFor(record.CurrentPlan) {
+				seekReanchorCandidate = strings.TrimSpace(record.CurrentPlan.EffectiveVirtualURI)
+			}
+			if seekReanchorCandidate != "" {
+				planSession := *session
+				planSession.VirtualSourceURI = seekReanchorCandidate
+				currentEffectiveFile = bindSessionVirtualSourceWithTracks(r.Context(), &pinnedFile, &planSession, h.fileResolver)
+				currentEffectiveFile = carryValidatedVirtualVideoEvidenceV3(currentEffectiveFile, record.CurrentPlan.Source)
+			} else if candidateUnchanged && evidenceComplete && !virtualDecodeRotation {
 				currentEffectiveFile.FilePath = session.VirtualSourceURI
 				currentEffectiveFile.VirtualOwnerInstallationID = session.VirtualSourceOwnerInstallationID
 			} else if carryPinnedCandidate {
@@ -10006,6 +10023,13 @@ func seekReanchorIdentityChangesV3(record *playback.AttemptRecordV3, candidate *
 	add("quirks", !sameAppliedQuirksV3(candidate.AppliedQuirks, current.AppliedQuirks))
 	add("runtime_corrections", !sameStringMultisetV3(candidate.RuntimeCorrections, current.RuntimeCorrections))
 	add("claims", candidate.Claims != current.Claims)
+	// A seek reanchor replays the running plan's source binding, so the
+	// candidate may not name a different candidate URI or source descriptor. The
+	// frozen rebuild copies both from record.CurrentPlan, so this only fires on a
+	// future caller that plans a seek from live state instead; it is the source
+	// half of the route-identity guard the other fields already cover.
+	add("effective_virtual_uri", candidate.EffectiveVirtualURI != current.EffectiveVirtualURI)
+	add("source", candidate.Source != current.Source)
 	return changed
 }
 

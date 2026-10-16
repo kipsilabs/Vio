@@ -81,6 +81,23 @@ func TestReplanSameRowBindingMoveDoesNotPairStaleDescriptor(t *testing.T) {
 				t.Fatalf("%s effective virtual URI = %q, want the reopened frozen recipe's %q", tc.slug, response.PlaybackPlan.EffectiveVirtualURI, fx.started.PlaybackPlan.EffectiveVirtualURI)
 			}
 			assertVideoDescriptorRoundTripV3(t, fx.started.PlaybackPlan.Source, response.PlaybackPlan.Source)
+			// The plan metadata above is copied from the frozen recipe, so it
+			// would look coherent even if the transport opened the moved pin.
+			// Prove the execution input too: the session stays bound to the
+			// plan's candidate, and no resolver was handed anything else, so the
+			// bytes the transport serves are the ones the plan describes.
+			session, err := fx.manager.GetSession(fx.started.SessionID)
+			if err != nil {
+				t.Fatalf("GetSession: %v", err)
+			}
+			if session.VirtualSourceURI != response.PlaybackPlan.EffectiveVirtualURI {
+				t.Fatalf("%s session bound %q, want the plan's candidate %q", tc.slug, session.VirtualSourceURI, response.PlaybackPlan.EffectiveVirtualURI)
+			}
+			for _, input := range fx.resolverInputs {
+				if input != fx.pinnedURI {
+					t.Fatalf("%s resolver was handed %q, want only the plan's candidate %q", tc.slug, input, fx.pinnedURI)
+				}
+			}
 		})
 	}
 }
