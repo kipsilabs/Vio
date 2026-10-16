@@ -1560,6 +1560,12 @@ func (r *ReplanRequestV3) Validate() error {
 	return nil
 }
 
+// validateSelectedTrackIdentityV3 bounds a replan-side selected identity. Every
+// negative index is rejected here, including the start-only subtitle off
+// sentinel: unlike a start request, whose -1 overrides a stored "always" mode,
+// a replan expresses "subtitles off" by omitting the identity, so there is no
+// sentinel to admit and the protocol document classifies a negative index on a
+// replan as malformed.
 func validateSelectedTrackIdentityV3(kind string, track *TrackIdentityV3) error {
 	if track == nil {
 		return nil

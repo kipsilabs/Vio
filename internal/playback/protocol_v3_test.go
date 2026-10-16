@@ -860,6 +860,41 @@ func TestReplanRequestV3RejectsInvalidNetworkAndTrackEvidence(t *testing.T) {
 	}
 }
 
+// The start-only subtitle off sentinel (-1) is not meaningful on a replan: an
+// omitted selected_tracks.subtitle already means "subtitles off", so there is
+// nothing for -1 to override and the protocol classifies a negative index as
+// malformed. This pins the intentional asymmetry with the start path, where -1
+// is the explicit override of a stored "always" mode.
+func TestReplanRequestV3TreatsSubtitleOffAsOmissionNotSentinel(t *testing.T) {
+	start := validStartRequestV3()
+	request := ReplanRequestV3{
+		ProtocolVersion:       ProtocolV3,
+		PlaybackAttemptID:     start.PlaybackAttemptID,
+		ReplanRequestID:       "replan-subtitle-off-0001",
+		FailedPlanID:          "plan:subtitle-off-0001",
+		PlanAttemptID:         "plan-attempt-subtitle-off-0001",
+		PlanAttemptKey:        "v3:0000000000000001",
+		AttemptCount:          1,
+		QualityPreference:     start.QualityPreference,
+		Failure:               FailureV3{Classification: "parser_failure"},
+		Capabilities:          start.Capabilities,
+		ClientPlaybackContext: start.ClientPlaybackContext,
+	}
+	if err := request.Validate(); err != nil {
+		t.Fatalf("omitted subtitle identity rejected instead of meaning off: %v", err)
+	}
+
+	negative := SubtitleTrackOffIndexV3
+	request.SelectedTracks.Subtitle = &TrackIdentityV3{Index: &negative}
+	if err := request.Validate(); err == nil {
+		t.Fatal("bare subtitle index -1 was accepted on a replan")
+	}
+	request.SelectedTracks.Subtitle = &TrackIdentityV3{ID: TrackIDV3(42, trackKindSubtitle, 0), Index: &negative}
+	if err := request.Validate(); err == nil {
+		t.Fatal("subtitle index -1 paired with an identity was accepted on a replan")
+	}
+}
+
 func TestPlanIdentityIncludesVideoSampleEntry(t *testing.T) {
 	plan := PlanV3{
 		PlanID:          "plan:sample-entry",
