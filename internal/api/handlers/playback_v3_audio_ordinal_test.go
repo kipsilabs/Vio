@@ -407,6 +407,23 @@ func TestAudioStreamOrdinalV3PlanRoundTripKeepsProtocolDomain(t *testing.T) {
 	}
 }
 
+// TestPlannedAudioTrackIndexV3PrefersCommittedPlanOverFailClosedSession pins the
+// transcode start's index resolution after a verified absence. The session
+// records the fail-closed sentinel -1 when its committed selection vanishes, but
+// the transcode path resolves the audio index through plannedAudioTrackIndexV3,
+// which uses the committed plan's selected array position and only falls back to
+// the session index when the plan carries none. The -1 sentinel therefore never
+// reaches the transport while the plan still names a valid stream.
+func TestPlannedAudioTrackIndexV3PrefersCommittedPlanOverFailClosedSession(t *testing.T) {
+	result := audioOrdinalResultV3(1)
+	if got := plannedAudioTrackIndexV3(result, -1); got != 1 {
+		t.Fatalf("plannedAudioTrackIndexV3(result, -1) = %d, want the committed plan index 1", got)
+	}
+	if got := plannedAudioTrackIndexV3(playback.PlannerResultV3{}, -1); got != -1 {
+		t.Fatalf("plannedAudioTrackIndexV3(empty result, -1) = %d, want the -1 fallback", got)
+	}
+}
+
 // Recovery evidence discipline (round-5 review finding 2): written response
 // headers are not media delivery. The relay explicitly forwards header-only
 // 204/304/416/zero-length 200 responses, so direct-play recovery must require
