@@ -69,13 +69,18 @@ func ClientAudioSignatureMatchesTrack(track models.AudioTrack, sig *userstore.Au
 		return true
 	}
 	// A stated signature language must be carried by the track, as its primary
-	// Language or as any member of its MULTi Languages list, under the same
-	// canonical/regional rank logic the strict matcher uses: "en" matches
-	// "en-US" and the canonical "eng", a bare/placeholder track token stays
-	// neutral rather than matching, and a conflicting script or a different
-	// language still refutes. Regional tags are not conflated by a raw-string
-	// comparison here; langMatchRank's rank ordering does the discrimination.
-	if sig.Language != "" && !trackHasLanguage(track, sig.Language) {
+	// Language or as any member of its MULTi Languages list. Both fields go
+	// through one shared rule (clientSignatureLanguageCarried, delegating to
+	// trackCarriesStatedLanguage), so the same constraint gets the same answer
+	// whichever field expressed it: a bare stated tag ("en") is carried by any
+	// non-conflicting variant ("en-US", the canonical "eng"), a stated tag with
+	// an explicit region or script ("en-US", "zh-Hans") is carried only by the
+	// same region/script or by a bare track tag, and a different explicit region
+	// ("en-US" against an "en-GB"-only track) or a conflicting script ("zh-Hans"
+	// against "zh-Hant") refutes. A stated tag that carries no concrete language
+	// (a bare MULTI/DUAL/und sentinel) is neutral, and a track with no
+	// identifying fields at all has nothing to compare and cannot refute either.
+	if !clientSignatureLanguageCarried(track, sig.Language) {
 		return false
 	}
 	if sig.Title != "" && !trackStringEqual(sig.Title, candidate.Title) {
@@ -120,24 +125,30 @@ func sortedLanguages(languages []string) []string {
 }
 
 // clientSignatureLanguagesCarried reports whether every language a signature
-// states is carried by the track. It is the Languages-member analog of the
-// primary-language path: each stated member is tested against the track with
-// the shared canonical/regional rank discipline instead of an exact set
-// comparison, so a partially enumerated MULTi list is not refuted by a fuller
-// one. A member that states no concrete language (a bare MULTI/DUAL/und
-// sentinel, or an empty entry) carries no constraint and is skipped, exactly as
-// the primary-language path leaves such a token neutral.
+// states is carried by the track. Each stated member is tested with the one
+// shared rule clientSignatureLanguageCarried uses for the primary Language
+// member, so a partially enumerated MULTi list is not refuted by a fuller one.
 func clientSignatureLanguagesCarried(track models.AudioTrack, stated []string) bool {
 	for _, code := range stated {
-		member := strings.TrimSpace(code)
-		if member == "" || unknownLanguageMembership(member) {
-			continue
-		}
-		if !trackCarriesStatedLanguage(track, member) {
+		if !clientSignatureLanguageCarried(track, code) {
 			return false
 		}
 	}
 	return true
+}
+
+// clientSignatureLanguageCarried reports whether one stated signature language
+// member is carried by the track. It is the single rule both the primary
+// Language member and every MULTi Languages member go through: a stated member
+// that carries no concrete language (empty, or a bare MULTI/DUAL/und sentinel)
+// carries no constraint and is neutral; otherwise the member must be carried
+// under trackCarriesStatedLanguage's region/script discipline.
+func clientSignatureLanguageCarried(track models.AudioTrack, stated string) bool {
+	member := strings.TrimSpace(stated)
+	if member == "" || unknownLanguageMembership(member) {
+		return true
+	}
+	return trackCarriesStatedLanguage(track, member)
 }
 
 // trackCarriesStatedLanguage reports whether the track carries one stated

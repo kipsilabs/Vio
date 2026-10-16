@@ -410,3 +410,75 @@ func probeStampPtr(t *testing.T) *time.Time {
 	t.Helper()
 	return &invalidationProbeStamp
 }
+
+// TestReconcileFromCommittedIgnoresUncommittedInventory pins the boundary the
+// verified-empty refusal depends on: only a durable evidence write that actually
+// committed a verified inventory may reconcile. A probe that failed or returned
+// an incomplete enumeration commits nothing (its carrier has fileID 0), so it can
+// never land as a verified-empty inventory and must record no reconcile decision.
+func TestReconcileFromCommittedIgnoresUncommittedInventory(t *testing.T) {
+	verified := &models.MediaFile{
+		ID:             7,
+		FilePath:       "virtual://episode/partial-signature",
+		AudioTracks:    []models.AudioTrack{{Index: 0, Codec: "aac", Channels: 2}},
+		ProbeUpdatedAt: probeStampPtr(t),
+	}
+	f := newExplicitReconcileFixture(t, verified)
+	// A failed/partial probe produces no committed carrier (fileID 0).
+	f.handler.reconcileVerifiedDefaultAudioFromCommitted(context.Background(), virtualCommittedProbeInventory{})
+
+	after, err := f.handler.PlanStoreV3.GetAttempt(context.Background(), f.session.ID)
+	if err != nil {
+		t.Fatalf("get attempt: %v", err)
+	}
+	if len(after.AudioReconcileLedger.Entries) != 0 {
+		t.Fatalf("an uncommitted (failed/partial) probe must record no reconcile decision, got %+v", after.AudioReconcileLedger.Entries)
+	}
+}
+
+// TestReconcileEmptyInventoryRefusalDoesNotSuppressPopulatedGeneration carries
+// the verified-empty case through recovery: an empty verified inventory records a
+// durable refusal under its own generation, and a later populated probe is a new
+// generation that is re-evaluated (the selection is now present, so a no-op). The
+// earlier refusal stays in the ledger and suppresses nothing.
+func TestReconcileEmptyInventoryRefusalDoesNotSuppressPopulatedGeneration(t *testing.T) {
+	verified := &models.MediaFile{
+		ID:       7,
+		FilePath: "virtual://episode/partial-signature",
+		AudioTracks: []models.AudioTrack{{
+			Index: 0, Language: "ja", Codec: "aac", Channels: 2, Layout: "stereo",
+			Title: "[Erai-raws]_AAC_CR", EmbeddedTitle: "[Erai-raws]_AAC_CR", Default: true,
+		}},
+		ProbeUpdatedAt: probeStampPtr(t),
+	}
+	f := newExplicitReconcileFixture(t, verified)
+
+	// A durable write commits a verified inventory with zero audio tracks: the
+	// committed selection cannot be present, so the refusal is recorded.
+	committed := virtualCommittedProbeInventory{fileID: verified.ID, candidateURI: verified.FilePath}
+	f.handler.reconcileVerifiedDefaultAudioFromCommitted(context.Background(), committed)
+
+	emptyGeneration := reconcileGenerationV3(&models.MediaFile{})
+	afterEmpty, err := f.handler.PlanStoreV3.GetAttempt(context.Background(), f.session.ID)
+	if err != nil {
+		t.Fatalf("get attempt after empty reconcile: %v", err)
+	}
+	if entry := playback.FindAudioReconcileEntry(afterEmpty.AudioReconcileLedger, emptyGeneration, f.session.ID); entry == nil || entry.Decision != playback.AudioReconcileRefused {
+		t.Fatalf("a verified-empty inventory must record the explicit refusal, got %+v", entry)
+	}
+
+	// A later probe populates the same row. Its probe stamp is a new generation,
+	// so the earlier refusal must not suppress it: the selection is present and
+	// the generation settles as a no-op.
+	populatedGeneration := reconcileGenerationV3(verified)
+	if populatedGeneration == emptyGeneration {
+		t.Fatal("a populated probe generation must differ from the empty-inventory generation")
+	}
+	afterPopulated := f.verify(t)
+	if entry := playback.FindAudioReconcileEntry(afterPopulated.AudioReconcileLedger, populatedGeneration, f.session.ID); entry == nil || entry.Decision != playback.AudioReconcileNoop {
+		t.Fatalf("the populated generation must be re-evaluated to a present no-op, got %+v", entry)
+	}
+	if entry := playback.FindAudioReconcileEntry(afterPopulated.AudioReconcileLedger, emptyGeneration, f.session.ID); entry == nil {
+		t.Fatal("the earlier empty-inventory refusal must remain in the ledger, not be overwritten")
+	}
+}
