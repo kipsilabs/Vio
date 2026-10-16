@@ -6,7 +6,6 @@ import {
   HLS_STARTUP_TIMEOUT_MS,
   HlsStartupGuard,
   ManifestLoadCoalescer,
-  isManifestLoadError,
   isStaleGenerationError,
   recoverFromStaleGeneration,
 } from "./hlsStartupGuard";
@@ -120,21 +119,6 @@ describe("recoverFromStaleGeneration", () => {
 
     expect(recoverFromStaleGeneration(host, 12)).toBe(false);
     expect(host.loadSource).not.toHaveBeenCalled();
-  });
-});
-
-describe("isManifestLoadError", () => {
-  it("recognizes hls.js's manifest-scoped failures", () => {
-    for (const details of ["manifestLoadError", "manifestLoadTimeOut", "manifestParsingError"]) {
-      expect(isManifestLoadError({ details })).toBe(true);
-    }
-  });
-
-  it("leaves a fragment error holding the in-flight manifest load", () => {
-    expect(isManifestLoadError({ details: "fragLoadError" })).toBe(false);
-    expect(isManifestLoadError({ details: "bufferAppendError" })).toBe(false);
-    expect(isManifestLoadError(null)).toBe(false);
-    expect(isManifestLoadError({})).toBe(false);
   });
 });
 
@@ -265,10 +249,63 @@ describe("ManifestLoadCoalescer", () => {
     const requests: string[] = [];
     const coalescer = new ManifestLoadCoalescer((url) => requests.push(url));
 
-    coalescer.begin("/master.m3u8");
+    const token = coalescer.begin("/master.m3u8");
     coalescer.request("/refetch.m3u8");
-    coalescer.settle();
-    coalescer.settle();
+    coalescer.settle(token);
+    // A duplicate completion for the superseded load is dropped; it must not
+    // replay the refetch a second time or clear the load it started.
+    coalescer.settle(token);
     expect(requests).toEqual(["/refetch.m3u8"]);
+
+    // A request raised after the duplicate still queues behind the replayed
+    // load instead of starting a second concurrent one.
+    expect(coalescer.request("/late.m3u8")).toBe(false);
+    expect(requests).toEqual(["/refetch.m3u8"]);
+  });
+
+  it("cannot clear the active replacement when a superseded load settles again", () => {
+    const requests: string[] = [];
+    const coalescer = new ManifestLoadCoalescer((url) => requests.push(url));
+
+    // A is in flight and B queues behind it.
+    const tokenA = coalescer.begin("/master.m3u8");
+    expect(coalescer.request("/refetch.m3u8")).toBe(false);
+    expect(requests).toEqual([]);
+
+    // A completes: B starts and holds the slot.
+    coalescer.settle(tokenA);
+    expect(requests).toEqual(["/refetch.m3u8"]);
+
+    // A second completion for A carries a stale token, so it must not clear
+    // B's slot and let a later request run concurrently with it.
+    coalescer.settle(tokenA);
+    expect(coalescer.request("/later.m3u8")).toBe(false);
+    expect(requests).toEqual(["/refetch.m3u8"]);
+
+    // B settling runs the queued request exactly once.
+    coalescer.settle();
+    expect(requests).toEqual(["/refetch.m3u8", "/later.m3u8"]);
+  });
+
+  it("charges a queued refetch when it replays, so queue/settle cycles count each start", () => {
+    const requests: string[] = [];
+    let recoveries = 0;
+    const coalescer = new ManifestLoadCoalescer((url) => requests.push(url));
+    const refetch = () =>
+      coalescer.request("/master.m3u8", () => {
+        recoveries++;
+      });
+
+    // Each cycle queues a refetch behind an in-flight load and settles it: the
+    // charge hook runs when the replay actually starts, not when it queues.
+    for (let cycle = 0; cycle < 3; cycle++) {
+      coalescer.begin("/master.m3u8");
+      expect(refetch()).toBe(false);
+      expect(recoveries).toBe(cycle);
+      coalescer.settle();
+    }
+
+    expect(recoveries).toBe(3);
+    expect(requests).toEqual(["/master.m3u8", "/master.m3u8", "/master.m3u8"]);
   });
 });

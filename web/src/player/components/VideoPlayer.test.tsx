@@ -3299,9 +3299,9 @@ describe("VideoPlayer stale generation recovery", () => {
     expect(onPlanFailure).not.toHaveBeenCalled();
   });
 
-  it("coalesces a stale-generation refetch raised during an in-flight manifest load", async () => {
-    // The manifest request the transport already has open does not settle, so a
-    // stale-generation fence on a segment arrives while it is still in flight.
+  it("starts the refetch immediately when the fatal fence tore down the manifest load", async () => {
+    // hls.js calls stopLoad() for a fatal error, destroying the manifest loader
+    // that was still open. The fence therefore must not queue behind it.
     hlsJS.holdManifestLoad = true;
     const onPlanFailure = vi.fn();
     renderPlayer({
@@ -3318,17 +3318,11 @@ describe("VideoPlayer stale generation recovery", () => {
       hlsJS.errorHandler?.("error", staleSegfault());
     });
 
-    // No second concurrent manifest request: the refetch is queued behind the
-    // in-flight load instead of racing it.
-    expect(hlsJS.loadSource).not.toHaveBeenCalled();
-    expect(onPlanFailure).not.toHaveBeenCalled();
-
-    // Once the in-flight load settles, the queued refetch runs exactly once.
-    act(() => {
-      hlsJS.latest?.emit("hlsManifestLoaded", { url: transcodeStreamUrl });
-    });
+    // The refetch starts now instead of waiting for a MANIFEST_LOADED the
+    // fatal error removed.
     expect(hlsJS.loadSource).toHaveBeenCalledTimes(1);
     expect(hlsJS.loadSource.mock.calls[0]?.[0]).toContain("master.m3u8");
+    expect(onPlanFailure).not.toHaveBeenCalled();
   });
 
   it("releases the held manifest load a fatal fragment error tore down", async () => {
@@ -3372,7 +3366,7 @@ describe("VideoPlayer stale generation recovery", () => {
     expect(hlsJS.loadSource.mock.calls[0]?.[0]).toContain("master.m3u8");
   });
 
-  it("does not replay a queued refetch into the instance a decode replan destroyed", async () => {
+  it("does not replay a refetch into the instance a decode replan destroyed", async () => {
     hlsJS.holdManifestLoad = true;
     const onPlanFailure = vi.fn();
     renderPlayer({
@@ -3384,14 +3378,14 @@ describe("VideoPlayer stale generation recovery", () => {
     await waitFor(() => expect(hlsJS.errorHandler).toBeTypeOf("function"));
     hlsJS.loadSource.mockClear();
 
-    // A stale-generation refetch queues behind the held manifest load.
+    // The stale-generation fence starts its refetch now: the fatal error tore
+    // the held manifest load down, so nothing is queued behind it.
     act(() => {
       hlsJS.errorHandler?.("error", staleSegfault());
     });
-    expect(hlsJS.loadSource).not.toHaveBeenCalled();
+    expect(hlsJS.loadSource).toHaveBeenCalledTimes(1);
 
-    // A decode verdict on a fragment destroys the transport. It is not a
-    // manifest-scoped error, so nothing settles the held load.
+    // A decode verdict on a fragment destroys the transport.
     act(() => {
       hlsJS.errorHandler?.("error", {
         fatal: true,
@@ -3404,15 +3398,15 @@ describe("VideoPlayer stale generation recovery", () => {
     });
     expect(onPlanFailure).toHaveBeenCalledTimes(1);
 
-    // A late MANIFEST_LOADED must not replay the queued refetch into the
-    // destroyed instance.
+    // A late MANIFEST_LOADED must not start another load in the destroyed
+    // instance.
     act(() => {
       hlsJS.latest?.emit("hlsManifestLoaded", { url: transcodeStreamUrl });
     });
-    expect(hlsJS.loadSource).not.toHaveBeenCalled();
+    expect(hlsJS.loadSource).toHaveBeenCalledTimes(1);
   });
 
-  it("drops a queued refetch when a window-edge refetch supersedes it", async () => {
+  it("does not add a redundant load when a window-edge refetch supersedes the recovery", async () => {
     hlsJS.holdManifestLoad = true;
     renderPlayer({
       plan: hlsTranscodePlan(),
@@ -3422,27 +3416,27 @@ describe("VideoPlayer stale generation recovery", () => {
     await waitFor(() => expect(hlsJS.errorHandler).toBeTypeOf("function"));
     hlsJS.loadSource.mockClear();
 
-    // A stale-generation refetch queues behind the held manifest load.
+    // The stale-generation fence starts its refetch immediately.
     act(() => {
       hlsJS.errorHandler?.("error", staleSegfault());
     });
-    expect(hlsJS.loadSource).not.toHaveBeenCalled();
+    expect(hlsJS.loadSource).toHaveBeenCalledTimes(1);
 
-    // The window-edge refetch issues its own loadSource for a newer URL.
+    // The window-edge refetch issues its own loadSource for a newer URL and
+    // takes over as the in-flight load.
     act(() => {
       hlsJS.latest?.loadSource("/api/v2/playback/transcode/session-1/master.m3u8?edge=1");
     });
-    expect(hlsJS.loadSource).toHaveBeenCalledTimes(1);
+    expect(hlsJS.loadSource).toHaveBeenCalledTimes(2);
 
-    // Settling the newer load must not replay the superseded recovery, which
-    // would be a third redundant load resumed at a stale position.
+    // Settling the newer load must not run another redundant recovery load.
     act(() => {
       hlsJS.latest?.emit("hlsManifestLoaded", { url: transcodeStreamUrl });
     });
-    expect(hlsJS.loadSource).toHaveBeenCalledTimes(1);
+    expect(hlsJS.loadSource).toHaveBeenCalledTimes(2);
   });
 
-  it("replays one refetch across duplicate MANIFEST_LOADED events", async () => {
+  it("keeps one refetch across duplicate MANIFEST_LOADED events", async () => {
     hlsJS.holdManifestLoad = true;
     renderPlayer({
       plan: hlsTranscodePlan(),
@@ -3455,6 +3449,8 @@ describe("VideoPlayer stale generation recovery", () => {
     act(() => {
       hlsJS.errorHandler?.("error", staleSegfault());
     });
+    // The refetch is already in flight; a duplicate completion for it must not
+    // replay it and start a second load.
     act(() => {
       hlsJS.latest?.emit("hlsManifestLoaded", { url: transcodeStreamUrl });
       hlsJS.latest?.emit("hlsManifestLoaded", { url: transcodeStreamUrl });

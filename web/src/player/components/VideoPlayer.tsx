@@ -53,7 +53,6 @@ import {
   HlsStartupGuard,
   MAX_STALE_GENERATION_RECOVERIES,
   ManifestLoadCoalescer,
-  isManifestLoadError,
   isStaleGenerationError,
   recoverFromStaleGeneration,
 } from "../utils/hlsStartupGuard";
@@ -2533,13 +2532,12 @@ export function VideoPlayer({
 
             // One manifest load at a time. The transport init, the not-ready
             // pollback and the stale-generation recovery each call loadSource,
-            // and a stale-generation fence on a segment is independent of the
-            // manifest request hls.js already has open: without serializing
-            // them, that recovery opens a second concurrent request for the same
-            // playlist and the superseded one is held to completion — the paired
-            // manifest load whose `receive` the server never produced. The
-            // coalescer keys off hls.js's manifest lifecycle and replays a
-            // superseded request once the in-flight load settles.
+            // and they can overlap with a manifest request hls.js already has
+            // open. The coalescer keys off hls.js's manifest lifecycle and
+            // replays a superseded request once the in-flight load settles, so
+            // the player's own manifest loads land in sequence rather than both
+            // opening a fetch.
+            let manifestLoadToken: number | undefined;
             const manifestLoads = new ManifestLoadCoalescer((url) => {
               // A replay can land after the transport was torn down (a decode
               // replan destroys the instance without setting `destroyed`), so
@@ -2549,20 +2547,23 @@ export function VideoPlayer({
             });
             activeManifestLoads = manifestLoads;
             hls.on(Hls.Events.MANIFEST_LOADING, (_event, data: { url?: string }) => {
-              manifestLoads.begin(data?.url ?? hls?.url ?? "");
+              manifestLoadToken = manifestLoads.begin(data?.url ?? hls?.url ?? "");
             });
             hls.on(Hls.Events.MANIFEST_LOADED, () => {
-              manifestLoads.settle();
+              manifestLoads.settle(manifestLoadToken);
             });
 
             hls.on(Hls.Events.ERROR, (_event, data) => {
               if (!data.fatal || destroyed) return;
 
-              // A fatal manifest error ends the manifest request hls.js had
-              // open. A fragment error does not, so the coalescer keeps holding
-              // that in-flight load through a stale-generation fence and queues
-              // the refetch behind it instead of racing it.
-              if (isManifestLoadError(data)) manifestLoads.settle();
+              // hls.js's error controller calls stopLoad() for every fatal
+              // error, destroying the playlist loaders — including any manifest
+              // request still open — without emitting MANIFEST_LOADED or a
+              // manifest-scoped error. Release the aborted load before any
+              // branch decides how to recover, so a refetch raised a moment
+              // later starts instead of queueing behind a load that will never
+              // settle.
+              manifestLoads.abandon();
 
               console.error("[hls.js] Fatal error:", {
                 type: data.type,
@@ -2654,21 +2655,20 @@ export function VideoPlayer({
               // redirect, not a transport failure.
               if (data.type === Hls.ErrorTypes.NETWORK_ERROR && isStaleGenerationError(data)) {
                 if (hls && staleGenerationRecoveriesRef.current < MAX_STALE_GENERATION_RECOVERIES) {
-                  let refetchStarted = false;
                   const recovered = recoverFromStaleGeneration(
                     hls,
                     video.currentTime,
                     (url, applyResume) => {
-                      refetchStarted = manifestLoads.request(url, applyResume);
+                      // Charge the budget where the load actually starts, so a
+                      // refetch that replays after an in-flight load settles
+                      // still counts and the cap cannot be bypassed by queueing.
+                      manifestLoads.request(url, () => {
+                        applyResume();
+                        staleGenerationRecoveriesRef.current++;
+                      });
                     },
                   );
                   if (recovered) {
-                    // Only a refetch that actually starts consumes the budget.
-                    // One coalesced behind a manifest load already in flight
-                    // replays when that load settles, so counting each fence
-                    // while it waits would exhaust the cap without a single
-                    // refetch.
-                    if (refetchStarted) staleGenerationRecoveriesRef.current++;
                     console.warn("[hls.js] Segment generation is stale; refetching playlist", {
                       details: data.details,
                       url: data.frag?.url ?? data.url,
@@ -2682,21 +2682,16 @@ export function VideoPlayer({
               if (now - lastRecoveryRef.current < 3000) return;
               lastRecoveryRef.current = now;
 
-              // Every fatal error here tore the manifest load down: hls.js
-              // stops the request it had open without a manifest-scoped event
-              // (`MANIFEST_LOADED` or a `manifest*` error). Release the
-              // coalescer's in-flight slot — replaying any queued recovery —
-              // before recovering or destroying, so a later request cannot
-              // queue behind a load that will never settle. The handled
-              // branches above (not-ready poll-back, decode replan,
-              // stale-generation refetch) return early and keep their slot.
+              // The fatal error already released the aborted manifest load
+              // above. Every branch that recovers or destroys below is free of a
+              // stale in-flight slot, so a later request cannot queue behind a
+              // load that will never settle.
               if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
                 const canRecoverStartup =
                   hlsStartupGuardRef.current?.handleFatalNetworkError() ?? true;
                 if (canRecoverStartup && networkRecoveryAttemptsRef.current < 3) {
                   networkRecoveryAttemptsRef.current++;
                   console.warn("[hls.js] Fatal network error, attempting recovery...");
-                  manifestLoads.settle();
                   hls?.startLoad();
                 } else {
                   console.error(
@@ -2718,11 +2713,9 @@ export function VideoPlayer({
               } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
                 if (mediaRecoveryAttemptsRef.current === 0) {
                   console.warn("[hls.js] Fatal media error, attempting recovery...");
-                  manifestLoads.settle();
                   hls?.recoverMediaError();
                 } else if (mediaRecoveryAttemptsRef.current === 1) {
                   console.warn("[hls.js] Fatal media error (2nd), swapping audio codec...");
-                  manifestLoads.settle();
                   hls?.swapAudioCodec();
                   hls?.recoverMediaError();
                 } else {

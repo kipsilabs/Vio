@@ -113,18 +113,6 @@ export interface StaleGenerationRecoveryHost {
 }
 
 /**
- * Reports whether an hls.js error ended the manifest load rather than a
- * fragment or media load. hls.js names manifest-scoped failures with a
- * `manifest` prefix (`manifestLoadError`, `manifestLoadTimeOut`,
- * `manifestParsingError`, …) and settles the manifest request either way. A
- * fragment error carries its own `fragLoadError` detail and does not mean a
- * concurrent manifest load finished, so it must not release the coalescer.
- */
-export function isManifestLoadError(carrier: { details?: unknown } | null | undefined): boolean {
-  return typeof carrier?.details === "string" && carrier.details.startsWith("manifest");
-}
-
-/**
  * Recovers hls.js from the server's stale-generation fence on a segment URL.
  *
  * The failing segment URI carried an `sgen` token minted against an FFmpeg
@@ -176,69 +164,86 @@ export function recoverFromStaleGeneration(
 /**
  * Serializes the manifest (re)loads one hls.js transport issues.
  *
- * `hls.js`'s `loadSource()` restarts the manifest fetch, and the player can
- * raise it from three places that overlap: the transport init, the not-ready
- * pollback, and the stale-generation recovery. When a request lands while an
- * earlier manifest load is still in flight — a stale-generation fence on a
- * segment is independent of the manifest request hls.js already has open —
- * issuing `loadSource()` again leaves two concurrent requests for the same
- * playlist: the fresh one supersedes the old, and the abandoned request is held
- * to completion. That is the paired manifest load in the playback HAR, where
- * one copy shows a long `receive` the server never produced.
- *
+ * The player raises a manifest load from three places that overlap: the
+ * transport init, the not-ready pollback, and the stale-generation recovery.
  * The coalescer keys off hls.js's own manifest lifecycle: the player calls
- * `begin` on `MANIFEST_LOADING` and `settle` on `MANIFEST_LOADED` or a
- * manifest-scoped fatal error, and routes every manifest load through
- * `request`. A request raised while one is in flight is remembered and replayed
- * once, after the in-flight load settles, so the recovery still happens without
- * a second concurrent request.
+ * `begin` on `MANIFEST_LOADING` and `settle` on `MANIFEST_LOADED`, and routes
+ * every manifest load through `request`. A request raised while one is in
+ * flight is remembered and replayed once, after the in-flight load settles, so
+ * overlapping requests land in sequence instead of both opening a fetch.
  *
- * An in-flight load is only ever released by hls.js's own manifest events, so a
- * transport that hls.js abandons without those events (a decode replan or an
- * exhausted recovery that destroys it) must call `abandon`; otherwise the slot
- * stays set with no load open and every later `request` queues behind a load
- * that will never settle.
+ * This governs the manifest requests the player itself issues; it does not
+ * claim to fix level-load concurrency. hls.js's own `loadSource()` calls
+ * `stopLoad()` first and its playlist loader ignores a matching ongoing
+ * request, so a repeated `loadSource()` for the same URL does not by itself
+ * leave a second fetch open. The paired manifest load seen in the playback HAR
+ * — one copy showing a long `receive` the server never produced — was
+ * attributed to an external interceptor on the session in the PR discussion;
+ * that attribution is not established here.
+ *
+ * A fatal error is different: hls.js's error controller calls `stopLoad()` for
+ * every fatal error, destroying the playlist loaders — including any manifest
+ * request still open — without emitting `MANIFEST_LOADED` or a manifest-scoped
+ * error. A transport that takes over recovery from a fatal error must
+ * therefore `abandon` the load hls.js tore down; otherwise the slot stays set
+ * with no load open and every later `request` queues behind a load that will
+ * never settle.
  */
 export class ManifestLoadCoalescer {
   private inFlightUrl: string | null = null;
+  private inFlightToken = 0;
+  private nextToken = 0;
   private pending: (() => void) | null = null;
 
   constructor(private readonly load: (url: string) => void) {}
 
   /**
-   * Marks the start of an hls.js manifest load (`MANIFEST_LOADING`). An empty
-   * URL names no load, so it is ignored rather than marking the coalescer busy
-   * with a load that has no URL to settle against.
+   * Marks the start of an hls.js manifest load (`MANIFEST_LOADING`) and returns
+   * a token identifying it, so its completion can be matched to it. An empty
+   * URL names no load, so it is ignored (no token) rather than marking the
+   * coalescer busy with a load that has no URL to settle against.
    *
    * A `begin` for a URL other than the one the coalescer has in flight is a
    * load the coalescer did not issue (the window-edge refetch). That newer load
    * supersedes any queued recovery, which would otherwise replay after it; drop
    * the queued one and adopt the newer load as in flight.
    */
-  begin(url: string): void {
-    if (url === "") return;
+  begin(url: string): number | undefined {
+    if (url === "") return undefined;
     if (this.pending !== null && url !== this.inFlightUrl) {
       this.pending = null;
     }
     this.inFlightUrl = url;
+    this.inFlightToken = ++this.nextToken;
+    return this.inFlightToken;
   }
 
-  /** Marks the end of an hls.js manifest load (`MANIFEST_LOADED` or a fatal manifest error). */
-  settle(): void {
+  /**
+   * Marks the end of an hls.js manifest load (`MANIFEST_LOADED`). Pass the
+   * token `begin` returned for that load so a late or duplicate completion for
+   * a superseded load cannot clear the slot a newer load now holds; omit it
+   * only to settle whatever is currently in flight.
+   */
+  settle(token?: number): void {
+    if (token !== undefined && token !== this.inFlightToken) return;
+
     const pending = this.pending;
     if (this.inFlightUrl === null && pending === null) return;
     this.inFlightUrl = null;
-    this.pending = null;
+    this.inFlightToken = 0;
     pending?.();
   }
 
   /**
    * Releases the in-flight and queued loads without replaying either. A
    * torn-down transport calls this so a destroyed instance cannot hold a queued
-   * recovery behind a load that will never settle.
+   * recovery behind a load that will never settle; the fatal-error handler also
+   * calls it because hls.js tears the manifest loader down for every fatal
+   * error without a manifest event.
    */
   abandon(): void {
     this.inFlightUrl = null;
+    this.inFlightToken = 0;
     this.pending = null;
   }
 
@@ -246,7 +251,8 @@ export class ManifestLoadCoalescer {
    * Issues a manifest load, or queues it behind the one already in flight.
    * `beforeStart`, when supplied, runs when the load actually starts — now, or
    * when a queued load replays — so a recovery's resume position cannot shift a
-   * load that is already in flight. Returns true when the request started
+   * load that is already in flight, and a budget charged there counts every
+   * start, including a replayed one. Returns true when the request started
    * immediately, false when it was coalesced into the in-flight load.
    */
   request(url: string, beforeStart?: () => void): boolean {
@@ -264,6 +270,7 @@ export class ManifestLoadCoalescer {
 
   private start(url: string): void {
     this.inFlightUrl = url;
+    this.inFlightToken = ++this.nextToken;
     this.load(url);
   }
 }
