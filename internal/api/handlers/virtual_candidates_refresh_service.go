@@ -107,6 +107,7 @@ type VirtualCandidatesDetailReader interface {
 // provider failure is retryable and never destructive: the persisted rows are
 // only replaced by a successful fresh listing.
 type VirtualCandidatesRefreshService struct {
+	ListCached VirtualPlaybackStreamLister
 	// ListFresh force-lists provider candidates for one virtual source path.
 	ListFresh VirtualPlaybackStreamLister
 	// Persist replaces the stored candidates for one source row; it is the same
@@ -130,13 +131,31 @@ type VirtualCandidatesRefreshService struct {
 const virtualURIScheme = "virtual"
 
 func (s *VirtualCandidatesRefreshService) RefreshVirtualCandidates(ctx context.Context, userID int, profileID, contentID string, filter catalog.AccessFilter) ([]catalog.FileVersion, error) {
-	if s == nil || s.ListFresh == nil || s.Persist == nil || s.Detail == nil {
+	if s == nil {
+		return nil, apiError(http.StatusServiceUnavailable, "unavailable", "Virtual candidate refresh is unavailable")
+	}
+	return s.listVirtualCandidates(ctx, userID, profileID, contentID, filter, s.ListFresh, "refresh:")
+}
+
+func (s *VirtualCandidatesRefreshService) DiscoverVirtualCandidates(ctx context.Context, userID int, profileID, contentID string, filter catalog.AccessFilter) ([]catalog.FileVersion, error) {
+	if s == nil {
+		return nil, apiError(http.StatusServiceUnavailable, "unavailable", "Virtual candidate discovery is unavailable")
+	}
+	return s.listVirtualCandidates(ctx, userID, profileID, contentID, filter, s.ListCached, "discover:")
+}
+
+func (s *VirtualCandidatesRefreshService) listVirtualCandidates(ctx context.Context, userID int, profileID, contentID string, filter catalog.AccessFilter, lister VirtualPlaybackStreamLister, keyPrefix string) ([]catalog.FileVersion, error) {
+	if lister == nil || s.Persist == nil || s.Detail == nil {
 		return nil, apiError(http.StatusServiceUnavailable, "unavailable", "Virtual candidate refresh is unavailable")
 	}
 	// The pre-refresh read validates the target and the caller's access through
 	// the same path the version list uses.
-	if _, err := s.Detail.WatchDetail(ctx, userID, profileID, contentID, filter); err != nil {
+	before, err := s.Detail.WatchDetail(ctx, userID, profileID, contentID, filter)
+	if err != nil {
 		return nil, err
+	}
+	if keyPrefix == "discover:" && (before == nil || (before.Type != itemTypeMovie && before.Type != itemTypeEpisode)) {
+		return nil, apiError(http.StatusUnprocessableEntity, "validation_failed", "Select a movie or an individual episode to discover versions.")
 	}
 	sources, err := s.virtualSources(ctx, contentID)
 	if err != nil {
@@ -146,7 +165,7 @@ func (s *VirtualCandidatesRefreshService) RefreshVirtualCandidates(ctx context.C
 		return nil, apiError(http.StatusUnprocessableEntity, "validation_failed", "The item has no virtual candidates to refresh.")
 	}
 	for _, source := range sources {
-		key := virtualSourceRefreshKey(source)
+		key := keyPrefix + virtualSourceRefreshKey(source)
 		// Do not bind the shared work to the first caller's context: a client
 		// disconnect must not cancel the provider re-list (or strand a
 		// coalesced waiter on a canceled context). The shared work runs under
@@ -155,7 +174,7 @@ func (s *VirtualCandidatesRefreshService) RefreshVirtualCandidates(ctx context.C
 		// own cancellation while waiting via the select below.
 		workCtx := context.WithoutCancel(ctx)
 		refreshCh := s.flight.DoChan(key, func() (any, error) {
-			_, err := s.refreshSource(workCtx, source, userID, profileID)
+			_, err := s.listSource(workCtx, source, userID, profileID, lister)
 			return nil, err
 		})
 		var refreshRes singleflight.Result
@@ -249,12 +268,16 @@ func (s *VirtualCandidatesRefreshService) RefreshSources(ctx context.Context, co
 // refreshSource force-lists one virtual source group and persists the result,
 // returning the persisted streams so the caller can reuse the listing.
 func (s *VirtualCandidatesRefreshService) refreshSource(ctx context.Context, source *models.MediaFile, userID int, profileID string) ([]VirtualPlaybackStream, error) {
+	return s.listSource(ctx, source, userID, profileID, s.ListFresh)
+}
+
+func (s *VirtualCandidatesRefreshService) listSource(ctx context.Context, source *models.MediaFile, userID int, profileID string, lister VirtualPlaybackStreamLister) ([]VirtualPlaybackStream, error) {
 	if source == nil {
 		return nil, nil
 	}
 	listCtx, cancel := context.WithTimeout(ctx, virtualCandidatesRefreshTimeout)
 	defer cancel()
-	streams, err := s.ListFresh.ListVirtualPlaybackStreams(
+	streams, err := lister.ListVirtualPlaybackStreams(
 		listCtx, source.FilePath, userID, profileID, source.VirtualOwnerInstallationID,
 	)
 	if err != nil {

@@ -51,6 +51,49 @@ func refreshTestDetail() *catalog.WatchDetail {
 	}}}
 }
 
+func TestVirtualCandidatesDiscoveryUsesCacheAndPreservesFailures(t *testing.T) {
+	for _, kind := range []string{"movie", "episode", "series"} {
+		for _, unavailable := range []bool{false, true} {
+			listed, persisted := 0, 0
+			detail := refreshTestDetail()
+			detail.Type = kind
+			service := &VirtualCandidatesRefreshService{
+				Detail: &fakeRefreshDetail{detail: detail},
+				ListCached: VirtualPlaybackStreamListerFunc(func(context.Context, string, int, string, int) ([]VirtualPlaybackStream, error) {
+					listed++
+					if unavailable {
+						return nil, errors.New("provider unavailable")
+					}
+					return []VirtualPlaybackStream{{ID: "candidate", URI: "virtual://movie/x?result=candidate"}}, nil
+				}),
+				ListFresh: VirtualPlaybackStreamListerFunc(func(context.Context, string, int, string, int) ([]VirtualPlaybackStream, error) {
+					t.Fatal("discovery forced a provider refresh")
+					return nil, nil
+				}),
+				ContentFiles: func(context.Context, string) ([]*models.MediaFile, error) {
+					return []*models.MediaFile{refreshTestSource(7, "movie:x", "virtual://movie/x")}, nil
+				},
+				Persist: func(context.Context, *models.MediaFile, []VirtualPlaybackStream) error {
+					persisted++
+					return nil
+				},
+			}
+			_, err := service.DiscoverVirtualCandidates(context.Background(), 1, "profile", "movie:x", catalog.AccessFilter{})
+			if kind == "series" {
+				if err == nil || listed != 0 || persisted != 0 {
+					t.Fatalf("whole series discovery: err=%v listed=%d persisted=%d", err, listed, persisted)
+				}
+			} else if unavailable {
+				if err == nil || listed != 1 || persisted != 0 {
+					t.Fatalf("failed discovery: err=%v listed=%d persisted=%d", err, listed, persisted)
+				}
+			} else if err != nil || listed != 1 || persisted != 1 {
+				t.Fatalf("discovery: err=%v listed=%d persisted=%d", err, listed, persisted)
+			}
+		}
+	}
+}
+
 // TestVirtualCandidatesRefreshServiceRefreshesAndReturnsList covers the happy
 // path: the item's virtual source group is force-listed, persisted through the
 // candidate sink with the provider-neutral source row, and the post-refresh

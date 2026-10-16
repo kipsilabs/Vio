@@ -33,6 +33,7 @@ type VirtualLibraryCapabilities struct {
 	IndexerRequest              bool `json:"indexer_request"`
 	RefreshPrunesDeadCandidates bool `json:"refresh_prunes_dead_candidates"`
 	WaitForImports              bool `json:"wait_for_imports"`
+	DiscoverBeforePlayback      bool `json:"discover_before_playback"`
 }
 
 type VirtualLibraryCapabilitiesOutput struct {
@@ -45,7 +46,7 @@ type VirtualLibraryCapabilitiesOutput struct {
 func registerVirtualLibraryCapabilities(reg *Registry) {
 	Register(reg, Operation{Operation: humaOp(http.MethodGet, Prefix+"/capabilities/virtual-library", "getVirtualLibraryCapabilities", "watch",
 		"Discover whether indexer search and provider release requests are available."), Class: ClassProfileScoped, ProfileOptional: true, ServiceBacked: true},
-		func(_ context.Context, _ *CapabilityInput) (*VirtualLibraryCapabilitiesOutput, error) {
+		func(ctx context.Context, _ *CapabilityInput) (*VirtualLibraryCapabilitiesOutput, error) {
 			indexerSearch, indexerRequest := false, false
 			prunes := false
 			waits := false
@@ -55,7 +56,8 @@ func registerVirtualLibraryCapabilities(reg *Registry) {
 				waits = reg.deps.VirtualLibraryStatus.WaitForImports()
 			}
 			state := StateNotConfigured
-			if indexerSearch || indexerRequest {
+			discover := reg.deps.VirtualCandidatesDiscovery != nil && reg.deps.PreplayDiscoveryEnabled != nil && reg.deps.PreplayDiscoveryEnabled(ctx)
+			if indexerSearch || indexerRequest || discover {
 				state = StateAvailable
 			}
 			return &VirtualLibraryCapabilitiesOutput{Body: VirtualLibraryCapabilities{
@@ -64,6 +66,7 @@ func registerVirtualLibraryCapabilities(reg *Registry) {
 				IndexerRequest:              indexerRequest,
 				RefreshPrunesDeadCandidates: prunes,
 				WaitForImports:              waits,
+				DiscoverBeforePlayback:      discover,
 			}}, nil
 		})
 }

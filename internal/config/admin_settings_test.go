@@ -31,6 +31,9 @@ func TestEffectiveAdminSettingsUsesRuntimeDefaults(t *testing.T) {
 	if got := effective["playback.max_virtual_failover_attempts"]; got != "5" {
 		t.Fatalf("playback.max_virtual_failover_attempts = %q, want 5", got)
 	}
+	if got := effective["virtual_library.discover_before_playback"]; got != "false" {
+		t.Fatalf("pre-play discovery default = %q, want false", got)
+	}
 	if got := effective["theme.catalog_url"]; got != DefaultThemeCatalogURL {
 		t.Fatalf("theme.catalog_url = %q, want %q", got, DefaultThemeCatalogURL)
 	}

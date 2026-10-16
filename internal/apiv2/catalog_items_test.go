@@ -254,6 +254,139 @@ func catalogDeps(t *testing.T) (Dependencies, *fakeCatalog) {
 	return deps, fake
 }
 
+type fakePreplayCatalog struct {
+	*fakeCatalog
+	detail        catalogpkg.ItemDetail
+	reads         int
+	discoveries   int
+	discoveryErr  error
+	reloadErr     error
+	discoveryView handlers.ItemViewer
+	discoveryUser int
+	discoveryID   string
+	bounded       bool
+}
+
+func (fake *fakePreplayCatalog) ItemDetail(_ context.Context, viewer handlers.ItemViewer, _ string) (*catalogpkg.ItemDetail, error) {
+	fake.reads++
+	if fake.err != nil {
+		return nil, fake.err
+	}
+	if fake.reads > 1 && fake.reloadErr != nil {
+		return nil, fake.reloadErr
+	}
+	fake.lastViewer = viewer
+	detail := fake.detail
+	return &detail, nil
+}
+
+func (fake *fakePreplayCatalog) DiscoverVirtualCandidates(ctx context.Context, userID int, profileID, contentID string, access catalogpkg.AccessFilter) ([]catalogpkg.FileVersion, error) {
+	fake.discoveries++
+	fake.discoveryView = handlers.ItemViewer{ProfileID: profileID, Access: access}
+	fake.discoveryUser, fake.discoveryID = userID, contentID
+	_, fake.bounded = ctx.Deadline()
+	if fake.discoveryErr != nil {
+		return nil, fake.discoveryErr
+	}
+	fake.detail.Versions = []catalogpkg.FileVersion{{FileID: 121, FilePath: "virtual://movie/tt0113277?result=candidate", Resolution: "2160p", AddedAt: fixedTime()}}
+	return fake.detail.Versions, nil
+}
+
+type fakePreplayWatch struct {
+	*fakeWatch
+	catalog *fakePreplayCatalog
+}
+
+func (fake *fakePreplayWatch) ContextAccessFilter(ctx context.Context, opts handlers.AccessFilterOptions) (catalogpkg.AccessFilter, error) {
+	return fake.catalog.ContextAccessFilter(ctx, opts)
+}
+
+func (fake *fakePreplayWatch) WatchDetail(ctx context.Context, _ int, profileID, contentID string, access catalogpkg.AccessFilter) (*catalogpkg.WatchDetail, error) {
+	detail, err := fake.catalog.ItemDetail(ctx, handlers.ItemViewer{ProfileID: profileID, Access: access}, contentID)
+	if err != nil {
+		return nil, err
+	}
+	return &catalogpkg.WatchDetail{ContentID: detail.ContentID, Type: detail.Type, Versions: detail.Versions}, nil
+}
+
+func TestDetailPreplayDiscovery(t *testing.T) {
+	for _, endpoint := range []string{"catalog/items", "watch"} {
+		for _, test := range []struct {
+			name        string
+			mediaType   string
+			path        string
+			disabled    bool
+			unwired     bool
+			denied      bool
+			discoverErr error
+			reloadErr   error
+			wantCalls   int
+			wantReads   int
+			wantFileID  string
+		}{
+			{name: "movie", mediaType: "movie", path: "virtual://movie/tt0113277", wantCalls: 1, wantReads: 2, wantFileID: "121"},
+			{name: "episode", mediaType: "episode", path: "virtual://series/tvdb/393159/1/2", wantCalls: 1, wantReads: 2, wantFileID: "121"},
+			{name: "disabled", mediaType: "movie", path: "virtual://movie/tt0113277", disabled: true, wantReads: 1, wantFileID: "120"},
+			{name: "unwired", mediaType: "movie", path: "virtual://movie/tt0113277", unwired: true, wantReads: 1, wantFileID: "120"},
+			{name: "local", mediaType: "movie", path: "/media/movie.mkv", wantReads: 1, wantFileID: "120"},
+			{name: "series", mediaType: "series", path: "virtual://series/tt123", wantReads: 1, wantFileID: "120"},
+			{name: "season", mediaType: "season", path: "virtual://series/tt123/1", wantReads: 1, wantFileID: "120"},
+			{name: "failure", mediaType: "movie", path: "virtual://movie/tt0113277", discoverErr: errors.New("provider failed"), wantCalls: 1, wantReads: 1, wantFileID: "120"},
+			{name: "timeout", mediaType: "episode", path: "virtual://series/tt123/1/2", discoverErr: context.DeadlineExceeded, wantCalls: 1, wantReads: 1, wantFileID: "120"},
+			{name: "reload failure", mediaType: "movie", path: "virtual://movie/tt0113277", reloadErr: errors.New("reload failed"), wantCalls: 1, wantReads: 2, wantFileID: "120"},
+			{name: "denied", mediaType: "movie", path: "virtual://movie/tt0113277", denied: true, wantReads: 1},
+		} {
+			if endpoint == "catalog/items" {
+				test.wantCalls = 0
+				test.wantReads = 1
+				test.wantFileID = "120"
+			}
+			t.Run(endpoint+"/"+test.name, func(t *testing.T) {
+				deps, base := catalogDeps(t)
+				fake := &fakePreplayCatalog{
+					fakeCatalog: base, discoveryErr: test.discoverErr, reloadErr: test.reloadErr,
+					detail: catalogpkg.ItemDetail{ContentID: "movie:heat-1995", Type: test.mediaType,
+						Versions: []catalogpkg.FileVersion{{FileID: 120, FilePath: test.path, AddedAt: fixedTime()}}},
+				}
+				if test.denied {
+					fake.err = notFoundItem()
+				}
+				deps.CatalogItems = fake
+				deps.Watch = &fakePreplayWatch{fakeWatch: &fakeWatch{}, catalog: fake}
+				if !test.unwired {
+					deps.VirtualCandidatesDiscovery = fake
+				}
+				deps.PreplayDiscoveryEnabled = func(context.Context) bool { return !test.disabled }
+				rec := do(t, newTestHandler(t, deps), http.MethodGet,
+					"/api/v2/"+endpoint+"/movie:heat-1995?library_id=2&file_id=120", "", viewerHeaders())
+				if test.denied {
+					requireProblem(t, rec, TypeNotFound)
+				} else {
+					if rec.Code != http.StatusOK {
+						t.Fatal(rec.Body.String())
+					}
+					var body struct {
+						Versions []struct {
+							FileID string `json:"file_id"`
+						} `json:"versions"`
+					}
+					decodeJSON(t, rec.Body, &body)
+					if len(body.Versions) != 1 || body.Versions[0].FileID != test.wantFileID {
+						t.Fatalf("versions = %+v", body.Versions)
+					}
+				}
+				if fake.discoveries != test.wantCalls || fake.reads != test.wantReads {
+					t.Fatalf("discoveries = %d, reads = %d", fake.discoveries, fake.reads)
+				}
+				if test.wantCalls > 0 && (!fake.bounded || !reflect.DeepEqual(fake.discoveryView, fake.lastViewer) ||
+					fake.discoveryUser != fake.lastViewer.Access.UserID || fake.discoveryID != fake.detail.ContentID) {
+					t.Fatalf("discovery viewer = %+v, detail viewer = %+v, bounded = %v", fake.discoveryView, fake.lastViewer, fake.bounded)
+				}
+			})
+		}
+	}
+}
+
 func TestListCatalogItems(t *testing.T) {
 	deps, fake := catalogDeps(t)
 	h := newTestHandler(t, deps)

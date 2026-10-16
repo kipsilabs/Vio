@@ -1,5 +1,18 @@
 import { fetchWithSession } from "@/api/client";
 
+export async function discoverVirtualCandidates(
+  mediaId: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  const { res } = await fetchWithSession(
+    `/api/v2/media/${encodeURIComponent(mediaId)}/virtual-candidates:discover`,
+    { method: "POST", headers: { Accept: "application/json" }, signal },
+  );
+  if (!res.ok) {
+    throw new Error(`Discovering versions failed (${res.status}).`);
+  }
+}
+
 /**
  * Asks the server to re-list a title's video candidates.
  *

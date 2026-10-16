@@ -335,6 +335,7 @@ var householdGateExemptOperations = map[string]string{
 	// Virtual candidate jobs are owner/installation-scoped and run under the
 	// caller's access filter, so they stay usable without a picked profile.
 	"refreshVirtualCandidates":       "owner-scoped async re-list job",
+	"discoverVirtualCandidates":      "access-checked provider discovery without a playback session",
 	"cancelVirtualCandidatesRefresh": "owner-scoped async re-list job",
 	"requestVirtualRelease":          "owner-scoped provider release request",
 }

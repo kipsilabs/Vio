@@ -3,6 +3,7 @@ package apiv2
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strconv"
 
@@ -362,6 +363,14 @@ func (reg *Registry) getWatchState(ctx context.Context, in *WatchDetailInput) (*
 	detail, err := reg.deps.Watch.WatchDetail(ctx, claims.UserID, profileFrom(ctx), string(in.ID), filter)
 	if err != nil {
 		return nil, watchDetailProblem(err)
+	}
+	if detail != nil && reg.discoverDetailVersions(ctx, string(in.ID), detail.Type, detail.Versions, filter, "watch_detail") {
+		refreshed, refreshErr := reg.deps.Watch.WatchDetail(ctx, claims.UserID, profileFrom(ctx), string(in.ID), filter)
+		if refreshErr == nil && refreshed != nil {
+			detail = refreshed
+		} else {
+			slog.WarnContext(ctx, "pre-play version discovery detail reload failed", "component", "apiv2", "item_id", in.ID, "trigger", "watch_detail")
+		}
 	}
 	body := watchDetailOf(detail)
 	body.IndexerReleases = reg.indexerReleasesFor(ctx, string(in.ID))
