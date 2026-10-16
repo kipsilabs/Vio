@@ -135,6 +135,57 @@ func TestStartRequestV3DropsRotatedOutSelectedTrackIdentities(t *testing.T) {
 	}
 }
 
+// The stale-identity drop clears both id and index, so the structural checks
+// must run before it. Otherwise a subtitle id paired with a negative index other
+// than the off sentinel (-2), or the off sentinel (-1) paired with an id, would
+// become a plain omission and — under a stored "always" subtitle mode — silently
+// auto-select subtitles. Same-file, stale-file, and malformed ids must all be
+// rejected regardless of the index, and only a stale positive selection may
+// still degrade to the default pipeline.
+func TestStartRequestV3RejectsMalformedTrackPairBeforeStaleDrop(t *testing.T) {
+	identities := []struct {
+		name string
+		id   string
+	}{
+		{"same-file", TrackIDV3(42, trackKindSubtitle, 0)},
+		{"stale-file", TrackIDV3(9999, trackKindSubtitle, 0)},
+		{"malformed", "not-a-track-id"},
+	}
+	for _, index := range []int{SubtitleTrackOffIndexV3, SubtitleTrackOffIndexV3 - 1} {
+		for _, identity := range identities {
+			req := validStartRequestV3()
+			idx := index
+			req.SubtitleTrackIndex = &idx
+			req.SubtitleTrackID = identity.id
+			if err := req.ValidateSelectedTrackStructureV3(); err == nil {
+				t.Errorf("%s subtitle id with index %d passed the pre-drop structural check", identity.name, index)
+			}
+			if _, err := req.NormalizeAndValidate(); err == nil {
+				t.Errorf("%s subtitle id with index %d was accepted", identity.name, index)
+			}
+		}
+	}
+
+	// Audio has no off sentinel, so a negative index is malformed there too, and
+	// a stale audio id must not mask it.
+	negative := -2
+	req := validStartRequestV3()
+	req.AudioTrackIndex = &negative
+	req.AudioTrackID = TrackIDV3(req.FileID+9999, "audio", 0)
+	if _, err := req.NormalizeAndValidate(); err == nil {
+		t.Fatal("stale audio id with a negative index was accepted")
+	}
+
+	// The legitimate stale positive selection still degrades rather than failing.
+	positive := 0
+	req = validStartRequestV3()
+	req.SubtitleTrackIndex = &positive
+	req.SubtitleTrackID = TrackIDV3(req.FileID+9999, trackKindSubtitle, positive)
+	if _, err := req.NormalizeAndValidate(); err != nil {
+		t.Fatalf("stale positive subtitle identity did not degrade: %v", err)
+	}
+}
+
 func TestDropStaleSelectedTrackIdentitiesV3(t *testing.T) {
 	req := validStartRequestV3()
 	req.AudioTrackID = TrackIDV3(req.FileID, "audio", 0)
@@ -4661,5 +4712,39 @@ func TestPlanPlaybackV3DroppingFallbackHistoryReintroducesRejectedRoute(t *testi
 	if replanned.Plan.Delivery != DeliveryOriginalHTTPV3 ||
 		replanned.Plan.Stream.Protocol != StreamHTTPProgressiveV3 || replanned.Plan.Stream.Container != "mp4" {
 		t.Fatalf("reintroduced route = %#v", replanned.Plan)
+	}
+}
+
+// TestNormalizeAndValidateV3ExplicitSubtitleOff pins the additive explicit-off
+// encoding: subtitle_track_index = -1 is accepted and names no track, while
+// omission stays "no selection intent". Other negatives and the same sentinel
+// on audio remain invalid, and an off index cannot be paired with an identity.
+func TestNormalizeAndValidateV3ExplicitSubtitleOff(t *testing.T) {
+	off := -1
+	req := validStartRequestV3()
+	req.SubtitleTrackIndex = &off
+	if _, err := req.NormalizeAndValidate(); err != nil {
+		t.Fatalf("explicit subtitle off rejected: %v", err)
+	}
+
+	req = validStartRequestV3()
+	req.SubtitleTrackIndex = &off
+	req.SubtitleTrackID = TrackIDV3(req.FileID, "subtitle", 0)
+	if _, err := req.NormalizeAndValidate(); err == nil {
+		t.Fatal("explicit off combined with a subtitle identity was accepted")
+	}
+
+	req = validStartRequestV3()
+	audioOff := -1
+	req.AudioTrackIndex = &audioOff
+	if _, err := req.NormalizeAndValidate(); err == nil {
+		t.Fatal("negative audio index was accepted")
+	}
+
+	req = validStartRequestV3()
+	minusTwo := -2
+	req.SubtitleTrackIndex = &minusTwo
+	if _, err := req.NormalizeAndValidate(); err == nil {
+		t.Fatal("subtitle index -2 was accepted")
 	}
 }
