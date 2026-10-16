@@ -154,7 +154,7 @@ func (s *VirtualCandidatesRefreshService) listVirtualCandidates(ctx context.Cont
 	if err != nil {
 		return nil, err
 	}
-	if keyPrefix == "discover:" && (before == nil || (before.Type != "movie" && before.Type != "episode")) {
+	if keyPrefix == "discover:" && (before == nil || (before.Type != "movie" && before.Type != itemTypeEpisode)) {
 		return nil, apiError(http.StatusUnprocessableEntity, "validation_failed", "Select a movie or an individual episode to discover versions.")
 	}
 	sources, err := s.virtualSources(ctx, contentID)
