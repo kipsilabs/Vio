@@ -329,7 +329,10 @@ func TestVerifyExplicitAudioSelectionGenuineAbsenceStaysRecoverable(t *testing.T
 	}
 
 	// The client's own recovery replan commits a fresh selection and clears the
-	// marker: that is what proves the session is recoverable, not stuck.
+	// marker: that is what proves the session is recoverable, not stuck. This is
+	// the session-manager commit seam; for the same recovery driven all the way
+	// through the transport (409 -> commit -> served media), see
+	// TestVirtualAudioSelectionInvalidRecoveryServesMedia.
 	if err := manager.UpdateAudioTrack(live.ID, 0, playback.PlayDirect); err != nil {
 		t.Fatalf("recovery replan update: %v", err)
 	}

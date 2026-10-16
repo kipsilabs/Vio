@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -85,6 +87,16 @@ func TestDeferredProbeOverlayRemovedOrAmbiguousCommittedAudioFailsClosed(t *test
 				{Index: 0, Language: "eng", Codec: "aac", Channels: 2, Layout: "stereo"},
 			},
 			wantCarried: 2,
+		},
+		{
+			name: "committed selection absent from a verified-empty inventory",
+			plan: []models.AudioTrack{
+				{Index: 1, Language: "en", Codec: "aac", Channels: 2, Layout: "stereo"},
+				{Index: 3, Language: "pt", Codec: "eac3", Channels: 6, Layout: "5.1"},
+			},
+			committed:   1,
+			verified:    nil,
+			wantCarried: 0,
 		},
 	}
 	for _, tc := range cases {
@@ -401,5 +413,141 @@ func TestVirtualAudioSelectionInvalidClearsOnStreamStateCommit(t *testing.T) {
 	}
 	if recovered.AudioTrackIndex != 0 {
 		t.Fatalf("recovered audio index = %d, want 0", recovered.AudioTrackIndex)
+	}
+}
+
+// TestVirtualAudioSelectionInvalidRecoveryServesMedia closes the fail-closed
+// chain at the transport, which the marker-only recovery tests never reach: a
+// virtual remux whose committed audio selection is absent from the verified
+// inventory answers the retryable 409, and once the client's recovery replan
+// commits an acceptable replacement through the same stream-state apply the v3
+// replan performs (replaceSession -> UpdateStreamState), the same transport
+// serves media instead of the error. The verified-empty inventory — the probe
+// committed that the file carries no audio at all — is the other variant.
+func TestVirtualAudioSelectionInvalidRecoveryServesMedia(t *testing.T) {
+	cases := []struct {
+		name     string
+		verified []models.AudioTrack
+	}{
+		{
+			name:     "removed committed track",
+			verified: []models.AudioTrack{{Index: 1, Language: "en", Codec: "aac", Channels: 2, Layout: "stereo"}},
+		},
+		{
+			name:     "verified-empty inventory",
+			verified: nil,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte("media-bytes"))
+			}))
+			defer upstream.Close()
+
+			pinned := "virtual://movie/tt-recovery-serve?result=cand-a"
+			file := &models.MediaFile{
+				ID:                         4312,
+				ContentID:                  "movie-recovery-serve",
+				FilePath:                   pinned,
+				CodecVideo:                 "h264",
+				VideoTracks:                []models.VideoTrack{{Codec: "h264"}},
+				VirtualOwnerInstallationID: 5,
+			}
+			manager := playback.NewSessionManager(0, 0)
+			session, err := manager.StartSession(1, "profile-1", file.ID, playback.PlayRemux, false)
+			if err != nil {
+				t.Fatalf("StartSession: %v", err)
+			}
+			if err := manager.SetVirtualSource(session.ID, pinned, 5); err != nil {
+				t.Fatalf("SetVirtualSource: %v", err)
+			}
+			t.Cleanup(func() { _ = manager.StopSession(session.ID) })
+
+			plan := []models.AudioTrack{
+				{Index: 1, Language: "en", Codec: "aac", Channels: 2, Layout: "stereo"},
+				{Index: 3, Language: "pt", Codec: "eac3", Channels: 6, Layout: "5.1"},
+			}
+			if err := manager.UpdateStreamState(session.ID, playback.SessionStreamState{
+				PlayMethod:                    playback.PlayRemux,
+				BasePlayMethod:                playback.PlayRemux,
+				AudioTrackIndex:               1, // pt
+				VirtualSourceSet:              true,
+				VirtualSourceOwnershipSet:     true,
+				VirtualSourceURI:              pinned,
+				VirtualSubtitleEvidenceSet:    true,
+				VirtualAudioTracks:            plan,
+				VirtualSubtitleEvidenceURI:    pinned,
+				VirtualSubtitleEvidenceFileID: file.ID,
+			}); err != nil {
+				t.Fatalf("UpdateStreamState: %v", err)
+			}
+			binding, err := manager.VirtualSourceBinding(session.ID)
+			if err != nil {
+				t.Fatalf("VirtualSourceBinding: %v", err)
+			}
+			if applied, err := manager.SetVirtualProbeVerifiedInventoryIfBinding(session.ID, binding, "rev", tc.verified, nil, nil); err != nil || !applied {
+				t.Fatalf("SetVirtualProbeVerifiedInventoryIfBinding = %v, %v; want applied", applied, err)
+			}
+			invalid, err := manager.GetSession(session.ID)
+			if err != nil {
+				t.Fatalf("GetSession: %v", err)
+			}
+			if !invalid.VirtualAudioSelectionInvalid || invalid.AudioTrackIndex != -1 {
+				t.Fatalf("fixture not invalid: index=%d invalid=%v", invalid.AudioTrackIndex, invalid.VirtualAudioSelectionInvalid)
+			}
+
+			// The transport fails closed before serving anything.
+			assertStreamAudioSelectionRejected(t, manager, testPlaybackFileResolver{file: file}, session.ID, pinned)
+
+			// The client's recovery replan commits an acceptable replacement. The
+			// v3 replan applies the fresh plan's stream state through this same
+			// manager seam, which installs the selection and clears the marker.
+			recoveredTracks := []models.AudioTrack{{Index: 1, Language: "en", Codec: "aac", Channels: 2, Layout: "stereo"}}
+			if err := manager.UpdateStreamState(session.ID, playback.SessionStreamState{
+				PlayMethod:                    playback.PlayRemux,
+				BasePlayMethod:                playback.PlayRemux,
+				AudioTrackIndex:               0,
+				VirtualSourceOwnershipSet:     true,
+				VirtualSourceURI:              pinned,
+				VirtualSubtitleEvidenceSet:    true,
+				VirtualAudioTracks:            recoveredTracks,
+				VirtualSubtitleEvidenceURI:    pinned,
+				VirtualSubtitleEvidenceFileID: file.ID,
+			}); err != nil {
+				t.Fatalf("recovery commit: %v", err)
+			}
+			live, err := manager.GetSession(session.ID)
+			if err != nil {
+				t.Fatalf("GetSession after recovery: %v", err)
+			}
+			if live.VirtualAudioSelectionInvalid || live.AudioTrackIndex != 0 {
+				t.Fatalf("recovery did not install a valid selection: index=%d invalid=%v", live.AudioTrackIndex, live.VirtualAudioSelectionInvalid)
+			}
+
+			// The same transport now serves media instead of the 409.
+			serveHandler := NewStreamHandler(manager, testPlaybackFileResolver{file: file})
+			serveHandler.AllowPrivateStreams = func(int) bool { return true }
+			serveHandler.VirtualCandidateTrustWindow = func() time.Duration { return 720 * time.Hour }
+			ffmpeg := filepath.Join(t.TempDir(), "ffmpeg")
+			if err := os.WriteFile(ffmpeg, []byte("#!/bin/sh\nprintf served-media\n"), 0o700); err != nil {
+				t.Fatalf("write fake ffmpeg: %v", err)
+			}
+			serveHandler.PlaybackConfig = func() config.PlaybackConfig {
+				return config.PlaybackConfig{FFmpegPath: ffmpeg}
+			}
+			serveHandler.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(context.Context, string, int, int, string, bool, []string, string) (ResolvedVirtualMedia, error) {
+				return ResolvedVirtualMedia{URL: upstream.URL, URI: pinned, CandidateID: "cand-a"}, nil
+			})
+
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/stream/"+session.ID, nil)
+			req = req.WithContext(newAuthorizedPlaybackContext())
+			req = withPlaybackRouteParam(req, "session_id", session.ID)
+			serveHandler.HandleStream(rec, req)
+			if rec.Code != http.StatusOK || rec.Body.Len() == 0 {
+				t.Fatalf("post-recovery delivery = %d %q, want 200 with media bytes", rec.Code, rec.Body.String())
+			}
+		})
 	}
 }

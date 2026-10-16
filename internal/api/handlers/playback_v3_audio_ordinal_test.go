@@ -389,6 +389,100 @@ func TestPrepareRemoteTransportV3AudioTrackIndexIsAudioOnlyOrdinal(t *testing.T)
 	}
 }
 
+// TestPrepareRemoteTransportV3ResolvesCommittedAudioAfterRemovalOrReorder drives
+// the real remote transcode-start request from the fail-closed state a verified
+// absence leaves behind (session index -1) and proves the ordinal sent to the
+// node still names the intended audio, not merely the helper's return value.
+// Two shapes are covered: a committed selection whose track was removed from the
+// session index while the plan still names it, and a verified inventory whose
+// array order is reversed relative to the absolute container stream order, where
+// an array-position ordinal would point at the other stream.
+func TestPrepareRemoteTransportV3ResolvesCommittedAudioAfterRemovalOrReorder(t *testing.T) {
+	reordered := func(t *testing.T) *models.MediaFile {
+		t.Helper()
+		file := v3HandlerFixtureFile(t)
+		// Array order is the reverse of stream order: the French stream (Index 3)
+		// sits at array 0, so array position no longer equals the ffmpeg ordinal.
+		file.AudioTracks = []models.AudioTrack{
+			{Index: 3, Language: "fra", Codec: "aac", Channels: 2, Layout: "stereo"},
+			{Index: 1, Language: "eng", Codec: "aac", Channels: 2, Layout: "stereo", Default: true},
+		}
+		return file
+	}
+	cases := []struct {
+		name         string
+		file         *models.MediaFile
+		planIndex    int
+		wantOrdinal  int
+		wantLanguage string
+	}{
+		{
+			name:         "removed track: the committed plan index survives the -1 session sentinel",
+			file:         audioOrdinalFixtureFileV3(t),
+			planIndex:    1, // the French track at stream 3
+			wantOrdinal:  1,
+			wantLanguage: "fra",
+		},
+		{
+			name:         "reordered inventory: the plan index maps through the absolute stream index",
+			file:         reordered(t),
+			planIndex:    0, // the French track, now at array position 0
+			wantOrdinal:  1,
+			wantLanguage: "fra",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var got transcodenode.TranscodeStartRequest
+			node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodPost && r.URL.Path == "/transcode/start":
+					if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+						t.Errorf("decode remote start: %v", err)
+					}
+					writeJSON(w, http.StatusAccepted, transcodenode.TranscodeStartResponse{SessionID: got.SessionID, Status: "started"})
+				default:
+					w.WriteHeader(http.StatusNoContent)
+				}
+			}))
+			defer node.Close()
+
+			handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+			handler.JWTSecret = "test-secret"
+			result := audioOrdinalResultV3(tc.planIndex)
+			// The verified absence marked the session's own selection invalid; the
+			// committed plan is the surviving identity, so the -1 sentinel must not
+			// reach the node.
+			session := &playback.Session{ID: "session-audio-ordinal-recovery", UserID: 7, ProfileID: "profile-1", AudioTrackIndex: -1}
+			transport, transportErr := handler.prepareRemoteTransportV3(
+				httptest.NewRequest(http.MethodPost, "/", nil),
+				session, tc.file, result,
+				nodepool.Plan{TranscodeNode: &nodepool.Node{URL: node.URL}}, preparedTimelineV3{}, mediaAuthModeV3{},
+			)
+			if transportErr != nil {
+				t.Fatalf("prepare remote transport: %v (cause: %v)", transportErr, transportErr.cause)
+			}
+			defer transport.rollback()
+			if got.AudioTrackIndex != tc.wantOrdinal {
+				t.Fatalf("remote AudioTrackIndex = %d, want %d (the %s stream)", got.AudioTrackIndex, tc.wantOrdinal, tc.wantLanguage)
+			}
+			if engIndex := trackIndexByLanguage(tc.file.AudioTracks, "eng"); engIndex >= 0 &&
+				audioStreamOrdinalV3(tc.file, engIndex) == got.AudioTrackIndex {
+				t.Fatalf("resolved ordinal %d names the English stream, not the intended %s stream", got.AudioTrackIndex, tc.wantLanguage)
+			}
+		})
+	}
+}
+
+func trackIndexByLanguage(tracks []models.AudioTrack, language string) int {
+	for i, track := range tracks {
+		if track.Language == language {
+			return i
+		}
+	}
+	return -1
+}
+
 // TestAudioStreamOrdinalV3PlanRoundTripKeepsProtocolDomain verifies the plan's
 // SelectedTracks.Audio.Index round-trip stays in the array-position domain:
 // plannedAudioTrackIndexV3 returns the plan's stored index verbatim, and only

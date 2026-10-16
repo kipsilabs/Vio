@@ -304,6 +304,54 @@ func TestClientAudioSignatureMatchesTrackLanguage(t *testing.T) {
 	}
 }
 
+// TestClientAudioSignatureMatchesTrackUnknownTrackLanguageIsNeutral pins the
+// other side of the non-refutation contract: a track that never stated a
+// concrete language has not contradicted the signature's stated language, so an
+// empty language, "und", and a bare MULTI/DUAL sentinel with no member list are
+// all missing evidence rather than a refutation. A stated different language and
+// a conflicting script still refute (see the language matrix above), and a
+// concrete different language in a MULTi list still refutes too.
+func TestClientAudioSignatureMatchesTrackUnknownTrackLanguageIsNeutral(t *testing.T) {
+	cases := []struct {
+		name  string
+		track models.AudioTrack
+		sig   *userstore.AudioTrackSignature
+	}{
+		{
+			name:  "empty language with populated codec and channels",
+			track: models.AudioTrack{Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Language: "en", Codec: "aac", Channels: 2},
+		},
+		{
+			name:  "undetermined language with populated codec and channels",
+			track: models.AudioTrack{Language: "und", Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Language: "en", Codec: "aac", Channels: 2},
+		},
+		{
+			name:  "bare MULTI sentinel with no member list",
+			track: models.AudioTrack{Language: "mul", Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Language: "en", Codec: "aac", Channels: 2},
+		},
+		{
+			name:  "bare DUAL sentinel with no member list",
+			track: models.AudioTrack{Language: "dual", Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Language: "en", Codec: "aac", Channels: 2},
+		},
+		{
+			name:  "sentinel primary with only sentinel members states nothing",
+			track: models.AudioTrack{Language: "mul", Languages: []string{"und"}, Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Language: "en", Codec: "aac", Channels: 2},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if !ClientAudioSignatureMatchesTrack(tc.track, tc.sig) {
+				t.Fatalf("ClientAudioSignatureMatchesTrack(%+v, %+v) = false, want true: an unstated track-side language is missing evidence, not a contradiction", tc.track, tc.sig)
+			}
+		})
+	}
+}
+
 // TestClientAudioSignatureMatchesTrackRegionalRuleMatrix pins the ONE regional
 // rule the predicate applies to both language fields. The primary Language
 // member and every MULTi Languages member must be carried under the same

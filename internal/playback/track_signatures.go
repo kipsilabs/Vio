@@ -78,7 +78,10 @@ func ClientAudioSignatureMatchesTrack(track models.AudioTrack, sig *userstore.Au
 	// same region/script or by a bare track tag, and a different explicit region
 	// ("en-US" against an "en-GB"-only track) or a conflicting script ("zh-Hans"
 	// against "zh-Hant") refutes. A stated tag that carries no concrete language
-	// (a bare MULTI/DUAL/und sentinel) is neutral, and a track with no
+	// (a bare MULTI/DUAL/und sentinel) is neutral, and a track that never stated
+	// a concrete language (empty, "und", or a bare MULTI/DUAL sentinel with no
+	// member list — including one that otherwise carries codec and channels) is
+	// missing evidence: it cannot refute a stated language. A track with no
 	// identifying fields at all has nothing to compare and cannot refute either.
 	if !clientSignatureLanguageCarried(track, sig.Language) {
 		return false
@@ -162,12 +165,34 @@ func clientSignatureLanguageCarried(track models.AudioTrack, stated string) bool
 func trackCarriesStatedLanguage(track models.AudioTrack, stated string) bool {
 	rank := trackLanguageRank(track, stated)
 	if rank < 0 {
-		return false
+		// Non-refutation is symmetric: a track that never stated a concrete
+		// language (empty, "und", or a bare MULTI/DUAL sentinel with no member
+		// list) has not contradicted the stated language, so its silence is
+		// missing evidence, not a mismatch. Only a track that stated a concrete
+		// but different language refutes.
+		return !trackStatesConcreteLanguage(track)
 	}
 	if strings.Contains(lang.CompatibleTag(stated), "-") {
 		return rank <= lang.RankBareLanguage
 	}
 	return rank < lang.RankScriptConflict
+}
+
+// trackStatesConcreteLanguage reports whether a probed track makes any concrete
+// language claim at all, as its primary Language code or anywhere in its MULTi
+// Languages list. A track carrying only empty/und/bare-MULTI membership
+// vocabulary has stated no language, so it can neither carry nor contradict a
+// stated signature member.
+func trackStatesConcreteLanguage(track models.AudioTrack) bool {
+	if !unknownLanguageMembership(track.Language) {
+		return true
+	}
+	for _, code := range track.Languages {
+		if !unknownLanguageMembership(code) {
+			return true
+		}
+	}
+	return false
 }
 
 func findExactAudioTrack(tracks []models.AudioTrack, sig *userstore.AudioTrackSignature) int {
