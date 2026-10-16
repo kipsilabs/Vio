@@ -665,16 +665,89 @@ func (h *PlaybackHandler) setVirtualProbeOutcomeIfBinding(sessionID string, bind
 // path, so a client watching either the push or the poll leaves its loading
 // state. The fence on the retained full binding ensures the shed probe's failure
 // is not written onto a replacement binding that never had this probe
-// outstanding; when the CAS rejects the outcome the binding moved, so the
-// failure is not published either — the new binding owns its own lifecycle.
+// outstanding.
+//
+// When the CAS rejects the outcome the session left the binding this shed was
+// armed for, so the failure could not be stored and the current binding owes a
+// probe of its own. Rather than stranding it, the stale job is handed to the
+// bounded retry queue: a worker re-evaluates it, its fence drops it, and it
+// admits a fresh replacement for the binding the session now serves. Recovery
+// through the queue is iterative — a shed triggered by an unresolved replacement
+// row can never recurse into the replacement path synchronously. Only when that
+// bounded queue is itself saturated — the admission-overflow case that triggered
+// this shed — is the current binding failed directly, so it leaves its loading
+// state instead of waiting for the convergence watchdog.
 func (h *PlaybackHandler) shedDeferredVirtualProbe(deferred *virtualDeferredProbeV3) {
 	if h == nil || deferred == nil {
 		return
 	}
-	if !h.setVirtualProbeOutcomeIfBinding(deferred.sessionID, deferred.binding, probeOutcomeFailed) {
+	if h.setVirtualProbeOutcomeIfBinding(deferred.sessionID, deferred.binding, probeOutcomeFailed) {
+		h.publishDeferredProbeInventory(deferred)
 		return
 	}
-	h.publishDeferredProbeInventory(deferred)
+	if !h.parkShedProbeRecovery(deferred) {
+		h.failCurrentBindingAfterRejectedShed(deferred)
+	}
+}
+
+// parkShedProbeRecovery hands a shed probe whose terminal CAS was rejected back
+// to the bounded retry queue, so a worker re-evaluates it against the current
+// binding: its pre-probe fence drops it (the shed was armed for a binding the
+// session has left) and admits a fresh replacement for the binding now served.
+// Routing recovery through the queue keeps the shed path iterative. It reports
+// false when the queue is at its bound and holds no entry this job could fold
+// onto, which is exactly the saturated-admission case; the caller then recovers
+// the current binding directly instead.
+func (h *PlaybackHandler) parkShedProbeRecovery(deferred *virtualDeferredProbeV3) bool {
+	if h == nil || deferred == nil {
+		return false
+	}
+	h.startDeferredProbeWorkers()
+	h.deferredProbeMu.Lock()
+	if _, folded := h.deferredProbeRetry[deferredProbeKey(deferred)]; !folded &&
+		len(h.deferredProbeRetry) >= virtualDeferredProbeQueueSize {
+		h.deferredProbeMu.Unlock()
+		return false
+	}
+	h.parkDeferredProbeRetryLocked(deferred)
+	h.deferredProbeMu.Unlock()
+	h.signalDeferredProbeRetry()
+	return true
+}
+
+// failCurrentBindingAfterRejectedShed terminally fails the binding a rejected
+// shed left behind when the bounded retry queue cannot take the recovery job.
+// The arm is the same fence the ordinary replacement uses: it refuses when the
+// current binding already carries a live pending probe or a terminal outcome, so
+// a lifecycle a worker owns is never overwritten. One arm and one fenced write,
+// so this stays bounded — unlike a synchronous replacement, it cannot chain
+// through further sheds.
+func (h *PlaybackHandler) failCurrentBindingAfterRejectedShed(deferred *virtualDeferredProbeV3) {
+	if h == nil || deferred == nil || h.sessionMgr == nil {
+		return
+	}
+	armer, ok := h.sessionMgr.(virtualProbeReplacementArmer)
+	if !ok {
+		return
+	}
+	ownerID := deferred.ownerID
+	if ownerID == 0 {
+		ownerID = deferred.binding.OwnerInstallationID
+	}
+	binding, armed, err := armer.ArmVirtualProbeReplacementForCurrentBinding(deferred.sessionID, deferred.cand.URI, ownerID)
+	if err != nil || !armed {
+		return
+	}
+	failed := *deferred
+	failed.binding = binding
+	failed.bindingGeneration = binding.Generation
+	failed.file = &models.MediaFile{ID: binding.EffectiveMediaFileID}
+	if h.setVirtualProbeOutcomeIfBinding(deferred.sessionID, binding, probeOutcomeFailed) {
+		slog.Warn("deferred virtual post-commit probe recovery failed the current binding: the bounded retry set was saturated",
+			"component", "api", "session", deferred.sessionID, "candidate_uri", deferred.cand.URI,
+			"effective_file_id", binding.EffectiveMediaFileID, "generation", binding.Generation)
+		h.publishDeferredProbeInventory(&failed)
+	}
 }
 
 // signalDeferredProbeRetry wakes one idle worker to drain the retry set. It
@@ -1096,14 +1169,22 @@ func verifiedProbeInventoryRevision(committed virtualCommittedProbeInventory) st
 }
 
 // deferredProbeBindingCurrent reports whether the session is still bound to the
-// exact candidate and generation this probe was admitted against. It is the one
-// fence predicate for the whole lifecycle — the cheap pre-probe re-check and the
-// fence passed into the probe — so a rotation is judged the same way before and
-// during the remote enumeration. The generation increments monotonically on
-// every binding move (see setVirtualSourceLocked), so an A→B→A rotation still
-// yields a different generation and is caught here. A manager without the
-// binding reader (a minimal test double) reports current so the probe proceeds,
-// matching the pre-existing best-effort behavior on those managers.
+// exact binding this probe was admitted against. It is the one fence predicate
+// for the whole lifecycle — the cheap pre-probe re-check and the fence passed
+// into the probe — so a rotation is judged the same way before and during the
+// remote enumeration. The generation increments monotonically on every binding
+// move (see setVirtualSourceLocked), so an A→B→A rotation still yields a
+// different generation and is caught here.
+//
+// The generation and candidate alone are not the whole binding: the admission
+// snapshot records the owner installation and the effective media file row too,
+// and SetEffectiveMediaFileID moves that row without advancing the generation.
+// A row-only move after admission would therefore pass a generation+candidate
+// fence while the worker still holds, probes, and persists through the row the
+// session no longer serves. Comparing the captured owner and effective row as
+// well drops such a job before it probes. A manager without the binding reader
+// (a minimal test double) reports current so the probe proceeds, matching the
+// pre-existing best-effort behavior on those managers.
 func (h *PlaybackHandler) deferredProbeBindingCurrent(deferred *virtualDeferredProbeV3) bool {
 	if h == nil || deferred == nil || deferred.sessionID == "" || h.sessionMgr == nil {
 		return true
@@ -1119,17 +1200,22 @@ func (h *PlaybackHandler) deferredProbeBindingCurrent(deferred *virtualDeferredP
 		return false
 	}
 	return binding.Generation == deferred.bindingGeneration &&
-		sameVirtualCandidate(binding.VirtualURI, deferred.cand.URI)
+		sameVirtualCandidate(binding.VirtualURI, deferred.cand.URI) &&
+		binding.OwnerInstallationID == deferred.binding.OwnerInstallationID &&
+		binding.EffectiveMediaFileID == deferred.binding.EffectiveMediaFileID
 }
 
 // deferredProbeBindingIntact is the fence the probe worker passes to
 // probeVirtualSourceAndPersist, evaluated after the remote enumeration but
-// before the verdict marks the damper or persists evidence. It checks the
-// candidate and the retained generation together — a URI-only check would let an
-// A→B→A rotation during probing carry superseded work into the persistence
-// write, because the second A binding re-uses the first's candidate URI. Without
-// the generation a probe that completes after a rotation could write its
-// evidence onto a row the session no longer serves.
+// before the verdict marks the damper or persists evidence. It delegates to
+// deferredProbeBindingCurrent, so it fences on the whole captured binding — the
+// retained generation, the candidate URI, the owner installation, and the
+// effective row. A URI-only check would let an A→B→A rotation during probing
+// carry superseded work into the persistence write, because the second A binding
+// re-uses the first's candidate URI; a generation-only check would let a
+// row-only move carry the superseded row's evidence into a binding the session
+// no longer serves. Without either dimension a probe that completes after a move
+// could write its evidence onto a row the session has left.
 func (h *PlaybackHandler) deferredProbeBindingIntact(deferred *virtualDeferredProbeV3) func() bool {
 	return func() bool {
 		return h.deferredProbeBindingCurrent(deferred)

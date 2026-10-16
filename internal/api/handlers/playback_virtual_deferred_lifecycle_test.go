@@ -2772,3 +2772,214 @@ func TestDeferredProbeBindingMoveDuringReconciliationAdmitsReplacement(t *testin
 		return probeCalls >= 2
 	}, "replacement probe for the binding moved during reconciliation")
 }
+
+// moveOnLookupThenFailResolver resolves rows by id, except that the first lookup
+// of moveFrom lands a row-only binding move to moveTo and then reports no row. It
+// models the replacement's effective-row lookup racing a move that leaves the
+// lookup with nothing to return — the exact window in which a rejected shed used
+// to strand the moved binding.
+type moveOnLookupThenFailResolver struct {
+	rows     map[int]*models.MediaFile
+	moveFrom int
+	move     func()
+	once     sync.Once
+}
+
+func (r *moveOnLookupThenFailResolver) GetByID(_ context.Context, id int) (*models.MediaFile, error) {
+	if id == r.moveFrom {
+		r.once.Do(func() {
+			if r.move != nil {
+				r.move()
+			}
+		})
+		return nil, errors.New("catalog row not found")
+	}
+	if row, ok := r.rows[id]; ok && row != nil {
+		return row, nil
+	}
+	return nil, errors.New("catalog row not found")
+}
+
+// TestDeferredProbeShedRowLookupRecoversMovedBinding is the rejected-shed
+// row-move regression: the replacement arms the session's effective row B, its
+// lookup of B lands a row-only move to C and then fails, so the replacement is
+// shed. The shed's terminal CAS is fenced on B and is rejected. Recovery must
+// hand the stale job back to the bounded retry queue instead of returning: a
+// worker drops it at the full-binding fence and admits a fresh probe for the row
+// the session now serves (C), so evidence is written only onto C. Without the
+// hand-off C kept a stale pending mark until the convergence watchdog; without
+// the full-binding fence the stale job would have probed and persisted through B.
+func TestDeferredProbeShedRowLookupRecoversMovedBinding(t *testing.T) {
+	const uri = "virtual://movie/tt-shed-row-lookup?result=a"
+	fx := newDeferredLifecycleFixture(t, 860, uri)
+	fx.saveAttempt(t)
+
+	resolver := &moveOnLookupThenFailResolver{
+		moveFrom: 860,
+		move: func() {
+			if err := fx.manager.SetEffectiveMediaFileID(fx.session.ID, 861); err != nil {
+				t.Errorf("SetEffectiveMediaFileID: %v", err)
+			}
+		},
+		rows: map[int]*models.MediaFile{
+			861: {
+				ID: 861, ContentID: "movie-shed-row-lookup", FilePath: uri, VirtualOwnerInstallationID: 5,
+				AudioTracks: []models.AudioTrack{{Codec: "aac", Channels: 2, Language: "eng", Default: true}},
+			},
+		},
+	}
+	fx.handler.fileResolver = resolver
+
+	var mu sync.Mutex
+	probeCalls := 0
+	fx.handler.VirtualPlaybackSourceProber = func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
+		mu.Lock()
+		probeCalls++
+		mu.Unlock()
+		f.AudioTracks = fx.probedAudio
+		f.SubtitleTracks = fx.probedSubs
+		f.CodecAudio = "eac3"
+		return f, nil
+	}
+	var saveIDs []int
+	fx.handler.VirtualFileMetadataSaver = func(_ context.Context, args models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error) {
+		mu.Lock()
+		saveIDs = append(saveIDs, args.FileID)
+		mu.Unlock()
+		return VirtualFileMetadataUpdateResult{MetadataUpdated: true, RowsAffected: 1}, nil
+	}
+
+	// The dropped job's input describes a superseded binding; the session serves
+	// row 860 and the lookup of it is what lands the move to 861 and then fails.
+	dropped := &virtualDeferredProbeV3{
+		stickyKey:      "sticky-shed-row-lookup",
+		file:           &models.MediaFile{ID: 700},
+		streamURL:      "http://provider.example/stream",
+		probeTransient: &models.MediaFile{ID: 700},
+		cand:           VirtualPlaybackStream{ID: "cand-1", URI: uri},
+		ownerID:        5,
+		sessionID:      fx.session.ID,
+	}
+	fx.handler.scheduleDroppedProbeReplacement(context.Background(), dropped)
+
+	// Recovery must probe and persist exactly the moved row, once, and never the
+	// superseded row the shed was armed against.
+	waitDeferredCondition(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(saveIDs) == 1
+	}, "evidence write onto the moved binding's row")
+	mu.Lock()
+	gotSaves := append([]int(nil), saveIDs...)
+	gotProbes := probeCalls
+	mu.Unlock()
+	if len(gotSaves) != 1 || gotSaves[0] != 861 {
+		t.Fatalf("durable evidence writes = %v, want exactly [861] (the moved row, never the superseded row)", gotSaves)
+	}
+	if gotProbes != 1 {
+		t.Fatalf("probe invocations = %d, want 1 (the superseded job must be dropped by the fence, never probed)", gotProbes)
+	}
+	live, err := fx.manager.GetSession(fx.session.ID)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if live.MediaFileID != 861 {
+		t.Fatalf("effective row = %d, want the moved row 861", live.MediaFileID)
+	}
+	if live.VirtualProbeOutcome != probeOutcomeVerified {
+		t.Fatalf("outcome = %q, want verified on the moved binding", live.VirtualProbeOutcome)
+	}
+}
+
+// TestDeferredProbeSaturatedAdmissionRecoversMovedBinding is the saturated-shed
+// half: admission overflows a full queue and a full retry set, and a row-only
+// move between the arm and the shed makes the shed's terminal CAS reject. With
+// the bounded retry queue already saturated there is nowhere to park a recovery
+// job, so the current binding is failed directly instead of being left pending
+// until the convergence watchdog. No probe runs, so no evidence is written onto
+// the superseded row, and the bounded retry set is not grown.
+func TestDeferredProbeSaturatedAdmissionRecoversMovedBinding(t *testing.T) {
+	const uri = "virtual://movie/tt-shed-saturated?result=a"
+	manager := playback.NewSessionManager(0, 0)
+	session, err := manager.StartSession(1, "profile-1", 850, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	if err := manager.SetVirtualSource(session.ID, uri, 5); err != nil {
+		t.Fatalf("SetVirtualSource: %v", err)
+	}
+	// A row-only move leaves the generation and candidate unchanged but points
+	// the session at row 851.
+	if err := manager.SetEffectiveMediaFileID(session.ID, 851); err != nil {
+		t.Fatalf("SetEffectiveMediaFileID: %v", err)
+	}
+
+	handler := NewPlaybackHandler(manager, idKeyedPlaybackFileResolver{rows: map[int]*models.MediaFile{
+		850: {ID: 850, ContentID: "movie-shed-saturated", FilePath: uri, VirtualOwnerInstallationID: 5},
+		851: {ID: 851, ContentID: "movie-shed-saturated", FilePath: uri, VirtualOwnerInstallationID: 5},
+		852: {ID: 852, ContentID: "movie-shed-saturated", FilePath: uri, VirtualOwnerInstallationID: 5},
+	}})
+	handler.RealtimeHub = playback.NewRealtimeHub()
+	// A canceled service context lets the lazily-started workers exit at once, so
+	// nothing drains the queue or the retry set: the saturation is deterministic.
+	handler.ServiceContext = canceledContext()
+	handler.startDeferredProbeWorkers()
+	handler.deferredProbeWG.Wait()
+
+	probeCalls, saverCalls := 0, 0
+	handler.VirtualPlaybackSourceProber = func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
+		probeCalls++
+		return f, nil
+	}
+	handler.VirtualFileMetadataSaver = func(_ context.Context, _ models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error) {
+		saverCalls++
+		return VirtualFileMetadataUpdateResult{MetadataUpdated: true, RowsAffected: 1}, nil
+	}
+
+	// Fill the probe queue and the bounded retry set to their bounds.
+	for i := 0; i < virtualDeferredProbeQueueSize; i++ {
+		handler.deferredProbeQueue <- &virtualDeferredProbeV3{sessionID: fmt.Sprintf("fill-%d", i)}
+	}
+	handler.deferredProbeMu.Lock()
+	for i := 0; i < virtualDeferredProbeQueueSize; i++ {
+		handler.deferredProbeRetry[fmt.Sprintf("retry-%d", i)] = &virtualDeferredProbeV3{sessionID: fmt.Sprintf("fill-%d", i)}
+	}
+	handler.deferredProbeMu.Unlock()
+
+	deferred := &virtualDeferredProbeV3{
+		stickyKey:      "sticky-shed-saturated",
+		file:           &models.MediaFile{ID: 851},
+		streamURL:      "http://provider.example/stream",
+		probeTransient: &models.MediaFile{ID: 851},
+		cand:           VirtualPlaybackStream{ID: "cand-1", URI: uri},
+		ownerID:        5,
+		sessionID:      session.ID,
+	}
+	// Admission arms the pending mark for row 851; the move to 852 lands after,
+	// so the shed's CAS is fenced on 851 and rejects.
+	if !handler.armDeferredProbePending(context.Background(), deferred) {
+		t.Fatal("admission rejected the saturated job as stale")
+	}
+	if err := manager.SetEffectiveMediaFileID(session.ID, 852); err != nil {
+		t.Fatalf("SetEffectiveMediaFileID: %v", err)
+	}
+
+	handler.admitArmedDeferredProbe(context.Background(), deferred)
+
+	live, err := manager.GetSession(session.ID)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if live.VirtualProbeOutcome != probeOutcomeFailed {
+		t.Fatalf("outcome = %q, want the terminal failure that keeps the moved binding from stranding", live.VirtualProbeOutcome)
+	}
+	if probeCalls != 0 || saverCalls != 0 {
+		t.Fatalf("probe/saver calls = %d/%d, want 0/0: a saturated shed must not probe or write onto a superseded row", probeCalls, saverCalls)
+	}
+	handler.deferredProbeMu.Lock()
+	retryLen := len(handler.deferredProbeRetry)
+	handler.deferredProbeMu.Unlock()
+	if retryLen != virtualDeferredProbeQueueSize {
+		t.Fatalf("bounded retry set size = %d, want it unchanged at %d", retryLen, virtualDeferredProbeQueueSize)
+	}
+}
