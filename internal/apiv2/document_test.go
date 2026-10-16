@@ -354,6 +354,7 @@ func TestGeneratedDocumentStatuses(t *testing.T) {
 		profileToken[id] = true
 	}
 	profileToken[opFallbackWatchTogetherSource] = true
+	profileToken[opDiscoverVirtualCandidates] = true
 	expect[opFallbackWatchTogetherSource] = map[int]bool{200: true, 409: true}
 	expect["deleteWatchTogetherSuggestion"] = map[int]bool{204: true, 409: true}
 	expect["voteWatchTogetherSuggestion"] = map[int]bool{204: true, 409: true}

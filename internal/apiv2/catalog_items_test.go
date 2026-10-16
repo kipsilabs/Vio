@@ -288,7 +288,7 @@ func (fake *fakePreplayCatalog) DiscoverVirtualCandidates(ctx context.Context, u
 	if fake.discoveryErr != nil {
 		return nil, fake.discoveryErr
 	}
-	fake.detail.Versions = []catalogpkg.FileVersion{{FileID: 121, FilePath: "virtual://movie/tt0113277?result=candidate", Resolution: "2160p"}}
+	fake.detail.Versions = []catalogpkg.FileVersion{{FileID: 121, FilePath: "virtual://movie/tt0113277?result=candidate", Resolution: "2160p", AddedAt: fixedTime()}}
 	return fake.detail.Versions, nil
 }
 
@@ -346,7 +346,7 @@ func TestDetailPreplayDiscovery(t *testing.T) {
 				fake := &fakePreplayCatalog{
 					fakeCatalog: base, discoveryErr: test.discoverErr, reloadErr: test.reloadErr,
 					detail: catalogpkg.ItemDetail{ContentID: "movie:heat-1995", Type: test.mediaType,
-						Versions: []catalogpkg.FileVersion{{FileID: 120, FilePath: test.path}}},
+						Versions: []catalogpkg.FileVersion{{FileID: 120, FilePath: test.path, AddedAt: fixedTime()}}},
 				}
 				if test.denied {
 					fake.err = notFoundItem()
