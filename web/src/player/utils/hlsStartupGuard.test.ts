@@ -287,6 +287,67 @@ describe("ManifestLoadCoalescer", () => {
     expect(requests).toEqual(["/refetch.m3u8", "/later.m3u8"]);
   });
 
+  it("does not replay a load once it has settled", () => {
+    const requests: string[] = [];
+    const coalescer = new ManifestLoadCoalescer((url) => requests.push(url));
+
+    // A is in flight and B queues behind it.
+    const tokenA = coalescer.begin("/a.m3u8");
+    expect(coalescer.request("/b.m3u8")).toBe(false);
+    expect(requests).toEqual([]);
+
+    // A settles: B starts and takes the slot.
+    coalescer.settle(tokenA);
+    expect(requests).toEqual(["/b.m3u8"]);
+
+    // B settles. Nothing was queued behind it, so it must not replay itself.
+    coalescer.settle();
+    expect(requests).toEqual(["/b.m3u8"]);
+
+    // The coalescer is idle, so a later request starts a fresh load instead of
+    // replaying B.
+    expect(coalescer.request("/c.m3u8")).toBe(true);
+    expect(requests).toEqual(["/b.m3u8", "/c.m3u8"]);
+  });
+
+  it("settles the load the completing URL names, not a superseded one", () => {
+    const requests: string[] = [];
+    const coalescer = new ManifestLoadCoalescer((url) => requests.push(url));
+
+    // A is in flight; a newer load for a different URL supersedes it, and a
+    // recovery queues behind the newer load.
+    const tokenA = coalescer.begin("/master.m3u8");
+    const tokenB = coalescer.begin("/edge.m3u8");
+    expect(tokenB).not.toBe(tokenA);
+    expect(coalescer.request("/queued.m3u8")).toBe(false);
+
+    // A completion naming the superseded load must not clear the newer slot,
+    // even though that load's token no longer matches the in-flight token.
+    coalescer.settleFor("/master.m3u8");
+    expect(requests).toEqual([]);
+
+    // The newer load's own completion settles it and runs the queued request.
+    coalescer.settleFor("/edge.m3u8");
+    expect(requests).toEqual(["/queued.m3u8"]);
+  });
+
+  it("ignores a completion that names no recorded load", () => {
+    const requests: string[] = [];
+    const coalescer = new ManifestLoadCoalescer((url) => requests.push(url));
+
+    coalescer.begin("/master.m3u8");
+    expect(coalescer.request("/refetch.m3u8")).toBe(false);
+
+    // A completion for a URL this coalescer never began cannot be attributed to
+    // the load in flight, so it must not settle it.
+    coalescer.settleFor("/other.m3u8");
+    expect(requests).toEqual([]);
+
+    // The load's own completion still settles it and runs the queued request.
+    coalescer.settleFor("/master.m3u8");
+    expect(requests).toEqual(["/refetch.m3u8"]);
+  });
+
   it("charges a queued refetch when it replays, so queue/settle cycles count each start", () => {
     const requests: string[] = [];
     let recoveries = 0;

@@ -2536,8 +2536,9 @@ export function VideoPlayer({
             // open. The coalescer keys off hls.js's manifest lifecycle and
             // replays a superseded request once the in-flight load settles, so
             // the player's own manifest loads land in sequence rather than both
-            // opening a fetch.
-            let manifestLoadToken: number | undefined;
+            // opening a fetch. A completion is matched to the load it finished
+            // by the manifest URL the event carries, so a late completion for a
+            // superseded load cannot clear the slot the current one holds.
             const manifestLoads = new ManifestLoadCoalescer((url) => {
               // A replay can land after the transport was torn down (a decode
               // replan destroys the instance without setting `destroyed`), so
@@ -2547,10 +2548,10 @@ export function VideoPlayer({
             });
             activeManifestLoads = manifestLoads;
             hls.on(Hls.Events.MANIFEST_LOADING, (_event, data: { url?: string }) => {
-              manifestLoadToken = manifestLoads.begin(data?.url ?? hls?.url ?? "");
+              manifestLoads.begin(data?.url ?? hls?.url ?? "");
             });
-            hls.on(Hls.Events.MANIFEST_LOADED, () => {
-              manifestLoads.settle(manifestLoadToken);
+            hls.on(Hls.Events.MANIFEST_LOADED, (_event, data: { url?: string }) => {
+              manifestLoads.settleFor(data?.url ?? hls?.url ?? "");
             });
 
             hls.on(Hls.Events.ERROR, (_event, data) => {

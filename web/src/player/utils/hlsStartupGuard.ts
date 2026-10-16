@@ -162,12 +162,27 @@ export function recoverFromStaleGeneration(
 }
 
 /**
+ * Normalizes a manifest URL to the absolute form hls.js addresses, so the URL
+ * on `MANIFEST_LOADING` (the source passed to `loadSource`, possibly relative)
+ * and on `MANIFEST_LOADED` (the loader's absolute response URL) compare equal.
+ */
+function normalizeManifestUrl(url: string): string {
+  if (url === "") return url;
+  const base = typeof location === "undefined" ? undefined : location.href;
+  try {
+    return new URL(url, base).href;
+  } catch {
+    return url;
+  }
+}
+
+/**
  * Serializes the manifest (re)loads one hls.js transport issues.
  *
  * The player raises a manifest load from three places that overlap: the
  * transport init, the not-ready pollback, and the stale-generation recovery.
  * The coalescer keys off hls.js's own manifest lifecycle: the player calls
- * `begin` on `MANIFEST_LOADING` and `settle` on `MANIFEST_LOADED`, and routes
+ * `begin` on `MANIFEST_LOADING` and `settleFor` on `MANIFEST_LOADED`, and routes
  * every manifest load through `request`. A request raised while one is in
  * flight is remembered and replayed once, after the in-flight load settles, so
  * overlapping requests land in sequence instead of both opening a fetch.
@@ -194,6 +209,12 @@ export class ManifestLoadCoalescer {
   private inFlightToken = 0;
   private nextToken = 0;
   private pending: (() => void) | null = null;
+  /**
+   * Tokens for the loads `begin` adopted, keyed by their normalized URL, so a
+   * completion can be matched to the load it finished rather than to whichever
+   * load happens to be in flight when the completion arrives.
+   */
+  private loadsByUrl = new Map<string, number>();
 
   constructor(private readonly load: (url: string) => void) {}
 
@@ -215,6 +236,7 @@ export class ManifestLoadCoalescer {
     }
     this.inFlightUrl = url;
     this.inFlightToken = ++this.nextToken;
+    this.loadsByUrl.set(normalizeManifestUrl(url), this.inFlightToken);
     return this.inFlightToken;
   }
 
@@ -225,13 +247,45 @@ export class ManifestLoadCoalescer {
    * only to settle whatever is currently in flight.
    */
   settle(token?: number): void {
-    if (token !== undefined && token !== this.inFlightToken) return;
+    if (token !== undefined && token !== this.inFlightToken) {
+      // A stale completion for a superseded load. Drop its token so it cannot
+      // settle again, but leave the newer load's slot alone.
+      for (const [url, tracked] of this.loadsByUrl) {
+        if (tracked === token) {
+          this.loadsByUrl.delete(url);
+          break;
+        }
+      }
+      return;
+    }
 
     const pending = this.pending;
     if (this.inFlightUrl === null && pending === null) return;
+    if (this.inFlightUrl !== null) {
+      this.loadsByUrl.delete(normalizeManifestUrl(this.inFlightUrl));
+    }
     this.inFlightUrl = null;
     this.inFlightToken = 0;
+    // Clear the queued load before replaying it, so its own completion cannot
+    // find it still queued and run it a second time.
+    this.pending = null;
     pending?.();
+  }
+
+  /**
+   * Settles the manifest load whose completion names `url`. The
+   * `MANIFEST_LOADED` event carries no per-load id — only the finished
+   * manifest's URL — so the URL is the correlation hls.js offers: a completion
+   * for a load a newer one superseded names that older load and is dropped,
+   * instead of being mistaken for the load now in flight. hls.js reports the
+   * loader's absolute response URL, which normalization maps to the same key as
+   * the source URL it began under. A completion naming no recorded load is
+   * ignored, so it cannot clear a slot it does not own.
+   */
+  settleFor(url: string): void {
+    const token = this.loadsByUrl.get(normalizeManifestUrl(url));
+    if (token === undefined) return;
+    this.settle(token);
   }
 
   /**
@@ -245,6 +299,7 @@ export class ManifestLoadCoalescer {
     this.inFlightUrl = null;
     this.inFlightToken = 0;
     this.pending = null;
+    this.loadsByUrl.clear();
   }
 
   /**
