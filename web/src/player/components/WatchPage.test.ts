@@ -2378,60 +2378,45 @@ describe("WatchPage live inventory refresh", () => {
     });
   });
 
-  it("arms deferred exhaustion with the live session identity across a replacement", async () => {
+  it("drops a deferred exhaustion when only the file moved on the live session", async () => {
     const markFirst = vi.fn();
     const markSecond = vi.fn();
-    const provisionalDeferred = {
+    // One stable session object: mutating it below mirrors the player adopting a
+    // replacement into the live ref before the armed round's effect restarts.
+    const stableSession = playbackSession({
+      mediaFileId: 7,
+      sessionId: "session-1",
+      inventoryUrl: "/api/v2/playback/session-1/inventory",
       planAudioTracks: richerAudioTracks,
       audioInventoryProvisional: true,
       subtitleUrls: [],
       subtitleInventoryProvisional: true,
       inventoryPending: true,
       pollInventory: vi.fn().mockResolvedValue(false),
-    };
-    playbackSessionMock.mockReturnValue(
-      playbackSession({
-        mediaFileId: 7,
-        sessionId: "session-1",
-        inventoryUrl: "/api/v2/playback/session-1/inventory",
-        markInventoryExhausted: markFirst,
-        ...provisionalDeferred,
-      }),
-    );
+      markInventoryExhausted: markFirst,
+    });
+    playbackSessionMock.mockReturnValue(stableSession);
 
-    const { rerender } = render(
-      createElement(WatchPage, { ...watchPageProps, versions: [virtualVersion] }),
-    );
+    render(createElement(WatchPage, { ...watchPageProps, versions: [virtualVersion] }));
 
+    // Spend most of the deferred budget, leaving the round's last poll armed.
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(2_000);
+      await vi.advanceTimersByTimeAsync(53_000);
     });
     expect(markFirst).not.toHaveBeenCalled();
 
-    // The player replaces the session while the deferred timer is armed. The
-    // replaced round is dropped; the fresh round's exhaustion names its own
-    // identity so the shared guard can drop a stale timer.
-    playbackSessionMock.mockReturnValue(
-      playbackSession({
-        mediaFileId: 8,
-        sessionId: "session-2",
-        inventoryUrl: "/api/v2/playback/session-2/inventory",
-        markInventoryExhausted: markSecond,
-        ...provisionalDeferred,
-      }),
-    );
-    rerender(createElement(WatchPage, { ...watchPageProps, versions: [virtualVersion] }));
-
+    // A serve-layer rotation moves only the effective file: the session and the
+    // deferred `inventory_url` stay put, so only the round's own stored file
+    // identity can recognize it as stale. The live ref now names file 8 while
+    // the armed round still holds file 7's closure.
+    stableSession.mediaFileId = 8;
+    stableSession.markInventoryExhausted = markSecond;
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(60_000);
+      await vi.advanceTimersByTimeAsync(1_000);
     });
 
     expect(markFirst).not.toHaveBeenCalled();
-    expect(markSecond).toHaveBeenCalled();
-    expect(markSecond.mock.calls.at(-1)?.[0]).toEqual({
-      sessionId: "session-2",
-      mediaFileId: 8,
-    });
+    expect(markSecond).not.toHaveBeenCalled();
   });
 
   it("retains a still-declared badge when the poll's reads stay empty", async () => {
