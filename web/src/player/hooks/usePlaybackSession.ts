@@ -2763,9 +2763,10 @@ export function usePlaybackSession(
     // actually set to start and the adopted plan's play intent, so Retry
     // rebuilds the session there instead of at zero or at a stale cycle's
     // position. An adopted plan owns the server-resolved source position; only
-    // an explicit start (forceStartPosition) keeps the request's own position,
-    // and before any plan is adopted `playbackPositionRef` still mirrors the
-    // request position.
+    // an explicit start (forceStartPosition) keeps the request's own position.
+    // Before any plan is adopted `playbackPositionRef` reflects the last known
+    // source position — the request's until a player update or a re-anchor
+    // moves it — so it is not necessarily the request position.
     const reconnect = reconnectRef.current;
     const startIntent = startIntentRef.current;
     const resumeFromAdoptedPlan = hasAdoptedPlanRef.current && !startIntent.forceStartPosition;
