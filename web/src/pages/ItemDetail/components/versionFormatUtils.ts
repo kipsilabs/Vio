@@ -149,6 +149,83 @@ export function hasFormatScore(score?: number): score is number {
   return typeof score === "number" && score !== 0;
 }
 
+/** The version fields the Radarr-style release presentation reads. Both version shapes satisfy it. */
+export interface ReleasePresentationSource {
+  matched_formats?: string[];
+  release_group?: string;
+  resolution?: string;
+  codec_video?: string;
+  codec_audio?: string;
+  file_name?: string;
+  edition_raw?: string;
+  hdr?: boolean;
+  video_tracks?: VideoRangeTrack[];
+  effective_audio_track_index?: number;
+  audio_channels?: number;
+  audio_tracks?: ReadonlyArray<{ channels?: number }>;
+}
+
+/** Channels for the release line: the structured top-level count when the
+ *  payload carries one, else the effective (default) audio track, else the
+ *  first track that reports channels. */
+function releaseAudioChannels(version: ReleasePresentationSource): number | undefined {
+  if (version.audio_channels != null) return version.audio_channels;
+  const tracks = version.audio_tracks ?? [];
+  const effective = version.effective_audio_track_index;
+  if (effective != null && effective >= 0 && effective < tracks.length) {
+    const channels = tracks[effective]?.channels;
+    if (channels != null) return channels;
+  }
+  return tracks.find((track) => track.channels != null)?.channels;
+}
+
+/**
+ * The Radarr-style release line a scored version row leads with, shared by the
+ * item-page version list and the in-player version menu:
+ * `[<matched formats>][<quality full>][<video range>][<audio codec>
+ * <channels>][<video codec>]-<release group>`, eliding empty pieces (so no
+ * dangling brackets or hyphen). Only a scored release candidate — one the
+ * server matched custom formats on — gets the line; anything else (unscored
+ * and local rows) returns "" and the caller falls back to the current quality
+ * summary.
+ */
+export function buildReleasePresentation(version: ReleasePresentationSource): string {
+  const formats = (version.matched_formats ?? []).map((name) => name.trim()).filter(Boolean);
+  if (formats.length === 0) {
+    return "";
+  }
+  const group = version.release_group?.trim() ?? "";
+
+  const tokens: string[] = [`[${formats.join(", ")}]`];
+
+  const scanText = [version.file_name, version.edition_raw].filter(Boolean).join(" ");
+  const sourceHint = scanText ? extractSourceHint(scanText) : null;
+  const quality = [version.resolution, sourceHint].filter(Boolean).join(" ");
+  if (quality) {
+    tokens.push(`[${quality}]`);
+  }
+
+  const rangeLabel = videoRangeLabel(version);
+  if (rangeLabel) {
+    tokens.push(`[${rangeLabel}]`);
+  }
+
+  const audioCodec = version.codec_audio ? mapAudioLabel(version.codec_audio) : "";
+  const audio = [audioCodec, formatChannels(releaseAudioChannels(version))]
+    .filter(Boolean)
+    .join(" ");
+  if (audio) {
+    tokens.push(`[${audio}]`);
+  }
+
+  if (version.codec_video) {
+    tokens.push(`[${version.codec_video.toUpperCase()}]`);
+  }
+
+  const line = tokens.join("");
+  return group ? `${line}-${group}` : line;
+}
+
 /** The ★ badge text for a custom-format score. */
 export function formatScoreBadgeLabel(score: number): string {
   return `★ ${score}`;
