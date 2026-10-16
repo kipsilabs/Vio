@@ -2758,6 +2758,13 @@ export function usePlaybackSession(
    * exists, the reconnect is the one recovery and runs instead.
    */
   const reportSessionLost = useCallback(() => {
+    // Nothing played before the session was answered gone, so no reconnect
+    // cycle recorded where the viewer asked to start. Carry the start request's
+    // own position and the adopted plan's play intent, so Retry rebuilds the
+    // session there instead of at zero or at a stale cycle's position.
+    const reconnect = reconnectRef.current;
+    reconnect.positionSeconds = startIntentRef.current.position;
+    reconnect.resume = planAutoPlayRef.current;
     giveUpReconnect(CONNECTION_LOST_ERROR);
   }, [giveUpReconnect]);
 

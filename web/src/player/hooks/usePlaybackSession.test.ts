@@ -8904,6 +8904,39 @@ describe("usePlaybackSession mid-stream reconnect", () => {
     rendered.unmount();
   });
 
+  it("retries a pre-first-frame loss from the position the start asked for", async () => {
+    const harness = reconnectHarness({
+      replan: () =>
+        jsonResponse(
+          { error: "playback_session_not_found", message: "Playback session not found" },
+          { status: 404 },
+        ),
+      restart: () => jsonResponse(playable("session-2"), { status: 201 }),
+    });
+    const rendered = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 240, true, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(rendered.result.current.planRevision).toBe(1));
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+
+    // The session is answered gone before the first frame: no stream played, so
+    // no reconnect cycle recorded where the viewer asked to be.
+    act(() => rendered.result.current.reportSessionLost());
+    expect(rendered.result.current.connectionStatus).toBe("lost");
+
+    // Retry must rebuild at the start's own position, not zero.
+    act(() => rendered.result.current.retryConnection());
+    await advance(0);
+
+    const restart = harness.startBodies[1];
+    expect(restart?.start_position).toBe(240);
+    expect(rendered.result.current.sessionId).toBe("session-2");
+    expect(rendered.result.current.connectionStatus).toBe("connected");
+
+    rendered.unmount();
+  });
+
   it("runs the reconnect's pending attempt immediately when a gone session is reported", async () => {
     const harness = reconnectHarness({ replan: () => unreachable() });
     const { result, unmount } = await startPlaying();

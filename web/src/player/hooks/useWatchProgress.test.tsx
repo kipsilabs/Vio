@@ -155,6 +155,44 @@ it("keeps polling when a progress 404 is a proxy page with no problem code", asy
   expect(onSessionLost).not.toHaveBeenCalled();
 });
 
+it("reports a gone session once when several queued samples reject", async () => {
+  vi.useFakeTimers();
+  const rejections: Array<(error: unknown) => void> = [];
+  for (let i = 0; i < 3; i += 1) {
+    mocks.send.mockImplementationOnce(
+      () =>
+        new Promise((_resolve, reject) => {
+          rejections.push(reject);
+        }),
+    );
+  }
+  const onSessionLost = vi.fn();
+  const { unmount } = renderHook(
+    () => useWatchProgress("session", videoRef, undefined, onSessionLost),
+    { wrapper },
+  );
+
+  // Serialized samples queue past the poll interval: three are outstanding.
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(30_000);
+  });
+  expect(rejections).toHaveLength(3);
+
+  // Each queued sample answers 404; only the first may report.
+  await act(async () => {
+    for (const reject of rejections) {
+      reject(new PlayerFetchError(404, "Playback session not found.", "not_found"));
+    }
+    await Promise.resolve();
+  });
+  expect(onSessionLost).toHaveBeenCalledTimes(1);
+
+  // The terminal latch still skips the cleanup's keepalive.
+  mocks.send.mockClear();
+  act(() => unmount());
+  expect(mocks.send).not.toHaveBeenCalled();
+});
+
 it("does not send a final keepalive to a session that is gone", async () => {
   vi.useFakeTimers();
   mocks.send.mockRejectedValue(

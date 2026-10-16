@@ -99,6 +99,10 @@ export function useWatchProgress(
     if (!sessionId) return;
     skipCleanupReportRef.current = false;
     let disposed = false;
+    // Serialized samples can outlive the interval and each reject on their own,
+    // so latch the terminal state to hand the player exactly one report. It
+    // resets with the effect, i.e. for a new session id.
+    let reportedLost = false;
 
     const stopPolling = () => {
       if (intervalRef.current) clearInterval(intervalRef.current);
@@ -111,8 +115,9 @@ export function useWatchProgress(
         // not disrupt playback. A session that no longer exists is terminal:
         // stop polling and hand the player its one report. A sample from a
         // session this effect has already left belongs to the old id.
-        if (disposed) return;
+        if (disposed || reportedLost) return;
         if (isPlaybackSessionGoneError(error)) {
+          reportedLost = true;
           stopPolling();
           // The session row is gone, so the cleanup's final keepalive would
           // only be answered 404. Skip it.
