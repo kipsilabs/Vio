@@ -303,22 +303,43 @@ func deferredProbeKey(deferred *virtualDeferredProbeV3) string {
 }
 
 // parkDeferredProbeRetryLocked records a probe in the bounded retry set, keeping
-// the entry that belongs to the newest binding generation when two probes for the
-// same session and candidate are both under overflow pressure. The set is keyed by
-// session and candidate URI, so the map can hold only one of them; the older job's
-// fence is already stale by the time it would run, and letting it displace the
-// newer job would lose a lifecycle that could still land and force a redundant
-// replacement, so the newer generation wins. Caller holds deferredProbeMu.
+// the entry the session currently serves when two probes for the same session and
+// candidate collide under overflow pressure. The set is keyed by session and
+// candidate URI, so the map can hold only one of them. A row-only move does not
+// advance the binding generation (see SetEffectiveMediaFileID), so comparing
+// generations alone cannot tell a legitimately armed replacement for the served
+// binding from a stale job a shed parked after the move superseded it: both carry
+// the same generation, and letting the stale job win would strand the replacement's
+// worker until the convergence watchdog. The entry bound to the session's current
+// candidate wins; when neither is readable or both relate to the binding the same
+// way, the newer generation wins. Caller holds deferredProbeMu.
 func (h *PlaybackHandler) parkDeferredProbeRetryLocked(deferred *virtualDeferredProbeV3) {
 	if h == nil || deferred == nil {
 		return
 	}
 	key := deferredProbeKey(deferred)
 	if existing, ok := h.deferredProbeRetry[key]; ok && existing != nil &&
-		existing.bindingGeneration > deferred.bindingGeneration {
+		!h.deferredProbeReplacesLocked(existing, deferred) {
 		return
 	}
 	h.deferredProbeRetry[key] = deferred
+}
+
+// deferredProbeReplacesLocked reports whether next should displace current in the
+// retry set both jobs share. It prefers the job bound to the session's CURRENT
+// candidate, because a row-only move leaves the generation equal: without this the
+// stale job a shed parked for the row the session left can evict the replacement
+// armed for the row it now serves, and the replacement would have no worker until
+// the watchdog converged. When the session binding is unreadable, or both jobs
+// relate to it the same way, the higher generation wins, matching the previous
+// contract. Caller holds deferredProbeMu.
+func (h *PlaybackHandler) deferredProbeReplacesLocked(current, next *virtualDeferredProbeV3) bool {
+	currentServed := h.deferredProbeBindingCurrent(current)
+	nextServed := h.deferredProbeBindingCurrent(next)
+	if currentServed != nextServed {
+		return nextServed
+	}
+	return next.bindingGeneration >= current.bindingGeneration
 }
 
 // enqueueDeferredVirtualProbeV3 admits one deferred probe into the bounded pool.
@@ -520,21 +541,36 @@ type virtualProbeReplacementArmer interface {
 	ArmVirtualProbeReplacementForCurrentBinding(sessionID, candidateURI string, ownerInstallationID int) (playback.VirtualSourceBindingSnapshot, bool, error)
 }
 
+// virtualProbeReplacementFailer is the session-manager capability that atomically
+// arms the deferred-probe lifecycle for the session's current binding and records
+// the terminal failure on it, in one critical section. The handler uses it for the
+// saturated-fallback recovery, where splitting the arm and the write across two
+// calls would let a row-only move (which does not advance the generation) carry the
+// failure onto a newer lifecycle for the same row.
+type virtualProbeReplacementFailer interface {
+	FailVirtualProbeReplacementForCurrentBinding(sessionID, candidateURI string, ownerInstallationID int) (playback.VirtualSourceBindingSnapshot, bool, error)
+}
+
 // armDeferredProbePending captures the session's candidate binding and marks the
 // deferred inventory pending on it, but only when no lifecycle is already armed
 // or terminal for that binding generation. The binding identity and generation
 // are one manager read, so a rotation cannot interleave between them: the
 // generation is then retained on the job for every later fence, and the pending
 // write CASes on it so a rotation landing between this read and the write drops
-// the pending mark instead of showing it on the replacement binding. It reports
-// false — the job is stale and must not be admitted — when the session is gone,
-// already bound to a different candidate, or already carries a probe outcome for
-// this binding (armed or terminal). That last case is the duplicate-start fence:
-// a concurrent winner's terminal save returns its plan to a loser that then
-// re-enters the start path, and the loser must not re-probe and re-arm the
-// winner's completed lifecycle. A manager without the binding reader (a minimal
-// test manager) admits unfenced, matching the pre-existing best-effort behavior
-// on those managers.
+// the pending mark instead of showing it on the replacement binding. Because the
+// job's input was resolved earlier, the captured binding is also checked against
+// the owner the job carries: a same-candidate owner move is dropped, since the
+// job would probe another installation's stream URL and headers. The effective
+// row is not asserted — a probe may legitimately write onto a same-release sibling
+// row, and propagation proves release continuity against the served row. It
+// reports false — the job is stale and must not be admitted — when the session is
+// gone, already bound to a different candidate, describes a different owner, or
+// already carries a probe outcome for this binding (armed or terminal). That last
+// case is the duplicate-start fence: a concurrent winner's terminal save returns
+// its plan to a loser that then re-enters the start path, and the loser must not
+// re-probe and re-arm the winner's completed lifecycle. A manager without the
+// binding reader (a minimal test manager) admits unfenced, matching the
+// pre-existing best-effort behavior on those managers.
 func (h *PlaybackHandler) armDeferredProbePending(ctx context.Context, deferred *virtualDeferredProbeV3) bool {
 	if h == nil || deferred == nil || h.sessionMgr == nil || deferred.sessionID == "" {
 		return true
@@ -554,6 +590,25 @@ func (h *PlaybackHandler) armDeferredProbePending(ctx context.Context, deferred 
 	if !sameVirtualCandidate(binding.VirtualURI, deferred.cand.URI) {
 		slog.DebugContext(ctx, "deferred virtual post-commit probe dropped: candidate binding moved before admission",
 			"component", "api", "session", deferred.sessionID, "candidate_uri", deferred.cand.URI, "bound_uri", binding.VirtualURI)
+		return false
+	}
+	// Re-check the owner the job was resolved with against the binding just
+	// captured, not only its candidate URI. A same-candidate owner move landing
+	// before this read leaves the job carrying another installation's stream URL
+	// and headers: probing it would write that source's verdict onto this
+	// binding, and the URI check alone cannot see the difference. The effective
+	// row is deliberately NOT asserted here: the probe is allowed to write its
+	// evidence onto a same-release sibling row (the canonical-collection case),
+	// and the propagation step proves release continuity against the served row
+	// before that evidence is applied.
+	ownerID := deferred.ownerID
+	if ownerID == 0 {
+		ownerID = deferred.binding.OwnerInstallationID
+	}
+	if ownerID != 0 && binding.OwnerInstallationID != 0 && binding.OwnerInstallationID != ownerID {
+		slog.DebugContext(ctx, "deferred virtual post-commit probe dropped: owner installation moved before admission",
+			"component", "api", "session", deferred.sessionID, "candidate_uri", deferred.cand.URI,
+			"job_owner", ownerID, "bound_owner", binding.OwnerInstallationID)
 		return false
 	}
 	deferred.bindingGeneration = binding.Generation
@@ -717,16 +772,18 @@ func (h *PlaybackHandler) parkShedProbeRecovery(deferred *virtualDeferredProbeV3
 
 // failCurrentBindingAfterRejectedShed terminally fails the binding a rejected
 // shed left behind when the bounded retry queue cannot take the recovery job.
-// The arm is the same fence the ordinary replacement uses: it refuses when the
-// current binding already carries a live pending probe or a terminal outcome, so
-// a lifecycle a worker owns is never overwritten. One arm and one fenced write,
-// so this stays bounded — unlike a synchronous replacement, it cannot chain
-// through further sheds.
+// The manager call is one critical section that both arms the current binding
+// and writes the failure, so the write cannot be delayed past a row-only move: a
+// B -> C -> B move does not advance the generation, and a separate arm and write
+// would let this fallback's failure land on a newer B lifecycle another recovery
+// armed after the row returned. One arm and one fenced write, so this stays
+// bounded — unlike a synchronous replacement, it cannot chain through further
+// sheds.
 func (h *PlaybackHandler) failCurrentBindingAfterRejectedShed(deferred *virtualDeferredProbeV3) {
 	if h == nil || deferred == nil || h.sessionMgr == nil {
 		return
 	}
-	armer, ok := h.sessionMgr.(virtualProbeReplacementArmer)
+	failer, ok := h.sessionMgr.(virtualProbeReplacementFailer)
 	if !ok {
 		return
 	}
@@ -734,20 +791,18 @@ func (h *PlaybackHandler) failCurrentBindingAfterRejectedShed(deferred *virtualD
 	if ownerID == 0 {
 		ownerID = deferred.binding.OwnerInstallationID
 	}
-	binding, armed, err := armer.ArmVirtualProbeReplacementForCurrentBinding(deferred.sessionID, deferred.cand.URI, ownerID)
-	if err != nil || !armed {
+	binding, applied, err := failer.FailVirtualProbeReplacementForCurrentBinding(deferred.sessionID, deferred.cand.URI, ownerID)
+	if err != nil || !applied {
 		return
 	}
 	failed := *deferred
 	failed.binding = binding
 	failed.bindingGeneration = binding.Generation
 	failed.file = &models.MediaFile{ID: binding.EffectiveMediaFileID}
-	if h.setVirtualProbeOutcomeIfBinding(deferred.sessionID, binding, probeOutcomeFailed) {
-		slog.Warn("deferred virtual post-commit probe recovery failed the current binding: the bounded retry set was saturated",
-			"component", "api", "session", deferred.sessionID, "candidate_uri", deferred.cand.URI,
-			"effective_file_id", binding.EffectiveMediaFileID, "generation", binding.Generation)
-		h.publishDeferredProbeInventory(&failed)
-	}
+	slog.Warn("deferred virtual post-commit probe recovery failed the current binding: the bounded retry set was saturated",
+		"component", "api", "session", deferred.sessionID, "candidate_uri", deferred.cand.URI,
+		"effective_file_id", binding.EffectiveMediaFileID, "generation", binding.Generation)
+	h.publishDeferredProbeInventory(&failed)
 }
 
 // signalDeferredProbeRetry wakes one idle worker to drain the retry set. It

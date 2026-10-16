@@ -2222,7 +2222,15 @@ func (m *SessionManager) VirtualSourceBinding(sessionID string) (VirtualSourceBi
 func (m *SessionManager) ArmVirtualProbeReplacementForCurrentBinding(sessionID, candidateURI string, ownerInstallationID int) (VirtualSourceBindingSnapshot, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.armVirtualProbeReplacementForCurrentBindingLocked(sessionID, candidateURI, ownerInstallationID)
+}
 
+// armVirtualProbeReplacementForCurrentBindingLocked is the critical section
+// shared by the replacement arm and its saturated-fallback twin: it applies the
+// candidate/owner/liveness checks and, when they pass, enters pending for the
+// current binding. It returns the binding it acted on whether or not it armed,
+// so a caller can report the row the decision targeted. Caller holds m.mu.
+func (m *SessionManager) armVirtualProbeReplacementForCurrentBindingLocked(sessionID, candidateURI string, ownerInstallationID int) (VirtualSourceBindingSnapshot, bool, error) {
 	s, ok := m.sessions[sessionID]
 	if !ok {
 		return VirtualSourceBindingSnapshot{}, false, ErrSessionNotFound
@@ -2247,6 +2255,33 @@ func (m *SessionManager) ArmVirtualProbeReplacementForCurrentBinding(sessionID, 
 	}
 	setVirtualProbeOutcomeLocked(s, VirtualProbeOutcomePending)
 	return s.virtualBindingSnapshotLocked(), true, nil
+}
+
+// FailVirtualProbeReplacementForCurrentBinding atomically arms the deferred
+// probe pending mark for the session's current candidate binding AND records the
+// terminal failure on it, in one critical section. It is the saturated-fallback
+// twin of the replacement arm: the handler uses it when the bounded retry set
+// cannot take a rejected shed's recovery job, so the current binding is failed
+// directly instead of being left pending.
+//
+// The two writes must be one step. A row-only move (SetEffectiveMediaFileID) does
+// not advance the binding generation, so if the arm and the failure were separate
+// manager calls a B -> C -> B move could land between them: the failure's
+// binding-equality fence would then match the returned-to B and stamp this
+// fallback's failure onto a DIFFERENT, newer B lifecycle that another recovery
+// armed after the row came back. Arming and failing under one lock makes the
+// failure belong to exactly the lifecycle this call created, and a later arm for
+// the same binding is refused because the outcome is already terminal.
+func (m *SessionManager) FailVirtualProbeReplacementForCurrentBinding(sessionID, candidateURI string, ownerInstallationID int) (VirtualSourceBindingSnapshot, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	binding, armed, err := m.armVirtualProbeReplacementForCurrentBindingLocked(sessionID, candidateURI, ownerInstallationID)
+	if err != nil || !armed {
+		return binding, false, err
+	}
+	setVirtualProbeOutcomeLocked(m.sessions[sessionID], VirtualProbeOutcomeFailed)
+	return binding, true, nil
 }
 
 // SetVirtualSourceIfBinding applies the candidate handoff and updates the effective

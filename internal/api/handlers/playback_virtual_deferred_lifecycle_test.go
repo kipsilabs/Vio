@@ -2641,6 +2641,99 @@ func TestDeferredProbeAdmissionRecordsScheduledBindingAcrossRowMove(t *testing.T
 	}
 }
 
+// TestDeferredProbeRetryFoldKeepsServedReplacementOverStalePark is the
+// equal-generation folding barrier: a stale recovery arriving after a legitimate
+// replacement for the moved row is already parked must leave the replacement's
+// worker in the retry set. A row-only move does not advance the binding
+// generation, so the stale job and the live replacement carry the SAME
+// generation; a generation-only comparison would let the stale job evict the
+// live one and leave the moved row with no worker until the convergence
+// watchdog. The fold must keep the entry bound to the row the session serves.
+func TestDeferredProbeRetryFoldKeepsServedReplacementOverStalePark(t *testing.T) {
+	const uri = "virtual://movie/tt-fold-equal-gen?result=a"
+	fx := newDeferredLifecycleFixture(t, 730, uri)
+	// A row-only move points the session at row 731 at the unchanged generation.
+	if err := fx.manager.SetEffectiveMediaFileID(fx.session.ID, 731); err != nil {
+		t.Fatalf("SetEffectiveMediaFileID: %v", err)
+	}
+	binding, err := fx.manager.VirtualSourceBinding(fx.session.ID)
+	if err != nil {
+		t.Fatalf("VirtualSourceBinding: %v", err)
+	}
+	if binding.Generation == 0 || binding.EffectiveMediaFileID != 731 {
+		t.Fatalf("binding = %#v, want the moved row 731 at a nonzero generation", binding)
+	}
+
+	// served is the legitimate replacement armed for the row the session serves;
+	// stale is the shed job for the row the move superseded. Both share the key
+	// (session + candidate URI) and the generation.
+	served := &virtualDeferredProbeV3{
+		sessionID:         fx.session.ID,
+		file:              &models.MediaFile{ID: binding.EffectiveMediaFileID},
+		cand:              VirtualPlaybackStream{ID: "cand-1", URI: uri},
+		ownerID:           binding.OwnerInstallationID,
+		bindingGeneration: binding.Generation,
+		binding:           binding,
+	}
+	staleBinding := binding
+	staleBinding.EffectiveMediaFileID = 730
+	stale := *served
+	stale.file = &models.MediaFile{ID: 730}
+	stale.binding = staleBinding
+	if stale.bindingGeneration != served.bindingGeneration {
+		t.Fatalf("test setup: generations differ (%d vs %d); the barrier is about equal generations",
+			stale.bindingGeneration, served.bindingGeneration)
+	}
+
+	// The stale job must not displace the already-parked live replacement.
+	fx.handler.deferredProbeRetry = make(map[string]*virtualDeferredProbeV3)
+	fx.handler.deferredProbeMu.Lock()
+	fx.handler.parkDeferredProbeRetryLocked(served)
+	fx.handler.parkDeferredProbeRetryLocked(&stale)
+	kept := fx.handler.deferredProbeRetry[deferredProbeKey(served)]
+	fx.handler.deferredProbeMu.Unlock()
+	if kept != served {
+		t.Fatalf("fold kept the stale job for the superseded row; want the replacement bound to row %d", binding.EffectiveMediaFileID)
+	}
+
+	// The reverse arrival order must converge on the same entry: the served
+	// replacement replaces an existing stale park.
+	fx.handler.deferredProbeMu.Lock()
+	delete(fx.handler.deferredProbeRetry, deferredProbeKey(served))
+	fx.handler.parkDeferredProbeRetryLocked(&stale)
+	fx.handler.parkDeferredProbeRetryLocked(served)
+	kept = fx.handler.deferredProbeRetry[deferredProbeKey(served)]
+	fx.handler.deferredProbeMu.Unlock()
+	if kept != served {
+		t.Fatal("fold dropped the served replacement when it arrived after the stale park")
+	}
+}
+
+// TestDeferredProbeAdmissionDropsOwnerMovedBeforeCapture is the admission input
+// re-check: the job's stream URL and headers were resolved for one owner
+// installation, so a same-candidate move to a different owner before the binding
+// is captured must drop it. Probing the old installation's source and stamping its
+// verdict onto the new owner's binding is exactly what the candidate-URI-only
+// check could not see.
+func TestDeferredProbeAdmissionDropsOwnerMovedBeforeCapture(t *testing.T) {
+	const uri = "virtual://movie/tt-admit-owner-move?result=a"
+	fx := newDeferredLifecycleFixture(t, 735, uri)
+
+	deferred := fx.job(uri)
+	// The fixture's session is bound to owner 5; the job describes owner 9.
+	deferred.ownerID = 9
+	if fx.handler.armDeferredProbePending(context.Background(), deferred) {
+		t.Fatal("admission accepted a job resolved for a different owner installation")
+	}
+	live, err := fx.manager.GetSession(fx.session.ID)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if live.VirtualProbeOutcome != "" {
+		t.Fatalf("outcome = %q, want empty: a dropped job must not leave a pending mark", live.VirtualProbeOutcome)
+	}
+}
+
 // TestDeferredProbeRowMoveDuringPersistenceAdmitsReplacement is the
 // move-after-the-post-probe-check regression for the failed-terminal-CAS window:
 // a row-only move lands while the durable write is blocked, so the write commits
