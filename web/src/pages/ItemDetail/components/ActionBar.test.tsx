@@ -1,11 +1,24 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ComponentProps } from "react";
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Plus } from "lucide-react";
 import type { FileVersion } from "@/api/types";
 import ActionBar from "./ActionBar";
+
+const discoveryMocks = vi.hoisted(() => ({
+  capability: vi.fn(),
+  discover: vi.fn(),
+}));
+vi.mock("@/api/v2/virtualLibrary", () => ({
+  fetchVirtualLibraryCapability: discoveryMocks.capability,
+}));
+vi.mock("@/api/v2/mediaCandidates", () => ({
+  discoverVirtualCandidates: discoveryMocks.discover,
+  awaitVirtualCandidatesRefresh: vi.fn(),
+  cancelVirtualCandidatesRefresh: vi.fn(),
+}));
 
 const startPlayback = vi.fn();
 vi.mock("@/playback/watchPlaybackContext", () => ({
@@ -47,6 +60,70 @@ function renderActionBar(overrides: Partial<ActionBarProps> = {}) {
 describe("ActionBar", () => {
   afterEach(() => {
     startPlayback.mockClear();
+    discoveryMocks.capability.mockReset();
+    discoveryMocks.discover.mockReset();
+  });
+
+  it.each([
+    "virtual://movie/tt123",
+    "virtual://series/tt123:1:2",
+    "virtual://series/tt123/1/2",
+    "virtual://series/tvdb/393159/3/1",
+    "virtual://series/tmdb/202555/1/2?profile=1080p",
+  ])(
+    "discovers %s before Play and refreshes the version queries",
+    async (filePath) => {
+      discoveryMocks.capability.mockResolvedValue({ discover_before_playback: true });
+      let finish!: () => void;
+      discoveryMocks.discover.mockImplementation(
+        () =>
+          new Promise<void>((resolve) => {
+            finish = resolve;
+          }),
+      );
+      const invalidate = vi.spyOn(QueryClient.prototype, "invalidateQueries");
+      const version = { ...selectedVersion, file_path: filePath };
+      renderActionBar({ contentId: "media-1", versions: [version], selectedVersion: version });
+      expect(await screen.findByText("Finding versions")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Play" })).toBeEnabled();
+      expect(discoveryMocks.discover).toHaveBeenCalledWith("media-1", expect.any(AbortSignal));
+      expect(startPlayback).not.toHaveBeenCalled();
+      await act(async () => finish());
+      await waitFor(() => expect(invalidate).toHaveBeenCalledTimes(2));
+      expect(screen.queryByText("Finding versions")).not.toBeInTheDocument();
+      invalidate.mockRestore();
+    },
+  );
+
+  it("keeps playback-time discovery when the option is off", async () => {
+    discoveryMocks.capability.mockResolvedValue({ discover_before_playback: false });
+    const version = { ...selectedVersion, file_path: "virtual://movie/tt123" };
+    renderActionBar({ contentId: "movie-1", versions: [version], selectedVersion: version });
+    await waitFor(() => expect(discoveryMocks.capability).toHaveBeenCalledOnce());
+    expect(discoveryMocks.discover).not.toHaveBeenCalled();
+    expect(screen.queryByText("Finding versions")).not.toBeInTheDocument();
+  });
+
+  it.each([
+    "/media/movie.mkv",
+    "virtual://series/tt123",
+    "virtual://series/tt123/1",
+    "virtual://series/tvdb/393159",
+    "virtual://series/tmdb/202555",
+  ])("does not discover %s", (filePath) => {
+    const version = { ...selectedVersion, file_path: filePath };
+    renderActionBar({ contentId: "media-1", versions: [version], selectedVersion: version });
+    expect(discoveryMocks.capability).not.toHaveBeenCalled();
+    expect(discoveryMocks.discover).not.toHaveBeenCalled();
+  });
+
+  it("keeps Play enabled when discovery fails", async () => {
+    discoveryMocks.capability.mockResolvedValue({ discover_before_playback: true });
+    discoveryMocks.discover.mockRejectedValue(new Error("provider unavailable"));
+    const version = { ...selectedVersion, file_path: "virtual://movie/tt123" };
+    renderActionBar({ contentId: "movie-1", versions: [version], selectedVersion: version });
+    expect(await screen.findByText("Versions unavailable. Retry with Play.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Play" })).toBeEnabled();
   });
 
   it.each([

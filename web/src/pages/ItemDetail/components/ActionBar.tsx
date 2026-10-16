@@ -38,6 +38,7 @@ import {
 } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useDeleteMediaItem } from "@/hooks/queries/items";
+import { usePreplayDiscovery } from "@/hooks/usePreplayDiscovery";
 import {
   awaitVirtualCandidatesRefresh,
   cancelVirtualCandidatesRefresh,
@@ -349,6 +350,12 @@ export default function ActionBar({
   const showTrickplay = isAdmin && canManageTrickplay && !!contentId;
   const deleteMediaItem = useDeleteMediaItem();
   const queryClient = useQueryClient();
+  const virtualDetail = !!versions?.some((version) =>
+    /^virtual:\/\/(?:movie\/[^?]+|series\/[^?]+(?::\d+:\d+|\/\d+\/\d+))(?:\?|$)/.test(
+      version.file_path ?? "",
+    ),
+  );
+  const { discovering, failed: discoveryFailed } = usePreplayDiscovery(contentId, virtualDetail);
   const { awaitAdminJob } = useRealtimeEvents();
   // The item-page "Refresh List": start the async re-list job, wait for it to
   // finish, then re-read the item and the watch detail so both the page's
@@ -1135,8 +1142,22 @@ export default function ActionBar({
       {/* flex-wrap matters: without it this row's min-content width (two or
           three nowrap trigger buttons) inflates the auto-sized hero column
           past narrow viewports, clipping the whole info column. */}
-      {hasStreamControls && (
+      {(hasStreamControls || discovering || discoveryFailed) && (
         <div className="detail-stream-actions flex min-w-0 flex-wrap items-center gap-2">
+          {discovering && (
+            <span
+              role="status"
+              className="text-muted-foreground inline-flex items-center gap-2 text-xs"
+            >
+              <Loader2 aria-hidden="true" className="size-3.5 animate-spin" />
+              Finding versions
+            </span>
+          )}
+          {!discovering && discoveryFailed && (
+            <span role="status" className="text-muted-foreground text-xs">
+              Versions unavailable. Retry with Play.
+            </span>
+          )}
           {versions && hasMultipleVersions && selectedVersion && onSelectVersion && (
             <VersionDropdown
               versions={versions}

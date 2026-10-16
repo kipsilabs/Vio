@@ -158,7 +158,50 @@ malformed id is `422`; an unconfigured provider is `503`.
 when either path is wired and `not_configured` otherwise. `indexer_search`
 reports whether Prowlarr search is configured and `indexer_request` whether
 provider enqueue is configured; clients that cannot request releases must not
-offer the action.
+offer the action. `discover_before_playback` reports whether opt-in pre-play
+version discovery is enabled and wired; it also makes `state` available.
+
+### Pre-play Discovery
+
+`virtual_library.discover_before_playback` is a server-wide streaming setting,
+defaulting to `false`. The capability and discovery operation read it on each
+request, so saving the setting does not require a restart.
+
+When enabled, the web detail page calls
+`POST /api/v2/media/{media_id}/virtual-candidates:discover` for the selected
+virtual movie or episode, without waiting for Play. The operation enforces the
+same account/profile access filter as watch detail. It reuses the provider
+candidate cache, coalesces concurrent discovery of the same source, persists
+successful non-empty listings, and answers `204 No Content`. A disabled or
+unwired service answers `503`; a whole-series or non-virtual target answers
+`422`. Provider failures leave existing candidates intact.
+
+Discovery does not request downloads, search indexers, or open media URLs.
+After success, clients reload item and watch detail to display the persisted
+versions. Play remains available during discovery, and playback-time resolution
+remains the fallback. The web client initiates discovery only for detail views,
+not list cards or whole seasons/series, and reuses a recent discovery for 30
+seconds. Native clients and Jellyfin clients keep their existing playback-time
+behavior when the setting is off.
+
+When enabled, `GET /api/v2/watch/{id}` also discovers versions after checking
+access for a virtual movie or individual episode. It uses the same cached
+discovery service and re-reads watch detail before answering, so existing
+native clients receive the persisted versions without calling the
+discovery operation themselves. Discovery has a 15-second waiting budget.
+On failure, the original detail is returned; shared provider work may finish
+after that wait and be visible on a later request.
+Catalog item detail reads never initiate pre-play discovery: artwork and
+metadata can render before the web's discovery call or the native client's
+watch-detail enrichment finishes. Local-file details, browse results, and
+season/series lists do not trigger it.
+Client-side watch-detail prefetches can trigger discovery; a view served entirely
+from the client's cache cannot. This does not add a Jellyfin-protocol trigger.
+
+Server logs identify this path with `pre-play version discovery started`,
+`pre-play version discovery completed`, or `pre-play version discovery unavailable`
+and `trigger=watch_detail`. A successful discovery
+followed by a failed detail re-read logs `pre-play version discovery detail reload failed`.
 
 ### Refresh List
 

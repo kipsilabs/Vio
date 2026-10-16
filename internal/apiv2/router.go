@@ -308,7 +308,9 @@ type Dependencies struct {
 	// VirtualCandidatesRefresh queues the asynchronous re-list of a virtual
 	// item's provider candidates. A missing service makes only that operation
 	// answer dependency_unavailable.
-	VirtualCandidatesRefresh VirtualCandidatesRefreshService
+	VirtualCandidatesRefresh   VirtualCandidatesRefreshService
+	VirtualCandidatesDiscovery VirtualCandidatesDiscoveryService
+	PreplayDiscoveryEnabled    func(context.Context) bool
 	// VirtualReleaseRequest requests one stored indexer release on the
 	// provider. A missing service makes only that operation answer
 	// dependency_unavailable.

@@ -22,6 +22,7 @@ import { SettingField, SettingFieldStatus } from "./SettingField";
 
 const PROVIDER_KEYS = [
   "virtual_library.enabled",
+  "virtual_library.discover_before_playback",
   "virtual_library.manifest_url",
   "virtual_library.tmdb_api_key",
   "virtual_library.cache_ttl_minutes",
@@ -259,6 +260,14 @@ export default function StreamingSettings() {
             value={form.getValue("virtual_library.manifest_url")}
             onChange={(v) => form.setValue("virtual_library.manifest_url", v)}
             restartRequired={restartKeys.has("virtual_library.manifest_url")}
+          />
+          <SettingField
+            label="Discover versions before playback"
+            type="toggle"
+            description="List available versions when a movie or episode is opened. When off, discovery starts at playback."
+            value={form.getValue("virtual_library.discover_before_playback") || "false"}
+            onChange={(v) => form.setValue("virtual_library.discover_before_playback", v)}
+            restartRequired={restartKeys.has("virtual_library.discover_before_playback")}
           />
           <SettingField
             label="TMDB API key"

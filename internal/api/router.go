@@ -1419,6 +1419,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 				// access-checked detail read.
 				if itemsHandler != nil {
 					virtualCandidatesRefresh = &handlers.VirtualCandidatesRefreshService{
+						ListCached: playbackHandler.VirtualPlaybackStreamLister,
 						ListFresh: handlers.VirtualPlaybackStreamListerFunc(func(ctx context.Context, path string, userID int, profileID string, ownerInstallationID int) ([]handlers.VirtualPlaybackStream, error) {
 							// Explicit user refresh: a provider list does run,
 							// so the fetch log is correlated like the start
@@ -3306,6 +3307,17 @@ func newChiRouter(deps Dependencies) chi.Router {
 	}
 	if virtualRefreshJobs != nil {
 		v2deps.VirtualCandidatesRefresh = virtualRefreshJobs
+	}
+	if virtualCandidatesRefresh != nil && settingsRepo != nil {
+		v2deps.VirtualCandidatesDiscovery = virtualCandidatesRefresh
+		v2deps.PreplayDiscoveryEnabled = func(ctx context.Context) bool {
+			enabled, err := settingsRepo.Get(ctx, "virtual_library.discover_before_playback")
+			if err != nil || enabled != "true" {
+				return false
+			}
+			streaming, err := settingsRepo.Get(ctx, "virtual_library.enabled")
+			return err == nil && streaming != "false"
+		}
 	}
 	if virtualIndexerReleases != nil {
 		v2deps.VirtualReleaseRequest = virtualIndexerReleases
