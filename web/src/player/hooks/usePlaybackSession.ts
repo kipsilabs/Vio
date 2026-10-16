@@ -2759,11 +2759,19 @@ export function usePlaybackSession(
    */
   const reportSessionLost = useCallback(() => {
     // Nothing played before the session was answered gone, so no reconnect
-    // cycle recorded where the viewer asked to start. Carry the start request's
-    // own position and the adopted plan's play intent, so Retry rebuilds the
-    // session there instead of at zero or at a stale cycle's position.
+    // cycle recorded where the viewer asked to start. Carry where playback was
+    // actually set to start and the adopted plan's play intent, so Retry
+    // rebuilds the session there instead of at zero or at a stale cycle's
+    // position. An adopted plan owns the server-resolved source position; only
+    // an explicit start (forceStartPosition) keeps the request's own position,
+    // and before any plan is adopted `playbackPositionRef` still mirrors the
+    // request position.
     const reconnect = reconnectRef.current;
-    reconnect.positionSeconds = startIntentRef.current.position;
+    const startIntent = startIntentRef.current;
+    const resumeFromAdoptedPlan = hasAdoptedPlanRef.current && !startIntent.forceStartPosition;
+    reconnect.positionSeconds = resumeFromAdoptedPlan
+      ? playbackPositionRef.current
+      : startIntent.position;
     reconnect.resume = planAutoPlayRef.current;
     giveUpReconnect(CONNECTION_LOST_ERROR);
   }, [giveUpReconnect]);

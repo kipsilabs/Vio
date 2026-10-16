@@ -8937,6 +8937,50 @@ describe("usePlaybackSession mid-stream reconnect", () => {
     rendered.unmount();
   });
 
+  it("retries a pre-first-frame loss from the server-resolved resume position", async () => {
+    // The caller asked for automatic resume (position zero); the server
+    // resolved where it actually starts.
+    const resumedPlan = fixturePlanV3({ session_id: "session-1" });
+    resumedPlan.timeline = {
+      ...resumedPlan.timeline,
+      source_start_seconds: 275,
+      player_start_seconds: 5,
+      timeline_offset_seconds: 270,
+    };
+    const harness = reconnectHarness({
+      initialPlan: resumedPlan,
+      replan: () =>
+        jsonResponse(
+          { error: "playback_session_not_found", message: "Playback session not found" },
+          { status: 404 },
+        ),
+      restart: () => jsonResponse(playable("session-2"), { status: 201 }),
+    });
+    const rendered = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(rendered.result.current.planRevision).toBe(1));
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+
+    // The session is answered gone before the first frame, so no reconnect
+    // cycle recorded the server-resolved resume.
+    act(() => rendered.result.current.reportSessionLost());
+    expect(rendered.result.current.connectionStatus).toBe("lost");
+
+    // Retry must rebuild at the adopted plan's position, not the request zero.
+    act(() => rendered.result.current.retryConnection());
+    await advance(0);
+
+    const restart = harness.startBodies[1];
+    expect(restart?.start_position).toBe(275);
+    expect(rendered.result.current.sessionId).toBe("session-2");
+    expect(rendered.result.current.connectionStatus).toBe("connected");
+    expect(rendered.result.current.shouldAutoPlay).toBe(true);
+
+    rendered.unmount();
+  });
+
   it("runs the reconnect's pending attempt immediately when a gone session is reported", async () => {
     const harness = reconnectHarness({ replan: () => unreachable() });
     const { result, unmount } = await startPlaying();
