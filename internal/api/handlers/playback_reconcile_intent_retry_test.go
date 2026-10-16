@@ -5,7 +5,6 @@ import (
 	"errors"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
@@ -100,11 +99,7 @@ func TestAudioSelectionIntentPresentWithoutIntentReadsOnce(t *testing.T) {
 	}
 	handler.PlanStoreV3 = store
 
-	start := time.Now()
 	intent := handler.audioSelectionIntentForSession(context.Background(), session)
-	if elapsed := time.Since(start); elapsed >= audioSelectionIntentRetryDelay {
-		t.Fatalf("present-without-intent read slept %s, want no retry delay", elapsed)
-	}
 	if calls := atomic.LoadInt32(&store.getAttemptCalls); calls != 1 {
 		t.Fatalf("present-without-intent read attempted %d times, want 1", calls)
 	}

@@ -360,6 +360,14 @@ func TestCarryValidatedVirtualVideoEvidenceV3DynamicRangeRoundTrip(t *testing.T)
 		file.VideoTracks[0].HDR10Plus = true
 		return file
 	}
+	// The probe's own range token names HDR10+ in the label alone, with the
+	// explicit boolean left false. The classifier must read the label so the
+	// carried row keeps its grade even without the boolean.
+	hdr10PlusLabelOnlyRow := func() *models.MediaFile {
+		file := baseRow()
+		file.VideoTracks[0].VideoRangeType = "HDR10Plus"
+		return file
+	}
 	// A profileless DV source carries only the "DOVI" range label: no profile
 	// and no base-layer provenance, the shape whose dynamic range was lost.
 	profilelessDVRow := func() *models.MediaFile {
@@ -382,10 +390,15 @@ func TestCarryValidatedVirtualVideoEvidenceV3DynamicRangeRoundTrip(t *testing.T)
 	cases := []struct {
 		name string
 		row  *models.MediaFile
+		// wantDynamicRange, when set, pins the grade the row must classify as
+		// before the carry. Without it a label-only HDR10+ row that falls back
+		// to HDR10 would still round-trip against its own misclassification.
+		wantDynamicRange string
 	}{
 		{name: "sdr", row: rangeRow("SDR")},
 		{name: "hdr10", row: rangeRow("HDR10")},
 		{name: "hdr10_plus", row: hdr10PlusRow()},
+		{name: "hdr10_plus_label_only", row: hdr10PlusLabelOnlyRow(), wantDynamicRange: playback.DynamicRangeHDR10PlusV3},
 		{name: "hlg", row: rangeRow("HLG")},
 		{name: "unknown_hdr", row: unknownHDRRow()},
 		{name: "dv_profileless", row: profilelessDVRow()},
@@ -395,6 +408,9 @@ func TestCarryValidatedVirtualVideoEvidenceV3DynamicRangeRoundTrip(t *testing.T)
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			descriptorIn := playback.SourceDescriptorFromFileV3(tc.row, -1)
+			if tc.wantDynamicRange != "" && descriptorIn.DynamicRange != tc.wantDynamicRange {
+				t.Fatalf("row classified as %q, want %q", descriptorIn.DynamicRange, tc.wantDynamicRange)
+			}
 			stub := virtualCarryRowV3()
 			got := carryValidatedVirtualVideoEvidenceV3(stub, descriptorIn)
 			if got == stub {

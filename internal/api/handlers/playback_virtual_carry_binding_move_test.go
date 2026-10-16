@@ -38,7 +38,8 @@ func TestReplanSameRowBindingMoveDoesNotPairStaleDescriptor(t *testing.T) {
 		slug string
 		// wantMovedPin asserts the plan was rebuilt for the moved pin. A seek
 		// reanchor instead reopens the frozen recipe, which still names the
-		// previous effective URI; its proof is the re-resolve itself.
+		// previous effective URI, so it must stay coherent with that recipe
+		// rather than adopt the moved pin.
 		wantMovedPin bool
 		request      func(fx *pinnedTrackChangeFixture, requestID string) playback.ReplanRequestV3
 	}{
@@ -62,12 +63,24 @@ func TestReplanSameRowBindingMoveDoesNotPairStaleDescriptor(t *testing.T) {
 			if response.Terminal != nil || response.PlaybackPlan == nil {
 				t.Fatalf("%s = plan %#v terminal %#v, want a plan", tc.slug, response.PlaybackPlan, response.Terminal)
 			}
-			if tc.wantMovedPin && response.PlaybackPlan.EffectiveVirtualURI != candidateB {
-				t.Fatalf("%s effective virtual URI = %q, want the moved pin %q", tc.slug, response.PlaybackPlan.EffectiveVirtualURI, candidateB)
+			if tc.wantMovedPin {
+				if response.PlaybackPlan.EffectiveVirtualURI != candidateB {
+					t.Fatalf("%s effective virtual URI = %q, want the moved pin %q", tc.slug, response.PlaybackPlan.EffectiveVirtualURI, candidateB)
+				}
+				if fx.detailCalls == 0 {
+					t.Fatalf("%s paired the running plan's descriptor with the moved pin without re-resolving", tc.slug)
+				}
+				return
 			}
-			if fx.detailCalls == 0 {
-				t.Fatalf("%s paired the running plan's descriptor with the moved pin without re-resolving", tc.slug)
+			// A seek reanchor instead reopens the frozen recipe, so the plan
+			// must keep describing the bytes already playing: the effective URI
+			// and the descriptor both have to name the previous pin. Pairing
+			// the moved candidate with the running plan's descriptor is exactly
+			// the franken-evidence this test exists to catch.
+			if response.PlaybackPlan.EffectiveVirtualURI != fx.started.PlaybackPlan.EffectiveVirtualURI {
+				t.Fatalf("%s effective virtual URI = %q, want the reopened frozen recipe's %q", tc.slug, response.PlaybackPlan.EffectiveVirtualURI, fx.started.PlaybackPlan.EffectiveVirtualURI)
 			}
+			assertVideoDescriptorRoundTripV3(t, fx.started.PlaybackPlan.Source, response.PlaybackPlan.Source)
 		})
 	}
 }
