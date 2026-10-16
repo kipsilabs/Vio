@@ -333,6 +333,14 @@ func TestClientAudioSignatureMatchesTrackUnknownTrackLanguageIsNeutral(t *testin
 			sig:   &userstore.AudioTrackSignature{Language: "en", Codec: "aac", Channels: 2},
 		},
 		{
+			// The stated language carries a region, so it would be regionally
+			// refused by any explicit variant the track named; a bare sentinel
+			// names none and stays missing evidence.
+			name:  "bare MULTI sentinel is neutral for a stated regional language",
+			track: models.AudioTrack{Language: "mul", Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Language: "en-US", Codec: "aac", Channels: 2},
+		},
+		{
 			name:  "bare DUAL sentinel with no member list",
 			track: models.AudioTrack{Language: "dual", Codec: "aac", Channels: 2},
 			sig:   &userstore.AudioTrackSignature{Language: "en", Codec: "aac", Channels: 2},
@@ -400,6 +408,16 @@ func TestClientAudioSignatureMatchesTrackRegionalRuleMatrix(t *testing.T) {
 			name:  "primary: script conflict refuses",
 			track: track("zh-Hant"),
 			sig:   &userstore.AudioTrackSignature{Language: "zh-Hans", Codec: "aac", Channels: 2},
+			want:  false,
+		},
+		{
+			// The track's own primary language is a bare sentinel, but its
+			// MULTi member names a different concrete region: the stated region
+			// is still refused through that member. Only a sentinel with no
+			// concrete member is neutral.
+			name:  "primary: sentinel primary with a different concrete member refuses the stated region",
+			track: track("mul", "en-GB"),
+			sig:   &userstore.AudioTrackSignature{Language: "en-US", Codec: "aac", Channels: 2},
 			want:  false,
 		},
 		// MULTi Languages member: the same rule, expressed in the other field.

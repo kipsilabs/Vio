@@ -71,6 +71,22 @@ func audioOrdinalSynthesizedZeroIndexFixtureFileV3(t *testing.T) *models.MediaFi
 	return file
 }
 
+// audioOrdinalPostRemovalFixtureFileV3 models the inventory a replacement plan
+// actually selects against AFTER a verified overlay removed a plan-time track:
+// the plan-time list [eng#1, fra#3, spa#5] loses the committed fra#3, leaving
+// the genuinely reduced [spa#5, eng#1]. Array order is the reverse of the
+// absolute container order, so an array-position ordinal would name the other
+// stream.
+func audioOrdinalPostRemovalFixtureFileV3(t *testing.T) *models.MediaFile {
+	t.Helper()
+	file := v3HandlerFixtureFile(t)
+	file.AudioTracks = []models.AudioTrack{
+		{Index: 5, Language: "spa", Codec: "aac", Channels: 2, Layout: "stereo"},
+		{Index: 1, Language: "eng", Codec: "aac", Channels: 2, Layout: "stereo", Default: true},
+	}
+	return file
+}
+
 // audioOrdinalPlanV3 is a transcode plan whose SelectedTracks.Audio.Index is
 // the array position of the selected audio track (the protocol domain).
 func audioOrdinalPlanV3(selectedAudioIndex int) *playback.PlanV3 {
@@ -393,10 +409,11 @@ func TestPrepareRemoteTransportV3AudioTrackIndexIsAudioOnlyOrdinal(t *testing.T)
 // the real remote transcode-start request from the fail-closed state a verified
 // absence leaves behind (session index -1) and proves the ordinal sent to the
 // node still names the intended audio, not merely the helper's return value.
-// Two shapes are covered: a committed selection whose track was removed from the
-// session index while the plan still names it, and a verified inventory whose
-// array order is reversed relative to the absolute container stream order, where
-// an array-position ordinal would point at the other stream.
+// Two shapes are covered: a replacement plan built against the genuinely reduced
+// post-removal inventory (the removed track is gone, not merely deselected), and
+// a verified inventory whose array order is reversed relative to the absolute
+// container stream order, where an array-position ordinal would point at the
+// other stream.
 func TestPrepareRemoteTransportV3ResolvesCommittedAudioAfterRemovalOrReorder(t *testing.T) {
 	reordered := func(t *testing.T) *models.MediaFile {
 		t.Helper()
@@ -417,11 +434,11 @@ func TestPrepareRemoteTransportV3ResolvesCommittedAudioAfterRemovalOrReorder(t *
 		wantLanguage string
 	}{
 		{
-			name:         "removed track: the committed plan index survives the -1 session sentinel",
-			file:         audioOrdinalFixtureFileV3(t),
-			planIndex:    1, // the French track at stream 3
+			name:         "removed track: the replacement plan selects against the reduced inventory",
+			file:         audioOrdinalPostRemovalFixtureFileV3(t),
+			planIndex:    0, // the Spanish track at stream 5, array position 0 post-removal
 			wantOrdinal:  1,
-			wantLanguage: "fra",
+			wantLanguage: "spa",
 		},
 		{
 			name:         "reordered inventory: the plan index maps through the absolute stream index",

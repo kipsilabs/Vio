@@ -422,20 +422,35 @@ func TestVirtualAudioSelectionInvalidClearsOnStreamStateCommit(t *testing.T) {
 // inventory answers the retryable 409, and once the client's recovery replan
 // commits an acceptable replacement through the same stream-state apply the v3
 // replan performs (replaceSession -> UpdateStreamState), the same transport
-// serves media instead of the error. The verified-empty inventory — the probe
-// committed that the file carries no audio at all — is the other variant.
+// serves media instead of the error. Two variants are covered. A removal with a
+// surviving verified track recovers onto that track. A verified-empty inventory
+// — the probe committed that the file carries no audio at all — recovers to
+// video-only playback: the recovery commits exactly the verified empty inventory
+// with no audio selection, and the transport serves the source without a
+// fabricated track. The empty inventory is the only honest replacement, so the
+// test asserts the derived audio-only ordinal is the no-audio sentinel rather
+// than naming a stream the probe never saw.
 func TestVirtualAudioSelectionInvalidRecoveryServesMedia(t *testing.T) {
 	cases := []struct {
-		name     string
-		verified []models.AudioTrack
+		name        string
+		verified    []models.AudioTrack
+		recovered   []models.AudioTrack
+		wantIndex   int
+		wantOrdinal int
 	}{
 		{
-			name:     "removed committed track",
-			verified: []models.AudioTrack{{Index: 1, Language: "en", Codec: "aac", Channels: 2, Layout: "stereo"}},
+			name:        "removed committed track",
+			verified:    []models.AudioTrack{{Index: 1, Language: "en", Codec: "aac", Channels: 2, Layout: "stereo"}},
+			recovered:   []models.AudioTrack{{Index: 1, Language: "en", Codec: "aac", Channels: 2, Layout: "stereo"}},
+			wantIndex:   0,
+			wantOrdinal: 0,
 		},
 		{
-			name:     "verified-empty inventory",
-			verified: nil,
+			name:        "verified-empty inventory recovers to video-only",
+			verified:    nil,
+			recovered:   nil,
+			wantIndex:   -1,
+			wantOrdinal: -1,
 		},
 	}
 	for _, tc := range cases {
@@ -503,15 +518,16 @@ func TestVirtualAudioSelectionInvalidRecoveryServesMedia(t *testing.T) {
 			// The client's recovery replan commits an acceptable replacement. The
 			// v3 replan applies the fresh plan's stream state through this same
 			// manager seam, which installs the selection and clears the marker.
-			recoveredTracks := []models.AudioTrack{{Index: 1, Language: "en", Codec: "aac", Channels: 2, Layout: "stereo"}}
+			// The recovered inventory is the case's verified replacement, never
+			// a track the probe did not report.
 			if err := manager.UpdateStreamState(session.ID, playback.SessionStreamState{
 				PlayMethod:                    playback.PlayRemux,
 				BasePlayMethod:                playback.PlayRemux,
-				AudioTrackIndex:               0,
+				AudioTrackIndex:               tc.wantIndex,
 				VirtualSourceOwnershipSet:     true,
 				VirtualSourceURI:              pinned,
 				VirtualSubtitleEvidenceSet:    true,
-				VirtualAudioTracks:            recoveredTracks,
+				VirtualAudioTracks:            tc.recovered,
 				VirtualSubtitleEvidenceURI:    pinned,
 				VirtualSubtitleEvidenceFileID: file.ID,
 			}); err != nil {
@@ -521,8 +537,17 @@ func TestVirtualAudioSelectionInvalidRecoveryServesMedia(t *testing.T) {
 			if err != nil {
 				t.Fatalf("GetSession after recovery: %v", err)
 			}
-			if live.VirtualAudioSelectionInvalid || live.AudioTrackIndex != 0 {
+			if live.VirtualAudioSelectionInvalid || live.AudioTrackIndex != tc.wantIndex {
 				t.Fatalf("recovery did not install a valid selection: index=%d invalid=%v", live.AudioTrackIndex, live.VirtualAudioSelectionInvalid)
+			}
+			if len(live.VirtualAudioTracks) != len(tc.recovered) {
+				t.Fatalf("recovery installed %d audio tracks, want the committed %d: %+v", len(live.VirtualAudioTracks), len(tc.recovered), live.VirtualAudioTracks)
+			}
+			// The transport derives its audio-only ordinal from this list. The
+			// verified-empty recovery must name no audio stream: a fabricated
+			// index would mux a track the probe said does not exist.
+			if got := playback.AudioStreamOrdinal(live.VirtualAudioTracks, live.AudioTrackIndex); got != tc.wantOrdinal {
+				t.Fatalf("recovered audio ordinal = %d, want %d", got, tc.wantOrdinal)
 			}
 
 			// The same transport now serves media instead of the 409.
@@ -549,5 +574,166 @@ func TestVirtualAudioSelectionInvalidRecoveryServesMedia(t *testing.T) {
 				t.Fatalf("post-recovery delivery = %d %q, want 200 with media bytes", rec.Code, rec.Body.String())
 			}
 		})
+	}
+}
+
+// virtualRemuxSelectionRecoveryFixture starts a real v3 virtual session on the
+// remux route so the fail-closed audio gate applies: the client advertises HLS
+// only, so the planner copies the H.264 video into HLS (PlayRemux) instead of
+// taking the direct route the gate would skip. The catalog row already carries
+// the concrete pinned candidate and probed evidence, so the start binds to that
+// candidate with its plan-time inventory captured.
+type virtualRemuxSelectionRecoveryFixture struct {
+	handler   *PlaybackHandler
+	manager   *playback.SessionManager
+	source    *models.MediaFile
+	start     playback.StartRequestV3
+	started   playback.DecisionResponseV3
+	pinnedURI string
+}
+
+func newVirtualRemuxSelectionRecoveryFixture(t *testing.T) *virtualRemuxSelectionRecoveryFixture {
+	t.Helper()
+	source := v3HandlerFixtureFile(t)
+	source.ID = 741
+	source.ContentID = "movie-selection-recovery"
+	source.FilePath = "virtual://movie/tt-selection-recovery"
+	source.VirtualOwnerInstallationID = 5
+	source.AudioTracks = []models.AudioTrack{
+		{Index: 0, Codec: "aac", Channels: 2, Layout: "stereo", Language: "eng", Default: true},
+		{Index: 1, Codec: "aac", Channels: 2, Layout: "stereo", Language: "spa"},
+	}
+	probedAt := time.Now().Add(-time.Hour)
+	source.ProbeUpdatedAt = &probedAt
+	pinnedURI := withVirtualResultKey(source.FilePath, "pinned")
+	source.FilePath = pinnedURI
+
+	manager := playback.NewSessionManager(0, 0)
+	handler := NewPlaybackHandler(manager, mapPlaybackFileResolver{files: map[int]*models.MediaFile{source.ID: source}})
+	stubCopySeekAnchorV3(handler)
+	handler.PlaybackConfig = playbackTestConfig(writePlaybackTestFFmpeg(t), t.TempDir())
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{
+		"allow_4k_transcode":                     "true",
+		"playback.max_virtual_failover_attempts": "3",
+	}}
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	handler.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(_ context.Context, virtualURI string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+		return ResolvedVirtualMedia{URL: "http://127.0.0.1:9/stream?path=" + virtualURI, URI: virtualURI, CandidateID: virtualResultCandidateID(virtualURI)}, nil
+	})
+	handler.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(func(_ context.Context, path string, _ int, _ string, _ int) (string, error) {
+		return "http://127.0.0.1:9/stream?path=" + path, nil
+	})
+	handler.VirtualPlaybackStreamLister = VirtualPlaybackStreamListerFunc(func(_ context.Context, _ string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
+		return []VirtualPlaybackStream{{
+			ID: "pinned", URI: pinnedURI,
+			Resolution: source.Resolution, CodecVideo: source.CodecVideo, CodecAudio: source.CodecAudio, Container: source.Container,
+		}}, nil
+	})
+	handler.VirtualPlaybackSourceProber = func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
+		f.VideoTracks = source.VideoTracks
+		f.AudioTracks = source.AudioTracks
+		f.CodecVideo, f.CodecAudio, f.Resolution, f.Container = source.CodecVideo, source.CodecAudio, source.Resolution, source.Container
+		return f, nil
+	}
+
+	start := v3HandlerStartRequest()
+	start.FileID = source.ID
+	start.QualityPreference = "auto"
+	start.ClientPlaybackContext.Deliveries = map[string]playback.DeliveryCapabilityV3{
+		playback.DeliveryClassHLSV3: {Enabled: true, SupportedOnDevice: true, Containers: []string{"hls"}, VideoCodecs: []string{"h264"}, AudioDecodeCodecs: []string{"aac"}},
+	}
+	fx := &virtualRemuxSelectionRecoveryFixture{
+		handler: handler, manager: manager, source: source, start: start, pinnedURI: pinnedURI,
+	}
+	fx.started = startV3PlaybackForHandlerTest(t, handler, start)
+	t.Cleanup(func() { _ = manager.StopSession(fx.started.SessionID) })
+	return fx
+}
+
+// TestVirtualAudioSelectionInvalidRecoveryReplanCommitsValidTransport drives the
+// whole fail-closed chain through the real replan entry point, which the
+// seam-only recovery tests never reached: a real v3 virtual remux session whose
+// committed audio selection is removed by the verified overlay answers the
+// retryable 409, and the client's recovery replan runs through
+// HandleReplanPlaybackV3 (durable attempt, lease, transport commit) to a valid,
+// in-inventory selection whose derived remux ordinal names a real stream. It
+// proves the recovery is production behavior, not an artifact of calling the
+// session mutators directly.
+func TestVirtualAudioSelectionInvalidRecoveryReplanCommitsValidTransport(t *testing.T) {
+	fx := newVirtualRemuxSelectionRecoveryFixture(t)
+	sessionID := fx.started.SessionID
+
+	// The committed selection moves to the non-default Spanish track, then the
+	// verified overlay reports it gone. remapAudioSelectionIndex cannot
+	// re-identify it, so the session records the fail-closed sentinel.
+	if err := fx.manager.UpdateAudioTrack(sessionID, 1, playback.PlayRemux); err != nil {
+		t.Fatalf("UpdateAudioTrack: %v", err)
+	}
+	binding, err := fx.manager.VirtualSourceBinding(sessionID)
+	if err != nil {
+		t.Fatalf("VirtualSourceBinding: %v", err)
+	}
+	verified := []models.AudioTrack{{Index: 0, Codec: "aac", Channels: 2, Layout: "stereo", Language: "eng", Default: true}}
+	if applied, err := fx.manager.SetVirtualProbeVerifiedInventoryIfBinding(sessionID, binding, "rev", verified, nil, nil); err != nil || !applied {
+		t.Fatalf("SetVirtualProbeVerifiedInventoryIfBinding = %v, %v; want applied", applied, err)
+	}
+	invalid, err := fx.manager.GetSession(sessionID)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if !invalid.VirtualAudioSelectionInvalid || invalid.AudioTrackIndex != -1 {
+		t.Fatalf("fixture not invalid: index=%d invalid=%v", invalid.AudioTrackIndex, invalid.VirtualAudioSelectionInvalid)
+	}
+	if invalid.PlayMethod != playback.PlayRemux {
+		t.Fatalf("session play method = %s, want PlayRemux so the audio gate applies", invalid.PlayMethod)
+	}
+
+	// The real transport fails closed before muxing the wrong stream.
+	assertStreamAudioSelectionRejected(t, fx.manager, mapPlaybackFileResolver{files: map[int]*models.MediaFile{fx.source.ID: fx.source}}, sessionID, fx.pinnedURI)
+
+	// The client's recovery replan selects the surviving English track.
+	english := 0
+	recovery := playback.ReplanRequestV3{
+		ProtocolVersion:   playback.ProtocolV3,
+		Operation:         playback.ReplanOperationTrackChangeV3,
+		PlaybackAttemptID: fx.start.PlaybackAttemptID,
+		ReplanRequestID:   "selection-recovery-0001",
+		FailedPlanID:      fx.started.PlaybackPlan.PlanID,
+		PlanAttemptID:     "selection-recovery-0001-plan",
+		PlanAttemptKey:    fx.started.PlaybackPlan.PlanAttemptKey,
+		AttemptCount:      1,
+		PositionSeconds:   10,
+		QualityPreference: "auto",
+		SelectedTracks: playback.SelectedTracksV3{
+			Audio: &playback.TrackIdentityV3{ID: playback.TrackIDV3(fx.source.ID, "audio", english), Index: &english},
+		},
+		Capabilities:          fx.start.Capabilities,
+		ClientPlaybackContext: fx.start.ClientPlaybackContext,
+	}
+	response := postPlaybackReplanV3(t, fx.handler, sessionID, recovery)
+	if response.Terminal != nil || response.PlaybackPlan == nil {
+		t.Fatalf("recovery replan = terminal %#v plan %#v, want a committed plan", response.Terminal, response.PlaybackPlan)
+	}
+	if response.PlaybackPlan.SelectedTracks.Audio == nil || response.PlaybackPlan.SelectedTracks.Audio.Index == nil ||
+		*response.PlaybackPlan.SelectedTracks.Audio.Index != english {
+		t.Fatalf("recovery plan audio selection = %#v, want index %d", response.PlaybackPlan.SelectedTracks.Audio, english)
+	}
+
+	// The committed session carries the fresh selection and no marker, the
+	// binding did not move, and the derived remux ordinal names the English
+	// stream rather than the sentinel or the removed Spanish track.
+	recovered, err := fx.manager.GetSession(sessionID)
+	if err != nil {
+		t.Fatalf("GetSession after recovery: %v", err)
+	}
+	if recovered.VirtualAudioSelectionInvalid || recovered.AudioTrackIndex != english {
+		t.Fatalf("recovery did not commit a valid selection: index=%d invalid=%v", recovered.AudioTrackIndex, recovered.VirtualAudioSelectionInvalid)
+	}
+	if recovered.VirtualSourceURI != fx.pinnedURI {
+		t.Fatalf("recovery moved the binding to %q, want the unchanged pin %q", recovered.VirtualSourceURI, fx.pinnedURI)
+	}
+	bound := bindSessionVirtualSourceWithTracks(context.Background(), fx.source, recovered, fx.handler.fileResolver)
+	if got := audioStreamOrdinalV3(bound, recovered.AudioTrackIndex); got != english {
+		t.Fatalf("recovered remux ordinal = %d, want %d (the English stream)", got, english)
 	}
 }
