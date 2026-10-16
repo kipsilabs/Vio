@@ -719,6 +719,7 @@ function WatchPagePlayer({
     }
 
     const sessionId = session.sessionId;
+    const mediaFileId = session.mediaFileId;
     const inventoryUrl = session.inventoryUrl;
     let cancelled = false;
     let completedAttempts = 0;
@@ -729,15 +730,22 @@ function WatchPagePlayer({
     const scheduleNextPoll = () => {
       if (cancelled) return;
       const current = sessionRef.current;
+      // Mirror the legacy catalog poll's identity guard: a deferred round armed
+      // for one session (or file) must not mark a replacement, and the deferred
+      // round owns a different `inventory_url` when a fresh one re-arms. The live
+      // ref is read here rather than trusted from the closure.
       if (
         current.sessionId !== sessionId ||
+        current.mediaFileId !== mediaFileId ||
         !current.inventoryPending ||
         current.inventoryUrl !== inventoryUrl
       ) {
         return;
       }
       if (completedAttempts >= INVENTORY_REFRESH_MAX_ATTEMPTS || Date.now() >= deadline) {
-        sessionRef.current.markInventoryExhausted();
+        // The expected identity lets the shared guard drop a stale timer whose
+        // round was replaced after this callback was armed but before it fired.
+        sessionRef.current.markInventoryExhausted({ sessionId, mediaFileId });
         return;
       }
       const delay = inventoryPollDelayMs(scheduledAttempts, false);
@@ -798,6 +806,15 @@ function WatchPagePlayer({
     const needsSubtitles = playableSubtitles.length === 0 || session.subtitleInventoryProvisional;
     if (!needsAudio && !needsSubtitles) return;
 
+    // This poll is a fresh discovery round. If a previous round (the deferred
+    // `inventory_url` poll, or an earlier legacy round) already spent its budget
+    // and drew the terminal failure, hand the badge to this retry: the menus go
+    // back to "Discovering…" for as long as the catalog fallback is actually
+    // looking, and only its own exhausted budget re-marks the failure. Without
+    // this, the terminal "discovery did not complete" notice would sit beside an
+    // active retry.
+    sessionRef.current.markInventoryRetrying();
+
     const mediaFileId = session.mediaFileId;
     const sessionId = session.sessionId;
     // A serve-layer rotation can move the effective virtual source without
@@ -824,6 +841,20 @@ function WatchPagePlayer({
 
     const scheduleNextPoll = () => {
       if (cancelled) return;
+      // Mirror the deferred `inventory_url` poll's identity guard: a timer
+      // armed for one session (or file) must not mark a replacement, and a
+      // deferred round that re-armed while this timer was waiting owns the
+      // inventory now. The live ref is read here rather than trusted from the
+      // closure, so neither a replaced session nor a fresh deferred round is
+      // marked by a stale legacy timer.
+      const current = sessionRef.current;
+      if (
+        current.sessionId !== sessionId ||
+        current.mediaFileId !== mediaFileId ||
+        current.inventoryPending
+      ) {
+        return;
+      }
       const delay = inventoryPollDelayMs(scheduledAttempts, audioComplete && subtitlesComplete);
       if (delay === 0) return;
       // The budget is spent. A catalog read that came back empty is not proof
@@ -832,6 +863,13 @@ function WatchPagePlayer({
       // verified on its own. The badge and the server's declared state stay put
       // until an authoritative payload carries `inventory_status: "verified"`.
       if (completedAttempts >= INVENTORY_REFRESH_MAX_ATTEMPTS || Date.now() >= deadline) {
+        // Same contract as the deferred `inventory_url` poll: an exhausted
+        // budget on a still-declared menu is a terminal failure, not an
+        // indefinite "Discovering…". `markInventoryExhausted` only sets the
+        // failure while a menu is still provisional, so a verified list is
+        // never mislabeled. The expected identity lets it drop a stale timer
+        // from a replaced session.
+        sessionRef.current.markInventoryExhausted({ sessionId, mediaFileId });
         return;
       }
       scheduledAttempts += 1;
