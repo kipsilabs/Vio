@@ -57,6 +57,14 @@ import {
 } from "../utils/hlsStartupGuard";
 import { isSafariBrowserV3, resolveHLSEngineV3 } from "../utils/hlsEngine";
 import {
+  WINDOWED_MANIFEST_RELOAD_MIN_INTERVAL_MS,
+  hlsTargetWithinServedWindow,
+  servedHlsWindow,
+  shouldAdvanceHlsWindow,
+  withWindowedHlsManifest,
+  type ServedHlsWindow,
+} from "../utils/hlsWindowedManifest";
+import {
   hlsBufferPolicy,
   isTimeBuffered,
   maxBufferSizeBytes,
@@ -561,6 +569,18 @@ export function VideoPlayer({
   const networkRecoveryAttemptsRef = useRef(0);
   const staleGenerationRecoveriesRef = useRef(0);
   const lastRecoveryRef = useRef(0);
+  // Windowed synthetic transcode manifest state. `servedHlsWindowRef` is the
+  // media window the loaded playlist can actually serve (null until its level
+  // details arrive); the player refetches the manifest near the window edge and
+  // reanchors a seek that falls outside it. `windowReloadAtRef` rate-limits the
+  // refetch, which hls.js would not perform on its own for a VOD playlist.
+  // `windowReloadFromEndRef` is the served-window end the last refetch started
+  // from: a refetch that does not extend it means the server has no more media
+  // to offer, so the advance/recovery loop stops instead of refetching the same
+  // final window forever.
+  const servedHlsWindowRef = useRef<ServedHlsWindow | null>(null);
+  const windowReloadAtRef = useRef(0);
+  const windowReloadFromEndRef = useRef<number | null>(null);
   const reportedPlanFailureKeyRef = useRef<string | null>(null);
   // Whether the current transport has shown a frame. A network error after
   // that is a lost connection, not a route that cannot play. Reset whenever
@@ -803,6 +823,14 @@ export function VideoPlayer({
   // codec strings or from what the engine reports.
   const isHlsStream = plan.stream.protocol === "hls";
   const effectiveStreamUrl = streamUrl;
+  // An encoded transcode is served from a synthetic playlist. Opt that route
+  // into the bounded window, so the playlist the client reloads during playback
+  // stays small; the whole-title manifest is still served while the title fits
+  // it, and every other route (copy remux, direct play) ignores the parameter.
+  const hlsStreamUrl = withWindowedHlsManifest(
+    effectiveStreamUrl,
+    isHlsStream && plan.delivery === "server_transcode_hls",
+  );
   const isPlayerReady = effectiveStreamUrl !== "";
   const planRef = useRef(plan);
   planRef.current = plan;
@@ -1399,7 +1427,20 @@ export function VideoPlayer({
         return true;
       }
 
-      if (canSeekAnywhere || isNativePositionInRanges(video.seekable, nativeSeconds)) {
+      // A windowed transcode playlist is seekable across the whole media
+      // timeline, but its omitted prefix is only EXT-X-GAP placeholders and its
+      // end is short of the title. A target in either region has no real segment
+      // to load — hls.js would silently skip forward to the window start or stall
+      // at the end — so it is treated as an out-of-window target and routed
+      // through the reanchor path below.
+      const servedWindow = servedHlsWindowRef.current;
+      const outsideServedWindow =
+        isHlsStream && !hlsTargetWithinServedWindow(servedWindow, nativeSeconds);
+
+      if (
+        !outsideServedWindow &&
+        (canSeekAnywhere || isNativePositionInRanges(video.seekable, nativeSeconds))
+      ) {
         rememberPendingSeek(seconds);
         setCurrentTime(seconds);
         if (isHlsStream) video.currentTime = nativeSeconds;
@@ -2615,6 +2656,11 @@ export function VideoPlayer({
                   recoverFromStaleGeneration(hls, video.currentTime)
                 ) {
                   staleGenerationRecoveriesRef.current++;
+                  // The refetch is a full MediaSource reset, exactly like the
+                  // window-edge advance. Record it on the shared reload clock so
+                  // the window advance that the stale fence often triggers next
+                  // does not immediately reset the buffer a second time.
+                  windowReloadAtRef.current = Date.now();
                   console.warn("[hls.js] Segment generation is stale; refetching playlist", {
                     details: data.details,
                     url: data.frag?.url ?? data.url,
@@ -2691,6 +2737,16 @@ export function VideoPlayer({
               attemptAutoplayWhenReady();
             });
 
+            // A windowed synthetic playlist publishes its served window on
+            // every level load. The window edge drives the refetch below, and
+            // its start tells the seek path when a target is only "seekable"
+            // because of the omitted gap prefix. A full manifest resolves to a
+            // window that spans the whole title, so neither matters for it.
+            hls.on(Hls.Events.LEVEL_LOADED, (_event, data) => {
+              if (destroyed) return;
+              servedHlsWindowRef.current = servedHlsWindow(data.details);
+            });
+
             hls.on(Hls.Events.BUFFER_APPENDED, () => {
               if (destroyed) return;
               networkRecoveryAttemptsRef.current = 0;
@@ -2704,7 +2760,9 @@ export function VideoPlayer({
               attemptAutoplayWhenReady();
             });
 
-            hls.loadSource(effectiveStreamUrl);
+            servedHlsWindowRef.current = null;
+            windowReloadFromEndRef.current = null;
+            hls.loadSource(hlsStreamUrl);
             hls.attachMedia(video);
             hlsRef.current = hls;
           } else {
@@ -2811,6 +2869,47 @@ export function VideoPlayer({
       }
     };
 
+    // Refetches the manifest around the playhead once the listed window runs
+    // out. The server recomputes the window from the client's buffered position,
+    // and the playlist keeps the absolute media timeline, so resuming at
+    // `video.currentTime` lands on the same media second. A cool-down between
+    // refetches keeps a stalled refill from spinning; the next level-loaded event
+    // republishes the window.
+    //
+    // Reloading the same URL is not seamless. hls.js's `loadSource` sees the
+    // media still attached and source buffers present, so it detaches and
+    // re-creates the MediaSource (see `loadSource` in the vendored 1.6 source):
+    // every advance drops the forward buffer and re-downloads from the playhead,
+    // showing a real, if short, rebuffer whose length is the first segment's
+    // fetch time. The reload-ahead margin below only decides *when* that reset
+    // fires — early enough that the window is replaced before the element would
+    // reach `#EXT-X-ENDLIST` — not how long the re-download takes.
+    const reloadHlsWindow = (): boolean => {
+      const hls = hlsRef.current;
+      if (!hls) return false;
+      const playlistUrl = hls.url;
+      if (!playlistUrl) return false;
+      const currentEnd = servedHlsWindowRef.current?.end ?? null;
+      // A refetch that did not extend the served window means the server has no
+      // more media to offer (the window is clamped to the title's last segment).
+      // Refetching the same final window every cooldown — the premature-`ended`
+      // path can even drive it — would loop forever, so treat it as the end.
+      if (
+        currentEnd !== null &&
+        windowReloadFromEndRef.current !== null &&
+        currentEnd <= windowReloadFromEndRef.current
+      ) {
+        return false;
+      }
+      const now = Date.now();
+      if (now - windowReloadAtRef.current < WINDOWED_MANIFEST_RELOAD_MIN_INTERVAL_MS) return false;
+      windowReloadAtRef.current = now;
+      windowReloadFromEndRef.current = currentEnd;
+      hls.config.startPosition = video.currentTime;
+      hls.loadSource(playlistUrl);
+      return true;
+    };
+
     const onPlay = () => {
       // Nothing can play until the reconnect hands over a new transport.
       if (connectionReplacedRef.current || connectionStatusRef.current !== "connected") {
@@ -2879,6 +2978,20 @@ export function VideoPlayer({
       if (hasCurrentFrame()) markPlaybackStarted();
       clearBuffering();
       applyPrefetchTarget();
+      // A windowed transcode playlist ends well before the media does, so the
+      // client refetches it as the playhead nears the listed window's edge.
+      // hls.js will not reload a VOD playlist on its own.
+      if (
+        !video.paused &&
+        !video.seeking &&
+        shouldAdvanceHlsWindow(
+          servedHlsWindowRef.current,
+          backendDurationRef.current,
+          video.currentTime,
+        )
+      ) {
+        reloadHlsWindow();
+      }
       if (roomReadinessPending && watchTogetherSync.attachedSessionId === sessionId) {
         watchTogetherSync.reportReady();
       }
@@ -2977,6 +3090,22 @@ export function VideoPlayer({
     };
     const onVideoEnded = () => {
       if (endedFiredRef.current) return;
+      // A windowed transcode playlist reaches its `#EXT-X-ENDLIST` long before
+      // the media does; if the element ended at a window edge, refetch and keep
+      // playing instead of treating it as the end of the title. `loadSource`
+      // leaves the element paused at its ended position, so resume explicitly;
+      // a rejected `play()` is the ordinary autoplay/no-gesture case and is left
+      // to the user.
+      const servedWindow = servedHlsWindowRef.current;
+      if (
+        servedWindow &&
+        !servedWindow.live &&
+        backendDurationRef.current > servedWindow.end + 1 &&
+        reloadHlsWindow()
+      ) {
+        void video.play().catch(() => {});
+        return;
+      }
       endedFiredRef.current = true;
       setHasEnded(true);
       // Cancel any active credits countdown to prevent it racing with post-roll.
