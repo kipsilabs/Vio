@@ -36,7 +36,7 @@ type VirtualCandidatesDiscoveryService interface {
 
 func (reg *Registry) discoverDetailVersions(ctx context.Context, contentID, mediaType string, versions []catalogpkg.FileVersion, filter catalogpkg.AccessFilter, trigger string) bool {
 	claims := claimsFrom(ctx)
-	if claims == nil || (mediaType != "movie" && mediaType != themeOwnerEpisode) ||
+	if claims == nil || (mediaType != themeOwnerMovie && mediaType != themeOwnerEpisode) ||
 		reg.deps.VirtualCandidatesDiscovery == nil || reg.deps.PreplayDiscoveryEnabled == nil ||
 		!reg.deps.PreplayDiscoveryEnabled(ctx) || !slices.ContainsFunc(versions, func(version catalogpkg.FileVersion) bool {
 		return strings.HasPrefix(version.FilePath, "virtual://")
