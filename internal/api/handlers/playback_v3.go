@@ -1928,8 +1928,15 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	// attempt, which virtual candidate rotation replaces. Drop it before the
 	// structural id/index check, mirroring the replan path's re-key-before-
 	// validation order: the start degrades to the default track pipeline
-	// instead of failing 400. NormalizeAndValidate applies the same drop as a
-	// second line of defense for callers that validate a copy (api/v2).
+	// instead of failing 400. The file-independent structural checks run first:
+	// the drop clears both id and index, so a negative index other than the off
+	// sentinel, or the off sentinel paired with an id, would otherwise pass as a
+	// plain omission and — under a stored "always" subtitle mode — auto-select
+	// subtitles. NormalizeAndValidate repeats both steps as a second line of
+	// defense for callers that validate a copy (api/v2).
+	if err := req.ValidateSelectedTrackStructureV3(); err != nil {
+		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusBadRequest, "bad_request", err.Error())
+	}
 	dropStaleRequestTrackIdentitiesV3(r.Context(), &req)
 	warnings, err := req.NormalizeAndValidate()
 	if err != nil {

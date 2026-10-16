@@ -1413,6 +1413,15 @@ func (r *StartRequestV3) NormalizeAndValidate() ([]DegradationWarningV3, error) 
 	// to the default track pipeline instead of failing 400; the replan path
 	// re-keys the equivalent identity before its own validation. A same-file
 	// id/index disagreement is not stale and is still rejected below.
+	//
+	// The structural checks run first: the drop clears both id and index, so a
+	// malformed pair (a negative index other than the off sentinel, or the off
+	// sentinel combined with an id) would otherwise reach the pair check as a
+	// plain omission and — under a stored "always" subtitle mode — auto-select
+	// subtitles. Only a stale positive selection may degrade.
+	if err := r.ValidateSelectedTrackStructureV3(); err != nil {
+		return nil, err
+	}
 	r.DropStaleSelectedTrackIdentitiesV3()
 	if err := validateTrackPairV3(r.FileID, "audio", r.AudioTrackID, r.AudioTrackIndex); err != nil {
 		return nil, err
@@ -1923,7 +1932,13 @@ func validateHDRCapabilitiesV3(hdr *HDRCapabilitiesV3) error {
 	return nil
 }
 
-func validateTrackPairV3(fileID int, kind, id string, index *int) error {
+// validateTrackSelectionStructureV3 checks the file-independent structure of a
+// selected track pair: the id length, the index bound, the subtitle off
+// sentinel, and the sentinel/identity contradiction. It is split out from
+// validateTrackPairV3 so the start paths can run it before the stale-identity
+// drop — the drop clears both id and index, which would erase a malformed pair
+// into a plain omission.
+func validateTrackSelectionStructureV3(kind, id string, index *int) error {
 	if len(id) > 128 {
 		return fmt.Errorf("%s_track_id exceeds supported size", kind)
 	}
@@ -1938,19 +1953,44 @@ func validateTrackPairV3(fileID int, kind, id string, index *int) error {
 		if *index < 0 && (kind != trackKindSubtitle || *index != SubtitleTrackOffIndexV3) {
 			return fmt.Errorf("%s_track_index is invalid", kind)
 		}
+		if *index < 0 && id != "" {
+			// Explicit off names no track, so a paired identity would disagree.
+			return fmt.Errorf("%s_track_id and explicit off cannot be combined", kind)
+		}
+	}
+	return nil
+}
+
+func validateTrackPairV3(fileID int, kind, id string, index *int) error {
+	if err := validateTrackSelectionStructureV3(kind, id, index); err != nil {
+		return err
 	}
 	if id == "" || index == nil {
 		return nil
-	}
-	if *index < 0 {
-		// Explicit off names no track, so a paired identity would disagree.
-		return fmt.Errorf("%s_track_id and explicit off cannot be combined", kind)
 	}
 	want := TrackIDV3(fileID, kind, *index)
 	if id != want {
 		return fmt.Errorf("%s track id and index disagree", kind)
 	}
 	return nil
+}
+
+// ValidateSelectedTrackStructureV3 rejects a selected audio or subtitle pair
+// whose structure is malformed before the stale-identity drop can erase it. The
+// start handler drops a stale identity by clearing both id and index; without
+// this check a stale subtitle identity paired with a negative index (or the off
+// sentinel paired with an id) would become a plain omission and, under a stored
+// "always" subtitle mode, silently auto-select subtitles — the exact outcome the
+// sentinel exists to prevent. A stale positive selection still degrades to the
+// default pipeline as before.
+func (r *StartRequestV3) ValidateSelectedTrackStructureV3() error {
+	if r == nil {
+		return nil
+	}
+	if err := validateTrackSelectionStructureV3("audio", r.AudioTrackID, r.AudioTrackIndex); err != nil {
+		return err
+	}
+	return validateTrackSelectionStructureV3(trackKindSubtitle, r.SubtitleTrackID, r.SubtitleTrackIndex)
 }
 
 // StaleTrackIdentityV3 reports whether a well-formed selected track identity of
