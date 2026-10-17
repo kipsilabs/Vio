@@ -253,21 +253,33 @@ it("does not restart a healthy interval when the recovery revision changes", asy
     { wrapper, initialProps: { revision: 0 } },
   );
 
+  // First sample fires on the original cadence at t=10s.
   await act(async () => {
     await vi.advanceTimersByTimeAsync(10_000);
   });
   expect(mocks.send).toHaveBeenCalledTimes(1);
 
-  // A revision bump with no loss behind it (an ordinary track change) must not
-  // reset the cadence.
+  // Bump the revision off-phase at t=13s. A restarted interval would next tick
+  // at t=23s, while the original one keeps its next tick at t=20s, so advancing
+  // past t=20s can tell the two apart: a restart sends nothing here.
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(3_000);
+  });
   rerender({ revision: 1 });
   await act(async () => {
-    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.advanceTimersByTimeAsync(7_500);
   });
-  expect(mocks.send).toHaveBeenCalledTimes(1);
+  expect(mocks.send).toHaveBeenCalledTimes(2);
+
+  // The rest of the cadence still sits on the original phase: no send until
+  // t=30s, then one. A restart at t=13s would have ticked at t=23s and t=33s.
   await act(async () => {
     await vi.advanceTimersByTimeAsync(9_000);
   });
   expect(mocks.send).toHaveBeenCalledTimes(2);
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(1_000);
+  });
+  expect(mocks.send).toHaveBeenCalledTimes(3);
   expect(onSessionLost).not.toHaveBeenCalled();
 });
