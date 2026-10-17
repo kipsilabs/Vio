@@ -1,4 +1,5 @@
 import { PlayerFetchError } from "./player-fetch";
+import { V2ProblemError } from "@/api/v2/request";
 import type { TerminalV3 } from "./protocol-v3";
 
 export interface PlaybackPolicyErrorDescription {
@@ -186,6 +187,61 @@ export function isDeadPlaybackSessionError(error: unknown): boolean {
     error.code === "playback_session_ended" ||
     error.status === 401
   );
+}
+
+/**
+ * The wire problem ids that mean a playback session is gone.
+ *
+ * The v2 handler names the missing session `session_not_found`, but that code
+ * is not in the shared problem catalog, so `playbackProblemType` renders it as
+ * the catalog's plain `not_found` — that is the code a live progress 404
+ * actually carries. The v1/bridge surfaces name the session directly
+ * (`playback_session_not_found`), and `playback_session_ended` is the 410 the
+ * bridge sends for a stopped session. Note the mismatch: the wire code the v2
+ * handler emits is `session_not_found`, while the protocol docs advertise
+ * `playback_session_not_found`; the wire code stays as the server sends it.
+ */
+const SESSION_GONE_PROBLEM_CODES = new Set([
+  "not_found",
+  "session_not_found",
+  "playback_session_not_found",
+  "playback_session_ended",
+]);
+
+/**
+ * Whether a session-scoped call was answered that the playback session no
+ * longer exists. Unlike `isDeadPlaybackSessionError`, this covers the v2
+ * handshake and progress calls, where a 404 *is* the session being gone:
+ * neither can answer 404 or 410 for anything else.
+ *
+ * A retried mint or progress sample for a dead session id can never succeed,
+ * so callers retire the session. But `mutationFetch` builds a typed
+ * `PlayerFetchError` from *any* non-2xx response, including a proxy's HTML
+ * error page (a mis-prefixed route, a captive portal, a stale ingress) whose
+ * body does not parse to a problem and leaves the code undefined. Requiring a
+ * recognized problem code is what keeps such a transport 404 on the retry
+ * path instead of killing playback on the next progress tick.
+ *
+ * A `V2ProblemError` already proves the server spoke the contract, so this
+ * branch accepts *any* 404/410 by status alone. That is deliberately broader
+ * than a missing-session answer: the v2 router's unmatched-route 404 is itself
+ * a well-formed problem document (`not_found`), so a route mismatch inside
+ * `/api/v2` also classifies as gone. The playback routes are static, so a
+ * mismatch would be a build error rather than a live condition, and widening
+ * this would need a route-scoped problem code the server does not emit.
+ */
+export function isPlaybackSessionGoneError(error: unknown): boolean {
+  if (error instanceof PlayerFetchError) {
+    return (
+      (error.status === 404 || error.status === 410) &&
+      error.code !== undefined &&
+      SESSION_GONE_PROBLEM_CODES.has(error.code)
+    );
+  }
+  if (error instanceof V2ProblemError) {
+    return error.status === 404 || error.status === 410;
+  }
+  return false;
 }
 
 /**

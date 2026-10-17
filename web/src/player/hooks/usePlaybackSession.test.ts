@@ -8883,6 +8883,251 @@ describe("usePlaybackSession mid-stream reconnect", () => {
     unmount();
   });
 
+  it("enters the lost state when the server says the session is gone and nothing played", async () => {
+    const harness = reconnectHarness({ replan: () => unreachable() });
+    const rendered = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(rendered.result.current.planRevision).toBe(1));
+
+    // A session-scoped call (ticket mint, progress) answered 404 before the
+    // first frame: there is no played stream for the reconnect to reposition,
+    // so the player goes straight to the terminal state.
+    act(() => rendered.result.current.reportSessionLost());
+
+    expect(rendered.result.current.connectionStatus).toBe("lost");
+    expect(rendered.result.current.connectionErrorTitle).toBe("Connection lost");
+    expect(harness.replanBodies).toHaveLength(0);
+    expect(harness.startBodies).toHaveLength(1);
+
+    rendered.unmount();
+  });
+
+  it("retries a pre-first-frame loss from the position the start asked for", async () => {
+    const harness = reconnectHarness({
+      replan: () =>
+        jsonResponse(
+          { error: "playback_session_not_found", message: "Playback session not found" },
+          { status: 404 },
+        ),
+      restart: () => jsonResponse(playable("session-2"), { status: 201 }),
+    });
+    const rendered = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 240, true, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(rendered.result.current.planRevision).toBe(1));
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+
+    // The session is answered gone before the first frame: no stream played, so
+    // no reconnect cycle recorded where the viewer asked to be.
+    act(() => rendered.result.current.reportSessionLost());
+    expect(rendered.result.current.connectionStatus).toBe("lost");
+
+    // Retry must rebuild at the start's own position, not zero.
+    act(() => rendered.result.current.retryConnection());
+    await advance(0);
+
+    const restart = harness.startBodies[1];
+    expect(restart?.start_position).toBe(240);
+    expect(rendered.result.current.sessionId).toBe("session-2");
+    expect(rendered.result.current.connectionStatus).toBe("connected");
+
+    rendered.unmount();
+  });
+
+  it("retries a pre-first-frame loss from the server-resolved resume position", async () => {
+    // The caller asked for automatic resume (position zero); the server
+    // resolved where it actually starts.
+    const resumedPlan = fixturePlanV3({ session_id: "session-1" });
+    resumedPlan.timeline = {
+      ...resumedPlan.timeline,
+      source_start_seconds: 275,
+      player_start_seconds: 5,
+      timeline_offset_seconds: 270,
+    };
+    const harness = reconnectHarness({
+      initialPlan: resumedPlan,
+      replan: () =>
+        jsonResponse(
+          { error: "playback_session_not_found", message: "Playback session not found" },
+          { status: 404 },
+        ),
+      restart: () => jsonResponse(playable("session-2"), { status: 201 }),
+    });
+    const rendered = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(rendered.result.current.planRevision).toBe(1));
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+
+    // The session is answered gone before the first frame, so no reconnect
+    // cycle recorded the server-resolved resume.
+    act(() => rendered.result.current.reportSessionLost());
+    expect(rendered.result.current.connectionStatus).toBe("lost");
+
+    // Retry must rebuild at the adopted plan's position, not the request zero.
+    act(() => rendered.result.current.retryConnection());
+    await advance(0);
+
+    const restart = harness.startBodies[1];
+    expect(restart?.start_position).toBe(275);
+    expect(rendered.result.current.sessionId).toBe("session-2");
+    expect(rendered.result.current.connectionStatus).toBe("connected");
+    expect(rendered.result.current.shouldAutoPlay).toBe(true);
+
+    rendered.unmount();
+  });
+
+  it("keeps the adopted-plan discriminator across a replacement in the same request", async () => {
+    // The first plan resolved a server position; a version switch then replaces
+    // it while the request stays the same. The adopted-plan flag is not reset
+    // by that replacement, so a pre-first-frame loss still retries at the
+    // replaced plan's position instead of the request's own.
+    const firstPlan = fixturePlanV3({ session_id: "session-1" });
+    firstPlan.timeline = {
+      ...firstPlan.timeline,
+      source_start_seconds: 275,
+      player_start_seconds: 5,
+      timeline_offset_seconds: 270,
+    };
+    const switchedPlan = fixturePlanV3({
+      session_id: "session-1",
+      plan_id: "plan:switched00000000001",
+      requested_media_file_id: 99,
+      effective_media_file_id: 99,
+    });
+    switchedPlan.timeline = {
+      ...switchedPlan.timeline,
+      source_start_seconds: 120,
+      player_start_seconds: 120,
+    };
+    let restarts = 0;
+    const harness = reconnectHarness({
+      initialPlan: firstPlan,
+      replan: () =>
+        jsonResponse(
+          { error: "playback_session_not_found", message: "Playback session not found" },
+          { status: 404 },
+        ),
+      restart: () => {
+        restarts += 1;
+        return restarts === 1
+          ? jsonResponse(playable("session-1", switchedPlan), { status: 201 })
+          : jsonResponse(playable("session-2"), { status: 201 });
+      },
+    });
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.planRevision).toBe(1));
+
+    act(() => result.current.switchVersion(99, 120));
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe("plan:switched00000000001"));
+    expect(result.current.initialPosition).toBe(120);
+
+    // The replacement's session is answered gone before its first frame.
+    act(() => result.current.reportSessionLost());
+    expect(result.current.connectionStatus).toBe("lost");
+
+    act(() => result.current.retryConnection());
+    await waitFor(() => expect(harness.startBodies).toHaveLength(3));
+
+    // Retry rebuilds at the replaced plan's position, proving the replacement
+    // did not clear the adopted-plan flag and fall back to the request zero.
+    expect(harness.startBodies[2]?.start_position).toBe(120);
+    expect(result.current.sessionId).toBe("session-2");
+    expect(result.current.connectionStatus).toBe("connected");
+
+    unmount();
+  });
+
+  it("keeps a paused adopted plan's resume intent through a pre-first-frame loss", async () => {
+    // The player was paused when the connection dropped, so the replacement the
+    // reconnect adopts is paused too, and the server resolved it to zero. A
+    // pre-first-frame loss must carry both through Retry: the pause stays, and
+    // the adopted zero supersedes the previous plan's position.
+    const firstPlan = fixturePlanV3({ session_id: "session-1" });
+    firstPlan.timeline = {
+      ...firstPlan.timeline,
+      source_start_seconds: 275,
+      player_start_seconds: 5,
+      timeline_offset_seconds: 270,
+    };
+    const pausedPlan = fixturePlanV3({
+      session_id: "session-1",
+      plan_id: "plan:paused000000000001",
+    });
+    let replans = 0;
+    const harness = reconnectHarness({
+      initialPlan: firstPlan,
+      replan: () => {
+        replans += 1;
+        return replans === 1
+          ? jsonResponse(playable("session-1", pausedPlan))
+          : jsonResponse(
+              { error: "playback_session_not_found", message: "Playback session not found" },
+              { status: 404 },
+            );
+      },
+      restart: () => jsonResponse(playable("session-2"), { status: 201 }),
+    });
+    const rendered = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(rendered.result.current.planRevision).toBe(1));
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+
+    // The viewer paused, then the connection dropped: the reconnect's first
+    // attempt adopts a replacement plan, paused and resolved to zero.
+    act(() => rendered.result.current.recoverConnection(275, false));
+    await advance(RECONNECT_BASE_DELAY_MS);
+
+    expect(rendered.result.current.plan?.plan_id).toBe("plan:paused000000000001");
+    expect(rendered.result.current.shouldAutoPlay).toBe(false);
+    expect(rendered.result.current.initialPosition).toBe(0);
+
+    // The replacement's session is answered gone before its first frame.
+    act(() => rendered.result.current.reportSessionLost());
+    expect(rendered.result.current.connectionStatus).toBe("lost");
+
+    // Retry keeps the pause and the adopted zero, not the previous plan's 275.
+    act(() => rendered.result.current.retryConnection());
+    await advance(0);
+
+    const restart = harness.startBodies[1];
+    expect(restart?.start_position).toBe(0);
+    expect(rendered.result.current.shouldAutoPlay).toBe(false);
+    expect(rendered.result.current.sessionId).toBe("session-2");
+
+    rendered.unmount();
+  });
+
+  it("runs the reconnect's pending attempt immediately when a gone session is reported", async () => {
+    const harness = reconnectHarness({ replan: () => unreachable() });
+    const { result, unmount } = await startPlaying();
+
+    // A network drop starts the reconnect and arms its first backoff.
+    act(() => result.current.recoverConnection(100, true));
+    expect(result.current.connectionStatus).toBe("reconnecting");
+    expect(harness.replanBodies).toHaveLength(0);
+
+    // A session-scoped call answers that the session is gone while the backoff
+    // is still armed. The reconnect replaces a dead session with a fresh start,
+    // so its next attempt must run now rather than wait out the delay.
+    act(() => result.current.expediteReconnect());
+    await advance(0);
+
+    expect(harness.replanBodies).toHaveLength(1);
+    expect(result.current.connectionStatus).toBe("reconnecting");
+
+    unmount();
+  });
+
   it("starts a new session when the server's installation changed", async () => {
     let restarts = 0;
     const harness = reconnectHarness({
