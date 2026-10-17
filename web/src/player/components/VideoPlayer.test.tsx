@@ -12,6 +12,10 @@ import type {
 import type { PlayerSubtitleInfo, VideoFitMode } from "../types";
 import { HLS_DEFAULT_MAX_BUFFER_SIZE_BYTES } from "../utils/bufferPolicy";
 import { HLS_STARTUP_TIMEOUT_MS } from "../utils/hlsStartupGuard";
+import {
+  MANIFEST_NOT_READY_CODE,
+  MANIFEST_NOT_READY_DEFAULT_DELAY_MS,
+} from "../manifest-not-ready";
 import { PENDING_SEEK_HOLD_TIMEOUT_MS } from "../utils/pendingSeek";
 import {
   buildQualitySummary,
@@ -3285,6 +3289,81 @@ describe("VideoPlayer stale generation recovery", () => {
     expect(hlsJS.loadSource).toHaveBeenCalledTimes(3);
     expect(hlsJS.startLoad).not.toHaveBeenCalled();
     expect(onPlanFailure).not.toHaveBeenCalled();
+  });
+});
+
+// A not-ready transcode manifest (503 `not_ready_retry`) is polled back after a
+// delay instead of spending the fatal network budget. Each not-ready error
+// schedules one reload timer; if a second arrives before the first fires, the
+// superseded timer has to be cancelled or both fire and open overlapping
+// manifest loads. Pin that a superseded pollback is dropped.
+describe("VideoPlayer manifest not-ready pollback", () => {
+  beforeEach(() => {
+    realtimeOptions.current = null;
+    controls.current = null;
+    hlsJS.supported = true;
+    hlsJS.constructed.mockClear();
+    hlsJS.startLoad.mockClear();
+    hlsJS.loadSource.mockClear();
+    hlsJS.errorHandler = null;
+    vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
+    vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
+    vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => {});
+    vi.spyOn(HTMLMediaElement.prototype, "canPlayType").mockReturnValue("");
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  function hlsTranscodePlan() {
+    return fixturePlanV3({
+      delivery: "server_transcode_hls",
+      stream: {
+        url: "/playback/transcode/session-1/master.m3u8",
+        protocol: "hls",
+        headers: {},
+        header_refresh: "none",
+      },
+    });
+  }
+
+  function notReadyError() {
+    return {
+      fatal: true,
+      type: "networkError",
+      details: "manifestLoadError",
+      url: "/api/v2/playback/transcode/session-1/master.m3u8",
+      response: {
+        code: 503,
+        url: "/api/v2/playback/transcode/session-1/master.m3u8",
+        data: { error: MANIFEST_NOT_READY_CODE },
+      },
+      networkDetails: { status: 503, headers: { get: () => null } },
+    };
+  }
+
+  it("cancels a superseded not-ready pollback instead of firing two loads", async () => {
+    renderPlayer({ plan: hlsTranscodePlan(), shouldAutoPlay: false });
+    await waitFor(() => expect(hlsJS.errorHandler).toBeTypeOf("function"));
+    // The initial transport load is not the pollback under test.
+    hlsJS.loadSource.mockClear();
+
+    vi.useFakeTimers();
+    act(() => {
+      hlsJS.errorHandler?.("error", notReadyError());
+      hlsJS.errorHandler?.("error", notReadyError());
+    });
+
+    // Both errors scheduled a pollback; neither fires before the delay.
+    expect(hlsJS.loadSource).not.toHaveBeenCalled();
+    act(() => vi.advanceTimersByTime(MANIFEST_NOT_READY_DEFAULT_DELAY_MS));
+
+    // Only the surviving timer reloads the manifest: the superseded retry was
+    // cancelled, so it cannot open a second, overlapping loadSource.
+    expect(hlsJS.loadSource).toHaveBeenCalledTimes(1);
   });
 });
 
