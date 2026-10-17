@@ -36,10 +36,15 @@ func AudioTrackSignatureFromTrack(track models.AudioTrack) *userstore.AudioTrack
 // Every member the caller left empty is a wildcard: /api/v2 documents each
 // AudioTrackSignature member as optional and absent as equal to its zero
 // value, so a signature that names only codec and channels still identifies a
-// probed track that also reports a language, title, layout and default flag. A
-// probed track with no identifying fields at all (a provider placeholder, or a
-// row that carries only a synthetic index and default flag) has nothing to
-// compare, so it cannot refute the selection either.
+// probed track that also reports a language, title, layout and default flag.
+// Symmetrically, a member the probed track left empty is unknown, not a
+// conflict: a track that reports no channel count has not contradicted a stated
+// 2, and a track that reports only a codec does not refute the channels the
+// signature carried. The rule is the same one the language member uses below —
+// only a member both sides state and disagree on refutes. A probed track with
+// no identifying fields at all (a provider placeholder, or a row that carries
+// only a synthetic index and default flag) has nothing to compare, so it cannot
+// refute the selection either.
 //
 // The MULTi Languages list is a per-member membership test, not an equality:
 // every language the signature states must be carried by the track, so a
@@ -86,19 +91,24 @@ func ClientAudioSignatureMatchesTrack(track models.AudioTrack, sig *userstore.Au
 	if !clientSignatureLanguageCarried(track, sig.Language) {
 		return false
 	}
-	if sig.Title != "" && !trackStringEqual(sig.Title, candidate.Title) {
+	// A non-language member refutes only when BOTH sides state it and they
+	// disagree. A member the probed track left empty is unknown evidence, exactly
+	// like the unstated track language above: a track that never stated channels
+	// has not contradicted a stated channel count, and one that reports only a
+	// codec has not contradicted the title or layout the signature also carried.
+	if sig.Title != "" && candidate.Title != "" && !trackStringEqual(sig.Title, candidate.Title) {
 		return false
 	}
-	if sig.EmbeddedTitle != "" && !trackStringEqual(sig.EmbeddedTitle, candidate.EmbeddedTitle) {
+	if sig.EmbeddedTitle != "" && candidate.EmbeddedTitle != "" && !trackStringEqual(sig.EmbeddedTitle, candidate.EmbeddedTitle) {
 		return false
 	}
-	if sig.Codec != "" && !trackStringEqual(sig.Codec, candidate.Codec) {
+	if sig.Codec != "" && candidate.Codec != "" && !trackStringEqual(sig.Codec, candidate.Codec) {
 		return false
 	}
-	if sig.Layout != "" && !trackStringEqual(sig.Layout, candidate.Layout) {
+	if sig.Layout != "" && candidate.Layout != "" && !trackStringEqual(sig.Layout, candidate.Layout) {
 		return false
 	}
-	if sig.Channels != 0 && sig.Channels != candidate.Channels {
+	if sig.Channels != 0 && candidate.Channels != 0 && sig.Channels != candidate.Channels {
 		return false
 	}
 	if len(sig.Languages) > 0 && !clientSignatureLanguagesCarried(track, sig.Languages) {

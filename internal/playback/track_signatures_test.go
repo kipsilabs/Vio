@@ -234,6 +234,75 @@ func TestClientAudioSignatureMatchesTrackWildcards(t *testing.T) {
 	}
 }
 
+// TestClientAudioSignatureMatchesTrackOmittedNonLanguageMembers pins the
+// unknown-versus-conflicting rule for the non-language members against the
+// signature {codec:"aac", channels:2}. A member the probed track never stated
+// is unknown, so it does not refute: a codec-only track is now present just like
+// the empty placeholder, adding compatible codec evidence must not turn an
+// accepted placeholder into a rejection. Only a member both sides state and
+// disagree on (a different codec, channel count, language, layout or title)
+// still refutes.
+func TestClientAudioSignatureMatchesTrackOmittedNonLanguageMembers(t *testing.T) {
+	sig := &userstore.AudioTrackSignature{Codec: "aac", Channels: 2}
+	present := []struct {
+		name  string
+		track models.AudioTrack
+	}{
+		{name: "empty placeholder", track: models.AudioTrack{Index: -1, Default: true}},
+		{name: "codec-only track", track: models.AudioTrack{Codec: "aac"}},
+		{name: "codec and channels", track: models.AudioTrack{Codec: "aac", Channels: 2}},
+		{
+			name:  "codec, channels and further compatible members",
+			track: models.AudioTrack{Codec: "aac", Channels: 2, Language: "ja", Layout: "stereo", Title: "t"},
+		},
+	}
+	for _, tc := range present {
+		t.Run("present/"+tc.name, func(t *testing.T) {
+			if !ClientAudioSignatureMatchesTrack(tc.track, sig) {
+				t.Fatalf("ClientAudioSignatureMatchesTrack(%+v, %+v) = false, want true: an omitted track member is unknown, not a conflict", tc.track, sig)
+			}
+		})
+	}
+	refute := []struct {
+		name  string
+		track models.AudioTrack
+		sig   *userstore.AudioTrackSignature
+	}{
+		{
+			name:  "different codec",
+			track: models.AudioTrack{Codec: "eac3", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Codec: "aac", Channels: 2},
+		},
+		{
+			name:  "different channel count",
+			track: models.AudioTrack{Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Codec: "aac", Channels: 6},
+		},
+		{
+			name:  "different stated language",
+			track: models.AudioTrack{Language: "de", Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Language: "en", Codec: "aac", Channels: 2},
+		},
+		{
+			name:  "different stated layout",
+			track: models.AudioTrack{Layout: "stereo", Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Layout: "5.1", Codec: "aac", Channels: 2},
+		},
+		{
+			name:  "different stated title",
+			track: models.AudioTrack{Title: "main", Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Title: "commentary", Codec: "aac", Channels: 2},
+		},
+	}
+	for _, tc := range refute {
+		t.Run("refute/"+tc.name, func(t *testing.T) {
+			if ClientAudioSignatureMatchesTrack(tc.track, tc.sig) {
+				t.Fatalf("ClientAudioSignatureMatchesTrack(%+v, %+v) = true, want false: a member both sides state must agree", tc.track, tc.sig)
+			}
+		})
+	}
+}
+
 // TestClientAudioSignatureMatchesTrackLanguage pins the language member against
 // MULTi lists and regional/canonical spellings. A signature language the client
 // actually named must be found as the track's primary Language or as any MULTi
