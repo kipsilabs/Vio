@@ -17,6 +17,7 @@ import DetailPopover from "./DetailPopover";
 import { sortPlaybackVariantsByEditionPreference } from "./versionRankingUtils";
 import {
   audioLanguageLabels,
+  buildReleasePresentation,
   formatScoreBadgeLabel,
   formatScoreTitle,
   hasFormatScore,
@@ -154,27 +155,40 @@ function VersionDropdown({
     () =>
       orderedVersions.map((version) => {
         const watchVersion = watchVersionByFileId.get(version.file_id);
-        // The catalog item detail lacks the custom-format score and may omit
-        // the track inventories; both live on the watch detail. Merge per
-        // field, falling back to the watch row's tracks, so the rows show the
-        // score and language badges the in-player menu shows.
+        // The catalog item detail lacks the custom-format score and matched
+        // formats and may omit the track inventories; all live on the watch
+        // detail. Merge per field, falling back to the watch row's tracks, so
+        // the rows show the score, the Radarr-style release line, and the
+        // language badges the in-player menu shows.
         const score = watchVersion?.format_score;
+        const matchedFormats = watchVersion?.matched_formats;
         const needsScore = score != null && version.format_score == null;
+        const needsFormats = matchedFormats != null && version.matched_formats == null;
         const needsAudio = !version.audio_tracks?.length && watchVersion?.audio_tracks?.length;
         const needsSubtitle =
           !version.subtitle_tracks?.length && watchVersion?.subtitle_tracks?.length;
-        if (!needsScore && !needsAudio && !needsSubtitle) {
+        if (!needsScore && !needsFormats && !needsAudio && !needsSubtitle) {
           return version;
         }
         return {
           ...version,
           ...(needsScore ? { format_score: score } : {}),
+          ...(needsFormats ? { matched_formats: matchedFormats } : {}),
           ...(needsAudio ? { audio_tracks: watchVersion?.audio_tracks } : {}),
           ...(needsSubtitle ? { subtitle_tracks: watchVersion?.subtitle_tracks } : {}),
         };
       }),
     [orderedVersions, watchVersionByFileId],
   );
+
+  // The trigger's label must match the selected row. `activeVersion` is resolved
+  // from the un-enriched item-detail list, so look it up in the watch-merged
+  // `renderedVersions` by file id and fall back to the original object when the
+  // watch data (or the version itself) is absent.
+  const triggerVersion =
+    (activeVersion
+      ? renderedVersions.find((version) => version.file_id === activeVersion.file_id)
+      : undefined) ?? activeVersion;
 
   const { visibleVersions, hiddenUnavailableCount, setShowUnavailable } = useVersionVisibility(
     renderedVersions,
@@ -249,7 +263,7 @@ function VersionDropdown({
               <Disc3 className="size-3.5" />
               Version
               <span className="text-muted-foreground max-w-44 truncate text-[0.6875rem] font-normal sm:max-w-64">
-                {activeVersion ? buildVersionTriggerSummary(activeVersion) : ""}
+                {triggerVersion ? buildVersionTriggerSummary(triggerVersion) : ""}
               </span>
               <ChevronDown className="text-muted-foreground size-3" />
             </Button>
@@ -274,7 +288,9 @@ function VersionDropdown({
             ) : null}
             {visibleVersions.map((version) => {
               const isSelected = version.file_id === activeVersion?.file_id;
-              const summary = buildQualitySummary(version);
+              // Scored release candidates lead with the Radarr-style release
+              // line; everything else keeps the current quality summary.
+              const summary = buildReleasePresentation(version) || buildQualitySummary(version);
               const detail = buildDetailLine(version);
               const rangeLabel = videoRangeLabel(version);
               const unavailable = isVersionUnavailable(version);
@@ -435,7 +451,12 @@ function VersionRefreshRow({ refreshing, cancelable, error, onPress }: VersionRe
 export default memo(VersionDropdown);
 
 function buildVersionTriggerSummary(version: FileVersion): string {
-  return buildQualitySummary(version) || buildDetailLine(version) || "Video version";
+  return (
+    buildReleasePresentation(version) ||
+    buildQualitySummary(version) ||
+    buildDetailLine(version) ||
+    "Video version"
+  );
 }
 
 function buildEditionOptions(
