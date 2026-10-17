@@ -240,8 +240,8 @@ func TestClientAudioSignatureMatchesTrackWildcards(t *testing.T) {
 // is unknown, so it does not refute: a codec-only track is now present just like
 // the empty placeholder, adding compatible codec evidence must not turn an
 // accepted placeholder into a rejection. Only a member both sides state and
-// disagree on (a different codec, channel count, language, layout or title)
-// still refutes.
+// disagree on (a different codec, channel count, language, layout, title or
+// embedded title) still refutes.
 func TestClientAudioSignatureMatchesTrackOmittedNonLanguageMembers(t *testing.T) {
 	sig := &userstore.AudioTrackSignature{Codec: "aac", Channels: 2}
 	present := []struct {
@@ -251,6 +251,12 @@ func TestClientAudioSignatureMatchesTrackOmittedNonLanguageMembers(t *testing.T)
 		{name: "empty placeholder", track: models.AudioTrack{Index: -1, Default: true}},
 		{name: "codec-only track", track: models.AudioTrack{Codec: "aac"}},
 		{name: "codec and channels", track: models.AudioTrack{Codec: "aac", Channels: 2}},
+		{
+			// The track states an embedded title the signature never carried, so
+			// the signature has no constraint there and the selection is present.
+			name:  "codec, channels and an embedded title the signature omits",
+			track: models.AudioTrack{Codec: "aac", Channels: 2, EmbeddedTitle: "[Erai-raws]_AAC_CR"},
+		},
 		{
 			name:  "codec, channels and further compatible members",
 			track: models.AudioTrack{Codec: "aac", Channels: 2, Language: "ja", Layout: "stereo", Title: "t"},
@@ -292,6 +298,11 @@ func TestClientAudioSignatureMatchesTrackOmittedNonLanguageMembers(t *testing.T)
 			name:  "different stated title",
 			track: models.AudioTrack{Title: "main", Codec: "aac", Channels: 2},
 			sig:   &userstore.AudioTrackSignature{Title: "commentary", Codec: "aac", Channels: 2},
+		},
+		{
+			name:  "different stated embedded title",
+			track: models.AudioTrack{EmbeddedTitle: "main", Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{EmbeddedTitle: "commentary", Codec: "aac", Channels: 2},
 		},
 	}
 	for _, tc := range refute {
