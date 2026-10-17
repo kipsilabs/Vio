@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient } from "@tanstack/react-query";
-import { createElement, useState } from "react";
+import { createElement, useCallback, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { itemKeys } from "@/hooks/queries/keys";
@@ -157,6 +157,7 @@ function playbackSession(
     refreshSubtitles: vi.fn(),
     pollInventory: vi.fn().mockResolvedValue(true),
     markInventoryExhausted: vi.fn(),
+    markInventoryRetrying: vi.fn(),
     applySubtitleTrack: vi.fn(),
     applyAudioInventory: vi.fn(),
     applyCommittedSource: vi.fn(),
@@ -2181,6 +2182,241 @@ describe("WatchPage live inventory refresh", () => {
     });
 
     expect(fetchWatchDetailMock).not.toHaveBeenCalled();
+  });
+
+  it("marks the legacy catalog poll exhausted when its budget runs out", async () => {
+    const markInventoryExhausted = vi.fn();
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        mediaFileId: 7,
+        planAudioTracks: richerAudioTracks,
+        audioInventoryProvisional: true,
+        subtitleUrls: [],
+        subtitleInventoryProvisional: true,
+        inventoryUrl: null,
+        inventoryPending: false,
+        markInventoryExhausted,
+      }),
+    );
+    // The catalog never gains probe evidence, so the legacy poll spends its
+    // whole attempt budget looking. No `inventory_url` means the deferred poll
+    // never runs; this is the older-server path.
+    fetchWatchDetailMock.mockResolvedValue({
+      versions: [{ ...virtualVersion, audio_tracks: [], subtitle_tracks: [] }],
+    });
+
+    render(createElement(WatchPage, { ...watchPageProps, versions: [virtualVersion] }));
+
+    expect(markInventoryExhausted).not.toHaveBeenCalled();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(INVENTORY_REFRESH_INTERVAL_MS * 10);
+    });
+
+    expect(fetchWatchDetailMock).toHaveBeenCalledTimes(5);
+    // The exhausted budget must read as a terminal failure rather than leaving
+    // the menus on an indefinite "Discovering…".
+    expect(markInventoryExhausted).toHaveBeenCalled();
+  });
+
+  it("does not mark the legacy poll failed once a verified list is present", async () => {
+    const markInventoryExhausted = vi.fn();
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        mediaFileId: 7,
+        planAudioTracks: richerAudioTracks,
+        subtitleUrls: [planSubtitle],
+        inventoryUrl: null,
+        inventoryPending: false,
+        markInventoryExhausted,
+      }),
+    );
+
+    render(createElement(WatchPage, { ...watchPageProps, versions: [virtualVersion] }));
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000);
+    });
+
+    // A confident list never starts the legacy poll, so nothing is exhausted.
+    expect(fetchWatchDetailMock).not.toHaveBeenCalled();
+    expect(markInventoryExhausted).not.toHaveBeenCalled();
+  });
+
+  it("hands the discovery badge to the legacy fallback after the deferred poll exhausts", async () => {
+    // A plan with `inventory_url` defers its enumeration, and the deferred poll
+    // exhausts without a terminal answer. The legacy catalog poll then takes
+    // over: the terminal "discovery did not complete" marker is handed back to
+    // it while it is actually retrying, and its own exhausted budget re-marks
+    // the failure.
+    const events: string[] = [];
+    // Stable identities: the poll effects key on these, so a fresh closure per
+    // render would restart the attempt budget for the wrong reason.
+    const stableSession = {
+      applyAudioInventory: vi.fn(),
+      applyInventoryUpdate: vi.fn(),
+      refreshSubtitles: vi.fn(),
+      pollInventory: vi.fn().mockResolvedValue(false),
+    };
+    queryClientOverride.current = { fetchQuery: fetchQueryMock };
+    function Harness() {
+      const [inventoryPending, setPending] = useState(true);
+      const [inventoryFailed, setFailed] = useState(false);
+      const markInventoryExhausted = useCallback(() => {
+        events.push("exhausted");
+        setPending(false);
+        setFailed(true);
+      }, []);
+      const markInventoryRetrying = useCallback(() => {
+        events.push("retrying");
+        setFailed(false);
+      }, []);
+      playbackSessionMock.mockReturnValue(
+        playbackSession({
+          ...stableSession,
+          mediaFileId: 7,
+          sessionId: "session-deferred-exhaust",
+          inventoryUrl: "/api/v2/playback/session-deferred-exhaust/inventory",
+          inventoryPending,
+          inventoryFailed,
+          audioInventoryProvisional: true,
+          planAudioTracks: richerAudioTracks,
+          subtitleUrls: [],
+          subtitleInventoryProvisional: true,
+          markInventoryExhausted,
+          markInventoryRetrying,
+        }),
+      );
+      return createElement(WatchPage, { ...watchPageProps, versions: [virtualVersion] });
+    }
+    fetchWatchDetailMock.mockResolvedValue({
+      versions: [{ ...virtualVersion, audio_tracks: [], subtitle_tracks: [] }],
+    });
+
+    render(createElement(Harness));
+
+    // Up to the end of the deferred budget (2 s + 4 s + 8 s + 20 s + 20 s) plus
+    // the fallback's first attempt: the terminal marker is already cleared and
+    // the badge is owned by the retry.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000);
+    });
+    const retryingProps = videoPlayerMock.mock.calls.at(-1)?.[0] as {
+      inventoryPending?: boolean;
+      inventoryFailed?: boolean;
+    };
+    expect(events[0]).toBe("exhausted");
+    expect(events).toContain("retrying");
+    expect(retryingProps.inventoryPending).toBe(false);
+    expect(retryingProps.inventoryFailed).toBe(false);
+
+    // The fallback spends its own budget and marks the terminal failure.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000);
+    });
+    const exhaustedProps = videoPlayerMock.mock.calls.at(-1)?.[0] as {
+      inventoryFailed?: boolean;
+    };
+    expect(events.filter((event) => event === "exhausted").length).toBeGreaterThanOrEqual(2);
+    expect(exhaustedProps.inventoryFailed).toBe(true);
+  });
+
+  it("arms legacy exhaustion with the live session identity across a replacement", async () => {
+    const markFirst = vi.fn();
+    const markSecond = vi.fn();
+    const provisionalLegacy = {
+      planAudioTracks: richerAudioTracks,
+      audioInventoryProvisional: true,
+      subtitleUrls: [],
+      subtitleInventoryProvisional: true,
+      inventoryUrl: null,
+      inventoryPending: false,
+    };
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        mediaFileId: 7,
+        sessionId: "session-1",
+        markInventoryExhausted: markFirst,
+        ...provisionalLegacy,
+      }),
+    );
+    fetchWatchDetailMock.mockResolvedValue({
+      versions: [{ ...virtualVersion, audio_tracks: [], subtitle_tracks: [] }],
+    });
+
+    const { rerender } = render(
+      createElement(WatchPage, { ...watchPageProps, versions: [virtualVersion] }),
+    );
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    expect(fetchWatchDetailMock).toHaveBeenCalledTimes(1);
+
+    // The player replaces the session while the legacy timer is armed.
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        mediaFileId: 8,
+        sessionId: "session-2",
+        markInventoryExhausted: markSecond,
+        ...provisionalLegacy,
+      }),
+    );
+    rerender(createElement(WatchPage, { ...watchPageProps, versions: [virtualVersion] }));
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(INVENTORY_REFRESH_INTERVAL_MS * 10);
+    });
+
+    // The replaced session is never marked, and the fresh session's exhaustion
+    // names its live identity so the shared guard can drop a stale timer.
+    expect(markFirst).not.toHaveBeenCalled();
+    expect(markSecond).toHaveBeenCalled();
+    expect(markSecond.mock.calls.at(-1)?.[0]).toEqual({
+      sessionId: "session-2",
+      mediaFileId: 8,
+    });
+  });
+
+  it("drops a deferred exhaustion when only the file moved on the live session", async () => {
+    const markFirst = vi.fn();
+    const markSecond = vi.fn();
+    // One stable session object: mutating it below mirrors the player adopting a
+    // replacement into the live ref before the armed round's effect restarts.
+    const stableSession = playbackSession({
+      mediaFileId: 7,
+      sessionId: "session-1",
+      inventoryUrl: "/api/v2/playback/session-1/inventory",
+      planAudioTracks: richerAudioTracks,
+      audioInventoryProvisional: true,
+      subtitleUrls: [],
+      subtitleInventoryProvisional: true,
+      inventoryPending: true,
+      pollInventory: vi.fn().mockResolvedValue(false),
+      markInventoryExhausted: markFirst,
+    });
+    playbackSessionMock.mockReturnValue(stableSession);
+
+    render(createElement(WatchPage, { ...watchPageProps, versions: [virtualVersion] }));
+
+    // Spend most of the deferred budget, leaving the round's last poll armed.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(53_000);
+    });
+    expect(markFirst).not.toHaveBeenCalled();
+
+    // A serve-layer rotation moves only the effective file: the session and the
+    // deferred `inventory_url` stay put, so only the round's own stored file
+    // identity can recognize it as stale. The live ref now names file 8 while
+    // the armed round still holds file 7's closure.
+    stableSession.mediaFileId = 8;
+    stableSession.markInventoryExhausted = markSecond;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+
+    expect(markFirst).not.toHaveBeenCalled();
+    expect(markSecond).not.toHaveBeenCalled();
   });
 
   it("retains a still-declared badge when the poll's reads stay empty", async () => {

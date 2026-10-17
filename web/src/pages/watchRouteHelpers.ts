@@ -10,6 +10,7 @@ import type {
   SubtitleMode,
   WatchPageProps,
 } from "@/player";
+import type { PlayerPlaybackVariant } from "@/player/types";
 import { resolveVersionAudioLanguage } from "@/player/utils/effectiveAudioLanguage";
 import { isBitmapCodec } from "@/player/utils/subtitleCodecs";
 import { buildPublishedSubtitleTracks } from "@/player/utils/subtitleInventory";
@@ -271,6 +272,11 @@ function buildInitialSubtitleTrackIndexes({
   return { start, bitmap };
 }
 
+// Stable empty reference: the array identity reaches the player's session hook
+// and its legacy catalog poll, so a fresh `[]` on every render would restart the
+// poll's attempt budget and clear its terminal failure badge.
+const EMPTY_PLAYBACK_VARIANTS: PlayerPlaybackVariant[] = [];
+
 export function buildWatchPageProps({
   request,
   item,
@@ -422,7 +428,7 @@ export function buildWatchPageProps({
     fileId: request.fileId,
     libraryId: request.libraryId,
     versions: item.versions,
-    playbackVariants: item.playback_variants ?? [],
+    playbackVariants: item.playback_variants ?? EMPTY_PLAYBACK_VARIANTS,
     // Omitted (rather than a fresh `[]`) when the detail carries none: a new
     // array identity on every render would loop the player's sync effect.
     ...(item.indexer_releases?.length ? { indexerReleases: item.indexer_releases } : {}),
