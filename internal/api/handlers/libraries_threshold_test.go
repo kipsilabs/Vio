@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -117,7 +118,8 @@ func TestValidateLibraryThresholds(t *testing.T) {
 			t.Errorf("%s: validateLibraryThresholds = nil, want an error", tc.name)
 			continue
 		}
-		if apiErr, ok := err.(*APIError); !ok || apiErr.Field != tc.field {
+		var apiErr *APIError
+		if !errors.As(err, &apiErr) || apiErr.Field != tc.field {
 			t.Errorf("%s: error = %#v, want field %q", tc.name, err, tc.field)
 		}
 	}
