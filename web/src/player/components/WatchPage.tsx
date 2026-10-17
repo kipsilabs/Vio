@@ -4,7 +4,7 @@ import { playerV2Origin } from "../player-v2";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import type { PlayerFileVersion, PlayerPlaybackStateChange, WatchPageProps } from "../types";
-import type { PlayerIndexerRelease } from "../types";
+import type { PlayerIndexerRelease, PlayerPlaybackVariant } from "../types";
 import type {
   PlaybackRealtimeEventEnvelope,
   PlaybackSourceCommittedPayload,
@@ -287,6 +287,13 @@ function WatchPartyPlaybackGate(props: WatchPageProps) {
 // sync effect a new identity on every render and loop it.
 const EMPTY_INDEXER_RELEASES: PlayerIndexerRelease[] = [];
 
+// Stable empty reference for the same reason as `EMPTY_INDEXER_RELEASES`: the
+// array identity reaches the session hook's `selectFileId` and the legacy
+// catalog poll's dependency set, so a fresh `[]` default on every render would
+// restart the poll's attempt budget before it can spend it and clear the
+// terminal failure badge.
+const EMPTY_PLAYBACK_VARIANTS: PlayerPlaybackVariant[] = [];
+
 // The liveness verdicts are optional so WatchPage can render without the
 // item-page check (watch-party tests, standalone renders). An empty map leaves
 // every row's own metadata flag untouched.
@@ -301,7 +308,7 @@ function WatchPagePlayer({
   libraryId,
   versions,
   versionLiveness = EMPTY_VERSION_LIVENESS,
-  playbackVariants = [],
+  playbackVariants = EMPTY_PLAYBACK_VARIANTS,
   indexerReleases = EMPTY_INDEXER_RELEASES,
   virtualRanking,
   subtitles,

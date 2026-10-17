@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fixturePlanV3, fixtureSubtitleInventoryItemV3 } from "../protocol-v3.fixtures";
 import { resetSessionMutations } from "../session-mutations";
 import { resetCodecDetectionForTests } from "../hooks/useCodecDetection";
-import type { PlayerFileVersion, PlayerPlaybackVariant, WatchPageProps } from "../types";
+import type { PlayerFileVersion, WatchPageProps } from "../types";
 import { WatchPage } from "./WatchPage";
 
 // The other WatchPage tests substitute the hook to pin its callers. This module
@@ -78,8 +78,6 @@ const playerConfig = {
   getDeviceId: () => "test-device",
 };
 
-const NO_VARIANTS: PlayerPlaybackVariant[] = [];
-
 const version: PlayerFileVersion = {
   file_id: 7,
   resolution: "1080p",
@@ -98,10 +96,10 @@ const watchPageProps: WatchPageProps = {
   contentId: "content-1",
   title: "Test movie",
   versions: [version],
-  // A stable empty array: a fresh literal would give the hook's `selectFileId`
-  // (and therefore `refreshSubtitles`) a new identity every render, restarting
-  // the legacy poll's attempt budget on every commit.
-  playbackVariants: NO_VARIANTS,
+  // `playbackVariants` is deliberately omitted so these tests exercise the
+  // component's default (and the app's `?? []`) path: the array identity must
+  // stay stable across renders or the legacy poll restarts before its budget
+  // can spend.
   subtitles: [],
   intro: null,
   credits: null,
@@ -231,5 +229,87 @@ describe("WatchPage with the real playback session hook", () => {
     expect(recovered?.inventoryFailed).toBe(false);
     expect(recovered?.audioInventoryProvisional).toBe(false);
     expect(recovered?.subtitleInventoryProvisional).toBe(false);
+  });
+
+  it("exhausts the legacy poll budget across unrelated re-renders in the default-prop path", async () => {
+    // Regression for the default `playbackVariants`: a fresh `[]` per render
+    // reaches the hook's `selectFileId` -> `loadSession` -> `replan` ->
+    // `refreshSubtitles`, which is a legacy-poll dependency. That restarts the
+    // effect, resets `completedAttempts`, and re-runs `markInventoryRetrying()`,
+    // so the budget never spends and the failure badge never survives. The app
+    // hits the same path through `item.playback_variants ?? []`, and both now
+    // use a module-level empty array.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith("/route-events")) return new Response(null, { status: 202 });
+        if (url.includes("/playback/")) return new Response(null, { status: 204 });
+        throw new Error(`Unexpected request: ${url}`);
+      }),
+    );
+    startPlaybackMock.mockResolvedValue({
+      protocol_version: 3,
+      server_features: ["playback_plan_v3"],
+      outcome: "playable",
+      session_id: "session-legacy-rerender",
+      // A legacy-only plan: no `inventory_url`, no `tracks_pending`, so the
+      // catalog poll (not the deferred poll) owns the discovery budget. The
+      // declared status keeps both menus provisional until probe evidence lands.
+      playback_plan: fixturePlanV3({
+        session_id: "session-legacy-rerender",
+        inventory_status: "declared",
+        inventory_provenance: "pending",
+        effective_media_file_id: 7,
+        audio_tracks: [
+          { codec: "aac", channels: 2, layout: "stereo", language: "eng", default: true },
+        ],
+      }),
+    });
+    fetchWatchDetailMock.mockResolvedValue({
+      versions: [{ ...version, audio_tracks: [], subtitle_tracks: [] }],
+    });
+
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const tree = (title: string) =>
+      createElement(
+        QueryClientProvider,
+        { client: queryClient },
+        createElement(WatchPage, { ...watchPageProps, title }),
+      );
+
+    const { rerender } = render(tree("Test movie"));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(lastPlayer()?.inventoryPending).toBe(false);
+    expect(lastPlayer()?.inventoryFailed).toBe(false);
+    expect(lastPlayer()?.audioInventoryProvisional).toBe(true);
+
+    // Ordinary unrelated re-renders across the polling window. Only the title
+    // changes; the inventory props keep their identity.
+    for (let i = 0; i < 40; i += 1) {
+      rerender(tree(`Test movie ${i}`));
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2_000);
+      });
+    }
+
+    // The budget is spent and the terminal failure is up.
+    expect(lastPlayer()?.inventoryPending).toBe(false);
+    expect(lastPlayer()?.inventoryFailed).toBe(true);
+
+    // It survives further unrelated re-renders and the rest of the deadline.
+    for (let i = 0; i < 5; i += 1) {
+      rerender(tree(`Test movie after ${i}`));
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2_000);
+      });
+    }
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(7 * 60_000);
+    });
+    expect(lastPlayer()?.inventoryPending).toBe(false);
+    expect(lastPlayer()?.inventoryFailed).toBe(true);
   });
 });
