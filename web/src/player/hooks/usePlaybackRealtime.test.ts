@@ -1,8 +1,9 @@
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { createElement } from "react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { V2ProblemError } from "@/api/v2/request";
 import { PlayerConfigProvider, type PlayerConfig } from "../context/PlayerConfigContext";
-import { usePlaybackRealtime } from "./usePlaybackRealtime";
+import { SESSION_GONE_MINT_RETRY_LIMIT, usePlaybackRealtime } from "./usePlaybackRealtime";
 
 const mocks = vi.hoisted(() => ({
   capture: vi.fn(),
@@ -73,9 +74,17 @@ it("opens only installation-bound v2 control without a URL credential", async ()
     "silo.ticket.ticket",
   ]);
 });
-it.each([404, 503, 403])("never opens bridge control after ticket failure %s", async (status) => {
+it.each([503, 403])("never opens bridge control after ticket failure %s", async (status) => {
   vi.useFakeTimers();
-  mocks.mint.mockRejectedValue(new Error(String(status)));
+  mocks.mint.mockRejectedValue(
+    new V2ProblemError("createPlaybackControlSocketTicket", {
+      type: `https://siloserver.org/docs/api/v2/problems/${status === 403 ? "permission_denied" : "unavailable"}`,
+      title: "Refused",
+      status,
+      detail: "Refused.",
+      instance: "/api/v2/playback/sessions/session/control/ws-ticket",
+    }),
+  );
   const onCommand = vi.fn();
   const { result } = renderHook(() => usePlaybackRealtime({ sessionId: "session", onCommand }), {
     wrapper,
@@ -87,6 +96,125 @@ it.each([404, 503, 403])("never opens bridge control after ticket failure %s", a
   expect(Socket.instances).toHaveLength(0);
   expect(result.current.connectionState).toBe("disconnected");
   expect(onCommand).not.toHaveBeenCalled();
+});
+
+function notFoundProblem() {
+  return new V2ProblemError("createPlaybackControlSocketTicket", {
+    type: "https://siloserver.org/docs/api/v2/problems/not_found",
+    title: "Not found",
+    status: 404,
+    detail: "Playback session not found.",
+    instance: "/api/v2/playback/sessions/session/control/ws-ticket",
+  });
+}
+
+it("retries a replica-local mint 404 with backoff instead of treating it as gone", async () => {
+  vi.useFakeTimers();
+  mocks.mint.mockRejectedValue(notFoundProblem());
+  const { result } = renderHook(
+    () => usePlaybackRealtime({ sessionId: "session", onCommand: vi.fn() }),
+    { wrapper },
+  );
+
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(0);
+  });
+  expect(mocks.mint).toHaveBeenCalledTimes(1);
+  expect(Socket.instances).toHaveLength(0);
+  expect(result.current.connectionState).toBe("disconnected");
+
+  // The mint's 404 is replica-local: it arms the backoff and the lane mints
+  // again rather than concluding the session ended.
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(500);
+  });
+  expect(mocks.mint).toHaveBeenCalledTimes(2);
+
+  // A later mint on the same 404 is still not terminal while the lane has
+  // retries left.
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(5_000);
+  });
+  expect(mocks.mint.mock.calls.length).toBeGreaterThan(2);
+  expect(result.current.connectionState).toBe("disconnected");
+});
+
+it("degrades quietly after the bounded mint 404s and re-arms on a recovery revision", async () => {
+  vi.useFakeTimers();
+  mocks.mint.mockRejectedValue(notFoundProblem());
+  const { result, rerender } = renderHook(
+    ({ revision }: { revision: number }) =>
+      usePlaybackRealtime({ sessionId: "session", onCommand: vi.fn(), recoveryRevision: revision }),
+    { wrapper, initialProps: { revision: 0 } },
+  );
+
+  // Bounded retries, then the lane stops: it never tears the player down and
+  // reports nothing, because a local miss cannot establish that playback ended.
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(60_000);
+  });
+  expect(mocks.mint).toHaveBeenCalledTimes(SESSION_GONE_MINT_RETRY_LIMIT);
+  expect(result.current.connectionState).toBe("disconnected");
+
+  // Degraded quietly: no further mint and no reconnect timer left armed.
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(60_000);
+  });
+  expect(mocks.mint).toHaveBeenCalledTimes(SESSION_GONE_MINT_RETRY_LIMIT);
+  expect(vi.getTimerCount()).toBe(0);
+
+  // An adopted plan (a recovery under the same session id) re-arms the lane; a
+  // second loss degrades it again.
+  rerender({ revision: 1 });
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(0);
+  });
+  expect(mocks.mint).toHaveBeenCalledTimes(SESSION_GONE_MINT_RETRY_LIMIT + 1);
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(60_000);
+  });
+  expect(mocks.mint).toHaveBeenCalledTimes(SESSION_GONE_MINT_RETRY_LIMIT * 2);
+  expect(result.current.connectionState).toBe("disconnected");
+  expect(vi.getTimerCount()).toBe(0);
+});
+
+it("ignores a gone answer for a session the player replaced before it landed", async () => {
+  vi.useFakeTimers();
+  const pending = new Map<string, { reject: (error: unknown) => void }>();
+  mocks.mint.mockImplementation((sessionId: string) => {
+    let reject!: (error: unknown) => void;
+    const promise = new Promise<never>((_resolve, rej) => {
+      reject = rej;
+    });
+    pending.set(sessionId, { reject });
+    return promise;
+  });
+  const { rerender } = renderHook(
+    ({ id }: { id: string }) => usePlaybackRealtime({ sessionId: id, onCommand: vi.fn() }),
+    { wrapper, initialProps: { id: "session-a" } },
+  );
+  await act(async () => {
+    await Promise.resolve();
+  });
+  expect(mocks.mint).toHaveBeenNthCalledWith(1, "session-a", "install", authority);
+
+  // The player moves on to a new session; session A's loop is disposed.
+  rerender({ id: "session-b" });
+  await act(async () => {
+    await Promise.resolve();
+  });
+  expect(mocks.mint).toHaveBeenCalledTimes(2);
+
+  // Session A answers 404 only after B replaced it. It belongs to the old id
+  // and must not schedule a retry behind B, nor mint for A again.
+  await act(async () => {
+    pending.get("session-a")?.reject(notFoundProblem());
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+
+  expect(mocks.mint).toHaveBeenCalledTimes(2);
+  expect(Socket.instances).toHaveLength(0);
 });
 
 it.each(["stop", "terminate", "server_restarting"])(
