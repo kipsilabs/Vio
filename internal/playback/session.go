@@ -145,7 +145,17 @@ type Session struct {
 	// is what makes the cross-row mismatch detectable. Zero means unknown
 	// (a legacy or reconstructed session) and falls back to the URI anchor.
 	VirtualSubtitleEvidenceFileID int
-	VirtualSubtitleEvidenceSet    bool
+	// VirtualSubtitleEvidenceOwnerInstallationID is the provider installation
+	// the evidence URI was resolved through. It is captured with the evidence
+	// and, like the URI and row id, deliberately left untouched when the
+	// binding moves (see SetVirtualSource). A seek reanchor that replays a
+	// frozen candidate must resolve through the candidate's own installation,
+	// never the moved binding's (VirtualSourceOwnerInstallationID): the two
+	// diverge after a cross-installation move, and using the live owner would
+	// resolve the pinned bytes through another installation's credentials.
+	// Zero means unknown, and the seek then fails closed rather than borrowing.
+	VirtualSubtitleEvidenceOwnerInstallationID int
+	VirtualSubtitleEvidenceSet                 bool
 	// SelectionOrigin mirrors the attempt's audio selection intent onto the
 	// live session ("auto" when the server resolved an omitted selection,
 	// "explicit" when the viewer named a track). In-memory recovery and
@@ -348,7 +358,13 @@ type SessionStreamState struct {
 	// apply A's inventory to sibling row B. Zero means unknown (legacy or
 	// reconstructed) and falls back to the URI anchor.
 	VirtualSubtitleEvidenceFileID int
-	VirtualSubtitleEvidenceSet    bool
+	// VirtualSubtitleEvidenceOwnerInstallationID is the provider installation
+	// the evidence was resolved through, captured alongside the evidence URI
+	// and row id. It survives a binding move so a seek reanchor can restore the
+	// frozen candidate's own owner instead of the moved binding's. Zero means
+	// unknown.
+	VirtualSubtitleEvidenceOwnerInstallationID int
+	VirtualSubtitleEvidenceSet                 bool
 	// SelectionOrigin, PreferredAudioLanguage,
 	// SeriesAudioPreferenceSignature and SelectedAudioSignature mirror the
 	// attempt's audio selection intent (see Session) onto the stream state so
@@ -1498,6 +1514,7 @@ func applySessionStreamStateLocked(s *Session, state SessionStreamState) {
 			s.VirtualAudioTracks = state.VirtualAudioTracks
 			s.VirtualSubtitleEvidenceURI = state.VirtualSubtitleEvidenceURI
 			s.VirtualSubtitleEvidenceFileID = state.VirtualSubtitleEvidenceFileID
+			s.VirtualSubtitleEvidenceOwnerInstallationID = state.VirtualSubtitleEvidenceOwnerInstallationID
 			s.VirtualSourceRevision = state.VirtualSourceRevision
 			s.VirtualSubtitleEvidenceSet = true
 		} else if state.VirtualSourceOwnershipSet {
@@ -1523,12 +1540,14 @@ func applySessionStreamStateLocked(s *Session, state SessionStreamState) {
 				s.VirtualAudioTracks = state.VirtualAudioTracks
 				s.VirtualSubtitleEvidenceURI = state.VirtualSubtitleEvidenceURI
 				s.VirtualSubtitleEvidenceFileID = state.VirtualSubtitleEvidenceFileID
+				s.VirtualSubtitleEvidenceOwnerInstallationID = state.VirtualSubtitleEvidenceOwnerInstallationID
 			} else {
 				// A non-virtual effective file clears any previous virtual
 				// inventory and its anchor.
 				s.VirtualAudioTracks = nil
 				s.VirtualSubtitleEvidenceURI = ""
 				s.VirtualSubtitleEvidenceFileID = 0
+				s.VirtualSubtitleEvidenceOwnerInstallationID = 0
 			}
 		}
 	}
@@ -1556,63 +1575,64 @@ func applySessionStreamStateLocked(s *Session, state SessionStreamState) {
 // snapshotSessionStreamStateLocked captures replaceable stream fields while the manager lock is held.
 func snapshotSessionStreamStateLocked(s *Session) SessionStreamState {
 	return SessionStreamState{
-		PlayMethod:                       s.PlayMethod,
-		BasePlayMethod:                   s.BasePlayMethod,
-		AudioTrackIndex:                  s.AudioTrackIndex,
-		VirtualAudioSelectionInvalid:     s.VirtualAudioSelectionInvalid,
-		TranscodeAudio:                   s.TranscodeAudio,
-		RemuxDVMode:                      s.RemuxDVMode,
-		DVProfile:                        s.DVProfile,
-		DVProfilePin:                     s.DVProfilePin,
-		RemuxResumeLeadingPictureDrop:    s.RemuxResumeLeadingPictureDrop,
-		ClientIP:                         s.ClientIP,
-		ClientName:                       s.ClientName,
-		ClientVersion:                    s.ClientVersion,
-		ClientUserAgent:                  s.ClientUserAgent,
-		StreamBitrateKbps:                s.StreamBitrateKbps,
-		TargetResolution:                 s.TargetResolution,
-		TargetVideoCodec:                 s.TargetVideoCodec,
-		OutputContainer:                  s.OutputContainer,
-		OutputProtocol:                   s.OutputProtocol,
-		TargetAudioCodec:                 s.TargetAudioCodec,
-		SourceAudioChannels:              s.SourceAudioChannels,
-		TargetAudioChannels:              s.TargetAudioChannels,
-		TargetAudioBitrateKbps:           s.TargetAudioBitrateKbps,
-		TargetBitrateKbps:                s.TargetBitrateKbps,
-		TranscodeHWAccel:                 s.TranscodeHWAccel,
-		ToneMapMode:                      s.ToneMapMode,
-		TranscodeNodeURL:                 s.TranscodeNodeURL,
-		TranscodeTransportID:             s.TranscodeTransportID,
-		TranscodeRouteSet:                true,
-		RoutingNetworkProvider:           s.RoutingNetworkProvider,
-		RoutingWorkload:                  s.RoutingWorkload,
-		RoutingExecution:                 s.RoutingExecution,
-		RoutingExecutionNodeID:           s.RoutingExecutionNodeID,
-		RoutingExecutionNodeURL:          s.RoutingExecutionNodeURL,
-		RoutingEgress:                    s.RoutingEgress,
-		RoutingEgressNodeID:              s.RoutingEgressNodeID,
-		RoutingEgressNodeURL:             s.RoutingEgressNodeURL,
-		RequireMediaAuthorization:        s.RequireMediaAuthorization,
-		MediaAuthorizationSet:            true,
-		VirtualSourceURI:                 s.VirtualSourceURI,
-		VirtualSourceOwnerInstallationID: s.VirtualSourceOwnerInstallationID,
-		VirtualSourceSet:                 true,
-		VirtualSourceOwnershipSet:        true,
-		VirtualSourceRevision:            s.VirtualSourceRevision,
-		VirtualSubtitleTracks:            s.VirtualSubtitleTracks,
-		VirtualExternalSubtitles:         s.VirtualExternalSubtitles,
-		VirtualAudioTracks:               s.VirtualAudioTracks,
-		VirtualSubtitleEvidenceURI:       s.VirtualSubtitleEvidenceURI,
-		VirtualSubtitleEvidenceFileID:    s.VirtualSubtitleEvidenceFileID,
-		VirtualSubtitleEvidenceSet:       s.VirtualSubtitleEvidenceSet,
-		SelectionOrigin:                  s.SelectionOrigin,
-		SelectionOriginSet:               true,
-		PreferredAudioLanguage:           s.PreferredAudioLanguage,
-		SeriesAudioPreferenceSignature:   s.SeriesAudioPreferenceSignature,
-		SelectedAudioSignature:           s.SelectedAudioSignature,
-		SubtitleTrackIndex:               s.SubtitleTrackIndex,
-		SubtitleBurnIn:                   s.SubtitleBurnIn,
-		SegmentDuration:                  s.SegmentDuration,
+		PlayMethod:                                 s.PlayMethod,
+		BasePlayMethod:                             s.BasePlayMethod,
+		AudioTrackIndex:                            s.AudioTrackIndex,
+		VirtualAudioSelectionInvalid:               s.VirtualAudioSelectionInvalid,
+		TranscodeAudio:                             s.TranscodeAudio,
+		RemuxDVMode:                                s.RemuxDVMode,
+		DVProfile:                                  s.DVProfile,
+		DVProfilePin:                               s.DVProfilePin,
+		RemuxResumeLeadingPictureDrop:              s.RemuxResumeLeadingPictureDrop,
+		ClientIP:                                   s.ClientIP,
+		ClientName:                                 s.ClientName,
+		ClientVersion:                              s.ClientVersion,
+		ClientUserAgent:                            s.ClientUserAgent,
+		StreamBitrateKbps:                          s.StreamBitrateKbps,
+		TargetResolution:                           s.TargetResolution,
+		TargetVideoCodec:                           s.TargetVideoCodec,
+		OutputContainer:                            s.OutputContainer,
+		OutputProtocol:                             s.OutputProtocol,
+		TargetAudioCodec:                           s.TargetAudioCodec,
+		SourceAudioChannels:                        s.SourceAudioChannels,
+		TargetAudioChannels:                        s.TargetAudioChannels,
+		TargetAudioBitrateKbps:                     s.TargetAudioBitrateKbps,
+		TargetBitrateKbps:                          s.TargetBitrateKbps,
+		TranscodeHWAccel:                           s.TranscodeHWAccel,
+		ToneMapMode:                                s.ToneMapMode,
+		TranscodeNodeURL:                           s.TranscodeNodeURL,
+		TranscodeTransportID:                       s.TranscodeTransportID,
+		TranscodeRouteSet:                          true,
+		RoutingNetworkProvider:                     s.RoutingNetworkProvider,
+		RoutingWorkload:                            s.RoutingWorkload,
+		RoutingExecution:                           s.RoutingExecution,
+		RoutingExecutionNodeID:                     s.RoutingExecutionNodeID,
+		RoutingExecutionNodeURL:                    s.RoutingExecutionNodeURL,
+		RoutingEgress:                              s.RoutingEgress,
+		RoutingEgressNodeID:                        s.RoutingEgressNodeID,
+		RoutingEgressNodeURL:                       s.RoutingEgressNodeURL,
+		RequireMediaAuthorization:                  s.RequireMediaAuthorization,
+		MediaAuthorizationSet:                      true,
+		VirtualSourceURI:                           s.VirtualSourceURI,
+		VirtualSourceOwnerInstallationID:           s.VirtualSourceOwnerInstallationID,
+		VirtualSourceSet:                           true,
+		VirtualSourceOwnershipSet:                  true,
+		VirtualSourceRevision:                      s.VirtualSourceRevision,
+		VirtualSubtitleTracks:                      s.VirtualSubtitleTracks,
+		VirtualExternalSubtitles:                   s.VirtualExternalSubtitles,
+		VirtualAudioTracks:                         s.VirtualAudioTracks,
+		VirtualSubtitleEvidenceURI:                 s.VirtualSubtitleEvidenceURI,
+		VirtualSubtitleEvidenceFileID:              s.VirtualSubtitleEvidenceFileID,
+		VirtualSubtitleEvidenceOwnerInstallationID: s.VirtualSubtitleEvidenceOwnerInstallationID,
+		VirtualSubtitleEvidenceSet:                 s.VirtualSubtitleEvidenceSet,
+		SelectionOrigin:                            s.SelectionOrigin,
+		SelectionOriginSet:                         true,
+		PreferredAudioLanguage:                     s.PreferredAudioLanguage,
+		SeriesAudioPreferenceSignature:             s.SeriesAudioPreferenceSignature,
+		SelectedAudioSignature:                     s.SelectedAudioSignature,
+		SubtitleTrackIndex:                         s.SubtitleTrackIndex,
+		SubtitleBurnIn:                             s.SubtitleBurnIn,
+		SegmentDuration:                            s.SegmentDuration,
 	}
 }
 
@@ -1675,6 +1695,7 @@ func restoreSessionStreamStateLocked(s *Session, state SessionStreamState) {
 		s.VirtualAudioTracks = state.VirtualAudioTracks
 		s.VirtualSubtitleEvidenceURI = state.VirtualSubtitleEvidenceURI
 		s.VirtualSubtitleEvidenceFileID = state.VirtualSubtitleEvidenceFileID
+		s.VirtualSubtitleEvidenceOwnerInstallationID = state.VirtualSubtitleEvidenceOwnerInstallationID
 		s.VirtualSubtitleEvidenceSet = true
 	} else {
 		s.VirtualSubtitleTracks = nil
@@ -1688,10 +1709,12 @@ func restoreSessionStreamStateLocked(s *Session, state SessionStreamState) {
 			s.VirtualAudioTracks = state.VirtualAudioTracks
 			s.VirtualSubtitleEvidenceURI = state.VirtualSubtitleEvidenceURI
 			s.VirtualSubtitleEvidenceFileID = state.VirtualSubtitleEvidenceFileID
+			s.VirtualSubtitleEvidenceOwnerInstallationID = state.VirtualSubtitleEvidenceOwnerInstallationID
 		} else {
 			s.VirtualAudioTracks = nil
 			s.VirtualSubtitleEvidenceURI = ""
 			s.VirtualSubtitleEvidenceFileID = 0
+			s.VirtualSubtitleEvidenceOwnerInstallationID = 0
 		}
 	}
 	s.SubtitleTrackIndex = state.SubtitleTrackIndex
