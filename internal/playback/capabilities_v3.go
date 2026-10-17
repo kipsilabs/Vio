@@ -651,6 +651,15 @@ func normalizeContainerV3(value string) string {
 	return strings.ToLower(strings.TrimSpace(value))
 }
 
+// CodecsAgreeV3 reports whether two codec spellings name the same codec under
+// the planner's own normalization, so "h265"/"hevc" and "h264"/"avc" compare
+// equal. Callers outside the playback package use it to refuse to mix a
+// declared codec with descriptor evidence for a different one instead of
+// duplicating the normalization table.
+func CodecsAgreeV3(left, right string) bool {
+	return normalizeCodecV3(left) == normalizeCodecV3(right)
+}
+
 func normalizeCodecV3(value string) string {
 	v := strings.ToLower(strings.TrimSpace(value))
 	switch v {
