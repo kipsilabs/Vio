@@ -3505,6 +3505,10 @@ export interface Library {
    * the server-wide scanner.realtime_monitoring setting is on.
    */
   realtime_monitoring: boolean;
+  /** Per-library percent at which an item is marked watched; null inherits the server setting. */
+  watched_threshold?: number | null;
+  /** Per-library percent floor below which progress is ignored; null inherits the server setting. */
+  min_resume_threshold?: number | null;
   sort_order: number;
   poster_url?: string;
   last_scanned_at: string | null;
@@ -3648,6 +3652,10 @@ export interface CreateLibraryRequest {
   trailer_kinds?: string[];
   /** Omitted on create means on. */
   realtime_monitoring?: boolean;
+  /** Omitted or null inherits the server setting; null on update clears a saved override. */
+  watched_threshold?: number | null;
+  /** Omitted or null inherits the server setting; null on update clears a saved override. */
+  min_resume_threshold?: number | null;
 }
 
 /**

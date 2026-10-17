@@ -50,6 +50,8 @@ export function libraryFromV2(library: LibraryV2): Library {
     trickplay_supported: library.trickplay_supported,
     trailer_kinds: library.trailer_kinds,
     realtime_monitoring: library.realtime_monitoring,
+    watched_threshold: library.watched_threshold,
+    min_resume_threshold: library.min_resume_threshold,
     sort_order: library.sort_order,
     poster_url: library.poster_url,
     last_scanned_at: library.last_scanned_at ?? null,
@@ -81,6 +83,10 @@ export function libraryCreateToV2(body: CreateLibraryRequest): V2Body<"POST /api
     ...(body.realtime_monitoring === undefined
       ? {}
       : { realtime_monitoring: body.realtime_monitoring }),
+    ...(body.watched_threshold === undefined ? {} : { watched_threshold: body.watched_threshold }),
+    ...(body.min_resume_threshold === undefined
+      ? {}
+      : { min_resume_threshold: body.min_resume_threshold }),
   };
 }
 

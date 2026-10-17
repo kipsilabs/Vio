@@ -1,6 +1,6 @@
 import { useState } from "react";
 import type { FormEvent } from "react";
-import { Database, FolderOpen, Settings2, SlidersHorizontal } from "lucide-react";
+import { CheckCheck, Database, FolderOpen, Settings2, SlidersHorizontal } from "lucide-react";
 
 import type { Library } from "@/api/types";
 import { Button } from "@/components/ui/button";
@@ -21,13 +21,14 @@ import {
   GeneralFields,
   MetadataFields,
   RealtimeMonitoringFields,
+  WatchBehaviorFields,
 } from "./LibraryFormSections";
 import { libraryTypeMeta } from "./libraryTypes";
 import { LibraryPosterSection } from "./LibraryPosterSection";
 import { useLibraryForm } from "./useLibraryForm";
 import type { LibraryFormErrors } from "./useLibraryForm";
 
-type SectionId = "general" | "folders" | "metadata" | "advanced";
+type SectionId = "general" | "folders" | "metadata" | "watch" | "advanced";
 
 const SECTIONS: Array<{
   id: SectionId;
@@ -56,6 +57,14 @@ const SECTIONS: Array<{
     icon: Database,
     title: "Metadata",
     description: "Control where artwork and descriptions come from, and in which language.",
+  },
+  {
+    id: "watch",
+    label: "Watch behavior",
+    icon: CheckCheck,
+    title: "Watch behavior",
+    description:
+      "Choose when items in this library count as watched and appear in Continue Watching.",
   },
   {
     id: "advanced",
@@ -214,6 +223,7 @@ function LibraryEditorBody({
                 </div>
               )}
               {id === "metadata" && <MetadataFields form={form} />}
+              {id === "watch" && <WatchBehaviorFields form={form} />}
               {id === "advanced" && (
                 <AdvancedFields
                   form={form}

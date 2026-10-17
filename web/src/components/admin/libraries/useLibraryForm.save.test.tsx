@@ -2,7 +2,7 @@ import { act, render, renderHook, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { Library } from "@/api/types";
-import { AdvancedFields } from "./LibraryFormSections";
+import { AdvancedFields, WatchBehaviorFields } from "./LibraryFormSections";
 import { useLibraryForm } from "./useLibraryForm";
 
 const { mutate } = vi.hoisted(() => ({ mutate: vi.fn() }));
@@ -320,5 +320,85 @@ describe("seek preview switch", () => {
     expect(screen.getByRole("switch", { name: /seek previews/i }).hasAttribute("disabled")).toBe(
       false,
     );
+  });
+});
+
+describe("watch behavior thresholds", () => {
+  const movies = { id: 1, name: "Movies", type: "movies", paths: ["/media"] } as Library;
+
+  it("saves typed overrides as numbers on a new library", () => {
+    const { result } = renderHook(() => useLibraryForm({ library: null }));
+    act(() => {
+      result.current.setName("Movies");
+      result.current.updatePath(0, "/media");
+      result.current.setWatchedThreshold("80");
+      result.current.setMinResumeThreshold("10");
+    });
+    act(() => {
+      result.current.submit();
+    });
+    expect(mutate.mock.calls[0]![0]).toMatchObject({
+      watched_threshold: 80,
+      min_resume_threshold: 10,
+    });
+  });
+
+  it("clears a saved override as null when the field is emptied", () => {
+    const { result } = renderHook(() =>
+      useLibraryForm({
+        library: { ...movies, watched_threshold: 90, min_resume_threshold: 5 },
+      }),
+    );
+    act(() => {
+      result.current.setWatchedThreshold("");
+      result.current.setMinResumeThreshold("");
+    });
+    act(() => {
+      result.current.submit();
+    });
+    const body = mutate.mock.calls[0]![0].body;
+    expect(body).toHaveProperty("watched_threshold", null);
+    expect(body).toHaveProperty("min_resume_threshold", null);
+  });
+
+  it("sends only the override that changed", () => {
+    const { result } = renderHook(() =>
+      useLibraryForm({ library: { ...movies, watched_threshold: 90 } }),
+    );
+    act(() => {
+      result.current.setMinResumeThreshold("15");
+    });
+    act(() => {
+      result.current.submit();
+    });
+    const body = mutate.mock.calls[0]![0].body;
+    expect(body).toHaveProperty("min_resume_threshold", 15);
+    expect(body).not.toHaveProperty("watched_threshold");
+  });
+
+  it("leaves untouched thresholds out of the save body", () => {
+    const { result } = renderHook(() =>
+      useLibraryForm({ library: { ...movies, watched_threshold: 80, min_resume_threshold: 5 } }),
+    );
+    act(() => {
+      result.current.setName("Films");
+    });
+    act(() => {
+      result.current.submit();
+    });
+    const body = mutate.mock.calls[0]![0].body;
+    expect(body).not.toHaveProperty("watched_threshold");
+    expect(body).not.toHaveProperty("min_resume_threshold");
+  });
+
+  it("shows both fields with the saved override and the inherit hint", () => {
+    const { result } = renderHook(() =>
+      useLibraryForm({ library: { ...movies, watched_threshold: 80 } }),
+    );
+    render(<WatchBehaviorFields form={result.current} />);
+
+    expect(screen.getByLabelText("Mark watched at (%)")).toHaveValue(80);
+    expect(screen.getByLabelText("Show in Continue Watching after (%)")).toHaveValue(null);
+    expect(screen.getAllByText(/Leave blank to use the server default/)).toHaveLength(2);
   });
 });

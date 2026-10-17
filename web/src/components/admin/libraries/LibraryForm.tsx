@@ -3,7 +3,13 @@ import type { FormEvent, ReactNode } from "react";
 import type { Library } from "@/api/types";
 import { Button } from "@/components/ui/button";
 
-import { AdvancedFields, FolderFields, GeneralFields, MetadataFields } from "./LibraryFormSections";
+import {
+  AdvancedFields,
+  FolderFields,
+  GeneralFields,
+  MetadataFields,
+  WatchBehaviorFields,
+} from "./LibraryFormSections";
 import { useLibraryForm } from "./useLibraryForm";
 
 export interface LibraryFormProps {
@@ -58,6 +64,9 @@ export function LibraryForm({
       </FormSection>
       <FormSection title="Metadata">
         <MetadataFields form={form} />
+      </FormSection>
+      <FormSection title="Watch behavior">
+        <WatchBehaviorFields form={form} />
       </FormSection>
       {(form.settingSupport.chapterThumbnails || form.settingSupport.introDetection) && (
         <FormSection title="Advanced">

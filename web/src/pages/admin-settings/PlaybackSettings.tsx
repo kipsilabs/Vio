@@ -233,7 +233,12 @@ const ROUTING_PRESETS = {
   },
 } as const;
 
-const WATCH_KEYS = ["playback.watched_threshold", "playback.min_resume_threshold"];
+const WATCH_KEYS = [
+  "playback.watched_threshold",
+  "playback.min_resume_threshold",
+  "playback.continue_watching_weeks",
+  "playback.scrobble_start_seconds",
+];
 
 // `playback.chapter_thumbnail_node_capacity` is deliberately absent from the
 // UI (hidden tier): it is still saved and read through the settings API, but
@@ -761,6 +766,24 @@ export default function PlaybackSettings() {
             value={form.getValue("playback.min_resume_threshold")}
             onChange={(v) => form.setValue("playback.min_resume_threshold", v)}
             restartRequired={restartKeys.has("playback.min_resume_threshold")}
+          />
+          <SettingField
+            label="Weeks to consider for Continue Watching"
+            type="number"
+            unit="weeks"
+            hint="How far back Continue Watching looks for in-progress titles, measured from each entry's last playback. 0 means no limit; Plex's default is 16 weeks."
+            value={form.getValue("playback.continue_watching_weeks")}
+            onChange={(v) => form.setValue("playback.continue_watching_weeks", v)}
+            restartRequired={restartKeys.has("playback.continue_watching_weeks")}
+          />
+          <SettingField
+            label="Delay scrobbling until watched"
+            type="number"
+            unit="seconds"
+            hint="0 scrobbles the start of a session immediately. With a delay, nothing is sent to watch providers until the session has been watched that long, so a pause or stop before then sends nothing."
+            value={form.getValue("playback.scrobble_start_seconds")}
+            onChange={(v) => form.setValue("playback.scrobble_start_seconds", v)}
+            restartRequired={restartKeys.has("playback.scrobble_start_seconds")}
           />
           <SettingField
             label="Max Virtual Failover Attempts"

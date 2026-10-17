@@ -119,6 +119,8 @@ describe("PlaybackSettings layout", () => {
     expect(keys).toContain("playback.allow_hevc_encoding");
     expect(keys).toContain("playback.routing.video_transcode_egress");
     expect(keys).toContain("playback.watched_threshold");
+    expect(keys).toContain("playback.continue_watching_weeks");
+    expect(keys).toContain("playback.scrobble_start_seconds");
     expect(keys.some((key) => key.startsWith("download."))).toBe(false);
     // Hidden tier: still saved and readable through the API, no UI.
     expect(keys).not.toContain("playback.chapter_thumbnail_node_capacity");
@@ -231,6 +233,38 @@ describe("PlaybackSettings CPU tone mapping", () => {
     );
     expect(markup).toContain("Max Virtual Failover Attempts");
     expect(markup).toContain('value="8"');
+  });
+});
+
+describe("PlaybackSettings watch behavior additions", () => {
+  it("shows the Continue Watching window with its value, unit, and Plex note", () => {
+    useSettingsFormMock.mockReturnValue(
+      makeForm({ "playback.hw_accel": "none", "playback.continue_watching_weeks": "16" }),
+    );
+
+    const container = parse(renderToStaticMarkup(<PlaybackSettings />));
+    const input = labelled(container, "Weeks to consider for Continue Watching");
+
+    expect(input).toHaveValue(16);
+    const row = input.closest(".settings-field-row");
+    expect(row?.textContent).toContain("weeks");
+    expect(row?.textContent).toContain("Plex's default is 16 weeks");
+    expect(row?.textContent).toContain("0 means no limit");
+  });
+
+  it("shows the scrobble delay with its value, unit, and pause/stop note", () => {
+    useSettingsFormMock.mockReturnValue(
+      makeForm({ "playback.hw_accel": "none", "playback.scrobble_start_seconds": "45" }),
+    );
+
+    const container = parse(renderToStaticMarkup(<PlaybackSettings />));
+    const input = labelled(container, "Delay scrobbling until watched");
+
+    expect(input).toHaveValue(45);
+    const row = input.closest(".settings-field-row");
+    expect(row?.textContent).toContain("seconds");
+    expect(row?.textContent).toContain("0 scrobbles the start of a session immediately");
+    expect(row?.textContent).toContain("a pause or stop before then sends nothing");
   });
 });
 

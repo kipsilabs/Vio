@@ -274,6 +274,48 @@ export function RealtimeMonitoringFields({ form }: { form: LibraryFormController
   );
 }
 
+/**
+ * The library's watch-threshold overrides. Both inputs stay blank while the
+ * library inherits the server's Watch behavior settings, so the form only
+ * sends a member when an override is set, changed, or cleared.
+ */
+export function WatchBehaviorFields({ form }: { form: LibraryFormController }) {
+  return (
+    <div className="space-y-5">
+      <div className="space-y-1.5">
+        <Label htmlFor="library-watched-threshold">Mark watched at (%)</Label>
+        <Input
+          id="library-watched-threshold"
+          type="number"
+          min={1}
+          max={100}
+          className="w-full sm:w-40"
+          value={form.watchedThreshold}
+          onChange={(e) => form.setWatchedThreshold(e.target.value)}
+        />
+        <p className="text-muted-foreground text-xs">
+          Items are marked watched at this percent. Leave blank to use the server default.
+        </p>
+      </div>
+      <div className="space-y-1.5">
+        <Label htmlFor="library-min-resume-threshold">Show in Continue Watching after (%)</Label>
+        <Input
+          id="library-min-resume-threshold"
+          type="number"
+          min={1}
+          max={99}
+          className="w-full sm:w-40"
+          value={form.minResumeThreshold}
+          onChange={(e) => form.setMinResumeThreshold(e.target.value)}
+        />
+        <p className="text-muted-foreground text-xs">
+          Progress below this percent is ignored. Leave blank to use the server default.
+        </p>
+      </div>
+    </div>
+  );
+}
+
 function ProviderLevelSection({
   level,
   items,

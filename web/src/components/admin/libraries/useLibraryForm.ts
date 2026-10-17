@@ -123,6 +123,19 @@ function buildProviderChainBody(activeLevelChains: Record<string, LevelChainItem
   };
 }
 
+/**
+ * One threshold input against the library's saved override: a typed value is
+ * the override, blank clears it (the API takes null to inherit the server
+ * setting), and an unchanged field stays out of the body entirely.
+ * undefined means "send nothing".
+ */
+function thresholdOverride(value: string, saved: number | null): number | null | undefined {
+  const trimmed = value.trim();
+  const next = trimmed === "" ? null : Number(trimmed);
+  if (next !== null && !Number.isFinite(next)) return undefined;
+  return next === saved ? undefined : next;
+}
+
 export function useLibraryForm({
   library,
   onClose,
@@ -154,6 +167,14 @@ export function useLibraryForm({
   );
   const [realtimeMonitoring, setRealtimeMonitoring] = useState(
     library?.realtime_monitoring ?? true,
+  );
+  // Per-library overrides of the server's watch thresholds. The inputs stay
+  // strings; blank means "inherit the server setting".
+  const [watchedThreshold, setWatchedThreshold] = useState(
+    library?.watched_threshold == null ? "" : String(library.watched_threshold),
+  );
+  const [minResumeThreshold, setMinResumeThreshold] = useState(
+    library?.min_resume_threshold == null ? "" : String(library.min_resume_threshold),
   );
   const [levelChains, setLevelChains] = useState<Record<string, LevelChainItem[]>>({});
   const [chainDirty, setChainDirty] = useState(false);
@@ -281,6 +302,15 @@ export function useLibraryForm({
       trailer_kinds: settingSupport.trailers ? trailerKinds : [],
       realtime_monitoring: realtimeMonitoring,
     };
+    // Blank keeps an unchanged override out of the body and clears a saved
+    // one as null, which the API reads as "inherit the server setting".
+    const watchedOverride = thresholdOverride(watchedThreshold, library?.watched_threshold ?? null);
+    if (watchedOverride !== undefined) body.watched_threshold = watchedOverride;
+    const resumeOverride = thresholdOverride(
+      minResumeThreshold,
+      library?.min_resume_threshold ?? null,
+    );
+    if (resumeOverride !== undefined) body.min_resume_threshold = resumeOverride;
     // Sent only when it changes: servers without seek previews reject the
     // member, and a web build can reach one during a rolling upgrade.
     const trickplay = settingSupport.trickplay && trickplayEnabled;
@@ -356,6 +386,10 @@ export function useLibraryForm({
     toggleTrailerKind,
     realtimeMonitoring,
     setRealtimeMonitoring,
+    watchedThreshold,
+    setWatchedThreshold,
+    minResumeThreshold,
+    setMinResumeThreshold,
     contentLevels: contentLevelsForType(type),
     activeLevelChains,
     chainLoading,
