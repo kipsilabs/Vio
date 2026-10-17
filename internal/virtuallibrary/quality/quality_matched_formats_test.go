@@ -65,3 +65,49 @@ func TestMatchedFormatNamesEmpty(t *testing.T) {
 		t.Fatalf("MatchedFormatNames = %v, want nil", got)
 	}
 }
+
+// TestMatchedFormatNamesMixedRejectAndKeep pins the boundary between this
+// display projection and the scoring verdict: a candidate that matches both a
+// rejecting rule and non-rejecting ones still lists the non-rejecting names,
+// even though CustomFormatScore rejects it and reports zero.
+func TestMatchedFormatNamesMixedRejectAndKeep(t *testing.T) {
+	formats := []CustomFormat{
+		{Name: "Keep Alpha", Category: "custom", Regex: `(?i)\bremux\b`, Score: 100, Enabled: true},
+		{Name: "Keep Beta", Category: "custom", Regex: `(?i)\bremux\b`, Score: 50, Enabled: true},
+		{Name: "Reject Cam", Category: "source", Regex: `(?i)\bremux\b`, Score: 500, Enabled: true, Reject: true},
+	}
+	candidate := candidateWithTitle("Movie.2024.2160p.REMUX")
+
+	if score, rejected := CustomFormatScore(candidate, formats); !rejected || score != 0 {
+		t.Fatalf("CustomFormatScore = %d rejected %t, want 0 true", score, rejected)
+	}
+
+	got := MatchedFormatNames(candidate, formats)
+	want := []string{"Keep Alpha", "Keep Beta"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("MatchedFormatNames = %v, want %v", got, want)
+	}
+}
+
+// TestMatchedFormatNamesZeroTotalStillNamed pins the other boundary: two
+// non-rejecting rules whose scores cancel to zero still match, so this
+// projection names them even though the summed score is zero and the api score
+// adapter later drops the row as unscored. An absent matched_formats field
+// therefore does not by itself mean no formats matched.
+func TestMatchedFormatNamesZeroTotalStillNamed(t *testing.T) {
+	formats := []CustomFormat{
+		{Name: "Plus", Category: "custom", Regex: `(?i)\bremux\b`, Score: 100, Enabled: true},
+		{Name: "Minus", Category: "custom", Regex: `(?i)\bremux\b`, Score: -100, Enabled: true},
+	}
+	candidate := candidateWithTitle("Movie.2024.2160p.REMUX")
+
+	if score, rejected := CustomFormatScore(candidate, formats); rejected || score != 0 {
+		t.Fatalf("CustomFormatScore = %d rejected %t, want 0 false", score, rejected)
+	}
+
+	got := MatchedFormatNames(candidate, formats)
+	want := []string{"Plus", "Minus"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("MatchedFormatNames = %v, want %v", got, want)
+	}
+}
