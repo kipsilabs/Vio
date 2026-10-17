@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -257,6 +258,25 @@ func TestSignedKeyAcceptsOnlyItsOwnValidURLs(t *testing.T) {
 		}
 		if got, ok := signer.SignedKey(rawURL, at); ok {
 			t.Errorf("%s: SignedKey(%s) = %q, want rejection", name, rawURL, got)
+		}
+	}
+}
+
+// A route-prefixed URL whose key has a ".." or empty path segment is refused by
+// key shape alone, before expiry or signature is consulted: a well-formed
+// future expiry and any signature cannot make it name an object.
+func TestSignedKeyRejectsMalformedKeysBeforeSignature(t *testing.T) {
+	now := time.Date(2026, 1, 2, 3, 0, 0, 0, time.UTC)
+	signer := NewSigner("secret", time.Hour)
+	future := strconv.FormatInt(now.Add(time.Hour).Unix(), 10)
+	for name, path := range map[string]string{
+		"parent segment":    "/api/v2/artwork/collection-images/../secret.webp",
+		"empty segment":     "/api/v2/artwork/collection-images//secret.webp",
+		"leading slash key": "/api/v2/artwork//secret.webp",
+	} {
+		rawURL := path + "?exp=" + future + "&sig=AAAA"
+		if key, ok := signer.SignedKey(rawURL, now); ok {
+			t.Errorf("%s: SignedKey(%s) = %q, want rejection", name, rawURL, key)
 		}
 	}
 }
