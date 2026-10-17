@@ -27,6 +27,86 @@ func AudioTrackSignatureFromTrack(track models.AudioTrack) *userstore.AudioTrack
 	return sig
 }
 
+// ClientAudioSignatureMatchesTrack reports whether an audio track signature a
+// client named (or the start-time snapshot persisted) is consistent with one
+// probed track. It is a NON-REFUTATION predicate for a presence check, never a
+// selector: it returns false only when a member the signature actually carried
+// provably conflicts with the track, and true otherwise.
+//
+// Every member the caller left empty is a wildcard: /api/v2 documents each
+// AudioTrackSignature member as optional and absent as equal to its zero
+// value, so a signature that names only codec and channels still identifies a
+// probed track that also reports a language, title, layout and default flag. A
+// probed track with no identifying fields at all (a provider placeholder, or a
+// row that carries only a synthetic index and default flag) has nothing to
+// compare, so it cannot refute the selection either.
+//
+// The MULTi Languages list is a per-member membership test, not an equality:
+// every language the signature states must be carried by the track, so a
+// partial list ("en") matches a fuller probed list ("en", "de") while a stated
+// member the track does not carry ("fr") still refutes. The signature's
+// Default flag is never compared, so a signature that carries Default and
+// nothing else constrains nothing and matches every track. That is deliberately
+// over-lenient: this predicate is a presence check, never a selector, so an
+// under-constrained positive can never move a transport onto the wrong stream.
+//
+// Because a partial signature and a placeholder track both match, a true result
+// is NOT proof of identity: this predicate must never be used to positively
+// authorize an unknown track or to pick among several streams. Callers use it
+// only to answer "is the committed selection still present anywhere in this
+// inventory" and keep serving the track the plan already committed.
+//
+// Probe-derived re-identification stays on the strict matchers
+// (audioTrackMatchesSignature, matchExactAudioTrack, remapAudioSelectionIndex),
+// which fail closed on ambiguity. This is deliberately a separate entry point:
+// it never feeds those matchers, and they never call it.
+func ClientAudioSignatureMatchesTrack(track models.AudioTrack, sig *userstore.AudioTrackSignature) bool {
+	if sig == nil || sig.IsZero() {
+		return true
+	}
+	candidate := AudioTrackSignatureFromTrack(track)
+	if candidate == nil {
+		return true
+	}
+	// A stated signature language must be carried by the track, as its primary
+	// Language or as any member of its MULTi Languages list. Both fields go
+	// through one shared rule (clientSignatureLanguageCarried, delegating to
+	// trackCarriesStatedLanguage), so the same constraint gets the same answer
+	// whichever field expressed it: a bare stated tag ("en") is carried by any
+	// non-conflicting variant ("en-US", the canonical "eng"), a stated tag with
+	// an explicit region or script ("en-US", "zh-Hans") is carried only by the
+	// same region/script or by a bare track tag, and a different explicit region
+	// ("en-US" against an "en-GB"-only track) or a conflicting script ("zh-Hans"
+	// against "zh-Hant") refutes. A stated tag that carries no concrete language
+	// (a bare MULTI/DUAL/und sentinel) is neutral, and a track that never stated
+	// a concrete language (empty, "und", or a bare MULTI/DUAL sentinel with no
+	// member list — including one that otherwise carries codec and channels) is
+	// missing evidence: it cannot refute a stated language. A track with no
+	// identifying fields at all has nothing to compare and cannot refute either.
+	if !clientSignatureLanguageCarried(track, sig.Language) {
+		return false
+	}
+	if sig.Title != "" && !trackStringEqual(sig.Title, candidate.Title) {
+		return false
+	}
+	if sig.EmbeddedTitle != "" && !trackStringEqual(sig.EmbeddedTitle, candidate.EmbeddedTitle) {
+		return false
+	}
+	if sig.Codec != "" && !trackStringEqual(sig.Codec, candidate.Codec) {
+		return false
+	}
+	if sig.Layout != "" && !trackStringEqual(sig.Layout, candidate.Layout) {
+		return false
+	}
+	if sig.Channels != 0 && sig.Channels != candidate.Channels {
+		return false
+	}
+	if len(sig.Languages) > 0 && !clientSignatureLanguagesCarried(track, sig.Languages) {
+		return false
+	}
+	return true
+}
+
 // sortedLanguages returns a sorted, canonicalized copy of a track's MULTi
 // language list so signatures compare as multisets regardless of the order a
 // container listed them in. Empty/undecodable entries are dropped.
@@ -45,6 +125,74 @@ func sortedLanguages(languages []string) []string {
 	}
 	slices.Sort(out)
 	return out
+}
+
+// clientSignatureLanguagesCarried reports whether every language a signature
+// states is carried by the track. Each stated member is tested with the one
+// shared rule clientSignatureLanguageCarried uses for the primary Language
+// member, so a partially enumerated MULTi list is not refuted by a fuller one.
+func clientSignatureLanguagesCarried(track models.AudioTrack, stated []string) bool {
+	for _, code := range stated {
+		if !clientSignatureLanguageCarried(track, code) {
+			return false
+		}
+	}
+	return true
+}
+
+// clientSignatureLanguageCarried reports whether one stated signature language
+// member is carried by the track. It is the single rule both the primary
+// Language member and every MULTi Languages member go through: a stated member
+// that carries no concrete language (empty, or a bare MULTI/DUAL/und sentinel)
+// carries no constraint and is neutral; otherwise the member must be carried
+// under trackCarriesStatedLanguage's region/script discipline.
+func clientSignatureLanguageCarried(track models.AudioTrack, stated string) bool {
+	member := strings.TrimSpace(stated)
+	if member == "" || unknownLanguageMembership(member) {
+		return true
+	}
+	return trackCarriesStatedLanguage(track, member)
+}
+
+// trackCarriesStatedLanguage reports whether the track carries one stated
+// language member. A bare stated tag ("en") is carried by any non-conflicting
+// variant the track names, exactly as the primary-language path accepts. A
+// stated tag that itself carries an explicit region or script is narrower: it is
+// carried by the same region/script or by a bare track tag, but NOT by a
+// different explicit variant — a stated "en-US" is not carried by an
+// "en-GB"-only track, because two explicitly different regions are different
+// streams, not a partial view of one.
+func trackCarriesStatedLanguage(track models.AudioTrack, stated string) bool {
+	rank := trackLanguageRank(track, stated)
+	if rank < 0 {
+		// Non-refutation is symmetric: a track that never stated a concrete
+		// language (empty, "und", or a bare MULTI/DUAL sentinel with no member
+		// list) has not contradicted the stated language, so its silence is
+		// missing evidence, not a mismatch. Only a track that stated a concrete
+		// but different language refutes.
+		return !trackStatesConcreteLanguage(track)
+	}
+	if strings.Contains(lang.CompatibleTag(stated), "-") {
+		return rank <= lang.RankBareLanguage
+	}
+	return rank < lang.RankScriptConflict
+}
+
+// trackStatesConcreteLanguage reports whether a probed track makes any concrete
+// language claim at all, as its primary Language code or anywhere in its MULTi
+// Languages list. A track carrying only empty/und/bare-MULTI membership
+// vocabulary has stated no language, so it can neither carry nor contradict a
+// stated signature member.
+func trackStatesConcreteLanguage(track models.AudioTrack) bool {
+	if !unknownLanguageMembership(track.Language) {
+		return true
+	}
+	for _, code := range track.Languages {
+		if !unknownLanguageMembership(code) {
+			return true
+		}
+	}
+	return false
 }
 
 func findExactAudioTrack(tracks []models.AudioTrack, sig *userstore.AudioTrackSignature) int {

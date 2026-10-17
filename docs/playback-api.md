@@ -86,7 +86,10 @@ selection intent against it (the same default-audio reconciliation the
 non-deferred evidence path runs) and asks the client to replan through the
 existing `plan_invalidated` handshake, so the executable recipe keeps the
 preferred language. An explicit viewer selection is verified present and never
-overridden.
+overridden. A selection that is genuinely absent from the committed inventory is
+never substituted: the session records an invalid audio selection, and a virtual
+remux start answers a retryable `409 audio_selection_invalid` for the client to
+replan from, with no route event ending the session.
 `tracks_pending` is a menu hint and is excluded from plan identity, so an
 idempotent start retry replays the same plan with the same marker.
 
