@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/userstore"
 )
 
 // TestRemapAudioSelectionIndexReidentifiesCommittedTrack pins the overlay-swap
@@ -189,4 +190,478 @@ func withEmbeddedTitle(track models.AudioTrack, title string) models.AudioTrack 
 func withLanguages(track models.AudioTrack, languages ...string) models.AudioTrack {
 	track.Languages = languages
 	return track
+}
+
+// TestClientAudioSignatureMatchesTrackWildcards pins the presence-check
+// semantics: a client/start signature constrains only the members it actually
+// carried, so a partial snapshot matches a richer probed track instead of being
+// falsely reported gone. The strict re-identification matchers are separate and
+// keep failing closed (see the remap tests above).
+func TestClientAudioSignatureMatchesTrackWildcards(t *testing.T) {
+	rich := models.AudioTrack{
+		Index: 0, Language: "ja", Codec: "aac", Channels: 2, Layout: "stereo",
+		Title: "[Erai-raws]_AAC_CR", EmbeddedTitle: "[Erai-raws]_AAC_CR", Default: true,
+	}
+	partial := &userstore.AudioTrackSignature{Codec: "aac", Channels: 2}
+	if !ClientAudioSignatureMatchesTrack(rich, partial) {
+		t.Fatal("a codec+channels signature must match a richer track that agrees on both")
+	}
+	// Every named member still has to agree.
+	for name, sig := range map[string]*userstore.AudioTrackSignature{
+		"wrong codec":      {Codec: "eac3", Channels: 2},
+		"wrong channels":   {Codec: "aac", Channels: 6},
+		"wrong language":   {Language: "en", Codec: "aac", Channels: 2},
+		"wrong layout":     {Codec: "aac", Channels: 2, Layout: "5.1"},
+		"wrong title":      {Codec: "aac", Channels: 2, Title: "commentary"},
+		"wrong multi list": {Codec: "aac", Channels: 2, Languages: []string{"en"}},
+	} {
+		if ClientAudioSignatureMatchesTrack(rich, sig) {
+			t.Fatalf("%s must not match the probed track", name)
+		}
+	}
+	// A fully populated signature reduces to strict member equality.
+	if !ClientAudioSignatureMatchesTrack(rich, AudioTrackSignatureFromTrack(rich)) {
+		t.Fatal("the track's own full signature must match it")
+	}
+	// A placeholder track (index/default only) has nothing comparable and must
+	// not refute the selection.
+	placeholder := models.AudioTrack{Index: -1, Default: true}
+	if !ClientAudioSignatureMatchesTrack(placeholder, partial) {
+		t.Fatal("a placeholder track must never refute a selection")
+	}
+	if !ClientAudioSignatureMatchesTrack(rich, nil) || !ClientAudioSignatureMatchesTrack(rich, &userstore.AudioTrackSignature{}) {
+		t.Fatal("a nil or zero signature carries no constraint")
+	}
+}
+
+// TestClientAudioSignatureMatchesTrackOmittedNonLanguageMembers pins the
+// unknown-versus-conflicting rule for the non-language members against the
+// signature {codec:"aac", channels:2}. A member the probed track never stated
+// is unknown, so it does not refute: a codec-only track is now present just like
+// the empty placeholder, adding compatible codec evidence must not turn an
+// accepted placeholder into a rejection. Only a member both sides state and
+// disagree on (a different codec, channel count, language, layout, title or
+// embedded title) still refutes.
+func TestClientAudioSignatureMatchesTrackOmittedNonLanguageMembers(t *testing.T) {
+	sig := &userstore.AudioTrackSignature{Codec: "aac", Channels: 2}
+	present := []struct {
+		name  string
+		track models.AudioTrack
+	}{
+		{name: "empty placeholder", track: models.AudioTrack{Index: -1, Default: true}},
+		{name: "codec-only track", track: models.AudioTrack{Codec: "aac"}},
+		{name: "codec and channels", track: models.AudioTrack{Codec: "aac", Channels: 2}},
+		{
+			// The track states an embedded title the signature never carried, so
+			// the signature has no constraint there and the selection is present.
+			name:  "codec, channels and an embedded title the signature omits",
+			track: models.AudioTrack{Codec: "aac", Channels: 2, EmbeddedTitle: "[Erai-raws]_AAC_CR"},
+		},
+		{
+			name:  "codec, channels and further compatible members",
+			track: models.AudioTrack{Codec: "aac", Channels: 2, Language: "ja", Layout: "stereo", Title: "t"},
+		},
+	}
+	for _, tc := range present {
+		t.Run("present/"+tc.name, func(t *testing.T) {
+			if !ClientAudioSignatureMatchesTrack(tc.track, sig) {
+				t.Fatalf("ClientAudioSignatureMatchesTrack(%+v, %+v) = false, want true: an omitted track member is unknown, not a conflict", tc.track, sig)
+			}
+		})
+	}
+	refute := []struct {
+		name  string
+		track models.AudioTrack
+		sig   *userstore.AudioTrackSignature
+	}{
+		{
+			name:  "different codec",
+			track: models.AudioTrack{Codec: "eac3", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Codec: "aac", Channels: 2},
+		},
+		{
+			name:  "different channel count",
+			track: models.AudioTrack{Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Codec: "aac", Channels: 6},
+		},
+		{
+			name:  "different stated language",
+			track: models.AudioTrack{Language: "de", Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Language: "en", Codec: "aac", Channels: 2},
+		},
+		{
+			name:  "different stated layout",
+			track: models.AudioTrack{Layout: "stereo", Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Layout: "5.1", Codec: "aac", Channels: 2},
+		},
+		{
+			name:  "different stated title",
+			track: models.AudioTrack{Title: "main", Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Title: "commentary", Codec: "aac", Channels: 2},
+		},
+		{
+			name:  "different stated embedded title",
+			track: models.AudioTrack{EmbeddedTitle: "main", Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{EmbeddedTitle: "commentary", Codec: "aac", Channels: 2},
+		},
+	}
+	for _, tc := range refute {
+		t.Run("refute/"+tc.name, func(t *testing.T) {
+			if ClientAudioSignatureMatchesTrack(tc.track, tc.sig) {
+				t.Fatalf("ClientAudioSignatureMatchesTrack(%+v, %+v) = true, want false: a member both sides state must agree", tc.track, tc.sig)
+			}
+		})
+	}
+}
+
+// TestClientAudioSignatureMatchesTrackLanguage pins the language member against
+// MULTi lists and regional/canonical spellings. A signature language the client
+// actually named must be found as the track's primary Language or as any MULTi
+// member, compared with the strict matcher's canonical/regional rank logic, while
+// a genuinely different language or a conflicting script still refutes.
+func TestClientAudioSignatureMatchesTrackLanguage(t *testing.T) {
+	cases := []struct {
+		name  string
+		track models.AudioTrack
+		sig   *userstore.AudioTrackSignature
+		want  bool
+	}{
+		{
+			name:  "multilist carries the signature language",
+			track: models.AudioTrack{Language: "mul", Languages: []string{"de", "en"}, Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Language: "en", Codec: "aac", Channels: 2},
+			want:  true,
+		},
+		{
+			name:  "regional track carries a bare signature language",
+			track: models.AudioTrack{Language: "en-US", Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Language: "en", Codec: "aac", Channels: 2},
+			want:  true,
+		},
+		{
+			name:  "bare track carries a regional signature language",
+			track: models.AudioTrack{Language: "en", Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Language: "en-US", Codec: "aac", Channels: 2},
+			want:  true,
+		},
+		{
+			name:  "canonical ISO alias matches",
+			track: models.AudioTrack{Language: "eng", Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Language: "en", Codec: "aac", Channels: 2},
+			want:  true,
+		},
+		{
+			name:  "case and surrounding space variants match",
+			track: models.AudioTrack{Language: "en", Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Language: "  EN  ", Codec: "aac", Channels: 2},
+			want:  true,
+		},
+		{
+			name:  "a different language still refutes",
+			track: models.AudioTrack{Language: "en", Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Language: "de", Codec: "aac", Channels: 2},
+			want:  false,
+		},
+		{
+			name:  "a MULTi list without the signature language still refutes",
+			track: models.AudioTrack{Language: "mul", Languages: []string{"de", "fr"}, Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Language: "en", Codec: "aac", Channels: 2},
+			want:  false,
+		},
+		{
+			name:  "a conflicting script still refutes",
+			track: models.AudioTrack{Language: "zh-Hant", Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Language: "zh-Hans", Codec: "aac", Channels: 2},
+			want:  false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ClientAudioSignatureMatchesTrack(tc.track, tc.sig); got != tc.want {
+				t.Fatalf("ClientAudioSignatureMatchesTrack(%+v, %+v) = %v, want %v", tc.track, tc.sig, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestClientAudioSignatureMatchesTrackUnknownTrackLanguageIsNeutral pins the
+// other side of the non-refutation contract: a track that never stated a
+// concrete language has not contradicted the signature's stated language, so an
+// empty language, "und", and a bare MULTI/DUAL sentinel with no member list are
+// all missing evidence rather than a refutation. A stated different language and
+// a conflicting script still refute (see the language matrix above), and a
+// concrete different language in a MULTi list still refutes too.
+func TestClientAudioSignatureMatchesTrackUnknownTrackLanguageIsNeutral(t *testing.T) {
+	cases := []struct {
+		name  string
+		track models.AudioTrack
+		sig   *userstore.AudioTrackSignature
+	}{
+		{
+			name:  "empty language with populated codec and channels",
+			track: models.AudioTrack{Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Language: "en", Codec: "aac", Channels: 2},
+		},
+		{
+			name:  "undetermined language with populated codec and channels",
+			track: models.AudioTrack{Language: "und", Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Language: "en", Codec: "aac", Channels: 2},
+		},
+		{
+			name:  "bare MULTI sentinel with no member list",
+			track: models.AudioTrack{Language: "mul", Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Language: "en", Codec: "aac", Channels: 2},
+		},
+		{
+			// The stated language carries a region, so it would be regionally
+			// refused by any explicit variant the track named; a bare sentinel
+			// names none and stays missing evidence.
+			name:  "bare MULTI sentinel is neutral for a stated regional language",
+			track: models.AudioTrack{Language: "mul", Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Language: "en-US", Codec: "aac", Channels: 2},
+		},
+		{
+			name:  "bare DUAL sentinel with no member list",
+			track: models.AudioTrack{Language: "dual", Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Language: "en", Codec: "aac", Channels: 2},
+		},
+		{
+			name:  "sentinel primary with only sentinel members states nothing",
+			track: models.AudioTrack{Language: "mul", Languages: []string{"und"}, Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Language: "en", Codec: "aac", Channels: 2},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if !ClientAudioSignatureMatchesTrack(tc.track, tc.sig) {
+				t.Fatalf("ClientAudioSignatureMatchesTrack(%+v, %+v) = false, want true: an unstated track-side language is missing evidence, not a contradiction", tc.track, tc.sig)
+			}
+		})
+	}
+}
+
+// TestClientAudioSignatureMatchesTrackRegionalRuleMatrix pins the ONE regional
+// rule the predicate applies to both language fields. The primary Language
+// member and every MULTi Languages member must be carried under the same
+// region/script discipline, so a constraint gets the same verdict whichever
+// field expressed it: a stated explicit region is refused by a different
+// explicit region, a bare stated language stays permissive, a matching region
+// and a bare track tag accept, and a script conflict refuses. A placeholder
+// track (nothing comparable) and a stated sentinel that carries no concrete
+// language are neutral.
+func TestClientAudioSignatureMatchesTrackRegionalRuleMatrix(t *testing.T) {
+	track := func(language string, languages ...string) models.AudioTrack {
+		return models.AudioTrack{Language: language, Languages: languages, Codec: "aac", Channels: 2}
+	}
+	cases := []struct {
+		name  string
+		track models.AudioTrack
+		sig   *userstore.AudioTrackSignature
+		want  bool
+	}{
+		// Primary Language member.
+		{
+			name:  "primary: stated en-US refuses an en-GB-only track",
+			track: track("en-GB"),
+			sig:   &userstore.AudioTrackSignature{Language: "en-US", Codec: "aac", Channels: 2},
+			want:  false,
+		},
+		{
+			name:  "primary: bare stated en accepts an en-GB track",
+			track: track("en-GB"),
+			sig:   &userstore.AudioTrackSignature{Language: "en", Codec: "aac", Channels: 2},
+			want:  true,
+		},
+		{
+			name:  "primary: matching region accepts",
+			track: track("en-US"),
+			sig:   &userstore.AudioTrackSignature{Language: "en-US", Codec: "aac", Channels: 2},
+			want:  true,
+		},
+		{
+			name:  "primary: stated region is carried by a bare track tag",
+			track: track("en"),
+			sig:   &userstore.AudioTrackSignature{Language: "en-US", Codec: "aac", Channels: 2},
+			want:  true,
+		},
+		{
+			name:  "primary: script conflict refuses",
+			track: track("zh-Hant"),
+			sig:   &userstore.AudioTrackSignature{Language: "zh-Hans", Codec: "aac", Channels: 2},
+			want:  false,
+		},
+		{
+			// The track's own primary language is a bare sentinel, but its
+			// MULTi member names a different concrete region: the stated region
+			// is still refused through that member. Only a sentinel with no
+			// concrete member is neutral.
+			name:  "primary: sentinel primary with a different concrete member refuses the stated region",
+			track: track("mul", "en-GB"),
+			sig:   &userstore.AudioTrackSignature{Language: "en-US", Codec: "aac", Channels: 2},
+			want:  false,
+		},
+		// MULTi Languages member: the same rule, expressed in the other field.
+		{
+			name:  "multi: stated en-US refuses an en-GB-only track",
+			track: track("mul", "en-GB"),
+			sig:   &userstore.AudioTrackSignature{Codec: "aac", Channels: 2, Languages: []string{"en-US"}},
+			want:  false,
+		},
+		{
+			name:  "multi: bare stated en accepts an en-GB track",
+			track: track("mul", "en-GB"),
+			sig:   &userstore.AudioTrackSignature{Codec: "aac", Channels: 2, Languages: []string{"en"}},
+			want:  true,
+		},
+		{
+			name:  "multi: matching region accepts",
+			track: track("mul", "en-US"),
+			sig:   &userstore.AudioTrackSignature{Codec: "aac", Channels: 2, Languages: []string{"en-US"}},
+			want:  true,
+		},
+		{
+			name:  "multi: stated region is carried by a bare track tag",
+			track: track("mul", "en"),
+			sig:   &userstore.AudioTrackSignature{Codec: "aac", Channels: 2, Languages: []string{"en-US"}},
+			want:  true,
+		},
+		{
+			name:  "multi: script conflict refuses",
+			track: track("mul", "zh-Hant"),
+			sig:   &userstore.AudioTrackSignature{Codec: "aac", Channels: 2, Languages: []string{"zh-Hans"}},
+			want:  false,
+		},
+		// Neutral cases.
+		{
+			name:  "placeholder track has nothing to compare",
+			track: models.AudioTrack{Index: -1, Default: true},
+			sig:   &userstore.AudioTrackSignature{Language: "en-US", Codec: "aac", Channels: 2, Languages: []string{"en-US"}},
+			want:  true,
+		},
+		{
+			name:  "sentinel stated language is neutral on the primary field",
+			track: track("en"),
+			sig:   &userstore.AudioTrackSignature{Language: "mul", Codec: "aac", Channels: 2},
+			want:  true,
+		},
+		{
+			name:  "sentinel stated language is neutral on the MULTi field",
+			track: track("en"),
+			sig:   &userstore.AudioTrackSignature{Codec: "aac", Channels: 2, Languages: []string{"und"}},
+			want:  true,
+		},
+		// The original regression: a partial snapshot is not refuted by a
+		// richer probed track that agrees on every member it named.
+		{
+			name:  "partial signature survives a richer track",
+			track: models.AudioTrack{Index: 0, Language: "ja", Codec: "aac", Channels: 2, Layout: "stereo", Title: "[Erai-raws]_AAC_CR", EmbeddedTitle: "[Erai-raws]_AAC_CR", Default: true},
+			sig:   &userstore.AudioTrackSignature{Codec: "aac", Channels: 2},
+			want:  true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ClientAudioSignatureMatchesTrack(tc.track, tc.sig); got != tc.want {
+				t.Fatalf("ClientAudioSignatureMatchesTrack(%+v, %+v) = %v, want %v", tc.track, tc.sig, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestClientAudioSignatureMatchesTrackStrictMatchersUntouched pins that the
+// non-refutation predicate did not relax probe-derived re-identification: a
+// remap whose only candidates tie because "en" and "eng" are canonically equal
+// still fails closed.
+func TestClientAudioSignatureMatchesTrackStrictMatchersUntouched(t *testing.T) {
+	plan := []models.AudioTrack{{Index: 0, Language: "en", Codec: "aac", Channels: 2}}
+	verified := []models.AudioTrack{
+		{Index: 0, Language: "en", Codec: "aac", Channels: 2},
+		{Index: 0, Language: "eng", Codec: "aac", Channels: 2},
+	}
+	if got := remapAudioSelectionIndex(plan, 0, verified); got != -1 {
+		t.Fatalf("remapped position = %d, want -1: probe-derived re-identification must stay fail-closed", got)
+	}
+}
+
+// TestClientAudioSignatureMatchesTrackLanguagesMembership pins the Languages
+// member as a per-member membership test rather than an exact multiset: a
+// snapshot that enumerated only some of a probed track's MULTi languages is not
+// refuted by the fuller demux, while a stated member the track does not carry
+// (including a different explicit region) still refutes.
+func TestClientAudioSignatureMatchesTrackLanguagesMembership(t *testing.T) {
+	cases := []struct {
+		name  string
+		track models.AudioTrack
+		sig   *userstore.AudioTrackSignature
+		want  bool
+	}{
+		{
+			name:  "a partial stated list is carried by the fuller probed list",
+			track: models.AudioTrack{Language: "mul", Languages: []string{"en", "de"}, Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Codec: "aac", Channels: 2, Languages: []string{"en"}},
+			want:  true,
+		},
+		{
+			name:  "every stated member of a matching list is carried",
+			track: models.AudioTrack{Language: "mul", Languages: []string{"de", "en"}, Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Codec: "aac", Channels: 2, Languages: []string{"en", "de"}},
+			want:  true,
+		},
+		{
+			name:  "a stated member absent from the track refutes",
+			track: models.AudioTrack{Language: "mul", Languages: []string{"en", "de"}, Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Codec: "aac", Channels: 2, Languages: []string{"fr"}},
+			want:  false,
+		},
+		{
+			name:  "a stated member partially absent refutes",
+			track: models.AudioTrack{Language: "mul", Languages: []string{"en", "de"}, Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Codec: "aac", Channels: 2, Languages: []string{"en", "fr"}},
+			want:  false,
+		},
+		{
+			name:  "a bare stated member is carried by a regional variant",
+			track: models.AudioTrack{Language: "mul", Languages: []string{"en-US"}, Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Codec: "aac", Channels: 2, Languages: []string{"en"}},
+			want:  true,
+		},
+		{
+			name:  "a stated explicit region is carried by a bare track tag",
+			track: models.AudioTrack{Language: "mul", Languages: []string{"en"}, Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Codec: "aac", Channels: 2, Languages: []string{"en-US"}},
+			want:  true,
+		},
+		{
+			name:  "a stated explicit region is not carried by a different region",
+			track: models.AudioTrack{Language: "en-GB", Languages: []string{"en-GB"}, Codec: "aac", Channels: 2},
+			sig:   &userstore.AudioTrackSignature{Codec: "aac", Channels: 2, Languages: []string{"en-US"}},
+			want:  false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ClientAudioSignatureMatchesTrack(tc.track, tc.sig); got != tc.want {
+				t.Fatalf("ClientAudioSignatureMatchesTrack(%+v, %+v) = %v, want %v", tc.track, tc.sig, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestClientAudioSignatureMatchesTrackDefaultOnlyIsOverLenient pins the
+// documented over-leniency: the signature's Default flag is never compared, so a
+// signature that carries Default and no other member constrains nothing and
+// matches every track. That is acceptable only because this predicate answers a
+// presence question and is never a selector, so an under-constrained positive
+// cannot move a transport onto the wrong stream.
+func TestClientAudioSignatureMatchesTrackDefaultOnlyIsOverLenient(t *testing.T) {
+	sig := &userstore.AudioTrackSignature{Default: true}
+	for _, track := range []models.AudioTrack{
+		{Index: 0, Language: "en", Codec: "aac", Channels: 2},
+		{Index: 1, Language: "de", Codec: "eac3", Channels: 6, Layout: "5.1", Default: true},
+		{Index: -1, Default: true},
+	} {
+		if !ClientAudioSignatureMatchesTrack(track, sig) {
+			t.Fatalf("a Default-only signature must not refute track %+v", track)
+		}
+	}
 }
