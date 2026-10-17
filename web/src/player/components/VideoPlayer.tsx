@@ -2630,6 +2630,12 @@ export function VideoPlayer({
                   const retryAfter = manifestRetryAfterMs(data);
                   const instance = hls;
                   const manifestUrl = instance?.url ?? data.frag?.url ?? data.url;
+                  // A pollback is a manifest reload like any other: replace any
+                  // timer still pending so a superseded retry cannot fire a
+                  // second, overlapping loadSource.
+                  if (manifestPollbackRef.current !== undefined) {
+                    window.clearTimeout(manifestPollbackRef.current);
+                  }
                   const timer = window.setTimeout(() => {
                     if (destroyed) return;
                     if (hlsStartupGuardRef.current?.isStarting() !== true) return;
