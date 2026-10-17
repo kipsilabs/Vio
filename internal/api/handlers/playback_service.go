@@ -1267,6 +1267,14 @@ func (h *PlaybackHandler) inventoryEffectiveFile(ctx context.Context, file *mode
 		placeholder.ExternalSubtitles = nil
 		placeholder.ProbeUpdatedAt = nil
 		base = &placeholder
+		// Name the fail-closed decision so an operator can correlate an empty
+		// menu with the reason it is empty: no catalog row names the bound
+		// candidate, so no row's inventory may be shown for it.
+		slog.InfoContext(ctx, "virtual inventory serving fail-closed placeholder: no catalog row names the bound candidate",
+			"component", "api",
+			"file_id", file.ID,
+			"base_id", placeholder.ID,
+			"candidate_uri", candidateURI)
 	}
 	return bindSessionVirtualSourceWithTracks(ctx, base, session, h.fileResolver)
 }
