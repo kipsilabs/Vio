@@ -386,3 +386,35 @@ func TestWatchVirtualRankingMapping(t *testing.T) {
 		t.Fatalf("nil ranking mapped to %+v, want nil", got)
 	}
 }
+
+// TestWatchVersionMatchedFormatsSerialization pins the wire contract on the
+// watch version payload: a scored row carries the matched format names, and an
+// unscored row omits the field entirely.
+func TestWatchVersionMatchedFormatsSerialization(t *testing.T) {
+	score := 850
+	scored, err := json.Marshal(watchVersionOf(catalogpkg.FileVersion{
+		FileID:         1,
+		AddedAt:        time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
+		FormatScore:    &score,
+		MatchedFormats: []string{"English", "Remux Tier 1"},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(scored, &body); err != nil {
+		t.Fatal(err)
+	}
+	formats, ok := body["matched_formats"].([]any)
+	if !ok || len(formats) != 2 || formats[0] != "English" || formats[1] != "Remux Tier 1" {
+		t.Fatalf("matched_formats = %v, want [English Remux Tier 1]", body["matched_formats"])
+	}
+
+	unscored, err := json.Marshal(watchVersionOf(catalogpkg.FileVersion{FileID: 2, AddedAt: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(unscored), "matched_formats") {
+		t.Fatalf("unscored row carried matched_formats: %s", unscored)
+	}
+}
