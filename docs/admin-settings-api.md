@@ -128,3 +128,26 @@ server encoder validation. Clients without HEVC delivery support retain
 H.264 output. Changes apply to new playback decisions and do not rewrite an
 active session's frozen recipe. The Playback settings page exposes this policy
 as **Allow HEVC encoding**.
+
+### Continue Watching age window
+
+`playback.continue_watching_weeks` is a whole number of weeks, default `0`. It
+sets how old an in-progress entry may be and still appear in Home's Continue
+Watching row, mirroring the Plex-alike *Weeks to consider for Continue
+Watching*. The window is measured against the entry's last playback activity,
+and `0` means no limit (the default). The window applies only to the Continue
+Watching and Continue Reading rows it belongs to; Jellyfin Resume, Next Up, and
+the Watch Tonight rail read progress without the age filter, since the window is
+scoped to that row rather than to progress state.
+
+### Minimum watched time before the first start scrobble
+
+`playback.scrobble_start_seconds` is a whole number of seconds, default `0`.
+When greater than `0`, a playback session's first start scrobble to a connected
+watch provider (Trakt and similar) is deferred until the session has been
+watched for that long; until then a pause or stop for the session sends
+nothing, because nothing was started. Once the window elapses the deferred
+start is sent at the next progress report and every later pause, resume, and
+stop behaves as before. `0` keeps the immediate first start. The value is read
+when the first start is decided, so a change applies to playback sessions
+started afterwards.

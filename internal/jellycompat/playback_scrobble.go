@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Silo-Server/silo-server/internal/config"
 	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/userstore"
 	"github.com/Silo-Server/silo-server/internal/watchsync"
@@ -42,6 +43,57 @@ func (h *PlaybackHandler) dispatchCompatScrobble(
 	preferredSource *PlaybackMediaSource,
 ) error {
 	return h.dispatchCompatScrobbleAt(ctx, action, playSession, upstreamSession, preferredSource, nil)
+}
+
+// compatScrobbleGateState is the resolved minimum-watched gate for a compat
+// upstream session's first start scrobble.
+type compatScrobbleGateState int
+
+const (
+	// compatScrobbleGateClosed: the watched window has not elapsed; nothing was
+	// started, so no start, pause, or stop scrobble is sent yet.
+	compatScrobbleGateClosed compatScrobbleGateState = iota
+	// compatScrobbleGateOpened: this call opened the gate; send the deferred
+	// first start.
+	compatScrobbleGateOpened
+	// compatScrobbleGateAlreadyOpen: the first start was already enabled.
+	compatScrobbleGateAlreadyOpen
+)
+
+// compatScrobbleGateState resolves the first-start gate for one upstream
+// session. A disabled threshold, a missing session manager, or a manager
+// without the gate reports the gate already open, preserving the pre-gate
+// behavior.
+func (h *PlaybackHandler) compatScrobbleGate(ctx context.Context, sessionID string) compatScrobbleGateState {
+	delay := h.compatScrobbleStartDelay(ctx)
+	if delay <= 0 || h == nil || h.sessionMgr == nil {
+		return compatScrobbleGateAlreadyOpen
+	}
+	gate, ok := h.sessionMgr.(interface {
+		OpenScrobbleStartGate(sessionID string, threshold time.Duration) (open, newly bool)
+	})
+	if !ok {
+		return compatScrobbleGateAlreadyOpen
+	}
+	open, newly := gate.OpenScrobbleStartGate(sessionID, delay)
+	switch {
+	case !open:
+		return compatScrobbleGateClosed
+	case newly:
+		return compatScrobbleGateOpened
+	default:
+		return compatScrobbleGateAlreadyOpen
+	}
+}
+
+// compatScrobbleStartDelay reads playback.scrobble_start_seconds. Zero keeps
+// today's immediate first start.
+func (h *PlaybackHandler) compatScrobbleStartDelay(ctx context.Context) time.Duration {
+	if h == nil || h.SettingsRepo == nil {
+		return 0
+	}
+	raw, _ := h.SettingsRepo.Get(ctx, config.PlaybackScrobbleStartSecondsSettingKey)
+	return config.ScrobbleStartDelay(raw)
 }
 
 func (h *PlaybackHandler) dispatchCompatScrobbleAt(
@@ -203,6 +255,11 @@ func (h *PlaybackHandler) sendCompatResumeStart(
 		}
 	}
 	position := compatScrobblePosition(playSession, sample)
+	if h.compatScrobbleGate(ctx, sample.ID) == compatScrobbleGateClosed {
+		// Nothing was started for this session yet: defer the start until the
+		// minimum watched window elapses (a later report or tick emits it).
+		return
+	}
 	sentAt := time.Now()
 	_ = h.dispatchCompatScrobbleAt(ctx, compatScrobbleStart, playSession, sample, source, &position)
 	h.recordCompatResumeScrobble(playSession.ID, sample.ID, position, sentAt)
@@ -299,8 +356,14 @@ func (h *PlaybackHandler) scrobbleCompatReport(
 	if h == nil || playSession == nil || previous == nil {
 		return
 	}
+	gate := h.compatScrobbleGate(ctx, previous.ID)
+	if gate == compatScrobbleGateClosed {
+		// The minimum-watched gate has not opened: nothing was started, so a
+		// pause or early report has nothing to send.
+		return
+	}
 	pauseChanged := previous.IsPaused != paused
-	if !pauseChanged && (paused || position <= 0) {
+	if gate != compatScrobbleGateOpened && !pauseChanged && (paused || position <= 0) {
 		return
 	}
 	var record *PlaybackSession
@@ -314,14 +377,19 @@ func (h *PlaybackHandler) scrobbleCompatReport(
 		}
 		record = current
 	}
-	if !pauseChanged && !compatResumeScrobbleNeedsCorrection(record, previous.ID, position, time.Now()) {
+	correctStart := !pauseChanged && compatResumeScrobbleNeedsCorrection(record, previous.ID, position, time.Now())
+	if gate != compatScrobbleGateOpened && !pauseChanged && !correctStart {
 		return
 	}
 	updated := *previous
 	updated.Position = position
 	updated.IsPaused = paused
+	// A paused transition sends only the pause; a playing transition or a gate
+	// opening sends the start (the gate opening is the deferred first start).
+	emitStart := gate == compatScrobbleGateOpened || (pauseChanged && !paused) || correctStart
+	emitPause := pauseChanged && paused
 	action := compatScrobbleStart
-	if paused {
+	if emitPause && !emitStart {
 		action = compatScrobblePause
 	}
 	if err := h.dispatchCompatScrobbleAt(ctx, action, playSession, &updated, source, &position); err != nil {
@@ -329,6 +397,13 @@ func (h *PlaybackHandler) scrobbleCompatReport(
 	}
 	if record != nil && record.ResumeScrobbleUpstreamID == previous.ID {
 		h.clearCompatResumeScrobble(playSession.ID, record.ResumeScrobbleUpstreamID, record.ResumeScrobbleSentAt)
+	}
+	if emitPause && emitStart {
+		// The gate opened on the same report that paused: send the deferred
+		// start first, then the pause, so the provider sees a whole lifecycle.
+		if err := h.dispatchCompatScrobbleAt(ctx, compatScrobblePause, playSession, &updated, source, &position); err != nil {
+			return
+		}
 	}
 }
 

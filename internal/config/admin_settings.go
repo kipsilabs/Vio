@@ -114,8 +114,14 @@ func splitRatingSourceList(raw string) (sources []string, malformed string) {
 const (
 	Allow4KTranscodeSettingKey               = "allow_4k_transcode"
 	PlaybackAllowHEVCEncodingSettingKey      = "playback.allow_hevc_encoding"
+	PlaybackScrobbleStartSecondsSettingKey   = "playback.scrobble_start_seconds"
 	DownloadLocalTranscodeFallbackSettingKey = "download.local_transcode_fallback"
 )
+
+// PlaybackContinueWatchingWeeksSettingKey is the "Weeks to consider for
+// Continue Watching" age window. Home's Continue Watching row drops
+// in-progress entries whose last activity predates it; 0 means no limit.
+const PlaybackContinueWatchingWeeksSettingKey = "playback.continue_watching_weeks"
 
 // ArtworkStorageReconcileCheckpointKey is machine-managed task state. It is
 // stored alongside server settings for durability but must not be exposed or
@@ -365,6 +371,8 @@ var adminSettingDefaults = map[string]string{
 	"playback.watched_threshold":                     "90",
 	"playback.min_resume_threshold":                  "5",
 	"playback.max_virtual_failover_attempts":         "5",
+	PlaybackScrobbleStartSecondsSettingKey:           "0",
+	PlaybackContinueWatchingWeeksSettingKey:          "0",
 	Allow4KTranscodeSettingKey:                       "true",
 	playback.TranscodeThrottleEnabledSettingKey:      strconv.FormatBool(playback.DefaultTranscodeThrottleEnabled),
 	playback.TranscodeThrottleSecondsSettingKey:      strconv.Itoa(playback.DefaultTranscodeThrottleSeconds),
@@ -693,6 +701,12 @@ func NormalizeAdminSetting(key, raw string) (string, error) {
 		return normalizeAdminInt(key, value, 1, 99)
 	case "playback.max_virtual_failover_attempts":
 		return normalizeAdminInt(key, value, 1, 50)
+	case PlaybackContinueWatchingWeeksSettingKey:
+		// 0 disables the window: no age limit (the Plex-alike "no limit").
+		return normalizeAdminInt(key, value, 0, 520)
+	case PlaybackScrobbleStartSecondsSettingKey:
+		// 0 keeps today's immediate first start scrobble.
+		return normalizeAdminInt(key, value, 0, 86400)
 	case "virtual_library.movie_library_id", "virtual_library.series_library_id":
 		return normalizeAdminInt(key, value, 1, 1000000)
 	case "virtual_library.cache_ttl_minutes", "virtual_library.indexer_rss_check_minutes", "virtual_library.altmount_check_minutes":
@@ -1303,6 +1317,38 @@ func VirtualCandidateStoreWindow(raw string) time.Duration {
 		return 0
 	}
 	return time.Duration(hours) * time.Hour
+}
+
+// ContinueWatchingWindow parses the playback.continue_watching_weeks setting
+// into the age window for Home's Continue Watching row. An empty value uses the
+// setting's default; a stored 0, or a non-positive or unparseable value, means
+// no limit (zero).
+func ContinueWatchingWindow(raw string) time.Duration {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		raw = adminSettingDefaults[PlaybackContinueWatchingWeeksSettingKey]
+	}
+	weeks, err := strconv.Atoi(raw)
+	if err != nil || weeks <= 0 {
+		return 0
+	}
+	return time.Duration(weeks) * 7 * 24 * time.Hour
+}
+
+// ScrobbleStartDelay parses the playback.scrobble_start_seconds setting into
+// how long a playback session must be watched before its first start scrobble
+// is sent. An empty value uses the setting's default; a stored 0, or a
+// non-positive or unparseable value, sends the start immediately (zero).
+func ScrobbleStartDelay(raw string) time.Duration {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		raw = adminSettingDefaults[PlaybackScrobbleStartSecondsSettingKey]
+	}
+	seconds, err := strconv.Atoi(raw)
+	if err != nil || seconds <= 0 {
+		return 0
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 func normalizeAdminInt64(key, value string, minValue, maxValue int64) (string, error) {

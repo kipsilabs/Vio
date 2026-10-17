@@ -216,6 +216,16 @@ type Session struct {
 
 	Position float64
 	IsPaused bool
+	// ScrobbleStartBaseline is the instant the minimum-watched gate
+	// (playback.scrobble_start_seconds) measures watched time from. It is
+	// captured at session creation. Zero means no baseline was captured, and the
+	// gate never holds this session's first start back.
+	ScrobbleStartBaseline time.Time
+	// ScrobbleStartArmed records that this session's first start scrobble has
+	// been enabled, either because the watched window elapsed or because the
+	// gate is disabled. Until it is set, pause and stop scrobbles are suppressed
+	// because nothing was started.
+	ScrobbleStartArmed bool
 	// ClientCanceled records the last transport cancel observed for this
 	// session, scoped to the route revision and binding generation it happened
 	// on. It is liveness evidence for one request, not a session verdict: the
@@ -889,6 +899,7 @@ func newSession(
 		RoutingNetworkProvider: new(netaccess.PathFromContext(ctx).Provider),
 		Position:               0,
 		IsPaused:               false,
+		ScrobbleStartBaseline:  now,
 		ClientName:             clientInfo.Name,
 		ClientVersion:          clientInfo.Version,
 		ClientBuild:            clientInfo.Build,
@@ -942,6 +953,12 @@ func (m *SessionManager) RegisterReconstructed(s *Session) *Session {
 	now := time.Now()
 	if s.StartedAt.IsZero() {
 		s.StartedAt = now
+	}
+	if s.ScrobbleStartBaseline.IsZero() {
+		// Sessions built outside newSession (restart reconstruction, compat
+		// fallbacks) still get a watched baseline so the first-start gate
+		// measures from when they entered the cluster.
+		s.ScrobbleStartBaseline = now
 	}
 	s.UpdatedAt = now
 	s.LastActivityAt = now
@@ -998,6 +1015,12 @@ func (m *SessionManager) RegisterReconstructedWithLimits(ctx context.Context, s 
 	now := time.Now()
 	if s.StartedAt.IsZero() {
 		s.StartedAt = now
+	}
+	if s.ScrobbleStartBaseline.IsZero() {
+		// Sessions built outside newSession (restart reconstruction, compat
+		// fallbacks) still get a watched baseline so the first-start gate
+		// measures from when they entered the cluster.
+		s.ScrobbleStartBaseline = now
 	}
 	s.UpdatedAt = now
 	s.LastActivityAt = now
@@ -1270,6 +1293,34 @@ func (m *SessionManager) UpdateProgress(sessionID string, position float64, isPa
 	s.streamRevision++
 	m.touchSessionLocked(s)
 	return nil
+}
+
+// OpenScrobbleStartGate resolves the minimum-watched gate for a session's first
+// start scrobble, opening it once the watched window has elapsed. It reports
+// whether the gate is open (the session is armed) and whether this call is the
+// one that opened it, so the caller emits the deferred first start exactly
+// once. A non-positive threshold disables the gate and always reports open. A
+// session the manager no longer holds also reports open, so a late terminal
+// event is never dropped. Calling it on a progress tick arms the session when
+// the window elapses, which is what lets the tick emit the deferred start.
+func (m *SessionManager) OpenScrobbleStartGate(sessionID string, threshold time.Duration) (open, newly bool) {
+	if m == nil || threshold <= 0 {
+		return true, false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		return true, false
+	}
+	if s.ScrobbleStartArmed {
+		return true, false
+	}
+	if s.ScrobbleStartBaseline.IsZero() || time.Since(s.ScrobbleStartBaseline) >= threshold {
+		s.ScrobbleStartArmed = true
+		return true, true
+	}
+	return false, false
 }
 
 // MarkStopReported records that a client reported this session stopped

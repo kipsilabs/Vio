@@ -2618,6 +2618,10 @@ func newChiRouter(deps Dependencies) chi.Router {
 		sectionFetcher := sections.NewFetcher(deps.DB)
 		sectionFetcher.StoreProvider = deps.UserStoreProvider
 		sectionFetcher.CollectionOwners = collectionOwners
+		if settingsRepo != nil {
+			// Home's Continue Watching age window (playback.continue_watching_weeks).
+			sectionFetcher.Settings = settingsRepo
+		}
 		if watchlistTitles != nil {
 			sectionFetcher.WatchlistPromoter = watchlistTitles
 		}

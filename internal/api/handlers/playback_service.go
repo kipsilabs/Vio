@@ -535,7 +535,7 @@ func (h *PlaybackHandler) writeProgressSideEffectsV2(ctx context.Context, record
 		h.syncSessionsOnPauseChange(ctx, wasPaused, sample.IsPaused)
 		if current, getErr := h.sessionMgr.GetSession(sessionID); getErr == nil && current != nil {
 			h.persistProgress(ctx, current)
-			h.scrobblePauseTransitionV2(ctx, current, wasPaused)
+			h.scrobbleProgressTransition(ctx, current, wasPaused)
 			return
 		}
 	}
@@ -656,28 +656,6 @@ func (h *PlaybackHandler) forgetProgressSideEffectLock(sessionID string) {
 	// delivered or complete. Dropping its in-process retry state here keeps a
 	// long-lived process from retaining state for every session it ever served.
 	forgetAudioReconcileAttemptsForSession(sessionID)
-}
-
-func (h *PlaybackHandler) scrobblePauseTransitionV2(ctx context.Context, sess *playback.Session, wasPaused bool) {
-	if sess.DisableProgressPersistence || h.WatchScrobbler == nil || wasPaused == sess.IsPaused {
-		return
-	}
-	file, loadErr := h.loadFileByPreferredID(ctx, requestedMediaFileID(sess), sess.MediaFileID)
-	if loadErr != nil || file == nil {
-		return
-	}
-	targetID := playbackProgressTarget(file)
-	if targetID == "" {
-		return
-	}
-	event := h.scrobbleEventForSession(ctx, sess, targetID, float64(file.Duration), sess.Position)
-	if sess.IsPaused {
-		if err := h.WatchScrobbler.ScrobblePause(ctx, event); err != nil {
-			slog.WarnContext(ctx, "failed to queue watch provider pause scrobble", "component", "api", "session", sess.ID, "error", err)
-		}
-	} else if err := h.WatchScrobbler.ScrobbleStart(ctx, event); err != nil {
-		slog.WarnContext(ctx, "failed to queue watch provider resume scrobble", "component", "api", "session", sess.ID, "error", err)
-	}
 }
 
 // StopPlaybackV2 is DELETE /api/v2/playback/{session_id}. The first stop wins

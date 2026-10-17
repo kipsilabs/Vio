@@ -2284,6 +2284,17 @@ func (h *PlaybackHandler) stageCompatStop(
 ) (current *PlaybackSession, upstreamSession *playback.Session, transcodeNodeURL string, staged bool) {
 	unlock := h.compatScrobbleLocks.lock(playSession.UpstreamSessionID)
 	upstreamSession, transcodeNodeURL = h.compatStopSnapshot(playSession, fallbackSession)
+	if upstreamSession != nil && h.compatScrobbleGate(ctx, upstreamSession.ID) == compatScrobbleGateClosed {
+		// Nothing was started for this session yet: a stop before the min-watched
+		// gate has nothing to report. Treat it like "no stop event to send" so the
+		// caller still cleans up the play session.
+		current = playSession
+		if reread, found := h.playbackStore.GetFinalizable(playSession.ID, playSession.CompatToken); found {
+			current = reread
+		}
+		unlock()
+		return current, upstreamSession, transcodeNodeURL, false
+	}
 	event, ok := h.compatScrobbleEvent(
 		ctx, compatScrobbleStop, playSession, upstreamSession, nil, positionOverride,
 	)
@@ -2916,7 +2927,9 @@ func (h *PlaybackHandler) ensureUpstreamPlayback(ctx context.Context, compatSess
 		transcodeNodeURL := ""
 		if current, err := h.sessionMgr.GetSession(oldUpstreamSessionID); err == nil {
 			transcodeNodeURL = current.TranscodeNodeURL
-			h.dispatchCompatScrobble(ctx, compatScrobbleStop, playSession, current, nil)
+			if h.compatScrobbleGate(ctx, current.ID) != compatScrobbleGateClosed {
+				_ = h.dispatchCompatScrobble(ctx, compatScrobbleStop, playSession, current, nil)
+			}
 		}
 		_ = h.sessionMgr.StopSession(oldUpstreamSessionID)
 		h.tm.CloseTranscodeSession(oldUpstreamSessionID, transcodeNodeURL)

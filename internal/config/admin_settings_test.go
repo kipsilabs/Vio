@@ -535,6 +535,57 @@ func TestNormalizeAdminSettingMaxVirtualFailoverAttempts(t *testing.T) {
 	}
 }
 
+// TestNormalizeAdminSettingContinueWatchingWeeks accepts the documented
+// 0..520 week range: 0 means no limit, so unlike the other playback ints it
+// must survive normalization.
+func TestNormalizeAdminSettingContinueWatchingWeeks(t *testing.T) {
+	for _, value := range []string{"0", "1", "520"} {
+		got, err := NormalizeAdminSetting(PlaybackContinueWatchingWeeksSettingKey, "  "+value+"  ")
+		if err != nil {
+			t.Fatalf("NormalizeAdminSetting(%q, %q): %v", PlaybackContinueWatchingWeeksSettingKey, value, err)
+		}
+		if got != value {
+			t.Fatalf("normalized weeks = %q, want %q", got, value)
+		}
+	}
+	for _, value := range []string{"-1", "521", "soon"} {
+		if _, err := NormalizeAdminSetting(PlaybackContinueWatchingWeeksSettingKey, value); err == nil {
+			t.Fatalf("NormalizeAdminSetting(%q, %q) accepted an out-of-range value", PlaybackContinueWatchingWeeksSettingKey, value)
+		}
+	}
+	if got := ContinueWatchingWindow("0"); got != 0 {
+		t.Fatalf("ContinueWatchingWindow(0) = %v, want zero", got)
+	}
+	if got := ContinueWatchingWindow("2"); got != 14*24*time.Hour {
+		t.Fatalf("ContinueWatchingWindow(2) = %v, want 336h", got)
+	}
+}
+
+// TestNormalizeAdminSettingScrobbleStartSeconds accepts 0 (today's immediate
+// first start scrobble) through the documented one-day ceiling.
+func TestNormalizeAdminSettingScrobbleStartSeconds(t *testing.T) {
+	for _, value := range []string{"0", "30", "86400"} {
+		got, err := NormalizeAdminSetting(PlaybackScrobbleStartSecondsSettingKey, "  "+value+"  ")
+		if err != nil {
+			t.Fatalf("NormalizeAdminSetting(%q, %q): %v", PlaybackScrobbleStartSecondsSettingKey, value, err)
+		}
+		if got != value {
+			t.Fatalf("normalized seconds = %q, want %q", got, value)
+		}
+	}
+	for _, value := range []string{"-1", "86401", "soon"} {
+		if _, err := NormalizeAdminSetting(PlaybackScrobbleStartSecondsSettingKey, value); err == nil {
+			t.Fatalf("NormalizeAdminSetting(%q, %q) accepted an out-of-range value", PlaybackScrobbleStartSecondsSettingKey, value)
+		}
+	}
+	if got := ScrobbleStartDelay("0"); got != 0 {
+		t.Fatalf("ScrobbleStartDelay(0) = %v, want zero", got)
+	}
+	if got := ScrobbleStartDelay("45"); got != 45*time.Second {
+		t.Fatalf("ScrobbleStartDelay(45) = %v, want 45s", got)
+	}
+}
+
 // TestNormalizeAdminSettingIndexerSearchTimeoutRoundTrip proves the Prowlarr
 // search timeout accepts the documented 5-900 range and rejects values the
 // client would silently clamp.

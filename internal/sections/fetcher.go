@@ -20,6 +20,7 @@ import (
 	"golang.org/x/sync/singleflight"
 
 	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/config"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/recommendations"
 	"github.com/Silo-Server/silo-server/internal/sections/recipes"
@@ -110,6 +111,17 @@ type Fetcher struct {
 	// Clock returns the current time. Defaults to recipes.RealClock{}.
 	// Clock controls time-based seasonal and editorial resolution.
 	Clock recipes.Clock
+
+	// Settings reads global admin settings for the Continue Watching age
+	// window (config.PlaybackContinueWatchingWeeksSettingKey). Nil leaves the
+	// window unset, so every in-progress entry stays.
+	Settings SettingsReader
+}
+
+// SettingsReader reads a global admin setting by key. Satisfied by
+// catalog.SettingsStore.
+type SettingsReader interface {
+	Get(ctx context.Context, key string) (string, error)
 }
 
 // NewFetcher creates a new section Fetcher.
@@ -203,6 +215,50 @@ func (f *Fetcher) now() time.Time {
 		return f.Clock.Now()
 	}
 	return time.Now()
+}
+
+// continueWatchingCutoff resolves the Continue Watching age window into the
+// instant before which an in-progress entry is stale. The zero time means no
+// limit. The window is read per fetch so a settings change takes effect on the
+// next home load.
+func (f *Fetcher) continueWatchingCutoff(ctx context.Context) time.Time {
+	if f == nil || f.Settings == nil {
+		return time.Time{}
+	}
+	raw, err := f.Settings.Get(ctx, config.PlaybackContinueWatchingWeeksSettingKey)
+	if err != nil {
+		return time.Time{}
+	}
+	window := config.ContinueWatchingWindow(raw)
+	if window <= 0 {
+		return time.Time{}
+	}
+	return f.now().Add(-window)
+}
+
+// dropProgressBefore removes entries whose last activity predates cutoff. A
+// zero cutoff keeps every entry. Entries arrive newest-first, so the first
+// dropped entry means every later one is older too: reached reports that the
+// caller can stop paging. Unparseable timestamps are kept rather than dropped
+// silently.
+func dropProgressBefore(entries []userstore.WatchProgress, cutoff time.Time) (kept []userstore.WatchProgress, reached bool) {
+	if cutoff.IsZero() {
+		return entries, false
+	}
+	kept = entries[:0]
+	for _, entry := range entries {
+		updatedAt, err := time.Parse(time.RFC3339, entry.UpdatedAt)
+		if err != nil {
+			kept = append(kept, entry)
+			continue
+		}
+		if updatedAt.Before(cutoff) {
+			reached = true
+			continue
+		}
+		kept = append(kept, entry)
+	}
+	return kept, reached
 }
 
 func (f *Fetcher) cachedEditorialCandidates(ctx context.Context, subjectType string, libraryID *int, libraryIDs []int, filter catalog.AccessFilter, ttl time.Duration, loader editorialCandidateLoader) ([]string, error) {
@@ -588,6 +644,10 @@ func (f *Fetcher) collectContinueProgressItems(
 	for _, item := range orderedItems {
 		seen[item.ContentID] = struct{}{}
 	}
+	// Home's Continue Watching row honors the configured age window; the
+	// shared scan below serves both the video and ebook sources, so filtering
+	// here covers both.
+	cutoff := f.continueWatchingCutoff(ctx)
 	for offset := 0; len(orderedItems) < limit && offset < continueProgressMaxScanned; offset += continueProgressPageSize {
 		pageLimit := continueProgressPageSize
 		if remaining := continueProgressMaxScanned - offset; remaining < pageLimit {
@@ -601,6 +661,7 @@ func (f *Fetcher) collectContinueProgressItems(
 			break
 		}
 		rawProgressCount := len(progressEntries)
+		progressEntries, windowReached := dropProgressBefore(progressEntries, cutoff)
 		progressEntries = dismissals.FilterProgress(progressEntries)
 		if filtered, err := dropped.FilterProgress(ctx, progressEntries); err != nil {
 			slog.ErrorContext(ctx, "filtering dropped series from continue watching", "component", "sections", "profile_id", profileID, "error", err)
@@ -614,7 +675,7 @@ func (f *Fetcher) collectContinueProgressItems(
 		}
 		orderedItems = appendUniqueContinueItems(orderedItems, pageItems, seen, limit)
 		maps.Copy(itemMeta, pageMeta)
-		if rawProgressCount < pageLimit {
+		if windowReached || rawProgressCount < pageLimit {
 			break
 		}
 	}

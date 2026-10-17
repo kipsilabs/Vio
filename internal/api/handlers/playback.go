@@ -1955,6 +1955,100 @@ func (h *PlaybackHandler) persistStopAndHistory(ctx context.Context, session *pl
 	return result, err
 }
 
+// scrobbleStartGate is implemented by the session manager to defer a session's
+// first start scrobble until it has been watched for the configured minimum
+// (playback.scrobble_start_seconds).
+type scrobbleStartGate interface {
+	OpenScrobbleStartGate(sessionID string, threshold time.Duration) (open, newly bool)
+}
+
+// scrobbleGateState is the resolved minimum-watched gate for one start scrobble.
+type scrobbleGateState int
+
+const (
+	// scrobbleGateClosed: the watched window has not elapsed. Nothing was
+	// started, so no start, pause, or stop scrobble is sent for the session yet.
+	scrobbleGateClosed scrobbleGateState = iota
+	// scrobbleGateOpened: this call is the one that opened the gate; the caller
+	// sends the deferred first start.
+	scrobbleGateOpened
+	// scrobbleGateAlreadyOpen: the first start was already enabled; the caller's
+	// ordinary transition behavior applies.
+	scrobbleGateAlreadyOpen
+)
+
+// scrobbleStartDelay reads playback.scrobble_start_seconds. Zero keeps today's
+// immediate first start.
+func (h *PlaybackHandler) scrobbleStartDelay(ctx context.Context) time.Duration {
+	if h == nil || h.SettingsRepo == nil {
+		return 0
+	}
+	raw, _ := h.SettingsRepo.Get(ctx, config.PlaybackScrobbleStartSecondsSettingKey)
+	return config.ScrobbleStartDelay(raw)
+}
+
+// scrobbleGateState resolves the first-start gate for sessionID. A disabled
+// threshold, a missing session manager, or a manager without the gate reports
+// the gate already open, preserving the pre-gate behavior everywhere else.
+func (h *PlaybackHandler) scrobbleGateState(ctx context.Context, sessionID string) scrobbleGateState {
+	delay := h.scrobbleStartDelay(ctx)
+	if delay <= 0 || h == nil || h.sessionMgr == nil {
+		return scrobbleGateAlreadyOpen
+	}
+	gate, ok := h.sessionMgr.(scrobbleStartGate)
+	if !ok {
+		return scrobbleGateAlreadyOpen
+	}
+	open, newly := gate.OpenScrobbleStartGate(sessionID, delay)
+	switch {
+	case !open:
+		return scrobbleGateClosed
+	case newly:
+		return scrobbleGateOpened
+	default:
+		return scrobbleGateAlreadyOpen
+	}
+}
+
+// scrobbleProgressTransition reconciles a progress tick's pause state with the
+// watch scrobbler. It sends the deferred first start when this tick opens the
+// minimum-watched gate, and otherwise sends the pause or resume the transition
+// calls for. Before the gate opens nothing was started, so it sends nothing.
+func (h *PlaybackHandler) scrobbleProgressTransition(ctx context.Context, session *playback.Session, wasPaused bool) {
+	if session == nil || session.DisableProgressPersistence || h.WatchScrobbler == nil {
+		return
+	}
+	state := h.scrobbleGateState(ctx, session.ID)
+	if state == scrobbleGateClosed {
+		return
+	}
+	transition := wasPaused != session.IsPaused
+	emitStart := state == scrobbleGateOpened || (transition && !session.IsPaused)
+	emitPause := transition && session.IsPaused
+	if !emitStart && !emitPause {
+		return
+	}
+	file, loadErr := h.loadFileByPreferredID(ctx, requestedMediaFileID(session), session.MediaFileID)
+	if loadErr != nil || file == nil {
+		return
+	}
+	targetID := playbackProgressTarget(file)
+	if targetID == "" {
+		return
+	}
+	event := h.scrobbleEventForSession(ctx, session, targetID, float64(file.Duration), session.Position)
+	if emitStart {
+		if err := h.WatchScrobbler.ScrobbleStart(ctx, event); err != nil {
+			slog.WarnContext(ctx, "failed to queue watch provider start scrobble", "component", "api", "session", session.ID, "error", err)
+		}
+	}
+	if emitPause {
+		if err := h.WatchScrobbler.ScrobblePause(ctx, event); err != nil {
+			slog.WarnContext(ctx, "failed to queue watch provider pause scrobble", "component", "api", "session", session.ID, "error", err)
+		}
+	}
+}
+
 func (h *PlaybackHandler) scrobbleEventForSession(ctx context.Context, session *playback.Session, mediaItemID string, duration, position float64) watchsync.ScrobbleEvent {
 	event := watchsync.ScrobbleEvent{
 		PlaybackSessionID: session.ID,
@@ -2190,7 +2284,7 @@ func (h *PlaybackHandler) finalizeSessionStopWithResult(ctx context.Context, ses
 	h.dropDeferredPublish(session.ID)
 
 	stopResult, historyErr := h.recordStopHistory(ctx, session, historyID)
-	if h.WatchScrobbler != nil {
+	if h.WatchScrobbler != nil && h.scrobbleGateState(ctx, session.ID) != scrobbleGateClosed {
 		if event, ok := h.scrobbleEventForStoppedSession(ctx, session, stopResult); ok && (userInitiated || stopResult.Completed) {
 			if err := h.WatchScrobbler.ScrobbleStop(ctx, event); err != nil {
 				slog.WarnContext(ctx, "failed to queue watch provider stop scrobble", "component", "api", "session", session.ID, "error", err)
@@ -2267,7 +2361,7 @@ func (h *PlaybackHandler) finalizeSessionAbort(ctx context.Context, session *pla
 	ctx, cancel := teardownContext(ctx)
 	defer cancel()
 
-	if h.WatchScrobbler != nil && h.fileResolver != nil {
+	if h.WatchScrobbler != nil && h.fileResolver != nil && h.scrobbleGateState(ctx, session.ID) != scrobbleGateClosed {
 		if file, err := h.loadFileByPreferredID(ctx, requestedMediaFileID(session), session.MediaFileID); err == nil && file != nil {
 			targetID := playbackProgressTarget(file)
 			if targetID != "" {
@@ -2536,21 +2630,7 @@ func (h *PlaybackHandler) HandleUpdateProgress(w http.ResponseWriter, r *http.Re
 		// (a settled selection is a byte-equal no-op), bounded to one
 		// heartbeat-triggered check per session attach generation.
 		h.reconcilePendingAudioStartup(r.Context(), sessionID)
-		if !sess.DisableProgressPersistence && h.WatchScrobbler != nil && wasPaused != sess.IsPaused {
-			if file, loadErr := h.loadFileByPreferredID(r.Context(), requestedMediaFileID(sess), sess.MediaFileID); loadErr == nil && file != nil {
-				targetID := playbackProgressTarget(file)
-				if targetID != "" {
-					event := h.scrobbleEventForSession(r.Context(), sess, targetID, float64(file.Duration), sess.Position)
-					if sess.IsPaused {
-						if err := h.WatchScrobbler.ScrobblePause(r.Context(), event); err != nil {
-							slog.WarnContext(r.Context(), "failed to queue watch provider pause scrobble", "component", "api", "session", sessionID, "error", err)
-						}
-					} else if err := h.WatchScrobbler.ScrobbleStart(r.Context(), event); err != nil {
-						slog.WarnContext(r.Context(), "failed to queue watch provider resume scrobble", "component", "api", "session", sessionID, "error", err)
-					}
-				}
-			}
-		}
+		h.scrobbleProgressTransition(r.Context(), sess, wasPaused)
 	}
 
 	w.WriteHeader(http.StatusNoContent)

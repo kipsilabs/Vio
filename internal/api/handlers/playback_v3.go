@@ -3670,7 +3670,11 @@ func (h *PlaybackHandler) runPlaybackStartSideEffectsV3(task playbackStartSideEf
 
 	if !task.session.DisableProgressPersistence && h.WatchScrobbler != nil {
 		targetID := playbackProgressTarget(&task.file)
-		if targetID != "" {
+		// With the min-watched gate disabled (delay <= 0) the first start is
+		// immediate, as before. With it enabled, only the call that opens the gate
+		// (a tick whose watched window elapsed, or a reconstructed session already
+		// past it) sends the start, so a late side-effect task never double-sends.
+		if targetID != "" && (h.scrobbleStartDelay(ctx) <= 0 || h.scrobbleGateState(ctx, task.session.ID) == scrobbleGateOpened) {
 			event := h.scrobbleEventForSession(ctx, &task.session, targetID, float64(task.file.Duration), task.session.Position)
 			if err := h.WatchScrobbler.ScrobbleStart(ctx, event); err != nil {
 				slog.WarnContext(ctx, "failed to queue watch provider start scrobble", "component", "api", "session", task.session.ID, "error", err)
