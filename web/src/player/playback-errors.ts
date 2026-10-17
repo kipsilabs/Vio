@@ -197,7 +197,9 @@ export function isDeadPlaybackSessionError(error: unknown): boolean {
  * the catalog's plain `not_found` — that is the code a live progress 404
  * actually carries. The v1/bridge surfaces name the session directly
  * (`playback_session_not_found`), and `playback_session_ended` is the 410 the
- * bridge sends for a stopped session.
+ * bridge sends for a stopped session. Note the mismatch: the wire code the v2
+ * handler emits is `session_not_found`, while the protocol docs advertise
+ * `playback_session_not_found`; the wire code stays as the server sends it.
  */
 const SESSION_GONE_PROBLEM_CODES = new Set([
   "not_found",
@@ -218,9 +220,15 @@ const SESSION_GONE_PROBLEM_CODES = new Set([
  * error page (a mis-prefixed route, a captive portal, a stale ingress) whose
  * body does not parse to a problem and leaves the code undefined. Requiring a
  * recognized problem code is what keeps such a transport 404 on the retry
- * path instead of killing playback on the next progress tick. A
- * `V2ProblemError` already proves the server spoke the contract, so its
- * status alone is enough.
+ * path instead of killing playback on the next progress tick.
+ *
+ * A `V2ProblemError` already proves the server spoke the contract, so this
+ * branch accepts *any* 404/410 by status alone. That is deliberately broader
+ * than a missing-session answer: the v2 router's unmatched-route 404 is itself
+ * a well-formed problem document (`not_found`), so a route mismatch inside
+ * `/api/v2` also classifies as gone. The playback routes are static, so a
+ * mismatch would be a build error rather than a live condition, and widening
+ * this would need a route-scoped problem code the server does not emit.
  */
 export function isPlaybackSessionGoneError(error: unknown): boolean {
   if (error instanceof PlayerFetchError) {

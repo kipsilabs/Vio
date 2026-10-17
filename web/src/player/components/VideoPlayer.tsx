@@ -873,27 +873,33 @@ export function VideoPlayer({
   onExpediteReconnectRef.current = onExpediteReconnect;
 
   /**
-   * Both the control-socket ticket mint and the progress sampler can answer
-   * that the session is gone in the same tick. React batches the reconnect
-   * state change, so `connectionStatusRef` cannot separate them on its own:
-   * report a given session's disappearance once. A fresh `connected` status
-   * re-arms it, since a recovery that lands can drop again later, and a new
-   * session id re-arms it unconditionally — it is a different session whose
-   * disappearance must be reported even when the status never left `connected`.
+   * The progress sampler reports a session's disappearance and can answer that
+   * the session is gone in the same tick as a previous report. React batches
+   * the reconnect state change, so `connectionStatusRef` cannot separate them on
+   * its own: report a given session's disappearance once. A recovery re-arms it
+   * — a fresh `connected` status, or a newly adopted plan under the same session
+   * id (`planRevision`), since either proves the session is alive again and can
+   * drop later. A new session id re-arms it unconditionally: it is a different
+   * session whose disappearance must be reported even when the status never left
+   * `connected`.
    */
   const sessionGoneReportedRef = useRef(false);
   useEffect(() => {
     sessionGoneReportedRef.current = false;
-  }, [sessionId]);
+  }, [planRevision, sessionId]);
   useEffect(() => {
     if (connectionStatus === "connected") sessionGoneReportedRef.current = false;
   }, [connectionStatus]);
 
   /**
-   * A session-scoped call (the control-socket ticket mint or a progress
-   * sample) answered that the session no longer exists. Route it through the
-   * one recovery the player has — the reconnect restarts at the same position
-   * — and fall through to the lost state when nothing has played to reposition.
+   * A session-scoped call — the progress sampler's 404 — answered that the
+   * session no longer exists. Route it through the one recovery the player has
+   * — the reconnect restarts at the same position — and fall through to the
+   * lost state when nothing has played to reposition.
+   *
+   * The control lane no longer reports here: a control-ticket mint 404 is
+   * replica-local and cannot establish that playback ended, so it only degrades
+   * its own reconnect quietly (see `usePlaybackRealtime`).
    *
    * A reconnect may already be running from an earlier network drop. The
    * server has now confirmed the session it is rebuilding is gone, so run its
@@ -1589,6 +1595,7 @@ export function VideoPlayer({
     videoRef,
     timelineOffsetRef,
     handleSessionGone,
+    planRevision,
   );
 
   const buildExitState = useCallback((): PlaybackExitState => {
@@ -4521,7 +4528,7 @@ export function VideoPlayer({
     onCommand: executeRealtimeCommand,
     onEvent: handleRealtimeEvent,
     supportedCommands: VIDEO_PLAYBACK_COMMANDS,
-    onSessionLost: handleSessionGone,
+    recoveryRevision: planRevision,
   });
 
   useEffect(() => {

@@ -36,11 +36,11 @@ interface UsePlaybackRealtimeOptions {
    */
   supportedCommands?: PlaybackCommandName[];
   /**
-   * Reports that the session no longer exists on the server (the ticket mint
-   * answered 404/410). The control lane stops reconnecting; the player runs its
-   * one recovery or surfaces the lost state.
+   * Bumped each time a plan is adopted for the session. Any adopted plan proves
+   * the server still holds the session, so it re-arms a control lane that gave
+   * up after its mint kept answering that the session was gone.
    */
-  onSessionLost?: () => void;
+  recoveryRevision?: number;
 }
 
 interface UsePlaybackRealtimeResult {
@@ -49,20 +49,36 @@ interface UsePlaybackRealtimeResult {
 
 const reconnectDelays = [500, 1_000, 2_000, 5_000];
 
+/**
+ * How many times a mint may answer 404/410 before the control lane stops
+ * retrying. The ticket is minted against a per-process, in-memory session map,
+ * so a 404 is replica-local: it proves this replica does not hold the session,
+ * not that the session ended. A bounded ladder of retries covers a request that
+ * lands on the wrong replica or a replica that restarted; after that the lane
+ * degrades quietly and leaves the authoritative missing/ended verdict to the
+ * durable attempt store behind the progress lane.
+ */
+export const SESSION_GONE_MINT_RETRY_LIMIT = 4;
+
 export function usePlaybackRealtime({
   sessionId,
   onCommand,
   onEvent,
   supportedCommands,
-  onSessionLost,
+  recoveryRevision = 0,
 }: UsePlaybackRealtimeOptions): UsePlaybackRealtimeResult {
   const config = usePlayerConfig();
   const [connectionState, setConnectionState] = useState<ConnectionState>("disconnected");
   const onCommandRef = useRef(onCommand);
   const onEventRef = useRef(onEvent);
   const supportedCommandsRef = useRef(supportedCommands);
-  const onSessionLostRef = useRef(onSessionLost);
   const seenCommandsRef = useRef<Set<string>>(new Set());
+  /**
+   * Re-arms a transport loop that degraded, from the recovery effect below. The
+   * loop owns its own timers and socket, so it publishes the one action the
+   * outside needs rather than exposing its state.
+   */
+  const reviveRef = useRef<() => void>(() => {});
 
   useEffect(() => {
     onCommandRef.current = onCommand;
@@ -75,10 +91,6 @@ export function usePlaybackRealtime({
   useEffect(() => {
     onEventRef.current = onEvent;
   }, [onEvent]);
-
-  useEffect(() => {
-    onSessionLostRef.current = onSessionLost;
-  }, [onSessionLost]);
 
   useEffect(() => {
     if (!sessionId) {
@@ -99,24 +111,26 @@ export function usePlaybackRealtime({
     let attempt = 0;
     let socket: WebSocket | null = null;
     let reconnectTimer: number | null = null;
-    // Whether a ticket has been minted for this session. A session-scoped 404
-    // on the very first mint may be a replica that has not seen the row a start
-    // just wrote, so the first failure gets one bounded retry; after a ticket
-    // exists, a 404 is terminal.
-    let mintSucceeded = false;
-    let sessionGoneRetryUsed = false;
+    // A mint answered 404/410. The ticket store is per-process and in-memory, so
+    // that answer is replica-local: it proves this replica does not hold the
+    // session, not that playback ended. Retry it a bounded number of times, then
+    // stop quietly — never tear the player down and never report the session
+    // lost. The authoritative missing/ended verdict lives in the durable attempt
+    // store behind the progress lane, which this hook does not read.
+    let sessionGoneMints = 0;
+    let degraded = false;
 
     let terminated = false;
     const scheduleReconnect = () => {
-      if (disposed || terminated) return;
+      if (disposed || terminated || degraded) return;
       const delay = reconnectDelays[Math.min(attempt, reconnectDelays.length - 1)];
       attempt += 1;
       reconnectTimer = window.setTimeout(connect, delay);
     };
     /**
-     * Ends the loop for good. A terminal answer (an administrator terminate or
-     * a session the server no longer has) must leave no reconnect scheduled,
-     * so a backoff timer already armed does not fire behind it.
+     * Ends the loop for good. An administrator terminate must leave no reconnect
+     * scheduled, so a backoff timer already armed does not fire behind it.
+     * Unlike `degraded`, this is not recoverable.
      */
     const terminate = () => {
       terminated = true;
@@ -136,6 +150,7 @@ export function usePlaybackRealtime({
           return;
         }
         attempt = 0;
+        sessionGoneMints = 0;
         setConnectionState("connected");
         seenCommandsRef.current.clear();
         socket.send(
@@ -205,7 +220,7 @@ export function usePlaybackRealtime({
     };
 
     const connect = () => {
-      if (disposed || terminated) return;
+      if (disposed || terminated || degraded) return;
       setConnectionState("connecting");
 
       if (!authorityActive()) {
@@ -215,8 +230,7 @@ export function usePlaybackRealtime({
 
       void mintPlaybackControlSocketTicket(sessionId, installationId, authority)
         .then((ticket) => {
-          if (disposed || terminated || !authorityActive()) return;
-          mintSucceeded = true;
+          if (disposed || terminated || degraded || !authorityActive()) return;
           try {
             attach(
               new WebSocket(
@@ -229,7 +243,7 @@ export function usePlaybackRealtime({
           }
         })
         .catch((error: unknown) => {
-          if (disposed || terminated) return;
+          if (disposed || terminated || degraded) return;
           if (error instanceof StaleApiRequestContextError) {
             // The account or profile changed underneath this player; nothing
             // this browser can mint is valid for the session any more.
@@ -237,22 +251,17 @@ export function usePlaybackRealtime({
             return;
           }
           if (isPlaybackSessionGoneError(error)) {
-            // The session no longer exists server-side (a restart, expiry, or
-            // terminate). Retrying the mint can never succeed, so the loop
-            // stops; the player runs its one recovery or surfaces the lost
-            // state. A later session id re-runs this effect and resets. The
-            // first mint is the exception: a start may have just written the
-            // row and this mint can race a replica that has not seen it, so
-            // one retry is allowed before the loss is called terminal.
-            if (!mintSucceeded && !sessionGoneRetryUsed) {
-              sessionGoneRetryUsed = true;
-              setConnectionState("disconnected");
-              scheduleReconnect();
-              return;
-            }
-            terminate();
+            // A 404/410 here is replica-local (see `sessionGoneMints`): it is
+            // not proof the session ended. Retry it a bounded number of times
+            // with backoff, then degrade quietly. Playback keeps running and the
+            // progress lane owns the authoritative missing/ended verdict.
+            sessionGoneMints += 1;
             setConnectionState("disconnected");
-            onSessionLostRef.current?.();
+            if (sessionGoneMints < SESSION_GONE_MINT_RETRY_LIMIT) {
+              scheduleReconnect();
+            } else {
+              degraded = true;
+            }
             return;
           }
           // A refused mint (403 non-owner, 409 installation mismatch) is
@@ -262,10 +271,26 @@ export function usePlaybackRealtime({
         });
     };
 
+    /**
+     * Re-arms the lane after it degraded on a mint 404. An adopted plan proves
+     * the server holds the session, so the replica-local miss that stopped the
+     * lane is gone. A terminated lane (an administrator ended the session) is
+     * not revived.
+     */
+    const revive = () => {
+      if (disposed || terminated || !degraded) return;
+      degraded = false;
+      sessionGoneMints = 0;
+      attempt = 0;
+      connect();
+    };
+    reviveRef.current = revive;
+
     connect();
 
     return () => {
       disposed = true;
+      reviveRef.current = () => {};
       setConnectionState("disconnected");
       if (reconnectTimer !== null) {
         window.clearTimeout(reconnectTimer);
@@ -278,6 +303,11 @@ export function usePlaybackRealtime({
       }
     };
   }, [config, sessionId]);
+
+  // A recovery (a plan adopted for the same session) re-arms a degraded lane.
+  useEffect(() => {
+    reviveRef.current();
+  }, [recoveryRevision]);
 
   return { connectionState };
 }

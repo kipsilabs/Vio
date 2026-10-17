@@ -17,7 +17,9 @@ import { toMediaTime } from "../utils/mediaTimeline";
  * A progress sample answered 404/410 means the session no longer exists
  * server-side; `onSessionLost` is reported once and polling stops, so the
  * player is not nudged every interval forever. The one recovery or lost UI
- * behind it is the caller's.
+ * behind it is the caller's. A recovery that keeps the same session id (an
+ * adopted plan) re-arms the sampler through `recoveryRevision`, so a later loss
+ * is reported again.
  *
  * On cleanup (player unmount), sends one final progress report with
  * keepalive so the backend records the last known position even when
@@ -28,6 +30,7 @@ export function useWatchProgress(
   videoRef: React.RefObject<HTMLVideoElement | null>,
   streamOriginRef?: React.RefObject<number>,
   onSessionLost?: () => void,
+  recoveryRevision = 0,
 ) {
   const config = usePlayerConfig();
   const configRef = useRef(config);
@@ -35,6 +38,13 @@ export function useWatchProgress(
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const skipCleanupReportRef = useRef(false);
   const onSessionLostRef = useRef(onSessionLost);
+  const reportedLostRef = useRef(false);
+  /**
+   * Restarts the poll interval after a recovery, published by the session
+   * effect so the recovery effect can resume polling without re-running that
+   * effect (which would send a spurious paused keepalive).
+   */
+  const startPollingRef = useRef<() => void>(() => {});
 
   useEffect(() => {
     onSessionLostRef.current = onSessionLost;
@@ -98,37 +108,46 @@ export function useWatchProgress(
   useEffect(() => {
     if (!sessionId) return;
     skipCleanupReportRef.current = false;
+    reportedLostRef.current = false;
     let disposed = false;
-    // Serialized samples can outlive the interval and each reject on their own,
-    // so latch the terminal state to hand the player exactly one report. It
-    // resets with the effect, i.e. for a new session id.
-    let reportedLost = false;
 
     const stopPolling = () => {
       if (intervalRef.current) clearInterval(intervalRef.current);
       intervalRef.current = null;
     };
 
-    intervalRef.current = setInterval(() => {
-      reportProgress().catch((error: unknown) => {
-        // Every other failure is best effort — a transient sample failure must
-        // not disrupt playback. A session that no longer exists is terminal:
-        // stop polling and hand the player its one report. A sample from a
-        // session this effect has already left belongs to the old id.
-        if (disposed || reportedLost) return;
-        if (isPlaybackSessionGoneError(error)) {
-          reportedLost = true;
-          stopPolling();
-          // The session row is gone, so the cleanup's final keepalive would
-          // only be answered 404. Skip it.
-          skipCleanupReportRef.current = true;
-          onSessionLostRef.current?.();
-        }
-      });
-    }, 10_000);
+    // Serialized samples can outlive the interval and each reject on their own,
+    // so latch the terminal state to hand the player exactly one report. The
+    // latch lives in a ref because a recovery under the same session id re-arms
+    // it without re-running this effect.
+    const startPolling = () => {
+      stopPolling();
+      reportedLostRef.current = false;
+      skipCleanupReportRef.current = false;
+      intervalRef.current = setInterval(() => {
+        reportProgress().catch((error: unknown) => {
+          // Every other failure is best effort — a transient sample failure
+          // must not disrupt playback. A session that no longer exists is
+          // terminal: stop polling and hand the player its one report. A sample
+          // from a session this effect has already left belongs to the old id.
+          if (disposed || reportedLostRef.current) return;
+          if (isPlaybackSessionGoneError(error)) {
+            reportedLostRef.current = true;
+            stopPolling();
+            // The session row is gone, so the cleanup's final keepalive would
+            // only be answered 404. Skip it.
+            skipCleanupReportRef.current = true;
+            onSessionLostRef.current?.();
+          }
+        });
+      }, 10_000);
+    };
+    startPollingRef.current = startPolling;
+    startPolling();
 
     return () => {
       disposed = true;
+      startPollingRef.current = () => {};
       stopPolling();
 
       if (skipCleanupReportRef.current) return;
@@ -138,6 +157,16 @@ export function useWatchProgress(
       reportProgress({ keepalive: true, isPaused: true }).catch(() => {});
     };
   }, [reportProgress, sessionId]);
+
+  // A recovery can keep the session id: an adopted plan proves the server still
+  // holds the session, so polling that stopped on a gone answer resumes. Without
+  // this the latch would re-arm only on a new session id, and the same session
+  // would stop reporting for the rest of its life.
+  useEffect(() => {
+    if (!sessionId) return;
+    if (!reportedLostRef.current) return;
+    startPollingRef.current();
+  }, [recoveryRevision, sessionId]);
 
   return flushProgress;
 }

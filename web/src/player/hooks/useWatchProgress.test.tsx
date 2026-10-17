@@ -214,3 +214,60 @@ it("does not send a final keepalive to a session that is gone", async () => {
   act(() => unmount());
   expect(mocks.send).toHaveBeenCalledTimes(1);
 });
+
+it("reports a second gone session after a recovery under the same id", async () => {
+  vi.useFakeTimers();
+  mocks.send.mockRejectedValue(
+    new PlayerFetchError(404, "Playback session not found.", "not_found"),
+  );
+  const onSessionLost = vi.fn();
+  const { rerender } = renderHook(
+    ({ revision }: { revision: number }) =>
+      useWatchProgress("session", videoRef, undefined, onSessionLost, revision),
+    { wrapper, initialProps: { revision: 0 } },
+  );
+
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(10_000);
+  });
+  expect(mocks.send).toHaveBeenCalledTimes(1);
+  expect(onSessionLost).toHaveBeenCalledTimes(1);
+
+  // Polling stopped. A recovery adopts a plan under the same session id: the
+  // sampler must re-arm rather than stay silent for the rest of the session.
+  rerender({ revision: 1 });
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(10_000);
+  });
+  expect(mocks.send).toHaveBeenCalledTimes(2);
+  expect(onSessionLost).toHaveBeenCalledTimes(2);
+});
+
+it("does not restart a healthy interval when the recovery revision changes", async () => {
+  vi.useFakeTimers();
+  mocks.send.mockResolvedValue(undefined);
+  const onSessionLost = vi.fn();
+  const { rerender } = renderHook(
+    ({ revision }: { revision: number }) =>
+      useWatchProgress("session", videoRef, undefined, onSessionLost, revision),
+    { wrapper, initialProps: { revision: 0 } },
+  );
+
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(10_000);
+  });
+  expect(mocks.send).toHaveBeenCalledTimes(1);
+
+  // A revision bump with no loss behind it (an ordinary track change) must not
+  // reset the cadence.
+  rerender({ revision: 1 });
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(1_000);
+  });
+  expect(mocks.send).toHaveBeenCalledTimes(1);
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(9_000);
+  });
+  expect(mocks.send).toHaveBeenCalledTimes(2);
+  expect(onSessionLost).not.toHaveBeenCalled();
+});

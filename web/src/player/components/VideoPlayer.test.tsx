@@ -23,11 +23,11 @@ const realtimeOptions = vi.hoisted(() => ({
   current: null as null | {
     onEvent?: (event: PlaybackRealtimeEventEnvelope) => void;
     onCommand: (command: PlaybackRealtimeCommandEnvelope) => Promise<void> | void;
-    onSessionLost?: () => void;
   },
 }));
-// Captures the progress sampler's gone-session callback, the other lane the
-// player funnels through its one recovery.
+// Captures the progress sampler's gone-session callback: the authoritative lane
+// the player funnels through its one recovery. The control lane no longer
+// reports session loss (a control-ticket 404 is replica-local).
 const progressOptions = vi.hoisted(() => ({
   current: null as null | { onSessionLost?: () => void },
 }));
@@ -5745,7 +5745,7 @@ describe("VideoPlayer lost connection", () => {
     expect(screen.queryByText("Go Back")).not.toBeInTheDocument();
   });
 
-  it("routes one gone session through both lanes on a stream that played", () => {
+  it("routes a gone session on a stream that played through its one recovery", () => {
     const onConnectionLost = vi.fn();
     const onSessionLost = vi.fn();
     const { container } = renderPlayer({ onConnectionLost, onSessionLost });
@@ -5754,10 +5754,9 @@ describe("VideoPlayer lost connection", () => {
     fireFrameTimeUpdate(video);
     Object.defineProperty(video, "paused", { configurable: true, value: false });
 
-    // The control-socket mint and the progress sampler both answer that the
-    // session is gone, in the same tick, before React commits the reconnect.
+    // The progress sampler is the authoritative lane; a control-ticket 404 is
+    // replica-local and never reaches the player, so only this one reports.
     act(() => {
-      realtimeOptions.current?.onSessionLost?.();
       progressOptions.current?.onSessionLost?.();
     });
 
@@ -5765,15 +5764,15 @@ describe("VideoPlayer lost connection", () => {
     expect(onSessionLost).not.toHaveBeenCalled();
   });
 
-  it("reports a gone session once when nothing played and both lanes answer", () => {
+  it("reports a gone session once when nothing played and the sampler answers twice", () => {
     const onConnectionLost = vi.fn();
     const onSessionLost = vi.fn();
     renderPlayer({ onConnectionLost, onSessionLost });
 
-    // No frame has played, so the reconnect has no position to restart from
-    // and the player goes straight to the lost state — once, not twice.
+    // No frame has played, so the reconnect has no position to restart from and
+    // the player goes straight to the lost state — once, not twice.
     act(() => {
-      realtimeOptions.current?.onSessionLost?.();
+      progressOptions.current?.onSessionLost?.();
       progressOptions.current?.onSessionLost?.();
     });
 
@@ -5781,7 +5780,7 @@ describe("VideoPlayer lost connection", () => {
     expect(onConnectionLost).not.toHaveBeenCalled();
   });
 
-  it("reports a later gone session after a reconnect landed", () => {
+  it("reports a later gone session after a recovery landed", () => {
     const onConnectionLost = vi.fn();
     const onSessionLost = vi.fn();
     const { container, rerenderPlayer } = renderPlayer({ onConnectionLost, onSessionLost });
@@ -5790,7 +5789,7 @@ describe("VideoPlayer lost connection", () => {
     fireFrameTimeUpdate(video);
     Object.defineProperty(video, "paused", { configurable: true, value: false });
 
-    act(() => realtimeOptions.current?.onSessionLost?.());
+    act(() => progressOptions.current?.onSessionLost?.());
     expect(onConnectionLost).toHaveBeenCalledOnce();
 
     // The reconnect runs, then a fresh transport reconnects: the report re-arms
@@ -5811,15 +5810,39 @@ describe("VideoPlayer lost connection", () => {
     const { rerenderPlayer } = renderPlayer({ onConnectionLost, onSessionLost });
 
     // Nothing played, so the first gone report goes straight to the lost state.
-    act(() => realtimeOptions.current?.onSessionLost?.());
+    act(() => progressOptions.current?.onSessionLost?.());
     expect(onSessionLost).toHaveBeenCalledOnce();
 
     // A new session id is a different session: its disappearance must report
     // even though the connection status prop never left "connected".
     rerenderPlayer({ sessionId: "session-2" });
-    act(() => realtimeOptions.current?.onSessionLost?.());
+    act(() => progressOptions.current?.onSessionLost?.());
 
     expect(onSessionLost).toHaveBeenCalledTimes(2);
+  });
+
+  it("re-arms the gone report after a recovery that keeps the session id", () => {
+    const onConnectionLost = vi.fn();
+    const onSessionLost = vi.fn();
+    const { container, rerenderPlayer } = renderPlayer({ onConnectionLost, onSessionLost });
+    const video = container.querySelector("video");
+    if (!video) throw new Error("expected video element");
+    fireFrameTimeUpdate(video);
+    Object.defineProperty(video, "paused", { configurable: true, value: false });
+
+    act(() => progressOptions.current?.onSessionLost?.());
+    expect(onConnectionLost).toHaveBeenCalledOnce();
+
+    // Recovery adopts a new plan without changing the session id and without
+    // leaving the "connected" status. The dedupe must re-arm on the revision so
+    // a second loss is reported rather than swallowed for the rest of the
+    // session.
+    rerenderPlayer({ planRevision: 2 });
+    // The replacement transport plays a frame again.
+    fireFrameTimeUpdate(video);
+    act(() => progressOptions.current?.onSessionLost?.());
+    expect(onConnectionLost).toHaveBeenCalledTimes(2);
+    expect(onSessionLost).not.toHaveBeenCalled();
   });
 
   it("expedites a reconnect already in flight when the session is gone", () => {
