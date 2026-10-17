@@ -289,11 +289,10 @@ GitHub closes the issue when the pull request merges into `main`; the
 or partly addressed issue on `Related issue:`, and write `Related issue: N/A`
 when none applies. Either way, the Problem section has to stand on its own. Keep the commit history intentional and the diff
 limited to the stated problem. Keep the description proportional to the change;
-omit session history, full logs, and private report links other than an
-`Evidence:` line. Follow the
-[public-content and media rules](AGENTS.md#pull-requests), and include evidence
-for every change users can see, as [Show visible changes](#show-visible-changes)
-describes.
+omit session history, full logs, and private report links other than a
+maintainer's `Evidence:` line. Follow the
+[public-content and media rules](AGENTS.md#pull-requests). Screenshots and recordings
+are not routine PR requirements; attach them only when explicitly requested.
 
 ### Write the description
 
@@ -317,67 +316,6 @@ change does; the rest should help them decide how closely to review.
   subtle change can take more. There is no word limit, so do not count words
   or trim to a target. Long supporting evidence, such as tables or
   measurements, can go in a `<details>` block after the summary.
-
-### Show visible changes
-
-A pull request that changes what a user sees must show the change in its
-Evidence section, so reviewers can see it without building the branch. In this
-repository that means the web app and web admin, and every client that renders
-server data. A change is visible when it alters any of these:
-
-- layout, styling, copy, navigation, focus, empty and error states;
-- which items a screen shows, or in what order: search results, home sections,
-  recommendations, library browsing, collections, sorting, or filtering;
-- what an item shows: titles, artwork, descriptions, ratings, badges, episode
-  grouping, or availability;
-- playback behavior a user notices, such as default audio or subtitle tracks,
-  markers, controls, or resume position;
-- a native API or jellycompat response field that clients render.
-
-Provide evidence that fits the change:
-
-- **Changes to a screen:** before-and-after screenshots of the same screen with
-  the same data, one pair per affected surface. Add a short recording when
-  motion, timing, focus movement, or a multi-step flow matters.
-- **Web app and web admin:** desktop and mobile web are separate surfaces. When
-  the change is also visible at a phone-width viewport, include before-and-after
-  captures for both desktop and mobile web (or a short recording that covers
-  both). Desktop-only screenshots are not enough unless the pull request shows
-  the change is desktop-only and mobile layout is unaffected.
-- **Server changes no client shows yet:** before-and-after excerpts of the API
-  response for the same request, trimmed to the fields that changed, such as the
-  ordered list of result titles.
-- Name the surface and the build or commit each capture came from.
-
-Capture against a test library or public-domain media where you can, and keep
-passwords, tokens, and API keys out of every capture. Then put the evidence in
-one of two places:
-
-- **On GitHub:** attach the screenshots or recordings, or paste response
-  excerpts in a code block, under the pull request's Evidence heading.
-  Everything on GitHub is public, so crop or blur hostnames, URLs, account
-  names, and personal library contents.
-- **On [evidence.siloserver.org](https://evidence.siloserver.org/) (optional):**
-  only you and Silo maintainers can open what you publish there, after signing
-  in with GitHub, so captures need no cropping or blurring. Captions that start
-  with `Before:` and `After:` become a side-by-side comparison, and recordings
-  get a player. Upload from the Details link of the pull request's `Evidence`
-  check, or with the command line (Node.js 22 or later):
-  `npx @silo-server/evidence login` once on each computer, then
-  `npx @silo-server/evidence publish <folder> --pr <number>`. The
-  [package README](https://www.npmjs.com/package/@silo-server/evidence) describes
-  the folder. Then write
-  `Evidence: https://evidence.siloserver.org/r/silo-server/pr-<number>/` under
-  the Evidence heading. Until a pull request of yours has merged here, a
-  maintainer approves you once before your first upload.
-
-The pull request's `Evidence` check passes once evidence is published or
-attached. It asks for evidence when the change touches the web app, the native
-API, or jellycompat, or when a maintainer adds the `evidence-required` label; a
-maintainer adds `evidence-not-needed` when nothing visible changed. Changes
-users cannot see write `Evidence: none, no user-visible change`. If you could
-not capture evidence, say why; the reviewer decides whether the pull request
-can merge without it.
 
 ## Review expectations
 

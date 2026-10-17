@@ -127,6 +127,22 @@ if grep -q 'trackHasLanguage' internal/playback/audio_select.go \
 else
   reject "audio selection MULTi trackHasLanguage or MatchRank missing from internal/playback/audio_select.go or internal/lang/lang.go"
 fi
+# 9. Contribution docs keep the pre-upstream-#2016 evidence policy.
+if grep -q '^### Show visible changes' CONTRIBUTING.md; then
+  reject "upstream 'Show visible changes' gate reintroduced in CONTRIBUTING.md (see docs/architecture/fork-divergence.md, upstream PR #2016)"
+else
+  pass "no Show-visible-changes gate in CONTRIBUTING.md"
+fi
+if grep -q 'attach them only when explicitly requested' CONTRIBUTING.md \
+  && grep -q 'Do not capture screenshots or record videos just to prepare a PR' AGENTS.md \
+  && ! grep -q '## Evidence' .github/PULL_REQUEST_TEMPLATE.md \
+  && ! grep -q 'Changes that alter what users see need' docs/ai-contributions.md \
+  && [ ! -e .macroscope/check-run-agents/visible-change-evidence.md ]; then
+  pass "pre-#2016 evidence policy (attach on request) intact"
+else
+  reject "pre-#2016 evidence policy altered (CONTRIBUTING.md / AGENTS.md / .github/PULL_REQUEST_TEMPLATE.md / docs/ai-contributions.md / .macroscope agent)"
+fi
+
 # The merge driver itself is per-clone setup (see `make install-hooks`), not
 # committed content: fresh CI checkouts never have it. Report, don't fail —
 # verification must stay read-only and green on a clean clone.
