@@ -43,17 +43,19 @@ func (fx *pinnedTrackChangeFixture) dropSessionSubtitleEvidence(t *testing.T) {
 	audio := append([]models.AudioTrack(nil), session.VirtualAudioTracks...)
 	evidenceURI := session.VirtualSubtitleEvidenceURI
 	evidenceFileID := session.VirtualSubtitleEvidenceFileID
+	evidenceOwner := session.VirtualSubtitleEvidenceOwnerInstallationID
 	if evidenceURI == "" || evidenceFileID == 0 {
 		t.Fatalf("fixture precondition: session carried no evidence anchor (%q, %d)", evidenceURI, evidenceFileID)
 	}
 	if err := fx.manager.UpdateStreamState(fx.started.SessionID, playback.SessionStreamState{
-		VirtualSourceURI:              fx.pinnedURI,
-		VirtualSourceSet:              true,
-		VirtualSourceOwnershipSet:     true,
-		VirtualAudioTracks:            audio,
-		VirtualSubtitleEvidenceURI:    evidenceURI,
-		VirtualSubtitleEvidenceFileID: evidenceFileID,
-		SubtitleTrackIndex:            -1,
+		VirtualSourceURI:                           fx.pinnedURI,
+		VirtualSourceSet:                           true,
+		VirtualSourceOwnershipSet:                  true,
+		VirtualAudioTracks:                         audio,
+		VirtualSubtitleEvidenceURI:                 evidenceURI,
+		VirtualSubtitleEvidenceFileID:              evidenceFileID,
+		VirtualSubtitleEvidenceOwnerInstallationID: evidenceOwner,
+		SubtitleTrackIndex:                         -1,
 	}); err != nil {
 		t.Fatalf("clear session subtitle evidence: %v", err)
 	}

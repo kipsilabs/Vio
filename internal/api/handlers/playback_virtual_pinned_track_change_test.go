@@ -25,6 +25,11 @@ type pinnedTrackChangeFixture struct {
 	detailCalls int
 	listCalls   int
 	probeCalls  int
+	// resolverInputs records every candidate URI a virtual resolver was handed
+	// during the fixture's lifetime. It is the execution input the transport
+	// would open, so a test can assert the replan stayed on the intended
+	// candidate instead of trusting the plan's copied metadata.
+	resolverInputs []string
 }
 
 func newPinnedTrackChangeFixture(t *testing.T, churnedResultToken string) *pinnedTrackChangeFixture {
@@ -62,9 +67,11 @@ func newPinnedTrackChangeFixture(t *testing.T, churnedResultToken string) *pinne
 	fx.handler.ItemAccess = allowAllPlaybackItemAccess{}
 	fx.handler.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(_ context.Context, virtualURI string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
 		fx.detailCalls++
+		fx.resolverInputs = append(fx.resolverInputs, virtualURI)
 		return ResolvedVirtualMedia{URL: "http://127.0.0.1:9/stream?path=" + virtualURI, URI: virtualURI, CandidateID: virtualResultCandidateID(virtualURI)}, nil
 	})
 	fx.handler.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(func(_ context.Context, path string, _ int, _ string, _ int) (string, error) {
+		fx.resolverInputs = append(fx.resolverInputs, path)
 		return "http://127.0.0.1:9/stream?path=" + path, nil
 	})
 	fx.handler.VirtualPlaybackStreamLister = VirtualPlaybackStreamListerFunc(func(_ context.Context, _ string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {

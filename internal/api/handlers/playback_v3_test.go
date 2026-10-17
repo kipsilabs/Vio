@@ -3077,6 +3077,11 @@ func TestValidateSeekReanchorPlanV3RejectsRouteDrift(t *testing.T) {
 			value.AppliedQuirks[0].Action = "disable-passthrough"
 		}},
 		{name: "effective version", mutate: func(value *playback.PlanV3) { value.EffectiveMediaFileID = 84 }},
+		{name: "effective virtual URI", mutate: func(value *playback.PlanV3) { value.EffectiveVirtualURI = "virtual://movie/x?result=b" }},
+		// Source substitution: every route field, track, and claim is unchanged,
+		// only the bytes the plan names differ. A seek reanchor replays the
+		// running plan, so this must be refused like any other route drift.
+		{name: "source descriptor", mutate: func(value *playback.PlanV3) { value.Source.BitDepth = 10 }},
 		{name: "track", mutate: func(value *playback.PlanV3) {
 			index := 1
 			value.SelectedTracks.Audio = &playback.TrackIdentityV3{ID: playback.TrackIDV3(42, "audio", index), Index: &index}
