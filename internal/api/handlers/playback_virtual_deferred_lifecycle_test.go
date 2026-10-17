@@ -562,10 +562,11 @@ func TestDeferredProbeGateWaitExpiryShedsTerminally(t *testing.T) {
 	fx.handler.deferredProbeMu.Unlock()
 
 	// Shorten the gate-wait budget so the worker's acquire returns false
-	// promptly without a sleep.
-	old := virtualBackgroundProbeBudget
-	virtualBackgroundProbeBudget = 50 * time.Millisecond
-	t.Cleanup(func() { virtualBackgroundProbeBudget = old })
+	// promptly without a sleep. Use the handler-level override rather than
+	// mutating virtualBackgroundProbeBudget: the lazily-started convergence
+	// watchdog reads that package global from its own goroutine, so a test that
+	// writes it here races the watchdog at teardown.
+	fx.handler.probeGateWaitOverride = 50 * time.Millisecond
 
 	done := make(chan struct{})
 	go func() {

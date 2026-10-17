@@ -821,6 +821,11 @@ type PlaybackHandler struct {
 	// scan cadence so a test can drive the watchdog quickly. Zero uses
 	// virtualProbeWatchdogInterval.
 	probeWatchdogIntervalOverride time.Duration
+	// probeGateWaitOverride, when positive, replaces virtualBackgroundProbeBudget
+	// for the deferred-probe worker's detached gate wait only, so a test can
+	// expire the wait promptly without mutating a package global a leaked
+	// watchdog goroutine may be reading. Zero uses virtualBackgroundProbeBudget.
+	probeGateWaitOverride time.Duration
 
 	// prefetchOnce guards the lazy prefetch worker pool. Prefetch work is
 	// admitted into a bounded queue (prefetchQueue) before any goroutine

@@ -223,6 +223,16 @@ func (h *PlaybackHandler) probeWatchdogCadence() time.Duration {
 	return virtualProbeWatchdogInterval
 }
 
+// probeGateWaitBudget is the deferred-probe worker's detached gate wait budget,
+// honoring a test override so a test can expire the wait without mutating the
+// package global the convergence watchdog reads.
+func (h *PlaybackHandler) probeGateWaitBudget() time.Duration {
+	if h != nil && h.probeGateWaitOverride > 0 {
+		return h.probeGateWaitOverride
+	}
+	return virtualBackgroundProbeBudget
+}
+
 // startDeferredProbeWatchdog lazily starts the single convergence watchdog. It
 // is tied to the service context so it exits at shutdown and never leaks.
 func (h *PlaybackHandler) startDeferredProbeWatchdog() {
@@ -939,7 +949,7 @@ func (h *PlaybackHandler) runDeferredVirtualProbe(deferred *virtualDeferredProbe
 	if h == nil || deferred == nil || deferred.file == nil {
 		return
 	}
-	waitCtx, waitCancel := h.virtualDetachedContext(h.ServiceContext, virtualBackgroundProbeBudget)
+	waitCtx, waitCancel := h.virtualDetachedContext(h.ServiceContext, h.probeGateWaitBudget())
 	defer waitCancel()
 	gate := h.detachedGate()
 	if !gate.acquire(waitCtx) {
