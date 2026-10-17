@@ -30956,6 +30956,8 @@ export interface components {
       intro?: components["schemas"]["WatchMarker"];
       /** @description All effective marker occurrences for this file in source-time order; empty, never null */
       marker_segments: components["schemas"]["MarkerOccurrence"][];
+      /** @description Names of the enabled, non-rejecting custom formats the ranking matched on this candidate, best score first, then name; absent when the row is unscored or matched none */
+      matched_formats?: string[];
       /** Format: int64 */
       multi_episode_end?: number;
       /** Format: int64 */

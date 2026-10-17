@@ -11,9 +11,9 @@ import (
 
 func TestAttachVirtualCandidateScoresStampsMatchingVersions(t *testing.T) {
 	var gotContentID string
-	svc := &DetailService{virtualScoreSource: func(_ context.Context, contentID string, _ []*models.MediaFile) map[int]int {
+	svc := &DetailService{virtualScoreSource: func(_ context.Context, contentID string, _ []*models.MediaFile) map[int]VirtualCandidateScore {
 		gotContentID = contentID
-		return map[int]int{7: 850}
+		return map[int]VirtualCandidateScore{7: {Score: 850, MatchedFormats: []string{"English"}}}
 	}}
 
 	versions := []FileVersion{{FileID: 7}, {FileID: 8}}
@@ -25,8 +25,14 @@ func TestAttachVirtualCandidateScoresStampsMatchingVersions(t *testing.T) {
 	if versions[0].FormatScore == nil || *versions[0].FormatScore != 850 {
 		t.Fatalf("scored version score = %v, want 850", versions[0].FormatScore)
 	}
+	if len(versions[0].MatchedFormats) != 1 || versions[0].MatchedFormats[0] != "English" {
+		t.Fatalf("scored version formats = %v, want [English]", versions[0].MatchedFormats)
+	}
 	if versions[1].FormatScore != nil {
 		t.Fatalf("unscored version score = %v, want nil", versions[1].FormatScore)
+	}
+	if versions[1].MatchedFormats != nil {
+		t.Fatalf("unscored version formats = %v, want nil", versions[1].MatchedFormats)
 	}
 }
 
@@ -53,9 +59,9 @@ func TestAttachVirtualCandidateScoresTimesOutFailOpen(t *testing.T) {
 	t.Cleanup(func() { virtualScoreTimeout = prev })
 
 	released := make(chan struct{})
-	svc := &DetailService{virtualScoreSource: func(_ context.Context, _ string, _ []*models.MediaFile) map[int]int {
+	svc := &DetailService{virtualScoreSource: func(_ context.Context, _ string, _ []*models.MediaFile) map[int]VirtualCandidateScore {
 		<-released
-		return map[int]int{7: 850}
+		return map[int]VirtualCandidateScore{7: {Score: 850}}
 	}}
 
 	versions := []FileVersion{{FileID: 7}}
@@ -77,7 +83,7 @@ func TestAttachVirtualCandidateScoresTimesOutFailOpen(t *testing.T) {
 // panic there must be contained rather than crashing the process while the
 // watch response serves unannotated.
 func TestAttachVirtualCandidateScoresRecoversScorerPanic(t *testing.T) {
-	svc := &DetailService{virtualScoreSource: func(context.Context, string, []*models.MediaFile) map[int]int {
+	svc := &DetailService{virtualScoreSource: func(context.Context, string, []*models.MediaFile) map[int]VirtualCandidateScore {
 		panic("scorer blew up")
 	}}
 
@@ -100,7 +106,7 @@ func TestAttachVirtualCandidateScoresBoundsConcurrentScorers(t *testing.T) {
 
 	released := make(chan struct{})
 	var started atomic.Int64
-	svc := &DetailService{virtualScoreSource: func(_ context.Context, _ string, _ []*models.MediaFile) map[int]int {
+	svc := &DetailService{virtualScoreSource: func(_ context.Context, _ string, _ []*models.MediaFile) map[int]VirtualCandidateScore {
 		started.Add(1)
 		<-released
 		return nil

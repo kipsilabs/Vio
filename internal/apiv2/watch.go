@@ -77,6 +77,7 @@ type WatchFileVersion struct {
 	DurationSeconds          int                  `json:"duration_seconds" example:"10200"`
 	Bitrate                  int                  `json:"bitrate" doc:"Bits per second"`
 	FormatScore              *int                 `json:"format_score,omitempty" doc:"Custom-format score the virtual ranking assigned this candidate; absent when the row is unscored (local files, no ranking)"`
+	MatchedFormats           []string             `json:"matched_formats,omitempty" doc:"Names of the enabled, non-rejecting custom formats the ranking matched on this candidate, best score first, then name; absent when the row is unscored or matched none"`
 	AddedAt                  Instant              `json:"added_at" example:"2026-01-02T03:04:05.000Z"`
 	EditionRaw               string               `json:"edition_raw,omitempty"`
 	EditionKey               string               `json:"edition_key,omitempty"`
@@ -511,6 +512,7 @@ func watchVersionOf(v catalogpkg.FileVersion) WatchFileVersion {
 		DurationSeconds:          v.Duration,
 		Bitrate:                  v.Bitrate,
 		FormatScore:              v.FormatScore,
+		MatchedFormats:           v.MatchedFormats,
 		AddedAt:                  NewInstant(v.AddedAt),
 		EditionRaw:               v.EditionRaw,
 		EditionKey:               v.EditionKey,
