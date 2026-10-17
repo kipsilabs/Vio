@@ -393,6 +393,12 @@ jobs:
       - name: Test image cache cleanup resumption against Postgres
         run: go test -race -count=1 -run '^(TestImageCacheCleanup|TestRequeuedImageCacheCleanup|TestJobOutcomeIsRecorded)' ./internal/adminjob/
 
+      # The collage composer enqueues a repair for a missing local source and
+      # the metadata image cache processor rebuilds it; this drives both halves
+      # of that loop against the migrated schema.
+      - name: Test the collage repair loop against Postgres
+        run: go test -race -count=1 -run '^TestCollectionCollageRepairLoopPostgres$' ./internal/api/handlers/
+
       - name: Test taste cluster replacement against Postgres
         run: go test -race -count=1 -run '^TestUpsertTasteClusters.*Postgres$' ./internal/recommendations/
 

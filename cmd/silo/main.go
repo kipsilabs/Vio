@@ -3683,6 +3683,8 @@ func main() {
 			)
 			collectionHandler.ArtworkStore = deps.Blobs.Assets
 			collectionHandler.ArtworkResolver = deps.ArtworkResolver
+			collectionHandler.ArtworkSigner = deps.ArtworkSigner
+			collectionHandler.ArtworkRepair = deps.ArtworkRepair
 			collectionHandler.FrontendFS = deps.FrontendFS
 			collectionHandler.SectionRepo = sectionRepo
 			collectionHandler.FolderRepo = deps.FolderRepo
