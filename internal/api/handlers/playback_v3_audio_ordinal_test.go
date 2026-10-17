@@ -71,6 +71,22 @@ func audioOrdinalSynthesizedZeroIndexFixtureFileV3(t *testing.T) *models.MediaFi
 	return file
 }
 
+// audioOrdinalPostRemovalFixtureFileV3 models the inventory a replacement plan
+// actually selects against AFTER a verified overlay removed a plan-time track:
+// the plan-time list [eng#1, fra#3, spa#5] loses the committed fra#3, leaving
+// the genuinely reduced [spa#5, eng#1]. Array order is the reverse of the
+// absolute container order, so an array-position ordinal would name the other
+// stream.
+func audioOrdinalPostRemovalFixtureFileV3(t *testing.T) *models.MediaFile {
+	t.Helper()
+	file := v3HandlerFixtureFile(t)
+	file.AudioTracks = []models.AudioTrack{
+		{Index: 5, Language: "spa", Codec: "aac", Channels: 2, Layout: "stereo"},
+		{Index: 1, Language: "eng", Codec: "aac", Channels: 2, Layout: "stereo", Default: true},
+	}
+	return file
+}
+
 // audioOrdinalPlanV3 is a transcode plan whose SelectedTracks.Audio.Index is
 // the array position of the selected audio track (the protocol domain).
 func audioOrdinalPlanV3(selectedAudioIndex int) *playback.PlanV3 {
@@ -389,6 +405,101 @@ func TestPrepareRemoteTransportV3AudioTrackIndexIsAudioOnlyOrdinal(t *testing.T)
 	}
 }
 
+// TestPrepareRemoteTransportV3ResolvesCommittedAudioAfterRemovalOrReorder drives
+// the real remote transcode-start request from the fail-closed state a verified
+// absence leaves behind (session index -1) and proves the ordinal sent to the
+// node still names the intended audio, not merely the helper's return value.
+// Two shapes are covered: a replacement plan built against the genuinely reduced
+// post-removal inventory (the removed track is gone, not merely deselected), and
+// a verified inventory whose array order is reversed relative to the absolute
+// container stream order, where an array-position ordinal would point at the
+// other stream.
+func TestPrepareRemoteTransportV3ResolvesCommittedAudioAfterRemovalOrReorder(t *testing.T) {
+	reordered := func(t *testing.T) *models.MediaFile {
+		t.Helper()
+		file := v3HandlerFixtureFile(t)
+		// Array order is the reverse of stream order: the French stream (Index 3)
+		// sits at array 0, so array position no longer equals the ffmpeg ordinal.
+		file.AudioTracks = []models.AudioTrack{
+			{Index: 3, Language: "fra", Codec: "aac", Channels: 2, Layout: "stereo"},
+			{Index: 1, Language: "eng", Codec: "aac", Channels: 2, Layout: "stereo", Default: true},
+		}
+		return file
+	}
+	cases := []struct {
+		name         string
+		file         *models.MediaFile
+		planIndex    int
+		wantOrdinal  int
+		wantLanguage string
+	}{
+		{
+			name:         "removed track: the replacement plan selects against the reduced inventory",
+			file:         audioOrdinalPostRemovalFixtureFileV3(t),
+			planIndex:    0, // the Spanish track at stream 5, array position 0 post-removal
+			wantOrdinal:  1,
+			wantLanguage: "spa",
+		},
+		{
+			name:         "reordered inventory: the plan index maps through the absolute stream index",
+			file:         reordered(t),
+			planIndex:    0, // the French track, now at array position 0
+			wantOrdinal:  1,
+			wantLanguage: "fra",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var got transcodenode.TranscodeStartRequest
+			node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodPost && r.URL.Path == "/transcode/start":
+					if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+						t.Errorf("decode remote start: %v", err)
+					}
+					writeJSON(w, http.StatusAccepted, transcodenode.TranscodeStartResponse{SessionID: got.SessionID, Status: "started"})
+				default:
+					w.WriteHeader(http.StatusNoContent)
+				}
+			}))
+			defer node.Close()
+
+			handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+			handler.JWTSecret = "test-secret"
+			result := audioOrdinalResultV3(tc.planIndex)
+			// The verified absence marked the session's own selection invalid; the
+			// committed plan is the surviving identity, so the -1 sentinel must not
+			// reach the node.
+			session := &playback.Session{ID: "session-audio-ordinal-recovery", UserID: 7, ProfileID: "profile-1", AudioTrackIndex: -1}
+			transport, transportErr := handler.prepareRemoteTransportV3(
+				httptest.NewRequest(http.MethodPost, "/", nil),
+				session, tc.file, result,
+				nodepool.Plan{TranscodeNode: &nodepool.Node{URL: node.URL}}, preparedTimelineV3{}, mediaAuthModeV3{},
+			)
+			if transportErr != nil {
+				t.Fatalf("prepare remote transport: %v (cause: %v)", transportErr, transportErr.cause)
+			}
+			defer transport.rollback()
+			if got.AudioTrackIndex != tc.wantOrdinal {
+				t.Fatalf("remote AudioTrackIndex = %d, want %d (the %s stream)", got.AudioTrackIndex, tc.wantOrdinal, tc.wantLanguage)
+			}
+			if engIndex := trackIndexByLanguage(tc.file.AudioTracks, "eng"); engIndex >= 0 &&
+				audioStreamOrdinalV3(tc.file, engIndex) == got.AudioTrackIndex {
+				t.Fatalf("resolved ordinal %d names the English stream, not the intended %s stream", got.AudioTrackIndex, tc.wantLanguage)
+			}
+		})
+	}
+}
+
+func trackIndexByLanguage(tracks []models.AudioTrack, language string) int {
+	for i, track := range tracks {
+		if track.Language == language {
+			return i
+		}
+	}
+	return -1
+}
+
 // TestAudioStreamOrdinalV3PlanRoundTripKeepsProtocolDomain verifies the plan's
 // SelectedTracks.Audio.Index round-trip stays in the array-position domain:
 // plannedAudioTrackIndexV3 returns the plan's stored index verbatim, and only
@@ -404,6 +515,23 @@ func TestAudioStreamOrdinalV3PlanRoundTripKeepsProtocolDomain(t *testing.T) {
 	}
 	if !strings.Contains(result.Plan.SelectedTracks.Audio.ID, "audio:") {
 		t.Fatalf("plan audio identity malformed: %q", result.Plan.SelectedTracks.Audio.ID)
+	}
+}
+
+// TestPlannedAudioTrackIndexV3PrefersCommittedPlanOverFailClosedSession pins the
+// transcode start's index resolution after a verified absence. The session
+// records the fail-closed sentinel -1 when its committed selection vanishes, but
+// the transcode path resolves the audio index through plannedAudioTrackIndexV3,
+// which uses the committed plan's selected array position and only falls back to
+// the session index when the plan carries none. The -1 sentinel therefore never
+// reaches the transport while the plan still names a valid stream.
+func TestPlannedAudioTrackIndexV3PrefersCommittedPlanOverFailClosedSession(t *testing.T) {
+	result := audioOrdinalResultV3(1)
+	if got := plannedAudioTrackIndexV3(result, -1); got != 1 {
+		t.Fatalf("plannedAudioTrackIndexV3(result, -1) = %d, want the committed plan index 1", got)
+	}
+	if got := plannedAudioTrackIndexV3(playback.PlannerResultV3{}, -1); got != -1 {
+		t.Fatalf("plannedAudioTrackIndexV3(empty result, -1) = %d, want the -1 fallback", got)
 	}
 }
 
