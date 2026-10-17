@@ -235,3 +235,72 @@ func TestFailVirtualProbeReplacementAtomicAcrossRowMoves(t *testing.T) {
 		t.Fatalf("outcome second = %q, want the worker's pending mark untouched", liveSecond.VirtualProbeOutcome)
 	}
 }
+
+// TestSetVirtualProbeOutcomeIfLifecycleFencesRowABA pins the ownership fence the
+// replacement shed needs. Two arms for the same binding (a B -> C -> B row-only
+// move between them) produce byte-for-byte equal snapshots, so binding equality
+// alone cannot tell them apart; the lifecycle token does. Only the current
+// lifecycle's token may write.
+func TestSetVirtualProbeOutcomeIfLifecycleFencesRowABA(t *testing.T) {
+	m := NewSessionManager(0, 0)
+	session, err := m.StartSession(1, "profile-1", 730, PlayDirect, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	const candidateURI = "virtual://movie/tt-lifecycle-aba?result=cand-1"
+	if err := m.SetVirtualSource(session.ID, candidateURI, 5); err != nil {
+		t.Fatalf("SetVirtualSource: %v", err)
+	}
+
+	first, applied, err := m.ArmVirtualProbeReplacementForCurrentBinding(session.ID, candidateURI, 5)
+	if err != nil || !applied {
+		t.Fatalf("first arm = (%#v, %v, %v), want applied", first, applied, err)
+	}
+	if first.ProbeLifecycle == 0 {
+		t.Fatal("first arm did not stamp a lifecycle token")
+	}
+	// A row-only move out and back leaves the binding byte-for-byte equal at a
+	// new lifecycle.
+	if err := m.SetEffectiveMediaFileID(session.ID, 731); err != nil {
+		t.Fatalf("SetEffectiveMediaFileID C: %v", err)
+	}
+	if _, applied, err := m.ArmVirtualProbeReplacementForCurrentBinding(session.ID, candidateURI, 5); err != nil || !applied {
+		t.Fatalf("arm C = (_, %v, %v), want applied", applied, err)
+	}
+	if err := m.SetEffectiveMediaFileID(session.ID, 730); err != nil {
+		t.Fatalf("SetEffectiveMediaFileID B: %v", err)
+	}
+	second, applied, err := m.ArmVirtualProbeReplacementForCurrentBinding(session.ID, candidateURI, 5)
+	if err != nil || !applied {
+		t.Fatalf("second arm = (%#v, %v, %v), want applied", second, applied, err)
+	}
+	if second.ProbeLifecycle == first.ProbeLifecycle {
+		t.Fatal("the returned-to binding reused the earlier lifecycle token; ABA is indistinguishable")
+	}
+
+	// The superseded first lifecycle must not write over the newer one.
+	applied, superseded, err := m.SetVirtualProbeOutcomeIfLifecycle(session.ID, first.ProbeLifecycle, first, VirtualProbeOutcomeFailed)
+	if err != nil || applied || !superseded {
+		t.Fatalf("stale lifecycle write = (%v, %v, %v), want (false, true, nil)", applied, superseded, err)
+	}
+	live, err := m.GetSession(session.ID)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if live.VirtualProbeOutcome != VirtualProbeOutcomePending {
+		t.Fatalf("outcome = %q, want the newer pending lifecycle untouched", live.VirtualProbeOutcome)
+	}
+
+	// The current lifecycle's token writes.
+	applied, superseded, err = m.SetVirtualProbeOutcomeIfLifecycle(session.ID, second.ProbeLifecycle, second, VirtualProbeOutcomeFailed)
+	if err != nil || !applied || superseded {
+		t.Fatalf("current lifecycle write = (%v, %v, %v), want (true, false, nil)", applied, superseded, err)
+	}
+	live, err = m.GetSession(session.ID)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if live.VirtualProbeOutcome != VirtualProbeOutcomeFailed {
+		t.Fatalf("outcome = %q, want failed", live.VirtualProbeOutcome)
+	}
+}

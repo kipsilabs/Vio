@@ -2642,13 +2642,12 @@ func TestDeferredProbeAdmissionRecordsScheduledBindingAcrossRowMove(t *testing.T
 }
 
 // TestDeferredProbeRetryFoldKeepsServedReplacementOverStalePark is the
-// equal-generation folding barrier: a stale recovery arriving after a legitimate
-// replacement for the moved row is already parked must leave the replacement's
-// worker in the retry set. A row-only move does not advance the binding
-// generation, so the stale job and the live replacement carry the SAME
-// generation; a generation-only comparison would let the stale job evict the
-// live one and leave the moved row with no worker until the convergence
-// watchdog. The fold must keep the entry bound to the row the session serves.
+// equal-generation retry-set barrier: the retry set is keyed by the full binding
+// (session, candidate, owner, effective row), so a stale job for the row a
+// row-only move superseded and a legitimate replacement for the row the session
+// now serves are distinct entries. A row-only move does not advance the binding
+// generation, so keying by session and candidate alone would let one evict the
+// other; neither may be discarded, because the session can return to either row.
 func TestDeferredProbeRetryFoldKeepsServedReplacementOverStalePark(t *testing.T) {
 	const uri = "virtual://movie/tt-fold-equal-gen?result=a"
 	fx := newDeferredLifecycleFixture(t, 730, uri)
@@ -2665,8 +2664,8 @@ func TestDeferredProbeRetryFoldKeepsServedReplacementOverStalePark(t *testing.T)
 	}
 
 	// served is the legitimate replacement armed for the row the session serves;
-	// stale is the shed job for the row the move superseded. Both share the key
-	// (session + candidate URI) and the generation.
+	// stale is the shed job for the row the move superseded. Both carry the same
+	// generation but a different effective row, so they key apart.
 	served := &virtualDeferredProbeV3{
 		sessionID:         fx.session.ID,
 		file:              &models.MediaFile{ID: binding.EffectiveMediaFileID},
@@ -2684,28 +2683,36 @@ func TestDeferredProbeRetryFoldKeepsServedReplacementOverStalePark(t *testing.T)
 		t.Fatalf("test setup: generations differ (%d vs %d); the barrier is about equal generations",
 			stale.bindingGeneration, served.bindingGeneration)
 	}
+	if deferredProbeKey(served) == deferredProbeKey(&stale) {
+		t.Fatal("test setup: the two rows share a retry key; the key must include the effective row")
+	}
 
-	// The stale job must not displace the already-parked live replacement.
+	// Both jobs must survive in either arrival order: the served replacement is
+	// reachable under its own key, and the stale job is not discarded either.
 	fx.handler.deferredProbeRetry = make(map[string]*virtualDeferredProbeV3)
 	fx.handler.deferredProbeMu.Lock()
 	fx.handler.parkDeferredProbeRetryLocked(served)
 	fx.handler.parkDeferredProbeRetryLocked(&stale)
-	kept := fx.handler.deferredProbeRetry[deferredProbeKey(served)]
+	keptServed := fx.handler.deferredProbeRetry[deferredProbeKey(served)]
+	keptStale := fx.handler.deferredProbeRetry[deferredProbeKey(&stale)]
 	fx.handler.deferredProbeMu.Unlock()
-	if kept != served {
-		t.Fatalf("fold kept the stale job for the superseded row; want the replacement bound to row %d", binding.EffectiveMediaFileID)
+	if keptServed != served {
+		t.Fatalf("retry set lost the replacement bound to row %d", binding.EffectiveMediaFileID)
+	}
+	if keptStale != &stale {
+		t.Fatal("retry set discarded the job for the superseded row; the session can return to it")
 	}
 
-	// The reverse arrival order must converge on the same entry: the served
-	// replacement replaces an existing stale park.
+	// The reverse arrival order must keep both entries too.
+	fx.handler.deferredProbeRetry = make(map[string]*virtualDeferredProbeV3)
 	fx.handler.deferredProbeMu.Lock()
-	delete(fx.handler.deferredProbeRetry, deferredProbeKey(served))
 	fx.handler.parkDeferredProbeRetryLocked(&stale)
 	fx.handler.parkDeferredProbeRetryLocked(served)
-	kept = fx.handler.deferredProbeRetry[deferredProbeKey(served)]
+	keptServed = fx.handler.deferredProbeRetry[deferredProbeKey(served)]
+	keptStale = fx.handler.deferredProbeRetry[deferredProbeKey(&stale)]
 	fx.handler.deferredProbeMu.Unlock()
-	if kept != served {
-		t.Fatal("fold dropped the served replacement when it arrived after the stale park")
+	if keptServed != served || keptStale != &stale {
+		t.Fatal("retry set dropped a job when the served replacement arrived after the stale park")
 	}
 }
 
@@ -3075,4 +3082,203 @@ func TestDeferredProbeSaturatedAdmissionRecoversMovedBinding(t *testing.T) {
 	if retryLen != virtualDeferredProbeQueueSize {
 		t.Fatalf("bounded retry set size = %d, want it unchanged at %d", retryLen, virtualDeferredProbeQueueSize)
 	}
+}
+
+// TestDeferredProbeRetryFoldKeepsReturnToRowJob is the finding-1 regression: a
+// row-only move does not advance the binding generation, so the job parked for
+// the row the session left and the job for the row it now serves carry the same
+// generation. If the retry set keyed only by session and candidate, one would
+// evict the other; when the session returned to the evicted row, its mark (armed
+// for that row and still live) would refuse a replacement arm while the only job
+// that could land it was gone, leaving convergence to the watchdog. Keying the
+// retry set by the full binding keeps the job for every row, so the mark
+// converges without the convergence watchdog.
+func TestDeferredProbeRetryFoldKeepsReturnToRowJob(t *testing.T) {
+	const uri = "virtual://movie/tt-fold-return?result=a"
+	fx := newDeferredLifecycleFixture(t, 730, uri)
+	// A synchronous prober so the retained job can drive the session to verified
+	// once the retry set is drained, without the fixture's gating probe.
+	fx.handler.VirtualPlaybackSourceProber = func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
+		f.AudioTracks = fx.probedAudio
+		f.SubtitleTracks = fx.probedSubs
+		f.CodecAudio = "eac3"
+		return f, nil
+	}
+	fx.handler.deferredProbeRetry = make(map[string]*virtualDeferredProbeV3)
+
+	// Row 730 is armed and its job parked.
+	j730 := fx.job(uri)
+	if !fx.handler.armDeferredProbePending(context.Background(), j730) {
+		t.Fatal("admission rejected the row-730 job as stale")
+	}
+	if j730.binding.EffectiveMediaFileID != 730 {
+		t.Fatalf("armed binding row = %d, want 730", j730.binding.EffectiveMediaFileID)
+	}
+	fx.handler.deferredProbeMu.Lock()
+	fx.handler.parkDeferredProbeRetryLocked(j730)
+	fx.handler.deferredProbeMu.Unlock()
+
+	// Row-only move away: the same generation, a different effective row.
+	if err := fx.manager.SetEffectiveMediaFileID(fx.session.ID, 731); err != nil {
+		t.Fatalf("SetEffectiveMediaFileID 731: %v", err)
+	}
+	// A colliding job for the row the session now serves.
+	binding, err := fx.manager.VirtualSourceBinding(fx.session.ID)
+	if err != nil {
+		t.Fatalf("VirtualSourceBinding: %v", err)
+	}
+	j731 := *j730
+	j731.binding = binding
+	j731.bindingGeneration = binding.Generation
+	fx.handler.deferredProbeMu.Lock()
+	fx.handler.parkDeferredProbeRetryLocked(&j731)
+	kept730 := fx.handler.deferredProbeRetry[deferredProbeKey(j730)]
+	fx.handler.deferredProbeMu.Unlock()
+	if kept730 != j730 {
+		t.Fatal("the retry set discarded the job for row 730; the session can return to that row and its live mark would be orphaned")
+	}
+
+	// Row returns to 730. The mark is live (armed for 730), so a replacement arm
+	// is refused; convergence must come from the retained job, not the watchdog.
+	if err := fx.manager.SetEffectiveMediaFileID(fx.session.ID, 730); err != nil {
+		t.Fatalf("SetEffectiveMediaFileID 730: %v", err)
+	}
+	if _, applied, err := fx.manager.ArmVirtualProbeReplacementForCurrentBinding(fx.session.ID, uri, 5); err != nil || applied {
+		t.Fatalf("replacement arm = (_, %v, %v), want refused: the returned-to mark reads live", applied, err)
+	}
+
+	// Drain the retry set: the retained row-730 job lands the mark.
+	for i := 0; i < virtualDeferredProbeQueueSize+1; i++ {
+		next := fx.handler.takeDeferredRetry()
+		if next == nil {
+			break
+		}
+		fx.handler.runDeferredVirtualProbe(next)
+	}
+	waitDeferredCondition(t, func() bool {
+		live, err := fx.manager.GetSession(fx.session.ID)
+		return err == nil && live.VirtualProbeOutcome == playback.VirtualProbeOutcomeVerified
+	}, "the returned-to row converging from its retained job without the watchdog")
+}
+
+// blockingUnresolvedRowResolver resolves rows by id except that its first lookup
+// of blockID blocks on release and then reports no row, modeling the
+// replacement's effective-row lookup racing a row-only move that leaves it
+// nothing to return. Later lookups of the same id do not block.
+type blockingUnresolvedRowResolver struct {
+	rows    map[int]*models.MediaFile
+	blockID int
+	started chan struct{}
+	release chan struct{}
+	once    *sync.Once
+}
+
+func (r *blockingUnresolvedRowResolver) GetByID(_ context.Context, id int) (*models.MediaFile, error) {
+	if id == r.blockID {
+		r.once.Do(func() {
+			close(r.started)
+			<-r.release
+		})
+		return nil, errors.New("catalog row not found")
+	}
+	if row, ok := r.rows[id]; ok && row != nil {
+		return row, nil
+	}
+	return nil, errors.New("catalog row not found")
+}
+
+// TestDeferredProbeLateUnresolvedShedKeepsNewerLifecycle is the finding-2
+// regression: the replacement path arms a lifecycle, blocks in the effective-row
+// lookup, and sheds when the lookup fails. A row-only B -> C -> B move can return
+// the session to a binding byte-for-byte equal to the one that first arm captured,
+// while a second recovery arms a newer lifecycle for the same binding. The late
+// shed must fence on the lifecycle token, not binding equality, so it does not
+// stamp its failure onto the newer pending lifecycle. The newer lifecycle must
+// survive and still verify.
+func TestDeferredProbeLateUnresolvedShedKeepsNewerLifecycle(t *testing.T) {
+	const uri = "virtual://movie/tt-late-shed?result=a"
+	fx := newDeferredLifecycleFixture(t, 730, uri)
+	fx.saveAttempt(t)
+	fx.handler.VirtualPlaybackSourceProber = func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
+		f.AudioTracks = fx.probedAudio
+		f.SubtitleTracks = fx.probedSubs
+		f.CodecAudio = "eac3"
+		return f, nil
+	}
+
+	lookupStarted := make(chan struct{})
+	releaseLookup := make(chan struct{})
+	var once sync.Once
+	fx.handler.fileResolver = &blockingUnresolvedRowResolver{
+		blockID: 730,
+		rows: map[int]*models.MediaFile{
+			731: {ID: 731, ContentID: "movie-late-shed", FilePath: uri, VirtualOwnerInstallationID: 5},
+		},
+		started: lookupStarted,
+		release: releaseLookup,
+		once:    &once,
+	}
+
+	// R1: arm row 730, then block in the effective-row lookup. The dropped job's
+	// row differs from the effective row so the lookup is actually taken.
+	dropped := &virtualDeferredProbeV3{
+		stickyKey:      "sticky-late-shed",
+		file:           &models.MediaFile{ID: 700},
+		streamURL:      "http://provider.example/stream",
+		probeTransient: &models.MediaFile{ID: 700},
+		cand:           VirtualPlaybackStream{ID: "cand-1", URI: uri},
+		ownerID:        5,
+		sessionID:      fx.session.ID,
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		fx.handler.scheduleDroppedProbeReplacement(context.Background(), dropped)
+	}()
+	select {
+	case <-lookupStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("R1 never reached the effective-row lookup")
+	}
+
+	// Move B -> C, arm C, move C -> B, then arm B again: a newer lifecycle for the
+	// returned-to B, byte-for-byte equal to R1's arm snapshot.
+	if err := fx.manager.SetEffectiveMediaFileID(fx.session.ID, 731); err != nil {
+		t.Fatalf("SetEffectiveMediaFileID 731: %v", err)
+	}
+	if _, applied, err := fx.manager.ArmVirtualProbeReplacementForCurrentBinding(fx.session.ID, uri, 5); err != nil || !applied {
+		t.Fatalf("R2 arm C = (_, %v, %v), want applied", applied, err)
+	}
+	if err := fx.manager.SetEffectiveMediaFileID(fx.session.ID, 730); err != nil {
+		t.Fatalf("SetEffectiveMediaFileID 730: %v", err)
+	}
+	r2Binding, applied, err := fx.manager.ArmVirtualProbeReplacementForCurrentBinding(fx.session.ID, uri, 5)
+	if err != nil || !applied {
+		t.Fatalf("R2 arm B = (_, %v, %v), want applied", applied, err)
+	}
+
+	// R1's lookup fails and it sheds. It must not write over R2's lifecycle.
+	close(releaseLookup)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("R1's unresolved shed did not return")
+	}
+	live, err := fx.manager.GetSession(fx.session.ID)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if live.VirtualProbeOutcome != probeOutcomePending {
+		t.Fatalf("outcome = %q, want R2's pending lifecycle untouched by R1's stale shed", live.VirtualProbeOutcome)
+	}
+
+	// R2 can still verify: a job bound to the lifecycle R2 armed lands verified.
+	job := fx.job(uri)
+	job.binding = r2Binding
+	job.bindingGeneration = r2Binding.Generation
+	fx.handler.runDeferredVirtualProbe(job)
+	waitDeferredCondition(t, func() bool {
+		live, err := fx.manager.GetSession(fx.session.ID)
+		return err == nil && live.VirtualProbeOutcome == playback.VirtualProbeOutcomeVerified
+	}, "R2's lifecycle reaching verified after R1's stale shed")
 }

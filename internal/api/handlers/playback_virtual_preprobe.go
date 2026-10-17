@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"time"
@@ -50,6 +51,15 @@ type virtualDeferredProbeV3 struct {
 	// manager that cannot supply a snapshot leaves it zero; the CAS then falls
 	// back to the generation-only fence.
 	binding playback.VirtualSourceBindingSnapshot
+	// lifecycleToken, when non-zero, is the deferred-probe lifecycle this job was
+	// armed into by the replacement path (see
+	// ArmVirtualProbeReplacementForCurrentBinding). A terminal shed write must
+	// match it in addition to the binding, because a row-only move can return the
+	// session to a binding byte-for-byte equal to the one the arm captured, and
+	// binding equality alone would let a superseded attempt stamp its failure onto
+	// a newer lifecycle another recovery armed for the same binding. Zero for jobs
+	// armed by ordinary admission, which keep the binding-only fence.
+	lifecycleToken uint64
 }
 
 const (
@@ -294,25 +304,28 @@ func (h *PlaybackHandler) failOverdueDeferredProbes(cutoff time.Time) {
 
 // deferredProbeKey identifies one outstanding deferred probe so a re-admitted
 // probe folds onto the same entry instead of stacking duplicates. It binds the
-// live session to the exact candidate the enumeration is for.
+// live session, the candidate the enumeration is for, and the exact effective
+// row the job will write. The effective row is part of the key because a
+// row-only move (SetEffectiveMediaFileID) does not advance the binding
+// generation: the job armed for the row the session left and the job for the row
+// it now serves carry the SAME generation, so keying by session and candidate
+// alone would let one evict the other. The session can return to either row, and
+// the job that matches the row it returns to is the only thing that can land that
+// mark, so both must survive.
 func deferredProbeKey(deferred *virtualDeferredProbeV3) string {
 	if deferred == nil {
 		return ""
 	}
-	return deferred.sessionID + "\x00" + deferred.cand.URI
+	return fmt.Sprintf("%s\x00%s\x00%d\x00%d", deferred.sessionID, deferred.cand.URI,
+		deferred.binding.OwnerInstallationID, deferred.binding.EffectiveMediaFileID)
 }
 
-// parkDeferredProbeRetryLocked records a probe in the bounded retry set, keeping
-// the entry the session currently serves when two probes for the same session and
-// candidate collide under overflow pressure. The set is keyed by session and
-// candidate URI, so the map can hold only one of them. A row-only move does not
-// advance the binding generation (see SetEffectiveMediaFileID), so comparing
-// generations alone cannot tell a legitimately armed replacement for the served
-// binding from a stale job a shed parked after the move superseded it: both carry
-// the same generation, and letting the stale job win would strand the replacement's
-// worker until the convergence watchdog. The entry bound to the session's current
-// candidate wins; when neither is readable or both relate to the binding the same
-// way, the newer generation wins. Caller holds deferredProbeMu.
+// parkDeferredProbeRetryLocked records a probe in the bounded retry set. The key
+// carries the full binding identity (see deferredProbeKey), so the set holds one
+// job per (session, candidate, owner, effective row): two jobs for different rows
+// of the same candidate never evict each other, and the session can return to
+// either row and still find the job that lands its mark. Two jobs under one key
+// differ only by generation, and the newer wins. Caller holds deferredProbeMu.
 func (h *PlaybackHandler) parkDeferredProbeRetryLocked(deferred *virtualDeferredProbeV3) {
 	if h == nil || deferred == nil {
 		return
@@ -326,19 +339,13 @@ func (h *PlaybackHandler) parkDeferredProbeRetryLocked(deferred *virtualDeferred
 }
 
 // deferredProbeReplacesLocked reports whether next should displace current in the
-// retry set both jobs share. It prefers the job bound to the session's CURRENT
-// candidate, because a row-only move leaves the generation equal: without this the
-// stale job a shed parked for the row the session left can evict the replacement
-// armed for the row it now serves, and the replacement would have no worker until
-// the watchdog converged. When the session binding is unreadable, or both jobs
-// relate to it the same way, the higher generation wins, matching the previous
-// contract. Caller holds deferredProbeMu.
+// retry set both jobs share. Entries under one key share the session, candidate,
+// owner, and effective row (see deferredProbeKey), so only the binding generation
+// can differ; the newer generation wins. Because a row-only move is a distinct
+// key, the stale job a shed parked for the row the session left can no longer
+// evict the replacement armed for the row it now serves, and vice versa: the two
+// never share a key. Caller holds deferredProbeMu.
 func (h *PlaybackHandler) deferredProbeReplacesLocked(current, next *virtualDeferredProbeV3) bool {
-	currentServed := h.deferredProbeBindingCurrent(current)
-	nextServed := h.deferredProbeBindingCurrent(next)
-	if currentServed != nextServed {
-		return nextServed
-	}
 	return next.bindingGeneration >= current.bindingGeneration
 }
 
@@ -455,6 +462,7 @@ func (h *PlaybackHandler) scheduleDroppedProbeReplacement(ctx context.Context, d
 	replacement := *dropped
 	replacement.binding = binding
 	replacement.bindingGeneration = binding.Generation
+	replacement.lifecycleToken = binding.ProbeLifecycle
 	row := h.replacementCatalogRow(ctx, binding, dropped.file)
 	if row == nil {
 		// The session's current effective row cannot be resolved, so the
@@ -549,6 +557,18 @@ type virtualProbeReplacementArmer interface {
 // failure onto a newer lifecycle for the same row.
 type virtualProbeReplacementFailer interface {
 	FailVirtualProbeReplacementForCurrentBinding(sessionID, candidateURI string, ownerInstallationID int) (playback.VirtualSourceBindingSnapshot, bool, error)
+}
+
+// virtualProbeLifecycleWriter is the session-manager capability that records a
+// replacement lifecycle's terminal outcome only while the session still carries
+// the exact lifecycle token the caller armed and that lifecycle is still pending.
+// The handler uses it for the replacement path's terminal shed, where a row-only
+// B -> C -> B move returns the session to a binding byte-for-byte equal to the one
+// an earlier arm captured, so binding equality alone cannot distinguish a
+// superseded attempt from the live lifecycle another recovery armed for the same
+// binding.
+type virtualProbeLifecycleWriter interface {
+	SetVirtualProbeOutcomeIfLifecycle(sessionID string, token uint64, expected playback.VirtualSourceBindingSnapshot, outcome string) (applied bool, superseded bool, err error)
 }
 
 // armDeferredProbePending captures the session's candidate binding and marks the
@@ -715,12 +735,50 @@ func (h *PlaybackHandler) setVirtualProbeOutcomeIfBinding(sessionID string, bind
 	return h.setVirtualProbeOutcomeIfGeneration(sessionID, binding.Generation, outcome)
 }
 
+// setVirtualProbeOutcomeIfLifecycleOwned records a replacement job's terminal
+// shed only while the session still carries the exact deferred-probe lifecycle
+// the job was armed into. It prefers the token-aware writer so a row-only
+// B -> C -> B move — which leaves the generation and the effective row equal to
+// an earlier snapshot — cannot let this job's failure land on a newer lifecycle
+// another recovery armed for the same binding. applied reports the write landed;
+// superseded reports a newer lifecycle (or a reached terminal outcome) owns the
+// binding, so the caller must not attempt recovery. A manager that cannot carry
+// the token falls back to the binding-only fence, matching the pre-existing
+// behavior on those managers.
+func (h *PlaybackHandler) setVirtualProbeOutcomeIfLifecycleOwned(deferred *virtualDeferredProbeV3) (applied bool, superseded bool) {
+	if h == nil || deferred == nil || h.sessionMgr == nil {
+		return false, false
+	}
+	writer, ok := h.sessionMgr.(virtualProbeLifecycleWriter)
+	if !ok {
+		return h.setVirtualProbeOutcomeIfBinding(deferred.sessionID, deferred.binding, probeOutcomeFailed), false
+	}
+	applied, superseded, err := writer.SetVirtualProbeOutcomeIfLifecycle(
+		deferred.sessionID, deferred.lifecycleToken, deferred.binding, probeOutcomeFailed)
+	if err != nil {
+		if !errors.Is(err, playback.ErrSessionNotFound) {
+			slog.Warn("failed to record virtual probe outcome",
+				"component", "api", "session", deferred.sessionID, "outcome", probeOutcomeFailed, "error", err)
+		}
+		return false, false
+	}
+	if !applied && !superseded {
+		slog.Info("virtual probe outcome dropped: candidate binding moved before outcome storage",
+			"component", "api", "session", deferred.sessionID, "outcome", probeOutcomeFailed,
+			"generation", deferred.binding.Generation)
+	}
+	return applied, superseded
+}
+
 // shedDeferredVirtualProbe terminally fails a probe that could not run: the
 // session outcome is marked failed and the failure published off the request
 // path, so a client watching either the push or the poll leaves its loading
 // state. The fence on the retained full binding ensures the shed probe's failure
 // is not written onto a replacement binding that never had this probe
-// outstanding.
+// outstanding. When the job carries a replacement lifecycle token (see
+// lifecycleToken), the write is fenced on that token as well, so a late shed
+// whose binding a row-only move returned to a byte-for-byte equal snapshot
+// cannot fail a newer lifecycle another recovery armed for the same binding.
 //
 // When the CAS rejects the outcome the session left the binding this shed was
 // armed for, so the failure could not be stored and the current binding owes a
@@ -731,12 +789,23 @@ func (h *PlaybackHandler) setVirtualProbeOutcomeIfBinding(sessionID string, bind
 // row can never recurse into the replacement path synchronously. Only when that
 // bounded queue is itself saturated — the admission-overflow case that triggered
 // this shed — is the current binding failed directly, so it leaves its loading
-// state instead of waiting for the convergence watchdog.
+// state instead of waiting for the convergence watchdog. A rejection that reports
+// the lifecycle superseded does none of this: a newer lifecycle owns the binding
+// and its own worker converges it.
 func (h *PlaybackHandler) shedDeferredVirtualProbe(deferred *virtualDeferredProbeV3) {
 	if h == nil || deferred == nil {
 		return
 	}
-	if h.setVirtualProbeOutcomeIfBinding(deferred.sessionID, deferred.binding, probeOutcomeFailed) {
+	if deferred.lifecycleToken != 0 {
+		applied, superseded := h.setVirtualProbeOutcomeIfLifecycleOwned(deferred)
+		if superseded {
+			return
+		}
+		if applied {
+			h.publishDeferredProbeInventory(deferred)
+			return
+		}
+	} else if h.setVirtualProbeOutcomeIfBinding(deferred.sessionID, deferred.binding, probeOutcomeFailed) {
 		h.publishDeferredProbeInventory(deferred)
 		return
 	}
