@@ -172,7 +172,11 @@ func TestReplanTrackChangeResolvesWhenPlanDescriptorLagsMovedPin(t *testing.T) {
 	fx := newPinnedTrackChangeFixture(t, "b")
 	candidateB := withVirtualResultKey(virtualPlaybackNeutralKey(fx.source.FilePath), "b")
 	movedOwner := fx.source.VirtualOwnerInstallationID + 94
-	bAudio := []models.AudioTrack{{Index: 0, Codec: "eac3", Channels: 6, Layout: "5.1", Language: "fra"}}
+	// B's audio is copy-compatible with the client's advertised AAC decode so
+	// the resolve path under test never needs the AAC conversion toolchain: a
+	// clean runner without ffmpeg would otherwise terminal
+	// audio_conversion_unsupported before the plan could name B.
+	bAudio := []models.AudioTrack{{Index: 0, Codec: "aac", Channels: 2, Layout: "stereo", Language: "fra"}}
 	bSubtitles := []models.SubtitleTrack{{Index: 0, Codec: "ass", Language: "fra"}}
 
 	// An incomplete B row: without the provenance gate the carry would top its
