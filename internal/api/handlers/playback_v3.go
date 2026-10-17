@@ -107,6 +107,11 @@ const (
 	// survive a concurrent stop instead of collapsing to a not-found.
 	virtualSourceUnavailableReasonV3  = "virtual_source_unavailable"
 	replanVirtualInputTimeoutReasonV3 = "replan_virtual_input_timeout"
+	// seekReanchorEvidenceUnavailableReasonV3 is the retryable transport reason
+	// for a seek reanchor whose frozen candidate's own evidence and installation
+	// owner cannot be established from the session. The seek fails closed rather
+	// than replaying the frozen recipe through a moved binding's owner.
+	seekReanchorEvidenceUnavailableReasonV3 = "seek_reanchor_evidence_unavailable"
 	// candidateSourceDecodeRejectedReasonV3 is the internal transport reason for
 	// a local generation whose decoder already rejected the source. It is never
 	// a client terminal: the start/replan rotation loop consumes it to substitute
@@ -6618,8 +6623,9 @@ func (h *PlaybackHandler) v3SessionStreamState(ctx context.Context, session *pla
 	// and the source revision anchor that evidence to the exact candidate, so
 	// the serve path can discard it when the bound candidate has moved.
 	if isVirtualPlaybackFile(file) && strings.HasPrefix(file.FilePath, "virtual://") {
+		owner := effectiveVirtualOwner(file.VirtualOwnerInstallationID, session.VirtualSourceOwnerInstallationID)
 		state.VirtualSourceURI = file.FilePath
-		state.VirtualSourceOwnerInstallationID = effectiveVirtualOwner(file.VirtualOwnerInstallationID, session.VirtualSourceOwnerInstallationID)
+		state.VirtualSourceOwnerInstallationID = owner
 		state.VirtualSourceRevision = planVirtualSourceRevisionV3(result)
 		state.VirtualSubtitleTracks = file.SubtitleTracks
 		state.VirtualExternalSubtitles = file.ExternalSubtitles
@@ -6630,7 +6636,21 @@ func (h *PlaybackHandler) v3SessionStreamState(ctx context.Context, session *pla
 		// later serve must apply this inventory only to the exact row it was
 		// captured from, never to a sibling row the probe rotated onto.
 		state.VirtualSubtitleEvidenceFileID = file.ID
-		state.VirtualSubtitleEvidenceSet = file.ProbeUpdatedAt != nil
+		// The evidence owner travels with the URI and row id so a later seek
+		// reanchor can restore the frozen candidate's own installation after a
+		// cross-installation binding move instead of borrowing the moved
+		// binding's owner.
+		state.VirtualSubtitleEvidenceOwnerInstallationID = owner
+		// The evidence-set flag is normally the row's probe stamp. When the
+		// session already retains evidence for this exact candidate — a seek
+		// reanchor or a same-candidate carry commits that inventory — the row
+		// may carry no stamp (a churned listing row) even though the retained
+		// evidence is proven, so the session's own flag is the authority.
+		evidenceSet := file.ProbeUpdatedAt != nil
+		if !evidenceSet && sameVirtualCandidate(session.VirtualSubtitleEvidenceURI, file.FilePath) {
+			evidenceSet = session.VirtualSubtitleEvidenceSet
+		}
+		state.VirtualSubtitleEvidenceSet = evidenceSet
 	}
 	return state
 }
@@ -7466,7 +7486,7 @@ func replanSessionNotFoundV3() *PlaybackOperationError {
 // stop, because the stall — not the stop — is what the replan observed.
 func virtualSourceStallTerminalV3(reason string) bool {
 	switch reason {
-	case virtualSourceUnavailableReasonV3, replanVirtualInputTimeoutReasonV3:
+	case virtualSourceUnavailableReasonV3, replanVirtualInputTimeoutReasonV3, seekReanchorEvidenceUnavailableReasonV3:
 		return true
 	default:
 		return false
@@ -8585,9 +8605,17 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			// same-release re-plan. sessionProvenanceMatchesPinnedRowV3 is the
 			// authority for that judgement.
 			pinnedRowProvenance := sessionProvenanceMatchesPinnedRowV3(r.Context(), session, currentEffectiveFile, h.fileResolver)
+			// A carry tops the carried row up with the running plan's validated
+			// source descriptor, so the descriptor must describe the candidate
+			// being carried. Session provenance alone cannot prove that: serving
+			// or probing can advance the session's evidence to another candidate
+			// while the durable plan still describes the previous one, and the
+			// carry would then pair the old descriptor with the new bytes.
+			planCarriesPin := sameVirtualCandidate(strings.TrimSpace(record.CurrentPlan.EffectiveVirtualURI), strings.TrimSpace(session.VirtualSourceURI))
 			carryPinnedCandidate := (trackChange || seekReanchor) && !virtualDecodeRotation &&
 				strings.TrimSpace(session.VirtualSourceURI) != "" &&
 				pinnedRowProvenance &&
+				planCarriesPin &&
 				// A user-intent replan keeps the session's pinned candidate when
 				// the reloaded row is the pin's own row under a churned
 				// per-listing token (the probe-evidence flag) or that profile's
@@ -8620,10 +8648,22 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				seekReanchorCandidate = strings.TrimSpace(record.CurrentPlan.EffectiveVirtualURI)
 			}
 			if seekReanchorCandidate != "" {
-				planSession := *session
-				planSession.VirtualSourceURI = seekReanchorCandidate
-				currentEffectiveFile = bindSessionVirtualSourceWithTracks(r.Context(), &pinnedFile, &planSession, h.fileResolver)
-				currentEffectiveFile = carryValidatedVirtualVideoEvidenceV3(currentEffectiveFile, record.CurrentPlan.Source)
+				// Rebuild the effective file for the frozen candidate from
+				// evidence that demonstrably belongs to it. The reloaded row may
+				// already describe another release, and the session's live pin
+				// and owner may have moved: replaying the frozen recipe through
+				// either would pair the running plan's descriptor and recipe with
+				// foreign bytes or another installation's credentials.
+				frozenCarrier, frozenErr := h.frozenSeekCarrierV3(r.Context(), session, record, currentEffectiveFile)
+				if frozenErr != nil {
+					return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{
+						reason:    seekReanchorEvidenceUnavailableReasonV3,
+						message:   "The frozen playback source could not be reopened; start a new playback attempt.",
+						retryable: true,
+						cause:     frozenErr,
+					}
+				}
+				currentEffectiveFile = frozenCarrier
 			} else if candidateUnchanged && evidenceComplete && !virtualDecodeRotation {
 				currentEffectiveFile.FilePath = session.VirtualSourceURI
 				currentEffectiveFile.VirtualOwnerInstallationID = session.VirtualSourceOwnerInstallationID
@@ -11395,6 +11435,73 @@ func virtualPinnedProfileRowV3(session *playback.Session, row *models.MediaFile)
 	return sameVirtualProfileScope(rowPath, pinned)
 }
 
+// errFrozenSeekEvidenceUnavailable reports that a seek reanchor cannot
+// establish evidence or an installation owner that belongs to the frozen
+// candidate, so the recipe must not be replayed through a foreign binding.
+var errFrozenSeekEvidenceUnavailable = errors.New("the frozen seek candidate's own evidence is unavailable")
+
+// frozenSeekCarrierV3 builds the effective file a seek reanchor replays from
+// evidence that demonstrably belongs to the plan's frozen candidate. The
+// reloaded row is mutable: a provider rotation re-probes it in place, so it may
+// now name another release and carry that release's inventory and probe stamp,
+// while the session's pin and owner may have moved to the same other release.
+// Either would pair the replayed descriptor and recipe with foreign bytes.
+//
+// The candidate's own evidence is the session's retained inventory, anchored at
+// exactly the frozen candidate and row, or the reloaded row itself when it still
+// names the candidate. The candidate's own installation owner is the session's
+// live owner while the pin still names the candidate, the owner captured with
+// the session's evidence, or the row's owner while the row still names the
+// candidate. When none of those can be established the seek fails closed
+// (errFrozenSeekEvidenceUnavailable) rather than borrowing the moved binding's
+// owner or committing another release's inventory under the candidate's URI.
+func (h *PlaybackHandler) frozenSeekCarrierV3(ctx context.Context, session *playback.Session, record *playback.AttemptRecordV3, row *models.MediaFile) (*models.MediaFile, error) {
+	if session == nil || record == nil || row == nil {
+		return nil, errFrozenSeekEvidenceUnavailable
+	}
+	candidate := strings.TrimSpace(record.CurrentPlan.EffectiveVirtualURI)
+	if candidate == "" {
+		return nil, errFrozenSeekEvidenceUnavailable
+	}
+	rowNamesCandidate := sameVirtualCandidate(row.FilePath, candidate)
+	// Evaluate the session's evidence exactly as the binder does, but against
+	// the frozen candidate rather than the session's (possibly moved) pin.
+	bound := *row
+	bound.FilePath = candidate
+	sessionEvidence := virtualEvidenceMatchesBoundFile(ctx, &bound, session, h.fileResolver)
+	if !rowNamesCandidate && !sessionEvidence {
+		return nil, errFrozenSeekEvidenceUnavailable
+	}
+	owner := 0
+	if sameVirtualCandidate(session.VirtualSourceURI, candidate) {
+		owner = session.VirtualSourceOwnerInstallationID
+	}
+	if owner <= 0 && sessionEvidence {
+		owner = session.VirtualSubtitleEvidenceOwnerInstallationID
+	}
+	if owner <= 0 && rowNamesCandidate {
+		owner = row.VirtualOwnerInstallationID
+	}
+	if owner <= 0 {
+		return nil, errFrozenSeekEvidenceUnavailable
+	}
+	carrier := *row
+	carrier.FilePath = candidate
+	carrier.VirtualOwnerInstallationID = owner
+	if !rowNamesCandidate {
+		// The row describes another release: its inventory and probe stamp are
+		// not evidence for the frozen candidate. Carry the session's retained
+		// inventory for the candidate and drop the row's stamp so the state
+		// writer cannot stamp the foreign inventory as verified under the
+		// candidate's URI.
+		carrier.AudioTracks = session.VirtualAudioTracks
+		carrier.SubtitleTracks = session.VirtualSubtitleTracks
+		carrier.ExternalSubtitles = session.VirtualExternalSubtitles
+		carrier.ProbeUpdatedAt = nil
+	}
+	return carryValidatedVirtualVideoEvidenceV3(&carrier, record.CurrentPlan.Source), nil
+}
+
 // carryValidatedVirtualVideoEvidenceV3 tops up a carried pinned candidate's
 // planner-grade video evidence from the source descriptor the running plan
 // validated. A user-intent replan (track_change or seek_reanchor) re-selects
@@ -11560,9 +11667,11 @@ func virtualVideoRangeTypeFromDescriptorV3(source playback.SourceDescriptorV3) s
 // A field that already carries a row value is left as-is; the carry only tops
 // up the unprobed metadata a fresh listing row dropped and never overwrites
 // evidence the row already has. The one deliberate exception is VideoCopyUnsafe,
-// an aggregated runtime verdict that must propagate whenever the running plan
-// proved it: reading it false would let a route the plan already disqualified as
-// copy-unsafe look copy-safe.
+// an aggregated runtime verdict that propagates on the paths this function
+// handles — a partial or empty track — so a route the running plan disqualified
+// as copy-unsafe does not read copy-safe. A row whose video evidence is already
+// complete is returned untouched by the caller before this runs, so its own
+// recorded verdict stands.
 func fillVirtualVideoTrackFromDescriptorV3(track *models.VideoTrack, source playback.SourceDescriptorV3) {
 	if track == nil {
 		return

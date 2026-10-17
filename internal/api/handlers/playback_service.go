@@ -1269,12 +1269,16 @@ func (h *PlaybackHandler) inventoryEffectiveFile(ctx context.Context, file *mode
 		base = &placeholder
 		// Name the fail-closed decision so an operator can correlate an empty
 		// menu with the reason it is empty: no catalog row names the bound
-		// candidate, so no row's inventory may be shown for it.
+		// candidate, so no row's inventory may be shown for it. The bound
+		// candidate URI is not logged raw — its query can carry provider
+		// identifiers — so the log carries the provider-neutral path and the
+		// concrete candidate id instead.
 		slog.InfoContext(ctx, "virtual inventory serving fail-closed placeholder: no catalog row names the bound candidate",
 			"component", "api",
 			"file_id", file.ID,
 			"base_id", placeholder.ID,
-			"candidate_uri", candidateURI)
+			"candidate_path", virtualPlaybackNeutralKey(candidateURI),
+			"candidate_id", virtualResultCandidateID(candidateURI))
 	}
 	return bindSessionVirtualSourceWithTracks(ctx, base, session, h.fileResolver)
 }

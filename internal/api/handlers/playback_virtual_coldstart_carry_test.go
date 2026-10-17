@@ -74,7 +74,7 @@ func TestInventoryEffectiveFileLogsFailClosedPlaceholder(t *testing.T) {
 	if !strings.Contains(out, "virtual inventory serving fail-closed placeholder") {
 		t.Fatalf("placeholder decision was not logged:\n%s", out)
 	}
-	for _, want := range []string{`"file_id":900`, `"base_id":900`, `"candidate_uri":"virtual://movie/tt-placeholder?result=bound"`} {
+	for _, want := range []string{`"file_id":900`, `"base_id":900`, `"candidate_path":"virtual://movie/tt-placeholder"`, `"candidate_id":"bound"`} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("placeholder log missing %s:\n%s", want, out)
 		}

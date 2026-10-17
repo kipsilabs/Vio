@@ -9,7 +9,9 @@ import (
 // A candidate rotation must not leave evidence that describes the previous
 // release bound to the new candidate: the inventories stay for the planner's
 // remap provenance, but their anchor moves so the serve path can prove the
-// mismatch and discard them.
+// mismatch and discard them. The captured evidence owner survives the move with
+// the anchor, so a later seek reanchor can restore the frozen candidate's own
+// installation instead of the moved binding's.
 func TestSetVirtualSourceRotationMovesEvidenceAnchor(t *testing.T) {
 	manager := NewSessionManager(0, 0)
 	session, err := manager.StartSession(1, "profile-1", 42, PlayDirect, false)
@@ -53,6 +55,44 @@ func TestSetVirtualSourceRotationMovesEvidenceAnchor(t *testing.T) {
 	}
 }
 
+// The evidence owner is captured with the evidence anchor and, like the URI and
+// row id, deliberately left untouched by a binding move: the two diverge after a
+// cross-installation move, so a seek reanchor must restore the frozen
+// candidate's own owner rather than the moved binding's.
+func TestSetVirtualSourceRotationKeepsEvidenceOwner(t *testing.T) {
+	manager := NewSessionManager(0, 0)
+	session, err := manager.StartSession(1, "profile-1", 42, PlayDirect, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	uri := "virtual://movie/tt1?result=candidate-a"
+	if err := manager.UpdateStreamState(session.ID, SessionStreamState{
+		VirtualSourceSet:                           true,
+		VirtualSourceOwnershipSet:                  true,
+		VirtualSourceURI:                           uri,
+		VirtualSourceOwnerInstallationID:           5,
+		VirtualSubtitleEvidenceSet:                 true,
+		VirtualSubtitleEvidenceURI:                 uri,
+		VirtualSubtitleEvidenceOwnerInstallationID: 5,
+		VirtualSubtitleTracks:                      []models.SubtitleTrack{{Index: 0, Codec: "subrip"}},
+	}); err != nil {
+		t.Fatalf("UpdateStreamState: %v", err)
+	}
+	if err := manager.SetVirtualSource(session.ID, "virtual://movie/tt1?result=candidate-b", 105); err != nil {
+		t.Fatalf("SetVirtualSource: %v", err)
+	}
+	current, err := manager.GetSession(session.ID)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if current.VirtualSourceOwnerInstallationID != 105 {
+		t.Fatalf("binding owner = %d, want the moved owner 105", current.VirtualSourceOwnerInstallationID)
+	}
+	if current.VirtualSubtitleEvidenceOwnerInstallationID != 5 {
+		t.Fatalf("evidence owner = %d, want the previous candidate's 5 kept with the anchor", current.VirtualSubtitleEvidenceOwnerInstallationID)
+	}
+}
+
 // A rebind to the same candidate is not a rotation and must not disturb the
 // evidence or its revision.
 func TestSetVirtualSourceSameCandidateKeepsEvidence(t *testing.T) {
@@ -93,13 +133,14 @@ func TestApplyStreamStateNonVirtualSnapshotClearsEvidence(t *testing.T) {
 	}
 	uri := "virtual://movie/tt1?result=candidate-a"
 	if err := manager.UpdateStreamState(session.ID, SessionStreamState{
-		VirtualSourceSet:           true,
-		VirtualSourceOwnershipSet:  true,
-		VirtualSourceURI:           uri,
-		VirtualSourceRevision:      "rev-a",
-		VirtualSubtitleEvidenceSet: true,
-		VirtualSubtitleEvidenceURI: uri,
-		VirtualSubtitleTracks:      []models.SubtitleTrack{{Index: 0, Codec: "subrip"}},
+		VirtualSourceSet:                           true,
+		VirtualSourceOwnershipSet:                  true,
+		VirtualSourceURI:                           uri,
+		VirtualSourceRevision:                      "rev-a",
+		VirtualSubtitleEvidenceSet:                 true,
+		VirtualSubtitleEvidenceURI:                 uri,
+		VirtualSubtitleEvidenceOwnerInstallationID: 5,
+		VirtualSubtitleTracks:                      []models.SubtitleTrack{{Index: 0, Codec: "subrip"}},
 	}); err != nil {
 		t.Fatalf("UpdateStreamState: %v", err)
 	}
@@ -118,6 +159,9 @@ func TestApplyStreamStateNonVirtualSnapshotClearsEvidence(t *testing.T) {
 	}
 	if len(current.VirtualSubtitleTracks) != 0 || current.VirtualSubtitleEvidenceURI != "" {
 		t.Fatalf("non-virtual snapshot kept stale inventory: %+v uri=%q", current.VirtualSubtitleTracks, current.VirtualSubtitleEvidenceURI)
+	}
+	if current.VirtualSubtitleEvidenceOwnerInstallationID != 0 {
+		t.Fatalf("non-virtual snapshot kept the evidence owner %d", current.VirtualSubtitleEvidenceOwnerInstallationID)
 	}
 }
 
