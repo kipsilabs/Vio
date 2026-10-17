@@ -134,6 +134,20 @@ type TranscodeManager struct {
 	// racing a fresh start could run two ffmpeg writers against the same dir.
 	lifecycleMu    sync.Mutex
 	lifecycleLocks map[string]*lifecycleLock
+
+	// asyncRestartMu guards asyncRestarts, the per-session coalesced far-seek
+	// restart workers. Each entry records the latest requested segment so two
+	// far-seeks landing on the same session converge on one restart at the
+	// newest target instead of racing to be the last writer.
+	asyncRestartMu sync.Mutex
+	asyncRestarts  map[string]*pendingAsyncRestart
+
+	// asyncRestartFinishHook, when non-nil, runs once the coalescing worker has
+	// atomically decided to leave its loop but before it returns. A test uses it
+	// to inject a request in the completion window, where a late target must
+	// start a fresh worker rather than update an entry that is being removed.
+	// Production leaves it nil.
+	asyncRestartFinishHook func()
 }
 
 // lifecycleLock is a refcounted per-session lock. The refcount lets the manager
@@ -388,14 +402,172 @@ func (m *TranscodeManager) RestartSegmentLocked(
 	ts *TranscodeSession,
 	segNum int,
 ) (SegmentRecoveryTarget, bool, error) {
+	return m.restartSegmentLockedWithTarget(ctx, sessionID, ts, func() int { return segNum })
+}
+
+// restartSegmentLockedWithTarget is RestartSegmentLocked with the segment read
+// inside the lifecycle critical section. The coalescing worker uses it so two
+// queued far-seeks collapse onto the target that is current when the lock is
+// actually held, instead of the one that was current when the goroutine started.
+func (m *TranscodeManager) restartSegmentLockedWithTarget(
+	ctx context.Context,
+	sessionID string,
+	ts *TranscodeSession,
+	segNum func() int,
+) (SegmentRecoveryTarget, bool, error) {
 	var target SegmentRecoveryTarget
 	var ok bool
 	err := m.restartSessionLocked(sessionID, ts, func() error {
 		var restartErr error
-		target, ok, restartErr = ts.RestartSegment(ctx, segNum)
+		target, ok, restartErr = ts.RestartSegment(ctx, segNum())
 		return restartErr
 	})
 	return target, ok, err
+}
+
+// restartSegmentAsyncTimeout bounds one detached seek restart so a wedged
+// resolver cannot leak the goroutine forever.
+const restartSegmentAsyncTimeout = 2 * time.Minute
+
+// pendingAsyncRestart coalesces the detached far-seek restarts for one session.
+// A request that arrives while a restart runs records the newest segment here
+// instead of starting a competing worker, so the running worker re-reads the
+// target after each restart and converges on the latest request. Without it two
+// far-seeks serialized by the lifecycle lock would apply in whatever order they
+// happened to acquire the lock, and the older target could win.
+type pendingAsyncRestart struct {
+	ts *TranscodeSession
+	// mu guards segNum, the latest requested segment.
+	mu     sync.Mutex
+	segNum int
+}
+
+// RestartSegmentAsync runs RestartSegmentLocked on its own goroutine so the
+// segment request that triggered a far-seek recovery is not held for the whole
+// restart. The generation rotates on restart, so the triggering request's token
+// can never serve the bytes the restart produces (the generation fence would
+// refuse them); the caller answers it the stale-generation verdict immediately
+// and this worker makes the next request on the new generation succeed. The
+// context is detached from the request so a client that disconnects after the
+// verdict does not cancel the restart the next request depends on.
+//
+// Concurrent far-seeks to different positions on one session coalesce onto a
+// single worker that ends at the latest requested segment, so a burst of seeks
+// cannot leave ffmpeg parked at an older position than the player's last one.
+func (m *TranscodeManager) RestartSegmentAsync(sessionID string, ts *TranscodeSession, segNum int) {
+	if m == nil || ts == nil {
+		return
+	}
+	m.asyncRestartMu.Lock()
+	if m.asyncRestarts == nil {
+		m.asyncRestarts = make(map[string]*pendingAsyncRestart)
+	}
+	if pending := m.asyncRestarts[sessionID]; pending != nil && pending.ts == ts {
+		// A restart for this session is already running: record the newest
+		// target and let the worker converge on it.
+		pending.mu.Lock()
+		pending.segNum = segNum
+		pending.mu.Unlock()
+		m.asyncRestartMu.Unlock()
+		return
+	}
+	pending := &pendingAsyncRestart{ts: ts, segNum: segNum}
+	m.asyncRestarts[sessionID] = pending
+	m.asyncRestartMu.Unlock()
+
+	go m.runAsyncRestart(sessionID, pending)
+}
+
+// runAsyncRestart applies far-seek restarts until the coalesced target stops
+// moving. A newer target arriving mid-restart makes the loop run once more, so
+// the final applied position is the last one the player asked for.
+//
+// The decision to leave the loop and the removal of the coalescing entry happen
+// in one critical section (see tryFinishAsyncRestart). If they did not, a
+// request landing after the "did the target move?" read but before the removal
+// would find the entry still present, record its target, and return without a
+// worker — and the exiting worker would then delete the entry, dropping the
+// newest target. Under one lock the request either lands before the read (the
+// worker loops onto it) or after the removal (it starts a fresh worker).
+func (m *TranscodeManager) runAsyncRestart(sessionID string, pending *pendingAsyncRestart) {
+	defer func() {
+		m.asyncRestartMu.Lock()
+		if m.asyncRestarts[sessionID] == pending {
+			delete(m.asyncRestarts, sessionID)
+		}
+		m.asyncRestartMu.Unlock()
+	}()
+	for {
+		// Read the target inside the lifecycle critical section: a request that
+		// queued behind another worker's restart is collapsed onto whatever the
+		// latest requested segment is when the lock is actually held.
+		applied := 0
+		nextTarget := func() int {
+			pending.mu.Lock()
+			defer pending.mu.Unlock()
+			applied = pending.segNum
+			return applied
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), restartSegmentAsyncTimeout)
+		target, ok, err := m.restartSegmentLockedWithTarget(ctx, sessionID, pending.ts, nextTarget)
+		cancel()
+		m.recordAsyncRestartOutcome(sessionID, pending.ts, applied, target, ok, err)
+
+		// A terminal failure cannot be fixed by a different target on the same
+		// dead generation, so stop rather than loop; the latched verdict is what
+		// the next request answers.
+		if err != nil {
+			return
+		}
+		if m.tryFinishAsyncRestart(sessionID, pending, applied) {
+			if m.asyncRestartFinishHook != nil {
+				m.asyncRestartFinishHook()
+			}
+			return
+		}
+	}
+}
+
+// tryFinishAsyncRestart atomically ends the coalescing worker when no newer
+// target arrived while it applied applied. It returns true when the worker
+// should leave the loop, having removed its entry under asyncRestartMu so a
+// request landing immediately after this check starts a fresh worker instead of
+// updating an entry about to be deleted. It returns false when the coalesced
+// target moved, so the caller loops and applies it.
+func (m *TranscodeManager) tryFinishAsyncRestart(sessionID string, pending *pendingAsyncRestart, applied int) bool {
+	m.asyncRestartMu.Lock()
+	defer m.asyncRestartMu.Unlock()
+	pending.mu.Lock()
+	advanced := pending.segNum != applied
+	pending.mu.Unlock()
+	if advanced {
+		return false
+	}
+	if m.asyncRestarts[sessionID] == pending {
+		delete(m.asyncRestarts, sessionID)
+	}
+	return true
+}
+
+func (m *TranscodeManager) recordAsyncRestartOutcome(sessionID string, ts *TranscodeSession, segNum int, target SegmentRecoveryTarget, ok bool, err error) {
+	switch {
+	case errors.Is(err, ErrSessionSuperseded):
+		// Routine teardown: the session was closed or replaced while the seek
+		// restart waited for the lifecycle lock, so nothing was re-spawned.
+		slog.Debug("restart transcode at missing segment skipped, session superseded (async)",
+			"component", "playback", "segment", segNum, "session", sessionID)
+	case err != nil && !errors.Is(err, ErrManifestNotReady):
+		slog.Warn("restart transcode at missing segment (async)", "component", "playback", "error", err, "segment", segNum, "session", sessionID)
+		// Latch the verdict so the retry surfaces the real failure instead of
+		// stale_generation again (the scheduled restart never rotated the
+		// generation it promised).
+		ts.RecordAsyncRestartFailure(err)
+	case ok:
+		slog.Info("transcode seek restart", "component", "playback", "segment", segNum,
+			"seek_seconds", target.SeekSeconds, "stream_origin_seconds", target.StreamOriginSeconds,
+			"resolved_start_segment", target.StartSegmentNumber, "session", sessionID)
+	}
 }
 
 func (m *TranscodeManager) restartSessionLocked(sessionID string, ts *TranscodeSession, restart func() error) error {
@@ -404,6 +576,12 @@ func (m *TranscodeManager) restartSessionLocked(sessionID string, ts *TranscodeS
 	if live := m.GetTranscodeSession(sessionID); live != ts {
 		return ErrSessionSuperseded
 	}
+	// Install a liveness predicate for the restart's cancel→respawn section.
+	// A stop that unregisters this session while the restart is in flight makes
+	// the predicate reject, so the restart aborts before spawning (or stops the
+	// process it just spawned) instead of leaving ffmpeg running after the close.
+	ts.setLifecycleLiveness(func() bool { return m.GetTranscodeSession(sessionID) == ts })
+	defer ts.setLifecycleLiveness(nil)
 	return restart()
 }
 
@@ -1145,6 +1323,13 @@ func (m *TranscodeManager) MonitorLocalTranscodeExit(sessionID string, session *
 // non-empty, sends DELETE to the remote transcode node. Otherwise closes the
 // local session.
 //
+// A concurrent restart's cancel→respawn critical section is protected by a
+// liveness predicate the manager installs around Restart (see
+// restartSessionLocked): the restart re-checks that this session is still the
+// live mapped one before and after spawning, so a stop that unregisters it
+// during the window cannot leave the replacement ffmpeg running. The close
+// itself therefore needs no lifecycle lock — several stop paths already hold it.
+//
 // Under token-carried reconstruction there is no durable card to drop: a stopped
 // session simply stops being served, and its segment dir is reaped by the
 // in-memory-liveness + age cleanup once no live token could still reconstruct it
@@ -1153,6 +1338,13 @@ func (m *TranscodeManager) MonitorLocalTranscodeExit(sessionID string, session *
 // deferred to a future PR; today a stopped session can be reconstructed by a
 // still-valid token until it expires.
 func (m *TranscodeManager) CloseTranscodeSession(sessionID, transcodeNodeURL string) {
+	m.closeTranscodeSessionLocal(sessionID)
+	m.StopRemoteTranscode(sessionID, transcodeNodeURL)
+}
+
+// closeTranscodeSessionLocal removes and closes the local runtime and retained
+// generation for sessionID.
+func (m *TranscodeManager) closeTranscodeSessionLocal(sessionID string) {
 	// Clean up local session if one exists (defensive).
 	m.transcodeMu.Lock()
 	session := m.transcodes[sessionID]
@@ -1168,8 +1360,6 @@ func (m *TranscodeManager) CloseTranscodeSession(sessionID, transcodeNodeURL str
 	if reaped && retained != nil && retained.Session != nil {
 		_ = retained.Session.Close()
 	}
-
-	m.StopRemoteTranscode(sessionID, transcodeNodeURL)
 }
 
 // RetainedGeneration is a displaced local transcode generation kept servable
