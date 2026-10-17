@@ -930,6 +930,10 @@ function describePlaybackSessionError(
   };
 }
 
+// Stable empty reference: consumers key effects on the variants array, so a
+// fresh `[]` default on every call would restart them.
+const EMPTY_PLAYBACK_VARIANTS: PlayerPlaybackVariant[] = [];
+
 /**
  * Owns the v3 playback session: the start decision, the plan it produced, and
  * every replan that supersedes it.
@@ -943,7 +947,7 @@ function describePlaybackSessionError(
 export function usePlaybackSession(
   requestKey: string,
   versions: PlayerFileVersion[],
-  playbackVariants: PlayerPlaybackVariant[] = [],
+  playbackVariants: PlayerPlaybackVariant[] = EMPTY_PLAYBACK_VARIANTS,
   fileId?: number,
   initialPosition = 0,
   forceInitialPosition = false,
