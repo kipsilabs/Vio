@@ -860,38 +860,55 @@ func TestReplanRequestV3RejectsInvalidNetworkAndTrackEvidence(t *testing.T) {
 	}
 }
 
-// The start-only subtitle off sentinel (-1) is not meaningful on a replan: an
-// omitted selected_tracks.subtitle already means "subtitles off", so there is
-// nothing for -1 to override and the protocol classifies a negative index as
-// malformed. This pins the intentional asymmetry with the start path, where -1
-// is the explicit override of a stored "always" mode.
-func TestReplanRequestV3TreatsSubtitleOffAsOmissionNotSentinel(t *testing.T) {
+// A replan carries no start-only subtitle off sentinel. For an explicit
+// track_change, "subtitles off" is expressed by omitting the identity; every
+// other replan operation preserves the durable selection when the identity is
+// omitted. Validation accepts the omission and rejects every negative index on
+// both operations, pinning the wire representation (the behavioral
+// clearing/preservation tests live with the session).
+func TestReplanRequestV3SubtitleIdentityValidationAcrossOperations(t *testing.T) {
 	start := validStartRequestV3()
-	request := ReplanRequestV3{
-		ProtocolVersion:       ProtocolV3,
-		PlaybackAttemptID:     start.PlaybackAttemptID,
-		ReplanRequestID:       "replan-subtitle-off-0001",
-		FailedPlanID:          "plan:subtitle-off-0001",
-		PlanAttemptID:         "plan-attempt-subtitle-off-0001",
-		PlanAttemptKey:        "v3:0000000000000001",
-		AttemptCount:          1,
-		QualityPreference:     start.QualityPreference,
-		Failure:               FailureV3{Classification: "parser_failure"},
-		Capabilities:          start.Capabilities,
-		ClientPlaybackContext: start.ClientPlaybackContext,
-	}
-	if err := request.Validate(); err != nil {
-		t.Fatalf("omitted subtitle identity rejected instead of meaning off: %v", err)
+	negative := SubtitleTrackOffIndexV3
+
+	base := func(operation ReplanOperationV3) ReplanRequestV3 {
+		request := ReplanRequestV3{
+			ProtocolVersion:       ProtocolV3,
+			Operation:             operation,
+			PlaybackAttemptID:     start.PlaybackAttemptID,
+			ReplanRequestID:       "replan-subtitle-off-0001",
+			FailedPlanID:          "plan:subtitle-off-0001",
+			PlanAttemptID:         "plan-attempt-subtitle-off-0001",
+			PlanAttemptKey:        "v3:0000000000000001",
+			AttemptCount:          1,
+			QualityPreference:     start.QualityPreference,
+			Capabilities:          start.Capabilities,
+			ClientPlaybackContext: start.ClientPlaybackContext,
+		}
+		if operation != ReplanOperationTrackChangeV3 {
+			request.Failure = FailureV3{Classification: "parser_failure"}
+		}
+		return request
 	}
 
-	negative := SubtitleTrackOffIndexV3
-	request.SelectedTracks.Subtitle = &TrackIdentityV3{Index: &negative}
-	if err := request.Validate(); err == nil {
-		t.Fatal("bare subtitle index -1 was accepted on a replan")
-	}
-	request.SelectedTracks.Subtitle = &TrackIdentityV3{ID: TrackIDV3(42, trackKindSubtitle, 0), Index: &negative}
-	if err := request.Validate(); err == nil {
-		t.Fatal("subtitle index -1 paired with an identity was accepted on a replan")
+	for _, operation := range []ReplanOperationV3{ReplanOperationFailureRecoveryV3, ReplanOperationTrackChangeV3} {
+		t.Run(string(operation), func(t *testing.T) {
+			request := base(operation)
+			if err := request.Validate(); err != nil {
+				t.Fatalf("omitted subtitle identity rejected: %v", err)
+			}
+
+			bare := base(operation)
+			bare.SelectedTracks.Subtitle = &TrackIdentityV3{Index: &negative}
+			if err := bare.Validate(); err == nil {
+				t.Fatal("bare subtitle index -1 was accepted on a replan")
+			}
+
+			paired := base(operation)
+			paired.SelectedTracks.Subtitle = &TrackIdentityV3{ID: TrackIDV3(42, trackKindSubtitle, 0), Index: &negative}
+			if err := paired.Validate(); err == nil {
+				t.Fatal("subtitle index -1 paired with an identity was accepted on a replan")
+			}
+		})
 	}
 }
 
