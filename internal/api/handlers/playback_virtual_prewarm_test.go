@@ -408,9 +408,9 @@ func TestVirtualPreparationWarmsPlaybackProbeCache(t *testing.T) {
 				})
 			}
 			service := &VirtualPlaybackPreparationService{
-				Enabled: func(context.Context) bool { return true },
+				Enabled:      func(context.Context) bool { return true },
 				AllowPrivate: func(context.Context) bool { return true },
-				Probe: prober,
+				Probe:        prober,
 				List: VirtualPlaybackStreamListerFunc(func(context.Context, string, int, string, int) ([]VirtualPlaybackStream, error) {
 					return []VirtualPlaybackStream{candidate}, nil
 				}),
@@ -462,7 +462,7 @@ func TestVirtualPreparationProbeRequiresPrivateOptIn(t *testing.T) {
 		t.Run(fmt.Sprintf("allowed_%t", allowed), func(t *testing.T) {
 			calls := 0
 			service := &VirtualPlaybackPreparationService{
-				Enabled: func(context.Context) bool { return true },
+				Enabled:      func(context.Context) bool { return true },
 				AllowPrivate: func(context.Context) bool { return allowed },
 				Probe: func(context.Context, string, *models.MediaFile, map[string]string) (*models.MediaFile, error) {
 					calls++
@@ -491,8 +491,8 @@ func TestVirtualPreparationProbeIsAsynchronousAndDeduplicated(t *testing.T) {
 			requestCtx, cancelRequest := context.WithCancel(context.Background())
 			defer cancelRequest()
 			service := &VirtualPlaybackPreparationService{
-				Context: serviceCtx,
-				Enabled: func(context.Context) bool { return true },
+				Context:      serviceCtx,
+				Enabled:      func(context.Context) bool { return true },
 				AllowPrivate: func(context.Context) bool { return true },
 				Detail: &fakeRefreshDetail{detail: &catalog.WatchDetail{
 					Type: kind, Versions: []catalog.FileVersion{{FileID: file.ID, FilePath: file.FilePath}},
