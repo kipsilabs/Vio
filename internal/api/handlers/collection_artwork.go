@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/artworkkey"
+	"github.com/Silo-Server/silo-server/internal/artworkurl"
 	"github.com/Silo-Server/silo-server/internal/blobstore"
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/collage"
@@ -390,6 +391,12 @@ func removeCollectionImageVariants(
 	return nil
 }
 
+// ArtworkRepairEnqueuer queues regeneration of a cached artwork revision that
+// is missing from the store, as the signed artwork route does.
+type ArtworkRepairEnqueuer interface {
+	EnqueueArtworkRepair(ctx context.Context, keys []string, limit int) (int, error)
+}
+
 // collectionCollageComposer composes collection collages from title posters
 // and stores them under one artwork prefix (catalog.CollageGenerator). Each
 // collage is stored in the collection's collage directory with its key as the
@@ -399,22 +406,29 @@ type collectionCollageComposer struct {
 	prefix     string
 	store      blobstore.Store
 	posters    itemPosterSigner
+	signer     *artworkurl.Signer
+	repair     ArtworkRepairEnqueuer
 	httpClient *http.Client
 }
 
 // NewPersonalCollectionCollageGenerator composes personal collection
 // collages and stores them beside their uploaded posters. It returns nil
 // when artwork storage or poster signing is not configured, which leaves
-// personal collections without collages. A nil httpClient uses
+// personal collections without collages. signer is the artwork URL signer, so
+// a source behind local storage can be read from the store directly; with a
+// nil signer a root-relative source fails as a configuration error instead of
+// being fetched, while an absolute source URL is still left to the HTTP fetch.
+// repair queues regeneration of a missing revisioned source, as the signed
+// artwork route does; a nil repair skips that. A nil httpClient uses
 // newCollectionImageClient.
-func NewPersonalCollectionCollageGenerator(store blobstore.Store, posters itemPosterSigner, httpClient *http.Client) catalog.CollageGenerator {
+func NewPersonalCollectionCollageGenerator(store blobstore.Store, posters itemPosterSigner, signer *artworkurl.Signer, repair ArtworkRepairEnqueuer, httpClient *http.Client) catalog.CollageGenerator {
 	if store == nil || posters == nil {
 		return nil
 	}
 	if httpClient == nil {
 		httpClient = newCollectionImageClient()
 	}
-	return collectionCollageComposer{prefix: userCollectionImagePrefix, store: store, posters: posters, httpClient: httpClient}
+	return collectionCollageComposer{prefix: userCollectionImagePrefix, store: store, posters: posters, signer: signer, repair: repair, httpClient: httpClient}
 }
 
 // ComposeCollectionCollage fetches the source posters, composes them and
@@ -471,12 +485,30 @@ func (c collectionCollageComposer) CollectionCollagePath(collectionID, key strin
 	return artworkkey.Original(collectionCollageDir(c.prefix, collectionID), key, ".webp")
 }
 
-// fetchImage downloads an image from a resolved URL. The URL is a catalog
-// title's poster as the server resolved it, usually from its own artwork
-// storage, which may be on the local network; no request supplies it. The
-// fetch is therefore trusted with the local network, and netguard still
-// refuses blocked addresses.
+// errCollageArtworkSignerNotConfigured reports a root-relative collage source
+// URL with no signer to verify it. Without a signer the store key is
+// unknowable, so the source cannot be read from the store and must not be
+// fetched over HTTP.
+var errCollageArtworkSignerNotConfigured = errors.New("collage artwork signer is not configured; cannot read a local source URL")
+
+// fetchImage reads one source image from a resolved URL. A URL that names an
+// object in this server's own artwork storage -- the root-relative signed route
+// a local backend issues -- is read straight from the store, so the build needs
+// no reachable server route and no base URL. Any other URL, such as a presigned
+// or public S3 URL, is fetched over HTTP. The URL is a catalog title's poster as
+// the server resolved it; no request supplies it, so the fetch is trusted with
+// the local network and netguard still refuses blocked addresses.
+//
+// A root-relative URL is never fetched over HTTP: it names this server's own
+// origin, so there is no absolute URL to request. One that does not verify is
+// answered with a signature error instead of a misleading HTTP result.
 func (c collectionCollageComposer) fetchImage(ctx context.Context, imageURL string) ([]byte, error) {
+	if key, ok := c.storedArtworkKey(imageURL, time.Now()); ok {
+		return c.readStoredImage(ctx, key)
+	}
+	if isRootRelativeURL(imageURL) {
+		return nil, c.localSourceError(imageURL)
+	}
 	if c.httpClient == nil {
 		return nil, errors.New("collage downloads have no HTTP client")
 	}
@@ -493,4 +525,66 @@ func (c collectionCollageComposer) fetchImage(ctx context.Context, imageURL stri
 		return nil, fmt.Errorf("image fetch returned status %d", resp.StatusCode)
 	}
 	return io.ReadAll(io.LimitReader(resp.Body, collectionImageMaxBytes))
+}
+
+// isRootRelativeURL reports whether rawURL names this server's own origin -- no
+// scheme and no host -- as the local artwork backend issues. Such a URL can only
+// be read from the store, never fetched over HTTP.
+func isRootRelativeURL(rawURL string) bool {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return false
+	}
+	return u.Scheme == "" && u.Host == ""
+}
+
+// localSourceError explains a root-relative source URL that was not read from
+// the store. The URL can only name a store key through the signer, so a missing
+// signer is a configuration error. Otherwise the resolver signed the URL before
+// handing it over, so one that no longer verifies has expired or carries a bad
+// signature; that is a data problem, not a fetchable address. The message names
+// the path only, never the URL or the query string that carries the signature.
+func (c collectionCollageComposer) localSourceError(imageURL string) error {
+	if c.signer == nil {
+		return errCollageArtworkSignerNotConfigured
+	}
+	path := imageURL
+	if u, err := url.Parse(strings.TrimSpace(imageURL)); err == nil {
+		path = u.Path
+	}
+	return fmt.Errorf("collage source path %q is not a valid signed artwork URL (expired or bad signature)", path)
+}
+
+// storedArtworkKey maps a resolved URL to the artwork store key it names when
+// the signer minted it, so a local-storage source can be read without a
+// request. An absolute URL, such as a presigned or public S3 URL, does not
+// match and falls through to the HTTP fetch. now is the instant the URL's
+// expiry is verified against.
+func (c collectionCollageComposer) storedArtworkKey(imageURL string, now time.Time) (string, bool) {
+	if c.signer == nil {
+		return "", false
+	}
+	return c.signer.SignedKey(imageURL, now)
+}
+
+// readStoredImage reads a source image's bytes from the artwork store.
+func (c collectionCollageComposer) readStoredImage(ctx context.Context, key string) ([]byte, error) {
+	if c.store == nil {
+		return nil, errors.New("collage artwork storage is not configured")
+	}
+	body, info, err := c.store.Get(ctx, key)
+	if err != nil {
+		// A missing revisioned source is queued for regeneration, as the
+		// signed artwork route does: the build fails now, and a later read
+		// retries it once the object is rebuilt.
+		if errors.Is(err, blobstore.ErrNotFound) && c.repair != nil && artworkkey.Revision(key) != "" {
+			_, _ = c.repair.EnqueueArtworkRepair(ctx, []string{artworkkey.OriginalOf(key)}, 1)
+		}
+		return nil, err
+	}
+	defer func() { _ = body.Close() }()
+	if info.Size > collectionImageMaxBytes {
+		return nil, fmt.Errorf("stored image is %d bytes, over the %d byte limit", info.Size, collectionImageMaxBytes)
+	}
+	return io.ReadAll(io.LimitReader(body, collectionImageMaxBytes))
 }
