@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"errors"
+	"log/slog"
 	"math/bits"
 	"net/http"
 	"slices"
@@ -593,6 +594,16 @@ func (reg *Registry) searchRequestMedia(ctx context.Context, in *RequestMediaSea
 	}
 	page, err := svc.Search(ctx, viewer, in.Query, mediarequests.MediaType(in.MediaType), in.Page)
 	if err != nil {
+		if requestCanceled(ctx, err) {
+			// The caller is gone or out of time: the lookup failure is not a
+			// server error. Keep the cause out of the error signal and leave
+			// it at debug for diagnosis.
+			slog.DebugContext(ctx, "apiv2: request search canceled",
+				"component", "apiv2",
+				"operation", opSearchRequestMedia,
+				"error", err)
+			return nil, canceledRequestProblem(err)
+		}
 		return nil, requestProblem(err)
 	}
 	out := requestMediaPageOf(page)
@@ -756,12 +767,36 @@ func requireSlug(slug string) *Problem {
 	return nil
 }
 
+// requestCanceled reports whether the request ended before the service could
+// answer: the client went away, the deadline expired, or the service surfaced
+// either from the context it was given. The request context is checked too
+// because a lookup can report a transport failure after the context is
+// already done.
+func requestCanceled(ctx context.Context, err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	return ctx != nil && (errors.Is(ctx.Err(), context.Canceled) || errors.Is(ctx.Err(), context.DeadlineExceeded))
+}
+
+// canceledRequestProblem is the answer for an abandoned request. It is a
+// client-side outcome, not an internal failure, so it uses the standard
+// request-timeout status instead of a 500. The detail stays generic because
+// nobody is guaranteed to read it, and the cause never travels on the body.
+func canceledRequestProblem(err error) *Problem {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return NewProblem(TypeRequestTimeout, "The request timed out.")
+	}
+	return NewProblem(TypeRequestTimeout, "The request was canceled.")
+}
+
 // requestProblem renders a request-service failure with the decisions v1's
 // writeRequestServiceError makes, as v2 problems: invalid input and
 // provider validation are 422, a disabled feature is 409
 // capability_disabled, an exhausted quota is 429, duplicates and state
 // conflicts are 409, an unreachable integration is 503
-// dependency_unavailable, and anything else is an internal error.
+// dependency_unavailable, an abandoned request is 408 request_timeout, and
+// anything else is an internal error.
 func requestProblem(err error) *Problem {
 	if verr, ok := errors.AsType[*mediarequests.ValidationError](err); ok {
 		p := NewProblem(TypeValidationFailed, "The request did not pass validation; see errors.")
@@ -777,12 +812,12 @@ func requestProblem(err error) *Problem {
 	}
 	var quota mediarequests.QuotaError
 	// A canceled lookup (client gone, or a dependency reporting the canceled
-	// context) masks like every other failure: status and type unchanged, a
-	// stable detail, the cause on the log only. Detail strings are never a
-	// contract surface (api-contract.md: clients never parse detail).
+	// context) is not a server failure. Answer the standard request-timeout
+	// status and keep the cause off the envelope: the caller may already be
+	// gone, and the request log reports it at debug rather than ERROR.
 	switch {
-	case errors.Is(err, context.Canceled):
-		return NewProblem(TypeInternalError, "The request was canceled.").withCause(err)
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return canceledRequestProblem(err)
 	case errors.As(err, &quota):
 		return NewProblem(TypeRateLimited, "Request quota exceeded: "+strconv.Itoa(quota.Used)+" of "+strconv.Itoa(quota.Limit)+" requests used in the last "+strconv.Itoa(quota.WindowDays)+" days.")
 	case errors.Is(err, mediarequests.ErrInvalidMediaType):
@@ -813,7 +848,7 @@ func requestProblem(err error) *Problem {
 		}
 		return NewProblem(TypeDependencyUnavailable, "The request integration could not be reached.")
 	}
-	return NewProblem(TypeInternalError, "An unexpected error occurred.")
+	return NewProblem(TypeInternalError, "An unexpected error occurred.").withCause(err)
 }
 
 // requestSourceOf reads an unset source (a request built outside the store)

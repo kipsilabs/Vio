@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -549,25 +550,80 @@ func TestSearchRequestMedia(t *testing.T) {
 	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/requests/search?q=%20", "", requestOwner), TypeValidationFailed)
 	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/requests/search?q=heat&media_type=tv", "", requestOwner), TypeValidationFailed)
 	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/requests/search?q=heat&page=0", "", requestOwner), TypeValidationFailed)
-	// A canceled provider lookup masks the same way: the body reports the
-	// cancellation without echoing the cause marker, and unknown failures
-	// keep the generic envelope.
+	// A canceled provider lookup is the caller going away, not a server
+	// failure: a 408 with a generic body, never internal_error.
 	buf := captureLogs(t)
-	svc.err = fmt.Errorf("request search private-search-marker: %w", context.Canceled)
+	svc.err = fmt.Errorf("lookup external ids private-search-marker: %w", context.Canceled)
 	rec = do(t, h, http.MethodGet, "/api/v2/requests/search?q=heat", "", requestOwner)
-	p := requireProblem(t, rec, TypeInternalError)
+	requireProblem(t, rec, TypeRequestTimeout)
 	if !strings.Contains(rec.Body.String(), "The request was canceled.") || strings.Contains(rec.Body.String(), "private-search-marker") {
 		t.Fatalf("canceled search body = %s", rec.Body.String())
 	}
-	if !strings.Contains(buf.String(), "private-search-marker") || !strings.Contains(buf.String(), `"request_id":"`+requestIDHeader(rec)+`"`) {
-		t.Fatalf("canceled search log lacks marker or request id: %s", buf.String())
+	if strings.Contains(buf.String(), `"level":"ERROR"`) || strings.Contains(buf.String(), `"status":500`) {
+		t.Fatalf("canceled search logged as an error: %s", buf.String())
 	}
-	_ = p
-	svc.err = fmt.Errorf("request search other-failure")
+	// A genuine provider failure keeps the generic 500 envelope and its cause
+	// reaches the request log under the same request id.
+	svc.err = fmt.Errorf("lookup external ids private-search-failure: connection refused")
 	rec = do(t, h, http.MethodGet, "/api/v2/requests/search?q=heat", "", requestOwner)
 	requireProblem(t, rec, TypeInternalError)
-	if !strings.Contains(rec.Body.String(), "An unexpected error occurred.") || strings.Contains(rec.Body.String(), "other-failure") {
+	if !strings.Contains(rec.Body.String(), "An unexpected error occurred.") || strings.Contains(rec.Body.String(), "private-search-failure") {
 		t.Fatalf("masked search body = %s", rec.Body.String())
+	}
+	if !strings.Contains(buf.String(), "private-search-failure") || !strings.Contains(buf.String(), `"request_id":"`+requestIDHeader(rec)+`"`) {
+		t.Fatalf("failed search log lacks marker or request id: %s", buf.String())
+	}
+}
+
+// TestSearchRequestMediaCanceledRequest covers the production shape: the
+// external-id lookup fails with context.Canceled while the request context is
+// already done because the client navigated away. It must answer the standard
+// request-timeout problem, not internal_error, and keep the cause out of the
+// ERROR signal.
+func TestSearchRequestMediaCanceledRequest(t *testing.T) {
+	svc := fixtureRequests()
+	svc.err = fmt.Errorf("lookup external ids private-canceled-request: %w", context.Canceled)
+	h := newTestHandler(t, requestDeps(svc))
+	buf := captureLogsAt(t, slog.LevelDebug)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r := httptest.NewRequest(http.MethodGet, "/api/v2/requests/search?q=heat", nil).WithContext(ctx)
+	for k, v := range requestOwner {
+		r.Header.Set(k, v)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, r)
+
+	requireProblem(t, rec, TypeRequestTimeout)
+	if !strings.Contains(rec.Body.String(), "The request was canceled.") || strings.Contains(rec.Body.String(), "private-canceled-request") {
+		t.Fatalf("canceled request body = %s", rec.Body.String())
+	}
+	logs := buf.String()
+	if strings.Contains(logs, `"level":"ERROR"`) || strings.Contains(logs, `"status":500`) {
+		t.Fatalf("canceled request logged as an error: %s", logs)
+	}
+	// The cause is still diagnosable at debug level only.
+	if !strings.Contains(logs, `"level":"DEBUG"`) || !strings.Contains(logs, "private-canceled-request") {
+		t.Fatalf("canceled request lacks its debug cause: %s", logs)
+	}
+}
+
+// TestSearchRequestMediaDeadlineExceeded pins the other abandoned-request
+// shape: an expired deadline is also the client's outcome, not a 500.
+func TestSearchRequestMediaDeadlineExceeded(t *testing.T) {
+	svc := fixtureRequests()
+	svc.err = fmt.Errorf("lookup external ids: %w", context.DeadlineExceeded)
+	h := newTestHandler(t, requestDeps(svc))
+	buf := captureLogs(t)
+
+	rec := do(t, h, http.MethodGet, "/api/v2/requests/search?q=heat", "", requestOwner)
+	requireProblem(t, rec, TypeRequestTimeout)
+	if !strings.Contains(rec.Body.String(), "The request timed out.") {
+		t.Fatalf("timed-out search body = %s", rec.Body.String())
+	}
+	if strings.Contains(buf.String(), `"level":"ERROR"`) || strings.Contains(buf.String(), `"status":500`) {
+		t.Fatalf("timed-out search logged as an error: %s", buf.String())
 	}
 }
 
