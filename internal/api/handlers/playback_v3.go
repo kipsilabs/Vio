@@ -294,6 +294,33 @@ type transportPhaseTimingsV3 struct {
 
 type transportPhaseTimingsKeyV3 struct{}
 
+// transportPhaseSuppressKeyV3 marks a context subtree whose phase writes are
+// discarded. The pooled capability fan-out installs it on the context shared by
+// its concurrent workers: each worker records its own duration, so parallel
+// spans would sum additively past the wall time the route span can net out. The
+// batch records its own wall time once instead, while standalone callers keep
+// their per-lookup recording.
+type transportPhaseSuppressKeyV3 struct{}
+
+// withoutTransportPhaseRecordingV3 returns ctx marked so phase writes on it and
+// its descendants are no-ops. A nil ctx stays nil.
+func withoutTransportPhaseRecordingV3(ctx context.Context) context.Context {
+	if ctx == nil {
+		return nil
+	}
+	return context.WithValue(ctx, transportPhaseSuppressKeyV3{}, true)
+}
+
+// transportPhaseRecordingSuppressedV3 reports whether ctx belongs to a subtree
+// whose phase writes are discarded.
+func transportPhaseRecordingSuppressedV3(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	suppressed, _ := ctx.Value(transportPhaseSuppressKeyV3{}).(bool)
+	return suppressed
+}
+
 // withTransportPhaseTimingsV3 attaches a fresh phase recorder to ctx and
 // returns it. A second call replaces the recorder so a nested or retried start
 // measures its own commit rather than accumulating into an outer one.
@@ -314,8 +341,12 @@ func transportPhaseTimingsFromV3(ctx context.Context) *transportPhaseTimingsV3 {
 }
 
 // recordTransportPhaseV3 adds the wall time since start to the named phase on
-// the context's recorder. It is a no-op without an installed recorder.
+// the context's recorder. It is a no-op without an installed recorder and on a
+// subtree marked by withoutTransportPhaseRecordingV3.
 func recordTransportPhaseV3(ctx context.Context, phase string, start time.Time) {
+	if transportPhaseRecordingSuppressedV3(ctx) {
+		return
+	}
 	recorder := transportPhaseTimingsFromV3(ctx)
 	if recorder == nil {
 		return
@@ -329,6 +360,9 @@ func recordTransportPhaseV3(ctx context.Context, phase string, start time.Time) 
 // phase. It lets a caller record an enclosing span net of a span recorded inside
 // it (spawn inside the hw_accel=auto walk) so the phases never overlap.
 func addTransportPhaseDurationV3(ctx context.Context, phase string, d time.Duration) {
+	if transportPhaseRecordingSuppressedV3(ctx) {
+		return
+	}
 	recorder := transportPhaseTimingsFromV3(ctx)
 	if recorder == nil {
 		return
@@ -346,8 +380,8 @@ func addTransportPhaseDurationV3(ctx context.Context, phase string, d time.Durat
 // inner total it read before the span began so the enclosing phase stays
 // disjoint from the phase that names work it performed inline. The subtraction
 // floors at zero (addTransportPhaseDurationV3 clamps a negative duration), so a
-// clock or ordering surprise degrades to the full outer span rather than a
-// nonsensical negative millisecond.
+// clock or ordering surprise can only report a zero outer span; it never emits
+// a negative millisecond.
 func recordTransportPhaseNetOfV3(ctx context.Context, outer string, start time.Time, inner string, innerBefore time.Duration) {
 	innerDelta := transportPhaseDurationV3(ctx, inner) - innerBefore
 	addTransportPhaseDurationV3(ctx, outer, time.Since(start)-innerDelta)
@@ -1653,8 +1687,19 @@ func (h *PlaybackHandler) pooledNodeTransformationsV3(ctx context.Context, nodeU
 }
 
 func (h *PlaybackHandler) pooledNodeCapabilitiesV3(ctx context.Context, nodeURLs []string) map[string]v3NodeCapabilityCache {
+	if len(nodeURLs) == 0 {
+		return map[string]v3NodeCapabilityCache{}
+	}
+	// The lookups below run concurrently. Each one records its own capability
+	// span, and parallel spans would sum additively into transport_capability —
+	// more than the wall time route resolution can net out (and the batch itself
+	// only spans one wall-clock interval). Suppress their recording on the shared
+	// batch context and name the fan-out's own wall time once below; standalone
+	// callers outside the pool keep their per-lookup recording.
+	batchStart := time.Now()
 	fetchCtx, cancel := context.WithTimeout(ctx, v3NodeCapabilityPlanTimeout)
 	defer cancel()
+	lookupCtx := withoutTransportPhaseRecordingV3(fetchCtx)
 	results := make([]v3NodeCapabilityCache, len(nodeURLs))
 	available := make([]bool, len(nodeURLs))
 	var wg sync.WaitGroup
@@ -1662,7 +1707,7 @@ func (h *PlaybackHandler) pooledNodeCapabilitiesV3(ctx context.Context, nodeURLs
 		wg.Add(1)
 		go func(i int, nodeURL string) {
 			defer wg.Done()
-			entry, err := h.lookupRemoteCapabilitiesV3(fetchCtx, nodeURL, true)
+			entry, err := h.lookupRemoteCapabilitiesV3(lookupCtx, nodeURL, true)
 			if err != nil {
 				slog.DebugContext(ctx, "protocol v3 node capability unavailable for planning", "component", "api", "node", logredact.SanitizeURL(nodeURL), "error", err)
 				return
@@ -1672,6 +1717,7 @@ func (h *PlaybackHandler) pooledNodeCapabilitiesV3(ctx context.Context, nodeURLs
 		}(i, nodeURL)
 	}
 	wg.Wait()
+	recordTransportPhaseV3(ctx, transportPhaseCapabilityV3, batchStart)
 	byURL := make(map[string]v3NodeCapabilityCache, len(nodeURLs))
 	for i, entry := range results {
 		if available[i] {
@@ -5831,6 +5877,16 @@ func (h *PlaybackHandler) newAutoTranscodePipelineV3(ctx context.Context, opts p
 // ManifestStartupTimeout. A variable so tests can shrink it.
 var localAutoStartupBudgetV3 = time.Duration(playback.MaxAutoTranscodeStartupAttempts)*playback.ManifestStartupTimeout + 5*time.Second
 
+// addTransportReadinessNetOfWalkV3 records an enabled hw_accel=auto walk's
+// readiness as its wall time net of the spans already named during the walk:
+// FFmpeg spawn, the upstream reopen, and any inline first-manifest wait. Each
+// delta is the phase total after the walk minus its total before, so a
+// multi-attempt walk and a reused recorder both net correctly. The result floors
+// at zero in addTransportPhaseDurationV3.
+func addTransportReadinessNetOfWalkV3(ctx context.Context, elapsed, spawn, upstream, manifest time.Duration) {
+	addTransportPhaseDurationV3(ctx, "transport_readiness", elapsed-spawn-upstream-manifest)
+}
+
 // startReadyAutoLocalPlaybackTransportV3 walks an enabled hw_accel=auto
 // pipeline until one path produces its first manifest. Failed attempts are
 // closed by the pipeline loop, so the failure carries the same cleanup
@@ -5845,6 +5901,8 @@ func (h *PlaybackHandler) startReadyAutoLocalPlaybackTransportV3(ctx context.Con
 	startedAt := time.Now()
 	attempts := 0
 	spawnBefore := transportPhaseDurationV3(ctx, "transport_spawn")
+	upstreamBefore := transportPhaseDurationV3(ctx, "transport_upstream")
+	manifestBefore := transportPhaseDurationV3(ctx, transportPhaseManifestV3)
 	ts, err := playback.StartReadyTranscode(ctx, pipeline, playback.TranscodeStartup{
 		Budget: localAutoStartupBudgetV3,
 		Start: func(ctx context.Context, opts playback.TranscodeOpts) (*playback.TranscodeSession, error) {
@@ -5860,10 +5918,15 @@ func (h *PlaybackHandler) startReadyAutoLocalPlaybackTransportV3(ctx context.Con
 		},
 	})
 	// The auto walk bounds spawn and per-attempt manifest readiness together.
-	// Readiness is the walk's wall time net of the (possibly multi-attempt) spawn
-	// time already recorded above, so the two phases stay disjoint.
-	spawnAfter := transportPhaseDurationV3(ctx, "transport_spawn")
-	addTransportPhaseDurationV3(ctx, "transport_readiness", time.Since(startedAt)-(spawnAfter-spawnBefore))
+	// Readiness is the walk's wall time net of every span already named during
+	// it: spawn, the upstream reopen, and the virtual transport's inline
+	// first-manifest wait. Spawn is recorded net of the last two, so subtracting
+	// only spawn would count the manifest wait in both transport_manifest and
+	// transport_readiness.
+	addTransportReadinessNetOfWalkV3(ctx, time.Since(startedAt),
+		transportPhaseDurationV3(ctx, "transport_spawn")-spawnBefore,
+		transportPhaseDurationV3(ctx, "transport_upstream")-upstreamBefore,
+		transportPhaseDurationV3(ctx, transportPhaseManifestV3)-manifestBefore)
 	outcome := transportStartupReadyV3
 	var failure *localTransportStartupFailureV3
 	var startupErr *playback.TranscodeStartupError

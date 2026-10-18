@@ -282,3 +282,85 @@ func TestTransportPhaseAutoReadinessIsNetOfSpawn(t *testing.T) {
 		t.Fatalf("transport_readiness = %v, want at least ~%v", readiness, readinessDelay-tolerance)
 	}
 }
+
+// TestTransportPhaseAutoReadinessNetsInlineManifestWait pins that a virtual
+// transport's inline first-manifest wait, recorded inside the start callback as
+// transport_manifest, is not counted again in transport_readiness by the
+// hw_accel=auto walk. The callback below records the phase during its spawn span,
+// exactly where the virtual start path records it.
+func TestTransportPhaseAutoReadinessNetsInlineManifestWait(t *testing.T) {
+	const (
+		spawnDelay     = 300 * time.Millisecond
+		manifestDelay  = 250 * time.Millisecond
+		readinessDelay = 300 * time.Millisecond
+		tolerance      = 120 * time.Millisecond
+	)
+	ctx, _ := withTransportPhaseTimingsV3(context.Background())
+	tempDir := t.TempDir()
+	manifestPath := filepath.Join(tempDir, "stream.m3u8")
+
+	h := &PlaybackHandler{
+		StartTranscodeFunc: func(_ context.Context, opts playback.TranscodeOpts) (*playback.TranscodeSession, error) {
+			time.Sleep(spawnDelay)
+			// Model the virtual start path: it waits for the inline first manifest
+			// and records that wait as transport_manifest before returning.
+			addTransportPhaseDurationV3(ctx, transportPhaseManifestV3, manifestDelay)
+			ts, err := playback.NewReadyTranscodeSessionForTesting(opts.OutputDir, opts)
+			if err != nil {
+				return nil, err
+			}
+			if err := os.Remove(manifestPath); err != nil {
+				return nil, err
+			}
+			go func() {
+				time.Sleep(readinessDelay)
+				tmp := manifestPath + ".tmp"
+				if writeErr := os.WriteFile(tmp, []byte(autoReadinessTestManifestV3), 0o644); writeErr != nil {
+					return
+				}
+				_ = os.Rename(tmp, manifestPath)
+			}()
+			return ts, nil
+		},
+	}
+	opts := playback.TranscodeOpts{
+		InputPath:          "/media/movie.mkv",
+		OutputDir:          tempDir,
+		SessionID:          "auto-net-of-inline-manifest",
+		TargetCodecVideo:   "h264",
+		TargetCodecAudio:   "aac",
+		SegmentDuration:    2,
+		HWAccel:            "nvenc",
+		AudioTrackIndex:    -1,
+		SubtitleTrackIndex: -1,
+	}
+	pipeline := playback.NewResolvedAutoTranscodePipelineForTest(opts)
+
+	begin := time.Now()
+	ts, failure := h.startReadyAutoLocalPlaybackTransportV3(ctx, pipeline)
+	totalWall := time.Since(begin)
+	if failure != nil {
+		t.Fatalf("auto start failed: %+v", failure)
+	}
+	defer func() { _ = ts.Close() }()
+
+	manifest := transportPhaseDurationV3(ctx, transportPhaseManifestV3)
+	spawn := transportPhaseDurationV3(ctx, "transport_spawn")
+	readiness := transportPhaseDurationV3(ctx, "transport_readiness")
+	if diff := manifest - manifestDelay; diff < -tolerance || diff > tolerance {
+		t.Fatalf("transport_manifest = %v, want ~%v", manifest, manifestDelay)
+	}
+	// Spawn is recorded net of the inline manifest wait it performed.
+	if want := spawnDelay - manifestDelay; spawn < want-tolerance || spawn > want+tolerance {
+		t.Fatalf("transport_spawn = %v, want ~%v (net of the inline manifest wait)", spawn, want)
+	}
+	// Readiness excludes both spawn and the inline manifest wait; the buggy
+	// decomposition (wall - spawn) would count the wait a second time.
+	want := totalWall - spawn - manifest
+	if diff := readiness - want; diff < -tolerance || diff > tolerance {
+		t.Fatalf("transport_readiness = %v, want wall-spawn-manifest = %v (diff %v)", readiness, want, diff)
+	}
+	if readiness > totalWall-spawn-tolerance {
+		t.Fatalf("transport_readiness = %v still includes the inline manifest wait (wall-spawn = %v)", readiness, totalWall-spawn)
+	}
+}

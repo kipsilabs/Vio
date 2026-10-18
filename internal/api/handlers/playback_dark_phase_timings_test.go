@@ -2,6 +2,9 @@ package handlers
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -229,5 +232,70 @@ func TestPutRequiredNodeRecipeRecordsAuthorityPhase(t *testing.T) {
 	}
 	if !darkPhaseRecordedV3(t, recorder, transportPhaseAuthorityV3) {
 		t.Fatal("transport_authority was not recorded by a stored node recipe")
+	}
+}
+
+// TestPooledNodeCapabilitiesRecordsBatchWallTime pins that concurrent node
+// capability probes contribute the fan-out's wall time to transport_capability
+// instead of the sum of parallel worker spans. Route resolution nets capability
+// out of its own span, so a summed value could zero route time and exceed the
+// request's wall time.
+func TestPooledNodeCapabilitiesRecordsBatchWallTime(t *testing.T) {
+	const (
+		probes     = 3
+		probeDelay = 150 * time.Millisecond
+	)
+	var (
+		arrivedMu  sync.Mutex
+		arrived    int
+		allArrived = make(chan struct{})
+	)
+	handlerFn := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/hw-capabilities" {
+			http.NotFound(w, r)
+			return
+		}
+		arrivedMu.Lock()
+		arrived++
+		if arrived == probes {
+			close(allArrived)
+		}
+		arrivedMu.Unlock()
+		select {
+		case <-allArrived:
+		case <-time.After(2 * time.Second):
+			http.Error(w, "probe barrier timed out", http.StatusGatewayTimeout)
+			return
+		}
+		time.Sleep(probeDelay)
+		writeJSON(w, http.StatusOK, playback.HWAccelInfo{
+			Transformations: []playback.TransformationV3{{Name: "video_to_h264", Executor: "server", RecipeVersion: "1"}},
+		})
+	})
+	nodeURLs := make([]string, 0, probes)
+	for range probes {
+		server := httptest.NewServer(handlerFn)
+		defer server.Close()
+		nodeURLs = append(nodeURLs, server.URL)
+	}
+
+	h := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	ctx, _ := withTransportPhaseTimingsV3(context.Background())
+	begin := time.Now()
+	capabilities := h.pooledNodeCapabilitiesV3(ctx, nodeURLs)
+	wall := time.Since(begin)
+	if len(capabilities) != probes {
+		t.Fatalf("capabilities = %d nodes, want %d", len(capabilities), probes)
+	}
+
+	capability := transportPhaseDurationV3(ctx, transportPhaseCapabilityV3)
+	if capability >= probes*probeDelay {
+		t.Fatalf("transport_capability = %v, want the batch wall time (below the %v parallel sum)", capability, probes*probeDelay)
+	}
+	if capability < probeDelay/2 {
+		t.Fatalf("transport_capability = %v, want the fan-out's elapsed span", capability)
+	}
+	if capability > wall+100*time.Millisecond {
+		t.Fatalf("transport_capability = %v exceeds the %v fan-out wall time", capability, wall)
 	}
 }
