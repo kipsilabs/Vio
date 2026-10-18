@@ -144,6 +144,23 @@ func (s *VirtualCandidatesRefreshService) DiscoverVirtualCandidates(ctx context.
 	return s.listVirtualCandidates(ctx, userID, profileID, contentID, filter, s.ListCached, "discover:")
 }
 
+// HasVirtualSource reports whether the item holds at least one persisted
+// virtual candidate group. It reads the same server-side rows as discovery,
+// independent of any viewer redaction: catalog detail responses strip file
+// paths for most viewers, so a caller that redacted versions cannot decide
+// eligibility from them. The caller must already have authorized the viewer's
+// access to the item; this lookup is content-keyed and carries no filtering.
+func (s *VirtualCandidatesRefreshService) HasVirtualSource(ctx context.Context, contentID string) (bool, error) {
+	if s == nil {
+		return false, nil
+	}
+	sources, err := s.virtualSources(ctx, contentID)
+	if err != nil {
+		return false, err
+	}
+	return len(sources) > 0, nil
+}
+
 func (s *VirtualCandidatesRefreshService) listVirtualCandidates(ctx context.Context, userID int, profileID, contentID string, filter catalog.AccessFilter, lister VirtualPlaybackStreamLister, keyPrefix string) ([]catalog.FileVersion, error) {
 	if lister == nil || s.Persist == nil || s.Detail == nil {
 		return nil, apiError(http.StatusServiceUnavailable, "unavailable", "Virtual candidate refresh is unavailable")

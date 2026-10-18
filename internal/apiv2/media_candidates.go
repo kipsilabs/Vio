@@ -5,9 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
-	"slices"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/api/handlers"
@@ -32,19 +30,42 @@ type VirtualCandidatesRefreshService interface {
 
 type VirtualCandidatesDiscoveryService interface {
 	DiscoverVirtualCandidates(ctx context.Context, userID int, profileID, contentID string, filter catalogpkg.AccessFilter) ([]catalogpkg.FileVersion, error)
+	HasVirtualSource(ctx context.Context, contentID string) (bool, error)
 }
 
-func (reg *Registry) discoverDetailVersions(ctx context.Context, contentID, mediaType string, versions []catalogpkg.FileVersion, filter catalogpkg.AccessFilter, trigger string) bool {
+const (
+	// preplayDiscoveryWatchBudget bounds version discovery started from
+	// GET /watch/{id}: the caller is preparing to play, so a cold provider
+	// scrape may be waited out before the answer.
+	preplayDiscoveryWatchBudget = 15 * time.Second
+	// preplayDiscoveryCatalogBudget bounds the same discovery started from a
+	// catalog leaf detail read: browsing is the hot path (Android opens item
+	// detail before any watch request), so the answer keeps a short budget
+	// while the discovery service keeps working detached from it.
+	preplayDiscoveryCatalogBudget = 2 * time.Second
+)
+
+func (reg *Registry) discoverDetailVersions(ctx context.Context, contentID, mediaType string, filter catalogpkg.AccessFilter, trigger string, budget time.Duration) bool {
 	claims := claimsFrom(ctx)
 	if claims == nil || (mediaType != themeOwnerMovie && mediaType != themeOwnerEpisode) ||
 		reg.deps.VirtualCandidatesDiscovery == nil || reg.deps.PreplayDiscoveryEnabled == nil ||
-		!reg.deps.PreplayDiscoveryEnabled(ctx) || !slices.ContainsFunc(versions, func(version catalogpkg.FileVersion) bool {
-		return strings.HasPrefix(version.FilePath, "virtual://")
-	}) {
+		!reg.deps.PreplayDiscoveryEnabled(ctx) {
+		return false
+	}
+	// Eligibility reads the stored rows server-side instead of the caller's
+	// (possibly path-redacted) version list, so ordinary viewers reach the
+	// same discovery the watch path performs.
+	virtual, err := reg.deps.VirtualCandidatesDiscovery.HasVirtualSource(ctx, contentID)
+	if err != nil {
+		slog.WarnContext(ctx, "pre-play version discovery skipped", "component", "apiv2", "item_id", contentID,
+			"trigger", trigger, "reason", "eligibility_lookup_failed", "error", err)
+		return false
+	}
+	if !virtual {
 		return false
 	}
 	started := time.Now()
-	discoveryCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	discoveryCtx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 	slog.InfoContext(ctx, "pre-play version discovery started", "component", "apiv2", "item_id", contentID, "trigger", trigger)
 	discovered, err := reg.deps.VirtualCandidatesDiscovery.DiscoverVirtualCandidates(

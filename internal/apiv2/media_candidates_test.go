@@ -94,6 +94,10 @@ func (f *fakeVirtualCandidatesRefresh) DiscoverVirtualCandidates(_ context.Conte
 	return nil, f.err
 }
 
+func (f *fakeVirtualCandidatesRefresh) HasVirtualSource(_ context.Context, _ string) (bool, error) {
+	return true, nil
+}
+
 func TestDiscoverVirtualCandidatesSettingAndAccess(t *testing.T) {
 	for _, enabled := range []bool{false, true} {
 		discovery := &fakeVirtualCandidatesRefresh{}

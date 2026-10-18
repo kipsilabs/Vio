@@ -1198,6 +1198,20 @@ func (reg *Registry) getCatalogItem(ctx context.Context, in *CatalogItemDeviceIn
 	if err != nil {
 		return nil, serviceProblem(err)
 	}
+	// A leaf detail (movie or individual episode, never a series, season or
+	// list) may discover and persist the item's provider versions in the same
+	// answer, so clients that only read catalog detail — Android among them —
+	// still see versions before pressing Play. Discovery failure keeps the
+	// original detail; a detached shared listing becomes visible on a later
+	// read.
+	if detail != nil && reg.discoverDetailVersions(ctx, detail.ContentID, detail.Type, viewer.Access, "catalog_detail", preplayDiscoveryCatalogBudget) {
+		refreshed, refreshErr := svc.ItemDetail(ctx, viewer, in.ID)
+		if refreshErr == nil && refreshed != nil {
+			detail = refreshed
+		} else {
+			slog.WarnContext(ctx, "pre-play version discovery detail reload failed", "component", "apiv2", "item_id", detail.ContentID, "trigger", "catalog_detail")
+		}
+	}
 	out := catalogItemDetailOf(detail, reg.ratingSelection(ctx))
 	out.Collections = NonNil(reg.itemCollections(ctx, detail, viewer.Access))
 	if reg.deps.ThemeSongs != nil && (detail.Type == themeOwnerMovie || detail.Type == themeOwnerSeries || detail.Type == themeOwnerSeason || detail.Type == themeOwnerEpisode) {
