@@ -5064,26 +5064,15 @@ func refreshVirtualPersistArgsForRow(args models.VirtualFilePersistArgs, current
 	return args
 }
 
-// virtualPersistSnapshotMoved reports whether refreshing the snapshot changed
-// anything. A write is retried only when the row actually moved; an unchanged
-// snapshot retries nothing.
+// virtualPersistSnapshotMoved reports whether the row moved to a different
+// candidate token since the caller's snapshot. Only a churned file_path (the
+// provider's per-listing ?result= token) authorizes the retry: a matching
+// provider-neutral key proves it is the same item/profile, not that this
+// writer may adopt a newer evidence revision another transaction committed.
+// A revision-only advance therefore keeps the caller's snapshot and the CAS
+// still refuses it.
 func virtualPersistSnapshotMoved(args, refreshed models.VirtualFilePersistArgs) bool {
-	if args.ExpectedFilePath != refreshed.ExpectedFilePath ||
-		args.OwnerID != refreshed.OwnerID ||
-		args.LibraryID != refreshed.LibraryID ||
-		args.ExpectedProviderVideoHash != refreshed.ExpectedProviderVideoHash ||
-		args.ExpectedProviderGUID != refreshed.ExpectedProviderGUID ||
-		args.ExpectedProviderReleaseName != refreshed.ExpectedProviderReleaseName ||
-		args.ExpectedProviderReleaseSize != refreshed.ExpectedProviderReleaseSize {
-		return true
-	}
-	if !args.UpdatedAt.Equal(refreshed.UpdatedAt) {
-		return true
-	}
-	if (args.ProbeUpdatedAt == nil) != (refreshed.ProbeUpdatedAt == nil) {
-		return true
-	}
-	return args.ProbeUpdatedAt != nil && !args.ProbeUpdatedAt.Equal(*refreshed.ProbeUpdatedAt)
+	return args.ExpectedFilePath != refreshed.ExpectedFilePath
 }
 
 // persistVirtualMetadataBounded admits a probe-evidence write into the
