@@ -777,6 +777,56 @@ func TestEffectiveClientFamilyIsOptionalButValidated(t *testing.T) {
 	})
 }
 
+// TestEffectiveReadResolvesUnwatchedSpoilerKeys guards the contract gap that
+// stalled client episode lists: clients built against upstream contract
+// revision 17 resolve catalog.hide_unwatched_episode_images and
+// catalog.hide_unwatched_episode_overviews on episode surfaces, and an
+// unknown key fails the whole effective read instead of resolving to the
+// false default.
+func TestEffectiveReadResolvesUnwatchedSpoilerKeys(t *testing.T) {
+	handler, _ := newValuesTestHandler(t)
+	keys := []string{
+		settingskeys.CatalogHideUnwatchedEpisodeImages,
+		settingskeys.CatalogHideUnwatchedEpisodeOverviews,
+	}
+
+	req := valuesRequest(http.MethodGet, "/settings/values/effective?keys="+strings.Join(keys, ","), nil)
+	rec := httptest.NewRecorder()
+	handler.HandleGetEffective(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("effective read of unwatched spoiler keys = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var body struct {
+		Settings []effectiveSettingValueResponse `json:"settings"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode effective response: %v", err)
+	}
+	if len(body.Settings) != len(keys) {
+		t.Fatalf("settings = %d, want %d", len(body.Settings), len(keys))
+	}
+	seen := make(map[string]int, len(keys))
+	for _, got := range body.Settings {
+		if !slices.Contains(keys, got.Key) {
+			t.Errorf("unexpected key %q", got.Key)
+			continue
+		}
+		seen[got.Key]++
+		if string(got.Value) != `false` {
+			t.Errorf("%s = %s, want false", got.Key, got.Value)
+		}
+		if got.Source != string(settingscontract.ScopeDefault) {
+			t.Errorf("%s source = %s, want default", got.Key, got.Source)
+		}
+	}
+	for _, key := range keys {
+		if seen[key] != 1 {
+			t.Errorf("%s appears %d times, want exactly once", key, seen[key])
+		}
+	}
+}
+
 func TestGetSettingValuesReportsSetAndUnsetAtOneScope(t *testing.T) {
 	handler, store := newValuesTestHandler(t)
 	if _, err := store.UpsertSettingValue(context.Background(), userstore.SettingIdentity{
