@@ -4457,9 +4457,12 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 			// a second probe cannot be started only to be truncated by the
 			// deadline.
 			//
-			// An upstream 5xx is a transient provider failure: it is retried the
-			// same way, but only after a short bounded backoff, so a provider
-			// that is already failing is not hammered by an immediate re-probe.
+			// An upstream 5xx and a probe signal-killed from outside (the OOM
+			// killer or an operator) are transient failures: they are retried
+			// the same way, but only after a short bounded backoff, so a
+			// provider that is already failing is not hammered by an immediate
+			// re-probe. A caller cancellation never reaches this branch: the
+			// loop stops before scheduling a retry.
 			retryReserved := copySeekAnchorRetryReserved(ctx)
 			lastProbedInput := ""
 			var err error

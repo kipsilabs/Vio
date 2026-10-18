@@ -3718,6 +3718,106 @@ func TestPrepareTransportV3CopyAnchorGenericFailureDoesNotBackOff(t *testing.T) 
 	}
 }
 
+// TestPrepareTransportV3CopyAnchorRetriesAfterExternalKill proves the live
+// production failure is bounded-recoverable: the first probe process is
+// SIGKILLed from outside (the OOM killer or an operator), which is not a verdict
+// about the release, so the transient classification triggers exactly one retry
+// and the second, healthy probe completes the start.
+func TestPrepareTransportV3CopyAnchorRetriesAfterExternalKill(t *testing.T) {
+	dir := t.TempDir()
+	ffmpegPath := filepath.Join(dir, "ffmpeg")
+	firstProbePath := filepath.Join(dir, "first-probe-done")
+	probe := `#!/bin/sh
+if [ ! -f "` + firstProbePath + `" ]; then
+  printf x > "` + firstProbePath + `"
+  kill -9 $$
+fi
+printf '%s\n' '#tb 0: 1/1000'
+printf '%s\n' '0,      118000,      120000,       41,   178989, 0xd16e41c4'
+`
+	if err := os.WriteFile(ffmpegPath, []byte(probe), 0o755); err != nil {
+		t.Fatalf("write fake ffmpeg: %v", err)
+	}
+
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	handler.JWTSecret = "test-secret"
+	probeCalls := 0
+	handler.copySeekAnchor = func(ctx context.Context, _ string, inputPath string, requested float64, segmentDuration int) (float64, int, error) {
+		probeCalls++
+		return playback.ResolveCopySeekAnchor(ctx, ffmpegPath, inputPath, requested, segmentDuration)
+	}
+	backoffCalls := 0
+	handler.copySeekAnchorBackoff = func(context.Context, time.Duration) bool {
+		backoffCalls++
+		return true
+	}
+	plan := &playback.PlanV3{
+		PlanID:               "plan:copy-external-kill",
+		Delivery:             playback.DeliveryRemuxProgressiveV3,
+		EffectiveMediaFileID: 42,
+		Timeline:             playback.TimelineV3{SourceStartSeconds: 120, PlayerStartSeconds: 120, CanSeekAnywhere: true, SeekRestoration: "player_position"},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	ctx, cancel := context.WithTimeout(req.Context(), time.Minute)
+	defer cancel()
+	transport, transportErr := handler.prepareTransportV3(
+		req.WithContext(ctx),
+		&playback.Session{ID: "session-copy-external-kill", UserID: 7, ProfileID: "profile-1", MediaFileID: 42, PlayMethod: playback.PlayRemux, BasePlayMethod: playback.PlayRemux},
+		&models.MediaFile{ID: 42, FilePath: "/media/movie.mkv"},
+		playback.PlannerResultV3{Plan: plan, PlayMethod: playback.PlayRemux}, mediaAuthModeV3{})
+	if transportErr != nil {
+		t.Fatalf("prepare transport after an external kill: %v", transportErr)
+	}
+	defer transport.rollback()
+	if probeCalls != 2 {
+		t.Fatalf("copy anchor probes = %d, want 2 (one bounded retry after the kill)", probeCalls)
+	}
+	if backoffCalls != 1 {
+		t.Fatalf("backoffs = %d, want exactly 1 before the retry", backoffCalls)
+	}
+	if firstProbe, err := os.ReadFile(firstProbePath); err != nil || string(firstProbe) != "x" {
+		t.Fatalf("first probe marker = %q, %v; want the killed first attempt", firstProbe, err)
+	}
+}
+
+// TestPrepareTransportV3CopyAnchorCallerCanceledProbeIsNotRetried pins that a
+// caller cancellation stays distinct from a transient probe failure: even when
+// the probe reports the transient class, the loop must observe the canceled
+// caller context and return instead of spending the bounded retry on a request
+// nobody is waiting for.
+func TestPrepareTransportV3CopyAnchorCallerCanceledProbeIsNotRetried(t *testing.T) {
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	probeCalls := 0
+	handler.copySeekAnchor = func(context.Context, string, string, float64, int) (float64, int, error) {
+		probeCalls++
+		cancel()
+		return 0, 0, fmt.Errorf("%w: exit status 137 (stderr: signal: killed)", playback.ErrTransientProvider)
+	}
+	backoffCalls := 0
+	handler.copySeekAnchorBackoff = func(context.Context, time.Duration) bool {
+		backoffCalls++
+		return true
+	}
+	plan := &playback.PlanV3{PlanID: "plan:copy-caller-canceled", Delivery: playback.DeliveryRemuxHLSV3, Timeline: playback.TimelineV3{SourceStartSeconds: 120}}
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	_, transportErr := handler.prepareTransportV3(
+		req.WithContext(ctx),
+		&playback.Session{ID: "session-copy-caller-canceled"},
+		&models.MediaFile{ID: 42, FilePath: "/media/movie.mkv"},
+		playback.PlannerResultV3{Plan: plan, PlayMethod: playback.PlayRemux}, mediaAuthModeV3{})
+	if probeCalls != 1 {
+		t.Fatalf("copy anchor probes = %d, want exactly 1 after caller cancellation", probeCalls)
+	}
+	if backoffCalls != 0 {
+		t.Fatalf("backoffs = %d, want 0 for a canceled caller", backoffCalls)
+	}
+	if transportErr == nil || transportErr.reason != "transcode_start_failed" {
+		t.Fatalf("transport error = %#v, want the canceled start to return", transportErr)
+	}
+}
+
 func TestPrepareTransportV3RejectsNodeMissingRequiredTransformation(t *testing.T) {
 	startHits := 0
 	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
