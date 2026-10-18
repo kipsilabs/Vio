@@ -4749,14 +4749,28 @@ func TestRouteEventV3AcceptsAndroidSeekEvents(t *testing.T) {
 	}
 }
 
-func TestRemapSubtitleSelectionV3RejectsNegativeIndex(t *testing.T) {
-	index := -1
-	request := playback.StartRequestV3{SubtitleTrackIndex: &index}
+// TestRemapSubtitleSelectionV3PreservesExplicitOff pins that the explicit-off
+// sentinel survives a version change untouched: -1 names no track, so there is
+// nothing to remap and it must not be reinterpreted against the target's
+// inventory. A value below the sentinel stays invalid.
+func TestRemapSubtitleSelectionV3PreservesExplicitOff(t *testing.T) {
+	off := playback.SubtitleTrackOffIndexV3
+	request := playback.StartRequestV3{SubtitleTrackIndex: &off}
 	source := &models.MediaFile{ID: 1, ExternalSubtitles: []models.ExternalSubtitle{{Language: "eng", Format: "srt"}}}
 	target := &models.MediaFile{ID: 2, ExternalSubtitles: []models.ExternalSubtitle{{Language: "eng", Format: "srt"}}}
 	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	dropped, err := handler.remapSubtitleSelectionV3(context.Background(), source, target, &request)
+	if err != nil || dropped {
+		t.Fatalf("explicit off remap = (dropped=%v, err=%v), want it preserved", dropped, err)
+	}
+	if request.SubtitleTrackIndex == nil || *request.SubtitleTrackIndex != playback.SubtitleTrackOffIndexV3 {
+		t.Fatalf("explicit off remap mutated the selection to %v", request.SubtitleTrackIndex)
+	}
+
+	invalid := playback.SubtitleTrackOffIndexV3 - 1
+	request = playback.StartRequestV3{SubtitleTrackIndex: &invalid}
 	if _, err := handler.remapSubtitleSelectionV3(context.Background(), source, target, &request); err == nil {
-		t.Fatal("negative subtitle index was accepted")
+		t.Fatal("subtitle index below the off sentinel was accepted")
 	}
 }
 

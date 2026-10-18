@@ -250,4 +250,30 @@ func TestHandleStartPlaybackV3StaleSelectedTrackIdentityDegrades(t *testing.T) {
 			t.Fatalf("status = %d, want 400; body = %s", rr.Code, rr.Body.String())
 		}
 	})
+
+	// The pre-drop structural check must reject a malformed pair before the
+	// stale drop can clear it into a plain omission: a negative subtitle index
+	// other than the off sentinel, or the off sentinel paired with any identity,
+	// is malformed whatever file the id names.
+	t.Run("malformed subtitle index behind any identity still rejected", func(t *testing.T) {
+		for _, index := range []int{playback.SubtitleTrackOffIndexV3, playback.SubtitleTrackOffIndexV3 - 1} {
+			for _, identity := range []string{"same-file", "stale-file", "malformed"} {
+				handler, file := newHandler(t)
+				idx := index
+				req := v3HandlerStartRequest()
+				req.SubtitleTrackIndex = &idx
+				switch identity {
+				case "same-file":
+					req.SubtitleTrackID = playback.TrackIDV3(file.ID, "subtitle", 0)
+				case "stale-file":
+					req.SubtitleTrackID = playback.TrackIDV3(file.ID+9999, "subtitle", 0)
+				default:
+					req.SubtitleTrackID = "not-a-track-id"
+				}
+				if rr := start(t, handler, req); rr.Code != http.StatusBadRequest {
+					t.Fatalf("%s subtitle id with index %d: status = %d, want 400; body = %s", identity, index, rr.Code, rr.Body.String())
+				}
+			}
+		}
+	})
 }

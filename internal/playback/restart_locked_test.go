@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -493,5 +494,102 @@ func TestRestartRotationDoesNotLeakAcrossRestarts(t *testing.T) {
 	}
 	if firstReleases != 1 || secondReleases != 1 {
 		t.Fatalf("superseded cleanups ran again after close: token-0=%d token-1=%d, want 1 each", firstReleases, secondReleases)
+	}
+}
+
+// TestRestartSessionLockedSupersededWhenClosedFirst proves a close that
+// unregisters the session before the restart starts makes the restart refuse
+// with ErrSessionSuperseded and never re-spawn ffmpeg.
+func TestRestartSessionLockedSupersededWhenClosedFirst(t *testing.T) {
+	m := NewTranscodeManager()
+	s := newFakeFFmpegSession(t)
+	const sid = "sess-x"
+	m.RegisterTranscodeSession(sid, s)
+	t.Cleanup(func() { _ = s.Close() })
+
+	m.CloseTranscodeSession(sid, "")
+
+	err := m.RestartSessionLocked(context.Background(), sid, s, 0, 0)
+	if !errors.Is(err, ErrSessionSuperseded) {
+		t.Fatalf("restart after close = %v, want ErrSessionSuperseded", err)
+	}
+	if s.IsRunning() {
+		t.Fatal("a restart after a close must not spawn ffmpeg")
+	}
+}
+
+// TestRestartSessionLockedSupersededWhenClosedMidRestart proves the restart's
+// liveness re-check stops a replacement that a stop unregistered after the
+// manager's guard but before the spawn: the restart returns ErrSessionSuperseded
+// and spawns no ffmpeg.
+func TestRestartSessionLockedSupersededWhenClosedMidRestart(t *testing.T) {
+	m := NewTranscodeManager()
+	s := newFakeFFmpegSession(t)
+	const sid = "sess-x"
+	s.opts.InputPath = "/media/movie.mkv"
+	m.RegisterTranscodeSession(sid, s)
+	t.Cleanup(func() { _ = s.Close() })
+
+	// Pause the restart after the guard and before the spawn so the close lands
+	// in the exact window the liveness re-check exists to cover.
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	s.opts.RefreshInput = func(context.Context) (string, func(), error) {
+		once.Do(func() { close(entered) })
+		<-release
+		return "/media/movie.mkv", nil, nil
+	}
+
+	restartDone := make(chan error, 1)
+	go func() { restartDone <- m.RestartSessionLocked(context.Background(), sid, s, 0, 0) }()
+	<-entered
+
+	m.CloseTranscodeSession(sid, "")
+	close(release)
+
+	err := <-restartDone
+	if !errors.Is(err, ErrSessionSuperseded) {
+		t.Fatalf("restart closed mid-flight = %v, want ErrSessionSuperseded", err)
+	}
+	if s.IsRunning() {
+		t.Fatal("a restart superseded mid-flight must not leave ffmpeg running")
+	}
+}
+
+// TestCloseTranscodeSessionDuringRestartKillsReplacement proves a close landing
+// after a restart spawned cannot leave the replacement ffmpeg running: the close
+// stops the process the restart produced.
+func TestCloseTranscodeSessionDuringRestartKillsReplacement(t *testing.T) {
+	m := NewTranscodeManager()
+	s := newFakeFFmpegSession(t)
+	const sid = "sess-x"
+	m.RegisterTranscodeSession(sid, s)
+	t.Cleanup(func() { _ = s.Close() })
+
+	hookEntered := make(chan struct{})
+	hookRelease := make(chan struct{})
+	s.SetRestartHook(func(context.Context) {
+		close(hookEntered)
+		<-hookRelease
+	})
+
+	restartDone := make(chan error, 1)
+	go func() { restartDone <- m.RestartSessionLocked(context.Background(), sid, s, 0, 0) }()
+	<-hookEntered // the restart has spawned ffmpeg and is past its liveness checks
+
+	// The close unregisters and stops the session while the restart is still in
+	// its critical section.
+	m.CloseTranscodeSession(sid, "")
+	close(hookRelease)
+	if err := <-restartDone; err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+
+	if m.GetTranscodeSession(sid) != nil {
+		t.Fatal("session still registered after close")
+	}
+	if s.IsRunning() {
+		t.Fatal("the restart's replacement ffmpeg survived the close")
 	}
 }

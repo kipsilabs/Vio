@@ -302,6 +302,17 @@ and `terminal.retryable: true`; mint a new attempt. Local direct and HLS media
 URLs in the plan are projected into the `/api/v2` namespace; the signed `st`
 query they carry is unchanged.
 
+When the profile's stored `playback.subtitle_mode` is `always`, an omitted
+`subtitle_track_id` / `subtitle_track_index` on start resolves to the stored
+preference's track before planning, so subtitles are on — and a bitmap track
+forces the burn-in video codec — on the first plan rather than after a
+reconciliation replan. `subtitle_track_index: -1` is the explicit-off encoding:
+it requests a one-off subtitle-free start without changing the stored mode, and
+overrides `always`. Omission (the field absent) remains "no selection intent"
+and is never read as off; a named track is never overridden; a stored mode other
+than `always` (including the off state) leaves the selection to the client on
+omission.
+
 A start that returns a playable decision registers the device the client
 declares in `X-Silo-Device-Id` (with the optional `X-Silo-Device-Name` and
 `X-Silo-Device-Platform`) for the acting profile and refreshes its
