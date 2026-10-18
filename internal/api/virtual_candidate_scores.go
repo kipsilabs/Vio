@@ -41,14 +41,21 @@ func virtualCandidateScoreSource(service virtualCandidateLister) catalog.Virtual
 			return nil
 		}
 		byURI := make(map[string]catalog.VirtualCandidateScore, len(streams))
-		for _, stream := range streams {
+		providerOrder := make(map[string]*int)
+		for i, stream := range streams {
 			// Zero is the unscored/neutral sum; the wire fields are omitted
-			// for it, so it must not be recorded as a real score.
-			if stream.QualityScore != 0 {
-				byURI[stream.URI] = catalog.VirtualCandidateScore{
+			// for it. Provider-order positions still travel through this port
+			// without becoming format scores on the wire.
+			if stream.QualityScore != 0 || stream.PreserveProviderOrder {
+				score := catalog.VirtualCandidateScore{
 					Score:          stream.QualityScore,
 					MatchedFormats: stream.MatchedFormats,
 				}
+				if stream.PreserveProviderOrder {
+					score.ProviderOrder = &i
+					providerOrder[virtualProviderOrderKey(stream.URI)] = &i
+				}
+				byURI[stream.URI] = score
 			}
 		}
 		if len(byURI) == 0 {
@@ -61,6 +68,8 @@ func virtualCandidateScoreSource(service virtualCandidateLister) catalog.Virtual
 			}
 			if score, ok := byURI[file.FilePath]; ok {
 				scores[file.ID] = score
+			} else if position, ok := providerOrder[virtualProviderOrderKey(file.FilePath)]; ok {
+				scores[file.ID] = catalog.VirtualCandidateScore{ProviderOrder: position}
 			}
 		}
 		if len(scores) == 0 {
@@ -68,6 +77,20 @@ func virtualCandidateScoreSource(service virtualCandidateLister) catalog.Virtual
 		}
 		return scores
 	}
+}
+
+// Profile views share the same provider response and candidate IDs. Removing
+// only the profile selector lets every view retain that provider order.
+func virtualProviderOrderKey(rawURI string) string {
+	parsed, err := url.Parse(rawURI)
+	if err != nil {
+		return rawURI
+	}
+	query := parsed.Query()
+	query.Del("profile")
+	query.Del("results")
+	parsed.RawQuery = query.Encode()
+	return parsed.String()
 }
 
 // virtualRankingResolver is the slice of *virtuallibrary.Service the ranking

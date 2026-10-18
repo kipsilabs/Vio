@@ -85,6 +85,20 @@ declared disposition. Synthesized or hint-only tracks (container index < 0) neve
 satisfy completeness and never stamp `probe_updated_at`; persisted probe evidence
 requires a real stream index.
 
+## Provider stream order
+
+Setting `virtual_library.custom_format_preset` to `server-order` preserves the
+Stremio provider's candidate order for listing, refresh, and automatic selection.
+It bypasses custom-format scoring, rejection, profile sorting, and confirmed-source
+promotion, including promotion before the selectable candidate cap. Saved format
+weights remain available when another preset is selected. Failed-source filtering,
+release deduplication, URL validation, quality-profile filters, and explicit
+candidate pins still apply. The playback picker also bypasses device, probed-source,
+and sticky-result promotion. Watch responses carry the provider order into version
+lists and default selection; a viewer's explicit selection or display-sort override
+still wins. Local files retain their existing positions. Indexer release ranking is
+unaffected.
+
 ## Indexer-only releases
 
 A title can exist at the indexers before the streaming provider has cached it.

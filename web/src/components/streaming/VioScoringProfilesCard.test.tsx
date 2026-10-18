@@ -18,6 +18,11 @@ if (typeof globalThis.ResizeObserver === "undefined") {
     ResizeObserverStub;
 }
 
+if (!window.HTMLElement.prototype.hasPointerCapture) {
+  window.HTMLElement.prototype.hasPointerCapture = () => false;
+  window.HTMLElement.prototype.scrollIntoView = () => {};
+}
+
 function makeForm(values: Record<string, string>) {
   return {
     getValue: (key: string) => values[key],
@@ -77,5 +82,25 @@ describe("VioScoringProfilesCard sort summary", () => {
     expect(screen.getByText("size ↓")).toBeInTheDocument();
     expect(screen.getByText("bitrate ↑")).toBeInTheDocument();
     expect(screen.getByText("Default order")).toBeInTheDocument();
+  });
+});
+
+describe("VioScoringProfilesCard server order", () => {
+  it("lets admins trust the provider order without replacing custom weights", async () => {
+    const user = userEvent.setup();
+    const values = {
+      "virtual_library.custom_format_preset": "custom",
+      "virtual_library.custom_formats":
+        '[{"id":"saved","name":"Saved rule","category":"custom","pattern":"saved","patternType":"token","enabled":true,"score":50}]',
+    };
+    const form = makeForm(values);
+    const { rerender } = render(<VioScoringProfilesCard form={form} defaultExpanded />);
+    await user.click(screen.getByRole("combobox", { name: "Custom format preset" }));
+    await user.click(screen.getByRole("option", { name: "Trust server order" }));
+    expect(values["virtual_library.custom_format_preset"]).toBe("server-order");
+    expect(values["virtual_library.custom_formats"]).toContain("saved");
+    rerender(<VioScoringProfilesCard form={form} defaultExpanded />);
+    expect(screen.getByText(/Keep streams in the order returned/)).toBeInTheDocument();
+    expect(screen.queryByText("Saved rule")).not.toBeInTheDocument();
   });
 });

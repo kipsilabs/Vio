@@ -76,6 +76,7 @@ export function VioScoringProfilesCard({
   const customFormatPreset =
     form.getValue("virtual_library.custom_format_preset") || "altmount-recommended";
   const rawFormats = form.getValue("virtual_library.custom_formats");
+  const trustServerOrder = customFormatPreset === "server-order";
 
   const formats: CustomFormatRule[] = useMemo(() => {
     if (rawFormats && rawFormats.trim()) {
@@ -127,8 +128,8 @@ export function VioScoringProfilesCard({
   };
 
   const handlePresetChange = (newPreset: string) => {
-    if (newPreset === "custom") {
-      form.setValue("virtual_library.custom_format_preset", "custom");
+    if (newPreset === "custom" || newPreset === "server-order") {
+      form.setValue("virtual_library.custom_format_preset", newPreset);
       return;
     }
     const defaultFormats = getDefaultFormatsForPreset(newPreset);
@@ -264,7 +265,7 @@ export function VioScoringProfilesCard({
                 type="button"
                 variant="default"
                 size="sm"
-                disabled={disabled}
+                disabled={disabled || trustServerOrder}
                 onClick={() => {
                   setEditingFormat(null);
                   setShowFormatModal(true);
@@ -304,7 +305,7 @@ export function VioScoringProfilesCard({
                   Custom format preset
                 </Label>
                 <p className="text-muted-foreground text-xs">
-                  Community-curated VIO format scoring baseline or fine-tuned custom weights.
+                  Choose format scoring or keep the Stremio server’s stream order.
                 </p>
               </div>
               <Select
@@ -320,6 +321,7 @@ export function VioScoringProfilesCard({
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
+                  <SelectItem value="server-order">Trust server order</SelectItem>
                   <SelectItem value="altmount-recommended">
                     🏆 Vio Recommended (Remux & HDR Priority)
                   </SelectItem>
@@ -334,164 +336,180 @@ export function VioScoringProfilesCard({
               </Select>
             </div>
 
-            {/* Category Filter Pills */}
-            <div className="flex flex-wrap items-center gap-1.5 border-b pb-3">
-              {[
-                { id: "all", label: "All Formats" },
-                { id: "source", label: "Source" },
-                { id: "hdr", label: "HDR" },
-                { id: "audio", label: "Audio" },
-                { id: "release_group", label: "Release Group" },
-                { id: "resolution", label: "Resolution" },
-                { id: "custom", label: "Custom Rules" },
-              ].map((tab) => (
-                <button
-                  key={tab.id}
-                  type="button"
-                  onClick={() => setActiveCategory(tab.id)}
-                  className={`rounded-lg px-2.5 py-1 text-xs font-medium transition-colors ${
-                    activeCategory === tab.id
-                      ? "bg-primary text-primary-foreground shadow-xs"
-                      : "text-muted-foreground hover:bg-muted hover:text-foreground"
-                  }`}
-                >
-                  {tab.label}
-                </button>
-              ))}
-            </div>
+            {trustServerOrder ? (
+              <p className="text-muted-foreground text-sm">
+                Keep streams in the order returned by the Stremio server. Format scores, profile
+                sorting, and confirmed-source priority do not reorder streams. Quality profile
+                filters still apply.
+              </p>
+            ) : (
+              <>
+                {/* Category Filter Pills */}
+                <div className="flex flex-wrap items-center gap-1.5 border-b pb-3">
+                  {[
+                    { id: "all", label: "All Formats" },
+                    { id: "source", label: "Source" },
+                    { id: "hdr", label: "HDR" },
+                    { id: "audio", label: "Audio" },
+                    { id: "release_group", label: "Release Group" },
+                    { id: "resolution", label: "Resolution" },
+                    { id: "custom", label: "Custom Rules" },
+                  ].map((tab) => (
+                    <button
+                      key={tab.id}
+                      type="button"
+                      onClick={() => setActiveCategory(tab.id)}
+                      className={`rounded-lg px-2.5 py-1 text-xs font-medium transition-colors ${
+                        activeCategory === tab.id
+                          ? "bg-primary text-primary-foreground shadow-xs"
+                          : "text-muted-foreground hover:bg-muted hover:text-foreground"
+                      }`}
+                    >
+                      {tab.label}
+                    </button>
+                  ))}
+                </div>
 
-            {/* Table */}
-            <div className="border-border/70 overflow-x-auto rounded-xl border">
-              <table className="w-full text-left text-xs">
-                <thead className="bg-muted/60 text-muted-foreground border-b text-[11px] font-semibold tracking-wider uppercase">
-                  <tr>
-                    <th className="w-12 px-3 py-2.5 text-center">Active</th>
-                    <th className="min-w-40 px-3 py-2.5">Custom Format Tag</th>
-                    <th className="w-28 px-3 py-2.5">Category</th>
-                    <th className="w-28 px-3 py-2.5 text-center">Score</th>
-                    <th className="min-w-48 px-3 py-2.5">Weight Adjustment</th>
-                    <th className="w-16 px-3 py-2.5 text-right">Actions</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-border/40 divide-y">
-                  {filteredFormats.length === 0 ? (
-                    <tr>
-                      <td colSpan={6} className="text-muted-foreground py-8 text-center text-xs">
-                        No custom formats found in this category.
-                      </td>
-                    </tr>
-                  ) : (
-                    filteredFormats.map((format) => {
-                      const isDiscard = format.score <= -1500 || format.reject;
-                      return (
-                        <tr
-                          key={format.id}
-                          className={`hover:bg-muted/30 transition-colors ${
-                            !format.enabled ? "opacity-45" : ""
-                          }`}
-                        >
-                          <td className="px-3 py-2 text-center">
-                            <Switch
-                              checked={format.enabled}
-                              disabled={disabled}
-                              onCheckedChange={(val) => handleFormatToggle(format.id, val)}
-                            />
-                          </td>
-                          <td className="px-3 py-2">
-                            <div className="font-semibold">{format.name}</div>
-                            <div className="text-muted-foreground max-w-xs truncate font-mono text-[10px]">
-                              {format.pattern}
-                            </div>
-                          </td>
-                          <td className="px-3 py-2">
-                            <span
-                              className={`inline-flex rounded-md border px-2 py-0.5 text-[10px] font-semibold tracking-wider uppercase ${
-                                CATEGORY_COLORS[format.category] || CATEGORY_COLORS.custom
-                              }`}
-                            >
-                              {format.category.replace("_", " ")}
-                            </span>
-                          </td>
-                          <td className="px-3 py-2 text-center">
-                            {isDiscard ? (
-                              <Badge variant="destructive" className="text-[10px] font-semibold">
-                                🚫 Discard
-                              </Badge>
-                            ) : (
-                              <Badge
-                                variant={
-                                  format.score > 0
-                                    ? "default"
-                                    : format.score < 0
-                                      ? "secondary"
-                                      : "outline"
-                                }
-                                className={`font-mono text-[11px] font-semibold ${
-                                  format.score > 0
-                                    ? "bg-green-600/15 text-green-700 hover:bg-green-600/20 dark:text-green-300"
-                                    : format.score < 0
-                                      ? "bg-amber-600/15 text-amber-700 hover:bg-amber-600/20 dark:text-amber-300"
-                                      : ""
-                                }`}
-                              >
-                                {format.score > 0 ? `+${format.score}` : format.score} pts
-                              </Badge>
-                            )}
-                          </td>
-                          <td className="px-3 py-2">
-                            <div className="flex items-center gap-3">
-                              <Slider
-                                min={-2000}
-                                max={1000}
-                                step={25}
-                                value={[format.score]}
-                                disabled={disabled || !format.enabled}
-                                onValueChange={([val]) =>
-                                  handleFormatScoreChange(format.id, val ?? format.score)
-                                }
-                                className="w-36"
-                              />
-                              <span className="text-muted-foreground font-mono text-[10px]">
-                                {format.score}
-                              </span>
-                            </div>
-                          </td>
-                          <td className="px-3 py-2 text-right">
-                            <div className="flex items-center justify-end gap-1">
-                              <Button
-                                type="button"
-                                variant="ghost"
-                                size="sm"
-                                className="size-7 p-0"
-                                onClick={() => {
-                                  setEditingFormat(format);
-                                  setShowFormatModal(true);
-                                }}
-                                title="Edit rule"
-                              >
-                                <Edit2 className="size-3.5" />
-                              </Button>
-                              {format.isCustom && (
-                                <Button
-                                  type="button"
-                                  variant="ghost"
-                                  size="sm"
-                                  className="text-destructive hover:bg-destructive/10 size-7 p-0"
-                                  onClick={() => handleDeleteFormat(format.id)}
-                                  title="Delete custom rule"
-                                >
-                                  <Trash2 className="size-3.5" />
-                                </Button>
-                              )}
-                            </div>
+                {/* Table */}
+                <div className="border-border/70 overflow-x-auto rounded-xl border">
+                  <table className="w-full text-left text-xs">
+                    <thead className="bg-muted/60 text-muted-foreground border-b text-[11px] font-semibold tracking-wider uppercase">
+                      <tr>
+                        <th className="w-12 px-3 py-2.5 text-center">Active</th>
+                        <th className="min-w-40 px-3 py-2.5">Custom Format Tag</th>
+                        <th className="w-28 px-3 py-2.5">Category</th>
+                        <th className="w-28 px-3 py-2.5 text-center">Score</th>
+                        <th className="min-w-48 px-3 py-2.5">Weight Adjustment</th>
+                        <th className="w-16 px-3 py-2.5 text-right">Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-border/40 divide-y">
+                      {filteredFormats.length === 0 ? (
+                        <tr>
+                          <td
+                            colSpan={6}
+                            className="text-muted-foreground py-8 text-center text-xs"
+                          >
+                            No custom formats found in this category.
                           </td>
                         </tr>
-                      );
-                    })
-                  )}
-                </tbody>
-              </table>
-            </div>
+                      ) : (
+                        filteredFormats.map((format) => {
+                          const isDiscard = format.score <= -1500 || format.reject;
+                          return (
+                            <tr
+                              key={format.id}
+                              className={`hover:bg-muted/30 transition-colors ${
+                                !format.enabled ? "opacity-45" : ""
+                              }`}
+                            >
+                              <td className="px-3 py-2 text-center">
+                                <Switch
+                                  checked={format.enabled}
+                                  disabled={disabled}
+                                  onCheckedChange={(val) => handleFormatToggle(format.id, val)}
+                                />
+                              </td>
+                              <td className="px-3 py-2">
+                                <div className="font-semibold">{format.name}</div>
+                                <div className="text-muted-foreground max-w-xs truncate font-mono text-[10px]">
+                                  {format.pattern}
+                                </div>
+                              </td>
+                              <td className="px-3 py-2">
+                                <span
+                                  className={`inline-flex rounded-md border px-2 py-0.5 text-[10px] font-semibold tracking-wider uppercase ${
+                                    CATEGORY_COLORS[format.category] || CATEGORY_COLORS.custom
+                                  }`}
+                                >
+                                  {format.category.replace("_", " ")}
+                                </span>
+                              </td>
+                              <td className="px-3 py-2 text-center">
+                                {isDiscard ? (
+                                  <Badge
+                                    variant="destructive"
+                                    className="text-[10px] font-semibold"
+                                  >
+                                    🚫 Discard
+                                  </Badge>
+                                ) : (
+                                  <Badge
+                                    variant={
+                                      format.score > 0
+                                        ? "default"
+                                        : format.score < 0
+                                          ? "secondary"
+                                          : "outline"
+                                    }
+                                    className={`font-mono text-[11px] font-semibold ${
+                                      format.score > 0
+                                        ? "bg-green-600/15 text-green-700 hover:bg-green-600/20 dark:text-green-300"
+                                        : format.score < 0
+                                          ? "bg-amber-600/15 text-amber-700 hover:bg-amber-600/20 dark:text-amber-300"
+                                          : ""
+                                    }`}
+                                  >
+                                    {format.score > 0 ? `+${format.score}` : format.score} pts
+                                  </Badge>
+                                )}
+                              </td>
+                              <td className="px-3 py-2">
+                                <div className="flex items-center gap-3">
+                                  <Slider
+                                    min={-2000}
+                                    max={1000}
+                                    step={25}
+                                    value={[format.score]}
+                                    disabled={disabled || !format.enabled}
+                                    onValueChange={([val]) =>
+                                      handleFormatScoreChange(format.id, val ?? format.score)
+                                    }
+                                    className="w-36"
+                                  />
+                                  <span className="text-muted-foreground font-mono text-[10px]">
+                                    {format.score}
+                                  </span>
+                                </div>
+                              </td>
+                              <td className="px-3 py-2 text-right">
+                                <div className="flex items-center justify-end gap-1">
+                                  <Button
+                                    type="button"
+                                    variant="ghost"
+                                    size="sm"
+                                    className="size-7 p-0"
+                                    onClick={() => {
+                                      setEditingFormat(format);
+                                      setShowFormatModal(true);
+                                    }}
+                                    title="Edit rule"
+                                  >
+                                    <Edit2 className="size-3.5" />
+                                  </Button>
+                                  {format.isCustom && (
+                                    <Button
+                                      type="button"
+                                      variant="ghost"
+                                      size="sm"
+                                      className="text-destructive hover:bg-destructive/10 size-7 p-0"
+                                      onClick={() => handleDeleteFormat(format.id)}
+                                      title="Delete custom rule"
+                                    >
+                                      <Trash2 className="size-3.5" />
+                                    </Button>
+                                  )}
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </>
+            )}
           </TabsContent>
 
           {/* Tab 2: Quality Profiles & Resolution */}

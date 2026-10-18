@@ -1329,6 +1329,10 @@ type VirtualPlaybackStream struct {
 	OwnerInstallationID int               `json:"-"`
 	Visible             bool              `json:"-"`
 	VisibilitySpecified bool              `json:"-"`
+
+	// PreserveProviderOrder carries the provider-order policy through caches and pickers.
+	PreserveProviderOrder bool `json:"-"`
+
 	// Rejected marks a candidate a configured custom format rejects. It is a
 	// transient ranking signal: accepted candidates always sort before
 	// rejected ones, and the final ordering partition keeps a rejected
@@ -8163,7 +8167,7 @@ func (h *PlaybackHandler) unpinVirtualSticky(key, uri string) {
 // candidate at index 0. If the pinned candidate has vanished or has a lower compatibility
 // score for the requesting device, it is not promoted.
 func (h *PlaybackHandler) applyVirtualStickyPin(key, pinnedURI string, candidates []VirtualPlaybackStream, device ...plugins.DeviceCapabilities) []VirtualPlaybackStream {
-	if pinnedURI == "" || len(candidates) == 0 {
+	if pinnedURI == "" || len(candidates) == 0 || virtualProviderOrderPreserved(candidates) {
 		return candidates
 	}
 	pinnedIdx := -1

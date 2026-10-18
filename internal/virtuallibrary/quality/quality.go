@@ -370,6 +370,12 @@ func altmountCompatibilityFormats() []CustomFormat {
 	}
 }
 
+// TrustServerOrder disables Vio ranking for provider streams. Stored weights and
+// profile filters remain available when switching back to a scoring preset.
+func (q QualityConfig) TrustServerOrder() bool {
+	return q.CustomFormatPreset == "server-order"
+}
+
 func (q *QualityConfig) ApplyPreset() {
 	if profiles := qualityPresetProfiles(q.Preset); len(profiles) > 0 {
 		q.Profiles = profiles

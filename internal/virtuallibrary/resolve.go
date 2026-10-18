@@ -231,6 +231,9 @@ func autoProfileFallbackFromContext(ctx context.Context) bool {
 // PlaybackStream represents an available stream candidate formatted for
 // playback selection in API handlers and Jellyfin compatibility.
 type PlaybackStream struct {
+	// PreserveProviderOrder prevents downstream pickers from re-ranking this listing.
+	PreserveProviderOrder bool
+
 	ID                  string
 	Label               string
 	URI                 string
@@ -377,6 +380,9 @@ type VirtualRanking struct {
 // and its own sort criteria; otherwise it reports the built-in default order.
 // It is the read-only counterpart of the ranking applied during resolution.
 func (s *Service) RankingForPath(virtualPath string) VirtualRanking {
+	if s.cfg.Quality.TrustServerOrder() {
+		return VirtualRanking{Source: VirtualRankingSourceDefault}
+	}
 	profile := s.qualityProfileForPath(virtualPath)
 	ranking := VirtualRanking{
 		Source:   VirtualRankingSourceDefault,
@@ -394,8 +400,11 @@ func (s *Service) RankingForPath(virtualPath string) VirtualRanking {
 // rejected verdict on each candidate, and orders accepted before rejected,
 // then by score, resolution, source, language and OriginalIndex. It mutates
 // the slice in place; the resolver hands out a private clone per call, so the
-// caller owns it.
+// caller owns it. The server-order preset bypasses scoring and sorting.
 func (s *Service) rankCandidatesForVirtualPath(virtualPath string, candidates []stream.StreamCandidate) {
+	if s.cfg.Quality.TrustServerOrder() {
+		return
+	}
 	quality.SortCandidatesForProfile(candidates, s.qualityProfileForPath(virtualPath), s.cfg.Quality.CustomFormats)
 }
 
@@ -961,11 +970,16 @@ func (s *Service) playbackStreamsFrom(ctx context.Context, virtualPath string, c
 	s.rankCandidatesForVirtualPath(virtualPath, candidates)
 	s.warnIfAllRejected(ctx, virtualPath, candidates)
 	formats := s.cfg.Quality.CustomFormats
+	if s.cfg.Quality.TrustServerOrder() {
+		formats = nil
+	}
 	streams := make([]PlaybackStream, 0, len(candidates))
 	for _, c := range candidates {
 		id := stream.CandidateVariantID(c)
 		label := stream.CandidateDisplayName(c)
 		streams = append(streams, PlaybackStream{
+			PreserveProviderOrder: s.cfg.Quality.TrustServerOrder(),
+
 			ID:                  id,
 			Label:               label,
 			URI:                 withResultKey(virtualPath, id),

@@ -111,6 +111,66 @@ func TestListStreamsAppliesCustomFormatRanking(t *testing.T) {
 	}
 }
 
+// TestServerOrderPreservesProviderPreference covers both listing and auto-selection,
+// including confirmed-source promotion and stale custom scoring configuration.
+func TestServerOrderPreservesProviderPreference(t *testing.T) {
+	cfg := virtuallibrary.Config{Quality: quality.QualityConfig{
+		CustomFormatPreset: "server-order",
+		EnableProfiles:     true,
+		Profiles: []quality.QualityProfile{{
+			Label: "All",
+			Sort:  []quality.SortCriterion{{Attribute: "resolution", Direction: "desc"}},
+		}},
+		CustomFormats: []quality.CustomFormat{
+			tokenFormat("Prefer 4K", "2160p", 500, false),
+			tokenFormat("Reject 720p", "720p", -2000, true),
+		},
+	}}
+	svc := newProviderService(t, nil, cfg,
+		streamEntry("720p", "http://192.168.1.10/720.mkv"),
+		streamEntry("2160p", "http://192.168.1.10/2160.mkv"),
+		streamEntry("1080p", "http://192.168.1.10/1080.mkv"),
+	)
+	svc.Resolver.SetCandidateClassifier(classifyByURL{
+		"http://192.168.1.10/2160.mkv": {confirmed: true},
+	})
+	ranking := svc.RankingForPath("virtual://movie/tt100?profile=All")
+	if len(ranking.Criteria) != 0 {
+		t.Fatalf("server order advertises sorting criteria: %+v", ranking)
+	}
+	ctx := context.Background()
+	for _, fresh := range []bool{false, true} {
+		var streams []virtuallibrary.PlaybackStream
+		var err error
+		if fresh {
+			streams, err = svc.ListStreamsFresh(ctx, "virtual://movie/tt100?profile=All")
+		} else {
+			streams, err = svc.ListStreams(ctx, "virtual://movie/tt100?profile=All")
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(streams) != 3 {
+			t.Fatalf("streams = %d, want 3", len(streams))
+		}
+		for i, resolution := range []string{"720p", "2160p", "1080p"} {
+			if streams[i].Resolution != resolution {
+				t.Fatalf("fresh=%t stream[%d] = %s, want %s", fresh, i, streams[i].Resolution, resolution)
+			}
+			if streams[i].QualityScore != 0 || streams[i].Rejected || len(streams[i].MatchedFormats) != 0 {
+				t.Fatalf("server-order stream carries format scoring: %+v", streams[i])
+			}
+		}
+		resolved, err := svc.ResolveDetailed(ctx, "virtual://movie/tt100?profile=All", fresh, nil, "", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resolved.CandidateID != streams[0].ID {
+			t.Fatalf("auto-selection did not use the first provider stream")
+		}
+	}
+}
+
 // TestListStreamsKeepsRejectedBehindAccepted proves a rejected candidate is
 // rank-last but still returned, never dropped.
 func TestListStreamsKeepsRejectedBehindAccepted(t *testing.T) {
@@ -901,5 +961,27 @@ func TestAllFailedListingWarnsAndRecoversWithoutNegativeCache(t *testing.T) {
 	}
 	if len(streams) != 2 {
 		t.Fatalf("recovered listing = %d candidates, want 2 (all-failed must not negative-cache)", len(streams))
+	}
+}
+
+func TestServerOrderCapsBeforeConfirmedSourcePromotion(t *testing.T) {
+	entries := make([]map[string]any, 0, 51)
+	for i := 0; i < 50; i++ {
+		entries = append(entries, streamEntry(fmt.Sprintf("Release.%02d.720p", i), fmt.Sprintf("http://192.168.1.10/release-%d.mkv", i)))
+	}
+	entries = append(entries, streamEntry("Last.2160p", "http://192.168.1.10/last.mkv"))
+	svc := newProviderService(t, nil, virtuallibrary.Config{Quality: quality.QualityConfig{CustomFormatPreset: "server-order"}}, entries...)
+	svc.Resolver.SetCandidateClassifier(classifyByURL{"http://192.168.1.10/last.mkv": {confirmed: true}})
+	streams, err := svc.ListStreams(context.Background(), "virtual://movie/tt100")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(streams) != 50 {
+		t.Fatalf("streams = %d, want 50", len(streams))
+	}
+	for _, stream := range streams {
+		if stream.Resolution != "720p" {
+			t.Fatal("confirmed source beyond provider cap displaced an earlier stream")
+		}
 	}
 }

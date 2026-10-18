@@ -35,12 +35,23 @@ func (h *PlaybackHandler) requestDeviceCapabilities(r *http.Request) (plugins.De
 // a low score alone). With a single candidate the input is returned unchanged:
 // a lone rejected stream is a last-resort choice, not an ordering decision.
 func (h *PlaybackHandler) finalizeVirtualCandidateOrder(r *http.Request, streams []VirtualPlaybackStream, qualityPreference string, bandwidthCapKbps int) []VirtualPlaybackStream {
-	if len(streams) <= 1 {
+	if len(streams) <= 1 || virtualProviderOrderPreserved(streams) {
 		return streams
 	}
 	ranked, _ := h.rankVirtualCandidatesForDevice(r, streams)
 	ranked = reorderVirtualCandidatesForQuality(ranked, qualityPreference, bandwidthCapKbps)
 	return partitionVirtualStreamsAcceptedFirst(ranked)
+}
+
+// virtualProviderOrderPreserved also checks listed alternatives when the first
+// candidate is a persisted pin without transient listing metadata.
+func virtualProviderOrderPreserved(streams []VirtualPlaybackStream) bool {
+	for _, stream := range streams {
+		if stream.PreserveProviderOrder {
+			return true
+		}
+	}
+	return false
 }
 
 // preferProbedVirtualCandidates stably moves candidates whose catalog row
@@ -50,7 +61,7 @@ func (h *PlaybackHandler) finalizeVirtualCandidateOrder(r *http.Request, streams
 // never jumps a healthy accepted stub. Best-effort: rows that fail the
 // verdict lookup keep their relative order rather than blocking the start.
 func (h *PlaybackHandler) preferProbedVirtualCandidates(ctx context.Context, candidates []VirtualPlaybackStream, file *models.MediaFile, ownerID int) []VirtualPlaybackStream {
-	if h == nil || len(candidates) < 2 {
+	if h == nil || len(candidates) < 2 || virtualProviderOrderPreserved(candidates) {
 		return candidates
 	}
 	probed := make([]bool, len(candidates))

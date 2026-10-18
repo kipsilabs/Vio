@@ -134,3 +134,49 @@ func TestAttachVirtualCandidateScoresBoundsConcurrentScorers(t *testing.T) {
 		t.Fatalf("scorers started = %d after saturation, want %d (no unbounded spawn)", got, virtualScoreConcurrency)
 	}
 }
+
+func TestProviderOrderControlsWatchVersionsAndDefaults(t *testing.T) {
+	svc := &DetailService{virtualScoreSource: func(context.Context, string, []*models.MediaFile) map[int]VirtualCandidateScore {
+		return map[int]VirtualCandidateScore{1: {ProviderOrder: intPtr(0)}, 2: {ProviderOrder: intPtr(1)}, 3: {ProviderOrder: intPtr(2)}}
+	}}
+	files := []*models.MediaFile{
+		{ID: 2, ContentID: "movie-1", FilePath: "virtual://movie/tt1?result=2", Resolution: "2160p", Duration: 120},
+		{ID: 3, ContentID: "movie-1", FilePath: "virtual://movie/tt1?result=3", Resolution: "1080p", Duration: 120},
+		{ID: 1, ContentID: "movie-1", FilePath: "virtual://movie/tt1?result=1", Resolution: "720p", Duration: 120},
+	}
+	for _, selected := range []int{0, 3} {
+		detail := svc.newWatchDetail(context.Background(), "movie-1", "movie", "Title", "", files, AccessFilter{SelectedFileID: selected}, "movie-1")
+		for i, id := range []int{1, 2, 3} {
+			if detail.Versions[i].FileID != id {
+				t.Fatalf("watch version[%d] = %d, want %d", i, detail.Versions[i].FileID, id)
+			}
+			if detail.Versions[i].FormatScore != nil {
+				t.Fatal("provider order became a format score")
+			}
+			if detail.PlaybackVariants[0].Parts[0].Versions[i].FileID != id {
+				t.Fatal("playback part lost provider order")
+			}
+		}
+		wantDefault := 1
+		if selected != 0 {
+			wantDefault = selected
+		}
+		if detail.PlaybackVariants[0].DefaultFileID != wantDefault {
+			t.Fatalf("default = %d, want %d", detail.PlaybackVariants[0].DefaultFileID, wantDefault)
+		}
+	}
+}
+
+func TestProviderOrderPreservesLocalVersionPlacement(t *testing.T) {
+	versions := []FileVersion{
+		{FileID: 1, Resolution: "2160p", FileSize: 100},
+		{FileID: 2, Resolution: "1080p", providerOrder: intPtr(1)},
+		{FileID: 3, Resolution: "720p", providerOrder: intPtr(0)},
+	}
+	sortFileVersions(versions)
+	for i, id := range []int{1, 3, 2} {
+		if versions[i].FileID != id {
+			t.Fatalf("version[%d] = %d, want %d", i, versions[i].FileID, id)
+		}
+	}
+}

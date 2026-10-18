@@ -80,6 +80,8 @@ type ChapterThumbnailQueuer interface {
 // candidate that matched none. Both fields are absent on the wire for an
 // unscored row.
 type VirtualCandidateScore struct {
+	// ProviderOrder is set only when the provider's order must be preserved.
+	ProviderOrder  *int
 	Score          int
 	MatchedFormats []string
 }
@@ -542,6 +544,7 @@ type PersonCredit struct {
 
 // FileVersion represents a single file version available for playback.
 type FileVersion struct {
+	providerOrder            *int
 	FileID                   int       `json:"file_id"`
 	FileName                 string    `json:"file_name,omitempty"`
 	FilePath                 string    `json:"file_path,omitempty"`
@@ -3499,13 +3502,13 @@ func (s *DetailService) newWatchDetail(
 	filter AccessFilter,
 	audioPreferenceContentID string,
 ) *WatchDetail {
+	var scores map[int]VirtualCandidateScore
+	if s.virtualScoreSource != nil && len(files) > 0 {
+		scores = s.scoreVirtualCandidates(ctx, contentID, files)
+	}
 	versions, playbackVariants, subtitles, intro, credits, recap, preview := s.buildPlaybackInfo(
-		ctx,
-		files,
-		filter,
-		audioPreferenceContentID,
+		ctx, files, filter, audioPreferenceContentID, scores,
 	)
-	s.attachVirtualCandidateScores(ctx, contentID, versions, files)
 	detail := &WatchDetail{
 		ContentID:        contentID,
 		Type:             contentType,
@@ -3549,14 +3552,20 @@ func (s *DetailService) attachVirtualCandidateScores(
 	if s.virtualScoreSource == nil || len(versions) == 0 {
 		return
 	}
-	scores := s.scoreVirtualCandidates(ctx, contentID, files)
+	applyVirtualCandidateScores(versions, s.scoreVirtualCandidates(ctx, contentID, files))
+}
+
+func applyVirtualCandidateScores(versions []FileVersion, scores map[int]VirtualCandidateScore) {
 	if len(scores) == 0 {
 		return
 	}
 	for i := range versions {
 		if score, ok := scores[versions[i].FileID]; ok {
-			versions[i].FormatScore = intPtr(score.Score)
+			if score.Score != 0 {
+				versions[i].FormatScore = intPtr(score.Score)
+			}
 			versions[i].MatchedFormats = score.MatchedFormats
+			versions[i].providerOrder = score.ProviderOrder
 		}
 	}
 }
@@ -4373,10 +4382,11 @@ func (s *DetailService) buildPlaybackInfo(
 	files []*models.MediaFile,
 	filter AccessFilter,
 	audioPreferenceContentID string,
+	candidateScores ...map[int]VirtualCandidateScore,
 ) ([]FileVersion, []PlaybackVariant, []SubtitleInfo, *Marker, *Marker, *Marker, *Marker) {
 	// Resolve the request-invariant audio preferences once; a multi-track item
 	// would otherwise re-query the profile/preference rows for every file.
-	return s.buildPlaybackInfoWith(ctx, files, filter, s.newAudioPrefResolver(ctx, filter, audioPreferenceContentID), s.trickplay)
+	return s.buildPlaybackInfoWith(ctx, files, filter, s.newAudioPrefResolver(ctx, filter, audioPreferenceContentID), s.trickplay, candidateScores...)
 }
 
 // buildPlaybackInfoWith is buildPlaybackInfo with a caller-owned audio
@@ -4387,6 +4397,7 @@ func (s *DetailService) buildPlaybackInfoWith(
 	filter AccessFilter,
 	audioResolver *audioPrefResolver,
 	availability TrickplayAvailability,
+	candidateScores ...map[int]VirtualCandidateScore,
 ) ([]FileVersion, []PlaybackVariant, []SubtitleInfo, *Marker, *Marker, *Marker, *Marker) {
 	versions := make([]FileVersion, 0, len(files))
 	subtitleSet := make(map[string]SubtitleInfo)
@@ -4536,6 +4547,10 @@ func (s *DetailService) buildPlaybackInfoWith(
 		subtitles = append(subtitles, sub)
 	}
 
+	if len(candidateScores) > 0 {
+		applyVirtualCandidateScores(versions, candidateScores[0])
+		preserveProviderVersionOrder(versions)
+	}
 	s.markTrickplay(ctx, versions, availability)
 	variants := buildPlaybackVariants(versions, filter.SelectedFileID)
 	selectedVersionExists := playbackVersionExists(versions, filter.SelectedFileID)
@@ -4721,6 +4736,29 @@ func sortFileVersions(versions []FileVersion) {
 		}
 		return a.FileSize > b.FileSize
 	})
+	preserveProviderVersionOrder(versions)
+}
+
+// Reorder only provider rows, leaving local and unlisted versions in their
+// existing slots. Provider preferences must not promote remote files over local files.
+func preserveProviderVersionOrder(versions []FileVersion) {
+	var ranked []FileVersion
+	for _, version := range versions {
+		if version.providerOrder != nil {
+			ranked = append(ranked, version)
+		}
+	}
+	if len(ranked) < 2 {
+		return
+	}
+	sort.SliceStable(ranked, func(i, j int) bool { return *ranked[i].providerOrder < *ranked[j].providerOrder })
+	next := 0
+	for i := range versions {
+		if versions[i].providerOrder != nil {
+			versions[i] = ranked[next]
+			next++
+		}
+	}
 }
 
 func chooseDefaultVariantVersion(versions []FileVersion, selectedFileID int) *FileVersion {

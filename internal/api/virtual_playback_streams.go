@@ -30,7 +30,9 @@ func virtualPlaybackStreamsFromCore(streams []virtuallibrary.PlaybackStream) []h
 			VisualTags: stream.VisualTags, AudioTags: stream.AudioTags,
 			OwnerInstallationID: stream.OwnerInstallationID,
 			Visible:             stream.Visible, VisibilitySpecified: stream.VisibilitySpecified,
-			Rejected:            stream.Rejected,
+			Rejected:              stream.Rejected,
+			PreserveProviderOrder: stream.PreserveProviderOrder,
+
 			ProviderURL:         stream.ProviderURL,
 			ProviderVideoHash:   stream.ProviderVideoHash,
 			ProviderGUID:        stream.ProviderGUID,
