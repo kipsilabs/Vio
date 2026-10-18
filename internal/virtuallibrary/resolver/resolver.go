@@ -41,6 +41,15 @@ import (
 // with backoff instead of rotating the release or returning a permanent error.
 var ErrProviderUnavailable = errors.New("virtual playback provider unavailable")
 
+// ErrTMDBExternalIDLookupFailed marks a TMDB external-id lookup that failed for
+// an availability reason (HTTP 5xx, timeout, decode error) rather than because
+// the title genuinely has no IMDb id. Callers must treat it as retryable and
+// must never cache it as a negative: a title's IMDb id does not change because
+// TMDB had a bad minute. It also wraps ErrProviderUnavailable so the serve layer
+// answers the retryable provider_unavailable condition instead of a terminal
+// "no playback id".
+var ErrTMDBExternalIDLookupFailed = errors.New("TMDB external-id lookup failed")
+
 const (
 	virtualPathPrefix = "virtual://"
 
@@ -1792,13 +1801,13 @@ func (r *Resolver) normalizeTMDBProviderID(ctx context.Context, mediaType, media
 	defer cancel()
 	externals, err := fetchTMDBExternalIDs(lookupCtx, mediaType, parts[1], key, baseURL)
 	if err != nil {
-		// Remember a genuine translation failure so a burst of resolves does
-		// not re-pay it. A failure caused by this caller's own cancellation is
-		// not the provider's state, so it is never cached.
-		if ctx.Err() == nil {
-			r.storeTMDBExternalID(cacheKey, "", tmdbExternalIDNegativeTTL)
-		}
-		return "", fmt.Errorf("TMDB ID %s has no IMDb playback ID", parts[1])
+		// A failed lookup is not evidence that the title has no IMDb id: TMDB
+		// may be down, rate-limiting, or slow. Do not cache it as a negative
+		// (that would make the title unplayable for the negative TTL with a
+		// misleading message), and report it as the retryable provider failure
+		// it is.
+		return "", fmt.Errorf("TMDB ID %s external-id lookup failed: %w", parts[1],
+			errors.Join(ErrTMDBExternalIDLookupFailed, ErrProviderUnavailable))
 	}
 	imdbID := strings.TrimSpace(externals.IMDbID)
 	if imdbID == "" {
