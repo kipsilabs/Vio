@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -136,6 +137,168 @@ func TestVirtualDirectPlayRepeated5xxDoesNotIndict(t *testing.T) {
 		t.Fatalf("repeated 5xx stacked %v of relay retries; want <= ~2 backoff (+1s slack) so it fits a 15s caller budget", elapsed)
 	}
 	t.Logf("repeated-5xx: elapsed=%v upstream_calls=%d resolver_calls=%d", elapsed.Round(time.Millisecond), upstreamCalls.Load(), *resolverCalls)
+}
+
+// TestVirtualStreamRepeated5xxFailsFastAfterRotationExhausted proves the
+// cross-request bound: once the pinned candidate's initial serve and the one
+// bounded rotation have both failed, a segment retry for the same session and
+// candidate answers the same retryable 502 without spending another resolve,
+// relist, or relay-open. The exhausted 5xx is availability-shaped, so this
+// terminal is in-memory only — it never becomes a durable failed_at stamp.
+func TestVirtualStreamRepeated5xxFailsFastAfterRotationExhausted(t *testing.T) {
+	const pinnedURI = "virtual://movie/tt-repeated-5xx-terminal?result=cand-a"
+	server, upstreamCalls := relayTransientServer(http.StatusServiceUnavailable, 0, "")
+	defer server.Close()
+
+	file := &models.MediaFile{ID: 505, ContentID: "movie-repeated-5xx-terminal", FilePath: pinnedURI, VirtualOwnerInstallationID: 5}
+	var stamps []string
+	handler, session, resolverCalls, rotateFlags := relayTransientFixture(t, file,
+		func(_ int, _ bool, _ bool, _ []string) ResolvedVirtualMedia {
+			return ResolvedVirtualMedia{URL: server.URL + "/provider/video.mp4", URI: pinnedURI, CandidateID: "cand-a"}
+		})
+	handler.VirtualCandidateFailMarker = func(_ context.Context, _ int, expectedFilePath string, _ *time.Time) error {
+		stamps = append(stamps, expectedFilePath)
+		return nil
+	}
+
+	recorder, req := streamRequestFor(session)
+	handler.HandleStream(recorder, req)
+
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("first status = %d, want 502, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if len(stamps) != 0 {
+		t.Fatalf("transport 5xx stamped candidate(s) %v", stamps)
+	}
+	if *resolverCalls != 2 {
+		t.Fatalf("first resolver calls = %d, want exactly 2 (initial + bounded rotation)", *resolverCalls)
+	}
+	if len(*rotateFlags) != 2 || !(*rotateFlags)[1] {
+		t.Fatalf("first rotation flags = %v, want the retry to declare bounded rotation", *rotateFlags)
+	}
+	exhaustedUpstreamCalls := upstreamCalls.Load()
+	if exhaustedUpstreamCalls != 4 {
+		t.Fatalf("first upstream calls = %d, want 4 (2 open attempts x 2 serve attempts)", exhaustedUpstreamCalls)
+	}
+
+	// The same session and pinned candidate now have an exhausted recovery
+	// terminal. This retry must not resolve, relist, rotate, or open upstream
+	// again; it still answers the client with the retryable 502.
+	recorder, req = streamRequestFor(session)
+	handler.HandleStream(recorder, req)
+
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("second status = %d, want 502, body = %s", recorder.Code, recorder.Body.String())
+	}
+	var errResp struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &errResp); err != nil {
+		t.Fatalf("decode second response: %v, body = %s", err, recorder.Body.String())
+	}
+	if errResp.Error != "virtual_stream_unavailable" {
+		t.Fatalf("second error code = %q, want virtual_stream_unavailable", errResp.Error)
+	}
+	if *resolverCalls != 2 {
+		t.Fatalf("second resolver calls = %d, want the exhausted terminal to skip re-resolve/rotation", *resolverCalls)
+	}
+	if len(*rotateFlags) != 2 {
+		t.Fatalf("second rotation flags = %v, want no new rotation", *rotateFlags)
+	}
+	if n := upstreamCalls.Load(); n != exhaustedUpstreamCalls {
+		t.Fatalf("second upstream calls = %d, want the exhausted terminal to skip provider opens", n)
+	}
+	if len(stamps) != 0 {
+		t.Fatalf("second request stamped candidate(s) %v", stamps)
+	}
+}
+
+// TestVirtualStreamRecoveryTerminalClearsOnSuccess proves a successful serve
+// retires the exhausted-recovery terminal: a session that replans to a live
+// candidate serves normally, and binding back to the previously exhausted
+// candidate resolves instead of failing fast.
+func TestVirtualStreamRecoveryTerminalClearsOnSuccess(t *testing.T) {
+	const (
+		pinnedURI  = "virtual://movie/tt-terminal-clear?result=pinned"
+		siblingURI = "virtual://movie/tt-terminal-clear?result=sibling"
+		media      = "recovered-media-bytes"
+	)
+	dead, _ := relayTransientServer(http.StatusServiceUnavailable, 0, "")
+	defer dead.Close()
+	live, liveCalls := relayTransientServer(http.StatusOK, 1, media)
+	defer live.Close()
+
+	activeURI := pinnedURI
+	activeID := "pinned"
+	activeURL := dead.URL + "/provider/pinned.mp4"
+
+	file := &models.MediaFile{ID: 506, ContentID: "movie-terminal-clear", FilePath: pinnedURI, VirtualOwnerInstallationID: 5}
+	handler, session, resolverCalls, _ := relayTransientFixture(t, file,
+		func(_ int, _ bool, _ bool, _ []string) ResolvedVirtualMedia {
+			return ResolvedVirtualMedia{URL: activeURL, URI: activeURI, CandidateID: activeID}
+		})
+	handler.VirtualCandidateFailMarker = func(_ context.Context, _ int, _ string, _ *time.Time) error {
+		return nil
+	}
+
+	recorder, req := streamRequestFor(session)
+	handler.HandleStream(recorder, req)
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("first status = %d, want 502, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if *resolverCalls != 2 {
+		t.Fatalf("first resolver calls = %d, want 2", *resolverCalls)
+	}
+
+	recorder, req = streamRequestFor(session)
+	handler.HandleStream(recorder, req)
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("second status = %d, want the fail-fast 502, body = %s", recorder.Code, recorder.Body.String())
+	}
+	exhaustedCalls := *resolverCalls
+	if exhaustedCalls != 2 {
+		t.Fatalf("second resolver calls = %d, want the terminal to skip resolution", exhaustedCalls)
+	}
+
+	// Replan the session to a live sibling. The successful serve clears the
+	// session's exhausted terminal.
+	sessionMgr, ok := handler.sessionMgr.(*playback.SessionManager)
+	if !ok {
+		t.Fatalf("session manager = %T, want *playback.SessionManager", handler.sessionMgr)
+	}
+	activeURI, activeID, activeURL = siblingURI, "sibling", live.URL+"/provider/sibling.mp4"
+	if err := sessionMgr.SetVirtualSource(session.ID, siblingURI, 5); err != nil {
+		t.Fatalf("SetVirtualSource sibling: %v", err)
+	}
+	recorder, req = streamRequestFor(session)
+	handler.HandleStream(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("sibling status = %d, want 200, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if recorder.Body.String() != media {
+		t.Fatalf("sibling body = %q, want %q", recorder.Body.String(), media)
+	}
+	if *resolverCalls != exhaustedCalls+1 {
+		t.Fatalf("sibling resolver calls = %d, want %d", *resolverCalls, exhaustedCalls+1)
+	}
+
+	// The successful sibling serve cleared the terminal, so binding back to
+	// the pinned candidate resolves and serves again.
+	activeURI, activeID, activeURL = pinnedURI, "pinned", live.URL+"/provider/pinned.mp4"
+	if err := sessionMgr.SetVirtualSource(session.ID, pinnedURI, 5); err != nil {
+		t.Fatalf("SetVirtualSource pinned: %v", err)
+	}
+	recorder, req = streamRequestFor(session)
+	handler.HandleStream(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("pinned status = %d, want the cleared terminal to resolve, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if *resolverCalls != exhaustedCalls+2 {
+		t.Fatalf("pinned resolver calls = %d, want %d", *resolverCalls, exhaustedCalls+2)
+	}
+	if n := liveCalls.Load(); n != 2 {
+		t.Fatalf("live upstream calls = %d, want 2", n)
+	}
 }
 
 // TestVirtualDirectPlay5xxRotatesToSiblingWithoutIndicting proves bounded
