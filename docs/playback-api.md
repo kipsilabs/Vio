@@ -238,18 +238,38 @@ unwired or saturated preparation returns `503`; an inaccessible version returns
 written, and Play remains independent of preparation failures. V1 and Jellyfin
 behavior is unchanged.
 
-The server makes a GET with `Range: bytes=0-0`, reads at most one body byte and
-closes it. This can start provider downloads, imports and health checks even if
-Play is never pressed. Work has a 90-second budget and four concurrent slots
+When the playback prober is configured, preparation runs the same cached ffprobe
+through the protected stream relay, including provider headers and the declared
+audio expectation used by playback. Opening the stream can start provider
+downloads, imports and health checks even if Play is never pressed. This replaces
+the separate one-byte request; it is not restricted to reading one byte. Without
+a configured prober, preparation falls back to GET with `Range: bytes=0-0`, reads
+at most one body byte and closes it.
+
+Successful probe metadata is cached for ten minutes in the API process that ran
+the probe. The cache distinguishes exact selected versions and expected audio,
+and coalesces concurrent probes of the same source. Playback can reuse completed
+metadata or join an existing probe through its normal probe path. Failed or
+partial probes are not cached and do not mark the version unavailable. No early
+probe writes catalog metadata, sticky selections, watch progress or playback
+sessions. Browsing prefetch and version discovery remain list-only.
+
+Preparation has a 90-second budget and four concurrent slots
 per API process. Requests for the same installation and pinned source coalesce
 for two minutes through Redis, or a bounded local map without Redis. Redis
-failure fails closed. Service shutdown cancels local work. Private destination
-access still requires `virtual_library.allow_private_streams`.
+failure fails closed. The shared probe worker has its own 60-second budget and
+can finish after its preparation caller stops waiting, so a concurrent playback
+request can still reuse its result. Service shutdown cancels the preparation
+caller. Private destination access still requires
+`virtual_library.allow_private_streams` and probes use the same pinned-IP relay
+as playback.
 
 Closing a detail page does not undo provider-side work already started. Whether
 a later Play request benefits depends on AIOStreams and the downstream provider
-reusing that work; preparation does not cache a resolved URL or join foreground
-playback. Reduced startup latency requires provider-specific verification.
+reusing that work and, for probe metadata, reaching the same API process before
+the cache expires. Preparation does not cache a resolved URL or create a
+foreground playback request. Reduced startup latency requires provider-specific
+verification.
 Android, Android TV, tvOS and macOS do not initiate preparation. Extending this
 to another client requires working version discovery and selection there first.
 

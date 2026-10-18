@@ -16,6 +16,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/plugins"
 	"github.com/Silo-Server/silo-server/internal/remotestream"
+	"github.com/Silo-Server/silo-server/internal/scanner"
 )
 
 // prewarmFile is a virtual row with no probe evidence and no persisted
@@ -289,6 +290,10 @@ func TestVirtualPreparationRequiresEnabledAndAuthorizedVersion(t *testing.T) {
 			service := &VirtualPlaybackPreparationService{
 				Enabled: func(context.Context) bool { return test.enabled },
 				Detail:  detail,
+				Probe: func(context.Context, string, *models.MediaFile, map[string]string) (*models.MediaFile, error) {
+					t.Fatal("must not probe without authorization")
+					return nil, nil
+				},
 				FileByID: func(context.Context, int) (*models.MediaFile, error) {
 					t.Fatal("must authorize the selected file before loading it")
 					return nil, nil
@@ -361,5 +366,180 @@ func TestVirtualPreparationCooldown(t *testing.T) {
 	service.recent["selected"] = time.Now().Add(-time.Second)
 	if claimed, err := service.claim(context.Background(), "selected"); err != nil || !claimed {
 		t.Fatalf("expired preparation claim: claimed=%v error=%v", claimed, err)
+	}
+}
+
+func TestVirtualPreparationWarmsPlaybackProbeCache(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{name: "complete"},
+		{name: "partial", err: scanner.ErrVirtualProbePartial},
+		{name: "failed", err: errors.New("provider not ready")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var rangeRequests atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				rangeRequests.Add(1)
+				writer.WriteHeader(http.StatusInternalServerError)
+			}))
+			defer server.Close()
+			file := prewarmFile("virtual://movie/tt-probe-preparation?result=selected")
+			file.Duration = 3600
+			candidate := VirtualPlaybackStream{
+				URI: file.FilePath, SourceType: "usenet", ProviderURL: server.URL + "/selected?token=first",
+				CodecAudio: "aac", RequestHeaders: map[string]string{"Referer": "https://provider.example"},
+			}
+			cache := scanner.NewVirtualProbeCache(time.Minute, 8)
+			probeCalls := 0
+			prober := func(ctx context.Context, sourceURL string, probeFile *models.MediaFile, headers map[string]string) (*models.MediaFile, error) {
+				if headers["Referer"] != candidate.RequestHeaders["Referer"] {
+					t.Errorf("provider headers were not preserved: %v", headers)
+				}
+				return cache.Probe(ctx, sourceURL, probeFile, func(_ context.Context, _ string, input *models.MediaFile) (*models.MediaFile, error) {
+					probeCalls++
+					if input.FilePath != file.FilePath || input.ID != file.ID || input.VirtualOwnerInstallationID != file.VirtualOwnerInstallationID || input.CodecAudio != "aac" || input.Duration != 0 {
+						t.Errorf("unexpected early probe input: %+v", input)
+					}
+					input.Duration = 3598
+					input.Container = "mkv"
+					return input, test.err
+				})
+			}
+			service := &VirtualPlaybackPreparationService{
+				Enabled: func(context.Context) bool { return true },
+				AllowPrivate: func(context.Context) bool { return true },
+				Probe: prober,
+				List: VirtualPlaybackStreamListerFunc(func(context.Context, string, int, string, int) ([]VirtualPlaybackStream, error) {
+					return []VirtualPlaybackStream{candidate}, nil
+				}),
+			}
+			service.prepare(context.Background(), file, 7, "profile-1")
+			playbackFile := cloneVirtualProbeTransient(*file)
+			playbackFile.Duration = 0
+			forwardVirtualCandidateDeclaredAudio(&playbackFile, candidate)
+			rotatedURL := server.URL + "/selected?token=second"
+			cached := cache.Lookup(rotatedURL, &playbackFile)
+			if (cached != nil) != (test.err == nil) {
+				t.Fatalf("cached probe = %v, probe error = %v", cached, test.err)
+			}
+			handler := &PlaybackHandler{VirtualPlaybackSourceProberWithHeaders: prober}
+			probed, err := handler.probeVirtualSource(context.Background(), rotatedURL, &playbackFile, candidate.RequestHeaders)
+			wantCalls := 1
+			if test.err != nil {
+				wantCalls = 2
+			}
+			if probeCalls != wantCalls || !errors.Is(err, test.err) {
+				t.Fatalf("playback probe calls=%d want=%d error=%v", probeCalls, wantCalls, err)
+			}
+			if test.err == nil && (probed == nil || probed.Duration != 3598 || probed.Container != "mkv") {
+				t.Fatalf("playback did not reuse early metadata: %+v", probed)
+			}
+			other := playbackFile
+			other.FilePath = "virtual://movie/tt-probe-preparation?result=other"
+			if cache.Lookup(rotatedURL, &other) != nil {
+				t.Fatal("probe evidence leaked to another selected version")
+			}
+			withoutAudio := playbackFile
+			withoutAudio.CodecAudio = ""
+			if cache.Lookup(rotatedURL, &withoutAudio) != nil {
+				t.Fatal("probe evidence reused with a different expected-audio signal")
+			}
+			if file.Duration != 3600 || file.Container != "virtual" || file.CodecAudio != "" || file.FailedAt != nil {
+				t.Fatalf("preparation mutated the catalog row: %+v", file)
+			}
+			if rangeRequests.Load() != 0 {
+				t.Fatal("cached probing must replace the independent one-byte request")
+			}
+		})
+	}
+}
+
+func TestVirtualPreparationProbeRequiresPrivateOptIn(t *testing.T) {
+	file := prewarmFile("virtual://movie/tt-probe-network?result=selected")
+	for _, allowed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("allowed_%t", allowed), func(t *testing.T) {
+			calls := 0
+			service := &VirtualPlaybackPreparationService{
+				Enabled: func(context.Context) bool { return true },
+				AllowPrivate: func(context.Context) bool { return allowed },
+				Probe: func(context.Context, string, *models.MediaFile, map[string]string) (*models.MediaFile, error) {
+					calls++
+					return nil, nil
+				},
+				List: VirtualPlaybackStreamListerFunc(func(context.Context, string, int, string, int) ([]VirtualPlaybackStream, error) {
+					return []VirtualPlaybackStream{{URI: file.FilePath, SourceType: "usenet", ProviderURL: "http://127.0.0.1/selected"}}, nil
+				}),
+			}
+			service.prepare(context.Background(), file, 7, "profile-1")
+			if (calls == 1) != allowed {
+				t.Fatalf("probe calls=%d allow_private=%v", calls, allowed)
+			}
+		})
+	}
+}
+
+func TestVirtualPreparationProbeIsAsynchronousAndDeduplicated(t *testing.T) {
+	for _, kind := range []string{itemTypeMovie, itemTypeEpisode} {
+		t.Run(kind, func(t *testing.T) {
+			file := prewarmFile("virtual://movie/tt-probe-async?result=selected")
+			started := make(chan struct{}, 4)
+			finished := make(chan struct{}, 4)
+			serviceCtx, stop := context.WithCancel(context.Background())
+			defer stop()
+			requestCtx, cancelRequest := context.WithCancel(context.Background())
+			defer cancelRequest()
+			service := &VirtualPlaybackPreparationService{
+				Context: serviceCtx,
+				Enabled: func(context.Context) bool { return true },
+				AllowPrivate: func(context.Context) bool { return true },
+				Detail: &fakeRefreshDetail{detail: &catalog.WatchDetail{
+					Type: kind, Versions: []catalog.FileVersion{{FileID: file.ID, FilePath: file.FilePath}},
+				}},
+				FileByID: func(context.Context, int) (*models.MediaFile, error) { return file, nil },
+				List: VirtualPlaybackStreamListerFunc(func(context.Context, string, int, string, int) ([]VirtualPlaybackStream, error) {
+					return []VirtualPlaybackStream{{URI: file.FilePath, SourceType: "usenet", ProviderURL: "http://127.0.0.1/selected"}}, nil
+				}),
+				Probe: func(ctx context.Context, _ string, input *models.MediaFile, _ map[string]string) (*models.MediaFile, error) {
+					started <- struct{}{}
+					<-ctx.Done()
+					finished <- struct{}{}
+					return input, ctx.Err()
+				},
+			}
+			admitted := make(chan error, 1)
+			go func() {
+				admitted <- service.PrepareVirtualPlayback(requestCtx, 7, "profile-1", file.ContentID, file.ID, catalog.AccessFilter{})
+			}()
+			select {
+			case err := <-admitted:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("preparation admission waited for ffprobe")
+			}
+			select {
+			case <-started:
+			case <-time.After(2 * time.Second):
+				t.Fatal("background probe did not start")
+			}
+			cancelRequest()
+			if err := service.PrepareVirtualPlayback(context.Background(), 7, "profile-1", file.ContentID, file.ID, catalog.AccessFilter{}); err != nil {
+				t.Fatal(err)
+			}
+			stop()
+			select {
+			case <-finished:
+			case <-time.After(2 * time.Second):
+				t.Fatal("shutdown did not cancel background preparation")
+			}
+			select {
+			case <-started:
+				t.Fatal("the same selected version started a second probe")
+			default:
+			}
+		})
 	}
 }

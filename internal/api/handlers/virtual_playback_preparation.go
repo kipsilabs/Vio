@@ -28,6 +28,7 @@ type VirtualPlaybackPreparationService struct {
 	AllowPrivate func(context.Context) bool
 	Claim        func(context.Context, string, time.Duration) (bool, error)
 	Context      context.Context
+	Probe        VirtualPlaybackSourceProberWithHeaders
 
 	once        sync.Once
 	active      chan struct{}
@@ -146,6 +147,18 @@ func (s *VirtualPlaybackPreparationService) prepare(ctx context.Context, file *m
 	allowPrivate := s.AllowPrivate != nil && s.AllowPrivate(ctx)
 	providerURL, err := virtuallibrary.ValidateProviderStreamURL(ctx, candidate.ProviderURL, allowPrivate)
 	if err != nil {
+		return
+	}
+	if s.Probe != nil {
+		probeFile := cloneVirtualProbeTransient(*file)
+		probeFile.Duration = 0
+		forwardVirtualCandidateDeclaredAudio(&probeFile, candidate)
+		probed, probeErr := s.Probe(ctx, providerURL, &probeFile, cloneHeaderMap(candidate.RequestHeaders))
+		if probeErr != nil || probed == nil {
+			slog.DebugContext(ctx, "early stream preparation probe did not complete", "component", "api", "file_id", file.ID)
+			return
+		}
+		slog.DebugContext(ctx, "early stream preparation warmed probe metadata", "component", "api", "file_id", file.ID)
 		return
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, providerURL, nil)
