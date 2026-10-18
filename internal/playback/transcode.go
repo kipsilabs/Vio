@@ -2622,6 +2622,16 @@ func (s *TranscodeSession) WaitForManifestContext(ctx context.Context, timeout t
 	return s.waitForManifest(ctx, timeout, false)
 }
 
+// WaitForManifestContextPolls is WaitForManifestContext that also reports how
+// many times it polled for the manifest. The start path records the wait as its
+// own phase and reports the count as a log attribute, which distinguishes a
+// manifest that appeared promptly (one or two polls) from one that rode the
+// deadline out (hundreds). The wait itself is unchanged: same deadline, same
+// owner-cancel handling, same single manifest read per tick.
+func (s *TranscodeSession) WaitForManifestContextPolls(ctx context.Context, timeout time.Duration) ([]byte, int, error) {
+	return s.waitForManifestPolls(ctx, timeout, false)
+}
+
 // WaitForGenerationManifest is WaitForManifest for startup readiness: it
 // accepts only a manifest the current FFmpeg generation wrote. A reconstruct
 // or replacement that reuses an output directory still holds the previous
@@ -2633,18 +2643,33 @@ func (s *TranscodeSession) WaitForGenerationManifest(timeout time.Duration) ([]b
 
 // WaitForGenerationManifestContext is WaitForGenerationManifest with an owner deadline.
 func (s *TranscodeSession) WaitForGenerationManifestContext(ctx context.Context, timeout time.Duration) ([]byte, error) {
-	return s.waitForManifest(ctx, timeout, true)
+	manifest, _, err := s.waitForManifestPolls(ctx, timeout, true)
+	return manifest, err
 }
 
+// waitForManifest is the historical (manifest, error) form of the poll loop. It
+// wraps waitForManifestPolls and drops the count, so existing callers are
+// unchanged.
 func (s *TranscodeSession) waitForManifest(ctx context.Context, timeout time.Duration, currentGeneration bool) ([]byte, error) {
+	manifest, _, err := s.waitForManifestPolls(ctx, timeout, currentGeneration)
+	return manifest, err
+}
+
+// waitForManifestPolls polls until the manifest is ready, the owner context
+// ends, or timeout expires, reporting how many polls it ran. The count is
+// observation only; every exit carries the same result the wait always
+// produced.
+func (s *TranscodeSession) waitForManifestPolls(ctx context.Context, timeout time.Duration, currentGeneration bool) ([]byte, int, error) {
 	deadline := time.After(timeout)
+	polls := 0
 	for {
+		polls++
 		manifest, err := s.getManifest(currentGeneration)
 		if err == nil {
-			return manifest, nil
+			return manifest, polls, nil
 		}
 		if err != nil && !errors.Is(err, ErrManifestNotReady) {
-			return nil, err
+			return nil, polls, err
 		}
 
 		// A revoked generation surfaces its decode verdict here instead of
@@ -2660,14 +2685,14 @@ func (s *TranscodeSession) waitForManifest(ctx context.Context, timeout time.Dur
 		virtualInput := isVirtualInputPath(s.opts.CanonicalInputPath)
 		s.mu.Unlock()
 		if virtualInput && s.IsSourceRejected() {
-			return nil, ErrSourceDecodeRejected
+			return nil, polls, ErrSourceDecodeRejected
 		}
 
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, polls, ctx.Err()
 		case <-deadline:
-			return nil, s.manifestTimeoutError(timeout)
+			return nil, polls, s.manifestTimeoutError(timeout)
 		case <-time.After(100 * time.Millisecond):
 		}
 	}

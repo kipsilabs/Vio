@@ -527,7 +527,16 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 			// per-wait timeout or whatever the resolve stages left of the
 			// single startup budget. The session keeps running on
 			// transcodeCtx regardless; only this wait is bounded.
-			if _, readyErr := session.WaitForManifestContext(startupCtx, playback.ManifestStartupTimeout); readyErr == nil {
+			//
+			// For a virtual source this inner wait is a real first-manifest
+			// cost, and the original split folded it into the caller's spawn
+			// span rather than naming it. Record it as its own manifest phase;
+			// the caller subtracts the same delta from spawn so the two stay
+			// disjoint.
+			manifestStart := time.Now()
+			_, readyErr := session.WaitForManifestContext(startupCtx, playback.ManifestStartupTimeout)
+			addTransportPhaseDurationV3(ctx, transportPhaseManifestV3, time.Since(manifestStart))
+			if readyErr == nil {
 				winningURI := resolvedMedia.URI
 				if winningURI == "" || winningURI == neutralPath {
 					if resolvedMedia.CandidateID != "" {
