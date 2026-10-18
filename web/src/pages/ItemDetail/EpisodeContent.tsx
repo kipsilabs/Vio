@@ -435,6 +435,7 @@ export default function EpisodeContent({
               versions={item.versions ?? []}
               playbackVariants={item.playback_variants}
               selectedVersion={selectedVersion}
+              explicitFileSelection={manualSelectedFileId != null}
               onSelectVersion={handleSelectVersion}
               onDownload={
                 user?.download_allowed && (item.versions ?? []).length > 0

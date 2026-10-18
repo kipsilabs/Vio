@@ -16,6 +16,7 @@ import (
 )
 
 const (
+	opPrepareVirtualPlayback        = "prepareVirtualPlayback"
 	opDiscoverVirtualCandidates      = "discoverVirtualCandidates"
 	opRefreshVirtualCandidates       = "refreshVirtualCandidates"
 	opCancelVirtualCandidatesRefresh = "cancelVirtualCandidatesRefresh"
@@ -32,6 +33,15 @@ type VirtualCandidatesRefreshService interface {
 
 type VirtualCandidatesDiscoveryService interface {
 	DiscoverVirtualCandidates(ctx context.Context, userID int, profileID, contentID string, filter catalogpkg.AccessFilter) ([]catalogpkg.FileVersion, error)
+}
+
+type VirtualPlaybackPreparationService interface {
+	PrepareVirtualPlayback(ctx context.Context, userID int, profileID, contentID string, fileID int, filter catalogpkg.AccessFilter) error
+}
+
+type VirtualPlaybackPreparationInput struct {
+	MediaID ID `path:"media_id" doc:"The selected movie or episode"`
+	FileID  ID `path:"file_id" doc:"The selected version's file id from watch detail"`
 }
 
 func (reg *Registry) discoverDetailVersions(ctx context.Context, contentID, mediaType string, versions []catalogpkg.FileVersion, filter catalogpkg.AccessFilter, trigger string) bool {
@@ -91,6 +101,15 @@ type VirtualReleaseRequestOutput struct {
 }
 
 func registerMediaCandidates(reg *Registry) {
+	prepare := humaOp(http.MethodPost, Prefix+"/media/{media_id}/virtual-candidates/{file_id}:prepare", opPrepareVirtualPlayback, "watch",
+		"Best-effort preparation of one selected Usenet stream when enabled, without creating a playback session. Acceptance does not mean the stream is ready.")
+	prepare.DefaultStatus = http.StatusAccepted
+	Register(reg, Operation{
+		Operation: prepare, Class: ClassProfileScoped, ProfileOptional: true,
+		HouseholdProfileGate: true,
+		ServiceBacked: true, RetrySafety: RetrySafetyCoalescing,
+	}, reg.prepareVirtualPlayback)
+
 	discover := humaOp(http.MethodPost, Prefix+"/media/{media_id}/virtual-candidates:discover", opDiscoverVirtualCandidates, "watch",
 		"Discover and persist cached provider versions before playback when enabled, without probing or requesting releases.")
 	discover.DefaultStatus = http.StatusNoContent
@@ -143,6 +162,29 @@ func registerMediaCandidates(reg *Registry) {
 		// enqueue.
 		RetrySafety: RetrySafetyDomainIdentity,
 	}, reg.requestVirtualRelease)
+}
+
+func (reg *Registry) prepareVirtualPlayback(ctx context.Context, in *VirtualPlaybackPreparationInput) (*struct{}, error) {
+	claims := claimsFrom(ctx)
+	if claims == nil {
+		return nil, NewProblem(TypeAuthenticationRequired, "Authentication is required.")
+	}
+	if reg.deps.VirtualPlaybackPreparation == nil || reg.deps.Watch == nil ||
+		reg.deps.PreplayPreparationEnabled == nil || !reg.deps.PreplayPreparationEnabled(ctx) {
+		return nil, unavailable("early stream preparation")
+	}
+	fileID, err := strconv.Atoi(string(in.FileID))
+	if err != nil || fileID <= 0 || strconv.Itoa(fileID) != string(in.FileID) {
+		return nil, NewProblem(TypeValidationFailed, "The selected file id is invalid.")
+	}
+	filter, err := reg.deps.Watch.ContextAccessFilter(ctx, handlers.AccessFilterOptions{})
+	if err != nil {
+		return nil, NewProblem(TypeInternalError, "An unexpected error occurred.")
+	}
+	if err := reg.deps.VirtualPlaybackPreparation.PrepareVirtualPlayback(ctx, claims.UserID, profileFrom(ctx), string(in.MediaID), fileID, filter); err != nil {
+		return nil, serviceProblem(err)
+	}
+	return &struct{}{}, nil
 }
 
 func (reg *Registry) discoverVirtualCandidates(ctx context.Context, in *VirtualCandidatesRefreshInput) (*struct{}, error) {

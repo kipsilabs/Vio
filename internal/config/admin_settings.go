@@ -310,6 +310,7 @@ var adminSettingDefaults = map[string]string{
 
 	"virtual_library.enabled":                        "true",
 	"virtual_library.discover_before_playback":       "false",
+	"virtual_library.prepare_before_playback":        "false",
 	"virtual_library.manifest_url":                   "",
 	"virtual_library.movie_library_id":               "1",
 	"virtual_library.series_library_id":              "2",
@@ -628,7 +629,7 @@ func NormalizeAdminSetting(key, raw string) (string, error) {
 		"notifications.apple_push_delivery_enabled", "notifications.android_push_delivery_enabled",
 		"catalog.search.meilisearch.semantic_enabled", "catalog.search.meilisearch.binary_quantized",
 		"s3.public_path_style", "s3.private_path_style", "s3.user_db_path_style",
-		"virtual_library.enabled", "virtual_library.discover_before_playback", "virtual_library.allow_insecure_http",
+		"virtual_library.enabled", "virtual_library.discover_before_playback", "virtual_library.prepare_before_playback", "virtual_library.allow_insecure_http",
 		"virtual_library.allow_private_streams",
 		"virtual_library.enable_quality_profiles",
 		"virtual_library.single_stream_with_failover",

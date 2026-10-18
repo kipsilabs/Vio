@@ -311,6 +311,8 @@ type Dependencies struct {
 	VirtualCandidatesRefresh   VirtualCandidatesRefreshService
 	VirtualCandidatesDiscovery VirtualCandidatesDiscoveryService
 	PreplayDiscoveryEnabled    func(context.Context) bool
+	VirtualPlaybackPreparation VirtualPlaybackPreparationService
+	PreplayPreparationEnabled  func(context.Context) bool
 	// VirtualReleaseRequest requests one stored indexer release on the
 	// provider. A missing service makes only that operation answer
 	// dependency_unavailable.

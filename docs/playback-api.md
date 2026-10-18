@@ -209,6 +209,50 @@ Server logs identify this path with `pre-play version discovery started`,
 and `trigger=watch_detail`. A successful discovery
 followed by a failed detail re-read logs `pre-play version discovery detail reload failed`.
 
+### Selected Stream Preparation
+
+`virtual_library.prepare_before_playback` is a separate, hot-read setting,
+defaulting to `false`. The `prepare_before_playback` capability flag is true
+only when the setting and service are enabled; it also makes `state` available.
+Clients must treat a missing flag as false.
+
+An active detail view may submit its selected, pinned virtual
+version to `POST /api/v2/media/{media_id}/virtual-candidates/{file_id}:prepare`.
+Web and iOS use their displayed version-selection policy and submit
+only the selected movie or individual episode, not a season, series or browse
+prefetch. When discovery is enabled, the web waits for it to finish. iOS waits
+for a successful watch-detail refresh before using its displayed selection;
+the initial cached version list alone does not trigger automatic preparation.
+Choosing a different pinned version starts preparation for that exact file
+immediately, without waiting for background discovery or an automatic-selection
+debounce. The per-source cooldown still applies when returning to a recently
+prepared version. Preparation
+also works independently for already enumerated versions when discovery is off.
+No URL is accepted from the client. The server checks watch-detail access and
+version membership, then matches that exact pinned candidate against the
+provider list. Hidden, rejected, expired and non-Usenet candidates are skipped.
+
+`202 Accepted` is best-effort admission, not a readiness verdict. Disabled,
+unwired or saturated preparation returns `503`; an inaccessible version returns
+`404`. No playback session, progress, sticky selection or failure state is
+written, and Play remains independent of preparation failures. V1 and Jellyfin
+behavior is unchanged.
+
+The server makes a GET with `Range: bytes=0-0`, reads at most one body byte and
+closes it. This can start provider downloads, imports and health checks even if
+Play is never pressed. Work has a 90-second budget and four concurrent slots
+per API process. Requests for the same installation and pinned source coalesce
+for two minutes through Redis, or a bounded local map without Redis. Redis
+failure fails closed. Service shutdown cancels local work. Private destination
+access still requires `virtual_library.allow_private_streams`.
+
+Closing a detail page does not undo provider-side work already started. Whether
+a later Play request benefits depends on AIOStreams and the downstream provider
+reusing that work; preparation does not cache a resolved URL or join foreground
+playback. Reduced startup latency requires provider-specific verification.
+Android, Android TV, tvOS and macOS do not initiate preparation. Extending this
+to another client requires working version discovery and selection there first.
+
 ### Refresh List
 
 `POST /api/v2/media/{media_id}/virtual-candidates:refresh` is asynchronous. It

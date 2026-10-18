@@ -34,6 +34,7 @@ type VirtualLibraryCapabilities struct {
 	RefreshPrunesDeadCandidates bool `json:"refresh_prunes_dead_candidates"`
 	WaitForImports              bool `json:"wait_for_imports"`
 	DiscoverBeforePlayback      bool `json:"discover_before_playback"`
+	PrepareBeforePlayback       bool `json:"prepare_before_playback"`
 }
 
 type VirtualLibraryCapabilitiesOutput struct {
@@ -57,7 +58,8 @@ func registerVirtualLibraryCapabilities(reg *Registry) {
 			}
 			state := StateNotConfigured
 			discover := reg.deps.VirtualCandidatesDiscovery != nil && reg.deps.PreplayDiscoveryEnabled != nil && reg.deps.PreplayDiscoveryEnabled(ctx)
-			if indexerSearch || indexerRequest || discover {
+			prepare := reg.deps.VirtualPlaybackPreparation != nil && reg.deps.PreplayPreparationEnabled != nil && reg.deps.PreplayPreparationEnabled(ctx)
+			if indexerSearch || indexerRequest || discover || prepare {
 				state = StateAvailable
 			}
 			return &VirtualLibraryCapabilitiesOutput{Body: VirtualLibraryCapabilities{
@@ -67,6 +69,7 @@ func registerVirtualLibraryCapabilities(reg *Registry) {
 				RefreshPrunesDeadCandidates: prunes,
 				WaitForImports:              waits,
 				DiscoverBeforePlayback:      discover,
+				PrepareBeforePlayback:       prepare,
 			}}, nil
 		})
 }

@@ -34,6 +34,7 @@ describe("fetchVirtualLibraryCapability", () => {
           indexer_search: true,
           indexer_request: true,
           discover_before_playback: true,
+          prepare_before_playback: true,
           revision: "rev-7",
         }),
       ),
@@ -50,6 +51,7 @@ describe("fetchVirtualLibraryCapability", () => {
       indexer_search: true,
       indexer_request: true,
       discover_before_playback: true,
+      prepare_before_playback: true,
       revision: "rev-7",
     });
   });
@@ -62,6 +64,7 @@ describe("fetchVirtualLibraryCapability", () => {
     expect(capability.indexer_search).toBe(false);
     expect(capability.indexer_request).toBe(false);
     expect(capability.discover_before_playback).toBe(false);
+    expect(capability.prepare_before_playback).toBe(false);
     expect(capability.revision).toBeUndefined();
   });
 

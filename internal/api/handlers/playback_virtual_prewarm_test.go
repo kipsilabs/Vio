@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -11,8 +12,10 @@ import (
 
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
 	"github.com/Silo-Server/silo-server/internal/auth"
+	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/plugins"
+	"github.com/Silo-Server/silo-server/internal/remotestream"
 )
 
 // prewarmFile is a virtual row with no probe evidence and no persisted
@@ -230,5 +233,133 @@ func TestPrefetchVirtualPlaybackNeverProbes(t *testing.T) {
 	}
 	if got := probeCalls.Load(); got != 0 {
 		t.Fatalf("probe calls = %d, want 0: prefetch must never open a media URL", got)
+	}
+}
+
+func TestSelectedVirtualPreparationCandidate(t *testing.T) {
+	selected := "virtual://movie/tt-preparation?result=selected"
+	base := VirtualPlaybackStream{
+		URI: selected, SourceType: "usenet", ProviderURL: "https://provider.example/selected",
+	}
+	for _, test := range []struct {
+		name      string
+		path      string
+		candidate VirtualPlaybackStream
+		want      bool
+	}{
+		{name: "exact selected usenet release", path: selected, candidate: base, want: true},
+		{name: "placeholder", path: "virtual://movie/tt-preparation", candidate: base},
+		{name: "different selected release", path: "virtual://movie/tt-preparation?result=other", candidate: base},
+		{name: "nonvirtual source", path: "https://provider.example/selected?result=selected", candidate: base},
+		{name: "nonusenet source", path: selected, candidate: VirtualPlaybackStream{URI: selected, SourceType: "torrent", ProviderURL: base.ProviderURL}},
+		{name: "rejected release", path: selected, candidate: VirtualPlaybackStream{URI: selected, SourceType: base.SourceType, ProviderURL: base.ProviderURL, Rejected: true}},
+		{name: "hidden release", path: selected, candidate: VirtualPlaybackStream{URI: selected, SourceType: base.SourceType, ProviderURL: base.ProviderURL, VisibilitySpecified: true}},
+		{name: "missing provider URL", path: selected, candidate: VirtualPlaybackStream{URI: selected, SourceType: base.SourceType}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			candidate, ok := selectedVirtualPreparationCandidate(&models.MediaFile{FilePath: test.path}, []VirtualPlaybackStream{test.candidate})
+			if ok != test.want {
+				t.Fatalf("preparation eligibility = %v, want %v", ok, test.want)
+			}
+			if ok && candidate.URI != selected {
+				t.Fatalf("prepared candidate = %q, want %q", candidate.URI, selected)
+			}
+		})
+	}
+	if _, ok := selectedVirtualPreparationCandidate(nil, []VirtualPlaybackStream{base}); ok {
+		t.Fatal("a missing file must not prepare a candidate")
+	}
+}
+
+func TestVirtualPreparationRequiresEnabledAndAuthorizedVersion(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		enabled bool
+		denied  bool
+	}{
+		{name: "disabled"},
+		{name: "access denied", enabled: true, denied: true},
+		{name: "file not in authorized detail", enabled: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			detail := &fakeRefreshDetail{detail: &catalog.WatchDetail{Type: itemTypeMovie}}
+			if test.denied {
+				detail.err = apiError(http.StatusForbidden, "forbidden", "Forbidden")
+			}
+			service := &VirtualPlaybackPreparationService{
+				Enabled: func(context.Context) bool { return test.enabled },
+				Detail: detail,
+				FileByID: func(context.Context, int) (*models.MediaFile, error) {
+					t.Fatal("must authorize the selected file before loading it")
+					return nil, nil
+				},
+				List: VirtualPlaybackStreamListerFunc(func(context.Context, string, int, string, int) ([]VirtualPlaybackStream, error) {
+					t.Fatal("must not list providers without authorization")
+					return nil, nil
+				}),
+			}
+			if err := service.PrepareVirtualPlayback(context.Background(), 7, "profile-1", "movie-1", 42, catalog.AccessFilter{}); err == nil {
+				t.Fatal("expected preparation to be rejected")
+			}
+		})
+	}
+}
+
+func TestVirtualPreparationUsesBoundedRangeAndPrivateOptIn(t *testing.T) {
+	for _, allowPrivate := range []bool{false, true} {
+		t.Run(fmt.Sprintf("allow_private_%t", allowPrivate), func(t *testing.T) {
+			var requests atomic.Int32
+			requestHeaders := make(chan http.Header, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				requests.Add(1)
+				requestHeaders <- request.Header.Clone()
+				writer.WriteHeader(http.StatusPartialContent)
+				_, _ = writer.Write([]byte{1})
+			}))
+			defer server.Close()
+			file := prewarmFile("virtual://movie/tt-preparation?result=selected")
+			service := &VirtualPlaybackPreparationService{
+				Enabled: func(context.Context) bool { return true },
+				AllowPrivate: func(context.Context) bool { return allowPrivate },
+				publicHTTP: remotestream.NewSafeClient(), privateHTTP: remotestream.NewInsecureClient(),
+				List: VirtualPlaybackStreamListerFunc(func(context.Context, string, int, string, int) ([]VirtualPlaybackStream, error) {
+					return []VirtualPlaybackStream{{
+						URI: file.FilePath, SourceType: "usenet", ProviderURL: server.URL,
+						RequestHeaders: map[string]string{"Referer": "https://provider.example", "Range": "bytes=0-"},
+					}}, nil
+				}),
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			service.prepare(ctx, file, 7, "profile-1")
+			if !allowPrivate {
+				if requests.Load() != 0 {
+					t.Fatal("private source contacted without the explicit network opt-in")
+				}
+				return
+			}
+			select {
+			case headers := <-requestHeaders:
+				if headers.Get("Range") != "bytes=0-0" || headers.Get("Referer") != "https://provider.example" {
+					t.Fatalf("unexpected provider headers: %v", headers)
+				}
+			default:
+				t.Fatal("selected provider was not contacted")
+			}
+		})
+	}
+}
+
+func TestVirtualPreparationCooldown(t *testing.T) {
+	service := &VirtualPlaybackPreparationService{recent: make(map[string]time.Time)}
+	for attempt := range 2 {
+		claimed, err := service.claim(context.Background(), "selected")
+		if err != nil || claimed != (attempt == 0) {
+			t.Fatalf("attempt %d: claimed=%v error=%v", attempt, claimed, err)
+		}
+	}
+	service.recent["selected"] = time.Now().Add(-time.Second)
+	if claimed, err := service.claim(context.Background(), "selected"); err != nil || !claimed {
+		t.Fatalf("expired preparation claim: claimed=%v error=%v", claimed, err)
 	}
 }

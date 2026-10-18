@@ -23,6 +23,7 @@ import { SettingField, SettingFieldStatus } from "./SettingField";
 const PROVIDER_KEYS = [
   "virtual_library.enabled",
   "virtual_library.discover_before_playback",
+  "virtual_library.prepare_before_playback",
   "virtual_library.manifest_url",
   "virtual_library.tmdb_api_key",
   "virtual_library.cache_ttl_minutes",
@@ -268,6 +269,14 @@ export default function StreamingSettings() {
             value={form.getValue("virtual_library.discover_before_playback") || "false"}
             onChange={(v) => form.setValue("virtual_library.discover_before_playback", v)}
             restartRequired={restartKeys.has("virtual_library.discover_before_playback")}
+          />
+          <SettingField
+            label="Prepare selected stream before playback"
+            type="toggle"
+            description="Prepare the selected Usenet version while its detail page is open, including when you choose another version. This can start provider downloads and health checks even if you never press Play."
+            value={form.getValue("virtual_library.prepare_before_playback") || "false"}
+            onChange={(v) => form.setValue("virtual_library.prepare_before_playback", v)}
+            restartRequired={restartKeys.has("virtual_library.prepare_before_playback")}
           />
           <SettingField
             label="TMDB API key"

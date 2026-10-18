@@ -16,6 +16,7 @@ export interface VirtualLibraryCapability {
   indexer_search: boolean;
   indexer_request: boolean;
   discover_before_playback?: boolean;
+  prepare_before_playback?: boolean;
   revision?: string;
 }
 
@@ -34,6 +35,7 @@ export async function fetchVirtualLibraryCapability(): Promise<VirtualLibraryCap
     // Absent or a server that predates the flag fails closed.
     indexer_request: body?.indexer_request === true,
     discover_before_playback: body?.discover_before_playback === true,
+    prepare_before_playback: body?.prepare_before_playback === true,
     revision: typeof body?.revision === "string" ? body.revision : undefined,
   };
 }

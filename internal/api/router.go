@@ -3320,6 +3320,29 @@ func newChiRouter(deps Dependencies) chi.Router {
 			streaming, err := settingsRepo.Get(ctx, "virtual_library.enabled")
 			return err == nil && streaming != "false"
 		}
+		v2deps.PreplayPreparationEnabled = func(ctx context.Context) bool {
+			enabled, err := settingsRepo.Get(ctx, "virtual_library.prepare_before_playback")
+			if err != nil || enabled != "true" {
+				return false
+			}
+			streaming, err := settingsRepo.Get(ctx, "virtual_library.enabled")
+			return err == nil && streaming != "false"
+		}
+		preparation := &handlers.VirtualPlaybackPreparationService{
+			Detail: itemsHandler, FileByID: deps.FileRepo.GetByID,
+			List: virtualCandidatesRefresh.ListCached, Context: deps.AppContext,
+			Enabled: v2deps.PreplayPreparationEnabled,
+			AllowPrivate: func(ctx context.Context) bool {
+				value, err := settingsRepo.Get(ctx, "virtual_library.allow_private_streams")
+				return err == nil && value == "true"
+			},
+		}
+		if deps.RedisClient != nil {
+			preparation.Claim = func(ctx context.Context, key string, ttl time.Duration) (bool, error) {
+				return deps.RedisClient.SetNX(ctx, key, "1", ttl).Result()
+			}
+		}
+		v2deps.VirtualPlaybackPreparation = preparation
 	}
 	if virtualIndexerReleases != nil {
 		v2deps.VirtualReleaseRequest = virtualIndexerReleases

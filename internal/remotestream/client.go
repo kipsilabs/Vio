@@ -118,6 +118,13 @@ func NewSafeClient() *http.Client {
 	}
 }
 
+func NewInsecureClient() *http.Client {
+	return &http.Client{
+		Transport:     NewInsecureTransport(),
+		CheckRedirect: checkRedirectAllowNonPublic,
+	}
+}
+
 func checkRedirect(req *http.Request, via []*http.Request) error {
 	return checkRedirectWithValidator(req, via, func(ctx context.Context, raw string) error {
 		_, err := validateURL(ctx, raw, net.DefaultResolver)

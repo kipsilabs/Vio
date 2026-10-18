@@ -1,5 +1,19 @@
 import { fetchWithSession } from "@/api/client";
 
+export async function prepareVirtualPlayback(
+  mediaId: string,
+  fileId: number,
+  signal?: AbortSignal,
+): Promise<void> {
+  const { res } = await fetchWithSession(
+    `/api/v2/media/${encodeURIComponent(mediaId)}/virtual-candidates/${fileId}:prepare`,
+    { method: "POST", headers: { Accept: "application/json" }, signal },
+  );
+  if (!res.ok) {
+    throw new Error(`Preparing the selected version failed (${res.status}).`);
+  }
+}
+
 export async function discoverVirtualCandidates(
   mediaId: string,
   signal?: AbortSignal,

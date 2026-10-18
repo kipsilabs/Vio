@@ -355,7 +355,16 @@ export default function ActionBar({
       version.file_path ?? "",
     ),
   );
-  const { discovering, failed: discoveryFailed } = usePreplayDiscovery(contentId, virtualDetail);
+  const preparationFileId =
+    /[?&]result=[^&]+/.test(selectedVersion?.file_path ?? "")
+      ? selectedVersion?.file_id
+      : undefined;
+  const { discovering, failed: discoveryFailed } = usePreplayDiscovery(
+    contentId,
+    virtualDetail,
+    preparationFileId,
+    explicitFileSelection,
+  );
   const { awaitAdminJob } = useRealtimeEvents();
   // The item-page "Refresh List": start the async re-list job, wait for it to
   // finish, then re-read the item and the watch detail so both the page's
