@@ -147,6 +147,7 @@ function playbackSession(
     refreshSubtitles: vi.fn(),
     pollInventory: vi.fn().mockResolvedValue(true),
     markInventoryExhausted: vi.fn(),
+    markInventoryRetrying: vi.fn(),
     applySubtitleTrack: vi.fn(),
     applyAudioInventory: vi.fn(),
     applyCommittedSource: vi.fn(),

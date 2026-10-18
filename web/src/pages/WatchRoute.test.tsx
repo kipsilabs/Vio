@@ -134,6 +134,17 @@ describe("buildWatchPageProps", () => {
     expect(props.virtualRanking).toBeUndefined();
   });
 
+  it("keeps the empty playback variants identity stable across builds", () => {
+    const build = () =>
+      buildWatchPageProps({
+        request: makeRequest(),
+        item: makeWatchDetail(),
+        currentProfile: profile,
+      });
+
+    expect(build().playbackVariants).toBe(build().playbackVariants);
+  });
+
   it("prefers effective subtitle defaults from watch detail over raw profile values", () => {
     const props = buildWatchPageProps({
       request: makeRequest(),
