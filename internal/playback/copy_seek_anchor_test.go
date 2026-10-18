@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -939,4 +940,88 @@ func BenchmarkCopySeekAnchorResolveVersusLookup(b *testing.B) {
 			}
 		}
 	})
+}
+
+// TestResolveCopySeekAnchorClassifiesExternalKillAsTransient pins the production
+// failure this fix covers: the probe process was SIGKILLed from outside (the OOM
+// killer or an operator) while the probe context was still live. A signal says
+// nothing about the source bytes, so the failure must be classified transient
+// and keep the caller's bounded retry rather than terminalling the start as a
+// verdict about the release.
+func TestResolveCopySeekAnchorClassifiesExternalKillAsTransient(t *testing.T) {
+	dir := t.TempDir()
+	ffmpegPath := filepath.Join(dir, "ffmpeg")
+	if err := os.WriteFile(ffmpegPath, []byte("#!/bin/sh\nkill -9 $$\n"), 0o755); err != nil {
+		t.Fatalf("write fake ffmpeg: %v", err)
+	}
+
+	_, _, err := ResolveCopySeekAnchor(context.Background(), ffmpegPath, "/media/external-kill.mkv", 120, 2)
+	if err == nil {
+		t.Fatal("an externally killed probe resolved an anchor")
+	}
+	if !IsTransientProviderError(err) {
+		t.Fatalf("external SIGKILL classified as non-transient: %v", err)
+	}
+	sig, ok := copySeekProbeKill(err)
+	if !ok || sig != syscall.SIGKILL {
+		t.Fatalf("probe kill signal = %v, %v; want SIGKILL in the error chain (%v)", sig, ok, err)
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("classification dropped the process exit error: %v", err)
+	}
+}
+
+// TestResolveCopySeekAnchorProbeTimeoutIsNotTransientProvider pins the other
+// side of the kill classification: when the probe's own budget expires, FFmpeg
+// is killed by our context, not from outside. That is a timeout, so it must not
+// carry the transient-provider marker (the caller keeps its existing single
+// immediate retry without the provider backoff) and it must stay recognizable as
+// the context deadline it is.
+func TestResolveCopySeekAnchorProbeTimeoutIsNotTransientProvider(t *testing.T) {
+	dir := t.TempDir()
+	ffmpegPath := filepath.Join(dir, "ffmpeg")
+	if err := os.WriteFile(ffmpegPath, []byte("#!/bin/sh\nsleep 5\n"), 0o755); err != nil {
+		t.Fatalf("write fake ffmpeg: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	_, _, err := ResolveCopySeekAnchor(ctx, ffmpegPath, "/media/probe-timeout.mkv", 120, 2)
+	if err == nil {
+		t.Fatal("a timed-out probe resolved an anchor")
+	}
+	if IsTransientProviderError(err) {
+		t.Fatalf("probe timeout classified as a transient provider error: %v", err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("probe timeout = %v, want context.DeadlineExceeded in the chain", err)
+	}
+}
+
+// TestResolveCopySeekAnchorDecodeFailureIsNotTransient is the negative case: a
+// real FFmpeg decode/config failure exits with a status of its own, which is a
+// verdict about the release (or the request) and must not be retried as the
+// transient provider/external-kill class.
+func TestResolveCopySeekAnchorDecodeFailureIsNotTransient(t *testing.T) {
+	dir := t.TempDir()
+	ffmpegPath := filepath.Join(dir, "ffmpeg")
+	probe := "#!/bin/sh\n" +
+		"printf '%s\\n' '[h264 @ 0x1] Invalid NAL unit size (1234 > 99).' >&2\n" +
+		"exit 1\n"
+	if err := os.WriteFile(ffmpegPath, []byte(probe), 0o755); err != nil {
+		t.Fatalf("write fake ffmpeg: %v", err)
+	}
+
+	_, _, err := ResolveCopySeekAnchor(context.Background(), ffmpegPath, "/media/decode-failure.mkv", 120, 2)
+	if err == nil {
+		t.Fatal("a decode failure resolved an anchor")
+	}
+	if IsTransientProviderError(err) {
+		t.Fatalf("genuine decode failure classified as transient: %v", err)
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("decode failure lost its process exit error: %v", err)
+	}
 }

@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"golang.org/x/sync/singleflight"
@@ -101,14 +102,92 @@ var upstream5xxMarkers = []string{
 	"Server returned 505",
 }
 
+// upstream5xxMarker returns the first marker proving the probe's stderr tail
+// names an upstream 5xx, or the empty string when none does.
+func upstream5xxMarker(stderrTail string) string {
+	for _, marker := range upstream5xxMarkers {
+		if strings.Contains(stderrTail, marker) {
+			return marker
+		}
+	}
+	return ""
+}
+
 // transientProviderCause wraps the command error with ErrTransientProvider when
 // the probe's stderr tail names an upstream 5xx. The original error is kept so
 // the exit status and message still reach the caller.
 func transientProviderCause(err error, stderrTail string) error {
-	for _, marker := range upstream5xxMarkers {
-		if strings.Contains(stderrTail, marker) {
-			return fmt.Errorf("%w: %w", ErrTransientProvider, err)
+	if upstream5xxMarker(stderrTail) != "" {
+		return fmt.Errorf("%w: %w", ErrTransientProvider, err)
+	}
+	return err
+}
+
+// externalProbeKillSignals are the signals that mean the probe process was
+// terminated from outside instead of exiting with a status of its own. SIGKILL
+// is the OOM killer or an operator's kill -9; SIGTERM is an orderly external
+// stop. Either one says nothing about the source bytes, so the probe is retried
+// once. Other signals (for example a repeatable FFmpeg crash) stay ordinary
+// failures, because a second probe would die the same way.
+var externalProbeKillSignals = []syscall.Signal{syscall.SIGKILL, syscall.SIGTERM}
+
+// copySeekProbeKill reports the external termination signal that ended the probe
+// process, if any. A decoder rejection, an invalid configuration, or a 4xx
+// refusal exits with a status instead, so only a signal match is treated as an
+// external kill rather than a verdict about the release.
+func copySeekProbeKill(err error) (syscall.Signal, bool) {
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ProcessState == nil {
+		return 0, false
+	}
+	status, ok := exitErr.Sys().(syscall.WaitStatus)
+	if !ok || !status.Signaled() {
+		return 0, false
+	}
+	sig := status.Signal()
+	for _, external := range externalProbeKillSignals {
+		if sig == external {
+			return sig, true
 		}
+	}
+	return 0, false
+}
+
+// classifyCopySeekProbeFailure turns one FFmpeg probe failure into the error a
+// caller classifies for retry, and logs why. The probe context is checked first:
+// context cancellation, including the probe's own budget expiring, kills the
+// process with SIGKILL, and that kill is our own doing rather than evidence
+// about the release, so it is not transient (a caller cancellation must never be
+// retried and a timeout keeps its existing single immediate retry). An external
+// SIGKILL/SIGTERM with the probe context still live is also not evidence about
+// the release, so it is transient and the caller's bounded retry applies. An
+// upstream 5xx marker is transient too, but the caller backs off before
+// re-probing a provider that is already failing. Everything else, such as a
+// decoder rejection or a 4xx configuration refusal, stays an ordinary failure.
+func classifyCopySeekProbeFailure(ctx context.Context, err error, stderr string) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		slog.WarnContext(ctx, "copy seek anchor probe stopped by its own context; not a provider verdict",
+			"component", "playback",
+			"cause", ctxErr,
+			"error", err,
+		)
+		return fmt.Errorf("resolve copy seek anchor: probe interrupted: %w", ctxErr)
+	}
+	if sig, ok := copySeekProbeKill(err); ok {
+		slog.WarnContext(ctx, "copy seek anchor probe killed by an external signal; treating the probe as transient",
+			"component", "playback",
+			"signal", sig.String(),
+			"error", err,
+		)
+		return fmt.Errorf("%w: %w", ErrTransientProvider, err)
+	}
+	if marker := upstream5xxMarker(stderr); marker != "" {
+		slog.WarnContext(ctx, "copy seek anchor probe hit a transient upstream provider response",
+			"component", "playback",
+			"marker", marker,
+			"error", err,
+		)
+		return fmt.Errorf("%w: %w", ErrTransientProvider, err)
 	}
 	return err
 }
@@ -546,8 +625,11 @@ func resolveCopySeekAnchor(
 		tail := truncateStderr(stderr.String())
 		// Classify the full tail, not the truncated message: an upstream 5xx is
 		// a transient provider failure a caller should back off and retry, while
-		// a decoder/stream error is not.
-		cause := transientProviderCause(err, stderr.String())
+		// a decoder/stream error is not. An external SIGKILL/SIGTERM is also
+		// transient: the kill says nothing about the release, so the caller's
+		// bounded retry covers it once. The probe's own context cancellation
+		// stays distinct so it is never retried as a provider verdict.
+		cause := classifyCopySeekProbeFailure(ctx, err, stderr.String())
 		if tail != "" {
 			return 0, 0, fmt.Errorf("resolve copy seek anchor: ffmpeg failed: %w (stderr: %s)", cause, tail)
 		}
