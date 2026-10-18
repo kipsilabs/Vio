@@ -94,6 +94,24 @@ func execVirtualFileMetadataUpdateResultTx(ctx context.Context, db VirtualFileMe
 	}
 
 	persistedPath, writeErr := statement.run(ctx, tx, args, args.AdoptPath)
+	if writeErr == nil && persistedPath == "" && args.RequireAdopt && args.AdoptPath != "" {
+		// A stale CAS snapshot is not an identity refusal. A provider re-list or
+		// rematch may have churned the ?result= token or advanced the evidence
+		// revision after the caller's snapshot, so the fence matches no row even
+		// though this is the same row. The row is locked for this transaction,
+		// so re-read it and retry the same write against the state that is
+		// actually current; only a row still inside the same item/profile is
+		// re-based.
+		if current, found, readErr := readVirtualRowCASState(ctx, tx, args.FileID); readErr == nil && found {
+			retried := refreshVirtualPersistArgsForRow(args, current)
+			if virtualPersistSnapshotMoved(args, retried) {
+				persistedPath, writeErr = statement.run(ctx, tx, retried, retried.AdoptPath)
+				if writeErr == nil {
+					args = retried
+				}
+			}
+		}
+	}
 	if writeErr == nil {
 		if persistedPath == "" {
 			// Only a required adoption that matched no row is a refusal. An

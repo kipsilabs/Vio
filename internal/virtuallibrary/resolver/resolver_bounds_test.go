@@ -117,8 +117,8 @@ func TestTMDBExternalIDsNegativeCached(t *testing.T) {
 
 // TestTMDBExternalIDTimeoutBounded pins the dedicated translation timeout: a
 // hung TMDB lookup is bounded well under the shared metadata client's 20s, and
-// because the caller's context is still alive the timeout is negative-cached
-// so the next resolve fails fast.
+// the timeout is a retryable provider failure — never a negative cache entry,
+// because a slow TMDB says nothing about whether the title has an IMDb id.
 func TestTMDBExternalIDTimeoutBounded(t *testing.T) {
 	prev := tmdbExternalIDTimeout
 	tmdbExternalIDTimeout = 50 * time.Millisecond
@@ -145,13 +145,15 @@ func TestTMDBExternalIDTimeoutBounded(t *testing.T) {
 		t.Fatalf("translation blocked for %v, want the dedicated timeout to bound it", elapsed)
 	}
 
-	// Our own timeout fired while the caller's context was alive, so the
-	// timeout is a genuine provider failure and must be cached.
-	if _, _, _, err := r.GetCandidates(ctx, "virtual://movie/tmdb:83533"); err == nil {
-		t.Fatal("second call: nil error, want the cached translation failure")
+	// Our own timeout fired while the caller's context is alive, so the
+	// timeout is a genuine provider failure — but an availability-shaped one:
+	// the next resolve must retry the lookup instead of serving a cached
+	// "no IMDb id" failure.
+	if _, _, _, err := r.GetCandidates(ctx, "virtual://movie/tmdb:83533"); err == nil || !errors.Is(err, ErrTMDBExternalIDLookupFailed) {
+		t.Fatalf("second call error = %v, want the retryable lookup failure", err)
 	}
-	if got := tmdb.requests(); got != 1 {
-		t.Fatalf("TMDB requests = %d, want 1 (timeout negative-cached)", got)
+	if got := tmdb.requests(); got != 2 {
+		t.Fatalf("TMDB requests = %d, want 2 (a timeout is not negative-cached)", got)
 	}
 }
 

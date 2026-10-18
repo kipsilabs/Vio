@@ -186,6 +186,12 @@ type StreamHandler struct {
 	// (font_extract_failed) stays the client-visible signal and the debug line
 	// keeps the diagnostic trail.
 	fontExtractFailures fontExtractFailLog
+	// virtualStreamRecoveryTerminals bounds cross-request recovery after a
+	// session-bound virtual candidate and its one bounded rotation have both
+	// failed. Once recorded, matching requests fail fast for a short TTL
+	// instead of replaying the resolve and rotation on every segment retry. A
+	// successful serve or a different candidate binding clears the way.
+	virtualStreamRecoveryTerminals virtualStreamRecoveryCache
 }
 
 // fontExtractFailLog throttles the subtitle-font extraction warning. See the
@@ -1641,6 +1647,25 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 	// the transport ends. It is a no-op for a non-virtual source.
 	releaseCacheHandoff := func() {}
 	if isVirtualPlaybackFile(file) && hasVirtualMediaResolver(h) {
+		// A previous request already spent the initial resolve and the bounded
+		// rotation on this session-bound candidate and produced no bytes. A
+		// client segment retry must not replay that whole recovery inside the
+		// short terminal window: answer the same retryable 502 until the
+		// session replans to another candidate or the entry expires.
+		if candidateID := virtualCandidateID(file); candidateID != "" &&
+			h.virtualStreamRecoveryTerminals.blocked(sessionID, candidateID) {
+			err := fmt.Errorf("virtual stream recovery exhausted for candidate %q", candidateID)
+			slog.DebugContext(r.Context(), "virtual stream recovery terminal",
+				"component", "api",
+				"session", sessionID,
+				"playback_session_id", sessionID,
+				"file_id", file.ID,
+				"pinned_candidate_id", candidateID,
+				"status", "failed_fast",
+			)
+			writeErrorCause(w, http.StatusBadGateway, "virtual_stream_unavailable", "Failed to stream virtual media source", err)
+			return
+		}
 		resolved, cleanup, resolveErr := h.resolveVirtualInputURI(r.Context(), file, session.UserID, session.ProfileID, false)
 		if resolveErr != nil && (errors.Is(resolveErr, virtuallibrary.ErrSessionBoundCandidateAbsent) || errors.Is(resolveErr, ErrVirtualCandidateMarkedFailed)) {
 			// The session's pinned release is absent from the provider's current
@@ -1745,6 +1770,11 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 			// dead-candidate verdict; the pinned release may still rotate for
 			// this attempt when a sibling exists.
 			relayTemporary := false
+			// recoveryExhaustedCandidateID names the pinned candidate whose
+			// initial serve and bounded rotation both failed without bytes.
+			// Recording it remembers the exhausted recovery for this session;
+			// an empty value means there is nothing to remember.
+			recoveryExhaustedCandidateID := ""
 			proxy := &httputil.ReverseProxy{
 				Rewrite: func(pr *httputil.ProxyRequest) {
 					pr.Out.URL = targetURL
@@ -1874,6 +1904,7 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 							// served bytes. Mirrors the success tail below.
 							if virtualCandidateDeliveryEvidence(streamWriter.StatusCode(), streamWriter.BytesWritten()) {
 								h.clearVirtualCandidateRecovered(r.Context(), file, deliveredPath, virtualObservedFailedAt)
+								h.virtualStreamRecoveryTerminals.clearSession(sessionID)
 							}
 							return
 						}
@@ -1893,8 +1924,19 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 						// but nothing is persisted, so the pin stays eligible
 						// for the next auto-pick.
 						failedID := virtualResultCandidateID(deliveredPath)
-						if failedID != "" && !relayTemporary {
-							h.markVirtualCandidateFailed(r.Context(), file, failedID)
+						if failedID != "" {
+							// The initial serve failed; the rotation below is
+							// the only remaining recovery for this request.
+							// Remember the candidate so an exhausted rotation
+							// can fail later retries fast. A transport-
+							// temporary failure is still remembered here: it
+							// is not a durable dead-candidate verdict, but the
+							// exhausted request is just as expensive to
+							// replay.
+							recoveryExhaustedCandidateID = failedID
+							if !relayTemporary {
+								h.markVirtualCandidateFailed(r.Context(), file, failedID)
+							}
 						}
 						excluded := []string{failedID}
 						if failedID == "" {
@@ -1985,6 +2027,16 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 				if lastProxyErr != nil {
+					// Both the pinned candidate and its one bounded rotation
+					// failed without delivering bytes. Remember that for this
+					// session and candidate so segment retries inside the
+					// short terminal window fail fast instead of re-running
+					// the same resolve and rotation. A successful serve, a
+					// different binding, or expiry clears the way.
+					if streamWriter.StatusCode() == 0 && recoveryExhaustedCandidateID != "" &&
+						!isClientCancellation(r.Context(), lastProxyErr) {
+						h.virtualStreamRecoveryTerminals.record(sessionID, recoveryExhaustedCandidateID)
+					}
 					h.handleTransportStartFailure(r.Context(), session, file, lastProxyErr)
 					if streamWriter.StatusCode() == 0 {
 						logVirtualStreamFailure(r.Context(), sessionID, file, lastProxyErr, deliveredPath)
@@ -1994,6 +2046,7 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 			}
 			if lastProxyErr == nil && virtualCandidateDeliveryEvidence(streamWriter.StatusCode(), streamWriter.BytesWritten()) {
 				h.clearVirtualCandidateRecovered(r.Context(), file, deliveredPath, virtualObservedFailedAt)
+				h.virtualStreamRecoveryTerminals.clearSession(sessionID)
 			}
 			return
 		}
