@@ -357,12 +357,16 @@ func (h *CatalogResourceHandler) ItemDetail(ctx context.Context, v ItemViewer, i
 				if isNotFound(syntheticErr) {
 					return nil, apiError(http.StatusNotFound, "not_found", "Item not found")
 				}
+				// The wire answer stays generic; the cause is logged for
+				// diagnosis of the intermittent failures seen in deployment.
+				slog.WarnContext(ctx, "catalog: synthetic season detail failed", "component", "api", "item_id", id, "error", syntheticErr)
 				return nil, apiError(http.StatusInternalServerError, "internal_error", "Failed to get item detail")
 			}
 			h.enrichItemDetail(ctx, v, syntheticDetail)
 			h.items.maybeRequestStaleDetailMetadataRefresh(ctx, syntheticDetail)
 			return syntheticDetail, nil
 		}
+		slog.WarnContext(ctx, "catalog: item detail failed", "component", "api", "item_id", id, "error", err)
 		return nil, apiError(http.StatusInternalServerError, "internal_error", "Failed to get item detail")
 	}
 	h.enrichItemDetail(ctx, v, detail)

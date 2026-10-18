@@ -197,16 +197,28 @@ native clients receive the persisted versions without calling the
 discovery operation themselves. Discovery has a 15-second waiting budget.
 On failure, the original detail is returned; shared provider work may finish
 after that wait and be visible on a later request.
-Catalog item detail reads never initiate pre-play discovery: artwork and
-metadata can render before the web's discovery call or the native client's
-watch-detail enrichment finishes. Local-file details, browse results, and
-season/series lists do not trigger it.
-Client-side watch-detail prefetches can trigger discovery; a view served entirely
-from the client's cache cannot. This does not add a Jellyfin-protocol trigger.
 
-Server logs identify this path with `pre-play version discovery started`,
+When enabled, a leaf catalog detail read — `GET /api/v2/catalog/items/{id}`
+resolving to a virtual movie or individual episode — runs the same discovery
+and re-reads the item detail before answering, under a 2-second waiting
+budget: browsing is the hot path and native clients such as Android read item
+detail alone before play. Shared provider work keeps running detached from
+the request, so a listing that finishes after the budget is visible on a
+later read. Discovery failure, a timeout, or a failed detail re-read returns
+the original detail. Eligibility reads the stored source rows and never the
+response's redacted file paths, so viewers without file-path visibility reach
+the same discovery.
+
+Local-file details, version-only routes, browse results, and series, season,
+and episode lists — including `GET /api/v2/catalog/items/{id}/versions`,
+`/episodes`, and the series season endpoints — still never initiate discovery.
+A view served entirely from the client's cache cannot. This does not add a
+Jellyfin-protocol trigger.
+
+Server logs identify these paths with `pre-play version discovery started`,
 `pre-play version discovery completed`, or `pre-play version discovery unavailable`
-and `trigger=watch_detail`. A successful discovery
+and `trigger=watch_detail` (watch detail) or `trigger=catalog_detail`
+(catalog leaf detail). A successful discovery
 followed by a failed detail re-read logs `pre-play version discovery detail reload failed`.
 
 ### Refresh List

@@ -365,7 +365,7 @@ func (reg *Registry) getWatchState(ctx context.Context, in *WatchDetailInput) (*
 	if err != nil {
 		return nil, watchDetailProblem(err)
 	}
-	if detail != nil && reg.discoverDetailVersions(ctx, string(in.ID), detail.Type, detail.Versions, filter, "watch_detail") {
+	if detail != nil && reg.discoverDetailVersions(ctx, detail.ContentID, detail.Type, filter, "watch_detail", preplayDiscoveryWatchBudget) {
 		refreshed, refreshErr := reg.deps.Watch.WatchDetail(ctx, claims.UserID, profileFrom(ctx), string(in.ID), filter)
 		if refreshErr == nil && refreshed != nil {
 			detail = refreshed

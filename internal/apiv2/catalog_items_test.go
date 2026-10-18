@@ -265,6 +265,14 @@ type fakePreplayCatalog struct {
 	discoveryUser int
 	discoveryID   string
 	bounded       bool
+	// hasVirtual is the eligibility answer from the stored rows (the table's
+	// unredacted path), independent of the file paths the response returns:
+	// a viewer's redaction must not gate discovery.
+	hasVirtual bool
+}
+
+func (fake *fakePreplayCatalog) HasVirtualSource(_ context.Context, _ string) (bool, error) {
+	return fake.hasVirtual, nil
 }
 
 func (fake *fakePreplayCatalog) ItemDetail(_ context.Context, viewer handlers.ItemViewer, _ string) (*catalogpkg.ItemDetail, error) {
@@ -318,6 +326,7 @@ func TestDetailPreplayDiscovery(t *testing.T) {
 			disabled    bool
 			unwired     bool
 			denied      bool
+			redactPath  bool
 			discoverErr error
 			reloadErr   error
 			wantCalls   int
@@ -326,6 +335,7 @@ func TestDetailPreplayDiscovery(t *testing.T) {
 		}{
 			{name: "movie", mediaType: "movie", path: "virtual://movie/tt0113277", wantCalls: 1, wantReads: 2, wantFileID: "121"},
 			{name: "episode", mediaType: "episode", path: "virtual://series/tvdb/393159/1/2", wantCalls: 1, wantReads: 2, wantFileID: "121"},
+			{name: "redacted for viewer", mediaType: "movie", path: "virtual://movie/tt0113277", redactPath: true, wantCalls: 1, wantReads: 2, wantFileID: "121"},
 			{name: "disabled", mediaType: "movie", path: "virtual://movie/tt0113277", disabled: true, wantReads: 1, wantFileID: "120"},
 			{name: "unwired", mediaType: "movie", path: "virtual://movie/tt0113277", unwired: true, wantReads: 1, wantFileID: "120"},
 			{name: "local", mediaType: "movie", path: "/media/movie.mkv", wantReads: 1, wantFileID: "120"},
@@ -336,17 +346,18 @@ func TestDetailPreplayDiscovery(t *testing.T) {
 			{name: "reload failure", mediaType: "movie", path: "virtual://movie/tt0113277", reloadErr: errors.New("reload failed"), wantCalls: 1, wantReads: 2, wantFileID: "120"},
 			{name: "denied", mediaType: "movie", path: "virtual://movie/tt0113277", denied: true, wantReads: 1},
 		} {
-			if endpoint == "catalog/items" {
-				test.wantCalls = 0
-				test.wantReads = 1
-				test.wantFileID = "120"
-			}
 			t.Run(endpoint+"/"+test.name, func(t *testing.T) {
 				deps, base := catalogDeps(t)
 				fake := &fakePreplayCatalog{
 					fakeCatalog: base, discoveryErr: test.discoverErr, reloadErr: test.reloadErr,
 					detail: catalogpkg.ItemDetail{ContentID: "movie:heat-1995", Type: test.mediaType,
 						Versions: []catalogpkg.FileVersion{{FileID: 120, FilePath: test.path, AddedAt: fixedTime()}}},
+					hasVirtual: strings.HasPrefix(test.path, "virtual://"),
+				}
+				if test.redactPath {
+					// A non-curator viewer's answer strips the stored path; the
+					// eligibility lookup reads the real rows instead.
+					fake.detail.Versions[0].FilePath = ""
 				}
 				if test.denied {
 					fake.err = notFoundItem()
@@ -384,6 +395,24 @@ func TestDetailPreplayDiscovery(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestCatalogVersionsRouteDoesNotDiscover(t *testing.T) {
+	deps, base := catalogDeps(t)
+	fake := &fakePreplayCatalog{fakeCatalog: base,
+		detail: catalogpkg.ItemDetail{ContentID: "movie:heat-1995", Type: "movie",
+			Versions: []catalogpkg.FileVersion{{FileID: 120, FilePath: "virtual://movie/tt0113277", AddedAt: fixedTime()}}},
+		hasVirtual: true}
+	deps.CatalogItems = fake
+	deps.VirtualCandidatesDiscovery = fake
+	deps.PreplayDiscoveryEnabled = func(context.Context) bool { return true }
+	rec := do(t, newTestHandler(t, deps), http.MethodGet, "/api/v2/catalog/items/movie:heat-1995/versions", "", viewerHeaders())
+	if rec.Code != http.StatusOK {
+		t.Fatal(rec.Body.String())
+	}
+	if fake.discoveries != 0 {
+		t.Fatal("versions route initiated pre-play discovery")
 	}
 }
 
