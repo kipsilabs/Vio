@@ -610,6 +610,76 @@ describe("VersionDropdown raw provider ids", () => {
   });
 });
 
+describe("VersionDropdown release line wiring", () => {
+  function makeReleaseVersions(): FileVersion[] {
+    return [
+      // The catalog item detail carries no matched_formats; only the watch
+      // detail does.
+      makeVersion({ file_id: 1, resolution: "2160p", edition_raw: "Movie.2026.2160p.WEB-DL" }),
+      makeVersion({ file_id: 2, resolution: "1080p" }),
+    ];
+  }
+
+  it("shows the release line on the trigger and the selected row once watch data arrives", () => {
+    const onSelectVersion = vi.fn();
+    // No watch data yet: the trigger falls back to the quality summary.
+    const versions = makeReleaseVersions();
+    const { rerender } = render(
+      <VersionDropdown
+        versions={versions}
+        selectedVersion={versions[0]!}
+        onSelectVersion={onSelectVersion}
+        contentId="movie-1"
+      />,
+    );
+    expect(screen.getByRole("button", { name: /Version/ })).toHaveTextContent(
+      "2160p · WEB-DL · H264 · AAC",
+    );
+
+    // The watch detail arrives (as when the player already loaded it); a fresh
+    // versions reference defeats the component's memo and re-renders.
+    watchDetailMock.current = {
+      versions: [{ file_id: 1, format_score: 850, matched_formats: ["Remux"] }],
+    };
+    const enriched = makeReleaseVersions();
+    rerender(
+      <VersionDropdown
+        versions={enriched}
+        selectedVersion={enriched[0]!}
+        onSelectVersion={onSelectVersion}
+        contentId="movie-1"
+      />,
+    );
+
+    // The trigger shows the release line without any row click.
+    const trigger = screen.getByRole("button", { name: /Version/ });
+    expect(trigger).toHaveTextContent("[Remux][2160p WEB-DL][AAC][H264]");
+
+    // Opening the picker shows the same release line on the selected row.
+    fireEvent.click(trigger);
+    const dialog = within(screen.getByRole("dialog"));
+    expect(dialog.getByText("[Remux][2160p WEB-DL][AAC][H264]")).toBeInTheDocument();
+    expect(dialog.getByText("★ 850")).toBeInTheDocument();
+    expect(onSelectVersion).not.toHaveBeenCalled();
+  });
+
+  it("keeps the quality summary on the trigger when watch data is absent", () => {
+    const versions = makeReleaseVersions();
+    render(
+      <VersionDropdown
+        versions={versions}
+        selectedVersion={versions[0]!}
+        onSelectVersion={vi.fn()}
+        contentId="movie-1"
+      />,
+    );
+
+    const trigger = screen.getByRole("button", { name: /Version/ });
+    expect(trigger).toHaveTextContent("2160p · WEB-DL · H264 · AAC");
+    expect(trigger).not.toHaveTextContent("[Remux]");
+  });
+});
+
 describe("VersionDropdown ranking indicator", () => {
   it("names the profile the ranked candidates carry", () => {
     const dialog = openPicker([

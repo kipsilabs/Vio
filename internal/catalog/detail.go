@@ -74,12 +74,22 @@ type ChapterThumbnailQueuer interface {
 	QueuePriorityFileAtPosition(ctx context.Context, fileID int, targetSeconds float64)
 }
 
-// VirtualCandidateScoreSource returns the custom-format score the virtual
-// ranking assigned to each candidate file, keyed by media-file ID. The scorer
-// is injected rather than imported because the virtual library service imports
-// catalog, so the dependency cannot point the other way. A nil source, a
-// provider miss, or an unscored candidate leaves the version without a score.
-type VirtualCandidateScoreSource func(ctx context.Context, contentID string, files []*models.MediaFile) map[int]int
+// VirtualCandidateScore is the custom-format ranking summary for one virtual
+// candidate file: the summed score the ranking assigned and the names of the
+// enabled, non-rejecting formats that matched it. MatchedFormats is nil for a
+// candidate that matched none. Both fields are absent on the wire for an
+// unscored row.
+type VirtualCandidateScore struct {
+	Score          int
+	MatchedFormats []string
+}
+
+// VirtualCandidateScoreSource returns the custom-format ranking summary the
+// virtual ranking assigned to each candidate file, keyed by media-file ID. The
+// scorer is injected rather than imported because the virtual library service
+// imports catalog, so the dependency cannot point the other way. A nil source,
+// a provider miss, or an unscored candidate leaves the version without a score.
+type VirtualCandidateScoreSource func(ctx context.Context, contentID string, files []*models.MediaFile) map[int]VirtualCandidateScore
 
 // VirtualRanking source values reported on the wire. A profile-scoped selector
 // names the profile that produced the order; the default is the built-in order
@@ -567,7 +577,12 @@ type FileVersion struct {
 	// virtual candidate under the active quality profile. Absent for local
 	// files and when no ranking ran, so an unscored row shows nothing. It is a
 	// display-only hint and is never used for ordering here.
-	FormatScore    *int                   `json:"format_score,omitempty"`
+	FormatScore *int `json:"format_score,omitempty"`
+	// MatchedFormats names the enabled, non-rejecting custom formats the
+	// virtual ranking matched on this candidate, ordered score-descending then
+	// name-ascending. It accompanies FormatScore and is absent on the same
+	// unscored rows. Display-only: ordering never consults it.
+	MatchedFormats []string               `json:"matched_formats,omitempty"`
 	VideoTracks    []models.VideoTrack    `json:"video_tracks,omitempty"`
 	AudioTracks    []models.AudioTrack    `json:"audio_tracks,omitempty"`
 	SubtitleTracks []VersionSubtitleTrack `json:"subtitle_tracks,omitempty"`
@@ -3540,7 +3555,8 @@ func (s *DetailService) attachVirtualCandidateScores(
 	}
 	for i := range versions {
 		if score, ok := scores[versions[i].FileID]; ok {
-			versions[i].FormatScore = intPtr(score)
+			versions[i].FormatScore = intPtr(score.Score)
+			versions[i].MatchedFormats = score.MatchedFormats
 		}
 	}
 }
@@ -3561,7 +3577,7 @@ func (s *DetailService) attachVirtualCandidateScores(
 // slot before the deadline and fail open without spawning another goroutine,
 // which bounds the leak. Acquiring a slot shares the response deadline
 // established for the lookup, so a caller never waits past virtualScoreTimeout.
-func (s *DetailService) scoreVirtualCandidates(ctx context.Context, contentID string, files []*models.MediaFile) map[int]int {
+func (s *DetailService) scoreVirtualCandidates(ctx context.Context, contentID string, files []*models.MediaFile) map[int]VirtualCandidateScore {
 	scoreCtx, cancel := context.WithTimeout(ctx, virtualScoreTimeout)
 	defer cancel()
 
@@ -3574,7 +3590,7 @@ func (s *DetailService) scoreVirtualCandidates(ctx context.Context, contentID st
 		return nil
 	}
 
-	done := make(chan map[int]int, 1)
+	done := make(chan map[int]VirtualCandidateScore, 1)
 	go func() {
 		defer func() { <-s.virtualScoreSem }()
 		defer func() {

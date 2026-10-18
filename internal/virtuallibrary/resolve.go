@@ -270,6 +270,11 @@ type PlaybackStream struct {
 	// transient ranking signal, recomputed on every list; reject means
 	// rank-last and last-resort selectable, never a hard drop.
 	Rejected bool
+	// MatchedFormats names the enabled, non-rejecting custom formats this
+	// candidate matched under the listing's profile, ordered score-descending
+	// then name-ascending. Display metadata for the version list, recomputed
+	// on every list like QualityScore; nil when none matched.
+	MatchedFormats []string
 }
 
 // ValidateProviderStreamURL checks structural syntax and enforces SSRF
@@ -955,6 +960,7 @@ func (s *Service) playbackStreamsFrom(ctx context.Context, virtualPath string, c
 	// verdict must be carried on the stream records.
 	s.rankCandidatesForVirtualPath(virtualPath, candidates)
 	s.warnIfAllRejected(ctx, virtualPath, candidates)
+	formats := s.cfg.Quality.CustomFormats
 	streams := make([]PlaybackStream, 0, len(candidates))
 	for _, c := range candidates {
 		id := stream.CandidateVariantID(c)
@@ -968,6 +974,7 @@ func (s *Service) playbackStreamsFrom(ctx context.Context, virtualPath string, c
 			CodecAudio:          c.CodecAudio,
 			HasAtmos:            c.HasAtmos,
 			QualityScore:        c.QualityScore,
+			MatchedFormats:      quality.MatchedFormatNames(c, formats),
 			Rejected:            c.CustomFormatRejected,
 			RequestHeaders:      c.RequestHeaders,
 			ExpiresAt:           c.ExpiresAt,
