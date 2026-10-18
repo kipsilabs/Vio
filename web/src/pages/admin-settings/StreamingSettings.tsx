@@ -273,7 +273,7 @@ export default function StreamingSettings() {
           <SettingField
             label="Prepare selected stream before playback"
             type="toggle"
-            description="Prepare the selected Usenet version while its detail page is open, including when you choose another version. This can start provider downloads and health checks even if you never press Play."
+            description="Prepare the selected provider stream while its detail page is open, including when you choose another version. This can start provider downloads and health checks even if you never press Play."
             value={form.getValue("virtual_library.prepare_before_playback") || "false"}
             onChange={(v) => form.setValue("virtual_library.prepare_before_playback", v)}
             restartRequired={restartKeys.has("virtual_library.prepare_before_playback")}

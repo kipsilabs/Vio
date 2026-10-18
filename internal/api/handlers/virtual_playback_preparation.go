@@ -221,7 +221,7 @@ func selectedVirtualPreparationCandidate(file *models.MediaFile, streams []Virtu
 		return VirtualPlaybackStream{}, false
 	}
 	for _, candidate := range streams {
-		if candidate.URI == file.FilePath && candidate.SourceType == "usenet" &&
+		if candidate.URI == file.FilePath &&
 			!candidate.Rejected && (!candidate.VisibilitySpecified || candidate.Visible) &&
 			(candidate.ProviderExpiresAt == nil || candidate.ProviderExpiresAt.After(time.Now())) &&
 			strings.TrimSpace(candidate.ProviderURL) != "" {

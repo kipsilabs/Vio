@@ -102,7 +102,7 @@ type VirtualReleaseRequestOutput struct {
 
 func registerMediaCandidates(reg *Registry) {
 	prepare := humaOp(http.MethodPost, Prefix+"/media/{media_id}/virtual-candidates/{file_id}:prepare", opPrepareVirtualPlayback, "watch",
-		"Best-effort preparation of one selected Usenet stream when enabled, without creating a playback session. Acceptance does not mean the stream is ready.")
+		"Best-effort preparation of one selected HTTP(S) provider stream when enabled, without creating a playback session. Acceptance does not mean the stream is ready.")
 	prepare.DefaultStatus = http.StatusAccepted
 	Register(reg, Operation{
 		Operation: prepare, Class: ClassProfileScoped, ProfileOptional: true,

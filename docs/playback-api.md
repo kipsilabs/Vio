@@ -230,7 +230,9 @@ prepared version. Preparation
 also works independently for already enumerated versions when discovery is off.
 No URL is accepted from the client. The server checks watch-detail access and
 version membership, then matches that exact pinned candidate against the
-provider list. Hidden, rejected, expired and non-Usenet candidates are skipped.
+provider list. Hidden, rejected and expired candidates are skipped. Preparation
+accepts selected HTTP(S) provider streams, including torrent-backed streams; the
+release-quality `source_type` is not a delivery protocol and does not gate it.
 
 `202 Accepted` is best-effort admission, not a readiness verdict. Disabled,
 unwired or saturated preparation returns `503`; an inaccessible version returns

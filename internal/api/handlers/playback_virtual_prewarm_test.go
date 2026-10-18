@@ -17,6 +17,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/plugins"
 	"github.com/Silo-Server/silo-server/internal/remotestream"
 	"github.com/Silo-Server/silo-server/internal/scanner"
+	"github.com/Silo-Server/silo-server/internal/virtuallibrary/stream"
 )
 
 // prewarmFile is a virtual row with no probe evidence and no persisted
@@ -240,19 +241,21 @@ func TestPrefetchVirtualPlaybackNeverProbes(t *testing.T) {
 func TestSelectedVirtualPreparationCandidate(t *testing.T) {
 	selected := "virtual://movie/tt-preparation?result=selected"
 	base := VirtualPlaybackStream{
-		URI: selected, SourceType: "usenet", ProviderURL: "https://provider.example/selected",
+		URI: selected, SourceType: "web-dl", ProviderURL: "https://provider.example/selected",
 	}
+	expired := time.Now().Add(-time.Minute)
 	for _, test := range []struct {
 		name      string
 		path      string
 		candidate VirtualPlaybackStream
 		want      bool
 	}{
-		{name: "exact selected usenet release", path: selected, candidate: base, want: true},
+		{name: "exact selected release", path: selected, candidate: base, want: true},
 		{name: "placeholder", path: "virtual://movie/tt-preparation", candidate: base},
 		{name: "different selected release", path: "virtual://movie/tt-preparation?result=other", candidate: base},
 		{name: "nonvirtual source", path: "https://provider.example/selected?result=selected", candidate: base},
-		{name: "nonusenet source", path: selected, candidate: VirtualPlaybackStream{URI: selected, SourceType: "torrent", ProviderURL: base.ProviderURL}},
+		{name: "unknown release quality", path: selected, candidate: VirtualPlaybackStream{URI: selected, ProviderURL: base.ProviderURL}, want: true},
+		{name: "expired release", path: selected, candidate: VirtualPlaybackStream{URI: selected, SourceType: base.SourceType, ProviderURL: base.ProviderURL, ProviderExpiresAt: &expired}},
 		{name: "rejected release", path: selected, candidate: VirtualPlaybackStream{URI: selected, SourceType: base.SourceType, ProviderURL: base.ProviderURL, Rejected: true}},
 		{name: "hidden release", path: selected, candidate: VirtualPlaybackStream{URI: selected, SourceType: base.SourceType, ProviderURL: base.ProviderURL, VisibilitySpecified: true}},
 		{name: "missing provider URL", path: selected, candidate: VirtualPlaybackStream{URI: selected, SourceType: base.SourceType}},
@@ -269,6 +272,28 @@ func TestSelectedVirtualPreparationCandidate(t *testing.T) {
 	}
 	if _, ok := selectedVirtualPreparationCandidate(nil, []VirtualPlaybackStream{base}); ok {
 		t.Fatal("a missing file must not prepare a candidate")
+	}
+}
+
+func TestSelectedVirtualPreparationCandidateUsesParsedReleaseQuality(t *testing.T) {
+	for _, sourceType := range []string{"web-dl", "bluray", "remux", "hdtv"} {
+		t.Run(sourceType, func(t *testing.T) {
+			parsed := stream.StreamCandidate{
+				Name: "Example 1080p " + sourceType,
+				URL: "https://provider.example/selected",
+			}
+			stream.ParseStreamDetails(&parsed)
+			if parsed.SourceType != sourceType {
+				t.Fatalf("parsed source type = %q, want %q", parsed.SourceType, sourceType)
+			}
+			file := prewarmFile("virtual://movie/tt-preparation?result=selected")
+			candidate := VirtualPlaybackStream{
+				URI: file.FilePath, SourceType: parsed.SourceType, ProviderURL: parsed.URL,
+			}
+			if _, ok := selectedVirtualPreparationCandidate(file, []VirtualPlaybackStream{candidate}); !ok {
+				t.Fatal("parsed release quality must not prevent selected-stream preparation")
+			}
+		})
 	}
 }
 
@@ -329,7 +354,7 @@ func TestVirtualPreparationUsesBoundedRangeAndPrivateOptIn(t *testing.T) {
 				publicHTTP:   remotestream.NewSafeClient(), privateHTTP: remotestream.NewInsecureClient(),
 				List: VirtualPlaybackStreamListerFunc(func(context.Context, string, int, string, int) ([]VirtualPlaybackStream, error) {
 					return []VirtualPlaybackStream{{
-						URI: file.FilePath, SourceType: "usenet", ProviderURL: server.URL,
+						URI: file.FilePath, SourceType: "web-dl", ProviderURL: server.URL,
 						RequestHeaders: map[string]string{"Referer": "https://provider.example", "Range": "bytes=0-"},
 					}}, nil
 				}),
@@ -391,7 +416,7 @@ func TestVirtualPreparationWarmsPlaybackProbeCache(t *testing.T) {
 			file := prewarmFile("virtual://movie/tt-probe-preparation?result=selected")
 			file.Duration = 3600
 			candidate := VirtualPlaybackStream{
-				URI: file.FilePath, SourceType: "usenet", ProviderURL: server.URL + "/selected?token=first",
+				URI: file.FilePath, SourceType: "remux", ProviderURL: server.URL + "/selected?token=first",
 				CodecAudio: "aac", RequestHeaders: map[string]string{"Referer": "https://provider.example"},
 			}
 			cache := scanner.NewVirtualProbeCache(time.Minute, 8)
@@ -488,7 +513,7 @@ func TestVirtualPreparationProbeRequiresPrivateOptIn(t *testing.T) {
 					return nil, nil
 				},
 				List: VirtualPlaybackStreamListerFunc(func(context.Context, string, int, string, int) ([]VirtualPlaybackStream, error) {
-					return []VirtualPlaybackStream{{URI: file.FilePath, SourceType: "usenet", ProviderURL: server.URL}}, nil
+					return []VirtualPlaybackStream{{URI: file.FilePath, SourceType: "bluray", ProviderURL: server.URL}}, nil
 				}),
 			}
 			service.prepare(context.Background(), file, 7, "profile-1")
@@ -525,7 +550,7 @@ func TestVirtualPreparationProbeIsAsynchronousAndDeduplicated(t *testing.T) {
 				}},
 				FileByID: func(context.Context, int) (*models.MediaFile, error) { return file, nil },
 				List: VirtualPlaybackStreamListerFunc(func(context.Context, string, int, string, int) ([]VirtualPlaybackStream, error) {
-					return []VirtualPlaybackStream{{URI: file.FilePath, SourceType: "usenet", ProviderURL: server.URL}}, nil
+					return []VirtualPlaybackStream{{URI: file.FilePath, SourceType: "hdtv", ProviderURL: server.URL}}, nil
 				}),
 				Probe: func(ctx context.Context, _ string, input *models.MediaFile, _ map[string]string) (*models.MediaFile, error) {
 					started <- struct{}{}
