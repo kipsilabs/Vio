@@ -1756,7 +1756,16 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 						return fmt.Errorf("relay token not found")
 					}
 					if res.StatusCode >= http.StatusInternalServerError {
+						// A 5xx before any bytes is availability-shaped whether or
+						// not the relay marked it: the relay's own open retry was
+						// already spent, so a provider outage must not stamp a
+						// durable dead-candidate verdict. The header can still
+						// mark a failure temporary, but its absence no longer
+						// makes a 5xx look like a dead release.
 						relayTemporary = remotestream.RelayTemporaryFailure(res)
+						if res.StatusCode >= http.StatusInternalServerError {
+							relayTemporary = true
+						}
 						return fmt.Errorf("relay returned HTTP %d", res.StatusCode)
 					}
 					return nil
