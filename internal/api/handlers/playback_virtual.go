@@ -4843,6 +4843,25 @@ func execVirtualFileMetadataUpdateResultUntx(ctx context.Context, db VirtualFile
 		return VirtualFileMetadataUpdateResult{}, err
 	}
 	persistedPath, err := statement.run(ctx, db, args, args.AdoptPath)
+	if err == nil && persistedPath == "" && args.RequireAdopt && args.AdoptPath != "" {
+		// The best-effort saver has no row lock, so a stale CAS snapshot gets
+		// one re-read and one retry against the current state; a row still
+		// inside the same item/profile is re-based (a churned ?result= token or
+		// an advanced evidence revision), while a row that moved elsewhere keeps
+		// the caller's snapshot. A second miss stays a refusal.
+		if current, found, readErr := readVirtualRowCASState(ctx, db, args.FileID); readErr == nil && found {
+			retried := refreshVirtualPersistArgsForRow(args, current)
+			if virtualPersistSnapshotMoved(args, retried) {
+				retryPath, retryErr := statement.run(ctx, db, retried, retried.AdoptPath)
+				if retryErr != nil {
+					return VirtualFileMetadataUpdateResult{}, retryErr
+				}
+				if retryPath != "" {
+					args, persistedPath = retried, retryPath
+				}
+			}
+		}
+	}
 	if err == nil {
 		if persistedPath == "" {
 			if args.RequireAdopt && args.AdoptPath != "" {
@@ -4963,6 +4982,108 @@ func snapshotVirtualRow(file *models.MediaFile) virtualSnapshot {
 		OwnerID:        file.VirtualOwnerInstallationID,
 		LibraryID:      file.MediaFolderID,
 	}
+}
+
+// virtualRowCASState is the row state the adoption CAS fences on. It is read
+// again only after a required adoption matched no row: a provider re-list or a
+// rematch that committed between the caller's snapshot and the write changes
+// file_path (a churned ?result= token), updated_at and/or probe_updated_at, so
+// the CAS misses even though the row is still the same item. Retrying against
+// the current state keeps the evidence instead of recording an adoption refusal
+// and eventually condemning the candidate.
+type virtualRowCASState struct {
+	FilePath       string
+	UpdatedAt      time.Time
+	ProbeUpdatedAt *time.Time
+	OwnerID        int
+	LibraryID      int
+	ProbeSource    string
+	VideoHash      string
+	GUID           string
+	ReleaseName    string
+	ReleaseSize    int64
+}
+
+const virtualRowCASStateSQL = `
+SELECT file_path,
+       updated_at,
+       probe_updated_at,
+       COALESCE(virtual_owner_installation_id, 0),
+       COALESCE(media_folder_id, 0),
+       COALESCE(probe_source, ''),
+       COALESCE(provider_video_hash, ''),
+       COALESCE(provider_guid, ''),
+       COALESCE(provider_release_name, ''),
+       COALESCE(provider_release_size, 0)
+FROM media_files
+WHERE id = $1`
+
+// readVirtualRowCASState reads the current CAS state for one row. A missing row
+// reports found=false without an error; any other failure is returned so the
+// caller keeps the caller's snapshot rather than guessing.
+func readVirtualRowCASState(ctx context.Context, db VirtualFileMetadataDB, fileID int) (virtualRowCASState, bool, error) {
+	if db == nil || fileID <= 0 {
+		return virtualRowCASState{}, false, nil
+	}
+	var state virtualRowCASState
+	err := db.QueryRow(ctx, virtualRowCASStateSQL, fileID).Scan(
+		&state.FilePath, &state.UpdatedAt, &state.ProbeUpdatedAt,
+		&state.OwnerID, &state.LibraryID, &state.ProbeSource,
+		&state.VideoHash, &state.GUID, &state.ReleaseName, &state.ReleaseSize,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return virtualRowCASState{}, false, nil
+	}
+	if err != nil {
+		return virtualRowCASState{}, false, err
+	}
+	return state, true, nil
+}
+
+// refreshVirtualPersistArgsForRow re-bases a required-adoption write on the
+// row's current state. The refresh is limited to a row that still belongs to
+// the same item/profile (the same provider-neutral key): a provider re-list
+// churns the ?result= token but never the neutral key, while a row that moved
+// to a different item/profile keeps the caller's snapshot and is refused.
+func refreshVirtualPersistArgsForRow(args models.VirtualFilePersistArgs, current virtualRowCASState) models.VirtualFilePersistArgs {
+	if args.ExpectedFilePath == "" || current.FilePath == "" {
+		return args
+	}
+	if virtualPlaybackNeutralKey(args.ExpectedFilePath) != virtualPlaybackNeutralKey(current.FilePath) {
+		return args
+	}
+	args.ExpectedFilePath = current.FilePath
+	args.UpdatedAt = current.UpdatedAt
+	args.ProbeUpdatedAt = current.ProbeUpdatedAt
+	args.OwnerID = current.OwnerID
+	args.LibraryID = current.LibraryID
+	args.ExpectedProviderVideoHash = current.VideoHash
+	args.ExpectedProviderGUID = current.GUID
+	args.ExpectedProviderReleaseName = current.ReleaseName
+	args.ExpectedProviderReleaseSize = current.ReleaseSize
+	return args
+}
+
+// virtualPersistSnapshotMoved reports whether refreshing the snapshot changed
+// anything. A write is retried only when the row actually moved; an unchanged
+// snapshot retries nothing.
+func virtualPersistSnapshotMoved(args, refreshed models.VirtualFilePersistArgs) bool {
+	if args.ExpectedFilePath != refreshed.ExpectedFilePath ||
+		args.OwnerID != refreshed.OwnerID ||
+		args.LibraryID != refreshed.LibraryID ||
+		args.ExpectedProviderVideoHash != refreshed.ExpectedProviderVideoHash ||
+		args.ExpectedProviderGUID != refreshed.ExpectedProviderGUID ||
+		args.ExpectedProviderReleaseName != refreshed.ExpectedProviderReleaseName ||
+		args.ExpectedProviderReleaseSize != refreshed.ExpectedProviderReleaseSize {
+		return true
+	}
+	if !args.UpdatedAt.Equal(refreshed.UpdatedAt) {
+		return true
+	}
+	if (args.ProbeUpdatedAt == nil) != (refreshed.ProbeUpdatedAt == nil) {
+		return true
+	}
+	return args.ProbeUpdatedAt != nil && !args.ProbeUpdatedAt.Equal(*refreshed.ProbeUpdatedAt)
 }
 
 // persistVirtualMetadataBounded admits a probe-evidence write into the
