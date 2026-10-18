@@ -131,6 +131,31 @@ type Session struct {
 	// never leave a client waiting forever. Zero means no deferred lifecycle is
 	// outstanding (empty, verified, or failed).
 	virtualProbeArmedAt time.Time
+	// virtualProbeArmedBinding is the candidate binding the outstanding pending
+	// mark was armed against, captured when the outcome entered pending and
+	// cleared whenever it leaves pending. It lets a caller tell a LIVE pending —
+	// owned by the session's current binding, which an admitted probe will land —
+	// from a STALE one left behind by a row-only move that never advanced the
+	// generation (see SetEffectiveMediaFileID). A stale pending no worker's fence
+	// can land, so the current binding owes a fresh probe; a live pending already
+	// has one and must not be duplicated.
+	//
+	// It is in-memory only, not persisted with the session. A session
+	// reconstructed after a restart carries the zero snapshot, so any pending mark
+	// on it reads as stale and a replacement may be admitted (the pre-restart
+	// worker is gone, so that is correct, not merely safe); the convergence
+	// watchdog still bounds a pending mark no worker lands.
+	virtualProbeArmedBinding VirtualSourceBindingSnapshot
+	// virtualProbeLifecycle is a monotonic token that changes every time a
+	// deferred-probe lifecycle enters pending. It is the ownership fence the
+	// replacement path's terminal write must match. SetEffectiveMediaFileID moves
+	// a session's effective row without advancing virtualSourceGeneration, so a
+	// row-only move can return a session to a binding byte-for-byte equal to the
+	// one an earlier arm captured; binding equality alone then cannot tell a
+	// superseded attempt from the live lifecycle another arm created for the same
+	// binding. The token does: only the arm that created the current lifecycle can
+	// stamp its terminal outcome.
+	virtualProbeLifecycle uint64
 	// VirtualSubtitleEvidenceURI names the provider-neutral candidate the
 	// evidence above was captured for. It is the provenance anchor: evidence
 	// may only be applied to a file bound to the same candidate, and a
@@ -1507,6 +1532,7 @@ func applySessionStreamStateLocked(s *Session, state SessionStreamState) {
 		if state.VirtualSourceOwnershipSet {
 			s.VirtualProbeOutcome = ""
 			s.virtualProbeArmedAt = time.Time{}
+			s.virtualProbeArmedBinding = VirtualSourceBindingSnapshot{}
 		}
 		if state.VirtualSubtitleEvidenceSet {
 			s.VirtualSubtitleTracks = state.VirtualSubtitleTracks
@@ -1767,6 +1793,7 @@ func (m *SessionManager) setVirtualSourceLocked(s *Session, virtualURI string, o
 	// previous candidate's deferred probe reached says nothing about this one.
 	s.VirtualProbeOutcome = ""
 	s.virtualProbeArmedAt = time.Time{}
+	s.virtualProbeArmedBinding = VirtualSourceBindingSnapshot{}
 	// The invalid-selection marker belongs to the previous candidate's verified
 	// inventory; the replacement binding re-plans and re-probes.
 	s.VirtualAudioSelectionInvalid = false
@@ -1809,18 +1836,41 @@ func (m *SessionManager) SetVirtualProbeOutcome(sessionID, outcome string) error
 }
 
 // setVirtualProbeOutcomeLocked writes the deferred-probe outcome and keeps the
-// convergence timestamp in step: entering pending stamps the armed instant,
-// and any other value (verified, failed, empty) clears it. Caller holds m.mu.
+// convergence timestamp and the armed-binding record in step: entering pending
+// stamps the armed instant and captures the binding the mark belongs to, and any
+// other value (verified, failed, empty) clears both. Caller holds m.mu.
 func setVirtualProbeOutcomeLocked(s *Session, outcome string) {
 	if s == nil {
 		return
 	}
 	s.VirtualProbeOutcome = outcome
 	if outcome == VirtualProbeOutcomePending {
-		s.virtualProbeArmedAt = time.Now()
+		setVirtualProbePendingForBindingLocked(s, s.virtualBindingSnapshotLocked())
 		return
 	}
 	s.virtualProbeArmedAt = time.Time{}
+	s.virtualProbeArmedBinding = VirtualSourceBindingSnapshot{}
+}
+
+// setVirtualProbePendingForBindingLocked enters the pending outcome and records
+// the binding the mark belongs to, supplied by the caller rather than reread from
+// the session. Admission uses it to record the binding the job was SCHEDULED for:
+// if SetEffectiveMediaFileID moves the effective row between the caller's
+// binding read and this write, recording the session's current row would make the
+// stale mark look live and block the replacement that owns the row the session
+// now serves. Both writes are one step under the session lock. Caller holds m.mu.
+func setVirtualProbePendingForBindingLocked(s *Session, armed VirtualSourceBindingSnapshot) {
+	if s == nil {
+		return
+	}
+	s.VirtualProbeOutcome = VirtualProbeOutcomePending
+	s.virtualProbeArmedAt = time.Now()
+	s.virtualProbeArmedBinding = armed
+	// Every entry into pending is a new lifecycle, so the ownership token moves
+	// here: a terminal write fenced on the token can only land on the lifecycle
+	// whose arm produced it, even when a row-only move has since returned the
+	// binding to a snapshot equal to an earlier one.
+	s.virtualProbeLifecycle++
 }
 
 // SetVirtualProbeOutcomeIfGeneration records a deferred probe's outcome on the
@@ -1875,6 +1925,53 @@ func (m *SessionManager) SetVirtualProbeOutcomeIfBinding(sessionID string, expec
 	}
 	setVirtualProbeOutcomeLocked(s, outcome)
 	return true, nil
+}
+
+// SetVirtualProbeOutcomeIfLifecycle records a deferred probe's terminal outcome
+// only while the session still carries the exact probe lifecycle the caller
+// armed (identified by the token) and that lifecycle is still pending, in
+// addition to the full-binding match SetVirtualProbeOutcomeIfBinding applies.
+//
+// It is the ownership fence the replacement path's late unresolved-row shed
+// needs. A row-only move (SetEffectiveMediaFileID) does not advance the
+// generation, so a B -> C -> B move returns the session to a snapshot
+// byte-for-byte equal to the one an earlier arm captured; the older attempt's
+// binding-equality fence would then match and its terminal failure would land on
+// a newer lifecycle another recovery armed for the same binding. The token
+// changes on every arm, so only the current lifecycle's owner can write.
+//
+// It returns applied=true when the outcome was written. superseded=true means a
+// newer lifecycle (or a reached terminal outcome) now owns the binding, so the
+// caller must not attempt recovery — that lifecycle is live and will converge on
+// its own. Both false means the token still matched but the binding moved, which
+// is the pre-existing stale-binding case the caller recovers. An unknown session
+// reports ErrSessionNotFound and writes nothing.
+func (m *SessionManager) SetVirtualProbeOutcomeIfLifecycle(sessionID string, token uint64, expected VirtualSourceBindingSnapshot, outcome string) (applied bool, superseded bool, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		return false, false, ErrSessionNotFound
+	}
+	if token != 0 && s.virtualProbeLifecycle != token {
+		// A newer arm created the current lifecycle for this binding; the
+		// superseded attempt owns nothing.
+		return false, true, nil
+	}
+	if s.VirtualProbeOutcome != VirtualProbeOutcomePending {
+		// The lifecycle already reached a terminal outcome (verified or failed)
+		// under the same token: the terminal write would overwrite a reached
+		// verdict, and nothing is owed.
+		return false, true, nil
+	}
+	if !s.matchesVirtualBindingLocked(expected) {
+		// The token still matches, so no newer lifecycle owns the binding; the
+		// row moved, which is the stale-binding recovery path.
+		return false, false, nil
+	}
+	setVirtualProbeOutcomeLocked(s, outcome)
+	return true, false, nil
 }
 
 // SetVirtualProbeVerifiedInventoryIfGeneration atomically records a deferred
@@ -2024,6 +2121,39 @@ func (m *SessionManager) ArmVirtualProbePendingIfGeneration(sessionID string, ge
 	return true, nil
 }
 
+// ArmVirtualProbePendingIfBinding transitions a binding generation's probe
+// outcome from empty to pending, and only from empty, exactly like
+// ArmVirtualProbePendingIfGeneration — with one difference that closes a
+// row-only-move window. The armed-binding record is the caller's captured
+// snapshot rather than the session's binding at write time. SetEffectiveMediaFileID
+// moves a session's effective row without advancing the generation, so if it
+// lands between the caller's binding read and this write, recording the current
+// row would leave the pending mark looking LIVE for a binding no worker owns and
+// block the replacement that could recover it. Recording the scheduled binding
+// keeps the mark stale (or live) according to what the queued job will actually
+// fence on, so recovery can hand the moved row a fresh lifecycle. It returns
+// false for an unknown session, a moved generation, or an already set outcome
+// (armed, verified, failed), so the caller drops the duplicate job unchanged.
+func (m *SessionManager) ArmVirtualProbePendingIfBinding(sessionID string, expected VirtualSourceBindingSnapshot) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		return false, ErrSessionNotFound
+	}
+	if s.virtualSourceGeneration != expected.Generation {
+		return false, nil
+	}
+	if s.VirtualProbeOutcome != "" {
+		// The lifecycle is already armed or terminal for this binding: a
+		// duplicate admission owns nothing and must not restart it.
+		return false, nil
+	}
+	setVirtualProbePendingForBindingLocked(s, expected)
+	return true, nil
+}
+
 // VirtualProbePendingSessions returns up to limit live sessions whose deferred
 // probe is still pending and was armed at or before cutoff. It is the read side
 // of the convergence watchdog: a session listed here has been waiting longer
@@ -2096,6 +2226,49 @@ type VirtualSourceBindingSnapshot struct {
 	OwnerInstallationID  int
 	EffectiveMediaFileID int
 	Generation           uint64
+	// ProbeLifecycle is the deferred-probe lifecycle token in force when the
+	// snapshot was taken (see Session.virtualProbeLifecycle). It is deliberately
+	// NOT asserted by matchesVirtualBindingLocked: it is not part of the binding
+	// identity, it is the ownership token a replacement path carries forward so a
+	// late terminal write can prove it still owns the lifecycle it armed. Zero on
+	// snapshots a caller constructed without reading a live session.
+	ProbeLifecycle uint64
+}
+
+// virtualBindingSnapshotLocked captures the session's full candidate-binding
+// identity under the session lock. It is the one place the four binding
+// dimensions are read together, so every snapshot (the public reader, the
+// pending-armed record, and the live-pending predicate) agrees on what "the
+// binding" means. Caller holds m.mu.
+func (s *Session) virtualBindingSnapshotLocked() VirtualSourceBindingSnapshot {
+	if s == nil {
+		return VirtualSourceBindingSnapshot{}
+	}
+	return VirtualSourceBindingSnapshot{
+		VirtualURI:           s.VirtualSourceURI,
+		OwnerInstallationID:  s.VirtualSourceOwnerInstallationID,
+		EffectiveMediaFileID: s.MediaFileID,
+		Generation:           s.virtualSourceGeneration,
+		ProbeLifecycle:       s.virtualProbeLifecycle,
+	}
+}
+
+// virtualProbePendingIsLiveLocked reports whether the session's outstanding
+// pending mark is still owned by the session's CURRENT candidate binding: a
+// probe armed for this exact generation, candidate URI, owner, and effective row
+// is in flight and will land against it. A pending mark whose armed binding no
+// longer matches (a row-only move that did not advance the generation) is stale
+// — no worker's fence can land it — so the current binding owes a fresh probe.
+// Caller holds m.mu.
+func (s *Session) virtualProbePendingIsLiveLocked() bool {
+	if s == nil || s.VirtualProbeOutcome != VirtualProbeOutcomePending {
+		return false
+	}
+	armed := s.virtualProbeArmedBinding
+	return armed.Generation == s.virtualSourceGeneration &&
+		sameVirtualSourceURI(armed.VirtualURI, s.VirtualSourceURI) &&
+		armed.OwnerInstallationID == s.VirtualSourceOwnerInstallationID &&
+		armed.EffectiveMediaFileID == s.MediaFileID
 }
 
 // VirtualSourceBinding captures the session's candidate-binding identity and generation
@@ -2108,12 +2281,103 @@ func (m *SessionManager) VirtualSourceBinding(sessionID string) (VirtualSourceBi
 	if !ok {
 		return VirtualSourceBindingSnapshot{}, ErrSessionNotFound
 	}
-	return VirtualSourceBindingSnapshot{
-		VirtualURI:           s.VirtualSourceURI,
-		OwnerInstallationID:  s.VirtualSourceOwnerInstallationID,
-		EffectiveMediaFileID: s.MediaFileID,
-		Generation:           s.virtualSourceGeneration,
-	}, nil
+	return s.virtualBindingSnapshotLocked(), nil
+}
+
+// ArmVirtualProbeReplacementForCurrentBinding atomically re-arms the deferred
+// probe pending mark for the session's CURRENT candidate binding. It is the
+// replacement half of dropped-probe recovery: a probe admitted for a binding the
+// session has since left is dropped by its fence without writing, and when the
+// current binding carries no live lifecycle of its own this hands it a fresh one
+// so it is not left un-enumerated.
+//
+// It refuses (returns applied=false and writes nothing) when:
+//   - the session's current candidate is not candidateURI, so a replacement built
+//     from the dropped probe's input cannot describe the current binding and must
+//     not be admitted; or
+//   - ownerInstallationID is non-zero and the current binding carries a different
+//     owner. The replacement reuses the dropped job's probe input (stream URL and
+//     request headers), which was resolved for one owner installation. A same-URI
+//     owner move is a different source behind the same candidate: the input is
+//     stale and the fresh resolve that produced the new binding is the only safe
+//     source of its URL and headers, so no replacement is admitted. The effective
+//     row is deliberately NOT fenced here: the replacement re-resolves the row it
+//     writes (see replacementCatalogRow), and a row-only move that keeps the
+//     candidate and owner serves the same bytes, so only the write target moves; or
+//   - the current binding already carries a LIVE pending probe (a worker will land
+//     it) or a terminal outcome (verified or failed), so nothing is owed.
+//
+// Otherwise the mark is stale (armed for a superseded binding) or absent, and the
+// call enters pending for the current binding and returns the snapshot it armed
+// against. Because the pending record captures the current binding, the
+// replacement job fences on that binding and the dropped job can never write
+// against it. The returned snapshot's ProbeLifecycle is the ownership token of
+// the lifecycle just armed, so a job that later sheds can fence its terminal
+// write on the exact lifecycle it created rather than binding equality alone. An
+// unknown session reports ErrSessionNotFound and writes nothing.
+func (m *SessionManager) ArmVirtualProbeReplacementForCurrentBinding(sessionID, candidateURI string, ownerInstallationID int) (VirtualSourceBindingSnapshot, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.armVirtualProbeReplacementForCurrentBindingLocked(sessionID, candidateURI, ownerInstallationID)
+}
+
+// armVirtualProbeReplacementForCurrentBindingLocked is the critical section
+// shared by the replacement arm and its saturated-fallback twin: it applies the
+// candidate/owner/liveness checks and, when they pass, enters pending for the
+// current binding. It returns the binding it acted on whether or not it armed,
+// so a caller can report the row the decision targeted. Caller holds m.mu.
+func (m *SessionManager) armVirtualProbeReplacementForCurrentBindingLocked(sessionID, candidateURI string, ownerInstallationID int) (VirtualSourceBindingSnapshot, bool, error) {
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		return VirtualSourceBindingSnapshot{}, false, ErrSessionNotFound
+	}
+	binding := s.virtualBindingSnapshotLocked()
+	if !sameVirtualSourceURI(binding.VirtualURI, candidateURI) {
+		return binding, false, nil
+	}
+	if ownerInstallationID != 0 && binding.OwnerInstallationID != ownerInstallationID {
+		// The dropped job's input was resolved for a different owner
+		// installation; reusing it would probe another source's bytes and stamp
+		// them onto this binding's row.
+		return binding, false, nil
+	}
+	if s.virtualProbePendingIsLiveLocked() {
+		return binding, false, nil
+	}
+	if s.VirtualProbeOutcome != "" && s.VirtualProbeOutcome != VirtualProbeOutcomePending {
+		// A terminal verdict for this binding: a replacement would overwrite a
+		// reached outcome, not fill a gap.
+		return binding, false, nil
+	}
+	setVirtualProbeOutcomeLocked(s, VirtualProbeOutcomePending)
+	return s.virtualBindingSnapshotLocked(), true, nil
+}
+
+// FailVirtualProbeReplacementForCurrentBinding atomically arms the deferred
+// probe pending mark for the session's current candidate binding AND records the
+// terminal failure on it, in one critical section. It is the saturated-fallback
+// twin of the replacement arm: the handler uses it when the bounded retry set
+// cannot take a rejected shed's recovery job, so the current binding is failed
+// directly instead of being left pending.
+//
+// The two writes must be one step. A row-only move (SetEffectiveMediaFileID) does
+// not advance the binding generation, so if the arm and the failure were separate
+// manager calls a B -> C -> B move could land between them: the failure's
+// binding-equality fence would then match the returned-to B and stamp this
+// fallback's failure onto a DIFFERENT, newer B lifecycle that another recovery
+// armed after the row came back. Arming and failing under one lock makes the
+// failure belong to exactly the lifecycle this call created, and a later arm for
+// the same binding is refused because the outcome is already terminal.
+func (m *SessionManager) FailVirtualProbeReplacementForCurrentBinding(sessionID, candidateURI string, ownerInstallationID int) (VirtualSourceBindingSnapshot, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	binding, armed, err := m.armVirtualProbeReplacementForCurrentBindingLocked(sessionID, candidateURI, ownerInstallationID)
+	if err != nil || !armed {
+		return binding, false, err
+	}
+	setVirtualProbeOutcomeLocked(m.sessions[sessionID], VirtualProbeOutcomeFailed)
+	return binding, true, nil
 }
 
 // SetVirtualSourceIfBinding applies the candidate handoff and updates the effective
