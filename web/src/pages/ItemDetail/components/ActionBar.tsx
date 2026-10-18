@@ -355,10 +355,9 @@ export default function ActionBar({
       version.file_path ?? "",
     ),
   );
-  const preparationFileId =
-    /[?&]result=[^&]+/.test(selectedVersion?.file_path ?? "")
-      ? selectedVersion?.file_id
-      : undefined;
+  const preparationFileId = /[?&]result=[^&]+/.test(selectedVersion?.file_path ?? "")
+    ? selectedVersion?.file_id
+    : undefined;
   const { discovering, failed: discoveryFailed } = usePreplayDiscovery(
     contentId,
     virtualDetail,

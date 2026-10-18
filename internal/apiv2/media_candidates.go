@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	opPrepareVirtualPlayback        = "prepareVirtualPlayback"
+	opPrepareVirtualPlayback         = "prepareVirtualPlayback"
 	opDiscoverVirtualCandidates      = "discoverVirtualCandidates"
 	opRefreshVirtualCandidates       = "refreshVirtualCandidates"
 	opCancelVirtualCandidatesRefresh = "cancelVirtualCandidatesRefresh"
@@ -107,7 +107,7 @@ func registerMediaCandidates(reg *Registry) {
 	Register(reg, Operation{
 		Operation: prepare, Class: ClassProfileScoped, ProfileOptional: true,
 		HouseholdProfileGate: true,
-		ServiceBacked: true, RetrySafety: RetrySafetyCoalescing,
+		ServiceBacked:        true, RetrySafety: RetrySafetyCoalescing,
 	}, reg.prepareVirtualPlayback)
 
 	discover := humaOp(http.MethodPost, Prefix+"/media/{media_id}/virtual-candidates:discover", opDiscoverVirtualCandidates, "watch",

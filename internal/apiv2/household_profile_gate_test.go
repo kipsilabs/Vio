@@ -152,6 +152,7 @@ var householdGatedOperations = []string{
 	"listStoredSubtitles",
 	"listSubtitleAIJobs",
 	"listSubtitleSync",
+	"prepareVirtualPlayback",
 	"searchSubtitles",
 	"setFileMarkers",
 	"setItemMarkers",

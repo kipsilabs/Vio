@@ -68,16 +68,26 @@ describe("ActionBar", () => {
   });
 
   it("prepares the automatic pinned selection after discovery finishes", async () => {
-    discoveryMocks.capability.mockResolvedValue({ discover_before_playback: true, prepare_before_playback: true });
+    discoveryMocks.capability.mockResolvedValue({
+      discover_before_playback: true,
+      prepare_before_playback: true,
+    });
     discoveryMocks.prepare.mockResolvedValue(undefined);
     let finish!: () => void;
-    discoveryMocks.discover.mockImplementation(() => new Promise<void>((resolve) => { finish = resolve; }));
+    discoveryMocks.discover.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          finish = resolve;
+        }),
+    );
     const version = { ...selectedVersion, file_path: "virtual://movie/tt123?result=chosen" };
     renderActionBar({ contentId: "movie-1", versions: [version], selectedVersion: version });
     await screen.findByText("Finding versions");
     expect(discoveryMocks.prepare).not.toHaveBeenCalled();
     await act(async () => finish());
-    await waitFor(() => expect(discoveryMocks.prepare).toHaveBeenCalledWith("movie-1", 1, expect.any(AbortSignal)));
+    await waitFor(() =>
+      expect(discoveryMocks.prepare).toHaveBeenCalledWith("movie-1", 1, expect.any(AbortSignal)),
+    );
     expect(startPlayback).not.toHaveBeenCalled();
   });
 
@@ -86,47 +96,89 @@ describe("ActionBar", () => {
     [true, true, "virtual://movie/tt123?result=chosen", 1],
     [true, false, "virtual://movie/tt123", 0],
     [true, false, "virtual://movie/tt123?result=chosen", 1],
-  ])("gates preparation independently (%s, manual %s, %s)", async (enabled, manual, filePath, calls) => {
-    discoveryMocks.capability.mockResolvedValue({ discover_before_playback: false, prepare_before_playback: enabled });
-    discoveryMocks.prepare.mockResolvedValue(undefined);
-    const version = { ...selectedVersion, file_path: filePath };
-    renderActionBar({ contentId: "movie-1", versions: [version], selectedVersion: version, explicitFileSelection: manual });
-    await waitFor(() => expect(discoveryMocks.capability).toHaveBeenCalledOnce());
-    if (calls) await waitFor(() => expect(discoveryMocks.prepare).toHaveBeenCalledOnce());
-    else expect(discoveryMocks.prepare).not.toHaveBeenCalled();
-    expect(discoveryMocks.discover).not.toHaveBeenCalled();
-    expect(screen.getByRole("button", { name: "Play" })).toBeEnabled();
-  });
+  ])(
+    "gates preparation independently (%s, manual %s, %s)",
+    async (enabled, manual, filePath, calls) => {
+      discoveryMocks.capability.mockResolvedValue({
+        discover_before_playback: false,
+        prepare_before_playback: enabled,
+      });
+      discoveryMocks.prepare.mockResolvedValue(undefined);
+      const version = { ...selectedVersion, file_path: filePath };
+      renderActionBar({
+        contentId: "movie-1",
+        versions: [version],
+        selectedVersion: version,
+        explicitFileSelection: manual,
+      });
+      await waitFor(() => expect(discoveryMocks.capability).toHaveBeenCalledOnce());
+      if (calls) await waitFor(() => expect(discoveryMocks.prepare).toHaveBeenCalledOnce());
+      else expect(discoveryMocks.prepare).not.toHaveBeenCalled();
+      expect(discoveryMocks.discover).not.toHaveBeenCalled();
+      expect(screen.getByRole("button", { name: "Play" })).toBeEnabled();
+    },
+  );
 
   it("prepares a changed version and reuses a recent preparation when switching back", async () => {
-    discoveryMocks.capability.mockResolvedValue({ discover_before_playback: false, prepare_before_playback: true });
+    discoveryMocks.capability.mockResolvedValue({
+      discover_before_playback: false,
+      prepare_before_playback: true,
+    });
     discoveryMocks.prepare.mockResolvedValue(undefined);
     const client = new QueryClient();
     const first = { ...selectedVersion, file_path: "virtual://movie/tt123?result=first" };
-    const second = { ...selectedVersion, file_id: 2, file_path: "virtual://movie/tt123?result=second" };
+    const second = {
+      ...selectedVersion,
+      file_id: 2,
+      file_path: "virtual://movie/tt123?result=second",
+    };
     const selection = (version: FileVersion, explicit: boolean) => (
       <QueryClientProvider client={client}>
         <MemoryRouter>
-          <ActionBar contentId="movie-1" playHref="/watch/movie-1" versions={[first, second]} selectedVersion={version} explicitFileSelection={explicit} />
+          <ActionBar
+            contentId="movie-1"
+            playHref="/watch/movie-1"
+            versions={[first, second]}
+            selectedVersion={version}
+            explicitFileSelection={explicit}
+          />
         </MemoryRouter>
       </QueryClientProvider>
     );
     const view = render(selection(first, false));
-    await waitFor(() => expect(discoveryMocks.prepare).toHaveBeenCalledWith("movie-1", 1, expect.any(AbortSignal)));
+    await waitFor(() =>
+      expect(discoveryMocks.prepare).toHaveBeenCalledWith("movie-1", 1, expect.any(AbortSignal)),
+    );
     view.rerender(selection(second, true));
-    await waitFor(() => expect(discoveryMocks.prepare).toHaveBeenCalledWith("movie-1", 2, expect.any(AbortSignal)));
+    await waitFor(() =>
+      expect(discoveryMocks.prepare).toHaveBeenCalledWith("movie-1", 2, expect.any(AbortSignal)),
+    );
     await act(async () => view.rerender(selection(first, true)));
     expect(discoveryMocks.prepare).toHaveBeenCalledTimes(2);
     expect(startPlayback).not.toHaveBeenCalled();
   });
 
   it("prepares a manual pinned choice without waiting for discovery", async () => {
-    discoveryMocks.capability.mockResolvedValue({ discover_before_playback: true, prepare_before_playback: true });
+    discoveryMocks.capability.mockResolvedValue({
+      discover_before_playback: true,
+      prepare_before_playback: true,
+    });
     discoveryMocks.discover.mockImplementation(() => new Promise<void>(() => {}));
     discoveryMocks.prepare.mockResolvedValue(undefined);
-    const version = { ...selectedVersion, file_id: 2, file_path: "virtual://movie/tt123?result=manual" };
-    renderActionBar({ contentId: "movie-1", versions: [version], selectedVersion: version, explicitFileSelection: true });
-    await waitFor(() => expect(discoveryMocks.prepare).toHaveBeenCalledWith("movie-1", 2, expect.any(AbortSignal)));
+    const version = {
+      ...selectedVersion,
+      file_id: 2,
+      file_path: "virtual://movie/tt123?result=manual",
+    };
+    renderActionBar({
+      contentId: "movie-1",
+      versions: [version],
+      selectedVersion: version,
+      explicitFileSelection: true,
+    });
+    await waitFor(() =>
+      expect(discoveryMocks.prepare).toHaveBeenCalledWith("movie-1", 2, expect.any(AbortSignal)),
+    );
     expect(screen.getByText("Finding versions")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Play" })).toBeEnabled();
   });

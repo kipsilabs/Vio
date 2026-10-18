@@ -29,11 +29,11 @@ type VirtualPlaybackPreparationService struct {
 	Claim        func(context.Context, string, time.Duration) (bool, error)
 	Context      context.Context
 
-	once       sync.Once
-	active     chan struct{}
-	mu         sync.Mutex
-	recent     map[string]time.Time
-	publicHTTP *http.Client
+	once        sync.Once
+	active      chan struct{}
+	mu          sync.Mutex
+	recent      map[string]time.Time
+	publicHTTP  *http.Client
 	privateHTTP *http.Client
 }
 

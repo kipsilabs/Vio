@@ -155,11 +155,11 @@ func TestRefreshVirtualCandidatesAcceptsJob(t *testing.T) {
 }
 
 type fakeVirtualPreparation struct {
-	userID int
+	userID    int
 	profileID string
 	contentID string
-	fileID int
-	calls int
+	fileID    int
+	calls     int
 }
 
 func (service *fakeVirtualPreparation) PrepareVirtualPlayback(_ context.Context, userID int, profileID, contentID string, fileID int, _ catalogpkg.AccessFilter) error {
@@ -177,12 +177,16 @@ func TestPrepareVirtualPlaybackSettingAndIdentity(t *testing.T) {
 		handler := newTestHandler(t, deps)
 		endpoint := "/api/v2/media/movie:heat-1995/virtual-candidates/42:prepare"
 		requireProblem(t, do(t, handler, http.MethodPost, endpoint, "", nil), TypeAuthenticationRequired)
-		if service.calls != 0 { t.Fatal("unauthenticated request reached preparation") }
+		if service.calls != 0 {
+			t.Fatal("unauthenticated request reached preparation")
+		}
 		owner := with(bearer(memberToken), "X-Profile-Id", "p-owner")
 		response := do(t, handler, http.MethodPost, endpoint, "", owner)
 		if !enabled {
 			requireProblem(t, response, TypeDependencyUnavailable)
-			if service.calls != 0 { t.Fatal("disabled request reached preparation") }
+			if service.calls != 0 {
+				t.Fatal("disabled request reached preparation")
+			}
 			continue
 		}
 		if response.Code != http.StatusAccepted || service.calls != 1 || service.userID != 1 || service.profileID != "p-owner" || service.contentID != "movie:heat-1995" || service.fileID != 42 {
@@ -190,7 +194,9 @@ func TestPrepareVirtualPlaybackSettingAndIdentity(t *testing.T) {
 		}
 		for _, fileID := range []string{"0", "-1", "042", "invalid"} {
 			response = do(t, handler, http.MethodPost, "/api/v2/media/movie:heat-1995/virtual-candidates/"+fileID+":prepare", "", owner)
-			if response.Code < 400 || response.Code >= 500 || service.calls != 1 { t.Fatalf("file %s: status=%d calls=%d", fileID, response.Code, service.calls) }
+			if response.Code < 400 || response.Code >= 500 || service.calls != 1 {
+				t.Fatalf("file %s: status=%d calls=%d", fileID, response.Code, service.calls)
+			}
 		}
 	}
 }

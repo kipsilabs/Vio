@@ -288,7 +288,7 @@ func TestVirtualPreparationRequiresEnabledAndAuthorizedVersion(t *testing.T) {
 			}
 			service := &VirtualPlaybackPreparationService{
 				Enabled: func(context.Context) bool { return test.enabled },
-				Detail: detail,
+				Detail:  detail,
 				FileByID: func(context.Context, int) (*models.MediaFile, error) {
 					t.Fatal("must authorize the selected file before loading it")
 					return nil, nil
@@ -319,9 +319,9 @@ func TestVirtualPreparationUsesBoundedRangeAndPrivateOptIn(t *testing.T) {
 			defer server.Close()
 			file := prewarmFile("virtual://movie/tt-preparation?result=selected")
 			service := &VirtualPlaybackPreparationService{
-				Enabled: func(context.Context) bool { return true },
+				Enabled:      func(context.Context) bool { return true },
 				AllowPrivate: func(context.Context) bool { return allowPrivate },
-				publicHTTP: remotestream.NewSafeClient(), privateHTTP: remotestream.NewInsecureClient(),
+				publicHTTP:   remotestream.NewSafeClient(), privateHTTP: remotestream.NewInsecureClient(),
 				List: VirtualPlaybackStreamListerFunc(func(context.Context, string, int, string, int) ([]VirtualPlaybackStream, error) {
 					return []VirtualPlaybackStream{{
 						URI: file.FilePath, SourceType: "usenet", ProviderURL: server.URL,
