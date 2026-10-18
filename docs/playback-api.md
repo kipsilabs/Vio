@@ -238,13 +238,15 @@ unwired or saturated preparation returns `503`; an inaccessible version returns
 written, and Play remains independent of preparation failures. V1 and Jellyfin
 behavior is unchanged.
 
-When the playback prober is configured, preparation runs the same cached ffprobe
-through the protected stream relay, including provider headers and the declared
-audio expectation used by playback. Opening the stream can start provider
-downloads, imports and health checks even if Play is never pressed. This replaces
-the separate one-byte request; it is not restricted to reading one byte. Without
-a configured prober, preparation falls back to GET with `Range: bytes=0-0`, reads
-at most one body byte and closes it.
+For each admitted eligible candidate, preparation sends an explicit GET with
+`Range: bytes=0-0`, reads at most one body byte and closes it. This request can
+start provider downloads, imports and health checks even if Play is never pressed.
+When the playback prober is configured, the same preparation task also runs cached
+ffprobe concurrently through the protected stream relay, including provider headers
+and the declared audio expectation used by playback. A cached, failed or slow probe
+does not suppress or delay the one-byte request, and a failed or slow warm-up does
+not block the probe. The probe is not restricted to reading one byte; the provider
+may receive both stream requests concurrently.
 
 Successful probe metadata is cached for ten minutes in the API process that ran
 the probe. The cache distinguishes exact selected versions and expected audio,
@@ -255,7 +257,8 @@ probe writes catalog metadata, sticky selections, watch progress or playback
 sessions. Browsing prefetch and version discovery remain list-only.
 
 Preparation has a 90-second budget and four concurrent slots
-per API process. Requests for the same installation and pinned source coalesce
+per API process. Each slot is held until both the one-byte request and the probe
+caller finish. Requests for the same installation and pinned source coalesce
 for two minutes through Redis, or a bounded local map without Redis. Redis
 failure fails closed. The shared probe worker has its own 60-second budget and
 can finish after its preparation caller stops waiting, so a concurrent playback
@@ -263,6 +266,11 @@ request can still reuse its result. Service shutdown cancels the preparation
 caller. Private destination access still requires
 `virtual_library.allow_private_streams` and probes use the same pinned-IP relay
 as playback.
+
+Debug logs distinguish skipped preparation (with a reason code), warm-up request
+initiation and completion, and probe initiation and outcome. They identify the file
+without logging provider URLs or request headers. A request-start log does not prove
+the provider received it, and `202` does not prove either operation completed.
 
 Closing a detail page does not undo provider-side work already started. Whether
 a later Play request benefits depends on AIOStreams and the downstream provider

@@ -68,6 +68,7 @@ func (s *VirtualPlaybackPreparationService) PrepareVirtualPlayback(ctx context.C
 	}
 	parsed, err := url.Parse(selectedPath)
 	if err != nil || parsed.Scheme != "virtual" || parsed.Query().Get("result") == "" || file.FailedAt != nil {
+		slog.DebugContext(ctx, "early stream preparation skipped", "component", "api", "file_id", file.ID, "reason", "ineligible_file")
 		return nil
 	}
 	s.once.Do(func() {
@@ -94,6 +95,7 @@ func (s *VirtualPlaybackPreparationService) PrepareVirtualPlayback(ctx context.C
 		if err != nil {
 			return apiError(http.StatusServiceUnavailable, "unavailable", "Early stream preparation is unavailable.")
 		}
+		slog.DebugContext(ctx, "early stream preparation skipped", "component", "api", "file_id", file.ID, "reason", "cooldown")
 		return nil
 	}
 	workCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), virtualPreparationBudget)
@@ -134,35 +136,41 @@ func (s *VirtualPlaybackPreparationService) claim(ctx context.Context, key strin
 
 func (s *VirtualPlaybackPreparationService) prepare(ctx context.Context, file *models.MediaFile, userID int, profileID string) {
 	if ctx.Err() != nil || !s.Enabled(ctx) {
+		slog.DebugContext(ctx, "early stream preparation skipped", "component", "api", "file_id", file.ID, "reason", "canceled_or_disabled")
 		return
 	}
 	streams, err := s.List.ListVirtualPlaybackStreams(ctx, virtualPlaybackNeutralKey(file.FilePath), userID, profileID, file.VirtualOwnerInstallationID)
 	if err != nil {
+		slog.DebugContext(ctx, "early stream preparation skipped", "component", "api", "file_id", file.ID, "reason", "list_failed")
 		return
 	}
 	candidate, ok := selectedVirtualPreparationCandidate(file, streams)
-	if !ok || ctx.Err() != nil || !s.Enabled(ctx) {
+	if !ok {
+		slog.DebugContext(ctx, "early stream preparation skipped", "component", "api", "file_id", file.ID, "reason", "no_eligible_candidate")
+		return
+	}
+	if ctx.Err() != nil || !s.Enabled(ctx) {
+		slog.DebugContext(ctx, "early stream preparation skipped", "component", "api", "file_id", file.ID, "reason", "canceled_or_disabled")
 		return
 	}
 	allowPrivate := s.AllowPrivate != nil && s.AllowPrivate(ctx)
 	providerURL, err := virtuallibrary.ValidateProviderStreamURL(ctx, candidate.ProviderURL, allowPrivate)
 	if err != nil {
+		slog.DebugContext(ctx, "early stream preparation skipped", "component", "api", "file_id", file.ID, "reason", "provider_url_rejected")
 		return
 	}
 	if s.Probe != nil {
-		probeFile := cloneVirtualProbeTransient(*file)
-		probeFile.Duration = 0
-		forwardVirtualCandidateDeclaredAudio(&probeFile, candidate)
-		probed, probeErr := s.Probe(ctx, providerURL, &probeFile, cloneHeaderMap(candidate.RequestHeaders))
-		if probeErr != nil || probed == nil {
-			slog.DebugContext(ctx, "early stream preparation probe did not complete", "component", "api", "file_id", file.ID)
-			return
-		}
-		slog.DebugContext(ctx, "early stream preparation warmed probe metadata", "component", "api", "file_id", file.ID)
-		return
+		var probes sync.WaitGroup
+		probes.Add(1)
+		go func() {
+			defer probes.Done()
+			s.prepareProbe(ctx, file, providerURL, candidate)
+		}()
+		defer probes.Wait()
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, providerURL, nil)
 	if err != nil {
+		slog.DebugContext(ctx, "early stream preparation did not complete", "component", "api", "file_id", file.ID, "reason", "request_invalid")
 		return
 	}
 	for name, value := range candidate.RequestHeaders {
@@ -173,19 +181,35 @@ func (s *VirtualPlaybackPreparationService) prepare(ctx context.Context, file *m
 	if allowPrivate {
 		client = s.privateHTTP
 	}
+	slog.DebugContext(ctx, "early stream preparation warm-up request started", "component", "api", "file_id", file.ID)
 	response, err := client.Do(request)
 	if err != nil {
-		slog.DebugContext(ctx, "early stream preparation did not complete", "component", "api", "file_id", file.ID)
+		slog.DebugContext(ctx, "early stream preparation did not complete", "component", "api", "file_id", file.ID, "reason", "request_failed")
 		return
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK && response.StatusCode != http.StatusPartialContent {
+		slog.DebugContext(ctx, "early stream preparation did not complete", "component", "api", "file_id", file.ID, "reason", "http_status", "status", response.StatusCode)
 		return
 	}
 	if _, err := io.CopyN(io.Discard, response.Body, 1); err != nil {
+		slog.DebugContext(ctx, "early stream preparation did not complete", "component", "api", "file_id", file.ID, "reason", "body_read_failed")
 		return
 	}
 	slog.DebugContext(ctx, "early stream preparation received a byte", "component", "api", "file_id", file.ID)
+}
+
+func (s *VirtualPlaybackPreparationService) prepareProbe(ctx context.Context, file *models.MediaFile, providerURL string, candidate VirtualPlaybackStream) {
+	probeFile := cloneVirtualProbeTransient(*file)
+	probeFile.Duration = 0
+	forwardVirtualCandidateDeclaredAudio(&probeFile, candidate)
+	slog.DebugContext(ctx, "early stream preparation probe started", "component", "api", "file_id", file.ID)
+	probed, probeErr := s.Probe(ctx, providerURL, &probeFile, cloneHeaderMap(candidate.RequestHeaders))
+	if probeErr != nil || probed == nil {
+		slog.DebugContext(ctx, "early stream preparation probe did not complete", "component", "api", "file_id", file.ID)
+		return
+	}
+	slog.DebugContext(ctx, "early stream preparation warmed probe metadata", "component", "api", "file_id", file.ID)
 }
 
 func selectedVirtualPreparationCandidate(file *models.MediaFile, streams []VirtualPlaybackStream) (VirtualPlaybackStream, bool) {
