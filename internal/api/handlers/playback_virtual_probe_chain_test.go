@@ -4,11 +4,14 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/Silo-Server/silo-server/internal/access"
+	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/models"
 )
 
@@ -47,15 +50,17 @@ func probeChainSourceRow() *models.MediaFile {
 // inside admitted work until released, so tests can hold the chain at that
 // exact point and inspect admission behavior while it is live.
 type blockedDefaultTarget struct {
-	mu    sync.Mutex
-	open  chan struct{}
-	callN int
-	row   *models.MediaFile
+	mu     sync.Mutex
+	open   chan struct{}
+	callN  int
+	row    *models.MediaFile
+	filter catalog.AccessFilter
 }
 
-func (b *blockedDefaultTarget) DefaultVirtualProbeTarget(ctx context.Context, contentID string) (*models.MediaFile, error) {
+func (b *blockedDefaultTarget) DefaultVirtualProbeTarget(ctx context.Context, contentID string, filter catalog.AccessFilter) (*models.MediaFile, error) {
 	b.mu.Lock()
 	b.callN++
+	b.filter = filter
 	b.mu.Unlock()
 	select {
 	case <-b.open:
@@ -63,6 +68,12 @@ func (b *blockedDefaultTarget) DefaultVirtualProbeTarget(ctx context.Context, co
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+}
+
+func (b *blockedDefaultTarget) lastFilter() catalog.AccessFilter {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.filter
 }
 
 func (b *blockedDefaultTarget) callCount() int {
@@ -164,7 +175,7 @@ func TestScheduleDefaultFileProbeProbesTheDefaultRowsOwnBytes(t *testing.T) {
 	h, target, prober := probeChainHandler(row)
 	target.releaseRow()
 
-	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), probeChainStreams(row))
+	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), probeChainStreams(row), catalog.AccessFilter{})
 	h.probeChainWG.Wait()
 	if prober.count() != 1 {
 		t.Fatalf("probe calls = %d, want exactly 1", prober.count())
@@ -183,10 +194,10 @@ func TestScheduleDefaultFileProbeSecondCallCoalescesIntoLiveChain(t *testing.T) 
 
 	// While the first chain sits inside admitted work, a second schedule of
 	// the same item must return immediately and spawn no second read.
-	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), probeChainStreams(row))
+	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), probeChainStreams(row), catalog.AccessFilter{})
 	probeChainWaitFor(t, 1, target.callCount, "live chain target reads")
 
-	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), probeChainStreams(row))
+	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), probeChainStreams(row), catalog.AccessFilter{})
 	probeChainStableWait(t, 1, target.callCount, "coalesced chain target reads")
 
 	target.releaseRow()
@@ -202,7 +213,7 @@ func TestScheduleDefaultFileProbeSkipsStampedRow(t *testing.T) {
 	h, target, prober := probeChainHandler(row)
 	target.releaseRow()
 
-	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), probeChainStreams(row))
+	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), probeChainStreams(row), catalog.AccessFilter{})
 	h.probeChainWG.Wait()
 
 	if prober.count() != 0 {
@@ -218,7 +229,7 @@ func TestScheduleDefaultFileProbeSkipsNeutralGroupRow(t *testing.T) {
 	h, target, prober := probeChainHandler(neutral)
 	target.releaseRow()
 
-	h.ScheduleDefaultFileProbe(probeChainTestContent, neutral, probeChainStreams(neutral))
+	h.ScheduleDefaultFileProbe(probeChainTestContent, neutral, probeChainStreams(neutral), catalog.AccessFilter{})
 	h.probeChainWG.Wait()
 
 	if prober.count() != 0 {
@@ -236,7 +247,7 @@ func TestScheduleDefaultFileProbeSkipsDefaultBytesMissingFromListing(t *testing.
 	streams := []VirtualPlaybackStream{
 		{URI: "virtual://movie/probe-chain?result=c5", OwnerInstallationID: 5},
 	}
-	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), streams)
+	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), streams, catalog.AccessFilter{})
 	h.probeChainWG.Wait()
 
 	if prober.count() != 0 {
@@ -249,7 +260,7 @@ func TestScheduleDefaultFileProbeSkipsUnwiredParts(t *testing.T) {
 
 	// No target: the chain is inert.
 	h := &PlaybackHandler{ServiceContext: context.Background()}
-	h.ScheduleDefaultFileProbe(probeChainTestContent, row, probeChainStreams(row))
+	h.ScheduleDefaultFileProbe(probeChainTestContent, row, probeChainStreams(row), catalog.AccessFilter{})
 	h.probeChainWG.Wait()
 
 	// No prober: similarly inert.
@@ -259,7 +270,7 @@ func TestScheduleDefaultFileProbeSkipsUnwiredParts(t *testing.T) {
 		ServiceContext:     context.Background(),
 		DefaultProbeTarget: target,
 	}
-	h2.ScheduleDefaultFileProbe(probeChainTestContent, row, probeChainStreams(row))
+	h2.ScheduleDefaultFileProbe(probeChainTestContent, row, probeChainStreams(row), catalog.AccessFilter{})
 	h2.probeChainWG.Wait()
 }
 
@@ -286,17 +297,17 @@ func TestScheduleDefaultFileProbeAdmissionBoundsSlotsAndReturnsImmediately(t *te
 		ServiceContext:              context.Background(),
 		VirtualPlaybackSourceProber: prober.probe,
 	}
-	h.DefaultProbeTarget = VirtualDefaultProbeTargetFunc(func(ctx context.Context, contentID string) (*models.MediaFile, error) {
+	h.DefaultProbeTarget = VirtualDefaultProbeTargetFunc(func(ctx context.Context, contentID string, _ catalog.AccessFilter) (*models.MediaFile, error) {
 		tgt := targetsByContent[contentID]
 		if tgt == nil {
 			return nil, fmt.Errorf("unexpected chain for %q", contentID)
 		}
-		return tgt.DefaultVirtualProbeTarget(ctx, contentID)
+		return tgt.DefaultVirtualProbeTarget(ctx, contentID, catalog.AccessFilter{})
 	})
 
 	// Two items fill the slots; their chains sit inside admitted work.
-	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), probeChainStreams(rowA))
-	h.ScheduleDefaultFileProbe(contentB, &models.MediaFile{ID: 307, ContentID: contentB, FilePath: "virtual://movie/probe-chain2"}, probeChainStreams(rowB))
+	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), probeChainStreams(rowA), catalog.AccessFilter{})
+	h.ScheduleDefaultFileProbe(contentB, &models.MediaFile{ID: 307, ContentID: contentB, FilePath: "virtual://movie/probe-chain2"}, probeChainStreams(rowB), catalog.AccessFilter{})
 	probeChainWaitFor(t, 1, targetA.callCount, "chain A entered its default-version read")
 	probeChainWaitFor(t, 1, targetB.callCount, "chain B entered its default-version read")
 
@@ -304,7 +315,7 @@ func TestScheduleDefaultFileProbeAdmissionBoundsSlotsAndReturnsImmediately(t *te
 	// answer "unexpected chain"), so its schedule returns immediately.
 	dropped := make(chan struct{})
 	go func() {
-		h.ScheduleDefaultFileProbe("movie-probe-chain-c", &models.MediaFile{ID: 308, ContentID: "movie-probe-chain-c", FilePath: "virtual://movie/probe-chain3"}, probeChainStreams(rowA))
+		h.ScheduleDefaultFileProbe("movie-probe-chain-c", &models.MediaFile{ID: 308, ContentID: "movie-probe-chain-c", FilePath: "virtual://movie/probe-chain3"}, probeChainStreams(rowA), catalog.AccessFilter{})
 		close(dropped)
 	}()
 	select {
@@ -320,7 +331,7 @@ func TestScheduleDefaultFileProbeAdmissionBoundsSlotsAndReturnsImmediately(t *te
 	h.probeChainWG.Wait()
 	prober4 := &recordingProber{hits: make(chan struct{}, 1)}
 	h.VirtualPlaybackSourceProber = prober4.probe
-	h.ScheduleDefaultFileProbe(contentD, &models.MediaFile{ID: 318, ContentID: contentD, FilePath: "virtual://movie/probe-chain4"}, probeChainStreams(rowD))
+	h.ScheduleDefaultFileProbe(contentD, &models.MediaFile{ID: 318, ContentID: contentD, FilePath: "virtual://movie/probe-chain4"}, probeChainStreams(rowD), catalog.AccessFilter{})
 	select {
 	case <-prober4.hits:
 	case <-time.After(2 * time.Second):
@@ -340,7 +351,7 @@ func TestScheduleDefaultFileProbeStallTeriminatesAndRestoresSlot(t *testing.T) {
 	// The target never opens its gate; it returns only when the chain context
 	// deadline fires. The goroutine must actually terminate and free the slot,
 	// not merely let a deadline lapse while the read continues.
-	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), probeChainStreams(row))
+	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), probeChainStreams(row), catalog.AccessFilter{})
 	h.probeChainWG.Wait()
 
 	if target.callCount() != 1 {
@@ -356,7 +367,7 @@ func TestScheduleDefaultFileProbeStallTeriminatesAndRestoresSlot(t *testing.T) {
 	target.row = row2
 	target.releaseRow()
 	h.VirtualPlaybackSourceProber = prober2.probe
-	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), probeChainStreams(row2))
+	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), probeChainStreams(row2), catalog.AccessFilter{})
 	select {
 	case <-prober2.hits:
 	case <-time.After(2 * time.Second):
@@ -386,13 +397,13 @@ func TestListSourceSchedulesChainAfterPersistOnlyForDiscover(t *testing.T) {
 		}),
 		Persist: func(context.Context, *models.MediaFile, []VirtualPlaybackStream) error { return nil },
 	}
-	svc.ScheduleDefaultFileProbe = func(contentID string, source *models.MediaFile, got []VirtualPlaybackStream) {
+	svc.ScheduleDefaultFileProbe = func(contentID string, source *models.MediaFile, got []VirtualPlaybackStream, _ catalog.AccessFilter) {
 		passed := make([]VirtualPlaybackStream, len(got))
 		copy(passed, got)
 		fired <- passed
 	}
 
-	if _, err := svc.listSource(context.Background(), row, 2, "p-1", svc.ListCached, probeChainTestContent); err != nil {
+	if _, err := svc.listSource(context.Background(), row, 2, "p-1", svc.ListCached, probeChainTestContent, catalog.AccessFilter{}); err != nil {
 		t.Fatalf("discover listSource: %v", err)
 	}
 	select {
@@ -404,7 +415,7 @@ func TestListSourceSchedulesChainAfterPersistOnlyForDiscover(t *testing.T) {
 		t.Fatal("discover persist did not schedule the probe chain")
 	}
 
-	if _, err := svc.listSource(context.Background(), row, 2, "p-1", svc.ListFresh, ""); err != nil {
+	if _, err := svc.listSource(context.Background(), row, 2, "p-1", svc.ListFresh, "", catalog.AccessFilter{}); err != nil {
 		t.Fatalf("refresh listSource: %v", err)
 	}
 	select {
@@ -434,7 +445,7 @@ func TestDiscoverScheduleSurvivesWaiterDisconnect(t *testing.T) {
 
 	deadCtx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := svc.listSource(deadCtx, probeChainSourceRow(), 2, "p-1", svc.ListCached, probeChainTestContent); err != nil {
+	if _, err := svc.listSource(deadCtx, probeChainSourceRow(), 2, "p-1", svc.ListCached, probeChainTestContent, catalog.AccessFilter{}); err != nil {
 		t.Fatalf("listSource with a dead caller context: %v", err)
 	}
 	h.probeChainWG.Wait()
@@ -445,32 +456,32 @@ func TestDiscoverScheduleSurvivesWaiterDisconnect(t *testing.T) {
 
 func TestDefaultProbeChainAdmissionIsAtomicWithoutGoroutines(t *testing.T) {
 	var admission defaultProbeChainAdmission
-	releaseA, ok := admission.acquire("movie-a")
-	if !ok {
-		t.Fatal("empty admission refused a fresh chain")
+	releaseA, refusal := admission.acquire("movie-a")
+	if refusal != defaultProbeChainRefusalNone {
+		t.Fatalf("empty admission refused a fresh chain: %q", refusal)
 	}
-	if _, occupies := admission.acquire("movie-a"); occupies {
-		t.Fatal("a live chain did not deduplicate its item")
+	if _, refusal := admission.acquire("movie-a"); refusal != defaultProbeChainRefusalLive {
+		t.Fatalf("a live chain did not deduplicate its item: %q", refusal)
 	}
-	releaseB, _ := admission.acquire("movie-b")
-	if releaseB == nil {
-		t.Fatal("second distinct item did not admit within the bound")
+	releaseB, refusal := admission.acquire("movie-b")
+	if refusal != defaultProbeChainRefusalNone || releaseB == nil {
+		t.Fatalf("second distinct item did not admit within the bound: %q", refusal)
 	}
 	releaseA()
-	releaseC, ok := admission.acquire("movie-c")
-	if !ok {
-		t.Fatal("a released chain kept its slot reserved")
+	releaseC, refusal := admission.acquire("movie-c")
+	if refusal != defaultProbeChainRefusalNone {
+		t.Fatalf("a released chain kept its slot reserved: %q", refusal)
 	}
 	// A double release must not hand out the same slot twice: with both slots
 	// legitimately live (b and c), nothing else is admissible.
 	releaseA()
-	if _, ok := admission.acquire("movie-d"); ok {
-		t.Fatal("a double release freed an extra slot")
+	if _, refusal := admission.acquire("movie-d"); refusal != defaultProbeChainRefusalCapacity {
+		t.Fatalf("a double release freed an extra slot: %q", refusal)
 	}
 	releaseC()
-	releaseD, ok := admission.acquire("movie-d")
-	if !ok {
-		t.Fatal("a released slot was not reusable")
+	releaseD, refusal := admission.acquire("movie-d")
+	if refusal != defaultProbeChainRefusalNone {
+		t.Fatalf("a released slot was not reusable: %q", refusal)
 	}
 	releaseB()
 	releaseD()
@@ -488,7 +499,7 @@ func TestScheduleDefaultFileProbeSurvivesPanickingWork(t *testing.T) {
 
 	// Panic inside the default-version read.
 	row := probeChainRow(320, "virtual://movie/probe-chain?result=cP1", nil)
-	panickingTarget := VirtualDefaultProbeTargetFunc(func(context.Context, string) (*models.MediaFile, error) {
+	panickingTarget := VirtualDefaultProbeTargetFunc(func(context.Context, string, catalog.AccessFilter) (*models.MediaFile, error) {
 		panic("target blew up")
 	})
 	prober := &recordingProber{}
@@ -497,14 +508,14 @@ func TestScheduleDefaultFileProbeSurvivesPanickingWork(t *testing.T) {
 		DefaultProbeTarget:          panickingTarget,
 		VirtualPlaybackSourceProber: prober.probe,
 	}
-	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), probeChainStreams(row))
+	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), probeChainStreams(row), catalog.AccessFilter{})
 	h.probeChainWG.Wait()
 
 	// The slot is reusable regardless of the panic.
 	reworked := &blockedDefaultTarget{open: make(chan struct{}), row: row}
 	reworked.releaseRow()
 	h.DefaultProbeTarget = reworked
-	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), probeChainStreams(row))
+	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), probeChainStreams(row), catalog.AccessFilter{})
 	probeChainWaitFor(t, 1, prober.count, "chain after a panicking target")
 
 	// Panic inside the probe: the chain must contain it, and both the
@@ -522,7 +533,7 @@ func TestScheduleDefaultFileProbeSurvivesPanickingWork(t *testing.T) {
 	}
 	h.DefaultProbeTarget = probedTarget
 	h.VirtualPlaybackSourceProber = explodingProber
-	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), probeChainStreams(probingRow))
+	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), probeChainStreams(probingRow), catalog.AccessFilter{})
 	h.probeChainWG.Wait()
 	if proberEntered.Load() != 1 {
 		t.Fatalf("panicking prober entered %d times, want exactly 1", proberEntered.Load())
@@ -540,7 +551,7 @@ func TestScheduleDefaultFileProbeSurvivesPanickingWork(t *testing.T) {
 	}
 	// A retry on the same item then runs normally.
 	h.VirtualPlaybackSourceProber = prober.probe
-	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), probeChainStreams(probingRow))
+	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), probeChainStreams(probingRow), catalog.AccessFilter{})
 	probeChainWaitFor(t, 2, prober.count, "chain after a panicking prober")
 	h.probeChainWG.Wait()
 }
@@ -568,7 +579,7 @@ func TestScheduleDefaultFileProbeSnapshotsMutableStreams(t *testing.T) {
 
 	streams := probeChainStreams(row)
 	streams[1].RequestHeaders = map[string]string{"User-Agent": "discovery-snapshotted"}
-	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), streams)
+	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), streams, catalog.AccessFilter{})
 	// The caller mutates its map after the hand-off; the chain must still
 	// probe with the value scheduled.
 	streams[1].RequestHeaders["User-Agent"] = "mutated-after-hand-off"
@@ -576,5 +587,133 @@ func TestScheduleDefaultFileProbeSnapshotsMutableStreams(t *testing.T) {
 
 	if got := seenHeaders["User-Agent"]; got != "discovery-snapshotted" {
 		t.Fatalf("prober headers = %q, want the value captured at scheduling", got)
+	}
+}
+
+// probeChainVersionReader is the production target's catalog seam for these
+// tests. It applies the real access filter to its file rows — the way
+// DetailService.GetItemVersions does before returning versions — and records
+// every filter it was handed and every file row it was asked to read.
+type probeChainVersionReader struct {
+	mu      sync.Mutex
+	files   []*models.MediaFile
+	rows    map[int]*models.MediaFile
+	filters []catalog.AccessFilter
+	reads   []int
+}
+
+func (r *probeChainVersionReader) GetItemVersions(_ context.Context, _ string, filter catalog.AccessFilter) ([]catalog.FileVersion, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.filters = append(r.filters, filter)
+	visible := catalog.FilterMediaFilesByAccess(r.files, filter)
+	versions := make([]catalog.FileVersion, 0, len(visible))
+	for _, file := range visible {
+		versions = append(versions, catalog.FileVersion{FileID: file.ID})
+	}
+	return versions, nil
+}
+
+func (r *probeChainVersionReader) GetByID(_ context.Context, id int) (*models.MediaFile, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.reads = append(r.reads, id)
+	return r.rows[id], nil
+}
+
+func (r *probeChainVersionReader) snapshot() ([]catalog.AccessFilter, []int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Clone(r.filters), slices.Clone(r.reads)
+}
+
+// TestScheduleDefaultFileProbeHonorsTheDiscoveryAccessFilter pins the target
+// lookup to the caller's access filter. The catalog read lists the hidden
+// library's version first; with the filter threaded through, the target
+// resolves and probes the visible default and never even reads the hidden
+// row's file. An unfiltered lookup — the bug this guards — would probe the
+// hidden version instead.
+func TestScheduleDefaultFileProbeHonorsTheDiscoveryAccessFilter(t *testing.T) {
+	const visibleLibrary, hiddenLibrary = 77, 78
+	visible := &models.MediaFile{
+		ID: 330, ContentID: probeChainTestContent, FilePath: "virtual://movie/probe-chain?result=visible",
+		MediaFolderID: visibleLibrary, VirtualOwnerInstallationID: 5, ProbeSource: "virtual",
+	}
+	hidden := &models.MediaFile{
+		ID: 331, ContentID: probeChainTestContent, FilePath: "virtual://movie/probe-chain?result=hidden",
+		MediaFolderID: hiddenLibrary, VirtualOwnerInstallationID: 5, ProbeSource: "virtual",
+	}
+	reader := &probeChainVersionReader{
+		// The hidden version sorts first, so an unfiltered read would pick it.
+		files: []*models.MediaFile{hidden, visible},
+		rows:  map[int]*models.MediaFile{visible.ID: visible, hidden.ID: hidden},
+	}
+	prober := &recordingProber{}
+	h := &PlaybackHandler{
+		ServiceContext:              context.Background(),
+		DefaultProbeTarget:          NewVirtualDefaultProbeTarget(reader, reader),
+		VirtualPlaybackSourceProber: prober.probe,
+	}
+	filter := catalog.AccessFilter{
+		AllowedLibraryIDs:         []int{visibleLibrary},
+		DisabledLibraryIDs:        []int{99},
+		PresentationLibraryID:     new(visibleLibrary),
+		MetadataLanguageOverrides: map[string]string{"en": "fr"},
+		MaturityLimits:            access.MaturityLimits{MaxContentRating: "PG-13"},
+	}
+	streams := []VirtualPlaybackStream{
+		{URI: hidden.FilePath, OwnerInstallationID: 5},
+		{URI: visible.FilePath, OwnerInstallationID: 5},
+	}
+
+	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), streams, filter)
+	h.probeChainWG.Wait()
+
+	filters, reads := reader.snapshot()
+	if len(reads) != 1 || reads[0] != visible.ID {
+		t.Fatalf("file rows read = %v, want only the visible version %d", reads, visible.ID)
+	}
+	if prober.count() != 1 || prober.last() != visible.FilePath {
+		t.Fatalf("probed %q (%d probes), want the visible default %q", prober.last(), prober.count(), visible.FilePath)
+	}
+	if len(filters) != 1 {
+		t.Fatalf("catalog version reads = %d, want 1", len(filters))
+	}
+	got := filters[0]
+	if !slices.Equal(got.AllowedLibraryIDs, filter.AllowedLibraryIDs) ||
+		!slices.Equal(got.DisabledLibraryIDs, filter.DisabledLibraryIDs) ||
+		got.PresentationLibraryID == nil || *got.PresentationLibraryID != visibleLibrary ||
+		got.MetadataLanguageOverrides["en"] != "fr" ||
+		got.MaxContentRating != "PG-13" {
+		t.Fatalf("catalog read filter = %+v, want the discovery request's filter %+v", got, filter)
+	}
+}
+
+// TestScheduleDefaultFileProbeSnapshotsAccessFilter pins the filter snapshot:
+// the request that scheduled the chain may reuse or mutate its filter after
+// the hand-off, and the detached read must still see the constraints that
+// authorized the discovery run.
+func TestScheduleDefaultFileProbeSnapshotsAccessFilter(t *testing.T) {
+	row := probeChainRow(332, "virtual://movie/probe-chain?result=cAF", nil)
+	h, target, _ := probeChainHandler(row)
+
+	filter := catalog.AccessFilter{
+		AllowedLibraryIDs:         []int{76},
+		MetadataLanguageOverrides: map[string]string{"en": "fr"},
+	}
+	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), probeChainStreams(row), filter)
+	probeChainWaitFor(t, 1, target.callCount, "chain entered its default-version read")
+
+	filter.AllowedLibraryIDs[0] = 99
+	filter.MetadataLanguageOverrides["en"] = "de"
+	target.releaseRow()
+	h.probeChainWG.Wait()
+
+	got := target.lastFilter()
+	if len(got.AllowedLibraryIDs) != 1 || got.AllowedLibraryIDs[0] != 76 {
+		t.Fatalf("chain read library scope = %v, want the value captured at scheduling", got.AllowedLibraryIDs)
+	}
+	if got.MetadataLanguageOverrides["en"] != "fr" {
+		t.Fatalf("chain read language overrides = %v, want the value captured at scheduling", got.MetadataLanguageOverrides)
 	}
 }
