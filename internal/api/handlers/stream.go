@@ -1615,6 +1615,10 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 		file, session = adopted, refreshed
 	}
 	file = bindSessionVirtualSourceWithTracks(r.Context(), file, session, h.fileResolver)
+	if isVirtualPlaybackFile(file) {
+		slog.DebugContext(r.Context(), "virtual stream source bound", "component", "api",
+			"file_id", file.ID, "session_file_id", session.MediaFileID, "resolution", file.Resolution)
+	}
 
 	// A verified overlay may have replaced the carried audio list with one that
 	// no longer contains the committed selection. The session records that as an

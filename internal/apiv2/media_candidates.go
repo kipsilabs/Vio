@@ -44,6 +44,34 @@ type VirtualPlaybackPreparationInput struct {
 	FileID  ID `path:"file_id" doc:"The selected version's file id from watch detail"`
 }
 
+func (reg *Registry) prepareNativeWatchVersion(ctx context.Context, contentID, mediaType string, versions []catalogpkg.FileVersion, selectedFileID int, filter catalogpkg.AccessFilter) {
+	claims := claimsFrom(ctx)
+	if claims == nil || (mediaType != themeOwnerMovie && mediaType != themeOwnerEpisode) || len(versions) == 0 ||
+		reg.deps.VirtualPlaybackPreparation == nil || reg.deps.PreplayPreparationEnabled == nil || !reg.deps.PreplayPreparationEnabled(ctx) {
+		return
+	}
+	switch strings.ToLower(strings.TrimSpace(observedClientName(ctx))) {
+	case "silo iphone", "silo ipad", "vio iphone", "vio ipad":
+	default:
+		return
+	}
+	version := versions[0]
+	if selectedFileID > 0 {
+		index := slices.IndexFunc(versions, func(candidate catalogpkg.FileVersion) bool { return candidate.FileID == selectedFileID })
+		if index < 0 {
+			return
+		}
+		version = versions[index]
+	}
+	if version.Failed || !strings.HasPrefix(version.FilePath, "virtual://") {
+		return
+	}
+	slog.DebugContext(ctx, "native watch stream preparation requested", "component", "apiv2", "file_id", version.FileID, "requested_file_id", selectedFileID)
+	if err := reg.deps.VirtualPlaybackPreparation.PrepareVirtualPlayback(ctx, claims.UserID, profileFrom(ctx), contentID, version.FileID, filter); err != nil {
+		slog.DebugContext(ctx, "native watch stream preparation unavailable", "component", "apiv2", "file_id", version.FileID)
+	}
+}
+
 func (reg *Registry) discoverDetailVersions(ctx context.Context, contentID, mediaType string, versions []catalogpkg.FileVersion, filter catalogpkg.AccessFilter, trigger string) bool {
 	claims := claimsFrom(ctx)
 	if claims == nil || (mediaType != themeOwnerMovie && mediaType != themeOwnerEpisode) ||

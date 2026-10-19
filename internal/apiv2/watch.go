@@ -373,6 +373,9 @@ func (reg *Registry) getWatchState(ctx context.Context, in *WatchDetailInput) (*
 			slog.WarnContext(ctx, "pre-play version discovery detail reload failed", "component", "apiv2", "item_id", in.ID, "trigger", "watch_detail")
 		}
 	}
+	if detail != nil {
+		reg.prepareNativeWatchVersion(ctx, string(in.ID), detail.Type, detail.Versions, opts.SelectedFileID, filter)
+	}
 	body := watchDetailOf(detail)
 	body.IndexerReleases = reg.indexerReleasesFor(ctx, string(in.ID))
 	return &WatchDetailOutput{Body: body}, nil

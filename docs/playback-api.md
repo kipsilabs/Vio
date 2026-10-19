@@ -218,15 +218,20 @@ Clients must treat a missing flag as false.
 
 An active detail view may submit its selected, pinned virtual
 version to `POST /api/v2/media/{media_id}/virtual-candidates/{file_id}:prepare`.
-Web and iOS use their displayed version-selection policy and submit
-only the selected movie or individual episode, not a season, series or browse
-prefetch. When discovery is enabled, the web waits for it to finish. iOS waits
-for a successful watch-detail refresh before using its displayed selection;
-the initial cached version list alone does not trigger automatic preparation.
-Choosing a different pinned version starts preparation for that exact file
-immediately, without waiting for background discovery or an automatic-selection
-debounce. The per-source cooldown still applies when returning to a recently
-prepared version. Preparation
+The web submits only the selected movie or individual episode, not a season,
+series or browse prefetch. When discovery is enabled, automatic web preparation
+waits for it to finish. An explicit web picker choice submits immediately.
+
+Installed iPhone and iPad clients do not need a new preparation request or app
+build. With preparation enabled, the server also prepares the selected version
+after their authenticated `GET /api/v2/watch/{id}` response data is loaded.
+The existing `file_id` query selects the exact authorized version; without it,
+the first ranked version is used. An absent selected file never falls back to a
+different version. This hook recognizes `Silo iPhone`, `Silo iPad`, `Vio iPhone`
+and `Vio iPad` client labels; Android, TV and macOS clients do not trigger it.
+A picker change that sends no watch request cannot trigger server preparation
+until the client transmits the selection. The per-source cooldown still applies
+when returning to a recently prepared version. Preparation
 also works independently for already enumerated versions when discovery is off.
 No URL is accepted from the client. The server checks watch-detail access and
 version membership, then matches that exact pinned candidate against the
