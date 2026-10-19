@@ -166,7 +166,7 @@ func (reg *Registry) watchlistTitleViewer(ctx context.Context) (handlers.Persona
 	rv := lifecycleViewer(ctx)
 	ceiling, err := reg.deps.WatchlistRequests.WatchlistCeiling(ctx, rv)
 	if err != nil {
-		return handlers.PersonalListViewer{}, mediarequests.Viewer{}, "", requestProblem(err)
+		return handlers.PersonalListViewer{}, mediarequests.Viewer{}, "", requestProblem(ctx, err)
 	}
 	return viewer, rv, ceiling, nil
 }
@@ -223,7 +223,7 @@ func (reg *Registry) listWatchlistTitles(ctx context.Context, cursors *Cursors, 
 	}
 	states, err := reg.deps.WatchlistRequests.WatchlistRequestStates(ctx, rv, titles)
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	items := make([]WatchlistTitle, 0, len(visible))
 	for _, e := range visible {
@@ -264,12 +264,12 @@ func (reg *Registry) addWatchlistTitle(ctx context.Context, in *WatchlistTitleIn
 		// The library has it: nothing to request, only the state to report.
 		states, err := reg.deps.WatchlistRequests.WatchlistRequestStates(ctx, rv, []mediarequests.WatchlistTitle{title})
 		if err != nil {
-			return nil, requestProblem(err)
+			return nil, requestProblem(ctx, err)
 		}
 		state = states[mediarequests.WatchlistKey{MediaType: title.MediaType, TMDBID: title.TMDBID}]
 	} else {
 		if state, err = reg.deps.WatchlistRequests.RequestFromWatchlist(ctx, rv, title); err != nil {
-			return nil, requestProblem(err)
+			return nil, requestProblem(ctx, err)
 		}
 		// A delete of the same title can run between the save and the
 		// request: it withdraws, then removes the entry. Rechecking the entry
@@ -281,11 +281,11 @@ func (reg *Registry) addWatchlistTitle(ctx context.Context, in *WatchlistTitleIn
 		}
 		if off {
 			if err := reg.withdrawWatchlistRequests(ctx, rv, snap.MediaType, append([]int{snap.TMDBID}, snap.FormerTMDBIDs...)); err != nil {
-				return nil, requestProblem(err)
+				return nil, requestProblem(ctx, err)
 			}
 			states, err := reg.deps.WatchlistRequests.WatchlistRequestStates(ctx, rv, []mediarequests.WatchlistTitle{title})
 			if err != nil {
-				return nil, requestProblem(err)
+				return nil, requestProblem(ctx, err)
 			}
 			state = states[mediarequests.WatchlistKey{MediaType: title.MediaType, TMDBID: title.TMDBID}]
 		}
@@ -318,7 +318,7 @@ func (reg *Registry) watchlistTitleSnapshot(ctx context.Context, rv mediarequest
 		return watchlist.Snapshot{}, notFound
 	}
 	if err != nil {
-		return watchlist.Snapshot{}, requestProblem(err)
+		return watchlist.Snapshot{}, requestProblem(ctx, err)
 	}
 	snap, err := watchlist.SnapshotFromDetail(detail)
 	if err != nil {
@@ -355,7 +355,7 @@ func (reg *Registry) deleteWatchlistTitle(ctx context.Context, in *WatchlistTitl
 		ids = append(ids, known.FormerTMDBIDs...)
 	}
 	if err := reg.withdrawWatchlistRequests(ctx, rv, in.MediaType, ids); err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	if _, err := reg.deps.WatchlistTitles.RemoveWatchlistTitle(ctx, viewer, in.MediaType, in.TMDBID); err != nil {
 		return nil, serviceProblem(err)
@@ -366,7 +366,7 @@ func (reg *Registry) deleteWatchlistTitle(ctx context.Context, in *WatchlistTitl
 	}
 	if off {
 		if err := reg.withdrawWatchlistRequests(ctx, rv, in.MediaType, ids); err != nil {
-			return nil, requestProblem(err)
+			return nil, requestProblem(ctx, err)
 		}
 	}
 	return nil, nil
