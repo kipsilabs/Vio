@@ -482,7 +482,7 @@ func TestGetVirtualCandidateByNeutralPath_ResultVariant(t *testing.T) {
 	}
 }
 
-func TestReplaceVirtualResultPin_CollisionUnpinsInsteadOfErroring(t *testing.T) {
+func TestReplaceVirtualResultPin_CollisionAdoptsOwner(t *testing.T) {
 	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("SILO_TEST_DATABASE_URL is not set")
@@ -498,7 +498,6 @@ func TestReplaceVirtualResultPin_CollisionUnpinsInsteadOfErroring(t *testing.T) 
 	contentID := fmt.Sprintf("virtual-pin-collision-%d", suffix)
 	deadPath := fmt.Sprintf("virtual://movie/tt%d?result=dead-candidate", suffix)
 	livePath := fmt.Sprintf("virtual://movie/tt%d?result=live-winner", suffix)
-	neutralPath := fmt.Sprintf("virtual://movie/tt%d", suffix)
 
 	var folderID int
 	if err := pool.QueryRow(ctx, `
@@ -540,21 +539,22 @@ func TestReplaceVirtualResultPin_CollisionUnpinsInsteadOfErroring(t *testing.T) 
 	repo := NewFileRepository(pool)
 
 	// Repointing the dead-pinned row at the live path collides with the sibling row:
-	// the pin must be stripped from this row and (false, nil) returned, not an error.
+	// the existing owner already represents the winning pin, so the update reports
+	// success without rewriting this row's path.
 	replaced, err := repo.ReplaceVirtualResultPin(ctx, deadFileID, deadPath, livePath)
 	if err != nil {
 		t.Fatalf("ReplaceVirtualResultPin error on collision: %v", err)
 	}
-	if replaced {
-		t.Fatal("ReplaceVirtualResultPin returned true on collision; pin should be stripped instead")
+	if !replaced {
+		t.Fatal("ReplaceVirtualResultPin returned false on collision; the owner already holds the winning pin")
 	}
 
 	var deadPathNow, livePathNow string
 	if err := pool.QueryRow(ctx, `SELECT file_path FROM media_files WHERE id=$1`, deadFileID).Scan(&deadPathNow); err != nil {
 		t.Fatalf("fetch dead-pinned row path: %v", err)
 	}
-	if deadPathNow != neutralPath {
-		t.Fatalf("dead-pinned row was not unpinned on collision: got %q, want %q", deadPathNow, neutralPath)
+	if deadPathNow != deadPath {
+		t.Fatalf("losing row path changed on collision: got %q, want %q", deadPathNow, deadPath)
 	}
 	if err := pool.QueryRow(ctx, `SELECT file_path FROM media_files WHERE file_path=$1 AND virtual_owner_installation_id=5 AND media_folder_id=$2`, livePath, folderID).Scan(&livePathNow); err != nil {
 		t.Fatalf("fetch sibling live row path: %v", err)
@@ -667,7 +667,7 @@ func TestClearVirtualResultPin_StripsResultPreservingOtherParams(t *testing.T) {
 	}
 }
 
-func TestReplaceVirtualResultPin_CollisionUnpinsProfileQualified(t *testing.T) {
+func TestReplaceVirtualResultPin_CollisionAdoptsProfileQualifiedOwner(t *testing.T) {
 	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("SILO_TEST_DATABASE_URL is not set")
@@ -683,7 +683,6 @@ func TestReplaceVirtualResultPin_CollisionUnpinsProfileQualified(t *testing.T) {
 	contentID := fmt.Sprintf("virtual-pin-collision-profile-%d", suffix)
 	deadPath := fmt.Sprintf("virtual://movie/tt%d?profile=1080p&result=dead-candidate", suffix)
 	livePath := fmt.Sprintf("virtual://movie/tt%d?profile=1080p&result=live-winner", suffix)
-	neutralPath := fmt.Sprintf("virtual://movie/tt%d?profile=1080p", suffix)
 
 	var folderID int
 	if err := pool.QueryRow(ctx, `
@@ -728,16 +727,16 @@ func TestReplaceVirtualResultPin_CollisionUnpinsProfileQualified(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReplaceVirtualResultPin error on collision: %v", err)
 	}
-	if replaced {
-		t.Fatal("ReplaceVirtualResultPin returned true on collision; pin should be stripped instead")
+	if !replaced {
+		t.Fatal("ReplaceVirtualResultPin returned false on collision; the owner already holds the winning pin")
 	}
 
 	var deadPathNow, livePathNow string
 	if err := pool.QueryRow(ctx, `SELECT file_path FROM media_files WHERE id=$1`, deadFileID).Scan(&deadPathNow); err != nil {
 		t.Fatalf("fetch dead-pinned row path: %v", err)
 	}
-	if deadPathNow != neutralPath {
-		t.Fatalf("dead-pinned row was not unpinned preserving profile: got %q, want %q", deadPathNow, neutralPath)
+	if deadPathNow != deadPath {
+		t.Fatalf("losing row path changed on collision: got %q, want %q", deadPathNow, deadPath)
 	}
 	if err := pool.QueryRow(ctx, `SELECT file_path FROM media_files WHERE file_path=$1 AND virtual_owner_installation_id=5 AND media_folder_id=$2`, livePath, folderID).Scan(&livePathNow); err != nil {
 		t.Fatalf("fetch sibling live row path: %v", err)
