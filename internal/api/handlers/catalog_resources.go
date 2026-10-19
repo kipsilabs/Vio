@@ -275,7 +275,7 @@ func (h *CatalogResourceHandler) syntheticSeasonDetail(ctx context.Context, v It
 		return nil, err
 	}
 
-	episodes, err := h.items.episodeRepo.ListBySeason(ctx, seriesID, seasonNum)
+	episodes, err := h.items.seasonEpisodesForRead(ctx, seriesID, seasonNum)
 	if err != nil {
 		return nil, fmt.Errorf("listing season episodes: %w", err)
 	}

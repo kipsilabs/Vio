@@ -1119,23 +1119,6 @@ func (r *EpisodeRepository) ListBySeasonID(ctx context.Context, seasonID string)
 	return scanEpisodes(rows)
 }
 
-// ListMetadataBySeasonID is ListBySeasonID without the library-availability
-// filter, for the same metadata-only season fallback as ListMetadataBySeason.
-func (r *EpisodeRepository) ListMetadataBySeasonID(ctx context.Context, seasonID string) ([]*models.Episode, error) {
-	query := `SELECT ` + episodeColumns + `
-		FROM episodes
-		WHERE season_id = $1
-		ORDER BY episode_number ASC`
-
-	rows, err := r.pool.Query(ctx, query, seasonID)
-	if err != nil {
-		return nil, fmt.Errorf("listing metadata episodes by season_id: %w", err)
-	}
-	defer rows.Close()
-
-	return scanEpisodes(rows)
-}
-
 func (r *EpisodeRepository) ListBySeasonIDs(ctx context.Context, seasonIDs []string) (map[string][]*models.Episode, error) {
 	result := make(map[string][]*models.Episode, len(seasonIDs))
 	if len(seasonIDs) == 0 {

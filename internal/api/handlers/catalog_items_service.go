@@ -433,15 +433,9 @@ func (h *CatalogResourceHandler) ItemEpisodes(ctx context.Context, v ItemViewer,
 		if err := h.ensureSeriesVisible(ctx, v, seriesID, failed); err != nil {
 			return nil, err
 		}
-		episodes, err := h.items.episodeRepo.ListBySeason(ctx, seriesID, seasonNum)
+		episodes, err := h.items.seasonEpisodesForRead(ctx, seriesID, seasonNum)
 		if err != nil {
 			return nil, apiError(http.StatusInternalServerError, "internal_error", failed)
-		}
-		if len(episodes) == 0 {
-			episodes, err = h.items.episodeRepo.ListMetadataBySeason(ctx, seriesID, seasonNum)
-			if err != nil {
-				return nil, apiError(http.StatusInternalServerError, "internal_error", failed)
-			}
 		}
 		if len(episodes) == 0 {
 			return nil, apiError(http.StatusNotFound, "not_found", "Item not found")
@@ -451,7 +445,7 @@ func (h *CatalogResourceHandler) ItemEpisodes(ctx context.Context, v ItemViewer,
 	if err := h.ensureSeriesVisible(ctx, v, season.SeriesID, failed); err != nil {
 		return nil, err
 	}
-	episodes, err := h.items.seasonEpisodesForRead(ctx, season)
+	episodes, err := h.items.seasonEpisodesForRead(ctx, season.SeriesID, season.SeasonNumber)
 	if err != nil {
 		return nil, apiError(http.StatusInternalServerError, "internal_error", failed)
 	}
@@ -459,27 +453,35 @@ func (h *CatalogResourceHandler) ItemEpisodes(ctx context.Context, v ItemViewer,
 	return h.items.buildEpisodeResponses(ctx, v, episodes), nil
 }
 
-// seasonEpisodesForRead lists a season row's episodes for a viewer read. It
-// prefers the library-available set and falls back to the episodes table when
-// no candidate is materialized, so a metadata-only season still answers with
-// its episodes rather than an empty page.
-func (h *ItemsHandler) seasonEpisodesForRead(ctx context.Context, season *models.Season) ([]*models.Episode, error) {
-	episodes, err := h.episodeRepo.ListBySeasonID(ctx, season.ContentID)
+// seasonEpisodesForRead lists a season's episodes by its (series_id,
+// season_number) identity: the library-available set first, then every
+// metadata episode when nothing is materialized. Every season read uses this
+// one rule, so the series count, season page, item episodes, and season detail
+// describe the same set. The season row's season_id is only a link hint; the
+// unique (series_id, season_number, episode_number) key makes the number the
+// stronger identity, and reading by number keeps unlinked-but-available
+// episodes (and their files) when a season is only partly linked.
+func (h *ItemsHandler) seasonEpisodesForRead(ctx context.Context, seriesID string, seasonNumber int) ([]*models.Episode, error) {
+	episodes, err := h.episodeRepo.ListBySeason(ctx, seriesID, seasonNumber)
 	if err != nil || len(episodes) > 0 {
 		return episodes, err
 	}
-	return h.metadataSeasonEpisodes(ctx, season)
+	return h.episodeRepo.ListMetadataBySeason(ctx, seriesID, seasonNumber)
 }
 
-// metadataSeasonEpisodes is the metadata-only fallback of seasonEpisodesForRead:
-// the season row's episodes first, then the series-and-number lookup for
-// rows whose season_id was never linked.
-func (h *ItemsHandler) metadataSeasonEpisodes(ctx context.Context, season *models.Season) ([]*models.Episode, error) {
-	episodes, err := h.episodeRepo.ListMetadataBySeasonID(ctx, season.ContentID)
-	if err != nil || len(episodes) > 0 {
-		return episodes, err
+// episodesAllLinkedToSeason reports whether every listed episode carries this
+// season row's season_id, so a rollup keyed by that row covers the same set
+// the reader returned.
+func episodesAllLinkedToSeason(episodes []*models.Episode, seasonID string) bool {
+	if len(episodes) == 0 {
+		return false
 	}
-	return h.episodeRepo.ListMetadataBySeason(ctx, season.SeriesID, season.SeasonNumber)
+	for _, episode := range episodes {
+		if episode == nil || episode.SeasonID != seasonID {
+			return false
+		}
+	}
+	return true
 }
 
 // ensureSeriesVisible is the access and presentation-library check every
@@ -521,15 +523,6 @@ func (h *CatalogResourceHandler) seriesSeasons(ctx context.Context, v ItemViewer
 			return nil, apiError(http.StatusInternalServerError, "internal_error", failed)
 		}
 		if len(seasons) > 0 {
-			// Season metadata is the list's authority: a virtual series keeps
-			// every metadata season after its candidates stop being
-			// materialized, so never drop a row because its library has no
-			// episodes yet. Metadata episode counts fill in the seasons the
-			// availability rollup has no entries for.
-			metadataCounts, err := h.items.metadataSeasonCounts(ctx, id)
-			if err != nil {
-				return nil, apiError(http.StatusInternalServerError, "internal_error", failed)
-			}
 			if h.items.detailSvc != nil {
 				if localized, locErr := h.items.detailSvc.LocalizeSeasonModels(ctx, seasons, filter); locErr == nil && len(localized) == len(seasons) {
 					seasons = localized
@@ -538,6 +531,22 @@ func (h *CatalogResourceHandler) seriesSeasons(ctx context.Context, v ItemViewer
 			episodeCounts, userData, err := h.items.seriesSeasonRollups(ctx, v, id)
 			if err != nil {
 				return nil, apiError(http.StatusInternalServerError, "internal_error", failed)
+			}
+			// Season metadata is the list's authority: a virtual series keeps
+			// every metadata season after its candidates stop being
+			// materialized, so never drop a row because its library has no
+			// episodes yet. Metadata episode counts fill in the seasons the
+			// availability rollup has no entries for; a fully materialized
+			// series skips that query altogether.
+			var metadataCounts map[int]int
+			for _, season := range seasons {
+				if episodeCounts[season.SeasonNumber] == 0 {
+					metadataCounts, err = h.items.metadataSeasonCounts(ctx, id)
+					if err != nil {
+						return nil, apiError(http.StatusInternalServerError, "internal_error", failed)
+					}
+					break
+				}
 			}
 
 			// Sign every season poster in one batch instead of resolving each
@@ -606,26 +615,19 @@ func (h *CatalogResourceHandler) SeriesSeason(ctx context.Context, v ItemViewer,
 		season, err := h.items.seasonRepo.GetBySeriesAndNumber(ctx, id, num)
 		switch {
 		case err == nil:
-			episodes, err := h.items.episodeRepo.ListBySeasonID(ctx, season.ContentID)
+			episodes, err := h.items.seasonEpisodesForRead(ctx, season.SeriesID, season.SeasonNumber)
 			if err != nil {
 				return SeasonView{}, apiError(http.StatusInternalServerError, "internal_error", failed)
 			}
-			// The SQL rollup groups by season row, so it answers only when
-			// available episodes are linked to this row. A metadata-only or
-			// unlinked season falls back to the episodes table and folds
-			// their progress instead.
+			// The SQL rollup groups by season row, so it covers the listed
+			// set only when every episode is linked to this row. A
+			// metadata-only, unlinked, or partly linked season folds the
+			// listed episodes instead, keeping progress on the same set the
+			// page reports.
 			var userData *catalog.SeasonUserData
 			rolledUp := false
-			if len(episodes) > 0 {
+			if episodesAllLinkedToSeason(episodes, season.ContentID) {
 				userData, rolledUp = h.items.parentRollupUserData(ctx, v, "season", season.ContentID)
-			} else {
-				// A metadata-only season has no available episodes to roll
-				// up; its metadata episodes still keep the season page
-				// coherent instead of returning an empty 200 or a 404.
-				episodes, err = h.items.metadataSeasonEpisodes(ctx, season)
-				if err != nil {
-					return SeasonView{}, apiError(http.StatusInternalServerError, "internal_error", failed)
-				}
 			}
 			if !rolledUp {
 				userData = h.items.getAggregateUserData(ctx, v, episodes)
@@ -638,15 +640,9 @@ func (h *CatalogResourceHandler) SeriesSeason(ctx context.Context, v ItemViewer,
 			return SeasonView{}, apiError(http.StatusInternalServerError, "internal_error", failed)
 		}
 	}
-	episodes, err := h.items.episodeRepo.ListBySeason(ctx, id, num)
+	episodes, err := h.items.seasonEpisodesForRead(ctx, id, num)
 	if err != nil {
 		return SeasonView{}, apiError(http.StatusInternalServerError, "internal_error", failed)
-	}
-	if len(episodes) == 0 {
-		episodes, err = h.items.episodeRepo.ListMetadataBySeason(ctx, id, num)
-		if err != nil {
-			return SeasonView{}, apiError(http.StatusInternalServerError, "internal_error", failed)
-		}
 	}
 	if len(episodes) == 0 {
 		return SeasonView{}, apiError(http.StatusNotFound, "not_found", "Season not found")
@@ -673,15 +669,9 @@ func (h *CatalogResourceHandler) SeasonEpisodes(ctx context.Context, v ItemViewe
 	if err := h.ensureSeriesVisible(ctx, v, id, failed); err != nil {
 		return nil, err
 	}
-	episodes, err := h.items.episodeRepo.ListBySeason(ctx, id, num)
+	episodes, err := h.items.seasonEpisodesForRead(ctx, id, num)
 	if err != nil {
 		return nil, apiError(http.StatusInternalServerError, "internal_error", failed).WithCause(err)
-	}
-	if len(episodes) == 0 {
-		episodes, err = h.items.episodeRepo.ListMetadataBySeason(ctx, id, num)
-		if err != nil {
-			return nil, apiError(http.StatusInternalServerError, "internal_error", failed).WithCause(err)
-		}
 	}
 	if h.items.seasonRepo != nil {
 		if season, seasonErr := h.items.seasonRepo.GetBySeriesAndNumber(ctx, id, num); seasonErr == nil && season != nil {

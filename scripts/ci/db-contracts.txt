@@ -176,3 +176,8 @@
 # resolver's identity (a missing or conflicting stronger tier is not neutral) and
 # the SQL adoption fence refuses it, leaving the original row byte-identical.
 ./internal/api/handlers TestForeignSubstitutionProbeWriteStaysFenced
+
+# Every season read selects episodes by (series_id, season_number), so a fully
+# unlinked, partly linked, metadata-only, or file-backed season answers the same
+# set from the series count, season page, item episodes, and season detail.
+./internal/api/handlers TestSeriesSeasonsKeepsMetadataOnlySeasons

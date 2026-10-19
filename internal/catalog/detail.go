@@ -3179,15 +3179,17 @@ func (s *DetailService) buildSeasonDetail(ctx context.Context, season *models.Se
 
 	episodes := []*models.Episode{}
 	if s.episodeRepo != nil {
-		episodes, err = s.episodeRepo.ListBySeasonID(ctx, season.ContentID)
+		episodes, err = s.episodeRepo.ListBySeason(ctx, season.SeriesID, season.SeasonNumber)
 		if err != nil {
 			return nil, fmt.Errorf("listing season episodes: %w", err)
 		}
 		// A virtual season keeps its metadata after its candidates stop being
 		// materialized. Fall back to the episodes table so the detail's
 		// episode_count agrees with the season page instead of reporting 0.
+		// Both reads use the (series_id, season_number) identity, the same
+		// rule every other season read uses.
 		if len(episodes) == 0 {
-			episodes, err = s.episodeRepo.ListMetadataBySeasonID(ctx, season.ContentID)
+			episodes, err = s.episodeRepo.ListMetadataBySeason(ctx, season.SeriesID, season.SeasonNumber)
 			if err != nil {
 				return nil, fmt.Errorf("listing metadata season episodes: %w", err)
 			}
