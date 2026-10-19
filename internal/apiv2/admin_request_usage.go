@@ -58,7 +58,7 @@ func registerAdminRequestUsage(reg *Registry) {
 		}
 		policy, err := reg.deps.AdminRequestUsage.EffectivePolicy(ctx, id)
 		if err != nil {
-			return nil, requestProblem(err)
+			return nil, requestProblem(ctx, err)
 		}
 		return &AdminRequestUserUsageOutput{Body: adminRequestUserUsageOf(policy)}, nil
 	})

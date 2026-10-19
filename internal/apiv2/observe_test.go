@@ -23,10 +23,16 @@ import (
 // captureLogs routes slog through the production redaction handler into a
 // buffer for the duration of the test.
 func captureLogs(t *testing.T) *bytes.Buffer {
+	return captureLogsAt(t, slog.LevelInfo)
+}
+
+// captureLogsAt is captureLogs with an explicit minimum level, for tests that
+// assert a cause reached a debug line without entering the INFO log.
+func captureLogsAt(t *testing.T, level slog.Level) *bytes.Buffer {
 	t.Helper()
 	var buf bytes.Buffer
 	prev := slog.Default()
-	slog.SetDefault(slog.New(logredact.New(slog.NewJSONHandler(&buf, nil))))
+	slog.SetDefault(slog.New(logredact.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: level}))))
 	t.Cleanup(func() { slog.SetDefault(prev) })
 	return &buf
 }

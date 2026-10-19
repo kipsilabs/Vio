@@ -642,7 +642,11 @@ authentication `401`, authorization `403` (or hidden `404`), missing resources `
 idempotency conflicts `409`, unacceptable representation `406`, configured request-body timeout
 `408`, oversized bodies `413`, unsupported media `415`, typed/domain input validation `422`, rate
 limiting `429`, unexpected failures `500`, and temporary dependency unavailability `503`.
-`Retry-After` accompanies `429` and applicable `503` responses.
+`Retry-After` accompanies `429` and applicable `503` responses. On the request-domain
+operations, a request the client abandoned or whose deadline expired answers `408
+request_timeout` with a generic detail rather than `500`; a genuine service failure keeps the
+internal error. A dependency that reports its own deadline while the incoming request is still
+live is `503 dependency_unavailable`, not a client timeout.
 
 ### Success responses
 

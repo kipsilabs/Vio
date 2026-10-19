@@ -251,7 +251,7 @@ func registerAdminRequests(reg *Registry) {
 				r, err = s.Retry(ctx, v, string(in.ID))
 			}
 			if err != nil {
-				return nil, requestProblem(err)
+				return nil, requestProblem(ctx, err)
 			}
 			return &MediaRequestOutput{Body: mediaRequestOf(r, v)}, nil
 		})
@@ -296,7 +296,7 @@ func (reg *Registry) listAdminRequests(ctx context.Context, cursors *Cursors, in
 	filter.Limit, filter.Before = in.Limit+1, before
 	rows, err := s.ListAdmin(ctx, v, filter)
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	next := ""
 	if len(rows) > in.Limit {
@@ -340,7 +340,7 @@ func (reg *Registry) getAdminRequestSettings(ctx context.Context, _ *struct{}) (
 	}
 	r, err := s.GetSettings(ctx, adminRequestViewer(ctx))
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	return &AdminRequestSettingsOutput{ETag: adminRequestTag(ctx, "settings", "global", r.Revision).String(), Body: adminSettingsOf(r)}, nil
 }
@@ -356,7 +356,7 @@ func (reg *Registry) updateAdminRequestSettings(ctx context.Context, in *AdminRe
 	v := adminRequestViewer(ctx)
 	r, err := s.GetSettings(ctx, v)
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	rev, p := adminRequestGuard(AdminRequestPreconditions{in.IfMatch, in.IfNoneMatch}, adminRequestTag(ctx, "settings", "global", r.Revision), r.Revision)
 	if p != nil {
@@ -371,7 +371,7 @@ func (reg *Registry) updateAdminRequestSettings(ctx context.Context, in *AdminRe
 		return nil, NewProblem(TypePreconditionFailed, "Request settings changed; reload before saving.").WithHeader("ETag", current.ETag)
 	}
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	return &AdminRequestSettingsOutput{ETag: adminRequestTag(ctx, "settings", "global", r.Revision).String(), Body: adminSettingsOf(r)}, nil
 }
@@ -389,7 +389,7 @@ func (reg *Registry) getAdminRequestUserLimit(ctx context.Context, in *AdminRequ
 	}
 	r, err := s.GetUserLimit(ctx, adminRequestViewer(ctx), id)
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	return &AdminRequestLimitOutput{ETag: adminRequestTag(ctx, "limit", string(in.UserID), r.Revision).String(), Body: adminLimitOf(r)}, nil
 }
@@ -409,7 +409,7 @@ func (reg *Registry) updateAdminRequestUserLimit(ctx context.Context, in *AdminR
 	v := adminRequestViewer(ctx)
 	r, err := s.GetUserLimit(ctx, v, id)
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	rev, p := adminRequestGuard(AdminRequestPreconditions{in.IfMatch, in.IfNoneMatch}, adminRequestTag(ctx, "limit", string(in.UserID), r.Revision), r.Revision)
 	if p != nil {
@@ -425,7 +425,7 @@ func (reg *Registry) updateAdminRequestUserLimit(ctx context.Context, in *AdminR
 		return nil, NewProblem(TypePreconditionFailed, "The account limit changed; reload before saving.").WithHeader("ETag", current.ETag)
 	}
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	return &AdminRequestLimitOutput{ETag: adminRequestTag(ctx, "limit", string(in.UserID), r.Revision).String(), Body: adminLimitOf(r)}, nil
 }
@@ -452,23 +452,23 @@ func adminIntegrationOf(r mediarequests.Integration) AdminRequestIntegration {
 // adminRequestBaseURL is the address a v2 probe or save sends on: http://
 // assumed and no trailing slash, so the probe and the saved row agree. A blank
 // address stays blank; the service then uses the saved one.
-func adminRequestBaseURL(raw string) (string, *Problem) {
+func adminRequestBaseURL(ctx context.Context, raw string) (string, *Problem) {
 	if strings.TrimSpace(raw) == "" {
 		return raw, nil
 	}
 	normalized, err := mediarequests.NormalizeIntegrationBaseURL(raw)
 	if err != nil {
-		return "", requestProblem(err)
+		return "", requestProblem(ctx, err)
 	}
 	return normalized, nil
 }
 
-func (b AdminRequestIntegrationBody) domain() (mediarequests.Integration, *Problem) {
+func (b AdminRequestIntegrationBody) domain(ctx context.Context) (mediarequests.Integration, *Problem) {
 	id, err := strconv.Atoi(string(b.InstallationID))
 	if err != nil || id < 0 {
 		return mediarequests.Integration{}, NewProblem(TypeValidationFailed, "Invalid installation ID.")
 	}
-	baseURL, p := adminRequestBaseURL(b.BaseURL)
+	baseURL, p := adminRequestBaseURL(ctx, b.BaseURL)
 	if p != nil {
 		return mediarequests.Integration{}, p
 	}
@@ -492,7 +492,7 @@ func (reg *Registry) listAdminRequestIntegrations(ctx context.Context, cursors *
 	}
 	rows, err := s.ListIntegrations(ctx, v)
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	slices.SortFunc(rows, func(a, b mediarequests.Integration) int { return cmp.Compare(a.ID, b.ID) })
 	items := make([]AdminRequestIntegration, 0, in.Limit)
@@ -519,7 +519,7 @@ func (reg *Registry) getAdminRequestIntegration(ctx context.Context, in *MediaRe
 	}
 	r, err := g.GetIntegration(ctx, adminRequestViewer(ctx), string(in.ID))
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	return &AdminRequestIntegrationOutput{ETag: adminRequestTag(ctx, "integration", r.ID, r.Revision).String(), Body: adminIntegrationOf(*r)}, nil
 }
@@ -528,13 +528,13 @@ func (reg *Registry) createAdminRequestIntegration(ctx context.Context, in *Admi
 	if p != nil {
 		return nil, p
 	}
-	b, p := in.Body.domain()
+	b, p := in.Body.domain(ctx)
 	if p != nil {
 		return nil, p
 	}
 	r, err := s.CreateIntegration(ctx, adminRequestViewer(ctx), b)
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	return &AdminRequestIntegrationCreateOutput{Location: Prefix + "/admin/request-integrations/" + r.ID, ETag: adminRequestTag(ctx, "integration", r.ID, r.Revision).String(), Body: adminIntegrationOf(*r)}, nil
 }
@@ -546,13 +546,13 @@ func (reg *Registry) updateAdminRequestIntegration(ctx context.Context, in *Admi
 	v := adminRequestViewer(ctx)
 	r, err := g.GetIntegration(ctx, v, string(in.ID))
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	rev, p := adminRequestGuard(AdminRequestPreconditions{in.IfMatch, in.IfNoneMatch}, adminRequestTag(ctx, "integration", r.ID, r.Revision), r.Revision)
 	if p != nil {
 		return nil, p
 	}
-	b, p := in.Body.domain()
+	b, p := in.Body.domain(ctx)
 	if p != nil {
 		return nil, p
 	}
@@ -566,7 +566,7 @@ func (reg *Registry) updateAdminRequestIntegration(ctx context.Context, in *Admi
 		return nil, NewProblem(TypePreconditionFailed, "The integration changed; reload before saving.").WithHeader("ETag", current.ETag)
 	}
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	return &AdminRequestIntegrationOutput{ETag: adminRequestTag(ctx, "integration", r.ID, r.Revision).String(), Body: adminIntegrationOf(*r)}, nil
 }
@@ -578,7 +578,7 @@ func (reg *Registry) deleteAdminRequestIntegration(ctx context.Context, in *Admi
 	v := adminRequestViewer(ctx)
 	r, err := g.GetIntegration(ctx, v, string(in.ID))
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	rev, p := adminRequestGuard(AdminRequestPreconditions{in.IfMatch, in.IfNoneMatch}, adminRequestTag(ctx, "integration", r.ID, r.Revision), r.Revision)
 	if p != nil {
@@ -593,7 +593,7 @@ func (reg *Registry) deleteAdminRequestIntegration(ctx context.Context, in *Admi
 		return nil, NewProblem(TypePreconditionFailed, "The integration changed; reload before deleting.").WithHeader("ETag", current.ETag)
 	}
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	return nil, nil
 }
@@ -611,13 +611,13 @@ func (reg *Registry) loadAdminRequestOptions(ctx context.Context, in *AdminReque
 		}
 		install = &id
 	}
-	baseURL, p := adminRequestBaseURL(b.BaseURL)
+	baseURL, p := adminRequestBaseURL(ctx, b.BaseURL)
 	if p != nil {
 		return nil, p
 	}
 	options, err := s.LoadIntegrationOptions(ctx, adminRequestViewer(ctx), mediarequests.Integration{ID: string(in.ID), Name: b.Name, CapabilityID: b.CapabilityID, InstallationID: install, BaseURL: baseURL, APIKeyRef: b.APIKey, PluginConfig: b.PluginConfig})
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	if options == nil {
 		options = map[string][]mediarequests.RouterOption{}
