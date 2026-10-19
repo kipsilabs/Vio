@@ -182,9 +182,8 @@ type StreamHandler struct {
 	// session+track before the file resolves), so recovery and failure always
 	// address the same slot; the retained map is capped with TTL and
 	// count-based eviction (see fontExtractFailLog). Font extraction never
-	// fails playback: the endpoint's 500
-	// (font_extract_failed) stays the client-visible signal and the debug line
-	// keeps the diagnostic trail.
+	// fails playback: the endpoint answers a pending empty bundle rather than
+	// a 500, and the throttled warning keeps the diagnostic trail.
 	fontExtractFailures fontExtractFailLog
 	// virtualStreamRecoveryTerminals bounds cross-request recovery after a
 	// session-bound virtual candidate and its one bounded rotation have both
@@ -2798,7 +2797,10 @@ func (h *StreamHandler) SubtitleFonts(ctx context.Context, in SubtitleFontReques
 			return nil, false, apiError(http.StatusNotFound, "not_found", "Source media file is missing")
 		}
 		h.logSubtitleFontInternalError(ctx, in, file.ID, trackIndex, "source_preflight", err)
-		return nil, false, apiError(http.StatusInternalServerError, "internal_error", "Failed to access source media file")
+		// A legitimate ASS track whose source cannot be read right now is a
+		// retryable dependency failure, not a server defect. Fonts are
+		// optional, so never turn a transient source-access failure into a 500.
+		return nil, false, apiError(http.StatusServiceUnavailable, subtitleSourceUnavailableErrorCode, "Failed to access source media file")
 	}
 	// Validate the requested ordinal and codec before extraction. A non-ASS
 	// ordinal or one outside the embedded range is a client error no retry
@@ -2865,6 +2867,15 @@ func (h *StreamHandler) fontBundleForRequest(ctx context.Context, session *playb
 			}
 			return items, false, nil
 		}
+		// A recent extraction failure is retried only after its backoff. Fonts
+		// are optional to playback, so the request answers the same pending
+		// empty bundle instead of spawning another provider read or ffmpeg.
+		if retryAfter, cooling := h.SubtitleCache.FontBundleRetryAfter(cacheKey); cooling {
+			slog.DebugContext(ctx, "subtitle font bundle extraction in backoff",
+				"component", "api", "file_id", file.ID, "track", trackIndex,
+				"retry_after", retryAfter)
+			return nil, true, nil
+		}
 		bundle, ready, err := h.SubtitleCache.ExtractFontBundleWithin(ctx, cacheKey, fontBundleClientWait, func(extractCtx context.Context) ([]byte, error) {
 			inputPath, releaseInput, resolveErr := resolveInput(extractCtx)
 			if resolveErr != nil {
@@ -2878,10 +2889,19 @@ func (h *StreamHandler) fontBundleForRequest(ctx context.Context, session *playb
 			return json.Marshal(playback.EncodeSubtitleFontBundle(fonts))
 		})
 		if err != nil {
-			if !errors.Is(err, errVirtualFontResolve) {
-				h.fontExtractFailures.failed(ctx, failKey, append(failAttrs, "error", err)...)
+			if errors.Is(err, errVirtualFontResolve) {
+				logVirtualStreamFailure(ctx, session.ID, file, err)
+				// Provider resolution is a retryable dependency failure; keep
+				// its 502 rather than inventing an empty bundle for a source
+				// that was never read.
+				return nil, false, err
 			}
-			return nil, false, err
+			h.fontExtractFailures.failed(ctx, failKey, append(failAttrs, "error", err)...)
+			// A legitimate ASS track whose optional font bundle could not be
+			// extracted is not a server error: degrade to the pending empty
+			// bundle so the player uses default fonts and re-fetches after the
+			// cache's failure backoff instead of hammering a 500.
+			return nil, true, nil
 		}
 		if !ready {
 			return nil, true, nil
@@ -2898,13 +2918,18 @@ func (h *StreamHandler) fontBundleForRequest(ctx context.Context, session *playb
 	// within the request, still resolved through the relay.
 	inputPath, releaseInput, err := resolveInput(ctx)
 	if err != nil {
-		return nil, false, err
+		if errors.Is(err, errVirtualFontResolve) {
+			logVirtualStreamFailure(ctx, session.ID, file, err)
+			return nil, false, err
+		}
+		h.fontExtractFailures.failed(ctx, failKey, append(failAttrs, "error", err)...)
+		return nil, true, nil
 	}
 	defer releaseInput()
 	fonts, err := playback.ExtractAttachedSubtitleFonts(ctx, inputPath, h.ffmpegPath())
 	if err != nil {
 		h.fontExtractFailures.failed(ctx, failKey, append(failAttrs, "error", err)...)
-		return nil, false, err
+		return nil, true, nil
 	}
 	h.fontExtractFailures.recovered(failKey)
 	return playback.EncodeSubtitleFontBundle(fonts), false, nil
@@ -3003,7 +3028,9 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 			Track:     trackParam,
 			Query:     r.URL.Query(),
 		}, file.ID, trackIndex, "source_preflight", err)
-		writePlaybackFilePreflightError(w, err)
+		// Same as the v2 path: a legitimate track whose source is temporarily
+		// inaccessible answers retryable, never a 500.
+		writeSubtitleSourceUnavailable(w)
 		return
 	}
 	// Validate the requested ordinal and codec before extraction, so a
@@ -3044,6 +3071,16 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 			writeFontBundleResponse(w, cached)
 			return
 		}
+		if retryAfter, cooling := h.SubtitleCache.FontBundleRetryAfter(cacheKey); cooling {
+			// The previous extraction failed; do not spawn another provider
+			// read inside its backoff. The pending bundle keeps the player on
+			// default fonts and tells it to re-fetch.
+			slog.DebugContext(r.Context(), "subtitle font bundle extraction in backoff",
+				"component", "api", "file_id", file.ID, "track", trackIndex,
+				"retry_after", retryAfter)
+			writePendingFontBundleResponse(w)
+			return
+		}
 	}
 
 	if h.SubtitleCache == nil {
@@ -3070,7 +3107,10 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 				"track", trackIndex,
 				"error", extractErr,
 			)
-			writeError(w, http.StatusInternalServerError, "font_extract_failed", "Failed to extract subtitle fonts")
+			// Fonts are optional to playback; a failed extraction degrades to
+			// the pending empty bundle rather than a 500 that a retrying client
+			// re-issues.
+			writePendingFontBundleResponse(w)
 			return
 		}
 		h.fontExtractFailures.recovered(fontExtractFailureKey(file.ID, trackIndex))
@@ -3121,7 +3161,10 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 			"track", trackIndex,
 			"error", err,
 		)
-		writeError(w, http.StatusInternalServerError, "font_extract_failed", "Failed to extract subtitle fonts")
+		// The track is legitimate; the optional font bundle is not. Answer the
+		// pending empty bundle (and let the cache's backoff gate the next
+		// extraction) instead of a 500.
+		writePendingFontBundleResponse(w)
 		return
 	}
 	if !ready {
@@ -3150,10 +3193,12 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 var errVirtualFontResolve = errors.New("virtual font bundle resolve failed")
 
 // fontBundleClientWait bounds how long the font-bundle handler waits for a
-// cold extraction before returning an empty bundle. It must stay well below
-// the web client's FONT_BUNDLE_BUDGET_MS (3s) so the client never waits on the
-// server; the extraction continues in the background.
-var fontBundleClientWait = 2 * time.Second
+// cold extraction before returning an empty bundle. It stays well below the
+// web client's FONT_BUNDLE_BUDGET_MS (3s) so the client never waits on the
+// server; the extraction continues in the background and lands in the cache.
+// A cold relay bundle can take tens of seconds, which is exactly why the
+// request must not block on it.
+var fontBundleClientWait = time.Second
 
 // emptyFontBundle is the valid, empty JSON bundle served when an extraction is
 // still in flight or has no fonts to return.
@@ -3628,6 +3673,20 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 		_, extractErr = h.SubtitleCache.ServeExtractWithResult(response, r, opts, playback.StreamExtractSubtitle)
 	}
 	if extractErr != nil {
+		var extractionRetry *playback.SubtitleExtractionRetryError
+		if errors.As(extractErr, &extractionRetry) {
+			// The per-identity backoff after an upstream failure is still
+			// active: no provider read or ffmpeg spawn happened. This is an
+			// expected retryable answer, not an extraction failure worth a
+			// warning on every client retry. Answer with the remaining delay
+			// so the client waits instead of retrying in its default
+			// few-second cadence.
+			if response.Status() != 0 {
+				panic(http.ErrAbortHandler)
+			}
+			writeSubtitleSourceUnavailableRetry(w, extractionRetry.RetryAfter)
+			return
+		}
 		playback.LogSubtitleStreamError(r.Context(), extractErr, file.ID, embeddedIndex)
 		if r.Context().Err() != nil {
 			clearSubtitleCoverageHeaders(w.Header())
@@ -3680,6 +3739,14 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 			opts.CacheIdentity = playback.VirtualSubtitleCacheIdentity(file.ID, session.VirtualSourceURI, opts.TrackIndex)
 		}
 		if retryErr := h.SubtitleCache.ServeExtract(response, r, opts, playback.StreamExtractSubtitle); retryErr != nil {
+			var retryBackoff *playback.SubtitleExtractionRetryError
+			if errors.As(retryErr, &retryBackoff) {
+				if response.Status() != 0 {
+					panic(http.ErrAbortHandler)
+				}
+				writeSubtitleSourceUnavailableRetry(w, retryBackoff.RetryAfter)
+				return
+			}
 			playback.LogSubtitleStreamError(r.Context(), retryErr, file.ID, embeddedIndex)
 			if r.Context().Err() != nil {
 				clearSubtitleCoverageHeaders(w.Header())
@@ -4068,7 +4135,26 @@ func writeSubtitleSourceChanged(w http.ResponseWriter) {
 // post-spawn recovery, so the server fails closed rather than stream a
 // possibly-truncated track; the client can retry once the source settles.
 func writeSubtitleSourceUnavailable(w http.ResponseWriter) {
+	writeSubtitleSourceUnavailableRetry(w, subtitleSourceRetryAfterSeconds*time.Second)
+}
+
+// subtitleSourceRetryAfterSeconds is the default Retry-After for a retryable
+// subtitle source failure that did not come with an explicit backoff (for
+// example a failed live-layout probe). The client already retries on its own
+// cadence; the header tells a compliant client how long the server prefers to
+// wait before re-opening the provider.
+const subtitleSourceRetryAfterSeconds = 5
+
+// writeSubtitleSourceUnavailableRetry answers a retryable 503 with a
+// server-chosen Retry-After. RetryAfter is rounded up to whole seconds and
+// floored at one so the header is always a positive delay.
+func writeSubtitleSourceUnavailableRetry(w http.ResponseWriter, retryAfter time.Duration) {
 	clearSubtitleCoverageHeaders(w.Header())
+	seconds := int(math.Ceil(retryAfter.Seconds()))
+	if seconds < 1 {
+		seconds = 1
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(seconds))
 	writeError(w, http.StatusServiceUnavailable, "subtitle_source_unavailable",
 		"Unable to verify the subtitle source; retry")
 }

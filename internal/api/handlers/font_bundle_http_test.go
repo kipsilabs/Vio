@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -158,15 +159,55 @@ func TestHandleSubtitleFontsReturnsEmptyBeforeDetachedExtractionCompletes(t *tes
 	}
 }
 
-func TestHandleSubtitleFontsReturns500OnDefinitiveFailure(t *testing.T) {
+// A failed font extraction for a legitimate ASS track is not a server error.
+// The endpoint answers the same pending empty bundle a cold extraction does,
+// so the player falls back to default fonts and re-fetches. A retry inside the
+// cache's failure backoff must not spawn another ffprobe/ffmpeg.
+func TestHandleSubtitleFontsDegradesExtractionFailureToPendingBundle(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell script test helper is unix-only")
 	}
-	handler, session, _, _, _ := newFontBundleHTTPFixture(t, assTestTracks(), "fail")
-	recorder := httptest.NewRecorder()
-	handler.HandleSubtitleFonts(recorder, fontBundleHTTPRequest(session.ID, "0"))
-	if recorder.Code != http.StatusInternalServerError {
-		t.Fatalf("status = %d, body = %s, want 500 for a definitive extraction failure", recorder.Code, recorder.Body.String())
+	handler, session, _, probeLog, _ := newFontBundleHTTPFixture(t, assTestTracks(), "fail")
+
+	for attempt := 0; attempt < 2; attempt++ {
+		recorder := httptest.NewRecorder()
+		handler.HandleSubtitleFonts(recorder, fontBundleHTTPRequest(session.ID, "0"))
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("attempt %d: status = %d, body = %s, want 200 pending bundle", attempt, recorder.Code, recorder.Body.String())
+		}
+		if strings.TrimSpace(recorder.Body.String()) != "[]" {
+			t.Fatalf("attempt %d: body = %q, want empty bundle", attempt, recorder.Body.String())
+		}
+		if recorder.Header().Get(fontBundlePendingHeader) != "true" {
+			t.Fatalf("attempt %d: missing pending header", attempt)
+		}
+	}
+	if got := countLogLines(t, probeLog); got != 1 {
+		t.Fatalf("ffprobe ran %d times for a retry inside the failure backoff, want 1", got)
+	}
+}
+
+// The v2 shared service must degrade a failed font extraction the same way:
+// pending empty bundle, no error, and no repeat extraction inside the backoff.
+func TestSubtitleFontsServiceDegradesExtractionFailureToPending(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+	handler, session, _, probeLog, _ := newFontBundleHTTPFixture(t, assTestTracks(), "fail")
+	request := SubtitleFontRequest{SessionID: session.ID, Track: "0", Query: url.Values{"file_id": {"42"}}}
+
+	fonts, pending, err := handler.SubtitleFonts(newAuthorizedPlaybackContext(), request)
+	if err != nil {
+		t.Fatalf("font service error = %v, want a pending bundle", err)
+	}
+	if !pending || len(fonts) != 0 {
+		t.Fatalf("fonts=%v pending=%v, want an empty pending bundle", fonts, pending)
+	}
+	if _, pending, err = handler.SubtitleFonts(newAuthorizedPlaybackContext(), request); err != nil || !pending {
+		t.Fatalf("retry inside backoff: pending=%v err=%v, want pending", pending, err)
+	}
+	if got := countLogLines(t, probeLog); got != 1 {
+		t.Fatalf("ffprobe ran %d times for a retry inside the failure backoff, want 1", got)
 	}
 }
 

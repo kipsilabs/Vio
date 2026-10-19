@@ -1,6 +1,7 @@
 package playback
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
@@ -65,6 +66,28 @@ type SubtitleCache struct {
 	// fontBundleFlight coalesces concurrent font-bundle extractions for the
 	// same source so a font fetch stampede runs ffprobe+ffmpeg exactly once.
 	fontBundleFlight singleflight.Group
+
+	// windowMu guards the in-memory last-good window cache and the per-window
+	// in-flight set. Repeated client requests for the same bounded slice (the
+	// normal retry pattern after an upstream flap) must not re-run ffmpeg, and
+	// concurrent duplicates must not fan out into parallel extracts.
+	windowMu      sync.Mutex
+	windowResults map[string]subtitleWindowResult
+	windowBytes   int64
+	windowFlights map[string]*subtitleWindowFlight
+
+	// failureMu guards failureGuard, the per-identity extraction backoff. An
+	// upstream 5xx is transient, but a client retrying every few seconds would
+	// otherwise re-open the provider and spawn ffmpeg on every attempt.
+	failureMu    sync.Mutex
+	failureGuard map[string]subtitleExtractionGuard
+
+	// fontFailureMu guards fontFailureRetryAt, the per-font-bundle extraction
+	// backoff. A failed font extraction is optional to playback, so callers
+	// degrade to an empty pending bundle instead of retrying a flapping
+	// provider on every request.
+	fontFailureMu      sync.Mutex
+	fontFailureRetryAt map[string]time.Time
 }
 
 const (
@@ -141,7 +164,89 @@ const (
 	// live entry simply lets the next attempt for that identity run sooner
 	// than its backoff would have allowed.
 	subtitleWarmGuardMaxEntries = 4096
+	// subtitleWindowResultTTL bounds how long a successful bounded window stays
+	// servable as the last-good copy. A hit refreshes the deadline, so a client
+	// that keeps retrying the same window through an upstream outage keeps its
+	// cached cues without pinning memory indefinitely.
+	subtitleWindowResultTTL = 30 * time.Minute
+	// subtitleWindowResultMaxBytes caps the in-memory last-good window cache.
+	// Windows are small text/ASS slices; the budget holds many of them.
+	subtitleWindowResultMaxBytes = 32 << 20
+	// subtitleWindowResultMaxEntryBytes skips caching a single oversized slice
+	// rather than letting one response evict the rest of the budget.
+	subtitleWindowResultMaxEntryBytes = 8 << 20
+	// subtitleWindowResultMaxEntries caps the number of windows kept regardless
+	// of their combined size (many tiny windows could otherwise accumulate).
+	subtitleWindowResultMaxEntries = 128
+	// subtitleWindowWaitTimeout bounds how long a duplicate window request waits
+	// for the in-flight extract it joined before answering retryable. A local or
+	// small-source window completes well inside it; a stuck remote extract does
+	// not hold the duplicate request open.
+	subtitleWindowWaitTimeout = 5 * time.Second
+	// subtitleWindowWaitRetries bounds how many consecutive in-flight window
+	// flights a request joins. A failure with no cached result lets it become
+	// the leader; the cap stops a pathological run of failed leaders from
+	// wedging one request indefinitely.
+	subtitleWindowWaitRetries = 2
+	// subtitleExtractionFailureBaseCooldown is the first backoff after a
+	// retryable upstream extraction failure. It is deliberately longer than the
+	// typical client retry cadence (a few seconds) so the provider is not
+	// re-opened on every retry.
+	subtitleExtractionFailureBaseCooldown = 10 * time.Second
+	// subtitleExtractionFailureMaxCooldown caps the exponential backoff so a
+	// permanently dead source is retried eventually rather than never.
+	subtitleExtractionFailureMaxCooldown = 60 * time.Second
+	// subtitleExtractionFailureMaxEntries caps the extraction backoff map. Like
+	// the warm guard, entries expire with their retry time; the cap only limits
+	// pathological churn.
+	subtitleExtractionFailureMaxEntries = 4096
+	// subtitleFontBundleFailureCooldown suppresses repeated font-bundle
+	// extractions after a transient/upstream failure. Font bundles are optional
+	// to playback, so a client retry inside the window gets the same pending
+	// empty bundle instead of spawning another ffprobe+ffmpeg.
+	subtitleFontBundleFailureCooldown = 15 * time.Second
+	// subtitleFontBundleFailureMaxEntries caps the font-bundle failure map.
+	subtitleFontBundleFailureMaxEntries = 512
 )
+
+// subtitleExtractRetryDelays is the bounded in-request retry schedule for an
+// extraction that failed on an upstream 5xx before emitting any bytes. Each
+// delay is the pause before the next attempt; the final count is small because
+// the provider outage is usually longer than one request. Package tests may
+// replace it with a zero-delay schedule.
+var subtitleExtractRetryDelays = []time.Duration{200 * time.Millisecond, 500 * time.Millisecond}
+
+// SubtitleExtractionRetryError reports that extraction is deliberately paused
+// after a retryable upstream failure. No response bytes have been written, so
+// HTTP callers answer a retryable 503 with Retry-After. It is returned by
+// ServeExtractWithResult while a per-identity backoff is active.
+type SubtitleExtractionRetryError struct {
+	RetryAfter time.Duration
+}
+
+func (e *SubtitleExtractionRetryError) Error() string {
+	return fmt.Sprintf("subtitle extraction retry after %s", e.RetryAfter)
+}
+
+// subtitleWindowResult is one successfully extracted bounded window kept as the
+// last-good copy for exact repeats.
+type subtitleWindowResult struct {
+	data     []byte
+	storedAt time.Time
+}
+
+// subtitleWindowFlight is a per-window in-flight marker; done closes when the
+// leading request finishes (success, failure, or cancellation).
+type subtitleWindowFlight struct {
+	done chan struct{}
+}
+
+// subtitleExtractionGuard tracks consecutive retryable extraction failures for
+// one identity and the earliest time the next attempt may run.
+type subtitleExtractionGuard struct {
+	failures int
+	retryAt  time.Time
+}
 
 // subtitleWarmGuard is the per-identity warm admission state: how many
 // consecutive warms failed and the earliest time the next one may start.
@@ -171,11 +276,15 @@ func NewSubtitleCache(transcodeDir func() string) *SubtitleCache {
 }
 
 // ServeExtract serves an embedded subtitle using the cache for complete
-// tracks. Explicit text windows stream without caching; SUP retains its
-// progressive window and background-warming behavior in ServeSUPExtract.
-// Only one request fills the cache; a request that arrives while a fill is in
-// flight waits for it to commit and serves the cached entry (a failed fill
-// falls back to a fresh attempt, then to an uncached stream).
+// tracks. Explicit text windows are not committed to disk, but each successful
+// slice is kept in a bounded in-memory last-good cache keyed by the exact
+// window, so a client retry after an upstream failure is served without
+// re-running ffmpeg; SUP retains its progressive window and background-warming
+// behavior in ServeSUPExtract. Only one request fills a complete track; a
+// request that arrives while a fill is in flight waits for it to commit and
+// serves the cached entry (a failed fill falls back to a fresh attempt, then to
+// an uncached stream). Retryable upstream failures are retried a bounded number
+// of times in-request and then put the identity in a short exponential backoff.
 //
 // It is ServeExtractWithResult without the serve report. Callers that need to
 // know whether a committed artifact was served — for example to decide whether
@@ -228,10 +337,23 @@ func (c *SubtitleCache) ServeExtractWithResult(w http.ResponseWriter, r *http.Re
 	}
 	var result ServeExtractResult
 	var fill *SubtitleCacheFill
+	// Compute the last-good window key before any rewrite of InputPath (a
+	// windowed extract may be redirected to a committed artifact below, whose
+	// path/mtime is not the source identity the window is cached under).
+	windowKey := ""
+	if opts.windowIntent() {
+		windowKey, _ = c.windowResultKey(opts, format)
+	}
+	windowLeader := false
 	if !opts.windowIntent() {
 		if c.serveCached(w, r, opts, format) {
 			result.ServedCommittedArtifact = true
 			return result, nil
+		}
+		// A cached artifact is the best last-good copy; only consult the
+		// failure backoff when there is nothing to serve.
+		if retryAfter, cooling := c.extractionCoolingDown(opts, format); cooling {
+			return result, &SubtitleExtractionRetryError{RetryAfter: retryAfter}
 		}
 		var wait <-chan struct{}
 		fill, wait = c.beginFillOrWait(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, format)
@@ -255,14 +377,12 @@ func (c *SubtitleCache) ServeExtractWithResult(w http.ResponseWriter, r *http.Re
 			return result, nil
 		}
 	} else {
-		// Windowed text fetches are position-dependent slices, so they are
-		// never cached themselves — but the cache still speeds them up,
-		// exactly like serveWindowedSUP does for PGS: when a committed
-		// full-track entry exists, the windowed extract's input is rewritten
-		// to that small artifact (the -ss scan reads kilobytes instead of
-		// re-demuxing a multi-GB remote source), and when it doesn't, a
-		// detached warm is kicked off so later windows hit the fast path.
-		// The committed-entry lookup always runs: virtual relay sources
+		// Windowed text fetches are position-dependent slices. A committed
+		// full-track entry is still preferred (the -ss scan reads kilobytes
+		// instead of re-demuxing a multi-GB remote source), and the exact
+		// window itself is kept in memory as the last-good copy so a client
+		// retry after an upstream flap never re-runs ffmpeg for the same
+		// bytes. The committed-entry lookup always runs: virtual relay sources
 		// disable only the background warm (a detached fill must not outlive
 		// the request-scoped relay registration) while an already-populated
 		// entry must still be served instead of re-demuxing the source.
@@ -288,8 +408,57 @@ func (c *SubtitleCache) ServeExtractWithResult(w http.ResponseWriter, r *http.Re
 				return ServeExtractResult{}, ErrCommittedTextArtifactGone
 			}
 		}
-		if !result.ServedCommittedArtifact && !opts.DisableBackgroundWarm {
-			c.WarmTrackInBackground(opts, extract, subtitleTraceRequestID(r.Context()))
+		// The exact window cache is keyed on the source identity computed
+		// before the committed-artifact rewrite, so it also covers windows
+		// extracted from that artifact.
+		if windowKey != "" && c.serveWindowResult(w, r, opts, format, windowKey) {
+			if !result.ServedCommittedArtifact && !opts.DisableBackgroundWarm {
+				c.WarmTrackInBackground(opts, extract, subtitleTraceRequestID(r.Context()))
+			}
+			return result, nil
+		}
+		if !result.ServedCommittedArtifact {
+			// No last-good copy: suppress a provider retry that is known to be
+			// inside its backoff window. An artifact-backed extraction reads a
+			// local file, so a previous source failure does not apply to it.
+			if retryAfter, cooling := c.extractionCoolingDown(opts, format); cooling {
+				return result, &SubtitleExtractionRetryError{RetryAfter: retryAfter}
+			}
+			if !opts.DisableBackgroundWarm {
+				c.WarmTrackInBackground(opts, extract, subtitleTraceRequestID(r.Context()))
+			}
+		}
+		// Coalesce identical in-flight windows: a duplicate request waits for
+		// the leader and serves the copy it stores instead of spawning a
+		// second ffmpeg. A failed leader leaves either a cached result or a
+		// failure backoff behind, both re-checked after the wait.
+		if windowKey != "" {
+			for attempt := 0; attempt < subtitleWindowWaitRetries; attempt++ {
+				leader, wait := c.beginWindowFlight(windowKey)
+				if leader {
+					windowLeader = true
+					break
+				}
+				if err := c.waitForWindowFlight(r.Context(), wait); err != nil {
+					return result, err
+				}
+				if c.serveWindowResult(w, r, opts, format, windowKey) {
+					return result, nil
+				}
+				if !result.ServedCommittedArtifact {
+					if retryAfter, cooling := c.extractionCoolingDown(opts, format); cooling {
+						return result, &SubtitleExtractionRetryError{RetryAfter: retryAfter}
+					}
+				}
+			}
+		}
+	}
+	if windowLeader {
+		defer c.endWindowFlight(windowKey)
+		// A previous leader may have stored its slice between our lookup and
+		// our successful reservation; serve that instead of extracting again.
+		if c.serveWindowResult(w, r, opts, format, windowKey) {
+			return result, nil
 		}
 	}
 
@@ -299,8 +468,25 @@ func (c *SubtitleCache) ServeExtractWithResult(w http.ResponseWriter, r *http.Re
 	if fill != nil {
 		writer = fill.Tee(counter)
 	}
+	var capture *subtitleWindowCapture
+	if windowLeader {
+		// Keep the successful slice as the last-good copy. The capture bound is
+		// per response, so a huge window is streamed but not retained.
+		capture = &subtitleWindowCapture{dst: writer, remaining: subtitleWindowResultMaxEntryBytes}
+		writer = capture
+	}
 	opts.Writer = writer
-	err := extract(r.Context(), opts)
+	err := c.runExtract(r.Context(), opts, extract, counter)
+	if err != nil {
+		if r.Context().Err() == nil && IsSubtitleUpstreamError(err) {
+			c.noteExtractionFailure(opts, format)
+		}
+	} else {
+		c.noteExtractionSuccess(opts, format)
+		if capture != nil && capture.bytes > 0 && !capture.truncated {
+			c.storeWindowResult(windowKey, opts, capture.buf.Bytes())
+		}
+	}
 	outcome := subtitleTraceOutcome(r.Context(), err)
 	if fill != nil {
 		if err != nil {
@@ -321,6 +507,71 @@ func (c *SubtitleCache) ServeExtractWithResult(w http.ResponseWriter, r *http.Re
 			counter.bytes, outcome, time.Since(start),
 			"track", opts.TrackIndex, "format", format)...)
 	return result, err
+}
+
+// runExtract invokes the extractor, retrying a bounded number of times when an
+// upstream 5xx failed before any bytes reached the client. Retrying after bytes
+// have been written would duplicate or corrupt the response, and a non-upstream
+// failure is not expected to recover within one request.
+func (c *SubtitleCache) runExtract(ctx context.Context, opts StreamExtractOpts, extract SUPExtractFunc, counter *subtitleCountingWriter) error {
+	var err error
+	for attempt := 0; ; attempt++ {
+		err = extract(ctx, opts)
+		if err == nil || ctx.Err() != nil || counter.bytes > 0 ||
+			!IsSubtitleUpstreamError(err) || attempt >= len(subtitleExtractRetryDelays) {
+			return err
+		}
+		delay := subtitleExtractRetryDelays[attempt]
+		if delay > 0 {
+			timer := time.NewTimer(delay)
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			}
+		}
+		slog.DebugContext(ctx, "retrying subtitle extraction after upstream failure",
+			"component", "playback", "track", opts.TrackIndex, "attempt", attempt+2, "error", err)
+	}
+}
+
+// subtitleWindowCapture tees the response into a bounded buffer while still
+// writing every byte to the client. Once the bound is reached it keeps
+// forwarding but stops retaining, so an oversized window is never cached.
+type subtitleWindowCapture struct {
+	dst       io.Writer
+	buf       bytes.Buffer
+	remaining int64
+	bytes     int64
+	// truncated marks a response that exceeded the capture bound. The buffer
+	// then holds a prefix, so it must never be stored as a complete slice.
+	truncated bool
+}
+
+func (w *subtitleWindowCapture) Write(p []byte) (int, error) {
+	n, err := w.dst.Write(p)
+	if n > 0 {
+		w.bytes += int64(n)
+		if w.remaining > 0 {
+			take := int64(n)
+			if take > w.remaining {
+				take = w.remaining
+				w.truncated = true
+			}
+			_, _ = w.buf.Write(p[:take])
+			w.remaining -= take
+		} else {
+			w.truncated = true
+		}
+	}
+	return n, err
+}
+
+func (w *subtitleWindowCapture) Flush() {
+	if flusher, ok := w.dst.(http.Flusher); ok {
+		flusher.Flush()
+	}
 }
 
 // waitForSubtitleFill blocks until the in-flight fill identified by wait
@@ -352,6 +603,250 @@ func (c *SubtitleCache) serveCached(w http.ResponseWriter, r *http.Request, opts
 	w.Header().Set("Cache-Control", "private, no-cache")
 	http.ServeContent(w, r, "", modTime, cached)
 	return true
+}
+
+// windowResultKey identifies one exact bounded window: the source identity
+// (path mtime/size, or a virtual identity plus its generation bucket), track
+// ordinal, output format, and the effective source-time range. A retry that
+// changes the position is a different window and is never served stale bytes
+// under the wrong coverage.
+func (c *SubtitleCache) windowResultKey(opts StreamExtractOpts, format string) (string, bool) {
+	windowed, start, end, openEnded := opts.WindowCoverage()
+	if !windowed {
+		return "", false
+	}
+	base, ok := c.formatEntryKey(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, format)
+	if !ok {
+		return "", false
+	}
+	return fmt.Sprintf("%s|%.3f|%.3f|%t", base, start, end, openEnded), true
+}
+
+// serveWindowResult serves the last-good copy for the exact window described by
+// opts, if one is cached. It never bypasses a committed full-track artifact:
+// callers check that first. A hit refreshes the entry's retention.
+func (c *SubtitleCache) serveWindowResult(w http.ResponseWriter, r *http.Request, opts StreamExtractOpts, format, key string) bool {
+	data, ok := c.lookupWindowResult(key)
+	if !ok {
+		return false
+	}
+	slog.Log(r.Context(), slog.LevelDebug, "windowed subtitle served from last-good cache",
+		subtitleTraceAttrs(r.Context(), opts.SourceCodec, SubtitleTracePhaseServe, int64(len(data)), SubtitleTraceOutcomeCacheHit, -1,
+			"track", opts.TrackIndex, "format", format)...)
+	w.Header().Set("Cache-Control", "private, no-cache")
+	w.WriteHeader(http.StatusOK)
+	_, err := w.Write(data)
+	return err == nil
+}
+
+func (c *SubtitleCache) lookupWindowResult(key string) ([]byte, bool) {
+	if c == nil || key == "" {
+		return nil, false
+	}
+	now := time.Now()
+	c.windowMu.Lock()
+	defer c.windowMu.Unlock()
+	entry, ok := c.windowResults[key]
+	if !ok {
+		return nil, false
+	}
+	if now.Sub(entry.storedAt) >= subtitleWindowResultTTL {
+		delete(c.windowResults, key)
+		c.windowBytes -= int64(len(entry.data))
+		return nil, false
+	}
+	// An actively-used last-good copy stays available through a long outage.
+	entry.storedAt = now
+	c.windowResults[key] = entry
+	return entry.data, true
+}
+
+func (c *SubtitleCache) storeWindowResult(key string, opts StreamExtractOpts, data []byte) {
+	if c == nil || key == "" || len(data) == 0 || len(data) > subtitleWindowResultMaxEntryBytes {
+		return
+	}
+	if windowed, _, _, _ := opts.WindowCoverage(); !windowed {
+		return
+	}
+	now := time.Now()
+	c.windowMu.Lock()
+	defer c.windowMu.Unlock()
+	if c.windowResults == nil {
+		c.windowResults = make(map[string]subtitleWindowResult)
+	}
+	if old, exists := c.windowResults[key]; exists {
+		c.windowBytes -= int64(len(old.data))
+	}
+	copyOfData := make([]byte, len(data))
+	copy(copyOfData, data)
+	c.windowResults[key] = subtitleWindowResult{
+		data:     copyOfData,
+		storedAt: now,
+	}
+	c.windowBytes += int64(len(copyOfData))
+	c.evictWindowResultsLocked(now)
+}
+
+// evictWindowResultsLocked drops expired entries and then the oldest entries
+// until the cache is back inside both its byte and count budgets. Caller holds
+// windowMu.
+func (c *SubtitleCache) evictWindowResultsLocked(now time.Time) {
+	for key, entry := range c.windowResults {
+		if now.Sub(entry.storedAt) >= subtitleWindowResultTTL {
+			delete(c.windowResults, key)
+			c.windowBytes -= int64(len(entry.data))
+		}
+	}
+	for len(c.windowResults) > subtitleWindowResultMaxEntries || c.windowBytes > subtitleWindowResultMaxBytes {
+		oldestKey := ""
+		var oldestAt time.Time
+		for key, entry := range c.windowResults {
+			if oldestKey == "" || entry.storedAt.Before(oldestAt) {
+				oldestKey, oldestAt = key, entry.storedAt
+			}
+		}
+		if oldestKey == "" {
+			break
+		}
+		c.windowBytes -= int64(len(c.windowResults[oldestKey].data))
+		delete(c.windowResults, oldestKey)
+	}
+}
+
+// beginWindowFlight reserves the in-flight marker for one exact window, or
+// returns the marker of the request already extracting it.
+func (c *SubtitleCache) beginWindowFlight(key string) (bool, <-chan struct{}) {
+	if c == nil || key == "" {
+		return true, nil
+	}
+	c.windowMu.Lock()
+	defer c.windowMu.Unlock()
+	if existing, ok := c.windowFlights[key]; ok {
+		return false, existing.done
+	}
+	if c.windowFlights == nil {
+		c.windowFlights = make(map[string]*subtitleWindowFlight)
+	}
+	flight := &subtitleWindowFlight{done: make(chan struct{})}
+	c.windowFlights[key] = flight
+	return true, nil
+}
+
+func (c *SubtitleCache) endWindowFlight(key string) {
+	if c == nil || key == "" {
+		return
+	}
+	c.windowMu.Lock()
+	defer c.windowMu.Unlock()
+	if flight, ok := c.windowFlights[key]; ok {
+		delete(c.windowFlights, key)
+		close(flight.done)
+	}
+}
+
+// waitForWindowFlight waits for the leading extraction to settle, bounded by
+// subtitleWindowWaitTimeout. A waiter that times out answers retryable rather
+// than spawning a duplicate. Returning an error means the caller must stop;
+// returning nil means the caller may re-check the cache and backoff.
+func (c *SubtitleCache) waitForWindowFlight(ctx context.Context, wait <-chan struct{}) error {
+	timer := time.NewTimer(subtitleWindowWaitTimeout)
+	defer timer.Stop()
+	select {
+	case <-wait:
+		return nil
+	case <-timer.C:
+		return &SubtitleExtractionRetryError{RetryAfter: 2 * time.Second}
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// extractionCoolingDown reports the remaining per-identity backoff after a
+// retryable upstream extraction failure. No entry means the next attempt is
+// allowed.
+func (c *SubtitleCache) extractionCoolingDown(opts StreamExtractOpts, format string) (time.Duration, bool) {
+	key, ok := c.formatEntryKey(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, format)
+	if !ok {
+		return 0, false
+	}
+	now := time.Now()
+	c.failureMu.Lock()
+	defer c.failureMu.Unlock()
+	guard, ok := c.failureGuard[key]
+	if !ok {
+		return 0, false
+	}
+	if !now.Before(guard.retryAt) {
+		delete(c.failureGuard, key)
+		return 0, false
+	}
+	return guard.retryAt.Sub(now), true
+}
+
+// noteExtractionFailure extends the per-identity backoff after a retryable
+// upstream failure. The first failure pauses for
+// subtitleExtractionFailureBaseCooldown; each consecutive failure doubles it up
+// to subtitleExtractionFailureMaxCooldown.
+func (c *SubtitleCache) noteExtractionFailure(opts StreamExtractOpts, format string) {
+	key, ok := c.formatEntryKey(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, format)
+	if !ok {
+		return
+	}
+	now := time.Now()
+	c.failureMu.Lock()
+	defer c.failureMu.Unlock()
+	if c.failureGuard == nil {
+		c.failureGuard = make(map[string]subtitleExtractionGuard)
+	}
+	if _, exists := c.failureGuard[key]; !exists && len(c.failureGuard) >= subtitleExtractionFailureMaxEntries {
+		c.sweepFailureGuardLocked(now)
+	}
+	guard := c.failureGuard[key]
+	guard.failures++
+	backoff := subtitleExtractionFailureBaseCooldown
+	for i := 1; i < guard.failures && backoff < subtitleExtractionFailureMaxCooldown; i++ {
+		backoff *= 2
+	}
+	if backoff > subtitleExtractionFailureMaxCooldown {
+		backoff = subtitleExtractionFailureMaxCooldown
+	}
+	guard.retryAt = now.Add(backoff)
+	c.failureGuard[key] = guard
+}
+
+// noteExtractionSuccess clears an identity's backoff once extraction (or its
+// cache commit) succeeds.
+func (c *SubtitleCache) noteExtractionSuccess(opts StreamExtractOpts, format string) {
+	key, ok := c.formatEntryKey(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, format)
+	if !ok {
+		return
+	}
+	c.failureMu.Lock()
+	delete(c.failureGuard, key)
+	c.failureMu.Unlock()
+}
+
+// sweepFailureGuardLocked drops lapsed entries, then the entry closest to
+// lapsing, to keep the backoff map bounded. Caller holds failureMu.
+func (c *SubtitleCache) sweepFailureGuardLocked(now time.Time) {
+	for key, guard := range c.failureGuard {
+		if !now.Before(guard.retryAt) {
+			delete(c.failureGuard, key)
+		}
+	}
+	if len(c.failureGuard) < subtitleExtractionFailureMaxEntries {
+		return
+	}
+	victim := ""
+	var victimAt time.Time
+	for key, guard := range c.failureGuard {
+		if victim == "" || guard.retryAt.Before(victimAt) || (guard.retryAt.Equal(victimAt) && key < victim) {
+			victim, victimAt = key, guard.retryAt
+		}
+	}
+	if victim != "" {
+		delete(c.failureGuard, victim)
+	}
 }
 
 // subtitleCacheFormat maps a codec/target pair to the cache format token,
@@ -1225,6 +1720,85 @@ func (c *SubtitleCache) LookupFontBundle(key FontBundleKey) ([]byte, bool) {
 	return data, true
 }
 
+// fontBundleFlightKey derives the stable in-flight/backoff key for a font
+// bundle. The invalidation coordinates are part of the key, so concurrent
+// requests for a changed source version (different mtime/size) neither
+// coalesce nor share a failure backoff with the stale version.
+func (c *SubtitleCache) fontBundleFlightKey(key FontBundleKey, now time.Time) (string, bool) {
+	if c == nil {
+		return "", false
+	}
+	identity, modTime, size, ok := key.source(now)
+	if !ok {
+		return "", false
+	}
+	return fmt.Sprintf("fontbundle:%s-%d-%d", identity, modTime.UnixNano(), size), true
+}
+
+// FontBundleRetryAfter reports the remaining font-bundle backoff after a
+// failed extraction. Handlers use it to serve the same pending empty bundle
+// without spawning another ffprobe/ffmpeg for a flapping provider. ok is false
+// when the key is unkeyable or the next attempt is allowed.
+func (c *SubtitleCache) FontBundleRetryAfter(key FontBundleKey) (time.Duration, bool) {
+	flightKey, ok := c.fontBundleFlightKey(key, time.Now())
+	if !ok {
+		return 0, false
+	}
+	now := time.Now()
+	c.fontFailureMu.Lock()
+	defer c.fontFailureMu.Unlock()
+	retryAt, ok := c.fontFailureRetryAt[flightKey]
+	if !ok {
+		return 0, false
+	}
+	if !now.Before(retryAt) {
+		delete(c.fontFailureRetryAt, flightKey)
+		return 0, false
+	}
+	return retryAt.Sub(now), true
+}
+
+func (c *SubtitleCache) noteFontBundleFailure(flightKey string) {
+	if c == nil || flightKey == "" {
+		return
+	}
+	c.fontFailureMu.Lock()
+	defer c.fontFailureMu.Unlock()
+	if c.fontFailureRetryAt == nil {
+		c.fontFailureRetryAt = make(map[string]time.Time)
+	}
+	if len(c.fontFailureRetryAt) >= subtitleFontBundleFailureMaxEntries {
+		now := time.Now()
+		for key, retryAt := range c.fontFailureRetryAt {
+			if !now.Before(retryAt) {
+				delete(c.fontFailureRetryAt, key)
+			}
+		}
+		if len(c.fontFailureRetryAt) >= subtitleFontBundleFailureMaxEntries {
+			// Every entry is still live; evict the one closest to lapsing so
+			// the map stays bounded under pathological churn.
+			victim := ""
+			var victimAt time.Time
+			for key, retryAt := range c.fontFailureRetryAt {
+				if victim == "" || retryAt.Before(victimAt) {
+					victim, victimAt = key, retryAt
+				}
+			}
+			delete(c.fontFailureRetryAt, victim)
+		}
+	}
+	c.fontFailureRetryAt[flightKey] = time.Now().Add(subtitleFontBundleFailureCooldown)
+}
+
+func (c *SubtitleCache) noteFontBundleSuccess(flightKey string) {
+	if c == nil || flightKey == "" {
+		return
+	}
+	c.fontFailureMu.Lock()
+	delete(c.fontFailureRetryAt, flightKey)
+	c.fontFailureMu.Unlock()
+}
+
 // startFontBundleFlight registers or joins the single-flight extraction for
 // key and returns the caller's result channel. The extraction runs on its own
 // goroutine (singleflight.DoChan) on a context detached from every caller and
@@ -1232,28 +1806,27 @@ func (c *SubtitleCache) LookupFontBundle(key FontBundleKey) ([]byte, bool) {
 // cancels the shared work. The bool is false when the key cannot be resolved
 // to a stable cache identity, in which case the caller extracts uncached.
 func (c *SubtitleCache) startFontBundleFlight(ctx context.Context, key FontBundleKey, extract func(context.Context) ([]byte, error)) (<-chan singleflight.Result, bool) {
-	identity, modTime, size, ok := key.source(time.Now())
+	flightKey, ok := c.fontBundleFlightKey(key, time.Now())
 	if !ok {
 		return nil, false
 	}
-	// The flight key carries the invalidation coordinates too, so concurrent
-	// requests for a changed source version (different mtime/size) do not
-	// coalesce onto the stale version's extraction.
-	flightKey := fmt.Sprintf("fontbundle:%s-%d-%d", identity, modTime.UnixNano(), size)
 	ch := c.fontBundleFlight.DoChan(flightKey, func() (any, error) {
 		// Another caller may have committed the entry while we waited to lead.
 		if data, ok := c.LookupFontBundle(key); ok {
+			c.noteFontBundleSuccess(flightKey)
 			return data, nil
 		}
 		extractCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), subtitleFontBundleExtractTimeout)
 		defer cancel()
 		data, extractErr := extract(extractCtx)
 		if extractErr != nil {
+			c.noteFontBundleFailure(flightKey)
 			return nil, extractErr
 		}
 		if storeErr := c.storeFontBundle(key, data); storeErr != nil {
 			slog.WarnContext(ctx, "subtitle font bundle cache store failed", "error", storeErr)
 		}
+		c.noteFontBundleSuccess(flightKey)
 		return data, nil
 	})
 	return ch, true
@@ -1263,7 +1836,8 @@ func (c *SubtitleCache) startFontBundleFlight(ctx context.Context, key FontBundl
 // (data, ready, err) shape. A timeout or cancellation is "pending", not an
 // error: a client-facing caller degrades to an empty bundle while the
 // detached flight keeps running. A definitive extractor failure (no usable
-// attachment, malformed input) is surfaced so the handler can return 500.
+// attachment, malformed input) is surfaced so the caller can log it and
+// degrade to the pending empty bundle instead of failing playback.
 func fontBundleFlightOutcome(res singleflight.Result) ([]byte, bool, error) {
 	if res.Err != nil {
 		if errors.Is(res.Err, context.DeadlineExceeded) || errors.Is(res.Err, context.Canceled) {
