@@ -11,6 +11,7 @@ import (
 
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
 	"github.com/Silo-Server/silo-server/internal/auth"
+	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/recommendations"
 )
 
@@ -106,7 +107,7 @@ type stubRecsEngine struct {
 	err     error
 }
 
-func (s stubRecsEngine) SimilarItems(context.Context, string, int) ([]recommendations.ScoredItem, error) {
+func (s stubRecsEngine) SimilarItems(context.Context, int, string, string, int, catalog.AccessFilter) ([]recommendations.ScoredItem, error) {
 	return s.similar, s.err
 }
 

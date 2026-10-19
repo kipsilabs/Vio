@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sync"
 	"testing"
@@ -13,6 +14,20 @@ import (
 	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/watchsync"
 )
+
+func realtimeResultMessage(t *testing.T, sessionID, commandID string, status playback.RealtimeResultStatus) []byte {
+	t.Helper()
+	data, err := json.Marshal(playback.ResultEnvelope{
+		Type:      playback.RealtimeMessageTypeResult,
+		CommandID: commandID,
+		SessionID: sessionID,
+		Status:    status,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
 
 // waitConfirmedPauseStates waits until the session's queued confirmed pause
 // and resume results have been applied.
@@ -55,7 +70,7 @@ func TestRealtimeConfirmedPauseAndResumeSetSessionState(t *testing.T) {
 	send := func(commandID string, name playback.CommandName, status playback.RealtimeResultStatus) {
 		t.Helper()
 		handler.rememberRealtimeCommand(commandID, session.ID, name)
-		if err := handler.handleRealtimeClientMessage(session.ID, realtimeResultMessage(t, session.ID, commandID, status)); err != nil {
+		if err := handler.handleRealtimeClientMessage(t.Context(), session.ID, realtimeResultMessage(t, session.ID, commandID, status)); err != nil {
 			t.Fatalf("handleRealtimeClientMessage: %v", err)
 		}
 		waitConfirmedPauseStates(t, handler, session.ID)
@@ -93,7 +108,7 @@ func TestRealtimeConfirmedPauseAndResumeScrobbleOnce(t *testing.T) {
 	send := func(commandID string, name playback.CommandName) {
 		t.Helper()
 		handler.rememberRealtimeCommand(commandID, session.ID, name)
-		if err := handler.handleRealtimeClientMessage(session.ID, realtimeResultMessage(t, session.ID, commandID, playback.RealtimeResultStatusCompleted)); err != nil {
+		if err := handler.handleRealtimeClientMessage(t.Context(), session.ID, realtimeResultMessage(t, session.ID, commandID, playback.RealtimeResultStatusCompleted)); err != nil {
 			t.Fatalf("handleRealtimeClientMessage: %v", err)
 		}
 		waitConfirmedPauseStates(t, handler, session.ID)
@@ -167,7 +182,7 @@ func TestRealtimeConfirmedPauseDoesNotBlockReader(t *testing.T) {
 			name playback.CommandName
 		}{{"cmd-pause", playback.CommandPause}, {"cmd-resume", playback.CommandUnpause}} {
 			handler.rememberRealtimeCommand(cmd.id, session.ID, cmd.name)
-			if err := handler.handleRealtimeClientMessage(session.ID, realtimeResultMessage(t, session.ID, cmd.id, playback.RealtimeResultStatusCompleted)); err != nil {
+			if err := handler.handleRealtimeClientMessage(t.Context(), session.ID, realtimeResultMessage(t, session.ID, cmd.id, playback.RealtimeResultStatusCompleted)); err != nil {
 				reader <- err
 				return
 			}
@@ -218,7 +233,7 @@ func TestRealtimeConfirmedStopRevokesAuthorityBeforeProviderFinalization(t *test
 	release := sync.OnceFunc(func() { close(scrobbler.release) })
 	defer func() { release(); waitConfirmedPauseStates(t, handler, session.ID) }()
 	handler.rememberRealtimeCommand("cmd-pause", session.ID, playback.CommandPause)
-	if err := handler.handleRealtimeClientMessage(session.ID, realtimeResultMessage(t, session.ID, "cmd-pause", playback.RealtimeResultStatusCompleted)); err != nil {
+	if err := handler.handleRealtimeClientMessage(t.Context(), session.ID, realtimeResultMessage(t, session.ID, "cmd-pause", playback.RealtimeResultStatusCompleted)); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -233,7 +248,7 @@ func TestRealtimeConfirmedStopRevokesAuthorityBeforeProviderFinalization(t *test
 			name playback.CommandName
 		}{{"cmd-resume", playback.CommandUnpause}, {"cmd-stop", playback.CommandStop}} {
 			handler.rememberRealtimeCommand(cmd.id, session.ID, cmd.name)
-			if err := handler.handleRealtimeClientMessage(session.ID, realtimeResultMessage(t, session.ID, cmd.id, playback.RealtimeResultStatusCompleted)); err != nil {
+			if err := handler.handleRealtimeClientMessage(t.Context(), session.ID, realtimeResultMessage(t, session.ID, cmd.id, playback.RealtimeResultStatusCompleted)); err != nil {
 				reader <- err
 				return
 			}
@@ -288,7 +303,7 @@ func TestRealtimeConfirmationSurvivesAcceptedProgressReplay(t *testing.T) {
 				t.Fatal(err)
 			}
 			f.handler.rememberRealtimeCommand("cmd-confirm", f.session.ID, commandName)
-			if err := f.handler.handleRealtimeClientMessage(f.session.ID, realtimeResultMessage(t, f.session.ID, "cmd-confirm", playback.RealtimeResultStatusCompleted)); err != nil {
+			if err := f.handler.handleRealtimeClientMessage(t.Context(), f.session.ID, realtimeResultMessage(t, f.session.ID, "cmd-confirm", playback.RealtimeResultStatusCompleted)); err != nil {
 				t.Fatal(err)
 			}
 			waitConfirmedPauseStates(t, f.handler, f.session.ID)
@@ -388,7 +403,7 @@ func TestRealtimeDelayedConfirmationPreservesNewerProgress(t *testing.T) {
 		t.Fatal("worker did not start")
 	}
 	f.handler.rememberRealtimeCommand("cmd-delayed-pause", f.session.ID, playback.CommandPause)
-	if err := f.handler.handleRealtimeClientMessage(f.session.ID, realtimeResultMessage(t, f.session.ID, "cmd-delayed-pause", playback.RealtimeResultStatusCompleted)); err != nil {
+	if err := f.handler.handleRealtimeClientMessage(t.Context(), f.session.ID, realtimeResultMessage(t, f.session.ID, "cmd-delayed-pause", playback.RealtimeResultStatusCompleted)); err != nil {
 		t.Fatal(err)
 	}
 	// The player resumed locally after its pause confirmation. This newer
@@ -420,7 +435,7 @@ func TestRealtimeDelayedConfirmationUsesNewerReplicaProgress(t *testing.T) {
 		t.Fatal("worker did not start")
 	}
 	f.handler.rememberRealtimeCommand("cmd-delayed-resume", f.session.ID, playback.CommandUnpause)
-	if err := f.handler.handleRealtimeClientMessage(f.session.ID, realtimeResultMessage(t, f.session.ID, "cmd-delayed-resume", playback.RealtimeResultStatusCompleted)); err != nil {
+	if err := f.handler.handleRealtimeClientMessage(t.Context(), f.session.ID, realtimeResultMessage(t, f.session.ID, "cmd-delayed-resume", playback.RealtimeResultStatusCompleted)); err != nil {
 		t.Fatal(err)
 	}
 	// Another replica accepts playing progress but does not hold this live
@@ -450,7 +465,7 @@ func TestRealtimeAndClientStopShareHistoryReceipt(t *testing.T) {
 	released := sync.OnceFunc(func() { close(scrobbler.release) })
 	defer func() { released(); waitConfirmedPauseStates(t, f.handler, f.session.ID) }()
 	f.handler.rememberRealtimeCommand("cmd-history-pause", f.session.ID, playback.CommandPause)
-	if err := f.handler.handleRealtimeClientMessage(f.session.ID, realtimeResultMessage(t, f.session.ID, "cmd-history-pause", playback.RealtimeResultStatusCompleted)); err != nil {
+	if err := f.handler.handleRealtimeClientMessage(t.Context(), f.session.ID, realtimeResultMessage(t, f.session.ID, "cmd-history-pause", playback.RealtimeResultStatusCompleted)); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -459,7 +474,7 @@ func TestRealtimeAndClientStopShareHistoryReceipt(t *testing.T) {
 		t.Fatal("pause scrobble did not start")
 	}
 	f.handler.rememberRealtimeCommand("cmd-history-stop", f.session.ID, playback.CommandStop)
-	if err := f.handler.handleRealtimeClientMessage(f.session.ID, realtimeResultMessage(t, f.session.ID, "cmd-history-stop", playback.RealtimeResultStatusCompleted)); err != nil {
+	if err := f.handler.handleRealtimeClientMessage(t.Context(), f.session.ID, realtimeResultMessage(t, f.session.ID, "cmd-history-stop", playback.RealtimeResultStatusCompleted)); err != nil {
 		t.Fatal(err)
 	}
 	receipt, err := f.handler.StopPlaybackV2(f.ctx, f.caller, f.session.ID, PlaybackStopCommand{StopID: uuid.NewString(), Sequence: 2, Position: new(1900.0)})
@@ -494,7 +509,7 @@ func TestRealtimeStopRecordsHistoryAfterTerminateMarker(t *testing.T) {
 	released := sync.OnceFunc(func() { close(scrobbler.release) })
 	defer func() { released(); waitConfirmedPauseStates(t, f.handler, f.session.ID) }()
 	f.handler.rememberRealtimeCommand("cmd-terminate-pause", f.session.ID, playback.CommandPause)
-	if err := f.handler.handleRealtimeClientMessage(f.session.ID, realtimeResultMessage(t, f.session.ID, "cmd-terminate-pause", playback.RealtimeResultStatusCompleted)); err != nil {
+	if err := f.handler.handleRealtimeClientMessage(t.Context(), f.session.ID, realtimeResultMessage(t, f.session.ID, "cmd-terminate-pause", playback.RealtimeResultStatusCompleted)); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -503,7 +518,7 @@ func TestRealtimeStopRecordsHistoryAfterTerminateMarker(t *testing.T) {
 		t.Fatal("pause scrobble did not start")
 	}
 	f.handler.rememberRealtimeCommand("cmd-terminate-stop", f.session.ID, playback.CommandStop)
-	if err := f.handler.handleRealtimeClientMessage(f.session.ID, realtimeResultMessage(t, f.session.ID, "cmd-terminate-stop", playback.RealtimeResultStatusCompleted)); err != nil {
+	if err := f.handler.handleRealtimeClientMessage(t.Context(), f.session.ID, realtimeResultMessage(t, f.session.ID, "cmd-terminate-stop", playback.RealtimeResultStatusCompleted)); err != nil {
 		t.Fatal(err)
 	}
 	control := NewAdminPlaybackControlHandler(f.handler)
@@ -591,7 +606,7 @@ func TestRealtimeConfirmationRetriesTransientAttemptReads(t *testing.T) {
 	store := &transientRealtimePlanStore{PlanStoreV3: f.handler.PlanStoreV3}
 	f.handler.PlanStoreV3 = store
 	f.handler.rememberRealtimeCommand("cmd-retry-pause", f.session.ID, playback.CommandPause)
-	if err := f.handler.handleRealtimeClientMessage(f.session.ID, realtimeResultMessage(t, f.session.ID, "cmd-retry-pause", playback.RealtimeResultStatusCompleted)); err != nil {
+	if err := f.handler.handleRealtimeClientMessage(t.Context(), f.session.ID, realtimeResultMessage(t, f.session.ID, "cmd-retry-pause", playback.RealtimeResultStatusCompleted)); err != nil {
 		t.Fatal(err)
 	}
 	waitConfirmedPauseStates(t, f.handler, f.session.ID)
@@ -642,7 +657,7 @@ func TestRealtimeConfirmationUsesReplicaPositionAtReceiptSequence(t *testing.T) 
 		t.Fatal(err)
 	}
 	f.handler.rememberRealtimeCommand("cmd-replica-pause", f.session.ID, playback.CommandPause)
-	if err := f.handler.handleRealtimeClientMessage(f.session.ID, realtimeResultMessage(t, f.session.ID, "cmd-replica-pause", playback.RealtimeResultStatusCompleted)); err != nil {
+	if err := f.handler.handleRealtimeClientMessage(t.Context(), f.session.ID, realtimeResultMessage(t, f.session.ID, "cmd-replica-pause", playback.RealtimeResultStatusCompleted)); err != nil {
 		t.Fatal(err)
 	}
 	waitConfirmedPauseStates(t, f.handler, f.session.ID)
@@ -669,7 +684,7 @@ func TestRealtimeConfirmationReadReleasesReaderBeforeCommandDeadline(t *testing.
 	f.handler.PlanStoreV3 = stalledRealtimePlanStore{PlanStoreV3: f.handler.PlanStoreV3}
 	f.handler.rememberRealtimeCommand("cmd-stalled-pause", f.session.ID, playback.CommandPause)
 	started := time.Now()
-	if err := f.handler.handleRealtimeClientMessage(f.session.ID, realtimeResultMessage(t, f.session.ID, "cmd-stalled-pause", playback.RealtimeResultStatusCompleted)); err != nil {
+	if err := f.handler.handleRealtimeClientMessage(t.Context(), f.session.ID, realtimeResultMessage(t, f.session.ID, "cmd-stalled-pause", playback.RealtimeResultStatusCompleted)); err != nil {
 		t.Fatal(err)
 	}
 	if elapsed := time.Since(started); elapsed >= defaultPlaybackControlDeadline {
@@ -777,7 +792,7 @@ func TestRealtimeConfirmedPauseScrobblesAfterPendingStart(t *testing.T) {
 	f.handler.v3StartEffectsMu.Unlock()
 
 	f.handler.rememberRealtimeCommand("cmd-start-order-pause", f.session.ID, playback.CommandPause)
-	if err := f.handler.handleRealtimeClientMessage(f.session.ID, realtimeResultMessage(t, f.session.ID, "cmd-start-order-pause", playback.RealtimeResultStatusCompleted)); err != nil {
+	if err := f.handler.handleRealtimeClientMessage(t.Context(), f.session.ID, realtimeResultMessage(t, f.session.ID, "cmd-start-order-pause", playback.RealtimeResultStatusCompleted)); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -843,7 +858,7 @@ func TestRealtimeStopRetriesTransientStoreErrors(t *testing.T) {
 	store := &transientStopStore{progressPlanStore: f.handler.PlanStoreV3.(progressPlanStore)}
 	f.handler.PlanStoreV3 = store
 	f.handler.rememberRealtimeCommand("cmd-transient-stop", f.session.ID, playback.CommandStop)
-	if err := f.handler.handleRealtimeClientMessage(f.session.ID, realtimeResultMessage(t, f.session.ID, "cmd-transient-stop", playback.RealtimeResultStatusCompleted)); err != nil {
+	if err := f.handler.handleRealtimeClientMessage(t.Context(), f.session.ID, realtimeResultMessage(t, f.session.ID, "cmd-transient-stop", playback.RealtimeResultStatusCompleted)); err != nil {
 		t.Fatal(err)
 	}
 	waitConfirmedPauseStates(t, f.handler, f.session.ID)
