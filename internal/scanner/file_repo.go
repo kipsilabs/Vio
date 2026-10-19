@@ -3703,30 +3703,65 @@ type virtualPinDB interface {
 }
 
 // virtualCandidateEvidenceResetSQL clears the probe, delivery and resolved-URL
-// evidence a candidate produced. It deliberately does not touch file_path: a
-// row that lost a path-ownership race keeps its dead pin but must not keep a
-// stored URL or evidence that describe the candidate that failed.
+// evidence a candidate produced and reports the live owner of the target path.
+// It deliberately does not touch file_path: a row that lost a path-ownership
+// race keeps its dead pin but must not keep a stored URL or evidence that
+// describe the candidate that failed.
+//
+// The owner lookup and the clear are one statement so no repair can commit
+// between them: a repair that rotates this row and writes fresh evidence makes
+// the revision fence (file_path and updated_at observed before the failed CAS)
+// match no row, and the update count stays zero. The caller must treat that as
+// a concurrent modification, never as a clean success, so the new evidence is
+// never erased. The owner predicate is: the exact target path, the same
+// virtual owner installation and media folder, the same content and episode,
+// a different row id, and no missing_since stamp.
+//
+// Placeholders: $1 losing row id, $2 target path, $3 observed file_path,
+// $4 observed updated_at.
 const virtualCandidateEvidenceResetSQL = `
-	UPDATE media_files
-	SET probe_updated_at = NULL,
-		probe_source = NULL,
-		last_delivered_at = NULL,
-		resolution = NULL,
-		codec_video = NULL,
-		codec_audio = NULL,
-		audio_channels = NULL,
-		container = 'virtual',
-		hdr = false,
-		bitrate = NULL,
-		video_tracks = '[]'::jsonb,
-		audio_tracks = '[]'::jsonb,
-		subtitle_tracks = '[]'::jsonb,
-		resolved_url = NULL,
-		resolved_url_expires_at = NULL,
-		-- Advance the revision so a stale evidence writer that snapshotted the
-		-- pre-reset row cannot CAS its dead evidence back in after the clear.
-		updated_at = GREATEST(clock_timestamp(), updated_at + interval '1 microsecond')
-	WHERE id = $1`
+	WITH owner AS (
+		SELECT owner.id, owner.file_path
+		FROM media_files current
+		JOIN media_files owner
+		  ON owner.file_path = $2
+		 AND owner.virtual_owner_installation_id IS NOT DISTINCT FROM current.virtual_owner_installation_id
+		 AND owner.media_folder_id IS NOT DISTINCT FROM current.media_folder_id
+		 AND owner.content_id = current.content_id
+		 AND owner.episode_id IS NOT DISTINCT FROM current.episode_id
+		 AND owner.id <> current.id
+		 AND owner.missing_since IS NULL
+		WHERE current.id = $1
+		LIMIT 1
+	),
+	cleared AS (
+		UPDATE media_files
+		SET probe_updated_at = NULL,
+			probe_source = NULL,
+			last_delivered_at = NULL,
+			resolution = NULL,
+			codec_video = NULL,
+			codec_audio = NULL,
+			audio_channels = NULL,
+			container = 'virtual',
+			hdr = false,
+			bitrate = NULL,
+			video_tracks = '[]'::jsonb,
+			audio_tracks = '[]'::jsonb,
+			subtitle_tracks = '[]'::jsonb,
+			resolved_url = NULL,
+			resolved_url_expires_at = NULL,
+			-- Advance the revision so a stale evidence writer that snapshotted the
+			-- pre-reset row cannot CAS its dead evidence back in after the clear.
+			updated_at = GREATEST(clock_timestamp(), updated_at + interval '1 microsecond')
+		WHERE id = $1
+		  AND file_path = $3
+		  AND updated_at = $4
+		  AND EXISTS (SELECT 1 FROM owner)
+		RETURNING id
+	)
+	SELECT owner.id, owner.file_path, (SELECT count(*) FROM cleared)::int
+	FROM owner`
 
 // virtualPinUpdate reports where a pin replacement landed. Replaced is true
 // when the requested target is represented in the catalog: either this row
@@ -3742,33 +3777,36 @@ func isUniqueViolation(err error) bool {
 	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }
 
-// virtualPathOwnerRow finds the live sibling row that already owns targetPath
-// for this row's virtual owner installation and media folder. The content and
-// episode guards keep an unrelated row from being reported as this file's
-// owner when a corrupt path collision crosses item boundaries.
-func virtualPathOwnerRow(ctx context.Context, db virtualPinDB, fileID int, targetPath string) (*models.MediaFile, error) {
-	var ownerID int
-	var ownerPath string
+// errVirtualPinRevisionSuperseded reports that a collision cleanup matched no
+// row because the losing row was rotated after the failed CAS. A newer repair
+// owns the row now, so its path and evidence must be left alone.
+var errVirtualPinRevisionSuperseded = errors.New("virtual pin row changed after the failed update")
+
+// virtualPinRevision is the losing row's state as observed before a pin CAS.
+// The collision fallback fences its evidence reset on this revision: only the
+// row that lost the CAS may be cleared, and only while it still holds the
+// state the caller observed.
+type virtualPinRevision struct {
+	filePath  string
+	updatedAt time.Time
+}
+
+// readVirtualPinRevision snapshots the row a pin write is about to CAS. It must
+// run before the write: a read after a 23505 could observe a newer repair that
+// another session already committed, and clearing against that revision would
+// erase the healthy evidence the repair just wrote.
+func readVirtualPinRevision(ctx context.Context, db virtualPinDB, fileID int) (virtualPinRevision, bool, error) {
+	var rev virtualPinRevision
 	err := db.QueryRow(ctx, `
-		SELECT owner.id, owner.file_path
-		FROM media_files current
-		JOIN media_files owner
-		  ON owner.file_path = $2
-		 AND owner.virtual_owner_installation_id IS NOT DISTINCT FROM current.virtual_owner_installation_id
-		 AND owner.media_folder_id IS NOT DISTINCT FROM current.media_folder_id
-		 AND owner.content_id = current.content_id
-		 AND owner.episode_id IS NOT DISTINCT FROM current.episode_id
-		 AND owner.id <> current.id
-		 AND owner.missing_since IS NULL
-		WHERE current.id = $1
-		LIMIT 1`, fileID, targetPath).Scan(&ownerID, &ownerPath)
+		SELECT file_path, updated_at FROM media_files WHERE id = $1`, fileID).
+		Scan(&rev.filePath, &rev.updatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, nil
+		return virtualPinRevision{}, false, nil
 	}
 	if err != nil {
-		return nil, err
+		return virtualPinRevision{}, false, fmt.Errorf("read virtual pin revision: %w", err)
 	}
-	return &models.MediaFile{ID: ownerID, FilePath: ownerPath}, nil
+	return rev, true, nil
 }
 
 // adoptVirtualPinOwner handles a target path that a sibling already owns. The
@@ -3777,18 +3815,29 @@ func virtualPathOwnerRow(ctx context.Context, db virtualPinDB, fileID int, targe
 // candidate evidence is cleared by id without rewriting file_path: its stored
 // URL and probe facts described the candidate that just failed, and keeping
 // them would let the durable-resume fast path serve those dead bytes.
-func adoptVirtualPinOwner(ctx context.Context, db virtualPinDB, fileID int, targetPath string) (*models.MediaFile, error) {
-	owner, err := virtualPathOwnerRow(ctx, db, fileID, targetPath)
-	if err != nil {
-		return nil, fmt.Errorf("resolve path owner for %q: %w", targetPath, err)
-	}
-	if owner == nil {
+//
+// The clear is revision-fenced to observed, the state read before the CAS that
+// lost. A concurrent repair that rotated this row and committed fresh evidence
+// makes the fence miss; that is reported as errVirtualPinRevisionSuperseded
+// instead of success so the repair survives.
+func adoptVirtualPinOwner(ctx context.Context, db virtualPinDB, fileID int, targetPath string, observed virtualPinRevision) (*models.MediaFile, error) {
+	var ownerID int
+	var ownerPath string
+	var cleared int
+	err := db.QueryRow(ctx, virtualCandidateEvidenceResetSQL,
+		fileID, targetPath, observed.filePath, observed.updatedAt).
+		Scan(&ownerID, &ownerPath, &cleared)
+	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("resolve path owner for %q: no live owner row", targetPath)
 	}
-	if _, err := db.Exec(ctx, virtualCandidateEvidenceResetSQL, fileID); err != nil {
-		return nil, fmt.Errorf("clear stale candidate evidence: %w", err)
+	if err != nil {
+		return nil, fmt.Errorf("clear stale candidate evidence for %q: %w", targetPath, err)
 	}
-	return owner, nil
+	if cleared == 0 {
+		return nil, fmt.Errorf("%w: %q no longer matches the observed path %q at %s",
+			errVirtualPinRevisionSuperseded, targetPath, observed.filePath, observed.updatedAt.Format(time.RFC3339Nano))
+	}
+	return &models.MediaFile{ID: ownerID, FilePath: ownerPath}, nil
 }
 
 // unpinVirtualResult strips the pinned ?result= selection from a virtual
@@ -3804,20 +3853,22 @@ func adoptVirtualPinOwner(ctx context.Context, db virtualPinDB, fileID int, targ
 // A 23505 here means the neutral no-pin path is also owned by a sibling row
 // (a provider re-list materialized it concurrently). The unpinned state already
 // exists on that owner, so this row's dead candidate evidence is cleared by id
-// and the operation reports success instead of leaving a stale pin behind.
+// and the operation reports success instead of leaving a stale pin behind. The
+// clear is fenced on the path and updated_at observed before the failed CAS; a
+// concurrent repair of this row is reported as an error and left untouched.
 func (r *FileRepository) unpinVirtualResult(ctx context.Context, fileID int, expectedPath string) error {
 	return unpinVirtualResultWithDB(ctx, r.pool, fileID, expectedPath)
 }
 
 func unpinVirtualResultWithDB(ctx context.Context, db virtualPinDB, fileID int, expectedPath string) error {
-	var currentPath string
-	err := db.QueryRow(ctx, `SELECT file_path FROM media_files WHERE id = $1`, fileID).Scan(&currentPath)
-	if errors.Is(err, pgx.ErrNoRows) {
+	observed, found, err := readVirtualPinRevision(ctx, db, fileID)
+	if err != nil {
+		return err
+	}
+	if !found {
 		return nil
 	}
-	if err != nil {
-		return fmt.Errorf("read current path: %w", err)
-	}
+	currentPath := observed.filePath
 	if expectedPath != "" && currentPath != expectedPath {
 		return nil
 	}
@@ -3831,7 +3882,7 @@ func unpinVirtualResultWithDB(ctx context.Context, db virtualPinDB, fileID int, 
 		WHERE id = $2 AND file_path = $3`, neutralPath, fileID, currentPath)
 	if err != nil {
 		if isUniqueViolation(err) {
-			if _, adoptErr := adoptVirtualPinOwner(ctx, db, fileID, neutralPath); adoptErr != nil {
+			if _, adoptErr := adoptVirtualPinOwner(ctx, db, fileID, neutralPath, observed); adoptErr != nil {
 				return fmt.Errorf("update path: %w (adopt path owner: %w)", err, adoptErr)
 			}
 			return nil
@@ -3865,8 +3916,11 @@ func (r *FileRepository) ClearVirtualResultPin(ctx context.Context, fileID int) 
 // this row would duplicate it and an unpin can collide the same way when the
 // neutral path is owned too, so the existing owner row is adopted: the target is
 // already pinned there, this row's stale evidence is cleared by id without
-// rewriting file_path, and the update reports success. A collision with no
-// resolvable owner is a genuine failure and is returned as an error.
+// rewriting file_path, and the update reports success. The clear is fenced on the
+// losing row's path and updated_at observed before the CAS; if another session
+// repaired this row after the collision, the update reports an error and leaves
+// the newer path and evidence in place. A collision with no resolvable owner is
+// a genuine failure and is returned as an error.
 func (r *FileRepository) ReplaceVirtualResultPin(ctx context.Context, fileID int, expectedPath, replacementPath string) (bool, error) {
 	res, err := replaceVirtualResultPinWithDB(ctx, r.pool, fileID, expectedPath, replacementPath)
 	if err != nil {
@@ -3876,6 +3930,13 @@ func (r *FileRepository) ReplaceVirtualResultPin(ctx context.Context, fileID int
 }
 
 func replaceVirtualResultPinWithDB(ctx context.Context, db virtualPinDB, fileID int, expectedPath, replacementPath string) (virtualPinUpdate, error) {
+	observed, found, err := readVirtualPinRevision(ctx, db, fileID)
+	if err != nil {
+		return virtualPinUpdate{}, err
+	}
+	if !found {
+		return virtualPinUpdate{}, nil
+	}
 	tag, err := db.Exec(ctx, `
 		UPDATE media_files
 		SET file_path = $1,
@@ -3906,7 +3967,7 @@ func replaceVirtualResultPinWithDB(ctx context.Context, db virtualPinDB, fileID 
 		WHERE id = $2 AND file_path = $3`, replacementPath, fileID, expectedPath)
 	if err != nil {
 		if isUniqueViolation(err) {
-			owner, adoptErr := adoptVirtualPinOwner(ctx, db, fileID, replacementPath)
+			owner, adoptErr := adoptVirtualPinOwner(ctx, db, fileID, replacementPath, observed)
 			if adoptErr != nil {
 				return virtualPinUpdate{}, fmt.Errorf("replacement path is owned: %w (after %w)", adoptErr, err)
 			}
