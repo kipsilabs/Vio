@@ -56,6 +56,11 @@ services:
   vio:
     image: ${VIO_IMAGE:-${SILO_IMAGE:-ghcr.io/kipsilabs/vio:dev}}
     restart: unless-stopped
+    # On stop Silo fails readiness, keeps serving for SILO_SHUTDOWN_DELAY
+    # (default 5s), then finishes in-flight requests. Docker kills a container
+    # 10s after asking it to stop, which would cut that short. A single server
+    # with no load balancer in front can set SILO_SHUTDOWN_DELAY=0.
+    stop_grace_period: 2m
     environment:
       MODE: integrated
       # Keep the container listeners fixed. PORT and JF_PORT in .env are
@@ -82,6 +87,14 @@ services:
       - ${VIO_DATA_ROOT:-${SILO_DATA_ROOT:-/opt/vio}}/artwork:/var/lib/vio/artwork
       - ${VIO_DATA_ROOT:-${SILO_DATA_ROOT:-/opt/vio}}/compat:/var/lib/vio/compat
       - ${VIO_DATA_ROOT:-${SILO_DATA_ROOT:-/opt/vio}}/transcode:/tmp/vio-transcode
+      # Prepared downloads. With "Prepared file directory" (download.artifact_dir)
+      # blank, Vio keeps them beside the transcode directory, not inside it, so
+      # they need their own mount to survive image updates. This path assumes the
+      # default playback.transcode_dir; with another one, mount the
+      # vio-download-artifacts directory beside it instead. No storage
+      # budget applies until one is set ("Default storage budget per location",
+      # download.artifact_max_bytes, in Settings > Downloads).
+      - ${VIO_DATA_ROOT:-${SILO_DATA_ROOT:-/opt/vio}}/download-artifacts:/tmp/vio-download-artifacts
       - ${VIO_DATA_ROOT:-${SILO_DATA_ROOT:-/opt/vio}}/catalog-seeds:/catalog-seeds:ro
       # Only load-bearing when the Docker host is itself an LXC container, where
       # these three files describe the physical machine and the LXC's own cap
@@ -108,6 +121,9 @@ services:
   #   image: ${VIO_IMAGE:-${SILO_IMAGE:-ghcr.io/kipsilabs/vio:dev}}
   #   restart: unless-stopped
   #   profiles: [proxy]
+  #   # Lets the proxy finish in-flight requests on stop instead of being
+  #   # killed after Docker's default 10s.
+  #   stop_grace_period: 2m
   #   environment:
   #     MODE: proxy
   #     # Must be the SAME SECRET_KEY as the primary node (shared encrypted data).
@@ -145,6 +161,11 @@ services:
   #   image: ${VIO_IMAGE:-${SILO_IMAGE:-ghcr.io/kipsilabs/vio:dev}}
   #   restart: unless-stopped
   #   profiles: [transcode]
+  #   # On stop the node drains: it takes no new work and lets its sessions
+  #   # finish for up to SILO_NODE_DRAIN_TIMEOUT (default 10m, 0 turns it off).
+  #   # Docker kills a container 10s after asking it to stop, so the grace
+  #   # period must cover the drain plus a minute for the shutdown after it.
+  #   stop_grace_period: 11m
   #   environment:
   #     MODE: transcode
   #     # Must be the SAME SECRET_KEY as the primary node (shared encrypted data).

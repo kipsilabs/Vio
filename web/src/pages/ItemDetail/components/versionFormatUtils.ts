@@ -1,9 +1,15 @@
-import type { VersionAudioTrack, VersionSubtitleTrack, VersionVideoTrack } from "@/api/types";
+import type {
+  FileVersion,
+  VersionAudioTrack,
+  VersionSubtitleTrack,
+  VersionVideoTrack,
+} from "@/api/types";
 import { normalizeSortCriteria } from "@/components/streaming/scoringPresets";
 import { englishLanguageName, getLanguageName } from "@/lib/languageNames";
 import type { ServerVersionRanking } from "@/lib/qualityRanking";
 import { videoRangeLabel, type VideoRangeTrack } from "@/lib/videoRange";
 import {
+  audioTrackAtmosEvidence,
   formatBitrate,
   formatChannels,
   formatFileSize,
@@ -404,6 +410,19 @@ export function buildVersionFallbackTitle(
   }
   const stillHasSize = /\b\d+(?:\.\d+)?\s*(?:TB|GB|MB)\b/i.test(label);
   return stillHasSize ? label.trim() : prettifyReleaseName(label);
+}
+
+/**
+ * Atmos evidence for the audio stream a version's codec_audio describes. The
+ * scanner takes codec_audio from the first audio stream, so the first track's
+ * profile and titles apply when its codec agrees.
+ */
+export function versionAudioAtmosEvidence(version: FileVersion): string | undefined {
+  const first = version.audio_tracks?.[0];
+  if (!first?.codec || !version.codec_audio) return undefined;
+  return first.codec.toLowerCase() === version.codec_audio.toLowerCase()
+    ? audioTrackAtmosEvidence(first)
+    : undefined;
 }
 
 export function formatPageCount(pages?: number): string {

@@ -163,7 +163,7 @@ describe("OrderBlock, Synced list", () => {
     };
   }
 
-  it("keeps the list's own order by default and says blank takes the whole list", () => {
+  it("keeps the list's own order by default and explains a blank limit", () => {
     const { input } = renderSynced();
     expect(screen.getByRole("combobox", { name: "Default sort" })).toHaveTextContent("List order");
     expect(input).toHaveAttribute("placeholder", "Whole list");

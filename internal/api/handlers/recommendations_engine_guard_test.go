@@ -110,7 +110,7 @@ func (s stubRecsEngine) SimilarItems(context.Context, string, int) ([]recommenda
 	return s.similar, s.err
 }
 
-func (s stubRecsEngine) BecauseYouWatched(context.Context, int, string, string, int) ([]recommendations.ScoredItem, error) {
+func (s stubRecsEngine) BecauseYouWatched(context.Context, int, string, string, int, catalog.AccessFilter) ([]recommendations.ScoredItem, error) {
 	return nil, nil
 }
 

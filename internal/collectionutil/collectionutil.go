@@ -2,6 +2,7 @@ package collectionutil
 
 import (
 	"errors"
+	"math"
 	"strings"
 )
 
@@ -13,22 +14,18 @@ const (
 	MaxExplicitItemLimit            = 100000
 )
 
-// SourceFetchLimit returns the maximum number of source entries to scan when
-// satisfying an item limit. If itemLimit is nil or <= 0, 0 is returned
-// (meaning fetch all available entries). Otherwise, it applies the multiplier
-// with a minimum floor of 100 entries up to MaxExplicitItemLimit.
+// SourceFetchLimit is how many source entries a sync reads for a collection
+// with an explicit item limit: a few times the limit, because some entries
+// don't match the catalog or the owner's access. It returns 0, meaning the
+// source's whole list, when the collection has no item limit or the scan
+// depth would overflow. The result is capped at MaxExplicitItemLimit.
+
 func SourceFetchLimit(itemLimit *int) int {
-	if itemLimit == nil || *itemLimit <= 0 {
+	if itemLimit == nil || *itemLimit <= 0 || *itemLimit > math.MaxInt/collectionSourceFetchMultiplier {
 		return 0
 	}
-	limit := *itemLimit * collectionSourceFetchMultiplier
-	if limit < collectionSourceFetchMin {
-		limit = collectionSourceFetchMin
-	}
-	if limit > MaxExplicitItemLimit {
-		limit = MaxExplicitItemLimit
-	}
-	return limit
+	limit := max(*itemLimit*collectionSourceFetchMultiplier, collectionSourceFetchMin)
+	return min(limit, MaxExplicitItemLimit)
 }
 
 func ItemLimitReached(itemCount int, itemLimit *int) bool {

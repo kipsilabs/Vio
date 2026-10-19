@@ -131,6 +131,8 @@ function playbackSession(
     connectionStatus: "connected",
     connectionErrorTitle: null,
     connectionError: null,
+    browserEngine: null,
+    nativeOriginalSupport: { containers: [], videoCodecs: [], audioCodecs: [] },
     switchVersion: vi.fn(),
     selectAutoVersion: vi.fn(),
     retryStart: vi.fn(),

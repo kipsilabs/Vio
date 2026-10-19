@@ -198,7 +198,7 @@ func (s *Postgres) getAttempt(ctx context.Context, predicate string, value any) 
 		       requested_media_file_id, effective_media_file_id,
 		       current_plan_id, current_replan_request_id, current_plan, frozen_recipe,
 		       normalized_request, start_response, request_digest, expires_at, server_bitrate_cap_kbps,
-		       last_sequence, last_sample, stopped_at, updated_at, recovery_state, recovery_revision,
+		       last_sequence, last_sample, stopped_at, COALESCE(stop_receipt->>'stop_id', ''), updated_at, recovery_state, recovery_revision,
 		       audio_selection, audio_reconcile_ledger
 		FROM playback_v3_attempts
 		WHERE `+predicate+` AND expires_at > NOW()`, value).Scan(
@@ -206,7 +206,7 @@ func (s *Postgres) getAttempt(ctx context.Context, predicate string, value any) 
 		&record.RequestedMediaFileID, &record.EffectiveMediaFileID,
 		&record.CurrentPlanID, &record.CurrentReplanRequestID, &planJSON, &recipeJSON,
 		&requestJSON, &responseJSON, &record.RequestDigest, &record.ExpiresAt, &record.ServerBitrateCapKbps,
-		&record.LastSequence, &sampleJSON, &record.StoppedAt, &record.LastSampleAt,
+		&record.LastSequence, &sampleJSON, &record.StoppedAt, &record.StopID, &record.LastSampleAt,
 		&recoveryJSON, &record.RecoveryRevision,
 		&selectionJSON, &ledgerJSON,
 	)

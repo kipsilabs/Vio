@@ -4,11 +4,18 @@ import { MemoryRouter } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import EpisodeCarousel from "./EpisodeCarousel";
 
+vi.mock("@/lib/thumbhash", () => ({ decodeThumbhash: () => "data:image/png;base64,fixture" }));
+
 const capturedMenuProps: Record<string, unknown>[] = [];
 const prefetchEpisodeDetail = vi.hoisted(() => vi.fn());
+const spoilerPrefs = vi.hoisted(() => ({ hideImages: false, hideOverviews: false }));
 
 vi.mock("@/hooks/queries/catalogRead", () => ({
   usePrefetchCatalogItemDetail: () => prefetchEpisodeDetail,
+}));
+
+vi.mock("@/hooks/useEpisodeSpoilerPrefs", () => ({
+  useEpisodeSpoilerPrefs: () => spoilerPrefs,
 }));
 
 vi.mock("@/hooks/useOverlayPrefs", () => ({
@@ -41,6 +48,61 @@ vi.mock("@/hooks/queries/episodeRelease", async (importOriginal) => {
     ...original,
     useEpisodeReleaseCapability: () => ({ data: { available: true } }),
   };
+});
+
+it("suppresses a protected still placeholder until the image loads", () => {
+  spoilerPrefs.hideImages = true;
+  const { container, rerender } = render(
+    <MemoryRouter>
+      <EpisodeCarousel
+        currentEpisodeNumber={0}
+        episodes={[
+          {
+            content_id: "ep-protected",
+            season_number: 1,
+            episode_number: 1,
+            title: "Protected",
+            overview: "",
+            air_date: null,
+            runtime: 42,
+            still_url: "https://example.invalid/still.jpg",
+            still_thumbhash: "fixture",
+            files: [],
+            still_is_episode_still: true,
+          },
+        ]}
+      />
+    </MemoryRouter>,
+  );
+  const image = container.querySelector("img")!;
+  expect(image.parentElement!.style.backgroundImage).toBe("");
+  expect(image.className).toContain("blur");
+  spoilerPrefs.hideImages = false;
+  rerender(
+    <MemoryRouter>
+      <EpisodeCarousel
+        currentEpisodeNumber={0}
+        episodes={[
+          {
+            content_id: "ep-protected",
+            season_number: 1,
+            episode_number: 1,
+            title: "Protected",
+            overview: "",
+            air_date: null,
+            runtime: 42,
+            still_url: "https://example.invalid/still.jpg",
+            still_thumbhash: "fixture",
+            files: [],
+            still_is_episode_still: true,
+          },
+        ]}
+      />
+    </MemoryRouter>,
+  );
+  expect(container.querySelector("img")!.parentElement!.style.backgroundImage).toContain(
+    "data:image/png",
+  );
 });
 
 describe("EpisodeCarousel", () => {
@@ -127,6 +189,25 @@ describe("EpisodeCarousel", () => {
                 duration_seconds: 1800,
               },
             },
+            {
+              content_id: "ep-3",
+              season_number: 1,
+              episode_number: 3,
+              title: "Rewatch",
+              overview: "",
+              air_date: null,
+              runtime: 44,
+              still_url: "",
+              still_thumbhash: "",
+              files: [],
+              // Watched before and partly rewatched: no progress bar, but a
+              // resume position Reset Progress can clear.
+              user_data: {
+                played: true,
+                position_seconds: 300,
+                duration_seconds: 1800,
+              },
+            },
           ]}
         />
       </MemoryRouter>,
@@ -143,6 +224,7 @@ describe("EpisodeCarousel", () => {
       showCollectionActions: false,
       showWatchedShortcut: true,
       hasPartialProgress: false,
+      hasResumePosition: false,
       quickActionMode: "watched",
     });
     expect(capturedMenuProps[1]).toMatchObject({
@@ -155,7 +237,13 @@ describe("EpisodeCarousel", () => {
       },
       showWatchedShortcut: true,
       hasPartialProgress: true,
+      hasResumePosition: true,
       quickActionMode: "watched",
+    });
+    expect(capturedMenuProps[2]).toMatchObject({
+      contentId: "ep-3",
+      hasPartialProgress: false,
+      hasResumePosition: true,
     });
   });
 

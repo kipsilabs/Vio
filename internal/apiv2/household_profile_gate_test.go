@@ -327,6 +327,12 @@ var householdGateExemptOperations = map[string]string{
 	"headPlaybackMedia":        exemptPlaybackSession,
 	"headPlaybackSubtitle":     exemptPlaybackSession,
 
+	// Job polls read no catalog content. A declared profile is verified only
+	// so the acting-admin decision can see it; that decision already refuses
+	// a profile-less admin on a household that requires a profile.
+	"getAdminJob":   "job poll; admin reach follows the acting-admin decision",
+	"getLibraryJob": "job poll; admin reach follows the acting-admin decision",
+
 	"detectSubtitleLanguage":          "file-less language detection",
 	"getVirtualLibraryCapabilities":   "capability probe, callable before a profile is chosen",
 	"getNotificationApplePushDisplay": "a display token binds the profile from its claims",
@@ -338,6 +344,7 @@ var householdGateExemptOperations = map[string]string{
 	"discoverVirtualCandidates":      "access-checked provider discovery without a playback session",
 	"cancelVirtualCandidatesRefresh": "owner-scoped async re-list job",
 	"requestVirtualRelease":          "owner-scoped provider release request",
+	"listSeasonalThemes":             "static seasonal holiday and vibe catalog",
 }
 
 // TestHouseholdProfileGateCoversProfileOptionalOperations: every operation

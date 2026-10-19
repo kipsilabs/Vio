@@ -85,12 +85,23 @@ func remoteOrphansForArtifact(orphans []RemoteArtifactOrphan, artifactID string)
 }
 
 func TestArtifactEnsureQueuedRoundTripsToneMapRecipe(t *testing.T) {
+	for _, kind := range tonemap.AllSourceKinds() {
+		t.Run(string(kind), func(t *testing.T) {
+			assertArtifactToneMapRecipeRoundTrips(t, kind)
+		})
+	}
+}
+
+// assertArtifactToneMapRecipeRoundTrips proves the download_artifacts recipe
+// constraint accepts a tone-map source kind and that every field survives.
+func assertArtifactToneMapRecipeRoundTrips(t *testing.T, kind tonemap.SourceKind) {
+	t.Helper()
 	repo, _, fileID := newArtifactTestRepo(t)
 	ctx := context.Background()
-	artifact := newArtifact(t, fileID, "hash-tone-map-round-trip")
+	artifact := newArtifact(t, fileID, "hash-tone-map-round-trip-"+string(kind))
 	artifact.ToneMapPolicy = tonemap.PolicyHardwareThenSoftware
 	artifact.ToneMapMode = tonemap.ModeHardware
-	artifact.ToneMapSourceKind = tonemap.SourcePQ
+	artifact.ToneMapSourceKind = kind
 	wantRecipeVersion := playback.TransformationHDRToSDRToneMapRecipeVersionV3
 	wantSourceRevision := tonemap.SourceRevision{MediaFileID: fileID, FileSize: 100, StreamSignature: "video"}.Encode()
 	artifact.ToneMapRecipeVersion = wantRecipeVersion
@@ -102,7 +113,7 @@ func TestArtifactEnsureQueuedRoundTripsToneMapRecipe(t *testing.T) {
 	}
 	assertToneMapRecipe := func(name string, got *Artifact) {
 		t.Helper()
-		if got.ToneMapPolicy != tonemap.PolicyHardwareThenSoftware || got.ToneMapMode != tonemap.ModeHardware || got.ToneMapSourceKind != tonemap.SourcePQ || got.ToneMapRecipeVersion != wantRecipeVersion || got.ToneMapSourceRevision != wantSourceRevision {
+		if got.ToneMapPolicy != tonemap.PolicyHardwareThenSoftware || got.ToneMapMode != tonemap.ModeHardware || got.ToneMapSourceKind != kind || got.ToneMapRecipeVersion != wantRecipeVersion || got.ToneMapSourceRevision != wantSourceRevision {
 			t.Fatalf("%s tone-map recipe = policy %q mode %q source %q version %q revision %q; want version %q revision %q", name, got.ToneMapPolicy, got.ToneMapMode, got.ToneMapSourceKind, got.ToneMapRecipeVersion, got.ToneMapSourceRevision, wantRecipeVersion, wantSourceRevision)
 		}
 	}
@@ -1497,4 +1508,77 @@ func requeueForTest(t *testing.T, pool *pgxpool.Pool, id string) {
 	if err := NewArtifactRepository(pool).Requeue(context.Background(), id); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// A device that fetched the whole file can report completion after recovery
+// found the output missing, requeued the job, and returned the download to
+// preparing: the report waited out the server update that lost the file. The
+// device holds the bytes, so the report must land, and a job still waiting in
+// the queue must stop once no other download needs it.
+func TestLateCompletionAfterMissingOutputRequeue(t *testing.T) {
+	cases := []struct {
+		name         string
+		otherWaiting bool
+		claimed      bool
+		wantArtifact string
+	}{
+		{name: "only requester", wantArtifact: ArtifactExpired},
+		{name: "another device still waiting", otherWaiting: true, wantArtifact: ArtifactQueued},
+		// A running encode finishes into the cache rather than being stopped.
+		{name: "already claimed by a worker", claimed: true, wantArtifact: ArtifactRunning},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := seedManagedFixture(t)
+			ctx := context.Background()
+			repo := NewArtifactRepository(f.pool)
+			ready := readyArtifactForRecovery(t, repo, f.pool, f.fileID, "")
+			t.Cleanup(func() { _, _ = f.pool.Exec(ctx, `DELETE FROM download_artifacts WHERE id = $1`, ready.ID) })
+			fetched := linkManagedArtifactDownload(t, f, f.profileA, f.deviceA, ready.ID, StatusDownloading)
+			if tc.otherWaiting {
+				linkManagedArtifactDownload(t, f, f.profileB, f.deviceB, ready.ID, StatusReady)
+			}
+			finishedAt := time.Now().Add(-time.Minute).UTC().Truncate(time.Millisecond)
+
+			if _, got, err := repo.RecoverMissing(ctx, ready.ID, missingArtifactRetireGrace); err != nil || got != artifactRequeued {
+				t.Fatalf("RecoverMissing = (%v, %v), want requeued", got, err)
+			}
+			if tc.claimed {
+				if _, err := f.pool.Exec(ctx, `UPDATE download_artifacts SET status = 'running', lease_owner = 'worker', lease_expires_at = now() + interval '1 minute' WHERE id = $1`, ready.ID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			service := &Service{repo: f.repo, artifacts: NewArtifactManager(repo, f.repo, nil, nil, "late-completion-test", nil, nil)}
+			// A late transfer-start report describes bytes the device no
+			// longer fetches; it must not move the row out of preparing.
+			if _, err := service.ReportStatus(ctx, f.userID, f.profileA, f.deviceA, fetched, StatusEvent{Status: StatusDownloading, UpdatedAt: finishedAt.Add(-time.Second), Revision: 1}); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("late downloading report = %v, want ErrNotFound", err)
+			}
+			got, err := service.ReportStatus(ctx, f.userID, f.profileA, f.deviceA, fetched, StatusEvent{Status: StatusCompleted, UpdatedAt: finishedAt, Revision: 1})
+			if err != nil || got.Status != StatusCompleted || got.CompletedAt == nil || !got.CompletedAt.Equal(finishedAt) {
+				t.Fatalf("late completion = %+v (%v), want completed at %v", got, err, finishedAt)
+			}
+			row, err := repo.GetByID(ctx, ready.ID)
+			if err != nil || row.Status != tc.wantArtifact {
+				t.Fatalf("artifact after late completion = %+v (%v), want %s", row, err, tc.wantArtifact)
+			}
+		})
+	}
+}
+
+// linkManagedArtifactDownload links one managed download in the given status
+// to artifactID for the fixture's user on profile/device.
+func linkManagedArtifactDownload(t *testing.T, f managedFixture, profileID, deviceID, artifactID, status string) string {
+	t.Helper()
+	id := fmt.Sprintf("late-%d", time.Now().UnixNano())
+	now := time.Now()
+	if err := f.repo.Create(context.Background(), &Download{
+		ID: id, UserID: f.userID, ProfileID: profileID, DeviceID: deviceID,
+		MediaFileID: f.fileID, ContentID: f.contentID, Kind: KindQueued,
+		Status: status, Format: FormatTranscode, ArtifactID: artifactID, FileSize: 4242,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("link managed download: %v", err)
+	}
+	return id
 }

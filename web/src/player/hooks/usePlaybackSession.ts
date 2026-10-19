@@ -11,16 +11,19 @@ import {
   type PlaybackPolicyErrorDescription,
 } from "../playback-errors";
 import {
+  isPlaybackSessionEndedError,
   isTransientPlayerRequestError,
   PlayerFetchError,
   playerFetchResponse,
 } from "../player-fetch";
 import { useCodecDetection } from "./useCodecDetection";
+import { useBrowserEngineCapabilities } from "./useBrowserEngine";
+import type { EngineCapabilities } from "../engine/capabilities";
+import type { NativeOriginalSupport } from "../engine/routing";
 import {
   buildClientCapabilitiesV3,
   buildClientPlaybackContextV3,
   detectBandwidthEstimateKbpsV3,
-  detectMeteredV3,
 } from "../client-context-v3";
 import { buildRouteEventV3 } from "../route-events-v3";
 import { reportSessionRouteEventV2 } from "../route-events-v2";
@@ -184,7 +187,11 @@ interface PlaybackSessionState {
   connectionError: string | null;
 }
 
-export type PlaybackConnectionStatus = "connected" | "reconnecting" | "lost";
+/**
+ * `ended` means the server ended the session for good (an administrator
+ * stopped it); the player exits rather than reconnecting.
+ */
+export type PlaybackConnectionStatus = "connected" | "reconnecting" | "lost" | "ended";
 
 // Mid-stream reconnect backoff: 1s, 2s, 4s, 8s, then every 15s, for about two
 // and a quarter minutes in total before the player gives up and asks the
@@ -553,6 +560,13 @@ function deferredIdentityIsAdmissible(
 type StartRequestWithForceRelinkV3 = StartRequestV3 & { force_relink?: boolean };
 
 export interface UsePlaybackSessionResult extends PlaybackSessionState {
+  /**
+   * The browser decode engine's capabilities, when browser decoding is on and
+   * this browser can run it. The player routes `original_http` plans with it.
+   */
+  browserEngine: EngineCapabilities | null;
+  /** What the media element itself plays from an untouched original. */
+  nativeOriginalSupport: NativeOriginalSupport;
   /** Starts a fresh session against another file (edition/version switch). */
   switchVersion: (fileId: number, currentPosition: number) => void;
   /**
@@ -998,9 +1012,24 @@ export function usePlaybackSession(
 ): UsePlaybackSessionResult {
   const config = usePlayerConfig();
   const probe = useCodecDetection();
-  const capabilitiesSettled = probe.settled;
-  const clientCapabilities = useMemo(() => buildClientCapabilitiesV3(probe), [probe]);
-  const clientPlaybackContext = useMemo(() => buildClientPlaybackContextV3(probe), [probe]);
+  const browserEngine = useBrowserEngineCapabilities();
+  const capabilitiesSettled = probe.settled && browserEngine.settled;
+  const clientCapabilities = useMemo(
+    () => buildClientCapabilitiesV3(probe, browserEngine.capabilities),
+    [probe, browserEngine.capabilities],
+  );
+  const clientPlaybackContext = useMemo(
+    () => buildClientPlaybackContextV3(probe, browserEngine.capabilities),
+    [probe, browserEngine.capabilities],
+  );
+  const nativeOriginalSupport = useMemo<NativeOriginalSupport>(
+    () => ({
+      containers: probe.containers,
+      videoCodecs: probe.codecsVideo,
+      audioCodecs: probe.codecsAudio,
+    }),
+    [probe.codecsAudio, probe.codecsVideo, probe.containers],
+  );
   const capabilityRequestKey = useMemo(
     () => JSON.stringify([clientCapabilities, clientPlaybackContext]),
     [clientCapabilities, clientPlaybackContext],
@@ -1026,7 +1055,7 @@ export function usePlaybackSession(
     planAudioTracks: [],
     audioInventoryProvisional: false,
     subtitleInventoryProvisional: false,
-    qualityPreference: qualityPreference?.trim() || "auto",
+    qualityPreference: qualityPreference?.trim() || QUALITY_ORIGINAL_V3,
     shouldAutoPlay: true,
     loading: true,
     replacing: false,
@@ -1052,6 +1081,10 @@ export function usePlaybackSession(
   const transportRevisionRef = useRef(0);
   const serverFeaturesRef = useRef<string[]>([]);
   const stateRef = useRef(state);
+  // Set as soon as the server says an administrator ended the session, before
+  // the state carrying it renders, so a caller acting on an older render
+  // cannot start a reconnect against it.
+  const sessionEndedRef = useRef(false);
   // The live effective source identity, folded through the same commits and
   // rotations as `state` but readable synchronously inside callbacks. Deferring
   // a push still moves where the stream actually is; later decisions (a queued
@@ -1243,7 +1276,7 @@ export function usePlaybackSession(
   // completion above can call it without depending on render order. Bound in
   // an effect — render-time ref writes are unsafe under concurrent React.
   const reanchorSeekRef = useRef<(positionSeconds: number) => Promise<boolean>>(async () => false);
-  const qualityRef = useRef(qualityPreference?.trim() || "auto");
+  const qualityRef = useRef(qualityPreference?.trim() || QUALITY_ORIGINAL_V3);
   // The running mid-stream reconnect, if any. `generation` invalidates the
   // timer and any request of a cycle that has ended, so nothing it started can
   // act after the viewer left, a new start took over, or a plan was adopted.
@@ -1481,6 +1514,7 @@ export function usePlaybackSession(
       const sessionId = plan.session_id ?? decision.session_id ?? sessionIdRef.current;
       planAttemptIdRef.current = randomUUID();
       planRef.current = plan;
+      sessionEndedRef.current = false;
       sessionIdRef.current = sessionId ?? null;
       // The adopted plan is the new live source; a rotation deferred before it
       // landed is superseded by what the plan itself names.
@@ -1631,7 +1665,6 @@ export function usePlaybackSession(
         fileSelection,
         forceRelink,
         subtitleTrackIndex,
-        metered: detectMeteredV3(),
         bandwidthEstimateKbps: detectBandwidthEstimateKbpsV3(),
         bandwidthCapKbps: maxBitrateKbps,
         clientCapabilities,
@@ -2073,7 +2106,7 @@ export function usePlaybackSession(
     }
     activeRequestKeyRef.current = requestKey;
     activeCapabilityRequestKeyRef.current = capabilityRequestKey;
-    qualityRef.current = qualityPreference?.trim() || "auto";
+    qualityRef.current = qualityPreference?.trim() || QUALITY_ORIGINAL_V3;
     playbackPositionRef.current = initialPosition;
     const intentAt = takePlaybackIntent(requestKey);
     startIntentRef.current = {
@@ -2367,6 +2400,19 @@ export function usePlaybackSession(
         // A reconnect-mode replan rethrows so the reconnect cycle — not the
         // error banner — owns the failure.
         if (reconnect) throw err;
+        if (isPlaybackSessionEndedError(err)) {
+          // An administrator ended the session: leave rather than show an
+          // error or recover into a fresh session.
+          sessionEndedRef.current = true;
+          setState((current) => ({
+            ...current,
+            replanning: false,
+            connectionStatus: "ended",
+            connectionErrorTitle: null,
+            connectionError: null,
+          }));
+          return false;
+        }
         const deadSession = isDeadPlaybackSessionError(err);
         if (deadSession && recoveredDeadSessionRef.current !== sessionId) {
           recoveredDeadSessionRef.current = sessionId;
@@ -2729,6 +2775,19 @@ export function usePlaybackSession(
         if (adopted || !isCurrent()) return;
       } catch (error) {
         if (!isCurrent()) return;
+        if (isPlaybackSessionEndedError(error)) {
+          sessionEndedRef.current = true;
+          endReconnect(false);
+          setState((current) => ({
+            ...current,
+            replacing: false,
+            replanning: false,
+            connectionStatus: "ended",
+            connectionErrorTitle: null,
+            connectionError: null,
+          }));
+          return;
+        }
         if (isRetryableReconnectError(error, "replan")) {
           retryLater();
           return;
@@ -2769,8 +2828,9 @@ export function usePlaybackSession(
 
   const recoverConnection = useCallback(
     (positionSeconds: number, resume: boolean) => {
-      // Only a stream that exists can lose its connection.
-      if (!planRef.current || !sessionIdRef.current) return;
+      // Only a stream that exists can lose its connection, and a session an
+      // administrator ended stays ended.
+      if (!planRef.current || !sessionIdRef.current || sessionEndedRef.current) return;
       beginReconnect(positionSeconds, resume, false);
     },
     [beginReconnect],
@@ -3923,6 +3983,8 @@ export function usePlaybackSession(
 
   return {
     ...state,
+    browserEngine: browserEngine.capabilities,
+    nativeOriginalSupport,
     switchVersion,
     selectAutoVersion,
     retryStart,

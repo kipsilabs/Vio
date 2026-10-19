@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { act, fireEvent, render, screen, within } from "@testing-library/react";
-import { createElement } from "react";
+import { createElement, type ComponentProps } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   buildVersionStatusLabels,
@@ -154,16 +154,16 @@ describe("QualityMenu", () => {
     render(
       createElement(QualityMenu, {
         options: [
+          { id: "auto", label: "Auto", sublabel: "", resolution: "", bitrateKbps: 0 },
           {
-            id: "original",
-            label: "Original",
-            sublabel: "",
-            resolution: "1080p",
-            bitrateKbps: 8000,
-            isOriginal: true,
+            id: "720p",
+            label: "720p",
+            sublabel: "3 Mbps",
+            resolution: "720p",
+            bitrateKbps: 3000,
           },
         ],
-        activeId: "original",
+        activeId: "auto",
         isTranscoding: false,
         error: null,
         onSelect: select,
@@ -175,8 +175,8 @@ describe("QualityMenu", () => {
     fireEvent.click(screen.getByRole("button", { name: "Quality" }));
     expect(screen.getByText(/Watch Party keeps everyone on the same version/)).toBeInTheDocument();
     expect(screen.queryByRole("menuitem", { name: /2160p HEVC HDR/ })).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("menuitem", { name: /Original/ }));
-    expect(select).toHaveBeenCalledWith("original");
+    fireEvent.click(screen.getByRole("menuitem", { name: /720p/ }));
+    expect(select).toHaveBeenCalledWith("720p");
     expect(switchVersion).not.toHaveBeenCalled();
   });
 
@@ -184,24 +184,17 @@ describe("QualityMenu", () => {
     render(
       createElement(QualityMenu, {
         options: [
-          {
-            id: "original",
-            label: "Original",
-            sublabel: "25 Mbps",
-            resolution: "2160p",
-            bitrateKbps: 25_000,
-            isOriginal: true,
-          },
+          { id: "auto", label: "Auto", sublabel: "", resolution: "", bitrateKbps: 0 },
           {
             id: "1080p-medium",
             label: "1080p Medium",
             sublabel: "6 Mbps",
             resolution: "1080p",
             bitrateKbps: 6000,
-            isOriginal: false,
           },
         ],
         activeId: "1080p",
+        source: { height: 2160, bitrate_kbps: 25_000 },
         isTranscoding: false,
         error: null,
         onSelect: () => {},
@@ -217,26 +210,24 @@ describe("QualityMenu", () => {
     );
   });
 
-  it("shows Original for a fitting source unless the delivered recipe shows a cap", () => {
+  it("lights no row for a fitting source under a fixed resolution unless a cap shows", () => {
     const options = [
-      {
-        id: "original",
-        label: "Original",
-        sublabel: "20 Mbps",
-        resolution: "1080p",
-        bitrateKbps: 20_000,
-        isOriginal: true,
-      },
+      { id: "auto", label: "Auto", sublabel: "", resolution: "", bitrateKbps: 0 },
       {
         id: "1080p-medium",
         label: "1080p Medium",
         sublabel: "6 Mbps",
         resolution: "1080p",
         bitrateKbps: 6000,
-        isOriginal: false,
       },
     ];
-    const props = { options, activeId: "1080p", isTranscoding: false, error: null };
+    const props = {
+      options,
+      activeId: "1080p",
+      source: { height: 1080, bitrate_kbps: 20_000 },
+      isTranscoding: false,
+      error: null,
+    };
     const { rerender } = render(
       createElement(QualityMenu, {
         ...props,
@@ -244,7 +235,9 @@ describe("QualityMenu", () => {
         onSelect: () => {},
       }),
     );
-    expect(screen.getByRole("button", { name: "Quality" })).toHaveTextContent("Original");
+    // The trigger names the saved resolution instead of lighting Auto.
+    expect(screen.getByRole("button", { name: "Quality" })).toHaveTextContent("1080p");
+    expect(screen.getByRole("button", { name: "Quality" })).not.toHaveTextContent("Auto");
 
     rerender(
       createElement(QualityMenu, {
@@ -711,5 +704,147 @@ describe("QualityMenu automatic version fallback", () => {
     );
     expect(screen.getByRole("menuitem", { name: /1080p H264/ })).toBeInTheDocument();
     expect(screen.getByRole("menuitem", { name: /2160p HEVC/ })).toBeInTheDocument();
+  });
+});
+
+const rung720 = {
+  id: "720p",
+  label: "720p",
+  sublabel: "3 Mbps",
+  resolution: "720p",
+  bitrateKbps: 3000,
+};
+const auto = {
+  id: "auto",
+  label: "Auto",
+  sublabel: "",
+  resolution: "",
+  bitrateKbps: 0,
+};
+const versions = [
+  makeVersionInfo({ isCurrentSource: true }),
+  makeVersionInfo({ fileId: 2, label: "1080p H264" }),
+];
+function menuProps(
+  overrides: Partial<ComponentProps<typeof QualityMenu>> = {},
+): ComponentProps<typeof QualityMenu> {
+  return {
+    options: [rung720],
+    activeId: "auto",
+    isTranscoding: false,
+    error: null,
+    onSelect: vi.fn(),
+    versions,
+    onSwitchVersion: vi.fn(),
+    ...overrides,
+  };
+}
+
+describe("available playback choices", () => {
+  it.each([{ options: [] }, { options: [rung720] }])(
+    "keeps version switching without a quality choice (%j)",
+    ({ options }) => {
+      const props = menuProps({ options });
+      render(createElement(QualityMenu, props));
+      fireEvent.click(screen.getByRole("button", { name: "Version" }));
+      expect(screen.queryByText("Quality")).not.toBeInTheDocument();
+      expect(screen.queryByRole("menuitem", { name: /720p/ })).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole("menuitem", { name: /1080p H264/ }));
+      expect(props.onSwitchVersion).toHaveBeenCalledWith(2);
+      expect(props.onSelect).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    { versions: [makeVersionInfo()] },
+    { versionLocked: true },
+    { onSwitchVersion: undefined },
+    { options: [], versions: [] },
+  ])("hides the trigger when neither choice is actionable (%j)", (overrides) => {
+    render(createElement(QualityMenu, menuProps(overrides)));
+    expect(screen.queryByRole("button")).not.toBeInTheDocument();
+  });
+
+  it("shows both sections when versions and qualities are available", () => {
+    render(createElement(QualityMenu, menuProps({ options: [auto, rung720] })));
+    fireEvent.click(screen.getByRole("button", { name: "Quality" }));
+    expect(screen.getByText("Version")).toBeInTheDocument();
+    expect(screen.getByText("Quality")).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: /Auto.*Selected/ })).toHaveAttribute(
+      "aria-current",
+      "true",
+    );
+  });
+
+  it("preserves Auto when playback changes from one quality to multiple qualities", () => {
+    const props = menuProps();
+    const { rerender } = render(createElement(QualityMenu, props));
+    expect(screen.getByRole("button", { name: "Version" })).toHaveTextContent("Version");
+    rerender(createElement(QualityMenu, { ...props, options: [auto, rung720] }));
+    fireEvent.click(screen.getByRole("button", { name: "Quality" }));
+    expect(screen.getByRole("menuitem", { name: /Auto.*Selected/ })).toBeInTheDocument();
+    expect(props.onSelect).not.toHaveBeenCalled();
+  });
+});
+
+describe("playback speed", () => {
+  it("keeps the menu for speed alone and picks a speed without closing it", () => {
+    const onPlaybackSpeedChange = vi.fn();
+    render(
+      createElement(
+        QualityMenu,
+        menuProps({ options: [rung720], versions: undefined, onPlaybackSpeedChange }),
+      ),
+    );
+    const trigger = screen.getByRole("button", { name: "Playback settings" });
+
+    fireEvent.click(trigger);
+    expect(screen.getByRole("group", { name: "Speed" })).toBeInTheDocument();
+    expect(screen.getAllByRole("menuitemradio")).toHaveLength(9);
+    expect(screen.getByRole("menuitemradio", { name: "1×" })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "1.5×" }));
+    expect(onPlaybackSpeedChange).toHaveBeenCalledExactlyOnceWith(1.5);
+    // The menu stays open so the viewer sees the speed take effect.
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+  });
+
+  it("moves between speeds with the left and right arrow keys", () => {
+    render(createElement(QualityMenu, menuProps({ onPlaybackSpeedChange: vi.fn() })));
+    fireEvent.click(screen.getByRole("button", { name: "Playback settings" }));
+    const half = screen.getByRole("menuitemradio", { name: "0.5×" });
+    half.focus();
+    fireEvent.keyDown(half, { key: "ArrowRight" });
+    expect(screen.getByRole("menuitemradio", { name: "0.75×" })).toHaveFocus();
+    fireEvent.keyDown(document.activeElement!, { key: "ArrowLeft" });
+    expect(half).toHaveFocus();
+  });
+
+  it("keeps focus in the menu when the track is pressed between stops", () => {
+    render(createElement(QualityMenu, menuProps({ onPlaybackSpeedChange: vi.fn() })));
+    fireEvent.click(screen.getByRole("button", { name: "Playback settings" }));
+    const track = screen.getByRole("menuitemradio", { name: "1×" }).parentElement!;
+    expect(fireEvent.pointerDown(track, { button: 0 })).toBe(false);
+    expect(
+      fireEvent.pointerDown(screen.getByRole("menuitemradio", { name: "2×" }), { button: 0 }),
+    ).toBe(true);
+  });
+
+  it("badges the gear with a speed other than 1x", () => {
+    const props = menuProps({
+      options: [auto, rung720],
+      activeId: "720p",
+      playbackSpeed: 1,
+      onPlaybackSpeedChange: vi.fn(),
+    });
+    const { rerender } = render(createElement(QualityMenu, props));
+    expect(screen.getByRole("button", { name: "Playback settings" })).toHaveTextContent(/^720p$/);
+
+    rerender(createElement(QualityMenu, { ...props, playbackSpeed: 1.5 }));
+    const trigger = screen.getByRole("button", { name: "Playback settings, 1.5×" });
+    expect(trigger.querySelector(".player-quality-label")).toHaveTextContent(/^720p$/);
+    expect(trigger.querySelector(".player-speed-badge")).toHaveTextContent(/^1\.5×$/);
   });
 });

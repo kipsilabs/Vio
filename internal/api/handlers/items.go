@@ -23,6 +23,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/artworkkey"
 	"github.com/Silo-Server/silo-server/internal/auth"
 	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/ctxerr"
 	evt "github.com/Silo-Server/silo-server/internal/events"
 	"github.com/Silo-Server/silo-server/internal/imagesize"
 	"github.com/Silo-Server/silo-server/internal/metadata"
@@ -104,8 +105,7 @@ type ItemsHandler struct {
 	detailSvc                *catalog.DetailService
 	storeProvider            userstore.UserStoreProvider
 	watchState               *watchstate.Service
-	profileStaler            ProfileStaler
-	profileRefreshRequester  ProfileRefreshRequester
+	signalsNotifier          SignalsChangedNotifier
 	metadataRefreshRequester MetadataRefreshRequester
 	trailerRefreshRequester  TrailerRefreshRequester
 	trailerItemAccess        trailerItemAccess
@@ -139,6 +139,9 @@ type ItemsHandler struct {
 	// concurrent init can never split them across channels.
 	virtualPrefetchLoadSem chan struct{}
 	prefetchSemOnce        sync.Once
+	MarkerImageURLs        interface {
+		ResolveURLs(context.Context, []string) map[string]catalog.ResolvedImageURL
+	}
 }
 
 // VirtualPrefetcher warms virtual playback listings off the click path.
@@ -202,14 +205,10 @@ func (h *ItemsHandler) SetCompletionObserver(obs watchstate.CompletionObserver) 
 	h.watchState.WithCompletionObserver(obs)
 }
 
-// SetProfileStaler configures an optional staleness trigger for taste profiles.
-func (h *ItemsHandler) SetProfileStaler(ps ProfileStaler) {
-	h.profileStaler = ps
-}
-
-// SetProfileRefreshRequester configures an optional background refresh queue for taste profiles.
-func (h *ItemsHandler) SetProfileRefreshRequester(requester ProfileRefreshRequester) {
-	h.profileRefreshRequester = requester
+// SetSignalsChangedNotifier configures where changes to a profile's
+// recommendation signals are reported. Without it they are not reported.
+func (h *ItemsHandler) SetSignalsChangedNotifier(notifier SignalsChangedNotifier) {
+	h.signalsNotifier = notifier
 }
 
 func (h *ItemsHandler) SetMetadataRefreshRequester(requester MetadataRefreshRequester) {
@@ -371,32 +370,36 @@ type itemListResponse struct {
 	// logo to the v2 card renderer. json:"-" because /api/v1 is frozen: the
 	// fields exist on the Go struct only, and apiv2 emits them under its own
 	// names.
-	AdvisoryAge       *int                        `json:"-"`
-	AdvisorySource    string                      `json:"-"`
-	Status            string                      `json:"status"`
-	ShowStatus        string                      `json:"show_status,omitempty"`
-	RatingIMDB        *float64                    `json:"rating_imdb,omitempty"`
-	RatingTMDB        *float64                    `json:"rating_tmdb,omitempty"`
-	RatingRTCritic    *int                        `json:"rating_rt_critic,omitempty"`
-	RatingRTAudience  *int                        `json:"rating_rt_audience,omitempty"`
-	OriginalLanguage  string                      `json:"original_language,omitempty"`
-	Overview          string                      `json:"overview,omitempty"`
-	PosterURL         string                      `json:"poster_url,omitempty"`
-	PosterThumbhash   string                      `json:"poster_thumbhash,omitempty"`
-	BackdropURL       string                      `json:"backdrop_url,omitempty"`
-	BackdropThumbhash string                      `json:"backdrop_thumbhash,omitempty"`
-	LogoURL           string                      `json:"-"`
-	ReleaseDate       *string                     `json:"release_date,omitempty"`
-	LastAirDate       *string                     `json:"last_air_date,omitempty"`
-	AddedAt           *time.Time                  `json:"added_at,omitempty"`
-	MangaChapterCount *int                        `json:"manga_chapter_count,omitempty"`
-	MangaVolumeCount  *int                        `json:"manga_volume_count,omitempty"`
-	OverlaySummary    *models.OverlaySummary      `json:"overlay_summary,omitempty"`
-	SortMetrics       *sortMetricsResponse        `json:"sort_metrics,omitempty"`
-	UserState         *itemUserStateResponse      `json:"user_state,omitempty"`
-	WorkID            string                      `json:"work_id,omitempty"`
-	WorkTitle         string                      `json:"work_title,omitempty"`
-	WorkFormats       []catalog.WorkFormatSummary `json:"work_formats,omitempty"`
+	AdvisoryAge            *int     `json:"-"`
+	AdvisorySource         string   `json:"-"`
+	Status                 string   `json:"status"`
+	ShowStatus             string   `json:"show_status,omitempty"`
+	RatingIMDB             *float64 `json:"rating_imdb,omitempty"`
+	RatingTMDB             *float64 `json:"rating_tmdb,omitempty"`
+	RatingRTCritic         *int     `json:"rating_rt_critic,omitempty"`
+	RatingRTAudience       *int     `json:"rating_rt_audience,omitempty"`
+	OriginalLanguage       string   `json:"original_language,omitempty"`
+	Overview               string   `json:"overview,omitempty"`
+	posterPath             string
+	backdropPath           string
+	PosterIsEpisodeStill   *bool                       `json:"-"`
+	BackdropIsEpisodeStill *bool                       `json:"-"`
+	PosterURL              string                      `json:"poster_url,omitempty"`
+	PosterThumbhash        string                      `json:"poster_thumbhash,omitempty"`
+	BackdropURL            string                      `json:"backdrop_url,omitempty"`
+	BackdropThumbhash      string                      `json:"backdrop_thumbhash,omitempty"`
+	LogoURL                string                      `json:"-"`
+	ReleaseDate            *string                     `json:"release_date,omitempty"`
+	LastAirDate            *string                     `json:"last_air_date,omitempty"`
+	AddedAt                *time.Time                  `json:"added_at,omitempty"`
+	MangaChapterCount      *int                        `json:"manga_chapter_count,omitempty"`
+	MangaVolumeCount       *int                        `json:"manga_volume_count,omitempty"`
+	OverlaySummary         *models.OverlaySummary      `json:"overlay_summary,omitempty"`
+	SortMetrics            *sortMetricsResponse        `json:"sort_metrics,omitempty"`
+	UserState              *itemUserStateResponse      `json:"user_state,omitempty"`
+	WorkID                 string                      `json:"work_id,omitempty"`
+	WorkTitle              string                      `json:"work_title,omitempty"`
+	WorkFormats            []catalog.WorkFormatSummary `json:"work_formats,omitempty"`
 }
 
 type sortMetricsResponse struct {
@@ -447,6 +450,8 @@ type seasonResponse struct {
 	PosterURL       string                  `json:"poster_url,omitempty"`
 	PosterThumbhash string                  `json:"poster_thumbhash,omitempty"`
 	UserData        *catalog.SeasonUserData `json:"user_data,omitempty"`
+	// MachineTranslatedFields reaches the v2 season row only; v1 is frozen.
+	MachineTranslatedFields []string `json:"-"`
 }
 
 // seasonsResponse wraps the seasons list for JSON serialization.
@@ -480,12 +485,13 @@ type episodeFileResponse struct {
 
 // episodeResponse is the shape of an episode in API responses.
 type episodeResponse struct {
-	ContentID     string `json:"content_id"`
-	SeasonNumber  int    `json:"season_number"`
-	EpisodeNumber int    `json:"episode_number"`
-	Title         string `json:"title"`
-	Overview      string `json:"overview,omitempty"`
-	AirDate       string `json:"air_date,omitempty"`
+	StillIsEpisodeStill *bool  `json:"-"`
+	ContentID           string `json:"content_id"`
+	SeasonNumber        int    `json:"season_number"`
+	EpisodeNumber       int    `json:"episode_number"`
+	Title               string `json:"title"`
+	Overview            string `json:"overview,omitempty"`
+	AirDate             string `json:"air_date,omitempty"`
 	// ReleaseState is the release timing derived from AirDate by
 	// EpisodeReleaseState: upcoming when the calendar date is after today
 	// (UTC), released otherwise, absent when the air date is unknown. The
@@ -501,6 +507,14 @@ type episodeResponse struct {
 	UserData       *catalog.SeasonUserData `json:"user_data,omitempty"`
 	Files          []episodeFileResponse   `json:"files,omitempty"`
 	OverlaySummary *models.OverlaySummary  `json:"overlay_summary,omitempty"`
+	// RatingIMDB and RatingTMDB feed the v2 episode's ratings; /api/v1 is
+	// frozen, so they stay off its wire.
+	RatingIMDB *float64 `json:"-"`
+	RatingTMDB *float64 `json:"-"`
+	// MachineTranslatedFields reaches the v2 episode row only; v1 is frozen.
+	MachineTranslatedFields []string `json:"-"`
+	// PendingTranslationLanguage reaches the v2 episode row only; v1 is frozen.
+	PendingTranslationLanguage string `json:"-"`
 }
 
 // Episode release states: release timing derived from an episode air date.
@@ -583,6 +597,7 @@ func (h *ItemsHandler) HandleGetWatchDetail(w http.ResponseWriter, r *http.Reque
 	if !ok {
 		return
 	}
+	filter.OmitWatchArtwork = true
 
 	detail, err := h.WatchDetail(r.Context(), apimw.GetUserID(r.Context()), requestProfileID(r), id, filter)
 	if err != nil {
@@ -1008,7 +1023,7 @@ func (h *ItemsHandler) writeCatalogBrowseResponse(w http.ResponseWriter, r *http
 	episodeMetadata := h.listEpisodeBrowseMetadata(r.Context(), result.Items)
 	items := make([]itemListResponse, 0, len(result.Items))
 	for _, item := range result.Items {
-		resp := h.toItemListResponseWithOverlay(r.Context(), viewer, item, overlaySummaries[item.ContentID], userStates[item.ContentID], filter.ImageSize)
+		resp := h.toItemListResponseWithOverlay(r.Context(), viewer, item, overlaySummaries[item.ContentID], userStates[item.ContentID], filter.Artwork())
 		// The resolver validated the item's own hint against this profile, so
 		// its answer replaces the unvalidated one carried by the item.
 		resp.PlayContentID = playTargets[playableTargetKeyForItem(item)]
@@ -1078,7 +1093,7 @@ func (h *ItemsHandler) resolvePlayableTargets(ctx context.Context, v ItemViewer,
 		ProgressStore: store,
 	})
 	if err != nil {
-		slog.WarnContext(ctx, "resolving playable poster targets", "component", "api", "error", err)
+		slog.Log(ctx, ctxerr.LogLevel(ctx, err, slog.LevelWarn), "resolving playable poster targets", "component", "api", "error", err)
 		return map[string]catalog.PlayableTarget{}
 	}
 	return targets
@@ -1155,25 +1170,27 @@ func (h *ItemsHandler) writeCatalogFiltersResponse(w http.ResponseWriter, r *htt
 
 // toItemListResponse converts a MediaItem to an itemListResponse with presigned
 // URLs at the size the caller's request asked for.
-func (h *ItemsHandler) toItemListResponse(ctx context.Context, v ItemViewer, item *models.MediaItem, size imagesize.Size) itemListResponse {
-	return h.toItemListResponseWithOverlay(ctx, v, item, nil, nil, size)
+func (h *ItemsHandler) toItemListResponse(ctx context.Context, v ItemViewer, item *models.MediaItem, art imagesize.Request) itemListResponse {
+	return h.toItemListResponseWithOverlay(ctx, v, item, nil, nil, art)
 }
 
-func (h *ItemsHandler) toItemListResponseWithOverlay(ctx context.Context, v ItemViewer, item *models.MediaItem, overlaySummary *models.OverlaySummary, userState *itemUserStateResponse, size imagesize.Size) itemListResponse {
+func (h *ItemsHandler) toItemListResponseWithOverlay(ctx context.Context, v ItemViewer, item *models.MediaItem, overlaySummary *models.OverlaySummary, userState *itemUserStateResponse, art imagesize.Request) itemListResponse {
 	if h.detailSvc != nil {
 		if localized, err := h.detailSvc.LocalizeItemModel(ctx, item, v.Access); err == nil && localized != nil {
 			item = localized
 		}
 	}
 	resp := itemListResponseShell(item, overlaySummary, userState)
-	hint := requestVariantHint("card", size)
-	resp.PosterURL = h.presignURLCtx(ctx, sizedCardPath(item.PosterPath, artworkkey.ImagePoster, size), hint)
-	resp.BackdropURL = h.presignURLCtx(ctx, sizedCardBackdropPath(item.BackdropPath, size), hint)
+	poster, backdrop := art.For(imagesize.SlotPoster), art.For(imagesize.SlotBackdrop)
+	resp.PosterURL = h.presignURLCtx(ctx, sizedCardPath(item.PosterPath, artworkkey.ImagePoster, poster), requestVariantHint("card", poster))
+	resp.BackdropURL = h.presignURLCtx(ctx, sizedCardBackdropPath(item.BackdropPath, backdrop), requestVariantHint("card", backdrop))
 	return resp
 }
 
 func itemListResponseShell(item *models.MediaItem, overlaySummary *models.OverlaySummary, userState *itemUserStateResponse) itemListResponse {
 	resp := itemListResponse{
+		posterPath:        item.PosterPath,
+		backdropPath:      item.BackdropPath,
 		ContentID:         item.ContentID,
 		PlayContentID:     item.PlayContentID,
 		Type:              item.Type,
@@ -1227,7 +1244,7 @@ func (h *ItemsHandler) localizeItemListModels(ctx context.Context, items []*mode
 	return localized
 }
 
-func (h *ItemsHandler) itemListCardImageURLs(ctx context.Context, items []*models.MediaItem, size imagesize.Size) map[string]itemListImageURLs {
+func (h *ItemsHandler) itemListCardImageURLs(ctx context.Context, items []*models.MediaItem, art imagesize.Request) map[string]itemListImageURLs {
 	urls := make(map[string]itemListImageURLs, len(items))
 	if h == nil || h.detailSvc == nil || len(items) == 0 {
 		return urls
@@ -1240,19 +1257,10 @@ func (h *ItemsHandler) itemListCardImageURLs(ctx context.Context, items []*model
 	}
 
 	pending := make([]pendingImages, 0, len(items))
-	paths := make([]string, 0, len(items)*2)
-	seenPaths := make(map[string]struct{}, len(items)*2)
 	logoPaths := make(map[string]string, len(items))
-	addPath := func(path string) {
-		if path == "" || path == "-" {
-			return
-		}
-		if _, ok := seenPaths[path]; ok {
-			return
-		}
-		seenPaths[path] = struct{}{}
-		paths = append(paths, path)
-	}
+	posterSize, backdropSize := art.For(imagesize.SlotPoster), art.For(imagesize.SlotBackdrop)
+	posterHint, backdropHint := requestVariantHint("card", posterSize), requestVariantHint("card", backdropSize)
+	var batch catalog.ArtworkBatch
 
 	for _, item := range items {
 		if item == nil || item.ContentID == "" {
@@ -1260,21 +1268,21 @@ func (h *ItemsHandler) itemListCardImageURLs(ctx context.Context, items []*model
 		}
 		images := pendingImages{
 			contentID:    item.ContentID,
-			posterPath:   sizedCardPath(item.PosterPath, artworkkey.ImagePoster, size),
-			backdropPath: sizedCardBackdropPath(item.BackdropPath, size),
+			posterPath:   sizedCardPath(item.PosterPath, artworkkey.ImagePoster, posterSize),
+			backdropPath: sizedCardBackdropPath(item.BackdropPath, backdropSize),
 		}
 		pending = append(pending, images)
-		addPath(images.posterPath)
-		addPath(images.backdropPath)
+		batch.Add(images.posterPath, posterHint)
+		batch.Add(images.backdropPath, backdropHint)
 		logoPaths[item.ContentID] = item.LogoPath
 	}
 
-	resolved := h.detailSvc.PresignURLsWithExpiry(ctx, paths, requestVariantHint("card", size))
-	logoURLs := signListingLogos(ctx, h.detailSvc, logoPaths, size)
+	resolved := batch.Resolve(ctx, h.detailSvc, requestVariantHint("card", art.Size))
+	logoURLs := signListingLogos(ctx, h.detailSvc, logoPaths, art.For(imagesize.SlotLogo))
 	for _, images := range pending {
 		urls[images.contentID] = itemListImageURLs{
-			posterURL:   resolved[images.posterPath].URL,
-			backdropURL: resolved[images.backdropPath].URL,
+			posterURL:   resolved.Get(images.posterPath, posterHint).URL,
+			backdropURL: resolved.Get(images.backdropPath, backdropHint).URL,
 			logoURL:     logoURLs[images.contentID],
 		}
 	}
@@ -1332,6 +1340,7 @@ func signListingLogos(ctx context.Context, svc *catalog.DetailService, logoPaths
 }
 
 type episodeBrowseMetadata struct {
+	StillPath     string
 	SeriesID      string
 	SeriesTitle   string
 	SeasonNumber  *int
@@ -1395,6 +1404,7 @@ func (h *ItemsHandler) listEpisodeBrowseMetadata(
 		seasonNumber := episode.SeasonNumber
 		episodeNumber := episode.EpisodeNumber
 		result[episode.ContentID] = episodeBrowseMetadata{
+			StillPath:     episode.StillPath,
 			SeriesID:      episode.SeriesID,
 			SeriesTitle:   seriesTitles[episode.SeriesID],
 			SeasonNumber:  &seasonNumber,
@@ -1429,16 +1439,22 @@ func episodeResponseShell(ep *models.Episode, fallback episodeImageFallback, siz
 		stillThumbhash = fallback.Thumbhash
 	}
 	resp := episodeResponse{
-		ContentID:      ep.ContentID,
-		SeasonNumber:   ep.SeasonNumber,
-		EpisodeNumber:  ep.EpisodeNumber,
-		Title:          ep.Title,
-		Overview:       ep.Overview,
-		Runtime:        ep.Runtime,
-		ImdbID:         ep.ImdbID,
-		TmdbID:         ep.TmdbID,
-		TvdbID:         ep.TvdbID,
-		StillThumbhash: stillThumbhash,
+		StillIsEpisodeStill: new(strings.TrimSpace(ep.StillPath) != ""),
+		ContentID:           ep.ContentID,
+		SeasonNumber:        ep.SeasonNumber,
+		EpisodeNumber:       ep.EpisodeNumber,
+		Title:               ep.Title,
+		Overview:            ep.Overview,
+		Runtime:             ep.Runtime,
+		ImdbID:              ep.ImdbID,
+		TmdbID:              ep.TmdbID,
+		TvdbID:              ep.TvdbID,
+		RatingIMDB:          ep.RatingIMDB,
+		RatingTMDB:          ep.RatingTMDB,
+		StillThumbhash:      stillThumbhash,
+
+		MachineTranslatedFields:    ep.MachineTranslatedFields,
+		PendingTranslationLanguage: ep.PendingTranslationLanguage,
 	}
 
 	if ep.AirDate != nil {
@@ -1454,7 +1470,7 @@ func episodeResponseShell(ep *models.Episode, fallback episodeImageFallback, siz
 // each resolve in one round-trip for the whole list instead of per episode.
 func (h *ItemsHandler) buildEpisodeResponses(ctx context.Context, v ItemViewer, episodes []*models.Episode) []episodeResponse {
 	filter := v.Access
-	size := filter.ImageSize
+	size := filter.ImageSizeFor(imagesize.SlotStill)
 
 	if h.detailSvc != nil {
 		if localized, err := h.detailSvc.LocalizeEpisodeModels(ctx, episodes, filter); err == nil && len(localized) == len(episodes) {
@@ -1724,6 +1740,9 @@ func (h *ItemsHandler) listAudiobookSortMetrics(
 		case "series":
 			resp.SeriesName = value
 		}
+	}
+	if err := rows.Err(); err != nil {
+		slog.Log(ctx, ctxerr.LogLevel(ctx, err, slog.LevelWarn), "listing audiobook sort metrics", "component", "api", "sort", sortField, "error", err)
 	}
 }
 
@@ -2038,6 +2057,8 @@ func (h *ItemsHandler) localizedSeasonResponse(
 		Overview:        s.Overview,
 		EpisodeCount:    episodeCount,
 		PosterThumbhash: s.PosterThumbhash,
+
+		MachineTranslatedFields: s.MachineTranslatedFields,
 	}
 	if s.AirDate != nil {
 		resp.AirDate = s.AirDate.Format("2006-01-02")
@@ -2482,6 +2503,8 @@ type AccessFilterOptions struct {
 	ScopeFilesToLibrary bool
 	// ImageSize is the artwork variant to presign; Unset picks defaults.
 	ImageSize imagesize.Size
+	// ImageWidths are per-slot target widths overriding ImageSize.
+	ImageWidths imagesize.Widths
 }
 
 // ContextAccessFilter is the viewer's access filter from the identity on the
@@ -2503,6 +2526,7 @@ func (h *ItemsHandler) ContextAccessFilter(ctx context.Context, opts AccessFilte
 			MetadataLanguageOverrides: scope.MetadataLanguageOverrides,
 			SelectedFileID:            opts.SelectedFileID,
 			ImageSize:                 opts.ImageSize,
+			ImageWidths:               opts.ImageWidths,
 			UserID:                    apimw.GetUserID(ctx),
 			ProfileID:                 apimw.GetProfileID(ctx),
 			DeviceID:                  opts.DeviceID,
@@ -2538,6 +2562,7 @@ func (h *ItemsHandler) ContextAccessFilter(ctx context.Context, opts AccessFilte
 		ScopeFilesToLibrary:   opts.ScopeFilesToLibrary,
 		SelectedFileID:        opts.SelectedFileID,
 		ImageSize:             opts.ImageSize,
+		ImageWidths:           opts.ImageWidths,
 		UserID:                apimw.GetUserID(ctx),
 		ProfileID:             apimw.GetProfileID(ctx),
 		DeviceID:              opts.DeviceID,
@@ -2624,37 +2649,33 @@ type watchedLeafTarget struct {
 	DurationSeconds float64
 }
 
-func (h *ItemsHandler) resolveWatchedTargets(ctx context.Context, contentID string, filter catalog.AccessFilter) (string, []watchedLeafTarget, error) {
+// watchedTarget is a watched-state target that exists and that the viewer
+// may see, before a season or series is expanded into its episodes.
+type watchedTarget struct {
+	Type    string
+	Item    *models.MediaItem
+	Season  *models.Season
+	Episode *models.Episode
+}
+
+// lookupWatchedTarget finds a movie, ebook, series, season or episode and
+// checks the viewer's access without loading a season's or series' episodes.
+// Any other item type is not found.
+func (h *ItemsHandler) lookupWatchedTarget(ctx context.Context, contentID string, filter catalog.AccessFilter) (watchedTarget, error) {
 	item, err := h.itemRepo.GetByID(ctx, contentID)
 	switch {
 	case err == nil:
 		if err := h.itemRepo.EnsureAccessible(ctx, contentID, filter); err != nil {
-			return "", nil, err
+			return watchedTarget{}, err
 		}
 		switch item.Type {
-		case "movie":
-			return "movie", []watchedLeafTarget{{
-				ContentID:       item.ContentID,
-				DurationSeconds: h.contentDurationSeconds(ctx, item.ContentID, "", item.Runtime),
-			}}, nil
-		case "ebook":
-			// Ebooks have no playback duration; read state is keyed off
-			// ebook_reader_progress, so the leaf target only carries the ID.
-			return "ebook", []watchedLeafTarget{{ContentID: item.ContentID}}, nil
-		case "series":
-			if h.episodeRepo == nil {
-				return "", nil, catalog.ErrItemNotFound
-			}
-			episodes, err := h.episodeRepo.ListBySeries(ctx, item.ContentID)
-			if err != nil {
-				return "", nil, err
-			}
-			return "series", h.episodeTargets(ctx, episodes), nil
+		case itemTypeMovie, itemTypeEbook, "series":
+			return watchedTarget{Type: item.Type, Item: item}, nil
 		default:
-			return "", nil, catalog.ErrItemNotFound
+			return watchedTarget{}, catalog.ErrItemNotFound
 		}
 	case !errors.Is(err, catalog.ErrItemNotFound):
-		return "", nil, err
+		return watchedTarget{}, err
 	}
 
 	if h.seasonRepo != nil {
@@ -2662,37 +2683,77 @@ func (h *ItemsHandler) resolveWatchedTargets(ctx context.Context, contentID stri
 		switch {
 		case err == nil:
 			if err := h.itemRepo.EnsureAccessible(ctx, season.SeriesID, filter); err != nil {
-				return "", nil, err
+				return watchedTarget{}, err
 			}
-			if h.episodeRepo == nil {
-				return "", nil, catalog.ErrItemNotFound
-			}
-			episodes, err := h.episodeRepo.ListBySeasonID(ctx, season.ContentID)
-			if err != nil {
-				return "", nil, err
-			}
-			return "season", h.episodeTargets(ctx, episodes), nil
+			return watchedTarget{Type: "season", Season: season}, nil
 		case !errors.Is(err, catalog.ErrSeasonNotFound):
-			return "", nil, err
+			return watchedTarget{}, err
 		}
 	}
 
 	if h.episodeRepo == nil {
-		return "", nil, catalog.ErrItemNotFound
+		return watchedTarget{}, catalog.ErrItemNotFound
 	}
 
 	episode, err := h.episodeRepo.GetByID(ctx, contentID)
 	if err != nil {
-		return "", nil, err
+		return watchedTarget{}, err
 	}
 	if err := h.itemRepo.EnsureAccessible(ctx, episode.SeriesID, filter); err != nil {
+		return watchedTarget{}, err
+	}
+	return watchedTarget{Type: itemTypeEpisode, Episode: episode}, nil
+}
+
+// resolveWatchedTargets checks access to contentID and resolves the leaf
+// targets a watched mark writes. Unwatching a series or season returns no
+// targets: the caller expands it with watchstate.ParentUnwatchTargets, which
+// also reaches watched episodes that no longer have a file.
+func (h *ItemsHandler) resolveWatchedTargets(ctx context.Context, contentID string, played bool, filter catalog.AccessFilter) (string, []watchedLeafTarget, error) {
+	target, err := h.lookupWatchedTarget(ctx, contentID, filter)
+	if err != nil {
 		return "", nil, err
 	}
-
-	return "episode", []watchedLeafTarget{{
-		ContentID:       episode.ContentID,
-		DurationSeconds: h.contentDurationSeconds(ctx, "", episode.ContentID, episode.Runtime),
-	}}, nil
+	switch target.Type {
+	case itemTypeMovie:
+		return itemTypeMovie, []watchedLeafTarget{{
+			ContentID:       target.Item.ContentID,
+			DurationSeconds: h.contentDurationSeconds(ctx, target.Item.ContentID, "", target.Item.Runtime),
+		}}, nil
+	case itemTypeEbook:
+		// Ebooks have no playback duration; read state is keyed off
+		// ebook_reader_progress, so the leaf target only carries the ID.
+		return itemTypeEbook, []watchedLeafTarget{{ContentID: target.Item.ContentID}}, nil
+	case "series":
+		if h.episodeRepo == nil {
+			return "", nil, catalog.ErrItemNotFound
+		}
+		if !played {
+			return "series", nil, nil
+		}
+		episodes, err := h.episodeRepo.ListBySeries(ctx, target.Item.ContentID)
+		if err != nil {
+			return "", nil, err
+		}
+		return "series", h.episodeTargets(ctx, episodes), nil
+	case "season":
+		if h.episodeRepo == nil {
+			return "", nil, catalog.ErrItemNotFound
+		}
+		if !played {
+			return "season", nil, nil
+		}
+		episodes, err := h.episodeRepo.ListBySeasonID(ctx, target.Season.ContentID)
+		if err != nil {
+			return "", nil, err
+		}
+		return "season", h.episodeTargets(ctx, episodes), nil
+	default:
+		return itemTypeEpisode, []watchedLeafTarget{{
+			ContentID:       target.Episode.ContentID,
+			DurationSeconds: h.contentDurationSeconds(ctx, "", target.Episode.ContentID, target.Episode.Runtime),
+		}}, nil
+	}
 }
 
 // episodeTargets resolves the watched leaf targets for a season or series.
@@ -2775,14 +2836,25 @@ func (h *ItemsHandler) canViewFilePaths(ctx context.Context) bool {
 		return false
 	}
 	if claims.Role == "admin" {
-		return true
+		// Only the acting admin sees paths by role. Another profile on the
+		// admin's account needs metadata curation assigned to the account,
+		// the bar the curation gate holds it to.
+		actingAdmin, err := apimw.ActingAdmin(ctx)
+		if err != nil {
+			slog.WarnContext(ctx, "checking file path visibility for an admin account", "component", "api", "user_id", claims.UserID, "error", err)
+			return false
+		}
+		if actingAdmin {
+			return true
+		}
+		return h.hasAssignedMetadataCuration(ctx, claims.UserID)
 	}
 	if h == nil || h.UserRepo == nil {
 		return false
 	}
 	user, err := h.UserRepo.GetByID(ctx, claims.UserID)
 	if err != nil {
-		slog.WarnContext(ctx, "checking file path visibility permissions", "component", "api", "user_id", claims.UserID, "error", err)
+		slog.Log(ctx, ctxerr.LogLevel(ctx, err, slog.LevelWarn), "checking file path visibility permissions", "component", "api", "user_id", claims.UserID, "error", err)
 		return false
 	}
 	return auth.HasEffectivePermission(user, auth.PermissionMetadataCuration)
@@ -2817,4 +2889,19 @@ func (h *ItemsHandler) HandleDelete(w http.ResponseWriter, r *http.Request) {
 		"images_cleaned": len(images),
 		"message":        "Media item deleted successfully",
 	})
+}
+
+// hasAssignedMetadataCuration reports whether the account has metadata
+// curation assigned explicitly, not by its admin role. A failed lookup fails
+// closed.
+func (h *ItemsHandler) hasAssignedMetadataCuration(ctx context.Context, userID int) bool {
+	if h == nil || h.UserRepo == nil {
+		return false
+	}
+	user, err := h.UserRepo.GetByID(ctx, userID)
+	if err != nil {
+		slog.WarnContext(ctx, "checking file path visibility permissions", "component", "api", "user_id", userID, "error", err)
+		return false
+	}
+	return user != nil && user.Enabled && auth.HasAssignedPermission(user, auth.PermissionMetadataCuration)
 }

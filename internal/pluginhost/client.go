@@ -110,16 +110,14 @@ func newClient(installationID int, rpc *sdkruntime.Client, manifest *pluginv1.Pl
 	return &Client{
 		installationID: installationID,
 		startSeq:       startSeq,
-		manifest:       proto.Clone(manifest).(*pluginv1.PluginManifest),
+		manifest:       proto.CloneOf(manifest),
 		rpc:            rpc,
 		capabilities:   capabilities,
 	}
 }
 
 func (c *Client) Manifest() *pluginv1.PluginManifest {
-	manifest := &pluginv1.PluginManifest{}
-	proto.Merge(manifest, c.manifest)
-	return manifest
+	return proto.CloneOf(c.manifest)
 }
 
 func (c *Client) Capabilities() []*pluginv1.CapabilityDescriptor {
@@ -128,9 +126,7 @@ func (c *Client) Capabilities() []*pluginv1.CapabilityDescriptor {
 
 	result := make([]*pluginv1.CapabilityDescriptor, 0, len(c.capabilities))
 	for _, capability := range c.capabilities {
-		clone := &pluginv1.CapabilityDescriptor{}
-		proto.Merge(clone, capability)
-		result = append(result, clone)
+		result = append(result, proto.CloneOf(capability))
 	}
 	return result
 }
@@ -153,6 +149,12 @@ func (c *Client) ImageResolver(capabilityID string) (*ImageResolverClient, error
 		client:  c.rpc.ImageResolver(),
 		timeout: DefaultMetadataTimeout,
 	}, nil
+}
+
+// NewMarkerProviderClient wraps a marker provider connection with the default
+// call timeout, for callers that hold the gRPC client directly.
+func NewMarkerProviderClient(client pluginv1.MarkerProviderClient) *MarkerProviderClient {
+	return &MarkerProviderClient{client: client, timeout: DefaultMarkerProviderTimeout}
 }
 
 func (c *Client) MarkerProvider(capabilityID string) (*MarkerProviderClient, error) {

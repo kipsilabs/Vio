@@ -57,7 +57,7 @@ func (f *fakeCatalogActions) RequestTrailersRefresh(_ context.Context, userID in
 	return handlers.TrailerRefreshView{}, notFoundItem()
 }
 
-func (f *fakeCatalogActions) Status() handlers.MetadataAIStatusView {
+func (f *fakeCatalogActions) Status(context.Context) handlers.MetadataAIStatusView {
 	if !f.enabled {
 		return handlers.MetadataAIStatusView{OnView: "off"}
 	}
@@ -92,7 +92,7 @@ func (f *fakeCatalogActions) SearchPeopleScoped(_ context.Context, query string,
 	f.lastUser = limit
 	f.lastMediaScope = mediaScope
 	f.lastFilter = filter
-	if strings.HasPrefix("al pacino", strings.ToLower(query)) {
+	if strings.HasPrefix("al pacino", strings.ToLower(query)) { //nolint:gocritic // the fake matches a typed prefix of the name
 		return []handlers.PersonView{fakePerson(7)}, nil
 	}
 	return nil, nil

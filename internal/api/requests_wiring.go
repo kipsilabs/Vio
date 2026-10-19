@@ -272,6 +272,8 @@ func (a PluginRequestRouterAdapter) RouterFeatures(ctx context.Context, installa
 	return mediarequests.RouterFeatures{
 		SupportsSeasons:         descriptor.GetSupportsSeasons(),
 		ReportsDownloadProgress: descriptor.GetReportsDownloadProgress(),
+		APIKeyOptional:          descriptor.GetApiKeyOptional(),
+		BaseURLOptional:         descriptor.GetBaseUrlOptional(),
 	}, nil
 }
 

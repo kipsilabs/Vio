@@ -16,7 +16,6 @@ import type {
   ImportMDBListCollectionRequest,
   ImportTMDBCollectionRequest,
   ImportTMDBListCollectionRequest,
-  ImportTraktCollectionRequest,
   UpdateLibraryCollectionRequest,
 } from "@/api/types";
 import { requiredETag } from "@/api/v2/etag";
@@ -545,46 +544,6 @@ export function useImportTMDBListCollection() {
           ? "TMDB list imported with warnings"
           : "TMDB list imported",
       );
-      void invalidateAdminCollectionQueries(queryClient);
-    },
-    onError: (error) => {
-      toast.error(error instanceof Error ? error.message : "Import failed");
-    },
-  });
-}
-
-export function useImportTraktCollection() {
-  const queryClient = useQueryClient();
-
-  return useMutation({
-    retry: false,
-    mutationFn: ({
-      body,
-      poster,
-      backdrop,
-    }: {
-      body: ImportTraktCollectionRequest;
-      poster?: File | null;
-      backdrop?: File | null;
-    }) => {
-      return v2("POST /api/v2/admin/collections/import/trakt", {
-        body: {
-          ...adminImportBody(body),
-          profile_id: body.profile_id === undefined ? undefined : String(body.profile_id),
-        },
-      }).then(async (result) => ({
-        ...result,
-        ...(await saveAdminArtwork(result.collection, body, poster, backdrop)),
-      }));
-    },
-    onSuccess: (result) => {
-      showArtworkErrors(result);
-      const statusMessages: Record<string, string> = {
-        warning: "Trakt collection imported with warnings",
-        failed: "Trakt collection imported but sync failed",
-      };
-      const status = result.sync_run?.status ?? "";
-      toast.success(statusMessages[status] ?? "Trakt collection imported");
       void invalidateAdminCollectionQueries(queryClient);
     },
     onError: (error) => {

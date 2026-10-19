@@ -207,7 +207,7 @@ func (h *CatalogHandler) catalogItemResponses(ctx context.Context, v ItemViewer,
 	responseWG.Add(2)
 	go func() {
 		defer responseWG.Done()
-		imageURLs = h.itemsH.itemListCardImageURLs(ctx, localizedItems, accessFilter.ImageSize)
+		imageURLs = h.itemsH.itemListCardImageURLs(ctx, localizedItems, accessFilter.Artwork())
 	}()
 	go func() {
 		defer responseWG.Done()
@@ -249,6 +249,8 @@ func applyEpisodeBrowseMetadata(resp *itemListResponse, meta episodeBrowseMetada
 	if resp == nil {
 		return
 	}
+	resp.PosterIsEpisodeStill = new(meta.StillPath != "" && resp.posterPath == meta.StillPath)
+	resp.BackdropIsEpisodeStill = new(meta.StillPath != "" && resp.backdropPath == meta.StillPath)
 	resp.SeriesID = meta.SeriesID
 	resp.SeriesTitle = meta.SeriesTitle
 	resp.SeasonNumber = meta.SeasonNumber
@@ -705,7 +707,7 @@ func (h *CatalogHandler) HandleLegacySearch(w http.ResponseWriter, r *http.Reque
 	userStates := h.itemsH.listItemUserStates(r.Context(), viewerFromRequest(r, accessFilter), items)
 	resp := make([]itemListResponse, 0, len(items))
 	for _, item := range items {
-		resp = append(resp, h.itemsH.toItemListResponseWithOverlay(r.Context(), viewerFromRequest(r, accessFilter), item, nil, userStates[item.ContentID], accessFilter.ImageSize))
+		resp = append(resp, h.itemsH.toItemListResponseWithOverlay(r.Context(), viewerFromRequest(r, accessFilter), item, nil, userStates[item.ContentID], accessFilter.Artwork()))
 	}
 
 	writeJSON(w, http.StatusOK, browseResponse{

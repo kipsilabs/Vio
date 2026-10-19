@@ -229,6 +229,8 @@ func TestLibraryMetadataMatchQueueHandlers_NilFolderRepo(t *testing.T) {
 
 type noopMovieMatchQueue struct{}
 
+func (noopMovieMatchQueue) EnqueueMovieFile(context.Context, int) error { return nil }
+
 func (noopMovieMatchQueue) SyncForFolder(context.Context, int) error {
 	return nil
 }
@@ -260,7 +262,8 @@ type fakeMovieMatchQueue struct {
 	bulkCalls    int
 }
 
-func (f *fakeMovieMatchQueue) SyncForFolder(context.Context, int) error { return nil }
+func (f *fakeMovieMatchQueue) EnqueueMovieFile(context.Context, int) error { return nil }
+func (f *fakeMovieMatchQueue) SyncForFolder(context.Context, int) error    { return nil }
 func (f *fakeMovieMatchQueue) DeleteByFolder(context.Context, int) (int, error) {
 	return 0, nil
 }
@@ -291,7 +294,9 @@ type fakeSeriesMatchQueue struct {
 	bulkCalls    int
 }
 
-func (f *fakeSeriesMatchQueue) SyncForFolder(context.Context, int) error { return nil }
+func (f *fakeSeriesMatchQueue) EnqueueSeriesRoot(context.Context, int, string) error { return nil }
+func (f *fakeSeriesMatchQueue) WakeRoot(context.Context, int, string) error          { return nil }
+func (f *fakeSeriesMatchQueue) SyncForFolder(context.Context, int) error             { return nil }
 func (f *fakeSeriesMatchQueue) DeleteByFolder(context.Context, int) (int, error) {
 	return 0, nil
 }

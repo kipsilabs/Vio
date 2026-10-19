@@ -124,12 +124,11 @@ func (p *Provider) Search(ctx context.Context, req subtitles.SearchRequest) ([]s
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("opensubtitles: search returned %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("opensubtitles: search returned %d: %s", resp.StatusCode, subtitles.ProviderErrorBody(resp.Body))
 	}
 
 	var searchResp searchResponse
-	if err := json.NewDecoder(resp.Body).Decode(&searchResp); err != nil {
+	if err := json.NewDecoder(subtitles.LimitProviderResponse(resp.Body)).Decode(&searchResp); err != nil {
 		return nil, fmt.Errorf("opensubtitles: decode response: %w", err)
 	}
 
@@ -201,8 +200,7 @@ func (p *Provider) Download(ctx context.Context, id string) ([]byte, subtitles.S
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return nil, "", fmt.Errorf("opensubtitles: download returned %d: %s", resp.StatusCode, string(respBody))
+		return nil, "", fmt.Errorf("opensubtitles: download returned %d: %s", resp.StatusCode, subtitles.ProviderErrorBody(resp.Body))
 	}
 
 	return p.fetchDownloadLink(ctx, resp.Body)
@@ -227,8 +225,7 @@ func (p *Provider) downloadWithToken(ctx context.Context, fileID int, token stri
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return nil, "", fmt.Errorf("opensubtitles: download returned %d: %s", resp.StatusCode, string(respBody))
+		return nil, "", fmt.Errorf("opensubtitles: download returned %d: %s", resp.StatusCode, subtitles.ProviderErrorBody(resp.Body))
 	}
 
 	return p.fetchDownloadLink(ctx, resp.Body)
@@ -236,7 +233,7 @@ func (p *Provider) downloadWithToken(ctx context.Context, fileID int, token stri
 
 func (p *Provider) fetchDownloadLink(ctx context.Context, body io.Reader) ([]byte, subtitles.SubtitleFormat, error) {
 	var dlResp downloadResponse
-	if err := json.NewDecoder(body).Decode(&dlResp); err != nil {
+	if err := json.NewDecoder(subtitles.LimitProviderResponse(body)).Decode(&dlResp); err != nil {
 		return nil, "", fmt.Errorf("opensubtitles: decode download response: %w", err)
 	}
 
@@ -252,7 +249,7 @@ func (p *Provider) fetchDownloadLink(ctx context.Context, body io.Reader) ([]byt
 	}
 	defer func() { _ = fileResp.Body.Close() }()
 
-	data, err := io.ReadAll(fileResp.Body)
+	data, err := subtitles.ReadProviderResponse(fileResp.Body)
 	if err != nil {
 		return nil, "", fmt.Errorf("opensubtitles: read file: %w", err)
 	}
@@ -289,12 +286,11 @@ func (p *Provider) ensureToken(ctx context.Context) (string, error) {
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("login returned %d: %s", resp.StatusCode, string(respBody))
+		return "", fmt.Errorf("login returned %d: %s", resp.StatusCode, subtitles.ProviderErrorBody(resp.Body))
 	}
 
 	var loginResp loginResponse
-	if err := json.NewDecoder(resp.Body).Decode(&loginResp); err != nil {
+	if err := json.NewDecoder(subtitles.LimitProviderResponse(resp.Body)).Decode(&loginResp); err != nil {
 		return "", fmt.Errorf("decode login response: %w", err)
 	}
 
