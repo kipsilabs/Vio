@@ -122,6 +122,10 @@ func TestDiscoverVirtualCandidatesSettingAndAccess(t *testing.T) {
 		if response.Code != http.StatusNoContent || discovery.calls != 1 || discovery.userID != 1 || discovery.profileID != "p-owner" || discovery.contentID != "movie:heat-1995" {
 			t.Fatalf("status=%d discovery=%+v", response.Code, discovery)
 		}
+		// An empty candidate list is a successful discovery (the fake returns
+		// nil versions); provider unavailability stays a retryable 503.
+		discovery.err = &handlers.APIError{Status: http.StatusServiceUnavailable, Code: "unavailable", Message: "The provider could not be reached; try again."}
+		requireProblem(t, do(t, handler, http.MethodPost, endpoint, "", owner), TypeDependencyUnavailable)
 		discovery.err = &handlers.APIError{Status: http.StatusNotFound, Code: "not_found", Message: "Watch target not found"}
 		requireProblem(t, do(t, handler, http.MethodPost, endpoint, "", owner), TypeNotFound)
 	}
