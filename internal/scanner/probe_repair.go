@@ -313,7 +313,7 @@ func ProbeVirtualSource(
 	if file == nil {
 		return nil, nil
 	}
-	probe, err := probeFile(ctx, ffprobePath, sourceURL, false)
+	probe, err := ProbeFile(ctx, ffprobePath, sourceURL)
 	if err != nil {
 		return file, err
 	}

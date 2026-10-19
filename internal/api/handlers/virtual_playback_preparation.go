@@ -28,7 +28,6 @@ type VirtualPlaybackPreparationService struct {
 	AllowPrivate func(context.Context) bool
 	Claim        func(context.Context, string, time.Duration) (bool, error)
 	Context      context.Context
-	Probe        VirtualPlaybackSourceProberWithHeaders
 
 	once        sync.Once
 	active      chan struct{}
@@ -159,15 +158,6 @@ func (s *VirtualPlaybackPreparationService) prepare(ctx context.Context, file *m
 		slog.DebugContext(ctx, "early stream preparation skipped", "component", "api", "file_id", file.ID, "reason", "provider_url_rejected")
 		return
 	}
-	if s.Probe != nil {
-		var probes sync.WaitGroup
-		probes.Add(1)
-		go func() {
-			defer probes.Done()
-			s.prepareProbe(ctx, file, providerURL, candidate)
-		}()
-		defer probes.Wait()
-	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, providerURL, nil)
 	if err != nil {
 		slog.DebugContext(ctx, "early stream preparation did not complete", "component", "api", "file_id", file.ID, "reason", "request_invalid")
@@ -197,19 +187,6 @@ func (s *VirtualPlaybackPreparationService) prepare(ctx context.Context, file *m
 		return
 	}
 	slog.DebugContext(ctx, "early stream preparation received a byte", "component", "api", "file_id", file.ID)
-}
-
-func (s *VirtualPlaybackPreparationService) prepareProbe(ctx context.Context, file *models.MediaFile, providerURL string, candidate VirtualPlaybackStream) {
-	probeFile := cloneVirtualProbeTransient(*file)
-	probeFile.Duration = 0
-	forwardVirtualCandidateDeclaredAudio(&probeFile, candidate)
-	slog.DebugContext(ctx, "early stream preparation probe started", "component", "api", "file_id", file.ID)
-	probed, probeErr := s.Probe(ctx, providerURL, &probeFile, cloneHeaderMap(candidate.RequestHeaders))
-	if probeErr != nil || probed == nil {
-		slog.DebugContext(ctx, "early stream preparation probe did not complete", "component", "api", "file_id", file.ID)
-		return
-	}
-	slog.DebugContext(ctx, "early stream preparation warmed probe metadata", "component", "api", "file_id", file.ID)
 }
 
 func selectedVirtualPreparationCandidate(file *models.MediaFile, streams []VirtualPlaybackStream) (VirtualPlaybackStream, bool) {

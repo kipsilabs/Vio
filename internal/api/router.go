@@ -3342,9 +3342,6 @@ func newChiRouter(deps Dependencies) chi.Router {
 				return deps.RedisClient.SetNX(ctx, key, "1", ttl).Result()
 			}
 		}
-		if playbackHandler != nil {
-			preparation.Probe = playbackHandler.VirtualPlaybackSourceProberWithHeaders
-		}
 		v2deps.VirtualPlaybackPreparation = preparation
 	}
 	if virtualIndexerReleases != nil {

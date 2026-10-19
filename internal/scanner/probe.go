@@ -122,10 +122,6 @@ func buildProbeArgs(filePath string) []string {
 // ProbeFile runs ffprobe on the given file and returns parsed ProbeData.
 // ffprobePath is the path to the ffprobe binary. filePath is the media file to probe.
 func ProbeFile(ctx context.Context, ffprobePath string, filePath string) (*ProbeData, error) {
-	return probeFile(ctx, ffprobePath, filePath, true)
-}
-
-func probeFile(ctx context.Context, ffprobePath string, filePath string, repairDuration bool) (*ProbeData, error) {
 	cmd := exec.CommandContext(ctx, ffprobePath, buildProbeArgs(filePath)...)
 
 	output := &boundedProbeBuffer{limit: maxFFprobeOutputBytes}
@@ -166,7 +162,7 @@ func probeFile(ctx context.Context, ffprobePath string, filePath string, repairD
 
 	probe := convertProbeData(&raw)
 	applyMatroskaSubtitleTrackIDs(ctx, filePath, probe)
-	if repairDuration && probe.Duration == 0 {
+	if probe.Duration == 0 {
 		if frameRate, hasVideo := primaryVideoFrameRate(raw.Streams); hasVideo {
 			// A failed or empty packet scan must not discard the codec and
 			// track metadata that already parsed successfully: callers persist

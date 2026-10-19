@@ -100,23 +100,6 @@ func PersistedCandidateIdentityFromContext(ctx context.Context) (PersistedCandid
 	return persistedCandidateIdentityFromContext(ctx)
 }
 
-type explicitCandidateSelectionContextKey struct{}
-
-func WithExplicitCandidateSelection(ctx context.Context, explicit bool) context.Context {
-	if ctx == nil {
-		return ctx
-	}
-	return context.WithValue(ctx, explicitCandidateSelectionContextKey{}, explicit)
-}
-
-func explicitCandidateSelectionFromContext(ctx context.Context) bool {
-	if ctx == nil {
-		return false
-	}
-	explicit, _ := ctx.Value(explicitCandidateSelectionContextKey{}).(bool)
-	return explicit
-}
-
 type persistedCandidateTrustContextKey struct{}
 
 // WithPersistedCandidateTrust marks a resolve as allowed to keep trusting the
@@ -626,9 +609,13 @@ func (s *Service) ResolveDetailed(
 
 	// pinnedRelease is the identity contract for a release the viewer is
 	// already bound to: a live session serving it (sessionBound), or an
-	// explicitly selected candidate, independently of cached URL trust. Either
-	// must rematch by durable identity or refuse, never substitute a sibling.
-	pinnedRelease := sessionBound || explicitCandidateSelectionFromContext(ctx) || persistedCandidateTrustFromContext(ctx)
+	// explicitly selected persisted candidate inside its trust window
+	// (WithPersistedCandidateTrust, which the caller threads only for an
+	// explicit pick or a session binding). Either must rematch by durable
+	// identity or refuse; neither may silently substitute a sibling. Outside
+	// the window an explicit pick carries no trust, so today's fallback
+	// behavior is unchanged.
+	pinnedRelease := sessionBound || persistedCandidateTrustFromContext(ctx)
 
 	// A quality profile is a selection preference, not a gate on a release the
 	// viewer is already bound to. When the pinned candidate still exists in the
