@@ -251,8 +251,12 @@ func TestServeExtractTextWindowedMissWarmsOnce(t *testing.T) {
 
 	windowed := StreamExtractOpts{InputPath: source, SourceCodec: "subrip", SeekSeconds: 100, DurationSeconds: 3600}
 	for i := 0; i < 4; i++ {
+		// Distinct windows: an exact repeat would be served from the last-good
+		// window cache instead of exercising the pre-warm path.
+		next := windowed
+		next.SeekSeconds = windowed.SeekSeconds + float64(i)
 		rec := httptest.NewRecorder()
-		if err := c.ServeExtract(rec, httptest.NewRequest(http.MethodGet, "/subtitle", nil), windowed, extract); err != nil {
+		if err := c.ServeExtract(rec, httptest.NewRequest(http.MethodGet, "/subtitle", nil), next, extract); err != nil {
 			t.Fatal(err)
 		}
 		if rec.Body.String() != "WINDOW SLICE" {
@@ -280,9 +284,11 @@ func TestServeExtractTextWindowedMissWarmsOnce(t *testing.T) {
 	}
 	mu.Unlock()
 
-	// Warm committed → the next windowed request reads the cached artifact.
+	// Warm committed → a fresh window reads the cached artifact.
+	postWarm := windowed
+	postWarm.SeekSeconds = 500
 	rec := httptest.NewRecorder()
-	if err := c.ServeExtract(rec, httptest.NewRequest(http.MethodGet, "/subtitle", nil), windowed, extract); err != nil {
+	if err := c.ServeExtract(rec, httptest.NewRequest(http.MethodGet, "/subtitle", nil), postWarm, extract); err != nil {
 		t.Fatal(err)
 	}
 	mu.Lock()
@@ -1722,8 +1728,12 @@ func TestServeExtractResultReportsCommittedArtifact(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	// A different window avoids the exact last-good slice cached by the cold
+	// miss above, so this serve exercises the committed-artifact input path.
+	postCommit := windowed
+	postCommit.SeekSeconds = 30
 	var served StreamExtractOpts
-	result, err = c.ServeExtractWithResult(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/subtitle.ass", nil), windowed, func(_ context.Context, o StreamExtractOpts) error {
+	result, err = c.ServeExtractWithResult(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/subtitle.ass", nil), postCommit, func(_ context.Context, o StreamExtractOpts) error {
 		served = o
 		_, err := io.WriteString(o.Writer, "SLICE")
 		return err
