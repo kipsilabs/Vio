@@ -1171,6 +1171,7 @@ func (s *Service) ServeDirect(ctx context.Context, w http.ResponseWriter, r *htt
 	if err != nil {
 		return err
 	}
+	notifyServeAuthorized(ctx, *target)
 	return s.serveLocalFile(ctx, w, r, target.Path, userID)
 }
 
@@ -1244,6 +1245,7 @@ func (s *Service) ServeFile(ctx context.Context, w http.ResponseWriter, r *http.
 		if err != nil {
 			return err
 		}
+		notifyServeAuthorized(ctx, *target)
 		return s.serveFileTarget(ctx, w, r, target, userID)
 	}
 
@@ -1498,6 +1500,7 @@ func (s *Service) serveDownloadBytes(ctx context.Context, w http.ResponseWriter,
 	if err != nil {
 		return err
 	}
+	notifyServeAuthorized(ctx, *target)
 	return s.serveFileTarget(ctx, w, r, target, userID)
 }
 
