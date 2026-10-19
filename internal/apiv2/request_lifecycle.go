@@ -187,13 +187,13 @@ func registerRequestLifecycle(reg *Registry, requests RequestLifecycleService, p
 		}
 		status, err := requests.GetFeatureStatus(ctx, lifecycleViewer(ctx))
 		if err != nil {
-			return nil, requestProblem(err)
+			return nil, requestProblem(ctx, err)
 		}
 		allowed := false
 		if status.RequestsEnabled {
 			allowed, err = requests.RequestCapabilityAllowed(ctx, lifecycleViewer(ctx))
 			if err != nil {
-				return nil, requestProblem(err)
+				return nil, requestProblem(ctx, err)
 			}
 		}
 		return &RequestFeatureStatusOutput{Body: FeatureStatus{Capability: Capability{State: enabledCapabilityState(status.RequestsEnabled), Allowed: &allowed}, RequestsEnabled: status.RequestsEnabled, RatingRestrictionsEnforced: status.RatingRestrictionsEnforced, FollowSupported: true, SeasonRequestsSupported: true, MissingSeasonsRequestable: status.MissingSeasonsRequestable, DownloadProgressSupported: true,
@@ -206,7 +206,7 @@ func registerRequestLifecycle(reg *Registry, requests RequestLifecycleService, p
 		viewer := lifecycleViewer(ctx)
 		result, err := requests.Cancel(ctx, viewer, string(in.ID), in.Body.Reason)
 		if err != nil {
-			return nil, requestProblem(err)
+			return nil, requestProblem(ctx, err)
 		}
 		return &MediaRequestOutput{Body: mediaRequestOf(result, viewer)}, nil
 	})

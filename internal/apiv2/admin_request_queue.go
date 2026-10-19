@@ -98,7 +98,7 @@ func (reg *Registry) getAdminRequestCounts(ctx context.Context, _ *struct{}) (*A
 	}
 	c, err := s.CountAdminViews(ctx, adminRequestViewer(ctx))
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	return &AdminRequestCountsOutput{Body: AdminRequestCounts{NeedsApproval: c.NeedsApproval, InProgress: c.InProgress, Failed: c.Failed, Done: c.Done}}, nil
 }
@@ -110,7 +110,7 @@ func (reg *Registry) listAdminRequestEvents(ctx context.Context, in *MediaReques
 	}
 	events, err := s.ListRequestEvents(ctx, adminRequestViewer(ctx), string(in.ID))
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	items := make([]AdminRequestEvent, 0, len(events))
 	for _, e := range events {

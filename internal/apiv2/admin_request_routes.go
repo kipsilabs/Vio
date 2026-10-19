@@ -283,7 +283,7 @@ func (reg *Registry) getAdminRequestRouting(ctx context.Context, _ *struct{}) (*
 	}
 	o, err := s.GetRoutingOverview(ctx, adminRequestViewer(ctx))
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	return &AdminRequestRoutingOutput{ETag: routingTag(ctx, *o).String(), Body: adminRequestRoutingOf(*o)}, nil
 }
@@ -296,7 +296,7 @@ func (reg *Registry) updateAdminRequestRouting(ctx context.Context, in *AdminReq
 	v := adminRequestViewer(ctx)
 	current, err := s.GetRoutingOverview(ctx, v)
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	rev, p := adminRequestGuard(AdminRequestPreconditions{in.IfMatch, in.IfNoneMatch}, routingTag(ctx, *current), current.Revision)
 	if p != nil {
@@ -306,12 +306,12 @@ func (reg *Registry) updateAdminRequestRouting(ctx context.Context, in *AdminReq
 	if errors.Is(err, mediarequests.ErrStaleRevision) {
 		latest, e := s.GetRoutingOverview(ctx, v)
 		if e != nil {
-			return nil, requestProblem(e)
+			return nil, requestProblem(ctx, e)
 		}
 		return nil, NewProblem(TypePreconditionFailed, "Request routing changed; reload before saving.").WithHeader("ETag", routingTag(ctx, *latest).String())
 	}
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	return &AdminRequestRoutingOutput{ETag: routingTag(ctx, *o).String(), Body: adminRequestRoutingOf(*o)}, nil
 }
@@ -356,7 +356,7 @@ func (reg *Registry) listAdminRequestRoutes(ctx context.Context, _ *struct{}) (*
 	}
 	routes, err := s.ListRoutesAdmin(ctx, adminRequestViewer(ctx))
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	items := make([]AdminRequestRoute, 0, len(routes))
 	for _, r := range routes {
@@ -372,7 +372,7 @@ func (reg *Registry) getAdminRequestRoute(ctx context.Context, in *AdminRequestR
 	}
 	r, err := s.GetRoute(ctx, adminRequestViewer(ctx), in.ID)
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	return &AdminRequestRouteOutput{ETag: routeTag(ctx, *r).String(), Body: adminRequestRouteOf(*r)}, nil
 }
@@ -384,7 +384,7 @@ func (reg *Registry) createAdminRequestRoute(ctx context.Context, in *AdminReque
 	}
 	r, err := s.CreateRoute(ctx, adminRequestViewer(ctx), in.Body.domain(""))
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	return &AdminRequestRouteCreateOutput{Location: Prefix + "/admin/request-routes/" + r.ID, ETag: routeTag(ctx, *r).String(), Body: adminRequestRouteOf(*r)}, nil
 }
@@ -394,7 +394,7 @@ func (reg *Registry) createAdminRequestRoute(ctx context.Context, in *AdminReque
 func (reg *Registry) currentRouteRevision(ctx context.Context, s adminRequestRoutes, id string) (EntityTag, int64, *Problem) {
 	current, err := s.GetRoute(ctx, adminRequestViewer(ctx), id)
 	if err != nil {
-		return EntityTag{}, 0, requestProblem(err)
+		return EntityTag{}, 0, requestProblem(ctx, err)
 	}
 	return routeTag(ctx, *current), current.Revision, nil
 }
@@ -421,7 +421,7 @@ func (reg *Registry) updateAdminRequestRoute(ctx context.Context, in *AdminReque
 		return nil, NewProblem(TypePreconditionFailed, "The routing rule changed; reload before saving.").WithHeader("ETag", current.String())
 	}
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	return &AdminRequestRouteOutput{ETag: routeTag(ctx, *r).String(), Body: adminRequestRouteOf(*r)}, nil
 }
@@ -433,7 +433,7 @@ func (reg *Registry) deleteAdminRequestRoute(ctx context.Context, in *AdminReque
 	}
 	current, err := s.GetRoute(ctx, adminRequestViewer(ctx), in.ID)
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	rev, p := adminRequestGuard(AdminRequestPreconditions{in.IfMatch, in.IfNoneMatch}, routeTag(ctx, *current), current.Revision)
 	if p != nil {
@@ -444,7 +444,7 @@ func (reg *Registry) deleteAdminRequestRoute(ctx context.Context, in *AdminReque
 		return nil, NewProblem(TypePreconditionFailed, "The routing rule changed; reload before deleting.")
 	}
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	return nil, nil
 }
@@ -456,7 +456,7 @@ func (reg *Registry) reorderAdminRequestRoutes(ctx context.Context, in *AdminReq
 	}
 	routes, err := s.ReorderRoutes(ctx, adminRequestViewer(ctx), mediarequests.MediaType(in.Body.MediaType), in.Body.IDs)
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	items := make([]AdminRequestRoute, 0, len(routes))
 	for _, r := range routes {
@@ -481,7 +481,7 @@ func (reg *Registry) previewAdminRequestRoute(ctx context.Context, in *AdminRequ
 	}
 	preview, err := s.PreviewRoute(ctx, adminRequestViewer(ctx), mediarequests.MediaType(in.Body.MediaType), in.Body.TMDBID, requester)
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	out := new(AdminRequestRoutePreviewOutput)
 	f := preview.Facts
@@ -517,7 +517,7 @@ func (reg *Registry) searchAdminRequestRouteTitles(ctx context.Context, in *Admi
 	}
 	results, err := s.SearchRouteTitles(ctx, adminRequestViewer(ctx), mediarequests.MediaType(in.MediaType), in.Q)
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	items := make([]AdminRequestRouteTitle, 0, len(results))
 	for _, r := range results {

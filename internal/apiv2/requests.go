@@ -516,7 +516,7 @@ func (reg *Registry) createRequest(ctx context.Context, in *MediaRequestCreateIn
 		Seasons:      in.Body.Seasons,
 	})
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	return &MediaRequestOutput{Body: mediaRequestOf(req, viewer)}, nil
 }
@@ -551,7 +551,7 @@ func (reg *Registry) listMyRequests(ctx context.Context, cursors *Cursors, in *M
 		Before:  before,
 	})
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	next := ""
 	if len(rows) > in.Limit {
@@ -577,7 +577,7 @@ func (reg *Registry) getRequest(ctx context.Context, in *MediaRequestGetInput) (
 	}
 	req, err := svc.GetRequest(ctx, viewer, string(in.ID))
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	return &MediaRequestOutput{Body: mediaRequestOf(req, viewer)}, nil
 }
@@ -594,17 +594,16 @@ func (reg *Registry) searchRequestMedia(ctx context.Context, in *RequestMediaSea
 	}
 	page, err := svc.Search(ctx, viewer, in.Query, mediarequests.MediaType(in.MediaType), in.Page)
 	if err != nil {
-		if requestCanceled(ctx, err) {
+		if requestAbandoned(ctx) {
 			// The caller is gone or out of time: the lookup failure is not a
 			// server error. Keep the cause out of the error signal and leave
 			// it at debug for diagnosis.
-			slog.DebugContext(ctx, "apiv2: request search canceled",
+			slog.DebugContext(ctx, "apiv2: request search abandoned",
 				"component", "apiv2",
 				"operation", opSearchRequestMedia,
 				"error", err)
-			return nil, canceledRequestProblem(err)
 		}
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	out := requestMediaPageOf(page)
 	reg.markInWatchlist(ctx, watchlistMarksOf(out.Results))
@@ -619,7 +618,7 @@ func (reg *Registry) getRequestMediaDetail(ctx context.Context, in *RequestMedia
 	}
 	detail, err := svc.GetDetail(ctx, viewer, mediarequests.MediaType(in.MediaType), in.TMDBID)
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	out := requestMediaDetailOf(detail)
 	marks := append(watchlistMarksOf(out.Recommendations), watchlistMark{mediaType: out.MediaType, tmdbID: out.TMDBID, itemID: out.LibraryContentID, in: &out.InWatchlist})
@@ -639,7 +638,7 @@ func (reg *Registry) followRequestMedia(ctx context.Context, in *RequestMediaDet
 	}
 	state, err := svc.Follow(ctx, viewer, mediarequests.MediaType(in.MediaType), in.TMDBID)
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	return &RequestMediaStateOutput{Body: requestMediaStateOf(state)}, nil
 }
@@ -650,7 +649,7 @@ func (reg *Registry) unfollowRequestMedia(ctx context.Context, in *RequestMediaD
 		return nil, p
 	}
 	if err := svc.Unfollow(ctx, viewer, mediarequests.MediaType(in.MediaType), in.TMDBID); err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	return nil, nil
 }
@@ -663,7 +662,7 @@ func (reg *Registry) listDiscoverSections(ctx context.Context, _ *struct{}) (*Di
 	}
 	sections, err := svc.DiscoverAll(ctx, viewer)
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	items := make([]DiscoverSection, 0, len(sections))
 	var marks []watchlistMark
@@ -685,7 +684,7 @@ func (reg *Registry) getDiscoverSection(ctx context.Context, in *DiscoverSection
 	}
 	section, err := svc.Discover(ctx, viewer, in.Section, in.Page)
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	out := discoverSectionOf(section)
 	reg.markInWatchlist(ctx, watchlistMarksOf(out.Results))
@@ -709,7 +708,7 @@ func (reg *Registry) listDiscoverBrands(ctx context.Context, opID string) (*Disc
 		cards, err = svc.ListStudios(ctx, viewer)
 	}
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	items := make([]DiscoverBrand, 0, len(cards))
 	for _, c := range cards {
@@ -732,7 +731,7 @@ func (reg *Registry) browseDiscoverBrand(ctx context.Context, in *DiscoverBrowse
 	}
 	resp, err := browse(svc, viewer)
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	out := discoverBrowsePageOf(resp)
 	reg.markInWatchlist(ctx, watchlistMarksOf(out.Results))
@@ -750,7 +749,7 @@ func (reg *Registry) browseDiscoverGenre(ctx context.Context, in *DiscoverGenreB
 	}
 	resp, err := svc.BrowseGenre(ctx, viewer, in.Slug, mediarequests.MediaType(in.MediaType), in.Sort, in.Page)
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	out := discoverBrowsePageOf(resp)
 	reg.markInWatchlist(ctx, watchlistMarksOf(out.Results))
@@ -767,24 +766,31 @@ func requireSlug(slug string) *Problem {
 	return nil
 }
 
-// requestCanceled reports whether the request ended before the service could
-// answer: the client went away, the deadline expired, or the service surfaced
-// either from the context it was given. The request context is checked too
-// because a lookup can report a transport failure after the context is
-// already done.
-func requestCanceled(ctx context.Context, err error) bool {
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return true
+// requestAbandoned reports whether the incoming request itself ended before
+// the service could answer. Only the caller's own context decides this: a
+// dependency that reports its canceled or expired context while the caller is
+// still waiting has failed, and is not a client timeout.
+func requestAbandoned(ctx context.Context) bool {
+	return ctx != nil && ctx.Err() != nil
+}
+
+// requestCanceledByCaller reports whether a cancellation failure belongs to
+// the caller: the incoming request context must itself be done, and the error
+// must be that cancellation. A dependency deadline or cancellation with a
+// live incoming context is the dependency failing, not the caller leaving.
+func requestCanceledByCaller(ctx context.Context, err error) bool {
+	if !requestAbandoned(ctx) {
+		return false
 	}
-	return ctx != nil && (errors.Is(ctx.Err(), context.Canceled) || errors.Is(ctx.Err(), context.DeadlineExceeded))
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // canceledRequestProblem is the answer for an abandoned request. It is a
 // client-side outcome, not an internal failure, so it uses the standard
 // request-timeout status instead of a 500. The detail stays generic because
 // nobody is guaranteed to read it, and the cause never travels on the body.
-func canceledRequestProblem(err error) *Problem {
-	if errors.Is(err, context.DeadlineExceeded) {
+func canceledRequestProblem(ctx context.Context) *Problem {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return NewProblem(TypeRequestTimeout, "The request timed out.")
 	}
 	return NewProblem(TypeRequestTimeout, "The request was canceled.")
@@ -797,7 +803,7 @@ func canceledRequestProblem(err error) *Problem {
 // conflicts are 409, an unreachable integration is 503
 // dependency_unavailable, an abandoned request is 408 request_timeout, and
 // anything else is an internal error.
-func requestProblem(err error) *Problem {
+func requestProblem(ctx context.Context, err error) *Problem {
 	if verr, ok := errors.AsType[*mediarequests.ValidationError](err); ok {
 		p := NewProblem(TypeValidationFailed, "The request did not pass validation; see errors.")
 		if verr.FormError != "" {
@@ -811,13 +817,14 @@ func requestProblem(err error) *Problem {
 		return p.WithErrors(errs...)
 	}
 	var quota mediarequests.QuotaError
-	// A canceled lookup (client gone, or a dependency reporting the canceled
-	// context) is not a server failure. Answer the standard request-timeout
-	// status and keep the cause off the envelope: the caller may already be
-	// gone, and the request log reports it at debug rather than ERROR.
+	// A cancellation is the caller's own outcome only when the incoming
+	// request context is done. A dependency that reports its deadline while
+	// the caller is still waiting has failed: its cause unwraps through
+	// IntegrationUnreachableError, so checking the error alone would answer
+	// 408 for an upstream timeout.
 	switch {
-	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
-		return canceledRequestProblem(err)
+	case requestCanceledByCaller(ctx, err):
+		return canceledRequestProblem(ctx)
 	case errors.As(err, &quota):
 		return NewProblem(TypeRateLimited, "Request quota exceeded: "+strconv.Itoa(quota.Used)+" of "+strconv.Itoa(quota.Limit)+" requests used in the last "+strconv.Itoa(quota.WindowDays)+" days.")
 	case errors.Is(err, mediarequests.ErrInvalidMediaType):
@@ -846,6 +853,11 @@ func requestProblem(err error) *Problem {
 		if unreachable, ok := errors.AsType[*mediarequests.IntegrationUnreachableError](err); ok && unreachable.Detail != "" {
 			return NewProblem(TypeDependencyUnavailable, unreachable.Detail)
 		}
+		return NewProblem(TypeDependencyUnavailable, "The request integration could not be reached.")
+	case errors.Is(err, context.DeadlineExceeded):
+		// A dependency deadline while the caller is still waiting: the
+		// integration did not answer in time, so it is temporarily
+		// unavailable rather than a client timeout or an internal failure.
 		return NewProblem(TypeDependencyUnavailable, "The request integration could not be reached.")
 	}
 	return NewProblem(TypeInternalError, "An unexpected error occurred.").withCause(err)

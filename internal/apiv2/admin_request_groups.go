@@ -97,7 +97,7 @@ func (reg *Registry) getAdminRequestGroupLimit(ctx context.Context, in *AdminReq
 	}
 	r, err := s.GetGroupLimit(ctx, adminRequestViewer(ctx), id)
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	return &AdminRequestGroupLimitOutput{ETag: adminRequestTag(ctx, "group-limit", string(in.GroupID), r.Revision).String(), Body: adminGroupLimitOf(r)}, nil
 }
@@ -114,7 +114,7 @@ func (reg *Registry) updateAdminRequestGroupLimit(ctx context.Context, in *Admin
 	v := adminRequestViewer(ctx)
 	r, err := s.GetGroupLimit(ctx, v, id)
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	rev, p := adminRequestGuard(AdminRequestPreconditions{in.IfMatch, in.IfNoneMatch}, adminRequestTag(ctx, "group-limit", string(in.GroupID), r.Revision), r.Revision)
 	if p != nil {
@@ -130,7 +130,7 @@ func (reg *Registry) updateAdminRequestGroupLimit(ctx context.Context, in *Admin
 		return nil, NewProblem(TypePreconditionFailed, "The access group's request limit changed; reload before saving.").WithHeader("ETag", current.ETag)
 	}
 	if err != nil {
-		return nil, requestProblem(err)
+		return nil, requestProblem(ctx, err)
 	}
 	return &AdminRequestGroupLimitOutput{ETag: adminRequestTag(ctx, "group-limit", string(in.GroupID), r.Revision).String(), Body: adminGroupLimitOf(r)}, nil
 }

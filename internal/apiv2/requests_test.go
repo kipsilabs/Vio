@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -550,20 +551,22 @@ func TestSearchRequestMedia(t *testing.T) {
 	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/requests/search?q=%20", "", requestOwner), TypeValidationFailed)
 	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/requests/search?q=heat&media_type=tv", "", requestOwner), TypeValidationFailed)
 	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/requests/search?q=heat&page=0", "", requestOwner), TypeValidationFailed)
-	// A canceled provider lookup is the caller going away, not a server
-	// failure: a 408 with a generic body, never internal_error.
+	// A dependency that hits its own deadline while the caller is still
+	// waiting is unavailable, not a client timeout: the integration error
+	// unwraps to context.DeadlineExceeded but the incoming context is live.
 	buf := captureLogs(t)
-	svc.err = fmt.Errorf("lookup external ids private-search-marker: %w", context.Canceled)
-	rec = do(t, h, http.MethodGet, "/api/v2/requests/search?q=heat", "", requestOwner)
-	requireProblem(t, rec, TypeRequestTimeout)
-	if !strings.Contains(rec.Body.String(), "The request was canceled.") || strings.Contains(rec.Body.String(), "private-search-marker") {
-		t.Fatalf("canceled search body = %s", rec.Body.String())
+	svc.err = &mediarequests.IntegrationUnreachableError{
+		Detail: "The server didn't answer in time.",
+		Err:    fmt.Errorf("probe private-search-marker: %w", context.DeadlineExceeded),
 	}
-	if strings.Contains(buf.String(), `"level":"ERROR"`) || strings.Contains(buf.String(), `"status":500`) {
-		t.Fatalf("canceled search logged as an error: %s", buf.String())
+	rec = do(t, h, http.MethodGet, "/api/v2/requests/search?q=heat", "", requestOwner)
+	p := requireProblem(t, rec, TypeDependencyUnavailable)
+	if p.Detail != "The server didn't answer in time." || strings.Contains(rec.Body.String(), "private-search-marker") {
+		t.Fatalf("dependency-deadline search body = %s", rec.Body.String())
 	}
 	// A genuine provider failure keeps the generic 500 envelope and its cause
 	// reaches the request log under the same request id.
+	buf.Reset()
 	svc.err = fmt.Errorf("lookup external ids private-search-failure: connection refused")
 	rec = do(t, h, http.MethodGet, "/api/v2/requests/search?q=heat", "", requestOwner)
 	requireProblem(t, rec, TypeInternalError)
@@ -610,20 +613,121 @@ func TestSearchRequestMediaCanceledRequest(t *testing.T) {
 }
 
 // TestSearchRequestMediaDeadlineExceeded pins the other abandoned-request
-// shape: an expired deadline is also the client's outcome, not a 500.
+// shape: the incoming request's own deadline expired, so the lookup failure
+// is the caller's outcome, not a 500.
 func TestSearchRequestMediaDeadlineExceeded(t *testing.T) {
 	svc := fixtureRequests()
-	svc.err = fmt.Errorf("lookup external ids: %w", context.DeadlineExceeded)
+	svc.err = fmt.Errorf("lookup external ids private-deadline-request: %w", context.DeadlineExceeded)
 	h := newTestHandler(t, requestDeps(svc))
-	buf := captureLogs(t)
+	buf := captureLogsAt(t, slog.LevelDebug)
 
-	rec := do(t, h, http.MethodGet, "/api/v2/requests/search?q=heat", "", requestOwner)
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	r := httptest.NewRequest(http.MethodGet, "/api/v2/requests/search?q=heat", nil).WithContext(ctx)
+	for k, v := range requestOwner {
+		r.Header.Set(k, v)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, r)
+
 	requireProblem(t, rec, TypeRequestTimeout)
-	if !strings.Contains(rec.Body.String(), "The request timed out.") {
+	if !strings.Contains(rec.Body.String(), "The request timed out.") || strings.Contains(rec.Body.String(), "private-deadline-request") {
 		t.Fatalf("timed-out search body = %s", rec.Body.String())
 	}
-	if strings.Contains(buf.String(), `"level":"ERROR"`) || strings.Contains(buf.String(), `"status":500`) {
-		t.Fatalf("timed-out search logged as an error: %s", buf.String())
+	logs := buf.String()
+	if strings.Contains(logs, `"level":"ERROR"`) || strings.Contains(logs, `"status":500`) {
+		t.Fatalf("timed-out search logged as an error: %s", logs)
+	}
+	if !strings.Contains(logs, `"level":"DEBUG"`) || !strings.Contains(logs, "private-deadline-request") {
+		t.Fatalf("timed-out search lacks its debug cause: %s", logs)
+	}
+}
+
+// TestRequestProblemCancellationClassification pins the shared mapper's
+// boundary between a client abandonment and a dependency failure. Only the
+// incoming request context decides whether a cancellation is a 408; an error
+// that unwraps a dependency's deadline while the caller is still waiting is
+// temporary unavailability, and an unexplained failure stays a 500.
+func TestRequestProblemCancellationClassification(t *testing.T) {
+	live := context.Background()
+	canceled, cancel := context.WithCancel(live)
+	cancel()
+	expired, expire := context.WithDeadline(live, time.Now().Add(-time.Second))
+	defer expire()
+
+	unreachableDeadline := &mediarequests.IntegrationUnreachableError{
+		Detail: "The server didn't answer in time.",
+		Err:    fmt.Errorf("probe: %w", context.DeadlineExceeded),
+	}
+	cases := []struct {
+		name   string
+		ctx    context.Context
+		err    error
+		want   ProblemType
+		detail string
+	}{
+		{
+			name:   "live caller, unreachable integration wrapping a deadline",
+			ctx:    live,
+			err:    unreachableDeadline,
+			want:   TypeDependencyUnavailable,
+			detail: "The server didn't answer in time.",
+		},
+		{
+			name:   "live caller, dependency deadline",
+			ctx:    live,
+			err:    fmt.Errorf("probe: %w", context.DeadlineExceeded),
+			want:   TypeDependencyUnavailable,
+			detail: "The request integration could not be reached.",
+		},
+		{
+			name:   "live caller, dependency cancellation",
+			ctx:    live,
+			err:    fmt.Errorf("probe: %w", context.Canceled),
+			want:   TypeInternalError,
+			detail: "An unexpected error occurred.",
+		},
+		{
+			name:   "canceled caller",
+			ctx:    canceled,
+			err:    fmt.Errorf("probe: %w", context.Canceled),
+			want:   TypeRequestTimeout,
+			detail: "The request was canceled.",
+		},
+		{
+			name:   "expired caller",
+			ctx:    expired,
+			err:    context.DeadlineExceeded,
+			want:   TypeRequestTimeout,
+			detail: "The request timed out.",
+		},
+		{
+			name:   "genuine failure",
+			ctx:    live,
+			err:    errors.New("boom"),
+			want:   TypeInternalError,
+			detail: "An unexpected error occurred.",
+		},
+		{
+			// An abandoned caller does not relabel a domain decision the
+			// service already reached.
+			name:   "canceled caller, domain error",
+			ctx:    canceled,
+			err:    mediarequests.ErrAlreadyRequested,
+			want:   TypeConflict,
+			detail: "The media already has an active request.",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := requestProblem(tc.ctx, tc.err)
+			if p.Type != tc.want.URI() {
+				t.Fatalf("type = %s, want %s", p.Type, tc.want.URI())
+			}
+			if p.Detail != tc.detail {
+				t.Fatalf("detail = %q, want %q", p.Detail, tc.detail)
+			}
+		})
 	}
 }
 

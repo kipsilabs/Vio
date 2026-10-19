@@ -40,6 +40,14 @@ func TestRequestLogCarries500Cause(t *testing.T) {
 		}, func(context.Context, *struct{}) (*probeOutput, error) {
 			return nil, catalogProblem(fmt.Errorf("lookup private-marker-9f3: %w", context.Canceled), "query.source")
 		})
+		// A request-service cancellation with a live incoming context is not a
+		// client timeout: it stays an internal error and carries its cause.
+		Register(reg, Operation{
+			Operation: humaOp(http.MethodGet, Prefix+"/probe/fail/canceled-request", "probeFailCanceledRequest", "probe", "canceled request lookup"),
+			Class:     ClassPublic,
+		}, func(ctx context.Context, _ *struct{}) (*probeOutput, error) {
+			return nil, requestProblem(ctx, fmt.Errorf("request private-marker-51c: %w", context.Canceled))
+		})
 		// A watch access-filter failure masks its cause the same way.
 		Register(reg, Operation{
 			Operation: humaOp(http.MethodGet, Prefix+"/probe/fail/access-filter", "probeFailAccessFilter", "probe", "canceled access filter"),
@@ -58,6 +66,7 @@ func TestRequestLogCarries500Cause(t *testing.T) {
 		{"/api/v2/probe/fail/internal", "boom masked cause", "", ""},
 		{"/api/v2/probe/fail/plain", "boom plain cause", "", ""},
 		{"/api/v2/probe/fail/canceled", "context canceled", "private-marker-9f3", "The request was canceled."},
+		{"/api/v2/probe/fail/canceled-request", "context canceled", "private-marker-51c", "An unexpected error occurred."},
 		{"/api/v2/probe/fail/access-filter", "context canceled", "private-marker-77d", "An unexpected error occurred."},
 	}
 	for _, tc := range cases {
