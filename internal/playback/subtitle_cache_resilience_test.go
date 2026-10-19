@@ -103,59 +103,165 @@ func TestServeExtractWindowedRepeatServesLastGoodThroughUpstreamFailure(t *testi
 
 // Without a cached copy, an upstream 5xx is retried a bounded number of times
 // inside the request, then the identity enters a backoff so an immediate client
-// retry does not open the provider again.
+// retry does not open the provider again. A lapsed cooldown keeps the failure
+// streak, so a sustained outage escalates 10→20→40→60s and then holds at the
+// cap instead of restarting at the base cooldown.
 func TestServeExtractWindowedUpstreamFailureBacksOff(t *testing.T) {
-	oldDelays := subtitleExtractRetryDelays
-	subtitleExtractRetryDelays = []time.Duration{time.Millisecond}
-	defer func() { subtitleExtractRetryDelays = oldDelays }()
-
 	c, source := newTestCache(t)
+	c.extractRetryDelays = []time.Duration{time.Millisecond}
 	opts := windowResilienceOpts(source)
 	calls := 0
 	extract := func(context.Context, StreamExtractOpts) error {
 		calls++
 		return upstreamSubtitleError()
 	}
+	wantCalls := 1 + len(c.extractRetryDelays)
+	format := subtitleFormatASS
 
-	err := c.ServeExtract(httptest.NewRecorder(), subtitleWindowRequest(), opts, extract)
-	if !IsSubtitleUpstreamError(err) {
-		t.Fatalf("first error = %v, want the upstream failure", err)
+	cooldowns := []time.Duration{
+		subtitleExtractionFailureBaseCooldown,
+		2 * subtitleExtractionFailureBaseCooldown,
+		4 * subtitleExtractionFailureBaseCooldown,
+		subtitleExtractionFailureMaxCooldown,
+		subtitleExtractionFailureMaxCooldown,
 	}
-	wantCalls := 1 + len(subtitleExtractRetryDelays)
-	if calls != wantCalls {
-		t.Fatalf("extract calls = %d, want %d bounded attempts", calls, wantCalls)
+	for i, wantCooldown := range cooldowns {
+		if i > 0 {
+			expireExtractionCooldown(t, c, opts, format)
+		}
+		if err := c.ServeExtract(httptest.NewRecorder(), subtitleWindowRequest(), opts, extract); !IsSubtitleUpstreamError(err) {
+			t.Fatalf("attempt %d error = %v, want the upstream failure", i, err)
+		}
+		if calls != wantCalls*(i+1) {
+			t.Fatalf("attempt %d extract calls = %d, want %d", i, calls, wantCalls*(i+1))
+		}
+		remaining, cooling := c.extractionCoolingDown(opts, format)
+		if !cooling {
+			t.Fatalf("attempt %d: no cooldown after the failure", i)
+		}
+		if remaining <= wantCooldown-time.Second || remaining > wantCooldown {
+			t.Fatalf("attempt %d cooldown = %s, want %s", i, remaining, wantCooldown)
+		}
+
+		// An immediate retry inside the cooldown is answered from the backoff
+		// without extracting.
+		err := c.ServeExtract(httptest.NewRecorder(), subtitleWindowRequest(), opts, extract)
+		var retry *SubtitleExtractionRetryError
+		if !errors.As(err, &retry) {
+			t.Fatalf("attempt %d retry error = %v, want SubtitleExtractionRetryError", i, err)
+		}
+		if retry.RetryAfter <= wantCooldown-time.Second || retry.RetryAfter > wantCooldown {
+			t.Fatalf("attempt %d retry after = %s, want %s", i, retry.RetryAfter, wantCooldown)
+		}
+		if calls != wantCalls*(i+1) {
+			t.Fatalf("attempt %d extract calls = %d after a retry inside the backoff, want %d", i, calls, wantCalls*(i+1))
+		}
 	}
 
-	// The next request is answered from the backoff without extracting.
-	err = c.ServeExtract(httptest.NewRecorder(), subtitleWindowRequest(), opts, extract)
-	var retry *SubtitleExtractionRetryError
-	if !errors.As(err, &retry) {
-		t.Fatalf("second error = %v, want SubtitleExtractionRetryError", err)
+	// A successful extraction clears the streak, so the next failure restarts
+	// at the base cooldown.
+	c.noteExtractionSuccess(opts, format)
+	c.noteExtractionFailure(opts, format)
+	remaining, cooling := c.extractionCoolingDown(opts, format)
+	if !cooling || remaining <= subtitleExtractionFailureBaseCooldown-time.Second || remaining > subtitleExtractionFailureBaseCooldown {
+		t.Fatalf("cooldown after success = %s (cooling=%t), want %s", remaining, cooling, subtitleExtractionFailureBaseCooldown)
 	}
-	if retry.RetryAfter <= 0 {
-		t.Fatalf("retry after = %s, want a positive backoff", retry.RetryAfter)
-	}
-	if calls != wantCalls {
-		t.Fatalf("extract calls = %d after a retry inside the backoff, want %d", calls, wantCalls)
-	}
+}
 
-	// Once the backoff lapses the next request attempts extraction again.
-	key, ok := c.formatEntryKey(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, subtitleFormatASS)
+// expireExtractionCooldown moves an identity's retry time into the past while
+// leaving its failure streak intact, as if the cooldown had simply elapsed.
+func expireExtractionCooldown(t *testing.T, c *SubtitleCache, opts StreamExtractOpts, format string) {
+	t.Helper()
+	key, ok := c.formatEntryKey(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, format)
 	if !ok {
 		t.Fatal("failed to compute the extraction key")
 	}
 	c.failureMu.Lock()
-	guard := c.failureGuard[key]
+	defer c.failureMu.Unlock()
+	guard, ok := c.failureGuard[key]
+	if !ok {
+		t.Fatal("no failure guard to expire")
+	}
 	guard.retryAt = time.Now().Add(-time.Second)
 	c.failureGuard[key] = guard
-	c.failureMu.Unlock()
+}
 
-	if err := c.ServeExtract(httptest.NewRecorder(), subtitleWindowRequest(), opts, extract); !IsSubtitleUpstreamError(err) {
-		t.Fatalf("post-backoff error = %v, want a fresh upstream attempt", err)
+// A cached window write that fails after committing 200 and a partial body must
+// terminate the request: it is not a cache miss, so the caller must not serve
+// the slice again or start an extraction against the same response.
+func TestServeExtractWindowCacheWriteFailureTerminatesRequest(t *testing.T) {
+	c, source := newTestCache(t)
+	opts := windowResilienceOpts(source)
+	//nolint:misspell // "Dialogue" is the ASS cue keyword, not prose.
+	payload := "[Script Info]\nDialogue: 0,0:02:00.00,0:02:01.00,Default,,0,0,0,,hello\n"
+
+	calls := 0
+	extract := func(_ context.Context, o StreamExtractOpts) error {
+		calls++
+		_, err := io.WriteString(o.Writer, payload)
+		return err
 	}
-	if calls != wantCalls*2 {
-		t.Fatalf("post-backoff extract calls = %d, want %d", calls, wantCalls*2)
+	// Populate the last-good window cache.
+	seed := httptest.NewRecorder()
+	if err := c.ServeExtract(seed, subtitleWindowRequest(), opts, extract); err != nil {
+		t.Fatalf("seed request: %v", err)
 	}
+	if calls != 1 {
+		t.Fatalf("seed extract calls = %d, want 1", calls)
+	}
+
+	writeErr := errors.New("client write failed")
+	writer := &prefixErrorWriter{limit: 8, err: writeErr}
+	err := c.ServeExtract(writer, subtitleWindowRequest(), opts, extract)
+	if !errors.Is(err, writeErr) {
+		t.Fatalf("cached serve error = %v, want the write failure", err)
+	}
+	if calls != 1 {
+		t.Fatalf("extract calls = %d after the cached write failure, want no extraction", calls)
+	}
+	if writer.writes != 1 {
+		t.Fatalf("cached serve write attempts = %d, want exactly 1 (no second serve)", writer.writes)
+	}
+	if writer.body.String() != payload[:8] {
+		t.Fatalf("cached serve body = %q, want the accepted prefix %q", writer.body.String(), payload[:8])
+	}
+}
+
+// prefixErrorWriter accepts limit bytes of the first write and then reports a
+// write error, simulating a response whose client goes away mid-body.
+type prefixErrorWriter struct {
+	header http.Header
+	status int
+	limit  int
+	err    error
+	writes int
+	body   bytes.Buffer
+}
+
+func (w *prefixErrorWriter) Header() http.Header {
+	if w.header == nil {
+		w.header = make(http.Header)
+	}
+	return w.header
+}
+
+func (w *prefixErrorWriter) WriteHeader(code int) {
+	if w.status == 0 {
+		w.status = code
+	}
+}
+
+func (w *prefixErrorWriter) Write(p []byte) (int, error) {
+	w.writes++
+	take := w.limit
+	if take > len(p) {
+		take = len(p)
+	}
+	w.body.Write(p[:take])
+	if take < len(p) {
+		return take, w.err
+	}
+	return take, nil
 }
 
 // Concurrent identical window requests must coalesce onto one extraction and
