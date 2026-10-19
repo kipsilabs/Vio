@@ -73,6 +73,11 @@ func TestSeasonListArtworkHTTP(t *testing.T) {
 		if err := episodes.Upsert(ctx, &models.Episode{ContentID: id + "-E1", SeriesID: prefix, SeasonID: id, SeasonNumber: i, EpisodeNumber: 1, Title: "Episode", DefaultMetadataLanguage: "en"}); err != nil {
 			t.Fatal(err)
 		}
+		// Season 37 stays metadata-only: it must still be listed and its
+		// poster signed, not hidden because no candidate materialized.
+		if i == 37 {
+			continue
+		}
 		if _, err := pool.Exec(ctx, `INSERT INTO episode_libraries(episode_id,media_folder_id) VALUES($1,$2)`, id+"-E1", library); err != nil {
 			t.Fatal(err)
 		}

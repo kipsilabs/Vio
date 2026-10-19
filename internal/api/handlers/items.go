@@ -2216,6 +2216,22 @@ func (h *ItemsHandler) parentRollupUserData(ctx context.Context, v ItemViewer, i
 	return catalog.SeasonUserDataFromCounts(parent), true
 }
 
+// metadataSeasonCounts returns each season number's metadata episode count,
+// including seasons with no library-materialized episodes. The seasons list
+// uses it only where the availability rollup has no entry, so a metadata-only
+// season still shows the episode total the provider knows.
+func (h *ItemsHandler) metadataSeasonCounts(ctx context.Context, seriesID string) (map[int]int, error) {
+	summaries, err := h.episodeRepo.ListMetadataSeasons(ctx, seriesID)
+	if err != nil {
+		return nil, err
+	}
+	counts := make(map[int]int, len(summaries))
+	for _, summary := range summaries {
+		counts[summary.SeasonNumber] = summary.EpisodeCount
+	}
+	return counts, nil
+}
+
 // seriesSeasonRollups returns each season number's available episode count
 // and, when the viewer's store is reachable, its aggregate user data. A store
 // with the SQL rollup answers both in one query; otherwise the series'

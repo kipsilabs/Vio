@@ -3183,6 +3183,15 @@ func (s *DetailService) buildSeasonDetail(ctx context.Context, season *models.Se
 		if err != nil {
 			return nil, fmt.Errorf("listing season episodes: %w", err)
 		}
+		// A virtual season keeps its metadata after its candidates stop being
+		// materialized. Fall back to the episodes table so the detail's
+		// episode_count agrees with the season page instead of reporting 0.
+		if len(episodes) == 0 {
+			episodes, err = s.episodeRepo.ListMetadataBySeasonID(ctx, season.ContentID)
+			if err != nil {
+				return nil, fmt.Errorf("listing metadata season episodes: %w", err)
+			}
+		}
 	}
 
 	title := season.Title
