@@ -115,13 +115,14 @@ export default function EpisodeContent({
       userData,
     ],
   );
-  const [manualSelectedFileId, setManualSelectedFileId] = useState<number | null>(null);
+  const [manualSelectedVersion, setManualSelectedVersion] = useState<FileVersion | null>(null);
   const selectedVersion = useMemo(
     () =>
-      (manualSelectedFileId != null
-        ? (sortedVersions.find((version) => version.file_id === manualSelectedFileId) ?? null)
-        : null) ?? defaultSelectedVersion,
-    [defaultSelectedVersion, manualSelectedFileId, sortedVersions],
+      manualSelectedVersion != null
+        ? (sortedVersions.find((version) => version.file_id === manualSelectedVersion.file_id) ??
+          manualSelectedVersion)
+        : defaultSelectedVersion,
+    [defaultSelectedVersion, manualSelectedVersion, sortedVersions],
   );
   const selectedMediaSummary = useMemo(
     () => resolveSelectedMediaSummary(selectedVersion, item.playback_variants, item.runtime ?? 0),
@@ -146,7 +147,7 @@ export default function EpisodeContent({
   const [prevContentId, setPrevContentId] = useState(item.content_id);
   if (prevContentId !== item.content_id) {
     setPrevContentId(item.content_id);
-    setManualSelectedFileId(null);
+    setManualSelectedVersion(null);
     setAudioSelectionMode("auto");
     setExplicitAudioTrackIndex(null);
     setSubtitleSelectionMode("auto");
@@ -154,7 +155,7 @@ export default function EpisodeContent({
   }
 
   const handleSelectVersion = useCallback((version: FileVersion) => {
-    setManualSelectedFileId(version.file_id);
+    setManualSelectedVersion(version);
     setAudioSelectionMode("auto");
     setExplicitAudioTrackIndex(null);
     setSubtitleSelectionMode("auto");
@@ -435,7 +436,7 @@ export default function EpisodeContent({
               versions={item.versions ?? []}
               playbackVariants={item.playback_variants}
               selectedVersion={selectedVersion}
-              explicitFileSelection={manualSelectedFileId != null}
+              explicitFileSelection={manualSelectedVersion != null}
               onSelectVersion={handleSelectVersion}
               onDownload={
                 user?.download_allowed && (item.versions ?? []).length > 0

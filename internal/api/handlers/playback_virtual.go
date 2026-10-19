@@ -2810,6 +2810,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	}
 	attemptCtx = withVirtualCandidateRotationV3(attemptCtx, rotateCandidates)
 	attemptCtx = withVirtualSessionBindingV3(attemptCtx, options.sessionBound)
+	attemptCtx = virtuallibrary.WithExplicitCandidateSelection(attemptCtx, explicitSelection)
 	// An auto-picked quality profile that matches no candidate degrades to the
 	// best-ranked candidate instead of hard-failing the start. Only a fresh,
 	// non-explicit selection qualifies: a session binding must not swap the
