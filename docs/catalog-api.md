@@ -593,12 +593,12 @@ year), a `title` value that is empty or not a string, or a
 `latest_episode_added` or `last_air_date` bound that is not a date (`2024-01-31`)
 or an RFC 3339 time.
 
-| Operators | Fields | Value |
-| --- | --- | --- |
-| `contains`, `not_contains`, `is`, `is_not`, `begins_with`, `ends_with` | `title` | string, compared ignoring case; `%` and `_` match literally |
-| `is`, `is_not` | `decade` | the decade's first year (`1990` matches 1990 to 1999) |
-| `gt`, `gte`, `lt`, `lte`, `between` | `runtime` (minutes), `rating_imdb`, `rating_tmdb`, `rating_rt_critic`, `rating_rt_audience` | number, or `[min, max]` for `between` |
-| `gt`, `lt`, `between`, `in_last`, `not_in_last` | `added_at`, `release_date`, `latest_episode_added`, `last_air_date` | ISO date, `[from, to]`, or a span such as `30d` (`h`, `d`, `w`, `m` for months, `y`) |
+| Operators                                                              | Fields                                                                                      | Value                                                                                |
+| ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| `contains`, `not_contains`, `is`, `is_not`, `begins_with`, `ends_with` | `title`                                                                                     | string, compared ignoring case; `%` and `_` match literally                          |
+| `is`, `is_not`                                                         | `decade`                                                                                    | the decade's first year (`1990` matches 1990 to 1999)                                |
+| `gt`, `gte`, `lt`, `lte`, `between`                                    | `runtime` (minutes), `rating_imdb`, `rating_tmdb`, `rating_rt_critic`, `rating_rt_audience` | number, or `[min, max]` for `between`                                                |
+| `gt`, `lt`, `between`, `in_last`, `not_in_last`                        | `added_at`, `release_date`, `latest_episode_added`, `last_air_date`                         | ISO date, `[from, to]`, or a span such as `30d` (`h`, `d`, `w`, `m` for months, `y`) |
 
 `not_in_last` keeps titles whose date falls before the span; a title without the
 date matches neither `in_last` nor `not_in_last`, and a title with no runtime
@@ -712,6 +712,7 @@ the same episode count and moves files from `files_created` to
 ```
 
 **Status Codes**:
+
 - `200 OK`: Item was successfully materialized or verified (idempotent).
 - `400 Bad Request`: Ineligible media type, incompatible target library, or virtual playback is disabled on the collection.
 - `401 Unauthorized`: Missing or invalid authentication token.
@@ -732,6 +733,21 @@ episode events collapsed into their parent series; it does not require a
 completed watch. `order=asc` puts the oldest latest watch first, and `desc`
 puts the newest first. Library/media-scope/search overlays retain this order
 before pagination. History does not currently support saved sort preferences.
+
+## Metadata-only seasons
+
+`listSeriesSeasons` lists every season row the metadata provider knows, not
+only seasons with library files. A season whose candidates were never
+materialized still appears, and its `episode_count` is the number of episodes
+the provider lists for it (aired or not). Its episode rows are returned
+without a `files` key, so clients render them as non-playable; a non-empty
+`files` array is the playability signal. Seasons with materialized episodes
+keep `episode_count` as the number of library-available episodes. The rule is
+the same for virtual and non-virtual libraries.
+
+The frozen `/api/v1` catalog season routes share these handlers. A season with
+metadata now answers with its metadata rows instead of being omitted or
+answering `404` when it has no materialized files.
 
 ## Season-list artwork
 
@@ -1164,11 +1180,11 @@ An empty set retains the requested item's ID and an empty array.
 Seasons derived from episode groups use the same ownership and inheritance rules.
 If the optional theme lookup fails, item detail still succeeds and omits `themes`.
 
-| Method and path | Result |
-| --- | --- |
-| `GET /api/v2/catalog/themes/capabilities` | Shared capability document with `delivery: routed`, `transcode`, `cluster_routing`, and `grant_lifetime_seconds` |
-| `POST /api/v2/catalog/items/{id}/themes/{theme_id}/playback` | `url`, `expires_at`, `delivery`, and `content_type` for an authenticated login session and verified profile |
-| `GET\|HEAD /api/v2/catalog/items/{id}/themes/{theme_id}/audio?token=...` | Theme audio this API node serves, authorized by the playback grant |
+| Method and path                                                          | Result                                                                                                           |
+| ------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------- |
+| `GET /api/v2/catalog/themes/capabilities`                                | Shared capability document with `delivery: routed`, `transcode`, `cluster_routing`, and `grant_lifetime_seconds` |
+| `POST /api/v2/catalog/items/{id}/themes/{theme_id}/playback`             | `url`, `expires_at`, `delivery`, and `content_type` for an authenticated login session and verified profile      |
+| `GET\|HEAD /api/v2/catalog/items/{id}/themes/{theme_id}/audio?token=...` | Theme audio this API node serves, authorized by the playback grant                                               |
 
 The optional playback request body lists what the client decodes as
 `accepted_formats`, pairs of `container` and `audio_codec` (for example

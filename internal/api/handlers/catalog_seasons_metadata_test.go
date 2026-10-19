@@ -79,6 +79,10 @@ func TestSeriesSeasonsKeepsMetadataOnlySeasons(t *testing.T) {
 		// Fully unlinked but materialized: the by-number rollback keeps the
 		// files even though no episode points at the season row.
 		{number: 4, episodes: 2, linked: 0, materialized: true},
+		// Linked but metadata-only: episodes point at the season row, yet no
+		// candidate materialized. The rollup has no entry, so the reads must
+		// still answer the metadata count and rows.
+		{number: 5, episodes: 2, linked: 2, materialized: false},
 	}
 
 	for _, f := range fixtures {
