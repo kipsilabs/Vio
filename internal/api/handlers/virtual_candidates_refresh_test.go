@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/Silo-Server/silo-server/internal/access"
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/models"
 )
@@ -120,7 +122,7 @@ func TestVirtualCandidatesDiscoveryEmptyListingIsEmptySuccess(t *testing.T) {
 			return nil
 		},
 	}
-	service.ScheduleDefaultFileProbe = func(string, *models.MediaFile, []VirtualPlaybackStream) {
+	service.ScheduleDefaultFileProbe = func(string, *models.MediaFile, []VirtualPlaybackStream, catalog.AccessFilter) {
 		t.Fatal("an empty listing must not schedule a pre-play probe chain")
 	}
 	versions, err := service.DiscoverVirtualCandidates(context.Background(), 1, "profile", "movie:x", catalog.AccessFilter{})
@@ -163,7 +165,7 @@ func TestVirtualCandidatesDiscoverySchedulesProbeAfterPersist(t *testing.T) {
 			return nil
 		},
 	}
-	service.ScheduleDefaultFileProbe = func(contentID string, got *models.MediaFile, gotStreams []VirtualPlaybackStream) {
+	service.ScheduleDefaultFileProbe = func(contentID string, got *models.MediaFile, gotStreams []VirtualPlaybackStream, gotFilter catalog.AccessFilter) {
 		order = append(order, "schedule")
 		if contentID != "movie:x" {
 			t.Fatalf("probe chain content = %q, want movie:x", contentID)
@@ -174,8 +176,12 @@ func TestVirtualCandidatesDiscoverySchedulesProbeAfterPersist(t *testing.T) {
 		if len(gotStreams) != len(streams) || gotStreams[0].URI != streams[0].URI {
 			t.Fatalf("probe chain streams = %+v, want the persisted listing", gotStreams)
 		}
+		if !slices.Equal(gotFilter.AllowedLibraryIDs, []int{42}) || gotFilter.MaxContentRating != "PG-13" {
+			t.Fatalf("probe chain filter = %+v, want the discovery request's filter", gotFilter)
+		}
 	}
-	if _, err := service.DiscoverVirtualCandidates(context.Background(), 1, "profile", "movie:x", catalog.AccessFilter{}); err != nil {
+	filter := catalog.AccessFilter{AllowedLibraryIDs: []int{42}, MaturityLimits: access.MaturityLimits{MaxContentRating: "PG-13"}}
+	if _, err := service.DiscoverVirtualCandidates(context.Background(), 1, "profile", "movie:x", filter); err != nil {
 		t.Fatalf("discovery: %v", err)
 	}
 	if len(order) != 2 || order[0] != "persist" || order[1] != "schedule" {
