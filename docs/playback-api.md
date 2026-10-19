@@ -178,9 +178,12 @@ When enabled, the web detail page calls
 virtual movie or episode, without waiting for Play. The operation enforces the
 same account/profile access filter as watch detail. It reuses the provider
 candidate cache, coalesces concurrent discovery of the same source, persists
-successful non-empty listings, and answers `204 No Content`. A disabled or
-unwired service answers `503`; a whole-series or non-virtual target answers
-`422`. Provider failures leave existing candidates intact.
+non-empty listings, and answers `204 No Content`. A provider listing that
+succeeds with no candidates is a valid empty discovery: it answers `204`,
+persists nothing, and leaves stored candidates intact. A disabled or unwired
+service answers `503`; a whole-series or non-virtual target answers `422`.
+Provider unavailability and timeouts answer `503` and leave existing candidates
+intact. The explicit Refresh List action stays available as the retry path.
 
 Discovery does not request downloads, search indexers, or open media URLs.
 After success, clients reload item and watch detail to display the persisted

@@ -25,6 +25,13 @@ const virtualCandidatesRefreshTimeout = 30 * time.Second
 // answers a retryable dependency problem and never touches the persisted rows.
 var ErrVirtualRefreshProvider = errors.New("virtual candidate provider refresh failed")
 
+// errVirtualNoCandidates marks a provider listing that completed successfully
+// with zero candidates. It is a valid empty answer, not a provider failure:
+// discovery answers it as success and leaves the stored rows untouched. It is
+// wrapped in ErrVirtualRefreshProvider so the refresh surfaces keep their
+// existing retryable-error contract.
+var errVirtualNoCandidates = errors.New("provider returned no candidates")
+
 // refreshEmbeddedURLPattern matches request URLs embedded in transport error
 // text (a *url.Error renders as `Get "https://host/path?query": ...`). Provider
 // URLs may carry credentials or tokens, so they are redacted from any message
@@ -37,12 +44,14 @@ var refreshEmbeddedURLPattern = regexp.MustCompile(`https?://[^\s"']+`)
 // the message. A bare "the provider could not be reached" cannot distinguish
 // a dead endpoint from a slow one, a rate limit, an ID-translation failure,
 // or an empty answer — and the async job persists exactly this message, so
-// the version-list banner can only show what is kept here.
+// the version-list banner can only show what is kept here. Discovery does not
+// reach this mapping for an empty answer: it treats that as a successful empty
+// result, while an explicit refresh keeps the retryable answer.
 func providerUnavailableError(err error) error {
+	if errors.Is(err, errVirtualNoCandidates) {
+		return apiError(http.StatusServiceUnavailable, "unavailable", "The provider answered but listed no candidates; try again.")
+	}
 	if cause := refreshProviderCause(err); cause != "" {
-		if strings.Contains(cause, "provider returned no candidates") {
-			return apiError(http.StatusServiceUnavailable, "unavailable", "The provider answered but listed no candidates; try again.")
-		}
 		return apiError(http.StatusServiceUnavailable, "unavailable", "The provider could not be reached ("+cause+"); try again.")
 	}
 	return apiError(http.StatusServiceUnavailable, "unavailable", "The provider could not be reached; try again.")
@@ -181,6 +190,7 @@ func (s *VirtualCandidatesRefreshService) listVirtualCandidates(ctx context.Cont
 	if len(sources) == 0 {
 		return nil, apiError(http.StatusUnprocessableEntity, "validation_failed", "The item has no virtual candidates to refresh.")
 	}
+	sawCandidateListing := false
 	for _, source := range sources {
 		key := keyPrefix + virtualSourceRefreshKey(source)
 		// Do not bind the shared work to the first caller's context: a client
@@ -204,14 +214,28 @@ func (s *VirtualCandidatesRefreshService) listVirtualCandidates(ctx context.Cont
 		case refreshRes = <-refreshCh:
 		}
 		if refreshRes.Err != nil {
+			if keyPrefix == "discover:" && errors.Is(refreshRes.Err, errVirtualNoCandidates) {
+				// The provider answered with zero candidates. Discovery treats
+				// that as a valid empty result rather than a dependency
+				// failure; the listing was not persisted, so stored rows stay
+				// untouched.
+				continue
+			}
 			if errors.Is(refreshRes.Err, ErrVirtualRefreshProvider) {
 				return nil, providerUnavailableError(refreshRes.Err)
 			}
 			return nil, apiError(http.StatusInternalServerError, "internal_error", "Failed to refresh virtual candidates")
 		}
+		sawCandidateListing = true
 		// A coalesced waiter reuses the winner's persistence; nothing more to
 		// do for this source.
 		_ = refreshRes.Shared
+	}
+	if keyPrefix == "discover:" && !sawCandidateListing {
+		// Every provider source answered with an empty listing. Report the
+		// true empty result instead of re-reading a detail whose versions were
+		// never this discovery's answer.
+		return []catalog.FileVersion{}, nil
 	}
 	detail, err := s.Detail.WatchDetail(ctx, userID, profileID, contentID, filter)
 	if err != nil {
@@ -301,11 +325,12 @@ func (s *VirtualCandidatesRefreshService) listSource(ctx context.Context, source
 		return nil, fmt.Errorf("%w: %w", ErrVirtualRefreshProvider, err)
 	}
 	if len(streams) == 0 {
-		// A zero-count listing is a provider hiccup, not an empty title. It must
-		// not reach ReplaceVirtualCandidates: persisting it would sweep or
-		// rewrite healthy stored candidates. Surface the same retryable provider
-		// failure the caller already understands, and leave the rows untouched.
-		return nil, fmt.Errorf("%w: provider returned no candidates", ErrVirtualRefreshProvider)
+		// A zero-count listing is a valid empty provider answer, not a
+		// reachability failure. It must not reach ReplaceVirtualCandidates:
+		// persisting it would sweep or rewrite healthy stored candidates.
+		// Discovery treats the sentinel as an empty success; the explicit
+		// refresh surfaces keep answering it as retryable.
+		return nil, fmt.Errorf("%w: %w", ErrVirtualRefreshProvider, errVirtualNoCandidates)
 	}
 	// Persist under the listing timeout, not the detached caller context: the
 	// database write must not outlive the provider budget that bounds this
