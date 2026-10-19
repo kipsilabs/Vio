@@ -94,6 +94,8 @@ var restartRequiredKeys = map[string]bool{
 	// fixed-capacity channel sized at construction.
 	"ai.max_concurrent_jobs":          true,
 	"subtitle_ai.max_concurrent_jobs": true,
+	// The virtual probe evidence cache is built once per server boot.
+	"virtual_library.playback_probe_cache_minutes": true,
 
 	// Catalog search provider construction is intentionally startup-bound in v1.
 	"catalog.search.provider":                      true,

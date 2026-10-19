@@ -200,7 +200,7 @@ after that wait and be visible on a later request.
 
 When enabled, a leaf catalog detail read — `GET /api/v2/catalog/items/{id}`
 resolving to a virtual movie or individual episode — runs the same discovery
-and re-reads the item detail before answering, under a 2-second waiting
+and re-reads the item detail before answering, under a 3-second waiting
 budget: browsing is the hot path and native clients such as Android read item
 detail alone before play. Shared provider work keeps running detached from
 the request, so a listing that finishes after the budget is visible on a
@@ -208,6 +208,41 @@ later read. Discovery failure, a timeout, or a failed detail re-read returns
 the original detail. Eligibility reads the stored source rows and never the
 response's redacted file paths, so viewers without file-path visibility reach
 the same discovery.
+
+The catalog wait is tuned with the admin Streaming setting
+`virtual_library.catalog_discovery_budget_ms` (500-10000, default 3000). It
+is read on each detail request, so saving it does not require a restart.
+Measured provider scrapes vary from tens of milliseconds to about 2.5s, and
+the built-in default absorbs the wall-clocked overhead the scrape accrues
+before persistence; the watch path keeps its full 15-second budget.
+
+Leaf answers carry an additive `has_virtual_source` boolean. It reports
+whether the item holds persisted virtual candidate groups, read from the same
+stored rows discovery uses, and it exists independently of whether discovery
+is enabled or its budget expired — a viewer whose file paths are redacted
+still learns whether the item's source rows live on the provider. The field
+does not promise additional playable versions beyond what the versions
+fields list, and `true` is its only rendered value: local items, non-leaf
+items (series, season, lists), and failed lookups leave the field out. It
+appears on `GET /api/v2/catalog/items/{id}`, `GET /api/v2/watch/{id}`, and
+the admin metadata update response, keeping v1 answers byte-identical.
+
+After discovery persists a listing, the server schedules one detached
+pre-play probe chain for the opened item: it re-reads the item's default
+version, requires that the default row is a persisted candidate whose exact
+bytes the just-persisted listing names, and probes that candidate through
+the ordinary background evidence path (queued, coalescing write). A neutral
+group row is never probed speculatively — it may resolve to a sibling
+candidate, so the play path's own probe handles it. Chains are bounded (two
+concurrent, one per item, a whole-chain deadline, and the shared probe
+gate), never block any API response, and never gate or delay playback: a
+chain may record evidence before a play attempt resolves the same row, in
+which case that attempt reuses it, and a play attempt that resolves first
+probes on its own as usual. The queued evidence write follows the existing
+persistence rules, including their stale-write protections; probing
+failures arm the same failure damper the playback path uses, an
+already-stamped row is skipped, and every unexpected chain failure —
+including a panic — is contained to the chain.
 
 Local-file details, version-only routes, browse results, and series, season,
 and episode lists — including `GET /api/v2/catalog/items/{id}/versions`,

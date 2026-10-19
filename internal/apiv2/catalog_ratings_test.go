@@ -29,7 +29,7 @@ func ratedDetail() *catalogpkg.ItemDetail {
 }
 
 func TestCatalogItemDetailShowsIMDbAndTMDBByDefault(t *testing.T) {
-	out := catalogItemDetailOf(ratedDetail(), ratingsources.Selection{})
+	out := catalogItemDetailOf(ratedDetail(), ratingsources.Selection{}, nil)
 
 	want := []CatalogRating{
 		{Source: "imdb", Name: "IMDb", Score: 85, Display: "8.5"},
@@ -44,12 +44,12 @@ func TestCatalogItemDetailShowsIMDbAndTMDBByDefault(t *testing.T) {
 // on every member of the detail, so a client that reads rating_rt_critic or
 // rating_sources directly still follows the administrator's choice.
 func TestCatalogItemDetailHidesSourcesAnAdministratorHasNotTurnedOn(t *testing.T) {
-	out := catalogItemDetailOf(ratedDetail(), ratingsources.Selection{})
+	out := catalogItemDetailOf(ratedDetail(), ratingsources.Selection{}, nil)
 	if out.RatingIMDB == nil || out.RatingRTCritic != nil || out.RatingRTAudience != nil || out.RatingSources != nil {
 		t.Fatalf("imdb=%v rt=%v audience=%v sources=%+v; want IMDb and TMDB only", out.RatingIMDB, out.RatingRTCritic, out.RatingRTAudience, out.RatingSources)
 	}
 
-	out = catalogItemDetailOf(ratedDetail(), ratingsources.NewSelection("metacritic").WithDeclared(mdblistSources))
+	out = catalogItemDetailOf(ratedDetail(), ratingsources.NewSelection("metacritic").WithDeclared(mdblistSources), nil)
 	if len(out.RatingSources) != 1 || out.RatingSources[0].Source != "metacritic" || out.RatingRTCritic != nil {
 		t.Fatalf("with Metacritic on: rt=%v sources=%+v; want the Metacritic row only", out.RatingRTCritic, out.RatingSources)
 	}
@@ -59,7 +59,7 @@ func TestCatalogItemDetailHidesSourcesAnAdministratorHasNotTurnedOn(t *testing.T
 func TestCatalogItemDetailKeepsStoredRatingsForCurators(t *testing.T) {
 	d := ratedDetail()
 	d.ViewerCurates = true
-	out := catalogItemDetailOf(d, ratingsources.Selection{})
+	out := catalogItemDetailOf(d, ratingsources.Selection{}, nil)
 	if out.RatingRTCritic == nil || out.RatingRTAudience == nil || len(out.RatingSources) != 1 {
 		t.Fatalf("rt=%v audience=%v sources=%+v; want every stored rating", out.RatingRTCritic, out.RatingRTAudience, out.RatingSources)
 	}
@@ -69,7 +69,7 @@ func TestCatalogItemDetailKeepsStoredRatingsForCurators(t *testing.T) {
 }
 
 func TestCatalogItemDetailAddsTurnedOnSources(t *testing.T) {
-	out := catalogItemDetailOf(ratedDetail(), ratingsources.NewSelection("rt_critic", "metacritic").WithDeclared(mdblistSources))
+	out := catalogItemDetailOf(ratedDetail(), ratingsources.NewSelection("rt_critic", "metacritic").WithDeclared(mdblistSources), nil)
 
 	var got []string
 	for _, r := range out.Ratings {
@@ -82,7 +82,7 @@ func TestCatalogItemDetailAddsTurnedOnSources(t *testing.T) {
 }
 
 func TestCatalogItemDetailRatingsAreNeverNull(t *testing.T) {
-	out := catalogItemDetailOf(&catalogpkg.ItemDetail{ContentID: "movie:x", Type: "movie"}, ratingsources.Selection{})
+	out := catalogItemDetailOf(&catalogpkg.ItemDetail{ContentID: "movie:x", Type: "movie"}, ratingsources.Selection{}, nil)
 	if out.Ratings == nil {
 		t.Fatal("ratings is nil; the member is empty, never null")
 	}
@@ -123,13 +123,13 @@ func TestCatalogItemDetailRatingSourcesFollowTheSelection(t *testing.T) {
 		{Source: "tmdb", Score: 82.5},
 	}
 	var got []string
-	for _, source := range catalogItemDetailOf(d, ratingsources.NewSelection("metacritic", "rt_critic", "letterboxd").WithDeclared(mdblistSources)).RatingSources {
+	for _, source := range catalogItemDetailOf(d, ratingsources.NewSelection("metacritic", "rt_critic", "letterboxd").WithDeclared(mdblistSources), nil).RatingSources {
 		got = append(got, source.Source)
 	}
 	if want := []string{"tmdb", "rt_critic", "metacritic"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("rating_sources = %q, want %q", got, want)
 	}
-	if out := catalogItemDetailOf(d, ratingsources.Selection{}); len(out.RatingSources) != 1 {
+	if out := catalogItemDetailOf(d, ratingsources.Selection{}, nil); len(out.RatingSources) != 1 {
 		t.Fatalf("rating_sources = %+v, want TMDB only by default", out.RatingSources)
 	}
 }

@@ -42,43 +42,69 @@ const (
 	// catalog leaf detail read: browsing is the hot path (Android opens item
 	// detail before any watch request), so the answer keeps a short budget
 	// while the discovery service keeps working detached from it.
-	preplayDiscoveryCatalogBudget = 2 * time.Second
+	//
+	// Three seconds, not two: cold provider scrapes run anywhere from tens of
+	// milliseconds to about 2.5s, and the original two-second budget cut the
+	// longest of them off after the wall-clock overhead around the scrape.
+	// Android has no refetch of its own, so a budget loss is a lost
+	// first-open answer, not a delayed one. Deployments tune it with the
+	// admin Streaming setting virtual_library.catalog_discovery_budget_ms.
+	preplayDiscoveryCatalogBudget = 3 * time.Second
 )
 
-func (reg *Registry) discoverDetailVersions(ctx context.Context, contentID, mediaType string, filter catalogpkg.AccessFilter, trigger string, budget time.Duration) bool {
+// preplayDiscoveryCatalogBudgetFor resolves the catalog leaf detail budget:
+// the configured setting when wired, otherwise the built-in default. A
+// non-positive answer (unset reader, unreadable setting) falls back to the
+// default rather than stretching the wait.
+func (reg *Registry) preplayDiscoveryCatalogBudgetFor(ctx context.Context) time.Duration {
+	if reg.deps.PreplayDiscoveryBudgetMs == nil {
+		return preplayDiscoveryCatalogBudget
+	}
+	if ms := reg.deps.PreplayDiscoveryBudgetMs(ctx); ms > 0 {
+		return time.Duration(ms) * time.Millisecond
+	}
+	return preplayDiscoveryCatalogBudget
+}
+
+func (reg *Registry) discoverDetailVersions(ctx context.Context, contentID, mediaType string, filter catalogpkg.AccessFilter, trigger string, budget time.Duration) (discovered, hasVirtualSource bool) {
 	claims := claimsFrom(ctx)
 	if claims == nil || (mediaType != themeOwnerMovie && mediaType != themeOwnerEpisode) ||
-		reg.deps.VirtualCandidatesDiscovery == nil || reg.deps.PreplayDiscoveryEnabled == nil ||
-		!reg.deps.PreplayDiscoveryEnabled(ctx) {
-		return false
+		reg.deps.VirtualCandidatesDiscovery == nil {
+		return false, false
 	}
 	// Eligibility reads the stored rows server-side instead of the caller's
 	// (possibly path-redacted) version list, so ordinary viewers reach the
-	// same discovery the watch path performs.
+	// same discovery the watch path performs. It also feeds the detail
+	// response's has_virtual_source hint, so it runs regardless of whether
+	// discovery is enabled.
 	virtual, err := reg.deps.VirtualCandidatesDiscovery.HasVirtualSource(ctx, contentID)
 	if err != nil {
 		slog.WarnContext(ctx, "pre-play version discovery skipped", "component", "apiv2", "item_id", contentID,
 			"trigger", trigger, "reason", "eligibility_lookup_failed", "error", err)
-		return false
+		return false, false
 	}
+	hasVirtualSource = virtual
 	if !virtual {
-		return false
+		return false, false
+	}
+	if reg.deps.PreplayDiscoveryEnabled == nil || !reg.deps.PreplayDiscoveryEnabled(ctx) {
+		return false, hasVirtualSource
 	}
 	started := time.Now()
 	discoveryCtx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 	slog.InfoContext(ctx, "pre-play version discovery started", "component", "apiv2", "item_id", contentID, "trigger", trigger)
-	discovered, err := reg.deps.VirtualCandidatesDiscovery.DiscoverVirtualCandidates(
+	listed, listErr := reg.deps.VirtualCandidatesDiscovery.DiscoverVirtualCandidates(
 		discoveryCtx, claims.UserID, profileFrom(ctx), contentID, filter,
 	)
-	if err != nil {
+	if listErr != nil {
 		slog.WarnContext(ctx, "pre-play version discovery unavailable", "component", "apiv2", "item_id", contentID,
 			"trigger", trigger, "duration_ms", time.Since(started).Milliseconds())
-		return false
+		return false, true
 	}
 	slog.InfoContext(ctx, "pre-play version discovery completed", "component", "apiv2", "item_id", contentID,
-		"trigger", trigger, "count", len(discovered), "duration_ms", time.Since(started).Milliseconds())
-	return true
+		"trigger", trigger, "count", len(listed), "duration_ms", time.Since(started).Milliseconds())
+	return true, true
 }
 
 // VirtualReleaseRequestService requests one stored indexer release on the

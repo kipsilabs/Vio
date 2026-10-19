@@ -411,6 +411,16 @@ type CatalogItemDetail struct {
 	Audiobook                       *catalogpkg.AudiobookDetailExtension `json:"audiobook,omitempty"`
 	Ebook                           *catalogpkg.EbookDetailExtension     `json:"ebook,omitempty"`
 	Manga                           *catalogpkg.MangaDetailExtension     `json:"manga,omitempty"`
+	// HasVirtualSource renders only when the item carries persisted virtual
+	// candidate groups (provider-hosted versions); the value is always true.
+	// The read comes from the same stored rows discovery uses and is
+	// independent of whether discovery is enabled, so a persisted
+	// redacted-path viewer still learns whether the item's source rows live
+	// on the provider; it does not promise additional playable versions
+	// beyond what the versions fields already list. Absent when the item is
+	// not a movie or episode, holds no virtual candidates, or the lookup
+	// failed.
+	HasVirtualSource *bool `json:"has_virtual_source,omitempty"`
 	// Collections are the visible collections this item belongs to: the
 	// title page's "Collections" row, each linking to the collection's view.
 	// Present on every v2 item detail, as an empty array when the item is in
@@ -1203,16 +1213,26 @@ func (reg *Registry) getCatalogItem(ctx context.Context, in *CatalogItemDeviceIn
 	// answer, so clients that only read catalog detail — Android among them —
 	// still see versions before pressing Play. Discovery failure keeps the
 	// original detail; a detached shared listing becomes visible on a later
-	// read.
-	if detail != nil && reg.discoverDetailVersions(ctx, detail.ContentID, detail.Type, viewer.Access, "catalog_detail", preplayDiscoveryCatalogBudget) {
-		refreshed, refreshErr := svc.ItemDetail(ctx, viewer, in.ID)
-		if refreshErr == nil && refreshed != nil {
-			detail = refreshed
-		} else {
-			slog.WarnContext(ctx, "pre-play version discovery detail reload failed", "component", "apiv2", "item_id", detail.ContentID, "trigger", "catalog_detail")
+	// read. The eligibility read the discovery performs also feeds the
+	// detail's has_virtual_source hint, which exists independently of whether
+	// discovery is enabled.
+	var virtualSource *bool
+	if detail != nil {
+		discovered, hasVirtualSource := reg.discoverDetailVersions(ctx, detail.ContentID, detail.Type, viewer.Access, "catalog_detail", reg.preplayDiscoveryCatalogBudgetFor(ctx))
+		if hasVirtualSource {
+			source := hasVirtualSource
+			virtualSource = &source
+		}
+		if discovered {
+			refreshed, refreshErr := svc.ItemDetail(ctx, viewer, in.ID)
+			if refreshErr == nil && refreshed != nil {
+				detail = refreshed
+			} else {
+				slog.WarnContext(ctx, "pre-play version discovery detail reload failed", "component", "apiv2", "item_id", detail.ContentID, "trigger", "catalog_detail")
+			}
 		}
 	}
-	out := catalogItemDetailOf(detail, reg.ratingSelection(ctx))
+	out := catalogItemDetailOf(detail, reg.ratingSelection(ctx), virtualSource)
 	out.Collections = NonNil(reg.itemCollections(ctx, detail, viewer.Access))
 	if reg.deps.ThemeSongs != nil && (detail.Type == themeOwnerMovie || detail.Type == themeOwnerSeries || detail.Type == themeOwnerSeason || detail.Type == themeOwnerEpisode) {
 		themes, err := reg.deps.ThemeSongs.Discover(ctx, in.ID, true, viewer.Access)
@@ -1458,8 +1478,9 @@ func catalogItemCardOf(d *catalogpkg.ItemDetail) CatalogItem {
 // from the same detail, so a detail never disagrees with its own card. A
 // viewer who curates the item's metadata gets every stored rating, for the
 // metadata editor; everyone else gets only the ratings sel shows, as on
-// cards.
-func catalogItemDetailOf(d *catalogpkg.ItemDetail, sel ratingsources.Selection) CatalogItemDetail {
+// cards. virtualSource, when non-nil, renders the has_virtual_source hint
+// read before discovery; nil leaves it absent.
+func catalogItemDetailOf(d *catalogpkg.ItemDetail, sel ratingsources.Selection, virtualSource *bool) CatalogItemDetail {
 	card := catalogItemCardOf(d)
 	ratingSources := d.RatingSources
 	if !d.ViewerCurates {
@@ -1478,6 +1499,7 @@ func catalogItemDetailOf(d *catalogpkg.ItemDetail, sel ratingsources.Selection) 
 		EffectiveVersionHDR:        d.EffectiveVersionHDR, EffectiveVersionCodecVideo: d.EffectiveVersionCodecVideo, EffectiveVersionEditionKey: d.EffectiveVersionEditionKey,
 		Audiobook: d.Audiobook, Ebook: d.Ebook, Manga: d.Manga, Collections: []ItemCollection{},
 	}
+	out.HasVirtualSource = virtualSource
 	if d.EffectiveSubtitleTrackSignature != nil {
 		out.EffectiveSubtitleTrackSignature = watchSignatureOf(*d.EffectiveSubtitleTrackSignature)
 	}

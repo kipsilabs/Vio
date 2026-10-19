@@ -120,6 +120,16 @@ type VirtualCandidatesRefreshService struct {
 	// Detail reads the pre- and post-refresh watch detail, which also enforces
 	// access and produces the version wire shape.
 	Detail VirtualCandidatesDetailReader
+	// ScheduleDefaultFileProbe, when non-nil, is called from inside the shared
+	// listing work immediately after a discovery run successfully persists one
+	// source group (never for :refresh runs). The hand-off is the successful
+	// persistence itself, not the request's return: the request-side caller
+	// can time out, disconnect, or release its budget before the winner lands
+	// the listing, while the detached work — and the chain scheduled from it —
+	// continues. The callback must be non-blocking: admission (an atomic
+	// check) only; the chain's own reads and probing happen in admitted work.
+	// PlaybackHandler.ScheduleDefaultFileProbe implements this.
+	ScheduleDefaultFileProbe func(contentID string, source *models.MediaFile, streams []VirtualPlaybackStream)
 
 	flight singleflight.Group
 }
@@ -181,6 +191,13 @@ func (s *VirtualCandidatesRefreshService) listVirtualCandidates(ctx context.Cont
 	if len(sources) == 0 {
 		return nil, apiError(http.StatusUnprocessableEntity, "validation_failed", "The item has no virtual candidates to refresh.")
 	}
+	// Only discovery schedules the pre-play probe chain. The ":refresh" job
+	// path force-lists under operator intent and carries its own enrichers;
+	// a chain on top would double-probe rows that path already targets.
+	var chainKey string
+	if keyPrefix == "discover:" {
+		chainKey = contentID
+	}
 	for _, source := range sources {
 		key := keyPrefix + virtualSourceRefreshKey(source)
 		// Do not bind the shared work to the first caller's context: a client
@@ -191,7 +208,7 @@ func (s *VirtualCandidatesRefreshService) listVirtualCandidates(ctx context.Cont
 		// own cancellation while waiting via the select below.
 		workCtx := context.WithoutCancel(ctx)
 		refreshCh := s.flight.DoChan(key, func() (any, error) {
-			_, err := s.listSource(workCtx, source, userID, profileID, lister)
+			_, err := s.listSource(workCtx, source, userID, profileID, lister, chainKey)
 			return nil, err
 		})
 		var refreshRes singleflight.Result
@@ -283,12 +300,14 @@ func (s *VirtualCandidatesRefreshService) RefreshSources(ctx context.Context, co
 }
 
 // refreshSource force-lists one virtual source group and persists the result,
-// returning the persisted streams so the caller can reuse the listing.
+// returning the persisted streams so the caller can reuse the listing. The
+// empty chain key schedules nothing: refresh runs target rows through their
+// own job machinery.
 func (s *VirtualCandidatesRefreshService) refreshSource(ctx context.Context, source *models.MediaFile, userID int, profileID string) ([]VirtualPlaybackStream, error) {
-	return s.listSource(ctx, source, userID, profileID, s.ListFresh)
+	return s.listSource(ctx, source, userID, profileID, s.ListFresh, "")
 }
 
-func (s *VirtualCandidatesRefreshService) listSource(ctx context.Context, source *models.MediaFile, userID int, profileID string, lister VirtualPlaybackStreamLister) ([]VirtualPlaybackStream, error) {
+func (s *VirtualCandidatesRefreshService) listSource(ctx context.Context, source *models.MediaFile, userID int, profileID string, lister VirtualPlaybackStreamLister, chainKey string) ([]VirtualPlaybackStream, error) {
 	if source == nil {
 		return nil, nil
 	}
@@ -313,6 +332,17 @@ func (s *VirtualCandidatesRefreshService) listSource(ctx context.Context, source
 	// waiter disconnect; it must not make persistence unbounded.)
 	if err := s.Persist(listCtx, source, streams); err != nil {
 		return nil, err
+	}
+	if chainKey != "" && s.ScheduleDefaultFileProbe != nil {
+		// Persistence landed: schedule the pre-play probe chain from here —
+		// inside the detached shared work, not on the request side — so a
+		// winner whose waiter has already disconnected still schedules it.
+		// The callback only admits and snapshots; it must never delay the shared
+		// answer coalesced waiters read. Pass a copy so the singleflight value
+		// cannot be aliased by the chain.
+		copied := make([]VirtualPlaybackStream, len(streams))
+		copy(copied, streams)
+		s.ScheduleDefaultFileProbe(chainKey, source, copied)
 	}
 	return streams, nil
 }

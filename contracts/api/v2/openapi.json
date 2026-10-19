@@ -22349,6 +22349,9 @@
             },
             "type": "array"
           },
+          "has_virtual_source": {
+            "type": "boolean"
+          },
           "imdb_id": {
             "type": "string"
           },
@@ -48024,6 +48027,9 @@
           "episode_number": {
             "format": "int64",
             "type": "integer"
+          },
+          "has_virtual_source": {
+            "type": "boolean"
           },
           "indexer_releases": {
             "description": "Releases that exist on the indexers but are not downloaded on the provider; empty, never null",

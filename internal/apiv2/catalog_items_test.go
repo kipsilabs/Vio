@@ -380,10 +380,23 @@ func TestDetailPreplayDiscovery(t *testing.T) {
 						Versions []struct {
 							FileID string `json:"file_id"`
 						} `json:"versions"`
+						HasVirtualSource *bool `json:"has_virtual_source"`
 					}
 					decodeJSON(t, rec.Body, &body)
 					if len(body.Versions) != 1 || body.Versions[0].FileID != test.wantFileID {
 						t.Fatalf("versions = %+v", body.Versions)
+					}
+					// The hint is present for eligible virtual leaves (regardless
+					// of whether discovery is enabled or succeeded), and absent
+					// for non-leaf media, local items, and unwired services.
+					wantVirtualHint := (test.mediaType == "movie" || test.mediaType == "episode") &&
+						strings.HasPrefix(test.path, "virtual://") && !test.unwired
+					if wantVirtualHint {
+						if body.HasVirtualSource == nil || !*body.HasVirtualSource {
+							t.Fatalf("has_virtual_source = %v, want true", body.HasVirtualSource)
+						}
+					} else if body.HasVirtualSource != nil {
+						t.Fatalf("has_virtual_source = %v, want absent", *body.HasVirtualSource)
 					}
 				}
 				if fake.discoveries != test.wantCalls || fake.reads != test.wantReads {
