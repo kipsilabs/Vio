@@ -200,7 +200,7 @@ func TestCatalogItemDetailOfCarriesEpisodeReleaseState(t *testing.T) {
 		AirDate: &air, ReleaseState: upcoming,
 		Cast: []catalogpkg.CastCredit{}, Crew: []catalogpkg.CrewCredit{},
 		Genres: []string{}, Versions: []catalogpkg.FileVersion{}, Subtitles: []catalogpkg.SubtitleInfo{},
-	}, ratingsources.Selection{})
+	}, ratingsources.Selection{}, nil)
 	if out.ReleaseState != "upcoming" {
 		t.Fatalf("episode detail release_state = %q, want upcoming", out.ReleaseState)
 	}
@@ -212,7 +212,7 @@ func TestCatalogItemDetailOfCarriesEpisodeReleaseState(t *testing.T) {
 		ContentID: "movie:heat-1995", Type: "movie", Title: "Heat",
 		Cast: []catalogpkg.CastCredit{}, Crew: []catalogpkg.CrewCredit{},
 		Genres: []string{}, Versions: []catalogpkg.FileVersion{}, Subtitles: []catalogpkg.SubtitleInfo{},
-	}, ratingsources.Selection{})
+	}, ratingsources.Selection{}, nil)
 	if movie.ReleaseState != "" {
 		t.Fatalf("movie detail release_state = %q, want absent", movie.ReleaseState)
 	}

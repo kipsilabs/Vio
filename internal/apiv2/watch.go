@@ -61,6 +61,13 @@ type WatchDetail struct {
 	EffectiveVersionHDR             *bool                   `json:"effective_version_hdr,omitempty"`
 	EffectiveVersionCodecVideo      *string                 `json:"effective_version_codec_video,omitempty"`
 	EffectiveVersionEditionKey      *string                 `json:"effective_version_edition_key,omitempty"`
+	// HasVirtualSource renders only when the item carries persisted virtual
+	// candidate groups; the value is always true. The read comes from the
+	// same stored rows discovery uses and is independent of whether discovery
+	// is enabled. Absent for non-leaf items, items without virtual
+	// candidates, and failed lookups. It does not promise additional playable
+	// versions beyond what the versions fields list.
+	HasVirtualSource *bool `json:"has_virtual_source,omitempty"`
 }
 
 // WatchFileVersion is one playable file of the item.
@@ -365,15 +372,28 @@ func (reg *Registry) getWatchState(ctx context.Context, in *WatchDetailInput) (*
 	if err != nil {
 		return nil, watchDetailProblem(err)
 	}
-	if detail != nil && reg.discoverDetailVersions(ctx, detail.ContentID, detail.Type, filter, "watch_detail", preplayDiscoveryWatchBudget) {
-		refreshed, refreshErr := reg.deps.Watch.WatchDetail(ctx, claims.UserID, profileFrom(ctx), string(in.ID), filter)
-		if refreshErr == nil && refreshed != nil {
-			detail = refreshed
-		} else {
-			slog.WarnContext(ctx, "pre-play version discovery detail reload failed", "component", "apiv2", "item_id", in.ID, "trigger", "watch_detail")
+	// The eligibility read that discovery performs also feeds
+	// has_virtual_source, independent of whether discovery is enabled or its
+	// budget expired: a leaf answer names whether the item carries persisted
+	// virtual candidates even when nothing new is discovered this read.
+	var virtualSource *bool
+	if detail != nil {
+		discovered, hasVirtualSource := reg.discoverDetailVersions(ctx, detail.ContentID, detail.Type, filter, "watch_detail", preplayDiscoveryWatchBudget)
+		if hasVirtualSource {
+			source := hasVirtualSource
+			virtualSource = &source
+		}
+		if discovered {
+			refreshed, refreshErr := reg.deps.Watch.WatchDetail(ctx, claims.UserID, profileFrom(ctx), string(in.ID), filter)
+			if refreshErr == nil && refreshed != nil {
+				detail = refreshed
+			} else {
+				slog.WarnContext(ctx, "pre-play version discovery detail reload failed", "component", "apiv2", "item_id", in.ID, "trigger", "watch_detail")
+			}
 		}
 	}
 	body := watchDetailOf(detail)
+	body.HasVirtualSource = virtualSource
 	body.IndexerReleases = reg.indexerReleasesFor(ctx, string(in.ID))
 	return &WatchDetailOutput{Body: body}, nil
 }

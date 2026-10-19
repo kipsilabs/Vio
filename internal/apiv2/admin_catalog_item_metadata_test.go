@@ -19,6 +19,9 @@ type fakeAdminItemMetadata struct {
 	id            string
 	mode          adminjob.ItemRefreshMode
 	update        handlers.UpdateItemMetadataRequest
+	// resultType shapes the detail the fake answers, so tests can exercise
+	// leaf and non-leaf documents. Empty means movie.
+	resultType string
 }
 
 func (f *fakeAdminItemMetadata) CreateItemMetadataRefresh(_ context.Context, id string, mode adminjob.ItemRefreshMode, userID int) (*models.AdminJob, error) {
@@ -29,7 +32,66 @@ func (f *fakeAdminItemMetadata) CreateItemMetadataRefresh(_ context.Context, id 
 func (f *fakeAdminItemMetadata) UpdateCatalogItemMetadata(_ context.Context, id string, req handlers.UpdateItemMetadataRequest) (*catalogsvc.ItemDetail, error) {
 	f.calls++
 	f.id, f.update = id, req
-	return &catalogsvc.ItemDetail{ContentID: id, Title: "Updated", Type: "movie"}, nil
+	resultType := f.resultType
+	if resultType == "" {
+		resultType = "movie"
+	}
+	return &catalogsvc.ItemDetail{ContentID: id, Title: "Updated", Type: resultType}, nil
+}
+
+// fakeVirtualDiscoverySource answers only the eligibility read; the editor
+// route never starts a discovery, so Discover is not implemented.
+type fakeVirtualDiscoverySource struct {
+	hasVirtual bool
+	err        error
+}
+
+func (f *fakeVirtualDiscoverySource) DiscoverVirtualCandidates(context.Context, int, string, string, catalogsvc.AccessFilter) ([]catalogsvc.FileVersion, error) {
+	return nil, nil
+}
+
+func (f *fakeVirtualDiscoverySource) HasVirtualSource(context.Context, string) (bool, error) {
+	return f.hasVirtual, f.err
+}
+
+// TestUpdateAdminItemMetadataShapesHasVirtualSource pins the editor
+// document's hint eligibility: leaf virtual media carry the boolean,
+// non-leaf media leave it out, matching the read detail's contract.
+func TestUpdateAdminItemMetadataShapesHasVirtualSource(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		resultType string
+		hasVirtual bool
+		wantField  bool
+		wantValue  bool
+	}{
+		{name: "virtual movie", resultType: "movie", hasVirtual: true, wantField: true, wantValue: true},
+		{name: "local movie", resultType: "movie", hasVirtual: false, wantField: false},
+		{name: "series", resultType: "series", hasVirtual: true, wantField: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			deps := pilotDeps(nil, nil)
+			f := &fakeAdminItemMetadata{resultType: tc.resultType}
+			deps.AdminItemMetadata = f
+			deps.PermissionGates[policy.PermissionMetadataCuration] = adminTranslationGate
+			deps.VirtualCandidatesDiscovery = &fakeVirtualDiscoverySource{hasVirtual: tc.hasVirtual}
+			h := newTestHandler(t, deps)
+
+			rec := do(t, h, "PATCH", Prefix+"/admin/items/item-1/metadata", `{"title":"Updated"}`, bearer(memberToken))
+			if rec.Code != 200 {
+				t.Fatalf("update: %d %s", rec.Code, rec.Body)
+			}
+			var detail CatalogItemDetail
+			decodeJSON(t, rec.Body, &detail)
+			if tc.wantField {
+				if detail.HasVirtualSource == nil || *detail.HasVirtualSource != tc.wantValue {
+					t.Fatalf("has_virtual_source = %v, want %v", detail.HasVirtualSource, tc.wantValue)
+				}
+			} else if detail.HasVirtualSource != nil {
+				t.Fatalf("has_virtual_source = %v, want absent", *detail.HasVirtualSource)
+			}
+		})
+	}
 }
 func TestAdminItemMetadataTransport(t *testing.T) {
 	deps := pilotDeps(nil, nil)

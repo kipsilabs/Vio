@@ -1435,6 +1435,22 @@ func newChiRouter(deps Dependencies) chi.Router {
 						EpisodeFiles: deps.FileRepo.GetByEpisodeID,
 						Detail:       itemsHandler,
 					}
+					// The discovery path schedules the pre-play probe chain
+					// after a successful detached persistence. Both sides stay
+					// decoupled: the service knows only the callback, the
+					// handler resolves its own target through the catalog's
+					// version ordering (the same top entry the browse picker
+					// defaults to) and the file repository.
+					if detailSvc != nil && deps.FileRepo != nil {
+						virtualCandidatesRefresh.ScheduleDefaultFileProbe = playbackHandler.ScheduleDefaultFileProbe
+						playbackHandler.DefaultProbeTarget = handlers.VirtualDefaultProbeTargetFunc(func(ctx context.Context, contentID string) (*models.MediaFile, error) {
+							versions, err := detailSvc.GetItemVersions(ctx, contentID, catalog.AccessFilter{})
+							if err != nil || len(versions) == 0 {
+								return nil, err
+							}
+							return deps.FileRepo.GetByID(ctx, versions[0].FileID)
+						})
+					}
 					// The indexer-release read/request surface and the async
 					// refresh executor share the store the service owns.
 					if store := deps.VirtualLibraryService.IndexerReleases(); store != nil {
@@ -1777,7 +1793,19 @@ func newChiRouter(deps Dependencies) chi.Router {
 		}
 		if deps.Config != nil {
 			ffprobePath := scanner.FFprobePathFromFFmpeg(deps.Config.Playback.FFmpegPath)
-			virtualProbeCache := scanner.NewVirtualProbeCache(10*time.Minute, 256)
+			// The ffprobe evidence cache TTL is the admin Streaming setting
+			// virtual_library.playback_probe_cache_minutes. Unset or
+			// unreadable keeps the ten minutes the cache shipped with. It does
+			// not share virtual_library.cache_ttl_minutes with the provider
+			// listing cache; that key governs listing reuse only. The cache
+			// is built once per boot, so changes apply after a restart.
+			probeCacheTTL := time.Duration(config.DefaultVirtualLibraryPlaybackProbeCacheMinutes) * time.Minute
+			if settingsRepo != nil {
+				if raw, err := settingsRepo.Get(context.Background(), config.VirtualLibraryPlaybackProbeCacheMinutesSettingKey); err == nil {
+					probeCacheTTL = time.Duration(config.VirtualLibraryPlaybackProbeCacheMinutes(raw)) * time.Minute
+				}
+			}
+			virtualProbeCache := scanner.NewVirtualProbeCache(probeCacheTTL, 256)
 			virtualSourceProberWithHeaders := func(ctx context.Context, sourceURL string, file *models.MediaFile, headers map[string]string) (*models.MediaFile, error) {
 				return virtualProbeCache.Probe(ctx, sourceURL, file, func(probeCtx context.Context, probeURL string, probeFile *models.MediaFile) (*models.MediaFile, error) {
 					// Keep ffprobe behind the same pinned-IP relay as playback. A
@@ -3319,6 +3347,15 @@ func newChiRouter(deps Dependencies) chi.Router {
 			}
 			streaming, err := settingsRepo.Get(ctx, "virtual_library.enabled")
 			return err == nil && streaming != "false"
+		}
+		// The catalog leaf detail read prices its wait on this setting; unset
+		// or unreadable keeps apiv2's built-in default.
+		v2deps.PreplayDiscoveryBudgetMs = func(ctx context.Context) int {
+			raw, err := settingsRepo.Get(ctx, config.VirtualLibraryCatalogDiscoveryBudgetMsSettingKey)
+			if err != nil {
+				return 0
+			}
+			return config.VirtualLibraryCatalogDiscoveryBudgetMs(raw)
 		}
 	}
 	if virtualIndexerReleases != nil {

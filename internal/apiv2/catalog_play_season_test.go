@@ -19,7 +19,7 @@ func TestCatalogItemDetailPlaySeasonNumber(t *testing.T) {
 		PlayContentID: "episode:s00e01", PlaySeasonNumber: &season,
 	}
 
-	out := catalogItemDetailOf(detail, ratingsources.Selection{})
+	out := catalogItemDetailOf(detail, ratingsources.Selection{}, nil)
 	body, err := json.Marshal(out)
 	if err != nil {
 		t.Fatal(err)
@@ -37,7 +37,7 @@ func TestCatalogItemDetailPlaySeasonNumber(t *testing.T) {
 	}
 
 	detail.PlayContentID, detail.PlaySeasonNumber = "", nil
-	body, err = json.Marshal(catalogItemDetailOf(detail, ratingsources.Selection{}))
+	body, err = json.Marshal(catalogItemDetailOf(detail, ratingsources.Selection{}, nil))
 	if err != nil {
 		t.Fatal(err)
 	}

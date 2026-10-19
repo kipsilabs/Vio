@@ -20398,6 +20398,7 @@ export interface components {
       folder_paths?: string[];
       /** @description Empty, never null */
       genres: string[];
+      has_virtual_source?: boolean;
       imdb_id?: string;
       intro?: components["schemas"]["Marker"];
       is_specials?: boolean;
@@ -30869,6 +30870,7 @@ export interface components {
       effective_version_resolution?: string;
       /** Format: int64 */
       episode_number?: number;
+      has_virtual_source?: boolean;
       /** @description Releases that exist on the indexers but are not downloaded on the provider; empty, never null */
       indexer_releases: components["schemas"]["WatchIndexerRelease"][];
       intro?: components["schemas"]["WatchMarker"];

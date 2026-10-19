@@ -23,9 +23,11 @@ import { SettingField, SettingFieldStatus } from "./SettingField";
 const PROVIDER_KEYS = [
   "virtual_library.enabled",
   "virtual_library.discover_before_playback",
+  "virtual_library.catalog_discovery_budget_ms",
   "virtual_library.manifest_url",
   "virtual_library.tmdb_api_key",
   "virtual_library.cache_ttl_minutes",
+  "virtual_library.playback_probe_cache_minutes",
   "virtual_library.candidate_store_hours",
 ];
 
@@ -270,6 +272,14 @@ export default function StreamingSettings() {
             restartRequired={restartKeys.has("virtual_library.discover_before_playback")}
           />
           <SettingField
+            label="Discovery wait (ms)"
+            type="number"
+            description="How long opening a movie or episode waits for version discovery before answering with what is stored. 500–10000; 3000 default."
+            value={form.getValue("virtual_library.catalog_discovery_budget_ms")}
+            onChange={(v) => form.setValue("virtual_library.catalog_discovery_budget_ms", v)}
+            restartRequired={restartKeys.has("virtual_library.catalog_discovery_budget_ms")}
+          />
+          <SettingField
             label="TMDB API key"
             description="Optional: resolves TMDB IDs to provider IDs for broader coverage."
             value={form.getValue("virtual_library.tmdb_api_key")}
@@ -283,6 +293,14 @@ export default function StreamingSettings() {
             value={form.getValue("virtual_library.cache_ttl_minutes")}
             onChange={(v) => form.setValue("virtual_library.cache_ttl_minutes", v)}
             restartRequired={restartKeys.has("virtual_library.cache_ttl_minutes")}
+          />
+          <SettingField
+            label="Probe cache TTL (minutes)"
+            type="number"
+            description="How long a finished ffprobe verdict on a provider version stays reusable. 1–10080; 10 default. Restart to apply."
+            value={form.getValue("virtual_library.playback_probe_cache_minutes")}
+            onChange={(v) => form.setValue("virtual_library.playback_probe_cache_minutes", v)}
+            restartRequired={restartKeys.has("virtual_library.playback_probe_cache_minutes")}
           />
           <SettingField
             label="Candidate trust window (hours)"

@@ -578,9 +578,19 @@ type PlaybackHandler struct {
 	// production wires the scanner's Postgres-backed store so a restart or a
 	// different replica continues the same count.
 	VirtualAdoptionRefusalStore VirtualAdoptionRefusalStore
-	VirtualSubtitleSearcher     SubtitleSearchTrigger
-	SubtitleSearchInFlight      *sync.Map
-	DeviceCapabilitySource      DeviceCapabilityProfileSource
+	// DefaultProbeTarget re-reads the item's default playback version for the
+	// pre-play probe chain (see ScheduleDefaultFileProbe). Nil disables the
+	// chain.
+	DefaultProbeTarget VirtualDefaultProbeTarget
+	// defaultProbeChains admits and deduplicates the pre-play probe chains.
+	// Zero value is ready to use; see defaultProbeChainAdmission.
+	defaultProbeChains defaultProbeChainAdmission
+	// probeChainWG tracks live pre-play probe chains so tests can wait for
+	// them to settle. Production never waits.
+	probeChainWG            sync.WaitGroup
+	VirtualSubtitleSearcher SubtitleSearchTrigger
+	SubtitleSearchInFlight  *sync.Map
+	DeviceCapabilitySource  DeviceCapabilityProfileSource
 	// PlaybackConfig returns the current playback config (ffmpeg path,
 	// hwaccel, transcode dir). Wired to the live config in integrated mode
 	// so admin changes apply to newly started transcodes. Read it through

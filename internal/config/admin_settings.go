@@ -56,6 +56,59 @@ const SetupCompletedSettingKey = "setup.completed"
 // version of an item visible no matter which library it was opened from.
 const CatalogScopeVersionsToLibrarySettingKey = "catalog.scope_versions_to_library"
 
+// VirtualLibraryPlaybackProbeCacheMinutesSettingKey sizes the playback-time
+// virtual-source ffprobe evidence cache: how long a completed remote probe's
+// verdict stays reusable before the next playback or pre-play probe pays a
+// fresh enumeration. It is not the provider listing cache
+// (virtual_library.cache_ttl_minutes). Restart-required: the cache is built
+// once per server boot.
+const (
+	VirtualLibraryPlaybackProbeCacheMinutesSettingKey = "virtual_library.playback_probe_cache_minutes"
+	// DefaultVirtualLibraryPlaybackProbeCacheMinutes matches the previous
+	// hardwired scanner.NewVirtualProbeCache TTL, so unaffected deployments
+	// keep probing behavior identical after upgrade.
+	DefaultVirtualLibraryPlaybackProbeCacheMinutes = 10
+	MinVirtualLibraryPlaybackProbeCacheMinutes     = 1
+	MaxVirtualLibraryPlaybackProbeCacheMinutes     = 10080
+)
+
+// VirtualLibraryCatalogDiscoveryBudgetMsSettingKey bounds how long one
+// catalog leaf detail read (v2 item detail; the browse path Android opens
+// first) waits for pre-play virtual version discovery before answering with
+// whatever is already persisted. Discovery keeps running detached either way;
+// this only prices the wait in the response. The pre-play probe chain carries
+// its own separate budget and never inherits this number.
+const (
+	VirtualLibraryCatalogDiscoveryBudgetMsSettingKey = "virtual_library.catalog_discovery_budget_ms"
+	DefaultVirtualLibraryCatalogDiscoveryBudgetMs    = 3000
+	MinVirtualLibraryCatalogDiscoveryBudgetMs        = 500
+	MaxVirtualLibraryCatalogDiscoveryBudgetMs        = 10000
+)
+
+// VirtualLibraryPlaybackProbeCacheMinutes reads a stored
+// VirtualLibraryPlaybackProbeCacheMinutesSettingKey value. An unset or invalid
+// value is the default; any other integer is brought within bounds.
+func VirtualLibraryPlaybackProbeCacheMinutes(raw string) int {
+	value, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil {
+		return DefaultVirtualLibraryPlaybackProbeCacheMinutes
+	}
+	return min(max(value, MinVirtualLibraryPlaybackProbeCacheMinutes), MaxVirtualLibraryPlaybackProbeCacheMinutes)
+}
+
+// VirtualLibraryCatalogDiscoveryBudgetMs reads a stored
+// VirtualLibraryCatalogDiscoveryBudgetMsSettingKey value as whole
+// milliseconds. Writer validation rejects out-of-range values; the reader
+// still defaults and clamps defensively so an unvalidated stored value
+// cannot stretch the wait.
+func VirtualLibraryCatalogDiscoveryBudgetMs(raw string) int {
+	value, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil {
+		return DefaultVirtualLibraryCatalogDiscoveryBudgetMs
+	}
+	return min(max(value, MinVirtualLibraryCatalogDiscoveryBudgetMs), MaxVirtualLibraryCatalogDiscoveryBudgetMs)
+}
+
 // AccessUnratedContentSettingKey decides what a profile with a content-rating
 // ceiling sees for a title with no rating: an empty rating, or an explicit
 // "not rated" marker. "hide", the default, keeps such a title out of every
@@ -308,32 +361,34 @@ var adminSettingDefaults = map[string]string{
 	"markers.detect_intros":                "true",
 	"markers.detect_credits":               "true",
 
-	"virtual_library.enabled":                        "true",
-	"virtual_library.discover_before_playback":       "false",
-	"virtual_library.manifest_url":                   "",
-	"virtual_library.movie_library_id":               "1",
-	"virtual_library.series_library_id":              "2",
-	"virtual_library.tmdb_api_key":                   "",
-	"virtual_library.allow_insecure_http":            "false",
-	"virtual_library.allow_private_streams":          "false",
-	"virtual_library.cache_ttl_minutes":              "10",
-	"virtual_library.candidate_store_hours":          "720",
-	"virtual_library.schedule_refresh_minutes":       "360",
-	"virtual_library.monitor_file":                   ".vio-virtual-library-monitored.json",
-	"virtual_library.enable_quality_profiles":        "false",
-	"virtual_library.quality_preset":                 "custom",
-	"virtual_library.custom_format_preset":           "custom",
-	"virtual_library.single_stream_with_failover":    "true",
-	"virtual_library.fallback_to_any_stream":         "false",
-	"virtual_library.quality_profiles":               "",
-	"virtual_library.custom_formats":                 "",
-	"virtual_library.indexer_rss_url":                "",
-	"virtual_library.indexer_api_key":                "",
-	"virtual_library.indexer_rss_check_minutes":      "15",
-	"virtual_library.indexer_search_timeout_seconds": "20",
-	"virtual_library.altmount_url":                   "",
-	"virtual_library.altmount_api_key":               "",
-	"virtual_library.altmount_check_minutes":         "15",
+	"virtual_library.enabled":                         "true",
+	"virtual_library.discover_before_playback":        "false",
+	"virtual_library.manifest_url":                    "",
+	"virtual_library.movie_library_id":                "1",
+	"virtual_library.series_library_id":               "2",
+	"virtual_library.tmdb_api_key":                    "",
+	"virtual_library.allow_insecure_http":             "false",
+	"virtual_library.allow_private_streams":           "false",
+	"virtual_library.cache_ttl_minutes":               "10",
+	VirtualLibraryPlaybackProbeCacheMinutesSettingKey: strconv.Itoa(DefaultVirtualLibraryPlaybackProbeCacheMinutes),
+	VirtualLibraryCatalogDiscoveryBudgetMsSettingKey:  strconv.Itoa(DefaultVirtualLibraryCatalogDiscoveryBudgetMs),
+	"virtual_library.candidate_store_hours":           "720",
+	"virtual_library.schedule_refresh_minutes":        "360",
+	"virtual_library.monitor_file":                    ".vio-virtual-library-monitored.json",
+	"virtual_library.enable_quality_profiles":         "false",
+	"virtual_library.quality_preset":                  "custom",
+	"virtual_library.custom_format_preset":            "custom",
+	"virtual_library.single_stream_with_failover":     "true",
+	"virtual_library.fallback_to_any_stream":          "false",
+	"virtual_library.quality_profiles":                "",
+	"virtual_library.custom_formats":                  "",
+	"virtual_library.indexer_rss_url":                 "",
+	"virtual_library.indexer_api_key":                 "",
+	"virtual_library.indexer_rss_check_minutes":       "15",
+	"virtual_library.indexer_search_timeout_seconds":  "20",
+	"virtual_library.altmount_url":                    "",
+	"virtual_library.altmount_api_key":                "",
+	"virtual_library.altmount_check_minutes":          "15",
 
 	"playback.ffmpeg_path":                           "",
 	playbackTranscodeDirSettingKey:                   DefaultTranscodeDir,
@@ -697,6 +752,10 @@ func NormalizeAdminSetting(key, raw string) (string, error) {
 		return normalizeAdminInt(key, value, 1, 1000000)
 	case "virtual_library.cache_ttl_minutes", "virtual_library.indexer_rss_check_minutes", "virtual_library.altmount_check_minutes":
 		return normalizeAdminInt(key, value, 1, 10080)
+	case VirtualLibraryPlaybackProbeCacheMinutesSettingKey:
+		return normalizeAdminInt(key, value, MinVirtualLibraryPlaybackProbeCacheMinutes, MaxVirtualLibraryPlaybackProbeCacheMinutes)
+	case VirtualLibraryCatalogDiscoveryBudgetMsSettingKey:
+		return normalizeAdminInt(key, value, MinVirtualLibraryCatalogDiscoveryBudgetMs, MaxVirtualLibraryCatalogDiscoveryBudgetMs)
 	case "virtual_library.indexer_search_timeout_seconds":
 		return normalizeAdminInt(key, value, 5, 900)
 	case "virtual_library.candidate_store_hours":

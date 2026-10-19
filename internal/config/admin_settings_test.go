@@ -338,6 +338,71 @@ func TestNormalizeAdminSettingAcceptsSoftwareFallbackPolicy(t *testing.T) {
 	}
 }
 
+func TestNormalizeAdminSettingValidatesVirtualProbeTuningBounds(t *testing.T) {
+	for _, tc := range []struct {
+		key    string
+		value  string
+		reject bool
+	}{
+		{VirtualLibraryPlaybackProbeCacheMinutesSettingKey, "10", false},
+		{VirtualLibraryPlaybackProbeCacheMinutesSettingKey, "0", true},
+		{VirtualLibraryPlaybackProbeCacheMinutesSettingKey, "-3", true},
+		{VirtualLibraryPlaybackProbeCacheMinutesSettingKey, "999999", true},
+		{VirtualLibraryPlaybackProbeCacheMinutesSettingKey, "next week", true},
+		{VirtualLibraryCatalogDiscoveryBudgetMsSettingKey, "3000", false},
+		{VirtualLibraryCatalogDiscoveryBudgetMsSettingKey, "499", true},
+		{VirtualLibraryCatalogDiscoveryBudgetMsSettingKey, "10001", true},
+		{VirtualLibraryCatalogDiscoveryBudgetMsSettingKey, "soon", true},
+	} {
+		got, err := NormalizeAdminSetting(tc.key, tc.value)
+		if tc.reject {
+			if err == nil {
+				t.Fatalf("NormalizeAdminSetting(%q, %q) accepted an out-of-bounds value", tc.key, tc.value)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("NormalizeAdminSetting(%q, %q): %v", tc.key, tc.value, err)
+		}
+		if got != tc.value {
+			t.Fatalf("NormalizeAdminSetting(%q, %q) = %q, want the value unchanged", tc.key, tc.value, got)
+		}
+	}
+}
+
+func TestVirtualProbeTuningReadersFallBackAndClamp(t *testing.T) {
+	if got := VirtualLibraryPlaybackProbeCacheMinutes(""); got != DefaultVirtualLibraryPlaybackProbeCacheMinutes {
+		t.Fatalf("unset probe cache minutes = %d, want default %d", got, DefaultVirtualLibraryPlaybackProbeCacheMinutes)
+	}
+	if got := VirtualLibraryPlaybackProbeCacheMinutes("123456789"); got != MaxVirtualLibraryPlaybackProbeCacheMinutes {
+		t.Fatalf("oversized probe cache minutes = %d, want clamped to %d", got, MaxVirtualLibraryPlaybackProbeCacheMinutes)
+	}
+	if got := VirtualLibraryCatalogDiscoveryBudgetMs(""); got != DefaultVirtualLibraryCatalogDiscoveryBudgetMs {
+		t.Fatalf("unset discovery budget = %d, want default %d", got, DefaultVirtualLibraryCatalogDiscoveryBudgetMs)
+	}
+	if got := VirtualLibraryCatalogDiscoveryBudgetMs("5"); got != MinVirtualLibraryCatalogDiscoveryBudgetMs {
+		t.Fatalf("undersized discovery budget = %d, want clamped to %d", got, MinVirtualLibraryCatalogDiscoveryBudgetMs)
+	}
+	if !RestartRequired(VirtualLibraryPlaybackProbeCacheMinutesSettingKey) {
+		t.Fatal("the boot-built probe cache TTL must be restart-required")
+	}
+	if RestartRequired(VirtualLibraryCatalogDiscoveryBudgetMsSettingKey) {
+		t.Fatal("the per-request discovery budget must not be restart-required")
+	}
+	if got := RestartRequiredKeys(); !containsString(got, VirtualLibraryPlaybackProbeCacheMinutesSettingKey) {
+		t.Fatal("RestartRequiredKeys() must advertise the probe cache TTL key")
+	}
+}
+
+func containsString(haystack []string, needle string) bool {
+	for _, s := range haystack {
+		if s == needle {
+			return true
+		}
+	}
+	return false
+}
+
 func TestNormalizeAdminSettingAcceptsSegmentRetentionBounds(t *testing.T) {
 	for _, value := range []string{"0", "120", "86400"} {
 		t.Run(value, func(t *testing.T) {

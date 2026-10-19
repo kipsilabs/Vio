@@ -311,6 +311,11 @@ type Dependencies struct {
 	VirtualCandidatesRefresh   VirtualCandidatesRefreshService
 	VirtualCandidatesDiscovery VirtualCandidatesDiscoveryService
 	PreplayDiscoveryEnabled    func(context.Context) bool
+	// PreplayDiscoveryBudgetMs reads the configured catalog leaf detail
+	// discovery budget in whole milliseconds
+	// (virtual_library.catalog_discovery_budget_ms). Nil or non-positive
+	// results fall back to the built-in default.
+	PreplayDiscoveryBudgetMs func(context.Context) int
 	// VirtualReleaseRequest requests one stored indexer release on the
 	// provider. A missing service makes only that operation answer
 	// dependency_unavailable.
