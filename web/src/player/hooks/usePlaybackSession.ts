@@ -351,7 +351,10 @@ function identityMatchesPlan(identity: SourceIdentity, plan: PlanV3): boolean {
   if (identity.uri != null) {
     if (plan.effective_virtual_uri == null) return false;
     if (identity.uri !== plan.effective_virtual_uri) return false;
-    if (identity.fileId != null && identity.fileId !== plan.effective_media_file_id) return false;
+    // The concrete candidate is the release identity. A catalog row id can
+    // move under it (duplicate rows, the owner row materializing, a serve-layer
+    // association); that is not a different source for the menu, so the plan's
+    // row id must not veto the payload. The fold adopts the payload's row.
     return true;
   }
   // A file-only push cannot be tied to a candidate when the plan names one.
@@ -389,6 +392,22 @@ function planWasReplaced(arrivalPlan: PlanV3 | null, plan: PlanV3): boolean {
 function identityNamesSameSource(a: SourceIdentity, b: SourceIdentity): boolean {
   if (a.uri != null || b.uri != null) return a.uri === b.uri;
   return a.fileId != null && a.fileId === b.fileId;
+}
+
+/**
+ * Whether two identities name one concrete candidate even when their catalog
+ * row ids differ.
+ *
+ * The provider-neutral candidate URI (including the `?result=` pick) is the
+ * release identity. One release can have several catalog rows: an owner row
+ * that materializes later, duplicate rows imported for the same path, or the
+ * row a serve-layer association moves the session onto. A push that keeps the
+ * candidate and only moves the row is the same source for the menus, so the
+ * stale-delivery guards must compare the URI first and adopt the payload's row
+ * instead of dropping the revision.
+ */
+function identityNamesSameCandidate(a: SourceIdentity, b: SourceIdentity): boolean {
+  return a.uri != null && b.uri != null && a.uri === b.uri;
 }
 
 /**
@@ -1270,9 +1289,15 @@ export function usePlaybackSession(
       identityTransitionClockRef.current += 1;
       // A source rotation moves where the stream actually is; verified evidence
       // bound to the previous file/URI must not suppress inventory updates for
-      // the new one.
+      // the new one. A row-only move (same concrete candidate URI, a new
+      // catalog row for it) is not a rotation: the verified menu still
+      // describes the source on screen, so keep the anchor and let the fold
+      // adopt the new row without re-marking the menus provisional.
       if (changed) {
-        lastVerifiedIdentityRef.current = null;
+        const rowOnlySameCandidate = previous.uri != null && uri != null && previous.uri === uri;
+        if (!rowOnlySameCandidate) {
+          lastVerifiedIdentityRef.current = null;
+        }
       }
       return changed;
     },
@@ -3063,13 +3088,23 @@ export function usePlaybackSession(
         // its confident marker in place; re-marking it would flap the menus
         // disabled/enabled on every interleaved declared delivery.
         const verified = source.inventoryStatus === "verified";
+        // A verified menu belongs to the candidate, not to the catalog row the
+        // plan happened to name. An owner row materializing, or a duplicate row
+        // being adopted, moves the file id but not the source; a declared push
+        // under that row must not re-mark the verified menu as provisional.
         const sameVerifiedSource =
-          !identityChanged &&
           verifiedAnchor !== null &&
-          verifiedAnchor.fileId === nextFileId &&
-          (verifiedAnchor.uri ?? null) === (nextUri ?? null);
+          (verifiedAnchor.uri != null || nextUri != null
+            ? verifiedAnchor.uri === nextUri
+            : !identityChanged && verifiedAnchor.fileId === nextFileId);
         const declaredDowngrade = !verified && source.inventoryStatus != null && sameVerifiedSource;
-        if (declaredDowngrade) return current;
+        if (declaredDowngrade) {
+          // Keep the verified list and its confident marker, but adopt the
+          // row id the delivery names so later subtitle URLs and pushes key on
+          // the source the session actually serves.
+          if (!identityChanged) return current;
+          return { ...current, mediaFileId: nextFileId, effectiveVirtualUri: nextUri };
+        }
         const provisional =
           source.inventoryStatus == null ? current.audioInventoryProvisional : !verified;
         const richer = audioTracks.length > current.planAudioTracks.length;
@@ -3169,10 +3204,19 @@ export function usePlaybackSession(
       const currentState = stateRef.current;
       const liveIdentity = menuIdentityRef.current;
       if (switchingRef.current || replanInFlightRef.current || currentState.replacing) {
+        const sameCandidate = identityNamesSameCandidate(
+          {
+            fileId: source.effectiveMediaFileId ?? null,
+            uri: source.effectiveVirtualUri ?? null,
+          },
+          liveIdentity,
+        );
         const movedSource =
-          (source.effectiveMediaFileId != null &&
+          !sameCandidate &&
+          ((source.effectiveMediaFileId != null &&
             source.effectiveMediaFileId !== liveIdentity.fileId) ||
-          (source.effectiveVirtualUri != null && source.effectiveVirtualUri !== liveIdentity.uri);
+            (source.effectiveVirtualUri != null &&
+              source.effectiveVirtualUri !== liveIdentity.uri));
         if (movedSource) pendingSwitchPositionRef.current = null;
         captureDeferredPush({
           kind: "source",
@@ -3229,8 +3273,9 @@ export function usePlaybackSession(
       const verifiedAnchor = lastVerifiedIdentityRef.current;
       const sameVerifiedSource =
         verifiedAnchor !== null &&
-        verifiedAnchor.fileId === effectiveFileId &&
-        (verifiedAnchor.uri ?? null) === (effectiveVirtualUri ?? null);
+        (verifiedAnchor.uri != null || effectiveVirtualUri != null
+          ? verifiedAnchor.uri === effectiveVirtualUri
+          : verifiedAnchor.fileId === effectiveFileId);
       const declaredDowngrade =
         sameVerifiedSource && inventoryStatus != null && inventoryStatus !== "verified";
       if (declaredDowngrade) return;
@@ -3393,11 +3438,18 @@ export function usePlaybackSession(
       };
       const current = stateRef.current;
       const liveIdentity = menuIdentityRef.current;
+      // A row-only move of the same concrete candidate is not a source move:
+      // the probe can commit its evidence to the release's owner row while the
+      // client still holds the row its plan named. Treating that as a rotation
+      // would discard the delivered revision and leave the open session
+      // discovering until it is reopened.
+      const sameCandidate = identityNamesSameCandidate(identity, liveIdentity);
       const movedSource =
-        (payload.effective_media_file_id != null &&
+        !sameCandidate &&
+        ((payload.effective_media_file_id != null &&
           payload.effective_media_file_id !== liveIdentity.fileId) ||
-        (payload.effective_virtual_uri != null &&
-          payload.effective_virtual_uri !== liveIdentity.uri);
+          (payload.effective_virtual_uri != null &&
+            payload.effective_virtual_uri !== liveIdentity.uri));
       // The same adoption barrier as applyCommittedSource: a switch, an
       // in-flight replan, or a replacement start owns the session, so hold the
       // push and replay it against the plan that wins. Both event kinds must
@@ -3411,15 +3463,21 @@ export function usePlaybackSession(
       // No adoption in flight: a push that names another source than the player
       // is on is a stale delivery and is dropped. The synchronous mirror, not
       // the rendered state, is the live identity a rotation already committed.
-      if (
-        (payload.effective_media_file_id != null &&
-          liveIdentity.fileId != null &&
-          payload.effective_media_file_id !== liveIdentity.fileId) ||
-        (payload.effective_virtual_uri != null &&
-          liveIdentity.uri != null &&
-          payload.effective_virtual_uri !== liveIdentity.uri)
-      ) {
-        return false;
+      // The exception is a row-only move of the same concrete candidate: the
+      // candidate URI is the release identity, so the revision still describes
+      // the source on screen and is adopted (and its row becomes the live one)
+      // rather than discarded.
+      if (!sameCandidate) {
+        if (
+          (payload.effective_media_file_id != null &&
+            liveIdentity.fileId != null &&
+            payload.effective_media_file_id !== liveIdentity.fileId) ||
+          (payload.effective_virtual_uri != null &&
+            liveIdentity.uri != null &&
+            payload.effective_virtual_uri !== liveIdentity.uri)
+        ) {
+          return false;
+        }
       }
       // A file-only push cannot be tied to a candidate. When the live source
       // already names a concrete candidate on that same file, the file alone is

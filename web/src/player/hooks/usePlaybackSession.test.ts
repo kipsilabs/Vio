@@ -5058,6 +5058,127 @@ describe("usePlaybackSession plan audio inventory", () => {
     unmount();
   });
 
+  it("adopts a verified inventory push that moves only the catalog row of the same candidate", async () => {
+    // Production capture (#345): a deferred probe's verified inventory was
+    // published after the serve layer moved the session onto the owner catalog
+    // row of the *same* concrete candidate (`?result=` unchanged). The push
+    // therefore named a different effective_media_file_id than the plan the
+    // client was still playing. The stale-delivery guard compared file ids
+    // only and dropped the revision, so the open session stayed on
+    // "Discovering…" until the viewer closed the player and resumed.
+    const candidateURI = "virtual://series/show/2/3?result=d3b36e7d105c9493432429f3";
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3", "deferred_track_inventory_v1"],
+            outcome: "playable",
+            session_id: "session-row-move",
+            playback_plan: fixturePlanV3({
+              session_id: "session-row-move",
+              tracks_pending: true,
+              inventory_url: "/api/v2/playback/session-row-move/inventory",
+              inventory_status: "pending",
+              inventory_provenance: "pending",
+              effective_media_file_id: 7,
+              effective_virtual_uri: candidateURI,
+              audio_tracks: [
+                { codec: "aac", channels: 2, layout: "stereo", language: "eng", default: true },
+              ],
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-row-move", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+    expect(result.current.inventoryPending).toBe(true);
+
+    const verifiedAudio = [
+      { codec: "aac", channels: 2, layout: "stereo", language: "ja", default: true },
+      { codec: "eac3", channels: 6, layout: "5.1", language: "eng", default: false },
+    ];
+    const verifiedSubtitles = Array.from({ length: 12 }, (_, index) =>
+      fixtureSubtitleInventoryItemV3({
+        track_id: `file:8:subtitle:${index}`,
+        combined_index: index,
+        language: index === 3 ? "eng" : "fra",
+      }),
+    );
+
+    let adopted = false;
+    act(() => {
+      adopted = result.current.applyInventoryUpdate({
+        session_id: "session-row-move",
+        inventory_revision: "inv:verified-row-8",
+        inventory_status: "verified",
+        // Same concrete candidate, owner row 8 instead of the plan's row 7.
+        effective_media_file_id: 8,
+        effective_virtual_uri: candidateURI,
+        audio_tracks: verifiedAudio,
+        subtitle_inventory: verifiedSubtitles,
+      });
+    });
+
+    // The delivered revision was for the source on screen, so it must be
+    // adopted: no poll, replan, or reopen is needed to finish discovery.
+    expect(adopted).toBe(true);
+    expect(result.current.inventoryPending).toBe(false);
+    expect(result.current.audioInventoryProvisional).toBe(false);
+    expect(result.current.subtitleInventoryProvisional).toBe(false);
+    expect(result.current.mediaFileId).toBe(8);
+    expect(result.current.planAudioTracks).toHaveLength(2);
+    expect(result.current.subtitleUrls).toHaveLength(12);
+
+    // A genuinely different candidate on another row is still stale traffic.
+    act(() => {
+      adopted = result.current.applyInventoryUpdate({
+        session_id: "session-row-move",
+        inventory_revision: "inv:verified-other",
+        inventory_status: "verified",
+        effective_media_file_id: 9,
+        effective_virtual_uri: "virtual://series/show/2/3?result=other",
+        audio_tracks: verifiedAudio,
+        subtitle_inventory: verifiedSubtitles,
+      });
+    });
+    expect(adopted).toBe(false);
+    expect(result.current.mediaFileId).toBe(8);
+
+    // A later declared source commit may name yet another row of the same
+    // candidate (the serve layer associating the session with its final owner
+    // row). It moves the live row without taking the verified menu back to
+    // "Discovering…".
+    act(() => {
+      result.current.applyCommittedSource(
+        {
+          effectiveMediaFileId: 9,
+          effectiveVirtualUri: candidateURI,
+          inventoryStatus: "declared",
+        },
+        verifiedAudio,
+      );
+    });
+    expect(result.current.mediaFileId).toBe(9);
+    expect(result.current.audioInventoryProvisional).toBe(false);
+    expect(result.current.subtitleInventoryProvisional).toBe(false);
+    expect(result.current.planAudioTracks).toHaveLength(2);
+    expect(result.current.subtitleUrls).toHaveLength(12);
+
+    unmount();
+  });
+
   it("polls inventory_url when pending and clears loading state on 200 verified response", async () => {
     let inventoryPolled = false;
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
