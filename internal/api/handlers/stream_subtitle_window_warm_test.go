@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -133,21 +134,22 @@ func TestVirtualTextWindowMissWarmsOnceWithServeIdentity(t *testing.T) {
 	// cleanup so LIFO releases the gate before the wait blocks on it.
 	t.Cleanup(func() { _ = os.WriteFile(gate, []byte("go"), 0o644) })
 
-	serve := func() *httptest.ResponseRecorder {
-		req := httptest.NewRequest(http.MethodGet, "/subtitle?position=600&duration=600", nil)
+	serve := func(position int) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/subtitle?position="+strconv.Itoa(position)+"&duration=600", nil)
 		rec := httptest.NewRecorder()
 		handler.streamEmbeddedSubtitle(rec, req, file, 0, session, false, "vtt")
 		return rec
 	}
 
-	if rec := serve(); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "WEBVTT") {
+	if rec := serve(600); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "WEBVTT") {
 		t.Fatalf("first window: status=%d body=%q", rec.Code, rec.Body.String())
 	}
 	// The first window request started its detached warm; wait until it holds
-	// the in-flight fill before issuing the second miss.
+	// the in-flight fill before issuing the second miss. A different window
+	// avoids the exact-window last-good cache and exercises the warm path.
 	waitForWarmInvocation(t, argsLog)
 
-	if rec := serve(); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "WEBVTT") {
+	if rec := serve(601); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "WEBVTT") {
 		t.Fatalf("second window: status=%d body=%q", rec.Code, rec.Body.String())
 	}
 
@@ -164,6 +166,37 @@ func TestVirtualTextWindowMissWarmsOnceWithServeIdentity(t *testing.T) {
 	}
 	if warm != 1 {
 		t.Fatalf("full-track warms = %d, want exactly 1 (coalesced)", warm)
+	}
+}
+
+// A repeated identical virtual window must serve the last-good slice without a
+// second ffmpeg run. This is the client retry pattern the provider outage
+// produces; the detached full-track warm is unrelated and stays coalesced.
+func TestVirtualTextWindowRepeatServesLastGoodWithoutExtract(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+	dir := t.TempDir()
+	argsLog := filepath.Join(dir, "ffmpeg.args")
+	gate := filepath.Join(dir, "warm.gate")
+	handler, session, file, _ := newVirtualSubtitleWindowFixture(t, dir, warmArgsLogScript(argsLog, gate))
+	t.Cleanup(func() { _ = os.WriteFile(gate, []byte("go"), 0o644) })
+
+	serve := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/subtitle?position=600&duration=600", nil)
+		rec := httptest.NewRecorder()
+		handler.streamEmbeddedSubtitle(rec, req, file, 0, session, false, "vtt")
+		return rec
+	}
+
+	for attempt := 0; attempt < 2; attempt++ {
+		rec := serve()
+		if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "WEBVTT") {
+			t.Fatalf("attempt %d: status=%d body=%q", attempt, rec.Code, rec.Body.String())
+		}
+	}
+	if window, _ := ffmpegLogLines(t, argsLog); window != 1 {
+		t.Fatalf("windowed extracts = %d, want 1 for a repeated window", window)
 	}
 }
 
@@ -951,6 +984,50 @@ func TestSubtitleErrorResponseOmitsCoverageHeaders(t *testing.T) {
 	}
 	if got := rec.Header().Get(playback.SubtitleWindowedHeader); got != "" {
 		t.Fatalf("error response carried windowed marker %q", got)
+	}
+}
+
+// An upstream 5xx must answer retryable with a Retry-After, and the next client
+// retry must not spawn ffmpeg again while the identity is in its backoff.
+func TestSubtitleUpstreamFailureAnswersRetryableAndBacksOff(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+	dir := t.TempDir()
+	argsLog := filepath.Join(dir, "ffmpeg.args")
+	handler, session, file, _ := newVirtualSubtitleWindowFixture(t, dir,
+		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\necho 'Server returned 5XX Server Error reply' >&2\nexit 8\n")
+
+	serve := func() *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/subtitle", nil)
+		handler.streamEmbeddedSubtitle(rec, req, file, 0, session, false, "ass")
+		return rec
+	}
+
+	first := serve()
+	if first.Code != http.StatusServiceUnavailable {
+		t.Fatalf("first status = %d body=%q, want 503", first.Code, first.Body.String())
+	}
+	retryAfter, err := strconv.Atoi(first.Header().Get("Retry-After"))
+	if err != nil || retryAfter < 1 {
+		t.Fatalf("Retry-After = %q, want a positive delay", first.Header().Get("Retry-After"))
+	}
+	firstCalls := countLogLines(t, argsLog)
+	if firstCalls == 0 {
+		t.Fatal("first request never ran ffmpeg")
+	}
+
+	second := serve()
+	if second.Code != http.StatusServiceUnavailable {
+		t.Fatalf("second status = %d body=%q, want 503", second.Code, second.Body.String())
+	}
+	if got := countLogLines(t, argsLog); got != firstCalls {
+		t.Fatalf("ffmpeg ran %d times on a retry inside the backoff, want %d", got, firstCalls)
+	}
+	retryAfter, err = strconv.Atoi(second.Header().Get("Retry-After"))
+	if err != nil || retryAfter < 1 {
+		t.Fatalf("second Retry-After = %q, want a positive delay", second.Header().Get("Retry-After"))
 	}
 }
 
