@@ -1655,6 +1655,9 @@ func ResolveQualityPolicyV3(request StartRequestV3, source SourceDescriptorV3) Q
 		warnings = append(warnings, DegradationWarningV3{Code: "quality_preference_normalized", Message: "Unknown quality preference was normalized to auto."})
 	}
 	capKbps := optionalValueV3(request.BandwidthCapKbps)
+	// The cap is a hard ceiling, so a video source whose bitrate is unknown
+	// cannot be shown to fit it, as with the server cap.
+	capExceededBySource := capKbps > 0 && (source.BitrateKbps > capKbps || source.BitrateKbps <= 0 && source.VideoCodec != "")
 	if rung, ok := ladderRungForLabelV3(quality); ok {
 		return compoundRungQualityResultV3(rung, source, capKbps, warnings)
 	}
@@ -1708,10 +1711,14 @@ func ResolveQualityPolicyV3(request StartRequestV3, source SourceDescriptorV3) Q
 	// preserve the source is forced down when the source bitrate exceeds the
 	// cap, and a transcode rung whose ladder bitrate exceeds the cap drops to
 	// the cap's rung.
-	if capKbps > 0 && !capApplied {
-		if adjusted, applied := CappedRungHeightV3(targetHeight, source.Height, source.BitrateKbps, capKbps); applied {
+	if capKbps > 0 {
+		wouldPreserve := source.Height > 0 && targetHeight >= source.Height
+		if (wouldPreserve && capExceededBySource) || (!wouldPreserve && ladderClassBitrateKbpsV3(targetHeight) > capKbps) {
 			capApplied = true
-			targetHeight = adjusted
+			if capHeight := streamLadderClassV3(capKbps, source); capHeight < targetHeight {
+				targetHeight = capHeight
+				classLimit = minPositiveV3(classLimit, capHeight)
+			}
 		}
 	}
 	if capApplied {

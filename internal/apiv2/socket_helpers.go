@@ -25,12 +25,17 @@ func socketIdentity(ctx context.Context) (evt.SocketIdentity, *Problem) {
 	return identity, nil
 }
 
-// socketDeviceID is the request's X-Silo-Device-Id as a ticket keeps it for
-// the acting-admin decision. An id sign-in would not record (over 128
+// socketDeviceID is the request's X-Vio-Device-Id as a ticket keeps it for
+// the acting-admin decision. The legacy X-Silo-Device-Id spelling is accepted
+// when the current header is absent. An id sign-in would not record (over 128
 // characters, or not shaped like one) is dropped rather than held with the
 // ticket.
 func socketDeviceID(r *http.Request) string {
-	return auth.ClientDeviceFromHeaders(r.Header).ID
+	id := r.Header.Get(deviceIDHeader)
+	if id == "" {
+		id = r.Header.Get(legacyDeviceIDHeader)
+	}
+	return auth.NewClientDevice(id, "", "").ID
 }
 
 func socketResponses(statuses []string, refused, established, headerDescription string) map[string]*huma.Response {

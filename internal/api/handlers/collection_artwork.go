@@ -512,7 +512,11 @@ func (c collectionCollageComposer) fetchImage(ctx context.Context, imageURL stri
 	if c.httpClient == nil {
 		return nil, errors.New("collage downloads have no HTTP client")
 	}
-	req, err := http.NewRequestWithContext(artworkurl.FetchContext(ctx, c.store, imageURL), http.MethodGet, imageURL, nil)
+	fetchCtx := artworkurl.FetchContext(ctx, c.store, imageURL)
+	// Collage sources are catalog posters the server resolves, often to
+	// artwork storage on its own network, so they may reach the local network.
+	fetchCtx = netguard.WithPrivateAccess(fetchCtx)
+	req, err := http.NewRequestWithContext(fetchCtx, http.MethodGet, imageURL, nil)
 	if err != nil {
 		return nil, err
 	}

@@ -1695,8 +1695,11 @@ func retryIncompleteToneMapPlanningV3(result playback.PlannerResultV3, capabilit
 		return result
 	}
 	switch result.Terminal.Reason {
-	case playback.TerminalHDRTranscodeUnsupportedV3, terminalSubtitleConversionUnsupportedV3:
+	case playback.TerminalHDRTranscodeUnsupportedV3:
 	default:
+		// A subtitle refusal is a verdict on the selected track and the file,
+		// not a tone-map capability gap; keep it so the same-release subtitle
+		// degrade can run.
 		return result
 	}
 	result.Terminal = &playback.TerminalV3{
@@ -8141,7 +8144,7 @@ func (h *PlaybackHandler) evaluateReplanCandidateV3(
 		}
 		return nil, &candidateErrorV3{Stage: candidateStageResolve, Message: fmt.Sprintf("candidate %d resolution failed", candidateAlternate.ID), Err: err}
 	}
-	return h.evaluatePreparedReplanCandidateV3(r, session, record, req, baseStart, sourceFile, candidateFile, candidateProvenance, plannerRequestedFile, plannerSettings, plannerSettingsErr, attemptedKeys)
+	return h.evaluatePreparedReplanCandidateV3(r, session, record, req, baseStart, sourceFile, candidateFile, candidateProvenance, plannerRequestedFile, plannerSettings, plannerSettingsErr, attemptedKeys, false)
 }
 
 // evaluatePreparedReplanCandidateV3 is evaluateReplanCandidateV3 with the
@@ -8162,6 +8165,7 @@ func (h *PlaybackHandler) evaluatePreparedReplanCandidateV3(
 	plannerSettings playback.PlannerSettingsV3,
 	plannerSettingsErr error,
 	attemptedKeys []string,
+	planOnly bool,
 ) (*candidateEvaluationV3, *candidateErrorV3) {
 	candidateStart := baseStart
 	// A carried selection was minted against the plan-time inventory. Use the
@@ -8254,6 +8258,17 @@ func (h *PlaybackHandler) evaluatePreparedReplanCandidateV3(
 		}
 	}
 
+	if planOnly {
+		// A same-release subtitle drop leaves the A/V recipe byte-identical;
+		// the caller reuses the active transport, so preparing a probe one
+		// would only spawn and wait on a second FFmpeg.
+		return &candidateEvaluationV3{
+			file:       candidateFile,
+			start:      candidateStart,
+			result:     candidateResult,
+			toneMapErr: candidateToneMapErr,
+		}, nil
+	}
 	candTransport, transportErr := h.prepareTransportV3(r, session, candidateFile, candidateResult, headerAuthenticatedMediaV3(req.ClientFeatures))
 	if transportErr != nil {
 		cancelCandidateReservation()
@@ -8341,7 +8356,7 @@ func (h *PlaybackHandler) evaluateSubtitleDegradeInPlaceV3(
 		return nil, &candidateErrorV3{Stage: candidateStageResolve, Message: "nil same-release subtitle degrade target"}
 	}
 	degradedStart := subtitleDegradedStartV3(baseStart)
-	eval, evalErr := h.evaluatePreparedReplanCandidateV3(r, session, record, req, degradedStart, file, file, provenance, plannerRequestedFile, plannerSettings, plannerSettingsErr, attemptedKeys)
+	eval, evalErr := h.evaluatePreparedReplanCandidateV3(r, session, record, req, degradedStart, file, file, provenance, plannerRequestedFile, plannerSettings, plannerSettingsErr, attemptedKeys, true)
 	if eval != nil {
 		annotateSubtitleDroppedV3(&eval.result)
 	}
@@ -8385,7 +8400,7 @@ func (h *PlaybackHandler) degradeStartSubtitleInPlaceV3(
 	provenance ProbeProvenance,
 ) (playback.StartRequestV3, playback.PlannerResultV3, error, bool) {
 	degradedReq := subtitleDegradedStartV3(req)
-	degradedResult, degradedToneMapErr := h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{
+	input := playback.PlannerInputV3{
 		Request: degradedReq, RequestedFile: requestedFile, EffectiveFile: effectiveFile,
 		AudioTrackIndex: audioIndex, Settings: settings,
 		Registry:            h.transformationRegistryV3(r.Context()),
@@ -8395,12 +8410,25 @@ func (h *PlaybackHandler) degradeStartSubtitleInPlaceV3(
 		// The degraded plan serves the same release with the subtitle dropped,
 		// so it keeps the selected source's provenance.
 		InventoryProvenance: string(provenance),
-	})
+	}
+	degradedResult, degradedToneMapErr := h.planPlaybackWithCapabilitiesV3(r.Context(), input)
 	clampPlannerTargetResolution(&degradedResult, effectiveFile)
 	if degradedResult.Terminal != nil {
 		return req, playback.PlannerResultV3{}, degradedToneMapErr, false
 	}
-	annotateSubtitleDroppedV3(&degradedResult)
+	// A progressive remux the API refuses must escalate here: the caller may
+	// drop a sibling that already plays in favor of this plan.
+	degradedResult, escalateErr := h.escalateRefusedProgressiveRemuxV3(
+		r.Context(), headerAuthenticatedMediaV3(degradedReq.ClientFeatures),
+		func() playback.PlannerInputV3 { return input }, degradedResult)
+	if escalateErr != nil {
+		return req, playback.PlannerResultV3{}, escalateErr, false
+	}
+	if degradedResult.Plan != nil {
+		// subtitle_track_unavailable covers both a subtitle missing from the
+		// file and one the file has but cannot show; its message says which.
+		degradedResult.Plan.DegradationWarnings = append(degradedResult.Plan.DegradationWarnings, playback.SubtitleNotShownWarningV3())
+	}
 	return degradedReq, degradedResult, degradedToneMapErr, true
 }
 
@@ -8538,7 +8566,7 @@ func (h *PlaybackHandler) evaluateAudioDegradeInPlaceV3(
 	}
 	for _, index := range inPlaceAudioCandidateOrderV3(baseStart, file, current) {
 		degradedStart := audioDegradedStartV3(baseStart, file, index)
-		eval, evalErr := h.evaluatePreparedReplanCandidateV3(r, session, record, req, degradedStart, file, file, provenance, plannerRequestedFile, plannerSettings, plannerSettingsErr, attemptedKeys)
+		eval, evalErr := h.evaluatePreparedReplanCandidateV3(r, session, record, req, degradedStart, file, file, provenance, plannerRequestedFile, plannerSettings, plannerSettingsErr, attemptedKeys, false)
 		if evalErr == nil && eval != nil && eval.result.Terminal == nil {
 			annotateAudioTrackSubstitutedV3(&eval.result, index)
 			return eval, nil, true
@@ -8608,7 +8636,10 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	// virtual failure: candidate substitution is the recovery, so the delivery
 	// stays eligible until rotation exhausts.
 	virtualDecodeRotation := h.virtualCandidateRotationPendingV3(record, req)
+	// A node that stopped answering indicts the node, not the delivery: keep
+	// the delivery class eligible so the same recipe can run on another node.
 	if failureRecoveryAbandonedDeliveryV3(operation, req.Failure.Classification) &&
+		len(unreachableNodes) == 0 &&
 		(!decodeFailureClassificationV3(req.Failure.Classification) ||
 			(!h.softwareDecodeRetryPendingV3(record, req) && !virtualDecodeRotation)) {
 		// Demote on both copies: the record (the durable attempt this replan
@@ -9600,14 +9631,19 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			// never re-listed or substituted. If the same release cannot play
 			// without the subtitle either, the original subtitle terminal
 			// stands and no sibling is tried.
-			if eval, evalErr := h.evaluateSubtitleDegradeInPlaceV3(r, session, record, req, start, effectiveFile, replanVirtualProvenance, plannerRequestedFile, plannerSettings, plannerSettingsErr, attemptedKeys); evalErr == nil && eval != nil && eval.result.Terminal == nil {
+			eval, evalErr := h.evaluateSubtitleDegradeInPlaceV3(r, session, record, req, start, effectiveFile, replanVirtualProvenance, plannerRequestedFile, plannerSettings, plannerSettingsErr, attemptedKeys)
+			if evalErr == nil && eval != nil && eval.result.Terminal == nil {
 				start = eval.start
 				effectiveFile = eval.file
 				result = eval.result
 				toneMapCapabilityErr = eval.toneMapErr
 				artifactRecipe = eval.frozenRecipe
-				preparedTransport = &eval.transport
-				transportPrepared = true
+				if effectiveFile.ID != record.EffectiveMediaFileID {
+					preparedTransport = &eval.transport
+					transportPrepared = true
+				}
+				// Same release: dropping the subtitle leaves the A/V recipe
+				// byte-identical, so the replan reuses the active transport.
 				reservationHeld = eval.reservationHeld
 			}
 		} else if audioOnlyAllowed {

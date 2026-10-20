@@ -700,14 +700,6 @@ func (c *Client) DeleteObjects(ctx context.Context, bucket string, keys []string
 func (c *Client) deleteObjects(ctx context.Context, bucket string, keys []string) (int, error) {
 	const batchSize = 1000
 	deleted := 0
-	failed := 0
-	var firstErr error
-	recordFailure := func(err error) {
-		failed++
-		if firstErr == nil {
-			firstErr = err
-		}
-	}
 
 	for i := 0; i < len(keys); i += batchSize {
 		if err := ctx.Err(); err != nil {
@@ -753,7 +745,6 @@ func (c *Client) deleteObjects(ctx context.Context, bucket string, keys []string
 						return deleted, ctxErr
 					}
 					slog.WarnContext(ctx, "s3 DeleteObjects fallback: failed to delete", "component", "s3client", "key", key, "code", s3ErrorCode(delErr))
-					recordFailure(fmt.Errorf("s3 DeleteObjects %s/%s: %s", bucket, key, s3ErrorCode(delErr)))
 					continue
 				}
 				deleted++
@@ -782,16 +773,13 @@ func (c *Client) deleteObjects(ctx context.Context, bucket string, keys []string
 				code := safeErrorCode(aws.ToString(e.Code))
 				slog.WarnContext(ctx, "s3 DeleteObjects: partial failure", "component", "s3client",
 					"key", key, "code", code)
-				// The backend's free-form message is omitted from both the log
-				// and the returned error: it may echo credentials or signed URLs.
-				recordFailure(fmt.Errorf("s3 DeleteObjects %s/%s: %s", bucket, key, code))
+				// The backend's free-form message is omitted from the log: it may
+				// echo credentials or signed URLs. Per-key failures are best-effort
+				// accounting, so the caller gets the deleted count and no error.
 			}
 		}
 	}
 
-	if failed > 0 {
-		return deleted, fmt.Errorf("s3 DeleteObjects %s: %d of %d objects not deleted: %w", bucket, failed, len(keys), firstErr)
-	}
 	return deleted, nil
 }
 

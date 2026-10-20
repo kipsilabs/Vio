@@ -1148,6 +1148,10 @@ func (h *PlaybackHandler) startRemotePlaybackTransport(ctx context.Context, node
 	}
 	response, err := telemetry.DoTrustedNode(transcodeproxy.NodeClient(), httpRequest, "transcode_start")
 	if err != nil {
+		// A node that could not be reached is out of selection at once, in
+		// addition to the suppression window: the next attempt and every
+		// later session skip it until a health check succeeds.
+		nodepool.ReportConnectFailure(h.NodePlanner, nodeURL, err)
 		h.suppressUnhealthyTranscodeNode(nodeURL, admittedEpoch, ctx, err)
 		return transcodenode.TranscodeStartResponse{}, 0, logredact.SanitizeURLError(err)
 	}
