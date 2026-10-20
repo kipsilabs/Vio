@@ -2,13 +2,13 @@ package handlers
 
 import (
 	"context"
-	"github.com/Silo-Server/silo-server/internal/plugins"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/plugins"
 )
 
 // probedStartPreferenceRows builds the two catalog rows of one release: a bare
