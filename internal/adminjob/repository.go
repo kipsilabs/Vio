@@ -967,7 +967,7 @@ func (r *Repository) withClaim(job *models.AdminJob) *Repository {
 // command accepts. Each has a runner path that observes CancelRequested and a
 // durable terminal transition, so setting the intent is enough for a queued job
 // and a running one alike.
-var cancellableJobTypes = []string{JobTypeLibraryRefresh, JobTypeStorageTransition, JobTypeVirtualCandidatesRefresh, JobTypeVirtualIdentityBackfill}
+var cancellableJobTypes = []string{JobTypeLibraryRefresh, JobTypeStorageTransition, JobTypeVirtualCandidatesRefresh, JobTypeVirtualIdentityBackfill, JobTypeImageCacheCleanup}
 
 func isCancellableJobType(jobType string) bool {
 	for _, candidate := range cancellableJobTypes {
