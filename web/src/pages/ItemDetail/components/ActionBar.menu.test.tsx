@@ -272,7 +272,7 @@ describe("ActionBar shuffle", () => {
 describe("ActionBar reset progress", () => {
   it("leaves Play from Beginning to the Play button's resume prompt", async () => {
     const onResetProgress = vi.fn();
-    render(
+    renderWithProviders(
       <MemoryRouter>
         <ActionBar
           contentId="movie-1"
@@ -293,7 +293,7 @@ describe("ActionBar reset progress", () => {
   });
 
   it("offers Play from Beginning before Reset Progress when Play does not ask", async () => {
-    render(
+    renderWithProviders(
       <MemoryRouter>
         <ActionBar
           contentId="movie-1"
@@ -312,7 +312,7 @@ describe("ActionBar reset progress", () => {
   });
 
   it("leaves Reset Progress out without a resume position", async () => {
-    render(
+    renderWithProviders(
       <MemoryRouter>
         <ActionBar contentId="movie-1" playHref="/watch/movie-1" />
       </MemoryRouter>,
@@ -368,7 +368,7 @@ describe("ActionBar Manage menu", () => {
 
   function renderAdmin() {
     const onEditMetadata = vi.fn();
-    render(
+    renderWithProviders(
       <MemoryRouter>
         <ActionBar
           contentId="movie-1"
@@ -405,7 +405,12 @@ describe("ActionBar Manage menu", () => {
     const labels = within(submenu)
       .getAllByRole("menuitem")
       .map((item) => item.textContent);
-    expect(labels).toEqual(["Edit Metadata", "Match Item", "View Play History"]);
+    expect(labels).toEqual([
+      "Edit Metadata",
+      "Match Item",
+      "View Play History",
+      "Delete Show / Movie",
+    ]);
     await userEvent.click(within(submenu).getByRole("menuitem", { name: "Edit Metadata" }));
     expect(onEditMetadata).toHaveBeenCalledOnce();
     expect(screen.queryByRole("menu")).toBeNull();
@@ -464,14 +469,19 @@ describe("ActionBar Manage menu", () => {
   });
 
   it("shows a lone management action in the main menu", async () => {
-    render(
+    renderWithProviders(
       <MemoryRouter>
-        <ActionBar contentId="movie-1" isAdmin onToggleWatchlist={vi.fn()} />
+        <ActionBar
+          contentId="movie-1"
+          canCurateMetadata
+          onShowMediaInfo={vi.fn()}
+          onToggleWatchlist={vi.fn()}
+        />
       </MemoryRouter>,
     );
 
     await userEvent.click(screen.getByTitle("More"));
     expect(screen.queryByRole("menuitem", { name: "Manage" })).toBeNull();
-    expect(screen.getByRole("menuitem", { name: "View Play History" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Media Info" })).toBeInTheDocument();
   });
 });

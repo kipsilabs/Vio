@@ -1,4 +1,4 @@
-import { PlayerFetchError } from "./player-fetch";
+import { isPlaybackSessionEndedError, PlayerFetchError } from "./player-fetch";
 import { V2ProblemError } from "@/api/v2/request";
 import type { TerminalV3 } from "./protocol-v3";
 
@@ -232,6 +232,10 @@ const SESSION_GONE_PROBLEM_CODES = new Set([
  */
 export function isPlaybackSessionGoneError(error: unknown): boolean {
   if (error instanceof PlayerFetchError) {
+    // A 410 that names playback_session_ended only in the problem body is
+    // still terminal: the progress lane must stop and hand the player its
+    // ended verdict, not keep polling a session an administrator closed.
+    if (isPlaybackSessionEndedError(error)) return true;
     return (
       (error.status === 404 || error.status === 410) &&
       error.code !== undefined &&

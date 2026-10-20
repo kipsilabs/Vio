@@ -876,6 +876,11 @@ describe("RealtimeEventsProvider", () => {
       };
       view.rerender(provider());
     });
+    // A return inside the socket grace period keeps the cache current; stay
+    // hidden past it so this return has a catch-up to inspect.
+    await act(async () => {
+      vi.advanceTimersByTime(HIDDEN_EVENTS_SOCKET_GRACE_MS);
+    });
 
     await act(async () => {
       mockState.pageActivity = {

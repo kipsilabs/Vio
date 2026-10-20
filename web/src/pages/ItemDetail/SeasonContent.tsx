@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router";
 import type { ItemDetail } from "@/api/types";
 import { useStartShuffle } from "@/hooks/queries/shuffles";
@@ -51,14 +51,15 @@ export default function SeasonContent({ item }: { item: ItemDetail & { type: "se
     error: episodesError,
   } = useItemEpisodes(item.content_id);
 
-  const episodes = episodesData?.episodes ?? [];
+  const episodes = useMemo(() => episodesData?.episodes ?? [], [episodesData]);
   useEffect(() => {
     const fileIDs = episodes
       .filter((episode) => !episode.user_data?.played)
       .slice(0, 2)
       .map((episode) => {
-        const candidate = episode.files.find((file) => file.container !== "virtual");
-        return candidate?.file_id ?? episode.files[0]?.file_id;
+        const files = episode.files ?? [];
+        const candidate = files.find((file) => file.container !== "virtual");
+        return candidate?.file_id ?? files[0]?.file_id;
       })
       .filter((fileID): fileID is number => fileID !== undefined);
     if (fileIDs.length > 0) void prefetchVirtualPlayback(fileIDs);

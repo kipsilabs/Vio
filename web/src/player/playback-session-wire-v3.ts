@@ -149,7 +149,6 @@ export interface StartRequestInput {
    *  on this start attempt. Only sent when the viewer explicitly picks an
    *  unavailable version. */
   forceRelink?: boolean;
-  metered: boolean;
   bandwidthEstimateKbps?: number | null;
   bandwidthCapKbps?: number | null;
   clientCapabilities: ClientCodecCapabilitiesV3;
@@ -249,7 +248,6 @@ export function buildReplanRequestV3(input: ReplanRequestInput): ReplanRequestV3
     attempt_count: input.attemptCount,
     quality_preference: input.qualityPreference,
     position_seconds: clampPosition(input.positionSeconds),
-    metered: input.metered,
     ...(input.autoFallback !== undefined ? { auto_fallback: input.autoFallback } : {}),
     // Omitted rather than sent empty: an absent field means "this replan is not
     // an answer to any withdrawal", which is what every non-reconciliation

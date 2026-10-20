@@ -516,13 +516,12 @@ describe("usePlaybackSession quality changes", () => {
     );
 
     await waitFor(() => expect(result.current.plan).not.toBeNull());
-    // A stored "original" is the legacy spelling of Auto.
-    expect(result.current.qualityPreference).toBe("auto");
+    expect(result.current.qualityPreference).toBe("original");
 
     act(() => result.current.changeQuality("720p", 120));
     await waitFor(() => {
       expect(result.current.replanning).toBe(false);
-      expect(result.current.qualityPreference).toBe("auto");
+      expect(result.current.qualityPreference).toBe("original");
       expect(result.current.error).toBeTruthy();
     });
 
@@ -536,14 +535,14 @@ describe("usePlaybackSession quality changes", () => {
     const replanBodies = fetchMock.mock.calls
       .filter(([url]) => String(url).endsWith("/playback/session-1/replan"))
       .map(([, init]) => JSON.parse(String(init?.body)) as { quality_preference: string });
-    expect(replanBodies.map((body) => body.quality_preference)).toEqual(["720p", "auto"]);
+    expect(replanBodies.map((body) => body.quality_preference)).toEqual(["720p", "original"]);
 
     const startBody = JSON.parse(
       String(
         fetchMock.mock.calls.find(([url]) => String(url).endsWith("/playback/start"))?.[1]?.body,
       ),
     ) as Record<string, unknown>;
-    expect(startBody.quality_preference).toBe("auto");
+    expect(startBody.quality_preference).toBe("original");
     for (const body of [startBody, ...replanBodies]) {
       expect(body).not.toHaveProperty("bandwidth_estimate_kbps");
       expect(body).not.toHaveProperty("metered");

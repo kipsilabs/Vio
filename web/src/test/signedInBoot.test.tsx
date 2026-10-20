@@ -216,7 +216,7 @@ describe("app boot request budget", () => {
       unauthorized: 0,
       refreshes: 1,
       duplicateGets: 0,
-      total: 13,
+      total: 12,
     });
     // The shell's theme, date/time, customization and playback preference hooks
     // all resolve into one default-context batch, not one GET per hook.

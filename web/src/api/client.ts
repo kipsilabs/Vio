@@ -839,4 +839,13 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
   return readApiResponse<T>(await apiResponse(path, options));
 }
 
+/**
+ * Typed v1 API call for a route that has no `/api/v2` operation yet, such as
+ * the frozen admin and catalog maintenance routes. The caller owns the
+ * response type; everything else goes through the inferred v2 contract.
+ */
+export async function apiV1<T>(path: string, options: RequestInit = {}): Promise<T> {
+  return readApiResponse<T>(await apiResponse(path, options));
+}
+
 export const API_BLOB_MAX_BYTES = 512 * 1024 * 1024;

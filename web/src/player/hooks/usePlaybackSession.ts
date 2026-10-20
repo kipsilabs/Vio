@@ -2094,6 +2094,7 @@ export function usePlaybackSession(
       selectFileId,
       stopSession,
       transitionSourceIdentity,
+      versions,
     ],
   );
   const loadSessionRef = useRef(loadSession);
@@ -2314,7 +2315,6 @@ export function usePlaybackSession(
         qualityPreference: qualityRef.current,
         attemptedPlanKeys,
         attemptCount,
-        metered: detectMeteredV3(),
         // State the viewer's current Auto intent on every replan so the
         // server's session flag cannot drift from the menu: a viewer who
         // started on an explicit pick and later re-armed Auto must still
@@ -3802,7 +3802,7 @@ export function usePlaybackSession(
         }
       })();
     },
-    [allowAlternateVersions, loadSession, setAutoFallback],
+    [allowAlternateVersions, loadSession, setAutoFallback, versions],
   );
 
   /**

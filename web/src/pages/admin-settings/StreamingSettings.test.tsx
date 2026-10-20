@@ -3,7 +3,8 @@ import { MemoryRouter } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { Library } from "@/api/types";
-import StreamingSettings, { prowlarrURLFeedback } from "./StreamingSettings";
+import { prowlarrURLFeedback } from "./prowlarrURLFeedback";
+import StreamingSettings from "./StreamingSettings";
 
 class ResizeObserverStub {
   observe() {}

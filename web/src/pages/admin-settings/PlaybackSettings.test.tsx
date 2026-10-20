@@ -481,7 +481,7 @@ describe("PlaybackSettings CPU tone mapping", () => {
       }),
     );
 
-    const markup = renderToStaticMarkup(<PlaybackSettings />);
+    const markup = renderToStaticMarkup(<Page />);
     expect(useSettingsFormMock.mock.calls[0]?.[0]?.keys).toContain(
       "playback.max_virtual_failover_attempts",
     );

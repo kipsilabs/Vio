@@ -1,7 +1,7 @@
 import { useQueries } from "@tanstack/react-query";
 import { useMemo } from "react";
 
-import { api } from "@/api/client";
+import { apiV1 } from "@/api/client";
 import type { VersionLivenessResponse } from "@/api/types";
 import { isVirtualFileVersion } from "@/pages/ItemDetail/components/versionFormatUtils";
 
@@ -28,7 +28,7 @@ export async function fetchVersionLiveness(
   fileIds: number[],
   options?: RequestInit,
 ): Promise<VersionLivenessResponse> {
-  return api<VersionLivenessResponse>("/catalog/versions/check", {
+  return apiV1<VersionLivenessResponse>("/catalog/versions/check", {
     ...options,
     method: "POST",
     headers: { "Content-Type": "application/json", ...(options?.headers ?? {}) },
@@ -115,7 +115,7 @@ export function useVersionLiveness(
       mergeVersionLiveness(versions, {
         results: queryResults.flatMap((query) => query.data?.results ?? []),
       }),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- depend on each query's data, not the result objects.
     [versions, ...queryResults.map((query) => query.data)],
   );
 }

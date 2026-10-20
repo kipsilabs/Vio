@@ -1026,7 +1026,7 @@ function WatchPagePlayer({
     // declared push after a verified one re-marks the menu, and the poll has to
     // come back to clear it again, so a transition restarts (or single-shots)
     // the poll.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- restart the poll on the inventory-identity transitions listed below.
   }, [
     applyAudioInventory,
     applyInventoryUpdate,

@@ -4,7 +4,7 @@ import { useCallback, useState } from "react";
 import { toast } from "sonner";
 
 import {
-  api,
+  apiV1,
   captureProfileRequestContext,
   isCapturedProfileAuthorityActive,
   StaleApiRequestContextError,
@@ -1090,7 +1090,7 @@ export function useSavePluginTaskBinding() {
 export function usePluginInstallationConfigOptions() {
   return useMutation({
     mutationFn: ({ installationId }: { installationId: number }) =>
-      api<Record<string, Array<{ value: string; label: string }>>>(
+      apiV1<Record<string, Array<{ value: string; label: string }>>>(
         `/admin/plugins/installations/${installationId}/config-options`,
         { method: "POST" },
       ),

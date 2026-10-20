@@ -79,7 +79,6 @@ const PREVIEW_SHOWN_KEYS = [
 const PREVIEW_PLACEMENT_KEYS = [
   "playback.chapter_thumbnail_execution",
   "playback.trickplay_execution",
-  "playback.max_virtual_failover_attempts",
 ];
 
 const PREVIEW_ADVANCED_KEYS = [
@@ -118,7 +117,11 @@ function remakeDescription(widthChanged: boolean, previews: number | null): stri
   return `${what} made again ${how}. This runs in the background and can take a long time on a large library; players keep the current images until each is replaced.`;
 }
 
-const WATCH_KEYS = ["playback.watched_threshold", "playback.min_resume_threshold"];
+const WATCH_KEYS = [
+  "playback.watched_threshold",
+  "playback.min_resume_threshold",
+  "playback.max_virtual_failover_attempts",
+];
 
 const MARKER_KEYS = [
   "markers.mode",

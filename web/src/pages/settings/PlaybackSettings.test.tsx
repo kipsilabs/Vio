@@ -280,7 +280,7 @@ describe("PlaybackSettings", () => {
     );
   });
 
-  it("shows a stored original quality as Auto and no longer offers Original", async () => {
+  it("keeps a stored original quality and offers it", async () => {
     mocks.useEffectiveSettings.mockReturnValue({
       data: resolved(SETTING_KEYS.PLAYBACK_PREFERRED_QUALITY, "original", "profile"),
       isLoading: false,
@@ -288,16 +288,14 @@ describe("PlaybackSettings", () => {
     render(<PlaybackSettings />);
 
     const select = screen.getByRole("combobox", { name: "Preferred quality" });
-    expect(select).toHaveTextContent("Auto");
+    expect(select).toHaveTextContent("Original quality");
     expect(
-      screen.getByText(
-        "Plays the original file whenever your device and connection can handle it.",
-      ),
+      screen.getByText("The resolution your profile should request when playback begins."),
     ).toBeInTheDocument();
 
     await userEvent.click(select);
-    expect(await screen.findByRole("option", { name: "Auto" })).toBeInTheDocument();
-    expect(screen.queryByRole("option", { name: /Original/ })).toBeNull();
+    expect(await screen.findByRole("option", { name: "Original quality" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Auto" })).toBeInTheDocument();
   });
 
   it("saves the bandwidth cap as a number", async () => {

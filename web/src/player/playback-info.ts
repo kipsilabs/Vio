@@ -168,41 +168,43 @@ export function buildPlaybackInfoSections({
 /**
  * Turns the plan's quality ladder into menu entries.
  *
- * The server owns the ladder: this maps its fixed rungs onto the menu's shape.
- * `id` is the rung's own label, which is what a `quality_change` replan sends
- * back. The `auto` entry is prepended locally because it is a *preference*,
- * not a rung, and it is also how the viewer returns to the source: Auto plays
- * the original file whenever the device and connection can carry it. Older
- * servers still list that source as an "original" entry, which is dropped
- * here.
+ * The server owns the ladder: this maps its rungs onto the menu's shape and
+ * adds nothing. `id` is the rung's own label, which is what a `quality_change`
+ * replan sends back. The `auto` entry is prepended locally because it is a
+ * *preference*, not a rung — no server rung names it, and picking it hands the
+ * choice back to the planner. Original is the server's source-preserving rung
+ * and stays a menu entry of its own.
  */
 export function qualityOptionsFromPlanV3(plan: PlanV3): QualityOption[] {
-  const rungs = plan.available_qualities
-    .filter((quality) => quality.label !== QUALITY_ORIGINAL_V3)
-    .map((quality) => ({
-      id: quality.label,
-      label: quality.display_name || quality.label,
-      sublabel: formatQualityBitrate(quality.bitrate_kbps),
-      resolution: quality.height ? `${quality.height}p` : "",
-      bitrateKbps: quality.bitrate_kbps ?? 0,
-    }));
+  const rungs = plan.available_qualities.map((quality) => ({
+    id: quality.label,
+    label: quality.display_name || qualityRungLabel(quality.label),
+    sublabel: formatQualityBitrate(quality.bitrate_kbps),
+    resolution: quality.height ? `${quality.height}p` : "",
+    bitrateKbps: quality.bitrate_kbps ?? 0,
+    isOriginal: quality.preserves_source,
+  }));
 
-  // Without a fixed rung there is nothing to choose, so there is no menu —
-  // audio-only plans and clients without HLS land here.
-  if (rungs.length === 0) {
-    return [];
+  // A single source-preserving rung is not a choice, so there is no menu to
+  // render — audio-only plans and clients without HLS land here.
+  if (rungs.length <= 1) {
+    return rungs;
   }
 
-  return [{ id: "auto", label: "Auto", sublabel: "", resolution: "", bitrateKbps: 0 }, ...rungs];
+  return [
+    { id: "auto", label: "Auto", sublabel: "", resolution: "", bitrateKbps: 0, isOriginal: false },
+    ...rungs,
+  ];
 }
 
 /**
  * Resolves a stored preference onto the menu entry that implements it in the
- * current plan. Auto and the legacy source labels light Auto. Plain
- * 2160p/1080p/720p preferences use the ladder's Medium bitrate; when that
- * resolution cap is at or above the source, the source plays as-is and no row
- * is lit, unless the plan's delivered recipe shows a bitrate cap reduced it.
- * Auto stays unlit so the viewer can still switch to it.
+ * current plan. Auto stays unlit when an explicit rung is active. A plain
+ * 2160p/1080p/720p preference uses the ladder's Medium bitrate; when that
+ * resolution cap is at or above the source, Original is the active entry,
+ * unless the plan's delivered recipe shows a bitrate cap reduced it. The
+ * legacy source labels resolve to Original, or to Auto on a plan that does
+ * not publish it.
  */
 export function resolveActiveQualityOptionId(
   options: QualityOption[],
@@ -212,9 +214,19 @@ export function resolveActiveQualityOptionId(
 ): string | null {
   if (options.length === 0) return null;
 
+  // A sole rung is effective regardless of the saved preference. Keep the
+  // preference unchanged so it applies again when more qualities are available.
+  if (options.length === 1) return options[0]!.id;
+
   const normalized = normalizeQualityPreferenceV3(preference).toLowerCase();
   const exact = options.find((option) => option.id.toLowerCase() === normalized);
   if (exact) return exact.id;
+
+  const original = options.find((option) => option.isOriginal);
+  if (normalized === QUALITY_ORIGINAL_V3) {
+    // A plan that predates Original still preserves the source through Auto.
+    return original?.id ?? options.find((option) => option.id === "auto")?.id ?? null;
+  }
 
   const aliasHeight = qualityPreferenceHeight(normalized);
   if (aliasHeight === null) return null;
@@ -232,7 +244,12 @@ export function resolveActiveQualityOptionId(
   const capped =
     (isPositive(deliveredKbps) && isPositive(sourceKbps) && deliveredKbps < sourceKbps) ||
     (isPositive(deliveredHeight) && isPositive(sourceHeight) && deliveredHeight < sourceHeight);
-  if (isPositive(sourceHeight) && !capped && sourceHeight <= aliasHeight) {
+  if (original) {
+    if (!capped && resolutionHeight(original.resolution) <= aliasHeight) {
+      return original.id;
+    }
+  } else if (isPositive(sourceHeight) && !capped && sourceHeight <= aliasHeight) {
+    // No Original entry on this plan: the source plays as-is, so no row is lit.
     return null;
   }
 
@@ -269,6 +286,18 @@ export function plainResolutionLabel(preference: string): string | null {
   return height === 2160 ? "4K" : `${height}p`;
 }
 
+function resolutionHeight(resolution: string): number {
+  const match = resolution
+    .trim()
+    .toLowerCase()
+    .match(/^(\d+)p$/);
+  return match ? Number.parseInt(match[1] ?? "0", 10) : 0;
+}
+
+function qualityRungLabel(label: string): string {
+  return label === QUALITY_ORIGINAL_V3 ? "Original" : label;
+}
+
 /**
  * The next quality rung below what the viewer receives now, for a viewer whose
  * connection cannot keep up. An explicit rung steps down from itself; Auto
@@ -282,7 +311,7 @@ export function lowerQualityOption(
   source?: Pick<SourceDescriptorV3, "height" | "bitrate_kbps">,
 ): QualityOption | null {
   const rungs = options
-    .filter((option) => option.id !== "auto" && option.bitrateKbps > 0)
+    .filter((option) => option.id !== "auto" && !option.isOriginal && option.bitrateKbps > 0)
     .sort((a, b) => b.bitrateKbps - a.bitrateKbps);
   const activeId = resolveActiveQualityOptionId(options, preference, delivered, source);
   const deliveredBitrateKbps = delivered?.bitrate_kbps;

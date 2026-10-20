@@ -334,6 +334,15 @@ function setMediaError(video: HTMLVideoElement, message: string) {
   });
 }
 
+/**
+ * Marks an original file's clock origin known, as a real load does before its
+ * first `timeupdate`. Until `loadedmetadata` fires the player keeps the
+ * scrubber at the session's start position instead of an event's media time.
+ */
+function fireDirectPlayMetadata(video: HTMLVideoElement) {
+  fireEvent.loadedMetadata(video);
+}
+
 /** Installs a fake `TimeRanges` list so tests can drive buffer/seek checks. */
 function setTimeRanges(
   video: HTMLVideoElement,
@@ -5834,6 +5843,7 @@ describe("VideoPlayer translation handoff", () => {
     const { container, rerenderPlayer } = renderPlayer({ plan, onReanchorSeek });
     const video = container.querySelector("video");
     if (!video) throw new Error("expected video element");
+    fireDirectPlayMetadata(video);
     Object.defineProperty(video, "currentTime", { configurable: true, writable: true, value: 12 });
 
     act(() => {
@@ -5854,6 +5864,7 @@ describe("VideoPlayer translation handoff", () => {
     const { container, rerenderPlayer } = renderPlayer({});
     const video = container.querySelector("video");
     if (!video) throw new Error("expected video element");
+    fireDirectPlayMetadata(video);
     Object.defineProperty(video, "currentTime", { configurable: true, writable: true, value: 50 });
     fireEvent.timeUpdate(video);
     await waitFor(() =>
@@ -5903,6 +5914,7 @@ describe("VideoPlayer buffered-first seeking", () => {
     const { container } = renderPlayer({ plan: nonSeekablePlan(), onReanchorSeek });
     const video = container.querySelector("video");
     if (!video) throw new Error("expected video element");
+    fireDirectPlayMetadata(video);
     Object.defineProperty(video, "currentTime", {
       configurable: true,
       writable: true,
@@ -6015,6 +6027,7 @@ describe("VideoPlayer bounded pending seek", () => {
     });
     const video = container.querySelector("video");
     if (!video) throw new Error("expected video element");
+    fireDirectPlayMetadata(video);
     Object.defineProperty(video, "currentTime", {
       configurable: true,
       writable: true,

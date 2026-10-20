@@ -435,7 +435,6 @@ export interface ReplanRequestV3 {
   attempt_count: number;
   quality_preference: string;
   position_seconds: number;
-  metered: boolean;
   /**
    * Re-negotiates the session's version-fallback intent. Set when the viewer
    * re-arms Auto mid-session so a later dead-source recovery rotates even

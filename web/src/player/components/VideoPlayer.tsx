@@ -107,12 +107,7 @@ import type {
   VideoFitMode,
 } from "../types";
 import type { PlayerTrickplay } from "../trickplay";
-import {
-  QUALITY_ORIGINAL_V3,
-  type FailureV3,
-  type PlanV3,
-  type SubtitleInventoryItemV3,
-} from "../protocol-v3";
+import { type FailureV3, type PlanV3, type SubtitleInventoryItemV3 } from "../protocol-v3";
 import { decodeFailure, isServerDecodeFailure } from "../decode-failure";
 import { isServerManifestNotReady, manifestRetryAfterMs } from "../manifest-not-ready";
 import {
@@ -1087,33 +1082,7 @@ export function VideoPlayer({
   // The menu is the plan's; which entry is lit is the session's own preference,
   // since `auto` is a valid preference that names no rung.
   const activeQualityId = qualityPreference;
-  const qualityOptions = useMemo<QualityOption[]>(() => {
-    const options = qualityOptionsFromPlanV3(plan);
-    // The upstream planner treats the source-preserving rung as "Auto", but
-    // Vio exposes it as its own Original choice. Keep that row in the menu
-    // even when the planner's helper filters it out.
-    const sourceRung = plan.available_qualities.find(
-      (quality) => quality.label === QUALITY_ORIGINAL_V3 || quality.preserves_source,
-    );
-    if (!sourceRung || options.some((option) => option.id === sourceRung.label)) {
-      return options;
-    }
-    const kbps = sourceRung.bitrate_kbps ?? 0;
-    const sublabel =
-      kbps >= 1000
-        ? `${kbps % 1000 === 0 ? kbps / 1000 : (kbps / 1000).toFixed(1)} Mbps`
-        : kbps > 0
-          ? `${kbps} kbps`
-          : "";
-    const original: QualityOption = {
-      id: sourceRung.label,
-      label: sourceRung.display_name || "Original",
-      sublabel,
-      resolution: sourceRung.height ? `${sourceRung.height}p` : "",
-      bitrateKbps: kbps,
-    };
-    return options.length === 0 ? [original] : [options[0]!, original, ...options.slice(1)];
-  }, [plan]);
+  const qualityOptions = useMemo<QualityOption[]>(() => qualityOptionsFromPlanV3(plan), [plan]);
 
   // The file the server actually planned against, which is not necessarily the
   // one that was asked for. When the plan resolved a neutral virtual row to a
@@ -1730,7 +1699,15 @@ export function VideoPlayer({
         },
       );
     },
-    [onReanchorSeek, releasePendingSeek, rememberPendingSeek],
+    [
+      canSeekAnywhere,
+      handleSeek,
+      isHlsStream,
+      onReanchorSeek,
+      releasePendingSeek,
+      rememberPendingSeek,
+      resetRoomCatchupRate,
+    ],
   );
 
   // Reports whether the seek was taken up, which callers that show an
@@ -1750,6 +1727,16 @@ export function VideoPlayer({
       }
 
       const nativeSeconds = toPlayerTime(seconds, timelineOffsetRef.current);
+      // Buffer-first: bytes already in the element's buffer play without any
+      // server round trip, so a target inside them is a local seek no matter
+      // what `canSeekAnywhere` claims or what window the server last planned.
+      // This is what keeps a ±skip step seamless on routes that report
+      // can_seek_anywhere=false. Falling through to the seekable/reanchor
+      // checks still rebuilds a genuinely unbuffered far seek.
+      if (isTimeBuffered(video, nativeSeconds)) {
+        video.currentTime = nativeSeconds;
+        return true;
+      }
       if (canSeekAnywhere || isNativePositionInRanges(video.seekable, nativeSeconds)) {
         rememberPendingSeek(seconds);
         setCurrentTime(seconds);
@@ -1780,8 +1767,6 @@ export function VideoPlayer({
   const planChangeInFlight = replanning || replacing;
   const planChangeInFlightRef = useRef(planChangeInFlight);
   planChangeInFlightRef.current = planChangeInFlight;
-  const planRevisionRef = useRef(planRevision);
-  planRevisionRef.current = planRevision;
   // What to do once the plan change in flight settles without replacing the
   // stream, and the plan revision it would replace.
   const afterPlanChangeRef = useRef<{ revision: number; run: () => void } | null>(null);
@@ -2703,7 +2688,7 @@ export function VideoPlayer({
     warmTransportUrlRef.current = url;
     void fetch(url, { signal: controller.signal, method: "GET" }).catch(() => {});
     return () => controller.abort();
-  }, [effectiveStreamUrl, effectiveTransportRevision, isPlayerReady]);
+  }, [effectiveStreamUrl, effectiveTransportRevision, isPlayerReady, transportRevision]);
   // Read by the transport effect, which reruns on planRevision rather than on
   // every input the original-file route depends on.
   const originalRouteInputRef = useRef({ plan, browserEngine, nativeOriginalSupport, audioTracks });
@@ -3288,7 +3273,8 @@ export function VideoPlayer({
             setDirectPlayOriginSeconds(origin);
             // A seek made while the origin was unknown wins over the start position.
             const mediaTarget =
-              pendingSeekTimeRef.current ?? toMediaTime(effectiveInitialPosition, planOffset);
+              pendingSeekTimeRef.current ??
+              toMediaTime(effectiveInitialPositionRef.current, planOffset);
             const target = toPlayerTime(mediaTarget, timelineOffsetRef.current);
             if (Math.abs(video.currentTime - target) > 0.01) video.currentTime = target;
             applyElementDuration(video);
@@ -3296,7 +3282,7 @@ export function VideoPlayer({
           };
           video.addEventListener("loadedmetadata", directPlayMetadataHandler, { once: true });
         } else {
-          video.currentTime = effectiveInitialPosition;
+          video.currentTime = effectiveInitialPositionRef.current;
           attemptAutoplayWhenReady();
         }
       }
@@ -3341,7 +3327,6 @@ export function VideoPlayer({
     effectiveTransportRevision,
     isHlsStream,
     isPlayerReady,
-    planRevision,
     playsOriginalFile,
     plannedBitrateKbps,
     plannedDynamicRange,
@@ -4104,6 +4089,11 @@ export function VideoPlayer({
     planSelectedSubtitleIdentity,
     subtitleSourceGeneration,
     plan.plan_id,
+    plan.plan_attempt_key,
+    plan.effective_media_file_id,
+    plan.effective_virtual_uri,
+    plan.virtual_source_revision,
+    sessionId,
     plan.selected_tracks.subtitle?.index,
     plan.subtitle.mode,
     subtitleHandoverPending,
@@ -4141,7 +4131,7 @@ export function VideoPlayer({
       setActiveSubtitleIndex(null);
       lastSubtitleTracksRef.current = effectiveSubtitleTracks;
     }
-  }, [initialSubtitleError, plan.plan_attempt_key, sessionId]);
+  }, [initialSubtitleError, plan.plan_attempt_key, sessionId, effectiveSubtitleTracks]);
 
   // -- Carry a manual subtitle selection across a version switch by identity --
   // A version switch mints a new session and a new subtitle inventory, and the
@@ -4253,6 +4243,7 @@ export function VideoPlayer({
   }, [
     activeSubtitleIndex,
     activeSubtitleSourceKey,
+    contentId,
     effectiveSubtitleTracks,
     plan.effective_media_file_id,
     plan.effective_virtual_uri,

@@ -3,9 +3,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import listEffectiveSettingsUnknownKey from "../../../../contracts/api/v2/fixtures/list_effective_settings_unknown_key.json";
 import { v2Problem } from "@/api/v2/problems.test-support";
-import { V2ProblemError } from "@/api/v2/request";
 import { SETTING_KEYS } from "@/lib/settingsContract";
 import {
   settingsCapabilitiesSupportAtomicShortcuts,

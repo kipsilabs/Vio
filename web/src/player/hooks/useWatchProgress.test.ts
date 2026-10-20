@@ -44,7 +44,7 @@ async function reportOnce(error: Error) {
   const videoRef = { current: video };
   vi.useFakeTimers();
   const rendered = renderHook(
-    () => useWatchProgress("session-1", videoRef, undefined, onSessionEnded),
+    () => useWatchProgress("session-1", videoRef, undefined, undefined, 0, onSessionEnded),
     { wrapper },
   );
   await act(async () => {
@@ -113,7 +113,8 @@ describe("useWatchProgress", () => {
     const videoRef = { current: video };
     vi.useFakeTimers();
     const rendered = renderHook(
-      ({ sessionId }) => useWatchProgress(sessionId, videoRef, undefined, onSessionEnded),
+      ({ sessionId }) =>
+        useWatchProgress(sessionId, videoRef, undefined, undefined, 0, onSessionEnded),
       { wrapper, initialProps: { sessionId: "session-1" } },
     );
     await act(async () => {

@@ -349,6 +349,7 @@ export const ADMIN_NAV_SECTIONS: AdminNavSection[] = [
           { ...PAGES.sections, label: "Home Sections" },
           PAGES.subtitleFiles,
           settingsPage("library", "Settings"),
+          settingsPage("streaming"),
         ],
       },
       {

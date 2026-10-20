@@ -10,7 +10,7 @@ import {
   templateResultFromV2,
   adminUpdateBody,
 } from "@/api/adminCollections";
-import { ApiClientError, api } from "@/api/client";
+import { ApiClientError, apiV1 } from "@/api/client";
 import type {
   CreateLibraryCollectionRequest,
   ImportMDBListCollectionRequest,
@@ -557,7 +557,7 @@ export function usePurgeVirtualPlaybackItems() {
 
   return useMutation({
     mutationFn: (options?: { dryRun?: boolean; libraryId?: number }) =>
-      api<{ success: boolean; files_deleted: number; items_deleted: number; message: string }>(
+      apiV1<{ success: boolean; files_deleted: number; items_deleted: number; message: string }>(
         `/admin/collections/purge-virtual?${new URLSearchParams({
           ...(options?.dryRun ? { dry_run: "true" } : {}),
           ...(options?.libraryId ? { library_id: String(options.libraryId) } : {}),

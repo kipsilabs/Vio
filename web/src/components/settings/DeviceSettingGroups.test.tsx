@@ -245,7 +245,7 @@ describe("DeviceSettingGroups", () => {
     expect(screen.queryByText("App default")).not.toBeInTheDocument();
   });
 
-  it("shows a stored original quality as Auto and no longer offers Original", async () => {
+  it("keeps a stored original quality and offers it", async () => {
     renderGroups({
       "playback.preferred_quality": effective({
         key: "playback.preferred_quality",
@@ -256,9 +256,9 @@ describe("DeviceSettingGroups", () => {
     });
 
     const select = screen.getByRole("combobox", { name: "Preferred quality" });
-    expect(select).toHaveTextContent("Auto");
+    expect(select).toHaveTextContent("Original quality");
     await userEvent.click(select);
-    expect(screen.queryByRole("option", { name: /Original/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Original quality" })).toBeInTheDocument();
   });
 
   it("offers the three intro modes and writes the selected device override", async () => {

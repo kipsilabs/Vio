@@ -655,7 +655,7 @@ export function useSubtitleTracks(
     // element and orphans the current track, so it must be rebuilt.
     // `sourceGeneration` is included so a genuine source change rebuilds the
     // track; a plan swap that leaves the source identity alone does not.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- rebuild on source identity, not every plan swap.
   }, [
     activeUrl,
     activeCodec,
