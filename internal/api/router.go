@@ -1517,16 +1517,11 @@ func newChiRouter(deps Dependencies) chi.Router {
 					// decoupled: the service knows only the callback, the
 					// handler resolves its own target through the catalog's
 					// version ordering (the same top entry the browse picker
-					// defaults to) and the file repository.
+					// defaults to) under the discovery request's access filter,
+					// and the file repository.
 					if detailSvc != nil && deps.FileRepo != nil {
 						virtualCandidatesRefresh.ScheduleDefaultFileProbe = playbackHandler.ScheduleDefaultFileProbe
-						playbackHandler.DefaultProbeTarget = handlers.VirtualDefaultProbeTargetFunc(func(ctx context.Context, contentID string) (*models.MediaFile, error) {
-							versions, err := detailSvc.GetItemVersions(ctx, contentID, catalog.AccessFilter{})
-							if err != nil || len(versions) == 0 {
-								return nil, err
-							}
-							return deps.FileRepo.GetByID(ctx, versions[0].FileID)
-						})
+						playbackHandler.DefaultProbeTarget = handlers.NewVirtualDefaultProbeTarget(detailSvc, deps.FileRepo)
 					}
 					// The indexer-release read/request surface and the async
 					// refresh executor share the store the service owns.
