@@ -44,14 +44,15 @@ fi
 grep -q 'id < 0' internal/apiv2/admin_requests.go \
   && pass "installation 0 validates" \
   || reject "installation 0 rejected in internal/apiv2/admin_requests.go"
-# Both request bodies carry the pattern: the save body (installation_id) and
-# the options body (installation_id,omitempty). Assert each one. A single
-# occurrence is not enough — the options body alone regressing while the save
-# body stays correct is the mixed state that motivated the fix.
-grep -Fq 'json:"installation_id" pattern:"^(0|[1-9][0-9]*)$"' internal/apiv2/admin_requests.go \
+# Assert each declaration itself, not any text in the file. A comment carrying
+# the expected pattern must not satisfy the check, and the save and options
+# bodies must be rejected independently.
+grep -E '^[[:space:]]*InstallationID[[:space:]]+ID[[:space:]]+`json:"installation_id"' internal/apiv2/admin_requests.go \
+  | grep -Fq 'pattern:"^(0|[1-9][0-9]*)$"' \
   && pass "installation 0 passes the v2 save schema" \
   || reject "installation 0 rejected by the v2 save schema"
-grep -Fq 'json:"installation_id,omitempty" pattern:"^(0|[1-9][0-9]*)$"' internal/apiv2/admin_requests.go \
+grep -E '^[[:space:]]*InstallationID[[:space:]]+\*ID[[:space:]]+`json:"installation_id,omitempty"' internal/apiv2/admin_requests.go \
+  | grep -Fq 'pattern:"^(0|[1-9][0-9]*)$"' \
   && pass "installation 0 passes the v2 options schema" \
   || reject "installation 0 rejected by the v2 options schema"
 grep -q 'ErrProviderUnavailable' internal/apiv2/admin_collections.go \
