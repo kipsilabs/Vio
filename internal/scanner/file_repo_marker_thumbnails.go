@@ -6,8 +6,9 @@ import (
 	"slices"
 	"time"
 
-	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/jackc/pgx/v5"
+
+	"github.com/Silo-Server/silo-server/internal/models"
 )
 
 // PrepareMarkerThumbnailState registers opaque image identities for an on-demand

@@ -733,7 +733,7 @@ func TestLibraryPrewarmStopsOnProviderFailure(t *testing.T) {
 	var calls atomic.Int32
 	failing := func(context.Context, string, string) (string, error) {
 		calls.Add(1)
-		return "", fmt.Errorf("quota exceeded")
+		return "", errors.New("quota exceeded")
 	}
 	cfg := Config{Enabled: true, Configured: true, ChatModel: "test-model"}
 	svc := NewService(ctx, cfg, repo, content, locs, failing, jobrunner.NewSemaphore(1), nil)
@@ -765,7 +765,7 @@ func TestLibraryPrewarmSkipsAFailingItem(t *testing.T) {
 	var calls atomic.Int32
 	chat := func(ctx context.Context, system, user string) (string, error) {
 		if calls.Add(1) == 1 {
-			return "", fmt.Errorf("content refused")
+			return "", errors.New("content refused")
 		}
 		return (&upperChat{}).fn(ctx, system, user)
 	}

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -150,7 +151,7 @@ func TestAICapabilitiesAreModelSpecific(t *testing.T) {
 
 func TestChatGPTCapabilityReflectsServiceAvailability(t *testing.T) {
 	for _, available := range []bool{false, true} {
-		t.Run(fmt.Sprint(available), func(t *testing.T) {
+		t.Run(strconv.FormatBool(available), func(t *testing.T) {
 			deps := requestDeps(fixtureRequests())
 			if available {
 				deps.ChatGPT = new(fakeChatGPT)

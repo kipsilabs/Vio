@@ -2,6 +2,7 @@ package sections
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"slices"
@@ -302,7 +303,7 @@ func TestForYouSectionFillsALibraryFromOtherPersonalRowsPostgres(t *testing.T) {
 // A failed fill fails the section, like a failed main-row read.
 func TestForYouSectionFillErrorFailsTheSection(t *testing.T) {
 	library := 3
-	fetcher := &Fetcher{RecommendationReader: &poolReader{rowType: "cluster", fillError: fmt.Errorf("cache read failed")}}
+	fetcher := &Fetcher{RecommendationReader: &poolReader{rowType: "cluster", fillError: errors.New("cache read failed")}}
 	if _, err := fetcher.FetchOne(context.Background(), ResolvedSection{ID: "recs", SectionType: SectionRecommendedForYou, ItemLimit: 20}, &library, nil, 7, "p1", catalog.AccessFilter{}); err == nil {
 		t.Fatal("FetchOne succeeded, want the fill's error")
 	}
@@ -310,7 +311,7 @@ func TestForYouSectionFillErrorFailsTheSection(t *testing.T) {
 
 // A reader failure fails the section rather than answering an empty row.
 func TestRecommendationSectionReadErrorFailsTheSection(t *testing.T) {
-	fetcher := &Fetcher{RecommendationReader: &poolReader{readError: fmt.Errorf("cache read failed")}}
+	fetcher := &Fetcher{RecommendationReader: &poolReader{readError: errors.New("cache read failed")}}
 	for _, sectionType := range []SectionType{SectionRecommendedForYou, SectionSimilarUsersLiked, SectionTasteMatch, SectionBecauseYouWatched} {
 		if _, err := fetcher.FetchOne(context.Background(), ResolvedSection{ID: "recs", SectionType: sectionType, ItemLimit: 20}, nil, nil, 7, "p1", catalog.AccessFilter{}); err == nil {
 			t.Fatalf("%s: FetchOne succeeded, want the reader's error", sectionType)

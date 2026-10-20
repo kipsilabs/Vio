@@ -5,8 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"testing"
 	"testing/synctest"
@@ -777,10 +777,10 @@ func TestPopulationHoldsAreCapped(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		service := NewPopulationService(PopulationOptions{})
 		for i := range markerMemoryLimit + 1 {
-			service.hold(fmt.Sprint(i))
+			service.hold(strconv.Itoa(i))
 			time.Sleep(time.Millisecond)
 		}
-		if len(service.holds) != markerMemoryLimit || service.held("0") || !service.held("1") || !service.held(fmt.Sprint(markerMemoryLimit)) {
+		if len(service.holds) != markerMemoryLimit || service.held("0") || !service.held("1") || !service.held(strconv.Itoa(markerMemoryLimit)) {
 			t.Fatalf("holds=%d, want %d without the first", len(service.holds), markerMemoryLimit)
 		}
 	})

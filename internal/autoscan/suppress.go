@@ -59,7 +59,7 @@ func (s *redisSuppressor) ShouldScan(ctx context.Context, key, state string, ttl
 		// given up rather than reported. The scanned state is still recorded
 		// by the scan itself.
 		slog.WarnContext(ctx, "autoscan suppression claim failed; scanning without it", "error", err)
-		return true, nil //nolint:nilerr // fail open: a Redis hiccup should not block scanning, and claimTarget drops the scan on any error
+		return true, nil
 	}
 	return claimed == 1, nil
 }

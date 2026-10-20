@@ -3,8 +3,8 @@ package auth
 import (
 	"context"
 	"errors"
-	"fmt"
 	"os"
+	"strconv"
 	"testing"
 	"time"
 
@@ -46,7 +46,7 @@ func newRemotePlaybackEnv(t *testing.T) *remotePlaybackEnv {
 	}
 	t.Cleanup(pool.Close)
 
-	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	suffix := strconv.FormatInt(time.Now().UnixNano(), 10)
 	env := &remotePlaybackEnv{pool: pool, name: "remote-playback-test-" + suffix}
 	users := NewUserRepository(pool)
 	sessions := NewSessionRepository(pool)

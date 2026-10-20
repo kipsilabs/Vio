@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -118,7 +119,7 @@ func cursorKeyStrings(c *QueryCursor) []string {
 	if c == nil {
 		return nil
 	}
-	out := []string{fmt.Sprint(c.Consumed)}
+	out := []string{strconv.Itoa(c.Consumed)}
 	for _, key := range c.Keys {
 		if key.Value == nil {
 			out = append(out, "<nil>")

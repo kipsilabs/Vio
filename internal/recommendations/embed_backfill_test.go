@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -226,7 +227,7 @@ func TestEmbedBatchStopsFallbackOnProviderLimit(t *testing.T) {
 // model: the run fails and writes neither the lock nor any row.
 func TestBackfillUnstorableVectorWritesNoLock(t *testing.T) {
 	for _, dims := range []int{0, CanonicalEmbeddingDimensions + 1, 4096} {
-		t.Run(fmt.Sprint(dims), func(t *testing.T) {
+		t.Run(strconv.Itoa(dims), func(t *testing.T) {
 			calls := 0
 			store := newFakeEmbeddingStore(testIDs("item-", 3)...)
 			b := newTestBackfill(store, quotaTestEmbedder(func(_ context.Context, texts []string) ([][]float32, error) {

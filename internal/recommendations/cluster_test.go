@@ -6,6 +6,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -73,7 +74,7 @@ func TestClusterLabelNamesWhatSetsAClusterApart(t *testing.T) {
 	titles := func(n int, weight float64, genres ...string) []clusterItem {
 		out := make([]clusterItem, n)
 		for i := range out {
-			out[i] = clusterItem{itemID: fmt.Sprint(i), weight: weight, genres: genres}
+			out[i] = clusterItem{itemID: strconv.Itoa(i), weight: weight, genres: genres}
 		}
 		return out
 	}

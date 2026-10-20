@@ -3,9 +3,11 @@ package handlers
 import (
 	"context"
 	"fmt"
-	"github.com/Silo-Server/silo-server/internal/models"
+	"strconv"
 	"testing"
 	"time"
+
+	"github.com/Silo-Server/silo-server/internal/models"
 )
 
 func TestAdminSplitDryRunRollbackAndCommit(t *testing.T) {
@@ -76,7 +78,7 @@ func (s *recordingRecommendationStaler) MarkProfilesStaleForItems(_ context.Cont
 // split that moves no user state, marks nothing.
 func TestAdminSplitMarksRecommendationsStaleWhenStateMoves(t *testing.T) {
 	pool := catalogTransferPool(t)
-	suffix := fmt.Sprint(time.Now().UnixNano())
+	suffix := strconv.FormatInt(time.Now().UnixNano(), 10)
 	source, target := "split-recs-source-"+suffix, "split-recs-target-"+suffix
 	for _, id := range []string{source, target} {
 		if _, err := pool.Exec(t.Context(), `INSERT INTO media_items(content_id,type,title)VALUES($1,'movie',$1)`, id); err != nil {

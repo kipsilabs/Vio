@@ -3,6 +3,7 @@ package metadata
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"testing"
 	"time"
 
@@ -25,7 +26,7 @@ func TestInitialMatch_NFOIDsReplaceTagAnchoredSkeleton(t *testing.T) {
 		catalog.NewLibraryItemRepository(pool), catalog.NewFolderRepository(pool),
 		nil, nil, nil, nil, nil)
 	nonce := time.Now().UnixNano() % 100_000_000
-	tagTMDB, nfoTMDB := fmt.Sprintf("%d", 600_000_000+nonce), fmt.Sprintf("%d", 700_000_000+nonce)
+	tagTMDB, nfoTMDB := strconv.FormatInt(600_000_000+nonce, 10), strconv.FormatInt(700_000_000+nonce, 10)
 	tagIMDb, nfoIMDb := fmt.Sprintf("tt8%08d", nonce), fmt.Sprintf("tt9%08d", nonce)
 	from, to := "movie-tmdb-"+tagTMDB, "movie-tmdb-"+nfoTMDB
 	t.Cleanup(func() {
@@ -98,7 +99,7 @@ func TestInitialMatch_NFOOnlyChainReplacesTagAnchoredSkeleton(t *testing.T) {
 		catalog.NewLibraryItemRepository(pool), catalog.NewFolderRepository(pool),
 		nil, nil, nil, nil, nil)
 	nonce := time.Now().UnixNano() % 100_000_000
-	tagTMDB, nfoTMDB := fmt.Sprintf("%d", 610_000_000+nonce), fmt.Sprintf("%d", 710_000_000+nonce)
+	tagTMDB, nfoTMDB := strconv.FormatInt(610_000_000+nonce, 10), strconv.FormatInt(710_000_000+nonce, 10)
 	tagIMDb := fmt.Sprintf("tt7%08d", nonce)
 	from, to := "movie-tmdb-"+tagTMDB, "movie-tmdb-"+nfoTMDB
 	t.Cleanup(func() {

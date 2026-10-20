@@ -212,8 +212,8 @@ func TestTransportErrorKeepsTimeoutClassification(t *testing.T) {
 		t.Fatalf("no *url.Error in %q", strings.ReplaceAll(err.Error(), secretKey, "[KEY]"))
 	}
 	assertErrorOmitsAPIKey(t, urlErr, secretKey)
-	if !urlErr.Timeout() || !urlErr.Temporary() { //nolint:staticcheck // Temporary is what's being preserved.
-		t.Fatalf("masked *url.Error: Timeout %v, Temporary %v; want both", urlErr.Timeout(), urlErr.Temporary()) //nolint:staticcheck // as above.
+	if !urlErr.Timeout() || !urlErr.Temporary() {
+		t.Fatalf("masked *url.Error: Timeout %v, Temporary %v; want both", urlErr.Timeout(), urlErr.Temporary())
 	}
 }
 

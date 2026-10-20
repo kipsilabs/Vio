@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -117,7 +118,7 @@ type failingRemoveStore struct {
 
 func (s failingRemoveStore) RemoveFromWatchlist(ctx context.Context, profileID, mediaItemID string) (bool, error) {
 	if *s.fail {
-		return false, fmt.Errorf("user store unavailable")
+		return false, errors.New("user store unavailable")
 	}
 	return s.UserStore.RemoveFromWatchlist(ctx, profileID, mediaItemID)
 }

@@ -159,7 +159,7 @@ type ApplyLocalItemImageRequest struct {
 func (s *MetadataService) ApplyLocalItemImage(ctx context.Context, req ApplyLocalItemImageRequest) (*ApplyItemImageResult, error) {
 	byteCacher, ok := s.imageCacher.(ImageByteCacher)
 	if !ok {
-		return nil, fmt.Errorf("image caching does not support local artwork")
+		return nil, errors.New("image caching does not support local artwork")
 	}
 	if !isLocalImageSourcePath(req.SourceURL) {
 		return nil, ErrLocalImageNotOffered

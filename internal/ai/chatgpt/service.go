@@ -468,7 +468,7 @@ func (s *Service) CompleteLoginWithSettings(ctx context.Context, callbackURL str
 				// Retain only its ID so a fresh authorization can reuse it.
 				c.Accounts = append(c.Accounts, account{ClientID: clientID, NeedsLogin: true})
 			}
-			return nil //nolint:nilerr // Commit the failed outcome before returning completionErr.
+			return nil
 		}
 		a := account{ClientID: clientID, Subject: claims.Subject, Email: claims.Email,
 			AccessToken: tokens.AccessToken, RefreshToken: tokens.RefreshToken, ExpiresAt: expiresAt,

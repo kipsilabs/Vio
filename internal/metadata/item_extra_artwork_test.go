@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"testing"
 
 	"github.com/Silo-Server/silo-server/internal/models"
@@ -510,7 +511,7 @@ func TestSyncItemExtraBackdropsStoresRowsAndQueuesJobs(t *testing.T) {
 		t.Fatalf("queued %d jobs, want 2", len(enqueuer.inputs))
 	}
 	for i, in := range enqueuer.inputs {
-		if in.TargetType != ImageCacheTargetItemBackdrop || in.TargetContentID != fmt.Sprint(rows[i].ID) ||
+		if in.TargetType != ImageCacheTargetItemBackdrop || in.TargetContentID != strconv.FormatInt(rows[i].ID, 10) ||
 			in.SeriesID != "movie-1" || in.ImageType != ImageCacheImageBackdrop ||
 			in.ProviderID != "local" || in.ProviderContentID != "movie-1" || in.ContentType != "movies" ||
 			in.SourcePath != rows[i].SourcePath || !in.RequeueSucceeded {

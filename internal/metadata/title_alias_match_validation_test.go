@@ -1,4 +1,3 @@
-//nolint:goconst // Repeated titles and provider IDs document each alias scenario.
 package metadata
 
 import (

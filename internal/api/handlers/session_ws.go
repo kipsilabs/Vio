@@ -206,7 +206,7 @@ func (h *PlaybackHandler) handleRealtimeClientMessage(ctx context.Context, sessi
 			}()
 			if err != nil {
 				if !errors.Is(err, playback.ErrSessionNotFound) {
-					slog.Error("failed to stop playback after realtime completion", "session", sessionID, "playback_session_id", sessionID, "error", err)
+					slog.ErrorContext(ctx, "failed to stop playback after realtime completion", "session", sessionID, "playback_session_id", sessionID, "error", err)
 				}
 				return nil
 			}
@@ -229,7 +229,7 @@ func (h *PlaybackHandler) handleRealtimeClientMessage(ctx context.Context, sessi
 			attempt, err := h.realtimeProgressAttempt(ctx, sessionID)
 			cancel()
 			if err != nil {
-				slog.Warn("failed to read progress sequence at realtime confirmation", "session", sessionID, "error", err)
+				slog.WarnContext(ctx, "failed to read progress sequence at realtime confirmation", "session", sessionID, "error", err)
 				return nil
 			}
 			var sequence int64

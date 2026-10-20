@@ -251,9 +251,11 @@ func TestCompatRecommendationsServeMoviesOnly(t *testing.T) {
 	var got []string
 	for _, c := range categories {
 		entry := c.RecommendationType + ":" + c.BaselineItemName
+		var entrySb254 strings.Builder
 		for _, item := range c.Items {
-			entry += " " + item.Name + "/" + item.Type
+			entrySb254.WriteString(" " + item.Name + "/" + item.Type)
 		}
+		entry += entrySb254.String()
 		got = append(got, entry)
 	}
 	want := []string{

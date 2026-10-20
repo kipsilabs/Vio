@@ -6,8 +6,9 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/Silo-Server/silo-server/internal/settingskeys"
 	"github.com/jackc/pgx/v5"
+
+	"github.com/Silo-Server/silo-server/internal/settingskeys"
 
 	"github.com/Silo-Server/silo-server/internal/ai/chatgpt"
 	"github.com/Silo-Server/silo-server/internal/config"
@@ -224,7 +225,7 @@ func (r *EncryptedSettingsRepo) UpdateValueAtomic(ctx context.Context, key strin
 		UpdateValueAtomic(context.Context, string, func(string) (string, error)) error
 	})
 	if !ok {
-		return fmt.Errorf("settings store does not support atomic value updates")
+		return errors.New("settings store does not support atomic value updates")
 	}
 	return inner.UpdateValueAtomic(ctx, key, func(raw string) (string, error) {
 		plain, err := r.cipher.DecryptIfEncrypted(raw, secret.SettingsAAD(key))

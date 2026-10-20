@@ -60,7 +60,7 @@ func (p *AccountProvisioner) CreateAccount(
 			return nil, fmt.Errorf(
 				"create default profile: %w (cleanup user: %w)",
 				err,
-				deleteErr, //nolint:errorlint // callers classify the profile error; the cleanup failure is only reported
+				deleteErr,
 			)
 		}
 		return nil, fmt.Errorf("create default profile: %w", err)

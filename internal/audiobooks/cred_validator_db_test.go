@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -120,7 +121,7 @@ func TestABSSignInChecksProfilePINDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Parent with its PIN: %v", err)
 	}
-	want := abs.Principal{UserID: fmt.Sprint(h.user.ID), ProfileID: h.parentID, DisplayName: "Parent", PINRevision: parent.PINRevision}
+	want := abs.Principal{UserID: strconv.Itoa(h.user.ID), ProfileID: h.parentID, DisplayName: "Parent", PINRevision: parent.PINRevision}
 	if got != want {
 		t.Fatalf("Parent with its PIN = %+v, want %+v", got, want)
 	}
@@ -174,7 +175,7 @@ func TestABSSignInPINAttemptsShareProfileLimitDB(t *testing.T) {
 func TestABSTokenProfileVerifierDB(t *testing.T) {
 	h := newABSPINHousehold(t)
 	ctx := context.Background()
-	uid := fmt.Sprint(h.user.ID)
+	uid := strconv.Itoa(h.user.ID)
 	verify := func(profileID string, rev *int64) error {
 		return h.validator.VerifyTokenProfile(ctx, uid, profileID, rev)
 	}

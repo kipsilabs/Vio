@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -300,14 +301,16 @@ func (f *fakeSheets) exec(_ context.Context, _ string, args []string, stdin io.R
 		if f.packetEnd > 0 {
 			end := int64(math.Round(f.packetEnd * 1000))
 			timing = "#tb 0: 1/1000\n"
+			var timingSb303 strings.Builder
 			for _, key := range f.keyPackets {
 				if math.IsNaN(key) {
-					timing += fmt.Sprintf("0, %d, %d, 1, 1, 0x00000000\n", int64(math.MinInt64), int64(math.MinInt64))
+					timingSb303.WriteString(fmt.Sprintf("0, %d, %d, 1, 1, 0x00000000\n", int64(math.MinInt64), int64(math.MinInt64)))
 					continue
 				}
 				at := int64(math.Round(key * 1000))
-				timing += fmt.Sprintf("0, %d, %d, 1, 1, 0x00000000\n0, %d, %d, 1, 1, 0x00000000, F=0x0\n", at, at, at+1, at+1)
+				timingSb303.WriteString(fmt.Sprintf("0, %d, %d, 1, 1, 0x00000000\n0, %d, %d, 1, 1, 0x00000000, F=0x0\n", at, at, at+1, at+1))
 			}
+			timing += timingSb303.String()
 			timing += fmt.Sprintf("0, %d, %d, 1, 1, 0x00000000\n", end-1, end-1)
 		}
 		if err := os.WriteFile(args[i+1], []byte(timing), 0o600); err != nil {
@@ -771,7 +774,7 @@ func TestSheetWindowCountsAnEmptyStaleSampleOnce(t *testing.T) {
 	var frames []fakeSheetFrame
 	for at := 4; at <= 38; at += 2 {
 		keys = append(keys, float64(at))
-		frames = append(frames, timed(byte(at), fmt.Sprint(at)))
+		frames = append(frames, timed(byte(at), strconv.Itoa(at)))
 	}
 	fake := &fakeSheets{format: "mpegts", frames: frames, packetEnd: 40, keyPackets: keys, editLog: logDuplicates}
 	result, err := Runner{Exec: fake.exec}.Run(t.Context(), req)

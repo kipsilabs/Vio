@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/Silo-Server/silo-server/internal/config"
@@ -15,7 +16,7 @@ func (r *EncryptedSettingsRepo) UpdateValueAndSettingsAtomic(ctx context.Context
 		UpdateValueAndSettingsAtomic(context.Context, string, func(map[string]string) (map[string]string, error)) error
 	})
 	if !ok {
-		return fmt.Errorf("settings store does not support coordinated updates")
+		return errors.New("settings store does not support coordinated updates")
 	}
 	return inner.UpdateValueAndSettingsAtomic(ctx, key, func(current map[string]string) (map[string]string, error) {
 		plain := make(map[string]string, len(current))

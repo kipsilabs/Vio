@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -556,7 +557,7 @@ func validateImageURLFor(ctx context.Context, u *url.URL) error {
 	}
 	host := u.Hostname()
 	if host == "" {
-		return fmt.Errorf("URL host is required")
+		return errors.New("URL host is required")
 	}
 	if addr, err := netip.ParseAddr(host); err == nil {
 		if err := netguard.CheckAddr(addr, netguard.PrivateAccess(ctx)); err != nil {

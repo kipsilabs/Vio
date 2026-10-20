@@ -1150,7 +1150,7 @@ func TestScoreFuzzyTitleVariantJoinsWordsWithinTheirTypoAllowance(t *testing.T) 
 		query, title string
 		want         int
 	}{
-		{"live stream from hel", "Livestream from Hell", 4}, //nolint:misspell
+		{"live stream from hel", "Livestream from Hell", 4},
 		{"spiderman", "Spider-Man", 1},
 		// Joining must not drop a short word that has no typo allowance.
 		{"ed wood", "Wood", 1},

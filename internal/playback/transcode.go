@@ -3672,7 +3672,7 @@ func (s *TranscodeSession) generateSyntheticPlaylist(segPrefix, rawQuery, namePr
 	buf.WriteString("#EXT-X-PLAYLIST-TYPE:VOD\n")
 
 	if initMap {
-		buf.WriteString(fmt.Sprintf("#EXT-X-MAP:URI=\"%sinit.mp4%s\"\n", segPrefix, suffix))
+		fmt.Fprintf(&buf, "#EXT-X-MAP:URI=\"%sinit.mp4%s\"\n", segPrefix, suffix)
 	}
 
 	for i := range segCount {
@@ -3684,7 +3684,7 @@ func (s *TranscodeSession) generateSyntheticPlaylist(segPrefix, rawQuery, namePr
 				dur = float64(segDur)
 			}
 		}
-		buf.WriteString(fmt.Sprintf("#EXTINF:%.6f,\n", dur))
+		fmt.Fprintf(&buf, "#EXTINF:%.6f,\n", dur)
 		fmt.Fprintf(&buf, "%s%s%05d%s%s\n", segPrefix, namePrefix, i, segExt, suffix)
 	}
 

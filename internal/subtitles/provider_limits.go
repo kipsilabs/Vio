@@ -86,5 +86,5 @@ func ExtractSubtitleFromZip(data []byte) ([]byte, SubtitleFormat, error) {
 		return content, format, nil
 	}
 
-	return nil, "", fmt.Errorf("no subtitle file found in zip archive")
+	return nil, "", errors.New("no subtitle file found in zip archive")
 }

@@ -143,10 +143,10 @@ func (s *PersonRefreshService) resolveProviders(ctx context.Context) ([]Provider
 // duplicate lookup this avoids.
 func (s *PersonRefreshService) RefreshPersonUnlessStartedSince(ctx context.Context, id int64, since time.Time) (*models.Person, error) {
 	if s.repo == nil {
-		return nil, fmt.Errorf("person refresh repository is not configured")
+		return nil, errors.New("person refresh repository is not configured")
 	}
 	if s.pluginResolver == nil || s.pool == nil {
-		return nil, fmt.Errorf("person refresh providers are not configured")
+		return nil, errors.New("person refresh providers are not configured")
 	}
 	return s.refreshPerson(ctx, id, s.resolveProviders, since)
 }
