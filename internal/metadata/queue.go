@@ -61,10 +61,7 @@ func (q *RefreshQueue) Dequeue() (RefreshEntry, bool) {
 		return RefreshEntry{}, false
 	}
 
-	entry, ok := heap.Pop(&q.entries).(*RefreshEntry)
-	if !ok {
-		return RefreshEntry{}, false
-	}
+	entry := heap.Pop(&q.entries).(*RefreshEntry) //nolint:errcheck,forcetypeassert // refHeap holds only *RefreshEntry
 	delete(q.byID, entry.ContentID)
 	return *entry, true
 }
@@ -87,10 +84,7 @@ func (h refHeap) Swap(i, j int) {
 	h[j].index = j
 }
 func (h *refHeap) Push(x any) {
-	entry, ok := x.(*RefreshEntry)
-	if !ok {
-		return
-	}
+	entry := x.(*RefreshEntry) //nolint:errcheck,forcetypeassert // Enqueue is the only caller of heap.Push and passes a *RefreshEntry
 	entry.index = len(*h)
 	*h = append(*h, entry)
 }

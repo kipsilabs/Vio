@@ -1,5 +1,5 @@
 import type { SectionItem } from "@/api/types";
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { renderToStaticMarkup } from "react-dom/server";
 import { MemoryRouter } from "react-router";
@@ -18,8 +18,26 @@ const playbackMocks = vi.hoisted(() => ({
   toggleActivePlayback: vi.fn(),
 }));
 
+const spoilerPrefs = vi.hoisted(() => ({ hideImages: false, hideOverviews: false }));
+
+vi.mock("@/hooks/useEpisodeSpoilerPrefs", () => ({
+  useEpisodeSpoilerPrefs: () => spoilerPrefs,
+}));
+
 vi.mock("@/hooks/useAmbientColor", () => ({
   useAmbientColor: () => undefined,
+}));
+
+const translationMocks = vi.hoisted(() => ({
+  hook: vi.fn(),
+  state: { translating: false, onTranslate: undefined as undefined | (() => void) },
+}));
+
+vi.mock("@/hooks/useOnViewTranslation", () => ({
+  useOnViewTranslation: (...args: unknown[]) => {
+    translationMocks.hook(...args);
+    return translationMocks.state;
+  },
 }));
 
 vi.mock("@/lib/thumbhash", () => ({
@@ -173,6 +191,8 @@ describe("formatHeroMetadata", () => {
 
 describe("HeroBanner", () => {
   beforeEach(() => {
+    spoilerPrefs.hideImages = false;
+    spoilerPrefs.hideOverviews = false;
     playbackMocks.controller = null;
     playbackMocks.toggleActivePlayback.mockClear();
     vi.stubGlobal("matchMedia", () => ({
@@ -185,6 +205,55 @@ describe("HeroBanner", () => {
   afterEach(() => {
     vi.useRealTimers();
     vi.unstubAllGlobals();
+  });
+
+  it("hides unwatched episode descriptions and reveals started episodes", () => {
+    spoilerPrefs.hideImages = true;
+    spoilerPrefs.hideOverviews = true;
+    const episode = movieSlide({
+      type: "episode",
+      backdrop_url: "/episode-still.jpg",
+      backdrop_is_episode_still: true,
+      overview: "The culprit is revealed",
+      user_state: { played: false, is_favorite: false, in_watchlist: false },
+    });
+    const { rerender } = render(
+      <MemoryRouter>
+        <HeroBanner items={[episode]} />
+      </MemoryRouter>,
+    );
+    expect(screen.queryByText("The culprit is revealed")).not.toBeInTheDocument();
+    expect(
+      document.querySelector('img[src="/episode-still.jpg"]')?.getAttribute("style"),
+    ).toContain("blur(24px)");
+
+    rerender(
+      <MemoryRouter>
+        <HeroBanner items={[{ ...episode, position_seconds: 120 }]} />
+      </MemoryRouter>,
+    );
+    expect(screen.getByText("The culprit is revealed")).toBeInTheDocument();
+    expect(
+      document.querySelector('img[src="/episode-still.jpg"]')?.getAttribute("style"),
+    ).not.toContain("blur(");
+  });
+
+  it("preserves the series backdrop on an unwatched episode", () => {
+    spoilerPrefs.hideImages = true;
+    render(
+      <MemoryRouter>
+        <HeroBanner
+          items={[
+            movieSlide({
+              type: "episode",
+              backdrop_url: "/series-art.jpg",
+              backdrop_is_episode_still: false,
+            }),
+          ]}
+        />
+      </MemoryRouter>,
+    );
+    expect(document.querySelector("img")?.getAttribute("style")).not.toContain("blur(");
   });
 
   it("names the ken burns tokens literally so tailwind keeps them", () => {
@@ -702,5 +771,97 @@ describe("HeroBanner", () => {
     await userEvent.click(screen.getByRole("link", { name: /pause/i }));
 
     expect(playbackMocks.toggleActivePlayback).toHaveBeenCalledTimes(1);
+  });
+
+  describe("on-view translation", () => {
+    afterEach(() => {
+      translationMocks.hook.mockClear();
+      translationMocks.state = { translating: false, onTranslate: undefined };
+    });
+
+    it("translates only the visible slide and refreshes the hero's items", async () => {
+      const refresh = vi.fn();
+      const visible = movieSlide({ content_id: "movie-1", pending_translation_language: "de" });
+      render(
+        <MemoryRouter>
+          <HeroBanner
+            items={[visible, movieSlide({ content_id: "movie-2" })]}
+            onRefreshItems={refresh}
+          />
+        </MemoryRouter>,
+      );
+      await waitFor(() =>
+        expect(translationMocks.hook).toHaveBeenLastCalledWith(visible, {
+          onPoll: refresh,
+          pendingContentIds: new Set(["movie-1"]),
+        }),
+      );
+    });
+
+    it("keeps translation state across a slide whose overview is hidden", async () => {
+      spoilerPrefs.hideOverviews = true;
+      const hidden = movieSlide({
+        content_id: "episode-1",
+        type: "episode",
+        overview: "Unwatched plot",
+        pending_translation_language: "de",
+      });
+      render(
+        <MemoryRouter>
+          <HeroBanner items={[hidden]} />
+        </MemoryRouter>,
+      );
+      // The hook stays mounted with no item, so nothing new starts for the
+      // hidden overview while an earlier slide's translation keeps polling.
+      await waitFor(() =>
+        expect(translationMocks.hook).toHaveBeenLastCalledWith(undefined, {
+          onPoll: undefined,
+          pendingContentIds: new Set(["episode-1"]),
+        }),
+      );
+      expect(screen.queryByText("Unwatched plot")).not.toBeInTheDocument();
+    });
+
+    it("pulses the description while it translates", async () => {
+      translationMocks.state = { translating: true, onTranslate: undefined };
+      render(
+        <MemoryRouter>
+          <HeroBanner items={[movieSlide({ overview: "Source text" })]} />
+        </MemoryRouter>,
+      );
+      expect(await screen.findByText("Translating…")).toBeInTheDocument();
+      expect(screen.getByText("Source text")).toHaveClass("animate-pulse");
+    });
+
+    it("offers the translate action in button mode", async () => {
+      const onTranslate = vi.fn();
+      translationMocks.state = { translating: false, onTranslate };
+      render(
+        <MemoryRouter>
+          <HeroBanner items={[movieSlide()]} />
+        </MemoryRouter>,
+      );
+      await userEvent.click(await screen.findByRole("button", { name: "Translate" }));
+      expect(onTranslate).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not label a provider overview when only the tagline is AI", async () => {
+      render(
+        <MemoryRouter>
+          <HeroBanner items={[movieSlide({ machine_translated_fields: ["tagline"] })]} />
+        </MemoryRouter>,
+      );
+      await waitFor(() => expect(translationMocks.hook).toHaveBeenCalled());
+      expect(screen.queryByText("Translated by AI")).not.toBeInTheDocument();
+    });
+
+    it("labels a machine-translated description", async () => {
+      render(
+        <MemoryRouter>
+          <HeroBanner items={[movieSlide({ machine_translated_fields: ["overview"] })]} />
+        </MemoryRouter>,
+      );
+      expect(await screen.findByText("Translated by AI")).toBeInTheDocument();
+    });
   });
 });

@@ -8,6 +8,20 @@
       "air_date": "2022-02-18",
       "release_state": "released",
       "runtime": 57,
+      "ratings": [
+        {
+          "source": "imdb",
+          "name": "IMDb",
+          "score": 87,
+          "display": "8.7"
+        },
+        {
+          "source": "tmdb",
+          "name": "TMDB",
+          "score": 82.5,
+          "display": "8.3"
+        }
+      ],
       "user_data": {
         "watched_count": 1,
         "unplayed_count": 0,

@@ -62,9 +62,12 @@ export function useSeriesEpisodes(
     title: ep.title,
     runtime: ep.runtime,
     overview: ep.overview,
+    machineTranslatedFields: ep.machine_translated_fields,
     stillUrl: ep.still_url,
+    stillIsEpisodeStill: ep.still_is_episode_still,
     stillThumbhash: ep.still_thumbhash,
     airDate: ep.air_date,
+    watchState: ep.user_data,
   }));
 
   const isLoading = seasonsLoading || currentLoading || (!!nextSeasonInfo && nextLoading);

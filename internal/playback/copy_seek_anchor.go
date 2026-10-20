@@ -509,10 +509,7 @@ func ResolveCopySeekAnchorForSource(
 		if result.Err != nil {
 			return 0, 0, result.Err
 		}
-		anchor, ok := result.Val.(copySeekAnchor)
-		if !ok {
-			return 0, 0, fmt.Errorf("unexpected copy seek anchor result %T", result.Val)
-		}
+		anchor := result.Val.(copySeekAnchor) //nolint:errcheck,forcetypeassert // copySeekProbeGroup's only DoChan closure returns a copySeekAnchor
 		return anchor.seconds, anchor.segment, nil
 	}
 }

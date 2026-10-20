@@ -53,6 +53,18 @@ func (f *titlecardImageService) ApplyItemImage(_ context.Context, r metadata.App
 	return &metadata.ApplyItemImageResult{StoredPath: "tmdb/series/1/still/original.rev.webp", Thumbhash: "hash", Revision: "rev"}, nil
 }
 
+func (f *titlecardImageService) FetchItemImagesWithLocal(context.Context, map[string]string, string, string, int, string) ([]metadata.RemoteImage, map[string]string, error) {
+	return []metadata.RemoteImage{{ProviderID: "tmdb", URL: "tmdb://episode-still.jpg", Type: metadata.ImageStill}}, nil, nil
+}
+
+func (f *titlecardImageService) LocalImagePreview(context.Context, string, string) (string, error) {
+	return "", nil
+}
+
+func (f *titlecardImageService) ApplyLocalItemImage(context.Context, metadata.ApplyLocalItemImageRequest) (*metadata.ApplyItemImageResult, error) {
+	return nil, nil
+}
+
 var errTitlecardImageDown = errors.New("synthetic image failure")
 
 func newTitlecardHandler(episode *models.Episode, svc *titlecardImageService) *AdminImageHandler {

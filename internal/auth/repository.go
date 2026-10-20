@@ -174,7 +174,7 @@ func createUser(ctx context.Context, db interface {
 	cols := []string{
 		"email", "username", "password_hash", "local_password_login_enabled", "password_change_required", "role", "permissions",
 		"library_ids", "max_playback_quality", "max_streams", "max_transcodes", "max_remote_stream_bitrate_kbps", "max_local_stream_bitrate_kbps",
-		"transcode_allowed", "audio_transcode_allowed", "download_allowed", "download_transcode_allowed",
+		"transcode_allowed", "audio_transcode_allowed", "max_profiles", "download_allowed", "download_transcode_allowed",
 		"requests_allowed",
 	}
 	args := []any{
@@ -193,30 +193,30 @@ func createUser(ctx context.Context, db interface {
 		input.MaxLocalStreamBitrateKbps,
 		input.TranscodeAllowed,
 		input.AudioTranscodeAllowed,
+		input.MaxProfiles,
 		input.DownloadAllowed,
 		input.DownloadTranscodeAllowed,
 		input.RequestsAllowed,
 	}
 
-	// Optional columns: nil means use DB default.
-	if input.MaxProfiles != nil {
-		cols = append(cols, "max_profiles")
-		args = append(args, *input.MaxProfiles)
+	accessGroupID := input.AccessGroupID
+	if input.Role == models.RoleAdmin {
+		accessGroupID = nil
 	}
-	if input.AccessGroupID != nil {
+	if accessGroupID != nil {
 		cols = append(cols, "access_group_id")
-		args = append(args, *input.AccessGroupID)
+		args = append(args, *accessGroupID)
 	}
 
 	// Build placeholders: $1, $2, ..., $N
-	placeholders := make([]string, len(args))
+	placeholders := make([]string, 0, len(args)+1)
 	for i := range args {
-		placeholders[i] = fmt.Sprintf("$%d", i+1)
+		placeholders = append(placeholders, fmt.Sprintf("$%d", i+1))
 	}
 	// Admins stay ungrouped: scope/action decisions are role-blind, so the
 	// default group's ceilings would cap the server owner (mirrors the
 	// exclusion in the assign_default_group_to_existing_users migration).
-	if input.AccessGroupID == nil && input.Role != "admin" {
+	if accessGroupID == nil && input.Role != models.RoleAdmin {
 		cols = append(cols, "access_group_id")
 		placeholders = append(placeholders, "(SELECT id FROM access_groups WHERE is_default)")
 	}
@@ -277,6 +277,62 @@ type userUpdateColumn struct {
 	set               bool
 	value             any
 	bumpsAccessPolicy bool
+}
+
+// accessGroupSetClause builds the SET clause and access-policy predicate for
+// access_group_id given the next free placeholder index. access_group_id is
+// handled outside the generic userUpdateColumn machinery because, unlike
+// every other column, what gets written depends on the row's current role:
+//
+//   - Granting admin (input.Role == "admin") clears the group unconditionally.
+//   - Changing role to anything else without naming a group lands the row on
+//     the default group, but only if it was an admin (accounts are never
+//     un-grouped by an unrelated role change).
+//   - Setting a group on its own (input.Role == nil) is guarded by a CASE so
+//     a write that races an admin promotion cannot leave the admin grouped.
+//   - Otherwise (explicit NULL, or a group set alongside a non-admin role
+//     change) the value is bound directly.
+//
+// Admin accounts are never grouped (see Create). Returns an empty setClause
+// if access_group_id is not touched by this update.
+//
+// The default-group branch reads from a CTE (aliased in defaultGroupCTE)
+// instead of inlining the subselect, because the same expression is spliced
+// into both the SET clause and the access_policy_revision predicate — as a
+// literal subselect it would run twice per UPDATE, but a CTE referenced more
+// than once is materialized once by Postgres.
+func accessGroupSetClause(input models.UpdateUserInput, argIndex int) (setClause, predicate, defaultGroupCTE string, args []any, nextArgIndex int) {
+	const isAdmin = "role = '" + models.RoleAdmin + "'"
+	nextArgIndex = argIndex
+	switch {
+	case input.Role != nil && *input.Role == models.RoleAdmin:
+		placeholder := fmt.Sprintf("$%d", argIndex)
+		setClause = "access_group_id = " + placeholder
+		args = []any{(*int64)(nil)}
+		nextArgIndex++
+	case input.Role != nil && !input.AccessGroupID.Set:
+		defaultGroupCTE = "default_group AS (SELECT id FROM access_groups WHERE is_default)"
+		expr := "(CASE WHEN " + isAdmin + " THEN (SELECT id FROM default_group) ELSE access_group_id END)"
+		setClause = "access_group_id = " + expr
+	case input.Role == nil && input.AccessGroupID.Set && input.AccessGroupID.Value != nil:
+		placeholder := fmt.Sprintf("$%d", argIndex)
+		// The cast pins the parameter type; inside a CASE the driver would
+		// otherwise send it as text.
+		expr := "(CASE WHEN " + isAdmin + " THEN NULL ELSE " + placeholder + "::bigint END)"
+		setClause = "access_group_id = " + expr
+		args = []any{input.AccessGroupID.Value}
+		nextArgIndex++
+	default:
+		if !input.AccessGroupID.Set {
+			return "", "", "", nil, argIndex
+		}
+		placeholder := fmt.Sprintf("$%d", argIndex)
+		setClause = "access_group_id = " + placeholder
+		args = []any{input.AccessGroupID.Value}
+		nextArgIndex++
+	}
+	predicate = "access_group_id IS DISTINCT FROM " + strings.TrimPrefix(setClause, "access_group_id = ")
+	return setClause, predicate, defaultGroupCTE, args, nextArgIndex
 }
 
 // Update modifies a user's fields. Only non-nil fields in the input are updated.
@@ -358,7 +414,7 @@ func updateUser(ctx context.Context, db interface {
 		{column: "max_local_stream_bitrate_kbps", set: input.MaxLocalStreamBitrateKbps.Set, value: input.MaxLocalStreamBitrateKbps.Value},
 		{column: "transcode_allowed", set: input.TranscodeAllowed.Set, value: input.TranscodeAllowed.Value},
 		{column: "audio_transcode_allowed", set: input.AudioTranscodeAllowed.Set, value: input.AudioTranscodeAllowed.Value},
-		{column: "max_profiles", set: input.MaxProfiles != nil, value: input.MaxProfiles},
+		{column: "max_profiles", set: input.MaxProfiles.Set, value: input.MaxProfiles.Value},
 		{column: "download_allowed", set: input.DownloadAllowed.Set, value: input.DownloadAllowed.Value},
 		{column: "download_transcode_allowed", set: input.DownloadTranscodeAllowed.Set, value: input.DownloadTranscodeAllowed.Value},
 		{column: "requests_allowed", set: input.RequestsAllowed.Set, value: input.RequestsAllowed.Value},
@@ -373,15 +429,28 @@ func updateUser(ctx context.Context, db interface {
 		if !col.set {
 			continue
 		}
-		setClauses = append(setClauses, fmt.Sprintf("%s = $%d", col.column, argIndex))
+		placeholder := fmt.Sprintf("$%d", argIndex)
+		setClauses = append(setClauses, fmt.Sprintf("%s = %s", col.column, placeholder))
 		if col.bumpsAccessPolicy {
 			accessPolicyPredicates = append(
 				accessPolicyPredicates,
-				fmt.Sprintf("%s IS DISTINCT FROM $%d", col.column, argIndex),
+				fmt.Sprintf("%s IS DISTINCT FROM %s", col.column, placeholder),
 			)
 		}
 		args = append(args, col.value)
 		argIndex++
+	}
+
+	// access_group_id is not a plain userUpdateColumn: what gets written
+	// depends on the row's current role, so it is assembled directly rather
+	// than through the generic column loop above.
+	var defaultGroupCTE string
+	if setClause, predicate, cte, groupArgs, nextArgIndex := accessGroupSetClause(input, argIndex); setClause != "" {
+		setClauses = append(setClauses, setClause)
+		accessPolicyPredicates = append(accessPolicyPredicates, predicate)
+		defaultGroupCTE = cte
+		args = append(args, groupArgs...)
+		argIndex = nextArgIndex
 	}
 
 	if len(setClauses) == 0 {
@@ -400,8 +469,14 @@ func updateUser(ctx context.Context, db interface {
 	// Always bump updated_at.
 	setClauses = append(setClauses, "updated_at = NOW()")
 
-	query := fmt.Sprintf("UPDATE users SET %s WHERE id = $%d",
-		strings.Join(setClauses, ", "), argIndex)
+	var query string
+	if defaultGroupCTE != "" {
+		query = fmt.Sprintf("WITH %s UPDATE users SET %s WHERE id = $%d",
+			defaultGroupCTE, strings.Join(setClauses, ", "), argIndex)
+	} else {
+		query = fmt.Sprintf("UPDATE users SET %s WHERE id = $%d",
+			strings.Join(setClauses, ", "), argIndex)
+	}
 	args = append(args, id)
 
 	tag, err := db.Exec(ctx, query, args...)

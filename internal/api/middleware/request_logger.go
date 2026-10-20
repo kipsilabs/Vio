@@ -3,6 +3,7 @@ package middleware
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -14,6 +15,8 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/activitylog"
 	"github.com/Silo-Server/silo-server/internal/clientip"
+	"github.com/Silo-Server/silo-server/internal/database/queryattr"
+	"github.com/Silo-Server/silo-server/internal/httpstream"
 )
 
 func RequestLogger(nodeID string) func(http.Handler) http.Handler {
@@ -26,6 +29,10 @@ func RequestLogger(nodeID string) func(http.Handler) http.Handler {
 				}
 			}
 
+			ctx, db := queryattr.StartRequest(r.Context())
+			if db != nil {
+				r = r.WithContext(ctx)
+			}
 			start := time.Now()
 			wrapped := &requestStatusWriter{ResponseWriter: w, status: http.StatusOK}
 			lc := activitylog.GetLogContext(r.Context())
@@ -54,7 +61,7 @@ func RequestLogger(nodeID string) func(http.Handler) http.Handler {
 				"method", r.Method,
 				"path", activitylog.RedactSecretPathParams(r, r.URL.Path),
 				"path_pattern", pathPattern,
-				"status", wrapped.status,
+				"status", activitylog.RecordedStatus(r, wrapped.status, wrapped.wroteHeader),
 				"duration_ms", time.Since(start).Milliseconds(),
 				"client_ip", clientip.FromContext(r.Context()),
 				"user_agent", r.UserAgent(),
@@ -69,6 +76,7 @@ func RequestLogger(nodeID string) func(http.Handler) http.Handler {
 			if playbackLC.PlaybackSessionID != "" {
 				attrs = append(attrs, "playback_session_id", playbackLC.PlaybackSessionID)
 			}
+			attrs = append(attrs, db.LogAttrs()...)
 			slog.InfoContext(r.Context(), "api request", append([]any{"component", "api"}, attrs...)...)
 		})
 	}
@@ -93,6 +101,13 @@ func (w *requestStatusWriter) Write(b []byte) (int, error) {
 		w.wroteHeader = true
 	}
 	return w.ResponseWriter.Write(b)
+}
+
+func (w *requestStatusWriter) ReadFrom(src io.Reader) (int64, error) {
+	if !w.wroteHeader {
+		w.status, w.wroteHeader = http.StatusOK, true
+	}
+	return httpstream.ForwardReadFrom(w.ResponseWriter, w, src, 0, nil)
 }
 
 func (w *requestStatusWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {

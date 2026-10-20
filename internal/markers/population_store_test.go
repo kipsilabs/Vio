@@ -88,6 +88,84 @@ func TestPopulationStoreLeasesFreshnessAndQuota(t *testing.T) {
 	}
 }
 
+// An abandoned request hands its claim back without touching what earlier
+// requests recorded, and never leaves a new identity waiting out an old
+// result's freshness with nothing cached.
+func TestPopulationStoreReleaseKeepsFetchState(t *testing.T) {
+	fixture := newContributionStoreFixture(t)
+	store := NewPopulationStore(fixture.pool)
+	ctx := t.Context()
+	fileID, provider := fixture.fileIDs[0], fixture.provider
+	type fetchState struct {
+		outcome, lastError, result string
+		failures                   int
+		retryAt                    time.Time
+		leased                     bool
+	}
+	read := func() fetchState {
+		t.Helper()
+		var state fetchState
+		if err := fixture.pool.QueryRow(ctx, `SELECT outcome,COALESCE(last_error,''),COALESCE(result::text,''),failures,retry_at,lease_token IS NOT NULL
+			FROM marker_fetch_state WHERE media_file_id=$1 AND provider=$2`, fileID, provider).
+			Scan(&state.outcome, &state.lastError, &state.result, &state.failures, &state.retryAt, &state.leased); err != nil {
+			t.Fatal(err)
+		}
+		return state
+	}
+	claim := func(identity string, force bool) FetchClaim {
+		t.Helper()
+		c, claimed, err := store.Claim(ctx, fileID, provider, identity, "rev1", force)
+		if err != nil || !claimed {
+			t.Fatalf("claim %s: claimed=%v err=%v", identity, claimed, err)
+		}
+		return c
+	}
+
+	// A cached answer, then a failed request whose backoff has run out.
+	if err := store.Complete(ctx, claim("identity", false), FetchCompletion{Outcome: "hit", RetryAt: time.Now().Add(-time.Second), Result: &Result{ProviderID: "cached"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Complete(ctx, claim("identity", false), FetchCompletion{Outcome: "error", RetryAt: time.Now().Add(-time.Second), Error: "provider down"}); err != nil {
+		t.Fatal(err)
+	}
+	before := read()
+	abandoned := claim("identity", false)
+	if abandoned.Failures != 1 {
+		t.Fatalf("claim failures=%d, want 1", abandoned.Failures)
+	}
+	stale := abandoned
+	stale.Token = "00000000-0000-0000-0000-000000000000"
+	if err := store.Release(ctx, stale); err != nil {
+		t.Fatal(err)
+	}
+	if !read().leased {
+		t.Fatal("release with another token freed the lease")
+	}
+	if err := store.Release(ctx, abandoned); err != nil {
+		t.Fatal(err)
+	}
+	after := read()
+	if after.leased || after.outcome != before.outcome || after.lastError != before.lastError || after.result != before.result ||
+		after.failures != before.failures || !after.retryAt.Equal(before.retryAt) {
+		t.Fatalf("release changed fetch state:\nbefore %+v\nafter  %+v", before, after)
+	}
+
+	// A fresh answer for the current identity, then an abandoned request for
+	// a new one: the new identity must be asked again at once.
+	if err := store.Complete(ctx, claim("identity", false), FetchCompletion{Outcome: "hit", RetryAt: time.Now().Add(24 * time.Hour), Result: &Result{ProviderID: "cached"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Release(ctx, claim("new-identity", false)); err != nil {
+		t.Fatal(err)
+	}
+	var due bool
+	if err := fixture.pool.QueryRow(ctx, `SELECT result IS NULL AND retry_at<=now() FROM marker_fetch_state WHERE media_file_id=$1 AND provider=$2`,
+		fileID, provider).Scan(&due); err != nil || !due {
+		t.Fatalf("released new identity kept the old freshness: %+v err=%v", read(), err)
+	}
+	claim("new-identity", false)
+}
+
 // seedMovieFiles adds a third file to the fixture, attaches all three to one
 // matched movie in an enabled movies library, and returns their IDs.
 func (f contributionStoreFixture) seedMovieFiles(t *testing.T) (string, []int) {
@@ -181,8 +259,8 @@ func TestMarkerResolverUsesShowIDsAndPreservesSpecials(t *testing.T) {
 		_, _ = fixture.pool.Exec(context.Background(), `DELETE FROM episodes WHERE content_id=$1`, episodeID)
 		_, _ = fixture.pool.Exec(context.Background(), `DELETE FROM media_items WHERE content_id=$1`, seriesID)
 	})
-	if _, err := fixture.pool.Exec(ctx, `INSERT INTO episodes(content_id,series_id,season_number,episode_number,tmdb_id,imdb_id,tvdb_id,air_date)
-		VALUES($1,$2,0,2,'88','tt99','99','2026-09-30')`, episodeID, seriesID); err != nil {
+	if _, err := fixture.pool.Exec(ctx, `INSERT INTO episodes(content_id,series_id,season_number,episode_number,tmdb_id,imdb_id,tvdb_id,title,air_date)
+		VALUES($1,$2,0,2,'88','tt99','99',' Special Two ','2026-09-30')`, episodeID, seriesID); err != nil {
 		t.Fatal(err)
 	}
 	resolver := NewDBExternalIDResolver(fixture.pool)
@@ -192,6 +270,9 @@ func TestMarkerResolverUsesShowIDsAndPreservesSpecials(t *testing.T) {
 	}
 	if ids.TmdbID != "" || ids.TvdbID != "" || ids.ImdbID != "tt42" || ids.SeasonNumber != 0 || ids.EpisodeNumber != 2 {
 		t.Fatalf("episode identity leaked into show lookup: %+v", ids)
+	}
+	if ids.Episode != (EpisodeIDs{TmdbID: "88", ImdbID: "tt99", TvdbID: "99"}) || ids.EpisodeTitle != "Special Two" {
+		t.Fatalf("episode refinement = %+v %q, want the episode's own IDs and trimmed title", ids.Episode, ids.EpisodeTitle)
 	}
 	if !ids.Released.Equal(time.Date(2026, 9, 30, 0, 0, 0, 0, time.UTC)) {
 		t.Fatalf("released=%v, want the episode air date", ids.Released)
@@ -374,4 +455,91 @@ type requestRecorder struct {
 func (r requestRecorder) FetchMarkers(ctx context.Context, req Request) (Result, error) {
 	*r.request = req
 	return r.populationProvider.FetchMarkers(ctx, req)
+}
+
+func TestMarkerResolverEpisodeNumberingFollowsLibraryChain(t *testing.T) {
+	fixture := newContributionStoreFixture(t)
+	ctx := t.Context()
+	seriesID := strconv.FormatInt(time.Now().UnixNano(), 10)
+	episodeID := strconv.FormatInt(time.Now().UnixNano()+1, 10)
+	if _, err := fixture.pool.Exec(ctx, `INSERT INTO media_items(content_id,type,title,tmdb_id,tvdb_id) VALUES($1,'series','Numbering fixture','70','80')`, seriesID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.pool.Exec(ctx, `INSERT INTO episodes(content_id,series_id,season_number,episode_number,tmdb_id,tvdb_id)
+		VALUES($1,$2,1,3,'700','800')`, episodeID, seriesID); err != nil {
+		t.Fatal(err)
+	}
+	installations := map[string]int64{}
+	for _, capability := range []string{"tvdb", "tmdb"} {
+		var id int64
+		if err := fixture.pool.QueryRow(ctx, `INSERT INTO plugin_installations(plugin_id,version,install_path) VALUES($1,'1.0.0','/numbering-fixture') RETURNING id`,
+			fmt.Sprintf("numbering.%s.%d", capability, fixture.suffix)).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		installations[capability] = id
+	}
+	t.Cleanup(func() {
+		ctx := context.Background()
+		_, _ = fixture.pool.Exec(ctx, `DELETE FROM library_provider_chains WHERE media_folder_id=$1`, fixture.folderID)
+		_, _ = fixture.pool.Exec(ctx, `DELETE FROM plugin_installations WHERE id = ANY($1)`, []int64{installations["tvdb"], installations["tmdb"]})
+		_, _ = fixture.pool.Exec(ctx, `DELETE FROM episodes WHERE content_id=$1`, episodeID)
+		_, _ = fixture.pool.Exec(ctx, `DELETE FROM media_items WHERE content_id=$1`, seriesID)
+	})
+	type link struct {
+		capability string
+		level      string
+		enabled    bool
+	}
+	setChain := func(t *testing.T, links ...link) {
+		t.Helper()
+		if _, err := fixture.pool.Exec(ctx, `DELETE FROM library_provider_chains WHERE media_folder_id=$1`, fixture.folderID); err != nil {
+			t.Fatal(err)
+		}
+		for priority, l := range links {
+			if _, err := fixture.pool.Exec(ctx, `INSERT INTO library_provider_chains(media_folder_id,priority,content_level,enabled,plugin_installation_id,capability_id)
+				VALUES($1,$2,$3,$4,$5,$6)`, fixture.folderID, priority, l.level, l.enabled, installations[l.capability], l.capability); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	resolver := NewDBExternalIDResolver(fixture.pool)
+	numbering := func(t *testing.T) string {
+		t.Helper()
+		ids, err := resolver.ResolveForFile(ctx, &models.MediaFile{ID: fixture.fileIDs[0], EpisodeID: episodeID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ids.EpisodeNumbering
+	}
+
+	for _, tt := range []struct {
+		name  string
+		chain []link
+		want  string
+	}{
+		{name: "no chain", want: ""},
+		{name: "TVDB first", chain: []link{{"tvdb", "episode", true}, {"tmdb", "episode", true}}, want: "tvdb"},
+		{name: "TMDB first", chain: []link{{"tmdb", "episode", true}, {"tvdb", "episode", true}}, want: "tmdb"},
+		{name: "disabled TVDB is skipped", chain: []link{{"tvdb", "episode", false}, {"tmdb", "episode", true}}, want: "tmdb"},
+		{name: "legacy flat chain", chain: []link{{"tvdb", "", true}, {"tmdb", "", true}}, want: "tvdb"},
+		{name: "per-level chain wins over legacy", chain: []link{{"tvdb", "", true}, {"tmdb", "episode", true}}, want: "tmdb"},
+		{name: "other levels do not count", chain: []link{{"tvdb", "series", true}, {"tmdb", "episode", true}}, want: "tmdb"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			setChain(t, tt.chain...)
+			if got := numbering(t); got != tt.want {
+				t.Fatalf("numbering = %q, want %q", got, tt.want)
+			}
+		})
+	}
+
+	t.Run("first provider the episode came from", func(t *testing.T) {
+		setChain(t, link{"tvdb", "episode", true}, link{"tmdb", "episode", true})
+		if _, err := fixture.pool.Exec(ctx, `UPDATE episodes SET tvdb_id='' WHERE content_id=$1`, episodeID); err != nil {
+			t.Fatal(err)
+		}
+		if got := numbering(t); got != "tmdb" {
+			t.Fatalf("numbering = %q, want tmdb for an episode TVDB did not supply", got)
+		}
+	})
 }

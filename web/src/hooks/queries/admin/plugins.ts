@@ -4,7 +4,7 @@ import { useCallback, useState } from "react";
 import { toast } from "sonner";
 
 import {
-  api,
+  apiV1,
   captureProfileRequestContext,
   isCapturedProfileAuthorityActive,
   StaleApiRequestContextError,
@@ -533,8 +533,11 @@ function captureInstallation(id: number): PluginLifecycleIntent {
   if (!profileContext) throw new StaleApiRequestContextError();
   return { id, profileContext };
 }
+// 422, 409, and 503 carry a reason written for the admin: a refused plugin
+// package, a conflicting state, or an unreachable catalog or download host.
 function lifecycleFailure(error: unknown, fallback: string): string {
-  return error instanceof V2ProblemError && (error.status === 422 || error.status === 409)
+  return error instanceof V2ProblemError &&
+    (error.status === 422 || error.status === 409 || error.status === 503)
     ? error.message
     : fallback;
 }
@@ -1087,7 +1090,7 @@ export function useSavePluginTaskBinding() {
 export function usePluginInstallationConfigOptions() {
   return useMutation({
     mutationFn: ({ installationId }: { installationId: number }) =>
-      api<Record<string, Array<{ value: string; label: string }>>>(
+      apiV1<Record<string, Array<{ value: string; label: string }>>>(
         `/admin/plugins/installations/${installationId}/config-options`,
         { method: "POST" },
       ),

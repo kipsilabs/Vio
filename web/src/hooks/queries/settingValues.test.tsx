@@ -358,4 +358,25 @@ describe("effective settings batching", () => {
     expect(request[1].query.library_ids).toEqual(["3"]);
     expect(request[1].query.series_ids).toEqual(["tv:1"]);
   });
+
+  it("fails every read that shared a failed request", async () => {
+    v2Mock.mockImplementation((operation: string) =>
+      operation === "GET /api/v2/settings/values/effective"
+        ? Promise.reject(new Error("offline"))
+        : Promise.resolve(undefined),
+    );
+
+    const { result } = renderHook(
+      () => ({
+        titleArt: useSettingValue(SETTING_KEYS.UI_TITLE_ART),
+        hdr: useSettingValue(SETTING_KEYS.PLAYER_HDR_ENABLED),
+      }),
+      { wrapper },
+    );
+
+    await waitFor(() =>
+      expect(result.current.titleArt.isError && result.current.hdr.isError).toBe(true),
+    );
+    expect(v2Mock).toHaveBeenCalledTimes(1);
+  });
 });

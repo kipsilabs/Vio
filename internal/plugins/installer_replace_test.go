@@ -149,7 +149,7 @@ func TestInstallerReplaceArchiveRequestsVirtualMediaCleanup(t *testing.T) {
 		Version:     "0.0.19",
 		InstallPath: oldPath,
 		Enabled:     true,
-	}, archiveData, nil); err != nil {
+	}, archiveData, InstallArchiveRequest{}); err != nil {
 		t.Fatalf("replaceArchive() returned error: %v", err)
 	}
 

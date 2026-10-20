@@ -139,15 +139,11 @@ func (r *PushDeviceRepository) ApplyAndroidPush(ctx context.Context, cmd Android
 	} else {
 		// Bootstrap cannot take over an existing legacy registration owned by a
 		// different account. Bind while its existing account is still selected.
-		var foreign bool
-		err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM push_devices WHERE device_id=$1 AND platform=$2 AND user_id<>$3)`, cmd.DeviceID, PushPlatformAndroid, cmd.UserID).Scan(&foreign)
-		if err != nil {
-			return result, fmt.Errorf("check ordered push ownership: %w", err)
-		}
-		if foreign {
-			return AndroidPushReceipt{}, ErrPushGenerationConflict
+		if err = checkPushInstallationOwner(ctx, tx, cmd.DeviceID, PushPlatformAndroid, cmd.UserID); err != nil {
+			return AndroidPushReceipt{}, err
 		}
 		if cmd.Remove {
+			var foreign bool
 			err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM push_devices WHERE device_id=$1 AND platform=$2 AND profile_id<>$3)`, cmd.DeviceID, PushPlatformAndroid, cmd.ProfileID).Scan(&foreign)
 			if err != nil {
 				return result, fmt.Errorf("check ordered push profile: %w", err)

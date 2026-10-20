@@ -208,11 +208,14 @@ func (p *PluginProvider) FetchMarkers(ctx context.Context, req Request) (Result,
 		return Result{}, err
 	}
 	response, err := client.FetchMarkers(ctx, &pluginv1.FetchMarkersRequest{
-		ItemType:        itemTypeName(req.Kind),
-		ExternalIds:     externalIDsProto(req.ExternalIDs),
-		SeasonNumber:    int32(season),
-		EpisodeNumber:   int32(episode),
-		DurationSeconds: req.Duration.Seconds(),
+		ItemType:           itemTypeName(req.Kind),
+		ExternalIds:        externalIDsProto(req.ExternalIDs),
+		SeasonNumber:       int32(season),  //nolint:gosec // markerCoordinate clamps both coordinates below MaxProviderSeason/MaxProviderEpisode, within int32.
+		EpisodeNumber:      int32(episode), //nolint:gosec // markerCoordinate clamps both coordinates below MaxProviderSeason/MaxProviderEpisode, within int32.
+		DurationSeconds:    req.Duration.Seconds(),
+		EpisodeExternalIds: episodeExternalIDsProto(req.EpisodeExternalIDs),
+		EpisodeNumbering:   req.EpisodeNumbering,
+		EpisodeTitle:       req.EpisodeTitle,
 	})
 	if err != nil {
 		return Result{}, pluginProviderError(p.ID(), err)
@@ -254,12 +257,15 @@ func (p *PluginProvider) SubmitMarker(ctx context.Context, req SubmissionRequest
 		return SubmissionResult{}, err
 	}
 	body := &pluginv1.SubmitMarkerRequest{
-		ItemType:        itemTypeName(req.Kind),
-		ExternalIds:     externalIDsProto(req.ExternalIDs),
-		SeasonNumber:    int32(season),
-		EpisodeNumber:   int32(episode),
-		Segment:         markerKindName(req.Segment),
-		DurationSeconds: req.Duration.Seconds(),
+		ItemType:           itemTypeName(req.Kind),
+		ExternalIds:        externalIDsProto(req.ExternalIDs),
+		SeasonNumber:       int32(season),  //nolint:gosec // markerCoordinate clamps both coordinates below MaxProviderSeason/MaxProviderEpisode, within int32.
+		EpisodeNumber:      int32(episode), //nolint:gosec // markerCoordinate clamps both coordinates below MaxProviderSeason/MaxProviderEpisode, within int32.
+		Segment:            markerKindName(req.Segment),
+		DurationSeconds:    req.Duration.Seconds(),
+		EpisodeExternalIds: episodeExternalIDsProto(req.EpisodeExternalIDs),
+		EpisodeNumbering:   req.EpisodeNumbering,
+		EpisodeTitle:       req.EpisodeTitle,
 	}
 	if req.Start != nil {
 		start := req.Start.Seconds()
@@ -361,6 +367,15 @@ func externalIDsProto(ids map[string]string) *pluginv1.MarkerExternalIDs {
 		TvdbId:      strings.TrimSpace(ids[ExternalIDKeyTVDB]),
 		ProviderIds: structIDs,
 	}
+}
+
+// episodeExternalIDsProto leaves the field unset for a movie or an episode
+// without its own IDs, as a host that predates the field would.
+func episodeExternalIDsProto(ids map[string]string) *pluginv1.MarkerExternalIDs {
+	if len(ids) == 0 {
+		return nil
+	}
+	return externalIDsProto(ids)
 }
 
 func itemTypeName(kind ItemKind) string {

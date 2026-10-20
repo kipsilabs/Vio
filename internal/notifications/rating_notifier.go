@@ -84,7 +84,7 @@ func (n *RatingNotifier) NotifyRating(ctx context.Context, userID int, profileID
 	if userID <= 0 || profileID == "" {
 		return nil
 	}
-	prefs, err := n.system.Preferences.Get(ctx, profileID)
+	prefs, err := n.system.Preferences.Get(ctx, userID, profileID)
 	if err != nil {
 		return err
 	}
@@ -95,7 +95,7 @@ func (n *RatingNotifier) NotifyRating(ctx context.Context, userID int, profileID
 	// writing a durable delivery row that no channel targets. The channel
 	// check must match what DispatchOperational's post-commit enqueuers
 	// consider recipient-eligible.
-	if !n.hasRatingSubscribers(ctx, profileID) {
+	if !n.hasRatingSubscribers(ctx, userID, profileID) {
 		return nil
 	}
 
@@ -126,7 +126,7 @@ func (n *RatingNotifier) NotifyRating(ctx context.Context, userID int, profileID
 // The checks mirror DispatchOperational's per-target gates; nil repos mean
 // that channel is unconfigured (no at-rest cipher / no VAPID provisioner) and
 // contribute no recipients.
-func (n *RatingNotifier) hasRatingSubscribers(ctx context.Context, profileID string) bool {
+func (n *RatingNotifier) hasRatingSubscribers(ctx context.Context, userID int, profileID string) bool {
 	if n.system == nil {
 		return false
 	}
@@ -139,7 +139,7 @@ func (n *RatingNotifier) hasRatingSubscribers(ctx context.Context, profileID str
 	}
 	// Web push subscriptions also receive rating deliveries.
 	if n.system.Settings.WebPushEnabled(ctx) && n.system.webPushRepo != nil {
-		if subs, err := n.system.webPushRepo.ListByProfile(ctx, profileID); err == nil && len(subs) > 0 {
+		if subs, err := n.system.webPushRepo.ListByProfile(ctx, userID, profileID); err == nil && len(subs) > 0 {
 			return true
 		}
 	}
@@ -152,9 +152,10 @@ func (n *RatingNotifier) hasRatingSubscribers(ctx context.Context, profileID str
 		if platforms := n.system.Settings.EnabledPushPlatforms(ctx); len(platforms) > 0 {
 			tx, err := n.system.pool.Begin(ctx)
 			if err == nil {
-				devices, listErr := n.system.pushDeviceRepo.ListEnabledPushByProfiles(ctx, tx, []string{profileID}, platforms)
+				key := profileKey{userID: userID, profileID: profileID}
+				devices, listErr := n.system.pushDeviceRepo.ListEnabledPushByProfiles(ctx, tx, []profileKey{key}, platforms)
 				_ = tx.Rollback(ctx)
-				if listErr == nil && len(devices[profileID]) > 0 {
+				if listErr == nil && len(devices[key]) > 0 {
 					return true
 				}
 			}

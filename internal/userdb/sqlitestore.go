@@ -54,8 +54,8 @@ func (s *SQLiteUserStore) UpdateProfile(_ context.Context, id string, u userstor
 	return UpdateProfile(s.db, id, u)
 }
 
-func (s *SQLiteUserStore) DeleteProfile(_ context.Context, id string) error {
-	return DeleteProfile(s.db, id)
+func (s *SQLiteUserStore) DeleteProfile(ctx context.Context, id string) error {
+	return DeleteProfile(ctx, s.db, id)
 }
 
 func (s *SQLiteUserStore) VerifyPIN(_ context.Context, profileID, pin string) (bool, error) {
@@ -90,6 +90,10 @@ func (s *SQLiteUserStore) MarkWatched(_ context.Context, profileID, mediaItemID 
 
 func (s *SQLiteUserStore) ClearProgress(_ context.Context, profileID, mediaItemID string) error {
 	return ClearProgress(s.db, profileID, mediaItemID)
+}
+
+func (s *SQLiteUserStore) ClearResumePosition(ctx context.Context, profileID, mediaItemID string, at time.Time) (bool, error) {
+	return ClearResumePosition(ctx, s.db, profileID, mediaItemID, at)
 }
 
 // MarkWatchedBatch is one of the few paths here that forwards ctx: the write
@@ -209,9 +213,31 @@ func (s *SQLiteUserStore) DeleteHomeDismissal(_ context.Context, profileID, surf
 	return DeleteHomeDismissal(s.db, profileID, surface, mediaItemID)
 }
 
+// --- Not interested ---
+
+func (s *SQLiteUserStore) MarkNotInterested(ctx context.Context, profileID, mediaItemID string) (bool, error) {
+	return MarkNotInterested(ctx, s.db, profileID, mediaItemID)
+}
+
+func (s *SQLiteUserStore) UnmarkNotInterested(ctx context.Context, profileID, mediaItemID string) (bool, error) {
+	return UnmarkNotInterested(ctx, s.db, profileID, mediaItemID)
+}
+
+func (s *SQLiteUserStore) GetNotInterested(ctx context.Context, profileID, mediaItemID string) (*userstore.NotInterestedEntry, error) {
+	return GetNotInterested(ctx, s.db, profileID, mediaItemID)
+}
+
+func (s *SQLiteUserStore) ListNotInterestedPage(ctx context.Context, profileID string, after *userstore.ListKey, limit int) ([]userstore.NotInterestedEntry, error) {
+	return ListNotInterestedPage(ctx, s.db, profileID, after, limit)
+}
+
+func (s *SQLiteUserStore) ListNotInterestedByMediaItems(ctx context.Context, profileID string, mediaItemIDs []string) (map[string]bool, error) {
+	return ListNotInterestedByMediaItems(ctx, s.db, profileID, mediaItemIDs)
+}
+
 // --- Favorites & Watchlist ---
 
-func (s *SQLiteUserStore) AddFavorite(_ context.Context, profileID, mediaItemID string) error {
+func (s *SQLiteUserStore) AddFavorite(_ context.Context, profileID, mediaItemID string) (bool, error) {
 	return AddFavorite(s.db, profileID, mediaItemID)
 }
 
@@ -219,8 +245,8 @@ func (s *SQLiteUserStore) AddFavoriteAt(_ context.Context, profileID, mediaItemI
 	return AddFavoriteAt(s.db, profileID, mediaItemID, addedAt)
 }
 
-func (s *SQLiteUserStore) RemoveFavorite(_ context.Context, profileID, mediaItemID string) error {
-	return RemoveFavorite(s.db, profileID, mediaItemID)
+func (s *SQLiteUserStore) RemoveFavorite(ctx context.Context, profileID, mediaItemID string) (bool, error) {
+	return RemoveFavorite(ctx, s.db, profileID, mediaItemID)
 }
 
 func (s *SQLiteUserStore) ListFavorites(_ context.Context, profileID string, limit, offset int) ([]userstore.Favorite, error) {
@@ -247,7 +273,7 @@ func (s *SQLiteUserStore) GetWatchlistEntry(_ context.Context, profileID, mediaI
 	return GetWatchlistEntry(s.db, profileID, mediaItemID)
 }
 
-func (s *SQLiteUserStore) AddToWatchlist(_ context.Context, profileID, mediaItemID string) error {
+func (s *SQLiteUserStore) AddToWatchlist(_ context.Context, profileID, mediaItemID string) (bool, error) {
 	return AddToWatchlist(s.db, profileID, mediaItemID)
 }
 
@@ -255,8 +281,8 @@ func (s *SQLiteUserStore) AddToWatchlistAt(_ context.Context, profileID, mediaIt
 	return AddToWatchlistAt(s.db, profileID, mediaItemID, addedAt)
 }
 
-func (s *SQLiteUserStore) RemoveFromWatchlist(_ context.Context, profileID, mediaItemID string) error {
-	return RemoveFromWatchlist(s.db, profileID, mediaItemID)
+func (s *SQLiteUserStore) RemoveFromWatchlist(ctx context.Context, profileID, mediaItemID string) (bool, error) {
+	return RemoveFromWatchlist(ctx, s.db, profileID, mediaItemID)
 }
 
 func (s *SQLiteUserStore) ReplaceWatchlistOrder(_ context.Context, profileID string, orderedMediaItemIDs []string) error {

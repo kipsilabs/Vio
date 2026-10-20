@@ -97,7 +97,7 @@ describe("buildQualitySummary", () => {
       hdr: true,
       codec_audio: "TrueHD Atmos",
     });
-    expect(buildQualitySummary(version)).toBe("2160p · HEVC · HDR · Atmos");
+    expect(buildQualitySummary(version)).toBe("2160p · HEVC · HDR · TrueHD Atmos");
   });
 
   it("appends audio languages after the audio codec", () => {

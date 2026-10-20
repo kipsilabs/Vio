@@ -119,7 +119,7 @@ export function PluginConfigForm({
       })
       .finally(() => setOptionsLoading(false));
     // Re-run only when the installation changes, not on every render.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- the installation or dynamic-field set changed, not every render.
   }, [installationId, hasDynamicFields]);
 
   useEffect(() => {

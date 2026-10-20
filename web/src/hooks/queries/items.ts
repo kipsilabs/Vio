@@ -1,7 +1,7 @@
 import { getAdminItemImages, applyAdminItemImage } from "@/api/v2/adminImages";
 import { getAdminItemFiles, splitAdminItem } from "@/api/v2/adminSplit";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { api } from "@/api/client";
+import { apiV1 } from "@/api/client";
 import { useRealtimeEvents } from "@/components/realtimeEventsContext";
 import type {
   ApplyItemImageRequest,
@@ -379,6 +379,7 @@ export function useWatchedStateMutation(item: WatchedMutationItem) {
         ...detail,
         user_data: { ...detail.user_data, played: nextPlayed },
         user_state: {
+          ...detail.user_state,
           played: nextPlayed,
           is_favorite: detail.user_state?.is_favorite ?? false,
           in_watchlist: detail.user_state?.in_watchlist ?? false,
@@ -392,6 +393,7 @@ export function useWatchedStateMutation(item: WatchedMutationItem) {
         ...detail,
         user_data: { ...detail.user_data, played: !nextPlayed },
         user_state: {
+          ...detail.user_state,
           played: !nextPlayed,
           is_favorite: detail.user_state?.is_favorite ?? false,
           in_watchlist: detail.user_state?.in_watchlist ?? false,
@@ -715,7 +717,7 @@ export function useDeleteMediaItem() {
 
   return useMutation({
     mutationFn: (contentId: string) =>
-      api<{ success: boolean; content_id: string; message: string }>(
+      apiV1<{ success: boolean; content_id: string; message: string }>(
         `/admin/items/${itemPathID(contentId)}`,
         { method: "DELETE" },
       ),

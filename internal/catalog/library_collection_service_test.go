@@ -336,28 +336,6 @@ func TestFetchMDBListEntriesHonorsContextCancellation(t *testing.T) {
 	}
 }
 
-func TestTraktCandidatesByPriority_ShowUsesTVDBBeforeTMDB(t *testing.T) {
-	lookup := &ExternalIDLookup{
-		ByTVDB: map[string]string{"100": "tvdb-hit"},
-		ByTMDB: map[string]string{"200": "tmdb-hit"},
-		ByIMDb: map[string]string{"tt300": "imdb-hit"},
-	}
-	candidates := traktCandidatesByPriority(lookup, TraktCollectionEntry{
-		TVDBID: 100,
-		TMDBID: 200,
-		IMDbID: "tt300",
-	}, "series")
-	want := []string{"tvdb-hit", "tmdb-hit", "imdb-hit"}
-	if len(candidates) != len(want) {
-		t.Fatalf("candidates = %v, want %v", candidates, want)
-	}
-	for i := range want {
-		if candidates[i] != want[i] {
-			t.Fatalf("candidates = %v, want %v", candidates, want)
-		}
-	}
-}
-
 // fakeMDBListAPI records calls and returns canned ListItems, standing in for
 // *mdblist.Client so tests can prove which fetch path ran without a network.
 type fakeMDBListAPI struct {
@@ -824,28 +802,6 @@ func TestValidateTMDBDiscoverConfig(t *testing.T) {
 				t.Errorf("mediaType = %q, want empty when invalid", mediaType)
 			}
 		})
-	}
-}
-
-func TestTraktCandidatesByPriority_MovieUsesTMDBBeforeIMDb(t *testing.T) {
-	lookup := &ExternalIDLookup{
-		ByTVDB: map[string]string{"100": "tvdb-hit"},
-		ByTMDB: map[string]string{"200": "tmdb-hit"},
-		ByIMDb: map[string]string{"tt300": "imdb-hit"},
-	}
-	candidates := traktCandidatesByPriority(lookup, TraktCollectionEntry{
-		TVDBID: 100,
-		TMDBID: 200,
-		IMDbID: "tt300",
-	}, "movie")
-	want := []string{"tmdb-hit", "imdb-hit"}
-	if len(candidates) != len(want) {
-		t.Fatalf("candidates = %v, want %v", candidates, want)
-	}
-	for i := range want {
-		if candidates[i] != want[i] {
-			t.Fatalf("candidates = %v, want %v", candidates, want)
-		}
 	}
 }
 

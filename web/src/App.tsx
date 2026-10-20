@@ -32,7 +32,6 @@ import { useIsActingAdmin } from "@/hooks/useIsActingAdmin";
 import { useNavigationDirection } from "@/hooks/useNavigationDirection";
 import { ThemeProvider } from "@/hooks/useTheme";
 import { DateTimeFormatProvider, useDateTimeFormat } from "@/hooks/useDateTimeFormat";
-import { CustomThemeProvider } from "@/contexts/CustomThemeProvider";
 import { BrandingProvider } from "@/contexts/BrandingProvider";
 import { UICustomizationProvider } from "@/contexts/UICustomizationProvider";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
@@ -44,7 +43,6 @@ import { useEventChannel } from "@/components/realtimeEventsContext";
 import { useSettingValuesRealtime } from "@/hooks/queries/settingValues";
 import Layout from "@/components/Layout";
 import Home from "@/pages/Home";
-import Login from "@/pages/Login";
 import { useRequestFeatureStatus } from "@/hooks/queries/useRequests";
 import { OnboardingGate } from "@/components/onboarding/OnboardingGate";
 import TasteSeedGate from "@/components/TasteSeedGate";
@@ -60,13 +58,11 @@ import {
   buildQueryCatalogHref,
   buildUserCollectionCatalogHref,
 } from "@/pages/catalogSearchParams";
-import { buildLegacyAutoscanRedirectTarget } from "@/pages/autoscanSearchParams";
 import LegacyAdminHomeRowsRedirect from "@/pages/LegacyAdminHomeRowsRedirect";
 import LegacyRequestDetailRedirect from "@/pages/LegacyRequestDetailRedirect";
 import { buildLegacyWebhookSyncRedirectTarget } from "@/lib/webhookSync";
 import { guardRedirectTarget } from "@/lib/authRedirect";
 import { toast } from "sonner";
-import { prewarmCodecDetection } from "@/player/hooks/useCodecDetection";
 import { prefetchRouteChunks, type RouteChunkImport } from "@/lib/routeChunkPrefetch";
 import { importCatalog } from "@/pages/catalogRoute";
 
@@ -84,6 +80,7 @@ const AdminDownloadPreparationsRefresh = lazy(
 );
 const SettingsLayout = lazy(() => import("@/pages/SettingsLayout"));
 const SignedInSessions = lazy(() => import("@/pages/settings/SignedInSessions"));
+const Login = lazy(() => import("@/pages/Login"));
 const OAuthComplete = lazy(() => import("@/pages/OAuthComplete"));
 const ActivateDevice = lazy(() => import("@/pages/ActivateDevice"));
 const SetupWizard = lazy(() => import("@/pages/SetupWizard"));
@@ -113,6 +110,8 @@ const AdminRequests = lazy(() => import("@/pages/AdminRequests"));
 const AdminDevices = lazy(() => import("@/pages/AdminDevices"));
 const AdminLibraries = lazy(() => import("@/pages/AdminLibraries"));
 const AdminVirtualLibrary = lazy(() => import("@/pages/AdminVirtualLibrary"));
+const AdminAutoscan = lazy(() => import("@/pages/AdminAutoscan"));
+const AdminAutoscanActivity = lazy(() => import("@/pages/AdminAutoscanActivity"));
 const AdminSettingsLayout = lazy(() => import("@/pages/admin-settings/AdminSettingsLayout"));
 const AdminNodes = lazy(() => import("@/pages/AdminNodes"));
 const AdminDownloads = lazy(() => import("@/pages/AdminDownloads"));
@@ -152,7 +151,7 @@ const SubtitleAppearanceSettings = lazy(
   () => import("@/pages/settings/SubtitleAppearanceSettings"),
 );
 const HomeScreenSettings = lazy(() => import("@/pages/settings/HomeScreenSettings"));
-const CardOverlaySettings = lazy(() => import("@/pages/settings/CardOverlaySettings"));
+const TitlePagesSettings = lazy(() => import("@/pages/settings/TitlePagesSettings"));
 const PersonalizeSettings = lazy(() => import("@/pages/settings/PersonalizeSettings"));
 const ConnectAppsSettings = lazy(() => import("@/pages/settings/ConnectAppsSettings"));
 const InterfaceSettings = lazy(() => import("@/pages/settings/InterfaceSettings"));
@@ -340,6 +339,7 @@ export function QueryCacheManager() {
     if (prevProfileId.current && prevProfileId.current !== profile?.id) {
       qc.removeQueries({ queryKey: ["favorites"] });
       qc.removeQueries({ queryKey: ["watchlist"] });
+      qc.removeQueries({ queryKey: ["notInterested"] });
       qc.removeQueries({ queryKey: ["history"] });
       qc.removeQueries({ queryKey: ["collections"] });
       qc.removeQueries({ queryKey: ["libraryPlaybackPreferences"] });
@@ -407,16 +407,6 @@ function LegacyBrowseRedirect() {
 function LegacyWebhookSyncRedirect() {
   const { search } = useLocation();
   return <Navigate to={buildLegacyWebhookSyncRedirectTarget(search)} replace />;
-}
-
-/**
- * `/admin/autoscan` → the Autoscan tab on Libraries. The old query has to be
- * translated, not dropped: the panel's own view moved from `tab` to `view`
- * because `tab` now names the Libraries tab hosting it.
- */
-function LegacyAutoscanRedirect() {
-  const { search } = useLocation();
-  return <Navigate to={buildLegacyAutoscanRedirectTarget(search)} replace />;
 }
 
 function LegacyPersonalCatalogRedirect({
@@ -531,8 +521,8 @@ function AppRoutes() {
                     <Route path="collections/:id/edit" />
                   </Route>
                   <Route path="requests" element={<AdminRequests />} />
-                  {/* Autoscan is a tab on Libraries now; keep old links working. */}
-                  <Route path="autoscan" element={<LegacyAutoscanRedirect />} />
+                  <Route path="autoscan" element={<AdminAutoscan />} />
+                  <Route path="autoscan/activity" element={<AdminAutoscanActivity />} />
                   <Route path="history" element={<AdminPlaybackHistory />} />
                   <Route path="marker-history" element={<AdminMarkerHistory />} />
                   <Route path="history-import" element={<AdminHistoryImport />} />
@@ -623,7 +613,12 @@ function AppRoutes() {
                   <Route path="watch-providers" element={<WatchProvidersSettings />} />
                   <Route path="subtitle-appearance" element={<SubtitleAppearanceSettings />} />
                   <Route path="home-screen" element={<HomeScreenSettings />} />
-                  <Route path="card-overlays" element={<CardOverlaySettings />} />
+                  {/* Card overlays merged into Navigation & Cards. */}
+                  <Route
+                    path="card-overlays"
+                    element={<Navigate to="/settings/interface" replace />}
+                  />
+                  <Route path="title-pages" element={<TitlePagesSettings />} />
                   <Route path="personalize" element={<PersonalizeSettings />} />
                   <Route path="requests" element={<RequestsSettings />} />
                   <Route path="devices" element={<DeviceSettings />} />
@@ -790,8 +785,42 @@ function AdminRealtimeEventChannels() {
 
 function PlaybackCapabilityPrewarmer() {
   useEffect(() => {
-    void prewarmCodecDetection();
+    void import("@/player/hooks/useCodecDetection")
+      .then(({ prewarmCodecDetection }) => prewarmCodecDetection())
+      .catch(() => {
+        // The watch page imports the same module and probes on its own, so a
+        // failed warm-up only costs that probe's wait when playback starts.
+      });
   }, []);
+  return null;
+}
+
+/**
+ * Measures throughput to the server in the background so Auto quality can
+ * tell a 4K-capable link from a slow one. Signed-out screens stay quiet and a
+ * fresh cached measurement skips the probe. There is deliberately no
+ * re-measure on `connection` change events: Chromium fires them whenever its
+ * rounded estimate moves, which would spend a probe every few minutes.
+ */
+function BandwidthProbePrewarmer() {
+  const { user } = useAuth();
+  const isAuthenticated = Boolean(user);
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    let cancelled = false;
+    let cleanup: (() => void) | undefined;
+    void import("@/player/bandwidth-probe")
+      .then(({ scheduleBandwidthProbe }) => {
+        if (!cancelled) cleanup = scheduleBandwidthProbe();
+      })
+      .catch(() => {
+        // Without a measurement Auto plans from the device and source alone.
+      });
+    return () => {
+      cancelled = true;
+      cleanup?.();
+    };
+  }, [isAuthenticated]);
   return null;
 }
 
@@ -828,30 +857,29 @@ function AppShell() {
         <ErrorBoundary>
           <BrandingProvider>
             <ThemeProvider>
-              <CustomThemeProvider>
-                <DateTimeFormatProvider>
-                  <WatchPlaybackProvider>
-                    <AudiobookPlaybackProvider>
-                      <RealtimeEventsProvider>
-                        <PlaybackCapabilityPrewarmer />
-                        <RouteChunkPrewarmer />
-                        <RealtimeEventChannels />
-                        <ScrollRestorationManager />
-                        <NavigationDirectionManager />
-                        <RouteAnnouncer />
-                        <QueryCacheManager />
-                        <AppChrome />
-                        <Suspense fallback={<RouteLoading />}>
-                          <Outlet />
-                        </Suspense>
-                        <WatchPlaybackHost />
-                        <WatchPlaybackBar />
-                        <Toaster />
-                      </RealtimeEventsProvider>
-                    </AudiobookPlaybackProvider>
-                  </WatchPlaybackProvider>
-                </DateTimeFormatProvider>
-              </CustomThemeProvider>
+              <DateTimeFormatProvider>
+                <WatchPlaybackProvider>
+                  <AudiobookPlaybackProvider>
+                    <RealtimeEventsProvider>
+                      <PlaybackCapabilityPrewarmer />
+                      <RouteChunkPrewarmer />
+                      <BandwidthProbePrewarmer />
+                      <RealtimeEventChannels />
+                      <ScrollRestorationManager />
+                      <NavigationDirectionManager />
+                      <RouteAnnouncer />
+                      <QueryCacheManager />
+                      <AppChrome />
+                      <Suspense fallback={<RouteLoading />}>
+                        <Outlet />
+                      </Suspense>
+                      <WatchPlaybackHost />
+                      <WatchPlaybackBar />
+                      <Toaster />
+                    </RealtimeEventsProvider>
+                  </AudiobookPlaybackProvider>
+                </WatchPlaybackProvider>
+              </DateTimeFormatProvider>
             </ThemeProvider>
           </BrandingProvider>
         </ErrorBoundary>

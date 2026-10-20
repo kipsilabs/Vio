@@ -1,6 +1,7 @@
 package userdb
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -302,10 +303,11 @@ func updateProfile(exec preferenceSettingsExecutor, id string, u UpdateProfileIn
 	return nil
 }
 
-// DeleteProfile removes a profile and cascades deletion to favorites,
-// watchlist, watch_progress, and personal_collections (plus their items).
-func DeleteProfile(db *sql.DB, id string) error {
-	tx, err := db.Begin()
+// DeleteProfile removes a profile and every row of its own: lists, watch
+// progress and history, preferences, settings and personal collections
+// (plus their items), matching the Postgres store.
+func DeleteProfile(ctx context.Context, db *sql.DB, id string) error {
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("beginning transaction for profile delete: %w", err)
 	}
@@ -314,7 +316,7 @@ func DeleteProfile(db *sql.DB, id string) error {
 	// Preferences belong to viewers, not creators, so deleting only this
 	// profile's rows below would leave other profiles' overrides pointing at
 	// personal collections that are about to be removed.
-	if _, err := tx.Exec(`
+	if _, err := tx.ExecContext(ctx, `
 		DELETE FROM collection_sort_preferences
 		WHERE collection_kind = 'user' AND collection_id IN (
 			SELECT id FROM personal_collections WHERE creator_profile_id = ?
@@ -323,7 +325,7 @@ func DeleteProfile(db *sql.DB, id string) error {
 	}
 
 	// Delete personal_collection_items for collections owned by this profile.
-	_, err = tx.Exec(`
+	_, err = tx.ExecContext(ctx, `
 		DELETE FROM personal_collection_items
 		WHERE collection_id IN (
 			SELECT id FROM personal_collections WHERE creator_profile_id = ?
@@ -331,7 +333,11 @@ func DeleteProfile(db *sql.DB, id string) error {
 	if err != nil {
 		return fmt.Errorf("deleting collection items for profile %s: %w", id, err)
 	}
-	if _, err := tx.Exec(`DELETE FROM personal_collection_profiles WHERE profile_id = ?`, id); err != nil {
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM personal_collection_profiles
+		WHERE profile_id = ? OR collection_id IN (
+			SELECT id FROM personal_collections WHERE creator_profile_id = ?
+		)`, id, id); err != nil {
 		return fmt.Errorf("deleting collection visibility for profile %s: %w", id, err)
 	}
 
@@ -341,12 +347,22 @@ func DeleteProfile(db *sql.DB, id string) error {
 	cascadeTables := []string{
 		"favorites",
 		"watchlist",
+		"not_interested",
 		"watch_progress",
+		"watch_history",
+		"hidden_history_items",
+		"home_item_dismissals",
 		"collection_sort_preferences",
 		"personal_collections",
 		"profile_allowed_libraries",
+		sqliteAudioPreferencesTable,
+		sqliteSubtitlePreferencesTable,
 		"series_playback_preferences",
 		"library_playback_preferences",
+		"profile_onboarding",
+		"profile_section_overrides",
+		"user_devices",
+		"user_device_settings",
 		"user_setting_values",
 	}
 	for _, table := range cascadeTables {
@@ -354,13 +370,19 @@ func DeleteProfile(db *sql.DB, id string) error {
 		if table == "personal_collections" {
 			column = "creator_profile_id"
 		}
-		if _, err := tx.Exec(fmt.Sprintf("DELETE FROM %s WHERE %s = ?", table, column), id); err != nil {
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf("DELETE FROM %s WHERE %s = ?", table, column), id); err != nil {
 			return fmt.Errorf("deleting from %s for profile %s: %w", table, id, err)
 		}
 	}
 
+	// Jellyfin display preferences carry the profile in their key.
+	prefix := userstore.ProfileDisplayPrefsPrefix(id)
+	if _, err := tx.ExecContext(ctx, `DELETE FROM jellycompat_displayprefs WHERE substr(prefs_id, 1, length(?)) = ?`, prefix, prefix); err != nil {
+		return fmt.Errorf("deleting display preferences for profile %s: %w", id, err)
+	}
+
 	// Delete the profile itself.
-	result, err := tx.Exec("DELETE FROM profiles WHERE id = ?", id)
+	result, err := tx.ExecContext(ctx, "DELETE FROM profiles WHERE id = ?", id)
 	if err != nil {
 		return fmt.Errorf("deleting profile %s: %w", id, err)
 	}

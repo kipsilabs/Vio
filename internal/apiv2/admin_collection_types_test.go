@@ -216,19 +216,6 @@ func TestAdminCollectionCommandVirtualPlaybackTriState(t *testing.T) {
 			},
 		},
 		{
-			name: "trakt_import",
-			build: func(t *testing.T, field string) (*bool, *Problem) {
-				t.Helper()
-				var dto AdminTraktImport
-				body := `{"library_ids":["1"],"title":"Import","preset":"trending","media_type":"movie"` + field + `}`
-				if err := json.Unmarshal([]byte(body), &dto); err != nil {
-					t.Fatal(err)
-				}
-				cmd, p := dto.command()
-				return cmd.VirtualPlayback, p
-			},
-		},
-		{
 			name: "template_apply",
 			build: func(t *testing.T, field string) (*bool, *Problem) {
 				t.Helper()
@@ -286,7 +273,6 @@ func TestAdminCollectionRequestSchemaExposesOptionalVirtualPlayback(t *testing.T
 	}{
 		{"AdminMDBListImport", AdminMDBListImport{}},
 		{"AdminTMDBImport", AdminTMDBImport{}},
-		{"AdminTraktImport", AdminTraktImport{}},
 		{"AdminTemplateApply", AdminTemplateApply{}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

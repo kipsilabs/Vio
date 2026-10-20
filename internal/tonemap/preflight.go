@@ -433,10 +433,16 @@ func sourcePreflightPositions(duration float64) []float64 {
 // preflightFrame is the minimal decoded-frame metadata needed to confirm a base
 // signal classification.
 type preflightFrame struct {
-	ColorRange     string `json:"color_range"`
-	ColorSpace     string `json:"color_space"`
-	ColorTransfer  string `json:"color_transfer"`
-	ColorPrimaries string `json:"color_primaries"`
+	ColorRange     string           `json:"color_range"`
+	ColorSpace     string           `json:"color_space"`
+	ColorTransfer  string           `json:"color_transfer"`
+	ColorPrimaries string           `json:"color_primaries"`
+	SideData       []sideDataRecord `json:"side_data_list"`
+}
+
+// sideDataRecord is one FFprobe side-data entry, identified by its label.
+type sideDataRecord struct {
+	Type string `json:"side_data_type"`
 }
 
 // inspectSourceFrame reads color metadata from one decoded frame at position.
@@ -445,7 +451,7 @@ func inspectSourceFrame(ctx context.Context, request SourcePreflightRequest, pos
 	args := []string{
 		"-v", ffmpegErrorLogLevel, "-read_intervals", interval, "-select_streams", "v:0",
 		"-show_frames",
-		"-show_entries", "frame=color_range,color_space,color_transfer,color_primaries",
+		"-show_entries", "frame=color_range,color_space,color_transfer,color_primaries:frame_side_data=side_data_type",
 		"-of", "json", request.InputPath,
 	}
 	output, err := runSourcePreflightBounded(ctx, run, request.InputPath, request.FFprobePath, args...)
@@ -464,7 +470,24 @@ func inspectSourceFrame(ctx context.Context, request SourcePreflightRequest, pos
 // frameMatchesSourceKind requires decoded-frame metadata compatible with the
 // frozen base-signal classification; remote and virtual sources may omit
 // individual fields, so completeness is not demanded here.
+// hasDolbyVisionMetadata reports whether the decoder attached a parsed RPU,
+// which FFprobe labels "Dolby Vision Metadata".
+func (frame preflightFrame) hasDolbyVisionMetadata() bool {
+	for _, sideData := range frame.SideData {
+		if strings.EqualFold(strings.TrimSpace(sideData.Type), "Dolby Vision Metadata") {
+			return true
+		}
+	}
+	return false
+}
+
 func frameMatchesSourceKind(frame preflightFrame, kind SourceKind) bool {
+	if kind == SourceDolbyVision {
+		return frame.hasDolbyVisionMetadata() && transferIsPQ(normalizeColorValue(frame.ColorTransfer))
+	}
+	// Vio keeps the relaxed compatibility check for other source kinds so
+	// remote and virtual inputs whose decoder omits complete color metadata
+	// can still pass preflight.
 	_, compatible := sourceMetadataCompatibility(kind, SourceMetadata{
 		ColorRange: frame.ColorRange, ColorPrimaries: frame.ColorPrimaries,
 		ColorTransfer: frame.ColorTransfer, ColorSpace: frame.ColorSpace,
@@ -543,14 +566,14 @@ func sourceConversionPreflightFilter(request SourcePreflightRequest) string {
 		if IsSDRSource(request.Kind) {
 			return "hwdownload,format=" + NVENCSoftwareFallbackPixelFormat(request.SourceBitDepth) + "," + SoftwareFilter(request.Kind, "") + ",format=nv12,hwupload_cuda"
 		}
-		return SourceParameters(request.Kind) + "," + CUDAFilter() + "," + HDRMetadataRemovalFilter()
+		return SourceParameters(request.Kind) + "," + CUDAFilter(request.Kind) + "," + HDRMetadataRemovalFilter()
 	}
 	filter := VAAPIFilter(request.Kind)
 	if request.SoftwareVideoDecode && (request.Backend == BackendQSV || request.Backend == BackendVAAPI) {
 		filter = "format=nv12,hwupload," + filter
 	}
 	if request.Backend == BackendQSV {
-		filter = QSVFilter(request.Kind) + "," + QSVInteropFilter()
+		filter = QSVFilter(request.Kind, 0) + "," + QSVInteropFilter()
 		if request.SoftwareVideoDecode {
 			format := "nv12"
 			if !IsSDRSource(request.Kind) {
@@ -583,9 +606,6 @@ func inspectPreflightOutput(ctx context.Context, ffprobePath, outputPath string,
 	if err != nil {
 		return fmt.Errorf("%w: inspect tone-map preflight output: %w (%s)", ErrSourcePreflightUnavailable, err, boundedCommandFailure(err, output))
 	}
-	type sideDataRecord struct {
-		Type string `json:"side_data_type"`
-	}
 	var payload struct {
 		Streams []struct {
 			CodecName      string           `json:"codec_name"`
@@ -596,13 +616,7 @@ func inspectPreflightOutput(ctx context.Context, ffprobePath, outputPath string,
 			ColorPrimaries string           `json:"color_primaries"`
 			SideData       []sideDataRecord `json:"side_data_list"`
 		} `json:"streams"`
-		Frames []struct {
-			ColorRange     string           `json:"color_range"`
-			ColorSpace     string           `json:"color_space"`
-			ColorTransfer  string           `json:"color_transfer"`
-			ColorPrimaries string           `json:"color_primaries"`
-			SideData       []sideDataRecord `json:"side_data_list"`
-		} `json:"frames"`
+		Frames []preflightFrame `json:"frames"`
 	}
 	if err := decodeCommandJSON(output, &payload); err != nil || len(payload.Streams) != 1 {
 		return fmt.Errorf("%w: tone-map preflight output metadata unavailable", ErrSourcePreflightRejected)

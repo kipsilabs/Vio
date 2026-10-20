@@ -11,6 +11,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("@/api/client", () => ({
   api: mocks.api,
+  apiV1: mocks.api,
 }));
 
 import {

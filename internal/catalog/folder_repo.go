@@ -706,16 +706,20 @@ func (r *FolderRepository) DeleteWithStats(
 	if progress != nil {
 		progress(orphanTotal, orphanTotal, "Deleting media files")
 	}
+	// An extra whose parent survives in another library loses its image with
+	// its last file.
 	if _, err := deleteInBatches(ctx, folderChildDeleteBatch, func(ctx context.Context) (int64, error) {
-		tag, e := r.pool.Exec(ctx, `
-			DELETE FROM media_files
-			WHERE id IN (
-				SELECT id FROM media_files WHERE media_folder_id = $1 LIMIT $2
-			)`, id, folderChildDeleteBatch)
-		if e != nil {
-			return 0, e
-		}
-		return tag.RowsAffected(), nil
+		var deleted int64
+		e := r.pool.QueryRow(ctx, `
+			WITH deleted AS (
+				DELETE FROM media_files
+				WHERE id IN (
+					SELECT id FROM media_files WHERE media_folder_id = $1 LIMIT $2
+				)
+				RETURNING id, extra_id
+			)`+ClearEmptiedExtraStillsCTE+`
+			SELECT count(*) FROM deleted`, id, folderChildDeleteBatch).Scan(&deleted)
+		return deleted, e
 	}); err != nil {
 		return nil, fmt.Errorf("deleting media files: %w", err)
 	}
@@ -1006,15 +1010,23 @@ func collectOrphanIDs(ctx context.Context, tx pgx.Tx, contentIDs []string) ([]st
 }
 
 // collectRawImageDirs returns the deduped S3 directory prefixes referenced by
-// the given content IDs (items, their seasons, and their episodes), without
+// the given content IDs (items, their seasons, episodes and local extras), without
 // filtering out dirs still used by other content.
 func collectRawImageDirs(ctx context.Context, q rowQuerier, contentIDs []string) ([]string, error) {
 	imgRows, err := q.Query(ctx, `
 		SELECT poster_path, backdrop_path, logo_path FROM media_items WHERE content_id = ANY($1)
 		UNION ALL
+		SELECT banner_path, thumb_path, clearart_path FROM media_items WHERE content_id = ANY($1)
+		UNION ALL
+		SELECT disc_path, '', '' FROM media_items WHERE content_id = ANY($1)
+		UNION ALL
+		SELECT path, '', '' FROM media_item_backdrops WHERE content_id = ANY($1)
+		UNION ALL
 		SELECT poster_path, '', '' FROM seasons WHERE series_id = ANY($1)
 		UNION ALL
 		SELECT still_path, '', '' FROM episodes WHERE series_id = ANY($1)
+		UNION ALL
+		SELECT still_path, '', '' FROM media_extras WHERE parent_id = ANY($1)
 	`, contentIDs)
 	if err != nil {
 		return nil, fmt.Errorf("collecting image paths: %w", err)
@@ -1045,9 +1057,9 @@ func collectRawImageDirs(ctx context.Context, q rowQuerier, contentIDs []string)
 }
 
 // filterUnreferencedImageDirs returns the candidate directories that no
-// surviving row still has artwork under: no poster, backdrop, logo, season
-// poster or episode still outside deletingContentIDs has a path that starts
-// with the directory.
+// surviving row still has artwork under: no item artwork slot, extra backdrop,
+// season poster or episode still outside deletingContentIDs has a path that
+// starts with the directory.
 //
 // The obvious form is a correlated `path LIKE candidate || '%'` per candidate,
 // and that is what this used to run. A pattern built from a column cannot be
@@ -1103,14 +1115,21 @@ func filterUnreferencedImageDirs(ctx context.Context, q rowQuerier, dirs, deleti
 			FROM unnest($1::text[]) AS t(dir)
 		), referenced_path AS (
 			SELECT a.path FROM media_items mi
-				CROSS JOIN LATERAL (VALUES (mi.poster_path), (mi.backdrop_path), (mi.logo_path)) AS a(path)
+				CROSS JOIN LATERAL (VALUES (mi.poster_path), (mi.backdrop_path), (mi.logo_path),
+					(mi.banner_path), (mi.thumb_path), (mi.clearart_path), (mi.disc_path)) AS a(path)
 				WHERE NOT (mi.content_id = ANY($2::text[])) AND a.path <> ''
+			UNION ALL
+			SELECT b.path FROM media_item_backdrops b
+				WHERE NOT (b.content_id = ANY($2::text[])) AND b.path <> ''
 			UNION ALL
 			SELECT s.poster_path FROM seasons s
 				WHERE NOT (s.series_id = ANY($2::text[])) AND s.poster_path <> ''
 			UNION ALL
 			SELECT e.still_path FROM episodes e
 				WHERE NOT (e.series_id = ANY($2::text[])) AND e.still_path <> ''
+			UNION ALL
+			SELECT x.still_path FROM media_extras x
+				WHERE NOT (x.parent_id = ANY($2::text[])) AND x.still_path <> ''
 		), referenced AS (
 			SELECT DISTINCT left(p.path, n) AS dir
 			FROM referenced_path p

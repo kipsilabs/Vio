@@ -320,13 +320,16 @@ func TestValidateAdvertisedTransformationsV3RejectsOldVideoRecipe(t *testing.T) 
 	}
 }
 
-func TestHandleStartPlaybackV3ExplainsOriginalQuality4KPinWhenAlternateExists(t *testing.T) {
+// A legacy "original" preference no longer pins the requested 4K version: like
+// auto, it falls back to a lower-resolution version when 4K transcoding is
+// disabled, and only refuses when no such version exists.
+func TestHandleStartPlaybackV3OriginalQualityFallsBackFrom4K(t *testing.T) {
 	for _, test := range []struct {
 		name                string
 		alternateResolution string
 		wantMessage         string
 	}{
-		{name: "lower-resolution alternate exists", alternateResolution: "1080p", wantMessage: "compatible lower-resolution version of this title is available"},
+		{name: "lower-resolution alternate exists", alternateResolution: "1080p"},
 		{name: "only 4K alternate exists", alternateResolution: "UHD", wantMessage: playback.TerminalMessage4KTranscodeDisabledV3},
 		{name: "only label-only 8K alternate exists", alternateResolution: "8K", wantMessage: playback.TerminalMessage4KTranscodeDisabledV3},
 		{name: "no alternate", wantMessage: playback.TerminalMessage4KTranscodeDisabledV3},
@@ -373,10 +376,16 @@ func TestHandleStartPlaybackV3ExplainsOriginalQuality4KPinWhenAlternateExists(t 
 			handler.HandleStartPlayback(rr, httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", strings.NewReader(marshalV3StartRequest(t, start))).WithContext(newAuthorizedPlaybackContext()))
 
 			var response playback.DecisionResponseV3
-			if rr.Code != http.StatusCreated || json.Unmarshal(rr.Body.Bytes(), &response) != nil || response.Terminal == nil {
+			if rr.Code != http.StatusCreated || json.Unmarshal(rr.Body.Bytes(), &response) != nil {
 				t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
 			}
-			if response.Terminal.Reason != "no_alternate_version" || !strings.Contains(response.Terminal.Message, test.wantMessage) {
+			if test.wantMessage == "" {
+				if response.PlaybackPlan == nil || response.PlaybackPlan.EffectiveMediaFileID != 84 {
+					t.Fatalf("response = %s, want the 1080p version played", rr.Body.String())
+				}
+				return
+			}
+			if response.Terminal == nil || response.Terminal.Reason != "no_alternate_version" || response.Terminal.Message != test.wantMessage {
 				t.Fatalf("terminal = %#v, want message containing %q", response.Terminal, test.wantMessage)
 			}
 		})
@@ -501,7 +510,7 @@ func TestHandleStartPlaybackV3SubtitleOnlyTerminalDegradesInPlace(t *testing.T) 
 	}
 	dropped := false
 	for _, warning := range response.PlaybackPlan.DegradationWarnings {
-		if warning.Code == "subtitle_dropped_unavailable" {
+		if warning.Code == playback.DegradationWarningSubtitleTrackUnavailableV3 {
 			dropped = true
 		}
 	}
@@ -745,6 +754,7 @@ func TestReplanAllowsAlternateFileV3PinsSeekOperations(t *testing.T) {
 		want      bool
 	}{
 		{name: "ordinary failure may use another version", operation: playback.ReplanOperationFailureRecoveryV3, quality: "auto", want: true},
+		{name: "quality change may use another version", operation: playback.ReplanOperationQualityChangeV3, quality: "auto", want: true},
 		{name: "output change may use another version", operation: playback.ReplanOperationOutputChangeV3, quality: "auto", want: true},
 		{name: "track change stays pinned to the mounted version", operation: playback.ReplanOperationTrackChangeV3, quality: "auto", want: false},
 		{name: "original quality remains pinned", operation: playback.ReplanOperationFailureRecoveryV3, quality: "original", want: false},
@@ -5027,6 +5037,21 @@ func TestResolveV3AudioIndexFallsBackWhenSelectionIsOutOfRange(t *testing.T) {
 	}
 }
 
+// The fallback never lands on a track FFmpeg cannot decode, while an explicit
+// choice of one is kept for the planner to refuse by name.
+func TestResolveV3AudioIndexAvoidsUndecodableFallback(t *testing.T) {
+	file := &models.MediaFile{ID: 1, AudioTracks: []models.AudioTrack{{Codec: "", Default: true}, {Codec: "eac3"}}}
+
+	out := 7
+	if index, degraded, err := resolveV3AudioIndex(file, "", &out); err != nil || !degraded || index != 1 {
+		t.Fatalf("out-of-range fallback = %d degraded=%v err=%v, want the decodable track 1", index, degraded, err)
+	}
+	explicit := 0
+	if index, degraded, err := resolveV3AudioIndex(file, "", &explicit); err != nil || degraded || index != 0 {
+		t.Fatalf("explicit undecodable choice = %d degraded=%v err=%v, want it kept", index, degraded, err)
+	}
+}
+
 func TestResolveV3AudioIndexRejectsNegativeIndex(t *testing.T) {
 	negative := -1
 	file := &models.MediaFile{ID: 1, AudioTracks: []models.AudioTrack{{Language: "eng"}}}
@@ -5674,7 +5699,7 @@ func TestHandleReplanPlaybackV3RemapsSubtitleAcrossFormatsInFallbackVersion(t *t
 	}
 }
 
-func TestHandleReplanPlaybackV3BitmapSubtitleFallsBackFromHDRToSDRVersion(t *testing.T) {
+func TestHandleReplanPlaybackV3BitmapSubtitleKeepsHDRVersionWithoutSubtitle(t *testing.T) {
 	source := v3HandlerFixtureFile(t)
 	source.Container = "mkv"
 	source.FilePath = writePlaybackTestMediaFile(t, "movie-4k.mkv")
@@ -5764,17 +5789,13 @@ func TestHandleReplanPlaybackV3BitmapSubtitleFallsBackFromHDRToSDRVersion(t *tes
 		},
 		Capabilities: startRequest.Capabilities, ClientPlaybackContext: startRequest.ClientPlaybackContext,
 	})
-	// A subtitle track_change must never move the version underneath the
-	// selection: the bitmap track cannot be delivered on the mounted HDR
-	// source, so the replan refuses with a terminal instead of silently
-	// swapping to the SDR alternate. Only an unreadable/corrupted video
-	// (surfaced as a failure_recovery) may fall back to another version.
-	if replanned.PlaybackPlan != nil || replanned.Terminal == nil {
-		t.Fatalf("subtitle track_change should refuse with a terminal, got plan=%#v terminal=%#v", replanned.PlaybackPlan, replanned.Terminal)
+	// The upstream subtitle-degrade rule keeps the mounted HDR version and
+	// drops the bitmap track instead of moving to the SDR sibling. The plan
+	// reports the subtitle as unavailable; the viewer keeps the 4K picture.
+	if replanned.PlaybackPlan == nil || replanned.Terminal != nil {
+		t.Fatalf("subtitle track_change should keep the HDR version without the subtitle, got plan=%#v terminal=%#v", replanned.PlaybackPlan, replanned.Terminal)
 	}
-	if replanned.Terminal.Reason != "subtitle_conversion_unsupported" {
-		t.Fatalf("subtitle track_change terminal = %#v, want subtitle_conversion_unsupported", replanned.Terminal)
-	}
+	requireRequestedVersionWithoutSubtitleV3(t, replanned.PlaybackPlan, source)
 	t.Cleanup(func() { handler.tm.CloseTranscodeSession(started.SessionID, "") })
 }
 
@@ -5953,6 +5974,7 @@ func TestHandleReplanPlaybackV3TrackChangeOperation(t *testing.T) {
 	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "true"}}
 	handler.ItemAccess = allowAllPlaybackItemAccess{}
 	startRequest := v3HandlerStartRequest()
+	startRequest.QualityPreference = "1080p"
 	startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassProgressiveV3] = playback.DeliveryCapabilityV3{Enabled: true, SupportedOnDevice: true}
 	startReq := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", strings.NewReader(marshalV3StartRequest(t, startRequest))).WithContext(newAuthorizedPlaybackContext())
 	startRR := httptest.NewRecorder()
@@ -6024,7 +6046,7 @@ func TestHandleReplanPlaybackV3TrackChangeOperation(t *testing.T) {
 		t.Fatal(err)
 	}
 	// A track change without a quality field keeps the durable quality intact.
-	if record.NormalizedRequest.QualityPreference != "original" {
+	if record.NormalizedRequest.QualityPreference != "1080p" {
 		t.Fatalf("quality after track change = %q", record.NormalizedRequest.QualityPreference)
 	}
 }
@@ -7099,7 +7121,8 @@ func TestHandleReplanPlaybackV3QualityChangeOperation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if record.NormalizedRequest.QualityPreference != "original" || record.NormalizedRequest.AllowsAlternateVersions() || record.EffectiveMediaFileID != file.ID {
+	// The legacy "original" spelling is stored as the auto it now means.
+	if record.NormalizedRequest.QualityPreference != "auto" || record.NormalizedRequest.AllowsAlternateVersions() || record.EffectiveMediaFileID != file.ID {
 		t.Fatalf("durable quality = %q", record.NormalizedRequest.QualityPreference)
 	}
 }
@@ -8399,7 +8422,7 @@ func TestRefreshNodeCapabilitiesDropsReportFetchedBeforeInvalidation(t *testing.
 }
 
 func TestRemoteToneMapProbeTimeoutUsesTargetNodeBudget(t *testing.T) {
-	probeTimeoutMillis := int64(137000)
+	probeTimeoutMillis := int64(161000)
 	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(playback.HWAccelInfo{ProbeRequestTimeoutMillis: probeTimeoutMillis})
 	}))
@@ -8415,14 +8438,14 @@ func TestRemoteToneMapProbeTimeoutUsesTargetNodeBudget(t *testing.T) {
 	// The node's own figure is what this path exists to use. It has to exceed
 	// what the cluster setting prices, or the floor below it would be answering
 	// and this would pass without the target node being consulted at all.
-	if cluster := playback.CapabilityRequestTimeout(tonemap.BackendQSV, "/central/device/one"); cluster >= 137*time.Second {
-		t.Fatalf("fixture is inert: the cluster price %s must stay under the node's 137s", cluster)
+	if cluster := playback.CapabilityRequestTimeout(tonemap.BackendQSV, "/central/device/one"); cluster >= 161*time.Second {
+		t.Fatalf("fixture is inert: the cluster price %s must stay under the node's 161s", cluster)
 	}
-	if got, want := handler.remoteToneMapProbeTimeoutV3(remote.URL), 137*time.Second; got != want {
+	if got, want := handler.remoteToneMapProbeTimeoutV3(remote.URL), 161*time.Second; got != want {
 		t.Fatalf("remote probe timeout = %s, want target node budget %s", got, want)
 	}
 	request := transcodenode.TranscodeStartRequest{ToneMapMode: tonemap.ModeHardware}
-	if got, want := handler.remotePlaybackTransportTimeout(remote.URL, request), 137*time.Second+playback.ManifestStartupTimeout; got != want {
+	if got, want := handler.remotePlaybackTransportTimeout(remote.URL, request), 161*time.Second+playback.ManifestStartupTimeout; got != want {
 		t.Fatalf("remote start timeout = %s, want target node budget %s", got, want)
 	}
 

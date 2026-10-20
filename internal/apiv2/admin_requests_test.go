@@ -22,6 +22,7 @@ type fakeAdminRequests struct {
 	filter                    mediarequests.ListFilter
 	action, reason, requestID string
 	probedBaseURL             string
+	probedBaseURLCleared      bool
 	// failed gives every returned request the errors a failed submission
 	// leaves (withSubmissionErrors).
 	failed bool
@@ -106,6 +107,7 @@ func (f *fakeAdminRequests) DeleteIntegrationConditional(_ context.Context, v me
 func (f *fakeAdminRequests) LoadIntegrationOptions(_ context.Context, v mediarequests.Viewer, r mediarequests.Integration) (map[string][]mediarequests.RouterOption, error) {
 	f.viewer = v
 	f.probedBaseURL = r.BaseURL
+	f.probedBaseURLCleared = r.BaseURLCleared
 	if r.APIKeyRef == "bad" {
 		return nil, &mediarequests.ValidationError{FieldErrors: map[string]string{"api_key_ref": "invalid key"}}
 	}
@@ -279,6 +281,43 @@ func TestAdminRequestOptionsNormalizesBaseURL(t *testing.T) {
 	requireProblem(t, rec, TypeValidationFailed)
 	if !strings.Contains(rec.Body.String(), `"body.base_url"`) || f.probedBaseURL != "unset" {
 		t.Fatal(rec.Body.String(), f.probedBaseURL)
+	}
+}
+
+// The core virtual router is installation 0. The HTTP schema must admit that
+// reserved ID while still rejecting non-canonical padded IDs.
+func TestAdminRequestOptionsAcceptsCoreVirtualInstallationZero(t *testing.T) {
+	f := fixtureAdminRequests()
+	h := adminRequestsHandler(f)
+	path := Prefix + "/admin/request-integrations/new/options"
+	if rec := do(t, h, http.MethodPost, path, `{"installation_id":"0"}`, actingRequestAdmin); rec.Code != 200 {
+		t.Fatalf("installation 0 options: %d %s", rec.Code, rec.Body.String())
+	}
+	requireProblem(t, do(t, h, http.MethodPost, path, `{"installation_id":"00"}`, actingRequestAdmin), TypeValidationFailed)
+}
+
+// A probe that leaves base_url out tests the saved address; one that sends it
+// blank clears it, which a router that needs no URL is then tested without.
+func TestAdminRequestOptionsTellsOmittedFromClearedBaseURL(t *testing.T) {
+	f := fixtureAdminRequests()
+	h := adminRequestsHandler(f)
+	path := Prefix + "/admin/request-integrations/7/options"
+	for _, tc := range []struct {
+		body        string
+		wantCleared bool
+		wantURL     string
+	}{
+		{`{}`, false, ""},
+		{`{"base_url":""}`, true, ""},
+		{`{"base_url":"  "}`, true, ""},
+		{`{"base_url":"10.0.0.5:8989"}`, false, "http://10.0.0.5:8989"},
+	} {
+		if rec := do(t, h, http.MethodPost, path, tc.body, actingRequestAdmin); rec.Code != 200 {
+			t.Fatal(tc.body, rec.Code, rec.Body.String())
+		}
+		if f.probedBaseURLCleared != tc.wantCleared || f.probedBaseURL != tc.wantURL {
+			t.Fatalf("%s: cleared = %v, url = %q; want %v, %q", tc.body, f.probedBaseURLCleared, f.probedBaseURL, tc.wantCleared, tc.wantURL)
+		}
 	}
 }
 

@@ -558,7 +558,7 @@ func TestInterestTrackingStoreConditionalCapabilities(t *testing.T) {
 			if err := wrapped.CreateProfile(ctx, userstore.Profile{ID: "p1", Name: "Test"}); err != nil {
 				t.Fatal(err)
 			}
-			if err := wrapped.AddFavorite(ctx, "p1", "series-1"); err != nil {
+			if _, err := wrapped.AddFavorite(ctx, "p1", "series-1"); err != nil {
 				t.Fatal(err)
 			}
 			if _, queued := updater.pending[interestMutation{userID: 7, profileID: "p1", itemID: "series-1"}]; !queued {
@@ -657,6 +657,10 @@ func (s *allCapabilitiesFakeStore) ListDeviceSettingsPage(context.Context, users
 
 func (s *allCapabilitiesFakeStore) RemoveDeviceSettings(context.Context, string, string, bool) ([]string, error) {
 	return nil, nil
+}
+
+func (s *allCapabilitiesFakeStore) RenameDevice(context.Context, string, string, string) error {
+	return nil
 }
 
 func (s *allCapabilitiesFakeStore) GetDeviceProfile(_ context.Context, profileID, deviceID string) (*userstore.DeviceCapabilityProfile, error) {

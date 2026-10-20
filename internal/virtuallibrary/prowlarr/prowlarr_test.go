@@ -274,10 +274,10 @@ func TestUnauthorizedStaysDistinguishable(t *testing.T) {
 		t.Fatal("search: expected an error for HTTP 401")
 	}
 	msg := err.Error()
-	if !strings.Contains(msg, "401") {
+	if !strings.Contains(msg, "HTTP 401") {
 		t.Errorf("error %q does not name HTTP 401", msg)
 	}
-	if strings.Contains(msg, "400") {
+	if strings.Contains(msg, "HTTP 400") {
 		t.Errorf("error %q is indistinguishable from a 400", msg)
 	}
 	if !strings.Contains(msg, "unauthorized") {

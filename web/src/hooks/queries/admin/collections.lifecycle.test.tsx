@@ -26,6 +26,7 @@ vi.mock("@/api/v2/request", async () => ({
 vi.mock("@/api/client", async () => ({
   ...(await vi.importActual<typeof import("@/api/client")>("@/api/client")),
   api: mocks.api,
+  apiV1: mocks.api,
 }));
 vi.mock("../collectionSurfaceRefresh", () => ({
   invalidateAdminCollectionQueries: mocks.invalidate,

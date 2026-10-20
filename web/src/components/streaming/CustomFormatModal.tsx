@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Sparkles } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -42,33 +42,34 @@ const DEFAULT_NEW_FORMAT: Omit<CustomFormatRule, "id"> = {
   reject: false,
 };
 
-export function CustomFormatModal({
-  isOpen,
-  onClose,
-  onSave,
-  editingFormat,
-}: CustomFormatModalProps) {
-  const [formData, setFormData] = useState<Omit<CustomFormatRule, "id">>(DEFAULT_NEW_FORMAT);
-  const [patternError, setPatternError] = useState<string | null>(null);
+function formatFormState(editingFormat?: CustomFormatRule | null): Omit<CustomFormatRule, "id"> {
+  if (!editingFormat) return DEFAULT_NEW_FORMAT;
+  return {
+    name: editingFormat.name,
+    category: editingFormat.category,
+    pattern: editingFormat.pattern,
+    patternType: editingFormat.patternType,
+    score: editingFormat.score,
+    enabled: editingFormat.enabled,
+    isCustom: true,
+    invert: editingFormat.invert ?? false,
+    reject: editingFormat.reject ?? editingFormat.score <= -1500,
+  };
+}
 
-  useEffect(() => {
-    if (editingFormat) {
-      setFormData({
-        name: editingFormat.name,
-        category: editingFormat.category,
-        pattern: editingFormat.pattern,
-        patternType: editingFormat.patternType,
-        score: editingFormat.score,
-        enabled: editingFormat.enabled,
-        isCustom: true,
-        invert: editingFormat.invert ?? false,
-        reject: editingFormat.reject ?? editingFormat.score <= -1500,
-      });
-    } else {
-      setFormData(DEFAULT_NEW_FORMAT);
-    }
-    setPatternError(null);
-  }, [editingFormat, isOpen]);
+export function CustomFormatModal(props: CustomFormatModalProps) {
+  // A fresh editor is a fresh form: remount when the dialog opens or its
+  // editing target changes instead of copying props into state in an effect.
+  return (
+    <CustomFormatModalBody key={`${props.isOpen}:${props.editingFormat?.id ?? "new"}`} {...props} />
+  );
+}
+
+function CustomFormatModalBody({ isOpen, onClose, onSave, editingFormat }: CustomFormatModalProps) {
+  const [formData, setFormData] = useState<Omit<CustomFormatRule, "id">>(() =>
+    formatFormState(editingFormat),
+  );
+  const [patternError, setPatternError] = useState<string | null>(null);
 
   const validatePattern = (pattern: string, type: "regex" | "token") => {
     if (type === "regex" && pattern.trim()) {

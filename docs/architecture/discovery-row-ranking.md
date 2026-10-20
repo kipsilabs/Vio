@@ -22,7 +22,9 @@ source row, every writer of rating sources locks the item first
 renames already do), so writers wait for one another instead of deadlocking. A
 missing source or a zero count leaves both NULL, and a NULL count never
 qualifies: an item without a known count is left out until a refresh supplies
-one. Catalog transfer carries each item's `tmdb` rating source, so the trigger
+one. An administrator who clears an item's TMDB rating deletes its `tmdb` row,
+so the item leaves these rows. The web editor also locks the rating field,
+which keeps a refresh from restoring the row until the field is unlocked. Catalog transfer carries each item's `tmdb` rating source, so the trigger
 derives the pair on import as well; a bundle exported before that leaves the
 target's sources in place.
 
@@ -54,7 +56,7 @@ section's libraries with the viewer's allowed libraries and applies the access
 filter's content allow-list and name prefix (`catalog.AppendContentScope`).
 
 Rows that sort by rating without requiring a vote count (format showcases,
-anniversaries, seasonal keyword picks) use `catalog.RatedOrder`: the weighted
+anniversaries) use `catalog.RatedOrder`: the weighted
 rating first, then titles with no known count by `rating_tmdb` and then
 `rating_imdb`, so a perfect score from a few votes never leads them either.
 The default Top Rated library rows are rule rows and keep the sort their

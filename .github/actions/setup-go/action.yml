@@ -32,7 +32,7 @@ runs:
     - name: Restore the libvips packages
       if: runner.environment == 'github-hosted'
       id: libvips-cache
-      uses: actions/cache/restore@v4
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ runner.temp }}/libvips-debs
         key: ${{ steps.libvips-cache-key.outputs.key }}
@@ -90,7 +90,7 @@ runs:
     # cannot be raced into a duplicate save by every job in the run.
     - name: Save the libvips packages
       if: runner.environment == 'github-hosted' && github.event_name != 'pull_request' && steps.libvips-cache.outputs.cache-hit != 'true'
-      uses: actions/cache/save@v4
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ runner.temp }}/libvips-debs
         key: ${{ steps.libvips-cache.outputs.cache-primary-key }}
@@ -101,7 +101,7 @@ runs:
     # commit and restored by prefix, so each run starts from the newest
     # cache any earlier run saved.
     - name: Set up Go
-      uses: actions/setup-go@v6
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
         go-version-file: go.mod
         cache: false
@@ -118,7 +118,7 @@ runs:
     # Only a push to main saves, and the prune job keeps the newest per lane.
     - name: Restore the Go build and module cache
       if: runner.environment == 'github-hosted' && github.event_name == 'pull_request'
-      uses: actions/cache/restore@v4
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |
           ~/.cache/go-build
@@ -130,7 +130,7 @@ runs:
 
     - name: Restore and save the Go build and module cache
       if: runner.environment == 'github-hosted' && github.event_name != 'pull_request'
-      uses: actions/cache@v4
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |
           ~/.cache/go-build
