@@ -5699,7 +5699,7 @@ func TestHandleReplanPlaybackV3RemapsSubtitleAcrossFormatsInFallbackVersion(t *t
 	}
 }
 
-func TestHandleReplanPlaybackV3BitmapSubtitleFallsBackFromHDRToSDRVersion(t *testing.T) {
+func TestHandleReplanPlaybackV3BitmapSubtitleKeepsHDRVersionWithoutSubtitle(t *testing.T) {
 	source := v3HandlerFixtureFile(t)
 	source.Container = "mkv"
 	source.FilePath = writePlaybackTestMediaFile(t, "movie-4k.mkv")
@@ -5789,17 +5789,13 @@ func TestHandleReplanPlaybackV3BitmapSubtitleFallsBackFromHDRToSDRVersion(t *tes
 		},
 		Capabilities: startRequest.Capabilities, ClientPlaybackContext: startRequest.ClientPlaybackContext,
 	})
-	// A subtitle track_change must never move the version underneath the
-	// selection: the bitmap track cannot be delivered on the mounted HDR
-	// source, so the replan refuses with a terminal instead of silently
-	// swapping to the SDR alternate. Only an unreadable/corrupted video
-	// (surfaced as a failure_recovery) may fall back to another version.
-	if replanned.PlaybackPlan != nil || replanned.Terminal == nil {
-		t.Fatalf("subtitle track_change should refuse with a terminal, got plan=%#v terminal=%#v", replanned.PlaybackPlan, replanned.Terminal)
+	// The upstream subtitle-degrade rule keeps the mounted HDR version and
+	// drops the bitmap track instead of moving to the SDR sibling. The plan
+	// reports the subtitle as unavailable; the viewer keeps the 4K picture.
+	if replanned.PlaybackPlan == nil || replanned.Terminal != nil {
+		t.Fatalf("subtitle track_change should keep the HDR version without the subtitle, got plan=%#v terminal=%#v", replanned.PlaybackPlan, replanned.Terminal)
 	}
-	if replanned.Terminal.Reason != "subtitle_conversion_unsupported" {
-		t.Fatalf("subtitle track_change terminal = %#v, want subtitle_conversion_unsupported", replanned.Terminal)
-	}
+	requireRequestedVersionWithoutSubtitleV3(t, replanned.PlaybackPlan, source)
 	t.Cleanup(func() { handler.tm.CloseTranscodeSession(started.SessionID, "") })
 }
 

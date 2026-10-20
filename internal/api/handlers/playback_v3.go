@@ -1695,11 +1695,8 @@ func retryIncompleteToneMapPlanningV3(result playback.PlannerResultV3, capabilit
 		return result
 	}
 	switch result.Terminal.Reason {
-	case playback.TerminalHDRTranscodeUnsupportedV3:
+	case playback.TerminalHDRTranscodeUnsupportedV3, terminalSubtitleConversionUnsupportedV3:
 	default:
-		// A subtitle refusal is a verdict on the selected track and the file,
-		// not a tone-map capability gap; keep it so the same-release subtitle
-		// degrade can run.
 		return result
 	}
 	result.Terminal = &playback.TerminalV3{
