@@ -232,7 +232,11 @@ func TestCopySegmentPlanManifest(t *testing.T) {
 func TestPlannedSessionServesPlanForEveryManifest(t *testing.T) {
 	plan := &copySegmentPlan{durations: []float64{2, 2, 1}}
 	s := &TranscodeSession{opts: plannedOpts(), copyPlan: plan}
-	want := plan.manifest(s.opts, "", "")
+	// The manifest carries the session's generation token on every segment
+	// URI (see BuildPlaybackManifest), so the expected plan is scoped the same
+	// way.
+	scoped := s.generationScopedQuery("")
+	want := plan.manifest(s.opts, "", scoped)
 	for name, build := range map[string]func(string, string) ([]byte, error){
 		"playback":       s.BuildPlaybackManifest,
 		"source aligned": s.BuildSourceAlignedPlaybackManifest,

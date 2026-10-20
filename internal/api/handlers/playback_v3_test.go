@@ -510,7 +510,7 @@ func TestHandleStartPlaybackV3SubtitleOnlyTerminalDegradesInPlace(t *testing.T) 
 	}
 	dropped := false
 	for _, warning := range response.PlaybackPlan.DegradationWarnings {
-		if warning.Code == "subtitle_dropped_unavailable" {
+		if warning.Code == playback.DegradationWarningSubtitleTrackUnavailableV3 {
 			dropped = true
 		}
 	}

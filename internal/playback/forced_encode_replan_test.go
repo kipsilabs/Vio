@@ -171,7 +171,7 @@ func TestToneMapBitmapGraphDropsRedundantScaleAtSourceHeight(t *testing.T) {
 		t.Fatalf("same-height tone-map bitmap graph is missing the map-only QSV tail: %s", graph)
 	}
 	toneMapIndex := strings.Index(graph, "tonemap_opencl")
-	overlayIndex := strings.Index(graph, "overlay_vaapi=eof_action=pass")
+	overlayIndex := strings.Index(graph, "overlay_opencl=eof_action=pass")
 	if toneMapIndex < 0 || overlayIndex < toneMapIndex {
 		t.Fatalf("subtitle overlay must follow the tone-map: %s", graph)
 	}
@@ -179,7 +179,7 @@ func TestToneMapBitmapGraphDropsRedundantScaleAtSourceHeight(t *testing.T) {
 	reduced := base
 	reduced.TargetResolution = "1080p"
 	reducedGraph := filterComplexArg(t, buildFFmpegArgs(reduced))
-	if !strings.Contains(reducedGraph, "scale_vaapi=w=-2:h=1080") {
+	if !strings.Contains(reducedGraph, "scale_opencl=w=-2:h=1080") {
 		t.Fatalf("1080p tone-map bitmap graph lost its real scale: %s", reducedGraph)
 	}
 }

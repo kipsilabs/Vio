@@ -199,7 +199,7 @@ func TestPostgresTracerSurvivesPanickingLogSink(t *testing.T) {
 func postgresDependencyCounter(t *testing.T, operation, outcome string) prometheus.Counter {
 	t.Helper()
 	probe := prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "silo_dependency_operations_total",
+		Name: "vio_dependency_operations_total",
 		Help: "Dependency operations completed, including cancellation and timeout, by bounded category.",
 	}, []string{"dependency", "role", "operation", "outcome"})
 	var duplicate prometheus.AlreadyRegisteredError

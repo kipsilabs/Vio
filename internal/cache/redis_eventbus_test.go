@@ -134,8 +134,8 @@ func TestCheckEventBusChannels(t *testing.T) {
 	}
 
 	for _, tc := range []struct{ path, want string }{
-		{"/3", "SUBSCRIBE silo:catalog@db3 silo:admin@db3 silo:playback@db3 silo:logs@db3 silo:events@db3"},
-		{"/0", "SUBSCRIBE silo:catalog silo:admin silo:playback silo:logs silo:events"},
+		{"/3", "SUBSCRIBE vio:catalog@db3 vio:admin@db3 vio:playback@db3 vio:logs@db3 vio:events@db3"},
+		{"/0", "SUBSCRIBE vio:catalog vio:admin vio:playback vio:logs vio:events"},
 	} {
 		server := startRESPTestServer(t, nil, respTestRedis)
 		if err := check(t, server, tc.path); err != nil {
@@ -150,7 +150,7 @@ func TestCheckEventBusChannels(t *testing.T) {
 		if args[0] != "SUBSCRIBE" {
 			return "", false
 		}
-		return "-NOPERM User silo has no permissions to access the 'silo:catalog' channel\r\n", true
+		return "-NOPERM User silo has no permissions to access the 'vio:catalog' channel\r\n", true
 	})
 	err := check(t, server, "/0")
 	if _, refused := errors.AsType[redis.Error](err); !refused || !strings.Contains(err.Error(), "NOPERM") {
@@ -167,8 +167,8 @@ func TestCheckEventBusChannels(t *testing.T) {
 			"-NOPERM User silo has no permissions to access the '" + args[2] + "' channel\r\n", true
 	})
 	err = check(t, server, "/0")
-	if _, refused := errors.AsType[redis.Error](err); !refused || !strings.Contains(err.Error(), "silo:admin") {
-		t.Errorf("a later channel refused: %v, want the NOPERM reply for silo:admin", err)
+	if _, refused := errors.AsType[redis.Error](err); !refused || !strings.Contains(err.Error(), "vio:admin") {
+		t.Errorf("a later channel refused: %v, want the NOPERM reply for vio:admin", err)
 	}
 }
 

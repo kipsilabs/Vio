@@ -91,6 +91,9 @@ func TestBuildPlaybackManifestPublishesSubtitleRendition(t *testing.T) {
 	opts.TargetAudioBitrateKbps = 128
 	session := &TranscodeSession{outputDir: opts.OutputDir, opts: opts}
 
+	subQuery := session.generationScopedQuery("silo_rendition=subtitles&st=abc")
+	videoQuery := session.generationScopedQuery("silo_rendition=video&st=abc")
+	stQuery := session.generationScopedQuery("st=abc")
 	master, err := session.BuildPlaybackManifest("segment/", "st=abc")
 	if err != nil {
 		t.Fatal(err)
@@ -99,9 +102,9 @@ func TestBuildPlaybackManifestPublishesSubtitleRendition(t *testing.T) {
 		"#EXTM3U",
 		"#EXT-X-VERSION:3",
 		"#EXT-X-INDEPENDENT-SEGMENTS",
-		`#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="Subtitles",DEFAULT=YES,AUTOSELECT=YES,FORCED=NO,URI="master.m3u8?silo_rendition=subtitles&st=abc"`,
+		`#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="Subtitles",DEFAULT=YES,AUTOSELECT=YES,FORCED=NO,URI="master.m3u8?` + subQuery + `"`,
 		`#EXT-X-STREAM-INF:BANDWIDTH=4128000,SUBTITLES="subs"`,
-		"master.m3u8?silo_rendition=video&st=abc",
+		"master.m3u8?" + videoQuery,
 		"",
 	}, "\n")
 	if string(master) != wantMaster {
@@ -112,7 +115,7 @@ func TestBuildPlaybackManifestPublishesSubtitleRendition(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := session.GenerateFullManifest("segment/", "st=abc"); string(video) != string(want) {
+	if want := session.GenerateFullManifest("segment/", stQuery); string(video) != string(want) {
 		t.Fatalf("video variant must be the unchanged synthetic playlist:\n%s\nwant:\n%s", video, want)
 	}
 
@@ -123,14 +126,14 @@ func TestBuildPlaybackManifestPublishesSubtitleRendition(t *testing.T) {
 	wantSubtitles := strings.Join([]string{
 		"#EXTM3U",
 		"#EXT-X-VERSION:3",
-		"#EXT-X-TARGETDURATION:2",
+		"#EXT-X-TARGETDURATION:3",
 		"#EXT-X-MEDIA-SEQUENCE:0",
 		"#EXT-X-PLAYLIST-TYPE:VOD",
-		"#EXTINF:2.000000,", "segment/sub_00000.vtt?st=abc",
-		"#EXTINF:2.000000,", "segment/sub_00001.vtt?st=abc",
-		"#EXTINF:2.000000,", "segment/sub_00002.vtt?st=abc",
-		"#EXTINF:2.000000,", "segment/sub_00003.vtt?st=abc",
-		"#EXTINF:1.000000,", "segment/sub_00004.vtt?st=abc",
+		"#EXTINF:2.000000,", "segment/sub_00000.vtt?" + stQuery,
+		"#EXTINF:2.000000,", "segment/sub_00001.vtt?" + stQuery,
+		"#EXTINF:2.000000,", "segment/sub_00002.vtt?" + stQuery,
+		"#EXTINF:2.000000,", "segment/sub_00003.vtt?" + stQuery,
+		"#EXTINF:1.000000,", "segment/sub_00004.vtt?" + stQuery,
 		"#EXT-X-ENDLIST",
 		"",
 	}, "\n")
@@ -152,7 +155,9 @@ func TestBuildPlaybackManifestRenditionWithoutQuery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{`URI="master.m3u8?silo_rendition=subtitles"`, "\nmaster.m3u8?silo_rendition=video\n", "BANDWIDTH=8192000"} {
+	subQuery := session.generationScopedQuery("silo_rendition=subtitles")
+	videoQuery := session.generationScopedQuery("silo_rendition=video")
+	for _, want := range []string{`URI="master.m3u8?` + subQuery + `"`, "\nmaster.m3u8?" + videoQuery + "\n", "BANDWIDTH=8192000"} {
 		if !strings.Contains(string(master), want) {
 			t.Fatalf("multivariant playlist missing %q:\n%s", want, master)
 		}
@@ -165,8 +170,10 @@ func TestAppendManifestQueryParamCoversSubtitleRendition(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	subQuery := session.generationScopedQuery("silo_rendition=subtitles")
+	videoQuery := session.generationScopedQuery("silo_rendition=video")
 	got := string(AppendManifestQueryParam(master, "st", "tok"))
-	for _, want := range []string{`URI="master.m3u8?silo_rendition=subtitles&st=tok"`, "\nmaster.m3u8?silo_rendition=video&st=tok\n"} {
+	for _, want := range []string{`URI="master.m3u8?` + subQuery + `&st=tok"`, "\nmaster.m3u8?" + videoQuery + "&st=tok\n"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("relay token missing from %q:\n%s", want, got)
 		}

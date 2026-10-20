@@ -659,6 +659,10 @@ func (s *allCapabilitiesFakeStore) RemoveDeviceSettings(context.Context, string,
 	return nil, nil
 }
 
+func (s *allCapabilitiesFakeStore) RenameDevice(context.Context, string, string, string) error {
+	return nil
+}
+
 func (s *allCapabilitiesFakeStore) GetDeviceProfile(_ context.Context, profileID, deviceID string) (*userstore.DeviceCapabilityProfile, error) {
 	if s.profile == nil || s.profile.ProfileID != profileID || s.profile.DeviceID != deviceID {
 		return nil, nil
