@@ -390,6 +390,16 @@ jobs:
       - name: Migrate the test database
         run: DATABASE_URL="$SILO_TEST_DATABASE_URL" SECRET_KEY="$(openssl rand -base64 48)" go run ./cmd/silo/ --migrate-only
 
+      # Run this change's registered DB contract through the same pin runner
+      # used by `make test-db-contracts`. The registration is the source, and
+      # the runner fails on a missing, skipped, or failing test, so the test
+      # cannot silently skip when SILO_TEST_DATABASE_URL is absent.
+      - name: Test the metadata-only season database contract
+        run: |
+          grep -E '^\./internal/api/handlers TestSeriesSeasonsKeepsMetadataOnlySeasons$' scripts/ci/db-contracts.txt \
+            > "$RUNNER_TEMP/season-contract.txt"
+          go run ./scripts/ci/dbpins -list "$RUNNER_TEMP/season-contract.txt"
+
       - name: Test image cache cleanup resumption against Postgres
         run: go test -race -count=1 -run '^(TestImageCacheCleanup|TestRequeuedImageCacheCleanup|TestJobOutcomeIsRecorded)' ./internal/adminjob/
 
