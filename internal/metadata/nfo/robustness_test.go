@@ -39,7 +39,7 @@ func utf16WithBOM(s string, bigEndian bool) string {
 // Real-world NFO files that Kodi and Jellyfin read must not count as absent:
 // legacy charsets, HTML entities, stray ampersands, non-numeric numbers, and
 // the link-only and legacy id forms.
-func TestParseNFOData_RealWorldForms(t *testing.T) {
+func TestParseNFOData_RealWorldForms(t *testing.T) { //nolint:funlen // upstream TestParseNFOData_RealWorldForms exceeds Vio's 100-line limit; refactor tracked separately
 	t.Parallel()
 
 	type want struct {

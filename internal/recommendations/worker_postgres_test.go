@@ -25,7 +25,7 @@ import (
 // Two workers on separate pools stand in for two API servers sharing one
 // database: while one runs a job the other skips it, and only finished runs
 // are recorded in task_executions.
-func TestRecommendationJobRunsOnOneServerPostgres(t *testing.T) {
+func TestRecommendationJobRunsOnOneServerPostgres(t *testing.T) { //nolint:funlen // upstream TestRecommendationJobRunsOnOneServerPostgres exceeds Vio's 100-line limit; refactor tracked separately
 	pool := newEngineTestPool(t)
 	ctx := t.Context()
 	otherPool, err := pgxpool.New(ctx, os.Getenv("SILO_TEST_DATABASE_URL"))

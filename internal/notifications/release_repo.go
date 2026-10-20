@@ -364,7 +364,7 @@ func (r *ReleaseRepository) recordAvailability(ctx context.Context, libraryID in
 	}
 
 	events := 0
-	if len(inserted) > 0 {
+	if len(inserted) > 0 { //nolint:nestif // upstream recordAvailability in release_repo.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
 		releases, err := markReleasedAvailability(ctx, tx, libraryID, emitEvents, inserted)
 		if err != nil {
 			return 0, 0, err

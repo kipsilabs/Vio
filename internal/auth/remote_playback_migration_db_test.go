@@ -21,7 +21,7 @@ const remotePlaybackMigration = "20261012171715_bind_remote_playback_sessions"
 // ended 24 hours after creation, ordinary sign-ins are untouched, and a node
 // from the earlier release (which collects and refreshes handoffs as ordinary
 // sign-ins) still produces a bound session that cannot outlive its limit.
-func TestBindRemotePlaybackSessionsMigrationDB(t *testing.T) {
+func TestBindRemotePlaybackSessionsMigrationDB(t *testing.T) { //nolint:funlen,gocyclo // upstream TestBindRemotePlaybackSessionsMigrationDB exceeds Vio's 100-line and complexity-30 limits; refactor tracked separately
 	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("SILO_TEST_DATABASE_URL is not set")

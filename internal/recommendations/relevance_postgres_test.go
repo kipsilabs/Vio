@@ -396,7 +396,7 @@ func rowSizes(rows []ForYouRow) []string {
 // its latest completion, co-watches books with its latest movie and has
 // three peers rate them, so a row built from any of those paths without the
 // type rule would carry one. A book still anchors its own "More like this".
-func TestPersonalRowsOfferOnlyRecommendableMediaTypesPostgres(t *testing.T) {
+func TestPersonalRowsOfferOnlyRecommendableMediaTypesPostgres(t *testing.T) { //nolint:funlen,gocyclo // upstream TestPersonalRowsOfferOnlyRecommendableMediaTypesPostgres exceeds Vio's 100-line and complexity-30 limits; refactor tracked separately
 	f := newRelevanceFixture(t, "types")
 	ctx := t.Context()
 	const axis = 2600

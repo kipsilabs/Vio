@@ -39,7 +39,7 @@ func (r *Reader) GetWatchTonight(ctx context.Context, userID int, profileID stri
 
 	// With recommendations disabled no personal row is served, even one
 	// still cached from before, and the cold-start rows stand in.
-	if !r.personalOff {
+	if !r.personalOff { //nolint:nestif // upstream GetWatchTonight in watch_tonight.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
 		// 1. For-you main row — highest relevance band (0.80–1.00).
 		forYouItems, err := r.repo.GetRecommendationCache(ctx, userID, profileID, RecTypeForYouMain, "")
 		if err != nil {

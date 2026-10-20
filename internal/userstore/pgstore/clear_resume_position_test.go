@@ -18,7 +18,7 @@ import (
 // watched state, reaches delta-sync clients through synced_seq, and advances
 // event_at so an older provider resume point cannot restore the position.
 // Skips unless SILO_TEST_DATABASE_URL names a migrated database.
-func TestPostgresClearResumePosition(t *testing.T) {
+func TestPostgresClearResumePosition(t *testing.T) { //nolint:funlen,gocyclo // upstream TestPostgresClearResumePosition exceeds Vio's 100-line and complexity-30 limits; refactor tracked separately
 	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("SILO_TEST_DATABASE_URL is not set")

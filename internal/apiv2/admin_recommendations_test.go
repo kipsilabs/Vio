@@ -178,7 +178,7 @@ func TestAdminRecommendationsTransport(t *testing.T) {
 	}
 }
 
-func TestAdminRecommendationsStatusReportsRunsConflictAndRefresh(t *testing.T) {
+func TestAdminRecommendationsStatusReportsRunsConflictAndRefresh(t *testing.T) { //nolint:gocyclo // upstream TestAdminRecommendationsStatusReportsRunsConflictAndRefresh exceeds Vio's complexity-30 limit; refactor tracked separately
 	deps := pilotDeps(nil, nil)
 	f := &fakeAdminRecommendations{conflict: `Embeddings were created with model "a", not "b". Reset embeddings before switching models.`}
 	deps.AdminRecommendations = f

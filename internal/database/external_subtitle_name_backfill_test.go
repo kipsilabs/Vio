@@ -70,7 +70,7 @@ func TestRepairExternalSubtitleNames(t *testing.T) {
 // TestPostgresExternalSubtitleNameBackfill runs the real goose provider, which
 // registers the Go migration, then exercises the backfill directly over seeded
 // rows.
-func TestPostgresExternalSubtitleNameBackfill(t *testing.T) {
+func TestPostgresExternalSubtitleNameBackfill(t *testing.T) { //nolint:funlen // upstream TestPostgresExternalSubtitleNameBackfill exceeds Vio's 100-line limit; refactor tracked separately
 	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("SILO_TEST_DATABASE_URL is not set")

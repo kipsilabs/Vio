@@ -137,7 +137,7 @@ func TestGeneratedHomeRowsSkipVideoLibrariesWithSharedRowDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !hasEnabledHomeRecentlyAddedCovering(home, "movies") {
+	if !hasEnabledHomeRecentlyAddedCovering(home, "movies") { //nolint:nestif // upstream TestGeneratedHomeRowsSkipVideoLibrariesWithSharedRowDB in recently_added_shared_db_test.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
 		// Older homes have no covering row, and a disabled covering row shows
 		// nothing; both keep per-library rows.
 		disabled, err := f.repo.Create(ctx, &PageSection{Scope: "home", SectionType: SectionRecentlyAdded, Title: f.app + "-disabled", ItemLimit: DefaultItemLimit, Config: defaultMediaScopeConfig(catalog.MediaScopeVideo), Enabled: false})

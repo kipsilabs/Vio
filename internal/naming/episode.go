@@ -46,7 +46,7 @@ type episodeToken struct {
 // movie libraries by themselves.
 // rootRelative reports that directories start directly in a configured library
 // folder, so the first one may be the show itself.
-func parseEpisodeToken(name string, directories []string, rootRelative, allowNumericSeason bool, allowUnseasoned ...bool) (episodeToken, bool) {
+func parseEpisodeToken(name string, directories []string, rootRelative, allowNumericSeason bool, allowUnseasoned ...bool) (episodeToken, bool) { //nolint:funlen,gocyclo // upstream parseEpisodeToken exceeds Vio's 100-line and complexity-30 limits; refactor tracked separately
 	for _, pattern := range []*regexp.Regexp{labeledEpisodeRe, xEpisodeRe} {
 		for _, match := range pattern.FindAllStringSubmatchIndex(name, -1) {
 			season, _ := strconv.Atoi(name[match[2]:match[3]])

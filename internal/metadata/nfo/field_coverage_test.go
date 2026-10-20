@@ -256,7 +256,7 @@ func TestParseNFOData_Trailers(t *testing.T) {
 	}
 }
 
-func TestParseNFOData_Ratings(t *testing.T) {
+func TestParseNFOData_Ratings(t *testing.T) { //nolint:funlen // upstream TestParseNFOData_Ratings exceeds Vio's 100-line limit; refactor tracked separately
 	t.Parallel()
 
 	tests := []struct {

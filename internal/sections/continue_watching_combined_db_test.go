@@ -49,7 +49,7 @@ func (c *nextUpWalkTracer) take() []string {
 // them, since anything older could not make the row. A profile showing new
 // releases first is the exception: a series finished before all of them leads
 // the row when its next episode was just released, so its walk is unbounded.
-func TestContinueWatchingCombinedRowKeepsNewestCardsDB(t *testing.T) {
+func TestContinueWatchingCombinedRowKeepsNewestCardsDB(t *testing.T) { //nolint:funlen // upstream TestContinueWatchingCombinedRowKeepsNewestCardsDB exceeds Vio's 100-line limit; refactor tracked separately
 	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("SILO_TEST_DATABASE_URL is not set")

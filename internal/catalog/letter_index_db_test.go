@@ -75,7 +75,7 @@ func orderedTitleKeys(t *testing.T, resolver *CatalogResolver, req CatalogReques
 // seek jumps there, and the runs match the pager's order whatever the
 // database collation does with accented and non-Latin initials. Set SILO_TEST_DATABASE_URL to a migrated
 // disposable database; every inserted row is removed on completion.
-func TestLetterIndexMatchesCursorPagesPostgres(t *testing.T) {
+func TestLetterIndexMatchesCursorPagesPostgres(t *testing.T) { //nolint:funlen // upstream TestLetterIndexMatchesCursorPagesPostgres exceeds Vio's 100-line limit; refactor tracked separately
 	pool := collectionSortTestPool(t)
 	ctx := t.Context()
 	prefix := fmt.Sprintf("letter-index-%d", time.Now().UnixNano())

@@ -11,7 +11,7 @@ import (
 // upstream. Its error must not land on the source, and last_run_at must stay
 // as the reset left it, so the next cycle polls the new upstream. Edits that
 // keep the upstream still record the error.
-func TestRecordErrorSkipsStalePoll(t *testing.T) {
+func TestRecordErrorSkipsStalePoll(t *testing.T) { //nolint:funlen // upstream TestRecordErrorSkipsStalePoll exceeds Vio's 100-line limit; refactor tracked separately
 	const msg = "dial tcp: i/o timeout"
 	for name, tc := range map[string]struct {
 		unmarked     bool // the poll started without a marker

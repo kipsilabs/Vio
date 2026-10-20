@@ -507,7 +507,7 @@ func TestSeriesWithoutSeasonOrEpisodeNFOs_UnchangedFallback(t *testing.T) {
 // provider fills back to the provider image, even through a fill-empty refresh
 // with an unrated poster; a slot no provider fills (the backdrop here) keeps
 // its copy. NFO text applies either way.
-func TestLocalArtworkUsedOnlyWithImageCaching(t *testing.T) {
+func TestLocalArtworkUsedOnlyWithImageCaching(t *testing.T) { //nolint:funlen,gocyclo // upstream TestLocalArtworkUsedOnlyWithImageCaching exceeds Vio's 100-line and complexity-30 limits; refactor tracked separately
 	const (
 		remotePoster = "https://img.example/series-poster.jpg"
 		remoteSeason = "https://img.example/season-1.jpg"

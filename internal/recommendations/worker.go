@@ -1007,7 +1007,7 @@ type userRowsResult struct {
 // cacheUserRows generates and caches personalized rows for a single user. A
 // main, cluster or Because You Watched row whose rebuild finds nothing is
 // deleted; a row whose build or write fails keeps its cached version.
-func (w *Worker) cacheUserRows(ctx context.Context, repo *Repo, userID int, profileID, expires string) userRowsResult {
+func (w *Worker) cacheUserRows(ctx context.Context, repo *Repo, userID int, profileID, expires string) userRowsResult { //nolint:funlen // upstream cacheUserRows exceeds Vio's 100-line limit; refactor tracked separately
 	var res userRowsResult
 	fail := func(step string, err error, attrs ...any) {
 		res.failed++
@@ -1078,7 +1078,7 @@ func (w *Worker) cacheUserRows(ctx context.Context, repo *Repo, userID int, prof
 		}()
 	}
 	aggregatedRow, err := builder.mainRow(ctx, userID, profileID, CacheCandidateLimit, excludeIDs, accessFilter)
-	if err != nil {
+	if err != nil { //nolint:nestif // upstream cacheUserRows in worker.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
 		// The cluster rows leave out the main row's titles, so they keep
 		// their cached versions too: rebuilt against no main row, they would
 		// repeat the cached one's titles.

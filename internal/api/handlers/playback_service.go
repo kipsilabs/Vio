@@ -1016,7 +1016,7 @@ func (h *PlaybackHandler) ReplanPlaybackV2(ctx context.Context, caller PlaybackC
 		return playback.DecisionResponseV3{}, h.stoppedAttemptError(ctx, sessionID, record)
 	}
 	response, err := h.replanPlaybackApplicationV3(playbackCallerSessionRequest(ctx, caller, sessionID), sessionID, body)
-	if err != nil {
+	if err != nil { //nolint:nestif // upstream ReplanPlaybackV2 in playback_service.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
 		// A stop that lands after the check above reaches the replan as a
 		// missing live session or a refused commit, both reported as not
 		// found. Re-read the attempt so an administrator stop still answers

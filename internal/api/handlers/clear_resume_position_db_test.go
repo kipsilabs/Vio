@@ -25,7 +25,7 @@ import (
 // position to clear (issue #2134): a movie or an episode clears and publishes
 // one progress change; a season, series or ebook is an invalid target; an
 // item without a resume position is a silent no-op.
-func TestClearResumePositionTargetsDB(t *testing.T) {
+func TestClearResumePositionTargetsDB(t *testing.T) { //nolint:funlen,gocyclo // upstream TestClearResumePositionTargetsDB exceeds Vio's 100-line and complexity-30 limits; refactor tracked separately
 	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("SILO_TEST_DATABASE_URL is not set")

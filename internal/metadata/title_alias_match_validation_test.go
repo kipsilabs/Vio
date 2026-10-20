@@ -124,7 +124,7 @@ func TestInitialMatchLeavesUnrelatedSameYearResultUnmatched(t *testing.T) {
 	}
 }
 
-func TestValidateMatchByProviderTitleAliases(t *testing.T) {
+func TestValidateMatchByProviderTitleAliases(t *testing.T) { //nolint:funlen // upstream TestValidateMatchByProviderTitleAliases exceeds Vio's 100-line limit; refactor tracked separately
 	t.Parallel()
 	hints := &MatchHints{Title: "首尔之春", Year: 2023, Type: "movie"}
 

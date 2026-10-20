@@ -283,7 +283,7 @@ func (b rowBuilder) addTypeSupplements(
 			short = append(short, mediaType)
 		}
 	}
-	if len(short) > 0 {
+	if len(short) > 0 { //nolint:nestif // upstream addTypeSupplements in personal.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
 		present, err := b.store.PresentMediaTypes(ctx, short, filter)
 		if err != nil {
 			slog.WarnContext(ctx, "main row media type check failed; querying every short type", "component", "recommendations", "error", err)

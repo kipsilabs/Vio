@@ -1052,7 +1052,7 @@ func (h *LibraryHandler) requeueItemMatchWork(ctx context.Context, contentID str
 			}
 		}
 	}
-	if h.SeriesMatchQueueRepo != nil {
+	if h.SeriesMatchQueueRepo != nil { //nolint:nestif // upstream requeueItemMatchWork in libraries_service.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
 		for _, root := range roots {
 			if err := h.SeriesMatchQueueRepo.EnqueueSeriesRoot(ctx, root.folderID, root.path); err != nil {
 				slog.WarnContext(ctx, "requeueing series match work", "component", "api", "content_id", contentID, "library_id", root.folderID, "error", err)

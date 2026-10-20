@@ -96,7 +96,7 @@ func TestDisconnectProviderTimeoutPreservesCleanupBudget(t *testing.T) {
 	})
 }
 
-func TestDisconnectRetryHonorsProviderDelay(t *testing.T) {
+func TestDisconnectRetryHonorsProviderDelay(t *testing.T) { //nolint:gocyclo // upstream TestDisconnectRetryHonorsProviderDelay exceeds Vio's complexity-30 limit; refactor tracked separately
 	for _, target := range []string{"discovery", "revocation"} {
 		for _, status := range []int{http.StatusTooManyRequests, http.StatusServiceUnavailable} {
 			for _, format := range []string{"seconds", "date", "at deadline", "beyond deadline"} {

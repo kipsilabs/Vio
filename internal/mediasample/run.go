@@ -254,7 +254,7 @@ func (a attemptRun) samples(req Request) (Result, *AttemptError) {
 	illegalShortTerm := false
 	// Sheets always probe: the codec decides how keyframes are read (see
 	// keyframeSkipFor), even for a read-through window.
-	if !req.Samples.ReadThrough || req.Sheets != nil {
+	if !req.Samples.ReadThrough || req.Sheets != nil { //nolint:nestif // upstream samples in run.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
 		header := &inputHeaderParser{}
 		if failure := a.exec(req, probeArgs(req.Input), nil, nil, header.line); failure != nil {
 			return Result{}, failure

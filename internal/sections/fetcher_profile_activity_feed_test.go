@@ -18,7 +18,7 @@ import (
 // server, like Trending and Most Watched. A pinned profile_id is saved section
 // config the caller chooses, so it resolves only to a profile on the caller's
 // account: pinning another account's profile lists nothing.
-func TestProfileActivityFeedPinnedProfileStaysOnCallersAccountDB(t *testing.T) {
+func TestProfileActivityFeedPinnedProfileStaysOnCallersAccountDB(t *testing.T) { //nolint:funlen // upstream TestProfileActivityFeedPinnedProfileStaysOnCallersAccountDB exceeds Vio's 100-line limit; refactor tracked separately
 	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("SILO_TEST_DATABASE_URL is not set")

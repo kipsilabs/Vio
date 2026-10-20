@@ -15,7 +15,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 )
 
-func TestLoginActivationReconcilesModelWithoutLosingAcceptedTokens(t *testing.T) {
+func TestLoginActivationReconcilesModelWithoutLosingAcceptedTokens(t *testing.T) { //nolint:funlen,gocyclo // upstream TestLoginActivationReconcilesModelWithoutLosingAcceptedTokens exceeds Vio's 100-line and complexity-30 limits; refactor tracked separately
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		t.Fatal(err)

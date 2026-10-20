@@ -687,7 +687,7 @@ func TestSplitSubtitleRenditionQueryKeepsOtherParametersVerbatim(t *testing.T) {
 // start later, and its video can start after its audio, in which case the
 // first generation's grid follows the video while a seek's follows the
 // container.
-func TestSubtitleRenditionAlignsWithRealFFmpegSegments(t *testing.T) {
+func TestSubtitleRenditionAlignsWithRealFFmpegSegments(t *testing.T) { //nolint:funlen // upstream TestSubtitleRenditionAlignsWithRealFFmpegSegments exceeds Vio's 100-line limit; refactor tracked separately
 	if testing.Short() {
 		t.Skip("real FFmpeg integration test")
 	}

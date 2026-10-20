@@ -29,7 +29,7 @@ type DownloadServer interface {
 // for items it believes it cannot download, so the flag stays true for every
 // account and this route enforces the download rules instead. An account
 // that may not download gets 403 here while its static streams keep playing.
-func (h *PlaybackHandler) HandleDownload(w http.ResponseWriter, r *http.Request) {
+func (h *PlaybackHandler) HandleDownload(w http.ResponseWriter, r *http.Request) { //nolint:funlen,gocyclo // upstream HandleDownload exceeds Vio's 100-line and complexity-30 limits; refactor tracked separately
 	session := SessionFromContext(r.Context())
 	if session == nil {
 		writeError(w, http.StatusUnauthorized, "Unauthorized", "Missing authentication token")
@@ -53,7 +53,7 @@ func (h *PlaybackHandler) HandleDownload(w http.ResponseWriter, r *http.Request)
 	if sourceFromRoute {
 		mediaSourceID = h.codec.EncodeIntID(EncodedIDMediaSource, routeFileID)
 	}
-	if mediaSourceID != "" {
+	if mediaSourceID != "" { //nolint:nestif // upstream HandleDownload in download.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
 		matched := false
 		if fileID, decodeErr := h.codec.DecodeIntID(EncodedIDMediaSource, mediaSourceID); decodeErr == nil {
 			for _, v := range detail.Versions {
@@ -82,7 +82,7 @@ func (h *PlaybackHandler) HandleDownload(w http.ResponseWriter, r *http.Request)
 		}
 		return
 	}
-	if isCompatVirtualPath(version.FilePath) || strings.EqualFold(strings.TrimSpace(version.Container), "virtual") {
+	if isCompatVirtualPath(version.FilePath) || strings.EqualFold(strings.TrimSpace(version.Container), "virtual") { //nolint:nestif // upstream HandleDownload in download.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
 		prepared, virtualSourceURI, virtualOwnerID, prepareErr := h.prepareVirtualPlaybackVersion(r.Context(), session, version)
 		if prepareErr != nil {
 			writeError(w, http.StatusBadGateway, "PlaybackUnavailable", "Failed to resolve virtual playback")

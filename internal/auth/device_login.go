@@ -883,7 +883,7 @@ func (s *DeviceLoginService) Poll(ctx context.Context, deviceCode string) (*Devi
 // Quick Connect request is collected only through CollectQuickConnect and
 // every other request only through Poll: a Quick Connect approval grants one
 // profile to a Jellyfin app, not a native session that could pick any.
-func (s *DeviceLoginService) poll(ctx context.Context, deviceCode string, quickConnect bool, persist QuickConnectPersist) (*DeviceLoginPollResult, error) {
+func (s *DeviceLoginService) poll(ctx context.Context, deviceCode string, quickConnect bool, persist QuickConnectPersist) (*DeviceLoginPollResult, error) { //nolint:funlen,gocyclo // upstream poll exceeds Vio's 100-line and complexity-30 limits; refactor tracked separately
 	// The approver is immutable once assigned. Read it before taking the
 	// device lock so collection and revocation both lock user -> device;
 	// inserting a session while holding only the device row would invert

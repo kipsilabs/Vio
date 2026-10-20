@@ -10,7 +10,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/ai/llm"
 )
 
-func TestUsagePauseBlocksReadinessAndPinnedRequestsUntilExplicitCheck(t *testing.T) {
+func TestUsagePauseBlocksReadinessAndPinnedRequestsUntilExplicitCheck(t *testing.T) { //nolint:gocyclo // upstream TestUsagePauseBlocksReadinessAndPinnedRequestsUntilExplicitCheck exceeds Vio's complexity-30 limit; refactor tracked separately
 	s, store := selectionFixture(t, map[string]string{"ai.auth_mode": "chatgpt", "ai.chat_model": "gpt-6-luna"})
 	cfg, err := s.TextConfig(t.Context())
 	if err != nil {

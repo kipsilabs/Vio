@@ -15,7 +15,7 @@ import (
 
 // Two library items can carry the same provider key, such as two items for one
 // title with the same IMDb id. Each keeps its own shadow row.
-func TestListItemsSharingProviderKeyDB(t *testing.T) {
+func TestListItemsSharingProviderKeyDB(t *testing.T) { //nolint:funlen // upstream TestListItemsSharingProviderKeyDB exceeds Vio's 100-line limit; refactor tracked separately
 	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("SILO_TEST_DATABASE_URL is not set")

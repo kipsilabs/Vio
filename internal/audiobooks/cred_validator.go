@@ -107,7 +107,7 @@ func (v *SiloCredValidator) Validate(
 		return principal, nil
 	}
 
-	if profile.PINHash != "" {
+	if profile.PINHash != "" { //nolint:nestif // upstream Validate in cred_validator.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
 		if pin == "" {
 			return abs.Principal{}, abs.ErrProfilePINRequired
 		}

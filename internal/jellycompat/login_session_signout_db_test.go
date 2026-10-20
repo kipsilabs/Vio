@@ -24,7 +24,7 @@ import (
 // every route that accepts it, on the node that holds it in memory and on one
 // that loads it from Postgres. The account's other Jellyfin sign-in keeps
 // working.
-func TestSignedOutLoginSessionEndsItsJellyfinSessionDB(t *testing.T) {
+func TestSignedOutLoginSessionEndsItsJellyfinSessionDB(t *testing.T) { //nolint:funlen // upstream TestSignedOutLoginSessionEndsItsJellyfinSessionDB exceeds Vio's 100-line limit; refactor tracked separately
 	pool, suffix := jellyfin12CompatPool(t)
 	ctx := context.Background()
 	users := auth.NewUserRepository(pool)

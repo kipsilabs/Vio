@@ -19,7 +19,7 @@ import (
 // episode listings leave it out. Marking its series or season unwatched must
 // still clear it: its completed progress otherwise keeps anchoring Next Up on
 // the series. File-less episodes nobody watched stay out of the unwatch.
-func TestParentUnwatchClearsEpisodesWithoutLibraryFilePostgres(t *testing.T) {
+func TestParentUnwatchClearsEpisodesWithoutLibraryFilePostgres(t *testing.T) { //nolint:funlen // upstream TestParentUnwatchClearsEpisodesWithoutLibraryFilePostgres exceeds Vio's 100-line limit; refactor tracked separately
 	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("SILO_TEST_DATABASE_URL is not set")

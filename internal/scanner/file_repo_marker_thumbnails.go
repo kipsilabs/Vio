@@ -59,7 +59,7 @@ func (r *FileRepository) saveMarkerThumbnailState(ctx context.Context, expected 
 	}
 	overlay := *expected
 	overlay.MarkerThumbnails = current.MarkerThumbnails
-	if prepare {
+	if prepare { //nolint:nestif // upstream saveMarkerThumbnailState in file_repo_marker_thumbnails.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
 		thumbnails = models.EffectiveMarkerThumbnails(&overlay)
 		for i := range thumbnails {
 			// This lookup supplies the range the deferral was waiting for.

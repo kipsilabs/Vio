@@ -75,7 +75,7 @@ func TestProcessLeavesIgnoredItemUnmatchedDB(t *testing.T) {
 // TestMatchQueuesSkipIgnoredItemsDB covers the matcher queues for issue
 // #2392: neither queues the files of an ignored movie or series, a sync
 // drops rows they already had, and clearing the mark queues them again.
-func TestMatchQueuesSkipIgnoredItemsDB(t *testing.T) {
+func TestMatchQueuesSkipIgnoredItemsDB(t *testing.T) { //nolint:funlen // upstream TestMatchQueuesSkipIgnoredItemsDB exceeds Vio's 100-line limit; refactor tracked separately
 	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("SILO_TEST_DATABASE_URL is not set")

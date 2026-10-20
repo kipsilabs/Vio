@@ -14,7 +14,7 @@ import (
 // Section cards are shared across profiles, so localization must return
 // per-viewer clones: translated text where a row exists, the source text and
 // a pending language where it does not, and episode cards through episode rows.
-func TestLocalizeSectionItems(t *testing.T) {
+func TestLocalizeSectionItems(t *testing.T) { //nolint:gocyclo // upstream TestLocalizeSectionItems exceeds Vio's complexity-30 limit; refactor tracked separately
 	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("SILO_TEST_DATABASE_URL is not set")

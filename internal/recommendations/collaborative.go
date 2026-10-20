@@ -118,7 +118,7 @@ func (e *Engine) SimilarUsersLiked(ctx context.Context, userID int, profileID st
 // by builder, whose aversion it applies around the profile's taste vector. It
 // answers an empty, non-nil list when the row has nothing to show, so a
 // cached row records that it was built.
-func (e *Engine) similarUsersLiked(ctx context.Context, builder rowBuilder, userID int, profileID string, limit int, excluded map[string]struct{}, filter catalog.AccessFilter) ([]ScoredItem, error) {
+func (e *Engine) similarUsersLiked(ctx context.Context, builder rowBuilder, userID int, profileID string, limit int, excluded map[string]struct{}, filter catalog.AccessFilter) ([]ScoredItem, error) { //nolint:funlen,gocyclo // upstream similarUsersLiked exceeds Vio's 100-line and complexity-30 limits; refactor tracked separately
 	meta, err := e.repo.GetTasteProfileMeta(ctx, userID, profileID)
 	if err != nil {
 		return nil, fmt.Errorf("get taste profile meta for user %d profile %s: %w", userID, profileID, err)

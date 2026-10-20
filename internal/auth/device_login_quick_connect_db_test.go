@@ -76,7 +76,7 @@ func quickConnectStatus(t *testing.T, svc *DeviceLoginService, secret string) st
 // visible only to a signed-in account, the account-level approval and the
 // native poll refuse it, and the approval for a profile is collected once
 // as a session of the approving account bound to that profile.
-func TestQuickConnectApproveAndCollectDB(t *testing.T) {
+func TestQuickConnectApproveAndCollectDB(t *testing.T) { //nolint:gocyclo // upstream TestQuickConnectApproveAndCollectDB exceeds Vio's complexity-30 limit; refactor tracked separately
 	svc, pool, userID, profileID, name := quickConnectTestService(t)
 	ctx := t.Context()
 	before := time.Now()

@@ -198,7 +198,7 @@ func (e *Engine) loadAversion(ctx context.Context, userID int, profileID string,
 		marked[i] = datedTitle{m.MediaItemID, m.MarkedAt}
 	}
 	var low []datedTitle
-	if e.ratingsRepo != nil {
+	if e.ratingsRepo != nil { //nolint:nestif // upstream loadAversion in aversion.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
 		ratings, err := e.ratingsRepo.ListAll(ctx, userID, profileID)
 		if err != nil {
 			return nil, fmt.Errorf("list ratings: %w", err)

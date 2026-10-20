@@ -82,7 +82,7 @@ func save(t *testing.T, store *memoryStore, c credentials) {
 	store.mu.Unlock()
 }
 
-func TestLoginValidatesIdentityAndConsumesCallback(t *testing.T) {
+func TestLoginValidatesIdentityAndConsumesCallback(t *testing.T) { //nolint:funlen,gocyclo // upstream TestLoginValidatesIdentityAndConsumesCallback exceeds Vio's 100-line and complexity-30 limits; refactor tracked separately
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		t.Fatal(err)
@@ -239,7 +239,7 @@ func TestLoginValidatesIdentityAndConsumesCallback(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if test.want {
+			if test.want { //nolint:nestif // upstream TestLoginValidatesIdentityAndConsumesCallback in service_test.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
 				if test.omitScope {
 					a := stored(t, store).Accounts[0]
 					if a.Scopes != u.Query().Get("scope") || a.AccessToken != "access" || a.RefreshToken != "refresh" || a.IDToken != signed || a.NeedsLogin {
@@ -270,7 +270,7 @@ func TestLoginValidatesIdentityAndConsumesCallback(t *testing.T) {
 					t.Fatalf("active credentials changed: %q, %v", activeToken, err)
 				}
 			}
-			if test.retainRegistration {
+			if test.retainRegistration { //nolint:nestif // upstream TestLoginValidatesIdentityAndConsumesCallback in service_test.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
 				c := stored(t, store)
 				i := slices.IndexFunc(c.Accounts, func(a account) bool { return a.ClientID == clientID })
 				if i < 0 {
@@ -303,7 +303,7 @@ func TestLoginValidatesIdentityAndConsumesCallback(t *testing.T) {
 					t.Fatal("unverified registration retained")
 				}
 			}
-			if test.reconsent || test.disconnectReconnect {
+			if test.reconsent || test.disconnectReconnect { //nolint:nestif // upstream TestLoginValidatesIdentityAndConsumesCallback in service_test.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
 				if test.disconnectReconnect {
 					if _, err := s.Disconnect(t.Context(), clientID); err != nil {
 						t.Fatal(err)
@@ -546,7 +546,7 @@ func TestRevokedRefreshAndDisconnectPreserveRegistration(t *testing.T) {
 	}
 }
 
-func TestDisconnectRetriesTransientRevocation(t *testing.T) {
+func TestDisconnectRetriesTransientRevocation(t *testing.T) { //nolint:gocyclo // upstream TestDisconnectRetriesTransientRevocation exceeds Vio's complexity-30 limit; refactor tracked separately
 	for _, tc := range []struct {
 		name        string
 		status      int
@@ -661,7 +661,7 @@ func TestDisconnectRetriesDiscoveryWithinRevocationBudget(t *testing.T) {
 					if c.Active != "" || !c.Accounts[0].NeedsLogin || c.Accounts[0].AccessToken != "" || c.Accounts[0].RefreshToken != "refresh" {
 						t.Fatal("account usable or refresh token discarded before revocation")
 					}
-					if r.URL.String() == s.discoveryURL {
+					if r.URL.String() == s.discoveryURL { //nolint:nestif // upstream TestDisconnectRetriesDiscoveryWithinRevocationBudget in service_test.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
 						discoveryCalls++
 						if discoveryCalls == 1 || tc.persistent {
 							if tc.network {

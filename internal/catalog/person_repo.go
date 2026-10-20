@@ -1529,7 +1529,7 @@ func PersonRefreshDue(person models.Person, now time.Time) bool {
 // leaves metadata_refresh_attempted_at alone: the lookup stamps it when it
 // starts, so a person claimed but not reached still gets a lookup when their
 // page is opened (PersonRefreshDue).
-func (r *PersonRepository) ClaimRefreshCandidates(ctx context.Context, limit int) ([]int64, error) {
+func (r *PersonRepository) ClaimRefreshCandidates(ctx context.Context, limit int) ([]int64, error) { //nolint:funlen // upstream ClaimRefreshCandidates exceeds Vio's 100-line limit; refactor tracked separately
 	if limit <= 0 {
 		return []int64{}, nil
 	}

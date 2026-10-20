@@ -29,7 +29,7 @@ import (
 // profile. It reads its own account's requests, as every household profile
 // does, but neither reads nor cancels another account's, which the admin
 // request queue already refuses it. The primary profile keeps admin reach.
-func TestRequestRoutesFollowActingAdminDB(t *testing.T) {
+func TestRequestRoutesFollowActingAdminDB(t *testing.T) { //nolint:funlen // upstream TestRequestRoutesFollowActingAdminDB exceeds Vio's 100-line limit; refactor tracked separately
 	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("SILO_TEST_DATABASE_URL is not set")

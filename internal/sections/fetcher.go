@@ -582,7 +582,7 @@ func (f *Fetcher) fetchContinueWatchingSection(ctx context.Context, resolved Res
 	// With new releases first, a series finished before all of them still
 	// leads the row when its next episode was just released, so the lookup is
 	// not bounded.
-	if combined {
+	if combined { //nolint:nestif // upstream fetchContinueWatchingSection in fetcher.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
 		newReleasesFirst := NextUpNewReleasesFirst(ctx, store, profileID)
 		var since *time.Time
 		if !newReleasesFirst {

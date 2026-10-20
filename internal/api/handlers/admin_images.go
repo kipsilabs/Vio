@@ -225,7 +225,7 @@ func (h *AdminImageHandler) GetAdminItemImages(ctx context.Context, contentID st
 	return h.listItemImages(ctx, contentID, true)
 }
 
-func (h *AdminImageHandler) listItemImages(ctx context.Context, contentID string, includeLocal bool) (AdminItemImagesView, error) {
+func (h *AdminImageHandler) listItemImages(ctx context.Context, contentID string, includeLocal bool) (AdminItemImagesView, error) { //nolint:funlen // upstream listItemImages exceeds Vio's 100-line limit; refactor tracked separately
 	resolved, err := h.resolveContentID(ctx, contentID)
 	if err != nil {
 		if errors.Is(err, catalog.ErrItemNotFound) {
@@ -298,7 +298,7 @@ func (h *AdminImageHandler) listItemImages(ctx context.Context, contentID string
 	for _, img := range images {
 		displayURL := img.URL
 		providerID := img.ProviderID
-		if withLocal && metadata.IsLocalImageSource(img.URL) {
+		if withLocal && metadata.IsLocalImageSource(img.URL) { //nolint:nestif // upstream listItemImages in admin_images.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
 			// A file the picker cannot preview could not be applied either:
 			// both read it under the same confinement and size checks. Report
 			// the failure so the admin can tell why the choice is missing.

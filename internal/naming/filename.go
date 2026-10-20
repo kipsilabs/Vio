@@ -342,7 +342,7 @@ func collapseWhitespace(value string) string {
 
 // deriveSeriesRoot finds the show folder above filePath. fileTitle is the
 // series title parsed from the file name, if any.
-func deriveSeriesRoot(filePath, fileTitle string, hasEpisodePattern bool, forceParent bool, libraryRoot string) (*SeriesRoot, bool) {
+func deriveSeriesRoot(filePath, fileTitle string, hasEpisodePattern bool, forceParent bool, libraryRoot string) (*SeriesRoot, bool) { //nolint:gocyclo // upstream deriveSeriesRoot exceeds Vio's complexity-30 limit; refactor tracked separately
 	parentDir := path.Dir(filePath)
 	fileStem := strings.TrimSuffix(path.Base(filePath), path.Ext(filePath))
 	bareSeason := ""

@@ -68,7 +68,7 @@ func (f *identityRetryFixture) transport(t *testing.T, metadata func(*http.Reque
 	f.service.http.Transport = transportFunc(func(r *http.Request) (*http.Response, error) {
 		path := r.URL.Path
 		f.calls[path] = append(f.calls[path], time.Now())
-		if path == "/.well-known/openid-configuration" || path == "/keys" {
+		if path == "/.well-known/openid-configuration" || path == "/keys" { //nolint:nestif // upstream transport in identity_retry_test.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
 			if r.Method != http.MethodGet || r.Header.Get("Authorization") != "" || r.URL.RawQuery != "" {
 				t.Fatal("identity metadata request carried credentials or used a different method")
 			}
@@ -162,7 +162,7 @@ func TestLoginRetriesTransientIdentityMetadata(t *testing.T) {
 	}
 }
 
-func TestLoginIdentityRetryHonorsRetryAfterAndExhaustion(t *testing.T) {
+func TestLoginIdentityRetryHonorsRetryAfterAndExhaustion(t *testing.T) { //nolint:gocyclo // upstream TestLoginIdentityRetryHonorsRetryAfterAndExhaustion exceeds Vio's complexity-30 limit; refactor tracked separately
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		t.Fatal(err)

@@ -21,7 +21,7 @@ import (
 // notification must leave a pending test to the request that enqueued it.
 // Repeating the test beside the delivery's own attempt must not collide on the
 // attempt key, and none of it touches the inbox.
-func TestSendPushTestCarriesTheProfilesNewestNotification(t *testing.T) {
+func TestSendPushTestCarriesTheProfilesNewestNotification(t *testing.T) { //nolint:funlen // upstream TestSendPushTestCarriesTheProfilesNewestNotification exceeds Vio's 100-line limit; refactor tracked separately
 	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("SILO_TEST_DATABASE_URL is not set")

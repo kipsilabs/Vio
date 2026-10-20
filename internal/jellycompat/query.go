@@ -127,7 +127,7 @@ func parseItemsQuery(r *http.Request, codec *ResourceIDCodec) itemsQuery {
 	}
 
 	// Every repeated Ids value counts, as in idsRequestCollectionsView.
-	if ids := splitCommaValues(q.Values("Ids")); len(ids) > 0 {
+	if ids := splitCommaValues(q.Values("Ids")); len(ids) > 0 { //nolint:nestif // upstream parseItemsQuery in query.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
 		keepsRouting := false
 		for _, raw := range ids {
 			if decoded, err := decodeItemID(codec, raw); err == nil && decoded != "" {

@@ -181,7 +181,7 @@ func (s *PersonRefreshService) refreshPersonSince(
 // started after it. resolve supplies the providers once the attempt is
 // recorded, so a failure to resolve them is a failed lookup that backs off
 // like any other.
-func (s *PersonRefreshService) refreshPerson(
+func (s *PersonRefreshService) refreshPerson( //nolint:funlen,gocyclo // upstream refreshPerson exceeds Vio's 100-line and complexity-30 limits; refactor tracked separately
 	ctx context.Context,
 	id int64,
 	resolve func(context.Context) ([]Provider, error),

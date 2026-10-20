@@ -1343,7 +1343,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 	}
 	// Ratings, favorites, watchlist, progress and watched-state writes rebuild
 	// the profile's recommendations when they are enabled.
-	if deps.RecWorker != nil {
+	if deps.RecWorker != nil { //nolint:nestif // upstream newChiRouter in router.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
 		if ratingsHandler != nil {
 			ratingsHandler.SetSignalsChangedNotifier(deps.RecWorker)
 		}

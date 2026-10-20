@@ -97,7 +97,7 @@ func scopedRecoveryDB(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
-func TestScopedAdminKeyCannotRedirectRecoveryDB(t *testing.T) {
+func TestScopedAdminKeyCannotRedirectRecoveryDB(t *testing.T) { //nolint:funlen,gocyclo // upstream TestScopedAdminKeyCannotRedirectRecoveryDB exceeds Vio's 100-line and complexity-30 limits; refactor tracked separately
 	// A private schema keeps the Owner cases independent of existing accounts
 	// and other packages running against the same database.
 	pool := scopedRecoveryDB(t)
@@ -168,7 +168,7 @@ func TestScopedAdminKeyCannotRedirectRecoveryDB(t *testing.T) {
 				if version == "v1" {
 					wantStatus = http.StatusOK
 				}
-				if owner {
+				if owner { //nolint:nestif // upstream TestScopedAdminKeyCannotRedirectRecoveryDB in admin_scoped_email_db_test.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
 					if metadata.Code != wantStatus {
 						t.Fatalf("metadata update: %d %s", metadata.Code, metadata.Body)
 					}

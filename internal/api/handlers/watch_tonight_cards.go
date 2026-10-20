@@ -298,7 +298,7 @@ func (h *RecommendationsHandler) swipeCards(ctx context.Context, candidates []me
 			}
 		}
 
-		if epMeta, ok := enriched.episodeMeta[m.scored.MediaItemID]; ok {
+		if epMeta, ok := enriched.episodeMeta[m.scored.MediaItemID]; ok { //nolint:nestif // upstream swipeCards in watch_tonight_cards.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
 			if epMeta.SeriesID != nil && item.SeriesID == "" {
 				item.SeriesID = *epMeta.SeriesID
 			}

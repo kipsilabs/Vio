@@ -222,7 +222,7 @@ func (s *MetadataService) reapplyLocalSeriesChildren(
 	}
 	showFiles := showFilePaths(childCtx.episodeFilePaths)
 	seasonResults := make(map[int]*SeasonResult)
-	if len(changedSeasons) > 0 {
+	if len(changedSeasons) > 0 { //nolint:nestif // upstream reapplyLocalSeriesChildren in local_reapply.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
 		seasonDirs := make(map[int][]string, len(changedSeasons))
 		for _, number := range changedSeasons {
 			seasonDirs[number] = childCtx.seasonDirectoryPaths[number]

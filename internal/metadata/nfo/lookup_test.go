@@ -43,7 +43,7 @@ func movieRequest(dir, file string, sidecarDirs ...string) metadata.MetadataRequ
 	}
 }
 
-func TestFindItemNFO_Lookup(t *testing.T) {
+func TestFindItemNFO_Lookup(t *testing.T) { //nolint:funlen // upstream TestFindItemNFO_Lookup exceeds Vio's 100-line limit; refactor tracked separately
 	t.Parallel()
 
 	tests := []struct {

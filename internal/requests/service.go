@@ -527,7 +527,7 @@ func (s *Service) resolveRouterConnections(ctx context.Context, fc *fulfillConte
 		// in.APIKeyRef was decrypted by the repo on read; empty means unconfigured.
 		apiKey := strings.TrimSpace(in.APIKeyRef)
 		baseURL := in.BaseURL
-		if isVirtualIntegration(in.InstallationID, in.CapabilityID) {
+		if isVirtualIntegration(in.InstallationID, in.CapabilityID) { //nolint:nestif // upstream resolveRouterConnections in service.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
 			// The core virtual library has no plugin credentials to declare;
 			// it always carries the core-managed placeholders.
 			if apiKey == "" {

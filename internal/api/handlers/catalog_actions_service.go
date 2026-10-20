@@ -209,7 +209,7 @@ func (h *MetadataAIHandler) TranslateOnView(ctx context.Context, filter catalog.
 			return nil, limited
 		}
 	}
-	if h.Pending != nil {
+	if h.Pending != nil { //nolint:nestif // upstream TranslateOnView in catalog_actions_service.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
 		// Only the language this viewer's detail page reports missing may be
 		// queued; anything else would let any profile spend the provider
 		// budget on languages nobody reads.

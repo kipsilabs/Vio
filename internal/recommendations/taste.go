@@ -192,7 +192,7 @@ func (e *Engine) purgeIfProfileDeleted(ctx context.Context, userID int, profileI
 // started, database time, before any of its signal reads. The profile is
 // stored as updated at started, so a stale mark set while it reads stays newer
 // than the profile and the stale sweep refreshes it again.
-func (e *Engine) rebuildTasteProfile(ctx context.Context, userID int, profileID string, started time.Time) (bool, error) {
+func (e *Engine) rebuildTasteProfile(ctx context.Context, userID int, profileID string, started time.Time) (bool, error) { //nolint:funlen,gocyclo // upstream rebuildTasteProfile exceeds Vio's 100-line and complexity-30 limits; refactor tracked separately
 	store, err := e.storeProvider.ForUser(ctx, userID)
 	if err != nil {
 		return false, fmt.Errorf("get user store for user %d: %w", userID, err)
