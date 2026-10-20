@@ -2683,7 +2683,7 @@ func (h *ItemsHandler) resolveWatchedTargets(ctx context.Context, contentID stri
 			if h.episodeRepo == nil {
 				return "", nil, catalog.ErrItemNotFound
 			}
-			episodes, err := h.episodeRepo.ListBySeasonID(ctx, season.ContentID)
+			episodes, err := h.seasonEpisodesForRead(ctx, season.SeriesID, season.SeasonNumber)
 			if err != nil {
 				return "", nil, err
 			}

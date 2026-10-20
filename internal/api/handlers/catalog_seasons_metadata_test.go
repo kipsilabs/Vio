@@ -11,9 +11,13 @@ import (
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/access"
+	"github.com/Silo-Server/silo-server/internal/api/middleware"
+	"github.com/Silo-Server/silo-server/internal/auth"
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/scanner"
+	"github.com/Silo-Server/silo-server/internal/userstore/pgstore"
+	"github.com/Silo-Server/silo-server/internal/watchstate"
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -340,6 +344,108 @@ func TestSeriesSeasonsKeepsMetadataOnlySeasons(t *testing.T) {
 	}
 	if len(syntheticSeason2Episodes) != 2 {
 		t.Fatalf("synthetic season 2 episodes = %d, want 2", len(syntheticSeason2Episodes))
+	}
+
+	// The public item-detail enrichment must agree with the season reads for
+	// linked, partly linked, unlinked, metadata-only, and synthetic seasons.
+	var userID int
+	if err := pool.QueryRow(ctx, `INSERT INTO users (username,role) VALUES ($1,'user') RETURNING id`, prefix+"-viewer").Scan(&userID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DELETE FROM users WHERE id=$1`, userID) })
+	profileID := fmt.Sprintf("00000000-0000-4000-8002-%012d", time.Now().UnixNano()%1_000_000_000_000)
+	if _, err := pool.Exec(ctx, `INSERT INTO user_profiles (id,user_id,name) VALUES ($1,$2,'Season metadata viewer')`, profileID, userID); err != nil {
+		t.Fatal(err)
+	}
+	provider := pgstore.NewPostgresProvider(pool)
+	store, err := provider.ForUser(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	watched := func(id string) {
+		t.Helper()
+		if err := store.SetProgressAt(ctx, profileID, id, 1500, 1500, true, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	resuming := func(id string) {
+		t.Helper()
+		if err := store.SetProgressAt(ctx, profileID, id, 300, 1500, false, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Season 2 is partly linked: these episodes have files but no season_id,
+	// so the old season-row rollup would report no state.
+	watched(episodeID(2, 3))
+	resuming(episodeID(2, 4))
+	// Metadata-only seasons have no availability rollup entry.
+	watched(episodeID(3, 1))
+	resuming(episodeID(3, 2))
+	// Fully unlinked but materialized.
+	watched(episodeID(4, 1))
+	watched(episodeID(4, 2))
+	// Synthetic season without a season row: one available episode watched.
+	watched(syntheticEpisodeID(1, 1))
+	// Synthetic metadata-only season: one metadata episode watched.
+	watched(syntheticEpisodeID(2, 1))
+
+	items.storeProvider = provider
+	authCtx := middleware.SetClaims(ctx, &auth.Claims{UserID: userID, Role: "user"})
+	authViewer := ItemViewer{ProfileID: profileID}
+	for _, tc := range []struct {
+		name       string
+		id         string
+		watched    int
+		inProgress int
+		unplayed   int
+		played     bool
+	}{
+		{"partly linked detail", seasonID(2), 1, 1, 3, false},
+		{"metadata-only detail", seasonID(3), 1, 1, 1, false},
+		{"unlinked materialized detail", seasonID(4), 2, 0, 0, true},
+		{"synthetic available detail", syntheticPrefix + "-S01", 1, 0, 1, false},
+		{"synthetic metadata-only detail", syntheticPrefix + "-S02", 1, 0, 1, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			detail, err := h.ItemDetail(authCtx, authViewer, tc.id)
+			if err != nil {
+				t.Fatalf("item detail: %v", err)
+			}
+			if detail.SeasonUserData == nil {
+				t.Fatal("season user_data is nil")
+			}
+			got := *detail.SeasonUserData
+			if got.WatchedCount != tc.watched || got.InProgressCount != tc.inProgress || got.UnplayedCount != tc.unplayed || got.Played != tc.played {
+				t.Fatalf("season user_data = %+v, want watched=%d in_progress=%d unplayed=%d played=%v",
+					got, tc.watched, tc.inProgress, tc.unplayed, tc.played)
+			}
+		})
+	}
+
+	// Marking a partly linked season watched must act on every episode the
+	// season reads expose, not only the season-row-linked subset.
+	items.watchState = watchstate.NewService(provider)
+	authFilter := catalog.AccessFilter{UserID: userID, ProfileID: profileID}
+	if _, err := items.SetWatchedState(authCtx, userID, profileID, seasonID(2), true, authFilter); err != nil {
+		t.Fatalf("mark partly linked season watched: %v", err)
+	}
+	marked, err := h.ItemDetail(authCtx, authViewer, seasonID(2))
+	if err != nil {
+		t.Fatalf("detail after watched mutation: %v", err)
+	}
+	if marked.SeasonUserData == nil || marked.SeasonUserData.WatchedCount != 4 || !marked.SeasonUserData.Played {
+		t.Fatalf("partly linked season watched state = %+v, want all 4 episodes watched", marked.SeasonUserData)
+	}
+	if _, err := items.SetWatchedState(authCtx, userID, profileID, seasonID(2), false, authFilter); err != nil {
+		t.Fatalf("mark partly linked season unwatched: %v", err)
+	}
+	unmarked, err := h.ItemDetail(authCtx, authViewer, seasonID(2))
+	if err != nil {
+		t.Fatalf("detail after unwatched mutation: %v", err)
+	}
+	if unmarked.SeasonUserData == nil || unmarked.SeasonUserData.WatchedCount != 0 || unmarked.SeasonUserData.InProgressCount != 0 || unmarked.SeasonUserData.Played {
+		t.Fatalf("partly linked season unwatched state = %+v, want no progress", unmarked.SeasonUserData)
 	}
 
 	if _, err := h.SeriesSeason(ctx, viewer, prefix, 9); err == nil {
