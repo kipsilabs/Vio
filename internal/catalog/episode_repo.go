@@ -972,6 +972,38 @@ func (r *EpisodeRepository) ListSeasons(ctx context.Context, seriesID string) ([
 	return seasons, nil
 }
 
+// ListMetadataSeasons is ListSeasons without the library-availability filter:
+// it summarizes every season the episodes table knows, including seasons whose
+// candidates a library has not materialized. Series pages use it to keep
+// metadata-only seasons visible instead of letting an empty episode_libraries
+// join hide them.
+func (r *EpisodeRepository) ListMetadataSeasons(ctx context.Context, seriesID string) ([]SeasonSummary, error) {
+	query := `SELECT season_number, COUNT(*) AS episode_count
+		FROM episodes
+		WHERE series_id = $1
+		GROUP BY season_number
+		ORDER BY season_number ASC`
+
+	rows, err := r.pool.Query(ctx, query, seriesID)
+	if err != nil {
+		return nil, fmt.Errorf("listing metadata seasons: %w", err)
+	}
+	defer rows.Close()
+
+	var seasons []SeasonSummary
+	for rows.Next() {
+		var s SeasonSummary
+		if err := rows.Scan(&s.SeasonNumber, &s.EpisodeCount); err != nil {
+			return nil, fmt.Errorf("scanning metadata season summary: %w", err)
+		}
+		seasons = append(seasons, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating metadata season summaries: %w", err)
+	}
+	return seasons, nil
+}
+
 // CountBySeries returns the number of episodes for a given series.
 func (r *EpisodeRepository) CountBySeries(ctx context.Context, seriesID string) (int, error) {
 	var count int
@@ -999,6 +1031,26 @@ func (r *EpisodeRepository) ListBySeason(ctx context.Context, seriesID string, s
 	rows, err := r.pool.Query(ctx, query, seriesID, seasonNum)
 	if err != nil {
 		return nil, fmt.Errorf("listing episodes by season: %w", err)
+	}
+	defer rows.Close()
+
+	return scanEpisodes(rows)
+}
+
+// ListMetadataBySeason is ListBySeason without the library-availability filter:
+// it returns every metadata episode of a season, including episodes whose
+// candidates a library has not materialized. A season read uses it only when
+// the available list is empty, so a metadata-only season answers with its
+// episodes (no playable files) instead of disappearing or 404ing.
+func (r *EpisodeRepository) ListMetadataBySeason(ctx context.Context, seriesID string, seasonNum int) ([]*models.Episode, error) {
+	query := `SELECT ` + episodeColumns + `
+		FROM episodes
+		WHERE series_id = $1 AND season_number = $2
+		ORDER BY episode_number ASC`
+
+	rows, err := r.pool.Query(ctx, query, seriesID, seasonNum)
+	if err != nil {
+		return nil, fmt.Errorf("listing metadata episodes by season: %w", err)
 	}
 	defer rows.Close()
 

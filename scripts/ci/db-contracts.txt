@@ -420,3 +420,8 @@
 # Explore all on a row the catalog cannot express as a query pages the row's
 # own fetch past its item limit, on Home and on its library page.
 ./internal/api/handlers TestCatalogRowBackedSectionBrowseDB
+
+# Every season read selects episodes by (series_id, season_number), so a fully
+# unlinked, partly linked, metadata-only, or file-backed season answers the same
+# set from the series count, season page, item episodes, and season detail.
+./internal/api/handlers TestSeriesSeasonsKeepsMetadataOnlySeasons
