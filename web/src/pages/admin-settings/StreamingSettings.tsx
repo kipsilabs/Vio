@@ -296,7 +296,6 @@ export default function StreamingSettings() {
         <FieldGroup label="Virtual libraries" dirty={anyDirty(LIBRARY_KEYS)}>
           <SettingField
             label="Movies library"
-            settingKey="virtual_library.movie_library_id"
             type={movieSelectOptions.length > 0 ? "select" : "number"}
             options={movieSelectOptions.length > 0 ? movieSelectOptions : undefined}
             description="Virtual movies library (virtual://movies) holding provider titles."
@@ -306,7 +305,6 @@ export default function StreamingSettings() {
           />
           <SettingField
             label="Series library"
-            settingKey="virtual_library.series_library_id"
             type={seriesSelectOptions.length > 0 ? "select" : "number"}
             options={seriesSelectOptions.length > 0 ? seriesSelectOptions : undefined}
             description="Virtual series library (virtual://series) holding provider episodes."

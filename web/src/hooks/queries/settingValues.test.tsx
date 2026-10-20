@@ -15,7 +15,6 @@ import {
   useSetSettingValue,
   useSettingValue,
   useSettingsCapabilities,
-  useSettingValue,
   useStoredSettingValues,
 } from "./settingValues";
 

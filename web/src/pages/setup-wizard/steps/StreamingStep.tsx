@@ -152,7 +152,6 @@ export function StreamingStep() {
             />
             <SettingField
               label="Movies library"
-              settingKey="virtual_library.movie_library_id"
               type={movieSelectOptions.length > 0 ? "select" : "number"}
               options={movieSelectOptions.length > 0 ? movieSelectOptions : undefined}
               description="Virtual movies library (virtual://movies) that holds provider titles."
@@ -161,7 +160,6 @@ export function StreamingStep() {
             />
             <SettingField
               label="Series library"
-              settingKey="virtual_library.series_library_id"
               type={seriesSelectOptions.length > 0 ? "select" : "number"}
               options={seriesSelectOptions.length > 0 ? seriesSelectOptions : undefined}
               description="Virtual series library (virtual://series) that holds provider episodes."
