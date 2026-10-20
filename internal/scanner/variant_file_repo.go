@@ -29,15 +29,12 @@ type VariantFile struct {
 	PresentationPartTotal int
 	MultiEpisodeStart     int
 	MultiEpisodeEnd       int
-	ReleaseName           string
-	ReleaseGroup          string
 }
 
 const variantFileColumns = `id, content_id, episode_id, file_path,
 	edition_raw, edition_key, edition_confidence, edition_source,
 	presentation_kind, presentation_group_key, presentation_part_index, presentation_part_total,
-	multi_episode_start, multi_episode_end,
-	release_name, release_group`
+	multi_episode_start, multi_episode_end`
 
 const (
 	// variantOwnerLookupChunk caps the owner ids sent in one query.
@@ -140,8 +137,6 @@ func (r *FileRepository) UpdateVariantMetadata(ctx context.Context, folderID int
 		partTotal := make([]*int, len(chunk))
 		multiStart := make([]*int, len(chunk))
 		multiEnd := make([]*int, len(chunk))
-		releaseName := make([]string, len(chunk))
-		releaseGroup := make([]string, len(chunk))
 		for i, file := range chunk {
 			ids[i] = int64(file.ID)
 			paths[i] = file.FilePath
@@ -155,8 +150,6 @@ func (r *FileRepository) UpdateVariantMetadata(ctx context.Context, folderID int
 			partTotal[i] = nilIfZero(file.PresentationPartTotal)
 			multiStart[i] = nilIfZero(file.MultiEpisodeStart)
 			multiEnd[i] = nilIfZero(file.MultiEpisodeEnd)
-			releaseName[i] = file.ReleaseName
-			releaseGroup[i] = file.ReleaseGroup
 		}
 		tag, err := r.pool.Exec(ctx, `
 			UPDATE media_files AS mf SET
@@ -170,31 +163,26 @@ func (r *FileRepository) UpdateVariantMetadata(ctx context.Context, folderID int
 				presentation_part_total = u.presentation_part_total,
 				multi_episode_start = u.multi_episode_start,
 				multi_episode_end = u.multi_episode_end,
-				release_name = u.release_name,
-				release_group = u.release_group,
 				updated_at = NOW()
 			FROM unnest(
 				$2::bigint[], $3::text[], $4::text[], $5::text[], $6::double precision[], $7::text[],
-				$8::text[], $9::text[], $10::integer[], $11::integer[], $12::integer[], $13::integer[],
-				$14::text[], $15::text[]
+				$8::text[], $9::text[], $10::integer[], $11::integer[], $12::integer[], $13::integer[]
 			) AS u(id, file_path, edition_raw, edition_key, edition_confidence, edition_source,
 				presentation_kind, presentation_group_key, presentation_part_index, presentation_part_total,
-				multi_episode_start, multi_episode_end, release_name, release_group)
+				multi_episode_start, multi_episode_end)
 			WHERE mf.id = u.id
 			  AND mf.media_folder_id = $1
 			  AND mf.file_path = u.file_path
 			  AND mf.missing_since IS NULL
 			  AND (mf.edition_raw, mf.edition_key, mf.edition_confidence, mf.edition_source,
 				mf.presentation_kind, mf.presentation_group_key, mf.presentation_part_index, mf.presentation_part_total,
-				mf.multi_episode_start, mf.multi_episode_end,
-				mf.release_name, mf.release_group)
+				mf.multi_episode_start, mf.multi_episode_end)
 				IS DISTINCT FROM
 				(u.edition_raw, u.edition_key, u.edition_confidence, u.edition_source,
 				u.presentation_kind, u.presentation_group_key, u.presentation_part_index, u.presentation_part_total,
-				u.multi_episode_start, u.multi_episode_end, u.release_name, u.release_group)`,
+				u.multi_episode_start, u.multi_episode_end)`,
 			folderID, ids, paths, editionRaw, editionKey, editionConfidence, editionSource,
-			presentationKind, presentationGroupKey, partIndex, partTotal, multiStart, multiEnd,
-			releaseName, releaseGroup)
+			presentationKind, presentationGroupKey, partIndex, partTotal, multiStart, multiEnd)
 		if err != nil {
 			return updated, fmt.Errorf("updating variant metadata: %w", err)
 		}
@@ -213,13 +201,12 @@ func scanVariantFiles(rows pgx.Rows) ([]VariantFile, error) {
 			editionRaw, editionKey, editionSource      *string
 			presentationKind, presentationGroupKey     *string
 			partIndex, partTotal, multiStart, multiEnd *int
-			releaseName, releaseGroup                  *string
 		)
 		if err := rows.Scan(
 			&file.ID, &contentID, &episodeID, &file.FilePath,
 			&editionRaw, &editionKey, &file.EditionConfidence, &editionSource,
 			&presentationKind, &presentationGroupKey, &partIndex, &partTotal,
-			&multiStart, &multiEnd, &releaseName, &releaseGroup,
+			&multiStart, &multiEnd,
 		); err != nil {
 			return nil, fmt.Errorf("scanning variant file: %w", err)
 		}
@@ -234,8 +221,6 @@ func scanVariantFiles(rows pgx.Rows) ([]VariantFile, error) {
 		file.PresentationPartTotal = intPtrValue(partTotal)
 		file.MultiEpisodeStart = intPtrValue(multiStart)
 		file.MultiEpisodeEnd = intPtrValue(multiEnd)
-		file.ReleaseName = stringPtrValue(releaseName)
-		file.ReleaseGroup = stringPtrValue(releaseGroup)
 		files = append(files, file)
 	}
 	if err := rows.Err(); err != nil {

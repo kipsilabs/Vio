@@ -470,7 +470,24 @@ func inspectSourceFrame(ctx context.Context, request SourcePreflightRequest, pos
 // frameMatchesSourceKind requires decoded-frame metadata compatible with the
 // frozen base-signal classification; remote and virtual sources may omit
 // individual fields, so completeness is not demanded here.
+// hasDolbyVisionMetadata reports whether the decoder attached a parsed RPU,
+// which FFprobe labels "Dolby Vision Metadata".
+func (frame preflightFrame) hasDolbyVisionMetadata() bool {
+	for _, sideData := range frame.SideData {
+		if strings.EqualFold(strings.TrimSpace(sideData.Type), "Dolby Vision Metadata") {
+			return true
+		}
+	}
+	return false
+}
+
 func frameMatchesSourceKind(frame preflightFrame, kind SourceKind) bool {
+	if kind == SourceDolbyVision {
+		return frame.hasDolbyVisionMetadata() && transferIsPQ(normalizeColorValue(frame.ColorTransfer))
+	}
+	// Vio keeps the relaxed compatibility check for other source kinds so
+	// remote and virtual inputs whose decoder omits complete color metadata
+	// can still pass preflight.
 	_, compatible := sourceMetadataCompatibility(kind, SourceMetadata{
 		ColorRange: frame.ColorRange, ColorPrimaries: frame.ColorPrimaries,
 		ColorTransfer: frame.ColorTransfer, ColorSpace: frame.ColorSpace,

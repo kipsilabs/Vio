@@ -62,13 +62,6 @@ func newVariantCandidates(files []VariantFile, folder *models.MediaFolder) []var
 		hints := variantHintsForFile(&files[i], folder)
 		if hints == nil {
 			hints = &naming.VariantHints{}
-		} else if files[i].EditionSource == editionSourceImport && files[i].EditionKey != "" {
-			// The import override pins only the edition fields; release
-			// name/group still come from the filename.
-			if releaseHints := naming.ParseVariantHints(files[i].FilePath, folder.Type, folder.Paths...); releaseHints != nil {
-				hints.ReleaseName = releaseHints.ReleaseName
-				hints.ReleaseGroup = releaseHints.ReleaseGroup
-			}
 		}
 		candidates = append(candidates, variantCandidate{
 			file:     files[i],
@@ -230,10 +223,6 @@ func variantMetadataUpdates(candidates []variantCandidate) []VariantFile {
 		updated.PresentationPartTotal = partTotal
 		updated.MultiEpisodeStart = hints.MultiEpisodeStart
 		updated.MultiEpisodeEnd = hints.MultiEpisodeEnd
-		// Release name/group come from the filename itself; newVariantCandidates
-		// leaves the import edition override untouched and re-parses them there.
-		updated.ReleaseName = hints.ReleaseName
-		updated.ReleaseGroup = hints.ReleaseGroup
 		updates = append(updates, updated)
 	}
 	sort.Slice(updates, func(i, j int) bool { return updates[i].ID < updates[j].ID })
@@ -333,9 +322,7 @@ func variantMetadataChanged(file *VariantFile, hints *naming.VariantHints, partT
 		file.PresentationPartIndex != hints.PresentationPartIndex ||
 		file.PresentationPartTotal != partTotal ||
 		file.MultiEpisodeStart != hints.MultiEpisodeStart ||
-		file.MultiEpisodeEnd != hints.MultiEpisodeEnd ||
-		file.ReleaseName != hints.ReleaseName ||
-		file.ReleaseGroup != hints.ReleaseGroup {
+		file.MultiEpisodeEnd != hints.MultiEpisodeEnd {
 		return true
 	}
 	switch {
