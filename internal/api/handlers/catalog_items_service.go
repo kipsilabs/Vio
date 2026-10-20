@@ -470,8 +470,8 @@ func (h *ItemsHandler) seasonEpisodesForRead(ctx context.Context, seriesID strin
 }
 
 // episodesAllLinkedToSeason reports whether every listed episode carries this
-// season row's season_id, so a rollup keyed by that row covers the same set
-// the reader returned.
+// season row's season_id, so a rollup keyed by that row can cover the same set
+// when it has a row for the season.
 func episodesAllLinkedToSeason(episodes []*models.Episode, seasonID string) bool {
 	if len(episodes) == 0 {
 		return false
@@ -567,13 +567,24 @@ func (h *CatalogResourceHandler) seriesSeasons(ctx context.Context, v ItemViewer
 				if episodeCount == 0 {
 					episodeCount = metadataCounts[s.SeasonNumber]
 				}
+				// A metadata-only season has no availability rollup entry. Fold
+				// the metadata episodes so its card reports the same historical
+				// progress as its season page and episode list.
+				seasonUserData := userData[s.SeasonNumber]
+				if episodeCounts[s.SeasonNumber] == 0 && episodeCount > 0 {
+					episodes, err := h.items.episodeRepo.ListMetadataBySeason(ctx, id, s.SeasonNumber)
+					if err != nil {
+						return nil, apiError(http.StatusInternalServerError, "internal_error", failed)
+					}
+					seasonUserData = h.items.getAggregateUserData(ctx, v, episodes)
+				}
 				// Construct metadata without resolving each season again.
 				season := *s
 				season.PosterPath = ""
 				if !includeArtwork {
 					season.PosterThumbhash = ""
 				}
-				sr := h.items.localizedSeasonResponse(ctx, v, &season, episodeCount, userData[s.SeasonNumber], filter.ImageSize)
+				sr := h.items.localizedSeasonResponse(ctx, v, &season, episodeCount, seasonUserData, filter.ImageSize)
 				sr.PosterURL = posterURLs[sizedPosterPath(s.PosterPath, filter.ImageSize)].URL
 				resp = append(resp, sr)
 			}
@@ -591,12 +602,27 @@ func (h *CatalogResourceHandler) seriesSeasons(ctx context.Context, v ItemViewer
 		if s.SeasonNumber == 0 {
 			title = specialsSeasonTitle
 		}
-		episodes, _ := h.items.episodeRepo.ListBySeason(ctx, id, s.SeasonNumber)
+		// Match the season page and episode reads: count the available set
+		// first, and fall back to the metadata total only when nothing is
+		// materialized. Use the same listed set for progress, so a synthetic
+		// season cannot report different counts or user data than its page.
+		episodes, err := h.items.episodeRepo.ListBySeason(ctx, id, s.SeasonNumber)
+		if err != nil {
+			return nil, apiError(http.StatusInternalServerError, "internal_error", failed)
+		}
+		episodeCount := len(episodes)
+		if episodeCount == 0 {
+			episodes, err = h.items.episodeRepo.ListMetadataBySeason(ctx, id, s.SeasonNumber)
+			if err != nil {
+				return nil, apiError(http.StatusInternalServerError, "internal_error", failed)
+			}
+			episodeCount = s.EpisodeCount
+		}
 		resp = append(resp, seasonResponse{
 			ContentID:    fmt.Sprintf("%s-S%02d", id, s.SeasonNumber),
 			SeasonNumber: s.SeasonNumber,
 			IsSpecials:   s.SeasonNumber == 0,
-			EpisodeCount: s.EpisodeCount,
+			EpisodeCount: episodeCount,
 			Title:        title,
 			UserData:     h.items.getAggregateUserData(ctx, v, episodes),
 		})
@@ -629,7 +655,10 @@ func (h *CatalogResourceHandler) SeriesSeason(ctx context.Context, v ItemViewer,
 			if episodesAllLinkedToSeason(episodes, season.ContentID) {
 				userData, rolledUp = h.items.parentRollupUserData(ctx, v, "season", season.ContentID)
 			}
-			if !rolledUp {
+			// The rollup has no entry for a metadata-only season. Fold the
+			// listed episodes instead, so linked and unlinked metadata-only
+			// seasons expose progress from the same set.
+			if !rolledUp || userData == nil {
 				userData = h.items.getAggregateUserData(ctx, v, episodes)
 			}
 			h.items.maybeRequestStaleSeasonMetadataRefresh(ctx, season.ContentID, episodes)

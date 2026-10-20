@@ -118,6 +118,48 @@ func TestSeriesSeasonsKeepsMetadataOnlySeasons(t *testing.T) {
 		}
 	}
 
+	// A series without season rows exercises the synthetic season list. Season
+	// 1 has ten metadata episodes but only two materialized, so its count must
+	// be the available two; season 2 has two metadata episodes and no files, so
+	// its count must be the metadata total.
+	syntheticPrefix := prefix + "-synthetic"
+	if _, err := pool.Exec(ctx, `INSERT INTO media_items(content_id,type,title,genres,default_metadata_language) VALUES($1,'series','Synthetic Series Without Season Rows','{}','en')`, syntheticPrefix); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO media_item_libraries(content_id,media_folder_id) VALUES($1,$2)`, syntheticPrefix, library); err != nil {
+		t.Fatal(err)
+	}
+	syntheticEpisodeID := func(season, episode int) string {
+		return fmt.Sprintf("%s-E%02d%02d", syntheticPrefix, season, episode)
+	}
+	for episodeNumber := 1; episodeNumber <= 10; episodeNumber++ {
+		id := syntheticEpisodeID(1, episodeNumber)
+		if err := episodes.Upsert(ctx, &models.Episode{
+			ContentID: id, SeriesID: syntheticPrefix, SeasonNumber: 1,
+			EpisodeNumber: episodeNumber, Title: "Episode", DefaultMetadataLanguage: "en",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if episodeNumber > 2 {
+			continue
+		}
+		if _, err := pool.Exec(ctx, `INSERT INTO episode_libraries(episode_id,media_folder_id) VALUES($1,$2)`, id, library); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `INSERT INTO media_files(content_id,media_folder_id,file_path,file_size,resolution,episode_id) VALUES($1,$2,$3,1024,'1080p',$4)`,
+			id, library, fmt.Sprintf("/synthetic/%s.mkv", id), id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for episodeNumber := 1; episodeNumber <= 2; episodeNumber++ {
+		if err := episodes.Upsert(ctx, &models.Episode{
+			ContentID: syntheticEpisodeID(2, episodeNumber), SeriesID: syntheticPrefix, SeasonNumber: 2,
+			EpisodeNumber: episodeNumber, Title: "Episode", DefaultMetadataLanguage: "en",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
 	itemsRepo := catalog.NewItemRepository(pool)
 	files := scanner.NewFileRepository(pool)
 	detailSvc := catalog.NewDetailService(itemsRepo, episodes, seasons, catalog.NewPersonRepository(pool), files)
@@ -252,6 +294,52 @@ func TestSeriesSeasonsKeepsMetadataOnlySeasons(t *testing.T) {
 				}
 			}
 		})
+	}
+
+	synthetic, err := h.SeriesSeasons(ctx, viewer, syntheticPrefix, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(synthetic) != 2 {
+		t.Fatalf("synthetic seasons = %d, want 2", len(synthetic))
+	}
+	syntheticCounts := make(map[int]int, len(synthetic))
+	for _, season := range synthetic {
+		syntheticCounts[season.SeasonNumber] = season.EpisodeCount
+	}
+	if syntheticCounts[1] != 2 {
+		t.Fatalf("synthetic season 1 episode_count = %d, want 2 available episodes", syntheticCounts[1])
+	}
+	if syntheticCounts[2] != 2 {
+		t.Fatalf("synthetic season 2 episode_count = %d, want 2 metadata episodes", syntheticCounts[2])
+	}
+	syntheticSeason1, err := h.SeriesSeason(ctx, viewer, syntheticPrefix, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if syntheticSeason1.EpisodeCount != 2 {
+		t.Fatalf("synthetic season 1 page count = %d, want 2", syntheticSeason1.EpisodeCount)
+	}
+	syntheticSeason1Episodes, err := h.SeasonEpisodes(ctx, viewer, syntheticPrefix, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(syntheticSeason1Episodes) != 2 {
+		t.Fatalf("synthetic season 1 episodes = %d, want 2", len(syntheticSeason1Episodes))
+	}
+	syntheticSeason2, err := h.SeriesSeason(ctx, viewer, syntheticPrefix, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if syntheticSeason2.EpisodeCount != 2 {
+		t.Fatalf("synthetic season 2 page count = %d, want 2", syntheticSeason2.EpisodeCount)
+	}
+	syntheticSeason2Episodes, err := h.SeasonEpisodes(ctx, viewer, syntheticPrefix, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(syntheticSeason2Episodes) != 2 {
+		t.Fatalf("synthetic season 2 episodes = %d, want 2", len(syntheticSeason2Episodes))
 	}
 
 	if _, err := h.SeriesSeason(ctx, viewer, prefix, 9); err == nil {
