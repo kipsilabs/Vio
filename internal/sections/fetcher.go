@@ -26,6 +26,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/recommendations"
 	"github.com/Silo-Server/silo-server/internal/sections/recipes"
+	"github.com/Silo-Server/silo-server/internal/settingsresolve"
 	"github.com/Silo-Server/silo-server/internal/userstore"
 )
 
@@ -120,6 +121,11 @@ type Fetcher struct {
 	// now has onto the library watchlist before the watchlist section reads
 	// it. Nil skips promotion.
 	WatchlistPromoter catalog.WatchlistPromoter
+
+	// AdminDefaults supplies the administrator's defaults for the Next Up
+	// settings when a request carries no resolved access scope (the node's
+	// shared *config.AdminDefaults). Nil uses the contract defaults.
+	AdminDefaults settingsresolve.ServerSettings
 
 	// CollectionOwners limits a row of another profile's shared personal
 	// collection to its owner's access. Without it such a row fails.
@@ -560,7 +566,7 @@ func (f *Fetcher) fetchContinueWatchingSection(ctx context.Context, resolved Res
 	}
 
 	combined := ContinueTypeAllowsNextUp(continueType) && !resolved.SuppressNextUp &&
-		NextUpMode(ctx, store, profileID) == NextUpModeCombined
+		NextUpMode(ctx, store, f.AdminDefaults, profileID) == NextUpModeCombined
 
 	dropped := f.activeDroppedSeries(ctx, userID, profileID)
 	orderedItems, err = f.collectContinueProgressItems(ctx, store, profileID, dismissals, dropped, continueType, effectiveLibID, effectiveLibraryIDs, filter, limit, combined, orderedItems, itemMeta, completedCache,
@@ -583,7 +589,7 @@ func (f *Fetcher) fetchContinueWatchingSection(ctx context.Context, resolved Res
 	// leads the row when its next episode was just released, so the lookup is
 	// not bounded.
 	if combined { //nolint:nestif // upstream fetchContinueWatchingSection in fetcher.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
-		newReleasesFirst := NextUpNewReleasesFirst(ctx, store, profileID)
+		newReleasesFirst := NextUpNewReleasesFirst(ctx, store, f.AdminDefaults, profileID)
 		var since *time.Time
 		if !newReleasesFirst {
 			since = continueNextUpCutoff(orderedItems, itemMeta, limit)
@@ -884,7 +890,7 @@ func (f *Fetcher) fetchNextUpSection(ctx context.Context, resolved ResolvedSecti
 	}
 
 	// Only resolve if the profile's preference is "separate"
-	if NextUpMode(ctx, store, profileID) != NextUpModeSeparate {
+	if NextUpMode(ctx, store, f.AdminDefaults, profileID) != NextUpModeSeparate {
 		return emptyResult, nil
 	}
 
@@ -893,7 +899,7 @@ func (f *Fetcher) fetchNextUpSection(ctx context.Context, resolved ResolvedSecti
 		limit = 20
 	}
 
-	items, meta, err := f.fetchNextUpItems(ctx, userID, profileID, libraryID, libraryIDs, filter, limit, nil, NextUpNewReleasesFirst(ctx, store, profileID))
+	items, meta, err := f.fetchNextUpItems(ctx, userID, profileID, libraryID, libraryIDs, filter, limit, nil, NextUpNewReleasesFirst(ctx, store, f.AdminDefaults, profileID))
 	if err != nil {
 		return SectionWithItems{}, err
 	}
@@ -924,7 +930,7 @@ func (f *Fetcher) FetchNextUpItems(ctx context.Context, userID int, profileID st
 	if err != nil {
 		return nil, nil, fmt.Errorf("getting user store: %w", err)
 	}
-	return f.fetchNextUpItems(ctx, userID, profileID, libraryID, libraryIDs, filter, limit, nil, NextUpNewReleasesFirst(ctx, store, profileID))
+	return f.fetchNextUpItems(ctx, userID, profileID, libraryID, libraryIDs, filter, limit, nil, NextUpNewReleasesFirst(ctx, store, f.AdminDefaults, profileID))
 }
 
 // fetchNextUpItems is FetchNextUpItems with the profile's new-releases-first
@@ -3710,7 +3716,7 @@ func (f *Fetcher) fetchNewToLibrary(ctx context.Context, s ResolvedSection, libr
 	whereClause := "WHERE " + strings.Join(conditions, " AND ")
 
 	query := fmt.Sprintf(
-		`SELECT %s FROM %s %s ORDER BY mi.created_at DESC LIMIT $%d`,
+		`SELECT %s FROM %s %s ORDER BY mi.created_at DESC, mi.content_id ASC LIMIT $%d`,
 		itemColumns("mi"), fromClause, whereClause, argIdx,
 	)
 	args = append(args, limit)

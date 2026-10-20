@@ -136,7 +136,7 @@ describe("SeasonEpisodeGrid", () => {
     // Only episode 3 has no readable version; episode 4 still plays its
     // second file.
     expect(screen.getAllByText("Damaged file")).toHaveLength(1);
-    const card = screen.getByText("Episode title 3").closest(".media-card");
+    const card = screen.getByText("S01E03 · Episode title 3").closest(".media-card");
     expect(card).not.toBeNull();
     expect(card).toHaveTextContent("Damaged file");
   });
@@ -186,14 +186,16 @@ describe("SeasonEpisodeGrid", () => {
       </MemoryRouter>,
     );
 
-    const episodeLabel = screen.getByText("Episode 1");
+    const episodeLabel = screen.getByText("S01E01 · Pilot");
     const watchedIndicator = screen.getByLabelText("Watched");
 
-    expect(episodeLabel.parentElement).toContainElement(watchedIndicator);
+    expect(episodeLabel.closest("div.flex")).toContainElement(watchedIndicator);
     expect(watchedIndicator).toHaveAttribute("data-watched-indicator", "icon-only");
     expect(watchedIndicator.querySelector(".lucide-circle-check")).toBeTruthy();
     expect(watchedIndicator.closest(".media-card-image")).toBeNull();
-    expect(screen.getByText("Episode 2").parentElement).not.toContainElement(watchedIndicator);
+    expect(screen.getByText("S01E02 · Next").closest("div.flex")).not.toContainElement(
+      watchedIndicator,
+    );
     expect(screen.getAllByLabelText("Watched")).toHaveLength(1);
   });
   it("badges server-classified upcoming episodes and leaves released ones alone", () => {
@@ -236,7 +238,7 @@ describe("SeasonEpisodeGrid", () => {
     const upcomingBadges = screen.getAllByText("Upcoming", { exact: false });
     // Artwork overlay badge plus the meta-line label ("Upcoming · Oct 3, 2099").
     expect(upcomingBadges.length).toBeGreaterThanOrEqual(2);
-    expect(screen.getByText("Remembrance Day")).toBeTruthy();
+    expect(screen.getByText("S02E01 · Remembrance Day")).toBeTruthy();
   });
   it("caps the grid at four rows and scrolls the rest", () => {
     render(
@@ -273,7 +275,7 @@ describe("SeasonEpisodeGrid", () => {
       </MemoryRouter>,
     );
 
-    const grid = screen.getByText("Pilot").closest(".grid");
+    const grid = screen.getByText("S01E01 · Pilot").closest(".grid");
     expect(grid).not.toBeNull();
     // Two columns is the narrowest layout. A single column made the capped
     // section over two viewports tall on a phone, so it scrolled inside a
@@ -336,7 +338,7 @@ describe("SeasonEpisodeGrid", () => {
     );
     // Only the watched episode shows its overview, so only it carries the label.
     expect(screen.getAllByText("Translated by AI")).toHaveLength(1);
-    const hiddenCard = screen.getByText("Episode title 2").closest("a");
+    const hiddenCard = screen.getByText("S01E02 · Episode title 2").closest("a");
     expect(hiddenCard).not.toHaveTextContent("Translated by AI");
   });
 });

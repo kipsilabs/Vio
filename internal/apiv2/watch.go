@@ -67,7 +67,7 @@ type WatchDetail struct {
 	// candidates, and failed lookups. It does not promise additional playable
 	// versions beyond what the versions fields list.
 	HasVirtualSource  *bool  `json:"has_virtual_source,omitempty"`
-	PosterURL         string `json:"poster_url,omitempty" doc:"The item's poster, an episode's still, or an extra's parent poster, sized by image_size; for system media controls"`
+	PosterURL         string `json:"poster_url,omitempty" doc:"The item's poster, an episode's still, or a local extra's still (its parent's poster when it has none), sized by image_size; for system media controls"`
 	PosterThumbhash   string `json:"poster_thumbhash,omitempty"`
 	BackdropURL       string `json:"backdrop_url,omitempty" doc:"The item's backdrop, an episode's series backdrop, or an extra's parent backdrop, sized by image_size"`
 	BackdropThumbhash string `json:"backdrop_thumbhash,omitempty"`

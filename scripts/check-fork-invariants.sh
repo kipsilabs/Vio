@@ -34,11 +34,19 @@ if [ -z "$dispatch" ]; then
 else
   reject "virtual→plugin dispatch callers remain: $dispatch"
 fi
+if grep -Eq 'PluginHTTPProxy[[:alnum:]_.]*ResolveVirtualMedia' internal/api/router.go internal/api/virtual_media_resolver.go 2>/dev/null; then
+  reject "playback still falls back to a plugin virtual resolver"
+else
+  pass "no plugin virtual resolver fallback"
+fi
 
 # 3. Core virtual router installation (0) validates; dormant saves are 422s.
 grep -q 'id < 0' internal/apiv2/admin_requests.go \
   && pass "installation 0 validates" \
   || reject "installation 0 rejected in internal/apiv2/admin_requests.go"
+grep -Fq 'pattern:"^(0|[1-9][0-9]*)$"' internal/apiv2/admin_requests.go \
+  && pass "installation 0 passes schema validation" \
+  || reject "installation 0 rejected by the v2 options schema"
 grep -q 'ErrProviderUnavailable' internal/apiv2/admin_collections.go \
   && pass "sync provider-unavailable mapping" \
   || reject "503 mapping missing from internal/apiv2/admin_collections.go"

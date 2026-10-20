@@ -43,10 +43,24 @@
       "approved_in": "#353"
     },
     {
+      "operation_id": "createRequestIntegration",
+      "change_id": "request-property-pattern-changed",
+      "fingerprint": "a00d04842eb7497c79e8c962fb356d518d0fddf943c8b6cf5b425cc957441e15",
+      "reason": "The v2 integration schema accepts canonical installation ID 0, the reserved core virtual router, and still rejects leading-zero padding. Vio clients probe installation 0 from the core virtual connection.",
+      "approved_in": "#353"
+    },
+    {
+      "operation_id": "updateRequestIntegration",
+      "change_id": "request-property-pattern-changed",
+      "fingerprint": "a743034747159f0a4061f7b7bbb95d10fecf5651a08fda74a497dcd6222e9c52",
+      "reason": "The v2 integration schema accepts canonical installation ID 0, the reserved core virtual router, and still rejects leading-zero padding. Vio clients probe installation 0 from the core virtual connection.",
+      "approved_in": "#353"
+    },
+    {
       "operation_id": "loadRequestIntegrationOptions",
       "change_id": "request-property-pattern-changed",
-      "fingerprint": "041aaa12dbc71142a135e940ed1b48eb0d71ef0fd0d15a51f722669aac1cae14",
-      "reason": "Upstream tightened installation_id to reject leading zeros. IDs are canonical positive integers and clients already send them without padding.",
+      "fingerprint": "28273945749f220c8053a2cdc9b25b40392f27768e780f7c92efec13e648812a",
+      "reason": "The v2 integration schema accepts canonical installation ID 0, the reserved core virtual router, and still rejects leading-zero padding. Vio clients probe installation 0 from the core virtual connection.",
       "approved_in": "#353"
     }
   ]

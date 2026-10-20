@@ -52,7 +52,7 @@ func TestWebhookGuardedUpdatePG(t *testing.T) {
 	if !ok {
 		t.Fatal("terminator missing")
 	}
-	if _, err = scoped.Exec(ctx, "CREATE TABLE notification_webhooks ("+ddl+"\n); ALTER TABLE notification_webhooks ADD COLUMN notify_requests boolean NOT NULL DEFAULT false"); err != nil {
+	if _, err = scoped.Exec(ctx, "CREATE TABLE notification_webhooks ("+ddl+"\n); ALTER TABLE notification_webhooks ADD COLUMN notify_requests boolean NOT NULL DEFAULT false, ADD COLUMN notify_ratings boolean NOT NULL DEFAULT false"); err != nil {
 		t.Fatal(err)
 	}
 	migration, err := os.ReadFile("../../migrations/sql/20260906145619_webhook_conditional_revision.sql")

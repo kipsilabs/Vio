@@ -9,11 +9,7 @@ import CardOverlays from "@/components/overlays/CardOverlays";
 import ViewTransitionLink from "@/components/ViewTransitionLink";
 import { useEpisodeSpoilerPrefs, type EpisodeSpoilerPrefs } from "@/hooks/useEpisodeSpoilerPrefs";
 import { useOverlayPrefs } from "@/hooks/useOverlayPrefs";
-import {
-  formatCalendarDate,
-  isUpcomingEpisode,
-  useEpisodeReleaseCapability,
-} from "@/hooks/queries/episodeRelease";
+import { isUpcomingEpisode, useEpisodeReleaseCapability } from "@/hooks/queries/episodeRelease";
 import { usePrefetchCatalogItemDetail } from "@/hooks/queries/catalogRead";
 import { useDwellPrefetch } from "@/hooks/useDwellPrefetch";
 import { useGridRowCap } from "@/hooks/useGridRowCap";
@@ -22,9 +18,8 @@ import { isEpisodeStill, isEpisodeUnwatched, SPOILER_IMAGE_CLASS } from "@/lib/e
 import { overlayDataFromEpisodeListItem, type CardOverlayPrefs } from "@/lib/overlays";
 import { cn } from "@/lib/utils";
 import { EpisodeGridSkeleton } from "./SectionSkeletons";
+import EpisodeCardCaption from "./EpisodeCardCaption";
 import type { EpisodeNavigationState } from "../itemDetailLayout";
-import MachineTranslatedLabel from "./MachineTranslatedLabel";
-import { hasMachineTranslation } from "./machineTranslation";
 
 /**
  * How much of a season stays visible before the section scrolls, so a long one
@@ -212,36 +207,19 @@ function SeasonEpisodeCard({
         state={episodeLinkState}
         className="block"
       >
-        <div className="text-muted-foreground mt-2 flex items-center gap-2 text-xs">
-          <span>Episode {episode.episode_number}</span>
-          {episodeFilesUnreadable(episode) && <UnreadableFileBadge />}
-          {episode.user_data?.played && <WatchedCheckIndicator className="ml-auto" />}
-        </div>
-        <p className="text-foreground truncate text-sm font-semibold">{episodeTitle}</p>
-        <div className="mt-1.5 space-y-1">
-          <div className="text-muted-foreground flex items-center gap-2 text-xs">
-            {upcoming ? (
-              <span>
-                Upcoming{episode.air_date && ` · ${formatCalendarDate(episode.air_date)}`}
-              </span>
-            ) : (
+        <EpisodeCardCaption
+          episode={episode}
+          hideOverview={hideOverview}
+          badges={episode.user_data?.played && <WatchedCheckIndicator />}
+          notice={
+            upcoming || episodeFilesUnreadable(episode) ? (
               <>
-                {episode.runtime > 0 && <span>{episode.runtime}m</span>}
-                {episode.air_date && <span>{formatCalendarDate(episode.air_date)}</span>}
+                {upcoming && <span>Upcoming</span>}
+                {episodeFilesUnreadable(episode) && <UnreadableFileBadge />}
               </>
-            )}
-            {episode.overview &&
-              !hideOverview &&
-              hasMachineTranslation(episode.machine_translated_fields) && (
-                <MachineTranslatedLabel compact />
-              )}
-          </div>
-          {episode.overview && !hideOverview && (
-            <p className="text-muted-foreground line-clamp-2 text-xs leading-relaxed">
-              {episode.overview}
-            </p>
-          )}
-        </div>
+            ) : undefined
+          }
+        />
       </ViewTransitionLink>
     </div>
   );

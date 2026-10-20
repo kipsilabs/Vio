@@ -99,7 +99,7 @@ type AdminRequestLimitOutput struct {
 type AdminRequestIntegrationBody struct {
 	Name                string         `json:"name" minLength:"1"`
 	CapabilityID        string         `json:"capability_id" minLength:"1"`
-	InstallationID      ID             `json:"installation_id" pattern:"^[0-9]+$"`
+	InstallationID      ID             `json:"installation_id" pattern:"^(0|[1-9][0-9]*)$"`
 	SupportedMediaTypes []string       `json:"supported_media_types"`
 	PluginConfig        map[string]any `json:"plugin_config"`
 	Enabled             bool           `json:"enabled"`
@@ -150,7 +150,7 @@ type AdminRequestOptionsInput struct {
 	Body struct {
 		Name           string         `json:"name,omitempty"`
 		CapabilityID   string         `json:"capability_id,omitempty"`
-		InstallationID *ID            `json:"installation_id,omitempty" pattern:"^[1-9][0-9]*$"`
+		InstallationID *ID            `json:"installation_id,omitempty" pattern:"^(0|[1-9][0-9]*)$"`
 		BaseURL        *string        `json:"base_url,omitempty"`
 		APIKey         string         `json:"api_key_ref,omitempty" writeOnly:"true"`
 		PluginConfig   map[string]any `json:"plugin_config,omitempty"`

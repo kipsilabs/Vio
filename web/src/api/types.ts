@@ -1208,6 +1208,9 @@ export interface ItemExtra {
   title?: string;
   duration_seconds?: number;
   file_id?: number;
+  /** 16:9 image: a sidecar beside the file, or a frame of the video. */
+  still_url?: string;
+  still_thumbhash?: string;
 }
 
 /**

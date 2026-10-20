@@ -284,6 +284,18 @@ func TestAdminRequestOptionsNormalizesBaseURL(t *testing.T) {
 	}
 }
 
+// The core virtual router is installation 0. The HTTP schema must admit that
+// reserved ID while still rejecting non-canonical padded IDs.
+func TestAdminRequestOptionsAcceptsCoreVirtualInstallationZero(t *testing.T) {
+	f := fixtureAdminRequests()
+	h := adminRequestsHandler(f)
+	path := Prefix + "/admin/request-integrations/new/options"
+	if rec := do(t, h, http.MethodPost, path, `{"installation_id":"0"}`, actingRequestAdmin); rec.Code != 200 {
+		t.Fatalf("installation 0 options: %d %s", rec.Code, rec.Body.String())
+	}
+	requireProblem(t, do(t, h, http.MethodPost, path, `{"installation_id":"00"}`, actingRequestAdmin), TypeValidationFailed)
+}
+
 // A probe that leaves base_url out tests the saved address; one that sends it
 // blank clears it, which a router that needs no URL is then tested without.
 func TestAdminRequestOptionsTellsOmittedFromClearedBaseURL(t *testing.T) {

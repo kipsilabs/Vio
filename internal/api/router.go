@@ -299,9 +299,13 @@ type Dependencies struct {
 	v2Wiring               func(apiv2.Dependencies)
 	v2RouteSnapshot        func([]streamtelemetry.WalkedRoute)
 	OnServerSettingUpdated func(ctx context.Context, key, value string)
-	RequestServerRestart   func(ctx context.Context) error
-	StorageTransition      *storagetransition.Service
-	ServerRestartStatus    *handlers.ServerRestartStatusTracker
+	// AdminDefaults is the node's shared snapshot of the administrator's
+	// setting defaults. Without it the router builds one from its settings
+	// repo, which then refreshes only on its own admin writes and its TTL.
+	AdminDefaults        *config.AdminDefaults
+	RequestServerRestart func(ctx context.Context) error
+	StorageTransition    *storagetransition.Service
+	ServerRestartStatus  *handlers.ServerRestartStatusTracker
 
 	// UserCollectionSync handles per-profile imported collections (TMDB /
 	// MDBList) — the user-facing counterpart of CollectionService.
@@ -558,6 +562,16 @@ func newChiRouter(deps Dependencies) chi.Router {
 	}
 	// One reader for access.unrated_content shared by every resolver built here.
 	unratedContent := config.NewUnratedContentPolicy(settingsRepo)
+	adminDefaults := deps.AdminDefaults
+	if adminDefaults == nil {
+		// Embeddings without cmd/silo's shared instance (tests, tools) get
+		// their own, refreshed by this router's admin writes and its TTL.
+		var reader config.ManySettingReader
+		if many, ok := settingsRepo.(config.ManySettingReader); ok {
+			reader = many
+		}
+		adminDefaults = config.NewAdminDefaults(reader)
+	}
 	var accessGroupStore *access.GroupStore
 	if deps.DB != nil {
 		accessGroupStore = access.NewGroupStore(deps.DB)
@@ -699,10 +713,10 @@ func newChiRouter(deps Dependencies) chi.Router {
 		authMiddleware = apimw.NewAuthMiddleware(jwtService, sessionRepo, apiKeyRepo, userRepo)
 		if deps.UserStoreProvider != nil {
 			if deps.PolicySystem != nil {
-				viewerResolver = policy.NewViewerResolver(userRepo, deps.UserStoreProvider, profileTokenService, deps.PolicySystem.PDP(), accessGroupStore).WithUnratedContentPolicy(unratedContent)
+				viewerResolver = policy.NewViewerResolver(userRepo, deps.UserStoreProvider, profileTokenService, deps.PolicySystem.PDP(), accessGroupStore).WithUnratedContentPolicy(unratedContent).WithAdminDefaults(adminDefaults)
 			} else {
 				// Legacy resolver: proxy/test wiring without a policy system. Production integrated/api modes always take the policy path. Removed with the legacy cleanup phase.
-				viewerResolver = access.NewResolver(userRepo, deps.UserStoreProvider, profileTokenService, accessGroupStore).WithUnratedContentPolicy(unratedContent)
+				viewerResolver = access.NewResolver(userRepo, deps.UserStoreProvider, profileTokenService, accessGroupStore).WithUnratedContentPolicy(unratedContent).WithAdminDefaults(adminDefaults)
 			}
 			viewerAccessMiddleware = apimw.NewViewerAccessMiddleware(viewerResolver)
 			// Shared personal collections are limited to their owner's
@@ -1292,6 +1306,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 			// profile on its own account. Without the token service a
 			// PIN-locked primary cannot widen rather than widening unguarded.
 			settingValuesHandler.ProfileTokens = profileTokenService
+			settingValuesHandler.SetAdminDefaults(adminDefaults)
 			if deps.FolderRepo != nil {
 				settingValuesHandler.SetLibraryLookup(deps.FolderRepo)
 			} else if deps.DB != nil {
@@ -1910,15 +1925,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 				return virtualProbeCache.Lookup(sourceURL, file)
 			}
 		}
-		if deps.VirtualLibraryService != nil {
-			playbackHandler.VirtualMediaResolver = handlers.VirtualMediaResolverFunc(func(ctx context.Context, virtualURI string, ownerInstallationID int, userID int, profileID string) (string, error) {
-				return deps.VirtualLibraryService.Resolve(ctx, virtualURI)
-			})
-		} else if deps.PluginHTTPProxy != nil {
-			playbackHandler.VirtualMediaResolver = handlers.VirtualMediaResolverFunc(func(ctx context.Context, virtualURI string, ownerInstallationID int, userID int, profileID string) (string, error) {
-				return deps.PluginHTTPProxy.ResolveVirtualMedia(ctx, virtualURI)
-			})
-		}
+		wireVirtualMediaResolver(playbackHandler, deps)
 		if streamHandler != nil {
 			streamHandler.VirtualMediaResolver = playbackHandler.VirtualMediaResolver
 			streamHandler.VirtualMediaRefreshResolver = playbackHandler.VirtualMediaRefreshResolver
@@ -2452,8 +2459,13 @@ func newChiRouter(deps Dependencies) chi.Router {
 		if deps.OnUserSessionsRevoked != nil {
 			adminHandler.OnUserSessionsRevoked = deps.OnUserSessionsRevoked
 		}
-		if deps.OnServerSettingUpdated != nil {
-			adminHandler.OnServerSettingUpdated = deps.OnServerSettingUpdated
+		// Refresh the administrator defaults before the handler tells clients
+		// to re-read, so their next request already sees the new default.
+		adminHandler.OnServerSettingUpdated = func(ctx context.Context, key, value string) {
+			adminDefaults.Changed(ctx, key)
+			if deps.OnServerSettingUpdated != nil {
+				deps.OnServerSettingUpdated(ctx, key, value)
+			}
 		}
 		if deps.RecWorker != nil {
 			adminHandler.RecWorker = deps.RecWorker
@@ -2763,6 +2775,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 		sectionBulkHandler = &handlers.SectionBulkHandler{Repo: sectionRepo}
 		sectionFetcher := sections.NewFetcher(deps.DB)
 		sectionFetcher.StoreProvider = deps.UserStoreProvider
+		sectionFetcher.AdminDefaults = adminDefaults
 		sectionFetcher.CollectionOwners = collectionOwners
 		if watchlistTitles != nil {
 			sectionFetcher.WatchlistPromoter = watchlistTitles
@@ -2991,6 +3004,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 		if deps.DB != nil {
 			recsFetcher := sections.NewFetcher(deps.DB)
 			recsFetcher.StoreProvider = deps.UserStoreProvider
+			recsFetcher.AdminDefaults = adminDefaults
 			recsFetcher.CollectionOwners = collectionOwners
 			if watchlistTitles != nil {
 				recsFetcher.WatchlistPromoter = watchlistTitles

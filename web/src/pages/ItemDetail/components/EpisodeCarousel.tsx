@@ -14,12 +14,9 @@ import { usePrefetchCatalogItemDetail } from "@/hooks/queries/catalogRead";
 import { useDwellPrefetch } from "@/hooks/useDwellPrefetch";
 import { useEpisodeSpoilerPrefs } from "@/hooks/useEpisodeSpoilerPrefs";
 import { useOverlayPrefs } from "@/hooks/useOverlayPrefs";
-import {
-  formatCalendarDate,
-  isUpcomingEpisode,
-  useEpisodeReleaseCapability,
-} from "@/hooks/queries/episodeRelease";
+import { isUpcomingEpisode, useEpisodeReleaseCapability } from "@/hooks/queries/episodeRelease";
 import type { CardQuickActionMode } from "@/lib/cardQuickActions";
+import EpisodeCardCaption from "./EpisodeCardCaption";
 
 interface EpisodeCarouselProps {
   episodes: EpisodeListItem[];
@@ -41,7 +38,7 @@ export default function EpisodeCarousel({
   // keep today's plain carousel rendering.
   const { data: releaseCapability } = useEpisodeReleaseCapability();
   const releaseSupported = releaseCapability?.available ?? false;
-  const { hideImages } = useEpisodeSpoilerPrefs();
+  const { hideImages, hideOverviews } = useEpisodeSpoilerPrefs();
   const { emblaApi, emblaRef, canScrollPrev, canScrollNext, scrollPrev, scrollNext } =
     useCarouselEmbla({
       options: {
@@ -80,6 +77,7 @@ export default function EpisodeCarousel({
                 quickActionMode={quickActionMode}
                 upcoming={isUpcomingEpisode(ep, releaseSupported)}
                 hideImageIfUnwatched={hideImages}
+                hideOverviewIfUnwatched={hideOverviews}
                 onPrefetch={() => prefetchEpisodeDetail(ep.content_id)}
               />
             ))}
@@ -108,6 +106,7 @@ function EpisodeCarouselCard({
   quickActionMode,
   upcoming,
   hideImageIfUnwatched,
+  hideOverviewIfUnwatched,
   onPrefetch,
 }: {
   ep: EpisodeListItem;
@@ -116,6 +115,7 @@ function EpisodeCarouselCard({
   quickActionMode: CardQuickActionMode;
   upcoming: boolean;
   hideImageIfUnwatched: boolean;
+  hideOverviewIfUnwatched: boolean;
   onPrefetch: () => void;
 }) {
   const cardRef = useRef<HTMLDivElement>(null);
@@ -238,23 +238,13 @@ function EpisodeCarouselCard({
           aria-current={isCurrent ? "page" : undefined}
           className="block"
         >
-          <div className="text-muted-foreground/70 mt-2 flex items-center gap-2 text-xs">
-            <span>Episode {ep.episode_number}</span>
-            {ep.user_data?.played && <WatchedCheckIndicator className="ml-auto" />}
-          </div>
-          <p
-            className="truncate text-sm font-semibold"
-            style={isCurrent ? { color: "var(--primary)" } : undefined}
-          >
-            {episodeTitle}
-          </p>
-          {upcoming ? (
-            <p className="text-muted-foreground/70 text-xs">
-              Upcoming{ep.air_date && ` · ${formatCalendarDate(ep.air_date)}`}
-            </p>
-          ) : (
-            ep.runtime > 0 && <p className="text-muted-foreground/70 text-xs">{ep.runtime}m</p>
-          )}
+          <EpisodeCardCaption
+            episode={ep}
+            hideOverview={hideOverviewIfUnwatched && isEpisodeUnwatched(ep.user_data)}
+            isCurrent={isCurrent}
+            badges={ep.user_data?.played && <WatchedCheckIndicator />}
+            notice={upcoming ? "Upcoming" : undefined}
+          />
         </ViewTransitionLink>
       </div>
     </li>

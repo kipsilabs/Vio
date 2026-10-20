@@ -38,7 +38,7 @@ func TestWebhookSecretRotationPG(t *testing.T) {
 	if !ok {
 		t.Fatal("terminator missing")
 	}
-	if _, err = pool.Exec(ctx, "CREATE TEMP TABLE notification_webhooks ("+ddl+"\n); ALTER TABLE notification_webhooks ADD COLUMN notify_requests boolean NOT NULL DEFAULT false, ADD COLUMN revision bigint NOT NULL DEFAULT 1"); err != nil {
+	if _, err = pool.Exec(ctx, "CREATE TEMP TABLE notification_webhooks ("+ddl+"\n); ALTER TABLE notification_webhooks ADD COLUMN notify_requests boolean NOT NULL DEFAULT false, ADD COLUMN notify_ratings boolean NOT NULL DEFAULT false, ADD COLUMN revision bigint NOT NULL DEFAULT 1"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = pool.Exec(ctx, `INSERT INTO notification_webhooks(id,user_id,profile_id,name,type,url_ciphertext,url_host,signing_secret_ciphertext,enabled,consecutive_failures) VALUES ('row',1,'owner','original','generic','url-cipher','example.test','initial-cipher',false,5),('discord',1,'owner','discord','discord','url-cipher','example.test',NULL,true,0)`); err != nil {

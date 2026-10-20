@@ -99,6 +99,7 @@ func NewRouter(deps Dependencies) chi.Router {
 	}
 	itemsHandler := NewItemsHandler(deps.ContentService, deps.UserDataService, deps.IDCodec, deps.Config, deps.ImageCache, nextUpRepo, deps.BrowseRepo, deps.PersonRepo, deps.DetailSvc, deps.ItemRepo, deps.EpisodeRepo, deps.SeasonRepo, deps.AccessFilterFn, subtitleRepo)
 	itemsHandler.storeProvider = deps.UserStoreProvider
+	itemsHandler.adminDefaults = deps.AdminDefaults
 	itemsHandler.MarkerPopulation = deps.MarkerPopulation
 	itemsHandler.FileResolver = deps.FileResolver
 	itemsHandler.catalogUserState = deps.Config != nil && deps.Config.UserDB.Backend != sqliteUserStoreBackend
@@ -118,6 +119,7 @@ func NewRouter(deps Dependencies) chi.Router {
 		// left unset as they serve other section types.
 		sf := sections.NewFetcher(deps.DB)
 		sf.StoreProvider = deps.UserStoreProvider
+		sf.AdminDefaults = deps.AdminDefaults
 		itemsHandler.sectionsFetcher = sf
 	}
 	itemsHandler.posterPresigner = deps.PosterPresigner
@@ -241,6 +243,9 @@ func NewRouter(deps Dependencies) chi.Router {
 		}
 	}
 	imagesHandler := NewImagesHandler(deps.ContentService, deps.IDCodec, deps.SessionStore, deps.ImageCache, deps.PersonRepo, deps.DetailSvc, deps.ItemRepo, deps.FolderRepo, deps.SeasonRepo, deps.EpisodeRepo, deps.AccessFilterFn, deps.PosterPresigner, deps.PresignTTL, deps.JWTSecret, deps.HTTPClient)
+	if deps.DB != nil {
+		imagesHandler.extraRepo = catalog.NewExtraRepository(deps.DB)
+	}
 	imagesHandler.collections = itemsHandler.collections
 	imagesHandler.collectionPosters = itemsHandler.collectionPosters
 	imagesHandler.keyAuth = adminAPIKeyAuth
