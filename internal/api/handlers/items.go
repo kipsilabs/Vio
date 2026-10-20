@@ -2759,7 +2759,7 @@ func (h *ItemsHandler) resolveWatchedTargets(ctx context.Context, contentID stri
 		if !played {
 			return "season", nil, nil
 		}
-		episodes, err := h.episodeRepo.ListBySeasonID(ctx, target.Season.ContentID)
+		episodes, err := h.seasonEpisodesForRead(ctx, target.Season.SeriesID, target.Season.SeasonNumber)
 		if err != nil {
 			return "", nil, err
 		}
