@@ -29,7 +29,7 @@ func (l *localListFields) record(result *MetadataResult) {
 // list only when it is empty, like the NFO's scalar fields, instead of being
 // added to it. A manual refresh replaces it. Credits follow the same rule in
 // keepStoredLocalCredits, which has to read them.
-func (l localListFields) keepStoredLists(accumulator, stored *MetadataResult) {
+func (l *localListFields) keepStoredLists(accumulator, stored *MetadataResult) {
 	keep := func(supplied bool, local *[]string, storedList []string) {
 		if supplied && len(storedList) > 0 {
 			*local = nil
@@ -49,8 +49,8 @@ func (l localListFields) keepStoredLists(accumulator, stored *MetadataResult) {
 // local files left empty fills from the remote one here, matched within its
 // own role. The result itself is not modified: provider results can be
 // shared.
-func (l localListFields) restrict(accumulator, result *MetadataResult) *MetadataResult {
-	if l == (localListFields{}) {
+func (l *localListFields) restrict(accumulator, result *MetadataResult) *MetadataResult {
+	if *l == (localListFields{}) {
 		return result
 	}
 	out := *result

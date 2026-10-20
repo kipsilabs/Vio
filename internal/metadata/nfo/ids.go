@@ -66,11 +66,11 @@ func uniqueIDKey(rawType string) string {
 		return -1
 	}, rawType)
 	switch normalized {
-	case "imdb", "imdbid":
+	case idKeyIMDB, "imdbid":
 		return idKeyIMDB
-	case "tmdb", "tmdbid", "themoviedb", "themoviedbid", "moviedb":
+	case idKeyTMDB, "tmdbid", "themoviedb", "themoviedbid", "moviedb":
 		return idKeyTMDB
-	case "tvdb", "tvdbid", "thetvdb", "thetvdbid":
+	case idKeyTVDB, "tvdbid", "thetvdb", "thetvdbid":
 		return idKeyTVDB
 	case "", "unknown":
 		return ""

@@ -963,10 +963,7 @@ const createClearedTasteProfileQuery = `
 // profile its user store still lists, so the row a profile deletion purged
 // does not come back. updatedAt is as for UpsertTasteProfile.
 func (r *Repo) ClearTasteProfile(ctx context.Context, userID int, profileID string, signalCounts map[string]int, maxContentRating string, updatedAt time.Time, create bool) error {
-	countsJSON, err := json.Marshal(signalCounts)
-	if err != nil {
-		return fmt.Errorf("marshaling signal counts: %w", err)
-	}
+	countsJSON, _ := json.Marshal(signalCounts)
 
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -1412,7 +1409,7 @@ func (r *Repo) UpsertCowatchPairs(ctx context.Context, pairs []CowatchPair) erro
 		itemIDs[i] = p.ItemID
 		similarIDs[i] = p.SimilarItemID
 		scores[i] = p.JaccardScore
-		counts[i] = int32(p.CowatchCount)
+		counts[i] = int32(p.CowatchCount) //nolint:gosec // Cowatch count is the number of profiles sharing an item, bounded far below int32.
 	}
 	_, err := r.pool.Exec(ctx, `
 		INSERT INTO item_cowatch (item_id, similar_item_id, jaccard_score, cowatch_count, updated_at)

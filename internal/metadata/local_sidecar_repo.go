@@ -279,10 +279,7 @@ func columnsOf(records []localSidecarRecord) (recordColumns, error) {
 		if ids == nil {
 			ids = map[string]string{}
 		}
-		encoded, err := json.Marshal(ids)
-		if err != nil {
-			return recordColumns{}, fmt.Errorf("encoding local sidecar provider ids: %w", err)
-		}
+		encoded, _ := json.Marshal(ids)
 		c.folderIDs[i] = int32(record.FolderID) //nolint:gosec // media_folders.id is an integer column
 		c.targetTypes[i] = record.TargetType
 		c.contentIDs[i] = record.ContentID

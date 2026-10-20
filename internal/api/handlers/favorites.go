@@ -342,6 +342,9 @@ func (h *PersonalDataHandler) HandleRemoveFavorite(w http.ResponseWriter, r *htt
 // watchlist change, which no longer end with the request.
 const listChangeNoticeTimeout = 30 * time.Second
 
+// userStateChangeFavorite is the event kind for a favorites change.
+const userStateChangeFavorite = "favorite"
+
 // notifyListChange tells every listener about a favorites or watchlist row a
 // write inserted or deleted: connected watch providers, the profile's
 // recommendations, and the profile's clients. The row is already committed,
@@ -354,7 +357,7 @@ func (h *PersonalDataHandler) notifyListChange(ctx context.Context, list watchsy
 	h.dispatchLocalListEvent(ctx, list, change, viewer.UserID, viewer.ProfileID, itemID)
 	notifySignalsChanged(ctx, h.signalsNotifier, viewer.UserID, viewer.ProfileID)
 	member := change == watchsync.ListChangeAdded
-	state, stateChange := userStateEventState{IsFavorite: &member}, "favorite"
+	state, stateChange := userStateEventState{IsFavorite: &member}, userStateChangeFavorite
 	if list == watchsync.ListKindWatchlist {
 		state, stateChange = userStateEventState{InWatchlist: &member}, "watchlist"
 	}

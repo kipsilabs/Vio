@@ -549,7 +549,7 @@ func TestClearResumePositionNeverMovesTimestampsBack(t *testing.T) {
 				t.Fatalf("read seq: %v", err)
 			}
 
-			cleared, err := ClearResumePosition(db, "p1", "m1", tc.at)
+			cleared, err := ClearResumePosition(t.Context(), db, "p1", "m1", tc.at)
 			if err != nil || !cleared {
 				t.Fatalf("ClearResumePosition = %v, %v; want cleared", cleared, err)
 			}

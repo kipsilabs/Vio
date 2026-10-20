@@ -1176,7 +1176,8 @@ func (s *Server) router() chi.Router {
 
 // handleDownloadPrepare validates and starts a prepared-download job.
 func (s *Server) handleDownloadPrepare(w http.ResponseWriter, r *http.Request) {
-	defer s.trackInFlight()()
+	inFlightDone := s.trackInFlight()
+	defer inFlightDone()
 	var req downloadprepare.Request
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&req); err != nil {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
@@ -1422,7 +1423,8 @@ func (s *Server) sessionOutputDir(sessionID string) string {
 }
 
 func (s *Server) handleDownloadArtifact(w http.ResponseWriter, r *http.Request) {
-	defer s.trackInFlight()()
+	inFlightDone := s.trackInFlight()
+	defer inFlightDone()
 	artifactID := chi.URLParam(r, "artifact_id")
 	if !downloadprepare.ValidArtifactID(artifactID) {
 		http.NotFound(w, r)
@@ -1514,7 +1516,7 @@ func (s *Server) trackDownloadPrepare(ctx context.Context, info nodesessions.Ses
 	}
 }
 
-func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	snapshot := s.metrics.Snapshot().RedactPaths()
 	var artifacts *downloadstorage.Usage
 	if usage, ok := s.artifactUsage(); ok {
@@ -1522,7 +1524,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 		artifacts = &redacted
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(HealthResponse{
+	if err := json.NewEncoder(w).Encode(HealthResponse{
 		Status:           s.healthStatus(),
 		ActiveJobs:       s.activeJobs.Load(),
 		CapabilitiesHash: s.storedCapabilityHash(),
@@ -1532,7 +1534,9 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 		SampledAt:        snapshot.SampledAt,
 		Build:            buildinfo.Current(),
 		Artifacts:        artifacts,
-	})
+	}); err != nil {
+		slog.WarnContext(r.Context(), "writing health response", "component", "transcodenode", "error", err)
+	}
 }
 
 // artifactUsage answers from the background measurement of the artifact
@@ -1730,7 +1734,8 @@ func toneMapCapabilityResolveTimeout(hardwareBackend, hardwareDevice string) tim
 }
 
 func (s *Server) handleChapterThumbnailExtract(w http.ResponseWriter, r *http.Request) {
-	defer s.trackInFlight()()
+	inFlightDone := s.trackInFlight()
+	defer inFlightDone()
 	var req chapterthumbs.RemoteExtractRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeChapterThumbnailError(w, http.StatusBadRequest, "invalid_request", "invalid request body")
@@ -1812,7 +1817,8 @@ func (s *Server) requireBearer(next http.Handler) http.Handler {
 
 // handleStart validates and starts a remote HLS transcode.
 func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
-	defer s.trackInFlight()()
+	inFlightDone := s.trackInFlight()
+	defer inFlightDone()
 	var req TranscodeStartRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
@@ -2206,7 +2212,8 @@ func recipeIsComplete(card playback.RecipeCard) bool {
 // single-flight in reconstructFromToken, so it is the sole writer racing to
 // register sessionID. Returns nil if the spawn fails or the slot wait is canceled.
 func (s *Server) spawnReconstruct(r *http.Request, sessionID string, requestedSegment int, card playback.RecipeCard) (*playback.TranscodeSession, error) {
-	defer s.trackInFlight()()
+	inFlightDone := s.trackInFlight()
+	defer inFlightDone()
 	if s.inputPaths == nil {
 		slog.ErrorContext(r.Context(), "transcode node reconstruct input authority unavailable", "component", "transcodenode", "session", sessionID)
 		return nil, nil
@@ -2483,7 +2490,8 @@ func (s *Server) acquireReconstructSlot(ctx context.Context) (func(), bool) {
 // authenticates the proxy process; the independently verified stream token
 // binds the media recipe and the exact transcode-execution/proxy-egress route.
 func (s *Server) handleRemux(w http.ResponseWriter, r *http.Request) {
-	defer s.trackInFlight()()
+	inFlightDone := s.trackInFlight()
+	defer inFlightDone()
 	cfg := s.watcher.Config()
 	if cfg == nil || cfg.Auth.JWTSecret == "" {
 		http.Error(w, "node not configured", http.StatusServiceUnavailable)

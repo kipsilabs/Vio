@@ -19,7 +19,8 @@ import (
 // need this node's resolved accelerator and the GPU admission gate, and no
 // remote caller needs it yet.
 func (s *Server) handleMediaSample(w http.ResponseWriter, r *http.Request) {
-	defer s.trackInFlight()()
+	inFlightDone := s.trackInFlight()
+	defer inFlightDone()
 	var req mediasample.Request
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, mediasample.MaxRemoteRequestBytes)).Decode(&req); err != nil {
 		writeMediaSampleError(w, http.StatusBadRequest, mediasample.ReasonInvalidRequest, "invalid request body")

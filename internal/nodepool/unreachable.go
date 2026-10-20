@@ -187,9 +187,8 @@ func (hc *HealthChecker) markUnreachable(nodeURL string, local bool) bool {
 		"url", nodeURL, "source", source)
 	hc.recheckUnreachable(ctx, nodeURL)
 	if local && broadcast != nil {
-		if payload, err := json.Marshal(unreachableAnnouncement{Origin: hc.origin, URL: nodeURL}); err == nil {
-			broadcast(string(payload))
-		}
+		payload, _ := json.Marshal(unreachableAnnouncement{Origin: hc.origin, URL: nodeURL})
+		broadcast(string(payload))
 	}
 	return true
 }

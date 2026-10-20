@@ -371,7 +371,8 @@ func (w *Worker) executeJob(j job, held clusterLock) {
 	ctx, cancel := context.WithTimeout(context.Background(), j.timeout)
 	defer cancel()
 	ctx, observation := workmetrics.Start(ctx, "recommendations", time.Time{})
-	defer workmetrics.Profile(ctx)()
+	profileDone := workmetrics.Profile(ctx)
+	defer profileDone()
 
 	startLevel := slog.LevelInfo
 	if j.quietWhenIdle {

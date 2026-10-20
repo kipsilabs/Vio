@@ -101,7 +101,7 @@ func (p *Provider) Search(ctx context.Context, req subtitles.SearchRequest) ([]s
 		// The request URL carries the API key; keep it out of the error text.
 		return nil, fmt.Errorf("subdl: search request: %w", logredact.SanitizeURLError(err))
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("subdl: search returned %d: %s", resp.StatusCode, subtitles.ProviderErrorBody(resp.Body))
@@ -156,7 +156,7 @@ func (p *Provider) Download(ctx context.Context, id string) ([]byte, subtitles.S
 	if err != nil {
 		return nil, "", fmt.Errorf("subdl: download request: %w", logredact.SanitizeURLError(err))
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, "", fmt.Errorf("subdl: download returned %d: %s", resp.StatusCode, subtitles.ProviderErrorBody(resp.Body))

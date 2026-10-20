@@ -74,11 +74,11 @@ func applyRatingValues(p *parsedNFO, in nfoRatingInput) {
 		}
 		// An explicit max attribute always wins over the source's default
 		// scale; a bare RT score (tomatometer 60) is out of 100, not 10.
-		max := spec.max
+		scale := spec.max
 		if parsed, parsedOK := parseRatingValue(r.Max); parsedOK {
-			max = parsed
+			scale = parsed
 		}
-		p.setRating(spec.source, value, max, parseVotes(r.Votes))
+		p.setRating(spec.source, value, scale, parseVotes(r.Votes))
 	}
 	if len(in.block.Ratings) == 0 {
 		if value, ok := parseRatingValue(in.legacy); ok {
@@ -94,23 +94,23 @@ func applyRatingValues(p *parsedNFO, in nfoRatingInput) {
 // setRating records value (out of max) for source unless the file already
 // gave it one: the headline slot for IMDb, TMDB, and Rotten Tomatoes, and the
 // per-source row with its votes on 0-100.
-func (p *parsedNFO) setRating(source string, value, max float64, votes int64) {
+func (p *parsedNFO) setRating(source string, value, scale float64, votes int64) {
 	if _, exists := p.RatingSources[source]; exists {
 		return
 	}
 	if p.RatingSources == nil {
 		p.RatingSources = make(map[string]metadata.RatingSource)
 	}
-	p.RatingSources[source] = metadata.RatingSource{Score: scaleRating(value, max, 100), Votes: votes}
+	p.RatingSources[source] = metadata.RatingSource{Score: scaleRating(value, scale, 100), Votes: votes}
 	switch source {
 	case models.RatingSourceIMDB:
-		p.RatingIMDB = scaleRating(value, max, 10)
+		p.RatingIMDB = scaleRating(value, scale, 10)
 	case models.RatingSourceTMDB:
-		p.RatingTMDB = scaleRating(value, max, 10)
+		p.RatingTMDB = scaleRating(value, scale, 10)
 	case models.RatingSourceRTCritic:
-		p.RatingRTCritic = scaleRating(value, max, 100)
+		p.RatingRTCritic = scaleRating(value, scale, 100)
 	case models.RatingSourceRTAudience:
-		p.RatingRTAudience = scaleRating(value, max, 100)
+		p.RatingRTAudience = scaleRating(value, scale, 100)
 	}
 }
 
@@ -140,13 +140,13 @@ func parseVotes(raw string) int64 {
 	return votes
 }
 
-func scaleRating(value, max, targetMax float64) float64 {
-	if max <= 0 {
-		max = targetMax
+func scaleRating(value, scale, targetScale float64) float64 {
+	if scale <= 0 {
+		scale = targetScale
 	}
-	scaled := value * targetMax / max
-	if scaled > targetMax {
-		return targetMax
+	scaled := value * targetScale / scale
+	if scaled > targetScale {
+		return targetScale
 	}
 	return scaled
 }

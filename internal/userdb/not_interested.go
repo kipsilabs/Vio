@@ -1,6 +1,7 @@
 package userdb
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"strings"
@@ -13,8 +14,8 @@ import (
 
 // MarkNotInterested records a profile's Not interested mark on a media item
 // and reports whether it was new.
-func MarkNotInterested(db *sql.DB, profileID, mediaItemID string) (bool, error) {
-	result, err := db.Exec(
+func MarkNotInterested(ctx context.Context, db *sql.DB, profileID, mediaItemID string) (bool, error) {
+	result, err := db.ExecContext(ctx,
 		`INSERT OR IGNORE INTO not_interested (profile_id, media_item_id, added_at) VALUES (?, ?, ?)`,
 		profileID, mediaItemID, time.Now().UTC().Format(time.RFC3339),
 	)
@@ -30,8 +31,8 @@ func MarkNotInterested(db *sql.DB, profileID, mediaItemID string) (bool, error) 
 
 // UnmarkNotInterested removes a profile's mark and reports whether it was
 // there.
-func UnmarkNotInterested(db *sql.DB, profileID, mediaItemID string) (bool, error) {
-	result, err := db.Exec(
+func UnmarkNotInterested(ctx context.Context, db *sql.DB, profileID, mediaItemID string) (bool, error) {
+	result, err := db.ExecContext(ctx,
 		`DELETE FROM not_interested WHERE profile_id = ? AND media_item_id = ?`,
 		profileID, mediaItemID,
 	)
@@ -47,9 +48,9 @@ func UnmarkNotInterested(db *sql.DB, profileID, mediaItemID string) (bool, error
 
 // GetNotInterested answers a profile's mark on a media item, nil when the
 // item is not marked.
-func GetNotInterested(db *sql.DB, profileID, mediaItemID string) (*userstore.NotInterestedEntry, error) {
+func GetNotInterested(ctx context.Context, db *sql.DB, profileID, mediaItemID string) (*userstore.NotInterestedEntry, error) {
 	var e userstore.NotInterestedEntry
-	err := db.QueryRow(
+	err := db.QueryRowContext(ctx,
 		`SELECT profile_id, media_item_id, added_at FROM not_interested WHERE profile_id = ? AND media_item_id = ?`,
 		profileID, mediaItemID,
 	).Scan(&e.ProfileID, &e.MediaItemID, &e.AddedAt)
@@ -63,9 +64,9 @@ func GetNotInterested(db *sql.DB, profileID, mediaItemID string) (*userstore.Not
 }
 
 // ListNotInterestedPage pages by keyset like ListFavoritesPage.
-func ListNotInterestedPage(db *sql.DB, profileID string, after *userstore.ListKey, limit int) ([]userstore.NotInterestedEntry, error) {
+func ListNotInterestedPage(ctx context.Context, db *sql.DB, profileID string, after *userstore.ListKey, limit int) ([]userstore.NotInterestedEntry, error) {
 	query, args := listKeysetQuery(`SELECT profile_id, media_item_id, added_at FROM not_interested`, profileID, after, limit)
-	rows, err := db.Query(query, args...)
+	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -84,7 +85,7 @@ func ListNotInterestedPage(db *sql.DB, profileID string, after *userstore.ListKe
 
 // ListNotInterestedByMediaItems reports which of mediaItemIDs the profile
 // marked.
-func ListNotInterestedByMediaItems(db *sql.DB, profileID string, mediaItemIDs []string) (map[string]bool, error) {
+func ListNotInterestedByMediaItems(ctx context.Context, db *sql.DB, profileID string, mediaItemIDs []string) (map[string]bool, error) {
 	result := make(map[string]bool, len(mediaItemIDs))
 	if len(mediaItemIDs) == 0 {
 		return result, nil
@@ -96,7 +97,8 @@ func ListNotInterestedByMediaItems(db *sql.DB, profileID string, mediaItemIDs []
 		placeholders[i] = "?"
 		args = append(args, mediaItemID)
 	}
-	rows, err := db.Query(
+	rows, err := db.QueryContext(ctx,
+		//nolint:gosec // Only literal placeholders are concatenated; profile and item IDs stay bound parameters.
 		`SELECT media_item_id FROM not_interested WHERE profile_id = ? AND media_item_id IN (`+strings.Join(placeholders, ",")+`)`,
 		args...,
 	)

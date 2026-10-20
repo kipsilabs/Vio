@@ -1,6 +1,7 @@
 package userdb
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -41,8 +42,8 @@ func AddFavoriteAt(db *sql.DB, profileID, mediaItemID string, addedAt time.Time)
 
 // RemoveFavorite removes a media item from a profile's favorites and reports
 // whether it was there.
-func RemoveFavorite(db *sql.DB, profileID, mediaItemID string) (bool, error) {
-	result, err := db.Exec(
+func RemoveFavorite(ctx context.Context, db *sql.DB, profileID, mediaItemID string) (bool, error) {
+	result, err := db.ExecContext(ctx,
 		`DELETE FROM favorites WHERE profile_id = ? AND media_item_id = ?`,
 		profileID, mediaItemID,
 	)
@@ -227,8 +228,8 @@ func AddToWatchlistAt(db *sql.DB, profileID, mediaItemID string, addedAt time.Ti
 
 // RemoveFromWatchlist removes a media item from a profile's watchlist and
 // reports whether it was there.
-func RemoveFromWatchlist(db *sql.DB, profileID, mediaItemID string) (bool, error) {
-	result, err := db.Exec(
+func RemoveFromWatchlist(ctx context.Context, db *sql.DB, profileID, mediaItemID string) (bool, error) {
+	result, err := db.ExecContext(ctx,
 		`DELETE FROM watchlist WHERE profile_id = ? AND media_item_id = ?`,
 		profileID, mediaItemID,
 	)

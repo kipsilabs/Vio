@@ -283,7 +283,7 @@ func TestMergeAndPersistDropsRemovedSidecarArtwork(t *testing.T) {
 	}
 }
 
-func TestPlanExtraBackdrops(t *testing.T) {
+func TestPlanExtraBackdrops(t *testing.T) { //nolint:funlen // upstream TestPlanExtraBackdrops exceeds Vio's 100-line limit; refactor tracked separately
 	ctx := context.Background()
 	searched := withLocalArtworkSearched(ctx, localArtworkItem)
 	item := &models.MediaItem{ContentID: "movie-1", BackdropSourcePath: "file:///m/fanart.jpg"}
@@ -502,7 +502,7 @@ func TestSyncItemExtraBackdropsStoresRowsAndQueuesJobs(t *testing.T) {
 		{ProviderID: "nfo", URL: "file:///m/extrafanart/a.jpg", Type: ImageBackdrop},
 	}
 
-	service.syncItemExtraBackdrops(ctx, itemRetention(ctx), item, nil, images)
+	_ = service.syncItemExtraBackdrops(ctx, itemRetention(ctx), item, nil, images)
 	rows := repo.rows["movie-1"]
 	if len(rows) != 2 || rows[0].SourcePath != "file:///m/fanart-1.jpg" || rows[1].SourcePath != "file:///m/extrafanart/a.jpg" {
 		t.Fatalf("stored rows = %+v", rows)
@@ -524,7 +524,7 @@ func TestSyncItemExtraBackdropsStoresRowsAndQueuesJobs(t *testing.T) {
 	repo.rows["movie-1"][0].Path = "local/movies/movie-1/aa-101/backdrop/original.r.webp"
 	repo.rows["movie-1"][1].Path = "local/movies/movie-1/bb-102/backdrop/original.r.webp"
 	enqueuer.inputs = nil
-	service.syncItemExtraBackdrops(ctx, itemRetention(ctx), item, nil, images)
+	_ = service.syncItemExtraBackdrops(ctx, itemRetention(ctx), item, nil, images)
 	if repo.replaces != 1 {
 		t.Fatalf("Replace calls = %d, want 1", repo.replaces)
 	}

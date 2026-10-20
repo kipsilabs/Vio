@@ -175,7 +175,7 @@ func readBlockHeader(r io.ReaderAt, off, size int64) (track uint64, rel int64, f
 	if !ok || int64(trackLen+3) > n {
 		return 0, 0, 0, fmt.Errorf("short block header at %d", off)
 	}
-	rel = int64(int16(binary.BigEndian.Uint16(buf[trackLen:])))
+	rel = int64(int16(binary.BigEndian.Uint16(buf[trackLen:]))) //nolint:gosec // Block relative timestamp is a signed 16-bit value; this is its two-complement interpretation.
 	return track, rel, buf[trackLen+2], nil
 }
 
@@ -269,7 +269,7 @@ func (v *videoEnd) add(t, duration int64) {
 // seconds returns when the last frame ends: its timestamp plus its block's
 // duration, else the track's default frame duration, else the gap to the
 // frame before. It returns 0 when that can't be worked out.
-func (v videoEnd) seconds(timescale int64, frame float64) float64 {
+func (v *videoEnd) seconds(timescale int64, frame float64) float64 {
 	if v.n == 0 {
 		return 0
 	}
@@ -299,7 +299,7 @@ func verifyAllClusters(r io.ReaderAt, m matroskaIndex) (videoEnd, error) {
 			}
 			return end, err
 		}
-		if id == idCluster {
+		if id == idCluster { //nolint:nestif // upstream verifyAllClusters in coverage.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
 			keys, next, err := clusterKeyframes(r, at, m.segEnd, m.video, &end)
 			if err != nil {
 				return end, err

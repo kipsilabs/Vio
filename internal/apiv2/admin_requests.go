@@ -616,10 +616,11 @@ func (reg *Registry) loadAdminRequestOptions(ctx context.Context, in *AdminReque
 	// for a router that needs none.
 	var baseURL string
 	if b.BaseURL != nil {
-		p := (*Problem)(nil)
-		if baseURL, p = adminRequestBaseURL(ctx, *b.BaseURL); p != nil {
-			return nil, p
+		resolved, problem := adminRequestBaseURL(ctx, *b.BaseURL)
+		if problem != nil {
+			return nil, problem
 		}
+		baseURL = resolved
 	}
 	cleared := b.BaseURL != nil && baseURL == ""
 	options, err := s.LoadIntegrationOptions(ctx, adminRequestViewer(ctx), mediarequests.Integration{ID: string(in.ID), Name: b.Name, CapabilityID: b.CapabilityID, InstallationID: install, BaseURL: baseURL, BaseURLCleared: cleared, APIKeyRef: b.APIKey, PluginConfig: b.PluginConfig})

@@ -378,9 +378,9 @@ func ClearProgress(db *sql.DB, profileID, mediaItemID string) error {
 // fractions), and as text "…:50Z" sorts after the earlier "…:50.220Z". at
 // stays whole-second, as the other native writes are, for the text comparison
 // against hidden_before.
-func ClearResumePosition(db *sql.DB, profileID, mediaItemID string, at time.Time) (bool, error) {
+func ClearResumePosition(ctx context.Context, db *sql.DB, profileID, mediaItemID string, at time.Time) (bool, error) {
 	atText := at.UTC().Format(time.RFC3339)
-	result, err := db.Exec(`
+	result, err := db.ExecContext(ctx, `
 		UPDATE watch_progress
 		SET position_seconds = 0,
 			updated_at = CASE

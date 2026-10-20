@@ -73,7 +73,8 @@ func TestRequestAdminTaskJobCancellationStopsALocalImageCacheCleanup(t *testing.
 	h := NewAdminJobsHandler(&cancellationRequestingRepository{fakeAdminJobRepository{job: job}}, nil)
 	h.CancelRegistry = adminjob.NewCancelRegistry()
 	stopped := false
-	defer h.CancelRegistry.Register(job.ID, func() { stopped = true })()
+	unregister := h.CancelRegistry.Register(job.ID, func() { stopped = true })
+	defer unregister()
 
 	got, err := h.RequestAdminTaskJobCancellation(context.Background(), job.ID)
 	if err != nil {

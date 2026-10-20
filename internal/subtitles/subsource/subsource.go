@@ -97,7 +97,7 @@ func (p *Provider) Search(ctx context.Context, req subtitles.SearchRequest) ([]s
 	if err != nil {
 		return nil, fmt.Errorf("subsource: search request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("subsource: search returned %d: %s", resp.StatusCode, subtitles.ProviderErrorBody(resp.Body))
@@ -145,7 +145,7 @@ func (p *Provider) Search(ctx context.Context, req subtitles.SearchRequest) ([]s
 	if err != nil {
 		return nil, fmt.Errorf("subsource: subtitle request: %w", err)
 	}
-	defer subResp.Body.Close()
+	defer func() { _ = subResp.Body.Close() }()
 
 	if subResp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("subsource: subtitle list returned %d: %s", subResp.StatusCode, subtitles.ProviderErrorBody(subResp.Body))
@@ -215,7 +215,7 @@ func (p *Provider) fetchSubtitles(ctx context.Context, movieID int, lang string)
 	if err != nil {
 		return nil, err
 	}
-	defer subResp.Body.Close()
+	defer func() { _ = subResp.Body.Close() }()
 
 	if subResp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("subsource: subtitle list returned %d", subResp.StatusCode)
@@ -243,7 +243,7 @@ func (p *Provider) Download(ctx context.Context, id string) ([]byte, subtitles.S
 	if err != nil {
 		return nil, "", fmt.Errorf("subsource: download request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, "", fmt.Errorf("subsource: download returned %d: %s", resp.StatusCode, subtitles.ProviderErrorBody(resp.Body))

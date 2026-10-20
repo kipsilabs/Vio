@@ -155,9 +155,9 @@ func (n cowatchNeighbor) ranksAbove(other cowatchNeighbor) bool {
 // the lowest-ranked one kept, so a better neighbor replaces it in O(log n).
 type cowatchNeighbors []cowatchNeighbor
 
-func (h cowatchNeighbors) Len() int           { return len(h) }
-func (h cowatchNeighbors) Less(i, j int) bool { return h[j].ranksAbove(h[i]) }
-func (h cowatchNeighbors) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *cowatchNeighbors) Len() int           { return len(*h) }
+func (h *cowatchNeighbors) Less(i, j int) bool { return (*h)[j].ranksAbove((*h)[i]) }
+func (h *cowatchNeighbors) Swap(i, j int)      { (*h)[i], (*h)[j] = (*h)[j], (*h)[i] }
 func (h *cowatchNeighbors) Push(x any) {
 	if n, ok := x.(cowatchNeighbor); ok {
 		*h = append(*h, n)

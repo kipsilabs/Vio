@@ -128,7 +128,9 @@ func (h *PlaybackHandler) stopPlaybackSessionByID(ctx context.Context, sessionID
 func (h *PlaybackHandler) recordRealtimeStoppedSession(ctx context.Context, session *playback.Session) {
 	result := h.realtimeStopHistory(ctx, session)
 	h.recordAdminStopHistory(ctx, session)
-	h.notifyStoppedSession(ctx, session, result, true)
+	if err := h.notifyStoppedSession(ctx, session, result, true); err != nil {
+		slog.WarnContext(ctx, "failed to delete stopped realtime session", "component", "api", "session", session.ID, "error", err)
+	}
 }
 
 func (h *PlaybackHandler) realtimeStopHistory(parent context.Context, session *playback.Session) watchstate.PlaybackStopResult {
@@ -330,7 +332,7 @@ func (h *PlaybackHandler) runRealtimeResult(sessionID string, background bool, a
 	if h.realtimeResultQueues == nil {
 		h.realtimeResultQueues = make(map[string]*realtimeResultQueue)
 	}
-	if queue := h.realtimeResultQueues[sessionID]; queue != nil {
+	if queue := h.realtimeResultQueues[sessionID]; queue != nil { //nolint:nestif // upstream runRealtimeResult in playback_realtime.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
 		if queue.terminalQueued {
 			h.realtimeResultMu.Unlock()
 			return

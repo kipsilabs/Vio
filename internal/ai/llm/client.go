@@ -286,7 +286,7 @@ func (c *Client) doReaderWithRetry(ctx context.Context, httpClient *http.Client,
 		}
 
 		respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 128<<10))
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if readErr != nil {
 			// A truncated/failed read could otherwise be misparsed as a valid
 			// (empty) response; treat it as a retryable transport error.

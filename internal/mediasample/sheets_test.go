@@ -304,11 +304,11 @@ func (f *fakeSheets) exec(_ context.Context, _ string, args []string, stdin io.R
 			var timingSb303 strings.Builder
 			for _, key := range f.keyPackets {
 				if math.IsNaN(key) {
-					timingSb303.WriteString(fmt.Sprintf("0, %d, %d, 1, 1, 0x00000000\n", int64(math.MinInt64), int64(math.MinInt64)))
+					fmt.Fprintf(&timingSb303, "0, %d, %d, 1, 1, 0x00000000\n", int64(math.MinInt64), int64(math.MinInt64))
 					continue
 				}
 				at := int64(math.Round(key * 1000))
-				timingSb303.WriteString(fmt.Sprintf("0, %d, %d, 1, 1, 0x00000000\n0, %d, %d, 1, 1, 0x00000000, F=0x0\n", at, at, at+1, at+1))
+				fmt.Fprintf(&timingSb303, "0, %d, %d, 1, 1, 0x00000000\n0, %d, %d, 1, 1, 0x00000000, F=0x0\n", at, at, at+1, at+1)
 			}
 			timing += timingSb303.String()
 			timing += fmt.Sprintf("0, %d, %d, 1, 1, 0x00000000\n", end-1, end-1)

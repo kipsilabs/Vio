@@ -91,7 +91,7 @@ type MetadataAIHandler struct {
 	SeasonLookup  metadataAISeasonLookup
 	EpisodeLookup metadataAIEpisodeLookup
 	// Libraries resolves library prewarm targets; nil leaves them unavailable.
-	Libraries metadataAILibraryLookup
+	Libraries libraryLookup
 	// Pending limits the on-view route to the language the viewer's own detail
 	// page reports missing, so a caller cannot queue arbitrary languages.
 	Pending metadataAIPendingLanguage

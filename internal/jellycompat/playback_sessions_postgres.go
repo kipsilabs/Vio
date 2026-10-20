@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Silo-Server/silo-server/internal/watchsync"
@@ -73,13 +72,9 @@ func negotiatedSessionAdvisoryLockKey(compatToken, clientDeviceID, routeItemID s
 	return int64(binary.BigEndian.Uint64(digest[:8]))
 }
 
-type negotiatedSessionAdvisoryLockExecutor interface {
-	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
-}
-
 func acquireNegotiatedSessionAdvisoryLock(
 	ctx context.Context,
-	executor negotiatedSessionAdvisoryLockExecutor,
+	executor sessionExecer,
 	compatToken, clientDeviceID, routeItemID string,
 ) error {
 	// Current-main processes know only the legacy text-derived key. Taking it

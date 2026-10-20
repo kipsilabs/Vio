@@ -20,6 +20,8 @@ const (
 	deleteScope    = "home"
 	deletePrefsID  = "usersettings"
 	deleteClient   = "emby"
+	recreatedName  = "Recreated"
+	playbackSpeed  = "1.25"
 )
 
 // registeredDevice names the device registry row profileStateLeft reports.
@@ -55,7 +57,7 @@ func RunDeleteProfileRemovesProfileState(t *testing.T, newStore func(t *testing.
 	if err := store.DeleteProfile(ctx, deletedProfile); err != nil {
 		t.Fatalf("DeleteProfile: %v", err)
 	}
-	if err := store.CreateProfile(ctx, userstore.Profile{ID: deletedProfile, Name: "Recreated"}); err != nil {
+	if err := store.CreateProfile(ctx, userstore.Profile{ID: deletedProfile, Name: recreatedName}); err != nil {
 		t.Fatalf("CreateProfile(recreate): %v", err)
 	}
 
@@ -114,7 +116,7 @@ func seedProfileState(t *testing.T, ctx context.Context, store userstore.UserSto
 	if err := store.UpsertOnboardingState(ctx, userstore.OnboardingState{ProfileID: profileID, TourID: deleteTour, LastStep: "subtitles"}); err != nil {
 		t.Fatalf("UpsertOnboardingState %s: %v", profileID, err)
 	}
-	if err := store.SetDeviceSetting(ctx, userstore.DeviceSettingEntry{ProfileID: profileID, DeviceID: deleteDevice, Key: deleteSetting, Value: "1.25"}); err != nil {
+	if err := store.SetDeviceSetting(ctx, userstore.DeviceSettingEntry{ProfileID: profileID, DeviceID: deleteDevice, Key: deleteSetting, Value: playbackSpeed}); err != nil {
 		t.Fatalf("SetDeviceSetting %s: %v", profileID, err)
 	}
 	registry, ok := store.(userstore.DeviceRegistry)

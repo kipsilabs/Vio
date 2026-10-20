@@ -1145,9 +1145,9 @@ func (s *LibraryCollectionService) SyncCollectionWithOptions(ctx context.Context
 
 	syncOnce := func() (*models.LibraryCollectionSyncRun, error) {
 		switch source.Mode {
-		case "smart":
+		case libraryCollectionSourceModeSmart:
 			return nil, ErrLibraryCollectionSyncUnsupported
-		case "mdblist_json":
+		case libraryCollectionSourceModeMDBListJSON:
 			return s.syncMDBListCollection(ctx, collection, collectionutil.MDBListURLCandidates(source.URL, collection.SourceURL), source.Limit, opts)
 		case "tmdb_preset":
 			return s.syncTMDBPresetCollection(ctx, collection, source, opts)
@@ -1742,7 +1742,7 @@ func (s *LibraryCollectionService) syncTMDBListCollection(ctx context.Context, c
 // MatchTMDBEntries. Shared by every TMDB source mode; source names the mode in
 // logs. virtualPlayback materializes a placeholder for an entry no library
 // holds, subject to the release gate.
-func (s *LibraryCollectionService) completeTMDBEntrySync(ctx context.Context, collection *models.LibraryCollection, fetcher any, results []TMDBCollectionEntry, limit *int, virtualPlayback bool, startedAt time.Time, opts SyncCollectionOptions, source string) (*models.LibraryCollectionSyncRun, error) {
+func (s *LibraryCollectionService) completeTMDBEntrySync(ctx context.Context, collection *models.LibraryCollection, fetcher any, results []TMDBCollectionEntry, limit *int, virtualPlayback bool, startedAt time.Time, opts SyncCollectionOptions, source string) (*models.LibraryCollectionSyncRun, error) { //nolint:funlen // upstream completeTMDBEntrySync exceeds Vio's 100-line limit; refactor tracked separately
 	contentIDs, err := s.matchTMDBEntriesInLibraries(ctx, collection.LibraryIDs, fetcher, results)
 	if err != nil {
 		return nil, err
@@ -1768,7 +1768,7 @@ func (s *LibraryCollectionService) completeTMDBEntrySync(ctx context.Context, co
 			continue
 		}
 		contentID := contentIDs[i]
-		if contentID == "" {
+		if contentID == "" { //nolint:nestif // upstream completeTMDBEntrySync in library_collection_service.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
 			// No library-resident match: the release gate applies only to
 			// new virtual candidates.
 			entryYear := tmdbReleaseYear(entry.ReleaseDate)

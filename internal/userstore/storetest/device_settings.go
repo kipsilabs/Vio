@@ -11,6 +11,11 @@ import (
 	"github.com/Silo-Server/silo-server/internal/userstore"
 )
 
+const (
+	livingRoomName  = "Living Room"
+	missingDeviceID = "missing"
+)
+
 func RunDeviceSettings(t *testing.T, newStore func(*testing.T) userstore.UserStore) {
 	store := newStore(t)
 	devices, ok := store.(userstore.DeviceSettingsStore)
@@ -118,18 +123,18 @@ func RunDeviceRename(t *testing.T, newStore func(*testing.T) userstore.UserStore
 		return got
 	}
 
-	if err := devices.RenameDevice(ctx, "a", "one", "Living Room"); err != nil {
+	if err := devices.RenameDevice(ctx, "a", "one", livingRoomName); err != nil {
 		t.Fatal(err)
 	}
-	want := map[string]string{"a/one": unnamed + "Living Room", "a/two": unnamed, "b/one": unnamed, "b/two": unnamed}
+	want := map[string]string{"a/one": unnamed + livingRoomName, "a/two": unnamed, "b/one": unnamed, "b/two": unnamed}
 	if got := names(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("rename reached other rows: %v", got)
 	}
-	if err := devices.RenameDevice(ctx, "a", "one", "Living Room"); err != nil {
+	if err := devices.RenameDevice(ctx, "a", "one", livingRoomName); err != nil {
 		t.Fatalf("repeating a rename: %v", err)
 	}
 	one, err := devices.ListDeviceSettingsPage(ctx, userstore.DevicePageOptions{ProfileID: "a", DeviceID: "one", Limit: 10})
-	if err != nil || len(one) != 1 || one[0].ProfileID != "a" || one[0].DeviceID != "one" || one[0].CustomName != "Living Room" {
+	if err != nil || len(one) != 1 || one[0].ProfileID != "a" || one[0].DeviceID != "one" || one[0].CustomName != livingRoomName {
 		t.Fatalf("one device's row: %+v %v", one, err)
 	}
 
@@ -147,7 +152,7 @@ func RunDeviceRename(t *testing.T, newStore func(*testing.T) userstore.UserStore
 		t.Fatalf("clearing: %q", got)
 	}
 
-	for _, target := range [][2]string{{"a", "missing"}, {"c", "one"}} {
+	for _, target := range [][2]string{{"a", missingDeviceID}, {"c", "one"}} {
 		if err := devices.RenameDevice(ctx, target[0], target[1], "x"); !errors.Is(err, userstore.ErrDeviceNotFound) {
 			t.Fatalf("rename %v: %v", target, err)
 		}

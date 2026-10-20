@@ -75,6 +75,8 @@ func NewReader(repo *Repo, ratingsRepo *catalog.RatingsRepo, refresh ReadRefresh
 }
 
 // ratingReader is repo as an itemRatingReader, nil when repo is nil.
+//
+//nolint:iface // Returning the interface preserves a nil rating source; a *catalog.RatingsRepo result would become a non-nil interface holding a nil pointer.
 func ratingReader(repo *catalog.RatingsRepo) itemRatingReader {
 	if repo == nil {
 		return nil
@@ -886,7 +888,7 @@ func (rr *rowRead) exclusionSet(ctx context.Context) (map[string]struct{}, error
 
 // ratedSet is every title the profile rated, a rated episode as its series.
 func (rr *rowRead) ratedSet(ctx context.Context) (map[string]struct{}, error) {
-	if rr.rated == nil {
+	if rr.rated == nil { //nolint:nestif // upstream ratedSet in reader.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
 		ratedIDs, err := rr.reader.repo.ListRatedItemIDs(ctx, rr.userID, rr.profileID)
 		if err != nil {
 			return nil, err

@@ -127,11 +127,11 @@ func releaseSet(alias string, slots []artworkReleaseSlot, clearSourceless bool) 
 	parts := make([]string, 0, len(slots)+1)
 	for _, slot := range slots {
 		path, source := alias+"."+slot.path, alias+"."+slot.source
-		clear := ""
+		clearSQL := ""
 		if clearSourceless {
-			clear = fmt.Sprintf(" WHEN %s THEN ''", sourcelessCopySQL(path, source))
+			clearSQL = fmt.Sprintf(" WHEN %s THEN ''", sourcelessCopySQL(path, source))
 		}
-		parts = append(parts, fmt.Sprintf("%s = CASE WHEN %s THEN %s%s ELSE %s END", slot.path, releasableSQL(path, source), source, clear, path))
+		parts = append(parts, fmt.Sprintf("%s = CASE WHEN %s THEN %s%s ELSE %s END", slot.path, releasableSQL(path, source), source, clearSQL, path))
 	}
 	parts = append(parts, "updated_at = NOW()")
 	return strings.Join(parts, ", ")

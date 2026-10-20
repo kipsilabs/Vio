@@ -111,7 +111,8 @@ func resolveCopyPlan(ctx context.Context, opts TranscodeOpts) *copySegmentPlan {
 		return planCopySegments(ctx, opts)
 	}
 	path := filepath.Join(opts.OutputDir, copyPlanRecordFile)
-	if data, err := os.ReadFile(path); err == nil {
+	//nolint:nestif // upstream resolveCopyPlan in copy_keyframe_plan.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
+	if data, err := os.ReadFile(path); err == nil { //nolint:gosec // Path is the transcode output directory's own plan record.
 		var rec copyPlanRecord
 		if err := json.Unmarshal(data, &rec); err == nil {
 			if !rec.Planned {
@@ -142,7 +143,7 @@ func resolveCopyPlan(ctx context.Context, opts TranscodeOpts) *copySegmentPlan {
 	data, err := json.Marshal(rec)
 	if err == nil {
 		tmp := path + ".tmp"
-		if err = os.WriteFile(tmp, data, 0o644); err == nil {
+		if err = os.WriteFile(tmp, data, 0o600); err == nil {
 			err = os.Rename(tmp, path)
 		}
 	}

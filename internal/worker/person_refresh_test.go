@@ -245,7 +245,7 @@ func TestPersonRefreshWorkerStoppedDuringOnDemandClaimsNothing(t *testing.T) {
 func TestPersonRefreshWorkerPausesOnOnDemandRateLimit(t *testing.T) {
 	service := &fakePersonRefresher{
 		batches: [][]int64{{1, 2, 3}},
-		errs:    map[int64]error{99: rateLimitErr{retryAfter: 30 * time.Minute}},
+		errs:    map[int64]error{99: rateLimitError{retryAfter: 30 * time.Minute}},
 	}
 	w := newTestPersonRefreshWorker(service)
 	w.Enqueue(99, nil)
@@ -255,7 +255,7 @@ func TestPersonRefreshWorkerPausesOnOnDemandRateLimit(t *testing.T) {
 
 	service = &fakePersonRefresher{
 		batches: [][]int64{{1, 2, 3}},
-		errs:    map[int64]error{99: rateLimitErr{}},
+		errs:    map[int64]error{99: rateLimitError{}},
 	}
 	w = newTestPersonRefreshWorker(service)
 	service.onRefresh = func(id int64) {
@@ -286,18 +286,18 @@ func TestPersonRefreshWorkerStopsMidBatch(t *testing.T) {
 	}
 }
 
-// rateLimitErr is a lookup a provider rate limited.
-type rateLimitErr struct{ retryAfter time.Duration }
+// rateLimitError is a lookup a provider rate limited.
+type rateLimitError struct{ retryAfter time.Duration }
 
-func (e rateLimitErr) Error() string                      { return "rate limited" }
-func (e rateLimitErr) RateLimitRetryAfter() time.Duration { return e.retryAfter }
+func (e rateLimitError) Error() string                      { return "rate limited" }
+func (e rateLimitError) RateLimitRetryAfter() time.Duration { return e.retryAfter }
 
 // A rate-limited lookup ends the batch and pauses background claims, while
 // on-demand lookups keep running (#1606).
 func TestPersonRefreshWorkerPausesBackgroundLookupsOnRateLimit(t *testing.T) {
 	service := &fakePersonRefresher{
 		batches: [][]int64{{1, 2, 3}, {4, 5, 6}},
-		errs:    map[int64]error{2: rateLimitErr{}},
+		errs:    map[int64]error{2: rateLimitError{}},
 	}
 	w := newTestPersonRefreshWorker(service)
 	now := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
@@ -335,7 +335,7 @@ func TestPersonRefreshWorkerRateLimitBackoff(t *testing.T) {
 	pause := func() time.Duration { return w.pausedUntil.Sub(now) }
 
 	for _, want := range []time.Duration{time.Minute, 2 * time.Minute, 4 * time.Minute, 8 * time.Minute, 15 * time.Minute, 15 * time.Minute} {
-		if !w.rateLimited(rateLimitErr{}) {
+		if !w.rateLimited(rateLimitError{}) {
 			t.Fatal("a rate-limit error didn't pause")
 		}
 		if got := pause(); got != want {
@@ -343,19 +343,19 @@ func TestPersonRefreshWorkerRateLimitBackoff(t *testing.T) {
 		}
 	}
 	w.rateLimited(nil)
-	w.rateLimited(rateLimitErr{retryAfter: 30 * time.Minute})
+	w.rateLimited(rateLimitError{retryAfter: 30 * time.Minute})
 	if got := pause(); got != 30*time.Minute {
 		t.Fatalf("pause = %s, want the provider's 30m", got)
 	}
 	// A rate limit without a Retry-After right after doesn't shorten it.
-	w.rateLimited(rateLimitErr{})
+	w.rateLimited(rateLimitError{})
 	if got := pause(); got != 30*time.Minute {
 		t.Fatalf("pause after a shorter rate limit = %s, want the provider's 30m", got)
 	}
 
 	now = now.Add(31 * time.Minute)
 	w.rateLimited(errors.New("timeout"))
-	w.rateLimited(rateLimitErr{})
+	w.rateLimited(rateLimitError{})
 	if got := pause(); got != time.Minute {
 		t.Fatalf("pause after a reset = %s, want 1m", got)
 	}

@@ -444,8 +444,8 @@ func TestPopulationUsesPriorityChangedDuringFetch(t *testing.T) {
 // passes when expire is called, so a test can run it out mid-request without
 // racing a timer.
 type expiringContext struct {
-	context.Context
-	expired chan struct{}
+	context.Context //nolint:containedctx // Test context implements cancellation by expiring on demand.
+	expired         chan struct{}
 }
 
 func newExpiringContext(parent context.Context) *expiringContext {
@@ -683,7 +683,7 @@ func TestPopulationSaveDeadline(t *testing.T) {
 	defer cancelNearlyDone()
 	for _, tc := range []struct {
 		name string
-		ctx  context.Context
+		ctx  context.Context //nolint:containedctx // Test table carries the request contexts under test.
 		want time.Duration
 	}{
 		{"caller waiting", live, time.Minute},
@@ -729,7 +729,7 @@ func TestPopulationShortReadsHoldSlowProvider(t *testing.T) {
 				if _, err := lookup(read); err != nil || provider.calls != 1 {
 					t.Fatalf("read during the hold: err=%v calls=%d, want the provider left alone", err, provider.calls)
 				}
-				time.Sleep(markerReadHold)
+				time.Sleep(markerReadHold) //nolint:forbidigo // Advances past the read hold to exercise the provider retry window.
 				if _, err := lookup(read); !errors.Is(err, context.DeadlineExceeded) || provider.calls != 2 {
 					t.Fatalf("read after the hold: err=%v calls=%d, want the provider asked again", err, provider.calls)
 				}
@@ -778,7 +778,7 @@ func TestPopulationHoldsAreCapped(t *testing.T) {
 		service := NewPopulationService(PopulationOptions{})
 		for i := range markerMemoryLimit + 1 {
 			service.hold(strconv.Itoa(i))
-			time.Sleep(time.Millisecond)
+			time.Sleep(time.Millisecond) //nolint:forbidigo // Advances virtual time in synctest through the hold window.
 		}
 		if len(service.holds) != markerMemoryLimit || service.held("0") || !service.held("1") || !service.held(strconv.Itoa(markerMemoryLimit)) {
 			t.Fatalf("holds=%d, want %d without the first", len(service.holds), markerMemoryLimit)

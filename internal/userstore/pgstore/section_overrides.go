@@ -96,7 +96,7 @@ const sectionOverridesAdvisoryClass int32 = 0x5345434f // "SECO"
 // writers that interleave would lose one profile's change. The lock also
 // covers a value that does not exist yet, which a row lock cannot.
 func lockSectionOverrides(ctx context.Context, tx pgx.Tx, userID int) error {
-	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1, $2)", sectionOverridesAdvisoryClass, int32(userID)); err != nil {
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1, $2)", sectionOverridesAdvisoryClass, int32(userID)); err != nil { //nolint:gosec // Account IDs are serial integers bounded by int32; the class separates the lock namespace.
 		return fmt.Errorf("locking section overrides: %w", err)
 	}
 	return nil
@@ -111,7 +111,7 @@ func (s *PostgresUserStore) updateSectionOverrides(ctx context.Context, scope, l
 	if err != nil {
 		return fmt.Errorf("beginning section overrides update: %w", err)
 	}
-	defer tx.Rollback(ctx) //nolint:errcheck
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op; the update error is returned separately.
 	if err := lockSectionOverrides(ctx, tx, s.userID); err != nil {
 		return err
 	}
@@ -131,9 +131,7 @@ func (s *PostgresUserStore) updateSectionOverrides(ctx context.Context, scope, l
 		_, err = tx.Exec(ctx, "DELETE FROM user_settings WHERE user_id = $1 AND key = $2", s.userID, key)
 	} else {
 		var data []byte
-		if data, err = json.Marshal(next); err != nil {
-			return fmt.Errorf("marshaling section overrides: %w", err)
-		}
+		data, _ = json.Marshal(next)
 		_, err = tx.Exec(ctx,
 			`INSERT INTO user_settings (user_id, key, value) VALUES ($1, $2, $3)
 			 ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value`,

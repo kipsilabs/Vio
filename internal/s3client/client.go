@@ -191,7 +191,7 @@ func (c *Client) GetObject(ctx context.Context, bucket, key string) ([]byte, err
 		}
 		return nil, fmt.Errorf("s3 GetObject %s/%s: %w", bucket, key, err)
 	}
-	defer out.Body.Close()
+	defer func() { _ = out.Body.Close() }()
 
 	data, err := io.ReadAll(out.Body)
 	if err != nil {
@@ -279,11 +279,11 @@ func (c *Client) PutObjectStream(ctx context.Context, bucket, key string, r io.R
 		input.ContentType = aws.String(ct)
 	}
 
-	uploader := manager.NewUploader(c.s3Client, func(u *manager.Uploader) {
+	uploader := manager.NewUploader(c.s3Client, func(u *manager.Uploader) { //nolint:staticcheck // AWS deprecates manager for transfermanager; migrating the upload path is tracked separately.
 		u.PartSize = streamUploadPartSize
 		u.Concurrency = 1
 	})
-	if _, err := uploader.Upload(ctx, input); err != nil {
+	if _, err := uploader.Upload(ctx, input); err != nil { //nolint:staticcheck // Same manager uploader deprecation as NewUploader above.
 		return fmt.Errorf("s3 PutObject stream %s/%s: %w", bucket, key, err)
 	}
 
@@ -318,7 +318,7 @@ func (c *Client) UploadFile(ctx context.Context, bucket, key, path, contentType 
 	if err != nil {
 		return 0, fmt.Errorf("opening upload file %s: %w", path, err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	info, err := file.Stat()
 	if err != nil {
