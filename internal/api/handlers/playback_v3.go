@@ -8357,9 +8357,28 @@ func (h *PlaybackHandler) evaluateSubtitleDegradeInPlaceV3(
 	}
 	degradedStart := subtitleDegradedStartV3(baseStart)
 	eval, evalErr := h.evaluatePreparedReplanCandidateV3(r, session, record, req, degradedStart, file, file, provenance, plannerRequestedFile, plannerSettings, plannerSettingsErr, attemptedKeys, true)
-	if eval != nil {
-		annotateSubtitleDroppedV3(&eval.result)
+	if evalErr != nil || eval == nil || eval.result.Terminal != nil || eval.result.Plan == nil {
+		return eval, evalErr
 	}
+	if eval.result.Plan.Delivery == playback.DeliveryRemuxProgressiveV3 {
+		// The same-release plan may be a progressive remux the API cannot run.
+		// Escalate it before adopting it; a failed escalation means this
+		// release cannot play without the subtitle either, so the caller can
+		// try a playable sibling.
+		audioIndex, _, indexErr := resolveV3AudioIndex(file, eval.start.AudioTrackID, eval.start.AudioTrackIndex)
+		if indexErr != nil {
+			return nil, &candidateErrorV3{Stage: candidateStageAudioRemap, Message: "subtitle degrade audio track resolve failed", Err: indexErr}
+		}
+		input := h.plannerInputV3(r.Context(), eval.start, plannerRequestedFile, file, audioIndex, attemptedKeys, provenance)
+		escalated, escalateErr := h.escalateRefusedProgressiveRemuxV3(
+			r.Context(), headerAuthenticatedMediaV3(eval.start.ClientFeatures),
+			func() playback.PlannerInputV3 { return input }, eval.result)
+		if escalateErr != nil {
+			return nil, &candidateErrorV3{Stage: candidateStageTransport, Reason: escalateErr.reason, Message: escalateErr.message, TransportErr: escalateErr, Err: escalateErr.cause}
+		}
+		eval.result = escalated
+	}
+	eval.result.Plan.DegradationWarnings = append(eval.result.Plan.DegradationWarnings, playback.SubtitleNotShownWarningV3())
 	return eval, evalErr
 }
 
@@ -9257,6 +9276,10 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	replanFallbackAllowed := resolveReplanAutoFallbackV3(h.sessionMgr, session.ID, record) &&
 		(replanAllowsAlternateFileV3(operation, start.QualityPreference) ||
 			(isVirtualPlaybackFile(requestedFile) && operation == playback.ReplanOperationFailureRecoveryV3))
+	// An output change keeps the active edition only because the requested
+	// edition lacks the selected subtitle. Once the subtitle is dropped, the
+	// requested edition is the picture the viewer asked for and is tried first.
+	outputChangeKeptActiveForSubtitle := false
 
 	// detourDroppedSubtitle remembers a selection a speculative detour
 	// through the requested edition could not honor; validation would then
@@ -9413,6 +9436,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 					// An output refresh may make the requested edition viable again,
 					// but it must not retire a healthy active alternate merely because
 					// the viewer selected a track unique to that alternate.
+					outputChangeKeptActiveForSubtitle = requestedFile != nil && requestedFile.ID != currentEffectiveFile.ID
 					effectiveFile = currentEffectiveFile
 				} else if errors.Is(remapErr, errSubtitleUnavailableInTargetV3) {
 					// The target edition has no equivalent track. Playability wins:
@@ -9590,15 +9614,42 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		// request, which a mid-session re-arm updates, so the reconstructed
 		// policy still matches the viewer's intent instead of the original start
 		// request.
-		subtitleOnlyAllowed := replanFallbackAllowed && subtitleOnlyTerminalV3(result.Terminal)
-		// An audio-only refusal takes the same in-place route as a subtitle
+		// A same-release degrade never substitutes the version, so it does not
+		// depend on the version-fallback policy: an explicit pick and a
+		// track_change both keep the mounted release and only drop the
+		// selected track. Seek reanchors replay a frozen recipe and stay out.
+		inPlaceDegradeAllowed := operation != playback.ReplanOperationSeekReanchorV3 &&
+			operation != playback.ReplanOperationSeekFailureRecoveryV3
+		subtitleOnlyAllowed := inPlaceDegradeAllowed && subtitleOnlyTerminalV3(result.Terminal)
+		subtitleResolved := false
+		if subtitleOnlyAllowed && outputChangeKeptActiveForSubtitle && requestedFile != nil && requestedFile.ID != effectiveFile.ID {
+			// The viewer asked to return to this edition; the active one was
+			// kept only for a subtitle that cannot be shown. Try the requested
+			// edition with the subtitle off before falling back to the active
+			// edition without it.
+			degradedStart := subtitleDegradedStartV3(start)
+			if eval, evalErr := h.evaluateReplanCandidateV3(r, session, record, req, degradedStart, effectiveFile, requestedFile, plannerRequestedFile, plannerSettings, plannerSettingsErr, attemptedKeys); evalErr == nil && eval != nil && eval.result.Terminal == nil {
+				start = eval.start
+				effectiveFile = eval.file
+				result = eval.result
+				toneMapCapabilityErr = eval.toneMapErr
+				artifactRecipe = eval.frozenRecipe
+				preparedTransport = &eval.transport
+				transportPrepared = true
+				reservationHeld = eval.reservationHeld
+				if result.Plan != nil {
+					result.Plan.DegradationWarnings = append(result.Plan.DegradationWarnings, playback.SubtitleTrackUnavailableWarningV3())
+				}
+				subtitleResolved = true
+			}
+		}
 		// one: keep the mounted release and re-plan it with another audio
 		// track. audio_conversion_unsupported is not in
 		// terminalAllowsAlternateFileV3, so an audio problem never reaches the
 		// sibling hunt. On a replan the mounted release is known to be
 		// playable, so a failed in-place resolution leaves the terminal in
 		// place rather than substituting a sibling.
-		audioOnlyAllowed := replanFallbackAllowed && audioOnlyTerminalV3(result.Terminal)
+		audioOnlyAllowed := inPlaceDegradeAllowed && audioOnlyTerminalV3(result.Terminal)
 		alternateFileAllowed := replanFallbackAllowed && terminalAllowsAlternateFileV3(result.Terminal)
 		// versionPickFallback remembers whether the hunt below runs for an
 		// explicitly picked but unplannable release, so its success publishes
@@ -9624,7 +9675,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			alternateFileAllowed = true
 			versionPickFallback = true
 		}
-		if subtitleOnlyAllowed {
+		if subtitleOnlyAllowed && !subtitleResolved {
 			// A subtitle-only refusal must not move the release. Re-plan the
 			// file already mounted with the subtitle dropped; the in-place
 			// helper uses the resolved file verbatim, so a virtual release is
@@ -9645,8 +9696,13 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				// Same release: dropping the subtitle leaves the A/V recipe
 				// byte-identical, so the replan reuses the active transport.
 				reservationHeld = eval.reservationHeld
+			} else if outputChange && replanFallbackAllowed {
+				// The release cannot play without the subtitle either, so an
+				// output change may still move to a playable sibling.
+				alternateFileAllowed = true
 			}
-		} else if audioOnlyAllowed {
+		}
+		if audioOnlyAllowed {
 			// An audio-only refusal must not move the release. Re-plan the file
 			// already mounted with another audio track; the helper uses the
 			// resolved file verbatim, so a virtual release is never re-listed or
@@ -9662,7 +9718,8 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				transportPrepared = true
 				reservationHeld = eval.reservationHeld
 			}
-		} else if alternateFileAllowed {
+		}
+		if alternateFileAllowed && result.Terminal != nil {
 			alternateOrder := alternateOrderingForClient(req.Capabilities)
 			if alternates, alternateErr := h.findAlternateFilesOrdered(r.Context(), requestedFile, requestAccessFilter(r), alternateOrder); alternateErr == nil {
 				baseStart := start
