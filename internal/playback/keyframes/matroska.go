@@ -104,7 +104,7 @@ type matroskaIndex struct {
 	frameSeconds float64
 }
 
-func readMatroska(r io.ReaderAt, size int64) (matroskaIndex, error) {
+func readMatroska(r io.ReaderAt, size int64) (matroskaIndex, error) { //nolint:funlen,gocyclo // upstream readMatroska exceeds Vio's 100-line and complexity-30 limits; refactor tracked separately
 	id, dataSize, headerLen, err := readElementHeader(r, 0)
 	if err != nil {
 		if isShortRead(err) {
@@ -294,7 +294,7 @@ func readElementHeader(r io.ReaderAt, off int64) (id uint64, size int64, headerL
 	if !ok {
 		return 0, 0, 0, io.ErrUnexpectedEOF
 	}
-	size = int64(raw)
+	size = int64(raw) //nolint:gosec // readElementData rejects a negative size; an overflowing vint is malformed input.
 	if raw == (uint64(1)<<(7*sizeLen))-1 {
 		size = unknownSize
 	}
@@ -360,10 +360,10 @@ func childrenComplete(data []byte, fn func(id uint64, payload []byte)) bool {
 			return false
 		}
 		start := idLen + sizeLen
-		if raw > uint64(len(data)-start) {
+		if raw > uint64(len(data)-start) { //nolint:gosec // raw is bounded by len(data)-start before conversion; len is non-negative.
 			return false
 		}
-		end := start + int(raw)
+		end := start + int(raw) //nolint:gosec // raw is bounded by len(data)-start before conversion, so int(raw) fits.
 		fn(id, data[start:end])
 		data = data[end:]
 	}
@@ -383,10 +383,10 @@ func children(data []byte, fn func(id uint64, payload []byte)) {
 			return
 		}
 		start := idLen + sizeLen
-		if raw > uint64(len(data)-start) {
+		if raw > uint64(len(data)-start) { //nolint:gosec // raw is bounded by len(data)-start before conversion; len is non-negative.
 			return
 		}
-		end := start + int(raw)
+		end := start + int(raw) //nolint:gosec // raw is bounded by len(data)-start before conversion, so int(raw) fits.
 		fn(id, data[start:end])
 		data = data[end:]
 	}
@@ -426,7 +426,7 @@ func seekPosition(seekHead []byte, target uint64) (int64, bool) {
 			case idSeekID:
 				seekID = readUint(v)
 			case idSeekPosition:
-				seekPos = int64(readUint(v))
+				seekPos = int64(readUint(v)) //nolint:gosec // Seek position is a container file offset; a negative result is rejected by the following check.
 			}
 		})
 		if seekID == target && seekPos >= 0 {
@@ -444,7 +444,7 @@ func parseInfo(info []byte) (timescale int64, duration float64, ok bool) {
 	children(info, func(id uint64, v []byte) {
 		switch id {
 		case idTimestampScale:
-			if s := int64(readUint(v)); s > 0 {
+			if s := int64(readUint(v)); s > 0 { //nolint:gosec // Timestamp scale must be positive; a non-positive conversion is rejected.
 				timescale = s
 			} else {
 				ok = false
@@ -544,7 +544,7 @@ func walkCuePoints(cues []byte, video uint64, fn func(ticks uint64, cluster int6
 					case idCueTrack:
 						track = readUint(v)
 					case idCueClusterPosition:
-						pos = int64(readUint(v))
+						pos = int64(readUint(v)) //nolint:gosec // Cue cluster position is a container file offset; negative values are not used as video.
 					}
 				}) {
 					complete = false

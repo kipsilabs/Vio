@@ -11275,16 +11275,6 @@ type alternateCandidateV3 struct {
 	toneMapErr error
 }
 
-// appendWarningOnceV3 adds warning unless one with the same code is already
-// present, so a subtitle dropped by both the version remap and the planner's
-// policy fallback is reported once.
-func appendWarningOnceV3(warnings []playback.DegradationWarningV3, warning playback.DegradationWarningV3) []playback.DegradationWarningV3 {
-	if slices.ContainsFunc(warnings, func(existing playback.DegradationWarningV3) bool { return existing.Code == warning.Code }) {
-		return warnings
-	}
-	return append(warnings, warning)
-}
-
 func replanAllowsAlternateFileV3(operation playback.ReplanOperationV3, qualityPreference string) bool {
 	switch operation {
 	case playback.ReplanOperationFailureRecoveryV3, playback.ReplanOperationQualityChangeV3, playback.ReplanOperationOutputChangeV3:

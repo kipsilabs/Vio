@@ -13,7 +13,7 @@ import (
 
 // The repository lists the matched items a scan scope touches with the
 // folders of all their files, and stores fingerprints per target.
-func TestLocalSidecarRepositoryDB(t *testing.T) {
+func TestLocalSidecarRepositoryDB(t *testing.T) { //nolint:funlen,gocyclo // upstream TestLocalSidecarRepositoryDB exceeds Vio's 100-line and complexity-30 limits; refactor tracked separately
 	pool := localArtworkTestPool(t)
 	ctx := context.Background()
 	repo := NewLocalSidecarRepository(pool)
@@ -269,7 +269,7 @@ func TestLocalSidecarRepositoryDB(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatal("the second check never waited for the item lock")
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond) //nolint:forbidigo // Polls the blocked sidecar check count.
 	}
 	unlock()
 	if !<-acquired {

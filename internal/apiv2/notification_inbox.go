@@ -55,7 +55,7 @@ type NotificationItem struct {
 // NotificationReasonFlags is a delivery's event-specific reason data: the
 // stored reason_flags object, carried as written. Its keys depend on the
 // delivery type, so the contract declares only an object.
-type NotificationReasonFlags []byte
+type NotificationReasonFlags []byte //nolint:recvcheck // encoding/json requires a value MarshalJSON and a pointer UnmarshalJSON.
 
 func (v NotificationReasonFlags) MarshalJSON() ([]byte, error) {
 	if len(v) == 0 {

@@ -173,7 +173,7 @@ func ProbeFile(ctx context.Context, ffprobePath string, filePath string) (*Probe
 func probeFileWithin(ctx context.Context, ffprobePath string, filePath string, limits probeLimits) (*ProbeData, error) {
 	probeCtx, cancel := context.WithTimeout(ctx, limits.probe)
 	defer cancel()
-	cmd := exec.CommandContext(probeCtx, ffprobePath, buildProbeArgs(filePath)...)
+	cmd := exec.CommandContext(probeCtx, ffprobePath, buildProbeArgs(filePath)...) //nolint:gosec // ffprobePath is the configured binary and filePath is a catalog media path; no shell is involved.
 	killProcessGroupOnCancel(cmd)
 	cmd.WaitDelay = limits.waitDelay
 
@@ -807,7 +807,7 @@ func probeVideoPacketDuration(
 ) (int, error) {
 	packetCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	cmd := exec.CommandContext(packetCtx, ffprobePath,
+	cmd := exec.CommandContext(packetCtx, ffprobePath, //nolint:gosec // ffprobePath is the configured binary and filePath is a catalog media path; no shell is involved.
 		"-v", "error",
 		"-select_streams", "v:0",
 		"-show_entries", "packet=pts_time",

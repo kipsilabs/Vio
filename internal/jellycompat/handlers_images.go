@@ -815,7 +815,7 @@ func (h *ImagesHandler) proxyImageURL(w http.ResponseWriter, r *http.Request, im
 	}
 
 	ctx := artworkurl.FetchContext(r.Context(), h.artworkStore, target.String())
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil) //nolint:gosec // target passed parseRemoteImageURL's http/https and host check; proxying provider artwork is this endpoint's purpose.
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "UpstreamError", "Failed to load image")
 		return

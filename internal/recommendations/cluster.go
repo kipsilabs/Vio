@@ -70,7 +70,7 @@ func kmeansRestartSeed(items []clusterItem, k, r int) int64 {
 // index, and the partition's inertia: the sum of the items' squared distances
 // to their centroids. It leaves weights out, so a choice between partitions
 // by inertia does not change as the weights decay.
-func kmeansRun(items []clusterItem, k int, seed int64) ([]int, float64) {
+func kmeansRun(items []clusterItem, k int, seed int64) ([]int, float64) { //nolint:funlen // upstream kmeansRun exceeds Vio's 100-line limit; refactor tracked separately
 	n := len(items)
 	if n == 0 || k <= 0 {
 		return nil, 0
@@ -80,7 +80,7 @@ func kmeansRun(items []clusterItem, k int, seed int64) ([]int, float64) {
 	}
 
 	dims := len(items[0].embedding)
-	rng := rand.New(rand.NewSource(seed))
+	rng := rand.New(rand.NewSource(seed)) //nolint:gosec // K-means initialization only; the seed selects a partition, not a security value.
 
 	// --- k-means++ initialization ---
 	// Select the first centroid uniformly at random.

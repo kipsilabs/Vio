@@ -111,7 +111,7 @@ func localMetadataUnreadableLevels(ctx context.Context) localArtworkLevel {
 // artwork would replace the cached local copy. The local copy gives way only
 // when the refresh can confirm the sidecar is gone (see sidecarGone).
 type localArtworkRetention struct {
-	ctx       context.Context
+	ctx       context.Context //nolint:containedctx // Retention lives for one metadata refresh and carries its request context to its probes.
 	contentID string
 	// searched is set when the refresh asked the local provider for artwork
 	// at this retention's level (withLocalArtworkSearched); otherwise nothing

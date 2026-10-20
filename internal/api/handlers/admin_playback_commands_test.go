@@ -386,6 +386,6 @@ func TestUnconfirmedPauseEndsTheAttemptAsAdministratorStop(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatalf("attempt not ended by administrator: %+v, %v", record, err)
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond) //nolint:forbidigo // Polls the attempt record; the administrator stop has no completion channel.
 	}
 }

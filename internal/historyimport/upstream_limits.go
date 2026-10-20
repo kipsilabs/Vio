@@ -139,7 +139,7 @@ func retainItems[T retainedSizer](ctx context.Context, items []T) error {
 const mapEntryOverhead = 48
 
 func sizeOf[T any]() int64 {
-	return int64(reflect.TypeFor[T]().Size())
+	return int64(reflect.TypeFor[T]().Size()) //nolint:gosec // reflect.Type.Size returns uintptr; supported builds are 64-bit and it fits int64.
 }
 
 func stringBytes(values ...string) int64 {

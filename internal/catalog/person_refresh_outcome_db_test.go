@@ -342,7 +342,7 @@ func TestRecordRefreshOutcomeConcurrentWritesBothCountPostgres(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatalf("only %d outcome writes waiting on the row lock", waiting)
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(20 * time.Millisecond) //nolint:forbidigo // Polls the blocked outcome writer count.
 	}
 	if err := holder.Commit(ctx); err != nil {
 		t.Fatal(err)

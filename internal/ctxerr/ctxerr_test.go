@@ -43,7 +43,7 @@ func TestLogLevelNeedsTheCallerGone(t *testing.T) {
 	defer cancelExpired()
 	for _, tc := range []struct {
 		name string
-		ctx  context.Context
+		ctx  context.Context //nolint:containedctx // Test table carries the request contexts under test.
 		err  error
 		want slog.Level
 	}{

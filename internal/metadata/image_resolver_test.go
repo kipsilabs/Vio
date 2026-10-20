@@ -482,7 +482,7 @@ func (c *stubPluginImageClient) ResolveImageURLs(ctx context.Context, req *plugi
 // detached from the caller, so no context can cut it short.
 func stubPluginSource(launch time.Duration, client *stubPluginImageClient) PluginImageResolverSource {
 	return NewPluginClientSource(1, "tmdb", func(context.Context, int, string) (PluginMetadataClient, error) {
-		time.Sleep(launch)
+		time.Sleep(launch) //nolint:forbidigo // Simulates a detached plugin launch that takes the configured duration.
 		return client, nil
 	})
 }

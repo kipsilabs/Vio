@@ -25,15 +25,6 @@ func withWebhookReceivedAt(ctx context.Context, at time.Time) context.Context {
 	return context.WithValue(ctx, webhookReceivedAtKey{}, at)
 }
 
-// webhookReceivedAt returns when the delivery started arriving, or now when
-// the caller did not record it.
-func webhookReceivedAt(ctx context.Context) time.Time {
-	if at, ok := ctx.Value(webhookReceivedAtKey{}).(time.Time); ok {
-		return at
-	}
-	return time.Now()
-}
-
 type PlexProvider struct {
 	client *historyimport.PlexClient
 }

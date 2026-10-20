@@ -152,8 +152,8 @@ func interleaveAnchors(lists [][]ScoredItem, slots []int, limit int) []ScoredIte
 				if !active[i] {
 					continue
 				}
-				current[i] += slots[i]
-				total += slots[i]
+				current[i] += slots[i] //nolint:gosec // i ranges over slices sized n; gosec cannot infer the loop bound.
+				total += slots[i]      //nolint:gosec // i ranges over slices sized n; gosec cannot infer the loop bound.
 				if pick < 0 || current[i] > current[pick] {
 					pick = i
 				}
@@ -162,7 +162,7 @@ func interleaveAnchors(lists [][]ScoredItem, slots []int, limit int) []ScoredIte
 				break
 			}
 			current[pick] -= total
-			if !take(pick) || (withinSlots && placed[pick] >= slots[pick]) {
+			if !take(pick) || (withinSlots && placed[pick] >= slots[pick]) { //nolint:gosec // pick is a validated index from range n after the pick < 0 check.
 				active[pick] = false
 			}
 		}

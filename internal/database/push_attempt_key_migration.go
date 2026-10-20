@@ -56,6 +56,7 @@ func scopePushAttemptKey(ctx context.Context, db *sql.DB, schema string) error {
 // beside a delivery's own, so they are detached from their deliveries first;
 // their history rows remain.
 func widenPushAttemptKey(ctx context.Context, db *sql.DB, schema string) error {
+	//nolint:gosec // Schema identifier is sanitized by pgx.Identifier; only fixed SQL text follows.
 	if _, err := db.ExecContext(ctx, `UPDATE `+pgx.Identifier{schema}.Sanitize()+`.push_delivery_attempts
 		SET notification_delivery_id = NULL
 		WHERE trigger_type = 'test' AND notification_delivery_id IS NOT NULL`); err != nil {

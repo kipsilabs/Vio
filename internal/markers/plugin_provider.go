@@ -210,8 +210,8 @@ func (p *PluginProvider) FetchMarkers(ctx context.Context, req Request) (Result,
 	response, err := client.FetchMarkers(ctx, &pluginv1.FetchMarkersRequest{
 		ItemType:           itemTypeName(req.Kind),
 		ExternalIds:        externalIDsProto(req.ExternalIDs),
-		SeasonNumber:       int32(season),
-		EpisodeNumber:      int32(episode),
+		SeasonNumber:       int32(season),  //nolint:gosec // markerCoordinate clamps both coordinates below MaxProviderSeason/MaxProviderEpisode, within int32.
+		EpisodeNumber:      int32(episode), //nolint:gosec // markerCoordinate clamps both coordinates below MaxProviderSeason/MaxProviderEpisode, within int32.
 		DurationSeconds:    req.Duration.Seconds(),
 		EpisodeExternalIds: episodeExternalIDsProto(req.EpisodeExternalIDs),
 		EpisodeNumbering:   req.EpisodeNumbering,
@@ -259,8 +259,8 @@ func (p *PluginProvider) SubmitMarker(ctx context.Context, req SubmissionRequest
 	body := &pluginv1.SubmitMarkerRequest{
 		ItemType:           itemTypeName(req.Kind),
 		ExternalIds:        externalIDsProto(req.ExternalIDs),
-		SeasonNumber:       int32(season),
-		EpisodeNumber:      int32(episode),
+		SeasonNumber:       int32(season),  //nolint:gosec // markerCoordinate clamps both coordinates below MaxProviderSeason/MaxProviderEpisode, within int32.
+		EpisodeNumber:      int32(episode), //nolint:gosec // markerCoordinate clamps both coordinates below MaxProviderSeason/MaxProviderEpisode, within int32.
 		Segment:            markerKindName(req.Segment),
 		DurationSeconds:    req.Duration.Seconds(),
 		EpisodeExternalIds: episodeExternalIDsProto(req.EpisodeExternalIDs),

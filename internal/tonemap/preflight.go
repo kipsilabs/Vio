@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -444,14 +443,6 @@ type preflightFrame struct {
 // sideDataRecord is one FFprobe side-data entry, identified by its label.
 type sideDataRecord struct {
 	Type string `json:"side_data_type"`
-}
-
-// hasDolbyVisionMetadata reports whether the decoder attached a parsed RPU,
-// which FFprobe labels "Dolby Vision Metadata".
-func (frame preflightFrame) hasDolbyVisionMetadata() bool {
-	return slices.ContainsFunc(frame.SideData, func(sideData sideDataRecord) bool {
-		return strings.EqualFold(strings.TrimSpace(sideData.Type), "Dolby Vision Metadata")
-	})
 }
 
 // inspectSourceFrame reads color metadata from one decoded frame at position.

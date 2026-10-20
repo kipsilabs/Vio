@@ -105,7 +105,7 @@ type MarkerThumbnail struct {
 }
 
 func MarkerThumbnailIdentity(file *MediaFile, segment MarkerSegment) string {
-	value, _ := json.Marshal([]any{MarkerFileIdentity(file), file.FilePath, segment})
+	value, _ := json.Marshal([]any{MarkerFileIdentity(file), file.FilePath, segment}) //nolint:errchkjson // []any holds only strings and MarkerSegment; keep its encoding for persisted digests.
 	digest := sha256.Sum256(value)
 	return hex.EncodeToString(digest[:])
 }

@@ -73,7 +73,7 @@ func LoadVerified(ctx context.Context, path string) (Index, error) {
 }
 
 func load(ctx context.Context, path string, wait bool) (Index, error) {
-	f, err := os.Open(path)
+	f, err := os.Open(path) //nolint:gosec // Path is a catalog media file selected by the playback planner.
 	if err != nil {
 		return Index{}, err
 	}
@@ -127,7 +127,7 @@ func transient(err error) bool {
 // contextReaderAt stops a full check once its caller has gone: every read
 // fails with the context's error.
 type contextReaderAt struct {
-	ctx context.Context
+	ctx context.Context //nolint:containedctx // io.ReaderAt has no context parameter; the adapter stops reads when the caller ends.
 	r   io.ReaderAt
 }
 

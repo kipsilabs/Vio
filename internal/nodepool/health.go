@@ -285,7 +285,7 @@ type HealthChecker struct {
 
 	// ctx is the context Start ran with; the rechecks started between sweeps
 	// end with it. Guarded by mu.
-	ctx context.Context
+	ctx context.Context //nolint:containedctx // Health checker owns the lifetime context Start set; it is guarded by mu.
 	// broadcastUnreachable tells other API servers about a transcode node this
 	// one could not connect to. Guarded by mu.
 	broadcastUnreachable func(payload string)
@@ -460,7 +460,7 @@ func (hc *HealthChecker) publishHealth(ctx context.Context, n *Node, report Heal
 			"drain_state", report.DrainState, "active_jobs", report.ActiveJobs)
 	}
 
-	if hc.repo != nil {
+	if hc.repo != nil { //nolint:nestif // upstream publishHealth in health.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
 		// Fenced on the URL that was checked: last_stats feeds transcode
 		// admission, so one worker's disk reading must never land on a
 		// row an administrator has since repointed at another.

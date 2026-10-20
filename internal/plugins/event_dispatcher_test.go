@@ -151,7 +151,7 @@ func (d *EventDispatcher) deliverDue(ctx context.Context) {
 			d.claimAndDeliver(ctx)
 			d.inflight.Wait()
 		}
-		time.Sleep(time.Millisecond)
+		time.Sleep(time.Millisecond) //nolint:forbidigo // Polls the dispatcher's in-flight work.
 	}
 }
 

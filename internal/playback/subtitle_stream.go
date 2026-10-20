@@ -231,7 +231,7 @@ func windowFromCachedSup(opts StreamExtractOpts, firstCue float64) StreamExtract
 // readSupFirstCue returns the time, in seconds, of the first segment in a
 // .sup file.
 func readSupFirstCue(path string) (float64, error) {
-	f, err := os.Open(path)
+	f, err := os.Open(path) //nolint:gosec // Path is a catalog subtitle file selected by the playback planner.
 	if err != nil {
 		return 0, err
 	}

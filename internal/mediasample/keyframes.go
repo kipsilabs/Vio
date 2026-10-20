@@ -106,7 +106,7 @@ func sheetKeyframes(ctx context.Context, req Request) []float64 {
 // or returns nil. The file opens without blocking, so a FIFO in its place
 // cannot hold the lookup, and only a regular file is read.
 func matroskaKeyframes(ctx context.Context, path string) []float64 {
-	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0) //nolint:gosec // Path is a catalog media file; O_NONBLOCK and the regular-file check confine the read.
 	if err != nil {
 		return nil
 	}
@@ -124,7 +124,7 @@ func matroskaKeyframes(ctx context.Context, path string) []float64 {
 
 // contextReaderAt stops reading once ctx ends.
 type contextReaderAt struct {
-	ctx context.Context
+	ctx context.Context //nolint:containedctx // io.ReaderAt has no context parameter; the adapter stops reads when the request ends.
 	r   io.ReaderAt
 }
 
