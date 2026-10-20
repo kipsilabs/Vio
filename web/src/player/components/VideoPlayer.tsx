@@ -4868,6 +4868,12 @@ export function VideoPlayer({
           video.paused &&
           transportStartupPendingRef.current &&
           video.readyState < HTMLMediaElement.HAVE_FUTURE_DATA;
+        if (awaitingMedia) {
+          // A room play held for this transport has not shown a frame yet.
+          // A failure before that frame resumes at the room's position, not
+          // the previous transport's local time.
+          streamPlayedRef.current = false;
+        }
         const playAllowed = !awaitingMedia && applyRoomPosition(video);
 
         if (command.action === "seek") {
