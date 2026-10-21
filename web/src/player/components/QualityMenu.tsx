@@ -1,3 +1,8 @@
+import { useProviderResultEnrichment } from "@/components/streaming/useProviderResultDisplay";
+import {
+  ProviderResultDisplayToggle,
+  ProviderResultText,
+} from "@/components/streaming/ProviderResultDisplay";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Check, RefreshCw, Settings } from "lucide-react";
 import { IndexerReleaseList } from "@/components/streaming/IndexerReleaseList";
@@ -24,6 +29,7 @@ export interface VersionInfo {
   fileId: number;
   label: string;
   releaseName?: string;
+  providerText?: string;
   /** Release + structured size + source hint, shared with the item-page picker.
    *  Preferred over `releaseName` when present so both menus show the same. */
   detail?: string;
@@ -127,6 +133,8 @@ export function QualityMenu({
   const visibleIndexerReleases = indexerRequest ? indexerReleases : [];
   // The viewer's per-profile display order. It only re-orders the list below;
   // the server's auto-pick is untouched.
+  const enrichProviderResults = useProviderResultEnrichment();
+  const hasProviderText = (versions ?? []).some((version) => version.providerText);
   const { criteria: userCriteria, apply: applySort, reset: resetSort } = useVersionSortPreference();
   const serverRanking = useMemo(
     () =>
@@ -241,7 +249,8 @@ export function QualityMenu({
   // Mirrors the render condition of the Version/Quality header block: the
   // refresh action lives inside it, so it renders only when this is true.
   const menuBlockRendered = versionRowsRendered || indexerRowsRendered;
-  const topRefreshRowIndex = speedRowCount;
+  const providerToggleRendered = versionRowsRendered && hasProviderText;
+  const topRefreshRowIndex = speedRowCount + (providerToggleRendered ? 1 : 0);
   const autoRowIndex = topRefreshRowIndex + (onRefreshVersions ? 1 : 0);
   const versionRowStart = autoRowIndex + (autoRowRendered ? 1 : 0);
   const indexerRowStart = versionRowStart + (versionRowsRendered ? orderedVersions.length : 0);
@@ -290,7 +299,7 @@ export function QualityMenu({
       {open && (
         <PlayerMenuSurface
           anchorRef={menuRef}
-          className="absolute right-0 bottom-full z-30 mb-2 max-h-[calc(100dvh-8rem)] min-w-[224px] overflow-y-auto rounded-lg bg-black/90 py-1 shadow-lg backdrop-blur"
+          className="absolute right-0 bottom-full z-30 mb-2 max-h-[calc(100dvh-8rem)] max-w-[calc(100vw-2rem)] min-w-[224px] overflow-y-auto rounded-lg bg-black/90 py-1 shadow-lg backdrop-blur"
           onClose={() => setOpen(false)}
           onKeyDown={handleMenuKeyDown}
         >
@@ -321,6 +330,13 @@ export function QualityMenu({
                 <div className="px-3 py-1 text-xs tracking-wider text-white/40 uppercase">
                   Version
                 </div>
+                {providerToggleRendered && (
+                  <ProviderResultDisplayToggle
+                    buttonRef={(element) => {
+                      menuItemsRef.current[speedRowCount] = element;
+                    }}
+                  />
+                )}
                 {onRefreshVersions && (
                   <VersionRefreshRow
                     rowIndex={topRefreshRowIndex}
@@ -375,13 +391,14 @@ export function QualityMenu({
                       const idx = versionRowStart + versionIndex;
                       const statusLabels = buildVersionStatusLabels(v);
                       const health = versionHealthOf(v);
-                      const hasScore = hasFormatScore(v.formatScore);
+                      const showDetails = !v.providerText || enrichProviderResults;
+                      const hasScore = showDetails && hasFormatScore(v.formatScore);
                       // One detail derivation for both lists; `detail` carries the
                       // shared release+size+hint line, and `releaseName` is only a
                       // fallback for callers that supply no detail at all.
-                      const detailLine = v.detail || v.releaseName;
-                      const audioLanguages = v.audioLanguages ?? [];
-                      const subtitleLanguages = v.subtitleLanguages ?? [];
+                      const detailLine = v.providerText ? undefined : v.detail || v.releaseName;
+                      const audioLanguages = showDetails ? (v.audioLanguages ?? []) : [];
+                      const subtitleLanguages = showDetails ? (v.subtitleLanguages ?? []) : [];
                       const hasBadges =
                         hasScore ||
                         statusLabels.length > 0 ||
@@ -405,7 +422,8 @@ export function QualityMenu({
                         >
                           <span className="flex min-w-0 items-center gap-2">
                             <span className="min-w-0">
-                              <span className="block truncate">{v.label}</span>
+                              {v.providerText && <ProviderResultText text={v.providerText} />}
+                              {showDetails && <span className="block truncate">{v.label}</span>}
                               {detailLine && (
                                 <span className="block truncate text-[11px] text-white/50">
                                   {detailLine}

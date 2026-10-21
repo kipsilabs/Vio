@@ -353,22 +353,32 @@ func CandidateVariantID(candidate StreamCandidate) string {
 	return hex.EncodeToString(digest[:12])
 }
 
-// CandidateDisplayName formats a clean display name for a stream candidate.
+// CandidateDisplayName preserves the addon's name and description (or legacy
+// title) as plain text. The label is persisted in edition_raw for version lists;
+// derived quality belongs in the optional client enrichment instead.
 func CandidateDisplayName(candidate StreamCandidate) string {
-	name := strings.TrimSpace(candidate.Name)
-	if name == "" {
-		name = strings.TrimSpace(candidate.Title)
+	description := candidate.Description
+	if strings.TrimSpace(description) == "" {
+		description = candidate.Title
 	}
-	if name == "" {
-		name = candidate.Resolution
+	parts := make([]string, 0, 2)
+	for _, value := range []string{candidate.Name, description} {
+		if strings.TrimSpace(value) != "" {
+			parts = append(parts, value)
+		}
 	}
-	clean := strings.Map(func(r rune) rune {
-		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+	label := strings.Join(parts, "\n")
+	if label == "" {
+		label = candidate.Resolution
+	}
+	// PostgreSQL text cannot store NUL. Preserve line breaks, tabs, and Unicode
+	// joiners so multi-line descriptions and compound emoji survive unchanged.
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) && r != '\n' && r != '\r' && r != '\t' {
 			return -1
 		}
 		return r
-	}, name)
-	return strings.TrimSpace(clean)
+	}, label)
 }
 
 func canonicalAudioLanguage(token string) string {

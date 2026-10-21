@@ -555,3 +555,23 @@ func TestCandidateLanguageMatchRankAliases(t *testing.T) {
 		t.Fatalf("regional vs bare rank = %d, want 2 (variant, never bare)", got)
 	}
 }
+
+func TestCandidateDisplayNamePreservesProviderFormatting(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		candidate StreamCandidate
+		want      string
+	}{
+		{"description", StreamCandidate{Name: "⚡ Provider\n4K", Description: "🎬 Movie.2024\n👨‍👩‍👧 English", FileSize: 5_000_000_000}, "⚡ Provider\n4K\n🎬 Movie.2024\n👨‍👩‍👧 English"},
+		{"title fallback", StreamCandidate{Name: "Provider", Title: "Movie\n🇪🇸 Spanish"}, "Provider\nMovie\n🇪🇸 Spanish"},
+		{"description wins", StreamCandidate{Name: "Provider", Description: "Description", Title: "Title"}, "Provider\nDescription"},
+		{"no name", StreamCandidate{Description: "🎬 Movie\nEnglish"}, "🎬 Movie\nEnglish"},
+		{"empty fallback", StreamCandidate{Resolution: "1080p"}, "1080p"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := CandidateDisplayName(tc.candidate); got != tc.want {
+				t.Fatalf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

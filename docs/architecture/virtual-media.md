@@ -85,6 +85,22 @@ declared disposition. Synthesized or hint-only tracks (container index < 0) neve
 satisfy completeness and never stamp `probe_updated_at`; persisted probe evidence
 requires a real stream index.
 
+## Provider result presentation
+
+Stremio candidate labels preserve the provider's `name` followed by its
+`description`, falling back to the legacy `title` when the description is empty.
+Line breaks and Unicode emoji joiners remain intact; non-display control
+characters, including NUL, are removed before persistence. The existing `Label`
+path stores this display-only text in `media_files.edition_raw`; release identity,
+ranking, and playback selection continue to use their own fields.
+
+The web version pickers render the label as plain text. Quality, source, and
+language enrichment is optional, defaults off, and is remembered per browser.
+Availability warnings stay visible in either mode. Existing rows gain the original
+description when candidates are refreshed; no API fields or settings keys are added.
+Apple, Android, and Jellyfin clients keep their existing presentation: this toggle
+belongs to the web UI and requires no protocol changes.
+
 ## Provider stream order
 
 Setting `virtual_library.custom_format_preset` to `server-order` preserves the

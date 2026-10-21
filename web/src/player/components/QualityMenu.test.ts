@@ -848,3 +848,47 @@ describe("playback speed", () => {
     expect(trigger.querySelector(".player-speed-badge")).toHaveTextContent(/^1\.5×$/);
   });
 });
+
+it("shows original provider text and optionally adds quality and languages", async () => {
+  localStorage.clear();
+  const original = "⚡ Provider\n🎬 Movie.WEB-DL\n🇪🇸 Spanish";
+  renderVersionMenu({
+    versions: [
+      makeVersionInfo({
+        providerText: original,
+        label: "1080p · WEB-DL",
+        audioLanguages: ["Spanish"],
+        unavailable: true,
+      }),
+      makeVersionInfo({ fileId: 2, label: "Other version" }),
+    ],
+  });
+  const text = await screen.findByText(
+    (_, element) => element?.childElementCount === 0 && element.textContent === original,
+  );
+  expect(text).toHaveClass("whitespace-pre-wrap");
+  expect(screen.queryByText("Spanish")).not.toBeInTheDocument();
+  expect(screen.getByText("Will retry on play")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("switch", { name: /Enrich/ }));
+  expect(screen.getByText("1080p · WEB-DL")).toBeInTheDocument();
+  expect(screen.getByText("Spanish")).toBeInTheDocument();
+  expect(text).toBeInTheDocument();
+});
+
+it("keeps provider enrichment in the keyboard order before refresh and Auto", () => {
+  localStorage.clear();
+  renderVersionMenu({
+    versions: [
+      makeVersionInfo({ providerText: "Provider result" }),
+      makeVersionInfo({ fileId: 2 }),
+    ],
+    onRefreshVersions: vi.fn().mockResolvedValue(undefined),
+    onSelectAutoVersion: vi.fn(),
+  });
+  const toggle = screen.getByRole("switch", { name: /Enrich/ });
+  toggle.focus();
+  fireEvent.keyDown(toggle, { key: "ArrowDown" });
+  expect(screen.getAllByRole("menuitem", { name: /Refresh List/ })[0]).toHaveFocus();
+  fireEvent.keyDown(document.activeElement!, { key: "ArrowDown" });
+  expect(screen.getByRole("menuitemradio", { name: /Auto/ })).toHaveFocus();
+});

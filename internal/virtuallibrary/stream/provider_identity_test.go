@@ -7,15 +7,16 @@ func TestCandidateDisplayNameDoesNotAppendSize(t *testing.T) {
 	second := StreamCandidate{Name: "AIO", Title: "Release 2.00 GB", URL: "https://provider.example/two.mkv"}
 	for _, candidate := range []StreamCandidate{first, second} {
 		ParseStreamDetails(&candidate)
-		if got := CandidateDisplayName(candidate); got != "AIO" {
-			t.Fatalf("display name = %q, want AIO", got)
+		want := candidate.Name + "\n" + candidate.Title
+		if got := CandidateDisplayName(candidate); got != want {
+			t.Fatalf("display name = %q, want %q without an appended size", got, want)
 		}
 		if candidate.FileSize == 0 {
 			t.Fatal("size metadata must still be parsed")
 		}
 	}
 	if CandidateVariantID(first) == CandidateVariantID(second) {
-		t.Fatal("equal display names must not collapse distinct versions")
+		t.Fatal("distinct versions must not share a variant ID")
 	}
 }
 
