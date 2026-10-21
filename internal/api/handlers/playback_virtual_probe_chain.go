@@ -10,6 +10,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/time/rate"
+
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary/resolver"
@@ -75,11 +77,18 @@ const (
 	virtualProbeChainReasonGateBusy           = "gate_busy"
 )
 
+// Refusal logging has constant memory and a process-wide budget, independent
+// of caller-controlled item IDs. Suppression never affects probe admission.
+var virtualProbeRefusalLogs = rate.NewLimiter(rate.Every(time.Minute), 1)
+
 // logVirtualProbeChainSkip records why one discovered item was not probed.
 // The first play still probes the row, so these lines are observability, not
 // alerts: expected no-ops stay at debug, while a refused, expired, or failed
 // chain leaves one info line naming the content and the discovery trigger.
 func logVirtualProbeChainSkip(ctx context.Context, level slog.Level, contentID, reason, detail string, attrs ...any) {
+	if reason == virtualProbeChainReasonScheduleRefused && level >= slog.LevelInfo && !virtualProbeRefusalLogs.Allow() {
+		return
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
