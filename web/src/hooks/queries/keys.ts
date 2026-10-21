@@ -336,6 +336,9 @@ export const recKeys = {
   tasteProfile: () => [...recKeys.all, "taste-profile"] as const,
   discover: () => [...recKeys.all, "discover"] as const,
   section: (kind: string, key?: string) => [...recKeys.all, "section", kind, key ?? ""] as const,
+  watchTonight: () => [...recKeys.all, "watch-tonight"] as const,
+  watchTonightCards: (mode: string, genres: string[]) =>
+    [...recKeys.all, "watch-tonight-cards", mode, ...[...genres].sort()] as const,
   tasteSeedItems: () => [...recKeys.all, "taste-seed", "items"] as const,
 };
 

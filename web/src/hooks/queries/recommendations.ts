@@ -1,10 +1,12 @@
-import { useQuery } from "@tanstack/react-query";
+import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import { catalogItemFromV2, type CatalogCardItem } from "@/api/v2/catalog";
 import {
   type DiscoverResponse,
   type RecommendationSectionResponse,
   discoverFromV2,
   recommendationSectionFromV2,
+  swipeCardsPageFromV2,
+  watchTonightFromV2,
 } from "@/api/v2/recommendations";
 import { v2, type V2PathParams, type V2Result } from "@/api/v2/request";
 import { recKeys } from "./keys";
@@ -98,5 +100,49 @@ export function useRecentlyAdded(days?: number) {
     queryFn: ({ signal }): Promise<RecommendationResponse> =>
       v2("GET /api/v2/recommendations/recently-added", { query: { days }, signal }).then(cardList),
     staleTime: 600_000,
+  });
+}
+
+export type WatchTonightResponse = ReturnType<typeof watchTonightFromV2>;
+export type WatchTonightItem = WatchTonightResponse["items"][number];
+
+export function useWatchTonight(enabled = true) {
+  return useQuery({
+    queryKey: recKeys.watchTonight(),
+    queryFn: ({ signal }) =>
+      v2("GET /api/v2/recommendations/watch-tonight", { signal }).then(watchTonightFromV2),
+    staleTime: 300_000,
+    enabled,
+  });
+}
+
+// --- Swipe Cards (gamified Watch Tonight) ---
+
+export type SwipeMode = "continue" | "discover";
+
+export type SwipeCardsPage = ReturnType<typeof swipeCardsPageFromV2>;
+export type SwipeCard = SwipeCardsPage["cards"][number];
+export type SwipeCardCastMember = SwipeCard["cast"][number];
+
+export function useSwipeCards(enabled: boolean, mode: SwipeMode, genres: string[]) {
+  return useInfiniteQuery({
+    queryKey: recKeys.watchTonightCards(mode, genres),
+    queryFn: ({ pageParam, signal }: { pageParam: string[]; signal?: AbortSignal }) =>
+      v2("GET /api/v2/recommendations/watch-tonight/cards", {
+        query: {
+          mode,
+          limit: 12,
+          genres: [...genres].sort(),
+          exclude_ids: pageParam,
+        },
+        signal,
+      }).then(swipeCardsPageFromV2),
+    initialPageParam: [] as string[],
+    getNextPageParam: (lastPage, allPages) => {
+      if (!lastPage.has_more || lastPage.paging_limited) return undefined;
+      return [...new Set(allPages.flatMap((p) => p.cards.map((c) => c.content_id)))];
+    },
+    staleTime: 0,
+    enabled,
   });
 }

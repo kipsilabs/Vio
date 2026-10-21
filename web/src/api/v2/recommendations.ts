@@ -8,6 +8,13 @@ import type { components } from "@/api/v2/schema";
  * return shapes so the screens are untouched.
  */
 
+type WatchTonightV2 = components["schemas"]["WatchTonight"];
+type WatchTonightItemV2 = components["schemas"]["WatchTonightItem"];
+type WatchTonightCardV2 = components["schemas"]["WatchTonightCard"];
+type WatchTonightCardPageV2 = components["schemas"]["WatchTonightCardPage"];
+
+export type WatchTonightSource = WatchTonightItemV2["watch_tonight_source"];
+
 type RecommendationRowV2 = components["schemas"]["RecommendationRow"];
 
 /** A recommendation row as the Discover and For You screens render it. */
@@ -56,5 +63,26 @@ export function recommendationSectionFromV2(
     type: row.type,
     label: row.title,
     items: row.items.map(catalogItemFromV2),
+  };
+}
+
+export function watchTonightItemFromV2(item: WatchTonightItemV2) {
+  return { ...catalogItemFromV2(item), watch_tonight_source: item.watch_tonight_source };
+}
+
+export function watchTonightFromV2(body: WatchTonightV2) {
+  return { items: body.items.map(watchTonightItemFromV2), is_cold: body.is_cold };
+}
+
+export function swipeCardFromV2(card: WatchTonightCardV2) {
+  return { ...watchTonightItemFromV2(card), cast: card.cast };
+}
+
+export function swipeCardsPageFromV2(page: WatchTonightCardPageV2) {
+  return {
+    cards: page.items.map(swipeCardFromV2),
+    has_more: page.has_more,
+    paging_limited: page.paging_limited,
+    is_cold: page.is_cold,
   };
 }

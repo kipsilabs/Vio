@@ -6,6 +6,7 @@ import { LayoutDashboard } from "lucide-react";
 import HeroBanner from "@/components/HeroBanner";
 import SectionRow from "@/components/SectionRow";
 import TasteSeedBanner from "@/components/TasteSeedBanner";
+import WatchTonightEntry from "@/components/WatchTonightEntry";
 import { Skeleton } from "@/components/ui/skeleton";
 import type { HomeSectionItemsResponse, ResolvedSection, ResolvedSectionLayout } from "@/api/types";
 import { useDocumentTitle } from "@/hooks/useDocumentTitle";
@@ -293,6 +294,7 @@ export default function Home() {
       <h1 className="sr-only">Home</h1>
       <div className={`space-y-10 ${hasHeroSlot ? "pb-2" : "pt-6 pb-2"}`}>
         {heroSlot}
+        <WatchTonightEntry />
         <TasteSeedBanner />
 
         {viewModel.rows.map((slot) => {
