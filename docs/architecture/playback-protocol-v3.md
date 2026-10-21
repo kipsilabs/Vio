@@ -1657,10 +1657,10 @@ live session, so the client applies it in place whenever its
 `effective_virtual_uri` names the candidate the session is bound to, even when
 its `effective_media_file_id` is a catalog row that appeared only after the plan
 committed. A differing `effective_virtual_uri` remains a foreign source and is
-dropped. This is what lets a cold plan whose inventory is empty (fast discovery
-timed out and the declared fallback carried no tracks) grow its audio and
-subtitle menus from the first verified push instead of staying empty until a
-stop/resume; it never replans, re-keys the transport, or reloads the element.
+dropped. This is what lets a cold plan whose inventory is empty or declared-only grow its
+audio and subtitle menus from the first verified push instead of staying empty
+until a stop/resume; it never replans, re-keys the transport, or reloads the
+element.
 
 The server pushes the event best-effort and does not gate it on a negotiated
 feature; a client that does not know the name ignores it. `/api/v2` advertises

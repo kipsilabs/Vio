@@ -3521,7 +3521,6 @@ export function usePlaybackSession(
    */
   const foldInventoryUpdate = useCallback(
     (payload: PlaybackInventoryUpdatedPayload): boolean => {
-    (payload: PlaybackInventoryUpdatedPayload) => {
       // A display-only offered release is a different animal: it carries
       // another release's tracks under the session's row id, so it must never
       // go through the identity-carrying fold. Route it to the menu-only fold
@@ -3673,9 +3672,9 @@ export function usePlaybackSession(
           liveIdentity.fileId == null ||
           payload.effective_media_file_id === liveIdentity.fileId;
         if (sameRow && offeredUri !== liveIdentity.uri) {
-          foldInventoryUpdate(payload);
+          return foldInventoryUpdate(payload);
         }
-        return;
+        return false;
       }
       // No adoption in flight: a push that names another source than the player
       // is on is a stale delivery and is dropped. The synchronous mirror, not

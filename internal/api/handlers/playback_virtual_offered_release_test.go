@@ -57,7 +57,7 @@ func TestOfferedReleaseInventoryPopulatesMenusWithoutMovingTransport(t *testing.
 	h.VirtualFileMetadataSaver = saver.save
 	h.VirtualFileSaver = func(context.Context, models.VirtualFilePersistArgs) (int64, error) { return 1, nil }
 
-	h.persistVirtualProbeEvidence(context.Background(), pinnedRow, offeredURI, probedDualAudioFile(), true, false)
+	h.persistVirtualProbeEvidence(context.Background(), pinnedRow, offeredURI, probedDualAudioFile(), noCandidateIdentity, true, false)
 	h.stopVirtualEvidence()
 
 	if calls := saver.recorded(); len(calls) != 0 {

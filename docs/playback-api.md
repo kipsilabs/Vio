@@ -291,14 +291,6 @@ failures arm the same failure damper the playback path uses, an
 already-stamped row is skipped, and every unexpected chain failure —
 including a panic — is contained to the chain.
 
-For a v2 client that negotiated `deferred_track_inventory_v1`, a cold start runs
-a bounded metadata-only stream enumeration against the already-resolved
-provider URL before the plan is built. The plan therefore carries the real
-audio and subtitle streams instead of the provider's declared label. The wait is
-at most two seconds; on timeout or failure the plan falls back to the declared
-inventory and the deferred full probe still verifies and publishes it. A row
-with stored probe evidence skips this discovery.
-
 A successful detail discovery is memoized for 30 seconds per viewer, item,
 selected file, and library. The player's inventory poll re-reads watch detail
 every few seconds while a probe is pending; those reads deliberately bypass the

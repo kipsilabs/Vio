@@ -308,14 +308,13 @@ func TestScheduleDefaultFileProbeSecondCallCoalescesIntoLiveChain(t *testing.T) 
 	}
 }
 
-func TestScheduleDefaultFileProbeAdmitsSelectedVersionFromSecondSource(t *testing.T) {
+func TestScheduleDefaultFileProbeCoalescesSelectedVersionAcrossSources(t *testing.T) {
 	row := probeChainRow(312, "virtual://movie/probe-chain?result=c12", nil)
 	h, target, _ := probeChainHandler(row)
 
-	// A detail read can select a row owned by a second provider source group.
-	// The first source's live chain must not occupy the admission key for the
-	// selected source, or the selected chain is dropped and the cold menus stay
-	// provisional.
+	// Discovery persists one source group at a time. Each group must not spawn
+	// its own chain for the same selected version: that exhausted the process
+	// slots with duplicates and left the actual selected chain unscheduled.
 	secondSource := probeChainSourceRow()
 	secondSource.FilePath = "virtual://movie/probe-chain?profile=1080p"
 	filter := catalog.AccessFilter{SelectedFileID: row.ID, AllowedLibraryIDs: []int{77}}
@@ -324,7 +323,7 @@ func TestScheduleDefaultFileProbeAdmitsSelectedVersionFromSecondSource(t *testin
 	probeChainWaitFor(t, 1, target.callCount, "first source target reads")
 
 	h.ScheduleDefaultFileProbe(probeChainTestContent, secondSource, probeChainStreams(row), filter)
-	probeChainWaitFor(t, 2, target.callCount, "second source target reads")
+	probeChainStableWait(t, 1, target.callCount, "coalesced second-source target reads")
 
 	target.releaseRow()
 	h.probeChainWG.Wait()

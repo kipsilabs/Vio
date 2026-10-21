@@ -57,8 +57,13 @@ var virtualCandidatePublishBudget = 5 * time.Second
 const (
 	defaultMaxVirtualFailoverAttempts = 5
 	virtualProbeBudget                = 15 * time.Second
-	maxVirtualPlaybackPrefetchFiles   = 2
-	virtualPlaybackPrefetchBudget     = 20 * time.Second
+	// virtualStartProbeBudget caps the synchronous start-path probe. The start
+	// response must not wait fifteen seconds for a remote byte source: past this
+	// bound the plan serves the candidate's declared metadata and the deferred
+	// probe owns verification. Background probes keep virtualProbeBudget.
+	virtualStartProbeBudget         = 3 * time.Second
+	maxVirtualPlaybackPrefetchFiles = 2
+	virtualPlaybackPrefetchBudget   = 20 * time.Second
 	// virtualPrefetchQueueSize bounds pending prefetch work: how many distinct
 	// source/profile prefetches may wait for a worker. virtualPrefetchWorkers
 	// bounds active work. Together they bound the dedup map, whose entries exist
@@ -3590,7 +3595,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				}, resolvedIdentity, resolvedRematched), nil
 			}
 		}
-		probeCtx, probeCancel := context.WithTimeout(attemptCtx, virtualProbeBudget)
+		probeCtx, probeCancel := context.WithTimeout(attemptCtx, virtualStartProbeBudget)
 		trace.probeRan = true
 		probeStart := time.Now()
 		forwardVirtualCandidateDeclaredAudio(&syncProbeFile, cand)

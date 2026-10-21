@@ -268,10 +268,12 @@ func (h *PlaybackHandler) ScheduleDefaultFileProbe(contentID string, source *mod
 			virtualProbeChainReasonScheduleRefused, "prober_unwired")
 		return
 	}
-	// A detail read can select a version from a different provider source
-	// group than the item's default. Admit the chain by source and selection
-	// so the first source cannot swallow the selected source's chain.
-	admissionKey := contentID + "\x00" + strconv.Itoa(filter.SelectedFileID) + "\x00" + virtualSourceRefreshKey(source)
+	// One chain per item and selected version. Discovery persists one source
+	// group at a time; keying admission by source as well let five groups for
+	// the same title each schedule a chain, exhausting the process-wide slots
+	// with duplicates. The chain re-reads the selected row and probes that row's
+	// own stored URL, so any discovery group can safely start it.
+	admissionKey := contentID + "\x00" + strconv.Itoa(filter.SelectedFileID)
 	release, refusal := h.defaultProbeChains.acquire(admissionKey)
 	if refusal != defaultProbeChainRefusalNone {
 		// A chain for this item is already live, or both slots are taken.
@@ -518,21 +520,16 @@ func virtualDefaultProbeCandidate(row *models.MediaFile, source *models.MediaFil
 	if !allowPersistedSelected {
 		return nil
 	}
-	// A selected version can be a persisted candidate from an earlier
-	// provider listing. Its row was authorized by the target read; if it
-	// belongs to this source group, its stored concrete URI is the exact
-	// bytes the play path would probe. Do not substitute the neutral group
-	// row or a sibling source's candidate.
-	rowGroup, rowOK := virtualCandidateGroupURI(target)
-	sourceGroup, sourceOK := virtualCandidateGroupURI(source.FilePath)
-	if !rowOK || !sourceOK {
+	if virtualResultCandidateID(target) == "" {
 		return nil
 	}
-	// A neutral source row covers every profile variant beneath its base
-	// path. A profile-specific source row only covers its own group.
-	if rowGroup != sourceGroup && !strings.HasPrefix(target, source.FilePath+"?") {
-		return nil
-	}
+	// A selected row can be a persisted candidate from an earlier provider
+	// listing. The target read authorized its content, episode, owner, and
+	// library; its own concrete result id names the bytes to probe. The
+	// discovery source only supplies the scheduling hand-off, so a chain started
+	// by a sibling source may still probe this row's stored URL. A neutral row
+	// (no result id) is never probed speculatively; the default path keeps the
+	// exact-listing requirement above.
 	return virtualPlaybackStreamFromFile(row)
 }
 
