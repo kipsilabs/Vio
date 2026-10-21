@@ -341,6 +341,8 @@ func (s *VirtualCandidatesRefreshService) RefreshSources(ctx context.Context, co
 		// work runs detached with its own timeout applied inside refreshSource.
 		workCtx := context.WithoutCancel(ctx)
 		refreshCh := s.flight.DoChan(key, func() (any, error) {
+			releaseSource := s.lockSource(virtualSourceRefreshKey(source))
+			defer releaseSource()
 			fresh, err := s.refreshSource(workCtx, source, userID, profileID)
 			if err != nil {
 				return nil, err
