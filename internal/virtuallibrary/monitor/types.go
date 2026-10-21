@@ -33,10 +33,12 @@ func (x *Library) GetMediaType() string {
 }
 
 type RequestDescriptor struct {
-	MediaType   string
-	Title       string
-	Year        int32
-	ExternalIds map[string]string
+	MediaType    string
+	Title        string
+	Year         int32
+	ExternalIds  map[string]string
+	PosterPath   string
+	BackdropPath string
 }
 
 func (x *RequestDescriptor) GetMediaType() string {

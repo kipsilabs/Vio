@@ -21,6 +21,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/Silo-Server/silo-server/internal/database/pglock"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary/altmount"
@@ -143,6 +144,12 @@ func (s *Monitor) SetResolver(resolver connectionValidator) { s.resolver = resol
 
 // SetRegistrar installs the catalog registrar used by Fulfill/CheckStatus/Run.
 func (s *Monitor) SetRegistrar(registrar MediaRegistrar) { s.monitor.setRegistrar(registrar) }
+
+func (s *Monitor) SetMetadataResolver(resolve func(context.Context, MonitoredMedia) (MonitoredMedia, error)) {
+	s.monitor.mu.Lock()
+	defer s.monitor.mu.Unlock()
+	s.monitor.metadataResolver = resolve
+}
 
 // ReleaseStore returns the in-memory release schedule cache the monitor
 // populates while evaluating items. A nil result means the monitor is
@@ -520,7 +527,8 @@ type mediaMonitor struct {
 	itemTimeout time.Duration
 	// evaluateFn is the per-item evaluation step; tests replace it to make
 	// pass budgeting deterministic without provider network calls.
-	evaluateFn func(context.Context, monitoredMedia) (monitoredMedia, string, error)
+	evaluateFn       func(context.Context, monitoredMedia) (monitoredMedia, string, error)
+	metadataResolver func(context.Context, MonitoredMedia) (MonitoredMedia, error)
 }
 
 type virtualMediaLister interface {
@@ -1128,7 +1136,11 @@ func mediaFromRequest(r *RequestDescriptor) (monitoredMedia, error) {
 	if streamID == "" {
 		return monitoredMedia{}, errors.New("IMDb, TVDB, or TMDB ID is required")
 	}
-	return monitoredMedia{Key: typ + ":" + streamID, MediaType: typ, Title: strings.TrimSpace(r.GetTitle()), Year: r.GetYear(), StreamID: streamID, IMDbID: imdb, TMDBID: tmdb, TVDBID: tvdb, SourceKey: "request:" + typ + ":" + streamID}, nil
+	return monitoredMedia{
+		Key: typ + ":" + streamID, MediaType: typ, Title: strings.TrimSpace(r.GetTitle()), Year: r.GetYear(),
+		StreamID: streamID, IMDbID: imdb, TMDBID: tmdb, TVDBID: tvdb, SourceKey: "request:" + typ + ":" + streamID,
+		Poster: strings.TrimSpace(r.PosterPath), Backdrop: strings.TrimSpace(r.BackdropPath),
+	}, nil
 }
 
 func virtualContentID(item monitoredMedia) string {
@@ -1159,7 +1171,16 @@ func appendUniqueString(values []string, value string) []string {
 func (m *mediaMonitor) evaluate(ctx context.Context, item monitoredMedia) (monitoredMedia, string, error) {
 	now := time.Now()
 	var metadataErr error
-	if enriched, err := m.fetchCinemeta(ctx, item); err == nil && (item.MediaType != "series" || episodeMetadataComplete(enriched.Episodes)) {
+	m.mu.Lock()
+	resolveMetadata := m.metadataResolver
+	m.mu.Unlock()
+	if resolveMetadata != nil {
+		enriched, err := resolveMetadata(ctx, item)
+		if err != nil {
+			return item, "Library metadata unavailable; monitoring will retry", err
+		}
+		item = enriched
+	} else if enriched, err := m.fetchCinemeta(ctx, item); err == nil && (item.MediaType != "series" || episodeMetadataComplete(enriched.Episodes)) {
 		item = enriched
 		if item.MediaType == "series" && episodeRuntimeMissing(item.Episodes) {
 			if supplemented, supplementErr := m.fetchTVMaze(ctx, item); supplementErr == nil {
@@ -1179,8 +1200,10 @@ func (m *mediaMonitor) evaluate(ctx context.Context, item monitoredMedia) (monit
 		}
 	}
 	if item.MediaType == "movie" {
-		if runtime, err := m.fetchTMDBMovieRuntime(ctx, item); err == nil && runtime > 0 {
-			item.Runtime = runtime
+		if resolveMetadata == nil {
+			if runtime, err := m.fetchTMDBMovieRuntime(ctx, item); err == nil && runtime > 0 {
+				item.Runtime = runtime
+			}
 		}
 		release, err := m.movieRelease(ctx, item)
 		if err != nil {
@@ -2087,7 +2110,23 @@ func parseRuntimeMinutes(value string) int {
 }
 
 func cleanTVMazeSummary(value string) string {
-	return strings.TrimSpace(html.UnescapeString(htmlTagPattern.ReplaceAllString(value, "")))
+	return CleanMetadataSummary(value)
+}
+
+func CleanMetadataSummary(value string) string {
+	return CleanMetadataText(html.UnescapeString(htmlTagPattern.ReplaceAllString(value, "")))
+}
+
+func CleanMetadataText(value string) string {
+	return strings.TrimSpace(strings.Map(func(character rune) rune {
+		if unicode.IsSpace(character) {
+			return ' '
+		}
+		if unicode.IsControl(character) {
+			return -1
+		}
+		return character
+	}, value))
 }
 
 func (m *mediaMonitor) fetchTVMaze(ctx context.Context, item monitoredMedia) (monitoredMedia, error) {
