@@ -29,7 +29,7 @@ type VirtualCandidatesRefreshService interface {
 }
 
 type VirtualCandidatesDiscoveryService interface {
-	DiscoverVirtualCandidates(ctx context.Context, userID int, profileID, contentID string, filter catalogpkg.AccessFilter) ([]catalogpkg.FileVersion, error)
+	DiscoverVirtualCandidates(ctx context.Context, userID int, profileID, contentID string, filter catalogpkg.AccessFilter, mode handlers.VirtualDiscoveryMode) ([]catalogpkg.FileVersion, error)
 	HasVirtualSource(ctx context.Context, contentID string) (bool, error)
 }
 
@@ -66,6 +66,9 @@ func (reg *Registry) preplayDiscoveryCatalogBudgetFor(ctx context.Context) time.
 	return preplayDiscoveryCatalogBudget
 }
 
+// discoverDetailVersions runs the candidate discovery a detail-page read needs
+// and reports whether it found any. A detail-page read may start the pre-play
+// preparation; a bare listing request may not.
 func (reg *Registry) discoverDetailVersions(ctx context.Context, contentID, mediaType string, filter catalogpkg.AccessFilter, trigger string, budget time.Duration) (discovered, hasVirtualSource bool) {
 	claims := claimsFrom(ctx)
 	if claims == nil || (mediaType != themeOwnerMovie && mediaType != themeOwnerEpisode) ||
@@ -96,6 +99,7 @@ func (reg *Registry) discoverDetailVersions(ctx context.Context, contentID, medi
 	slog.InfoContext(ctx, "pre-play version discovery started", "component", "apiv2", "item_id", contentID, "trigger", trigger)
 	listed, listErr := reg.deps.VirtualCandidatesDiscovery.DiscoverVirtualCandidates(
 		discoveryCtx, claims.UserID, profileFrom(ctx), contentID, filter,
+		handlers.VirtualDiscoveryDetail,
 	)
 	if listErr != nil {
 		slog.WarnContext(ctx, "pre-play version discovery unavailable", "component", "apiv2", "item_id", contentID,
@@ -205,7 +209,10 @@ func (reg *Registry) discoverVirtualCandidates(ctx context.Context, in *VirtualC
 	if err != nil {
 		return nil, NewProblem(TypeInternalError, "An unexpected error occurred.")
 	}
-	if _, err := reg.deps.VirtualCandidatesDiscovery.DiscoverVirtualCandidates(ctx, claims.UserID, profileFrom(ctx), string(in.MediaID), filter); err != nil {
+	// This operation is a listing surface: it is callable for any item by any
+	// client, so it lists and persists candidates and prepares nothing. A
+	// detail-page read is what may start a preparation.
+	if _, err := reg.deps.VirtualCandidatesDiscovery.DiscoverVirtualCandidates(ctx, claims.UserID, profileFrom(ctx), string(in.MediaID), filter, handlers.VirtualDiscoveryListingOnly); err != nil {
 		return nil, serviceProblem(err)
 	}
 	return &struct{}{}, nil

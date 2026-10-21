@@ -48,7 +48,7 @@ type fakeVirtualDiscoverySource struct {
 	err        error
 }
 
-func (f *fakeVirtualDiscoverySource) DiscoverVirtualCandidates(context.Context, int, string, string, catalogsvc.AccessFilter) ([]catalogsvc.FileVersion, error) {
+func (f *fakeVirtualDiscoverySource) DiscoverVirtualCandidates(context.Context, int, string, string, catalogsvc.AccessFilter, handlers.VirtualDiscoveryMode) ([]catalogsvc.FileVersion, error) {
 	return nil, nil
 }
 

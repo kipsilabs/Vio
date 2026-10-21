@@ -281,6 +281,7 @@ type fakePreplayCatalog struct {
 	discoveryView handlers.ItemViewer
 	discoveryUser int
 	discoveryID   string
+	discoveryMode handlers.VirtualDiscoveryMode
 	bounded       bool
 	// hasVirtual is the eligibility answer from the stored rows (the table's
 	// unredacted path), independent of the file paths the response returns:
@@ -305,8 +306,9 @@ func (fake *fakePreplayCatalog) ItemDetail(_ context.Context, viewer handlers.It
 	return &detail, nil
 }
 
-func (fake *fakePreplayCatalog) DiscoverVirtualCandidates(ctx context.Context, userID int, profileID, contentID string, access catalogpkg.AccessFilter) ([]catalogpkg.FileVersion, error) {
+func (fake *fakePreplayCatalog) DiscoverVirtualCandidates(ctx context.Context, userID int, profileID, contentID string, access catalogpkg.AccessFilter, mode handlers.VirtualDiscoveryMode) ([]catalogpkg.FileVersion, error) {
 	fake.discoveries++
+	fake.discoveryMode = mode
 	fake.discoveryView = handlers.ItemViewer{ProfileID: profileID, Access: access}
 	fake.discoveryUser, fake.discoveryID = userID, contentID
 	_, fake.bounded = ctx.Deadline()
@@ -418,6 +420,9 @@ func TestDetailPreplayDiscovery(t *testing.T) {
 				}
 				if fake.discoveries != test.wantCalls || fake.reads != test.wantReads {
 					t.Fatalf("discoveries = %d, reads = %d", fake.discoveries, fake.reads)
+				}
+				if test.wantCalls > 0 && fake.discoveryMode != handlers.VirtualDiscoveryDetail {
+					t.Fatalf("discovery mode = %q, want a detail-page read to prepare", fake.discoveryMode)
 				}
 				if test.wantCalls > 0 && (!fake.bounded || !reflect.DeepEqual(fake.discoveryView, fake.lastViewer) ||
 					fake.discoveryUser != fake.lastViewer.Access.UserID || fake.discoveryID != fake.detail.ContentID) {
