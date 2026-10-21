@@ -640,9 +640,11 @@ func (h *PlaybackHandler) runDefaultFileProbeChain(ctx context.Context, contentI
 			virtualProbeChainReasonRevalidateFailed, "revalidate", virtualEvidenceLogKeyFileID, row.ID)
 		return
 	}
-	// Only an exact, runnable probe consumes the source allowance. Default
-	// and selected targets share it; unrelated groups cannot consume it.
-	releaseLease, admitted := h.ProbeLease.acquire(ctx, strconv.Itoa(oid))
+	// Only an exact, runnable probe consumes the item's lease. Default and
+	// selected targets of the same item and provider share it, so duplicate
+	// discovery callbacks coalesce across replicas; a different item stays
+	// independent and prepares while this one probes.
+	releaseLease, admitted := h.ProbeLease.acquire(ctx, contentID+"\x00"+strconv.Itoa(oid))
 	if !admitted {
 		// A configured Redis that is unreachable, or another chain holding this
 		// provider's lease, refuses optional work. Both are correct, and both

@@ -11,7 +11,12 @@ import (
 )
 
 // VirtualProbeLease isolates speculative admission from every foreground permit.
-// A configured but unreachable Redis rejects optional work.
+// The lease is per item: one item is speculative-probed at a time across
+// replicas, while different items prepare independently. Keying it on the
+// provider installation instead serialized the whole library, so opening a
+// second episode while the first was probing dropped the second one's
+// preparation entirely. A configured but unreachable Redis rejects optional
+// work.
 type VirtualProbeLease struct{ Client *redis.Client }
 
 // NewVirtualProbeLease preserves configured-but-unavailable Redis as fail closed.
@@ -29,14 +34,14 @@ end
 return 0
 `)
 
-func (l *VirtualProbeLease) acquire(ctx context.Context, provider string) (func(), bool) {
+func (l *VirtualProbeLease) acquire(ctx context.Context, item string) (func(), bool) {
 	if l == nil {
 		return func() {}, true
 	}
 	if l.Client == nil {
 		return nil, false
 	}
-	key := fmt.Sprintf("vio:preplay:provider:%x", sha256.Sum256([]byte(provider)))
+	key := fmt.Sprintf("vio:preplay:item:%x", sha256.Sum256([]byte(item)))
 	token := uuid.NewString()
 	attempt, cancel := context.WithTimeout(ctx, time.Second)
 	defer cancel()

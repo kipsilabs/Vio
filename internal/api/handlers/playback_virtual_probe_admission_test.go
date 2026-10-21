@@ -130,7 +130,7 @@ func TestPreparationRedisContentionAndExpiry(t *testing.T) {
 	if _, ok := lease.acquire(ctx, provider); ok {
 		t.Fatal("contending lease admitted")
 	}
-	key := fmt.Sprintf("vio:preplay:provider:%x", sha256.Sum256([]byte(provider)))
+	key := fmt.Sprintf("vio:preplay:item:%x", sha256.Sum256([]byte(provider)))
 	if err := client.PExpire(ctx, key, -time.Millisecond).Err(); err != nil {
 		t.Fatal(err)
 	}
