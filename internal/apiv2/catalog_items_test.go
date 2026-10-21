@@ -428,6 +428,9 @@ func TestDetailPreplayDiscovery(t *testing.T) {
 					fake.discoveryUser != fake.lastViewer.Access.UserID || fake.discoveryID != fake.detail.ContentID) {
 					t.Fatalf("discovery viewer = %+v, detail viewer = %+v, bounded = %v", fake.discoveryView, fake.lastViewer, fake.bounded)
 				}
+				if test.wantCalls > 0 && fake.discoveryView.Access.SelectedFileID != 120 {
+					t.Fatalf("discovery selected file = %d, want the route's file_id 120", fake.discoveryView.Access.SelectedFileID)
+				}
 			})
 		}
 	}
