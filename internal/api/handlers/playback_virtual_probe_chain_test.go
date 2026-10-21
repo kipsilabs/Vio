@@ -13,6 +13,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/access"
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/notifications"
 )
 
 // The pre-play probe chain must never block its caller, never probe bytes it
@@ -210,6 +211,33 @@ func TestNewVirtualDefaultProbeTargetUsesSelectedFile(t *testing.T) {
 	reader.rows[selectedRow.ID] = selectedRow
 	if got, err := target.DefaultVirtualProbeTarget(t.Context(), probeChainTestContent, catalog.AccessFilter{SelectedFileID: selectedRow.ID, AllowedLibraryIDs: []int{77}}); err != nil || got != nil {
 		t.Fatalf("hidden selected target = %+v, err = %v; want no target", got, err)
+	}
+}
+
+func TestScheduleDefaultFileProbePublishesAfterDurableEvidence(t *testing.T) {
+	defaultRow := probeChainRow(720, "virtual://movie/probe-chain?result=default", nil)
+	selectedRow := probeChainRow(721, "virtual://movie/probe-chain?result=selected", nil)
+	reader := &probeChainVersionReader{
+		files: []*models.MediaFile{defaultRow, selectedRow},
+		rows:  map[int]*models.MediaFile{defaultRow.ID: defaultRow, selectedRow.ID: selectedRow},
+	}
+	bus := &recordingEventBus{}
+	hub := notifications.NewHub("probe-chain-event", bus)
+	prober := &recordingProber{}
+	h := &PlaybackHandler{
+		ServiceContext:              context.Background(),
+		EventsHub:                   hub.EventsHub(),
+		DefaultProbeTarget:          NewVirtualDefaultProbeTarget(reader, reader),
+		VirtualPlaybackSourceProber: prober.probe,
+		VirtualFileMetadataSaver: func(context.Context, models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error) {
+			return VirtualFileMetadataUpdateResult{MetadataUpdated: true, RowsAffected: 1}, nil
+		},
+	}
+	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), probeChainStreams(selectedRow), catalog.AccessFilter{SelectedFileID: selectedRow.ID, AllowedLibraryIDs: []int{77}})
+	h.probeChainWG.Wait()
+	payload := waitForRecordingEvent(t, bus, 2*time.Second, "catalog.item.changed", "versions_updated", probeChainTestContent)
+	if payload == "" {
+		t.Fatal("verified evidence did not publish versions_updated")
 	}
 }
 

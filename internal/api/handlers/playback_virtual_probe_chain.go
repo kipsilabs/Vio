@@ -425,15 +425,20 @@ func (h *PlaybackHandler) runDefaultFileProbeChain(ctx context.Context, contentI
 	// Zero the duration so the probe measures the empirical duration instead
 	// of inheriting the catalog value.
 	probeTransient.Duration = 0
-	// The chain probes the default row's own candidate bytes (probeURL = the
-	// row's persisted URI) and persists through the queued, coalescing
-	// evidence path. No session binding exists here, so the fence is nil and
-	// the identity tiers are zero — the same posture the unstamped-row fast
-	// path takes, where the row owns its persisted candidate.
-	outcome := h.probeVirtualSourceAndPersist(
+	// The chain probes the selected/default row's own candidate bytes and uses
+	// the durable evidence path: an already-loaded detail/version page can only
+	// be invalidated after the tracks are actually committed. No session binding
+	// exists here, so the fence is nil and the identity tiers are zero — the same
+	// posture the unstamped-row fast path takes, where the row owns its candidate.
+	outcome, _ := h.probeVirtualSourceAndPersistWith(
 		ctx, stickyKey, row, row.FilePath, probeTransient, *probeCand,
-		resolver.PersistedIdentityTiers{}, expectedRuntimeMinutes, oid,
+		resolver.PersistedIdentityTiers{}, expectedRuntimeMinutes, oid, true, nil,
 	)
+	if outcome == probeOutcomeVerified && h.EventsHub != nil {
+		publishCtx, publishCancel := context.WithTimeout(context.WithoutCancel(ctx), virtualCandidatePublishBudget)
+		publishVirtualVersionsUpdatedEvent(publishCtx, nil, h.EventsHub, contentID)
+		publishCancel()
+	}
 	switch outcome {
 	case probeOutcomeFailed:
 		if ctx.Err() != nil {
