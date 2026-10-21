@@ -7,6 +7,17 @@ import (
 	mediarequests "github.com/Silo-Server/silo-server/internal/requests"
 )
 
+func TestRequestDescriptorPreservesArtwork(t *testing.T) {
+	request := mediarequests.Request{
+		PosterPath:   "https://images.example/poster.jpg",
+		BackdropPath: "https://images.example/backdrop.jpg",
+	}
+	descriptor := requestDescriptorOf(request)
+	if descriptor.PosterPath != request.PosterPath || descriptor.BackdropPath != request.BackdropPath {
+		t.Fatalf("request artwork lost: %+v", descriptor)
+	}
+}
+
 // AttachRequestRouter must tolerate absent dependencies (e.g. a build with the
 // plugin service disabled) without panicking — fulfillment then degrades to the
 // existing "no backend configured" failure rather than crashing the wiring.
