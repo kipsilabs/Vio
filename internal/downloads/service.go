@@ -1242,6 +1242,32 @@ func (s *Service) ResolveDirectFile(ctx context.Context, userID, fileID int, for
 	return &FileTarget{Path: file.FilePath, MediaFileID: file.ID, ProxyEligible: proxyDeliveryAllowed(cfg)}, nil
 }
 
+// responseStatusWriter records the status a served response committed. The
+// ephemeral lifecycle uses it to tell a delivered file (or requested range)
+// from a conditional or range-error reply that must not be recorded as
+// completion.
+type responseStatusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *responseStatusWriter) WriteHeader(status int) {
+	if w.status == 0 {
+		w.status = status
+	}
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *responseStatusWriter) Write(body []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return w.ResponseWriter.Write(body)
+}
+
+// Unwrap keeps http.ResponseController able to reach the original writer.
+func (w *responseStatusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
 // ServeFile serves a download's file. Managed entries (device header present)
 // authorize on (user, profile, device) and re-check per-profile content access
 // before serving; ephemeral rows keep today's queued→downloading→completed
@@ -1291,8 +1317,12 @@ func (s *Service) ServeFile(ctx context.Context, w http.ResponseWriter, r *http.
 		}
 	}
 
-	if err := s.serveDownloadBytes(ctx, w, r, dl, userID, filter); err != nil {
-		if dl.Format == FormatOriginal {
+	recorder := &responseStatusWriter{ResponseWriter: w}
+	if err := s.serveDownloadBytes(ctx, recorder, r, dl, userID, filter); err != nil {
+		// A transfer that broke after the response was committed is resumable:
+		// the client can ask for the remaining range. Marking the row failed
+		// would refuse that retry for the rest of the row's life.
+		if dl.Format == FormatOriginal && !errors.Is(err, ErrResponseCommitted) {
 			failureCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 			updateErr := s.repo.TransitionStatus(failureCtx, dl.ID, StatusDownloading, StatusFailed, 0, nil)
 			cancel()
@@ -1303,9 +1333,15 @@ func (s *Service) ServeFile(ctx context.Context, w http.ResponseWriter, r *http.
 		return err
 	}
 
-	now := time.Now()
-	if err := s.repo.UpdateStatus(ctx, dl.ID, StatusCompleted, dl.FileSize, &now); err != nil {
-		slog.ErrorContext(ctx, "failed to mark download as completed", "component", "downloads", "download_id", dl.ID, "error", err)
+	// Only a response that carried the file, or the range the client asked
+	// for, is a completed delivery. A conditional or range-error reply leaves
+	// the row as it was; recording completion for it would claim bytes the
+	// client never received.
+	if recorder.status == http.StatusOK || recorder.status == http.StatusPartialContent {
+		now := time.Now()
+		if err := s.repo.UpdateStatus(ctx, dl.ID, StatusCompleted, dl.FileSize, &now); err != nil {
+			slog.ErrorContext(ctx, "failed to mark download as completed", "component", "downloads", "download_id", dl.ID, "error", err)
+		}
 	}
 	return nil
 }

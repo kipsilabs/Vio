@@ -214,6 +214,29 @@ func episodeSeriesID(dl *Download, detail *catalog.ItemDetail) string {
 	return detail.SeriesID
 }
 
+// withMeasuredOriginalSize replaces a virtual original's catalog size hint with
+// the source's measured length. Provider-backed rows carry an estimate, and a
+// manifest's file_size and integrity.expected_bytes must not present it as an
+// exact byte count. A nil measurer leaves the size unknown (zero) instead.
+func (b *ManifestBuilder) withMeasuredOriginalSize(ctx context.Context, dl *Download, file *models.MediaFile, filter catalog.AccessFilter) (*Download, error) {
+	if dl.Format != FormatOriginal || !isVirtualMediaFile(file) {
+		return dl, nil
+	}
+	if !catalog.FileAllowedByAccess(file, filter) {
+		return nil, catalog.ErrItemNotFound
+	}
+	resolved := *dl
+	resolved.FileSize = 0
+	if b.originalSize != nil {
+		size, err := b.originalSize(ctx, file)
+		if err != nil {
+			return nil, err
+		}
+		resolved.FileSize = size
+	}
+	return &resolved, nil
+}
+
 // build is Build with an optional per-batch series-detail cache: a season
 // batch shares one series, so the batch endpoint resolves its detail once
 // instead of once per episode.
@@ -223,19 +246,9 @@ func (b *ManifestBuilder) build(ctx context.Context, dl *Download, filter catalo
 		return nil, err
 	}
 	file := b.lookupFile(ctx, dl.MediaFileID)
-	if dl.Format == FormatOriginal && isVirtualMediaFile(file) {
-		if !catalog.FileAllowedByAccess(file, filter) {
-			return nil, catalog.ErrItemNotFound
-		}
-		resolved := *dl
-		resolved.FileSize = 0
-		if b.originalSize != nil {
-			resolved.FileSize, err = b.originalSize(ctx, file)
-			if err != nil {
-				return nil, err
-			}
-		}
-		dl = &resolved
+	dl, err = b.withMeasuredOriginalSize(ctx, dl, file, filter)
+	if err != nil {
+		return nil, err
 	}
 	var seriesDetail *catalog.ItemDetail
 	if seriesID := episodeSeriesID(dl, detail); seriesID != "" {

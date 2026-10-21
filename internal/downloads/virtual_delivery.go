@@ -34,41 +34,82 @@ func (s *Service) resolveDownloadMetadata(ctx context.Context, file *models.Medi
 	return resolved, nil
 }
 
-var virtualDownloadClient = func() *http.Client {
-	transport := http.DefaultTransport.(*http.Transport).Clone()
+// Media containers that map to a filename extension the download response
+// advertises. Anything else falls back to .bin so the client never receives a
+// provider-controlled name.
+const (
+	containerMatroska = "matroska"
+	extensionMP4      = "mp4"
+	extensionMKV      = "mkv"
+	extensionAAC      = "aac"
+)
+
+// virtualDownloadTransport is the loopback-only client used for the API's own
+// relay: no proxy, no compression (so byte counts stay exact), and a bounded
+// wait for response headers. Redirects are refused by the client so a provider
+// can never move the request off the relay.
+func virtualDownloadTransport() *http.Transport {
+	base, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return &http.Transport{DisableCompression: true, ResponseHeaderTimeout: 30 * time.Second}
+	}
+	transport := base.Clone()
 	transport.Proxy = nil
 	transport.DisableCompression = true
 	transport.ResponseHeaderTimeout = 30 * time.Second
-	return &http.Client{
-		Transport: transport,
-		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
-}()
+	return transport
+}
+
+var virtualDownloadClient = &http.Client{
+	Transport: virtualDownloadTransport(),
+	CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
 
 func (s *Service) SetVirtualInputResolver(resolver VirtualInputResolver) {
 	s.virtualInput = resolver
 }
 
+// virtualRelayInput resolves the download's authorized provider input and
+// requires it to be this host's relay registration. The client below only
+// speaks to loopback, so anything else is refused before a request is built.
+func (s *Service) virtualRelayInput(ctx context.Context, file *models.MediaFile) (string, func(), error) {
+	if s.virtualInput == nil {
+		return "", nil, ErrFormatUnavailable
+	}
+	input, cleanup, err := s.virtualInput.ResolveVirtualDownloadInput(ctx, file)
+	if err != nil {
+		if cleanup != nil {
+			cleanup()
+		}
+		return "", nil, errors.New("virtual download source is unavailable")
+	}
+	if !isLoopbackPrepareInput(input) {
+		if cleanup != nil {
+			cleanup()
+		}
+		return "", nil, errors.New("virtual download source requires a local relay")
+	}
+	return input, cleanup, nil
+}
+
 func (s *Service) virtualOriginalSize(ctx context.Context, file *models.MediaFile) (int64, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	if s.virtualInput == nil {
-		return 0, ErrFormatUnavailable
-	}
-	input, cleanup, err := s.virtualInput.ResolveVirtualDownloadInput(ctx, file)
+	input, cleanup, err := s.virtualRelayInput(ctx, file)
 	if cleanup != nil {
 		defer cleanup()
 	}
-	if err != nil || !isLoopbackPrepareInput(input) {
-		return 0, errors.New("virtual download source is unavailable")
+	if err != nil {
+		return 0, err
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodHead, input, nil)
 	if err != nil {
 		return 0, errors.New("invalid virtual download relay request")
 	}
 	request.Header.Set("Accept-Encoding", "identity")
+	//nolint:gosec // input is this host's relay registration, validated by virtualRelayInput
 	response, err := virtualDownloadClient.Do(request)
 	if err != nil {
 		return 0, errors.New("virtual download relay is unavailable")
@@ -86,9 +127,9 @@ func (s *Service) virtualOriginalSize(ctx context.Context, file *models.MediaFil
 func virtualDownloadFilename(file *models.MediaFile) string {
 	extension := strings.ToLower(strings.TrimSpace(file.Container))
 	switch extension {
-	case "matroska":
-		extension = "mkv"
-	case "mp4", "mkv", "webm", "mov", "avi", "m4v", "ts", "mpeg", "mp3", "m4a", "flac", "ogg", "opus", "wav", "aac":
+	case containerMatroska:
+		extension = extensionMKV
+	case extensionMP4, extensionMKV, "webm", "mov", "avi", "m4v", "ts", "mpeg", "mp3", "m4a", "flac", "ogg", "opus", "wav", extensionAAC:
 	default:
 		extension = "bin"
 	}
@@ -96,18 +137,12 @@ func virtualDownloadFilename(file *models.MediaFile) string {
 }
 
 func (s *Service) serveVirtualOriginal(ctx context.Context, w http.ResponseWriter, r *http.Request, file *models.MediaFile, userID int) error {
-	if s.virtualInput == nil {
-		return ErrFormatUnavailable
-	}
-	input, cleanup, err := s.virtualInput.ResolveVirtualDownloadInput(ctx, file)
+	input, cleanup, err := s.virtualRelayInput(ctx, file)
 	if cleanup != nil {
 		defer cleanup()
 	}
 	if err != nil {
-		return errors.New("virtual download source is unavailable")
-	}
-	if !isLoopbackPrepareInput(input) {
-		return errors.New("virtual download source requires a local relay")
+		return err
 	}
 	request, err := http.NewRequestWithContext(ctx, r.Method, input, nil)
 	if err != nil {
@@ -119,6 +154,7 @@ func (s *Service) serveVirtualOriginal(ctx context.Context, w http.ResponseWrite
 		}
 	}
 	request.Header.Set("Accept-Encoding", "identity")
+	//nolint:gosec // input is this host's relay registration, validated by virtualRelayInput
 	response, err := virtualDownloadClient.Do(request)
 	if err != nil {
 		return errors.New("virtual download relay is unavailable")

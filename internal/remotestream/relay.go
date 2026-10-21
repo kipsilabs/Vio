@@ -1337,7 +1337,7 @@ func (r *Relay) proxyWithClient(w http.ResponseWriter, request *http.Request, so
 	if err != nil {
 		return errors.New("prepare remote stream request")
 	}
-	for _, header := range []string{"Range", "If-Range", "If-Modified-Since", "If-None-Match", "If-Match", "If-Unmodified-Since", "Accept", "User-Agent"} {
+	for _, header := range []string{"Range", "If-Range", "If-Modified-Since", "If-None-Match", "If-Match", "If-Unmodified-Since", headerAccept, headerUserAgent} {
 		if value := request.Header.Get(header); value != "" {
 			upstream.Header.Set(header, value)
 		}

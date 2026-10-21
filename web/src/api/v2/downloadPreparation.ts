@@ -55,7 +55,15 @@ export function downloadPreparationErrorMessage(error: unknown): string {
 
 /** A preparation the picker must report, with a concrete reason. */
 export class DownloadPreparationError extends Error {
-  constructor(message: string) {
+  constructor(
+    message: string,
+    /**
+     * Whether repeating the same request could succeed. A 5xx, a timeout, or a
+     * rate limit is worth another attempt; a 404/410/412/416 is the server's
+     * final answer and retrying only delays the refusal.
+     */
+    readonly retryable = false,
+  ) {
     super(message);
     this.name = "DownloadPreparationError";
   }
@@ -252,7 +260,10 @@ export async function getPreparedDownloadFile(
   );
   requireCurrent(snapshot);
   if (!res.ok) {
-    throw new DownloadPreparationError(preparedFileRefusalMessage(res.status));
+    throw new DownloadPreparationError(
+      preparedFileRefusalMessage(res.status),
+      isRetryableFileStatus(res.status),
+    );
   }
   const size = Number(res.headers.get("Content-Length"));
   return {
@@ -400,6 +411,15 @@ function preparedFileRefusalMessage(status: number): string {
     default:
       return "The prepared file could not be downloaded. Try preparing it again.";
   }
+}
+
+/**
+ * Whether a file-metadata refusal is worth another attempt. Timeouts, rate
+ * limits, and server faults pass; a missing or expired row does not, and
+ * retrying it would only keep the picker spinning.
+ */
+function isRetryableFileStatus(status: number): boolean {
+  return status === 408 || status === 425 || status === 429 || status >= 500;
 }
 
 interface SaveFilePickerWindow {

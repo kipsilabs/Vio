@@ -25,6 +25,7 @@ import {
   canSavePreparedDownload,
   createPreparedDownload,
   downloadPreparationErrorMessage,
+  DownloadPreparationError,
   getPreparedDownload,
   getPreparedDownloadFile,
   isDownloadPreparing,
@@ -35,6 +36,7 @@ import {
   type PreparedDownloadQuality,
 } from "@/api/v2/downloadPreparation";
 import { deleteDownloadEntry } from "@/api/v2/downloadRegistry";
+import { V2ProblemError } from "@/api/v2/request";
 import { useDownloadCapability, type DownloadQualityOption } from "@/hooks/queries/downloads";
 import { isVersionUnavailable } from "@/pages/ItemDetail/components/versionAvailability";
 import { isVirtualFileVersion } from "@/pages/ItemDetail/components/versionFormatUtils";
@@ -81,6 +83,12 @@ interface PendingVirtualDownload {
   status: string;
 }
 
+/** A ready download whose file metadata (name and exact size) is still being read. */
+interface FinalizingVirtualDownload {
+  id: string;
+  filename: string;
+}
+
 /** Why the server refuses downloads for this account, or null when it permits them. */
 function capabilityDenialReason(
   capability: { enabled: boolean; allowed: boolean } | undefined,
@@ -95,6 +103,23 @@ function capabilityDenialReason(
 function downloadFailureMessage(error: unknown): string {
   if (error instanceof DirectDownloadError) return error.message;
   return "Download could not be started. Check your connection and try again.";
+}
+
+/** How many times the picker re-reads file metadata before reporting a refusal. */
+const FILE_METADATA_RETRIES = 2;
+const FILE_METADATA_RETRY_MS = 1000;
+
+/**
+ * Whether a failed metadata read may succeed if repeated. A stale request or
+ * an abort is fenced elsewhere; a missing or expired row is the server's final
+ * answer; a retryable refusal, a network fault, or a server fault is not.
+ */
+function isTransientMetadataFailure(error: unknown): boolean {
+  if (error instanceof StaleApiRequestContextError) return false;
+  if (error instanceof DOMException && error.name === "AbortError") return false;
+  if (error instanceof DownloadPreparationError) return error.retryable;
+  if (error instanceof V2ProblemError) return error.status >= 500;
+  return true;
 }
 
 /** The ordered quality choices a virtual download may request. */
@@ -135,6 +160,13 @@ export default function DownloadVersionPicker({
   const [virtualQuality, setVirtualQuality] = useState<PreparedDownloadQuality>("original");
   const [submitting, setSubmitting] = useState(false);
   const [preparing, setPreparing] = useState<PendingVirtualDownload | null>(null);
+  // The server has the file, but its exact name and byte count still have to be
+  // read. Kept apart from `preparing` so a metadata read that fails cannot be
+  // mistaken for a preparation that is still running.
+  const [finalizing, setFinalizing] = useState<FinalizingVirtualDownload | null>(null);
+  // The metadata read ended in a refusal; the row is still ready, so the user
+  // can retry the read without creating a second download.
+  const [metadataFailure, setMetadataFailure] = useState<FinalizingVirtualDownload | null>(null);
   const [virtualReady, setVirtualReady] = useState<{
     id: string;
     filename: string;
@@ -183,6 +215,8 @@ export default function DownloadVersionPicker({
     setVirtualQuality("original");
     setSubmitting(false);
     setPreparing(null);
+    setFinalizing(null);
+    setMetadataFailure(null);
     setVirtualReady(null);
     return () => {
       pollGeneration.current += 1;
@@ -205,12 +239,14 @@ export default function DownloadVersionPicker({
   );
 
   // Poll a preparing virtual download until the artifact is ready or refused.
-  // The effect is keyed on the download id so a status update on the row does
-  // not restart the poll. Reads are serialized: the next tick is scheduled only
-  // after the previous read settles, so a slow response is never overtaken by a
-  // later one. Every update is fenced by the generation captured when the poll
-  // started, so a reply that lands after a cancel, a refresh, a reopen, or a
-  // terminal result is dropped instead of restoring obsolete state.
+  // A ready row is handed to the finalizing effect below instead of reading
+  // its metadata here: that read has its own controller and retry budget, so a
+  // failure cannot keep the status poll spinning. Reads are serialized: the
+  // next tick is scheduled only after the previous read settles, so a slow
+  // response is never overtaken by a later one. Every update is fenced by the
+  // generation captured when the poll started, so a reply that lands after a
+  // cancel, a refresh, a reopen, or a terminal result is dropped instead of
+  // restoring obsolete state.
   const preparingId = preparing?.id ?? null;
   useEffect(() => {
     if (!preparingId) return;
@@ -225,14 +261,8 @@ export default function DownloadVersionPicker({
         entry = await getPreparedDownload(downloadId, controller.signal);
         if (!isCurrent()) return;
         if (entry?.status === "ready") {
-          const file = await getPreparedDownloadFile(
-            downloadId,
-            pendingFilenameRef.current,
-            controller.signal,
-          );
-          if (!isCurrent()) return;
-          setVirtualReady(file);
           setPreparing(null);
+          setFinalizing({ id: downloadId, filename: pendingFilenameRef.current });
           return;
         }
       } catch {
@@ -264,6 +294,44 @@ export default function DownloadVersionPicker({
       if (timer !== undefined) window.clearTimeout(timer);
     };
   }, [preparingId]);
+
+  // Read the ready file's metadata: the server's filename and exact byte count,
+  // which a provider-backed original may only learn from the source. A
+  // transient failure is retried a bounded number of times; a final refusal
+  // stops and offers Retry instead of polling forever.
+  useEffect(() => {
+    if (!finalizing) return;
+    const request = finalizing;
+    const generation = pollGeneration.current;
+    const controller = new AbortController();
+    const isCurrent = () => pollGeneration.current === generation && !controller.signal.aborted;
+    let timer: number | undefined;
+    let retries = 0;
+    async function load(): Promise<void> {
+      try {
+        const file = await getPreparedDownloadFile(request.id, request.filename, controller.signal);
+        if (!isCurrent()) return;
+        setVirtualReady(file);
+        setFinalizing(null);
+      } catch (error) {
+        if (!isCurrent()) return;
+        if (isTransientMetadataFailure(error) && retries < FILE_METADATA_RETRIES) {
+          retries += 1;
+          timer = window.setTimeout(() => void load(), FILE_METADATA_RETRY_MS * retries);
+          return;
+        }
+        const message = downloadPreparationErrorMessage(error);
+        setRefusalMessage(message);
+        setMetadataFailure(request);
+        setFinalizing(null);
+      }
+    }
+    void load();
+    return () => {
+      controller.abort();
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [finalizing]);
 
   const handleDownload = async (version: FileVersion) => {
     if (active.current || !open || prepared) return;
@@ -316,6 +384,7 @@ export default function DownloadVersionPicker({
     prepareAbortRef.current = controller;
     const isCurrent = () => active.current === attempt;
     setRefusalMessage(null);
+    setMetadataFailure(null);
     setSubmitting(true);
     pendingFilenameRef.current = version.file_name ?? "";
     try {
@@ -331,13 +400,7 @@ export default function DownloadVersionPicker({
       if (!isCurrent()) return;
       setVirtualSelection(null);
       if (entry.status === "ready") {
-        const file = await getPreparedDownloadFile(
-          String(entry.id),
-          version.file_name ?? "",
-          controller.signal,
-        );
-        if (!isCurrent()) return;
-        setVirtualReady(file);
+        setFinalizing({ id: String(entry.id), filename: version.file_name ?? "" });
       } else if (isDownloadPreparing(entry.status)) {
         setPreparing({ id: String(entry.id), status: entry.status });
       } else {
@@ -373,6 +436,28 @@ export default function DownloadVersionPicker({
       // Cancellation is best-effort: the row may already be gone or the
       // prepare may have completed. Neither is worth interrupting the user.
     }
+  };
+
+  const handleCancelFinalize = async () => {
+    const id = finalizing?.id;
+    pollGeneration.current += 1;
+    setFinalizing(null);
+    if (!id) return;
+    try {
+      await deleteDownloadEntry(id);
+    } catch {
+      // Same best-effort rule as cancelling a preparation.
+    }
+  };
+
+  // The ready row still exists on the server; retrying the metadata read is
+  // cheaper and safer than preparing a second download for the same version.
+  const handleRetryMetadata = () => {
+    if (!metadataFailure) return;
+    const request = metadataFailure;
+    setMetadataFailure(null);
+    setRefusalMessage(null);
+    setFinalizing(request);
   };
 
   const handleSavePrepared = async () => {
@@ -462,6 +547,7 @@ export default function DownloadVersionPicker({
     virtualSelection !== null ||
     submitting ||
     preparing !== null ||
+    finalizing !== null ||
     virtualReady !== null;
 
   return (
@@ -503,9 +589,14 @@ export default function DownloadVersionPicker({
         )}
 
         {refusalMessage && (
-          <p className="text-muted-foreground text-sm" role="status">
-            {refusalMessage}
-          </p>
+          <div className="flex items-center justify-between gap-2" role="status">
+            <p className="text-muted-foreground text-sm">{refusalMessage}</p>
+            {metadataFailure && (
+              <Button type="button" variant="outline" size="sm" onClick={handleRetryMetadata}>
+                Retry
+              </Button>
+            )}
+          </div>
         )}
 
         {unavailableCount > 0 && (
@@ -574,7 +665,7 @@ export default function DownloadVersionPicker({
           </div>
         )}
 
-        {preparing && (
+        {(preparing || finalizing) && (
           <div className="border-border/50 bg-accent/30 space-y-3 rounded-xl border px-4 py-3">
             <p className="text-foreground flex items-center gap-2 text-sm font-medium">
               <Loader2 className="size-4 animate-spin" />
@@ -587,7 +678,7 @@ export default function DownloadVersionPicker({
               type="button"
               variant="outline"
               size="sm"
-              onClick={() => void handleCancelPrepare()}
+              onClick={() => void (preparing ? handleCancelPrepare() : handleCancelFinalize())}
             >
               Cancel
             </Button>
