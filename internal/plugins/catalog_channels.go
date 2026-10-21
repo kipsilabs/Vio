@@ -6,9 +6,12 @@ const (
 
 	ApprovedCommunityRepositoryURL  = "https://raw.githubusercontent.com/Silo-Community/silo-plugins/main/manifest.json"
 	ApprovedCommunityRepositoryName = "Approved community"
+	ForkVirtualRepositoryURL        = "https://raw.githubusercontent.com/drondeseries/vio-virtual-library/main/catalog.json"
+	ForkVirtualRepositoryName       = "Vio Virtual Library"
 
 	OfficialRepositoryManagedKey          = "official"
 	ApprovedCommunityRepositoryManagedKey = "approved-community"
+	ForkVirtualRepositoryManagedKey       = "fork-virtual-library"
 
 	RepositorySourceSilo              = "vio"
 	RepositorySourceApprovedCommunity = "approved_community"
@@ -37,6 +40,12 @@ var managedRepositoryDefinitions = []managedRepositoryDefinition{
 		URL:         ApprovedCommunityRepositoryURL,
 		DisplayName: ApprovedCommunityRepositoryName,
 		SourceKind:  RepositorySourceApprovedCommunity,
+	},
+	{
+		Key:         ForkVirtualRepositoryManagedKey,
+		URL:         ForkVirtualRepositoryURL,
+		DisplayName: ForkVirtualRepositoryName,
+		SourceKind:  RepositorySourceSilo,
 	},
 }
 
