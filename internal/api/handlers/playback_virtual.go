@@ -3595,7 +3595,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				}, resolvedIdentity, resolvedRematched), nil
 			}
 		}
-		probeCtx, probeCancel := context.WithTimeout(attemptCtx, virtualStartProbeBudget)
+		probeCtx, probeCancel := context.WithTimeout(attemptCtx, virtualProbeBudget)
 		trace.probeRan = true
 		probeStart := time.Now()
 		forwardVirtualCandidateDeclaredAudio(&syncProbeFile, cand)
