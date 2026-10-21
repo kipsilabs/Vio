@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -797,7 +798,7 @@ func TestProbeChainFailedProbeRollsBackCooldown(t *testing.T) {
 		}),
 		VirtualPlaybackSourceProber: func(context.Context, string, *models.MediaFile) (*models.MediaFile, error) {
 			entered.Store(true)
-			return nil, fmt.Errorf("probe failed")
+			return nil, errors.New("probe failed")
 		},
 	}
 	h.ScheduleDefaultFileProbe(probeChainTestContent, source, probeChainStreams(row), catalog.AccessFilter{})
