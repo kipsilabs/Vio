@@ -245,6 +245,11 @@ func (s *VirtualCandidatesRefreshService) listVirtualCandidates(ctx context.Cont
 		// winner would swallow a detail caller's preparation while a detail
 		// winner would prepare for a caller that only asked for a listing.
 		key := keyPrefix + string(mode) + "\x00" + virtualSourceRefreshKey(source)
+		if mode == VirtualDiscoveryDetail {
+			// Selected intent must not be swallowed by a concurrent default
+			// discovery winner. The filter carries the watch request's file_id.
+			key += fmt.Sprintf("\x00%d", filter.SelectedFileID)
+		}
 		// Do not bind the shared work to the first caller's context: a client
 		// disconnect must not cancel the provider re-list (or strand a
 		// coalesced waiter on a canceled context). The shared work runs under

@@ -6,6 +6,7 @@ import (
 	"maps"
 	"runtime/debug"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -155,7 +156,37 @@ func NewVirtualDefaultProbeTarget(versions VirtualProbeVersionLister, files Virt
 		if err != nil || len(list) == 0 {
 			return nil, err
 		}
-		return files.GetByID(ctx, list[0].FileID)
+		selected := list[0].FileID
+		if filter.SelectedFileID != 0 {
+			selected = 0
+			for _, version := range list {
+				if version.FileID == filter.SelectedFileID {
+					selected = version.FileID
+					break
+				}
+			}
+			if selected == 0 {
+				return nil, nil
+			}
+		}
+		row, err := files.GetByID(ctx, selected)
+		if err != nil || row == nil {
+			return nil, err
+		}
+		// A catalog listing authorizes an association, not unrestricted access
+		// to a numeric ID. Revalidate the fetched row after the listing/read
+		// boundary; an episode row must match the episode, not its series.
+		if row.ID != selected || (row.EpisodeID != "" && row.EpisodeID != contentID) ||
+			(row.EpisodeID == "" && row.ContentID != contentID) {
+			return nil, nil
+		}
+		if _, none := filter.LibraryScope([]int{row.MediaFolderID}); none {
+			return nil, nil
+		}
+		if filter.ScopeFilesToLibrary && filter.PresentationLibraryID != nil && row.MediaFolderID != *filter.PresentationLibraryID {
+			return nil, nil
+		}
+		return row, nil
 	})
 }
 
@@ -170,9 +201,44 @@ func NewVirtualDefaultProbeTarget(versions VirtualProbeVersionLister, files Virt
 // reads and the goroutine belong to admitted work only. The zero value is
 // ready to use.
 type defaultProbeChainAdmission struct {
-	mu       sync.Mutex
-	active   map[string]struct{}
-	admitted int
+	mu            sync.Mutex
+	active        map[string]struct{}
+	admitted      int
+	cooldowns     map[string]time.Time
+	cooldownQueue []string
+}
+
+const virtualProbeSourceCooldown = time.Minute
+const virtualProbeCooldownCapacity = 1024
+
+// recentlyStarted performs at most eight expiry removals per admission. The
+// bounded queue is chronological because every entry has the same lifetime.
+func (a *defaultProbeChainAdmission) recentlyStarted(key string, reserve bool) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	now := time.Now()
+	for n := 0; n < 8 && len(a.cooldownQueue) > 0; n++ {
+		oldest := a.cooldownQueue[0]
+		if now.Before(a.cooldowns[oldest]) {
+			break
+		}
+		delete(a.cooldowns, oldest)
+		a.cooldownQueue = a.cooldownQueue[1:]
+	}
+	if _, ok := a.cooldowns[key]; ok {
+		return true
+	}
+	if len(a.cooldowns) >= virtualProbeCooldownCapacity {
+		return true
+	}
+	if reserve {
+		if a.cooldowns == nil {
+			a.cooldowns = make(map[string]time.Time)
+		}
+		a.cooldowns[key] = now.Add(virtualProbeSourceCooldown)
+		a.cooldownQueue = append(a.cooldownQueue, key)
+	}
+	return false
 }
 
 // defaultProbeChainRefusal names why admission rejected a chain. The empty
@@ -247,7 +313,10 @@ func (h *PlaybackHandler) ScheduleDefaultFileProbe(contentID string, source *mod
 			virtualProbeChainReasonScheduleRefused, "prober_unwired")
 		return
 	}
-	release, refusal := h.defaultProbeChains.acquire(contentID + "\x00" + virtualSourceRefreshKey(source))
+	if h.defaultProbeChains.recentlyStarted(contentID+"\x00"+virtualSourceRefreshKey(source), false) {
+		return
+	}
+	release, refusal := h.defaultProbeChains.acquire(contentID + "\x00" + strconv.Itoa(filter.SelectedFileID) + "\x00" + virtualSourceRefreshKey(source))
 	if refusal != defaultProbeChainRefusalNone {
 		// A chain for this item is already live, or both slots are taken.
 		// Either way the callback is dropped: the live chain re-reads the same
@@ -405,6 +474,11 @@ func (h *PlaybackHandler) runDefaultFileProbeChain(ctx context.Context, contentI
 	// evidence path. No session binding exists here, so the fence is nil and
 	// the identity tiers are zero — the same posture the unstamped-row fast
 	// path takes, where the row owns its persisted candidate.
+	// Only an exact, runnable probe consumes the source allowance. Default
+	// and selected targets share it; unrelated groups cannot consume it.
+	if h.defaultProbeChains.recentlyStarted(contentID+"\x00"+virtualSourceRefreshKey(source), true) {
+		return
+	}
 	outcome := h.probeVirtualSourceAndPersist(
 		ctx, stickyKey, row, row.FilePath, probeTransient, *probeCand,
 		resolver.PersistedIdentityTiers{}, expectedRuntimeMinutes, oid,
