@@ -151,7 +151,7 @@ func NewVirtualDefaultProbeTarget(versions VirtualProbeVersionLister, files Virt
 	if versions == nil || files == nil {
 		return nil
 	}
-	return VirtualDefaultProbeTargetFunc(func(ctx context.Context, contentID string, filter catalog.AccessFilter) (*models.MediaFile, error) {
+	return revalidatingVirtualProbeTarget{VirtualDefaultProbeTargetFunc(func(ctx context.Context, contentID string, filter catalog.AccessFilter) (*models.MediaFile, error) {
 		list, err := versions.GetItemVersions(ctx, contentID, filter)
 		if err != nil || len(list) == 0 {
 			return nil, err
@@ -187,7 +187,17 @@ func NewVirtualDefaultProbeTarget(versions VirtualProbeVersionLister, files Virt
 			return nil, nil
 		}
 		return row, nil
-	})
+	})}
+}
+
+// The production resolver repeats the authorized catalog read immediately
+// before submission. Test-only target implementations need not implement it.
+type revalidatingVirtualProbeTarget struct{ VirtualDefaultProbeTarget }
+
+func (r revalidatingVirtualProbeTarget) Revalidate(ctx context.Context, contentID string, filter catalog.AccessFilter, row *models.MediaFile) bool {
+	filter.SelectedFileID = row.ID
+	current, err := r.DefaultVirtualProbeTarget(ctx, contentID, filter)
+	return err == nil && current != nil && current.FilePath == row.FilePath && current.VirtualOwnerInstallationID == row.VirtualOwnerInstallationID
 }
 
 // defaultProbeChainAdmission deduplicates and bounds pre-play probe chains.
@@ -474,6 +484,11 @@ func (h *PlaybackHandler) runDefaultFileProbeChain(ctx context.Context, contentI
 	// evidence path. No session binding exists here, so the fence is nil and
 	// the identity tiers are zero — the same posture the unstamped-row fast
 	// path takes, where the row owns its persisted candidate.
+	if target, ok := h.DefaultProbeTarget.(interface {
+		Revalidate(context.Context, string, catalog.AccessFilter, *models.MediaFile) bool
+	}); ok && !target.Revalidate(ctx, contentID, filter, row) {
+		return
+	}
 	// Only an exact, runnable probe consumes the source allowance. Default
 	// and selected targets share it; unrelated groups cannot consume it.
 	if h.defaultProbeChains.recentlyStarted(contentID+"\x00"+virtualSourceRefreshKey(source), true) {
