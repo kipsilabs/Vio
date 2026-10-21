@@ -207,6 +207,25 @@ func TestScheduleDefaultFileProbeSecondCallCoalescesIntoLiveChain(t *testing.T) 
 	}
 }
 
+func TestScheduleDefaultFileProbeSourceGroupsDoNotCoalesce(t *testing.T) {
+	row := probeChainRow(312, "virtual://movie/probe-chain?result=second", nil)
+	h, target, prober := probeChainHandler(row)
+	first := *probeChainSourceRow()
+	first.FilePath = "virtual://movie/other-group"
+
+	// Keep the wrong group's target read live while the right group arrives.
+	// Content-only admission would discard the second group's callback.
+	h.ScheduleDefaultFileProbe(probeChainTestContent, &first, []VirtualPlaybackStream{{URI: "virtual://movie/other-group?result=first", OwnerInstallationID: 5}}, catalog.AccessFilter{})
+	probeChainWaitFor(t, 1, target.callCount, "first group target read")
+	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), probeChainStreams(row), catalog.AccessFilter{})
+	probeChainWaitFor(t, 2, target.callCount, "second group target read")
+	target.releaseRow()
+	h.probeChainWG.Wait()
+	if prober.count() != 1 || prober.last() != row.FilePath {
+		t.Fatalf("probe calls = %d, last = %q; want exactly the intended target %q", prober.count(), prober.last(), row.FilePath)
+	}
+}
+
 func TestScheduleDefaultFileProbeSkipsStampedRow(t *testing.T) {
 	stampedAt := time.Now().Add(-time.Hour)
 	row := probeChainRow(302, "virtual://movie/probe-chain?result=c2", &stampedAt)

@@ -247,7 +247,7 @@ func (h *PlaybackHandler) ScheduleDefaultFileProbe(contentID string, source *mod
 			virtualProbeChainReasonScheduleRefused, "prober_unwired")
 		return
 	}
-	release, refusal := h.defaultProbeChains.acquire(contentID)
+	release, refusal := h.defaultProbeChains.acquire(contentID + "\x00" + virtualSourceRefreshKey(source))
 	if refusal != defaultProbeChainRefusalNone {
 		// A chain for this item is already live, or both slots are taken.
 		// Either way the callback is dropped: the live chain re-reads the same
