@@ -395,7 +395,7 @@ func (h *PlaybackHandler) runDefaultFileProbeChain(ctx context.Context, contentI
 		return
 	}
 	oid := row.VirtualOwnerInstallationID
-	probeCand := virtualDefaultProbeCandidate(row, source, streams)
+	probeCand := virtualDefaultProbeCandidate(row, source, streams, filter.SelectedFileID != 0)
 	if probeCand == nil {
 		// Without an exact byte match there is nothing safe to enumerate: the
 		// default may be the neutral group row, and a neutral default may
@@ -460,7 +460,7 @@ func (h *PlaybackHandler) runDefaultFileProbeChain(ctx context.Context, contentI
 // bytes the probe opens. The neutral group row itself is never admissible —
 // the just-persisted listing necessarily contains it (under the same virtual
 // path the group was listed from) without naming any specific release.
-func virtualDefaultProbeCandidate(row *models.MediaFile, source *models.MediaFile, streams []VirtualPlaybackStream) *VirtualPlaybackStream {
+func virtualDefaultProbeCandidate(row *models.MediaFile, source *models.MediaFile, streams []VirtualPlaybackStream, allowPersistedSelected bool) *VirtualPlaybackStream {
 	if row == nil || source == nil {
 		return nil
 	}
@@ -476,5 +476,51 @@ func virtualDefaultProbeCandidate(row *models.MediaFile, source *models.MediaFil
 			return &streams[i]
 		}
 	}
-	return nil
+	if !allowPersistedSelected {
+		return nil
+	}
+	// A selected version can be a persisted candidate from an earlier
+	// provider listing. Its row was authorized by the target read; if it
+	// belongs to this source group, its stored concrete URI is the exact
+	// bytes the play path would probe. Do not substitute the neutral group
+	// row or a sibling source's candidate.
+	rowGroup, rowOK := virtualCandidateGroupURI(target)
+	sourceGroup, sourceOK := virtualCandidateGroupURI(source.FilePath)
+	if !rowOK || !sourceOK {
+		return nil
+	}
+	// A neutral source row covers every profile variant beneath its base
+	// path. A profile-specific source row only covers its own group.
+	if rowGroup != sourceGroup && !strings.HasPrefix(target, source.FilePath+"?") {
+		return nil
+	}
+	return virtualPlaybackStreamFromFile(row)
+}
+
+func virtualPlaybackStreamFromFile(row *models.MediaFile) *VirtualPlaybackStream {
+	if row == nil {
+		return nil
+	}
+	stream := &VirtualPlaybackStream{
+		URI:                 row.FilePath,
+		OwnerInstallationID: row.VirtualOwnerInstallationID,
+		Resolution:          row.Resolution,
+		CodecVideo:          row.CodecVideo,
+		CodecAudio:          row.CodecAudio,
+		Container:           row.Container,
+		Bitrate:             row.Bitrate,
+		FileSize:            row.FileSize,
+		RequestHeaders:      maps.Clone(row.ProviderRequestHeaders),
+	}
+	for _, track := range row.AudioTracks {
+		if track.Language != "" {
+			stream.AudioLanguages = append(stream.AudioLanguages, track.Language)
+		}
+	}
+	for _, track := range row.SubtitleTracks {
+		if track.Language != "" {
+			stream.SubtitleLanguages = append(stream.SubtitleLanguages, track.Language)
+		}
+	}
+	return stream
 }

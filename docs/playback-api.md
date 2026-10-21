@@ -267,9 +267,11 @@ the admin metadata update response, keeping v1 answers byte-identical.
 
 After a detail-page read persists a listing, the server schedules one detached
 pre-play probe chain for the opened item: it re-reads the item's selected
-version when the detail read supplied `file_id`, otherwise its default version;
-it requires that the chosen row is a persisted candidate whose exact bytes the
-just-persisted listing names, and probes that candidate through
+version when the detail read supplied `file_id`, otherwise its default version.
+The chosen row is a persisted candidate; when a fresh listing no longer names a
+selected profile variant, the neutral source row may probe that row's own stored
+bytes after the target's authorization checks. The chain probes the chosen
+candidate through
 the ordinary background evidence path (queued, coalescing write). A neutral
 group row is never probed speculatively — it may resolve to a sibling
 candidate, so the play path's own probe handles it. Chains are bounded (two

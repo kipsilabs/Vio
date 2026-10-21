@@ -214,6 +214,28 @@ func TestNewVirtualDefaultProbeTargetUsesSelectedFile(t *testing.T) {
 	}
 }
 
+func TestScheduleDefaultFileProbeProbesPersistedSelectedWhenListingChanged(t *testing.T) {
+	defaultRow := probeChainRow(730, "virtual://movie/probe-chain?result=default", nil)
+	selectedRow := probeChainRow(731, "virtual://movie/probe-chain?profile=4K+Dolby+Vision&result=selected", nil)
+	reader := &probeChainVersionReader{
+		files: []*models.MediaFile{defaultRow, selectedRow},
+		rows:  map[int]*models.MediaFile{defaultRow.ID: defaultRow, selectedRow.ID: selectedRow},
+	}
+	prober := &recordingProber{}
+	h := &PlaybackHandler{
+		ServiceContext:              context.Background(),
+		DefaultProbeTarget:          NewVirtualDefaultProbeTarget(reader, reader),
+		VirtualPlaybackSourceProber: prober.probe,
+	}
+	// The fresh listing no longer names the selected row's URI (the provider
+	// renumbered it), but the selected row itself is persisted and authorized.
+	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), probeChainStreams(defaultRow), catalog.AccessFilter{SelectedFileID: selectedRow.ID, AllowedLibraryIDs: []int{77}})
+	h.probeChainWG.Wait()
+	if prober.count() != 1 || prober.last() != selectedRow.FilePath {
+		t.Fatalf("probes = %d, last = %q; want the persisted selected row %q", prober.count(), prober.last(), selectedRow.FilePath)
+	}
+}
+
 func TestScheduleDefaultFileProbePublishesAfterDurableEvidence(t *testing.T) {
 	defaultRow := probeChainRow(720, "virtual://movie/probe-chain?result=default", nil)
 	selectedRow := probeChainRow(721, "virtual://movie/probe-chain?result=selected", nil)
