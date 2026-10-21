@@ -35,8 +35,10 @@ const (
 	// a successful probe. These limits exceed the playback pipelines' caps
 	// (3 s / 5 MB — see playback/transcode.go and playback/remux.go) so the
 	// metadata probe sees the same stream table playback does.
-	probeAnalyzeDuration = "10M" // 10 s (10,000,000 us)
-	probeSizeLimit       = "32M" // 32 MiB
+	probeAnalyzeDuration     = "10M" // 10 s (10,000,000 us)
+	probeSizeLimit           = "32M" // 32 MiB
+	probeSizeFlag            = "-probesize"
+	probeAnalyzeDurationFlag = "-analyzeduration"
 )
 
 var errFFprobeOutputTooLarge = fmt.Errorf("ffprobe output exceeds %d bytes", maxFFprobeOutputBytes)
@@ -113,8 +115,8 @@ func buildProbeArgs(filePath string) []string {
 		"-show_format",
 		"-show_streams",
 		"-show_chapters",
-		"-probesize", probeSizeLimit,
-		"-analyzeduration", probeAnalyzeDuration,
+		probeSizeFlag, probeSizeLimit,
+		probeAnalyzeDurationFlag, probeAnalyzeDuration,
 		filePath,
 	}
 }
