@@ -7,6 +7,31 @@ progress and stop, delivery, and revocation. Every operation requires an
 authenticated account and an active profile. Validation failures are `422`; an
 unavailable store is `503`.
 
+## Optional selected-version preparation
+
+Detail discovery may prepare the selected `file_id`, or the default version when
+no selection is supplied. Preparation requires an authorized persisted row and
+an exact candidate match. Authorization is read again before probe submission;
+a missing, hidden, changed, or already-probed target is skipped. Listing-only
+requests do not prepare playback. Playback never waits for this optional work
+and uses its ordinary foreground resolution when evidence is not yet available.
+
+Per process, preparation admits at most two chains, with a 90-second deadline,
+a one-minute source cooldown, and at most four probe starts per provider
+installation in any minute. Cooldown and provider-start tracking are bounded to
+1,024 entries; saturation rejects work rather than evicting live allowances.
+Selected-target discovery also admits at most two detached provider listings;
+excess selections return the existing versions without starting more work.
+
+When Redis is configured, an installation-scoped lease admits only one optional
+probe for that provider across replicas. The lease is acquired before probing,
+released afterward with owner-token checking, and expires after the chain budget
+plus one minute if its process dies. Redis errors skip preparation (fail closed),
+not playback. These keys and local permits are not foreground playback permits.
+Without Redis, admission is process-local: deployment-wide work can grow with
+replica count. The per-minute start allowance remains process-local even with
+Redis; the lease bounds concurrent probes, not aggregate cluster start rate.
+
 ## Operations
 
 | Operation | Method and path | Success |

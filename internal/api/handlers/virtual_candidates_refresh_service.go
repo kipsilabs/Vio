@@ -163,7 +163,7 @@ type VirtualCandidatesRefreshService struct {
 	// PlaybackHandler.ScheduleDefaultFileProbe implements this.
 	ScheduleDefaultFileProbe func(contentID string, source *models.MediaFile, streams []VirtualPlaybackStream, filter catalog.AccessFilter)
 
-	flight singleflight.Group
+	flight            singleflight.Group
 	selectedDiscovery defaultProbeChainAdmission
 }
 

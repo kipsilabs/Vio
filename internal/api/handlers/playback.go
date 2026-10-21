@@ -597,7 +597,7 @@ type PlaybackHandler struct {
 	// defaultProbeChains admits and deduplicates the pre-play probe chains.
 	// Zero value is ready to use; see defaultProbeChainAdmission.
 	defaultProbeChains defaultProbeChainAdmission
-	ProbeLease *VirtualProbeLease
+	ProbeLease         *VirtualProbeLease
 	// probeChainWG tracks live pre-play probe chains so tests can wait for
 	// them to settle. Production never waits.
 	probeChainWG            sync.WaitGroup

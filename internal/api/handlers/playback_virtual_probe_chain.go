@@ -211,11 +211,11 @@ func (r revalidatingVirtualProbeTarget) Revalidate(ctx context.Context, contentI
 // reads and the goroutine belong to admitted work only. The zero value is
 // ready to use.
 type defaultProbeChainAdmission struct {
-	mu            sync.Mutex
-	active        map[string]struct{}
-	admitted      int
-	cooldowns     map[string]time.Time
-	cooldownQueue []string
+	mu             sync.Mutex
+	active         map[string]struct{}
+	admitted       int
+	cooldowns      map[string]time.Time
+	cooldownQueue  []string
 	providerStarts map[string][]time.Time
 }
 
@@ -522,12 +522,12 @@ func (h *PlaybackHandler) runDefaultFileProbeChain(ctx context.Context, contentI
 	if h.defaultProbeChains.recentlyStarted(contentID+"\x00"+virtualSourceRefreshKey(source), true) {
 		return
 	}
-	releaseLease, admitted := h.ProbeLease.acquire(ctx, oid)
+	releaseLease, admitted := h.ProbeLease.acquire(ctx, strconv.Itoa(oid))
 	if !admitted {
 		return
 	}
 	defer releaseLease()
-	if !h.defaultProbeChains.allowProviderStart(oid) {
+	if !h.defaultProbeChains.allowProviderStart(strconv.Itoa(oid)) {
 		return
 	}
 	outcome := h.probeVirtualSourceAndPersist(
