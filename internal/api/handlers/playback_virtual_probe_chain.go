@@ -216,6 +216,7 @@ type defaultProbeChainAdmission struct {
 	admitted      int
 	cooldowns     map[string]time.Time
 	cooldownQueue []string
+	providerStarts map[string][]time.Time
 }
 
 const virtualProbeSourceCooldown = time.Minute
@@ -249,6 +250,33 @@ func (a *defaultProbeChainAdmission) recentlyStarted(key string, reserve bool) b
 		a.cooldownQueue = append(a.cooldownQueue, key)
 	}
 	return false
+}
+
+// allowProviderStart permits at most four starts in any minute per installation.
+// Saturation rejects new installations rather than evicting live allowances.
+func (a *defaultProbeChainAdmission) allowProviderStart(provider string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	now := time.Now()
+	if a.providerStarts == nil {
+		a.providerStarts = make(map[string][]time.Time)
+	}
+	for key, starts := range a.providerStarts {
+		for len(starts) > 0 && !now.Before(starts[0].Add(time.Minute)) {
+			starts = starts[1:]
+		}
+		if len(starts) == 0 {
+			delete(a.providerStarts, key)
+		} else {
+			a.providerStarts[key] = starts
+		}
+	}
+	starts := a.providerStarts[provider]
+	if len(starts) >= 4 || (len(starts) == 0 && len(a.providerStarts) >= virtualProbeCooldownCapacity) {
+		return false
+	}
+	a.providerStarts[provider] = append(starts, now)
+	return true
 }
 
 // defaultProbeChainRefusal names why admission rejected a chain. The empty
@@ -492,6 +520,14 @@ func (h *PlaybackHandler) runDefaultFileProbeChain(ctx context.Context, contentI
 	// Only an exact, runnable probe consumes the source allowance. Default
 	// and selected targets share it; unrelated groups cannot consume it.
 	if h.defaultProbeChains.recentlyStarted(contentID+"\x00"+virtualSourceRefreshKey(source), true) {
+		return
+	}
+	releaseLease, admitted := h.ProbeLease.acquire(ctx, oid)
+	if !admitted {
+		return
+	}
+	defer releaseLease()
+	if !h.defaultProbeChains.allowProviderStart(oid) {
 		return
 	}
 	outcome := h.probeVirtualSourceAndPersist(

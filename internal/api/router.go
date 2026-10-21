@@ -1522,6 +1522,9 @@ func newChiRouter(deps Dependencies) chi.Router {
 					if detailSvc != nil && deps.FileRepo != nil {
 						virtualCandidatesRefresh.ScheduleDefaultFileProbe = playbackHandler.ScheduleDefaultFileProbe
 						playbackHandler.DefaultProbeTarget = handlers.NewVirtualDefaultProbeTarget(detailSvc, deps.FileRepo)
+						if deps.RedisClient != nil {
+							playbackHandler.ProbeLease = &handlers.VirtualProbeLease{Client: deps.RedisClient}
+						}
 					}
 					// The indexer-release read/request surface and the async
 					// refresh executor share the store the service owns.

@@ -164,6 +164,7 @@ type VirtualCandidatesRefreshService struct {
 	ScheduleDefaultFileProbe func(contentID string, source *models.MediaFile, streams []VirtualPlaybackStream, filter catalog.AccessFilter)
 
 	flight singleflight.Group
+	selectedDiscovery defaultProbeChainAdmission
 }
 
 // RefreshVirtualCandidates re-lists and persists the item's virtual candidates
@@ -257,7 +258,18 @@ func (s *VirtualCandidatesRefreshService) listVirtualCandidates(ctx context.Cont
 		// timeout, applied inside refreshSource); waiters still observe their
 		// own cancellation while waiting via the select below.
 		workCtx := context.WithoutCancel(ctx)
+		var releaseSelected func()
+		if mode == VirtualDiscoveryDetail && filter.SelectedFileID != 0 {
+			var refusal defaultProbeChainRefusal
+			releaseSelected, refusal = s.selectedDiscovery.acquire(key)
+			if refusal != defaultProbeChainRefusalNone {
+				return before.Versions, nil
+			}
+		}
 		refreshCh := s.flight.DoChan(key, func() (any, error) {
+			if releaseSelected != nil {
+				defer releaseSelected()
+			}
 			_, err := s.listSource(workCtx, source, userID, profileID, lister, chainKey, filter)
 			return nil, err
 		})
