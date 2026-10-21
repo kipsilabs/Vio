@@ -301,10 +301,6 @@ func hasResolutionMarker(text string) bool {
 		strings.Contains(text, "480p")
 }
 
-func streamSize(s StreamCandidate) string {
-	return streamSizePattern.FindString(s.Name + " " + s.Description + " " + s.Title)
-}
-
 // CandidateVideoHash returns the candidate's provider-declared content hash:
 // the Stremio behaviorHints.videoHash when the addon sends one, else the
 // torrent infoHash. Both identify the same bytes across a re-listing's result
@@ -365,9 +361,6 @@ func CandidateDisplayName(candidate StreamCandidate) string {
 	}
 	if name == "" {
 		name = candidate.Resolution
-	}
-	if size := streamSize(candidate); size != "" && !strings.Contains(strings.ToLower(name), strings.ToLower(size)) {
-		name += " · " + size
 	}
 	clean := strings.Map(func(r rune) rune {
 		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
