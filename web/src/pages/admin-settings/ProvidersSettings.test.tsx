@@ -107,34 +107,37 @@ vi.mock("@/hooks/queries/admin/settings", () => ({
   }),
 }));
 
+const subtitleProviderState = vi.hoisted(() => {
+  const providers = [
+    {
+      provider_name: "subdl",
+      enabled: false,
+      has_api_key: false,
+      has_credentials: false,
+      updated_at: "",
+    },
+    {
+      provider_name: "opensubtitles",
+      enabled: true,
+      has_api_key: false,
+      has_credentials: true,
+      updated_at: "",
+    },
+    {
+      provider_name: "subsource",
+      enabled: false,
+      has_api_key: true,
+      has_credentials: false,
+      updated_at: "",
+    },
+  ];
+  return { providers, initial: providers.map((provider) => ({ ...provider })) };
+});
+
 vi.mock("@/hooks/queries/admin/subtitles", () => ({
   useSubtitleProviders: () => ({
     scope: adminSubtitleListScope(),
-    data: {
-      providers: [
-        {
-          provider_name: "subdl",
-          enabled: false,
-          has_api_key: false,
-          has_credentials: false,
-          updated_at: "",
-        },
-        {
-          provider_name: "opensubtitles",
-          enabled: true,
-          has_api_key: false,
-          has_credentials: true,
-          updated_at: "",
-        },
-        {
-          provider_name: "subsource",
-          enabled: false,
-          has_api_key: true,
-          has_credentials: false,
-          updated_at: "",
-        },
-      ],
-    },
+    data: { providers: subtitleProviderState.providers },
     isLoading: false,
   }),
   useUpdateSubtitleProvider: () => ({ mutate: mocks.updateProvider, isPending: false }),
@@ -160,12 +163,15 @@ describe("ProvidersSettings", () => {
       "fetch",
       vi.fn<typeof fetch>().mockImplementation(async (input) => {
         const provider = String(input).split("/").pop();
+        const configured = subtitleProviderState.providers.find(
+          (entry) => entry.provider_name === provider,
+        );
         return new Response(
           JSON.stringify({
             provider_name: provider,
-            enabled: provider === "opensubtitles",
-            has_api_key: provider === "subsource",
-            has_credentials: provider === "opensubtitles",
+            enabled: configured?.enabled ?? provider === "opensubtitles",
+            has_api_key: configured?.has_api_key ?? provider === "subsource",
+            has_credentials: configured?.has_credentials ?? provider === "opensubtitles",
           }),
           { headers: { "Content-Type": "application/json", ETag: '"captured"' } },
         );
@@ -173,6 +179,9 @@ describe("ProvidersSettings", () => {
     );
     sensitiveConfigured = ["mdblist.api_key"];
     settingsValues = {};
+    subtitleProviderState.providers = subtitleProviderState.initial.map((provider) => ({
+      ...provider,
+    }));
     setValueMock.mockReset();
     markerProviders = [];
     pluginInstallations = [];
@@ -228,6 +237,40 @@ describe("ProvidersSettings", () => {
     // Tile drafts live outside useSettingsForm; the navigation guard and the
     // reload prompt only see them through this report.
     expect(reportUnsavedMock).toHaveBeenLastCalledWith(true);
+  });
+
+  it("explains the username hint when no OpenSubtitles credentials are saved", async () => {
+    subtitleProviderState.providers = subtitleProviderState.providers.map((provider) =>
+      provider.provider_name === "opensubtitles"
+        ? { ...provider, has_credentials: false }
+        : provider,
+    );
+    const user = userEvent.setup();
+    render(<ProvidersSettings />);
+
+    await user.click(
+      within(screen.getByRole("group", { name: "OpenSubtitles" })).getByRole("button", {
+        name: /Manage|Connect|Set up/,
+      }),
+    );
+
+    expect(
+      await screen.findByText("OpenSubtitles signs you in with your username, not your email."),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/Leave blank to keep the saved one/)).not.toBeInTheDocument();
+  });
+
+  it("does not show the OpenSubtitles username hint on API-key providers", async () => {
+    const user = userEvent.setup();
+    render(<ProvidersSettings />);
+
+    await user.click(
+      within(screen.getByRole("group", { name: "SubDL" })).getByRole("button", {
+        name: /Manage|Connect|Set up/,
+      }),
+    );
+
+    expect(screen.queryByText(/OpenSubtitles signs you in/)).not.toBeInTheDocument();
   });
 
   it("retains subtitle draft after uncertain save and requires explicit reload", async () => {
