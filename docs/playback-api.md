@@ -262,9 +262,10 @@ appears on `GET /api/v2/catalog/items/{id}`, `GET /api/v2/watch/{id}`, and
 the admin metadata update response, keeping v1 answers byte-identical.
 
 After discovery persists a listing, the server schedules one detached
-pre-play probe chain for the opened item: it re-reads the item's default
-version, requires that the default row is a persisted candidate whose exact
-bytes the just-persisted listing names, and probes that candidate through
+pre-play probe chain for the opened item: it re-reads the item's selected
+version when the detail read supplied `file_id`, otherwise its default version;
+it requires that the chosen row is a persisted candidate whose exact bytes the
+just-persisted listing names, and probes that candidate through
 the ordinary background evidence path (queued, coalescing write). A neutral
 group row is never probed speculatively — it may resolve to a sibling
 candidate, so the play path's own probe handles it. Chains are bounded (two

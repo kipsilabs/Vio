@@ -6,6 +6,7 @@ import (
 	"maps"
 	"runtime/debug"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -267,7 +268,11 @@ func (h *PlaybackHandler) ScheduleDefaultFileProbe(contentID string, source *mod
 			virtualProbeChainReasonScheduleRefused, "prober_unwired")
 		return
 	}
-	release, refusal := h.defaultProbeChains.acquire(contentID)
+	// A detail read can select a version from a different provider source
+	// group than the item's default. Admit the chain by source and selection
+	// so the first source cannot swallow the selected source's chain.
+	admissionKey := contentID + "\x00" + strconv.Itoa(filter.SelectedFileID) + "\x00" + virtualSourceRefreshKey(source)
+	release, refusal := h.defaultProbeChains.acquire(admissionKey)
 	if refusal != defaultProbeChainRefusalNone {
 		// A chain for this item is already live, or both slots are taken.
 		// Either way the callback is dropped: the live chain re-reads the same
