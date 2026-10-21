@@ -188,6 +188,51 @@ func TestScheduleDefaultFileProbeProbesTheDefaultRowsOwnBytes(t *testing.T) {
 	}
 }
 
+func TestNewVirtualDefaultProbeTargetUsesSelectedFile(t *testing.T) {
+	defaultRow := probeChainRow(700, "virtual://movie/probe-chain?result=default", nil)
+	selectedRow := probeChainRow(701, "virtual://movie/probe-chain?result=selected", nil)
+	reader := &probeChainVersionReader{
+		files: []*models.MediaFile{defaultRow, selectedRow},
+		rows:  map[int]*models.MediaFile{defaultRow.ID: defaultRow, selectedRow.ID: selectedRow},
+	}
+	target := NewVirtualDefaultProbeTarget(reader, reader)
+
+	got, err := target.DefaultVirtualProbeTarget(t.Context(), probeChainTestContent, catalog.AccessFilter{SelectedFileID: selectedRow.ID, AllowedLibraryIDs: []int{77}})
+	if err != nil || got == nil || got.ID != selectedRow.ID || got.FilePath != selectedRow.FilePath {
+		t.Fatalf("selected target = %+v, err = %v; want file %d", got, err, selectedRow.ID)
+	}
+
+	if got, err := target.DefaultVirtualProbeTarget(t.Context(), probeChainTestContent, catalog.AccessFilter{SelectedFileID: 999, AllowedLibraryIDs: []int{77}}); err != nil || got != nil {
+		t.Fatalf("unknown selected target = %+v, err = %v; want no target", got, err)
+	}
+
+	selectedRow.MediaFolderID = 78
+	reader.rows[selectedRow.ID] = selectedRow
+	if got, err := target.DefaultVirtualProbeTarget(t.Context(), probeChainTestContent, catalog.AccessFilter{SelectedFileID: selectedRow.ID, AllowedLibraryIDs: []int{77}}); err != nil || got != nil {
+		t.Fatalf("hidden selected target = %+v, err = %v; want no target", got, err)
+	}
+}
+
+func TestScheduleDefaultFileProbeProbesSelectedBytes(t *testing.T) {
+	defaultRow := probeChainRow(710, "virtual://movie/probe-chain?result=default", nil)
+	selectedRow := probeChainRow(711, "virtual://movie/probe-chain?result=selected", nil)
+	reader := &probeChainVersionReader{
+		files: []*models.MediaFile{defaultRow, selectedRow},
+		rows:  map[int]*models.MediaFile{defaultRow.ID: defaultRow, selectedRow.ID: selectedRow},
+	}
+	prober := &recordingProber{}
+	h := &PlaybackHandler{
+		ServiceContext:              context.Background(),
+		DefaultProbeTarget:          NewVirtualDefaultProbeTarget(reader, reader),
+		VirtualPlaybackSourceProber: prober.probe,
+	}
+	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), probeChainStreams(selectedRow), catalog.AccessFilter{SelectedFileID: selectedRow.ID, AllowedLibraryIDs: []int{77}})
+	h.probeChainWG.Wait()
+	if prober.count() != 1 || prober.last() != selectedRow.FilePath {
+		t.Fatalf("probes = %d, last = %q; want selected file %q", prober.count(), prober.last(), selectedRow.FilePath)
+	}
+}
+
 func TestScheduleDefaultFileProbeSecondCallCoalescesIntoLiveChain(t *testing.T) {
 	row := probeChainRow(311, "virtual://movie/probe-chain?result=c11", nil)
 	h, target, prober := probeChainHandler(row)

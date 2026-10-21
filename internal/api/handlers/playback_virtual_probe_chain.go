@@ -146,7 +146,36 @@ func NewVirtualDefaultProbeTarget(versions VirtualProbeVersionLister, files Virt
 		if err != nil || len(list) == 0 {
 			return nil, err
 		}
-		return files.GetByID(ctx, list[0].FileID)
+		selected := list[0].FileID
+		if filter.SelectedFileID != 0 {
+			selected = 0
+			for _, version := range list {
+				if version.FileID == filter.SelectedFileID {
+					selected = version.FileID
+					break
+				}
+			}
+			if selected == 0 {
+				return nil, nil
+			}
+		}
+		row, err := files.GetByID(ctx, selected)
+		if err != nil || row == nil {
+			return nil, err
+		}
+		// A selected catalog entry authorizes the association named by the
+		// listing, not an unrelated row that happens to carry the same id.
+		if row.ID != selected || (row.EpisodeID != "" && row.EpisodeID != contentID) ||
+			(row.EpisodeID == "" && row.ContentID != contentID) {
+			return nil, nil
+		}
+		if _, none := filter.LibraryScope([]int{row.MediaFolderID}); none {
+			return nil, nil
+		}
+		if filter.ScopeFilesToLibrary && filter.PresentationLibraryID != nil && row.MediaFolderID != *filter.PresentationLibraryID {
+			return nil, nil
+		}
+		return row, nil
 	})
 }
 
