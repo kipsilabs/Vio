@@ -176,6 +176,8 @@ func ProbeFile(ctx context.Context, ffprobePath string, filePath string) (*Probe
 // construction, deadlines, and any post-parse work.
 func runProbeFFprobe(ctx context.Context, ffprobePath string, args []string, filePath string) (*ProbeData, *ffprobeOutput, error) {
 	cmd := exec.CommandContext(ctx, ffprobePath, args...) //nolint:gosec // ffprobePath is the configured binary and args are built by the scanner.
+	killProcessGroupOnCancel(cmd)
+	cmd.WaitDelay = defaultProbeLimits.waitDelay
 	output := &boundedProbeBuffer{limit: maxFFprobeOutputBytes}
 	cmd.Stdout = output
 	if err := cmd.Run(); err != nil {
