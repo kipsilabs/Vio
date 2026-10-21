@@ -479,6 +479,7 @@ func cloneCandidates(candidates []StreamCandidate) []StreamCandidate {
 // confirmation), drops releases AltMount reports as failed, and stably moves
 // confirmed releases ahead of unconfirmed ones. Order within each group is
 // preserved, so the quality ranking still decides which confirmed release wins.
+// The server-order preset skips promotion to preserve provider order before capping.
 // Classification runs before dedup so a failed variant can never shadow a live
 // duplicate of the same release.
 //
@@ -517,6 +518,12 @@ func (r *Resolver) preferConfirmedCandidates(ctx context.Context, candidates []S
 		}
 	}
 	candidates, dropped := dedupeCandidates(candidates)
+	r.mu.RLock()
+	trustServerOrder := r.config.Quality.TrustServerOrder()
+	r.mu.RUnlock()
+	if trustServerOrder {
+		return candidates, dropped
+	}
 	return stablePartitionCandidates(candidates), dropped
 }
 

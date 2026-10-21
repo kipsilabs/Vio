@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/plugins"
 )
 
 // probedStartPreferenceRows builds the two catalog rows of one release: a bare
@@ -134,5 +135,49 @@ func TestPreferProbedVirtualCandidatesOrderingRespectsGroups(t *testing.T) {
 		if ordered[i].ID != id {
 			t.Fatalf("ordered[%d] = %q, want %q (got order %#v)", i, ordered[i].ID, id, ordered)
 		}
+	}
+}
+
+func TestResolveVirtualStartPreservesServerOrderAcrossCachedStarts(t *testing.T) {
+	const neutralURI = "virtual://movie/tt-server-order-start"
+	placeholder, probed := probedStartPreferenceRows(neutralURI, "stub", "probed")
+	file := *placeholder
+	file.FilePath = neutralURI
+	file.ContentID = "movie-server-order"
+	listings := 0
+	h := &PlaybackHandler{
+		BestResultCache: NewVirtualBestResultCache(time.Minute, 16),
+		DeviceCapabilitySource: staticDeviceCapabilities{device: plugins.DeviceCapabilities{
+			CodecsVideo: []string{"h264"}, CodecsAudio: []string{"aac"}, Containers: []string{"mkv"}, MaxResolution: "2160p",
+		}},
+		VirtualPlaybackResolver: VirtualPlaybackResolverFunc(func(context.Context, string, int, string, int) (string, error) {
+			return "https://93.184.216.34/stream", nil
+		}),
+		VirtualPlaybackStreamLister: VirtualPlaybackStreamListerFunc(func(context.Context, string, int, string, int) ([]VirtualPlaybackStream, error) {
+			listings++
+			return []VirtualPlaybackStream{
+				{ID: "stub", URI: placeholder.FilePath, Resolution: "720p", CodecVideo: "hevc", PreserveProviderOrder: true},
+				{ID: "probed", URI: probed.FilePath, Resolution: "2160p", CodecVideo: "h264", PreserveProviderOrder: true},
+			}, nil
+		}),
+		VirtualFileLookup: func(_ context.Context, path string) (*models.MediaFile, error) {
+			if path == probed.FilePath {
+				return probed, nil
+			}
+			return nil, nil
+		},
+	}
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/api/v2/playback/start", nil)
+		resolved, err := h.resolveVirtualPlaybackSource(req, &file, "profile-1", true, nil, "", "auto", 0, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resolved.URI != placeholder.FilePath {
+			t.Fatalf("start %d selected %q, want provider's first candidate", i, resolved.URI)
+		}
+	}
+	if listings != 1 {
+		t.Fatalf("listings = %d, want one listing reused from cache", listings)
 	}
 }

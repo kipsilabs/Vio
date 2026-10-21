@@ -78,3 +78,46 @@ func TestVirtualCandidateScoreSourceSwallowsProviderError(t *testing.T) {
 		t.Fatalf("scores = %v, want nil on provider error", scores)
 	}
 }
+
+func TestVirtualCandidateScoreSourceCarriesProviderOrderWithoutScores(t *testing.T) {
+	lister := &fakeCandidateLister{streams: []virtuallibrary.PlaybackStream{
+		{URI: "virtual://movie/tt1?result=first", PreserveProviderOrder: true},
+		{URI: "virtual://movie/tt1?result=second", PreserveProviderOrder: true},
+	}}
+	source := virtualCandidateScoreSource(lister)
+	scores := source(context.Background(), "movie-1", []*models.MediaFile{
+		{ID: 2, FilePath: "virtual://movie/tt1?result=second"},
+		{ID: 1, FilePath: "virtual://movie/tt1?result=first"},
+	})
+	for id, position := range map[int]int{1: 0, 2: 1} {
+		score, ok := scores[id]
+		if !ok || score.ProviderOrder == nil || *score.ProviderOrder != position || score.Score != 0 {
+			t.Fatalf("file %d order = %+v, want position %d without score", id, score, position)
+		}
+	}
+	converted := virtualPlaybackStreamsFromCore(lister.streams)
+	if !converted[0].PreserveProviderOrder || !converted[1].PreserveProviderOrder {
+		t.Fatal("playback adapter discarded provider-order policy")
+	}
+}
+
+func TestProviderOrderAppliesAcrossQualityProfiles(t *testing.T) {
+	lister := &fakeCandidateLister{streams: []virtuallibrary.PlaybackStream{
+		{URI: "virtual://movie/tt1?profile=first&result=a", PreserveProviderOrder: true},
+		{URI: "virtual://movie/tt1?profile=first&result=b", PreserveProviderOrder: true},
+	}}
+	scores := virtualCandidateScoreSource(lister)(context.Background(), "movie-1", []*models.MediaFile{
+		{ID: 1, FilePath: "virtual://movie/tt1?profile=first&result=a"},
+		{ID: 2, FilePath: "virtual://movie/tt1?profile=first&result=b"},
+		{ID: 3, FilePath: "virtual://movie/tt1?profile=second&result=a"},
+		{ID: 4, FilePath: "virtual://movie/tt1?profile=second&result=b"},
+		{ID: 5, FilePath: "virtual://movie/tt1?result=a&results=all"},
+		{ID: 6, FilePath: "virtual://movie/tt1?result=b&results=all"},
+	})
+	for id, position := range map[int]int{1: 0, 2: 1, 3: 0, 4: 1, 5: 0, 6: 1} {
+		score, ok := scores[id]
+		if !ok || score.ProviderOrder == nil || *score.ProviderOrder != position {
+			t.Fatalf("file %d lacks provider position %d: %+v", id, position, score)
+		}
+	}
+}

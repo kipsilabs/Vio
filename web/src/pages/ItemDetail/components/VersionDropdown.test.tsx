@@ -699,3 +699,26 @@ describe("VersionDropdown ranking indicator", () => {
     expect(dialog.getByText(/4K\+HDR/)).toBeInTheDocument();
   });
 });
+
+describe("VersionDropdown provider order", () => {
+  it("uses the watch listing order when the server disables ranking", () => {
+    const versions = [
+      makeVersion({ file_id: 2, resolution: "2160p" }),
+      makeVersion({ file_id: 3, resolution: "1080p" }),
+      makeVersion({ file_id: 1, resolution: "720p" }),
+    ];
+    watchDetailMock.current = {
+      virtual_ranking: { source: "default", criteria: [] },
+      versions: [versions[2], versions[0], versions[1]],
+    };
+    const dialog = openPicker(versions, { contentId: "movie-1" });
+    const rows = dialog
+      .getAllByRole("button")
+      .filter((button) => /H264/.test(button.textContent ?? ""));
+    expect(rows.map((row) => row.textContent?.match(/2160p|1080p|720p/)?.[0])).toEqual([
+      "720p",
+      "2160p",
+      "1080p",
+    ]);
+  });
+});

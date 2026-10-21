@@ -140,10 +140,17 @@ function VersionDropdown({
     [activeVersions, watch],
   );
   const effectiveCriteria = userCriteria.length > 0 ? userCriteria : serverRanking.criteria;
-  const orderedVersions = useMemo(
-    () => sortVersionsByCriteria(activeVersions, effectiveCriteria, versionSortableFromFile),
-    [activeVersions, effectiveCriteria],
-  );
+  const orderedVersions = useMemo(() => {
+    // An explicit empty ranking means the server already supplied the order.
+    // Restore it from watch detail after the catalog/edition fallback sorting.
+    if (effectiveCriteria.length === 0 && serverRanking.fromPayload && watch?.versions) {
+      const positions = new Map(watch.versions.map((version, index) => [version.file_id, index]));
+      return [...activeVersions].sort(
+        (a, b) => (positions.get(a.file_id) ?? Infinity) - (positions.get(b.file_id) ?? Infinity),
+      );
+    }
+    return sortVersionsByCriteria(activeVersions, effectiveCriteria, versionSortableFromFile);
+  }, [activeVersions, effectiveCriteria, serverRanking.fromPayload, watch]);
   const watchVersionByFileId = useMemo(() => {
     const versions = new Map<number, FileVersion>();
     for (const version of watch?.versions ?? []) {

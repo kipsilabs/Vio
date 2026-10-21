@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/plugins"
 )
 
@@ -84,5 +85,30 @@ func TestFinalizeVirtualCandidateOrderSingleRejectedIsAZeroAllocNoOp(t *testing.
 	out := h.finalizeVirtualCandidateOrder(httptest.NewRequest(http.MethodGet, "/", nil), []VirtualPlaybackStream{only}, "auto", 0)
 	if len(out) != 1 || out[0].URI != only.URI || !out[0].Rejected {
 		t.Fatalf("single rejected candidate changed: %+v", out)
+	}
+}
+
+func TestServerOrderBypassesHandlerPreferences(t *testing.T) {
+	const neutral = "virtual://movie/tt-server-order"
+	stub, probed := probedStartPreferenceRows(neutral, "stub", "probed")
+	streams := []VirtualPlaybackStream{
+		{URI: stub.FilePath, Resolution: "720p", CodecVideo: "hevc", PreserveProviderOrder: true},
+		{URI: probed.FilePath, Resolution: "2160p", CodecVideo: "h264", PreserveProviderOrder: true},
+	}
+	h := &PlaybackHandler{
+		DeviceCapabilitySource: staticDeviceCapabilities{device: plugins.DeviceCapabilities{CodecsVideo: []string{"h264"}, MaxResolution: "2160p"}},
+		VirtualFileLookup: func(_ context.Context, path string) (*models.MediaFile, error) {
+			if path == probed.FilePath {
+				return probed, nil
+			}
+			return nil, nil
+		},
+	}
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	ordered := h.finalizeVirtualCandidateOrder(req, streams, "2160p", 0)
+	ordered = h.preferProbedVirtualCandidates(context.Background(), ordered, stub, 0)
+	ordered = h.applyVirtualStickyPin("server-order", probed.FilePath, ordered)
+	if ordered[0].URI != stub.FilePath {
+		t.Fatal("handler preferences replaced the provider's first stream")
 	}
 }
