@@ -4493,11 +4493,11 @@ func (s *MetadataService) refreshSeriesChildTarget(
 		if err != nil {
 			return err
 		}
-		seasons, seasonSearched, err := s.fetchTargetSeasonResults(ctx, providerIDs, folderID, language, seasonNumber, childCtx, skipLocal)
+		seasons, seasonSearched, _, err := s.fetchTargetSeasonResults(ctx, providerIDs, folderID, language, seasonNumber, childCtx, skipLocal)
 		if err != nil {
 			return err
 		}
-		episodes, episodeSearched, err := s.fetchTargetEpisodeResults(ctx, providerIDs, folderID, language, seasonNumber, episodeNumber, childCtx, skipLocal)
+		episodes, episodeSearched, _, err := s.fetchTargetEpisodeResults(ctx, providerIDs, folderID, language, seasonNumber, episodeNumber, childCtx, skipLocal)
 		if err != nil {
 			return err
 		}
@@ -4605,12 +4605,17 @@ func (s *MetadataService) resolveSeriesRefreshProviderIDs(ctx context.Context, s
 
 // fetchTargetSeasonResults also reports localArtworkSeason when the local
 // provider answered, as processInternal records it.
-func (s *MetadataService) fetchTargetSeasonResults(ctx context.Context, providerIDs map[string]string, folderID int, language string, seasonNumber int, childCtx seriesChildLocalContext, skipLocal bool) ([]SeasonResult, localArtworkLevel, error) {
+//
+// It also reports whether a provider failed. A caller that has to tell an
+// authoritative answer from a partial one needs to know that a provider in
+// the chain did not answer.
+func (s *MetadataService) fetchTargetSeasonResults(ctx context.Context, providerIDs map[string]string, folderID int, language string, seasonNumber int, childCtx seriesChildLocalContext, skipLocal bool) ([]SeasonResult, localArtworkLevel, bool, error) {
 	seasonChain, err := s.resolveChainCached(ctx, folderID, "season")
 	if err != nil {
-		return nil, 0, fmt.Errorf("resolve season provider chain: %w", err)
+		return nil, 0, false, fmt.Errorf("resolve season provider chain: %w", err)
 	}
 	var searched localArtworkLevel
+	providerFailed := false
 	seasonResults := make(map[int]*SeasonResult)
 	for _, p := range seasonChain {
 		ep, ok := p.(EpisodeProvider)
@@ -4629,7 +4634,7 @@ func (s *MetadataService) fetchTargetSeasonResults(ctx context.Context, provider
 			ShowFilePaths:        showFilePaths(childCtx.episodeFilePaths),
 		})
 		if errors.Is(err, ErrLocalMetadataUnavailable) {
-			return nil, 0, fmt.Errorf("metadata: %s seasons: %w", p.Slug(), err)
+			return nil, 0, false, fmt.Errorf("metadata: %s seasons: %w", p.Slug(), err)
 		}
 		if err != nil {
 			if handleScopedProvider404(p.Slug(), providerIDs, err, "season", seasonNumber) {
@@ -4637,6 +4642,7 @@ func (s *MetadataService) fetchTargetSeasonResults(ctx context.Context, provider
 			}
 			slog.WarnContext(ctx, "metadata: target season provider error", "component", "metadata",
 				"provider", p.Slug(), "season", seasonNumber, "error", err)
+			providerFailed = true
 			continue
 		}
 		if !s.localArtworkUsable() {
@@ -4652,17 +4658,21 @@ func (s *MetadataService) fetchTargetSeasonResults(ctx context.Context, provider
 			accumulateSeasonResults(seasonResults, []SeasonResult{season})
 		}
 	}
-	return flattenSeasonResults(seasonResults), searched, nil
+	return flattenSeasonResults(seasonResults), searched, providerFailed, nil
 }
 
 // fetchTargetEpisodeResults also reports localArtworkEpisode when the local
 // provider answered, as processInternal records it.
-func (s *MetadataService) fetchTargetEpisodeResults(ctx context.Context, providerIDs map[string]string, folderID int, language string, seasonNumber int, episodeNumber int, childCtx seriesChildLocalContext, skipLocal bool) ([]EpisodeResult, localArtworkLevel, error) {
+//
+// It also reports whether a provider failed, so a caller can tell an
+// authoritative episode list from a partial one.
+func (s *MetadataService) fetchTargetEpisodeResults(ctx context.Context, providerIDs map[string]string, folderID int, language string, seasonNumber int, episodeNumber int, childCtx seriesChildLocalContext, skipLocal bool) ([]EpisodeResult, localArtworkLevel, bool, error) {
 	episodeChain, err := s.resolveChainCached(ctx, folderID, "episode")
 	if err != nil {
-		return nil, 0, fmt.Errorf("resolve episode provider chain: %w", err)
+		return nil, 0, false, fmt.Errorf("resolve episode provider chain: %w", err)
 	}
 	var searched localArtworkLevel
+	providerFailed := false
 	episodeResults := make(map[episodeResultKey]*EpisodeResult)
 	for _, p := range episodeChain {
 		ep, ok := p.(EpisodeProvider)
@@ -4681,7 +4691,7 @@ func (s *MetadataService) fetchTargetEpisodeResults(ctx context.Context, provide
 			ShowFilePaths:    showFilePaths(childCtx.episodeFilePaths),
 		})
 		if errors.Is(err, ErrLocalMetadataUnavailable) {
-			return nil, 0, fmt.Errorf("metadata: %s episodes: %w", p.Slug(), err)
+			return nil, 0, false, fmt.Errorf("metadata: %s episodes: %w", p.Slug(), err)
 		}
 		if err != nil {
 			if handleScopedProvider404(p.Slug(), providerIDs, err, "season", seasonNumber) {
@@ -4689,6 +4699,7 @@ func (s *MetadataService) fetchTargetEpisodeResults(ctx context.Context, provide
 			}
 			slog.WarnContext(ctx, "metadata: target episode provider error", "component", "metadata",
 				"provider", p.Slug(), "season", seasonNumber, "error", err)
+			providerFailed = true
 			continue
 		}
 		if !s.localArtworkUsable() {
@@ -4707,7 +4718,7 @@ func (s *MetadataService) fetchTargetEpisodeResults(ctx context.Context, provide
 			accumulateEpisodeResults(episodeResults, []EpisodeResult{episode})
 		}
 	}
-	return flattenEpisodeResults(episodeResults), searched, nil
+	return flattenEpisodeResults(episodeResults), searched, providerFailed, nil
 }
 
 func (s *MetadataService) enqueueSeriesChildImages(ctx context.Context, seriesID string, inputs []EnqueueImageCacheJobInput) {

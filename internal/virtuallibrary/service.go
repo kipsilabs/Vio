@@ -51,6 +51,11 @@ type Service struct {
 	// the pool) is unavailable, so callers must nil-check.
 	indexerReleases *IndexerReleaseStore
 
+	// registrar is the catalog registrar the monitor registers through. It is
+	// kept so the artwork cache can be installed after construction, when the
+	// metadata service is wired.
+	registrar *catalogMonitorRegistrar
+
 	cfg    Config
 	logger *slog.Logger
 }
@@ -235,12 +240,14 @@ func New(cfg Config, registrar *catalog.VirtualMediaRegistrar, logger *slog.Logg
 			logger.Warn("virtual library altmount configuration error", "error", err)
 		}
 	}
+	var monitorRegistrar *catalogMonitorRegistrar
 	if registrar != nil {
-		m.SetRegistrar(&catalogMonitorRegistrar{
+		monitorRegistrar = &catalogMonitorRegistrar{
 			registrar:       registrar,
 			movieLibraryID:  cfg.MovieLibraryID,
 			seriesLibraryID: cfg.SeriesLibraryID,
-		})
+		}
+		m.SetRegistrar(monitorRegistrar)
 		m.SetHost(&catalogRegistrarAdapter{registrar: registrar})
 	}
 	// Wire the resolver's ingestion hooks. The monitor owns the classifier
@@ -259,7 +266,7 @@ func New(cfg Config, registrar *catalog.VirtualMediaRegistrar, logger *slog.Logg
 	if store := m.ReleaseStore(); store != nil {
 		r.SetReleaseGate(store)
 	}
-	service := &Service{Resolver: r, Monitor: m, cfg: cfg, logger: logger}
+	service := &Service{Resolver: r, Monitor: m, cfg: cfg, logger: logger, registrar: monitorRegistrar}
 	if pool := registrarPool(registrar); pool != nil {
 		service.indexerReleases = NewIndexerReleaseStore(pool)
 	}

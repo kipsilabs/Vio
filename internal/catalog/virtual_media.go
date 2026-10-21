@@ -41,6 +41,7 @@ const (
 	maxVirtualVariantLabelBytes    = 256
 	maxVirtualAttributeBytes       = 128
 	maxVirtualIdentifierBytes      = 128
+	maxVirtualContentIDBytes       = 256
 	maxVirtualGenres               = 64
 	maxVirtualGenreBytes           = 128
 	maxVirtualEpisodes             = 4096
@@ -177,6 +178,14 @@ type VirtualMedia struct {
 	SubtitleLanguages                    []string
 	Episodes                             []VirtualEpisode
 	Variants                             []VirtualMediaVariant
+	// ContentID pins the identity of an item the caller has already
+	// resolved. It is empty when the caller has no existing identity, and
+	// the registrar then derives one from the provider IDs. A caller that
+	// resolved the item through its provider aliases sets it, so an
+	// enriched registration updates that item instead of creating a second
+	// row for the same title. New provider IDs are recorded as aliases of
+	// the pinned item; they never move the item to a new identity.
+	ContentID string
 }
 
 type VirtualMediaResult struct {
@@ -234,6 +243,94 @@ func (r *VirtualMediaRegistrar) Upsert(ctx context.Context, in VirtualMedia) (*V
 	return r.UpsertVirtualMedia(ctx, 0, in)
 }
 
+// ResolveVirtualMediaContentID finds the catalog item that already owns any
+// of the given provider IDs, so an enriched registration updates that item
+// instead of creating a second one for the same title.
+//
+// The lookup covers the item's own provider columns and the provider alias
+// table, so a series that gained a TVDB id after it was registered under its
+// TMDB id still resolves to the row that holds the TMDB id. The item that
+// matches the most of the given IDs wins; ties are broken by content id so
+// the answer is stable. An empty result means the catalog has no item for
+// these IDs yet.
+func (r *VirtualMediaRegistrar) ResolveVirtualMediaContentID(ctx context.Context, mediaType, tmdbID, tvdbID, imdbID string) (string, error) {
+	if r == nil || r.pool == nil {
+		return "", errors.New("virtual catalog is unavailable")
+	}
+	tmdbID = strings.TrimSpace(tmdbID)
+	tvdbID = strings.TrimSpace(tvdbID)
+	imdbID = strings.TrimSpace(imdbID)
+	if tmdbID == "" && tvdbID == "" && imdbID == "" {
+		return "", nil
+	}
+	matches := map[string]int{}
+	rows, err := r.pool.Query(ctx, `
+		SELECT content_id,
+			(CASE WHEN tmdb_id = $2 AND $2 <> '' THEN 1 ELSE 0 END) +
+			(CASE WHEN tvdb_id = $3 AND $3 <> '' THEN 1 ELSE 0 END) +
+			(CASE WHEN imdb_id = $4 AND $4 <> '' THEN 1 ELSE 0 END) AS hits
+		FROM media_items
+		WHERE type = $1 AND (
+			($2 <> '' AND tmdb_id = $2) OR
+			($3 <> '' AND tvdb_id = $3) OR
+			($4 <> '' AND imdb_id = $4))
+		`, mediaType, tmdbID, tvdbID, imdbID)
+	if err != nil {
+		return "", fmt.Errorf("resolve virtual media identity: %w", err)
+	}
+	for rows.Next() {
+		var contentID string
+		var hits int
+		if err := rows.Scan(&contentID, &hits); err != nil {
+			rows.Close()
+			return "", fmt.Errorf("scan virtual media identity: %w", err)
+		}
+		matches[contentID] += hits
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return "", fmt.Errorf("iterate virtual media identity: %w", err)
+	}
+	// The provider alias table records ids an item gained after it was
+	// registered, so a title that learned a new provider id still resolves
+	// to the row that owns the id it started with.
+	aliasRows, err := r.pool.Query(ctx, `
+		SELECT mi.content_id, count(*) AS hits
+		FROM media_item_provider_ids p
+		JOIN media_items mi ON mi.content_id = p.content_id
+		WHERE p.item_type = $1 AND (
+			(p.provider = 'tmdb' AND p.provider_id = $2 AND $2 <> '') OR
+			(p.provider = 'tvdb' AND p.provider_id = $3 AND $3 <> '') OR
+			(p.provider = 'imdb' AND p.provider_id = $4 AND $4 <> ''))
+		GROUP BY mi.content_id
+		`, mediaType, tmdbID, tvdbID, imdbID)
+	if err != nil {
+		return "", fmt.Errorf("resolve virtual media alias identity: %w", err)
+	}
+	for aliasRows.Next() {
+		var contentID string
+		var hits int
+		if err := aliasRows.Scan(&contentID, &hits); err != nil {
+			aliasRows.Close()
+			return "", fmt.Errorf("scan virtual media alias identity: %w", err)
+		}
+		matches[contentID] += hits
+	}
+	aliasRows.Close()
+	if err := aliasRows.Err(); err != nil {
+		return "", fmt.Errorf("iterate virtual media alias identity: %w", err)
+	}
+	best := ""
+	bestHits := 0
+	for contentID, hits := range matches {
+		if best == "" || hits > bestHits || (hits == bestHits && contentID < best) {
+			best = contentID
+			bestHits = hits
+		}
+	}
+	return best, nil
+}
+
 // UpsertVirtualMedia is the plugin-host entry point. The installation ID is
 // persisted as ownership metadata so reconciliation cannot remove another
 // plugin's virtual catalog entries.
@@ -251,6 +348,12 @@ func (r *VirtualMediaRegistrar) UpsertVirtualMedia(ctx context.Context, installa
 	var releaseSnapshot []ReleaseOverride
 	eligible := false
 	permitViaPhysical := false
+	// The identity of the item is either the one the caller resolved
+	// through the item's provider aliases or the one the provider IDs
+	// derive. A pinned identity keeps the item's row, its episodes and its
+	// state together when a later registration carries an additional
+	// provider ID, so an enriched title never splits into a second item.
+	contentID := virtualMediaContentID(in)
 	movieIDs := releaseIdentities("movie", in.TMDBID, "", in.IMDbID, 0, 0)
 	if in.MediaType == "movie" {
 		// Resolve the full alias set before deciding whether provider
@@ -260,7 +363,7 @@ func (r *VirtualMediaRegistrar) UpsertVirtualMedia(ctx context.Context, installa
 		// consulted and behavior matches the pre-override gate).
 		if r.ReleaseOverrides != nil {
 			var err error
-			movieIDs, err = releaseIdentitiesForContent(ctx, r.pool, "movie", virtualContentID(in), "movie", in.TMDBID, "", in.IMDbID, 0, 0)
+			movieIDs, err = releaseIdentitiesForContent(ctx, r.pool, "movie", contentID, "movie", in.TMDBID, "", in.IMDbID, 0, 0)
 			if err != nil {
 				return nil, err
 			}
@@ -284,7 +387,7 @@ func (r *VirtualMediaRegistrar) UpsertVirtualMedia(ctx context.Context, installa
 			// override wiring so the unwired fail-fast path stays
 			// database-free.
 			if r.ReleaseOverrides != nil {
-				physical, err := hasPhysicalMediaFiles(ctx, r.pool, virtualContentID(in))
+				physical, err := hasPhysicalMediaFiles(ctx, r.pool, contentID)
 				if err != nil {
 					return nil, err
 				}
@@ -322,7 +425,7 @@ func (r *VirtualMediaRegistrar) UpsertVirtualMedia(ctx context.Context, installa
 	// that owns item metadata can insert or change scalar aliases, so it is
 	// an alias writer. No shared-to-exclusive upgrade happens later.
 	if in.MediaType == "movie" || in.MediaType == "series" {
-		if err := lockReleaseContentTx(ctx, tx, virtualContentID(in), true); err != nil {
+		if err := lockReleaseContentTx(ctx, tx, contentID, true); err != nil {
 			return nil, fmt.Errorf("lock release content: %w", err)
 		}
 	}
@@ -345,7 +448,6 @@ func (r *VirtualMediaRegistrar) UpsertVirtualMedia(ctx context.Context, installa
 	if err := validateReleaseSnapshotTx(ctx, tx, releaseSnapshot); err != nil {
 		return nil, err
 	}
-	contentID := virtualContentID(in)
 	ownsItemMetadata, err := upsertVirtualMediaItem(ctx, tx, installationID, source, contentID, in)
 	if err != nil {
 		return nil, err
@@ -472,19 +574,26 @@ func upsertVirtualMediaItem(ctx context.Context, tx pgx.Tx, installationID int, 
 	if in.Overview != "" || in.PosterPath != "" {
 		status = "matched"
 	}
+	// The artwork a provider offered is a source path: the image cache copies
+	// it and replaces the provider URL with the local copy. The source path
+	// is what the cache matches on, so it is recorded next to the artwork.
+	posterSource := virtualArtworkSourcePath(in.PosterPath)
+	backdropSource := virtualArtworkSourcePath(in.BackdropPath)
 	var insertedID string
 	err := tx.QueryRow(ctx, `
 		INSERT INTO media_items(
 			content_id,type,title,year,imdb_id,tmdb_id,tvdb_id,overview,genres,poster_path,backdrop_path,
+			poster_source_path,backdrop_source_path,
 			runtime,matched_at,status,virtual_owner_installation_id,virtual_source,virtual_last_seen_at
 		) VALUES(
-			$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
+			$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$16,$17,$12,
 			CASE WHEN $13='matched' THEN NOW() END,$13,NULLIF($14,0),$15,NOW()
 		)
 		ON CONFLICT(content_id) DO NOTHING
 		RETURNING content_id`,
 		contentID, in.MediaType, in.Title, in.Year, in.IMDbID, in.TMDBID, in.TVDBID,
 		in.Overview, in.Genres, in.PosterPath, in.BackdropPath, in.RuntimeMinutes, status, installationID, source,
+		posterSource, backdropSource,
 	).Scan(&insertedID)
 	if err == nil {
 		return true, nil
@@ -570,6 +679,8 @@ func upsertVirtualMediaItem(ctx context.Context, tx pgx.Tx, installationID int, 
 			genres=CASE WHEN cardinality($8::text[])>0 THEN $8 ELSE genres END,
 			poster_path=CASE WHEN $9<>'' THEN $9 ELSE poster_path END,
 			backdrop_path=CASE WHEN $10<>'' THEN $10 ELSE backdrop_path END,
+			poster_source_path=CASE WHEN $9<>'' THEN $15 ELSE poster_source_path END,
+			backdrop_source_path=CASE WHEN $10<>'' THEN $16 ELSE backdrop_source_path END,
 			runtime=CASE WHEN $11>0 THEN $11 ELSE runtime END,
 			matched_at=CASE WHEN $12='matched' THEN COALESCE(matched_at,NOW()) ELSE matched_at END,
 			status=CASE WHEN $12='matched' THEN 'matched' ELSE status END,
@@ -580,6 +691,7 @@ func upsertVirtualMediaItem(ctx context.Context, tx pgx.Tx, installationID int, 
 		WHERE content_id=$1`,
 		contentID, in.Title, in.Year, in.IMDbID, in.TMDBID, in.TVDBID, in.Overview,
 		in.Genres, in.PosterPath, in.BackdropPath, in.RuntimeMinutes, status, installationID, source,
+		posterSource, backdropSource,
 	); err != nil {
 		return false, fmt.Errorf("update owned virtual media: %w", err)
 	}
@@ -1307,6 +1419,11 @@ func validateVirtualMedia(in VirtualMedia) error {
 	if err := validateVirtualIdentifiers(in); err != nil {
 		return err
 	}
+	if in.ContentID != "" {
+		if err := validateVirtualText("content_id", in.ContentID, maxVirtualContentIDBytes, true, false); err != nil {
+			return err
+		}
+	}
 	if in.TMDBID == "" && in.TVDBID == "" && in.IMDbID == "" {
 		return fmt.Errorf("%w: an external identifier is required", ErrInvalidVirtualMedia)
 	}
@@ -1607,6 +1724,34 @@ func runtimeSeconds(minutes int) int {
 		return 0
 	}
 	return minutes * 60
+}
+
+// virtualArtworkSourcePath returns the source path an artwork value carries.
+// A provider's URL is a source: the image cache copies it and replaces the
+// artwork with the local copy. A path that is already a local file is the
+// copy itself and has no source.
+func virtualArtworkSourcePath(path string) string {
+	trimmed := strings.TrimSpace(path)
+	if trimmed == "" || trimmed == "-" || !strings.Contains(trimmed, "://") {
+		return ""
+	}
+	lower := strings.ToLower(trimmed)
+	for _, local := range []string{"file://", "local://", "upload://", "generated://", "s3://"} {
+		if strings.HasPrefix(lower, local) {
+			return ""
+		}
+	}
+	return trimmed
+}
+
+// virtualMediaContentID is the identity a registration writes to: the one
+// the caller pinned after resolving the item through its provider aliases, or
+// the one the provider IDs derive.
+func virtualMediaContentID(in VirtualMedia) string {
+	if pinned := strings.TrimSpace(in.ContentID); pinned != "" {
+		return pinned
+	}
+	return virtualContentID(in)
 }
 
 func virtualContentID(in VirtualMedia) string {
@@ -2098,7 +2243,7 @@ func (r *VirtualMediaRegistrar) normalizeSeriesVirtualMedia(ctx context.Context,
 		return in
 	}
 
-	contentID := virtualContentID(in)
+	contentID := virtualMediaContentID(in)
 
 	if len(in.Episodes) == 0 && r != nil && r.pool != nil {
 		rows, err := r.pool.Query(ctx, `

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
 
@@ -17,6 +18,7 @@ type catalogMonitorRegistrar struct {
 	registrar       *catalog.VirtualMediaRegistrar
 	movieLibraryID  int
 	seriesLibraryID int
+	artworkCache    monitor.VirtualMediaArtworkCache
 }
 
 var _ monitor.MediaRegistrar = (*catalogMonitorRegistrar)(nil)
@@ -69,8 +71,48 @@ func (r *catalogMonitorRegistrar) Register(ctx context.Context, item monitor.Mon
 		libraryIDStr = strconv.Itoa(folderID)
 	}
 
-	_, err := r.registrar.Upsert(ctx, virtualMediaRegistration(item, libraryIDStr))
-	return err
+	payload := virtualMediaRegistration(item, libraryIDStr)
+	// Resolve the catalog identity through the item's provider aliases. An
+	// enriched registration carries provider ids the item did not have when
+	// it was first registered, and those ids are aliases of the existing
+	// item rather than an instruction to create a second one.
+	contentID, err := r.registrar.ResolveVirtualMediaContentID(ctx, item.MediaType, item.TMDBID, item.TVDBID, item.IMDbID)
+	if err != nil {
+		return fmt.Errorf("resolve virtual media identity: %w", err)
+	}
+	if contentID != "" {
+		payload.ContentID = contentID
+	}
+	if _, err := r.registrar.Upsert(ctx, payload); err != nil {
+		return err
+	}
+	r.primeArtworkCache(ctx, contentID, item)
+	return nil
+}
+
+// primeArtworkCache queues the image cache jobs for a registered item, so the
+// artwork a provider offered is stored locally when image caching is on. It
+// runs after the registration, because the cached copy replaces the provider
+// URL on the catalog row.
+func (r *catalogMonitorRegistrar) primeArtworkCache(ctx context.Context, contentID string, item monitor.MonitoredMedia) {
+	if r == nil || r.artworkCache == nil || contentID == "" {
+		return
+	}
+	providerIDs := map[string]string{}
+	if item.TMDBID != "" {
+		providerIDs["tmdb"] = item.TMDBID
+	}
+	if item.TVDBID != "" {
+		providerIDs["tvdb"] = item.TVDBID
+	}
+	if item.IMDbID != "" {
+		providerIDs["imdb"] = item.IMDbID
+	}
+	if err := r.artworkCache.EnqueueVirtualMediaArtwork(ctx, contentID, item.MediaType, providerIDs, item.Poster, item.Backdrop); err != nil {
+		// The artwork stays on the provider, so a cache failure is not a
+		// registration failure.
+		slog.WarnContext(ctx, "queue virtual media artwork cache", "component", "virtuallibrary", "content_id", contentID, "error", err)
+	}
 }
 
 // virtualMediaRegistration maps a monitored item onto the catalog payload.

@@ -83,6 +83,20 @@ type ReconcileEvidence struct {
 // deleted.
 var ErrReconcileRefused = errors.New("virtual reconciliation refused")
 
+// ErrMetadataNotConfigured reports that the library metadata path has no
+// provider chain for the destination library. It is a configuration failure
+// rather than a transient one: an operator has to enable a provider for that
+// library. The monitor reports it loudly and falls back to the public
+// providers instead of failing the request.
+var ErrMetadataNotConfigured = errors.New("library metadata is not configured")
+
+// VirtualMediaArtworkCache primes the artwork cache for a registered virtual
+// item. It is optional: without it the artwork stays on the provider, which
+// is the behavior when image caching is off.
+type VirtualMediaArtworkCache interface {
+	EnqueueVirtualMediaArtwork(ctx context.Context, contentID, mediaType string, providerIDs map[string]string, poster, backdrop string) error
+}
+
 type mediaReconciler interface {
 	Reconcile(ctx context.Context, source string, keepIDs []string, libraryIDs []int, evidence ReconcileEvidence) error
 }
@@ -462,6 +476,13 @@ const (
 	// always leaves budget for later items. A per-item timeout is a deferral,
 	// not a pass failure: the item is retried on a later pass.
 	monitorPerItemTimeout = 45 * time.Second
+
+	// requestEvaluationTimeout bounds the evaluation a fulfillment request
+	// runs. The request holds the monitor's process mutex while it evaluates,
+	// so it needs a bound of its own: a slow provider must not stall the
+	// scheduled pass behind it. An evaluation that runs out of time leaves the
+	// item queued for the next pass.
+	requestEvaluationTimeout = 60 * time.Second
 
 	// mediaTypeMovie is the movie media-type value shared by the queue's
 	// movie/series branches.
@@ -1174,29 +1195,44 @@ func (m *mediaMonitor) evaluate(ctx context.Context, item monitoredMedia) (monit
 	m.mu.Lock()
 	resolveMetadata := m.metadataResolver
 	m.mu.Unlock()
+	// The library metadata path is the preferred one, but it must not turn a
+	// previously usable request into one that depends on a stronger provider
+	// requirement. When it cannot answer, the public providers are used
+	// instead and the failure is remembered, so the item stays queued and the
+	// monitor retries instead of failing the request outright.
+	resolved := false
 	if resolveMetadata != nil {
 		enriched, err := resolveMetadata(ctx, item)
-		if err != nil {
-			return item, "Library metadata unavailable; monitoring will retry", err
+		switch {
+		case err == nil:
+			item = enriched
+			resolved = true
+		case errors.Is(err, ErrMetadataNotConfigured):
+			m.logger.Error("library metadata is not configured; falling back to public providers", "key", item.Key, "error", err)
+		default:
+			m.logger.Warn("library metadata unavailable; falling back to public providers", "key", item.Key, "error", err)
 		}
-		item = enriched
-	} else if enriched, err := m.fetchCinemeta(ctx, item); err == nil && (item.MediaType != "series" || episodeMetadataComplete(enriched.Episodes)) {
-		item = enriched
-		if item.MediaType == "series" && episodeRuntimeMissing(item.Episodes) {
-			if supplemented, supplementErr := m.fetchTVMaze(ctx, item); supplementErr == nil {
-				item = supplemented
-			}
-		}
-	} else {
-		if item.MediaType == "series" {
-			if fallback, fallbackErr := m.fetchTVMaze(ctx, item); fallbackErr == nil {
-				item = fallback
-			} else {
-				m.logger.Warn("fetch series metadata", "key", item.Key, "cinemeta_error", err, "tvmaze_error", fallbackErr)
-				metadataErr = errors.Join(err, fallbackErr)
+	}
+	if !resolved {
+		if enriched, err := m.fetchCinemeta(ctx, item); err == nil && (item.MediaType != "series" || episodeMetadataComplete(enriched.Episodes)) {
+			item = enriched
+			if item.MediaType == "series" && episodeRuntimeMissing(item.Episodes) {
+				if supplemented, supplementErr := m.fetchTVMaze(ctx, item); supplementErr == nil {
+					item = supplemented
+				}
 			}
 		} else {
-			m.logger.Warn("fetch Cinemeta metadata", "key", item.Key, "error", err)
+			if item.MediaType == "series" {
+				if fallback, fallbackErr := m.fetchTVMaze(ctx, item); fallbackErr == nil {
+					item = fallback
+				} else {
+					m.logger.Warn("fetch series metadata", "key", item.Key, "cinemeta_error", err, "tvmaze_error", fallbackErr)
+					metadataErr = errors.Join(metadataErr, err, fallbackErr)
+				}
+			} else {
+				m.logger.Warn("fetch Cinemeta metadata", "key", item.Key, "error", err)
+				metadataErr = errors.Join(metadataErr, err)
+			}
 		}
 	}
 	if item.MediaType == "movie" {
@@ -1384,6 +1420,14 @@ func episodeMetadataComplete(episodes []virtualEpisode) bool {
 	return true
 }
 
+// MergeSeriesEpisodeMetadata merges fresh episode metadata into the episodes
+// an item already holds. The episodes already known are never dropped: a
+// lookup that answered only part of a series must not erase the rest, and a
+// field the fresh answer has no value for keeps the stored one.
+func MergeSeriesEpisodeMetadata(existing, fresh []VirtualEpisode) []VirtualEpisode {
+	return mergeSeriesEpisodeMetadata(existing, fresh)
+}
+
 func mergeSeriesEpisodeMetadata(existing, fresh []virtualEpisode) []virtualEpisode {
 	byKey := make(map[string]virtualEpisode, len(existing)+len(fresh))
 	order := make([]string, 0, len(existing)+len(fresh))
@@ -1462,7 +1506,10 @@ func (s *Monitor) Fulfill(ctx context.Context, req *FulfillRequest) (resp *Fulfi
 	if err != nil {
 		return nil, err
 	}
-	item, message, _ := s.monitor.evaluate(ctx, item)
+	// The destination library decides which providers and which language the
+	// metadata lookup uses, so it has to be known before the evaluation. A
+	// request that names a library must be evaluated against that library,
+	// not against the service-wide default.
 	if len(req.GetConnections()) > 0 {
 		folderID, folderErr := configuredFolderID(req.GetConnections()[0].GetConfig()["media_folder_id"])
 		if folderErr != nil {
@@ -1470,6 +1517,12 @@ func (s *Monitor) Fulfill(ctx context.Context, req *FulfillRequest) (resp *Fulfi
 		}
 		item.MediaFolderID = folderID
 	}
+	// The evaluation runs under the same process mutex as the scheduled
+	// pass, so it also needs its own bound: a request must not hold the
+	// monitor hostage while providers answer.
+	evaluateCtx, cancelEvaluate := context.WithTimeout(ctx, requestEvaluationTimeout)
+	defer cancelEvaluate()
+	item, message, _ := s.monitor.evaluate(evaluateCtx, item)
 	// If media is available but still has no title or is a series with no
 	// episodes (Silo did not include episodes in the request descriptor and
 	// metadata lookup hasn't resolved them yet), keep it queued so the
