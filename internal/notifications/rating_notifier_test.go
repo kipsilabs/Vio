@@ -306,6 +306,7 @@ func ratingNotifierTestSchema(t *testing.T, pool *pgxpool.Pool) {
 
 		CREATE TEMP TABLE notification_preferences (
 			profile_id text PRIMARY KEY,
+			user_id integer NOT NULL DEFAULT 1,
 			enabled boolean NOT NULL DEFAULT true,
 			notify_favorites boolean NOT NULL DEFAULT true,
 			notify_watchlist boolean NOT NULL DEFAULT true,
@@ -337,6 +338,7 @@ func ratingNotifierTestSchema(t *testing.T, pool *pgxpool.Pool) {
 			last_failure_status integer,
 			last_failure_message varchar(256),
 			created_at timestamptz NOT NULL DEFAULT now(),
+			revision bigint NOT NULL DEFAULT 1,
 			updated_at timestamptz NOT NULL DEFAULT now()
 		) ON COMMIT PRESERVE ROWS;
 
@@ -432,7 +434,7 @@ func ratingNotifierTestSchema(t *testing.T, pool *pgxpool.Pool) {
 // tables. Settings enable webhooks, web push, and both native push platforms
 // so each channel's gate is exercised; individual tests seed only the
 // subscribers they want.
-func ratingNotifierTestSystem(pool *pgxpool.Pool) *System {
+func ratingNotifierTestSystem(pool *pgxpool.Pool, libraryID int) *System {
 	return &System{
 		pool:           pool,
 		Settings:       NewSettings(mapSettingReader{SettingWebhooksEnabled: "true", SettingApplePushDeliveryEnabled: "true", SettingAndroidPushDeliveryEnabled: "true"}),
@@ -442,7 +444,13 @@ func ratingNotifierTestSystem(pool *pgxpool.Pool) *System {
 		webPushRepo:    NewWebPushRepository(pool),
 		pushDeviceRepo: NewPushDeviceRepository(pool),
 		dispatcher:     NewMultiDispatcher(),
-		logger:         slog.New(slog.DiscardHandler),
+		scopes: scopeByProfile{
+			"profile-native-only":    {},
+			"profile-no-subscribers": {},
+			"profile-webhook":        {},
+			"profile-webpush":        {},
+		},
+		logger: slog.New(slog.DiscardHandler),
 	}
 }
 
@@ -509,6 +517,7 @@ func countRatingDeliveries(t *testing.T, pool *pgxpool.Pool, profileID string) i
 func TestNotifyRatingEligibilityGate(t *testing.T) {
 	pool := ratingNotifierTestDB(t)
 	ratingNotifierTestSchema(t, pool)
+	c := seedAccessCatalog(t, pool)
 	ctx := context.Background()
 
 	t.Run("native-only subscribers pass the gate and create a delivery", func(t *testing.T) {
@@ -516,8 +525,8 @@ func TestNotifyRatingEligibilityGate(t *testing.T) {
 		seedRatingPushDevice(t, pool, "apple-1", profileID, PushPlatformApple, PushModePrivatePush, true)
 		seedRatingPushDevice(t, pool, "android-1", profileID, PushPlatformAndroid, PushModePrivatePush, true)
 
-		system := ratingNotifierTestSystem(pool)
-		notifier := &RatingNotifier{system: system, itemRepo: &stubItemLookuper{item: &models.MediaItem{ContentID: "movie-1"}}}
+		system := ratingNotifierTestSystem(pool, c.library)
+		notifier := &RatingNotifier{system: system, itemRepo: &stubItemLookuper{item: &models.MediaItem{ContentID: c.series}}}
 		if err := notifier.NotifyRating(ctx, 42, profileID, "movie-1", 5); err != nil {
 			t.Fatalf("NotifyRating: %v", err)
 		}
@@ -533,8 +542,8 @@ func TestNotifyRatingEligibilityGate(t *testing.T) {
 		seedRatingWebhook(t, pool, "hook-off", profileID, false)
 		seedRatingPushDevice(t, pool, "apple-disabled", profileID, PushPlatformApple, PushModePrivatePush, false)
 
-		system := ratingNotifierTestSystem(pool)
-		notifier := &RatingNotifier{system: system, itemRepo: &stubItemLookuper{item: &models.MediaItem{ContentID: "movie-1"}}}
+		system := ratingNotifierTestSystem(pool, c.library)
+		notifier := &RatingNotifier{system: system, itemRepo: &stubItemLookuper{item: &models.MediaItem{ContentID: c.series}}}
 		if err := notifier.NotifyRating(ctx, 42, profileID, "movie-1", 5); err != nil {
 			t.Fatalf("NotifyRating: %v", err)
 		}
@@ -547,8 +556,8 @@ func TestNotifyRatingEligibilityGate(t *testing.T) {
 		profileID := "profile-webhook"
 		seedRatingWebhook(t, pool, "hook-on", profileID, true)
 
-		system := ratingNotifierTestSystem(pool)
-		notifier := &RatingNotifier{system: system, itemRepo: &stubItemLookuper{item: &models.MediaItem{ContentID: "movie-1"}}}
+		system := ratingNotifierTestSystem(pool, c.library)
+		notifier := &RatingNotifier{system: system, itemRepo: &stubItemLookuper{item: &models.MediaItem{ContentID: c.series}}}
 		if err := notifier.NotifyRating(ctx, 42, profileID, "movie-1", 5); err != nil {
 			t.Fatalf("NotifyRating: %v", err)
 		}
@@ -561,8 +570,8 @@ func TestNotifyRatingEligibilityGate(t *testing.T) {
 		profileID := "profile-webpush"
 		seedRatingWebPush(t, pool, "sub-1", profileID)
 
-		system := ratingNotifierTestSystem(pool)
-		notifier := &RatingNotifier{system: system, itemRepo: &stubItemLookuper{item: &models.MediaItem{ContentID: "movie-1"}}}
+		system := ratingNotifierTestSystem(pool, c.library)
+		notifier := &RatingNotifier{system: system, itemRepo: &stubItemLookuper{item: &models.MediaItem{ContentID: c.series}}}
 		if err := notifier.NotifyRating(ctx, 42, profileID, "movie-1", 5); err != nil {
 			t.Fatalf("NotifyRating: %v", err)
 		}

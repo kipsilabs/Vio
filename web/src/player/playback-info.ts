@@ -1,15 +1,19 @@
 import {
+  audioTrackHasAtmos,
+  audioTrackLabel,
   dolbyVisionLabel,
   formatBitrate,
   formatCodecLabel,
   formatFileSize,
   formatMbpsFromKbps,
   formatSampleRate,
+  mentionsAtmos,
 } from "@/lib/mediaFormat";
 import { videoRangeLabel } from "@/lib/videoRange";
-import type { DeliveryV3, EffectiveRecipeV3, PlanV3 } from "./protocol-v3";
+import type { DeliveryV3, EffectiveRecipeV3, PlanV3, SourceDescriptorV3 } from "./protocol-v3";
 import {
   QUALITY_ORIGINAL_V3,
+  normalizeQualityPreferenceV3,
   TRANSFORMATION_AUDIO_TO_AAC_V3,
   TRANSFORMATION_VIDEO_TO_H264_V3,
 } from "./protocol-v3";
@@ -40,6 +44,8 @@ interface BuildPlaybackInfoSectionsInput {
   currentSourceVersion?: PlayerFileVersion;
   requestedVersion?: PlayerFileVersion;
   runtimeStats: RuntimePlaybackStats;
+  /** True while the browser decode engine plays the stream instead of the media element. */
+  browserEngine?: boolean;
 }
 
 export function buildPlaybackInfoSections({
@@ -48,6 +54,7 @@ export function buildPlaybackInfoSections({
   currentSourceVersion,
   requestedVersion,
   runtimeStats,
+  browserEngine = false,
 }: BuildPlaybackInfoSectionsInput): PlaybackInfoSection[] {
   const videoTrack = currentSourceVersion ? pickVideoTrack(currentSourceVersion) : undefined;
   const audioTrack = currentSourceVersion ? pickAudioTrack(currentSourceVersion) : undefined;
@@ -62,7 +69,7 @@ export function buildPlaybackInfoSections({
     {
       title: "Player",
       rows: [
-        { label: "Player", value: "HTML Video Player" },
+        { label: "Player", value: browserEngine ? "Browser decoder" : "HTML Video Player" },
         { label: "Play method", value: formatDelivery(plan.delivery) },
         { label: "Protocol", value: formatProtocol(streamUrl) },
         { label: "Stream type", value: formatStreamType(plan) },
@@ -165,7 +172,8 @@ export function buildPlaybackInfoSections({
  * adds nothing. `id` is the rung's own label, which is what a `quality_change`
  * replan sends back. The `auto` entry is prepended locally because it is a
  * *preference*, not a rung — no server rung names it, and picking it hands the
- * choice back to the planner.
+ * choice back to the planner. Original is the server's source-preserving rung
+ * and stays a menu entry of its own.
  */
 export function qualityOptionsFromPlanV3(plan: PlanV3): QualityOption[] {
   const rungs = plan.available_qualities.map((quality) => ({
@@ -190,40 +198,59 @@ export function qualityOptionsFromPlanV3(plan: PlanV3): QualityOption[] {
 }
 
 /**
- * Resolves a stored resolution-only preference onto the explicit bitrate rung
- * that implements the same policy in the current plan. Plain 2160p/1080p/720p
- * preferences use the ladder's Medium bitrate; when that resolution cap is at
- * or above the source, the source-preserving Original rung is the active one,
- * unless the plan's delivered recipe shows a bitrate cap reduced it.
+ * Resolves a stored preference onto the menu entry that implements it in the
+ * current plan. Auto stays unlit when an explicit rung is active. A plain
+ * 2160p/1080p/720p preference uses the ladder's Medium bitrate; when that
+ * resolution cap is at or above the source, Original is the active entry,
+ * unless the plan's delivered recipe shows a bitrate cap reduced it. The
+ * legacy source labels resolve to Original, or to Auto on a plan that does
+ * not publish it.
  */
 export function resolveActiveQualityOptionId(
   options: QualityOption[],
   preference: string,
   delivered?: EffectiveRecipeV3,
+  source?: Pick<SourceDescriptorV3, "height" | "bitrate_kbps">,
 ): string | null {
+  if (options.length === 0) return null;
+
   // A sole rung is effective regardless of the saved preference. Keep the
   // preference unchanged so it applies again when more qualities are available.
   if (options.length === 1) return options[0]!.id;
 
-  const normalized = preference.trim().toLowerCase();
+  const normalized = normalizeQualityPreferenceV3(preference).toLowerCase();
   const exact = options.find((option) => option.id.toLowerCase() === normalized);
   if (exact) return exact.id;
 
-  const aliasHeight = qualityPreferenceHeight(normalized);
-  if (aliasHeight === null) {
-    const originalAlias = ["source", "max"].includes(normalized);
-    return originalAlias ? (options.find((option) => option.isOriginal)?.id ?? null) : null;
+  const original = options.find((option) => option.isOriginal);
+  if (normalized === QUALITY_ORIGINAL_V3) {
+    // A plan that predates Original still preserves the source through Auto.
+    return original?.id ?? options.find((option) => option.id === "auto")?.id ?? null;
   }
+
+  const aliasHeight = qualityPreferenceHeight(normalized);
+  if (aliasHeight === null) return null;
 
   // The planner preserves a source that fits the cap, even when the ladder
   // also publishes same-height rungs below the source bitrate. A bitrate cap,
   // the viewer's or the server's, can still force a transcode the ladder does
   // not show; the delivered bitrate reveals it.
-  const original = options.find((option) => option.isOriginal);
+  const sourceHeight = source?.height;
+  const sourceKbps = source?.bitrate_kbps;
   const deliveredKbps = delivered?.bitrate_kbps;
-  const capped = isPositive(deliveredKbps) && deliveredKbps < (original?.bitrateKbps ?? 0);
-  if (original && !capped && resolutionHeight(original.resolution) <= aliasHeight) {
-    return original.id;
+  const deliveredHeight = delivered?.height;
+  // A smaller delivered frame shows a reduction even when the source bitrate
+  // is unknown.
+  const capped =
+    (isPositive(deliveredKbps) && isPositive(sourceKbps) && deliveredKbps < sourceKbps) ||
+    (isPositive(deliveredHeight) && isPositive(sourceHeight) && deliveredHeight < sourceHeight);
+  if (original) {
+    if (!capped && resolutionHeight(original.resolution) <= aliasHeight) {
+      return original.id;
+    }
+  } else if (isPositive(sourceHeight) && !capped && sourceHeight <= aliasHeight) {
+    // No Original entry on this plan: the source plays as-is, so no row is lit.
+    return null;
   }
 
   // Otherwise the planner encodes at the Medium bitrate of a ladder class: the
@@ -250,20 +277,43 @@ function classMediumRungId(classHeight: number): string | null {
 }
 
 /**
+ * The label for a plain resolution preference ("1080p", "4K") when it plays
+ * the source as-is and no menu row is lit; null for any other preference.
+ */
+export function plainResolutionLabel(preference: string): string | null {
+  const height = qualityPreferenceHeight(normalizeQualityPreferenceV3(preference).toLowerCase());
+  if (height === null) return null;
+  return height === 2160 ? "4K" : `${height}p`;
+}
+
+function resolutionHeight(resolution: string): number {
+  const match = resolution
+    .trim()
+    .toLowerCase()
+    .match(/^(\d+)p$/);
+  return match ? Number.parseInt(match[1] ?? "0", 10) : 0;
+}
+
+function qualityRungLabel(label: string): string {
+  return label === QUALITY_ORIGINAL_V3 ? "Original" : label;
+}
+
+/**
  * The next quality rung below what the viewer receives now, for a viewer whose
- * connection cannot keep up. An explicit rung steps down from itself; Auto and
- * Original step down from the delivered bitrate, or to the top transcode rung
- * when a copy delivery reports none.
+ * connection cannot keep up. An explicit rung steps down from itself; Auto
+ * steps down from the delivered bitrate, or to the top transcode rung when a
+ * copy delivery reports none.
  */
 export function lowerQualityOption(
   options: QualityOption[],
   preference: string,
   delivered?: EffectiveRecipeV3,
+  source?: Pick<SourceDescriptorV3, "height" | "bitrate_kbps">,
 ): QualityOption | null {
   const rungs = options
     .filter((option) => option.id !== "auto" && !option.isOriginal && option.bitrateKbps > 0)
     .sort((a, b) => b.bitrateKbps - a.bitrateKbps);
-  const activeId = resolveActiveQualityOptionId(options, preference, delivered);
+  const activeId = resolveActiveQualityOptionId(options, preference, delivered, source);
   const deliveredBitrateKbps = delivered?.bitrate_kbps;
   const active = rungs.find((option) => option.id === activeId);
   const ceiling =
@@ -313,18 +363,6 @@ function ladderClassHeight(width?: number, height?: number): number | null {
   );
   // A frame larger than every box is in the largest class.
   return box?.height ?? 2160;
-}
-
-function resolutionHeight(resolution: string): number {
-  const match = resolution
-    .trim()
-    .toLowerCase()
-    .match(/^(\d+)p$/);
-  return match ? Number.parseInt(match[1] ?? "0", 10) : 0;
-}
-
-function qualityRungLabel(label: string): string {
-  return label === QUALITY_ORIGINAL_V3 ? "Original" : label;
 }
 
 // Quality-menu bitrate label: Mbps with collapsed integers ("8 Mbps", not
@@ -467,6 +505,11 @@ export function formatOriginalAudioCodec(
   track?: PlayerAudioTrack,
 ): string {
   const title = track?.title || track?.embedded_title;
+  // An Atmos track whose title does not say so, such as the codec's long
+  // name the scanner gives an untagged track, shows its family label.
+  if (track?.codec && audioTrackHasAtmos(track) && !mentionsAtmos(title)) {
+    return audioTrackLabel(track);
+  }
   if (title) {
     return title;
   }

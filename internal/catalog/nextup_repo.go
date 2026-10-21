@@ -24,6 +24,11 @@ type NextUpQuery struct {
 	EnableResumable  bool       // include in-progress episodes
 	EnableRewatching bool       // accepted but deferred (no-op)
 	DateCutoff       *time.Time // only series with activity after this date
+	// RankByRelease orders results by ActivityAt, so a series whose next
+	// episode was released after the profile finished the previous one moves
+	// up (the profile's ui.next_up_new_releases_first). Off, results keep the
+	// completion-time order and ActivityAt equals CompletedAt.
+	RankByRelease bool
 
 	// droppedSeriesIDs are the profile's actively dropped series, which a
 	// global lookup excludes. ListNextUp loads them; a series-scoped lookup
@@ -39,7 +44,11 @@ type NextUpResult struct {
 	SeasonNumber  int
 	EpisodeNumber int
 	CompletedAt   time.Time // when the preceding episode was completed
-	IsResumable   bool      // true if this is an in-progress item (enableResumable)
+	// ActivityAt orders the results: CompletedAt, or the time this episode was
+	// released to the server when that came later. A series the profile had
+	// caught up on moves to the front when its next episode arrives.
+	ActivityAt  time.Time
+	IsResumable bool // true if this is an in-progress item (enableResumable)
 }
 
 // NextUpRepository queries for next unwatched episodes per series.
@@ -66,6 +75,11 @@ const (
 	// the resumable-first-episode branch. It is a row cap on the store's
 	// in-progress listing, not an anchor cap.
 	nextUpResumableScanLimit = 100
+
+	// nextUpRankedCandidates is how many next-up rows are considered when
+	// ranking by release, whatever the requested limit, so a newly released
+	// episode can lift its series before the list is trimmed.
+	nextUpRankedCandidates = 100
 )
 
 // statePageLimit returns the page size to request from the store.
@@ -150,12 +164,17 @@ func (r *NextUpRepository) ListNextUp(ctx context.Context, q NextUpQuery) ([]Nex
 		q.droppedSeriesIDs = dropped
 	}
 
+	walkLimit := limit
+	if q.RankByRelease {
+		walkLimit = max(limit, nextUpRankedCandidates)
+	}
+
 	var results []NextUpResult
 	var anchors map[string]nextUpAnchor
 	if q.SeriesID != "" {
 		results, anchors, err = r.listNextUpForSeries(ctx, q, stateStore)
 	} else {
-		results, anchors, err = r.listNextUpGlobal(ctx, q, stateStore, limit)
+		results, anchors, err = r.listNextUpGlobal(ctx, q, stateStore, walkLimit)
 	}
 	if err != nil {
 		return nil, err
@@ -185,7 +204,105 @@ func (r *NextUpRepository) ListNextUp(ctx context.Context, q NextUpQuery) ([]Nex
 		}
 	}
 
+	for i := range results {
+		if results[i].ActivityAt.IsZero() {
+			results[i].ActivityAt = results[i].CompletedAt
+		}
+	}
+	if q.RankByRelease {
+		if err := r.applyNextUpReleaseActivity(ctx, q, results); err != nil {
+			return nil, err
+		}
+		sortNextUpByActivity(results)
+	}
+	if q.SeriesID == "" && len(results) > limit {
+		results = results[:limit]
+	}
+
 	return results, nil
+}
+
+// sortNextUpByActivity orders next-up rows by ActivityAt, newest first, with
+// completion time and then series ID (one row per series) breaking ties.
+func sortNextUpByActivity(results []NextUpResult) {
+	sort.SliceStable(results, func(i, j int) bool {
+		if c := results[j].ActivityAt.Compare(results[i].ActivityAt); c != 0 {
+			return c < 0
+		}
+		if c := results[j].CompletedAt.Compare(results[i].CompletedAt); c != 0 {
+			return c < 0
+		}
+		return results[i].SeriesID < results[j].SeriesID
+	})
+}
+
+// nextUpReleaseScope limits release lookups to the libraries the request can
+// reach, so an episode that arrived where the viewer can't follow never moves
+// a series ahead of one they can watch.
+func nextUpReleaseScope(q NextUpQuery, argIdx int) (string, []interface{}) {
+	var requested []int
+	if q.LibraryID != nil {
+		requested = []int{*q.LibraryID}
+	} else {
+		requested = q.LibraryIDs
+	}
+	ids, none := q.AccessFilter.LibraryScope(requested)
+	if none {
+		ids = []int{}
+	}
+	switch {
+	case ids != nil:
+		return fmt.Sprintf(" AND ea.library_id = ANY($%d::int[])", argIdx), []interface{}{ids}
+	case len(q.AccessFilter.DisabledLibraryIDs) > 0:
+		return fmt.Sprintf(" AND NOT (ea.library_id = ANY($%d::int[]))", argIdx), []interface{}{q.AccessFilter.DisabledLibraryIDs}
+	default:
+		return "", nil
+	}
+}
+
+// applyNextUpReleaseActivity lifts a next-up row's ActivityAt to the time its
+// episode was released to the server, following the availability contract:
+// released_at counts only when it still equals the row's available_at, so an
+// initial scan, imported history, or a merged content ID never moves a series.
+func (r *NextUpRepository) applyNextUpReleaseActivity(ctx context.Context, q NextUpQuery, results []NextUpResult) error {
+	if len(results) == 0 {
+		return nil
+	}
+	ids := make([]string, len(results))
+	byContentID := make(map[string]int, len(results))
+	for i := range results {
+		ids[i] = results[i].ContentID
+		byContentID[results[i].ContentID] = i
+	}
+	scope, scopeArgs := nextUpReleaseScope(q, 2)
+	query := `SELECT DISTINCT ON (ea.episode_id) ea.episode_id,
+			CASE WHEN ea.released_at = ea.available_at THEN ea.released_at END
+		FROM episode_availability ea
+		WHERE ea.episode_id = ANY($1::text[])` + scope + `
+		ORDER BY ea.episode_id, ea.available_at, ea.library_id`
+	args := append([]any{ids}, scopeArgs...)
+	rows, err := r.pool.Query(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("querying next-up release times: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var contentID string
+		var releasedAt *time.Time
+		if err := rows.Scan(&contentID, &releasedAt); err != nil {
+			return fmt.Errorf("scanning next-up release time: %w", err)
+		}
+		if releasedAt == nil {
+			continue
+		}
+		if i, ok := byContentID[contentID]; ok && releasedAt.After(results[i].ActivityAt) {
+			results[i].ActivityAt = *releasedAt
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterating next-up release times: %w", err)
+	}
+	return nil
 }
 
 // listNextUpGlobal walks the store's state pages newest-first, resolves each

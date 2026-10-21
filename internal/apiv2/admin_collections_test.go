@@ -28,7 +28,6 @@ type fakeAdminCollections struct {
 	template                                           handlers.AdminCollectionTemplateResult
 	lastMDBList                                        handlers.AdminCollectionImportMDBList
 	lastTMDB                                           handlers.AdminCollectionImportTMDB
-	lastTrakt                                          handlers.AdminCollectionImportTrakt
 	lastApply                                          handlers.AdminCollectionTemplateApply
 	bundles                                            []templates.BundleWithTemplates
 	bundleReads                                        int
@@ -86,11 +85,6 @@ func (f *fakeAdminCollections) ImportAdminMDBList(_ context.Context, cmd handler
 func (f *fakeAdminCollections) ImportAdminTMDB(_ context.Context, cmd handlers.AdminCollectionImportTMDB) (handlers.AdminCollectionImportResult, error) {
 	f.imports++
 	f.lastTMDB = cmd
-	return handlers.AdminCollectionImportResult{Collection: f.view}, nil
-}
-func (f *fakeAdminCollections) ImportAdminTrakt(_ context.Context, cmd handlers.AdminCollectionImportTrakt) (handlers.AdminCollectionImportResult, error) {
-	f.imports++
-	f.lastTrakt = cmd
 	return handlers.AdminCollectionImportResult{Collection: f.view}, nil
 }
 func (f *fakeAdminCollections) ApplyAdminCollectionTemplate(_ context.Context, _ string, cmd handlers.AdminCollectionTemplateApply) (handlers.AdminCollectionTemplateResult, error) {

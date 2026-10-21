@@ -10,13 +10,12 @@ import {
   templateResultFromV2,
   adminUpdateBody,
 } from "@/api/adminCollections";
-import { ApiClientError, api } from "@/api/client";
+import { ApiClientError, apiV1 } from "@/api/client";
 import type {
   CreateLibraryCollectionRequest,
   ImportMDBListCollectionRequest,
   ImportTMDBCollectionRequest,
   ImportTMDBListCollectionRequest,
-  ImportTraktCollectionRequest,
   UpdateLibraryCollectionRequest,
 } from "@/api/types";
 import { requiredETag } from "@/api/v2/etag";
@@ -553,52 +552,12 @@ export function useImportTMDBListCollection() {
   });
 }
 
-export function useImportTraktCollection() {
-  const queryClient = useQueryClient();
-
-  return useMutation({
-    retry: false,
-    mutationFn: ({
-      body,
-      poster,
-      backdrop,
-    }: {
-      body: ImportTraktCollectionRequest;
-      poster?: File | null;
-      backdrop?: File | null;
-    }) => {
-      return v2("POST /api/v2/admin/collections/import/trakt", {
-        body: {
-          ...adminImportBody(body),
-          profile_id: body.profile_id === undefined ? undefined : String(body.profile_id),
-        },
-      }).then(async (result) => ({
-        ...result,
-        ...(await saveAdminArtwork(result.collection, body, poster, backdrop)),
-      }));
-    },
-    onSuccess: (result) => {
-      showArtworkErrors(result);
-      const statusMessages: Record<string, string> = {
-        warning: "Trakt collection imported with warnings",
-        failed: "Trakt collection imported but sync failed",
-      };
-      const status = result.sync_run?.status ?? "";
-      toast.success(statusMessages[status] ?? "Trakt collection imported");
-      void invalidateAdminCollectionQueries(queryClient);
-    },
-    onError: (error) => {
-      toast.error(error instanceof Error ? error.message : "Import failed");
-    },
-  });
-}
-
 export function usePurgeVirtualPlaybackItems() {
   const queryClient = useQueryClient();
 
   return useMutation({
     mutationFn: (options?: { dryRun?: boolean; libraryId?: number }) =>
-      api<{ success: boolean; files_deleted: number; items_deleted: number; message: string }>(
+      apiV1<{ success: boolean; files_deleted: number; items_deleted: number; message: string }>(
         `/admin/collections/purge-virtual?${new URLSearchParams({
           ...(options?.dryRun ? { dry_run: "true" } : {}),
           ...(options?.libraryId ? { library_id: String(options.libraryId) } : {}),

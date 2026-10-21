@@ -70,8 +70,7 @@ export function MetadataProvidersSection() {
       if (!catalogById.has(plugin_id)) continue;
       void installOne(plugin_id);
     }
-    // Runs once per attempt; data arrives through the shared plugin queries.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- run once per attempt; data arrives through the shared plugin queries.
   }, [isLoading, attempt]);
 
   // Re-checks the catalog and installations (e.g. after an offline failure or

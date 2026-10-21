@@ -278,23 +278,6 @@ func TestImportCreationPersistsResolvedVirtualPlayback(t *testing.T) {
 				}
 			},
 		},
-		{
-			name: "trakt_preset",
-			create: func(t *testing.T, title string, vp *bool) {
-				// The collection is persisted before the first sync. The test
-				// handler has no Trakt client, so the sync fails fast and the
-				// returned error is expected; the stored config is what matters.
-				if _, err := h.ImportAdminTrakt(ctx, importTraktRequest{
-					LibraryID:       libraryID,
-					Title:           title,
-					Preset:          "trending",
-					MediaType:       "movie",
-					VirtualPlayback: vp,
-				}); err == nil {
-					t.Fatal("expected the unconfigured Trakt sync to fail")
-				}
-			},
-		},
 	}
 
 	for _, src := range sources {

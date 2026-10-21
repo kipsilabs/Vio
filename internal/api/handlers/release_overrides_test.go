@@ -40,7 +40,13 @@ func TestReleaseOverrideAuthorizationAndActor(t *testing.T) {
 				h := &RequestsHandler{ReleaseOverrides: store}
 				req := httptest.NewRequest(method, "/api/v1/admin/release-overrides?media_type=movie&provider=tmdb&provider_id=42", strings.NewReader(`{"media_type":"movie","provider":"tmdb","provider_id":"42","evidence_note":"verified"}`))
 				if role != "" {
-					req = req.WithContext(apimw.SetClaims(req.Context(), &auth.Claims{UserID: 27, Role: role, TokenType: auth.TokenTypeAccess}))
+					ctx := apimw.SetClaims(req.Context(), &auth.Claims{UserID: 27, Role: role, TokenType: auth.TokenTypeAccess})
+					// Admin reach follows the acting-admin decision, as it does
+					// on the router; only the admin role acts as an admin here.
+					ctx = apimw.SetActingAdminDecider(ctx, func(context.Context, apimw.ActingAdminRequest) (bool, error) {
+						return role == "admin", nil
+					})
+					req = req.WithContext(ctx)
 				}
 				rec := httptest.NewRecorder()
 				h.HandleReleaseOverrides(rec, req)
@@ -67,7 +73,9 @@ func TestReleaseOverrideAuthorizationAndActor(t *testing.T) {
 func TestReleaseOverrideRejectsForgedActor(t *testing.T) {
 	h := &RequestsHandler{ReleaseOverrides: &overrideTestStore{}}
 	req := httptest.NewRequest("PUT", "/", strings.NewReader(`{"actor_account_id":1}`))
-	req = req.WithContext(apimw.SetClaims(req.Context(), &auth.Claims{UserID: 27, Role: "admin", TokenType: auth.TokenTypeAccess}))
+	ctx := apimw.SetClaims(req.Context(), &auth.Claims{UserID: 27, Role: "admin", TokenType: auth.TokenTypeAccess})
+	ctx = apimw.SetActingAdminDecider(ctx, func(context.Context, apimw.ActingAdminRequest) (bool, error) { return true, nil })
+	req = req.WithContext(ctx)
 	rec := httptest.NewRecorder()
 	h.HandleReleaseOverrides(rec, req)
 	if rec.Code != 400 {

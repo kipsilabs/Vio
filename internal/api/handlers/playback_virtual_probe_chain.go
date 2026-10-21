@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary/resolver"
 )
@@ -50,22 +51,103 @@ var virtualDefaultProbeChainBudget = 90 * time.Second
 // gate while still admitting a genuinely concurrent browse.
 const virtualDefaultProbeChainConcurrency = 2
 
+// virtualProbeChainTriggerDiscovery names the one caller that schedules
+// chains. It is a log attribute, not a dispatch key: refresh runs never
+// schedule (see VirtualCandidatesRefreshService.listSource).
+const virtualProbeChainTriggerDiscovery = "virtual-candidates:discover"
+
+// Reasons a discovered item ends up not probed. They are log values only —
+// nothing branches on them — so an operator can tell a chain that was never
+// admitted (schedule_refused) from one that ran out of budget before it
+// reached the probe (budget_expired) and one whose probe failed
+// (probe_failed). The remaining values name ordinary skips.
+const (
+	virtualProbeChainReasonScheduleRefused    = "schedule_refused"
+	virtualProbeChainReasonBudgetExpired      = "budget_expired"
+	virtualProbeChainReasonDefaultUnavailable = "default_unavailable"
+	virtualProbeChainReasonProbeFailed        = "probe_failed"
+	virtualProbeChainReasonProbeIncomplete    = "probe_incomplete"
+	virtualProbeChainReasonNoDefaultVersion   = "no_default_version"
+	virtualProbeChainReasonNotVirtual         = "not_virtual"
+	virtualProbeChainReasonAlreadyProbed      = "already_probed"
+	virtualProbeChainReasonNoExactCandidate   = "no_exact_candidate"
+	virtualProbeChainReasonRecentlyFailed     = "recently_failed"
+	virtualProbeChainReasonGateBusy           = "gate_busy"
+)
+
+// logVirtualProbeChainSkip records why one discovered item was not probed.
+// The first play still probes the row, so these lines are observability, not
+// alerts: expected no-ops stay at debug, while a refused, expired, or failed
+// chain leaves one info line naming the content and the discovery trigger.
+func logVirtualProbeChainSkip(ctx context.Context, level slog.Level, contentID, reason, detail string, attrs ...any) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	args := []any{
+		virtualEvidenceLogKeyComponent, virtualEvidenceLogValueAPI,
+		contentIDKey, contentID,
+		virtualEvidenceLogKeyReason, reason,
+		"trigger", virtualProbeChainTriggerDiscovery,
+	}
+	if detail != "" {
+		args = append(args, "detail", detail)
+	}
+	args = append(args, attrs...)
+	slog.Log(ctx, level, "virtual pre-play probe chain skipped", args...)
+}
+
 // VirtualDefaultProbeTarget re-reads the item's default (top-sorted) playback
 // version after discovery persistence. The chain must probe the row a viewer
 // will actually open — the default — and it must re-read those rows after
 // persistence instead of trusting the discovery response, because discovery
 // may have replaced rows between the request and the persist landing.
+//
+// The read carries the access filter of the request that triggered discovery:
+// "the default" is the default of the versions that viewer may see, and a
+// version outside their visibility is not a version they can open.
 type VirtualDefaultProbeTarget interface {
-	DefaultVirtualProbeTarget(ctx context.Context, contentID string) (*models.MediaFile, error)
+	DefaultVirtualProbeTarget(ctx context.Context, contentID string, filter catalog.AccessFilter) (*models.MediaFile, error)
 }
 
 // VirtualDefaultProbeTargetFunc allows wiring the default-version lookup as a
 // plain function.
-type VirtualDefaultProbeTargetFunc func(ctx context.Context, contentID string) (*models.MediaFile, error)
+type VirtualDefaultProbeTargetFunc func(ctx context.Context, contentID string, filter catalog.AccessFilter) (*models.MediaFile, error)
 
 // DefaultVirtualProbeTarget re-reads the item's default playback version.
-func (f VirtualDefaultProbeTargetFunc) DefaultVirtualProbeTarget(ctx context.Context, contentID string) (*models.MediaFile, error) {
-	return f(ctx, contentID)
+func (f VirtualDefaultProbeTargetFunc) DefaultVirtualProbeTarget(ctx context.Context, contentID string, filter catalog.AccessFilter) (*models.MediaFile, error) {
+	return f(ctx, contentID, filter)
+}
+
+// VirtualProbeVersionLister is the catalog version read behind the production
+// default-probe target: the same top-sorted, access-filtered version list the
+// browse picker uses. *catalog.DetailService implements it.
+type VirtualProbeVersionLister interface {
+	GetItemVersions(ctx context.Context, contentID string, filter catalog.AccessFilter) ([]catalog.FileVersion, error)
+}
+
+// VirtualProbeFileReader resolves a version's media file row.
+// *scanner.FileRepository implements it.
+type VirtualProbeFileReader interface {
+	GetByID(ctx context.Context, id int) (*models.MediaFile, error)
+}
+
+// NewVirtualDefaultProbeTarget builds the production default-probe target from
+// the catalog detail service and the file repository. It resolves the default
+// under the access filter of the discovery request that scheduled the chain
+// (see VirtualDefaultProbeTarget), so versions the viewer cannot see are never
+// read and never probed. A nil reader disables the target, and with it the
+// chain.
+func NewVirtualDefaultProbeTarget(versions VirtualProbeVersionLister, files VirtualProbeFileReader) VirtualDefaultProbeTarget {
+	if versions == nil || files == nil {
+		return nil
+	}
+	return VirtualDefaultProbeTargetFunc(func(ctx context.Context, contentID string, filter catalog.AccessFilter) (*models.MediaFile, error) {
+		list, err := versions.GetItemVersions(ctx, contentID, filter)
+		if err != nil || len(list) == 0 {
+			return nil, err
+		}
+		return files.GetByID(ctx, list[0].FileID)
+	})
 }
 
 // defaultProbeChainAdmission deduplicates and bounds pre-play probe chains.
@@ -84,26 +166,37 @@ type defaultProbeChainAdmission struct {
 	admitted int
 }
 
-// acquire admits one chain for contentID. ok is false when a chain for the
-// item is already live (duplicate callbacks coalesce into that chain) or when
-// every slot is taken (the callback is dropped; the play path and any later
-// discovery run still probe normally). The returned func releases the slot
-// and must be called exactly once.
-func (a *defaultProbeChainAdmission) acquire(contentID string) (func(), bool) {
+// defaultProbeChainRefusal names why admission rejected a chain. The empty
+// value means the chain was admitted.
+type defaultProbeChainRefusal string
+
+const (
+	defaultProbeChainRefusalNone     defaultProbeChainRefusal = ""
+	defaultProbeChainRefusalLive     defaultProbeChainRefusal = "chain_already_live"
+	defaultProbeChainRefusalCapacity defaultProbeChainRefusal = "concurrency_full"
+)
+
+// acquire admits one chain for contentID. refusal is empty when admitted;
+// otherwise it names the reason the callback was dropped. A live chain for the
+// item already covers it (duplicate callbacks coalesce into that chain), and
+// when every slot is taken the callback is dropped — the play path and any
+// later discovery run still probe normally. The returned func releases the
+// slot and must be called exactly once.
+func (a *defaultProbeChainAdmission) acquire(contentID string) (func(), defaultProbeChainRefusal) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.active == nil {
 		a.active = make(map[string]struct{})
 	}
 	if _, live := a.active[contentID]; live {
-		return nil, false
+		return nil, defaultProbeChainRefusalLive
 	}
 	if a.admitted >= virtualDefaultProbeChainConcurrency {
-		return nil, false
+		return nil, defaultProbeChainRefusalCapacity
 	}
 	a.active[contentID] = struct{}{}
 	a.admitted++
-	return func() { a.release(contentID) }, true
+	return func() { a.release(contentID) }, defaultProbeChainRefusalNone
 }
 
 func (a *defaultProbeChainAdmission) release(contentID string) {
@@ -121,30 +214,46 @@ func (a *defaultProbeChainAdmission) release(contentID string) {
 // VirtualCandidatesRefreshService.ScheduleDefaultFileProbe). It is
 // non-blocking by contract: admission is a single atomic check, and
 // everything else — including the database re-read — happens inside the
-// admitted chain, never on the discovery caller.
-func (h *PlaybackHandler) ScheduleDefaultFileProbe(contentID string, source *models.MediaFile, streams []VirtualPlaybackStream) {
-	if h == nil || contentID == "" || source == nil || len(streams) == 0 {
+// admitted chain, never on the discovery caller. filter is the access filter
+// of the request that triggered discovery; the chain resolves its default
+// under that same filter (see VirtualDefaultProbeTarget).
+func (h *PlaybackHandler) ScheduleDefaultFileProbe(contentID string, source *models.MediaFile, streams []VirtualPlaybackStream, filter catalog.AccessFilter) {
+	if h == nil {
+		logVirtualProbeChainSkip(context.Background(), slog.LevelInfo, contentID,
+			virtualProbeChainReasonScheduleRefused, "nil_handler")
+		return
+	}
+	if contentID == "" || source == nil || len(streams) == 0 {
+		logVirtualProbeChainSkip(context.Background(), slog.LevelInfo, contentID,
+			virtualProbeChainReasonScheduleRefused, "invalid_input")
 		return
 	}
 	if h.DefaultProbeTarget == nil {
+		logVirtualProbeChainSkip(context.Background(), slog.LevelInfo, contentID,
+			virtualProbeChainReasonScheduleRefused, "target_unwired")
 		return
 	}
 	if h.VirtualPlaybackSourceProber == nil && h.VirtualPlaybackSourceProberWithHeaders == nil {
+		logVirtualProbeChainSkip(context.Background(), slog.LevelInfo, contentID,
+			virtualProbeChainReasonScheduleRefused, "prober_unwired")
 		return
 	}
-	release, ok := h.defaultProbeChains.acquire(contentID)
-	if !ok {
+	release, refusal := h.defaultProbeChains.acquire(contentID)
+	if refusal != defaultProbeChainRefusalNone {
 		// A chain for this item is already live, or both slots are taken.
-		// Either way the item is covered: the live chain re-reads the same
+		// Either way the callback is dropped: the live chain re-reads the same
 		// defaults, and a dropped probe still happens on the first play. No
 		// queue, no retry, no delay for the caller.
+		logVirtualProbeChainSkip(context.Background(), slog.LevelInfo, contentID,
+			virtualProbeChainReasonScheduleRefused, string(refusal))
 		return
 	}
 	// Snapshot the exact inputs so a later mutation of the caller's structures
-	// cannot change what is probed: the row is copied by value and the
-	// listing entries are deep-copied for the mutable members the probe
-	// reads.
+	// cannot change what is probed: the row is copied by value, the filter's
+	// reference members are cloned, and the listing entries are deep-copied
+	// for the mutable members the probe reads.
 	probeSource := *source
+	filterSnapshot := virtualProbeAccessFilterSnapshot(filter)
 	streamsSnapshot := make([]VirtualPlaybackStream, len(streams))
 	for i := range streams {
 		streamsSnapshot[i] = virtualProbeStreamSnapshot(streams[i])
@@ -170,8 +279,26 @@ func (h *PlaybackHandler) ScheduleDefaultFileProbe(contentID string, source *mod
 			cancel()
 			h.probeChainWG.Done()
 		}()
-		h.runDefaultFileProbeChain(ctx, contentID, &probeSource, streamsSnapshot)
+		h.runDefaultFileProbeChain(ctx, contentID, &probeSource, streamsSnapshot, filterSnapshot)
 	}()
+}
+
+// virtualProbeAccessFilterSnapshot deep-copies the reference members of an
+// access filter so the detached chain reads exactly the constraints of the
+// request that scheduled it, even if that request's structures are reused
+// afterwards. Scalar members copy with the value.
+func virtualProbeAccessFilterSnapshot(filter catalog.AccessFilter) catalog.AccessFilter {
+	clone := filter
+	clone.AllowedLibraryIDs = slices.Clone(filter.AllowedLibraryIDs)
+	clone.AllowedContentIDs = slices.Clone(filter.AllowedContentIDs)
+	clone.DisabledLibraryIDs = slices.Clone(filter.DisabledLibraryIDs)
+	clone.ExcludedMediaTypes = slices.Clone(filter.ExcludedMediaTypes)
+	clone.MetadataLanguageOverrides = maps.Clone(filter.MetadataLanguageOverrides)
+	if filter.PresentationLibraryID != nil {
+		presentationLibrary := *filter.PresentationLibraryID
+		clone.PresentationLibraryID = &presentationLibrary
+	}
+	return clone
 }
 
 // virtualProbeStreamSnapshot deep-copies the mutable members a probe reads
@@ -188,29 +315,49 @@ func virtualProbeStreamSnapshot(base VirtualPlaybackStream) VirtualPlaybackStrea
 }
 
 // runDefaultFileProbeChain is the body of one admitted chain. Every step is
-// bounded by the chain context; a failure or an unsafe target skips silently.
-func (h *PlaybackHandler) runDefaultFileProbeChain(ctx context.Context, contentID string, source *models.MediaFile, streams []VirtualPlaybackStream) {
-	if ctx.Err() != nil {
+// bounded by the chain context; a failure or an unsafe target leaves one
+// structured skip line naming the reason (see logVirtualProbeChainSkip).
+func (h *PlaybackHandler) runDefaultFileProbeChain(ctx context.Context, contentID string, source *models.MediaFile, streams []VirtualPlaybackStream, filter catalog.AccessFilter) {
+	if err := ctx.Err(); err != nil {
+		logVirtualProbeChainSkip(ctx, slog.LevelInfo, contentID,
+			virtualProbeChainReasonBudgetExpired, "chain_start", virtualEvidenceLogKeyError, err)
 		return
 	}
 	// Re-read the persisted default. Discovery may have replaced the rows
 	// between the listing and the persistence of this chain's inputs, so the
 	// target is never the request-time row: it is whatever the catalog
-	// serves now for this item.
-	row, err := h.DefaultProbeTarget.DefaultVirtualProbeTarget(ctx, contentID)
-	if err != nil || row == nil || ctx.Err() != nil {
-		if err != nil && ctx.Err() == nil {
-			slog.InfoContext(ctx, "virtual pre-play probe skipped: default version unavailable",
-				"component", "api", "content_id", contentID, "error", err)
+	// serves now for this item, under the triggering request's access filter.
+	row, err := h.DefaultProbeTarget.DefaultVirtualProbeTarget(ctx, contentID, filter)
+	if err != nil {
+		if ctx.Err() != nil {
+			logVirtualProbeChainSkip(ctx, slog.LevelInfo, contentID,
+				virtualProbeChainReasonBudgetExpired, "default_read", virtualEvidenceLogKeyError, ctx.Err())
+			return
 		}
+		logVirtualProbeChainSkip(ctx, slog.LevelInfo, contentID,
+			virtualProbeChainReasonDefaultUnavailable, "default_read", virtualEvidenceLogKeyError, err)
+		return
+	}
+	if ctx.Err() != nil {
+		logVirtualProbeChainSkip(ctx, slog.LevelInfo, contentID,
+			virtualProbeChainReasonBudgetExpired, "default_read", virtualEvidenceLogKeyError, ctx.Err())
+		return
+	}
+	if row == nil {
+		logVirtualProbeChainSkip(ctx, slog.LevelDebug, contentID,
+			virtualProbeChainReasonNoDefaultVersion, "")
 		return
 	}
 	if !isVirtualPlaybackFile(row) {
+		logVirtualProbeChainSkip(ctx, slog.LevelDebug, contentID,
+			virtualProbeChainReasonNotVirtual, "")
 		return
 	}
 	// Stamp skip and damper check happen inside admitted work — the admission
 	// callback only reserves the slot, by design.
 	if row.ProbeUpdatedAt != nil {
+		logVirtualProbeChainSkip(ctx, slog.LevelDebug, contentID,
+			virtualProbeChainReasonAlreadyProbed, "", virtualEvidenceLogKeyFileID, row.ID)
 		return
 	}
 	oid := row.VirtualOwnerInstallationID
@@ -220,15 +367,21 @@ func (h *PlaybackHandler) runDefaultFileProbeChain(ctx context.Context, contentI
 		// default may be the neutral group row, and a neutral default may
 		// resolve to a sibling candidate. The play path's own probe handles
 		// those; a chain must never guess.
+		logVirtualProbeChainSkip(ctx, slog.LevelDebug, contentID,
+			virtualProbeChainReasonNoExactCandidate, "", virtualEvidenceLogKeyFileID, row.ID)
 		return
 	}
 	if virtualProbeFailures.recent(virtualProbeFailureKey(probeCand.URI, oid)) {
+		logVirtualProbeChainSkip(ctx, slog.LevelDebug, contentID,
+			virtualProbeChainReasonRecentlyFailed, "", virtualEvidenceLogKeyFileID, row.ID)
 		return
 	}
 	// The enumeration runs behind the shared detached gate, the same bounded
 	// admission every background virtual probe uses. No slot, no probe.
 	gate := h.detachedGate()
 	if gate == nil || !gate.tryAcquire() {
+		logVirtualProbeChainSkip(ctx, slog.LevelInfo, contentID,
+			virtualProbeChainReasonGateBusy, "", virtualEvidenceLogKeyFileID, row.ID)
 		return
 	}
 	defer gate.release()
@@ -243,10 +396,23 @@ func (h *PlaybackHandler) runDefaultFileProbeChain(ctx context.Context, contentI
 	// evidence path. No session binding exists here, so the fence is nil and
 	// the identity tiers are zero — the same posture the unstamped-row fast
 	// path takes, where the row owns its persisted candidate.
-	h.probeVirtualSourceAndPersist(
+	outcome := h.probeVirtualSourceAndPersist(
 		ctx, stickyKey, row, row.FilePath, probeTransient, *probeCand,
 		resolver.PersistedIdentityTiers{}, expectedRuntimeMinutes, oid,
 	)
+	switch outcome {
+	case probeOutcomeFailed:
+		if ctx.Err() != nil {
+			logVirtualProbeChainSkip(ctx, slog.LevelInfo, contentID,
+				virtualProbeChainReasonBudgetExpired, "probe", virtualEvidenceLogKeyError, ctx.Err())
+			return
+		}
+		logVirtualProbeChainSkip(ctx, slog.LevelInfo, contentID,
+			virtualProbeChainReasonProbeFailed, "probe", virtualEvidenceLogKeyFileID, row.ID)
+	case probeOutcomePartial:
+		logVirtualProbeChainSkip(ctx, slog.LevelInfo, contentID,
+			virtualProbeChainReasonProbeIncomplete, "probe", virtualEvidenceLogKeyFileID, row.ID)
+	}
 }
 
 // virtualDefaultProbeCandidate matches the default row's exact bytes against

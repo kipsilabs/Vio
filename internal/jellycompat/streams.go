@@ -26,6 +26,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/httpstream"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/netaccess"
+	"github.com/Silo-Server/silo-server/internal/nodeauth"
 	"github.com/Silo-Server/silo-server/internal/nodepool"
 	"github.com/Silo-Server/silo-server/internal/noderouting"
 	"github.com/Silo-Server/silo-server/internal/playback"
@@ -381,6 +382,7 @@ func compatRecipeMatchesSource(recipe *playback.RecipeCard, source PlaybackMedia
 		recipe.AudioTrackIndex == compatAudioOrdinalOrDefault(source) &&
 		recipe.SourceAudioChannels == compatHLSRecipeSourceAudioChannels(source) &&
 		recipe.CopyVideoMPEGTS == source.HLSRemuxMPEGTS &&
+		(!compatHLSCopiesVideo(source) || recipe.KeyframePlaylist == source.KeyframePlaylist) &&
 		recipe.SubtitleBurnIn == source.SubtitleBurnIn && (!source.SubtitleBurnIn || (recipe.SubtitleTrackIndex == source.SubtitleTrackIndex && recipe.SubtitleCodec == source.SubtitleCodec)) &&
 		(source.TargetBitrateKbps == 0 || recipe.TargetBitrateKbps == source.TargetBitrateKbps) &&
 		(source.TargetResolution == "" || recipe.TargetResolution == source.TargetResolution)
@@ -858,127 +860,6 @@ func (h *PlaybackHandler) HandleVideoStream(w http.ResponseWriter, r *http.Reque
 	}
 }
 
-// HandleDownload serves the original media file for /Items/{id}/Download.
-// This route backs the CanDownload flag set in mapping.go. CanDownload is
-// load-bearing for Infuse: it refuses Direct Play (Static=true streaming)
-// for items it believes it cannot download, so the flag must stay true and
-// this route must exist.
-func (h *PlaybackHandler) HandleDownload(w http.ResponseWriter, r *http.Request) {
-	session := SessionFromContext(r.Context())
-	if session == nil {
-		writeError(w, http.StatusUnauthorized, "Unauthorized", "Missing authentication token")
-		return
-	}
-
-	contentID, routeFileID, err := decodeContentOrMediaSourceID(r.Context(), h.codec, chiURLParam(r, "id"))
-	if err != nil {
-		writeItemIDError(w, r, err)
-		return
-	}
-	detail, err := h.content.GetItemDetail(r.Context(), session, contentID, nil)
-	if err != nil || detail == nil || len(detail.Versions) == 0 {
-		writeError(w, http.StatusNotFound, "NotFound", "Item not found")
-		return
-	}
-
-	version := detail.Versions[0]
-	mediaSourceID := firstNonEmpty(r.URL.Query().Get("mediaSourceId"), r.URL.Query().Get("MediaSourceId"))
-	sourceFromRoute := mediaSourceID == "" && routeFileID > 0
-	if sourceFromRoute {
-		mediaSourceID = h.codec.EncodeIntID(EncodedIDMediaSource, routeFileID)
-	}
-	if mediaSourceID != "" {
-		matched := false
-		if fileID, decodeErr := h.codec.DecodeIntID(EncodedIDMediaSource, mediaSourceID); decodeErr == nil {
-			for _, v := range detail.Versions {
-				if int64(v.FileID) == fileID {
-					version = v
-					matched = true
-					break
-				}
-			}
-		}
-		if !matched && sourceFromRoute {
-			// The route named a version the item no longer has; do not serve
-			// a different file.
-			writeError(w, http.StatusNotFound, "NotFound", "Media source not found")
-			return
-		}
-	}
-
-	var virtualSourceURI string
-	var virtualOwnerID int
-	if source := h.boundVirtualDownloadSource(session, newCaseInsensitiveQuery(r.URL.Query()).Get("PlaySessionId"), version.FileID, firstNonEmpty(r.URL.Query().Get("mediaSourceId"), r.URL.Query().Get("MediaSourceId"))); source != nil {
-		version = source.Version
-		virtualSourceURI = source.VirtualSourceURI
-		virtualOwnerID = source.VirtualSourceOwnerInstallationID
-	} else if isCompatVirtualPath(version.FilePath) || strings.EqualFold(strings.TrimSpace(version.Container), "virtual") {
-		var prepareErr error
-		version, virtualSourceURI, virtualOwnerID, prepareErr = h.prepareVirtualPlaybackVersion(r.Context(), session, version)
-		if prepareErr != nil {
-			writeError(w, http.StatusBadGateway, "PlaybackUnavailable", "Failed to resolve virtual playback")
-			return
-		}
-	}
-
-	if h.fileResolver == nil {
-		writeError(w, http.StatusInternalServerError, "ServerError", "File resolver not available")
-		return
-	}
-	file, err := h.fileResolver.GetByID(r.Context(), version.FileID)
-	if err != nil {
-		writeError(w, http.StatusNotFound, "NotFound", "Media file not found")
-		return
-	}
-
-	if virtualSourceURI != "" {
-		source := PlaybackMediaSource{
-			FileID: version.FileID, Version: version,
-			VirtualSourceURI:                 virtualSourceURI,
-			VirtualSourceOwnerInstallationID: virtualOwnerID,
-		}
-		w.Header().Set("Content-Disposition", "attachment; filename*=UTF-8''"+url.PathEscape(virtualDownloadName(version)))
-		if streamErr := h.serveVirtualDirect(w, r, session, source); streamErr != nil {
-			writeError(w, http.StatusBadGateway, "PlaybackUnavailable", "Failed to stream virtual playback")
-		}
-		return
-	}
-
-	if isCompatVirtualFile(file) || isCompatVirtualPath(version.FilePath) {
-		playSessionID := firstNonEmpty(r.URL.Query().Get("PlaySessionId"), r.URL.Query().Get("playSessionId"))
-		mediaSourceID := firstNonEmpty(r.URL.Query().Get("MediaSourceId"), r.URL.Query().Get("mediaSourceId"))
-		boundSource := h.boundVirtualDownloadSource(session, playSessionID, version.FileID, mediaSourceID)
-		var source PlaybackMediaSource
-		if boundSource != nil {
-			source = *boundSource
-		} else {
-			resolved, err := h.resolveAndProbeVirtualSource(r.Context(), file, session.StreamAppUserID, session.ProfileID)
-			if err != nil {
-				writeCompatUpstreamError(w, err)
-				return
-			}
-			source = PlaybackMediaSource{
-				FileID:                           version.FileID,
-				Version:                          applyVirtualProbeToVersion(version, resolved.file),
-				VirtualSourceURI:                 resolved.uri,
-				VirtualSourceOwnerInstallationID: resolved.ownerID,
-			}
-		}
-		w.Header().Set("Content-Disposition", "attachment; filename*=UTF-8''"+url.PathEscape(virtualDownloadName(source.Version)))
-		if err := h.serveVirtualDirect(w, r, session, source); err != nil {
-			writeCompatUpstreamError(w, err)
-		}
-		return
-	}
-
-	// §4.2b: a download has a user but no stable playback session, so it is a
-	// Transfer rather than a logical session.
-	attachCompatTransfer(r.Context(), session, version.FileID)
-
-	w.Header().Set("Content-Disposition", "attachment; filename*=UTF-8''"+url.PathEscape(filepath.Base(file.FilePath)))
-	_ = playback.ServeDirectPlay(w, r, file.FilePath)
-}
-
 // HandleMasterManifest serves the compat-owned HLS manifest route.
 // It returns a full-duration VOD manifest so clients can seek to any position.
 // Segments that haven't been transcoded yet are served on-demand by the segment handler.
@@ -1193,7 +1074,7 @@ func (h *PlaybackHandler) HandleMasterManifest(w http.ResponseWriter, r *http.Re
 		manifest, relayErr := h.fetchRemoteCompatManifest(r.Context(), remoteNodeURL, playSession.UpstreamSessionID)
 		if relayErr != nil {
 			lastPreparationErr = relayErr
-			h.tm.StopRemoteTranscode(playSession.UpstreamSessionID, remoteNodeURL)
+			h.tm.StopRemoteTranscodeAfterFailure(playSession.UpstreamSessionID, remoteNodeURL, relayErr)
 			h.releaseCompatSessionReservation(playSession.UpstreamSessionID)
 			excludedNodes[strings.TrimRight(remoteNodeURL, "/")] = struct{}{}
 			continue
@@ -1616,9 +1497,12 @@ func (h *PlaybackHandler) fetchRemoteCompatManifest(ctx context.Context, nodeURL
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+h.JWTSecret)
+	if err := nodeauth.Sign(req, nodeURL, h.JWTSecret); err != nil {
+		return nil, err
+	}
 	resp, err := telemetry.DoTrustedNode(transcodeproxy.NodeClient(), req, "stream")
 	if err != nil {
+		nodepool.ReportConnectFailure(h.NodePlanner, nodeURL, err)
 		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -1637,10 +1521,14 @@ func (h *PlaybackHandler) proxyRemoteCompatSegment(w http.ResponseWriter, r *htt
 		writeError(w, http.StatusInternalServerError, "ServerError", "Failed to build remote segment request")
 		return
 	}
-	req.Header.Set("Authorization", "Bearer "+h.JWTSecret)
+	if err := nodeauth.Sign(req, nodeURL, h.JWTSecret); err != nil {
+		writeError(w, http.StatusInternalServerError, "ServerError", "Failed to build remote segment request")
+		return
+	}
 	transcodeproxy.PrepareRequest(req, r)
 	resp, err := telemetry.DoTrustedNode(transcodeproxy.NodeClient(), req, "stream")
 	if err != nil {
+		nodepool.ReportConnectFailure(h.NodePlanner, nodeURL, err)
 		writeError(w, http.StatusBadGateway, "TranscodeUnavailable", "Remote transcode segment is unavailable")
 		return
 	}
@@ -1653,7 +1541,7 @@ func (h *PlaybackHandler) proxyRemoteCompatSegment(w http.ResponseWriter, r *htt
 		return
 	}
 	if generation != "" && r.Method == http.MethodGet && sw.CompletedFullResponse(transcodeproxy.FullRepresentationSize(resp)) {
-		if err := transcodeproxy.Acknowledge(r.Context(), transcodeproxy.NodeClient(), nodepool.NodeEndpoint(nodeURL, path), h.JWTSecret, generation); err != nil {
+		if err := transcodeproxy.Acknowledge(r.Context(), transcodeproxy.NodeClient(), nodepool.NodeEndpoint(nodeURL, ""), path, h.JWTSecret, generation); err != nil {
 			slog.WarnContext(r.Context(), "acknowledge Jellyfin-compatible transcode segment", "component", "jellycompat", "error", err, "playback_session_id", upstreamSessionID)
 		}
 	}
@@ -2618,7 +2506,6 @@ func (h *PlaybackHandler) handlePlaybackReport(w http.ResponseWriter, r *http.Re
 		}
 	}
 	audioTrackIndex := 0
-	audioRestarted := false
 	// Jellyfin web/mobile clients send AudioStreamIndex on every progress
 	// report, not just on track changes. Restarting ffmpeg on each report
 	// (every ~10s) tears down segments the player is still appending and
@@ -2641,13 +2528,12 @@ func (h *PlaybackHandler) handlePlaybackReport(w http.ResponseWriter, r *http.Re
 			if resolvedAudioTrackIndex, ok := compatAudioOrdinal(*updatedSource); ok {
 				audioTrackIndex = resolvedAudioTrackIndex
 			}
-			audioRestarted = restarted
 			slog.InfoContext(r.Context(), "jellycompat audio selection updated", "component", "jellycompat",
 				"play_session_id", playSession.ID,
 				"media_source_id", updatedSource.ID,
 				"audio_stream_index", selectedAudioStreamIndex,
 				"audio_track_index", audioTrackIndex,
-				"transcode_restarted", audioRestarted,
+				"transcode_restarted", restarted,
 			)
 		}
 	}
@@ -2712,7 +2598,7 @@ func (h *PlaybackHandler) handlePlaybackReport(w http.ResponseWriter, r *http.Re
 		}
 	}
 	if refreshTasteProfile && playSession.ItemID != "" {
-		triggerProfileRefresh(r.Context(), h.profileStaler, h.profileRefreshRequester, session.StreamAppUserID, session.ProfileID)
+		notifySignalsChanged(r.Context(), h.signalsNotifier, session.StreamAppUserID, session.ProfileID)
 	}
 	// ID-less players still supply a final resume sample on Stopped. Persist
 	// it above, but do not use an item/source match to tear down a play: a
@@ -2827,11 +2713,39 @@ func (h *PlaybackHandler) refreshPlaySession(current *PlaybackSession) *Playback
 	return current
 }
 
+// withNegotiatedClientInfo names the client from its PlaybackInfo request when
+// the stream request didn't send a MediaBrowser header, so the native session
+// isn't labeled from the User-Agent alone.
+func withNegotiatedClientInfo(ctx context.Context, playSession *PlaybackSession) context.Context {
+	info := playback.ClientInfoFromContext(ctx)
+	if info.Name != "" || playSession.ClientName == "" {
+		return ctx
+	}
+	info.Name, info.Version = playSession.ClientName, playSession.ClientVersion
+	return playback.WithClientInfo(ctx, info)
+}
+
+// fillReconstructedClientInfo labels a recipe card that is about to rebuild a
+// native session. Cards minted before client metadata was recorded (and the
+// direct/remux fallback cards built from scratch) carry none; the current
+// compat request identifies the client, so the reconstructed session keeps its
+// label and JF pill. A card minted from the User-Agent alone, by a binary that
+// didn't yet name the client from PlaybackInfo, still takes the name.
+func fillReconstructedClientInfo(card *playback.RecipeCard, info playback.ClientInfo) {
+	card.IsJellyfinCompat = info.IsCompat
+	if card.ClientName == "" && card.ClientUserAgent == "" {
+		card.ClientName, card.ClientVersion, card.ClientUserAgent = info.Name, info.Version, info.UserAgent
+	} else if card.ClientName == "" && info.Name != "" {
+		card.ClientName, card.ClientVersion = info.Name, info.Version
+	}
+}
+
 func (h *PlaybackHandler) ensureUpstreamPlayback(ctx context.Context, compatSession *Session, playSessionID string, source PlaybackMediaSource, method string) (*PlaybackSession, error) {
 	playSession, ok := h.playbackStore.Get(playSessionID)
 	if !ok {
 		return nil, ErrSessionNotFound
 	}
+	ctx = withNegotiatedClientInfo(ctx, playSession)
 	// Captured before any mutation: the CAS attach below verifies no concurrent
 	// request replaced the upstream session this request observed.
 	observedUpstreamID := playSession.UpstreamSessionID
@@ -2848,15 +2762,7 @@ func (h *PlaybackHandler) ensureUpstreamPlayback(ctx context.Context, compatSess
 			}
 			if h.tm != nil {
 				card := h.upstreamRecipeCard(playSession, compatSession, source, method)
-				// Cards minted before client metadata was recorded (and the
-				// direct/remux fallback cards built here from scratch) carry
-				// none; the current compat request identifies the client, so
-				// the reconstructed session keeps its label and JF pill.
-				info := playback.ClientInfoFromContext(ctx)
-				card.IsJellyfinCompat = info.IsCompat
-				if card.ClientName == "" && card.ClientUserAgent == "" {
-					card.ClientName, card.ClientVersion, card.ClientUserAgent = info.Name, info.Version, info.UserAgent
-				}
+				fillReconstructedClientInfo(&card, playback.ClientInfoFromContext(ctx))
 				if reconstructed := h.tm.ReconstructSession(ctx, playSession.UpstreamSessionID, compatSession.StreamAppUserID, card); reconstructed != nil {
 					if !playSession.ProgressPersistenceKnown ||
 						playSession.DisableProgressPersistence != reconstructed.DisableProgressPersistence {
@@ -3182,6 +3088,7 @@ func (h *PlaybackHandler) ensureTranscodeSessionWithToneMapMode(
 		opts.TargetCodecVideo = compatCopyCodec
 		opts.VideoSampleEntry, opts.VideoBitstreamFilter = compatCopyVideoRecipe(source, file.PrimaryDVProfile())
 		opts.CopyVideoMPEGTS = source.HLSRemuxMPEGTS
+		opts.KeyframePlaylist = source.KeyframePlaylist
 	}
 	if !compatHLSTranscodesAudio(source) {
 		opts.TargetCodecAudio = compatCopyCodec
@@ -3457,6 +3364,7 @@ func compatLiveTranscodeMatchesAudioSource(transcodeSession *playback.TranscodeS
 	return opts.AudioTrackIndex == compatAudioOrdinalOrDefault(source) &&
 		opts.SourceAudioChannels == compatHLSRecipeSourceAudioChannels(source) &&
 		opts.CopyVideoMPEGTS == source.HLSRemuxMPEGTS &&
+		(!compatHLSCopiesVideo(source) || opts.KeyframePlaylist == source.KeyframePlaylist) &&
 		opts.SubtitleBurnIn == source.SubtitleBurnIn && (!source.SubtitleBurnIn || (opts.SubtitleTrackIndex == source.SubtitleTrackIndex && opts.SubtitleCodec == source.SubtitleCodec)) &&
 		(source.TargetBitrateKbps == 0 || opts.TargetBitrateKbps == source.TargetBitrateKbps) &&
 		(source.TargetResolution == "" || opts.TargetResolution == source.TargetResolution)

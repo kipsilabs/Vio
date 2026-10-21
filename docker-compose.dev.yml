@@ -112,6 +112,9 @@ services:
       VIO_PLUGIN_CACHE_DIR: /var/lib/vio/plugins
       SILO_PLUGIN_CACHE_DIR: /var/lib/vio/plugins
       POSTGRES_TUNE: "off"
+      # air restarts on every rebuild and kills the process 500 ms after
+      # interrupting it; a single dev server has no traffic to route away.
+      SILO_SHUTDOWN_DELAY: "0"
     ports:
       - "${BACKEND_PORT:-18080}:8080"
       - "${JF_PORT:-8096}:8096"
@@ -125,6 +128,7 @@ services:
       - vio-dev-artwork:/var/lib/vio/artwork
       - vio-dev-compat:/var/lib/vio/compat
       - vio-dev-transcode:/tmp/vio-transcode
+      - vio-dev-download-artifacts:/tmp/vio-download-artifacts
       - ${MEDIA_ROOT:-/tmp/vio-dev-media}:${MEDIA_CONTAINER_ROOT:-/mnt/media}:ro
     depends_on:
       postgres:
@@ -172,6 +176,7 @@ volumes:
   vio-dev-air-tmp:
   vio-dev-artwork:
   vio-dev-compat:
+  vio-dev-download-artifacts:
   vio-dev-go-build:
   vio-dev-go-mod:
   vio-dev-plugins:

@@ -13,7 +13,7 @@ import { useIsActingAdmin } from "@/hooks/useIsActingAdmin";
 import { useAmbientColor } from "@/hooks/useAmbientColor";
 import { useCurrentProfile } from "@/hooks/useCurrentProfile";
 import CastCarousel from "@/components/CastCarousel";
-import CrewList from "@/components/CrewList";
+import { buildCrewGroups } from "@/components/castCrewGroups";
 import DownloadVersionPicker from "@/components/DownloadVersionPicker";
 import EditMetadataDialog from "@/components/EditMetadataDialog";
 import MediaLocations from "@/components/MediaLocations";
@@ -46,6 +46,7 @@ import {
 import { formatRuntimeMinutes } from "@/lib/mediaFormat";
 import { useQualityPreference } from "@/hooks/queries/qualityPreference";
 import { useDetailWatchTogether } from "@/pages/watchtogether/DetailWatchTogether";
+import { hasMachineTranslation } from "./components/machineTranslation";
 
 export default function MovieContent({
   item,
@@ -94,6 +95,7 @@ export default function MovieContent({
   const [downloadOpen, setDownloadOpen] = useState(false);
   const [subtitleSearchOpen, setSubtitleSearchOpen] = useState(false);
   const [mediaInfoOpen, setMediaInfoOpen] = useState(false);
+  const crewGroups = useMemo(() => buildCrewGroups(item.crew ?? [], "Director"), [item.crew]);
   const [mediaInfoFileId, setMediaInfoFileId] = useState<number | null>(null);
   // Tracks whether a version picker has been opened; the picker-open path
   // widens the liveness probe from the default version to the whole list.
@@ -304,6 +306,11 @@ export default function MovieContent({
           overview={item.overview}
           overviewTranslating={overviewTranslating}
           onTranslateOverview={onTranslateOverview}
+          overviewMachineTranslated={hasMachineTranslation(item.machine_translated_fields)}
+          taglineMachineTranslated={hasMachineTranslation(
+            item.machine_translated_fields,
+            "tagline",
+          )}
           crewLine={<HeroCrewLine crew={item.crew ?? []} genres={item.genres} />}
           actions={
             <MediaUserActionBar
@@ -453,17 +460,16 @@ export default function MovieContent({
         />
       )}
 
-      {item.videos && item.videos.length > 0 && <TrailersSection videos={item.videos} />}
-
+      {/* Local extras play in Silo, so they lead; YouTube videos follow. */}
       {item.extras && item.extras.length > 0 && <ExtrasSection extras={item.extras} />}
 
-      {item.cast && item.cast.length > 0 && (
-        <DetailSection title="Cast">
-          <CastCarousel cast={item.cast} prefetchPeople />
+      {item.videos && item.videos.length > 0 && <TrailersSection videos={item.videos} />}
+
+      {((item.cast?.length ?? 0) > 0 || crewGroups.some((g) => g.members.length > 0)) && (
+        <DetailSection title="Cast & Crew">
+          <CastCarousel cast={item.cast ?? []} crewGroups={crewGroups} limit={12} prefetchPeople />
         </DetailSection>
       )}
-
-      {item.crew && item.crew.length > 0 && <CrewList crew={item.crew} />}
 
       <CollectionsSection collections={item.collections} />
 

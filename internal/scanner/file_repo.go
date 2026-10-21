@@ -82,7 +82,7 @@ const fileColumns = `id, content_id, episode_id, extra_id, season_number, episod
 	base_title, base_year, base_type, identity_confidence, identity_json,
 	file_path, file_size, file_modified_at, file_hash,
 	codec_video, codec_audio, resolution, audio_channels, hdr, container,
-	duration, bitrate, video_tracks, audio_tracks, subtitle_tracks, external_subtitles, chapters,
+	duration, bitrate, video_tracks, audio_tracks, subtitle_tracks, external_subtitles, chapters, marker_thumbnails,
 	chapter_thumbnail_retry_after, chapter_thumbnail_failure_count, chapter_thumbnail_last_error,
 	intro_start, intro_end, credits_start, credits_end, recap_start, recap_end, preview_start, preview_end, marker_segments, markers_source, markers_confidence,
 	intro_markers_source, intro_markers_provider, intro_markers_confidence, intro_markers_algorithm, intro_markers_detected_at,
@@ -112,7 +112,7 @@ const mfFileColumns = `mf.id, mf.content_id, mf.episode_id, mf.extra_id, mf.seas
 	mf.base_title, mf.base_year, mf.base_type, mf.identity_confidence, mf.identity_json,
 	mf.file_path, mf.file_size, mf.file_modified_at, mf.file_hash,
 	mf.codec_video, mf.codec_audio, mf.resolution, mf.audio_channels, mf.hdr, mf.container,
-	mf.duration, mf.bitrate, mf.video_tracks, mf.audio_tracks, mf.subtitle_tracks, mf.external_subtitles, mf.chapters,
+	mf.duration, mf.bitrate, mf.video_tracks, mf.audio_tracks, mf.subtitle_tracks, mf.external_subtitles, mf.chapters, mf.marker_thumbnails,
 	mf.chapter_thumbnail_retry_after, mf.chapter_thumbnail_failure_count, mf.chapter_thumbnail_last_error,
 	mf.intro_start, mf.intro_end, mf.credits_start, mf.credits_end, mf.recap_start, mf.recap_end, mf.preview_start, mf.preview_end, mf.marker_segments, mf.markers_source, mf.markers_confidence,
 	mf.intro_markers_source, mf.intro_markers_provider, mf.intro_markers_confidence, mf.intro_markers_algorithm, mf.intro_markers_detected_at,
@@ -210,6 +210,7 @@ func scanMediaFile(row pgx.Row) (*models.MediaFile, error) {
 		&subtitleTracksJSON,
 		&externalSubtitlesJSON,
 		&chaptersJSON,
+		&f.MarkerThumbnails,
 		&chapterThumbnailRetryAfter,
 		&chapterThumbnailFailureCount,
 		&chapterThumbnailLastError,
@@ -589,6 +590,7 @@ func scanMediaFiles(rows pgx.Rows) ([]*models.MediaFile, error) {
 			&subtitleTracksJSON,
 			&externalSubtitlesJSON,
 			&chaptersJSON,
+			&f.MarkerThumbnails,
 			&chapterThumbnailRetryAfter,
 			&chapterThumbnailFailureCount,
 			&chapterThumbnailLastError,
@@ -4835,7 +4837,8 @@ func (r *FileRepository) DeleteMissingByFolder(ctx context.Context, folderID int
 	// Virtual plugin-backed files are not present on the local filesystem by
 	// design. They must never be treated as missing physical files by scanner
 	// cleanup, otherwise a scan/restart disables playback for every virtual item.
-	query := `DELETE FROM media_files mf
+	query := `WITH deleted AS (
+		DELETE FROM media_files mf
 		WHERE mf.media_folder_id = $1
 		  AND mf.missing_since IS NOT NULL
 		  AND mf.missing_since < $2
@@ -4851,11 +4854,15 @@ func (r *FileRepository) DeleteMissingByFolder(ctx context.Context, folderID int
 		query += " AND NOT (" + strings.Join(clauses, " OR ") + ")"
 		args = append(args, clauseArgs...)
 	}
-	tag, err := r.pool.Exec(ctx, query, args...)
-	if err != nil {
+	query += `
+		RETURNING mf.id, mf.extra_id
+	)` + catalog.ClearEmptiedExtraStillsCTE + `
+	SELECT count(*) FROM deleted`
+	var deleted int
+	if err := r.pool.QueryRow(ctx, query, args...).Scan(&deleted); err != nil {
 		return 0, fmt.Errorf("deleting missing files for folder %d: %w", folderID, err)
 	}
-	return int(tag.RowsAffected()), nil
+	return deleted, nil
 }
 
 // ListRootsWithCatalogedFiles returns the subset of roots (in input order)
@@ -4959,20 +4966,25 @@ func (r *FileRepository) ListRootsWithOnlyMissingFiles(ctx context.Context, fold
 	return suspect, nil
 }
 
-// DeleteByIDs removes specific media file rows by primary key.
+// DeleteByIDs removes specific media file rows by primary key, clearing the
+// image of any local extra left without a file
+// (catalog.ClearEmptiedExtraStillsCTE).
 func (r *FileRepository) DeleteByIDs(ctx context.Context, ids []int) (int, error) {
 	if len(ids) == 0 {
 		return 0, nil
 	}
 
-	tag, err := r.pool.Exec(ctx,
-		"DELETE FROM media_files WHERE id = ANY($1)",
+	var deleted int
+	err := r.pool.QueryRow(ctx, `WITH deleted AS (
+		DELETE FROM media_files WHERE id = ANY($1) RETURNING id, extra_id
+	)`+catalog.ClearEmptiedExtraStillsCTE+`
+	SELECT count(*) FROM deleted`,
 		ids,
-	)
+	).Scan(&deleted)
 	if err != nil {
 		return 0, fmt.Errorf("deleting media files by id: %w", err)
 	}
-	return int(tag.RowsAffected()), nil
+	return deleted, nil
 }
 
 // ListIDsOutsideRoots returns file row ids for a folder whose paths are no
@@ -5899,7 +5911,25 @@ func (r *FileRepository) ListMissingChapterThumbnails(ctx context.Context, limit
 		  )
 		  AND (
 			mf.chapters IS NULL
-			OR (
+            -- Count only markers models.EffectiveMarkerThumbnails can preview;
+            -- others never write state and would be listed every sweep.
+            OR (EXISTS (
+                    SELECT 1 FROM (
+                        SELECT segment->>'kind' AS kind, (segment->>'start_seconds')::float8 AS start_seconds, (segment->>'end_seconds')::float8 AS end_seconds
+                        FROM jsonb_array_elements(mf.marker_segments) AS segment
+                        UNION ALL VALUES ('intro', mf.intro_start, mf.intro_end), ('credits', mf.credits_start, mf.credits_end),
+                            ('recap', mf.recap_start, mf.recap_end), ('preview', mf.preview_start, mf.preview_end)
+                    ) AS marker
+                    WHERE marker.kind IN ('intro', 'credits', 'recap', 'preview')
+                      AND mf.duration > 0 AND marker.start_seconds >= 0 AND marker.start_seconds < mf.duration + 1
+                      AND marker.end_seconds > marker.start_seconds AND marker.end_seconds <= mf.duration + 1
+                )
+                AND (jsonb_array_length(mf.marker_thumbnails) = 0 OR EXISTS (
+                    SELECT 1 FROM jsonb_array_elements(mf.marker_thumbnails) AS marker
+                    WHERE right(COALESCE(marker->>'thumbnail_path', ''), length($2)) <> $2
+                    AND (COALESCE(marker->>'thumbnail_retry_after', '') = '' OR (marker->>'thumbnail_retry_after')::timestamptz <= NOW())
+                )))
+            OR (
 				jsonb_typeof(mf.chapters) = 'array'
 				AND jsonb_array_length(mf.chapters) > 0
 				AND EXISTS (
@@ -5953,7 +5983,7 @@ func (r *FileRepository) ListChapterThumbnailsAtOtherWidths(ctx context.Context,
 		  AND NOT ($4::boolean AND `+chapterHDRFileSQL+`)
 		  AND EXISTS (
 			SELECT 1 FROM jsonb_array_elements(
-				CASE WHEN jsonb_typeof(mf.chapters) = 'array' THEN mf.chapters ELSE '[]'::jsonb END
+				(CASE WHEN jsonb_typeof(mf.chapters) = 'array' THEN mf.chapters ELSE '[]'::jsonb END) || mf.marker_thumbnails
 			) AS chapter
 			WHERE right(COALESCE(chapter->>'thumbnail_path', ''), length($2)) <> $2
 			  AND (COALESCE(chapter->>'thumbnail_retry_after', '') = ''
@@ -5985,7 +6015,7 @@ func (r *FileRepository) ListChapterThumbnailsAtOtherWidths(ctx context.Context,
 		FROM media_files mf
 		JOIN media_folders folders ON folders.id = mf.media_folder_id
 		CROSS JOIN LATERAL jsonb_array_elements(
-			CASE WHEN jsonb_typeof(mf.chapters) = 'array' THEN mf.chapters ELSE '[]'::jsonb END
+			(CASE WHEN jsonb_typeof(mf.chapters) = 'array' THEN mf.chapters ELSE '[]'::jsonb END) || mf.marker_thumbnails
 		) AS chapter
 		WHERE mf.missing_since IS NULL
 		  AND folders.enabled = true

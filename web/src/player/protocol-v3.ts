@@ -180,8 +180,44 @@ export const FEATURE_INVENTORY_UPDATED_V3 = "inventory_updated_event_v1";
  */
 export const FEATURE_DEFERRED_TRACK_INVENTORY_V3 = "deferred_track_inventory_v1";
 
-/** The `original` rung label, which always preserves the source. */
+/**
+ * `original_http` validated claim: the client maps `selected_tracks.audio.index`
+ * onto the file's own audio tracks, so a non-default track needs no remux.
+ */
+export const CLAIM_CLIENT_SELECTED_AUDIO_TRACK_V3 = "client_selected_audio_track_v1";
+
+/**
+ * `original_http` validated claim: the client accepts HDR and Dolby Vision
+ * originals and resolves presentation for the live output itself.
+ */
+export const CLAIM_CLIENT_MANAGED_DYNAMIC_RANGE_V3 = "client_managed_dynamic_range_v1";
+
+/**
+ * The source-preserving rung label. Vio keeps it as its own quality choice
+ * rather than collapsing it into `auto`; the server publishes it when the
+ * source fits the configured cap.
+ */
 export const QUALITY_ORIGINAL_V3 = "original";
+
+/**
+ * A stored or chosen quality preference in the form the client works with.
+ * Empty reads as `auto`; the legacy source labels ("source", "max") read as
+ * {@link QUALITY_ORIGINAL_V3}, which Vio keeps as its own choice; anything
+ * else, including `original`, passes through trimmed.
+ */
+export function normalizeQualityPreferenceV3(value: string | null | undefined): string {
+  const trimmed = value?.trim() ?? "";
+  switch (trimmed.toLowerCase()) {
+    case "":
+    case "auto":
+      return "auto";
+    case "source":
+    case "max":
+      return QUALITY_ORIGINAL_V3;
+    default:
+      return trimmed;
+  }
+}
 
 /** Server-executed transformation names a plan can list. */
 export const TRANSFORMATION_AUDIO_TO_AAC_V3 = "audio_to_aac";
@@ -363,7 +399,6 @@ export interface StartRequestV3 {
   force_relink?: boolean;
   subtitle_track_id?: string;
   subtitle_track_index?: number;
-  metered: boolean;
   bandwidth_estimate_kbps?: number;
   bandwidth_cap_kbps?: number;
   client_capabilities: ClientCodecCapabilitiesV3;
@@ -400,7 +435,6 @@ export interface ReplanRequestV3 {
   attempt_count: number;
   quality_preference: string;
   position_seconds: number;
-  metered: boolean;
   /**
    * Re-negotiates the session's version-fallback intent. Set when the viewer
    * re-arms Auto mid-session so a later dead-source recovery rotates even

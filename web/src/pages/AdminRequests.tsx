@@ -837,7 +837,7 @@ function useConnectionOptions(
           setStatus("error");
         }
       });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only a new debounced signature or load permission refetches.
   }, [debouncedSig, canLoad]);
   return { options, status };
 }
@@ -1051,8 +1051,7 @@ function IntegrationEditor({
       capability_id: soleInstallation.capability.id,
       ...(defaults ? { base_url: defaults.baseURL, api_key_ref: defaults.apiKey } : {}),
     });
-    // onChange identity is stable per card; intentionally depend on the data only.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- onChange is stable per card; depend on the installation data only.
   }, [form.installation_id, soleInstallationID]);
 
   const selectedInstallationID = Number(form.installation_id);
@@ -1096,7 +1095,7 @@ function IntegrationEditor({
     if (Object.keys(updates).length > 0) {
       onChange(updates);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only the selected plugin's defaults and name seed the form.
   }, [selectedDefaults?.baseURL, selectedDefaults?.apiKey, selected?.capability.display_name]);
 
   // Switching the selected plugin must drop the previous plugin's config (so its

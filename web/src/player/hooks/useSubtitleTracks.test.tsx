@@ -1,6 +1,9 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
 import type { RefObject } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { EnginePlayer } from "../engine/EnginePlayer";
+import { attachEngineToElement } from "../engine/facade";
+import { EngineTextTrack } from "../engine/textTracks";
 import type { PlayerSubtitleInfo } from "../types";
 import { useSubtitleTracks } from "./useSubtitleTracks";
 
@@ -268,6 +271,54 @@ describe("useSubtitleTracks", () => {
     },
   );
 
+  it("moves a selected track onto the browser engine once its metadata arrives", async () => {
+    fetchMock.mockResolvedValue(vttResponse("WEBVTT\n\n00:00:10.000 --> 00:00:12.000\nhi\n\n"));
+    const videoRef = makeVideoRef(1);
+    const { result, rerender } = renderHook(
+      ({ generation }) =>
+        useSubtitleTracks(
+          videoRef,
+          [srtTrack],
+          1,
+          0,
+          0,
+          { current: 7200 },
+          { current: 0 },
+          undefined,
+          null,
+          generation,
+        ),
+      { initialProps: { generation: 0 } },
+    );
+    // The track is built on the native element before the engine has loaded.
+    await waitFor(() => expect(createdTracks[0]?.cues).toHaveLength(1));
+
+    // The engine takes over the element, then reports loadedmetadata on it,
+    // which VideoPlayer turns into a stream generation bump.
+    const engineTracks: EngineTextTrack[] = [];
+    const engine = {
+      readyState: 1,
+      currentTime: 0,
+      paused: true,
+      volume: 1,
+      muted: false,
+      addTextTrack: (kind: TextTrackKind, label: string, language: string) => {
+        const track = new EngineTextTrack(kind, label, language);
+        engineTracks.push(track);
+        return track;
+      },
+    };
+    const detach = attachEngineToElement(videoRef.current!, engine as unknown as EnginePlayer);
+    rerender({ generation: 1 });
+
+    await waitFor(() => expect(engineTracks).toHaveLength(1));
+    // The fetched cues carry over, and the engine's clock drives them.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    act(() => engineTracks[0]!.update(11));
+    expect(result.current).toEqual(["hi"]);
+    detach();
+  });
+
   it("refetches retimed cues behind an unchanged URL when the cue revision changes", async () => {
     fetchMock
       .mockResolvedValueOnce(vttResponse("WEBVTT\n\n00:00:10.000 --> 00:00:12.000\nold\n\n"))
@@ -475,7 +526,7 @@ describe("useSubtitleTracks", () => {
   it("keeps retrying explicitly-retryable 503s past the terminal ceiling", async () => {
     vi.useFakeTimers();
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
-    fetchMock.mockResolvedValue({ ok: false, status: 503 } as unknown as Response);
+    fetchMock.mockResolvedValue(new Response(null, { status: 503 }));
     const { videoRef, unmount } = renderTracks({ origin: 0, durationRef: { current: 7200 } });
     try {
       await act(async () => {
@@ -675,11 +726,10 @@ describe("subtitle loading recovery", () => {
 
 describe("subtitle source changed", () => {
   function errorResponse(status: number, body?: unknown) {
-    return {
-      ok: false,
+    return new Response(body === undefined ? null : JSON.stringify(body), {
       status,
-      json: vi.fn().mockResolvedValue(body),
-    } as unknown as Response;
+      headers: { "Content-Type": "application/json" },
+    });
   }
 
   function renderWithSourceChanged() {
@@ -707,7 +757,9 @@ describe("subtitle source changed", () => {
   it("signals onSourceChanged once on 409 subtitle_source_changed and schedules no retry", async () => {
     vi.useFakeTimers();
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
-    fetchMock.mockResolvedValue(errorResponse(409, { error: "subtitle_source_changed" }));
+    fetchMock.mockImplementation(() =>
+      Promise.resolve(errorResponse(409, { error: "subtitle_source_changed" })),
+    );
     const { onSourceChanged, unmount } = renderWithSourceChanged();
     try {
       await act(async () => {
@@ -730,7 +782,7 @@ describe("subtitle source changed", () => {
   it("does not signal onSourceChanged on a generic 500 and still backs off", async () => {
     vi.useFakeTimers();
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
-    fetchMock.mockResolvedValue(errorResponse(500, { error: "internal" }));
+    fetchMock.mockImplementation(() => Promise.resolve(errorResponse(500, { error: "internal" })));
     const { onSourceChanged, unmount } = renderWithSourceChanged();
     try {
       await act(async () => {
@@ -751,7 +803,7 @@ describe("subtitle source changed", () => {
   it("keeps the generic-failure backoff path for a 404", async () => {
     vi.useFakeTimers();
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
-    fetchMock.mockResolvedValue(errorResponse(404, { error: "missing" }));
+    fetchMock.mockImplementation(() => Promise.resolve(errorResponse(404, { error: "missing" })));
     const { onSourceChanged, unmount } = renderWithSourceChanged();
     try {
       await act(async () => {
@@ -772,7 +824,9 @@ describe("subtitle source changed", () => {
   it("does not signal onSourceChanged again when a rebuilt track retries the same source generation", async () => {
     vi.useFakeTimers();
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
-    fetchMock.mockResolvedValue(errorResponse(409, { error: "subtitle_source_changed" }));
+    fetchMock.mockImplementation(() =>
+      Promise.resolve(errorResponse(409, { error: "subtitle_source_changed" })),
+    );
     const videoRef = makeVideoRef();
     const onSourceChanged = vi.fn();
     const { rerender, unmount } = renderHook(

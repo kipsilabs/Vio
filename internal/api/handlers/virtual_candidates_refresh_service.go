@@ -137,8 +137,11 @@ type VirtualCandidatesRefreshService struct {
 	// the listing, while the detached work — and the chain scheduled from it —
 	// continues. The callback must be non-blocking: admission (an atomic
 	// check) only; the chain's own reads and probing happen in admitted work.
+	// The access filter is the one that authorized the discovery run (the
+	// singleflight winner's, when callers coalesce), so the chain resolves the
+	// same visible default the discovery response offered.
 	// PlaybackHandler.ScheduleDefaultFileProbe implements this.
-	ScheduleDefaultFileProbe func(contentID string, source *models.MediaFile, streams []VirtualPlaybackStream)
+	ScheduleDefaultFileProbe func(contentID string, source *models.MediaFile, streams []VirtualPlaybackStream, filter catalog.AccessFilter)
 
 	flight singleflight.Group
 }
@@ -218,7 +221,7 @@ func (s *VirtualCandidatesRefreshService) listVirtualCandidates(ctx context.Cont
 		// own cancellation while waiting via the select below.
 		workCtx := context.WithoutCancel(ctx)
 		refreshCh := s.flight.DoChan(key, func() (any, error) {
-			_, err := s.listSource(workCtx, source, userID, profileID, lister, chainKey)
+			_, err := s.listSource(workCtx, source, userID, profileID, lister, chainKey, filter)
 			return nil, err
 		})
 		var refreshRes singleflight.Result
@@ -328,10 +331,10 @@ func (s *VirtualCandidatesRefreshService) RefreshSources(ctx context.Context, co
 // empty chain key schedules nothing: refresh runs target rows through their
 // own job machinery.
 func (s *VirtualCandidatesRefreshService) refreshSource(ctx context.Context, source *models.MediaFile, userID int, profileID string) ([]VirtualPlaybackStream, error) {
-	return s.listSource(ctx, source, userID, profileID, s.ListFresh, "")
+	return s.listSource(ctx, source, userID, profileID, s.ListFresh, "", catalog.AccessFilter{})
 }
 
-func (s *VirtualCandidatesRefreshService) listSource(ctx context.Context, source *models.MediaFile, userID int, profileID string, lister VirtualPlaybackStreamLister, chainKey string) ([]VirtualPlaybackStream, error) {
+func (s *VirtualCandidatesRefreshService) listSource(ctx context.Context, source *models.MediaFile, userID int, profileID string, lister VirtualPlaybackStreamLister, chainKey string, filter catalog.AccessFilter) ([]VirtualPlaybackStream, error) {
 	if source == nil {
 		return nil, nil
 	}
@@ -364,10 +367,11 @@ func (s *VirtualCandidatesRefreshService) listSource(ctx context.Context, source
 		// winner whose waiter has already disconnected still schedules it.
 		// The callback only admits and snapshots; it must never delay the shared
 		// answer coalesced waiters read. Pass a copy so the singleflight value
-		// cannot be aliased by the chain.
+		// cannot be aliased by the chain. The filter is the winner's — for a
+		// coalesced wave that is the run whose persistence this is.
 		copied := make([]VirtualPlaybackStream, len(streams))
 		copy(copied, streams)
-		s.ScheduleDefaultFileProbe(chainKey, source, copied)
+		s.ScheduleDefaultFileProbe(chainKey, source, copied, filter)
 	}
 	return streams, nil
 }

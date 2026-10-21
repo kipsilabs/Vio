@@ -6,18 +6,26 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
 	"github.com/Silo-Server/silo-server/internal/auth"
 	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/config"
 	"github.com/Silo-Server/silo-server/internal/downloads"
+	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/nodepool"
+	"github.com/Silo-Server/silo-server/internal/playback"
+	policyengine "github.com/Silo-Server/silo-server/internal/policy"
 	"github.com/Silo-Server/silo-server/internal/streamtoken"
 )
 
@@ -37,6 +45,7 @@ type fakeDownloadService struct {
 	patchErr       error
 	serveErr       error
 	serveBody      string
+	directBody     string
 	directErr      error
 	manifest       *downloads.OfflineManifest
 	batchManifests []*downloads.OfflineManifest
@@ -178,6 +187,9 @@ func (f *fakeDownloadService) SyncSubscriptions(_ context.Context, userID int, p
 func (f *fakeDownloadService) ServeDirect(_ context.Context, w http.ResponseWriter, _ *http.Request, _, fileID int, format string, _ catalog.AccessFilter) error {
 	f.gotDirectFileID = fileID
 	f.gotDirectFormat = format
+	if f.directBody != "" {
+		_, _ = w.Write([]byte(f.directBody))
+	}
 	if f.directErr != nil {
 		return f.directErr
 	}
@@ -370,6 +382,184 @@ func TestHandleCreateDownloadThreadsQuality(t *testing.T) {
 	if resp.Quality != downloads.Quality5Mbps || resp.DeliveryFormat != downloads.FormatTranscode ||
 		resp.TargetBitrateKbps != 5000 || resp.Revision != 2 {
 		t.Fatalf("response = %+v, want quality/delivery/bitrate/revision", resp)
+	}
+}
+
+func TestHandleCreateDownloadPreservesBoundedSoftwareDecodeEvidence(t *testing.T) {
+	svc := &fakeDownloadService{created: &downloads.Download{
+		ID: "dl1", ContentID: "c1", Status: downloads.StatusQueued,
+		Format: downloads.FormatOriginal, Quality: downloads.QualityOriginal,
+		EffectiveQuality: downloads.QualityOriginal,
+	}}
+	h := NewDownloadHandler(svc)
+	body := []byte(`{
+		"content_id":"c1",
+		"quality":"original",
+		"caps":{
+			"client_features":["software_video_decode_v1"],
+			"video_evidence":"platform_attested",
+			"codecs_video":["av1"],
+			"codecs_audio":["aac"],
+			"containers":["mp4"],
+			"max_resolution":"2160p",
+			"video_decode":[{
+				"codec":"av1","bit_depths":[8,10],"max_width":1920,
+				"max_height":1080,"max_frame_rate":60,
+				"max_bitrate_kbps":40000,"hardware":false
+			}]
+		}
+	}`)
+	rec := httptest.NewRecorder()
+	h.HandleCreateDownload(rec, downloadTestRequest(http.MethodPost, "/downloads", body, 7, "", ""))
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 (body: %s)", rec.Code, rec.Body.String())
+	}
+	caps := svc.gotCreateReq.Caps
+	if caps.VideoEvidence != playback.EvidencePlatformAttestedV3 ||
+		len(caps.ClientFeatures) != 1 || caps.ClientFeatures[0] != playback.FeatureSoftwareVideoDecodeV3 ||
+		len(caps.VideoDecode) != 1 || caps.VideoDecode[0].MaxWidth != 1920 ||
+		caps.VideoDecode[0].Hardware {
+		t.Fatalf("service received altered software evidence: %+v", caps)
+	}
+}
+
+func TestHandleCreateDownloadRejectsUnboundedDetailedDecoderInput(t *testing.T) {
+	svc := &fakeDownloadService{}
+	h := NewDownloadHandler(svc)
+	body := []byte(`{
+		"content_id":"c1",
+		"caps":{
+			"client_features":["software_video_decode_v1"],
+			"video_evidence":"platform_attested",
+			"codecs_video":["av1"],
+			"video_decode":[{"codec":"av1","max_width":-1,"hardware":false}]
+		}
+	}`)
+	rec := httptest.NewRecorder()
+	h.HandleCreateDownload(rec, downloadTestRequest(http.MethodPost, "/downloads", body, 7, "", ""))
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if svc.gotCreateReq.ContentID != "" {
+		t.Fatal("invalid detailed decoder evidence reached the download service")
+	}
+}
+
+// Flat-list payloads are legal at every evidence tier on the v3 playback start
+// path, so download creation must accept the same shapes rather than 400 on
+// them. Only video_decode entries the tier cannot validate are refused.
+func TestHandleCreateDownloadAcceptsFlatCapabilityPayloads(t *testing.T) {
+	tests := []struct {
+		name string
+		caps string
+	}{
+		{
+			name: "declared evidence with flat lists",
+			caps: `{
+				"video_evidence":"declared",
+				"codecs_video":["h264","hevc"],
+				"codecs_audio":["aac"],
+				"containers":["mp4"],
+				"max_resolution":"1080p"
+			}`,
+		},
+		{
+			name: "feature token only",
+			caps: `{
+				"client_features":["software_video_decode_v1"],
+				"codecs_video":["av1"],
+				"codecs_audio":["aac"],
+				"containers":["mp4"]
+			}`,
+		},
+		{
+			name: "platform attested without entries",
+			caps: `{
+				"client_features":["software_video_decode_v1"],
+				"video_evidence":"platform_attested",
+				"codecs_video":["av1"]
+			}`,
+		},
+		{
+			name: "legacy flat payload",
+			caps: `{
+				"codecs_video":["h264"],
+				"codecs_audio":["aac"],
+				"containers":["mp4"],
+				"max_resolution":"1080p"
+			}`,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := &fakeDownloadService{created: &downloads.Download{
+				ID: "dl1", ContentID: "c1", Status: downloads.StatusQueued,
+				Format: downloads.FormatOriginal, Quality: downloads.QualityOriginal,
+				EffectiveQuality: downloads.QualityOriginal,
+			}}
+			h := NewDownloadHandler(svc)
+			body := []byte(`{"content_id":"c1","quality":"original","caps":` + tc.caps + `}`)
+			rec := httptest.NewRecorder()
+			h.HandleCreateDownload(rec, downloadTestRequest(http.MethodPost, "/downloads", body, 7, "", ""))
+
+			if rec.Code != http.StatusAccepted {
+				t.Fatalf("status = %d, want 202 (body: %s)", rec.Code, rec.Body.String())
+			}
+			if len(svc.gotCreateReq.Caps.CodecsVideo) == 0 {
+				t.Fatalf("service received no flat codec list: %+v", svc.gotCreateReq.Caps)
+			}
+		})
+	}
+}
+
+// A misspelled evidence tier on an otherwise flat payload must 400 exactly as
+// it does on the v3 playback start path. Accepting it would degrade the client
+// to flat resolution with no signal that its tier was never read.
+func TestHandleCreateDownloadRejectsUnknownVideoEvidenceOnFlatPayloads(t *testing.T) {
+	svc := &fakeDownloadService{}
+	h := NewDownloadHandler(svc)
+	body := []byte(`{
+		"content_id":"c1",
+		"caps":{
+			"video_evidence":"exat",
+			"codecs_video":["h264"],
+			"codecs_audio":["aac"],
+			"containers":["mp4"],
+			"max_resolution":"1080p"
+		}
+	}`)
+	rec := httptest.NewRecorder()
+	h.HandleCreateDownload(rec, downloadTestRequest(http.MethodPost, "/downloads", body, 7, "", ""))
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if svc.gotCreateReq.ContentID != "" {
+		t.Fatal("an unrecognized video_evidence tier reached the download service")
+	}
+}
+
+func TestHandleCreateDownloadRejectsDetailedEntriesWithoutStrictEvidence(t *testing.T) {
+	svc := &fakeDownloadService{}
+	h := NewDownloadHandler(svc)
+	body := []byte(`{
+		"content_id":"c1",
+		"caps":{
+			"video_evidence":"declared",
+			"codecs_video":["av1"],
+			"video_decode":[{"codec":"av1","max_width":1920,"hardware":true}]
+		}
+	}`)
+	rec := httptest.NewRecorder()
+	h.HandleCreateDownload(rec, downloadTestRequest(http.MethodPost, "/downloads", body, 7, "", ""))
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if svc.gotCreateReq.ContentID != "" {
+		t.Fatal("unvalidatable video_decode entries reached the download service")
 	}
 }
 
@@ -738,6 +928,54 @@ func TestHandleDirectDownloadThreadsOriginalFormat(t *testing.T) {
 	}
 }
 
+// A transfer that fails after the file's headers and first bytes went out
+// aborts the response instead of appending a JSON 500, and logs only when the
+// failure is the server's: a client that left has canceled the request.
+func TestHandleDirectDownloadAbortsAfterResponseCommitted(t *testing.T) {
+	routes := map[string]func(*DownloadHandler, http.ResponseWriter, *http.Request){
+		"direct": (*DownloadHandler).HandleDirectDownload,
+		"proxy":  (*DownloadHandler).HandleDirectDownloadViaProxy,
+	}
+	for name, handle := range routes {
+		for _, clientLeft := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/client_left=%v", name, clientLeft), func(t *testing.T) {
+				var logs bytes.Buffer
+				previous := slog.Default()
+				slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+				t.Cleanup(func() { slog.SetDefault(previous) })
+
+				svc := &fakeDownloadService{
+					directBody: "partial",
+					directErr:  fmt.Errorf("serving download: %w", downloads.ErrResponseCommitted),
+				}
+				req := downloadTestRequest(http.MethodGet, "/direct-download?file_id=42", nil, 7, "", "")
+				if clientLeft {
+					ctx, cancel := context.WithCancel(req.Context())
+					cancel()
+					req = req.WithContext(ctx)
+				}
+				rec := httptest.NewRecorder()
+				func() {
+					defer func() {
+						if got := recover(); got != http.ErrAbortHandler { //nolint:errorlint // sentinel compared by identity, as net/http does
+							t.Fatalf("panic = %v, want http.ErrAbortHandler", got)
+						}
+					}()
+					handle(NewDownloadHandler(svc), rec, req)
+				}()
+
+				if rec.Body.String() != "partial" {
+					t.Fatalf("body = %q, want the partial file only", rec.Body.String())
+				}
+				logged := strings.Contains(logs.String(), "direct download failed after the response started")
+				if logged == clientLeft || strings.Contains(logs.String(), "level=ERROR") {
+					t.Fatalf("client left = %v, logs = %q", clientLeft, logs.String())
+				}
+			})
+		}
+	}
+}
+
 func TestHandleDirectDownloadViaProxyRedirectsToProxy(t *testing.T) {
 	const secret = "download-proxy-secret"
 	maxJobs := 1
@@ -884,6 +1122,107 @@ func TestHandleDirectDownloadUnknownFileIsNotFound(t *testing.T) {
 				t.Fatalf("status = %d, want 404 (body: %s)", rec.Code, rec.Body.String())
 			}
 		})
+	}
+}
+
+// ceilingOverrideDecider stands in for a custom action override that keeps
+// every download grant but narrows the download quality ceiling to 1080p.
+type ceilingOverrideDecider struct{}
+
+func (ceilingOverrideDecider) CheckAction(context.Context, policyengine.ActionInput) (policyengine.ActionDecision, policyengine.Meta, error) {
+	return policyengine.ActionDecision{Allowed: true, QualityCeiling: "1080p"}, policyengine.Meta{}, nil
+}
+
+type singleFileRepo struct {
+	downloads.FileResolver
+	file *models.MediaFile
+}
+
+func (r singleFileRepo) GetByID(context.Context, int) (*models.MediaFile, error) { return r.file, nil }
+
+type singleUserRepo struct{ user *models.User }
+
+func (r singleUserRepo) GetByID(context.Context, int) (*models.User, error) { return r.user, nil }
+
+type openItemAccess struct{}
+
+func (openItemAccess) EnsureAccessible(context.Context, string, catalog.AccessFilter) error {
+	return nil
+}
+
+type countingLinkIssuer struct{ calls int }
+
+func (i *countingLinkIssuer) GenerateDirectDownloadLinkToken(int, string, string, string, *int, int) (string, time.Time, error) {
+	i.calls++
+	return "link-token", time.Now().Add(time.Minute), nil
+}
+
+// overrideCeilingDownloadService is the real download service over one
+// on-disk file of the given resolution, with a 1080p override ceiling.
+func overrideCeilingDownloadService(t *testing.T, resolution string) *downloads.Service {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "movie-"+resolution+".mkv")
+	if err := os.WriteFile(path, []byte("original bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	allowed := true
+	cfg := config.DownloadConfig{Enabled: true}
+	svc := downloads.NewService(nil, nil, nil,
+		singleFileRepo{file: &models.MediaFile{ID: 42, ContentID: "movie", FilePath: path, Resolution: resolution}},
+		nil, nil, singleUserRepo{user: &models.User{ID: 7, DownloadAllowed: &allowed}}, openItemAccess{}, nil, &cfg)
+	svc.SetActionDecider(ceilingOverrideDecider{})
+	return svc
+}
+
+// TestDirectDownloadRefusesOriginalAboveOverrideCeiling is the #2234
+// regression: every direct-download entry point (GET and HEAD, the
+// proxy-aware variant, and link minting) refuses a 2160p original under a
+// 1080p override ceiling with the policy denial, and serves nothing.
+func TestDirectDownloadRefusesOriginalAboveOverrideCeiling(t *testing.T) {
+	svc := overrideCeilingDownloadService(t, "2160p")
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		t.Run("direct_"+method, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			NewDownloadHandler(svc).HandleDirectDownload(rec, downloadTestRequest(method, "/direct-download?file_id=42", nil, 7, "", ""))
+			if rec.Code != http.StatusForbidden || strings.Contains(rec.Body.String(), "original bytes") {
+				t.Fatalf("status = %d body = %q, want 403 without file bytes", rec.Code, rec.Body.String())
+			}
+		})
+		t.Run("proxy_"+method, func(t *testing.T) {
+			proxyRequests := 0
+			proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				proxyRequests++
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer proxy.Close()
+			proxies := nodepool.NewProxyPool()
+			proxies.SetNodes([]*nodepool.Node{{URL: proxy.URL, Enabled: true, Healthy: true}})
+			h := NewDownloadHandler(svc)
+			h.SetProxyDelivery(nodepool.NewPlanner(proxies, nodepool.NewTranscodePool()), func() string { return "secret" })
+			rec := httptest.NewRecorder()
+			h.HandleDirectDownloadViaProxy(rec, downloadTestRequest(method, "/direct-download-proxy?file_id=42", nil, 7, "", ""))
+			if rec.Code != http.StatusForbidden || rec.Header().Get("Location") != "" || proxyRequests != 0 {
+				t.Fatalf("status = %d location = %q proxy requests = %d, want 403 with no redirect", rec.Code, rec.Header().Get("Location"), proxyRequests)
+			}
+		})
+	}
+	t.Run("link", func(t *testing.T) {
+		issuer := &countingLinkIssuer{}
+		h := NewDownloadHandler(svc)
+		h.SetDirectDownloadLinks(issuer)
+		ctx := apimw.SetProfileID(apimw.SetClaims(context.Background(), &auth.Claims{
+			UserID: 7, Role: "user", SessionID: "s1", TokenType: auth.TokenTypeAccess,
+		}), "p1")
+		if _, _, err := h.CreateDirectDownloadLink(ctx, 42); !errors.Is(err, downloads.ErrDownloadNotAllowed) || issuer.calls != 0 {
+			t.Fatalf("CreateDirectDownloadLink() error = %v, issuer calls = %d; want ErrDownloadNotAllowed and no link", err, issuer.calls)
+		}
+	})
+
+	// The same override leaves a file at the ceiling downloadable.
+	rec := httptest.NewRecorder()
+	NewDownloadHandler(overrideCeilingDownloadService(t, "1080p")).HandleDirectDownload(rec, downloadTestRequest(http.MethodGet, "/direct-download?file_id=42", nil, 7, "", ""))
+	if rec.Code != http.StatusOK || rec.Body.String() != "original bytes" {
+		t.Fatalf("1080p original: status = %d body = %q, want 200 with the file", rec.Code, rec.Body.String())
 	}
 }
 

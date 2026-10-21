@@ -1,7 +1,8 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
+import { forgetBandwidthEstimate, recordObservedBandwidthLimitKbps } from "../bandwidth-probe";
 import { PlayerConfigProvider, type PlayerConfig } from "../context/PlayerConfigContext";
 import { markPlaybackIntent } from "../first-frame";
 import {
@@ -79,6 +80,7 @@ function jsonResponse(body: unknown, init: ResponseInit = {}) {
 afterEach(() => {
   resetCodecDetectionForTests();
   resetSessionMutations();
+  forgetBandwidthEstimate();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
@@ -90,7 +92,6 @@ const startBase = {
   qualityPreference: "auto",
   position: 0,
   forceStartPosition: false,
-  metered: false,
   clientCapabilities: fixtureClientCapabilitiesV3(),
   clientPlaybackContext: fixtureClientPlaybackContextV3(),
 };
@@ -104,7 +105,6 @@ const replanBase = {
   positionSeconds: 120,
   attemptedPlanKeys: [],
   attemptCount: 1,
-  metered: false,
   clientCapabilities: fixtureClientCapabilitiesV3(),
   clientPlaybackContext: fixtureClientPlaybackContextV3(),
 };
@@ -135,6 +135,7 @@ describe("buildStartRequestV3", () => {
     ).toEqual([
       "playback_plan_v3",
       "plan_invalidated_v1",
+      "marker_thumbnails_v1",
       "default_audio_reconcile_response_v1",
       "source_committed_event_v1",
       "inventory_updated_event_v1",
@@ -219,6 +220,11 @@ describe("buildStartRequestV3", () => {
     ).toMatchObject({ bandwidth_estimate_kbps: 25_000, bandwidth_cap_kbps: 6_000 });
   });
 
+  // The server ignores `metered`; a metered link only stops a measurement.
+  it("sends no metered flag", () => {
+    expect(buildStartRequestV3(startBase)).not.toHaveProperty("metered");
+  });
+
   it("sends the quality preference verbatim for the server to normalize", () => {
     expect(buildStartRequestV3({ ...startBase, qualityPreference: "original" })).toMatchObject({
       quality_preference: "original",
@@ -261,6 +267,7 @@ describe("buildReplanRequestV3", () => {
     ).toEqual([
       "playback_plan_v3",
       "plan_invalidated_v1",
+      "marker_thumbnails_v1",
       "default_audio_reconcile_response_v1",
       "source_committed_event_v1",
       "inventory_updated_event_v1",
@@ -409,6 +416,19 @@ describe("buildReplanRequestV3", () => {
     expect(body.quality_preference).toBe("original");
   });
 
+  it("sends a measured estimate when there is one, and no metered flag", () => {
+    const body = buildReplanRequestV3({ ...replanBase, operation: "quality_change" });
+    expect(body).not.toHaveProperty("bandwidth_estimate_kbps");
+    expect(body).not.toHaveProperty("metered");
+    expect(
+      buildReplanRequestV3({
+        ...replanBase,
+        operation: "quality_change",
+        bandwidthEstimateKbps: 4_200,
+      }),
+    ).toMatchObject({ bandwidth_estimate_kbps: 4_200 });
+  });
+
   it("preserves the user bandwidth ceiling across replans", () => {
     const body = buildReplanRequestV3({
       ...replanBase,
@@ -480,6 +500,15 @@ describe("usePlaybackSession quality changes", () => {
       throw new Error(`Unexpected request: ${url}`);
     });
     vi.stubGlobal("fetch", fetchMock);
+    // Only the browser's rounded downlink hint is available, which is a guess:
+    // no request may carry it as an estimate.
+    Object.defineProperty(navigator, "connection", {
+      configurable: true,
+      value: { downlink: 4.5 },
+    });
+    onTestFinished(() => {
+      delete (navigator as Navigator & { connection?: unknown }).connection;
+    });
 
     const { result, unmount } = renderHook(
       () => usePlaybackSession("request-1", [], [], 7, 0, false, "original"),
@@ -487,6 +516,7 @@ describe("usePlaybackSession quality changes", () => {
     );
 
     await waitFor(() => expect(result.current.plan).not.toBeNull());
+    expect(result.current.qualityPreference).toBe("original");
 
     act(() => result.current.changeQuality("720p", 120));
     await waitFor(() => {
@@ -506,6 +536,93 @@ describe("usePlaybackSession quality changes", () => {
       .filter(([url]) => String(url).endsWith("/playback/session-1/replan"))
       .map(([, init]) => JSON.parse(String(init?.body)) as { quality_preference: string });
     expect(replanBodies.map((body) => body.quality_preference)).toEqual(["720p", "original"]);
+
+    const startBody = JSON.parse(
+      String(
+        fetchMock.mock.calls.find(([url]) => String(url).endsWith("/playback/start"))?.[1]?.body,
+      ),
+    ) as Record<string, unknown>;
+    expect(startBody.quality_preference).toBe("original");
+    for (const body of [startBody, ...replanBodies]) {
+      expect(body).not.toHaveProperty("bandwidth_estimate_kbps");
+      expect(body).not.toHaveProperty("metered");
+    }
+
+    unmount();
+  });
+
+  it("replans Auto with the lower estimate a stall step-down recorded", async () => {
+    const plan = fixturePlanV3();
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: plan,
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/session-1/replan")) {
+        return jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "playable",
+          session_id: "session-1",
+          playback_plan: fixturePlanV3({
+            plan_id: "plan:fedcba9876543210",
+            plan_attempt_key: "v3:fedcba9876543210",
+          }),
+        });
+      }
+      if (url.endsWith("/playback/route-events")) {
+        return new Response(null, { status: 202 });
+      }
+      if (init?.method === "DELETE") {
+        return jsonResponse({ outcome: "stopped" });
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const bodiesTo = (suffix: string) =>
+      fetchMock.mock.calls
+        .filter(([url]) => String(url).endsWith(suffix))
+        .map(([, init]) => JSON.parse(String(init?.body)) as Record<string, unknown>);
+
+    // The viewer's saved maximum is 8 Mbps.
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto", 8_000),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+    // Nothing was measured yet, so Auto starts without an estimate.
+    expect(bodiesTo("/playback/start")[0]).not.toHaveProperty("bandwidth_estimate_kbps");
+    expect(bodiesTo("/playback/start")[0]?.bandwidth_cap_kbps).toBe(8_000);
+
+    // What VideoPlayer does when Auto keeps stalling: record the lower
+    // estimate, then replan Auto.
+    recordObservedBandwidthLimitKbps(4_200);
+    act(() => result.current.changeQuality("auto", 120));
+    await waitFor(() => expect(bodiesTo("/playback/session-1/replan")).toHaveLength(1));
+    expect(bodiesTo("/playback/session-1/replan")[0]).toMatchObject({
+      operation: "quality_change",
+      quality_preference: "auto",
+      bandwidth_estimate_kbps: 4_200,
+      bandwidth_cap_kbps: 8_000,
+    });
+    await waitFor(() => expect(result.current.replanning).toBe(false));
+
+    // The cap stays the viewer's own saved maximum on a fixed quality too.
+    act(() => result.current.changeQuality("720p", 130));
+    await waitFor(() => expect(bodiesTo("/playback/session-1/replan")).toHaveLength(2));
+    expect(bodiesTo("/playback/session-1/replan")[1]).toMatchObject({
+      quality_preference: "720p",
+      bandwidth_cap_kbps: 8_000,
+    });
 
     unmount();
   });
@@ -9798,6 +9915,97 @@ describe("usePlaybackSession mid-stream reconnect", () => {
 
     expect(harness.replanBodies).toHaveLength(1);
     expect(result.current.connectionStatus).toBe("reconnecting");
+
+    unmount();
+  });
+
+  it("ends instead of starting a new session when an administrator ended the session", async () => {
+    const harness = reconnectHarness({
+      replan: () =>
+        jsonResponse(
+          {
+            type: "https://siloserver.org/docs/api/v2/problems/playback_session_ended",
+            title: "Playback session ended",
+            status: 410,
+            detail: "An administrator ended this playback session",
+          },
+          { status: 410 },
+        ),
+      restart: () => jsonResponse(playable("session-2"), { status: 201 }),
+    });
+    const { result, unmount } = await startPlaying();
+
+    act(() => result.current.recoverConnection(240, true));
+    await advance(RECONNECT_BASE_DELAY_MS);
+
+    expect(harness.replanBodies).toHaveLength(1);
+    expect(harness.startBodies).toHaveLength(1);
+    expect(result.current.connectionStatus).toBe("ended");
+    expect(result.current.sessionId).toBe("session-1");
+
+    // Nothing retries an ended session.
+    await advance(RECONNECT_MAX_DELAY_MS * 2);
+    expect(harness.replanBodies).toHaveLength(1);
+    expect(harness.startBodies).toHaveLength(1);
+
+    unmount();
+  });
+
+  it("ends when a recovery replan learns an administrator ended the session", async () => {
+    const harness = reconnectHarness({
+      replan: () =>
+        jsonResponse(
+          {
+            type: "https://siloserver.org/docs/api/v2/problems/playback_session_ended",
+            title: "Playback session ended",
+            status: 410,
+            detail: "An administrator ended this playback session",
+          },
+          { status: 410 },
+        ),
+    });
+    const { result, unmount } = await startPlaying();
+
+    await act(async () => {
+      result.current.changeQuality("720p", 100);
+    });
+
+    expect(harness.replanBodies).toHaveLength(1);
+    expect(harness.startBodies).toHaveLength(1);
+    expect(result.current.connectionStatus).toBe("ended");
+    expect(result.current.error).toBeNull();
+
+    unmount();
+  });
+
+  it("does not reconnect a session a reanchor found ended before that state renders", async () => {
+    const harness = reconnectHarness({
+      replan: () =>
+        jsonResponse(
+          {
+            type: "https://siloserver.org/docs/api/v2/problems/playback_session_ended",
+            title: "Playback session ended",
+            status: 410,
+            detail: "An administrator ended this playback session",
+          },
+          { status: 410 },
+        ),
+      restart: () => jsonResponse(playable("session-2"), { status: 201 }),
+    });
+    const { result, unmount } = await startPlaying();
+    const session = result.current;
+
+    // The player's reopen fallback runs as soon as the reanchor settles, from a
+    // render that still says connected.
+    await act(async () => {
+      expect(await session.reanchorSeek(240)).toBe(false);
+      session.recoverConnection(240, true);
+    });
+    await advance(RECONNECT_MAX_DELAY_MS * 2);
+
+    expect(harness.replanBodies).toHaveLength(1);
+    expect(harness.startBodies).toHaveLength(1);
+    expect(result.current.connectionStatus).toBe("ended");
 
     unmount();
   });

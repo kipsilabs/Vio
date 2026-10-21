@@ -79,7 +79,7 @@ describe("buildReleasePresentation", () => {
           release_group: "GRP",
         }),
       ),
-    ).toBe("[Atmos][Atmos][X265]-GRP");
+    ).toBe("[Atmos][TrueHD Atmos][X265]-GRP");
   });
 
   it("derives the video range from probed tracks", () => {

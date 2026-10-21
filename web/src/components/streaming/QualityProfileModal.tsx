@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { ChevronDown, ChevronUp, Plus, Sliders, Trash2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -60,30 +60,43 @@ const DEFAULT_PROFILE: QualityProfileRule = {
   preferred_order: 1,
 };
 
-export function QualityProfileModal({
+function profileFormState(
+  editingProfile: QualityProfileRule | null | undefined,
+  defaultOrder: number,
+): QualityProfileRule {
+  if (!editingProfile) return { ...DEFAULT_PROFILE, preferred_order: defaultOrder };
+  return {
+    ...editingProfile,
+    min_size_gb:
+      editingProfile.min_size_gb ??
+      (editingProfile.min_size ? editingProfile.min_size / 1e9 : undefined),
+    max_size_gb:
+      editingProfile.max_size_gb ??
+      (editingProfile.max_size ? editingProfile.max_size / 1e9 : undefined),
+  };
+}
+
+export function QualityProfileModal(props: QualityProfileModalProps) {
+  // A fresh editor is a fresh form: remount when the dialog opens or its
+  // editing target changes instead of copying props into state in an effect.
+  return (
+    <QualityProfileModalBody
+      key={`${props.isOpen}:${props.editingProfile?.label ?? "new"}:${props.defaultOrder ?? 1}`}
+      {...props}
+    />
+  );
+}
+
+function QualityProfileModalBody({
   isOpen,
   onClose,
   onSave,
   editingProfile,
   defaultOrder = 1,
 }: QualityProfileModalProps) {
-  const [formData, setFormData] = useState<QualityProfileRule>(DEFAULT_PROFILE);
-
-  useEffect(() => {
-    if (editingProfile) {
-      setFormData({
-        ...editingProfile,
-        min_size_gb:
-          editingProfile.min_size_gb ??
-          (editingProfile.min_size ? editingProfile.min_size / 1e9 : undefined),
-        max_size_gb:
-          editingProfile.max_size_gb ??
-          (editingProfile.max_size ? editingProfile.max_size / 1e9 : undefined),
-      });
-    } else {
-      setFormData({ ...DEFAULT_PROFILE, preferred_order: defaultOrder });
-    }
-  }, [editingProfile, defaultOrder, isOpen]);
+  const [formData, setFormData] = useState<QualityProfileRule>(() =>
+    profileFormState(editingProfile, defaultOrder),
+  );
 
   const criteria = normalizeSortCriteria(formData.sort);
   const atCriteriaCap = criteria.length >= MAX_SORT_CRITERIA;

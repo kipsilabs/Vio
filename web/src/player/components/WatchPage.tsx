@@ -1026,7 +1026,7 @@ function WatchPagePlayer({
     // declared push after a verified one re-marks the menu, and the poll has to
     // come back to clear it again, so a transition restarts (or single-shots)
     // the poll.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- restart the poll on the inventory-identity transitions listed below.
   }, [
     applyAudioInventory,
     applyInventoryUpdate,
@@ -1228,6 +1228,32 @@ function WatchPagePlayer({
 
   const handleRealtimeEvent = useCallback(
     (event: PlaybackRealtimeEventEnvelope) => {
+      if (event.name === "marker_thumbnail_ready") {
+        const image = event.payload;
+        if (image.file_id !== session.mediaFileId || image.session_id !== session.sessionId) return;
+        setPlaybackVersions((current) =>
+          current.map((version) =>
+            version.file_id !== image.file_id
+              ? version
+              : {
+                  ...version,
+                  marker_segments: version.marker_segments?.map((marker) =>
+                    marker.kind === image.kind &&
+                    marker.start_seconds === image.start_seconds &&
+                    marker.end_seconds === image.end_seconds
+                      ? {
+                          ...marker,
+                          thumbnail_url: image.thumbnail_url,
+                          thumbnail_thumbhash: image.thumbnail_thumbhash,
+                          thumbnail_capture_seconds: image.thumbnail_capture_seconds,
+                        }
+                      : marker,
+                  ),
+                },
+          ),
+        );
+        return;
+      }
       if (event.name === "chapter_thumbnail_ready") {
         const { file_id, chapter_index, thumbnail_url, thumbnail_thumbhash } = event.payload;
         if (file_id !== session.mediaFileId) {
@@ -1274,7 +1300,7 @@ function WatchPagePlayer({
         ),
       );
     },
-    [session.mediaFileId],
+    [session.mediaFileId, session.sessionId],
   );
 
   // The server tells us whether a terminal is worth retrying. A retryable
@@ -1463,6 +1489,8 @@ function WatchPagePlayer({
         plan={session.plan}
         planRevision={session.planRevision}
         transportRevision={session.transportRevision}
+        browserEngine={session.browserEngine}
+        nativeOriginalSupport={session.nativeOriginalSupport}
         shouldAutoPlay={session.shouldAutoPlay}
         replanning={session.replanning}
         replanningQuality={session.replanningQuality}

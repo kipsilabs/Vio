@@ -67,7 +67,7 @@ func TestNoEpisodeDeletePath_ProtectsLastAirDateDenorm(t *testing.T) {
 	for _, root := range roots {
 		err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 			if err != nil {
-				return nil //nolint:nilerr // This repository scan deliberately skips unreadable entries.
+				return nil //nolint:nilerr // skip unreadable paths in the checkout instead of aborting the source scan
 			}
 			if info.IsDir() {
 				// Skip vendor, node_modules, build artifacts, and the
@@ -94,7 +94,7 @@ func TestNoEpisodeDeletePath_ProtectsLastAirDateDenorm(t *testing.T) {
 			}
 			data, readErr := os.ReadFile(path)
 			if readErr != nil {
-				return nil //nolint:nilerr // This repository scan deliberately skips unreadable files.
+				return nil //nolint:nilerr // skip unreadable files, as the walk does for unreadable paths
 			}
 			if deletePattern.Match(data) {
 				hits = append(hits, rel)

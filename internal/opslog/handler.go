@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"reflect"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -174,25 +175,36 @@ func attrValue(v slog.Value) any {
 	case slog.KindTime:
 		return v.Time().UTC().Format(time.RFC3339Nano)
 	case slog.KindAny:
-		// Errors marshal to {} with encoding/json, which is how
-		// "error:{}" rows appear in operational_logs. Store the
-		// sanitized message text so a transport or resolve failure
-		// stays diagnosable. SanitizeURLError strips URL-embedded
-		// credentials; it passes non-URL errors through unchanged, so
-		// this sink is safe for URL-bearing transport errors but is not
-		// a general secret scrubber for prose-embedded secrets. The
-		// message is bounded so a wrapped multi-error chain cannot
-		// bloat the attrs column.
-		if err, ok := v.Any().(error); ok {
-			if err == nil {
-				return ""
-			}
-			return truncateErrorText(logredact.SanitizeURLError(err).Error())
+		// Error types from errors.New and fmt.Errorf have no exported fields
+		// and would encode as {}, hiding the failure cause. Record the text,
+		// as the console handler does.
+		if err, ok := v.Any().(error); ok && err != nil {
+			return errorText(err)
 		}
 		return snapshot(v.Any())
 	default:
 		return v.String()
 	}
+}
+
+// errorText records an error's message for the stored entry. Requested URLs
+// inside the chain are sanitized with logredact.SanitizeURLError, the same
+// helper transport errors pass through elsewhere, so signed stream URLs and
+// query-string tokens are not written to the database. Secret key=value pairs
+// left in plain text, such as a plugin's gRPC status description, are masked
+// with logredact.RedactSecretAssignments. A typed-nil pointer
+// that satisfies error is recorded as a placeholder instead of calling Error
+// on a nil receiver, and a panicking Error method is contained.
+func errorText(err error) (text string) {
+	if rv := reflect.ValueOf(err); rv.Kind() == reflect.Pointer && rv.IsNil() {
+		return fmt.Sprintf("<nil %T>", err)
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			text = fmt.Sprintf("<%T: Error panicked>", err)
+		}
+	}()
+	return truncateErrorText(logredact.RedactSecretAssignments(logredact.SanitizeURLError(err).Error()))
 }
 
 // maxPersistedErrorText bounds one error attribute persisted to

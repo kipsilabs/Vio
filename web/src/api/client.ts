@@ -251,6 +251,25 @@ export function captureProfileRequestContext(): ProfileRequestContextSnapshot | 
 }
 
 /**
+ * Capture the session with an explicit profile authority, for one request
+ * made as a profile other than the active one: approving a Jellyfin Quick
+ * Connect request for the profile the person chose. Null while signed out.
+ */
+export function captureProfileRequestContextAs(
+  profileId: string,
+  profileToken: string | null,
+): ProfileRequestContextSnapshot | null {
+  if (!accessToken) return null;
+  return {
+    accessToken,
+    authContextVersion,
+    serverOrigin: currentServerOrigin(),
+    profileId,
+    profileToken,
+  };
+}
+
+/**
  * A session-authority change advances authContextVersion even if an account
  * later happens to return to the same token. Queued work can therefore never
  * cross a logout, impersonation, account switch, or server-origin switch
@@ -817,6 +836,15 @@ export async function apiResponse(path: string, options: RequestInit = {}): Prom
 
 /** Typed v1 API call. New code should use the v2 request boundary. */
 export async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
+  return readApiResponse<T>(await apiResponse(path, options));
+}
+
+/**
+ * Typed v1 API call for a route that has no `/api/v2` operation yet, such as
+ * the frozen admin and catalog maintenance routes. The caller owns the
+ * response type; everything else goes through the inferred v2 contract.
+ */
+export async function apiV1<T>(path: string, options: RequestInit = {}): Promise<T> {
   return readApiResponse<T>(await apiResponse(path, options));
 }
 

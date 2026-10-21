@@ -34,6 +34,18 @@ func (f *titlecardPublicationImages) ApplyItemImage(context.Context, metadata.Ap
 	return &metadata.ApplyItemImageResult{StoredPath: f.stored, Thumbhash: f.hash, Revision: "rev"}, nil
 }
 
+func (f *titlecardPublicationImages) FetchItemImagesWithLocal(context.Context, map[string]string, string, string, int, string) ([]metadata.RemoteImage, map[string]string, error) {
+	return nil, nil, nil
+}
+
+func (f *titlecardPublicationImages) LocalImagePreview(context.Context, string, string) (string, error) {
+	return "", nil
+}
+
+func (f *titlecardPublicationImages) ApplyLocalItemImage(context.Context, metadata.ApplyLocalItemImageRequest) (*metadata.ApplyItemImageResult, error) {
+	return nil, nil
+}
+
 // titlecardPublicationFiles is the in-memory FileVersionFetcher the detail and
 // row builders call. It also implements the batch provider so listEpisodeFiles
 // takes the batch path, the way scanner.FileRepository does.

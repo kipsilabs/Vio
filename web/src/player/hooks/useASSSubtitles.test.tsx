@@ -1,3 +1,5 @@
+import { ReadableStream } from "node:stream/web";
+
 import { act, renderHook, waitFor } from "@testing-library/react";
 import type { RefObject } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -97,56 +99,38 @@ const attachedFontTrack: PlayerSubtitleInfo = {
 };
 
 function mockFetchResponse(text: string): Response {
-  return {
-    ok: true,
-    status: 200,
-    text: vi.fn().mockResolvedValue(text),
-    arrayBuffer: vi.fn().mockResolvedValue(new ArrayBuffer(8)),
-    json: vi.fn().mockResolvedValue([]),
-  } as unknown as Response;
+  return new Response(text, { status: 200 });
 }
 
 function mockFontBundleResponse(bytes: string): Response {
-  return {
-    ok: true,
+  return new Response(JSON.stringify({ items: [{ name: "Attached.ttf", data: btoa(bytes) }] }), {
     status: 200,
-    json: vi.fn().mockResolvedValue({ items: [{ name: "Attached.ttf", data: btoa(bytes) }] }),
-  } as unknown as Response;
-}
-
-function responseHeaders(entries: Record<string, string>): Headers {
-  const lower = Object.fromEntries(Object.entries(entries).map(([k, v]) => [k.toLowerCase(), v]));
-  return { get: (name: string) => lower[name.toLowerCase()] ?? null } as unknown as Headers;
+    headers: { "Content-Type": "application/json" },
+  });
 }
 
 /** A pending (in-flight) font bundle: empty body plus the no-store marker. */
 function pendingFontBundleResponse(): Response {
-  return {
-    ok: true,
+  return new Response(JSON.stringify([]), {
     status: 200,
-    headers: responseHeaders({ "Cache-Control": "no-store" }),
-    json: vi.fn().mockResolvedValue([]),
-  } as unknown as Response;
+    headers: { "Cache-Control": "no-store", "Content-Type": "application/json" },
+  });
 }
 
 /** A definitive font-less bundle: empty body but cacheable, no pending marker. */
 function definitiveEmptyFontBundleResponse(): Response {
-  return {
-    ok: true,
+  return new Response(JSON.stringify([]), {
     status: 200,
-    headers: responseHeaders({ "Cache-Control": "private, max-age=600" }),
-    json: vi.fn().mockResolvedValue([]),
-  } as unknown as Response;
+    headers: { "Cache-Control": "private, max-age=600", "Content-Type": "application/json" },
+  });
 }
 
 /** A pending bundle identified by the explicit marker header. */
 function pendingHeaderFontBundleResponse(): Response {
-  return {
-    ok: true,
+  return new Response(JSON.stringify([]), {
     status: 200,
-    headers: responseHeaders({ "X-Vio-Font-Bundle-Pending": "true" }),
-    json: vi.fn().mockResolvedValue([]),
-  } as unknown as Response;
+    headers: { "X-Vio-Font-Bundle-Pending": "true", "Content-Type": "application/json" },
+  });
 }
 
 /** A response that never resolves until its request signal aborts. */
@@ -165,7 +149,10 @@ beforeEach(() => {
   constructorOpts.length = 0;
   instances.length = 0;
   rendererReady = Promise.resolve();
-  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(mockFetchResponse("")));
+  vi.stubGlobal(
+    "fetch",
+    vi.fn().mockImplementation(() => Promise.resolve(mockFetchResponse(""))),
+  );
 });
 
 afterEach(() => {
@@ -624,25 +611,25 @@ it("keeps a slowly progressing ASS extraction alive beyond 30 seconds", async ()
   vi.useFakeTimers();
   const state = vi.fn();
   let reads = 0;
-  vi.mocked(fetch).mockResolvedValue({
-    ok: true,
-    body: {
-      getReader: () => ({
-        read: () =>
-          new Promise((resolve) => {
-            setTimeout(
-              () =>
-                resolve(
-                  ++reads <= 3
-                    ? { done: false, value: new TextEncoder().encode("[Script Info]\n") }
-                    : { done: true },
-                ),
-              15_000,
-            );
-          }),
+  vi.mocked(fetch).mockResolvedValue(
+    new Response(
+      new ReadableStream<Uint8Array>({
+        pull(controller) {
+          return new Promise((resolve) => {
+            setTimeout(() => {
+              ++reads;
+              if (reads <= 3) {
+                controller.enqueue(new TextEncoder().encode("[Script Info]\n"));
+              } else {
+                controller.close();
+              }
+              resolve();
+            }, 15_000);
+          });
+        },
       }),
-    },
-  } as unknown as Response);
+    ),
+  );
   const videoRef = makeVideoRef();
   const { unmount } = renderHook(() =>
     useASSSubtitles(videoRef, [germanTrack], 6, false, 0, 0, state),
@@ -713,11 +700,12 @@ describe("useASSSubtitles subtitle source changed", () => {
     vi.useFakeTimers();
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
     const onSourceChanged = vi.fn();
-    vi.mocked(fetch).mockResolvedValue({
-      ok: false,
-      status: 409,
-      json: vi.fn().mockResolvedValue({ error: "subtitle_source_changed" }),
-    } as unknown as Response);
+    vi.mocked(fetch).mockResolvedValue(
+      new Response(JSON.stringify({ error: "subtitle_source_changed" }), {
+        status: 409,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
     const videoRef = makeVideoRef();
     const { unmount } = renderHook(() =>
       useASSSubtitles(
@@ -756,7 +744,7 @@ describe("useASSSubtitles subtitle source changed", () => {
     const onSourceChanged = vi.fn();
     const state = vi.fn();
     vi.mocked(fetch)
-      .mockResolvedValueOnce({ ok: false, status: 500 } as unknown as Response)
+      .mockResolvedValueOnce(new Response(null, { status: 500 }))
       .mockResolvedValue(mockFetchResponse("[Script Info]"));
     const videoRef = makeVideoRef();
     const { unmount } = renderHook(() =>
@@ -981,7 +969,7 @@ describe("useASSSubtitles bounded retry/watchdog policy", () => {
     vi.useFakeTimers();
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
     const state = vi.fn();
-    vi.mocked(fetch).mockResolvedValue({ ok: false, status: 500 } as unknown as Response);
+    vi.mocked(fetch).mockResolvedValue(new Response(null, { status: 500 }));
     const videoRef = makeVideoRef(1);
     const { unmount } = renderHook(() =>
       useASSSubtitles(videoRef, [germanTrack], 6, false, 0, 0, state),
@@ -1017,11 +1005,11 @@ describe("useASSSubtitles bounded retry/watchdog policy", () => {
     // statuses ride their own generous budget, so the 6th attempt still
     // fetches and the track recovers instead of latching terminal.
     vi.mocked(fetch)
-      .mockResolvedValueOnce({ ok: false, status: 503 } as unknown as Response)
-      .mockResolvedValueOnce({ ok: false, status: 503 } as unknown as Response)
-      .mockResolvedValueOnce({ ok: false, status: 503 } as unknown as Response)
-      .mockResolvedValueOnce({ ok: false, status: 503 } as unknown as Response)
-      .mockResolvedValueOnce({ ok: false, status: 503 } as unknown as Response)
+      .mockResolvedValueOnce(new Response(null, { status: 503 }))
+      .mockResolvedValueOnce(new Response(null, { status: 503 }))
+      .mockResolvedValueOnce(new Response(null, { status: 503 }))
+      .mockResolvedValueOnce(new Response(null, { status: 503 }))
+      .mockResolvedValueOnce(new Response(null, { status: 503 }))
       .mockResolvedValue(mockFetchResponse("[Script Info]"));
     const videoRef = makeVideoRef();
     const { unmount } = renderHook(() =>
@@ -1043,7 +1031,7 @@ describe("useASSSubtitles bounded retry/watchdog policy", () => {
     vi.useFakeTimers();
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
     const state = vi.fn();
-    vi.mocked(fetch).mockResolvedValue({ ok: false, status: 415 } as unknown as Response);
+    vi.mocked(fetch).mockResolvedValue(new Response(null, { status: 415 }));
     const videoRef = makeVideoRef(1);
     const { unmount } = renderHook(() =>
       useASSSubtitles(videoRef, [germanTrack], 6, false, 0, 0, state),

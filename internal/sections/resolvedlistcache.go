@@ -5,8 +5,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,6 +19,7 @@ import (
 	"golang.org/x/sync/singleflight"
 
 	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/logredact"
 	"github.com/Silo-Server/silo-server/internal/models"
 )
 
@@ -291,14 +294,30 @@ func getOrRefresh(ctx context.Context, key string, now time.Time, loader resolve
 }
 
 // blockingResolvedListRebuild rebuilds the entry for key, using singleflight so
-// concurrent cold/expired callers collapse into a single loader call.
+// concurrent cold/expired callers collapse into a single loader call. The
+// build is shared, so it runs detached from the request that started it; each
+// caller still stops waiting, with its context's error, when its own context
+// ends, and the build carries on for the others and fills the cache.
 func blockingResolvedListRebuild(ctx context.Context, key string, now time.Time, loader resolvedListLoader) ([]*models.MediaItem, int, error) {
 	type buildResult struct {
 		items []*models.MediaItem
 		total int
 	}
 
-	value, err, _ := resolvedListGroup.Do(key, func() (any, error) {
+	// A caller whose context is already done starts no detached build.
+	if err := ctx.Err(); err != nil {
+		return nil, 0, err
+	}
+	flight := resolvedListGroup.DoChan(key, func() (value any, err error) {
+		defer func() {
+			// The build runs on its own goroutine, out of reach of the
+			// request's panic recovery.
+			if rec := recover(); rec != nil {
+				slog.ErrorContext(ctx, "resolved list cache rebuild panicked", "key_hash", resolvedListLogKey(key),
+					"panic", logredact.SanitizeText(fmt.Sprint(rec)), "stack", string(debug.Stack()))
+				err = errors.New("resolved list cache rebuild panicked")
+			}
+		}()
 		// A concurrent async refresh may have installed a still-usable entry
 		// between the outer read and acquiring the flight; reuse it rather than
 		// hitting the database again.
@@ -326,12 +345,18 @@ func blockingResolvedListRebuild(ctx context.Context, key string, now time.Time,
 		}
 		return buildResult{items: items, total: total}, nil
 	})
-	if err != nil {
-		return nil, 0, err
+	var outcome singleflight.Result
+	select {
+	case <-ctx.Done():
+		return nil, 0, ctx.Err()
+	case outcome = <-flight:
 	}
-	res, ok := value.(buildResult)
+	if outcome.Err != nil {
+		return nil, 0, outcome.Err
+	}
+	res, ok := outcome.Val.(buildResult)
 	if !ok {
-		return nil, 0, fmt.Errorf("unexpected resolved list result %T", value)
+		return nil, 0, fmt.Errorf("unexpected resolved list result %T", outcome.Val)
 	}
 	return cloneMediaItems(res.items), res.total, nil
 }

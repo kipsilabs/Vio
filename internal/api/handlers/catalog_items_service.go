@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/imagesize"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/sections"
 	"github.com/Silo-Server/silo-server/internal/userstore"
@@ -99,6 +101,23 @@ func (h *CatalogHandler) Browse(ctx context.Context, v ItemViewer, req catalog.C
 	}
 	items := h.catalogItemResponses(ctx, v, result.Items, catalogSortMetricField(req, result), playableTargetLibraryIDs(req), v.Access)
 	return catalogBrowseView(result, items), nil
+}
+
+// LetterIndex answers the letter index of a title-ordered query-source
+// browse; see catalog.CatalogResolver.LetterIndex.
+func (h *CatalogHandler) LetterIndex(ctx context.Context, v ItemViewer, req catalog.CatalogRequest) (catalog.LetterIndex, error) {
+	if h == nil || h.resolver == nil {
+		return catalog.LetterIndex{}, apiError(http.StatusInternalServerError, "internal_error", "Catalog is not configured")
+	}
+	// Numbering every match sorts the whole result; bound it like a distant
+	// window seek.
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	index, err := h.resolver.LetterIndex(ctx, req, v.Access)
+	if err != nil {
+		return catalog.LetterIndex{}, catalogResolveError(ctx, err, false)
+	}
+	return index, nil
 }
 
 // catalogResolveError keeps grouped and ordinary catalog resolution on the
@@ -292,6 +311,9 @@ func (h *CatalogHandler) QueryItems(ctx context.Context, v ItemViewer, req Catal
 		modelItems = append(modelItems, &item)
 		total = rowTotal
 	}
+	if err := rows.Err(); err != nil {
+		return CatalogQueryView{}, apiError(http.StatusInternalServerError, "internal_error", "Failed to query items")
+	}
 	// COUNT(*) OVER () emits no rows when the data SELECT is empty, so total
 	// stays 0 even when the broader result set has matching rows (OFFSET past
 	// the last page). Re-query the count to give callers the real total.
@@ -312,7 +334,7 @@ func (h *CatalogHandler) QueryItems(ctx context.Context, v ItemViewer, req Catal
 				item = localized
 			}
 		}
-		items = append(items, h.itemsH.toItemListResponseWithOverlay(ctx, viewer, item, nil, userStates[item.ContentID], accessFilter.ImageSize))
+		items = append(items, h.itemsH.toItemListResponseWithOverlay(ctx, viewer, item, nil, userStates[item.ContentID], accessFilter.Artwork()))
 	}
 	return CatalogQueryView{Total: total, HasMore: req.Offset+req.Limit < total, Items: items}, nil
 }
@@ -523,6 +545,37 @@ func (h *CatalogResourceHandler) seriesSeasons(ctx context.Context, v ItemViewer
 			return nil, apiError(http.StatusInternalServerError, "internal_error", failed)
 		}
 		if len(seasons) > 0 {
+			// A persisted season row and a metadata-only season can coexist
+			// for one series. Keep every persisted row and synthesize only
+			// the season numbers the episodes table knows that have no row.
+			if h.items.episodeRepo != nil {
+				summaries, err := h.items.episodeRepo.ListMetadataSeasons(ctx, id)
+				if err != nil {
+					return nil, apiError(http.StatusInternalServerError, "internal_error", failed)
+				}
+				present := make(map[int]struct{}, len(seasons))
+				for _, season := range seasons {
+					present[season.SeasonNumber] = struct{}{}
+				}
+				for _, summary := range summaries {
+					if _, ok := present[summary.SeasonNumber]; ok {
+						continue
+					}
+					title := "Season " + strconv.Itoa(summary.SeasonNumber)
+					if summary.SeasonNumber == 0 {
+						title = "Specials"
+					}
+					seasons = append(seasons, &models.Season{
+						ContentID:    fmt.Sprintf("%s-S%02d", id, summary.SeasonNumber),
+						SeriesID:     id,
+						SeasonNumber: summary.SeasonNumber,
+						Title:        title,
+					})
+				}
+				sort.Slice(seasons, func(i, j int) bool {
+					return seasons[i].SeasonNumber < seasons[j].SeasonNumber
+				})
+			}
 			if h.items.detailSvc != nil {
 				if localized, locErr := h.items.detailSvc.LocalizeSeasonModels(ctx, seasons, filter); locErr == nil && len(localized) == len(seasons) {
 					seasons = localized
@@ -556,10 +609,10 @@ func (h *CatalogResourceHandler) seriesSeasons(ctx context.Context, v ItemViewer
 				paths := make([]string, 0, len(seasons))
 				for _, season := range seasons {
 					if season.PosterPath != "" {
-						paths = append(paths, sizedPosterPath(season.PosterPath, filter.ImageSize))
+						paths = append(paths, sizedPosterPath(season.PosterPath, filter.ImageSizeFor(imagesize.SlotPoster)))
 					}
 				}
-				posterURLs = h.items.detailSvc.PresignURLsWithExpiry(ctx, paths, requestVariantHint("featured", filter.ImageSize))
+				posterURLs = h.items.detailSvc.PresignURLsWithExpiry(ctx, paths, requestVariantHint("featured", filter.ImageSizeFor(imagesize.SlotPoster)))
 			}
 			resp := make([]seasonResponse, 0, len(seasons))
 			for _, s := range seasons {
@@ -584,8 +637,8 @@ func (h *CatalogResourceHandler) seriesSeasons(ctx context.Context, v ItemViewer
 				if !includeArtwork {
 					season.PosterThumbhash = ""
 				}
-				sr := h.items.localizedSeasonResponse(ctx, v, &season, episodeCount, seasonUserData, filter.ImageSize)
-				sr.PosterURL = posterURLs[sizedPosterPath(s.PosterPath, filter.ImageSize)].URL
+				sr := h.items.localizedSeasonResponse(ctx, v, &season, episodeCount, seasonUserData, filter.ImageSizeFor(imagesize.SlotPoster))
+				sr.PosterURL = posterURLs[sizedPosterPath(s.PosterPath, filter.ImageSizeFor(imagesize.SlotPoster))].URL
 				resp = append(resp, sr)
 			}
 			h.items.enrichSeasonPlayTargets(ctx, v, id, resp)
@@ -662,7 +715,7 @@ func (h *CatalogResourceHandler) SeriesSeason(ctx context.Context, v ItemViewer,
 				userData = h.items.getAggregateUserData(ctx, v, episodes)
 			}
 			h.items.maybeRequestStaleSeasonMetadataRefresh(ctx, season.ContentID, episodes)
-			resp := h.items.toSeasonResponseFromEpisodes(ctx, v, id, season, episodes, userData, v.Access.ImageSize)
+			resp := h.items.toSeasonResponseFromEpisodes(ctx, v, id, season, episodes, userData, v.Access.ImageSizeFor(imagesize.SlotPoster))
 			h.items.resolveSeasonPlayTarget(ctx, v, id, &resp)
 			return resp, nil
 		case !errors.Is(err, catalog.ErrSeasonNotFound):

@@ -9,11 +9,13 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Silo-Server/silo-server/internal/api/handlers"
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
 	"github.com/Silo-Server/silo-server/internal/auth"
 	"github.com/Silo-Server/silo-server/internal/clientip"
 	"github.com/Silo-Server/silo-server/internal/config"
 	"github.com/Silo-Server/silo-server/internal/playback"
+	"github.com/Silo-Server/silo-server/internal/plugins"
 	"github.com/Silo-Server/silo-server/internal/scanner"
 	"github.com/Silo-Server/silo-server/internal/secret"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary"
@@ -190,5 +192,21 @@ func TestRouterCoreOwnershipPolicy(t *testing.T) {
 	var nilSvc *virtuallibrary.Service
 	if _, err := nilSvc.Resolve(context.Background(), "virtual://movie/tt100"); err == nil {
 		t.Fatal("expected unavailable error from nil service")
+	}
+}
+
+func TestVirtualMediaResolverDoesNotFallBackToPlugin(t *testing.T) {
+	proxy := &plugins.HTTPProxy{}
+	handler := &handlers.PlaybackHandler{}
+	wireVirtualMediaResolver(handler, Dependencies{PluginHTTPProxy: proxy})
+	if handler.VirtualMediaResolver != nil {
+		t.Fatal("virtual media resolver fell back to a plugin when core is unavailable")
+	}
+
+	_, core := newCoreTestProvider(t)
+	handler = &handlers.PlaybackHandler{}
+	wireVirtualMediaResolver(handler, Dependencies{VirtualLibraryService: core, PluginHTTPProxy: proxy})
+	if handler.VirtualMediaResolver == nil {
+		t.Fatal("core virtual-library resolver was not wired")
 	}
 }

@@ -34,11 +34,27 @@ if [ -z "$dispatch" ]; then
 else
   reject "virtual→plugin dispatch callers remain: $dispatch"
 fi
+if grep -Eq 'PluginHTTPProxy[[:alnum:]_.]*ResolveVirtualMedia' internal/api/router.go internal/api/virtual_media_resolver.go 2>/dev/null; then
+  reject "playback still falls back to a plugin virtual resolver"
+else
+  pass "no plugin virtual resolver fallback"
+fi
 
 # 3. Core virtual router installation (0) validates; dormant saves are 422s.
 grep -q 'id < 0' internal/apiv2/admin_requests.go \
   && pass "installation 0 validates" \
   || reject "installation 0 rejected in internal/apiv2/admin_requests.go"
+# Assert each declaration itself, not any text in the file. A comment carrying
+# the expected pattern must not satisfy the check, and the save and options
+# bodies must be rejected independently.
+grep -E '^[[:space:]]*InstallationID[[:space:]]+ID[[:space:]]+`json:"installation_id"' internal/apiv2/admin_requests.go \
+  | grep -Fq 'pattern:"^(0|[1-9][0-9]*)$"' \
+  && pass "installation 0 passes the v2 save schema" \
+  || reject "installation 0 rejected by the v2 save schema"
+grep -E '^[[:space:]]*InstallationID[[:space:]]+\*ID[[:space:]]+`json:"installation_id,omitempty"' internal/apiv2/admin_requests.go \
+  | grep -Fq 'pattern:"^(0|[1-9][0-9]*)$"' \
+  && pass "installation 0 passes the v2 options schema" \
+  || reject "installation 0 rejected by the v2 options schema"
 grep -q 'ErrProviderUnavailable' internal/apiv2/admin_collections.go \
   && pass "sync provider-unavailable mapping" \
   || reject "503 mapping missing from internal/apiv2/admin_collections.go"

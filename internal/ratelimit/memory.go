@@ -38,8 +38,11 @@ func NewMemoryLimiter() *MemoryLimiter {
 }
 
 func (ml *MemoryLimiter) Allow(_ context.Context, key string, limit Rate) AllowResult {
+	return ml.allowAt(key, limit, time.Now())
+}
+
+func (ml *MemoryLimiter) allowAt(key string, limit Rate, now time.Time) AllowResult {
 	entry := ml.getOrCreate(key, limit)
-	now := time.Now()
 	entry.touch()
 
 	// Check per-second limiter via Reserve
@@ -55,12 +58,23 @@ func (ml *MemoryLimiter) Allow(_ context.Context, key string, limit Rate) AllowR
 	}
 	if delay := secRes.DelayFrom(now); delay > 0 {
 		secRes.CancelAt(now)
+		resetAt := now.Add(time.Second).Truncate(time.Second)
+		// An empty per-minute bucket would refuse the retry too, so wait for both.
+		if minDelay := tokenDelay(entry.perMinute, now); minDelay > delay {
+			delay = minDelay
+			// Round up: X-RateLimit-Reset carries whole seconds. Rounding the
+			// time, not the delay, keeps a saturated delay from overflowing.
+			resetAt = now.Add(delay)
+			if whole := resetAt.Truncate(time.Second); whole.Before(resetAt) {
+				resetAt = whole.Add(time.Second)
+			}
+		}
 		return AllowResult{
 			Allowed:    false,
 			RetryAfter: delay,
 			Limit:      int(limit.RequestsPerSecond),
 			Remaining:  0,
-			ResetAt:    now.Add(time.Second).Truncate(time.Second),
+			ResetAt:    resetAt,
 		}
 	}
 
@@ -97,12 +111,24 @@ func (ml *MemoryLimiter) Allow(_ context.Context, key string, limit Rate) AllowR
 	}
 }
 
+// tokenDelay returns how long lim needs to hold a whole token at t, without
+// taking one.
+func tokenDelay(lim *rate.Limiter, t time.Time) time.Duration {
+	missing := 1 - lim.TokensAt(t)
+	perSecond := float64(lim.Limit())
+	if missing <= 0 || perSecond <= 0 {
+		return 0
+	}
+	delay := math.Ceil(missing / perSecond * float64(time.Second))
+	if delay >= float64(math.MaxInt64) {
+		return rate.InfDuration
+	}
+	return time.Duration(delay)
+}
+
 func (ml *MemoryLimiter) getOrCreate(key string, limit Rate) *memoryEntry {
 	if val, ok := ml.entries.Load(key); ok {
-		if entry, valid := val.(*memoryEntry); valid {
-			return entry
-		}
-		ml.entries.Delete(key)
+		return val.(*memoryEntry) //nolint:errcheck,forcetypeassert // entries stores only *memoryEntry
 	}
 	minuteBurst := int(math.Ceil(limit.RequestsPerMinute))
 	if minuteBurst < 1 {
@@ -114,11 +140,7 @@ func (ml *MemoryLimiter) getOrCreate(key string, limit Rate) *memoryEntry {
 	}
 	entry.touch()
 	actual, _ := ml.entries.LoadOrStore(key, entry)
-	if stored, ok := actual.(*memoryEntry); ok {
-		return stored
-	}
-	ml.entries.Store(key, entry)
-	return entry
+	return actual.(*memoryEntry) //nolint:errcheck,forcetypeassert // entries stores only *memoryEntry
 }
 
 // Clear removes all entries (called on config reload).
@@ -143,8 +165,7 @@ func (ml *MemoryLimiter) evictLoop() {
 		case <-ticker.C:
 			cutoff := time.Now().Add(-10 * time.Minute)
 			ml.entries.Range(func(key, value any) bool {
-				entry, ok := value.(*memoryEntry)
-				if !ok || entry.lastUsedTime().Before(cutoff) {
+				if value.(*memoryEntry).lastUsedTime().Before(cutoff) { //nolint:errcheck,forcetypeassert // entries stores only *memoryEntry
 					ml.entries.Delete(key)
 				}
 				return true

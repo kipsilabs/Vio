@@ -6,6 +6,7 @@ import {
   observeSessionProgress,
   captureSessionProgress,
 } from "../session-mutations";
+import { isPlaybackSessionEndedError } from "../player-fetch";
 import { toMediaTime } from "../utils/mediaTimeline";
 
 /**
@@ -24,6 +25,9 @@ import { toMediaTime } from "../utils/mediaTimeline";
  * On cleanup (player unmount), sends one final progress report with
  * keepalive so the backend records the last known position even when
  * the user seeks and closes quickly.
+ *
+ * `onSessionEnded` runs when a report learns the server ended the session for
+ * good (an administrator stopped it while the player was unreachable).
  */
 export function useWatchProgress(
   sessionId: string | null,
@@ -31,7 +35,12 @@ export function useWatchProgress(
   streamOriginRef?: React.RefObject<number>,
   onSessionLost?: () => void,
   recoveryRevision = 0,
+  onSessionEnded?: () => void,
 ) {
+  const onSessionEndedRef = useRef(onSessionEnded);
+  useEffect(() => {
+    onSessionEndedRef.current = onSessionEnded;
+  }, [onSessionEnded]);
   const config = usePlayerConfig();
   const configRef = useRef(config);
   configRef.current = config;
@@ -52,7 +61,9 @@ export function useWatchProgress(
 
   const getProgressSnapshot = useCallback(() => {
     const video = videoRef.current;
-    if (!video) return null;
+    // Before metadata (startup, or a transport swap) currentTime is not a
+    // position on this stream yet; reporting it would overwrite the resume point.
+    if (!video || video.readyState === HTMLMediaElement.HAVE_NOTHING) return null;
 
     return {
       position: toMediaTime(video.currentTime ?? 0, streamOriginRef?.current ?? 0),
@@ -137,6 +148,10 @@ export function useWatchProgress(
             // The session row is gone, so the cleanup's final keepalive would
             // only be answered 404. Skip it.
             skipCleanupReportRef.current = true;
+            // An administrator-ended session is a session-gone answer with a
+            // specific problem code; report both the recovery hook and the
+            // ended hook so the player can leave instead of reconnecting.
+            if (isPlaybackSessionEndedError(error)) onSessionEndedRef.current?.();
             onSessionLostRef.current?.();
           }
         });

@@ -374,6 +374,18 @@ func TestGeneratedDocumentStatuses(t *testing.T) {
 	profileToken["getAdminPlaybackSummary"] = true
 	profileToken["getThemeSongsCapability"] = true
 	profileToken["createThemeSongPlayback"] = true
+	for _, id := range []string{
+		"cancelLibraryMetadataTranslation", "clearResumePosition", "completeAdminChatGPTLogin", "disconnectAdminChatGPTAccount",
+		"drainAdminNode", "getAdminAICapabilities", "getAdminChatGPTConnection", "getAdminJob",
+		"getAdminNodeCapabilities", "getHomeCapabilities", "getLibraryJob", "getNotInterested",
+		"getNotInterestedCapability", "getProgressCapabilities", "ignoreUnmatchedItem", "listAdminChatGPTModels",
+		"listLibraryMetadataTranslationJobs", "listNotInterested", "listNotificationSeries", "listSeasonalThemes",
+		"markNotInterested", "muteNotificationSeries", "queryCatalogLetters", "resetAdminRecommendationEmbeddings",
+		"resumeAdminNode", "selectAdminChatGPTAccount", "startAdminChatGPTLogin", "translateLibraryMetadata",
+		"unignoreUnmatchedItem", "unmarkNotInterested", "unmuteNotificationSeries", "updateDevice",
+	} {
+		profileToken[id] = true
+	}
 	seen := map[string]bool{}
 	for path, item := range doc["paths"].(map[string]any) {
 		for method, raw := range item.(map[string]any) {

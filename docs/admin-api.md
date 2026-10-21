@@ -322,6 +322,14 @@ omit both; clients then show the output as unknown rather than inferring it
 from `play_method`, the source container, or the video codec. The frozen
 `/api/v1` bridge does not carry these fields.
 
+`source_video_height: true` advertises an optional `source_video_height` on v2
+session rows: the pixel height of the source's primary video track.
+`source_video_resolution` names the file's size class, so a 3840x1600 file is
+`2160p`, while a transcode's `target_resolution` names its output height
+(`1600p`). A client compares the target height with `source_video_height` to
+tell a full-resolution transcode from a downscale. The frozen `/api/v1` bridge
+does not carry the field.
+
 `silo_playback_routing_decisions_total` counts routing outcomes with bounded
 `workload`, `execution`, `egress`, `outcome`, and `reason` labels. It never
 labels observations with playback-session or node identity.
@@ -355,9 +363,11 @@ configuration, last health result, and last stored hardware inventory. See
 | `public_url` | string \| null | Client-facing base URL, when it differs from `url`. Stream and download URLs handed to players are built on it. Only meaningful on proxy nodes — clients never talk to transcode nodes. Absent or `null` means clients use `url`, which must then be publicly reachable. |
 | `enabled` | bool | Whether the node is eligible for new placement. Disabling also stops routine health sampling after pool reconciliation; existing streams continue. See the v2 node configuration lifecycle below. |
 | `healthy` | bool | Result of the last health check. |
+| `drain_requested` | bool | An administrator asked this transcode node to drain: it stays listed and health-checked, but new work goes to other nodes while its sessions finish. See [node drain (v2)](#node-drain-v2). Always `false` on a proxy. |
+| `drain_state` | string | What the node reported on its last health check: `none`, `draining` (after a drain request or SIGTERM, while it finishes its work) or `drained` (nothing left; safe to stop). `none` for a proxy, a node that predates draining, and a node that did not answer. |
 | `active_jobs`, `egress_kbps` | int | Last health-reported load. `egress_kbps` is a rolling average and is currently non-zero for proxy nodes only. |
 | `group` | string \| null | Co-location group. A group is only eligible while every enabled member is healthy. |
-| `max_jobs`, `max_bandwidth_kbps` | int \| null | Capacity caps. `null` means unlimited. |
+| `max_jobs`, `max_bandwidth_kbps` | int \| null | Capacity caps. `null` means unlimited. `max_jobs` limits streams and file downloads on a proxy and transcodes on a transcode node. `max_bandwidth_kbps` limits a proxy's egress, and a proxy with it set takes no file downloads, because a download's rate is unknown and cannot be reserved; it is stored for a transcode node but not enforced, because a transcode node's output leaves through a proxy or the API server. |
 | `last_health_check` | RFC3339 string \| null | When the node was last checked. |
 | `created_at` | RFC3339 string | When the node was registered. |
 | `capabilities` | object | The node's last stored capability report — the same body `GET /hw-capabilities` returns on the node. Omitted until one has been stored. |
@@ -511,7 +521,7 @@ Each entry in `disks`:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `path` | string | Where the mount is. Absent from a node's `last_stats`: the node reports it on its own bearer-authed `/status`, and the API host reports its own on `GET /admin/system/resources`, but a node's `/health` takes no credential and withholds it. Use `role`. |
+| `path` | string | Where the mount is. Absent from a node's `last_stats`: the node reports it on its own `/status`, which needs a [signed request](architecture/worker-http-protocol.md#authentication), and the API host reports its own on `GET /admin/system/resources`, but a node's `/health` takes no credential and withholds it. Use `role`. |
 | `role` | string | What the mount is for: `scratch`, or `library-N` positionally per media root. Assigned when the sample is built, so it names the same mount on `/health`, `/status`, `/admin/system/resources` and the `streamapp_node_disk_*` series, and it stays with the mount even when a probe cannot measure it. |
 | `used_gb`, `total_gb` | float | Capacity in GiB. `used_gb` counts filesystem-reserved blocks, as `df` does. `total_gb` is the capacity usable by the node process — used plus still-available — so it reads lower than the device's nameplate size on a volume that reserves blocks for root, and `used_gb`/`total_gb` is the ratio `df` prints as Use%. |
 | `stale` | bool | The numbers are real but carried over from an earlier pass because the current probe has not returned — the normal reading for a network mount whose server went away. Omitted when false. |
@@ -845,7 +855,7 @@ report. Every hardware probe ends in a real encode on the GPU; a card at its
 concurrent encoder-session limit fails that encode with an error nothing can
 distinguish from a missing device, and the resulting `verified: false` would be
 stored as a hardware regression for a GPU that is at that moment encoding.
-Disable the node or wait for it to drain, then re-probe.
+[Drain](#node-drain-v2) the node, wait for `drained`, then re-probe.
 
 The call can take a while. The node is given the probe budget it advertises in
 its own report (`probe_request_timeout_ms`, up to five minutes); a node that has
@@ -856,7 +866,7 @@ this route can legitimately outlive the API listener's ordinary 120-second
 as a hung request. This re-probes only — it does not reload configuration or tear
 anything down.
 
-Under the hood this is a bearer-authenticated `POST
+Under the hood this is a [signed](architecture/worker-http-protocol.md#authentication) `POST
 /admin/reprobe-capabilities` on the node's own listener, which both transcode
 nodes and proxy nodes serve. That route is internal to the cluster and is not
 part of any client contract.
@@ -1138,6 +1148,7 @@ client tells "this deployment is older than my build" from "the request failed".
 | `log_level_list` | `GET /admin/logs/app` accepts a multi-level filter. |
 | `watch_providers` | `GET /admin/stats` carries the per-provider `watch_providers` array. |
 | `downloads_stats` | `GET /admin/stats/downloads` serves the offline-download aggregate, and timeseries points carry the additive `download_egress_kbps` split. |
+| `egress_totals` | `GET /admin/stats/timeseries` carries the window's additive `egress_bytes` and `download_egress_bytes` totals. |
 
 ```json
 {
@@ -1148,7 +1159,8 @@ client tells "this deployment is older than my build" from "the request failed".
   "health": true,
   "log_level_list": true,
   "watch_providers": true,
-  "downloads_stats": true
+  "downloads_stats": true,
+  "egress_totals": true
 }
 ```
 
@@ -1176,7 +1188,7 @@ Each entry:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `provider` | string | Provider key: `trakt`, `simkl`, or `mdblist` for the first-party plugins, otherwise `plugin:<installation id>:<capability id>`. |
+| `provider` | string | Provider key: `simkl` or `mdblist` for the first-party plugins, otherwise `plugin:<installation id>:<capability id>`. |
 | `display_name` | string | Human name from the registry, or the key when the provider is not registered. |
 | `registered` | bool | False when the provider only exists in stored rows. |
 | `scrobbling` | bool | The provider declares the scrobble-playback capability. |
@@ -1222,8 +1234,8 @@ Each entry:
       "scrobbles_24h": 0
     },
     {
-      "provider": "trakt",
-      "display_name": "Trakt",
+      "provider": "simkl",
+      "display_name": "Simkl",
       "registered": true,
       "scrobbling": true,
       "exporting": true,
@@ -1283,6 +1295,12 @@ an average: these charts are read to answer "how bad did it get", and a mean
 would erase exactly that. Stream counts and egress are maxed independently, so
 a bucket's columns may come from different minutes within it.
 
+`egress_bytes` and `download_egress_bytes` are the data served over the whole
+window, integrated from every sampled minute rather than from `points` — summing
+the peak-per-bucket points would count a one-minute spike as if it lasted the
+whole bucket. Unsampled minutes contribute nothing and node egress is a rolling
+average, so treat the totals as a close estimate, not byte-exact accounting.
+
 Each minute holds up to two kinds of row. The `shared` row is the cluster-wide
 snapshot: stream counts by play method, plus the egress reported by enabled,
 healthy stream nodes. Every replica tries to write it and the first one to land
@@ -1325,6 +1343,8 @@ fresh install renders "collecting data" instead of an empty chart.
   "from": "2026-08-25T12:00:00Z",
   "to": "2026-08-26T12:00:00Z",
   "oldest_sample_at": "2026-08-24T09:31:00Z",
+  "egress_bytes": 412500000000,
+  "download_egress_bytes": 37800000000,
   "points": [
     {
       "t": "2026-08-26T11:55:00Z",
@@ -2189,6 +2209,12 @@ by any other route. It answers deterministically:
 - Pause, resume and message require a live realtime lane (`409 conflict`
   otherwise). Stop without a lane answers `delivery: "fallback_scheduled"` and
   the server ends the session after the deadline, as on the bridge.
+- A pause, resume or stop the player does not confirm before its deadline ends
+  the session, here and on the bridge. The session's playback attempt is then
+  recorded as ended by an administrator, so the player is told to leave
+  (`410 playback_session_ended`) when it next reports progress or replans,
+  rather than starting a fresh session
+  ([playback API](playback-api.md#progress-and-stop)).
 - An unknown session is `404`; a server without playback control answers
   `503 dependency_unavailable`.
 
@@ -2212,7 +2238,8 @@ session's playback authority durably, then dispatches the dismissal as best
 effort, and reports the two facts separately. It never promises that media
 already buffered stops instantly, and it never waits for the player.
 
-Revocation is the ordinary user stop plus the stream deny marker. The server
+Revocation is the ordinary user stop plus the stream deny marker, and the
+attempt is recorded as ended by an administrator, as above. The server
 stops the live session and its transcode, runs the stop and history writer, and
 writes the Redis key `silo:streamauth:<session_id>` so no replica serves or
 reconstructs the session from a stream token that is still inside its TTL
@@ -2261,8 +2288,10 @@ prospective combined values. Single-key validation preserves the existing paired
 setting repair behavior. Empty values retain the established clear/default rules.
 
 Both writes are nonretryable. Enabling diagnostics can probe storage before the
-transaction, and runtime notifications after commit are not durable command
-receipts. A lost response does not establish whether the update committed. The
+transaction, a change to the Redis connection connects to Redis before it (see
+[Saving the Redis connection](admin-settings-api.md#saving-the-redis-connection)),
+and runtime notifications after commit are not durable command receipts. A
+lost response does not establish whether the update committed. The
 web captures the displayed validator, copied values and acting profile before an
 offline pause, does not refresh/replay a failed mutation, and keeps dirty edits on
 the original baseline across background reads and 412 responses. Changing acting
@@ -2301,12 +2330,12 @@ invalidates the exact compatibility status scope only for the active authority.
 
 ### Dashboard capability discovery in v2
 
-`GET /api/v2/admin/dashboard/capabilities` returns the eight dashboard support
+`GET /api/v2/admin/dashboard/capabilities` returns the nine dashboard support
 flags to an acting administrator. These describe the v2 surface in the API build;
 they do not promise that a database or other runtime dependency is healthy.
 
-`timeseries`, `playback_activity`, `top_activity`, `health`, `watch_providers` and
-`downloads_stats` are true for the existing v2 dashboard operations.
+`timeseries`, `playback_activity`, `top_activity`, `health`, `watch_providers`,
+`downloads_stats` and `egress_totals` are true for the existing v2 dashboard operations.
 `server_layouts` remains false while the v2 layout lifecycle is unavailable.
 `log_level_list` is true for the accepted multi-level application-log reader. Clients
 must not infer v2 support from the bridge's independently retained capabilities.
@@ -2348,7 +2377,8 @@ the handshake is served on this process, the protocol (`silo.admin-logs.v2`) and
 selections (`app`, `audit`). `POST /api/v2/admin/logs/ws-ticket` (`createAdminLogsSocketTicket`)
 delegates the acting administrator's current access-token login session for one connection.
 API keys and credentials without a bounded expiry cannot mint; a login whose effective role is
-not administrator (a secondary profile on an administrator account) is refused with 403. The
+not administrator (a secondary profile on an administrator account, or a profile-less session
+on a household with a PIN-protected or access-limited profile) is refused with 403. The
 ticket is opaque, single-use, expires within 30 seconds and binds the account, login session,
 role, profile proof and resolved access scope. The response carries `ticket`, `expires_in`,
 `max_connection_seconds` (300) and `protocol`, is not cached, and minting is naturally
@@ -2366,7 +2396,8 @@ proof and administrator role are validated again before 101.
 
 The connection ends at the earlier of five minutes or access-token expiry, and the handler
 rechecks session, account, profile and administrator role every 15 seconds with a two-second
-bound; a failed check or a demotion closes the socket. Reconnect with a newly minted credential;
+bound; a failed check or a demotion closes the socket, including once the household of a
+profile-less session gains a PIN-protected or access-limited profile. Reconnect with a newly minted credential;
 this is bounded revocation detection, not instantaneous. Without Redis the ticket is
 process-local and requires affinity to the minting node.
 
@@ -2604,15 +2635,19 @@ submission. No automatic retry, authentication replay or provider update occurs.
 The web edit submission captures identity and input before queueing and refuses
 late completion from another authority or a newer dialog draft.
 
-An update that changes the upstream the plugin is handed clears the poll marker of
-every source bound to it, in the same transaction, so those sources restart from
-now against the new upstream. That upstream is the linked Requests integration
-when there is one, otherwise the connection's base URL: linking, unlinking or
-switching the integration, or changing an unlinked connection's base URL, resets
-markers. Changing the name, kind or API key, or the stored base URL of a linked
-connection, keeps them. The frozen v1 connection update shares this repository
-path. Editing the linked Requests integration itself does not reset markers. A poll that was already running does not restore the old marker; see the
-source update below.
+An update that changes the upstream the plugin is handed clears the poll marker and
+`last_run_at` of every source bound to it, in the same transaction, so those
+sources restart from now against the new upstream and are polled at the next
+cycle instead of after their interval. That upstream is the linked Requests
+integration when there is one, otherwise the connection's base URL: linking,
+unlinking or switching the integration, or changing an unlinked connection's base
+URL, resets markers. Base URLs that differ only in the case of the scheme or host,
+surrounding whitespace, or trailing slashes name the same server and keep them; a
+different port, scheme or path (an escaped slash, `%2F`, included) does not.
+Changing the name, kind or API key, or the stored base URL of a linked connection,
+keeps them. The frozen v1 connection update shares this repository path. Editing
+the linked Requests integration itself does not reset markers. A poll that was
+already running does not restore the old marker; see the source update below.
 
 ### Delete an autoscan connection (v2)
 
@@ -2832,9 +2867,12 @@ delivery mode preserves the stored mode. Rewrites need nonblank from/to values.
 
 An update that changes the bound connection (including unbinding it) or the stored
 source configuration clears the source's poll marker, so the next poll starts from
-now. A marker is the plugin's continuation token for one upstream; replaying it
-against another server can repeat or skip that server's history. Changing only the
-label, enabled state, delivery mode, poll interval or path rewrites keeps the marker.
+now. It clears `last_run_at` too, so the next cycle polls the source instead of
+waiting out its interval, and the source reads as not run until then. A marker is
+the plugin's continuation token for one upstream; replaying it against another
+server can repeat or skip that server's history. Changing only the label, enabled
+state, delivery mode, poll interval or path rewrites keeps the marker and
+`last_run_at`.
 The rule lives in the repository update, so the frozen v1 source update applies it too.
 A poll cycle re-reads each source just before polling it, so an edit made earlier in
 the cycle is honored; a source whose row cannot be read is skipped until the next cycle. A poll already running during the reset cannot write the old
@@ -2845,7 +2883,9 @@ started from. Otherwise it skips the
 write without an error, leaves `last_run_at` and `last_error` as they were (so the next
 cycle polls the new upstream without waiting for the interval), records its starting
 marker as the event's `marker_after` with a note that the marker was not stored, and
-the next poll starts from the reset marker.
+the next poll starts from the reset marker. A poll that fails after such a reset
+likewise leaves `last_error` and `last_run_at` as the reset left them; its error is
+recorded only on the poll's event, with a note that it was not stored on the source.
 
 Configuration keys/values, connection and label are normalized as in the bridge.
 Webhook mode is restricted to the built-in identity, with auto/sonarr/radarr provider
@@ -2988,6 +3028,38 @@ disable automatic/authentication replay, and fence late receipts, feedback and c
 invalidation. Node list caches include profile/PIN authority so old rows cannot be reused
 under a new authority. There is no corresponding Jellyfin administrative operation.
 
+### Node drain (v2)
+
+`POST /api/v2/admin/nodes/{id}/drain` (`drainAdminNode`) and
+`POST /api/v2/admin/nodes/{id}/resume` (`resumeAdminNode`) set and clear a
+transcode node's drain request. Both require an acting administrator, reject
+demo mode, take no body and are natural_idempotent: repeating converges on the
+same request. A proxy node returns 409 (only transcode nodes drain), a missing
+node 404, missing configuration 503, invalid IDs 422, and repository failures a
+private 500 problem. The request is operational state, not configuration: it does not
+advance `config_etag` or the pool generation.
+
+The 200 body is `{node_id, drain_requested, drain_state, active_jobs}` with
+`node_id` an opaque decimal string. This replica's pools change before the
+response; the server publishes `node_pool_changed`, so the other replicas and the
+node itself reread the row at once (and within five seconds and sixty seconds
+respectively without the event). From then on new sessions, downloads,
+trickplay, chapter thumbnails and subtitle-sync samples go to other nodes, while
+sessions already on the node keep playing until they end. `drain_state` moves to
+`draining` once the node has read the request and to `drained` when it has no
+work left. Resume also resets `drain_state` to `none`, so the node takes new
+work at once; a node that is draining on its own after SIGTERM (until its
+sessions end or `SILO_NODE_DRAIN_TIMEOUT`, default ten minutes, passes) reports
+`draining` again on its next check, and resume does not end that drain.
+Changing a node's `url` also resets `drain_state`. Drained covers sessions and
+jobs, not prepared downloads stored on the node, which are unavailable while it
+is stopped.
+
+`GET /api/v2/admin/nodes/capabilities` (`getAdminNodeCapabilities`) advertises
+`drain: true`. The web nodes page shows `Draining · N transcodes left` and then
+`Drained · safe to stop` from these fields. See
+[node drain](architecture/node-drain.md) for the protocol.
+
 ### Force reload nodes (v2)
 
 `POST /api/v2/admin/nodes/force-reload` (`forceReloadAdminNodes`) takes a snapshot
@@ -3057,7 +3129,8 @@ post-commit URL/override reload described above creates no durable execution job
 Setting only `enabled` to false removes the node from new placement and routine
 health sweeps on each replica's next pool reconciliation. It does not contact
 the worker, drain or reassign existing sessions, or revoke their stream authority;
-existing streams keep serving. Previously stored `healthy`, `active_jobs`,
+existing streams keep serving. To take a transcode node out of service while
+keeping its health and load current, [drain](#node-drain-v2) it instead. Previously stored `healthy`, `active_jobs`,
 `egress_kbps`, `last_stats` and `last_health_check` remain the last observations,
 not current liveness or load. A health check already in flight may still finish;
 an explicit administrator check can also refresh the sample. Re-enabling restores
@@ -3086,7 +3159,12 @@ by `id`. Both listeners share one projection: global configuration values contai
 public fields the manifest declares and list configured secret names in
 `configured_secrets`; a configuration whose schema is missing from the manifest is projected
 empty. The reserved built-in host row is excluded and a projection that contains it is an
-internal error. Timestamps are RFC 3339 UTC milliseconds.
+internal error. Timestamps are RFC 3339 UTC milliseconds. In every plugin view that lists
+capabilities (installations, catalog entries, and the install, upload and update responses), a
+`request_router.v1` capability carries `request_router`, whose `api_key_optional` and
+`base_url_optional` say which request server fields its plugin can do without; both are false
+when the plugin declares neither. For an installation they come from the capability stored at
+install or update, which is what routing reads.
 
 Both reads require an acting administrator and answer 503 when the
 plugin service or stores are not wired. The web plugins page and admin sidebar read these
@@ -3116,9 +3194,24 @@ installation without a recorded update or without a repository is 409 (v1 answer
 Success is 200. Non-retryable: no replay identity, and a lost response may follow a
 committed update.
 
+Install, update and upload refuse a package with a `detail` written for the administrator,
+never a URL or checksum. This covers binaries, zip archives, archive links and legacy
+catalog archives. A package that cannot install as listed is 422 `validation_failed`: a
+download whose SHA-256 differs from the catalog's, a catalog index, checksum file or
+download answering 404 or another 4xx, a catalog or checksum file that can't be parsed or
+has no entry for the download, a download address that isn't an http or https link or
+can't be parsed, a catalog entry with no build for this server, a
+`silo_api_version` the server does not support, a binary or archive whose own manifest
+names a different `plugin_id` or `version` than the catalog entry, or a catalog that no
+longer lists the requested version. A catalog, checksum or download host that cannot be
+reached, answers 429 or 5xx, or cuts the response short is 503 `dependency_unavailable`
+with `Retry-After: 30`. Nothing is written in either case; an update leaves the installed
+version in place.
+
 `POST /api/v2/admin/plugins/installations/{id}/restart` stops the installation's process
 and, for a resident plugin, starts it again with a fresh failure budget; a non-resident plugin
-is only stopped and launches on its next use. A disabled installation is 409. Success is 200
+is only stopped, its recorded start failure is cleared, and it launches on its next use. A
+disabled installation is 409. Success is 200
 with the installation, whose `runtime` reports the outcome, including a launch that failed.
 Repeating the request converges on one running process, so it is naturally idempotent.
 
@@ -3128,7 +3221,9 @@ exponential backoff from 1 s to 60 s, and is parked as `failed` after ten consec
 failures until restarted or reconfigured), `state` (`stopped`, `starting`, `running`,
 `backoff`, `failed`), `restart_count`, `last_error`, `last_started_at` and `next_restart_at`.
 Plugins declaring `network_access_provider.v1` are resident; every other plugin starts on
-first use and reports only `running` or `stopped`.
+first use and reports `running`, `stopped`, or `failed` when its last launch on the answering
+server failed, with `last_error` saying why. A later successful launch, an administrator
+restart, an update or a configuration change clears that failure.
 
 `DELETE /api/v2/admin/plugins/installations/{id}` stops the plugin, deletes the row
 (configuration, bindings and archives cascade) and removes its files; on a failed row delete
@@ -3190,6 +3285,8 @@ automatically. A revision precondition (`If-Match`) is a follow-up, not part of 
 `POST /api/v2/admin/plugins/installations/{id}/config/test` probes one prospective entry:
 the server starts a temporary plugin instance with the merged configuration, runs the
 plugin's connection check under a 20 s timeout, and stops the instance. Nothing is stored.
+A metadata provider is checked with a movie search; a marker provider is asked for its
+account statistics, which need the staged credentials.
 A completed failed check, including a plugin without connection-check support, is a 200
 result with `success` false and the message; only transport or store failures are problems.
 The probe launches a process and may call a billed provider, so it is non-retryable: the

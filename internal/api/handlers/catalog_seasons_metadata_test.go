@@ -382,6 +382,10 @@ func TestSeriesSeasonsKeepsMetadataOnlySeasons(t *testing.T) {
 	// Metadata-only seasons have no availability rollup entry.
 	watched(episodeID(3, 1))
 	resuming(episodeID(3, 2))
+	// Linked metadata-only season: the row rollup has no entry, so this
+	// branch must fold the linked metadata episodes.
+	watched(episodeID(5, 1))
+	resuming(episodeID(5, 2))
 	// Fully unlinked but materialized.
 	watched(episodeID(4, 1))
 	watched(episodeID(4, 2))
@@ -403,6 +407,7 @@ func TestSeriesSeasonsKeepsMetadataOnlySeasons(t *testing.T) {
 	}{
 		{"partly linked detail", seasonID(2), 1, 1, 3, false},
 		{"metadata-only detail", seasonID(3), 1, 1, 1, false},
+		{"linked metadata-only detail", seasonID(5), 1, 1, 1, false},
 		{"unlinked materialized detail", seasonID(4), 2, 0, 0, true},
 		{"synthetic available detail", syntheticPrefix + "-S01", 1, 0, 1, false},
 		{"synthetic metadata-only detail", syntheticPrefix + "-S02", 1, 0, 1, false},
@@ -446,6 +451,65 @@ func TestSeriesSeasonsKeepsMetadataOnlySeasons(t *testing.T) {
 	}
 	if unmarked.SeasonUserData == nil || unmarked.SeasonUserData.WatchedCount != 0 || unmarked.SeasonUserData.InProgressCount != 0 || unmarked.SeasonUserData.Played {
 		t.Fatalf("partly linked season unwatched state = %+v, want no progress", unmarked.SeasonUserData)
+	}
+
+	// Synthetic seasons have no season row; watched/unwatched must still
+	// resolve their displayed available or metadata episodes.
+	for _, tc := range []struct{ name, id string }{
+		{"synthetic available season", syntheticPrefix + "-S01"},
+		{"synthetic metadata-only season", syntheticPrefix + "-S02"},
+	} {
+		t.Run(tc.name+" mutation", func(t *testing.T) {
+			if _, err := items.SetWatchedState(authCtx, userID, profileID, tc.id, true, authFilter); err != nil {
+				t.Fatalf("mark synthetic season watched: %v", err)
+			}
+			marked, err := h.ItemDetail(authCtx, authViewer, tc.id)
+			if err != nil {
+				t.Fatalf("synthetic detail after watched mutation: %v", err)
+			}
+			if marked.SeasonUserData == nil || marked.SeasonUserData.WatchedCount != 2 || !marked.SeasonUserData.Played {
+				t.Fatalf("synthetic season watched state = %+v, want both episodes watched", marked.SeasonUserData)
+			}
+			if _, err := items.SetWatchedState(authCtx, userID, profileID, tc.id, false, authFilter); err != nil {
+				t.Fatalf("mark synthetic season unwatched: %v", err)
+			}
+			unmarked, err := h.ItemDetail(authCtx, authViewer, tc.id)
+			if err != nil {
+				t.Fatalf("synthetic detail after unwatched mutation: %v", err)
+			}
+			if unmarked.SeasonUserData == nil || unmarked.SeasonUserData.WatchedCount != 0 || unmarked.SeasonUserData.InProgressCount != 0 || unmarked.SeasonUserData.Played {
+				t.Fatalf("synthetic season unwatched state = %+v, want no progress", unmarked.SeasonUserData)
+			}
+		})
+	}
+
+	// A persisted season row and a metadata-only season can coexist. Both
+	// must appear in the series list; only the missing row is synthesized.
+	mixedPrefix := prefix + "-mixed"
+	if _, err := pool.Exec(ctx, `INSERT INTO media_items(content_id,type,title,genres,default_metadata_language) VALUES($1,'series','Mixed Series','{}','en')`, mixedPrefix); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO media_item_libraries(content_id,media_folder_id) VALUES($1,$2)`, mixedPrefix, library); err != nil {
+		t.Fatal(err)
+	}
+	if err := seasons.Upsert(ctx, &models.Season{ContentID: mixedPrefix + "-S01", SeriesID: mixedPrefix, SeasonNumber: 1, Title: "Season 1", DefaultMetadataLanguage: "en"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := episodes.Upsert(ctx, &models.Episode{ContentID: mixedPrefix + "-S01E01", SeriesID: mixedPrefix, SeasonID: mixedPrefix + "-S01", SeasonNumber: 1, EpisodeNumber: 1, Title: "One", DefaultMetadataLanguage: "en"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := episodes.Upsert(ctx, &models.Episode{ContentID: mixedPrefix + "-S02E01", SeriesID: mixedPrefix, SeasonNumber: 2, EpisodeNumber: 1, Title: "Two", DefaultMetadataLanguage: "en"}); err != nil {
+		t.Fatal(err)
+	}
+	mixed, err := h.SeriesSeasons(ctx, viewer, mixedPrefix, false)
+	if err != nil {
+		t.Fatalf("mixed series seasons: %v", err)
+	}
+	if len(mixed) != 2 || mixed[0].SeasonNumber != 1 || mixed[1].SeasonNumber != 2 {
+		t.Fatalf("mixed series seasons = %+v, want persisted season 1 plus synthesized season 2", mixed)
+	}
+	if mixed[1].EpisodeCount != 1 {
+		t.Fatalf("mixed synthesized season count = %d, want 1", mixed[1].EpisodeCount)
 	}
 
 	if _, err := h.SeriesSeason(ctx, viewer, prefix, 9); err == nil {
