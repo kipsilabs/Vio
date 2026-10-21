@@ -10,6 +10,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/Silo-Server/silo-server/internal/access"
 	"github.com/Silo-Server/silo-server/internal/api/middleware"
 	"github.com/Silo-Server/silo-server/internal/auth"
@@ -18,8 +21,6 @@ import (
 	"github.com/Silo-Server/silo-server/internal/scanner"
 	"github.com/Silo-Server/silo-server/internal/userstore/pgstore"
 	"github.com/Silo-Server/silo-server/internal/watchstate"
-	"github.com/go-chi/chi/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // TestSeriesSeasonsKeepsMetadataOnlySeasons pins two rules with one fixture
@@ -31,6 +32,8 @@ import (
 // set from the series count, season page, ItemEpisodes, SeasonEpisodes, and the
 // season detail. The partly linked season also proves the by-number read keeps
 // unlinked-but-available materialized episodes and their files.
+//
+//nolint:funlen,gocyclo // One DB fixture matrix covers linked, partly linked, unlinked, metadata-only, synthetic, and mixed seasons; splitting it would duplicate the migration-backed setup.
 func TestSeriesSeasonsKeepsMetadataOnlySeasons(t *testing.T) {
 	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
 	if dsn == "" {
