@@ -40,8 +40,12 @@ func (l *VirtualProbeLease) acquire(ctx context.Context, provider string) (func(
 	token := uuid.NewString()
 	attempt, cancel := context.WithTimeout(ctx, time.Second)
 	defer cancel()
-	ok, err := l.Client.SetNX(attempt, key, token, virtualDefaultProbeChainBudget+time.Minute).Result()
-	if err != nil || !ok {
+	// SetArgs with NX replaces the deprecated SetNX. It reports redis.Nil when
+	// the key already exists, which means another holder has the lease.
+	if _, err := l.Client.SetArgs(attempt, key, token, redis.SetArgs{
+		Mode: string(redis.NX),
+		TTL:  virtualDefaultProbeChainBudget + time.Minute,
+	}).Result(); err != nil {
 		return nil, false
 	}
 	return func() {

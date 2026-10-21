@@ -4,12 +4,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
-	"github.com/redis/go-redis/v9"
 	"net"
 	"os"
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/models"
@@ -99,9 +100,9 @@ func TestPreparationRedisUnreachable(t *testing.T) {
 		t.Fatal(err)
 	}
 	addr := listener.Addr().String()
-	listener.Close()
+	_ = listener.Close()
 	client := redis.NewClient(&redis.Options{Addr: addr, MaxRetries: -1})
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 	if _, ok := NewVirtualProbeLease(client, true).acquire(context.Background(), "unreachable"); ok {
 		t.Fatal("unreachable Redis admitted probe")
 	}
@@ -117,7 +118,7 @@ func TestPreparationRedisContentionAndExpiry(t *testing.T) {
 		t.Fatal(err)
 	}
 	client := redis.NewClient(opts)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 	ctx := context.Background()
 	provider := fmt.Sprintf("lease-test-%d", time.Now().UnixNano())
 	lease := NewVirtualProbeLease(client, true)
