@@ -19,14 +19,14 @@ function makeCatalogEntry(
   overrides: { displayName?: string; summary?: string } = {},
 ): PluginCatalogEntry {
   const suffix = String(index).padStart(2, "0");
-  const repoURL = `https://github.com/Silo-Server/plugin-${suffix}`;
+  const repoURL = `https://github.com/Vio-Server/plugin-${suffix}`;
   return {
     repository_id: 1,
     plugin_id: `silo.plugin-${suffix}`,
     version: "1.0.0",
     archive_url: `${repoURL}/releases/download/v1.0.0/plugin-linux-amd64`,
     source_kind: "silo",
-    repository_name: "Silo plugins",
+    repository_name: "Vio plugins",
     repo_url: repoURL,
     presentation: {
       display_name: overrides.displayName ?? `Plugin ${suffix}`,
@@ -37,8 +37,8 @@ function makeCatalogEntry(
       source_url: repoURL,
       support_url: `${repoURL}/issues`,
       changelog_url: `${repoURL}/releases`,
-      publisher_name: "Silo",
-      publisher_url: "https://github.com/Silo-Server",
+      publisher_name: "Vio",
+      publisher_url: "https://github.com/Vio-Server",
       license_spdx: "AGPL-3.0-or-later",
     },
     capabilities: [],
@@ -60,7 +60,7 @@ function makeInstallation(index: number, displayName: string): PluginInstallatio
     enabled: true,
     runtime: { resident: false, state: "stopped", restart_count: 0 },
     source_kind: "silo",
-    repository_name: "Silo plugins",
+    repository_name: "Vio plugins",
     updates_paused: false,
     presentation: {
       display_name: displayName,
@@ -68,11 +68,11 @@ function makeInstallation(index: number, displayName: string): PluginInstallatio
       description_markdown: `Installed description ${suffix}.`,
       setup_markdown: "Configure it.",
       homepage_url: "",
-      source_url: `https://github.com/Silo-Server/installed-${suffix}`,
+      source_url: `https://github.com/Vio-Server/installed-${suffix}`,
       support_url: "",
       changelog_url: "",
-      publisher_name: "Silo",
-      publisher_url: "https://github.com/Silo-Server",
+      publisher_name: "Vio",
+      publisher_url: "https://github.com/Vio-Server",
       license_spdx: "AGPL-3.0-or-later",
     },
     capabilities: [],
@@ -316,7 +316,7 @@ describe("AdminPlugins", () => {
       </MemoryRouter>,
     );
 
-    expect(markup).toContain("Silo maintained");
+    expect(markup).toContain("Vio maintained");
     expect(markup).toContain("Other sources");
     expect(markup).not.toContain("Approved community");
     // Uninstalled plugins come first within a group.
@@ -393,7 +393,7 @@ describe("AdminPlugins", () => {
     expect(markup).toContain("No catalog plugins match");
   });
 
-  it("renders 'vio' source_kind entries under Silo maintained alongside approved_community", () => {
+  it("renders 'vio' source_kind entries under Vio maintained alongside approved_community", () => {
     const vioPlugin1: PluginCatalogEntry = {
       ...makeCatalogEntry(1, { displayName: "TMDB Metadata" }),
       source_kind: "vio",
@@ -423,13 +423,13 @@ describe("AdminPlugins", () => {
       </MemoryRouter>,
     );
 
-    // Both "Silo maintained" and "Approved community" groups must render
-    expect(markup).toContain("Silo maintained");
+    // Both "Vio maintained" and "Approved community" groups must render
+    expect(markup).toContain("Vio maintained");
     expect(markup).toContain("Approved community");
 
-    // Section-scoped placement: Vio plugins inside Silo maintained section, Community inside Approved community
+    // Section-scoped placement: Vio plugins inside Vio maintained section, Community inside Approved community
     const vioSection = markup.slice(
-      markup.indexOf('aria-label="Silo maintained"'),
+      markup.indexOf('aria-label="Vio maintained"'),
       markup.indexOf('aria-label="Approved community"'),
     );
     expect(vioSection).toContain("TMDB Metadata");

@@ -22,7 +22,7 @@ export function sourceLabel(sourceKind: string): string {
   switch (sourceKind) {
     case "vio":
     case "silo":
-      return "Silo maintained";
+      return "Vio maintained";
     case "approved_community":
       return "Approved community";
     default:
@@ -31,7 +31,7 @@ export function sourceLabel(sourceKind: string): string {
 }
 
 /**
- * The notice community and external plugins carry on their page. Silo's own
+ * The notice community and external plugins carry on their page. Vio's own
  * plugins have none.
  */
 export function tierNotice(sourceKind: string): string | null {
@@ -40,9 +40,9 @@ export function tierNotice(sourceKind: string): string | null {
     case "silo":
       return null;
     case "approved_community":
-      return "Reviewed by Silo maintainers to work as described and be safe for its documented use. Its author maintains and supports it, not the Silo project.";
+      return "Reviewed by Vio maintainers to work as described and be safe for its documented use. Its author maintains and supports it, not the Vio project.";
     default:
-      return "Silo has not reviewed this plugin. It comes from a repository or file you added, so only run it if you trust its source.";
+      return "Vio has not reviewed this plugin. It comes from a repository or file you added, so only run it if you trust its source.";
   }
 }
 
@@ -60,7 +60,7 @@ export interface CatalogGroup {
 export const CATALOG_GROUPS: readonly CatalogGroup[] = [
   {
     kind: "vio",
-    title: "Silo maintained",
+    title: "Vio maintained",
     matches: (sourceKind: string) => sourceKind === "vio" || sourceKind === "silo",
   },
   {

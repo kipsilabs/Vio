@@ -73,14 +73,14 @@ describe("pluginPresentation", () => {
   });
 
   it("labels every tier and gives community and external plugins a notice", () => {
-    expect(sourceLabel("silo")).toBe("Silo maintained");
-    expect(sourceLabel("vio")).toBe("Silo maintained");
+    expect(sourceLabel("silo")).toBe("Vio maintained");
+    expect(sourceLabel("vio")).toBe("Vio maintained");
     expect(sourceLabel("approved_community")).toBe("Approved community");
     expect(sourceLabel("external")).toBe("External source");
     expect(tierNotice("silo")).toBeNull();
     expect(tierNotice("vio")).toBeNull();
-    expect(tierNotice("approved_community")).toMatch(/Reviewed by Silo maintainers/);
-    expect(tierNotice("external")).toMatch(/Silo has not reviewed this plugin/);
+    expect(tierNotice("approved_community")).toMatch(/Reviewed by Vio maintainers/);
+    expect(tierNotice("external")).toMatch(/Vio has not reviewed this plugin/);
   });
 
   it("matches catalog groups correctly, falling back unknown kinds to external", () => {
@@ -106,7 +106,7 @@ describe("pluginPresentation", () => {
     expect(safeExternalURL("data:text/html,x")).toBeUndefined();
     expect(safeExternalURL("not a url")).toBeUndefined();
     expect(
-      pluginResourceLinks(undefined, "https://github.com/Silo-Server/x").map((l) => l.label),
+      pluginResourceLinks(undefined, "https://github.com/Vio-Server/x").map((l) => l.label),
     ).toEqual(["Source code"]);
     // A rejected presentation URL falls back to the repository URL.
     expect(
@@ -124,9 +124,9 @@ describe("pluginPresentation", () => {
           publisher_url: "",
           license_spdx: "",
         },
-        "https://github.com/Silo-Server/x",
+        "https://github.com/Vio-Server/x",
       ),
-    ).toEqual([{ label: "Source code", url: "https://github.com/Silo-Server/x" }]);
+    ).toEqual([{ label: "Source code", url: "https://github.com/Vio-Server/x" }]);
   });
 
   it("falls back to a readable name and license", () => {

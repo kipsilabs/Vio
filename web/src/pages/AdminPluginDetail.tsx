@@ -119,7 +119,7 @@ export default function AdminPluginDetail() {
     return (
       <PageUnavailable
         title="Couldn't load plugins"
-        description="Silo couldn't read the installed plugins. Try again in a moment."
+        description="Vio couldn't read the installed plugins. Try again in a moment."
         onRetry={() => void installationsQuery.refetch()}
         retrying={installationsQuery.isFetching}
       >
@@ -135,7 +135,7 @@ export default function AdminPluginDetail() {
     return (
       <PageUnavailable
         title="Couldn't load the plugin catalog"
-        description="This plugin isn't installed, and Silo couldn't read the catalog to look it up."
+        description="This plugin isn't installed, and Vio couldn't read the catalog to look it up."
         onRetry={() => void catalogQuery.refetch()}
         retrying={catalogQuery.isFetching}
       >
@@ -147,7 +147,7 @@ export default function AdminPluginDetail() {
   return (
     <PageUnavailable
       title="Plugin not found"
-      description="This plugin isn't installed and isn't in any catalog Silo can see."
+      description="This plugin isn't installed and isn't in any catalog Vio can see."
     >
       <AllPluginsLink />
     </PageUnavailable>
@@ -406,7 +406,7 @@ function InstalledPluginPage({
                   ? `${name} stopped and won't restart on its own.`
                   : `${name} keeps stopping.`}
               </strong>{" "}
-              Silo has restarted it {runtime.restart_count}{" "}
+              Vio has restarted it {runtime.restart_count}{" "}
               {runtime.restart_count === 1 ? "time" : "times"}
               {runtime.state === "backoff" && runtime.next_restart_at
                 ? `. The next attempt is at ${formatDateTime(runtime.next_restart_at)}.`
@@ -414,8 +414,8 @@ function InstalledPluginPage({
             </p>
           ) : (
             <p>
-              <strong className="font-semibold">{name} failed to start.</strong> Silo tries again
-              the next time it needs the plugin.
+              <strong className="font-semibold">{name} failed to start.</strong> Vio tries again the
+              next time it needs the plugin.
             </p>
           )}
           {runtime.last_error ? (
@@ -471,7 +471,7 @@ function InstalledPluginPage({
           <AlertDialogHeader>
             <AlertDialogTitle>Uninstall {name}?</AlertDialogTitle>
             <AlertDialogDescription>
-              Silo will stop the plugin, then remove its installation, configuration, and installed
+              Vio will stop the plugin, then remove its installation, configuration, and installed
               files. This cannot be undone.
             </AlertDialogDescription>
           </AlertDialogHeader>
