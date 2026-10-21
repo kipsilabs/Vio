@@ -35,21 +35,21 @@ type VirtualCandidatesDiscoveryService interface {
 
 const (
 	// preplayDiscoveryWatchBudget bounds version discovery started from
-	// GET /watch/{id}: the caller is preparing to play, so a cold provider
-	// scrape may be waited out before the answer.
-	preplayDiscoveryWatchBudget = 15 * time.Second
+	// GET /watch/{id}. The caller is about to play, but the discovery work is
+	// detached and the start path resolves its own candidate; waiting longer
+	// only delays the player's first request.
+	preplayDiscoveryWatchBudget = 2 * time.Second
 	// preplayDiscoveryCatalogBudget bounds the same discovery started from a
 	// catalog leaf detail read: browsing is the hot path (Android opens item
 	// detail before any watch request), so the answer keeps a short budget
 	// while the discovery service keeps working detached from it.
 	//
-	// Three seconds, not two: cold provider scrapes run anywhere from tens of
-	// milliseconds to about 2.5s, and the original two-second budget cut the
-	// longest of them off after the wall-clock overhead around the scrape.
-	// Android has no refetch of its own, so a budget loss is a lost
-	// first-open answer, not a delayed one. Deployments tune it with the
-	// admin Streaming setting virtual_library.catalog_discovery_budget_ms.
-	preplayDiscoveryCatalogBudget = 3 * time.Second
+	// One second keeps navigation responsive. The discovery work continues
+	// detached after this waiter returns, so a cold provider scrape is not
+	// lost; the detail page reads the already-persisted rows and the chain
+	// publishes the refreshed inventory when it lands. Deployments tune it
+	// with the admin Streaming setting virtual_library.catalog_discovery_budget_ms.
+	preplayDiscoveryCatalogBudget = 1 * time.Second
 
 	// preplayDiscoveryDetailRepeatWindow is how long a successful detail
 	// discovery suppresses another list for the same viewer, item, selected

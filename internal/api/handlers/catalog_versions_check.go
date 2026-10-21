@@ -27,9 +27,9 @@ const (
 	// versionCheckConcurrency bounds simultaneous provider resolutions.
 	versionCheckConcurrency = 4
 	// versionCheckPerFileBudget bounds one file's provider resolution.
-	versionCheckPerFileBudget = 6 * time.Second
+	versionCheckPerFileBudget = 1500 * time.Millisecond
 	// versionCheckOverallBudget bounds the whole batch.
-	versionCheckOverallBudget = 15 * time.Second
+	versionCheckOverallBudget = 3 * time.Second
 )
 
 type versionCheckRequest struct {
@@ -207,6 +207,15 @@ func (h *CatalogResourceHandler) checkVersion(ctx context.Context, fileID int) v
 	}
 	if !isVirtualPlaybackFile(file) {
 		outcome.available = file.MissingSince == nil
+		return outcome
+	}
+	// A probed row already carries real evidence for its pinned bytes. Version
+	// liveness is a navigation surface, not a second probe: resolving every
+	// warm row here fan-outs one provider call per version and used to take
+	// whole seconds for a season page. Durable failed_at rows still resolve so
+	// a recovered pin can clear its verdict.
+	if file.ProbeUpdatedAt != nil && file.FailedAt == nil {
+		outcome.available = true
 		return outcome
 	}
 	if h.VirtualResolver == nil {

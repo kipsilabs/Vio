@@ -425,13 +425,20 @@ func (h *PlaybackHandler) runDefaultFileProbeChain(ctx context.Context, contentI
 	// Zero the duration so the probe measures the empirical duration instead
 	// of inheriting the catalog value.
 	probeTransient.Duration = 0
+	probeURL, probeHeaders, hasProbeURL := h.virtualChainProbeURL(ctx, row, *probeCand, filter)
+	if !hasProbeURL {
+		logVirtualProbeChainSkip(ctx, slog.LevelDebug, contentID,
+			virtualProbeChainReasonNoExactCandidate, "no_provider_url", virtualEvidenceLogKeyFileID, row.ID)
+		return
+	}
+	probeCand.RequestHeaders = probeHeaders
 	// The chain probes the selected/default row's own candidate bytes and uses
 	// the durable evidence path: an already-loaded detail/version page can only
 	// be invalidated after the tracks are actually committed. No session binding
 	// exists here, so the fence is nil and the identity tiers are zero — the same
 	// posture the unstamped-row fast path takes, where the row owns its candidate.
 	outcome, _ := h.probeVirtualSourceAndPersistWith(
-		ctx, stickyKey, row, row.FilePath, probeTransient, *probeCand,
+		ctx, stickyKey, row, probeURL, probeTransient, *probeCand,
 		resolver.PersistedIdentityTiers{}, expectedRuntimeMinutes, oid, true, nil,
 	)
 	if outcome == probeOutcomeVerified && h.EventsHub != nil {
@@ -452,6 +459,36 @@ func (h *PlaybackHandler) runDefaultFileProbeChain(ctx context.Context, contentI
 		logVirtualProbeChainSkip(ctx, slog.LevelInfo, contentID,
 			virtualProbeChainReasonProbeIncomplete, "probe", virtualEvidenceLogKeyFileID, row.ID)
 	}
+}
+
+// virtualChainProbeURL resolves the HTTP source the pre-play probe must open.
+// The catalog row and the discovery listing both name the candidate by its
+// durable virtual URI; that URI is not a provider transport and must never be
+// handed to ffprobe. The fresh listing's resolved URL is preferred, then the
+// row's stored URL while unexpired, then a fresh resolve under the same access
+// filter that authorized discovery.
+func (h *PlaybackHandler) virtualChainProbeURL(ctx context.Context, row *models.MediaFile, cand VirtualPlaybackStream, filter catalog.AccessFilter) (string, map[string]string, bool) {
+	if row == nil {
+		return "", nil, false
+	}
+	if url := strings.TrimSpace(cand.ProviderURL); url != "" {
+		return url, maps.Clone(cand.RequestHeaders), true
+	}
+	if url := strings.TrimSpace(row.ResolvedURL); url != "" &&
+		(row.ResolvedURLExpiresAt == nil || row.ResolvedURLExpiresAt.After(time.Now())) {
+		return url, maps.Clone(row.ProviderRequestHeaders), true
+	}
+	if h.VirtualMediaDetailedResolver == nil {
+		return "", nil, false
+	}
+	resolved, err := h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
+		ctx, row.FilePath, row.VirtualOwnerInstallationID, filter.UserID, filter.ProfileID,
+		false, nil, "",
+	)
+	if err != nil || strings.TrimSpace(resolved.URL) == "" {
+		return "", nil, false
+	}
+	return resolved.URL, maps.Clone(resolved.RequestHeaders), true
 }
 
 // virtualDefaultProbeCandidate resolves the exact bytes the chain may probe.
@@ -505,6 +542,8 @@ func virtualPlaybackStreamFromFile(row *models.MediaFile) *VirtualPlaybackStream
 	}
 	stream := &VirtualPlaybackStream{
 		URI:                 row.FilePath,
+		ProviderURL:         row.ResolvedURL,
+		ProviderExpiresAt:   row.ResolvedURLExpiresAt,
 		OwnerInstallationID: row.VirtualOwnerInstallationID,
 		Resolution:          row.Resolution,
 		CodecVideo:          row.CodecVideo,
