@@ -17,8 +17,10 @@ import (
 // decisions assume, which a fake QueryRow cannot.
 
 // TestVirtualAdoptionBoundDBCASStaleSnapshotIsZeroRow proves the CAS fence
-// really rejects a stale snapshot against the migrated schema: a write whose
-// captured updated_at no longer matches leaves the whole row byte-identical.
+// still rejects a genuinely stale snapshot against the migrated schema: a write
+// whose captured probe stamp no longer matches leaves the whole row
+// byte-identical. A catalog re-list that advances only updated_at is handled by
+// the bounded revision retry and is covered separately.
 func TestVirtualAdoptionBoundDBCASStaleSnapshotIsZeroRow(t *testing.T) {
 	pool := virtualMetadataUpdateTestPool(t)
 	ctx := context.Background()
@@ -37,6 +39,13 @@ func TestVirtualAdoptionBoundDBCASStaleSnapshotIsZeroRow(t *testing.T) {
 		t.Fatalf("insert row: %v", err)
 	}
 	before := readVirtualEvidenceRowJSON(t, pool, id)
+	// Another probe committed after the caller's snapshot. The path is
+	// unchanged, but the probe stamp is not, so this is not catalog re-list
+	// churn and the revision retry must not re-base it.
+	if _, err := pool.Exec(ctx, `UPDATE media_files SET probe_updated_at = now(), updated_at = now() WHERE id = $1`, id); err != nil {
+		t.Fatalf("advance probe stamp: %v", err)
+	}
+	before = readVirtualEvidenceRowJSON(t, pool, id)
 
 	args := models.VirtualFilePersistArgs{
 		FileID:           id,
