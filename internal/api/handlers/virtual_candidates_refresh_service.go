@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/sync/singleflight"
@@ -163,7 +164,8 @@ type VirtualCandidatesRefreshService struct {
 	// PlaybackHandler.ScheduleDefaultFileProbe implements this.
 	ScheduleDefaultFileProbe func(contentID string, source *models.MediaFile, streams []VirtualPlaybackStream, filter catalog.AccessFilter)
 
-	flight singleflight.Group
+	flight      singleflight.Group
+	sourceLocks [64]sync.Mutex
 }
 
 // RefreshVirtualCandidates re-lists and persists the item's virtual candidates
@@ -206,6 +208,19 @@ func (s *VirtualCandidatesRefreshService) HasVirtualSource(ctx context.Context, 
 		return false, err
 	}
 	return len(sources) > 0, nil
+}
+
+// lockSource serializes the provider list and its persistence for one source.
+// A listing that starts before a detail run must not commit its candidates
+// after the detail run has persisted and scheduled its preparation.
+func (s *VirtualCandidatesRefreshService) lockSource(key string) func() {
+	var hash uint32
+	for i := 0; i < len(key); i++ {
+		hash = hash*16777619 ^ uint32(key[i])
+	}
+	mu := &s.sourceLocks[hash%uint32(len(s.sourceLocks))]
+	mu.Lock()
+	return mu.Unlock
 }
 
 func (s *VirtualCandidatesRefreshService) listVirtualCandidates(ctx context.Context, userID int, profileID, contentID string, filter catalog.AccessFilter, lister VirtualPlaybackStreamLister, keyPrefix string, mode VirtualDiscoveryMode) ([]catalog.FileVersion, error) {
@@ -253,6 +268,8 @@ func (s *VirtualCandidatesRefreshService) listVirtualCandidates(ctx context.Cont
 		// own cancellation while waiting via the select below.
 		workCtx := context.WithoutCancel(ctx)
 		refreshCh := s.flight.DoChan(key, func() (any, error) {
+			releaseSource := s.lockSource(virtualSourceRefreshKey(source))
+			defer releaseSource()
 			_, err := s.listSource(workCtx, source, userID, profileID, lister, chainKey, filter)
 			return nil, err
 		})

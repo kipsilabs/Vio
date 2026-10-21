@@ -22,6 +22,7 @@ import (
 // fixed error, and can answer a different detail after the refresh so a test
 // can prove the response is the post-refresh list.
 type fakeRefreshDetail struct {
+	mu     sync.Mutex
 	detail *catalog.WatchDetail
 	post   *catalog.WatchDetail
 	err    error
@@ -29,6 +30,8 @@ type fakeRefreshDetail struct {
 }
 
 func (f *fakeRefreshDetail) WatchDetail(_ context.Context, _ int, _ string, _ string, _ catalog.AccessFilter) (*catalog.WatchDetail, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.calls++
 	if f.err != nil {
 		return nil, f.err
@@ -677,13 +680,15 @@ func TestVirtualCandidatesListingOnlyAndDetailFlightsDoNotCoalesce(t *testing.T)
 		defer func() { done <- struct{}{} }()
 		_, _ = service.DiscoverVirtualCandidates(context.Background(), 1, "profile", "movie:x", catalog.AccessFilter{}, VirtualDiscoveryDetail)
 	}()
+	// The per-source critical section makes the detail run wait for the
+	// listing's list-and-persist; release the listing, then expect the
+	// detail run's own provider call.
+	close(release)
 	select {
 	case <-started:
 	case <-time.After(2 * time.Second):
-		close(release)
-		t.Fatal("detail discovery coalesced into the listing-only flight")
+		t.Fatal("detail discovery did not issue its own provider call")
 	}
-	close(release)
 	for i := 0; i < 2; i++ {
 		select {
 		case <-done:
@@ -693,5 +698,75 @@ func TestVirtualCandidatesListingOnlyAndDetailFlightsDoNotCoalesce(t *testing.T)
 	}
 	if got := scheduled.Load(); got != 1 {
 		t.Fatalf("scheduled preparations = %d, want exactly the detail run's one", got)
+	}
+}
+
+// TestVirtualCandidatesPersistSerializedPerSource pins that a listing that
+// starts first cannot commit its candidates while a detail run is persisting,
+// and the detail run therefore commits and schedules last.
+func TestVirtualCandidatesPersistSerializedPerSource(t *testing.T) {
+	source := refreshTestSource(7, "movie:x", "virtual://movie/x")
+	streams := []VirtualPlaybackStream{{ID: "candidate", URI: "virtual://movie/x?result=candidate"}}
+	detail := refreshTestDetail()
+	detail.Type = "movie"
+	firstPersist := make(chan struct{})
+	secondPersist := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var calls atomic.Int32
+	var scheduled atomic.Int32
+	service := &VirtualCandidatesRefreshService{
+		Detail: &fakeRefreshDetail{detail: detail},
+		ListCached: VirtualPlaybackStreamListerFunc(func(context.Context, string, int, string, int) ([]VirtualPlaybackStream, error) {
+			return streams, nil
+		}),
+		ContentFiles: func(context.Context, string) ([]*models.MediaFile, error) {
+			return []*models.MediaFile{source}, nil
+		},
+		Persist: func(context.Context, *models.MediaFile, []VirtualPlaybackStream) error {
+			if calls.Add(1) == 1 {
+				close(firstPersist)
+				<-releaseFirst
+			} else {
+				close(secondPersist)
+			}
+			return nil
+		},
+	}
+	service.ScheduleDefaultFileProbe = func(string, *models.MediaFile, []VirtualPlaybackStream, catalog.AccessFilter) {
+		scheduled.Add(1)
+	}
+
+	done := make(chan struct{}, 2)
+	go func() {
+		defer func() { done <- struct{}{} }()
+		_, _ = service.DiscoverVirtualCandidates(context.Background(), 1, "profile", "movie:x", catalog.AccessFilter{}, VirtualDiscoveryListingOnly)
+	}()
+	select {
+	case <-firstPersist:
+	case <-time.After(2 * time.Second):
+		t.Fatal("listing-only run never reached persistence")
+	}
+	go func() {
+		defer func() { done <- struct{}{} }()
+		_, _ = service.DiscoverVirtualCandidates(context.Background(), 1, "profile", "movie:x", catalog.AccessFilter{}, VirtualDiscoveryDetail)
+	}()
+	select {
+	case <-secondPersist:
+		t.Fatal("detail run overlapped the listing's persistence")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(releaseFirst)
+	for i := 0; i < 2; i++ {
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("discovery run did not finish")
+		}
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("persist calls = %d, want the listing and detail writes", got)
+	}
+	if got := scheduled.Load(); got != 1 {
+		t.Fatalf("scheduled preparations = %d, want the detail run's one", got)
 	}
 }
