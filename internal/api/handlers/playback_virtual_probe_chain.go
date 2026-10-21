@@ -454,12 +454,14 @@ func (h *PlaybackHandler) runDefaultFileProbeChain(ctx context.Context, contentI
 	}
 }
 
-// virtualDefaultProbeCandidate matches the default row's exact bytes against
-// the listing the discovery run just persisted. An exact URI match is the only
-// admissible enumeration target: the row's persisted identity must be the
-// bytes the probe opens. The neutral group row itself is never admissible —
-// the just-persisted listing necessarily contains it (under the same virtual
-// path the group was listed from) without naming any specific release.
+// virtualDefaultProbeCandidate resolves the exact bytes the chain may probe.
+// An exact URI match against the listing the discovery run just persisted is
+// preferred. A selected version may also use its own persisted row when the
+// fresh listing dropped that profile variant: the target read authorized the
+// row, and a neutral source covers every profile variant beneath its base path.
+// A profile-specific source covers only its own group. The neutral group row
+// itself is never admissible — it names no specific release and may resolve to
+// a sibling candidate, so the play path's own probe handles it.
 func virtualDefaultProbeCandidate(row *models.MediaFile, source *models.MediaFile, streams []VirtualPlaybackStream, allowPersistedSelected bool) *VirtualPlaybackStream {
 	if row == nil || source == nil {
 		return nil
