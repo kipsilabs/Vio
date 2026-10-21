@@ -55,8 +55,8 @@ func TestProbeGroupsFirstCompletesBeforeSelectedGroup(t *testing.T) {
 	}
 	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), probeChainStreams(row), filter)
 	h.probeChainWG.Wait()
-	if prober.count() != 1 || prober.last() != row.FilePath {
-		t.Fatal("second group did not probe exactly the selected target")
+	if prober.count() != 1 || prober.last() != probeChainProviderURL(row.FilePath) {
+		t.Fatal("second group did not probe exactly the selected target's provider URL")
 	}
 	reads := target.callCount()
 	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), probeChainStreams(row), catalog.AccessFilter{})

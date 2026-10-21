@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"maps"
+	"net/url"
 	"runtime/debug"
 	"slices"
 	"strconv"
@@ -77,6 +78,10 @@ const (
 	virtualProbeChainReasonSiblingTarget      = "sibling_target"
 	virtualProbeChainReasonRecentlyFailed     = "recently_failed"
 	virtualProbeChainReasonGateBusy           = "gate_busy"
+	virtualProbeChainReasonRevalidateFailed   = "revalidate_failed"
+	virtualProbeChainReasonLeaseRefused       = "lease_refused"
+	virtualProbeChainReasonProviderStartLimit = "provider_start_limited"
+	virtualProbeChainReasonSourceCooldown     = "source_cooldown"
 )
 
 // Refusal logging has constant memory and a process-wide budget, independent
@@ -594,7 +599,10 @@ func (h *PlaybackHandler) runDefaultFileProbeChain(ctx context.Context, contentI
 	}
 	oid := row.VirtualOwnerInstallationID
 	if virtualProbeFailures.recent(virtualProbeFailureKey(probeCand.URI, oid)) {
-		logVirtualProbeChainSkip(ctx, slog.LevelDebug, contentID,
+		// A candidate that failed recently is intentionally not re-probed on
+		// every open, but that suppression is the one refusal that otherwise
+		// looks identical to a chain that never ran, so it is named at info.
+		logVirtualProbeChainSkip(ctx, slog.LevelInfo, contentID,
 			virtualProbeChainReasonRecentlyFailed, "", virtualEvidenceLogKeyFileID, row.ID)
 		return
 	}
@@ -623,21 +631,38 @@ func (h *PlaybackHandler) runDefaultFileProbeChain(ctx context.Context, contentI
 	if target, ok := h.DefaultProbeTarget.(interface {
 		Revalidate(context.Context, string, catalog.AccessFilter, *models.MediaFile) bool
 	}); ok && !target.Revalidate(ctx, contentID, filter, row) {
+		// The authorized read that selected the target no longer returns it
+		// under the same filter: discovery replaced or re-scoped the rows while
+		// this chain was queued. Nothing safe to enumerate, but the refusal is
+		// named — without this line a refused revalidation looks exactly like a
+		// chain that silently stopped.
+		logVirtualProbeChainSkip(ctx, slog.LevelInfo, contentID,
+			virtualProbeChainReasonRevalidateFailed, "revalidate", virtualEvidenceLogKeyFileID, row.ID)
 		return
 	}
 	// Only an exact, runnable probe consumes the source allowance. Default
 	// and selected targets share it; unrelated groups cannot consume it.
 	releaseLease, admitted := h.ProbeLease.acquire(ctx, strconv.Itoa(oid))
 	if !admitted {
+		// A configured Redis that is unreachable, or another chain holding this
+		// provider's lease, refuses optional work. Both are correct, and both
+		// must be visible: a permanent silent refusal disables preparation
+		// while every other signal still says the chain selected a target.
+		logVirtualProbeChainSkip(ctx, slog.LevelInfo, contentID,
+			virtualProbeChainReasonLeaseRefused, "lease", virtualEvidenceLogKeyFileID, row.ID)
 		return
 	}
 	defer releaseLease()
 	if !h.defaultProbeChains.allowProviderStart(strconv.Itoa(oid)) {
+		logVirtualProbeChainSkip(ctx, slog.LevelInfo, contentID,
+			virtualProbeChainReasonProviderStartLimit, "provider_start", virtualEvidenceLogKeyFileID, row.ID)
 		return
 	}
 	cooldownKey := contentID + "\x00" + virtualSourceRefreshKey(source)
 	recent, owner := h.defaultProbeChains.recentlyStarted(cooldownKey, true)
 	if recent {
+		logVirtualProbeChainSkip(ctx, slog.LevelDebug, contentID,
+			virtualProbeChainReasonSourceCooldown, "cooldown", virtualEvidenceLogKeyFileID, row.ID)
 		return
 	}
 	completed := false
@@ -646,6 +671,15 @@ func (h *PlaybackHandler) runDefaultFileProbeChain(ctx context.Context, contentI
 			h.defaultProbeChains.rollbackCooldown(cooldownKey, owner)
 		}
 	}()
+	// Name the enumeration before it starts and its verdict after it returns.
+	// A chain that reaches the probe and then persists nothing otherwise looks
+	// identical to one that never probed at all.
+	slog.InfoContext(ctx, "virtual pre-play probe started",
+		virtualEvidenceLogKeyComponent, virtualEvidenceLogValueAPI,
+		contentIDKey, contentID,
+		virtualEvidenceLogKeyFileID, row.ID,
+		"candidate_uri", probeCand.URI,
+		"probe_host", virtualProbeURLHost(probeCand.ProviderURL))
 	outcome := h.probeVirtualSourceAndPersist(
 		ctx, stickyKey, row, strings.TrimSpace(probeCand.ProviderURL), probeTransient, *probeCand,
 		resolver.NewPersistedIdentityTiers(
@@ -667,6 +701,26 @@ func (h *PlaybackHandler) runDefaultFileProbeChain(ctx context.Context, contentI
 		logVirtualProbeChainSkip(ctx, slog.LevelInfo, contentID,
 			virtualProbeChainReasonProbeIncomplete, "probe", virtualEvidenceLogKeyFileID, row.ID)
 	}
+	// The chain is done and the evidence write has been queued. Naming the
+	// verdict here is what separates "probed, evidence refused later" from
+	// "never probed": without it a successful enumeration that persists
+	// nothing leaves no trace at all.
+	slog.InfoContext(ctx, "virtual pre-play probe finished",
+		virtualEvidenceLogKeyComponent, virtualEvidenceLogValueAPI,
+		contentIDKey, contentID,
+		virtualEvidenceLogKeyFileID, row.ID,
+		"outcome", outcome)
+}
+
+// virtualProbeURLHost returns the host of a concrete provider URL for logs.
+// The provider URL may carry a token in its path or query, so only the host is
+// recorded; the candidate URI already identifies the release.
+func virtualProbeURLHost(rawURL string) string {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || parsed.Host == "" {
+		return ""
+	}
+	return parsed.Host
 }
 
 // probeableSiblingTarget returns the first authorized version row the

@@ -157,7 +157,9 @@ func TestSlowPreparationDoesNotBlockForegroundProbe(t *testing.T) {
 	h, target, _ := probeChainHandler(row)
 	target.releaseRow()
 	h.VirtualPlaybackSourceProber = func(ctx context.Context, url string, file *models.MediaFile) (*models.MediaFile, error) {
-		if url == row.FilePath {
+		// Preparation probes the listing's concrete provider URL, never the
+		// catalog's virtual:// row path: the prober cannot open a virtual URI.
+		if url == probeChainProviderURL(row.FilePath) {
 			close(entered)
 			select {
 			case <-unblock:
