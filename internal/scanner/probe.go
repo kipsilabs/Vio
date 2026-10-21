@@ -35,10 +35,8 @@ const (
 	// a successful probe. These limits exceed the playback pipelines' caps
 	// (3 s / 5 MB — see playback/transcode.go and playback/remux.go) so the
 	// metadata probe sees the same stream table playback does.
-	probeAnalyzeDuration     = "10M" // 10 s (10,000,000 us)
-	probeSizeLimit           = "32M" // 32 MiB
-	probeSizeFlag            = "-probesize"
-	probeAnalyzeDurationFlag = "-analyzeduration"
+	probeAnalyzeDuration = "10M" // 10 s (10,000,000 us)
+	probeSizeLimit       = "32M" // 32 MiB
 )
 
 var errFFprobeOutputTooLarge = fmt.Errorf("ffprobe output exceeds %d bytes", maxFFprobeOutputBytes)
@@ -115,8 +113,8 @@ func buildProbeArgs(filePath string) []string {
 		"-show_format",
 		"-show_streams",
 		"-show_chapters",
-		probeSizeFlag, probeSizeLimit,
-		probeAnalyzeDurationFlag, probeAnalyzeDuration,
+		"-probesize", probeSizeLimit,
+		"-analyzeduration", probeAnalyzeDuration,
 		filePath,
 	}
 }
@@ -170,41 +168,6 @@ func probeTimedOut(ctx, runCtx context.Context) bool {
 // timeout, which IsProbeRejection does not count against the file.
 func ProbeFile(ctx context.Context, ffprobePath string, filePath string) (*ProbeData, error) {
 	return probeFileWithin(ctx, ffprobePath, filePath, defaultProbeLimits)
-}
-
-// runProbeFFprobe executes one bounded ffprobe invocation and parses its
-// bounded JSON output. It is the shared exec tail for the full file probe and
-// the start-path metadata-only stream enumeration; callers own argument
-// construction, deadlines, and any post-parse work.
-func runProbeFFprobe(ctx context.Context, ffprobePath string, args []string, filePath string) (*ProbeData, *ffprobeOutput, error) {
-	cmd := exec.CommandContext(ctx, ffprobePath, args...) //nolint:gosec // ffprobePath is the configured binary and args are built by the scanner.
-	killProcessGroupOnCancel(cmd)
-	cmd.WaitDelay = defaultProbeLimits.waitDelay
-	output := &boundedProbeBuffer{limit: maxFFprobeOutputBytes}
-	cmd.Stdout = output
-	if err := cmd.Run(); err != nil {
-		processmetrics.Record(processmetrics.Probe, cmd.ProcessState, err, ctx.Err())
-		if output.overflow || errors.Is(err, errFFprobeOutputTooLarge) {
-			return nil, nil, errFFprobeOutputTooLarge
-		}
-		return nil, nil, fmt.Errorf("ffprobe failed for %s: %w", filePath, err)
-	}
-	if output.overflow {
-		return nil, nil, errFFprobeOutputTooLarge
-	}
-	processmetrics.Record(processmetrics.Probe, cmd.ProcessState, nil, ctx.Err())
-
-	var raw ffprobeOutput
-	if err := json.Unmarshal(output.Bytes(), &raw); err != nil {
-		return nil, nil, fmt.Errorf("ffprobe JSON parse failed for %s: %w", filePath, err)
-	}
-	if len(raw.Streams) > maxFFprobeStreams {
-		return nil, nil, fmt.Errorf("ffprobe returned %d streams (maximum %d)", len(raw.Streams), maxFFprobeStreams)
-	}
-	if len(raw.Chapters) > maxFFprobeChapters {
-		return nil, nil, fmt.Errorf("ffprobe returned %d chapters (maximum %d)", len(raw.Chapters), maxFFprobeChapters)
-	}
-	return convertProbeData(&raw), &raw, nil
 }
 
 func probeFileWithin(ctx context.Context, ffprobePath string, filePath string, limits probeLimits) (*ProbeData, error) {
