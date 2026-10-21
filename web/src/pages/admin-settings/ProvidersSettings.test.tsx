@@ -218,6 +218,11 @@ describe("ProvidersSettings", () => {
         name: /Manage|Connect|Set up/,
       }),
     );
+    expect(
+      screen.getByText(
+        "OpenSubtitles signs you in with your username, not your email. Leave blank to keep the saved one.",
+      ),
+    ).toBeInTheDocument();
     await user.type(screen.getByLabelText(/Username/i), "user");
 
     // Tile drafts live outside useSettingsForm; the navigation guard and the
