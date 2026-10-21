@@ -21,10 +21,12 @@ a one-minute source cooldown checked before catalog reads and reserved immediate
 before probing, and at most four probe starts per provider
 installation in any minute. Cooldown and provider-start tracking are bounded to
 1,024 entries; saturation rejects work rather than evicting live allowances.
-A cooldown refusal performs no catalog read. Work skipped before probing reserves
-no source cooldown; a failed probe or panic rolls back only its own reservation,
-never a newer chain's allowance. Default and selected targets share the same
-source allowance.
+A scheduling-time cooldown refusal performs no catalog read; admission is checked
+again immediately before probing, so two chains with different selections may
+both read the catalog and then contend at the reservation. Work skipped before
+probing reserves no source cooldown; a failed probe or panic rolls back only its
+own reservation, never a newer chain's allowance. Default and selected targets
+share the same source allowance.
 Selected-target discovery also admits at most two detached provider listings;
 excess selections return the existing versions without starting more work.
 
@@ -299,13 +301,16 @@ appears on `GET /api/v2/catalog/items/{id}`, `GET /api/v2/watch/{id}`, and
 the admin metadata update response, keeping v1 answers byte-identical.
 
 After a detail-page read persists a listing, the server schedules one detached
-pre-play probe chain for the opened item: it re-reads the item's default
-version, requires that the default row is a persisted candidate whose exact
-bytes the just-persisted listing names, and probes that candidate through
-the ordinary background evidence path (queued, coalescing write). A neutral
+pre-play probe chain for the opened item: it prepares the selected `file_id` when
+the read supplied one, and the default version otherwise, requiring that the
+resolved row is a persisted candidate whose exact bytes the just-persisted
+listing names, and probes that candidate through the ordinary background
+evidence path (queued, coalescing write). Chains are deduplicated by item,
+selection, and provider source group, so the default and a picked version are
+separate preparations for the same item. A neutral
 group row is never probed speculatively — it may resolve to a sibling
 candidate, so the play path's own probe handles it. Chains are bounded (two
-concurrent, one per item, a whole-chain deadline, and the shared probe
+concurrent per process, a whole-chain deadline, and the shared probe
 gate), never block any API response, and never wait for playback: a chain may
 record evidence before a play attempt resolves the same row, in which case that
 attempt reuses it, and a play attempt that resolves first probes on its own as
