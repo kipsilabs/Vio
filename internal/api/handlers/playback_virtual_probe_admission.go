@@ -14,6 +14,14 @@ import (
 // A configured but unreachable Redis rejects optional work.
 type VirtualProbeLease struct{ Client *redis.Client }
 
+// NewVirtualProbeLease preserves configured-but-unavailable Redis as fail closed.
+func NewVirtualProbeLease(client *redis.Client, configured bool) *VirtualProbeLease {
+	if !configured && client == nil {
+		return nil
+	}
+	return &VirtualProbeLease{Client: client}
+}
+
 var releaseVirtualProbeLease = redis.NewScript(`
 if redis.call('GET', KEYS[1]) == ARGV[1] then
  return redis.call('DEL', KEYS[1])

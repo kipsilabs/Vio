@@ -2,6 +2,11 @@ package handlers
 
 import (
 	"context"
+	"crypto/sha256"
+	"fmt"
+	"github.com/redis/go-redis/v9"
+	"net"
+	"os"
 	"strconv"
 	"testing"
 	"time"
@@ -72,5 +77,113 @@ func TestSelectedProbeSubmissionRevalidatesPermissions(t *testing.T) {
 	}
 	if prober.count() != 0 {
 		t.Fatal("permission change did not stop submission")
+	}
+}
+
+func TestPreparationRedisBootstrap(t *testing.T) {
+	for _, configured := range []bool{false, true} {
+		lease := NewVirtualProbeLease(nil, configured)
+		release, ok := lease.acquire(context.Background(), "bootstrap")
+		if ok == configured {
+			t.Fatalf("configured=%v admitted=%v", configured, ok)
+		}
+		if ok {
+			release()
+		}
+	}
+}
+
+func TestPreparationRedisUnreachable(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := listener.Addr().String()
+	listener.Close()
+	client := redis.NewClient(&redis.Options{Addr: addr, MaxRetries: -1})
+	defer client.Close()
+	if _, ok := NewVirtualProbeLease(client, true).acquire(context.Background(), "unreachable"); ok {
+		t.Fatal("unreachable Redis admitted probe")
+	}
+}
+
+func TestPreparationRedisContentionAndExpiry(t *testing.T) {
+	endpoint := os.Getenv("SILO_TEST_REDIS_URL")
+	if endpoint == "" {
+		t.Skip("SILO_TEST_REDIS_URL required for running Redis lease coverage")
+	}
+	opts, err := redis.ParseURL(endpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := redis.NewClient(opts)
+	defer client.Close()
+	ctx := context.Background()
+	provider := fmt.Sprintf("lease-test-%d", time.Now().UnixNano())
+	lease := NewVirtualProbeLease(client, true)
+	release, ok := lease.acquire(ctx, provider)
+	if !ok {
+		t.Fatal("first lease refused")
+	}
+	defer release()
+	if _, ok := lease.acquire(ctx, provider); ok {
+		t.Fatal("contending lease admitted")
+	}
+	key := fmt.Sprintf("vio:preplay:provider:%x", sha256.Sum256([]byte(provider)))
+	if err := client.PExpire(ctx, key, -time.Millisecond).Err(); err != nil {
+		t.Fatal(err)
+	}
+	secondRelease, ok := lease.acquire(ctx, provider)
+	if !ok {
+		t.Fatal("expired lease blocked new owner")
+	}
+	defer secondRelease()
+	release()
+	if _, ok := lease.acquire(ctx, provider); ok {
+		t.Fatal("old owner released new lease")
+	}
+	secondRelease()
+	thirdRelease, ok := lease.acquire(ctx, provider)
+	if !ok {
+		t.Fatal("released lease blocked new owner")
+	}
+	thirdRelease()
+}
+
+func TestSlowPreparationDoesNotBlockForegroundProbe(t *testing.T) {
+	row := probeChainRow(904, "virtual://movie/probe-chain?result=slow", nil)
+	entered, unblock := make(chan struct{}), make(chan struct{})
+	h, target, _ := probeChainHandler(row)
+	target.releaseRow()
+	h.VirtualPlaybackSourceProber = func(ctx context.Context, url string, file *models.MediaFile) (*models.MediaFile, error) {
+		if url == row.FilePath {
+			close(entered)
+			select {
+			case <-unblock:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		return file, nil
+	}
+	defer func() { close(unblock); h.probeChainWG.Wait() }()
+	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), probeChainStreams(row), catalog.AccessFilter{})
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("preparation did not enter provider")
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := h.probeVirtualSource(context.Background(), "foreground", &models.MediaFile{}, nil)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("foreground probe waited for slow preparation")
 	}
 }

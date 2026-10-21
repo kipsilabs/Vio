@@ -236,8 +236,14 @@ func (a *defaultProbeChainAdmission) recentlyStarted(key string, reserve bool) b
 		delete(a.cooldowns, oldest)
 		a.cooldownQueue = a.cooldownQueue[1:]
 	}
-	if _, ok := a.cooldowns[key]; ok {
-		return true
+	if expiry, ok := a.cooldowns[key]; ok {
+		if !expiry.IsZero() {
+			return true
+		}
+		if reserve {
+			a.cooldowns[key] = now.Add(virtualProbeSourceCooldown)
+		}
+		return false
 	}
 	if len(a.cooldowns) >= virtualProbeCooldownCapacity {
 		return true
@@ -519,9 +525,6 @@ func (h *PlaybackHandler) runDefaultFileProbeChain(ctx context.Context, contentI
 	}
 	// Only an exact, runnable probe consumes the source allowance. Default
 	// and selected targets share it; unrelated groups cannot consume it.
-	if h.defaultProbeChains.recentlyStarted(contentID+"\x00"+virtualSourceRefreshKey(source), true) {
-		return
-	}
 	releaseLease, admitted := h.ProbeLease.acquire(ctx, strconv.Itoa(oid))
 	if !admitted {
 		return
@@ -530,10 +533,23 @@ func (h *PlaybackHandler) runDefaultFileProbeChain(ctx context.Context, contentI
 	if !h.defaultProbeChains.allowProviderStart(strconv.Itoa(oid)) {
 		return
 	}
+	if h.defaultProbeChains.recentlyStarted(contentID+"\x00"+virtualSourceRefreshKey(source), true) {
+		return
+	}
+	completed := false
+	defer func() {
+		if !completed {
+			// Keep the queue entry for bounded pruning; expire only this reservation.
+			h.defaultProbeChains.mu.Lock()
+			h.defaultProbeChains.cooldowns[contentID+"\x00"+virtualSourceRefreshKey(source)] = time.Time{}
+			h.defaultProbeChains.mu.Unlock()
+		}
+	}()
 	outcome := h.probeVirtualSourceAndPersist(
 		ctx, stickyKey, row, row.FilePath, probeTransient, *probeCand,
 		resolver.PersistedIdentityTiers{}, expectedRuntimeMinutes, oid,
 	)
+	completed = true
 	switch outcome {
 	case probeOutcomeFailed:
 		if ctx.Err() != nil {

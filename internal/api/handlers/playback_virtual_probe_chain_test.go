@@ -550,12 +550,18 @@ func TestScheduleDefaultFileProbeSurvivesPanickingWork(t *testing.T) {
 		proberEntered.Add(1)
 		panic("prober blew up")
 	}
+	h.defaultProbeChains = defaultProbeChainAdmission{}
 	h.DefaultProbeTarget = probedTarget
 	h.VirtualPlaybackSourceProber = explodingProber
 	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), probeChainStreams(probingRow), catalog.AccessFilter{})
 	h.probeChainWG.Wait()
 	if proberEntered.Load() != 1 {
 		t.Fatalf("panicking prober entered %d times, want exactly 1", proberEntered.Load())
+	}
+	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), probeChainStreams(probingRow), catalog.AccessFilter{})
+	h.probeChainWG.Wait()
+	if proberEntered.Load() != 2 {
+		t.Fatal("panicking probe consumed source cooldown")
 	}
 	// The crashing chain must not have kept a gate slot: after it settles,
 	// every slot of the shared gate is free again.
@@ -689,14 +695,20 @@ func TestScheduleDefaultFileProbeHonorsTheDiscoveryAccessFilter(t *testing.T) {
 	h.probeChainWG.Wait()
 
 	filters, reads := reader.snapshot()
-	if len(reads) != 1 || reads[0] != visible.ID {
+	if len(reads) != 2 || reads[0] != visible.ID || reads[1] != visible.ID {
 		t.Fatalf("file rows read = %v, want only the visible version %d", reads, visible.ID)
 	}
 	if prober.count() != 1 || prober.last() != visible.FilePath {
 		t.Fatalf("probed %q (%d probes), want the visible default %q", prober.last(), prober.count(), visible.FilePath)
 	}
-	if len(filters) != 1 {
-		t.Fatalf("catalog version reads = %d, want 1", len(filters))
+	if len(filters) != 2 {
+		t.Fatalf("catalog version reads = %d, want 2", len(filters))
+	}
+	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), streams, filter)
+	h.probeChainWG.Wait()
+	afterFilters, afterReads := reader.snapshot()
+	if len(afterFilters) != len(filters) || len(afterReads) != len(reads) {
+		t.Fatal("cooldown refusal performed catalog reads")
 	}
 	got := filters[0]
 	if !slices.Equal(got.AllowedLibraryIDs, filter.AllowedLibraryIDs) ||
