@@ -74,6 +74,7 @@ const (
 	virtualProbeChainReasonNotVirtual         = "not_virtual"
 	virtualProbeChainReasonAlreadyProbed      = "already_probed"
 	virtualProbeChainReasonNoExactCandidate   = "no_exact_candidate"
+	virtualProbeChainReasonSiblingTarget      = "sibling_target"
 	virtualProbeChainReasonRecentlyFailed     = "recently_failed"
 	virtualProbeChainReasonGateBusy           = "gate_busy"
 )
@@ -119,6 +120,15 @@ type VirtualDefaultProbeTarget interface {
 	DefaultVirtualProbeTarget(ctx context.Context, contentID string, filter catalog.AccessFilter) (*models.MediaFile, error)
 }
 
+// VirtualProbeTargetRows is the optional extension of VirtualDefaultProbeTarget
+// that exposes every authorized version row of an item, in the same top-sorted
+// order the browse picker shows. A chain uses it when the resolved row names
+// no release in the just-persisted listing — the default of a virtual item is
+// often a neutral group row, and the listing names no release for it.
+type VirtualProbeTargetRows interface {
+	VirtualProbeTargetRows(ctx context.Context, contentID string, filter catalog.AccessFilter) ([]*models.MediaFile, error)
+}
+
 // VirtualDefaultProbeTargetFunc allows wiring the default-version lookup as a
 // plain function.
 type VirtualDefaultProbeTargetFunc func(ctx context.Context, contentID string, filter catalog.AccessFilter) (*models.MediaFile, error)
@@ -151,43 +161,94 @@ func NewVirtualDefaultProbeTarget(versions VirtualProbeVersionLister, files Virt
 	if versions == nil || files == nil {
 		return nil
 	}
-	return revalidatingVirtualProbeTarget{VirtualDefaultProbeTargetFunc(func(ctx context.Context, contentID string, filter catalog.AccessFilter) (*models.MediaFile, error) {
-		list, err := versions.GetItemVersions(ctx, contentID, filter)
-		if err != nil || len(list) == 0 {
-			return nil, err
-		}
-		selected := list[0].FileID
-		if filter.SelectedFileID != 0 {
-			selected = 0
-			for _, version := range list {
-				if version.FileID == filter.SelectedFileID {
-					selected = version.FileID
-					break
+	return &virtualDefaultProbeTarget{
+		revalidatingVirtualProbeTarget: revalidatingVirtualProbeTarget{VirtualDefaultProbeTargetFunc(func(ctx context.Context, contentID string, filter catalog.AccessFilter) (*models.MediaFile, error) {
+			list, err := versions.GetItemVersions(ctx, contentID, filter)
+			if err != nil || len(list) == 0 {
+				return nil, err
+			}
+			selected := list[0].FileID
+			if filter.SelectedFileID != 0 {
+				selected = 0
+				for _, version := range list {
+					if version.FileID == filter.SelectedFileID {
+						selected = version.FileID
+						break
+					}
+				}
+				if selected == 0 {
+					return nil, nil
 				}
 			}
-			if selected == 0 {
+			row, err := files.GetByID(ctx, selected)
+			if err != nil || row == nil {
+				return nil, err
+			}
+			// A catalog listing authorizes an association, not unrestricted access
+			// to a numeric ID. Revalidate the fetched row after the listing/read
+			// boundary; an episode row must match the episode, not its series.
+			if row.ID != selected || !virtualProbeRowAuthorized(row, contentID, filter) {
 				return nil, nil
 			}
+			return row, nil
+		})},
+		versions: versions,
+		files:    files,
+	}
+}
+
+// virtualDefaultProbeTarget is the production probe target. It reads the
+// catalog's top-sorted, access-filtered version list, resolves the default
+// (or the selected) row of that list, revalidates that row immediately before
+// submission, and — for a chain that needs a row the listing names a release
+// for — exposes every authorized row of the same list.
+type virtualDefaultProbeTarget struct {
+	revalidatingVirtualProbeTarget
+	versions VirtualProbeVersionLister
+	files    VirtualProbeFileReader
+}
+
+// virtualProbeRowAuthorized applies the association and visibility rules a
+// probe target must satisfy: the row must belong to the item or episode the
+// read asked for, and it must be inside the viewer's library scope.
+func virtualProbeRowAuthorized(row *models.MediaFile, contentID string, filter catalog.AccessFilter) bool {
+	if row == nil {
+		return false
+	}
+	if (row.EpisodeID != "" && row.EpisodeID != contentID) ||
+		(row.EpisodeID == "" && row.ContentID != contentID) {
+		return false
+	}
+	if _, none := filter.LibraryScope([]int{row.MediaFolderID}); none {
+		return false
+	}
+	if filter.ScopeFilesToLibrary && filter.PresentationLibraryID != nil && row.MediaFolderID != *filter.PresentationLibraryID {
+		return false
+	}
+	return true
+}
+
+// VirtualProbeTargetRows returns every authorized version row of the item, in
+// the same top-sorted order the browse picker shows. A row that cannot be
+// read, or that fails the association or visibility rules, is not a candidate
+// and is left out: the list is the authorization boundary.
+func (t *virtualDefaultProbeTarget) VirtualProbeTargetRows(ctx context.Context, contentID string, filter catalog.AccessFilter) ([]*models.MediaFile, error) {
+	list, err := t.versions.GetItemVersions(ctx, contentID, filter)
+	if err != nil {
+		return nil, err
+	}
+	rows := make([]*models.MediaFile, 0, len(list))
+	for _, version := range list {
+		row, err := t.files.GetByID(ctx, version.FileID)
+		if err != nil || row == nil || row.ID != version.FileID {
+			continue
 		}
-		row, err := files.GetByID(ctx, selected)
-		if err != nil || row == nil {
-			return nil, err
+		if !virtualProbeRowAuthorized(row, contentID, filter) {
+			continue
 		}
-		// A catalog listing authorizes an association, not unrestricted access
-		// to a numeric ID. Revalidate the fetched row after the listing/read
-		// boundary; an episode row must match the episode, not its series.
-		if row.ID != selected || (row.EpisodeID != "" && row.EpisodeID != contentID) ||
-			(row.EpisodeID == "" && row.ContentID != contentID) {
-			return nil, nil
-		}
-		if _, none := filter.LibraryScope([]int{row.MediaFolderID}); none {
-			return nil, nil
-		}
-		if filter.ScopeFilesToLibrary && filter.PresentationLibraryID != nil && row.MediaFolderID != *filter.PresentationLibraryID {
-			return nil, nil
-		}
-		return row, nil
-	})}
+		rows = append(rows, row)
+	}
+	return rows, nil
 }
 
 // The production resolver repeats the authorized catalog read immediately
@@ -499,17 +560,38 @@ func (h *PlaybackHandler) runDefaultFileProbeChain(ctx context.Context, contentI
 			virtualProbeChainReasonAlreadyProbed, "", virtualEvidenceLogKeyFileID, row.ID)
 		return
 	}
-	oid := row.VirtualOwnerInstallationID
 	probeCand := virtualDefaultProbeCandidate(row, source, streams)
 	if probeCand == nil {
+		// The resolved row names no release in the just-persisted listing: the
+		// default of a virtual item is often a neutral group row, and the
+		// listing names no release for it. A pinned row of the same authorized
+		// list that the listing itself names IS an admissible target, and it
+		// is the row a play attempt resolves for the item. The play path's own
+		// resolution stays untouched: this only warms up evidence for bytes
+		// the listing already named.
+		sibling, siblingCand := h.probeableSiblingTarget(ctx, contentID, row, source, streams, filter)
+		if sibling != nil {
+			row, probeCand = sibling, siblingCand
+			slog.InfoContext(ctx, "virtual pre-play probe target selected",
+				virtualEvidenceLogKeyComponent, virtualEvidenceLogValueAPI,
+				contentIDKey, contentID,
+				virtualEvidenceLogKeyFileID, row.ID,
+				"row_source", row.ProbeSource,
+				"selected_as", virtualProbeChainReasonSiblingTarget)
+		}
+	}
+	if probeCand == nil {
 		// Without an exact byte match there is nothing safe to enumerate: the
-		// default may be the neutral group row, and a neutral default may
-		// resolve to a sibling candidate. The play path's own probe handles
-		// those; a chain must never guess.
-		logVirtualProbeChainSkip(ctx, slog.LevelDebug, contentID,
-			virtualProbeChainReasonNoExactCandidate, "", virtualEvidenceLogKeyFileID, row.ID)
+		// row may be a neutral group row, and a neutral row may resolve to a
+		// sibling candidate the listing never named. The play path's own probe
+		// handles those; a chain must never guess. This line is info, not
+		// debug, so an operator can see an item that is never prepared.
+		logVirtualProbeChainSkip(ctx, slog.LevelInfo, contentID,
+			virtualProbeChainReasonNoExactCandidate, "", virtualEvidenceLogKeyFileID, row.ID,
+			"row_source", row.ProbeSource)
 		return
 	}
+	oid := row.VirtualOwnerInstallationID
 	if virtualProbeFailures.recent(virtualProbeFailureKey(probeCand.URI, oid)) {
 		logVirtualProbeChainSkip(ctx, slog.LevelDebug, contentID,
 			virtualProbeChainReasonRecentlyFailed, "", virtualEvidenceLogKeyFileID, row.ID)
@@ -579,6 +661,45 @@ func (h *PlaybackHandler) runDefaultFileProbeChain(ctx context.Context, contentI
 		logVirtualProbeChainSkip(ctx, slog.LevelInfo, contentID,
 			virtualProbeChainReasonProbeIncomplete, "probe", virtualEvidenceLogKeyFileID, row.ID)
 	}
+}
+
+// probeableSiblingTarget returns the first authorized version row the
+// just-persisted listing names a release for, in picker order. A row qualifies
+// only when its exact bytes appear in the listing under the same owner
+// installation, so the chain never probes a row the listing does not name and
+// never probes a neutral group row: a neutral row names no release, so it
+// never matches. The row already tried is skipped, as are rows that are not
+// virtual playback files and rows that already carry probe evidence.
+func (h *PlaybackHandler) probeableSiblingTarget(ctx context.Context, contentID string, tried *models.MediaFile, source *models.MediaFile, streams []VirtualPlaybackStream, filter catalog.AccessFilter) (*models.MediaFile, *VirtualPlaybackStream) {
+	lister, ok := h.DefaultProbeTarget.(VirtualProbeTargetRows)
+	if !ok {
+		return nil, nil
+	}
+	rows, err := lister.VirtualProbeTargetRows(ctx, contentID, filter)
+	if err != nil {
+		return nil, nil
+	}
+	for _, row := range rows {
+		if row == nil {
+			continue
+		}
+		if tried != nil && row.ID == tried.ID {
+			continue
+		}
+		if ctx.Err() != nil {
+			return nil, nil
+		}
+		if !isVirtualPlaybackFile(row) {
+			continue
+		}
+		if row.ProbeUpdatedAt != nil {
+			continue
+		}
+		if cand := virtualDefaultProbeCandidate(row, source, streams); cand != nil {
+			return row, cand
+		}
+	}
+	return nil, nil
 }
 
 // virtualDefaultProbeCandidate matches the default row's exact bytes against
