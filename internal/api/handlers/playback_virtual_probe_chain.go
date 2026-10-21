@@ -581,11 +581,12 @@ func (h *PlaybackHandler) runDefaultFileProbeChain(ctx context.Context, contentI
 		}
 	}
 	if probeCand == nil {
-		// Without an exact byte match there is nothing safe to enumerate: the
-		// row may be a neutral group row, and a neutral row may resolve to a
-		// sibling candidate the listing never named. The play path's own probe
-		// handles those; a chain must never guess. This line is info, not
-		// debug, so an operator can see an item that is never prepared.
+		// Without a release the listing names there is nothing safe to
+		// enumerate: the row may be a neutral group row, and a neutral row may
+		// resolve to a sibling candidate the listing never named. The play
+		// path's own probe handles those; a chain must never guess. This line
+		// is info, not debug, so an operator can see an item that is never
+		// prepared.
 		logVirtualProbeChainSkip(ctx, slog.LevelInfo, contentID,
 			virtualProbeChainReasonNoExactCandidate, "", virtualEvidenceLogKeyFileID, row.ID,
 			"row_source", row.ProbeSource)
@@ -612,11 +613,13 @@ func (h *PlaybackHandler) runDefaultFileProbeChain(ctx context.Context, contentI
 	// Zero the duration so the probe measures the empirical duration instead
 	// of inheriting the catalog value.
 	probeTransient.Duration = 0
-	// The chain probes the default row's own candidate bytes (probeURL = the
-	// row's persisted URI) and persists through the queued, coalescing
-	// evidence path. No session binding exists here, so the fence is nil and
-	// the identity tiers are zero — the same posture the unstamped-row fast
-	// path takes, where the row owns its persisted candidate.
+	// The chain probes the concrete provider URL the listing named for this
+	// release — the same bytes a play attempt of the row resolves and ffprobes
+	// — and persists through the queued, coalescing evidence path. The prober
+	// runs a real URL behind the remote-stream relay; a virtual:// row path is
+	// not a URL it can open. The candidate's durable identity travels with the
+	// probe, as the play path's own background probe carries it. No session
+	// binding exists here, so the fence is nil.
 	if target, ok := h.DefaultProbeTarget.(interface {
 		Revalidate(context.Context, string, catalog.AccessFilter, *models.MediaFile) bool
 	}); ok && !target.Revalidate(ctx, contentID, filter, row) {
@@ -644,8 +647,11 @@ func (h *PlaybackHandler) runDefaultFileProbeChain(ctx context.Context, contentI
 		}
 	}()
 	outcome := h.probeVirtualSourceAndPersist(
-		ctx, stickyKey, row, row.FilePath, probeTransient, *probeCand,
-		resolver.PersistedIdentityTiers{}, expectedRuntimeMinutes, oid,
+		ctx, stickyKey, row, strings.TrimSpace(probeCand.ProviderURL), probeTransient, *probeCand,
+		resolver.NewPersistedIdentityTiers(
+			probeCand.ProviderVideoHash, probeCand.ProviderGUID, probeCand.ProviderReleaseName, probeCand.FileSize,
+		),
+		expectedRuntimeMinutes, oid,
 	)
 	completed = outcome != probeOutcomeFailed
 	switch outcome {
@@ -665,11 +671,12 @@ func (h *PlaybackHandler) runDefaultFileProbeChain(ctx context.Context, contentI
 
 // probeableSiblingTarget returns the first authorized version row the
 // just-persisted listing names a release for, in picker order. A row qualifies
-// only when its exact bytes appear in the listing under the same owner
-// installation, so the chain never probes a row the listing does not name and
-// never probes a neutral group row: a neutral row names no release, so it
-// never matches. The row already tried is skipped, as are rows that are not
-// virtual playback files and rows that already carry probe evidence.
+// only when the listing names its release — the same concrete ?result=
+// candidate id under the row's provider-neutral path — so the chain never
+// probes a row the listing does not name and never probes a neutral group row:
+// a neutral row names no release, so it never matches. The row already tried
+// is skipped, as are rows that are not virtual playback files and rows that
+// already carry probe evidence.
 func (h *PlaybackHandler) probeableSiblingTarget(ctx context.Context, contentID string, tried *models.MediaFile, source *models.MediaFile, streams []VirtualPlaybackStream, filter catalog.AccessFilter) (*models.MediaFile, *VirtualPlaybackStream) {
 	lister, ok := h.DefaultProbeTarget.(VirtualProbeTargetRows)
 	if !ok {
@@ -702,27 +709,52 @@ func (h *PlaybackHandler) probeableSiblingTarget(ctx context.Context, contentID 
 	return nil, nil
 }
 
-// virtualDefaultProbeCandidate matches the default row's exact bytes against
-// the listing the discovery run just persisted. An exact URI match is the only
-// admissible enumeration target: the row's persisted identity must be the
-// bytes the probe opens. The neutral group row itself is never admissible —
-// the just-persisted listing necessarily contains it (under the same virtual
-// path the group was listed from) without naming any specific release.
+// virtualDefaultProbeCandidate returns the listing entry that names the row's
+// own release — the candidate a play attempt of the row would resolve and
+// probe.
+//
+// The listing is the provider's candidate list, not a catalog snapshot: every
+// entry is built with OwnerInstallationID 0 (resolve.go, variants.go) and the
+// provider's own URI. The persisted row carries its own installation id and
+// may add a profile qualifier the provider does not know. Requiring an
+// installation-id match, or a byte-identical URI, therefore made every real
+// listing unnameable: a pinned row on owner 1 never equaled a listing entry on
+// owner 0. What the listing must name is the release, so the match is the
+// concrete ?result= candidate id under the row's provider-neutral path — the
+// same identity virtualCandidateRowVerified already accepts as the row's own
+// evidence.
+//
+// A neutral group row names no release (?result= absent), so it never matches:
+// probing it would mean guessing which candidate it resolves to at play time.
+// A hidden or expired candidate is not admissible either, and the entry must
+// carry the concrete URL the probe opens.
 func virtualDefaultProbeCandidate(row *models.MediaFile, source *models.MediaFile, streams []VirtualPlaybackStream) *VirtualPlaybackStream {
 	if row == nil || source == nil {
 		return nil
 	}
 	target := strings.TrimSpace(row.FilePath)
-	if target == "" {
+	if target == "" || virtualResultCandidateID(target) == "" {
 		return nil
 	}
 	if source.FilePath == target {
 		return nil
 	}
+	now := time.Now()
 	for i := range streams {
-		if streams[i].URI == target && streams[i].OwnerInstallationID == row.VirtualOwnerInstallationID {
-			return &streams[i]
+		stream := &streams[i]
+		if !sameVirtualReleaseIdentity(target, stream.URI) {
+			continue
 		}
+		if stream.VisibilitySpecified && !stream.Visible {
+			continue
+		}
+		if stream.ProviderExpiresAt != nil && !stream.ProviderExpiresAt.After(now) {
+			continue
+		}
+		if strings.TrimSpace(stream.ProviderURL) == "" {
+			continue
+		}
+		return stream
 	}
 	return nil
 }

@@ -32,10 +32,26 @@ func probeChainRow(fileID int, filePath string, probeUpdatedAt *time.Time) *mode
 	}
 }
 
+// probeChainProviderURL is the concrete URL a listing entry carries for a
+// virtual candidate. The real listing is provider-side: it names the candidate
+// the prober can actually open, never the catalog's virtual:// row path.
+func probeChainProviderURL(virtualURI string) string {
+	id := virtualResultCandidateID(virtualURI)
+	if id == "" {
+		id = "neutral"
+	}
+	return "http://provider.example/" + id
+}
+
 func probeChainStreams(row *models.MediaFile) []VirtualPlaybackStream {
+	// The listing is the provider's candidate list, so every entry carries
+	// owner installation 0 (resolve.go's playbackStreamsFrom) and the concrete
+	// provider URL. A row's own installation id never appears here.
 	return []VirtualPlaybackStream{
-		{URI: "virtual://movie/probe-chain?result=c5", OwnerInstallationID: 5, Resolution: "1080p"},
-		{URI: row.FilePath, OwnerInstallationID: row.VirtualOwnerInstallationID, Resolution: "2160p",
+		{URI: "virtual://movie/probe-chain?result=c5", OwnerInstallationID: 0,
+			ProviderURL: "http://provider.example/c5", Visible: true, VisibilitySpecified: true, Resolution: "1080p"},
+		{URI: row.FilePath, OwnerInstallationID: 0,
+			ProviderURL: probeChainProviderURL(row.FilePath), Visible: true, VisibilitySpecified: true, Resolution: "2160p",
 			AudioLanguages: []string{"eng"}, SubtitleLanguages: []string{"eng"}},
 	}
 }
@@ -181,8 +197,8 @@ func TestScheduleDefaultFileProbeProbesTheDefaultRowsOwnBytes(t *testing.T) {
 	if prober.count() != 1 {
 		t.Fatalf("probe calls = %d, want exactly 1", prober.count())
 	}
-	if got := prober.last(); got != row.FilePath {
-		t.Fatalf("probed %q, want the default row's own persisted bytes %q", got, row.FilePath)
+	if got := prober.last(); got != probeChainProviderURL(row.FilePath) {
+		t.Fatalf("probed %q, want the listing's concrete URL for the default row %q", got, probeChainProviderURL(row.FilePath))
 	}
 	if target.callCount() != 1 {
 		t.Fatalf("target reads = %d, want 1", target.callCount())
@@ -216,14 +232,14 @@ func TestScheduleDefaultFileProbeSourceGroupsDoNotCoalesce(t *testing.T) {
 
 	// Keep the wrong group's target read live while the right group arrives.
 	// Content-only admission would discard the second group's callback.
-	h.ScheduleDefaultFileProbe(probeChainTestContent, &first, []VirtualPlaybackStream{{URI: "virtual://movie/other-group?result=first", OwnerInstallationID: 5}}, catalog.AccessFilter{})
+	h.ScheduleDefaultFileProbe(probeChainTestContent, &first, []VirtualPlaybackStream{{URI: "virtual://movie/other-group?result=first", ProviderURL: "http://provider.example/first"}}, catalog.AccessFilter{})
 	probeChainWaitFor(t, 1, target.callCount, "first group target read")
 	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), probeChainStreams(row), catalog.AccessFilter{})
 	probeChainWaitFor(t, 2, target.callCount, "second group target read")
 	target.releaseRow()
 	h.probeChainWG.Wait()
-	if prober.count() != 1 || prober.last() != row.FilePath {
-		t.Fatalf("probe calls = %d, last = %q; want exactly the intended target %q", prober.count(), prober.last(), row.FilePath)
+	if prober.count() != 1 || prober.last() != probeChainProviderURL(row.FilePath) {
+		t.Fatalf("probe calls = %d, last = %q; want exactly the intended target %q", prober.count(), prober.last(), probeChainProviderURL(row.FilePath))
 	}
 }
 
@@ -265,7 +281,7 @@ func TestScheduleDefaultFileProbeSkipsDefaultBytesMissingFromListing(t *testing.
 	// The listing names other candidates; the default's own bytes are absent,
 	// so a probe would enumerate unverified bytes.
 	streams := []VirtualPlaybackStream{
-		{URI: "virtual://movie/probe-chain?result=c5", OwnerInstallationID: 5},
+		{URI: "virtual://movie/probe-chain?result=c5", ProviderURL: "http://provider.example/c5"},
 	}
 	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), streams, catalog.AccessFilter{})
 	h.probeChainWG.Wait()
@@ -394,8 +410,8 @@ func TestScheduleDefaultFileProbeStallTeriminatesAndRestoresSlot(t *testing.T) {
 		t.Fatal("a well-behaved chain after a stall did not probe")
 	}
 	h.probeChainWG.Wait()
-	if got := prober2.last(); got != row2.FilePath {
-		t.Fatalf("retry probed %q, want the default row's bytes %q", got, row2.FilePath)
+	if got := prober2.last(); got != probeChainProviderURL(row2.FilePath) {
+		t.Fatalf("retry probed %q, want the listing's URL for the default row %q", got, probeChainProviderURL(row2.FilePath))
 	}
 }
 
@@ -688,8 +704,8 @@ func TestScheduleDefaultFileProbeHonorsTheDiscoveryAccessFilter(t *testing.T) {
 		MaturityLimits:            access.MaturityLimits{MaxContentRating: "PG-13"},
 	}
 	streams := []VirtualPlaybackStream{
-		{URI: hidden.FilePath, OwnerInstallationID: 5},
-		{URI: visible.FilePath, OwnerInstallationID: 5},
+		{URI: hidden.FilePath, ProviderURL: probeChainProviderURL(hidden.FilePath)},
+		{URI: visible.FilePath, ProviderURL: probeChainProviderURL(visible.FilePath)},
 	}
 
 	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), streams, filter)
@@ -699,8 +715,8 @@ func TestScheduleDefaultFileProbeHonorsTheDiscoveryAccessFilter(t *testing.T) {
 	if len(reads) != 2 || reads[0] != visible.ID || reads[1] != visible.ID {
 		t.Fatalf("file rows read = %v, want only the visible version %d", reads, visible.ID)
 	}
-	if prober.count() != 1 || prober.last() != visible.FilePath {
-		t.Fatalf("probed %q (%d probes), want the visible default %q", prober.last(), prober.count(), visible.FilePath)
+	if prober.count() != 1 || prober.last() != probeChainProviderURL(visible.FilePath) {
+		t.Fatalf("probed %q (%d probes), want the visible default %q", prober.last(), prober.count(), probeChainProviderURL(visible.FilePath))
 	}
 	if len(filters) != 2 {
 		t.Fatalf("catalog version reads = %d, want 2", len(filters))

@@ -307,15 +307,20 @@ the admin metadata update response, keeping v1 answers byte-identical.
 
 After a detail-page read persists a listing, the server schedules one detached
 pre-play probe chain for the opened item: it prepares the selected `file_id` when
-the read supplied one, and the default version otherwise, requiring that the
-resolved row is a persisted candidate whose exact bytes the just-persisted
-listing names, falling back to the first authorized row the listing does name
-when the resolved row names no release, and probes that candidate through the ordinary background
-evidence path (queued, coalescing write). Chains are deduplicated by item,
+the read supplied one, and the default version otherwise, falling back to the
+first authorized row the listing does name when the resolved row names no
+release. A row is prepared only when the just-persisted listing names its
+release — the same concrete `?result=` candidate id, which the provider issues
+and the row pins — and the probe opens that listing entry's concrete provider
+URL through the ordinary background evidence path (queued, coalescing write).
+Installation ownership is not part of that match: listing entries are
+provider-side and carry no installation. A hidden or expired candidate is never
+probed. Chains are deduplicated by item,
 selection, and provider source group, so the default and a picked version are
 separate preparations for the same item. A neutral
-group row is never probed speculatively — it may resolve to a sibling
-candidate, so the play path's own probe handles it. Chains are bounded (two
+group row is never probed speculatively — it names no release, so it may
+resolve to a sibling candidate, and the play path's own probe handles it.
+Chains are bounded (two
 concurrent per process, a whole-chain deadline, and the shared probe
 gate), never block any API response, and never wait for playback: a chain may
 record evidence before a play attempt resolves the same row, in which case that
