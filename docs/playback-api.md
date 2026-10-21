@@ -11,7 +11,12 @@ unavailable store is `503`.
 
 Detail discovery may prepare the selected `file_id`, or the default version when
 no selection is supplied. Preparation requires an authorized persisted row and
-an exact candidate match. Authorization is read again before probe submission;
+an exact candidate match. When the resolved row names no release in the
+just-persisted listing — the default of a virtual item is often a neutral group
+row, and the listing names no release for it — the first authorized row of the
+same version list that the listing does name is prepared instead; a row the
+listing does not name is never prepared. Authorization is read again before
+probe submission;
 a missing, hidden, changed, or already-probed target is skipped. Listing-only
 requests do not prepare playback. Playback never waits for this optional work
 and uses its ordinary foreground resolution when evidence is not yet available.
@@ -304,7 +309,8 @@ After a detail-page read persists a listing, the server schedules one detached
 pre-play probe chain for the opened item: it prepares the selected `file_id` when
 the read supplied one, and the default version otherwise, requiring that the
 resolved row is a persisted candidate whose exact bytes the just-persisted
-listing names, and probes that candidate through the ordinary background
+listing names, falling back to the first authorized row the listing does name
+when the resolved row names no release, and probes that candidate through the ordinary background
 evidence path (queued, coalescing write). Chains are deduplicated by item,
 selection, and provider source group, so the default and a picked version are
 separate preparations for the same item. A neutral
