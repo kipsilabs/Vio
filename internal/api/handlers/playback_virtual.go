@@ -4847,23 +4847,16 @@ func execVirtualFileMetadataUpdateResultUntx(ctx context.Context, db VirtualFile
 		return VirtualFileMetadataUpdateResult{}, err
 	}
 	persistedPath, err := statement.run(ctx, db, args, args.AdoptPath)
-	if err == nil && persistedPath == "" && args.RequireAdopt && args.AdoptPath != "" {
+	if err == nil && persistedPath == "" {
 		// The best-effort saver has no row lock, so a stale CAS snapshot gets
-		// one re-read and one retry against the current state; a row still
-		// inside the same item/profile is re-based (a churned ?result= token or
-		// an advanced evidence revision), while a row that moved elsewhere keeps
-		// the caller's snapshot. A second miss stays a refusal.
-		if current, found, readErr := readVirtualRowCASState(ctx, db, args.FileID); readErr == nil && found {
-			retried := refreshVirtualPersistArgsForRow(args, current)
-			if virtualPersistSnapshotMoved(args, retried) {
-				retryPath, retryErr := statement.run(ctx, db, retried, retried.AdoptPath)
-				if retryErr != nil {
-					return VirtualFileMetadataUpdateResult{}, retryErr
-				}
-				if retryPath != "" {
-					args, persistedPath = retried, retryPath
-				}
-			}
+		// one re-read and one retry against the current state. A provider
+		// re-list can advance updated_at without changing the probe stamp; a
+		// metadata-only write is re-based only while the exact path, owner and
+		// probe stamp still match. A churned ?result= token is re-based only for
+		// a required adoption. A second miss stays a refusal.
+		persistedPath, args, err = retryVirtualMetadataUpdate(ctx, db, args, statement)
+		if err != nil {
+			return VirtualFileMetadataUpdateResult{}, err
 		}
 	}
 	if err == nil {
@@ -5068,15 +5061,68 @@ func refreshVirtualPersistArgsForRow(args models.VirtualFilePersistArgs, current
 	return args
 }
 
-// virtualPersistSnapshotMoved reports whether the row moved to a different
-// candidate token since the caller's snapshot. Only a churned file_path (the
-// provider's per-listing ?result= token) authorizes the retry: a matching
-// provider-neutral key proves it is the same item/profile, not that this
-// writer may adopt a newer evidence revision another transaction committed.
-// A revision-only advance therefore keeps the caller's snapshot and the CAS
-// still refuses it.
-func virtualPersistSnapshotMoved(args, refreshed models.VirtualFilePersistArgs) bool {
-	return args.ExpectedFilePath != refreshed.ExpectedFilePath
+// virtualPersistSnapshotMoved decides whether a zero-row CAS write may be
+// retried once against the row's current state.
+//
+// A required adoption follows a churned ?result= token: the provider-neutral
+// key proves the new path is still the same item/profile, so the write is
+// re-based onto it. That is the only case where a changed path is accepted.
+//
+// A metadata-only write is bound to the exact row bytes the probe enumerated.
+// It may be re-based only while the path, owner and probe stamp are unchanged;
+// the only difference allowed is a newer updated_at, which a provider re-list
+// advances without changing any probe evidence. If another probe committed in
+// the meantime, probe_updated_at differs and the write still refuses. A row
+// that moved elsewhere keeps the caller's snapshot.
+func virtualPersistSnapshotMoved(original models.VirtualFilePersistArgs, current virtualRowCASState, refreshed models.VirtualFilePersistArgs) bool {
+	if original.RequireAdopt && original.AdoptPath != "" {
+		return original.ExpectedFilePath != refreshed.ExpectedFilePath
+	}
+	if original.ExpectedFilePath == "" || original.ExpectedFilePath != current.FilePath {
+		return false
+	}
+	if original.OwnerID != 0 && original.OwnerID != current.OwnerID {
+		return false
+	}
+	if original.LibraryID != 0 && original.LibraryID != current.LibraryID {
+		return false
+	}
+	if !sameVirtualProbeStamp(original.ProbeUpdatedAt, current.ProbeUpdatedAt) {
+		return false
+	}
+	return current.UpdatedAt.After(original.UpdatedAt)
+}
+
+func sameVirtualProbeStamp(a, b *time.Time) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.Equal(*b)
+}
+
+// retryVirtualMetadataUpdate performs the single bounded CAS retry after a
+// zero-row metadata write. It returns the write's path, the arguments that
+// produced it (so a caller can keep the re-based snapshot), and any terminal
+// error. A read failure or a row that moved beyond the allowed churn is a
+// plain miss: the caller keeps its original snapshot and reports no metadata
+// update.
+func retryVirtualMetadataUpdate(ctx context.Context, db VirtualFileMetadataDB, args models.VirtualFilePersistArgs, statement virtualMetadataStatement) (string, models.VirtualFilePersistArgs, error) {
+	current, found, readErr := readVirtualRowCASState(ctx, db, args.FileID)
+	if readErr != nil {
+		return "", args, readErr
+	}
+	if !found {
+		return "", args, nil
+	}
+	retried := refreshVirtualPersistArgsForRow(args, current)
+	if !virtualPersistSnapshotMoved(args, current, retried) {
+		return "", args, nil
+	}
+	path, err := statement.run(ctx, db, retried, retried.AdoptPath)
+	if err != nil || path == "" {
+		return "", args, err
+	}
+	return path, retried, nil
 }
 
 // persistVirtualMetadataBounded admits a probe-evidence write into the

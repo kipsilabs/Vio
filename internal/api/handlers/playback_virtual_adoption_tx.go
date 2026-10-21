@@ -94,23 +94,16 @@ func execVirtualFileMetadataUpdateResultTx(ctx context.Context, db VirtualFileMe
 	}
 
 	persistedPath, writeErr := statement.run(ctx, tx, args, args.AdoptPath)
-	if writeErr == nil && persistedPath == "" && args.RequireAdopt && args.AdoptPath != "" {
-		// A stale CAS snapshot is not an identity refusal. A provider re-list or
-		// rematch may have churned the ?result= token or advanced the evidence
-		// revision after the caller's snapshot, so the fence matches no row even
-		// though this is the same row. The row is locked for this transaction,
+	if writeErr == nil && persistedPath == "" {
+		// A stale CAS snapshot is not an identity refusal. A provider re-list
+		// advances updated_at without touching probe_updated_at, and a rematch
+		// may churn the ?result= token. The row is locked for this transaction,
 		// so re-read it and retry the same write against the state that is
 		// actually current; only a row still inside the same item/profile is
-		// re-based.
-		if current, found, readErr := readVirtualRowCASState(ctx, tx, args.FileID); readErr == nil && found {
-			retried := refreshVirtualPersistArgsForRow(args, current)
-			if virtualPersistSnapshotMoved(args, retried) {
-				persistedPath, writeErr = statement.run(ctx, tx, retried, retried.AdoptPath)
-				if writeErr == nil {
-					args = retried
-				}
-			}
-		}
+		// re-based. A metadata-only write additionally requires the same exact
+		// path, owner and probe stamp so a listing refresh cannot redirect the
+		// evidence to another candidate.
+		persistedPath, args, writeErr = retryVirtualMetadataUpdate(ctx, tx, args, statement)
 	}
 	if writeErr == nil {
 		if persistedPath == "" {

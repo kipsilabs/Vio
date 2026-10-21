@@ -321,6 +321,72 @@ func TestVirtualMetadataUpdateRecoversEvidenceAfterTransientTimeout(t *testing.T
 	}
 }
 
+// TestVirtualFileMetadataUpdateRetriesCatalogRevisionOnlyAdvance covers the
+// cold-player race: the inventory poll's detail read re-lists candidates and
+// advances updated_at while a probe is still running. The probe snapshot is
+// then one catalog revision old, but its path, owner and probe stamp are
+// unchanged, so the evidence write must re-base and land instead of reporting
+// a superseded snapshot.
+func TestVirtualFileMetadataUpdateRetriesCatalogRevisionOnlyAdvance(t *testing.T) {
+	pool := virtualMetadataUpdateTestPool(t)
+	ctx := context.Background()
+	const folderID, ownerID = 994316, 7006
+	seedVirtualMetadataUpdateFolder(t, pool, folderID, ownerID)
+
+	candidatePath := "virtual://movie/tt-db-revision?profile=4K+Dolby+Vision&result=cand-a"
+	var candidateID int
+	var updatedAt time.Time
+	var probeUpdatedAt *time.Time
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO media_files(content_id, media_folder_id, file_path, container, virtual_owner_installation_id, probe_source)
+		VALUES('movie-db-revision', $1, $2, 'virtual', $3, 'virtual')
+		RETURNING id, updated_at, probe_updated_at`, folderID, candidatePath, ownerID,
+	).Scan(&candidateID, &updatedAt, &probeUpdatedAt); err != nil {
+		t.Fatalf("insert candidate row: %v", err)
+	}
+
+	// A re-list rewrites the candidate row's catalog revision without changing
+	// its path or probe evidence.
+	if _, err := pool.Exec(ctx, `UPDATE media_files SET updated_at = updated_at + interval '1 minute' WHERE id = $1`, candidateID); err != nil {
+		t.Fatalf("simulate re-list revision: %v", err)
+	}
+
+	result, err := ExecVirtualFileMetadataUpdateResult(ctx, pool, models.VirtualFilePersistArgs{
+		FileID:           candidateID,
+		ExpectedFilePath: candidatePath,
+		VideoTracks:      []byte(`[]`),
+		AudioTracks:      []byte(`[{"codec":"eac3","channels":6,"language":"eng"}]`),
+		SubtitleTracks:   []byte(`[]`),
+		Resolution:       "2160p",
+		CodecVideo:       "hevc",
+		CodecAudio:       "eac3",
+		Container:        "mkv",
+		HDR:              true,
+		Bitrate:          8000000,
+		Duration:         5400,
+		StampProbe:       true,
+		UpdatedAt:        updatedAt,
+		ProbeUpdatedAt:   probeUpdatedAt,
+		OwnerID:          ownerID,
+		LibraryID:        folderID,
+	})
+	if err != nil {
+		t.Fatalf("revision-only evidence write failed: %v", err)
+	}
+	if !result.MetadataUpdated {
+		t.Fatal("revision-only evidence write reported a superseded snapshot")
+	}
+
+	var resolution string
+	var stampedAt *time.Time
+	if err := pool.QueryRow(ctx, `SELECT resolution, probe_updated_at FROM media_files WHERE id = $1`, candidateID).Scan(&resolution, &stampedAt); err != nil {
+		t.Fatalf("read evidence row: %v", err)
+	}
+	if resolution != "2160p" || stampedAt == nil {
+		t.Fatalf("resolution = %q, probe_updated_at = %v; evidence did not land", resolution, stampedAt)
+	}
+}
+
 // TestVirtualFileMetadataUpdateRequestHeadersPreserveAndReplace proves the
 // adopt-path write treats request headers as part of the resolution pair: a
 // metadata-only write with no headers preserves the stored set, and a write

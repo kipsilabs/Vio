@@ -288,6 +288,19 @@ failures arm the same failure damper the playback path uses, an
 already-stamped row is skipped, and every unexpected chain failure —
 including a panic — is contained to the chain.
 
+A successful detail discovery is memoized for 30 seconds per viewer, item,
+selected file, and library. The player's inventory poll re-reads watch detail
+every few seconds while a probe is pending; those reads deliberately bypass the
+client cache, and without the memo each one would re-list and re-persist every
+candidate. A different selected file starts its own discovery immediately, and
+the explicit discovery operation and refresh action bypass the memo.
+
+The evidence write also tolerates one catalog-revision race that a re-list can
+cause: if the row's exact path, owner, and probe stamp are unchanged and only
+`updated_at` advanced, the write re-reads the row once and retries against the
+new revision. A changed path, owner, or probe stamp is not re-based, so a
+concurrent probe or a different candidate still wins.
+
 The explicit discovery operation, the refresh action, search, browse, and
 series, season, and episode listings never start a preparation. A listing-only
 run and a detail run are separate work and do not coalesce, so a listing can
