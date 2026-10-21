@@ -315,6 +315,14 @@ export default function DownloadVersionPicker({
         setFinalizing(null);
       } catch (error) {
         if (!isCurrent()) return;
+        if (error instanceof StaleApiRequestContextError) {
+          // The authority that owned this row changed while the read was in
+          // flight. The row is not refused: it belongs to a session the picker
+          // no longer represents, so the read is dropped without a message the
+          // user would read as the server rejecting the file.
+          setFinalizing(null);
+          return;
+        }
         if (isTransientMetadataFailure(error) && retries < FILE_METADATA_RETRIES) {
           retries += 1;
           timer = window.setTimeout(() => void load(), FILE_METADATA_RETRY_MS * retries);

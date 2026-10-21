@@ -1268,6 +1268,32 @@ func (w *responseStatusWriter) Write(body []byte) (int, error) {
 // Unwrap keeps http.ResponseController able to reach the original writer.
 func (w *responseStatusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
+// downloadFailureIsDefinitive reports whether a failed delivery can never be
+// retried: the client closed the connection, the file is gone, the format is
+// unavailable, or access was refused. A transfer that broke mid-flight, a
+// source that is briefly unavailable, and a read error are not definitive —
+// the client can ask again and the row stays resumable.
+func downloadFailureIsDefinitive(err error) bool {
+	switch {
+	case err == nil:
+		return false
+	case errors.Is(err, io.ErrClosedPipe), errors.Is(err, context.Canceled):
+		// The client hung up. The delivery is over, not resumable.
+		return true
+	case errors.Is(err, ErrResponseCommitted):
+		return false
+	case errors.Is(err, catalog.ErrItemNotFound),
+		errors.Is(err, ErrFormatUnavailable),
+		errors.Is(err, ErrQualityUnavailable),
+		errors.Is(err, ErrDownloadNotAllowed),
+		errors.Is(err, ErrFileUnavailable),
+		errors.Is(err, ErrFileAccessDenied):
+		return true
+	default:
+		return false
+	}
+}
+
 // ServeFile serves a download's file. Managed entries (device header present)
 // authorize on (user, profile, device) and re-check per-profile content access
 // before serving; ephemeral rows keep today's queued→downloading→completed
@@ -1319,10 +1345,12 @@ func (s *Service) ServeFile(ctx context.Context, w http.ResponseWriter, r *http.
 
 	recorder := &responseStatusWriter{ResponseWriter: w}
 	if err := s.serveDownloadBytes(ctx, recorder, r, dl, userID, filter); err != nil {
-		// A transfer that broke after the response was committed is resumable:
-		// the client can ask for the remaining range. Marking the row failed
-		// would refuse that retry for the rest of the row's life.
-		if dl.Format == FormatOriginal && !errors.Is(err, ErrResponseCommitted) {
+		// A delivery that broke after the response was committed is resumable:
+		// the client can ask for the remaining range. The same holds for a
+		// source that is briefly unavailable or a read that failed. Only a
+		// refusal that can never be retried fails the row, so a failed row
+		// keeps its meaning.
+		if dl.Format == FormatOriginal && downloadFailureIsDefinitive(err) {
 			failureCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 			updateErr := s.repo.TransitionStatus(failureCtx, dl.ID, StatusDownloading, StatusFailed, 0, nil)
 			cancel()
@@ -1334,9 +1362,10 @@ func (s *Service) ServeFile(ctx context.Context, w http.ResponseWriter, r *http.
 	}
 
 	// Only a response that carried the file, or the range the client asked
-	// for, is a completed delivery. A conditional or range-error reply leaves
-	// the row as it was; recording completion for it would claim bytes the
-	// client never received.
+	// for, is a completed delivery. A conditional or range-error reply does
+	// not record completion: the row keeps whatever state it had, and
+	// claiming completion for it would assert bytes the client never
+	// received.
 	if recorder.status == http.StatusOK || recorder.status == http.StatusPartialContent {
 		now := time.Now()
 		if err := s.repo.UpdateStatus(ctx, dl.ID, StatusCompleted, dl.FileSize, &now); err != nil {

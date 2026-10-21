@@ -1,11 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { setAccessToken, setProfileId, setProfileToken } from "@/api/client";
+import {
+  setAccessToken,
+  setProfileId,
+  setProfileToken,
+  StaleApiRequestContextError,
+} from "@/api/client";
 import {
   BUFFERED_SAVE_LIMIT_BYTES,
   canSavePreparedDownload,
   createPreparedDownload,
   DownloadPreparationError,
   getPreparedDownload,
+  getPreparedDownloadFile,
   readBoundedSaveBlob,
   savePreparedDownload,
   SaveCancelledError,
@@ -315,6 +321,77 @@ describe("savePreparedDownload", () => {
 
     await expect(savePreparedDownload("dl-1", "Movie.mp4")).rejects.toThrow(/too large/i);
     expect(createObjectURL).not.toHaveBeenCalled();
+  });
+});
+
+describe("getPreparedDownloadFile", () => {
+  it("reads the file's name and length with a HEAD request", async () => {
+    const fetch = vi.fn().mockResolvedValue(
+      new Response(null, {
+        status: 200,
+        headers: {
+          "Content-Disposition": `attachment; filename="Movie.mp4"`,
+          "Content-Length": "4096",
+        },
+      }),
+    );
+    vi.stubGlobal("fetch", fetch);
+
+    const got = await getPreparedDownloadFile("dl-1", "hint.mp4");
+
+    expect(got).toMatchObject({ id: "dl-1", filename: "Movie.mp4", fileSize: 4096 });
+    const [url, init] = fetch.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/v2/downloads/dl-1/file");
+    expect(init.method).toBe("HEAD");
+  });
+
+  it("falls back to the caller's hint and an unknown length", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(null, { status: 200 })));
+
+    const got = await getPreparedDownloadFile("dl-1", "hint.mp4");
+
+    expect(got).toMatchObject({ id: "dl-1", filename: "hint.mp4" });
+    expect(got.fileSize).toBeUndefined();
+  });
+
+  it("names a terminal refusal as one that must not be retried", async () => {
+    for (const status of [404, 410, 416]) {
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(problemResponse(status)));
+      const attempt = getPreparedDownloadFile("dl-1", "Movie.mp4");
+      await expect(attempt).rejects.toBeInstanceOf(DownloadPreparationError);
+      await expect(attempt).rejects.toMatchObject({ retryable: false });
+    }
+  });
+
+  it("names a transient refusal as one that may be retried", async () => {
+    for (const status of [429, 503]) {
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(problemResponse(status)));
+      const attempt = getPreparedDownloadFile("dl-1", "Movie.mp4");
+      await expect(attempt).rejects.toBeInstanceOf(DownloadPreparationError);
+      await expect(attempt).rejects.toMatchObject({ retryable: true });
+    }
+  });
+
+  it("reports a stale authority instead of a file refusal", async () => {
+    let release: (response: Response) => void = () => undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        () =>
+          new Promise<Response>((resolve) => {
+            release = resolve;
+          }),
+      ),
+    );
+
+    const stale = getPreparedDownloadFile("dl-1", "Movie.mp4");
+    await Promise.resolve();
+    // The session authority changes while the read is in flight, so the answer
+    // belongs to an authority the caller no longer holds.
+    setAccessToken("other-account-token");
+    release(new Response(null, { status: 200 }));
+
+    await expect(stale).rejects.toBeInstanceOf(StaleApiRequestContextError);
   });
 });
 

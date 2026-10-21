@@ -1,5 +1,6 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, expect, it, vi } from "vitest";
+import { StaleApiRequestContextError } from "@/api/client";
 import type { FileVersion } from "@/api/types";
 import {
   SaveCancelledError,
@@ -244,6 +245,66 @@ it("ignores a file-metadata reply that lands after the finalize is cancelled", a
 
   expect(screen.queryByRole("button", { name: /Save file/i })).toBeNull();
   expect(mocks.toastError).not.toHaveBeenCalled();
+});
+
+it("stops after three attempts when the metadata read keeps failing", async () => {
+  mocks.create.mockResolvedValue({ id: "dl_exhaust", status: "ready" });
+  mocks.file.mockRejectedValue(
+    new DownloadPreparationError("Downloads are temporarily unavailable. Try again shortly.", true),
+  );
+  await openVirtualPanel();
+
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: /Prepare download/i }));
+  });
+
+  await screen.findByRole("button", { name: /^Retry$/i }, { timeout: 8000 });
+  // One attempt plus two retries, and then the picker stops.
+  expect(mocks.file).toHaveBeenCalledTimes(3);
+  expect(screen.queryByText(/Preparing your download/i)).toBeNull();
+});
+
+it("hands a row that becomes ready while polling over to the metadata read", async () => {
+  mocks.create.mockResolvedValue({ id: "dl_polled", status: "preparing" });
+  mocks.poll.mockResolvedValue({ id: "dl_polled", status: "ready" });
+  mocks.file.mockResolvedValue({ id: "dl_polled", filename: "Movie.mp4" });
+  await openVirtualPanel();
+
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: /Prepare download/i }));
+  });
+
+  expect(
+    await screen.findByRole("button", { name: /Save file/i }, { timeout: 8000 }),
+  ).toBeVisible();
+  expect(mocks.poll).toHaveBeenCalledWith("dl_polled", expect.anything());
+  expect(mocks.file).toHaveBeenCalledWith("dl_polled", expect.any(String), expect.anything());
+});
+
+it("drops a metadata read that lost its authority without reporting a refusal", async () => {
+  mocks.create.mockResolvedValue({ id: "dl_stale", status: "ready" });
+  let rejectFile: (error: unknown) => void = () => undefined;
+  mocks.file.mockImplementation(
+    () =>
+      new Promise((_resolve, reject) => {
+        rejectFile = reject;
+      }),
+  );
+  await openVirtualPanel();
+
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: /Prepare download/i }));
+  });
+  await vi.waitFor(() => expect(mocks.file).toHaveBeenCalled());
+
+  await act(async () => {
+    rejectFile(new StaleApiRequestContextError());
+  });
+
+  // The row belongs to a session the picker no longer represents: it is
+  // neither a refusal nor a retryable failure.
+  expect(screen.queryByRole("button", { name: /^Retry$/i })).toBeNull();
+  expect(screen.queryByText(/Preparing your download/i)).toBeNull();
 });
 
 it("cancels a preparing virtual download through delete", async () => {

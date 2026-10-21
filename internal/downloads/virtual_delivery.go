@@ -72,8 +72,13 @@ func (s *Service) SetVirtualInputResolver(resolver VirtualInputResolver) {
 }
 
 // virtualRelayInput resolves the download's authorized provider input and
-// requires it to be this host's relay registration. The client below only
-// speaks to loopback, so anything else is refused before a request is built.
+// requires it to be a loopback URL. The client below only speaks to loopback,
+// so anything else is refused before a request is built.
+//
+// Two separate guarantees meet here: the resolver wiring is trusted to hand
+// back this host's own relay registration, and the loopback check below
+// refuses any input that would leave the machine. The loopback check alone
+// does not prove the URL belongs to this relay.
 func (s *Service) virtualRelayInput(ctx context.Context, file *models.MediaFile) (string, func(), error) {
 	if s.virtualInput == nil {
 		return "", nil, ErrFormatUnavailable
@@ -109,7 +114,7 @@ func (s *Service) virtualOriginalSize(ctx context.Context, file *models.MediaFil
 		return 0, errors.New("invalid virtual download relay request")
 	}
 	request.Header.Set("Accept-Encoding", "identity")
-	//nolint:gosec // input is this host's relay registration, validated by virtualRelayInput
+	//nolint:gosec // input is this host's own relay registration, trusted from the resolver wiring and confirmed to be loopback by virtualRelayInput
 	response, err := virtualDownloadClient.Do(request)
 	if err != nil {
 		return 0, errors.New("virtual download relay is unavailable")
@@ -154,7 +159,7 @@ func (s *Service) serveVirtualOriginal(ctx context.Context, w http.ResponseWrite
 		}
 	}
 	request.Header.Set("Accept-Encoding", "identity")
-	//nolint:gosec // input is this host's relay registration, validated by virtualRelayInput
+	//nolint:gosec // input is this host's own relay registration, trusted from the resolver wiring and confirmed to be loopback by virtualRelayInput
 	response, err := virtualDownloadClient.Do(request)
 	if err != nil {
 		return errors.New("virtual download relay is unavailable")
