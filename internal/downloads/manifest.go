@@ -182,7 +182,8 @@ type ManifestBuilder struct {
 	externalTimings subtitles.ExternalTimingLookup
 	// artifact resolves a download's linked prepared artifact so artifact-backed
 	// manifests can describe the delivered file instead of the catalog source.
-	artifact func(ctx context.Context, id string) (*Artifact, error)
+	artifact     func(ctx context.Context, id string) (*Artifact, error)
+	originalSize func(context.Context, *models.MediaFile) (int64, error)
 }
 
 type MarkerPopulationService interface {
@@ -222,6 +223,20 @@ func (b *ManifestBuilder) build(ctx context.Context, dl *Download, filter catalo
 		return nil, err
 	}
 	file := b.lookupFile(ctx, dl.MediaFileID)
+	if dl.Format == FormatOriginal && isVirtualMediaFile(file) {
+		if !catalog.FileAllowedByAccess(file, filter) {
+			return nil, catalog.ErrItemNotFound
+		}
+		resolved := *dl
+		resolved.FileSize = 0
+		if b.originalSize != nil {
+			resolved.FileSize, err = b.originalSize(ctx, file)
+			if err != nil {
+				return nil, err
+			}
+		}
+		dl = &resolved
+	}
 	var seriesDetail *catalog.ItemDetail
 	if seriesID := episodeSeriesID(dl, detail); seriesID != "" {
 		if cached, ok := seriesCache[seriesID]; ok {

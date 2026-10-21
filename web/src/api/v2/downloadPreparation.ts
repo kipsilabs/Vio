@@ -233,6 +233,38 @@ export function canSavePreparedDownload(fileSizeBytes?: number): boolean {
  * a larger file with an actionable reason rather than risk the tab. A user who
  * cancels the picker throws SaveCancelledError so the caller can stay silent.
  */
+export async function getPreparedDownloadFile(
+  downloadId: string,
+  filenameHint: string,
+  signal?: AbortSignal,
+): Promise<{ id: string; filename: string; fileSize?: number }> {
+  const snapshot = requireSnapshot();
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${snapshot.accessToken}`,
+    "X-Profile-Id": snapshot.profileId,
+  };
+  if (snapshot.profileToken) headers["X-Profile-Token"] = snapshot.profileToken;
+  const { res } = await fetchWithSession(
+    `/api/v2/downloads/${encodeURIComponent(downloadId)}/file`,
+    { method: "HEAD", headers, signal, cache: "no-store" },
+    snapshot,
+    false,
+  );
+  requireCurrent(snapshot);
+  if (!res.ok) {
+    throw new DownloadPreparationError(preparedFileRefusalMessage(res.status));
+  }
+  const size = Number(res.headers.get("Content-Length"));
+  return {
+    id: downloadId,
+    filename:
+      filenameFromDisposition(res.headers.get("Content-Disposition")) ||
+      filenameHint ||
+      "download.bin",
+    fileSize: Number.isSafeInteger(size) && size > 0 ? size : undefined,
+  };
+}
+
 export async function savePreparedDownload(
   downloadId: string,
   filenameHint: string,

@@ -26,6 +26,7 @@ import {
   createPreparedDownload,
   downloadPreparationErrorMessage,
   getPreparedDownload,
+  getPreparedDownloadFile,
   isDownloadPreparing,
   isDownloadRefused,
   savePreparedDownload,
@@ -222,6 +223,18 @@ export default function DownloadVersionPicker({
       let entry: PreparedDownloadEntry | null = null;
       try {
         entry = await getPreparedDownload(downloadId, controller.signal);
+        if (!isCurrent()) return;
+        if (entry?.status === "ready") {
+          const file = await getPreparedDownloadFile(
+            downloadId,
+            pendingFilenameRef.current,
+            controller.signal,
+          );
+          if (!isCurrent()) return;
+          setVirtualReady(file);
+          setPreparing(null);
+          return;
+        }
       } catch {
         if (isCurrent()) timer = window.setTimeout(() => void poll(), 2000);
         return;
@@ -233,15 +246,6 @@ export default function DownloadVersionPicker({
         const message = "This download is no longer available. Prepare it again.";
         setRefusalMessage(message);
         toast.error(message);
-        setPreparing(null);
-        return;
-      }
-      if (entry.status === "ready") {
-        setVirtualReady({
-          id: downloadId,
-          filename: pendingFilenameRef.current,
-          fileSize: entry.file_size,
-        });
         setPreparing(null);
         return;
       }
@@ -327,11 +331,13 @@ export default function DownloadVersionPicker({
       if (!isCurrent()) return;
       setVirtualSelection(null);
       if (entry.status === "ready") {
-        setVirtualReady({
-          id: String(entry.id),
-          filename: version.file_name ?? "",
-          fileSize: entry.file_size,
-        });
+        const file = await getPreparedDownloadFile(
+          String(entry.id),
+          version.file_name ?? "",
+          controller.signal,
+        );
+        if (!isCurrent()) return;
+        setVirtualReady(file);
       } else if (isDownloadPreparing(entry.status)) {
         setPreparing({ id: String(entry.id), status: entry.status });
       } else {

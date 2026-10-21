@@ -32,6 +32,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/transcodenode"
 	"github.com/Silo-Server/silo-server/internal/transcodeproxy"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary"
+	"github.com/Silo-Server/silo-server/internal/virtuallibrary/resolver"
 )
 
 // startLocalPlaybackTransport is the shared local ffmpeg launch primitive for
@@ -904,6 +905,41 @@ func (h *PlaybackHandler) ResolveVirtualTransportInput(ctx context.Context, virt
 // requesting session for a background preparation, so the session-bound
 // account/profile are the zero value; per-requester authorization is enforced
 // on the download row and its /file route, never here.
+func (h *PlaybackHandler) ResolveVirtualDownloadMetadata(ctx context.Context, file *models.MediaFile) (*models.MediaFile, error) {
+	if h == nil || file == nil {
+		return nil, errors.New("virtual download metadata resolver is unavailable")
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, virtualProbeBudget)
+	defer cancel()
+	resolveCtx := virtualResolveContextWithPersistedIdentity(probeCtx, file)
+	resolved, cleanup, err := h.ResolveVirtualTransportInput(resolveCtx, file.FilePath, file.VirtualOwnerInstallationID, 0, "")
+	if cleanup != nil {
+		defer cleanup()
+	}
+	if err != nil {
+		return nil, errors.New("virtual download source is unavailable")
+	}
+	transient := cloneVirtualProbeTransient(*file)
+	input := resolved.sourceURL
+	if input == "" {
+		input = resolved.URL
+	}
+	probed, err := h.probeVirtualSource(probeCtx, input, &transient, resolved.RequestHeaders)
+	if err != nil || probed == nil || probed.Container == "" || strings.EqualFold(probed.Container, "virtual") {
+		return nil, errors.New("virtual download source metadata is unavailable")
+	}
+	identity := resolver.NewPersistedIdentityTiers(resolved.ProviderVideoHash, resolved.ProviderGUID, resolved.ProviderReleaseName, resolved.ProviderReleaseSize)
+	if _, committed := h.persistVirtualProbeEvidenceDurable(probeCtx, file, resolved.URI, probed, identity, true); !committed {
+		return nil, errors.New("virtual download source metadata was not committed")
+	}
+	probed.ID = file.ID
+	probed.ContentID = file.ContentID
+	probed.EpisodeID = file.EpisodeID
+	probed.MediaFolderID = file.MediaFolderID
+	probed.FilePath = file.FilePath
+	return probed, nil
+}
+
 func (h *PlaybackHandler) ResolveVirtualDownloadInput(ctx context.Context, file *models.MediaFile) (string, func(), error) {
 	if h == nil || file == nil {
 		return "", nil, errors.New("virtual download input resolver is unavailable")
@@ -1115,6 +1151,7 @@ func (h *PlaybackHandler) resolveVirtualInputURI(
 		)
 		return ResolvedVirtualMedia{}, nil, err
 	}
+	res.sourceURL = res.URL
 	res.URL = relayURL
 	return res, cleanup, nil
 }

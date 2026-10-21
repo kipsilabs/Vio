@@ -93,6 +93,7 @@ type Capability struct {
 // from the request-scoped resolver methods below; a path alone is never an
 // authorization grant.
 type FileTarget struct {
+	virtualFile                  *models.MediaFile
 	Path                         string
 	DownloadID                   string
 	MediaFileID                  int
@@ -138,7 +139,8 @@ type Service struct {
 	externalTimings  subtitles.ExternalTimingLookup
 
 	// Prepare-to-file pipeline (Phase 3); nil until SetArtifactManager wires it.
-	artifacts *ArtifactManager
+	artifacts    *ArtifactManager
+	virtualInput VirtualInputResolver
 
 	// Series-monitoring subscriptions (auto-download); nil until SetSubscriptions
 	// wires the repo, in which case the subscription endpoints report unavailable.
@@ -183,6 +185,7 @@ func (s *Service) SetOfflineDeps(detail ManifestSource, subs SubtitleSource, cli
 	})
 	s.manifest.MarkerPopulation = s.markerPopulation
 	s.manifest.externalTimings = s.externalTimings
+	s.manifest.originalSize = s.virtualOriginalSize
 	// A nil client leaves artwork fetches on artworkClient and its timeout.
 	s.httpClient = client
 }
@@ -438,6 +441,10 @@ func (s *Service) Create(ctx context.Context, userID int, req CreateRequest, fil
 		return nil, err
 	}
 
+	file, err = s.resolveDownloadMetadata(ctx, file, req.Caps)
+	if err != nil {
+		return nil, err
+	}
 	decision, err := s.policy.Resolve(ctx, req.Quality, user, cfg, file, req.Caps, s.artifacts != nil, req.DeviceID)
 	if err != nil {
 		return nil, err
@@ -1269,6 +1276,10 @@ func (s *Service) ServeFile(ctx context.Context, w http.ResponseWriter, r *http.
 		return fmt.Errorf("download is preparing: %w", ErrDownloadNotActive)
 	}
 
+	if r.Method == http.MethodHead {
+		return s.serveDownloadBytes(ctx, w, r, dl, userID, filter)
+	}
+
 	// Atomically transition queued → downloading for original rows. Artifact
 	// (remux/transcode) rows are already ready by the time bytes are served.
 	if dl.Format == FormatOriginal && dl.Status == StatusQueued {
@@ -1554,7 +1565,15 @@ func (s *Service) resolveDownloadBytesTarget(ctx context.Context, dl *Download, 
 	if !catalog.FileAllowedByAccess(file, filter) {
 		return nil, catalog.ErrItemNotFound
 	}
-	return &FileTarget{Path: file.FilePath, DownloadID: dl.ID, MediaFileID: file.ID, ProxyEligible: sourceProxyEligible}, nil
+	target := &FileTarget{Path: file.FilePath, DownloadID: dl.ID, MediaFileID: file.ID, ProxyEligible: sourceProxyEligible}
+	if isVirtualMediaFile(file) {
+		if s.virtualInput == nil {
+			return nil, ErrFormatUnavailable
+		}
+		target.virtualFile = file
+		target.ProxyEligible = false
+	}
+	return target, nil
 }
 
 // Download bandwidth settings are aggregate guarantees enforced by the API
@@ -1674,6 +1693,9 @@ func attachmentDisposition(path string) string {
 func (s *Service) serveFileTarget(ctx context.Context, w http.ResponseWriter, r *http.Request, target *FileTarget, userID int) error {
 	if target == nil {
 		return catalog.ErrItemNotFound
+	}
+	if target.virtualFile != nil {
+		return s.serveVirtualOriginal(ctx, w, r, target.virtualFile, userID)
 	}
 	if target.OriginArtifactID == "" {
 		return s.serveLocalFile(ctx, w, r, target.Path, userID)

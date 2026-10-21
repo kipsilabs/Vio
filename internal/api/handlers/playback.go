@@ -159,6 +159,7 @@ type PlaybackChapterThumbnailQueuer interface {
 // ResolvedVirtualMedia represents a resolved virtual stream with provider details,
 // temporary URL, candidate identity, and proxy request headers.
 type ResolvedVirtualMedia struct {
+	sourceURL      string
 	URL            string
 	URI            string
 	CandidateID    string
