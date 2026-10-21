@@ -248,11 +248,13 @@ response's redacted file paths, so viewers without file-path visibility reach
 the same discovery.
 
 The catalog wait is tuned with the admin Streaming setting
-`virtual_library.catalog_discovery_budget_ms` (500-10000, default 3000). It
+`virtual_library.catalog_discovery_budget_ms` (500-10000, default 1000). It
 is read on each detail request, so saving it does not require a restart.
 Measured provider scrapes vary from tens of milliseconds to about 2.5s, and
 the built-in default absorbs the wall-clocked overhead the scrape accrues
-before persistence; the watch path keeps its full 15-second budget.
+before persistence; the watch path keeps a short 2-second wait. Both paths
+continue the provider work detached after the response, so a cold scrape is
+not lost when the response returns first.
 
 Leaf answers carry an additive `has_virtual_source` boolean. It reports
 whether the item holds persisted virtual candidate groups, read from the same
@@ -270,8 +272,9 @@ pre-play probe chain for the opened item: it re-reads the item's selected
 version when the detail read supplied `file_id`, otherwise its default version.
 The chosen row is a persisted candidate; when a fresh listing no longer names a
 selected profile variant, the neutral source row may probe that row's own stored
-bytes after the target's authorization checks. The chain probes the chosen
-candidate through
+bytes after the target's authorization checks. The chain resolves the row's
+stored provider URL (or fresh resolve) before probing; a durable `virtual://`
+catalog URI is never handed to ffprobe. It probes the chosen candidate through
 the ordinary background evidence path (queued, coalescing write). A neutral
 group row is never probed speculatively — it may resolve to a sibling
 candidate, so the play path's own probe handles it. Chains are bounded (two
@@ -287,6 +290,14 @@ persistence rules, including their stale-write protections; probing
 failures arm the same failure damper the playback path uses, an
 already-stamped row is skipped, and every unexpected chain failure —
 including a panic — is contained to the chain.
+
+For a v2 client that negotiated `deferred_track_inventory_v1`, a cold start runs
+a bounded metadata-only stream enumeration against the already-resolved
+provider URL before the plan is built. The plan therefore carries the real
+audio and subtitle streams instead of the provider's declared label. The wait is
+at most two seconds; on timeout or failure the plan falls back to the declared
+inventory and the deferred full probe still verifies and publishes it. A row
+with stored probe evidence skips this discovery.
 
 A successful detail discovery is memoized for 30 seconds per viewer, item,
 selected file, and library. The player's inventory poll re-reads watch detail

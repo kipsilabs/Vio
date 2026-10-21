@@ -27,9 +27,9 @@ const (
 	// versionCheckConcurrency bounds simultaneous provider resolutions.
 	versionCheckConcurrency = 4
 	// versionCheckPerFileBudget bounds one file's provider resolution.
-	versionCheckPerFileBudget = 1500 * time.Millisecond
+	versionCheckPerFileBudget = 1 * time.Second
 	// versionCheckOverallBudget bounds the whole batch.
-	versionCheckOverallBudget = 3 * time.Second
+	versionCheckOverallBudget = 2 * time.Second
 )
 
 type versionCheckRequest struct {
