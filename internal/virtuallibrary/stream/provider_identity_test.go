@@ -2,6 +2,24 @@ package stream
 
 import "testing"
 
+func TestCandidateDisplayNameDoesNotAppendSize(t *testing.T) {
+	first := StreamCandidate{Name: "AIO", Title: "Release 1.00 GB", URL: "https://provider.example/one.mkv"}
+	second := StreamCandidate{Name: "AIO", Title: "Release 2.00 GB", URL: "https://provider.example/two.mkv"}
+	for _, candidate := range []StreamCandidate{first, second} {
+		ParseStreamDetails(&candidate)
+		want := candidate.Name + "\n" + candidate.Title
+		if got := CandidateDisplayName(candidate); got != want {
+			t.Fatalf("display name = %q, want %q without an appended size", got, want)
+		}
+		if candidate.FileSize == 0 {
+			t.Fatal("size metadata must still be parsed")
+		}
+	}
+	if CandidateVariantID(first) == CandidateVariantID(second) {
+		t.Fatal("distinct versions must not share a variant ID")
+	}
+}
+
 // TestCandidateVideoHashAcceptsInfoHashAndHint pins the fallback order for the
 // provider-declared content hash: the explicit Stremio behaviorHints.videoHash
 // wins, and a torrent infoHash is the durable alternative an addon like AltMount
