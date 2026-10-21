@@ -748,3 +748,65 @@ func TestScheduleDefaultFileProbeSnapshotsAccessFilter(t *testing.T) {
 		t.Fatalf("chain read language overrides = %v, want the value captured at scheduling", got.MetadataLanguageOverrides)
 	}
 }
+
+// An expired chain may still unwind after a successor reserves the same source.
+func TestProbeChainPanicRollbackPreservesSuccessorCooldown(t *testing.T) {
+	row := probeChainRow(321, "virtual://movie/probe-chain?result=owner", nil)
+	source := probeChainSourceRow()
+	key := probeChainTestContent + "\x00" + virtualSourceRefreshKey(source)
+	h := &PlaybackHandler{
+		DefaultProbeTarget: VirtualDefaultProbeTargetFunc(func(context.Context, string, catalog.AccessFilter) (*models.MediaFile, error) {
+			return row, nil
+		}),
+	}
+	var successor *virtualProbeCooldown
+	h.VirtualPlaybackSourceProber = func(context.Context, string, *models.MediaFile) (*models.MediaFile, error) {
+		// Advance A's reservation to expiry without a wall-clock sleep, then
+		// let B reserve while A is still in its probe.
+		h.defaultProbeChains.mu.Lock()
+		h.defaultProbeChains.cooldowns[key].expires = time.Now().Add(-time.Second)
+		h.defaultProbeChains.mu.Unlock()
+		var refused bool
+		refused, successor = h.defaultProbeChains.recentlyStarted(key, true)
+		if refused || successor == nil {
+			panic("successor reservation refused")
+		}
+		panic("chain A probe panicked after B reserved")
+	}
+	h.ScheduleDefaultFileProbe(probeChainTestContent, source, probeChainStreams(row), catalog.AccessFilter{})
+	h.probeChainWG.Wait()
+	if successor == nil {
+		t.Fatal("probe never reserved successor allowance")
+	}
+	if recent, _ := h.defaultProbeChains.recentlyStarted(key, false); !recent {
+		t.Fatal("chain A panic released chain B's cooldown")
+	}
+	h.defaultProbeChains.rollbackCooldown(key, successor)
+	if recent, _ := h.defaultProbeChains.recentlyStarted(key, false); recent {
+		t.Fatal("owner could not roll back its own cooldown")
+	}
+}
+
+func TestProbeChainFailedProbeRollsBackCooldown(t *testing.T) {
+	row := probeChainRow(322, "virtual://movie/probe-chain?result=failed-owner", nil)
+	source := probeChainSourceRow()
+	var entered atomic.Bool
+	h := &PlaybackHandler{
+		DefaultProbeTarget: VirtualDefaultProbeTargetFunc(func(context.Context, string, catalog.AccessFilter) (*models.MediaFile, error) {
+			return row, nil
+		}),
+		VirtualPlaybackSourceProber: func(context.Context, string, *models.MediaFile) (*models.MediaFile, error) {
+			entered.Store(true)
+			return nil, fmt.Errorf("probe failed")
+		},
+	}
+	h.ScheduleDefaultFileProbe(probeChainTestContent, source, probeChainStreams(row), catalog.AccessFilter{})
+	h.probeChainWG.Wait()
+	if !entered.Load() {
+		t.Fatal("probe was not attempted")
+	}
+	key := probeChainTestContent + "\x00" + virtualSourceRefreshKey(source)
+	if recent, _ := h.defaultProbeChains.recentlyStarted(key, false); recent {
+		t.Fatal("failed probe consumed source cooldown")
+	}
+}

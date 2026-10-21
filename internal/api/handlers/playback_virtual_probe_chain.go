@@ -214,7 +214,7 @@ type defaultProbeChainAdmission struct {
 	mu             sync.Mutex
 	active         map[string]struct{}
 	admitted       int
-	cooldowns      map[string]time.Time
+	cooldowns      map[string]*virtualProbeCooldown
 	cooldownQueue  []string
 	providerStarts map[string][]time.Time
 }
@@ -222,40 +222,57 @@ type defaultProbeChainAdmission struct {
 const virtualProbeSourceCooldown = time.Minute
 const virtualProbeCooldownCapacity = 1024
 
-// recentlyStarted performs at most eight expiry removals per admission. The
-// bounded queue is chronological because every entry has the same lifetime.
-func (a *defaultProbeChainAdmission) recentlyStarted(key string, reserve bool) bool {
+type virtualProbeCooldown struct {
+	expires time.Time
+}
+
+// recentlyStarted performs at most eight expiry removals per admission. Queue
+// entries stay bounded even on rollback; each reservation has a unique owner.
+func (a *defaultProbeChainAdmission) recentlyStarted(key string, reserve bool) (bool, *virtualProbeCooldown) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	now := time.Now()
 	for n := 0; n < 8 && len(a.cooldownQueue) > 0; n++ {
 		oldest := a.cooldownQueue[0]
-		if now.Before(a.cooldowns[oldest]) {
+		if now.Before(a.cooldowns[oldest].expires) {
 			break
 		}
 		delete(a.cooldowns, oldest)
 		a.cooldownQueue = a.cooldownQueue[1:]
 	}
-	if expiry, ok := a.cooldowns[key]; ok {
-		if !expiry.IsZero() {
-			return true
+	if current, ok := a.cooldowns[key]; ok {
+		if !current.expires.IsZero() {
+			return true, nil
 		}
 		if reserve {
-			a.cooldowns[key] = now.Add(virtualProbeSourceCooldown)
+			owner := &virtualProbeCooldown{expires: now.Add(virtualProbeSourceCooldown)}
+			a.cooldowns[key] = owner
+			return false, owner
 		}
-		return false
+		return false, nil
 	}
 	if len(a.cooldowns) >= virtualProbeCooldownCapacity {
-		return true
+		return true, nil
 	}
 	if reserve {
 		if a.cooldowns == nil {
-			a.cooldowns = make(map[string]time.Time)
+			a.cooldowns = make(map[string]*virtualProbeCooldown)
 		}
-		a.cooldowns[key] = now.Add(virtualProbeSourceCooldown)
+		owner := &virtualProbeCooldown{expires: now.Add(virtualProbeSourceCooldown)}
+		a.cooldowns[key] = owner
 		a.cooldownQueue = append(a.cooldownQueue, key)
+		return false, owner
 	}
-	return false
+	return false, nil
+}
+
+func (a *defaultProbeChainAdmission) rollbackCooldown(key string, owner *virtualProbeCooldown) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if owner != nil && a.cooldowns[key] == owner {
+		// Keep the queue entry for bounded pruning, without a release-time scan.
+		owner.expires = time.Time{}
+	}
 }
 
 // allowProviderStart permits at most four starts in any minute per installation.
@@ -357,7 +374,7 @@ func (h *PlaybackHandler) ScheduleDefaultFileProbe(contentID string, source *mod
 			virtualProbeChainReasonScheduleRefused, "prober_unwired")
 		return
 	}
-	if h.defaultProbeChains.recentlyStarted(contentID+"\x00"+virtualSourceRefreshKey(source), false) {
+	if recent, _ := h.defaultProbeChains.recentlyStarted(contentID+"\x00"+virtualSourceRefreshKey(source), false); recent {
 		return
 	}
 	release, refusal := h.defaultProbeChains.acquire(contentID + "\x00" + strconv.Itoa(filter.SelectedFileID) + "\x00" + virtualSourceRefreshKey(source))
@@ -533,23 +550,22 @@ func (h *PlaybackHandler) runDefaultFileProbeChain(ctx context.Context, contentI
 	if !h.defaultProbeChains.allowProviderStart(strconv.Itoa(oid)) {
 		return
 	}
-	if h.defaultProbeChains.recentlyStarted(contentID+"\x00"+virtualSourceRefreshKey(source), true) {
+	cooldownKey := contentID + "\x00" + virtualSourceRefreshKey(source)
+	recent, owner := h.defaultProbeChains.recentlyStarted(cooldownKey, true)
+	if recent {
 		return
 	}
 	completed := false
 	defer func() {
 		if !completed {
-			// Keep the queue entry for bounded pruning; expire only this reservation.
-			h.defaultProbeChains.mu.Lock()
-			h.defaultProbeChains.cooldowns[contentID+"\x00"+virtualSourceRefreshKey(source)] = time.Time{}
-			h.defaultProbeChains.mu.Unlock()
+			h.defaultProbeChains.rollbackCooldown(cooldownKey, owner)
 		}
 	}()
 	outcome := h.probeVirtualSourceAndPersist(
 		ctx, stickyKey, row, row.FilePath, probeTransient, *probeCand,
 		resolver.PersistedIdentityTiers{}, expectedRuntimeMinutes, oid,
 	)
-	completed = true
+	completed = outcome != probeOutcomeFailed
 	switch outcome {
 	case probeOutcomeFailed:
 		if ctx.Err() != nil {
