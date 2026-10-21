@@ -1,3 +1,11 @@
+import {
+  useProviderResultEnrichment,
+  providerResultText,
+} from "@/components/streaming/useProviderResultDisplay";
+import {
+  ProviderResultDisplayToggle,
+  ProviderResultText,
+} from "@/components/streaming/ProviderResultDisplay";
 import { memo, useMemo, useState } from "react";
 import { Check, ChevronDown, Disc3, Layers3, RefreshCw } from "lucide-react";
 
@@ -73,6 +81,7 @@ function VersionDropdown({
   onRefreshVersions,
   onCancelRefresh,
 }: VersionDropdownProps) {
+  const enrichProviderResults = useProviderResultEnrichment();
   const [editionOpen, setEditionOpen] = useState(false);
   const [versionOpen, setVersionOpen] = useState(false);
   const {
@@ -277,6 +286,9 @@ function VersionDropdown({
           }
         >
           <div className="space-y-0.5">
+            {activeVersions.some((version) => providerResultText(version)) && (
+              <ProviderResultDisplayToggle />
+            )}
             <QualityRankingSummary
               serverRanking={serverRanking}
               userCriteria={userCriteria}
@@ -294,11 +306,13 @@ function VersionDropdown({
               />
             ) : null}
             {visibleVersions.map((version) => {
+              const providerText = providerResultText(version);
+              const showDetails = !providerText || enrichProviderResults;
               const isSelected = version.file_id === activeVersion?.file_id;
               // Scored release candidates lead with the Radarr-style release
               // line; everything else keeps the current quality summary.
               const summary = buildReleasePresentation(version) || buildQualitySummary(version);
-              const detail = buildDetailLine(version);
+              const detail = providerText ? "" : buildDetailLine(version);
               const rangeLabel = videoRangeLabel(version);
               const unavailable = isVersionUnavailable(version);
               const health = deriveVersionHealth(version);
@@ -317,10 +331,13 @@ function VersionDropdown({
                   } ${unavailable && !isSelected ? "opacity-80" : ""}`}
                 >
                   <div className="min-w-0 flex-1">
+                    {providerText && <ProviderResultText text={providerText} />}
                     <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
                       <div className="flex items-center gap-2">
-                        <span className="text-sm font-medium">{summary || "Video version"}</span>
-                        {rangeLabel ? (
+                        {showDetails && (
+                          <span className="text-sm font-medium">{summary || "Video version"}</span>
+                        )}
+                        {showDetails && rangeLabel ? (
                           <Badge
                             variant="secondary"
                             className="px-1.5 py-0 text-[0.625rem] uppercase"
@@ -341,7 +358,7 @@ function VersionDropdown({
                             {health.label}
                           </Badge>
                         ) : null}
-                        {hasFormatScore(version.format_score) ? (
+                        {showDetails && hasFormatScore(version.format_score) ? (
                           <Badge
                             variant="outline"
                             className="text-muted-foreground bg-muted/40 px-1.5 py-0 font-mono text-[0.625rem] font-medium"
@@ -352,35 +369,38 @@ function VersionDropdown({
                         ) : null}
                       </div>
                       <div className="flex flex-wrap gap-1">
-                        {audioLanguageLabels(version.audio_tracks).map((lang) => (
-                          <Badge
-                            key={lang}
-                            variant="outline"
-                            className="border-blue-500/20 bg-blue-500/10 px-1 py-0 text-[0.625rem] font-medium text-blue-400"
-                          >
-                            <span className="mr-0.5 opacity-70">🔊</span>
-                            {lang}
-                          </Badge>
-                        ))}
-                      </div>
-                    </div>
-                    {detail && (
-                      <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1">
-                        <span className="text-muted-foreground text-xs">{detail}</span>
-                        <div className="flex flex-wrap gap-1">
-                          {subtitleLanguageLabels(version.subtitle_tracks).map((lang) => (
+                        {(showDetails ? audioLanguageLabels(version.audio_tracks) : []).map(
+                          (lang) => (
                             <Badge
                               key={lang}
                               variant="outline"
-                              className="border-amber-500/20 bg-amber-500/10 px-1 py-0 text-[0.625rem] font-medium text-amber-400"
+                              className="border-blue-500/20 bg-blue-500/10 px-1 py-0 text-[0.625rem] font-medium text-blue-400"
                             >
-                              <span className="mr-0.5 opacity-70">CC</span>
+                              <span className="mr-0.5 opacity-70">🔊</span>
                               {lang}
                             </Badge>
-                          ))}
-                        </div>
+                          ),
+                        )}
                       </div>
-                    )}
+                    </div>
+                    {showDetails &&
+                      (detail || subtitleLanguageLabels(version.subtitle_tracks).length > 0) && (
+                        <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1">
+                          <span className="text-muted-foreground text-xs">{detail}</span>
+                          <div className="flex flex-wrap gap-1">
+                            {subtitleLanguageLabels(version.subtitle_tracks).map((lang) => (
+                              <Badge
+                                key={lang}
+                                variant="outline"
+                                className="border-amber-500/20 bg-amber-500/10 px-1 py-0 text-[0.625rem] font-medium text-amber-400"
+                              >
+                                <span className="mr-0.5 opacity-70">CC</span>
+                                {lang}
+                              </Badge>
+                            ))}
+                          </div>
+                        </div>
+                      )}
                   </div>
                   {isSelected && <Check className="text-primary size-4 shrink-0" />}
                 </button>

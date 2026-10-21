@@ -1,9 +1,16 @@
+import {
+  useProviderResultEnrichment,
+  providerResultText,
+  setProviderResultEnrichment,
+} from "@/components/streaming/useProviderResultDisplay";
+import { ProviderResultText } from "@/components/streaming/ProviderResultDisplay";
 import { useMemo } from "react";
 import { ListFilter, Play } from "lucide-react";
 import type { FileVersion } from "@/api/types";
 import { Badge } from "@/components/ui/badge";
 import {
   DropdownMenuItem,
+  DropdownMenuCheckboxItem,
   DropdownMenuLabel,
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
@@ -44,6 +51,7 @@ interface VersionFlyoutItemsProps {
 }
 
 export default function VersionFlyoutItems({ versions, onPlayVersion }: VersionFlyoutItemsProps) {
+  const enrichProviderResults = useProviderResultEnrichment();
   const sorted = useMemo(() => sortByResolution(versions), [versions]);
   const { visibleVersions, hiddenUnavailableCount, setShowUnavailable } = useVersionVisibility(
     sorted,
@@ -54,10 +62,21 @@ export default function VersionFlyoutItems({ versions, onPlayVersion }: VersionF
     <>
       <DropdownMenuLabel>Play Version</DropdownMenuLabel>
       <DropdownMenuSeparator />
+      {versions.some((version) => providerResultText(version)) && (
+        <DropdownMenuCheckboxItem
+          checked={enrichProviderResults}
+          onCheckedChange={(checked) => setProviderResultEnrichment(checked === true)}
+          onSelect={(event) => event.preventDefault()}
+        >
+          Enrich with quality, source, and languages
+        </DropdownMenuCheckboxItem>
+      )}
 
       {visibleVersions.map((version) => {
+        const providerText = providerResultText(version);
+        const showDetails = !providerText || enrichProviderResults;
         const qualitySummary = buildQualitySummary(version);
-        const detailLine = buildDetailLine(version);
+        const detailLine = providerText ? "" : buildDetailLine(version);
         const isMoreAction = qualitySummary === "More results…";
         const isVirtual =
           version.container === "virtual" ||
@@ -79,10 +98,11 @@ export default function VersionFlyoutItems({ versions, onPlayVersion }: VersionF
             </span>
 
             <span className="min-w-0 flex-1">
+              {providerText && <ProviderResultText text={providerText} />}
               <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
                 <span className="text-foreground flex items-center gap-1.5 text-sm font-semibold">
-                  <span>{qualitySummary}</span>
-                  {isVirtual && !isMoreAction && (
+                  {showDetails && <span>{qualitySummary}</span>}
+                  {showDetails && isVirtual && !isMoreAction && (
                     <Badge
                       variant="secondary"
                       className="shrink-0 px-1.5 py-0 text-[10px] font-medium"
@@ -100,7 +120,7 @@ export default function VersionFlyoutItems({ versions, onPlayVersion }: VersionF
                   )}
                 </span>
                 <div className="flex flex-wrap gap-1">
-                  {audioLanguageLabels(version.audio_tracks).map((lang) => (
+                  {(showDetails ? audioLanguageLabels(version.audio_tracks) : []).map((lang) => (
                     <Badge
                       key={lang}
                       variant="outline"
@@ -112,23 +132,24 @@ export default function VersionFlyoutItems({ versions, onPlayVersion }: VersionF
                   ))}
                 </div>
               </div>
-              {detailLine && (
-                <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1">
-                  <span className="text-muted-foreground text-xs">{detailLine}</span>
-                  <div className="flex flex-wrap gap-1">
-                    {subtitleLanguageLabels(version.subtitle_tracks).map((lang) => (
-                      <Badge
-                        key={lang}
-                        variant="outline"
-                        className="border-amber-500/20 bg-amber-500/10 px-1 py-0 text-[10px] font-medium text-amber-400"
-                      >
-                        <span className="mr-0.5 opacity-70">CC</span>
-                        {lang}
-                      </Badge>
-                    ))}
+              {showDetails &&
+                (detailLine || subtitleLanguageLabels(version.subtitle_tracks).length > 0) && (
+                  <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1">
+                    <span className="text-muted-foreground text-xs">{detailLine}</span>
+                    <div className="flex flex-wrap gap-1">
+                      {subtitleLanguageLabels(version.subtitle_tracks).map((lang) => (
+                        <Badge
+                          key={lang}
+                          variant="outline"
+                          className="border-amber-500/20 bg-amber-500/10 px-1 py-0 text-[10px] font-medium text-amber-400"
+                        >
+                          <span className="mr-0.5 opacity-70">CC</span>
+                          {lang}
+                        </Badge>
+                      ))}
+                    </div>
                   </div>
-                </div>
-              )}
+                )}
             </span>
           </DropdownMenuItem>
         );

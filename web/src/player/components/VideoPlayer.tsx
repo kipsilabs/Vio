@@ -1,3 +1,4 @@
+import { providerResultText } from "@/components/streaming/useProviderResultDisplay";
 import { useMediaSkipHandlers } from "../hooks/useMediaSkipHandlers";
 import { useAutoQualityDownshift } from "../hooks/useAutoQualityDownshift";
 import { recordObservedBandwidthLimitKbps } from "../bandwidth-probe";
@@ -1128,6 +1129,7 @@ export function VideoPlayer({
       versions.map((v) => {
         return {
           fileId: v.file_id,
+          providerText: providerResultText(v),
           // Scored release candidates lead with the Radarr-style release
           // line; everything else keeps the shared one-line quality summary,
           // identical to the item-page picker's for the same version fields.

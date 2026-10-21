@@ -722,3 +722,28 @@ describe("VersionDropdown provider order", () => {
     ]);
   });
 });
+
+it("preserves provider formatting and optionally enriches it without changing selection", () => {
+  localStorage.clear();
+  const select = vi.fn();
+  const original = "⚡ Provider\n🎬 Movie.WEB-DL\n🇪🇸 Spanish";
+  const candidate = makeVersion({
+    container: "virtual",
+    file_path: "virtual://movie/tt1?result=a",
+    edition_raw: original,
+    audio_tracks: [{ language: "es", codec: "aac", channels: 2 }],
+  });
+  const menu = openPicker([candidate, makeVersion({ file_id: 2 })], { onSelectVersion: select });
+  const text = menu.getByText(
+    (_, element) => element?.childElementCount === 0 && element.textContent === original,
+  );
+  expect(text).toHaveClass("whitespace-pre-wrap");
+  expect(menu.queryByText("Spanish")).not.toBeInTheDocument();
+  fireEvent.click(menu.getByRole("switch", { name: /Enrich/ }));
+  expect(menu.getByText("Spanish")).toBeInTheDocument();
+  expect(select).not.toHaveBeenCalled();
+  fireEvent.click(menu.getByRole("switch", { name: /Enrich/ }));
+  expect(menu.queryByText("Spanish")).not.toBeInTheDocument();
+  fireEvent.click(text.closest("button")!);
+  expect(select).toHaveBeenCalledWith(candidate);
+});
