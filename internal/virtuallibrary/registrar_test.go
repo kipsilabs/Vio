@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Silo-Server/silo-server/internal/metadata"
+	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary/monitor"
 )
 
@@ -221,5 +223,62 @@ func TestCatalogMonitorRegistrarEpisodeMapping(t *testing.T) {
 	err := r.Register(context.Background(), item)
 	if err == nil {
 		t.Fatal("expected error from unconfigured catalog registrar")
+	}
+}
+
+func TestVirtualMediaRegistrationPreservesArtworkSourcePaths(t *testing.T) {
+	item := monitor.MonitoredMedia{
+		MediaType:          "movie",
+		Title:              "Example",
+		Poster:             "https://cache.example/poster.jpg",
+		PosterSourcePath:   "tmdb://poster.jpg",
+		Backdrop:           "https://cache.example/backdrop.jpg",
+		BackdropSourcePath: "tmdb://backdrop.jpg",
+	}
+	payload := virtualMediaRegistration(item, "1")
+	if payload.PosterSourcePath != "tmdb://poster.jpg" {
+		t.Fatalf("PosterSourcePath = %q, want tmdb://poster.jpg", payload.PosterSourcePath)
+	}
+	if payload.BackdropSourcePath != "tmdb://backdrop.jpg" {
+		t.Fatalf("BackdropSourcePath = %q, want tmdb://backdrop.jpg", payload.BackdropSourcePath)
+	}
+}
+
+type recordingArtworkEnqueuer struct {
+	item        *models.MediaItem
+	providerIDs map[string]string
+}
+
+func (r *recordingArtworkEnqueuer) EnqueueLibraryItemImages(_ context.Context, item *models.MediaItem, providerIDs map[string]string, _ []metadata.RemoteImage) error {
+	r.item = item
+	r.providerIDs = providerIDs
+	return nil
+}
+
+func TestEnqueueArtworkPassesSourcePaths(t *testing.T) {
+	enqueuer := &recordingArtworkEnqueuer{}
+	reg := &catalogMonitorRegistrar{artwork: enqueuer}
+	item := monitor.MonitoredMedia{
+		MediaType:          "movie",
+		TMDBID:             "123",
+		Poster:             "https://cache.example/poster.jpg",
+		PosterSourcePath:   "tmdb://poster.jpg",
+		Backdrop:           "https://cache.example/backdrop.jpg",
+		BackdropSourcePath: "tmdb://backdrop.jpg",
+	}
+	if err := reg.EnqueueArtwork(context.Background(), "movie-123", item); err != nil {
+		t.Fatalf("EnqueueArtwork failed: %v", err)
+	}
+	if enqueuer.item == nil {
+		t.Fatal("expected item to be enqueued")
+	}
+	if enqueuer.item.PosterSourcePath != "tmdb://poster.jpg" {
+		t.Fatalf("PosterSourcePath = %q, want tmdb://poster.jpg", enqueuer.item.PosterSourcePath)
+	}
+	if enqueuer.item.BackdropSourcePath != "tmdb://backdrop.jpg" {
+		t.Fatalf("BackdropSourcePath = %q, want tmdb://backdrop.jpg", enqueuer.item.BackdropSourcePath)
+	}
+	if enqueuer.providerIDs["tmdb"] != "123" {
+		t.Fatalf("tmdb ID = %q, want 123", enqueuer.providerIDs["tmdb"])
 	}
 }

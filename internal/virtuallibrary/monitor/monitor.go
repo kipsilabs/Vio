@@ -21,6 +21,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/Silo-Server/silo-server/internal/database/pglock"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary/altmount"
@@ -65,6 +66,32 @@ type MediaRegistrar interface {
 	Register(ctx context.Context, item MonitoredMedia) error
 }
 
+// mediaIdentityResolver is the optional registrar capability that resolves an
+// existing catalog item from provider aliases. A registrar without it keeps
+// the legacy compute-from-provider-IDs behavior.
+type mediaIdentityResolver interface {
+	ResolveContentID(ctx context.Context, mediaType string, providerIDs map[string]string) (string, error)
+}
+
+// mediaLibraryResolver validates a destination library, falling back to the
+// registrar's configured default when requested is zero.
+type mediaLibraryResolver interface {
+	ResolveLibrary(ctx context.Context, mediaType string, requested int) (int, error)
+}
+
+// mediaRegistrationResult is the optional registrar capability that reports
+// the catalog identity it actually stored. Register remains for adapters that
+// predate identity preservation.
+type mediaRegistrationResult interface {
+	RegisterWithResult(ctx context.Context, item MonitoredMedia) (string, error)
+}
+
+// mediaArtworkEnqueuer is the optional registrar capability that caps a
+// successful registration with artwork-cache work for the stored item.
+type mediaArtworkEnqueuer interface {
+	EnqueueArtwork(ctx context.Context, contentID string, item MonitoredMedia) error
+}
+
 // ReconcileEvidence attests that a source's keep set came from a pass that
 // enumerated the entire queue from the front. FullCycle is false for resumed
 // or deadline-cut passes. The monitor reconciles only after a full cycle, and
@@ -81,6 +108,11 @@ type ReconcileEvidence struct {
 // reported at Error rather than Debug because live media was about to be
 // deleted.
 var ErrReconcileRefused = errors.New("virtual reconciliation refused")
+
+// ErrIdentityConflict reports that a queue item's tracked catalog identity
+// disagrees with the identity its provider aliases resolve to. Registering
+// through the conflict would merge two catalog items.
+var ErrIdentityConflict = errors.New("catalog identity conflict")
 
 type mediaReconciler interface {
 	Reconcile(ctx context.Context, source string, keepIDs []string, libraryIDs []int, evidence ReconcileEvidence) error
@@ -143,6 +175,12 @@ func (s *Monitor) SetResolver(resolver connectionValidator) { s.resolver = resol
 
 // SetRegistrar installs the catalog registrar used by Fulfill/CheckStatus/Run.
 func (s *Monitor) SetRegistrar(registrar MediaRegistrar) { s.monitor.setRegistrar(registrar) }
+
+func (s *Monitor) SetMetadataResolver(resolve func(context.Context, MonitoredMedia) (MonitoredMedia, error)) {
+	s.monitor.mu.Lock()
+	defer s.monitor.mu.Unlock()
+	s.monitor.metadataResolver = resolve
+}
 
 // ReleaseStore returns the in-memory release schedule cache the monitor
 // populates while evaluating items. A nil result means the monitor is
@@ -520,7 +558,8 @@ type mediaMonitor struct {
 	itemTimeout time.Duration
 	// evaluateFn is the per-item evaluation step; tests replace it to make
 	// pass budgeting deterministic without provider network calls.
-	evaluateFn func(context.Context, monitoredMedia) (monitoredMedia, string, error)
+	evaluateFn       func(context.Context, monitoredMedia) (monitoredMedia, string, error)
+	metadataResolver func(context.Context, MonitoredMedia) (MonitoredMedia, error)
 }
 
 type virtualMediaLister interface {
@@ -662,14 +701,115 @@ func (m *mediaMonitor) isRegistered(key string) bool {
 	return ok
 }
 
-func (m *mediaMonitor) register(ctx context.Context, item monitoredMedia) error {
+func (m *mediaMonitor) currentRegistrar() virtualMediaRegistrar {
 	m.mu.Lock()
-	registrar := m.registrar
-	m.mu.Unlock()
-	if registrar == nil {
-		return errors.New("Vio virtual catalog service is not configured")
+	defer m.mu.Unlock()
+	return m.registrar
+}
+
+// monitoredProviderIDs returns the external IDs this item can use to match an
+// existing catalog item. Empty values are omitted.
+func monitoredProviderIDs(item monitoredMedia) map[string]string {
+	ids := make(map[string]string, 3)
+	if id := strings.TrimSpace(item.TMDBID); id != "" {
+		ids["tmdb"] = id
 	}
-	return registrar.Register(ctx, item)
+	if id := strings.TrimSpace(item.TVDBID); id != "" {
+		ids["tvdb"] = id
+	}
+	if id := strings.TrimSpace(item.IMDbID); id != "" {
+		ids["imdb"] = id
+	}
+	return ids
+}
+
+// resolveIdentity adopts an existing catalog identity from provider aliases.
+// It is idempotent: once CatalogContentID is set, a later alias match must
+// agree with it or registration refuses to merge two catalog items.
+func (m *mediaMonitor) resolveIdentity(ctx context.Context, item *monitoredMedia) error {
+	if item == nil {
+		return nil
+	}
+	resolver, ok := m.currentRegistrar().(mediaIdentityResolver)
+	if !ok {
+		return nil
+	}
+	ids := monitoredProviderIDs(*item)
+	if len(ids) == 0 {
+		return nil
+	}
+	resolved, err := resolver.ResolveContentID(ctx, item.MediaType, ids)
+	if err != nil {
+		return err
+	}
+	if resolved == "" {
+		return nil
+	}
+	if item.CatalogContentID != "" && item.CatalogContentID != resolved {
+		return fmt.Errorf("%w: tracked identity %q resolves to %q", ErrIdentityConflict, item.CatalogContentID, resolved)
+	}
+	item.CatalogContentID = resolved
+	return nil
+}
+
+// resolveLibrary returns a validated destination library. A requested value
+// (from the request connection) wins over the registrar's configured default.
+func (m *mediaMonitor) resolveLibrary(ctx context.Context, mediaType string, requested int) (int, error) {
+	resolver, ok := m.currentRegistrar().(mediaLibraryResolver)
+	if !ok {
+		if requested > 0 {
+			return requested, nil
+		}
+		return 0, nil
+	}
+	return resolver.ResolveLibrary(ctx, mediaType, requested)
+}
+
+func (m *mediaMonitor) register(ctx context.Context, item monitoredMedia) (string, error) {
+	registrar := m.currentRegistrar()
+	if registrar == nil {
+		return "", errors.New("virtual catalog service is not configured")
+	}
+	if err := m.resolveIdentity(ctx, &item); err != nil {
+		return "", err
+	}
+	if item.MediaFolderID <= 0 {
+		folderID, err := m.resolveLibrary(ctx, item.MediaType, 0)
+		if err != nil {
+			return "", err
+		}
+		item.MediaFolderID = folderID
+	}
+	if resultRegistrar, ok := registrar.(mediaRegistrationResult); ok {
+		return m.registerWithResultAndArtwork(ctx, resultRegistrar, registrar, item)
+	}
+	if err := registrar.Register(ctx, item); err != nil {
+		return "", err
+	}
+	return item.CatalogContentID, nil
+}
+
+func (m *mediaMonitor) registerWithResultAndArtwork(
+	ctx context.Context,
+	resultRegistrar mediaRegistrationResult,
+	registrar virtualMediaRegistrar,
+	item monitoredMedia,
+) (string, error) {
+	mediaID, err := resultRegistrar.RegisterWithResult(ctx, item)
+	if err != nil {
+		return "", err
+	}
+	if mediaID == "" {
+		mediaID = item.CatalogContentID
+	}
+	if enqueuer, ok := registrar.(mediaArtworkEnqueuer); ok && mediaID != "" {
+		// Artwork caching is an optimization: a failure must not fail a
+		// registration that already committed.
+		if err := enqueuer.EnqueueArtwork(ctx, mediaID, item); err != nil {
+			m.logger.WarnContext(ctx, "enqueue virtual media artwork", "key", item.Key, "content_id", mediaID, "error", err)
+		}
+	}
+	return mediaID, nil
 }
 
 func newMediaMonitor(resolver streamResolver, logger *slog.Logger) *mediaMonitor {
@@ -862,6 +1002,14 @@ func (m *mediaMonitor) rememberSeriesEpisodes(key string, episodes []virtualEpis
 	m.items[key] = item
 }
 
+// MergeEpisodes merges fresh observations into existing by season/episode
+// coordinate. Fresh non-empty fields refresh the snapshot; missing fields keep
+// the stored value. It never deletes an episode and preserves availability that
+// a file source already established.
+func MergeEpisodes(existing, fresh []VirtualEpisode) []VirtualEpisode {
+	return mergeEpisodes(existing, fresh)
+}
+
 func mergeEpisodes(existing, fresh []virtualEpisode) []virtualEpisode {
 	byKey := make(map[string]int, len(existing))
 	for i, episode := range existing {
@@ -870,14 +1018,22 @@ func mergeEpisodes(existing, fresh []virtualEpisode) []virtualEpisode {
 	for _, episode := range fresh {
 		key := episodeKey(episode)
 		if idx, ok := byKey[key]; ok {
-			if !existing[idx].Available && episode.Available {
-				existing[idx].Available = true
+			stored := &existing[idx]
+			stored.Available = stored.Available || episode.Available
+			if episode.Title != "" {
+				stored.Title = episode.Title
 			}
-			if existing[idx].Title == "" {
-				existing[idx].Title = episode.Title
+			if episode.Overview != "" {
+				stored.Overview = episode.Overview
 			}
-			if existing[idx].Released.IsZero() {
-				existing[idx].Released = episode.Released
+			if episode.Thumbnail != "" {
+				stored.Thumbnail = episode.Thumbnail
+			}
+			if episode.Runtime > 0 {
+				stored.Runtime = episode.Runtime
+			}
+			if !episode.Released.IsZero() {
+				stored.Released = episode.Released
 			}
 			continue
 		}
@@ -1106,6 +1262,16 @@ func validateMonitoredMedia(item monitoredMedia) error {
 	if item.MediaType != "movie" && item.MediaType != "series" {
 		return errors.New("monitored media type must be movie or series")
 	}
+	if item.CatalogContentID != "" {
+		if strings.TrimSpace(item.CatalogContentID) != item.CatalogContentID ||
+			!strings.HasPrefix(item.CatalogContentID, item.MediaType+"-") ||
+			len(item.CatalogContentID) > maxMonitorKeyBytes*4 {
+			return errors.New("monitored media catalog content ID is invalid")
+		}
+	}
+	if item.MetadataNextSeason < 0 {
+		return errors.New("monitored media metadata season cursor is negative")
+	}
 	return nil
 }
 
@@ -1128,10 +1294,17 @@ func mediaFromRequest(r *RequestDescriptor) (monitoredMedia, error) {
 	if streamID == "" {
 		return monitoredMedia{}, errors.New("IMDb, TVDB, or TMDB ID is required")
 	}
-	return monitoredMedia{Key: typ + ":" + streamID, MediaType: typ, Title: strings.TrimSpace(r.GetTitle()), Year: r.GetYear(), StreamID: streamID, IMDbID: imdb, TMDBID: tmdb, TVDBID: tvdb, SourceKey: "request:" + typ + ":" + streamID}, nil
+	return monitoredMedia{
+		Key: typ + ":" + streamID, MediaType: typ, Title: strings.TrimSpace(r.GetTitle()), Year: r.GetYear(),
+		StreamID: streamID, IMDbID: imdb, TMDBID: tmdb, TVDBID: tvdb, SourceKey: "request:" + typ + ":" + streamID,
+		Poster: strings.TrimSpace(r.PosterPath), Backdrop: strings.TrimSpace(r.BackdropPath),
+	}, nil
 }
 
 func virtualContentID(item monitoredMedia) string {
+	if item.CatalogContentID != "" {
+		return item.CatalogContentID
+	}
 	if item.MediaType == "series" && item.TVDBID != "" {
 		return "series-tvdb-" + item.TVDBID
 	}
@@ -1159,28 +1332,33 @@ func appendUniqueString(values []string, value string) []string {
 func (m *mediaMonitor) evaluate(ctx context.Context, item monitoredMedia) (monitoredMedia, string, error) {
 	now := time.Now()
 	var metadataErr error
-	if enriched, err := m.fetchCinemeta(ctx, item); err == nil && (item.MediaType != "series" || episodeMetadataComplete(enriched.Episodes)) {
-		item = enriched
-		if item.MediaType == "series" && episodeRuntimeMissing(item.Episodes) {
-			if supplemented, supplementErr := m.fetchTVMaze(ctx, item); supplementErr == nil {
-				item = supplemented
-			}
+	if err := m.resolveIdentity(ctx, &item); err != nil {
+		return item, "Catalog identity conflict; resolve duplicate catalog entries", err
+	}
+	folderID, err := m.resolveLibrary(ctx, item.MediaType, item.MediaFolderID)
+	if err != nil {
+		return item, "Destination library unavailable", err
+	}
+	if folderID > 0 {
+		item.MediaFolderID = folderID
+	}
+	m.mu.Lock()
+	resolveMetadata := m.metadataResolver
+	m.mu.Unlock()
+	if resolveMetadata != nil {
+		var msg string
+		item, msg, err = m.resolveLibraryMetadata(ctx, resolveMetadata, item)
+		if err != nil {
+			return item, msg, err
 		}
 	} else {
-		if item.MediaType == "series" {
-			if fallback, fallbackErr := m.fetchTVMaze(ctx, item); fallbackErr == nil {
-				item = fallback
-			} else {
-				m.logger.Warn("fetch series metadata", "key", item.Key, "cinemeta_error", err, "tvmaze_error", fallbackErr)
-				metadataErr = errors.Join(err, fallbackErr)
-			}
-		} else {
-			m.logger.Warn("fetch Cinemeta metadata", "key", item.Key, "error", err)
-		}
+		item, metadataErr = m.fallbackPublicMetadata(ctx, item)
 	}
 	if item.MediaType == "movie" {
-		if runtime, err := m.fetchTMDBMovieRuntime(ctx, item); err == nil && runtime > 0 {
-			item.Runtime = runtime
+		if item.Runtime == 0 {
+			if runtime, err := m.fetchTMDBMovieRuntime(ctx, item); err == nil && runtime > 0 {
+				item.Runtime = runtime
+			}
 		}
 		release, err := m.movieRelease(ctx, item)
 		if err != nil {
@@ -1271,10 +1449,13 @@ func (m *mediaMonitor) evaluate(ctx context.Context, item monitoredMedia) (monit
 			}
 		}
 		item.Ready = available > 0
-		if !item.Ready {
-			return item, "Series registered; monitoring for released episodes", metadataErr
+		if metadataErr != nil {
+			m.logger.WarnContext(ctx, "series metadata incomplete; keeping known episodes", "key", item.Key, "error", metadataErr)
 		}
-		return item, fmt.Sprintf("%d episodes registered for on-demand playback", available), metadataErr
+		if !item.Ready {
+			return item, "Series registered; monitoring for released episodes", nil
+		}
+		return item, fmt.Sprintf("%d episodes registered for on-demand playback", available), nil
 	}
 	item.Ready = true
 	return item, "Movie is available for home media", nil
@@ -1439,13 +1620,34 @@ func (s *Monitor) Fulfill(ctx context.Context, req *FulfillRequest) (resp *Fulfi
 	if err != nil {
 		return nil, err
 	}
-	item, message, _ := s.monitor.evaluate(ctx, item)
+	requestedFolder := 0
 	if len(req.GetConnections()) > 0 {
 		folderID, folderErr := configuredFolderID(req.GetConnections()[0].GetConfig()["media_folder_id"])
 		if folderErr != nil {
 			return nil, folderErr
 		}
+		requestedFolder = folderID
+	}
+	item.MediaFolderID = requestedFolder
+	folderID, folderErr := s.monitor.resolveLibrary(ctx, item.MediaType, requestedFolder)
+	if folderErr != nil {
+		return nil, fmt.Errorf("resolve destination library: %w", folderErr)
+	}
+	if folderID > 0 {
 		item.MediaFolderID = folderID
+	}
+	// The request path shares the scheduler's per-item bound: metadata,
+	// destination validation, release evaluation, and registration must not
+	// hold runMu for an unbounded provider chain.
+	evaluateCtx := ctx
+	if timeout := s.monitor.itemTimeout; timeout > 0 {
+		var cancel context.CancelFunc
+		evaluateCtx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	item, message, evalErr := s.monitor.evaluate(evaluateCtx, item)
+	if evalErr != nil {
+		return nil, fmt.Errorf("evaluate virtual media: %w", evalErr)
 	}
 	// If media is available but still has no title or is a series with no
 	// episodes (Silo did not include episodes in the request descriptor and
@@ -1460,8 +1662,12 @@ func (s *Monitor) Fulfill(ctx context.Context, req *FulfillRequest) (resp *Fulfi
 		}
 	}
 	if item.Ready {
-		if err := s.monitor.register(ctx, item); err != nil {
-			return nil, fmt.Errorf("register virtual media: %w", err)
+		mediaID, regErr := s.monitor.register(evaluateCtx, item)
+		if regErr != nil {
+			return nil, fmt.Errorf("register virtual media: %w", regErr)
+		}
+		if mediaID != "" {
+			item.CatalogContentID = mediaID
 		}
 		s.monitor.markRegistered(item.Key)
 		message = "Virtual media registered in Vio library"
@@ -1498,7 +1704,55 @@ func (s *Monitor) CheckStatus(ctx context.Context, req *CheckStatusRequest) (*Ch
 		if !ok {
 			item = base
 		}
-		item, message, _ := s.monitor.evaluate(ctx, item)
+		// Status calls may omit or reorder the connection that created the
+		// request. Restore the destination from the target's connection when
+		// the persisted item has none, then validate whichever ID wins.
+		requestedFolder := 0
+		for _, connection := range req.Connections {
+			if connection == nil {
+				continue
+			}
+			if target.GetConnectionId() != "" && connection.GetId() != target.GetConnectionId() {
+				continue
+			}
+			folderID, folderErr := configuredFolderID(connection.GetConfig()["media_folder_id"])
+			if folderErr != nil {
+				return nil, folderErr
+			}
+			requestedFolder = folderID
+			break
+		}
+		destination := item.MediaFolderID
+		if destination <= 0 {
+			destination = requestedFolder
+		}
+		folderID, folderErr := s.monitor.resolveLibrary(ctx, item.MediaType, destination)
+		if folderErr != nil {
+			return nil, fmt.Errorf("resolve destination library: %w", folderErr)
+		}
+		if folderID > 0 {
+			item.MediaFolderID = folderID
+		}
+		evaluateCtx := ctx
+		var cancel context.CancelFunc
+		if timeout := s.monitor.itemTimeout; timeout > 0 {
+			evaluateCtx, cancel = context.WithTimeout(ctx, timeout)
+		}
+		item, message, evalErr := s.monitor.evaluate(evaluateCtx, item)
+		ctxErr := evaluateCtx.Err()
+		if cancel != nil {
+			cancel()
+		}
+		if evalErr != nil {
+			if ctxErr != nil {
+				return nil, fmt.Errorf("evaluate virtual media: %w", evalErr)
+			}
+			// A transient metadata or provider failure keeps the target
+			// queued. Identity and destination errors were returned above.
+			s.monitor.logger.WarnContext(ctx, "evaluate virtual media status", "key", item.Key, "error", evalErr)
+			item.Ready = false
+			message = "Virtual media status unavailable; will retry"
+		}
 		// If media is available but still has no title or is a series with no
 		// episodes, keep it queued rather than failing the RPC with an SDK validation error.
 		if item.Ready && (strings.TrimSpace(item.Title) == "" || (item.MediaType == "series" && len(item.Episodes) == 0)) {
@@ -1510,8 +1764,12 @@ func (s *Monitor) CheckStatus(ctx context.Context, req *CheckStatusRequest) (*Ch
 			}
 		}
 		if item.Ready {
-			if err := s.monitor.register(ctx, item); err != nil {
-				return nil, fmt.Errorf("register virtual media: %w", err)
+			mediaID, regErr := s.monitor.register(ctx, item)
+			if regErr != nil {
+				return nil, fmt.Errorf("register virtual media: %w", regErr)
+			}
+			if mediaID != "" {
+				item.CatalogContentID = mediaID
 			}
 			s.monitor.markRegistered(item.Key)
 			message = "Virtual media registered in Vio library"
@@ -1743,6 +2001,13 @@ func (m *mediaMonitor) runPass(ctx context.Context, items []monitoredMedia, regi
 		// Keep the previously known content unless an authoritative successful
 		// pass proves it should be absent. Metadata and host failures must never
 		// turn an empty keep-set into destructive reconciliation.
+		// Adopt an existing catalog identity before building the keep set so
+		// an enrichment-added provider ID cannot move the keep set to a new
+		// content ID and make the old item look absent.
+		if err := m.resolveIdentity(ctx, &item); err != nil {
+			m.logger.WarnContext(ctx, "resolve virtual media catalog identity", "key", item.Key, "error", err)
+			reconcileSafeBySource[source] = false
+		}
 		if contentID := virtualContentID(item); contentID != "" {
 			keepBySource[source] = appendUniqueString(keepBySource[source], contentID)
 		}
@@ -1953,7 +2218,8 @@ func (m *mediaMonitor) processItem(ctx context.Context, item monitoredMedia) (mo
 		if updated.MediaType == "movie" && m.isRegistered(updated.Key) {
 			return updated, message, itemPending
 		}
-		if err := m.register(itemCtx, updated); err != nil {
+		mediaID, err := m.register(itemCtx, updated)
+		if err != nil {
 			switch {
 			case ctx.Err() != nil:
 				return item, "", itemBudgetExhausted
@@ -1964,6 +2230,9 @@ func (m *mediaMonitor) processItem(ctx context.Context, item monitoredMedia) (mo
 				m.logger.ErrorContext(itemCtx, "register virtual media", "key", updated.Key, "error", err)
 				return updated, "", itemFailed
 			}
+		}
+		if mediaID != "" {
+			updated.CatalogContentID = mediaID
 		}
 		m.markRegistered(updated.Key)
 		if updated.MediaType == "series" {
@@ -2087,7 +2356,23 @@ func parseRuntimeMinutes(value string) int {
 }
 
 func cleanTVMazeSummary(value string) string {
-	return strings.TrimSpace(html.UnescapeString(htmlTagPattern.ReplaceAllString(value, "")))
+	return CleanMetadataSummary(value)
+}
+
+func CleanMetadataSummary(value string) string {
+	return CleanMetadataText(html.UnescapeString(htmlTagPattern.ReplaceAllString(value, "")))
+}
+
+func CleanMetadataText(value string) string {
+	return strings.TrimSpace(strings.Map(func(character rune) rune {
+		if unicode.IsSpace(character) {
+			return ' '
+		}
+		if unicode.IsControl(character) {
+			return -1
+		}
+		return character
+	}, value))
 }
 
 func (m *mediaMonitor) fetchTVMaze(ctx context.Context, item monitoredMedia) (monitoredMedia, error) {
@@ -2213,6 +2498,94 @@ type tmdbReleaseDates struct {
 			Type int       `json:"type"`
 		} `json:"release_dates"`
 	} `json:"results"`
+}
+
+func (m *mediaMonitor) resolveLibraryMetadata(
+	ctx context.Context,
+	resolve func(context.Context, MonitoredMedia) (MonitoredMedia, error),
+	item monitoredMedia,
+) (monitoredMedia, string, error) {
+	enriched, err := resolve(ctx, item)
+	if err != nil {
+		if ctx.Err() != nil {
+			return item, "Library metadata lookup timed out; monitoring will retry", err
+		}
+		// Enrichment is optional. Keep whatever usable metadata the
+		// resolver already had and fall back to public providers.
+		m.logger.WarnContext(ctx, "library metadata unavailable; falling back to public providers", "key", item.Key, "error", err)
+	}
+	if enriched.Key != "" {
+		item = enriched
+	}
+	if resolveErr := m.resolveIdentity(ctx, &item); resolveErr != nil {
+		return item, "Catalog identity conflict; resolve duplicate catalog entries", resolveErr
+	}
+	// Fall back to Cinemeta/TVMaze if library resolution failed or left an item
+	// without a title or a series without episodes.
+	if err != nil || (item.MediaType == "series" && len(item.Episodes) == 0) || item.Title == "" {
+		fallback, fallbackErr := m.fallbackPublicMetadata(ctx, item)
+		if fallbackErr == nil {
+			item = fallback
+		}
+	}
+	return item, "", nil
+}
+
+func (m *mediaMonitor) fallbackPublicMetadata(ctx context.Context, item monitoredMedia) (monitoredMedia, error) {
+	enriched, err := m.fetchCinemeta(ctx, item)
+	if err == nil && (item.MediaType != "series" || episodeMetadataComplete(enriched.Episodes)) {
+		item = mergePublicMetadata(item, enriched)
+		if item.MediaType == "series" && episodeRuntimeMissing(item.Episodes) {
+			if supplemented, supplementErr := m.fetchTVMaze(ctx, item); supplementErr == nil {
+				item = mergePublicMetadata(item, supplemented)
+			}
+		}
+		return item, nil
+	}
+	if item.MediaType == "series" {
+		fallback, fallbackErr := m.fetchTVMaze(ctx, item)
+		if fallbackErr == nil {
+			return mergePublicMetadata(item, fallback), nil
+		}
+		m.logger.WarnContext(ctx, "fetch series metadata", "key", item.Key, "cinemeta_error", err, "tvmaze_error", fallbackErr)
+		return item, errors.Join(err, fallbackErr)
+	}
+	m.logger.WarnContext(ctx, "fetch Cinemeta metadata", "key", item.Key, "error", err)
+	return item, nil
+}
+
+func mergePublicMetadata(stored, incoming monitoredMedia) monitoredMedia {
+	if stored.Title == "" {
+		stored.Title = incoming.Title
+	}
+	if stored.Overview == "" {
+		stored.Overview = incoming.Overview
+	}
+	if stored.Poster == "" {
+		stored.Poster = incoming.Poster
+	}
+	if stored.Backdrop == "" {
+		stored.Backdrop = incoming.Backdrop
+	}
+	if stored.Runtime == 0 {
+		stored.Runtime = incoming.Runtime
+	}
+	if len(stored.Genres) == 0 {
+		stored.Genres = incoming.Genres
+	}
+	if stored.TMDBID == "" {
+		stored.TMDBID = incoming.TMDBID
+	}
+	if stored.TVDBID == "" {
+		stored.TVDBID = incoming.TVDBID
+	}
+	if stored.IMDbID == "" {
+		stored.IMDbID = incoming.IMDbID
+	}
+	if stored.MediaType == "series" {
+		stored.Episodes = mergeEpisodes(stored.Episodes, incoming.Episodes)
+	}
+	return stored
 }
 
 func (m *mediaMonitor) movieRelease(ctx context.Context, item monitoredMedia) (time.Time, error) {

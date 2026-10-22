@@ -24,6 +24,11 @@ import (
 
 var ErrInvalidVirtualMedia = errors.New("invalid virtual media")
 
+// ErrVirtualMediaIdentityConflict reports that provider aliases resolve to
+// more than one catalog item. Registration refuses to choose between them
+// because either choice would merge two identities.
+var ErrVirtualMediaIdentityConflict = errors.New("virtual media identity is ambiguous")
+
 // ErrVirtualReconcileRefused reports that a destructive reconciliation was
 // rejected because the caller did not carry positive completeness evidence
 // for the source's membership, or because the keep set shrank beyond what a
@@ -163,6 +168,7 @@ type VirtualMedia struct {
 	IMDbID, TMDBID, TVDBID, Overview     string
 	Genres                               []string
 	PosterPath, BackdropPath, VirtualURI string
+	PosterSourcePath, BackdropSourcePath string
 	RuntimeMinutes                       int
 	Source                               string
 	Resolution                           string
@@ -238,6 +244,19 @@ func (r *VirtualMediaRegistrar) Upsert(ctx context.Context, in VirtualMedia) (*V
 // persisted as ownership metadata so reconciliation cannot remove another
 // plugin's virtual catalog entries.
 func (r *VirtualMediaRegistrar) UpsertVirtualMedia(ctx context.Context, installationID int, in VirtualMedia) (*VirtualMediaResult, error) {
+	return r.upsertVirtualMedia(ctx, installationID, "", in)
+}
+
+// UpsertVirtualMediaResolved registers virtual media under an existing catalog
+// identity that the caller resolved from provider aliases. It preserves that
+// identity when enrichment adds a provider ID that would otherwise change the
+// canonical content ID and split the item.
+func (r *VirtualMediaRegistrar) UpsertVirtualMediaResolved(ctx context.Context, installationID int, contentID string, in VirtualMedia) (*VirtualMediaResult, error) {
+	return r.upsertVirtualMedia(ctx, installationID, contentID, in)
+}
+
+//nolint:funlen,gocyclo // upsertVirtualMedia manages transaction, locks, overrides, and catalog row persistence in one atomic unit
+func (r *VirtualMediaRegistrar) upsertVirtualMedia(ctx context.Context, installationID int, resolvedContentID string, in VirtualMedia) (*VirtualMediaResult, error) {
 	if r == nil || r.pool == nil {
 		return nil, errors.New("virtual catalog is unavailable")
 	}
@@ -246,6 +265,12 @@ func (r *VirtualMediaRegistrar) UpsertVirtualMedia(ctx context.Context, installa
 		in = r.fillEpisodeReleaseDates(ctx, in)
 	}
 	if err := validateVirtualMedia(in); err != nil {
+		return nil, err
+	}
+	contentID := strings.TrimSpace(resolvedContentID)
+	if contentID == "" {
+		contentID = virtualContentID(in)
+	} else if err := validateResolvedVirtualContentID(contentID, in.MediaType); err != nil {
 		return nil, err
 	}
 	var releaseSnapshot []ReleaseOverride
@@ -260,7 +285,7 @@ func (r *VirtualMediaRegistrar) UpsertVirtualMedia(ctx context.Context, installa
 		// consulted and behavior matches the pre-override gate).
 		if r.ReleaseOverrides != nil {
 			var err error
-			movieIDs, err = releaseIdentitiesForContent(ctx, r.pool, "movie", virtualContentID(in), "movie", in.TMDBID, "", in.IMDbID, 0, 0)
+			movieIDs, err = releaseIdentitiesForContent(ctx, r.pool, "movie", contentID, "movie", in.TMDBID, "", in.IMDbID, 0, 0)
 			if err != nil {
 				return nil, err
 			}
@@ -284,7 +309,7 @@ func (r *VirtualMediaRegistrar) UpsertVirtualMedia(ctx context.Context, installa
 			// override wiring so the unwired fail-fast path stays
 			// database-free.
 			if r.ReleaseOverrides != nil {
-				physical, err := hasPhysicalMediaFiles(ctx, r.pool, virtualContentID(in))
+				physical, err := hasPhysicalMediaFiles(ctx, r.pool, contentID)
 				if err != nil {
 					return nil, err
 				}
@@ -322,7 +347,7 @@ func (r *VirtualMediaRegistrar) UpsertVirtualMedia(ctx context.Context, installa
 	// that owns item metadata can insert or change scalar aliases, so it is
 	// an alias writer. No shared-to-exclusive upgrade happens later.
 	if in.MediaType == "movie" || in.MediaType == "series" {
-		if err := lockReleaseContentTx(ctx, tx, virtualContentID(in), true); err != nil {
+		if err := lockReleaseContentTx(ctx, tx, contentID, true); err != nil {
 			return nil, fmt.Errorf("lock release content: %w", err)
 		}
 	}
@@ -345,7 +370,6 @@ func (r *VirtualMediaRegistrar) UpsertVirtualMedia(ctx context.Context, installa
 	if err := validateReleaseSnapshotTx(ctx, tx, releaseSnapshot); err != nil {
 		return nil, err
 	}
-	contentID := virtualContentID(in)
 	ownsItemMetadata, err := upsertVirtualMediaItem(ctx, tx, installationID, source, contentID, in)
 	if err != nil {
 		return nil, err
@@ -464,6 +488,66 @@ func (r *VirtualMediaRegistrar) UpsertVirtualMedia(ctx context.Context, installa
 	return &VirtualMediaResult{MediaID: contentID, LibraryID: in.LibraryID, EpisodesUpserted: episodes}, nil
 }
 
+// ResolveVirtualMediaContentID returns the single catalog item whose current,
+// recorded, or stale provider IDs match the supplied identity. Multiple matches
+// are an ambiguity the caller must resolve; registering through it would merge
+// two catalog items.
+func (r *VirtualMediaRegistrar) ResolveVirtualMediaContentID(ctx context.Context, mediaType string, providerIDs map[string]string) (string, error) {
+	if r == nil || r.pool == nil {
+		return "", errors.New("virtual catalog is unavailable")
+	}
+	mediaType = strings.ToLower(strings.TrimSpace(mediaType))
+	if mediaType != "movie" && mediaType != "series" {
+		return "", fmt.Errorf("%w: media type must be movie or series", ErrInvalidVirtualMedia)
+	}
+	aliases := make([]ProviderAlias, 0, len(providerIDs))
+	for provider, providerID := range providerIDs {
+		provider = strings.ToLower(strings.TrimSpace(provider))
+		providerID = strings.TrimSpace(providerID)
+		if providerID == "" {
+			continue
+		}
+		aliases = append(aliases, ProviderAlias{Key: 1, MediaType: mediaType, Provider: provider, ProviderID: providerID})
+	}
+	if len(aliases) == 0 {
+		return "", nil
+	}
+	matches, err := NewItemRepository(r.pool).ResolveProviderAliases(ctx, aliases)
+	if err != nil {
+		return "", err
+	}
+	ids := matches[1]
+	if len(ids) == 0 {
+		return "", nil
+	}
+	if len(ids) > 1 {
+		return "", fmt.Errorf("%w: provider identity matches multiple catalog items: %s", ErrVirtualMediaIdentityConflict, strings.Join(ids, ", "))
+	}
+	return ids[0], nil
+}
+
+// ValidateVirtualMediaLibrary checks that a destination library exists, is
+// enabled, and accepts the media type before any metadata work runs.
+func (r *VirtualMediaRegistrar) ValidateVirtualMediaLibrary(ctx context.Context, mediaType string, folderID int) error {
+	if r == nil || r.pool == nil {
+		return errors.New("virtual catalog is unavailable")
+	}
+	if folderID <= 0 {
+		return fmt.Errorf("%w: destination library is required", ErrInvalidVirtualMedia)
+	}
+	var folderType string
+	if err := r.pool.QueryRow(ctx, `SELECT type FROM media_folders WHERE id=$1 AND enabled IS NOT FALSE`, folderID).Scan(&folderType); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("%w: destination library does not exist or is disabled", ErrInvalidVirtualMedia)
+		}
+		return fmt.Errorf("load destination library: %w", err)
+	}
+	if !virtualLibraryCompatible(folderType, mediaType) {
+		return fmt.Errorf("%w: %s cannot be added to %s library", ErrInvalidVirtualMedia, mediaType, folderType)
+	}
+	return nil
+}
+
 func upsertVirtualMediaItem(ctx context.Context, tx pgx.Tx, installationID int, source, contentID string, in VirtualMedia) (bool, error) {
 	if err := requestlock.LockItem(ctx, tx, contentID); err != nil {
 		return false, fmt.Errorf("lock virtual media identity: %w", err)
@@ -476,15 +560,19 @@ func upsertVirtualMediaItem(ctx context.Context, tx pgx.Tx, installationID int, 
 	err := tx.QueryRow(ctx, `
 		INSERT INTO media_items(
 			content_id,type,title,year,imdb_id,tmdb_id,tvdb_id,overview,genres,poster_path,backdrop_path,
+			poster_source_path,backdrop_source_path,
 			runtime,matched_at,status,virtual_owner_installation_id,virtual_source,virtual_last_seen_at
 		) VALUES(
-			$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
-			CASE WHEN $13='matched' THEN NOW() END,$13,NULLIF($14,0),$15,NOW()
+			$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,
+			COALESCE(NULLIF($12,''),$10),COALESCE(NULLIF($13,''),$11),
+			$14,
+			CASE WHEN $15='matched' THEN NOW() END,$15,NULLIF($16,0),$17,NOW()
 		)
 		ON CONFLICT(content_id) DO NOTHING
 		RETURNING content_id`,
 		contentID, in.MediaType, in.Title, in.Year, in.IMDbID, in.TMDBID, in.TVDBID,
-		in.Overview, in.Genres, in.PosterPath, in.BackdropPath, in.RuntimeMinutes, status, installationID, source,
+		in.Overview, in.Genres, in.PosterPath, in.BackdropPath, in.PosterSourcePath, in.BackdropSourcePath,
+		in.RuntimeMinutes, status, installationID, source,
 	).Scan(&insertedID)
 	if err == nil {
 		return true, nil
@@ -570,16 +658,19 @@ func upsertVirtualMediaItem(ctx context.Context, tx pgx.Tx, installationID int, 
 			genres=CASE WHEN cardinality($8::text[])>0 THEN $8 ELSE genres END,
 			poster_path=CASE WHEN $9<>'' THEN $9 ELSE poster_path END,
 			backdrop_path=CASE WHEN $10<>'' THEN $10 ELSE backdrop_path END,
+			poster_source_path=CASE WHEN $14<>'' THEN $14 WHEN $9<>'' THEN $9 ELSE poster_source_path END,
+			backdrop_source_path=CASE WHEN $15<>'' THEN $15 WHEN $10<>'' THEN $10 ELSE backdrop_source_path END,
 			runtime=CASE WHEN $11>0 THEN $11 ELSE runtime END,
 			matched_at=CASE WHEN $12='matched' THEN COALESCE(matched_at,NOW()) ELSE matched_at END,
 			status=CASE WHEN $12='matched' THEN 'matched' ELSE status END,
 			virtual_owner_installation_id=NULLIF($13,0),
-			virtual_source=$14,
+			virtual_source=$16,
 			virtual_last_seen_at=NOW(),
 			updated_at=NOW()
 		WHERE content_id=$1`,
 		contentID, in.Title, in.Year, in.IMDbID, in.TMDBID, in.TVDBID, in.Overview,
-		in.Genres, in.PosterPath, in.BackdropPath, in.RuntimeMinutes, status, installationID, source,
+		in.Genres, in.PosterPath, in.BackdropPath, in.RuntimeMinutes, status,
+		installationID, in.PosterSourcePath, in.BackdropSourcePath, source,
 	); err != nil {
 		return false, fmt.Errorf("update owned virtual media: %w", err)
 	}
@@ -1623,6 +1714,27 @@ func virtualContentID(in VirtualMedia) string {
 	// items do not silently collide on the same content_id.
 	h := sha256.Sum256([]byte(in.Source + "|" + in.MediaType + "|" + in.Title + "|" + strconv.Itoa(in.Year) + "|" + in.VirtualURI))
 	return in.MediaType + "-hash-" + hex.EncodeToString(h[:12])
+}
+
+// validateResolvedVirtualContentID bounds an identity supplied by the core
+// monitor so a caller cannot target a row of a different media type or pass a
+// malformed key into the catalog.
+func validateResolvedVirtualContentID(contentID, mediaType string) error {
+	if contentID == "" || strings.TrimSpace(contentID) != contentID {
+		return fmt.Errorf("%w: resolved content ID is empty or has surrounding whitespace", ErrInvalidVirtualMedia)
+	}
+	if len(contentID) > maxVirtualTitleBytes*4 {
+		return fmt.Errorf("%w: resolved content ID is too long", ErrInvalidVirtualMedia)
+	}
+	if !strings.HasPrefix(contentID, mediaType+"-") {
+		return fmt.Errorf("%w: resolved content ID %q does not belong to media type %q", ErrInvalidVirtualMedia, contentID, mediaType)
+	}
+	for _, character := range contentID {
+		if character <= ' ' || character == '/' || character == '\\' {
+			return fmt.Errorf("%w: resolved content ID contains an invalid character", ErrInvalidVirtualMedia)
+		}
+	}
+	return nil
 }
 
 func virtualLibraryCompatible(folderType, mediaType string) bool {

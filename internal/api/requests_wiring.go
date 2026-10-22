@@ -44,9 +44,11 @@ func requestDescriptorOf(req mediarequests.Request) *monitor.RequestDescriptor {
 		tvdbStr = strconv.Itoa(*req.TVDBID)
 	}
 	return &monitor.RequestDescriptor{
-		MediaType: string(req.MediaType),
-		Title:     req.Title,
-		Year:      year,
+		MediaType:    string(req.MediaType),
+		Title:        req.Title,
+		Year:         year,
+		PosterPath:   req.PosterPath,
+		BackdropPath: req.BackdropPath,
 		ExternalIds: map[string]string{
 			"imdb": req.IMDbID,
 			"tmdb": tmdbStr,

@@ -108,25 +108,36 @@ type VirtualEpisode = virtualEpisode
 
 // monitoredMedia mirrors the virtual-library monitored item shape.
 type monitoredMedia struct {
-	Key           string           `json:"key"`
-	MediaType     string           `json:"media_type"`
-	Title         string           `json:"title"`
-	StreamID      string           `json:"stream_id,omitempty"`
-	IMDbID        string           `json:"imdb_id,omitempty"`
-	TMDBID        string           `json:"tmdb_id,omitempty"`
-	TVDBID        string           `json:"tvdb_id,omitempty"`
-	SourceKey     string           `json:"source_key,omitempty"`
-	MediaFolderID int              `json:"media_folder_id,omitempty"`
-	Year          int32            `json:"year,omitempty"`
-	Runtime       int              `json:"runtime,omitempty"`
-	Release       time.Time        `json:"release,omitempty"`
-	Ready         bool             `json:"ready"`
-	Force         bool             `json:"force"`
-	Overview      string           `json:"overview,omitempty"`
-	Poster        string           `json:"poster,omitempty"`
-	Backdrop      string           `json:"backdrop,omitempty"`
-	Genres        []string         `json:"genres,omitempty"`
-	Episodes      []virtualEpisode `json:"episodes,omitempty"`
+	Key                string           `json:"key"`
+	MediaType          string           `json:"media_type"`
+	Title              string           `json:"title"`
+	StreamID           string           `json:"stream_id,omitempty"`
+	IMDbID             string           `json:"imdb_id,omitempty"`
+	TMDBID             string           `json:"tmdb_id,omitempty"`
+	TVDBID             string           `json:"tvdb_id,omitempty"`
+	SourceKey          string           `json:"source_key,omitempty"`
+	MediaFolderID      int              `json:"media_folder_id,omitempty"`
+	Year               int32            `json:"year,omitempty"`
+	Runtime            int              `json:"runtime,omitempty"`
+	Release            time.Time        `json:"release,omitempty"`
+	Ready              bool             `json:"ready"`
+	Force              bool             `json:"force"`
+	Overview           string           `json:"overview,omitempty"`
+	Poster             string           `json:"poster,omitempty"`
+	PosterSourcePath   string           `json:"poster_source_path,omitempty"`
+	Backdrop           string           `json:"backdrop,omitempty"`
+	BackdropSourcePath string           `json:"backdrop_source_path,omitempty"`
+	Genres             []string         `json:"genres,omitempty"`
+	Episodes           []virtualEpisode `json:"episodes,omitempty"`
+	// CatalogContentID is the catalog identity resolved from provider aliases.
+	// Once set, enrichment may add provider IDs but must never change this ID.
+	CatalogContentID string `json:"catalog_content_id,omitempty"`
+	// MetadataNextSeason is the resumable series metadata cursor. Zero means
+	// the next lookup starts from the first season.
+	MetadataNextSeason int `json:"metadata_next_season,omitempty"`
+	// MetadataComplete records that the last lookup reached the end of the
+	// season list. It never authorizes deleting episodes.
+	MetadataComplete bool `json:"metadata_complete,omitempty"`
 }
 
 // virtualEpisode mirrors a series episode for episode-level matching.
