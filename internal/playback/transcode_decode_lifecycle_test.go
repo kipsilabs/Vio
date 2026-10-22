@@ -591,6 +591,8 @@ func TestVerdictPathsAgreeUnderInterleaving(t *testing.T) {
 		}
 	}()
 	var rejectedSeen, notRejectedSeen int32
+	observed := make(chan struct{})
+	var observeOnce sync.Once
 	for i := 0; i < 4; i++ {
 		wg.Add(1)
 		go func() {
@@ -602,6 +604,7 @@ func TestVerdictPathsAgreeUnderInterleaving(t *testing.T) {
 				default:
 					if s.IsSourceRejected() {
 						atomic.AddInt32(&rejectedSeen, 1)
+						observeOnce.Do(func() { close(observed) })
 					} else {
 						atomic.AddInt32(&notRejectedSeen, 1)
 					}
@@ -615,14 +618,14 @@ func TestVerdictPathsAgreeUnderInterleaving(t *testing.T) {
 	clock.Advance(decodeObservationWindow)
 	s.evaluateDecodeVerdict()
 	waitSourceRejected(t, s)
-	// The readers are what prove the interleaving. Give them a bounded chance
-	// to observe the confirmed verdict before the stop channel retires them;
-	// on a loaded CI runner the 30 ms storm can otherwise end with every
-	// reader still descheduled, making the assertion below race the scheduler
-	// rather than exercise the verdict.
-	observeDeadline := time.Now().Add(2 * time.Second)
-	for atomic.LoadInt32(&rejectedSeen) == 0 && time.Now().Before(observeDeadline) {
-		time.Sleep(time.Millisecond)
+	// The readers are what prove the interleaving. Wait for one of them to
+	// report the confirmed verdict before the stop channel retires them; on a
+	// loaded CI runner the 30 ms storm can otherwise end with every reader still
+	// descheduled, making the assertion below race the scheduler.
+	select {
+	case <-observed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("interleaving never observed the confirmed verdict")
 	}
 	close(stop)
 	wg.Wait()
