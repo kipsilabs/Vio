@@ -269,6 +269,8 @@ func transportStartFailureV3(cause error, fallback *transportErrorV3) *transport
 // classifier cannot name.
 func virtualStartUnresolvedTerminalV3(resolveErr error) playback.DecisionResponseV3 {
 	switch {
+	case errors.Is(resolveErr, errOfferedCandidateUnavailable):
+		return playback.NewTerminalResponseV3("offered_release_unavailable", "The offered release is no longer available; refresh the version list and choose again.", true)
 	case errors.Is(resolveErr, resolver.ErrProviderUnavailable):
 		return playback.NewTerminalResponseV3(providerUnavailableReasonV3, "The virtual source provider is temporarily unavailable.", true)
 	case strings.Contains(strings.ToLower(fmt.Sprint(resolveErr)), "no streams available"):

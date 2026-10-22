@@ -345,8 +345,8 @@ func TestVirtualPGSWholeTrackFetchServesImplicitWindowThenWarms(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("PGS whole-track fetch = %d %q", rec.Code, rec.Body.String())
 	}
-	if got := rec.Header().Get(playback.SubtitleCoverageHeader); got != "0.000-120.000" {
-		t.Fatalf("PGS windowed coverage header = %q, want 0.000-120.000", got)
+	if got := rec.Header().Get(playback.SubtitleCoverageHeader); got != "0.000-600.000" {
+		t.Fatalf("PGS windowed coverage header = %q, want 0.000-600.000", got)
 	}
 
 	waitForWarmInvocation(t, argsLog)
@@ -385,11 +385,11 @@ func TestVirtualImplicitWindowAppliesToASS(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("ASS whole-track fetch = %d %q", rec.Code, rec.Body.String())
 	}
-	if got := rec.Header().Get(playback.SubtitleCoverageHeader); got != "0.000-120.000" {
-		t.Fatalf("ASS windowed coverage header = %q, want 0.000-120.000", got)
+	if got := rec.Header().Get(playback.SubtitleCoverageHeader); got != "0.000-600.000" {
+		t.Fatalf("ASS windowed coverage header = %q, want 0.000-600.000", got)
 	}
 	windowLine := windowedFFmpegArgs(t, argsLog)
-	for _, want := range []string{"-ss 0.000", "-to 120.000", "-copyts", "-c:s copy", "-f ass pipe:1"} {
+	for _, want := range []string{"-ss 0.000", "-to 600.000", "-copyts", "-c:s copy", "-f ass pipe:1"} {
 		if !strings.Contains(windowLine, want) {
 			t.Fatalf("implicit ASS window args %q missing %q", windowLine, want)
 		}
@@ -740,8 +740,8 @@ func TestVirtualWholeTrackTextFetchServesImplicitWindowThenWarms(t *testing.T) {
 	}
 	// A whole-track request served only a window must say so, or the client
 	// cannot know it needs to request subsequent windows.
-	if got := rec.Header().Get(playback.SubtitleCoverageHeader); got != "0.000-120.000" {
-		t.Fatalf("windowed coverage header = %q, want 0.000-120.000", got)
+	if got := rec.Header().Get(playback.SubtitleCoverageHeader); got != "0.000-600.000" {
+		t.Fatalf("windowed coverage header = %q, want 0.000-600.000", got)
 	}
 	if got := rec.Header().Get(playback.SubtitleWindowedHeader); got != "true" {
 		t.Fatalf("windowed marker = %q, want true", got)
@@ -772,8 +772,8 @@ func TestVirtualWholeTrackTextFetchServesImplicitWindowThenWarms(t *testing.T) {
 			windowLine = line
 		}
 	}
-	if !strings.Contains(windowLine, "-ss 0.000") || !strings.Contains(windowLine, "-to 120.000") {
-		t.Fatalf("implicit window args = %q, want -ss 0.000 -to 120.000", windowLine)
+	if !strings.Contains(windowLine, "-ss 0.000") || !strings.Contains(windowLine, "-to 600.000") {
+		t.Fatalf("implicit window args = %q, want -ss 0.000 -to 600.000", windowLine)
 	}
 
 	// Warm regression: once the detached warm has committed, a second
@@ -925,8 +925,8 @@ func TestVirtualPositionWithoutDurationClampsToImplicitWindow(t *testing.T) {
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "WEBVTT") {
 		t.Fatalf("position-only fetch = %d %q", rec.Code, rec.Body.String())
 	}
-	if got := rec.Header().Get(playback.SubtitleCoverageHeader); got != "0.000-120.000" {
-		t.Fatalf("position-only coverage header = %q, want 0.000-120.000", got)
+	if got := rec.Header().Get(playback.SubtitleCoverageHeader); got != "0.000-600.000" {
+		t.Fatalf("position-only coverage header = %q, want 0.000-600.000", got)
 	}
 	if got := rec.Header().Get(playback.SubtitleWindowedHeader); got != "true" {
 		t.Fatalf("position-only windowed marker = %q, want true", got)
@@ -934,7 +934,7 @@ func TestVirtualPositionWithoutDurationClampsToImplicitWindow(t *testing.T) {
 	// The advertised range must match the ffmpeg command: the open `-ss 0`
 	// without a `-to` was the unbounded extract this finding is about.
 	windowLine := windowedFFmpegArgs(t, argsLog)
-	for _, want := range []string{"-ss 0.000", "-to 120.000"} {
+	for _, want := range []string{"-ss 0.000", "-to 600.000"} {
 		if !strings.Contains(windowLine, want) {
 			t.Fatalf("position-only window args %q missing %q", windowLine, want)
 		}

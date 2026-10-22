@@ -260,6 +260,14 @@ the historical behavior — the server may substitute an alternate version when
 the requested one cannot be delivered. The field is optional and
 unconditionally available; existing clients that omit it are unchanged.
 
+**Binding an offered release.** `offered_virtual_uri` is optional and is set
+only when the viewer picks a track from a display-only offered inventory. It
+names the concrete candidate that offer described. The server passes its
+`?result=` identity to the resolver and refuses the start with the retryable
+`offered_release_unavailable` terminal if that exact candidate cannot be
+served. It never applies the offered track ordinals to a substituted release.
+The field is additive; clients that do not send it are unchanged.
+
 **Forcing a fresh relink.** `force_relink` is an optional boolean (default
 `false`). When `true`, the server re-queries the provider for a fresh virtual-
 source listing instead of trusting the cached or pinned candidate, and drops

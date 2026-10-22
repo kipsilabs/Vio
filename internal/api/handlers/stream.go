@@ -3890,14 +3890,14 @@ func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(file *models.MediaFil
 }
 
 // Defaults for the implicit first window served to a cold whole-track subtitle
-// request against a large/unknown virtual/remote source. The duration matches
-// the web player's 120 s sliding-window cadence (see
-// web/src/player/hooks/useSubtitleTracks.ts) so a client that manages its own
-// windows and one that does not observe the same coverage. The backoff pulls
-// the window start behind the session position so a small scrub back stays
-// covered, mirroring that player's SEEK_BACKOFF.
+// request against a large/unknown virtual/remote source. The web player asks
+// for its own 120 s windows; this legacy implicit bound stays at 600 s for
+// clients that request a whole track and have no windowing contract, so a
+// native client that does not refetch cannot lose subtitles after two minutes.
+// The backoff pulls the window start behind the session position so a small
+// scrub back stays covered, mirroring the player's SEEK_BACKOFF.
 const (
-	virtualSubtitleImplicitWindowSeconds        = 120.0
+	virtualSubtitleImplicitWindowSeconds        = 600.0
 	virtualSubtitleImplicitWindowBackoffSeconds = 2.0
 	// virtualSubtitleImplicitWindowMinSourceBytes is the source size above
 	// which a whole-track virtual read is considered untenable and is bounded

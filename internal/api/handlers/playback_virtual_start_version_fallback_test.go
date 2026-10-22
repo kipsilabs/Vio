@@ -110,6 +110,46 @@ func TestResolveVirtualPlaybackSourceRecoveryBypassesFloor(t *testing.T) {
 	}
 }
 
+// A start that carries an offered candidate must hand that candidate id to the
+// resolver and refuse a different one. The client's selected track ordinals
+// belong to the offered release, so substituting another release would apply
+// them to different bytes.
+func TestResolveVirtualStartBindsOfferedCandidate(t *testing.T) {
+	const offeredURI = "virtual://movie/movie-offered?result=C"
+	primary := &models.MediaFile{ID: 1, ContentID: "movie-offered", FilePath: "virtual://movie/movie-offered", VirtualOwnerInstallationID: 5}
+	var seenPreferred string
+	h := &PlaybackHandler{
+		VirtualPlaybackResolver: VirtualPlaybackResolverFunc(func(context.Context, string, int, string, int) (string, error) {
+			return "", errors.New("detailed resolver expected")
+		}),
+		VirtualMediaDetailedResolver: VirtualMediaDetailedResolverFunc(func(_ context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, preferred string) (ResolvedVirtualMedia, error) {
+			seenPreferred = preferred
+			return ResolvedVirtualMedia{URL: "https://cdn.example/c.mkv", URI: offeredURI, CandidateID: "C", OwnerID: 5}, nil
+		}),
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/playback/start", nil)
+	start := playback.StartRequestV3{QualityPreference: "auto", OfferedVirtualURI: offeredURI}
+	resolved, err := h.resolveVirtualStartWithVersionFallback(req, primary, "profile-1", start, false, 0)
+	if err != nil {
+		t.Fatalf("offered candidate resolve: %v", err)
+	}
+	if seenPreferred != "C" {
+		t.Fatalf("resolver preferred candidate = %q, want C", seenPreferred)
+	}
+	if !sameVirtualCandidate(resolved.URI, offeredURI) {
+		t.Fatalf("resolved URI = %q, want the offered candidate %q", resolved.URI, offeredURI)
+	}
+
+	// A resolver that substitutes another candidate must fail the start, not
+	// silently apply the offered track identities to D.
+	h.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(_ context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+		return ResolvedVirtualMedia{URL: "https://cdn.example/d.mkv", URI: "virtual://movie/movie-offered?result=D", CandidateID: "D", OwnerID: 5}, nil
+	})
+	if _, err := h.resolveVirtualStartWithVersionFallback(req, primary, "profile-1", start, false, 0); !errors.Is(err, errOfferedCandidateUnavailable) {
+		t.Fatalf("substituted offered candidate error = %v, want errOfferedCandidateUnavailable", err)
+	}
+}
+
 // TestResolveVirtualStartWithVersionFallbackSkipsAltMountFailedVersion pins
 // behavior 2: when the pinned release's listing fails on a fresh start, the
 // walk tries alternate versions and returns the first that resolves. A version

@@ -188,6 +188,15 @@ describe("buildStartRequestV3", () => {
     expect(buildStartRequestV3(startBase)).not.toHaveProperty("carried_audio_track_id");
   });
 
+  it("binds an offered candidate on the start request", () => {
+    expect(
+      buildStartRequestV3({
+        ...startBase,
+        offeredVirtualURI: "virtual://movie/x?result=offered",
+      }),
+    ).toMatchObject({ offered_virtual_uri: "virtual://movie/x?result=offered" });
+  });
+
   it("emits file_selection when the file was explicitly chosen", () => {
     expect(buildStartRequestV3({ ...startBase, fileSelection: "explicit" })).toMatchObject({
       file_selection: "explicit",
@@ -2616,6 +2625,7 @@ describe("usePlaybackSession version switches", () => {
       file_id: 7,
       start_position: 42,
       file_selection: "auto",
+      offered_virtual_uri: "virtual://movie/x?result=7398",
       force_relink: true,
       carried_audio_track_id: "file:7:audio:0",
     });
@@ -2626,7 +2636,7 @@ describe("usePlaybackSession version switches", () => {
     unmount();
   });
 
-  it("retires an offered release when the live source's verified inventory returns", async () => {
+  it("restores live inventory when a previously folded revision retires an offer", async () => {
     const liveAudio = [
       {
         codec: "aac",
@@ -2707,6 +2717,21 @@ describe("usePlaybackSession version switches", () => {
     );
     await waitFor(() => expect(result.current.plan).not.toBeNull());
 
+    // Fold the live inventory first, then replace it with an offer. The later
+    // packet repeats the already-folded live revision: retirement must still
+    // restore the live tracks instead of clearing only the offer marker and
+    // returning at the revision gate.
+    act(() =>
+      result.current.applyInventoryUpdate({
+        session_id: "session-1",
+        inventory_revision: "inv:live-A",
+        inventory_status: "verified",
+        effective_media_file_id: 7,
+        effective_virtual_uri: "virtual://movie/x?result=A",
+        audio_tracks: liveAudio,
+        subtitle_inventory: [],
+      }),
+    );
     act(() =>
       result.current.applyInventoryUpdate({
         session_id: "session-1",
@@ -2720,8 +2745,6 @@ describe("usePlaybackSession version switches", () => {
     );
     expect(result.current.planAudioTracks).toEqual(offeredAudio);
 
-    // The live candidate's verified inventory returns. The offer must retire,
-    // so the next pick is a normal track change on A, not another start of C.
     act(() =>
       result.current.applyInventoryUpdate({
         session_id: "session-1",
@@ -2819,6 +2842,7 @@ describe("usePlaybackSession version switches", () => {
       file_id: 7,
       start_position: 30,
       file_selection: "auto",
+      offered_virtual_uri: "virtual://movie/x?result=7398",
       force_relink: true,
       carried_audio_track_id: "file:7:audio:0",
       subtitle_track_index: 4,
@@ -2842,6 +2866,7 @@ describe("usePlaybackSession version switches", () => {
     expect(startBodies[2]).toMatchObject({
       file_id: 7,
       start_position: 35,
+      offered_virtual_uri: "virtual://movie/x?result=9999",
       carried_audio_track_id: "file:7:audio:0",
     });
     expect(startBodies[2]).not.toHaveProperty("subtitle_track_index");

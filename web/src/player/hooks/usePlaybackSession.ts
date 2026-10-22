@@ -1704,6 +1704,7 @@ export function usePlaybackSession(
       subtitleTrackID: string | undefined,
       carriedAudioTrackID: string | null,
       fileSelection: "auto" | "explicit",
+      offeredVirtualURI: string | undefined,
       forceRelink?: boolean,
       audioTrackIndex: number | null | undefined = explicitAudioTrackIndex,
     ): Promise<DecisionResponseV3> => {
@@ -1724,6 +1725,7 @@ export function usePlaybackSession(
           carriedAudioTrackID != null ? null : (audioTrackIndex ?? explicitAudioTrackIndex),
         carriedAudioTrackID,
         fileSelection,
+        offeredVirtualURI,
         forceRelink,
         subtitleTrackIndex,
         subtitleTrackID,
@@ -1835,6 +1837,7 @@ export function usePlaybackSession(
       carriedAudioTrackId,
       carriedSubtitleTrackIndex,
       fileSelection,
+      offeredVirtualURI,
       forceRelink,
       intentAt,
       reconnect = false,
@@ -1857,6 +1860,8 @@ export function usePlaybackSession(
       /** How the requested file was chosen; `explicit` forbids silent
        * server-side version substitution. */
       fileSelection?: "auto" | "explicit";
+      /** Concrete offered candidate this start binds to. */
+      offeredVirtualURI?: string;
       /** When true, the server should force a re-link/re-query of the virtual
        * file on this start attempt. Set when the viewer explicitly picks an
        * unavailable version, or by the retry path after a no-streams terminal. */
@@ -2003,6 +2008,7 @@ export function usePlaybackSession(
           tracks?.subtitleTrackId,
           carriedAudioTrackId ?? null,
           fileSelection ?? "auto",
+          offeredVirtualURI,
           forceRelink,
           startAudioTrackIndex,
         );
@@ -2066,6 +2072,7 @@ export function usePlaybackSession(
             undefined,
             carriedAudioTrackId ?? null,
             fileSelection ?? "auto",
+            undefined,
             forceRelink,
             startAudioTrackIndex,
           );
@@ -2689,6 +2696,7 @@ export function usePlaybackSession(
         initialErrorMessage: "Failed to switch to the offered release",
         carriedAudioTrackId: tracks.carriedAudioTrackId ?? null,
         fileSelection: "auto",
+        offeredVirtualURI: offeredVirtualUriRef.current ?? undefined,
         forceRelink: true,
         intentAt: Date.now(),
         tracks,
@@ -3586,23 +3594,27 @@ export function usePlaybackSession(
       // A verified revision for the source the transport actually plays
       // retires a display-only offer. Otherwise the offered candidate would
       // keep intercepting ordinary picks after the live inventory recovered.
+      // The retirement and the menu restore are one operation: a duplicate of a
+      // revision already folded while the offer was showing must still fold the
+      // live tracks back, not just clear the ref and return at the revision gate.
       const livePlan = planRef.current;
-      if (offeredVirtualUriRef.current && livePlan) {
+      let retiresOfferedSource = false;
+      if (offeredVirtualUriRef.current && livePlan && payload.inventory_status === "verified") {
         const payloadUri = payload.effective_virtual_uri?.trim() ?? "";
         const liveUri = livePlan.effective_virtual_uri?.trim() ?? "";
-        const describesLiveSource =
+        retiresOfferedSource =
           payloadUri !== ""
             ? payloadUri === liveUri
             : payload.effective_media_file_id != null &&
               payload.effective_media_file_id === livePlan.effective_media_file_id;
-        if (describesLiveSource) offeredVirtualUriRef.current = null;
+        if (retiresOfferedSource) offeredVirtualUriRef.current = null;
       }
       const scope = syncRevisionScope();
       const alreadyFolded =
         payload.inventory_revision != null && scope.revisions.has(payload.inventory_revision);
       const isTerminal =
         payload.inventory_status === "verified" || payload.inventory_status === "failed";
-      if (alreadyFolded) {
+      if (alreadyFolded && !retiresOfferedSource) {
         // If the state is still pending or provisional, a redelivery of the terminal
         // revision must re-fold its verified tracks and clear pending, not early-return.
         const needsTerminalReconciliation =

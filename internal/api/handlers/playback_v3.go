@@ -2233,6 +2233,13 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	// teaching its session model the split first.
 	if isVirtualPlaybackFile(requestedFile) {
 		requestedCatalogFileID := requestedFile.ID
+		if offered := strings.TrimSpace(req.OfferedVirtualURI); offered != "" {
+			if virtualResultCandidateID(offered) == "" ||
+				virtualPlaybackNeutralKey(offered) != virtualPlaybackNeutralKey(requestedFile.FilePath) {
+				return playback.DecisionResponseV3{}, playbackOperationError(http.StatusBadRequest, "invalid_offered_candidate",
+					"The offered release does not belong to this title")
+			}
+		}
 		// An auto selection skips a catalog row the catalog marked failed, even
 		// when the row already carries a concrete result= identity adopted by an
 		// earlier auto pick; only an explicit pick or a forced relink re-tries
@@ -3126,12 +3133,14 @@ func (h *PlaybackHandler) resolveVirtualStartWithVersionFallback(
 	allowFailedCandidate bool,
 	bandwidthCapKbps int,
 ) (resolvedVirtualPlaybackSource, error) {
+	offeredURI := strings.TrimSpace(req.OfferedVirtualURI)
+	offeredCandidateID := virtualResultCandidateID(offeredURI)
 	resolved, resolveErr := h.resolveVirtualPlaybackSource(
-		r, file, profileID, true, nil, "", req.QualityPreference, bandwidthCapKbps, req.ForceRelink,
+		r, file, profileID, true, nil, offeredCandidateID, req.QualityPreference, bandwidthCapKbps, req.ForceRelink,
 		virtualResolveOptionsV3{
 			allowFailedCandidate: allowFailedCandidate,
 			sessionBound:         false,
-			explicitSelection:    req.FileSelection == playback.FileSelectionExplicitV3,
+			explicitSelection:    req.FileSelection == playback.FileSelectionExplicitV3 || offeredCandidateID != "",
 			// Defer the candidate-declared upgrade probe past the transport
 			// commit only when the surface AND the client negotiated the
 			// deferred track-inventory lifecycle (see
@@ -3143,6 +3152,22 @@ func (h *PlaybackHandler) resolveVirtualStartWithVersionFallback(
 			deferProbePastCommit: h.deferTrackInventoryNegotiatedV3(r, req),
 		},
 	)
+	if offeredCandidateID != "" {
+		// An offered-track pick names one concrete candidate. Falling back to
+		// another candidate would apply the offered track ordinals to different
+		// bytes; fail the start and let the client refresh the version offer.
+		if resolveErr != nil {
+			return resolved, fmt.Errorf("%w: %w", errOfferedCandidateUnavailable, resolveErr)
+		}
+		resolvedURI := strings.TrimSpace(resolved.URI)
+		if resolvedURI == "" {
+			resolvedURI = strings.TrimSpace(resolved.File.FilePath)
+		}
+		if !sameVirtualCandidate(resolvedURI, offeredURI) {
+			return resolved, errOfferedCandidateUnavailable
+		}
+		return resolved, nil
+	}
 	if resolveErr == nil || !virtualStartVersionFallbackEligibleV3(req) || !virtualProviderListingOutage(resolveErr) {
 		return resolved, resolveErr
 	}
@@ -11896,6 +11921,12 @@ func virtualPinnedProfileRowV3(session *playback.Session, row *models.MediaFile)
 // establish evidence or an installation owner that belongs to the frozen
 // candidate, so the recipe must not be replayed through a foreign binding.
 var errFrozenSeekEvidenceUnavailable = errors.New("the frozen seek candidate's own evidence is unavailable")
+
+// errOfferedCandidateUnavailable reports that a start bound to an offered
+// candidate could not serve that exact candidate. A different candidate is not
+// an acceptable substitute because the client's selected track ordinals belong
+// to the offered release.
+var errOfferedCandidateUnavailable = errors.New("the offered release is no longer available")
 
 // frozenSeekCarrierV3 builds the effective file a seek reanchor replays from
 // evidence that demonstrably belongs to the plan's frozen candidate. The
