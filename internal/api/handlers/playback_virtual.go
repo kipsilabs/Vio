@@ -4073,7 +4073,43 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 // tracks with another release's while the binding generation was unchanged; the
 // caller propagates the carried inventory under its own generation fence and must
 // never trust a reread.
+// refreshVirtualCatalogFileForEvidence re-reads the row a probe is about to
+// write. The probe snapshot may predate a detail read's catalog revision or a
+// provider re-list; the evidence write is fenced on the row's current
+// updated_at/probe stamp, so writing against the old snapshot can be refused
+// even when the row still names the same item and source. Keep the old row when
+// the lookup is unavailable or the row identity moved, preserving the existing
+// fail-closed behavior.
+func (h *PlaybackHandler) refreshVirtualCatalogFileForEvidence(ctx context.Context, file *models.MediaFile) *models.MediaFile {
+	if h == nil || h.fileResolver == nil || file == nil || file.ID <= 0 {
+		return file
+	}
+	fresh, err := h.fileResolver.GetByID(ctx, file.ID)
+	if err != nil || fresh == nil || fresh.ID != file.ID {
+		return file
+	}
+	if fresh.ContentID != file.ContentID ||
+		fresh.MediaFolderID != file.MediaFolderID ||
+		fresh.VirtualOwnerInstallationID != file.VirtualOwnerInstallationID {
+		return file
+	}
+	// Do not let a stale probe overwrite evidence another probe already
+	// committed. Refresh the CAS snapshot for revision-only or path churn, but
+	// keep the old snapshot when the probe stamp moved; that case must take the
+	// normal superseded-write path rather than regress newer evidence.
+	if !sameVirtualProbeStamp(file.ProbeUpdatedAt, fresh.ProbeUpdatedAt) {
+		return file
+	}
+	return fresh
+}
+
 func (h *PlaybackHandler) persistVirtualProbeEvidenceDurable(ctx context.Context, catalogFile *models.MediaFile, resolvedPath string, probed *models.MediaFile, candidate resolver.PersistedIdentityTiers, stampProbe bool) (virtualCommittedProbeInventory, bool) {
+	// A detail read or a provider re-list can advance the row's revision while
+	// the detached probe is running. Re-read the exact row immediately before
+	// the write so the CAS snapshot and the adoption target are current; using
+	// the pre-probe snapshot here made a successful probe look like a
+	// superseded write and left the session fail-closed on its old inventory.
+	catalogFile = h.refreshVirtualCatalogFileForEvidence(ctx, catalogFile)
 	args, _, ok := h.virtualProbeEvidenceArgs(ctx, catalogFile, resolvedPath, probed, candidate, stampProbe)
 	if !ok {
 		slog.WarnContext(ctx, "durable virtual probe evidence write refused before execution",
