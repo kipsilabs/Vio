@@ -909,7 +909,7 @@ func (p *Planner) transcodeEligible(n *Node, proxies []*Node, groupHealthy map[s
 	// planner has just dropped its provisional reservation; counting it again
 	// makes a one-job node report capacity exhaustion for its own in-place
 	// track change. Other sessions still obey the cap.
-	if !p.underCap(n, now) && !(currentURL != "" && sameNodeURL(n.URL, currentURL)) {
+	if !p.underCap(n, now) && (currentURL == "" || !sameNodeURL(n.URL, currentURL)) {
 		return false
 	}
 	if p.transcodes != nil && p.transcodes.suppressedAt(n.URL, now) {
