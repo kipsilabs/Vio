@@ -359,6 +359,22 @@ func (s *directUserDataService) ParentUnplayedTargets(ctx context.Context, sessi
 	return s.watchState.ParentUnwatchTargets(ctx, session.StreamAppUserID, session.ProfileID, s.episodes, parentKind, parentID)
 }
 
+// ParentUnplayedTargetsForSeason expands a season by its durable
+// (series_id, season_number) coordinates. handled is false when the wired
+// partitioner does not implement the season-keyed contract, in which case the
+// caller keeps the legacy season-id path.
+func (s *directUserDataService) ParentUnplayedTargetsForSeason(ctx context.Context, session *Session, parentID, seriesID string, seasonNumber int) ([]string, bool, error) {
+	if s.watchState == nil || s.episodes == nil || seriesID == "" {
+		return nil, false, nil
+	}
+	partitioner, ok := s.episodes.(watchstate.SeasonPartitioner)
+	if !ok {
+		return nil, false, nil
+	}
+	targets, err := s.watchState.ParentUnwatchTargetsForSeason(ctx, session.StreamAppUserID, session.ProfileID, partitioner, seriesID, seasonNumber)
+	return targets, true, err
+}
+
 func (s *directUserDataService) MarkUnplayedBatch(ctx context.Context, session *Session, contentIDs []string) error {
 	if s.watchState == nil {
 		return fmt.Errorf("watch state service is not configured")
