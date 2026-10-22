@@ -77,8 +77,8 @@ func (s *MetadataService) FetchLibraryMetadata(
 	item *models.MediaItem,
 	opts LibraryMetadataLookupOptions,
 ) (*LibraryMetadataLookupResult, error) {
-	if s == nil || folderID <= 0 || item == nil || (item.Type != "movie" && item.Type != "series") {
-		return nil, fmt.Errorf("library metadata requires a destination library and movie or series identity")
+	if s == nil || folderID <= 0 || item == nil || (item.Type != anchoredItemTypeMovie && item.Type != anchoredItemTypeSeries) {
+		return nil, errors.New("library metadata requires a destination library and movie or series identity")
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -96,7 +96,7 @@ func (s *MetadataService) FetchLibraryMetadata(
 		return &LibraryMetadataLookupResult{Metadata: metadata}, err
 	}
 	result := &LibraryMetadataLookupResult{Metadata: metadata}
-	if item.Type == "series" {
+	if item.Type == anchoredItemTypeSeries {
 		err = s.lookupLibrarySeriesEpisodes(ctx, folderID, language, opts, metadata.ProviderIDs, result)
 	}
 	// Artwork is optional enrichment: a failed image provider must not discard
@@ -109,7 +109,7 @@ func (s *MetadataService) FetchLibraryMetadata(
 		result.BackdropPath = image.BackdropPath
 		result.Images = image.Images
 	}
-	if item.Type != "series" {
+	if item.Type != anchoredItemTypeSeries {
 		result.Complete = true
 	}
 	return result, err
@@ -338,7 +338,7 @@ func (s *MetadataService) lookupLibrarySeasons(
 		}
 		seasons, err := episodeProvider.GetSeasons(ctx, SeasonsRequest{
 			ProviderIDs: maps.Clone(providerIDs),
-			ContentType: "series",
+			ContentType: matchContentTypeSeries,
 			Language:    language,
 		})
 		if err != nil {

@@ -72,7 +72,7 @@ func (r *catalogMonitorRegistrar) Register(ctx context.Context, item monitor.Mon
 // cannot move the item to a new identity.
 func (r *catalogMonitorRegistrar) RegisterWithResult(ctx context.Context, item monitor.MonitoredMedia) (string, error) {
 	if r == nil || r.registrar == nil {
-		return "", fmt.Errorf("virtual catalog registrar is unavailable")
+		return "", errors.New("virtual catalog registrar is unavailable")
 	}
 	folderID := item.MediaFolderID
 	if folderID <= 0 {
@@ -109,7 +109,7 @@ func (r *catalogMonitorRegistrar) RegisterWithResult(ctx context.Context, item m
 // ResolveContentID maps provider aliases onto a single existing catalog item.
 func (r *catalogMonitorRegistrar) ResolveContentID(ctx context.Context, mediaType string, providerIDs map[string]string) (string, error) {
 	if r == nil || r.registrar == nil {
-		return "", fmt.Errorf("virtual catalog registrar is unavailable")
+		return "", errors.New("virtual catalog registrar is unavailable")
 	}
 	return r.registrar.ResolveVirtualMediaContentID(ctx, mediaType, providerIDs)
 }
@@ -118,7 +118,7 @@ func (r *catalogMonitorRegistrar) ResolveContentID(ctx context.Context, mediaTyp
 // default for the media type when the request did not name one.
 func (r *catalogMonitorRegistrar) ResolveLibrary(ctx context.Context, mediaType string, requested int) (int, error) {
 	if r == nil || r.registrar == nil {
-		return 0, fmt.Errorf("virtual catalog registrar is unavailable")
+		return 0, errors.New("virtual catalog registrar is unavailable")
 	}
 	folderID := requested
 	if folderID <= 0 {
@@ -128,7 +128,7 @@ func (r *catalogMonitorRegistrar) ResolveLibrary(ctx context.Context, mediaType 
 		case "series":
 			folderID = r.seriesLibraryID
 		default:
-			return 0, fmt.Errorf("destination library requires movie or series media type")
+			return 0, errors.New("destination library requires movie or series media type")
 		}
 	}
 	if folderID <= 0 {

@@ -2,6 +2,7 @@ package virtuallibrary
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -10,6 +11,11 @@ import (
 	"github.com/Silo-Server/silo-server/internal/metadata"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary/monitor"
+)
+
+const (
+	mediaTypeMovie  = "movie"
+	mediaTypeSeries = "series"
 )
 
 const (
@@ -70,14 +76,14 @@ func (s *Service) enrichFromLibraryMetadata(
 	if folderID <= 0 {
 		// The monitor resolves the destination before enrichment. Retain the
 		// service defaults as a fallback for callers that predate that step.
-		if item.MediaType == "series" {
+		if item.MediaType == mediaTypeSeries {
 			folderID = s.cfg.SeriesLibraryID
 		} else {
 			folderID = s.cfg.MovieLibraryID
 		}
 	}
 	if folderID <= 0 {
-		return item, fmt.Errorf("library metadata requires a destination library")
+		return item, errors.New("library metadata requires a destination library")
 	}
 	metadataCtx, cancel := context.WithTimeout(ctx, libraryMetadataTimeout)
 	defer cancel()
@@ -116,37 +122,7 @@ func applyLibraryMetadataResult(item *monitor.MonitoredMedia, result *metadata.L
 	if item == nil || result == nil {
 		return
 	}
-	if md := result.Metadata; md != nil {
-		if title := monitor.CleanMetadataText(md.Title); title != "" {
-			item.Title = title
-		}
-		if overview := monitor.CleanMetadataSummary(md.Overview); overview != "" {
-			item.Overview = overview
-		}
-		if md.Runtime > 0 {
-			item.Runtime = md.Runtime
-		}
-		if len(md.Genres) > 0 {
-			genres := make([]string, 0, len(md.Genres))
-			for _, genre := range md.Genres {
-				if genre = monitor.CleanMetadataText(genre); genre != "" {
-					genres = append(genres, genre)
-				}
-			}
-			if len(genres) > 0 {
-				item.Genres = genres
-			}
-		}
-		if item.TMDBID == "" {
-			item.TMDBID = strings.TrimSpace(md.ProviderIDs["tmdb"])
-		}
-		if item.TVDBID == "" {
-			item.TVDBID = strings.TrimSpace(md.ProviderIDs["tvdb"])
-		}
-		if item.IMDbID == "" {
-			item.IMDbID = strings.TrimSpace(md.ProviderIDs["imdb"])
-		}
-	}
+	applyMetadataResultFields(item, result.Metadata)
 	poster := strings.TrimSpace(result.PosterPath)
 	if poster == "" && result.Metadata != nil {
 		poster = strings.TrimSpace(result.Metadata.PosterPath)
@@ -161,7 +137,7 @@ func applyLibraryMetadataResult(item *monitor.MonitoredMedia, result *metadata.L
 	if backdrop != "" {
 		item.Backdrop = backdrop
 	}
-	if item.MediaType == "series" {
+	if item.MediaType == mediaTypeSeries {
 		// Episodes are merged by coordinate. A partial lookup must never
 		// delete an episode that an earlier lookup or the catalog already
 		// knows about, and Complete does not authorize deletion either.
@@ -170,6 +146,41 @@ func applyLibraryMetadataResult(item *monitor.MonitoredMedia, result *metadata.L
 	item.MediaFolderID = folderID
 	item.MetadataNextSeason = result.NextSeason
 	item.MetadataComplete = result.Complete
+}
+
+func applyMetadataResultFields(item *monitor.MonitoredMedia, md *metadata.MetadataResult) {
+	if md == nil {
+		return
+	}
+	if title := monitor.CleanMetadataText(md.Title); title != "" {
+		item.Title = title
+	}
+	if overview := monitor.CleanMetadataSummary(md.Overview); overview != "" {
+		item.Overview = overview
+	}
+	if md.Runtime > 0 {
+		item.Runtime = md.Runtime
+	}
+	if len(md.Genres) > 0 {
+		var genres []string
+		for _, genre := range md.Genres {
+			if cleaned := monitor.CleanMetadataText(genre); cleaned != "" {
+				genres = append(genres, cleaned)
+			}
+		}
+		if len(genres) > 0 {
+			item.Genres = genres
+		}
+	}
+	if item.TMDBID == "" {
+		item.TMDBID = strings.TrimSpace(md.ProviderIDs["tmdb"])
+	}
+	if item.TVDBID == "" {
+		item.TVDBID = strings.TrimSpace(md.ProviderIDs["tvdb"])
+	}
+	if item.IMDbID == "" {
+		item.IMDbID = strings.TrimSpace(md.ProviderIDs["imdb"])
+	}
 }
 
 func libraryEpisodes(episodes []metadata.EpisodeResult) []monitor.VirtualEpisode {

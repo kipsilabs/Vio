@@ -2,7 +2,7 @@ package metadata
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"log/slog"
 	"strings"
 
@@ -88,19 +88,19 @@ func (s *MetadataService) discoverLibraryItemImages(
 	language string,
 ) (*LibraryImageDiscoveryResult, error) {
 	if s == nil {
-		return nil, fmt.Errorf("metadata service is required")
+		return nil, errors.New("metadata service is required")
 	}
 	if folderID <= 0 {
-		return nil, fmt.Errorf("library image discovery requires a destination folder")
+		return nil, errors.New("library image discovery requires a destination folder")
 	}
 	if item == nil {
-		return nil, fmt.Errorf("library image discovery requires an item")
+		return nil, errors.New("library image discovery requires an item")
 	}
 	if contentType == "" {
 		contentType = item.Type
 	}
-	if contentType != "movie" && contentType != "series" {
-		return nil, fmt.Errorf("library image discovery requires movie or series content type")
+	if contentType != anchoredItemTypeMovie && contentType != anchoredItemTypeSeries {
+		return nil, errors.New("library image discovery requires movie or series content type")
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -122,16 +122,14 @@ func (s *MetadataService) discoverLibraryItemImages(
 	applyBestImages(&target, filtered, MergeReplaceUnlocked, language)
 	applyLibraryImageSourcePaths(&target)
 
-	if item != nil {
-		item.PosterPath = target.PosterPath
-		item.PosterSourcePath = target.PosterSourcePath
-		item.PosterThumbhash = target.PosterThumbhash
-		item.BackdropPath = target.BackdropPath
-		item.BackdropSourcePath = target.BackdropSourcePath
-		item.BackdropThumbhash = target.BackdropThumbhash
-		item.LogoPath = target.LogoPath
-		item.LogoSourcePath = target.LogoSourcePath
-	}
+	item.PosterPath = target.PosterPath
+	item.PosterSourcePath = target.PosterSourcePath
+	item.PosterThumbhash = target.PosterThumbhash
+	item.BackdropPath = target.BackdropPath
+	item.BackdropSourcePath = target.BackdropSourcePath
+	item.BackdropThumbhash = target.BackdropThumbhash
+	item.LogoPath = target.LogoPath
+	item.LogoSourcePath = target.LogoSourcePath
 
 	return &LibraryImageDiscoveryResult{
 		PosterPath:         target.PosterPath,

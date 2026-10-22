@@ -109,12 +109,12 @@ func TestFetchLibraryMetadataRejectsConflictsAgainstAccumulatedIDs(t *testing.T)
 
 func TestFetchLibraryMetadataDoesNotMutateProvidersOrTrustedIDs(t *testing.T) {
 	mutator := &libraryLookupProvider{metadata: &MetadataResult{HasMetadata: true, Title: "Mutator"}}
-	mutator.targetRefreshProvider.slug = "mutator"
+	mutator.slug = "mutator"
 	// The provider writes into the request map it was handed and returns its
 	// own map for the lookup to fold; neither may reach the trusted identity.
 	mutatingProvider := &mutatingLibraryLookupProvider{inner: mutator}
 	observer := &libraryLookupProvider{metadata: &MetadataResult{HasMetadata: true}}
-	observer.targetRefreshProvider.slug = "observer"
+	observer.slug = "observer"
 
 	harness := newTestHarness()
 	seedLibraryLookupChains(t, harness, 42, map[string][]Provider{"movie": {mutatingProvider, observer}})

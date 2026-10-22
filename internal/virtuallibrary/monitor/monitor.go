@@ -768,7 +768,7 @@ func (m *mediaMonitor) resolveLibrary(ctx context.Context, mediaType string, req
 func (m *mediaMonitor) register(ctx context.Context, item monitoredMedia) (string, error) {
 	registrar := m.currentRegistrar()
 	if registrar == nil {
-		return "", errors.New("Vio virtual catalog service is not configured")
+		return "", errors.New("virtual catalog service is not configured")
 	}
 	if err := m.resolveIdentity(ctx, &item); err != nil {
 		return "", err
@@ -781,26 +781,35 @@ func (m *mediaMonitor) register(ctx context.Context, item monitoredMedia) (strin
 		item.MediaFolderID = folderID
 	}
 	if resultRegistrar, ok := registrar.(mediaRegistrationResult); ok {
-		mediaID, err := resultRegistrar.RegisterWithResult(ctx, item)
-		if err != nil {
-			return "", err
-		}
-		if mediaID == "" {
-			mediaID = item.CatalogContentID
-		}
-		if enqueuer, ok := registrar.(mediaArtworkEnqueuer); ok && mediaID != "" {
-			// Artwork caching is an optimization: a failure must not fail a
-			// registration that already committed.
-			if err := enqueuer.EnqueueArtwork(ctx, mediaID, item); err != nil {
-				m.logger.WarnContext(ctx, "enqueue virtual media artwork", "key", item.Key, "content_id", mediaID, "error", err)
-			}
-		}
-		return mediaID, nil
+		return m.registerWithResultAndArtwork(ctx, resultRegistrar, registrar, item)
 	}
 	if err := registrar.Register(ctx, item); err != nil {
 		return "", err
 	}
 	return item.CatalogContentID, nil
+}
+
+func (m *mediaMonitor) registerWithResultAndArtwork(
+	ctx context.Context,
+	resultRegistrar mediaRegistrationResult,
+	registrar virtualMediaRegistrar,
+	item monitoredMedia,
+) (string, error) {
+	mediaID, err := resultRegistrar.RegisterWithResult(ctx, item)
+	if err != nil {
+		return "", err
+	}
+	if mediaID == "" {
+		mediaID = item.CatalogContentID
+	}
+	if enqueuer, ok := registrar.(mediaArtworkEnqueuer); ok && mediaID != "" {
+		// Artwork caching is an optimization: a failure must not fail a
+		// registration that already committed.
+		if err := enqueuer.EnqueueArtwork(ctx, mediaID, item); err != nil {
+			m.logger.WarnContext(ctx, "enqueue virtual media artwork", "key", item.Key, "content_id", mediaID, "error", err)
+		}
+	}
+	return mediaID, nil
 }
 
 func newMediaMonitor(resolver streamResolver, logger *slog.Logger) *mediaMonitor {
@@ -1337,39 +1346,13 @@ func (m *mediaMonitor) evaluate(ctx context.Context, item monitoredMedia) (monit
 	resolveMetadata := m.metadataResolver
 	m.mu.Unlock()
 	if resolveMetadata != nil {
-		enriched, err := resolveMetadata(ctx, item)
+		var msg string
+		item, msg, err = m.resolveLibraryMetadata(ctx, resolveMetadata, item)
 		if err != nil {
-			if ctx.Err() != nil {
-				return item, "Library metadata lookup timed out; monitoring will retry", err
-			}
-			// Enrichment is optional. Keep whatever usable metadata the
-			// resolver already had and let release eligibility decide.
-			m.logger.WarnContext(ctx, "library metadata unavailable; keeping known metadata", "key", item.Key, "error", err)
-		}
-		if enriched.Key != "" {
-			item = enriched
-		}
-		if err := m.resolveIdentity(ctx, &item); err != nil {
-			return item, "Catalog identity conflict; resolve duplicate catalog entries", err
-		}
-	} else if enriched, err := m.fetchCinemeta(ctx, item); err == nil && (item.MediaType != "series" || episodeMetadataComplete(enriched.Episodes)) {
-		item = enriched
-		if item.MediaType == "series" && episodeRuntimeMissing(item.Episodes) {
-			if supplemented, supplementErr := m.fetchTVMaze(ctx, item); supplementErr == nil {
-				item = supplemented
-			}
+			return item, msg, err
 		}
 	} else {
-		if item.MediaType == "series" {
-			if fallback, fallbackErr := m.fetchTVMaze(ctx, item); fallbackErr == nil {
-				item = fallback
-			} else {
-				m.logger.Warn("fetch series metadata", "key", item.Key, "cinemeta_error", err, "tvmaze_error", fallbackErr)
-				metadataErr = errors.Join(err, fallbackErr)
-			}
-		} else {
-			m.logger.Warn("fetch Cinemeta metadata", "key", item.Key, "error", err)
-		}
+		item, metadataErr = m.fallbackPublicMetadata(ctx, item)
 	}
 	if item.MediaType == "movie" {
 		if resolveMetadata == nil {
@@ -1751,12 +1734,14 @@ func (s *Monitor) CheckStatus(ctx context.Context, req *CheckStatusRequest) (*Ch
 			item.MediaFolderID = folderID
 		}
 		evaluateCtx := ctx
+		var cancel context.CancelFunc
 		if timeout := s.monitor.itemTimeout; timeout > 0 {
-			var cancel context.CancelFunc
 			evaluateCtx, cancel = context.WithTimeout(ctx, timeout)
-			defer cancel()
 		}
 		item, message, evalErr := s.monitor.evaluate(evaluateCtx, item)
+		if cancel != nil {
+			cancel()
+		}
 		if evalErr != nil {
 			if evaluateCtx.Err() != nil {
 				return nil, fmt.Errorf("evaluate virtual media: %w", evalErr)
@@ -1778,7 +1763,7 @@ func (s *Monitor) CheckStatus(ctx context.Context, req *CheckStatusRequest) (*Ch
 			}
 		}
 		if item.Ready {
-			mediaID, regErr := s.monitor.register(evaluateCtx, item)
+			mediaID, regErr := s.monitor.register(ctx, item)
 			if regErr != nil {
 				return nil, fmt.Errorf("register virtual media: %w", regErr)
 			}
@@ -2512,6 +2497,52 @@ type tmdbReleaseDates struct {
 			Type int       `json:"type"`
 		} `json:"release_dates"`
 	} `json:"results"`
+}
+
+func (m *mediaMonitor) resolveLibraryMetadata(
+	ctx context.Context,
+	resolve func(context.Context, MonitoredMedia) (MonitoredMedia, error),
+	item monitoredMedia,
+) (monitoredMedia, string, error) {
+	enriched, err := resolve(ctx, item)
+	if err != nil {
+		if ctx.Err() != nil {
+			return item, "Library metadata lookup timed out; monitoring will retry", err
+		}
+		// Enrichment is optional. Keep whatever usable metadata the
+		// resolver already had and let release eligibility decide.
+		m.logger.WarnContext(ctx, "library metadata unavailable; keeping known metadata", "key", item.Key, "error", err)
+	}
+	if enriched.Key != "" {
+		item = enriched
+	}
+	if err := m.resolveIdentity(ctx, &item); err != nil {
+		return item, "Catalog identity conflict; resolve duplicate catalog entries", err
+	}
+	return item, "", nil
+}
+
+func (m *mediaMonitor) fallbackPublicMetadata(ctx context.Context, item monitoredMedia) (monitoredMedia, error) {
+	enriched, err := m.fetchCinemeta(ctx, item)
+	if err == nil && (item.MediaType != "series" || episodeMetadataComplete(enriched.Episodes)) {
+		item = enriched
+		if item.MediaType == "series" && episodeRuntimeMissing(item.Episodes) {
+			if supplemented, supplementErr := m.fetchTVMaze(ctx, item); supplementErr == nil {
+				item = supplemented
+			}
+		}
+		return item, nil
+	}
+	if item.MediaType == "series" {
+		fallback, fallbackErr := m.fetchTVMaze(ctx, item)
+		if fallbackErr == nil {
+			return fallback, nil
+		}
+		m.logger.WarnContext(ctx, "fetch series metadata", "key", item.Key, "cinemeta_error", err, "tvmaze_error", fallbackErr)
+		return item, errors.Join(err, fallbackErr)
+	}
+	m.logger.WarnContext(ctx, "fetch Cinemeta metadata", "key", item.Key, "error", err)
+	return item, nil
 }
 
 func (m *mediaMonitor) movieRelease(ctx context.Context, item monitoredMedia) (time.Time, error) {

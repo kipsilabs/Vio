@@ -254,6 +254,7 @@ func (r *VirtualMediaRegistrar) UpsertVirtualMediaResolved(ctx context.Context, 
 	return r.upsertVirtualMedia(ctx, installationID, contentID, in)
 }
 
+//nolint:funlen,gocyclo // upsertVirtualMedia manages transaction, locks, overrides, and catalog row persistence in one atomic unit
 func (r *VirtualMediaRegistrar) upsertVirtualMedia(ctx context.Context, installationID int, resolvedContentID string, in VirtualMedia) (*VirtualMediaResult, error) {
 	if r == nil || r.pool == nil {
 		return nil, errors.New("virtual catalog is unavailable")
