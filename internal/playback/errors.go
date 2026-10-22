@@ -23,8 +23,12 @@ var (
 	// ErrSegmentStalled means the encoder stopped advancing the produced head,
 	// so waiting longer cannot serve the requested segment. It is distinct from
 	// a slow-but-progressing encode: callers restart only on this verdict.
-	ErrSegmentStalled   = errors.New("segment production stalled")
-	ErrManifestNotReady = errors.New("manifest not ready")
+	ErrSegmentStalled = errors.New("segment production stalled")
+	// ErrSubtitleWarmCanceled reports an intentional abandonment of an
+	// opportunistic subtitle warm, such as playback resuming. It is not a
+	// source failure and must not arm the warm failure cooldown.
+	ErrSubtitleWarmCanceled = errors.New("subtitle warm canceled by playback")
+	ErrManifestNotReady     = errors.New("manifest not ready")
 	// ErrToneMapSourceValidationUnavailable reports that the executor could not
 	// freshly probe the source metadata needed to validate a tone-map recipe.
 	// The failure is transient: callers may retry after the source or probe

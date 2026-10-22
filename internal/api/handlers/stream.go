@@ -3933,7 +3933,11 @@ func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(file *models.MediaFil
 			}
 			cleanup = resolvedCleanup
 			extractOpts.InputPath = resolved.URL
-			return playback.StreamExtractSubtitle(warmCtx, extractOpts)
+			err = playback.StreamExtractSubtitle(warmCtx, extractOpts)
+			if warmCtx.Err() != nil {
+				return playback.ErrSubtitleWarmCanceled
+			}
+			return err
 		}
 		<-h.SubtitleCache.WarmTrackInBackground(opts, extract, requestID)
 	}()
