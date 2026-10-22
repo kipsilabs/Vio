@@ -68,6 +68,26 @@ import type {
   ResumeHints,
 } from "../types";
 
+/** Terminal reasons that mean the selected subtitle, not the release, blocked
+ *  the plan. Only these may drop the subtitle and retry the same start. */
+const BITMAP_SUBTITLE_REFUSAL_REASONS = new Set([
+  "subtitle_burn_in_source_unsupported",
+  "subtitle_codec_unsupported",
+  "subtitle_conversion_unsupported",
+  "subtitle_track_invalid",
+  "subtitle_track_unavailable",
+  "subtitle_unavailable_in_version",
+  "subtitle_artifact_unavailable",
+  // HDR conversion refusal can be raised only because the selected bitmap
+  // subtitle forced a burn-in; dropping that subtitle is the intended retry.
+  "hdr_transcode_unsupported",
+]);
+
+function isBitmapSubtitleRefusal(decision: DecisionResponseV3): boolean {
+  const reason = decision.terminal?.reason?.trim() ?? "";
+  return reason !== "" && BITMAP_SUBTITLE_REFUSAL_REASONS.has(reason);
+}
+
 interface PlaybackSessionState {
   /**
    * The server's plan, verbatim. It is the single source of truth for the
@@ -1236,6 +1256,7 @@ export function usePlaybackSession(
     forceStartPosition: boolean;
     fileSelection: "auto" | "explicit";
     carriedAudioTrackId: string | null;
+    offeredVirtualURI: string | null;
   } | null>(null);
   const retryingRef = useRef(false);
   // The dead session whose refused replan has already triggered one fresh
@@ -1991,6 +2012,7 @@ export function usePlaybackSession(
           forceStartPosition,
           fileSelection: fileSelection ?? "auto",
           carriedAudioTrackId: carriedAudioTrackId ?? null,
+          offeredVirtualURI: offeredVirtualURI ?? null,
         };
 
         const targetSubtitleIndex =
@@ -2049,7 +2071,7 @@ export function usePlaybackSession(
           bitmapSubtitleTrackIndex !== undefined ||
           (carriedSubtitleTrackIndex === undefined &&
             initialBitmapSubtitleTrackIndexByFileId?.[selectedFileId] !== undefined);
-        if (!decision.playback_plan && hasBitmapSubtitle) {
+        if (!decision.playback_plan && hasBitmapSubtitle && isBitmapSubtitleRefusal(decision)) {
           initialSubtitleFailure = describeDecisionWithoutPlan(decision);
           if (decision.session_id) {
             void stopSession(decision.session_id).catch(() => {
@@ -2072,7 +2094,7 @@ export function usePlaybackSession(
             undefined,
             carriedAudioTrackId ?? null,
             fileSelection ?? "auto",
-            undefined,
+            offeredVirtualURI,
             forceRelink,
             startAudioTrackIndex,
           );
@@ -2508,6 +2530,10 @@ export function usePlaybackSession(
             initialErrorMessage: "Failed to restart playback",
             carriedAudioTrackId: plan.selected_tracks.audio?.id ?? null,
             carriedSubtitleTrackIndex: plan.selected_tracks.subtitle?.index ?? null,
+            offeredVirtualURI:
+              retryTargetRef.current?.offeredVirtualURI ??
+              offeredVirtualUriRef.current ??
+              undefined,
             // Preserve the viewer's version choice; the server must not
             // silently substitute another edition behind a rebuild. Use the
             // live Auto intent first (a mid-session re-arm never re-records
@@ -2683,6 +2709,7 @@ export function usePlaybackSession(
         carriedAudioTrackId?: string;
         subtitleIndex?: number;
         subtitleTrackId?: string;
+        subtitleBurnIn?: boolean;
       },
     ) => {
       const plan = planRef.current;
@@ -2771,6 +2798,7 @@ export function usePlaybackSession(
           carriedAudioTrackId: plan.selected_tracks.audio?.id,
           subtitleIndex: combinedIndex ?? undefined,
           subtitleTrackId: track?.track_id,
+          subtitleBurnIn: track?.codec ? isBitmapCodec(track.codec) : undefined,
         });
         return;
       }
@@ -4093,6 +4121,7 @@ export function usePlaybackSession(
       replacementErrorMessage: "Failed to retry playback",
       initialErrorMessage: "Failed to retry playback",
       carriedAudioTrackId: target.carriedAudioTrackId,
+      offeredVirtualURI: target.offeredVirtualURI ?? undefined,
       // When Auto is armed the retry re-selects automatically, so the server
       // may walk alternate versions instead of replaying the dead pin.
       fileSelection: autoFallbackRef.current ? "auto" : target.fileSelection,

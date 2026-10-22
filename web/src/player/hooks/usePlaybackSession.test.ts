@@ -2874,6 +2874,190 @@ describe("usePlaybackSession version switches", () => {
     unmount();
   });
 
+  it("keeps the offered candidate through the bitmap-subtitle fallback", async () => {
+    const offeredAudio = [
+      {
+        codec: "eac3",
+        channels: 6,
+        layout: "5.1",
+        language: "eng",
+        default: true,
+        track_id: "file:7:audio:0",
+      },
+    ];
+    const offeredBitmap = fixtureSubtitleInventoryItemV3({
+      track_id: "file:7:subtitle:4",
+      combined_index: 4,
+      codec: "pgs",
+      delivery: "burn_in_only",
+      url: undefined,
+    });
+    const startBodies: Array<Record<string, unknown>> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        startBodies.push(body);
+        if (startBodies.length === 1) {
+          return jsonResponse(
+            {
+              protocol_version: 3,
+              server_features: ["playback_plan_v3"],
+              outcome: "playable",
+              session_id: "session-1",
+              playback_plan: fixturePlanV3({
+                effective_virtual_uri: "virtual://movie/x?result=A",
+                audio_tracks: offeredAudio,
+                subtitle: { mode: "off", inventory: [] },
+              }),
+            },
+            { status: 201 },
+          );
+        }
+        if (startBodies.length === 2) {
+          return jsonResponse({
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "adaptation_unavailable",
+            terminal: {
+              reason: "subtitle_conversion_unsupported",
+              message: "The selected subtitle cannot be burned in.",
+              retryable: false,
+            },
+          });
+        }
+        return jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "playable",
+          session_id: "session-2",
+          playback_plan: fixturePlanV3({
+            session_id: "session-2",
+            effective_virtual_uri: "virtual://movie/x?result=7398",
+            audio_tracks: offeredAudio,
+            selected_tracks: { audio: { id: "file:7:audio:0", index: 0 } },
+            subtitle: { mode: "off", inventory: [] },
+          }),
+        });
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+    act(() =>
+      result.current.applyInventoryUpdate({
+        session_id: "session-1",
+        inventory_revision: "inv:offered-bitmap",
+        inventory_status: "verified",
+        effective_media_file_id: 7,
+        offered_virtual_uri: "virtual://movie/x?result=7398",
+        audio_tracks: offeredAudio,
+        subtitle_inventory: [offeredBitmap],
+      }),
+    );
+    act(() => result.current.changeSubtitleTrack(4, 30));
+    await waitFor(() => expect(startBodies).toHaveLength(3));
+    expect(startBodies[1]).toMatchObject({
+      file_id: 7,
+      offered_virtual_uri: "virtual://movie/x?result=7398",
+      subtitle_track_index: 4,
+      subtitle_track_id: "file:7:subtitle:4",
+    });
+    // The subtitle-free retry still belongs to the offered candidate.
+    expect(startBodies[2]).toMatchObject({
+      file_id: 7,
+      offered_virtual_uri: "virtual://movie/x?result=7398",
+    });
+    expect(startBodies[2]).not.toHaveProperty("subtitle_track_index");
+    expect(startBodies[2]).not.toHaveProperty("subtitle_track_id");
+    unmount();
+  });
+
+  it("does not run the bitmap fallback for an unavailable offered candidate", async () => {
+    const offeredAudio = [
+      {
+        codec: "eac3",
+        channels: 6,
+        layout: "5.1",
+        language: "eng",
+        default: true,
+        track_id: "file:7:audio:0",
+      },
+    ];
+    const offeredBitmap = fixtureSubtitleInventoryItemV3({
+      track_id: "file:7:subtitle:4",
+      combined_index: 4,
+      codec: "pgs",
+      delivery: "burn_in_only",
+      url: undefined,
+    });
+    let starts = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        starts += 1;
+        if (starts === 1) {
+          return jsonResponse(
+            {
+              protocol_version: 3,
+              server_features: ["playback_plan_v3"],
+              outcome: "playable",
+              session_id: "session-1",
+              playback_plan: fixturePlanV3({
+                effective_virtual_uri: "virtual://movie/x?result=A",
+                audio_tracks: offeredAudio,
+                subtitle: { mode: "off", inventory: [] },
+              }),
+            },
+            { status: 201 },
+          );
+        }
+        return jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "adaptation_unavailable",
+          terminal: {
+            reason: "offered_release_unavailable",
+            message: "The offered release is no longer available.",
+            retryable: true,
+          },
+        });
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+    act(() =>
+      result.current.applyInventoryUpdate({
+        session_id: "session-1",
+        inventory_revision: "inv:offered-bitmap-unavailable",
+        inventory_status: "verified",
+        effective_media_file_id: 7,
+        offered_virtual_uri: "virtual://movie/x?result=7398",
+        audio_tracks: offeredAudio,
+        subtitle_inventory: [offeredBitmap],
+      }),
+    );
+    act(() => result.current.changeSubtitleTrack(4, 30));
+    await waitFor(() => expect(starts).toBe(2));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(starts).toBe(2);
+    unmount();
+  });
+
   it("folds a mid-switch seek into a chained switch without a competing replan", async () => {
     const startBodies: Array<{ file_id: number; start_position?: number }> = [];
     const replanBodies: Array<Record<string, unknown>> = [];

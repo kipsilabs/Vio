@@ -437,10 +437,20 @@ export default function ActionBar({
       (version) => version.file_id === selectedVersion.file_id,
     );
     if (!watchVersion) return selectedVersion;
+    // An empty watch-detail list can be an unprobed row, not evidence that the
+    // selected version has no tracks. Keep the catalog lists until the probe
+    // actually supplies a non-empty inventory, so a cold page does not hide its
+    // audio/subtitle menus.
     return {
       ...selectedVersion,
-      audio_tracks: watchVersion.audio_tracks ?? selectedVersion.audio_tracks,
-      subtitle_tracks: watchVersion.subtitle_tracks ?? selectedVersion.subtitle_tracks,
+      audio_tracks:
+        (watchVersion.audio_tracks?.length ?? 0) > 0
+          ? watchVersion.audio_tracks
+          : selectedVersion.audio_tracks,
+      subtitle_tracks:
+        (watchVersion.subtitle_tracks?.length ?? 0) > 0
+          ? watchVersion.subtitle_tracks
+          : selectedVersion.subtitle_tracks,
     };
   }, [selectedVersion, selectedWatch]);
   const showMarkerEditor = canEditMarkers && !!contentId;

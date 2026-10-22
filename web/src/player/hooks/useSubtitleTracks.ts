@@ -8,8 +8,9 @@ import { isSubtitleSourceChanged } from "../utils/subtitleSourceChanged";
 // Explicitly bound each subtitle fetch to this many source-time seconds. A
 // cold remote 600 s window takes ~18-24 s to read; the client displays cues as
 // they stream, but the long read still holds the relay while the next seek or
-// track change is waiting. Two minutes matches the server's implicit virtual
-// window and the ASS/PGS fetchers; the prefetch lead still schedules the next
+// track change is waiting. Two minutes matches the ASS/PGS fetchers; the
+// server's legacy implicit window stays at ten minutes for native clients that
+// do not request their own slices. The prefetch lead still schedules the next
 // slice before playback reaches the end.
 const WINDOW_DURATION = 120;
 // Start fetching the next window this many seconds before the current
