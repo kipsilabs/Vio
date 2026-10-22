@@ -876,13 +876,12 @@ func TestScheduleDefaultFileProbeSnapshotsAccessFilter(t *testing.T) {
 
 func TestDefaultProbeChainAdmissionCancelsLiveChain(t *testing.T) {
 	var admission defaultProbeChainAdmission
-	release, refusal := admission.acquire("content-1\x000")
+	ctx, cancel := context.WithCancel(context.Background())
+	release, refusal := admission.acquireWithCancel("content-1\x000", cancel)
 	if refusal != defaultProbeChainRefusalNone || release == nil {
 		t.Fatalf("acquire refusal=%q, release_nil=%v", refusal, release == nil)
 	}
 	defer release()
-	ctx, cancel := context.WithCancel(context.Background())
-	admission.setCancel("content-1\x000", cancel)
 	if !admission.cancelKey("content-1\x000") {
 		t.Fatal("cancelKey reported no live chain")
 	}
@@ -891,5 +890,4 @@ func TestDefaultProbeChainAdmissionCancelsLiveChain(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("chain context was not canceled")
 	}
-	admission.clearCancel("content-1\x000")
 }

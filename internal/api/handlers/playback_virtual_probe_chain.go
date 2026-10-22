@@ -214,6 +214,14 @@ const (
 // later discovery run still probe normally. The returned func releases the
 // slot and must be called exactly once.
 func (a *defaultProbeChainAdmission) acquire(contentID string) (func(), defaultProbeChainRefusal) {
+	return a.acquireWithCancel(contentID, nil)
+}
+
+// acquireWithCancel admits one chain and registers its cancellation function
+// under the same lock. Registering separately left a window where playback
+// start could observe the live key but find no cancel function, then launch the
+// detached probe concurrently with playback.
+func (a *defaultProbeChainAdmission) acquireWithCancel(contentID string, cancel context.CancelFunc) (func(), defaultProbeChainRefusal) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.active == nil {
@@ -226,33 +234,14 @@ func (a *defaultProbeChainAdmission) acquire(contentID string) (func(), defaultP
 		return nil, defaultProbeChainRefusalCapacity
 	}
 	a.active[contentID] = struct{}{}
+	if cancel != nil {
+		if a.cancel == nil {
+			a.cancel = make(map[string]context.CancelFunc)
+		}
+		a.cancel[contentID] = cancel
+	}
 	a.admitted++
 	return func() { a.release(contentID) }, defaultProbeChainRefusalNone
-}
-
-// setCancel records the chain's cancellation function under the same key used
-// for admission. It is called after admission and before the chain goroutine
-// starts, so a playback start that arrives while the chain is live can cancel
-// the duplicate remote probe instead of letting it race the play path.
-func (a *defaultProbeChainAdmission) setCancel(key string, cancel context.CancelFunc) {
-	if a == nil || key == "" || cancel == nil {
-		return
-	}
-	a.mu.Lock()
-	if a.cancel == nil {
-		a.cancel = make(map[string]context.CancelFunc)
-	}
-	a.cancel[key] = cancel
-	a.mu.Unlock()
-}
-
-func (a *defaultProbeChainAdmission) clearCancel(key string) {
-	if a == nil || key == "" {
-		return
-	}
-	a.mu.Lock()
-	delete(a.cancel, key)
-	a.mu.Unlock()
 }
 
 // cancelKey cancels a live chain for key and reports whether one was live.
@@ -277,6 +266,7 @@ func (a *defaultProbeChainAdmission) release(contentID string) {
 		return
 	}
 	delete(a.active, contentID)
+	delete(a.cancel, contentID)
 	a.admitted--
 }
 
@@ -333,8 +323,10 @@ func (h *PlaybackHandler) ScheduleDefaultFileProbe(contentID string, source *mod
 	// with duplicates. The chain re-reads the selected row and probes that row's
 	// own stored URL, so any discovery group can safely start it.
 	admissionKey := contentID + "\x00" + strconv.Itoa(filter.SelectedFileID)
-	release, refusal := h.defaultProbeChains.acquire(admissionKey)
+	ctx, cancel := h.virtualDetachedContext(context.Background(), virtualDefaultProbeChainBudget)
+	release, refusal := h.defaultProbeChains.acquireWithCancel(admissionKey, cancel)
 	if refusal != defaultProbeChainRefusalNone {
+		cancel()
 		// A chain for this item is already live, or both slots are taken.
 		// Either way the callback is dropped: the live chain re-reads the same
 		// defaults, and a dropped probe still happens on the first play. No
@@ -362,12 +354,9 @@ func (h *PlaybackHandler) ScheduleDefaultFileProbe(contentID string, source *mod
 	// unrelated playback would share, and Done() reports the slot truly
 	// free: a Wait() caller must be able to re-schedule the same item
 	// without racing the previous chain's teardown.
-	ctx, cancel := h.virtualDetachedContext(context.Background(), virtualDefaultProbeChainBudget)
-	h.defaultProbeChains.setCancel(admissionKey, cancel)
 	h.probeChainWG.Add(1)
 	go func() {
 		defer func() {
-			h.defaultProbeChains.clearCancel(admissionKey)
 			if r := recover(); r != nil {
 				slog.ErrorContext(context.WithoutCancel(ctx), "virtual pre-play probe chain panicked",
 					"component", "api", "content_id", contentID, "stack", string(debug.Stack()))
