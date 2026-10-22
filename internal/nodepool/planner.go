@@ -689,7 +689,7 @@ func (p *Planner) pickNode(nodes []*Node, currentURL string, now time.Time, elig
 // still occupies the same GPU.
 func (p *Planner) pickTranscode(transcodes, pool, proxies []*Node, groupHealthy map[string]bool, currentURL string, estKbps int, now time.Time) *Node {
 	return p.pickWithScratchGuard(transcodes, pool, currentURL, now, func(n *Node) bool {
-		return admitsSession(n, currentURL) && p.transcodeEligible(n, proxies, groupHealthy, estKbps, now)
+		return admitsSession(n, currentURL) && p.transcodeEligible(n, proxies, groupHealthy, estKbps, currentURL, now)
 	}, p.physicalGPULoadScore(pool, now))
 }
 
@@ -885,7 +885,7 @@ func (p *Planner) physicalGPULoadScore(pool []*Node, now time.Time) func(*Node) 
 // and group-healthy, with no proxy partner required.
 func (p *Planner) pickLocalEgressTranscode(transcodes, pool []*Node, groupHealthy map[string]bool, currentURL string, now time.Time) *Node {
 	return p.pickWithScratchGuard(transcodes, pool, currentURL, now, func(n *Node) bool {
-		return admitsSession(n, currentURL) && p.transcodeEligible(n, nil, groupHealthy, 0, now)
+		return admitsSession(n, currentURL) && p.transcodeEligible(n, nil, groupHealthy, 0, currentURL, now)
 	}, p.physicalGPULoadScore(pool, now))
 }
 
@@ -900,8 +900,16 @@ func (p *Planner) pickLocalEgressTranscode(transcodes, pool []*Node, groupHealth
 // empty the candidate set; a hard predicate could not. Callers that use this
 // directly (ReserveTranscodeWorkWith's non-streaming reservations) intentionally
 // keep the historical behavior.
-func (p *Planner) transcodeEligible(n *Node, proxies []*Node, groupHealthy map[string]bool, estKbps int, now time.Time) bool {
-	if !n.Healthy || !n.Enabled || !p.underCap(n, now) {
+func (p *Planner) transcodeEligible(n *Node, proxies []*Node, groupHealthy map[string]bool, estKbps int, currentURL string, now time.Time) bool {
+	if !n.Healthy || !n.Enabled {
+		return false
+	}
+	// A replacement for the session already running on this node is not a new
+	// admission. The health-reported ActiveJobs includes that session, and the
+	// planner has just dropped its provisional reservation; counting it again
+	// makes a one-job node report capacity exhaustion for its own in-place
+	// track change. Other sessions still obey the cap.
+	if !p.underCap(n, now) && !(currentURL != "" && sameNodeURL(n.URL, currentURL)) {
 		return false
 	}
 	if p.transcodes != nil && p.transcodes.suppressedAt(n.URL, now) {

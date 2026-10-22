@@ -448,3 +448,35 @@ func TestEscalateRefusedProgressiveRemuxV3TreatsAnUnreachableProxyAsAbsent(t *te
 		})
 	}
 }
+
+// A track change on a one-job transcode node must be allowed to prepare its
+// replacement on the node that is already running the session. ActiveJobs
+// includes the current session, so treating it as a new admission makes the
+// only route look exhausted and forces the client into a new session.
+func TestPrepareTransportV3ReusesOneJobNodeForCurrentSession(t *testing.T) {
+	live := remoteTranscodeNodeStubV3(t)
+	transcodes := nodepool.NewTranscodePool()
+	transcodes.SetNodes([]*nodepool.Node{{
+		ID: 1, URL: live.URL, Enabled: true, Healthy: true,
+		ActiveJobs: 1, MaxJobs: intPtr(1),
+	}})
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	handler.JWTSecret = "test-secret"
+	handler.NodePlanner = nodepool.NewPlanner(nodepool.NewProxyPool(), transcodes)
+	requireWorkerRoutingV3(handler)
+
+	session := &playback.Session{
+		ID: "one-job-replacement", UserID: 7, ProfileID: "profile-1",
+		TranscodeNodeURL: live.URL, PlayMethod: playback.PlayTranscode,
+	}
+	transport, transportErr := handler.prepareTransportV3(
+		httptest.NewRequest(http.MethodPost, "/", nil), session,
+		v3HandlerFixtureFile(t), remoteHLSResultV3(), mediaAuthModeV3{})
+	if transportErr != nil {
+		t.Fatalf("prepare transport on current one-job node: %#v", transportErr)
+	}
+	defer transport.rollback()
+	if transport.nodeURL != live.URL {
+		t.Fatalf("transport node = %q, want the current node %q", transport.nodeURL, live.URL)
+	}
+}

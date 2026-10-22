@@ -106,6 +106,31 @@ func TestPlanSessionWithRestrictsEligibleTranscodeNodes(t *testing.T) {
 	}
 }
 
+func TestPlanRouteReusesCurrentTranscodeNodeAtJobCapacity(t *testing.T) {
+	node := transcodeNode(1, "http://tc-1", nil, 0)
+	node.MaxJobs = intPtr(1)
+	node.ActiveJobs = 1
+	f := newFixture(nil, []*Node{node})
+
+	// The current session's own job is already counted in ActiveJobs. Its
+	// track change must be allowed to prepare a replacement on the same node
+	// even when the node has no free slot for a new session.
+	plan := f.planner.PlanRoute(RouteRequest{
+		SessionID:           "s-current",
+		CurrentTranscodeURL: node.URL,
+		NeedsTranscode:      true,
+	})
+	if plan.TranscodeNode == nil || plan.TranscodeNode.URL != node.URL {
+		t.Fatalf("current-session plan = %+v, want the running node %s", plan.TranscodeNode, node.URL)
+	}
+
+	// A different session must still see the one-job node as full.
+	other := f.planner.PlanRoute(RouteRequest{SessionID: "s-other", NeedsTranscode: true})
+	if other.TranscodeNode != nil {
+		t.Fatalf("new session bypassed the one-job cap: %+v", other.TranscodeNode)
+	}
+}
+
 func TestReleaseSessionDropsProvisionalReservation(t *testing.T) {
 	node := transcodeNode(1, "http://tc-1", nil, 0)
 	node.MaxJobs = intPtr(1)
