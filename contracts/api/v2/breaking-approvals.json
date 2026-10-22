@@ -1,11 +1,3 @@
 {
-  "approvals": [
-    {
-      "operation_id": "startPlayback",
-      "change_id": "new-optional-request-property",
-      "fingerprint": "487118f571625b1be0cf960b1747dab4d4e5b4576470d7ec088306de4e11950e",
-      "reason": "Adds the optional offered_virtual_uri request field so a track picked from a display-only offered release starts that exact candidate instead of re-resolving another release and applying the offered ordinal to it.",
-      "approved_in": "#361"
-    }
-  ]
+  "approvals": []
 }
