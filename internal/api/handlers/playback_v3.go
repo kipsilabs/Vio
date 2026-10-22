@@ -2280,6 +2280,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		// must survive into the attempt record for idempotent replay.
 		resolutionWasAssumed = resolved.ResolutionAssumed
 		resolutionProvenance = resolved.Provenance
+		virtualDecision.effectiveVirtualOwner = effectiveVirtualOwner(resolved.OwnerID, resolved.File.VirtualOwnerInstallationID)
 		virtualDecision.candidateRank = resolved.CandidateRank
 		virtualDecision.candidateCount = resolved.CandidateCount
 		// The alternate-version walk resolved a different release than the one
@@ -3551,7 +3552,15 @@ func appendStartWarningsV3(result *playback.PlannerResultV3, warnings []playback
 // omits the rank fields then rather than printing a misleading 0.
 type virtualPlanDecisionV3 struct {
 	preferredAudioLanguage string
-	candidateRank          int
+	// effectiveVirtualOwner is the provider installation that resolved the
+	// planned candidate. A first-ever auto start can plan a concrete
+	// ?result= candidate while the effective catalog row is still the
+	// provider-neutral sibling, whose owner is 0. Carrying the resolver's owner
+	// onto the session binding keeps a later seek able to reopen the frozen
+	// candidate instead of failing closed until another operation materializes
+	// the concrete row.
+	effectiveVirtualOwner int
+	candidateRank         int
 	// candidateCount is the ranked candidate list's length, or -1 when the
 	// resolve took a path that never ranked (a fast path with no list). The
 	// plan-decision log distinguishes that unknown from a measured zero.
@@ -3637,6 +3646,7 @@ func (h *PlaybackHandler) startPlannedPlaybackV3(r *http.Request, userID int, pr
 	if result.Plan == nil {
 		return playback.DecisionResponseV3{}, &transportErrorV3{reason: "internal_error", message: "The server produced no playback plan."}
 	}
+	effectiveFile = bindPlannedVirtualFileV3(effectiveFile, result.Plan, virtualDecision.effectiveVirtualOwner)
 	if checker, ok := h.sessionMgr.(transcodePermissionChecker); ok && (result.PlayMethod == playback.PlayTranscode || result.TranscodeAudio) {
 		if err := checker.CheckTranscodingAllowed(r.Context(), userID, result.PlayMethod == playback.PlayTranscode); err != nil {
 			reason := "transcoding_disabled"
@@ -6864,6 +6874,34 @@ func sourceVideoTranscodeFactsV3(file *models.MediaFile, result playback.Planner
 	return profile, bitDepth
 }
 
+// bindPlannedVirtualFileV3 pins the effective file to the concrete candidate
+// and provider installation the plan actually selected. A first-ever auto
+// start can return the catalog's provider-neutral sibling as the effective
+// row while the planner resolved a concrete ?result= candidate; the neutral
+// row carries owner 0, so storing its path and owner on the session leaves a
+// seek reanchor unable to reopen the frozen candidate. The plan's
+// EffectiveVirtualURI is the candidate that is actually playing, and
+// virtualDecision carries the resolver's installation for it.
+func bindPlannedVirtualFileV3(file *models.MediaFile, plan *playback.PlanV3, owner int) *models.MediaFile {
+	if file == nil || plan == nil || !isVirtualPlaybackFile(file) {
+		return file
+	}
+	uri := strings.TrimSpace(plan.EffectiveVirtualURI)
+	if uri == "" {
+		return file
+	}
+	owner = effectiveVirtualOwner(owner, file.VirtualOwnerInstallationID)
+	if uri == file.FilePath && owner == file.VirtualOwnerInstallationID {
+		return file
+	}
+	bound := *file
+	bound.FilePath = uri
+	if owner > 0 {
+		bound.VirtualOwnerInstallationID = owner
+	}
+	return &bound
+}
+
 // v3SessionStreamState builds the durable stream state for a prepared transport.
 func (h *PlaybackHandler) v3SessionStreamState(ctx context.Context, session *playback.Session, file *models.MediaFile, result playback.PlannerResultV3, transport preparedTransportV3, mode mediaAuthModeV3) playback.SessionStreamState {
 	state := playback.SessionStreamState{
@@ -6945,13 +6983,22 @@ func (h *PlaybackHandler) v3SessionStreamState(ctx context.Context, session *pla
 	// the serve path can discard it when the bound candidate has moved.
 	if isVirtualPlaybackFile(file) && strings.HasPrefix(file.FilePath, "virtual://") {
 		owner := effectiveVirtualOwner(file.VirtualOwnerInstallationID, session.VirtualSourceOwnerInstallationID)
-		state.VirtualSourceURI = file.FilePath
+		// The plan names the concrete candidate it validated. Prefer it over a
+		// neutral catalog sibling so the session binding and its evidence anchor
+		// both name the bytes that are actually playing.
+		virtualURI := strings.TrimSpace(file.FilePath)
+		if result.Plan != nil {
+			if plannedURI := strings.TrimSpace(result.Plan.EffectiveVirtualURI); plannedURI != "" {
+				virtualURI = plannedURI
+			}
+		}
+		state.VirtualSourceURI = virtualURI
 		state.VirtualSourceOwnerInstallationID = owner
 		state.VirtualSourceRevision = planVirtualSourceRevisionV3(result)
 		state.VirtualSubtitleTracks = file.SubtitleTracks
 		state.VirtualExternalSubtitles = file.ExternalSubtitles
 		state.VirtualAudioTracks = file.AudioTracks
-		state.VirtualSubtitleEvidenceURI = file.FilePath
+		state.VirtualSubtitleEvidenceURI = virtualURI
 		// The evidence row id is as important as the URI: duplicate catalog
 		// rows for one release share candidate URIs and neutral keys, so a
 		// later serve must apply this inventory only to the exact row it was
@@ -6968,7 +7015,7 @@ func (h *PlaybackHandler) v3SessionStreamState(ctx context.Context, session *pla
 		// may carry no stamp (a churned listing row) even though the retained
 		// evidence is proven, so the session's own flag is the authority.
 		evidenceSet := file.ProbeUpdatedAt != nil
-		if !evidenceSet && sameVirtualCandidate(session.VirtualSubtitleEvidenceURI, file.FilePath) {
+		if !evidenceSet && sameVirtualCandidate(session.VirtualSubtitleEvidenceURI, virtualURI) {
 			evidenceSet = session.VirtualSubtitleEvidenceSet
 		}
 		state.VirtualSubtitleEvidenceSet = evidenceSet

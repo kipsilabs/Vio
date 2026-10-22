@@ -3897,7 +3897,7 @@ func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(file *models.MediaFil
 // position so a small scrub back stays covered, mirroring that player's
 // SEEK_BACKOFF.
 const (
-	virtualSubtitleImplicitWindowSeconds        = 600.0
+	virtualSubtitleImplicitWindowSeconds        = 120.0
 	virtualSubtitleImplicitWindowBackoffSeconds = 2.0
 	// virtualSubtitleImplicitWindowMinSourceBytes is the source size above
 	// which a whole-track virtual read is considered untenable and is bounded

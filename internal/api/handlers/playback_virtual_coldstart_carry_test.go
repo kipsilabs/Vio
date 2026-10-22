@@ -53,6 +53,37 @@ func TestReplanTrackChangeCarriesValidatedVideoEvidenceForUnprobedRow(t *testing
 	}
 }
 
+// A first-ever auto start can plan a concrete candidate while the effective
+// catalog row is still the provider-neutral sibling. That sibling carries no
+// installation owner, so binding its path and owner leaves a later seek unable
+// to reopen the frozen candidate. The start binding must name the planned
+// candidate and carry the resolver's owner.
+func TestBindPlannedVirtualFilePinsConcreteCandidateOwner(t *testing.T) {
+	neutral := &models.MediaFile{
+		ID: 3971178, FilePath: "virtual://series/tt26743760/2/23",
+		Container: "virtual", VirtualOwnerInstallationID: 0,
+	}
+	candidate := "virtual://series/tt26743760/2/23?result=0f52cdc36ee53a6b1bbc3853"
+	plan := &playback.PlanV3{EffectiveVirtualURI: candidate}
+
+	bound := bindPlannedVirtualFileV3(neutral, plan, 7)
+	if bound == nil {
+		t.Fatal("bindPlannedVirtualFileV3 returned nil")
+	}
+	if bound.ID != neutral.ID {
+		t.Fatalf("bound row id = %d, want the effective catalog row %d", bound.ID, neutral.ID)
+	}
+	if bound.FilePath != candidate {
+		t.Fatalf("bound path = %q, want the planned candidate %q", bound.FilePath, candidate)
+	}
+	if bound.VirtualOwnerInstallationID != 7 {
+		t.Fatalf("bound owner = %d, want the resolver's owner 7", bound.VirtualOwnerInstallationID)
+	}
+	if neutral.FilePath != "virtual://series/tt26743760/2/23" || neutral.VirtualOwnerInstallationID != 0 {
+		t.Fatal("bindPlannedVirtualFileV3 mutated the catalog row")
+	}
+}
+
 // The fail-closed placeholder an empty inventory is served as must be
 // observable: when no catalog row names the bound candidate, the placeholder
 // decision is logged with the held row id, the bound candidate URI, and the row
