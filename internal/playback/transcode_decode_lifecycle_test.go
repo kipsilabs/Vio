@@ -615,6 +615,15 @@ func TestVerdictPathsAgreeUnderInterleaving(t *testing.T) {
 	clock.Advance(decodeObservationWindow)
 	s.evaluateDecodeVerdict()
 	waitSourceRejected(t, s)
+	// The readers are what prove the interleaving. Give them a bounded chance
+	// to observe the confirmed verdict before the stop channel retires them;
+	// on a loaded CI runner the 30 ms storm can otherwise end with every
+	// reader still descheduled, making the assertion below race the scheduler
+	// rather than exercise the verdict.
+	observeDeadline := time.Now().Add(2 * time.Second)
+	for atomic.LoadInt32(&rejectedSeen) == 0 && time.Now().Before(observeDeadline) {
+		time.Sleep(time.Millisecond)
+	}
 	close(stop)
 	wg.Wait()
 
