@@ -193,6 +193,7 @@ func NewVirtualDefaultProbeTarget(versions VirtualProbeVersionLister, files Virt
 type defaultProbeChainAdmission struct {
 	mu       sync.Mutex
 	active   map[string]struct{}
+	cancel   map[string]context.CancelFunc
 	admitted int
 }
 
@@ -229,6 +230,46 @@ func (a *defaultProbeChainAdmission) acquire(contentID string) (func(), defaultP
 	return func() { a.release(contentID) }, defaultProbeChainRefusalNone
 }
 
+// setCancel records the chain's cancellation function under the same key used
+// for admission. It is called after admission and before the chain goroutine
+// starts, so a playback start that arrives while the chain is live can cancel
+// the duplicate remote probe instead of letting it race the play path.
+func (a *defaultProbeChainAdmission) setCancel(key string, cancel context.CancelFunc) {
+	if a == nil || key == "" || cancel == nil {
+		return
+	}
+	a.mu.Lock()
+	if a.cancel == nil {
+		a.cancel = make(map[string]context.CancelFunc)
+	}
+	a.cancel[key] = cancel
+	a.mu.Unlock()
+}
+
+func (a *defaultProbeChainAdmission) clearCancel(key string) {
+	if a == nil || key == "" {
+		return
+	}
+	a.mu.Lock()
+	delete(a.cancel, key)
+	a.mu.Unlock()
+}
+
+// cancelKey cancels a live chain for key and reports whether one was live.
+func (a *defaultProbeChainAdmission) cancelKey(key string) bool {
+	if a == nil || key == "" {
+		return false
+	}
+	a.mu.Lock()
+	cancel := a.cancel[key]
+	a.mu.Unlock()
+	if cancel == nil {
+		return false
+	}
+	cancel()
+	return true
+}
+
 func (a *defaultProbeChainAdmission) release(contentID string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -237,6 +278,24 @@ func (a *defaultProbeChainAdmission) release(contentID string) {
 	}
 	delete(a.active, contentID)
 	a.admitted--
+}
+
+// cancelDefaultFileProbe drops a detached pre-play probe for the content/file
+// a playback start is about to resolve. The start path performs its own resolve
+// and deferred probe; allowing the detached chain to keep a second ffprobe open
+// on the same provider source only adds relay contention and duplicate evidence
+// writes. A missed chain is harmless because the start probe is authoritative.
+func (h *PlaybackHandler) cancelDefaultFileProbe(contentID string, fileID int) {
+	if h == nil || contentID == "" {
+		return
+	}
+	for _, selected := range []int{fileID, 0} {
+		key := contentID + "\x00" + strconv.Itoa(selected)
+		if h.defaultProbeChains.cancelKey(key) {
+			slog.DebugContext(context.Background(), "virtual pre-play probe chain canceled by playback start",
+				"component", "api", "content_id", contentID, "selected_file_id", selected)
+		}
+	}
 }
 
 // ScheduleDefaultFileProbe is the subscription point the discovery services
@@ -304,9 +363,11 @@ func (h *PlaybackHandler) ScheduleDefaultFileProbe(contentID string, source *mod
 	// free: a Wait() caller must be able to re-schedule the same item
 	// without racing the previous chain's teardown.
 	ctx, cancel := h.virtualDetachedContext(context.Background(), virtualDefaultProbeChainBudget)
+	h.defaultProbeChains.setCancel(admissionKey, cancel)
 	h.probeChainWG.Add(1)
 	go func() {
 		defer func() {
+			h.defaultProbeChains.clearCancel(admissionKey)
 			if r := recover(); r != nil {
 				slog.ErrorContext(context.WithoutCancel(ctx), "virtual pre-play probe chain panicked",
 					"component", "api", "content_id", contentID, "stack", string(debug.Stack()))

@@ -873,3 +873,23 @@ func TestScheduleDefaultFileProbeSnapshotsAccessFilter(t *testing.T) {
 		t.Fatalf("chain read language overrides = %v, want the value captured at scheduling", got.MetadataLanguageOverrides)
 	}
 }
+
+func TestDefaultProbeChainAdmissionCancelsLiveChain(t *testing.T) {
+	var admission defaultProbeChainAdmission
+	release, refusal := admission.acquire("content-1\x000")
+	if refusal != defaultProbeChainRefusalNone || release == nil {
+		t.Fatalf("acquire refusal=%q, release_nil=%v", refusal, release == nil)
+	}
+	defer release()
+	ctx, cancel := context.WithCancel(context.Background())
+	admission.setCancel("content-1\x000", cancel)
+	if !admission.cancelKey("content-1\x000") {
+		t.Fatal("cancelKey reported no live chain")
+	}
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("chain context was not canceled")
+	}
+	admission.clearCancel("content-1\x000")
+}
