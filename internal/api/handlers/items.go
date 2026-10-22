@@ -2798,28 +2798,20 @@ func (h *ItemsHandler) resolveWatchedTargets(ctx context.Context, contentID stri
 		if h.episodeRepo == nil {
 			return "", nil, catalog.ErrItemNotFound
 		}
-		if target.Synthetic {
-			episodes, err := h.seasonEpisodesForRead(ctx, target.Season.SeriesID, target.Season.SeasonNumber)
-			if err != nil {
-				return "", nil, err
-			}
-			if len(episodes) == 0 {
-				return "", nil, catalog.ErrItemNotFound
-			}
-			return "season", h.episodeTargets(ctx, episodes), nil
-		}
 		episodes, err := h.seasonEpisodesForRead(ctx, target.Season.SeriesID, target.Season.SeasonNumber)
 		if err != nil {
 			return "", nil, err
 		}
+		if len(episodes) == 0 {
+			return "", nil, catalog.ErrItemNotFound
+		}
 		if !played {
-			// The parent expansion partitions by season row. A partly linked
-			// or unlinked season must clear the same selected episodes the
-			// season page shows, not only the season_id-linked subset.
-			if episodesAllLinkedToSeason(episodes, target.Season.ContentID) {
-				return "season", nil, nil
-			}
-			return "season", h.episodeTargets(ctx, episodes), nil
+			// ParentUnwatchTargetsForSeason now partitions by
+			// (series_id, season_number) and applies the watched-fileless
+			// filter. Returning the displayed episodes here would append those
+			// unfiltered metadata rows to that set and hide never-watched
+			// episodes from future history.
+			return "season", nil, nil
 		}
 		return "season", h.episodeTargets(ctx, episodes), nil
 	default:

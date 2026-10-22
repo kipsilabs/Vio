@@ -48,6 +48,7 @@
 ./internal/api/handlers TestRemoveHistoryHidesEpisodesWithoutLibraryFilePostgres
 ./internal/api/handlers TestParentUnwatchClearsEpisodesWithoutLibraryFilePostgres
 ./internal/api/handlers TestSeasonUnwatchClearsSyntheticAndUnlinkedFilelessEpisodesPostgres
+./internal/api/handlers TestSeasonUnwatchMetadataOnlyFiltersFilelessHistoryPostgres
 ./internal/auth TestUserRepositoryUpdateAccessGroupIDDB
 ./internal/auth TestUserRepositoryUpdatePromotingToAdminClearsAccessGroupDB
 ./internal/auth TestUserRepositoryUpdateDemotingAdminAssignsDefaultAccessGroupDB
