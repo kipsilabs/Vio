@@ -813,6 +813,38 @@ func TestScheduleDefaultFileProbeHonorsTheDiscoveryAccessFilter(t *testing.T) {
 	}
 }
 
+// A selected profile variant that vanished from the fresh listing is probed
+// from its own persisted candidate. That candidate can carry an expired signed
+// URL copied from the selected row; it must be resolved afresh rather than
+// probing the expired transport and marking the candidate failed.
+func TestVirtualChainProbeURLRefreshesExpiredSelectedCandidate(t *testing.T) {
+	const freshURL = "https://probe.example/fresh-selected"
+	past := time.Now().Add(-time.Hour)
+	row := probeChainRow(7001, "virtual://movie/probe-chain?result=selected", nil)
+	row.ResolvedURL = "https://probe.example/expired-selected"
+	row.ResolvedURLExpiresAt = &past
+	cand := virtualPlaybackStreamFromFile(row)
+	if cand == nil {
+		t.Fatal("selected candidate was not built")
+	}
+	calls := 0
+	h := &PlaybackHandler{VirtualMediaDetailedResolver: VirtualMediaDetailedResolverFunc(func(_ context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+		calls++
+		return ResolvedVirtualMedia{URL: freshURL}, nil
+	})}
+
+	url, _, ok := h.virtualChainProbeURL(context.Background(), row, *cand, catalog.AccessFilter{UserID: 1, ProfileID: "profile-1"})
+	if !ok {
+		t.Fatal("expired selected candidate produced no probe URL")
+	}
+	if url != freshURL {
+		t.Fatalf("probe URL = %q, want the fresh resolve %q", url, freshURL)
+	}
+	if calls != 1 {
+		t.Fatalf("fresh resolver calls = %d, want 1", calls)
+	}
+}
+
 // TestScheduleDefaultFileProbeSnapshotsAccessFilter pins the filter snapshot:
 // the request that scheduled the chain may reuse or mutate its filter after
 // the hand-off, and the detached read must still see the constraints that

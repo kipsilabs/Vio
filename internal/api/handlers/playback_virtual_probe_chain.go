@@ -473,11 +473,17 @@ func (h *PlaybackHandler) virtualChainProbeURL(ctx context.Context, row *models.
 	if row == nil {
 		return "", nil, false
 	}
-	if url := strings.TrimSpace(cand.ProviderURL); url != "" {
+	now := time.Now()
+	// A persisted candidate copied from a selected row carries that row's signed
+	// URL too. It must obey the same expiry fence as the row fallback below;
+	// otherwise a vanished profile variant with an expired URL is probed instead
+	// of being resolved freshly, and the probe failure damages the candidate.
+	if url := strings.TrimSpace(cand.ProviderURL); url != "" &&
+		(cand.ProviderExpiresAt == nil || cand.ProviderExpiresAt.After(now)) {
 		return url, maps.Clone(cand.RequestHeaders), true
 	}
 	if url := strings.TrimSpace(row.ResolvedURL); url != "" &&
-		(row.ResolvedURLExpiresAt == nil || row.ResolvedURLExpiresAt.After(time.Now())) {
+		(row.ResolvedURLExpiresAt == nil || row.ResolvedURLExpiresAt.After(now)) {
 		return url, maps.Clone(row.ProviderRequestHeaders), true
 	}
 	if h.VirtualMediaDetailedResolver == nil {

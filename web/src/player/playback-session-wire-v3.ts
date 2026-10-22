@@ -139,6 +139,10 @@ export interface StartRequestInput {
   progressPersistence?: ProgressPersistenceV3;
   explicitAudioTrackIndex?: number | null;
   subtitleTrackIndex?: number | null;
+  /** File-bound subtitle identity carried into a replacement start, so a
+   * source transition keeps the selected language instead of falling back to
+   * the new plan's default. */
+  subtitleTrackID?: string | null;
   /** File-bound audio track identity carried from the current plan into a
    * replacement start (a version switch); remapped by family server-side. */
   carriedAudioTrackID?: string | null;
@@ -191,6 +195,7 @@ export function buildStartRequestV3(input: StartRequestInput): StartRequestV3 {
     ...(input.subtitleTrackIndex != null && input.subtitleTrackIndex >= 0
       ? { subtitle_track_index: input.subtitleTrackIndex }
       : {}),
+    ...(input.subtitleTrackID ? { subtitle_track_id: input.subtitleTrackID } : {}),
     ...(input.bandwidthEstimateKbps != null
       ? { bandwidth_estimate_kbps: input.bandwidthEstimateKbps }
       : {}),
