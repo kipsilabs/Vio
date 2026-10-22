@@ -879,6 +879,34 @@ func (r *EpisodeRepository) PartitionIDsBySeason(ctx context.Context, seasonID s
 	return r.partitionIDs(ctx, "season_id", seasonID)
 }
 
+// PartitionIDsBySeriesSeason partitions one season by its durable
+// (series_id, season_number) identity. Synthetic seasons have no season row,
+// and partly linked seasons can carry episodes outside the row's season_id
+// group; unwatch must still reach both the available episodes and watched
+// file-less ones.
+func (r *EpisodeRepository) PartitionIDsBySeriesSeason(ctx context.Context, seriesID string, seasonNumber int) (withFile, fileless []string, err error) {
+	rows, err := r.pool.Query(ctx, fmt.Sprintf(`SELECT content_id, %s FROM episodes
+		WHERE series_id = $1 AND season_number = $2
+		ORDER BY episode_number ASC`, episodeAvailabilityPredicate), seriesID, seasonNumber)
+	if err != nil {
+		return nil, nil, fmt.Errorf("partitioning episode ids by series and season: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var contentID string
+		var available bool
+		if err := rows.Scan(&contentID, &available); err != nil {
+			return nil, nil, fmt.Errorf("scanning episode ids by series and season: %w", err)
+		}
+		if available {
+			withFile = append(withFile, contentID)
+		} else {
+			fileless = append(fileless, contentID)
+		}
+	}
+	return withFile, fileless, rows.Err()
+}
+
 func (r *EpisodeRepository) partitionIDs(ctx context.Context, parentColumn, parentID string) (withFile, fileless []string, err error) {
 	// parentColumn comes only from the two fixed-column wrappers above.
 	rows, err := r.pool.Query(ctx, fmt.Sprintf(`SELECT content_id, %s FROM episodes
@@ -972,6 +1000,38 @@ func (r *EpisodeRepository) ListSeasons(ctx context.Context, seriesID string) ([
 	return seasons, nil
 }
 
+// ListMetadataSeasons is ListSeasons without the library-availability filter:
+// it summarizes every season the episodes table knows, including seasons whose
+// candidates a library has not materialized. Series pages use it to keep
+// metadata-only seasons visible instead of letting an empty episode_libraries
+// join hide them.
+func (r *EpisodeRepository) ListMetadataSeasons(ctx context.Context, seriesID string) ([]SeasonSummary, error) {
+	query := `SELECT season_number, COUNT(*) AS episode_count
+		FROM episodes
+		WHERE series_id = $1
+		GROUP BY season_number
+		ORDER BY season_number ASC`
+
+	rows, err := r.pool.Query(ctx, query, seriesID)
+	if err != nil {
+		return nil, fmt.Errorf("listing metadata seasons: %w", err)
+	}
+	defer rows.Close()
+
+	var seasons []SeasonSummary
+	for rows.Next() {
+		var s SeasonSummary
+		if err := rows.Scan(&s.SeasonNumber, &s.EpisodeCount); err != nil {
+			return nil, fmt.Errorf("scanning metadata season summary: %w", err)
+		}
+		seasons = append(seasons, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating metadata season summaries: %w", err)
+	}
+	return seasons, nil
+}
+
 // CountBySeries returns the number of episodes for a given series.
 func (r *EpisodeRepository) CountBySeries(ctx context.Context, seriesID string) (int, error) {
 	var count int
@@ -999,6 +1059,26 @@ func (r *EpisodeRepository) ListBySeason(ctx context.Context, seriesID string, s
 	rows, err := r.pool.Query(ctx, query, seriesID, seasonNum)
 	if err != nil {
 		return nil, fmt.Errorf("listing episodes by season: %w", err)
+	}
+	defer rows.Close()
+
+	return scanEpisodes(rows)
+}
+
+// ListMetadataBySeason is ListBySeason without the library-availability filter:
+// it returns every metadata episode of a season, including episodes whose
+// candidates a library has not materialized. A season read uses it only when
+// the available list is empty, so a metadata-only season answers with its
+// episodes (no playable files) instead of disappearing or 404ing.
+func (r *EpisodeRepository) ListMetadataBySeason(ctx context.Context, seriesID string, seasonNum int) ([]*models.Episode, error) {
+	query := `SELECT ` + episodeColumns + `
+		FROM episodes
+		WHERE series_id = $1 AND season_number = $2
+		ORDER BY episode_number ASC`
+
+	rows, err := r.pool.Query(ctx, query, seriesID, seasonNum)
+	if err != nil {
+		return nil, fmt.Errorf("listing metadata episodes by season: %w", err)
 	}
 	defer rows.Close()
 

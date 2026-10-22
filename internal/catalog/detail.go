@@ -1405,10 +1405,7 @@ func (s *DetailService) pendingSeasonTranslationLanguageChecked(ctx context.Cont
 		}
 	}
 	if episodes == nil {
-		if s.episodeRepo == nil {
-			return "", nil
-		}
-		episodes, err = s.episodeRepo.ListBySeasonID(ctx, season.ContentID)
+		episodes, err = s.seasonEpisodesForRead(ctx, season.SeriesID, season.SeasonNumber)
 		if err != nil {
 			return "", err
 		}
@@ -3380,6 +3377,21 @@ func clearSentinel(s string) string {
 	return s
 }
 
+// seasonEpisodesForRead lists a season by its (series_id, season_number)
+// identity: available episodes first, then metadata episodes when none are
+// materialized. The selected slice feeds both detail counts and pending
+// translation detection.
+func (s *DetailService) seasonEpisodesForRead(ctx context.Context, seriesID string, seasonNumber int) ([]*models.Episode, error) {
+	if s.episodeRepo == nil {
+		return nil, nil
+	}
+	episodes, err := s.episodeRepo.ListBySeason(ctx, seriesID, seasonNumber)
+	if err != nil || len(episodes) > 0 {
+		return episodes, err
+	}
+	return s.episodeRepo.ListMetadataBySeason(ctx, seriesID, seasonNumber)
+}
+
 func (s *DetailService) buildSeasonDetail(ctx context.Context, season *models.Season, filter AccessFilter) (*ItemDetail, error) {
 	series, err := s.itemRepo.GetByID(ctx, season.SeriesID)
 	if err != nil {
@@ -3388,12 +3400,9 @@ func (s *DetailService) buildSeasonDetail(ctx context.Context, season *models.Se
 	localizationFilter := filter
 	localizationFilter.PresentationOriginalLanguage = series.OriginalLanguage
 
-	episodes := []*models.Episode{}
-	if s.episodeRepo != nil {
-		episodes, err = s.episodeRepo.ListBySeasonID(ctx, season.ContentID)
-		if err != nil {
-			return nil, fmt.Errorf("listing season episodes: %w", err)
-		}
+	episodes, err := s.seasonEpisodesForRead(ctx, season.SeriesID, season.SeasonNumber)
+	if err != nil {
+		return nil, fmt.Errorf("listing season episodes: %w", err)
 	}
 	pendingTranslation := s.pendingSeasonTranslationLanguage(ctx, season, localizationFilter, episodes)
 	localizedSeason, err := s.LocalizeSeasonModel(ctx, season, localizationFilter)

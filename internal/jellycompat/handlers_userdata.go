@@ -266,15 +266,30 @@ func (h *UserDataHandler) resolveUnplayedTargets(r *http.Request, session *Sessi
 	if err != nil || parent.kind == "" {
 		return targets, err
 	}
-	resolver, ok := h.userData.(interface {
-		ParentUnplayedTargets(context.Context, *Session, string, string) ([]string, error)
-	})
-	if !ok {
-		return targets, nil
+	var extra []string
+	seasonHandled := false
+	if parent.kind == watchstate.ParentSeason && parent.seriesID != "" && parent.seasonNumber != nil {
+		seasonResolver, ok := h.userData.(interface {
+			ParentUnplayedTargetsForSeason(context.Context, *Session, string, string, int) ([]string, bool, error)
+		})
+		if ok {
+			extra, seasonHandled, err = seasonResolver.ParentUnplayedTargetsForSeason(r.Context(), session, parent.id, parent.seriesID, *parent.seasonNumber)
+			if err != nil {
+				return nil, err
+			}
+		}
 	}
-	extra, err := resolver.ParentUnplayedTargets(r.Context(), session, parent.kind, parent.id)
-	if err != nil {
-		return nil, err
+	if !seasonHandled {
+		resolver, ok := h.userData.(interface {
+			ParentUnplayedTargets(context.Context, *Session, string, string) ([]string, error)
+		})
+		if !ok {
+			return targets, nil
+		}
+		extra, err = resolver.ParentUnplayedTargets(r.Context(), session, parent.kind, parent.id)
+		if err != nil {
+			return nil, err
+		}
 	}
 	seen := make(map[string]struct{}, len(targets))
 	for _, target := range targets {
@@ -290,12 +305,21 @@ const playedTargetNotFound = "Item not found"
 // empty for a movie or episode.
 type playedParent struct {
 	kind, id string
+	// seriesID and seasonNumber identify a season by durable catalog
+	// coordinates. A season row can be synthetic or partly linked, so the
+	// mutable season id alone cannot reach every watched file-less episode.
+	seriesID     string
+	seasonNumber *int
 }
 
 func (h *UserDataHandler) resolvePlayedTargetsWithParent(r *http.Request, session *Session, rawItemID string) ([]string, playedParent, error) {
 	if seasonID, err := h.codec.DecodeStringID(EncodedIDSeason, rawItemID); err == nil {
 		targets, err := h.resolvePlayedTargetsForSeason(r, session, seasonID)
-		return targets, playedParent{kind: watchstate.ParentSeason, id: seasonID}, err
+		parent := playedParent{kind: watchstate.ParentSeason, id: seasonID}
+		if detail, detailErr := h.content.GetItemDetail(r.Context(), session, seasonID, nil); detailErr == nil && detail != nil {
+			parent.seriesID, parent.seasonNumber = detail.SeriesID, detail.SeasonNumber
+		}
+		return targets, parent, err
 	}
 
 	contentID, _, err := decodeItemOrMediaSourceID(r.Context(), h.codec, rawItemID)
@@ -319,7 +343,10 @@ func (h *UserDataHandler) resolvePlayedTargetsForItem(r *http.Request, session *
 		return []string{detail.ContentID}, playedParent{}, nil
 	case "season":
 		targets, err := h.resolvePlayedTargetsForSeason(r, session, detail.ContentID)
-		return targets, playedParent{kind: watchstate.ParentSeason, id: detail.ContentID}, err
+		return targets, playedParent{
+			kind: watchstate.ParentSeason, id: detail.ContentID,
+			seriesID: detail.SeriesID, seasonNumber: detail.SeasonNumber,
+		}, err
 	case "series":
 		seasons, err := h.content.ListSeasons(r.Context(), session, detail.ContentID, nil)
 		if err != nil {

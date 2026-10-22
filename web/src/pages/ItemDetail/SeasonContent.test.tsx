@@ -285,6 +285,63 @@ describe("SeasonContent", () => {
     );
   });
 
+  it("links Play First Episode to the first playable episode", () => {
+    mocks.useItemEpisodes.mockReturnValue({
+      data: {
+        episodes: [
+          {
+            content_id: "missing",
+            title: "Missing",
+            episode_number: 1,
+            files: [],
+            user_data: { played: false },
+          },
+          {
+            content_id: "playable",
+            title: "Available",
+            episode_number: 2,
+            files: [{ file_id: 2 }],
+            user_data: { played: false },
+          },
+        ],
+      },
+      isLoading: false,
+      error: null,
+    });
+    renderToStaticMarkup(
+      <MemoryRouter initialEntries={["/item/season-1"]}>
+        <SeasonContent item={makeSeasonItem()} />
+      </MemoryRouter>,
+    );
+    expect(mocks.capturedActionBarProps.value).toMatchObject({
+      playHref: "/watch/playable",
+    });
+  });
+
+  it("leaves Play First Episode empty when nothing is playable", () => {
+    mocks.useItemEpisodes.mockReturnValue({
+      data: {
+        episodes: [
+          {
+            content_id: "missing",
+            title: "Missing",
+            episode_number: 1,
+            files: [],
+            user_data: { played: false },
+          },
+        ],
+      },
+      isLoading: false,
+      error: null,
+    });
+    renderToStaticMarkup(
+      <MemoryRouter initialEntries={["/item/season-1"]}>
+        <SeasonContent item={makeSeasonItem()} />
+      </MemoryRouter>,
+    );
+    expect(mocks.capturedActionBarProps.value?.playHref).toBeUndefined();
+  });
+
   it("does not pass rating props to ActionBar", () => {
     renderWithQueryClient(
       <MemoryRouter initialEntries={["/item/season-1"]}>

@@ -75,7 +75,6 @@ export default function SeasonContent({ item }: { item: ItemDetail & { type: "se
   const label = item.is_specials ? "Specials" : seasonLabel(seasonNumber, item.title);
   const seriesTitle = item.series_title ?? "Series";
   const seriesId = item.series_id;
-  const firstEpisode = episodes[0];
   const playableEpisodes = episodes.filter((episode) => (episode.files?.length ?? 0) > 0);
   const firstUnwatched =
     playableEpisodes.find((episode) => !episode.user_data?.played) ?? playableEpisodes[0];
@@ -161,7 +160,9 @@ export default function SeasonContent({ item }: { item: ItemDetail & { type: "se
               contentId={item.content_id}
               canAddToCollection={false}
               watchTogether={watchTogether.menu}
-              playHref={firstEpisode ? `/watch/${firstEpisode.content_id}` : undefined}
+              playHref={
+                playableEpisodes[0] ? `/watch/${playableEpisodes[0].content_id}` : undefined
+              }
               playLabel="Play First Episode"
               onRefresh={
                 canCurateMetadata

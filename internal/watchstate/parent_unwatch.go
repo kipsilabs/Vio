@@ -21,6 +21,13 @@ type EpisodePartitioner interface {
 	PartitionIDsBySeason(ctx context.Context, seasonID string) (withFile, fileless []string, err error)
 }
 
+// SeasonPartitioner expands a season by its durable identity instead of the
+// mutable season row. Synthetic seasons have no row, and a partly linked or
+// unlinked season can have file-less episodes that no season_id lookup finds.
+type SeasonPartitioner interface {
+	PartitionIDsBySeriesSeason(ctx context.Context, seriesID string, seasonNumber int) (withFile, fileless []string, err error)
+}
+
 // ParentUnwatchTargets returns the episodes marking a series or season
 // unwatched must clear: every episode with a library file, plus the file-less
 // ones the profile still has history or progress on. A watched episode whose
@@ -43,6 +50,22 @@ func (s *Service) ParentUnwatchTargets(ctx context.Context, userID int, profileI
 	if err != nil {
 		return nil, err
 	}
+	return s.parentUnwatchTargets(ctx, userID, profileID, withFile, fileless)
+}
+
+// ParentUnwatchTargetsForSeason is the season form keyed by (series_id,
+// season_number). A synthetic season has no season row to partition by, and a
+// partly linked or unlinked season can have watched file-less episodes outside
+// its season_id group; both must still clear on unwatch.
+func (s *Service) ParentUnwatchTargetsForSeason(ctx context.Context, userID int, profileID string, episodes SeasonPartitioner, seriesID string, seasonNumber int) ([]string, error) {
+	withFile, fileless, err := episodes.PartitionIDsBySeriesSeason(ctx, seriesID, seasonNumber)
+	if err != nil {
+		return nil, err
+	}
+	return s.parentUnwatchTargets(ctx, userID, profileID, withFile, fileless)
+}
+
+func (s *Service) parentUnwatchTargets(ctx context.Context, userID int, profileID string, withFile, fileless []string) ([]string, error) {
 	if len(fileless) == 0 {
 		return withFile, nil
 	}

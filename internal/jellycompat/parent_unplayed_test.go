@@ -86,3 +86,74 @@ func TestParentUnplayedClearsWatchedEpisodesWithoutFile(t *testing.T) {
 		})
 	}
 }
+
+type seasonKeyedPartitioner struct {
+	withFile, fileless []string
+	seriesID           string
+	seasonNumber       int
+	seasonKeyed        bool
+	seasonIDKeyed      bool
+}
+
+func (p *seasonKeyedPartitioner) PartitionIDsBySeries(context.Context, string) ([]string, []string, error) {
+	return p.withFile, p.fileless, nil
+}
+
+func (p *seasonKeyedPartitioner) PartitionIDsBySeason(context.Context, string) ([]string, []string, error) {
+	p.seasonIDKeyed = true
+	return p.withFile, p.fileless, nil
+}
+
+func (p *seasonKeyedPartitioner) PartitionIDsBySeriesSeason(_ context.Context, seriesID string, seasonNumber int) ([]string, []string, error) {
+	p.seasonKeyed = true
+	if seriesID != p.seriesID || seasonNumber != p.seasonNumber {
+		return nil, nil, context.Canceled
+	}
+	return p.withFile, p.fileless, nil
+}
+
+// The Jellyfin surface must use the durable season identity too. A synthetic or
+// partly linked season has no reliable season_id group, so a season-keyed
+// unplayed mark would otherwise miss watched file-less episodes.
+func TestParentUnplayedUsesSeriesSeasonIdentity(t *testing.T) {
+	store := newJellycompatUserStore(t)
+	provider := notifications.WrapUserStoreProvider(compatTestUserStoreProvider{store: store}, &notifications.System{})
+	partitioner := &seasonKeyedPartitioner{
+		withFile: []string{"on-disk"}, fileless: []string{"deleted"},
+		seriesID: "series-1", seasonNumber: 2,
+	}
+	service := &directUserDataService{
+		storeProvider: provider,
+		watchState:    watchstate.NewService(provider),
+		episodes:      partitioner,
+	}
+	if err := service.watchState.RecordJellycompatMarkPlayedBatch(t.Context(), 1, "profile-1", []string{"on-disk", "deleted"}, time.Now().UTC().Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	codec := NewResourceIDCodec()
+	content := &seasonContentService{
+		stubContentService: stubContentService{detail: &upstreamItemDetail{
+			ContentID: "season-1", Type: "season", SeriesID: "series-1", SeasonNumber: intPtr(2),
+		}},
+		onDisk: []string{"on-disk"},
+	}
+	h := NewUserDataHandler(content, service, codec, &config.Config{})
+	session := &Session{StreamAppUserID: 1, ProfileID: "profile-1"}
+	rec := httptest.NewRecorder()
+	h.HandleMarkUnplayed(rec, viewerRequest("DELETE", "/", "", "itemId", codec.EncodeStringID(EncodedIDSeason, "season-1"), session))
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	if !partitioner.seasonKeyed || partitioner.seasonIDKeyed {
+		t.Fatalf("season keys = seasonKeyed:%v seasonIDKeyed:%v, want only the durable season keys", partitioner.seasonKeyed, partitioner.seasonIDKeyed)
+	}
+	for _, id := range []string{"on-disk", "deleted"} {
+		progress, err := store.GetProgress(t.Context(), "profile-1", id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if progress != nil {
+			t.Fatalf("%s progress after unplayed = %+v, want cleared", id, progress)
+		}
+	}
+}
