@@ -1376,7 +1376,20 @@ func (h *PlaybackHandler) HandleHLSSegment(w http.ResponseWriter, r *http.Reques
 					"session", playSession.UpstreamSessionID,
 					"playback_session_id", playSession.UpstreamSessionID,
 				)
-				segmentLease, err = transcodeSession.WaitForOpenSegment(segmentName, decision.WaitTimeout)
+				if decision.Reason == "near_produced_head" {
+					segmentLease, err = transcodeSession.WaitForOpenSegmentWithStall(segmentName, decision.WaitTimeout, playback.SegmentStallTimeout)
+				} else {
+					segmentLease, err = transcodeSession.WaitForOpenSegment(segmentName, decision.WaitTimeout)
+				}
+				if errors.Is(err, playback.ErrSegmentStalled) {
+					slog.WarnContext(r.Context(), "transcode segment production stalled", "component", "jellycompat",
+						"segment", segmentName, "requested_segment", segNum,
+						"produced_head", decision.Progress.ProducedHead,
+						"session", playSession.UpstreamSessionID,
+						"playback_session_id", playSession.UpstreamSessionID)
+					decision.RestartOnTimeout = true
+					err = playback.ErrSegmentNotFound
+				}
 				if err != nil && errors.Is(err, playback.ErrSegmentNotFound) {
 					slog.InfoContext(r.Context(), "transcode segment wait timeout", "component", "jellycompat",
 						"segment", segmentName,

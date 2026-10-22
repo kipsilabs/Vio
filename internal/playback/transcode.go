@@ -566,12 +566,11 @@ func ManifestStartupTimeoutFor(opts TranscodeOpts) time.Duration {
 const (
 	maxSequentialMissingSegments = 2
 	activeSegmentWait            = 12 * time.Second
-	// activeProducedHeadWait is the longest a client should sit on a segment
-	// that is only one step past the produced head. A healthy encoder produces
-	// the next two-second segment well inside this window; if it has not, the
-	// client is already stalled and a seek restart is cheaper than holding the
-	// request until the old 12 s timeout and then returning 404.
-	activeProducedHeadWait = 4 * time.Second
+	// SegmentStallTimeout is how long the produced head may remain unchanged
+	// before a segment wait is treated as stalled. A slow encoder that keeps
+	// advancing is allowed to use the full wait; only a generation that has
+	// stopped producing is restarted.
+	SegmentStallTimeout    = 6 * time.Second
 	segmentWaitGrace       = 1500 * time.Millisecond
 	maxSegmentWait         = 6 * time.Second
 	minSegmentWait         = 3 * time.Second
@@ -3597,8 +3596,8 @@ func (s *TranscodeSession) SegmentRecoveryDecision(segNum int, now time.Time) Se
 		if progress.Running && segNum == progress.LastRequestedSegment+1 &&
 			(progress.LastProducedAt.IsZero() || now.Sub(progress.LastProducedAt) <= staleProducedWindow(progress.SegmentDuration)) {
 			decision.Wait = true
-			decision.WaitTimeout = activeProducedHeadWait
-			decision.RestartOnTimeout = true
+			decision.WaitTimeout = activeSegmentWait
+			decision.RestartOnTimeout = false
 			decision.Reason = "near_produced_head"
 		} else {
 			decision.Reason = SegmentRecoveryFarSeekReason
@@ -3607,8 +3606,8 @@ func (s *TranscodeSession) SegmentRecoveryDecision(segNum int, now time.Time) Se
 		decision.Reason = "produced_output_stale"
 	default:
 		decision.Wait = true
-		decision.WaitTimeout = activeProducedHeadWait
-		decision.RestartOnTimeout = true
+		decision.WaitTimeout = activeSegmentWait
+		decision.RestartOnTimeout = false
 		decision.Reason = "near_produced_head"
 	}
 
@@ -4527,7 +4526,28 @@ func (s *TranscodeSession) WaitForSegment(name string, timeout time.Duration) (s
 // closes the stat-to-open race for HTTP serving while preserving the same
 // restart and ffmpeg-exit error contract.
 func (s *TranscodeSession) WaitForOpenSegment(name string, timeout time.Duration) (*SegmentLease, error) {
+	return s.waitForOpenSegment(name, timeout, 0)
+}
+
+// WaitForOpenSegmentWithStall is WaitForOpenSegment with a produced-head
+// watchdog. A wait may use the full timeout while the encoder keeps advancing
+// the head; if the head does not move for stall, it returns ErrSegmentStalled
+// so the caller can restart the generation instead of treating a slow encode
+// as a dead segment.
+func (s *TranscodeSession) WaitForOpenSegmentWithStall(name string, timeout, stall time.Duration) (*SegmentLease, error) {
+	return s.waitForOpenSegment(name, timeout, stall)
+}
+
+func (s *TranscodeSession) waitForOpenSegment(name string, timeout, stall time.Duration) (*SegmentLease, error) {
 	deadline := time.After(timeout)
+	numbered := false
+	if stall > 0 {
+		_, parseErr := ParseSegmentNumber(name)
+		numbered = parseErr == nil
+	}
+	lastHead := -1
+	lastHeadAt := time.Time{}
+	lastStallCheck := time.Time{}
 	for {
 		segment, err := s.OpenSegment(name)
 		if err == nil {
@@ -4552,6 +4572,9 @@ func (s *TranscodeSession) WaitForOpenSegment(name string, timeout time.Duration
 		}
 
 		if restarting {
+			lastHead = -1
+			lastHeadAt = time.Time{}
+			lastStallCheck = time.Time{}
 			select {
 			case <-deadline:
 				return nil, ErrSegmentNotFound
@@ -4564,6 +4587,22 @@ func (s *TranscodeSession) WaitForOpenSegment(name string, timeout time.Duration
 		}
 		if !running {
 			return nil, ErrSegmentNotFound
+		}
+
+		if numbered && stall > 0 {
+			now := time.Now()
+			if lastStallCheck.IsZero() || now.Sub(lastStallCheck) >= 500*time.Millisecond {
+				progress := s.SegmentProgress(now)
+				lastStallCheck = now
+				if progress.HasManifest && progress.ProducedHead >= progress.StartSegmentNumber {
+					if progress.ProducedHead != lastHead {
+						lastHead = progress.ProducedHead
+						lastHeadAt = now
+					} else if !lastHeadAt.IsZero() && now.Sub(lastHeadAt) >= stall {
+						return nil, ErrSegmentStalled
+					}
+				}
+			}
 		}
 
 		select {

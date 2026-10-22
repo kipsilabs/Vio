@@ -904,14 +904,14 @@ func TestSegmentRecoveryDecisionWaitsForFreshNextSegment(t *testing.T) {
 	if !decision.Wait {
 		t.Fatalf("Wait = false, want true (reason=%s)", decision.Reason)
 	}
-	if decision.WaitTimeout != 4*time.Second {
-		t.Fatalf("WaitTimeout = %s, want 4s", decision.WaitTimeout)
+	if decision.WaitTimeout != 12*time.Second {
+		t.Fatalf("WaitTimeout = %s, want 12s", decision.WaitTimeout)
 	}
 	if decision.Reason != "near_produced_head" {
 		t.Fatalf("Reason = %q, want near_produced_head", decision.Reason)
 	}
-	if !decision.RestartOnTimeout {
-		t.Fatal("RestartOnTimeout = false, want true")
+	if decision.RestartOnTimeout {
+		t.Fatal("RestartOnTimeout = true, want false")
 	}
 	if p := decision.Progress; p.ProducedHead != 225 || p.ProducedCount != 2 || !p.HasManifest {
 		t.Fatalf("progress = %+v, want two ready files ending at225 with a manifest", p)
@@ -1359,8 +1359,8 @@ func TestSegmentRecoveryDecisionWaitsForSequentialNextSegmentWhenManifestInFlux(
 	if decision.Reason != "near_produced_head" {
 		t.Fatalf("Reason = %q, want near_produced_head", decision.Reason)
 	}
-	if !decision.RestartOnTimeout {
-		t.Fatal("RestartOnTimeout = false, want true")
+	if decision.RestartOnTimeout {
+		t.Fatal("RestartOnTimeout = true, want false")
 	}
 }
 
@@ -1396,5 +1396,29 @@ func TestSourceAlignedCopyStartHintSurvivesReload(t *testing.T) {
 				raw += fmt.Sprintf("#EXTINF:1.700000,\nseg_%05d.m4s\n", tc.segment+reload+1)
 			}
 		})
+	}
+}
+
+func TestWaitForOpenSegmentWithStallReturnsWhenHeadStops(t *testing.T) {
+	tempDir := t.TempDir()
+	now := time.Now()
+	writeManifestRange(t, tempDir, 0, 0, ".ts")
+	writeSegmentFile(t, tempDir, "seg_00000.ts", []byte("x"), now)
+	session := &TranscodeSession{
+		outputDir: tempDir,
+		running:   true,
+		opts: TranscodeOpts{
+			TargetCodecVideo:   "h264",
+			SegmentDuration:    2,
+			StartSegmentNumber: 0,
+		},
+	}
+	started := time.Now()
+	_, err := session.WaitForOpenSegmentWithStall("seg_00001.ts", 2*time.Second, 50*time.Millisecond)
+	if !errors.Is(err, ErrSegmentStalled) {
+		t.Fatalf("WaitForOpenSegmentWithStall error = %v, want ErrSegmentStalled", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("stalled wait took %s, want the short stall verdict", elapsed)
 	}
 }

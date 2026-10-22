@@ -3276,7 +3276,23 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 					"session", sessionID,
 					"playback_session_id", sessionID,
 				)
-				segmentLease, err = transcodeSession.WaitForOpenSegment(segmentName, decision.WaitTimeout)
+				if decision.Reason == "near_produced_head" {
+					segmentLease, err = transcodeSession.WaitForOpenSegmentWithStall(segmentName, decision.WaitTimeout, playback.SegmentStallTimeout)
+				} else {
+					segmentLease, err = transcodeSession.WaitForOpenSegment(segmentName, decision.WaitTimeout)
+				}
+				if errors.Is(err, playback.ErrSegmentStalled) {
+					slog.WarnContext(r.Context(), "transcode segment production stalled", "component", "api",
+						"segment", segmentName,
+						"requested_segment", segNum,
+						"produced_head", decision.Progress.ProducedHead,
+						"reason", decision.Reason,
+						"session", sessionID,
+						"playback_session_id", sessionID,
+					)
+					decision.RestartOnTimeout = true
+					err = playback.ErrSegmentNotFound
+				}
 				if err != nil && errors.Is(err, playback.ErrSegmentNotFound) {
 					slog.InfoContext(r.Context(), "transcode segment wait timeout", "component", "api",
 						"segment", segmentName,

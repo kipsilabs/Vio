@@ -3020,7 +3020,19 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 					"session", sessionID,
 					"playback_session_id", sessionID,
 				)
-				segmentLease, err = session.WaitForOpenSegment(name, decision.WaitTimeout)
+				if decision.Reason == "near_produced_head" {
+					segmentLease, err = session.WaitForOpenSegmentWithStall(name, decision.WaitTimeout, playback.SegmentStallTimeout)
+				} else {
+					segmentLease, err = session.WaitForOpenSegment(name, decision.WaitTimeout)
+				}
+				if errors.Is(err, playback.ErrSegmentStalled) {
+					slog.WarnContext(r.Context(), "transcode segment production stalled", "component", "transcodenode",
+						"segment", name, "requested_segment", segNum,
+						"produced_head", decision.Progress.ProducedHead,
+						"session", sessionID, "playback_session_id", sessionID)
+					decision.RestartOnTimeout = true
+					err = playback.ErrSegmentNotFound
+				}
 				if errors.Is(err, playback.ErrSegmentNotFound) {
 					slog.InfoContext(r.Context(), "transcode segment wait timeout", "component", "transcodenode",
 						"segment", name,
