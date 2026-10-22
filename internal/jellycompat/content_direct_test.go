@@ -2,6 +2,7 @@ package jellycompat
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"slices"
@@ -851,4 +852,136 @@ func TestSeasonUserDataFromCountsMatchesEpisodeRollup(t *testing.T) {
 
 func (s *progressCountingStore) LatestHistoryIDs(context.Context, string, map[string][]string) (map[string]string, error) {
 	return nil, nil
+}
+
+// syntheticSeasonRowSource reports every season id as absent, as the seasons
+// repository does for a season derived from episode groups.
+type syntheticSeasonRowSource struct{}
+
+func (syntheticSeasonRowSource) ListBySeries(context.Context, string) ([]*models.Season, error) {
+	return nil, nil
+}
+
+func (syntheticSeasonRowSource) GetBySeriesAndNumber(context.Context, string, int) (*models.Season, error) {
+	panic("unused")
+}
+
+func (syntheticSeasonRowSource) GetByID(context.Context, string) (*models.Season, error) {
+	return nil, catalog.ErrSeasonNotFound
+}
+
+// coordinateEpisodeSource keys episodes by the (series, season number) pair the
+// listing uses and records each lookup.
+type coordinateEpisodeSource struct {
+	byKey map[string][]*models.Episode
+	calls []string
+}
+
+func (c *coordinateEpisodeSource) ListBySeason(_ context.Context, seriesID string, seasonNum int) ([]*models.Episode, error) {
+	key := episodeBySeasonKey(seriesID, seasonNum)
+	c.calls = append(c.calls, key)
+	return c.byKey[key], nil
+}
+
+func (c *coordinateEpisodeSource) ListBySeriesGroupedBySeason(context.Context, string) (map[int][]*models.Episode, error) {
+	panic("unused")
+}
+
+func (c *coordinateEpisodeSource) ListBySeriesIDs(context.Context, []string) (map[string][]*models.Episode, error) {
+	panic("unused")
+}
+
+func (c *coordinateEpisodeSource) GetByIDs(context.Context, []string) ([]*models.Episode, error) {
+	panic("unused")
+}
+
+// A synthetic season has no seasons row. Its id carries the durable (series,
+// season number) coordinates the episode listing is keyed by, so the season-id
+// form must resolve through them instead of returning not-found.
+func TestListEpisodesBySeasonIDResolvesSyntheticSeasonCoordinates(t *testing.T) {
+	episodes := &coordinateEpisodeSource{byKey: map[string][]*models.Episode{
+		episodeBySeasonKey("series-1", 2): {
+			{ContentID: "ep-1", SeriesID: "series-1", SeasonNumber: 2, EpisodeNumber: 1},
+		},
+	}}
+	svc := &directContentService{
+		itemRepo:    stubItemAccessSource{},
+		seasonRepo:  syntheticSeasonRowSource{},
+		episodeRepo: episodes,
+	}
+
+	result, err := svc.ListEpisodesBySeasonID(t.Context(), &Session{StreamAppUserID: 1, ProfileID: "profile-1"}, "series-1-S02", nil)
+	if err != nil {
+		t.Fatalf("ListEpisodesBySeasonID: %v", err)
+	}
+	if len(result) != 1 || result[0].ContentID != "ep-1" {
+		t.Fatalf("episodes = %+v, want ep-1", result)
+	}
+	if want := []string{episodeBySeasonKey("series-1", 2)}; !slices.Equal(episodes.calls, want) {
+		t.Fatalf("episode lookups = %v, want %v", episodes.calls, want)
+	}
+}
+
+// Without a seasons row and without the synthetic (series, season number) id
+// shape, the listing keeps the catalog's not-found instead of guessing one.
+func TestListEpisodesBySeasonIDUnknownSeasonStaysNotFound(t *testing.T) {
+	episodes := &coordinateEpisodeSource{}
+	svc := &directContentService{
+		itemRepo:    stubItemAccessSource{},
+		seasonRepo:  syntheticSeasonRowSource{},
+		episodeRepo: episodes,
+	}
+
+	_, err := svc.ListEpisodesBySeasonID(t.Context(), &Session{StreamAppUserID: 1, ProfileID: "profile-1"}, "season-without-row", nil)
+	var httpErr *HTTPError
+	if !errors.As(err, &httpErr) || httpErr.StatusCode != 404 {
+		t.Fatalf("err = %v, want a 404 HTTPError", err)
+	}
+	if len(episodes.calls) != 0 {
+		t.Fatalf("episode lookups = %v, want none without coordinates", episodes.calls)
+	}
+}
+
+// storedSeasonRowSource answers a season id with its stored row.
+type storedSeasonRowSource struct{ season *models.Season }
+
+func (storedSeasonRowSource) ListBySeries(context.Context, string) ([]*models.Season, error) {
+	return nil, nil
+}
+
+func (storedSeasonRowSource) GetBySeriesAndNumber(context.Context, string, int) (*models.Season, error) {
+	panic("unused")
+}
+
+func (s storedSeasonRowSource) GetByID(_ context.Context, contentID string) (*models.Season, error) {
+	if s.season != nil && s.season.ContentID == contentID {
+		return s.season, nil
+	}
+	return nil, catalog.ErrSeasonNotFound
+}
+
+// A stored season keeps listing by its row's coordinates, whatever its id
+// shape looks like.
+func TestListEpisodesBySeasonIDUsesStoredSeasonRow(t *testing.T) {
+	episodes := &coordinateEpisodeSource{byKey: map[string][]*models.Episode{
+		episodeBySeasonKey("series-9", 4): {
+			{ContentID: "ep-9", SeriesID: "series-9", SeasonNumber: 4, EpisodeNumber: 1},
+		},
+	}}
+	svc := &directContentService{
+		itemRepo:    stubItemAccessSource{},
+		seasonRepo:  storedSeasonRowSource{season: &models.Season{ContentID: "series-9-S04", SeriesID: "series-9", SeasonNumber: 4}},
+		episodeRepo: episodes,
+	}
+
+	result, err := svc.ListEpisodesBySeasonID(t.Context(), &Session{StreamAppUserID: 1, ProfileID: "profile-1"}, "series-9-S04", nil)
+	if err != nil {
+		t.Fatalf("ListEpisodesBySeasonID: %v", err)
+	}
+	if len(result) != 1 || result[0].ContentID != "ep-9" {
+		t.Fatalf("episodes = %+v, want ep-9", result)
+	}
+	if want := []string{episodeBySeasonKey("series-9", 4)}; !slices.Equal(episodes.calls, want) {
+		t.Fatalf("episode lookups = %v, want %v", episodes.calls, want)
+	}
 }
