@@ -19,8 +19,23 @@ type virtualDownloadMetadataResolver interface {
 	ResolveVirtualDownloadMetadata(context.Context, *models.MediaFile) (*models.MediaFile, error)
 }
 
-func (s *Service) resolveDownloadMetadata(ctx context.Context, file *models.MediaFile, caps playback.ClientCapabilities) (*models.MediaFile, error) {
-	if !isVirtualMediaFile(file) || !hasCapabilities(caps) || (file.Container != "" && !strings.EqualFold(file.Container, "virtual")) {
+// Media-container names as the catalog stores them. A virtual download's
+// filename extension comes from the persisted probe result, never from the
+// provider URL.
+const (
+	containerMatroska = "matroska"
+	containerMP4      = "mp4"
+	containerMKV      = "mkv"
+	containerAAC      = "aac"
+)
+
+// resolveDownloadMetadata returns file with the container, tracks, and size a
+// virtual probe measured. It probes whenever the row's container is still
+// unknown; device capabilities play no part, because every download route needs
+// the resolved container for its filename and format decision, and the create
+// body sends none. Non-virtual and already-probed rows pass through unchanged.
+func (s *Service) resolveDownloadMetadata(ctx context.Context, file *models.MediaFile) (*models.MediaFile, error) {
+	if !isVirtualMediaFile(file) || (file.Container != "" && !strings.EqualFold(file.Container, "virtual")) {
 		return file, nil
 	}
 	resolver, ok := s.virtualInput.(virtualDownloadMetadataResolver)
@@ -34,8 +49,19 @@ func (s *Service) resolveDownloadMetadata(ctx context.Context, file *models.Medi
 	return resolved, nil
 }
 
+// virtualDownloadClient opens only the loopback relay registration the service
+// resolved from trusted server wiring (see isLoopbackPrepareInput): proxies are
+// disabled and redirects are refused, so a relay response cannot steer it to
+// another host.
 var virtualDownloadClient = func() *http.Client {
-	transport := http.DefaultTransport.(*http.Transport).Clone()
+	// A replaced http.DefaultTransport has no *http.Transport to clone, so
+	// configure a fresh one instead of panicking at init.
+	var transport *http.Transport
+	if base, ok := http.DefaultTransport.(*http.Transport); ok {
+		transport = base.Clone()
+	} else {
+		transport = &http.Transport{}
+	}
 	transport.Proxy = nil
 	transport.DisableCompression = true
 	transport.ResponseHeaderTimeout = 30 * time.Second
@@ -80,15 +106,21 @@ func (s *Service) virtualOriginalSize(ctx context.Context, file *models.MediaFil
 	if response.StatusCode != http.StatusOK {
 		return 0, fmt.Errorf("virtual download relay returned %d", response.StatusCode)
 	}
+	// A playlist has no single-file length, so a size probe would report a
+	// manifest's length as the download's. Refuse it the way delivery does.
+	contentType := strings.ToLower(response.Header.Get("Content-Type"))
+	if strings.Contains(contentType, "mpegurl") || strings.Contains(contentType, "dash+xml") {
+		return 0, ErrFormatUnavailable
+	}
 	return max(0, response.ContentLength), nil
 }
 
 func virtualDownloadFilename(file *models.MediaFile) string {
 	extension := strings.ToLower(strings.TrimSpace(file.Container))
 	switch extension {
-	case "matroska":
-		extension = "mkv"
-	case "mp4", "mkv", "webm", "mov", "avi", "m4v", "ts", "mpeg", "mp3", "m4a", "flac", "ogg", "opus", "wav", "aac":
+	case containerMatroska:
+		extension = containerMKV
+	case containerMP4, containerMKV, "webm", "mov", "avi", "m4v", "ts", "mpeg", "mp3", "m4a", "flac", "ogg", "opus", "wav", containerAAC:
 	default:
 		extension = "bin"
 	}
@@ -119,7 +151,7 @@ func (s *Service) serveVirtualOriginal(ctx context.Context, w http.ResponseWrite
 		}
 	}
 	request.Header.Set("Accept-Encoding", "identity")
-	response, err := virtualDownloadClient.Do(request)
+	response, err := virtualDownloadClient.Do(request) //nolint:gosec // loopback relay URL from trusted wiring; proxies disabled and redirects refused
 	if err != nil {
 		return errors.New("virtual download relay is unavailable")
 	}

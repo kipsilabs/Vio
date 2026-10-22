@@ -441,7 +441,7 @@ func (s *Service) Create(ctx context.Context, userID int, req CreateRequest, fil
 		return nil, err
 	}
 
-	file, err = s.resolveDownloadMetadata(ctx, file, req.Caps)
+	file, err = s.resolveDownloadMetadata(ctx, file)
 	if err != nil {
 		return nil, err
 	}
@@ -1569,6 +1569,13 @@ func (s *Service) resolveDownloadBytesTarget(ctx context.Context, dl *Download, 
 	if isVirtualMediaFile(file) {
 		if s.virtualInput == nil {
 			return nil, ErrFormatUnavailable
+		}
+		// A row registered before probing committed has no container yet, so the
+		// delivery filename would fall back to .bin. Probe here, best effort: the
+		// download is servable either way and a metadata failure must not turn it
+		// into an error.
+		if probed, probeErr := s.resolveDownloadMetadata(ctx, file); probeErr == nil && probed != nil {
+			file = probed
 		}
 		target.virtualFile = file
 		target.ProxyEligible = false

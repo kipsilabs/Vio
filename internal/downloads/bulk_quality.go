@@ -43,7 +43,7 @@ func (s *Service) resolveItemDecisions(
 	decisions := make([]QualityDecision, 0, len(items))
 	var skipped []SkippedDownload
 	for _, it := range items {
-		file, err := s.resolveDownloadMetadata(ctx, it.file, caps)
+		file, err := s.resolveDownloadMetadata(ctx, it.file)
 		var decision QualityDecision
 		if err == nil {
 			it.file = file

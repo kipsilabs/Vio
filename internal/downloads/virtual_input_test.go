@@ -120,6 +120,49 @@ func TestVirtualOriginalAccessDeniedBeforeResolve(t *testing.T) {
 	}
 }
 
+// A row registered before a probe committed carries no container, so the
+// delivery filename would fall back to .bin. Resolving the bytes target probes
+// it best effort and serves the bytes under the container the probe persisted.
+func TestVirtualOriginalLegacyRowProbesForFilename(t *testing.T) {
+	file := &models.MediaFile{ID: 7, FilePath: "virtual://movie/tt1?result=a"}
+	probed := *file
+	probed.Container = containerMKV
+	resolver := &stubVirtualMetadataResolver{file: &probed}
+	service := &Service{fileRepo: fakeFileResolver{file: file}, virtualInput: resolver}
+
+	target, err := service.resolveDownloadBytesTarget(context.Background(), &Download{MediaFileID: file.ID, Format: FormatOriginal}, catalog.AccessFilter{}, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target.virtualFile != &probed || resolver.metadataCalls != 1 {
+		t.Fatalf("target file = %+v, probes = %d, want the probed row", target.virtualFile, resolver.metadataCalls)
+	}
+	if target.ProxyEligible {
+		t.Fatal("virtual original must stay on the API host")
+	}
+	if filename := virtualDownloadFilename(target.virtualFile); filename != "download-7.mkv" {
+		t.Fatalf("filename = %q, want the probed container", filename)
+	}
+}
+
+// A failed probe must not fail a download whose bytes are still servable: the
+// row keeps serving and only the filename falls back to .bin.
+func TestVirtualOriginalLegacyRowProbeFailureKeepsServing(t *testing.T) {
+	file := &models.MediaFile{ID: 7, FilePath: "virtual://movie/tt1?result=a"}
+	service := &Service{fileRepo: fakeFileResolver{file: file}, virtualInput: &stubVirtualMetadataResolver{err: errors.New("provider unavailable")}}
+
+	target, err := service.resolveDownloadBytesTarget(context.Background(), &Download{MediaFileID: file.ID, Format: FormatOriginal}, catalog.AccessFilter{}, false, false)
+	if err != nil {
+		t.Fatalf("bytes target error = %v, want the row still servable", err)
+	}
+	if target.virtualFile != file {
+		t.Fatalf("target file = %+v, want the original row", target.virtualFile)
+	}
+	if filename := virtualDownloadFilename(target.virtualFile); filename != "download-7.bin" {
+		t.Fatalf("filename = %q, want the .bin fallback", filename)
+	}
+}
+
 func TestVirtualOriginalSize(t *testing.T) {
 	for _, testCase := range []struct {
 		name      string
@@ -160,6 +203,91 @@ func TestVirtualOriginalSize(t *testing.T) {
 			}
 			if file.FileSize != 536870000 {
 				t.Fatal("size lookup must not mutate catalog metadata")
+			}
+		})
+	}
+}
+
+func TestVirtualOriginalSizeRejectsPlaylistContentTypes(t *testing.T) {
+	for _, contentType := range []string{"application/vnd.apple.mpegurl", "application/dash+xml"} {
+		t.Run(contentType, func(t *testing.T) {
+			origin := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+				response.Header().Set("Content-Type", contentType)
+				response.Header().Set("Content-Length", "512")
+				response.WriteHeader(http.StatusOK)
+			}))
+			defer origin.Close()
+			cleanups := 0
+			service := &Service{virtualInput: &stubVirtualResolver{inputPath: origin.URL, cleanup: func() { cleanups++ }}}
+			size, err := service.virtualOriginalSize(context.Background(), &models.MediaFile{ID: 7, FilePath: "virtual://movie/tt1?result=a"})
+			if !errors.Is(err, ErrFormatUnavailable) || size != 0 || cleanups != 1 {
+				t.Fatalf("size = %d, error = %v, cleanups = %d, want a playlist refusal", size, err, cleanups)
+			}
+		})
+	}
+}
+
+func TestVirtualOriginalSizeRefusesRedirect(t *testing.T) {
+	followed := false
+	target := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		followed = true
+		response.Header().Set("Content-Length", "12")
+		response.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+	origin := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		http.Redirect(response, request, target.URL, http.StatusFound)
+	}))
+	defer origin.Close()
+
+	service := &Service{virtualInput: &stubVirtualResolver{inputPath: origin.URL}}
+	if _, err := service.virtualOriginalSize(context.Background(), &models.MediaFile{ID: 7}); err == nil {
+		t.Fatal("redirected size probe error = nil, want the 302 reported as a failure")
+	}
+	if followed {
+		t.Fatal("size probe followed a redirect")
+	}
+}
+
+func TestVirtualOriginalSizeHonorsContextDeadline(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		<-request.Context().Done()
+	}))
+	defer origin.Close()
+
+	service := &Service{virtualInput: &stubVirtualResolver{inputPath: origin.URL}}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	if _, err := service.virtualOriginalSize(ctx, &models.MediaFile{ID: 7}); err == nil {
+		t.Fatal("timed-out size probe error = nil")
+	}
+	if elapsed := time.Since(started); elapsed > 10*time.Second {
+		t.Fatalf("size probe ignored its context deadline after %s", elapsed)
+	}
+}
+
+func TestVirtualOriginalSizeReleasesSourceOnEveryPath(t *testing.T) {
+	for _, testCase := range []struct {
+		name       string
+		resolveErr error
+		input      string
+	}{
+		{name: "resolve failure", resolveErr: errors.New("provider unavailable")},
+		{name: "non-relay input", input: "https://provider.invalid/source?token=private"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			cleanups := 0
+			service := &Service{virtualInput: &stubVirtualResolver{
+				inputPath: testCase.input,
+				err:       testCase.resolveErr,
+				cleanup:   func() { cleanups++ },
+			}}
+			if _, err := service.virtualOriginalSize(context.Background(), &models.MediaFile{ID: 7}); err == nil {
+				t.Fatal("size probe error = nil, want a refusal")
+			}
+			if cleanups != 1 {
+				t.Fatalf("cleanup calls = %d, want 1", cleanups)
 			}
 		})
 	}
@@ -208,6 +336,33 @@ func TestVirtualOriginalRejectsGenericMIMEPlaylist(t *testing.T) {
 	}
 }
 
+// A playlist is a manifest, not a downloadable original. Delivery and size
+// lookup both refuse the provider content types, for GET and HEAD, before any
+// response header or byte reaches the client.
+func TestVirtualOriginalRejectsPlaylistContentTypes(t *testing.T) {
+	for _, contentType := range []string{"application/vnd.apple.mpegurl", "application/dash+xml"} {
+		for _, method := range []string{http.MethodGet, http.MethodHead} {
+			t.Run(method+" "+contentType, func(t *testing.T) {
+				origin := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+					response.Header().Set("Content-Type", contentType)
+					response.Header().Set("Content-Length", "512")
+					if request.Method != http.MethodHead {
+						_, _ = response.Write([]byte("#EXTM3U\n#EXT-X-ENDLIST\n"))
+					}
+				}))
+				defer origin.Close()
+				request := httptest.NewRequest(method, "/downloads/test/file", nil)
+				response := httptest.NewRecorder()
+				service := &Service{virtualInput: &stubVirtualResolver{inputPath: origin.URL}}
+				err := service.serveVirtualOriginal(request.Context(), response, request, &models.MediaFile{ID: 7, Container: containerMP4}, 1)
+				if !errors.Is(err, ErrFormatUnavailable) || response.Body.Len() != 0 || response.Header().Get("Content-Disposition") != "" {
+					t.Fatalf("playlist delivery = %v, headers = %v, body = %q", err, response.Header(), response.Body.String())
+				}
+			})
+		}
+	}
+}
+
 func TestVirtualOriginalMultipartRanges(t *testing.T) {
 	origin := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		response.Header().Set("Content-Type", "video/mp4")
@@ -250,32 +405,99 @@ func TestVirtualOriginalMultipartRanges(t *testing.T) {
 type stubVirtualMetadataResolver struct {
 	stubVirtualResolver
 	file          *models.MediaFile
+	err           error
 	metadataCalls int
 }
 
 func (resolver *stubVirtualMetadataResolver) ResolveVirtualDownloadMetadata(context.Context, *models.MediaFile) (*models.MediaFile, error) {
 	resolver.metadataCalls++
+	if resolver.err != nil {
+		return nil, resolver.err
+	}
 	return resolver.file, nil
 }
 
+// A virtual row whose container is still unknown is probed even though the
+// request carries no device capabilities: the create body sends none, and both
+// the download filename and the format decision need the resolved container.
 func TestVirtualOriginalMetadataResolution(t *testing.T) {
+	probedFile := func(file *models.MediaFile) *models.MediaFile {
+		resolved := *file
+		resolved.Container = containerMP4
+		return &resolved
+	}
+
+	for _, testCase := range []struct {
+		name   string
+		file   *models.MediaFile
+		probed bool
+	}{
+		{name: "placeholder container", file: &models.MediaFile{ID: 7, Container: "virtual", FilePath: "virtual://movie/tt1?result=a"}, probed: true},
+		{name: "empty container", file: &models.MediaFile{ID: 8, FilePath: "virtual://movie/tt2?result=b"}, probed: true},
+		{name: "known container", file: &models.MediaFile{ID: 9, Container: containerMKV, FilePath: "virtual://movie/tt3?result=c"}},
+		{name: "local file", file: &models.MediaFile{ID: 10, Container: containerMKV, FilePath: "/media/movie.mkv"}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			resolver := &stubVirtualMetadataResolver{file: probedFile(testCase.file)}
+			service := &Service{virtualInput: resolver}
+
+			got, err := service.resolveDownloadMetadata(context.Background(), testCase.file)
+			if err != nil {
+				t.Fatalf("metadata resolution error = %v", err)
+			}
+			if testCase.probed {
+				if got != resolver.file || resolver.metadataCalls != 1 {
+					t.Fatalf("metadata resolution = %+v, calls = %d, want the probed file once", got, resolver.metadataCalls)
+				}
+				return
+			}
+			if got != testCase.file || resolver.metadataCalls != 0 {
+				t.Fatalf("metadata resolution = %+v, calls = %d, want the row unchanged and no probe", got, resolver.metadataCalls)
+			}
+		})
+	}
+}
+
+func TestVirtualOriginalMetadataResolutionWithoutMetadataSupport(t *testing.T) {
 	file := &models.MediaFile{ID: 7, Container: "virtual", FilePath: "virtual://movie/tt1?result=a"}
-	probed := *file
-	probed.Container = "mp4"
-	resolver := &stubVirtualMetadataResolver{file: &probed}
+	resolver := &stubVirtualResolver{}
 	service := &Service{virtualInput: resolver}
-	caps := playback.ClientCapabilities{Containers: []string{"mp4"}}
-	got, err := service.resolveDownloadMetadata(context.Background(), file, caps)
-	if err != nil || got != &probed || resolver.metadataCalls != 1 {
-		t.Fatalf("metadata resolution = %v, calls = %d", err, resolver.metadataCalls)
+
+	got, err := service.resolveDownloadMetadata(context.Background(), file)
+	if err != nil || got != file {
+		t.Fatalf("metadata resolution = %+v, error = %v, want the row unchanged", got, err)
 	}
-	got, err = service.resolveDownloadMetadata(context.Background(), &probed, caps)
-	if err != nil || got != &probed || resolver.metadataCalls != 1 {
-		t.Fatal("known container should not be probed again")
+	if resolver.calls != 0 {
+		t.Fatalf("input resolver calls = %d, want 0", resolver.calls)
 	}
-	probed.FilePath = "virtual://movie/tt1?result=other"
-	if _, err := service.resolveDownloadMetadata(context.Background(), file, caps); !errors.Is(err, ErrQualityUnavailable) {
-		t.Fatal("metadata for a different source must be refused")
+}
+
+func TestVirtualOriginalMetadataResolutionFailureRefuses(t *testing.T) {
+	file := &models.MediaFile{ID: 7, Container: "virtual", FilePath: "virtual://movie/tt1?result=a"}
+	otherFile := *file
+	otherFile.ID = 8
+	otherSource := *file
+	otherSource.FilePath = "virtual://movie/tt1?result=other"
+
+	for _, testCase := range []struct {
+		name     string
+		resolver *stubVirtualMetadataResolver
+	}{
+		{name: "probe error", resolver: &stubVirtualMetadataResolver{err: errors.New("provider unavailable")}},
+		{name: "no metadata", resolver: &stubVirtualMetadataResolver{}},
+		{name: "different file", resolver: &stubVirtualMetadataResolver{file: &otherFile}},
+		{name: "different source", resolver: &stubVirtualMetadataResolver{file: &otherSource}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			service := &Service{virtualInput: testCase.resolver}
+			got, err := service.resolveDownloadMetadata(context.Background(), file)
+			if !errors.Is(err, ErrQualityUnavailable) || got != nil {
+				t.Fatalf("metadata resolution = %+v, error = %v, want ErrQualityUnavailable", got, err)
+			}
+			if testCase.resolver.metadataCalls != 1 {
+				t.Fatalf("metadata probes = %d, want 1", testCase.resolver.metadataCalls)
+			}
+		})
 	}
 }
 

@@ -53,11 +53,30 @@ export function downloadPreparationErrorMessage(error: unknown): string {
   return "Download could not be prepared. Check your connection and try again.";
 }
 
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "AbortError";
+}
+
+/**
+ * Whether a HEAD refusal is transient. A throttled, timed-out, or failed
+ * request may succeed on the next tick; an expired or forbidden row will not.
+ */
+function preparedFileFailureIsRetryable(status: number): boolean {
+  return status === 408 || status === 425 || status === 429 || status >= 500;
+}
+
 /** A preparation the picker must report, with a concrete reason. */
 export class DownloadPreparationError extends Error {
-  constructor(message: string) {
+  /** HTTP status when the refusal came from a response. */
+  readonly status?: number;
+  /** Whether retrying the same request can plausibly succeed later. */
+  readonly retryable?: boolean;
+
+  constructor(message: string, options?: { status?: number; retryable?: boolean }) {
     super(message);
     this.name = "DownloadPreparationError";
+    this.status = options?.status;
+    this.retryable = options?.retryable;
   }
 }
 
@@ -244,15 +263,27 @@ export async function getPreparedDownloadFile(
     "X-Profile-Id": snapshot.profileId,
   };
   if (snapshot.profileToken) headers["X-Profile-Token"] = snapshot.profileToken;
-  const { res } = await fetchWithSession(
-    `/api/v2/downloads/${encodeURIComponent(downloadId)}/file`,
-    { method: "HEAD", headers, signal, cache: "no-store" },
-    snapshot,
-    false,
-  );
+  let res: Response;
+  try {
+    ({ res } = await fetchWithSession(
+      `/api/v2/downloads/${encodeURIComponent(downloadId)}/file`,
+      { method: "HEAD", headers, signal, cache: "no-store" },
+      snapshot,
+      false,
+    ));
+  } catch (error) {
+    // Cancellation and a superseded profile context are the caller's to
+    // handle. Any other transport failure is retryable: the row itself may
+    // still be ready and the next probe may reach the server.
+    if (isAbortError(error) || error instanceof StaleApiRequestContextError) throw error;
+    throw new DownloadPreparationError(preparedFileRefusalMessage(503), { retryable: true });
+  }
   requireCurrent(snapshot);
   if (!res.ok) {
-    throw new DownloadPreparationError(preparedFileRefusalMessage(res.status));
+    throw new DownloadPreparationError(preparedFileRefusalMessage(res.status), {
+      status: res.status,
+      retryable: preparedFileFailureIsRetryable(res.status),
+    });
   }
   const size = Number(res.headers.get("Content-Length"));
   return {

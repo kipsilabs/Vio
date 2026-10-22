@@ -11,6 +11,7 @@ import DownloadVersionPicker from "./DownloadVersionPicker";
 const mocks = vi.hoisted(() => ({
   create: vi.fn(),
   poll: vi.fn(),
+  file: vi.fn(),
   save: vi.fn(),
   remove: vi.fn(),
   toastError: vi.fn(),
@@ -23,6 +24,7 @@ vi.mock("@/api/v2/downloadPreparation", async (importOriginal) => {
     ...actual,
     createPreparedDownload: mocks.create,
     getPreparedDownload: mocks.poll,
+    getPreparedDownloadFile: mocks.file,
     savePreparedDownload: mocks.save,
   };
 });
@@ -53,6 +55,13 @@ const createTarget = { contentId: "mv_1" };
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // The ready state's filename and size come from the authoritative HEAD, not
+  // from the create/poll row. Every test that reaches "ready" needs this mock
+  // so no real session/network code runs in jsdom.
+  mocks.file.mockReset();
+  mocks.file.mockImplementation((id: string) =>
+    Promise.resolve({ id, filename: "Movie.mp4", fileSize: 1024 }),
+  );
 });
 
 async function openVirtualPanel() {
@@ -95,6 +104,7 @@ it("creates a virtual download at original quality and prepares it", async () =>
     expect(screen.getByRole("button", { name: /Save file/i })).toBeInTheDocument(),
   );
   expect(mocks.poll).toHaveBeenCalledWith("dl_1", expect.any(AbortSignal));
+  expect(mocks.file).toHaveBeenCalledWith("dl_1", "Movie.mp4", expect.any(AbortSignal));
 });
 
 it("saves a ready virtual download with the server's authority", async () => {
@@ -147,10 +157,11 @@ it("stays silent and keeps the file ready when the save picker is cancelled", as
 });
 
 it("communicates an over-budget file the browser cannot stream", async () => {
-  mocks.create.mockResolvedValue({
+  mocks.create.mockResolvedValue({ id: "dl_big", status: "ready" });
+  mocks.file.mockResolvedValue({
     id: "dl_big",
-    status: "ready",
-    file_size: BUFFERED_SAVE_LIMIT_BYTES + 1,
+    filename: "Movie.mp4",
+    fileSize: BUFFERED_SAVE_LIMIT_BYTES + 1,
   });
   await openVirtualPanel();
 
@@ -160,6 +171,102 @@ it("communicates an over-budget file the browser cannot stream", async () => {
 
   expect(screen.getByText(/too large to save in this browser/i)).toBeVisible();
   expect(screen.getByRole("button", { name: /Save file/i })).toBeDisabled();
+});
+
+it("stops polling when a ready file is permanently refused", async () => {
+  mocks.create.mockResolvedValue({ id: "dl_gone2", status: "preparing" });
+  mocks.poll.mockResolvedValue({ id: "dl_gone2", status: "ready" });
+  mocks.file.mockRejectedValue(
+    new DownloadPreparationError(
+      "This download is expired or no longer available. Prepare it again.",
+      { status: 404, retryable: false },
+    ),
+  );
+  await openVirtualPanel();
+
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: /Prepare download/i }));
+  });
+
+  await vi.waitFor(() =>
+    expect(mocks.toastError).toHaveBeenCalledWith(
+      "This download is expired or no longer available. Prepare it again.",
+    ),
+  );
+  expect(screen.queryByRole("button", { name: /Save file/i })).toBeNull();
+  expect(screen.queryByText(/Preparing your download/i)).toBeNull();
+  const calls = mocks.file.mock.calls.length;
+  await new Promise((resolve) => window.setTimeout(resolve, 50));
+  expect(mocks.file).toHaveBeenCalledTimes(calls);
+});
+
+it("keeps a successful create and retries a transient HEAD failure", async () => {
+  mocks.create.mockResolvedValue({ id: "dl_retry", status: "ready" });
+  mocks.poll.mockResolvedValue({ id: "dl_retry", status: "ready" });
+  mocks.file
+    .mockRejectedValueOnce(new DownloadPreparationError("busy", { status: 503, retryable: true }))
+    .mockResolvedValue({ id: "dl_retry", filename: "Movie.mp4", fileSize: 1024 });
+  await openVirtualPanel();
+
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: /Prepare download/i }));
+  });
+
+  expect(await screen.findByRole("button", { name: /Save file/i })).toBeInTheDocument();
+  expect(mocks.file).toHaveBeenCalledTimes(2);
+  expect(mocks.toastError).not.toHaveBeenCalled();
+});
+
+it("stops after the transient HEAD retry budget is exhausted", async () => {
+  vi.useFakeTimers();
+  try {
+    mocks.create.mockResolvedValue({ id: "dl_tired", status: "preparing" });
+    mocks.poll.mockResolvedValue({ id: "dl_tired", status: "ready" });
+    mocks.file.mockRejectedValue(
+      new DownloadPreparationError("busy", { status: 503, retryable: true }),
+    );
+    await openVirtualPanel();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Prepare download/i }));
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000 * 30);
+    });
+
+    expect(mocks.toastError).toHaveBeenCalledWith(
+      "The file is ready, but this browser could not verify it. Prepare it again.",
+    );
+    expect(screen.queryByText(/Preparing your download/i)).toBeNull();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("drops a HEAD result that arrives after the user cancels", async () => {
+  let resolveFile!: (value: { id: string; filename: string; fileSize: number }) => void;
+  mocks.create.mockResolvedValue({ id: "dl_stale", status: "preparing" });
+  mocks.poll.mockResolvedValue({ id: "dl_stale", status: "ready" });
+  mocks.file.mockReturnValue(
+    new Promise((resolve) => {
+      resolveFile = resolve;
+    }),
+  );
+  await openVirtualPanel();
+
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: /Prepare download/i }));
+  });
+  await vi.waitFor(() => expect(mocks.file).toHaveBeenCalled());
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: /^Cancel$/i }));
+  });
+  await act(async () => {
+    resolveFile({ id: "dl_stale", filename: "Movie.mp4", fileSize: 1024 });
+  });
+
+  expect(screen.queryByRole("button", { name: /Save file/i })).toBeNull();
+  expect(mocks.toastError).not.toHaveBeenCalled();
 });
 
 it("cancels a preparing virtual download through delete", async () => {
