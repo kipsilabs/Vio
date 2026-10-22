@@ -445,8 +445,12 @@ func TestSeriesSeasonsKeepsMetadataOnlySeasons(t *testing.T) {
 	if marked.SeasonUserData == nil || marked.SeasonUserData.WatchedCount != 4 || !marked.SeasonUserData.Played {
 		t.Fatalf("partly linked season watched state = %+v, want all 4 episodes watched", marked.SeasonUserData)
 	}
-	if _, err := items.SetWatchedState(authCtx, userID, profileID, seasonID(2), false, authFilter); err != nil {
+	unwatchView, err := items.SetWatchedState(authCtx, userID, profileID, seasonID(2), false, authFilter)
+	if err != nil {
 		t.Fatalf("mark partly linked season unwatched: %v", err)
+	}
+	if unwatchView.AffectedCount != 4 {
+		t.Fatalf("partly linked season unwatch affected_count = %d, want 4 distinct episodes", unwatchView.AffectedCount)
 	}
 	unmarked, err := h.ItemDetail(authCtx, authViewer, seasonID(2))
 	if err != nil {

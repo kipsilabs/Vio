@@ -112,13 +112,30 @@ func (h *ItemsHandler) SetWatchedState(ctx context.Context, userID int, profileI
 		return WatchedStateView{}, apiError(http.StatusInternalServerError, "internal_error", "Failed to update watched state")
 	}
 	if !played && h.watchState != nil && (targetType == watchstate.ParentSeries || targetType == watchstate.ParentSeason) {
-		ids, err := h.watchState.ParentUnwatchTargets(ctx, userID, profileID, h.episodeRepo, targetType, contentID)
+		var ids []string
+		if targetType == watchstate.ParentSeason {
+			// Expand by the season's durable identity, not its mutable row:
+			// synthetic seasons have no row and partly linked/unlinked seasons
+			// can carry watched file-less episodes outside the season_id group.
+			seasonTarget, lookupErr := h.lookupWatchedTarget(ctx, contentID, filter)
+			if lookupErr != nil || seasonTarget.Season == nil {
+				return WatchedStateView{}, apiError(http.StatusInternalServerError, "internal_error", "Failed to update watched state")
+			}
+			ids, err = h.watchState.ParentUnwatchTargetsForSeason(ctx, userID, profileID, h.episodeRepo, seasonTarget.Season.SeriesID, seasonTarget.Season.SeasonNumber)
+		} else {
+			ids, err = h.watchState.ParentUnwatchTargets(ctx, userID, profileID, h.episodeRepo, targetType, contentID)
+		}
 		if err != nil {
 			return WatchedStateView{}, apiError(http.StatusInternalServerError, "internal_error", "Failed to update watched state")
 		}
 		for _, id := range ids {
 			targets = append(targets, watchedLeafTarget{ContentID: id})
 		}
+		// A partly linked season can return the same available episode from
+		// both the resolved leaf set and the parent expansion. PostgreSQL
+		// de-duplicates history deletes, but AffectedCount must count distinct
+		// episodes too.
+		targets = dedupeWatchedLeafTargets(targets)
 	}
 
 	switch {

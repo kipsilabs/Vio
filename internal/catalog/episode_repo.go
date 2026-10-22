@@ -879,6 +879,34 @@ func (r *EpisodeRepository) PartitionIDsBySeason(ctx context.Context, seasonID s
 	return r.partitionIDs(ctx, "season_id", seasonID)
 }
 
+// PartitionIDsBySeriesSeason partitions one season by its durable
+// (series_id, season_number) identity. Synthetic seasons have no season row,
+// and partly linked seasons can carry episodes outside the row's season_id
+// group; unwatch must still reach both the available episodes and watched
+// file-less ones.
+func (r *EpisodeRepository) PartitionIDsBySeriesSeason(ctx context.Context, seriesID string, seasonNumber int) (withFile, fileless []string, err error) {
+	rows, err := r.pool.Query(ctx, fmt.Sprintf(`SELECT content_id, %s FROM episodes
+		WHERE series_id = $1 AND season_number = $2
+		ORDER BY episode_number ASC`, episodeAvailabilityPredicate), seriesID, seasonNumber)
+	if err != nil {
+		return nil, nil, fmt.Errorf("partitioning episode ids by series and season: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var contentID string
+		var available bool
+		if err := rows.Scan(&contentID, &available); err != nil {
+			return nil, nil, fmt.Errorf("scanning episode ids by series and season: %w", err)
+		}
+		if available {
+			withFile = append(withFile, contentID)
+		} else {
+			fileless = append(fileless, contentID)
+		}
+	}
+	return withFile, fileless, rows.Err()
+}
+
 func (r *EpisodeRepository) partitionIDs(ctx context.Context, parentColumn, parentID string) (withFile, fileless []string, err error) {
 	// parentColumn comes only from the two fixed-column wrappers above.
 	rows, err := r.pool.Query(ctx, fmt.Sprintf(`SELECT content_id, %s FROM episodes

@@ -2665,6 +2665,33 @@ type watchedLeafTarget struct {
 	DurationSeconds float64
 }
 
+// dedupeWatchedLeafTargets removes duplicate episode targets while retaining
+// the first duration-bearing copy. A partly linked season resolves available
+// episodes explicitly and then expands the parent by season number, so the
+// same episode can appear twice; the mutation is idempotent but the response's
+// AffectedCount is not.
+func dedupeWatchedLeafTargets(targets []watchedLeafTarget) []watchedLeafTarget {
+	if len(targets) < 2 {
+		return targets
+	}
+	indexByID := make(map[string]int, len(targets))
+	deduped := make([]watchedLeafTarget, 0, len(targets))
+	for _, target := range targets {
+		if target.ContentID == "" {
+			continue
+		}
+		if index, ok := indexByID[target.ContentID]; ok {
+			if deduped[index].DurationSeconds == 0 && target.DurationSeconds > 0 {
+				deduped[index].DurationSeconds = target.DurationSeconds
+			}
+			continue
+		}
+		indexByID[target.ContentID] = len(deduped)
+		deduped = append(deduped, target)
+	}
+	return deduped
+}
+
 // watchedTarget is a watched-state target that exists and that the viewer
 // may see, before a season or series is expanded into its episodes.
 type watchedTarget struct {
