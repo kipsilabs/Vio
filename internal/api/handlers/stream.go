@@ -3847,9 +3847,11 @@ func (h *StreamHandler) virtualSubtitleWarmAllowed(session *playback.Session) bo
 	}
 	live := session
 	if h.sessionMgr != nil {
-		if current, err := h.sessionMgr.GetSession(session.ID); err == nil && current != nil {
-			live = current
+		current, err := h.sessionMgr.GetSession(session.ID)
+		if err != nil || current == nil {
+			return false
 		}
+		live = current
 	}
 	return live.IsPaused
 }
@@ -3903,7 +3905,26 @@ func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(file *models.MediaFil
 			// request context: a resolver that hangs is canceled when the warm
 			// budget is exhausted, releasing the warm slot and fill instead of
 			// holding them forever.
-			resolveCtx, cancel := context.WithTimeout(extractCtx, virtualSubtitleWarmResolveTimeout)
+			warmCtx, cancelWarm := context.WithCancel(extractCtx)
+			defer cancelWarm()
+			if h.sessionMgr != nil {
+				go func() {
+					ticker := time.NewTicker(time.Second)
+					defer ticker.Stop()
+					for {
+						select {
+						case <-warmCtx.Done():
+							return
+						case <-ticker.C:
+							if !h.virtualSubtitleWarmAllowed(session) {
+								cancelWarm()
+								return
+							}
+						}
+					}
+				}()
+			}
+			resolveCtx, cancel := context.WithTimeout(warmCtx, virtualSubtitleWarmResolveTimeout)
 			defer cancel()
 			resolved, resolvedCleanup, err := h.resolveVirtualInputURI(resolveCtx, file, session.UserID, session.ProfileID, false)
 			if err != nil {
@@ -3912,7 +3933,7 @@ func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(file *models.MediaFil
 			}
 			cleanup = resolvedCleanup
 			extractOpts.InputPath = resolved.URL
-			return playback.StreamExtractSubtitle(extractCtx, extractOpts)
+			return playback.StreamExtractSubtitle(warmCtx, extractOpts)
 		}
 		<-h.SubtitleCache.WarmTrackInBackground(opts, extract, requestID)
 	}()
