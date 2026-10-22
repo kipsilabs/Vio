@@ -904,14 +904,14 @@ func TestSegmentRecoveryDecisionWaitsForFreshNextSegment(t *testing.T) {
 	if !decision.Wait {
 		t.Fatalf("Wait = false, want true (reason=%s)", decision.Reason)
 	}
-	if decision.WaitTimeout != 12*time.Second {
-		t.Fatalf("WaitTimeout = %s, want 12s", decision.WaitTimeout)
+	if decision.WaitTimeout != 4*time.Second {
+		t.Fatalf("WaitTimeout = %s, want 4s", decision.WaitTimeout)
 	}
 	if decision.Reason != "near_produced_head" {
 		t.Fatalf("Reason = %q, want near_produced_head", decision.Reason)
 	}
-	if decision.RestartOnTimeout {
-		t.Fatal("RestartOnTimeout = true, want false")
+	if !decision.RestartOnTimeout {
+		t.Fatal("RestartOnTimeout = false, want true")
 	}
 	if p := decision.Progress; p.ProducedHead != 225 || p.ProducedCount != 2 || !p.HasManifest {
 		t.Fatalf("progress = %+v, want two ready files ending at225 with a manifest", p)
@@ -1359,8 +1359,8 @@ func TestSegmentRecoveryDecisionWaitsForSequentialNextSegmentWhenManifestInFlux(
 	if decision.Reason != "near_produced_head" {
 		t.Fatalf("Reason = %q, want near_produced_head", decision.Reason)
 	}
-	if decision.RestartOnTimeout {
-		t.Fatal("RestartOnTimeout = true, want false")
+	if !decision.RestartOnTimeout {
+		t.Fatal("RestartOnTimeout = false, want true")
 	}
 }
 

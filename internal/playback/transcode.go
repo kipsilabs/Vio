@@ -566,10 +566,16 @@ func ManifestStartupTimeoutFor(opts TranscodeOpts) time.Duration {
 const (
 	maxSequentialMissingSegments = 2
 	activeSegmentWait            = 12 * time.Second
-	segmentWaitGrace             = 1500 * time.Millisecond
-	maxSegmentWait               = 6 * time.Second
-	minSegmentWait               = 3 * time.Second
-	minStaleProducedWindow       = 5 * time.Second
+	// activeProducedHeadWait is the longest a client should sit on a segment
+	// that is only one step past the produced head. A healthy encoder produces
+	// the next two-second segment well inside this window; if it has not, the
+	// client is already stalled and a seek restart is cheaper than holding the
+	// request until the old 12 s timeout and then returning 404.
+	activeProducedHeadWait = 4 * time.Second
+	segmentWaitGrace       = 1500 * time.Millisecond
+	maxSegmentWait         = 6 * time.Second
+	minSegmentWait         = 3 * time.Second
+	minStaleProducedWindow = 5 * time.Second
 )
 
 // NewReadyTranscodeSessionForTesting creates a TranscodeSession with an outputDir
@@ -3591,8 +3597,8 @@ func (s *TranscodeSession) SegmentRecoveryDecision(segNum int, now time.Time) Se
 		if progress.Running && segNum == progress.LastRequestedSegment+1 &&
 			(progress.LastProducedAt.IsZero() || now.Sub(progress.LastProducedAt) <= staleProducedWindow(progress.SegmentDuration)) {
 			decision.Wait = true
-			decision.WaitTimeout = activeSegmentWait
-			decision.RestartOnTimeout = false
+			decision.WaitTimeout = activeProducedHeadWait
+			decision.RestartOnTimeout = true
 			decision.Reason = "near_produced_head"
 		} else {
 			decision.Reason = SegmentRecoveryFarSeekReason
@@ -3601,8 +3607,8 @@ func (s *TranscodeSession) SegmentRecoveryDecision(segNum int, now time.Time) Se
 		decision.Reason = "produced_output_stale"
 	default:
 		decision.Wait = true
-		decision.WaitTimeout = activeSegmentWait
-		decision.RestartOnTimeout = false
+		decision.WaitTimeout = activeProducedHeadWait
+		decision.RestartOnTimeout = true
 		decision.Reason = "near_produced_head"
 	}
 
