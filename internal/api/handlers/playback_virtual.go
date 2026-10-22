@@ -4073,36 +4073,6 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 // tracks with another release's while the binding generation was unchanged; the
 // caller propagates the carried inventory under its own generation fence and must
 // never trust a reread.
-// refreshVirtualCatalogFileForEvidence re-reads the row a probe is about to
-// write. The probe snapshot may predate a detail read's catalog revision or a
-// provider re-list; the evidence write is fenced on the row's current
-// updated_at/probe stamp, so writing against the old snapshot can be refused
-// even when the row still names the same item and source. Keep the old row when
-// the lookup is unavailable or the row identity moved, preserving the existing
-// fail-closed behavior.
-func (h *PlaybackHandler) refreshVirtualCatalogFileForEvidence(ctx context.Context, file *models.MediaFile) *models.MediaFile {
-	if h == nil || h.fileResolver == nil || file == nil || file.ID <= 0 {
-		return file
-	}
-	fresh, err := h.fileResolver.GetByID(ctx, file.ID)
-	if err != nil || fresh == nil || fresh.ID != file.ID {
-		return file
-	}
-	if fresh.ContentID != file.ContentID ||
-		fresh.MediaFolderID != file.MediaFolderID ||
-		fresh.VirtualOwnerInstallationID != file.VirtualOwnerInstallationID {
-		return file
-	}
-	// Do not let a stale probe overwrite evidence another probe already
-	// committed. Refresh the CAS snapshot for revision-only or path churn, but
-	// keep the old snapshot when the probe stamp moved; that case must take the
-	// normal superseded-write path rather than regress newer evidence.
-	if !sameVirtualProbeStamp(file.ProbeUpdatedAt, fresh.ProbeUpdatedAt) {
-		return file
-	}
-	return fresh
-}
-
 func (h *PlaybackHandler) persistVirtualProbeEvidenceDurable(ctx context.Context, catalogFile *models.MediaFile, resolvedPath string, probed *models.MediaFile, candidate resolver.PersistedIdentityTiers, stampProbe bool) (virtualCommittedProbeInventory, bool) {
 	// A detail read or a provider re-list can advance the row's revision while
 	// the detached probe is running. Re-read the exact row immediately before
@@ -5116,6 +5086,13 @@ func refreshVirtualPersistArgsForRow(args models.VirtualFilePersistArgs, current
 // the meantime, probe_updated_at differs and the write still refuses. A row
 // that moved elsewhere keeps the caller's snapshot.
 func virtualPersistSnapshotMoved(original models.VirtualFilePersistArgs, current virtualRowCASState, refreshed models.VirtualFilePersistArgs) bool {
+	// The probe stamp is the authority on whether this evidence still describes
+	// the row's current bytes. Check it before the adoption path can re-base:
+	// otherwise a concurrent probe that moved both the concrete path and the
+	// stamp could be overwritten by this older adoption.
+	if !sameVirtualProbeStamp(original.ProbeUpdatedAt, current.ProbeUpdatedAt) {
+		return false
+	}
 	if original.RequireAdopt && original.AdoptPath != "" &&
 		original.ExpectedFilePath != refreshed.ExpectedFilePath {
 		return true
@@ -5127,9 +5104,6 @@ func virtualPersistSnapshotMoved(original models.VirtualFilePersistArgs, current
 		return false
 	}
 	if original.LibraryID != 0 && original.LibraryID != current.LibraryID {
-		return false
-	}
-	if !sameVirtualProbeStamp(original.ProbeUpdatedAt, current.ProbeUpdatedAt) {
 		return false
 	}
 	return current.UpdatedAt.After(original.UpdatedAt)
