@@ -3578,21 +3578,24 @@ func scanActiveTempProgress(outputDir string, progress *SegmentProgress) {
 	if err != nil {
 		return
 	}
+	var newest os.FileInfo
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".tmp") {
+		if entry.IsDir() || !strings.HasPrefix(entry.Name(), "seg_") || !strings.HasSuffix(entry.Name(), ".tmp") {
 			continue
 		}
 		info, infoErr := entry.Info()
 		if infoErr != nil || info.Size() <= 0 {
 			continue
 		}
-		if info.ModTime().After(progress.ActiveTempAt) {
-			progress.ActiveTempAt = info.ModTime()
-		}
-		if info.Size() > progress.ActiveTempSize {
-			progress.ActiveTempSize = info.Size()
+		if newest == nil || info.ModTime().After(newest.ModTime()) {
+			newest = info
 		}
 	}
+	if newest == nil {
+		return
+	}
+	progress.ActiveTempAt = newest.ModTime()
+	progress.ActiveTempSize = newest.Size()
 }
 
 // SegmentRecoveryDecision determines whether a missing segment should briefly

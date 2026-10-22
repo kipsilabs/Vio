@@ -1450,16 +1450,21 @@ func TestWaitForOpenSegmentWithStallAllowsGrowingPartialSegment(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
+		size := 0
 		for {
 			select {
 			case <-stop:
 				return
 			case <-time.After(20 * time.Millisecond):
-				_ = os.WriteFile(filepath.Join(tempDir, "seg_00001.ts.tmp"), []byte("partial"), 0o600)
+				size += 4096
+				_ = os.WriteFile(filepath.Join(tempDir, "seg_00001.ts.tmp"), bytes.Repeat([]byte("x"), size), 0o600)
 			}
 		}
 	}()
-	_, err := session.WaitForOpenSegmentWithStall("seg_00001.ts", 250*time.Millisecond, 50*time.Millisecond)
+	// The stall sampler runs at most twice a second. Use a wait that crosses
+	// several samples and a stall window shorter than the overall wait, so a
+	// missing partial-progress reset would produce ErrSegmentStalled.
+	_, err := session.WaitForOpenSegmentWithStall("seg_00001.ts", 1300*time.Millisecond, 650*time.Millisecond)
 	close(stop)
 	<-done
 	if !errors.Is(err, ErrSegmentNotFound) {
