@@ -2233,6 +2233,13 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	// teaching its session model the split first.
 	if isVirtualPlaybackFile(requestedFile) {
 		requestedCatalogFileID := requestedFile.ID
+		if offered := strings.TrimSpace(req.OfferedVirtualURI); offered != "" {
+			if virtualResultCandidateID(offered) == "" ||
+				virtualPlaybackNeutralKey(offered) != virtualPlaybackNeutralKey(requestedFile.FilePath) {
+				return playback.DecisionResponseV3{}, playbackOperationError(http.StatusBadRequest, "invalid_offered_candidate",
+					"The offered release does not belong to this title")
+			}
+		}
 		// An auto selection skips a catalog row the catalog marked failed, even
 		// when the row already carries a concrete result= identity adopted by an
 		// earlier auto pick; only an explicit pick or a forced relink re-tries
@@ -2280,6 +2287,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		// must survive into the attempt record for idempotent replay.
 		resolutionWasAssumed = resolved.ResolutionAssumed
 		resolutionProvenance = resolved.Provenance
+		virtualDecision.effectiveVirtualOwner = effectiveVirtualOwner(resolved.OwnerID, resolved.File.VirtualOwnerInstallationID)
 		virtualDecision.candidateRank = resolved.CandidateRank
 		virtualDecision.candidateCount = resolved.CandidateCount
 		// The alternate-version walk resolved a different release than the one
@@ -3125,12 +3133,14 @@ func (h *PlaybackHandler) resolveVirtualStartWithVersionFallback(
 	allowFailedCandidate bool,
 	bandwidthCapKbps int,
 ) (resolvedVirtualPlaybackSource, error) {
+	offeredURI := strings.TrimSpace(req.OfferedVirtualURI)
+	offeredCandidateID := virtualResultCandidateID(offeredURI)
 	resolved, resolveErr := h.resolveVirtualPlaybackSource(
-		r, file, profileID, true, nil, "", req.QualityPreference, bandwidthCapKbps, req.ForceRelink,
+		r, file, profileID, true, nil, offeredCandidateID, req.QualityPreference, bandwidthCapKbps, req.ForceRelink,
 		virtualResolveOptionsV3{
 			allowFailedCandidate: allowFailedCandidate,
 			sessionBound:         false,
-			explicitSelection:    req.FileSelection == playback.FileSelectionExplicitV3,
+			explicitSelection:    req.FileSelection == playback.FileSelectionExplicitV3 || offeredCandidateID != "",
 			// Defer the candidate-declared upgrade probe past the transport
 			// commit only when the surface AND the client negotiated the
 			// deferred track-inventory lifecycle (see
@@ -3142,6 +3152,22 @@ func (h *PlaybackHandler) resolveVirtualStartWithVersionFallback(
 			deferProbePastCommit: h.deferTrackInventoryNegotiatedV3(r, req),
 		},
 	)
+	if offeredCandidateID != "" {
+		// An offered-track pick names one concrete candidate. Falling back to
+		// another candidate would apply the offered track ordinals to different
+		// bytes; fail the start and let the client refresh the version offer.
+		if resolveErr != nil {
+			return resolved, fmt.Errorf("%w: %w", errOfferedCandidateUnavailable, resolveErr)
+		}
+		resolvedURI := strings.TrimSpace(resolved.URI)
+		if resolvedURI == "" {
+			resolvedURI = strings.TrimSpace(resolved.File.FilePath)
+		}
+		if !sameVirtualCandidate(resolvedURI, offeredURI) {
+			return resolved, errOfferedCandidateUnavailable
+		}
+		return resolved, nil
+	}
 	if resolveErr == nil || !virtualStartVersionFallbackEligibleV3(req) || !virtualProviderListingOutage(resolveErr) {
 		return resolved, resolveErr
 	}
@@ -3551,7 +3577,15 @@ func appendStartWarningsV3(result *playback.PlannerResultV3, warnings []playback
 // omits the rank fields then rather than printing a misleading 0.
 type virtualPlanDecisionV3 struct {
 	preferredAudioLanguage string
-	candidateRank          int
+	// effectiveVirtualOwner is the provider installation that resolved the
+	// planned candidate. A first-ever auto start can plan a concrete
+	// ?result= candidate while the effective catalog row is still the
+	// provider-neutral sibling, whose owner is 0. Carrying the resolver's owner
+	// onto the session binding keeps a later seek able to reopen the frozen
+	// candidate instead of failing closed until another operation materializes
+	// the concrete row.
+	effectiveVirtualOwner int
+	candidateRank         int
 	// candidateCount is the ranked candidate list's length, or -1 when the
 	// resolve took a path that never ranked (a fast path with no list). The
 	// plan-decision log distinguishes that unknown from a measured zero.
@@ -3637,6 +3671,7 @@ func (h *PlaybackHandler) startPlannedPlaybackV3(r *http.Request, userID int, pr
 	if result.Plan == nil {
 		return playback.DecisionResponseV3{}, &transportErrorV3{reason: "internal_error", message: "The server produced no playback plan."}
 	}
+	effectiveFile = bindPlannedVirtualFileV3(effectiveFile, result.Plan, virtualDecision.effectiveVirtualOwner)
 	if checker, ok := h.sessionMgr.(transcodePermissionChecker); ok && (result.PlayMethod == playback.PlayTranscode || result.TranscodeAudio) {
 		if err := checker.CheckTranscodingAllowed(r.Context(), userID, result.PlayMethod == playback.PlayTranscode); err != nil {
 			reason := "transcoding_disabled"
@@ -3822,13 +3857,13 @@ func (h *PlaybackHandler) startPlannedPlaybackV3(r *http.Request, userID int, pr
 	// consumer watching the same session can still learn it from here; a
 	// rotation is the case that depends on it.
 	h.PublishSourceCommitted(r.Context(), session.ID)
-	// The transport is committed above. Run the virtual subtitle and font warms
-	// detached from this start request: each resolves its own relay registration
-	// and demuxes the remote source, and running them on the response path let
-	// full remote reads race the just-committed video transport. Scheduling here
-	// keeps the transport start uncontended while the first client subtitle or
-	// font fetch still finds a warm (or in-flight) entry.
-	h.scheduleVirtualWarmAfterTransportV3(r.Context(), session, effectiveFile, result.SubtitleTrackIndex)
+	// The transport is committed above. Run the virtual font warm detached from
+	// this start request: it resolves its own relay registration and reads the
+	// remote source, and running it on the response path let that read race the
+	// just-committed video transport. Subtitle tracks are not warmed here; the
+	// windowed subtitle serve caches its own slice, and a full-track warm would
+	// compete with the first subtitle window the client requests.
+	h.scheduleVirtualWarmAfterTransportV3(r.Context(), session, effectiveFile)
 	h.enqueuePlaybackStartSideEffectsV3(r.Context(), session, effectiveFile, userID, profileID, plannedAudioTrackIndexV3(result, audioIndex))
 	h.enqueueRouteEventV3(playback.RouteEventRecordV3{RouteEventV3: playback.RouteEventV3{ProtocolVersion: playback.ProtocolV3, PlaybackAttemptID: req.PlaybackAttemptID, SessionID: session.ID, PlanID: result.Plan.PlanID, Event: playback.RouteEventPlanSelectedV3, AppliedQuirkIDs: appliedQuirkIDsV3(result.Plan), QuirkRegistryRevision: appliedQuirkRevisionV3(result.Plan), OutputContextID: req.ClientPlaybackContext.Output.OutputContextID}, UserID: userID, ProfileID: profileID, ClientName: clientInfo.Name, ClientVersion: clientInfo.Version, ClientBuild: clientInfo.Build, ClientChannel: clientInfo.Channel, ClientModel: req.ClientPlaybackContext.Device.Model})
 	return response, nil
@@ -6864,6 +6899,41 @@ func sourceVideoTranscodeFactsV3(file *models.MediaFile, result playback.Planner
 	return profile, bitDepth
 }
 
+// bindPlannedVirtualFileV3 pins the effective file to the concrete candidate
+// and provider installation the plan actually selected. A first-ever auto
+// start can return the catalog's provider-neutral sibling as the effective
+// row while the planner resolved a concrete ?result= candidate; the neutral
+// row carries owner 0, so storing its path and owner on the session leaves a
+// seek reanchor unable to reopen the frozen candidate. The plan's
+// EffectiveVirtualURI is the candidate that is actually playing, and
+// virtualDecision carries the resolver's installation for it.
+func bindPlannedVirtualFileV3(file *models.MediaFile, plan *playback.PlanV3, owner int) *models.MediaFile {
+	if file == nil || plan == nil || !isVirtualPlaybackFile(file) {
+		return file
+	}
+	uri := strings.TrimSpace(plan.EffectiveVirtualURI)
+	if uri == "" {
+		return file
+	}
+	// Never replace an already-concrete catalog candidate with a neutral plan
+	// hint. The plan normally carries the concrete candidate; this guard keeps a
+	// caller that built the plan from a neutral row from erasing a concrete
+	// binding that is already in hand.
+	if virtualResultCandidateID(uri) == "" && virtualResultCandidateID(file.FilePath) != "" {
+		return file
+	}
+	owner = effectiveVirtualOwner(owner, file.VirtualOwnerInstallationID)
+	if uri == file.FilePath && owner == file.VirtualOwnerInstallationID {
+		return file
+	}
+	bound := *file
+	bound.FilePath = uri
+	if owner > 0 {
+		bound.VirtualOwnerInstallationID = owner
+	}
+	return &bound
+}
+
 // v3SessionStreamState builds the durable stream state for a prepared transport.
 func (h *PlaybackHandler) v3SessionStreamState(ctx context.Context, session *playback.Session, file *models.MediaFile, result playback.PlannerResultV3, transport preparedTransportV3, mode mediaAuthModeV3) playback.SessionStreamState {
 	state := playback.SessionStreamState{
@@ -6945,13 +7015,23 @@ func (h *PlaybackHandler) v3SessionStreamState(ctx context.Context, session *pla
 	// the serve path can discard it when the bound candidate has moved.
 	if isVirtualPlaybackFile(file) && strings.HasPrefix(file.FilePath, "virtual://") {
 		owner := effectiveVirtualOwner(file.VirtualOwnerInstallationID, session.VirtualSourceOwnerInstallationID)
-		state.VirtualSourceURI = file.FilePath
+		// The plan names the concrete candidate it validated. Prefer it over a
+		// neutral catalog sibling so the session binding and its evidence anchor
+		// both name the bytes that are actually playing.
+		virtualURI := strings.TrimSpace(file.FilePath)
+		if result.Plan != nil {
+			if plannedURI := strings.TrimSpace(result.Plan.EffectiveVirtualURI); plannedURI != "" &&
+				(virtualResultCandidateID(plannedURI) != "" || virtualResultCandidateID(file.FilePath) == "") {
+				virtualURI = plannedURI
+			}
+		}
+		state.VirtualSourceURI = virtualURI
 		state.VirtualSourceOwnerInstallationID = owner
 		state.VirtualSourceRevision = planVirtualSourceRevisionV3(result)
 		state.VirtualSubtitleTracks = file.SubtitleTracks
 		state.VirtualExternalSubtitles = file.ExternalSubtitles
 		state.VirtualAudioTracks = file.AudioTracks
-		state.VirtualSubtitleEvidenceURI = file.FilePath
+		state.VirtualSubtitleEvidenceURI = virtualURI
 		// The evidence row id is as important as the URI: duplicate catalog
 		// rows for one release share candidate URIs and neutral keys, so a
 		// later serve must apply this inventory only to the exact row it was
@@ -6968,7 +7048,7 @@ func (h *PlaybackHandler) v3SessionStreamState(ctx context.Context, session *pla
 		// may carry no stamp (a churned listing row) even though the retained
 		// evidence is proven, so the session's own flag is the authority.
 		evidenceSet := file.ProbeUpdatedAt != nil
-		if !evidenceSet && sameVirtualCandidate(session.VirtualSubtitleEvidenceURI, file.FilePath) {
+		if !evidenceSet && sameVirtualCandidate(session.VirtualSubtitleEvidenceURI, virtualURI) {
 			evidenceSet = session.VirtualSubtitleEvidenceSet
 		}
 		state.VirtualSubtitleEvidenceSet = evidenceSet
@@ -6980,31 +7060,19 @@ func (h *PlaybackHandler) updateV3SessionState(ctx context.Context, session *pla
 	return h.sessionMgr.UpdateStreamState(session.ID, h.v3SessionStreamState(ctx, session, file, result, transport, mode))
 }
 
-// virtualSubtitleWarmSourceURI picks the source URI the text-subtitle warm
-// keys its cache identities on. The live session's bound URI wins when set —
-// that is the value updateV3SessionState writes and the serve path reads — and
-// otherwise the effective file's pinned URI is used, because the start path's
-// session copy predates the state write. Mirrors warmVirtualFontBundleV3 so
-// the warm and serve identities agree.
-func virtualSubtitleWarmSourceURI(session *playback.Session, file *models.MediaFile) string {
-	if session != nil && session.VirtualSourceURI != "" {
-		return session.VirtualSourceURI
-	}
-	if file != nil {
-		return file.FilePath
-	}
-	return ""
-}
-
-// scheduleVirtualWarmAfterTransportV3 runs the virtual subtitle and font-bundle
-// warms detached from the start request, after the transport commit. Both warms
-// resolve their own relay registration and demux the remote source; running
-// them inline on the response path let full remote reads race the
-// just-committed video transport and inflated startup. Detaching keeps the
-// transport start uncontended while the first client subtitle/font fetch still
-// finds a warm (or in-flight fill) entry. Best-effort: a nil cache or file is a
-// no-op.
-func (h *PlaybackHandler) scheduleVirtualWarmAfterTransportV3(ctx context.Context, session *playback.Session, file *models.MediaFile, selectedSubtitleIndex int) {
+// scheduleVirtualWarmAfterTransportV3 starts the virtual font-bundle warm
+// detached from the start request, after the transport commit. A font bundle is
+// shared by every ASS track in the file, so one extraction serves the whole
+// release. Best-effort: a nil cache or file is a no-op.
+//
+// Text/ASS/PGS subtitle tracks are deliberately not warmed here. A full-track
+// warm has to read the entire remote source (30-95 s on the production relay)
+// and it starts exactly when the player requests its first bounded subtitle
+// window. The two demuxes then compete for the same relay and provider, which
+// delays the cues the viewer is waiting for. The windowed serve already caches
+// its slice, and the post-window warm fills the whole-track entry once the
+// client's first window has completed.
+func (h *PlaybackHandler) scheduleVirtualWarmAfterTransportV3(ctx context.Context, session *playback.Session, file *models.MediaFile) {
 	if h == nil || h.SubtitleCache == nil || file == nil || session == nil {
 		return
 	}
@@ -7016,107 +7084,17 @@ func (h *PlaybackHandler) scheduleVirtualWarmAfterTransportV3(ctx context.Contex
 	}
 	warmCtx := context.WithoutCancel(ctx)
 	go func() {
-		h.warmVirtualSubtitlesV3(warmCtx, session, file, selectedSubtitleIndex)
 		h.warmVirtualFontBundleV3(warmCtx, session, file)
-	}()
-}
-
-// warmVirtualSubtitlesV3 pre-warms the subtitle cache for a virtual source's
-// selected embedded track after the transport commit. The serve path always
-// fetches text subtitles windowed (the client appends position/duration), so a
-// first click otherwise pays a full remote demux against a fresh relay
-// registration; a committed full-track entry turns every windowed fetch into a
-// near-instant scan of a small cached artifact instead. PGS already gets this
-// fast path from serveWindowedSUP; this warm supplies the entry so both classes
-// start instant.
-//
-// Only the session's selected embedded track is warmed. The windowed serve
-// branch looks the cache up by the full-track key — cachedFormatEntryPath
-// carries no window component — and, on a hit, runs the client's windowed
-// extract against that artifact. A bounded-window artifact committed under the
-// same key would look like a complete track and silently truncate every window
-// past the warmed slice, so a correct warm must extract the whole track. Warming
-// exactly the selected track (instead of every track) and running detached after
-// the transport commit keeps the startup path free of competing remote demuxes.
-//
-// The warm resolves its own relay registration (the transport's is held by
-// the transcode session, not shareable) and holds it open until the track's
-// warm finishes — a relay URL released mid-warm would 404 under ffmpeg.
-// Best-effort by design: resolution failure, warm-slot exhaustion, and cache
-// misses (the 24h generation bucket rotates) all degrade to the existing
-// cold-serve path with no user-visible error.
-func (h *PlaybackHandler) warmVirtualSubtitlesV3(ctx context.Context, session *playback.Session, file *models.MediaFile, selectedSubtitleIndex int) {
-	if h == nil || h.SubtitleCache == nil || file == nil || session == nil {
-		return
-	}
-	if !isVirtualPlaybackFile(file) {
-		return
-	}
-	// Resolve the selected combined subtitle index (externals, then embedded,
-	// then downloaded) to its inventory segment. Only an embedded selection has
-	// an extractable container stream; external and downloaded selections are
-	// served by other paths and need no virtual warm.
-	location, ok := classifySubtitleIndexV3(file, selectedSubtitleIndex)
-	if !ok || location.source != playback.SubtitleSourceEmbeddedV3 {
-		return
-	}
-	// The start path holds a session copy captured before UpdateStreamState
-	// wrote VirtualSourceURI, so the warm must key off the effective file's
-	// pinned URI or it silently no-ops exactly where it matters most. Mirror
-	// warmVirtualFontBundleV3: prefer the live session's bound URI when it has
-	// one, otherwise fall back to the effective file. Both name the same
-	// release the serve path binds (updateV3SessionState sets
-	// state.VirtualSourceURI = file.FilePath), so the warm and serve cache
-	// identities agree.
-	virtualURI := virtualSubtitleWarmSourceURI(session, file)
-	if virtualURI == "" {
-		return
-	}
-	tracks := session.VirtualSubtitleTracks
-	if len(tracks) <= location.offset {
-		// Fall back to the catalog row's inventory when the session carries
-		// no virtual evidence (a drift remap or a rotated candidate) or a
-		// shorter layout than the selected ordinal.
-		tracks = file.SubtitleTracks
-	}
-	trackIndex := location.offset
-	if trackIndex < 0 || trackIndex >= len(tracks) {
-		return
-	}
-	resolved, cleanup, err := h.resolveVirtualInputURI(
-		ctx, file.FilePath, file.VirtualOwnerInstallationID,
-		session.UserID, session.ProfileID, false, nil, "",
-	)
-	if err != nil {
-		slog.DebugContext(ctx, "virtual subtitle pre-warm skipped: resolve failed",
-			"component", "api", "file_id", file.ID, "error", err)
-		return
-	}
-	warmDone := h.SubtitleCache.WarmTrackInBackground(playback.StreamExtractOpts{
-		InputPath:     resolved.URL,
-		CacheIdentity: playback.VirtualSubtitleCacheIdentity(file.ID, virtualURI, trackIndex),
-		TrackIndex:    trackIndex,
-		SourceCodec:   tracks[trackIndex].Codec,
-		FFmpegPath:    h.playbackConfig().FFmpegPath,
-	}, playback.StreamExtractSubtitle, chimw.GetReqID(ctx))
-	// Release the relay registration exactly once, after the warm settled
-	// (ran, failed, or was skipped). The entry itself is also bounded by the
-	// relay's 24h lifetime, so a lost release never pins a slot forever.
-	go func() {
-		<-warmDone
-		if cleanup != nil {
-			cleanup()
-		}
 	}()
 }
 
 // warmVirtualFontBundleV3 pre-warms the font-bundle cache for a virtual
 // source's effective file when it carries at least one ASS/SSA embedded track.
 // Font bundles are keyed per file (not per track), so exactly one extraction is
-// scheduled however many ASS tracks the release has. It mirrors
-// warmVirtualSubtitlesV3: it resolves its own relay registration, runs the
-// extraction detached under the cache's warm budget, and holds the relay open
-// until the extraction settles — a relay URL released mid-extract would 404
+// scheduled however many ASS tracks the release has. It resolves its own
+// relay registration, runs the extraction detached under the cache's warm
+// budget, and holds the relay open until the extraction settles — a relay URL
+// released mid-extract would 404
 // under ffmpeg. Best-effort by design: resolution failure, warm-slot
 // exhaustion, and an already-cached bundle all degrade to the existing
 // cold-serve path with no user-visible error. The returned channel closes when
@@ -11943,6 +11921,12 @@ func virtualPinnedProfileRowV3(session *playback.Session, row *models.MediaFile)
 // establish evidence or an installation owner that belongs to the frozen
 // candidate, so the recipe must not be replayed through a foreign binding.
 var errFrozenSeekEvidenceUnavailable = errors.New("the frozen seek candidate's own evidence is unavailable")
+
+// errOfferedCandidateUnavailable reports that a start bound to an offered
+// candidate could not serve that exact candidate. A different candidate is not
+// an acceptable substitute because the client's selected track ordinals belong
+// to the offered release.
+var errOfferedCandidateUnavailable = errors.New("the offered release is no longer available")
 
 // frozenSeekCarrierV3 builds the effective file a seek reanchor replays from
 // evidence that demonstrably belongs to the plan's frozen candidate. The

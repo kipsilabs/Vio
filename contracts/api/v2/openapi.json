@@ -38939,6 +38939,9 @@
           "inventory_status": {
             "type": "string"
           },
+          "offered_virtual_uri": {
+            "type": "string"
+          },
           "session_id": {
             "type": "string"
           },
@@ -40186,6 +40189,9 @@
             "deprecated": true,
             "description": "Deprecated; ignored. A client on a metered link sends its cellular quality as quality_preference and bandwidth_cap_kbps instead.",
             "type": "boolean"
+          },
+          "offered_virtual_uri": {
+            "type": "string"
           },
           "playback_attempt_id": {
             "type": "string"

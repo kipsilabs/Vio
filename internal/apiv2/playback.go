@@ -65,6 +65,7 @@ type PlaybackStartBody struct {
 	AudioTrackIndex            *int                               `json:"audio_track_index,omitempty" nullable:"false"`
 	CarriedAudioTrackID        string                             `json:"carried_audio_track_id,omitempty"`
 	FileSelection              playback.FileSelectionV3           `json:"file_selection,omitempty" enum:"auto,explicit"`
+	OfferedVirtualURI          string                             `json:"offered_virtual_uri,omitempty"`
 	ForceRelink                bool                               `json:"force_relink,omitempty"`
 	SubtitleTrackID            string                             `json:"subtitle_track_id,omitempty"`
 	SubtitleTrackIndex         *int                               `json:"subtitle_track_index,omitempty" nullable:"false"`
@@ -624,7 +625,7 @@ func playbackMutation(view handlers.PlaybackMutationView, err error) (*PlaybackM
 	return &PlaybackMutationOutput{Body: body}, nil
 }
 func (in PlaybackStartBody) domain(fileID int) playback.StartRequestV3 {
-	return playback.StartRequestV3{ProtocolVersion: in.ProtocolVersion, ClientFeatures: in.ClientFeatures, FileID: fileID, ProfileID: string(in.ProfileID), PlaybackAttemptID: in.PlaybackAttemptID, QualityPreference: in.QualityPreference, AllowAlternateVersions: in.AllowAlternateVersions, SubtitleFidelityPreference: in.SubtitleFidelityPreference, StartPosition: in.StartPosition, ProgressPersistence: in.ProgressPersistence, AudioTrackID: in.AudioTrackID, AudioTrackIndex: in.AudioTrackIndex, CarriedAudioTrackID: in.CarriedAudioTrackID, FileSelection: in.FileSelection, ForceRelink: in.ForceRelink, SubtitleTrackID: in.SubtitleTrackID, SubtitleTrackIndex: in.SubtitleTrackIndex, Metered: in.Metered, BandwidthEstimateKbps: in.BandwidthEstimateKbps, BandwidthCapKbps: in.BandwidthCapKbps, Capabilities: in.Capabilities, ClientPlaybackContext: in.ClientPlaybackContext}
+	return playback.StartRequestV3{ProtocolVersion: in.ProtocolVersion, ClientFeatures: in.ClientFeatures, FileID: fileID, ProfileID: string(in.ProfileID), PlaybackAttemptID: in.PlaybackAttemptID, QualityPreference: in.QualityPreference, AllowAlternateVersions: in.AllowAlternateVersions, SubtitleFidelityPreference: in.SubtitleFidelityPreference, StartPosition: in.StartPosition, ProgressPersistence: in.ProgressPersistence, AudioTrackID: in.AudioTrackID, AudioTrackIndex: in.AudioTrackIndex, CarriedAudioTrackID: in.CarriedAudioTrackID, FileSelection: in.FileSelection, OfferedVirtualURI: in.OfferedVirtualURI, ForceRelink: in.ForceRelink, SubtitleTrackID: in.SubtitleTrackID, SubtitleTrackIndex: in.SubtitleTrackIndex, Metered: in.Metered, BandwidthEstimateKbps: in.BandwidthEstimateKbps, BandwidthCapKbps: in.BandwidthCapKbps, Capabilities: in.Capabilities, ClientPlaybackContext: in.ClientPlaybackContext}
 }
 func playbackDecision(in playback.DecisionResponseV3) PlaybackDecision {
 	out := PlaybackDecision{ProtocolVersion: in.ProtocolVersion, ServerFeatures: in.ServerFeatures, Outcome: in.Outcome, SessionID: in.SessionID, Terminal: in.Terminal}

@@ -82,7 +82,7 @@ const (
 // its own separate budget and never inherits this number.
 const (
 	VirtualLibraryCatalogDiscoveryBudgetMsSettingKey = "virtual_library.catalog_discovery_budget_ms"
-	DefaultVirtualLibraryCatalogDiscoveryBudgetMs    = 3000
+	DefaultVirtualLibraryCatalogDiscoveryBudgetMs    = 1000
 	MinVirtualLibraryCatalogDiscoveryBudgetMs        = 500
 	MaxVirtualLibraryCatalogDiscoveryBudgetMs        = 10000
 )

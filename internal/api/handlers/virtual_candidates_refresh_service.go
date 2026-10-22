@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/sync/singleflight"
@@ -106,6 +107,25 @@ type VirtualCandidatesDetailReader interface {
 	WatchDetail(ctx context.Context, userID int, profileID, contentID string, filter catalog.AccessFilter) (*catalog.WatchDetail, error)
 }
 
+// VirtualDiscoveryMode says why an item's provider candidates are being
+// listed, and therefore whether the listing may start a background
+// preparation probe.
+//
+// The mode is the enforcement boundary, not a log attribute. Only a
+// detail-page read may spend provider traffic on a preparation: the explicit
+// discover operation is callable for any item by any client, so it lists and
+// persists candidates and prepares nothing.
+type VirtualDiscoveryMode string
+
+const (
+	// VirtualDiscoveryListingOnly lists and persists candidates without
+	// starting any preparation probe.
+	VirtualDiscoveryListingOnly VirtualDiscoveryMode = "listing_only"
+	// VirtualDiscoveryDetail is a detail-page read: its listing may start the
+	// pre-play preparation probe for the item's default version.
+	VirtualDiscoveryDetail VirtualDiscoveryMode = "detail"
+)
+
 // VirtualCandidatesRefreshService is the "Refresh List" action: it force-lists
 // a virtual item's provider candidates and persists them through the existing
 // ReplaceVirtualCandidates path, preserving every known-working row, then
@@ -131,19 +151,21 @@ type VirtualCandidatesRefreshService struct {
 	Detail VirtualCandidatesDetailReader
 	// ScheduleDefaultFileProbe, when non-nil, is called from inside the shared
 	// listing work immediately after a discovery run successfully persists one
-	// source group (never for :refresh runs). The hand-off is the successful
-	// persistence itself, not the request's return: the request-side caller
-	// can time out, disconnect, or release its budget before the winner lands
-	// the listing, while the detached work — and the chain scheduled from it —
-	// continues. The callback must be non-blocking: admission (an atomic
-	// check) only; the chain's own reads and probing happen in admitted work.
+	// source group (never for :refresh runs, never for a listing-only
+	// discovery). The hand-off is the successful persistence itself, not the
+	// request's return: the request-side caller can time out, disconnect, or
+	// release its budget before the winner lands the listing, while the
+	// detached work — and the chain scheduled from it — continues. The
+	// callback must be non-blocking: admission (an atomic check) only; the
+	// chain's own reads and probing happen in admitted work.
 	// The access filter is the one that authorized the discovery run (the
 	// singleflight winner's, when callers coalesce), so the chain resolves the
 	// same visible default the discovery response offered.
 	// PlaybackHandler.ScheduleDefaultFileProbe implements this.
 	ScheduleDefaultFileProbe func(contentID string, source *models.MediaFile, streams []VirtualPlaybackStream, filter catalog.AccessFilter)
 
-	flight singleflight.Group
+	flight      singleflight.Group
+	sourceLocks [64]sync.Mutex
 }
 
 // RefreshVirtualCandidates re-lists and persists the item's virtual candidates
@@ -156,14 +178,19 @@ func (s *VirtualCandidatesRefreshService) RefreshVirtualCandidates(ctx context.C
 	if s == nil {
 		return nil, apiError(http.StatusServiceUnavailable, "unavailable", "Virtual candidate refresh is unavailable")
 	}
-	return s.listVirtualCandidates(ctx, userID, profileID, contentID, filter, s.ListFresh, "refresh:")
+	// A refresh runs under operator intent: it force-lists and persists, and
+	// prepares nothing.
+	return s.listVirtualCandidates(ctx, userID, profileID, contentID, filter, s.ListFresh, "refresh:", VirtualDiscoveryListingOnly)
 }
 
-func (s *VirtualCandidatesRefreshService) DiscoverVirtualCandidates(ctx context.Context, userID int, profileID, contentID string, filter catalog.AccessFilter) ([]catalog.FileVersion, error) {
+// DiscoverVirtualCandidates lists the item's provider candidates and persists
+// them. The mode decides whether the persisted listing may start a
+// preparation probe: a detail-page read may, a bare listing request may not.
+func (s *VirtualCandidatesRefreshService) DiscoverVirtualCandidates(ctx context.Context, userID int, profileID, contentID string, filter catalog.AccessFilter, mode VirtualDiscoveryMode) ([]catalog.FileVersion, error) {
 	if s == nil {
 		return nil, apiError(http.StatusServiceUnavailable, "unavailable", "Virtual candidate discovery is unavailable")
 	}
-	return s.listVirtualCandidates(ctx, userID, profileID, contentID, filter, s.ListCached, "discover:")
+	return s.listVirtualCandidates(ctx, userID, profileID, contentID, filter, s.ListCached, "discover:", mode)
 }
 
 // HasVirtualSource reports whether the item holds at least one persisted
@@ -183,7 +210,20 @@ func (s *VirtualCandidatesRefreshService) HasVirtualSource(ctx context.Context, 
 	return len(sources) > 0, nil
 }
 
-func (s *VirtualCandidatesRefreshService) listVirtualCandidates(ctx context.Context, userID int, profileID, contentID string, filter catalog.AccessFilter, lister VirtualPlaybackStreamLister, keyPrefix string) ([]catalog.FileVersion, error) {
+// lockSource serializes the provider list and its persistence for one source.
+// A listing that starts before a detail run must not commit its candidates
+// after the detail run has persisted and scheduled its preparation.
+func (s *VirtualCandidatesRefreshService) lockSource(key string) func() {
+	var hash uint32
+	for i := 0; i < len(key); i++ {
+		hash = hash*16777619 ^ uint32(key[i])
+	}
+	mu := &s.sourceLocks[hash%uint32(len(s.sourceLocks))]
+	mu.Lock()
+	return mu.Unlock
+}
+
+func (s *VirtualCandidatesRefreshService) listVirtualCandidates(ctx context.Context, userID int, profileID, contentID string, filter catalog.AccessFilter, lister VirtualPlaybackStreamLister, keyPrefix string, mode VirtualDiscoveryMode) ([]catalog.FileVersion, error) {
 	if lister == nil || s.Persist == nil || s.Detail == nil {
 		return nil, apiError(http.StatusServiceUnavailable, "unavailable", "Virtual candidate refresh is unavailable")
 	}
@@ -203,16 +243,23 @@ func (s *VirtualCandidatesRefreshService) listVirtualCandidates(ctx context.Cont
 	if len(sources) == 0 {
 		return nil, apiError(http.StatusUnprocessableEntity, "validation_failed", "The item has no virtual candidates to refresh.")
 	}
-	// Only discovery schedules the pre-play probe chain. The ":refresh" job
-	// path force-lists under operator intent and carries its own enrichers;
-	// a chain on top would double-probe rows that path already targets.
+	// Only a detail-page read may schedule the pre-play probe chain. The
+	// ":refresh" job path force-lists under operator intent and carries its own
+	// enrichers; a chain on top would double-probe rows that path already
+	// targets. A bare listing request is callable for any item by any client,
+	// so it prepares nothing either.
 	var chainKey string
-	if keyPrefix == "discover:" {
+	if mode == VirtualDiscoveryDetail {
 		chainKey = contentID
 	}
 	sawCandidateListing := false
 	for _, source := range sources {
-		key := keyPrefix + virtualSourceRefreshKey(source)
+		// The mode is part of the flight key. A listing-only run and a
+		// detail run are different work: coalescing them would let the
+		// winner's intent decide the other's preparation, so a listing-only
+		// winner would swallow a detail caller's preparation while a detail
+		// winner would prepare for a caller that only asked for a listing.
+		key := keyPrefix + string(mode) + "\x00" + virtualSourceRefreshKey(source)
 		// Do not bind the shared work to the first caller's context: a client
 		// disconnect must not cancel the provider re-list (or strand a
 		// coalesced waiter on a canceled context). The shared work runs under
@@ -221,6 +268,8 @@ func (s *VirtualCandidatesRefreshService) listVirtualCandidates(ctx context.Cont
 		// own cancellation while waiting via the select below.
 		workCtx := context.WithoutCancel(ctx)
 		refreshCh := s.flight.DoChan(key, func() (any, error) {
+			releaseSource := s.lockSource(virtualSourceRefreshKey(source))
+			defer releaseSource()
 			_, err := s.listSource(workCtx, source, userID, profileID, lister, chainKey, filter)
 			return nil, err
 		})
@@ -292,6 +341,8 @@ func (s *VirtualCandidatesRefreshService) RefreshSources(ctx context.Context, co
 		// work runs detached with its own timeout applied inside refreshSource.
 		workCtx := context.WithoutCancel(ctx)
 		refreshCh := s.flight.DoChan(key, func() (any, error) {
+			releaseSource := s.lockSource(virtualSourceRefreshKey(source))
+			defer releaseSource()
 			fresh, err := s.refreshSource(workCtx, source, userID, profileID)
 			if err != nil {
 				return nil, err

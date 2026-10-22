@@ -260,6 +260,14 @@ the historical behavior — the server may substitute an alternate version when
 the requested one cannot be delivered. The field is optional and
 unconditionally available; existing clients that omit it are unchanged.
 
+**Binding an offered release.** `offered_virtual_uri` is optional and is set
+only when the viewer picks a track from a display-only offered inventory. It
+names the concrete candidate that offer described. The server passes its
+`?result=` identity to the resolver and refuses the start with the retryable
+`offered_release_unavailable` terminal if that exact candidate cannot be
+served. It never applies the offered track ordinals to a substituted release.
+The field is additive; clients that do not send it are unchanged.
+
 **Forcing a fresh relink.** `force_relink` is an optional boolean (default
 `false`). When `true`, the server re-queries the provider for a fresh virtual-
 source listing instead of trusting the cached or pinned candidate, and drops
@@ -1652,10 +1660,66 @@ event — an older build, or a session without a live realtime connection — ke
 its previous behavior and still converges through the subtitle `409` and replan
 paths.
 
+A `verified` `inventory_updated` revision is the server's own inventory for the
+live session, so the client applies it in place whenever its
+`effective_virtual_uri` names the candidate the session is bound to, even when
+its `effective_media_file_id` is a catalog row that appeared only after the plan
+committed. A differing `effective_virtual_uri` remains a foreign source and is
+dropped. This is what lets a cold plan whose inventory is empty or declared-only grow its
+audio and subtitle menus from the first verified push instead of staying empty
+until a stop/resume; it never replans, re-keys the transport, or reloads the
+element.
+
 The server pushes the event best-effort and does not gate it on a negotiated
 feature; a client that does not know the name ignores it. `/api/v2` advertises
 `source_committed_event_v1` in `features` so a client can tell a server that
 sends it apart from one that does not.
+
+**Inventory adoption is in place.** Folding the real video/audio/subtitle track
+lists from a deferred probe, a `source_committed`, or an `inventory_updated`
+push is menu data: it must never replan, switch rows or files, or reload the
+media element. What is already playing keeps playing, and only the lists the
+watch page and in-player menus render change. A client that adopts a *verified*
+inventory for a source must also refuse to regress it to a declared or pending
+list when a later plan for the same source is adopted — a replan can have been
+built before the probe persisted, and the menus must stay on the real evidence.
+
+### 6.3 `inventory_updated_event_v1` — a vanished pin still offers the row's menu
+
+A row pinned to a concrete `?result=` candidate can have the provider renumber
+or drop that candidate mid-session. The transport keeps playing the already-open
+relay, and every rotation path correctly refuses to swap a different release into
+the playing row, so the track menus would otherwise stay empty until a
+stop/resume. When the refused evidence is the row's own current listing, the
+server pushes it as a display-only `inventory_updated` revision:
+
+```json
+{
+  "type": "event",
+  "session_id": "…",
+  "name": "inventory_updated",
+  "payload": {
+    "session_id": "…",
+    "inventory_revision": "inv:…",
+    "inventory_status": "verified",
+    "effective_media_file_id": 200,
+    "offered_virtual_uri": "virtual://movie/…?result=C",
+    "audio_tracks": [{"language": "eng", "codec": "eac3", "default": true}],
+    "subtitle_inventory": []
+  }
+}
+```
+
+`offered_virtual_uri` names the candidate the row offers now. The payload
+deliberately omits `effective_virtual_uri` and carries only the bound row in
+`effective_media_file_id`, so a client can never mistake the offer for the
+playing identity: the transport, session and plan revisions are untouched and no
+replan is issued. A client that ignores the field keeps its existing behavior
+(the file-only revision is dropped as ambiguous). The offered track lists are
+display data; selecting a track from the offered release must go through the
+explicit rotation/replan path, never an in-place switch. The server pushes it
+best-effort and does not gate it on a negotiated feature; the field is additive
+and absent on every ordinary read.
 
 ---
 

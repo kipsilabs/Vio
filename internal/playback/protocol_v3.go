@@ -735,6 +735,12 @@ type StartRequestV3 struct {
 	// behavior; an explicit pick pins the requested file and disables the
 	// start-path alternate-file fallback.
 	FileSelection FileSelectionV3 `json:"file_selection,omitempty"`
+	// OfferedVirtualURI binds a start to the concrete candidate a previous
+	// inventory event offered under this row. It is set only when the viewer
+	// picks a track from an offered release; the resolver must serve that
+	// candidate or fail, never substitute another one and apply the offered
+	// track ordinals to it.
+	OfferedVirtualURI string `json:"offered_virtual_uri,omitempty"`
 	// ForceRelink asks the server to fetch a fresh provider listing for an
 	// explicitly re-selected version instead of trusting the cached or pinned
 	// candidate. It is only meaningful alongside an explicit file_selection;
@@ -1305,6 +1311,19 @@ type PlaybackInventoryV3 struct {
 	// inventory is declared rather than verified. Empty for a non-virtual
 	// source.
 	VirtualSourceRevision string `json:"virtual_source_revision,omitempty"`
+	// OfferedVirtualURI, when set, names a concrete candidate under the same
+	// neutral key that the row currently offers but the session's transport is
+	// NOT bound to: the pinned candidate vanished from the provider listing and
+	// the transport keeps playing it. The audio and subtitle lists describe that
+	// offered candidate, so a client can show what the row offers now. The bound
+	// candidate is deliberately not repeated: EffectiveVirtualURI stays empty
+	// and EffectiveMediaFileID is the row the session is bound to, so a consumer
+	// can never mistake the offer for the playing identity. It is display-only:
+	// selecting a track from the offered release must go through the explicit
+	// rotation/replan path, and a client that does not know this field falls
+	// back to the playing source's own inventory. Additive; absent on every
+	// ordinary read.
+	OfferedVirtualURI string `json:"offered_virtual_uri,omitempty"`
 }
 
 type inventoryRevisionEnvelope struct {
@@ -1488,6 +1507,9 @@ func (r *StartRequestV3) NormalizeAndValidate() ([]DegradationWarningV3, error) 
 	}
 	if len(r.CarriedAudioTrackID) > 128 {
 		return nil, errors.New("carried_audio_track_id is too long")
+	}
+	if len(r.OfferedVirtualURI) > 512 {
+		return nil, errors.New("offered_virtual_uri is too long")
 	}
 	if err := validateTrackPairV3(r.FileID, trackKindSubtitle, r.SubtitleTrackID, r.SubtitleTrackIndex); err != nil {
 		return nil, err

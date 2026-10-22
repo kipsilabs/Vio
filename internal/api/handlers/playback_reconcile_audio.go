@@ -950,7 +950,21 @@ func defaultAudioLanguageStillSatisfied(selected models.AudioTrack, verified []m
 	if !audioTrackSignatureEqual(selected, *playback.AudioTrackSignatureFromTrack(verified[recomputed])) {
 		return false
 	}
-	return intent.preferredLang == "" || playback.TrackCarriesLanguage(selected, intent.preferredLang)
+	if intent.preferredLang == "" || playback.TrackCarriesLanguage(selected, intent.preferredLang) {
+		return true
+	}
+	// The preference may be unavailable on this release. SelectAudioTrack has
+	// already fallen back to the best available track, and correcting to that
+	// same stream is not a correction: withdrawing the plan would reload the
+	// transport with no possible language change. Only a verified track that
+	// actually carries the preferred language makes the current fallback
+	// stale.
+	for _, track := range verified {
+		if playback.TrackCarriesLanguage(track, intent.preferredLang) {
+			return false
+		}
+	}
+	return true
 }
 
 // reconcileDefaultAudioReplan issues the automatic track_change replan built

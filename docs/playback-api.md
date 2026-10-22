@@ -216,6 +216,10 @@ service answers `503`; a whole-series or non-virtual target answers `422`.
 Provider unavailability and timeouts answer `503` and leave existing candidates
 intact. The explicit Refresh List action stays available as the retry path.
 
+The operation is a listing surface: it prepares nothing. Only a detail-page
+read starts a pre-play preparation, so a client that calls the operation for
+its own reasons cannot spend provider traffic on background probing.
+
 Discovery does not request downloads, search indexers, or open media URLs.
 After success, clients reload item and watch detail to display the persisted
 versions. Play remains available during discovery, and playback-time resolution
@@ -244,11 +248,13 @@ response's redacted file paths, so viewers without file-path visibility reach
 the same discovery.
 
 The catalog wait is tuned with the admin Streaming setting
-`virtual_library.catalog_discovery_budget_ms` (500-10000, default 3000). It
+`virtual_library.catalog_discovery_budget_ms` (500-10000, default 1000). It
 is read on each detail request, so saving it does not require a restart.
 Measured provider scrapes vary from tens of milliseconds to about 2.5s, and
 the built-in default absorbs the wall-clocked overhead the scrape accrues
-before persistence; the watch path keeps its full 15-second budget.
+before persistence; the watch path keeps a short 2-second wait. Both paths
+continue the provider work detached after the response, so a cold scrape is
+not lost when the response returns first.
 
 Leaf answers carry an additive `has_virtual_source` boolean. It reports
 whether the item holds persisted virtual candidate groups, read from the same
@@ -261,22 +267,50 @@ items (series, season, lists), and failed lookups leave the field out. It
 appears on `GET /api/v2/catalog/items/{id}`, `GET /api/v2/watch/{id}`, and
 the admin metadata update response, keeping v1 answers byte-identical.
 
-After discovery persists a listing, the server schedules one detached
-pre-play probe chain for the opened item: it re-reads the item's default
-version, requires that the default row is a persisted candidate whose exact
-bytes the just-persisted listing names, and probes that candidate through
+After a detail-page read persists a listing, the server schedules one detached
+pre-play probe chain for the opened item: it re-reads the item's selected
+version when the detail read supplied `file_id`, otherwise its default version.
+The chosen row is a persisted candidate; when a fresh listing no longer names a
+selected profile variant, the neutral source row may probe that row's own stored
+bytes after the target's authorization checks. The chain resolves the row's
+stored provider URL (or fresh resolve) before probing; a durable `virtual://`
+catalog URI is never handed to ffprobe. It probes the chosen candidate through
 the ordinary background evidence path (queued, coalescing write). A neutral
 group row is never probed speculatively — it may resolve to a sibling
 candidate, so the play path's own probe handles it. Chains are bounded (two
 concurrent, one per item, a whole-chain deadline, and the shared probe
-gate), never block any API response, and never gate or delay playback: a
-chain may record evidence before a play attempt resolves the same row, in
-which case that attempt reuses it, and a play attempt that resolves first
-probes on its own as usual. The queued evidence write follows the existing
+gate), never block any API response, and never wait for playback: a chain may
+record evidence before a play attempt resolves the same row, in which case that
+attempt reuses it, and a play attempt that resolves first probes on its own as
+usual. Foreground probing may still be required when the chain has not
+finished, or when it prepared a version the play attempt does not resolve.
+These bounds are per process: a deployment with several replicas prepares
+independently on each one. The queued evidence write follows the existing
 persistence rules, including their stale-write protections; probing
 failures arm the same failure damper the playback path uses, an
 already-stamped row is skipped, and every unexpected chain failure —
 including a panic — is contained to the chain.
+
+A successful detail discovery is memoized for 30 seconds per viewer, item,
+selected file, and library. The player's inventory poll re-reads watch detail
+every few seconds while a probe is pending; those reads deliberately bypass the
+client cache, and without the memo each one would re-list and re-persist every
+candidate. A different selected file starts its own discovery immediately, and
+the explicit discovery operation and refresh action bypass the memo.
+
+The evidence write also tolerates one catalog-revision race that a re-list can
+cause: if the row's exact path, owner, and probe stamp are unchanged and only
+`updated_at` advanced, the write re-reads the row once and retries against the
+new revision. A changed path, owner, or probe stamp is not re-based, so a
+concurrent probe or a different candidate still wins.
+
+The explicit discovery operation, the refresh action, search, browse, and
+series, season, and episode listings never start a preparation. A listing-only
+run and a detail run are separate work and do not coalesce, so a listing can
+never decide whether a detail read gets its preparation.
+
+`discover_before_playback` promises that the provider listing is fetched and
+persisted. It does not promise that the preparation has finished.
 
 Local-file details, version-only routes, browse results, and series, season,
 and episode lists — including `GET /api/v2/catalog/items/{id}/versions`,

@@ -345,10 +345,11 @@ func adoptionSuccessArgs(id int, path string, ownerID, folderID int, updatedAt t
 }
 
 // TestVirtualAdoptionRefusalNonRequiredZeroRowDoesNotCountDB is the blocker-1
-// regression against the real schema: an ordinary metadata CAS miss on a
-// non-required write leaves the exact-pin counter and the row's failed_at
-// verdict untouched, so ordinary misses can never replenish the bound after a
-// clear.
+// regression against the real schema: a metadata CAS miss on a non-required
+// write leaves the exact-pin counter and the row's failed_at verdict untouched,
+// so ordinary misses can never replenish the bound after a clear. A probe-stamp
+// advance is not a re-list revision: it must not be re-based by the bounded
+// catalog-churn retry.
 func TestVirtualAdoptionRefusalNonRequiredZeroRowDoesNotCountDB(t *testing.T) {
 	pool := virtualMetadataUpdateTestPool(t)
 	ctx := context.Background()
@@ -357,6 +358,11 @@ func TestVirtualAdoptionRefusalNonRequiredZeroRowDoesNotCountDB(t *testing.T) {
 
 	path := "virtual://movie/tt-db-nonrequired-zero?result=pin"
 	id, updatedAt, probeUpdatedAt := insertVirtualAdoptionRow(t, pool, "movie-db-nonrequired-zero", folderID, ownerID, path)
+	// Another probe committed evidence after the caller's snapshot. The path is
+	// unchanged, but the probe stamp is not, so this miss is not catalog churn.
+	if _, err := pool.Exec(ctx, `UPDATE media_files SET probe_updated_at = now(), updated_at = now() WHERE id = $1`, id); err != nil {
+		t.Fatalf("advance probe stamp: %v", err)
+	}
 	repo := scanner.NewFileRepository(pool)
 	for i := 0; i < virtualAdoptionRefusalBound; i++ {
 		if _, err := repo.RecordVirtualAdoptionRefusal(ctx, id, path, virtualAdoptionRefusalTTL); err != nil {

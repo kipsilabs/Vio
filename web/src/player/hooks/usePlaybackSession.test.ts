@@ -188,6 +188,15 @@ describe("buildStartRequestV3", () => {
     expect(buildStartRequestV3(startBase)).not.toHaveProperty("carried_audio_track_id");
   });
 
+  it("binds an offered candidate on the start request", () => {
+    expect(
+      buildStartRequestV3({
+        ...startBase,
+        offeredVirtualURI: "virtual://movie/x?result=offered",
+      }),
+    ).toMatchObject({ offered_virtual_uri: "virtual://movie/x?result=offered" });
+  });
+
   it("emits file_selection when the file was explicitly chosen", () => {
     expect(buildStartRequestV3({ ...startBase, fileSelection: "explicit" })).toMatchObject({
       file_selection: "explicit",
@@ -2454,6 +2463,601 @@ describe("usePlaybackSession version switches", () => {
     unmount();
   });
 
+  it("populates the track menus from an offered release without moving the transport", async () => {
+    const offeredAudio = [
+      { codec: "eac3", channels: 6, layout: "5.1", language: "eng", default: true },
+    ];
+    const offeredSubtitle: SubtitleInventoryItemV3 = {
+      track_id: "file:7:subtitle:4",
+      combined_index: 4,
+      source: "embedded",
+      codec: "subrip",
+      language: "eng",
+      forced: false,
+      default: false,
+      hearing_impaired: false,
+      delivery: "sidecar",
+      url: "/stream/session-1/subtitles/4.vtt?file_id=7",
+    };
+    let replanCalls = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3({
+              inventory_status: "declared",
+              effective_virtual_uri: "virtual://movie/x?result=8376",
+              audio_tracks: [],
+              subtitle: { mode: "off", inventory: [] },
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/replan")) {
+        replanCalls += 1;
+        throw new Error("an offered-release fold must not replan");
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+    const transportBefore = result.current.transportRevision;
+    const planRevisionBefore = result.current.planRevision;
+    const sessionBefore = result.current.sessionId;
+    expect(result.current.planAudioTracks).toEqual([]);
+
+    // The pinned candidate vanished: the server offers the row's current
+    // listing as display data keyed on the row, not on the playing candidate.
+    act(() =>
+      result.current.applyInventoryUpdate({
+        session_id: "session-1",
+        inventory_revision: "inv:offered-7398",
+        inventory_status: "verified",
+        effective_media_file_id: 7,
+        offered_virtual_uri: "virtual://movie/x?result=7398",
+        audio_tracks: offeredAudio,
+        subtitle_inventory: [offeredSubtitle],
+      }),
+    );
+
+    // The menus show what the row offers now...
+    expect(result.current.planAudioTracks).toEqual(offeredAudio);
+    expect(result.current.subtitleUrls).toHaveLength(1);
+    expect(result.current.subtitleUrls[0]?.language).toBe("eng");
+    expect(result.current.audioInventoryProvisional).toBe(false);
+    expect(result.current.subtitleInventoryProvisional).toBe(false);
+    // ...while the transport, session and revisions never move.
+    expect(result.current.effectiveVirtualUri).toBe("virtual://movie/x?result=8376");
+    expect(result.current.mediaFileId).toBe(7);
+    expect(result.current.transportRevision).toBe(transportBefore);
+    expect(result.current.planRevision).toBe(planRevisionBefore);
+    expect(result.current.sessionId).toBe(sessionBefore);
+    expect(replanCalls).toBe(0);
+    unmount();
+  });
+
+  it("starts the offered release with the picked audio identity", async () => {
+    const offeredAudio = [
+      {
+        codec: "eac3",
+        channels: 6,
+        layout: "5.1",
+        language: "eng",
+        default: true,
+        track_id: "file:7:audio:0",
+      },
+    ];
+    const startBodies: Array<Record<string, unknown>> = [];
+    let replanCalls = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        startBodies.push(body);
+        const offeredStart = startBodies.length > 1;
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: offeredStart ? "session-2" : "session-1",
+            playback_plan: fixturePlanV3({
+              session_id: offeredStart ? "session-2" : "session-1",
+              inventory_status: "declared",
+              effective_virtual_uri: offeredStart
+                ? "virtual://movie/x?result=7398"
+                : "virtual://movie/x?result=8376",
+              audio_tracks: offeredStart ? offeredAudio : [],
+              selected_tracks: { audio: { id: "file:7:audio:0", index: 0 } },
+              subtitle: { mode: "off", inventory: [] },
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/replan")) {
+        replanCalls += 1;
+        throw new Error("an offered-release track pick must not send a generic recovery");
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    act(() =>
+      result.current.applyInventoryUpdate({
+        session_id: "session-1",
+        inventory_revision: "inv:offered-7398",
+        inventory_status: "verified",
+        effective_media_file_id: 7,
+        offered_virtual_uri: "virtual://movie/x?result=7398",
+        audio_tracks: offeredAudio,
+        subtitle_inventory: [],
+      }),
+    );
+    act(() => result.current.switchAudioTrack(0, 42));
+
+    await waitFor(() => expect(startBodies).toHaveLength(2));
+    // The pick belongs to a release the transport is not playing. The start
+    // names the row, asks for a fresh link, carries the position, and carries
+    // the offered track identity — a generic recovery names none of those.
+    expect(startBodies[1]).toMatchObject({
+      file_id: 7,
+      start_position: 42,
+      file_selection: "auto",
+      offered_virtual_uri: "virtual://movie/x?result=7398",
+      force_relink: true,
+      carried_audio_track_id: "file:7:audio:0",
+    });
+    expect(replanCalls).toBe(0);
+    await waitFor(() =>
+      expect(result.current.effectiveVirtualUri).toBe("virtual://movie/x?result=7398"),
+    );
+    unmount();
+  });
+
+  it("restores live inventory when a previously folded revision retires an offer", async () => {
+    const liveAudio = [
+      {
+        codec: "aac",
+        channels: 2,
+        layout: "stereo",
+        language: "eng",
+        default: true,
+        track_id: "file:7:audio:0",
+      },
+      {
+        codec: "eac3",
+        channels: 6,
+        layout: "5.1",
+        language: "fra",
+        default: false,
+        track_id: "file:7:audio:1",
+      },
+    ];
+    const offeredAudio = [
+      {
+        codec: "eac3",
+        channels: 6,
+        layout: "5.1",
+        language: "deu",
+        default: true,
+        track_id: "file:7:audio:0",
+      },
+    ];
+    let startCalls = 0;
+    const replanBodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/playback/start")) {
+          startCalls += 1;
+          return jsonResponse(
+            {
+              protocol_version: 3,
+              server_features: ["playback_plan_v3"],
+              outcome: "playable",
+              session_id: "session-1",
+              playback_plan: fixturePlanV3({
+                effective_virtual_uri: "virtual://movie/x?result=A",
+                audio_tracks: liveAudio,
+                selected_tracks: { audio: { id: "file:7:audio:0", index: 0 } },
+                inventory_status: "declared",
+              }),
+            },
+            { status: 201 },
+          );
+        }
+        if (url.endsWith("/playback/session-1/replan")) {
+          replanBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+          return jsonResponse({
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3({
+              plan_id: "plan:live-recovered",
+              plan_attempt_key: "v3:live-recovered",
+              effective_virtual_uri: "virtual://movie/x?result=A",
+              audio_tracks: liveAudio,
+              selected_tracks: { audio: { id: "file:7:audio:1", index: 1 } },
+            }),
+          });
+        }
+        if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+        if (init?.method === "DELETE") return new Response(null, { status: 204 });
+        throw new Error(`Unexpected request: ${url}`);
+      }),
+    );
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    // Fold the live inventory first, then replace it with an offer. The later
+    // packet repeats the already-folded live revision: retirement must still
+    // restore the live tracks instead of clearing only the offer marker and
+    // returning at the revision gate.
+    act(() =>
+      result.current.applyInventoryUpdate({
+        session_id: "session-1",
+        inventory_revision: "inv:live-A",
+        inventory_status: "verified",
+        effective_media_file_id: 7,
+        effective_virtual_uri: "virtual://movie/x?result=A",
+        audio_tracks: liveAudio,
+        subtitle_inventory: [],
+      }),
+    );
+    act(() =>
+      result.current.applyInventoryUpdate({
+        session_id: "session-1",
+        inventory_revision: "inv:offered-C",
+        inventory_status: "verified",
+        effective_media_file_id: 7,
+        offered_virtual_uri: "virtual://movie/x?result=C",
+        audio_tracks: offeredAudio,
+        subtitle_inventory: [],
+      }),
+    );
+    expect(result.current.planAudioTracks).toEqual(offeredAudio);
+
+    act(() =>
+      result.current.applyInventoryUpdate({
+        session_id: "session-1",
+        inventory_revision: "inv:live-A",
+        inventory_status: "verified",
+        effective_media_file_id: 7,
+        effective_virtual_uri: "virtual://movie/x?result=A",
+        audio_tracks: liveAudio,
+        subtitle_inventory: [],
+      }),
+    );
+    expect(result.current.planAudioTracks).toEqual(liveAudio);
+    act(() => result.current.switchAudioTrack(1, 10));
+    await waitFor(() => expect(replanBodies).toHaveLength(1));
+    expect(replanBodies[0]).toMatchObject({
+      operation: "track_change",
+      selected_tracks: { audio: { id: "file:7:audio:1", index: 1 } },
+    });
+    expect(startCalls).toBe(1);
+    unmount();
+  });
+
+  it("carries an offered subtitle identity and expresses subtitles off on restart", async () => {
+    const offeredAudio = [
+      {
+        codec: "eac3",
+        channels: 6,
+        layout: "5.1",
+        language: "eng",
+        default: true,
+        track_id: "file:7:audio:0",
+      },
+    ];
+    const offeredSubtitle = fixtureSubtitleInventoryItemV3({
+      track_id: "file:7:subtitle:4",
+      combined_index: 4,
+      language: "eng",
+      label: "English",
+      url: "/stream/session-1/subtitles/4.vtt?file_id=7",
+    });
+    const startBodies: Array<Record<string, unknown>> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        startBodies.push(body);
+        const session = `session-${startBodies.length}`;
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: session,
+            playback_plan: fixturePlanV3({
+              session_id: session,
+              inventory_status: "declared",
+              effective_virtual_uri:
+                startBodies.length === 1
+                  ? "virtual://movie/x?result=8376"
+                  : "virtual://movie/x?result=7398",
+              audio_tracks: startBodies.length === 1 ? [] : offeredAudio,
+              selected_tracks: { audio: { id: "file:7:audio:0", index: 0 } },
+              subtitle: { mode: "off", inventory: [] },
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    act(() =>
+      result.current.applyInventoryUpdate({
+        session_id: "session-1",
+        inventory_revision: "inv:offered-sub-1",
+        inventory_status: "verified",
+        effective_media_file_id: 7,
+        offered_virtual_uri: "virtual://movie/x?result=7398",
+        audio_tracks: offeredAudio,
+        subtitle_inventory: [offeredSubtitle],
+      }),
+    );
+    act(() => result.current.changeSubtitleTrack(4, 30));
+    await waitFor(() => expect(startBodies).toHaveLength(2));
+    expect(startBodies[1]).toMatchObject({
+      file_id: 7,
+      start_position: 30,
+      file_selection: "auto",
+      offered_virtual_uri: "virtual://movie/x?result=7398",
+      force_relink: true,
+      carried_audio_track_id: "file:7:audio:0",
+      subtitle_track_index: 4,
+      subtitle_track_id: "file:7:subtitle:4",
+    });
+
+    await waitFor(() => expect(result.current.sessionId).toBe("session-2"));
+    act(() =>
+      result.current.applyInventoryUpdate({
+        session_id: "session-2",
+        inventory_revision: "inv:offered-sub-2",
+        inventory_status: "verified",
+        effective_media_file_id: 7,
+        offered_virtual_uri: "virtual://movie/x?result=9999",
+        audio_tracks: offeredAudio,
+        subtitle_inventory: [offeredSubtitle],
+      }),
+    );
+    act(() => result.current.changeSubtitleTrack(null, 35));
+    await waitFor(() => expect(startBodies).toHaveLength(3));
+    expect(startBodies[2]).toMatchObject({
+      file_id: 7,
+      start_position: 35,
+      offered_virtual_uri: "virtual://movie/x?result=9999",
+      carried_audio_track_id: "file:7:audio:0",
+    });
+    expect(startBodies[2]).not.toHaveProperty("subtitle_track_index");
+    expect(startBodies[2]).not.toHaveProperty("subtitle_track_id");
+    unmount();
+  });
+
+  it("keeps the offered candidate through the bitmap-subtitle fallback", async () => {
+    const offeredAudio = [
+      {
+        codec: "eac3",
+        channels: 6,
+        layout: "5.1",
+        language: "eng",
+        default: true,
+        track_id: "file:7:audio:0",
+      },
+    ];
+    const offeredBitmap = fixtureSubtitleInventoryItemV3({
+      track_id: "file:7:subtitle:4",
+      combined_index: 4,
+      codec: "pgs",
+      delivery: "burn_in_only",
+      url: undefined,
+    });
+    const startBodies: Array<Record<string, unknown>> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        startBodies.push(body);
+        if (startBodies.length === 1) {
+          return jsonResponse(
+            {
+              protocol_version: 3,
+              server_features: ["playback_plan_v3"],
+              outcome: "playable",
+              session_id: "session-1",
+              playback_plan: fixturePlanV3({
+                effective_virtual_uri: "virtual://movie/x?result=A",
+                audio_tracks: offeredAudio,
+                subtitle: { mode: "off", inventory: [] },
+              }),
+            },
+            { status: 201 },
+          );
+        }
+        if (startBodies.length === 2) {
+          return jsonResponse({
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "adaptation_unavailable",
+            terminal: {
+              reason: "subtitle_conversion_unsupported",
+              message: "The selected subtitle cannot be burned in.",
+              retryable: false,
+            },
+          });
+        }
+        return jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "playable",
+          session_id: "session-2",
+          playback_plan: fixturePlanV3({
+            session_id: "session-2",
+            effective_virtual_uri: "virtual://movie/x?result=7398",
+            audio_tracks: offeredAudio,
+            selected_tracks: { audio: { id: "file:7:audio:0", index: 0 } },
+            subtitle: { mode: "off", inventory: [] },
+          }),
+        });
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+    act(() =>
+      result.current.applyInventoryUpdate({
+        session_id: "session-1",
+        inventory_revision: "inv:offered-bitmap",
+        inventory_status: "verified",
+        effective_media_file_id: 7,
+        offered_virtual_uri: "virtual://movie/x?result=7398",
+        audio_tracks: offeredAudio,
+        subtitle_inventory: [offeredBitmap],
+      }),
+    );
+    act(() => result.current.changeSubtitleTrack(4, 30));
+    await waitFor(() => expect(startBodies).toHaveLength(3));
+    expect(startBodies[1]).toMatchObject({
+      file_id: 7,
+      offered_virtual_uri: "virtual://movie/x?result=7398",
+      subtitle_track_index: 4,
+      subtitle_track_id: "file:7:subtitle:4",
+    });
+    // The subtitle-free retry still belongs to the offered candidate.
+    expect(startBodies[2]).toMatchObject({
+      file_id: 7,
+      offered_virtual_uri: "virtual://movie/x?result=7398",
+    });
+    expect(startBodies[2]).not.toHaveProperty("subtitle_track_index");
+    expect(startBodies[2]).not.toHaveProperty("subtitle_track_id");
+    unmount();
+  });
+
+  it("does not run the bitmap fallback for an unavailable offered candidate", async () => {
+    const offeredAudio = [
+      {
+        codec: "eac3",
+        channels: 6,
+        layout: "5.1",
+        language: "eng",
+        default: true,
+        track_id: "file:7:audio:0",
+      },
+    ];
+    const offeredBitmap = fixtureSubtitleInventoryItemV3({
+      track_id: "file:7:subtitle:4",
+      combined_index: 4,
+      codec: "pgs",
+      delivery: "burn_in_only",
+      url: undefined,
+    });
+    let starts = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        starts += 1;
+        if (starts === 1) {
+          return jsonResponse(
+            {
+              protocol_version: 3,
+              server_features: ["playback_plan_v3"],
+              outcome: "playable",
+              session_id: "session-1",
+              playback_plan: fixturePlanV3({
+                effective_virtual_uri: "virtual://movie/x?result=A",
+                audio_tracks: offeredAudio,
+                subtitle: { mode: "off", inventory: [] },
+              }),
+            },
+            { status: 201 },
+          );
+        }
+        return jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "adaptation_unavailable",
+          terminal: {
+            reason: "offered_release_unavailable",
+            message: "The offered release is no longer available.",
+            retryable: true,
+          },
+        });
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+    act(() =>
+      result.current.applyInventoryUpdate({
+        session_id: "session-1",
+        inventory_revision: "inv:offered-bitmap-unavailable",
+        inventory_status: "verified",
+        effective_media_file_id: 7,
+        offered_virtual_uri: "virtual://movie/x?result=7398",
+        audio_tracks: offeredAudio,
+        subtitle_inventory: [offeredBitmap],
+      }),
+    );
+    act(() => result.current.changeSubtitleTrack(4, 30));
+    await waitFor(() => expect(starts).toBe(2));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(starts).toBe(2);
+    unmount();
+  });
+
   it("folds a mid-switch seek into a chained switch without a competing replan", async () => {
     const startBodies: Array<{ file_id: number; start_position?: number }> = [];
     const replanBodies: Array<Record<string, unknown>> = [];
@@ -2916,6 +3520,128 @@ describe("usePlaybackSession replans", () => {
     expect(
       replanBodies.map(({ operation, position_seconds }) => ({ operation, position_seconds })),
     ).toEqual([{ operation: "track_change", position_seconds: 120 }]);
+
+    unmount();
+  });
+
+  it("rejects deferred inventory for the outgoing candidate after a replan adopts another", async () => {
+    const outgoingURI = "virtual://movie/x?result=outgoing";
+    const incomingURI = "virtual://movie/x?result=incoming";
+    const outgoingAudio = [
+      { index: 0, language: "eng", codec: "aac", channels: 2, layout: "stereo", default: true },
+    ];
+    const incomingAudio = [
+      {
+        index: 0,
+        language: "spa",
+        codec: "eac3",
+        channels: 6,
+        layout: "5.1",
+        default: true,
+        track_id: "file:7:audio:0",
+      },
+      {
+        index: 1,
+        language: "eng",
+        codec: "aac",
+        channels: 2,
+        layout: "stereo",
+        default: false,
+        track_id: "file:7:audio:1",
+      },
+    ];
+    let releaseReplan!: (response: Response) => void;
+    const heldReplan = new Promise<Response>((resolve) => {
+      releaseReplan = resolve;
+    });
+    const replanBodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/playback/start")) {
+          return jsonResponse(
+            {
+              protocol_version: 3,
+              server_features: ["playback_plan_v3"],
+              outcome: "playable",
+              session_id: "session-1",
+              playback_plan: fixturePlanV3({
+                effective_virtual_uri: outgoingURI,
+                audio_tracks: outgoingAudio,
+                inventory_status: "declared",
+              }),
+            },
+            { status: 201 },
+          );
+        }
+        if (url.endsWith("/playback/session-1/replan")) {
+          replanBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+          return heldReplan;
+        }
+        if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+        if (init?.method === "DELETE") return jsonResponse({ outcome: "stopped" });
+        throw new Error(`Unexpected request: ${url}`);
+      }),
+    );
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+    expect(result.current.effectiveVirtualUri).toBe(outgoingURI);
+
+    // Hold the replacement plan open, then let the outgoing candidate's
+    // verified inventory arrive while the client is still waiting for it.
+    act(() => void result.current.refreshSubtitles(120));
+    await waitFor(() => expect(replanBodies).toHaveLength(1));
+    act(() =>
+      result.current.applyInventoryUpdate({
+        session_id: "session-1",
+        inventory_revision: "inv:outgoing-verified",
+        inventory_status: "verified",
+        effective_media_file_id: 7,
+        effective_virtual_uri: outgoingURI,
+        audio_tracks: outgoingAudio,
+        subtitle_inventory: [],
+      }),
+    );
+
+    await act(async () => {
+      releaseReplan(
+        jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "playable",
+          session_id: "session-1",
+          playback_plan: fixturePlanV3({
+            plan_id: "plan:incoming-replacement",
+            plan_attempt_key: "v3:incoming-replacement",
+            effective_virtual_uri: incomingURI,
+            audio_tracks: incomingAudio,
+            selected_tracks: { audio: { id: "file:7:audio:0", index: 0 } },
+            inventory_status: "declared",
+          }),
+        }),
+      );
+      await heldReplan;
+    });
+
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe("plan:incoming-replacement"));
+    expect(result.current.effectiveVirtualUri).toBe(incomingURI);
+    expect(result.current.planAudioTracks).toEqual(incomingAudio);
+
+    // The next pick must target the winning release, not the deferred
+    // outgoing inventory that was queued before the replacement landed.
+    act(() => result.current.switchAudioTrack(1, 45));
+    await waitFor(() => expect(replanBodies).toHaveLength(2));
+    expect(replanBodies[1]).toMatchObject({
+      operation: "track_change",
+      selected_tracks: {
+        audio: { id: "file:7:audio:1", index: 1 },
+      },
+    });
 
     unmount();
   });
@@ -3674,6 +4400,138 @@ describe("usePlaybackSession server-invalidated plans", () => {
     // Pause state is untouched: the adopted plan reports the transport's own
     // paused state rather than autoplaying over the viewer's pause.
     expect(result.current.shouldAutoPlay).toBe(false);
+
+    unmount();
+  });
+
+  // The deferred-inventory adoption: a cold virtual start commits a plan from
+  // declared audio metadata, the probe reorders the inventory so the preferred
+  // track lands at the same POSITIONAL index, and the verified revision then
+  // arrives. Both menus fill in without a client replan; the server withdraws
+  // the stale recipe and the client's replacement replan adopts the corrected
+  // plan. The replacement is transport-different even though the positional
+  // `selected_tracks.audio.index` is unchanged, because the executable stream
+  // ordinal moved — the element must reload, or the already-rebuilt session
+  // stream (which now muxes the corrected audio) is never read and playback
+  // stays silent until a stop/resume.
+  // The in-place adoption invariant: the deferred probe's real lists land
+  // while the cold-start plan is still provisional, and a later plan adoption
+  // (an output/quality refresh built before the probe persisted) must not
+  // regress the menus to the stale declared list. Nothing replans for the
+  // adoption, nothing reloads, and what is already playing keeps playing.
+  it("keeps the real deferred inventory in place when a later provisional plan is adopted", async () => {
+    const declaredAudio = [
+      { index: 1, language: "eng", codec: "aac", channels: 2, layout: "stereo", default: true },
+      { index: 3, language: "spa", codec: "eac3", channels: 6, layout: "5.1", default: false },
+    ];
+    // The probe found the preferred spa stream first in the verified order.
+    const verifiedAudio = [
+      { index: 3, language: "spa", codec: "eac3", channels: 6, layout: "5.1", default: true },
+      { index: 1, language: "eng", codec: "aac", channels: 2, layout: "stereo", default: false },
+    ];
+    const declaredPlan = fixturePlanV3({
+      inventory_status: "declared",
+      inventory_provenance: "pending",
+      tracks_pending: true,
+      audio_tracks: declaredAudio,
+      selected_tracks: { audio: { id: "file:7:audio:0", index: 0 } },
+    });
+    // A replan built before the probe persisted: provisional again, carrying
+    // the stale declared list rather than the real one.
+    const provisionalPlan = fixturePlanV3({
+      plan_id: "plan:2222222222222222",
+      plan_attempt_key: "v3:2222222222222222",
+      inventory_status: "declared",
+      inventory_provenance: "pending",
+      tracks_pending: true,
+      audio_tracks: declaredAudio,
+      selected_tracks: { audio: { id: "file:7:audio:0", index: 0 } },
+    });
+    const verifiedSubtitle = {
+      track_id: "file:7:subtitle:0",
+      combined_index: 0,
+      source: "embedded" as const,
+      codec: "subrip",
+      language: "eng",
+      forced: false,
+      default: false,
+      hearing_impaired: false,
+      delivery: "sidecar" as const,
+      url: "/stream/session-1/subtitles/0.vtt?file_id=7",
+    };
+    const replanBodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/playback/start")) {
+          return jsonResponse(
+            {
+              protocol_version: 3,
+              server_features: ["playback_plan_v3"],
+              outcome: "playable",
+              session_id: "session-1",
+              playback_plan: declaredPlan,
+            },
+            { status: 201 },
+          );
+        }
+        if (url.endsWith("/playback/session-1/replan")) {
+          replanBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+          return jsonResponse({
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: provisionalPlan,
+          });
+        }
+        if (url.endsWith("/playback/route-events")) {
+          return new Response(null, { status: 202 });
+        }
+        if (init?.method === "DELETE") {
+          return new Response(null, { status: 204 });
+        }
+        throw new Error(`Unexpected request: ${url}`);
+      }),
+    );
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe("plan:0123456789abcdef"));
+    expect(result.current.audioInventoryProvisional).toBe(true);
+    expect(result.current.transportRevision).toBe(1);
+
+    // The verified revision lands while the provisional plan is still playing:
+    // both menus fill in without a client replan and without a stream reload.
+    act(() =>
+      result.current.applyInventoryUpdate({
+        session_id: "session-1",
+        inventory_revision: "inv:1",
+        inventory_status: "verified",
+        effective_media_file_id: 7,
+        audio_tracks: verifiedAudio,
+        subtitle_inventory: [verifiedSubtitle],
+      }),
+    );
+    expect(replanBodies).toHaveLength(0);
+    expect(result.current.audioInventoryProvisional).toBe(false);
+    expect(result.current.planAudioTracks).toEqual(verifiedAudio);
+    expect(result.current.subtitleUrls).toHaveLength(1);
+
+    // A later provisional plan is adopted (vehicle: an ordinary track change).
+    // The real lists must survive it in place; the stream does not reload.
+    await act(async () => {
+      result.current.switchAudioTrack(1, 450);
+    });
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe("plan:2222222222222222"));
+    expect(replanBodies).toHaveLength(1);
+    expect(result.current.planAudioTracks).toEqual(verifiedAudio);
+    expect(result.current.audioInventoryProvisional).toBe(false);
+    expect(result.current.subtitleUrls).toHaveLength(1);
+    expect(result.current.transportRevision).toBe(1);
 
     unmount();
   });
@@ -6884,6 +7742,215 @@ describe("usePlaybackSession plan audio inventory", () => {
 
     expect(result.current.planAudioTracks).toEqual(verified);
     expect(result.current.audioInventoryProvisional).toBe(false);
+    unmount();
+  });
+
+  // The cold plan for a virgin virtual release carries zero tracks (fast
+  // discovery timed out, the declared fallback is empty too) and commits before
+  // the background probe materializes the candidate's own catalog row. The
+  // verified push that follows is bound to the same candidate URI but names that
+  // later row, so its `effective_media_file_id` differs from the plan's. It is
+  // the server's own inventory for the live session, not another source: folding
+  // it in place mounts both track menus (the audio button and the subtitle list)
+  // without a replan, a row/file switch, or an element reload. Red before the
+  // guard learned to admit a verified revision for the exact live candidate.
+  it("mounts both menus from a verified push when the cold plan is empty", async () => {
+    const candidateUri = "virtual://movie/x?result=A";
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3({
+              inventory_status: "declared",
+              inventory_provenance: "pending",
+              effective_media_file_id: 7,
+              effective_virtual_uri: candidateUri,
+              audio_tracks: [],
+              subtitle: { mode: "off", inventory: [] },
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+    expect(result.current.planAudioTracks).toEqual([]);
+    expect(result.current.subtitleUrls).toEqual([]);
+    expect(result.current.audioInventoryProvisional).toBe(true);
+    expect(result.current.subtitleInventoryProvisional).toBe(true);
+    const planRevision = result.current.planRevision;
+    const transportRevision = result.current.transportRevision;
+    const streamUrl = result.current.streamUrl;
+
+    act(() =>
+      result.current.applyInventoryUpdate({
+        session_id: "session-1",
+        inventory_revision: "inv:1",
+        inventory_status: "verified",
+        // The candidate's own catalog row, materialized after the cold plan
+        // committed; the URI still names the live candidate.
+        effective_media_file_id: 8,
+        effective_virtual_uri: candidateUri,
+        audio_tracks: [
+          { codec: "eac3", channels: 6, layout: "5.1", language: "eng", default: true },
+          { codec: "ac3", channels: 2, layout: "stereo", language: "spa", default: false },
+        ],
+        subtitle_inventory: [
+          {
+            track_id: "file:8:subtitle:0",
+            combined_index: 0,
+            source: "embedded",
+            codec: "subrip",
+            language: "eng",
+            forced: false,
+            default: false,
+            hearing_impaired: false,
+            delivery: "sidecar",
+            url: "/stream/session-1/subtitles/0.vtt?file_id=8",
+          },
+        ],
+      }),
+    );
+
+    // Both menus are created from the verified push; the badge clears.
+    expect(result.current.planAudioTracks).toHaveLength(2);
+    expect(result.current.subtitleUrls).toHaveLength(1);
+    expect(result.current.subtitleUrls[0]?.language).toBe("eng");
+    expect(result.current.audioInventoryProvisional).toBe(false);
+    expect(result.current.subtitleInventoryProvisional).toBe(false);
+    // Menu data only: the same session keeps its stream, transport and plan.
+    expect(result.current.sessionId).toBe("session-1");
+    expect(result.current.planRevision).toBe(planRevision);
+    expect(result.current.transportRevision).toBe(transportRevision);
+    expect(result.current.streamUrl).toBe(streamUrl);
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).includes("/replan"))).toHaveLength(0);
+    unmount();
+  });
+
+  // The same cold-empty plan, but the verified push arrives while the
+  // default-audio reconciliation replan is in flight. The flush must still mount
+  // the menus from it: the push names the live candidate's URI, so its differing
+  // catalog row is the resolved identity, not a sibling. Red before the flush
+  // admitted a verified revision for the exact live candidate.
+  it("mounts both menus from a verified push deferred by a replan", async () => {
+    const candidateUri = "virtual://movie/x?result=A";
+    let releaseReplan: ((response: Response) => void) | undefined;
+    const heldReplan = new Promise<Response>((resolve) => {
+      releaseReplan = resolve;
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3({
+              inventory_status: "declared",
+              inventory_provenance: "pending",
+              effective_media_file_id: 7,
+              effective_virtual_uri: candidateUri,
+              audio_tracks: [],
+              subtitle: { mode: "off", inventory: [] },
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/session-1/replan")) return heldReplan;
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+    const transportRevision = result.current.transportRevision;
+
+    act(() => {
+      void result.current.refreshSubtitles(120);
+    });
+    await waitFor(() => expect(result.current.replanning).toBe(true));
+
+    act(() =>
+      result.current.applyInventoryUpdate({
+        session_id: "session-1",
+        inventory_revision: "inv:deferred-empty",
+        inventory_status: "verified",
+        effective_media_file_id: 8,
+        effective_virtual_uri: candidateUri,
+        audio_tracks: [
+          { codec: "eac3", channels: 6, layout: "5.1", language: "eng", default: true },
+          { codec: "ac3", channels: 2, layout: "stereo", language: "spa", default: false },
+        ],
+        subtitle_inventory: [
+          {
+            track_id: "file:8:subtitle:0",
+            combined_index: 0,
+            source: "embedded",
+            codec: "subrip",
+            language: "eng",
+            forced: false,
+            default: false,
+            hearing_impaired: false,
+            delivery: "sidecar",
+            url: "/stream/session-1/subtitles/0.vtt?file_id=8",
+          },
+        ],
+      }),
+    );
+
+    // The reconciliation replan settles on the same candidate with the stale
+    // (empty) declared list; the deferred verified push then mounts the menus.
+    await act(async () => {
+      releaseReplan?.(
+        jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "playable",
+          session_id: "session-1",
+          playback_plan: fixturePlanV3({
+            plan_id: "plan:deferred-empty",
+            plan_attempt_key: "v3:deferred-empty",
+            inventory_status: "declared",
+            inventory_provenance: "pending",
+            effective_media_file_id: 7,
+            effective_virtual_uri: candidateUri,
+            audio_tracks: [],
+            subtitle: { mode: "off", inventory: [] },
+          }),
+        }),
+      );
+      await heldReplan;
+    });
+
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe("plan:deferred-empty"));
+    expect(result.current.planAudioTracks).toHaveLength(2);
+    expect(result.current.subtitleUrls).toHaveLength(1);
+    expect(result.current.audioInventoryProvisional).toBe(false);
+    expect(result.current.subtitleInventoryProvisional).toBe(false);
+    expect(result.current.transportRevision).toBe(transportRevision);
+    expect(result.current.sessionId).toBe("session-1");
     unmount();
   });
 });

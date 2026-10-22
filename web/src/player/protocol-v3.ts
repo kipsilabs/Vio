@@ -393,6 +393,10 @@ export interface StartRequestV3 {
    * terminal for a capability reason.
    */
   file_selection?: "auto" | "explicit";
+  /** Concrete candidate a previous inventory event offered under this row.
+   *  Set when the viewer picks a track from that offer, so the server binds
+   *  the same release rather than re-resolving an arbitrary one. */
+  offered_virtual_uri?: string;
   /** When true, the server should force a re-link/re-query of the virtual file
    *  on this start attempt. Only sent when the viewer explicitly picks an
    *  unavailable version. */

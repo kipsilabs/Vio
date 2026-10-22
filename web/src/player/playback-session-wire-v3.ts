@@ -139,12 +139,18 @@ export interface StartRequestInput {
   progressPersistence?: ProgressPersistenceV3;
   explicitAudioTrackIndex?: number | null;
   subtitleTrackIndex?: number | null;
+  /** File-bound subtitle identity carried into a replacement start, so a
+   * source transition keeps the selected language instead of falling back to
+   * the new plan's default. */
+  subtitleTrackID?: string | null;
   /** File-bound audio track identity carried from the current plan into a
    * replacement start (a version switch); remapped by family server-side. */
   carriedAudioTrackID?: string | null;
   /** How the requested file was chosen; `explicit` forbids silent server-side
    * version substitution. Omitted means the server owns the choice. */
   fileSelection?: "auto" | "explicit";
+  /** Concrete offered candidate this start is binding to. */
+  offeredVirtualURI?: string;
   /** When true, the server should force a re-link/re-query of the virtual file
    *  on this start attempt. Only sent when the viewer explicitly picks an
    *  unavailable version. */
@@ -187,10 +193,12 @@ export function buildStartRequestV3(input: StartRequestInput): StartRequestV3 {
       : {}),
     ...(input.carriedAudioTrackID ? { carried_audio_track_id: input.carriedAudioTrackID } : {}),
     ...(input.fileSelection ? { file_selection: input.fileSelection } : {}),
+    ...(input.offeredVirtualURI ? { offered_virtual_uri: input.offeredVirtualURI } : {}),
     ...(input.forceRelink ? { force_relink: input.forceRelink } : {}),
     ...(input.subtitleTrackIndex != null && input.subtitleTrackIndex >= 0
       ? { subtitle_track_index: input.subtitleTrackIndex }
       : {}),
+    ...(input.subtitleTrackID ? { subtitle_track_id: input.subtitleTrackID } : {}),
     ...(input.bandwidthEstimateKbps != null
       ? { bandwidth_estimate_kbps: input.bandwidthEstimateKbps }
       : {}),

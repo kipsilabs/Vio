@@ -6,6 +6,7 @@ import (
 	"maps"
 	"runtime/debug"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -146,7 +147,36 @@ func NewVirtualDefaultProbeTarget(versions VirtualProbeVersionLister, files Virt
 		if err != nil || len(list) == 0 {
 			return nil, err
 		}
-		return files.GetByID(ctx, list[0].FileID)
+		selected := list[0].FileID
+		if filter.SelectedFileID != 0 {
+			selected = 0
+			for _, version := range list {
+				if version.FileID == filter.SelectedFileID {
+					selected = version.FileID
+					break
+				}
+			}
+			if selected == 0 {
+				return nil, nil
+			}
+		}
+		row, err := files.GetByID(ctx, selected)
+		if err != nil || row == nil {
+			return nil, err
+		}
+		// A selected catalog entry authorizes the association named by the
+		// listing, not an unrelated row that happens to carry the same id.
+		if row.ID != selected || (row.EpisodeID != "" && row.EpisodeID != contentID) ||
+			(row.EpisodeID == "" && row.ContentID != contentID) {
+			return nil, nil
+		}
+		if _, none := filter.LibraryScope([]int{row.MediaFolderID}); none {
+			return nil, nil
+		}
+		if filter.ScopeFilesToLibrary && filter.PresentationLibraryID != nil && row.MediaFolderID != *filter.PresentationLibraryID {
+			return nil, nil
+		}
+		return row, nil
 	})
 }
 
@@ -238,7 +268,13 @@ func (h *PlaybackHandler) ScheduleDefaultFileProbe(contentID string, source *mod
 			virtualProbeChainReasonScheduleRefused, "prober_unwired")
 		return
 	}
-	release, refusal := h.defaultProbeChains.acquire(contentID)
+	// One chain per item and selected version. Discovery persists one source
+	// group at a time; keying admission by source as well let five groups for
+	// the same title each schedule a chain, exhausting the process-wide slots
+	// with duplicates. The chain re-reads the selected row and probes that row's
+	// own stored URL, so any discovery group can safely start it.
+	admissionKey := contentID + "\x00" + strconv.Itoa(filter.SelectedFileID)
+	release, refusal := h.defaultProbeChains.acquire(admissionKey)
 	if refusal != defaultProbeChainRefusalNone {
 		// A chain for this item is already live, or both slots are taken.
 		// Either way the callback is dropped: the live chain re-reads the same
@@ -361,7 +397,7 @@ func (h *PlaybackHandler) runDefaultFileProbeChain(ctx context.Context, contentI
 		return
 	}
 	oid := row.VirtualOwnerInstallationID
-	probeCand := virtualDefaultProbeCandidate(row, source, streams)
+	probeCand := virtualDefaultProbeCandidate(row, source, streams, filter.SelectedFileID != 0)
 	if probeCand == nil {
 		// Without an exact byte match there is nothing safe to enumerate: the
 		// default may be the neutral group row, and a neutral default may
@@ -391,15 +427,27 @@ func (h *PlaybackHandler) runDefaultFileProbeChain(ctx context.Context, contentI
 	// Zero the duration so the probe measures the empirical duration instead
 	// of inheriting the catalog value.
 	probeTransient.Duration = 0
-	// The chain probes the default row's own candidate bytes (probeURL = the
-	// row's persisted URI) and persists through the queued, coalescing
-	// evidence path. No session binding exists here, so the fence is nil and
-	// the identity tiers are zero — the same posture the unstamped-row fast
-	// path takes, where the row owns its persisted candidate.
-	outcome := h.probeVirtualSourceAndPersist(
-		ctx, stickyKey, row, row.FilePath, probeTransient, *probeCand,
-		resolver.PersistedIdentityTiers{}, expectedRuntimeMinutes, oid,
+	probeURL, probeHeaders, hasProbeURL := h.virtualChainProbeURL(ctx, row, *probeCand, filter)
+	if !hasProbeURL {
+		logVirtualProbeChainSkip(ctx, slog.LevelDebug, contentID,
+			virtualProbeChainReasonNoExactCandidate, "no_provider_url", virtualEvidenceLogKeyFileID, row.ID)
+		return
+	}
+	probeCand.RequestHeaders = probeHeaders
+	// The chain probes the selected/default row's own candidate bytes and uses
+	// the durable evidence path: an already-loaded detail/version page can only
+	// be invalidated after the tracks are actually committed. No session binding
+	// exists here, so the fence is nil and the identity tiers are zero — the same
+	// posture the unstamped-row fast path takes, where the row owns its candidate.
+	outcome, _ := h.probeVirtualSourceAndPersistWith(
+		ctx, stickyKey, row, probeURL, probeTransient, *probeCand,
+		resolver.PersistedIdentityTiers{}, expectedRuntimeMinutes, oid, true, nil,
 	)
+	if outcome == probeOutcomeVerified && h.EventsHub != nil {
+		publishCtx, publishCancel := context.WithTimeout(context.WithoutCancel(ctx), virtualCandidatePublishBudget)
+		publishVirtualVersionsUpdatedEvent(publishCtx, nil, h.EventsHub, contentID)
+		publishCancel()
+	}
 	switch outcome {
 	case probeOutcomeFailed:
 		if ctx.Err() != nil {
@@ -415,13 +463,51 @@ func (h *PlaybackHandler) runDefaultFileProbeChain(ctx context.Context, contentI
 	}
 }
 
-// virtualDefaultProbeCandidate matches the default row's exact bytes against
-// the listing the discovery run just persisted. An exact URI match is the only
-// admissible enumeration target: the row's persisted identity must be the
-// bytes the probe opens. The neutral group row itself is never admissible —
-// the just-persisted listing necessarily contains it (under the same virtual
-// path the group was listed from) without naming any specific release.
-func virtualDefaultProbeCandidate(row *models.MediaFile, source *models.MediaFile, streams []VirtualPlaybackStream) *VirtualPlaybackStream {
+// virtualChainProbeURL resolves the HTTP source the pre-play probe must open.
+// The catalog row and the discovery listing both name the candidate by its
+// durable virtual URI; that URI is not a provider transport and must never be
+// handed to ffprobe. The fresh listing's resolved URL is preferred, then the
+// row's stored URL while unexpired, then a fresh resolve under the same access
+// filter that authorized discovery.
+func (h *PlaybackHandler) virtualChainProbeURL(ctx context.Context, row *models.MediaFile, cand VirtualPlaybackStream, filter catalog.AccessFilter) (string, map[string]string, bool) {
+	if row == nil {
+		return "", nil, false
+	}
+	now := time.Now()
+	// A persisted candidate copied from a selected row carries that row's signed
+	// URL too. It must obey the same expiry fence as the row fallback below;
+	// otherwise a vanished profile variant with an expired URL is probed instead
+	// of being resolved freshly, and the probe failure damages the candidate.
+	if url := strings.TrimSpace(cand.ProviderURL); url != "" &&
+		(cand.ProviderExpiresAt == nil || cand.ProviderExpiresAt.After(now)) {
+		return url, maps.Clone(cand.RequestHeaders), true
+	}
+	if url := strings.TrimSpace(row.ResolvedURL); url != "" &&
+		(row.ResolvedURLExpiresAt == nil || row.ResolvedURLExpiresAt.After(now)) {
+		return url, maps.Clone(row.ProviderRequestHeaders), true
+	}
+	if h.VirtualMediaDetailedResolver == nil {
+		return "", nil, false
+	}
+	resolved, err := h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
+		ctx, row.FilePath, row.VirtualOwnerInstallationID, filter.UserID, filter.ProfileID,
+		false, nil, "",
+	)
+	if err != nil || strings.TrimSpace(resolved.URL) == "" {
+		return "", nil, false
+	}
+	return resolved.URL, maps.Clone(resolved.RequestHeaders), true
+}
+
+// virtualDefaultProbeCandidate resolves the exact bytes the chain may probe.
+// An exact URI match against the listing the discovery run just persisted is
+// preferred. A selected version may also use its own persisted row when the
+// fresh listing dropped that profile variant: the target read authorized the
+// row, and a neutral source covers every profile variant beneath its base path.
+// A profile-specific source covers only its own group. The neutral group row
+// itself is never admissible — it names no specific release and may resolve to
+// a sibling candidate, so the play path's own probe handles it.
+func virtualDefaultProbeCandidate(row *models.MediaFile, source *models.MediaFile, streams []VirtualPlaybackStream, allowPersistedSelected bool) *VirtualPlaybackStream {
 	if row == nil || source == nil {
 		return nil
 	}
@@ -437,5 +523,48 @@ func virtualDefaultProbeCandidate(row *models.MediaFile, source *models.MediaFil
 			return &streams[i]
 		}
 	}
-	return nil
+	if !allowPersistedSelected {
+		return nil
+	}
+	if virtualResultCandidateID(target) == "" {
+		return nil
+	}
+	// A selected row can be a persisted candidate from an earlier provider
+	// listing. The target read authorized its content, episode, owner, and
+	// library; its own concrete result id names the bytes to probe. The
+	// discovery source only supplies the scheduling hand-off, so a chain started
+	// by a sibling source may still probe this row's stored URL. A neutral row
+	// (no result id) is never probed speculatively; the default path keeps the
+	// exact-listing requirement above.
+	return virtualPlaybackStreamFromFile(row)
+}
+
+func virtualPlaybackStreamFromFile(row *models.MediaFile) *VirtualPlaybackStream {
+	if row == nil {
+		return nil
+	}
+	stream := &VirtualPlaybackStream{
+		URI:                 row.FilePath,
+		ProviderURL:         row.ResolvedURL,
+		ProviderExpiresAt:   row.ResolvedURLExpiresAt,
+		OwnerInstallationID: row.VirtualOwnerInstallationID,
+		Resolution:          row.Resolution,
+		CodecVideo:          row.CodecVideo,
+		CodecAudio:          row.CodecAudio,
+		Container:           row.Container,
+		Bitrate:             row.Bitrate,
+		FileSize:            row.FileSize,
+		RequestHeaders:      maps.Clone(row.ProviderRequestHeaders),
+	}
+	for _, track := range row.AudioTracks {
+		if track.Language != "" {
+			stream.AudioLanguages = append(stream.AudioLanguages, track.Language)
+		}
+	}
+	for _, track := range row.SubtitleTracks {
+		if track.Language != "" {
+			stream.SubtitleLanguages = append(stream.SubtitleLanguages, track.Language)
+		}
+	}
+	return stream
 }

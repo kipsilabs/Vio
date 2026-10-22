@@ -52,6 +52,7 @@ import {
 } from "@/api/v2/mediaCandidates";
 import { catalogKeys, itemKeys } from "@/hooks/queries/keys";
 import { useRealtimeEvents } from "@/components/realtimeEventsContext";
+import { useWatchDetail } from "@/hooks/queries/items";
 import { cn } from "@/lib/utils";
 import AddToCollectionDialog from "@/components/AddToCollectionDialog";
 import { Button } from "@/components/ui/button";
@@ -421,6 +422,37 @@ export default function ActionBar({
     if (!contentId) return;
     await cancelVirtualCandidatesRefresh(contentId);
   }, [contentId]);
+  // The catalog version rows can omit the probed track inventory. Read the
+  // selected file's watch detail and use its current audio/subtitle lists for
+  // the pre-play menus, so the media page offers the same tracks as the player
+  // rather than the pre-probe placeholders. The zero stale time is deliberate:
+  // this read may follow the probe that populated those lists.
+  const { data: selectedWatch } = useWatchDetail(contentId, selectedVersion?.file_id, undefined, {
+    enabled: !!contentId && !!selectedVersion,
+    staleTime: 0,
+  });
+  const selectedVersionWithTracks = useMemo(() => {
+    if (!selectedVersion) return null;
+    const watchVersion = selectedWatch?.versions?.find(
+      (version) => version.file_id === selectedVersion.file_id,
+    );
+    if (!watchVersion) return selectedVersion;
+    // An empty watch-detail list can be an unprobed row, not evidence that the
+    // selected version has no tracks. Keep the catalog lists until the probe
+    // actually supplies a non-empty inventory, so a cold page does not hide its
+    // audio/subtitle menus.
+    return {
+      ...selectedVersion,
+      audio_tracks:
+        (watchVersion.audio_tracks?.length ?? 0) > 0
+          ? watchVersion.audio_tracks
+          : selectedVersion.audio_tracks,
+      subtitle_tracks:
+        (watchVersion.subtitle_tracks?.length ?? 0) > 0
+          ? watchVersion.subtitle_tracks
+          : selectedVersion.subtitle_tracks,
+    };
+  }, [selectedVersion, selectedWatch]);
   const showMarkerEditor = canEditMarkers && !!contentId;
   const hasMultipleVersions = (playbackVariants?.length ?? 0) > 1 || (versions?.length ?? 0) > 1;
   const showPlayChoiceDialog =
@@ -1352,7 +1384,7 @@ export default function ActionBar({
             <VersionDropdown
               versions={versions}
               playbackVariants={playbackVariants}
-              selectedVersion={selectedVersion}
+              selectedVersion={selectedVersionWithTracks}
               onSelectVersion={onSelectVersion}
               contentId={contentId}
               onOpenChange={onVersionPickerOpenChange}
@@ -1360,18 +1392,19 @@ export default function ActionBar({
               onCancelRefresh={contentId ? handleCancelRefresh : undefined}
             />
           )}
-          {selectedVersion && (selectedVersion.audio_tracks?.length ?? 0) > 0 && (
-            <AudioTracksPopover
-              version={selectedVersion}
-              selectionMode={audioSelectionMode}
-              explicitTrackIndex={explicitAudioTrackIndex}
-              onSelectTrack={onSelectAudioTrack}
-              onResetSelection={onResetAudioSelection}
-            />
-          )}
-          {selectedVersion && (
+          {selectedVersionWithTracks &&
+            (selectedVersionWithTracks.audio_tracks?.length ?? 0) > 0 && (
+              <AudioTracksPopover
+                version={selectedVersionWithTracks}
+                selectionMode={audioSelectionMode}
+                explicitTrackIndex={explicitAudioTrackIndex}
+                onSelectTrack={onSelectAudioTrack}
+                onResetSelection={onResetAudioSelection}
+              />
+            )}
+          {selectedVersionWithTracks && (
             <SubtitlesPopover
-              version={selectedVersion}
+              version={selectedVersionWithTracks}
               selectionMode={prePlaySubtitleMode}
               explicitSelection={explicitSubtitleSelection}
               preferredSubtitleLanguage={preferredSubtitleLanguage}

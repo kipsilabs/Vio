@@ -370,7 +370,12 @@ func (m *mapper) itemFromDetailWithFields(item upstreamItemDetail, isFavorite bo
 			dto.IsHD = isHDVideo(firstVersion.VideoTracks[0])
 		}
 		routeItemID := m.codec.EncodeStringID(EncodedIDItem, item.ContentID)
-		wantMediaSources := wantField("mediasources")
+		// Multi-version detail pages need the version list even when the client
+		// did not spell out Fields=MediaSources. Some Jellyfin clients (Plezy
+		// among them) render versions from the item DTO rather than issuing a
+		// separate PlaybackInfo call, so omitting the field leaves their version
+		// menu empty while single-version clients see no difference.
+		wantMediaSources := wantField("mediasources") || len(item.Versions) > 1
 		wantMediaStreams := wantField("mediastreams")
 		if wantMediaSources {
 			dto.MediaSources = make([]mediaSourceDTO, 0, len(item.Versions))

@@ -68,6 +68,26 @@ import type {
   ResumeHints,
 } from "../types";
 
+/** Terminal reasons that mean the selected subtitle, not the release, blocked
+ *  the plan. Only these may drop the subtitle and retry the same start. */
+const BITMAP_SUBTITLE_REFUSAL_REASONS = new Set([
+  "subtitle_burn_in_source_unsupported",
+  "subtitle_codec_unsupported",
+  "subtitle_conversion_unsupported",
+  "subtitle_track_invalid",
+  "subtitle_track_unavailable",
+  "subtitle_unavailable_in_version",
+  "subtitle_artifact_unavailable",
+  // HDR conversion refusal can be raised only because the selected bitmap
+  // subtitle forced a burn-in; dropping that subtitle is the intended retry.
+  "hdr_transcode_unsupported",
+]);
+
+function isBitmapSubtitleRefusal(decision: DecisionResponseV3): boolean {
+  const reason = decision.terminal?.reason?.trim() ?? "";
+  return reason !== "" && BITMAP_SUBTITLE_REFUSAL_REASONS.has(reason);
+}
+
 interface PlaybackSessionState {
   /**
    * The server's plan, verbatim. It is the single source of truth for the
@@ -481,6 +501,7 @@ function deferredIdentityIsAdmissible(
    */
   appliedPollNewer: SourceIdentity | null,
   outgoingSuperseded = false,
+  verifiedInventoryPush = false,
 ): boolean {
   if (!identityNamesSource(identity)) return false;
 
@@ -491,10 +512,37 @@ function deferredIdentityIsAdmissible(
 
   // The winner was replaced and names a concrete candidate: its URI is the only
   // candidate it vouches for, and an exact match wins outright. This must be
-  // decided before the collision guards below, which would otherwise let the
-  // outgoing candidate the session was leaving veto the explicitly winning plan.
+  // decided before the verified-inventory shortcut and every collision guard
+  // below, which would otherwise let the outgoing candidate the session was
+  // leaving admit a superseded inventory under the winning plan. A URI-less
+  // replacement (the v2 wire) leaves a URI-only push as the only identity the
+  // client has; the applied-source vetoes below still judge it.
   if (replaced && plan.effective_virtual_uri != null) {
     return identityMatchesPlan(identity, plan);
+  }
+
+  // A verified inventory revision is the server's own inventory for the live
+  // session. When it names the exact candidate the live source carries — at
+  // arrival or once the flush runs — the payload is not another source even
+  // when its catalog row differs from the plan's, so it folds in place. This is
+  // the same admission the direct path makes; without it, a verified push held
+  // behind a reconciliation replan would be refused at the flush and the menus
+  // a cold, empty plan never had would stay empty.
+  //
+  // It still yields to source state newer than the queued entry: once a poll or
+  // an applied replacement has moved the live source to another candidate, an
+  // inventory naming the outgoing candidate is stale even though that URI was
+  // live at arrival.
+  if (verifiedInventoryPush && identity.uri != null) {
+    if (applied.uri != null && applied.uri !== outgoing.uri && identity.uri !== applied.uri) {
+      return false;
+    }
+    if (appliedPollNewer?.uri != null && identity.uri !== appliedPollNewer.uri) {
+      return false;
+    }
+    if (identity.uri === outgoing.uri || identity.uri === applied.uri) {
+      return true;
+    }
   }
 
   // A concrete candidate already current on the push's file is authority the
@@ -1121,6 +1169,13 @@ export function usePlaybackSession(
     fileId: state.mediaFileId,
     uri: state.effectiveVirtualUri,
   });
+  // The offered candidate the menus are currently displaying for a row whose
+  // pinned release vanished from the provider listing, or null. It is a
+  // display-only overlay: the plan identity, session id and transport revision
+  // never move for it, so it must be read synchronously (a menu selection can
+  // land in the same tick as the fold) and cleared whenever the transport's own
+  // source identity actually changes.
+  const offeredVirtualUriRef = useRef<string | null>(null);
   const activeRequestKeyRef = useRef<string | null>(null);
   const activeCapabilityRequestKeyRef = useRef<string | null>(null);
   const playbackPositionRef = useRef(initialPosition);
@@ -1201,6 +1256,7 @@ export function usePlaybackSession(
     forceStartPosition: boolean;
     fileSelection: "auto" | "explicit";
     carriedAudioTrackId: string | null;
+    offeredVirtualURI: string | null;
   } | null>(null);
   const retryingRef = useRef(false);
   // The dead session whose refused replan has already triggered one fresh
@@ -1332,6 +1388,9 @@ export function usePlaybackSession(
           lastVerifiedIdentityRef.current = null;
         }
       }
+      // A real identity move retires any display-only offered release: the
+      // transport is now somewhere else, so the old offer is stale.
+      if (changed) offeredVirtualUriRef.current = null;
       return changed;
     },
     [],
@@ -1369,8 +1428,10 @@ export function usePlaybackSession(
       scope.generation = loadSequenceRef.current;
       scope.revisions.clear();
       // A new load generation also abandons any remembered mid-switch seek: it
-      // belongs to the session this generation replaces.
+      // belongs to the session this generation replaces. A display-only offered
+      // release belongs to that same superseded transport too.
       pendingSeekRef.current = null;
+      offeredVirtualUriRef.current = null;
     }
     return scope;
   }, []);
@@ -1512,6 +1573,21 @@ export function usePlaybackSession(
       planTransportShownRef.current = false;
       endReconnect(true);
       const sessionId = plan.session_id ?? decision.session_id ?? sessionIdRef.current;
+      // The verified-inventory anchor in force *before* this adoption. A real
+      // (probed/verified) list already folded for this exact source must not be
+      // regressed to a declared/pending plan's list by a later replan — the
+      // replan may have been built before the probe persisted. Adoption is in
+      // place: the stream is untouched, and only the menus hold the real list.
+      const verifiedAnchor = lastVerifiedIdentityRef.current;
+      const planIsProvisional = isInventoryProvisional(
+        plan.inventory_status,
+        plan.inventory_provenance,
+      );
+      const keepVerifiedInventory =
+        planIsProvisional &&
+        verifiedAnchor !== null &&
+        verifiedAnchor.fileId === plan.effective_media_file_id &&
+        (verifiedAnchor.uri ?? null) === (plan.effective_virtual_uri ?? null);
       planAttemptIdRef.current = randomUUID();
       planRef.current = plan;
       sessionEndedRef.current = false;
@@ -1531,6 +1607,11 @@ export function usePlaybackSession(
           fileId: plan.effective_media_file_id,
           uri: plan.effective_virtual_uri ?? null,
         };
+      } else if (keepVerifiedInventory) {
+        // Re-seed the anchor `transitionSourceIdentity` just cleared, so the
+        // preserved verified list also keeps suppressing later same-source
+        // declared pushes.
+        lastVerifiedIdentityRef.current = verifiedAnchor;
       }
       if (plan.inventory_revision != null) {
         inventoryRevisionRef.current = plan.inventory_revision;
@@ -1641,8 +1722,10 @@ export function usePlaybackSession(
       forceStartPosition: boolean,
       playbackAttemptId: string,
       subtitleTrackIndex: number | undefined,
+      subtitleTrackID: string | undefined,
       carriedAudioTrackID: string | null,
       fileSelection: "auto" | "explicit",
+      offeredVirtualURI: string | undefined,
       forceRelink?: boolean,
       audioTrackIndex: number | null | undefined = explicitAudioTrackIndex,
     ): Promise<DecisionResponseV3> => {
@@ -1663,8 +1746,10 @@ export function usePlaybackSession(
           carriedAudioTrackID != null ? null : (audioTrackIndex ?? explicitAudioTrackIndex),
         carriedAudioTrackID,
         fileSelection,
+        offeredVirtualURI,
         forceRelink,
         subtitleTrackIndex,
+        subtitleTrackID,
         bandwidthEstimateKbps: detectBandwidthEstimateKbpsV3(),
         bandwidthCapKbps: maxBitrateKbps,
         clientCapabilities,
@@ -1773,6 +1858,7 @@ export function usePlaybackSession(
       carriedAudioTrackId,
       carriedSubtitleTrackIndex,
       fileSelection,
+      offeredVirtualURI,
       forceRelink,
       intentAt,
       reconnect = false,
@@ -1795,6 +1881,8 @@ export function usePlaybackSession(
       /** How the requested file was chosen; `explicit` forbids silent
        * server-side version substitution. */
       fileSelection?: "auto" | "explicit";
+      /** Concrete offered candidate this start binds to. */
+      offeredVirtualURI?: string;
       /** When true, the server should force a re-link/re-query of the virtual
        * file on this start attempt. Set when the viewer explicitly picks an
        * unavailable version, or by the retry path after a no-streams terminal. */
@@ -1811,7 +1899,12 @@ export function usePlaybackSession(
        * track the server has to burn in, which gets the same retry without
        * subtitles as a bitmap track at the initial start when it is refused.
        */
-      tracks?: { audioIndex?: number; subtitleIndex?: number; subtitleBurnIn?: boolean };
+      tracks?: {
+        audioIndex?: number;
+        subtitleIndex?: number;
+        subtitleTrackId?: string;
+        subtitleBurnIn?: boolean;
+      };
     }): Promise<LoadSessionOutcome> => {
       // Any other start supersedes a running reconnect: it owns the session now.
       if (!reconnect) endReconnect(false);
@@ -1919,6 +2012,7 @@ export function usePlaybackSession(
           forceStartPosition,
           fileSelection: fileSelection ?? "auto",
           carriedAudioTrackId: carriedAudioTrackId ?? null,
+          offeredVirtualURI: offeredVirtualURI ?? null,
         };
 
         const targetSubtitleIndex =
@@ -1933,8 +2027,10 @@ export function usePlaybackSession(
           forceStartPosition,
           playbackAttemptId,
           tracks ? tracks.subtitleIndex : targetSubtitleIndex,
+          tracks?.subtitleTrackId,
           carriedAudioTrackId ?? null,
           fileSelection ?? "auto",
+          offeredVirtualURI,
           forceRelink,
           startAudioTrackIndex,
         );
@@ -1975,7 +2071,7 @@ export function usePlaybackSession(
           bitmapSubtitleTrackIndex !== undefined ||
           (carriedSubtitleTrackIndex === undefined &&
             initialBitmapSubtitleTrackIndexByFileId?.[selectedFileId] !== undefined);
-        if (!decision.playback_plan && hasBitmapSubtitle) {
+        if (!decision.playback_plan && hasBitmapSubtitle && isBitmapSubtitleRefusal(decision)) {
           initialSubtitleFailure = describeDecisionWithoutPlan(decision);
           if (decision.session_id) {
             void stopSession(decision.session_id).catch(() => {
@@ -1995,8 +2091,10 @@ export function usePlaybackSession(
             forceStartPosition,
             fallbackPlaybackAttemptId,
             undefined,
+            undefined,
             carriedAudioTrackId ?? null,
             fileSelection ?? "auto",
+            offeredVirtualURI,
             forceRelink,
             startAudioTrackIndex,
           );
@@ -2432,6 +2530,10 @@ export function usePlaybackSession(
             initialErrorMessage: "Failed to restart playback",
             carriedAudioTrackId: plan.selected_tracks.audio?.id ?? null,
             carriedSubtitleTrackIndex: plan.selected_tracks.subtitle?.index ?? null,
+            offeredVirtualURI:
+              retryTargetRef.current?.offeredVirtualURI ??
+              offeredVirtualUriRef.current ??
+              undefined,
             // Preserve the viewer's version choice; the server must not
             // silently substitute another edition behind a rebuild. Use the
             // live Auto intent first (a mid-session re-arm never re-records
@@ -2594,10 +2696,58 @@ export function usePlaybackSession(
     retireActiveSession,
   ]);
 
+  // Selecting a track from an offered release is a source transition, not a
+  // track change on the playing release. Start the row again with a fresh
+  // provider link and carry the chosen track identity across; a generic
+  // failure_recovery has no way to say which offered candidate or track the
+  // viewer picked and may land on another candidate's default.
+  const loadOfferedRelease = useCallback(
+    (
+      position: number,
+      tracks: {
+        audioIndex?: number;
+        carriedAudioTrackId?: string;
+        subtitleIndex?: number;
+        subtitleTrackId?: string;
+        subtitleBurnIn?: boolean;
+      },
+    ) => {
+      const plan = planRef.current;
+      if (!plan) return;
+      void loadSession({
+        preferredFileId: plan.effective_media_file_id,
+        position,
+        forceStartPosition: true,
+        allowPreserveExistingSessionOnError: true,
+        replacementErrorMessage: "Failed to switch to the offered release",
+        initialErrorMessage: "Failed to switch to the offered release",
+        carriedAudioTrackId: tracks.carriedAudioTrackId ?? null,
+        fileSelection: "auto",
+        offeredVirtualURI: offeredVirtualUriRef.current ?? undefined,
+        forceRelink: true,
+        intentAt: Date.now(),
+        tracks,
+      });
+    },
+    [loadSession],
+  );
+
   const switchAudioTrack = useCallback(
     (index: number, currentPosition: number) => {
       const plan = planRef.current;
       if (!plan) return;
+      if (offeredVirtualUriRef.current) {
+        // The menus are showing a release the row offers now, not the one the
+        // transport plays. Start the offered release and carry the picked
+        // track, so the server receives both the source transition and the
+        // selection instead of a generic recovery that names neither.
+        const offered = stateRef.current.planAudioTracks[index];
+        loadOfferedRelease(currentPosition, {
+          audioIndex: index,
+          carriedAudioTrackId: offered?.track_id,
+        });
+        return;
+      }
       // The menu renders the probed inventory `applyAudioInventory` may have
       // replaced, whose ordering a probe repair can change. Carry the plan's
       // canonical identity for the picked track — matched by signature, then
@@ -2623,7 +2773,7 @@ export function usePlaybackSession(
         audio,
       });
     },
-    [replan],
+    [loadOfferedRelease, replan],
   );
 
   const changeSubtitleTrack = useCallback(
@@ -2634,13 +2784,31 @@ export function usePlaybackSession(
       // replan validation runs against the plan's declared list, and the
       // server remaps or degrades there. The follow-up verified inventory
       // replaces the menu without touching this selection.
+      if (offeredVirtualUriRef.current) {
+        // Same rule as the audio menu: start the offered release and carry the
+        // picked subtitle identity. Null is an explicit subtitles-off request;
+        // passing a `tracks` object with no subtitle index keeps it off instead
+        // of falling back to the new plan's initial subtitle.
+        const track =
+          combinedIndex == null
+            ? undefined
+            : stateRef.current.subtitleUrls.find((item) => item.index === combinedIndex);
+        loadOfferedRelease(currentPosition, {
+          audioIndex: plan.selected_tracks.audio?.index,
+          carriedAudioTrackId: plan.selected_tracks.audio?.id,
+          subtitleIndex: combinedIndex ?? undefined,
+          subtitleTrackId: track?.track_id,
+          subtitleBurnIn: track?.codec ? isBitmapCodec(track.codec) : undefined,
+        });
+        return;
+      }
       void replan({
         operation: "track_change",
         positionSeconds: currentPosition,
         subtitle: combinedIndex == null ? null : { id: "", index: combinedIndex },
       });
     },
-    [replan],
+    [loadOfferedRelease, replan],
   );
 
   const changeQuality = useCallback(
@@ -3380,6 +3548,57 @@ export function usePlaybackSession(
   );
 
   /**
+   * Folds a display-only offered-release revision into the menus.
+   *
+   * When the session's pinned candidate vanishes from the provider listing but
+   * the transport keeps playing it, the server offers the row's current
+   * listing here. The payload carries only the bound row in
+   * `effective_media_file_id` and leaves `effective_virtual_uri` empty, so
+   * nothing re-keys the transport, while `audio_tracks` and
+   * `subtitle_inventory` describe the release the row offers now. The fold
+   * replaces the rendered track lists and subtitle URLs, records the offered
+   * candidate for the menu selection guard, and records the revision. It
+   * deliberately leaves `plan.effective_media_file_id`,
+   * `plan.effective_virtual_uri`, `mediaFileId`, `transportRevision` and the
+   * session id untouched, and never calls replan or reloads the element.
+   */
+  const foldOfferedInventory = useCallback(
+    (payload: PlaybackInventoryUpdatedPayload, offeredUri: string) => {
+      const scope = syncRevisionScope();
+      if (payload.inventory_revision != null && scope.revisions.has(payload.inventory_revision)) {
+        return;
+      }
+      const plan = planRef.current;
+      if (!plan) return;
+      const audioTracks = (payload.audio_tracks ?? []).map((track) => ({ ...track }));
+      const subtitleInventory = payload.subtitle_inventory ?? [];
+      const nextPlan: PlanV3 = {
+        ...plan,
+        // The playing identity is deliberately preserved: this is menu data for
+        // another release, never for the served one.
+        subtitle: { ...plan.subtitle, inventory: subtitleInventory },
+      };
+      planRef.current = nextPlan;
+      offeredVirtualUriRef.current = offeredUri;
+      setState((current) => ({
+        ...current,
+        plan: nextPlan,
+        planAudioTracks: audioTracks,
+        // The offered lists are the probe's own evidence for the row's current
+        // listing, so the menus are no longer "loading".
+        audioInventoryProvisional: false,
+        subtitleInventoryProvisional: false,
+        subtitleUrls: mapSubtitleInventory(subtitleInventory, plan.effective_media_file_id, config),
+      }));
+      if (payload.inventory_revision != null) {
+        inventoryRevisionRef.current = payload.inventory_revision;
+        scope.revisions.add(payload.inventory_revision);
+      }
+    },
+    [config, syncRevisionScope],
+  );
+
+  /**
    * The shared inventory fold used by both a direct push and the deferred
    * flush.
    *
@@ -3391,12 +3610,39 @@ export function usePlaybackSession(
    */
   const foldInventoryUpdate = useCallback(
     (payload: PlaybackInventoryUpdatedPayload): boolean => {
+      // A display-only offered release is a different animal: it carries
+      // another release's tracks under the session's row id, so it must never
+      // go through the identity-carrying fold. Route it to the menu-only fold
+      // and return.
+      const offeredUri = payload.offered_virtual_uri?.trim() ?? "";
+      if (offeredUri) {
+        foldOfferedInventory(payload, offeredUri);
+        return true;
+      }
+      // A verified revision for the source the transport actually plays
+      // retires a display-only offer. Otherwise the offered candidate would
+      // keep intercepting ordinary picks after the live inventory recovered.
+      // The retirement and the menu restore are one operation: a duplicate of a
+      // revision already folded while the offer was showing must still fold the
+      // live tracks back, not just clear the ref and return at the revision gate.
+      const livePlan = planRef.current;
+      let retiresOfferedSource = false;
+      if (offeredVirtualUriRef.current && livePlan && payload.inventory_status === "verified") {
+        const payloadUri = payload.effective_virtual_uri?.trim() ?? "";
+        const liveUri = livePlan.effective_virtual_uri?.trim() ?? "";
+        retiresOfferedSource =
+          payloadUri !== ""
+            ? payloadUri === liveUri
+            : payload.effective_media_file_id != null &&
+              payload.effective_media_file_id === livePlan.effective_media_file_id;
+        if (retiresOfferedSource) offeredVirtualUriRef.current = null;
+      }
       const scope = syncRevisionScope();
       const alreadyFolded =
         payload.inventory_revision != null && scope.revisions.has(payload.inventory_revision);
       const isTerminal =
         payload.inventory_status === "verified" || payload.inventory_status === "failed";
-      if (alreadyFolded) {
+      if (alreadyFolded && !retiresOfferedSource) {
         // If the state is still pending or provisional, a redelivery of the terminal
         // revision must re-fold its verified tracks and clear pending, not early-return.
         const needsTerminalReconciliation =
@@ -3477,7 +3723,7 @@ export function usePlaybackSession(
       }
       return true;
     },
-    [applySubtitleInventory, foldCommittedSource, syncRevisionScope],
+    [applySubtitleInventory, foldCommittedSource, foldOfferedInventory, syncRevisionScope],
   );
 
   /**
@@ -3518,6 +3764,23 @@ export function usePlaybackSession(
       if (switchingRef.current || replanInFlightRef.current || current.replacing) {
         if (movedSource) pendingSwitchPositionRef.current = null;
         captureDeferredPush({ kind: "inventory", payload, identity });
+        return false;
+      }
+      // A display-only offered-release revision carries another release's
+      // tracks under the session's bound row id and deliberately names no
+      // candidate. Admit it when it names the same row on screen and genuinely
+      // offers a candidate other than the one playing; the fold is display-only
+      // and never moves identity. A packet whose row has moved, or that names
+      // the playing candidate, is stale and dropped.
+      const offeredUri = payload.offered_virtual_uri?.trim() ?? "";
+      if (offeredUri) {
+        const sameRow =
+          payload.effective_media_file_id == null ||
+          liveIdentity.fileId == null ||
+          payload.effective_media_file_id === liveIdentity.fileId;
+        if (sameRow && offeredUri !== liveIdentity.uri) {
+          return foldInventoryUpdate(payload);
+        }
         return false;
       }
       // No adoption in flight: a push that names another source than the player
@@ -3644,6 +3907,24 @@ export function usePlaybackSession(
       // only against state older than it: a poll that folded a candidate after
       // this entry was queued is external and newer and still vetoes the commit.
       // See deferredIdentityIsAdmissible.
+      // A display-only offered release is admitted on its own terms at the
+      // flush too: it names the same row and a candidate other than the settled
+      // plan's, and folding it can only repaint the menus. The identity-aware
+      // admission below is for pushes that carry a source identity, which an
+      // offer deliberately does not.
+      if (entry.kind === "inventory") {
+        const offeredUri = entry.payload.offered_virtual_uri?.trim() ?? "";
+        if (offeredUri) {
+          const sameRow =
+            entry.payload.effective_media_file_id == null ||
+            plan.effective_media_file_id == null ||
+            entry.payload.effective_media_file_id === plan.effective_media_file_id;
+          if (sameRow && offeredUri !== (plan.effective_virtual_uri ?? null)) {
+            foldInventoryUpdate(entry.payload);
+          }
+          continue;
+        }
+      }
       const pollApplied = lastPollAppliedRef.current;
       const appliedPollNewer =
         pollApplied != null && pollApplied.clock > entry.arrivalTransitionClock
@@ -3659,6 +3940,7 @@ export function usePlaybackSession(
           entry.kind === "source",
           appliedPollNewer,
           entry.kind === "source" && entry.outgoingFromDeferredSource,
+          entry.kind === "inventory" && entry.payload.inventory_status === "verified",
         )
       ) {
         handleRefusedPush(entry);
@@ -3839,6 +4121,7 @@ export function usePlaybackSession(
       replacementErrorMessage: "Failed to retry playback",
       initialErrorMessage: "Failed to retry playback",
       carriedAudioTrackId: target.carriedAudioTrackId,
+      offeredVirtualURI: target.offeredVirtualURI ?? undefined,
       // When Auto is armed the retry re-selects automatically, so the server
       // may walk alternate versions instead of replaying the dead pin.
       fileSelection: autoFallbackRef.current ? "auto" : target.fileSelection,

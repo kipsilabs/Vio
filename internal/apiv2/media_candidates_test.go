@@ -22,6 +22,7 @@ type fakeVirtualCandidatesRefresh struct {
 	userID    int
 	profileID string
 	contentID string
+	modes     []handlers.VirtualDiscoveryMode
 	job       *models.AdminJob
 	err       error
 	cancelJob *models.AdminJob
@@ -88,9 +89,10 @@ func mediaCandidatesDeps(refresh *fakeVirtualCandidatesRefresh) Dependencies {
 	return deps
 }
 
-func (f *fakeVirtualCandidatesRefresh) DiscoverVirtualCandidates(_ context.Context, userID int, profileID, contentID string, _ catalogpkg.AccessFilter) ([]catalogpkg.FileVersion, error) {
+func (f *fakeVirtualCandidatesRefresh) DiscoverVirtualCandidates(_ context.Context, userID int, profileID, contentID string, _ catalogpkg.AccessFilter, mode handlers.VirtualDiscoveryMode) ([]catalogpkg.FileVersion, error) {
 	f.calls++
 	f.userID, f.profileID, f.contentID = userID, profileID, contentID
+	f.modes = append(f.modes, mode)
 	return nil, f.err
 }
 
@@ -121,6 +123,11 @@ func TestDiscoverVirtualCandidatesSettingAndAccess(t *testing.T) {
 		}
 		if response.Code != http.StatusNoContent || discovery.calls != 1 || discovery.userID != 1 || discovery.profileID != "p-owner" || discovery.contentID != "movie:heat-1995" {
 			t.Fatalf("status=%d discovery=%+v", response.Code, discovery)
+		}
+		// The explicit discovery operation is a listing surface: it must not
+		// start a playback preparation.
+		if len(discovery.modes) != 1 || discovery.modes[0] != handlers.VirtualDiscoveryListingOnly {
+			t.Fatalf("discovery modes = %v, want a listing-only request", discovery.modes)
 		}
 		// An empty candidate list is a successful discovery (the fake returns
 		// nil versions); provider unavailability stays a retryable 503.

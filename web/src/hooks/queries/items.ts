@@ -54,7 +54,7 @@ export function useWatchDetail(
   id: string | undefined,
   fileId?: number,
   libraryId?: number,
-  options?: { enabled?: boolean },
+  options?: { enabled?: boolean; staleTime?: number },
 ) {
   return useQuery({
     queryKey: itemKeys.watchDetail(id!, fileId, libraryId),
@@ -64,7 +64,7 @@ export function useWatchDetail(
     // freshness window lets the inventory poll, chapter refresh, and realtime
     // reconcile reach share one payload instead of each issuing its own
     // `staleTime: 0` fetch; explicit invalidations still force a refetch.
-    staleTime: 30_000,
+    staleTime: options?.staleTime ?? 30_000,
   });
 }
 

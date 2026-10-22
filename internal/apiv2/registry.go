@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 	"unicode"
 
 	"github.com/danielgtaylor/huma/v2"
@@ -227,6 +228,15 @@ type Registry struct {
 	mu                      sync.Mutex
 	ops                     []Declared
 	publicCapabilitySchemas map[string]bool
+
+	// preplayDiscoverySeen coalesces repeated detail reads for the same
+	// viewer/item/selected version. The player inventory poll deliberately
+	// bypasses the client cache and re-reads watch detail every few seconds;
+	// without this memo each poll re-lists and re-persists every provider
+	// candidate, advancing media_files.updated_at while a probe is writing its
+	// evidence. The map is bounded and entries are only a short-lived hint.
+	preplayDiscoveryMu   sync.Mutex
+	preplayDiscoverySeen map[string]time.Time
 }
 
 // Declared is what the registry recorded for one operation; the runtime

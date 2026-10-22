@@ -29,28 +29,89 @@ type VirtualCandidatesRefreshService interface {
 }
 
 type VirtualCandidatesDiscoveryService interface {
-	DiscoverVirtualCandidates(ctx context.Context, userID int, profileID, contentID string, filter catalogpkg.AccessFilter) ([]catalogpkg.FileVersion, error)
+	DiscoverVirtualCandidates(ctx context.Context, userID int, profileID, contentID string, filter catalogpkg.AccessFilter, mode handlers.VirtualDiscoveryMode) ([]catalogpkg.FileVersion, error)
 	HasVirtualSource(ctx context.Context, contentID string) (bool, error)
 }
 
 const (
 	// preplayDiscoveryWatchBudget bounds version discovery started from
-	// GET /watch/{id}: the caller is preparing to play, so a cold provider
-	// scrape may be waited out before the answer.
-	preplayDiscoveryWatchBudget = 15 * time.Second
+	// GET /watch/{id}. The caller is about to play, but the discovery work is
+	// detached and the start path resolves its own candidate; waiting longer
+	// only delays the player's first request.
+	preplayDiscoveryWatchBudget = 2 * time.Second
 	// preplayDiscoveryCatalogBudget bounds the same discovery started from a
 	// catalog leaf detail read: browsing is the hot path (Android opens item
 	// detail before any watch request), so the answer keeps a short budget
 	// while the discovery service keeps working detached from it.
 	//
-	// Three seconds, not two: cold provider scrapes run anywhere from tens of
-	// milliseconds to about 2.5s, and the original two-second budget cut the
-	// longest of them off after the wall-clock overhead around the scrape.
-	// Android has no refetch of its own, so a budget loss is a lost
-	// first-open answer, not a delayed one. Deployments tune it with the
-	// admin Streaming setting virtual_library.catalog_discovery_budget_ms.
-	preplayDiscoveryCatalogBudget = 3 * time.Second
+	// One second keeps navigation responsive. The discovery work continues
+	// detached after this waiter returns, so a cold provider scrape is not
+	// lost; the detail page reads the already-persisted rows and the chain
+	// publishes the refreshed inventory when it lands. Deployments tune it
+	// with the admin Streaming setting virtual_library.catalog_discovery_budget_ms.
+	preplayDiscoveryCatalogBudget = 1 * time.Second
+
+	// preplayDiscoveryDetailRepeatWindow is how long a successful detail
+	// discovery suppresses another list for the same viewer, item, selected
+	// version and library. The player's inventory poll re-reads watch detail
+	// at 2s/4s/8s/20s while a virtual probe is pending; a listing on every read
+	// would rewrite all candidates and invalidate the probe's CAS snapshot.
+	// Manual refresh and the explicit :discover operation do not use this memo.
+	preplayDiscoveryDetailRepeatWindow = 30 * time.Second
+	// Bound the per-process memo so a busy catalog cannot grow it without
+	// limit. Expired entries are swept first; if the map is still full, it is
+	// cleared, which only costs one extra discovery per item.
+	preplayDiscoveryDetailMemoMaxEntries = 512
 )
+
+// preplayDiscoveryMemoKey identifies one viewer's detail read for one item and
+// selected version. The selected file is part of the key: switching versions
+// must run discovery for the newly selected row even inside the repeat window.
+func preplayDiscoveryMemoKey(ctx context.Context, contentID string, filter catalogpkg.AccessFilter) string {
+	userID := 0
+	if claims := claimsFrom(ctx); claims != nil {
+		userID = claims.UserID
+	}
+	libraryID := 0
+	if filter.PresentationLibraryID != nil {
+		libraryID = *filter.PresentationLibraryID
+	}
+	return strconv.Itoa(userID) + "\x00" + profileFrom(ctx) + "\x00" + contentID + "\x00" +
+		strconv.Itoa(filter.SelectedFileID) + "\x00" + strconv.Itoa(libraryID)
+}
+
+func (reg *Registry) preplayDiscoveryRecentlyRan(key string) bool {
+	if reg == nil || key == "" {
+		return false
+	}
+	reg.preplayDiscoveryMu.Lock()
+	defer reg.preplayDiscoveryMu.Unlock()
+	seen, ok := reg.preplayDiscoverySeen[key]
+	return ok && time.Since(seen) < preplayDiscoveryDetailRepeatWindow
+}
+
+func (reg *Registry) rememberPreplayDiscovery(key string) {
+	if reg == nil || key == "" {
+		return
+	}
+	now := time.Now()
+	reg.preplayDiscoveryMu.Lock()
+	defer reg.preplayDiscoveryMu.Unlock()
+	if reg.preplayDiscoverySeen == nil {
+		reg.preplayDiscoverySeen = make(map[string]time.Time)
+	}
+	if len(reg.preplayDiscoverySeen) >= preplayDiscoveryDetailMemoMaxEntries {
+		for existing, seen := range reg.preplayDiscoverySeen {
+			if now.Sub(seen) >= preplayDiscoveryDetailRepeatWindow {
+				delete(reg.preplayDiscoverySeen, existing)
+			}
+		}
+		if len(reg.preplayDiscoverySeen) >= preplayDiscoveryDetailMemoMaxEntries {
+			reg.preplayDiscoverySeen = make(map[string]time.Time)
+		}
+	}
+	reg.preplayDiscoverySeen[key] = now
+}
 
 // preplayDiscoveryCatalogBudgetFor resolves the catalog leaf detail budget:
 // the configured setting when wired, otherwise the built-in default. A
@@ -66,6 +127,9 @@ func (reg *Registry) preplayDiscoveryCatalogBudgetFor(ctx context.Context) time.
 	return preplayDiscoveryCatalogBudget
 }
 
+// discoverDetailVersions runs the candidate discovery a detail-page read needs
+// and reports whether it found any. A detail-page read may start the pre-play
+// preparation; a bare listing request may not.
 func (reg *Registry) discoverDetailVersions(ctx context.Context, contentID, mediaType string, filter catalogpkg.AccessFilter, trigger string, budget time.Duration) (discovered, hasVirtualSource bool) {
 	claims := claimsFrom(ctx)
 	if claims == nil || (mediaType != themeOwnerMovie && mediaType != themeOwnerEpisode) ||
@@ -90,12 +154,23 @@ func (reg *Registry) discoverDetailVersions(ctx context.Context, contentID, medi
 	if reg.deps.PreplayDiscoveryEnabled == nil || !reg.deps.PreplayDiscoveryEnabled(ctx) {
 		return false, hasVirtualSource
 	}
+	memoKey := preplayDiscoveryMemoKey(ctx, contentID, filter)
+	if reg.preplayDiscoveryRecentlyRan(memoKey) {
+		// The player polls watch detail for inventory while the pre-play probe
+		// is still running. Re-listing on that poll rewrites every candidate and
+		// invalidates the probe write's catalog snapshot; the first read in this
+		// window already did the work.
+		slog.DebugContext(ctx, "pre-play version discovery coalesced", "component", "apiv2", "item_id", contentID,
+			"trigger", trigger, "selected_file_id", filter.SelectedFileID)
+		return false, true
+	}
 	started := time.Now()
 	discoveryCtx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 	slog.InfoContext(ctx, "pre-play version discovery started", "component", "apiv2", "item_id", contentID, "trigger", trigger)
 	listed, listErr := reg.deps.VirtualCandidatesDiscovery.DiscoverVirtualCandidates(
 		discoveryCtx, claims.UserID, profileFrom(ctx), contentID, filter,
+		handlers.VirtualDiscoveryDetail,
 	)
 	if listErr != nil {
 		slog.WarnContext(ctx, "pre-play version discovery unavailable", "component", "apiv2", "item_id", contentID,
@@ -104,6 +179,7 @@ func (reg *Registry) discoverDetailVersions(ctx context.Context, contentID, medi
 	}
 	slog.InfoContext(ctx, "pre-play version discovery completed", "component", "apiv2", "item_id", contentID,
 		"trigger", trigger, "count", len(listed), "duration_ms", time.Since(started).Milliseconds())
+	reg.rememberPreplayDiscovery(memoKey)
 	return true, true
 }
 
@@ -205,7 +281,10 @@ func (reg *Registry) discoverVirtualCandidates(ctx context.Context, in *VirtualC
 	if err != nil {
 		return nil, NewProblem(TypeInternalError, "An unexpected error occurred.")
 	}
-	if _, err := reg.deps.VirtualCandidatesDiscovery.DiscoverVirtualCandidates(ctx, claims.UserID, profileFrom(ctx), string(in.MediaID), filter); err != nil {
+	// This operation is a listing surface: it is callable for any item by any
+	// client, so it lists and persists candidates and prepares nothing. A
+	// detail-page read is what may start a preparation.
+	if _, err := reg.deps.VirtualCandidatesDiscovery.DiscoverVirtualCandidates(ctx, claims.UserID, profileFrom(ctx), string(in.MediaID), filter, handlers.VirtualDiscoveryListingOnly); err != nil {
 		return nil, serviceProblem(err)
 	}
 	return &struct{}{}, nil

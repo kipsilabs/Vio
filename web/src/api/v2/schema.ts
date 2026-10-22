@@ -27455,6 +27455,7 @@ export interface components {
       effective_virtual_uri?: string;
       inventory_revision: string;
       inventory_status: string;
+      offered_virtual_uri?: string;
       session_id: string;
       subtitle_inventory: components["schemas"]["SubtitleInventoryItemV3"][];
       virtual_source_revision?: string;
@@ -28024,6 +28025,7 @@ export interface components {
        * @description Deprecated; ignored. A client on a metered link sends its cellular quality as quality_preference and bandwidth_cap_kbps instead.
        */
       metered?: boolean;
+      offered_virtual_uri?: string;
       playback_attempt_id: string;
       /**
        * @description Opaque identifier

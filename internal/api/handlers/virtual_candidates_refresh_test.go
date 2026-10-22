@@ -22,6 +22,7 @@ import (
 // fixed error, and can answer a different detail after the refresh so a test
 // can prove the response is the post-refresh list.
 type fakeRefreshDetail struct {
+	mu     sync.Mutex
 	detail *catalog.WatchDetail
 	post   *catalog.WatchDetail
 	err    error
@@ -29,6 +30,8 @@ type fakeRefreshDetail struct {
 }
 
 func (f *fakeRefreshDetail) WatchDetail(_ context.Context, _ int, _ string, _ string, _ catalog.AccessFilter) (*catalog.WatchDetail, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.calls++
 	if f.err != nil {
 		return nil, f.err
@@ -80,7 +83,7 @@ func TestVirtualCandidatesDiscoveryUsesCacheAndPreservesFailures(t *testing.T) {
 					return nil
 				},
 			}
-			_, err := service.DiscoverVirtualCandidates(context.Background(), 1, "profile", "movie:x", catalog.AccessFilter{})
+			_, err := service.DiscoverVirtualCandidates(context.Background(), 1, "profile", "movie:x", catalog.AccessFilter{}, VirtualDiscoveryDetail)
 			if kind == "series" {
 				if err == nil || listed != 0 || persisted != 0 {
 					t.Fatalf("whole series discovery: err=%v listed=%d persisted=%d", err, listed, persisted)
@@ -125,7 +128,7 @@ func TestVirtualCandidatesDiscoveryEmptyListingIsEmptySuccess(t *testing.T) {
 	service.ScheduleDefaultFileProbe = func(string, *models.MediaFile, []VirtualPlaybackStream, catalog.AccessFilter) {
 		t.Fatal("an empty listing must not schedule a pre-play probe chain")
 	}
-	versions, err := service.DiscoverVirtualCandidates(context.Background(), 1, "profile", "movie:x", catalog.AccessFilter{})
+	versions, err := service.DiscoverVirtualCandidates(context.Background(), 1, "profile", "movie:x", catalog.AccessFilter{}, VirtualDiscoveryDetail)
 	if err != nil {
 		t.Fatalf("empty listing must not be a discovery failure: %v", err)
 	}
@@ -181,7 +184,7 @@ func TestVirtualCandidatesDiscoverySchedulesProbeAfterPersist(t *testing.T) {
 		}
 	}
 	filter := catalog.AccessFilter{AllowedLibraryIDs: []int{42}, MaturityLimits: access.MaturityLimits{MaxContentRating: "PG-13"}}
-	if _, err := service.DiscoverVirtualCandidates(context.Background(), 1, "profile", "movie:x", filter); err != nil {
+	if _, err := service.DiscoverVirtualCandidates(context.Background(), 1, "profile", "movie:x", filter, VirtualDiscoveryDetail); err != nil {
 		t.Fatalf("discovery: %v", err)
 	}
 	if len(order) != 2 || order[0] != "persist" || order[1] != "schedule" {
@@ -209,7 +212,7 @@ func TestVirtualCandidatesDiscoveryProviderFailureStaysRetryable(t *testing.T) {
 			return nil
 		},
 	}
-	_, err := service.DiscoverVirtualCandidates(context.Background(), 1, "profile", "movie:x", catalog.AccessFilter{})
+	_, err := service.DiscoverVirtualCandidates(context.Background(), 1, "profile", "movie:x", catalog.AccessFilter{}, VirtualDiscoveryDetail)
 	var apiErr *APIError
 	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusServiceUnavailable || apiErr.Code != "unavailable" {
 		t.Fatalf("err = %v, want a retryable 503 APIError", err)
@@ -595,5 +598,175 @@ func TestVirtualCandidatesRefreshServiceProviderCauseSurfaces(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestVirtualCandidatesListingOnlyDiscoverySchedulesNoProbe pins the trigger
+// boundary: the explicit discover operation is a listing surface, so it lists
+// and persists candidates and prepares nothing.
+func TestVirtualCandidatesListingOnlyDiscoverySchedulesNoProbe(t *testing.T) {
+	source := refreshTestSource(7, "movie:x", "virtual://movie/x")
+	streams := []VirtualPlaybackStream{{ID: "candidate", URI: "virtual://movie/x?result=candidate"}}
+	detail := refreshTestDetail()
+	detail.Type = "movie"
+	persisted := 0
+	service := &VirtualCandidatesRefreshService{
+		Detail: &fakeRefreshDetail{detail: detail},
+		ListCached: VirtualPlaybackStreamListerFunc(func(context.Context, string, int, string, int) ([]VirtualPlaybackStream, error) {
+			return streams, nil
+		}),
+		ContentFiles: func(context.Context, string) ([]*models.MediaFile, error) {
+			return []*models.MediaFile{source}, nil
+		},
+		Persist: func(context.Context, *models.MediaFile, []VirtualPlaybackStream) error {
+			persisted++
+			return nil
+		},
+	}
+	service.ScheduleDefaultFileProbe = func(string, *models.MediaFile, []VirtualPlaybackStream, catalog.AccessFilter) {
+		t.Fatal("a listing-only discovery must not schedule a pre-play probe chain")
+	}
+
+	versions, err := service.DiscoverVirtualCandidates(context.Background(), 1, "profile", "movie:x", catalog.AccessFilter{}, VirtualDiscoveryListingOnly)
+	if err != nil {
+		t.Fatalf("listing-only discovery: %v", err)
+	}
+	if len(versions) == 0 {
+		t.Fatal("listing-only discovery returned no versions; it must still list")
+	}
+	if persisted != 1 {
+		t.Fatalf("persist calls = %d, want 1: a listing-only run still persists its listing", persisted)
+	}
+}
+
+// TestVirtualCandidatesListingOnlyAndDetailFlightsDoNotCoalesce pins that the
+// two intents are separate work: a listing-only run in flight must not decide
+// whether a detail read gets its preparation.
+func TestVirtualCandidatesListingOnlyAndDetailFlightsDoNotCoalesce(t *testing.T) {
+	source := refreshTestSource(7, "movie:x", "virtual://movie/x")
+	streams := []VirtualPlaybackStream{{ID: "candidate", URI: "virtual://movie/x?result=candidate"}}
+	detail := refreshTestDetail()
+	detail.Type = "movie"
+	release := make(chan struct{})
+	started := make(chan struct{}, 4)
+	service := &VirtualCandidatesRefreshService{
+		Detail: &fakeRefreshDetail{detail: detail},
+		ListCached: VirtualPlaybackStreamListerFunc(func(context.Context, string, int, string, int) ([]VirtualPlaybackStream, error) {
+			started <- struct{}{}
+			<-release
+			return streams, nil
+		}),
+		ContentFiles: func(context.Context, string) ([]*models.MediaFile, error) {
+			return []*models.MediaFile{source}, nil
+		},
+		Persist: func(context.Context, *models.MediaFile, []VirtualPlaybackStream) error { return nil },
+	}
+	var scheduled atomic.Int32
+	service.ScheduleDefaultFileProbe = func(string, *models.MediaFile, []VirtualPlaybackStream, catalog.AccessFilter) {
+		scheduled.Add(1)
+	}
+
+	done := make(chan struct{}, 2)
+	go func() {
+		defer func() { done <- struct{}{} }()
+		_, _ = service.DiscoverVirtualCandidates(context.Background(), 1, "profile", "movie:x", catalog.AccessFilter{}, VirtualDiscoveryListingOnly)
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("listing-only run never reached the provider")
+	}
+	go func() {
+		defer func() { done <- struct{}{} }()
+		_, _ = service.DiscoverVirtualCandidates(context.Background(), 1, "profile", "movie:x", catalog.AccessFilter{}, VirtualDiscoveryDetail)
+	}()
+	// The per-source critical section makes the detail run wait for the
+	// listing's list-and-persist; release the listing, then expect the
+	// detail run's own provider call.
+	close(release)
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("detail discovery did not issue its own provider call")
+	}
+	for i := 0; i < 2; i++ {
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("discovery run did not finish")
+		}
+	}
+	if got := scheduled.Load(); got != 1 {
+		t.Fatalf("scheduled preparations = %d, want exactly the detail run's one", got)
+	}
+}
+
+// TestVirtualCandidatesPersistSerializedPerSource pins that a listing that
+// starts first cannot commit its candidates while a detail run is persisting,
+// and the detail run therefore commits and schedules last.
+func TestVirtualCandidatesPersistSerializedPerSource(t *testing.T) {
+	source := refreshTestSource(7, "movie:x", "virtual://movie/x")
+	streams := []VirtualPlaybackStream{{ID: "candidate", URI: "virtual://movie/x?result=candidate"}}
+	detail := refreshTestDetail()
+	detail.Type = "movie"
+	firstPersist := make(chan struct{})
+	secondPersist := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var calls atomic.Int32
+	var scheduled atomic.Int32
+	service := &VirtualCandidatesRefreshService{
+		Detail: &fakeRefreshDetail{detail: detail},
+		ListCached: VirtualPlaybackStreamListerFunc(func(context.Context, string, int, string, int) ([]VirtualPlaybackStream, error) {
+			return streams, nil
+		}),
+		ContentFiles: func(context.Context, string) ([]*models.MediaFile, error) {
+			return []*models.MediaFile{source}, nil
+		},
+		Persist: func(context.Context, *models.MediaFile, []VirtualPlaybackStream) error {
+			if calls.Add(1) == 1 {
+				close(firstPersist)
+				<-releaseFirst
+			} else {
+				close(secondPersist)
+			}
+			return nil
+		},
+	}
+	service.ScheduleDefaultFileProbe = func(string, *models.MediaFile, []VirtualPlaybackStream, catalog.AccessFilter) {
+		scheduled.Add(1)
+	}
+
+	done := make(chan struct{}, 2)
+	go func() {
+		defer func() { done <- struct{}{} }()
+		_, _ = service.DiscoverVirtualCandidates(context.Background(), 1, "profile", "movie:x", catalog.AccessFilter{}, VirtualDiscoveryListingOnly)
+	}()
+	select {
+	case <-firstPersist:
+	case <-time.After(2 * time.Second):
+		t.Fatal("listing-only run never reached persistence")
+	}
+	go func() {
+		defer func() { done <- struct{}{} }()
+		_, _ = service.DiscoverVirtualCandidates(context.Background(), 1, "profile", "movie:x", catalog.AccessFilter{}, VirtualDiscoveryDetail)
+	}()
+	select {
+	case <-secondPersist:
+		t.Fatal("detail run overlapped the listing's persistence")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(releaseFirst)
+	for i := 0; i < 2; i++ {
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("discovery run did not finish")
+		}
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("persist calls = %d, want the listing and detail writes", got)
+	}
+	if got := scheduled.Load(); got != 1 {
+		t.Fatalf("scheduled preparations = %d, want the detail run's one", got)
 	}
 }

@@ -13,6 +13,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/access"
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/notifications"
 )
 
 // The pre-play probe chain must never block its caller, never probe bytes it
@@ -23,18 +24,24 @@ import (
 
 const probeChainTestContent = "movie-probe-chain"
 
+func probeChainProviderURL(row *models.MediaFile) string {
+	return fmt.Sprintf("https://probe.example/stream/%d", row.ID)
+}
+
 func probeChainRow(fileID int, filePath string, probeUpdatedAt *time.Time) *models.MediaFile {
-	return &models.MediaFile{
+	row := &models.MediaFile{
 		ID: fileID, ContentID: probeChainTestContent, FilePath: filePath,
 		MediaFolderID: 77, VirtualOwnerInstallationID: 5, ProbeSource: "virtual",
 		ProbeUpdatedAt: probeUpdatedAt,
 	}
+	row.ResolvedURL = probeChainProviderURL(row)
+	return row
 }
 
 func probeChainStreams(row *models.MediaFile) []VirtualPlaybackStream {
 	return []VirtualPlaybackStream{
 		{URI: "virtual://movie/probe-chain?result=c5", OwnerInstallationID: 5, Resolution: "1080p"},
-		{URI: row.FilePath, OwnerInstallationID: row.VirtualOwnerInstallationID, Resolution: "2160p",
+		{URI: row.FilePath, ProviderURL: probeChainProviderURL(row), OwnerInstallationID: row.VirtualOwnerInstallationID, Resolution: "2160p",
 			AudioLanguages: []string{"eng"}, SubtitleLanguages: []string{"eng"}},
 	}
 }
@@ -180,11 +187,105 @@ func TestScheduleDefaultFileProbeProbesTheDefaultRowsOwnBytes(t *testing.T) {
 	if prober.count() != 1 {
 		t.Fatalf("probe calls = %d, want exactly 1", prober.count())
 	}
-	if got := prober.last(); got != row.FilePath {
-		t.Fatalf("probed %q, want the default row's own persisted bytes %q", got, row.FilePath)
+	if got := prober.last(); got != probeChainProviderURL(row) {
+		t.Fatalf("probed %q, want the default row's own resolved bytes %q", got, probeChainProviderURL(row))
 	}
 	if target.callCount() != 1 {
 		t.Fatalf("target reads = %d, want 1", target.callCount())
+	}
+}
+
+func TestNewVirtualDefaultProbeTargetUsesSelectedFile(t *testing.T) {
+	defaultRow := probeChainRow(700, "virtual://movie/probe-chain?result=default", nil)
+	selectedRow := probeChainRow(701, "virtual://movie/probe-chain?result=selected", nil)
+	reader := &probeChainVersionReader{
+		files: []*models.MediaFile{defaultRow, selectedRow},
+		rows:  map[int]*models.MediaFile{defaultRow.ID: defaultRow, selectedRow.ID: selectedRow},
+	}
+	target := NewVirtualDefaultProbeTarget(reader, reader)
+
+	got, err := target.DefaultVirtualProbeTarget(t.Context(), probeChainTestContent, catalog.AccessFilter{SelectedFileID: selectedRow.ID, AllowedLibraryIDs: []int{77}})
+	if err != nil || got == nil || got.ID != selectedRow.ID || got.FilePath != selectedRow.FilePath {
+		t.Fatalf("selected target = %+v, err = %v; want file %d", got, err, selectedRow.ID)
+	}
+
+	if got, err := target.DefaultVirtualProbeTarget(t.Context(), probeChainTestContent, catalog.AccessFilter{SelectedFileID: 999, AllowedLibraryIDs: []int{77}}); err != nil || got != nil {
+		t.Fatalf("unknown selected target = %+v, err = %v; want no target", got, err)
+	}
+
+	selectedRow.MediaFolderID = 78
+	reader.rows[selectedRow.ID] = selectedRow
+	if got, err := target.DefaultVirtualProbeTarget(t.Context(), probeChainTestContent, catalog.AccessFilter{SelectedFileID: selectedRow.ID, AllowedLibraryIDs: []int{77}}); err != nil || got != nil {
+		t.Fatalf("hidden selected target = %+v, err = %v; want no target", got, err)
+	}
+}
+
+func TestScheduleDefaultFileProbeProbesPersistedSelectedWhenListingChanged(t *testing.T) {
+	defaultRow := probeChainRow(730, "virtual://movie/probe-chain?result=default", nil)
+	selectedRow := probeChainRow(731, "virtual://movie/probe-chain?profile=4K+Dolby+Vision&result=selected", nil)
+	reader := &probeChainVersionReader{
+		files: []*models.MediaFile{defaultRow, selectedRow},
+		rows:  map[int]*models.MediaFile{defaultRow.ID: defaultRow, selectedRow.ID: selectedRow},
+	}
+	prober := &recordingProber{}
+	h := &PlaybackHandler{
+		ServiceContext:              context.Background(),
+		DefaultProbeTarget:          NewVirtualDefaultProbeTarget(reader, reader),
+		VirtualPlaybackSourceProber: prober.probe,
+	}
+	// The fresh listing no longer names the selected row's URI (the provider
+	// renumbered it), but the selected row itself is persisted and authorized.
+	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), probeChainStreams(defaultRow), catalog.AccessFilter{SelectedFileID: selectedRow.ID, AllowedLibraryIDs: []int{77}})
+	h.probeChainWG.Wait()
+	if prober.count() != 1 || prober.last() != probeChainProviderURL(selectedRow) {
+		t.Fatalf("probes = %d, last = %q; want the persisted selected row %q", prober.count(), prober.last(), probeChainProviderURL(selectedRow))
+	}
+}
+
+func TestScheduleDefaultFileProbePublishesAfterDurableEvidence(t *testing.T) {
+	defaultRow := probeChainRow(720, "virtual://movie/probe-chain?result=default", nil)
+	selectedRow := probeChainRow(721, "virtual://movie/probe-chain?result=selected", nil)
+	reader := &probeChainVersionReader{
+		files: []*models.MediaFile{defaultRow, selectedRow},
+		rows:  map[int]*models.MediaFile{defaultRow.ID: defaultRow, selectedRow.ID: selectedRow},
+	}
+	bus := &recordingEventBus{}
+	hub := notifications.NewHub("probe-chain-event", bus)
+	prober := &recordingProber{}
+	h := &PlaybackHandler{
+		ServiceContext:              context.Background(),
+		EventsHub:                   hub.EventsHub(),
+		DefaultProbeTarget:          NewVirtualDefaultProbeTarget(reader, reader),
+		VirtualPlaybackSourceProber: prober.probe,
+		VirtualFileMetadataSaver: func(context.Context, models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error) {
+			return VirtualFileMetadataUpdateResult{MetadataUpdated: true, RowsAffected: 1}, nil
+		},
+	}
+	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), probeChainStreams(selectedRow), catalog.AccessFilter{SelectedFileID: selectedRow.ID, AllowedLibraryIDs: []int{77}})
+	h.probeChainWG.Wait()
+	payload := waitForRecordingEvent(t, bus, 2*time.Second, "catalog.item.changed", "versions_updated", probeChainTestContent)
+	if payload == "" {
+		t.Fatal("verified evidence did not publish versions_updated")
+	}
+}
+
+func TestScheduleDefaultFileProbeProbesSelectedBytes(t *testing.T) {
+	defaultRow := probeChainRow(710, "virtual://movie/probe-chain?result=default", nil)
+	selectedRow := probeChainRow(711, "virtual://movie/probe-chain?result=selected", nil)
+	reader := &probeChainVersionReader{
+		files: []*models.MediaFile{defaultRow, selectedRow},
+		rows:  map[int]*models.MediaFile{defaultRow.ID: defaultRow, selectedRow.ID: selectedRow},
+	}
+	prober := &recordingProber{}
+	h := &PlaybackHandler{
+		ServiceContext:              context.Background(),
+		DefaultProbeTarget:          NewVirtualDefaultProbeTarget(reader, reader),
+		VirtualPlaybackSourceProber: prober.probe,
+	}
+	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), probeChainStreams(selectedRow), catalog.AccessFilter{SelectedFileID: selectedRow.ID, AllowedLibraryIDs: []int{77}})
+	h.probeChainWG.Wait()
+	if prober.count() != 1 || prober.last() != probeChainProviderURL(selectedRow) {
+		t.Fatalf("probes = %d, last = %q; want selected file %q", prober.count(), prober.last(), probeChainProviderURL(selectedRow))
 	}
 }
 
@@ -205,6 +306,27 @@ func TestScheduleDefaultFileProbeSecondCallCoalescesIntoLiveChain(t *testing.T) 
 	if prober.count() != 1 {
 		t.Fatalf("probe calls after two schedules = %d, want one chain", prober.count())
 	}
+}
+
+func TestScheduleDefaultFileProbeCoalescesSelectedVersionAcrossSources(t *testing.T) {
+	row := probeChainRow(312, "virtual://movie/probe-chain?result=c12", nil)
+	h, target, _ := probeChainHandler(row)
+
+	// Discovery persists one source group at a time. Each group must not spawn
+	// its own chain for the same selected version: that exhausted the process
+	// slots with duplicates and left the actual selected chain unscheduled.
+	secondSource := probeChainSourceRow()
+	secondSource.FilePath = "virtual://movie/probe-chain?profile=1080p"
+	filter := catalog.AccessFilter{SelectedFileID: row.ID, AllowedLibraryIDs: []int{77}}
+
+	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), probeChainStreams(row), filter)
+	probeChainWaitFor(t, 1, target.callCount, "first source target reads")
+
+	h.ScheduleDefaultFileProbe(probeChainTestContent, secondSource, probeChainStreams(row), filter)
+	probeChainStableWait(t, 1, target.callCount, "coalesced second-source target reads")
+
+	target.releaseRow()
+	h.probeChainWG.Wait()
 }
 
 func TestScheduleDefaultFileProbeSkipsStampedRow(t *testing.T) {
@@ -374,8 +496,8 @@ func TestScheduleDefaultFileProbeStallTeriminatesAndRestoresSlot(t *testing.T) {
 		t.Fatal("a well-behaved chain after a stall did not probe")
 	}
 	h.probeChainWG.Wait()
-	if got := prober2.last(); got != row2.FilePath {
-		t.Fatalf("retry probed %q, want the default row's bytes %q", got, row2.FilePath)
+	if got := prober2.last(); got != probeChainProviderURL(row2) {
+		t.Fatalf("retry probed %q, want the default row's resolved bytes %q", got, probeChainProviderURL(row2))
 	}
 }
 
@@ -643,6 +765,8 @@ func TestScheduleDefaultFileProbeHonorsTheDiscoveryAccessFilter(t *testing.T) {
 		ID: 331, ContentID: probeChainTestContent, FilePath: "virtual://movie/probe-chain?result=hidden",
 		MediaFolderID: hiddenLibrary, VirtualOwnerInstallationID: 5, ProbeSource: "virtual",
 	}
+	visible.ResolvedURL = probeChainProviderURL(visible)
+	hidden.ResolvedURL = probeChainProviderURL(hidden)
 	reader := &probeChainVersionReader{
 		// The hidden version sorts first, so an unfiltered read would pick it.
 		files: []*models.MediaFile{hidden, visible},
@@ -673,8 +797,8 @@ func TestScheduleDefaultFileProbeHonorsTheDiscoveryAccessFilter(t *testing.T) {
 	if len(reads) != 1 || reads[0] != visible.ID {
 		t.Fatalf("file rows read = %v, want only the visible version %d", reads, visible.ID)
 	}
-	if prober.count() != 1 || prober.last() != visible.FilePath {
-		t.Fatalf("probed %q (%d probes), want the visible default %q", prober.last(), prober.count(), visible.FilePath)
+	if prober.count() != 1 || prober.last() != probeChainProviderURL(visible) {
+		t.Fatalf("probed %q (%d probes), want the visible default %q", prober.last(), prober.count(), probeChainProviderURL(visible))
 	}
 	if len(filters) != 1 {
 		t.Fatalf("catalog version reads = %d, want 1", len(filters))
@@ -686,6 +810,38 @@ func TestScheduleDefaultFileProbeHonorsTheDiscoveryAccessFilter(t *testing.T) {
 		got.MetadataLanguageOverrides["en"] != "fr" ||
 		got.MaxContentRating != "PG-13" {
 		t.Fatalf("catalog read filter = %+v, want the discovery request's filter %+v", got, filter)
+	}
+}
+
+// A selected profile variant that vanished from the fresh listing is probed
+// from its own persisted candidate. That candidate can carry an expired signed
+// URL copied from the selected row; it must be resolved afresh rather than
+// probing the expired transport and marking the candidate failed.
+func TestVirtualChainProbeURLRefreshesExpiredSelectedCandidate(t *testing.T) {
+	const freshURL = "https://probe.example/fresh-selected"
+	past := time.Now().Add(-time.Hour)
+	row := probeChainRow(7001, "virtual://movie/probe-chain?result=selected", nil)
+	row.ResolvedURL = "https://probe.example/expired-selected"
+	row.ResolvedURLExpiresAt = &past
+	cand := virtualPlaybackStreamFromFile(row)
+	if cand == nil {
+		t.Fatal("selected candidate was not built")
+	}
+	calls := 0
+	h := &PlaybackHandler{VirtualMediaDetailedResolver: VirtualMediaDetailedResolverFunc(func(_ context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+		calls++
+		return ResolvedVirtualMedia{URL: freshURL}, nil
+	})}
+
+	url, _, ok := h.virtualChainProbeURL(context.Background(), row, *cand, catalog.AccessFilter{UserID: 1, ProfileID: "profile-1"})
+	if !ok {
+		t.Fatal("expired selected candidate produced no probe URL")
+	}
+	if url != freshURL {
+		t.Fatalf("probe URL = %q, want the fresh resolve %q", url, freshURL)
+	}
+	if calls != 1 {
+		t.Fatalf("fresh resolver calls = %d, want 1", calls)
 	}
 }
 

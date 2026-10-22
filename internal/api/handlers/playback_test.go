@@ -362,6 +362,11 @@ func newPlaybackTestStore(t *testing.T) userstore.UserStore {
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
+	// SQLite's :memory: database is per connection. Pin the pool to one
+	// connection so InitSchema and every later query see the same database;
+	// otherwise a request under load can open a second connection and fail
+	// with "no such table: audio_preferences".
+	db.SetMaxOpenConns(1)
 	t.Cleanup(func() {
 		_ = db.Close()
 	})

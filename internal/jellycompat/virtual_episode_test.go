@@ -53,6 +53,37 @@ func TestVirtualEpisodeLocationType(t *testing.T) {
 	}
 }
 
+// A multi-version detail response carries the version list even when the client
+// did not request Fields=MediaSources. Clients such as Plezy render their
+// version menu from the item DTO and never make the separate request that would
+// otherwise supply it.
+func TestMultiVersionDetailIncludesMediaSourcesByDefault(t *testing.T) {
+	m := newMapper(NewResourceIDCodec(), &config.Config{})
+	detail := upstreamItemDetail{
+		ContentID: "movie-multi",
+		Type:      "movie",
+		Title:     "Multi Version",
+		Versions: []catalog.FileVersion{
+			{FileID: 42, Container: "mkv", Duration: 1200},
+			{FileID: 43, Container: "mp4", Duration: 1200},
+		},
+	}
+	noFields := map[string]bool{}
+	dto := m.itemFromDetailWithFields(detail, false, nil, noFields)
+	if len(dto.MediaSources) != 2 {
+		t.Fatalf("multi-version MediaSources = %d, want 2 without an explicit field request", len(dto.MediaSources))
+	}
+	single := upstreamItemDetail{
+		ContentID: "movie-single",
+		Type:      "movie",
+		Title:     "Single Version",
+		Versions:  []catalog.FileVersion{{FileID: 44, Container: "mkv", Duration: 1200}},
+	}
+	if got := len(m.itemFromDetailWithFields(single, false, nil, noFields).MediaSources); got != 0 {
+		t.Fatalf("single-version default MediaSources = %d, want 0", got)
+	}
+}
+
 // TestVirtualEpisodeListPaths verifies the list-side mappers honor the
 // HasMediaFiles signal: false -> Virtual, true -> FileSystem, and nil
 // (unknown, producing query did not check) preserves the historical

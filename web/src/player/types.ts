@@ -175,6 +175,8 @@ export interface PlayerAudioTrack {
    * virtual track carries no index.
    */
   index?: number;
+  /** Server-assigned identity (`file:<id>:audio:<ordinal>`), when published. */
+  track_id?: string;
   title?: string;
   embedded_title?: string;
   language?: string;
