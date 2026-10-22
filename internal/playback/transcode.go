@@ -3563,26 +3563,36 @@ func (s *TranscodeSession) SegmentProgress(time.Time) SegmentProgress {
 		}
 	}
 
-	if s.outputDir != "" {
-		if entries, err := os.ReadDir(s.outputDir); err == nil {
-			for _, entry := range entries {
-				if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".tmp") {
-					continue
-				}
-				info, infoErr := entry.Info()
-				if infoErr != nil || info.Size() <= 0 {
-					continue
-				}
-				if info.ModTime().After(progress.ActiveTempAt) {
-					progress.ActiveTempAt = info.ModTime()
-				}
-				if info.Size() > progress.ActiveTempSize {
-					progress.ActiveTempSize = info.Size()
-				}
-			}
+	scanActiveTempProgress(s.outputDir, &progress)
+	return progress
+}
+
+// scanActiveTempProgress records the newest partial HLS segment in outputDir.
+// ffmpeg writes the segment to a .tmp file and renames it on completion, so its
+// growth is progress even while the manifest head cannot advance.
+func scanActiveTempProgress(outputDir string, progress *SegmentProgress) {
+	if outputDir == "" {
+		return
+	}
+	entries, err := os.ReadDir(outputDir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".tmp") {
+			continue
+		}
+		info, infoErr := entry.Info()
+		if infoErr != nil || info.Size() <= 0 {
+			continue
+		}
+		if info.ModTime().After(progress.ActiveTempAt) {
+			progress.ActiveTempAt = info.ModTime()
+		}
+		if info.Size() > progress.ActiveTempSize {
+			progress.ActiveTempSize = info.Size()
 		}
 	}
-	return progress
 }
 
 // SegmentRecoveryDecision determines whether a missing segment should briefly
