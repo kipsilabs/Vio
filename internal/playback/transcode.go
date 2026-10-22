@@ -4538,6 +4538,29 @@ func (s *TranscodeSession) WaitForOpenSegmentWithStall(name string, timeout, sta
 	return s.waitForOpenSegment(name, timeout, stall)
 }
 
+// checkSegmentStall samples produced-head progress at most twice a second and
+// reports ErrSegmentStalled when the head has not moved for stall. It is split
+// from the wait loop so the recovery condition stays readable.
+func (s *TranscodeSession) checkSegmentStall(now time.Time, stall time.Duration, lastCheck *time.Time, lastHead *int, lastHeadAt *time.Time) error {
+	if !lastCheck.IsZero() && now.Sub(*lastCheck) < 500*time.Millisecond {
+		return nil
+	}
+	progress := s.SegmentProgress(now)
+	*lastCheck = now
+	if !progress.HasManifest || progress.ProducedHead < progress.StartSegmentNumber {
+		return nil
+	}
+	if progress.ProducedHead != *lastHead {
+		*lastHead = progress.ProducedHead
+		*lastHeadAt = now
+		return nil
+	}
+	if !lastHeadAt.IsZero() && now.Sub(*lastHeadAt) >= stall {
+		return ErrSegmentStalled
+	}
+	return nil
+}
+
 func (s *TranscodeSession) waitForOpenSegment(name string, timeout, stall time.Duration) (*SegmentLease, error) {
 	deadline := time.After(timeout)
 	numbered := false
@@ -4590,18 +4613,8 @@ func (s *TranscodeSession) waitForOpenSegment(name string, timeout, stall time.D
 		}
 
 		if numbered && stall > 0 {
-			now := time.Now()
-			if lastStallCheck.IsZero() || now.Sub(lastStallCheck) >= 500*time.Millisecond {
-				progress := s.SegmentProgress(now)
-				lastStallCheck = now
-				if progress.HasManifest && progress.ProducedHead >= progress.StartSegmentNumber {
-					if progress.ProducedHead != lastHead {
-						lastHead = progress.ProducedHead
-						lastHeadAt = now
-					} else if !lastHeadAt.IsZero() && now.Sub(lastHeadAt) >= stall {
-						return nil, ErrSegmentStalled
-					}
-				}
+			if err := s.checkSegmentStall(time.Now(), stall, &lastStallCheck, &lastHead, &lastHeadAt); err != nil {
+				return nil, err
 			}
 		}
 
