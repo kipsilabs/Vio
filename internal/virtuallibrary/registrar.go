@@ -8,6 +8,8 @@ import (
 	"strings"
 
 	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/metadata"
+	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary/monitor"
 )
 
@@ -17,6 +19,14 @@ type catalogMonitorRegistrar struct {
 	registrar       *catalog.VirtualMediaRegistrar
 	movieLibraryID  int
 	seriesLibraryID int
+	artwork         libraryArtworkEnqueuer
+}
+
+// libraryArtworkEnqueuer is the metadata service's artwork-cache surface. The
+// adapter calls it after a successful registration with the stored content ID,
+// so jobs are keyed to the item the catalog actually committed.
+type libraryArtworkEnqueuer interface {
+	EnqueueLibraryItemImages(context.Context, *models.MediaItem, map[string]string, []metadata.RemoteImage) error
 }
 
 var _ monitor.MediaRegistrar = (*catalogMonitorRegistrar)(nil)
@@ -53,8 +63,16 @@ func virtualEpisodeURI(item monitor.MonitoredMedia, ep monitor.VirtualEpisode) s
 }
 
 func (r *catalogMonitorRegistrar) Register(ctx context.Context, item monitor.MonitoredMedia) error {
+	_, err := r.RegisterWithResult(ctx, item)
+	return err
+}
+
+// RegisterWithResult registers the item and reports the catalog content ID the
+// registrar actually stored. The monitor persists that ID so later enrichment
+// cannot move the item to a new identity.
+func (r *catalogMonitorRegistrar) RegisterWithResult(ctx context.Context, item monitor.MonitoredMedia) (string, error) {
 	if r == nil || r.registrar == nil {
-		return fmt.Errorf("virtual catalog registrar is unavailable")
+		return "", fmt.Errorf("virtual catalog registrar is unavailable")
 	}
 	folderID := item.MediaFolderID
 	if folderID <= 0 {
@@ -69,8 +87,96 @@ func (r *catalogMonitorRegistrar) Register(ctx context.Context, item monitor.Mon
 		libraryIDStr = strconv.Itoa(folderID)
 	}
 
-	_, err := r.registrar.Upsert(ctx, virtualMediaRegistration(item, libraryIDStr))
-	return err
+	payload := virtualMediaRegistration(item, libraryIDStr)
+	var (
+		result *catalog.VirtualMediaResult
+		err    error
+	)
+	if contentID := strings.TrimSpace(item.CatalogContentID); contentID != "" {
+		result, err = r.registrar.UpsertVirtualMediaResolved(ctx, 0, contentID, payload)
+	} else {
+		result, err = r.registrar.Upsert(ctx, payload)
+	}
+	if err != nil {
+		return "", err
+	}
+	if result == nil {
+		return "", nil
+	}
+	return result.MediaID, nil
+}
+
+// ResolveContentID maps provider aliases onto a single existing catalog item.
+func (r *catalogMonitorRegistrar) ResolveContentID(ctx context.Context, mediaType string, providerIDs map[string]string) (string, error) {
+	if r == nil || r.registrar == nil {
+		return "", fmt.Errorf("virtual catalog registrar is unavailable")
+	}
+	return r.registrar.ResolveVirtualMediaContentID(ctx, mediaType, providerIDs)
+}
+
+// ResolveLibrary validates the requested destination, or the configured
+// default for the media type when the request did not name one.
+func (r *catalogMonitorRegistrar) ResolveLibrary(ctx context.Context, mediaType string, requested int) (int, error) {
+	if r == nil || r.registrar == nil {
+		return 0, fmt.Errorf("virtual catalog registrar is unavailable")
+	}
+	folderID := requested
+	if folderID <= 0 {
+		switch mediaType {
+		case "movie":
+			folderID = r.movieLibraryID
+		case "series":
+			folderID = r.seriesLibraryID
+		default:
+			return 0, fmt.Errorf("destination library requires movie or series media type")
+		}
+	}
+	if folderID <= 0 {
+		return 0, fmt.Errorf("no destination library is configured for %s", mediaType)
+	}
+	if err := r.registrar.ValidateVirtualMediaLibrary(ctx, mediaType, folderID); err != nil {
+		return 0, err
+	}
+	return folderID, nil
+}
+
+// EnqueueArtwork queues cache jobs for the artwork the registration stored.
+// Failures are non-fatal and are logged by the monitor.
+func (r *catalogMonitorRegistrar) EnqueueArtwork(ctx context.Context, contentID string, item monitor.MonitoredMedia) error {
+	if r == nil || r.artwork == nil || contentID == "" {
+		return nil
+	}
+	stored := &models.MediaItem{
+		ContentID:    contentID,
+		Type:         item.MediaType,
+		PosterPath:   strings.TrimSpace(item.Poster),
+		BackdropPath: strings.TrimSpace(item.Backdrop),
+	}
+	stored.PosterSourcePath = catalogArtworkSourcePath(stored.PosterPath)
+	stored.BackdropSourcePath = catalogArtworkSourcePath(stored.BackdropPath)
+	return r.artwork.EnqueueLibraryItemImages(ctx, stored, catalogProviderIDs(item), nil)
+}
+
+func catalogArtworkSourcePath(path string) string {
+	path = strings.TrimSpace(path)
+	if strings.Contains(path, "://") {
+		return path
+	}
+	return ""
+}
+
+func catalogProviderIDs(item monitor.MonitoredMedia) map[string]string {
+	ids := make(map[string]string, 3)
+	if id := strings.TrimSpace(item.TMDBID); id != "" {
+		ids["tmdb"] = id
+	}
+	if id := strings.TrimSpace(item.TVDBID); id != "" {
+		ids["tvdb"] = id
+	}
+	if id := strings.TrimSpace(item.IMDbID); id != "" {
+		ids["imdb"] = id
+	}
+	return ids
 }
 
 // virtualMediaRegistration maps a monitored item onto the catalog payload.

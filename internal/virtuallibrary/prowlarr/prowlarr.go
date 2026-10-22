@@ -127,6 +127,15 @@ type monitoredMedia struct {
 	Backdrop      string           `json:"backdrop,omitempty"`
 	Genres        []string         `json:"genres,omitempty"`
 	Episodes      []virtualEpisode `json:"episodes,omitempty"`
+	// CatalogContentID is the catalog identity resolved from provider aliases.
+	// Once set, enrichment may add provider IDs but must never change this ID.
+	CatalogContentID string `json:"catalog_content_id,omitempty"`
+	// MetadataNextSeason is the resumable series metadata cursor. Zero means
+	// the next lookup starts from the first season.
+	MetadataNextSeason int `json:"metadata_next_season,omitempty"`
+	// MetadataComplete records that the last lookup reached the end of the
+	// season list. It never authorizes deleting episodes.
+	MetadataComplete bool `json:"metadata_complete,omitempty"`
 }
 
 // virtualEpisode mirrors a series episode for episode-level matching.

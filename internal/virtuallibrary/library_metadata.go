@@ -3,6 +3,7 @@ package virtuallibrary
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -11,94 +12,205 @@ import (
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary/monitor"
 )
 
+const (
+	// libraryMetadataTimeout bounds enrichment inside the monitor's 45-second
+	// per-item budget. Provider metadata, artwork discovery, and one resumable
+	// season batch must fit here; registration keeps the remaining time.
+	libraryMetadataTimeout = 30 * time.Second
+	// libraryMetadataSeasonsPerCall keeps a long series resumable instead of
+	// requiring a complete season traversal before anything can register.
+	libraryMetadataSeasonsPerCall = 2
+)
+
+// LibraryMetadataResolver is the metadata service surface the virtual monitor
+// uses. A lookup returns partial observations with an error when it could not
+// finish; the caller keeps the partial result and retries from NextSeason.
 type LibraryMetadataResolver interface {
-	FetchLibraryMetadata(context.Context, int, *models.MediaItem) (*metadata.MetadataResult, []metadata.EpisodeResult, error)
+	FetchLibraryMetadata(context.Context, int, *models.MediaItem, metadata.LibraryMetadataLookupOptions) (*metadata.LibraryMetadataLookupResult, error)
 }
 
+var _ LibraryMetadataResolver = (*metadata.MetadataService)(nil)
+var _ libraryArtworkEnqueuer = (*metadata.MetadataService)(nil)
+
+// SetLibraryMetadataResolver installs the destination-library enrichment path.
+// A nil resolver disables it, leaving the monitor's legacy metadata path.
 func (s *Service) SetLibraryMetadataResolver(resolver LibraryMetadataResolver) {
+	if resolver == nil {
+		s.Monitor.SetMetadataResolver(nil)
+		if s.registrarAdapter != nil {
+			s.registrarAdapter.artwork = nil
+		}
+		return
+	}
+	if s.registrarAdapter != nil {
+		if enqueuer, ok := resolver.(libraryArtworkEnqueuer); ok {
+			s.registrarAdapter.artwork = enqueuer
+		}
+	}
+	logger := s.logger
+	if logger == nil {
+		logger = slog.Default()
+	}
 	s.Monitor.SetMetadataResolver(func(ctx context.Context, item monitor.MonitoredMedia) (monitor.MonitoredMedia, error) {
-		if resolver == nil {
-			return item, fmt.Errorf("library metadata service is unavailable")
+		return s.enrichFromLibraryMetadata(ctx, logger, resolver, item)
+	})
+}
+
+// enrichFromLibraryMetadata applies whatever the destination library could
+// resolve. Enrichment is optional: provider failures and partial traversals
+// preserve existing metadata, episodes, and the resumable season cursor.
+// Identity and release eligibility are evaluated by the monitor afterwards.
+func (s *Service) enrichFromLibraryMetadata(
+	ctx context.Context,
+	logger *slog.Logger,
+	resolver LibraryMetadataResolver,
+	item monitor.MonitoredMedia,
+) (monitor.MonitoredMedia, error) {
+	folderID := item.MediaFolderID
+	if folderID <= 0 {
+		// The monitor resolves the destination before enrichment. Retain the
+		// service defaults as a fallback for callers that predate that step.
+		if item.MediaType == "series" {
+			folderID = s.cfg.SeriesLibraryID
+		} else {
+			folderID = s.cfg.MovieLibraryID
 		}
-		folderID := item.MediaFolderID
-		if folderID <= 0 {
-			if item.MediaType == "series" {
-				folderID = s.cfg.SeriesLibraryID
-			} else {
-				folderID = s.cfg.MovieLibraryID
-			}
+	}
+	if folderID <= 0 {
+		return item, fmt.Errorf("library metadata requires a destination library")
+	}
+	metadataCtx, cancel := context.WithTimeout(ctx, libraryMetadataTimeout)
+	defer cancel()
+
+	lookupItem := &models.MediaItem{
+		ContentID:    item.CatalogContentID,
+		Type:         item.MediaType,
+		Title:        item.Title,
+		Year:         int(item.Year),
+		TmdbID:       item.TMDBID,
+		TvdbID:       item.TVDBID,
+		ImdbID:       item.IMDbID,
+		PosterPath:   item.Poster,
+		BackdropPath: item.Backdrop,
+	}
+	result, lookupErr := resolver.FetchLibraryMetadata(metadataCtx, folderID, lookupItem, metadata.LibraryMetadataLookupOptions{
+		AfterSeason: item.MetadataNextSeason,
+		MaxSeasons:  libraryMetadataSeasonsPerCall,
+	})
+	if result != nil {
+		applyLibraryMetadataResult(&item, result, folderID)
+	}
+	if lookupErr != nil {
+		if metadataCtx.Err() != nil {
+			return item, metadataCtx.Err()
 		}
-		result, episodes, err := resolver.FetchLibraryMetadata(ctx, folderID, &models.MediaItem{
-			Type: item.MediaType, Title: item.Title, Year: int(item.Year),
-			TmdbID: item.TMDBID, TvdbID: item.TVDBID, ImdbID: item.IMDbID,
-		})
-		if err != nil {
-			return item, err
-		}
-		if result == nil {
-			return item, metadata.ErrMetadataNotFound
-		}
-		if title := monitor.CleanMetadataText(result.Title); title != "" {
+		// Provider failure is degraded, not fatal: known metadata and
+		// episodes remain usable, and the next pass retries the lookup.
+		logger.WarnContext(ctx, "virtual library metadata incomplete; keeping known metadata",
+			"key", item.Key, "folder_id", folderID, "error", lookupErr)
+	}
+	return item, nil
+}
+
+func applyLibraryMetadataResult(item *monitor.MonitoredMedia, result *metadata.LibraryMetadataLookupResult, folderID int) {
+	if item == nil || result == nil {
+		return
+	}
+	if md := result.Metadata; md != nil {
+		if title := monitor.CleanMetadataText(md.Title); title != "" {
 			item.Title = title
 		}
-		if overview := monitor.CleanMetadataSummary(result.Overview); overview != "" {
+		if overview := monitor.CleanMetadataSummary(md.Overview); overview != "" {
 			item.Overview = overview
 		}
-		if poster := strings.TrimSpace(result.PosterPath); poster != "" {
-			item.Poster = poster
+		if md.Runtime > 0 {
+			item.Runtime = md.Runtime
 		}
-		if backdrop := strings.TrimSpace(result.BackdropPath); backdrop != "" {
-			item.Backdrop = backdrop
-		}
-		if result.Runtime > 0 {
-			item.Runtime = result.Runtime
-		}
-		if len(result.Genres) > 0 {
-			item.Genres = make([]string, 0, len(result.Genres))
-			for _, genre := range result.Genres {
+		if len(md.Genres) > 0 {
+			genres := make([]string, 0, len(md.Genres))
+			for _, genre := range md.Genres {
 				if genre = monitor.CleanMetadataText(genre); genre != "" {
-					item.Genres = append(item.Genres, genre)
+					genres = append(genres, genre)
 				}
+			}
+			if len(genres) > 0 {
+				item.Genres = genres
 			}
 		}
 		if item.TMDBID == "" {
-			item.TMDBID = result.ProviderIDs["tmdb"]
+			item.TMDBID = strings.TrimSpace(md.ProviderIDs["tmdb"])
 		}
 		if item.TVDBID == "" {
-			item.TVDBID = result.ProviderIDs["tvdb"]
+			item.TVDBID = strings.TrimSpace(md.ProviderIDs["tvdb"])
 		}
 		if item.IMDbID == "" {
-			item.IMDbID = result.ProviderIDs["imdb"]
+			item.IMDbID = strings.TrimSpace(md.ProviderIDs["imdb"])
 		}
-		if item.MediaType == "series" {
-			fresh := make([]monitor.VirtualEpisode, 0, len(episodes))
-			for _, episode := range episodes {
-				if episode.SeasonNumber <= 0 || episode.EpisodeNumber <= 0 {
-					continue
-				}
-				title := monitor.CleanMetadataText(episode.Title)
-				if title == "" {
-					return item, fmt.Errorf("episode metadata is missing a title")
-				}
-				released, err := time.Parse(time.DateOnly, episode.AirDate)
-				if err != nil && episode.AirDate != "" {
-					released, err = time.Parse(time.RFC3339, episode.AirDate)
-					if err != nil {
-						return item, fmt.Errorf("invalid episode air date: %w", err)
-					}
-				}
-				fresh = append(fresh, monitor.VirtualEpisode{
-					Season: episode.SeasonNumber, Episode: episode.EpisodeNumber,
-					Title: title, Overview: monitor.CleanMetadataSummary(episode.Overview),
-					Runtime: episode.Runtime, Thumbnail: episode.StillPath, Released: released,
-				})
-			}
-			if len(fresh) == 0 {
-				return item, metadata.ErrMetadataNotFound
-			}
-			item.Episodes = fresh
+	}
+	poster := strings.TrimSpace(result.PosterPath)
+	if poster == "" && result.Metadata != nil {
+		poster = strings.TrimSpace(result.Metadata.PosterPath)
+	}
+	if poster != "" {
+		item.Poster = poster
+	}
+	backdrop := strings.TrimSpace(result.BackdropPath)
+	if backdrop == "" && result.Metadata != nil {
+		backdrop = strings.TrimSpace(result.Metadata.BackdropPath)
+	}
+	if backdrop != "" {
+		item.Backdrop = backdrop
+	}
+	if item.MediaType == "series" {
+		// Episodes are merged by coordinate. A partial lookup must never
+		// delete an episode that an earlier lookup or the catalog already
+		// knows about, and Complete does not authorize deletion either.
+		item.Episodes = monitor.MergeEpisodes(item.Episodes, libraryEpisodes(result.Episodes))
+	}
+	item.MediaFolderID = folderID
+	item.MetadataNextSeason = result.NextSeason
+	item.MetadataComplete = result.Complete
+}
+
+func libraryEpisodes(episodes []metadata.EpisodeResult) []monitor.VirtualEpisode {
+	fresh := make([]monitor.VirtualEpisode, 0, len(episodes))
+	for _, episode := range episodes {
+		if episode.SeasonNumber <= 0 || episode.EpisodeNumber <= 0 {
+			continue
 		}
-		item.MediaFolderID = folderID
-		return item, nil
-	})
+		title := monitor.CleanMetadataText(episode.Title)
+		if title == "" {
+			title = fmt.Sprintf("Episode %d", episode.EpisodeNumber)
+		}
+		released, ok := parseLibraryAirDate(episode.AirDate)
+		if !ok {
+			// The lookup already rejects malformed dates. Skip a row that
+			// still slips through rather than failing usable siblings.
+			continue
+		}
+		fresh = append(fresh, monitor.VirtualEpisode{
+			Season:    episode.SeasonNumber,
+			Episode:   episode.EpisodeNumber,
+			Title:     title,
+			Overview:  monitor.CleanMetadataSummary(episode.Overview),
+			Runtime:   episode.Runtime,
+			Thumbnail: strings.TrimSpace(episode.StillPath),
+			Released:  released,
+		})
+	}
+	return fresh
+}
+
+func parseLibraryAirDate(value string) (time.Time, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Time{}, true
+	}
+	if released, err := time.Parse(time.DateOnly, value); err == nil {
+		return released, true
+	}
+	if released, err := time.Parse(time.RFC3339, value); err == nil {
+		return released, true
+	}
+	return time.Time{}, false
 }

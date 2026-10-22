@@ -46,6 +46,10 @@ type Service struct {
 	Resolver *resolver.Resolver
 	Monitor  *monitor.Monitor
 
+	// registrarAdapter is the catalog-backed monitor registrar. It is kept so
+	// late-wired services (metadata artwork enqueue) can reach it.
+	registrarAdapter *catalogMonitorRegistrar
+
 	// indexerReleases persists the Prowlarr releases offered for a title the
 	// provider does not have yet. It is nil when the registrar (and therefore
 	// the pool) is unavailable, so callers must nil-check.
@@ -235,12 +239,14 @@ func New(cfg Config, registrar *catalog.VirtualMediaRegistrar, logger *slog.Logg
 			logger.Warn("virtual library altmount configuration error", "error", err)
 		}
 	}
+	var registrarAdapter *catalogMonitorRegistrar
 	if registrar != nil {
-		m.SetRegistrar(&catalogMonitorRegistrar{
+		registrarAdapter = &catalogMonitorRegistrar{
 			registrar:       registrar,
 			movieLibraryID:  cfg.MovieLibraryID,
 			seriesLibraryID: cfg.SeriesLibraryID,
-		})
+		}
+		m.SetRegistrar(registrarAdapter)
 		m.SetHost(&catalogRegistrarAdapter{registrar: registrar})
 	}
 	// Wire the resolver's ingestion hooks. The monitor owns the classifier
@@ -259,7 +265,7 @@ func New(cfg Config, registrar *catalog.VirtualMediaRegistrar, logger *slog.Logg
 	if store := m.ReleaseStore(); store != nil {
 		r.SetReleaseGate(store)
 	}
-	service := &Service{Resolver: r, Monitor: m, cfg: cfg, logger: logger}
+	service := &Service{Resolver: r, Monitor: m, registrarAdapter: registrarAdapter, cfg: cfg, logger: logger}
 	if pool := registrarPool(registrar); pool != nil {
 		service.indexerReleases = NewIndexerReleaseStore(pool)
 	}
