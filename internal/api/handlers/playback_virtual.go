@@ -5080,8 +5080,9 @@ func refreshVirtualPersistArgsForRow(args models.VirtualFilePersistArgs, current
 // the meantime, probe_updated_at differs and the write still refuses. A row
 // that moved elsewhere keeps the caller's snapshot.
 func virtualPersistSnapshotMoved(original models.VirtualFilePersistArgs, current virtualRowCASState, refreshed models.VirtualFilePersistArgs) bool {
-	if original.RequireAdopt && original.AdoptPath != "" {
-		return original.ExpectedFilePath != refreshed.ExpectedFilePath
+	if original.RequireAdopt && original.AdoptPath != "" &&
+		original.ExpectedFilePath != refreshed.ExpectedFilePath {
+		return true
 	}
 	if original.ExpectedFilePath == "" || original.ExpectedFilePath != current.FilePath {
 		return false

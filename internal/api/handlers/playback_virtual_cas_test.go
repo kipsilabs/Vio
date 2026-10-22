@@ -62,4 +62,13 @@ func TestVirtualPersistSnapshotMovedRebasesOnlyCatalogRevisionChurn(t *testing.T
 	if !virtualPersistSnapshotMoved(adopt, movedAdopt, refreshVirtualPersistArgsForRow(adopt, movedAdopt)) {
 		t.Fatal("a required adoption did not follow the provider's churned candidate token")
 	}
+
+	// A provider re-list can advance the row revision while a required
+	// adoption is probing the same path. That is catalog churn, not a second
+	// probe, so the same-path required write must also be re-based.
+	samePathCurrent := current
+	samePathCurrent.UpdatedAt = base.UpdatedAt.Add(time.Minute)
+	if !virtualPersistSnapshotMoved(adopt, samePathCurrent, refreshVirtualPersistArgsForRow(adopt, samePathCurrent)) {
+		t.Fatal("a required adoption was not re-based after a same-path catalog revision advance")
+	}
 }

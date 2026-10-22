@@ -58,7 +58,15 @@ export function useSubtitleFontPrefetch(
       ) {
         continue;
       }
-      const cacheKey = fontBundleCacheKey(url);
+      // Attached fonts belong to the file, not to one embedded text stream.
+      // Every ASS track of a file advertises its own URL, but all of them
+      // resolve to the server's file-scoped font bundle. Fetching each track
+      // URL at plan adoption both wasted ffmpeg extractions and exhausted the
+      // route rate limit, leaving the active track without fonts.
+      const cacheKey =
+        track.media_file_id != null
+          ? `file:${track.media_file_id}`
+          : `url:${fontBundleCacheKey(url)}`;
       if (!byCacheKey.has(cacheKey)) byCacheKey.set(cacheKey, url);
     }
     return [...byCacheKey.values()];
