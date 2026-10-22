@@ -3053,6 +3053,9 @@ func newChiRouter(deps Dependencies) chi.Router {
 			&deps.Config.Download,
 		)
 		downloadSvc.SetGroupPolicyProvider(accessGroupStore)
+		if playbackHandler != nil {
+			downloadSvc.SetVirtualInputResolver(playbackHandler)
+		}
 		if deps.PolicySystem != nil {
 			downloadSvc.SetActionDecider(deps.PolicySystem.PDP())
 		}

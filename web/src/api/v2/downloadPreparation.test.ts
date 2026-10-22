@@ -6,6 +6,7 @@ import {
   createPreparedDownload,
   DownloadPreparationError,
   getPreparedDownload,
+  getPreparedDownloadFile,
   readBoundedSaveBlob,
   savePreparedDownload,
   SaveCancelledError,
@@ -351,5 +352,90 @@ describe("canSavePreparedDownload", () => {
 
     vi.stubGlobal("showSaveFilePicker", vi.fn());
     expect(canSavePreparedDownload(BUFFERED_SAVE_LIMIT_BYTES + 1)).toBe(true);
+  });
+});
+
+describe("getPreparedDownloadFile", () => {
+  const headResponse = (status: number, headers: Record<string, string> = {}) =>
+    new Response(null, { status, headers });
+
+  it("probes the file with the session's authority", async () => {
+    const fetch = vi.fn().mockResolvedValue(
+      headResponse(200, {
+        "Content-Length": "1024",
+        "Content-Disposition": 'attachment; filename="Server.mkv"',
+      }),
+    );
+    vi.stubGlobal("fetch", fetch);
+
+    const got = await getPreparedDownloadFile("dl-1", "Hint.mp4");
+
+    expect(got).toEqual({ id: "dl-1", filename: "Server.mkv", fileSize: 1024 });
+    const [url, init] = fetch.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/v2/downloads/dl-1/file");
+    expect(init.method).toBe("HEAD");
+    expect(init.cache).toBe("no-store");
+    const headers = new Headers(init.headers);
+    expect(headers.get("Authorization")).toBe("Bearer account-token");
+    expect(headers.get("X-Profile-Id")).toBe("profile-one");
+    expect(headers.get("X-Profile-Token")).toBe("pin-one");
+  });
+
+  it("parses an RFC 5987 disposition before falling back to the hint", async () => {
+    const encoded = vi.fn().mockResolvedValue(
+      headResponse(200, {
+        "Content-Disposition": "attachment; filename*=UTF-8''Na%C3%AFve%20Movie.mp4",
+      }),
+    );
+    vi.stubGlobal("fetch", encoded);
+    await expect(getPreparedDownloadFile("dl-1", "Hint.mp4")).resolves.toMatchObject({
+      filename: "Naïve Movie.mp4",
+      fileSize: undefined,
+    });
+
+    const bare = vi.fn().mockResolvedValue(headResponse(200, { "Content-Length": "0" }));
+    vi.stubGlobal("fetch", bare);
+    await expect(getPreparedDownloadFile("dl-1", "Hint.mp4")).resolves.toEqual({
+      id: "dl-1",
+      filename: "Hint.mp4",
+      fileSize: undefined,
+    });
+
+    await expect(getPreparedDownloadFile("dl-1", "")).resolves.toMatchObject({
+      filename: "download.bin",
+    });
+  });
+
+  it("classifies a permanent refusal as non-retryable", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(problemResponse(404)));
+
+    const attempt = getPreparedDownloadFile("dl-1", "Movie.mp4");
+    await expect(attempt).rejects.toBeInstanceOf(DownloadPreparationError);
+    await expect(attempt).rejects.toMatchObject({
+      status: 404,
+      retryable: false,
+      message: "This download is expired or no longer available. Prepare it again.",
+    });
+  });
+
+  it("classifies a server failure and a transport failure as retryable", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(problemResponse(503)));
+    await expect(getPreparedDownloadFile("dl-1", "Movie.mp4")).rejects.toMatchObject({
+      status: 503,
+      retryable: true,
+    });
+
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("fetch failed")));
+    await expect(getPreparedDownloadFile("dl-1", "Movie.mp4")).rejects.toMatchObject({
+      retryable: true,
+    });
+  });
+
+  it("propagates an abort instead of reporting a refusal", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new DOMException("aborted", "AbortError")));
+
+    await expect(getPreparedDownloadFile("dl-1", "Movie.mp4")).rejects.toMatchObject({
+      name: "AbortError",
+    });
   });
 });

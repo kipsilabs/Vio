@@ -96,6 +96,34 @@ it. The row keeps the requested `quality`; `effective_quality` is `original`.
 `quality_options` in the capability (§3) reports each preset's resolution for
 labels.
 
+For registered downloads, virtual sources follow the same compatibility decision
+as local files. A direct-compatible `original` streams the selected source bytes
+through the API's existing virtual relay without FFmpeg or a prepared artifact.
+The relay preserves Range, HEAD, and conditional requests; resume support still
+depends on the provider. Provider URLs and credentials are not returned to clients.
+When the source container is still unknown, the server probes through playback's
+protected transport and commits the measured metadata before deciding
+compatibility; device capabilities do not gate the probe. A failed probe or
+refused metadata write returns `quality_unavailable`; known incompatible sources
+retain the existing compatibility fallback. A file `HEAD` request also probes a
+row that is still unprobed, best effort: the download stays servable when
+metadata discovery fails, and only the filename falls back.
+For virtual originals, manifest `file_size` and `integrity.expected_bytes` come
+from a bounded HEAD request through the protected relay, not the catalog's
+potentially rounded size hint. A missing length or an unsupported HEAD
+(`405`/`501`) reports zero (unknown); clients must not treat zero as an exact
+expected length, and an unsupported HEAD does not prove that a later `GET` will
+succeed. A playlist MIME type (HLS/DASH) is refused rather than sized. Source
+lookup failures fail the manifest request rather than asserting an estimated byte
+count. Registry and create-row `file_size` values remain catalog estimates; only
+manifest and delivery HEAD metadata are authoritative.
+Download responses use a generated filename with the container persisted by the
+probe and the matching media content type, falling back to `download-<id>.bin`
+for unknown containers. Virtual-original playlists (HLS/DASH) are refused. The
+web save flow reads these headers before opening its file picker; HEAD does not
+mark an ephemeral download completed.
+The browser-only direct-file endpoint is unchanged and still rejects virtual files.
+
 `remux` is **not** a public quality preset. It is an internal delivery format used
 when `original` is requested but device caps show the source only needs container
 or audio compatibility work. Rows expose both:
@@ -562,7 +590,11 @@ HEAD /api/v2/downloads/{id}/file
 Streams either the source file or the prepared artifact. Range requests are
 supported for resumable/background downloads. `HEAD` is accepted like
 `/direct-download`: it returns the same headers with no body so clients can
-probe size and resumability before issuing ranged `GET`s.
+probe size and resumability before issuing ranged `GET`s. It shares the same
+authorization, policy and ownership checks as `GET`. For a virtual original,
+`HEAD` is a bounded relay probe used for filename and size, not a promise that a
+later `GET` will replay the same provider response. An unsupported relay `HEAD`
+answers `200` without a length, meaning unknown rather than empty.
 
 Common responses:
 

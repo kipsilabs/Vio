@@ -56,8 +56,6 @@ func TestDownloadQualityResolverResolve(t *testing.T) {
 			FrameRate: "60/1", Bitrate: 55_000, BitDepth: 10,
 		}},
 	}
-	// A provider-backed row has no local bytes; any download quality must
-	// prepare an artifact rather than offering the unservable original.
 	virtualFile := &models.MediaFile{
 		ID:         6,
 		CodecVideo: "h264",
@@ -66,6 +64,8 @@ func TestDownloadQualityResolverResolve(t *testing.T) {
 		Resolution: "1080p",
 		FilePath:   "virtual://movie/tt1?result=a",
 	}
+	probedVirtualFile := *virtualFile
+	probedVirtualFile.Container = "mp4"
 	caps := playback.ClientCapabilities{
 		CodecsVideo: []string{"h264"},
 		CodecsAudio: []string{"aac"},
@@ -220,19 +220,40 @@ func TestDownloadQualityResolverResolve(t *testing.T) {
 			wantErr:          ErrQualityUnavailable,
 		},
 		{
-			name:               "virtual original prepares a remux artifact even without caps",
+			name:               "virtual original stays direct without caps",
 			requested:          QualityOriginal,
 			file:               virtualFile,
 			artifactsAvailable: true,
-			wantFormat:         FormatRemux,
+			wantFormat:         FormatOriginal,
 			wantQuality:        QualityOriginal,
 			wantEffective:      QualityOriginal,
 		},
 		{
-			name:      "virtual download without an artifact pipeline is unavailable",
-			requested: QualityOriginal,
-			file:      virtualFile,
-			wantErr:   ErrQualityUnavailable,
+			name:          "virtual original does not require an artifact pipeline",
+			requested:     QualityOriginal,
+			file:          virtualFile,
+			wantFormat:    FormatOriginal,
+			wantQuality:   QualityOriginal,
+			wantEffective: QualityOriginal,
+		},
+		{
+			name:          "compatible probed virtual original stays direct",
+			requested:     QualityOriginal,
+			file:          &probedVirtualFile,
+			caps:          caps,
+			wantFormat:    FormatOriginal,
+			wantQuality:   QualityOriginal,
+			wantEffective: QualityOriginal,
+		},
+		{
+			name:               "unprobed virtual container retains compatibility remux",
+			requested:          QualityOriginal,
+			file:               virtualFile,
+			caps:               caps,
+			artifactsAvailable: true,
+			wantFormat:         FormatRemux,
+			wantQuality:        QualityOriginal,
+			wantEffective:      QualityOriginal,
 		},
 		{
 			name:               "virtual preset resolves to a transcode target",
@@ -268,6 +289,9 @@ func TestDownloadQualityResolverResolve(t *testing.T) {
 			if got.DeliveryFormat != tc.wantFormat || got.RequestedQuality != tc.wantQuality ||
 				got.EffectiveQuality != tc.wantEffective || got.TargetBitrateKbps != tc.wantBitrate {
 				t.Fatalf("Resolve(%q) = %+v", tc.requested, got)
+			}
+			if got.RequiresArtifact != (tc.wantFormat != FormatOriginal) {
+				t.Fatalf("Resolve(%q) RequiresArtifact = %v for %s", tc.requested, got.RequiresArtifact, tc.wantFormat)
 			}
 		})
 	}

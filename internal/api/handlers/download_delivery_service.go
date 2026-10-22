@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"errors"
+	"log/slog"
 	"net/http"
 
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
@@ -34,7 +35,18 @@ func (h *DownloadHandler) ServeDownloadFile(w http.ResponseWriter, r *http.Reque
 	}
 	err := h.svc.ServeFile(serveCtx, httpstream.NewRollingDeadlineWriter(w), r, userID, profileID, deviceID, id, filter)
 	if errors.Is(err, downloads.ErrResponseCommitted) {
-		return nil
+		// Headers and part of the file already went out, so an error body would
+		// corrupt the media response. Abort it instead: both transports (the v1
+		// handler and the v2 raw download routes) leave the sentinel to
+		// net/http, which closes the connection on http.ErrAbortHandler rather
+		// than ending a known-length or chunked body cleanly. A client that left
+		// has canceled the request; any other failure, such as a short read from
+		// storage, is the server's.
+		if r.Context().Err() == nil {
+			slog.WarnContext(r.Context(), "download failed after the response started",
+				"component", "downloads", "download_id", id, "error", err)
+		}
+		panic(http.ErrAbortHandler)
 	}
 	return err
 }

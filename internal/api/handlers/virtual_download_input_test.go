@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/remotestream"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary"
 )
@@ -79,6 +80,60 @@ func TestResolveVirtualDownloadInputRefusesUnresolvedSource(t *testing.T) {
 
 	if _, _, err := h.ResolveVirtualDownloadInput(context.Background(), file); err == nil {
 		t.Fatal("ResolveVirtualDownloadInput error = nil, want refusal")
+	}
+}
+
+func TestResolveVirtualDownloadMetadata(t *testing.T) {
+	for _, commit := range []bool{true, false} {
+		t.Run(map[bool]string{true: "committed", false: "stale metadata"}[commit], func(t *testing.T) {
+			relay := remotestream.NewRelay()
+			defer func() { _ = relay.Close(context.Background()) }()
+			file := &models.MediaFile{ID: 7, ContentID: "movie", Container: "virtual", FilePath: "virtual://movie/tt1?result=a"}
+			var saved models.VirtualFilePersistArgs
+			handler := &PlaybackHandler{
+				RemoteStreamRelay:   relay,
+				AllowPrivateStreams: func(int) bool { return true },
+				VirtualMediaResolver: VirtualMediaResolverFunc(func(context.Context, string, int, int, string) (string, error) {
+					return "http://provider.invalid/source.mp4", nil
+				}),
+				VirtualPlaybackSourceProber: func(ctx context.Context, source string, transient *models.MediaFile) (*models.MediaFile, error) {
+					if source != "http://provider.invalid/source.mp4" {
+						t.Fatalf("probe input = %q, want provider input rather than nested relay", source)
+					}
+					if _, ok := ctx.Deadline(); !ok {
+						t.Fatal("probe must have a deadline")
+					}
+					transient.Container = "mp4"
+					transient.CodecVideo = "hevc"
+					transient.CodecAudio = "eac3"
+					return transient, nil
+				},
+				VirtualFileMetadataSaver: func(_ context.Context, args models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error) {
+					saved = args
+					return VirtualFileMetadataUpdateResult{MetadataUpdated: commit}, nil
+				},
+			}
+			probed, err := handler.ResolveVirtualDownloadMetadata(context.Background(), file)
+			if !commit {
+				if err == nil || probed != nil {
+					t.Fatal("uncommitted metadata must not authorize a download")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if file.Container != "virtual" || probed.ID != file.ID || probed.FilePath != file.FilePath {
+				t.Fatal("probe changed the catalog snapshot or source identity")
+			}
+			if !saved.StampProbe || saved.Container != "mp4" || saved.ExpectedFilePath != file.FilePath || saved.RequireAdopt {
+				t.Fatalf("unexpected metadata write: %+v", saved)
+			}
+			decision := playback.Resolve(probed, playback.ClientCapabilities{CodecsVideo: []string{"hevc"}, CodecsAudio: []string{"eac3"}, Containers: []string{"mp4"}}, playback.AdminSettings{})
+			if decision.Method != playback.PlayDirect {
+				t.Fatalf("probed download decision = %s", decision.Method)
+			}
+		})
 	}
 }
 

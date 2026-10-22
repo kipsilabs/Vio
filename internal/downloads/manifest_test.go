@@ -160,6 +160,71 @@ func TestManifestBuilderAssembles(t *testing.T) {
 	}
 }
 
+// TestManifestVirtualOriginalSize pins the manifest's virtual-original size
+// rule: the relay length replaces the catalog hint, zero means unknown (no
+// probe configured), size errors propagate, and access is re-checked before the
+// row is described.
+func TestManifestVirtualOriginalSize(t *testing.T) {
+	ctx := context.Background()
+	detail := &catalog.ItemDetail{Type: "movie", Title: "Film"}
+	file := &models.MediaFile{ID: 99, Container: containerMP4, FilePath: "virtual://movie/tt1?result=a", MediaFolderID: 2}
+	newBuilder := func(originalSize func(context.Context, *models.MediaFile) (int64, error)) *ManifestBuilder {
+		b := NewManifestBuilder(fakeManifestSource{detail: detail}, nil, fakeFileResolver{file: file}, nil)
+		b.originalSize = originalSize
+		return b
+	}
+	dl := &Download{ID: "dl1", ContentID: "movie", MediaFileID: 99, FileSize: 536870000, Format: FormatOriginal}
+
+	t.Run("no probe reports unknown", func(t *testing.T) {
+		m, err := newBuilder(nil).Build(ctx, dl, catalog.AccessFilter{})
+		if err != nil || m.FileSize != 0 {
+			t.Fatalf("manifest size = %d, error = %v, want 0 (unknown)", m.FileSize, err)
+		}
+		if dl.FileSize != 536870000 {
+			t.Fatal("manifest build mutated the registry row's size")
+		}
+	})
+
+	t.Run("relay length replaces the catalog hint", func(t *testing.T) {
+		b := newBuilder(func(context.Context, *models.MediaFile) (int64, error) { return 422458714, nil })
+		m, err := b.Build(ctx, dl, catalog.AccessFilter{})
+		if err != nil || m.FileSize != 422458714 {
+			t.Fatalf("manifest size = %d, error = %v, want the relay length", m.FileSize, err)
+		}
+	})
+
+	t.Run("size error propagates", func(t *testing.T) {
+		boom := errors.New("relay unavailable")
+		b := newBuilder(func(context.Context, *models.MediaFile) (int64, error) { return 0, boom })
+		if _, err := b.Build(ctx, dl, catalog.AccessFilter{}); !errors.Is(err, boom) {
+			t.Fatalf("manifest error = %v, want the size failure", err)
+		}
+	})
+
+	t.Run("access denied", func(t *testing.T) {
+		called := false
+		b := newBuilder(func(context.Context, *models.MediaFile) (int64, error) {
+			called = true
+			return 1, nil
+		})
+		_, err := b.Build(ctx, dl, catalog.AccessFilter{AllowedLibraryIDs: []int{1}})
+		if !errors.Is(err, catalog.ErrItemNotFound) || called {
+			t.Fatalf("manifest error = %v, size probe called = %v, want an access refusal before probing", err, called)
+		}
+	})
+
+	t.Run("prepared rows keep the registry size", func(t *testing.T) {
+		b := newBuilder(func(context.Context, *models.MediaFile) (int64, error) {
+			t.Fatal("a prepared row must not consult the virtual size probe")
+			return 0, nil
+		})
+		m, err := b.Build(ctx, &Download{ID: "dl2", ContentID: "movie", MediaFileID: 99, FileSize: 1024, Format: FormatTranscode}, catalog.AccessFilter{})
+		if err != nil || m.FileSize != 1024 {
+			t.Fatalf("manifest size = %d, error = %v, want the registry size", m.FileSize, err)
+		}
+	})
+}
+
 func preparedManifestFixture(artifact *Artifact) (*ManifestBuilder, *Download) {
 	audio := []models.AudioTrack{
 		{Codec: "truehd", Channels: 8, Language: "en", Layout: "7.1", Title: "TrueHD 7.1", Default: true},

@@ -681,7 +681,10 @@ func TestManagedFileThreadsIdentity(t *testing.T) {
 	}
 }
 
-func TestManagedFileDoesNotAppendJSONAfterRelayResponseCommitted(t *testing.T) {
+// A committed transfer failure aborts the response instead of appending a JSON
+// error document; returning normally would let a chunked response end as a
+// complete, truncated file.
+func TestManagedFileAbortsAfterRelayResponseCommitted(t *testing.T) {
 	svc := &fakeDownloadService{
 		serveBody: "partial",
 		serveErr:  fmt.Errorf("remote relay failed: %w", downloads.ErrResponseCommitted),
@@ -689,10 +692,20 @@ func TestManagedFileDoesNotAppendJSONAfterRelayResponseCommitted(t *testing.T) {
 	h := NewDownloadHandler(svc)
 	req := withChiID(downloadTestRequest(http.MethodGet, "/downloads/dl1/file", nil, 7, "pA", "devA"), "dl1")
 	rec := httptest.NewRecorder()
-	h.HandleDownloadFile(rec, req)
+	func() {
+		defer func() {
+			if got := recover(); got != http.ErrAbortHandler { //nolint:errorlint // sentinel compared by identity, as net/http does
+				t.Fatalf("panic = %v, want http.ErrAbortHandler", got)
+			}
+		}()
+		h.HandleDownloadFile(rec, req)
+	}()
 
-	if rec.Code != http.StatusOK || rec.Body.String() != "partial" {
-		t.Fatalf("response status=%d body=%q", rec.Code, rec.Body.String())
+	if rec.Body.String() != "partial" {
+		t.Fatalf("body=%q, want the partial file only", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "internal_error") {
+		t.Fatal("a JSON error document was appended after the abort point")
 	}
 }
 

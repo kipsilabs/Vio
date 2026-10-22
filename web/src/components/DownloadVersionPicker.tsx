@@ -24,8 +24,10 @@ import {
   BUFFERED_SAVE_TOO_LARGE_MESSAGE,
   canSavePreparedDownload,
   createPreparedDownload,
+  DownloadPreparationError,
   downloadPreparationErrorMessage,
   getPreparedDownload,
+  getPreparedDownloadFile,
   isDownloadPreparing,
   isDownloadRefused,
   savePreparedDownload,
@@ -42,6 +44,12 @@ import {
   buildQualitySummary,
   sortByResolution,
 } from "@/pages/ItemDetail/components/VersionFlyout";
+
+// A ready row whose HEAD preflight keeps failing transiently is retried on the
+// poll cadence for about a minute before the picker reports that it could not
+// verify the file. Permanent refusals stop on the first response.
+const MAX_PREPARED_FILE_ATTEMPTS = 30;
+const PREPARED_FILE_RETRY_MS = 2000;
 
 interface DownloadVersionPickerProps {
   open: boolean;
@@ -218,12 +226,52 @@ export default function DownloadVersionPicker({
     const controller = new AbortController();
     const isCurrent = () => pollGeneration.current === generation && !controller.signal.aborted;
     let timer: number | undefined;
+    let fileAttempts = 0;
     async function poll(): Promise<void> {
       let entry: PreparedDownloadEntry | null = null;
       try {
         entry = await getPreparedDownload(downloadId, controller.signal);
       } catch {
-        if (isCurrent()) timer = window.setTimeout(() => void poll(), 2000);
+        if (isCurrent()) {
+          timer = window.setTimeout(() => void poll(), PREPARED_FILE_RETRY_MS);
+        }
+        return;
+      }
+      if (!isCurrent()) return;
+      if (entry?.status === "ready") {
+        // The row is ready; this HEAD only reads the server's authoritative
+        // filename and size. A refusal is classified so a permanently missing
+        // file cannot keep the picker "preparing" forever.
+        try {
+          const file = await getPreparedDownloadFile(
+            downloadId,
+            pendingFilenameRef.current,
+            controller.signal,
+          );
+          if (!isCurrent()) return;
+          setVirtualReady(file);
+          setPreparing(null);
+        } catch (error) {
+          if (!isCurrent() || error instanceof StaleApiRequestContextError) return;
+          if (error instanceof DOMException && error.name === "AbortError") return;
+          if (error instanceof DownloadPreparationError && error.retryable === true) {
+            fileAttempts += 1;
+            if (fileAttempts < MAX_PREPARED_FILE_ATTEMPTS) {
+              timer = window.setTimeout(() => void poll(), PREPARED_FILE_RETRY_MS);
+              return;
+            }
+            const message =
+              "The file is ready, but this browser could not verify it. Prepare it again.";
+            setRefusalMessage(message);
+            toast.error(message);
+            setPreparing(null);
+            return;
+          }
+          const message = downloadPreparationErrorMessage(error);
+          setRefusalMessage(message);
+          toast.error(message);
+          setPreparing(null);
+        }
         return;
       }
       if (!isCurrent()) return;
@@ -233,15 +281,6 @@ export default function DownloadVersionPicker({
         const message = "This download is no longer available. Prepare it again.";
         setRefusalMessage(message);
         toast.error(message);
-        setPreparing(null);
-        return;
-      }
-      if (entry.status === "ready") {
-        setVirtualReady({
-          id: downloadId,
-          filename: pendingFilenameRef.current,
-          fileSize: entry.file_size,
-        });
         setPreparing(null);
         return;
       }
@@ -327,11 +366,30 @@ export default function DownloadVersionPicker({
       if (!isCurrent()) return;
       setVirtualSelection(null);
       if (entry.status === "ready") {
-        setVirtualReady({
-          id: String(entry.id),
-          filename: version.file_name ?? "",
-          fileSize: entry.file_size,
-        });
+        try {
+          const file = await getPreparedDownloadFile(
+            String(entry.id),
+            version.file_name ?? "",
+            controller.signal,
+          );
+          if (!isCurrent()) return;
+          setVirtualReady(file);
+        } catch (error) {
+          if (error instanceof StaleApiRequestContextError) return;
+          if (error instanceof DOMException && error.name === "AbortError") return;
+          // The row exists and is ready: a transient probe failure must not
+          // discard it. Hand the id to the poll effect, which retries the HEAD
+          // with its bounded budget. A permanent refusal is reported below.
+          if (
+            error instanceof DownloadPreparationError &&
+            error.retryable === true &&
+            isCurrent()
+          ) {
+            setPreparing({ id: String(entry.id), status: "preparing" });
+            return;
+          }
+          throw error;
+        }
       } else if (isDownloadPreparing(entry.status)) {
         setPreparing({ id: String(entry.id), status: entry.status });
       } else {
