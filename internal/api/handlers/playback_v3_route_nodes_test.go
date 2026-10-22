@@ -193,13 +193,14 @@ func TestPrepareTransportV3RoutesAroundAnUnreachableProxy(t *testing.T) {
 // remoteReplanFixtureV3 starts a protocol-v3 transcode on one of two fake
 // transcode nodes and returns the handler, the start, and the node URLs.
 type remoteReplanFixtureV3 struct {
-	handler   *PlaybackHandler
-	probe     *probeRecorderV3
-	start     playback.StartRequestV3
-	started   playback.DecisionResponseV3
-	startedOn string
-	other     string
-	starts    func() int
+	handler    *PlaybackHandler
+	probe      *probeRecorderV3
+	start      playback.StartRequestV3
+	started    playback.DecisionResponseV3
+	startedOn  string
+	other      string
+	starts     func() int
+	transcodes *nodepool.TranscodePool
 }
 
 func newRemoteReplanFixtureV3(t *testing.T) remoteReplanFixtureV3 {
@@ -269,7 +270,8 @@ func newRemoteReplanFixtureV3(t *testing.T) remoteReplanFixtureV3 {
 	return remoteReplanFixtureV3{
 		handler: handler, probe: recorder, start: startRequest, started: started,
 		startedOn: session.TranscodeNodeURL, other: other,
-		starts: func() int { mu.Lock(); defer mu.Unlock(); return starts },
+		starts:     func() int { mu.Lock(); defer mu.Unlock(); return starts },
+		transcodes: transcodes,
 	}
 }
 
@@ -341,6 +343,28 @@ func TestHandleReplanPlaybackV3MovesTrackChangeOffAnUnreachableNode(t *testing.T
 			t.Fatalf("remote starts = %d, want the original start and one replacement", n)
 		}
 	})
+}
+
+// A byte-identical track change must reuse the active transport even when
+// every transcode node is at its one-job capacity. It must not ask the planner
+// for a second slot or start another remote job.
+func TestHandleReplanPlaybackV3TrackChangeReusesTransportAtOneJobCapacity(t *testing.T) {
+	f := newRemoteReplanFixtureV3(t)
+	for _, node := range f.transcodes.Nodes() {
+		node.MaxJobs = intPtr(1)
+		node.ActiveJobs = 1
+	}
+	before := f.starts()
+	replanned := f.replan(t, playback.ReplanOperationTrackChangeV3, playback.FailureV3{}, nil)
+	if replanned.PlaybackPlan == nil {
+		t.Fatalf("one-job replan returned no plan: %#v", replanned)
+	}
+	if got := f.starts(); got != before {
+		t.Fatalf("one-job track change started %d remote transports, want reuse of the active one", got-before)
+	}
+	if node := f.currentNode(t); node != f.startedOn {
+		t.Fatalf("one-job track change moved node %s -> %s", f.startedOn, node)
+	}
 }
 
 // A failure recovery from a node that stopped answering keeps the failed
