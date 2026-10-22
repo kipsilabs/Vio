@@ -3836,8 +3836,37 @@ var virtualSubtitleWarmResolveTimeout = 2 * time.Minute
 // remote work and a stuck resolver cannot pin either: concurrent window misses
 // on the same serve identity resolve once and demux once, and the registration
 // is released exactly once when the warm settles.
+
+// virtualSubtitleWarmAllowed reports whether a full-track virtual subtitle
+// warm may run now. The session copy on the serve request predates the latest
+// progress sample, so prefer the live session when the handler has a manager.
+// A nil manager keeps the copy's state for minimal handlers/tests.
+func (h *StreamHandler) virtualSubtitleWarmAllowed(session *playback.Session) bool {
+	if session == nil {
+		return false
+	}
+	live := session
+	if h.sessionMgr != nil {
+		if current, err := h.sessionMgr.GetSession(session.ID); err == nil && current != nil {
+			live = current
+		}
+	}
+	return live.IsPaused
+}
+
 func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(file *models.MediaFile, session *playback.Session, opts playback.StreamExtractOpts, virtualActive bool, requestID string) {
 	if h == nil || h.SubtitleCache == nil || file == nil || session == nil || !virtualActive {
+		return
+	}
+	// A full-track warm is a second read of the remote source. Running it while
+	// the viewer is playing competes with the transcode and with the next
+	// window/seek; the production trace showed a 53 s warm overlapping playback
+	// and ending just before the video source failed. Window slices already
+	// populate the small result cache, so only warm the full track while the
+	// session is paused. A resumed session keeps the window path.
+	if !h.virtualSubtitleWarmAllowed(session) {
+		slog.DebugContext(context.Background(), "virtual subtitle warm skipped: session is playing",
+			"component", "api", "session", session.ID, "file_id", file.ID)
 		return
 	}
 	if opts.CacheIdentity == "" {
