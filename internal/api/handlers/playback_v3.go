@@ -6890,6 +6890,13 @@ func bindPlannedVirtualFileV3(file *models.MediaFile, plan *playback.PlanV3, own
 	if uri == "" {
 		return file
 	}
+	// Never replace an already-concrete catalog candidate with a neutral plan
+	// hint. The plan normally carries the concrete candidate; this guard keeps a
+	// caller that built the plan from a neutral row from erasing a concrete
+	// binding that is already in hand.
+	if virtualResultCandidateID(uri) == "" && virtualResultCandidateID(file.FilePath) != "" {
+		return file
+	}
 	owner = effectiveVirtualOwner(owner, file.VirtualOwnerInstallationID)
 	if uri == file.FilePath && owner == file.VirtualOwnerInstallationID {
 		return file
@@ -6988,7 +6995,8 @@ func (h *PlaybackHandler) v3SessionStreamState(ctx context.Context, session *pla
 		// both name the bytes that are actually playing.
 		virtualURI := strings.TrimSpace(file.FilePath)
 		if result.Plan != nil {
-			if plannedURI := strings.TrimSpace(result.Plan.EffectiveVirtualURI); plannedURI != "" {
+			if plannedURI := strings.TrimSpace(result.Plan.EffectiveVirtualURI); plannedURI != "" &&
+				(virtualResultCandidateID(plannedURI) != "" || virtualResultCandidateID(file.FilePath) == "") {
 				virtualURI = plannedURI
 			}
 		}
