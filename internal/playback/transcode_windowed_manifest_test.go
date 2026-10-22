@@ -254,7 +254,7 @@ func TestSyntheticManifestWindowClampsToTheTitleAndStartSegment(t *testing.T) {
 			segCount: 1000,
 			progress: SegmentProgress{ProducedHead: -1, StartSegmentNumber: 0, LastRequestedSegment: 0},
 			wantFrom: 0,
-			wantTo:   syntheticManifestWindowAheadSegments,
+			wantTo:   syntheticWindowMarginSegments(syntheticManifestWindowAheadSeconds, defaultSegmentDuration),
 		},
 		{
 			name:     "window follows the client buffer",
@@ -295,5 +295,19 @@ func TestSyntheticManifestWindowClampsToTheTitleAndStartSegment(t *testing.T) {
 				t.Fatalf("syntheticManifestWindow() = (%d, %d), want (%d, %d)", from, to, tt.wantFrom, tt.wantTo)
 			}
 		})
+	}
+}
+
+func TestSyntheticManifestWindowSizesMarginsToTheSegmentCadence(t *testing.T) {
+	// The segment cadence is configurable, so the 180 s/120 s back/ahead margins
+	// must track it rather than a fixed segment count. At a 6 s cadence they are
+	// 30/20 segments, not the 2 s cadence's 90/60.
+	from, to := syntheticManifestWindow(1000, SegmentProgress{
+		StartSegmentNumber:   0,
+		LastRequestedSegment: 100,
+		SegmentDuration:      6,
+	})
+	if from != 70 || to != 120 {
+		t.Fatalf("syntheticManifestWindow() = (%d, %d), want (70, 120)", from, to)
 	}
 }

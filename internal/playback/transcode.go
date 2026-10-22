@@ -435,25 +435,26 @@ const maxSyntheticManifestSegments = 50_000
 // of #EXT-X-GAP entries carries the omitted prefix so the listed segments keep
 // their absolute media times (see GenerateWindowedManifest).
 const (
-	// syntheticManifestWindowBackSegments reaches behind the client's furthest
+	// syntheticManifestWindowBackSeconds reaches behind the client's furthest
 	// fetched segment. It must exceed the client's forward buffer (at most
 	// 120 s, see web/src/player/utils/bufferPolicy.ts) so a reload triggered at
 	// the window edge still contains the playhead.
-	syntheticManifestWindowBackSegments = 90
-	// syntheticManifestWindowAheadSegments reaches past the client's furthest
+	syntheticManifestWindowBackSeconds = 180
+	// syntheticManifestWindowAheadSeconds reaches past the client's furthest
 	// fetched segment so hls.js can refill a full forward buffer from the new
 	// window before it needs to reload again. Reloading a window is a full hls.js
 	// MediaSource reset that drops the buffer and re-downloads from the playhead
 	// (the client refetches a VOD playlist itself, see
-	// web/src/player/utils/hlsWindowedManifest.ts), so the ahead margin is sized
-	// to the client's forward-buffer ceiling: 60 two-second segments = 120 s.
-	// A shorter margin would make the client hit the next window edge with its
-	// buffer only partly refilled, resetting again sooner.
-	syntheticManifestWindowAheadSegments = 60
+	// web/src/player/utils/hlsWindowedManifest.ts), so the ahead margin matches
+	// the client's 120 s forward-buffer ceiling. The margin is expressed in
+	// seconds, not segments: the segment cadence is configurable (protocol v3
+	// pins it at 2 s, the Jellyfin compat surface does not), and a fixed segment
+	// count would shrink below the client's buffer at a shorter cadence.
+	syntheticManifestWindowAheadSeconds = 120
 	// syntheticManifestWindowCapacity is the largest whole-title playlist that
-	// is served unwindowed. Below it the legacy full VOD manifest is cheaper to
-	// reason about and is unchanged.
-	syntheticManifestWindowCapacity = syntheticManifestWindowBackSegments + syntheticManifestWindowAheadSegments
+	// is served unwindowed, in segments. Below it the legacy full VOD manifest
+	// is cheaper to reason about and is unchanged.
+	syntheticManifestWindowCapacity = 150
 	// syntheticManifestMaxGapEntries bounds the number of EXT-X-GAP entries
 	// that carry the omitted prefix. Each covers an equal slice of the prefix,
 	// so a longer title grows each gap's EXTINF (and the advertised target
@@ -462,6 +463,16 @@ const (
 	// playlist, so a coarse gap run is cheaper than a fine one.
 	syntheticManifestMaxGapEntries = 32
 )
+
+// syntheticWindowMarginSegments converts a margin expressed in seconds to the
+// number of segments that covers it at the session's cadence, rounding up so the
+// margin never falls short. A non-positive cadence falls back to the default.
+func syntheticWindowMarginSegments(seconds, segmentDuration int) int {
+	if segmentDuration <= 0 {
+		segmentDuration = defaultSegmentDuration
+	}
+	return (seconds + segmentDuration - 1) / segmentDuration
+}
 
 // Large synthetic playlists used to repeat the full access and reconstruction
 // query on every segment URI. For a feature-length title that turns a small
@@ -2829,11 +2840,13 @@ func syntheticManifestWindow(segCount int, progress SegmentProgress) (int, int) 
 		anchor = progress.StartSegmentNumber
 	}
 
-	start := anchor - syntheticManifestWindowBackSegments
+	back := syntheticWindowMarginSegments(syntheticManifestWindowBackSeconds, progress.SegmentDuration)
+	ahead := syntheticWindowMarginSegments(syntheticManifestWindowAheadSeconds, progress.SegmentDuration)
+	start := anchor - back
 	if start < 0 {
 		start = 0
 	}
-	end := anchor + syntheticManifestWindowAheadSegments
+	end := anchor + ahead
 	if end < start+1 {
 		end = start + 1
 	}
