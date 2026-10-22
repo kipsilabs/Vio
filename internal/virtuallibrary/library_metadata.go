@@ -111,9 +111,13 @@ func (s *Service) enrichFromLibraryMetadata(
 			return item, metadataCtx.Err()
 		}
 		// Provider failure is degraded, not fatal: known metadata and
-		// episodes remain usable, and the next pass retries the lookup.
-		logger.WarnContext(ctx, "virtual library metadata incomplete; keeping known metadata",
+		// episodes remain usable, and the caller falls back to public providers.
+		logger.WarnContext(ctx, "virtual library metadata incomplete; falling back to public providers",
 			"key", item.Key, "folder_id", folderID, "error", lookupErr)
+		return item, lookupErr
+	}
+	if result == nil || result.Metadata == nil {
+		return item, metadata.ErrMetadataNotFound
 	}
 	return item, nil
 }
@@ -130,12 +134,27 @@ func applyLibraryMetadataResult(item *monitor.MonitoredMedia, result *metadata.L
 	if poster != "" {
 		item.Poster = poster
 	}
+	posterSource := strings.TrimSpace(result.PosterSourcePath)
+	if posterSource == "" {
+		posterSource = poster
+	}
+	if posterSource != "" {
+		item.PosterSourcePath = posterSource
+	}
+
 	backdrop := strings.TrimSpace(result.BackdropPath)
 	if backdrop == "" && result.Metadata != nil {
 		backdrop = strings.TrimSpace(result.Metadata.BackdropPath)
 	}
 	if backdrop != "" {
 		item.Backdrop = backdrop
+	}
+	backdropSource := strings.TrimSpace(result.BackdropSourcePath)
+	if backdropSource == "" {
+		backdropSource = backdrop
+	}
+	if backdropSource != "" {
+		item.BackdropSourcePath = backdropSource
 	}
 	if item.MediaType == mediaTypeSeries {
 		// Episodes are merged by coordinate. A partial lookup must never

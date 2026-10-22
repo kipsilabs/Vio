@@ -1355,7 +1355,7 @@ func (m *mediaMonitor) evaluate(ctx context.Context, item monitoredMedia) (monit
 		item, metadataErr = m.fallbackPublicMetadata(ctx, item)
 	}
 	if item.MediaType == "movie" {
-		if resolveMetadata == nil {
+		if item.Runtime == 0 {
 			if runtime, err := m.fetchTMDBMovieRuntime(ctx, item); err == nil && runtime > 0 {
 				item.Runtime = runtime
 			}
@@ -1739,11 +1739,12 @@ func (s *Monitor) CheckStatus(ctx context.Context, req *CheckStatusRequest) (*Ch
 			evaluateCtx, cancel = context.WithTimeout(ctx, timeout)
 		}
 		item, message, evalErr := s.monitor.evaluate(evaluateCtx, item)
+		ctxErr := evaluateCtx.Err()
 		if cancel != nil {
 			cancel()
 		}
 		if evalErr != nil {
-			if evaluateCtx.Err() != nil {
+			if ctxErr != nil {
 				return nil, fmt.Errorf("evaluate virtual media: %w", evalErr)
 			}
 			// A transient metadata or provider failure keeps the target
@@ -2510,14 +2511,22 @@ func (m *mediaMonitor) resolveLibraryMetadata(
 			return item, "Library metadata lookup timed out; monitoring will retry", err
 		}
 		// Enrichment is optional. Keep whatever usable metadata the
-		// resolver already had and let release eligibility decide.
-		m.logger.WarnContext(ctx, "library metadata unavailable; keeping known metadata", "key", item.Key, "error", err)
+		// resolver already had and fall back to public providers.
+		m.logger.WarnContext(ctx, "library metadata unavailable; falling back to public providers", "key", item.Key, "error", err)
 	}
 	if enriched.Key != "" {
 		item = enriched
 	}
-	if err := m.resolveIdentity(ctx, &item); err != nil {
-		return item, "Catalog identity conflict; resolve duplicate catalog entries", err
+	if resolveErr := m.resolveIdentity(ctx, &item); resolveErr != nil {
+		return item, "Catalog identity conflict; resolve duplicate catalog entries", resolveErr
+	}
+	// Fall back to Cinemeta/TVMaze if library resolution failed or left an item
+	// without a title or a series without episodes.
+	if err != nil || (item.MediaType == "series" && len(item.Episodes) == 0) || item.Title == "" {
+		fallback, fallbackErr := m.fallbackPublicMetadata(ctx, item)
+		if fallbackErr == nil {
+			item = fallback
+		}
 	}
 	return item, "", nil
 }
@@ -2525,10 +2534,10 @@ func (m *mediaMonitor) resolveLibraryMetadata(
 func (m *mediaMonitor) fallbackPublicMetadata(ctx context.Context, item monitoredMedia) (monitoredMedia, error) {
 	enriched, err := m.fetchCinemeta(ctx, item)
 	if err == nil && (item.MediaType != "series" || episodeMetadataComplete(enriched.Episodes)) {
-		item = enriched
+		item = mergePublicMetadata(item, enriched)
 		if item.MediaType == "series" && episodeRuntimeMissing(item.Episodes) {
 			if supplemented, supplementErr := m.fetchTVMaze(ctx, item); supplementErr == nil {
-				item = supplemented
+				item = mergePublicMetadata(item, supplemented)
 			}
 		}
 		return item, nil
@@ -2536,13 +2545,47 @@ func (m *mediaMonitor) fallbackPublicMetadata(ctx context.Context, item monitore
 	if item.MediaType == "series" {
 		fallback, fallbackErr := m.fetchTVMaze(ctx, item)
 		if fallbackErr == nil {
-			return fallback, nil
+			return mergePublicMetadata(item, fallback), nil
 		}
 		m.logger.WarnContext(ctx, "fetch series metadata", "key", item.Key, "cinemeta_error", err, "tvmaze_error", fallbackErr)
 		return item, errors.Join(err, fallbackErr)
 	}
 	m.logger.WarnContext(ctx, "fetch Cinemeta metadata", "key", item.Key, "error", err)
 	return item, nil
+}
+
+func mergePublicMetadata(stored, incoming monitoredMedia) monitoredMedia {
+	if stored.Title == "" {
+		stored.Title = incoming.Title
+	}
+	if stored.Overview == "" {
+		stored.Overview = incoming.Overview
+	}
+	if stored.Poster == "" {
+		stored.Poster = incoming.Poster
+	}
+	if stored.Backdrop == "" {
+		stored.Backdrop = incoming.Backdrop
+	}
+	if stored.Runtime == 0 {
+		stored.Runtime = incoming.Runtime
+	}
+	if len(stored.Genres) == 0 {
+		stored.Genres = incoming.Genres
+	}
+	if stored.TMDBID == "" {
+		stored.TMDBID = incoming.TMDBID
+	}
+	if stored.TVDBID == "" {
+		stored.TVDBID = incoming.TVDBID
+	}
+	if stored.IMDbID == "" {
+		stored.IMDbID = incoming.IMDbID
+	}
+	if stored.MediaType == "series" {
+		stored.Episodes = mergeEpisodes(stored.Episodes, incoming.Episodes)
+	}
+	return stored
 }
 
 func (m *mediaMonitor) movieRelease(ctx context.Context, item monitoredMedia) (time.Time, error) {

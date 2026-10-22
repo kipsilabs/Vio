@@ -146,14 +146,25 @@ func (r *catalogMonitorRegistrar) EnqueueArtwork(ctx context.Context, contentID 
 	if r == nil || r.artwork == nil || contentID == "" {
 		return nil
 	}
-	stored := &models.MediaItem{
-		ContentID:    contentID,
-		Type:         item.MediaType,
-		PosterPath:   strings.TrimSpace(item.Poster),
-		BackdropPath: strings.TrimSpace(item.Backdrop),
+	posterSource := strings.TrimSpace(item.PosterSourcePath)
+	if posterSource == "" {
+		posterSource = catalogArtworkSourcePath(item.Poster)
 	}
-	stored.PosterSourcePath = catalogArtworkSourcePath(stored.PosterPath)
-	stored.BackdropSourcePath = catalogArtworkSourcePath(stored.BackdropPath)
+	backdropSource := strings.TrimSpace(item.BackdropSourcePath)
+	if backdropSource == "" {
+		backdropSource = catalogArtworkSourcePath(item.Backdrop)
+	}
+	stored := &models.MediaItem{
+		ContentID:          contentID,
+		Type:               item.MediaType,
+		PosterPath:         strings.TrimSpace(item.Poster),
+		BackdropPath:       strings.TrimSpace(item.Backdrop),
+		PosterSourcePath:   posterSource,
+		BackdropSourcePath: backdropSource,
+		TmdbID:             strings.TrimSpace(item.TMDBID),
+		TvdbID:             strings.TrimSpace(item.TVDBID),
+		ImdbID:             strings.TrimSpace(item.IMDbID),
+	}
 	return r.artwork.EnqueueLibraryItemImages(ctx, stored, catalogProviderIDs(item), nil)
 }
 
@@ -187,23 +198,33 @@ func catalogProviderIDs(item monitor.MonitoredMedia) map[string]string {
 // them here — the boundary between provider data and the strict validator —
 // instead of relaxing validation.
 func virtualMediaRegistration(item monitor.MonitoredMedia, libraryID string) catalog.VirtualMedia {
+	posterSource := strings.TrimSpace(item.PosterSourcePath)
+	if posterSource == "" {
+		posterSource = catalogArtworkSourcePath(item.Poster)
+	}
+	backdropSource := strings.TrimSpace(item.BackdropSourcePath)
+	if backdropSource == "" {
+		backdropSource = catalogArtworkSourcePath(item.Backdrop)
+	}
 	return catalog.VirtualMedia{
-		MediaType:      item.MediaType,
-		LibraryID:      libraryID,
-		IMDbID:         item.IMDbID,
-		TMDBID:         item.TMDBID,
-		TVDBID:         item.TVDBID,
-		Title:          strings.TrimSpace(item.Title),
-		Year:           int(item.Year),
-		Overview:       strings.TrimSpace(item.Overview),
-		PosterPath:     strings.TrimSpace(item.Poster),
-		BackdropPath:   strings.TrimSpace(item.Backdrop),
-		Genres:         trimVirtualStrings(item.Genres),
-		RuntimeMinutes: item.Runtime,
-		Source:         strings.TrimSpace(item.SourceKey),
-		VirtualURI:     virtualURIForMonitored(item),
-		Episodes:       monitoredEpisodePayload(item),
-		Variants:       make([]catalog.VirtualMediaVariant, 0),
+		MediaType:          item.MediaType,
+		LibraryID:          libraryID,
+		IMDbID:             item.IMDbID,
+		TMDBID:             item.TMDBID,
+		TVDBID:             item.TVDBID,
+		Title:              strings.TrimSpace(item.Title),
+		Year:               int(item.Year),
+		Overview:           strings.TrimSpace(item.Overview),
+		PosterPath:         strings.TrimSpace(item.Poster),
+		BackdropPath:       strings.TrimSpace(item.Backdrop),
+		PosterSourcePath:   posterSource,
+		BackdropSourcePath: backdropSource,
+		Genres:             trimVirtualStrings(item.Genres),
+		RuntimeMinutes:     item.Runtime,
+		Source:             strings.TrimSpace(item.SourceKey),
+		VirtualURI:         virtualURIForMonitored(item),
+		Episodes:           monitoredEpisodePayload(item),
+		Variants:           make([]catalog.VirtualMediaVariant, 0),
 	}
 }
 

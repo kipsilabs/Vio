@@ -168,6 +168,7 @@ type VirtualMedia struct {
 	IMDbID, TMDBID, TVDBID, Overview     string
 	Genres                               []string
 	PosterPath, BackdropPath, VirtualURI string
+	PosterSourcePath, BackdropSourcePath string
 	RuntimeMinutes                       int
 	Source                               string
 	Resolution                           string
@@ -559,15 +560,19 @@ func upsertVirtualMediaItem(ctx context.Context, tx pgx.Tx, installationID int, 
 	err := tx.QueryRow(ctx, `
 		INSERT INTO media_items(
 			content_id,type,title,year,imdb_id,tmdb_id,tvdb_id,overview,genres,poster_path,backdrop_path,
+			poster_source_path,backdrop_source_path,
 			runtime,matched_at,status,virtual_owner_installation_id,virtual_source,virtual_last_seen_at
 		) VALUES(
-			$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
-			CASE WHEN $13='matched' THEN NOW() END,$13,NULLIF($14,0),$15,NOW()
+			$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,
+			COALESCE(NULLIF($12,''),$10),COALESCE(NULLIF($13,''),$11),
+			$14,
+			CASE WHEN $15='matched' THEN NOW() END,$15,NULLIF($16,0),$17,NOW()
 		)
 		ON CONFLICT(content_id) DO NOTHING
 		RETURNING content_id`,
 		contentID, in.MediaType, in.Title, in.Year, in.IMDbID, in.TMDBID, in.TVDBID,
-		in.Overview, in.Genres, in.PosterPath, in.BackdropPath, in.RuntimeMinutes, status, installationID, source,
+		in.Overview, in.Genres, in.PosterPath, in.BackdropPath, in.PosterSourcePath, in.BackdropSourcePath,
+		in.RuntimeMinutes, status, installationID, source,
 	).Scan(&insertedID)
 	if err == nil {
 		return true, nil
@@ -653,16 +658,19 @@ func upsertVirtualMediaItem(ctx context.Context, tx pgx.Tx, installationID int, 
 			genres=CASE WHEN cardinality($8::text[])>0 THEN $8 ELSE genres END,
 			poster_path=CASE WHEN $9<>'' THEN $9 ELSE poster_path END,
 			backdrop_path=CASE WHEN $10<>'' THEN $10 ELSE backdrop_path END,
+			poster_source_path=CASE WHEN $14<>'' THEN $14 WHEN $9<>'' THEN $9 ELSE poster_source_path END,
+			backdrop_source_path=CASE WHEN $15<>'' THEN $15 WHEN $10<>'' THEN $10 ELSE backdrop_source_path END,
 			runtime=CASE WHEN $11>0 THEN $11 ELSE runtime END,
 			matched_at=CASE WHEN $12='matched' THEN COALESCE(matched_at,NOW()) ELSE matched_at END,
 			status=CASE WHEN $12='matched' THEN 'matched' ELSE status END,
 			virtual_owner_installation_id=NULLIF($13,0),
-			virtual_source=$14,
+			virtual_source=$16,
 			virtual_last_seen_at=NOW(),
 			updated_at=NOW()
 		WHERE content_id=$1`,
 		contentID, in.Title, in.Year, in.IMDbID, in.TMDBID, in.TVDBID, in.Overview,
-		in.Genres, in.PosterPath, in.BackdropPath, in.RuntimeMinutes, status, installationID, source,
+		in.Genres, in.PosterPath, in.BackdropPath, in.RuntimeMinutes, status,
+		installationID, in.PosterSourcePath, in.BackdropSourcePath, source,
 	); err != nil {
 		return false, fmt.Errorf("update owned virtual media: %w", err)
 	}

@@ -106,7 +106,9 @@ func (s *MetadataService) FetchLibraryMetadata(
 			"folder_id", folderID, "error", imageErr)
 	} else {
 		result.PosterPath = image.PosterPath
+		result.PosterSourcePath = image.PosterSourcePath
 		result.BackdropPath = image.BackdropPath
+		result.BackdropSourcePath = image.BackdropSourcePath
 		result.Images = image.Images
 	}
 	if item.Type != anchoredItemTypeSeries {
