@@ -13,6 +13,11 @@ import { toMediaTime } from "./mediaTimeline";
 // remote 600 s window costs ~18-24 s. Two minutes keeps the first paint short;
 // the prefetch lead below leaves time to fetch the next slice.
 export const SUBTITLE_WINDOW_SECONDS = 120;
+// Bitmap subtitles must be fully extracted before the first frame can paint.
+// A 30 s slice cuts the cold read roughly fourfold versus the old 120 s PGS
+// window; the prefetch lead still schedules the next slice before the current
+// one runs out.
+export const BITMAP_SUBTITLE_WINDOW_SECONDS = 30;
 // Start fetching the next window this many seconds before the current one's
 // requested end, so the new cues are already on hand when playback crosses in.
 export const SUBTITLE_PREFETCH_LEAD_SECONDS = 30;
@@ -67,6 +72,8 @@ export function planSubtitleWindow(
   time: number,
   now: number,
   seekBackoffSeconds: number,
+  windowSeconds = SUBTITLE_WINDOW_SECONDS,
+  prefetchLeadSeconds = SUBTITLE_PREFETCH_LEAD_SECONDS,
 ): SubtitleWindowAction {
   const fresh = (): SubtitleWindowAction => ({
     kind: "fresh",
@@ -75,7 +82,7 @@ export function planSubtitleWindow(
   if (state.inflightStart !== null) {
     const covered =
       time >= Math.min(state.coverageStart, state.inflightStart) - 1 &&
-      time <= state.inflightStart + SUBTITLE_WINDOW_SECONDS + 1;
+      time <= state.inflightStart + windowSeconds + 1;
     // A seek outside the requested range must not wait for extraction.
     return covered ? { kind: "none" } : fresh();
   }
@@ -83,7 +90,7 @@ export function planSubtitleWindow(
   if (!state.hasFetched || time < state.coverageStart - 1 || time > state.windowEnd + 1) {
     return fresh();
   }
-  if (!state.atEOF && time > state.windowEnd - SUBTITLE_PREFETCH_LEAD_SECONDS) {
+  if (!state.atEOF && time > state.windowEnd - prefetchLeadSeconds) {
     return { kind: "extend", start: state.windowEnd - SUBTITLE_WINDOW_OVERLAP_SECONDS };
   }
   return { kind: "none" };
@@ -98,10 +105,15 @@ export function nextSubtitleRetryDelay(previousMs: number): number {
 }
 
 /** The request for the window starting at `position`, in source seconds. */
-export function subtitleWindowUrl(url: string, position: number, extraQuery = ""): string {
+export function subtitleWindowUrl(
+  url: string,
+  position: number,
+  extraQuery = "",
+  windowSeconds = SUBTITLE_WINDOW_SECONDS,
+): string {
   const separator = url.includes("?") ? "&" : "?";
   const extra = extraQuery ? `${extraQuery}&` : "";
-  return `${url}${separator}${extra}position=${position}&duration=${SUBTITLE_WINDOW_SECONDS}`;
+  return `${url}${separator}${extra}position=${position}&duration=${windowSeconds}`;
 }
 
 /**
@@ -134,6 +146,10 @@ export interface SubtitleWindowFetcherOptions {
   /** Known media duration in source seconds (0 when unknown). */
   duration: () => number;
   seekBackoffSeconds: number;
+  /** Source-time seconds per window; defaults to SUBTITLE_WINDOW_SECONDS. */
+  windowSeconds?: number;
+  /** Seconds before the window end to schedule the next slice. */
+  prefetchLeadSeconds?: number;
   /** Coverage carried over from an earlier fetcher for the same track. */
   initial?: SubtitleWindowCoverage;
   /** A window is about to stream; `fresh` replaces everything loaded. */
@@ -177,6 +193,7 @@ export function createSubtitleWindowFetcher(
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
   let lastFetchFailureAt = 0;
   let retryDelay = 0;
+  const windowSeconds = options.windowSeconds ?? SUBTITLE_WINDOW_SECONDS;
 
   async function fetchWindow(seekStart: number, fresh: boolean) {
     // Only one window on the wire at a time: each fetch keeps an ffmpeg
@@ -192,7 +209,7 @@ export function createSubtitleWindowFetcher(
       atEOF = false;
     }
     options.onWindowStart(fresh);
-    const requestedEnd = seekStart + SUBTITLE_WINDOW_SECONDS;
+    const requestedEnd = seekStart + windowSeconds;
 
     // Abort the fetch if the response stops delivering chunks. Re-armed on
     // every read so a slow-but-progressing extraction is never cut off.
@@ -270,6 +287,8 @@ export function createSubtitleWindowFetcher(
       options.playhead(),
       Date.now(),
       options.seekBackoffSeconds,
+      windowSeconds,
+      options.prefetchLeadSeconds,
     );
     if (action.kind === "fresh") void fetchWindow(action.start, true);
     else if (action.kind === "extend") void fetchWindow(action.start, false);

@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  BITMAP_SUBTITLE_WINDOW_SECONDS,
   createSubtitleWindowFetcher,
   nextSubtitleRetryDelay,
   planSubtitleWindow,
   SUBTITLE_FETCH_RETRY_MAX_BACKOFF_MS,
+  subtitleWindowUrl,
   type SubtitleWindowState,
 } from "./subtitleWindows";
 
@@ -51,6 +53,14 @@ describe("planSubtitleWindow", () => {
     const failing = { ...covered, hasFetched: false, failedAt: 1_000, retryDelayMs: 5_000 };
     expect(planSubtitleWindow(failing, 10, 3_000, 2)).toEqual({ kind: "none" });
     expect(planSubtitleWindow(failing, 10, 7_000, 2).kind).toBe("fresh");
+  });
+});
+
+describe("subtitleWindowUrl", () => {
+  it("uses the requested bitmap window length", () => {
+    expect(
+      subtitleWindowUrl("https://example.test/sub", 10, "", BITMAP_SUBTITLE_WINDOW_SECONDS),
+    ).toBe("https://example.test/sub?position=10&duration=30");
   });
 });
 

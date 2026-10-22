@@ -12,8 +12,8 @@ import {
   type PGSPlacedObject,
 } from "../utils/pgs";
 import {
+  BITMAP_SUBTITLE_WINDOW_SECONDS,
   createSubtitleWindowFetcher,
-  SUBTITLE_WINDOW_SECONDS,
   subtitlePlayheadSeconds,
   subtitleWindowUrl,
 } from "../utils/subtitleWindows";
@@ -372,10 +372,13 @@ export function usePGSSubtitles({
     }
 
     const fetcher = createSubtitleWindowFetcher({
-      windowUrl: (start) => subtitleWindowUrl(url, start, "windowed=1"),
+      windowUrl: (start) =>
+        subtitleWindowUrl(url, start, "windowed=1", BITMAP_SUBTITLE_WINDOW_SECONDS),
       playhead: () => Math.max(0, sourceTime()),
       duration: () => durationRef.current ?? 0,
       seekBackoffSeconds: SEEK_BACKOFF,
+      windowSeconds: BITMAP_SUBTITLE_WINDOW_SECONDS,
+      prefetchLeadSeconds: 10,
       logTag: "usePGSSubtitles",
       onWindowStart: (fresh) => {
         if (fresh) {
@@ -399,7 +402,7 @@ export function usePGSSubtitles({
         onLoadStateRef.current?.("ready");
         // Keep about one window behind the playhead, so a straight run
         // through a long film holds a bounded number of screens.
-        const keepFrom = sourceTime() - SUBTITLE_WINDOW_SECONDS;
+        const keepFrom = sourceTime() - BITMAP_SUBTITLE_WINDOW_SECONDS;
         if (!fresh && keepFrom > fetcher.coverage().coverageStart) {
           timeline = prunePGSTimeline(timeline, keepFrom);
           fetcher.releaseBefore(keepFrom);
