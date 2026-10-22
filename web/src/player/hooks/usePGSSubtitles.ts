@@ -379,6 +379,7 @@ export function usePGSSubtitles({
       seekBackoffSeconds: SEEK_BACKOFF,
       windowSeconds: BITMAP_SUBTITLE_WINDOW_SECONDS,
       prefetchLeadSeconds: 10,
+      playbackRate: () => videoRef.current?.playbackRate ?? 1,
       logTag: "usePGSSubtitles",
       onWindowStart: (fresh) => {
         if (fresh) {

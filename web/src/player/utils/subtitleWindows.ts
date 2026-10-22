@@ -150,6 +150,8 @@ export interface SubtitleWindowFetcherOptions {
   windowSeconds?: number;
   /** Seconds before the window end to schedule the next slice. */
   prefetchLeadSeconds?: number;
+  /** Current playback rate; media-time leads scale with it. */
+  playbackRate?: () => number;
   /** Coverage carried over from an earlier fetcher for the same track. */
   initial?: SubtitleWindowCoverage;
   /** A window is about to stream; `fresh` replaces everything loaded. */
@@ -288,7 +290,9 @@ export function createSubtitleWindowFetcher(
       Date.now(),
       options.seekBackoffSeconds,
       windowSeconds,
-      options.prefetchLeadSeconds,
+      options.prefetchLeadSeconds == null
+        ? undefined
+        : options.prefetchLeadSeconds * Math.max(1, options.playbackRate?.() ?? 1),
     );
     if (action.kind === "fresh") void fetchWindow(action.start, true);
     else if (action.kind === "extend") void fetchWindow(action.start, false);
