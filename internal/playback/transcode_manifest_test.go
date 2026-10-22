@@ -1422,3 +1422,47 @@ func TestWaitForOpenSegmentWithStallReturnsWhenHeadStops(t *testing.T) {
 		t.Fatalf("stalled wait took %s, want the short stall verdict", elapsed)
 	}
 }
+
+func TestSegmentStallTimeoutForScalesWithSegmentDuration(t *testing.T) {
+	if got := SegmentStallTimeoutFor(TranscodeOpts{SegmentDuration: 2}); got != 6*time.Second {
+		t.Fatalf("2s segment stall timeout = %s, want 6s", got)
+	}
+	if got := SegmentStallTimeoutFor(TranscodeOpts{SegmentDuration: 4}); got != 12*time.Second {
+		t.Fatalf("4s segment stall timeout = %s, want 12s", got)
+	}
+}
+
+func TestWaitForOpenSegmentWithStallAllowsGrowingPartialSegment(t *testing.T) {
+	tempDir := t.TempDir()
+	now := time.Now()
+	writeManifestRange(t, tempDir, 0, 0, ".ts")
+	writeSegmentFile(t, tempDir, "seg_00000.ts", []byte("x"), now)
+	session := &TranscodeSession{
+		outputDir: tempDir,
+		running:   true,
+		opts: TranscodeOpts{
+			TargetCodecVideo:   "h264",
+			SegmentDuration:    2,
+			StartSegmentNumber: 0,
+		},
+	}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(20 * time.Millisecond):
+				_ = os.WriteFile(filepath.Join(tempDir, "seg_00001.ts.tmp"), []byte("partial"), 0o600)
+			}
+		}
+	}()
+	_, err := session.WaitForOpenSegmentWithStall("seg_00001.ts", 250*time.Millisecond, 50*time.Millisecond)
+	close(stop)
+	<-done
+	if !errors.Is(err, ErrSegmentNotFound) {
+		t.Fatalf("wait with a growing partial segment = %v, want timeout, not a stall verdict", err)
+	}
+}

@@ -417,6 +417,11 @@ type SegmentProgress struct {
 	ProducedCount   int
 	LastProducedAt  time.Time
 	ManifestModTime time.Time
+	// ActiveTempAt and ActiveTempSize describe the newest partial HLS segment
+	// (the temp_file write before ffmpeg renames it). A slow encode still
+	// advances this even while ProducedHead is unchanged.
+	ActiveTempAt   time.Time
+	ActiveTempSize int64
 	// GenerationStartedAt is when the ffmpeg process that currently owns the
 	// output directory was spawned. It is the zero time for sessions that never
 	// started a process. Output stamped before it belongs to an earlier
@@ -576,6 +581,18 @@ const (
 	minSegmentWait         = 3 * time.Second
 	minStaleProducedWindow = 5 * time.Second
 )
+
+// SegmentStallTimeoutFor scales the produced-head watchdog with the segment
+// duration. A four-second segment can legitimately take longer than the default
+// six seconds to encode; three segment durations is the minimum window that
+// lets a slow-but-progressing encoder finish without being mistaken for a hang.
+func SegmentStallTimeoutFor(opts TranscodeOpts) time.Duration {
+	duration := time.Duration(opts.SegmentDuration) * 3 * time.Second
+	if duration > SegmentStallTimeout {
+		return duration
+	}
+	return SegmentStallTimeout
+}
 
 // NewReadyTranscodeSessionForTesting creates a TranscodeSession with an outputDir
 // containing a valid stream.m3u8 and startup segments for unit testing.
@@ -3546,6 +3563,25 @@ func (s *TranscodeSession) SegmentProgress(time.Time) SegmentProgress {
 		}
 	}
 
+	if s.outputDir != "" {
+		if entries, err := os.ReadDir(s.outputDir); err == nil {
+			for _, entry := range entries {
+				if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".tmp") {
+					continue
+				}
+				info, infoErr := entry.Info()
+				if infoErr != nil || info.Size() <= 0 {
+					continue
+				}
+				if info.ModTime().After(progress.ActiveTempAt) {
+					progress.ActiveTempAt = info.ModTime()
+				}
+				if info.Size() > progress.ActiveTempSize {
+					progress.ActiveTempSize = info.Size()
+				}
+			}
+		}
+	}
 	return progress
 }
 
@@ -4541,7 +4577,7 @@ func (s *TranscodeSession) WaitForOpenSegmentWithStall(name string, timeout, sta
 // checkSegmentStall samples produced-head progress at most twice a second and
 // reports ErrSegmentStalled when the head has not moved for stall. It is split
 // from the wait loop so the recovery condition stays readable.
-func (s *TranscodeSession) checkSegmentStall(now time.Time, stall time.Duration, lastCheck *time.Time, lastHead *int, lastHeadAt *time.Time) error {
+func (s *TranscodeSession) checkSegmentStall(now time.Time, stall time.Duration, lastCheck *time.Time, lastHead *int, lastHeadAt, lastTempAt *time.Time, lastTempSize *int64) error {
 	if !lastCheck.IsZero() && now.Sub(*lastCheck) < 500*time.Millisecond {
 		return nil
 	}
@@ -4553,7 +4589,13 @@ func (s *TranscodeSession) checkSegmentStall(now time.Time, stall time.Duration,
 	if progress.ProducedHead != *lastHead {
 		*lastHead = progress.ProducedHead
 		*lastHeadAt = now
-		return nil
+	}
+	// A growing partial segment is encoder progress even though the published
+	// head cannot move until that segment is complete.
+	if progress.ActiveTempAt.After(*lastTempAt) || progress.ActiveTempSize != *lastTempSize {
+		*lastTempAt = progress.ActiveTempAt
+		*lastTempSize = progress.ActiveTempSize
+		*lastHeadAt = now
 	}
 	if !lastHeadAt.IsZero() && now.Sub(*lastHeadAt) >= stall {
 		return ErrSegmentStalled
@@ -4571,6 +4613,8 @@ func (s *TranscodeSession) waitForOpenSegment(name string, timeout, stall time.D
 	lastHead := -1
 	lastHeadAt := time.Time{}
 	lastStallCheck := time.Time{}
+	lastTempAt := time.Time{}
+	var lastTempSize int64
 	for {
 		segment, err := s.OpenSegment(name)
 		if err == nil {
@@ -4598,6 +4642,8 @@ func (s *TranscodeSession) waitForOpenSegment(name string, timeout, stall time.D
 			lastHead = -1
 			lastHeadAt = time.Time{}
 			lastStallCheck = time.Time{}
+			lastTempAt = time.Time{}
+			lastTempSize = 0
 			select {
 			case <-deadline:
 				return nil, ErrSegmentNotFound
@@ -4613,7 +4659,7 @@ func (s *TranscodeSession) waitForOpenSegment(name string, timeout, stall time.D
 		}
 
 		if numbered && stall > 0 {
-			if err := s.checkSegmentStall(time.Now(), stall, &lastStallCheck, &lastHead, &lastHeadAt); err != nil {
+			if err := s.checkSegmentStall(time.Now(), stall, &lastStallCheck, &lastHead, &lastHeadAt, &lastTempAt, &lastTempSize); err != nil {
 				return nil, err
 			}
 		}

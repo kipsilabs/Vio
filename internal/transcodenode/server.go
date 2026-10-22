@@ -2991,6 +2991,7 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 		if parseErr == nil {
 			now := time.Now()
 			decision := session.SegmentRecoveryDecision(segNum, now)
+			segmentStalled := false
 			lastProducedAgeMS := int64(-1)
 			if !decision.Progress.LastProducedAt.IsZero() {
 				lastProducedAgeMS = now.Sub(decision.Progress.LastProducedAt).Milliseconds()
@@ -3021,16 +3022,18 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 					"playback_session_id", sessionID,
 				)
 				if decision.Reason == "near_produced_head" {
-					segmentLease, err = session.WaitForOpenSegmentWithStall(name, decision.WaitTimeout, playback.SegmentStallTimeout)
+					segmentLease, err = session.WaitForOpenSegmentWithStall(name, decision.WaitTimeout, playback.SegmentStallTimeoutFor(session.Opts()))
 				} else {
 					segmentLease, err = session.WaitForOpenSegment(name, decision.WaitTimeout)
 				}
 				if errors.Is(err, playback.ErrSegmentStalled) {
+					stalledHead := session.SegmentProgress(time.Now()).ProducedHead
 					slog.WarnContext(r.Context(), "transcode segment production stalled", "component", "transcodenode",
 						"segment", name, "requested_segment", segNum,
-						"produced_head", decision.Progress.ProducedHead,
+						"produced_head", stalledHead,
 						"session", sessionID, "playback_session_id", sessionID)
 					decision.RestartOnTimeout = true
+					segmentStalled = true
 					err = playback.ErrSegmentNotFound
 				}
 				if errors.Is(err, playback.ErrSegmentNotFound) {
@@ -3043,6 +3046,7 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 						"last_produced_age_ms", lastProducedAgeMS,
 						"wait_timeout_ms", decision.WaitTimeout.Milliseconds(),
 						"reason", decision.Reason,
+						"stalled", segmentStalled,
 						"session", sessionID,
 						"playback_session_id", sessionID,
 					)
@@ -3058,13 +3062,14 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 				// request, would serve from a restart it never addressed).
 				// Copy-mode stays synchronous: its target resolution reads the
 				// live manifest.
-				if decision.Reason == playback.SegmentRecoveryFarSeekReason && !session.IsCopyVideo() {
+				if (decision.Reason == playback.SegmentRecoveryFarSeekReason || segmentStalled) && !session.IsCopyVideo() {
 					slog.InfoContext(r.Context(), "transcode node seek restart scheduled", "component", "transcodenode",
 						"segment", name,
 						"requested_segment", segNum,
 						"produced_head", decision.Progress.ProducedHead,
 						"start_segment_number", decision.Progress.StartSegmentNumber,
 						"reason", decision.Reason,
+						"stalled", segmentStalled,
 						"session", sessionID,
 						"playback_session_id", sessionID,
 					)
