@@ -293,6 +293,34 @@ func TestReconcileRegionalVariantFidelity(t *testing.T) {
 	}
 }
 
+// A preferred language that the release does not carry is not a correction.
+// The selector already fell back to the only available stream; withdrawing the
+// plan for it would reload the transport without changing the audio.
+func TestReconcileUnavailablePreferredLanguageIsNoop(t *testing.T) {
+	verified := []models.AudioTrack{
+		{Index: 1, Language: "ja", Codec: "eac3", Channels: 6, Layout: "5.1"},
+	}
+	selected := verified[0]
+	intent := audioSelectionIntent{origin: SelectionOriginAuto, preferredLang: "fr"}
+	if !defaultAudioLanguageStillSatisfied(selected, verified, 0, intent) {
+		t.Fatal("a preference absent from the verified inventory must leave the selector's fallback a no-op")
+	}
+	if !audioSignatureMatchesCommittedTrack(selected, selected, intent, 0, 0, verified, verified) {
+		t.Fatal("the only available track must compare as the committed executable selection")
+	}
+
+	// Once a matching verified track exists, the old fallback is stale again.
+	withFrench := append([]models.AudioTrack{}, verified...)
+	withFrench = append(withFrench, models.AudioTrack{Index: 2, Language: "fr", Codec: "eac3", Channels: 6, Layout: "5.1"})
+	recomputed := playback.SelectAudioTrack(withFrench, intent.preferredLang, intent.seriesPref)
+	if recomputed != 1 {
+		t.Fatalf("fr preference selected %d, want the newly available fr track", recomputed)
+	}
+	if defaultAudioLanguageStillSatisfied(selected, withFrench, 0, intent) {
+		t.Fatal("the fallback must not remain a no-op once a preferred-language track is available")
+	}
+}
+
 // Omitted vs explicit: an explicit selection verified present is never
 // moved; a legacy record with no intent fields never reconciles.
 func TestReconcileExplicitSelectionSurvivesProbe(t *testing.T) {
