@@ -36,11 +36,12 @@ import liberationSansUrl from "../assets/liberation-sans.woff2?url";
 // fonts. The subtitle TEXT is never gated by this budget.
 const FONT_BUNDLE_BUDGET_MS = 3000;
 
-// Explicitly bound each ASS fetch to this many source-time seconds, matching
-// the VTT window (`useSubtitleTracks`). The server extracts the whole track
-// otherwise — ~100s for an embedded ASS track over a relay — long enough to
-// trip the stall watchdog and loop. Windowed extraction is seconds.
-const ASS_WINDOW_DURATION_SECONDS = 600;
+// Explicitly bound each ASS fetch to this many source-time seconds. JASSUB
+// cannot render anything until the whole script response arrives, so a cold
+// remote 600 s slice keeps the viewer waiting ~18-24 s before the first line
+// appears. A two-minute slice reads proportionally less of the container and
+// starts in a few seconds; the prefetch below keeps the next slice ready.
+const ASS_WINDOW_DURATION_SECONDS = 120;
 // Start a window this many seconds before the playhead so the cue currently
 // on screen is inside the requested interval rather than cut off at its start.
 const ASS_WINDOW_LEAD_SECONDS = 20;

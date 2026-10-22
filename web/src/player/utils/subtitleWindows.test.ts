@@ -117,7 +117,7 @@ describe("createSubtitleWindowFetcher", () => {
     expect(fetcher.coverage()).toMatchObject({
       hasFetched: true,
       coverageStart: 90,
-      windowEnd: 690,
+      windowEnd: 210,
     });
     fetcher.dispose();
   });

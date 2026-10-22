@@ -8,8 +8,11 @@
 
 import { toMediaTime } from "./mediaTimeline";
 
-// Explicitly bound each subtitle fetch to this many source-time seconds.
-export const SUBTITLE_WINDOW_SECONDS = 600;
+// Explicitly bound each subtitle fetch to this many source-time seconds. A
+// bitmap slice has to be fully extracted before it can be painted, so a cold
+// remote 600 s window costs ~18-24 s. Two minutes keeps the first paint short;
+// the prefetch lead below leaves time to fetch the next slice.
+export const SUBTITLE_WINDOW_SECONDS = 120;
 // Start fetching the next window this many seconds before the current one's
 // requested end, so the new cues are already on hand when playback crosses in.
 export const SUBTITLE_PREFETCH_LEAD_SECONDS = 30;

@@ -19,6 +19,8 @@ import (
 	"github.com/Silo-Server/silo-server/internal/remotestream"
 )
 
+const warmSubtitleVTT = "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhello\n"
+
 // newVirtualSubtitleWindowFixture builds a StreamHandler rooted at dir that
 // resolves a virtual source through a live relay and extracts text subtitles
 // through a fake ffmpeg at dir/ffmpeg. The caller writes the ffmpeg script and
