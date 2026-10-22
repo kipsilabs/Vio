@@ -4246,6 +4246,241 @@ describe("usePlaybackSession dead-session recovery", () => {
   });
 });
 
+describe("usePlaybackSession seek reanchor evidence recovery", () => {
+  const SEEK_EVIDENCE_MESSAGE =
+    "The frozen playback source could not be reopened; start a new playback attempt.";
+
+  // A plan the viewer has selections on, so the rebuild can be checked to carry
+  // them rather than falling back to server defaults.
+  const selectedPlan = (sessionId: string) =>
+    fixturePlanV3({
+      session_id: sessionId,
+      stream: {
+        url: `/stream/${sessionId}/master.m3u8`,
+        protocol: "hls",
+        mime_type: "application/vnd.apple.mpegurl",
+        headers: {},
+        header_refresh: "none",
+      },
+      requested_media_file_id: 7,
+      effective_media_file_id: 7,
+      effective_virtual_uri: "virtual://movie/x?result=8376",
+      selected_tracks: {
+        audio: { id: "file:7:audio:1", index: 1 },
+        subtitle: { id: "file:7:subtitle:2", index: 2 },
+      },
+    });
+
+  const seekEvidenceTerminal = (sessionId: string) => ({
+    protocol_version: 3,
+    server_features: ["playback_plan_v3"],
+    outcome: "adaptation_unavailable",
+    session_id: sessionId,
+    terminal: {
+      reason: "seek_reanchor_evidence_unavailable",
+      message: SEEK_EVIDENCE_MESSAGE,
+      retryable: true,
+    },
+  });
+
+  // Records the start bodies and answers every start with the next session in
+  // the chain, so a rebuild is visible as a second start.
+  function startChainMock(
+    startBodies: Array<Record<string, unknown>>,
+    replan: (sessionId: string, body: Record<string, unknown>) => unknown,
+  ) {
+    return vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        startBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        const sessionId = `session-${startBodies.length}`;
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: sessionId,
+            playback_plan: selectedPlan(sessionId),
+          },
+          { status: 201 },
+        );
+      }
+      const replanMatch = /\/playback\/([^/]+)\/replan$/.exec(url);
+      if (replanMatch) {
+        const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        return jsonResponse(replan(replanMatch[1]!, body));
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return jsonResponse({ outcome: "stopped" });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+  }
+
+  it("restarts once at the seek position with the plan's tracks and offered release", async () => {
+    const startBodies: Array<Record<string, unknown>> = [];
+    const replanBodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal(
+      "fetch",
+      startChainMock(startBodies, (sessionId, body) => {
+        replanBodies.push(body);
+        return seekEvidenceTerminal(sessionId);
+      }),
+    );
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+    expect(result.current.plan?.session_id).toBe("session-1");
+
+    // The row's pinned candidate vanished and the server offers its current
+    // listing as display data; a rebuild must keep naming that candidate.
+    act(() =>
+      result.current.applyInventoryUpdate({
+        session_id: "session-1",
+        inventory_revision: "inv:offered-7398",
+        inventory_status: "verified",
+        effective_media_file_id: 7,
+        offered_virtual_uri: "virtual://movie/x?result=7398",
+        audio_tracks: [
+          {
+            codec: "eac3",
+            channels: 6,
+            layout: "5.1",
+            language: "eng",
+            default: true,
+            track_id: "file:7:audio:1",
+          },
+        ],
+        subtitle_inventory: [],
+      }),
+    );
+
+    let accepted = false;
+    await act(async () => {
+      accepted = await result.current.reanchorSeek(1234);
+    });
+
+    // The recovery start is the answer to the seek, not a dead end.
+    expect(accepted).toBe(true);
+    await waitFor(() => expect(result.current.plan?.session_id).toBe("session-2"));
+
+    expect(replanBodies).toHaveLength(1);
+    expect(replanBodies[0]).toMatchObject({ operation: "seek_reanchor" });
+
+    expect(startBodies).toHaveLength(2);
+    expect(startBodies[1]).toMatchObject({
+      file_id: 7,
+      file_selection: "auto",
+      start_position: 1234,
+      carried_audio_track_id: "file:7:audio:1",
+      subtitle_track_index: 2,
+      offered_virtual_uri: "virtual://movie/x?result=7398",
+    });
+    // A fresh start re-resolves the source; it is not a relink retry.
+    expect(startBodies[1]?.force_relink).toBeUndefined();
+    expect(result.current.error).toBeNull();
+
+    unmount();
+  });
+
+  it("does not restart for another seek terminal reason", async () => {
+    const startBodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal(
+      "fetch",
+      startChainMock(startBodies, (sessionId) => ({
+        protocol_version: 3,
+        server_features: ["playback_plan_v3"],
+        outcome: "terminal",
+        session_id: sessionId,
+        terminal: {
+          reason: "session_expired",
+          message: "This playback session is no longer active.",
+          retryable: false,
+        },
+      })),
+    );
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    await act(async () => {
+      expect(await result.current.reanchorSeek(1234)).toBe(false);
+    });
+
+    await waitFor(() => expect(result.current.error).toBeTruthy());
+    expect(result.current.errorReason).toBe("session_expired");
+    expect(startBodies).toHaveLength(1);
+
+    unmount();
+  });
+
+  it("does not restart for the seek terminal on another operation", async () => {
+    const startBodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal(
+      "fetch",
+      startChainMock(startBodies, (sessionId) => seekEvidenceTerminal(sessionId)),
+    );
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    await act(async () => {
+      expect(await result.current.refreshSubtitles(100)).toBe(false);
+    });
+
+    await waitFor(() =>
+      expect(result.current.errorReason).toBe("seek_reanchor_evidence_unavailable"),
+    );
+    expect(result.current.errorRetryable).toBe(true);
+    // Only a failed `seek_reanchor` authorizes the rebuild.
+    expect(startBodies).toHaveLength(1);
+
+    unmount();
+  });
+
+  it("does not restart a second time when the replacement sees the same terminal", async () => {
+    const startBodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal(
+      "fetch",
+      startChainMock(startBodies, (sessionId) => seekEvidenceTerminal(sessionId)),
+    );
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    await act(async () => {
+      expect(await result.current.reanchorSeek(300)).toBe(true);
+    });
+    await waitFor(() => expect(result.current.plan?.session_id).toBe("session-2"));
+    expect(startBodies).toHaveLength(2);
+
+    // The replacement session's own frozen evidence fails the same way. One
+    // original attempt gets exactly one rebuild; this surfaces the retryable
+    // terminal instead of starting a third session.
+    await act(async () => {
+      expect(await result.current.reanchorSeek(600)).toBe(false);
+    });
+
+    await waitFor(() => expect(result.current.error).toBe(SEEK_EVIDENCE_MESSAGE));
+    expect(result.current.errorReason).toBe("seek_reanchor_evidence_unavailable");
+    expect(result.current.errorRetryable).toBe(true);
+    expect(startBodies).toHaveLength(2);
+
+    unmount();
+  });
+});
+
 describe("usePlaybackSession server-invalidated plans", () => {
   function invalidationFetchMock(replanBodies: Array<Record<string, unknown>>, replan: unknown) {
     return vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
