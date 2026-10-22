@@ -2237,6 +2237,22 @@ func (h *ItemsHandler) parentRollupUserData(ctx context.Context, v ItemViewer, i
 	return catalog.SeasonUserDataFromCounts(parent), true
 }
 
+// metadataSeasonCounts returns each season number's metadata episode count,
+// including seasons with no library-materialized episodes. The seasons list
+// uses it only where the availability rollup has no entry, so a metadata-only
+// season still shows the episode total the provider knows.
+func (h *ItemsHandler) metadataSeasonCounts(ctx context.Context, seriesID string) (map[int]int, error) {
+	summaries, err := h.episodeRepo.ListMetadataSeasons(ctx, seriesID)
+	if err != nil {
+		return nil, err
+	}
+	counts := make(map[int]int, len(summaries))
+	for _, summary := range summaries {
+		counts[summary.SeasonNumber] = summary.EpisodeCount
+	}
+	return counts, nil
+}
+
 // seriesSeasonRollups returns each season number's available episode count
 // and, when the viewer's store is reachable, its aggregate user data. A store
 // with the SQL rollup answers both in one query; otherwise the series'
@@ -2649,13 +2665,41 @@ type watchedLeafTarget struct {
 	DurationSeconds float64
 }
 
+// dedupeWatchedLeafTargets removes duplicate episode targets while retaining
+// the first duration-bearing copy. A partly linked season resolves available
+// episodes explicitly and then expands the parent by season number, so the
+// same episode can appear twice; the mutation is idempotent but the response's
+// AffectedCount is not.
+func dedupeWatchedLeafTargets(targets []watchedLeafTarget) []watchedLeafTarget {
+	if len(targets) < 2 {
+		return targets
+	}
+	indexByID := make(map[string]int, len(targets))
+	deduped := make([]watchedLeafTarget, 0, len(targets))
+	for _, target := range targets {
+		if target.ContentID == "" {
+			continue
+		}
+		if index, ok := indexByID[target.ContentID]; ok {
+			if deduped[index].DurationSeconds == 0 && target.DurationSeconds > 0 {
+				deduped[index].DurationSeconds = target.DurationSeconds
+			}
+			continue
+		}
+		indexByID[target.ContentID] = len(deduped)
+		deduped = append(deduped, target)
+	}
+	return deduped
+}
+
 // watchedTarget is a watched-state target that exists and that the viewer
 // may see, before a season or series is expanded into its episodes.
 type watchedTarget struct {
-	Type    string
-	Item    *models.MediaItem
-	Season  *models.Season
-	Episode *models.Episode
+	Type      string
+	Item      *models.MediaItem
+	Season    *models.Season
+	Episode   *models.Episode
+	Synthetic bool
 }
 
 // lookupWatchedTarget finds a movie, ebook, series, season or episode and
@@ -2689,6 +2733,20 @@ func (h *ItemsHandler) lookupWatchedTarget(ctx context.Context, contentID string
 		case !errors.Is(err, catalog.ErrSeasonNotFound):
 			return watchedTarget{}, err
 		}
+	}
+
+	if seriesID, seasonNumber, ok := parseSyntheticSeasonID(contentID); ok {
+		if h.episodeRepo == nil {
+			return watchedTarget{}, catalog.ErrItemNotFound
+		}
+		if err := h.itemRepo.EnsureAccessible(ctx, seriesID, filter); err != nil {
+			return watchedTarget{}, err
+		}
+		return watchedTarget{
+			Type:      "season",
+			Season:    &models.Season{ContentID: contentID, SeriesID: seriesID, SeasonNumber: seasonNumber},
+			Synthetic: true,
+		}, nil
 	}
 
 	if h.episodeRepo == nil {
@@ -2740,12 +2798,20 @@ func (h *ItemsHandler) resolveWatchedTargets(ctx context.Context, contentID stri
 		if h.episodeRepo == nil {
 			return "", nil, catalog.ErrItemNotFound
 		}
-		if !played {
-			return "season", nil, nil
-		}
-		episodes, err := h.episodeRepo.ListBySeasonID(ctx, target.Season.ContentID)
+		episodes, err := h.seasonEpisodesForRead(ctx, target.Season.SeriesID, target.Season.SeasonNumber)
 		if err != nil {
 			return "", nil, err
+		}
+		if len(episodes) == 0 {
+			return "", nil, catalog.ErrItemNotFound
+		}
+		if !played {
+			// ParentUnwatchTargetsForSeason now partitions by
+			// (series_id, season_number) and applies the watched-fileless
+			// filter. Returning the displayed episodes here would append those
+			// unfiltered metadata rows to that set and hide never-watched
+			// episodes from future history.
+			return "season", nil, nil
 		}
 		return "season", h.episodeTargets(ctx, episodes), nil
 	default:

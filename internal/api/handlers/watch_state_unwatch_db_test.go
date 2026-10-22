@@ -133,3 +133,230 @@ func TestParentUnwatchClearsEpisodesWithoutLibraryFilePostgres(t *testing.T) { /
 		})
 	}
 }
+
+// A metadata-only season has no available episodes, so seasonEpisodesForRead
+// falls back to every metadata episode. Season unwatch must still apply the
+// watched-fileless filter: returning the displayed metadata rows as explicit
+// targets would hide never-watched episodes from future history imports.
+func TestSeasonUnwatchMetadataOnlyFiltersFilelessHistoryPostgres(t *testing.T) { //nolint:funlen // one DB fixture covers synthetic and partly linked metadata seasons
+	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("SILO_TEST_DATABASE_URL is not set")
+	}
+	ctx := t.Context()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+
+	for _, tc := range []struct {
+		name      string
+		seasonRow bool
+	}{
+		{name: "synthetic", seasonRow: false},
+		{name: "partly-linked", seasonRow: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			exec := func(sql string, args ...any) {
+				t.Helper()
+				if _, err := pool.Exec(ctx, sql, args...); err != nil {
+					t.Fatal(err)
+				}
+			}
+			prefix := fmt.Sprintf("season-metadata-unwatch-%s-%d", tc.name, time.Now().UnixNano())
+			series := prefix + "-series"
+			season := prefix + "-season-1"
+			watchedID := prefix + "-s01e02"
+			neverOne, neverTwo := prefix+"-s01e01", prefix+"-s01e03"
+			var folder, userID int
+			if err := pool.QueryRow(ctx, `INSERT INTO media_folders (type,name,enabled) VALUES ('series',$1,true) RETURNING id`, prefix).Scan(&folder); err != nil {
+				t.Fatal(err)
+			}
+			if err := pool.QueryRow(ctx, `INSERT INTO users (username,role) VALUES ($1,'user') RETURNING id`, prefix).Scan(&userID); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				_, _ = pool.Exec(context.Background(), `DELETE FROM episodes WHERE series_id=$1`, series)
+				_, _ = pool.Exec(context.Background(), `DELETE FROM seasons WHERE series_id=$1`, series)
+				_, _ = pool.Exec(context.Background(), `DELETE FROM users WHERE id=$1`, userID)
+				_, _ = pool.Exec(context.Background(), `DELETE FROM media_items WHERE content_id=$1`, series)
+				_, _ = pool.Exec(context.Background(), `DELETE FROM media_folders WHERE id=$1`, folder)
+			})
+			exec(`INSERT INTO media_items (content_id,type,title) VALUES ($1,'series','Metadata Unwatch Series')`, series)
+			exec(`INSERT INTO media_item_libraries (content_id,media_folder_id) VALUES ($1,$2)`, series, folder)
+			if tc.seasonRow {
+				if err := catalog.NewSeasonRepository(pool).Upsert(ctx, &models.Season{ContentID: season, SeriesID: series, SeasonNumber: 1, Title: "Season 1", DefaultMetadataLanguage: "en"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			seasonID := any(nil)
+			if tc.seasonRow {
+				seasonID = season
+			}
+			exec(`INSERT INTO episodes (content_id,series_id,season_id,season_number,episode_number,title) VALUES
+				($1,$4,$5,1,1,'Never one'), ($2,$4,NULL,1,2,'Watched'), ($3,$4,NULL,1,3,'Never two')`,
+				neverOne, watchedID, neverTwo, series, seasonID)
+			profileID := fmt.Sprintf("00000000-0000-4000-8000-%012d", time.Now().UnixNano()%1_000_000_000_000)
+			exec(`INSERT INTO user_profiles (id,user_id,name) VALUES ($1,$2,'Metadata unwatch fixture')`, profileID, userID)
+
+			provider := pgstore.NewPostgresProvider(pool)
+			handler := &ItemsHandler{
+				itemRepo:    catalog.NewItemRepository(pool),
+				seasonRepo:  catalog.NewSeasonRepository(pool),
+				episodeRepo: catalog.NewEpisodeRepository(pool),
+				watchState:  watchstate.NewService(provider),
+			}
+			if err := handler.markLeafTargetsWatched(ctx, userID, profileID, []watchedLeafTarget{{ContentID: watchedID}}); err != nil {
+				t.Fatal(err)
+			}
+			target := series + "-S01"
+			if tc.seasonRow {
+				target = season
+			}
+			view, err := handler.SetWatchedState(ctx, userID, profileID, target, false, catalog.AccessFilter{})
+			if err != nil {
+				t.Fatalf("SetWatchedState: %v", err)
+			}
+			if view.AffectedCount != 1 {
+				t.Fatalf("affected_count = %d, want the one watched file-less episode", view.AffectedCount)
+			}
+			store, err := provider.ForUser(ctx, userID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			progress, err := store.GetProgress(ctx, profileID, watchedID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if progress != nil {
+				t.Fatalf("watched episode progress after unwatch = %+v, want cleared", progress)
+			}
+			for _, id := range []string{neverOne, neverTwo} {
+				var hidden int
+				if err := pool.QueryRow(ctx, `SELECT count(*) FROM user_history_hidden_items WHERE user_id=$1 AND media_item_id=$2`, userID, id).Scan(&hidden); err != nil {
+					t.Fatal(err)
+				}
+				if hidden != 0 {
+					t.Fatalf("never-watched episode %s was hidden; want it left out", id)
+				}
+			}
+		})
+	}
+}
+
+// Season unwatch must reach watched file-less episodes even when the season is
+// synthetic (no seasons row) or partly linked (the file-less episode has no
+// season_id). Expanding only by season_id misses exactly those rows.
+func TestSeasonUnwatchClearsSyntheticAndUnlinkedFilelessEpisodesPostgres(t *testing.T) { //nolint:funlen // one DB fixture covers synthetic and partly linked seasons
+	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("SILO_TEST_DATABASE_URL is not set")
+	}
+	ctx := t.Context()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+
+	for _, tc := range []struct {
+		name      string
+		seasonRow bool
+	}{
+		{name: "synthetic", seasonRow: false},
+		{name: "partly-linked", seasonRow: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			exec := func(sql string, args ...any) {
+				t.Helper()
+				if _, err := pool.Exec(ctx, sql, args...); err != nil {
+					t.Fatal(err)
+				}
+			}
+			prefix := fmt.Sprintf("season-unwatch-%s-%d", tc.name, time.Now().UnixNano())
+			series := prefix + "-series"
+			season := prefix + "-season-1"
+			onDisk := prefix + "-s01e01"
+			deletedWatched := prefix + "-s01e02"
+			neverWatched := prefix + "-s01e03"
+			var folder, userID int
+			if err := pool.QueryRow(ctx, `INSERT INTO media_folders (type,name,enabled) VALUES ('series',$1,true) RETURNING id`, prefix).Scan(&folder); err != nil {
+				t.Fatal(err)
+			}
+			if err := pool.QueryRow(ctx, `INSERT INTO users (username,role) VALUES ($1,'user') RETURNING id`, prefix).Scan(&userID); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				_, _ = pool.Exec(context.Background(), `DELETE FROM media_files WHERE episode_id = ANY($1)`, []string{onDisk})
+				_, _ = pool.Exec(context.Background(), `DELETE FROM episodes WHERE series_id=$1`, series)
+				_, _ = pool.Exec(context.Background(), `DELETE FROM seasons WHERE series_id=$1`, series)
+				_, _ = pool.Exec(context.Background(), `DELETE FROM users WHERE id=$1`, userID)
+				_, _ = pool.Exec(context.Background(), `DELETE FROM media_items WHERE content_id=$1`, series)
+				_, _ = pool.Exec(context.Background(), `DELETE FROM media_folders WHERE id=$1`, folder)
+			})
+			exec(`INSERT INTO media_items (content_id,type,title) VALUES ($1,'series','Season Unwatch Series')`, series)
+			exec(`INSERT INTO media_item_libraries (content_id,media_folder_id) VALUES ($1,$2)`, series, folder)
+			if tc.seasonRow {
+				if err := catalog.NewSeasonRepository(pool).Upsert(ctx, &models.Season{ContentID: season, SeriesID: series, SeasonNumber: 1, Title: "Season 1", DefaultMetadataLanguage: "en"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// The available episode is linked when the season row exists; the
+			// watched file-less episode deliberately stays outside it.
+			seasonID := any(nil)
+			if tc.seasonRow {
+				seasonID = season
+			}
+			exec(`INSERT INTO episodes (content_id,series_id,season_id,season_number,episode_number,title) VALUES
+				($1,$4,$5,1,1,'On disk'), ($2,$4,NULL,1,2,'Deleted watched'), ($3,$4,NULL,1,3,'Deleted never watched')`,
+				onDisk, deletedWatched, neverWatched, series, seasonID)
+			exec(`INSERT INTO episode_libraries (episode_id,media_folder_id) VALUES ($1,$2)`, onDisk, folder)
+			exec(`INSERT INTO media_files (episode_id,media_folder_id,file_path) VALUES ($1,$2,$3)`, onDisk, folder, "/"+onDisk)
+			profileID := fmt.Sprintf("00000000-0000-4000-8000-%012d", time.Now().UnixNano()%1_000_000_000_000)
+			exec(`INSERT INTO user_profiles (id,user_id,name) VALUES ($1,$2,'Season unwatch fixture')`, profileID, userID)
+
+			provider := pgstore.NewPostgresProvider(pool)
+			handler := &ItemsHandler{
+				itemRepo:    catalog.NewItemRepository(pool),
+				seasonRepo:  catalog.NewSeasonRepository(pool),
+				episodeRepo: catalog.NewEpisodeRepository(pool),
+				watchState:  watchstate.NewService(provider),
+			}
+			if err := handler.markLeafTargetsWatched(ctx, userID, profileID, []watchedLeafTarget{{ContentID: deletedWatched}}); err != nil {
+				t.Fatal(err)
+			}
+			target := series + "-S01"
+			if tc.seasonRow {
+				target = season
+			}
+			view, err := handler.SetWatchedState(ctx, userID, profileID, target, false, catalog.AccessFilter{})
+			if err != nil {
+				t.Fatalf("SetWatchedState: %v", err)
+			}
+			if view.AffectedCount != 2 {
+				t.Fatalf("affected_count = %d, want the available and watched file-less episodes", view.AffectedCount)
+			}
+			store, err := provider.ForUser(ctx, userID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, id := range []string{deletedWatched} {
+				progress, err := store.GetProgress(ctx, profileID, id)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if progress != nil {
+					t.Fatalf("%s progress after unwatch = %+v, want cleared", id, progress)
+				}
+			}
+			var hiddenNeverWatched int
+			if err := pool.QueryRow(ctx, `SELECT count(*) FROM user_history_hidden_items WHERE user_id=$1 AND media_item_id=$2`, userID, neverWatched).Scan(&hiddenNeverWatched); err != nil {
+				t.Fatal(err)
+			}
+			if hiddenNeverWatched != 0 {
+				t.Fatal("unwatch hid the never-watched file-less episode; want it left out")
+			}
+		})
+	}
+}

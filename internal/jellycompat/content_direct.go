@@ -2,6 +2,7 @@ package jellycompat
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/url"
@@ -1044,7 +1045,16 @@ func (s *directContentService) ListEpisodes(ctx context.Context, session *Sessio
 func (s *directContentService) ListEpisodesBySeasonID(ctx context.Context, session *Session, seasonID string, libraryID *int) ([]upstreamEpisode, error) {
 	season, err := s.seasonRepo.GetByID(ctx, seasonID)
 	if err != nil {
-		return nil, wrapCatalogError(err)
+		if !errors.Is(err, catalog.ErrSeasonNotFound) {
+			return nil, wrapCatalogError(err)
+		}
+		// A synthetic season has no seasons row; its id carries the durable
+		// (series, season number) coordinates the episode listing uses.
+		seriesID, seasonNumber, ok := catalog.ParseSyntheticSeasonID(seasonID)
+		if !ok {
+			return nil, wrapCatalogError(err)
+		}
+		return s.ListEpisodes(ctx, session, seriesID, seasonNumber, libraryID)
 	}
 	return s.ListEpisodes(ctx, session, season.SeriesID, season.SeasonNumber, libraryID)
 }
