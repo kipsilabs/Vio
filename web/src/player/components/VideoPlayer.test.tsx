@@ -3199,12 +3199,15 @@ describe("VideoPlayer HLS buffer policy", () => {
     expect(onEnded).not.toHaveBeenCalled();
   });
 
-  it("stops refetching a window the server cannot extend", async () => {
-    const { container } = renderPlayer({ plan: hlsPlan(), shouldAutoPlay: false });
+  it("keeps retrying a stalled non-final window instead of ending", async () => {
+    const onEnded = vi.fn();
+    const { container } = renderPlayer({ plan: hlsPlan(), shouldAutoPlay: false, onEnded });
     await waitFor(() => expect(hlsJS.constructed).toHaveBeenCalledOnce());
     const video = container.querySelector("video");
     if (!video) throw new Error("expected video element");
 
+    // A windowed playlist whose listed window ends at 470 s of a 3600 s title:
+    // the encoder is behind the playhead, not finished with the title.
     hlsJS.latest!.emit("levelLoaded", {
       details: { live: false, edge: 470, fragments: [{ gap: true, start: 0 }, { start: 400 }] },
     });
@@ -3218,19 +3221,122 @@ describe("VideoPlayer HLS buffer policy", () => {
     fireEvent.timeUpdate(video);
     expect(hlsJS.loadSource).toHaveBeenCalledTimes(1);
 
-    // The refetch returns the same final window: the plan's 3600 s runtime
-    // exceeds the manifest's own end, but the server has no more media to list.
+    // The encoder has produced nothing further, so the refetch returns the same
+    // window. That is a transient stall, not the title's end: the next edge event
+    // must refetch again on the cool-down rather than fail playback dead.
     hlsJS.latest!.emit("levelLoaded", {
       details: { live: false, edge: 470, fragments: [{ gap: true, start: 0 }, { start: 400 }] },
     });
-
-    // Past the cool-down the advance would fire again if it did not notice the
-    // window never grew. It must not loop the full MediaSource reset.
     nowSpy.mockReturnValue(base + WINDOWED_MANIFEST_RELOAD_MIN_INTERVAL_MS + 1);
-    video.currentTime = 465;
+    act(() => {
+      fireEvent.ended(video);
+    });
+
+    expect(hlsJS.loadSource).toHaveBeenCalledTimes(2);
+    expect(onEnded).not.toHaveBeenCalled();
+  });
+
+  it("does not end playback while a refetch is still in flight", async () => {
+    const onEnded = vi.fn();
+    const { container } = renderPlayer({ plan: hlsPlan(), shouldAutoPlay: false, onEnded });
+    await waitFor(() => expect(hlsJS.constructed).toHaveBeenCalledOnce());
+    const video = container.querySelector("video");
+    if (!video) throw new Error("expected video element");
+
+    hlsJS.latest!.emit("levelLoaded", {
+      details: { live: false, edge: 470, fragments: [{ gap: true, start: 0 }, { start: 400 }] },
+    });
+    hlsJS.loadSource.mockClear();
+    Object.defineProperty(video, "paused", { configurable: true, get: () => false });
+    Object.defineProperty(video, "seeking", { configurable: true, get: () => false });
+
+    video.currentTime = 455;
+    fireEvent.timeUpdate(video);
+    expect(hlsJS.loadSource).toHaveBeenCalledTimes(1);
+
+    // The element reaches `#EXT-X-ENDLIST` before the refetched LEVEL_LOADED
+    // republishes the window. The refetch is already on the wire, so this is a
+    // premature end: it must not be recorded as the end of the title.
+    act(() => {
+      fireEvent.ended(video);
+    });
+
+    expect(onEnded).not.toHaveBeenCalled();
+    expect(hlsJS.loadSource).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps advancing after a backward-seek reanchor", async () => {
+    const onReanchorSeek = vi.fn(() => true);
+    const { container } = renderPlayer({
+      plan: hlsPlan(),
+      onReanchorSeek,
+      shouldAutoPlay: false,
+    });
+    await waitFor(() => expect(hlsJS.constructed).toHaveBeenCalledOnce());
+    const video = container.querySelector("video");
+    if (!video) throw new Error("expected video element");
+
+    hlsJS.loadSource.mockClear();
+    Object.defineProperty(video, "paused", { configurable: true, get: () => false });
+    Object.defineProperty(video, "seeking", { configurable: true, get: () => false });
+
+    const base = Date.now();
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(base);
+
+    // Two window advances, each landing a window further along the title.
+    hlsJS.latest!.emit("levelLoaded", {
+      details: { live: false, edge: 470, fragments: [{ gap: true, start: 0 }, { start: 400 }] },
+    });
+    video.currentTime = 455;
+    fireEvent.timeUpdate(video);
+    hlsJS.latest!.emit("levelLoaded", {
+      details: { live: false, edge: 530, fragments: [{ gap: true, start: 0 }, { start: 460 }] },
+    });
+    nowSpy.mockReturnValue(base + WINDOWED_MANIFEST_RELOAD_MIN_INTERVAL_MS + 1);
+    video.currentTime = 515;
+    fireEvent.timeUpdate(video);
+    hlsJS.latest!.emit("levelLoaded", {
+      details: { live: false, edge: 590, fragments: [{ gap: true, start: 0 }, { start: 520 }] },
+    });
+    expect(hlsJS.loadSource).toHaveBeenCalledTimes(2);
+
+    // A backward seek into the omitted prefix replans on the same transport and
+    // the server lands a window behind the old one. The bookkeeping from the
+    // forward advances must not be read as "the window stopped growing" against
+    // the new window, or every later advance would be refused.
+    act(() => controls.current!.onSeek(100));
+    expect(onReanchorSeek).toHaveBeenCalledWith(100);
+    hlsJS.latest!.emit("levelLoaded", {
+      details: { live: false, edge: 170, fragments: [{ gap: true, start: 0 }, { start: 80 }] },
+    });
+
+    nowSpy.mockReturnValue(base + 2 * WINDOWED_MANIFEST_RELOAD_MIN_INTERVAL_MS + 2);
+    video.currentTime = 155;
     fireEvent.timeUpdate(video);
 
-    expect(hlsJS.loadSource).toHaveBeenCalledTimes(1);
+    expect(hlsJS.loadSource).toHaveBeenCalledTimes(3);
+  });
+
+  it("stops at the final window instead of refetching it", async () => {
+    const onEnded = vi.fn();
+    const { container } = renderPlayer({ plan: hlsPlan(), shouldAutoPlay: false, onEnded });
+    await waitFor(() => expect(hlsJS.constructed).toHaveBeenCalledOnce());
+    const video = container.querySelector("video");
+    if (!video) throw new Error("expected video element");
+
+    // The listed window reaches the plan's 3600 s runtime, so the title is over.
+    hlsJS.latest!.emit("levelLoaded", {
+      details: { live: false, edge: 3600, fragments: [{ gap: true, start: 0 }, { start: 3580 }] },
+    });
+    hlsJS.loadSource.mockClear();
+
+    act(() => {
+      fireEvent.ended(video);
+    });
+
+    // No refetch of a window that already reaches the media end.
+    expect(hlsJS.loadSource).not.toHaveBeenCalled();
+    expect(onEnded).toHaveBeenCalledTimes(1);
   });
 });
 

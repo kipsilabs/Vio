@@ -109,10 +109,7 @@ export function servedHlsWindow(
  * `mediaDurationSeconds` is the plan's `source.duration_seconds`, the same
  * `file.Duration` the server uses for the transcode session's total runtime. So
  * the final window's edge reaches it and the `+ 1` slack only absorbs the float
- * sums of the EXTINF entries; the two values are not independent estimates. A
- * caller that needs to defend against a future divergence between the two can
- * additionally refuse to refetch a window that a previous refetch did not
- * extend (see the player's window-reload guard).
+ * sums of the EXTINF entries; the two values are not independent estimates.
  */
 export function shouldAdvanceHlsWindow(
   window: ServedHlsWindow | null,

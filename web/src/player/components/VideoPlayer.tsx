@@ -389,6 +389,15 @@ const ROOM_ITEM_END_WINDOW_SECONDS = 5;
 // in well under a second, so only a longer gap is worth a warning.
 const ROOM_RECONNECT_NOTICE_DELAY_MS = 2_000;
 
+/**
+ * Outcome of asking the player to refetch a windowed synthetic manifest.
+ *
+ * `pending` is not a failure: a refetch is already on the wire, or the cool-down
+ * that bounds how often the manifest is refetched has not elapsed. The caller
+ * must keep waiting instead of treating the window as exhausted.
+ */
+type HlsWindowReloadOutcome = "launched" | "pending" | "exhausted";
+
 interface PlaybackNoticeState {
   title?: string;
   message: string;
@@ -574,13 +583,13 @@ export function VideoPlayer({
   // details arrive); the player refetches the manifest near the window edge and
   // reanchors a seek that falls outside it. `windowReloadAtRef` rate-limits the
   // refetch, which hls.js would not perform on its own for a VOD playlist.
-  // `windowReloadFromEndRef` is the served-window end the last refetch started
-  // from: a refetch that does not extend it means the server has no more media
-  // to offer, so the advance/recovery loop stops instead of refetching the same
-  // final window forever.
+  // `windowReloadLandedRef` is false while a refetch is on the wire: the next
+  // `LEVEL_LOADED` republishes the served window and marks it landed. Until it
+  // lands the served window still describes the pre-refetch playlist, so a
+  // recovery must not read it as "the window did not grow".
   const servedHlsWindowRef = useRef<ServedHlsWindow | null>(null);
   const windowReloadAtRef = useRef(0);
-  const windowReloadFromEndRef = useRef<number | null>(null);
+  const windowReloadLandedRef = useRef(true);
   const reportedPlanFailureKeyRef = useRef<string | null>(null);
   // Whether the current transport has shown a frame. A network error after
   // that is a lost connection, not a route that cannot play. Reset whenever
@@ -1403,6 +1412,17 @@ export function VideoPlayer({
     }
   }, []);
 
+  // An accepted reanchor replans the stream around the seek target. The window
+  // refetch bookkeeping from the old window is stale — its cool-down would
+  // suppress the first advance of the new window, and an in-flight refetch of
+  // the old URL is moot — so clear it. The served window itself is left alone:
+  // the replan republishes it on the next `LEVEL_LOADED`, and until then the old
+  // window still describes the media actually attached to the element.
+  const resetWindowReloadBookkeeping = useCallback(() => {
+    windowReloadAtRef.current = 0;
+    windowReloadLandedRef.current = true;
+  }, []);
+
   // Reports whether the seek was taken up, which callers that show an
   // affordance for it (the intro prompt) need in order to know whether the
   // affordance did anything.
@@ -1458,11 +1478,13 @@ export function VideoPlayer({
       const accepted = onReanchorSeek(seconds);
       if (typeof accepted === "boolean") {
         if (!accepted) releasePendingSeek(seconds);
+        else resetWindowReloadBookkeeping();
         return accepted;
       }
       return accepted.then(
         (ok) => {
           if (!ok) releasePendingSeek(seconds);
+          else resetWindowReloadBookkeeping();
           return ok;
         },
         (error: unknown) => {
@@ -1479,6 +1501,7 @@ export function VideoPlayer({
       releasePendingSeek,
       rememberPendingSeek,
       resetRoomCatchupRate,
+      resetWindowReloadBookkeeping,
     ],
   );
 
@@ -2745,6 +2768,9 @@ export function VideoPlayer({
             hls.on(Hls.Events.LEVEL_LOADED, (_event, data) => {
               if (destroyed) return;
               servedHlsWindowRef.current = servedHlsWindow(data.details);
+              // A refetch that was on the wire has now republished its window;
+              // recovery may read the served window again.
+              windowReloadLandedRef.current = true;
             });
 
             hls.on(Hls.Events.BUFFER_APPENDED, () => {
@@ -2761,7 +2787,8 @@ export function VideoPlayer({
             });
 
             servedHlsWindowRef.current = null;
-            windowReloadFromEndRef.current = null;
+            windowReloadAtRef.current = 0;
+            windowReloadLandedRef.current = true;
             hls.loadSource(hlsStreamUrl);
             hls.attachMedia(video);
             hlsRef.current = hls;
@@ -2884,30 +2911,41 @@ export function VideoPlayer({
     // fetch time. The reload-ahead margin below only decides *when* that reset
     // fires — early enough that the window is replaced before the element would
     // reach `#EXT-X-ENDLIST` — not how long the re-download takes.
-    const reloadHlsWindow = (): boolean => {
+    //
+    // The only condition that stops the advance/recovery loop is the served
+    // window reaching the media end: there is nothing more to list, and
+    // refetching it would reset the MediaSource for no gain. A window *short* of
+    // the media end that a refetch did not extend is a stalled encoder, not the
+    // end — the encoder catches up on demand, so it keeps retrying on the
+    // cool-down instead of ending playback. A `fromEnd` comparison cannot tell
+    // the two apart, which is what made the previous guard fail playback dead at
+    // a transient stall.
+    const reloadHlsWindow = (): HlsWindowReloadOutcome => {
       const hls = hlsRef.current;
-      if (!hls) return false;
+      if (!hls) return "exhausted";
       const playlistUrl = hls.url;
-      if (!playlistUrl) return false;
+      if (!playlistUrl) return "exhausted";
       const currentEnd = servedHlsWindowRef.current?.end ?? null;
-      // A refetch that did not extend the served window means the server has no
-      // more media to offer (the window is clamped to the title's last segment).
-      // Refetching the same final window every cooldown — the premature-`ended`
-      // path can even drive it — would loop forever, so treat it as the end.
-      if (
-        currentEnd !== null &&
-        windowReloadFromEndRef.current !== null &&
-        currentEnd <= windowReloadFromEndRef.current
-      ) {
-        return false;
+      // Media-end proximity, mirroring the ended handler's own check. The plan's
+      // `source.duration_seconds` and the session runtime are the same
+      // `file.Duration`, so the final window's edge reaches it and the `+ 1`
+      // only absorbs the EXTINF float sums.
+      if (currentEnd !== null && backendDurationRef.current <= currentEnd + 1) {
+        return "exhausted";
       }
+      // A refetch already on the wire: do not stack a second MediaSource reset
+      // on it, and do not read its pre-refetch window as a stall. Playback
+      // resumes when its `LEVEL_LOADED` lands.
+      if (!windowReloadLandedRef.current) return "pending";
       const now = Date.now();
-      if (now - windowReloadAtRef.current < WINDOWED_MANIFEST_RELOAD_MIN_INTERVAL_MS) return false;
+      if (now - windowReloadAtRef.current < WINDOWED_MANIFEST_RELOAD_MIN_INTERVAL_MS) {
+        return "pending";
+      }
       windowReloadAtRef.current = now;
-      windowReloadFromEndRef.current = currentEnd;
+      windowReloadLandedRef.current = false;
       hls.config.startPosition = video.currentTime;
       hls.loadSource(playlistUrl);
-      return true;
+      return "launched";
     };
 
     const onPlay = () => {
@@ -3095,14 +3133,10 @@ export function VideoPlayer({
       // playing instead of treating it as the end of the title. `loadSource`
       // leaves the element paused at its ended position, so resume explicitly;
       // a rejected `play()` is the ordinary autoplay/no-gesture case and is left
-      // to the user.
+      // to the user. An exhausted window (one that reaches the media end) is the
+      // title's real end; a refetch already on the wire is not terminal.
       const servedWindow = servedHlsWindowRef.current;
-      if (
-        servedWindow &&
-        !servedWindow.live &&
-        backendDurationRef.current > servedWindow.end + 1 &&
-        reloadHlsWindow()
-      ) {
+      if (servedWindow && !servedWindow.live && reloadHlsWindow() !== "exhausted") {
         void video.play().catch(() => {});
         return;
       }
