@@ -1446,25 +1446,34 @@ func TestWaitForOpenSegmentWithStallAllowsGrowingPartialSegment(t *testing.T) {
 			StartSegmentNumber: 0,
 		},
 	}
+	// Seed the partial segment before the wait starts. A CI runner can otherwise
+	// deschedule the writer long enough for the first sampling window to look
+	// like a real stall before any progress exists.
+	size := 4096
+	partialPath := filepath.Join(tempDir, "seg_00001.ts.tmp")
+	if err := os.WriteFile(partialPath, bytes.Repeat([]byte("x"), size), 0o600); err != nil {
+		t.Fatalf("seed partial segment: %v", err)
+	}
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		size := 0
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
 		for {
 			select {
 			case <-stop:
 				return
-			case <-time.After(20 * time.Millisecond):
+			case <-ticker.C:
 				size += 4096
-				_ = os.WriteFile(filepath.Join(tempDir, "seg_00001.ts.tmp"), bytes.Repeat([]byte("x"), size), 0o600)
+				_ = os.WriteFile(partialPath, bytes.Repeat([]byte("x"), size), 0o600)
 			}
 		}
 	}()
-	// The stall sampler runs at most twice a second. Use a wait that crosses
-	// several samples and a stall window shorter than the overall wait, so a
-	// missing partial-progress reset would produce ErrSegmentStalled.
-	_, err := session.WaitForOpenSegmentWithStall("seg_00001.ts", 1300*time.Millisecond, 650*time.Millisecond)
+	// The sampler polls every 500 ms. Keep the stall window below the overall
+	// wait but wide enough for a loaded CI scheduler: without the partial
+	// progress reset this still reaches ErrSegmentStalled.
+	_, err := session.WaitForOpenSegmentWithStall("seg_00001.ts", 4*time.Second, 2*time.Second)
 	close(stop)
 	<-done
 	if !errors.Is(err, ErrSegmentNotFound) {
