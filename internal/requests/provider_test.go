@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type fakeRouterClient struct {
@@ -13,6 +15,7 @@ type fakeRouterClient struct {
 	statuses       []*pluginv1.TargetStatus
 	optionsByField map[string]*pluginv1.ConfigOptionList
 	validateResp   *pluginv1.ValidateResponse
+	validateErr    error
 }
 
 func (f *fakeRouterClient) Fulfill(_ context.Context, req *pluginv1.FulfillRequest) (*pluginv1.FulfillResponse, error) {
@@ -32,7 +35,7 @@ func (f *fakeRouterClient) TestConnection(context.Context, *pluginv1.TestConnect
 	return &pluginv1.TestConnectionResponse{Ok: true}, nil
 }
 func (f *fakeRouterClient) Validate(context.Context, *pluginv1.ValidateRequest) (*pluginv1.ValidateResponse, error) {
-	return f.validateResp, nil
+	return f.validateResp, f.validateErr
 }
 
 type fakeRouterResolver struct{ c RouterClient }
@@ -135,5 +138,16 @@ func TestPluginRouterProviderValidateTranslates(t *testing.T) {
 		nil)
 	if err != nil || form != "" || fe["is_default"] != "cannot be 4K" {
 		t.Fatalf("unexpected: fe=%v form=%q err=%v", fe, form, err)
+	}
+}
+
+func TestPluginRouterProviderValidateTreatsUnimplementedAsNoValidation(t *testing.T) {
+	fc := &fakeRouterClient{validateErr: status.Error(codes.Unimplemented, "method Validate not implemented")}
+	p := NewPluginRouterProvider(fakeRouterResolver{c: fc})
+	fe, form, err := p.Validate(context.Background(), 1, "streaming",
+		ResolvedRouterConnection{ID: "c1", BaseURL: "virtual://streaming"},
+		nil)
+	if err != nil || form != "" || len(fe) != 0 {
+		t.Fatalf("unimplemented Validate should be a no-op: fe=%v form=%q err=%v", fe, form, err)
 	}
 }
