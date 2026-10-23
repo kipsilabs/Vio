@@ -15,7 +15,7 @@ import (
 // through its alias row, an alias row never becomes its own card, and the
 // canonical episode's own membership plus its alias's membership collapse into
 // one arrival per folder.
-func TestRecentTVAliasMembershipDB(t *testing.T) {
+func TestRecentTVAliasMembershipDB(t *testing.T) { //nolint:funlen // one DB fixture covers list, prefix, and newest queries
 	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("SILO_TEST_DATABASE_URL is not set")
