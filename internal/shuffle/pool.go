@@ -261,17 +261,19 @@ func pickFrom(ctx context.Context, q querier, p pool, access catalog.AccessFilte
 // files in libraryID. It draws ids uniformly from media_files' id range and
 // keeps each present file in the library that is its item's lowest-id present
 // file there, so an item with several files is no likelier than one with a
-// single file. Every item in the library is then equally likely to be
-// sampled, and a uniform pick among the sampled items in the pool is a
-// uniform pick from the pool.
+// single file. An episode file that lives on a layout alias names its canonical
+// episode, and the DISTINCT keeps one sample entry per item even when a
+// canonical episode owns files in more than one group. A uniform pick among the
+// sampled items in the pool is then a uniform pick from the pool.
 func sampleCTE(libraryID, draws int, args *[]any) string {
 	return fmt.Sprintf(`WITH shuffle_sample AS MATERIALIZED (
-		SELECT COALESCE(mf.episode_id, mf.content_id) AS content_id
+		SELECT DISTINCT COALESCE(ea.canonical_episode_id, mf.episode_id, mf.content_id) AS content_id
 		FROM (
 			SELECT bounds.lo + floor(random() * (bounds.hi - bounds.lo + 1))::bigint AS id
 			FROM (%s) bounds, generate_series(1, %s)
 		) draw
 		JOIN media_files mf ON mf.id = draw.id
+		LEFT JOIN episode_aliases ea ON ea.alias_episode_id = mf.episode_id
 		WHERE mf.media_folder_id = %s AND mf.missing_since IS NULL AND (
 			(mf.episode_id IS NOT NULL AND NOT EXISTS (
 				SELECT 1 FROM media_files lower_file
@@ -332,7 +334,9 @@ func movieCandidates(p pool, access catalog.AccessFilter, sampled bool, args *[]
 
 // episodeCandidates selects the pool's episodes the viewer may see and play.
 // Maturity and library access come from the parent series, as everywhere else
-// in the catalog. Specials play like any other episode.
+// in the catalog. Specials play like any other episode. A layout alias row is
+// not a candidate; a canonical episode stays eligible through a present file
+// that one of its alias rows owns (see playableEpisodeFile).
 func episodeCandidates(p pool, access catalog.AccessFilter, sampled bool, args *[]any) string {
 	conditions := []string{}
 	if sampled {
@@ -356,7 +360,9 @@ func episodeCandidates(p pool, access catalog.AccessFilter, sampled bool, args *
 		conditions = append(conditions, "("+strings.Join(members, " OR ")+")")
 	}
 	conditions = appendItemAccess("si", "e.series_id", access, conditions, args)
-	conditions = append(conditions, playableFile("e.content_id", "mf.episode_id", p.libraryID, sampled, access, args))
+	conditions = append(conditions,
+		catalog.EpisodeAliasExclusionSQL("e.content_id"),
+		playableEpisodeFile("e.content_id", p.libraryID, sampled, access, args))
 	return `SELECT e.content_id FROM episodes e JOIN media_items si ON si.content_id = e.series_id AND si.type = 'series' WHERE ` +
 		strings.Join(conditions, " AND ")
 }
@@ -398,6 +404,38 @@ func playableFile(key, fileKey string, libraryID int, sampled bool, access catal
 		return key + ` IN (SELECT ` + fileKey + files + `)`
 	}
 	return `EXISTS (SELECT 1` + files + ` AND ` + fileKey + ` = ` + key + `)`
+}
+
+// playableEpisodeFile is playableFile for a canonical episode: a present file
+// owned directly by the episode or by one of its alias rows qualifies. The
+// alias row is a layout artifact and is never a candidate itself, so the file
+// it owns has to count for the canonical episode it maps to.
+//
+// The file conditions reference only mf, which lets the probe form use
+// catalog.CanonicalEpisodeFileExistsSQL. The enabled-library check is an
+// EXISTS over pf for the same reason.
+func playableEpisodeFile(key string, libraryID int, sampled bool, access catalog.AccessFilter, args *[]any) string {
+	conditions := []string{
+		"mf.missing_since IS NULL",
+		"EXISTS (SELECT 1 FROM media_folders pf WHERE pf.id = mf.media_folder_id AND pf.enabled = TRUE)",
+	}
+	if libraryID > 0 {
+		conditions = append(conditions, fmt.Sprintf("mf.media_folder_id = %s", bind(args, libraryID)))
+	}
+	var fileAccess []string
+	fileAccess, *args = catalog.MediaFileAccessSQL("mf", access, *args)
+	conditions = append(conditions, fileAccess...)
+	fileConditions := strings.Join(conditions, " AND ")
+	if libraryID > 0 && !sampled {
+		// Membership in the library's playable files keeps the planner able to
+		// start from that library's files. An alias file contributes its
+		// canonical episode.
+		return key + ` IN (SELECT COALESCE(ea.canonical_episode_id, mf.episode_id)
+			FROM media_files mf
+			LEFT JOIN episode_aliases ea ON ea.alias_episode_id = mf.episode_id
+			WHERE ` + fileConditions + `)`
+	}
+	return catalog.CanonicalEpisodeFileExistsSQL(key, fileConditions)
 }
 
 // bind appends value to args and returns its placeholder.

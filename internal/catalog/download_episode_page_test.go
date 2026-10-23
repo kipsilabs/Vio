@@ -32,6 +32,7 @@ func TestDownloadEpisodePagesSQLBoundsAndAvailability(t *testing.T) {
 	// real catalog's uniqueness constraints or any shared fixture rows.
 	exec(`CREATE TEMP TABLE episodes (LIKE public.episodes INCLUDING DEFAULTS)`)
 	exec(`CREATE TEMP TABLE episode_libraries (LIKE public.episode_libraries INCLUDING DEFAULTS)`)
+	exec(`CREATE TEMP TABLE episode_aliases (LIKE public.episode_aliases INCLUDING DEFAULTS)`)
 	for _, v := range []struct {
 		id, series string
 		s, e       int
@@ -42,6 +43,12 @@ func TestDownloadEpisodePagesSQLBoundsAndAvailability(t *testing.T) {
 			exec(`INSERT INTO episode_libraries(episode_id,media_folder_id)VALUES($1,1)`, v.id)
 		}
 	}
+	// A layout alias is its own library-linked episode row. It must not take a
+	// page slot or move the keyset cursor; the canonical episode "b" stays the
+	// row the page returns.
+	exec(`INSERT INTO episodes(content_id,series_id,season_number,episode_number,title)VALUES('alias-row','series',1,0,'Alias')`)
+	exec(`INSERT INTO episode_libraries(episode_id,media_folder_id)VALUES('alias-row',1)`)
+	exec(`INSERT INTO episode_aliases(series_id,canonical_episode_id,alias_episode_id,source)VALUES('series','b','alias-row','absolute_layout')`)
 	repo := NewEpisodeRepository(pool)
 	var after *EpisodePagePosition
 	got := []string{}
