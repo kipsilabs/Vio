@@ -12,8 +12,9 @@ import (
 
 // TestFileRepositoryFallsBackToAliasEpisodeFilesDB pins the read-time alias
 // behavior: a canonical episode with no present files resolves the files owned
-// by its alias rows, and a canonical episode with its own files also includes
-// alias files so listing matches the playability rule.
+// by its alias rows, and a canonical episode with its own files lists those
+// direct files first and then alias files so listing matches the playability
+// rule.
 func TestFileRepositoryFallsBackToAliasEpisodeFilesDB(t *testing.T) { //nolint:funlen,gocyclo // one DB fixture covers direct, alias-only, duplicate, batch, and missing-file cases
 	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
 	if dsn == "" {
@@ -92,8 +93,13 @@ func TestFileRepositoryFallsBackToAliasEpisodeFilesDB(t *testing.T) { //nolint:f
 	aliasFirst := insertFile(aliasFallbackID, "/media/alias-fallback-1.mkv", false)
 	insertFile(aliasFallbackID, "/media/alias-fallback-missing.mkv", true)
 	aliasSecond := insertFile(aliasFallbackID, "/media/alias-fallback-2.mkv", false)
-	canonicalOwnedFile := insertFile(canonicalOwnedID, "/media/canonical-owned.mkv", false)
+	// Insert the alias file first so its lower ID cannot accidentally satisfy
+	// the canonical-first expectation below.
 	aliasShadowedFile := insertFile(aliasShadowedID, "/media/alias-shadowed.mkv", false)
+	canonicalOwnedFile := insertFile(canonicalOwnedID, "/media/canonical-owned.mkv", false)
+	if aliasShadowedFile >= canonicalOwnedFile {
+		t.Fatalf("fixture ids = alias %d, canonical %d; want the alias file to sort first by id", aliasShadowedFile, canonicalOwnedFile)
+	}
 
 	repo := NewFileRepository(pool)
 
@@ -115,13 +121,13 @@ func TestFileRepositoryFallsBackToAliasEpisodeFilesDB(t *testing.T) { //nolint:f
 		}
 	})
 
-	t.Run("canonical with files also includes alias files in id order", func(t *testing.T) {
+	t.Run("canonical with files lists direct files before alias files", func(t *testing.T) {
 		files, err := repo.GetByEpisodeID(ctx, canonicalOwnedID)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if len(files) != 2 || files[0].ID != canonicalOwnedFile || files[1].ID != aliasShadowedFile {
-			t.Fatalf("GetByEpisodeID returned %+v, want canonical file %d and alias file %d", files, canonicalOwnedFile, aliasShadowedFile)
+			t.Fatalf("GetByEpisodeID returned %+v, want canonical file %d before alias file %d", files, canonicalOwnedFile, aliasShadowedFile)
 		}
 		if files[1].EpisodeID != aliasShadowedID {
 			t.Fatalf("alias file.EpisodeID = %q, want stored alias id %q", files[1].EpisodeID, aliasShadowedID)
@@ -144,7 +150,7 @@ func TestFileRepositoryFallsBackToAliasEpisodeFilesDB(t *testing.T) { //nolint:f
 		}
 		owned := grouped[canonicalOwnedID]
 		if len(owned) != 2 || owned[0].ID != canonicalOwnedFile || owned[1].ID != aliasShadowedFile {
-			t.Fatalf("batch canonical-owned files = %+v, want canonical file %d and alias file %d", owned, canonicalOwnedFile, aliasShadowedFile)
+			t.Fatalf("batch canonical-owned files = %+v, want canonical file %d before alias file %d", owned, canonicalOwnedFile, aliasShadowedFile)
 		}
 		if _, ok := grouped["unknown-episode"]; ok {
 			t.Fatalf("unknown episode unexpectedly has a key: %+v", grouped["unknown-episode"])

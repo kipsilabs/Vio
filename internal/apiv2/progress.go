@@ -229,9 +229,15 @@ func (reg *Registry) syncProgress(ctx context.Context, in *ProgressSyncInput) (*
 			item.Status = "failure"
 			kind := TypeInternalError
 			detail := "Progress could not be updated."
-			if r.FailureStatus == http.StatusNotFound {
+			switch r.FailureStatus {
+			case http.StatusNotFound:
 				kind = TypeNotFound
 				detail = "Catalog item not found."
+			case http.StatusServiceUnavailable:
+				// Canonical identity lookup failed; the client can retry the
+				// same item without changing its cached id.
+				kind = TypeDependencyUnavailable
+				detail = "Progress could not be updated because the catalog could not be read."
 			}
 			item.Failure = bulkFailure(kind, detail)
 			out.Body.Summary.Failed++

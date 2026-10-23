@@ -3945,8 +3945,11 @@ func (h *PlaybackHandler) runPlaybackStartSideEffectsV3(task playbackStartSideEf
 	ctx := state.ctx
 
 	if !task.session.DisableProgressPersistence && h.WatchScrobbler != nil {
-		targetID := h.playbackProgressTarget(ctx, &task.file)
-		if targetID != "" {
+		targetID, targetErr := h.playbackProgressTarget(ctx, &task.file)
+		if targetErr != nil {
+			slog.WarnContext(ctx, "failed to resolve canonical episode for start scrobble", "component", "api",
+				"session", task.session.ID, "error", targetErr)
+		} else if targetID != "" {
 			event := h.scrobbleEventForSession(ctx, &task.session, targetID, float64(task.file.Duration), task.session.Position)
 			if err := h.WatchScrobbler.ScrobbleStart(ctx, event); err != nil {
 				slog.WarnContext(ctx, "failed to queue watch provider start scrobble", "component", "api", "session", task.session.ID, "error", err)
@@ -5869,7 +5872,10 @@ func (h *PlaybackHandler) resumePositionV3(ctx context.Context, userID int, prof
 	if h.StoreProvider == nil {
 		return nil, nil
 	}
-	targetID := h.playbackProgressTarget(ctx, file)
+	targetID, err := h.playbackProgressTarget(ctx, file)
+	if err != nil {
+		return nil, err
+	}
 	if targetID == "" {
 		return nil, nil
 	}

@@ -59,6 +59,10 @@ func (s *PostgresUserStore) UpdateProgress(ctx context.Context, profileID, media
 	if skip {
 		return nil
 	}
+	targetID, err := canonicalWatchStateID(ctx, s.pool, mediaItemID)
+	if err != nil {
+		return err
+	}
 	now := time.Now().UTC()
 	// `completed` is a one-way watched latch; position resets to 0 on
 	// completion so `position_seconds > 0` means "has a resume point".
@@ -67,7 +71,7 @@ func (s *PostgresUserStore) UpdateProgress(ctx context.Context, profileID, media
 	// resume at the stale, later position on every client). Rewatching a
 	// completed row still re-enters Continue Watching (stored position is 0,
 	// any heartbeat replaces it) while the watched flag survives.
-	_, err := s.pool.Exec(ctx, `
+	_, err = s.pool.Exec(ctx, `
 		WITH visible AS (
 			SELECT
 				CASE
@@ -92,7 +96,7 @@ func (s *PostgresUserStore) UpdateProgress(ctx context.Context, profileID, media
 				THEN TRUE ELSE user_watch_progress.completed END,
 			updated_at = excluded.updated_at,
 			event_at = excluded.updated_at`,
-		s.userID, profileID, mediaItemID, position, duration, completed, now,
+		s.userID, profileID, targetID, position, duration, completed, now,
 	)
 	if err != nil {
 		return fmt.Errorf("updating progress: %w", err)
@@ -106,8 +110,12 @@ func (s *PostgresUserStore) SetProgress(ctx context.Context, profileID, mediaIte
 	if skip {
 		return nil
 	}
+	targetID, err := canonicalWatchStateID(ctx, s.pool, mediaItemID)
+	if err != nil {
+		return err
+	}
 	now := time.Now().UTC()
-	_, err := s.pool.Exec(ctx, `
+	_, err = s.pool.Exec(ctx, `
 		WITH visible AS (
 			SELECT
 				CASE
@@ -130,7 +138,7 @@ func (s *PostgresUserStore) SetProgress(ctx context.Context, profileID, mediaIte
 			completed = user_watch_progress.completed OR excluded.completed,
 			updated_at = excluded.updated_at,
 			event_at = excluded.updated_at`,
-		s.userID, profileID, mediaItemID, position, duration, completed, now,
+		s.userID, profileID, targetID, position, duration, completed, now,
 	)
 	if err != nil {
 		return fmt.Errorf("setting progress: %w", err)
@@ -151,7 +159,11 @@ func (s *PostgresUserStore) SetProgressAt(ctx context.Context, profileID, mediaI
 	if updatedAt.IsZero() {
 		updatedAt = time.Now().UTC()
 	}
-	suppressed, err := s.historyIsHidden(ctx, profileID, mediaItemID, updatedAt.UTC())
+	targetID, err := canonicalWatchStateID(ctx, s.pool, mediaItemID)
+	if err != nil {
+		return err
+	}
+	suppressed, err := s.historyIsHidden(ctx, profileID, targetID, updatedAt.UTC())
 	if err != nil {
 		return err
 	}
@@ -167,7 +179,7 @@ func (s *PostgresUserStore) SetProgressAt(ctx context.Context, profileID, mediaI
 			completed = user_watch_progress.completed OR excluded.completed,
 			updated_at = excluded.updated_at,
 			event_at = excluded.updated_at`,
-		s.userID, profileID, mediaItemID, position, duration, completed, updatedAt.UTC(),
+		s.userID, profileID, targetID, position, duration, completed, updatedAt.UTC(),
 	)
 	if err != nil {
 		return fmt.Errorf("setting progress at time: %w", err)
@@ -188,7 +200,11 @@ func (s *PostgresUserStore) SetProgressIfNewer(ctx context.Context, profileID, m
 	if updatedAt.IsZero() {
 		updatedAt = time.Now().UTC()
 	}
-	suppressed, err := s.historyIsHidden(ctx, profileID, mediaItemID, updatedAt.UTC())
+	targetID, err := canonicalWatchStateID(ctx, s.pool, mediaItemID)
+	if err != nil {
+		return false, err
+	}
+	suppressed, err := s.historyIsHidden(ctx, profileID, targetID, updatedAt.UTC())
 	if err != nil {
 		return false, err
 	}
@@ -207,7 +223,7 @@ func (s *PostgresUserStore) SetProgressIfNewer(ctx context.Context, profileID, m
 				updated_at = EXCLUDED.updated_at,
 				event_at = EXCLUDED.event_at
 			WHERE EXCLUDED.event_at > user_watch_progress.event_at`,
-		s.userID, profileID, mediaItemID, position, duration, completed, updatedAt.UTC(),
+		s.userID, profileID, targetID, position, duration, completed, updatedAt.UTC(),
 	)
 	if err != nil {
 		return false, fmt.Errorf("setting newer progress: %w", err)
@@ -439,9 +455,13 @@ func (s *PostgresUserStore) MarkWatched(ctx context.Context, profileID, mediaIte
 	if duration < 0 {
 		duration = 0
 	}
+	targetID, err := canonicalWatchStateID(ctx, s.pool, mediaItemID)
+	if err != nil {
+		return err
+	}
 
 	now := time.Now().UTC()
-	_, err := s.pool.Exec(ctx, `
+	_, err = s.pool.Exec(ctx, `
 		WITH visible AS (
 			SELECT
 				CASE
@@ -464,7 +484,7 @@ func (s *PostgresUserStore) MarkWatched(ctx context.Context, profileID, mediaIte
 			completed = TRUE,
 			updated_at = excluded.updated_at,
 			event_at = excluded.updated_at`,
-		s.userID, profileID, mediaItemID, duration, now,
+		s.userID, profileID, targetID, duration, now,
 	)
 	if err != nil {
 		return fmt.Errorf("marking watched: %w", err)
@@ -473,10 +493,14 @@ func (s *PostgresUserStore) MarkWatched(ctx context.Context, profileID, mediaIte
 }
 
 func (s *PostgresUserStore) ClearProgress(ctx context.Context, profileID, mediaItemID string) error {
-	_, err := s.pool.Exec(ctx, `
+	targetID, err := canonicalWatchStateID(ctx, s.pool, mediaItemID)
+	if err != nil {
+		return err
+	}
+	_, err = s.pool.Exec(ctx, `
 		DELETE FROM user_watch_progress
 		WHERE user_id = $1 AND profile_id = $2 AND media_item_id = $3`,
-		s.userID, profileID, mediaItemID,
+		s.userID, profileID, targetID,
 	)
 	if err != nil {
 		return fmt.Errorf("clearing progress: %w", err)
@@ -489,6 +513,10 @@ func (s *PostgresUserStore) ClearProgress(ctx context.Context, profileID, mediaI
 // to at least event_at: the stamp trigger copies updated_at into an unchanged
 // event_at, and an offline write may have left event_at slightly ahead.
 func (s *PostgresUserStore) ClearResumePosition(ctx context.Context, profileID, mediaItemID string, at time.Time) (bool, error) {
+	targetID, err := canonicalWatchStateID(ctx, s.pool, mediaItemID)
+	if err != nil {
+		return false, err
+	}
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE user_watch_progress
 		SET position_seconds = 0,
@@ -504,7 +532,7 @@ func (s *PostgresUserStore) ClearResumePosition(ctx context.Context, profileID, 
 			  AND hhi.media_item_id = user_watch_progress.media_item_id
 			  AND user_watch_progress.updated_at <= hhi.hidden_before
 		  )`,
-		s.userID, profileID, mediaItemID, at.UTC(),
+		s.userID, profileID, targetID, at.UTC(),
 	)
 	if err != nil {
 		return false, fmt.Errorf("clearing resume position: %w", err)
@@ -561,6 +589,22 @@ func (s *PostgresUserStore) markWatchedBatchTx(ctx context.Context, tx pgx.Tx, p
 		return nil, nil
 	}
 
+	allIDs := make([]string, 0, len(targets)+len(entries))
+	for _, target := range targets {
+		if mediaItemID := strings.TrimSpace(target.MediaItemID); mediaItemID != "" {
+			allIDs = append(allIDs, mediaItemID)
+		}
+	}
+	for _, entry := range entries {
+		if mediaItemID := strings.TrimSpace(entry.MediaItemID); mediaItemID != "" {
+			allIDs = append(allIDs, mediaItemID)
+		}
+	}
+	canonicalByID, err := canonicalWatchStateIDMap(ctx, tx, allIDs)
+	if err != nil {
+		return nil, err
+	}
+
 	mediaItemIDs := make([]string, 0, len(targets))
 	durations := make([]float64, 0, len(targets))
 	eventDates := make([]*time.Time, 0, len(targets))
@@ -571,15 +615,16 @@ func (s *PostgresUserStore) markWatchedBatchTx(ctx context.Context, tx pgx.Tx, p
 		if mediaItemID == "" {
 			continue
 		}
-		if _, ok := seen[mediaItemID]; ok {
+		canonicalID := canonicalByID[mediaItemID]
+		if _, ok := seen[canonicalID]; ok {
 			continue
 		}
-		seen[mediaItemID] = struct{}{}
+		seen[canonicalID] = struct{}{}
 		duration := target.DurationSeconds
 		if duration < 0 {
 			duration = 0
 		}
-		mediaItemIDs = append(mediaItemIDs, mediaItemID)
+		mediaItemIDs = append(mediaItemIDs, canonicalID)
 		durations = append(durations, duration)
 		eventDates = append(eventDates, target.EventAt)
 		explicitDates = explicitDates || target.EventAt != nil
@@ -605,6 +650,7 @@ func (s *PostgresUserStore) markWatchedBatchTx(ctx context.Context, tx pgx.Tx, p
 		if mediaItemID == "" {
 			continue
 		}
+		mediaItemID = canonicalByID[mediaItemID]
 		id := entry.ID
 		if id == "" {
 			id = generateUUID()
@@ -774,14 +820,17 @@ func (s *PostgresUserStore) markWatchedBatchTx(ctx context.Context, tx pgx.Tx, p
 // in mediaItemIDs in a single statement. Used by the jellycompat series
 // mark-played path so a 200-episode mark collapses to one INSERT.
 func (s *PostgresUserStore) MarkProgressBatch(ctx context.Context, profileID string, mediaItemIDs []string, updatedAt time.Time) error {
-	mediaItemIDs = compactMediaItemIDs(mediaItemIDs)
+	mediaItemIDs, err := canonicalWatchStateIDs(ctx, s.pool, mediaItemIDs)
+	if err != nil {
+		return err
+	}
 	if len(mediaItemIDs) == 0 {
 		return nil
 	}
 	if updatedAt.IsZero() {
 		updatedAt = time.Now().UTC()
 	}
-	_, err := s.pool.Exec(ctx, `
+	_, err = s.pool.Exec(ctx, `
 		WITH target(media_item_id) AS (
 			SELECT unnest($3::text[])
 		),
@@ -822,7 +871,10 @@ func (s *PostgresUserStore) MarkProgressBatch(ctx context.Context, profileID str
 // don't exist are silently skipped. (Mark-unplayed flows currently go through
 // RemoveHistoryItems; this remains on the interface for bulk resets.)
 func (s *PostgresUserStore) ClearProgressBatch(ctx context.Context, profileID string, mediaItemIDs []string, updatedAt time.Time) error {
-	mediaItemIDs = compactMediaItemIDs(mediaItemIDs)
+	mediaItemIDs, err := canonicalWatchStateIDs(ctx, s.pool, mediaItemIDs)
+	if err != nil {
+		return err
+	}
 	if len(mediaItemIDs) == 0 {
 		return nil
 	}
@@ -834,7 +886,7 @@ func (s *PostgresUserStore) ClearProgressBatch(ctx context.Context, profileID st
 	// DELETE-d the row unconditionally, so any non-default state must be
 	// cleared. Skip rows already in the target state (completed = FALSE AND
 	// position_seconds = 0) to avoid pointless writes.
-	_, err := s.pool.Exec(ctx, `
+	_, err = s.pool.Exec(ctx, `
 		UPDATE user_watch_progress
 		SET completed = FALSE, position_seconds = 0, updated_at = $4
 		WHERE user_id = $1 AND profile_id = $2
@@ -1328,11 +1380,15 @@ func queryEpisodeWatchCounts[K comparable](ctx context.Context, s *PostgresUserS
 }
 
 func (s *PostgresUserStore) UpdateProgressHints(ctx context.Context, profileID, mediaItemID string, hints userstore.VersionHints) error {
-	_, err := s.pool.Exec(ctx, `
+	targetID, err := canonicalWatchStateID(ctx, s.pool, mediaItemID)
+	if err != nil {
+		return err
+	}
+	_, err = s.pool.Exec(ctx, `
 		UPDATE user_watch_progress
 		SET last_file_id = $4, last_resolution = $5, last_hdr = $6, last_codec_video = $7, last_edition_key = $8
 		WHERE user_id = $1 AND profile_id = $2 AND media_item_id = $3`,
-		s.userID, profileID, mediaItemID,
+		s.userID, profileID, targetID,
 		hints.FileID, hints.Resolution, hints.HDR, hints.CodecVideo, nilIfEmpty(hints.EditionKey),
 	)
 	if err != nil {
@@ -1362,7 +1418,11 @@ func (s *PostgresUserStore) AddHistory(ctx context.Context, entry userstore.Watc
 	if err != nil {
 		return fmt.Errorf("parsing history watched_at: %w", err)
 	}
-	suppressed, err := s.historyIsHidden(ctx, entry.ProfileID, entry.MediaItemID, watchedAt)
+	targetID, err := canonicalWatchStateID(ctx, s.pool, entry.MediaItemID)
+	if err != nil {
+		return err
+	}
+	suppressed, err := s.historyIsHidden(ctx, entry.ProfileID, targetID, watchedAt)
 	if err != nil {
 		return err
 	}
@@ -1376,7 +1436,7 @@ func (s *PostgresUserStore) AddHistory(ctx context.Context, entry userstore.Watc
 	_, err = s.pool.Exec(ctx, `
 		INSERT INTO user_watch_history (id, user_id, profile_id, media_item_id, watched_at, duration_seconds, completed, source, watch_identity)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-		entry.ID, s.userID, entry.ProfileID, entry.MediaItemID,
+		entry.ID, s.userID, entry.ProfileID, targetID,
 		watchedAt, entry.DurationSeconds, entry.Completed, entry.Source,
 		string(identityJSON),
 	)
@@ -1390,9 +1450,7 @@ func (s *PostgresUserStore) AddVisibleHistory(ctx context.Context, entry usersto
 	return s.addVisibleHistory(ctx, s.pool, entry)
 }
 
-func (s *PostgresUserStore) addVisibleHistory(ctx context.Context, db interface {
-	QueryRow(context.Context, string, ...any) pgx.Row
-}, entry userstore.WatchHistoryEntry) (userstore.WatchHistoryEntry, error) {
+func (s *PostgresUserStore) addVisibleHistory(ctx context.Context, db watchStateRowQuerier, entry userstore.WatchHistoryEntry) (userstore.WatchHistoryEntry, error) {
 	if entry.ID == "" {
 		entry.ID = generateUUID()
 	}
@@ -1401,6 +1459,10 @@ func (s *PostgresUserStore) addVisibleHistory(ctx context.Context, db interface 
 	}
 	if entry.Source == "" {
 		entry.Source = userstore.WatchHistorySourceLegacy
+	}
+	targetID, err := canonicalWatchStateID(ctx, db, entry.MediaItemID)
+	if err != nil {
+		return entry, err
 	}
 	identityJSON, err := json.Marshal(entry.Identity)
 	if err != nil {
@@ -1427,7 +1489,7 @@ func (s *PostgresUserStore) addVisibleHistory(ctx context.Context, db interface 
 		ON CONFLICT (user_id, id) DO UPDATE SET completed = TRUE
 		WHERE NOT user_watch_history.completed AND EXCLUDED.completed
 		RETURNING watched_at`,
-		entry.ID, s.userID, entry.ProfileID, entry.MediaItemID, entry.WatchedAt,
+		entry.ID, s.userID, entry.ProfileID, targetID, entry.WatchedAt,
 		entry.DurationSeconds, entry.Completed, entry.Source, string(identityJSON),
 	).Scan(&watchedAt); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -1435,6 +1497,7 @@ func (s *PostgresUserStore) addVisibleHistory(ctx context.Context, db interface 
 		}
 		return entry, fmt.Errorf("adding visible history entry: %w", err)
 	}
+	entry.MediaItemID = targetID
 	entry.WatchedAt = timeToString(watchedAt)
 	return entry, nil
 }
@@ -1467,6 +1530,10 @@ func (s *PostgresUserStore) AddHistoryIfMissing(ctx context.Context, entry users
 	if err := lockImportedHistory(ctx, tx, s.userID, entry.ProfileID); err != nil {
 		return false, err
 	}
+	targetID, err := canonicalWatchStateID(ctx, tx, entry.MediaItemID)
+	if err != nil {
+		return false, err
+	}
 	// The watermark is compared at full precision ($5), so an import later in
 	// the same second as a removal is kept. It is stored at the whole second
 	// ($10), as imports always were, unless that second is at or before the
@@ -1491,7 +1558,7 @@ func (s *PostgresUserStore) AddHistoryIfMissing(ctx context.Context, entry users
             WHERE user_id = $2 AND profile_id = $3 AND media_item_id = $4
               AND watched_at >= $10::timestamptz AND watched_at < $10::timestamptz + interval '1 second'
         )`,
-		entry.ID, s.userID, entry.ProfileID, entry.MediaItemID, watchedAt, entry.DurationSeconds, entry.Completed, entry.Source, string(identityJSON),
+		entry.ID, s.userID, entry.ProfileID, targetID, watchedAt, entry.DurationSeconds, entry.Completed, entry.Source, string(identityJSON),
 		watchedAt.Truncate(time.Second))
 	if err != nil {
 		return false, fmt.Errorf("adding missing history: %w", err)
@@ -1752,6 +1819,13 @@ func (s *PostgresUserStore) RemoveHistoryItems(
 }
 
 func (s *PostgresUserStore) removeHistoryItems(ctx context.Context, tx pgx.Tx, profileID string, mediaItemIDs []string, removedAt time.Time) error {
+	mediaItemIDs, err := canonicalWatchStateIDs(ctx, tx, mediaItemIDs)
+	if err != nil {
+		return err
+	}
+	if len(mediaItemIDs) == 0 {
+		return nil
+	}
 	if _, err := tx.Exec(ctx, `
 		WITH target(media_item_id) AS (
 			SELECT unnest($3::text[])
@@ -1804,10 +1878,14 @@ func (s *PostgresUserStore) removeHistoryItems(ctx context.Context, tx pgx.Tx, p
 }
 
 func (s *PostgresUserStore) DeleteHistoryBySource(ctx context.Context, profileID string, mediaItemIDs []string, source userstore.WatchHistorySource) error {
+	mediaItemIDs, err := canonicalWatchStateIDs(ctx, s.pool, mediaItemIDs)
+	if err != nil {
+		return err
+	}
 	if len(mediaItemIDs) == 0 {
 		return nil
 	}
-	_, err := s.pool.Exec(ctx, `
+	_, err = s.pool.Exec(ctx, `
 		DELETE FROM user_watch_history
 		WHERE user_id = $1 AND profile_id = $2 AND source = $3 AND media_item_id = ANY($4::text[])`,
 		s.userID, profileID, source, mediaItemIDs,

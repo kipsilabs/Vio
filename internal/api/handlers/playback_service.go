@@ -676,7 +676,12 @@ func (h *PlaybackHandler) scrobblePauseTransitionV2(ctx context.Context, sess *p
 	if loadErr != nil || file == nil {
 		return
 	}
-	targetID := h.playbackProgressTarget(ctx, file)
+	targetID, targetErr := h.playbackProgressTarget(ctx, file)
+	if targetErr != nil {
+		slog.WarnContext(ctx, "failed to resolve canonical episode for pause scrobble", "component", "api",
+			"session", sess.ID, "error", targetErr)
+		return
+	}
 	if targetID == "" {
 		return
 	}

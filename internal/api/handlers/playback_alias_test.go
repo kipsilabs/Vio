@@ -28,8 +28,8 @@ func TestPlaybackProgressTargetCanonicalizesAliasEpisode(t *testing.T) {
 	handler := &PlaybackHandler{EpisodeAliasLookup: lookup}
 	file := &models.MediaFile{ContentID: "series-1", EpisodeID: alias}
 
-	if got := handler.playbackProgressTarget(context.Background(), file); got != canonical {
-		t.Fatalf("progress target = %q, want canonical episode %q", got, canonical)
+	if got, err := handler.playbackProgressTarget(context.Background(), file); err != nil || got != canonical {
+		t.Fatalf("progress target = %q, %v; want canonical episode %q", got, err, canonical)
 	}
 	if len(lookup.seen) != 1 || lookup.seen[0] != alias {
 		t.Fatalf("alias lookup = %v, want [%q]", lookup.seen, alias)
@@ -41,18 +41,18 @@ func TestPlaybackProgressTargetFallsBackToStoredIdentity(t *testing.T) {
 	handler := &PlaybackHandler{EpisodeAliasLookup: &fakeEpisodeAliasLookup{found: false}}
 	file := &models.MediaFile{ContentID: "series-1", EpisodeID: alias}
 
-	if got := handler.playbackProgressTarget(context.Background(), file); got != alias {
-		t.Fatalf("unmapped progress target = %q, want stored episode %q", got, alias)
+	if got, err := handler.playbackProgressTarget(context.Background(), file); err != nil || got != alias {
+		t.Fatalf("unmapped progress target = %q, %v; want stored episode %q", got, err, alias)
 	}
 }
 
-func TestPlaybackProgressTargetFallsBackOnLookupError(t *testing.T) {
+func TestPlaybackProgressTargetFailsOnLookupError(t *testing.T) {
 	alias := "episode-layout-2-1"
 	handler := &PlaybackHandler{EpisodeAliasLookup: &fakeEpisodeAliasLookup{err: errors.New("temporary lookup failure")}}
 	file := &models.MediaFile{ContentID: "series-1", EpisodeID: alias}
 
-	if got := handler.playbackProgressTarget(context.Background(), file); got != alias {
-		t.Fatalf("failed progress target = %q, want stored episode %q", got, alias)
+	if got, err := handler.playbackProgressTarget(context.Background(), file); err == nil || got != "" {
+		t.Fatalf("failed progress target = %q, %v; want a retryable error and no alias write", got, err)
 	}
 }
 
@@ -60,8 +60,42 @@ func TestPlaybackProgressTargetKeepsContentIdentityForMovie(t *testing.T) {
 	handler := &PlaybackHandler{EpisodeAliasLookup: &fakeEpisodeAliasLookup{canonical: "wrong", found: true}}
 	file := &models.MediaFile{ContentID: "movie-1"}
 
-	if got := handler.playbackProgressTarget(context.Background(), file); got != "movie-1" {
-		t.Fatalf("movie progress target = %q, want movie-1", got)
+	if got, err := handler.playbackProgressTarget(context.Background(), file); err != nil || got != "movie-1" {
+		t.Fatalf("movie progress target = %q, %v; want movie-1", got, err)
+	}
+}
+
+func TestPlaybackAliasLookupFailureWritesNoProgress(t *testing.T) {
+	store := newPlaybackTestStore(t)
+	alias := "episode-layout-2-1"
+	file := &models.MediaFile{
+		ID:         42,
+		ContentID:  "series-1",
+		EpisodeID:  alias,
+		FilePath:   "/media/series/S02E01.mkv",
+		Resolution: "1080p",
+		Duration:   1800,
+	}
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), testPlaybackFileResolver{file: file})
+	handler.StoreProvider = testUserStoreProvider{store: store}
+	handler.EpisodeAliasLookup = &fakeEpisodeAliasLookup{err: errors.New("temporary lookup failure")}
+	session := &playback.Session{
+		ID:          "alias-lookup-failure",
+		UserID:      1,
+		ProfileID:   "profile-1",
+		MediaFileID: 42,
+		Position:    600,
+	}
+
+	handler.persistProgress(context.Background(), session)
+	if progress, err := store.GetProgress(context.Background(), "profile-1", alias); err != nil || progress != nil {
+		t.Fatalf("alias progress = %v, %v; want none", progress, err)
+	}
+	if _, err := handler.persistStopAndHistory(context.Background(), session, ""); err == nil {
+		t.Fatal("persistStopAndHistory succeeded despite a failed identity lookup")
+	}
+	if history, err := store.ListHistory(context.Background(), "profile-1", 10, 0); err != nil || len(history) != 0 {
+		t.Fatalf("history = %#v, %v; want none", history, err)
 	}
 }
 
