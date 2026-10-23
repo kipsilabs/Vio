@@ -32,6 +32,13 @@
 ./internal/catalog TestEpisodeAliasExcludedFromCanonicalCatalogDB
 ./internal/scanner TestFileRepositoryFallsBackToAliasEpisodeFilesDB
 
+# Watch-count rollups count canonical episodes, including a canonical row whose
+# alias owns the only present file, without counting duplicate alias rows.
+./internal/userstore/pgstore TestEpisodeAliasWatchCountsCanonicalSeasonsDB
+
+# Play targets select canonical episodes and accept an alias-owned file.
+./internal/catalog TestPlayableTargetsResolveCanonicalAliasFilesDB
+
 # Same-day episodes sorted by air date keep series title and season/episode order on every query path.
 ./internal/catalog TestQueryEpisodeAirDateTiesPostgres
 
@@ -432,3 +439,7 @@
 # unlinked, partly linked, metadata-only, or file-backed season answers the same
 # set from the series count, season page, item episodes, and season detail.
 ./internal/api/handlers TestSeriesSeasonsKeepsMetadataOnlySeasons
+
+# A partly available season lists canonical metadata-only rows beside the
+# file-backed subset; fileless rows carry no files and alias rows stay hidden.
+./internal/api/handlers TestSeasonEpisodesMergePartialAvailabilityDB

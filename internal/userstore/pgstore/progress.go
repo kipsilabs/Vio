@@ -1207,9 +1207,11 @@ var _ userstore.SeriesEpisodeRollupStore = (*PostgresUserStore)(nil)
 // every requested series (a 50-series page of an episode-heavy library
 // expanded to 32k episode rows and ~65 sequential queries, ~17s measured).
 //
-// Semantics mirror the chunked path exactly:
-//   - episodes count when they are available (episode_libraries row — the same
-//     predicate as catalog's episode listings);
+// Semantics mirror the canonical episode path:
+//   - alias layout rows (episode_aliases.alias_episode_id) are excluded;
+//   - a canonical episode counts when it is available through an
+//     episode_libraries row or through a present file owned by one of its alias
+//     rows;
 //   - a progress row is visible unless hidden via user_history_hidden_items
 //     (updated_at <= hidden_before), matching ListProgressByMediaItems;
 //   - watched = visible completed progress OR a visible completed history row
@@ -1252,6 +1254,13 @@ func (s *PostgresUserStore) SeasonEpisodeWatchCounts(ctx context.Context, profil
 // episodeWatchCountsSQL is the rollup shared by the series and season
 // variants. Each selects its grouping column first, then appends its $3
 // parent filter and GROUP BY.
+//
+// The counted set is the canonical episode set: a row named by
+// episode_aliases.alias_episode_id is excluded, and a canonical episode is
+// available when it has an episode_libraries row or a present file owned by
+// one of its alias rows. That matches the catalog's canonical episode lists
+// while keeping file-backed canonical rows countable before their own
+// media_files row exists.
 const episodeWatchCountsSQL = `
 		       COUNT(*)::int,
 		       COUNT(*) FILTER (WHERE ws.watched)::int,
@@ -1278,7 +1287,21 @@ const episodeWatchCountsSQL = `
 		        ) AS watched,
 		        COALESCE(p.position_seconds, 0) > 0 AS resumable
 		) ws
-		WHERE EXISTS (SELECT 1 FROM episode_libraries el WHERE el.episode_id = e.content_id)`
+		WHERE NOT EXISTS (
+		    SELECT 1 FROM episode_aliases ea
+		    WHERE ea.alias_episode_id = e.content_id
+		)
+		  AND (
+		      EXISTS (SELECT 1 FROM episode_libraries el WHERE el.episode_id = e.content_id)
+		      OR EXISTS (
+		          SELECT 1
+		          FROM episode_aliases ea
+		          JOIN media_files mf ON mf.episode_id = ea.alias_episode_id
+		          WHERE ea.canonical_episode_id = e.content_id
+		            AND ea.alias_episode_id IS NOT NULL
+		            AND mf.missing_since IS NULL
+		      )
+		  )`
 
 // queryEpisodeWatchCounts runs one episodeWatchCountsSQL rollup and keys the
 // counts by its grouping column.
