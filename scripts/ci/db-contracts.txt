@@ -32,6 +32,10 @@
 ./internal/catalog TestEpisodeAliasExcludedFromCanonicalCatalogDB
 ./internal/scanner TestFileRepositoryFallsBackToAliasEpisodeFilesDB
 
+# A fileless episode still reaches the indexer search, and its release scope
+# inherits the series library instead of aborting on a missing provider source.
+./internal/api/handlers TestRefreshJobSearchesIndexersWithoutProviderSource
+
 # Watch-count rollups count canonical episodes, including a canonical row whose
 # alias owns the only present file, without counting duplicate alias rows.
 ./internal/userstore/pgstore TestEpisodeAliasWatchCountsCanonicalSeasonsDB

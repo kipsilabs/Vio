@@ -17,7 +17,7 @@ import (
 // TestEpisodeAliasExcludedFromCanonicalCatalogDB pins the read-time alias rule
 // for every canonical episode list and count: the row named by
 // episode_aliases.alias_episode_id never appears, and the canonical row does.
-func TestEpisodeAliasExcludedFromCanonicalCatalogDB(t *testing.T) {
+func TestEpisodeAliasExcludedFromCanonicalCatalogDB(t *testing.T) { //nolint:funlen,gocyclo // one DB fixture covers every canonical list and count path
 	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("SILO_TEST_DATABASE_URL is not set")
