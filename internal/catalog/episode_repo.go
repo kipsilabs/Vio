@@ -140,11 +140,85 @@ func (r *EpisodeRepository) RefreshDueSeriesAirDates(ctx context.Context, limit 
 	return len(seriesIDs), int(tag.RowsAffected()), nil
 }
 
-const episodeAvailabilityPredicate = `EXISTS (
+const episodeAvailabilityPredicate = `(EXISTS (
 		SELECT 1
 		FROM episode_libraries el
 		WHERE el.episode_id = episodes.content_id
+	) OR EXISTS (
+		SELECT 1
+		FROM episode_aliases ea
+		JOIN media_files mf
+		  ON mf.episode_id = ea.alias_episode_id
+		 AND mf.missing_since IS NULL
+		WHERE ea.canonical_episode_id = episodes.content_id
+	))`
+
+// episodeAvailabilityPredicateFor is episodeAvailabilityPredicate for a query
+// whose episodes table is aliased. The alias argument is package-owned.
+func episodeAvailabilityPredicateFor(episodesAlias string) string {
+	return fmt.Sprintf(`(EXISTS (
+		SELECT 1
+		FROM episode_libraries el
+		WHERE el.episode_id = %[1]s.content_id
+	) OR EXISTS (
+		SELECT 1
+		FROM episode_aliases ea
+		JOIN media_files mf
+		  ON mf.episode_id = ea.alias_episode_id
+		 AND mf.missing_since IS NULL
+		WHERE ea.canonical_episode_id = %[1]s.content_id
+	))`, episodesAlias)
+}
+
+// episodeAliasExclusionPredicate drops duplicate layout rows from canonical
+// catalog reads. episode_aliases.alias_episode_id names a concrete episode row
+// that exists only to carry another episode's files under a different season
+// layout; the mapping's canonical_episode_id is the row the catalog displays.
+// The alias row is not deleted and keeps its media_files, so file lookups fall
+// back to it at read time (see scanner.FileRepository).
+//
+// The outer episodes table must be unaliased. Queries that alias it use
+// episodeAliasExclusionPredicateFor instead.
+const episodeAliasExclusionPredicate = `NOT EXISTS (
+		SELECT 1
+		FROM episode_aliases ea
+		WHERE ea.alias_episode_id = episodes.content_id
 	)`
+
+// episodeAliasExclusionPredicateFor is episodeAliasExclusionPredicate for a
+// query whose episodes table is aliased. episodesAlias must be one of the
+// package's own fixed aliases, never caller input.
+func episodeAliasExclusionPredicateFor(episodesAlias string) string {
+	return fmt.Sprintf(`NOT EXISTS (
+		SELECT 1
+		FROM episode_aliases ea
+		WHERE ea.alias_episode_id = %s.content_id
+	)`, episodesAlias)
+}
+
+// canonicalEpisodeFileExistsSQL renders a present-file predicate for an
+// episode content-id expression such as episode.content_id. It accepts a direct
+// file or a present file owned by one of the episode's alias rows.
+// fileConditions reference the media_files alias mf and already include the
+// missing-file condition. episodeContentIDExpr is built from package-owned
+// aliases, never caller input.
+func canonicalEpisodeFileExistsSQL(episodeContentIDExpr, fileConditions string) string {
+	direct := fmt.Sprintf(`EXISTS (
+			SELECT 1
+			FROM media_files mf
+			WHERE mf.episode_id = %s
+			  AND %s
+		)`, episodeContentIDExpr, fileConditions)
+	aliased := fmt.Sprintf(`EXISTS (
+			SELECT 1
+			FROM episode_aliases ea
+			JOIN media_files mf ON mf.episode_id = ea.alias_episode_id
+			WHERE ea.canonical_episode_id = %s
+			  AND ea.alias_episode_id IS NOT NULL
+			  AND %s
+		)`, episodeContentIDExpr, fileConditions)
+	return "(" + direct + " OR " + aliased + ")"
+}
 
 // scanEpisode scans a single row into a *models.Episode.
 func scanEpisode(row pgx.Row) (*models.Episode, error) {
@@ -648,7 +722,9 @@ func (r *EpisodeRepository) GetBySeriesAndNumber(ctx context.Context, seriesID s
 
 // ListBySeriesAndAirDates retrieves provider episode rows for a series keyed by
 // air date. It intentionally does not use episodeAvailabilityPredicate because
-// callers use it to link files before episode_libraries rows exist.
+// callers use it to link files before episode_libraries rows exist. It does
+// exclude alias layout rows: the canonical row owns the episode identity, and
+// returning both sides of a mapping would make an air-date match ambiguous.
 func (r *EpisodeRepository) ListBySeriesAndAirDates(ctx context.Context, seriesID string, airDates []string) (map[string][]*models.Episode, error) {
 	result := make(map[string][]*models.Episode, len(airDates))
 	if len(airDates) == 0 {
@@ -677,6 +753,7 @@ func (r *EpisodeRepository) ListBySeriesAndAirDates(ctx context.Context, seriesI
 	query := `SELECT ` + episodeColumns + `
 		FROM episodes
 		WHERE series_id = $1
+		  AND ` + episodeAliasExclusionPredicate + `
 		  AND air_date IN (` + strings.Join(placeholders, ", ") + `)
 		ORDER BY air_date ASC, season_number ASC, episode_number ASC`
 
@@ -756,8 +833,10 @@ func (r *EpisodeRepository) ListBySeriesAndNumbers(
 }
 
 // HasFilesByIDs reports which of the given episodes are backed by at least one
-// live (non-missing) media file. Episodes absent from the result map have no
-// file — e.g. provider-metadata-only entries for unaired episodes.
+// live (non-missing) media file. A canonical episode whose own rows are absent
+// is reported when an alias row owns a live file. Episodes absent from the
+// result map have no file — e.g. provider-metadata-only entries for unaired
+// episodes.
 func (r *EpisodeRepository) HasFilesByIDs(ctx context.Context, contentIDs []string) (map[string]bool, error) {
 	result := make(map[string]bool, len(contentIDs))
 	if len(contentIDs) == 0 {
@@ -765,7 +844,13 @@ func (r *EpisodeRepository) HasFilesByIDs(ctx context.Context, contentIDs []stri
 	}
 	query := `SELECT episode_id FROM media_files
 		WHERE episode_id = ANY($1) AND missing_since IS NULL
-		GROUP BY episode_id`
+		UNION
+		SELECT ea.canonical_episode_id
+		FROM episode_aliases ea
+		JOIN media_files mf ON mf.episode_id = ea.alias_episode_id
+		WHERE ea.canonical_episode_id = ANY($1)
+		  AND ea.alias_episode_id IS NOT NULL
+		  AND mf.missing_since IS NULL`
 	rows, err := r.pool.Query(ctx, query, contentIDs)
 	if err != nil {
 		return nil, fmt.Errorf("checking episode file presence: %w", err)
@@ -787,6 +872,7 @@ func (r *EpisodeRepository) ListBySeries(ctx context.Context, seriesID string) (
 	query := `SELECT ` + episodeColumns + `
 		FROM episodes
 		WHERE series_id = $1
+		  AND ` + episodeAliasExclusionPredicate + `
 		  AND ` + episodeAvailabilityPredicate + `
 		ORDER BY season_number ASC, episode_number ASC`
 
@@ -808,6 +894,7 @@ func (r *EpisodeRepository) ListBySeriesIDs(ctx context.Context, seriesIDs []str
 	query := `SELECT ` + episodeColumns + `
 		FROM episodes
 		WHERE series_id = ANY($1)
+		  AND ` + episodeAliasExclusionPredicate + `
 		  AND ` + episodeAvailabilityPredicate + `
 		ORDER BY series_id ASC, season_number ASC, episode_number ASC`
 
@@ -845,10 +932,13 @@ func (r *EpisodeRepository) listIDsByParent(ctx context.Context, parentColumn st
 	}
 
 	// parentColumn comes only from the two fixed-column wrappers above.
-	// Completion is order-independent; preserve the same availability rule
-	// as ListBySeriesIDs and ListBySeasonIDs, including missing-file rows.
+	// Completion is order-independent; preserve the same canonical set and
+	// availability rule as ListBySeriesIDs and ListBySeasonIDs, including
+	// missing-file rows.
 	query := fmt.Sprintf(`SELECT content_id, %s FROM episodes
-		WHERE %s = ANY($1) AND %s`, parentColumn, parentColumn, episodeAvailabilityPredicate)
+		WHERE %s = ANY($1)
+		  AND %s
+		  AND %s`, parentColumn, parentColumn, episodeAliasExclusionPredicate, episodeAvailabilityPredicate)
 	rows, err := r.pool.Query(ctx, query, parentIDs)
 	if err != nil {
 		return nil, fmt.Errorf("listing episode ids by %s: %w", parentColumn, err)
@@ -887,7 +977,8 @@ func (r *EpisodeRepository) PartitionIDsBySeason(ctx context.Context, seasonID s
 func (r *EpisodeRepository) PartitionIDsBySeriesSeason(ctx context.Context, seriesID string, seasonNumber int) (withFile, fileless []string, err error) {
 	rows, err := r.pool.Query(ctx, fmt.Sprintf(`SELECT content_id, %s FROM episodes
 		WHERE series_id = $1 AND season_number = $2
-		ORDER BY episode_number ASC`, episodeAvailabilityPredicate), seriesID, seasonNumber)
+		  AND %s
+		ORDER BY episode_number ASC`, episodeAvailabilityPredicate, episodeAliasExclusionPredicate), seriesID, seasonNumber)
 	if err != nil {
 		return nil, nil, fmt.Errorf("partitioning episode ids by series and season: %w", err)
 	}
@@ -911,7 +1002,8 @@ func (r *EpisodeRepository) partitionIDs(ctx context.Context, parentColumn, pare
 	// parentColumn comes only from the two fixed-column wrappers above.
 	rows, err := r.pool.Query(ctx, fmt.Sprintf(`SELECT content_id, %s FROM episodes
 		WHERE %s = $1
-		ORDER BY season_number ASC, episode_number ASC`, episodeAvailabilityPredicate, parentColumn), parentID)
+		  AND %s
+		ORDER BY season_number ASC, episode_number ASC`, episodeAvailabilityPredicate, parentColumn, episodeAliasExclusionPredicate), parentID)
 	if err != nil {
 		return nil, nil, fmt.Errorf("partitioning episode ids by %s: %w", parentColumn, err)
 	}
@@ -938,6 +1030,7 @@ func (r *EpisodeRepository) buildListBySeriesGroupedBySeasonQuery(seriesID strin
 	sql := `SELECT ` + episodeColumns + `
 		FROM episodes
 		WHERE series_id = $1
+		  AND ` + episodeAliasExclusionPredicate + `
 		  AND ` + episodeAvailabilityPredicate + `
 		ORDER BY season_number ASC, episode_number ASC`
 	return sql, []any{seriesID}
@@ -976,6 +1069,7 @@ func (r *EpisodeRepository) ListSeasons(ctx context.Context, seriesID string) ([
 	query := `SELECT season_number, COUNT(*) AS episode_count
 		FROM episodes
 		WHERE series_id = $1
+		  AND ` + episodeAliasExclusionPredicate + `
 		  AND ` + episodeAvailabilityPredicate + `
 		GROUP BY season_number
 		ORDER BY season_number ASC`
@@ -1009,6 +1103,7 @@ func (r *EpisodeRepository) ListMetadataSeasons(ctx context.Context, seriesID st
 	query := `SELECT season_number, COUNT(*) AS episode_count
 		FROM episodes
 		WHERE series_id = $1
+		  AND ` + episodeAliasExclusionPredicate + `
 		GROUP BY season_number
 		ORDER BY season_number ASC`
 
@@ -1039,6 +1134,7 @@ func (r *EpisodeRepository) CountBySeries(ctx context.Context, seriesID string) 
 		`SELECT COUNT(*)
 		FROM episodes
 		WHERE series_id = $1
+		  AND `+episodeAliasExclusionPredicate+`
 		  AND `+episodeAvailabilityPredicate, seriesID,
 	).Scan(&count)
 	if err != nil {
@@ -1053,6 +1149,7 @@ func (r *EpisodeRepository) ListBySeason(ctx context.Context, seriesID string, s
 	query := `SELECT ` + episodeColumns + `
 		FROM episodes
 		WHERE series_id = $1 AND season_number = $2
+		  AND ` + episodeAliasExclusionPredicate + `
 		  AND ` + episodeAvailabilityPredicate + `
 		ORDER BY episode_number ASC`
 
@@ -1074,6 +1171,7 @@ func (r *EpisodeRepository) ListMetadataBySeason(ctx context.Context, seriesID s
 	query := `SELECT ` + episodeColumns + `
 		FROM episodes
 		WHERE series_id = $1 AND season_number = $2
+		  AND ` + episodeAliasExclusionPredicate + `
 		ORDER BY episode_number ASC`
 
 	rows, err := r.pool.Query(ctx, query, seriesID, seasonNum)
@@ -1099,6 +1197,7 @@ func (r *EpisodeRepository) ListAdjacentInSeries(ctx context.Context, seriesID s
 			FROM episodes
 			WHERE series_id = $1
 			  AND (season_number, episode_number) < ($2, $3)
+			  AND ` + episodeAliasExclusionPredicate + `
 			  AND ` + episodeAvailabilityPredicate + `
 			ORDER BY season_number DESC, episode_number DESC
 			LIMIT 1)
@@ -1108,12 +1207,14 @@ func (r *EpisodeRepository) ListAdjacentInSeries(ctx context.Context, seriesID s
 			WHERE series_id = $1
 			  AND season_number = $2
 			  AND episode_number = $3
+			  AND ` + episodeAliasExclusionPredicate + `
 			  AND ` + episodeAvailabilityPredicate + `)
 		UNION ALL
 		(SELECT ` + episodeColumns + `
 			FROM episodes
 			WHERE series_id = $1
 			  AND (season_number, episode_number) > ($2, $3)
+			  AND ` + episodeAliasExclusionPredicate + `
 			  AND ` + episodeAvailabilityPredicate + `
 			ORDER BY season_number ASC, episode_number ASC
 			LIMIT 1)
@@ -1135,6 +1236,7 @@ func (r *EpisodeRepository) ListBySeasonID(ctx context.Context, seasonID string)
 	query := `SELECT ` + episodeColumns + `
 		FROM episodes
 		WHERE season_id = $1
+		  AND ` + episodeAliasExclusionPredicate + `
 		  AND ` + episodeAvailabilityPredicate + `
 		ORDER BY episode_number ASC`
 
@@ -1156,6 +1258,7 @@ func (r *EpisodeRepository) ListBySeasonIDs(ctx context.Context, seasonIDs []str
 	query := `SELECT ` + episodeColumns + `
 		FROM episodes
 		WHERE season_id = ANY($1)
+		  AND ` + episodeAliasExclusionPredicate + `
 		  AND ` + episodeAvailabilityPredicate + `
 		ORDER BY season_id ASC, season_number ASC, episode_number ASC`
 
@@ -1278,7 +1381,7 @@ func (r *EpisodeRepository) UpdateStillIfSourceMatches(ctx context.Context, cont
 // ListUpcoming returns episodes premiered since the supplied UTC boundary,
 // including future metadata without a local file, within the viewer's scope.
 func (r *EpisodeRepository) ListUpcoming(ctx context.Context, since time.Time, seriesID, seasonID string, libraryID, limit, offset int, filter AccessFilter, includeTotal bool) ([]*models.Episode, int, error) {
-	conditions := []string{"mi.content_id = episodes.series_id", "mi.type = 'series'"}
+	conditions := []string{"mi.content_id = episodes.series_id", "mi.type = 'series'", episodeAliasExclusionPredicate}
 	args := []any{since}
 	index := 2
 	appendLibraryAccessConditions("mi.content_id", filter, &conditions, &args, &index)
@@ -1318,7 +1421,7 @@ func (r *EpisodeRepository) ListUpcoming(ctx context.Context, since time.Time, s
 // BrowseEpisodes applies catalog and profile predicates before counting and
 // paging, so a long series only hydrates the selected page.
 func (r *EpisodeRepository) BrowseEpisodes(ctx context.Context, seriesID, seasonID string, seasonNumber *int, startItemID string, filters BrowseFilters, access AccessFilter, includeTotal bool) ([]*models.Episode, int, error) {
-	conditions := []string{"e.series_id = $1", "EXISTS (SELECT 1 FROM episode_libraries el WHERE el.episode_id=e.content_id)"}
+	conditions := []string{"e.series_id = $1", episodeAvailabilityPredicateFor("e"), episodeAliasExclusionPredicateFor("e")}
 	args := []any{seriesID}
 	index := 2
 	appendLibraryAccessConditions("s.content_id", access, &conditions, &args, &index)
@@ -1401,7 +1504,7 @@ func (r *EpisodeRepository) BrowseEpisodes(ctx context.Context, seriesID, season
 // ListAvailableIDsBySeriesPage pages the same episode set used by completion
 // rollups without loading metadata or all episodes into memory.
 func (r *EpisodeRepository) ListAvailableIDsBySeriesPage(ctx context.Context, seriesID string, limit, offset int) ([]string, error) {
-	rows, err := r.pool.Query(ctx, `SELECT content_id FROM episodes WHERE series_id=$1 AND `+episodeAvailabilityPredicate+` ORDER BY content_id LIMIT $2 OFFSET $3`, seriesID, min(max(limit, 1), 1000), max(offset, 0))
+	rows, err := r.pool.Query(ctx, `SELECT content_id FROM episodes WHERE series_id=$1 AND `+episodeAliasExclusionPredicate+` AND `+episodeAvailabilityPredicate+` ORDER BY content_id LIMIT $2 OFFSET $3`, seriesID, min(max(limit, 1), 1000), max(offset, 0))
 	if err != nil {
 		return nil, err
 	}

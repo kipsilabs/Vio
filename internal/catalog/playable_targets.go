@@ -127,6 +127,123 @@ func (r *PlayableTargetResolver) Resolve(ctx context.Context, q PlayableTargetQu
 	return PlayableTargetIDs(targets), nil
 }
 
+// buildPlayableTargetsQuery renders the backend-neutral play-target statement.
+// fileConditions reference the media_files alias mf and already include the
+// missing-file condition.
+func buildPlayableTargetsQuery(fileConditions []string) string { //nolint:funlen // one SQL statement; splitting the CTEs would hide the selection flow
+	fileSQL := strings.Join(fileConditions, " AND ")
+	leafFileSQL := canonicalEpisodeFileExistsSQL("requested.content_id", fileSQL)
+	candidateFileSQL := canonicalEpisodeFileExistsSQL("candidate.content_id", fileSQL)
+	return fmt.Sprintf(`
+		WITH requested AS (
+			SELECT content_id, media_type, series_id, season_number, preferred_content_id, ord
+			FROM unnest($1::text[], $2::text[], $3::text[], $4::integer[], $5::text[]) WITH ORDINALITY
+			  AS requested(content_id, media_type, series_id, season_number, preferred_content_id, ord)
+		),
+		leaf_targets AS (
+			-- The movie and episode file checks are separate EXISTS branches
+			-- rather than one CASE expression: a CASE over both columns keeps
+			-- PostgreSQL from using either media_files index and forces a scan
+			-- of the whole table per requested card. An episode leaf also
+			-- accepts a present file owned by one of its alias rows.
+			SELECT requested.ord, requested.content_id, requested.content_id AS play_content_id,
+			       leaf_episode.season_number AS target_season
+			FROM requested
+			LEFT JOIN episodes leaf_episode
+			  ON requested.media_type = 'episode'
+			 AND leaf_episode.content_id = requested.content_id
+			WHERE (
+				requested.media_type = 'movie'
+				AND EXISTS (
+					SELECT 1
+					FROM media_files mf
+					WHERE mf.content_id = requested.content_id
+					  AND %[1]s
+				)
+			  ) OR (
+				requested.media_type = 'episode'
+				AND %[2]s
+			  )
+		),
+		candidate_episodes AS (
+			SELECT requested.ord, episode.content_id, episode.season_number, episode.episode_number
+			FROM requested
+			JOIN episodes episode
+			  ON requested.media_type = 'series'
+			 AND episode.series_id = requested.content_id
+			WHERE `+episodeAliasExclusionPredicateFor("episode")+`
+			UNION ALL
+			SELECT requested.ord, episode.content_id, episode.season_number, episode.episode_number
+			FROM requested
+			JOIN episodes episode
+			  ON requested.media_type = 'season'
+			 AND requested.series_id <> ''
+			 AND requested.season_number >= 0
+			 AND episode.series_id = requested.series_id
+			 AND episode.season_number = requested.season_number
+			WHERE `+episodeAliasExclusionPredicateFor("episode")+`
+			UNION ALL
+			SELECT requested.ord, episode.content_id, episode.season_number, episode.episode_number
+			FROM requested
+			JOIN seasons season
+			  ON requested.media_type = 'season'
+			 AND season.content_id = requested.content_id
+			 AND NOT (
+				requested.series_id <> ''
+				AND requested.season_number >= 0
+				AND requested.series_id = season.series_id
+				AND requested.season_number = season.season_number
+			 )
+			JOIN episodes episode
+			  ON episode.series_id = season.series_id
+			 AND episode.season_number = season.season_number
+			WHERE `+episodeAliasExclusionPredicateFor("episode")+`
+		),
+		available_candidates AS (
+			SELECT requested.ord,
+			       requested.content_id,
+			       candidate.content_id AS play_content_id,
+			       candidate.season_number,
+			       candidate.episode_number
+			FROM requested
+			JOIN candidate_episodes candidate ON candidate.ord = requested.ord
+			WHERE %[3]s
+		),
+		hint_targets AS (
+			-- A card's anchor hint is honored only when it is one of that
+			-- card's own available leaves, so it passes exactly the same file
+			-- conditions (library, enabled folder, quality rank) as any other
+			-- candidate and can never point outside the displayed item.
+			SELECT candidate.ord, candidate.content_id, candidate.play_content_id, candidate.season_number AS target_season
+			FROM available_candidates candidate
+			JOIN requested
+			  ON requested.ord = candidate.ord
+			 AND requested.preferred_content_id = candidate.play_content_id
+			UNION ALL
+			SELECT leaf.ord, leaf.content_id, leaf.play_content_id, leaf.target_season
+			FROM leaf_targets leaf
+			JOIN requested
+			  ON requested.ord = leaf.ord
+			 AND requested.preferred_content_id = leaf.play_content_id
+		),
+		resolved AS (
+			SELECT ord, play_content_id, TRUE AS is_hint, -1 AS season_number, -1 AS episode_number, target_season FROM hint_targets
+			UNION ALL
+			SELECT ord, play_content_id, FALSE, -1, -1, target_season FROM leaf_targets
+			UNION ALL
+			SELECT ord, play_content_id, FALSE, season_number, episode_number, season_number FROM available_candidates
+		)
+		SELECT ord, play_content_id, is_hint, target_season
+		FROM resolved
+		ORDER BY ord,
+		         is_hint DESC,
+		         CASE WHEN season_number = 0 THEN 1 ELSE 0 END,
+		         season_number,
+		         episode_number,
+		         play_content_id
+	`, fileSQL, leafFileSQL, candidateFileSQL)
+}
+
 // PlayableTargetIDs drops the seasons from ResolveTargets' answer.
 func PlayableTargetIDs(targets map[string]PlayableTarget) map[string]string {
 	ids := make(map[string]string, len(targets))
@@ -137,7 +254,7 @@ func PlayableTargetIDs(targets map[string]PlayableTarget) map[string]string {
 }
 
 // ResolveTargets is Resolve with each target's season attached.
-func (r *PlayableTargetResolver) ResolveTargets(ctx context.Context, q PlayableTargetQuery) (map[string]PlayableTarget, error) {
+func (r *PlayableTargetResolver) ResolveTargets(ctx context.Context, q PlayableTargetQuery) (map[string]PlayableTarget, error) { //nolint:funlen,gocyclo // backend-neutral and PostgreSQL winner paths retain their explicit candidate/hint branches
 	result := make(map[string]PlayableTarget)
 	if r == nil || r.pool == nil || q.UserID <= 0 || strings.TrimSpace(q.ProfileID) == "" {
 		return result, nil
@@ -218,120 +335,7 @@ func (r *PlayableTargetResolver) ResolveTargets(ctx context.Context, q PlayableT
 		}
 	}
 
-	query := fmt.Sprintf(`
-		WITH requested AS (
-			SELECT content_id, media_type, series_id, season_number, preferred_content_id, ord
-			FROM unnest($1::text[], $2::text[], $3::text[], $4::integer[], $5::text[]) WITH ORDINALITY
-			  AS requested(content_id, media_type, series_id, season_number, preferred_content_id, ord)
-		),
-		leaf_targets AS (
-			-- The movie and episode file checks are separate EXISTS branches
-			-- rather than one CASE expression: a CASE over both columns keeps
-			-- PostgreSQL from using either media_files index and forces a scan
-			-- of the whole table per requested card.
-			SELECT requested.ord, requested.content_id, requested.content_id AS play_content_id,
-			       leaf_episode.season_number AS target_season
-			FROM requested
-			LEFT JOIN episodes leaf_episode
-			  ON requested.media_type = 'episode'
-			 AND leaf_episode.content_id = requested.content_id
-			WHERE (
-				requested.media_type = 'movie'
-				AND EXISTS (
-					SELECT 1
-					FROM media_files mf
-					WHERE mf.content_id = requested.content_id
-					  AND %s
-				)
-			  ) OR (
-				requested.media_type = 'episode'
-				AND EXISTS (
-					SELECT 1
-					FROM media_files mf
-					WHERE mf.episode_id = requested.content_id
-					  AND %s
-				)
-			  )
-		),
-		candidate_episodes AS (
-			SELECT requested.ord, episode.content_id, episode.season_number, episode.episode_number
-			FROM requested
-			JOIN episodes episode
-			  ON requested.media_type = 'series'
-			 AND episode.series_id = requested.content_id
-			UNION ALL
-			SELECT requested.ord, episode.content_id, episode.season_number, episode.episode_number
-			FROM requested
-			JOIN episodes episode
-			  ON requested.media_type = 'season'
-			 AND requested.series_id <> ''
-			 AND requested.season_number >= 0
-			 AND episode.series_id = requested.series_id
-			 AND episode.season_number = requested.season_number
-			UNION ALL
-			SELECT requested.ord, episode.content_id, episode.season_number, episode.episode_number
-			FROM requested
-			JOIN seasons season
-			  ON requested.media_type = 'season'
-			 AND season.content_id = requested.content_id
-			 AND NOT (
-				requested.series_id <> ''
-				AND requested.season_number >= 0
-				AND requested.series_id = season.series_id
-				AND requested.season_number = season.season_number
-			 )
-			JOIN episodes episode
-			  ON episode.series_id = season.series_id
-			 AND episode.season_number = season.season_number
-		),
-		available_candidates AS (
-			SELECT requested.ord,
-			       requested.content_id,
-			       candidate.content_id AS play_content_id,
-			       candidate.season_number,
-			       candidate.episode_number
-			FROM requested
-			JOIN candidate_episodes candidate ON candidate.ord = requested.ord
-			WHERE EXISTS (
-				SELECT 1
-				FROM media_files mf
-				WHERE mf.episode_id = candidate.content_id
-				  AND %s
-			  )
-		),
-		hint_targets AS (
-			-- A card's anchor hint is honored only when it is one of that
-			-- card's own available leaves, so it passes exactly the same file
-			-- conditions (library, enabled folder, quality rank) as any other
-			-- candidate and can never point outside the displayed item.
-			SELECT candidate.ord, candidate.content_id, candidate.play_content_id, candidate.season_number AS target_season
-			FROM available_candidates candidate
-			JOIN requested
-			  ON requested.ord = candidate.ord
-			 AND requested.preferred_content_id = candidate.play_content_id
-			UNION ALL
-			SELECT leaf.ord, leaf.content_id, leaf.play_content_id, leaf.target_season
-			FROM leaf_targets leaf
-			JOIN requested
-			  ON requested.ord = leaf.ord
-			 AND requested.preferred_content_id = leaf.play_content_id
-		),
-		resolved AS (
-			SELECT ord, play_content_id, TRUE AS is_hint, -1 AS season_number, -1 AS episode_number, target_season FROM hint_targets
-			UNION ALL
-			SELECT ord, play_content_id, FALSE, -1, -1, target_season FROM leaf_targets
-			UNION ALL
-			SELECT ord, play_content_id, FALSE, season_number, episode_number, season_number FROM available_candidates
-		)
-		SELECT ord, play_content_id, is_hint, target_season
-		FROM resolved
-		ORDER BY ord,
-		         is_hint DESC,
-		         CASE WHEN season_number = 0 THEN 1 ELSE 0 END,
-		         season_number,
-		         episode_number,
-		         play_content_id
-	`, strings.Join(fileConditions, " AND "), strings.Join(fileConditions, " AND "), strings.Join(fileConditions, " AND "))
+	query := buildPlayableTargetsQuery(fileConditions)
 
 	candidates := make(map[string][]string, len(ids))
 	hints := make(map[string]string, len(ids))

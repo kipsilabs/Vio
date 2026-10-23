@@ -3378,18 +3378,24 @@ func clearSentinel(s string) string {
 }
 
 // seasonEpisodesForRead lists a season by its (series_id, season_number)
-// identity: available episodes first, then metadata episodes when none are
-// materialized. The selected slice feeds both detail counts and pending
-// translation detection.
+// identity. It merges the available episodes with every canonical metadata
+// episode, keyed by content ID, so a partly available season keeps its
+// metadata-only rows visible. Metadata-only rows render without a Play target.
+// The selected slice feeds both detail counts and pending translation
+// detection.
 func (s *DetailService) seasonEpisodesForRead(ctx context.Context, seriesID string, seasonNumber int) ([]*models.Episode, error) {
 	if s.episodeRepo == nil {
 		return nil, nil
 	}
-	episodes, err := s.episodeRepo.ListBySeason(ctx, seriesID, seasonNumber)
-	if err != nil || len(episodes) > 0 {
-		return episodes, err
+	available, err := s.episodeRepo.ListBySeason(ctx, seriesID, seasonNumber)
+	if err != nil {
+		return nil, err
 	}
-	return s.episodeRepo.ListMetadataBySeason(ctx, seriesID, seasonNumber)
+	metadata, err := s.episodeRepo.ListMetadataBySeason(ctx, seriesID, seasonNumber)
+	if err != nil {
+		return nil, err
+	}
+	return MergeSeasonEpisodesByContentID(available, metadata), nil
 }
 
 func (s *DetailService) buildSeasonDetail(ctx context.Context, season *models.Season, filter AccessFilter) (*ItemDetail, error) {

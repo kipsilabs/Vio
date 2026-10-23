@@ -322,6 +322,18 @@ func (s *VirtualCandidatesRefreshService) listVirtualCandidates(ctx context.Cont
 // dedup the indexer search against the releases the provider already has and
 // target enrichment at the candidates that were just persisted.
 func (s *VirtualCandidatesRefreshService) RefreshSources(ctx context.Context, contentID string, userID int, profileID string) ([]*models.MediaFile, []VirtualPlaybackStream, error) {
+	return s.refreshSources(ctx, contentID, userID, profileID, false)
+}
+
+// RefreshSourcesAllowEmpty is RefreshSources for the asynchronous refresh job.
+// A fileless episode can still be searched on the indexers even when it has no
+// provider source row yet; the job must not abort before that search. The
+// caller treats an empty source list as a successful provider result.
+func (s *VirtualCandidatesRefreshService) RefreshSourcesAllowEmpty(ctx context.Context, contentID string, userID int, profileID string) ([]*models.MediaFile, []VirtualPlaybackStream, error) {
+	return s.refreshSources(ctx, contentID, userID, profileID, true)
+}
+
+func (s *VirtualCandidatesRefreshService) refreshSources(ctx context.Context, contentID string, userID int, profileID string, allowEmpty bool) ([]*models.MediaFile, []VirtualPlaybackStream, error) {
 	if s == nil || s.ListFresh == nil || s.Persist == nil {
 		return nil, nil, apiError(http.StatusServiceUnavailable, "unavailable", "Virtual candidate refresh is unavailable")
 	}
@@ -330,6 +342,9 @@ func (s *VirtualCandidatesRefreshService) RefreshSources(ctx context.Context, co
 		return nil, nil, apiError(http.StatusInternalServerError, "internal_error", "Failed to load virtual candidates")
 	}
 	if len(sources) == 0 {
+		if allowEmpty {
+			return nil, nil, nil
+		}
 		return nil, nil, apiError(http.StatusUnprocessableEntity, "validation_failed", "The item has no virtual candidates to refresh.")
 	}
 	var streams []VirtualPlaybackStream
