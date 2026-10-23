@@ -5361,11 +5361,12 @@ func (r *FileRepository) ListOverlayFilesByContentIDs(ctx context.Context, conte
 // episode IDs, excluding files that are marked missing.
 //
 // A canonical episode row can be fileless when episode_aliases points at a
-// duplicate layout row that owns the files. For a requested episode with no
-// present file of its own, the files of its alias rows are returned under the
-// requested canonical key. Returned MediaFile.EpisodeID stays the stored alias
-// ID; only the result map key is canonical. Canonical files win, so a canonical
-// episode with its own files never also returns alias files.
+// duplicate layout row that owns the files. For a requested episode, the files
+// of its alias rows are returned under the requested canonical key in addition
+// to any direct files. Returned MediaFile.EpisodeID stays the stored alias ID;
+// only the result map key is canonical. Keeping both sets is deliberate: the
+// playability query can admit a canonical episode through either a direct file
+// or an alias file, so the file listing must offer the same candidate.
 func (r *FileRepository) ListByEpisodeIDs(ctx context.Context, episodeIDs []string) (map[string][]*models.MediaFile, error) {
 	grouped := make(map[string][]*models.MediaFile, len(episodeIDs))
 	if len(episodeIDs) == 0 {
@@ -5378,28 +5379,45 @@ func (r *FileRepository) ListByEpisodeIDs(ctx context.Context, episodeIDs []stri
 	}
 
 	seen := make(map[string]struct{}, len(episodeIDs))
-	fallbackIDs := make([]string, 0, len(episodeIDs))
+	canonicalIDs := make([]string, 0, len(episodeIDs))
 	for _, episodeID := range episodeIDs {
 		if _, ok := seen[episodeID]; ok {
 			continue
 		}
 		seen[episodeID] = struct{}{}
-		if len(direct[episodeID]) == 0 {
-			fallbackIDs = append(fallbackIDs, episodeID)
-		}
-	}
-	if len(fallbackIDs) == 0 {
-		return direct, nil
+		canonicalIDs = append(canonicalIDs, episodeID)
 	}
 
-	fallback, err := r.listAliasFilesByCanonicalEpisodeIDs(ctx, fallbackIDs)
+	fallback, err := r.listAliasFilesByCanonicalEpisodeIDs(ctx, canonicalIDs)
 	if err != nil {
 		return nil, err
 	}
 	for canonicalID, files := range fallback {
-		direct[canonicalID] = files
+		direct[canonicalID] = mergeEpisodeFiles(direct[canonicalID], files)
 	}
 	return direct, nil
+}
+
+func mergeEpisodeFiles(direct, alias []*models.MediaFile) []*models.MediaFile {
+	if len(alias) == 0 {
+		return direct
+	}
+	seen := make(map[int]struct{}, len(direct)+len(alias))
+	merged := make([]*models.MediaFile, 0, len(direct)+len(alias))
+	for _, files := range [][]*models.MediaFile{direct, alias} {
+		for _, file := range files {
+			if file == nil {
+				continue
+			}
+			if _, ok := seen[file.ID]; ok {
+				continue
+			}
+			seen[file.ID] = struct{}{}
+			merged = append(merged, file)
+		}
+	}
+	sort.Slice(merged, func(i, j int) bool { return merged[i].ID < merged[j].ID })
+	return merged
 }
 
 // listFilesByEpisodeIDs is the direct media_files lookup behind
@@ -5426,9 +5444,8 @@ func (r *FileRepository) listFilesByEpisodeIDs(ctx context.Context, episodeIDs [
 }
 
 // listAliasFilesByCanonicalEpisodeIDs resolves canonical episode IDs to the
-// files owned by their alias rows. It assumes the canonical rows themselves
-// have no present files; callers check that first. Files are ordered by ID
-// within each canonical episode, like GetByEpisodeID.
+// files owned by their alias rows. It returns alias files independently of
+// direct files; ListByEpisodeIDs merges and orders the two sets by file ID.
 func (r *FileRepository) listAliasFilesByCanonicalEpisodeIDs(ctx context.Context, canonicalEpisodeIDs []string) (map[string][]*models.MediaFile, error) {
 	grouped := make(map[string][]*models.MediaFile, len(canonicalEpisodeIDs))
 	mappingRows, err := r.pool.Query(ctx, `
@@ -5945,19 +5962,20 @@ func (r *FileRepository) ListBySeriesUnlinked(ctx context.Context, seriesContent
 // GetByEpisodeID returns all media files linked to the given episode ID.
 //
 // A canonical episode row can be fileless when episode_aliases points at a
-// duplicate layout row that owns the files. When the requested episode has no
-// present file of its own, this falls back to the present files of its alias
-// rows. Returned MediaFile.EpisodeID stays the stored alias ID so marker and
-// playback paths keep keying on the row that owns the file.
+// duplicate layout row that owns the files. This returns direct files plus the
+// present files of the episode's alias rows, merged by file ID. Returned
+// MediaFile.EpisodeID stays the stored alias ID so marker and playback paths
+// keep keying on the row that owns the file.
 func (r *FileRepository) GetByEpisodeID(ctx context.Context, episodeID string) ([]*models.MediaFile, error) {
 	files, err := r.listFilesByEpisodeID(ctx, episodeID)
 	if err != nil {
 		return nil, err
 	}
-	if len(files) > 0 {
-		return files, nil
+	aliasFiles, err := r.listAliasFilesByCanonicalEpisodeID(ctx, episodeID)
+	if err != nil {
+		return nil, err
 	}
-	return r.listAliasFilesByCanonicalEpisodeID(ctx, episodeID)
+	return mergeEpisodeFiles(files, aliasFiles), nil
 }
 
 // listFilesByEpisodeID is the direct media_files lookup behind
@@ -5976,8 +5994,7 @@ func (r *FileRepository) listFilesByEpisodeID(ctx context.Context, episodeID str
 }
 
 // listAliasFilesByCanonicalEpisodeID returns the present files owned by the
-// alias rows of one canonical episode, ordered by file ID. It is only called
-// when the canonical episode has no present file of its own.
+// alias rows of one canonical episode, ordered by file ID.
 func (r *FileRepository) listAliasFilesByCanonicalEpisodeID(ctx context.Context, canonicalEpisodeID string) ([]*models.MediaFile, error) {
 	query := `SELECT ` + fileColumns + ` FROM media_files
 		WHERE episode_id IN (

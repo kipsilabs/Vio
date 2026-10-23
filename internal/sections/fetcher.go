@@ -4141,11 +4141,14 @@ func (f *Fetcher) fetchReturningShows(ctx context.Context, s ResolvedSection, li
 		argIdx++
 	}
 
+	fileConditions := "mf.missing_since IS NULL" + fileScopeCond
+
 	conditions = append(conditions,
 		"mi.type = 'series'",
 		// A season newer than any the profile has watched (joined from
 		// `watched` below) arrived recently with at least one playable file
-		// in an in-scope library.
+		// in an in-scope library. Layout alias rows are not seasons of their
+		// own, and a canonical episode's file can live on its alias row.
 		fmt.Sprintf(`EXISTS (
 			SELECT 1
 			FROM episodes ne
@@ -4153,12 +4156,9 @@ func (f *Fetcher) fetchReturningShows(ctx context.Context, s ResolvedSection, li
 			  AND ne.season_number > 0
 			  AND ne.created_at > NOW() - make_interval(days => $3)
 			  AND ne.season_number > COALESCE(w.max_season, 0)
-			  AND EXISTS (
-				SELECT 1 FROM media_files mf
-				WHERE mf.episode_id = ne.content_id
-				  AND mf.missing_since IS NULL%s
-			  )
-		)`, fileScopeCond),
+			  AND %s
+			  AND %s
+		)`, catalog.EpisodeAliasExclusionSQL("ne.content_id"), catalog.CanonicalEpisodeFileExistsSQL("ne.content_id", fileConditions)),
 	)
 
 	fromClause, libConditions, libArgs, newArgIdx := buildLibraryScope(libraryID, libraryIDs, nil, filter.DisabledLibraryIDs, argIdx)
@@ -4192,9 +4192,11 @@ func (f *Fetcher) fetchReturningShows(ctx context.Context, s ResolvedSection, li
 			FROM episodes ord
 			WHERE ord.series_id = mi.content_id
 			  AND ord.created_at > NOW() - make_interval(days => $3)
+			  AND %s
 		) DESC NULLS LAST, mi.content_id ASC
 		LIMIT $%d`,
-		itemColumns("mi"), fromClause, strings.Join(conditions, " AND "), argIdx,
+		itemColumns("mi"), fromClause, strings.Join(conditions, " AND "),
+		catalog.EpisodeAliasExclusionSQL("ord.content_id"), argIdx,
 	)
 	args = append(args, limit)
 

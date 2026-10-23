@@ -156,18 +156,36 @@ const episodeAvailabilityPredicate = `(EXISTS (
 // episodeAvailabilityPredicateFor is episodeAvailabilityPredicate for a query
 // whose episodes table is aliased. The alias argument is package-owned.
 func episodeAvailabilityPredicateFor(episodesAlias string) string {
+	return EpisodeAvailabilitySQL(episodesAlias + ".content_id")
+}
+
+// EpisodeAvailabilitySQL is the canonical availability rule for an episode
+// content-id expression: a direct episode_libraries link, or a present file
+// owned by one of the episode's alias rows. The expression is built from
+// package-owned aliases or fixed column names, never caller input.
+func EpisodeAvailabilitySQL(episodeIDExpr string) string {
 	return fmt.Sprintf(`(EXISTS (
 		SELECT 1
 		FROM episode_libraries el
-		WHERE el.episode_id = %[1]s.content_id
+		WHERE el.episode_id = %[1]s
 	) OR EXISTS (
 		SELECT 1
 		FROM episode_aliases ea
 		JOIN media_files mf
 		  ON mf.episode_id = ea.alias_episode_id
 		 AND mf.missing_since IS NULL
-		WHERE ea.canonical_episode_id = %[1]s.content_id
-	))`, episodesAlias)
+		WHERE ea.canonical_episode_id = %[1]s
+	))`, episodeIDExpr)
+}
+
+// EpisodeAliasExclusionSQL drops an episode row that is only a layout alias.
+// The expression is a fixed column or a package-owned alias, never caller input.
+func EpisodeAliasExclusionSQL(episodeIDExpr string) string {
+	return fmt.Sprintf(`NOT EXISTS (
+		SELECT 1
+		FROM episode_aliases ea
+		WHERE ea.alias_episode_id = %s
+	)`, episodeIDExpr)
 }
 
 // episodeAliasExclusionPredicate drops duplicate layout rows from canonical
@@ -189,11 +207,7 @@ const episodeAliasExclusionPredicate = `NOT EXISTS (
 // query whose episodes table is aliased. episodesAlias must be one of the
 // package's own fixed aliases, never caller input.
 func episodeAliasExclusionPredicateFor(episodesAlias string) string {
-	return fmt.Sprintf(`NOT EXISTS (
-		SELECT 1
-		FROM episode_aliases ea
-		WHERE ea.alias_episode_id = %s.content_id
-	)`, episodesAlias)
+	return EpisodeAliasExclusionSQL(episodesAlias + ".content_id")
 }
 
 // canonicalEpisodeFileExistsSQL renders a present-file predicate for an
@@ -203,6 +217,14 @@ func episodeAliasExclusionPredicateFor(episodesAlias string) string {
 // missing-file condition. episodeContentIDExpr is built from package-owned
 // aliases, never caller input.
 func canonicalEpisodeFileExistsSQL(episodeContentIDExpr, fileConditions string) string {
+	return CanonicalEpisodeFileExistsSQL(episodeContentIDExpr, fileConditions)
+}
+
+// CanonicalEpisodeFileExistsSQL accepts a direct file or a present file owned
+// by one of the episode's alias rows. fileConditions reference the media_files
+// alias mf and already include the missing-file condition. The expression is
+// built from package-owned aliases, never caller input.
+func CanonicalEpisodeFileExistsSQL(episodeContentIDExpr, fileConditions string) string {
 	direct := fmt.Sprintf(`EXISTS (
 			SELECT 1
 			FROM media_files mf

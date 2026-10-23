@@ -3945,7 +3945,7 @@ func (h *PlaybackHandler) runPlaybackStartSideEffectsV3(task playbackStartSideEf
 	ctx := state.ctx
 
 	if !task.session.DisableProgressPersistence && h.WatchScrobbler != nil {
-		targetID := playbackProgressTarget(&task.file)
+		targetID := h.playbackProgressTarget(ctx, &task.file)
 		if targetID != "" {
 			event := h.scrobbleEventForSession(ctx, &task.session, targetID, float64(task.file.Duration), task.session.Position)
 			if err := h.WatchScrobbler.ScrobbleStart(ctx, event); err != nil {
@@ -5869,7 +5869,7 @@ func (h *PlaybackHandler) resumePositionV3(ctx context.Context, userID int, prof
 	if h.StoreProvider == nil {
 		return nil, nil
 	}
-	targetID := playbackProgressTarget(file)
+	targetID := h.playbackProgressTarget(ctx, file)
 	if targetID == "" {
 		return nil, nil
 	}

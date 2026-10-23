@@ -193,26 +193,35 @@ func (s *VirtualCandidatesRefreshJobService) firstFolderID(ctx context.Context, 
 		if lookup == nil {
 			continue
 		}
-		if files, err := lookup(ctx, contentID); err == nil {
-			for _, file := range files {
-				if file != nil && file.MediaFolderID > 0 {
-					return file.MediaFolderID
-				}
-			}
+		files, err := lookup(ctx, contentID)
+		if err != nil {
+			continue
+		}
+		if folderID := firstMediaFolderID(files); folderID > 0 {
+			return folderID
 		}
 	}
 	// A fileless episode has no row of its own to name a library. Its series
 	// still owns a virtual source row, so resolve the series and use that
 	// source's library for the indexer-release scope.
-	if s.ContentFiles != nil && s.Episodes != nil {
-		if episode, err := s.episodeFor(ctx, contentID); err == nil && episode != nil && episode.SeriesID != "" {
-			if files, err := s.ContentFiles(ctx, episode.SeriesID); err == nil {
-				for _, file := range files {
-					if file != nil && file.MediaFolderID > 0 {
-						return file.MediaFolderID
-					}
-				}
-			}
+	if s.ContentFiles == nil || s.Episodes == nil {
+		return 0
+	}
+	episode, err := s.episodeFor(ctx, contentID)
+	if err != nil || episode == nil || episode.SeriesID == "" {
+		return 0
+	}
+	files, err := s.ContentFiles(ctx, episode.SeriesID)
+	if err != nil {
+		return 0
+	}
+	return firstMediaFolderID(files)
+}
+
+func firstMediaFolderID(files []*models.MediaFile) int {
+	for _, file := range files {
+		if file != nil && file.MediaFolderID > 0 {
+			return file.MediaFolderID
 		}
 	}
 	return 0

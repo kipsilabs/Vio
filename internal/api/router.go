@@ -4894,6 +4894,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 					playbackHandler.ItemAccess = itemRepo
 					playbackHandler.ItemLookup = itemRepo
 					playbackHandler.EpisodeLookup = episodeRepo
+					playbackHandler.EpisodeAliasLookup = catalog.NewEpisodeAliasRepository(deps.DB)
 					playbackHandler.ExtraLookup = extraRepo
 					playbackHandler.OriginalLangLookup = itemRepo
 					playbackHandler.FFmpegLogSink = deps.FFmpegLogSink

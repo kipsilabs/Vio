@@ -32,6 +32,19 @@
 ./internal/catalog TestEpisodeAliasExcludedFromCanonicalCatalogDB
 ./internal/scanner TestFileRepositoryFallsBackToAliasEpisodeFilesDB
 
+# Episode catalog entries are written under the canonical id, aggregate alias
+# files, and track alias mapping changes.
+./internal/catalog TestEpisodeCatalogEntriesCanonicalDB
+
+# The generic episode relation and recently-added TV accept alias membership
+# and alias-owned files without surfacing alias rows as separate episodes.
+./internal/catalog TestEpisodeCatalogBaseRelationAliasDB
+./internal/catalog TestRecentTVAliasMembershipDB
+
+# Returning shows count a canonical episode whose only file is alias-owned and
+# do not treat an alias arrival as a new season.
+./internal/sections TestReturningShowsAliasDB
+
 # A fileless episode still reaches the indexer search, and its release scope
 # inherits the series library instead of aborting on a missing provider source.
 ./internal/api/handlers TestRefreshJobSearchesIndexersWithoutProviderSource
