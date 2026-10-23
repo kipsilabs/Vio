@@ -1097,6 +1097,100 @@ describe("useASSSubtitles bounded retry/watchdog policy", () => {
     }
   });
 
+  it("does not let timeupdate cancel an in-flight window refresh", async () => {
+    vi.useFakeTimers();
+    const state = vi.fn();
+    let calls = 0;
+    let refreshSignal: AbortSignal | undefined;
+    let resolveRefresh!: (response: Response) => void;
+    vi.mocked(fetch).mockImplementation((_input, init) => {
+      calls += 1;
+      if (calls === 1) return Promise.resolve(mockFetchResponse("[Script Info]"));
+      if (calls === 2) {
+        refreshSignal = init?.signal as AbortSignal;
+        return new Promise((resolve) => {
+          resolveRefresh = resolve;
+        });
+      }
+      return Promise.resolve(mockFetchResponse("[Script Info]"));
+    });
+    const videoRef = makeVideoRef(1);
+    const { unmount } = renderHook(() =>
+      useASSSubtitles(videoRef, [germanTrack], 6, false, 0, 0, state),
+    );
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(constructorOpts).toHaveLength(1);
+
+      // Start the replacement window at 590 and let timeupdate keep firing
+      // outside the old [0, 120] window while extraction is still pending.
+      await act(async () => {
+        videoRef.current!.currentTime = 590;
+        videoRef.current!.dispatchEvent(new Event("timeupdate"));
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(calls).toBe(2);
+      expect(refreshSignal?.aborted).toBe(false);
+      await act(async () => {
+        for (const time of [595, 600, 605]) {
+          videoRef.current!.currentTime = time;
+          videoRef.current!.dispatchEvent(new Event("timeupdate"));
+        }
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      // A normal playback tick must not supersede the request it is waiting on.
+      expect(refreshSignal?.aborted).toBe(false);
+      expect(calls).toBe(2);
+
+      await act(async () => {
+        resolveRefresh(mockFetchResponse("[Script Info]"));
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(constructorOpts).toHaveLength(2);
+      expect(state).toHaveBeenLastCalledWith("ready");
+    } finally {
+      unmount();
+      vi.useRealTimers();
+    }
+  });
+
+  it("reuses the last window across a transport rebuild", async () => {
+    const videoRef = makeVideoRef(1);
+    videoRef.current!.currentTime = 1021;
+    const { rerender } = renderHook(
+      ({ transportRevision }) =>
+        useASSSubtitles(
+          videoRef,
+          [germanTrack],
+          6,
+          false,
+          0,
+          0,
+          undefined,
+          undefined,
+          0,
+          "contain",
+          { x: 0, y: 0 },
+          0,
+          transportRevision,
+        ),
+      { initialProps: { transportRevision: 0 } },
+    );
+
+    await waitFor(() => expect(vi.mocked(fetch)).toHaveBeenCalledTimes(1));
+    expect(String(vi.mocked(fetch).mock.calls[0]![0])).toContain("position=1001&duration=120");
+
+    // The replacement stream attaches at time 0; the remembered window must
+    // keep the request at the real playhead instead of restarting at 0.
+    videoRef.current!.currentTime = 0;
+    rerender({ transportRevision: 1 });
+
+    await waitFor(() => expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2));
+    expect(String(vi.mocked(fetch).mock.calls[1]![0])).toContain("position=1001&duration=120");
+  });
+
   it("cancels an in-flight refresh on seek and restarts the attempt budget", async () => {
     vi.useFakeTimers();
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
