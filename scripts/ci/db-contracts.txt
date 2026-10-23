@@ -27,6 +27,11 @@
 # Series air-date sort keys advance when a known episode airs.
 ./internal/catalog TestSeriesAirDatesFollowEpisodesAndCalendarDB
 
+# Episode alias rows stay out of canonical episode lists and counts, and episode
+# file reads fall back to the alias row that owns the files.
+./internal/catalog TestEpisodeAliasExcludedFromCanonicalCatalogDB
+./internal/scanner TestFileRepositoryFallsBackToAliasEpisodeFilesDB
+
 # Same-day episodes sorted by air date keep series title and season/episode order on every query path.
 ./internal/catalog TestQueryEpisodeAirDateTiesPostgres
 
