@@ -101,7 +101,7 @@ func TestPlaybackAliasFileWritesCanonicalProgressAndHistory(t *testing.T) {
 	}
 
 	session.Position = 1790
-	if err := handler.persistStopAndHistory(context.Background(), session, ""); err != nil {
+	if _, err := handler.persistStopAndHistory(context.Background(), session, ""); err != nil {
 		t.Fatalf("persist stop and history: %v", err)
 	}
 	history, err := store.ListHistory(context.Background(), "profile-1", 10, 0)
