@@ -196,6 +196,70 @@ func TestEpisodeAliasExcludedFromCanonicalCatalogDB(t *testing.T) {
 		assertEpisodeIDs(t, "ListMetadataBySeason season 2", episodes, nil)
 	})
 
+	t.Run("ListIDsByParent", func(t *testing.T) {
+		seriesIDs, err := repo.ListIDsBySeriesIDs(ctx, []string{seriesID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := seriesIDs[seriesID]; !slices.Equal(got, canonicalOnly) {
+			t.Fatalf("ListIDsBySeriesIDs = %v, want %v", got, canonicalOnly)
+		}
+		seasonIDs, err := repo.ListIDsBySeasonIDs(ctx, []string{seasonOneID, seasonTwoID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := seasonIDs[seasonOneID]; !slices.Equal(got, canonicalOnly) {
+			t.Fatalf("ListIDsBySeasonIDs season 1 = %v, want %v", got, canonicalOnly)
+		}
+		if got := seasonIDs[seasonTwoID]; len(got) != 0 {
+			t.Fatalf("ListIDsBySeasonIDs season 2 = %v, want no alias rows", got)
+		}
+	})
+
+	t.Run("PartitionIDs", func(t *testing.T) {
+		assertPartition := func(t *testing.T, label string, withFile, fileless []string) {
+			t.Helper()
+			if !slices.Equal(withFile, canonicalOnly) || len(fileless) != 0 {
+				t.Fatalf("%s = withFile %v fileless %v, want canonical only", label, withFile, fileless)
+			}
+		}
+		withFile, fileless, err := repo.PartitionIDsBySeries(ctx, seriesID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertPartition(t, "PartitionIDsBySeries", withFile, fileless)
+
+		withFile, fileless, err = repo.PartitionIDsBySeason(ctx, seasonOneID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertPartition(t, "PartitionIDsBySeason", withFile, fileless)
+
+		withFile, fileless, err = repo.PartitionIDsBySeriesSeason(ctx, seriesID, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertPartition(t, "PartitionIDsBySeriesSeason", withFile, fileless)
+	})
+
+	t.Run("ListAdjacentInSeries", func(t *testing.T) {
+		episodes, err := repo.ListAdjacentInSeries(ctx, seriesID, 1, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertEpisodeIDs(t, "ListAdjacentInSeries", episodes, canonicalOnly)
+	})
+
+	t.Run("ListAvailableIDsBySeriesPage", func(t *testing.T) {
+		ids, err := repo.ListAvailableIDsBySeriesPage(ctx, seriesID, 10, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(ids, canonicalOnly) {
+			t.Fatalf("ListAvailableIDsBySeriesPage = %v, want %v", ids, canonicalOnly)
+		}
+	})
+
 	t.Run("CountBySeries", func(t *testing.T) {
 		count, err := repo.CountBySeries(ctx, seriesID)
 		if err != nil {

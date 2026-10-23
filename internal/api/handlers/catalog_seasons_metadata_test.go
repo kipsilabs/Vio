@@ -127,8 +127,9 @@ func TestSeriesSeasonsKeepsMetadataOnlySeasons(t *testing.T) {
 
 	// A series without season rows exercises the synthetic season list. Season
 	// 1 has ten metadata episodes but only two materialized, so its count must
-	// be the available two; season 2 has two metadata episodes and no files, so
-	// its count must be the metadata total.
+	// be all ten canonical episodes (two playable, eight fileless); season 2 has
+	// two metadata episodes and no files, so its count is also the metadata
+	// total.
 	syntheticPrefix := prefix + "-synthetic"
 	if _, err := pool.Exec(ctx, `INSERT INTO media_items(content_id,type,title,genres,default_metadata_language) VALUES($1,'series','Synthetic Series Without Season Rows','{}','en')`, syntheticPrefix); err != nil {
 		t.Fatal(err)
@@ -314,8 +315,8 @@ func TestSeriesSeasonsKeepsMetadataOnlySeasons(t *testing.T) {
 	for _, season := range synthetic {
 		syntheticCounts[season.SeasonNumber] = season.EpisodeCount
 	}
-	if syntheticCounts[1] != 2 {
-		t.Fatalf("synthetic season 1 episode_count = %d, want 2 available episodes", syntheticCounts[1])
+	if syntheticCounts[1] != 10 {
+		t.Fatalf("synthetic season 1 episode_count = %d, want 10 canonical episodes", syntheticCounts[1])
 	}
 	if syntheticCounts[2] != 2 {
 		t.Fatalf("synthetic season 2 episode_count = %d, want 2 metadata episodes", syntheticCounts[2])
@@ -324,15 +325,22 @@ func TestSeriesSeasonsKeepsMetadataOnlySeasons(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if syntheticSeason1.EpisodeCount != 2 {
-		t.Fatalf("synthetic season 1 page count = %d, want 2", syntheticSeason1.EpisodeCount)
+	if syntheticSeason1.EpisodeCount != 10 {
+		t.Fatalf("synthetic season 1 page count = %d, want 10", syntheticSeason1.EpisodeCount)
 	}
 	syntheticSeason1Episodes, err := h.SeasonEpisodes(ctx, viewer, syntheticPrefix, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(syntheticSeason1Episodes) != 2 {
-		t.Fatalf("synthetic season 1 episodes = %d, want 2", len(syntheticSeason1Episodes))
+	if len(syntheticSeason1Episodes) != 10 {
+		t.Fatalf("synthetic season 1 episodes = %d, want 10", len(syntheticSeason1Episodes))
+	}
+	for i, view := range syntheticSeason1Episodes {
+		fields := episodeWireFields(t, view)
+		_, hasFiles := fields["files"]
+		if wantFiles := i < 2; hasFiles != wantFiles {
+			t.Fatalf("synthetic season 1 episode[%d] files key present = %v, want %v", i, hasFiles, wantFiles)
+		}
 	}
 	syntheticSeason2, err := h.SeriesSeason(ctx, viewer, syntheticPrefix, 2)
 	if err != nil {
@@ -412,7 +420,7 @@ func TestSeriesSeasonsKeepsMetadataOnlySeasons(t *testing.T) {
 		{"metadata-only detail", seasonID(3), 1, 1, 1, false},
 		{"linked metadata-only detail", seasonID(5), 1, 1, 1, false},
 		{"unlinked materialized detail", seasonID(4), 2, 0, 0, true},
-		{"synthetic available detail", syntheticPrefix + "-S01", 1, 0, 1, false},
+		{"synthetic partially available detail", syntheticPrefix + "-S01", 1, 0, 9, false},
 		{"synthetic metadata-only detail", syntheticPrefix + "-S02", 1, 0, 1, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -462,9 +470,12 @@ func TestSeriesSeasonsKeepsMetadataOnlySeasons(t *testing.T) {
 
 	// Synthetic seasons have no season row; watched/unwatched must still
 	// resolve their displayed available or metadata episodes.
-	for _, tc := range []struct{ name, id string }{
-		{"synthetic available season", syntheticPrefix + "-S01"},
-		{"synthetic metadata-only season", syntheticPrefix + "-S02"},
+	for _, tc := range []struct {
+		name, id string
+		want     int
+	}{
+		{"synthetic partially available season", syntheticPrefix + "-S01", 10},
+		{"synthetic metadata-only season", syntheticPrefix + "-S02", 2},
 	} {
 		t.Run(tc.name+" mutation", func(t *testing.T) {
 			if _, err := items.SetWatchedState(authCtx, userID, profileID, tc.id, true, authFilter); err != nil {
@@ -474,8 +485,8 @@ func TestSeriesSeasonsKeepsMetadataOnlySeasons(t *testing.T) {
 			if err != nil {
 				t.Fatalf("synthetic detail after watched mutation: %v", err)
 			}
-			if marked.SeasonUserData == nil || marked.SeasonUserData.WatchedCount != 2 || !marked.SeasonUserData.Played {
-				t.Fatalf("synthetic season watched state = %+v, want both episodes watched", marked.SeasonUserData)
+			if marked.SeasonUserData == nil || marked.SeasonUserData.WatchedCount != tc.want || !marked.SeasonUserData.Played {
+				t.Fatalf("synthetic season watched state = %+v, want %d episodes watched", marked.SeasonUserData, tc.want)
 			}
 			if _, err := items.SetWatchedState(authCtx, userID, profileID, tc.id, false, authFilter); err != nil {
 				t.Fatalf("mark synthetic season unwatched: %v", err)

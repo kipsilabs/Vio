@@ -476,19 +476,26 @@ func (h *CatalogResourceHandler) ItemEpisodes(ctx context.Context, v ItemViewer,
 }
 
 // seasonEpisodesForRead lists a season's episodes by its (series_id,
-// season_number) identity: the library-available set first, then every
-// metadata episode when nothing is materialized. Every season read uses this
-// one rule, so the series count, season page, item episodes, and season detail
-// describe the same set. The season row's season_id is only a link hint; the
-// unique (series_id, season_number, episode_number) key makes the number the
-// stronger identity, and reading by number keeps unlinked-but-available
-// episodes (and their files) when a season is only partly linked.
+// season_number) identity. It merges the library-available set with every
+// canonical metadata episode, keyed by content ID, so a partly available season
+// keeps its metadata-only rows visible alongside file-backed ones. A
+// metadata-only row serializes without files and therefore has no Play target.
+// Every season read uses this one rule, so the series count, season page, item
+// episodes, and season detail describe the same set. The season row's season_id
+// is only a link hint; the unique (series_id, season_number, episode_number) key
+// makes the number the stronger identity, and reading by number keeps
+// unlinked-but-available episodes (and their files) when a season is only
+// partly linked.
 func (h *ItemsHandler) seasonEpisodesForRead(ctx context.Context, seriesID string, seasonNumber int) ([]*models.Episode, error) {
-	episodes, err := h.episodeRepo.ListBySeason(ctx, seriesID, seasonNumber)
-	if err != nil || len(episodes) > 0 {
-		return episodes, err
+	available, err := h.episodeRepo.ListBySeason(ctx, seriesID, seasonNumber)
+	if err != nil {
+		return nil, err
 	}
-	return h.episodeRepo.ListMetadataBySeason(ctx, seriesID, seasonNumber)
+	metadata, err := h.episodeRepo.ListMetadataBySeason(ctx, seriesID, seasonNumber)
+	if err != nil {
+		return nil, err
+	}
+	return catalog.MergeSeasonEpisodesByContentID(available, metadata), nil
 }
 
 // episodesAllLinkedToSeason reports whether every listed episode carries this
@@ -588,17 +595,14 @@ func (h *CatalogResourceHandler) seriesSeasons(ctx context.Context, v ItemViewer
 			// Season metadata is the list's authority: a virtual series keeps
 			// every metadata season after its candidates stop being
 			// materialized, so never drop a row because its library has no
-			// episodes yet. Metadata episode counts fill in the seasons the
-			// availability rollup has no entries for; a fully materialized
-			// series skips that query altogether.
+			// episodes yet. Every available episode is also a metadata episode
+			// of the same season, so the metadata total is the merged canonical
+			// count a partly available season page lists.
 			var metadataCounts map[int]int
-			for _, season := range seasons {
-				if episodeCounts[season.SeasonNumber] == 0 {
-					metadataCounts, err = h.items.metadataSeasonCounts(ctx, id)
-					if err != nil {
-						return nil, apiError(http.StatusInternalServerError, "internal_error", failed)
-					}
-					break
+			if h.items.episodeRepo != nil {
+				metadataCounts, err = h.items.metadataSeasonCounts(ctx, id)
+				if err != nil {
+					return nil, apiError(http.StatusInternalServerError, "internal_error", failed)
 				}
 			}
 
@@ -616,15 +620,16 @@ func (h *CatalogResourceHandler) seriesSeasons(ctx context.Context, v ItemViewer
 			}
 			resp := make([]seasonResponse, 0, len(seasons))
 			for _, s := range seasons {
-				episodeCount := episodeCounts[s.SeasonNumber]
+				episodeCount := metadataCounts[s.SeasonNumber]
 				if episodeCount == 0 {
-					episodeCount = metadataCounts[s.SeasonNumber]
+					episodeCount = episodeCounts[s.SeasonNumber]
 				}
-				// A metadata-only season has no availability rollup entry. Fold
-				// the metadata episodes so its card reports the same historical
-				// progress as its season page and episode list.
+				// The availability rollup covers only the file-backed subset.
+				// A metadata-only or partly available season folds the merged
+				// episode set so its card reports the same progress as its
+				// season page and episode list.
 				seasonUserData := userData[s.SeasonNumber]
-				if episodeCounts[s.SeasonNumber] == 0 && episodeCount > 0 {
+				if h.items.episodeRepo != nil && episodeCount > episodeCounts[s.SeasonNumber] {
 					episodes, err := h.items.episodeRepo.ListMetadataBySeason(ctx, id, s.SeasonNumber)
 					if err != nil {
 						return nil, apiError(http.StatusInternalServerError, "internal_error", failed)
@@ -655,20 +660,17 @@ func (h *CatalogResourceHandler) seriesSeasons(ctx context.Context, v ItemViewer
 		if s.SeasonNumber == 0 {
 			title = specialsSeasonTitle
 		}
-		// Match the season page and episode reads: count the available set
-		// first, and fall back to the metadata total only when nothing is
-		// materialized. Use the same listed set for progress, so a synthetic
-		// season cannot report different counts or user data than its page.
-		episodes, err := h.items.episodeRepo.ListBySeason(ctx, id, s.SeasonNumber)
+		// Match the season page and episode reads: every available episode is
+		// also a metadata episode of this season, so the metadata list is the
+		// merged canonical set. Use it for both the count and progress, so a
+		// partly available synthetic season cannot report different values
+		// than its page.
+		episodes, err := h.items.episodeRepo.ListMetadataBySeason(ctx, id, s.SeasonNumber)
 		if err != nil {
 			return nil, apiError(http.StatusInternalServerError, "internal_error", failed)
 		}
 		episodeCount := len(episodes)
 		if episodeCount == 0 {
-			episodes, err = h.items.episodeRepo.ListMetadataBySeason(ctx, id, s.SeasonNumber)
-			if err != nil {
-				return nil, apiError(http.StatusInternalServerError, "internal_error", failed)
-			}
 			episodeCount = s.EpisodeCount
 		}
 		resp = append(resp, seasonResponse{
