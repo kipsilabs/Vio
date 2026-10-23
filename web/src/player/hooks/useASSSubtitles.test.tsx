@@ -1322,6 +1322,81 @@ describe("useASSSubtitles bounded retry/watchdog policy", () => {
     expect(String(vi.mocked(fetch).mock.calls[1]![0])).toContain("position=0&duration=120");
   });
 
+  it("starts from the playhead when a same-identity rebuild follows a failed fresh run", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const state = vi.fn();
+    const requested: string[] = [];
+    vi.mocked(fetch).mockImplementation((input, init) => {
+      requested.push(String(input));
+      // Generation 0 commits [1001, 1121].
+      if (requested.length === 1) return abortAwareResponse("[Script Info]", init);
+      // The first run of generation 1 starts at the real playhead (0) and fails
+      // before it can commit anything.
+      if (requested.length === 2) {
+        return Promise.resolve(new Response(null, { status: 500 }));
+      }
+      return abortAwareResponse("[Script Info]", init);
+    });
+    const videoRef = makeVideoRef(1);
+    videoRef.current!.currentTime = 1021;
+    const { rerender } = renderHook(
+      ({
+        sourceGeneration,
+        transportRevision,
+      }: {
+        sourceGeneration: number;
+        transportRevision: number;
+      }) =>
+        useASSSubtitles(
+          videoRef,
+          [germanTrack],
+          6,
+          false,
+          0,
+          0,
+          state,
+          undefined,
+          sourceGeneration,
+          "contain",
+          { x: 0, y: 0 },
+          0,
+          transportRevision,
+        ),
+      { initialProps: { sourceGeneration: 0, transportRevision: 0 } },
+    );
+
+    try {
+      await waitFor(() => expect(state).toHaveBeenLastCalledWith("ready"));
+      expect(requested).toHaveLength(1);
+      expect(requested[0]).toContain("position=1001&duration=120");
+
+      // The source identity changes at the start of the timeline. The fresh
+      // run correctly requests the zero window and fails before committing, so
+      // generation 1 owns no window.
+      videoRef.current!.currentTime = 0;
+      await act(async () => {
+        rerender({ sourceGeneration: 1, transportRevision: 0 });
+      });
+      await waitFor(() => expect(requested).toHaveLength(2));
+      expect(requested[1]).toContain("position=0&duration=120");
+      await waitFor(() => expect(state).toHaveBeenLastCalledWith("error"));
+
+      // A transport rebuild of the same URL and generation must not certify
+      // generation 0's committed window as reusable: the run that started here
+      // never committed, so the request stays at the playhead instead of
+      // jumping to the stale 1001 window and disabling completion reconciliation.
+      await act(async () => {
+        rerender({ sourceGeneration: 1, transportRevision: 1 });
+      });
+      await waitFor(() => expect(requested).toHaveLength(3));
+      expect(requested[2]).toContain("position=0&duration=120");
+      await waitFor(() => expect(state).toHaveBeenLastCalledWith("ready"));
+      expect(constructorOpts).toHaveLength(2);
+    } finally {
+      error.mockRestore();
+    }
+  });
+
   it("rechecks the playhead when a window lands after the position left it", async () => {
     const state = vi.fn();
     const videoRef = makeVideoRef(1);
