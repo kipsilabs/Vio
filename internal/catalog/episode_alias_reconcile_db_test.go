@@ -15,7 +15,7 @@ import (
 // reconciliation must move state for the mappings it inserts. The merge is
 // deterministic across multiple aliases, existing canonical state, and
 // profiles, and a second reconciliation changes nothing.
-func TestEpisodeAliasReconcileRepairsWatchStateDB(t *testing.T) { //nolint:funlen // one fixture pins migration, merge policy, idempotence, and profile scope
+func TestEpisodeAliasReconcileRepairsWatchStateDB(t *testing.T) { //nolint:funlen,gocyclo // one fixture pins migration, merge policy, idempotence, and profile scope
 	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("SILO_TEST_DATABASE_URL is not set")

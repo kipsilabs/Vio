@@ -22,7 +22,7 @@ import (
 // same series: the second must wait on the trigger's advisory lock, then fail
 // the identity check after the first commits. Without the lock in the trigger,
 // the unique indexes do not conflict and both rows commit.
-func TestEpisodeAliasIdentityGuardSerializesConcurrentWritesPostgres(t *testing.T) {
+func TestEpisodeAliasIdentityGuardSerializesConcurrentWritesPostgres(t *testing.T) { //nolint:funlen,gocyclo // one DB test covers lock wait, conflict, and a non-conflicting series
 	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("SILO_TEST_DATABASE_URL is not set")

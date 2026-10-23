@@ -16,7 +16,7 @@ import (
 // boundary: a caller that still carries a cached alias id may write progress,
 // hints, resume state, and history, and every row lands on the canonical
 // episode. No alias-keyed watch state is created.
-func TestPostgresWatchStateWritesCanonicalEpisodeDB(t *testing.T) {
+func TestPostgresWatchStateWritesCanonicalEpisodeDB(t *testing.T) { //nolint:funlen,gocyclo // one DB fixture covers progress, hints, resume, history, and profile separation
 	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("SILO_TEST_DATABASE_URL is not set")
