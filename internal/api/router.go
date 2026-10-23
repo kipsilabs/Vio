@@ -1253,6 +1253,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 		}
 		if deps.DB != nil {
 			progressHandler.LibraryLookup = catalog.NewLibraryItemRepository(deps.DB)
+			progressHandler.EpisodeAliasLookup = catalog.NewEpisodeAliasRepository(deps.DB)
 		}
 		collectionHandler = handlers.NewCollectionHandler(deps.UserStoreProvider)
 		if deps.DB != nil {

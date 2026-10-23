@@ -1898,9 +1898,17 @@ func (h *PlaybackHandler) persistProgress(ctx context.Context, session *playback
 	}
 
 	file, err := h.progressPersistenceFile(ctx, session)
-	targetID := h.playbackProgressTarget(ctx, file)
-	if err != nil || targetID == "" {
+	if err != nil {
 		return // file not found or not yet matched to a media item
+	}
+	targetID, err := h.playbackProgressTarget(ctx, file)
+	if err != nil {
+		slog.ErrorContext(ctx, "failed to resolve canonical episode for progress", "component", "api",
+			"session", session.ID, "error", err)
+		return
+	}
+	if targetID == "" {
+		return
 	}
 
 	store, err := h.StoreProvider.ForUser(ctx, session.UserID)
@@ -1957,7 +1965,12 @@ func (h *PlaybackHandler) persistStopAndHistory(ctx context.Context, session *pl
 		// replayable instead of marking a missing history row complete.
 		return watchstate.PlaybackStopResult{}, err
 	}
-	targetID := h.playbackProgressTarget(ctx, file)
+	targetID, targetErr := h.playbackProgressTarget(ctx, file)
+	if targetErr != nil {
+		// Leave the stop replayable: a transient identity lookup must not
+		// record the play under the hidden alias row.
+		return watchstate.PlaybackStopResult{}, targetErr
+	}
 	if targetID == "" {
 		return watchstate.PlaybackStopResult{}, nil
 	}
@@ -2029,10 +2042,11 @@ func (h *PlaybackHandler) scrobbleEventForStoppedSession(
 		if err != nil || file == nil {
 			return watchsync.ScrobbleEvent{}, false
 		}
-		mediaItemID = h.playbackProgressTarget(ctx, file)
-		if mediaItemID == "" {
+		targetID, targetErr := h.playbackProgressTarget(ctx, file)
+		if targetErr != nil || targetID == "" {
 			return watchsync.ScrobbleEvent{}, false
 		}
+		mediaItemID = targetID
 		duration = float64(file.Duration)
 		position = session.Position
 	}
@@ -2056,7 +2070,10 @@ func (h *PlaybackHandler) buildAdminHistoryEntry(
 		return nil, fmt.Errorf("loading media file: %w", err)
 	}
 
-	targetID := h.playbackProgressTarget(ctx, file)
+	targetID, err := h.playbackProgressTarget(ctx, file)
+	if err != nil {
+		return nil, err
+	}
 	profileName := session.ProfileID
 	if h.StoreProvider != nil {
 		store, storeErr := h.StoreProvider.ForUser(ctx, session.UserID)
@@ -2337,8 +2354,11 @@ func (h *PlaybackHandler) finalizeSessionAbort(ctx context.Context, session *pla
 
 	if h.WatchScrobbler != nil && h.fileResolver != nil {
 		if file, err := h.loadFileByPreferredID(ctx, requestedMediaFileID(session), session.MediaFileID); err == nil && file != nil {
-			targetID := h.playbackProgressTarget(ctx, file)
-			if targetID != "" {
+			targetID, targetErr := h.playbackProgressTarget(ctx, file)
+			if targetErr != nil {
+				slog.WarnContext(ctx, "failed to resolve canonical episode for abort scrobble", "component", "api",
+					"session", session.ID, "error", targetErr)
+			} else if targetID != "" {
 				event := h.scrobbleEventForSession(ctx, session, targetID, float64(file.Duration), session.Position)
 				if err := h.WatchScrobbler.ScrobblePause(ctx, event); err != nil {
 					slog.WarnContext(ctx, "failed to queue watch provider abort scrobble", "component", "api", "session", session.ID, "error", err)
@@ -2431,24 +2451,26 @@ func playbackFileTarget(file *models.MediaFile) string {
 // A media file can belong to a layout-alias episode row; progress, history,
 // resume, and scrobbles must use the canonical episode that the catalog
 // displays, while file-scoped work keeps the stored EpisodeID.
-func (h *PlaybackHandler) playbackProgressTarget(ctx context.Context, file *models.MediaFile) string {
+//
+// A failed lookup is returned, never replaced by the stored alias id: writing
+// watch state under the hidden identity is exactly the bug this boundary
+// prevents, so the caller must retry instead.
+func (h *PlaybackHandler) playbackProgressTarget(ctx context.Context, file *models.MediaFile) (string, error) {
 	targetID := playbackFileTarget(file)
 	if targetID == "" || file == nil || file.EpisodeID == "" || h == nil || h.EpisodeAliasLookup == nil {
-		return targetID
+		return targetID, nil
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	canonicalID, found, err := h.EpisodeAliasLookup.ResolveCanonicalEpisodeIDByAlias(ctx, file.EpisodeID)
 	if err != nil {
-		slog.WarnContext(ctx, "failed to resolve canonical episode for progress", "component", "api",
-			"episode_id", file.EpisodeID, "file_id", file.ID, "error", err)
-		return targetID
+		return "", fmt.Errorf("resolving canonical episode %s for watch state: %w", file.EpisodeID, err)
 	}
 	if found && canonicalID != "" {
-		return canonicalID
+		return canonicalID, nil
 	}
-	return targetID
+	return targetID, nil
 }
 
 func (h *PlaybackHandler) persistSeriesPlaybackPreference(
@@ -2641,8 +2663,11 @@ func (h *PlaybackHandler) HandleUpdateProgress(w http.ResponseWriter, r *http.Re
 		h.reconcilePendingAudioStartup(r.Context(), sessionID)
 		if !sess.DisableProgressPersistence && h.WatchScrobbler != nil && wasPaused != sess.IsPaused {
 			if file, loadErr := h.loadFileByPreferredID(r.Context(), requestedMediaFileID(sess), sess.MediaFileID); loadErr == nil && file != nil {
-				targetID := h.playbackProgressTarget(r.Context(), file)
-				if targetID != "" {
+				targetID, targetErr := h.playbackProgressTarget(r.Context(), file)
+				if targetErr != nil {
+					slog.WarnContext(r.Context(), "failed to resolve canonical episode for heartbeat scrobble", "component", "api",
+						"session", sessionID, "error", targetErr)
+				} else if targetID != "" {
 					event := h.scrobbleEventForSession(r.Context(), sess, targetID, float64(file.Duration), sess.Position)
 					if sess.IsPaused {
 						if err := h.WatchScrobbler.ScrobblePause(r.Context(), event); err != nil {

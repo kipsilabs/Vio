@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/config"
@@ -48,10 +49,38 @@ func parseEpisodeAliasCommand(args []string) (envFile, seriesID string, dryRun b
 	flags.SetOutput(io.Discard)
 	env := flags.String("env", ".env", "path to .env bootstrap file")
 	dry := flags.Bool("dry-run", false, "report candidates without writing")
-	if parseErr := flags.Parse(args[1:]); parseErr != nil || flags.NArg() != 1 || flags.Arg(0) == "" {
+	// The flag package stops at the first positional argument, and the
+	// documented form puts --dry-run after <series-id>. Move flags ahead of
+	// the positional argument so both orders parse identically; an unknown
+	// flag still reaches the flag set and fails there.
+	flagArgs, positional := splitEpisodeAliasArgs(args[1:])
+	if parseErr := flags.Parse(append(flagArgs, positional...)); parseErr != nil || flags.NArg() != 1 || flags.Arg(0) == "" {
 		return "", "", false, errors.New(episodeAliasCommandUsage)
 	}
 	return *env, flags.Arg(0), *dry, nil
+}
+
+// splitEpisodeAliasArgs separates flags (and the separate value of -env) from
+// positional arguments so the flag set can parse a trailing --dry-run. A "--"
+// terminator stays in the flag list, so the flag set still treats everything
+// after it as positional.
+func splitEpisodeAliasArgs(args []string) (flagArgs, positional []string) {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "-env" || arg == "--env":
+			flagArgs = append(flagArgs, arg)
+			if i+1 < len(args) {
+				i++
+				flagArgs = append(flagArgs, args[i])
+			}
+		case strings.HasPrefix(arg, "-") && arg != "-":
+			flagArgs = append(flagArgs, arg)
+		default:
+			positional = append(positional, arg)
+		}
+	}
+	return flagArgs, positional
 }
 
 func writeEpisodeAliasReport(out io.Writer, result *catalog.EpisodeAliasReconcileResult) {
