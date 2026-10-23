@@ -45,11 +45,12 @@ silo episode-aliases reconcile <series-id> --dry-run
 silo episode-aliases reconcile <series-id>
 ```
 
-The reconciler locks one series, matches episode rows by exact title and air
-date, and only proposes a mapping when exactly one fileless canonical row and
-one or more file-backed layout rows exist. Ambiguous groups are reported and
-left untouched. The dry run writes nothing and prints the candidate and skipped
-groups for review.
+Flags may precede or follow the series ID; `-env <file>` selects the bootstrap
+file in either position. The reconciler locks one series, matches episode rows
+by exact title and air date, and only proposes a mapping when exactly one
+fileless canonical row and one or more file-backed layout rows exist. Ambiguous
+groups are reported and left untouched. The dry run writes nothing and prints
+the candidate and skipped groups for review.
 
 ## Rollout
 
@@ -60,6 +61,9 @@ do not know about aliases, so nodes can disagree about episode identity and
 write incompatible progress. Upgrade every node, then run reconciliation.
 
 The migration is additive and keeps both episode rows. Rolling back the binary
-is safe. Dropping `episode_aliases` discards the mappings and breaks running
-binaries that read them; do not run its `Down` migration while new binaries are
-serving.
+is safe while `episode_aliases` is empty. Once aliases are populated, an old
+binary still starts and ignores the table, but it serves the alias-unaware
+episode identity, so it no longer agrees with new binaries about which episode
+owns progress and files. Dropping `episode_aliases`, or running its `Down`
+migration, discards the mappings, hides the identity link, and breaks running
+binaries that read the table; do not run `Down` while new binaries are serving.

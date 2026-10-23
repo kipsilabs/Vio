@@ -6,12 +6,14 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/access"
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
 	evt "github.com/Silo-Server/silo-server/internal/events"
 	"github.com/Silo-Server/silo-server/internal/userstore"
+	"github.com/Silo-Server/silo-server/internal/watchstate"
 )
 
 // progressClockSkew bounds how far ahead of server time a client-supplied
@@ -54,11 +56,15 @@ type ProgressLibraryLookup interface {
 
 // ProgressHandler handles watch progress and sync endpoints.
 type ProgressHandler struct {
-	storeProvider   userstore.UserStoreProvider
-	LibraryLookup   ProgressLibraryLookup
-	SettingsRepo    PlaybackSettingsReader
-	EventsHub       *evt.Hub
-	signalsNotifier SignalsChangedNotifier
+	storeProvider userstore.UserStoreProvider
+	LibraryLookup ProgressLibraryLookup
+	SettingsRepo  PlaybackSettingsReader
+	EventsHub     *evt.Hub
+	// EpisodeAliasLookup resolves a client's cached layout-alias episode id to
+	// the canonical episode before access checks and writes. Optional; when
+	// present a lookup failure is a retryable per-item error.
+	EpisodeAliasLookup watchstate.EpisodeAliasLookup
+	signalsNotifier    SignalsChangedNotifier
 }
 
 // NewProgressHandler creates a new ProgressHandler.
@@ -420,11 +426,24 @@ func (h *ProgressHandler) SyncProgress(ctx context.Context, userID int, profileI
 		return nil, apiError(http.StatusInternalServerError, "internal_error", "Failed to access user store")
 	}
 
+	// Resolve every target to its canonical episode before access checks and
+	// writes. A client's cached alias id must not create progress under the
+	// hidden identity canonical reads ignore. A failed resolution is a
+	// retryable per-item error, never a silent write to the submitted id.
+	canonicalIDs := make([]string, len(updates))
+	resolveErrors := make([]error, len(updates))
+	for i, item := range updates {
+		if strings.TrimSpace(item.MediaItemID) == "" {
+			continue
+		}
+		canonicalIDs[i], resolveErrors[i] = watchstate.CanonicalEpisodeTarget(ctx, h.EpisodeAliasLookup, item.MediaItemID)
+	}
+
 	// Resolve visibility before writes using the same viewer scope as progress reads.
 	var checkedIDs []string
-	for _, item := range updates {
-		if item.CheckAccess {
-			checkedIDs = append(checkedIDs, item.MediaItemID)
+	for i, item := range updates {
+		if item.CheckAccess && resolveErrors[i] == nil && canonicalIDs[i] != "" {
+			checkedIDs = append(checkedIDs, canonicalIDs[i])
 		}
 	}
 	var accessible map[string]bool
@@ -458,15 +477,16 @@ func (h *ProgressHandler) SyncProgress(ctx context.Context, userID int, profileI
 	results := make([]syncProgressResultItem, 0, len(updates))
 	hadSuccessfulUpdate := false
 
-	for _, item := range updates {
+	for i, item := range updates {
 		result := syncProgressResultItem{
 			MediaItemID: item.MediaItemID,
 		}
-
-		if item.CheckAccess && !accessible[item.MediaItemID] {
+		if resolveErrors[i] != nil {
+			slog.WarnContext(ctx, "failed to resolve canonical episode for progress sync", "component", "api",
+				"profile_id", profileID, "media_item_id", item.MediaItemID, "error", resolveErrors[i])
 			result.Status = syncProgressStatusError
-			result.Error = "catalog item not found"
-			result.FailureStatus = http.StatusNotFound
+			result.Error = "catalog item lookup failed"
+			result.FailureStatus = http.StatusServiceUnavailable
 			results = append(results, result)
 			continue
 		}
@@ -479,6 +499,14 @@ func (h *ProgressHandler) SyncProgress(ctx context.Context, userID int, profileI
 		if item.invalidUpdatedAt {
 			result.Status = syncProgressStatusError
 			result.Error = "updated_at must be RFC3339"
+			results = append(results, result)
+			continue
+		}
+		canonicalID := canonicalIDs[i]
+		if item.CheckAccess && !accessible[canonicalID] {
+			result.Status = syncProgressStatusError
+			result.Error = "catalog item not found"
+			result.FailureStatus = http.StatusNotFound
 			results = append(results, result)
 			continue
 		}
@@ -499,12 +527,12 @@ func (h *ProgressHandler) SyncProgress(ctx context.Context, userID int, profileI
 			}
 			pos, completed, skip := userstore.ResolveProgressState(item.Position, item.Duration, thresholds)
 			if !skip {
-				_, updateErr = store.SetProgressIfNewer(ctx, profileID, item.MediaItemID, pos, item.Duration, completed, eventAt)
+				_, updateErr = store.SetProgressIfNewer(ctx, profileID, canonicalID, pos, item.Duration, completed, eventAt)
 			}
 		case item.ForceOverwrite:
-			updateErr = store.SetProgress(ctx, profileID, item.MediaItemID, item.Position, item.Duration, thresholds)
+			updateErr = store.SetProgress(ctx, profileID, canonicalID, item.Position, item.Duration, thresholds)
 		default:
-			updateErr = store.UpdateProgress(ctx, profileID, item.MediaItemID, item.Position, item.Duration, thresholds)
+			updateErr = store.UpdateProgress(ctx, profileID, canonicalID, item.Position, item.Duration, thresholds)
 		}
 
 		if updateErr != nil {
@@ -520,11 +548,8 @@ func (h *ProgressHandler) SyncProgress(ctx context.Context, userID int, profileI
 
 	if hadSuccessfulUpdate {
 		notifySignalsChanged(ctx, h.signalsNotifier, userID, profileID)
-		for i, item := range updates {
-			if item.CheckAccess && results[i].Status != "ok" {
-				continue
-			}
-			if item.MediaItemID == "" {
+		for i := range updates {
+			if results[i].Status != "ok" || canonicalIDs[i] == "" {
 				continue
 			}
 			publishUserStateEvent(
@@ -532,7 +557,7 @@ func (h *ProgressHandler) SyncProgress(ctx context.Context, userID int, profileI
 				h.EventsHub,
 				userID,
 				profileID,
-				item.MediaItemID,
+				canonicalIDs[i],
 				"",
 				"progress",
 				userStateEventState{},

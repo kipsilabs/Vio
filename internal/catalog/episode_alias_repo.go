@@ -231,6 +231,14 @@ func (r *EpisodeAliasRepository) ReconcileSeries(ctx context.Context, seriesID s
 	if err := applyReconcileCandidates(ctx, tx, seriesID, result.Candidates); err != nil {
 		return nil, err
 	}
+	// Apply the same repair the canonical-progress migration uses. The migration
+	// normally runs before aliases exist, so this is the path that moves state
+	// for a mapping created later; running it on every reconcile also repairs
+	// mappings created by an earlier apply and keeps the two paths identical.
+	if _, err := tx.Exec(ctx,
+		`SELECT public.canonicalize_episode_watch_state($1)`, seriesID); err != nil {
+		return nil, fmt.Errorf("repairing canonical watch state for series %s: %w", seriesID, err)
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("committing episode alias reconciliation: %w", err)
 	}
