@@ -13,7 +13,11 @@ import (
 	"github.com/Silo-Server/silo-server/internal/database"
 )
 
-const episodeAliasCommandUsage = "usage: silo episode-aliases reconcile [-env .env] [--dry-run] <series-id>"
+const (
+	episodeAliasReconcileCommand = "reconcile"
+	episodeAliasEnvFlag          = "-env"
+	episodeAliasCommandUsage     = "usage: silo episode-aliases " + episodeAliasReconcileCommand + " [" + episodeAliasEnvFlag + " .env] [--dry-run] <series-id>"
+)
 
 // runEpisodeAliasCommand is the supported, auditable activation path for
 // episode aliases. It reads only the database and writes only a bounded set of
@@ -42,10 +46,10 @@ func runEpisodeAliasCommand(ctx context.Context, args []string, out io.Writer) e
 }
 
 func parseEpisodeAliasCommand(args []string) (envFile, seriesID string, dryRun bool, err error) {
-	if len(args) == 0 || args[0] != "reconcile" {
+	if len(args) == 0 || args[0] != episodeAliasReconcileCommand {
 		return "", "", false, errors.New(episodeAliasCommandUsage)
 	}
-	flags := flag.NewFlagSet("episode-aliases reconcile", flag.ContinueOnError)
+	flags := flag.NewFlagSet("episode-aliases "+episodeAliasReconcileCommand, flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	env := flags.String("env", ".env", "path to .env bootstrap file")
 	dry := flags.Bool("dry-run", false, "report candidates without writing")
@@ -68,7 +72,7 @@ func splitEpisodeAliasArgs(args []string) (flagArgs, positional []string) {
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		switch {
-		case arg == "-env" || arg == "--env":
+		case arg == episodeAliasEnvFlag || arg == "--env":
 			flagArgs = append(flagArgs, arg)
 			if i+1 < len(args) {
 				i++

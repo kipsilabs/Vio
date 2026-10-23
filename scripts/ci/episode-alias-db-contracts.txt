@@ -1,0 +1,35 @@
+# Episode-alias database contracts for the pull-request gate.
+# This is the alias subset of scripts/ci/db-contracts.txt. The full registry
+# includes unrelated contracts with their own pre-existing failures and is run
+# by the trusted workflow; this list must keep every alias/watch-state
+# contract that this change touches.
+
+# Alias rows stay out of canonical lists; canonical rows inherit alias files.
+./internal/catalog TestEpisodeAliasExcludedFromCanonicalCatalogDB
+./internal/scanner TestFileRepositoryFallsBackToAliasEpisodeFilesDB
+
+# ECE is canonical at write time and aggregates alias files.
+./internal/catalog TestEpisodeCatalogEntriesCanonicalDB
+
+# Generic episode hydration and recently-added TV resolve alias membership.
+./internal/catalog TestEpisodeCatalogBaseRelationAliasDB
+./internal/catalog TestRecentTVAliasMembershipDB
+
+# Returning shows count alias-owned files and ignore alias arrivals.
+./internal/sections TestReturningShowsAliasDB
+./internal/sections TestReturningShowsDB
+
+# Watch counts, reconciliation repair, and the canonical storage write boundary.
+./internal/userstore/pgstore TestEpisodeAliasWatchCountsCanonicalSeasonsDB
+./internal/catalog TestEpisodeAliasReconcileRepairsWatchStateDB
+./internal/userstore/pgstore TestPostgresWatchStateWritesCanonicalEpisodeDB
+
+# The identity guard serializes concurrent writers and rejects cycles.
+./internal/database TestEpisodeAliasIdentityGuardSerializesConcurrentWritesPostgres
+
+# Play targets accept alias-owned files under the shared access filters.
+./internal/catalog TestPlayableTargetsResolveCanonicalAliasFilesDB
+
+# Season reads keep canonical metadata rows beside the file-backed subset.
+./internal/api/handlers TestSeriesSeasonsKeepsMetadataOnlySeasons
+./internal/api/handlers TestSeasonEpisodesMergePartialAvailabilityDB

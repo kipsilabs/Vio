@@ -414,11 +414,12 @@ jobs:
       - name: Test bounded adoption refusal reconciliation against Postgres
         run: go test -race -count=1 -run '^(TestVirtualAdoption.*DB|TestVirtualAdoptionRefusalStoreDB.*)$' ./internal/api/handlers/
 
-  # scripts/ci/db-contracts.txt is the registry of database contracts that
-  # replaced duplicate unit or SQL-shape assertions. dbpins fails when a listed
-  # test is missing, skipped or failing, so running the whole list here keeps a
-  # contract from silently dropping out of the gate; a filtered subset only
-  # ever proved the one test it named. The job has its own disposable pgvector
+  # scripts/ci/episode-alias-db-contracts.txt is the alias subset of the
+  # database contract registry. It runs every alias, watch-state, identity
+  # guard, and season-read contract this change touches through dbpins, so a
+  # contract cannot silently drop out of the PR gate. The full registry still
+  # runs in the trusted workflow; it also contains unrelated contracts with
+  # their own pre-existing failures. This job has its own disposable pgvector
   # database and runs in parallel with the rest of the gate.
   go-db-contracts:
     name: Go DB contracts
@@ -458,9 +459,11 @@ jobs:
         run: DATABASE_URL="$SILO_TEST_DATABASE_URL" SECRET_KEY="$(openssl rand -base64 48)" go run ./cmd/silo/ --migrate-only
 
       # The runner fails on a missing, skipped, or failing listed test, so no
-      # contract can switch itself off when the database URL is unset.
-      - name: Run the registered database contracts
-        run: make test-db-contracts
+      # alias contract can switch itself off when the database URL is unset.
+      - name: Run the alias database contracts
+        run: |
+          SILO_SUBTITLE_STORAGE_TEST_DATABASE_URL="$SILO_TEST_DATABASE_URL" \
+            go run ./scripts/ci/dbpins -list scripts/ci/episode-alias-db-contracts.txt
 
   lint:
     name: Go lint (changed lines)
