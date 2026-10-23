@@ -676,7 +676,7 @@ func (h *PlaybackHandler) scrobblePauseTransitionV2(ctx context.Context, sess *p
 	if loadErr != nil || file == nil {
 		return
 	}
-	targetID := playbackProgressTarget(file)
+	targetID := h.playbackProgressTarget(ctx, file)
 	if targetID == "" {
 		return
 	}
