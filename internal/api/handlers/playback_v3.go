@@ -2233,6 +2233,15 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	// teaching its session model the split first.
 	if isVirtualPlaybackFile(requestedFile) {
 		requestedCatalogFileID := requestedFile.ID
+		// A detail-page read may have scheduled a detached probe for this row.
+		// The start path is about to resolve and probe the same provider bytes;
+		// cancel that duplicate before it races the transport and writes a
+		// second evidence snapshot.
+		playbackContentID := requestedFile.ContentID
+		if requestedFile.EpisodeID != "" {
+			playbackContentID = requestedFile.EpisodeID
+		}
+		h.cancelDefaultFileProbe(playbackContentID, requestedFile.ID)
 		if offered := strings.TrimSpace(req.OfferedVirtualURI); offered != "" {
 			if virtualResultCandidateID(offered) == "" ||
 				virtualPlaybackNeutralKey(offered) != virtualPlaybackNeutralKey(requestedFile.FilePath) {

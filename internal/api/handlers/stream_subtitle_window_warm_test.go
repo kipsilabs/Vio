@@ -54,6 +54,9 @@ func newVirtualSubtitleWindowFixture(t *testing.T, dir, ffmpegScript string) (*S
 	session := &playback.Session{
 		ID: "sess-window", UserID: 1, ProfileID: "profile-1", MediaFileID: file.ID,
 		VirtualSourceURI: virtualURI, VirtualSubtitleTracks: file.SubtitleTracks,
+		// Full-track virtual warms are opportunistic and only run while the
+		// viewer is paused; the window-miss tests exercise that paused path.
+		IsPaused: true,
 	}
 	// The window-miss warm is detached; wait for it to settle before the
 	// fixture's temp dir is removed, or the warm keeps writing into a directory
@@ -317,6 +320,35 @@ func TestVirtualTextWindowWarmSkipsNonVirtual(t *testing.T) {
 
 	if _, err := os.Stat(argsLog); !os.IsNotExist(err) {
 		t.Fatalf("no warm should run for a non-virtual request: %v", err)
+	}
+}
+
+// A playing session must not start the second full-source read. The window
+// result cache and the client's next window are enough while playback is
+// active; the full-track warm is reserved for the paused path.
+func TestVirtualTextWindowWarmSkipsActivePlayback(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+	dir := t.TempDir()
+	argsLog := filepath.Join(dir, "ffmpeg.args")
+	handler, session, file, virtualURI := newVirtualSubtitleWindowFixture(t, dir,
+		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\n")
+	session.IsPaused = false
+	identity := playback.VirtualSubtitleCacheIdentity(file.ID, virtualURI, 0)
+
+	handler.warmVirtualSubtitleAfterWindowMiss(file, session, playback.StreamExtractOpts{
+		InputPath:       "unused",
+		CacheIdentity:   identity,
+		TrackIndex:      0,
+		SourceCodec:     "subrip",
+		SeekSeconds:     100,
+		DurationSeconds: 120,
+		FFmpegPath:      filepath.Join(dir, "ffmpeg"),
+	}, true, "")
+
+	if _, err := os.Stat(argsLog); !os.IsNotExist(err) {
+		t.Fatalf("no warm should run while the session is playing: %v", err)
 	}
 }
 

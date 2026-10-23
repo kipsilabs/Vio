@@ -1398,3 +1398,85 @@ func TestSourceAlignedCopyStartHintSurvivesReload(t *testing.T) {
 		})
 	}
 }
+
+func TestWaitForOpenSegmentWithStallReturnsWhenHeadStops(t *testing.T) {
+	tempDir := t.TempDir()
+	now := time.Now()
+	writeManifestRange(t, tempDir, 0, 0, ".ts")
+	writeSegmentFile(t, tempDir, "seg_00000.ts", []byte("x"), now)
+	session := &TranscodeSession{
+		outputDir: tempDir,
+		running:   true,
+		opts: TranscodeOpts{
+			TargetCodecVideo:   "h264",
+			SegmentDuration:    2,
+			StartSegmentNumber: 0,
+		},
+	}
+	started := time.Now()
+	_, err := session.WaitForOpenSegmentWithStall("seg_00001.ts", 2*time.Second, 50*time.Millisecond)
+	if !errors.Is(err, ErrSegmentStalled) {
+		t.Fatalf("WaitForOpenSegmentWithStall error = %v, want ErrSegmentStalled", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("stalled wait took %s, want the short stall verdict", elapsed)
+	}
+}
+
+func TestSegmentStallTimeoutForScalesWithSegmentDuration(t *testing.T) {
+	if got := SegmentStallTimeoutFor(TranscodeOpts{SegmentDuration: 2}); got != 6*time.Second {
+		t.Fatalf("2s segment stall timeout = %s, want 6s", got)
+	}
+	if got := SegmentStallTimeoutFor(TranscodeOpts{SegmentDuration: 4}); got != 12*time.Second {
+		t.Fatalf("4s segment stall timeout = %s, want 12s", got)
+	}
+}
+
+func TestWaitForOpenSegmentWithStallAllowsGrowingPartialSegment(t *testing.T) {
+	tempDir := t.TempDir()
+	now := time.Now()
+	writeManifestRange(t, tempDir, 0, 0, ".ts")
+	writeSegmentFile(t, tempDir, "seg_00000.ts", []byte("x"), now)
+	session := &TranscodeSession{
+		outputDir: tempDir,
+		running:   true,
+		opts: TranscodeOpts{
+			TargetCodecVideo:   "h264",
+			SegmentDuration:    2,
+			StartSegmentNumber: 0,
+		},
+	}
+	// Seed the partial segment before the wait starts. A CI runner can otherwise
+	// deschedule the writer long enough for the first sampling window to look
+	// like a real stall before any progress exists.
+	size := 4096
+	partialPath := filepath.Join(tempDir, "seg_00001.ts.tmp")
+	if err := os.WriteFile(partialPath, bytes.Repeat([]byte("x"), size), 0o600); err != nil {
+		t.Fatalf("seed partial segment: %v", err)
+	}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				size += 4096
+				_ = os.WriteFile(partialPath, bytes.Repeat([]byte("x"), size), 0o600)
+			}
+		}
+	}()
+	// The sampler polls every 500 ms. Keep the stall window below the overall
+	// wait but wide enough for a loaded CI scheduler: without the partial
+	// progress reset this still reaches ErrSegmentStalled.
+	_, err := session.WaitForOpenSegmentWithStall("seg_00001.ts", 4*time.Second, 2*time.Second)
+	close(stop)
+	<-done
+	if !errors.Is(err, ErrSegmentNotFound) {
+		t.Fatalf("wait with a growing partial segment = %v, want timeout, not a stall verdict", err)
+	}
+}

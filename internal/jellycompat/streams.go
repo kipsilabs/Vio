@@ -1345,6 +1345,7 @@ func (h *PlaybackHandler) HandleHLSSegment(w http.ResponseWriter, r *http.Reques
 		if parseErr == nil {
 			now := time.Now()
 			decision := transcodeSession.SegmentRecoveryDecision(segNum, now)
+			segmentStalled := false
 			lastProducedAgeMS := int64(-1)
 			if !decision.Progress.LastProducedAt.IsZero() {
 				lastProducedAgeMS = now.Sub(decision.Progress.LastProducedAt).Milliseconds()
@@ -1376,7 +1377,22 @@ func (h *PlaybackHandler) HandleHLSSegment(w http.ResponseWriter, r *http.Reques
 					"session", playSession.UpstreamSessionID,
 					"playback_session_id", playSession.UpstreamSessionID,
 				)
-				segmentLease, err = transcodeSession.WaitForOpenSegment(segmentName, decision.WaitTimeout)
+				if decision.Reason == "near_produced_head" {
+					segmentLease, err = transcodeSession.WaitForOpenSegmentWithStall(segmentName, decision.WaitTimeout, playback.SegmentStallTimeoutFor(transcodeSession.Opts()))
+				} else {
+					segmentLease, err = transcodeSession.WaitForOpenSegment(segmentName, decision.WaitTimeout)
+				}
+				if errors.Is(err, playback.ErrSegmentStalled) {
+					stalledHead := transcodeSession.SegmentProgress(time.Now()).ProducedHead
+					slog.WarnContext(r.Context(), "transcode segment production stalled", "component", "jellycompat",
+						"segment", segmentName, "requested_segment", segNum,
+						"produced_head", stalledHead,
+						"session", playSession.UpstreamSessionID,
+						"playback_session_id", playSession.UpstreamSessionID)
+					decision.RestartOnTimeout = true
+					segmentStalled = true
+					err = playback.ErrSegmentNotFound
+				}
 				if err != nil && errors.Is(err, playback.ErrSegmentNotFound) {
 					slog.InfoContext(r.Context(), "transcode segment wait timeout", "component", "jellycompat",
 						"segment", segmentName,
@@ -1394,7 +1410,25 @@ func (h *PlaybackHandler) HandleHLSSegment(w http.ResponseWriter, r *http.Reques
 				}
 			}
 
-			if err != nil && errors.Is(err, playback.ErrSegmentNotFound) && decision.RestartOnTimeout {
+			if err != nil && errors.Is(err, playback.ErrSegmentNotFound) && decision.RestartOnTimeout && segmentStalled && !transcodeSession.IsCopyVideo() {
+				// A stalled encoder cannot produce the requested segment by waiting.
+				// Restart detached and answer with the same retryable 404 the
+				// Jellyfin child-resource contract already uses; holding the request
+				// through a synchronous restart only adds latency.
+				slog.InfoContext(r.Context(), "transcode seek restart scheduled", "component", "jellycompat",
+					"segment", segmentName,
+					"requested_segment", segNum,
+					"produced_head", decision.Progress.ProducedHead,
+					"start_segment_number", decision.Progress.StartSegmentNumber,
+					"reason", decision.Reason,
+					"stalled", true,
+					"play_session", playSessionID,
+					"session", playSession.UpstreamSessionID,
+					"playback_session_id", playSession.UpstreamSessionID,
+				)
+				h.tm.RestartSegmentAsync(playSession.UpstreamSessionID, transcodeSession, segNum)
+				err = playback.ErrSegmentNotFound
+			} else if err != nil && errors.Is(err, playback.ErrSegmentNotFound) && decision.RestartOnTimeout {
 				target, ok, restartErr := h.tm.RestartSegmentLocked(
 					r.Context(),
 					playSession.UpstreamSessionID,

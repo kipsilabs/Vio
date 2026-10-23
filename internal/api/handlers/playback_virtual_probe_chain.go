@@ -193,6 +193,7 @@ func NewVirtualDefaultProbeTarget(versions VirtualProbeVersionLister, files Virt
 type defaultProbeChainAdmission struct {
 	mu       sync.Mutex
 	active   map[string]struct{}
+	cancel   map[string]context.CancelFunc
 	admitted int
 }
 
@@ -213,6 +214,14 @@ const (
 // later discovery run still probe normally. The returned func releases the
 // slot and must be called exactly once.
 func (a *defaultProbeChainAdmission) acquire(contentID string) (func(), defaultProbeChainRefusal) {
+	return a.acquireWithCancel(contentID, nil)
+}
+
+// acquireWithCancel admits one chain and registers its cancellation function
+// under the same lock. Registering separately left a window where playback
+// start could observe the live key but find no cancel function, then launch the
+// detached probe concurrently with playback.
+func (a *defaultProbeChainAdmission) acquireWithCancel(contentID string, cancel context.CancelFunc) (func(), defaultProbeChainRefusal) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.active == nil {
@@ -225,8 +234,29 @@ func (a *defaultProbeChainAdmission) acquire(contentID string) (func(), defaultP
 		return nil, defaultProbeChainRefusalCapacity
 	}
 	a.active[contentID] = struct{}{}
+	if cancel != nil {
+		if a.cancel == nil {
+			a.cancel = make(map[string]context.CancelFunc)
+		}
+		a.cancel[contentID] = cancel
+	}
 	a.admitted++
 	return func() { a.release(contentID) }, defaultProbeChainRefusalNone
+}
+
+// cancelKey cancels a live chain for key and reports whether one was live.
+func (a *defaultProbeChainAdmission) cancelKey(key string) bool {
+	if a == nil || key == "" {
+		return false
+	}
+	a.mu.Lock()
+	cancel := a.cancel[key]
+	a.mu.Unlock()
+	if cancel == nil {
+		return false
+	}
+	cancel()
+	return true
 }
 
 func (a *defaultProbeChainAdmission) release(contentID string) {
@@ -236,7 +266,26 @@ func (a *defaultProbeChainAdmission) release(contentID string) {
 		return
 	}
 	delete(a.active, contentID)
+	delete(a.cancel, contentID)
 	a.admitted--
+}
+
+// cancelDefaultFileProbe drops a detached pre-play probe for the content/file
+// a playback start is about to resolve. The start path performs its own resolve
+// and deferred probe; allowing the detached chain to keep a second ffprobe open
+// on the same provider source only adds relay contention and duplicate evidence
+// writes. A missed chain is harmless because the start probe is authoritative.
+func (h *PlaybackHandler) cancelDefaultFileProbe(contentID string, fileID int) {
+	if h == nil || contentID == "" {
+		return
+	}
+	for _, selected := range []int{fileID, 0} {
+		key := contentID + "\x00" + strconv.Itoa(selected)
+		if h.defaultProbeChains.cancelKey(key) {
+			slog.DebugContext(context.Background(), "virtual pre-play probe chain canceled by playback start",
+				"component", "api", "content_id", contentID, "selected_file_id", selected)
+		}
+	}
 }
 
 // ScheduleDefaultFileProbe is the subscription point the discovery services
@@ -274,8 +323,10 @@ func (h *PlaybackHandler) ScheduleDefaultFileProbe(contentID string, source *mod
 	// with duplicates. The chain re-reads the selected row and probes that row's
 	// own stored URL, so any discovery group can safely start it.
 	admissionKey := contentID + "\x00" + strconv.Itoa(filter.SelectedFileID)
-	release, refusal := h.defaultProbeChains.acquire(admissionKey)
+	ctx, cancel := h.virtualDetachedContext(context.Background(), virtualDefaultProbeChainBudget)
+	release, refusal := h.defaultProbeChains.acquireWithCancel(admissionKey, cancel)
 	if refusal != defaultProbeChainRefusalNone {
+		cancel()
 		// A chain for this item is already live, or both slots are taken.
 		// Either way the callback is dropped: the live chain re-reads the same
 		// defaults, and a dropped probe still happens on the first play. No
@@ -303,7 +354,6 @@ func (h *PlaybackHandler) ScheduleDefaultFileProbe(contentID string, source *mod
 	// unrelated playback would share, and Done() reports the slot truly
 	// free: a Wait() caller must be able to re-schedule the same item
 	// without racing the previous chain's teardown.
-	ctx, cancel := h.virtualDetachedContext(context.Background(), virtualDefaultProbeChainBudget)
 	h.probeChainWG.Add(1)
 	go func() {
 		defer func() {

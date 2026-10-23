@@ -1331,6 +1331,15 @@ func (c *SubtitleCache) WarmInBackground(opts StreamExtractOpts, extract SUPExtr
 			"input", opts.InputPath, "track", opts.TrackIndex)
 		if err := extract(ctx, opts); err != nil {
 			fill.Discard()
+			if errors.Is(err, ErrSubtitleWarmCanceled) {
+				// The caller intentionally abandoned this opportunistic warm,
+				// usually because playback resumed. It is not a source failure
+				// and must not arm the failure cooldown. Generic context
+				// cancellation still counts as a failure so a vanished relay
+				// cannot trigger a re-spawn storm.
+				slog.DebugContext(ctx, "subtitle cache warm canceled by playback")
+				return
+			}
 			c.noteWarmOutcome(key, false, time.Now())
 			slog.Log(ctx, slog.LevelWarn, "subtitle cache warm failed",
 				subtitleTraceAttrsForRequest(requestID, opts.SourceCodec, SubtitleTracePhaseWarm, counter.bytes, subtitleTraceOutcome(ctx, err), time.Since(start),
@@ -1434,6 +1443,15 @@ func (c *SubtitleCache) WarmTrackInBackground(opts StreamExtractOpts, extract SU
 			"input", opts.InputPath, "track", opts.TrackIndex, "format", format)
 		if err := extract(ctx, opts); err != nil {
 			fill.Discard()
+			if errors.Is(err, ErrSubtitleWarmCanceled) {
+				// The caller intentionally abandoned this opportunistic warm,
+				// usually because playback resumed. It is not a source failure
+				// and must not arm the failure cooldown. Generic context
+				// cancellation still counts as a failure so a vanished relay
+				// cannot trigger a re-spawn storm.
+				slog.DebugContext(ctx, "subtitle cache warm canceled by playback")
+				return
+			}
 			c.noteWarmOutcome(key, false, time.Now())
 			slog.Log(ctx, slog.LevelWarn, "subtitle cache warm failed",
 				subtitleTraceAttrsForRequest(requestID, opts.SourceCodec, SubtitleTracePhaseWarm, counter.bytes, subtitleTraceOutcome(ctx, err), time.Since(start),

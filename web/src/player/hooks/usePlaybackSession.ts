@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { usePlayerConfig } from "../context/PlayerConfigContext";
+import { publishPlaybackInventory } from "../playbackInventoryMirror";
 import type { PlayerConfig } from "../context/PlayerConfigContext";
 import { startPlaybackV2 } from "../start-v2";
 import { hasSequencedProgress, stopSequencedSession } from "../session-mutations";
@@ -87,6 +88,17 @@ function isBitmapSubtitleRefusal(decision: DecisionResponseV3): boolean {
   const reason = decision.terminal?.reason?.trim() ?? "";
   return reason !== "" && BITMAP_SUBTITLE_REFUSAL_REASONS.has(reason);
 }
+
+/**
+ * The retryable terminal a seek reanchor returns when the session's frozen
+ * source can no longer be reopened from evidence that belongs to it.
+ *
+ * The session is not dead and the file is not unplayable: replaying the frozen
+ * recipe would pair the running plan with foreign bytes, so the server fails
+ * the reanchor closed. A fresh start at the requested position resolves the
+ * source again from scratch, which is why the terminal is retryable.
+ */
+const SEEK_REANCHOR_EVIDENCE_UNAVAILABLE_REASON = "seek_reanchor_evidence_unavailable";
 
 interface PlaybackSessionState {
   /**
@@ -1266,6 +1278,18 @@ export function usePlaybackSession(
   // allowed, while a replan still refused for the session already rebuilt
   // surfaces the error instead of starting again.
   const recoveredDeadSessionRef = useRef<string | null>(null);
+  // The seek-reanchor refusal that forced a fresh start, tracked as a chain:
+  // the session whose frozen source failed and the replacement its rebuild
+  // adopted. A second `seek_reanchor_evidence_unavailable` naming either of
+  // them surfaces the retryable error instead of starting yet another session,
+  // so one original attempt can never restart in a loop. `replacementSessionId`
+  // stays null until the rebuild's start actually adopts a plan, and a rebuild
+  // that is refused or fails outright leaves it null — the error is already on
+  // screen there.
+  const seekRebuildChainRef = useRef<{
+    originSessionId: string;
+    replacementSessionId: string | null;
+  } | null>(null);
 
   // v3 identity. `playback_attempt_id` spans one whole attempt chain (a start
   // and every replan that follows it); `plan_attempt_id` identifies the single
@@ -2468,6 +2492,70 @@ export function usePlaybackSession(
           options.operation === "track_change" && options.subtitle !== undefined ? null : undefined,
           isFailureRecovery,
         );
+        if (
+          !adopted &&
+          options.operation === "seek_reanchor" &&
+          decision.terminal?.reason?.trim() === SEEK_REANCHOR_EVIDENCE_UNAVAILABLE_REASON
+        ) {
+          const chain = seekRebuildChainRef.current;
+          const alreadyRebuilt =
+            chain !== null &&
+            (chain.originSessionId === sessionId || chain.replacementSessionId === sessionId);
+          if (!alreadyRebuilt) {
+            // The session's frozen source cannot be reopened, but the file
+            // itself is fine: a fresh start re-resolves it at the seek target.
+            // Retire the session the same way a reaped one is retired and
+            // reuse `loadSession` for the transport, carrying the viewer's
+            // tracks, the offered candidate and their version intent so the
+            // rebuild lands on what they were watching.
+            const restartPosition =
+              typeof options.positionSeconds === "number" &&
+              Number.isFinite(options.positionSeconds)
+                ? options.positionSeconds
+                : playbackPositionRef.current;
+            // Read the offered candidate before retiring: the retirement
+            // clears the display-only offer along with the outgoing source.
+            const offeredVirtualURI =
+              retryTargetRef.current?.offeredVirtualURI ??
+              offeredVirtualUriRef.current ??
+              undefined;
+            const rebuildSelection: "auto" | "explicit" = autoFallbackRef.current
+              ? "auto"
+              : (retryTargetRef.current?.fileSelection ??
+                (explicitFileSelection ? "explicit" : "auto"));
+            seekRebuildChainRef.current = {
+              originSessionId: sessionId,
+              replacementSessionId: null,
+            };
+            retireActiveSession(sessionId);
+            const outcome = await loadSession({
+              preferredFileId: plan.requested_media_file_id,
+              position: restartPosition,
+              // The seek target is the viewer's intent; do not fall back to
+              // the server's stored resume point for this file.
+              forceStartPosition: true,
+              allowPreserveExistingSessionOnError: false,
+              replacementErrorMessage: "Failed to restart playback",
+              initialErrorMessage: "Failed to restart playback",
+              carriedAudioTrackId: plan.selected_tracks.audio?.id ?? null,
+              carriedSubtitleTrackIndex: plan.selected_tracks.subtitle?.index ?? null,
+              offeredVirtualURI,
+              fileSelection: rebuildSelection,
+              intentAt: null,
+            });
+            // The replacement belongs to the same recovery chain: a second
+            // identical refusal on its session surfaces the error instead of
+            // starting a third. Read the adopted session only when this start
+            // actually won, so a superseded or refused rebuild records nothing.
+            if (outcome.kind === "adopted" && sessionIdRef.current) {
+              seekRebuildChainRef.current = {
+                originSessionId: sessionId,
+                replacementSessionId: sessionIdRef.current,
+              };
+            }
+            return outcome.kind === "adopted";
+          }
+        }
         if (!adopted && retireSessionOnRefusal) {
           const pending = pendingReplanRef.current;
           const pendingCanValidateOutput =
@@ -4263,6 +4351,19 @@ export function usePlaybackSession(
       current.inventoryFailed ? { ...current, inventoryFailed: false } : current,
     );
   }, []);
+
+  // Mirror the player's authoritative menus for the item page. The page can be
+  // unmounted while this hook is alive, so a module-level snapshot is the only
+  // carrier that survives the trip back from the player. Publish both the
+  // effective row and the requested row: a virtual rotation can move the
+  // effective file id while the media page still holds the viewer's selection.
+  useEffect(() => {
+    const requestedFileId = planRef.current?.requested_media_file_id ?? null;
+    publishPlaybackInventory(state.mediaFileId, state.planAudioTracks, state.subtitleUrls);
+    if (requestedFileId && requestedFileId !== state.mediaFileId) {
+      publishPlaybackInventory(requestedFileId, state.planAudioTracks, state.subtitleUrls);
+    }
+  }, [state.mediaFileId, state.planAudioTracks, state.planRevision, state.subtitleUrls]);
 
   return {
     ...state,

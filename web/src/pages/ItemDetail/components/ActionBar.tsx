@@ -53,6 +53,10 @@ import {
 import { catalogKeys, itemKeys } from "@/hooks/queries/keys";
 import { useRealtimeEvents } from "@/components/realtimeEventsContext";
 import { useWatchDetail } from "@/hooks/queries/items";
+import {
+  mergePlaybackInventory,
+  usePlaybackInventoryMirror,
+} from "@/player/playbackInventoryMirror";
 import { cn } from "@/lib/utils";
 import AddToCollectionDialog from "@/components/AddToCollectionDialog";
 import { Button } from "@/components/ui/button";
@@ -431,6 +435,7 @@ export default function ActionBar({
     enabled: !!contentId && !!selectedVersion,
     staleTime: 0,
   });
+  const playerInventory = usePlaybackInventoryMirror(selectedVersion?.file_id);
   const selectedVersionWithTracks = useMemo(() => {
     if (!selectedVersion) return null;
     const watchVersion = selectedWatch?.versions?.find(
@@ -441,18 +446,21 @@ export default function ActionBar({
     // selected version has no tracks. Keep the catalog lists until the probe
     // actually supplies a non-empty inventory, so a cold page does not hide its
     // audio/subtitle menus.
-    return {
-      ...selectedVersion,
-      audio_tracks:
-        (watchVersion.audio_tracks?.length ?? 0) > 0
-          ? watchVersion.audio_tracks
-          : selectedVersion.audio_tracks,
-      subtitle_tracks:
-        (watchVersion.subtitle_tracks?.length ?? 0) > 0
-          ? watchVersion.subtitle_tracks
-          : selectedVersion.subtitle_tracks,
-    };
-  }, [selectedVersion, selectedWatch]);
+    return mergePlaybackInventory(
+      {
+        ...selectedVersion,
+        audio_tracks:
+          (watchVersion.audio_tracks?.length ?? 0) > 0
+            ? watchVersion.audio_tracks
+            : selectedVersion.audio_tracks,
+        subtitle_tracks:
+          (watchVersion.subtitle_tracks?.length ?? 0) > 0
+            ? watchVersion.subtitle_tracks
+            : selectedVersion.subtitle_tracks,
+      },
+      playerInventory,
+    );
+  }, [playerInventory, selectedVersion, selectedWatch]);
   const showMarkerEditor = canEditMarkers && !!contentId;
   const hasMultipleVersions = (playbackVariants?.length ?? 0) > 1 || (versions?.length ?? 0) > 1;
   const showPlayChoiceDialog =
