@@ -6,6 +6,8 @@ import (
 	"strconv"
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
@@ -298,6 +300,12 @@ func (p *pluginRouterProvider) Validate(ctx context.Context, installationID int,
 	}
 	resp, err := client.Validate(ctx, &pluginv1.ValidateRequest{CapabilityId: capabilityID, Connection: pc, Siblings: sibs})
 	if err != nil {
+		// Older request_router plugins predate the Validate RPC. Their config
+		// shape is still checked by the host, so an unimplemented validator is
+		// a no-op rather than a failed save.
+		if status.Code(err) == codes.Unimplemented {
+			return nil, "", nil
+		}
 		return nil, "", err
 	}
 	return resp.GetFieldErrors(), resp.GetFormError(), nil
