@@ -271,19 +271,17 @@ export function useASSSubtitles(
 
   const jassubRef = useRef<JASSUB | null>(null);
   const fillRef = useRef<ASSFillState | null>(null);
-  // The last window this track committed, so a renderer rebuild can keep it.
-  // The video element can briefly report currentTime 0 while a replacement
-  // stream attaches; without this, the rebuild starts a window at 0 and then
-  // races the playhead at the real position. Written only on success: a
-  // requested-but-never-loaded target is not something to carry forward.
-  const lastWindowStartRef = useRef<{ url: string; start: number } | null>(null);
-  // Identity of the last effect run (`null` when no ASS track was active), used
-  // to tell a transport/renderer rebuild of the same track from a fresh
-  // activation. A stale window is only meaningful for the former.
-  const lastRunRef = useRef<{
-    url: string | null;
+  // The window a run committed, with the track identity it was loaded for, so
+  // a renderer rebuild can keep it. The video element can briefly report
+  // currentTime 0 while a replacement stream attaches; without this, the
+  // rebuild starts a window at 0 and then races the playhead at the real
+  // position. Written only on success and consumed by the next effect run,
+  // which clears it first: a run that merely starts, or that fails before
+  // committing, is not eligible to donate a window to a later rebuild.
+  const committedWindowRef = useRef<{
+    url: string;
     sourceGeneration: number;
-    attached: boolean;
+    start: number;
   } | null>(null);
   const syncedFitRef = useRef(videoFit);
   const jassubImportRef = useRef<Promise<typeof JASSUB> | null>(null);
@@ -326,17 +324,22 @@ export function useASSSubtitles(
     onLoadStateRef.current?.("idle");
 
     // A rebuild of the same track (plan revision, transport rebuild, retime)
-    // may keep the window it already loaded. A deactivated track, a track
-    // switch, or a changed subtitle source identity starts over from the
+    // may keep the window the previous run committed. A deactivated track, a
+    // track switch, or a changed subtitle source identity starts over from the
     // playhead rather than reviving a window from the previous position.
-    const previousRun = lastRunRef.current;
-    const resumesLoadedWindow =
-      previousRun !== null &&
-      previousRun.attached &&
-      previousRun.url === activeUrl &&
-      previousRun.url !== null &&
-      previousRun.sourceGeneration === sourceGeneration;
-    lastRunRef.current = { url: activeUrl, sourceGeneration, attached: false };
+    // Take the committed window, then invalidate it: this run must commit its
+    // own window before a later run can reuse one. That keeps a run that only
+    // started, or failed before its first commit, from certifying the previous
+    // generation's window as a continuation.
+    const previousCommitted = committedWindowRef.current;
+    committedWindowRef.current = null;
+    const rememberedWindow =
+      previousCommitted !== null &&
+      activeUrl !== null &&
+      previousCommitted.url === activeUrl &&
+      previousCommitted.sourceGeneration === sourceGeneration
+        ? previousCommitted
+        : null;
 
     // Destroy JASSUB if the active track is not ASS, or player is detached,
     // or no video element is available.
@@ -345,16 +348,10 @@ export function useASSSubtitles(
         jassubRef.current.destroy();
         jassubRef.current = null;
       }
-      // A deactivated track whose playhead is authoritatively back at zero has
-      // no continuation left to preserve (off, seek to 0, on again), so the
-      // remembered window must not outlive the deactivation.
-      if (!activeUrl && video && video.readyState > 0 && video.currentTime <= 0) {
-        lastWindowStartRef.current = null;
-      }
+      // Nothing was committed for this deactivated run, so there is no
+      // continuation left to preserve (off, seek to 0, on again).
       return;
     }
-
-    lastRunRef.current = { url: activeUrl, sourceGeneration, attached: true };
 
     let cancelled = false;
     // Exactly one attempt (initial load or boundary/seek refresh) runs at a
@@ -378,7 +375,6 @@ export function useASSSubtitles(
     // Infinity once the whole-track fallback is in use, so boundary refresh
     // never schedules.
     let usingWholeTrack = false;
-    const rememberedWindow = lastWindowStartRef.current;
     const playheadStart = Math.max(
       0,
       (video.readyState > 0 ? video.currentTime : 0) +
@@ -387,14 +383,16 @@ export function useASSSubtitles(
     );
     // The element reports 0 both for a real seek to the start and for a
     // replacement stream that has not been seeked yet. Only the latter may
-    // reuse the loaded window; in that case the position is unknown until the
-    // transport reports one, so the commit backstop below must not read it.
+    // reuse the committed window; in that case the position is unknown until
+    // the transport reports one, so the commit backstop below must not read it.
     const resumedAtUnknownPlayhead =
-      resumesLoadedWindow &&
-      rememberedWindow?.url === activeUrl &&
+      rememberedWindow !== null &&
       (video.readyState === 0 || video.currentTime <= 0) &&
       rememberedWindow.start > playheadStart;
-    let windowStart = resumedAtUnknownPlayhead ? rememberedWindow!.start : playheadStart;
+    let windowStart =
+      resumedAtUnknownPlayhead && rememberedWindow !== null
+        ? rememberedWindow.start
+        : playheadStart;
     let windowEnd = windowStart + ASS_WINDOW_DURATION_SECONDS;
     // Consecutive windowed failures since the last successful window, shared by
     // the initial load and boundary refreshes so the 3→1→terminal budget is one
@@ -698,7 +696,9 @@ export function useASSSubtitles(
         // the failure budgets so a later unrelated error starts fresh.
         usingWholeTrack = wholeTrack;
         windowStart = start;
-        lastWindowStartRef.current = { url: activeUrl!, start };
+        // This run's commit is the only window a later rebuild of this same
+        // track identity may reuse.
+        committedWindowRef.current = { url: activeUrl!, sourceGeneration, start };
         windowEnd = wholeTrack ? Infinity : start + ASS_WINDOW_DURATION_SECONDS;
         windowFailures = 0;
         textFailures = 0;
