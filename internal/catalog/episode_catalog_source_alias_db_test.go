@@ -16,7 +16,7 @@ import (
 // episode_libraries row and no file must hydrate through its alias row's
 // membership, while the alias row itself must never hydrate. The scoped
 // relations must apply the same rule to allowed and disabled libraries.
-func TestEpisodeCatalogBaseRelationAliasDB(t *testing.T) {
+func TestEpisodeCatalogBaseRelationAliasDB(t *testing.T) { //nolint:funlen // one DB fixture covers base and scoped relations
 	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("SILO_TEST_DATABASE_URL is not set")

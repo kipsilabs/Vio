@@ -220,6 +220,25 @@ func (r *EpisodeAliasRepository) ReconcileSeries(ctx context.Context, seriesID s
 	if err := lockEpisodeAliasSeries(ctx, tx, seriesID); err != nil {
 		return nil, err
 	}
+	grouped, err := loadReconcileEpisodes(ctx, tx, seriesID)
+	if err != nil {
+		return nil, err
+	}
+	result := buildReconcileResult(seriesID, dryRun, grouped)
+	if dryRun {
+		return result, nil
+	}
+	if err := applyReconcileCandidates(ctx, tx, seriesID, result.Candidates); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("committing episode alias reconciliation: %w", err)
+	}
+	result.Applied = len(result.Candidates)
+	return result, nil
+}
+
+func loadReconcileEpisodes(ctx context.Context, tx pgx.Tx, seriesID string) (map[string][]reconcileEpisodeRow, error) {
 	rows, err := tx.Query(ctx, `
 		SELECT e.content_id, e.season_number, e.episode_number,
 		       COALESCE(e.title, ''), e.air_date,
@@ -252,7 +271,10 @@ func (r *EpisodeAliasRepository) ReconcileSeries(ctx context.Context, seriesID s
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterating episodes for alias reconciliation: %w", err)
 	}
+	return grouped, nil
+}
 
+func buildReconcileResult(seriesID string, dryRun bool, grouped map[string][]reconcileEpisodeRow) *EpisodeAliasReconcileResult {
 	result := &EpisodeAliasReconcileResult{SeriesID: seriesID, DryRun: dryRun}
 	for _, group := range grouped {
 		if len(group) < 2 {
@@ -296,11 +318,11 @@ func (r *EpisodeAliasRepository) ReconcileSeries(ctx context.Context, seriesID s
 		}
 		return left.Title < right.Title
 	})
+	return result
+}
 
-	if dryRun {
-		return result, nil
-	}
-	for _, candidate := range result.Candidates {
+func applyReconcileCandidates(ctx context.Context, tx pgx.Tx, seriesID string, candidates []EpisodeAliasReconcileCandidate) error {
+	for _, candidate := range candidates {
 		aliasEpisodeID := candidate.AliasEpisodeID
 		alias := &models.EpisodeAlias{
 			SeriesID:              seriesID,
@@ -312,14 +334,10 @@ func (r *EpisodeAliasRepository) ReconcileSeries(ctx context.Context, seriesID s
 			Confidence:            100,
 		}
 		if err := upsertEpisodeAlias(ctx, tx, alias); err != nil {
-			return nil, fmt.Errorf("applying episode alias %s -> %s: %w", candidate.CanonicalEpisodeID, candidate.AliasEpisodeID, err)
+			return fmt.Errorf("applying episode alias %s -> %s: %w", candidate.CanonicalEpisodeID, candidate.AliasEpisodeID, err)
 		}
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("committing episode alias reconciliation: %w", err)
-	}
-	result.Applied = len(result.Candidates)
-	return result, nil
+	return nil
 }
 
 type reconcileEpisodeRow struct {
