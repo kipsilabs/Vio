@@ -4074,6 +4074,12 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 // caller propagates the carried inventory under its own generation fence and must
 // never trust a reread.
 func (h *PlaybackHandler) persistVirtualProbeEvidenceDurable(ctx context.Context, catalogFile *models.MediaFile, resolvedPath string, probed *models.MediaFile, candidate resolver.PersistedIdentityTiers, stampProbe bool) (virtualCommittedProbeInventory, bool) {
+	// A detail read or a provider re-list can advance the row's revision while
+	// the detached probe is running. Re-read the exact row immediately before
+	// the write so the CAS snapshot and the adoption target are current; using
+	// the pre-probe snapshot here made a successful probe look like a
+	// superseded write and left the session fail-closed on its old inventory.
+	catalogFile = h.refreshVirtualCatalogFileForEvidence(ctx, catalogFile)
 	args, _, ok := h.virtualProbeEvidenceArgs(ctx, catalogFile, resolvedPath, probed, candidate, stampProbe)
 	if !ok {
 		slog.WarnContext(ctx, "durable virtual probe evidence write refused before execution",
@@ -5080,6 +5086,13 @@ func refreshVirtualPersistArgsForRow(args models.VirtualFilePersistArgs, current
 // the meantime, probe_updated_at differs and the write still refuses. A row
 // that moved elsewhere keeps the caller's snapshot.
 func virtualPersistSnapshotMoved(original models.VirtualFilePersistArgs, current virtualRowCASState, refreshed models.VirtualFilePersistArgs) bool {
+	// The probe stamp is the authority on whether this evidence still describes
+	// the row's current bytes. Check it before the adoption path can re-base:
+	// otherwise a concurrent probe that moved both the concrete path and the
+	// stamp could be overwritten by this older adoption.
+	if !sameVirtualProbeStamp(original.ProbeUpdatedAt, current.ProbeUpdatedAt) {
+		return false
+	}
 	if original.RequireAdopt && original.AdoptPath != "" &&
 		original.ExpectedFilePath != refreshed.ExpectedFilePath {
 		return true
@@ -5091,9 +5104,6 @@ func virtualPersistSnapshotMoved(original models.VirtualFilePersistArgs, current
 		return false
 	}
 	if original.LibraryID != 0 && original.LibraryID != current.LibraryID {
-		return false
-	}
-	if !sameVirtualProbeStamp(original.ProbeUpdatedAt, current.ProbeUpdatedAt) {
 		return false
 	}
 	return current.UpdatedAt.After(original.UpdatedAt)

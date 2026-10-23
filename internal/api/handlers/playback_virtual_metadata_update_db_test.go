@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -609,5 +610,62 @@ func TestVirtualFileMetadataUpdateNeutralRowRefusesSiblingOwnedCandidateWithoutE
 	}
 	if after := readVirtualEvidenceRowJSON(t, pool, rowID); after != before {
 		t.Fatalf("neutral row changed on a sibling-owned candidate write with no expected path:\nbefore=%s\nafter =%s", before, after)
+	}
+}
+
+// TestVirtualFileMetadataUpdateRefusesStaleAdoptionAfterProbeStampMoves proves
+// the retry path does not let an older required adoption re-base after a
+// concurrent probe moved both the concrete path and probe_updated_at. The
+// probe-stamp fence must run before the adoption-path exception.
+func TestVirtualFileMetadataUpdateRefusesStaleAdoptionAfterProbeStampMoves(t *testing.T) {
+	pool := virtualMetadataUpdateTestPool(t)
+	ctx := context.Background()
+	const folderID, ownerID = 994318, 7008
+	seedVirtualMetadataUpdateFolder(t, pool, folderID, ownerID)
+
+	oldPath := "virtual://movie/tt-db-stale-adoption?result=old"
+	newPath := "virtual://movie/tt-db-stale-adoption?result=newer"
+	adoptPath := "virtual://movie/tt-db-stale-adoption?result=stale-adoption"
+	var rowID int
+	var updatedAt time.Time
+	var probeUpdatedAt *time.Time
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO media_files(content_id, media_folder_id, file_path, container, virtual_owner_installation_id, probe_source)
+		VALUES('movie-db-stale-adoption', $1, $2, 'virtual', $3, 'virtual')
+		RETURNING id, updated_at, probe_updated_at`, folderID, oldPath, ownerID,
+	).Scan(&rowID, &updatedAt, &probeUpdatedAt); err != nil {
+		t.Fatalf("insert row: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE media_files
+		SET file_path = $2, probe_updated_at = clock_timestamp(), updated_at = updated_at + interval '1 minute'
+		WHERE id = $1`, rowID, newPath); err != nil {
+		t.Fatalf("simulate concurrent probe: %v", err)
+	}
+	before := readVirtualEvidenceRowJSON(t, pool, rowID)
+
+	_, err := ExecVirtualFileMetadataUpdateResult(ctx, pool, models.VirtualFilePersistArgs{
+		FileID:           rowID,
+		ExpectedFilePath: oldPath,
+		AdoptPath:        adoptPath,
+		RequireAdopt:     true,
+		VideoTracks:      []byte(`[]`),
+		AudioTracks:      []byte(`[{"codec":"eac3","channels":6,"language":"eng"}]`),
+		SubtitleTracks:   []byte(`[]`),
+		Resolution:       "2160p",
+		CodecVideo:       "hevc",
+		CodecAudio:       "eac3",
+		Container:        "mkv",
+		StampProbe:       true,
+		UpdatedAt:        updatedAt,
+		ProbeUpdatedAt:   probeUpdatedAt,
+		OwnerID:          ownerID,
+		LibraryID:        folderID,
+	})
+	if !errors.Is(err, errVirtualAdoptIdentityNotPersisted) {
+		t.Fatalf("stale-adoption error = %v, want errVirtualAdoptIdentityNotPersisted", err)
+	}
+	if after := readVirtualEvidenceRowJSON(t, pool, rowID); after != before {
+		t.Fatalf("row changed after a stale adoption with a newer probe stamp:\nbefore=%s\nafter =%s", before, after)
 	}
 }
