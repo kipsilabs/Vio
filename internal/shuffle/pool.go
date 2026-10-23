@@ -394,7 +394,7 @@ func appendItemAccess(alias, libraryKey string, access catalog.AccessFilter, con
 func playableFile(key, fileKey string, libraryID int, sampled bool, access catalog.AccessFilter, args *[]any) string {
 	conditions := []string{"mf.missing_since IS NULL", "pf.enabled = TRUE"}
 	if libraryID > 0 {
-		conditions = append(conditions, fmt.Sprintf("mf.media_folder_id = %s", bind(args, libraryID)))
+		conditions = append(conditions, "mf.media_folder_id = "+bind(args, libraryID))
 	}
 	var fileAccess []string
 	fileAccess, *args = catalog.MediaFileAccessSQL("mf", access, *args)
@@ -420,7 +420,7 @@ func playableEpisodeFile(key string, libraryID int, sampled bool, access catalog
 		"EXISTS (SELECT 1 FROM media_folders pf WHERE pf.id = mf.media_folder_id AND pf.enabled = TRUE)",
 	}
 	if libraryID > 0 {
-		conditions = append(conditions, fmt.Sprintf("mf.media_folder_id = %s", bind(args, libraryID)))
+		conditions = append(conditions, "mf.media_folder_id = "+bind(args, libraryID))
 	}
 	var fileAccess []string
 	fileAccess, *args = catalog.MediaFileAccessSQL("mf", access, *args)

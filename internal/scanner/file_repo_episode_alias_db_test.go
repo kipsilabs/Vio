@@ -14,7 +14,7 @@ import (
 // behavior: a canonical episode with no present files resolves the files owned
 // by its alias rows, and a canonical episode with its own files also includes
 // alias files so listing matches the playability rule.
-func TestFileRepositoryFallsBackToAliasEpisodeFilesDB(t *testing.T) { //nolint:funlen // one DB fixture covers direct, alias-only, duplicate, batch, and missing-file cases
+func TestFileRepositoryFallsBackToAliasEpisodeFilesDB(t *testing.T) { //nolint:funlen,gocyclo // one DB fixture covers direct, alias-only, duplicate, batch, and missing-file cases
 	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("SILO_TEST_DATABASE_URL is not set")
