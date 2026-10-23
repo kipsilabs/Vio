@@ -14,7 +14,7 @@ import (
 // used by the series and season watch-count rollups: duplicate absolute-layout
 // rows do not inflate a season, and a canonical episode with no direct file
 // still counts when its alias row owns a present file.
-func TestEpisodeAliasWatchCountsCanonicalSeasonsDB(t *testing.T) {
+func TestEpisodeAliasWatchCountsCanonicalSeasonsDB(t *testing.T) { //nolint:funlen // one DB fixture covers canonical, alias-file, and alias-row counts
 	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("SILO_TEST_DATABASE_URL is not set")

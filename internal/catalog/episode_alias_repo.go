@@ -148,11 +148,7 @@ func (r *EpisodeAliasRepository) ResolveCanonicalEpisodeID(
 	return canonicalID, true, nil
 }
 
-type episodeAliasScanner interface {
-	Scan(dest ...any) error
-}
-
-func scanEpisodeAlias(row episodeAliasScanner) (*models.EpisodeAlias, error) {
+func scanEpisodeAlias(row groupRowScanner) (*models.EpisodeAlias, error) {
 	var alias models.EpisodeAlias
 	var aliasEpisode *string
 	if err := row.Scan(

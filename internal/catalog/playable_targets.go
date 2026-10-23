@@ -130,7 +130,7 @@ func (r *PlayableTargetResolver) Resolve(ctx context.Context, q PlayableTargetQu
 // buildPlayableTargetsQuery renders the backend-neutral play-target statement.
 // fileConditions reference the media_files alias mf and already include the
 // missing-file condition.
-func buildPlayableTargetsQuery(fileConditions []string) string {
+func buildPlayableTargetsQuery(fileConditions []string) string { //nolint:funlen // one SQL statement; splitting the CTEs would hide the selection flow
 	fileSQL := strings.Join(fileConditions, " AND ")
 	leafFileSQL := canonicalEpisodeFileExistsSQL("requested.content_id", fileSQL)
 	candidateFileSQL := canonicalEpisodeFileExistsSQL("candidate.content_id", fileSQL)
@@ -254,7 +254,7 @@ func PlayableTargetIDs(targets map[string]PlayableTarget) map[string]string {
 }
 
 // ResolveTargets is Resolve with each target's season attached.
-func (r *PlayableTargetResolver) ResolveTargets(ctx context.Context, q PlayableTargetQuery) (map[string]PlayableTarget, error) {
+func (r *PlayableTargetResolver) ResolveTargets(ctx context.Context, q PlayableTargetQuery) (map[string]PlayableTarget, error) { //nolint:funlen,gocyclo // backend-neutral and PostgreSQL winner paths retain their explicit candidate/hint branches
 	result := make(map[string]PlayableTarget)
 	if r == nil || r.pool == nil || q.UserID <= 0 || strings.TrimSpace(q.ProfileID) == "" {
 		return result, nil

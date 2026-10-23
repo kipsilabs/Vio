@@ -18,7 +18,7 @@ import (
 // partly available season: every canonical metadata episode is listed, the
 // file-backed subset carries files, fileless rows carry no files, and an alias
 // layout row never appears.
-func TestSeasonEpisodesMergePartialAvailabilityDB(t *testing.T) {
+func TestSeasonEpisodesMergePartialAvailabilityDB(t *testing.T) { //nolint:funlen // one DB fixture covers persisted and partial-availability season reads
 	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("SILO_TEST_DATABASE_URL is not set")

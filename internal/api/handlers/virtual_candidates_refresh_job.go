@@ -201,6 +201,20 @@ func (s *VirtualCandidatesRefreshJobService) firstFolderID(ctx context.Context, 
 			}
 		}
 	}
+	// A fileless episode has no row of its own to name a library. Its series
+	// still owns a virtual source row, so resolve the series and use that
+	// source's library for the indexer-release scope.
+	if s.ContentFiles != nil && s.Episodes != nil {
+		if episode, err := s.episodeFor(ctx, contentID); err == nil && episode != nil && episode.SeriesID != "" {
+			if files, err := s.ContentFiles(ctx, episode.SeriesID); err == nil {
+				for _, file := range files {
+					if file != nil && file.MediaFolderID > 0 {
+						return file.MediaFolderID
+					}
+				}
+			}
+		}
+	}
 	return 0
 }
 
@@ -293,7 +307,7 @@ func (e *VirtualCandidatesRefreshExecutor) Execute(ctx context.Context, req admi
 	}
 
 	report(1, totalSteps, "Listing provider candidates")
-	sources, streams, err := e.Refresh.RefreshSources(ctx, req.ContentID, req.UserID, req.ProfileID)
+	sources, streams, err := e.Refresh.RefreshSourcesAllowEmpty(ctx, req.ContentID, req.UserID, req.ProfileID)
 	if err != nil {
 		return nil, fmt.Errorf("list provider candidates: %w", err)
 	}

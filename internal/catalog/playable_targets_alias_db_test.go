@@ -16,7 +16,7 @@ import (
 // media_files row and its alias does. Both the backend-neutral path and the
 // PostgreSQL winner path must return the canonical ID for series, season, and
 // explicit episode cards.
-func TestPlayableTargetsResolveCanonicalAliasFilesDB(t *testing.T) {
+func TestPlayableTargetsResolveCanonicalAliasFilesDB(t *testing.T) { //nolint:funlen // one DB fixture covers backend-neutral and PostgreSQL winner paths
 	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("SILO_TEST_DATABASE_URL is not set")
