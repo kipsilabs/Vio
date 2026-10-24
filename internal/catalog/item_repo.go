@@ -4566,19 +4566,22 @@ func (r *ItemRepository) Delete(ctx context.Context, contentID string) ([]string
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	// Collect image paths before deletion.
+	// Collect image paths before deletion. The artwork columns predate their
+	// NOT NULL defaults (episodes.still_path and seasons.poster_path are still
+	// nullable), so every arm coalesces: a single NULL would fail the scan
+	// below and take the whole delete with it.
 	imgRows, err := tx.Query(ctx, `
-		SELECT poster_path, backdrop_path, logo_path FROM media_items WHERE content_id = $1
+		SELECT COALESCE(poster_path, ''), COALESCE(backdrop_path, ''), COALESCE(logo_path, '') FROM media_items WHERE content_id = $1
 		UNION ALL
-		SELECT banner_path, thumb_path, clearart_path FROM media_items WHERE content_id = $1
+		SELECT COALESCE(banner_path, ''), COALESCE(thumb_path, ''), COALESCE(clearart_path, '') FROM media_items WHERE content_id = $1
 		UNION ALL
-		SELECT disc_path, '', '' FROM media_items WHERE content_id = $1
+		SELECT COALESCE(disc_path, ''), '', '' FROM media_items WHERE content_id = $1
 		UNION ALL
-		SELECT path, '', '' FROM media_item_backdrops WHERE content_id = $1
+		SELECT COALESCE(path, ''), '', '' FROM media_item_backdrops WHERE content_id = $1
 		UNION ALL
-		SELECT poster_path, '', '' FROM seasons WHERE series_id = $1
+		SELECT COALESCE(poster_path, ''), '', '' FROM seasons WHERE series_id = $1
 		UNION ALL
-		SELECT still_path, '', '' FROM episodes WHERE series_id = $1
+		SELECT COALESCE(still_path, ''), '', '' FROM episodes WHERE series_id = $1
 	`, contentID)
 	if err != nil {
 		return nil, fmt.Errorf("collecting image paths before delete: %w", err)
