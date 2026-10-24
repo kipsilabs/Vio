@@ -134,7 +134,7 @@ func (r *HistoryReconciler) Run(ctx context.Context) (ReconcileStats, error) {
 		}
 
 		updateQuery := updateHistoryMediaItemQuery
-		if identity.StableType == "episode" {
+		if identity.StableType == stableTypeEpisode {
 			// The episode update must lock and canonicalize; a bare ID rewrite
 			// can recreate history under a hidden alias row.
 			updateQuery = updateEpisodeHistoryMediaItemQuery
@@ -158,12 +158,12 @@ func (r *HistoryReconciler) Run(ctx context.Context) (ReconcileStats, error) {
 
 func (r *HistoryReconciler) resolve(ctx context.Context, identity userstore.WatchIdentity) (string, error) {
 	switch identity.StableType {
-	case "movie":
+	case stableTypeMovie:
 		if len(identity.ProviderIDs) == 0 {
 			return "", nil
 		}
 		return r.resolver.ResolveMovieContentID(ctx, identity.ProviderIDs)
-	case "episode":
+	case stableTypeEpisode:
 		seriesProviderIDs := episodeSeriesProviderIDs(identity)
 		if len(seriesProviderIDs) == 0 || identity.Season == nil || identity.Episode == nil {
 			return "", nil
