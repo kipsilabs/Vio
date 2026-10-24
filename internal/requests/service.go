@@ -919,7 +919,7 @@ func (s *Service) detailRatingCeiling(ctx context.Context, viewer Viewer, mediaT
 	}
 	client, ok := s.tmdb.(TMDBCertificationClient)
 	if !ok {
-		return "", fmt.Errorf("requests: tmdb client cannot resolve certifications")
+		return "", errors.New("requests: tmdb client cannot resolve certifications")
 	}
 	cert, err := client.GetCertification(ctx, tmdbMediaType(mediaType), tmdbID)
 	if err != nil {
