@@ -4107,6 +4107,12 @@ export function VideoPlayer({
     videoFit,
     bottomInsetPx: subtitleHudInsetPx,
     onLoadState: setPGSSubtitleState,
+    onSourceChanged: handleSubtitleSourceChanged,
+    sourceGeneration: subtitleSourceGeneration,
+    cueRevision: activeSubtitleCueRevision,
+    transportRevision: engineTransportRevision,
+    replayRevision,
+    refreshRevision: subtitleRefreshRevision,
   });
   const subtitleLoadState = isASSActive
     ? assSubtitleState
