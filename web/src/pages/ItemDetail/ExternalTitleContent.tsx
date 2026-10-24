@@ -104,7 +104,9 @@ function TitleSeasons({ seasons }: { seasons: RequestMediaSeason[] }) {
     <SeasonRail count={seasons.length}>
       {seasons.map((season) => {
         const label = season.name || `Season ${season.season_number}`;
-        const poster = tmdbImageURL(season.poster_path);
+        // TVDB seasons come with an absolute poster_url; TMDB seasons come
+        // with a relative poster_path the image helper expands.
+        const poster = season.poster_url || tmdbImageURL(season.poster_path);
         return (
           <li key={season.season_number} className="embla__slide w-[160px] shrink-0 sm:w-[170px]">
             <div className="media-card-image relative aspect-[2/3] overflow-hidden rounded-xl">

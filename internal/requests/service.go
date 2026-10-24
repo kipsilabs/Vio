@@ -809,6 +809,16 @@ func (s *Service) DiscoverAll(ctx context.Context, viewer Viewer) ([]DiscoverySe
 // request-state signals used by search and discovery. Recommendations carry
 // their own per-item state so the detail page can render them as request cards.
 func (s *Service) GetDetail(ctx context.Context, viewer Viewer, mediaType MediaType, tmdbID int) (*MediaDetail, error) {
+	return s.getDetail(ctx, viewer, mediaType, tmdbID, "")
+}
+
+// GetDetailWithSeasonSource is GetDetail with an explicit series season
+// numbering source. An empty source keeps the default TVDB-preferred path.
+func (s *Service) GetDetailWithSeasonSource(ctx context.Context, viewer Viewer, mediaType MediaType, tmdbID int, seasonSource string) (*MediaDetail, error) {
+	return s.getDetail(ctx, viewer, mediaType, tmdbID, seasonSource)
+}
+
+func (s *Service) getDetail(ctx context.Context, viewer Viewer, mediaType MediaType, tmdbID int, preferredSeasonSource string) (*MediaDetail, error) {
 	if s == nil || s.store == nil || s.tmdb == nil {
 		return nil, fmt.Errorf("request service is not configured")
 	}
@@ -886,7 +896,7 @@ func (s *Service) GetDetail(ctx context.Context, viewer Viewer, mediaType MediaT
 		fromTVDB       bool
 	)
 	if mediaType == MediaTypeSeries {
-		seasonSource, resolvedTVDBID, fromTVDB, _ = s.seriesSeasonSource(ctx, raw, raw.TVDBID)
+		seasonSource, resolvedTVDBID, fromTVDB, _ = s.seriesSeasonSource(ctx, raw, raw.TVDBID, preferredSeasonSource)
 		counts, err := s.seasonCounts(ctx, primaryMatch)
 		if err != nil {
 			return nil, err
@@ -949,6 +959,13 @@ func (s *Service) GetDetail(ctx context.Context, viewer Viewer, mediaType MediaT
 	if fromTVDB {
 		detail.NumberOfSeasons, detail.NumberOfEpisodes = seriesSeasonTotals(seasonSource)
 	}
+	if mediaType == MediaTypeSeries {
+		if fromTVDB {
+			detail.SeasonSource = "tvdb"
+		} else if len(seasons) > 0 {
+			detail.SeasonSource = "tmdb"
+		}
+	}
 	if resolvedTVDBID > 0 {
 		tvdb := resolvedTVDBID
 		detail.TVDBID = &tvdb
@@ -997,6 +1014,7 @@ func (s *Service) CreateRequest(ctx context.Context, viewer Viewer, input Create
 	if err != nil {
 		return nil, err
 	}
+	normalized.SeasonSource = requestSeasonSource(normalized.SeasonSource)
 	if err := s.ensureCreateAllowedByCeiling(ctx, viewer, normalized); err != nil {
 		return nil, err
 	}
@@ -1066,7 +1084,7 @@ func (s *Service) CreateRequest(ctx context.Context, viewer Viewer, input Create
 			if tvdbID == 0 && normalized.TVDBID != nil {
 				tvdbID = *normalized.TVDBID
 			}
-			seasonSource, _, _, sourceAvailable := s.seriesSeasonSource(ctx, detail, tvdbID)
+			seasonSource, _, _, sourceAvailable := s.seriesSeasonSource(ctx, detail, tvdbID, normalized.SeasonSource)
 			seasons, err := s.resolveRequestedSeasons(ctx, normalized.Seasons, seasonSource, sourceAvailable, match)
 			if err != nil {
 				return nil, err

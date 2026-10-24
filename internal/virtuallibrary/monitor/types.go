@@ -39,6 +39,8 @@ type RequestDescriptor struct {
 	ExternalIds  map[string]string
 	PosterPath   string
 	BackdropPath string
+	// SeasonSource is the requester's TVDB/TMDB season source choice.
+	SeasonSource string
 }
 
 func (x *RequestDescriptor) GetMediaType() string {
@@ -67,6 +69,13 @@ func (x *RequestDescriptor) GetExternalIds() map[string]string {
 		return x.ExternalIds
 	}
 	return nil
+}
+
+func (x *RequestDescriptor) GetSeasonSource() string {
+	if x != nil {
+		return x.SeasonSource
+	}
+	return ""
 }
 
 type RouterConnection struct {

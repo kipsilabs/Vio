@@ -59,6 +59,7 @@ type RequestSeason struct {
 	EpisodeCount int          `json:"-"`
 	AirDate      string       `json:"-"`
 	PosterPath   string       `json:"-"`
+	PosterURL    string       `json:"-"`
 	Availability Availability `json:"-"`
 	// Requested reports that the title's active request covers the season.
 	Requested bool `json:"-"`
@@ -132,13 +133,16 @@ func (s *Service) requestFulfilled(ctx context.Context, req Request, match Prese
 }
 
 // SeriesSeason is one season of a series as the request detail and create
-// paths see it, independent of which metadata source answered.
+// paths see it, independent of which metadata source answered. PosterPath is a
+// provider-relative path (TMDB); PosterURL is absolute artwork a provider such
+// as TVDB supplies instead.
 type SeriesSeason struct {
 	Number       int
 	Name         string
 	EpisodeCount int
 	AirDate      string
 	PosterPath   string
+	PosterURL    string
 }
 
 // seasonsFromTMDB converts TMDB's season list. TMDB groups long anime into a
@@ -182,12 +186,21 @@ func seriesSeasonTotals(seasons []SeriesSeason) (seasonsCount, episodesCount int
 //
 // The provider is asked for English because the request TMDB client also
 // returns English metadata (it sends no language).
-func (s *Service) seriesSeasonSource(ctx context.Context, detail *tmdb.MediaDetail, tvdbID int) (seasons []SeriesSeason, resolvedTVDBID int, fromTVDB bool, available bool) {
+func (s *Service) seriesSeasonSource(ctx context.Context, detail *tmdb.MediaDetail, tvdbID int, seasonSource string) (seasons []SeriesSeason, resolvedTVDBID int, fromTVDB bool, available bool) {
 	switch {
 	case detail != nil && detail.TVDBID > 0:
 		resolvedTVDBID = detail.TVDBID
 	case tvdbID > 0:
 		resolvedTVDBID = tvdbID
+	}
+	// An explicit TMDB request bypasses TVDB entirely. This is the inverse of
+	// the default path: the detail API and request validation must agree with
+	// the source the requester chose.
+	if requestSeasonSource(seasonSource) == "tmdb" {
+		if detail != nil {
+			return seasonsFromTMDB(detail), resolvedTVDBID, false, true
+		}
+		return nil, resolvedTVDBID, false, false
 	}
 	if resolvedTVDBID == 0 && detail != nil && s.tvdbResolver != nil {
 		id, err := s.tvdbResolver.ResolveSeriesTVDBID(ctx, detail.ID, detail.IMDbID)
@@ -300,7 +313,8 @@ func requestSeasons(seasons []SeriesSeason, counts map[int]SeasonCounts, active 
 		requested := active != nil && (len(active.Seasons) == 0 || slices.Contains(active.Seasons, season.Number))
 		out = append(out, RequestSeason{
 			Number: season.Number, Name: season.Name, EpisodeCount: season.EpisodeCount, AirDate: season.AirDate,
-			PosterPath: season.PosterPath, Availability: availability, Requested: requested,
+			PosterPath: season.PosterPath, PosterURL: season.PosterURL,
+			Availability: availability, Requested: requested,
 		})
 	}
 	return out

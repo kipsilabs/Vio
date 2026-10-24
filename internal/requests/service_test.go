@@ -2060,6 +2060,7 @@ func (f *fakeStore) CreateRequest(_ context.Context, input CreateRequestRecord) 
 		IsAnime:              input.IsAnime,
 		RoutingFacts:         input.Facts,
 		Seasons:              input.Input.Seasons,
+		SeasonSource:         input.Input.SeasonSource,
 		RequestedByUserID:    input.Requester.UserID,
 		RequestedByProfileID: input.Requester.ProfileID,
 		Source:               requestSource(input.Input.Source),

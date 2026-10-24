@@ -4,12 +4,16 @@ import type { RequestMediaDetail, RequestMediaSeason } from "@/api/types";
 
 const mocks = vi.hoisted(() => ({
   create: vi.fn(),
+  detailCalls: [] as Array<{ mediaType: string; tmdbID: number; options?: unknown }>,
   loaded: { data: undefined as RequestMediaDetail | undefined, isFetching: false, isError: false },
 }));
 
 vi.mock("@/hooks/queries/useRequests", () => ({
   useCreateMediaRequest: () => ({ mutate: mocks.create, isPending: false }),
-  useRequestMediaDetail: () => mocks.loaded,
+  useRequestMediaDetail: (mediaType: string, tmdbID: number, options?: unknown) => {
+    mocks.detailCalls.push({ mediaType, tmdbID, options });
+    return mocks.loaded;
+  },
 }));
 
 import { RequestSeasonsDialog } from "./RequestSeasonsDialog";
@@ -49,6 +53,7 @@ function open(detail?: RequestMediaDetail) {
 describe("RequestSeasonsDialog", () => {
   beforeEach(() => {
     mocks.create.mockReset();
+    mocks.detailCalls.length = 0;
     mocks.loaded = { data: undefined, isFetching: false, isError: false };
   });
 
@@ -59,6 +64,30 @@ describe("RequestSeasonsDialog", () => {
     expect(available).toHaveAccessibleDescription(/In library/);
     fireEvent.click(within(dialog).getByRole("button", { name: "Request Season 1" }));
     expect(mocks.create.mock.calls[0]![0]).not.toHaveProperty("seasons");
+    expect(mocks.create.mock.calls[0]![0]).toMatchObject({ season_source: "tvdb" });
+  });
+
+  it("switches the season source and sends the chosen source", () => {
+    mocks.loaded = {
+      data: series({
+        season_source: "tmdb",
+        seasons: [season(1), season(2, { air_date: "2999-01-01" })],
+      }),
+      isFetching: false,
+      isError: false,
+    };
+    const dialog = open(series({ season_source: "tvdb", seasons: [season(1)] }));
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "TMDB" }));
+
+    expect(mocks.detailCalls.at(-1)).toMatchObject({
+      mediaType: "series",
+      tmdbID: 42,
+      options: { enabled: true, seasonSource: "tmdb" },
+    });
+    expect(within(dialog).getByRole("switch", { name: "Season 2" })).toBeInTheDocument();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Request Season 1" }));
+    expect(mocks.create.mock.calls[0]![0]).toMatchObject({ season_source: "tmdb" });
   });
 
   it("requests a series with nothing aired whole", () => {

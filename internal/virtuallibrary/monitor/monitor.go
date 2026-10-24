@@ -1297,7 +1297,8 @@ func mediaFromRequest(r *RequestDescriptor) (monitoredMedia, error) {
 	return monitoredMedia{
 		Key: typ + ":" + streamID, MediaType: typ, Title: strings.TrimSpace(r.GetTitle()), Year: r.GetYear(),
 		StreamID: streamID, IMDbID: imdb, TMDBID: tmdb, TVDBID: tvdb, SourceKey: "request:" + typ + ":" + streamID,
-		Poster: strings.TrimSpace(r.PosterPath), Backdrop: strings.TrimSpace(r.BackdropPath),
+		MetadataSource: strings.TrimSpace(r.GetSeasonSource()),
+		Poster:         strings.TrimSpace(r.PosterPath), Backdrop: strings.TrimSpace(r.BackdropPath),
 	}, nil
 }
 

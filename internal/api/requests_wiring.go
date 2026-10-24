@@ -49,6 +49,7 @@ func requestDescriptorOf(req mediarequests.Request) *monitor.RequestDescriptor {
 		Year:         year,
 		PosterPath:   req.PosterPath,
 		BackdropPath: req.BackdropPath,
+		SeasonSource: req.SeasonSource,
 		ExternalIds: map[string]string{
 			"imdb": req.IMDbID,
 			"tmdb": tmdbStr,

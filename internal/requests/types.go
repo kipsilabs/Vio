@@ -275,7 +275,10 @@ type Request struct {
 	// reason was given. v2 only; the frozen v1 shape does not carry it.
 	OutcomeReason string `json:"-"`
 	// Source is what created the request. v2 only.
-	Source           Source     `json:"-"`
+	Source Source `json:"-"`
+	// SeasonSource is the metadata provider whose season numbering the request
+	// was created with: "tvdb", "tmdb", or empty for the server default. v2 only.
+	SeasonSource     string     `json:"-"`
 	IntegrationKind  string     `json:"integration_kind,omitempty"`
 	IsAnime          bool       `json:"is_anime"`
 	Targets          []Target   `json:"targets,omitempty"`
@@ -505,6 +508,9 @@ type MediaDetail struct {
 	// Seasons lists a series' regular seasons with their library
 	// availability and whether the active request covers them.
 	Seasons []RequestSeason `json:"-"`
+	// SeasonSource is the metadata provider that supplied Seasons: "tvdb",
+	// "tmdb", or empty for the server default. v2 only.
+	SeasonSource string `json:"-"`
 }
 
 type CreateRequestInput struct {
@@ -528,6 +534,9 @@ type CreateRequestInput struct {
 	// Source records what created the request; empty means SourceDirect.
 	// Set by the watchlist path, never read from a client body.
 	Source Source `json:"-"`
+	// SeasonSource selects the series metadata provider whose season numbering
+	// the request uses: "tvdb", "tmdb", or empty for the server default.
+	SeasonSource string `json:"-"`
 }
 
 // RequestPageKey identifies the last emitted request in descending creation order.
