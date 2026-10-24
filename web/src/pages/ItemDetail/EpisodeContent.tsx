@@ -385,6 +385,7 @@ export default function EpisodeContent({
               compactMobile
               item={item}
               contentId={item.content_id}
+              hasVirtualSource={item.has_virtual_source === true}
               canAddToCollection={false}
               watchTogether={watchTogether.menu}
               playHref={isPlayable ? `/watch/${item.content_id}` : undefined}

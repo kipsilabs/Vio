@@ -153,6 +153,11 @@ type virtualEpisode struct {
 	Thumbnail string    `json:"thumbnail,omitempty"`
 	Released  time.Time `json:"released,omitempty"`
 	Available bool      `json:"available,omitempty"`
+	// Season artwork is repeated on each episode because the registration
+	// payload is episode-based; the catalog upsert keeps one row per season.
+	SeasonPosterPath       string `json:"season_poster_path,omitempty"`
+	SeasonPosterSourcePath string `json:"season_poster_source_path,omitempty"`
+	SeasonPosterThumbhash  string `json:"season_poster_thumbhash,omitempty"`
 }
 
 // NewSearchClient builds a SearchClient with an injectable HTTP client. A nil

@@ -46,6 +46,10 @@ type LibraryMetadataLookupResult struct {
 	// Episodes holds every well-formed episode observation gathered by this
 	// call.
 	Episodes []EpisodeResult
+	// Seasons is the provider season list accepted by this call, including
+	// season artwork. It is separate from Episodes so virtual registration can
+	// persist season rows without re-querying the provider.
+	Seasons []SeasonResult
 	// NextSeason is the cursor to pass back as Options.AfterSeason. It is the
 	// last season this call attempted, or 0 once the traversal reached the end
 	// of the season list (or nothing was left to examine).
@@ -235,6 +239,7 @@ func (s *MetadataService) lookupLibrarySeriesEpisodes(
 		result.Complete = false
 		return err
 	}
+	result.Seasons = seasons
 	candidates := make([]SeasonResult, 0, len(seasons))
 	for _, season := range seasons {
 		if season.SeasonNumber > opts.AfterSeason {

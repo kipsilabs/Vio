@@ -177,10 +177,48 @@ func applyLibraryMetadataResult(item *monitor.MonitoredMedia, result *metadata.L
 		// delete an episode that an earlier lookup or the catalog already
 		// knows about, and Complete does not authorize deletion either.
 		item.Episodes = monitor.MergeEpisodes(item.Episodes, libraryEpisodes(result.Episodes))
+		applySeasonArtwork(item, result.Seasons)
 	}
 	item.MediaFolderID = folderID
 	item.MetadataNextSeason = result.NextSeason
 	item.MetadataComplete = result.Complete
+}
+
+// applySeasonArtwork attaches provider season posters to the episodes that
+// belong to each season. The registration payload is episode-based, and the
+// catalog keeps one season row, so repeating the poster on each episode is the
+// transport that reaches the season upsert.
+func applySeasonArtwork(item *monitor.MonitoredMedia, seasons []metadata.SeasonResult) {
+	if item == nil || len(seasons) == 0 {
+		return
+	}
+	bySeason := make(map[int]metadata.SeasonResult, len(seasons))
+	for _, season := range seasons {
+		if season.SeasonNumber <= 0 {
+			continue
+		}
+		bySeason[season.SeasonNumber] = season
+	}
+	for i := range item.Episodes {
+		season, ok := bySeason[item.Episodes[i].Season]
+		if !ok {
+			continue
+		}
+		path := strings.TrimSpace(season.PosterPath)
+		source := strings.TrimSpace(season.PosterSourcePath)
+		if path == "" && source == "" {
+			continue
+		}
+		if path == "" {
+			path = source
+		}
+		if source == "" {
+			source = path
+		}
+		item.Episodes[i].SeasonPosterPath = path
+		item.Episodes[i].SeasonPosterSourcePath = source
+		item.Episodes[i].SeasonPosterThumbhash = strings.TrimSpace(season.PosterThumbhash)
+	}
 }
 
 func applyMetadataResultFields(item *monitor.MonitoredMedia, md *metadata.MetadataResult) {

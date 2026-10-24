@@ -264,6 +264,7 @@ export function catalogItemDetailFromV2(item: CatalogItemDetailV2): ItemDetail {
   return {
     themes: item.themes,
     content_id: item.content_id,
+    has_virtual_source: item.has_virtual_source,
     play_content_id: item.play_content_id,
     play_season_number: item.play_season_number,
     type: item.type as ItemDetail["type"],

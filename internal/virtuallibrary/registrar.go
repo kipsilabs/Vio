@@ -29,6 +29,13 @@ type libraryArtworkEnqueuer interface {
 	EnqueueLibraryItemImages(context.Context, *models.MediaItem, map[string]string, []metadata.RemoteImage) error
 }
 
+// librarySeasonArtworkEnqueuer is the optional extension for season posters.
+// Keeping it separate preserves compatibility with test and alternate
+// enqueuers that only implement item artwork.
+type librarySeasonArtworkEnqueuer interface {
+	EnqueueLibrarySeasonImages(context.Context, string, []metadata.EnqueueImageCacheJobInput) error
+}
+
 var _ monitor.MediaRegistrar = (*catalogMonitorRegistrar)(nil)
 var _ interface {
 	Reconcile(context.Context, string, []string, []int, monitor.ReconcileEvidence) error
@@ -165,7 +172,73 @@ func (r *catalogMonitorRegistrar) EnqueueArtwork(ctx context.Context, contentID 
 		TvdbID:             strings.TrimSpace(item.TVDBID),
 		ImdbID:             strings.TrimSpace(item.IMDbID),
 	}
-	return r.artwork.EnqueueLibraryItemImages(ctx, stored, catalogProviderIDs(item), nil)
+	if err := r.artwork.EnqueueLibraryItemImages(ctx, stored, catalogProviderIDs(item), nil); err != nil {
+		return err
+	}
+	if seasonEnqueuer, ok := r.artwork.(librarySeasonArtworkEnqueuer); ok && item.MediaType == "series" {
+		if inputs := seasonImageInputs(contentID, item); len(inputs) > 0 {
+			return seasonEnqueuer.EnqueueLibrarySeasonImages(ctx, contentID, inputs)
+		}
+	}
+	return nil
+}
+
+// seasonImageInputs builds one cache job per season poster. Registration is
+// episode-based, so the same season poster is repeated across its episodes;
+// deduplicate by season before enqueuing.
+func seasonImageInputs(seriesID string, item monitor.MonitoredMedia) []metadata.EnqueueImageCacheJobInput {
+	seen := make(map[int]bool, len(item.Episodes))
+	inputs := make([]metadata.EnqueueImageCacheJobInput, 0, len(item.Episodes))
+	for _, episode := range item.Episodes {
+		if episode.Season <= 0 || seen[episode.Season] {
+			continue
+		}
+		source := strings.TrimSpace(episode.SeasonPosterSourcePath)
+		if source == "" {
+			source = strings.TrimSpace(episode.SeasonPosterPath)
+		}
+		if source == "" {
+			continue
+		}
+		seen[episode.Season] = true
+		season := episode.Season
+		inputs = append(inputs, metadata.EnqueueImageCacheJobInput{
+			TargetType:        metadata.ImageCacheTargetSeason,
+			TargetContentID:   fmt.Sprintf("%s-%d", strings.Replace(seriesID, "series-", "season-", 1), season),
+			SeriesID:          seriesID,
+			SourcePath:        source,
+			ProviderID:        artworkProviderID(source),
+			ProviderContentID: artworkProviderContentID(item, source),
+			ContentType:       "series",
+			ImageType:         metadata.ImageCacheImagePoster,
+			SeasonNumber:      &season,
+			RequeueSucceeded:  true,
+		})
+	}
+	return inputs
+}
+
+func artworkProviderID(source string) string {
+	if i := strings.Index(source, "://"); i > 0 {
+		return strings.ToLower(strings.TrimSpace(source[:i]))
+	}
+	return ""
+}
+
+func artworkProviderContentID(item monitor.MonitoredMedia, source string) string {
+	switch artworkProviderID(source) {
+	case "tvdb":
+		return strings.TrimSpace(item.TVDBID)
+	case "tmdb":
+		return strings.TrimSpace(item.TMDBID)
+	case "imdb":
+		return strings.TrimSpace(item.IMDbID)
+	default:
+		if id := strings.TrimSpace(item.TVDBID); id != "" {
+			return id
+		}
+		return strings.TrimSpace(item.TMDBID)
+	}
 }
 
 func catalogArtworkSourcePath(path string) string {
@@ -259,14 +332,17 @@ func monitoredEpisodePayload(item monitor.MonitoredMedia) []catalog.VirtualEpiso
 			continue
 		}
 		episodes = append(episodes, catalog.VirtualEpisode{
-			SeasonNumber:   episode.Season,
-			EpisodeNumber:  episode.Episode,
-			Title:          strings.TrimSpace(episode.Title),
-			Overview:       strings.TrimSpace(episode.Overview),
-			StillPath:      strings.TrimSpace(episode.Thumbnail),
-			AirDate:        episode.Released,
-			RuntimeMinutes: episode.Runtime,
-			VirtualURI:     virtualEpisodeURI(item, episode),
+			SeasonNumber:           episode.Season,
+			EpisodeNumber:          episode.Episode,
+			Title:                  strings.TrimSpace(episode.Title),
+			Overview:               strings.TrimSpace(episode.Overview),
+			StillPath:              strings.TrimSpace(episode.Thumbnail),
+			SeasonPosterPath:       strings.TrimSpace(episode.SeasonPosterPath),
+			SeasonPosterSourcePath: strings.TrimSpace(episode.SeasonPosterSourcePath),
+			SeasonPosterThumbhash:  strings.TrimSpace(episode.SeasonPosterThumbhash),
+			AirDate:                episode.Released,
+			RuntimeMinutes:         episode.Runtime,
+			VirtualURI:             virtualEpisodeURI(item, episode),
 		})
 	}
 	return episodes
