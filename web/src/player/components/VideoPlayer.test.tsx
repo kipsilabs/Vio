@@ -160,6 +160,31 @@ vi.mock("../hooks/useASSSubtitles", () => ({
     return { isActive: false };
   },
 }));
+const pgsHook = vi.hoisted(() => ({
+  options: null as null | {
+    activeSubtitleIndex: number | null;
+    enabled: boolean;
+    sourceGeneration?: number;
+    cueRevision?: number;
+    transportRevision?: number;
+    replayRevision?: number;
+    refreshRevision?: number;
+  },
+}));
+vi.mock("../hooks/usePGSSubtitles", () => ({
+  usePGSSubtitles: (options: {
+    activeSubtitleIndex: number | null;
+    enabled: boolean;
+    sourceGeneration?: number;
+    cueRevision?: number;
+    transportRevision?: number;
+    replayRevision?: number;
+    refreshRevision?: number;
+  }) => {
+    pgsHook.options = options;
+    return { isActive: options.enabled && options.activeSubtitleIndex !== null };
+  },
+}));
 // The delay is the profile's saved offset; plain state stands in for the query.
 vi.mock("../hooks/useSubtitleDelay", async () => {
   const { useState } = await import("react");
@@ -294,6 +319,66 @@ function renderPlayer(overrides: Partial<Parameters<typeof VideoPlayer>[0]> = {}
     },
   };
 }
+
+const renderModePGS: PlayerSubtitleInfo = {
+  index: 0,
+  media_file_id: 7,
+  track_id: "file:7:subtitle:0",
+  language: "en",
+  codec: "pgs",
+  label: "English PGS",
+  source: "embedded",
+  url: "/api/v2/stream/session/subtitles/0.sup?file_id=7",
+  burn_in_only: false,
+};
+
+describe("PGS render mode", () => {
+  it("shows the bitmap canvas for a sidecar PGS track", async () => {
+    const { container, unmount } = renderPlayer({
+      subtitleUrls: [renderModePGS],
+      subtitleMode: "off",
+    });
+
+    act(() => {
+      controls.current?.onSubtitleSelect?.(0);
+    });
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
+
+    const canvas = container.querySelector("canvas");
+    expect(canvas).not.toBeNull();
+    expect(canvas!.style.display).not.toBe("none");
+    expect(pgsHook.options).toMatchObject({
+      activeSubtitleIndex: 0,
+      enabled: true,
+    });
+
+    unmount();
+  });
+
+  it("keeps the canvas hidden when the plan burns PGS in", async () => {
+    const burnInPlan = fixturePlanV3({
+      ...directPlan,
+      subtitle: { mode: "burn_in", inventory: [] },
+    });
+    const { container, unmount } = renderPlayer({
+      plan: burnInPlan,
+      subtitleUrls: [renderModePGS],
+      subtitleMode: "off",
+    });
+
+    act(() => {
+      controls.current?.onSubtitleSelect?.(0);
+    });
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
+
+    const canvas = container.querySelector("canvas");
+    expect(canvas).not.toBeNull();
+    expect(canvas!.style.display).toBe("none");
+    expect(pgsHook.options?.enabled).toBe(false);
+
+    unmount();
+  });
+});
 
 function planInvalidatedCommand(
   payload: Record<string, unknown> = {
