@@ -33,11 +33,11 @@ start is not blamed on it.
   (`windowed=1&position=&duration=`) through the shared window fetcher
   (`web/src/player/utils/subtitleWindows.ts`), so seeks far into a file do not
   download the whole track. A fresh window after a seek or track change asks
-  for 30 seconds, enough for first paint; extends ask for 120 seconds. The
-  fetcher starts the next extend 30 seconds before the current one ends and
-  seeks 30 seconds back on a fresh window, leaving room for a display set that
-  was already on screen. An extend keeps the parser's epoch state; a fresh
-  window starts a new parser.
+  for 60 seconds: 30 seconds behind the playhead and 30 seconds ahead, so a
+  slow extraction cannot be overtaken by playback. Extends ask for 120 seconds.
+  The fetcher starts the next extend 30 seconds before the current one ends,
+  leaving room for a display set that was already on screen. An extend keeps
+  the parser's epoch state; a fresh window starts a new parser.
 - A screen stays up until the next display set replaces it, but never past
   what has loaded: the end of the last finished window or, beyond it, the
   latest segment read from the window on the wire. Screens more than one window

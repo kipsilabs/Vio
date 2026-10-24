@@ -1,7 +1,13 @@
 // @vitest-environment node
 
 import { describe, expect, it } from "vitest";
-import { isASSCodec, isBitmapCodec, isPGSCodec, isSubtitleFormatLabel } from "./subtitleCodecs";
+import {
+  getSubtitleFormatLabel,
+  isASSCodec,
+  isBitmapCodec,
+  isPGSCodec,
+  isSubtitleFormatLabel,
+} from "./subtitleCodecs";
 
 describe("isPGSCodec", () => {
   it("matches PGS codec names case-insensitively", () => {
@@ -45,6 +51,13 @@ describe("isASSCodec", () => {
     expect(isASSCodec("ssa")).toBe(true);
     expect(isASSCodec("pgs")).toBe(false);
     expect(isASSCodec(undefined)).toBe(false);
+  });
+});
+
+describe("getSubtitleFormatLabel", () => {
+  it("names MOV_TEXT tracks instead of hiding the format", () => {
+    expect(getSubtitleFormatLabel("mov_text")).toBe("MOV_TEXT");
+    expect(getSubtitleFormatLabel("MOVTEXT")).toBe("MOV_TEXT");
   });
 });
 

@@ -176,7 +176,7 @@ describe("useSubtitleTracks", () => {
   });
 
   it("keeps prefetching past a window whose cues stop before the window end", async () => {
-    // First window's only cue ends at 12s — far short of the 120s window.
+    // First window's only cue ends at 12s — far short of the 60s window.
     // That must NOT be treated as end-of-input (the file is 2h long).
     fetchMock.mockResolvedValue(vttResponse("WEBVTT\n\n00:00:10.000 --> 00:00:12.000\nearly\n\n"));
 
@@ -196,13 +196,13 @@ describe("useSubtitleTracks", () => {
   it("stops prefetching once the window reaches the media duration", async () => {
     fetchMock.mockResolvedValue(vttResponse("WEBVTT\n\n00:00:10.000 --> 00:00:12.000\nearly\n\n"));
 
-    // Whole file fits inside the first 120s window.
-    const { videoRef } = renderTracks({ origin: 0, durationRef: { current: 100 } });
+    // Whole file fits inside the first 60s window.
+    const { videoRef } = renderTracks({ origin: 0, durationRef: { current: 50 } });
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(createdTracks[0]?.cues).toHaveLength(1));
 
-    videoRef.current!.currentTime = 100;
+    videoRef.current!.currentTime = 50;
     videoRef.current!.dispatchEvent(new Event("timeupdate"));
 
     // Give any (incorrect) follow-up fetch a chance to fire.
@@ -223,7 +223,7 @@ describe("useSubtitleTracks", () => {
     });
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
-    expect(String(fetchMock.mock.calls[0]![0])).toContain("position=1398&duration=120");
+    expect(String(fetchMock.mock.calls[0]![0])).toContain("position=1398&duration=60");
     expect(String(fetchMock.mock.calls[0]![0])).toContain("token=abc");
   });
 
@@ -654,8 +654,8 @@ describe("useSubtitleTracks", () => {
       await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
       await waitFor(() => expect(createdTracks[0]?.cues).toHaveLength(1));
 
-      // Enter the prefetch lead of window [0, 120] — this extend fails.
-      videoRef.current!.currentTime = 100;
+      // Enter the prefetch lead of window [0, 60] — this extend fails.
+      videoRef.current!.currentTime = 40;
       videoRef.current!.dispatchEvent(new Event("timeupdate"));
       await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
 
@@ -665,7 +665,7 @@ describe("useSubtitleTracks", () => {
       now += 6_000;
       videoRef.current!.dispatchEvent(new Event("timeupdate"));
       await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
-      expect(String(fetchMock.mock.calls[2]![0])).toContain("position=115");
+      expect(String(fetchMock.mock.calls[2]![0])).toContain("position=55");
       await waitFor(() =>
         expect(createdTracks[0]!.cues.map((c) => c.text)).toEqual(["first", "second"]),
       );
@@ -715,7 +715,7 @@ describe("useSubtitleTracks", () => {
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     const url = String(fetchMock.mock.calls[0]![0]);
     expect(url).toContain("position=");
-    expect(url).toContain("duration=120");
+    expect(url).toContain("duration=60");
     await waitFor(() => expect(createdTracks[0]?.cues.map((c) => c.text)).toEqual(["embedded"]));
 
     videoRef.current!.currentTime = 600;

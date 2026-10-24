@@ -68,6 +68,32 @@ const SOURCE_LABELS: Record<string, string> = {
   downloaded: "Downloaded",
 };
 
+function subtitleGroupKey(track: PlayerSubtitleInfo): string {
+  return [
+    (track.language ?? "").trim().toLowerCase(),
+    (track.codec ?? "").trim().toLowerCase(),
+    track.forced ? "forced" : "",
+    track.hearing_impaired ? "sdh" : "",
+    track.source ?? "embedded",
+  ].join("|");
+}
+
+/** Distinguish real tracks that share a language and flags but have no title. */
+function subtitleDisplayName(
+  track: PlayerSubtitleInfo,
+  languageName: string,
+  ordinal: number,
+  duplicateCount: number,
+): string {
+  const qualifiers: string[] = [];
+  if (track.forced) qualifiers.push("Forced");
+  if (track.hearing_impaired) qualifiers.push("SDH");
+  let label = languageName;
+  if (qualifiers.length > 0) label += ` (${qualifiers.join(", ")})`;
+  if (duplicateCount > 1) label += ` ${ordinal}`;
+  return label;
+}
+
 function formatDelay(ms: number): string {
   if (ms === 0) return "0 ms";
   const sign = ms > 0 ? "+" : "−";
@@ -112,6 +138,28 @@ export function SubtitleMenu({
   // indexes; the menu shows one row per distinct descriptor, keeping the first
   // ordinal for selection. Differing forced/hearing-impaired/flag rows stay.
   const sortedTracks = useMemo(() => dedupeSubtitleTracks(sortSubtitlesBySource(tracks)), [tracks]);
+  // The server publishes one row per real container stream. Some releases carry
+  // several untitled mov_text streams in the same language, so number the
+  // duplicate descriptor groups instead of showing “English” several times.
+  const groupCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const track of sortedTracks) {
+      const key = subtitleGroupKey(track);
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+    return counts;
+  }, [sortedTracks]);
+  const groupOrdinals = useMemo(() => {
+    const seen = new Map<string, number>();
+    const ordinals = new Map<number, number>();
+    for (const track of sortedTracks) {
+      const key = subtitleGroupKey(track);
+      const ordinal = (seen.get(key) ?? 0) + 1;
+      seen.set(key, ordinal);
+      ordinals.set(track.index, ordinal);
+    }
+    return ordinals;
+  }, [sortedTracks]);
 
   // Discover whether the server has AI subtitle translation configured, so we
   // only surface the entry point when it can actually do something. This is a
@@ -317,6 +365,12 @@ export function SubtitleMenu({
             {sortedTracks.map((track) => {
               const isActive = track.index === activeIndex;
               const languageName = getLanguageName(track.language);
+              const displayName = subtitleDisplayName(
+                track,
+                languageName,
+                groupOrdinals.get(track.index) ?? 1,
+                groupCounts.get(subtitleGroupKey(track)) ?? 1,
+              );
               const sourceLabel = SOURCE_LABELS[track.source ?? "embedded"] ?? "Embedded";
               const formatLabel = getSubtitleFormatLabel(track.codec);
               const hasDetail =
@@ -346,7 +400,7 @@ export function SubtitleMenu({
                   </span>
                   <span className="flex min-w-0 flex-1 flex-col">
                     <span className="flex w-full items-center justify-between gap-3">
-                      <span className="text-sm">{languageName}</span>
+                      <span className="text-sm">{displayName}</span>
                       <span className="flex shrink-0 items-center gap-1">
                         {formatLabel && (
                           <span className="rounded bg-white/10 px-1.5 py-0.5 text-[10px] tracking-wide text-white/50 uppercase">
