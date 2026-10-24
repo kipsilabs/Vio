@@ -97,6 +97,7 @@ export function createStallTracker(): StallTracker {
 export interface DownshiftQuality {
   label: string;
   bitrate_kbps?: number;
+  height?: number;
   preserves_source?: boolean;
 }
 
@@ -109,11 +110,23 @@ export interface DownshiftQuality {
 export function lowerQualityLabel(
   qualities: readonly DownshiftQuality[] | undefined,
   failedKbps: number,
+  failedHeight?: number,
 ): string | undefined {
-  let best: DownshiftQuality | undefined;
-  for (const quality of qualities ?? []) {
+  const lower = (qualities ?? []).filter((quality) => {
     const bitrate = quality.bitrate_kbps ?? 0;
-    if (quality.preserves_source === true || bitrate <= 0 || bitrate >= failedKbps) continue;
+    return quality.preserves_source !== true && bitrate > 0 && bitrate < failedKbps;
+  });
+  // Prefer a genuinely lower resolution: a 4K-low rung still asks the browser
+  // to decode 4K. Fall back to the next bitrate when the ladder has no lower
+  // height (for example a cropped source).
+  const lowerHeight =
+    failedHeight && failedHeight > 0
+      ? lower.filter((quality) => (quality.height ?? 0) > 0 && (quality.height ?? 0) < failedHeight)
+      : [];
+  const candidates = lowerHeight.length > 0 ? lowerHeight : lower;
+  let best: DownshiftQuality | undefined;
+  for (const quality of candidates) {
+    const bitrate = quality.bitrate_kbps ?? 0;
     if (best === undefined || bitrate > (best.bitrate_kbps ?? 0)) best = quality;
   }
   return best?.label;
