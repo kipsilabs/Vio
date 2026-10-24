@@ -79,6 +79,7 @@ const updateEpisodeHistoryMediaItemQuery = `
 		WHERE user_id = $2
 		  AND id = $3
 		  AND media_item_id = $4
+		  AND EXISTS (SELECT 1 FROM episodes WHERE content_id = $1)
 	`
 
 // HistoryReconciler repairs orphaned watch-history rows by resolving each row's
@@ -185,8 +186,14 @@ func (r *HistoryReconciler) rebindEpisodeHistory(ctx context.Context, newID stri
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	if _, err := tx.Exec(ctx, lockEpisodeSeriesQuery, newID); err != nil {
+	lockTag, err := tx.Exec(ctx, lockEpisodeSeriesQuery, newID)
+	if err != nil {
 		return false, fmt.Errorf("lock episode history series: %w", err)
+	}
+	// The lock statement also confirms the target episode exists; a resolved
+	// content ID can still be stale if the catalog changed underneath us.
+	if lockTag.RowsAffected() == 0 {
+		return false, nil
 	}
 	tag, err := tx.Exec(ctx, updateEpisodeHistoryMediaItemQuery, newID, userID, id, currentItemID)
 	if err != nil {
