@@ -3578,6 +3578,9 @@ func main() {
 		requestReconcileSvc.SetRequesterIdentityResolver(plugins.RequesterIdentityFromLookup(plugins.NewPgUserIdentityLookup(deps.DB)))
 		if metadataService != nil {
 			requestReconcileSvc.SetTVDBIDResolver(metadataService)
+			if source, ok := any(metadataService).(api.SeriesTVDBSeasonSource); ok {
+				requestReconcileSvc.SetSeriesSeasonProvider(api.NewSeriesSeasonProvider(source))
+			}
 		}
 		api.AttachRequestRouter(requestReconcileSvc, pluginService, vlSvc)
 		requestReconcileSvc.SetCatalogChangeNotifier(sections.InvalidateResolvedListCache)

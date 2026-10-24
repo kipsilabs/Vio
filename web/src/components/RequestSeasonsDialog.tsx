@@ -119,7 +119,7 @@ export function RequestSeasonsDialog({
         ) : seasons.length === 0 ? (
           requestable ? (
             <p className="text-muted-foreground py-6 text-center text-sm">
-              TMDB lists no seasons for this series yet; the request covers the whole series.
+              No seasons are listed for this series yet; the request covers the whole series.
             </p>
           ) : null
         ) : (
