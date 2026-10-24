@@ -4,6 +4,7 @@ import { useAutoQualityDownshift } from "../hooks/useAutoQualityDownshift";
 import { recordObservedBandwidthLimitKbps } from "../bandwidth-probe";
 import { skipTarget } from "../utils/skipTarget";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import type { CSSProperties } from "react";
 import type { ParsedCue } from "../utils/parseVTT";
 import { matchSubtitleTrackAcrossVersions, resolveSubtitleAutoSelect } from "../utils/subtitleSort";
 import type HlsType from "hls.js";
@@ -21,7 +22,7 @@ import { usePlayerFullscreenRoot } from "../context/PlayerFullscreenContext";
 import { isPlayerFullscreen, toggleFullscreen } from "../utils/fullscreen";
 import { useIntroSkipPrompt } from "../hooks/useIntroSkipPrompt";
 import { useRemuxSeeking } from "../hooks/useRemuxSeeking";
-import { useSubtitleTracks } from "../hooks/useSubtitleTracks";
+import { useSubtitleTracks, type ActiveSubtitleCue } from "../hooks/useSubtitleTracks";
 import { useASSSubtitles } from "../hooks/useASSSubtitles";
 import { useSubtitleFontPrefetch } from "../hooks/useSubtitleFontPrefetch";
 import { usePGSSubtitles } from "../hooks/usePGSSubtitles";
@@ -36,7 +37,7 @@ import { SubtitleSyncIndicator } from "./SubtitleSyncIndicator";
 import { useSubtitleAppearance } from "../hooks/useSubtitleAppearance";
 import { useSubtitleLayout } from "../hooks/useSubtitleLayout";
 import { useCoarsePointer } from "../hooks/useCoarsePointer";
-import { computeSubtitleFontSize } from "@/lib/subtitleAppearance";
+import { computeSubtitleFontSize, type SubtitleAppearance } from "@/lib/subtitleAppearance";
 import { useNextEpisode } from "../hooks/useNextEpisode";
 import { MARKER_KINDS, useMarkerEditor } from "../hooks/useMarkerEditor";
 import { useWatchTogetherPlaybackSync } from "../hooks/useWatchTogetherPlaybackSync";
@@ -509,6 +510,53 @@ function readStringPayload(
     }
   }
   return null;
+}
+
+// ─── Text cue placement ─────────────────────────────────────────────────────
+
+type SubtitleCueGroup = "top" | "middle" | "bottom";
+
+const SUBTITLE_CUE_GROUPS: readonly SubtitleCueGroup[] = ["top", "middle", "bottom"];
+
+// Alignment comes from the cue's own `align`; cues without one center, which
+// is what the overlay always did before placement was honored.
+const SUBTITLE_ALIGN_CLASS: Record<NonNullable<ActiveSubtitleCue["align"]>, string> = {
+  left: "self-start text-left",
+  center: "self-center text-center",
+  right: "self-end text-right",
+};
+
+function clampSubtitlePercent(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+/**
+ * The vertical group a text cue renders in. The cue's own `line` setting wins;
+ * a cue without one follows the viewer's subtitle position, where "top" is the
+ * top and the two bottom-anchored settings are both the bottom.
+ */
+function subtitleCueGroup(
+  cue: ActiveSubtitleCue,
+  position: SubtitleAppearance["position"],
+): SubtitleCueGroup {
+  return cue.line ?? (position === "top" ? "top" : "bottom");
+}
+
+/**
+ * How far a cue's box shifts toward its declared `position`, as a percentage
+ * of the player width. WebVTT anchors the box at `position` and `align` picks
+ * which box edge sits there; the shift is capped at the room the cue's `size`
+ * leaves, so the box never crosses a player edge. A cue without `position`
+ * stays on its alignment edge, and VTT's default `size` of 100% leaves no room
+ * to shift.
+ */
+function subtitleCueShiftPercent(cue: ActiveSubtitleCue): number {
+  if (cue.position === undefined) return 0;
+  const position = clampSubtitlePercent(cue.position, 0, 100);
+  const room = 100 - clampSubtitlePercent(cue.size ?? 100, 1, 100);
+  if (cue.align === "left") return clampSubtitlePercent(position, 0, room);
+  if (cue.align === "right") return -clampSubtitlePercent(100 - position, 0, room);
+  return clampSubtitlePercent(position - 50, -room / 2, room / 2);
 }
 
 export function VideoPlayer({
@@ -2224,10 +2272,23 @@ export function VideoPlayer({
   // (windowed VTT and ASS both fire) are ignored until the source identity
   // itself changes.
   const subtitleSourceChangedGenerationRef = useRef<number | null>(null);
+  // Set between a source-changed signal and the replan that answers it. The
+  // text-track hook must retry the window only once the re-minted URLs land:
+  // retrying when the 409 is signaled would re-fetch the stale URL. The
+  // planRevision effect below turns that landing into refreshRevision.
+  const subtitleRefreshPendingRef = useRef(false);
+  const [subtitleRefreshRevision, setSubtitleRefreshRevision] = useState(0);
+  useEffect(() => {
+    if (!subtitleRefreshPendingRef.current) return;
+    subtitleRefreshPendingRef.current = false;
+    setSubtitleRefreshRevision((revision) => revision + 1);
+  }, [planRevision]);
   const handleSubtitleSourceChanged = useCallback(() => {
     if (subtitleSourceChangedGenerationRef.current === subtitleSourceGeneration) return;
     subtitleSourceChangedGenerationRef.current = subtitleSourceGeneration;
-    onRefreshSubtitles?.(getSubtitleStartPosition());
+    if (!onRefreshSubtitles) return;
+    subtitleRefreshPendingRef.current = true;
+    onRefreshSubtitles(getSubtitleStartPosition());
   }, [getSubtitleStartPosition, onRefreshSubtitles, subtitleSourceGeneration]);
 
   const resumeFromTranslationPause = useCallback(() => {
@@ -3953,11 +4014,11 @@ export function VideoPlayer({
       : 0;
 
   // -- Subtitle cue matching --
-  // Returns active cue texts for custom rendering instead of native TextTrack
+  // Returns active cues for custom rendering instead of native TextTrack
   // (which has browser bugs with stale cues persisting after seek).
   const [textSubtitleState, setTextSubtitleState] = useState("idle");
   const [assSubtitleState, setASSSubtitleState] = useState("idle");
-  const activeCueTexts = useSubtitleTracks(
+  const activeSubtitleCues = useSubtitleTracks(
     videoRef,
     effectiveSubtitleTracks,
     activeSubtitleIndex,
@@ -3972,7 +4033,34 @@ export function VideoPlayer({
     handleSubtitleSourceChanged,
     subtitleSourceGeneration,
     activeSubtitleCueRevision,
+    subtitleRefreshRevision,
+    engineTransportRevision,
+    replayRevision,
   );
+
+  // Group cues by the vertical band their source cue declares (`line`), so a
+  // top-authored cue stays at the top while cues without one follow the
+  // viewer's subtitle position. Each group lays its own cues out; empty groups
+  // render nothing.
+  const groupedSubtitleCues = useMemo(() => {
+    const groups: Record<SubtitleCueGroup, ActiveSubtitleCue[]> = {
+      top: [],
+      middle: [],
+      bottom: [],
+    };
+    for (const cue of activeSubtitleCues) {
+      groups[subtitleCueGroup(cue, subtitleSettings.position)].push(cue);
+    }
+    return groups;
+  }, [activeSubtitleCues, subtitleSettings.position]);
+
+  // The bottom group keeps the measured bottom anchor and control-bar lift.
+  // With the viewer's position set to Top, the measured style anchors to the
+  // top instead, so explicit bottom-line cues fall back to the default bottom
+  // offset (the same 7% computeSubtitlePositionStyle uses before measuring)
+  // rather than following the setting upward.
+  const bottomGroupPositionStyle: CSSProperties =
+    subtitleSettings.position === "top" ? { top: "auto", bottom: "7%" } : subtitlePositionStyle;
 
   // -- ASS/SSA subtitle rendering via JASSUB (client-side libass) --
   const { isActive: isASSActive } = useASSSubtitles(
@@ -5855,41 +5943,90 @@ export function VideoPlayer({
             role="status"
             className="pointer-events-none absolute inset-x-0 top-20 z-40 flex justify-center"
           >
-            <span className="rounded bg-black/75 px-3 py-2 text-sm text-white">
-              {subtitleLoadState === "loading"
-                ? "Loading subtitles…"
-                : "Subtitles couldn't load. Retrying…"}
+            <span className="flex items-center gap-3 rounded bg-black/75 px-3 py-2 text-sm text-white">
+              {subtitleLoadState === "loading" ? (
+                "Loading subtitles…"
+              ) : (
+                <>
+                  {"Subtitles couldn't load."}
+                  {/* ASS rendering runs through libass and does not consume the
+                      refresh revision, so a retry could not rebuild it. */}
+                  {!isASSActive && (
+                    <button
+                      type="button"
+                      onClick={() => setSubtitleRefreshRevision((revision) => revision + 1)}
+                      className="pointer-events-auto rounded bg-white/10 px-2 py-0.5 text-sm font-medium text-white transition-colors hover:bg-white/20 focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:outline-none"
+                    >
+                      Retry
+                    </button>
+                  )}
+                </>
+              )}
             </span>
           </div>
         )}
 
       {/* Subtitle overlay — suppressed when JASSUB (ASS) is rendering; bitmap
           tracks are drawn by the PGS canvas above or burned in by the server.
-          While the control bar is up, bottom-anchored cues rise just above it
+          Cues are grouped by the band their source cue declares (top, middle,
+          bottom); cues without one follow the viewer's position setting. While
+          the control bar is up, bottom-anchored cues rise just above it
           (subtitleLiftPx) so they never overlap the HUD; they settle back when
           it hides. z-[5] keeps cues below the controls layer (z-10) as a
           safety, so any residual overlap tucks behind the bar rather than
           painting on top of it. */}
-      {!isDetached && !isASSActive && activeCueTexts.length > 0 && (
-        <div
-          className="pointer-events-none absolute inset-x-0 z-[5] flex flex-col items-center gap-1"
-          style={{
-            ...containerStyle,
-            ...subtitlePositionStyle,
-            transform: `translateY(-${subtitleLiftPx}px)`,
-            transition: "transform 200ms ease",
-          }}
-        >
-          {activeCueTexts.map((text, i) => (
-            <span
-              key={i}
-              className="inline-block rounded px-3 py-1 text-center leading-snug"
-              style={{ ...scaledCueStyle, whiteSpace: "pre-line" }}
-            >
-              {text}
-            </span>
-          ))}
-        </div>
+      {!isDetached && !isASSActive && activeSubtitleCues.length > 0 && (
+        <>
+          {SUBTITLE_CUE_GROUPS.map((group) => {
+            const cues = groupedSubtitleCues[group];
+            if (cues.length === 0) return null;
+            return (
+              <div
+                key={group}
+                data-subtitle-group={group}
+                className={`pointer-events-none absolute inset-x-0 z-[5] flex flex-col gap-1 ${
+                  group === "middle" ? "top-1/2 -translate-y-1/2" : ""
+                }`}
+                style={
+                  group === "bottom"
+                    ? {
+                        ...containerStyle,
+                        ...bottomGroupPositionStyle,
+                        transform: `translateY(-${subtitleLiftPx}px)`,
+                        transition: "transform 200ms ease",
+                      }
+                    : group === "top"
+                      ? { top: "10%" }
+                      : undefined
+                }
+              >
+                {cues.map((cue, i) => {
+                  const shiftPercent = subtitleCueShiftPercent(cue);
+                  return (
+                    <span
+                      key={i}
+                      className={`inline-block max-w-full rounded px-3 py-1 leading-snug ${
+                        SUBTITLE_ALIGN_CLASS[cue.align ?? "center"]
+                      }`}
+                      style={{
+                        ...scaledCueStyle,
+                        whiteSpace: "pre-line",
+                        ...(cue.size !== undefined
+                          ? { maxWidth: `${clampSubtitlePercent(cue.size, 1, 100)}%` }
+                          : null),
+                        ...(shiftPercent !== 0
+                          ? { position: "relative", left: `${shiftPercent}%` }
+                          : null),
+                      }}
+                    >
+                      {cue.text}
+                    </span>
+                  );
+                })}
+              </div>
+            );
+          })}
+        </>
       )}
 
       {/* Intro skip / undo prompt */}
