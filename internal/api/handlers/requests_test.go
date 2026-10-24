@@ -81,6 +81,10 @@ func (f *fakeRequestService) GetDetail(context.Context, mediarequests.Viewer, me
 	return nil, nil
 }
 
+func (f *fakeRequestService) GetDetailWithSeasonSource(ctx context.Context, viewer mediarequests.Viewer, mediaType mediarequests.MediaType, tmdbID int, _ string) (*mediarequests.MediaDetail, error) {
+	return f.GetDetail(ctx, viewer, mediaType, tmdbID)
+}
+
 func (f *fakeRequestService) CreateRequest(context.Context, mediarequests.Viewer, mediarequests.CreateRequestInput) (*mediarequests.Request, error) {
 	return nil, nil
 }

@@ -117,9 +117,11 @@ export function searchRequestMediaV2(
 export function getRequestMediaDetailV2(
   mediaType: RequestMediaType,
   tmdbID: number,
+  seasonSource?: "tvdb" | "tmdb",
 ): Promise<RequestMediaDetail> {
   return v2("GET /api/v2/requests/detail/{media_type}/{tmdb_id}", {
     path: { media_type: mediaType, tmdb_id: tmdbID },
+    query: seasonSource ? { season_source: seasonSource } : undefined,
   }).then(
     (d) =>
       ({

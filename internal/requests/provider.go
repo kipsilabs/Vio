@@ -93,10 +93,10 @@ func NewPluginRouterProvider(r RouterClientResolver) RequestRouterProvider {
 func routerDescriptor(req Request) *pluginv1.RequestDescriptor {
 	ids := map[string]string{}
 	if req.TMDBID != 0 {
-		ids["tmdb"] = strconv.Itoa(req.TMDBID)
+		ids[SeasonSourceTMDB] = strconv.Itoa(req.TMDBID)
 	}
 	if req.TVDBID != nil && *req.TVDBID > 0 {
-		ids["tvdb"] = strconv.Itoa(*req.TVDBID)
+		ids[SeasonSourceTVDB] = strconv.Itoa(*req.TVDBID)
 	}
 	if req.IMDbID != "" {
 		ids["imdb"] = req.IMDbID

@@ -25,11 +25,12 @@ type fakeRequests struct {
 	// detailDownload is the download progress GetDetail reports.
 	detailDownload *mediarequests.DownloadProgress
 
-	lastViewer mediarequests.Viewer
-	lastFilter mediarequests.ListFilter
-	lastCreate mediarequests.CreateRequestInput
-	lastCall   string
-	lastArgs   []any
+	lastViewer       mediarequests.Viewer
+	lastFilter       mediarequests.ListFilter
+	lastCreate       mediarequests.CreateRequestInput
+	lastDetailSource string
+	lastCall         string
+	lastArgs         []any
 }
 
 // fixtureMediaRequest is an approved movie request with one queued target.
@@ -84,13 +85,19 @@ func (f *fakeRequests) DiscoverAll(_ context.Context, viewer mediarequests.Viewe
 	return []mediarequests.DiscoverySection{{Key: "trending_movies", Title: "Trending Movies", Page: 1, TotalPages: 500, TotalResults: 10000, Results: []mediarequests.MediaResult{fixtureResult(949)}}}, nil
 }
 
-func (f *fakeRequests) GetDetail(_ context.Context, viewer mediarequests.Viewer, mediaType mediarequests.MediaType, tmdbID int) (*mediarequests.MediaDetail, error) {
+func (f *fakeRequests) GetDetail(ctx context.Context, viewer mediarequests.Viewer, mediaType mediarequests.MediaType, tmdbID int) (*mediarequests.MediaDetail, error) {
+	return f.GetDetailWithSeasonSource(ctx, viewer, mediaType, tmdbID, "")
+}
+
+func (f *fakeRequests) GetDetailWithSeasonSource(_ context.Context, viewer mediarequests.Viewer, mediaType mediarequests.MediaType, tmdbID int, seasonSource string) (*mediarequests.MediaDetail, error) {
+	f.lastDetailSource = seasonSource
 	if err := f.record(viewer, "detail", mediaType, tmdbID); err != nil {
 		return nil, err
 	}
 	return &mediarequests.MediaDetail{
 		MediaType: mediaType, TMDBID: tmdbID, IMDbID: "tt0113277", Title: "Heat", Year: 1995, Runtime: 170, Genres: []string{"Crime"},
-		Cast: []mediarequests.MediaCastMember{{Name: "Al Pacino", Character: "Vincent Hanna"}}, Director: "Michael Mann",
+		SeasonSource: seasonSource,
+		Cast:         []mediarequests.MediaCastMember{{Name: "Al Pacino", Character: "Vincent Hanna"}}, Director: "Michael Mann",
 		Recommendations: []mediarequests.MediaResult{fixtureResult(950)}, Availability: mediarequests.AvailabilityAvailable,
 		LibraryContentID: "movie:heat-1995", Request: mediarequests.RequestState{Reason: "already_available", Download: f.detailDownload},
 	}, nil
@@ -256,7 +263,7 @@ var requestOwner = with(bearer(memberToken), "X-Profile-Id", "p-owner")
 func TestCreateRequest(t *testing.T) {
 	svc := fixtureRequests()
 	h := newTestHandler(t, requestDeps(svc))
-	body := `{"media_type":"series","tmdb_id":1399,"title":"Game of Thrones","year":2011,"tvdb_id":121361}`
+	body := `{"media_type":"series","tmdb_id":1399,"title":"Game of Thrones","year":2011,"tvdb_id":121361,"season_source":"tmdb"}`
 	rec := do(t, h, http.MethodPost, "/api/v2/requests", body, requestOwner)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("%d %s", rec.Code, rec.Body.String())
@@ -274,6 +281,9 @@ func TestCreateRequest(t *testing.T) {
 	}
 	if svc.lastViewer != (mediarequests.Viewer{UserID: 1, ProfileID: "p-owner"}) || svc.lastCreate.MediaType != mediarequests.MediaTypeSeries || svc.lastCreate.TVDBID == nil || *svc.lastCreate.TVDBID != 121361 {
 		t.Fatalf("viewer %+v create %+v", svc.lastViewer, svc.lastCreate)
+	}
+	if svc.lastCreate.SeasonSource != "tmdb" {
+		t.Fatalf("season source = %q, want tmdb", svc.lastCreate.SeasonSource)
 	}
 
 	// A second active request for the same media is a 409, never a duplicate.
@@ -776,6 +786,7 @@ func TestGetRequestMediaDetail(t *testing.T) {
 	rec := do(t, h, http.MethodGet, "/api/v2/requests/detail/movie/949", "", requestOwner)
 	var got struct {
 		TMDBID           int      `json:"tmdb_id"`
+		SeasonSource     string   `json:"season_source"`
 		Availability     string   `json:"availability"`
 		LibraryContentID string   `json:"library_content_id"`
 		Networks         []string `json:"networks"`
@@ -789,11 +800,19 @@ func TestGetRequestMediaDetail(t *testing.T) {
 	if svc.lastArgs[0] != mediarequests.MediaTypeMovie || svc.lastArgs[1] != 949 {
 		t.Fatalf("args = %v", svc.lastArgs)
 	}
+	rec = do(t, h, http.MethodGet, "/api/v2/requests/detail/series/949?season_source=tmdb", "", requestOwner)
+	decodeBody(t, rec.Body, &got)
+	if rec.Code != 200 || svc.lastDetailSource != "tmdb" || got.SeasonSource != "tmdb" {
+		t.Fatalf("season source: %d %s source=%q", rec.Code, rec.Body.String(), svc.lastDetailSource)
+	}
+	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/requests/detail/series/949?season_source=imdb", "", requestOwner), TypeValidationFailed)
 	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/requests/detail/tv/949", "", requestOwner), TypeValidationFailed)
 	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/requests/detail/movie/0", "", requestOwner), TypeValidationFailed)
 	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/requests/detail/movie/abc", "", requestOwner), TypeValidationFailed)
 	svc.err = mediarequests.ErrNotFound
 	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/requests/detail/movie/949", "", requestOwner), TypeNotFound)
+	svc.err = mediarequests.ErrSeasonSourceUnavailable
+	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/requests/detail/series/949?season_source=tvdb", "", requestOwner), TypeDependencyUnavailable)
 }
 
 func TestDiscover(t *testing.T) {
