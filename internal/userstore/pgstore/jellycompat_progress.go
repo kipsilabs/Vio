@@ -9,6 +9,9 @@ import (
 )
 
 func (s *PostgresUserStore) setJellycompatProgress(ctx context.Context, tx pgx.Tx, profileID, itemID string, position, duration float64, completed bool, date time.Time) error {
+	if err := lockWatchStateSeries(ctx, tx, []string{itemID}); err != nil {
+		return err
+	}
 	targetID, err := canonicalWatchStateID(ctx, tx, itemID)
 	if err != nil {
 		return err

@@ -12,6 +12,40 @@
 -- This is a one-time data repair. The same repair function is called by
 -- ReconcileSeries after it inserts mappings, because the documented activation
 -- sequence applies migrations with an empty alias table and populates it later.
+--
+-- The repair below is destructive: it merges an alias episode's watch state
+-- into the canonical row and then deletes the alias row. A chain or cycle in
+-- episode_aliases makes that merge lossy (A -> B -> C moves A's state onto B,
+-- then deletes B's own state before the graph is ever rejected). Validate the
+-- graph first so a malformed install fails closed, before any watch-state row
+-- changes. Goose runs this migration in one transaction, so the exception also
+-- rolls back the functions this file creates.
+--
+-- The same check is repeated at the top of
+-- 20261023175027_serialize_episode_alias_guard so that migration still fails
+-- closed on its own; keep both copies.
+
+-- +goose StatementBegin
+DO $$
+DECLARE
+    offending_episode_id TEXT;
+BEGIN
+    SELECT aliased.alias_episode_id
+      INTO offending_episode_id
+      FROM episode_aliases aliased
+      JOIN episode_aliases canonical
+        ON canonical.canonical_episode_id = aliased.alias_episode_id
+       AND canonical.id <> aliased.id
+     ORDER BY aliased.alias_episode_id
+     LIMIT 1;
+
+    IF offending_episode_id IS NOT NULL THEN
+        RAISE EXCEPTION 'episode_aliases is not installable: episode % is both a canonical episode and an alias episode, so the table already contains a chain or cycle', offending_episode_id
+            USING ERRCODE = '23514';
+    END IF;
+END
+$$;
+-- +goose StatementEnd
 
 -- One identity lookup for every watch-state write. The partial unique index on
 -- episode_aliases.alias_episode_id makes this one indexed probe. An id with no

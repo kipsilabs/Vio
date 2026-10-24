@@ -23,9 +23,17 @@
 ./internal/userstore/pgstore TestEpisodeAliasWatchCountsCanonicalSeasonsDB
 ./internal/catalog TestEpisodeAliasReconcileRepairsWatchStateDB
 ./internal/userstore/pgstore TestPostgresWatchStateWritesCanonicalEpisodeDB
+./internal/userstore/pgstore TestPostgresAliasWriteSerializedWithReconcileDB
+./internal/userstore/pgstore TestPostgresCanonicalStateSurvivesReconcileSnapshotDB
+./internal/userstore/pgstore TestPostgresWatchStateWritesLockSeriesDB
 
 # The identity guard serializes concurrent writers and rejects cycles.
 ./internal/database TestEpisodeAliasIdentityGuardSerializesConcurrentWritesPostgres
+
+# Canonicalization validates the alias graph before the destructive watch-state
+# repair, so a pre-existing chain fails the migration with every progress,
+# history, hidden-state, and alias row unchanged.
+./internal/database TestEpisodeAliasChainValidationPrecedesWatchStateRepairPostgres
 
 # Play targets accept alias-owned files under the shared access filters.
 ./internal/catalog TestPlayableTargetsResolveCanonicalAliasFilesDB

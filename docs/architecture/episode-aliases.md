@@ -22,6 +22,26 @@ that duplicate layout row without deleting or renumbering either episode.
   that boundary. A legacy-data migration moves progress and history rows that
   were stored under alias IDs onto their canonical episode.
 
+## Watch-state writes
+
+Every watch-state write resolves the submitted id to its canonical episode
+before it writes, at the playback boundary and again in storage. A failed
+resolution never falls back to the submitted alias id: the write fails instead
+of recreating the hidden row that canonical reads ignore, and the caller can
+retry with the id it already holds. There is no single wire code for that
+failure: v2 bulk progress sync marks the item `dependency_unavailable`, v1 bulk
+sync returns a per-item `error`, and best-effort playback persistence only logs
+it. Treat the failed write as retryable rather than keying off one code.
+
+Resolution and the row write are serialized with reconciliation by one
+per-series advisory lock. A storage write takes its shared form
+(`pg_advisory_xact_lock_shared`) before resolving the id and holds it through
+commit; reconciliation and the alias identity trigger take it exclusively. A
+write therefore either sees the mapping reconciliation already committed, or
+commits before reconciliation takes its snapshot and repairs the row it wrote.
+Batch writes collect their series and lock them in id order, so two writers
+spanning several series cannot deadlock against each other.
+
 ## Database invariants
 
 The follow-up migration enforces:
@@ -34,6 +54,11 @@ The follow-up migration enforces:
 
 The repository also serializes alias writes per series and reports identity or
 coordinate conflicts instead of choosing an arbitrary mapping.
+
+The canonicalizing repair runs the same chain/cycle check before it moves any
+watch state, in the migration's transaction. A malformed install therefore
+fails the migration with progress, history, and alias rows unchanged instead of
+merging state onto an intermediate row and deleting it.
 
 ## Activation and reconciliation
 
