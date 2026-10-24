@@ -145,13 +145,70 @@ function hangingResponse(signal: AbortSignal): Promise<Response> {
   });
 }
 
+/**
+ * A response that settles like the real fetch: aborting its request before the
+ * body is delivered rejects with an AbortError rather than resolving into a
+ * response the caller already abandoned.
+ */
+function abortAwareResponse(text: string, init?: RequestInit): Promise<Response> {
+  const signal = init?.signal;
+  return new Promise<Response>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException("Aborted", "AbortError"));
+      return;
+    }
+    const onAbort = () => reject(new DOMException("Aborted", "AbortError"));
+    signal?.addEventListener("abort", onAbort, { once: true });
+    Promise.resolve().then(() => {
+      signal?.removeEventListener("abort", onAbort);
+      if (signal?.aborted) reject(new DOMException("Aborted", "AbortError"));
+      else resolve(mockFetchResponse(text));
+    });
+  });
+}
+
+/**
+ * A request the test settles by hand. Its promise rejects on abort exactly like
+ * a real fetch, so an abandoned window is distinguishable from one that landed.
+ */
+function deferredResponse(init?: RequestInit) {
+  const signal = init?.signal;
+  let settled = false;
+  let resolveResponse!: (response: Response) => void;
+  let rejectResponse!: (reason: unknown) => void;
+  const promise = new Promise<Response>((resolve, reject) => {
+    resolveResponse = resolve;
+    rejectResponse = reject;
+  });
+  const onAbort = () => {
+    if (settled) return;
+    settled = true;
+    rejectResponse(new DOMException("Aborted", "AbortError"));
+  };
+  if (signal?.aborted) onAbort();
+  else signal?.addEventListener("abort", onAbort, { once: true });
+  return {
+    promise,
+    get aborted() {
+      return signal?.aborted ?? false;
+    },
+    settle(text: string) {
+      if (settled) return;
+      settled = true;
+      resolveResponse(mockFetchResponse(text));
+    },
+  };
+}
+
 beforeEach(() => {
   constructorOpts.length = 0;
   instances.length = 0;
   rendererReady = Promise.resolve();
+  // Abort-aware by default: a request whose signal fires rejects instead of
+  // resolving, so tests cannot mistake an abandoned window for a loaded one.
   vi.stubGlobal(
     "fetch",
-    vi.fn().mockImplementation(() => Promise.resolve(mockFetchResponse(""))),
+    vi.fn().mockImplementation((_input, init) => abortAwareResponse("", init)),
   );
 });
 
@@ -382,6 +439,28 @@ describe("useASSSubtitles stream reload", () => {
     for (const [type, listener] of added) {
       expect(remove).toHaveBeenCalledWith(type, listener);
     }
+  });
+
+  it("removes a replaced renderer's resize listeners", async () => {
+    const videoRef = makeVideoRef(1);
+    const video = videoRef.current!;
+    const add = vi.spyOn(video, "addEventListener");
+    const remove = vi.spyOn(video, "removeEventListener");
+    const { unmount } = renderHook(() => useASSSubtitles(videoRef, [germanTrack], 6, false, 0, 0));
+    await waitFor(() => expect(instances).toHaveLength(1));
+    const first = add.mock.calls.filter(([type]) => type === "loadedmetadata" || type === "resize");
+    expect(first).toHaveLength(2);
+
+    await act(async () => {
+      video.currentTime = 590;
+      video.dispatchEvent(new Event("timeupdate"));
+    });
+    await waitFor(() => expect(instances).toHaveLength(2));
+
+    for (const [type, listener] of first) {
+      expect(remove).toHaveBeenCalledWith(type, listener);
+    }
+    unmount();
   });
 });
 
@@ -1094,6 +1173,450 @@ describe("useASSSubtitles bounded retry/watchdog policy", () => {
       unmount();
       error.mockRestore();
       vi.useRealTimers();
+    }
+  });
+
+  it("does not let timeupdate cancel an in-flight window refresh", async () => {
+    vi.useFakeTimers();
+    const state = vi.fn();
+    let calls = 0;
+    let refreshSignal: AbortSignal | undefined;
+    let refresh: ReturnType<typeof deferredResponse> | null = null;
+    vi.mocked(fetch).mockImplementation((_input, init) => {
+      calls += 1;
+      if (calls === 1) return abortAwareResponse("[Script Info]", init);
+      if (calls === 2) {
+        refreshSignal = init?.signal as AbortSignal;
+        refresh = deferredResponse(init);
+        return refresh.promise;
+      }
+      return abortAwareResponse("[Script Info]", init);
+    });
+    const videoRef = makeVideoRef(1);
+    const { unmount } = renderHook(() =>
+      useASSSubtitles(videoRef, [germanTrack], 6, false, 0, 0, state),
+    );
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(constructorOpts).toHaveLength(1);
+
+      // Start the replacement window at 590 and let timeupdate keep firing
+      // outside the old [0, 120] window while extraction is still pending.
+      await act(async () => {
+        videoRef.current!.currentTime = 590;
+        videoRef.current!.dispatchEvent(new Event("timeupdate"));
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(calls).toBe(2);
+      expect(refreshSignal?.aborted).toBe(false);
+      await act(async () => {
+        for (const time of [595, 600, 605]) {
+          videoRef.current!.currentTime = time;
+          videoRef.current!.dispatchEvent(new Event("timeupdate"));
+        }
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      // A normal playback tick must not supersede the request it is waiting on.
+      expect(refreshSignal?.aborted).toBe(false);
+      expect(calls).toBe(2);
+
+      await act(async () => {
+        refresh!.settle("[Script Info]");
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(constructorOpts).toHaveLength(2);
+      expect(state).toHaveBeenLastCalledWith("ready");
+      // The playhead ticked to 605, inside the committed [570, 690] window, so
+      // the completion backstop does not request another window.
+      expect(calls).toBe(2);
+    } finally {
+      unmount();
+      vi.useRealTimers();
+    }
+  });
+
+  it("reuses the last window across a transport rebuild", async () => {
+    const state = vi.fn();
+    const videoRef = makeVideoRef(1);
+    videoRef.current!.currentTime = 1021;
+    const { rerender } = renderHook(
+      ({ transportRevision }) =>
+        useASSSubtitles(
+          videoRef,
+          [germanTrack],
+          6,
+          false,
+          0,
+          0,
+          state,
+          undefined,
+          0,
+          "contain",
+          { x: 0, y: 0 },
+          0,
+          transportRevision,
+        ),
+      { initialProps: { transportRevision: 0 } },
+    );
+
+    await waitFor(() => expect(state).toHaveBeenLastCalledWith("ready"));
+    expect(String(vi.mocked(fetch).mock.calls[0]![0])).toContain("position=1001&duration=120");
+
+    // The replacement stream attaches at time 0; the remembered window must
+    // keep the request at the real playhead instead of restarting at 0.
+    videoRef.current!.currentTime = 0;
+    await act(async () => {
+      rerender({ transportRevision: 1 });
+    });
+
+    await waitFor(() => expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2));
+    expect(String(vi.mocked(fetch).mock.calls[1]![0])).toContain("position=1001&duration=120");
+    await waitFor(() => expect(state).toHaveBeenLastCalledWith("ready"));
+    // The commit backstop must not read the same ambiguous 0 and undo the
+    // window the rebuild just restored.
+    await act(async () => {});
+    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2);
+  });
+
+  it("starts from the playhead when a replay bump accompanies a transport rebuild", async () => {
+    const state = vi.fn();
+    const videoRef = makeVideoRef(1);
+    const requested: string[] = [];
+    vi.mocked(fetch).mockImplementation((input, init) => {
+      requested.push(String(input));
+      return abortAwareResponse("[Script Info]", init);
+    });
+    videoRef.current!.currentTime = 1021;
+    const { rerender } = renderHook(
+      ({ transportRevision, replayRevision }) =>
+        useASSSubtitles(
+          videoRef,
+          [germanTrack],
+          6,
+          false,
+          0,
+          0,
+          state,
+          undefined,
+          0,
+          "contain",
+          { x: 0, y: 0 },
+          0,
+          transportRevision,
+          replayRevision,
+        ),
+      { initialProps: { transportRevision: 0, replayRevision: 0 } },
+    );
+
+    await waitFor(() => expect(state).toHaveBeenLastCalledWith("ready"));
+    expect(requested[0]).toContain("position=1001&duration=120");
+
+    // The replay keeps the URL and source generation but starts at zero. The
+    // transport rebuild alone would reuse the old window; the explicit replay
+    // epoch must win.
+    videoRef.current!.currentTime = 0;
+    await act(async () => {
+      rerender({ transportRevision: 1, replayRevision: 1 });
+    });
+
+    await waitFor(() => expect(requested).toHaveLength(2));
+    expect(requested[1]).toContain("position=0&duration=120");
+  });
+
+  it("reconciles a resumed window once the playhead becomes authoritative", async () => {
+    const state = vi.fn();
+    const videoRef = makeVideoRef(1);
+    const requested: string[] = [];
+    let resumed: ReturnType<typeof deferredResponse> | null = null;
+    vi.mocked(fetch).mockImplementation((input, init) => {
+      requested.push(String(input));
+      if (requested.length === 2) {
+        resumed = deferredResponse(init);
+        return resumed.promise;
+      }
+      return abortAwareResponse("[Script Info]", init);
+    });
+    videoRef.current!.currentTime = 1021;
+    const { rerender } = renderHook(
+      ({ transportRevision }) =>
+        useASSSubtitles(
+          videoRef,
+          [germanTrack],
+          6,
+          false,
+          0,
+          0,
+          state,
+          undefined,
+          0,
+          "contain",
+          { x: 0, y: 0 },
+          0,
+          transportRevision,
+        ),
+      { initialProps: { transportRevision: 0 } },
+    );
+
+    await waitFor(() => expect(state).toHaveBeenLastCalledWith("ready"));
+    expect(requested[0]).toContain("position=1001&duration=120");
+
+    // The rebuilt transport briefly reports zero, so the committed window is
+    // resumed and the completion backstop is suppressed while the position is
+    // ambiguous.
+    videoRef.current!.currentTime = 0;
+    await act(async () => {
+      rerender({ transportRevision: 1 });
+    });
+    await waitFor(() => expect(requested).toHaveLength(2));
+    expect(requested[1]).toContain("position=1001&duration=120");
+
+    // The playhead becomes real while the resumed extraction is still pending.
+    // Completion must reconcile instead of leaving the old window in place.
+    videoRef.current!.currentTime = 750;
+    await act(async () => {
+      resumed!.settle("[Script Info]");
+    });
+
+    await waitFor(() => expect(requested).toHaveLength(3));
+    expect(requested[2]).toContain("position=730&duration=120");
+    await waitFor(() => expect(state).toHaveBeenLastCalledWith("ready"));
+  });
+
+  it("starts from zero when a track is re-enabled after a seek to the start", async () => {
+    const state = vi.fn();
+    const videoRef = makeVideoRef(1);
+    const video = videoRef.current!;
+    video.currentTime = 1021;
+    const { rerender } = renderHook(
+      ({ index }: { index: number | null }) =>
+        useASSSubtitles(videoRef, [germanTrack], index, false, 0, 0, state),
+      { initialProps: { index: 6 as number | null } },
+    );
+
+    await waitFor(() => expect(state).toHaveBeenLastCalledWith("ready"));
+    expect(String(vi.mocked(fetch).mock.calls[0]![0])).toContain("position=1001&duration=120");
+
+    // Subtitles off, seek to the start while paused, then on again. The window
+    // loaded at 1021 is not a transport continuation of this position.
+    await act(async () => {
+      rerender({ index: null });
+    });
+    video.currentTime = 0;
+    await act(async () => {
+      rerender({ index: 6 });
+    });
+
+    await waitFor(() => expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2));
+    expect(String(vi.mocked(fetch).mock.calls[1]![0])).toContain("position=0&duration=120");
+    await waitFor(() => expect(state).toHaveBeenLastCalledWith("ready"));
+    expect(constructorOpts).toHaveLength(2);
+  });
+
+  it("starts a fresh window when the subtitle source identity changes at zero", async () => {
+    const state = vi.fn();
+    const videoRef = makeVideoRef(1);
+    videoRef.current!.currentTime = 1021;
+    const { rerender } = renderHook(
+      ({ sourceGeneration }: { sourceGeneration: number }) =>
+        useASSSubtitles(
+          videoRef,
+          [germanTrack],
+          6,
+          false,
+          0,
+          0,
+          state,
+          undefined,
+          sourceGeneration,
+        ),
+      { initialProps: { sourceGeneration: 0 } },
+    );
+
+    await waitFor(() => expect(state).toHaveBeenLastCalledWith("ready"));
+    expect(String(vi.mocked(fetch).mock.calls[0]![0])).toContain("position=1001&duration=120");
+
+    // A restart from the beginning can arrive as a new source identity without
+    // changing the URL: the old position must not pin the request.
+    videoRef.current!.currentTime = 0;
+    await act(async () => {
+      rerender({ sourceGeneration: 1 });
+    });
+
+    await waitFor(() => expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2));
+    expect(String(vi.mocked(fetch).mock.calls[1]![0])).toContain("position=0&duration=120");
+  });
+
+  it("starts from the playhead when a same-identity rebuild follows a failed fresh run", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const state = vi.fn();
+    const requested: string[] = [];
+    vi.mocked(fetch).mockImplementation((input, init) => {
+      requested.push(String(input));
+      // Generation 0 commits [1001, 1121].
+      if (requested.length === 1) return abortAwareResponse("[Script Info]", init);
+      // The first run of generation 1 starts at the real playhead (0) and fails
+      // before it can commit anything.
+      if (requested.length === 2) {
+        return Promise.resolve(new Response(null, { status: 500 }));
+      }
+      return abortAwareResponse("[Script Info]", init);
+    });
+    const videoRef = makeVideoRef(1);
+    videoRef.current!.currentTime = 1021;
+    const { rerender } = renderHook(
+      ({
+        sourceGeneration,
+        transportRevision,
+      }: {
+        sourceGeneration: number;
+        transportRevision: number;
+      }) =>
+        useASSSubtitles(
+          videoRef,
+          [germanTrack],
+          6,
+          false,
+          0,
+          0,
+          state,
+          undefined,
+          sourceGeneration,
+          "contain",
+          { x: 0, y: 0 },
+          0,
+          transportRevision,
+        ),
+      { initialProps: { sourceGeneration: 0, transportRevision: 0 } },
+    );
+
+    try {
+      await waitFor(() => expect(state).toHaveBeenLastCalledWith("ready"));
+      expect(requested).toHaveLength(1);
+      expect(requested[0]).toContain("position=1001&duration=120");
+
+      // The source identity changes at the start of the timeline. The fresh
+      // run correctly requests the zero window and fails before committing, so
+      // generation 1 owns no window.
+      videoRef.current!.currentTime = 0;
+      await act(async () => {
+        rerender({ sourceGeneration: 1, transportRevision: 0 });
+      });
+      await waitFor(() => expect(requested).toHaveLength(2));
+      expect(requested[1]).toContain("position=0&duration=120");
+      await waitFor(() => expect(state).toHaveBeenLastCalledWith("error"));
+
+      // A transport rebuild of the same URL and generation must not certify
+      // generation 0's committed window as reusable: the run that started here
+      // never committed, so the request stays at the playhead instead of
+      // jumping to the stale 1001 window and disabling completion reconciliation.
+      await act(async () => {
+        rerender({ sourceGeneration: 1, transportRevision: 1 });
+      });
+      await waitFor(() => expect(requested).toHaveLength(3));
+      expect(requested[2]).toContain("position=0&duration=120");
+      await waitFor(() => expect(state).toHaveBeenLastCalledWith("ready"));
+      expect(constructorOpts).toHaveLength(2);
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  it("rechecks the playhead when a window lands after the position left it", async () => {
+    const state = vi.fn();
+    const videoRef = makeVideoRef(1);
+    const requested: Array<{ url: string; signal?: AbortSignal }> = [];
+    let refresh: ReturnType<typeof deferredResponse> | null = null;
+    vi.mocked(fetch).mockImplementation((input, init) => {
+      requested.push({ url: String(input), signal: init?.signal ?? undefined });
+      if (requested.length === 2) {
+        refresh = deferredResponse(init);
+        return refresh.promise;
+      }
+      return abortAwareResponse("[Script Info]", init);
+    });
+    const { unmount } = renderHook(() =>
+      useASSSubtitles(videoRef, [germanTrack], 6, false, 0, 0, state),
+    );
+    try {
+      await waitFor(() => expect(state).toHaveBeenLastCalledWith("ready"));
+      expect(requested).toHaveLength(1);
+
+      await act(async () => {
+        videoRef.current!.currentTime = 590;
+        videoRef.current!.dispatchEvent(new Event("timeupdate"));
+      });
+      await waitFor(() => expect(requested).toHaveLength(2));
+      expect(requested[1]!.url).toContain("position=570&duration=120");
+
+      // The playhead leaves the replacement while it is still extracting, then
+      // playback pauses: no later event will ask for the right window, so
+      // completion must recheck rather than stop at "ready".
+      videoRef.current!.currentTime = 750;
+      await act(async () => {
+        refresh!.settle("[Script Info]");
+      });
+
+      await waitFor(() => expect(requested).toHaveLength(3));
+      expect(requested[2]!.url).toContain("position=730&duration=120");
+      // The tick that moved the playhead never aborted the in-flight window.
+      expect(requested[1]!.signal?.aborted).toBe(false);
+      expect(constructorOpts).toHaveLength(3);
+    } finally {
+      unmount();
+    }
+  });
+
+  it("does not restart the same replacement for paired seeking/seeked events", async () => {
+    const state = vi.fn();
+    const videoRef = makeVideoRef(1);
+    const requested: Array<{ url: string; signal?: AbortSignal }> = [];
+    const pendingRequests: Array<ReturnType<typeof deferredResponse>> = [];
+    vi.mocked(fetch).mockImplementation((input, init) => {
+      requested.push({ url: String(input), signal: init?.signal ?? undefined });
+      if (requested.length === 1) return abortAwareResponse("[Script Info]", init);
+      const request = deferredResponse(init);
+      pendingRequests.push(request);
+      return request.promise;
+    });
+    const { unmount } = renderHook(() =>
+      useASSSubtitles(videoRef, [germanTrack], 6, false, 0, 0, state),
+    );
+    try {
+      await waitFor(() => expect(state).toHaveBeenLastCalledWith("ready"));
+
+      await act(async () => {
+        videoRef.current!.currentTime = 590;
+        videoRef.current!.dispatchEvent(new Event("timeupdate"));
+      });
+      await waitFor(() => expect(requested).toHaveLength(2));
+
+      // A seek to 3000 supersedes the in-flight window; its replacement starts
+      // once the aborted request settles.
+      videoRef.current!.currentTime = 3000;
+      await act(async () => {
+        videoRef.current!.dispatchEvent(new Event("seeking"));
+      });
+      await waitFor(() => expect(requested).toHaveLength(3));
+      expect(requested[2]!.url).toContain("position=2980&duration=120");
+
+      // `seeked` reports the same position for the same seek: it must not
+      // abort and restart the replacement that is already extracting.
+      await act(async () => {
+        videoRef.current!.dispatchEvent(new Event("seeked"));
+      });
+      expect(requested).toHaveLength(3);
+      expect(requested[2]!.signal?.aborted).toBe(false);
+
+      await act(async () => {
+        pendingRequests[1]!.settle("[Script Info]");
+      });
+      await waitFor(() => expect(state).toHaveBeenLastCalledWith("ready"));
+      expect(requested).toHaveLength(3);
+      expect(constructorOpts).toHaveLength(2);
+    } finally {
+      unmount();
     }
   });
 

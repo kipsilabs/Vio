@@ -11,6 +11,16 @@ describe("isSubtitleSourceChanged", () => {
     expect(await isSubtitleSourceChanged(resp)).toBe(true);
   });
 
+  it("is true for the v2 conflict problem document", async () => {
+    const resp = response(409, {
+      type: "https://siloserver.org/docs/api/v2/problems/conflict",
+      title: "Conflict",
+      status: 409,
+      detail: "Conflict",
+    });
+    expect(await isSubtitleSourceChanged(resp)).toBe(true);
+  });
+
   it("is false for a 409 carrying a different error code", async () => {
     const resp = response(409, { error: "something_else" });
     expect(await isSubtitleSourceChanged(resp)).toBe(false);
