@@ -12,7 +12,6 @@ import {
   type PGSPlacedObject,
 } from "../utils/pgs";
 import {
-  BITMAP_SUBTITLE_WINDOW_SECONDS,
   createSubtitleWindowFetcher,
   subtitlePlayheadSeconds,
   subtitleWindowUrl,
@@ -24,10 +23,12 @@ import {
 // back far enough to include a subtitle already showing at the playhead. A
 // display set can precede a long silent stretch, so allow a wide margin.
 const SEEK_BACKOFF = 30;
-// The first slice after a seek or track change only has to cover first paint;
-// the server extracts 30 s of PGS far faster than a 120 s span. Extends after
-// that use the full two-minute window.
-const FIRST_WINDOW_SECONDS = BITMAP_SUBTITLE_WINDOW_SECONDS;
+// A fresh slice must cover the playhead for long enough that a slow extraction
+// cannot outrun it. Thirty seconds back plus thirty seconds forward keeps the
+// playhead inside the in-flight range while the request is still on the wire;
+// a 30/30 pair made the window end at the playhead and caused an abort loop.
+const FRESH_WINDOW_FORWARD_SECONDS = 30;
+const FIRST_WINDOW_SECONDS = SEEK_BACKOFF + FRESH_WINDOW_FORWARD_SECONDS;
 const WINDOW_SECONDS = SUBTITLE_WINDOW_SECONDS;
 // Schedule the next slice with enough lead that a cold remote extraction has
 // time to land before playback reaches it.
@@ -460,12 +461,13 @@ export function usePGSSubtitles({
       },
       onWindowFailed: () => onLoadStateRef.current?.("error"),
     });
-    const maybeFetch = fetcher.maybeFetch;
+    const maybeFetch = () => fetcher.maybeFetch();
+    const maybeFetchAfterSeek = () => fetcher.maybeFetch(true);
 
     maybeFetch();
     videoEl.addEventListener("timeupdate", maybeFetch);
-    videoEl.addEventListener("seeking", maybeFetch);
-    videoEl.addEventListener("seeked", maybeFetch);
+    videoEl.addEventListener("seeking", maybeFetchAfterSeek);
+    videoEl.addEventListener("seeked", maybeFetchAfterSeek);
     frameRequest = requestAnimationFrame(renderFrame);
 
     return () => {
@@ -473,8 +475,8 @@ export function usePGSSubtitles({
       fetcher.dispose();
       if (frameRequest) cancelAnimationFrame(frameRequest);
       videoEl.removeEventListener("timeupdate", maybeFetch);
-      videoEl.removeEventListener("seeking", maybeFetch);
-      videoEl.removeEventListener("seeked", maybeFetch);
+      videoEl.removeEventListener("seeking", maybeFetchAfterSeek);
+      videoEl.removeEventListener("seeked", maybeFetchAfterSeek);
       canvasEl.getContext("2d")?.clearRect(0, 0, canvasEl.width, canvasEl.height);
     };
   }, [

@@ -223,8 +223,11 @@ export interface SubtitleWindowFetcherOptions {
 }
 
 export interface SubtitleWindowFetcher {
-  /** Fetches whatever the playhead needs next; see planSubtitleWindow. */
-  maybeFetch: () => void;
+  /**
+   * Fetches whatever the playhead needs next; see planSubtitleWindow.
+   * `seeked` marks a deliberate seek, which may revive a terminal fetcher.
+   */
+  maybeFetch: (seeked?: boolean) => void;
   coverage: () => SubtitleWindowCoverage;
   /** Drops coverage before `start` once the caller has released it. */
   releaseBefore: (start: number) => void;
@@ -311,7 +314,12 @@ export function createSubtitleWindowFetcher(
     try {
       armStallTimer();
       const response = await fetch(url, { signal: controller.signal });
-      if (await isSubtitleSourceChanged(response)) {
+      const sourceChangedResponse = await isSubtitleSourceChanged(response);
+      // The 409 check reads the body asynchronously. A seek or disposal while
+      // that read is pending must not signal a refresh for a request that is
+      // no longer on the wire.
+      if (disposed || inflight !== controller) return;
+      if (sourceChangedResponse) {
         // The plan's subtitle inventory is stale, so this URL can never
         // succeed. Signal once; the caller refreshes the plan and rebuilds
         // this fetcher with a new URL. No retry, no failure budget.
@@ -404,8 +412,19 @@ export function createSubtitleWindowFetcher(
     }
   }
 
-  function maybeFetch() {
-    if (disposed || terminal || sourceChanged) return;
+  function maybeFetch(seeked = false) {
+    if (disposed || sourceChanged) return;
+    if (terminal) {
+      // A deliberate seek is a new window request, not a retry of the failed
+      // one. Reset the exhausted budget so the viewer can recover without
+      // rebuilding the whole track.
+      if (!seeked) return;
+      terminal = false;
+      hardFailures = 0;
+      retryableFailures = 0;
+      retryDelay = 0;
+      lastFetchFailureAt = 0;
+    }
     const action = planSubtitleWindow(
       {
         hasFetched,
