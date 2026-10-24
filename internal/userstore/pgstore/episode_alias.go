@@ -18,6 +18,61 @@ type watchStateQuerier interface {
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 }
 
+// lockWatchStateSeries serializes a watch-state write against episode-alias
+// reconciliation for every episode series named by mediaItemIDs. It takes the
+// shared form of the per-series lock reconciliation takes exclusively
+// (lockEpisodeAliasSeries in internal/catalog, and the episode_aliases identity
+// guard trigger), so canonical resolution and the write cannot interleave with
+// a repair: reconciliation either commits before the resolver runs, so the
+// write sees the mapping and lands on the canonical episode, or it starts only
+// after the write commits, so its repair sees the row and moves it.
+//
+// The lock is transaction-scoped and must be acquired before resolving the
+// canonical id, because the resolution statement needs a snapshot taken after
+// the lock is granted. Series ids are locked in ascending order so a batch
+// write spanning several series cannot deadlock against another batch writer
+// that takes the same series in a different input order.
+//
+// Items that are not episodes (movies, series rows) have no series to lock and
+// are already canonical. Aliases are only defined between episodes that share
+// one series, so the submitted id's own episodes row names the series that
+// owns any mapping it can match.
+func lockWatchStateSeries(ctx context.Context, tx pgx.Tx, mediaItemIDs []string) error {
+	mediaItemIDs = compactMediaItemIDs(mediaItemIDs)
+	if len(mediaItemIDs) == 0 {
+		return nil
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT DISTINCT e.series_id
+		FROM episodes e
+		WHERE e.content_id = ANY($1::text[])
+		ORDER BY e.series_id`, mediaItemIDs)
+	if err != nil {
+		return fmt.Errorf("listing watch-state series: %w", err)
+	}
+	seriesIDs := make([]string, 0, len(mediaItemIDs))
+	for rows.Next() {
+		var seriesID string
+		if err := rows.Scan(&seriesID); err != nil {
+			rows.Close()
+			return fmt.Errorf("scanning watch-state series: %w", err)
+		}
+		seriesIDs = append(seriesIDs, seriesID)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterating watch-state series: %w", err)
+	}
+	for _, seriesID := range seriesIDs {
+		if _, err := tx.Exec(ctx,
+			`SELECT pg_advisory_xact_lock_shared(hashtextextended($1, 0))`, seriesID,
+		); err != nil {
+			return fmt.Errorf("locking watch-state series %q: %w", seriesID, err)
+		}
+	}
+	return nil
+}
+
 // canonicalWatchStateID maps one watch-state target to the canonical episode
 // through the same SQL function the progress migration and series
 // reconciliation use. An id with no alias mapping is returned unchanged, so

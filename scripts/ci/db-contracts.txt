@@ -62,9 +62,20 @@
 # for progress, hints, resume state, and history, keeping profiles separate.
 ./internal/userstore/pgstore TestPostgresWatchStateWritesCanonicalEpisodeDB
 
+# Reconciliation excludes concurrent watch-state writes for the same series and
+# preserves newer canonical state instead of overwriting it with a stale snapshot.
+./internal/userstore/pgstore TestPostgresAliasWriteSerializedWithReconcileDB
+./internal/userstore/pgstore TestPostgresCanonicalStateSurvivesReconcileSnapshotDB
+./internal/userstore/pgstore TestPostgresWatchStateWritesLockSeriesDB
+
 # The identity guard serializes concurrent writers per series at the database
 # boundary, so two concurrent one-hop mappings cannot commit a cycle.
 ./internal/database TestEpisodeAliasIdentityGuardSerializesConcurrentWritesPostgres
+
+# Canonicalization validates the alias graph before the destructive watch-state
+# repair, so a pre-existing chain fails the migration with every progress,
+# history, hidden-state, and alias row unchanged.
+./internal/database TestEpisodeAliasChainValidationPrecedesWatchStateRepairPostgres
 
 # Play targets select canonical episodes and accept an alias-owned file.
 ./internal/catalog TestPlayableTargetsResolveCanonicalAliasFilesDB
