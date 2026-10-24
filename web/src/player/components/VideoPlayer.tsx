@@ -2224,10 +2224,23 @@ export function VideoPlayer({
   // (windowed VTT and ASS both fire) are ignored until the source identity
   // itself changes.
   const subtitleSourceChangedGenerationRef = useRef<number | null>(null);
+  // Set between a source-changed signal and the replan that answers it. The
+  // text-track hook must retry the window only once the re-minted URLs land:
+  // retrying when the 409 is signaled would re-fetch the stale URL. The
+  // planRevision effect below turns that landing into refreshRevision.
+  const subtitleRefreshPendingRef = useRef(false);
+  const [subtitleRefreshRevision, setSubtitleRefreshRevision] = useState(0);
+  useEffect(() => {
+    if (!subtitleRefreshPendingRef.current) return;
+    subtitleRefreshPendingRef.current = false;
+    setSubtitleRefreshRevision((revision) => revision + 1);
+  }, [planRevision]);
   const handleSubtitleSourceChanged = useCallback(() => {
     if (subtitleSourceChangedGenerationRef.current === subtitleSourceGeneration) return;
     subtitleSourceChangedGenerationRef.current = subtitleSourceGeneration;
-    onRefreshSubtitles?.(getSubtitleStartPosition());
+    if (!onRefreshSubtitles) return;
+    subtitleRefreshPendingRef.current = true;
+    onRefreshSubtitles(getSubtitleStartPosition());
   }, [getSubtitleStartPosition, onRefreshSubtitles, subtitleSourceGeneration]);
 
   const resumeFromTranslationPause = useCallback(() => {
@@ -3953,11 +3966,11 @@ export function VideoPlayer({
       : 0;
 
   // -- Subtitle cue matching --
-  // Returns active cue texts for custom rendering instead of native TextTrack
+  // Returns active cues for custom rendering instead of native TextTrack
   // (which has browser bugs with stale cues persisting after seek).
   const [textSubtitleState, setTextSubtitleState] = useState("idle");
   const [assSubtitleState, setASSSubtitleState] = useState("idle");
-  const activeCueTexts = useSubtitleTracks(
+  const activeSubtitleCues = useSubtitleTracks(
     videoRef,
     effectiveSubtitleTracks,
     activeSubtitleIndex,
@@ -3972,6 +3985,9 @@ export function VideoPlayer({
     handleSubtitleSourceChanged,
     subtitleSourceGeneration,
     activeSubtitleCueRevision,
+    subtitleRefreshRevision,
+    engineTransportRevision,
+    replayRevision,
   );
 
   // -- ASS/SSA subtitle rendering via JASSUB (client-side libass) --
@@ -5870,7 +5886,7 @@ export function VideoPlayer({
           it hides. z-[5] keeps cues below the controls layer (z-10) as a
           safety, so any residual overlap tucks behind the bar rather than
           painting on top of it. */}
-      {!isDetached && !isASSActive && activeCueTexts.length > 0 && (
+      {!isDetached && !isASSActive && activeSubtitleCues.length > 0 && (
         <div
           className="pointer-events-none absolute inset-x-0 z-[5] flex flex-col items-center gap-1"
           style={{
@@ -5880,13 +5896,13 @@ export function VideoPlayer({
             transition: "transform 200ms ease",
           }}
         >
-          {activeCueTexts.map((text, i) => (
+          {activeSubtitleCues.map((cue, i) => (
             <span
               key={i}
               className="inline-block rounded px-3 py-1 text-center leading-snug"
               style={{ ...scaledCueStyle, whiteSpace: "pre-line" }}
             >
-              {text}
+              {cue.text}
             </span>
           ))}
         </div>
