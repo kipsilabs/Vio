@@ -109,6 +109,7 @@ function playbackSession(
     plan: fixturePlanV3(),
     planRevision: 1,
     transportRevision: 1,
+    replayRevision: 0,
     streamUrl: "/stream/session-1",
     sessionId: "session-1",
     playbackAttemptId: "attempt-1",

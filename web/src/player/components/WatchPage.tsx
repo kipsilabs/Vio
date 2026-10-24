@@ -1489,6 +1489,7 @@ function WatchPagePlayer({
         plan={session.plan}
         planRevision={session.planRevision}
         transportRevision={session.transportRevision}
+        replayRevision={session.replayRevision}
         browserEngine={session.browserEngine}
         nativeOriginalSupport={session.nativeOriginalSupport}
         shouldAutoPlay={session.shouldAutoPlay}

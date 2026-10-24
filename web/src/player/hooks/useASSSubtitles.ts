@@ -259,6 +259,10 @@ export function useASSSubtitles(
   // re-arms requestVideoFrameCallback only from inside its own callback, and
   // callbacks registered on an engine end with it, so the renderer rebuilds.
   transportRevision = 0,
+  // Bumped when a new playback session starts at the beginning. Unlike a
+  // transport rebuild, a replay can reuse the same URL and source generation,
+  // so it needs an explicit signal to discard the previous playhead's window.
+  replayRevision = 0,
 ): { isActive: boolean } {
   const onLoadStateRef = useRef(onLoadState);
   onLoadStateRef.current = onLoadState;
@@ -271,6 +275,19 @@ export function useASSSubtitles(
 
   const jassubRef = useRef<JASSUB | null>(null);
   const fillRef = useRef<ASSFillState | null>(null);
+  // The window a run committed, with the track identity it was loaded for, so
+  // a renderer rebuild can keep it. The video element can briefly report
+  // currentTime 0 while a replacement stream attaches; without this, the
+  // rebuild starts a window at 0 and then races the playhead at the real
+  // position. Written only on success and consumed by the next effect run,
+  // which clears it first: a run that merely starts, or that fails before
+  // committing, is not eligible to donate a window to a later rebuild.
+  const committedWindowRef = useRef<{
+    url: string;
+    sourceGeneration: number;
+    replayRevision: number;
+    start: number;
+  } | null>(null);
   const syncedFitRef = useRef(videoFit);
   const jassubImportRef = useRef<Promise<typeof JASSUB> | null>(null);
   // The track and cue revision the running renderer was built from, and
@@ -311,6 +328,25 @@ export function useASSSubtitles(
     const video = videoRef.current;
     onLoadStateRef.current?.("idle");
 
+    // A rebuild of the same track (plan revision, transport rebuild, retime)
+    // may keep the window the previous run committed. A deactivated track, a
+    // track switch, or a changed subtitle source identity starts over from the
+    // playhead rather than reviving a window from the previous position.
+    // Take the committed window, then invalidate it: this run must commit its
+    // own window before a later run can reuse one. That keeps a run that only
+    // started, or failed before its first commit, from certifying the previous
+    // generation's window as a continuation.
+    const previousCommitted = committedWindowRef.current;
+    committedWindowRef.current = null;
+    const rememberedWindow =
+      previousCommitted !== null &&
+      activeUrl !== null &&
+      previousCommitted.url === activeUrl &&
+      previousCommitted.sourceGeneration === sourceGeneration &&
+      previousCommitted.replayRevision === replayRevision
+        ? previousCommitted
+        : null;
+
     // Destroy JASSUB if the active track is not ASS, or player is detached,
     // or no video element is available.
     if (!activeUrl || !video || isDetached) {
@@ -318,6 +354,8 @@ export function useASSSubtitles(
         jassubRef.current.destroy();
         jassubRef.current = null;
       }
+      // Nothing was committed for this deactivated run, so there is no
+      // continuation left to preserve (off, seek to 0, on again).
       return;
     }
 
@@ -343,12 +381,24 @@ export function useASSSubtitles(
     // Infinity once the whole-track fallback is in use, so boundary refresh
     // never schedules.
     let usingWholeTrack = false;
-    let windowStart = Math.max(
+    const playheadStart = Math.max(
       0,
       (video.readyState > 0 ? video.currentTime : 0) +
         sourceOriginRef.current -
         ASS_WINDOW_LEAD_SECONDS,
     );
+    // The element reports 0 both for a real seek to the start and for a
+    // replacement stream that has not been seeked yet. Only the latter may
+    // reuse the committed window; in that case the position is unknown until
+    // the transport reports one, so the commit backstop below must not read it.
+    const resumedAtUnknownPlayhead =
+      rememberedWindow !== null &&
+      (video.readyState === 0 || video.currentTime <= 0) &&
+      rememberedWindow.start > playheadStart;
+    let windowStart =
+      resumedAtUnknownPlayhead && rememberedWindow !== null
+        ? rememberedWindow.start
+        : playheadStart;
     let windowEnd = windowStart + ASS_WINDOW_DURATION_SECONDS;
     // Consecutive windowed failures since the last successful window, shared by
     // the initial load and boundary refreshes so the 3→1→terminal budget is one
@@ -367,6 +417,9 @@ export function useASSSubtitles(
     // and wedge the mount on "Retrying…".
     let retryableTextFailures = 0;
     let busy = false;
+    // Start position of the attempt currently in flight, so a paired
+    // seeking/seeked event for the same position does not abort and restart it.
+    let attemptStart: number | null = null;
     // Newest seek target queued while an attempt is in flight.
     let pendingStart: number | null = null;
 
@@ -383,6 +436,21 @@ export function useASSSubtitles(
     let fontRefreshAttempts = 0;
     let fontRefreshTimer: ReturnType<typeof setTimeout> | null = null;
     let fontRefreshController: AbortController | null = null;
+
+    /** Whether the element can report a playhead at all. */
+    function playheadKnown(): boolean {
+      return !!video && video.readyState > 0;
+    }
+
+    /**
+     * Whether a resumed transport's ambiguous zero has become a real playhead.
+     * A resumed window deliberately skips completion reconciliation while the
+     * element still reports 0, but once a position arrives the normal backstop
+     * must not stay suppressed for the rest of that attempt.
+     */
+    function playheadLeftTransportZero(): boolean {
+      return !!video && video.readyState > 0 && video.currentTime > 0;
+    }
 
     /** Source-time position of the playhead (player clock + stream origin). */
     function sourcePosition(): number {
@@ -514,8 +582,8 @@ export function useASSSubtitles(
       progress: () => void,
       start: number,
       wholeTrack: boolean,
-    ) {
-      if (!video || cancelled) return;
+    ): Promise<boolean> {
+      if (!video || cancelled) return false;
       onLoadStateRef.current?.("loading");
 
       // Lazy-load JASSUB module (only once).
@@ -575,10 +643,10 @@ export function useASSSubtitles(
         throw err;
       }
 
-      if (cancelled || signal.aborted) return;
+      if (cancelled || signal.aborted) return false;
 
       const JASSUBClass = await classPromise;
-      if (cancelled || signal.aborted) return;
+      if (cancelled || signal.aborted) return false;
       const initialInset = fillInset(renderedSubContent, videoFitRef.current, coverCropRef.current);
       const instance = new JASSUBClass({
         video,
@@ -600,14 +668,18 @@ export function useASSSubtitles(
       // Guard against the effect being cleaned up while the constructor ran.
       if (cancelled || signal.aborted) {
         instance.destroy();
-        return;
+        return false;
       }
 
       const previous = jassubRef.current;
       jassubRef.current = instance;
       // Resizes skipped while a stream reload emptied the video happen here,
       // once the next stream has a frame size. Some browsers report that size
-      // after loadedmetadata, with a resize event.
+      // after loadedmetadata, with a resize event. Replacements share the same
+      // <video>, so drop the previous renderer's listeners before attaching the
+      // new pair rather than leaving them behind until the effect tears down.
+      stopResizeToStream?.();
+      stopResizeToStream = null;
       const resizeToStream = () => repaintASS(instance, () => jassubRef.current === instance);
       video.addEventListener("loadedmetadata", resizeToStream);
       video.addEventListener("resize", resizeToStream);
@@ -626,7 +698,7 @@ export function useASSSubtitles(
       fillRef.current = fill;
       instance._canvas.classList.toggle("player-ass-fill", videoFitRef.current === "cover");
       await instance.ready;
-      if (cancelled || signal.aborted || jassubRef.current !== instance) return;
+      if (cancelled || signal.aborted || jassubRef.current !== instance) return false;
       if (previous && previous !== instance) previous.destroy();
 
       // Fit and the player size can change while the subtitle source, fonts,
@@ -644,6 +716,9 @@ export function useASSSubtitles(
         // the failure budgets so a later unrelated error starts fresh.
         usingWholeTrack = wholeTrack;
         windowStart = start;
+        // This run's commit is the only window a later rebuild of this same
+        // track identity may reuse.
+        committedWindowRef.current = { url: activeUrl!, sourceGeneration, replayRevision, start };
         windowEnd = wholeTrack ? Infinity : start + ASS_WINDOW_DURATION_SECONDS;
         windowFailures = 0;
         textFailures = 0;
@@ -654,7 +729,9 @@ export function useASSSubtitles(
           ready: true,
         };
         onLoadStateRef.current?.("ready");
+        return true;
       }
+      return false;
     }
 
     /**
@@ -670,9 +747,10 @@ export function useASSSubtitles(
      * a release that errors every request from being re-fetched forever as the
      * window re-anchors on seeks.
      */
-    async function attempt(start: number, wholeTrack: boolean) {
+    async function attempt(start: number, wholeTrack: boolean, recheckAfterCommit = true) {
       if (cancelled || terminal || busy) return;
       busy = true;
+      attemptStart = start;
       supersededBySeek = false;
       const attemptController = new AbortController();
       activeController = attemptController;
@@ -684,8 +762,9 @@ export function useASSSubtitles(
       };
       // Arm the watchdog before the fetch, not on first progress.
       progress();
+      let committed = false;
       try {
-        await initJASSUB(attemptController.signal, progress, start, wholeTrack);
+        committed = await initJASSUB(attemptController.signal, progress, start, wholeTrack);
       } catch (err) {
         if (cancelled) return;
         // A signaled source change must not re-run against the same stale URL;
@@ -741,26 +820,47 @@ export function useASSSubtitles(
           terminal = true;
           return;
         }
+        // Re-anchor from the playhead unless it is unknown (an emptied
+        // element): then the window this attempt was for is still the best
+        // position and must not be replaced by a window at 0.
         const retryStart = usingWholeTrack
           ? windowStart
-          : Math.max(0, sourcePosition() - ASS_WINDOW_LEAD_SECONDS);
+          : playheadKnown()
+            ? Math.max(0, sourcePosition() - ASS_WINDOW_LEAD_SECONDS)
+            : start;
         retryTimer = setTimeout(() => {
           retryTimer = null;
-          void attempt(retryStart, usingWholeTrack);
+          void attempt(retryStart, usingWholeTrack, recheckAfterCommit);
         }, ASS_RETRY_BACKOFF_MS);
       } finally {
         if (timeout !== null) clearTimeout(timeout);
         if (activeController === attemptController) activeController = null;
         busy = false;
+        attemptStart = null;
         const next = pendingStart;
         pendingStart = null;
         if (next !== null && !cancelled && !terminal) {
           void attempt(next, false);
+        } else if (
+          committed &&
+          (recheckAfterCommit || playheadLeftTransportZero()) &&
+          !cancelled &&
+          !terminal &&
+          playheadKnown()
+        ) {
+          // Backstop for a playhead that left the committed window while the
+          // extraction ran and then stopped emitting events (paused). If the
+          // position is inside, this is a no-op: there is no refresh loop. An
+          // empty element has no playhead to reconcile, and a window resumed
+          // across a transport rebuild must not be undone by the same
+          // ambiguous 0 that made it necessary. Once that resumed attempt sees
+          // a real non-zero playhead, reconcile it.
+          maybeRefreshWindow(false);
         }
       }
     }
 
-    function maybeRefreshWindow() {
+    function maybeRefreshWindow(seek: boolean) {
       if (cancelled || terminal || usingWholeTrack || !jassubRef.current) return;
       const source = sourcePosition();
       const outside = source < windowStart - 1 || source > windowEnd + 1;
@@ -770,9 +870,17 @@ export function useASSSubtitles(
       // overlaps the cue currently on screen regardless of why it fired.
       const target = Math.max(0, source - ASS_WINDOW_LEAD_SECONDS);
       if (busy) {
-        // A seek while an attempt is in flight must win: cancel it and restart
-        // the budget at the new position once it settles.
-        if (outside) {
+        // Only a real seek supersedes an in-flight attempt. A timeupdate can
+        // report a position outside the old window while the replacement is
+        // still extracting; aborting on every tick would cancel that request
+        // indefinitely. Let the current attempt finish, then the next
+        // timeupdate starts the correct window.
+        if (outside && seek) {
+          // `seeking` and `seeked` both fire for one seek. When the
+          // replacement for this position is already pending or already
+          // extracting, one event is enough: aborting and restarting the same
+          // target twice would throw away a request that is about to land.
+          if (target === pendingStart || target === attemptStart) return;
           supersededBySeek = true;
           windowFailures = 0;
           usingWholeTrack = false;
@@ -790,10 +898,12 @@ export function useASSSubtitles(
       void attempt(target, false);
     }
 
-    void attempt(windowStart, false);
-    video.addEventListener("timeupdate", maybeRefreshWindow);
-    video.addEventListener("seeking", maybeRefreshWindow);
-    video.addEventListener("seeked", maybeRefreshWindow);
+    const handleTimeUpdate = () => maybeRefreshWindow(false);
+    const handleSeek = () => maybeRefreshWindow(true);
+    void attempt(windowStart, false, !resumedAtUnknownPlayhead);
+    video.addEventListener("timeupdate", handleTimeUpdate);
+    video.addEventListener("seeking", handleSeek);
+    video.addEventListener("seeked", handleSeek);
 
     return () => {
       cancelled = true;
@@ -802,9 +912,9 @@ export function useASSSubtitles(
       fontRefreshController?.abort();
       activeController?.abort();
       stopResizeToStream?.();
-      video.removeEventListener("timeupdate", maybeRefreshWindow);
-      video.removeEventListener("seeking", maybeRefreshWindow);
-      video.removeEventListener("seeked", maybeRefreshWindow);
+      video.removeEventListener("timeupdate", handleTimeUpdate);
+      video.removeEventListener("seeking", handleSeek);
+      video.removeEventListener("seeked", handleSeek);
       // Destroy the current instance if the effect is being torn down
       // (e.g. track switch or unmount). This covers the common case where
       // initJASSUB has already completed and stored the instance.
@@ -824,6 +934,7 @@ export function useASSSubtitles(
     sourceGeneration,
     rebuild,
     transportRevision,
+    replayRevision,
   ]);
 
   // A retime of the track on screen (subtitle sync, a timing reset) loads the

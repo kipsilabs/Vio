@@ -6,16 +6,20 @@ import {
 } from "./subtitleFonts";
 
 describe("fontBundleCacheKey", () => {
-  it("strips only the embedded_stream_index query param", () => {
-    const url = "/api/v1/stream/x/subtitles/8/fonts?embedded_stream_index=2&file_id=7&token=abc";
-    const twin = "/api/v1/stream/x/subtitles/8/fonts?embedded_stream_index=3&file_id=7&token=abc";
-    expect(fontBundleCacheKey(url)).toBe(fontBundleCacheKey(twin));
-    expect(fontBundleCacheKey(url)).toBe("/api/v1/stream/x/subtitles/8/fonts?file_id=7&token=abc");
+  it("shares one key for every track of the same file", () => {
+    const english =
+      "/api/v1/stream/x/subtitles/8/fonts?embedded_stream_index=2&file_id=7&token=abc";
+    const french =
+      "/api/v1/stream/x/subtitles/10/fonts?embedded_stream_index=3&file_id=7&token=xyz";
+    expect(fontBundleCacheKey(english)).toBe("file:7");
+    expect(fontBundleCacheKey(french)).toBe("file:7");
   });
 
-  it("keeps a URL without the param unchanged", () => {
-    const url = "/api/v1/stream/x/subtitles/8/fonts?file_id=7&token=abc";
-    expect(fontBundleCacheKey(url)).toBe(url);
+  it("falls back to the normalized URL when the file id is absent", () => {
+    const url = "/api/v1/stream/x/subtitles/8/fonts?embedded_stream_index=2&token=abc";
+    const twin = "/api/v1/stream/x/subtitles/8/fonts?embedded_stream_index=3&token=abc";
+    expect(fontBundleCacheKey(url)).toBe(fontBundleCacheKey(twin));
+    expect(fontBundleCacheKey(url)).toBe("/api/v1/stream/x/subtitles/8/fonts?token=abc");
   });
 
   it("keeps a parameterless URL unchanged", () => {
