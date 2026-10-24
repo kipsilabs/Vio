@@ -72,6 +72,9 @@ export function getSubtitleFormatLabel(codec: string | undefined): string | null
     case "vtt":
     case "webvtt":
       return "VTT";
+    case "mov_text":
+    case "movtext":
+      return "MOV_TEXT";
     case "pgs":
     case "hdmv_pgs_subtitle":
       return "PGS";

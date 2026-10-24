@@ -103,6 +103,44 @@ describe("SubtitleMenu", () => {
     expect(trackRows[1]?.textContent).toContain("✓");
   });
 
+  it("enriches MOV_TEXT rows and disambiguates duplicate language groups", () => {
+    renderMenu([
+      subtitleTrack({
+        index: 0,
+        codec: "mov_text",
+        label: "MOV_TEXT",
+        track_id: "file:7:subtitle:0",
+      }),
+      subtitleTrack({
+        index: 1,
+        codec: "mov_text",
+        label: "MOV_TEXT",
+        track_id: "file:7:subtitle:1",
+      }),
+      subtitleTrack({
+        index: 2,
+        codec: "mov_text",
+        label: "MOV_TEXT",
+        forced: true,
+        track_id: "file:7:subtitle:2",
+      }),
+      subtitleTrack({
+        index: 3,
+        codec: "mov_text",
+        label: "MOV_TEXT",
+        hearing_impaired: true,
+        track_id: "file:7:subtitle:3",
+      }),
+    ]);
+
+    expect(screen.getByRole("menuitem", { name: /English 1/ })).toHaveTextContent("MOV_TEXT");
+    expect(screen.getByRole("menuitem", { name: /English 2/ })).toHaveTextContent("MOV_TEXT");
+    expect(screen.getByRole("menuitem", { name: /English \(Forced\)/ })).toHaveTextContent(
+      "MOV_TEXT",
+    );
+    expect(screen.getByRole("menuitem", { name: /English \(SDH\)/ })).toHaveTextContent("MOV_TEXT");
+  });
+
   it("locks the menu shut while the session inventory is switching", () => {
     const onSelect = vi.fn();
     const props = {
