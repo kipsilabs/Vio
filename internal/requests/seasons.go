@@ -180,44 +180,91 @@ func regularSeasons(seasons []SeriesSeason) []SeriesSeason {
 //
 // The provider is asked for English because the request TMDB client also
 // returns English metadata (it sends no language).
-func (s *Service) seriesSeasonSource(ctx context.Context, detail *tmdb.MediaDetail, tvdbID int, seasonSource string) (seasons []SeriesSeason, resolvedTVDBID int, fromTVDB bool, available bool) {
+func (s *Service) seriesSeasonSource(
+	ctx context.Context,
+	detail *tmdb.MediaDetail,
+	tvdbID int,
+	seasonSource string,
+) (seasons []SeriesSeason, resolvedTVDBID int, fromTVDB bool, available bool, err error) {
 	switch {
 	case detail != nil && detail.TVDBID > 0:
 		resolvedTVDBID = detail.TVDBID
 	case tvdbID > 0:
 		resolvedTVDBID = tvdbID
 	}
+	explicit := requestSeasonSource(seasonSource)
 	// An explicit TMDB request bypasses TVDB entirely. This is the inverse of
 	// the default path: the detail API and request validation must agree with
 	// the source the requester chose.
-	if requestSeasonSource(seasonSource) == SeasonSourceTMDB {
-		if detail != nil {
-			return seasonsFromTMDB(detail), resolvedTVDBID, false, true
-		}
-		return nil, resolvedTVDBID, false, false
+	if explicit == SeasonSourceTMDB {
+		return fallbackToTMDB(detail, resolvedTVDBID)
 	}
 	if resolvedTVDBID == 0 && detail != nil && s.tvdbResolver != nil {
-		id, err := s.tvdbResolver.ResolveSeriesTVDBID(ctx, detail.ID, detail.IMDbID)
-		if err != nil {
+		id, resolveErr := s.tvdbResolver.ResolveSeriesTVDBID(ctx, detail.ID, detail.IMDbID)
+		if resolveErr != nil {
+			if explicit == SeasonSourceTVDB {
+				return nil, resolvedTVDBID, false, false,
+					fmt.Errorf("%w: resolve TVDB id: %v", ErrSeasonSourceUnavailable, resolveErr)
+			}
 			slog.DebugContext(ctx, "requests: resolve series tvdb id for seasons failed", "component", "requests",
-				"tmdb_id", detail.ID, "err", err)
+				"tmdb_id", detail.ID, "err", resolveErr)
 		} else if id > 0 {
 			resolvedTVDBID = id
 		}
 	}
-	if resolvedTVDBID > 0 && s.seriesSeasonProvider != nil {
-		results, err := s.seriesSeasonProvider.FetchSeriesTVDBSeasons(ctx, resolvedTVDBID, "en")
-		if err != nil {
-			slog.DebugContext(ctx, "requests: fetch tvdb seasons failed; using tmdb", "component", "requests",
-				"tvdb_id", resolvedTVDBID, "err", err)
-		} else if regular := regularSeasons(results); len(regular) > 0 {
-			return regular, resolvedTVDBID, true, true
+	if resolvedTVDBID == 0 {
+		if explicit == SeasonSourceTVDB {
+			return nil, 0, false, false, fmt.Errorf("%w: no TVDB id", ErrSeasonSourceUnavailable)
 		}
+		return fallbackToTMDB(detail, resolvedTVDBID)
 	}
+	if s.seriesSeasonProvider == nil {
+		if explicit == SeasonSourceTVDB {
+			return nil, resolvedTVDBID, false, false,
+				fmt.Errorf("%w: TVDB provider is not configured", ErrSeasonSourceUnavailable)
+		}
+		return fallbackToTMDB(detail, resolvedTVDBID)
+	}
+	results, fetchErr := s.seriesSeasonProvider.FetchSeriesTVDBSeasons(ctx, resolvedTVDBID, "en")
+	if fetchErr != nil {
+		if explicit == SeasonSourceTVDB {
+			return nil, resolvedTVDBID, false, false,
+				fmt.Errorf("%w: %v", ErrSeasonSourceUnavailable, fetchErr)
+		}
+		slog.DebugContext(ctx, "requests: fetch tvdb seasons failed; using tmdb", "component", "requests",
+			"tvdb_id", resolvedTVDBID, "err", fetchErr)
+		return fallbackToTMDB(detail, resolvedTVDBID)
+	}
+	if regular := regularSeasons(results); len(regular) > 0 {
+		return regular, resolvedTVDBID, true, true, nil
+	}
+	if explicit == SeasonSourceTVDB {
+		return nil, resolvedTVDBID, false, false,
+			fmt.Errorf("%w: TVDB returned no regular seasons", ErrSeasonSourceUnavailable)
+	}
+	return fallbackToTMDB(detail, resolvedTVDBID)
+}
+
+func fallbackToTMDB(detail *tmdb.MediaDetail, resolvedTVDBID int) ([]SeriesSeason, int, bool, bool, error) {
 	if detail != nil {
-		return seasonsFromTMDB(detail), resolvedTVDBID, false, true
+		return seasonsFromTMDB(detail), resolvedTVDBID, false, true, nil
 	}
-	return nil, resolvedTVDBID, false, false
+	return nil, resolvedTVDBID, false, false, nil
+}
+
+// seasonCountsCompatible reports whether catalog season counts use the same
+// provider numbering as the request list. An integer season join across TVDB
+// and TMDB is unsafe because the providers split and combine seasons
+// differently; an unknown or absent provider match keeps the historical join.
+func seasonCountsCompatible(fromTVDB bool, match PresenceMatch) bool {
+	switch match.MatchedProvider {
+	case SeasonSourceTVDB:
+		return fromTVDB
+	case SeasonSourceTMDB:
+		return !fromTVDB
+	default:
+		return true
+	}
 }
 
 // airedSeasons returns the numbers of a series' regular seasons that have
@@ -242,7 +289,7 @@ func airedSeasons(seasons []SeriesSeason, today time.Time) []int {
 // and ErrInvalidInput for a season the series metadata does not know. With no
 // season list it returns the named seasons as they are (none means the whole
 // series).
-func (s *Service) resolveRequestedSeasons(ctx context.Context, named []int, seasons []SeriesSeason, available bool, match PresenceMatch) ([]int, error) {
+func (s *Service) resolveRequestedSeasons(ctx context.Context, named []int, seasons []SeriesSeason, available bool, match PresenceMatch, joinCounts bool) ([]int, error) {
 	named = normalizeSeasons(named)
 	if !available {
 		if match.Available && len(named) == 0 {
@@ -265,9 +312,13 @@ func (s *Service) resolveRequestedSeasons(ctx context.Context, named []int, seas
 	if len(candidates) == 0 {
 		candidates = airedSeasons(seasons, s.now())
 	}
-	counts, err := s.seasonCounts(ctx, match)
-	if err != nil {
-		return nil, err
+	var counts map[int]SeasonCounts
+	if joinCounts {
+		var err error
+		counts, err = s.seasonCounts(ctx, match)
+		if err != nil {
+			return nil, err
+		}
 	}
 	wanted := slices.DeleteFunc(slices.Clone(candidates), func(season int) bool {
 		return counts[season].Complete()

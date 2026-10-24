@@ -811,6 +811,8 @@ func TestGetRequestMediaDetail(t *testing.T) {
 	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/requests/detail/movie/abc", "", requestOwner), TypeValidationFailed)
 	svc.err = mediarequests.ErrNotFound
 	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/requests/detail/movie/949", "", requestOwner), TypeNotFound)
+	svc.err = mediarequests.ErrSeasonSourceUnavailable
+	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/requests/detail/series/949?season_source=tvdb", "", requestOwner), TypeDependencyUnavailable)
 }
 
 func TestDiscover(t *testing.T) {

@@ -940,10 +940,18 @@ func (s *Service) seriesDetailSeasons(
 	active map[int]*Request,
 	preferredSeasonSource string,
 ) ([]RequestSeason, int, bool, bool, error) {
-	seasonSource, resolvedTVDBID, fromTVDB, _ := s.seriesSeasonSource(ctx, raw, raw.TVDBID, preferredSeasonSource)
+	seasonSource, resolvedTVDBID, fromTVDB, _, err := s.seriesSeasonSource(ctx, raw, raw.TVDBID, preferredSeasonSource)
+	if err != nil {
+		return nil, 0, false, match.Available, err
+	}
 	counts, err := s.seasonCounts(ctx, match)
 	if err != nil {
 		return nil, 0, false, match.Available, err
+	}
+	if !seasonCountsCompatible(fromTVDB, match) {
+		// The catalog and the request list use different season numbering.
+		// Integer season joins would mark the wrong seasons available.
+		counts = nil
 	}
 	activeRequest := active[raw.ID]
 	seasons := requestSeasons(seasonSource, counts, activeRequest)
@@ -1125,10 +1133,12 @@ func (s *Service) CreateRequest(ctx context.Context, viewer Viewer, input Create
 		detail := s.requestDetail(ctx, normalized.MediaType, normalized.TMDBID)
 		normalized = applyRequestDetail(normalized, detail)
 		facts = s.routingFacts(ctx, detail)
-		if !normalized.WholeSeries {
+		if normalized.MediaType == MediaTypeSeries {
 			// A series partly in the library can still be requested for the
 			// seasons it is missing. Prefer TVDB's season list, which keeps a
-			// long anime's seasons apart where TMDB groups them.
+			// long anime's seasons apart where TMDB groups them. Resolve and
+			// freeze the actual source even for a whole-series request so
+			// fulfillment does not later pick a different provider chain.
 			tvdbID := 0
 			if detail != nil {
 				tvdbID = detail.TVDBID
@@ -1136,12 +1146,22 @@ func (s *Service) CreateRequest(ctx context.Context, viewer Viewer, input Create
 			if tvdbID == 0 && normalized.TVDBID != nil {
 				tvdbID = *normalized.TVDBID
 			}
-			seasonSource, _, _, sourceAvailable := s.seriesSeasonSource(ctx, detail, tvdbID, normalized.SeasonSource)
-			seasons, err := s.resolveRequestedSeasons(ctx, normalized.Seasons, seasonSource, sourceAvailable, match)
-			if err != nil {
-				return nil, err
+			seasonSource, _, fromTVDB, sourceAvailable, sourceErr := s.seriesSeasonSource(ctx, detail, tvdbID, normalized.SeasonSource)
+			if sourceErr != nil {
+				return nil, sourceErr
 			}
-			normalized.Seasons = seasons
+			if fromTVDB {
+				normalized.SeasonSource = SeasonSourceTVDB
+			} else if sourceAvailable {
+				normalized.SeasonSource = SeasonSourceTMDB
+			}
+			if !normalized.WholeSeries {
+				seasons, err := s.resolveRequestedSeasons(ctx, normalized.Seasons, seasonSource, sourceAvailable, match, seasonCountsCompatible(fromTVDB, match))
+				if err != nil {
+					return nil, err
+				}
+				normalized.Seasons = seasons
+			}
 		}
 	}
 

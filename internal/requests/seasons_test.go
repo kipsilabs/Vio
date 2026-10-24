@@ -605,6 +605,69 @@ func TestCreateSeriesRequestStoresExplicitTMDBSeasonSource(t *testing.T) {
 	}
 }
 
+func TestSeriesSeasonSourceExplicitTVDBFailureDoesNotFallBack(t *testing.T) {
+	svc := longAnimeService(newFakeStore(), &fakeSeriesSeasonProvider{err: errors.New("tvdb rate limited")})
+
+	_, _, _, _, err := svc.seriesSeasonSource(context.Background(), longAnimeDetail(), 900001, "tvdb")
+	if !errors.Is(err, ErrSeasonSourceUnavailable) {
+		t.Fatalf("err = %v, want ErrSeasonSourceUnavailable", err)
+	}
+}
+
+func TestCreateSeriesRequestExplicitTVDBFailureDoesNotFallBack(t *testing.T) {
+	store := newFakeStore()
+	svc := longAnimeService(store, &fakeSeriesSeasonProvider{err: errors.New("tvdb rate limited")})
+
+	_, err := svc.CreateRequest(context.Background(), testViewer(1), CreateRequestInput{
+		MediaType: MediaTypeSeries, TMDBID: 700001, Title: "Long Anime", Seasons: []int{1}, SeasonSource: "tvdb",
+	})
+	if !errors.Is(err, ErrSeasonSourceUnavailable) {
+		t.Fatalf("err = %v, want ErrSeasonSourceUnavailable", err)
+	}
+	if len(store.created) != 0 {
+		t.Fatalf("created = %+v, want no request after an explicit TVDB failure", store.created)
+	}
+}
+
+func TestCreateSeriesRequestFreezesFallbackSource(t *testing.T) {
+	store := newFakeStore()
+	svc := longAnimeService(store, &fakeSeriesSeasonProvider{err: errors.New("tvdb unavailable")})
+
+	req, err := svc.CreateRequest(context.Background(), testViewer(1), CreateRequestInput{
+		MediaType: MediaTypeSeries, TMDBID: 700001, Title: "Long Anime", Seasons: []int{1},
+	})
+	if err != nil {
+		t.Fatalf("CreateRequest: %v", err)
+	}
+	if req.SeasonSource != SeasonSourceTMDB {
+		t.Fatalf("season source = %q, want the actual TMDB fallback source", req.SeasonSource)
+	}
+	if len(store.created) != 1 || store.created[0].Input.SeasonSource != SeasonSourceTMDB {
+		t.Fatalf("stored input = %+v, want season_source tmdb", store.created)
+	}
+}
+
+func TestSeasonCountsCompatibleUsesTheMatchingProvider(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		fromTVDB   bool
+		provider   string
+		compatible bool
+	}{
+		{name: "tvdb list against tvdb catalog", fromTVDB: true, provider: SeasonSourceTVDB, compatible: true},
+		{name: "tmdb list against tvdb catalog", fromTVDB: false, provider: SeasonSourceTVDB, compatible: false},
+		{name: "tvdb list against tmdb catalog", fromTVDB: true, provider: SeasonSourceTMDB, compatible: false},
+		{name: "tmdb list against tmdb catalog", fromTVDB: false, provider: SeasonSourceTMDB, compatible: true},
+		{name: "unknown catalog source keeps the historical join", fromTVDB: true, compatible: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := seasonCountsCompatible(tc.fromTVDB, PresenceMatch{MatchedProvider: tc.provider}); got != tc.compatible {
+				t.Fatalf("seasonCountsCompatible = %v, want %v", got, tc.compatible)
+			}
+		})
+	}
+}
+
 func TestSeriesSeasonSourceResolvesAMissingTVDBID(t *testing.T) {
 	store := newFakeStore()
 	detail := longAnimeDetail()
@@ -617,7 +680,10 @@ func TestSeriesSeasonSourceResolvesAMissingTVDBID(t *testing.T) {
 	resolver := &fakeTVDBResolver{tvdbID: 900001}
 	svc.SetTVDBIDResolver(resolver)
 
-	seasons, resolvedTVDBID, fromTVDB, available := svc.seriesSeasonSource(context.Background(), detail, 0, "")
+	seasons, resolvedTVDBID, fromTVDB, available, err := svc.seriesSeasonSource(context.Background(), detail, 0, "")
+	if err != nil {
+		t.Fatalf("seriesSeasonSource: %v", err)
+	}
 	if resolver.gotTMDBID != 700001 || resolver.gotIMDbID != "" {
 		t.Fatalf("resolver got tmdb=%d imdb=%q, want 700001 and no IMDb id", resolver.gotTMDBID, resolver.gotIMDbID)
 	}

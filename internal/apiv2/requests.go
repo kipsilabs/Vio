@@ -849,6 +849,8 @@ func requestProblem(ctx context.Context, err error) *Problem {
 			WithErrors(ProblemError{Location: "query.media_type", Code: codeInvalid, Detail: "expected movie or series"})
 	case errors.Is(err, mediarequests.ErrInvalidInput):
 		return NewProblem(TypeValidationFailed, "The request did not pass validation.")
+	case errors.Is(err, mediarequests.ErrSeasonSourceUnavailable):
+		return NewProblem(TypeDependencyUnavailable, "The selected season source is unavailable.")
 	case errors.Is(err, mediarequests.ErrRequestsDisabled):
 		return CapabilityProblem(StateDisabled, "requests")
 	case errors.Is(err, mediarequests.ErrUserBlocked):
