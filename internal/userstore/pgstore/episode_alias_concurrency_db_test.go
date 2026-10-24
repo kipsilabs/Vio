@@ -180,7 +180,7 @@ func (h *heldWatchStateWrite) waitResolved(t *testing.T) string {
 // writer store state under the alias id it resolved. The repair that follows
 // the writer's commit moves that state to the canonical episode, so no hidden
 // alias-keyed progress row can survive.
-func TestPostgresAliasWriteSerializedWithReconcileDB(t *testing.T) { //nolint:funlen,gocyclo // alias resurrection needs one fixture plus a queued lock check
+func TestPostgresAliasWriteSerializedWithReconcileDB(t *testing.T) {
 	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("SILO_TEST_DATABASE_URL is not set")
@@ -276,7 +276,7 @@ func TestPostgresAliasWriteSerializedWithReconcileDB(t *testing.T) { //nolint:fu
 // lock and has written newer position, completion, and hints, but has not
 // committed; reconciliation queues instead of taking its snapshot. Once the
 // writer commits, the repair aggregates the newer row and leaves it in place.
-func TestPostgresCanonicalStateSurvivesReconcileSnapshotDB(t *testing.T) { //nolint:funlen,gocyclo // repair snapshot loss needs one fixture plus a queued lock check
+func TestPostgresCanonicalStateSurvivesReconcileSnapshotDB(t *testing.T) { //nolint:funlen // repair snapshot loss needs one fixture plus a queued lock check
 	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("SILO_TEST_DATABASE_URL is not set")
@@ -400,7 +400,7 @@ func TestPostgresCanonicalStateSurvivesReconcileSnapshotDB(t *testing.T) { //nol
 // TestPostgresWatchStateWritesLockSeriesDB pins the store boundary itself: each
 // write path that can receive a cached alias id takes the shared series lock in
 // its own transaction, including profile-separated progress and history.
-func TestPostgresWatchStateWritesLockSeriesDB(t *testing.T) { //nolint:funlen,gocyclo // one fixture covers every write path and profile separation
+func TestPostgresWatchStateWritesLockSeriesDB(t *testing.T) { //nolint:funlen // one fixture covers every write path and profile separation
 	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("SILO_TEST_DATABASE_URL is not set")
