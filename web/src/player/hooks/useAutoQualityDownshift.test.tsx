@@ -103,14 +103,15 @@ describe("lowerQualityLabel", () => {
     expect(
       lowerQualityLabel(
         [
-          { label: "original", bitrate_kbps: 19_489, preserves_source: true },
-          { label: "2160p-low", bitrate_kbps: 10_000 },
-          { label: "1080p-high", bitrate_kbps: 10_000 },
-          { label: "1080p-medium", bitrate_kbps: 6_000 },
+          { label: "original", bitrate_kbps: 19_489, height: 1920, preserves_source: true },
+          { label: "2160p-low", bitrate_kbps: 10_000, height: 2160 },
+          { label: "1080p-high", bitrate_kbps: 10_000, height: 1080 },
+          { label: "1080p-medium", bitrate_kbps: 6_000, height: 1080 },
         ],
         19_489,
+        1920,
       ),
-    ).toBe("2160p-low");
+    ).toBe("1080p-high");
   });
 
   it("returns undefined when no lower rung exists", () => {

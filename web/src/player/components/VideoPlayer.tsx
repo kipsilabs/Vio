@@ -5305,7 +5305,11 @@ export function VideoPlayer({
     onDownshift: (estimateKbps) => {
       recordObservedBandwidthLimitKbps(estimateKbps);
       const failedKbps = plan.effective_recipe.bitrate_kbps ?? plan.source.bitrate_kbps ?? 0;
-      const lowerLabel = lowerQualityLabel(lastAvailableQualitiesRef.current, failedKbps);
+      const lowerLabel = lowerQualityLabel(
+        lastAvailableQualitiesRef.current,
+        failedKbps,
+        plan.effective_recipe.height ?? plan.source.height,
+      );
       setNotice({
         title: "Lowering quality",
         message: lowerLabel
