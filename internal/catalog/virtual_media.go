@@ -241,6 +241,36 @@ func (r *VirtualMediaRegistrar) Pool() *pgxpool.Pool {
 	return r.pool
 }
 
+// SeasonContentIDs returns the persisted content IDs for a series' seasons.
+// Season rows can predate virtual registration and carry IDs that are not
+// derived from the series ID, so artwork jobs must address the real row.
+func (r *VirtualMediaRegistrar) SeasonContentIDs(ctx context.Context, seriesID string, seasonNumbers []int) (map[int]string, error) {
+	out := make(map[int]string, len(seasonNumbers))
+	if r == nil || r.pool == nil || strings.TrimSpace(seriesID) == "" || len(seasonNumbers) == 0 {
+		return out, nil
+	}
+	rows, err := r.pool.Query(ctx, `
+		SELECT season_number, content_id
+		FROM seasons
+		WHERE series_id = $1 AND season_number = ANY($2)`, seriesID, seasonNumbers)
+	if err != nil {
+		return nil, fmt.Errorf("list season content ids: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var number int
+		var contentID string
+		if err := rows.Scan(&number, &contentID); err != nil {
+			return nil, fmt.Errorf("scan season content id: %w", err)
+		}
+		out[number] = contentID
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate season content ids: %w", err)
+	}
+	return out, nil
+}
+
 func (r *VirtualMediaRegistrar) Upsert(ctx context.Context, in VirtualMedia) (*VirtualMediaResult, error) {
 	return r.UpsertVirtualMedia(ctx, 0, in)
 }
