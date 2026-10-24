@@ -141,6 +141,30 @@ describe("SubtitleMenu", () => {
     expect(screen.getByRole("menuitem", { name: /English \(SDH\)/ })).toHaveTextContent("MOV_TEXT");
   });
 
+  it("infers Forced and SDH from titles when the server flags are missing", () => {
+    renderMenu([
+      subtitleTrack({
+        index: 10,
+        language: "fr",
+        codec: "subrip",
+        label: "Französisch SDH",
+        hearing_impaired: false,
+        track_id: "file:7:subtitle:10",
+      }),
+      subtitleTrack({
+        index: 11,
+        language: "fr",
+        codec: "subrip",
+        label: "Forced",
+        forced: false,
+        track_id: "file:7:subtitle:11",
+      }),
+    ]);
+
+    expect(screen.getByRole("menuitem", { name: /French \(SDH\)/ })).toBeTruthy();
+    expect(screen.getByRole("menuitem", { name: /French \(Forced\)/ })).toBeTruthy();
+  });
+
   it("locks the menu shut while the session inventory is switching", () => {
     const onSelect = vi.fn();
     const props = {

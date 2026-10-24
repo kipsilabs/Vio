@@ -1,6 +1,6 @@
 import { providerResultText } from "@/components/streaming/useProviderResultDisplay";
 import { useMediaSkipHandlers } from "../hooks/useMediaSkipHandlers";
-import { useAutoQualityDownshift } from "../hooks/useAutoQualityDownshift";
+import { lowerQualityLabel, useAutoQualityDownshift } from "../hooks/useAutoQualityDownshift";
 import { recordObservedBandwidthLimitKbps } from "../bandwidth-probe";
 import { skipTarget } from "../utils/skipTarget";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
@@ -5275,6 +5275,16 @@ export function VideoPlayer({
     lastTransportErrorAtRef.current = 0;
   }, [planRevision]);
 
+  // Keep the last populated quality ladder. A quality replan can return the
+  // same source plan with an empty list; the previous rungs are still valid
+  // targets for the next explicit downshift.
+  const lastAvailableQualitiesRef = useRef<PlanV3["available_qualities"]>([]);
+  useEffect(() => {
+    if ((plan.available_qualities?.length ?? 0) > 0) {
+      lastAvailableQualitiesRef.current = plan.available_qualities;
+    }
+  }, [plan.available_qualities]);
+
   // Auto plays the source unless a measured estimate says the link cannot
   // carry it. When the link proves slower, record what it could not sustain
   // and replan Auto, which reads that lower estimate. Rooms have their own
@@ -5294,12 +5304,18 @@ export function VideoPlayer({
       Date.now() - lastTransportErrorAtRef.current < TRANSPORT_TROUBLE_WINDOW_MS,
     onDownshift: (estimateKbps) => {
       recordObservedBandwidthLimitKbps(estimateKbps);
+      const failedKbps = plan.effective_recipe.bitrate_kbps ?? plan.source.bitrate_kbps ?? 0;
+      const lowerLabel = lowerQualityLabel(lastAvailableQualitiesRef.current, failedKbps);
       setNotice({
         title: "Lowering quality",
-        message: "Playback kept buffering, so Auto is switching to a lower bitrate.",
+        message: lowerLabel
+          ? `Playback kept buffering, so it is switching to ${lowerLabel}.`
+          : "Playback kept buffering, so Auto is switching to a lower bitrate.",
         tone: "info",
       });
-      handleQualitySelectRef.current("auto");
+      // Auto can return the same source plan when only the estimate changed.
+      // Prefer a concrete lower rung when the ladder still knows one.
+      handleQualitySelectRef.current(lowerLabel ?? "auto");
     },
   });
 

@@ -8701,7 +8701,8 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				subtitleSelectionDiffersFromStartV3(req.SelectedTracks, start)
 		case qualityChange:
 			nextQuality, _ := playback.NormalizeQualityV3(req.QualityPreference)
-			intentChange = nextQuality != start.QualityPreference
+			intentChange = nextQuality != start.QualityPreference ||
+				intOrZeroHandlerV3(req.BandwidthEstimateKbps) != intOrZeroHandlerV3(start.BandwidthEstimateKbps)
 		case outputChange:
 			intentChange = true
 		default:

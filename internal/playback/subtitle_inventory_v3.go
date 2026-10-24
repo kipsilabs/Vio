@@ -3,6 +3,7 @@ package playback
 import (
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -111,24 +112,26 @@ func BuildSubtitleInventoryV3(file *models.MediaFile, additional []SubtitleInven
 	seen := make(map[string]struct{}, base+len(additional))
 
 	for index, sub := range file.ExternalSubtitles {
-		if subtitleInventoryDuplicateV3(seen, SubtitleSourceExternalV3, externalSubtitleIdentityV3(sub), sub.Format, sub.Language, sub.Forced, sub.HearingImpaired) {
+		label := firstNonEmptySubtitleLabelV3(sub.Title, sub.EmbeddedTitle, filepath.Base(sub.Path), sub.Language)
+		forced, hearingImpaired := subtitleInventoryFlagsV3(firstNonEmptySubtitleLabelV3(sub.Title, sub.EmbeddedTitle, sub.Language), sub.Forced, sub.HearingImpaired)
+		if subtitleInventoryDuplicateV3(seen, SubtitleSourceExternalV3, externalSubtitleIdentityV3(sub), sub.Format, sub.Language, forced, hearingImpaired) {
 			continue
 		}
 		item := subtitleInventoryItemV3(file.ID, len(items), index, SubtitleSourceExternalV3, sub.Format,
-			sub.Language, firstNonEmptySubtitleLabelV3(sub.Title, sub.EmbeddedTitle, filepath.Base(sub.Path), sub.Language),
-			sub.Forced, sub.Default, sub.HearingImpaired)
+			sub.Language, label, forced, sub.Default, hearingImpaired)
 		if subtitles.SupportsRetime(subtitles.SubtitleFormat(sub.Format)) {
 			item.SyncKey = subtitles.ExternalSyncKey(sub.Path)
 		}
 		items = append(items, item)
 	}
 	for index, track := range file.SubtitleTracks {
-		if subtitleInventoryDuplicateV3(seen, SubtitleSourceEmbeddedV3, embeddedSubtitleIdentityV3(track), track.Codec, track.Language, track.Forced, track.HearingImpaired) {
+		label := firstNonEmptySubtitleLabelV3(track.Title, track.EmbeddedTitle, track.Language)
+		forced, hearingImpaired := subtitleInventoryFlagsV3(label, track.Forced, track.HearingImpaired)
+		if subtitleInventoryDuplicateV3(seen, SubtitleSourceEmbeddedV3, embeddedSubtitleIdentityV3(track), track.Codec, track.Language, forced, hearingImpaired) {
 			continue
 		}
 		items = append(items, subtitleInventoryItemV3(file.ID, len(items), externalCount+index, SubtitleSourceEmbeddedV3, track.Codec,
-			track.Language, firstNonEmptySubtitleLabelV3(track.Title, track.EmbeddedTitle, track.Language),
-			track.Forced, track.Default, track.HearingImpaired))
+			track.Language, label, forced, track.Default, hearingImpaired))
 	}
 	for index, entry := range additional {
 		source := entry.Source
@@ -139,7 +142,9 @@ func BuildSubtitleInventoryV3(file *models.MediaFile, additional []SubtitleInven
 		if source == SubtitleSourceDownloadedV3 && entry.DownloadedSubtitleID > 0 {
 			identity = strconv.Itoa(entry.DownloadedSubtitleID)
 		}
-		if subtitleInventoryDuplicateV3(seen, source, identity, entry.Codec, entry.Language, entry.Forced, entry.HearingImpaired) {
+		label := firstNonEmptySubtitleLabelV3(entry.Label, entry.Language)
+		forced, hearingImpaired := subtitleInventoryFlagsV3(label, entry.Forced, entry.HearingImpaired)
+		if subtitleInventoryDuplicateV3(seen, source, identity, entry.Codec, entry.Language, forced, hearingImpaired) {
 			continue
 		}
 		sourceIndex := entry.CombinedIndex
@@ -147,8 +152,7 @@ func BuildSubtitleInventoryV3(file *models.MediaFile, additional []SubtitleInven
 			sourceIndex = base + index
 		}
 		item := subtitleInventoryItemV3(file.ID, len(items), sourceIndex, source, entry.Codec,
-			entry.Language, firstNonEmptySubtitleLabelV3(entry.Label, entry.Language),
-			entry.Forced, false, entry.HearingImpaired)
+			entry.Language, label, forced, false, hearingImpaired)
 		item.downloadedSubtitleID = entry.DownloadedSubtitleID
 		if source == SubtitleSourceDownloadedV3 && entry.DownloadedSubtitleID > 0 && subtitles.SupportsRetime(subtitles.SubtitleFormat(entry.Codec)) {
 			item.SyncKey = subtitles.StoredSyncKey(entry.DownloadedSubtitleID)
@@ -399,6 +403,23 @@ func firstNonEmptySubtitleLabelV3(values ...string) string {
 		}
 	}
 	return ""
+}
+
+var subtitleInventoryFlagRE = regexp.MustCompile(`(?i)\b(forced|sdh|hi|cc)\b|hearing impaired|closed captions?`)
+
+// subtitleInventoryFlagsV3 fills in flags that the container probe did not
+// expose but the authored track title states. The media page and every native
+// client read these published flags, so "Französisch SDH" must not reach them
+// as a full track with no accessibility marker.
+func subtitleInventoryFlagsV3(label string, forced, hearingImpaired bool) (bool, bool) {
+	match := subtitleInventoryFlagRE.FindString(strings.ToLower(label))
+	switch strings.ToLower(strings.TrimSpace(match)) {
+	case "forced":
+		forced = true
+	case "sdh", "hi", "cc", "hearing impaired", "closed caption", "closed captions":
+		hearingImpaired = true
+	}
+	return forced, hearingImpaired
 }
 
 // subtitleInventoryDuplicateV3 records an inventory entry's de-duplication key
