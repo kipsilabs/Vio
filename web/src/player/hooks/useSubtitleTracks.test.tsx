@@ -702,6 +702,28 @@ describe("useSubtitleTracks", () => {
     expect(createdTracks[0]!.cues.map((c) => c.text)).toEqual(["whole"]);
   });
 
+  it("treats a track without a source as embedded and windows it", async () => {
+    fetchMock.mockResolvedValue(
+      vttResponse("WEBVTT\n\n00:00:10.000 --> 00:00:12.000\nembedded\n\n"),
+    );
+    const { videoRef } = renderTracks({
+      origin: 0,
+      durationRef: { current: 7200 },
+      track: { ...srtTrack, source: undefined },
+    });
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    const url = String(fetchMock.mock.calls[0]![0]);
+    expect(url).toContain("position=");
+    expect(url).toContain("duration=120");
+    await waitFor(() => expect(createdTracks[0]?.cues.map((c) => c.text)).toEqual(["embedded"]));
+
+    videoRef.current!.currentTime = 600;
+    videoRef.current!.dispatchEvent(new Event("seeking"));
+    videoRef.current!.dispatchEvent(new Event("seeked"));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+  });
+
   it("backs off a failed whole-track fetch instead of refetching on every timeupdate", async () => {
     vi.useFakeTimers();
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
