@@ -21,9 +21,15 @@ class FakeVTTCue {
 class FakeTextTrack {
   mode = "hidden";
   cues: FakeVTTCue[] = [];
-  activeCues: FakeVTTCue[] = [];
   addEventListener = vi.fn();
   removeEventListener = vi.fn();
+  constructor(private video?: HTMLVideoElement) {}
+  // jsdom never computes active cues, so resolve them from the element's
+  // clock the way a real TextTrack does.
+  get activeCues(): FakeVTTCue[] {
+    const time = this.video?.currentTime ?? 0;
+    return this.cues.filter((cue) => cue.startTime <= time && time < cue.endTime);
+  }
   addCue(cue: FakeVTTCue) {
     this.cues.push(cue);
   }
@@ -41,7 +47,7 @@ const createdTracks: FakeTextTrack[] = [];
 function makeVideoRef(readyState = 1): RefObject<HTMLVideoElement | null> {
   const video = document.createElement("video");
   (video as unknown as { addTextTrack: () => FakeTextTrack }).addTextTrack = () => {
-    const track = new FakeTextTrack();
+    const track = new FakeTextTrack(video);
     createdTracks.push(track);
     return track;
   };
@@ -95,14 +101,29 @@ function renderTracks(initial: {
   anchorRef?: RefObject<number>;
   readyState?: number;
   streamGeneration?: number;
+  track?: PlayerSubtitleInfo;
+  sourceGeneration?: number;
+  refreshRevision?: number;
+  onLoadState?: (state: "idle" | "loading" | "refreshing" | "ready" | "error") => void;
+  onSourceChanged?: () => void;
 }) {
   const videoRef = makeVideoRef(initial.readyState);
   const defaultAnchor = { current: 0 };
   const hook = renderHook(
-    ({ origin, durationRef, anchorRef, streamGeneration }) =>
+    ({
+      origin,
+      durationRef,
+      anchorRef,
+      streamGeneration,
+      track,
+      sourceGeneration,
+      refreshRevision,
+      onLoadState,
+      onSourceChanged,
+    }) =>
       useSubtitleTracks(
         videoRef,
-        [srtTrack],
+        [track ?? srtTrack],
         1,
         origin,
         0,
@@ -111,6 +132,11 @@ function renderTracks(initial: {
         undefined,
         null,
         streamGeneration ?? 0,
+        onLoadState,
+        onSourceChanged,
+        sourceGeneration ?? 0,
+        0,
+        refreshRevision ?? 0,
       ),
     { initialProps: initial },
   );
@@ -315,7 +341,7 @@ describe("useSubtitleTracks", () => {
     // The fetched cues carry over, and the engine's clock drives them.
     expect(fetchMock).toHaveBeenCalledTimes(1);
     act(() => engineTracks[0]!.update(11));
-    expect(result.current).toEqual(["hi"]);
+    expect(result.current).toEqual([{ text: "hi" }]);
     detach();
   });
 
@@ -555,7 +581,7 @@ describe("useSubtitleTracks", () => {
     }
   });
 
-  it("recovers only on a track rebuild after the consecutive-failure ceiling latches terminal", async () => {
+  it("recovers on a track rebuild after the consecutive-failure ceiling latches terminal", async () => {
     vi.useFakeTimers();
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
     // Every fetch fails until the rebuild, then the rebuilt mount succeeds.
@@ -586,11 +612,11 @@ describe("useSubtitleTracks", () => {
       await act(async () => {
         await vi.advanceTimersByTimeAsync(10 * 60_000);
         videoRef.current!.dispatchEvent(new Event("timeupdate"));
-        videoRef.current!.dispatchEvent(new Event("seeking"));
-        videoRef.current!.dispatchEvent(new Event("seeked"));
         await vi.advanceTimersByTimeAsync(10 * 60_000);
       });
-      // Terminal for this mount: no backoff retry, no media-event revival.
+      // Terminal between rebuilds: no backoff retry and no timeupdate revival.
+      // (An explicit seek resets the budget too; that path is covered
+      // separately.)
       expect(fetchMock).toHaveBeenCalledTimes(4);
 
       // A stream restart rebuilds the fetcher (streamGeneration bump) and its
@@ -647,6 +673,274 @@ describe("useSubtitleTracks", () => {
       nowSpy.mockRestore();
       errorSpy.mockRestore();
     }
+  });
+
+  it("fetches a sidecar track once whole and never refetches on seeks", async () => {
+    fetchMock.mockResolvedValue(vttResponse("WEBVTT\n\n00:00:10.000 --> 00:00:12.000\nwhole\n\n"));
+    const externalTrack: PlayerSubtitleInfo = { ...srtTrack, source: "external" };
+    const { videoRef } = renderTracks({
+      origin: 0,
+      durationRef: { current: 7200 },
+      track: externalTrack,
+    });
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    // A whole-track fetch asks for the complete artifact: no position/duration
+    // window parameters at all.
+    expect(String(fetchMock.mock.calls[0]![0])).toBe(externalTrack.url);
+    await waitFor(() => expect(createdTracks[0]?.cues.map((c) => c.text)).toEqual(["whole"]));
+
+    // Seeking inside a complete track never needs another request.
+    for (const time of [600, 1400, 30]) {
+      videoRef.current!.currentTime = time;
+      videoRef.current!.dispatchEvent(new Event("seeking"));
+      videoRef.current!.dispatchEvent(new Event("seeked"));
+      videoRef.current!.dispatchEvent(new Event("timeupdate"));
+    }
+    await new Promise((r) => setTimeout(r, 20));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(createdTracks[0]!.cues.map((c) => c.text)).toEqual(["whole"]);
+  });
+
+  it("treats a track without a source as embedded and windows it", async () => {
+    fetchMock.mockResolvedValue(
+      vttResponse("WEBVTT\n\n00:00:10.000 --> 00:00:12.000\nembedded\n\n"),
+    );
+    const { videoRef } = renderTracks({
+      origin: 0,
+      durationRef: { current: 7200 },
+      track: { ...srtTrack, source: undefined },
+    });
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    const url = String(fetchMock.mock.calls[0]![0]);
+    expect(url).toContain("position=");
+    expect(url).toContain("duration=120");
+    await waitFor(() => expect(createdTracks[0]?.cues.map((c) => c.text)).toEqual(["embedded"]));
+
+    videoRef.current!.currentTime = 600;
+    videoRef.current!.dispatchEvent(new Event("seeking"));
+    videoRef.current!.dispatchEvent(new Event("seeked"));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+  });
+
+  it("backs off a failed whole-track fetch instead of refetching on every timeupdate", async () => {
+    vi.useFakeTimers();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    fetchMock
+      .mockRejectedValueOnce(new Error("sidecar read died"))
+      .mockResolvedValueOnce(vttResponse("WEBVTT\n\n00:00:10.000 --> 00:00:12.000\nwhole\n\n"));
+    const { videoRef, unmount } = renderTracks({
+      origin: 0,
+      durationRef: { current: 7200 },
+      track: { ...srtTrack, source: "external" },
+    });
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      // Inside the backoff a timeupdate must not start a second whole-track
+      // read; the scheduled retry is the only path forward.
+      await act(async () => {
+        videoRef.current!.dispatchEvent(new Event("timeupdate"));
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5_000);
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(createdTracks[0]!.cues.map((c) => c.text)).toEqual(["whole"]);
+    } finally {
+      unmount();
+      error.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("retries immediately on an out-of-coverage seek during backoff", async () => {
+    let now = 1_000_000;
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      fetchMock
+        .mockResolvedValueOnce(vttResponse("WEBVTT\n\n00:00:10.000 --> 00:00:12.000\nearly\n\n"))
+        .mockRejectedValueOnce(new Error("prefetch died"))
+        .mockResolvedValueOnce(vttResponse("WEBVTT\n\n23:20.000 --> 23:22.000\nlate\n\n"));
+
+      const { videoRef } = renderTracks({ origin: 0, durationRef: { current: 7200 } });
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+      await waitFor(() => expect(createdTracks[0]?.cues).toHaveLength(1));
+
+      // Enter the prefetch lead; this extend fails and starts the backoff.
+      videoRef.current!.currentTime = 100;
+      videoRef.current!.dispatchEvent(new Event("timeupdate"));
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+
+      // Still inside the backoff: a seek into unfetched range is a new window
+      // request, so it must not wait out a retry for the failed one.
+      now += 1_000;
+      videoRef.current!.currentTime = 1400;
+      videoRef.current!.dispatchEvent(new Event("seeked"));
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+      expect(String(fetchMock.mock.calls[2]![0])).toContain("position=1398");
+      await waitFor(() => expect(createdTracks[0]!.cues.map((c) => c.text)).toEqual(["late"]));
+    } finally {
+      nowSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("retries on a seek while the failed first window is still backing off", async () => {
+    let now = 1_000_000;
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      fetchMock
+        .mockRejectedValueOnce(new Error("first extraction died"))
+        .mockResolvedValueOnce(vttResponse("WEBVTT\n\n23:20.000 --> 23:22.000\nlate\n\n"));
+      const states: string[] = [];
+      const { videoRef } = renderTracks({
+        origin: 0,
+        durationRef: { current: 7200 },
+        onLoadState: (state) => states.push(state),
+      });
+      // Wait until the initial failure has been counted, not merely requested.
+      await waitFor(() => expect(states.at(-1)).toBe("error"));
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      // Still inside the 5s backoff and hasFetched is false: no window has
+      // ever loaded, so a seek is a fresh request rather than a retry of the
+      // failed one. It must not wait out the backoff.
+      now += 1_000;
+      videoRef.current!.currentTime = 1400;
+      videoRef.current!.dispatchEvent(new Event("seeked"));
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+      expect(String(fetchMock.mock.calls[1]![0])).toContain("position=1398");
+      await waitFor(() => expect(createdTracks[0]!.cues.map((c) => c.text)).toEqual(["late"]));
+    } finally {
+      nowSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("revives the fetcher on a seek after the terminal failure budget", async () => {
+    vi.useFakeTimers();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    fetchMock
+      .mockResolvedValueOnce(vttResponse("WEBVTT\n\n00:00:10.000 --> 00:00:12.000\nearly\n\n"))
+      .mockRejectedValueOnce(new Error("extend one dead"))
+      .mockRejectedValueOnce(new Error("extend two dead"))
+      .mockRejectedValueOnce(new Error("extend three dead"))
+      .mockRejectedValueOnce(new Error("extend four dead"))
+      .mockResolvedValueOnce(vttResponse("WEBVTT\n\n23:20.000 --> 23:22.000\nlate\n\n"));
+    const { videoRef, unmount } = renderTracks({ origin: 0, durationRef: { current: 7200 } });
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      // Enter the prefetch lead; the first extend fails and spends one of the
+      // four terminal failures.
+      await act(async () => {
+        videoRef.current!.currentTime = 100;
+        videoRef.current!.dispatchEvent(new Event("timeupdate"));
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+
+      // The 5s/10s/20s backoff rungs spend the rest of the budget; the fourth
+      // failure schedules no fifth attempt.
+      for (const delay of [5_000, 10_000, 20_000]) {
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(delay);
+        });
+      }
+      expect(fetchMock).toHaveBeenCalledTimes(5);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10 * 60_000);
+        videoRef.current!.dispatchEvent(new Event("timeupdate"));
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(5);
+
+      // A seek into unfetched range resets the spent budget and fetches.
+      await act(async () => {
+        videoRef.current!.currentTime = 1400;
+        videoRef.current!.dispatchEvent(new Event("seeked"));
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(6);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(createdTracks[0]!.cues.map((c) => c.text)).toEqual(["late"]);
+    } finally {
+      unmount();
+      error.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("populates the display when cues are added while paused", async () => {
+    fetchMock.mockResolvedValue(
+      vttResponse("WEBVTT\n\n00:00:10.000 --> 00:00:12.000\npaused cue\n\n"),
+    );
+    const videoRef = makeVideoRef(1);
+    // The playhead sits inside the cue before the first fetch resolves; a real
+    // track would leave it active, but adding a cue while paused does not fire
+    // `cuechange`.
+    videoRef.current!.currentTime = 11;
+    const { result } = renderHook(() =>
+      useSubtitleTracks(videoRef, [srtTrack], 1, 0, 0, { current: 7200 }, { current: 0 }),
+    );
+
+    await waitFor(() => expect(result.current).toEqual([{ text: "paused cue" }]));
+    expect(videoRef.current!.paused).toBe(true);
+
+    // The pause event refreshes the display from the track as well.
+    act(() => videoRef.current!.dispatchEvent(new Event("pause")));
+    expect(result.current).toEqual([{ text: "paused cue" }]);
+  });
+
+  it("carries cue placement through to the display objects", async () => {
+    fetchMock.mockResolvedValue(
+      vttResponse("WEBVTT\n\n00:00:10.000 --> 00:00:12.000 align:right line:50%\nmiddle right\n\n"),
+    );
+    const videoRef = makeVideoRef(1);
+    videoRef.current!.currentTime = 11;
+    const { result } = renderHook(() =>
+      useSubtitleTracks(videoRef, [srtTrack], 1, 0, 0, { current: 7200 }, { current: 0 }),
+    );
+
+    await waitFor(() =>
+      expect(result.current).toEqual([{ text: "middle right", align: "right", line: "middle" }]),
+    );
+    // The cue itself also receives the settings when the implementation has
+    // them; a fake that only stores text must not throw.
+    const cue = createdTracks[0]!.cues[0] as unknown as { align?: string; line?: number };
+    expect(cue.align).toBe("right");
+    expect(cue.line).toBe(50);
+  });
+
+  it("renders decoded cue text and preserves literal angle brackets", async () => {
+    fetchMock.mockResolvedValue(
+      vttResponse(
+        "WEBVTT\n\n00:00:10.000 --> 00:00:12.000\n<i>Fish &lt;3 U &gt; 2</i> &amp; hearts &lt;b&gt;literal&lt;/b&gt;\n\n",
+      ),
+    );
+    const videoRef = makeVideoRef(1);
+    videoRef.current!.currentTime = 11;
+    const { result } = renderHook(() =>
+      useSubtitleTracks(videoRef, [srtTrack], 1, 0, 0, { current: 7200 }, { current: 0 }),
+    );
+
+    await waitFor(() =>
+      expect(result.current).toEqual([{ text: "Fish <3 U > 2 & hearts <b>literal</b>" }]),
+    );
   });
 });
 
@@ -776,6 +1070,55 @@ describe("subtitle source changed", () => {
       unmount();
       error.mockRestore();
       vi.useRealTimers();
+    }
+  });
+
+  it("retries the same URL on a refresh revision after a 409 and renders the cues", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const states: string[] = [];
+    const onSourceChanged = vi.fn();
+    fetchMock
+      .mockResolvedValueOnce(errorResponse(409, { error: "subtitle_source_changed" }))
+      .mockResolvedValueOnce(vttResponse("WEBVTT\n\n00:00:10.000 --> 00:00:12.000\nrecovered\n\n"));
+    const videoRef = makeVideoRef();
+    const durationRef = { current: 7200 };
+    const { rerender, unmount } = renderHook(
+      ({ refreshRevision }: { refreshRevision: number }) =>
+        useSubtitleTracks(
+          videoRef,
+          [srtTrack],
+          1,
+          0,
+          0,
+          durationRef,
+          { current: 0 },
+          undefined,
+          null,
+          0,
+          (state) => states.push(state),
+          onSourceChanged,
+          0,
+          0,
+          refreshRevision,
+        ),
+      { initialProps: { refreshRevision: 0 } },
+    );
+    try {
+      await waitFor(() => expect(onSourceChanged).toHaveBeenCalledTimes(1));
+      // The stale URL cannot deliver cues: the overlay must stop claiming to
+      // load and report the error until the refreshed URL arrives.
+      expect(states.at(-1)).toBe("error");
+      const staleUrl = fetchMock.mock.calls[0]![0];
+
+      // The refresh replan lands even when it re-mints the same URL: the
+      // rebuild retries it once instead of staying parked on the 409.
+      rerender({ refreshRevision: 1 });
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+      expect(fetchMock.mock.calls[1]![0]).toBe(staleUrl);
+      await waitFor(() => expect(createdTracks[1]!.cues.map((c) => c.text)).toEqual(["recovered"]));
+    } finally {
+      unmount();
+      error.mockRestore();
     }
   });
 
