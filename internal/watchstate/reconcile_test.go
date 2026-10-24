@@ -310,6 +310,11 @@ func TestHistoryReconcilerRunRebindsMissingEpisodeWithUserScopedUpdate(t *testin
 		!strings.Contains(exec.sql, "media_item_id = $4") {
 		t.Fatalf("update query is not scoped by user, history id, and old media item:\n%s", exec.sql)
 	}
+	if !strings.Contains(exec.sql, "pg_advisory_xact_lock_shared") ||
+		!strings.Contains(exec.sql, "canonical_episode_id($1)") ||
+		!strings.Contains(exec.sql, "FROM locked") {
+		t.Fatalf("episode update does not lock before canonicalizing:\n%s", exec.sql)
+	}
 	wantArgs := []any{"episode-new", 42, "history-1", "episode-old"}
 	if !reflect.DeepEqual(exec.args, wantArgs) {
 		t.Fatalf("exec args = %#v, want %#v", exec.args, wantArgs)

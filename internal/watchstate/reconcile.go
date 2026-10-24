@@ -55,6 +55,32 @@ const updateHistoryMediaItemQuery = `
 		  AND media_item_id = $4
 	`
 
+// updateEpisodeHistoryMediaItemQuery keeps the resolve-and-write sequence under
+// the same per-series shared lock reconciliation takes exclusively. The lock is
+// acquired before canonical_episode_id runs, so a mapping committed before this
+// statement is visible, and one starting later waits until the history row is
+// updated. The whole statement is one transaction, so the lock covers the
+// update as well as the canonical lookup.
+const updateEpisodeHistoryMediaItemQuery = `
+		WITH target AS (
+			SELECT e.series_id
+			FROM episodes e
+			WHERE e.content_id = $1
+		), locked AS (
+			SELECT pg_advisory_xact_lock_shared(hashtextextended(series_id, 0))
+			FROM target
+		), canonical AS (
+			SELECT public.canonical_episode_id($1) AS media_item_id
+			FROM locked
+		)
+		UPDATE user_watch_history
+		SET media_item_id = canonical.media_item_id
+		FROM canonical
+		WHERE user_id = $2
+		  AND id = $3
+		  AND media_item_id = $4
+	`
+
 // HistoryReconciler repairs orphaned watch-history rows by resolving each row's
 // stored watch_identity back to a current media_item_id via the catalog.
 type HistoryReconciler struct {
@@ -107,7 +133,13 @@ func (r *HistoryReconciler) Run(ctx context.Context) (ReconcileStats, error) {
 			continue
 		}
 
-		tag, err := r.pool.Exec(ctx, updateHistoryMediaItemQuery, newID, userID, id, currentItemID)
+		updateQuery := updateHistoryMediaItemQuery
+		if identity.StableType == "episode" {
+			// The episode update must lock and canonicalize; a bare ID rewrite
+			// can recreate history under a hidden alias row.
+			updateQuery = updateEpisodeHistoryMediaItemQuery
+		}
+		tag, err := r.pool.Exec(ctx, updateQuery, newID, userID, id, currentItemID)
 		if err != nil {
 			stats.Errors++
 			continue
