@@ -20,7 +20,37 @@ func (r *PlayableTargetResolver) resolvePostgresTargets(ctx context.Context, arg
 		-- Keep the unique-key lookup when profile statistics lag a bulk import.
 		OFFSET 0
 	)`, progress)
-	query := fmt.Sprintf(`
+	query := buildPostgresPlayableTargetsQuery(fileSQL, progress, completedSQL)
+
+	result := make(map[string]PlayableTarget, len(keysByOrd))
+	err := r.queryPlayableTargets(ctx, query, args, func(rows pgx.Rows) error {
+		var ord int64
+		var contentID string
+		var season *int
+		if err := rows.Scan(&ord, &contentID, &season); err != nil {
+			return fmt.Errorf("scanning postgres playable target: %w", err)
+		}
+		if ord < 1 || ord > int64(len(keysByOrd)) {
+			return fmt.Errorf("postgres playable target ordinality %d is outside the requested set", ord)
+		}
+		result[keysByOrd[ord-1]] = PlayableTarget{ContentID: contentID, SeasonNumber: season}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("resolving postgres playable targets: %w", err)
+	}
+	return result, nil
+}
+
+// buildPostgresPlayableTargetsQuery renders the SQL winner path. fileSQL
+// references the media_files alias mf; progress names the profile progress
+// relation. Canonical episodes may be backed by a direct file or by a present
+// file owned by one of their alias rows.
+func buildPostgresPlayableTargetsQuery(fileSQL, progress, completedSQL string) string {
+	episodeFileSQL := canonicalEpisodeFileExistsSQL("episode.content_id", fileSQL)
+	leafFileSQL := canonicalEpisodeFileExistsSQL("requested.content_id", fileSQL)
+	excludeAliases := episodeAliasExclusionPredicateFor("episode")
+	return fmt.Sprintf(`
 		WITH requested AS (
 			SELECT content_id, media_type, series_id, season_number, preferred_content_id, ord
 			FROM unnest($1::text[], $2::text[], $3::text[], $4::integer[], $5::text[]) WITH ORDINALITY
@@ -45,15 +75,15 @@ func (r *PlayableTargetResolver) resolvePostgresTargets(ctx context.Context, arg
 				CASE WHEN requested.media_type = 'movie' AND EXISTS (
 					SELECT 1 FROM media_files mf WHERE mf.content_id = requested.content_id AND %[1]s
 				) THEN requested.content_id
-				WHEN requested.media_type = 'episode' AND EXISTS (
-					SELECT 1 FROM media_files mf WHERE mf.episode_id = requested.content_id AND %[1]s
-				) THEN requested.content_id END,
+				WHEN requested.media_type = 'episode' AND %[5]s
+				THEN requested.content_id END,
 				(SELECT episode.content_id
 				 FROM target_scopes scope
 				 JOIN episodes episode ON episode.series_id = scope.series_id
 				   AND (scope.season_number IS NULL OR episode.season_number = scope.season_number)
 				 WHERE scope.ord = requested.ord AND episode.content_id = requested.preferred_content_id
-				   AND EXISTS (SELECT 1 FROM media_files mf WHERE mf.episode_id = episode.content_id AND %[1]s)
+				   AND `+excludeAliases+`
+				   AND %[6]s
 				 LIMIT 1),
 				(SELECT episode.content_id
 				 FROM %[2]s progress
@@ -61,7 +91,8 @@ func (r *PlayableTargetResolver) resolvePostgresTargets(ctx context.Context, arg
 				 JOIN target_scopes scope ON scope.ord = requested.ord AND episode.series_id = scope.series_id
 				   AND (scope.season_number IS NULL OR episode.season_number = scope.season_number)
 				 WHERE progress.position_seconds > 0 AND NOT progress.completed
-				   AND EXISTS (SELECT 1 FROM media_files mf WHERE mf.episode_id = episode.content_id AND %[1]s)
+				   AND `+excludeAliases+`
+				   AND %[6]s
 				 ORDER BY progress.updated_at DESC,
 				   CASE WHEN episode.season_number = 0 THEN 1 ELSE 0 END,
 				   episode.season_number, episode.episode_number, episode.content_id
@@ -76,26 +107,7 @@ func (r *PlayableTargetResolver) resolvePostgresTargets(ctx context.Context, arg
 		-- One primary-key probe per winner, not per candidate.
 		LEFT JOIN episodes target_episode ON target_episode.content_id = target.play_content_id
 		WHERE target.play_content_id IS NOT NULL
-	`, fileSQL, progress, firstPlayableEpisodeSQL(fileSQL, completedSQL), firstPlayableEpisodeSQL(fileSQL, ""))
-
-	result := make(map[string]PlayableTarget, len(keysByOrd))
-	err := r.queryPlayableTargets(ctx, query, args, func(rows pgx.Rows) error {
-		var ord int64
-		var contentID string
-		var season *int
-		if err := rows.Scan(&ord, &contentID, &season); err != nil {
-			return fmt.Errorf("scanning postgres playable target: %w", err)
-		}
-		if ord < 1 || ord > int64(len(keysByOrd)) {
-			return fmt.Errorf("postgres playable target ordinality %d is outside the requested set", ord)
-		}
-		result[keysByOrd[ord-1]] = PlayableTarget{ContentID: contentID, SeasonNumber: season}
-		return nil
-	})
-	if err != nil {
-		return nil, fmt.Errorf("resolving postgres playable targets: %w", err)
-	}
-	return result, nil
+	`, fileSQL, progress, firstPlayableEpisodeSQL(fileSQL, completedSQL), firstPlayableEpisodeSQL(fileSQL, ""), leafFileSQL, episodeFileSQL)
 }
 
 // firstPlayableEpisodeSQL takes one ordered winner per scope before comparing
@@ -104,6 +116,8 @@ func (r *PlayableTargetResolver) resolvePostgresTargets(ctx context.Context, arg
 // Separating regular seasons and specials lets the episode series index supply
 // the order, so ordinary unseen cards stop after their first available match.
 func firstPlayableEpisodeSQL(fileSQL, progressSQL string) string {
+	episodeFileSQL := canonicalEpisodeFileExistsSQL("episode.content_id", fileSQL)
+	excludeAliases := episodeAliasExclusionPredicateFor("episode")
 	first := func(seasonSQL string) string {
 		return fmt.Sprintf(`(SELECT winner.content_id
 			FROM target_scopes scope
@@ -112,15 +126,16 @@ func firstPlayableEpisodeSQL(fileSQL, progressSQL string) string {
 				FROM episodes episode
 				WHERE episode.series_id = scope.series_id
 				  AND (scope.season_number IS NULL OR episode.season_number = scope.season_number)
+				  AND `+excludeAliases+`
 				  AND %s
-				  AND EXISTS (SELECT 1 FROM media_files mf WHERE mf.episode_id = episode.content_id AND %s)
+				  AND %s
 				  %s
 				ORDER BY episode.season_number, episode.episode_number, episode.content_id
 				LIMIT 1
 			) winner
 			WHERE scope.ord = requested.ord
 			ORDER BY winner.season_number, winner.episode_number, winner.content_id
-			LIMIT 1)`, seasonSQL, fileSQL, progressSQL)
+			LIMIT 1)`, seasonSQL, episodeFileSQL, progressSQL)
 	}
 	return "COALESCE(" + first("episode.season_number IS DISTINCT FROM 0") + ", " + first("episode.season_number = 0") + ")"
 }

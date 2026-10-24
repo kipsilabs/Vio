@@ -70,7 +70,87 @@ func TestEpisodeCatalogSelectBodyExcludesNonSeriesEpisodes(t *testing.T) {
 	}
 }
 
+// TestEpisodeCatalogRelationExcludesAliasRows guards the invariant that an
+// episode row named by episode_aliases.alias_episode_id never hydrates as its
+// own catalog episode. Every render site must carry the exclusion, so only the
+// canonical row appears.
+func TestEpisodeCatalogRelationExcludesAliasRows(t *testing.T) {
+	aliasExclusion := EpisodeAliasExclusionSQL("e.content_id")
+	scoped, _, handled := episodeCatalogBaseRelationForLibraries([]int{2}, []int{9}, 1)
+	if !handled {
+		t.Fatal("expected episode library scope to be handled")
+	}
+	for name, relation := range map[string]string{
+		"base relation":           episodeCatalogBaseRelation,
+		"library-scoped relation": scoped,
+	} {
+		if got := strings.Count(relation, aliasExclusion); got != 1 {
+			t.Fatalf("%s alias-exclusion count = %d, want 1:\n%s", name, got, relation)
+		}
+	}
+}
+
+// TestEpisodeCatalogRelationAcceptsAliasMembership guards the availability rule
+// for the episode base relation: a canonical episode with no direct
+// episode_libraries row still qualifies when an alias row owns the membership.
+// Membership alone is enough, so the relation must not require a media file.
+func TestEpisodeCatalogRelationAcceptsAliasMembership(t *testing.T) {
+	scoped, _, handled := episodeCatalogBaseRelationForLibraries([]int{2}, nil, 1)
+	if !handled {
+		t.Fatal("expected episode library scope to be handled")
+	}
+	disabledOnly, _, handled := episodeCatalogBaseRelationForLibraries(nil, []int{9}, 1)
+	if !handled {
+		t.Fatal("expected disabled-only episode library scope to be handled")
+	}
+	for name, relation := range map[string]string{
+		"base relation":            episodeCatalogBaseRelation,
+		"allowed-library relation": scoped,
+		"disabled-only relation":   disabledOnly,
+	} {
+		for _, want := range []string{
+			"FROM episode_libraries",
+			".episode_id = ea.alias_episode_id",
+			"ea.canonical_episode_id = e.content_id",
+		} {
+			if !strings.Contains(relation, want) {
+				t.Fatalf("%s missing %q:\n%s", name, want, relation)
+			}
+		}
+		if strings.Contains(relation, "media_files") {
+			t.Fatalf("%s must accept alias membership without requiring a file:\n%s", name, relation)
+		}
+	}
+}
+
+// TestEpisodeCatalogLibraryScopeCoversAliasRows pins both branches of the
+// allowed and disabled library predicates to the canonical episode's own
+// membership and its alias membership.
+func TestEpisodeCatalogLibraryScopeCoversAliasRows(t *testing.T) {
+	relation, args, handled := episodeCatalogBaseRelationForLibraries([]int{2, 7}, []int{9}, 3)
+	if !handled {
+		t.Fatal("expected episode library scope to be handled")
+	}
+	if len(args) != 4 {
+		t.Fatalf("args = %v, want 4 slice args", args)
+	}
+	// One direct branch and one alias branch per allowed/disabled predicate.
+	if got := strings.Count(relation, "el_scope_in.media_folder_id = ANY($3)"); got != 2 {
+		t.Fatalf("allowed-library predicate count = %d, want direct and alias branches:\n%s", got, relation)
+	}
+	if got := strings.Count(relation, "el_scope_out.media_folder_id = ANY($4)"); got != 2 {
+		t.Fatalf("disabled-library predicate count = %d, want direct and alias branches:\n%s", got, relation)
+	}
+	if got := strings.Count(relation, "episode_libraries el_scope_out ON el_scope_out.episode_id = ea.alias_episode_id"); got != 1 {
+		t.Fatalf("disabled-library alias branch count = %d, want 1:\n%s", got, relation)
+	}
+	if got := strings.Count(relation, "FROM episode_libraries el_scope_out"); got != 1 {
+		t.Fatalf("disabled-library direct branch count = %d, want 1:\n%s", got, relation)
+	}
+}
+
 // columnsReferencedOnAlias returns every distinct column referenced as
+
 // "<alias>.<column>" within projection (e.g. mi.air_timezone -> air_timezone).
 func columnsReferencedOnAlias(projection, alias string) map[string]bool {
 	re := regexp.MustCompile(`\b` + regexp.QuoteMeta(alias) + `\.([a-zA-Z_][a-zA-Z0-9_]*)`)

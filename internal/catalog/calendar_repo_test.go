@@ -80,6 +80,28 @@ func TestBuildListEventsQuery_UsesNotExistsForDisabledLibraries(t *testing.T) {
 	}
 }
 
+func TestBuildListEventsQuery_ExcludesAliasLayoutEpisodes(t *testing.T) {
+	t.Parallel()
+
+	repo := &CalendarRepository{}
+	query, _ := repo.buildListEventsQuery(CalendarFilter{
+		Start: time.Date(2026, time.April, 6, 0, 0, 0, 0, time.UTC),
+		End:   time.Date(2026, time.April, 12, 0, 0, 0, 0, time.UTC),
+	})
+
+	// filtered_episodes, season_finales, and episode_one_with_air_date each
+	// read the episodes table, so each needs the exclusion; an alias row in any
+	// of them would add a phantom episode, finale, or premiere.
+	if got := strings.Count(query, EpisodeAliasExclusionSQL("e.content_id")); got != 3 {
+		t.Fatalf("expected the alias exclusion in all three episode reads, found %d in:\n%s", got, query)
+	}
+	// Calendar metadata keeps episodes without a file; the exclusion must not
+	// turn into a library-availability filter.
+	if strings.Contains(query, "episode_libraries") {
+		t.Fatalf("calendar query gained a library-availability filter:\n%s", query)
+	}
+}
+
 func TestBuildListEventsQuery_RejectsExplicitLibraryOutsideAllowedScope(t *testing.T) {
 	t.Parallel()
 
