@@ -193,6 +193,11 @@ const (
 	// the leader; the cap stops a pathological run of failed leaders from
 	// wedging one request indefinitely.
 	subtitleWindowWaitRetries = 2
+	// subtitleWindowExtractTimeout bounds a coalesced window extraction after
+	// its leader disconnects. The extract runs detached from the leader's
+	// request context so waiting followers can still receive its committed
+	// result, but it cannot run forever.
+	subtitleWindowExtractTimeout = 2 * time.Minute
 	// subtitleExtractionFailureBaseCooldown is the first backoff after a
 	// retryable upstream extraction failure. It is deliberately longer than the
 	// typical client retry cadence (a few seconds) so the provider is not
@@ -1256,7 +1261,20 @@ func (c *SubtitleCache) serveWindowedSUP(w http.ResponseWriter, r *http.Request,
 		writer = capture
 	}
 	opts.Writer = writer
-	err := c.runExtract(r.Context(), opts, extract, counter)
+	// A coalesced extraction belongs to the flight, not only to the leader
+	// request. Detach it from the leader's cancellation (bounded by the
+	// timeout) so a leader disconnect does not throw away work that waiters
+	// can still consume from the last-good cache.
+	extractCtx := r.Context()
+	if leader {
+		var cancel context.CancelFunc
+		extractCtx, cancel = context.WithTimeout(
+			context.WithoutCancel(r.Context()),
+			subtitleWindowExtractTimeout,
+		)
+		defer cancel()
+	}
+	err := c.runExtract(extractCtx, opts, extract, counter)
 	if err != nil {
 		if r.Context().Err() == nil && IsSubtitleUpstreamError(err) {
 			// Recorded against the original source identity (sourceOpts), not

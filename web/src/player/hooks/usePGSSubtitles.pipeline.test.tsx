@@ -146,7 +146,7 @@ describe("PGS pipeline", () => {
     const firstUrl = String(fetchMock.mock.calls[0]![0]);
     expect(firstUrl).toContain("windowed=1");
     expect(firstUrl).toContain("position=0");
-    expect(firstUrl).toContain("duration=30");
+    expect(firstUrl).toContain("duration=60");
 
     act(() => flushFrame());
     expect(contexts.get(hook.canvas)?.drawImage).toHaveBeenCalled();

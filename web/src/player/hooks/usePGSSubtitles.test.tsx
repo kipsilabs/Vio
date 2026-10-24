@@ -320,11 +320,11 @@ describe("usePGSSubtitles fetcher", () => {
       { initialProps: { sourceGeneration: 1 } },
     );
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(fetchMock.mock.calls[0]?.[0]).toContain("position=70&duration=30");
+    expect(fetchMock.mock.calls[0]?.[0]).toContain("position=70&duration=60");
     rerender({ sourceGeneration: 2 });
     expect(fetchMock).toHaveBeenCalledTimes(2);
     // A fresh timeline after the rebuild starts with a short fresh window.
-    expect(fetchMock.mock.calls[1]?.[0]).toContain("position=70&duration=30");
+    expect(fetchMock.mock.calls[1]?.[0]).toContain("position=70&duration=60");
   });
 
   it("does not rebuild the fetcher for a new callback identity alone", () => {

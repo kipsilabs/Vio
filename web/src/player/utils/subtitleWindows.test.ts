@@ -276,6 +276,56 @@ describe("createSubtitleWindowFetcher", () => {
     fetcher.dispose();
   });
 
+  it("keeps a fresh 30/60 window on the wire while the playhead advances", () => {
+    let playhead = 1000;
+    const fetchMock = vi.fn(() => neverDelivers());
+    vi.stubGlobal("fetch", fetchMock);
+    const { fetcher } = makeFetcher(() => playhead, {
+      seekBackoffSeconds: 30,
+      firstWindowSeconds: 60,
+      windowSeconds: 120,
+    });
+
+    fetcher.maybeFetch();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // The production 30s backoff + 30s forward window ends at T+30. A
+    // playhead that advances during extraction must stay covered, or every
+    // timeupdate aborts the request and restarts the same window.
+    playhead = 1005;
+    fetcher.maybeFetch();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    fetcher.dispose();
+  });
+
+  it("revives a terminal fetcher on an explicit seek", async () => {
+    let playhead = 100;
+    let fail = true;
+    const fetchMock = vi.fn(() =>
+      fail ? respond([], false, { status: 500 }) : respond(["recovered"]),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const onTerminal = vi.fn();
+    const { fetcher, events } = makeFetcher(() => playhead, {
+      maxConsecutiveFailures: 1,
+      onTerminal,
+    });
+
+    fetcher.maybeFetch();
+    await vi.waitFor(() => expect(onTerminal).toHaveBeenCalledTimes(1));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    fail = false;
+    playhead = 2000;
+    fetcher.maybeFetch(true);
+    await vi.waitFor(() => expect(events).toContain("committed"));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    fetcher.dispose();
+  });
+
   it("aborts an in-flight window and starts a fresh short window on a seek", async () => {
     let playhead = 100;
     const signals: AbortSignal[] = [];
