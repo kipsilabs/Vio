@@ -1293,11 +1293,13 @@ func TestServeSUPExtractWindowedMissWarmsOnce(t *testing.T) {
 	// N windowed misses: each still streams its own windowed slice from the
 	// original file; only the first starts a warm (BeginFill coalescing keeps
 	// the rest out — deterministic because the in-flight slot is reserved
-	// synchronously before ServeSUPExtract returns).
+	// synchronously before ServeSUPExtract returns). Distinct windows: an exact
+	// repeat would be served from the last-good window cache instead of
+	// exercising the pre-warm path.
 	for i := 0; i < 4; i++ {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodGet, "/sub.sup?windowed=1&position=100&duration=3600", nil)
-		if err := c.ServeSUPExtract(rec, req, windowedSupOpts(source, 0, 100, 3600), extract); err != nil {
+		if err := c.ServeSUPExtract(rec, req, windowedSupOpts(source, 0, 100+float64(i), 3600), extract); err != nil {
 			t.Fatal(err)
 		}
 		if rec.Body.String() != "WINDOW SLICE" {
@@ -1365,6 +1367,234 @@ func TestServeSUPExtractWindowedRemoteInputSkipsDetachedWarm(t *testing.T) {
 	}
 	if recorder.Body.String() != "WINDOW" {
 		t.Fatalf("windowed body = %q", recorder.Body.String())
+	}
+}
+
+// The window cache key is the original source identity, so a window stored
+// before a full-track artifact exists is still a hit after one is committed.
+func TestServeSUPExtractWindowedCacheKeySurvivesArtifactCommit(t *testing.T) {
+	c, source := newTestCache(t)
+	opts := windowedSupOpts(source, 0, 300, 600)
+	opts.DisableBackgroundWarm = true
+	const payload = "PGS WINDOW"
+
+	calls := 0
+	extract := func(_ context.Context, extractOpts StreamExtractOpts) error {
+		calls++
+		_, err := io.WriteString(extractOpts.Writer, payload)
+		return err
+	}
+	rec := httptest.NewRecorder()
+	if err := c.ServeSUPExtract(rec, httptest.NewRequest(http.MethodGet, "/sub.sup?windowed=1", nil), opts, extract); err != nil {
+		t.Fatalf("source-backed request: %v", err)
+	}
+
+	// A full-track artifact now exists, so a repeat would take the cached-.sup
+	// fast path if it missed the window cache. The key must not change.
+	fillEntry(t, c, source, 0, "FULL TRACK")
+
+	rec = httptest.NewRecorder()
+	if err := c.ServeSUPExtract(rec, httptest.NewRequest(http.MethodGet, "/sub.sup?windowed=1", nil), opts, extract); err != nil {
+		t.Fatalf("artifact-backed request: %v", err)
+	}
+	if rec.Body.String() != payload {
+		t.Fatalf("body = %q, want the cached window %q", rec.Body.String(), payload)
+	}
+	if calls != 1 {
+		t.Fatalf("extract calls = %d, want the cached window (still 1)", calls)
+	}
+}
+
+// A repeated identical windowed SUP request must serve the last-good copy
+// instead of re-running ffmpeg.
+func TestServeSUPExtractWindowedRepeatServesLastGood(t *testing.T) {
+	c, source := newTestCache(t)
+	opts := windowedSupOpts(source, 0, 300, 600)
+	opts.DisableBackgroundWarm = true
+	const payload = "PGS WINDOW"
+
+	calls := 0
+	extract := func(_ context.Context, extractOpts StreamExtractOpts) error {
+		calls++
+		_, err := io.WriteString(extractOpts.Writer, payload)
+		return err
+	}
+	for attempt := range 2 {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/sub.sup?windowed=1&position=300&duration=600", nil)
+		if err := c.ServeSUPExtract(rec, req, opts, extract); err != nil {
+			t.Fatalf("attempt %d: %v", attempt, err)
+		}
+		if rec.Body.String() != payload {
+			t.Fatalf("attempt %d body = %q, want %q", attempt, rec.Body.String(), payload)
+		}
+		wantCacheControl := "private, no-cache"
+		if attempt == 0 {
+			wantCacheControl = "no-store"
+		}
+		if cc := rec.Header().Get("Cache-Control"); cc != wantCacheControl {
+			t.Fatalf("attempt %d Cache-Control = %q, want %q", attempt, cc, wantCacheControl)
+		}
+		if ct := rec.Header().Get("Content-Type"); ct != "application/octet-stream" {
+			t.Fatalf("attempt %d Content-Type = %q", attempt, ct)
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("extract calls = %d, want 1 for a repeated window", calls)
+	}
+}
+
+// Concurrent identical windowed SUP requests must coalesce onto one extraction
+// and all serve its bytes.
+func TestServeSUPExtractWindowedCoalescesConcurrentRepeats(t *testing.T) {
+	c, source := newTestCache(t)
+	opts := windowedSupOpts(source, 0, 300, 600)
+	opts.DisableBackgroundWarm = true
+	const payload = "PGS WINDOW"
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+
+	var (
+		mu    sync.Mutex
+		calls int
+	)
+	extract := func(_ context.Context, extractOpts StreamExtractOpts) error {
+		mu.Lock()
+		calls++
+		leader := calls == 1
+		mu.Unlock()
+		if leader {
+			close(started)
+			<-release
+		}
+		_, err := io.WriteString(extractOpts.Writer, payload)
+		return err
+	}
+
+	type result struct {
+		body string
+		err  error
+	}
+	const requests = 4
+	begin := make(chan struct{})
+	results := make(chan result, requests)
+	for range requests {
+		go func() {
+			<-begin
+			rec := httptest.NewRecorder()
+			err := c.ServeSUPExtract(rec, httptest.NewRequest(http.MethodGet, "/sub.sup?windowed=1", nil), opts, extract)
+			results <- result{body: rec.Body.String(), err: err}
+		}()
+	}
+	close(begin)
+
+	// The leader holds the extraction open; the others either join its flight
+	// or, if they arrive after it stores the slice, serve that stored copy.
+	<-started
+	releaseOnce.Do(func() { close(release) })
+
+	for range requests {
+		got := <-results
+		if got.err != nil {
+			t.Fatalf("request error = %v", got.err)
+		}
+		if got.body != payload {
+			t.Fatalf("body = %q, want %q", got.body, payload)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("extract calls = %d, want 1 coalesced extraction", calls)
+	}
+}
+
+// Without a cached window, an upstream 5xx leaves the identity in a backoff so
+// an immediate retry is answered retryable without opening the source again.
+func TestServeSUPExtractWindowedUpstreamFailureBacksOff(t *testing.T) {
+	c, source := newTestCache(t)
+	c.extractRetryDelays = []time.Duration{}
+	opts := windowedSupOpts(source, 0, 300, 600)
+	opts.DisableBackgroundWarm = true
+
+	calls := 0
+	extract := func(context.Context, StreamExtractOpts) error {
+		calls++
+		return upstreamSubtitleError()
+	}
+	req := httptest.NewRequest(http.MethodGet, "/sub.sup?windowed=1", nil)
+	err := c.ServeSUPExtract(httptest.NewRecorder(), req, opts, extract)
+	if !IsSubtitleUpstreamError(err) {
+		t.Fatalf("first request error = %v, want the upstream failure", err)
+	}
+	if calls != 1 {
+		t.Fatalf("extract calls = %d, want 1", calls)
+	}
+
+	rec := httptest.NewRecorder()
+	err = c.ServeSUPExtract(rec, httptest.NewRequest(http.MethodGet, "/sub.sup?windowed=1", nil), opts, extract)
+	var retry *SubtitleExtractionRetryError
+	if !errors.As(err, &retry) {
+		t.Fatalf("retry error = %v, want SubtitleExtractionRetryError", err)
+	}
+	if retry.RetryAfter <= 0 || retry.RetryAfter > subtitleExtractionFailureBaseCooldown {
+		t.Fatalf("retry after = %s, want within %s", retry.RetryAfter, subtitleExtractionFailureBaseCooldown)
+	}
+	if calls != 1 {
+		t.Fatalf("extract calls = %d after a retry inside the backoff, want 1", calls)
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("backoff response body = %q, want none", rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "" {
+		t.Fatalf("backoff response must not commit a Content-Type, got %q", ct)
+	}
+}
+
+// A cached window stays servable while its identity is in the failure backoff.
+func TestServeSUPExtractWindowedServesLastGoodDuringCooldown(t *testing.T) {
+	c, source := newTestCache(t)
+	opts := windowedSupOpts(source, 0, 300, 600)
+	opts.DisableBackgroundWarm = true
+	const payload = "PGS WINDOW"
+
+	calls := 0
+	succeed := func(_ context.Context, extractOpts StreamExtractOpts) error {
+		calls++
+		_, err := io.WriteString(extractOpts.Writer, payload)
+		return err
+	}
+	rec := httptest.NewRecorder()
+	if err := c.ServeSUPExtract(rec, httptest.NewRequest(http.MethodGet, "/sub.sup?windowed=1", nil), opts, succeed); err != nil {
+		t.Fatalf("seed request: %v", err)
+	}
+	if rec.Body.String() != payload {
+		t.Fatalf("seed body = %q, want %q", rec.Body.String(), payload)
+	}
+
+	// A different window of the same identity failed upstream, so the identity
+	// is cooling down.
+	c.noteExtractionFailure(opts, subtitleFormatSUP)
+
+	failing := func(context.Context, StreamExtractOpts) error {
+		calls++
+		return upstreamSubtitleError()
+	}
+	rec = httptest.NewRecorder()
+	if err := c.ServeSUPExtract(rec, httptest.NewRequest(http.MethodGet, "/sub.sup?windowed=1", nil), opts, failing); err != nil {
+		t.Fatalf("cached window during cooldown: %v", err)
+	}
+	if rec.Body.String() != payload {
+		t.Fatalf("cached body during cooldown = %q, want %q", rec.Body.String(), payload)
+	}
+	if cc := rec.Header().Get("Cache-Control"); cc != "private, no-cache" {
+		t.Fatalf("cached window Cache-Control = %q", cc)
+	}
+	if calls != 1 {
+		t.Fatalf("extract calls = %d, want the cached copy (still 1)", calls)
 	}
 }
 
