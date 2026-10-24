@@ -259,6 +259,10 @@ export function useASSSubtitles(
   // re-arms requestVideoFrameCallback only from inside its own callback, and
   // callbacks registered on an engine end with it, so the renderer rebuilds.
   transportRevision = 0,
+  // Bumped when a new playback session starts at the beginning. Unlike a
+  // transport rebuild, a replay can reuse the same URL and source generation,
+  // so it needs an explicit signal to discard the previous playhead's window.
+  replayRevision = 0,
 ): { isActive: boolean } {
   const onLoadStateRef = useRef(onLoadState);
   onLoadStateRef.current = onLoadState;
@@ -281,6 +285,7 @@ export function useASSSubtitles(
   const committedWindowRef = useRef<{
     url: string;
     sourceGeneration: number;
+    replayRevision: number;
     start: number;
   } | null>(null);
   const syncedFitRef = useRef(videoFit);
@@ -337,7 +342,8 @@ export function useASSSubtitles(
       previousCommitted !== null &&
       activeUrl !== null &&
       previousCommitted.url === activeUrl &&
-      previousCommitted.sourceGeneration === sourceGeneration
+      previousCommitted.sourceGeneration === sourceGeneration &&
+      previousCommitted.replayRevision === replayRevision
         ? previousCommitted
         : null;
 
@@ -434,6 +440,16 @@ export function useASSSubtitles(
     /** Whether the element can report a playhead at all. */
     function playheadKnown(): boolean {
       return !!video && video.readyState > 0;
+    }
+
+    /**
+     * Whether a resumed transport's ambiguous zero has become a real playhead.
+     * A resumed window deliberately skips completion reconciliation while the
+     * element still reports 0, but once a position arrives the normal backstop
+     * must not stay suppressed for the rest of that attempt.
+     */
+    function playheadLeftTransportZero(): boolean {
+      return !!video && video.readyState > 0 && video.currentTime > 0;
     }
 
     /** Source-time position of the playhead (player clock + stream origin). */
@@ -659,7 +675,11 @@ export function useASSSubtitles(
       jassubRef.current = instance;
       // Resizes skipped while a stream reload emptied the video happen here,
       // once the next stream has a frame size. Some browsers report that size
-      // after loadedmetadata, with a resize event.
+      // after loadedmetadata, with a resize event. Replacements share the same
+      // <video>, so drop the previous renderer's listeners before attaching the
+      // new pair rather than leaving them behind until the effect tears down.
+      stopResizeToStream?.();
+      stopResizeToStream = null;
       const resizeToStream = () => repaintASS(instance, () => jassubRef.current === instance);
       video.addEventListener("loadedmetadata", resizeToStream);
       video.addEventListener("resize", resizeToStream);
@@ -698,7 +718,7 @@ export function useASSSubtitles(
         windowStart = start;
         // This run's commit is the only window a later rebuild of this same
         // track identity may reuse.
-        committedWindowRef.current = { url: activeUrl!, sourceGeneration, start };
+        committedWindowRef.current = { url: activeUrl!, sourceGeneration, replayRevision, start };
         windowEnd = wholeTrack ? Infinity : start + ASS_WINDOW_DURATION_SECONDS;
         windowFailures = 0;
         textFailures = 0;
@@ -821,13 +841,20 @@ export function useASSSubtitles(
         pendingStart = null;
         if (next !== null && !cancelled && !terminal) {
           void attempt(next, false);
-        } else if (committed && recheckAfterCommit && !cancelled && !terminal && playheadKnown()) {
+        } else if (
+          committed &&
+          (recheckAfterCommit || playheadLeftTransportZero()) &&
+          !cancelled &&
+          !terminal &&
+          playheadKnown()
+        ) {
           // Backstop for a playhead that left the committed window while the
           // extraction ran and then stopped emitting events (paused). If the
           // position is inside, this is a no-op: there is no refresh loop. An
           // empty element has no playhead to reconcile, and a window resumed
           // across a transport rebuild must not be undone by the same
-          // ambiguous 0 that made it necessary.
+          // ambiguous 0 that made it necessary. Once that resumed attempt sees
+          // a real non-zero playhead, reconcile it.
           maybeRefreshWindow(false);
         }
       }
@@ -907,6 +934,7 @@ export function useASSSubtitles(
     sourceGeneration,
     rebuild,
     transportRevision,
+    replayRevision,
   ]);
 
   // A retime of the track on screen (subtitle sync, a timing reset) loads the

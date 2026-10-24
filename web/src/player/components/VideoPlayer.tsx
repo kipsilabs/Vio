@@ -215,6 +215,8 @@ interface VideoPlayerProps {
   /** Bumped on every adopted plan; stream-reload effects key on it. */
   planRevision: number;
   transportRevision?: number;
+  /** Bumped when a new session starts at the beginning; transport-local state resets. */
+  replayRevision?: number;
   /**
    * The browser decode engine, when browser decoding is on and this browser
    * can run it. An `original_http` plan the media element cannot play goes to
@@ -517,6 +519,7 @@ export function VideoPlayer({
   plan,
   planRevision,
   transportRevision,
+  replayRevision = 0,
   browserEngine = null,
   nativeOriginalSupport,
   shouldAutoPlay = true,
@@ -3959,6 +3962,7 @@ export function VideoPlayer({
     coverCrop,
     activeSubtitleCueRevision,
     engineTransportRevision,
+    replayRevision,
   );
   // Prefetch ASS font bundles at plan adoption so a later track selection hits
   // the in-memory font cache instead of a cold server extraction. Purely a

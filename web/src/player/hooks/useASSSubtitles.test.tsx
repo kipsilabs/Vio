@@ -440,6 +440,28 @@ describe("useASSSubtitles stream reload", () => {
       expect(remove).toHaveBeenCalledWith(type, listener);
     }
   });
+
+  it("removes a replaced renderer's resize listeners", async () => {
+    const videoRef = makeVideoRef(1);
+    const video = videoRef.current!;
+    const add = vi.spyOn(video, "addEventListener");
+    const remove = vi.spyOn(video, "removeEventListener");
+    const { unmount } = renderHook(() => useASSSubtitles(videoRef, [germanTrack], 6, false, 0, 0));
+    await waitFor(() => expect(instances).toHaveLength(1));
+    const first = add.mock.calls.filter(([type]) => type === "loadedmetadata" || type === "resize");
+    expect(first).toHaveLength(2);
+
+    await act(async () => {
+      video.currentTime = 590;
+      video.dispatchEvent(new Event("timeupdate"));
+    });
+    await waitFor(() => expect(instances).toHaveLength(2));
+
+    for (const [type, listener] of first) {
+      expect(remove).toHaveBeenCalledWith(type, listener);
+    }
+    unmount();
+  });
 });
 
 describe("useASSSubtitles video fit", () => {
@@ -1256,6 +1278,110 @@ describe("useASSSubtitles bounded retry/watchdog policy", () => {
     // window the rebuild just restored.
     await act(async () => {});
     expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2);
+  });
+
+  it("starts from the playhead when a replay bump accompanies a transport rebuild", async () => {
+    const state = vi.fn();
+    const videoRef = makeVideoRef(1);
+    const requested: string[] = [];
+    vi.mocked(fetch).mockImplementation((input, init) => {
+      requested.push(String(input));
+      return abortAwareResponse("[Script Info]", init);
+    });
+    videoRef.current!.currentTime = 1021;
+    const { rerender } = renderHook(
+      ({ transportRevision, replayRevision }) =>
+        useASSSubtitles(
+          videoRef,
+          [germanTrack],
+          6,
+          false,
+          0,
+          0,
+          state,
+          undefined,
+          0,
+          "contain",
+          { x: 0, y: 0 },
+          0,
+          transportRevision,
+          replayRevision,
+        ),
+      { initialProps: { transportRevision: 0, replayRevision: 0 } },
+    );
+
+    await waitFor(() => expect(state).toHaveBeenLastCalledWith("ready"));
+    expect(requested[0]).toContain("position=1001&duration=120");
+
+    // The replay keeps the URL and source generation but starts at zero. The
+    // transport rebuild alone would reuse the old window; the explicit replay
+    // epoch must win.
+    videoRef.current!.currentTime = 0;
+    await act(async () => {
+      rerender({ transportRevision: 1, replayRevision: 1 });
+    });
+
+    await waitFor(() => expect(requested).toHaveLength(2));
+    expect(requested[1]).toContain("position=0&duration=120");
+  });
+
+  it("reconciles a resumed window once the playhead becomes authoritative", async () => {
+    const state = vi.fn();
+    const videoRef = makeVideoRef(1);
+    const requested: string[] = [];
+    let resumed: ReturnType<typeof deferredResponse> | null = null;
+    vi.mocked(fetch).mockImplementation((input, init) => {
+      requested.push(String(input));
+      if (requested.length === 2) {
+        resumed = deferredResponse(init);
+        return resumed.promise;
+      }
+      return abortAwareResponse("[Script Info]", init);
+    });
+    videoRef.current!.currentTime = 1021;
+    const { rerender } = renderHook(
+      ({ transportRevision }) =>
+        useASSSubtitles(
+          videoRef,
+          [germanTrack],
+          6,
+          false,
+          0,
+          0,
+          state,
+          undefined,
+          0,
+          "contain",
+          { x: 0, y: 0 },
+          0,
+          transportRevision,
+        ),
+      { initialProps: { transportRevision: 0 } },
+    );
+
+    await waitFor(() => expect(state).toHaveBeenLastCalledWith("ready"));
+    expect(requested[0]).toContain("position=1001&duration=120");
+
+    // The rebuilt transport briefly reports zero, so the committed window is
+    // resumed and the completion backstop is suppressed while the position is
+    // ambiguous.
+    videoRef.current!.currentTime = 0;
+    await act(async () => {
+      rerender({ transportRevision: 1 });
+    });
+    await waitFor(() => expect(requested).toHaveLength(2));
+    expect(requested[1]).toContain("position=1001&duration=120");
+
+    // The playhead becomes real while the resumed extraction is still pending.
+    // Completion must reconcile instead of leaving the old window in place.
+    videoRef.current!.currentTime = 750;
+    await act(async () => {
+      resumed!.settle("[Script Info]");
+    });
+
+    await waitFor(() => expect(requested).toHaveLength(3));
+    expect(requested[2]).toContain("position=730&duration=120");
+    await waitFor(() => expect(state).toHaveBeenLastCalledWith("ready"));
   });
 
   it("starts from zero when a track is re-enabled after a seek to the start", async () => {
