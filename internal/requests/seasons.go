@@ -290,7 +290,7 @@ func catalogSeriesSeasonSource(match PresenceMatch) string {
 func requestSeasonCountsCompatible(source string, match PresenceMatch) bool {
 	source = requestSeasonSource(source)
 	if source == "" {
-		return true
+		return catalogSeriesSeasonSource(match) != ""
 	}
 	return seasonCountsCompatible(source == SeasonSourceTVDB, match)
 }

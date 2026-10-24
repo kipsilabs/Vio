@@ -666,11 +666,17 @@ func TestSeasonCountsCompatibleUsesCatalogNumberingProvenance(t *testing.T) {
 			}
 		})
 	}
-	if !requestSeasonCountsCompatible("", PresenceMatch{ContentID: "series-42"}) {
-		t.Fatal("legacy requests without a frozen source must keep the historical join")
+	if requestSeasonCountsCompatible("", PresenceMatch{ContentID: "series-42"}) {
+		t.Fatal("requests must fail closed when catalog provenance is unknown")
 	}
-	if requestSeasonCountsCompatible("tvdb", PresenceMatch{ContentID: "series-42"}) {
-		t.Fatal("explicit TVDB requests must fail closed when provenance is unknown")
+	if !requestSeasonCountsCompatible("", PresenceMatch{ContentID: "series-tvdb-42"}) {
+		t.Fatal("legacy requests with known catalog provenance keep the historical join")
+	}
+	if !requestSeasonCountsCompatible("tvdb", PresenceMatch{ContentID: "series-tvdb-42"}) {
+		t.Fatal("explicit TVDB requests must join a TVDB-numbered catalog")
+	}
+	if requestSeasonCountsCompatible("tvdb", PresenceMatch{ContentID: "series-tmdb-42"}) {
+		t.Fatal("explicit TVDB requests must not join a TMDB-numbered catalog")
 	}
 }
 
