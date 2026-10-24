@@ -222,11 +222,11 @@ export function nextBrowsePage(
 export function useRequestMediaDetail(
   mediaType: RequestMediaType,
   tmdbID: number,
-  options: { enabled?: boolean } = {},
+  options: { enabled?: boolean; seasonSource?: "tvdb" | "tmdb" } = {},
 ) {
   return useQuery({
-    queryKey: requestKeys.detail(mediaType, tmdbID),
-    queryFn: () => getRequestMediaDetailV2(mediaType, tmdbID),
+    queryKey: requestKeys.detail(mediaType, tmdbID, options.seasonSource ?? ""),
+    queryFn: () => getRequestMediaDetailV2(mediaType, tmdbID, options.seasonSource),
     enabled: tmdbID > 0 && (options.enabled ?? true),
     staleTime: REQUESTS_STALE_TIME,
     refetchInterval: (query) =>

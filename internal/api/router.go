@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -146,12 +147,32 @@ func (a seriesSeasonProviderAdapter) FetchSeriesTVDBSeasons(ctx context.Context,
 			Name:         season.Title,
 			EpisodeCount: episodeCount,
 			AirDate:      season.AirDate,
-			// TVDB returns absolute artwork URLs while the v2 poster_path and
-			// web helper assume TMDB paths; the UI name fallback is used instead.
+			// TVDB supplies absolute artwork URLs, which do not fit the v2
+			// poster_path field or the TMDB image helper; PosterURL carries
+			// them. A relative path is not a URL this surface can serve, so it
+			// is left out rather than handed to clients as artwork.
 			PosterPath: "",
+			PosterURL:  absoluteArtworkURL(season.PosterPath),
 		})
 	}
 	return out, nil
+}
+
+// absoluteArtworkURL returns raw when it is an absolute http or https URL, and
+// "" for anything else: provider-relative paths and other schemes are not
+// artwork clients can load directly.
+func absoluteArtworkURL(raw string) string {
+	if raw = strings.TrimSpace(raw); raw == "" {
+		return ""
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || !parsed.IsAbs() || parsed.Host == "" {
+		return ""
+	}
+	if !strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https") {
+		return ""
+	}
+	return raw
 }
 
 // Dependencies holds all shared dependencies that handlers need.

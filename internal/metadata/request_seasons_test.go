@@ -206,6 +206,54 @@ func TestFetchSeriesTVDBSeasonsSortsSeasonsAndCountsEpisodes(t *testing.T) {
 	}
 }
 
+// A TVDB season often arrives without its own air date even though its
+// episodes are dated. The season takes the earliest episode date so the
+// request page does not show it as unannounced, while a season the provider
+// already dated keeps that date and malformed episode dates are ignored.
+func TestFetchSeriesTVDBSeasonsDatesSeasonsFromEpisodes(t *testing.T) {
+	tvdb := &requestSeasonsProvider{
+		slug: "tvdb",
+		seasons: []SeasonResult{
+			{SeasonNumber: 1, Title: "Season 1"},
+			{SeasonNumber: 2, Title: "Season 2", AirDate: "2020-05-01"},
+			{SeasonNumber: 3, Title: "Season 3"},
+			{SeasonNumber: 4, Title: "Season 4"},
+		},
+		episodesBySeason: map[int][]EpisodeResult{
+			1: {
+				{SeasonNumber: 1, EpisodeNumber: 1, AirDate: "2021-03-01T20:00:00Z"},
+				{SeasonNumber: 1, EpisodeNumber: 2, AirDate: "2021-03-08"},
+				{SeasonNumber: 1, EpisodeNumber: 3, AirDate: "sometime in 2021"},
+			},
+			2: {{SeasonNumber: 2, EpisodeNumber: 1, AirDate: "2019-01-01"}},
+			3: {
+				{SeasonNumber: 3, EpisodeNumber: 1, AirDate: "2022-13-01"},
+				{SeasonNumber: 3, EpisodeNumber: 2},
+			},
+		},
+	}
+
+	seasons, err := requestSeasonsService(tvdb).FetchSeriesTVDBSeasons(context.Background(), 321, "en")
+	if err != nil {
+		t.Fatalf("FetchSeriesTVDBSeasons: %v", err)
+	}
+	got := make(map[int]string, len(seasons))
+	for _, season := range seasons {
+		got[season.SeasonNumber] = season.AirDate
+	}
+	want := map[int]string{
+		1: "2021-03-01", // earliest episode date, normalized from RFC3339
+		2: "2020-05-01", // the season's own date wins over its episode's earlier one
+		3: "",           // every episode date is malformed or empty
+		4: "",           // no episodes, so no date to infer
+	}
+	for number, wantDate := range want {
+		if got[number] != wantDate {
+			t.Errorf("season %d air date = %q, want %q", number, got[number], wantDate)
+		}
+	}
+}
+
 func TestFetchSeriesTVDBSeasonsSkipsSpecialsEpisodes(t *testing.T) {
 	tvdb := &requestSeasonsProvider{
 		slug: "tvdb",

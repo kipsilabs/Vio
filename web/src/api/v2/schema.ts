@@ -25930,6 +25930,12 @@ export interface components {
       /** @description TMDB image path */
       poster_path?: string;
       /**
+       * @description Series only: use TVDB or TMDB season numbering. Omitted: the server prefers TVDB
+       * @example tvdb
+       * @enum {string}
+       */
+      season_source?: "tvdb" | "tmdb";
+      /**
        * @description Series only: the season numbers to request, starting at 1 (a season below 1 is refused). Omitted: every aired season not yet complete in the library
        * @example [
        *       2,
@@ -29412,6 +29418,11 @@ export interface components {
        * @example 170
        */
       runtime?: number;
+      /**
+       * @description Series: the metadata provider that supplied the season list: tvdb or tmdb
+       * @example tvdb
+       */
+      season_source?: string;
       /** @description Series: the regular seasons (specials excluded) from the series metadata provider, with library availability and request coverage; empty for movies */
       seasons: components["schemas"]["RequestMediaSeason"][];
       /**
@@ -29537,6 +29548,8 @@ export interface components {
       name?: string;
       /** @description TMDB image path, when available */
       poster_path?: string;
+      /** @description Absolute artwork URL when the series metadata provider supplies one */
+      poster_url?: string;
       /** @description The title's active request covers this season */
       requested: boolean;
       /**
@@ -126071,7 +126084,10 @@ export interface operations {
   };
   getRequestMediaDetail: {
     parameters: {
-      query?: never;
+      query?: {
+        /** @description Series only: return TVDB or TMDB season numbering. Omitted: the server prefers TVDB */
+        season_source?: "tvdb" | "tmdb";
+      };
       header: {
         /** @description The household profile acting for this request; it must belong to the authenticated account. */
         "X-Profile-Id": string;

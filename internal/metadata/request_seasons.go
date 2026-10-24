@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
+	"time"
 
 	"golang.org/x/sync/errgroup"
 )
@@ -117,6 +119,9 @@ func (s *MetadataService) FetchSeriesTVDBSeasons(ctx context.Context, tvdbID int
 				kept = append(kept, episode)
 			}
 			season.Episodes = kept
+			if season.AirDate == "" {
+				season.AirDate = earliestEpisodeAirDate(kept)
+			}
 			return nil
 		})
 	}
@@ -128,4 +133,33 @@ func (s *MetadataService) FetchSeriesTVDBSeasons(ctx context.Context, tvdbID int
 	}
 
 	return ordered, nil
+}
+
+// earliestEpisodeAirDate returns the calendar date of the earliest episode with
+// a parseable air date, or "" when none has one. Providers date episodes as a
+// bare calendar date or as RFC3339; malformed values are ignored rather than
+// dating the season wrongly. The result is normalized to YYYY-MM-DD so the
+// request page and season rules can read it as a season air date.
+func earliestEpisodeAirDate(episodes []EpisodeResult) string {
+	var earliest time.Time
+	for _, episode := range episodes {
+		raw := strings.TrimSpace(episode.AirDate)
+		if raw == "" {
+			continue
+		}
+		aired, err := time.Parse(time.DateOnly, raw)
+		if err != nil {
+			aired, err = time.Parse(time.RFC3339, raw)
+		}
+		if err != nil {
+			continue
+		}
+		if earliest.IsZero() || aired.Before(earliest) {
+			earliest = aired
+		}
+	}
+	if earliest.IsZero() {
+		return ""
+	}
+	return earliest.Format(time.DateOnly)
 }

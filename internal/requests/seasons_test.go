@@ -513,6 +513,27 @@ func TestGetDetailPrefersTVDBSeasons(t *testing.T) {
 	}
 }
 
+// TVDB season artwork is an absolute URL, not a TMDB path: the detail page's
+// season list carries it in PosterURL and leaves PosterPath empty.
+func TestGetDetailCarriesTVDBSeasonPosterURL(t *testing.T) {
+	const posterURL = "https://artworks.thetvdb.com/banners/seasons/season-1.jpg"
+	provider := &fakeSeriesSeasonProvider{results: []SeriesSeason{{
+		Number: 1, Name: "TVDB Season 1", EpisodeCount: 3, AirDate: "2000-01-01", PosterURL: posterURL,
+	}}}
+	svc := longAnimeService(newFakeStore(), provider)
+
+	detail, err := svc.GetDetail(context.Background(), testViewer(1), MediaTypeSeries, 700001)
+	if err != nil {
+		t.Fatalf("GetDetail: %v", err)
+	}
+	if len(detail.Seasons) != 1 {
+		t.Fatalf("seasons = %+v, want the one TVDB season", detail.Seasons)
+	}
+	if season := detail.Seasons[0]; season.PosterURL != posterURL || season.PosterPath != "" {
+		t.Fatalf("season = %+v, want poster_url %q and no poster_path", season, posterURL)
+	}
+}
+
 func TestGetDetailFallsBackToTMDBSeasons(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -543,6 +564,47 @@ func TestGetDetailFallsBackToTMDBSeasons(t *testing.T) {
 	}
 }
 
+func TestGetDetailExplicitTMDBSeasonSourceBypassesTVDB(t *testing.T) {
+	provider := &fakeSeriesSeasonProvider{results: longAnimeTVDBSeasons()}
+	svc := longAnimeService(newFakeStore(), provider)
+
+	detail, err := svc.GetDetailWithSeasonSource(context.Background(), testViewer(1), MediaTypeSeries, 700001, "tmdb")
+	if err != nil {
+		t.Fatalf("GetDetailWithSeasonSource: %v", err)
+	}
+	if provider.calls != 0 {
+		t.Fatalf("TVDB provider calls = %d, want 0 for an explicit TMDB request", provider.calls)
+	}
+	if detail.SeasonSource != "tmdb" || len(detail.Seasons) != 2 || detail.Seasons[0].Name != "Season 1" {
+		t.Fatalf("detail = %+v, want the two TMDB seasons", detail)
+	}
+	if detail.NumberOfSeasons != 2 || detail.NumberOfEpisodes != 416 {
+		t.Fatalf("totals = %d/%d, want TMDB's 2/416", detail.NumberOfSeasons, detail.NumberOfEpisodes)
+	}
+}
+
+func TestCreateSeriesRequestStoresExplicitTMDBSeasonSource(t *testing.T) {
+	provider := &fakeSeriesSeasonProvider{results: longAnimeTVDBSeasons()}
+	store := newFakeStore()
+	svc := longAnimeService(store, provider)
+
+	req, err := svc.CreateRequest(context.Background(), testViewer(1), CreateRequestInput{
+		MediaType: MediaTypeSeries, TMDBID: 700001, Title: "Long Anime", Seasons: []int{2}, SeasonSource: "tmdb",
+	})
+	if err != nil {
+		t.Fatalf("CreateRequest: %v", err)
+	}
+	if provider.calls != 0 {
+		t.Fatalf("TVDB provider calls = %d, want 0 for an explicit TMDB request", provider.calls)
+	}
+	if req.SeasonSource != "tmdb" || !slices.Equal(req.Seasons, []int{2}) {
+		t.Fatalf("created = %+v, want the TMDB season source and season 2", req)
+	}
+	if len(store.created) != 1 || store.created[0].Input.SeasonSource != "tmdb" {
+		t.Fatalf("stored input = %+v, want season_source tmdb", store.created)
+	}
+}
+
 func TestSeriesSeasonSourceResolvesAMissingTVDBID(t *testing.T) {
 	store := newFakeStore()
 	detail := longAnimeDetail()
@@ -555,7 +617,7 @@ func TestSeriesSeasonSourceResolvesAMissingTVDBID(t *testing.T) {
 	resolver := &fakeTVDBResolver{tvdbID: 900001}
 	svc.SetTVDBIDResolver(resolver)
 
-	seasons, resolvedTVDBID, fromTVDB, available := svc.seriesSeasonSource(context.Background(), detail, 0)
+	seasons, resolvedTVDBID, fromTVDB, available := svc.seriesSeasonSource(context.Background(), detail, 0, "")
 	if resolver.gotTMDBID != 700001 || resolver.gotIMDbID != "" {
 		t.Fatalf("resolver got tmdb=%d imdb=%q, want 700001 and no IMDb id", resolver.gotTMDBID, resolver.gotIMDbID)
 	}

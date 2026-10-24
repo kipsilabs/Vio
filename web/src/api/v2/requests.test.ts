@@ -67,4 +67,29 @@ describe("request v2 adapters keep download progress", () => {
 
     expect(mapped.request.download).toEqual(download);
   });
+
+  it("passes an explicit TVDB or TMDB season source to the detail read", async () => {
+    vi.mocked(v2).mockResolvedValue({
+      media_type: "series",
+      tmdb_id: 42,
+      title: "Example",
+      availability: "missing",
+      in_watchlist: false,
+      cast: [],
+      creators: [],
+      genres: [],
+      networks: [],
+      production_companies: [],
+      recommendations: [],
+      seasons: [],
+      request: { requestable: true, following: false, requested_by_viewer: false },
+    } as never);
+
+    await getRequestMediaDetailV2("series", 42, "tmdb");
+
+    expect(v2).toHaveBeenCalledWith("GET /api/v2/requests/detail/{media_type}/{tmdb_id}", {
+      path: { media_type: "series", tmdb_id: 42 },
+      query: { season_source: "tmdb" },
+    });
+  });
 });
