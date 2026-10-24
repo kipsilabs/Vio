@@ -16,12 +16,25 @@ import {
   createSubtitleWindowFetcher,
   subtitlePlayheadSeconds,
   subtitleWindowUrl,
+  SUBTITLE_WINDOW_SECONDS,
 } from "../utils/subtitleWindows";
 
 // A PGS composition stays on screen until the next one replaces it, and the
 // server's positioned extract starts at the window, so a fresh window reaches
-// back far enough to include a subtitle already showing at the playhead.
-const SEEK_BACKOFF = 10;
+// back far enough to include a subtitle already showing at the playhead. A
+// display set can precede a long silent stretch, so allow a wide margin.
+const SEEK_BACKOFF = 30;
+// The first slice after a seek or track change only has to cover first paint;
+// the server extracts 30 s of PGS far faster than a 120 s span. Extends after
+// that use the full two-minute window.
+const FIRST_WINDOW_SECONDS = BITMAP_SUBTITLE_WINDOW_SECONDS;
+const WINDOW_SECONDS = SUBTITLE_WINDOW_SECONDS;
+// Schedule the next slice with enough lead that a cold remote extraction has
+// time to land before playback reaches it.
+const PREFETCH_LEAD_SECONDS = 30;
+// A cold positioned extraction from remote storage can spend a while before
+// its first byte, and PGS bytes arrive in bursts; do not cut one off early.
+const STALL_TIMEOUT_MS = 60_000;
 // Decoding is the costly step, and a crafted stream could redefine a huge
 // object on every display set. Real streams stay well under this, even a
 // full-plane fade at 24 frames a second (about 50 million pixels).
@@ -61,6 +74,22 @@ export interface UsePGSSubtitlesOptions {
    */
   bottomInsetPx?: number;
   onLoadState?: (state: PGSLoadState) => void;
+  /**
+   * The server reported `subtitle_source_changed`: the plan's subtitle
+   * inventory is stale and the player must refresh it. The fetcher stops
+   * retrying; the caller replans, which rebuilds it.
+   */
+  onSourceChanged?: () => void;
+  /**
+   * Rebuild the parser and fetcher when the plan's subtitle source, cue set,
+   * transport, replay, or refresh generation changes. Any of these makes the
+   * timeline and the windows fetched against the old release wrong.
+   */
+  sourceGeneration?: number;
+  cueRevision?: number;
+  transportRevision?: number;
+  replayRevision?: number;
+  refreshRevision?: number;
 }
 
 /**
@@ -196,9 +225,21 @@ export function usePGSSubtitles({
   videoFit,
   bottomInsetPx = 0,
   onLoadState,
+  onSourceChanged,
+  sourceGeneration,
+  cueRevision,
+  transportRevision,
+  replayRevision,
+  refreshRevision,
 }: UsePGSSubtitlesOptions): { isActive: boolean } {
   const onLoadStateRef = useRef(onLoadState);
   onLoadStateRef.current = onLoadState;
+  // A new callback identity (a fresh inline closure on every render) must not
+  // rebuild the fetcher by itself; only the revisions do that.
+  const onSourceChangedRef = useRef(onSourceChanged);
+  useEffect(() => {
+    onSourceChangedRef.current = onSourceChanged;
+  }, [onSourceChanged]);
   const timingRef = useRef({ origin: streamOriginSeconds, delayMs: subtitleDelayMs });
   timingRef.current = { origin: streamOriginSeconds, delayMs: subtitleDelayMs };
   const videoFitRef = useRef(videoFit);
@@ -372,15 +413,23 @@ export function usePGSSubtitles({
     }
 
     const fetcher = createSubtitleWindowFetcher({
-      windowUrl: (start) =>
-        subtitleWindowUrl(url, start, "windowed=1", BITMAP_SUBTITLE_WINDOW_SECONDS),
+      windowUrl: (start, duration) => subtitleWindowUrl(url, start, "windowed=1", duration),
       playhead: () => Math.max(0, sourceTime()),
       duration: () => durationRef.current ?? 0,
       seekBackoffSeconds: SEEK_BACKOFF,
-      windowSeconds: BITMAP_SUBTITLE_WINDOW_SECONDS,
-      prefetchLeadSeconds: 10,
+      firstWindowSeconds: FIRST_WINDOW_SECONDS,
+      windowSeconds: WINDOW_SECONDS,
+      prefetchLeadSeconds: PREFETCH_LEAD_SECONDS,
+      stallTimeoutMs: STALL_TIMEOUT_MS,
       playbackRate: () => videoRef.current?.playbackRate ?? 1,
       logTag: "usePGSSubtitles",
+      onSourceChanged: () => {
+        // If the refresh cannot rebuild this fetcher, do not leave the
+        // overlay claiming a load is still in progress.
+        onLoadStateRef.current?.("error");
+        onSourceChangedRef.current?.();
+      },
+      onTerminal: () => onLoadStateRef.current?.("error"),
       onWindowStart: (fresh) => {
         if (fresh) {
           onLoadStateRef.current?.("loading");
@@ -403,7 +452,7 @@ export function usePGSSubtitles({
         onLoadStateRef.current?.("ready");
         // Keep about one window behind the playhead, so a straight run
         // through a long film holds a bounded number of screens.
-        const keepFrom = sourceTime() - BITMAP_SUBTITLE_WINDOW_SECONDS;
+        const keepFrom = sourceTime() - WINDOW_SECONDS;
         if (!fresh && keepFrom > fetcher.coverage().coverageStart) {
           timeline = prunePGSTimeline(timeline, keepFrom);
           fetcher.releaseBefore(keepFrom);
@@ -428,7 +477,18 @@ export function usePGSSubtitles({
       videoEl.removeEventListener("seeked", maybeFetch);
       canvasEl.getContext("2d")?.clearRect(0, 0, canvasEl.width, canvasEl.height);
     };
-  }, [activeUrl, canvasRef, durationRef, fetchAnchorRef, videoRef]);
+  }, [
+    activeUrl,
+    canvasRef,
+    durationRef,
+    fetchAnchorRef,
+    videoRef,
+    sourceGeneration,
+    cueRevision,
+    transportRevision,
+    replayRevision,
+    refreshRevision,
+  ]);
 
   return { isActive: activeUrl !== null };
 }
