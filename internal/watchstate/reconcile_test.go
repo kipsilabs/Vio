@@ -33,11 +33,38 @@ type fakeHistoryDB struct {
 	execs      []fakeHistoryExec
 	execTag    pgconn.CommandTag
 	execTagSet bool
+	tx         *fakeHistoryTx
 }
 
 type fakeHistoryExec struct {
 	sql  string
 	args []any
+}
+
+type fakeHistoryTx struct {
+	execs      []fakeHistoryExec
+	committed  bool
+	rolledBack bool
+}
+
+func (tx *fakeHistoryTx) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	tx.execs = append(tx.execs, fakeHistoryExec{sql: sql, args: args})
+	return pgconn.NewCommandTag("UPDATE 1"), nil
+}
+
+func (tx *fakeHistoryTx) Commit(context.Context) error {
+	tx.committed = true
+	return nil
+}
+
+func (tx *fakeHistoryTx) Rollback(context.Context) error {
+	tx.rolledBack = true
+	return nil
+}
+
+func (db *fakeHistoryDB) Begin(context.Context) (historyTx, error) {
+	db.tx = &fakeHistoryTx{}
+	return db.tx, nil
 }
 
 func (db *fakeHistoryDB) Query(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
@@ -282,7 +309,8 @@ func TestHistoryReconcilerRunRebindsMissingEpisodeWithUserScopedUpdate(t *testin
 		},
 	}}
 	r := &HistoryReconciler{
-		pool: db,
+		pool:  db,
+		begin: db.Begin,
 		resolver: newTestReconciler(
 			nil,
 			map[string]*models.Episode{
@@ -301,23 +329,29 @@ func TestHistoryReconcilerRunRebindsMissingEpisodeWithUserScopedUpdate(t *testin
 	if stats.OrphansFound != 1 || stats.Resolved != 1 || stats.Unresolvable != 0 || stats.Errors != 0 {
 		t.Fatalf("stats = %+v, want one resolved orphan", stats)
 	}
-	if len(db.execs) != 1 {
-		t.Fatalf("exec count = %d, want 1", len(db.execs))
+	if len(db.execs) != 0 {
+		t.Fatalf("pool exec count = %d, want the episode update in its transaction", len(db.execs))
 	}
-	exec := db.execs[0]
-	if !strings.Contains(exec.sql, "user_id = $2") ||
+	if db.tx == nil || len(db.tx.execs) != 2 {
+		t.Fatalf("transaction execs = %+v, want lock and update", db.tx)
+	}
+	lock := db.tx.execs[0]
+	if !strings.Contains(lock.sql, "pg_advisory_xact_lock_shared") || !reflect.DeepEqual(lock.args, []any{"episode-new"}) {
+		t.Fatalf("lock statement = %+v", lock)
+	}
+	exec := db.tx.execs[1]
+	if !strings.Contains(exec.sql, "canonical_episode_id($1)") ||
+		!strings.Contains(exec.sql, "user_id = $2") ||
 		!strings.Contains(exec.sql, "id = $3") ||
 		!strings.Contains(exec.sql, "media_item_id = $4") {
-		t.Fatalf("update query is not scoped by user, history id, and old media item:\n%s", exec.sql)
-	}
-	if !strings.Contains(exec.sql, "pg_advisory_xact_lock_shared") ||
-		!strings.Contains(exec.sql, "canonical_episode_id($1)") ||
-		!strings.Contains(exec.sql, "FROM locked") {
-		t.Fatalf("episode update does not lock before canonicalizing:\n%s", exec.sql)
+		t.Fatalf("update query is not canonicalized and scoped:\n%s", exec.sql)
 	}
 	wantArgs := []any{"episode-new", 42, "history-1", "episode-old"}
 	if !reflect.DeepEqual(exec.args, wantArgs) {
 		t.Fatalf("exec args = %#v, want %#v", exec.args, wantArgs)
+	}
+	if !db.tx.committed {
+		t.Fatal("episode history transaction was not committed")
 	}
 }
 
@@ -331,7 +365,8 @@ func TestHistoryReconcilerRunLeavesUnresolvedIdentityUnchanged(t *testing.T) {
 		},
 	}}
 	r := &HistoryReconciler{
-		pool: db,
+		pool:  db,
+		begin: db.Begin,
 		resolver: newTestReconciler(
 			nil,
 			map[string]*models.Episode{
