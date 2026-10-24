@@ -329,28 +329,33 @@ func (s *MetadataService) resolveLibraryProviderChain(
 	contentLevel string,
 	preferredProvider string,
 ) ([]Provider, error) {
+	preferred := strings.TrimSpace(preferredProvider)
 	chain, err := s.resolveChainCached(ctx, folderID, contentLevel)
-	if err != nil || strings.TrimSpace(preferredProvider) == "" {
+	if err != nil {
+		if preferred != "" {
+			return nil, err
+		}
 		return chain, err
 	}
-	if filtered := filterProviderChain(chain, preferredProvider); len(filtered) > 0 {
+	if preferred == "" {
+		return chain, nil
+	}
+	if filtered := filterProviderChain(chain, preferred); len(filtered) > 0 {
 		return filtered, nil
 	}
 	if s.chainRepo == nil {
-		return chain, nil
+		return nil, fmt.Errorf("preferred metadata provider %q is not enabled: %w", preferred, ErrMetadataNotFound)
 	}
 	all, err := resolveEnabledProvidersByPriority(
 		ctx, contentLevel, s.pluginResolver, s.chainRepo.pool, s.enabledChecker, nil,
 	)
 	if err != nil {
-		// The library's configured chain remains usable when the enabled-provider
-		// lookup fails; falling back is safer than failing the whole lookup.
-		return chain, nil //nolint:nilerr // keep the configured chain when the enabled-provider lookup fails
+		return nil, fmt.Errorf("resolve preferred metadata provider %q: %w", preferred, err)
 	}
-	if filtered := filterProviderChain(all, preferredProvider); len(filtered) > 0 {
+	if filtered := filterProviderChain(all, preferred); len(filtered) > 0 {
 		return filtered, nil
 	}
-	return chain, nil
+	return nil, fmt.Errorf("preferred metadata provider %q is not enabled: %w", preferred, ErrMetadataNotFound)
 }
 
 func filterProviderChain(chain []Provider, preferredProvider string) []Provider {

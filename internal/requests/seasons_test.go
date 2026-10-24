@@ -647,24 +647,30 @@ func TestCreateSeriesRequestFreezesFallbackSource(t *testing.T) {
 	}
 }
 
-func TestSeasonCountsCompatibleUsesTheMatchingProvider(t *testing.T) {
+func TestSeasonCountsCompatibleUsesCatalogNumberingProvenance(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		fromTVDB   bool
-		provider   string
+		contentID  string
 		compatible bool
 	}{
-		{name: "tvdb list against tvdb catalog", fromTVDB: true, provider: SeasonSourceTVDB, compatible: true},
-		{name: "tmdb list against tvdb catalog", fromTVDB: false, provider: SeasonSourceTVDB, compatible: false},
-		{name: "tvdb list against tmdb catalog", fromTVDB: true, provider: SeasonSourceTMDB, compatible: false},
-		{name: "tmdb list against tmdb catalog", fromTVDB: false, provider: SeasonSourceTMDB, compatible: true},
-		{name: "unknown catalog source keeps the historical join", fromTVDB: true, compatible: true},
+		{name: "tvdb list against tvdb catalog", fromTVDB: true, contentID: "series-tvdb-42", compatible: true},
+		{name: "tmdb list against tvdb catalog", fromTVDB: false, contentID: "series-tvdb-42", compatible: false},
+		{name: "tvdb list against tmdb catalog", fromTVDB: true, contentID: "series-tmdb-42", compatible: false},
+		{name: "tmdb list against tmdb catalog", fromTVDB: false, contentID: "series-tmdb-42", compatible: true},
+		{name: "unknown catalog provenance fails closed", fromTVDB: true, contentID: "series-42", compatible: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := seasonCountsCompatible(tc.fromTVDB, PresenceMatch{MatchedProvider: tc.provider}); got != tc.compatible {
+			if got := seasonCountsCompatible(tc.fromTVDB, PresenceMatch{ContentID: tc.contentID}); got != tc.compatible {
 				t.Fatalf("seasonCountsCompatible = %v, want %v", got, tc.compatible)
 			}
 		})
+	}
+	if !requestSeasonCountsCompatible("", PresenceMatch{ContentID: "series-42"}) {
+		t.Fatal("legacy requests without a frozen source must keep the historical join")
+	}
+	if requestSeasonCountsCompatible("tvdb", PresenceMatch{ContentID: "series-42"}) {
+		t.Fatal("explicit TVDB requests must fail closed when provenance is unknown")
 	}
 }
 

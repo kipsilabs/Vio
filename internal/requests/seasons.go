@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/metadata/tmdb"
@@ -123,6 +124,9 @@ func seasonsDelivered(progress []SeasonProgress, serverDone bool) bool {
 func (s *Service) requestFulfilled(ctx context.Context, req Request, match PresenceMatch) (bool, []SeasonProgress, error) {
 	if req.MediaType != MediaTypeSeries || len(req.Seasons) == 0 {
 		return match.Available, nil, nil
+	}
+	if !requestSeasonCountsCompatible(req.SeasonSource, match) {
+		return false, nil, nil
 	}
 	counts, err := s.seasonCounts(ctx, match)
 	if err != nil || counts == nil {
@@ -255,16 +259,40 @@ func fallbackToTMDB(detail *tmdb.MediaDetail, resolvedTVDBID int) ([]SeriesSeaso
 // seasonCountsCompatible reports whether catalog season counts use the same
 // provider numbering as the request list. An integer season join across TVDB
 // and TMDB is unsafe because the providers split and combine seasons
-// differently; an unknown or absent provider match keeps the historical join.
+// differently, so unknown numbering provenance fails closed.
 func seasonCountsCompatible(fromTVDB bool, match PresenceMatch) bool {
-	switch match.MatchedProvider {
-	case SeasonSourceTVDB:
-		return fromTVDB
-	case SeasonSourceTMDB:
-		return !fromTVDB
+	catalogSource := catalogSeriesSeasonSource(match)
+	if catalogSource == "" {
+		return false
+	}
+	return (fromTVDB && catalogSource == SeasonSourceTVDB) ||
+		(!fromTVDB && catalogSource == SeasonSourceTMDB)
+}
+
+// catalogSeriesSeasonSource reads numbering provenance from the catalog
+// content ID. PresenceMatch.MatchedProvider records the external ID that found
+// the item, which is not necessarily the provider whose seasons were indexed.
+func catalogSeriesSeasonSource(match PresenceMatch) string {
+	id := strings.ToLower(strings.TrimSpace(match.ContentID))
+	switch {
+	case strings.HasPrefix(id, "series-tvdb-"):
+		return SeasonSourceTVDB
+	case strings.HasPrefix(id, "series-tmdb-"):
+		return SeasonSourceTMDB
 	default:
+		return ""
+	}
+}
+
+// requestSeasonCountsCompatible gates a persisted request's season counts on
+// the numbering source it was created with. Legacy requests without a frozen
+// source keep the historical behavior.
+func requestSeasonCountsCompatible(source string, match PresenceMatch) bool {
+	source = requestSeasonSource(source)
+	if source == "" {
 		return true
 	}
+	return seasonCountsCompatible(source == SeasonSourceTVDB, match)
 }
 
 // airedSeasons returns the numbers of a series' regular seasons that have
