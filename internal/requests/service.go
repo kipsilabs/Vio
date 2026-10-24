@@ -84,6 +84,16 @@ type TVDBIDResolver interface {
 	ResolveSeriesTVDBID(ctx context.Context, tmdbID int, imdbID string) (int, error)
 }
 
+// SeriesSeasonProvider reads a series' season list from TVDB. The request paths
+// prefer it over TMDB, whose grouping collapses long anime into few seasons.
+//
+// The result type is local because requests cannot import internal/metadata:
+// metadata imports internal/notifications, which imports requests. The API
+// layer adapts the metadata service to this interface.
+type SeriesSeasonProvider interface {
+	FetchSeriesTVDBSeasons(ctx context.Context, tvdbID int, language string) ([]SeriesSeason, error)
+}
+
 type Service struct {
 	store                   Store
 	tmdb                    TMDBClient
@@ -95,6 +105,7 @@ type Service struct {
 	users                   access.UserRepository
 	requesterIdentity       RequesterIdentityResolver
 	tvdbResolver            TVDBIDResolver
+	seriesSeasonProvider    SeriesSeasonProvider
 	notifier                FulfillmentNotifier
 	lifecycle               LifecycleNotifier
 	watchlistPref           WatchlistPreference
@@ -162,6 +173,10 @@ func (s *Service) SetRequesterIdentityResolver(r RequesterIdentityResolver) {
 // SetTVDBIDResolver wires the metadata-provider fallback used when TMDB has no
 // TVDB ID for a requested series.
 func (s *Service) SetTVDBIDResolver(r TVDBIDResolver) { s.tvdbResolver = r }
+
+// SetSeriesSeasonProvider wires the TVDB season source used in preference to
+// TMDB's season list for series requests.
+func (s *Service) SetSeriesSeasonProvider(p SeriesSeasonProvider) { s.seriesSeasonProvider = p }
 
 // populateRequesterIdentity fills req.RequesterEmail/Username from the resolver.
 // Nil resolver or any error leaves them empty (the plugin then behaves as admin).
@@ -864,13 +879,19 @@ func (s *Service) GetDetail(ctx context.Context, viewer Viewer, mediaType MediaT
 	// A series counts as available only when every aired season is complete;
 	// until then its missing seasons can be requested.
 	available := primaryMatch.Available
-	var seasons []RequestSeason
+	var (
+		seasons        []RequestSeason
+		seasonSource   []SeriesSeason
+		resolvedTVDBID int
+		fromTVDB       bool
+	)
 	if mediaType == MediaTypeSeries {
+		seasonSource, resolvedTVDBID, fromTVDB, _ = s.seriesSeasonSource(ctx, raw, raw.TVDBID)
 		counts, err := s.seasonCounts(ctx, primaryMatch)
 		if err != nil {
 			return nil, err
 		}
-		seasons = requestSeasons(raw, counts, primaryRequests[raw.ID])
+		seasons = requestSeasons(seasonSource, counts, primaryRequests[raw.ID])
 		if active := primaryRequests[raw.ID]; active != nil && len(active.Seasons) > 0 && counts != nil {
 			// Attach the season progress the request lists attach, so the
 			// state can read partially available or available.
@@ -879,7 +900,7 @@ func (s *Service) GetDetail(ctx context.Context, viewer Viewer, mediaType MediaT
 			withProgress.SeasonProgress = seasonProgress(active.Seasons, counts)
 			primaryRequests[raw.ID] = &withProgress
 		}
-		if available && seriesHasOpenSeason(raw, counts) {
+		if available && seriesHasOpenSeason(seasonSource, counts) {
 			more, err := s.moreSeasonsRequestable(ctx)
 			if err != nil {
 				return nil, err
@@ -925,7 +946,13 @@ func (s *Service) GetDetail(ctx context.Context, viewer Viewer, mediaType MediaT
 		Request:             primaryState,
 		Seasons:             seasons,
 	}
-	if raw.TVDBID > 0 {
+	if fromTVDB {
+		detail.NumberOfSeasons, detail.NumberOfEpisodes = seriesSeasonTotals(seasonSource)
+	}
+	if resolvedTVDBID > 0 {
+		tvdb := resolvedTVDBID
+		detail.TVDBID = &tvdb
+	} else if raw.TVDBID > 0 {
 		tvdb := raw.TVDBID
 		detail.TVDBID = &tvdb
 	}
@@ -1030,8 +1057,17 @@ func (s *Service) CreateRequest(ctx context.Context, viewer Viewer, input Create
 		facts = s.routingFacts(ctx, detail)
 		if !normalized.WholeSeries {
 			// A series partly in the library can still be requested for the
-			// seasons it is missing.
-			seasons, err := s.resolveRequestedSeasons(ctx, normalized.Seasons, detail, match)
+			// seasons it is missing. Prefer TVDB's season list, which keeps a
+			// long anime's seasons apart where TMDB groups them.
+			tvdbID := 0
+			if detail != nil {
+				tvdbID = detail.TVDBID
+			}
+			if tvdbID == 0 && normalized.TVDBID != nil {
+				tvdbID = *normalized.TVDBID
+			}
+			seasonSource, _, _, sourceAvailable := s.seriesSeasonSource(ctx, detail, tvdbID)
+			seasons, err := s.resolveRequestedSeasons(ctx, normalized.Seasons, seasonSource, sourceAvailable, match)
 			if err != nil {
 				return nil, err
 			}

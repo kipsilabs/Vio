@@ -109,16 +109,16 @@ type RequestMediaDetail struct {
 	LibraryContentID    string                   `json:"library_content_id,omitempty" doc:"The catalog item when the media is available"`
 	Request             RequestMediaState        `json:"request"`
 	InWatchlist         bool                     `json:"in_watchlist" doc:"Whether the title is on the viewing profile's watchlist, as a watchlist title or through its catalog item" example:"false"`
-	Seasons             []RequestMediaSeason     `json:"seasons" doc:"Series: the regular seasons (specials excluded) with library availability and request coverage; empty for movies"`
+	Seasons             []RequestMediaSeason     `json:"seasons" doc:"Series: the regular seasons (specials excluded) from the series metadata provider, with library availability and request coverage; empty for movies"`
 }
 
 // RequestMediaSeason is one season of a series on its detail document.
 type RequestMediaSeason struct {
 	SeasonNumber int    `json:"season_number" example:"2"`
 	Name         string `json:"name,omitempty" example:"Season 2"`
-	EpisodeCount int    `json:"episode_count" doc:"Episodes TMDB lists for the season, aired or not" example:"10"`
+	EpisodeCount int    `json:"episode_count" doc:"Episodes the series metadata provider lists for the season, aired or not" example:"10"`
 	AirDate      string `json:"air_date,omitempty" doc:"Calendar date, YYYY-MM-DD" example:"2025-01-17"`
-	PosterPath   string `json:"poster_path,omitempty" doc:"TMDB image path"`
+	PosterPath   string `json:"poster_path,omitempty" doc:"TMDB image path, when available"`
 	Availability string `json:"availability" enum:"missing,partial,available" doc:"Whether every aired episode is in the library" example:"partial"`
 	Requested    bool   `json:"requested" doc:"The title's active request covers this season"`
 }
