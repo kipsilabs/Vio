@@ -2511,6 +2511,11 @@ func (m *mediaMonitor) resolveLibraryMetadata(
 		if ctx.Err() != nil {
 			return item, "Library metadata lookup timed out; monitoring will retry", err
 		}
+		if strings.TrimSpace(item.MetadataSource) != "" {
+			// A frozen request source must not be replaced by a different
+			// provider's numbering. Leave the item queued for a retry.
+			return item, "Selected metadata source unavailable; monitoring will retry", err
+		}
 		// Enrichment is optional. Keep whatever usable metadata the
 		// resolver already had and fall back to public providers.
 		m.logger.WarnContext(ctx, "library metadata unavailable; falling back to public providers", "key", item.Key, "error", err)
@@ -2524,6 +2529,9 @@ func (m *mediaMonitor) resolveLibraryMetadata(
 	// Fall back to Cinemeta/TVMaze if library resolution failed or left an item
 	// without a title or a series without episodes.
 	if err != nil || (item.MediaType == "series" && len(item.Episodes) == 0) || item.Title == "" {
+		if strings.TrimSpace(item.MetadataSource) != "" {
+			return item, "Selected metadata source incomplete; monitoring will retry", errors.New("preferred metadata source returned no usable series data")
+		}
 		fallback, fallbackErr := m.fallbackPublicMetadata(ctx, item)
 		if fallbackErr == nil {
 			item = fallback

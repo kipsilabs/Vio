@@ -1424,7 +1424,8 @@ func (s *Service) attachLibraryContent(ctx context.Context, reqs ...*Request) er
 			}
 			for _, req := range requestsByKey[requestKey{mediaType: mediaType, tmdbID: tmdbID}] {
 				req.LibraryContentID = match.ContentID
-				if req.MediaType == MediaTypeSeries && len(req.Seasons) > 0 {
+				if req.MediaType == MediaTypeSeries && len(req.Seasons) > 0 &&
+					requestSeasonCountsCompatible(req.SeasonSource, match) {
 					seasonRequests[match.ContentID] = append(seasonRequests[match.ContentID], req)
 				}
 			}
@@ -3247,7 +3248,8 @@ func (s *Service) presentRequests(ctx context.Context, reqs []*Request) (map[str
 				continue
 			}
 			out[req.ID] = false
-			if match.Available && match.ContentID != "" {
+			if match.Available && match.ContentID != "" &&
+				requestSeasonCountsCompatible(req.SeasonSource, match) {
 				seasonRequests[match.ContentID] = append(seasonRequests[match.ContentID], req)
 			}
 		}

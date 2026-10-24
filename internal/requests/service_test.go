@@ -773,8 +773,8 @@ func TestSearchMarksSeriesAvailableByHydratedTVDBID(t *testing.T) {
 	if got := page.Results[0].Availability; got != AvailabilityAvailable {
 		t.Fatalf("availability = %q, want available", got)
 	}
-	if got := page.Results[0].LibraryContentID; got != "series-201992" {
-		t.Fatalf("library content id = %q, want series-201992", got)
+	if got := page.Results[0].LibraryContentID; got != "series-tvdb-420105" {
+		t.Fatalf("library content id = %q, want series-tvdb-420105", got)
 	}
 	if page.Results[0].Request.Reason != "already_available" {
 		t.Fatalf("request reason = %q, want already_available", page.Results[0].Request.Reason)
@@ -3152,7 +3152,7 @@ func (f *fakePresence) Lookup(_ context.Context, mediaType MediaType, candidates
 			if tmdbID, ok := f.byTVDB[mediaType][*candidate.TVDBID]; ok && tmdbID == candidate.TMDBID {
 				out[candidate.TMDBID] = PresenceMatch{
 					Available:       true,
-					ContentID:       fakePresenceContentID(mediaType, candidate.TMDBID),
+					ContentID:       fakePresenceTVDBContentID(mediaType, *candidate.TVDBID),
 					MatchedProvider: "tvdb",
 				}
 			}
@@ -3162,7 +3162,14 @@ func (f *fakePresence) Lookup(_ context.Context, mediaType MediaType, candidates
 }
 
 func fakePresenceContentID(mediaType MediaType, tmdbID int) string {
+	if mediaType == MediaTypeSeries {
+		return fmt.Sprintf("%s-tmdb-%d", mediaType, tmdbID)
+	}
 	return fmt.Sprintf("%s-%d", mediaType, tmdbID)
+}
+
+func fakePresenceTVDBContentID(mediaType MediaType, tvdbID int) string {
+	return fmt.Sprintf("%s-tvdb-%d", mediaType, tvdbID)
 }
 
 func (f *fakePresence) LookupTMDB(_ context.Context, mediaType MediaType, ids []int) (map[int]bool, error) {
