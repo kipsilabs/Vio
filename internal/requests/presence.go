@@ -121,7 +121,7 @@ func (p *CatalogPresence) Lookup(ctx context.Context, mediaType MediaType, candi
 			ContentID:       row.MediaID,
 			MatchedProvider: row.MatchedProvider,
 		}
-		if row.MatchedProvider != "tmdb" && p.tmdbBackfill != nil {
+		if row.MatchedProvider != SeasonSourceTMDB && p.tmdbBackfill != nil {
 			if err := p.tmdbBackfill.AttachTMDBID(ctx, row.MediaID, string(mediaType), id); err != nil {
 				slog.WarnContext(ctx, "requests: failed to backfill tmdb id from presence lookup", "component", "requests",
 					"content_id", row.MediaID,

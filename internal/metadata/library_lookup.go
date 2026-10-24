@@ -343,7 +343,9 @@ func (s *MetadataService) resolveLibraryProviderChain(
 		ctx, contentLevel, s.pluginResolver, s.chainRepo.pool, s.enabledChecker, nil,
 	)
 	if err != nil {
-		return chain, nil
+		// The library's configured chain remains usable when the enabled-provider
+		// lookup fails; falling back is safer than failing the whole lookup.
+		return chain, nil //nolint:nilerr
 	}
 	if filtered := filterProviderChain(all, preferredProvider); len(filtered) > 0 {
 		return filtered, nil

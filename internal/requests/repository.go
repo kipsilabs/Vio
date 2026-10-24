@@ -1503,10 +1503,10 @@ func requestSource(source Source) Source {
 
 func requestSeasonSource(value string) string {
 	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "tvdb":
-		return "tvdb"
-	case "tmdb":
-		return "tmdb"
+	case SeasonSourceTVDB:
+		return SeasonSourceTVDB
+	case SeasonSourceTMDB:
+		return SeasonSourceTMDB
 	default:
 		return ""
 	}

@@ -132,6 +132,12 @@ func (s *Service) requestFulfilled(ctx context.Context, req Request, match Prese
 	return seasonsDelivered(progress, req.Status == StatusCompleted), progress, nil
 }
 
+// Season source identifiers stored on a request and reported on detail.
+const (
+	SeasonSourceTVDB = "tvdb"
+	SeasonSourceTMDB = "tmdb"
+)
+
 // SeriesSeason is one season of a series as the request detail and create
 // paths see it, independent of which metadata source answered. PosterPath is a
 // provider-relative path (TMDB); PosterURL is absolute artwork a provider such
@@ -167,18 +173,6 @@ func regularSeasons(seasons []SeriesSeason) []SeriesSeason {
 	return slices.DeleteFunc(slices.Clone(seasons), func(season SeriesSeason) bool { return season.Number <= 0 })
 }
 
-// seriesSeasonTotals counts regular seasons and their episodes.
-func seriesSeasonTotals(seasons []SeriesSeason) (seasonsCount, episodesCount int) {
-	for _, season := range seasons {
-		if season.Number <= 0 {
-			continue
-		}
-		seasonsCount++
-		episodesCount += season.EpisodeCount
-	}
-	return seasonsCount, episodesCount
-}
-
 // seriesSeasonSource picks the season list a series request is checked and
 // displayed against: the installed TVDB provider's when it answers, TMDB's
 // otherwise. available reports whether any season list is available; a nil
@@ -196,7 +190,7 @@ func (s *Service) seriesSeasonSource(ctx context.Context, detail *tmdb.MediaDeta
 	// An explicit TMDB request bypasses TVDB entirely. This is the inverse of
 	// the default path: the detail API and request validation must agree with
 	// the source the requester chose.
-	if requestSeasonSource(seasonSource) == "tmdb" {
+	if requestSeasonSource(seasonSource) == SeasonSourceTMDB {
 		if detail != nil {
 			return seasonsFromTMDB(detail), resolvedTVDBID, false, true
 		}
