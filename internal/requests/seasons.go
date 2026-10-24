@@ -3,6 +3,7 @@ package requests
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"slices"
 	"time"
 
@@ -130,11 +131,93 @@ func (s *Service) requestFulfilled(ctx context.Context, req Request, match Prese
 	return seasonsDelivered(progress, req.Status == StatusCompleted), progress, nil
 }
 
-// airedSeasons returns the numbers of a series' regular seasons that have
-// started airing, by TMDB's dates.
-func airedSeasons(detail *tmdb.MediaDetail, today time.Time) []int {
-	var out []int
+// SeriesSeason is one season of a series as the request detail and create
+// paths see it, independent of which metadata source answered.
+type SeriesSeason struct {
+	Number       int
+	Name         string
+	EpisodeCount int
+	AirDate      string
+	PosterPath   string
+}
+
+// seasonsFromTMDB converts TMDB's season list. TMDB groups long anime into a
+// few wide seasons, which is why TVDB is preferred when a provider answers.
+func seasonsFromTMDB(detail *tmdb.MediaDetail) []SeriesSeason {
+	if detail == nil {
+		return nil
+	}
+	out := make([]SeriesSeason, 0, len(detail.Seasons))
 	for _, season := range detail.Seasons {
+		out = append(out, SeriesSeason{
+			Number: season.Number, Name: season.Name, EpisodeCount: season.EpisodeCount, AirDate: season.AirDate,
+			PosterPath: season.PosterPath,
+		})
+	}
+	return out
+}
+
+// regularSeasons drops specials. A source that lists only specials is not a
+// usable series season list.
+func regularSeasons(seasons []SeriesSeason) []SeriesSeason {
+	return slices.DeleteFunc(slices.Clone(seasons), func(season SeriesSeason) bool { return season.Number <= 0 })
+}
+
+// seriesSeasonTotals counts regular seasons and their episodes.
+func seriesSeasonTotals(seasons []SeriesSeason) (seasonsCount, episodesCount int) {
+	for _, season := range seasons {
+		if season.Number <= 0 {
+			continue
+		}
+		seasonsCount++
+		episodesCount += season.EpisodeCount
+	}
+	return seasonsCount, episodesCount
+}
+
+// seriesSeasonSource picks the season list a series request is checked and
+// displayed against: the installed TVDB provider's when it answers, TMDB's
+// otherwise. available reports whether any season list is available; a nil
+// detail with no provider leaves the caller on the old whole-series rule.
+//
+// The provider is asked for English because the request TMDB client also
+// returns English metadata (it sends no language).
+func (s *Service) seriesSeasonSource(ctx context.Context, detail *tmdb.MediaDetail, tvdbID int) (seasons []SeriesSeason, resolvedTVDBID int, fromTVDB bool, available bool) {
+	switch {
+	case detail != nil && detail.TVDBID > 0:
+		resolvedTVDBID = detail.TVDBID
+	case tvdbID > 0:
+		resolvedTVDBID = tvdbID
+	}
+	if resolvedTVDBID == 0 && detail != nil && s.tvdbResolver != nil {
+		id, err := s.tvdbResolver.ResolveSeriesTVDBID(ctx, detail.ID, detail.IMDbID)
+		if err != nil {
+			slog.DebugContext(ctx, "requests: resolve series tvdb id for seasons failed", "component", "requests",
+				"tmdb_id", detail.ID, "err", err)
+		} else if id > 0 {
+			resolvedTVDBID = id
+		}
+	}
+	if resolvedTVDBID > 0 && s.seriesSeasonProvider != nil {
+		results, err := s.seriesSeasonProvider.FetchSeriesTVDBSeasons(ctx, resolvedTVDBID, "en")
+		if err != nil {
+			slog.DebugContext(ctx, "requests: fetch tvdb seasons failed; using tmdb", "component", "requests",
+				"tvdb_id", resolvedTVDBID, "err", err)
+		} else if regular := regularSeasons(results); len(regular) > 0 {
+			return regular, resolvedTVDBID, true, true
+		}
+	}
+	if detail != nil {
+		return seasonsFromTMDB(detail), resolvedTVDBID, false, true
+	}
+	return nil, resolvedTVDBID, false, false
+}
+
+// airedSeasons returns the numbers of a series' regular seasons that have
+// started airing, by the season metadata's dates.
+func airedSeasons(seasons []SeriesSeason, today time.Time) []int {
+	var out []int
+	for _, season := range seasons {
 		if season.Number <= 0 || season.AirDate == "" || season.EpisodeCount == 0 {
 			continue
 		}
@@ -149,19 +232,22 @@ func airedSeasons(detail *tmdb.MediaDetail, today time.Time) []int {
 // resolveRequestedSeasons decides which seasons a new series request asks
 // for: the ones named, or every aired season, minus the seasons already
 // complete in the library. It answers ErrAlreadyAvailable when nothing is left
-// and ErrInvalidInput for a season TMDB does not know. With no TMDB detail it
-// returns the named seasons as they are (none means the whole series).
-func (s *Service) resolveRequestedSeasons(ctx context.Context, named []int, detail *tmdb.MediaDetail, match PresenceMatch) ([]int, error) {
+// and ErrInvalidInput for a season the series metadata does not know. With no
+// season list it returns the named seasons as they are (none means the whole
+// series).
+func (s *Service) resolveRequestedSeasons(ctx context.Context, named []int, seasons []SeriesSeason, available bool, match PresenceMatch) ([]int, error) {
 	named = normalizeSeasons(named)
-	if detail == nil {
+	if !available {
 		if match.Available && len(named) == 0 {
 			return nil, ErrAlreadyAvailable
 		}
 		return named, nil
 	}
 	known := map[int]bool{}
-	for _, season := range detail.Seasons {
-		known[season.Number] = true
+	for _, season := range seasons {
+		if season.Number > 0 {
+			known[season.Number] = true
+		}
 	}
 	for _, season := range named {
 		if !known[season] {
@@ -170,7 +256,7 @@ func (s *Service) resolveRequestedSeasons(ctx context.Context, named []int, deta
 	}
 	candidates := named
 	if len(candidates) == 0 {
-		candidates = airedSeasons(detail, s.now())
+		candidates = airedSeasons(seasons, s.now())
 	}
 	counts, err := s.seasonCounts(ctx, match)
 	if err != nil {
@@ -181,7 +267,8 @@ func (s *Service) resolveRequestedSeasons(ctx context.Context, named []int, deta
 	})
 	if len(wanted) == 0 {
 		if len(candidates) == 0 && !match.Available {
-			// TMDB lists no aired season yet: request the whole series.
+			// The series metadata lists no aired season yet: request the whole
+			// series.
 			return nil, nil
 		}
 		return nil, ErrAlreadyAvailable
@@ -195,12 +282,12 @@ func normalizeSeasons(seasons []int) []int {
 	return slices.Compact(out)
 }
 
-// requestSeasons builds the detail page's season list: TMDB's regular
-// seasons with their library availability and whether the active request
-// covers them.
-func requestSeasons(detail *tmdb.MediaDetail, counts map[int]SeasonCounts, active *Request) []RequestSeason {
+// requestSeasons builds the detail page's season list: the series metadata's
+// regular seasons with their library availability and whether the active
+// request covers them.
+func requestSeasons(seasons []SeriesSeason, counts map[int]SeasonCounts, active *Request) []RequestSeason {
 	var out []RequestSeason
-	for _, season := range detail.Seasons {
+	for _, season := range seasons {
 		if season.Number <= 0 {
 			continue
 		}
@@ -222,8 +309,8 @@ func requestSeasons(detail *tmdb.MediaDetail, counts map[int]SeasonCounts, activ
 // seriesHasOpenSeason reports whether a series in the library has a regular
 // season it lacks: aired and incomplete, or not aired yet. The series detail
 // then stays requestable, for the missing seasons or the upcoming ones.
-func seriesHasOpenSeason(detail *tmdb.MediaDetail, counts map[int]SeasonCounts) bool {
-	for _, season := range detail.Seasons {
+func seriesHasOpenSeason(seasons []SeriesSeason, counts map[int]SeasonCounts) bool {
+	for _, season := range seasons {
 		if season.Number > 0 && !counts[season.Number].Complete() {
 			return true
 		}

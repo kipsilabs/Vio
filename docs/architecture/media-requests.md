@@ -260,8 +260,11 @@ nothing is left to send, the remaining targets decide the status.
 
 A series request names the seasons it wants (`seasons`). Season numbers start
 at 1: a request naming season 0 (specials) or a negative number is refused with
-`validation_failed`, never read as naming none. When the requester names none, the server asks for every aired regular season (TMDB's seasons that
-have started airing, specials excluded) that is not complete in the library.
+`validation_failed`, never read as naming none. When the requester names none,
+the server asks for every aired regular season (the series metadata provider's
+seasons that have started airing, specials excluded) that is not complete in
+the library, preferring TVDB when available and falling back to TMDB. Request
+validation and defaults use the same season source the detail page shows.
 Requests from before season requests, and every v1 request, have no seasons:
 they mean the whole series and keep the old rule that any episode in the
 library fulfills them. A series with no aired season yet, and not in the
@@ -313,10 +316,15 @@ when every requested season is complete; while only some are, its state is
 season also counts when any episode of it is present: an episode the server
 cannot find would otherwise hold the request and its notification open for
 good. A season with no episode in the library never counts, since it may not
-have aired yet. A library whose metadata provider numbers seasons differently
-from TMDB (absolute or TVDB order) can therefore leave a season request
-waiting; the fulfilled-notification pass stamps each request it checks without
+have aired yet. The request path now prefers TVDB seasons and falls back to
+TMDB, so a TVDB-numbered library and its request page use the same numbering
+when TVDB is available. A library whose metadata provider still numbers seasons
+differently from the request path's source (absolute order, or TVDB order when
+only TMDB seasons are available) can therefore leave a season request waiting;
+the fulfilled-notification pass stamps each request it checks without
 notifying, so such requests rotate behind newer ones rather than starve them.
+Season numbers already stored on a request are not renumbered when this source
+changes: a request created under TMDB numbering keeps the numbers it stored.
 
 The series detail lists each regular season with its availability (`missing`,
 `partial`, `available`) and whether the active request covers it. A title still
