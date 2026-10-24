@@ -1,6 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { renderHook } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { videoContentRect, type FitRect } from "../utils/videoFit";
-import { pgsPlaneRect, placePGSObjects } from "./usePGSSubtitles";
+import type { PlayerSubtitleInfo } from "../types";
+import { pgsPlaneRect, placePGSObjects, usePGSSubtitles } from "./usePGSSubtitles";
 
 type PlaceArgs = Omit<Parameters<typeof placePGSObjects>[0], "objects"> & {
   object: { x: number; y: number };
@@ -202,5 +204,164 @@ describe("videoContentRect", () => {
     const cover = videoContentRect(1000, 1000, 1920, 1080, "cover");
     expect(cover.height).toBe(1000);
     expect(cover.x).toBeLessThan(0);
+  });
+});
+
+describe("usePGSSubtitles fetcher", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  const pgsTrack: PlayerSubtitleInfo = {
+    index: 0,
+    language: "eng",
+    label: "English",
+    codec: "pgs",
+    url: "/stream/media/subtitles/0.sup",
+  };
+
+  function fakeVideo(): HTMLVideoElement {
+    return {
+      readyState: 1,
+      currentTime: 100,
+      playbackRate: 1,
+      videoWidth: 1920,
+      videoHeight: 1080,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    } as unknown as HTMLVideoElement;
+  }
+
+  function fakeCanvas(): HTMLCanvasElement {
+    return {
+      clientWidth: 1600,
+      clientHeight: 900,
+      width: 0,
+      height: 0,
+      getContext: vi.fn(() => null),
+    } as unknown as HTMLCanvasElement;
+  }
+
+  function options() {
+    return {
+      videoRef: { current: fakeVideo() },
+      canvasRef: { current: fakeCanvas() },
+      subtitleUrls: [pgsTrack],
+      activeSubtitleIndex: 0,
+      enabled: true,
+      streamOriginSeconds: 0,
+      subtitleDelayMs: 0,
+      durationRef: { current: 0 },
+      fetchAnchorRef: { current: 0 },
+      videoFit: "contain" as const,
+    };
+  }
+
+  /** A window that streams in no bytes and commits. */
+  function emptyWindow() {
+    return Promise.resolve({
+      ok: true,
+      status: 200,
+      headers: new Headers(),
+      body: { getReader: () => ({ read: async () => ({ done: true, value: undefined }) }) },
+      json: async () => ({}),
+    });
+  }
+
+  function sourceChangedWindow() {
+    return Promise.resolve({
+      ok: false,
+      status: 409,
+      headers: new Headers(),
+      body: null,
+      json: async () => ({ error: "subtitle_source_changed" }),
+    });
+  }
+
+  function hardFailureWindow() {
+    return Promise.resolve({
+      ok: false,
+      status: 500,
+      headers: new Headers(),
+      body: null,
+      json: async () => ({}),
+    });
+  }
+
+  function stubPlayerGlobals() {
+    vi.stubGlobal(
+      "requestAnimationFrame",
+      vi.fn(() => 1),
+    );
+    vi.stubGlobal("cancelAnimationFrame", vi.fn());
+  }
+
+  it("reports a source change instead of retrying the window", async () => {
+    stubPlayerGlobals();
+    const fetchMock = vi.fn(() => sourceChangedWindow());
+    vi.stubGlobal("fetch", fetchMock);
+    const onSourceChanged = vi.fn();
+    const { unmount } = renderHook(() => usePGSSubtitles({ ...options(), onSourceChanged }));
+    await vi.waitFor(() => expect(onSourceChanged).toHaveBeenCalledTimes(1));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    unmount();
+  });
+
+  it("rebuilds the fetcher when a source revision changes", () => {
+    stubPlayerGlobals();
+    const fetchMock = vi.fn((_url: string, _init?: RequestInit) => emptyWindow());
+    vi.stubGlobal("fetch", fetchMock);
+    const opts = options();
+    const { rerender } = renderHook(
+      ({ sourceGeneration }: { sourceGeneration: number }) =>
+        usePGSSubtitles({ ...opts, sourceGeneration }),
+      { initialProps: { sourceGeneration: 1 } },
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]?.[0]).toContain("position=70&duration=60");
+    rerender({ sourceGeneration: 2 });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    // A fresh timeline after the rebuild starts with a short fresh window.
+    expect(fetchMock.mock.calls[1]?.[0]).toContain("position=70&duration=60");
+  });
+
+  it("does not rebuild the fetcher for a new callback identity alone", () => {
+    stubPlayerGlobals();
+    const fetchMock = vi.fn(() => emptyWindow());
+    vi.stubGlobal("fetch", fetchMock);
+    const opts = options();
+    const { rerender } = renderHook(
+      ({ marker }: { marker: number }) =>
+        usePGSSubtitles({ ...opts, onSourceChanged: () => void marker }),
+      { initialProps: { marker: 1 } },
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    rerender({ marker: 2 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("ends in the error state once the failure budget is spent", async () => {
+    vi.useFakeTimers();
+    stubPlayerGlobals();
+    const fetchMock = vi.fn(() => hardFailureWindow());
+    vi.stubGlobal("fetch", fetchMock);
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const onLoadState = vi.fn();
+    const { unmount } = renderHook(() => usePGSSubtitles({ ...options(), onLoadState }));
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await vi.advanceTimersByTimeAsync(5_000);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    await vi.advanceTimersByTimeAsync(10_000);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    await vi.advanceTimersByTimeAsync(20_000);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
+    expect(onLoadState).toHaveBeenLastCalledWith("error");
+    // Terminal: the playhead moving on must not start another window.
+    await vi.advanceTimersByTimeAsync(180_000);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(onLoadState).toHaveBeenLastCalledWith("error");
+    unmount();
   });
 });

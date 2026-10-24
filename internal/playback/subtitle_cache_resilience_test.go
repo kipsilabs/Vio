@@ -37,6 +37,105 @@ func TestSubtitleWindowCaptureMarksTruncation(t *testing.T) {
 	}
 }
 
+// A failed destination must not stop the shared capture: the bytes still
+// belong to the window result, and later writes must not touch the dead
+// response writer.
+func TestSubtitleWindowCaptureKeepsCapturingAfterDestinationFailure(t *testing.T) {
+	dst := &prefixErrorWriter{limit: 3, err: errors.New("broken pipe")}
+	capture := &subtitleWindowCapture{dst: dst, remaining: 64}
+
+	n, err := capture.Write([]byte("abcdef"))
+	if n != 6 || err != nil {
+		t.Fatalf("first write = (%d, %v), want (6, nil)", n, err)
+	}
+	n, err = capture.Write([]byte("ghi"))
+	if n != 3 || err != nil {
+		t.Fatalf("second write = (%d, %v), want (3, nil)", n, err)
+	}
+	if dst.writes != 1 {
+		t.Fatalf("destination write attempts = %d, want 1", dst.writes)
+	}
+	if got := dst.body.String(); got != "abc" {
+		t.Fatalf("destination body = %q, want the accepted prefix", got)
+	}
+	if got := capture.buf.String(); got != "abcdefghi" {
+		t.Fatalf("captured body = %q, want the full window", got)
+	}
+}
+
+// A leader whose response writer breaks mid-body must still commit the window
+// so a coalesced follower can serve it. This is the disconnect path that
+// previously returned a write error to copyAndFlush, killed ffmpeg, and left
+// the follower waiting on a fill that never committed.
+func TestServeSUPExtractWindowedLeaderWriteFailureStillCommits(t *testing.T) {
+	c, source := newTestCache(t)
+	opts := windowedSupOpts(source, 0, 300, 600)
+	opts.DisableBackgroundWarm = true
+	const payload = "PGS WINDOW"
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+
+	var (
+		mu    sync.Mutex
+		calls int
+	)
+	extract := func(_ context.Context, extractOpts StreamExtractOpts) error {
+		mu.Lock()
+		calls++
+		leader := calls == 1
+		mu.Unlock()
+		if leader {
+			close(started)
+			<-release
+		}
+		_, err := io.WriteString(extractOpts.Writer, payload)
+		return err
+	}
+
+	leaderWriter := &prefixErrorWriter{limit: 3, err: errors.New("broken pipe")}
+	leaderResult := make(chan error, 1)
+	go func() {
+		leaderResult <- c.ServeSUPExtract(
+			leaderWriter,
+			httptest.NewRequest(http.MethodGet, "/sub.sup?windowed=1", nil),
+			opts,
+			extract,
+		)
+	}()
+
+	<-started
+	followerRec := httptest.NewRecorder()
+	followerResult := make(chan error, 1)
+	go func() {
+		followerResult <- c.ServeSUPExtract(
+			followerRec,
+			httptest.NewRequest(http.MethodGet, "/sub.sup?windowed=1", nil),
+			opts,
+			extract,
+		)
+	}()
+
+	releaseOnce.Do(func() { close(release) })
+
+	if err := <-leaderResult; err != nil {
+		t.Fatalf("leader error = %v, want the window committed", err)
+	}
+	if err := <-followerResult; err != nil {
+		t.Fatalf("follower error = %v", err)
+	}
+	if got := followerRec.Body.String(); got != payload {
+		t.Fatalf("follower body = %q, want %q", got, payload)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("extract calls = %d, want 1 coalesced extraction", calls)
+	}
+}
+
 func windowResilienceOpts(source string) StreamExtractOpts {
 	return StreamExtractOpts{
 		InputPath:             source,

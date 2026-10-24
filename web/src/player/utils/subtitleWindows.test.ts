@@ -6,6 +6,7 @@ import {
   planSubtitleWindow,
   SUBTITLE_FETCH_RETRY_MAX_BACKOFF_MS,
   subtitleWindowUrl,
+  type SubtitleWindowFetcherOptions,
   type SubtitleWindowState,
 } from "./subtitleWindows";
 
@@ -49,6 +50,12 @@ describe("planSubtitleWindow", () => {
     });
   });
 
+  it("covers the in-flight window by its own end, not a fixed window length", () => {
+    const inflight = { ...covered, inflightStart: 695, inflightEnd: 750 };
+    expect(planSubtitleWindow(inflight, 740, 0, 2)).toEqual({ kind: "none" });
+    expect(planSubtitleWindow(inflight, 760, 0, 2)).toEqual({ kind: "fresh", start: 758 });
+  });
+
   it("holds off inside a failure backoff", () => {
     const failing = { ...covered, hasFetched: false, failedAt: 1_000, retryDelayMs: 5_000 };
     expect(planSubtitleWindow(failing, 10, 3_000, 2)).toEqual({ kind: "none" });
@@ -75,15 +82,22 @@ describe("nextSubtitleRetryDelay", () => {
 describe("createSubtitleWindowFetcher", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
   });
 
   /** A streamed response that yields `chunks` in order. */
-  function respond(chunks: string[], ok = true) {
+  function respond(
+    chunks: string[],
+    ok = true,
+    init: { status?: number; headers?: Record<string, string>; json?: unknown } = {},
+  ) {
     const encoder = new TextEncoder();
     const pending = [...chunks];
     return Promise.resolve({
       ok,
-      status: ok ? 200 : 503,
+      status: init.status ?? (ok ? 200 : 503),
+      headers: new Headers(init.headers),
       body: ok
         ? {
             getReader: () => ({
@@ -96,14 +110,29 @@ describe("createSubtitleWindowFetcher", () => {
             }),
           }
         : null,
+      json: async () => init.json ?? {},
     });
   }
 
-  function makeFetcher(playhead: number) {
+  /** A response whose body never delivers a chunk; only aborting it ends it. */
+  function neverDelivers() {
+    return Promise.resolve({
+      ok: true,
+      status: 200,
+      headers: new Headers(),
+      body: { getReader: () => ({ read: () => new Promise(() => {}) }) },
+      json: async () => ({}),
+    });
+  }
+
+  function makeFetcher(
+    playhead: () => number,
+    overrides: Partial<SubtitleWindowFetcherOptions> = {},
+  ) {
     const events: string[] = [];
     const fetcher = createSubtitleWindowFetcher({
-      windowUrl: (start) => `/sub?position=${start}`,
-      playhead: () => playhead,
+      windowUrl: (start, duration) => `/sub?position=${start}&duration=${duration}`,
+      playhead,
       duration: () => 0,
       seekBackoffSeconds: 10,
       logTag: "test",
@@ -111,6 +140,7 @@ describe("createSubtitleWindowFetcher", () => {
       onChunk: (chunk) => events.push(`chunk ${new TextDecoder().decode(chunk)}`),
       onWindowCommitted: () => events.push("committed"),
       onWindowFailed: () => events.push("failed"),
+      ...overrides,
     });
     return { fetcher, events };
   }
@@ -120,7 +150,7 @@ describe("createSubtitleWindowFetcher", () => {
       "fetch",
       vi.fn(() => respond(["a", "b"])),
     );
-    const { fetcher, events } = makeFetcher(100);
+    const { fetcher, events } = makeFetcher(() => 100);
     fetcher.maybeFetch();
     await vi.waitFor(() => expect(events).toContain("committed"));
     expect(events).toEqual(["start fresh", "chunk a", "chunk b", "committed"]);
@@ -138,12 +168,222 @@ describe("createSubtitleWindowFetcher", () => {
       const fetchMock = vi.fn(() => respond([], false));
       vi.stubGlobal("fetch", fetchMock);
       vi.spyOn(console, "error").mockImplementation(() => {});
-      const { fetcher, events } = makeFetcher(100);
+      const { fetcher, events } = makeFetcher(() => 100);
       fetcher.maybeFetch();
       await vi.waitFor(() => expect(events).toContain("failed"));
       expect(fetcher.coverage()).toMatchObject({ hasFetched: false, windowEnd: 90 });
       fetcher.maybeFetch();
       expect(fetchMock).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      fetcher.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("signals a source change once and never retries it", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMock = vi.fn(() =>
+        respond(["{}"], false, {
+          status: 409,
+          json: { error: "subtitle_source_changed" },
+        }),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      const onSourceChanged = vi.fn();
+      const { fetcher, events } = makeFetcher(() => 100, { onSourceChanged });
+      fetcher.maybeFetch();
+      await vi.waitFor(() => expect(onSourceChanged).toHaveBeenCalledTimes(1));
+      expect(events).not.toContain("failed");
+      // A later tick of the playhead must not re-fetch a URL that can never
+      // succeed, and no retry timer may be pending.
+      fetcher.maybeFetch();
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(onSourceChanged).toHaveBeenCalledTimes(1);
+      fetcher.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("waits at least Retry-After before retrying a retryable failure", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMock = vi.fn(() =>
+        respond([], false, { status: 503, headers: { "Retry-After": "10" } }),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      const { fetcher, events } = makeFetcher(() => 100);
+      fetcher.maybeFetch();
+      await vi.waitFor(() => expect(events).toContain("failed"));
+      // The normal backoff is 5 s, but the server asked for 10.
+      await vi.advanceTimersByTimeAsync(9_000);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      fetcher.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops retrying once the hard failure budget is spent", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMock = vi.fn(() => respond([], false, { status: 500 }));
+      vi.stubGlobal("fetch", fetchMock);
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      const onTerminal = vi.fn();
+      const { fetcher, events } = makeFetcher(() => 100, { onTerminal });
+      fetcher.maybeFetch();
+      await vi.waitFor(() => expect(events.filter((e) => e === "failed")).toHaveLength(1));
+      await vi.advanceTimersByTimeAsync(5_000);
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+      await vi.advanceTimersByTimeAsync(10_000);
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+      await vi.advanceTimersByTimeAsync(20_000);
+      await vi.waitFor(() => expect(onTerminal).toHaveBeenCalledTimes(1));
+      expect(fetchMock).toHaveBeenCalledTimes(4);
+      // The playhead keeps moving; a terminal fetcher must stay quiet.
+      fetcher.maybeFetch();
+      await vi.advanceTimersByTimeAsync(180_000);
+      expect(fetchMock).toHaveBeenCalledTimes(4);
+      expect(onTerminal).toHaveBeenCalledTimes(1);
+      fetcher.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("fetches a short first window and a long extend", async () => {
+    const fetchMock = vi.fn((_url: string, _init?: RequestInit) => respond([]));
+    vi.stubGlobal("fetch", fetchMock);
+    const { fetcher } = makeFetcher(() => 95, {
+      firstWindowSeconds: BITMAP_SUBTITLE_WINDOW_SECONDS,
+      windowSeconds: 120,
+    });
+    fetcher.maybeFetch();
+    await vi.waitFor(() => expect(fetcher.coverage().windowEnd).toBe(115));
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/sub?position=85&duration=30");
+    fetcher.maybeFetch();
+    await vi.waitFor(() => expect(fetcher.coverage().windowEnd).toBe(230));
+    expect(fetchMock.mock.calls[1]?.[0]).toBe("/sub?position=110&duration=120");
+    fetcher.dispose();
+  });
+
+  it("keeps a fresh 30/60 window on the wire while the playhead advances", () => {
+    let playhead = 1000;
+    const fetchMock = vi.fn(() => neverDelivers());
+    vi.stubGlobal("fetch", fetchMock);
+    const { fetcher } = makeFetcher(() => playhead, {
+      seekBackoffSeconds: 30,
+      firstWindowSeconds: 60,
+      windowSeconds: 120,
+    });
+
+    fetcher.maybeFetch();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // The production 30s backoff + 30s forward window ends at T+30. A
+    // playhead that advances during extraction must stay covered, or every
+    // timeupdate aborts the request and restarts the same window.
+    playhead = 1005;
+    fetcher.maybeFetch();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    fetcher.dispose();
+  });
+
+  it("revives a terminal fetcher on an explicit seek", async () => {
+    let playhead = 100;
+    let fail = true;
+    const fetchMock = vi.fn(() =>
+      fail ? respond([], false, { status: 500 }) : respond(["recovered"]),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const onTerminal = vi.fn();
+    const { fetcher, events } = makeFetcher(() => playhead, {
+      maxConsecutiveFailures: 1,
+      onTerminal,
+    });
+
+    fetcher.maybeFetch();
+    await vi.waitFor(() => expect(onTerminal).toHaveBeenCalledTimes(1));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    fail = false;
+    playhead = 2000;
+    fetcher.maybeFetch(true);
+    await vi.waitFor(() => expect(events).toContain("committed"));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    fetcher.dispose();
+  });
+
+  it("aborts an in-flight window and starts a fresh short window on a seek", async () => {
+    let playhead = 100;
+    const signals: AbortSignal[] = [];
+    const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
+      if (init?.signal) signals.push(init.signal);
+      return neverDelivers();
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const durations: string[] = [];
+    const { fetcher } = makeFetcher(() => playhead, {
+      firstWindowSeconds: BITMAP_SUBTITLE_WINDOW_SECONDS,
+      windowSeconds: 120,
+      windowUrl: (start, duration) => {
+        durations.push(`${start}/${duration}`);
+        return `/sub?position=${start}&duration=${duration}`;
+      },
+    });
+    fetcher.maybeFetch();
+    expect(durations).toEqual(["90/30"]);
+    playhead = 2_000;
+    fetcher.maybeFetch();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(signals[0]?.aborted).toBe(true);
+    expect(durations).toEqual(["90/30", "1990/30"]);
+    fetcher.dispose();
+  });
+
+  it("logs and retries a stalled window instead of swallowing the abort", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
+        const signal = init?.signal;
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          body: {
+            getReader: () => ({
+              read: () =>
+                new Promise((_resolve, reject) => {
+                  signal?.addEventListener("abort", () =>
+                    reject(new DOMException("Aborted", "AbortError")),
+                  );
+                }),
+            }),
+          },
+          json: async () => ({}),
+        });
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const { fetcher, events } = makeFetcher(() => 100, { stallTimeoutMs: 1_000 });
+      fetcher.maybeFetch();
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+      await vi.advanceTimersByTimeAsync(1_000);
+      await vi.waitFor(() => expect(events).toContain("failed"));
+      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("stalled"));
+      // A stall is transient, so it retries rather than spending the hard budget.
       await vi.advanceTimersByTimeAsync(5_000);
       expect(fetchMock).toHaveBeenCalledTimes(2);
       fetcher.dispose();
