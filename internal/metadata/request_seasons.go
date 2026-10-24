@@ -15,7 +15,10 @@ import (
 // every season of a show; fetching them one by one would make long series wait
 // on a chain of remote calls, while unbounded fan-out would hammer the TVDB
 // plugin.
-const requestSeasonsEpisodeConcurrency = 4
+const (
+	requestSeasonsEpisodeConcurrency = 4
+	requestSeasonsTVDBProvider       = "tvdb"
+)
 
 // FetchSeriesTVDBSeasons returns the TVDB season list for a series together
 // with the episodes of each numbered season, which the request-detail page uses
@@ -49,7 +52,7 @@ func (s *MetadataService) FetchSeriesTVDBSeasons(ctx context.Context, tvdbID int
 
 	var episodeProvider EpisodeProvider
 	for _, provider := range chain {
-		if provider.Slug() != "tvdb" {
+		if provider.Slug() != requestSeasonsTVDBProvider {
 			continue
 		}
 		tvdbProvider, ok := provider.(EpisodeProvider)
@@ -63,10 +66,10 @@ func (s *MetadataService) FetchSeriesTVDBSeasons(ctx context.Context, tvdbID int
 		return nil, fmt.Errorf("fetch TVDB seasons: no enabled TVDB episode provider: %w", ErrMetadataNotFound)
 	}
 
-	providerIDs := map[string]string{"tvdb": strconv.Itoa(tvdbID)}
+	providerIDs := map[string]string{requestSeasonsTVDBProvider: strconv.Itoa(tvdbID)}
 	seasons, err := episodeProvider.GetSeasons(ctx, SeasonsRequest{
 		ProviderIDs: providerIDs,
-		ContentType: "series",
+		ContentType: matchContentTypeSeries,
 		Language:    language,
 	})
 	if err != nil {
@@ -99,7 +102,7 @@ func (s *MetadataService) FetchSeriesTVDBSeasons(ctx context.Context, tvdbID int
 			episodes, err := episodeProvider.GetEpisodes(groupCtx, EpisodesRequest{
 				// A fresh map per call: providers may keep or mutate the request
 				// they are handed.
-				ProviderIDs:  map[string]string{"tvdb": strconv.Itoa(tvdbID)},
+				ProviderIDs:  map[string]string{requestSeasonsTVDBProvider: strconv.Itoa(tvdbID)},
 				SeasonNumber: season.SeasonNumber,
 				Language:     language,
 			})
