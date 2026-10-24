@@ -436,6 +436,16 @@ export function useASSSubtitles(
       return !!video && video.readyState > 0;
     }
 
+    /**
+     * Whether a resumed transport's ambiguous zero has become a real playhead.
+     * A resumed window deliberately skips completion reconciliation while the
+     * element still reports 0, but once a position arrives the normal backstop
+     * must not stay suppressed for the rest of that attempt.
+     */
+    function playheadLeftTransportZero(): boolean {
+      return !!video && video.readyState > 0 && video.currentTime > 0;
+    }
+
     /** Source-time position of the playhead (player clock + stream origin). */
     function sourcePosition(): number {
       return (video!.readyState > 0 ? video!.currentTime : 0) + sourceOriginRef.current;
@@ -659,7 +669,11 @@ export function useASSSubtitles(
       jassubRef.current = instance;
       // Resizes skipped while a stream reload emptied the video happen here,
       // once the next stream has a frame size. Some browsers report that size
-      // after loadedmetadata, with a resize event.
+      // after loadedmetadata, with a resize event. Replacements share the same
+      // <video>, so drop the previous renderer's listeners before attaching the
+      // new pair rather than leaving them behind until the effect tears down.
+      stopResizeToStream?.();
+      stopResizeToStream = null;
       const resizeToStream = () => repaintASS(instance, () => jassubRef.current === instance);
       video.addEventListener("loadedmetadata", resizeToStream);
       video.addEventListener("resize", resizeToStream);
@@ -821,13 +835,20 @@ export function useASSSubtitles(
         pendingStart = null;
         if (next !== null && !cancelled && !terminal) {
           void attempt(next, false);
-        } else if (committed && recheckAfterCommit && !cancelled && !terminal && playheadKnown()) {
+        } else if (
+          committed &&
+          (recheckAfterCommit || playheadLeftTransportZero()) &&
+          !cancelled &&
+          !terminal &&
+          playheadKnown()
+        ) {
           // Backstop for a playhead that left the committed window while the
           // extraction ran and then stopped emitting events (paused). If the
           // position is inside, this is a no-op: there is no refresh loop. An
           // empty element has no playhead to reconcile, and a window resumed
           // across a transport rebuild must not be undone by the same
-          // ambiguous 0 that made it necessary.
+          // ambiguous 0 that made it necessary. Once that resumed attempt sees
+          // a real non-zero playhead, reconcile it.
           maybeRefreshWindow(false);
         }
       }
