@@ -345,7 +345,7 @@ func (s *MetadataService) resolveLibraryProviderChain(
 	if err != nil {
 		// The library's configured chain remains usable when the enabled-provider
 		// lookup fails; falling back is safer than failing the whole lookup.
-		return chain, nil //nolint:nilerr
+		return chain, nil //nolint:nilerr // keep the configured chain when the enabled-provider lookup fails
 	}
 	if filtered := filterProviderChain(all, preferredProvider); len(filtered) > 0 {
 		return filtered, nil
