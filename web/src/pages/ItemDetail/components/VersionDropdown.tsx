@@ -137,7 +137,8 @@ function VersionDropdown({
   const indexerReleases = indexerRequest ? (watch?.indexer_releases ?? []) : [];
   // A title with nothing but indexer releases still gets the picker, so the
   // viewer can request one even before any playable version exists.
-  const showVersionDropdown = activeVersions.length > 1 || indexerReleases.length > 0;
+  const showVersionDropdown =
+    activeVersions.length > 1 || indexerReleases.length > 0 || !!onRefreshVersions;
   const serverRanking = useMemo(
     () =>
       serverRankingFromVersions(
@@ -452,7 +453,12 @@ interface VersionRefreshRowProps {
  * Both instances read the same `useVersionListRefresh` state, so one refresh
  * locks and spins both.
  */
-function VersionRefreshRow({ refreshing, cancelable, error, onPress }: VersionRefreshRowProps) {
+export function VersionRefreshRow({
+  refreshing,
+  cancelable,
+  error,
+  onPress,
+}: VersionRefreshRowProps) {
   return (
     <button
       type="button"

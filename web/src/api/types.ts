@@ -1226,6 +1226,8 @@ export interface ItemDetail {
     items: { id: string; title: string; duration_seconds: number; container: string }[];
   };
   content_id: string;
+  /** The item has a virtual source even when discovery has not produced a playable version. */
+  has_virtual_source?: boolean;
   play_content_id?: string;
   /** The season of `play_content_id` when it is an episode. */
   play_season_number?: number;

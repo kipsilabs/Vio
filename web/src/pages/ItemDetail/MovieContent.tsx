@@ -370,6 +370,7 @@ export default function MovieContent({
                 canCurateMetadata && item.versions.length > 0 ? () => openMediaInfo() : undefined
               }
               versions={versionsWithLiveness}
+              hasVirtualSource={item.has_virtual_source === true}
               playbackVariants={item.playback_variants}
               selectedVersion={selectedVersion}
               onSelectVersion={handleSelectVersion}

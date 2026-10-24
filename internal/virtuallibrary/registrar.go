@@ -259,14 +259,17 @@ func monitoredEpisodePayload(item monitor.MonitoredMedia) []catalog.VirtualEpiso
 			continue
 		}
 		episodes = append(episodes, catalog.VirtualEpisode{
-			SeasonNumber:   episode.Season,
-			EpisodeNumber:  episode.Episode,
-			Title:          strings.TrimSpace(episode.Title),
-			Overview:       strings.TrimSpace(episode.Overview),
-			StillPath:      strings.TrimSpace(episode.Thumbnail),
-			AirDate:        episode.Released,
-			RuntimeMinutes: episode.Runtime,
-			VirtualURI:     virtualEpisodeURI(item, episode),
+			SeasonNumber:           episode.Season,
+			EpisodeNumber:          episode.Episode,
+			Title:                  strings.TrimSpace(episode.Title),
+			Overview:               strings.TrimSpace(episode.Overview),
+			StillPath:              strings.TrimSpace(episode.Thumbnail),
+			SeasonPosterPath:       strings.TrimSpace(episode.SeasonPosterPath),
+			SeasonPosterSourcePath: strings.TrimSpace(episode.SeasonPosterSourcePath),
+			SeasonPosterThumbhash:  strings.TrimSpace(episode.SeasonPosterThumbhash),
+			AirDate:                episode.Released,
+			RuntimeMinutes:         episode.Runtime,
+			VirtualURI:             virtualEpisodeURI(item, episode),
 		})
 	}
 	return episodes
