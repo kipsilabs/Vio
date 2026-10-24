@@ -681,6 +681,67 @@ func TestLibraryPickFallsBackWhenSamplesFindNothing(t *testing.T) {
 	}
 }
 
+// A canonical episode whose only present file is owned by a layout alias row
+// stays playable, and the alias row itself never becomes a shuffle candidate.
+// Both the sampled and the full library read must agree on that.
+func TestShuffleUsesAliasFilesForCanonicalEpisodes(t *testing.T) {
+	f := seed(t)
+	ctx := t.Context()
+	canonical := f.season1[0]
+	aliasID := f.prefix + "alias-episode"
+	for _, statement := range []struct {
+		sql  string
+		args []any
+	}{
+		{`INSERT INTO episodes (content_id, series_id, season_number, episode_number, title)
+			VALUES ($1, $2, 1, 0, $1)`, []any{aliasID, f.series}},
+		{`UPDATE media_files SET episode_id = $1 WHERE episode_id = $2`, []any{aliasID, canonical}},
+		{`INSERT INTO episode_aliases (
+				series_id, canonical_episode_id, alias_episode_id,
+				provider_installation_id, provider_series_id,
+				provider_season_number, provider_episode_number, source
+			) VALUES ($1, $2, $3, 0, '', 1, 0, 'absolute_layout')`, []any{f.series, canonical, aliasID}},
+	} {
+		if _, err := f.pool.Exec(ctx, statement.sql, statement.args...); err != nil {
+			t.Fatalf("seed %q: %v", statement.sql, err)
+		}
+	}
+
+	// The sampled read maps alias-owned files to their canonical episode; the
+	// full read accepts the alias file through the per-episode file check.
+	p := pool{episodes: true, libraryID: f.tvLibrary}
+	for _, draws := range []int{1024, 0} {
+		seen := map[string]bool{}
+		for range 200 {
+			id, err := pickFrom(ctx, f.pool, p, catalog.AccessFilter{}, "", nil, draws)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if id == "" {
+				t.Fatalf("draws=%d: no pick from a library with playable items", draws)
+			}
+			if id == aliasID {
+				t.Fatalf("draws=%d: picked layout alias %q", draws, aliasID)
+			}
+			seen[id] = true
+		}
+		if got := slices.Collect(maps.Keys(seen)); !sameSet(got, f.allEpisodes()) {
+			t.Fatalf("draws=%d picked %v, want exactly %v", draws, got, f.allEpisodes())
+		}
+	}
+
+	// A series shuffle hands each canonical episode out once, including the one
+	// whose file lives on the alias, and never the alias row.
+	svc := NewService(f.pool, nil)
+	s, err := svc.Create(ctx, f.owner, catalog.AccessFilter{}, Scope{Kind: ScopeSeries, ID: f.series})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := playthrough(t, svc, f.owner, catalog.AccessFilter{}, s, len(f.allEpisodes())-1); !sameSet(got, f.allEpisodes()) {
+		t.Fatalf("played %v, want each of %v once", got, f.allEpisodes())
+	}
+}
+
 // An episode with several files in the library is no likelier to be sampled
 // than one with a single file.
 func TestSampledPickCountsEachItemOnce(t *testing.T) {

@@ -204,6 +204,83 @@ func TestRefreshJobIndexerFailureCompletesAltmountOnly(t *testing.T) {
 	}
 }
 
+// fakeJobEpisodes resolves one episode for the job's library-folder fallback.
+type fakeJobEpisodes struct {
+	episode *models.Episode
+}
+
+func (f fakeJobEpisodes) GetByID(context.Context, string) (*models.Episode, error) {
+	return f.episode, nil
+}
+
+// TestRefreshJobFirstFolderIDFallsBackToSeriesSource proves a fileless episode
+// inherits the library from its series' virtual source row, so the indexer
+// scope has a real folder even before the episode owns a file.
+func TestRefreshJobFirstFolderIDFallsBackToSeriesSource(t *testing.T) {
+	service := &VirtualCandidatesRefreshJobService{
+		Episodes: fakeJobEpisodes{episode: &models.Episode{ContentID: "episode:fileless", SeriesID: "series:source"}},
+		ContentFiles: func(_ context.Context, contentID string) ([]*models.MediaFile, error) {
+			if contentID == "series:source" {
+				return []*models.MediaFile{{MediaFolderID: 14}}, nil
+			}
+			return nil, nil
+		},
+	}
+	if got := service.firstFolderID(t.Context(), "episode:fileless"); got != 14 {
+		t.Fatalf("firstFolderID = %d, want 14 from the series source", got)
+	}
+}
+
+// TestRefreshJobSearchesIndexersWithoutProviderSource proves a fileless
+// episode still reaches the indexer search instead of failing at the missing
+// provider source. The provider stage is empty; the job persists the releases
+// under the episode scope and reports a successful search.
+func TestRefreshJobSearchesIndexersWithoutProviderSource(t *testing.T) {
+	store := refreshJobTestStore(t)
+	contentID := "episode:job-no-source"
+	searcher := &fakeIndexerSearcher{releases: []virtuallibrary.SearchItem{
+		fakeSearchRelease("new", "Bleach.Thousand.Year.Blood.War.S17E01.1080p.WEB-DL-GRP", 1_400_000_000),
+	}}
+	executor := &VirtualCandidatesRefreshExecutor{
+		Refresh: &VirtualCandidatesRefreshService{
+			ListFresh: VirtualPlaybackStreamListerFunc(func(context.Context, string, int, string, int) ([]VirtualPlaybackStream, error) {
+				t.Fatal("provider listing must not run without a virtual source")
+				return nil, nil
+			}),
+			Persist: func(context.Context, *models.MediaFile, []VirtualPlaybackStream) error {
+				t.Fatal("persistence must not run without a virtual source")
+				return nil
+			},
+			ContentFiles: func(context.Context, string) ([]*models.MediaFile, error) { return nil, nil },
+			EpisodeFiles: func(context.Context, string) ([]*models.MediaFile, error) { return nil, nil },
+		},
+		Store:    store,
+		Searcher: searcher,
+	}
+
+	result, err := executor.Execute(t.Context(), adminjob.VirtualCandidatesRefreshRequest{
+		ContentID: contentID, EpisodeID: contentID, MediaFolderID: 14,
+		Title: "Bleach", Year: 2004, TVDBID: "74796", SeasonNumber: 17, EpisodeNumber: 1,
+	}, nil)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if result.ProviderCandidates != 0 || !result.IndexerSearchOK || result.IndexerReleases != 1 {
+		t.Fatalf("result = %+v", result)
+	}
+	if len(result.Releases) != 1 || !strings.Contains(result.Releases[0].Title, "S17E01") {
+		t.Fatalf("releases = %+v", result.Releases)
+	}
+	scope := virtuallibrary.IndexerReleaseScope{ContentID: contentID, EpisodeID: contentID, MediaFolderID: 14}
+	persisted, err := store.ListIndexerReleases(t.Context(), scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(persisted) != 1 || persisted[0].GUID != "new" {
+		t.Fatalf("persisted rows = %+v", persisted)
+	}
+}
+
 // TestRefreshJobProviderFailureFails proves an altmount re-list failure is the
 // one fatal stage.
 func TestRefreshJobProviderFailureFails(t *testing.T) {

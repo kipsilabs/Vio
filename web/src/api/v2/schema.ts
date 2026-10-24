@@ -29412,7 +29412,7 @@ export interface components {
        * @example 170
        */
       runtime?: number;
-      /** @description Series: the regular seasons (specials excluded) with library availability and request coverage; empty for movies */
+      /** @description Series: the regular seasons (specials excluded) from the series metadata provider, with library availability and request coverage; empty for movies */
       seasons: components["schemas"]["RequestMediaSeason"][];
       /**
        * @description TMDB release status
@@ -29529,13 +29529,13 @@ export interface components {
       availability: "missing" | "partial" | "available";
       /**
        * Format: int64
-       * @description Episodes TMDB lists for the season, aired or not
+       * @description Episodes the series metadata provider lists for the season, aired or not
        * @example 10
        */
       episode_count: number;
       /** @example Season 2 */
       name?: string;
-      /** @description TMDB image path */
+      /** @description TMDB image path, when available */
       poster_path?: string;
       /** @description The title's active request covers this season */
       requested: boolean;

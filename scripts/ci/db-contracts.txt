@@ -27,6 +27,59 @@
 # Series air-date sort keys advance when a known episode airs.
 ./internal/catalog TestSeriesAirDatesFollowEpisodesAndCalendarDB
 
+# Episode alias rows stay out of canonical episode lists and counts, and episode
+# file reads fall back to the alias row that owns the files.
+./internal/catalog TestEpisodeAliasExcludedFromCanonicalCatalogDB
+./internal/scanner TestFileRepositoryFallsBackToAliasEpisodeFilesDB
+
+# Episode catalog entries are written under the canonical id, aggregate alias
+# files, and track alias mapping changes.
+./internal/catalog TestEpisodeCatalogEntriesCanonicalDB
+
+# The generic episode relation and recently-added TV accept alias membership
+# and alias-owned files without surfacing alias rows as separate episodes.
+./internal/catalog TestEpisodeCatalogBaseRelationAliasDB
+./internal/catalog TestRecentTVAliasMembershipDB
+
+# Returning shows count a canonical episode whose only file is alias-owned and
+# do not treat an alias arrival as a new season.
+./internal/sections TestReturningShowsAliasDB
+
+# A fileless episode still reaches the indexer search, and its release scope
+# inherits the series library instead of aborting on a missing provider source.
+./internal/api/handlers TestRefreshJobSearchesIndexersWithoutProviderSource
+
+# Watch-count rollups count canonical episodes, including a canonical row whose
+# alias owns the only present file, without counting duplicate alias rows.
+./internal/userstore/pgstore TestEpisodeAliasWatchCountsCanonicalSeasonsDB
+
+# Reconciliation repairs watch state for the mappings it inserts: progress,
+# hints, resume, history, and history-hide markers move to the canonical episode
+# across profiles; multiple aliases merge deterministically; a repeat is a no-op.
+./internal/catalog TestEpisodeAliasReconcileRepairsWatchStateDB
+
+# The storage write boundary resolves a cached alias id to the canonical episode
+# for progress, hints, resume state, and history, keeping profiles separate.
+./internal/userstore/pgstore TestPostgresWatchStateWritesCanonicalEpisodeDB
+
+# Reconciliation excludes concurrent watch-state writes for the same series and
+# preserves newer canonical state instead of overwriting it with a stale snapshot.
+./internal/userstore/pgstore TestPostgresAliasWriteSerializedWithReconcileDB
+./internal/userstore/pgstore TestPostgresCanonicalStateSurvivesReconcileSnapshotDB
+./internal/userstore/pgstore TestPostgresWatchStateWritesLockSeriesDB
+
+# The identity guard serializes concurrent writers per series at the database
+# boundary, so two concurrent one-hop mappings cannot commit a cycle.
+./internal/database TestEpisodeAliasIdentityGuardSerializesConcurrentWritesPostgres
+
+# Canonicalization validates the alias graph before the destructive watch-state
+# repair, so a pre-existing chain fails the migration with every progress,
+# history, hidden-state, and alias row unchanged.
+./internal/database TestEpisodeAliasChainValidationPrecedesWatchStateRepairPostgres
+
+# Play targets select canonical episodes and accept an alias-owned file.
+./internal/catalog TestPlayableTargetsResolveCanonicalAliasFilesDB
+
 # Same-day episodes sorted by air date keep series title and season/episode order on every query path.
 ./internal/catalog TestQueryEpisodeAirDateTiesPostgres
 
@@ -427,3 +480,7 @@
 # unlinked, partly linked, metadata-only, or file-backed season answers the same
 # set from the series count, season page, item episodes, and season detail.
 ./internal/api/handlers TestSeriesSeasonsKeepsMetadataOnlySeasons
+
+# A partly available season lists canonical metadata-only rows beside the
+# file-backed subset; fileless rows carry no files and alias rows stay hidden.
+./internal/api/handlers TestSeasonEpisodesMergePartialAvailabilityDB

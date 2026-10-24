@@ -132,6 +132,7 @@ func (r *CalendarRepository) buildListEventsQuery(f CalendarFilter) (string, []a
        SELECT e.series_id, e.season_number, MAX(e.episode_number) AS max_episode_number
        FROM episodes e
        JOIN episode_seasons es ON es.series_id = e.series_id AND es.season_number = e.season_number
+       WHERE `+EpisodeAliasExclusionSQL("e.content_id")+`
        GROUP BY e.series_id, e.season_number
      ),
      filtered_seasons AS (%s),
@@ -140,6 +141,7 @@ func (r *CalendarRepository) buildListEventsQuery(f CalendarFilter) (string, []a
        FROM episodes e
        JOIN filtered_seasons fs ON fs.series_id = e.series_id AND fs.season_number = e.season_number
        WHERE e.episode_number = 1 AND e.air_date IS NOT NULL
+         AND `+EpisodeAliasExclusionSQL("e.content_id")+`
      )
 SELECT content_id, type, title, episode_title, series_id,
        season_number, episode_number, air_date, air_time, air_timezone,
@@ -181,6 +183,7 @@ func (r *CalendarRepository) buildFilteredEpisodesCTE(startArg, endArg, restrict
 	r.appendLibraryExistsClauses("e.series_id", f, &conditions, args, argIdx)
 	r.appendContentRatingClause("mi", f, &conditions, args, argIdx)
 	r.appendRestrictClause("e.series_id", restrictArg, f, &conditions)
+	conditions = append(conditions, EpisodeAliasExclusionSQL("e.content_id"))
 
 	return fmt.Sprintf(`SELECT e.content_id, e.series_id, e.season_number,
        e.episode_number, e.title AS episode_title, e.air_date,

@@ -107,13 +107,63 @@ const episodeCatalogSeriesParentGuard = `EXISTS (
 		  AND si.type = 'series'
 	)`
 
-const episodeCatalogActiveLibraryExists = `EXISTS (
+// episodeLibraryMembershipClausesSQL renders the two ways an episode can hold a
+// library membership: the episode row itself has an episode_libraries row, or
+// one of its alias rows does. libraryAlias names the inner episode_libraries
+// alias and is package-owned. folderCondition optionally narrows both branches
+// and must reference that alias.
+//
+// The clauses are returned separately so a negated library scope renders as two
+// NOT EXISTS probes instead of one OR-ed predicate.
+func episodeLibraryMembershipClausesSQL(episodeIDExpr, libraryAlias, folderCondition string) (string, string) {
+	folder := ""
+	if folderCondition != "" {
+		folder = "\n\t\t  AND " + folderCondition
+	}
+	direct := fmt.Sprintf(`EXISTS (
 		SELECT 1
-		FROM episode_libraries el
-		WHERE el.episode_id = e.content_id
-	)`
+		FROM episode_libraries %[1]s
+		WHERE %[1]s.episode_id = %[2]s%[3]s
+	)`, libraryAlias, episodeIDExpr, folder)
+	aliased := fmt.Sprintf(`EXISTS (
+		SELECT 1
+		FROM episode_aliases ea
+		JOIN episode_libraries %[1]s ON %[1]s.episode_id = ea.alias_episode_id
+		WHERE ea.canonical_episode_id = %[2]s%[3]s
+	)`, libraryAlias, episodeIDExpr, folder)
+	return direct, aliased
+}
 
-var episodeCatalogBaseRelation = fmt.Sprintf(episodeCatalogSelectBody, episodeCatalogActiveLibraryExists)
+// episodeLibraryMembershipSQL accepts an episode through its own membership or
+// an alias row's membership. Membership alone is enough: the alias file does
+// not have to be present for the canonical episode to stay visible.
+func episodeLibraryMembershipSQL(episodeIDExpr, libraryAlias, folderCondition string) string {
+	direct, aliased := episodeLibraryMembershipClausesSQL(episodeIDExpr, libraryAlias, folderCondition)
+	return "(" + direct + "\n\tOR " + aliased + ")"
+}
+
+// episodeLibraryExclusionSQL rejects an episode that has any membership, direct
+// or alias-owned, inside the excluded library scope.
+func episodeLibraryExclusionSQL(episodeIDExpr, libraryAlias, folderCondition string) string {
+	direct, aliased := episodeLibraryMembershipClausesSQL(episodeIDExpr, libraryAlias, folderCondition)
+	return "NOT " + direct + "\n\tAND NOT " + aliased
+}
+
+var episodeCatalogActiveLibraryExists = episodeLibraryMembershipSQL("e.content_id", "el", "")
+
+// episodeCatalogConditionsSQL wraps a render's scope predicates with the alias
+// exclusion every episode-catalog render must apply. A row named by
+// episode_aliases.alias_episode_id is a layout duplicate carrying another
+// episode's files; the catalog displays only its canonical row.
+func episodeCatalogConditionsSQL(scopePredicates string) string {
+	return "(" + scopePredicates + `)
+	  AND ` + EpisodeAliasExclusionSQL("e.content_id")
+}
+
+var episodeCatalogBaseRelation = fmt.Sprintf(
+	episodeCatalogSelectBody,
+	episodeCatalogConditionsSQL(episodeCatalogActiveLibraryExists),
+)
 
 func isEpisodeCatalogScope(scope string) bool {
 	return scope == "episode"
@@ -142,12 +192,11 @@ func episodeCatalogBaseRelationForLibraries(
 	args := make([]any, 0, len(allowedLibraryIDs)+len(disabledLibraryIDs))
 
 	if len(allowedLibraryIDs) > 0 {
-		libraryPredicates = append(libraryPredicates, fmt.Sprintf(`EXISTS (
-		SELECT 1
-		FROM episode_libraries el_scope_in
-		WHERE el_scope_in.episode_id = e.content_id
-		  AND el_scope_in.media_folder_id = ANY($%d)
-	)`, argIdx))
+		libraryPredicates = append(libraryPredicates, episodeLibraryMembershipSQL(
+			"e.content_id",
+			"el_scope_in",
+			fmt.Sprintf("el_scope_in.media_folder_id = ANY($%d)", argIdx),
+		))
 		args = append(args, allowedLibraryIDs)
 		argIdx++
 	} else if len(disabledLibraryIDs) > 0 {
@@ -155,12 +204,11 @@ func episodeCatalogBaseRelationForLibraries(
 	}
 
 	if len(disabledLibraryIDs) > 0 {
-		libraryPredicates = append(libraryPredicates, fmt.Sprintf(`NOT EXISTS (
-		SELECT 1
-		FROM episode_libraries el_scope_out
-		WHERE el_scope_out.episode_id = e.content_id
-		  AND el_scope_out.media_folder_id = ANY($%d)
-	)`, argIdx))
+		libraryPredicates = append(libraryPredicates, episodeLibraryExclusionSQL(
+			"e.content_id",
+			"el_scope_out",
+			fmt.Sprintf("el_scope_out.media_folder_id = ANY($%d)", argIdx),
+		))
 		args = append(args, disabledLibraryIDs)
 		argIdx++
 	}
@@ -173,7 +221,7 @@ func episodeCatalogBaseRelationForLibraries(
 
 	relation := fmt.Sprintf(
 		episodeCatalogSelectBody,
-		strings.Join(libraryPredicates, "\n\tAND "),
+		episodeCatalogConditionsSQL(strings.Join(libraryPredicates, "\n\tAND ")),
 	)
 	return relation, args, true
 }
