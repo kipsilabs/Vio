@@ -93,6 +93,32 @@ export function createStallTracker(): StallTracker {
   };
 }
 
+/** A ladder rung the player can request explicitly when Auto does not move. */
+export interface DownshiftQuality {
+  label: string;
+  bitrate_kbps?: number;
+  preserves_source?: boolean;
+}
+
+/**
+ * Highest non-source-preserving rung below the bitrate that stalled. Auto
+ * normally re-plans from the recorded estimate, but a server can return the
+ * same source plan for an unchanged "auto" label; naming a real rung forces
+ * the decision through the quality ladder.
+ */
+export function lowerQualityLabel(
+  qualities: readonly DownshiftQuality[] | undefined,
+  failedKbps: number,
+): string | undefined {
+  let best: DownshiftQuality | undefined;
+  for (const quality of qualities ?? []) {
+    const bitrate = quality.bitrate_kbps ?? 0;
+    if (quality.preserves_source === true || bitrate <= 0 || bitrate >= failedKbps) continue;
+    if (best === undefined || bitrate > (best.bitrate_kbps ?? 0)) best = quality;
+  }
+  return best?.label;
+}
+
 /** The estimate to plan with after `deliveredKbps` stalled, or undefined. */
 export function downshiftEstimateKbps(deliveredKbps: number | undefined): number | undefined {
   if (deliveredKbps === undefined || !Number.isFinite(deliveredKbps) || deliveredKbps <= 0) {

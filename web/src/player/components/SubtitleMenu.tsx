@@ -68,12 +68,24 @@ const SOURCE_LABELS: Record<string, string> = {
   downloaded: "Downloaded",
 };
 
+function subtitleFlags(track: PlayerSubtitleInfo): { forced: boolean; hearingImpaired: boolean } {
+  const label = (track.label ?? "").toLowerCase();
+  return {
+    forced: track.forced === true || /\bforced\b/.test(label),
+    hearingImpaired:
+      track.hearing_impaired === true ||
+      /\b(sdh|hi|cc)\b/.test(label) ||
+      /hearing impaired|closed captions?/.test(label),
+  };
+}
+
 function subtitleGroupKey(track: PlayerSubtitleInfo): string {
+  const flags = subtitleFlags(track);
   return [
     (track.language ?? "").trim().toLowerCase(),
     (track.codec ?? "").trim().toLowerCase(),
-    track.forced ? "forced" : "",
-    track.hearing_impaired ? "sdh" : "",
+    flags.forced ? "forced" : "",
+    flags.hearingImpaired ? "sdh" : "",
     track.source ?? "embedded",
   ].join("|");
 }
@@ -85,9 +97,10 @@ function subtitleDisplayName(
   ordinal: number,
   duplicateCount: number,
 ): string {
+  const flags = subtitleFlags(track);
   const qualifiers: string[] = [];
-  if (track.forced) qualifiers.push("Forced");
-  if (track.hearing_impaired) qualifiers.push("SDH");
+  if (flags.forced) qualifiers.push("Forced");
+  if (flags.hearingImpaired) qualifiers.push("SDH");
   let label = languageName;
   if (qualifiers.length > 0) label += ` (${qualifiers.join(", ")})`;
   if (duplicateCount > 1) label += ` ${ordinal}`;

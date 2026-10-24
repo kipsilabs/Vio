@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createStallTracker,
   downshiftEstimateKbps,
+  lowerQualityLabel,
   useAutoQualityDownshift,
 } from "./useAutoQualityDownshift";
 
@@ -94,6 +95,31 @@ describe("createStallTracker", () => {
     tracker.waiting(20_000);
     tracker.seeking();
     expect(tracker.shouldDownshift(30_000)).toBe(false);
+  });
+});
+
+describe("lowerQualityLabel", () => {
+  it("picks the highest non-source rung below the failed bitrate", () => {
+    expect(
+      lowerQualityLabel(
+        [
+          { label: "original", bitrate_kbps: 19_489, preserves_source: true },
+          { label: "2160p-low", bitrate_kbps: 10_000 },
+          { label: "1080p-high", bitrate_kbps: 10_000 },
+          { label: "1080p-medium", bitrate_kbps: 6_000 },
+        ],
+        19_489,
+      ),
+    ).toBe("2160p-low");
+  });
+
+  it("returns undefined when no lower rung exists", () => {
+    expect(
+      lowerQualityLabel(
+        [{ label: "original", bitrate_kbps: 19_489, preserves_source: true }],
+        19_489,
+      ),
+    ).toBeUndefined();
   });
 });
 

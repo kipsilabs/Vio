@@ -61,6 +61,31 @@ func TestBuildSubtitleInventoryV3_OrdinalsAreDenseAcrossAllThreeRanges(t *testin
 	}
 }
 
+func TestBuildSubtitleInventoryV3_InfersAccessibilityFlagsFromTitles(t *testing.T) {
+	file := &models.MediaFile{
+		ID: 51,
+		SubtitleTracks: []models.SubtitleTrack{
+			{Index: 0, Codec: "subrip", Language: "fr", Title: "Französisch SDH"},
+			{Index: 1, Codec: "subrip", Language: "fr", Title: "Forced"},
+			{Index: 2, Codec: "mov_text", Language: "en", Title: "MOV_TEXT"},
+		},
+	}
+
+	items := BuildSubtitleInventoryV3(file, nil)
+	if len(items) != 3 {
+		t.Fatalf("expected 3 items, got %d", len(items))
+	}
+	if !items[0].HearingImpaired || items[0].Forced {
+		t.Errorf("SDH title flags = forced:%v hearing:%v, want hearing only", items[0].Forced, items[0].HearingImpaired)
+	}
+	if !items[1].Forced || items[1].HearingImpaired {
+		t.Errorf("forced title flags = forced:%v hearing:%v, want forced only", items[1].Forced, items[1].HearingImpaired)
+	}
+	if items[2].Forced || items[2].HearingImpaired {
+		t.Errorf("generic codec title gained flags: %+v", items[2])
+	}
+}
+
 func TestBuildSubtitleInventoryV3_ClassifiesDelivery(t *testing.T) {
 	file := &models.MediaFile{
 		ID: 7,
