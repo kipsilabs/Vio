@@ -43374,7 +43374,7 @@
             "type": "integer"
           },
           "seasons": {
-            "description": "Series: the regular seasons (specials excluded) with library availability and request coverage; empty for movies",
+            "description": "Series: the regular seasons (specials excluded) from the series metadata provider, with library availability and request coverage; empty for movies",
             "items": {
               "$ref": "#/components/schemas/RequestMediaSeason"
             },
@@ -43600,7 +43600,7 @@
             "type": "string"
           },
           "episode_count": {
-            "description": "Episodes TMDB lists for the season, aired or not",
+            "description": "Episodes the series metadata provider lists for the season, aired or not",
             "examples": [
               10
             ],
@@ -43614,7 +43614,7 @@
             "type": "string"
           },
           "poster_path": {
-            "description": "TMDB image path",
+            "description": "TMDB image path, when available",
             "type": "string"
           },
           "requested": {
