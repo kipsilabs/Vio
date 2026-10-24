@@ -259,6 +259,10 @@ export function useASSSubtitles(
   // re-arms requestVideoFrameCallback only from inside its own callback, and
   // callbacks registered on an engine end with it, so the renderer rebuilds.
   transportRevision = 0,
+  // Bumped when a new playback session starts at the beginning. Unlike a
+  // transport rebuild, a replay can reuse the same URL and source generation,
+  // so it needs an explicit signal to discard the previous playhead's window.
+  replayRevision = 0,
 ): { isActive: boolean } {
   const onLoadStateRef = useRef(onLoadState);
   onLoadStateRef.current = onLoadState;
@@ -281,6 +285,7 @@ export function useASSSubtitles(
   const committedWindowRef = useRef<{
     url: string;
     sourceGeneration: number;
+    replayRevision: number;
     start: number;
   } | null>(null);
   const syncedFitRef = useRef(videoFit);
@@ -337,7 +342,8 @@ export function useASSSubtitles(
       previousCommitted !== null &&
       activeUrl !== null &&
       previousCommitted.url === activeUrl &&
-      previousCommitted.sourceGeneration === sourceGeneration
+      previousCommitted.sourceGeneration === sourceGeneration &&
+      previousCommitted.replayRevision === replayRevision
         ? previousCommitted
         : null;
 
@@ -712,7 +718,7 @@ export function useASSSubtitles(
         windowStart = start;
         // This run's commit is the only window a later rebuild of this same
         // track identity may reuse.
-        committedWindowRef.current = { url: activeUrl!, sourceGeneration, start };
+        committedWindowRef.current = { url: activeUrl!, sourceGeneration, replayRevision, start };
         windowEnd = wholeTrack ? Infinity : start + ASS_WINDOW_DURATION_SECONDS;
         windowFailures = 0;
         textFailures = 0;
@@ -928,6 +934,7 @@ export function useASSSubtitles(
     sourceGeneration,
     rebuild,
     transportRevision,
+    replayRevision,
   ]);
 
   // A retime of the track on screen (subtitle sync, a timing reset) loads the

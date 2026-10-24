@@ -1280,6 +1280,51 @@ describe("useASSSubtitles bounded retry/watchdog policy", () => {
     expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2);
   });
 
+  it("starts from the playhead when a replay bump accompanies a transport rebuild", async () => {
+    const state = vi.fn();
+    const videoRef = makeVideoRef(1);
+    const requested: string[] = [];
+    vi.mocked(fetch).mockImplementation((input, init) => {
+      requested.push(String(input));
+      return abortAwareResponse("[Script Info]", init);
+    });
+    videoRef.current!.currentTime = 1021;
+    const { rerender } = renderHook(
+      ({ transportRevision, replayRevision }) =>
+        useASSSubtitles(
+          videoRef,
+          [germanTrack],
+          6,
+          false,
+          0,
+          0,
+          state,
+          undefined,
+          0,
+          "contain",
+          { x: 0, y: 0 },
+          0,
+          transportRevision,
+          replayRevision,
+        ),
+      { initialProps: { transportRevision: 0, replayRevision: 0 } },
+    );
+
+    await waitFor(() => expect(state).toHaveBeenLastCalledWith("ready"));
+    expect(requested[0]).toContain("position=1001&duration=120");
+
+    // The replay keeps the URL and source generation but starts at zero. The
+    // transport rebuild alone would reuse the old window; the explicit replay
+    // epoch must win.
+    videoRef.current!.currentTime = 0;
+    await act(async () => {
+      rerender({ transportRevision: 1, replayRevision: 1 });
+    });
+
+    await waitFor(() => expect(requested).toHaveLength(2));
+    expect(requested[1]).toContain("position=0&duration=120");
+  });
+
   it("reconciles a resumed window once the playhead becomes authoritative", async () => {
     const state = vi.fn();
     const videoRef = makeVideoRef(1);

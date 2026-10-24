@@ -1661,6 +1661,72 @@ describe("usePlaybackSession output capability changes", () => {
   });
 });
 
+describe("usePlaybackSession replay revision", () => {
+  it("bumps only when a new session starts at the beginning", async () => {
+    let sessionCount = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        const body = JSON.parse(String(init?.body)) as { start_position?: number };
+        sessionCount += 1;
+        const position = body.start_position ?? 0;
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: `session-${sessionCount}`,
+            playback_plan: fixturePlanV3({
+              session_id: `session-${sessionCount}`,
+              timeline: { ...fixturePlanV3().timeline, player_start_seconds: position },
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return jsonResponse({ outcome: "stopped" });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, rerender, unmount } = renderHook(
+      ({
+        requestKey,
+        initialPosition,
+        forceInitialPosition,
+      }: {
+        requestKey: string;
+        initialPosition: number;
+        forceInitialPosition: boolean;
+      }) =>
+        usePlaybackSession(requestKey, [], [], 7, initialPosition, forceInitialPosition, "auto"),
+      {
+        wrapper,
+        initialProps: {
+          requestKey: "episode-1",
+          initialPosition: 120,
+          forceInitialPosition: false,
+        },
+      },
+    );
+    await waitFor(() => expect(result.current.sessionId).toBe("session-1"));
+    expect(result.current.replayRevision).toBe(0);
+
+    // A resume at a non-zero position is a continuation, not a replay.
+    rerender({ requestKey: "episode-2", initialPosition: 240, forceInitialPosition: false });
+    await waitFor(() => expect(result.current.sessionId).toBe("session-2"));
+    expect(result.current.replayRevision).toBe(0);
+
+    // A new session at the beginning is a replay.
+    rerender({ requestKey: "episode-3", initialPosition: 0, forceInitialPosition: true });
+    await waitFor(() => expect(result.current.sessionId).toBe("session-3"));
+    expect(result.current.replayRevision).toBe(1);
+
+    unmount();
+  });
+});
+
 describe("usePlaybackSession version switches", () => {
   it("clears and stops the previous session when a new request ends terminally", async () => {
     let startCount = 0;

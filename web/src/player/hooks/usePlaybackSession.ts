@@ -136,6 +136,13 @@ interface PlaybackSessionState {
    */
   planRevision: number;
   transportRevision: number;
+  /**
+   * Bumped when a new playback session starts at the beginning. Consumers that
+   * remember transport-local state can discard it: the same URL and source
+   * generation can be reused for a replay from zero, where a remembered
+   * playhead is stale.
+   */
+  replayRevision: number;
   streamUrl: string | null;
   sessionId: string | null;
   playbackAttemptId: string | null;
@@ -930,6 +937,7 @@ function planToSessionState(
   playbackAttemptId: string,
   planRevision: number,
   transportRevision: number,
+  replayRevision: number,
   qualityPreference: string,
   shouldAutoPlay: boolean,
   autoFallback: boolean,
@@ -939,6 +947,7 @@ function planToSessionState(
     plan,
     planRevision,
     transportRevision,
+    replayRevision,
     streamUrl: buildPlayerStreamUrl(config.apiBaseUrl, plan.stream.url, config.getAccessToken()),
     sessionId,
     playbackAttemptId,
@@ -1099,6 +1108,7 @@ export function usePlaybackSession(
     plan: null,
     planRevision: 0,
     transportRevision: 0,
+    replayRevision: 0,
     streamUrl: null,
     sessionId: null,
     playbackAttemptId: null,
@@ -1139,6 +1149,7 @@ export function usePlaybackSession(
   const planRef = useRef<PlanV3 | null>(null);
   const planRevisionRef = useRef(0);
   const transportRevisionRef = useRef(0);
+  const replayRevisionRef = useRef(0);
   const serverFeaturesRef = useRef<string[]>([]);
   const stateRef = useRef(state);
   // Set as soon as the server says an administrator ended the session, before
@@ -1677,6 +1688,7 @@ export function usePlaybackSession(
           playbackAttemptIdRef.current ?? "",
           planRevisionRef.current,
           transportRevisionRef.current,
+          replayRevisionRef.current,
           qualityRef.current,
           playbackPlayingRef.current,
           current.autoFallback,
@@ -1939,6 +1951,16 @@ export function usePlaybackSession(
       // replacement nulls the ref in the same tick, and the replacement must be
       // treated as a fresh start rather than a replacement of the dead plan.
       const hasExistingSession = !!previousSessionId && !!previousState.streamUrl;
+      // A new session at the start is a replay, not a continuation. The URL
+      // and source generation can be identical to the previous session, so
+      // transport-local consumers need this separate epoch to discard state
+      // that belongs to the old playhead.
+      if (
+        position <= 0 &&
+        (hasExistingSession || hasAdoptedPlanRef.current || forceStartPosition)
+      ) {
+        replayRevisionRef.current += 1;
+      }
       const loadSequence = ++loadSequenceRef.current;
       const previousAttempt = {
         playbackAttemptId: playbackAttemptIdRef.current,
