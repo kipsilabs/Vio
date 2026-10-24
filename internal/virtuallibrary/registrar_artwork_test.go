@@ -14,12 +14,15 @@ func TestSeasonImageInputsDeduplicatesBySeason(t *testing.T) {
 			{Season: 1, Episode: 2, SeasonPosterPath: "tvdb://seasons/1.jpg", SeasonPosterSourcePath: "tvdb://seasons/1.jpg"},
 			{Season: 2, Episode: 1, SeasonPosterPath: "tvdb://seasons/2.jpg", SeasonPosterSourcePath: "tvdb://seasons/2.jpg"},
 		},
+	}, map[int]string{
+		1: "legacy-season-one",
+		2: "season-tvdb-42-2",
 	})
 
 	if len(inputs) != 2 {
 		t.Fatalf("inputs = %+v, want one job per season", inputs)
 	}
-	if inputs[0].TargetContentID != "season-tvdb-42-1" || inputs[0].ProviderID != "tvdb" || inputs[0].ProviderContentID != "42" {
+	if inputs[0].TargetContentID != "legacy-season-one" || inputs[0].ProviderID != "tvdb" || inputs[0].ProviderContentID != "42" {
 		t.Fatalf("season 1 input = %+v", inputs[0])
 	}
 	if inputs[1].TargetContentID != "season-tvdb-42-2" || inputs[1].SourcePath != "tvdb://seasons/2.jpg" {

@@ -176,17 +176,37 @@ func (r *catalogMonitorRegistrar) EnqueueArtwork(ctx context.Context, contentID 
 		return err
 	}
 	if seasonEnqueuer, ok := r.artwork.(librarySeasonArtworkEnqueuer); ok && item.MediaType == "series" {
-		if inputs := seasonImageInputs(contentID, item); len(inputs) > 0 {
+		if inputs := r.seasonImageInputs(ctx, contentID, item); len(inputs) > 0 {
 			return seasonEnqueuer.EnqueueLibrarySeasonImages(ctx, contentID, inputs)
 		}
 	}
 	return nil
 }
 
+func (r *catalogMonitorRegistrar) seasonImageInputs(ctx context.Context, seriesID string, item monitor.MonitoredMedia) []metadata.EnqueueImageCacheJobInput {
+	if r.registrar == nil {
+		return nil
+	}
+	numbers := make([]int, 0, len(item.Episodes))
+	seen := make(map[int]bool, len(item.Episodes))
+	for _, episode := range item.Episodes {
+		if episode.Season <= 0 || seen[episode.Season] {
+			continue
+		}
+		seen[episode.Season] = true
+		numbers = append(numbers, episode.Season)
+	}
+	seasonIDs, err := r.registrar.SeasonContentIDs(ctx, seriesID, numbers)
+	if err != nil {
+		return nil
+	}
+	return seasonImageInputs(seriesID, item, seasonIDs)
+}
+
 // seasonImageInputs builds one cache job per season poster. Registration is
 // episode-based, so the same season poster is repeated across its episodes;
 // deduplicate by season before enqueuing.
-func seasonImageInputs(seriesID string, item monitor.MonitoredMedia) []metadata.EnqueueImageCacheJobInput {
+func seasonImageInputs(seriesID string, item monitor.MonitoredMedia, seasonIDs map[int]string) []metadata.EnqueueImageCacheJobInput {
 	seen := make(map[int]bool, len(item.Episodes))
 	inputs := make([]metadata.EnqueueImageCacheJobInput, 0, len(item.Episodes))
 	for _, episode := range item.Episodes {
@@ -197,14 +217,15 @@ func seasonImageInputs(seriesID string, item monitor.MonitoredMedia) []metadata.
 		if source == "" {
 			source = strings.TrimSpace(episode.SeasonPosterPath)
 		}
-		if source == "" {
+		targetID := strings.TrimSpace(seasonIDs[episode.Season])
+		if source == "" || targetID == "" {
 			continue
 		}
 		seen[episode.Season] = true
 		season := episode.Season
 		inputs = append(inputs, metadata.EnqueueImageCacheJobInput{
 			TargetType:        metadata.ImageCacheTargetSeason,
-			TargetContentID:   fmt.Sprintf("%s-%d", strings.Replace(seriesID, "series-", "season-", 1), season),
+			TargetContentID:   targetID,
 			SeriesID:          seriesID,
 			SourcePath:        source,
 			ProviderID:        artworkProviderID(source),
