@@ -926,6 +926,49 @@ describe("useSubtitleTracks", () => {
     expect(cue.line).toBe(50);
   });
 
+  it("repopulates live cues after a transport rebuild", async () => {
+    const liveTrack: PlayerSubtitleInfo = {
+      ...srtTrack,
+      live: true,
+      url: "",
+    };
+    const liveCues = [{ start: 0, end: 10, text: "live cue" }];
+    const videoRef = makeVideoRef(1);
+    videoRef.current!.currentTime = 1;
+    const { rerender } = renderHook(
+      ({ transportRevision }: { transportRevision: number }) =>
+        useSubtitleTracks(
+          videoRef,
+          [liveTrack],
+          1,
+          0,
+          0,
+          { current: 7200 },
+          { current: 0 },
+          liveCues,
+          "job-1",
+          0,
+          undefined,
+          undefined,
+          0,
+          0,
+          0,
+          transportRevision,
+          0,
+        ),
+      { initialProps: { transportRevision: 0 } },
+    );
+
+    await waitFor(() =>
+      expect(createdTracks[0]!.cues.map((cue) => cue.text)).toEqual(["live cue"]),
+    );
+
+    rerender({ transportRevision: 1 });
+    await waitFor(() =>
+      expect(createdTracks[1]!.cues.map((cue) => cue.text)).toEqual(["live cue"]),
+    );
+  });
+
   it("renders decoded cue text and preserves literal angle brackets", async () => {
     fetchMock.mockResolvedValue(
       vttResponse(

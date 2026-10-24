@@ -72,6 +72,17 @@ Fish <3 U > 2 hearts
     expect(cues[0]!.text).toBe("Bold and italic class speaker\nFish <3 U > 2 hearts");
   });
 
+  it("strips SRT font markup copied into the WebVTT stream", () => {
+    const vtt = `WEBVTT
+
+00:00:01.000 --> 00:00:04.000
+<font color="#ffffff">Colored line</font>
+`;
+    const cues = parseVTT(vtt);
+    expect(cues).toHaveLength(1);
+    expect(cues[0]!.text).toBe("Colored line");
+  });
+
   it("decodes named, numeric, and hex character entities", () => {
     const vtt = `WEBVTT
 
