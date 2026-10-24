@@ -1767,7 +1767,12 @@ func upsertVirtualEpisode(ctx context.Context, tx pgx.Tx, seriesID string, folde
 			air_date=CASE WHEN $9 THEN COALESCE(EXCLUDED.air_date,seasons.air_date) ELSE seasons.air_date END,
 			poster_path=CASE WHEN $9 AND EXCLUDED.poster_path<>'' THEN EXCLUDED.poster_path ELSE seasons.poster_path END,
 			poster_source_path=CASE WHEN $9 AND EXCLUDED.poster_source_path<>'' THEN EXCLUDED.poster_source_path ELSE seasons.poster_source_path END,
-			poster_thumbhash=CASE WHEN $9 AND EXCLUDED.poster_thumbhash<>'' THEN EXCLUDED.poster_thumbhash ELSE seasons.poster_thumbhash END,
+			poster_thumbhash=CASE
+				WHEN $9 AND EXCLUDED.poster_path<>''
+				  AND (EXCLUDED.poster_thumbhash<>'' OR EXCLUDED.poster_path IS DISTINCT FROM seasons.poster_path)
+				THEN EXCLUDED.poster_thumbhash
+				ELSE seasons.poster_thumbhash
+			END,
 			updated_at=CASE WHEN $9 THEN NOW() ELSE seasons.updated_at END
 		RETURNING content_id`,
 		seasonID, seriesID, ep.SeasonNumber, fmt.Sprintf("Season %d", ep.SeasonNumber), nullTime(ep.AirDate),

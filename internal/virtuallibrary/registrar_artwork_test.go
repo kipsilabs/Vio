@@ -6,6 +6,27 @@ import (
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary/monitor"
 )
 
+func TestSeasonImageInputsDeduplicatesBySeason(t *testing.T) {
+	inputs := seasonImageInputs("series-tvdb-42", monitor.MonitoredMedia{
+		TVDBID: "42",
+		Episodes: []monitor.VirtualEpisode{
+			{Season: 1, Episode: 1, SeasonPosterPath: "tvdb://seasons/1.jpg", SeasonPosterSourcePath: "tvdb://seasons/1.jpg"},
+			{Season: 1, Episode: 2, SeasonPosterPath: "tvdb://seasons/1.jpg", SeasonPosterSourcePath: "tvdb://seasons/1.jpg"},
+			{Season: 2, Episode: 1, SeasonPosterPath: "tvdb://seasons/2.jpg", SeasonPosterSourcePath: "tvdb://seasons/2.jpg"},
+		},
+	})
+
+	if len(inputs) != 2 {
+		t.Fatalf("inputs = %+v, want one job per season", inputs)
+	}
+	if inputs[0].TargetContentID != "season-tvdb-42-1" || inputs[0].ProviderID != "tvdb" || inputs[0].ProviderContentID != "42" {
+		t.Fatalf("season 1 input = %+v", inputs[0])
+	}
+	if inputs[1].TargetContentID != "season-tvdb-42-2" || inputs[1].SourcePath != "tvdb://seasons/2.jpg" {
+		t.Fatalf("season 2 input = %+v", inputs[1])
+	}
+}
+
 func TestVirtualMediaRegistrationCarriesSeasonPoster(t *testing.T) {
 	payload := virtualMediaRegistration(monitor.MonitoredMedia{
 		MediaType: "series",
