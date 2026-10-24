@@ -4061,6 +4061,16 @@ export function VideoPlayer({
   // rather than following the setting upward.
   const bottomGroupPositionStyle: CSSProperties =
     subtitleSettings.position === "top" ? { top: "auto", bottom: "7%" } : subtitlePositionStyle;
+  // When the viewer selected Top, the measured position style already accounts
+  // for the rendered video rectangle and letterboxing. Use it for the top band
+  // instead of the fallback percentage. Explicit bottom-line cues still use a
+  // bottom anchor, and lift clear of the controls even under Top preference.
+  const topGroupPositionStyle: CSSProperties =
+    subtitleSettings.position === "top"
+      ? { ...containerStyle, ...subtitlePositionStyle }
+      : { top: "10%" };
+  const bottomGroupLiftPx =
+    subtitleSettings.position === "top" ? subtitleHudInsetPx : subtitleLiftPx;
 
   // -- ASS/SSA subtitle rendering via JASSUB (client-side libass) --
   const { isActive: isASSActive } = useASSSubtitles(
@@ -5998,11 +6008,11 @@ export function VideoPlayer({
                     ? {
                         ...containerStyle,
                         ...bottomGroupPositionStyle,
-                        transform: `translateY(-${subtitleLiftPx}px)`,
+                        transform: `translateY(-${bottomGroupLiftPx}px)`,
                         transition: "transform 200ms ease",
                       }
                     : group === "top"
-                      ? { top: "10%" }
+                      ? topGroupPositionStyle
                       : undefined
                 }
               >

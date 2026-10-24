@@ -38,7 +38,7 @@ const TIMESTAMP_RE = /^([\d:.]+)\s*-->\s*([\d:.]+)(.*)$/;
 // "Fish <3 U > 2 hearts" must survive parsing untouched, which a blanket
 // `<[^>]+>` strip cannot guarantee.
 const VTT_TAG_RE =
-  /<\/?(?:[biu]|ruby|rt)(?:\s+[^>]*)?>|<\/?(?:c|v|lang)(?:\.[^.\s>]+)*(?:\s+[^>]*)?>/gi;
+  /<\/?(?:[biu]|font|ruby|rt)(?:\s+[^>]*)?>|<\/?(?:c|v|lang)(?:\.[^.\s>]+)*(?:\s+[^>]*)?>/gi;
 
 const VTT_ENTITY_RE = /&(?:#(\d+)|#x([0-9a-fA-F]+)|(amp|lt|gt|nbsp|quot|apos));/g;
 

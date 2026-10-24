@@ -998,7 +998,22 @@ export function useSubtitleTracks(
           : [],
       );
     }
-  }, [liveCues, activeIsLive, activeSubtitleIndex, liveTrackKey, videoRef]);
+  }, [
+    liveCues,
+    activeIsLive,
+    activeSubtitleIndex,
+    activeUrl,
+    activeCodec,
+    activeLang,
+    liveTrackKey,
+    streamGeneration,
+    sourceGeneration,
+    cueRevision,
+    refreshRevision,
+    transportRevision,
+    replayRevision,
+    videoRef,
+  ]);
 
   return activeCues;
 }
