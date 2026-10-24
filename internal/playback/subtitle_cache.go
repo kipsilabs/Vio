@@ -595,31 +595,46 @@ type subtitleWindowCapture struct {
 	buf       bytes.Buffer
 	remaining int64
 	bytes     int64
+	// deliveryFailed records a response writer that has gone away. The
+	// extraction still owns the capture buffer, so keep filling it and stop
+	// touching dst; a disconnected leader must not abort a shared fill that
+	// waiting followers can consume.
+	deliveryFailed bool
 	// truncated marks a response that exceeded the capture bound. The buffer
 	// then holds a prefix, so it must never be stored as a complete slice.
 	truncated bool
 }
 
 func (w *subtitleWindowCapture) Write(p []byte) (int, error) {
-	n, err := w.dst.Write(p)
-	if n > 0 {
-		w.bytes += int64(n)
-		if w.remaining > 0 {
-			take := int64(n)
-			if take > w.remaining {
-				take = w.remaining
-				w.truncated = true
-			}
-			_, _ = w.buf.Write(p[:take])
-			w.remaining -= take
-		} else {
-			w.truncated = true
+	if !w.deliveryFailed {
+		n, err := w.dst.Write(p)
+		if err != nil || n < len(p) {
+			w.deliveryFailed = true
 		}
 	}
-	return n, err
+
+	// Count and retain every byte produced, including bytes a failed leader
+	// could not receive. Returning success is deliberate: copyAndFlush treats
+	// a write error as fatal and would kill ffmpeg before CommitWindow.
+	w.bytes += int64(len(p))
+	if w.remaining > 0 {
+		take := int64(len(p))
+		if take > w.remaining {
+			take = w.remaining
+			w.truncated = true
+		}
+		_, _ = w.buf.Write(p[:take])
+		w.remaining -= take
+	} else {
+		w.truncated = true
+	}
+	return len(p), nil
 }
 
 func (w *subtitleWindowCapture) Flush() {
+	if w.deliveryFailed {
+		return
+	}
 	if flusher, ok := w.dst.(http.Flusher); ok {
 		flusher.Flush()
 	}
