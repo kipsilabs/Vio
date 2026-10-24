@@ -10,6 +10,11 @@ import (
 	"github.com/Silo-Server/silo-server/internal/userstore"
 )
 
+const (
+	stableTypeMovie   = "movie"
+	stableTypeEpisode = "episode"
+)
+
 type itemLookup interface {
 	GetByID(ctx context.Context, contentID string) (*models.MediaItem, error)
 }
@@ -59,7 +64,7 @@ func (r *StableIdentityResolver) ResolveHistoryIdentity(ctx context.Context, med
 			seasonNumber := episode.SeasonNumber
 			episodeNumber := episode.EpisodeNumber
 			return userstore.WatchIdentity{
-				StableType:        "episode",
+				StableType:        stableTypeEpisode,
 				ProviderIDs:       episodeIDs,
 				SeriesProviderIDs: seriesIDs,
 				Season:            &seasonNumber,
@@ -72,7 +77,7 @@ func (r *StableIdentityResolver) ResolveHistoryIdentity(ctx context.Context, med
 		return userstore.WatchIdentity{}
 	}
 	item, err := r.items.GetByID(ctx, mediaItemID)
-	if err != nil || item == nil || item.Type != "movie" {
+	if err != nil || item == nil || item.Type != stableTypeMovie {
 		return userstore.WatchIdentity{}
 	}
 
@@ -81,7 +86,7 @@ func (r *StableIdentityResolver) ResolveHistoryIdentity(ctx context.Context, med
 		return userstore.WatchIdentity{}
 	}
 	return userstore.WatchIdentity{
-		StableType:  "movie",
+		StableType:  stableTypeMovie,
 		ProviderIDs: itemIDs,
 	}
 }
@@ -167,7 +172,7 @@ func (r *StableIdentityResolver) ResolveHistoryIdentities(ctx context.Context, m
 			seasonNumber := episode.SeasonNumber
 			episodeNumber := episode.EpisodeNumber
 			result[mediaItemID] = userstore.WatchIdentity{
-				StableType:        "episode",
+				StableType:        stableTypeEpisode,
 				ProviderIDs:       episodeIDs,
 				SeriesProviderIDs: seriesProviderIDs,
 				Season:            &seasonNumber,
@@ -180,7 +185,7 @@ func (r *StableIdentityResolver) ResolveHistoryIdentities(ctx context.Context, m
 			continue
 		}
 		item, err := r.items.GetByID(ctx, mediaItemID)
-		if err != nil || item == nil || item.Type != "movie" {
+		if err != nil || item == nil || item.Type != stableTypeMovie {
 			continue
 		}
 		itemIDs := providerIDMap(providerIDsByContent[mediaItemID])
@@ -188,7 +193,7 @@ func (r *StableIdentityResolver) ResolveHistoryIdentities(ctx context.Context, m
 			continue
 		}
 		result[mediaItemID] = userstore.WatchIdentity{
-			StableType:  "movie",
+			StableType:  stableTypeMovie,
 			ProviderIDs: itemIDs,
 		}
 	}
@@ -249,7 +254,7 @@ func (r *StableIdentityResolver) ResolveMovieContentID(ctx context.Context, prov
 	if r == nil || r.providerIDs == nil {
 		return "", nil
 	}
-	return r.providerIDs.FindContentIDByProviderIDs(ctx, providerIDs, "movie", "")
+	return r.providerIDs.FindContentIDByProviderIDs(ctx, providerIDs, stableTypeMovie, "")
 }
 
 func (r *StableIdentityResolver) ResolveEpisodeContentID(
