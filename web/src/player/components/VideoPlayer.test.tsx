@@ -176,25 +176,32 @@ const pgsHook = vi.hoisted(() => ({
   options: null as null | {
     activeSubtitleIndex: number | null;
     enabled: boolean;
+    subtitleUrls: PlayerSubtitleInfo[];
     sourceGeneration?: number;
     cueRevision?: number;
     transportRevision?: number;
     replayRevision?: number;
     refreshRevision?: number;
+    onSourceChanged?: () => void;
   },
 }));
 vi.mock("../hooks/usePGSSubtitles", () => ({
   usePGSSubtitles: (options: {
     activeSubtitleIndex: number | null;
     enabled: boolean;
+    subtitleUrls: PlayerSubtitleInfo[];
     sourceGeneration?: number;
     cueRevision?: number;
     transportRevision?: number;
     replayRevision?: number;
     refreshRevision?: number;
+    onSourceChanged?: () => void;
   }) => {
     pgsHook.options = options;
-    return { isActive: options.enabled && options.activeSubtitleIndex !== null };
+    const selected = options.subtitleUrls.find(
+      (track) => track.index === options.activeSubtitleIndex,
+    );
+    return { isActive: options.enabled && selected?.codec === "pgs" };
   },
 }));
 // The delay is the profile's saved offset; plain state stands in for the query.
@@ -346,9 +353,11 @@ const renderModePGS: PlayerSubtitleInfo = {
 
 describe("PGS render mode", () => {
   it("shows the bitmap canvas for a sidecar PGS track", async () => {
+    const onRefreshSubtitles = vi.fn();
     const { container, unmount } = renderPlayer({
       subtitleUrls: [renderModePGS],
       subtitleMode: "off",
+      onRefreshSubtitles,
     });
 
     act(() => {
@@ -362,7 +371,15 @@ describe("PGS render mode", () => {
     expect(pgsHook.options).toMatchObject({
       activeSubtitleIndex: 0,
       enabled: true,
+      sourceGeneration: 0,
+      cueRevision: 0,
+      transportRevision: 0,
+      replayRevision: 0,
+      refreshRevision: 0,
+      onSourceChanged: expect.any(Function),
     });
+    act(() => pgsHook.options?.onSourceChanged?.());
+    expect(onRefreshSubtitles).toHaveBeenCalledTimes(1);
 
     unmount();
   });

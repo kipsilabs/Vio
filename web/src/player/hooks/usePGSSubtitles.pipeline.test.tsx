@@ -122,11 +122,11 @@ beforeEach(() => {
     return rafCallbacks.length;
   });
   vi.stubGlobal("cancelAnimationFrame", vi.fn());
-  vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockImplementation(
-    (function (this: HTMLCanvasElement) {
-      return contextFor(this) as unknown as CanvasRenderingContext2D;
-    }) as unknown as typeof HTMLCanvasElement.prototype.getContext,
-  );
+  vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockImplementation(function (
+    this: HTMLCanvasElement,
+  ) {
+    return contextFor(this) as unknown as CanvasRenderingContext2D;
+  } as unknown as typeof HTMLCanvasElement.prototype.getContext);
 });
 
 afterEach(() => {
