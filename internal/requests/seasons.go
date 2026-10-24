@@ -201,14 +201,14 @@ func (s *Service) seriesSeasonSource(
 	}
 	if resolvedTVDBID == 0 && detail != nil && s.tvdbResolver != nil {
 		id, resolveErr := s.tvdbResolver.ResolveSeriesTVDBID(ctx, detail.ID, detail.IMDbID)
-		if resolveErr != nil {
-			if explicit == SeasonSourceTVDB {
-				return nil, resolvedTVDBID, false, false,
-					fmt.Errorf("%w: resolve TVDB id: %v", ErrSeasonSourceUnavailable, resolveErr)
-			}
+		switch {
+		case resolveErr != nil && explicit == SeasonSourceTVDB:
+			return nil, resolvedTVDBID, false, false,
+				fmt.Errorf("%w: resolve TVDB id: %w", ErrSeasonSourceUnavailable, resolveErr)
+		case resolveErr != nil:
 			slog.DebugContext(ctx, "requests: resolve series tvdb id for seasons failed", "component", "requests",
 				"tmdb_id", detail.ID, "err", resolveErr)
-		} else if id > 0 {
+		case id > 0:
 			resolvedTVDBID = id
 		}
 	}
@@ -229,7 +229,7 @@ func (s *Service) seriesSeasonSource(
 	if fetchErr != nil {
 		if explicit == SeasonSourceTVDB {
 			return nil, resolvedTVDBID, false, false,
-				fmt.Errorf("%w: %v", ErrSeasonSourceUnavailable, fetchErr)
+				fmt.Errorf("%w: %w", ErrSeasonSourceUnavailable, fetchErr)
 		}
 		slog.DebugContext(ctx, "requests: fetch tvdb seasons failed; using tmdb", "component", "requests",
 			"tvdb_id", resolvedTVDBID, "err", fetchErr)
