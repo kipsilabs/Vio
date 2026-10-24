@@ -108,14 +108,17 @@ type VirtualEpisode = virtualEpisode
 
 // monitoredMedia mirrors the virtual-library monitored item shape.
 type monitoredMedia struct {
-	Key                string           `json:"key"`
-	MediaType          string           `json:"media_type"`
-	Title              string           `json:"title"`
-	StreamID           string           `json:"stream_id,omitempty"`
-	IMDbID             string           `json:"imdb_id,omitempty"`
-	TMDBID             string           `json:"tmdb_id,omitempty"`
-	TVDBID             string           `json:"tvdb_id,omitempty"`
-	SourceKey          string           `json:"source_key,omitempty"`
+	Key       string `json:"key"`
+	MediaType string `json:"media_type"`
+	Title     string `json:"title"`
+	StreamID  string `json:"stream_id,omitempty"`
+	IMDbID    string `json:"imdb_id,omitempty"`
+	TMDBID    string `json:"tmdb_id,omitempty"`
+	TVDBID    string `json:"tvdb_id,omitempty"`
+	SourceKey string `json:"source_key,omitempty"`
+	// MetadataSource is the per-request metadata provider choice ("tvdb" or
+	// "tmdb"); empty follows the library provider chain.
+	MetadataSource     string           `json:"metadata_source,omitempty"`
 	MediaFolderID      int              `json:"media_folder_id,omitempty"`
 	Year               int32            `json:"year,omitempty"`
 	Runtime            int              `json:"runtime,omitempty"`

@@ -109,16 +109,18 @@ type RequestMediaDetail struct {
 	LibraryContentID    string                   `json:"library_content_id,omitempty" doc:"The catalog item when the media is available"`
 	Request             RequestMediaState        `json:"request"`
 	InWatchlist         bool                     `json:"in_watchlist" doc:"Whether the title is on the viewing profile's watchlist, as a watchlist title or through its catalog item" example:"false"`
-	Seasons             []RequestMediaSeason     `json:"seasons" doc:"Series: the regular seasons (specials excluded) with library availability and request coverage; empty for movies"`
+	Seasons             []RequestMediaSeason     `json:"seasons" doc:"Series: the regular seasons (specials excluded) from the series metadata provider, with library availability and request coverage; empty for movies"`
+	SeasonSource        string                   `json:"season_source,omitempty" doc:"Series: the metadata provider that supplied the season list: tvdb or tmdb" example:"tvdb"`
 }
 
 // RequestMediaSeason is one season of a series on its detail document.
 type RequestMediaSeason struct {
 	SeasonNumber int    `json:"season_number" example:"2"`
 	Name         string `json:"name,omitempty" example:"Season 2"`
-	EpisodeCount int    `json:"episode_count" doc:"Episodes TMDB lists for the season, aired or not" example:"10"`
+	EpisodeCount int    `json:"episode_count" doc:"Episodes the series metadata provider lists for the season, aired or not" example:"10"`
 	AirDate      string `json:"air_date,omitempty" doc:"Calendar date, YYYY-MM-DD" example:"2025-01-17"`
-	PosterPath   string `json:"poster_path,omitempty" doc:"TMDB image path"`
+	PosterPath   string `json:"poster_path,omitempty" doc:"TMDB image path, when available"`
+	PosterURL    string `json:"poster_url,omitempty" doc:"Absolute artwork URL when the series metadata provider supplies one"`
 	Availability string `json:"availability" enum:"missing,partial,available" doc:"Whether every aired episode is in the library" example:"partial"`
 	Requested    bool   `json:"requested" doc:"The title's active request covers this season"`
 }
@@ -266,6 +268,7 @@ type MediaRequestCreate struct {
 	PosterPath   string `json:"poster_path,omitempty" doc:"TMDB image path"`
 	BackdropPath string `json:"backdrop_path,omitempty" doc:"TMDB image path"`
 	Seasons      []int  `json:"seasons,omitempty" maxItems:"200" doc:"Series only: the season numbers to request, starting at 1 (a season below 1 is refused). Omitted: every aired season not yet complete in the library" example:"[2,3]"`
+	SeasonSource string `json:"season_source,omitempty" enum:"tvdb,tmdb" doc:"Series only: use TVDB or TMDB season numbering. Omitted: the server prefers TVDB" example:"tvdb"`
 }
 
 // MediaRequestCreateInput is the createRequest request.
@@ -304,10 +307,20 @@ type RequestMediaPageOutput struct {
 	Body RequestMediaPage
 }
 
-// RequestMediaDetailInput names one piece of media.
+// RequestMediaDetailInput names one piece of media. Follow and unfollow share
+// the identity but have no season source, so the detail read uses its own
+// input rather than publishing an unused query parameter on both.
 type RequestMediaDetailInput struct {
 	MediaType string `path:"media_type" enum:"movie,series" doc:"The media type" example:"movie"`
 	TMDBID    int    `path:"tmdb_id" minimum:"1" doc:"TMDB identifier (external, not a Vio ID)" example:"949"`
+}
+
+// RequestMediaDetailWithSourceInput is the detail read, which also accepts an
+// explicit season numbering source.
+type RequestMediaDetailWithSourceInput struct {
+	MediaType    string `path:"media_type" enum:"movie,series" doc:"The media type" example:"movie"`
+	TMDBID       int    `path:"tmdb_id" minimum:"1" doc:"TMDB identifier (external, not a Vio ID)" example:"949"`
+	SeasonSource string `query:"season_source" enum:"tvdb,tmdb" doc:"Series only: return TVDB or TMDB season numbering. Omitted: the server prefers TVDB" example:"tvdb"`
 }
 
 // RequestMediaDetailOutput is the getRequestMediaDetail response.
@@ -517,6 +530,7 @@ func (reg *Registry) createRequest(ctx context.Context, in *MediaRequestCreateIn
 		PosterPath:   in.Body.PosterPath,
 		BackdropPath: in.Body.BackdropPath,
 		Seasons:      in.Body.Seasons,
+		SeasonSource: in.Body.SeasonSource,
 	})
 	if err != nil {
 		return nil, requestProblem(ctx, err)
@@ -614,12 +628,12 @@ func (reg *Registry) searchRequestMedia(ctx context.Context, in *RequestMediaSea
 }
 
 // getRequestMediaDetail is v1 GET /requests/detail/{media_type}/{tmdb_id}.
-func (reg *Registry) getRequestMediaDetail(ctx context.Context, in *RequestMediaDetailInput) (*RequestMediaDetailOutput, error) {
+func (reg *Registry) getRequestMediaDetail(ctx context.Context, in *RequestMediaDetailWithSourceInput) (*RequestMediaDetailOutput, error) {
 	svc, viewer, p := reg.requestViewer(ctx)
 	if p != nil {
 		return nil, p
 	}
-	detail, err := svc.GetDetail(ctx, viewer, mediarequests.MediaType(in.MediaType), in.TMDBID)
+	detail, err := svc.GetDetailWithSeasonSource(ctx, viewer, mediarequests.MediaType(in.MediaType), in.TMDBID, in.SeasonSource)
 	if err != nil {
 		return nil, requestProblem(ctx, err)
 	}
@@ -1004,7 +1018,7 @@ func requestMediaDetailOf(d *mediarequests.MediaDetail) RequestMediaDetail {
 		Networks: NonNil(d.Networks), Cast: cast, Director: d.Director, Creators: NonNil(d.Creators),
 		Recommendations: requestMediaResultsOf(d.Recommendations), Availability: string(d.Availability),
 		LibraryContentID: d.LibraryContentID, Request: requestMediaStateOf(d.Request),
-		Seasons: requestMediaSeasonsOf(d.Seasons),
+		Seasons: requestMediaSeasonsOf(d.Seasons), SeasonSource: d.SeasonSource,
 	}
 }
 
@@ -1013,7 +1027,7 @@ func requestMediaSeasonsOf(seasons []mediarequests.RequestSeason) []RequestMedia
 	for _, s := range seasons {
 		out = append(out, RequestMediaSeason{
 			SeasonNumber: s.Number, Name: s.Name, EpisodeCount: s.EpisodeCount, AirDate: s.AirDate,
-			PosterPath: s.PosterPath, Availability: string(s.Availability), Requested: s.Requested,
+			PosterPath: s.PosterPath, PosterURL: s.PosterURL, Availability: string(s.Availability), Requested: s.Requested,
 		})
 	}
 	return out

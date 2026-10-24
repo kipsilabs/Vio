@@ -32,6 +32,10 @@ type LibraryMetadataLookupOptions struct {
 	// MaxSeasons is the maximum number of seasons this call examines. Zero or
 	// a negative value means defaultLibraryLookupSeasons.
 	MaxSeasons int
+	// PreferredProvider restricts the lookup to one provider slug, such as
+	// "tvdb" or "tmdb". It lets a request override the library chain for its
+	// imported season numbering. Empty keeps the configured chain.
+	PreferredProvider string
 }
 
 // LibraryMetadataLookupResult is one lookup call's output.
@@ -88,7 +92,7 @@ func (s *MetadataService) FetchLibraryMetadata(
 	if err != nil {
 		return nil, err
 	}
-	metadata, err := s.lookupLibraryItemMetadata(ctx, folderID, item.Type, language, providerIDs)
+	metadata, err := s.lookupLibraryItemMetadata(ctx, folderID, item.Type, language, providerIDs, opts.PreferredProvider)
 	if err != nil {
 		if metadata == nil {
 			return nil, err
@@ -128,8 +132,9 @@ func (s *MetadataService) lookupLibraryItemMetadata(
 	itemType string,
 	language string,
 	providerIDs map[string]string,
+	preferredProvider string,
 ) (*MetadataResult, error) {
-	chain, err := s.resolveChainCached(ctx, folderID, itemType)
+	chain, err := s.resolveLibraryProviderChain(ctx, folderID, itemType, preferredProvider)
 	if err != nil {
 		return nil, err
 	}
@@ -224,7 +229,7 @@ func (s *MetadataService) lookupLibrarySeriesEpisodes(
 	providerIDs map[string]string,
 	result *LibraryMetadataLookupResult,
 ) error {
-	seasons, err := s.lookupLibrarySeasons(ctx, folderID, language, providerIDs)
+	seasons, err := s.lookupLibrarySeasons(ctx, folderID, language, providerIDs, opts.PreferredProvider)
 	if err != nil {
 		result.NextSeason = max(opts.AfterSeason, 0)
 		result.Complete = false
@@ -255,7 +260,7 @@ func (s *MetadataService) lookupLibrarySeriesEpisodes(
 		if err := ctx.Err(); err != nil {
 			return libraryPartialSeriesResult(result, accumulator, nextSeason, err)
 		}
-		outcome := s.lookupLibrarySeasonEpisodes(ctx, folderID, language, providerIDs, season)
+		outcome := s.lookupLibrarySeasonEpisodes(ctx, folderID, language, providerIDs, season, opts.PreferredProvider)
 		accumulateEpisodeResults(accumulator, outcome.episodes)
 		failures = append(failures, librarySeasonFailure(season, outcome)...)
 		if err := ctx.Err(); err != nil {
@@ -313,13 +318,63 @@ func librarySeasonFailure(season SeasonResult, outcome librarySeasonEpisodes) []
 // lookupLibrarySeasons lists the chain's seasons and reports provider
 // failures instead of treating a surviving provider's partial list as
 // authoritative.
+// resolveLibraryProviderChain applies an explicit request-level provider
+// choice. A provider enabled in the chain wins directly; a provider that the
+// library chain leaves disabled for this level is still resolved from the
+// enabled installation list, so a request can use TVDB or TMDB independently
+// of the library's default season chain.
+func (s *MetadataService) resolveLibraryProviderChain(
+	ctx context.Context,
+	folderID int,
+	contentLevel string,
+	preferredProvider string,
+) ([]Provider, error) {
+	chain, err := s.resolveChainCached(ctx, folderID, contentLevel)
+	if err != nil || strings.TrimSpace(preferredProvider) == "" {
+		return chain, err
+	}
+	if filtered := filterProviderChain(chain, preferredProvider); len(filtered) > 0 {
+		return filtered, nil
+	}
+	if s.chainRepo == nil {
+		return chain, nil
+	}
+	all, err := resolveEnabledProvidersByPriority(
+		ctx, contentLevel, s.pluginResolver, s.chainRepo.pool, s.enabledChecker, nil,
+	)
+	if err != nil {
+		// The library's configured chain remains usable when the enabled-provider
+		// lookup fails; falling back is safer than failing the whole lookup.
+		return chain, nil //nolint:nilerr // keep the configured chain when the enabled-provider lookup fails
+	}
+	if filtered := filterProviderChain(all, preferredProvider); len(filtered) > 0 {
+		return filtered, nil
+	}
+	return chain, nil
+}
+
+func filterProviderChain(chain []Provider, preferredProvider string) []Provider {
+	preferredProvider = strings.ToLower(strings.TrimSpace(preferredProvider))
+	if preferredProvider == "" {
+		return chain
+	}
+	out := make([]Provider, 0, len(chain))
+	for _, provider := range chain {
+		if strings.ToLower(provider.Slug()) == preferredProvider {
+			out = append(out, provider)
+		}
+	}
+	return out
+}
+
 func (s *MetadataService) lookupLibrarySeasons(
 	ctx context.Context,
 	folderID int,
 	language string,
 	providerIDs map[string]string,
+	preferredProvider string,
 ) ([]SeasonResult, error) {
-	chain, err := s.resolveChainCached(ctx, folderID, "season")
+	chain, err := s.resolveLibraryProviderChain(ctx, folderID, "season", preferredProvider)
 	if err != nil {
 		return nil, err
 	}
@@ -376,8 +431,9 @@ func (s *MetadataService) lookupLibrarySeasonEpisodes(
 	language string,
 	providerIDs map[string]string,
 	season SeasonResult,
+	preferredProvider string,
 ) librarySeasonEpisodes {
-	chain, err := s.resolveChainCached(ctx, folderID, "episode")
+	chain, err := s.resolveLibraryProviderChain(ctx, folderID, "episode", preferredProvider)
 	if err != nil {
 		return librarySeasonEpisodes{outcome: libraryEpisodesPartial, err: err}
 	}

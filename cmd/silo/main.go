@@ -761,6 +761,13 @@ func main() {
 		return
 	}
 
+	if len(os.Args) > 1 && os.Args[1] == "episode-aliases" {
+		if err := runEpisodeAliasCommand(context.Background(), os.Args[2:], os.Stdout); err != nil {
+			log.Fatalf("episode-aliases: %v", err)
+		}
+		return
+	}
+
 	envFile := flag.String("env", ".env", "path to .env bootstrap file")
 	migrateOnly := flag.Bool("migrate-only", false, "apply database migrations and exit")
 	migrateStatus := flag.Bool("migrate-status", false, "show database migration status and exit")
@@ -3578,6 +3585,9 @@ func main() {
 		requestReconcileSvc.SetRequesterIdentityResolver(plugins.RequesterIdentityFromLookup(plugins.NewPgUserIdentityLookup(deps.DB)))
 		if metadataService != nil {
 			requestReconcileSvc.SetTVDBIDResolver(metadataService)
+			if source, ok := any(metadataService).(api.SeriesTVDBSeasonSource); ok {
+				requestReconcileSvc.SetSeriesSeasonProvider(api.NewSeriesSeasonProvider(source))
+			}
 		}
 		api.AttachRequestRouter(requestReconcileSvc, pluginService, vlSvc)
 		requestReconcileSvc.SetCatalogChangeNotifier(sections.InvalidateResolvedListCache)

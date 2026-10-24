@@ -393,20 +393,21 @@ func (r *Repository) insertRequest(
 			id, provider, media_type, tmdb_id, tvdb_id, imdb_id, title, year,
 			overview, poster_path, backdrop_path, status, outcome,
 			requested_by_user_id, requested_by_profile_id, is_anime, created_at, updated_at, approved_at,
-			routing_facts, seasons, source
+			routing_facts, seasons, source, season_source
 		)
 		VALUES (
 			$1, 'tmdb', $2, $3, $4, $5, $6, $7,
 			$8, $9, $10, $11, $12,
 			$13, $14, $15, $16, $16, $17,
-			$18, $19, $20
+			$18, $19, $20, $21
 		)
 		RETURNING `+requestColumns(), input.ID, input.Input.MediaType, input.Input.TMDBID, tvdbID,
 		strings.TrimSpace(input.Input.IMDbID), strings.TrimSpace(input.Input.Title), year,
 		strings.TrimSpace(input.Input.Overview), strings.TrimSpace(input.Input.PosterPath),
 		strings.TrimSpace(input.Input.BackdropPath), status, outcome,
 		input.Requester.UserID, input.Requester.ProfileID, input.IsAnime, now, approvedAt,
-		facts, nonNilSeasons(input.Input.Seasons), requestSource(input.Input.Source))
+		facts, nonNilSeasons(input.Input.Seasons), requestSource(input.Input.Source),
+		requestSeasonSource(input.Input.SeasonSource))
 	req, err := scanRequest(row)
 	if err != nil {
 		return nil, fmt.Errorf("insert request: %w", err)
@@ -1500,6 +1501,17 @@ func requestSource(source Source) Source {
 	return source
 }
 
+func requestSeasonSource(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case SeasonSourceTVDB:
+		return SeasonSourceTVDB
+	case SeasonSourceTMDB:
+		return SeasonSourceTMDB
+	default:
+		return ""
+	}
+}
+
 func requestSelectSQL() string {
 	return "SELECT " + requestColumns() + " FROM media_requests "
 }
@@ -1509,7 +1521,8 @@ func requestColumns() string {
 	        overview, poster_path, backdrop_path, status, outcome,
 	        requested_by_user_id, requested_by_profile_id, is_anime,
 	        last_error, created_at, updated_at, approved_at, completed_at,
-	        submit_attempts, submit_lease_until, next_submit_at, outcome_reason, routing_facts, seasons, source`
+	        submit_attempts, submit_lease_until, next_submit_at, outcome_reason, routing_facts, seasons, source,
+	        season_source`
 }
 
 type requestScanner interface {
@@ -1550,6 +1563,7 @@ func scanRequest(row requestScanner) (*Request, error) {
 		&rawFacts,
 		&req.Seasons,
 		&req.Source,
+		&req.SeasonSource,
 	); err != nil {
 		return nil, err
 	}

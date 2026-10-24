@@ -197,7 +197,13 @@ func (h *PlaybackHandler) realtimeStopHistory(parent context.Context, session *p
 	result := watchstate.PlaybackStopResult{HistoryID: receipt.HistoryID, FinalPositionSeconds: session.Position}
 	file, err := h.loadFileByPreferredID(ctx, requestedMediaFileID(session), session.MediaFileID)
 	if err == nil && file != nil {
-		result.MediaItemID = playbackProgressTarget(file)
+		targetID, targetErr := h.playbackProgressTarget(ctx, file)
+		if targetErr != nil {
+			slog.WarnContext(ctx, "failed to resolve canonical episode for realtime stop", "component", "api",
+				"session", session.ID, "error", targetErr)
+		} else {
+			result.MediaItemID = targetID
+		}
 		result.DurationSeconds = float64(file.Duration)
 		result.Completed = result.HistoryID != "" && !session.DisableProgressPersistence && result.DurationSeconds > 0 &&
 			session.Position/result.DurationSeconds > userstore.WatchedFraction(h.playbackThresholds(ctx).WatchedPct)
