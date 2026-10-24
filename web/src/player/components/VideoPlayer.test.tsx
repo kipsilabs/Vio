@@ -69,7 +69,17 @@ const subtitleTimeline = vi.hoisted(() => ({
   streamGeneration: 0,
   cueRevision: 0,
   assCueRevision: 0,
+  refreshRevision: 0,
   setLoadState: null as null | ((state: string) => void),
+  setASSLoadState: null as null | ((state: string) => void),
+  assActive: false,
+  activeCues: [] as Array<{
+    text: string;
+    align?: "left" | "center" | "right";
+    line?: "top" | "middle" | "bottom";
+    position?: number;
+    size?: number;
+  }>,
 }));
 const toastError = vi.hoisted(() => vi.fn());
 const toastInfo = vi.hoisted(() => vi.fn());
@@ -149,15 +159,17 @@ vi.mock("../hooks/useSubtitleTracks", () => ({
     subtitleTimeline.setLoadState = args[10] as (state: string) => void;
     subtitleHooks.vttSourceChanged = (args[11] as (() => void) | undefined) ?? null;
     subtitleTimeline.cueRevision = args[13] as number;
-    return [];
+    subtitleTimeline.refreshRevision = args[14] as number;
+    return subtitleTimeline.activeCues;
   },
 }));
 vi.mock("../hooks/useASSSubtitles", () => ({
   useASSSubtitles: (...args: unknown[]) => {
     subtitleTimeline.assOffsetSeconds = args[4] as number;
+    subtitleTimeline.setASSLoadState = args[6] as (state: string) => void;
     subtitleHooks.assSourceChanged = (args[7] as (() => void) | undefined) ?? null;
     subtitleTimeline.assCueRevision = args[11] as number;
-    return { isActive: false };
+    return { isActive: subtitleTimeline.assActive };
   },
 }));
 // The delay is the profile's saved offset; plain state stands in for the query.
@@ -5308,6 +5320,116 @@ describe("VideoPlayer subtitle sync", () => {
     act(() => subtitleTimeline.setLoadState?.("ready"));
     expect(indicator()).toHaveTextContent("Subtitles synced");
     expect(indicator()).toHaveTextContent("+2.3 s");
+  });
+});
+
+describe("VideoPlayer subtitle overlay", () => {
+  const track: PlayerSubtitleInfo = {
+    index: 0,
+    language: "en",
+    label: "English",
+    source: "external",
+    codec: "vtt",
+    sync_key: "external-" + "a".repeat(64),
+    url: "/api/v1/stream/session-1/subtitles/0.vtt?file_id=7",
+  };
+
+  const selectTrack = async () => {
+    await act(async () => {
+      (
+        controls.current as unknown as { onSubtitleSelect: (index: number) => void }
+      ).onSubtitleSelect(0);
+    });
+  };
+
+  const cueGroup = (text: string): HTMLElement => {
+    const group = screen.getByText(text).parentElement;
+    if (!group) throw new Error(`No group rendered for cue "${text}"`);
+    return group;
+  };
+
+  beforeEach(() => {
+    realtimeOptions.current = null;
+    controls.current = null;
+    subtitleTimeline.activeCues = [];
+    subtitleTimeline.assActive = false;
+    subtitleTimeline.refreshRevision = 0;
+    playerV2Mock.mockReset().mockResolvedValue({});
+    vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
+    vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
+    vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    subtitleTimeline.activeCues = [];
+    subtitleTimeline.assActive = false;
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("places top, middle and bottom cues in their own groups", () => {
+    subtitleTimeline.activeCues = [
+      { text: "Top caption", line: "top" },
+      { text: "Middle caption", line: "middle" },
+      { text: "Bottom caption", line: "bottom" },
+      // No line: the viewer's position setting (bottom in this suite) decides.
+      { text: "Setting caption" },
+    ];
+    renderPlayer();
+
+    expect(cueGroup("Top caption")).toHaveAttribute("data-subtitle-group", "top");
+    expect(cueGroup("Top caption").style.top).toBe("10%");
+    expect(cueGroup("Middle caption")).toHaveAttribute("data-subtitle-group", "middle");
+    expect(cueGroup("Middle caption")).toHaveClass("top-1/2", "-translate-y-1/2");
+    expect(cueGroup("Bottom caption")).toHaveAttribute("data-subtitle-group", "bottom");
+    expect(cueGroup("Setting caption")).toBe(cueGroup("Bottom caption"));
+    expect(cueGroup("Bottom caption").style.transform).toContain("translateY(");
+    expect(cueGroup("Bottom caption").style.top).toBe("");
+  });
+
+  it("aligns each cue by its source alignment", () => {
+    subtitleTimeline.activeCues = [
+      { text: "Left caption", line: "bottom", align: "left" },
+      { text: "Right caption", line: "bottom", align: "right" },
+      { text: "Centered caption", line: "bottom" },
+    ];
+    renderPlayer();
+
+    expect(screen.getByText("Left caption")).toHaveClass("self-start", "text-left");
+    expect(screen.getByText("Right caption")).toHaveClass("self-end", "text-right");
+    expect(screen.getByText("Centered caption")).toHaveClass("self-center", "text-center");
+  });
+
+  it("bounds a positioned cue by its size and stays inside the player", () => {
+    subtitleTimeline.activeCues = [
+      { text: "Positioned caption", line: "bottom", align: "left", position: 10, size: 40 },
+    ];
+    renderPlayer();
+
+    const cue = screen.getByText("Positioned caption");
+    expect(cue).toHaveStyle({ maxWidth: "40%", left: "10%" });
+  });
+
+  it("offers a retry for a text subtitle failure that rebuilds the track", async () => {
+    renderPlayer({ subtitleUrls: [track] });
+    await selectTrack();
+    act(() => subtitleTimeline.setLoadState?.("error"));
+
+    expect(screen.getByText("Subtitles couldn't load.")).toBeInTheDocument();
+    expect(subtitleTimeline.refreshRevision).toBe(0);
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(subtitleTimeline.refreshRevision).toBe(1);
+  });
+
+  it("shows an ASS subtitle failure without a retry action", async () => {
+    subtitleTimeline.assActive = true;
+    renderPlayer({ subtitleUrls: [track] });
+    await selectTrack();
+    act(() => subtitleTimeline.setASSLoadState?.("error"));
+
+    expect(screen.getByText("Subtitles couldn't load.")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
   });
 });
 
