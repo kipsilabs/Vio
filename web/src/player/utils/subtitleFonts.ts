@@ -150,6 +150,14 @@ export function fontBundleCacheKey(url: string): string {
   } catch {
     return url;
   }
+  // Attached fonts belong to the media file. The endpoint takes a track in
+  // its path, but every ASS track of one file resolves to the same bundle;
+  // keying by file_id lets the prefetch and the active track share one
+  // multi-megabyte download instead of fetching it once per track.
+  const fileID = parsed.searchParams.get("file_id")?.trim();
+  if (fileID) {
+    return `file:${fileID}`;
+  }
   parsed.searchParams.delete("embedded_stream_index");
   const qs = parsed.searchParams.toString();
   return qs ? `${parsed.pathname}?${qs}` : parsed.pathname;

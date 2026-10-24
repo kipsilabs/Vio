@@ -2709,8 +2709,35 @@ export function VideoPlayer({
     transportRevisionRef.current = effectiveTransportRevision;
     const controller = new AbortController();
     warmTransportUrlRef.current = url;
-    void fetch(url, { signal: controller.signal, method: "GET" }).catch(() => {});
-    return () => controller.abort();
+    // Ask only for a small prefix and cancel after the first chunk. A plain
+    // GET here downloads the whole remux (tens of megabytes per transport
+    // change) in parallel with the element that is about to play it, which
+    // wastes bandwidth and causes stalls. The first bytes are enough to start
+    // the server-side remux; the element's own load then shares that work.
+    const timer = setTimeout(() => controller.abort(), 2000);
+    void fetch(url, {
+      signal: controller.signal,
+      method: "GET",
+      headers: { Range: "bytes=0-65535" },
+    })
+      .then(async (response) => {
+        if (response.body) {
+          const reader = response.body.getReader();
+          try {
+            await reader.read();
+          } catch {
+            // Abort or a closed body: nothing left to warm.
+          }
+          await reader.cancel().catch(() => {});
+        }
+        controller.abort();
+      })
+      .catch(() => {})
+      .finally(() => clearTimeout(timer));
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
   }, [effectiveStreamUrl, effectiveTransportRevision, isPlayerReady, transportRevision]);
   // Read by the transport effect, which reruns on planRevision rather than on
   // every input the original-file route depends on.

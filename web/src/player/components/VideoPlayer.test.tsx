@@ -5790,7 +5790,11 @@ describe("VideoPlayer translation handoff", () => {
       expect(fetchMock).toHaveBeenCalledTimes(1);
       expect(fetchMock).toHaveBeenCalledWith(
         "/api/v1/stream/session-1?token=token",
-        expect.objectContaining({ method: "GET", signal: expect.any(AbortSignal) }),
+        expect.objectContaining({
+          method: "GET",
+          headers: { Range: "bytes=0-65535" },
+          signal: expect.any(AbortSignal),
+        }),
       );
 
       // The same transportRevision across a further plan revision must not
