@@ -3,6 +3,7 @@ package watchstate
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -176,7 +177,7 @@ func (r *HistoryReconciler) Run(ctx context.Context) (ReconcileStats, error) {
 // update waited.
 func (r *HistoryReconciler) rebindEpisodeHistory(ctx context.Context, newID string, userID int, id, currentItemID string) (bool, error) {
 	if r.begin == nil {
-		return false, fmt.Errorf("episode history transaction is not configured")
+		return false, errors.New("episode history transaction is not configured")
 	}
 	tx, err := r.begin(ctx)
 	if err != nil {
