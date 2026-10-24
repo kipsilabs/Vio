@@ -104,6 +104,16 @@ describe("VersionDropdown Refresh List", () => {
     makeVersion({ file_id: 2, resolution: "1080p" }),
   ];
 
+  it("opens for one version when a refresh action is available", () => {
+    const dialog = openPicker([makeVersion({ file_id: 1 })], {
+      onRefreshVersions: vi.fn(),
+      onCancelRefresh: vi.fn(),
+    });
+
+    // The picker renders the control above and below its rows.
+    expect(dialog.getAllByRole("button", { name: /Refresh List/ })).toHaveLength(2);
+  });
+
   it("renders a Refresh List control above and below the version rows", () => {
     const dialog = openPicker(versions, { onRefreshVersions: vi.fn() });
 

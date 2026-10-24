@@ -46,6 +46,7 @@ import {
 import { useQueryClient } from "@tanstack/react-query";
 import { useDeleteMediaItem } from "@/hooks/queries/items";
 import { usePreplayDiscovery } from "@/hooks/usePreplayDiscovery";
+import { useVersionListRefresh } from "@/hooks/useVersionListRefresh";
 import {
   awaitVirtualCandidatesRefresh,
   cancelVirtualCandidatesRefresh,
@@ -82,7 +83,7 @@ import StarRating from "@/components/StarRating";
 import { MediaActionIcon } from "@/components/mediaActionIcons";
 import { useWatchPlaybackController } from "@/playback/watchPlaybackContext";
 import { parseWatchHref } from "@/pages/watchRouteHelpers";
-import VersionDropdown from "./VersionDropdown";
+import VersionDropdown, { VersionRefreshRow } from "./VersionDropdown";
 import AudioTracksPopover from "./AudioTracksPopover";
 import SubtitlesPopover from "./SubtitlesPopover";
 
@@ -271,6 +272,8 @@ export interface ActionBarProps {
   /** Enables the admin "Seek Previews" action; the server must offer seek previews. */
   canManageTrickplay?: boolean;
   versions?: FileVersion[];
+  /** The item has a virtual source, even when no version is currently playable. */
+  hasVirtualSource?: boolean;
   playbackVariants?: PlaybackVariant[];
   selectedVersion?: FileVersion | null;
   onSelectVersion?: (version: FileVersion) => void;
@@ -344,6 +347,7 @@ export default function ActionBar({
   canEditMarkers = false,
   canManageTrickplay = false,
   versions,
+  hasVirtualSource = false,
   playbackVariants,
   selectedVersion,
   onSelectVersion,
@@ -398,11 +402,13 @@ export default function ActionBar({
   const showTrickplay = isAdmin && canManageTrickplay && !!contentId;
   const deleteMediaItem = useDeleteMediaItem();
   const queryClient = useQueryClient();
-  const virtualDetail = !!versions?.some((version) =>
-    /^virtual:\/\/(?:movie\/[^?]+|series\/[^?]+(?::\d+:\d+|\/\d+\/\d+))(?:\?|$)/.test(
-      version.file_path ?? "",
-    ),
-  );
+  const virtualDetail =
+    hasVirtualSource ||
+    !!versions?.some((version) =>
+      /^virtual:\/\/(?:movie\/[^?]+|series\/[^?]+(?::\d+:\d+|\/\d+\/\d+))(?:\?|$)/.test(
+        version.file_path ?? "",
+      ),
+    );
   const { discovering, failed: discoveryFailed } = usePreplayDiscovery(contentId, virtualDetail);
   const { awaitAdminJob } = useRealtimeEvents();
   // The item-page "Refresh List": start the async re-list job, wait for it to
@@ -426,6 +432,12 @@ export default function ActionBar({
     if (!contentId) return;
     await cancelVirtualCandidatesRefresh(contentId);
   }, [contentId]);
+  // A virtual item with no discovered version still needs the indexer search
+  // entry point; the version picker cannot carry it when there are no rows.
+  const standaloneRefresh = useVersionListRefresh(
+    virtualDetail && !selectedVersion ? handleRefreshVersions : undefined,
+    virtualDetail && !selectedVersion ? handleCancelRefresh : undefined,
+  );
   // The catalog version rows can omit the probed track inventory. Read the
   // selected file's watch detail and use its current audio/subtitle lists for
   // the pre-play menus, so the media page offers the same tracks as the player
@@ -1372,7 +1384,10 @@ export default function ActionBar({
       {/* flex-wrap matters: without it this row's min-content width (two or
           three nowrap trigger buttons) inflates the auto-sized hero column
           past narrow viewports, clipping the whole info column. */}
-      {(hasStreamControls || discovering || discoveryFailed) && (
+      {(hasStreamControls ||
+        discovering ||
+        discoveryFailed ||
+        (virtualDetail && !selectedVersion)) && (
         <div className="detail-stream-actions flex min-w-0 flex-wrap items-center gap-2">
           {discovering && (
             <span
@@ -1388,17 +1403,30 @@ export default function ActionBar({
               Versions unavailable. Retry with Play.
             </span>
           )}
-          {versions && hasMultipleVersions && selectedVersion && onSelectVersion && (
-            <VersionDropdown
-              versions={versions}
-              playbackVariants={playbackVariants}
-              selectedVersion={selectedVersionWithTracks}
-              onSelectVersion={onSelectVersion}
-              contentId={contentId}
-              onOpenChange={onVersionPickerOpenChange}
-              onRefreshVersions={contentId ? handleRefreshVersions : undefined}
-              onCancelRefresh={contentId ? handleCancelRefresh : undefined}
-            />
+          {versions &&
+            (hasMultipleVersions || virtualDetail) &&
+            selectedVersion &&
+            onSelectVersion && (
+              <VersionDropdown
+                versions={versions}
+                playbackVariants={playbackVariants}
+                selectedVersion={selectedVersionWithTracks}
+                onSelectVersion={onSelectVersion}
+                contentId={contentId}
+                onOpenChange={onVersionPickerOpenChange}
+                onRefreshVersions={contentId ? handleRefreshVersions : undefined}
+                onCancelRefresh={contentId ? handleCancelRefresh : undefined}
+              />
+            )}
+          {virtualDetail && !selectedVersion && contentId && (
+            <div className="w-44 shrink-0">
+              <VersionRefreshRow
+                refreshing={standaloneRefresh.refreshing}
+                cancelable={standaloneRefresh.cancelable}
+                error={standaloneRefresh.error}
+                onPress={standaloneRefresh.refresh}
+              />
+            </div>
           )}
           {selectedVersionWithTracks &&
             (selectedVersionWithTracks.audio_tracks?.length ?? 0) > 0 && (
