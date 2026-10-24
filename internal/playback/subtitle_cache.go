@@ -193,6 +193,11 @@ const (
 	// the leader; the cap stops a pathological run of failed leaders from
 	// wedging one request indefinitely.
 	subtitleWindowWaitRetries = 2
+	// subtitleWindowExtractTimeout bounds a coalesced window extraction after
+	// its leader disconnects. The extract runs detached from the leader's
+	// request context so waiting followers can still receive its committed
+	// result, but it cannot run forever.
+	subtitleWindowExtractTimeout = 2 * time.Minute
 	// subtitleExtractionFailureBaseCooldown is the first backoff after a
 	// retryable upstream extraction failure. It is deliberately longer than the
 	// typical client retry cadence (a few seconds) so the provider is not
@@ -685,6 +690,12 @@ func (c *SubtitleCache) serveWindowResult(w http.ResponseWriter, r *http.Request
 	slog.Log(r.Context(), slog.LevelDebug, "windowed subtitle served from last-good cache",
 		subtitleTraceAttrs(r.Context(), opts.SourceCodec, SubtitleTracePhaseServe, int64(len(data)), SubtitleTraceOutcomeCacheHit, -1,
 			"track", opts.TrackIndex, "format", format)...)
+	if format == subtitleFormatSUP {
+		// A cached .sup slice needs its type: the text path sets it before
+		// calling in, but the SUP path reaches the cache before writing any
+		// headers.
+		w.Header().Set("Content-Type", "application/octet-stream")
+	}
 	w.Header().Set("Cache-Control", "private, no-cache")
 	w.WriteHeader(http.StatusOK)
 	n, err := w.Write(data)
@@ -1040,11 +1051,14 @@ func (c *SubtitleCache) HasCommittedEntry(inputPath, cacheIdentity string, track
 // that fill and serves its committed entry rather than running a second full
 // demux; only when no fill can be owned does it fall back to an uncached
 // stream. Windowed requests (opts.AllowWindow): the output covers only a
-// slice of the track, so it is never cached; but when the full-track entry
-// already exists, the windowed extract runs against the small cached .sup
-// instead of re-demuxing the original file, and when it doesn't, a detached
-// background warm is kicked off so subsequent windows get that fast path. A
-// nil receiver disables caching and just streams.
+// slice of the track, so no full-track entry is committed from it; but when
+// the full-track entry already exists, the windowed extract runs against the
+// small cached .sup instead of re-demuxing the original file, and when it
+// doesn't, a detached background warm is kicked off so subsequent windows get
+// that fast path. The exact window is kept as an in-memory last-good copy,
+// identical concurrent windows coalesce onto one extract, and a retryable
+// upstream failure puts the identity in a short backoff. A nil receiver
+// disables caching and just streams.
 //
 // The caller sets any extra response headers (e.g. CORS) before calling.
 // The returned error is the extract error; cache hits return nil.
@@ -1133,13 +1147,43 @@ func (c *SubtitleCache) serveSUPEntry(w http.ResponseWriter, r *http.Request, op
 }
 
 // serveWindowedSUP streams a windowed slice of the track. The output is a
-// position-dependent slice so it is never cached itself, but the cache still
-// speeds it up: with a committed full-track entry the extract's input is
-// rewritten to the cached .sup (15-80 MB, so the -ss scan is near-instant
-// versus re-demuxing a multi-GB source); without one, a background warm is
-// started so later windows — the client re-fetches on every seek — hit the
-// fast path.
+// position-dependent slice, but the cache still speeds it up: with a committed
+// full-track entry the extract's input is rewritten to the cached .sup (15-80 MB,
+// so the -ss scan is near-instant versus re-demuxing a multi-GB source); without
+// one, a background warm is started so later windows — the client re-fetches on
+// every seek — hit the fast path.
+//
+// The exact window is also kept in memory as the last-good copy, so a repeat
+// after an upstream failure is served without re-running ffmpeg; identical
+// concurrent windows are coalesced into one extract; and a retryable upstream
+// failure puts the source identity in a short backoff. Retryable upstream
+// failures are retried in-request by runExtract before any bytes are written.
 func (c *SubtitleCache) serveWindowedSUP(w http.ResponseWriter, r *http.Request, opts StreamExtractOpts, extract SUPExtractFunc) error {
+	if err := r.Context().Err(); err != nil {
+		return err
+	}
+	start := time.Now()
+	// Compute the last-good window key before the committed-entry fast path
+	// rewrites InputPath to the cached .sup (and may re-anchor the seek). The
+	// key must stay on the original source identity and requested range so a
+	// window cached from the source matches the same window extracted from
+	// the artifact.
+	sourceOpts := opts
+	windowKey, _ := c.windowResultKey(opts, subtitleFormatSUP)
+	served, serveErr := c.serveWindowResult(w, r, opts, subtitleFormatSUP, windowKey)
+	if serveErr != nil {
+		// The 200 and part of the slice are already on the wire; serving or
+		// extracting again would corrupt the response.
+		return serveErr
+	}
+	if served {
+		return nil
+	}
+
+	// A committed full-track entry is the best last-good copy, so it is
+	// preferred over the failure backoff: an artifact-backed extract reads a
+	// local file and a previous provider failure does not apply to it.
+	artifactBacked := false
 	if cachedPath, _, ok := c.cachedEntryPath(opts.InputPath, opts.CacheIdentity, opts.TrackIndex); ok {
 		slog.DebugContext(r.Context(), "windowed subtitle extract using cached full track",
 			"input", opts.InputPath, "track", opts.TrackIndex, "cache_entry", cachedPath)
@@ -1148,16 +1192,111 @@ func (c *SubtitleCache) serveWindowedSUP(w http.ResponseWriter, r *http.Request,
 		if firstCue, err := readSupFirstCue(cachedPath); err == nil {
 			opts = windowFromCachedSup(opts, firstCue)
 		}
-	} else if !opts.DisableBackgroundWarm {
-		c.WarmInBackground(opts, extract, subtitleTraceRequestID(r.Context()))
+		artifactBacked = true
+	} else {
+		// No last-good copy: suppress an extract that is known to be inside
+		// its backoff window before any header or provider read, so the
+		// handler can answer 503 + Retry-After.
+		if retryAfter, cooling := c.extractionCoolingDown(sourceOpts, subtitleFormatSUP); cooling {
+			return &SubtitleExtractionRetryError{RetryAfter: retryAfter}
+		}
+		if !opts.DisableBackgroundWarm {
+			c.WarmInBackground(opts, extract, subtitleTraceRequestID(r.Context()))
+		}
+	}
+
+	// Coalesce identical in-flight windows: a duplicate request waits for the
+	// leader and serves the copy it stores instead of spawning a second ffmpeg.
+	// A failed leader leaves either a cached window or the failure backoff
+	// behind, both re-checked after the wait.
+	leader := false
+	for attempt := 0; windowKey != "" && attempt < subtitleWindowWaitRetries; attempt++ {
+		var wait <-chan struct{}
+		leader, wait = c.beginWindowFlight(windowKey)
+		if leader {
+			break
+		}
+		if err := c.waitForWindowFlight(r.Context(), wait); err != nil {
+			return err
+		}
+		served, serveErr := c.serveWindowResult(w, r, opts, subtitleFormatSUP, windowKey)
+		if serveErr != nil {
+			return serveErr
+		}
+		if served {
+			return nil
+		}
+		if !artifactBacked {
+			if retryAfter, cooling := c.extractionCoolingDown(sourceOpts, subtitleFormatSUP); cooling {
+				return &SubtitleExtractionRetryError{RetryAfter: retryAfter}
+			}
+		}
+	}
+	if leader {
+		// Every leader path — a re-check hit, success, failure, cancellation,
+		// or a write error — must release the flight so waiters proceed.
+		defer c.endWindowFlight(windowKey)
+		// A previous leader may have stored its slice between our lookup and
+		// our successful reservation; serve that instead of extracting again.
+		served, serveErr := c.serveWindowResult(w, r, opts, subtitleFormatSUP, windowKey)
+		if serveErr != nil {
+			return serveErr
+		}
+		if served {
+			return nil
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
 
-	opts.Writer = w
-	return extract(r.Context(), opts)
+	counter := &subtitleCountingWriter{w: w}
+	var writer io.Writer = counter
+	var capture *subtitleWindowCapture
+	if leader {
+		// Keep the successful slice as the last-good copy. The capture bound
+		// is per response, so a huge window is streamed but not retained.
+		capture = &subtitleWindowCapture{dst: counter, remaining: subtitleWindowResultMaxEntryBytes}
+		writer = capture
+	}
+	opts.Writer = writer
+	// A coalesced extraction belongs to the flight, not only to the leader
+	// request. Detach it from the leader's cancellation (bounded by the
+	// timeout) so a leader disconnect does not throw away work that waiters
+	// can still consume from the last-good cache.
+	extractCtx := r.Context()
+	if leader {
+		var cancel context.CancelFunc
+		extractCtx, cancel = context.WithTimeout(
+			context.WithoutCancel(r.Context()),
+			subtitleWindowExtractTimeout,
+		)
+		defer cancel()
+	}
+	err := c.runExtract(extractCtx, opts, extract, counter)
+	if err != nil {
+		if r.Context().Err() == nil && IsSubtitleUpstreamError(err) {
+			// Recorded against the original source identity (sourceOpts), not
+			// the rewritten cached-artifact path.
+			c.noteExtractionFailure(sourceOpts, subtitleFormatSUP)
+		}
+	} else {
+		c.noteExtractionSuccess(sourceOpts, subtitleFormatSUP)
+		if capture != nil && capture.bytes > 0 && !capture.truncated {
+			c.storeWindowResult(windowKey, sourceOpts, capture.buf.Bytes())
+		}
+	}
+	outcome := subtitleTraceOutcome(r.Context(), err)
+	level := slog.LevelInfo
+	if outcome != SubtitleTraceOutcomeSuccess {
+		level = slog.LevelWarn
+	}
+	slog.Log(r.Context(), level, "subtitle extract served",
+		subtitleTraceAttrs(r.Context(), opts.SourceCodec, subtitlePhaseForOutput(opts.SourceCodec, opts.TargetFormat),
+			counter.bytes, outcome, time.Since(start),
+			"track", opts.TrackIndex, "format", subtitleFormatSUP)...)
+	return err
 }
 
 // formatEntryKey computes the in-flight/cache key for a source identity,
