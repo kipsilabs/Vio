@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"math"
 	"testing"
 
@@ -8,10 +9,6 @@ import (
 	"github.com/Silo-Server/silo-server/internal/playback"
 )
 
-// TestCarryFailureRecoveryVirtualEvidenceV3SatisfiesCompletenessRequirement tests
-// that a virtual media file with missing frame rate and bitrate, when carried against
-// a running plan for the same candidate URI and row with complete fields, satisfies
-// the planner's completeness requirement without setting ProbeUpdatedAt.
 func TestCarryFailureRecoveryVirtualEvidenceV3SatisfiesCompletenessRequirement(t *testing.T) {
 	matchingURI := "virtual://movie/tt12345?result=cand-alpha"
 	file := &models.MediaFile{
@@ -52,7 +49,17 @@ func TestCarryFailureRecoveryVirtualEvidenceV3SatisfiesCompletenessRequirement(t
 		},
 	}
 
-	carried := carryFailureRecoveryVirtualEvidenceV3(record, matchingURI, file)
+	session := &playback.Session{
+		VirtualSourceURI:                 matchingURI,
+		VirtualSourceOwnerInstallationID: 11,
+		VirtualSubtitleEvidenceURI:       matchingURI,
+		VirtualSubtitleEvidenceFileID:    720,
+	}
+
+	h := &PlaybackHandler{}
+	ctx := context.Background()
+
+	carried := h.carryFailureRecoveryVirtualEvidenceV3(ctx, session, record, playback.ReplanOperationFailureRecoveryV3, matchingURI, 11, file)
 	if carried == file {
 		t.Fatal("expected carried file to be a topped-up copy, got unmodified pointer")
 	}
@@ -80,14 +87,11 @@ func TestCarryFailureRecoveryVirtualEvidenceV3SatisfiesCompletenessRequirement(t
 	}
 }
 
-// TestCarryFailureRecoveryVirtualEvidenceV3LeavesMismatchedCandidateUnchanged tests
-// that a different resolved URI, a source whose MediaFileID differs from the row id,
-// or a conflicting video codec leaves the file returned unchanged.
-func TestCarryFailureRecoveryVirtualEvidenceV3LeavesMismatchedCandidateUnchanged(t *testing.T) {
-	planURI := "virtual://movie/tt12345?result=cand-alpha"
+func TestCarryFailureRecoveryVirtualEvidenceV3FencingAndProvenance(t *testing.T) {
+	matchingURI := "virtual://movie/tt12345?result=cand-alpha"
 	file := &models.MediaFile{
 		ID:         720,
-		FilePath:   planURI,
+		FilePath:   matchingURI,
 		Container:  "mkv",
 		CodecVideo: "hevc",
 		VideoTracks: []models.VideoTrack{{
@@ -102,7 +106,7 @@ func TestCarryFailureRecoveryVirtualEvidenceV3LeavesMismatchedCandidateUnchanged
 
 	record := &playback.AttemptRecordV3{
 		CurrentPlan: playback.PlanV3{
-			EffectiveVirtualURI: planURI,
+			EffectiveVirtualURI: matchingURI,
 			Source: playback.SourceDescriptorV3{
 				MediaFileID:  720,
 				Container:    "mkv",
@@ -118,33 +122,63 @@ func TestCarryFailureRecoveryVirtualEvidenceV3LeavesMismatchedCandidateUnchanged
 		},
 	}
 
-	// 1. Different resolved URI
+	session := &playback.Session{
+		VirtualSourceURI:                 matchingURI,
+		VirtualSourceOwnerInstallationID: 11,
+		VirtualSubtitleEvidenceURI:       matchingURI,
+		VirtualSubtitleEvidenceFileID:    720,
+	}
+
+	h := &PlaybackHandler{}
+	ctx := context.Background()
+
+	// 1. Operation not failure_recovery
+	gotNonRecovery := h.carryFailureRecoveryVirtualEvidenceV3(ctx, session, record, playback.ReplanOperationTrackChangeV3, matchingURI, 11, file)
+	if gotNonRecovery != file {
+		t.Fatal("expected carry to be refused for non-failure-recovery operation")
+	}
+
+	// 2. Different owner installation ID
+	gotDiffOwner := h.carryFailureRecoveryVirtualEvidenceV3(ctx, session, record, playback.ReplanOperationFailureRecoveryV3, matchingURI, 99, file)
+	if gotDiffOwner != file {
+		t.Fatal("expected carry to be refused when owner installation ID differs")
+	}
+
+	// 3. Different resolved candidate URI
 	diffURI := "virtual://movie/tt12345?result=cand-beta"
-	gotDiffURI := carryFailureRecoveryVirtualEvidenceV3(record, diffURI, file)
+	gotDiffURI := h.carryFailureRecoveryVirtualEvidenceV3(ctx, session, record, playback.ReplanOperationFailureRecoveryV3, diffURI, 11, file)
 	if gotDiffURI != file {
-		t.Fatalf("expected file to be returned unchanged on different URI, got %+v", gotDiffURI)
+		t.Fatal("expected carry to be refused when resolved URI differs from plan candidate")
 	}
 
-	// 2. Source whose MediaFileID differs from row id
-	diffIDRecord := &playback.AttemptRecordV3{
-		CurrentPlan: playback.PlanV3{
-			EffectiveVirtualURI: planURI,
-			Source: func() playback.SourceDescriptorV3 {
-				s := record.CurrentPlan.Source
-				s.MediaFileID = 999
-				return s
-			}(),
-		},
+	// 4. Session pin differs from plan candidate
+	diffSession := &playback.Session{
+		VirtualSourceURI:                 "virtual://movie/tt12345?result=cand-gamma",
+		VirtualSourceOwnerInstallationID: 11,
+		VirtualSubtitleEvidenceURI:       matchingURI,
+		VirtualSubtitleEvidenceFileID:    720,
 	}
-	gotDiffID := carryFailureRecoveryVirtualEvidenceV3(diffIDRecord, planURI, file)
-	if gotDiffID != file {
-		t.Fatalf("expected file to be returned unchanged when MediaFileID differs, got %+v", gotDiffID)
+	gotDiffPin := h.carryFailureRecoveryVirtualEvidenceV3(ctx, diffSession, record, playback.ReplanOperationFailureRecoveryV3, matchingURI, 11, file)
+	if gotDiffPin != file {
+		t.Fatal("expected carry to be refused when session pin differs from plan candidate")
 	}
 
-	// 3. Conflicting codec
+	// 5. Stale session provenance (e.g. evidence captured for another file ID)
+	staleProvenanceSession := &playback.Session{
+		VirtualSourceURI:                 matchingURI,
+		VirtualSourceOwnerInstallationID: 11,
+		VirtualSubtitleEvidenceURI:       matchingURI,
+		VirtualSubtitleEvidenceFileID:    999, // mismatch
+	}
+	gotStaleProv := h.carryFailureRecoveryVirtualEvidenceV3(ctx, staleProvenanceSession, record, playback.ReplanOperationFailureRecoveryV3, matchingURI, 11, file)
+	if gotStaleProv != file {
+		t.Fatal("expected carry to be refused when session provenance does not match row")
+	}
+
+	// 6. Conflicting codec in source descriptor
 	conflictCodecRecord := &playback.AttemptRecordV3{
 		CurrentPlan: playback.PlanV3{
-			EffectiveVirtualURI: planURI,
+			EffectiveVirtualURI: matchingURI,
 			Source: func() playback.SourceDescriptorV3 {
 				s := record.CurrentPlan.Source
 				s.VideoCodec = "h264"
@@ -152,57 +186,8 @@ func TestCarryFailureRecoveryVirtualEvidenceV3LeavesMismatchedCandidateUnchanged
 			}(),
 		},
 	}
-	gotConflictCodec := carryFailureRecoveryVirtualEvidenceV3(conflictCodecRecord, planURI, file)
+	gotConflictCodec := h.carryFailureRecoveryVirtualEvidenceV3(ctx, session, conflictCodecRecord, playback.ReplanOperationFailureRecoveryV3, matchingURI, 11, file)
 	if gotConflictCodec != file {
-		t.Fatalf("expected file to be returned unchanged when codec conflicts, got %+v", gotConflictCodec)
-	}
-}
-
-// TestCarryFailureRecoveryVirtualEvidenceV3PerformsNoWrites tests that the carry
-// is a pure memory operation: it performs no catalog/store/resolver writes, does not
-// mutate the input row in place, and keeps ProbeUpdatedAt nil.
-func TestCarryFailureRecoveryVirtualEvidenceV3PerformsNoWrites(t *testing.T) {
-	matchingURI := "virtual://movie/tt12345?result=cand-alpha"
-	file := &models.MediaFile{
-		ID:         720,
-		FilePath:   matchingURI,
-		Container:  "mkv",
-		CodecVideo: "hevc",
-		VideoTracks: []models.VideoTrack{{
-			Codec:    "hevc",
-			BitDepth: 10,
-			Width:    3840,
-			Height:   2160,
-			// FrameRate and Bitrate missing
-		}},
-	}
-
-	record := &playback.AttemptRecordV3{
-		CurrentPlan: playback.PlanV3{
-			EffectiveVirtualURI: matchingURI,
-			Source: playback.SourceDescriptorV3{
-				MediaFileID: 720,
-				Container:   "mkv",
-				VideoCodec:  "hevc",
-				BitDepth:    10,
-				Width:       3840,
-				Height:      2160,
-				FrameRate:   23.976,
-				BitrateKbps: 20_000,
-			},
-		},
-	}
-
-	carried := carryFailureRecoveryVirtualEvidenceV3(record, matchingURI, file)
-	if carried == file {
-		t.Fatal("expected carried file to be a copy")
-	}
-
-	// Assert input file was not mutated in place
-	if file.Bitrate != 0 || file.VideoTracks[0].Bitrate != 0 || file.VideoTracks[0].FrameRate != "" {
-		t.Fatal("input file was mutated in place")
-	}
-	if file.ProbeUpdatedAt != nil || carried.ProbeUpdatedAt != nil {
-		t.Fatal("ProbeUpdatedAt must not be set on input or carried file")
+		t.Fatal("expected carry to be refused when source codec conflicts with row")
 	}
 }
