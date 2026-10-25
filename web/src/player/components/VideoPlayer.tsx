@@ -3174,12 +3174,6 @@ export function VideoPlayer({
                 return;
               }
 
-              // hls.js has already retried the request; a fatal network error
-              // on a stream that played means the server went away.
-              if (data.type === Hls.ErrorTypes.NETWORK_ERROR && reportConnectionLostRef.current()) {
-                return;
-              }
-
               // A stale-generation fence reaches hls.js as a fatal fragment
               // network error carrying the server's 412. The failing segment URL
               // was minted with an `sgen` token for an FFmpeg incarnation the
@@ -3188,12 +3182,17 @@ export function VideoPlayer({
               // that same URL can never succeed, so invalidate the cached
               // playlist and fetch it again: the fresh manifest rebuilds every
               // segment URL with the current token. This sits before the
-              // throttle/network-recovery budget because it is a deterministic
-              // redirect, not a transport failure.
+              // connection-lost branch and the throttle/network-recovery budget
+              // because it is a deterministic redirect, not a transport failure:
+              // once the stream has played, the reconnect path would otherwise
+              // take the 412 first and replan a healthy session.
               if (data.type === Hls.ErrorTypes.NETWORK_ERROR && isStaleGenerationError(data)) {
                 if (
                   hls &&
                   staleGenerationRecoveriesRef.current < MAX_STALE_GENERATION_RECOVERIES &&
+                  // hls.js `startPosition` is the player/playlist clock, the
+                  // same clock used for the initial HLS start. Do not add the
+                  // media timeline offset here.
                   recoverFromStaleGeneration(hls, video.currentTime)
                 ) {
                   staleGenerationRecoveriesRef.current++;
@@ -3203,6 +3202,12 @@ export function VideoPlayer({
                   });
                   return;
                 }
+              }
+
+              // hls.js has already retried the request; a fatal network error
+              // on a stream that played means the server went away.
+              if (data.type === Hls.ErrorTypes.NETWORK_ERROR && reportConnectionLostRef.current()) {
+                return;
               }
 
               const now = Date.now();

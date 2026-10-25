@@ -12,7 +12,7 @@ import {
   VIDEO_CLIENT_FEATURES_V3,
 } from "../playback-session-wire-v3";
 import { PLAN_INVALIDATED_DEFAULT_AUDIO_RECONCILIATION } from "../realtime-protocol";
-import type { PlayerAudioTrack } from "../types";
+import type { PlayerAudioTrack, PlayerFileVersion } from "../types";
 import type { SubtitleInventoryItemV3 } from "../protocol-v3";
 import {
   fixtureClientCapabilitiesV3,
@@ -11711,6 +11711,513 @@ describe("usePlaybackSession mid-stream reconnect", () => {
 
     act(() => result.current.recoverConnection(10, true));
     expect(result.current.connectionStatus).toBe("connected");
+
+    unmount();
+  });
+});
+
+describe("usePlaybackSession initial file selection", () => {
+  function version(overrides: Partial<PlayerFileVersion> & { file_id: number }): PlayerFileVersion {
+    return {
+      resolution: "",
+      codec_video: "",
+      codec_audio: "",
+      hdr: false,
+      container: "virtual",
+      file_size: 0,
+      duration: 0,
+      bitrate: 0,
+      ...overrides,
+    };
+  }
+
+  // The season-card route leaves `fileId` unset and its resume hint can point at
+  // the collapsed episode row (23_517) rather than the concrete candidate
+  // (23_519) that actually owns the tracks.
+  const neutralRow = version({
+    file_id: 23_517,
+    file_path: "virtual://series/tt0434665/17/1",
+  });
+  const concreteRow = version({
+    file_id: 23_519,
+    file_path: "virtual://series/tt0434665/17/1?result=23519",
+    resolution: "1080p",
+    codec_video: "h264",
+    codec_audio: "aac",
+    subtitle_tracks: [{ index: 0, language: "eng" }],
+  });
+
+  function captureStarts() {
+    const startBodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/playback/start")) {
+          startBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+          return jsonResponse(
+            {
+              protocol_version: 3,
+              server_features: ["playback_plan_v3"],
+              outcome: "playable",
+              session_id: "session-1",
+              playback_plan: fixturePlanV3(),
+            },
+            { status: 201 },
+          );
+        }
+        if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+        if (init?.method === "DELETE") return jsonResponse({ outcome: "stopped" });
+        throw new Error(`Unexpected request: ${url}`);
+      }),
+    );
+    return startBodies;
+  }
+
+  it("does not request a neutral virtual row named only by the resume hint", async () => {
+    const startBodies = captureStarts();
+    const { result, unmount } = renderHook(
+      () =>
+        usePlaybackSession(
+          "request-1",
+          [neutralRow, concreteRow],
+          [],
+          undefined,
+          0,
+          false,
+          "auto",
+          null,
+          { lastFileId: neutralRow.file_id },
+          null,
+          undefined,
+          undefined,
+          false,
+          false,
+          true,
+          "auto",
+        ),
+      { wrapper },
+    );
+
+    await waitFor(() => expect(result.current.planRevision).toBe(1));
+    expect(startBodies).toHaveLength(1);
+    expect(startBodies[0]?.file_id).toBe(concreteRow.file_id);
+
+    unmount();
+  });
+
+  it("keeps an explicit preferred file authoritative even when it is neutral", async () => {
+    const startBodies = captureStarts();
+    const { result, unmount } = renderHook(
+      () =>
+        usePlaybackSession(
+          "request-1",
+          [neutralRow, concreteRow],
+          [],
+          neutralRow.file_id,
+          0,
+          false,
+          "auto",
+          null,
+          { lastFileId: concreteRow.file_id },
+          null,
+          undefined,
+          undefined,
+          true,
+          false,
+          true,
+          "always",
+        ),
+      { wrapper },
+    );
+
+    await waitFor(() => expect(result.current.planRevision).toBe(1));
+    expect(startBodies).toHaveLength(1);
+    expect(startBodies[0]?.file_id).toBe(neutralRow.file_id);
+
+    unmount();
+  });
+
+  it("switches to a subtitle-bearing candidate in the resumed edition, not another edition", async () => {
+    const resumedWithoutSubtitles = version({
+      file_id: 23_520,
+      file_path: "virtual://series/show/1/1?result=a",
+      edition_key: "theatrical",
+      resolution: "2160p",
+      codec_video: "hevc",
+      codec_audio: "eac3",
+      subtitle_tracks: [],
+    });
+    const sameEditionWithSubtitles = version({
+      file_id: 23_521,
+      file_path: "virtual://series/show/1/1?result=b",
+      edition_key: "theatrical",
+      resolution: "1080p",
+      codec_video: "h264",
+      codec_audio: "aac",
+      subtitle_tracks: [{ index: 0, language: "eng" }],
+    });
+    const otherEditionWithSubtitles = version({
+      file_id: 23_522,
+      file_path: "virtual://series/show/1/1?result=c",
+      edition_key: "director",
+      resolution: "1080p",
+      codec_video: "h264",
+      codec_audio: "aac",
+      subtitle_tracks: [{ index: 0, language: "eng" }],
+    });
+    const startBodies = captureStarts();
+    const { result, unmount } = renderHook(
+      () =>
+        usePlaybackSession(
+          "request-1",
+          [resumedWithoutSubtitles, sameEditionWithSubtitles, otherEditionWithSubtitles],
+          [],
+          undefined,
+          0,
+          false,
+          "auto",
+          null,
+          { lastFileId: resumedWithoutSubtitles.file_id, lastEditionKey: "theatrical" },
+          null,
+          undefined,
+          undefined,
+          false,
+          false,
+          true,
+          "auto",
+        ),
+      { wrapper },
+    );
+
+    await waitFor(() => expect(result.current.planRevision).toBe(1));
+    expect(startBodies[0]?.file_id).toBe(sameEditionWithSubtitles.file_id);
+
+    unmount();
+  });
+});
+
+describe("usePlaybackSession track change guards", () => {
+  const planAudioTracks = [
+    {
+      codec: "aac",
+      channels: 2,
+      layout: "stereo",
+      language: "eng",
+      default: true,
+      track_id: "file:7:audio:0",
+    },
+    {
+      codec: "eac3",
+      channels: 6,
+      layout: "5.1",
+      language: "fra",
+      default: false,
+      track_id: "file:7:audio:1",
+    },
+  ];
+
+  function guardHarness(plan = fixturePlanV3()) {
+    const replanBodies: Array<{
+      selected_tracks?: {
+        audio?: Record<string, unknown>;
+        subtitle?: Record<string, unknown>;
+      };
+    }> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/playback/start")) {
+          return jsonResponse(
+            {
+              protocol_version: 3,
+              server_features: ["playback_plan_v3"],
+              outcome: "playable",
+              session_id: "session-1",
+              playback_plan: plan,
+            },
+            { status: 201 },
+          );
+        }
+        if (url.endsWith("/playback/session-1/replan")) {
+          replanBodies.push(JSON.parse(String(init?.body)) as (typeof replanBodies)[number]);
+          return jsonResponse({
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3({
+              plan_id: "plan:2222222222222222",
+              plan_attempt_key: "v3:2222222222222222",
+              audio_tracks: plan.audio_tracks,
+              subtitle: plan.subtitle,
+            }),
+          });
+        }
+        if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+        if (init?.method === "DELETE") return new Response(null, { status: 204 });
+        throw new Error(`Unexpected request: ${url}`);
+      }),
+    );
+    return replanBodies;
+  }
+
+  it("ignores an audio ordinal the plan does not publish", async () => {
+    const plan = fixturePlanV3({
+      audio_tracks: planAudioTracks,
+      selected_tracks: { audio: { id: "file:7:audio:0", index: 0 } },
+    });
+    const replanBodies = guardHarness(plan);
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe(plan.plan_id));
+
+    act(() => result.current.switchAudioTrack(5, 30));
+    expect(replanBodies).toHaveLength(0);
+    expect(result.current.replanning).toBe(false);
+
+    // A published ordinal still changes the track.
+    act(() => result.current.switchAudioTrack(1, 31));
+    await waitFor(() => expect(replanBodies).toHaveLength(1));
+    expect(replanBodies[0]?.selected_tracks?.audio).toMatchObject({
+      id: "file:7:audio:1",
+      index: 1,
+    });
+
+    unmount();
+  });
+
+  it("ignores a subtitle ordinal the plan does not publish", async () => {
+    const published = fixtureSubtitleInventoryItemV3({
+      track_id: "file:7:subtitle:0",
+      combined_index: 0,
+      language: "eng",
+    });
+    const plan = fixturePlanV3({
+      subtitle: { mode: "render", track_id: published.track_id, inventory: [published] },
+    });
+    const replanBodies = guardHarness(plan);
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe(plan.plan_id));
+
+    act(() => result.current.changeSubtitleTrack(4, 30));
+    expect(replanBodies).toHaveLength(0);
+    expect(result.current.replanning).toBe(false);
+
+    // The published ordinal is sent with its identity, not a bare index.
+    act(() => result.current.changeSubtitleTrack(0, 31));
+    await waitFor(() => expect(replanBodies).toHaveLength(1));
+    expect(replanBodies[0]?.selected_tracks?.subtitle).toMatchObject({
+      id: "file:7:subtitle:0",
+      index: 0,
+    });
+
+    unmount();
+  });
+
+  it("reconciles a stale subtitle slot by language instead of sending its ordinal", async () => {
+    const outgoing = fixtureSubtitleInventoryItemV3({
+      track_id: "file:7:subtitle:4",
+      combined_index: 4,
+      language: "eng",
+      label: "English",
+    });
+    const incoming = fixtureSubtitleInventoryItemV3({
+      track_id: "file:7:subtitle:7",
+      combined_index: 7,
+      language: "eng",
+      label: "English",
+    });
+    const plan = fixturePlanV3({
+      subtitle: { mode: "render", track_id: outgoing.track_id, inventory: [outgoing] },
+    });
+    const replanBodies = guardHarness(plan);
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe(plan.plan_id));
+
+    // The verified push replaces the plan's inventory in the same tick the
+    // viewer's click still names the outgoing menu slot (4). The pick is the
+    // same English track, now at ordinal 7, so that is what the replan asks
+    // for; ordinal 4 no longer exists in the plan.
+    act(() => {
+      result.current.applyInventoryUpdate({
+        session_id: "session-1",
+        inventory_revision: "inv:subtitle-moved",
+        inventory_status: "verified",
+        effective_media_file_id: 7,
+        audio_tracks: planAudioTracks,
+        subtitle_inventory: [incoming],
+      });
+      result.current.changeSubtitleTrack(4, 40);
+    });
+
+    await waitFor(() => expect(replanBodies).toHaveLength(1));
+    expect(replanBodies[0]?.selected_tracks?.subtitle).toMatchObject({
+      id: "file:7:subtitle:7",
+      index: 7,
+    });
+
+    unmount();
+  });
+
+  it("reconciles a stale subtitle slot by identity when the plan reorders ordinals", async () => {
+    const english = fixtureSubtitleInventoryItemV3({
+      track_id: "file:7:subtitle:0",
+      combined_index: 0,
+      language: "eng",
+      label: "English",
+    });
+    const french = fixtureSubtitleInventoryItemV3({
+      track_id: "file:7:subtitle:1",
+      combined_index: 1,
+      language: "fra",
+      label: "French",
+    });
+    const plan = fixturePlanV3({
+      subtitle: { mode: "render", track_id: english.track_id, inventory: [english, french] },
+    });
+    const replanBodies = guardHarness(plan);
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe(plan.plan_id));
+
+    // The verified revision swaps the ordinal order: French is now 0 and
+    // English is 1. The click still names the displayed English slot (0), so
+    // the plan ordinal would select French. The picked track's identity wins.
+    act(() => {
+      result.current.applyInventoryUpdate({
+        session_id: "session-1",
+        inventory_revision: "inv:subtitle-reordered",
+        inventory_status: "verified",
+        effective_media_file_id: 7,
+        audio_tracks: planAudioTracks,
+        subtitle_inventory: [
+          { ...french, combined_index: 0 },
+          { ...english, combined_index: 1 },
+        ],
+      });
+      result.current.changeSubtitleTrack(0, 40);
+    });
+
+    await waitFor(() => expect(replanBodies).toHaveLength(1));
+    expect(replanBodies[0]?.selected_tracks?.subtitle).toMatchObject({
+      id: "file:7:subtitle:0",
+      index: 1,
+    });
+
+    unmount();
+  });
+
+  it("reconciles a stale subtitle slot without track ids by language", async () => {
+    const english = fixtureSubtitleInventoryItemV3({
+      track_id: "",
+      combined_index: 0,
+      language: "eng",
+      label: "English",
+    });
+    const french = fixtureSubtitleInventoryItemV3({
+      track_id: "",
+      combined_index: 1,
+      language: "fra",
+      label: "French",
+    });
+    const plan = fixturePlanV3({
+      subtitle: { mode: "render", inventory: [english, french] },
+    });
+    const replanBodies = guardHarness(plan);
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe(plan.plan_id));
+
+    // The menu publishes no stable ids, so the pick is named only by its slot:
+    // slot 0 is English. The verified revision moves French to 0, and only the
+    // language reconciliation can still find the track the viewer clicked.
+    act(() => {
+      result.current.applyInventoryUpdate({
+        session_id: "session-1",
+        inventory_revision: "inv:subtitle-reordered-no-ids",
+        inventory_status: "verified",
+        effective_media_file_id: 7,
+        audio_tracks: planAudioTracks,
+        subtitle_inventory: [
+          { ...french, track_id: "file:7:subtitle:1", combined_index: 0 },
+          { ...english, track_id: "file:7:subtitle:0", combined_index: 1 },
+        ],
+      });
+      result.current.changeSubtitleTrack(0, 40);
+    });
+
+    await waitFor(() => expect(replanBodies).toHaveLength(1));
+    expect(replanBodies[0]?.selected_tracks?.subtitle).toMatchObject({
+      id: "file:7:subtitle:0",
+      index: 1,
+    });
+
+    unmount();
+  });
+
+  it("ignores a stale subtitle slot with no counterpart even when the ordinal exists", async () => {
+    const japanese = fixtureSubtitleInventoryItemV3({
+      track_id: "file:7:subtitle:2",
+      combined_index: 0,
+      language: "jpn",
+      label: "Japanese",
+    });
+    const english = fixtureSubtitleInventoryItemV3({
+      track_id: "file:7:subtitle:0",
+      combined_index: 1,
+      language: "eng",
+      label: "English",
+    });
+    const french = fixtureSubtitleInventoryItemV3({
+      track_id: "file:7:subtitle:1",
+      combined_index: 2,
+      language: "fra",
+      label: "French",
+    });
+    const plan = fixturePlanV3({
+      subtitle: { mode: "render", track_id: japanese.track_id, inventory: [japanese, english] },
+    });
+    const replanBodies = guardHarness(plan);
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe(plan.plan_id));
+
+    // The viewer clicked the displayed Japanese slot (0). The revision no
+    // longer carries Japanese, and slot 0 now names English: sending the stale
+    // ordinal would silently switch language, so the pick is dropped.
+    act(() => {
+      result.current.applyInventoryUpdate({
+        session_id: "session-1",
+        inventory_revision: "inv:subtitle-dropped",
+        inventory_status: "verified",
+        effective_media_file_id: 7,
+        audio_tracks: planAudioTracks,
+        subtitle_inventory: [
+          { ...english, combined_index: 0 },
+          { ...french, combined_index: 1 },
+        ],
+      });
+      result.current.changeSubtitleTrack(0, 40);
+    });
+
+    expect(replanBodies).toHaveLength(0);
+    expect(result.current.replanning).toBe(false);
 
     unmount();
   });

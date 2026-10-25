@@ -1065,6 +1065,28 @@ func TestSubtitleUpstreamFailureAnswersRetryableAndBacksOff(t *testing.T) {
 	}
 }
 
+// The implicit window stays the legacy 600 s bound for whole-track clients
+// without a windowing contract, so a native client that does not refetch does
+// not lose subtitles after two minutes. A resumed position still gets the small
+// SEEK_BACKOFF lead-in on top of the duration.
+func TestVirtualSubtitleImplicitWindowDurationAndResumeStart(t *testing.T) {
+	if virtualSubtitleImplicitWindowSeconds != 600 {
+		t.Fatalf("implicit window = %vs, want 600s", virtualSubtitleImplicitWindowSeconds)
+	}
+	handler := &StreamHandler{}
+	opts := playback.StreamExtractOpts{TrackIndex: 0, SourceCodec: "subrip"}
+	handler.applyImplicitVirtualWindow(&opts, &models.MediaFile{FileSize: 1 << 30}, &playback.Session{Position: 3600}, true)
+	if !opts.WindowRequested {
+		t.Fatal("cold whole-track virtual fetch was not bounded to the implicit window")
+	}
+	if opts.SeekSeconds != 3598 {
+		t.Fatalf("implicit start = %v, want the resumed position minus backoff (3598)", opts.SeekSeconds)
+	}
+	if opts.DurationSeconds != 600 {
+		t.Fatalf("implicit duration = %v, want 600", opts.DurationSeconds)
+	}
+}
+
 // The implicit window start follows the session position (pulled back a little)
 // so a resumed fetch covers playback, and falls back to zero for a fresh start.
 func TestImplicitVirtualWindowStart(t *testing.T) {

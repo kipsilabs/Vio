@@ -3512,6 +3512,102 @@ func virtualCandidateDeliveryEvidence(statusCode int, bytesWritten int64) bool {
 	return bytesWritten > 0
 }
 
+// shouldRetryVirtualSubtitleWithFreshSource reports whether a virtual subtitle
+// extraction failed with an upstream 5xx before the response committed. That is
+// the one failure a fresh provider URL can recover: the extraction command and
+// the relay are fine, but the stored provider URL or its candidate answered
+// 5xx. A committed response (notably a PGS .sup 200) must never be retried,
+// because the client already owns those bytes. A map failure stays a rotation
+// first even when the same attempt also 5xxed, so the existing re-probe path
+// keeps that case.
+func shouldRetryVirtualSubtitleWithFreshSource(virtual bool, status int, err error) bool {
+	return virtual && status == 0 &&
+		playback.IsSubtitleUpstreamError(err) &&
+		!playback.IsSubtitleStreamMapError(err)
+}
+
+// retryVirtualSubtitleWithFreshSource performs the one bounded recovery after
+// a virtual subtitle extraction fails on an upstream 5xx before writing bytes.
+// It resolves the source again with forceRefresh and a fresh relay
+// registration, releases the failed registration, replaces InputPath, and
+// retries the extraction once. CacheIdentity is left untouched: it is the
+// credential-free file/session/track key, so the retry lands under the same
+// entry and only that identity's backoff is bypassed for this call.
+//
+// retried reports whether the extraction actually ran again. On a resolve
+// failure the original release is returned unchanged, retried is false, and
+// err describes the resolve failure; the caller keeps its original extraction
+// error as the response cause.
+func (h *StreamHandler) retryVirtualSubtitleWithFreshSource(
+	ctx context.Context,
+	file *models.MediaFile,
+	session *playback.Session,
+	opts *playback.StreamExtractOpts,
+	releaseInput func(),
+	retry func(playback.StreamExtractOpts) error,
+) (release func(), retried bool, err error) {
+	if h == nil || file == nil || session == nil || opts == nil || retry == nil {
+		return releaseInput, false, errors.New("fresh virtual subtitle retry requires a file, session, options, and retry")
+	}
+	resolved, cleanup, resolveErr := h.resolveVirtualInputURI(
+		withVirtualRelayFreshRegistration(ctx), file, session.UserID, session.ProfileID, true)
+	if resolveErr != nil {
+		return releaseInput, false, resolveErr
+	}
+	// The failed registration must not stay live while the retry opens the
+	// provider again.
+	if releaseInput != nil {
+		releaseInput()
+	}
+	opts.InputPath = resolved.URL
+	retryOpts := *opts
+	retryOpts.FreshSourceRetry = true
+	slog.InfoContext(ctx, "retrying virtual subtitle extraction with a fresh source registration", "component", "api",
+		"file_id", file.ID,
+		"track", opts.TrackIndex)
+	return cleanup, true, retry(retryOpts)
+}
+
+// retryVirtualSubtitleAfterFailure applies the one bounded fresh-source retry
+// only when the failed extraction is eligible. It returns the release for the
+// input that remains current: the original release when the retry did not run
+// or could not resolve, otherwise the fresh registration's release. The
+// original extraction error is preserved when the retry never ran.
+func (h *StreamHandler) retryVirtualSubtitleAfterFailure(
+	ctx context.Context,
+	file *models.MediaFile,
+	session *playback.Session,
+	opts *playback.StreamExtractOpts,
+	releaseInput func(),
+	virtual bool,
+	status int,
+	extractErr error,
+	retry func(playback.StreamExtractOpts) error,
+) (func(), error) {
+	if ctx.Err() != nil || !shouldRetryVirtualSubtitleWithFreshSource(virtual, status, extractErr) {
+		return releaseInput, extractErr
+	}
+	freshRelease, retried, freshErr := h.retryVirtualSubtitleWithFreshSource(
+		ctx, file, session, opts, releaseInput, retry,
+	)
+	if retried {
+		return freshRelease, freshErr
+	}
+	if freshErr != nil {
+		track := 0
+		if opts != nil {
+			track = opts.TrackIndex
+		}
+		// Keep the original extraction failure as the response cause; the
+		// resolve failure only explains why the retry never ran.
+		slog.WarnContext(ctx, "virtual subtitle fresh source resolution failed", "component", "api",
+			"file_id", file.ID,
+			"track", track,
+			"error", logredact.SanitizeURLError(freshErr))
+	}
+	return releaseInput, extractErr
+}
+
 // streamEmbeddedSubtitle runs a dedicated ffmpeg for a single embedded
 // track, optionally windowed by explicit client parameters, and pipes its
 // stdout directly to w. Because this ffmpeg is independent of the video
@@ -3572,7 +3668,9 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 		releaseInput = cleanup
 		virtualResolved = true
 	}
-	defer releaseInput()
+	// Read the release through the variable: the bounded fresh-source retry
+	// below replaces it with the retry registration's release.
+	defer func() { releaseInput() }()
 	if len(requestedFormat) > 0 && requestedFormat[0] == "vtt" {
 		// Only text sources can be converted to WebVTT. A bitmap track (PGS
 		// reaches here because it is deliverable as .sup; DVD/DVB are rejected
@@ -3693,6 +3791,17 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 		h.applyImplicitVirtualWindow(&opts, file, session, virtualActive)
 		playback.SetSubtitleCoverageHeader(w.Header(), opts)
 		_, extractErr = h.SubtitleCache.ServeExtractWithResult(response, r, opts, playback.StreamExtractSubtitle)
+	}
+	retryWithFreshSource := func(retryOpts playback.StreamExtractOpts) error {
+		_, retryServeErr := h.SubtitleCache.ServeExtractWithResult(response, r, retryOpts, playback.StreamExtractSubtitle)
+		return retryServeErr
+	}
+	if extractErr != nil {
+		releaseInput, extractErr = h.retryVirtualSubtitleAfterFailure(
+			r.Context(), file, session, &opts, releaseInput,
+			virtualResolved && session != nil, response.Status(), extractErr,
+			retryWithFreshSource,
+		)
 	}
 	if extractErr != nil {
 		var extractionRetry *playback.SubtitleExtractionRetryError

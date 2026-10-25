@@ -501,8 +501,11 @@ export function useSubtitleTracks(
 
     track.addEventListener("cuechange", handleCueChange);
     // Paused playback adds cues without a cuechange, and a seek can change the
-    // active cue before the next cuechange fires.
+    // active cue before the next cuechange fires. A track rebuilt or cleared
+    // while paused leaves the display empty, so resuming replays the current
+    // cue list instead of waiting for the next cuechange.
     videoEl.addEventListener("pause", refreshActiveCues);
+    videoEl.addEventListener("play", refreshActiveCues);
     videoEl.addEventListener("seeking", refreshActiveCues);
     videoEl.addEventListener("seeked", refreshActiveCues);
     refreshActiveCues();
@@ -864,6 +867,7 @@ export function useSubtitleTracks(
       videoEl.removeEventListener("seeking", handleSeek);
       videoEl.removeEventListener("seeked", handleSeek);
       videoEl.removeEventListener("pause", refreshActiveCues);
+      videoEl.removeEventListener("play", refreshActiveCues);
       videoEl.removeEventListener("seeking", refreshActiveCues);
       videoEl.removeEventListener("seeked", refreshActiveCues);
       track.removeEventListener("cuechange", handleCueChange);

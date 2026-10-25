@@ -427,3 +427,56 @@ func TestServeExtractWindowedCoalescesConcurrentRepeats(t *testing.T) {
 		t.Fatalf("extract calls = %d, want 1 coalesced extraction", calls)
 	}
 }
+
+// A bounded fresh-source retry replaces the failed relay URL but keeps the
+// credential-free cache identity. The failed attempt's per-identity backoff
+// suppresses ordinary client retries; it must not suppress that one deliberate
+// re-open, and a success must clear the streak.
+func TestServeExtractFreshSourceRetryBypassesIdentityBackoff(t *testing.T) {
+	c, source := newTestCache(t)
+	c.extractRetryDelays = []time.Duration{}
+	opts := windowResilienceOpts(source)
+	opts.CacheIdentity = "virtual-fresh-source"
+	const payload = "[Script Info]\nDialogue: 0,0:02:00.00,0:02:01.00,Default,,0,0,0,,hello\n" //nolint:misspell // ASS cue keyword.
+	const freshPath = "/relay/fresh-token"
+
+	var calls []string
+	extract := func(_ context.Context, o StreamExtractOpts) error {
+		calls = append(calls, o.InputPath)
+		if o.InputPath == opts.InputPath {
+			return upstreamSubtitleError()
+		}
+		_, err := io.WriteString(o.Writer, payload)
+		return err
+	}
+	format := subtitleFormatASS
+
+	if err := c.ServeExtract(httptest.NewRecorder(), subtitleWindowRequest(), opts, extract); !IsSubtitleUpstreamError(err) {
+		t.Fatalf("first extraction error = %v, want the upstream failure", err)
+	}
+	// An ordinary retry inside the cooldown must not open the provider again.
+	var retry *SubtitleExtractionRetryError
+	if err := c.ServeExtract(httptest.NewRecorder(), subtitleWindowRequest(), opts, extract); !errors.As(err, &retry) {
+		t.Fatalf("retry inside backoff error = %v, want SubtitleExtractionRetryError", err)
+	}
+	if len(calls) != 1 {
+		t.Fatalf("extract calls = %d after a retry inside the backoff, want 1", len(calls))
+	}
+
+	freshOpts := opts
+	freshOpts.InputPath = freshPath
+	freshOpts.FreshSourceRetry = true
+	rec := httptest.NewRecorder()
+	if err := c.ServeExtract(rec, subtitleWindowRequest(), freshOpts, extract); err != nil {
+		t.Fatalf("fresh-source retry: %v", err)
+	}
+	if rec.Body.String() != payload {
+		t.Fatalf("fresh-source body = %q, want %q", rec.Body.String(), payload)
+	}
+	if len(calls) != 2 || calls[1] != freshPath {
+		t.Fatalf("extract calls = %v, want the failed URL then %q", calls, freshPath)
+	}
+	if _, cooling := c.extractionCoolingDown(freshOpts, format); cooling {
+		t.Fatal("fresh-source success left the identity cooling down")
+	}
+}
