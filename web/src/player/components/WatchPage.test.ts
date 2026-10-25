@@ -2804,14 +2804,14 @@ describe("Watch Party source fallback", () => {
     const fallbackSource = vi.fn().mockRejectedValue(new Error("No alternative room source"));
     roomConnectionMock.mockReturnValue({ room, connectionState: "connected", fallbackSource });
     const view = render(createElement(WatchPage, props));
-    await waitFor(() =>
+    await waitFor(() => {
       expect(
         screen.getByText(
           "A lower-resolution source is required because 4K transcoding is disabled.",
         ),
-      ).toBeTruthy(),
-    );
-    expect(fallbackSource).toHaveBeenCalledTimes(1);
+      ).toBeTruthy();
+      expect(fallbackSource).toHaveBeenCalledTimes(1);
+    });
     view.rerender(createElement(WatchPage, props));
     expect(fallbackSource).toHaveBeenCalledTimes(1);
   });
