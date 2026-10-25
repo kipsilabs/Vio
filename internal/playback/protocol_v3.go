@@ -1209,6 +1209,11 @@ type AvailableQualityV3 struct {
 type PlanV3 struct {
 	ProtocolVersion int    `json:"protocol_version"`
 	PlanID          string `json:"plan_id"`
+	// CanonicalPlanID is the unsalted plan ID that identifies the recipe for
+	// this attempt. Replan installations incorporate a unique generation salt
+	// into PlanID for transport identity; CanonicalPlanID stays invariant so
+	// server-side recipe exclusion and PlanAttemptKey are computed consistently.
+	CanonicalPlanID string `json:"canonical_plan_id,omitempty"`
 	// PlanAttemptKey is the server-computed opaque loop-prevention token for
 	// this plan. Clients store the keys of attempted plans and echo them in
 	// attempted_plan_keys on replan; they never compute keys themselves.

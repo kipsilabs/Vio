@@ -10338,10 +10338,11 @@ func finalizeReplanPlanIdentityV3(plan *playback.PlanV3, attemptID, replanReques
 	}
 	canonicalPlan := *plan
 	canonicalPlan.PlanID = playback.DeterministicPlanIDV3(attemptID, plan.RequestedMediaFileID, plan.EffectiveMediaFileID, *plan)
-	plan.PlanAttemptKey = playback.PlanAttemptKeyV3(canonicalPlan, outputContextID, nil)
+	plan.CanonicalPlanID = canonicalPlan.PlanID
 
 	replanAttemptID := strings.TrimSpace(attemptID) + "|replan:" + strings.TrimSpace(replanRequestID)
 	plan.PlanID = playback.DeterministicPlanIDV3(replanAttemptID, plan.RequestedMediaFileID, plan.EffectiveMediaFileID, *plan)
+	plan.PlanAttemptKey = playback.PlanAttemptKeyV3(*plan, outputContextID, nil)
 }
 
 // softwareDecodeRouteDiagnosticsV3 records the reactive software-decode

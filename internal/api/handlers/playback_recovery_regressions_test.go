@@ -562,3 +562,128 @@ func TestSameCandidateFailureDescriptorCarryV3Fences(t *testing.T) {
 		})
 	}
 }
+
+// Server's recomputed PlanAttemptKeyV3 on a replanned CurrentPlan must equal the published canonical PlanAttemptKey.
+func TestHandleReplanPlaybackV3RecomputedCurrentKeyMatchesPublishedKey(t *testing.T) {
+	file := v3HandlerFixtureFile(t)
+	file.AudioTracks = append(file.AudioTracks, models.AudioTrack{Codec: "aac", Channels: 2, Layout: "stereo", Language: "fra"})
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), testPlaybackFileResolver{file: file})
+	stubCopySeekAnchorV3(handler)
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "true"}}
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+
+	startRequest := v3HandlerStartRequest()
+	startRequest.QualityPreference = "original"
+	orig := startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassOriginalHTTPV3]
+	orig.ValidatedClaims = []string{playback.ClaimClientSelectedAudioTrackV3}
+	startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassOriginalHTTPV3] = orig
+	started := startV3PlaybackForHandlerTest(t, handler, startRequest)
+	if started.PlaybackPlan == nil {
+		t.Fatalf("start plan = %#v", started)
+	}
+
+	audioIdx1 := 1
+	trackChangeReq := playback.ReplanRequestV3{
+		ProtocolVersion:       playback.ProtocolV3,
+		Operation:             playback.ReplanOperationTrackChangeV3,
+		PlaybackAttemptID:     startRequest.PlaybackAttemptID,
+		ReplanRequestID:       "replan-key-match-001",
+		FailedPlanID:          started.PlaybackPlan.PlanID,
+		PlanAttemptID:         "plan-attempt-km-001",
+		PlanAttemptKey:        started.PlaybackPlan.PlanAttemptKey,
+		AttemptCount:          1,
+		PositionSeconds:       10,
+		SelectedTracks:        playback.SelectedTracksV3{Audio: &playback.TrackIdentityV3{ID: "file:42:audio:1", Index: &audioIdx1}},
+		Capabilities:          startRequest.Capabilities,
+		ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	}
+	resp := postPlaybackReplanV3(t, handler, started.SessionID, trackChangeReq)
+	if resp.Outcome != playback.OutcomePlayableV3 || resp.PlaybackPlan == nil {
+		t.Fatalf("track change failed: %#v", resp)
+	}
+
+	outputContextID := startRequest.ClientPlaybackContext.Output.OutputContextID
+	recomputed := playback.PlanAttemptKeyV3(*resp.PlaybackPlan, outputContextID, nil)
+	if recomputed != resp.PlaybackPlan.PlanAttemptKey {
+		t.Fatalf("recomputed key %q does not match published canonical key %q", recomputed, resp.PlaybackPlan.PlanAttemptKey)
+	}
+
+	// Stored attempt CurrentPlan also recomputes to the same canonical key.
+	rec, err := handler.PlanStoreV3.GetAttempt(context.Background(), started.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	storedRecomputed := playback.PlanAttemptKeyV3(rec.CurrentPlan, outputContextID, nil)
+	if storedRecomputed != resp.PlaybackPlan.PlanAttemptKey {
+		t.Fatalf("stored attempt key %q does not match published canonical key %q", storedRecomputed, resp.PlaybackPlan.PlanAttemptKey)
+	}
+}
+
+// Incomplete or stale client history must not bypass server recipe exclusion on failure recovery.
+func TestHandleReplanPlaybackV3ReplanFailsWithIncompleteHistory(t *testing.T) {
+	file := v3HandlerFixtureFile(t)
+	file.AudioTracks = append(file.AudioTracks, models.AudioTrack{Codec: "aac", Channels: 2, Layout: "stereo", Language: "fra"})
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), testPlaybackFileResolver{file: file})
+	stubCopySeekAnchorV3(handler)
+	handler.PlaybackConfig = playbackTestConfigNoTranscode(t.TempDir())
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"transcode_enabled": "false", "allow_4k_transcode": "false"}}
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+
+	startRequest := v3HandlerStartRequest()
+	startRequest.QualityPreference = "original"
+	orig := startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassOriginalHTTPV3]
+	orig.ValidatedClaims = []string{playback.ClaimClientSelectedAudioTrackV3}
+	startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassOriginalHTTPV3] = orig
+	startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassHLSV3] = playback.DeliveryCapabilityV3{
+		Enabled: true, SupportedOnDevice: true, Containers: []string{"hls"},
+		VideoCodecs: []string{"h264"}, AudioDecodeCodecs: []string{"aac"},
+	}
+	started := startV3PlaybackForHandlerTest(t, handler, startRequest)
+	if started.PlaybackPlan == nil {
+		t.Fatalf("start plan = %#v", started)
+	}
+
+	audioIdx1 := 1
+	trackChangeReq := playback.ReplanRequestV3{
+		ProtocolVersion:       playback.ProtocolV3,
+		Operation:             playback.ReplanOperationTrackChangeV3,
+		PlaybackAttemptID:     startRequest.PlaybackAttemptID,
+		ReplanRequestID:       "replan-incomplete-hist-001",
+		FailedPlanID:          started.PlaybackPlan.PlanID,
+		PlanAttemptID:         "plan-attempt-ih-001",
+		PlanAttemptKey:        started.PlaybackPlan.PlanAttemptKey,
+		AttemptCount:          1,
+		PositionSeconds:       10,
+		SelectedTracks:        playback.SelectedTracksV3{Audio: &playback.TrackIdentityV3{ID: "file:42:audio:1", Index: &audioIdx1}},
+		Capabilities:          startRequest.Capabilities,
+		ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	}
+	resp := postPlaybackReplanV3(t, handler, started.SessionID, trackChangeReq)
+	if resp.Outcome != playback.OutcomePlayableV3 || resp.PlaybackPlan == nil {
+		t.Fatalf("track change failed: %#v", resp)
+	}
+
+	// Client sends failure recovery with EMPTY AttemptedPlanKeys and a stale PlanAttemptKey.
+	// Server's own recomputed currentKey must exclude the failed recipe.
+	recoveryReq := playback.ReplanRequestV3{
+		ProtocolVersion:       playback.ProtocolV3,
+		Operation:             playback.ReplanOperationFailureRecoveryV3,
+		PlaybackAttemptID:     startRequest.PlaybackAttemptID,
+		ReplanRequestID:       "replan-recovery-empty-hist",
+		FailedPlanID:          resp.PlaybackPlan.PlanID,
+		PlanAttemptID:         "plan-attempt-rec-empty",
+		PlanAttemptKey:        "v3:stale00000000000",
+		AttemptedPlanKeys:     []string{started.PlaybackPlan.PlanAttemptKey}, // omits current plan's key
+		AttemptCount:          1,
+		PositionSeconds:       10,
+		Failure:               playback.FailureV3{Classification: "player_failure"},
+		SelectedTracks:        resp.PlaybackPlan.SelectedTracks,
+		Capabilities:          startRequest.Capabilities,
+		ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	}
+	failResp := postPlaybackReplanV3(t, handler, started.SessionID, recoveryReq)
+	// Server must have excluded the failed recipe despite incomplete client history.
+	if failResp.PlaybackPlan != nil && failResp.PlaybackPlan.PlanAttemptKey == resp.PlaybackPlan.PlanAttemptKey {
+		t.Fatalf("incomplete history must not reselect failed recipe, got: %#v", failResp)
+	}
+}
