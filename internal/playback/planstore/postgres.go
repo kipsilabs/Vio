@@ -199,7 +199,7 @@ func (s *Postgres) getAttempt(ctx context.Context, predicate string, value any) 
 		       current_plan_id, current_replan_request_id, current_plan, frozen_recipe,
 		       normalized_request, start_response, request_digest, expires_at, server_bitrate_cap_kbps,
 		       last_sequence, last_sample, stopped_at, COALESCE(stop_receipt->>'stop_id', ''), updated_at, recovery_state, recovery_revision,
-		       audio_selection, audio_reconcile_ledger
+		       audio_selection, audio_reconcile_ledger, stream_reissues, current_transport_rendered
 		FROM playback_v3_attempts
 		WHERE `+predicate+` AND expires_at > NOW()`, value).Scan(
 		&record.PlaybackAttemptID, &record.SessionID, &record.UserID, &record.ProfileID,
@@ -208,7 +208,7 @@ func (s *Postgres) getAttempt(ctx context.Context, predicate string, value any) 
 		&requestJSON, &responseJSON, &record.RequestDigest, &record.ExpiresAt, &record.ServerBitrateCapKbps,
 		&record.LastSequence, &sampleJSON, &record.StoppedAt, &record.StopID, &record.LastSampleAt,
 		&recoveryJSON, &record.RecoveryRevision,
-		&selectionJSON, &ledgerJSON,
+		&selectionJSON, &ledgerJSON, &record.StreamReissues, &record.CurrentTransportRendered,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, playback.ErrSessionNotFound
@@ -536,9 +536,10 @@ func (s *Postgres) CompleteReplan(ctx context.Context, sessionID, requestID, lea
 		UPDATE playback_v3_attempts SET
 			effective_media_file_id = $2, current_plan_id = $3,
 			current_replan_request_id = $4, current_plan = $5, frozen_recipe = $6,
-			normalized_request = $7, start_response = $8, expires_at = $9, updated_at = NOW()
+			normalized_request = $7, start_response = $8, expires_at = $9,
+			stream_reissues = $11, current_transport_rendered = $12, updated_at = NOW()
 		WHERE session_id = $1::uuid AND current_replan_request_id = $10 AND stopped_at IS NULL`,
-		sessionID, record.EffectiveMediaFileID, record.CurrentPlanID, record.CurrentReplanRequestID, planJSON, recipeJSON, requestJSON, startResponseJSON, record.ExpiresAt, baseReplanRequestID)
+		sessionID, record.EffectiveMediaFileID, record.CurrentPlanID, record.CurrentReplanRequestID, planJSON, recipeJSON, requestJSON, startResponseJSON, record.ExpiresAt, baseReplanRequestID, record.StreamReissues, record.CurrentTransportRendered)
 	if err != nil {
 		return err
 	}
@@ -578,11 +579,17 @@ func (s *Postgres) RecordRouteEvent(ctx context.Context, record playback.RouteEv
 	if err != nil {
 		return false, err
 	}
+	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
 	// A v2 report carries an event id: the partial unique index makes a retry
 	// after a lost 202 a no-op instead of a second row, which RowsAffected
 	// reports as zero. Legacy v1 reports have no id and keep their
 	// unconditional insert.
-	tag, err := s.db.Exec(ctx, `
+	tag, err := tx.Exec(ctx, `
 		INSERT INTO playback_route_events (
 			playback_attempt_id, session_id, plan_id, plan_attempt_id, plan_attempt_key,
 			event, failure_classification, fallback_reason, output_context_id,
@@ -600,7 +607,20 @@ func (s *Postgres) RecordRouteEvent(ctx context.Context, record playback.RouteEv
 	if err != nil {
 		return false, err
 	}
-	return tag.RowsAffected() == 1, nil
+	inserted := tag.RowsAffected() == 1
+	if inserted && record.Event == playback.RouteEventFirstFrameV3 && record.PlanID != "" {
+		if _, updateErr := tx.Exec(ctx, `
+			UPDATE playback_v3_attempts
+			SET current_transport_rendered = true
+			WHERE playback_attempt_id = $1 AND current_plan_id = $2`,
+			record.PlaybackAttemptID, record.PlanID); updateErr != nil {
+			return false, updateErr
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return inserted, nil
 }
 
 // Progress and stop sequencing. Both are single-statement compare-and-sets on

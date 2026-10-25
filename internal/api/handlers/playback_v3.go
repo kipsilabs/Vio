@@ -8792,6 +8792,26 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		}
 	}
 	start.ClientFeatures = withoutFailedSubtitleRoutesV3(start.ClientFeatures, record.NormalizedRequest.ClientFeatures, req.Failure.Classification)
+	// A failure recovery after the current transport showed frames and suffered
+	// a network connectivity loss (e.g. transport_stall) is a lost connection,
+	// not a failed recipe: the transport already delivered frames, so the same
+	// delivery and recipe may be reissued once instead of retiring the route (§6.2).
+	// Pre-first-frame failures keep the ordinary ladder because the route itself
+	// never proved it could reach this client. Capability/engine rejections
+	// (such as browser_engine_unsupported_source), decode errors, and delivery
+	// demotions are not connectivity losses and must continue through route retirement.
+	currentTransportRendered := record.CurrentTransportRendered
+	progressReissue := operation == playback.ReplanOperationFailureRecoveryV3 &&
+		!intentChange &&
+		!proxyOriginRecovery &&
+		!nodeRecovery &&
+		!virtualDecodeRotation &&
+		connectivityFailureClassificationV3(req.Failure.Classification) &&
+		currentTransportRendered &&
+		record.StreamReissues < 1
+	if progressReissue {
+		record.StreamReissues++
+	}
 	requestedFallbackID := record.EffectiveMediaFileID
 	effectiveFallbackID := record.RequestedMediaFileID
 	if seekScopedRecovery {
@@ -9209,14 +9229,20 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 					// record's requested row.
 					resolvedFile.FilePath = resolved.URI
 					resolvedFile.VirtualOwnerInstallationID = resolved.OwnerID
+					// A same-candidate failure recovery re-resolves the release
+					// the running plan validated, and the provider may serve a
+					// catalog row that never received the probe's video
+					// metadata. Carry the running plan's validated descriptor
+					// when identity, installation, and session provenance all
+					// still describe the same bytes, exactly as the
+					// user-intent carry does. Without it the planner terminals
+					// source_metadata_incomplete on a route that just played.
+					carryProvenance := sessionProvenanceMatchesPinnedRowV3(r.Context(), session, resolved.File, h.fileResolver)
+					if sameCandidateFailureDescriptorCarryV3(operation, session, record, carryProvenance, resolved, virtualDecodeRotation) {
+						resolvedFile = *carryValidatedVirtualVideoEvidenceV3(&resolvedFile, record.CurrentPlan.Source)
+					}
 					currentEffectiveFile = &resolvedFile
 					replanVirtualProvenance = resolved.Provenance
-					// A failure recovery re-resolves the virtual candidate, and the resolver can
-					// return a row whose inventory lacks fields the running plan already proved.
-					// Carry only when the resolved candidate is the plan's own candidate,
-					// matching the plan, the session anchor, the owner installation, and
-					// retained session provenance.
-					currentEffectiveFile = h.carryFailureRecoveryVirtualEvidenceV3(r.Context(), session, record, operation, resolved.URI, resolved.OwnerID, currentEffectiveFile)
 				}
 			}
 		}
@@ -9514,15 +9540,24 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		}
 		attemptedKeys = []string(nil)
 		currentKey := playback.PlanAttemptKeyV3(record.CurrentPlan, record.NormalizedRequest.ClientPlaybackContext.Output.OutputContextID, req.LocalMutations)
+		unmutatedKey := playback.PlanAttemptKeyV3(record.CurrentPlan, record.NormalizedRequest.ClientPlaybackContext.Output.OutputContextID, nil)
 		if !intentChange && !seekReanchor && !userIntentOperation {
 			failedKey := strings.TrimSpace(req.PlanAttemptKey)
 			for _, key := range req.AttemptedPlanKeys {
-				if trimmed := strings.TrimSpace(key); nodeRecovery && (trimmed == failedKey || trimmed == currentKey) {
+				trimmed := strings.TrimSpace(key)
+				if nodeRecovery && (trimmed == failedKey || trimmed == currentKey) {
+					continue
+				}
+				// Keep the current recipe out of the loop guard for its one
+				// reissue. The client echoes it in its history and the server
+				// computes the same key; both copies must be dropped or the
+				// planner cannot select the route it just played.
+				if progressReissue && (trimmed == failedKey || trimmed == currentKey || trimmed == unmutatedKey) {
 					continue
 				}
 				attemptedKeys = append(attemptedKeys, key)
 			}
-			if !proxyOriginRecovery && !nodeRecovery && !containsStringExactV3(attemptedKeys, req.PlanAttemptKey) {
+			if !proxyOriginRecovery && !nodeRecovery && !progressReissue && !containsStringExactV3(attemptedKeys, req.PlanAttemptKey) {
 				attemptedKeys = append(attemptedKeys, req.PlanAttemptKey)
 			}
 		}
@@ -9532,13 +9567,12 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			// ping-pong the session. A client-reported local mutation (for example a
 			// PCM recovery route) is folded into the failed plan's key here — the
 			// server owns the hash; clients only echo opaque keys.
-			if !proxyOriginRecovery && !nodeRecovery && !containsStringExactV3(attemptedKeys, currentKey) {
+			if !proxyOriginRecovery && !nodeRecovery && !progressReissue && !containsStringExactV3(attemptedKeys, currentKey) {
 				attemptedKeys = append(attemptedKeys, currentKey)
 			}
-			if len(req.LocalMutations) > 0 && !proxyOriginRecovery && !nodeRecovery {
+			if len(req.LocalMutations) > 0 && !proxyOriginRecovery && !nodeRecovery && !progressReissue {
 				// The unmutated recipe already failed before the client mutated it
 				// locally; exclude it as well.
-				unmutatedKey := playback.PlanAttemptKeyV3(record.CurrentPlan, record.NormalizedRequest.ClientPlaybackContext.Output.OutputContextID, nil)
 				if !containsStringExactV3(attemptedKeys, unmutatedKey) {
 					attemptedKeys = append(attemptedKeys, unmutatedKey)
 				}
@@ -10162,6 +10196,12 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		}
 	}
 	result.Plan.Stream.URL = transport.url
+	if result.Plan != nil && !transportReused {
+		// Give each newly installed replan transport a unique plan ID that
+		// cannot be confused with an earlier installation, while preserving
+		// the canonical recipe attempt key for loop retirement.
+		finalizeReplanPlanIdentityV3(result.Plan, record.PlaybackAttemptID, req.ReplanRequestID, start.ClientPlaybackContext.Output.OutputContextID)
+	}
 	response := playback.DecisionResponseV3{ProtocolVersion: playback.ProtocolV3, ServerFeatures: serverFeaturesForRequestV3(r.Context()), Outcome: playback.OutcomePlayableV3, SessionID: session.ID, PlaybackPlan: result.Plan}
 	updated := *record
 	updated.CurrentPlanID = result.Plan.PlanID
@@ -10178,6 +10218,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	updated.NormalizedRequest = start
 	updated.EffectiveMediaFileID = effectiveFile.ID
 	updated.ExpiresAt = time.Now().Add(playback.MaxTokenTTL)
+	updated.CurrentTransportRendered = transportReused && record.CurrentTransportRendered
 	if transportReused {
 		if expiresAt, parseErr := time.Parse(time.RFC3339, result.Plan.ExpiresAt); parseErr == nil {
 			updated.ExpiresAt = expiresAt
@@ -10283,6 +10324,24 @@ func deliveryChangeV3(previousDelivery playback.DeliveryV3, previousPlayMethod p
 		DeliveryChanged:    deliveryChanged,
 		PlayMethodChanged:  playMethodChanged,
 	}
+}
+
+// finalizeReplanPlanIdentityV3 mints a generation-scoped plan id for each newly
+// installed replan transport, while preserving the canonical recipe attempt key
+// for retirement in attempted_plan_keys. The replan request id distinguishes
+// this transport generation so a delayed first-frame event from an earlier
+// installation cannot falsely mark a reopened transport as rendered.
+func finalizeReplanPlanIdentityV3(plan *playback.PlanV3, attemptID, replanRequestID, outputContextID string) {
+	if plan == nil {
+		return
+	}
+	canonicalPlan := *plan
+	canonicalPlan.PlanID = playback.DeterministicPlanIDV3(attemptID, plan.RequestedMediaFileID, plan.EffectiveMediaFileID, *plan)
+	plan.CanonicalPlanID = canonicalPlan.PlanID
+
+	replanAttemptID := strings.TrimSpace(attemptID) + "|replan:" + strings.TrimSpace(replanRequestID)
+	plan.PlanID = playback.DeterministicPlanIDV3(replanAttemptID, plan.RequestedMediaFileID, plan.EffectiveMediaFileID, *plan)
+	plan.PlanAttemptKey = playback.PlanAttemptKeyV3(*plan, outputContextID, nil)
 }
 
 // softwareDecodeRouteDiagnosticsV3 records the reactive software-decode
@@ -10498,7 +10557,21 @@ func seekReanchorIdentityChangesV3(record *playback.AttemptRecordV3, candidate *
 			changed = append(changed, name)
 		}
 	}
-	add("plan_id", candidate.PlanID != record.CurrentPlanID || candidate.PlanID != current.PlanID)
+	// Generation-scoped plan IDs rotate per transport; the seek-reanchor guard
+	// compares the canonical recipe identity so a new generation of the same
+	// recipe stays eligible. Plans without a canonical ID keep the exact
+	// generation comparison.
+	candidateIdentity := candidate.PlanID
+	if candidate.CanonicalPlanID != "" {
+		candidateIdentity = candidate.CanonicalPlanID
+	}
+	currentIdentity := current.PlanID
+	committedIdentity := record.CurrentPlanID
+	if current.CanonicalPlanID != "" {
+		currentIdentity = current.CanonicalPlanID
+		committedIdentity = current.CanonicalPlanID
+	}
+	add("plan_id", candidateIdentity != currentIdentity || candidateIdentity != committedIdentity)
 	add("requested_file_id", candidate.RequestedMediaFileID != record.RequestedMediaFileID)
 	add("effective_file_id", candidate.EffectiveMediaFileID != record.EffectiveMediaFileID)
 	add("delivery", candidate.Delivery != current.Delivery)
@@ -12024,50 +12097,6 @@ func (h *PlaybackHandler) frozenSeekCarrierV3(ctx context.Context, session *play
 	return carryValidatedVirtualVideoEvidenceV3(&carrier, record.CurrentPlan.Source), nil
 }
 
-// carryFailureRecoveryVirtualEvidenceV3 tops up a rehydrated virtual candidate's
-// inventory with descriptor fields the running plan already proved, when
-// rehydration resolved the plan's own candidate under matching owner installation
-// and session provenance.
-func (h *PlaybackHandler) carryFailureRecoveryVirtualEvidenceV3(
-	ctx context.Context,
-	session *playback.Session,
-	record *playback.AttemptRecordV3,
-	operation playback.ReplanOperationV3,
-	resolvedURI string,
-	resolvedOwnerID int,
-	file *models.MediaFile,
-) *models.MediaFile {
-	if record == nil || file == nil || session == nil {
-		return file
-	}
-	if !failureRecoveryOperationV3(operation) {
-		return file
-	}
-	planURI := strings.TrimSpace(record.CurrentPlan.EffectiveVirtualURI)
-	resolvedURI = strings.TrimSpace(resolvedURI)
-	sessionURI := strings.TrimSpace(session.VirtualSourceURI)
-	if planURI == "" || resolvedURI == "" || sessionURI == "" {
-		return file
-	}
-	// Installation ownership must agree with the session.
-	if resolvedOwnerID <= 0 || session.VirtualSourceOwnerInstallationID <= 0 || resolvedOwnerID != session.VirtualSourceOwnerInstallationID {
-		return file
-	}
-	// Candidate must match between the running plan, the resolved URI, and the session pin.
-	if !sameVirtualCandidate(planURI, resolvedURI) || !sameVirtualCandidate(planURI, sessionURI) {
-		return file
-	}
-	// Retained session provenance must match the row being adopted.
-	var resolver FilePathResolver
-	if h != nil {
-		resolver = h.fileResolver
-	}
-	if !sessionProvenanceMatchesPinnedRowV3(ctx, session, file, resolver) {
-		return file
-	}
-	return carryValidatedVirtualVideoEvidenceV3(file, record.CurrentPlan.Source)
-}
-
 // carryValidatedVirtualVideoEvidenceV3 tops up a carried pinned candidate's
 // planner-grade video evidence from the source descriptor the running plan
 // validated. A user-intent replan (track_change or seek_reanchor) re-selects
@@ -12150,6 +12179,39 @@ func carryValidatedVirtualVideoEvidenceV3(file *models.MediaFile, source playbac
 	// plan proved is not.
 	fillVirtualVideoTrackFromDescriptorV3(&carried.VideoTracks[0], source)
 	return &carried
+}
+
+// sameCandidateFailureDescriptorCarryV3 reports whether a rehydrated
+// failure-recovery source may receive the running plan's validated video
+// descriptor. It is the failure-recovery counterpart of the carryPinnedCandidate
+// gate: the resolver must have returned the plan's own candidate on the same
+// installation, the session's retained provenance must still describe the
+// pinned row, and no decode rotation may be substituting the release. A row id
+// mismatch is left to carryValidatedVirtualVideoEvidenceV3, which only tops up
+// the exact row its descriptor names.
+func sameCandidateFailureDescriptorCarryV3(operation playback.ReplanOperationV3, session *playback.Session, record *playback.AttemptRecordV3, pinnedRowProvenance bool, resolved resolvedVirtualPlaybackSource, decodeRotation bool) bool {
+	if !failureRecoveryOperationV3(operation) || session == nil || record == nil || resolved.File == nil {
+		return false
+	}
+	if decodeRotation || !pinnedRowProvenance {
+		return false
+	}
+	planURI := strings.TrimSpace(record.CurrentPlan.EffectiveVirtualURI)
+	resolvedURI := strings.TrimSpace(resolved.URI)
+	if planURI == "" || resolvedURI == "" {
+		return false
+	}
+	// The running plan must still name the session's pin, and the resolver must
+	// have returned that same candidate. Session provenance proves the retained
+	// evidence describes the pinned row; it does not by itself prove the plan's
+	// descriptor is for the same bytes, so both candidate checks are required.
+	if !sameVirtualCandidate(session.VirtualSourceURI, planURI) ||
+		!sameVirtualCandidate(resolvedURI, planURI) {
+		return false
+	}
+	// An installation change is a different provider binding even when the
+	// provider-neutral path is unchanged.
+	return resolved.OwnerID > 0 && resolved.OwnerID == session.VirtualSourceOwnerInstallationID
 }
 
 // virtualCodecAgreesV3 reports whether every video-codec spelling the row
@@ -12662,6 +12724,29 @@ var transportFailureClassificationsV3 = map[string]bool{
 // classification so the transport-failure lookup is spelling-insensitive.
 func failureClassificationKeyV3(classification string) string {
 	return strings.ToLower(strings.TrimSpace(classification))
+}
+
+// connectivityFailureClassificationsV3 use named constants so the repeated
+// client-reported strings do not trip the repeated-string lint.
+const (
+	connectivityTransportStallV3 = "transport_stall"
+	connectivityNetworkErrorV3   = "network_error"
+	connectivityNetworkFailureV3 = "network_failure"
+)
+
+// connectivityFailureClassificationsV3 are client classifications that mean
+// the network did not deliver bytes, so they do not indict the recipe. The
+// protocol requires the client to reconnect rather than report these through
+// failure_recovery (§6.2), but a client that reports one anyway must not spend
+// the route ladder on a transient loss.
+var connectivityFailureClassificationsV3 = map[string]bool{
+	connectivityTransportStallV3: true,
+	connectivityNetworkErrorV3:   true,
+	connectivityNetworkFailureV3: true,
+}
+
+func connectivityFailureClassificationV3(classification string) bool {
+	return connectivityFailureClassificationsV3[failureClassificationKeyV3(classification)]
 }
 
 // failureRecoveryAbandonedDeliveryV3 reports whether this replan is a failure

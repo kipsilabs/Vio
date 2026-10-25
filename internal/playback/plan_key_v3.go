@@ -54,10 +54,14 @@ func PlanAttemptKeyV3(plan PlanV3, outputContextID string, localMutations []stri
 	sort.Strings(transformations)
 	mutations := append([]string(nil), localMutations...)
 	sort.Strings(mutations)
+	planID := plan.PlanID
+	if plan.CanonicalPlanID != "" {
+		planID = plan.CanonicalPlanID
+	}
 	// The canonical string is a server implementation detail built from
 	// lowercase wire tokens; clients treat the resulting key as opaque.
 	parts := []string{
-		plan.PlanID,
+		planID,
 		string(plan.Delivery),
 		string(plan.Stream.Protocol),
 		strings.ToLower(plan.Stream.Container),

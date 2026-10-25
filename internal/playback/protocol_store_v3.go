@@ -204,6 +204,12 @@ type AttemptRecordV3 struct {
 	// reads the revision with the state and a mismatched write is retried
 	// against the freshly read state instead of clobbering it.
 	RecoveryRevision int64
+	// StreamReissues records how many times this attempt reissued a recipe
+	// after mid-stream connectivity loss.
+	StreamReissues int `json:"stream_reissues,omitempty"`
+	// CurrentTransportRendered records whether the active transport generation
+	// has delivered a verified first_frame route event.
+	CurrentTransportRendered bool `json:"current_transport_rendered,omitempty"`
 }
 
 // RecoveryStateV3 is the durable, attempt-scoped recovery memory. The
@@ -657,7 +663,8 @@ func (s *MemoryPlanStoreV3) SaveAttempt(_ context.Context, record AttemptRecordV
 		}
 		return ErrPlaybackAttemptExistsV3
 	}
-	record.LastSequence, record.LastSample, record.StoppedAt, record.StopID = 0, nil, nil, ""
+	record.LastSequence, record.LastSample, record.StoppedAt, record.StopID, record.StreamReissues = 0, nil, nil, "", 0
+	record.CurrentTransportRendered = false
 	s.attempts[record.PlaybackAttemptID] = record
 	return nil
 }
@@ -827,6 +834,14 @@ func (s *MemoryPlanStoreV3) RecordRouteEvent(_ context.Context, record RouteEven
 		}
 	}
 	s.events = append(s.events, record)
+	if record.Event == RouteEventFirstFrameV3 && record.PlanID != "" {
+		if att, ok := s.attempts[record.PlaybackAttemptID]; ok {
+			if att.CurrentPlanID == record.PlanID {
+				att.CurrentTransportRendered = true
+				s.attempts[record.PlaybackAttemptID] = att
+			}
+		}
+	}
 	return true, nil
 }
 

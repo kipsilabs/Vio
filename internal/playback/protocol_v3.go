@@ -440,6 +440,13 @@ const (
 // administrator's local or remote per-stream bitrate limit for this version.
 const TerminalBitratePolicyUnavailableV3 = "bitrate_policy_unavailable"
 
+// TerminalRoutesExhaustedV3 reports that video adaptation is the only route
+// left after attempt history already retired the source-preserving routes, but
+// transcoding is unavailable. Unlike transcoding_disabled, a first plan never
+// reaches this reason: it names recovery history as the blocker, so retrying is
+// meaningful once the transient cause clears or the operator enables encoding.
+const TerminalRoutesExhaustedV3 = "routes_exhausted"
+
 type SubtitleModeV3 string
 
 const (
@@ -1202,6 +1209,11 @@ type AvailableQualityV3 struct {
 type PlanV3 struct {
 	ProtocolVersion int    `json:"protocol_version"`
 	PlanID          string `json:"plan_id"`
+	// CanonicalPlanID is the unsalted plan ID that identifies the recipe for
+	// this attempt. Replan installations incorporate a unique generation salt
+	// into PlanID for transport identity; CanonicalPlanID stays invariant so
+	// server-side recipe exclusion and PlanAttemptKey are computed consistently.
+	CanonicalPlanID string `json:"canonical_plan_id,omitempty"`
 	// PlanAttemptKey is the server-computed opaque loop-prevention token for
 	// this plan. Clients store the keys of attempted plans and echo them in
 	// attempted_plan_keys on replan; they never compute keys themselves.
