@@ -56,6 +56,65 @@ describe("sequenced playback mutations", () => {
     expect(JSON.parse(bodies[2])).toMatchObject({ ...sample, position: 10, sequence: 2 });
   });
 
+  it("reads the live sample when a queued progress request actually sends", async () => {
+    let releaseFirst: (response: Response) => void = () => {};
+    const heldFirst = new Promise<Response>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const fetcher = vi
+      .fn()
+      // The first reply is held while the viewer pauses; the queued second
+      // sample must report the current element state, not its enqueue one.
+      .mockImplementationOnce(() => heldFirst)
+      .mockImplementation(async () => applied());
+    vi.stubGlobal("fetch", fetcher);
+    registerSessionMutations("progress-live", "install");
+    let current = { position: 30, is_paused: false };
+    observeSessionProgress("progress-live", () => current);
+    const first = sendSessionProgress(config, "progress-live", current);
+    // The viewer pauses before the queued request's turn. The live sample, not
+    // the enqueued one, is what goes on the wire.
+    current = { position: 31, is_paused: true };
+    const second = sendSessionProgress(config, "progress-live", {
+      position: 30.5,
+      is_paused: false,
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(fetcher.mock.calls[0]![1].body)).toMatchObject({
+      position: 31,
+      is_paused: true,
+      sequence: 1,
+    });
+
+    // A later sample read when the second request's own turn arrives.
+    current = { position: 40, is_paused: true };
+    releaseFirst(applied());
+    await Promise.all([first, second]);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(fetcher.mock.calls[1]![1].body)).toMatchObject({
+      position: 40,
+      is_paused: true,
+      sequence: 2,
+    });
+  });
+
+  it("keeps a pinned pause sample even when the live sample is playing", async () => {
+    const fetcher = vi.fn().mockImplementation(async () => applied());
+    vi.stubGlobal("fetch", fetcher);
+    registerSessionMutations("progress-pinned", "install");
+    observeSessionProgress("progress-pinned", () => ({ position: 50, is_paused: false }));
+    await sendSessionProgress(config, "progress-pinned", { position: 40, is_paused: true }, true, {
+      pinned: true,
+    });
+    expect(JSON.parse(fetcher.mock.calls[0]![1].body)).toMatchObject({
+      position: 40,
+      is_paused: true,
+      sequence: 1,
+    });
+  });
+
   it("retries a 5xx progress reply but not a 4xx", async () => {
     vi.useFakeTimers();
     const fetcher = vi

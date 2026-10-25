@@ -2561,10 +2561,19 @@ describe("WatchPage realtime reconnect reconcile", () => {
       }),
     );
 
-    // The reconcile runs only once the player reports a live socket.
+    // The reconcile is for a reconnection. The first live socket is the one
+    // the starting player opened, one read after the mounted detail query.
     const connProps = videoPlayerMock.mock.calls.at(-1)?.[0] as {
-      onRealtimeConnectionStateChange?: (state: "connected") => void;
+      onRealtimeConnectionStateChange?: (state: "connected" | "connecting") => void;
     };
+    act(() => {
+      connProps.onRealtimeConnectionStateChange?.("connected");
+    });
+    expect(fetchWatchDetailMock).not.toHaveBeenCalled();
+
+    act(() => {
+      connProps.onRealtimeConnectionStateChange?.("connecting");
+    });
     act(() => {
       connProps.onRealtimeConnectionStateChange?.("connected");
     });
@@ -2604,8 +2613,14 @@ describe("WatchPage realtime reconnect reconcile", () => {
     await waitFor(() => expect(fetchWatchDetailMock).toHaveBeenCalledTimes(0));
 
     const connProps = videoPlayerMock.mock.calls.at(-1)?.[0] as {
-      onRealtimeConnectionStateChange?: (state: "connected") => void;
+      onRealtimeConnectionStateChange?: (state: "connected" | "connecting") => void;
     };
+    act(() => {
+      connProps.onRealtimeConnectionStateChange?.("connected");
+    });
+    act(() => {
+      connProps.onRealtimeConnectionStateChange?.("connecting");
+    });
     act(() => {
       connProps.onRealtimeConnectionStateChange?.("connected");
     });

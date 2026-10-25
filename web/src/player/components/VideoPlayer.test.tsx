@@ -39,6 +39,7 @@ const controls = vi.hoisted(() => ({
   current: null as null | {
     currentTime: number;
     duration: number;
+    playing?: boolean;
     onSeek: (seconds: number) => void;
     activeSubtitleIndex: number | null;
     subtitleTracks: PlayerSubtitleInfo[];
@@ -271,6 +272,7 @@ vi.mock("./PlayerControls", () => ({
     (props: {
       currentTime: number;
       duration: number;
+      playing?: boolean;
       onSeek: (seconds: number) => void;
       activeSubtitleIndex: number | null;
       subtitleTracks: PlayerSubtitleInfo[];
@@ -6036,7 +6038,7 @@ describe("VideoPlayer translation handoff", () => {
     }
   });
 
-  it("warms the new transport once when transportRevision bumps and not on first load", async () => {
+  it("warms a changed transport once per route, not on first load or for a seek", async () => {
     const fetchMock = vi
       .spyOn(globalThis, "fetch")
       .mockResolvedValue(new Response(null, { status: 200 }));
@@ -6066,9 +6068,103 @@ describe("VideoPlayer translation handoff", () => {
       // refire the warm fetch.
       rerenderPlayer({ planRevision: 3, transportRevision: 2 });
       expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      // A seek reanchor bumps the transport revision and mints a new stream
+      // URL, but its route is unchanged. The element's own load is the only
+      // request the seek needs; warming it would spawn a second remux seek.
+      const seekPlan = fixturePlanV3({
+        ...directPlan,
+        plan_id: "plan:seek",
+        plan_attempt_key: "v3:seek",
+        stream: { ...directPlan.stream, url: "/stream/session-1?seek=900" },
+      });
+      rerenderPlayer({
+        plan: seekPlan,
+        streamUrl: "/api/v1/stream/session-1?seek=900&token=token",
+        planRevision: 4,
+        transportRevision: 3,
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
     } finally {
       fetchMock.mockRestore();
     }
+  });
+
+  it("never warms an HLS transport: hls.js loads the playlist itself", async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(null, { status: 200 }));
+    try {
+      const hlsPlan = fixturePlanV3();
+      const { rerenderPlayer } = renderPlayer({
+        plan: hlsPlan,
+        streamUrl: "/api/v1/stream/session-1/master.m3u8?token=token",
+        planRevision: 1,
+        transportRevision: 0,
+      });
+      expect(fetchMock).not.toHaveBeenCalled();
+
+      // A quality change replaces the manifest URL and bumps the transport.
+      const qualityPlan = fixturePlanV3({
+        plan_id: "plan:quality",
+        plan_attempt_key: "v3:quality",
+        stream: {
+          ...hlsPlan.stream,
+          url: "/stream/session-1/master.m3u8?quality=1080",
+        },
+      });
+      rerenderPlayer({
+        plan: qualityPlan,
+        streamUrl: "/api/v1/stream/session-1/master.m3u8?quality=1080&token=token",
+        planRevision: 2,
+        transportRevision: 2,
+      });
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
+  it("drives the play/pause icon from the element's own state", async () => {
+    const { container } = renderPlayer();
+    const video = container.querySelector("video") as HTMLVideoElement;
+    const setPaused = (paused: boolean) => {
+      Object.defineProperty(video, "paused", { configurable: true, value: paused });
+    };
+
+    setPaused(false);
+    act(() => {
+      video.dispatchEvent(new Event("play"));
+    });
+    expect(controls.current?.playing).toBe(true);
+
+    // The element pauses itself (a teardown load, the browser, a lost route):
+    // the icon follows the element, not the player's last intent.
+    setPaused(true);
+    act(() => {
+      video.dispatchEvent(new Event("emptied"));
+    });
+    expect(controls.current?.playing).toBe(false);
+
+    // A buffering stall is not a pause; it must not flip the icon.
+    setPaused(false);
+    act(() => {
+      video.dispatchEvent(new Event("waiting"));
+    });
+    expect(controls.current?.playing).toBe(true);
+
+    setPaused(true);
+    act(() => {
+      video.dispatchEvent(new Event("pause"));
+    });
+    expect(controls.current?.playing).toBe(false);
+
+    // A resume that only reports `playing` (no fresh `play`) still shows play.
+    setPaused(false);
+    act(() => {
+      video.dispatchEvent(new Event("playing"));
+    });
+    expect(controls.current?.playing).toBe(true);
   });
 
   it("refreshes the subtitle inventory once per source generation on a source-changed signal", async () => {
