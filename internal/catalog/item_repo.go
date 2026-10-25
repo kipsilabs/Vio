@@ -4566,19 +4566,26 @@ func (r *ItemRepository) Delete(ctx context.Context, contentID string) ([]string
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	// Collect image paths before deletion.
+	// Collect image paths before deletion. The outer COALESCE covers every
+	// artwork surface: episodes.still_path is still nullable, and a NULL there
+	// surfaces under the union's first column name (poster_path), so scanning
+	// the union raw fails the whole delete for a series with an unstilled
+	// episode.
 	imgRows, err := tx.Query(ctx, `
-		SELECT poster_path, backdrop_path, logo_path FROM media_items WHERE content_id = $1
-		UNION ALL
-		SELECT banner_path, thumb_path, clearart_path FROM media_items WHERE content_id = $1
-		UNION ALL
-		SELECT disc_path, '', '' FROM media_items WHERE content_id = $1
-		UNION ALL
-		SELECT path, '', '' FROM media_item_backdrops WHERE content_id = $1
-		UNION ALL
-		SELECT poster_path, '', '' FROM seasons WHERE series_id = $1
-		UNION ALL
-		SELECT still_path, '', '' FROM episodes WHERE series_id = $1
+		SELECT COALESCE(poster_path, ''), COALESCE(backdrop_path, ''), COALESCE(logo_path, '')
+		FROM (
+			SELECT poster_path, backdrop_path, logo_path FROM media_items WHERE content_id = $1
+			UNION ALL
+			SELECT banner_path, thumb_path, clearart_path FROM media_items WHERE content_id = $1
+			UNION ALL
+			SELECT disc_path, '', '' FROM media_items WHERE content_id = $1
+			UNION ALL
+			SELECT path, '', '' FROM media_item_backdrops WHERE content_id = $1
+			UNION ALL
+			SELECT poster_path, '', '' FROM seasons WHERE series_id = $1
+			UNION ALL
+			SELECT still_path, '', '' FROM episodes WHERE series_id = $1
+		) artwork
 	`, contentID)
 	if err != nil {
 		return nil, fmt.Errorf("collecting image paths before delete: %w", err)

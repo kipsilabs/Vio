@@ -1013,20 +1013,27 @@ func collectOrphanIDs(ctx context.Context, tx pgx.Tx, contentIDs []string) ([]st
 // the given content IDs (items, their seasons, episodes and local extras), without
 // filtering out dirs still used by other content.
 func collectRawImageDirs(ctx context.Context, q rowQuerier, contentIDs []string) ([]string, error) {
+	// The outer COALESCE covers every artwork surface: episodes.still_path is
+	// still nullable, and a NULL there surfaces under the union's first column
+	// name (poster_path), so scanning the union raw fails when a series has an
+	// unstilled episode.
 	imgRows, err := q.Query(ctx, `
-		SELECT poster_path, backdrop_path, logo_path FROM media_items WHERE content_id = ANY($1)
-		UNION ALL
-		SELECT banner_path, thumb_path, clearart_path FROM media_items WHERE content_id = ANY($1)
-		UNION ALL
-		SELECT disc_path, '', '' FROM media_items WHERE content_id = ANY($1)
-		UNION ALL
-		SELECT path, '', '' FROM media_item_backdrops WHERE content_id = ANY($1)
-		UNION ALL
-		SELECT poster_path, '', '' FROM seasons WHERE series_id = ANY($1)
-		UNION ALL
-		SELECT still_path, '', '' FROM episodes WHERE series_id = ANY($1)
-		UNION ALL
-		SELECT still_path, '', '' FROM media_extras WHERE parent_id = ANY($1)
+		SELECT COALESCE(poster_path, ''), COALESCE(backdrop_path, ''), COALESCE(logo_path, '')
+		FROM (
+			SELECT poster_path, backdrop_path, logo_path FROM media_items WHERE content_id = ANY($1)
+			UNION ALL
+			SELECT banner_path, thumb_path, clearart_path FROM media_items WHERE content_id = ANY($1)
+			UNION ALL
+			SELECT disc_path, '', '' FROM media_items WHERE content_id = ANY($1)
+			UNION ALL
+			SELECT path, '', '' FROM media_item_backdrops WHERE content_id = ANY($1)
+			UNION ALL
+			SELECT poster_path, '', '' FROM seasons WHERE series_id = ANY($1)
+			UNION ALL
+			SELECT still_path, '', '' FROM episodes WHERE series_id = ANY($1)
+			UNION ALL
+			SELECT still_path, '', '' FROM media_extras WHERE parent_id = ANY($1)
+		) artwork
 	`, contentIDs)
 	if err != nil {
 		return nil, fmt.Errorf("collecting image paths: %w", err)
