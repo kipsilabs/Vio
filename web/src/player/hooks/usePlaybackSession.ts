@@ -1716,6 +1716,14 @@ export function usePlaybackSession(
       if (reconnectRef.current.active) playbackPlayingRef.current = reconnectRef.current.resume;
       planAutoPlayRef.current = playbackPlayingRef.current;
       planTransportShownRef.current = false;
+      const attemptId = playbackAttemptIdRef.current;
+      if (prevPlan !== null && planWasReplaced(prevPlan, plan) && attemptId) {
+        firstFrameRef.current = {
+          attemptId,
+          reported: false,
+          intentAt: performance.now(),
+        };
+      }
       endReconnect(true);
       const sessionId = plan.session_id ?? decision.session_id ?? sessionIdRef.current;
       // The verified-inventory anchor in force *before* this adoption. A real
