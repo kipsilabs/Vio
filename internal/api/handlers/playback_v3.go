@@ -10201,18 +10201,16 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		// cannot be confused with an earlier installation, while preserving
 		// the canonical recipe attempt key for loop retirement.
 		finalizeReplanPlanIdentityV3(result.Plan, record.PlaybackAttemptID, req.ReplanRequestID, start.ClientPlaybackContext.Output.OutputContextID)
+		artifactRecipe.PlanID = result.Plan.PlanID
 	}
 	response := playback.DecisionResponseV3{ProtocolVersion: playback.ProtocolV3, ServerFeatures: serverFeaturesForRequestV3(r.Context()), Outcome: playback.OutcomePlayableV3, SessionID: session.ID, PlaybackPlan: result.Plan}
 	updated := *record
 	updated.CurrentPlanID = result.Plan.PlanID
 	updated.CurrentPlan = *result.Plan
-	// A seek reanchor replays the durable recipe verbatim (updated already
-	// carries it); re-freezing from live inventory could only re-introduce
-	// the drift this path exists to exclude. Every other replan just accepted
-	// a freshly planned route and must freeze its recipe — loudly, because a
-	// recipe with a silently missing subtitle identity would disable drift
-	// detection for every later seek on this attempt.
-	if !seekReanchor {
+	// A seek reanchor that reuses the transport replays the durable recipe
+	// verbatim; a rebuilt seek or newly planned replan binds the frozen
+	// recipe to the final installed plan ID so ValidFor remains true.
+	if !seekReanchor || !transportReused {
 		updated.FrozenRecipe = artifactRecipe
 	}
 	updated.NormalizedRequest = start

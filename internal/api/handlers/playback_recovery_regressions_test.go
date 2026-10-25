@@ -864,3 +864,84 @@ func TestHandleReplanPlaybackV3RebuiltSeekTransportStartsUnrendered(t *testing.T
 		t.Fatalf("unrendered rebuilt seek transport must not be reissued, got: %#v", failResp)
 	}
 }
+
+// Ordinary rebuilding replan and rebuilt seek must bind the committed frozen recipe to the final installed plan ID,
+// so that ValidFor remains true and a subsequent seek reanchor succeeds.
+func TestHandleReplanPlaybackV3RebuiltPlanFrozenRecipeValidForSubsequentSeek(t *testing.T) {
+	file := v3HandlerFixtureFile(t)
+	file.AudioTracks = append(file.AudioTracks, models.AudioTrack{Codec: "aac", Channels: 2, Layout: "stereo", Language: "fra"})
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), testPlaybackFileResolver{file: file})
+	stubCopySeekAnchorV3(handler)
+	handler.PlaybackConfig = playbackTestConfigNoTranscode(t.TempDir())
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "true"}}
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+
+	startRequest := v3HandlerStartRequest()
+	startRequest.QualityPreference = "original"
+	orig := startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassOriginalHTTPV3]
+	orig.ValidatedClaims = []string{playback.ClaimClientSelectedAudioTrackV3}
+	startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassOriginalHTTPV3] = orig
+	started := startV3PlaybackForHandlerTest(t, handler, startRequest)
+	if started.PlaybackPlan == nil {
+		t.Fatalf("start plan = %#v", started)
+	}
+
+	// 1. Ordinary rebuilding replan (track change installs a new transport).
+	audioIdx1 := 1
+	trackChangeReq := playback.ReplanRequestV3{
+		ProtocolVersion:       playback.ProtocolV3,
+		Operation:             playback.ReplanOperationTrackChangeV3,
+		PlaybackAttemptID:     startRequest.PlaybackAttemptID,
+		ReplanRequestID:       "replan-tc-rebuild-001",
+		FailedPlanID:          started.PlaybackPlan.PlanID,
+		PlanAttemptID:         "plan-attempt-tc-rb",
+		PlanAttemptKey:        started.PlaybackPlan.PlanAttemptKey,
+		AttemptCount:          1,
+		PositionSeconds:       10,
+		SelectedTracks:        playback.SelectedTracksV3{Audio: &playback.TrackIdentityV3{ID: "file:42:audio:1", Index: &audioIdx1}},
+		Capabilities:          startRequest.Capabilities,
+		ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	}
+	replanResp := postPlaybackReplanV3(t, handler, started.SessionID, trackChangeReq)
+	if replanResp.Outcome != playback.OutcomePlayableV3 || replanResp.PlaybackPlan == nil {
+		t.Fatalf("track change failed: %#v", replanResp)
+	}
+
+	// Assert updated attempt has FrozenRecipe.ValidFor(CurrentPlan) == true!
+	recAfterReplan, err := handler.PlanStoreV3.GetAttempt(context.Background(), started.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !recAfterReplan.FrozenRecipe.ValidFor(recAfterReplan.CurrentPlan) {
+		t.Fatalf("frozen recipe PlanID %q is not valid for CurrentPlan %q", recAfterReplan.FrozenRecipe.PlanID, recAfterReplan.CurrentPlan.PlanID)
+	}
+
+	// 2. Subsequent seek reanchor succeeds!
+	seekReq := playback.ReplanRequestV3{
+		ProtocolVersion:       playback.ProtocolV3,
+		Operation:             playback.ReplanOperationSeekReanchorV3,
+		PlaybackAttemptID:     startRequest.PlaybackAttemptID,
+		ReplanRequestID:       "replan-seek-after-tc",
+		FailedPlanID:          replanResp.PlaybackPlan.PlanID,
+		PlanAttemptID:         "plan-attempt-seek-after-tc",
+		PlanAttemptKey:        replanResp.PlaybackPlan.PlanAttemptKey,
+		AttemptCount:          1,
+		PositionSeconds:       25,
+		SelectedTracks:        replanResp.PlaybackPlan.SelectedTracks,
+		Capabilities:          startRequest.Capabilities,
+		ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	}
+	seekResp := postPlaybackReplanV3(t, handler, started.SessionID, seekReq)
+	if seekResp.Outcome != playback.OutcomePlayableV3 || seekResp.PlaybackPlan == nil {
+		t.Fatalf("subsequent seek failed: %#v", seekResp)
+	}
+
+	// Assert updated attempt after seek reanchor still has FrozenRecipe.ValidFor(CurrentPlan) == true!
+	recAfterSeek, err := handler.PlanStoreV3.GetAttempt(context.Background(), started.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !recAfterSeek.FrozenRecipe.ValidFor(recAfterSeek.CurrentPlan) {
+		t.Fatalf("frozen recipe PlanID %q after seek is not valid for CurrentPlan %q", recAfterSeek.FrozenRecipe.PlanID, recAfterSeek.CurrentPlan.PlanID)
+	}
+}
