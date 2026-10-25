@@ -200,6 +200,13 @@ func TestFarSeekStaleGenerationAfterRestartServesFromLiveGeneration(t *testing.T
 		t.Fatalf("pre-restart stale token = %d %q, want the stale_generation verdict", beforeRestart.Code, beforeRestart.Body.String())
 	}
 
+	// The init segment is generation-independent for the same recipe, so a
+	// playlist fetched before the rotation keeps working through it.
+	staleInit := segmentRequest("init.mp4", staleToken)
+	if staleInit.Code != http.StatusOK {
+		t.Fatalf("stale-token init = %d %q, want 200 from the live generation", staleInit.Code, staleInit.Body.String())
+	}
+
 	// The replacement generation's own token serves the rest of its playlist.
 	initRec := segmentRequest("init.mp4", currentToken)
 	if initRec.Code != http.StatusOK {
