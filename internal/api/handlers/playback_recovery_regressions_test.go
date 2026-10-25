@@ -944,4 +944,24 @@ func TestHandleReplanPlaybackV3RebuiltPlanFrozenRecipeValidForSubsequentSeek(t *
 	if !recAfterSeek.FrozenRecipe.ValidFor(recAfterSeek.CurrentPlan) {
 		t.Fatalf("frozen recipe PlanID %q after seek is not valid for CurrentPlan %q", recAfterSeek.FrozenRecipe.PlanID, recAfterSeek.CurrentPlan.PlanID)
 	}
+
+	// 3. Second seek reanchor after the first seek also succeeds!
+	seekReq2 := playback.ReplanRequestV3{
+		ProtocolVersion:       playback.ProtocolV3,
+		Operation:             playback.ReplanOperationSeekReanchorV3,
+		PlaybackAttemptID:     startRequest.PlaybackAttemptID,
+		ReplanRequestID:       "replan-seek-2-after-tc",
+		FailedPlanID:          seekResp.PlaybackPlan.PlanID,
+		PlanAttemptID:         "plan-attempt-seek-2-after-tc",
+		PlanAttemptKey:        seekResp.PlaybackPlan.PlanAttemptKey,
+		AttemptCount:          1,
+		PositionSeconds:       30,
+		SelectedTracks:        seekResp.PlaybackPlan.SelectedTracks,
+		Capabilities:          startRequest.Capabilities,
+		ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	}
+	seekResp2 := postPlaybackReplanV3(t, handler, started.SessionID, seekReq2)
+	if seekResp2.Outcome != playback.OutcomePlayableV3 || seekResp2.PlaybackPlan == nil {
+		t.Fatalf("second seek failed: %#v", seekResp2)
+	}
 }
