@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Silo-Server/silo-server/internal/contentid"
 	"github.com/Silo-Server/silo-server/internal/requestlock"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary/stream"
 )
@@ -1407,7 +1408,7 @@ func validateVirtualMedia(in VirtualMedia) error {
 		return err
 	}
 	switch in.SeasonNumberingSource {
-	case "", "tvdb", "tmdb":
+	case "", contentid.ProviderTVDB, contentid.ProviderTMDB:
 	default:
 		return fmt.Errorf("%w: season_numbering_source must be tvdb, tmdb, or empty", ErrInvalidVirtualMedia)
 	}

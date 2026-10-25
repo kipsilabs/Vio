@@ -224,7 +224,7 @@ func TestRunPassPersistsSameSourceProgressOnDeferredItem(t *testing.T) {
 	m.evaluateFn = func(_ context.Context, item monitoredMedia) (monitoredMedia, string, error) {
 		item.Episodes = []virtualEpisode{{Season: 1, Episode: 1, Title: "Pilot"}}
 		item.MetadataNextSeason = 1
-		return item, "Selected metadata source unavailable; monitoring will retry", context.DeadlineExceeded
+		return item, selectedSourceUnavailableMessage, context.DeadlineExceeded
 	}
 
 	resp, err := m.runPass(context.Background(), []monitoredMedia{item}, &trackingRegistrar{})

@@ -497,6 +497,11 @@ const (
 	// mediaTypeMovie is the movie media-type value shared by the queue's
 	// movie/series branches.
 	mediaTypeMovie = "movie"
+
+	// selectedSourceUnavailableMessage is the deferral reason when a frozen
+	// request source fails and the item is queued for a retry instead of
+	// falling back to another provider's numbering.
+	selectedSourceUnavailableMessage = "Selected metadata source unavailable; monitoring will retry"
 )
 
 // monitorState is the on-disk monitor queue. Older releases wrote a bare JSON
@@ -2544,7 +2549,7 @@ func (m *mediaMonitor) resolveLibraryMetadata(
 				}
 				item = enriched
 			}
-			return item, "Selected metadata source unavailable; monitoring will retry", err
+			return item, selectedSourceUnavailableMessage, err
 		}
 		// Enrichment is optional. Keep whatever usable metadata the
 		// resolver already had and fall back to public providers.

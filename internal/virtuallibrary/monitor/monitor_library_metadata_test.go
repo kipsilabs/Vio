@@ -143,7 +143,7 @@ func TestEvaluateKeepsSameSourcePartialProgressOnRetryableFailure(t *testing.T) 
 	if err == nil {
 		t.Fatal("a frozen source failure must defer the item, not fall back")
 	}
-	if message != "Selected metadata source unavailable; monitoring will retry" {
+	if message != selectedSourceUnavailableMessage {
 		t.Fatalf("message = %q, want the retry message", message)
 	}
 	if len(updated.Episodes) != 1 || updated.Episodes[0].Title != "Pilot" {
