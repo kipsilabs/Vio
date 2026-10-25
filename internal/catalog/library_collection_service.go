@@ -651,6 +651,11 @@ func (s *LibraryCollectionService) acceptCollectionItems(ctx context.Context, co
 		return errors.New("collection sync preparation is missing")
 	}
 	if tracker.err != nil {
+		// Only collection-level preparation failures poison the run: release
+		// evidence that cannot be evaluated (fail closed) and canonical alias
+		// conflicts. A member's own provider or variant failure is a per-entry
+		// warning, recorded by the sync loop, so the remaining members still
+		// commit.
 		return tracker.err
 	}
 	prepared := make(map[string]preparedCollectionItem, len(matched))
@@ -1022,17 +1027,17 @@ func (s *LibraryCollectionService) EnsureCollectionItemMaterializedWithOptions(
 		}
 		variants, err = s.configuredVirtualVariants(ctx, uri, item.Type)
 		if err != nil {
-			err = fmt.Errorf("%w: getting virtual profile variants: %w", ErrProviderUnavailable, err)
-			if tracker != nil {
-				tracker.err = err
-			}
-			return nil, err
+			// Provider variant resolution is member-scoped: this item has no
+			// playable variants right now, but the rest of the collection can
+			// still sync. Callers record the failure as a run warning and skip
+			// the member, and the next sync retries it. Do not poison the
+			// collection run through tracker.err.
+			return nil, fmt.Errorf("%w: getting virtual profile variants: %w", ErrProviderUnavailable, err)
 		}
 	}
 	if len(variants) == 0 {
-		if tracker != nil {
-			tracker.err = ErrProviderUnavailable
-		}
+		// Same member-scoped outcome as a failed provider call: this item
+		// resolved no variants, so skip it without failing the collection.
 		return nil, ErrProviderUnavailable
 	}
 	if tracker != nil {
