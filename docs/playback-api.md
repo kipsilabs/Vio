@@ -460,6 +460,18 @@ off. There is no new request or response field: a client that always sends its
 own selection is unaffected, and a second device on the same profile never
 inherits another device's picks.
 
+Client guidance for resume and restarts:
+
+- Send `start_position` when the player already knows where to begin, or omit it
+  so the server applies its own resume policy. Send an explicit `0` only for a
+  deliberate start-over; the server must not reinterpret it as "resume".
+- Do not start at zero and seek afterwards. That fetches the head of the
+  timeline, then forces a second generation to be produced at the real position
+  and costs the same seek recovery a direct start avoids.
+- On a restart or reconnect, resend the viewer's audio and subtitle selection.
+  The server carries it for the same client, but an explicit request is
+  authoritative and survives a client identity that the server cannot match.
+
 Two terminal reasons describe a source without stream metadata.
 `source_metadata_incomplete` (`retryable: true`) means the file has not been
 probed yet, or its probe lacks a field a route needs; trying again after the
@@ -566,6 +578,11 @@ reply was lost. An attempt started with `progress_persistence: "client"`
 records no resume position; multi-part audiobooks use it and report their
 global position through `POST /api/v2/sync/progress`.
 
+The progress response is an acknowledgement, not a long-poll or a state feed.
+Post-CAS side effects run under a bounded budget, so a slow writer cannot hold
+the receipt; keep the heartbeat at its normal cadence and never derive pause or
+play state from how long the receipt took.
+
 Stop accepts `{installation_id, stop_id}` plus an optional final sample
 `{sequence, position, is_paused}`; `sequence` and `position` appear together or
 not at all. `stop_id` is a canonical UUID the client mints once and keeps on
@@ -643,12 +660,31 @@ unsatisfiable range is `416 range_not_satisfiable`. A failure before the first
 byte is a v2 problem; a failure after it ends the stream. A stopped, expired or
 terminated session answers `410 playback_session_ended`.
 
+A progressive remux commits its body only after FFmpeg produces a media byte.
+If no byte arrives within 15 seconds (a provider candidate that accepts the
+connection but never serves), the server closes the process and answers a
+pre-body failure (502 / retryable dependency problem) instead of holding the
+response. Clients should treat that as retryable: retry or replan to another
+candidate rather than waiting for the stream to start.
+
+A seek is one server operation. Issue a single media request for the new
+position; sending the same seek twice (or aborting and immediately re-sending an
+identical request) spawns a second remux/transcode for the same position and
+doubles encoder work. Retry only after a response, a timeout, or a client-side
+failure verdict.
+
 Segment URLs the manifest exposes carry an opaque `sgen` generation token. A
 segment request whose token names a generation the server no longer serves —
 neither the live FFmpeg timeline nor a retained switchover predecessor — answers
 `412 stale_generation`; the client reloads the manifest and re-addresses the
 segment to the current generation. A request without `sgen`, minted before the
 token existed, keeps the legacy behavior.
+
+A `412` on a segment is a playlist-staleness signal, not a retryable fragment
+error: retrying the same URL with the same `sgen` cannot succeed. Refetch the
+playlist (or the manifest URL the client loaded) and retry the same position
+with the new URLs. Do not count the `412` against the fragment retry budget and
+do not tear down the session for it.
 
 An in-place restart (a far seek or a switchover) rotates the generation but
 continues the same absolute segmented timeline: segment numbers are absolute, so
@@ -657,7 +693,14 @@ generation when the live generation restarted at or before the requested segment
 number. A segment before the restart point still answers `412`, because the live
 generation never produced that position. This keeps a client that has not yet
 refetched the playlist playing through the restart instead of exhausting its
-fragment retry budget against a URL the server replaced.
+fragment retry budget against a URL the server replaced. The `init.mp4` segment
+is generation-independent for the same recipe and is served through the rotation
+too.
+
+A far-seek segment request that schedules a restart is held for the restarted
+generation's output (bounded to 6 seconds and stall-aware) and then served.
+Clients should let that request finish; if it still answers `412`, refetch the
+playlist as above.
 
 Subtitle inventory URLs in v2 playback responses use the `/api/v2/stream/`
 mount, including relative `/stream/` values produced by the shared inventory
