@@ -25,6 +25,13 @@ import {
 } from "@/lib/mediaRequests";
 import { cn } from "@/lib/utils";
 
+type SeasonSource = "tvdb" | "tmdb";
+
+/** Unknown or absent provider metadata falls back to the server default. */
+function seasonSourceOf(detail?: RequestMediaDetail): SeasonSource {
+  return detail?.season_source === "tmdb" ? "tmdb" : "tvdb";
+}
+
 interface RequestSeasonsDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -49,11 +56,18 @@ export function RequestSeasonsDialog({
   title,
   detail: givenDetail,
 }: RequestSeasonsDialogProps) {
-  const loaded = useRequestMediaDetail("series", tmdbID, { enabled: open && !givenDetail });
-  const detail = givenDetail ?? loaded.data;
+  const defaultSource = seasonSourceOf(givenDetail);
+  const [seasonSource, setSeasonSource] = useState<SeasonSource>(defaultSource);
+  const givenMatchesSource =
+    givenDetail !== undefined && seasonSourceOf(givenDetail) === seasonSource;
+  const loaded = useRequestMediaDetail("series", tmdbID, {
+    enabled: open && !givenMatchesSource,
+    seasonSource,
+  });
+  const detail = givenMatchesSource ? givenDetail : loaded.data;
   // A reopened dialog can show the detail from before a request until the
   // refetch lands; don't send from it.
-  const refreshing = !givenDetail && loaded.isFetching;
+  const refreshing = !givenMatchesSource && loaded.isFetching;
   const rowID = useId();
   const createRequest = useCreateMediaRequest();
   // null keeps the default pick, so it follows the detail as it loads.
@@ -78,17 +92,28 @@ export function RequestSeasonsDialog({
   const upcoming = upcomingRequestSeasons(choices);
 
   const close = (next: boolean) => {
-    if (!next) setPicked(null);
+    if (!next) {
+      setPicked(null);
+      setSeasonSource(defaultSource);
+    }
     onOpenChange(next);
   };
   const toggle = (season: number, on: boolean) =>
     setPicked(
       on ? [...selected, season].sort((a, b) => a - b) : selected.filter((s) => s !== season),
     );
+  const changeSource = (source: SeasonSource) => {
+    setSeasonSource(source);
+    setPicked(null);
+  };
   const submit = () => {
     if (!detail) return;
     createRequest.mutate(
-      { ...requestInputFromMediaResult(detail), ...(!serverChooses && { seasons: selected }) },
+      {
+        ...requestInputFromMediaResult(detail),
+        season_source: seasonSource,
+        ...(!serverChooses && { seasons: selected }),
+      },
       { onSuccess: () => close(false) },
     );
   };
@@ -105,6 +130,29 @@ export function RequestSeasonsDialog({
           </DialogDescription>
         </DialogHeader>
 
+        <div
+          role="group"
+          aria-label="Season numbering source"
+          className="bg-muted text-muted-foreground flex w-fit items-center gap-0.5 rounded-md p-0.5 text-xs font-medium"
+        >
+          {(["tvdb", "tmdb"] as const).map((source) => (
+            <button
+              key={source}
+              type="button"
+              aria-pressed={seasonSource === source}
+              onClick={() => changeSource(source)}
+              className={cn(
+                "rounded px-2.5 py-1 transition-colors",
+                seasonSource === source
+                  ? "bg-background text-foreground shadow-sm"
+                  : "hover:text-foreground",
+              )}
+            >
+              {source.toUpperCase()}
+            </button>
+          ))}
+        </div>
+
         {!detail ? (
           <div className="text-muted-foreground flex items-center justify-center gap-2 py-10 text-sm">
             {loaded.isError ? (
@@ -119,7 +167,7 @@ export function RequestSeasonsDialog({
         ) : seasons.length === 0 ? (
           requestable ? (
             <p className="text-muted-foreground py-6 text-center text-sm">
-              TMDB lists no seasons for this series yet; the request covers the whole series.
+              No seasons are listed for this series yet; the request covers the whole series.
             </p>
           ) : null
         ) : (

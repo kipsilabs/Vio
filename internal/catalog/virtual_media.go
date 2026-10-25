@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Silo-Server/silo-server/internal/contentid"
 	"github.com/Silo-Server/silo-server/internal/requestlock"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary/stream"
 )
@@ -174,20 +175,25 @@ type VirtualMedia struct {
 	Genres                               []string
 	PosterPath, BackdropPath, VirtualURI string
 	PosterSourcePath, BackdropSourcePath string
-	RuntimeMinutes                       int
-	Source                               string
-	Resolution                           string
-	CodecVideo                           string
-	CodecAudio                           string
-	HDR                                  string
-	Bitrate                              int
-	FileSize                             int64
-	Container                            string
-	SourceType                           string
-	AudioLanguages                       []string
-	SubtitleLanguages                    []string
-	Episodes                             []VirtualEpisode
-	Variants                             []VirtualMediaVariant
+	// SeasonNumberingSource is the provider whose season and episode numbers
+	// this registration uses ("tvdb" or "tmdb"). Empty means the caller did
+	// not declare a numbering source, which request season joins treat as
+	// incompatible.
+	SeasonNumberingSource string
+	RuntimeMinutes        int
+	Source                string
+	Resolution            string
+	CodecVideo            string
+	CodecAudio            string
+	HDR                   string
+	Bitrate               int
+	FileSize              int64
+	Container             string
+	SourceType            string
+	AudioLanguages        []string
+	SubtitleLanguages     []string
+	Episodes              []VirtualEpisode
+	Variants              []VirtualMediaVariant
 }
 
 type VirtualMediaResult struct {
@@ -596,18 +602,20 @@ func upsertVirtualMediaItem(ctx context.Context, tx pgx.Tx, installationID int, 
 		INSERT INTO media_items(
 			content_id,type,title,year,imdb_id,tmdb_id,tvdb_id,overview,genres,poster_path,backdrop_path,
 			poster_source_path,backdrop_source_path,
-			runtime,matched_at,status,virtual_owner_installation_id,virtual_source,virtual_last_seen_at
+			runtime,matched_at,status,virtual_owner_installation_id,virtual_source,virtual_last_seen_at,
+			season_numbering_source
 		) VALUES(
 			$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,
 			COALESCE(NULLIF($12,''),$10),COALESCE(NULLIF($13,''),$11),
 			$14,
-			CASE WHEN $15='matched' THEN NOW() END,$15,NULLIF($16,0),$17,NOW()
+			CASE WHEN $15='matched' THEN NOW() END,$15,NULLIF($16,0),$17,NOW(),
+			$18
 		)
 		ON CONFLICT(content_id) DO NOTHING
 		RETURNING content_id`,
 		contentID, in.MediaType, in.Title, in.Year, in.IMDbID, in.TMDBID, in.TVDBID,
 		in.Overview, in.Genres, in.PosterPath, in.BackdropPath, in.PosterSourcePath, in.BackdropSourcePath,
-		in.RuntimeMinutes, status, installationID, source,
+		in.RuntimeMinutes, status, installationID, source, in.SeasonNumberingSource,
 	).Scan(&insertedID)
 	if err == nil {
 		return true, nil
@@ -701,11 +709,12 @@ func upsertVirtualMediaItem(ctx context.Context, tx pgx.Tx, installationID int, 
 			virtual_owner_installation_id=NULLIF($13,0),
 			virtual_source=$16,
 			virtual_last_seen_at=NOW(),
+			season_numbering_source=$17,
 			updated_at=NOW()
 		WHERE content_id=$1`,
 		contentID, in.Title, in.Year, in.IMDbID, in.TMDBID, in.TVDBID, in.Overview,
 		in.Genres, in.PosterPath, in.BackdropPath, in.RuntimeMinutes, status,
-		installationID, in.PosterSourcePath, in.BackdropSourcePath, source,
+		installationID, in.PosterSourcePath, in.BackdropSourcePath, source, in.SeasonNumberingSource,
 	); err != nil {
 		return false, fmt.Errorf("update owned virtual media: %w", err)
 	}
@@ -1432,6 +1441,14 @@ func validateVirtualMedia(in VirtualMedia) error {
 	}
 	if err := validateVirtualIdentifiers(in); err != nil {
 		return err
+	}
+	switch in.SeasonNumberingSource {
+	case "", contentid.ProviderTVDB, contentid.ProviderTMDB:
+	default:
+		return fmt.Errorf("%w: season_numbering_source must be tvdb, tmdb, or empty", ErrInvalidVirtualMedia)
+	}
+	if in.MediaType != "series" && in.SeasonNumberingSource != "" {
+		return fmt.Errorf("%w: season_numbering_source is only valid for series", ErrInvalidVirtualMedia)
 	}
 	if in.TMDBID == "" && in.TVDBID == "" && in.IMDbID == "" {
 		return fmt.Errorf("%w: an external identifier is required", ErrInvalidVirtualMedia)

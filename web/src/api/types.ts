@@ -2043,6 +2043,8 @@ export interface RequestMediaDetail {
   director?: string;
   creators?: string[];
   recommendations?: RequestMediaResult[];
+  /** Series: the metadata provider that supplied the season list. */
+  season_source?: "tvdb" | "tmdb";
   /** Series: the regular seasons with library availability and request coverage. */
   seasons?: RequestMediaSeason[];
   availability: RequestAvailability;
@@ -2056,11 +2058,13 @@ export interface RequestMediaDetail {
 export interface RequestMediaSeason {
   season_number: number;
   name?: string;
-  /** YYYY-MM-DD; absent until TMDB dates the season. */
+  /** YYYY-MM-DD; absent until the series metadata provider dates the season. */
   air_date?: string;
-  /** Episodes TMDB lists for the season, aired or not. */
+  /** Episodes the series metadata provider lists for the season, aired or not. */
   episode_count: number;
   poster_path?: string;
+  /** Absolute artwork URL when the provider supplies one instead of a TMDB path. */
+  poster_url?: string;
   /** Whether every aired episode is in the library. */
   availability: "missing" | "partial" | "available";
   /** The title's active request covers this season. */
@@ -2136,6 +2140,8 @@ export interface CreateMediaRequestInput {
   overview?: string;
   poster_path?: string;
   backdrop_path?: string;
+  /** Series only: the season numbering source to use. Omitted: the server prefers TVDB. */
+  season_source?: "tvdb" | "tmdb";
   /** Series only: the seasons to request. Omitted: every aired season not yet in the library. */
   seasons?: number[];
 }

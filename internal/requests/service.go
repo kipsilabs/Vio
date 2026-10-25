@@ -84,6 +84,16 @@ type TVDBIDResolver interface {
 	ResolveSeriesTVDBID(ctx context.Context, tmdbID int, imdbID string) (int, error)
 }
 
+// SeriesSeasonProvider reads a series' season list from TVDB. The request paths
+// prefer it over TMDB, whose grouping collapses long anime into few seasons.
+//
+// The result type is local because requests cannot import internal/metadata:
+// metadata imports internal/notifications, which imports requests. The API
+// layer adapts the metadata service to this interface.
+type SeriesSeasonProvider interface {
+	FetchSeriesTVDBSeasons(ctx context.Context, tvdbID int, language string) ([]SeriesSeason, error)
+}
+
 type Service struct {
 	store                   Store
 	tmdb                    TMDBClient
@@ -95,6 +105,7 @@ type Service struct {
 	users                   access.UserRepository
 	requesterIdentity       RequesterIdentityResolver
 	tvdbResolver            TVDBIDResolver
+	seriesSeasonProvider    SeriesSeasonProvider
 	notifier                FulfillmentNotifier
 	lifecycle               LifecycleNotifier
 	watchlistPref           WatchlistPreference
@@ -162,6 +173,10 @@ func (s *Service) SetRequesterIdentityResolver(r RequesterIdentityResolver) {
 // SetTVDBIDResolver wires the metadata-provider fallback used when TMDB has no
 // TVDB ID for a requested series.
 func (s *Service) SetTVDBIDResolver(r TVDBIDResolver) { s.tvdbResolver = r }
+
+// SetSeriesSeasonProvider wires the TVDB season source used in preference to
+// TMDB's season list for series requests.
+func (s *Service) SetSeriesSeasonProvider(p SeriesSeasonProvider) { s.seriesSeasonProvider = p }
 
 // populateRequesterIdentity fills req.RequesterEmail/Username from the resolver.
 // Nil resolver or any error leaves them empty (the plugin then behaves as admin).
@@ -794,6 +809,16 @@ func (s *Service) DiscoverAll(ctx context.Context, viewer Viewer) ([]DiscoverySe
 // request-state signals used by search and discovery. Recommendations carry
 // their own per-item state so the detail page can render them as request cards.
 func (s *Service) GetDetail(ctx context.Context, viewer Viewer, mediaType MediaType, tmdbID int) (*MediaDetail, error) {
+	return s.getDetail(ctx, viewer, mediaType, tmdbID, "")
+}
+
+// GetDetailWithSeasonSource is GetDetail with an explicit series season
+// numbering source. An empty source keeps the default TVDB-preferred path.
+func (s *Service) GetDetailWithSeasonSource(ctx context.Context, viewer Viewer, mediaType MediaType, tmdbID int, seasonSource string) (*MediaDetail, error) {
+	return s.getDetail(ctx, viewer, mediaType, tmdbID, seasonSource)
+}
+
+func (s *Service) getDetail(ctx context.Context, viewer Viewer, mediaType MediaType, tmdbID int, preferredSeasonSource string) (*MediaDetail, error) {
 	if s == nil || s.store == nil || s.tmdb == nil {
 		return nil, fmt.Errorf("request service is not configured")
 	}
@@ -825,22 +850,9 @@ func (s *Service) GetDetail(ctx context.Context, viewer Viewer, mediaType MediaT
 	// country's cert, and a foreign "PG"/"G" is the same string as the US
 	// rating, so it would pass the US ladder. ErrNotFound rather than
 	// ErrForbidden: a restricted profile shouldn't learn the title exists.
-	ceiling, err := s.viewerContentCeiling(ctx, viewer)
+	ceiling, err := s.detailRatingCeiling(ctx, viewer, mediaType, tmdbID)
 	if err != nil {
 		return nil, err
-	}
-	if ceiling != "" {
-		client, ok := s.tmdb.(TMDBCertificationClient)
-		if !ok {
-			return nil, fmt.Errorf("requests: tmdb client cannot resolve certifications")
-		}
-		cert, err := client.GetCertification(ctx, tmdbMediaType(mediaType), tmdbID)
-		if err != nil {
-			return nil, err
-		}
-		if !access.RatingAllowed(cert, ceiling) {
-			return nil, ErrNotFound
-		}
 	}
 
 	policy, err := s.EffectivePolicy(ctx, viewer.UserID)
@@ -864,27 +876,15 @@ func (s *Service) GetDetail(ctx context.Context, viewer Viewer, mediaType MediaT
 	// A series counts as available only when every aired season is complete;
 	// until then its missing seasons can be requested.
 	available := primaryMatch.Available
-	var seasons []RequestSeason
+	var (
+		seasons        []RequestSeason
+		resolvedTVDBID int
+		fromTVDB       bool
+	)
 	if mediaType == MediaTypeSeries {
-		counts, err := s.seasonCounts(ctx, primaryMatch)
+		seasons, resolvedTVDBID, fromTVDB, available, err = s.seriesDetailSeasons(ctx, raw, primaryMatch, primaryRequests, preferredSeasonSource)
 		if err != nil {
 			return nil, err
-		}
-		seasons = requestSeasons(raw, counts, primaryRequests[raw.ID])
-		if active := primaryRequests[raw.ID]; active != nil && len(active.Seasons) > 0 && counts != nil {
-			// Attach the season progress the request lists attach, so the
-			// state can read partially available or available.
-			withProgress := *active
-			withProgress.LibraryContentID = primaryMatch.ContentID
-			withProgress.SeasonProgress = seasonProgress(active.Seasons, counts)
-			primaryRequests[raw.ID] = &withProgress
-		}
-		if available && seriesHasOpenSeason(raw, counts) {
-			more, err := s.moreSeasonsRequestable(ctx)
-			if err != nil {
-				return nil, err
-			}
-			available = !more
 		}
 	}
 	primaryState := requestStateFor(viewer, policy, available, primaryRequests[raw.ID])
@@ -893,6 +893,98 @@ func (s *Service) GetDetail(ctx context.Context, viewer Viewer, mediaType MediaT
 		return nil, err
 	}
 
+	detail := mediaDetailOf(raw, mediaType, primaryMatch, primaryState, seasons, resolvedTVDBID, fromTVDB)
+
+	if len(raw.Recommendations) > 0 {
+		recPage := &tmdb.MediaPage{Results: raw.Recommendations}
+		enriched, err := s.enrichPageWithCeiling(ctx, viewer, recPage, ceiling)
+		if err != nil {
+			return nil, err
+		}
+		detail.Recommendations = enriched.Results
+	}
+
+	return detail, nil
+}
+
+// detailRatingCeiling enforces the viewer's content ceiling for a detail read
+// and returns the ceiling for the recommendation enrichment that follows.
+func (s *Service) detailRatingCeiling(ctx context.Context, viewer Viewer, mediaType MediaType, tmdbID int) (string, error) {
+	ceiling, err := s.viewerContentCeiling(ctx, viewer)
+	if err != nil {
+		return "", err
+	}
+	if ceiling == "" {
+		return "", nil
+	}
+	client, ok := s.tmdb.(TMDBCertificationClient)
+	if !ok {
+		return "", errors.New("requests: tmdb client cannot resolve certifications")
+	}
+	cert, err := client.GetCertification(ctx, tmdbMediaType(mediaType), tmdbID)
+	if err != nil {
+		return "", err
+	}
+	if !access.RatingAllowed(cert, ceiling) {
+		return "", ErrNotFound
+	}
+	return ceiling, nil
+}
+
+// seriesDetailSeasons builds the season list and availability signals for a
+// series detail read, including the active request's season progress.
+func (s *Service) seriesDetailSeasons(
+	ctx context.Context,
+	raw *tmdb.MediaDetail,
+	match PresenceMatch,
+	active map[int]*Request,
+	preferredSeasonSource string,
+) ([]RequestSeason, int, bool, bool, error) {
+	seasonSource, resolvedTVDBID, fromTVDB, _, err := s.seriesSeasonSource(ctx, raw, raw.TVDBID, preferredSeasonSource)
+	if err != nil {
+		return nil, 0, false, match.Available, err
+	}
+	counts, err := s.seasonCounts(ctx, match)
+	if err != nil {
+		return nil, 0, false, match.Available, err
+	}
+	if !seasonCountsCompatible(fromTVDB, match) {
+		// The catalog and the request list use different season numbering.
+		// Integer season joins would mark the wrong seasons available.
+		counts = nil
+	}
+	activeRequest := active[raw.ID]
+	seasons := requestSeasons(seasonSource, counts, activeRequest)
+	if activeRequest != nil && len(activeRequest.Seasons) > 0 && counts != nil {
+		// Attach the season progress the request lists attach, so the state
+		// can read partially available or available.
+		withProgress := *activeRequest
+		withProgress.LibraryContentID = match.ContentID
+		withProgress.SeasonProgress = seasonProgress(activeRequest.Seasons, counts)
+		active[raw.ID] = &withProgress
+	}
+	available := match.Available
+	if available && seriesHasOpenSeason(seasonSource, counts) {
+		more, err := s.moreSeasonsRequestable(ctx)
+		if err != nil {
+			return nil, 0, false, available, err
+		}
+		available = !more
+	}
+	return seasons, resolvedTVDBID, fromTVDB, available, nil
+}
+
+// mediaDetailOf turns a TMDB detail response into the request detail payload,
+// including the source-specific season totals and TVDB identifier.
+func mediaDetailOf(
+	raw *tmdb.MediaDetail,
+	mediaType MediaType,
+	match PresenceMatch,
+	state RequestState,
+	seasons []RequestSeason,
+	resolvedTVDBID int,
+	fromTVDB bool,
+) *MediaDetail {
 	detail := &MediaDetail{
 		MediaType:           mediaType,
 		TMDBID:              raw.ID,
@@ -920,12 +1012,34 @@ func (s *Service) GetDetail(ctx context.Context, viewer Viewer, mediaType MediaT
 		Networks:            raw.Networks,
 		Director:            raw.Director,
 		Creators:            raw.Creators,
-		Availability:        availabilityValue(primaryMatch.Available),
-		LibraryContentID:    primaryMatch.ContentID,
-		Request:             primaryState,
+		Availability:        availabilityValue(match.Available),
+		LibraryContentID:    match.ContentID,
+		Request:             state,
 		Seasons:             seasons,
 	}
-	if raw.TVDBID > 0 {
+	if fromTVDB {
+		seasonsCount, episodesCount := 0, 0
+		for _, season := range seasons {
+			if season.Number <= 0 {
+				continue
+			}
+			seasonsCount++
+			episodesCount += season.EpisodeCount
+		}
+		detail.NumberOfSeasons, detail.NumberOfEpisodes = seasonsCount, episodesCount
+	}
+	if mediaType == MediaTypeSeries {
+		switch {
+		case fromTVDB:
+			detail.SeasonSource = SeasonSourceTVDB
+		case len(seasons) > 0:
+			detail.SeasonSource = SeasonSourceTMDB
+		}
+	}
+	if resolvedTVDBID > 0 {
+		tvdb := resolvedTVDBID
+		detail.TVDBID = &tvdb
+	} else if raw.TVDBID > 0 {
 		tvdb := raw.TVDBID
 		detail.TVDBID = &tvdb
 	}
@@ -940,17 +1054,7 @@ func (s *Service) GetDetail(ctx context.Context, viewer Viewer, mediaType MediaT
 			})
 		}
 	}
-
-	if len(raw.Recommendations) > 0 {
-		recPage := &tmdb.MediaPage{Results: raw.Recommendations}
-		enriched, err := s.enrichPageWithCeiling(ctx, viewer, recPage, ceiling)
-		if err != nil {
-			return nil, err
-		}
-		detail.Recommendations = enriched.Results
-	}
-
-	return detail, nil
+	return detail
 }
 
 func (s *Service) CreateRequest(ctx context.Context, viewer Viewer, input CreateRequestInput) (*Request, error) {
@@ -970,6 +1074,7 @@ func (s *Service) CreateRequest(ctx context.Context, viewer Viewer, input Create
 	if err != nil {
 		return nil, err
 	}
+	normalized.SeasonSource = requestSeasonSource(normalized.SeasonSource)
 	if err := s.ensureCreateAllowedByCeiling(ctx, viewer, normalized); err != nil {
 		return nil, err
 	}
@@ -1028,14 +1133,35 @@ func (s *Service) CreateRequest(ctx context.Context, viewer Viewer, input Create
 		detail := s.requestDetail(ctx, normalized.MediaType, normalized.TMDBID)
 		normalized = applyRequestDetail(normalized, detail)
 		facts = s.routingFacts(ctx, detail)
-		if !normalized.WholeSeries {
+		if normalized.MediaType == MediaTypeSeries {
 			// A series partly in the library can still be requested for the
-			// seasons it is missing.
-			seasons, err := s.resolveRequestedSeasons(ctx, normalized.Seasons, detail, match)
-			if err != nil {
-				return nil, err
+			// seasons it is missing. Prefer TVDB's season list, which keeps a
+			// long anime's seasons apart where TMDB groups them. Resolve and
+			// freeze the actual source even for a whole-series request so
+			// fulfillment does not later pick a different provider chain.
+			tvdbID := 0
+			if detail != nil {
+				tvdbID = detail.TVDBID
 			}
-			normalized.Seasons = seasons
+			if tvdbID == 0 && normalized.TVDBID != nil {
+				tvdbID = *normalized.TVDBID
+			}
+			seasonSource, _, fromTVDB, sourceAvailable, sourceErr := s.seriesSeasonSource(ctx, detail, tvdbID, normalized.SeasonSource)
+			if sourceErr != nil {
+				return nil, sourceErr
+			}
+			if fromTVDB {
+				normalized.SeasonSource = SeasonSourceTVDB
+			} else if sourceAvailable {
+				normalized.SeasonSource = SeasonSourceTMDB
+			}
+			if !normalized.WholeSeries {
+				seasons, err := s.resolveRequestedSeasons(ctx, normalized.Seasons, seasonSource, sourceAvailable, match, seasonCountsCompatible(fromTVDB, match))
+				if err != nil {
+					return nil, err
+				}
+				normalized.Seasons = seasons
+			}
 		}
 	}
 
@@ -1298,7 +1424,8 @@ func (s *Service) attachLibraryContent(ctx context.Context, reqs ...*Request) er
 			}
 			for _, req := range requestsByKey[requestKey{mediaType: mediaType, tmdbID: tmdbID}] {
 				req.LibraryContentID = match.ContentID
-				if req.MediaType == MediaTypeSeries && len(req.Seasons) > 0 {
+				if req.MediaType == MediaTypeSeries && len(req.Seasons) > 0 &&
+					requestSeasonCountsCompatible(req.SeasonSource, match) {
 					seasonRequests[match.ContentID] = append(seasonRequests[match.ContentID], req)
 				}
 			}
@@ -3121,7 +3248,8 @@ func (s *Service) presentRequests(ctx context.Context, reqs []*Request) (map[str
 				continue
 			}
 			out[req.ID] = false
-			if match.Available && match.ContentID != "" {
+			if match.Available && match.ContentID != "" &&
+				requestSeasonCountsCompatible(req.SeasonSource, match) {
 				seasonRequests[match.ContentID] = append(seasonRequests[match.ContentID], req)
 			}
 		}

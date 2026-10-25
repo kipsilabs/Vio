@@ -34939,6 +34939,17 @@
             "description": "TMDB image path",
             "type": "string"
           },
+          "season_source": {
+            "description": "Series only: use TVDB or TMDB season numbering. Omitted: the server prefers TVDB",
+            "enum": [
+              "tvdb",
+              "tmdb"
+            ],
+            "examples": [
+              "tvdb"
+            ],
+            "type": "string"
+          },
           "seasons": {
             "description": "Series only: the season numbers to request, starting at 1 (a season below 1 is refused). Omitted: every aired season not yet complete in the library",
             "examples": [
@@ -43373,8 +43384,15 @@
             "format": "int64",
             "type": "integer"
           },
+          "season_source": {
+            "description": "Series: the metadata provider that supplied the season list: tvdb or tmdb",
+            "examples": [
+              "tvdb"
+            ],
+            "type": "string"
+          },
           "seasons": {
-            "description": "Series: the regular seasons (specials excluded) with library availability and request coverage; empty for movies",
+            "description": "Series: the regular seasons (specials excluded) from the series metadata provider, with library availability and request coverage; empty for movies",
             "items": {
               "$ref": "#/components/schemas/RequestMediaSeason"
             },
@@ -43600,7 +43618,7 @@
             "type": "string"
           },
           "episode_count": {
-            "description": "Episodes TMDB lists for the season, aired or not",
+            "description": "Episodes the series metadata provider lists for the season, aired or not",
             "examples": [
               10
             ],
@@ -43614,7 +43632,11 @@
             "type": "string"
           },
           "poster_path": {
-            "description": "TMDB image path",
+            "description": "TMDB image path, when available",
+            "type": "string"
+          },
+          "poster_url": {
+            "description": "Absolute artwork URL when the series metadata provider supplies one",
             "type": "string"
           },
           "requested": {
@@ -194066,6 +194088,23 @@
               "format": "int64",
               "minimum": 1,
               "type": "integer"
+            }
+          },
+          {
+            "description": "Series only: return TVDB or TMDB season numbering. Omitted: the server prefers TVDB",
+            "explode": false,
+            "in": "query",
+            "name": "season_source",
+            "schema": {
+              "description": "Series only: return TVDB or TMDB season numbering. Omitted: the server prefers TVDB",
+              "enum": [
+                "tvdb",
+                "tmdb"
+              ],
+              "examples": [
+                "tvdb"
+              ],
+              "type": "string"
             }
           }
         ],

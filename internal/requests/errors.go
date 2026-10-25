@@ -5,11 +5,15 @@ import "errors"
 var (
 	ErrInvalidMediaType = errors.New("invalid media type")
 	ErrInvalidInput     = errors.New("invalid request input")
-	ErrRequestsDisabled = errors.New("requests are disabled")
-	ErrUserBlocked      = errors.New("user is blocked from requesting")
-	ErrQuotaExceeded    = errors.New("request quota exceeded")
-	ErrAlreadyAvailable = errors.New("media is already available")
-	ErrAlreadyRequested = errors.New("media is already requested")
+	// ErrSeasonSourceUnavailable reports that the explicitly selected season
+	// provider could not answer. Falling back to the other provider here would
+	// silently validate a different season numbering than the requester chose.
+	ErrSeasonSourceUnavailable = errors.New("selected season source is unavailable")
+	ErrRequestsDisabled        = errors.New("requests are disabled")
+	ErrUserBlocked             = errors.New("user is blocked from requesting")
+	ErrQuotaExceeded           = errors.New("request quota exceeded")
+	ErrAlreadyAvailable        = errors.New("media is already available")
+	ErrAlreadyRequested        = errors.New("media is already requested")
 	// ErrNotRequested answers a follow for a title nobody has an active
 	// request for; the viewer should request it instead.
 	ErrNotRequested = errors.New("media has no active request")

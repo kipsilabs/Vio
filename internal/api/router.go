@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -104,6 +105,75 @@ import (
 
 // The media request service answers the administrator request-usage read.
 var _ apiv2.AdminRequestUsageService = (*mediarequests.Service)(nil)
+
+// SeriesTVDBSeasonSource is the metadata service's TVDB season method. It is
+// declared here so internal/requests need not import internal/metadata, which
+// would close an import cycle through internal/notifications.
+type SeriesTVDBSeasonSource interface {
+	FetchSeriesTVDBSeasons(ctx context.Context, tvdbID int, language string) ([]metadata.SeasonResult, error)
+}
+
+// NewSeriesSeasonProvider adapts a TVDB season source to the request service's
+// season-provider seam.
+func NewSeriesSeasonProvider(source SeriesTVDBSeasonSource) mediarequests.SeriesSeasonProvider {
+	if source == nil {
+		return nil
+	}
+	return seriesSeasonProviderAdapter{source: source}
+}
+
+type seriesSeasonProviderAdapter struct {
+	source SeriesTVDBSeasonSource
+}
+
+func (a seriesSeasonProviderAdapter) FetchSeriesTVDBSeasons(ctx context.Context, tvdbID int, language string) ([]mediarequests.SeriesSeason, error) {
+	results, err := a.source.FetchSeriesTVDBSeasons(ctx, tvdbID, language)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]mediarequests.SeriesSeason, 0, len(results))
+	for _, season := range results {
+		if season.SeasonNumber <= 0 {
+			continue
+		}
+		episodeCount := 0
+		for _, episode := range season.Episodes {
+			if episode.EpisodeNumber > 0 && episode.SeasonNumber == season.SeasonNumber {
+				episodeCount++
+			}
+		}
+		out = append(out, mediarequests.SeriesSeason{
+			Number:       season.SeasonNumber,
+			Name:         season.Title,
+			EpisodeCount: episodeCount,
+			AirDate:      season.AirDate,
+			// TVDB supplies absolute artwork URLs, which do not fit the v2
+			// poster_path field or the TMDB image helper; PosterURL carries
+			// them. A relative path is not a URL this surface can serve, so it
+			// is left out rather than handed to clients as artwork.
+			PosterPath: "",
+			PosterURL:  absoluteArtworkURL(season.PosterPath),
+		})
+	}
+	return out, nil
+}
+
+// absoluteArtworkURL returns raw when it is an absolute http or https URL, and
+// "" for anything else: provider-relative paths and other schemes are not
+// artwork clients can load directly.
+func absoluteArtworkURL(raw string) string {
+	if raw = strings.TrimSpace(raw); raw == "" {
+		return ""
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || !parsed.IsAbs() || parsed.Host == "" {
+		return ""
+	}
+	if !strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https") {
+		return ""
+	}
+	return raw
+}
 
 // Dependencies holds all shared dependencies that handlers need.
 // ArtworkDelivery describes how clients read artwork. External is true only
@@ -1070,6 +1140,9 @@ func newChiRouter(deps Dependencies) chi.Router {
 		requestSvc.SetRequesterIdentityResolver(plugins.RequesterIdentityFromLookup(plugins.NewPgUserIdentityLookup(deps.DB)))
 		if tvdbResolver, ok := deps.MetadataService.(mediarequests.TVDBIDResolver); ok {
 			requestSvc.SetTVDBIDResolver(tvdbResolver)
+		}
+		if source, ok := deps.MetadataService.(SeriesTVDBSeasonSource); ok {
+			requestSvc.SetSeriesSeasonProvider(NewSeriesSeasonProvider(source))
 		}
 		if viewerResolver != nil {
 			requestSvc.SetEntitlementResolver(scopeEntitlementResolver{resolver: viewerResolver})

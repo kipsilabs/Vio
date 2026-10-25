@@ -124,6 +124,36 @@ func TestEvaluateFallsBackWhenLibraryMetadataHasNoEpisodes(t *testing.T) {
 	}
 }
 
+// TestEvaluateKeepsSameSourcePartialProgressOnRetryableFailure covers a
+// provider timeout during a frozen-source traversal: the episodes and cursor
+// already accumulated from that same source must survive the deferred retry,
+// while the fallback public providers stay out of a frozen request.
+func TestEvaluateKeepsSameSourcePartialProgressOnRetryableFailure(t *testing.T) {
+	m := newMediaMonitor(nil, slog.New(slog.DiscardHandler))
+	m.metadataResolver = func(_ context.Context, item MonitoredMedia) (MonitoredMedia, error) {
+		item.Episodes = []VirtualEpisode{{Season: 1, Episode: 1, Title: "Pilot"}}
+		item.MetadataNextSeason = 1
+		return item, errors.New("tvdb timeout")
+	}
+	item := monitoredMedia{
+		Key: "series:tvdb:1", MediaType: "series", TVDBID: "1", MetadataSource: "tvdb",
+	}
+
+	updated, message, err := m.evaluate(context.Background(), item)
+	if err == nil {
+		t.Fatal("a frozen source failure must defer the item, not fall back")
+	}
+	if message != selectedSourceUnavailableMessage {
+		t.Fatalf("message = %q, want the retry message", message)
+	}
+	if len(updated.Episodes) != 1 || updated.Episodes[0].Title != "Pilot" {
+		t.Fatalf("episodes = %+v, want the same-source partial progress preserved", updated.Episodes)
+	}
+	if updated.MetadataNextSeason != 1 {
+		t.Fatalf("metadata next season = %d, want the preserved cursor 1", updated.MetadataNextSeason)
+	}
+}
+
 // TestFulfillEvaluatesAgainstTheConnectionLibrary covers the destination
 // library: the connection names the library the media is registered in, so
 // the metadata lookup has to run against that library and not against the

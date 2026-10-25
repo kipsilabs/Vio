@@ -193,6 +193,49 @@ func TestPresenceRequiresFileInMatchingEnabledLibrary(t *testing.T) {
 	}
 }
 
+// TestVirtualMediaUpsertPersistsSeasonNumberingSource covers the provenance
+// that request season joins read: a TMDB-numbered import keeps its canonical
+// series-tvdb identity (TVDB wins for identity) but records tmdb numbering.
+func TestVirtualMediaUpsertPersistsSeasonNumberingSource(t *testing.T) {
+	pool := newVirtualMediaTestPool(t)
+	ctx := context.Background()
+	reg := newReleasedVirtualMediaRegistrar(pool)
+
+	if _, err := pool.Exec(ctx, "INSERT INTO media_folders(id,name,type,enabled) VALUES(999,'TestVirtual','mixed',true)"); err != nil {
+		t.Fatalf("seed virtual media folder: %v", err)
+	}
+	res, err := reg.UpsertVirtualMedia(ctx, 11, VirtualMedia{
+		LibraryID: "999", MediaType: "series", Title: "Numbered Series",
+		IMDbID: "tt301", TMDBID: "3", TVDBID: "300", Source: "provider-a",
+		SeasonNumberingSource: "tmdb",
+		Episodes: []VirtualEpisode{{
+			SeasonNumber: 1, EpisodeNumber: 1, Title: "Pilot", AirDate: time.Now().Add(-time.Hour),
+			VirtualURI: "virtual://series/tt301/1/1",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("upsert series: %v", err)
+	}
+	if res.MediaID != "series-tvdb-300" {
+		t.Fatalf("media id = %q, want the canonical TVDB identity series-tvdb-300", res.MediaID)
+	}
+	var persisted string
+	if err := pool.QueryRow(ctx, "SELECT season_numbering_source FROM media_items WHERE content_id=$1", res.MediaID).Scan(&persisted); err != nil {
+		t.Fatalf("load season numbering source: %v", err)
+	}
+	if persisted != "tmdb" {
+		t.Fatalf("season_numbering_source = %q, want tmdb", persisted)
+	}
+
+	rows, err := NewItemRepository(pool).LookupExternalIDs(ctx, "series", []ExternalIDLookupCandidate{{TMDBID: "3"}})
+	if err != nil {
+		t.Fatalf("lookup external ids: %v", err)
+	}
+	if len(rows) != 1 || rows[0].SeasonNumberingSource != "tmdb" {
+		t.Fatalf("lookup rows = %+v, want one row with tmdb season numbering", rows)
+	}
+}
+
 func TestVirtualMediaVariantsUpsert(t *testing.T) {
 	pool := newVirtualMediaTestPool(t)
 	ctx := context.Background()

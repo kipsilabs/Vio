@@ -428,6 +428,352 @@ func TestSeasonRequestForALibrarySeriesSkipsALaterRouter(t *testing.T) {
 	}
 }
 
+// fakeSeriesSeasonProvider stands in for the installed TVDB provider.
+type fakeSeriesSeasonProvider struct {
+	results     []SeriesSeason
+	err         error
+	gotTVDBID   int
+	gotLanguage string
+	calls       int
+}
+
+func (f *fakeSeriesSeasonProvider) FetchSeriesTVDBSeasons(_ context.Context, tvdbID int, language string) ([]SeriesSeason, error) {
+	f.calls++
+	f.gotTVDBID = tvdbID
+	f.gotLanguage = language
+	return f.results, f.err
+}
+
+// longAnimeDetail is TMDB's grouping of a long series: two wide seasons. TVDB
+// lists the same show as three seasons.
+func longAnimeDetail() *tmdb.MediaDetail {
+	return &tmdb.MediaDetail{
+		MediaType: "series", ID: 700001, Title: "Long Anime", TVDBID: 900001,
+		NumberOfSeasons: 2, NumberOfEpisodes: 416,
+		Seasons: []tmdb.SeasonSummary{
+			{Number: 1, Name: "Season 1", EpisodeCount: 366, AirDate: "2000-01-01"},
+			{Number: 2, Name: "Season 2", EpisodeCount: 50, AirDate: "2001-01-01"},
+		},
+	}
+}
+
+func longAnimeTVDBSeasons() []SeriesSeason {
+	season := func(number int, name, airDate string, episodeCount int) SeriesSeason {
+		return SeriesSeason{Number: number, Name: name, EpisodeCount: episodeCount, AirDate: airDate}
+	}
+	return []SeriesSeason{
+		season(1, "TVDB Season 1", "2000-01-01", 3),
+		season(2, "TVDB Season 2", "2001-01-01", 2),
+		season(3, "TVDB Season 3", "2002-01-01", 1),
+		{Number: 0, Name: "Specials", AirDate: "1999-01-01"},
+	}
+}
+
+func longAnimeService(store *fakeStore, provider SeriesSeasonProvider) *Service {
+	svc := NewService(store, &fakeTMDBClient{detail: longAnimeDetail()}, &fakePresence{})
+	svc.Now = newTestService(store).Now
+	svc.SetUserRepository(requestUserRepo{})
+	if provider != nil {
+		svc.SetSeriesSeasonProvider(provider)
+	}
+	return svc
+}
+
+func TestGetDetailPrefersTVDBSeasons(t *testing.T) {
+	provider := &fakeSeriesSeasonProvider{results: longAnimeTVDBSeasons()}
+	svc := longAnimeService(newFakeStore(), provider)
+
+	detail, err := svc.GetDetail(context.Background(), testViewer(1), MediaTypeSeries, 700001)
+	if err != nil {
+		t.Fatalf("GetDetail: %v", err)
+	}
+	if provider.gotTVDBID != 900001 || provider.gotLanguage != "en" {
+		t.Fatalf("provider got tvdb=%d language=%q, want 900001 and en", provider.gotTVDBID, provider.gotLanguage)
+	}
+	if len(detail.Seasons) != 3 {
+		t.Fatalf("seasons = %+v, want the three TVDB regular seasons", detail.Seasons)
+	}
+	want := []SeriesSeason{
+		{Number: 1, Name: "TVDB Season 1", EpisodeCount: 3, AirDate: "2000-01-01"},
+		{Number: 2, Name: "TVDB Season 2", EpisodeCount: 2, AirDate: "2001-01-01"},
+		{Number: 3, Name: "TVDB Season 3", EpisodeCount: 1, AirDate: "2002-01-01"},
+	}
+	for i, season := range detail.Seasons {
+		w := want[i]
+		if season.Number != w.Number || season.Name != w.Name || season.EpisodeCount != w.EpisodeCount ||
+			season.AirDate != w.AirDate || season.PosterPath != "" || season.Availability != AvailabilityMissing {
+			t.Fatalf("season %d = %+v, want %+v", i, season, w)
+		}
+	}
+	if detail.NumberOfSeasons != 3 || detail.NumberOfEpisodes != 6 {
+		t.Fatalf("totals = %d seasons/%d episodes, want the TVDB totals 3/6", detail.NumberOfSeasons, detail.NumberOfEpisodes)
+	}
+	if detail.TVDBID == nil || *detail.TVDBID != 900001 {
+		t.Fatalf("tvdb_id = %v, want 900001", detail.TVDBID)
+	}
+}
+
+// TVDB season artwork is an absolute URL, not a TMDB path: the detail page's
+// season list carries it in PosterURL and leaves PosterPath empty.
+func TestGetDetailCarriesTVDBSeasonPosterURL(t *testing.T) {
+	const posterURL = "https://artworks.thetvdb.com/banners/seasons/season-1.jpg"
+	provider := &fakeSeriesSeasonProvider{results: []SeriesSeason{{
+		Number: 1, Name: "TVDB Season 1", EpisodeCount: 3, AirDate: "2000-01-01", PosterURL: posterURL,
+	}}}
+	svc := longAnimeService(newFakeStore(), provider)
+
+	detail, err := svc.GetDetail(context.Background(), testViewer(1), MediaTypeSeries, 700001)
+	if err != nil {
+		t.Fatalf("GetDetail: %v", err)
+	}
+	if len(detail.Seasons) != 1 {
+		t.Fatalf("seasons = %+v, want the one TVDB season", detail.Seasons)
+	}
+	if season := detail.Seasons[0]; season.PosterURL != posterURL || season.PosterPath != "" {
+		t.Fatalf("season = %+v, want poster_url %q and no poster_path", season, posterURL)
+	}
+}
+
+func TestGetDetailFallsBackToTMDBSeasons(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		provider *fakeSeriesSeasonProvider
+	}{
+		{"provider error", &fakeSeriesSeasonProvider{err: errors.New("tvdb unavailable")}},
+		{"provider empty", &fakeSeriesSeasonProvider{}},
+		{"specials only", &fakeSeriesSeasonProvider{results: []SeriesSeason{{Number: 0, Name: "Specials"}}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := longAnimeService(newFakeStore(), tc.provider)
+
+			detail, err := svc.GetDetail(context.Background(), testViewer(1), MediaTypeSeries, 700001)
+			if err != nil {
+				t.Fatalf("GetDetail: %v", err)
+			}
+			if len(detail.Seasons) != 2 || detail.Seasons[0].Name != "Season 1" || detail.Seasons[0].EpisodeCount != 366 ||
+				detail.Seasons[1].Name != "Season 2" || detail.Seasons[1].EpisodeCount != 50 {
+				t.Fatalf("seasons = %+v, want TMDB's two seasons", detail.Seasons)
+			}
+			if detail.NumberOfSeasons != 2 || detail.NumberOfEpisodes != 416 {
+				t.Fatalf("totals = %d seasons/%d episodes, want TMDB's 2/416", detail.NumberOfSeasons, detail.NumberOfEpisodes)
+			}
+			if detail.TVDBID == nil || *detail.TVDBID != 900001 {
+				t.Fatalf("tvdb_id = %v, want the TMDB cross-reference 900001", detail.TVDBID)
+			}
+		})
+	}
+}
+
+func TestGetDetailExplicitTMDBSeasonSourceBypassesTVDB(t *testing.T) {
+	provider := &fakeSeriesSeasonProvider{results: longAnimeTVDBSeasons()}
+	svc := longAnimeService(newFakeStore(), provider)
+
+	detail, err := svc.GetDetailWithSeasonSource(context.Background(), testViewer(1), MediaTypeSeries, 700001, "tmdb")
+	if err != nil {
+		t.Fatalf("GetDetailWithSeasonSource: %v", err)
+	}
+	if provider.calls != 0 {
+		t.Fatalf("TVDB provider calls = %d, want 0 for an explicit TMDB request", provider.calls)
+	}
+	if detail.SeasonSource != "tmdb" || len(detail.Seasons) != 2 || detail.Seasons[0].Name != "Season 1" {
+		t.Fatalf("detail = %+v, want the two TMDB seasons", detail)
+	}
+	if detail.NumberOfSeasons != 2 || detail.NumberOfEpisodes != 416 {
+		t.Fatalf("totals = %d/%d, want TMDB's 2/416", detail.NumberOfSeasons, detail.NumberOfEpisodes)
+	}
+}
+
+func TestCreateSeriesRequestStoresExplicitTMDBSeasonSource(t *testing.T) {
+	provider := &fakeSeriesSeasonProvider{results: longAnimeTVDBSeasons()}
+	store := newFakeStore()
+	svc := longAnimeService(store, provider)
+
+	req, err := svc.CreateRequest(context.Background(), testViewer(1), CreateRequestInput{
+		MediaType: MediaTypeSeries, TMDBID: 700001, Title: "Long Anime", Seasons: []int{2}, SeasonSource: "tmdb",
+	})
+	if err != nil {
+		t.Fatalf("CreateRequest: %v", err)
+	}
+	if provider.calls != 0 {
+		t.Fatalf("TVDB provider calls = %d, want 0 for an explicit TMDB request", provider.calls)
+	}
+	if req.SeasonSource != "tmdb" || !slices.Equal(req.Seasons, []int{2}) {
+		t.Fatalf("created = %+v, want the TMDB season source and season 2", req)
+	}
+	if len(store.created) != 1 || store.created[0].Input.SeasonSource != "tmdb" {
+		t.Fatalf("stored input = %+v, want season_source tmdb", store.created)
+	}
+}
+
+func TestSeriesSeasonSourceExplicitTVDBFailureDoesNotFallBack(t *testing.T) {
+	svc := longAnimeService(newFakeStore(), &fakeSeriesSeasonProvider{err: errors.New("tvdb rate limited")})
+
+	_, _, _, _, err := svc.seriesSeasonSource(context.Background(), longAnimeDetail(), 900001, "tvdb")
+	if !errors.Is(err, ErrSeasonSourceUnavailable) {
+		t.Fatalf("err = %v, want ErrSeasonSourceUnavailable", err)
+	}
+}
+
+func TestCreateSeriesRequestExplicitTVDBFailureDoesNotFallBack(t *testing.T) {
+	store := newFakeStore()
+	svc := longAnimeService(store, &fakeSeriesSeasonProvider{err: errors.New("tvdb rate limited")})
+
+	_, err := svc.CreateRequest(context.Background(), testViewer(1), CreateRequestInput{
+		MediaType: MediaTypeSeries, TMDBID: 700001, Title: "Long Anime", Seasons: []int{1}, SeasonSource: "tvdb",
+	})
+	if !errors.Is(err, ErrSeasonSourceUnavailable) {
+		t.Fatalf("err = %v, want ErrSeasonSourceUnavailable", err)
+	}
+	if len(store.created) != 0 {
+		t.Fatalf("created = %+v, want no request after an explicit TVDB failure", store.created)
+	}
+}
+
+func TestCreateSeriesRequestFreezesFallbackSource(t *testing.T) {
+	store := newFakeStore()
+	svc := longAnimeService(store, &fakeSeriesSeasonProvider{err: errors.New("tvdb unavailable")})
+
+	req, err := svc.CreateRequest(context.Background(), testViewer(1), CreateRequestInput{
+		MediaType: MediaTypeSeries, TMDBID: 700001, Title: "Long Anime", Seasons: []int{1},
+	})
+	if err != nil {
+		t.Fatalf("CreateRequest: %v", err)
+	}
+	if req.SeasonSource != SeasonSourceTMDB {
+		t.Fatalf("season source = %q, want the actual TMDB fallback source", req.SeasonSource)
+	}
+	if len(store.created) != 1 || store.created[0].Input.SeasonSource != SeasonSourceTMDB {
+		t.Fatalf("stored input = %+v, want season_source tmdb", store.created)
+	}
+}
+
+func TestSeasonCountsCompatibleUsesCatalogNumberingProvenance(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		fromTVDB   bool
+		numbering  string
+		compatible bool
+	}{
+		{name: "tvdb list against tvdb catalog", fromTVDB: true, numbering: SeasonSourceTVDB, compatible: true},
+		{name: "tmdb list against tvdb catalog", fromTVDB: false, numbering: SeasonSourceTVDB, compatible: false},
+		{name: "tvdb list against tmdb catalog", fromTVDB: true, numbering: SeasonSourceTMDB, compatible: false},
+		{name: "tmdb list against tmdb catalog", fromTVDB: false, numbering: SeasonSourceTMDB, compatible: true},
+		{name: "unknown catalog provenance fails closed", fromTVDB: true, numbering: "", compatible: false},
+		{name: "tmdb identity does not imply tmdb numbering", fromTVDB: true, numbering: "", compatible: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := seasonCountsCompatible(tc.fromTVDB, PresenceMatch{SeasonNumberingSource: tc.numbering}); got != tc.compatible {
+				t.Fatalf("seasonCountsCompatible = %v, want %v", got, tc.compatible)
+			}
+		})
+	}
+	if requestSeasonCountsCompatible("", PresenceMatch{SeasonNumberingSource: ""}) {
+		t.Fatal("requests must fail closed when catalog provenance is unknown")
+	}
+	if !requestSeasonCountsCompatible("", PresenceMatch{SeasonNumberingSource: SeasonSourceTVDB}) {
+		t.Fatal("legacy requests with known catalog provenance keep the historical join")
+	}
+	if !requestSeasonCountsCompatible("tvdb", PresenceMatch{SeasonNumberingSource: SeasonSourceTVDB}) {
+		t.Fatal("explicit TVDB requests must join a TVDB-numbered catalog")
+	}
+	if requestSeasonCountsCompatible("tvdb", PresenceMatch{SeasonNumberingSource: SeasonSourceTMDB}) {
+		t.Fatal("explicit TVDB requests must not join a TMDB-numbered catalog")
+	}
+}
+
+func TestCatalogSeriesSeasonSourceIgnoresContentIDPrefix(t *testing.T) {
+	// A TVDB canonical content ID says nothing about which provider numbered
+	// the imported seasons: virtual import prefers TVDB identity even when the
+	// request explicitly imported TMDB-numbered seasons.
+	match := PresenceMatch{ContentID: "series-tvdb-42", SeasonNumberingSource: SeasonSourceTMDB}
+	if got := catalogSeriesSeasonSource(match); got != SeasonSourceTMDB {
+		t.Fatalf("catalogSeriesSeasonSource = %q, want the persisted tmdb source", got)
+	}
+	if requestSeasonCountsCompatible(SeasonSourceTVDB, match) {
+		t.Fatal("a TVDB request must not join TMDB-numbered catalog seasons under a series-tvdb ID")
+	}
+	if !requestSeasonCountsCompatible(SeasonSourceTMDB, match) {
+		t.Fatal("a TMDB request must join its own TMDB-numbered import under a series-tvdb ID")
+	}
+	if got := catalogSeriesSeasonSource(PresenceMatch{ContentID: "series-tvdb-42"}); got != "" {
+		t.Fatalf("catalogSeriesSeasonSource = %q, want unknown without persisted provenance", got)
+	}
+}
+
+func TestSeriesSeasonSourceResolvesAMissingTVDBID(t *testing.T) {
+	store := newFakeStore()
+	detail := longAnimeDetail()
+	detail.TVDBID = 0
+	provider := &fakeSeriesSeasonProvider{results: longAnimeTVDBSeasons()}
+	svc := NewService(store, &fakeTMDBClient{detail: detail}, &fakePresence{})
+	svc.Now = newTestService(store).Now
+	svc.SetUserRepository(requestUserRepo{})
+	svc.SetSeriesSeasonProvider(provider)
+	resolver := &fakeTVDBResolver{tvdbID: 900001}
+	svc.SetTVDBIDResolver(resolver)
+
+	seasons, resolvedTVDBID, fromTVDB, available, err := svc.seriesSeasonSource(context.Background(), detail, 0, "")
+	if err != nil {
+		t.Fatalf("seriesSeasonSource: %v", err)
+	}
+	if resolver.gotTMDBID != 700001 || resolver.gotIMDbID != "" {
+		t.Fatalf("resolver got tmdb=%d imdb=%q, want 700001 and no IMDb id", resolver.gotTMDBID, resolver.gotIMDbID)
+	}
+	if !fromTVDB || !available || resolvedTVDBID != 900001 || len(seasons) != 3 {
+		t.Fatalf("source = %+v, tvdb=%d, fromTVDB=%v, available=%v; want TVDB's three seasons", seasons, resolvedTVDBID, fromTVDB, available)
+	}
+	if provider.gotTVDBID != 900001 {
+		t.Fatalf("provider got tvdb=%d, want the resolved 900001", provider.gotTVDBID)
+	}
+}
+
+func TestCreateSeriesRequestAcceptsATVDBOnlySeason(t *testing.T) {
+	store := newFakeStore()
+	svc := longAnimeService(store, &fakeSeriesSeasonProvider{results: longAnimeTVDBSeasons()})
+
+	req, err := svc.CreateRequest(context.Background(), testViewer(1), CreateRequestInput{
+		MediaType: MediaTypeSeries, TMDBID: 700001, Title: "Long Anime", Seasons: []int{3},
+	})
+	if err != nil {
+		t.Fatalf("CreateRequest: %v", err)
+	}
+	if !slices.Equal(req.Seasons, []int{3}) {
+		t.Fatalf("seasons = %v, want [3] from TVDB", req.Seasons)
+	}
+	if len(store.created) != 1 || !slices.Equal(store.created[0].Input.Seasons, []int{3}) {
+		t.Fatalf("created = %+v, want the TVDB-only season stored", store.created)
+	}
+
+	// Without a provider, the same season is not in TMDB's list.
+	tmdbOnly := longAnimeService(newFakeStore(), nil)
+	if _, err := tmdbOnly.CreateRequest(context.Background(), testViewer(1), CreateRequestInput{
+		MediaType: MediaTypeSeries, TMDBID: 700001, Title: "Long Anime", Seasons: []int{3},
+	}); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("without TVDB: err = %v, want ErrInvalidInput for season 3", err)
+	}
+}
+
+func TestSeriesSeasonsUseTMDBWithoutAProvider(t *testing.T) {
+	detail := severanceDetail()
+	detail.NumberOfSeasons = 3
+	detail.NumberOfEpisodes = 22
+	store := newFakeStore()
+	svc := NewService(store, &fakeTMDBClient{detail: detail}, &fakePresence{})
+	svc.Now = newTestService(store).Now
+	svc.SetUserRepository(requestUserRepo{})
+
+	got, err := svc.GetDetail(context.Background(), testViewer(1), MediaTypeSeries, 95396)
+	if err != nil {
+		t.Fatalf("GetDetail: %v", err)
+	}
+	if len(got.Seasons) != 3 || got.Seasons[0].Name != "Season 1" || got.Seasons[2].Name != "Season 3" {
+		t.Fatalf("seasons = %+v, want the TMDB regular seasons", got.Seasons)
+	}
+	if got.NumberOfSeasons != 3 || got.NumberOfEpisodes != 22 {
+		t.Fatalf("totals = %d/%d, want TMDB's 3/22", got.NumberOfSeasons, got.NumberOfEpisodes)
+	}
+}
+
 // A mutation returns the request with its season progress, so its state
 // matches what a detail or list read reports.
 func TestSeasonRequestMutationsReturnSeasonProgress(t *testing.T) {

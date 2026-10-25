@@ -99,27 +99,43 @@ func (s *Service) enrichFromLibraryMetadata(
 		PosterPath:   item.Poster,
 		BackdropPath: item.Backdrop,
 	}
-	result, lookupErr := resolver.FetchLibraryMetadata(metadataCtx, folderID, lookupItem, metadata.LibraryMetadataLookupOptions{
-		AfterSeason: item.MetadataNextSeason,
-		MaxSeasons:  libraryMetadataSeasonsPerCall,
-	})
-	if result != nil {
-		applyLibraryMetadataResult(&item, result, folderID)
-	}
-	if lookupErr != nil {
-		if metadataCtx.Err() != nil {
-			return item, metadataCtx.Err()
+	// Each call stays bounded so a long provider traversal remains
+	// resumable, but registration needs the whole snapshot. Walk the
+	// remaining season cursor here and merge every page into the item.
+	afterSeason := item.MetadataNextSeason
+	for {
+		result, lookupErr := resolver.FetchLibraryMetadata(metadataCtx, folderID, lookupItem, metadata.LibraryMetadataLookupOptions{
+			AfterSeason:       afterSeason,
+			MaxSeasons:        libraryMetadataSeasonsPerCall,
+			PreferredProvider: item.MetadataSource,
+		})
+		if result != nil {
+			applyLibraryMetadataResult(&item, result, folderID)
 		}
-		// Provider failure is degraded, not fatal: known metadata and
-		// episodes remain usable, and the caller falls back to public providers.
-		logger.WarnContext(ctx, "virtual library metadata incomplete; falling back to public providers",
-			"key", item.Key, "folder_id", folderID, "error", lookupErr)
-		return item, lookupErr
+		if lookupErr != nil {
+			if metadataCtx.Err() != nil {
+				return item, metadataCtx.Err()
+			}
+			// Provider failure is degraded, not fatal: known metadata and
+			// episodes, including those merged by earlier calls, remain
+			// usable and the caller falls back to public providers.
+			logger.WarnContext(ctx, "virtual library metadata incomplete; falling back to public providers",
+				"key", item.Key, "folder_id", folderID, "error", lookupErr)
+			return item, lookupErr
+		}
+		if result == nil || result.Metadata == nil {
+			return item, metadata.ErrMetadataNotFound
+		}
+		if result.Complete || result.NextSeason <= afterSeason {
+			// Complete ends the traversal. A cursor that did not advance
+			// also ends it so a provider repeating a season cannot loop.
+			return item, nil
+		}
+		afterSeason = result.NextSeason
+		if err := metadataCtx.Err(); err != nil {
+			return item, err
+		}
 	}
-	if result == nil || result.Metadata == nil {
-		return item, metadata.ErrMetadataNotFound
-	}
-	return item, nil
 }
 
 func applyLibraryMetadataResult(item *monitor.MonitoredMedia, result *metadata.LibraryMetadataLookupResult, folderID int) {

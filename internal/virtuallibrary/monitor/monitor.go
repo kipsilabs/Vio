@@ -497,6 +497,11 @@ const (
 	// mediaTypeMovie is the movie media-type value shared by the queue's
 	// movie/series branches.
 	mediaTypeMovie = "movie"
+
+	// selectedSourceUnavailableMessage is the deferral reason when a frozen
+	// request source fails and the item is queued for a retry instead of
+	// falling back to another provider's numbering.
+	selectedSourceUnavailableMessage = "Selected metadata source unavailable; monitoring will retry"
 )
 
 // monitorState is the on-disk monitor queue. Older releases wrote a bare JSON
@@ -988,6 +993,22 @@ func (m *mediaMonitor) remember(item monitoredMedia) error {
 	return nil
 }
 
+// rememberRetainedProgress persists the metadata cursor and episodes an
+// evaluation accumulated before a retryable failure. Without it, a frozen
+// request source that times out mid-traversal would discard its same-source
+// progress and restart from the first season on every retry.
+func (m *mediaMonitor) rememberRetainedProgress(before, after monitoredMedia) error {
+	if after.Key == "" {
+		return nil
+	}
+	if after.MetadataNextSeason == before.MetadataNextSeason &&
+		after.MetadataComplete == before.MetadataComplete &&
+		len(after.Episodes) <= len(before.Episodes) {
+		return nil
+	}
+	return m.remember(after)
+}
+
 // rememberSeriesEpisodes merges freshly evaluated episodes into the persisted
 // series item without dropping entries that are already registered, so the
 // monitor queue can keep tracking upcoming episodes for ongoing series.
@@ -1297,7 +1318,8 @@ func mediaFromRequest(r *RequestDescriptor) (monitoredMedia, error) {
 	return monitoredMedia{
 		Key: typ + ":" + streamID, MediaType: typ, Title: strings.TrimSpace(r.GetTitle()), Year: r.GetYear(),
 		StreamID: streamID, IMDbID: imdb, TMDBID: tmdb, TVDBID: tvdb, SourceKey: "request:" + typ + ":" + streamID,
-		Poster: strings.TrimSpace(r.PosterPath), Backdrop: strings.TrimSpace(r.BackdropPath),
+		MetadataSource: strings.TrimSpace(r.GetSeasonSource()),
+		Poster:         strings.TrimSpace(r.PosterPath), Backdrop: strings.TrimSpace(r.BackdropPath),
 	}, nil
 }
 
@@ -2024,10 +2046,16 @@ func (m *mediaMonitor) runPass(ctx context.Context, items []monitoredMedia, regi
 			deferred++
 			reconcileSafeBySource[source] = false
 			advance = item.Key
+			if err := m.rememberRetainedProgress(item, updated); err != nil {
+				return nil, err
+			}
 		case itemFailed:
 			pending++
 			reconcileSafeBySource[source] = false
 			advance = item.Key
+			if err := m.rememberRetainedProgress(item, updated); err != nil {
+				return nil, err
+			}
 		case itemReady:
 			advance = item.Key
 			if err := m.remember(updated); err != nil {
@@ -2204,10 +2232,10 @@ func (m *mediaMonitor) processItem(ctx context.Context, item monitoredMedia) (mo
 			return item, "", itemBudgetExhausted
 		case itemCtx.Err() != nil, errors.Is(evaluationErr, context.Canceled), errors.Is(evaluationErr, context.DeadlineExceeded):
 			m.logger.DebugContext(itemCtx, "defer virtual media item; per-item budget elapsed", "key", item.Key)
-			return item, "", itemDeferred
+			return updated, "", itemDeferred
 		default:
 			m.logger.WarnContext(itemCtx, "evaluate virtual media", "key", item.Key, "error", evaluationErr)
-			return item, "", itemFailed
+			return updated, "", itemFailed
 		}
 	}
 	if updated.Ready && (strings.TrimSpace(updated.Title) == "" || (updated.MediaType == "series" && len(updated.Episodes) == 0)) {
@@ -2510,6 +2538,19 @@ func (m *mediaMonitor) resolveLibraryMetadata(
 		if ctx.Err() != nil {
 			return item, "Library metadata lookup timed out; monitoring will retry", err
 		}
+		if strings.TrimSpace(item.MetadataSource) != "" {
+			// A frozen request source must not be replaced by a different
+			// provider's numbering. Keep the same-source episodes the resolver
+			// already accumulated so the retry resumes instead of restarting
+			// the traversal, and leave the item queued.
+			if enriched.Key != "" {
+				if strings.TrimSpace(enriched.MetadataSource) == "" {
+					enriched.MetadataSource = item.MetadataSource
+				}
+				item = enriched
+			}
+			return item, selectedSourceUnavailableMessage, err
+		}
 		// Enrichment is optional. Keep whatever usable metadata the
 		// resolver already had and fall back to public providers.
 		m.logger.WarnContext(ctx, "library metadata unavailable; falling back to public providers", "key", item.Key, "error", err)
@@ -2523,6 +2564,9 @@ func (m *mediaMonitor) resolveLibraryMetadata(
 	// Fall back to Cinemeta/TVMaze if library resolution failed or left an item
 	// without a title or a series without episodes.
 	if err != nil || (item.MediaType == "series" && len(item.Episodes) == 0) || item.Title == "" {
+		if strings.TrimSpace(item.MetadataSource) != "" {
+			return item, "Selected metadata source incomplete; monitoring will retry", errors.New("preferred metadata source returned no usable series data")
+		}
 		fallback, fallbackErr := m.fallbackPublicMetadata(ctx, item)
 		if fallbackErr == nil {
 			item = fallback

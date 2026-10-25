@@ -300,25 +300,46 @@ func virtualMediaRegistration(item monitor.MonitoredMedia, libraryID string) cat
 	if backdropSource == "" {
 		backdropSource = catalogArtworkSourcePath(item.Backdrop)
 	}
+	numberingSource := ""
+	if item.MediaType == "series" {
+		numberingSource = seasonNumberingSource(item.MetadataSource)
+	}
 	return catalog.VirtualMedia{
-		MediaType:          item.MediaType,
-		LibraryID:          libraryID,
-		IMDbID:             item.IMDbID,
-		TMDBID:             item.TMDBID,
-		TVDBID:             item.TVDBID,
-		Title:              strings.TrimSpace(item.Title),
-		Year:               int(item.Year),
-		Overview:           strings.TrimSpace(item.Overview),
-		PosterPath:         strings.TrimSpace(item.Poster),
-		BackdropPath:       strings.TrimSpace(item.Backdrop),
-		PosterSourcePath:   posterSource,
-		BackdropSourcePath: backdropSource,
-		Genres:             trimVirtualStrings(item.Genres),
-		RuntimeMinutes:     item.Runtime,
-		Source:             strings.TrimSpace(item.SourceKey),
-		VirtualURI:         virtualURIForMonitored(item),
-		Episodes:           monitoredEpisodePayload(item),
-		Variants:           make([]catalog.VirtualMediaVariant, 0),
+		MediaType:             item.MediaType,
+		LibraryID:             libraryID,
+		IMDbID:                item.IMDbID,
+		TMDBID:                item.TMDBID,
+		TVDBID:                item.TVDBID,
+		SeasonNumberingSource: numberingSource,
+		Title:                 strings.TrimSpace(item.Title),
+		Year:                  int(item.Year),
+		Overview:              strings.TrimSpace(item.Overview),
+		PosterPath:            strings.TrimSpace(item.Poster),
+		BackdropPath:          strings.TrimSpace(item.Backdrop),
+		PosterSourcePath:      posterSource,
+		BackdropSourcePath:    backdropSource,
+		Genres:                trimVirtualStrings(item.Genres),
+		RuntimeMinutes:        item.Runtime,
+		Source:                strings.TrimSpace(item.SourceKey),
+		VirtualURI:            virtualURIForMonitored(item),
+		Episodes:              monitoredEpisodePayload(item),
+		Variants:              make([]catalog.VirtualMediaVariant, 0),
+	}
+}
+
+// seasonNumberingSource normalizes the request's metadata source into the
+// catalog's stored season-numbering provenance. The monitor sets
+// MonitoredMedia.MetadataSource to the source it enriched with, so a completed
+// import can persist the numbering it actually used. Any other value stays
+// empty: unknown provenance must not be joined by season number.
+func seasonNumberingSource(source string) string {
+	switch strings.ToLower(strings.TrimSpace(source)) {
+	case "tvdb":
+		return "tvdb"
+	case "tmdb":
+		return "tmdb"
+	default:
+		return ""
 	}
 }
 
