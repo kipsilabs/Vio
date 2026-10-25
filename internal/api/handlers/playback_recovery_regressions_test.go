@@ -118,10 +118,10 @@ func TestHandleReplanPlaybackV3ReissuesRecipeAfterProgress(t *testing.T) {
 		t.Fatalf("reissued route = %s / %#v, want the recipe that played", first.PlaybackPlan.Delivery, first.PlaybackPlan.EffectiveRecipe)
 	}
 	if first.PlaybackPlan.PlanID == started.PlaybackPlan.PlanID {
-		t.Fatalf("reissued plan id = %q, want a fresh id", first.PlaybackPlan.PlanID)
+		t.Fatalf("reissued plan id = %q, want a fresh generation id", first.PlaybackPlan.PlanID)
 	}
-	if first.PlaybackPlan.PlanAttemptKey == started.PlaybackPlan.PlanAttemptKey {
-		t.Fatalf("reissued attempt key = %q, want a fresh key", first.PlaybackPlan.PlanAttemptKey)
+	if first.PlaybackPlan.PlanAttemptKey != started.PlaybackPlan.PlanAttemptKey {
+		t.Fatalf("reissued attempt key = %q, want canonical recipe key %q", first.PlaybackPlan.PlanAttemptKey, started.PlaybackPlan.PlanAttemptKey)
 	}
 
 	// The reissued transport is a second transport; its failure is the second
@@ -239,9 +239,9 @@ func TestHandleReplanPlaybackV3ReopenedRecipeFailsBeforeFirstFrameNotReissued(t 
 		t.Fatalf("start plan = %#v", started)
 	}
 
-	// 1. Recipe A starts and renders first frame.
-	applyReplanProgressV3(t, handler, started.SessionID)
-	applyReplanFirstFrameV3(t, handler, started.SessionID, startRequest.PlaybackAttemptID, started.PlaybackPlan.PlanID, started.PlaybackPlan.PlanAttemptKey)
+	// 1. Recipe A starts. Its first-frame event is delayed and NOT persisted yet.
+	delayedPlanIDA := started.PlaybackPlan.PlanID
+	delayedPlanKeyA := started.PlaybackPlan.PlanAttemptKey
 
 	// 2. Track change to audio track 1 installs Recipe B.
 	audioIdx1 := 1
@@ -287,7 +287,20 @@ func TestHandleReplanPlaybackV3ReopenedRecipeFailsBeforeFirstFrameNotReissued(t 
 		t.Fatalf("return to Recipe A failed: %#v", respA2)
 	}
 
-	// 4. That new A transport fails before its first frame.
+	// 4. Now persist the delayed original first-frame event from Recipe A's first installation.
+	// Its plan ID matches the original A installation, but NOT the new reopened A generation.
+	applyReplanFirstFrameV3(t, handler, started.SessionID, startRequest.PlaybackAttemptID, delayedPlanIDA, delayedPlanKeyA)
+
+	// Verify the attempt's CurrentTransportRendered flag is still false because the plan IDs differ.
+	rec, err := handler.PlanStoreV3.GetAttempt(context.Background(), started.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.CurrentTransportRendered {
+		t.Fatalf("delayed first frame event from earlier installation falsely marked reopened transport as rendered")
+	}
+
+	// 5. That new A transport fails before its first frame.
 	failA2Req := playback.ReplanRequestV3{
 		ProtocolVersion:       playback.ProtocolV3,
 		Operation:             playback.ReplanOperationFailureRecoveryV3,

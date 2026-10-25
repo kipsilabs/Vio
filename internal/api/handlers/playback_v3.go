@@ -9874,12 +9874,11 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	}
 	result = retryIncompleteToneMapPlanningV3(result, toneMapCapabilityErr)
 	result = retryIncompletePlaybackSettingsV3(result, plannerSettingsErr)
-	if progressReissue && result.Plan != nil {
-		// The reissued route is the recipe that just played, so its
-		// deterministic identity would repeat the failed plan's id. Mint a fresh
-		// id and attempt key for this recovery so the client (and the loop
-		// guard) treats the reissue as a new attempt rather than a cached no-op.
-		reissueProgressPlanIdentityV3(result.Plan, record.PlaybackAttemptID, req.ReplanRequestID, start.ClientPlaybackContext.Output.OutputContextID)
+	if result.Plan != nil {
+		// Give each newly installed replan transport a unique plan ID that
+		// cannot be confused with an earlier installation, while preserving
+		// the canonical recipe attempt key for loop retirement.
+		finalizeReplanPlanIdentityV3(result.Plan, record.PlaybackAttemptID, req.ReplanRequestID, start.ClientPlaybackContext.Output.OutputContextID)
 	}
 	reportDetourSubtitleDrop()
 	h.clarifyOriginalQuality4KTerminalV3(r.Context(), requestAccessFilter(r), result.Terminal, requestedFile, replanAlternateFilePinnedByOriginalQualityV3(operation, start.QualityPreference))
@@ -10328,18 +10327,21 @@ func deliveryChangeV3(previousDelivery playback.DeliveryV3, previousPlayMethod p
 	}
 }
 
-// reissueProgressPlanIdentityV3 mints a fresh plan id and attempt key for a
-// failure recovery that reissues the route the session was already playing.
-// The recipe is unchanged, so its deterministic identity would otherwise repeat
-// the failed plan's id; the replan request id distinguishes this reissue while
-// staying stable across an idempotent retry of the same request.
-func reissueProgressPlanIdentityV3(plan *playback.PlanV3, attemptID, replanRequestID, outputContextID string) {
+// finalizeReplanPlanIdentityV3 mints a generation-scoped plan id for each newly
+// installed replan transport, while preserving the canonical recipe attempt key
+// for retirement in attempted_plan_keys. The replan request id distinguishes
+// this transport generation so a delayed first-frame event from an earlier
+// installation cannot falsely mark a reopened transport as rendered.
+func finalizeReplanPlanIdentityV3(plan *playback.PlanV3, attemptID, replanRequestID, outputContextID string) {
 	if plan == nil {
 		return
 	}
-	reissueAttemptID := strings.TrimSpace(attemptID) + "|reissue:" + strings.TrimSpace(replanRequestID)
-	plan.PlanID = playback.DeterministicPlanIDV3(reissueAttemptID, plan.RequestedMediaFileID, plan.EffectiveMediaFileID, *plan)
-	plan.PlanAttemptKey = playback.PlanAttemptKeyV3(*plan, outputContextID, nil)
+	canonicalPlan := *plan
+	canonicalPlan.PlanID = playback.DeterministicPlanIDV3(attemptID, plan.RequestedMediaFileID, plan.EffectiveMediaFileID, *plan)
+	plan.PlanAttemptKey = playback.PlanAttemptKeyV3(canonicalPlan, outputContextID, nil)
+
+	replanAttemptID := strings.TrimSpace(attemptID) + "|replan:" + strings.TrimSpace(replanRequestID)
+	plan.PlanID = playback.DeterministicPlanIDV3(replanAttemptID, plan.RequestedMediaFileID, plan.EffectiveMediaFileID, *plan)
 }
 
 // softwareDecodeRouteDiagnosticsV3 records the reactive software-decode
