@@ -9872,10 +9872,11 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	}
 	result = retryIncompleteToneMapPlanningV3(result, toneMapCapabilityErr)
 	result = retryIncompletePlaybackSettingsV3(result, plannerSettingsErr)
-	if result.Plan != nil {
+	if result.Plan != nil && !seekReanchor {
 		// Give each newly installed replan transport a unique plan ID that
 		// cannot be confused with an earlier installation, while preserving
-		// the canonical recipe attempt key for loop retirement.
+		// the canonical recipe attempt key for loop retirement. A seek reanchor
+		// continues the running transport verbatim and must keep its plan ID.
 		finalizeReplanPlanIdentityV3(result.Plan, record.PlaybackAttemptID, req.ReplanRequestID, start.ClientPlaybackContext.Output.OutputContextID)
 	}
 	reportDetourSubtitleDrop()
