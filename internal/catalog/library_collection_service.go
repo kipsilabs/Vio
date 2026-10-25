@@ -645,10 +645,16 @@ type collectionVirtualVariantCache struct {
 	entries map[string][]VirtualPlaybackVariant
 }
 
-func (s *LibraryCollectionService) acceptCollectionItems(ctx context.Context, collection *models.LibraryCollection, matched []LibraryCollectionItemInput) ([]LibraryCollectionItemInput, error) {
+// ErrMemberVariantsUnavailable marks a variant resolution failure for a specific
+// collection member. It wraps ErrProviderUnavailable so errors.Is matches both,
+// but lets acceptance distinguish member-level variant gaps from collection-level
+// release policy rejections.
+var ErrMemberVariantsUnavailable = fmt.Errorf("%w: virtual profile variants unavailable", ErrProviderUnavailable)
+
+func (s *LibraryCollectionService) acceptCollectionItems(ctx context.Context, collection *models.LibraryCollection, matched []LibraryCollectionItemInput) ([]LibraryCollectionItemInput, []string, error) {
 	tracker, _ := ctx.Value(collectionVirtualCreationTrackerKey{}).(*collectionVirtualCreationTracker)
 	if tracker == nil {
-		return nil, errors.New("collection sync preparation is missing")
+		return nil, nil, errors.New("collection sync preparation is missing")
 	}
 	if tracker.err != nil {
 		// Only collection-level preparation failures poison the run: release
@@ -656,10 +662,11 @@ func (s *LibraryCollectionService) acceptCollectionItems(ctx context.Context, co
 		// conflicts. A member's own provider or variant failure is a per-entry
 		// warning, recorded by the sync loop, so the remaining members still
 		// commit.
-		return nil, tracker.err
+		return nil, nil, tracker.err
 	}
 	prepared := make(map[string]preparedCollectionItem, len(matched))
 	accepted := make([]LibraryCollectionItemInput, 0, len(matched))
+	var acceptanceWarnings []string
 	if collection != nil && sourceEnablesVirtualPlayback(collection.SourceConfig) {
 		ids := make([]string, 0, len(matched))
 		for _, member := range matched {
@@ -671,20 +678,20 @@ func (s *LibraryCollectionService) acceptCollectionItems(ctx context.Context, co
 			  AND mf.container IS DISTINCT FROM 'virtual'
 			  AND mf.file_path NOT LIKE 'virtual://%'`, ids)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		physical := make(map[string]bool)
 		for rows.Next() {
 			var id string
 			if err := rows.Scan(&id); err != nil {
 				rows.Close()
-				return nil, err
+				return nil, nil, err
 			}
 			physical[id] = true
 		}
 		rows.Close()
 		if err := rows.Err(); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		for _, member := range matched {
 			if physical[member.MediaItemID] {
@@ -697,19 +704,27 @@ func (s *LibraryCollectionService) acceptCollectionItems(ctx context.Context, co
 			if !ok {
 				item, err := s.items.GetByID(ctx, member.MediaItemID)
 				if err != nil {
-					return nil, err
+					return nil, nil, err
 				}
 				if _, err := s.EnsureCollectionItemMaterializedWithOptions(ctx, collection, item, VirtualMaterializeOptions{}); err != nil {
-					if errors.Is(err, ErrProviderUnavailable) {
+					if tracker.err != nil {
+						return nil, nil, tracker.err
+					}
+					if errors.Is(err, ErrMemberVariantsUnavailable) {
 						hasState := false
 						if s.collections != nil && s.collections.pool != nil {
-							_ = s.collections.pool.QueryRow(ctx, `
+							scanErr := s.collections.pool.QueryRow(ctx, `
 								SELECT EXISTS(
-									SELECT 1 FROM media_files WHERE content_id=$1
-									UNION ALL
-									SELECT 1 FROM virtual_media_source_claims WHERE source_key=$2 AND content_id=$1
-								)`, member.MediaItemID, "collection:"+collection.ID).Scan(&hasState)
+									SELECT 1 FROM library_collection_items WHERE collection_id=$1 AND media_item_id=$2
+								) AND EXISTS(
+									SELECT 1 FROM virtual_media_source_claims WHERE source_key=$3 AND content_id=$2
+								)`, collection.ID, member.MediaItemID, "collection:"+collection.ID).Scan(&hasState)
+							if scanErr != nil {
+								return nil, nil, fmt.Errorf("checking resident collection item state: %w", scanErr)
+							}
 						}
+						warningMsg := fmt.Sprintf("materializing virtual item %q: %v", item.Title, err)
+						acceptanceWarnings = append(acceptanceWarnings, warningMsg)
 						if hasState {
 							slog.WarnContext(ctx, "failed to refresh resident virtual item during acceptance; preserving existing valid state",
 								"component", "catalog", "collection_id", collection.ID, "title", item.Title, "error", err)
@@ -717,7 +732,7 @@ func (s *LibraryCollectionService) acceptCollectionItems(ctx context.Context, co
 						}
 						continue
 					}
-					return nil, err
+					return nil, nil, err
 				}
 				candidate = tracker.items[member.MediaItemID]
 			}
@@ -729,7 +744,7 @@ func (s *LibraryCollectionService) acceptCollectionItems(ctx context.Context, co
 	}
 
 	if len(accepted) == 0 && len(matched) > 0 {
-		return nil, ErrProviderUnavailable
+		return nil, nil, ErrProviderUnavailable
 	}
 
 	for i := range accepted {
@@ -740,13 +755,13 @@ func (s *LibraryCollectionService) acceptCollectionItems(ctx context.Context, co
 		if err := s.collections.AcceptPreparedItems(ctx, collection, accepted, prepared, s.items); err != nil {
 			slog.WarnContext(ctx, "collection sync accept failed", "component", "catalog",
 				"collection_id", collection.ID, "error", err)
-			return nil, err
+			return nil, nil, err
 		}
 	}
 	for id := range prepared {
 		s.queueVirtualMetadataRefresh(id)
 	}
-	return accepted, nil
+	return accepted, acceptanceWarnings, nil
 }
 
 func (s *LibraryCollectionService) configuredVirtualVariants(ctx context.Context, virtualURI, mediaType string) ([]VirtualPlaybackVariant, error) {
@@ -1065,13 +1080,13 @@ func (s *LibraryCollectionService) EnsureCollectionItemMaterializedWithOptions(
 			// still sync. Callers record the failure as a run warning and skip
 			// the member, and the next sync retries it. Do not poison the
 			// collection run through tracker.err.
-			return nil, fmt.Errorf("%w: getting virtual profile variants: %w", ErrProviderUnavailable, err)
+			return nil, fmt.Errorf("%w: %w", ErrMemberVariantsUnavailable, err)
 		}
 	}
 	if len(variants) == 0 {
 		// Same member-scoped outcome as a failed provider call: this item
 		// resolved no variants, so skip it without failing the collection.
-		return nil, ErrProviderUnavailable
+		return nil, fmt.Errorf("%w: no variants resolved for source", ErrMemberVariantsUnavailable)
 	}
 	if tracker != nil {
 		if tracker.items == nil {
@@ -1536,11 +1551,12 @@ func (s *LibraryCollectionService) syncMDBListCollection(ctx context.Context, co
 		}
 	}
 
-	acceptedItems, err := s.acceptCollectionItems(ctx, collection, matchedItems)
+	acceptedItems, acceptanceWarnings, err := s.acceptCollectionItems(ctx, collection, matchedItems)
 	if err != nil {
 		return nil, err
 	}
 	matchedItems = acceptedItems
+	warnings = appendUniqueCollectionWarnings(warnings, acceptanceWarnings)
 
 	status := "success"
 	if len(warnings) > 0 {
@@ -1916,11 +1932,14 @@ type tmdbEntrySyncTally struct {
 // recordTMDBEntrySync stores a TMDB sync's members and its run record out of
 // total fetched entries.
 func (s *LibraryCollectionService) recordTMDBEntrySync(ctx context.Context, collection *models.LibraryCollection, tally tmdbEntrySyncTally, total int, startedAt time.Time, opts SyncCollectionOptions) (*models.LibraryCollectionSyncRun, error) {
-	accepted, err := s.acceptCollectionItems(ctx, collection, tally.matched)
+	accepted, acceptanceWarnings, err := s.acceptCollectionItems(ctx, collection, tally.matched)
 	if err != nil {
 		return nil, err
 	}
+	droppedCount := len(tally.matched) - len(accepted)
 	tally.matched = accepted
+	tally.unmatched += droppedCount
+	tally.warnings = appendUniqueCollectionWarnings(tally.warnings, acceptanceWarnings)
 
 	status := "success"
 	if len(tally.warnings) > 0 {
@@ -1957,6 +1976,20 @@ func (s *LibraryCollectionService) recordTMDBEntrySync(ctx context.Context, coll
 	}
 
 	return run, nil
+}
+
+func appendUniqueCollectionWarnings(dest []string, extra []string) []string {
+	seen := make(map[string]bool, len(dest))
+	for _, w := range dest {
+		seen[w] = true
+	}
+	for _, w := range extra {
+		if !seen[w] {
+			seen[w] = true
+			dest = append(dest, w)
+		}
+	}
+	return dest
 }
 
 func (s *LibraryCollectionService) recordFailedCollectionSync(ctx context.Context, collectionID string, startedAt time.Time, message string) (*models.LibraryCollectionSyncRun, error) {

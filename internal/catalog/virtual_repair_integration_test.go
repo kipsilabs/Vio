@@ -2623,7 +2623,7 @@ func TestVirtualCollection_FailedSyncBeforeMembershipCleansEpisodeLibraries(t *t
 	}
 
 	tracker.err = ErrProviderUnavailable
-	if _, err := service.acceptCollectionItems(ctx, collection, []LibraryCollectionItemInput{{MediaItemID: seriesID}}); !errors.Is(err, ErrProviderUnavailable) {
+	if _, _, err := service.acceptCollectionItems(ctx, collection, []LibraryCollectionItemInput{{MediaItemID: seriesID}}); !errors.Is(err, ErrProviderUnavailable) {
 		t.Fatalf("failed preparation accepted: %v", err)
 	}
 	var files, claims, items int
@@ -2816,7 +2816,7 @@ func TestVirtualCollection_StagedSeriesPreparesEpisodesAtomically(t *testing.T) 
 		t.Fatalf("prepared state base=%d ep=%d links=%d epLinks=%d, want 0/0/0/0", stagedBase, stagedEp, links, epLinks)
 	}
 
-	if _, err := service.acceptCollectionItems(ctx, collection, []LibraryCollectionItemInput{{MediaItemID: seriesID, Position: 0, SourceRank: 1}}); err != nil {
+	if _, _, err := service.acceptCollectionItems(ctx, collection, []LibraryCollectionItemInput{{MediaItemID: seriesID, Position: 0, SourceRank: 1}}); err != nil {
 		t.Fatalf("accept membership: %v", err)
 	}
 	var activeBase, activeEp int
@@ -3234,13 +3234,13 @@ func TestVirtualCollection_FailedCleanupPreservesAcceptedAndForeignClaims(t *tes
 		if _, err := service.EnsureCollectionItemMaterializedWithOptions(acceptedCtx, tc.col, it, VirtualMaterializeOptions{}); err != nil {
 			t.Fatalf("prepare %s: %v", tc.id, err)
 		}
-		if _, err := service.acceptCollectionItems(acceptedCtx, tc.col, []LibraryCollectionItemInput{{MediaItemID: tc.id}}); err != nil {
+		if _, _, err := service.acceptCollectionItems(acceptedCtx, tc.col, []LibraryCollectionItemInput{{MediaItemID: tc.id}}); err != nil {
 			t.Fatalf("activate %s: %v", tc.id, err)
 		}
 	}
 
 	tracker.err = ErrProviderUnavailable
-	if _, err := service.acceptCollectionItems(prepareCtx, colXObj, []LibraryCollectionItemInput{{MediaItemID: stagedID}, {MediaItemID: keptID}, {MediaItemID: foreignID}}); !errors.Is(err, ErrProviderUnavailable) {
+	if _, _, err := service.acceptCollectionItems(prepareCtx, colXObj, []LibraryCollectionItemInput{{MediaItemID: stagedID}, {MediaItemID: keptID}, {MediaItemID: foreignID}}); !errors.Is(err, ErrProviderUnavailable) {
 		t.Fatalf("failed preparation accepted: %v", err)
 	}
 	var stagedFiles int
