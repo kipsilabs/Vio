@@ -691,8 +691,37 @@ func TestHandleReplanPlaybackV3ReplanFailsWithIncompleteHistory(t *testing.T) {
 // End-to-end lifecycle regression covering: first frame -> successful seek reanchor -> connectivity failure.
 // Preserves rendered evidence when the existing transport is actually retained across seek.
 func TestHandleReplanPlaybackV3FirstFrameSeekReissueLifecycle(t *testing.T) {
-	handler := newProgressReissueHandlerV3(t)
-	started, startRequest := progressReissueStartV3(t, handler)
+	file := v3HandlerFixtureFile(t)
+	file.Container = "mkv"
+	file.FilePath = writePlaybackTestMediaFile(t, "movie.mkv")
+	file.ExternalSubtitles = []models.ExternalSubtitle{
+		{Path: writePlaybackTestMediaFile(t, "movie.de.srt"), Language: "de", Format: "srt"},
+	}
+	manager := playback.NewSessionManager(0, 0)
+	handler := NewPlaybackHandler(manager, testPlaybackFileResolver{file: file})
+	stubCopySeekAnchorV3(handler)
+	handler.PlaybackConfig = playbackTestConfig(writePlaybackTestFFmpeg(t), t.TempDir())
+	presetLocalRegistryV3(handler, playback.NewTransformationRegistryV3(nil))
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"transcode_enabled": "false", "allow_4k_transcode": "false"}}
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+
+	startRequest := v3HandlerStartRequest()
+	startRequest.Capabilities.Containers = []string{"m3u8"}
+	startRequest.ClientPlaybackContext.Deliveries = map[string]playback.DeliveryCapabilityV3{
+		playback.DeliveryClassHLSV3: {
+			Enabled: true, SupportedOnDevice: true,
+			Subtitles: playback.DeliverySubtitleCapabilitiesV3{SidecarText: true},
+		},
+	}
+	german := 0
+	startRequest.SubtitleTrackID = playback.TrackIDV3(file.ID, "subtitle", german)
+	startRequest.SubtitleTrackIndex = &german
+	started := startV3PlaybackForHandlerTest(t, handler, startRequest)
+	if started.PlaybackPlan == nil || started.PlaybackPlan.Delivery != playback.DeliveryRemuxHLSV3 {
+		t.Fatalf("start plan = %#v, want copy HLS", started.PlaybackPlan)
+	}
+	t.Cleanup(func() { handler.tm.CloseTranscodeSession(started.SessionID, "") })
+
 	applyReplanProgressV3(t, handler, started.SessionID)
 	applyReplanFirstFrameV3(t, handler, started.SessionID, startRequest.PlaybackAttemptID, started.PlaybackPlan.PlanID, started.PlaybackPlan.PlanAttemptKey)
 
@@ -705,7 +734,7 @@ func TestHandleReplanPlaybackV3FirstFrameSeekReissueLifecycle(t *testing.T) {
 		t.Fatal("expected CurrentTransportRendered to be true after first_frame event")
 	}
 
-	// 1. Viewer seeks (seek_reanchor within active window retains the transport).
+	// 1. Viewer seeks (seek_reanchor within active window retains the HLS transport).
 	seekReq := playback.ReplanRequestV3{
 		ProtocolVersion:       playback.ProtocolV3,
 		Operation:             playback.ReplanOperationSeekReanchorV3,
@@ -758,5 +787,80 @@ func TestHandleReplanPlaybackV3FirstFrameSeekReissueLifecycle(t *testing.T) {
 	}
 	if reissueResp.PlaybackPlan.PlanAttemptKey != seekResp.PlaybackPlan.PlanAttemptKey {
 		t.Fatalf("reissued attempt key %q does not match seek attempt key %q", reissueResp.PlaybackPlan.PlanAttemptKey, seekResp.PlaybackPlan.PlanAttemptKey)
+	}
+}
+
+// When a seek rebuilds the transport rather than retaining it, rendered evidence is not preserved.
+// The rebuilt transport starts unrendered, rejects stale first-frame events, and is not reissued on pre-first-frame failure.
+func TestHandleReplanPlaybackV3RebuiltSeekTransportStartsUnrendered(t *testing.T) {
+	handler := newProgressReissueHandlerV3(t)
+	started, startRequest := progressReissueStartV3(t, handler)
+	applyReplanProgressV3(t, handler, started.SessionID)
+	// First frame is delayed and NOT sent yet.
+	origPlanID := started.PlaybackPlan.PlanID
+	origPlanKey := started.PlaybackPlan.PlanAttemptKey
+
+	// 1. Viewer seeks with un-reusable transport (RoutingExecution = "", so transportReused is false and transport is rebuilt).
+	seekReq := playback.ReplanRequestV3{
+		ProtocolVersion:       playback.ProtocolV3,
+		Operation:             playback.ReplanOperationSeekReanchorV3,
+		PlaybackAttemptID:     startRequest.PlaybackAttemptID,
+		ReplanRequestID:       "replan-seek-rebuild-001",
+		FailedPlanID:          started.PlaybackPlan.PlanID,
+		PlanAttemptID:         "plan-attempt-seek-rb-001",
+		PlanAttemptKey:        started.PlaybackPlan.PlanAttemptKey,
+		AttemptCount:          1,
+		PositionSeconds:       20,
+		SelectedTracks:        started.PlaybackPlan.SelectedTracks,
+		Capabilities:          startRequest.Capabilities,
+		ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	}
+	seekResp := postPlaybackReplanV3(t, handler, started.SessionID, seekReq)
+	if seekResp.Outcome != playback.OutcomePlayableV3 || seekResp.PlaybackPlan == nil {
+		t.Fatalf("seek reanchor failed: %#v", seekResp)
+	}
+
+	// Rebuilt transport must start unrendered.
+	recAfterSeek, err := handler.PlanStoreV3.GetAttempt(context.Background(), started.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recAfterSeek.CurrentTransportRendered {
+		t.Fatal("expected rebuilt seek transport to start unrendered (CurrentTransportRendered = false)")
+	}
+
+	// 2. Delayed first-frame event from original transport arrives carrying old origPlanID.
+	applyReplanFirstFrameV3(t, handler, started.SessionID, startRequest.PlaybackAttemptID, origPlanID, origPlanKey)
+
+	// Rebuilt transport must still be unrendered because plan IDs differ.
+	recAfterDelayed, err := handler.PlanStoreV3.GetAttempt(context.Background(), started.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recAfterDelayed.CurrentTransportRendered {
+		t.Fatal("stale first-frame event falsely marked rebuilt seek transport as rendered")
+	}
+
+	// 3. Rebuilt transport fails before its first frame with connectivity loss.
+	recoveryReq := playback.ReplanRequestV3{
+		ProtocolVersion:       playback.ProtocolV3,
+		Operation:             playback.ReplanOperationFailureRecoveryV3,
+		PlaybackAttemptID:     startRequest.PlaybackAttemptID,
+		ReplanRequestID:       "replan-fail-after-rebuilt-seek",
+		FailedPlanID:          seekResp.PlaybackPlan.PlanID,
+		PlanAttemptID:         "plan-attempt-fail-rb",
+		PlanAttemptKey:        seekResp.PlaybackPlan.PlanAttemptKey,
+		AttemptedPlanKeys:     []string{seekResp.PlaybackPlan.PlanAttemptKey},
+		AttemptCount:          1,
+		PositionSeconds:       20,
+		Failure:               playback.FailureV3{Classification: "transport_stall"},
+		SelectedTracks:        seekResp.PlaybackPlan.SelectedTracks,
+		Capabilities:          startRequest.Capabilities,
+		ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	}
+	failResp := postPlaybackReplanV3(t, handler, started.SessionID, recoveryReq)
+	// Must NOT reissue because the rebuilt transport never rendered a frame!
+	if failResp.Terminal == nil || failResp.Terminal.Reason != playback.TerminalRoutesExhaustedV3 || !failResp.Terminal.Retryable {
+		t.Fatalf("unrendered rebuilt seek transport must not be reissued, got: %#v", failResp)
 	}
 }

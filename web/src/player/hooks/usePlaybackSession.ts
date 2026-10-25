@@ -1716,7 +1716,7 @@ export function usePlaybackSession(
       if (reconnectRef.current.active) playbackPlayingRef.current = reconnectRef.current.resume;
       planAutoPlayRef.current = playbackPlayingRef.current;
       planTransportShownRef.current = false;
-      if (planWasReplaced(arrivalPlanRef.current, plan)) {
+      if (prevPlan !== null && planWasReplaced(prevPlan, plan)) {
         firstFrameRef.current = {
           attemptId: playbackAttemptIdRef.current,
           reported: false,

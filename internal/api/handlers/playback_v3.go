@@ -9872,13 +9872,6 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	}
 	result = retryIncompleteToneMapPlanningV3(result, toneMapCapabilityErr)
 	result = retryIncompletePlaybackSettingsV3(result, plannerSettingsErr)
-	if result.Plan != nil && !seekReanchor {
-		// Give each newly installed replan transport a unique plan ID that
-		// cannot be confused with an earlier installation, while preserving
-		// the canonical recipe attempt key for loop retirement. A seek reanchor
-		// continues the running transport verbatim and must keep its plan ID.
-		finalizeReplanPlanIdentityV3(result.Plan, record.PlaybackAttemptID, req.ReplanRequestID, start.ClientPlaybackContext.Output.OutputContextID)
-	}
 	reportDetourSubtitleDrop()
 	h.clarifyOriginalQuality4KTerminalV3(r.Context(), requestAccessFilter(r), result.Terminal, requestedFile, replanAlternateFilePinnedByOriginalQualityV3(operation, start.QualityPreference))
 	// A planner terminal on a rotated sibling is surfaced as-is: it names the
@@ -10203,6 +10196,12 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		}
 	}
 	result.Plan.Stream.URL = transport.url
+	if result.Plan != nil && !transportReused {
+		// Give each newly installed replan transport a unique plan ID that
+		// cannot be confused with an earlier installation, while preserving
+		// the canonical recipe attempt key for loop retirement.
+		finalizeReplanPlanIdentityV3(result.Plan, record.PlaybackAttemptID, req.ReplanRequestID, start.ClientPlaybackContext.Output.OutputContextID)
+	}
 	response := playback.DecisionResponseV3{ProtocolVersion: playback.ProtocolV3, ServerFeatures: serverFeaturesForRequestV3(r.Context()), Outcome: playback.OutcomePlayableV3, SessionID: session.ID, PlaybackPlan: result.Plan}
 	updated := *record
 	updated.CurrentPlanID = result.Plan.PlanID
@@ -10219,7 +10218,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	updated.NormalizedRequest = start
 	updated.EffectiveMediaFileID = effectiveFile.ID
 	updated.ExpiresAt = time.Now().Add(playback.MaxTokenTTL)
-	updated.CurrentTransportRendered = (seekReanchor || transportReused) && record.CurrentTransportRendered
+	updated.CurrentTransportRendered = transportReused && record.CurrentTransportRendered
 	if transportReused {
 		if expiresAt, parseErr := time.Parse(time.RFC3339, result.Plan.ExpiresAt); parseErr == nil {
 			updated.ExpiresAt = expiresAt
