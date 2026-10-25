@@ -12068,4 +12068,157 @@ describe("usePlaybackSession track change guards", () => {
 
     unmount();
   });
+
+  it("reconciles a stale subtitle slot by identity when the plan reorders ordinals", async () => {
+    const english = fixtureSubtitleInventoryItemV3({
+      track_id: "file:7:subtitle:0",
+      combined_index: 0,
+      language: "eng",
+      label: "English",
+    });
+    const french = fixtureSubtitleInventoryItemV3({
+      track_id: "file:7:subtitle:1",
+      combined_index: 1,
+      language: "fra",
+      label: "French",
+    });
+    const plan = fixturePlanV3({
+      subtitle: { mode: "render", track_id: english.track_id, inventory: [english, french] },
+    });
+    const replanBodies = guardHarness(plan);
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe(plan.plan_id));
+
+    // The verified revision swaps the ordinal order: French is now 0 and
+    // English is 1. The click still names the displayed English slot (0), so
+    // the plan ordinal would select French. The picked track's identity wins.
+    act(() => {
+      result.current.applyInventoryUpdate({
+        session_id: "session-1",
+        inventory_revision: "inv:subtitle-reordered",
+        inventory_status: "verified",
+        effective_media_file_id: 7,
+        audio_tracks: planAudioTracks,
+        subtitle_inventory: [
+          { ...french, combined_index: 0 },
+          { ...english, combined_index: 1 },
+        ],
+      });
+      result.current.changeSubtitleTrack(0, 40);
+    });
+
+    await waitFor(() => expect(replanBodies).toHaveLength(1));
+    expect(replanBodies[0]?.selected_tracks?.subtitle).toMatchObject({
+      id: "file:7:subtitle:0",
+      index: 1,
+    });
+
+    unmount();
+  });
+
+  it("reconciles a stale subtitle slot without track ids by language", async () => {
+    const english = fixtureSubtitleInventoryItemV3({
+      track_id: "",
+      combined_index: 0,
+      language: "eng",
+      label: "English",
+    });
+    const french = fixtureSubtitleInventoryItemV3({
+      track_id: "",
+      combined_index: 1,
+      language: "fra",
+      label: "French",
+    });
+    const plan = fixturePlanV3({
+      subtitle: { mode: "render", inventory: [english, french] },
+    });
+    const replanBodies = guardHarness(plan);
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe(plan.plan_id));
+
+    // The menu publishes no stable ids, so the pick is named only by its slot:
+    // slot 0 is English. The verified revision moves French to 0, and only the
+    // language reconciliation can still find the track the viewer clicked.
+    act(() => {
+      result.current.applyInventoryUpdate({
+        session_id: "session-1",
+        inventory_revision: "inv:subtitle-reordered-no-ids",
+        inventory_status: "verified",
+        effective_media_file_id: 7,
+        audio_tracks: planAudioTracks,
+        subtitle_inventory: [
+          { ...french, track_id: "file:7:subtitle:1", combined_index: 0 },
+          { ...english, track_id: "file:7:subtitle:0", combined_index: 1 },
+        ],
+      });
+      result.current.changeSubtitleTrack(0, 40);
+    });
+
+    await waitFor(() => expect(replanBodies).toHaveLength(1));
+    expect(replanBodies[0]?.selected_tracks?.subtitle).toMatchObject({
+      id: "file:7:subtitle:0",
+      index: 1,
+    });
+
+    unmount();
+  });
+
+  it("ignores a stale subtitle slot with no counterpart even when the ordinal exists", async () => {
+    const japanese = fixtureSubtitleInventoryItemV3({
+      track_id: "file:7:subtitle:2",
+      combined_index: 0,
+      language: "jpn",
+      label: "Japanese",
+    });
+    const english = fixtureSubtitleInventoryItemV3({
+      track_id: "file:7:subtitle:0",
+      combined_index: 1,
+      language: "eng",
+      label: "English",
+    });
+    const french = fixtureSubtitleInventoryItemV3({
+      track_id: "file:7:subtitle:1",
+      combined_index: 2,
+      language: "fra",
+      label: "French",
+    });
+    const plan = fixturePlanV3({
+      subtitle: { mode: "render", track_id: japanese.track_id, inventory: [japanese, english] },
+    });
+    const replanBodies = guardHarness(plan);
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe(plan.plan_id));
+
+    // The viewer clicked the displayed Japanese slot (0). The revision no
+    // longer carries Japanese, and slot 0 now names English: sending the stale
+    // ordinal would silently switch language, so the pick is dropped.
+    act(() => {
+      result.current.applyInventoryUpdate({
+        session_id: "session-1",
+        inventory_revision: "inv:subtitle-dropped",
+        inventory_status: "verified",
+        effective_media_file_id: 7,
+        audio_tracks: planAudioTracks,
+        subtitle_inventory: [
+          { ...english, combined_index: 0 },
+          { ...french, combined_index: 1 },
+        ],
+      });
+      result.current.changeSubtitleTrack(0, 40);
+    });
+
+    expect(replanBodies).toHaveLength(0);
+    expect(result.current.replanning).toBe(false);
+
+    unmount();
+  });
 });

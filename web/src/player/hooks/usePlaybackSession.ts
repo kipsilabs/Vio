@@ -951,12 +951,18 @@ function resolveAudioTrackChange(
  * Resolves the subtitle identity to send for a menu pick, or null when the pick
  * cannot be reconciled to the current plan's inventory.
  *
- * The picked ordinal is authoritative while the plan still publishes it. After
- * a replacement or a source rotation the menu can still show the outgoing
- * inventory, so the picked slot is reconciled by its stable `track_id`, then by
- * language/signature (the same matcher version switches use); a slot with no
- * counterpart is dropped rather than sent as an ordinal the server's inventory
- * does not contain.
+ * The menu slot the viewer clicked is what identifies the pick, so the
+ * displayed track's stable `track_id` is reconciled first, then its
+ * language/signature (the same matcher version switches use). The ordinal is
+ * deliberately not the primary key: after a replacement or a source rotation
+ * the menu can still show the outgoing inventory, and the plan can publish a
+ * *different* track at that same ordinal. Trusting the ordinal there would
+ * switch to a language the viewer never asked for.
+ *
+ * A pick with a stable identity and no counterpart in the plan is dropped
+ * rather than sent. The plan's exact ordinal is used only when there is no
+ * stable picked identity to reconcile (the menu publishes no `track_id`s, or
+ * names no slot) or when the plan publishes no inventory at all.
  *
  * A plan with no published inventory (deferred or legacy) keeps the ordinal:
  * there is no list to validate against, and the server remaps or degrades the
@@ -972,19 +978,25 @@ function resolveSubtitleTrackChange(
   const inventory = plan.subtitle.inventory;
   if (inventory.length === 0) return { id: "", index: combinedIndex };
 
-  const exact = inventory.find((item) => item.combined_index === combinedIndex);
-  if (exact) return { id: exact.track_id, index: exact.combined_index };
-
   const picked = displayed.find((item) => item.index === combinedIndex);
-  if (!picked) return null;
-  if (picked.track_id) {
-    const byId = inventory.find((item) => item.track_id === picked.track_id);
-    if (byId) return { id: byId.track_id, index: byId.combined_index };
+  if (picked) {
+    if (picked.track_id) {
+      const byId = inventory.find((item) => item.track_id === picked.track_id);
+      if (byId) return { id: byId.track_id, index: byId.combined_index };
+    }
+    const candidates = inventory.map((item) => ({ ...item, index: item.combined_index }));
+    const byLanguage = matchSubtitleTrackAcrossVersions(candidates, picked);
+    if (byLanguage) return { id: byLanguage.track_id, index: byLanguage.combined_index };
+    // A displayed slot with a stable identity the plan cannot name has no safe
+    // counterpart: its ordinal belongs to the stale menu, and in the current
+    // plan it may well point at another language.
+    if (picked.track_id) return null;
   }
 
-  const candidates = inventory.map((item) => ({ ...item, index: item.combined_index }));
-  const byLanguage = matchSubtitleTrackAcrossVersions(candidates, picked);
-  return byLanguage ? { id: byLanguage.track_id, index: byLanguage.combined_index } : null;
+  // No stable picked identity to reconcile from: the ordinal is the only
+  // channel the menu offers, so keep it while the plan publishes that slot.
+  const exact = inventory.find((item) => item.combined_index === combinedIndex);
+  return exact ? { id: exact.track_id, index: exact.combined_index } : null;
 }
 
 // Temporary client-side heuristic for A/V transport equivalence.
