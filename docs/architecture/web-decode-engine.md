@@ -50,8 +50,11 @@ decoded or presented fails with a typed classification, and the normal
 `failure_recovery` replan excludes the plan's attempt key, so the server falls
 through to a packaged route.
 
-The server needs no change: the planner already honours both claims on
-`original_http`.
+The server requires a cross-compatible base layer (compatibility ID 1, 2,
+4, or 6) for Dolby Vision sources under `client_managed_dynamic_range_v1`;
+sources without one (such as Profile 5 or absent compatibility IDs) fall
+through to server-adapted routes so the engine is not sent an unplayable
+source.
 
 ## Routing an `original_http` plan
 

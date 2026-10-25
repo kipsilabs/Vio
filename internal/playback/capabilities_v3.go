@@ -410,6 +410,14 @@ func clientManagesOriginalDynamicRangeV3(source SourceDescriptorV3, request Star
 	if source.DynamicRange == "" || source.DynamicRange == DynamicRangeSDRV3 {
 		return false
 	}
+	// A client that manages its own dynamic-range presentation still needs a
+	// decodable base layer for Dolby Vision. Compatibility IDs 1 (HDR10),
+	// 2 (SDR), 4 (HLG) and 6 (HDR10) guarantee one. An absent ID or any other
+	// value (for example profile 5) does not, so the claim is refused and the
+	// planner keeps the routes that carry a validated range.
+	if source.DynamicRange == DynamicRangeDolbyVisionV3 && !crossCompatibleDVBaseLayerV3(source.DVBLCompatID) {
+		return false
+	}
 	delivery, ok := request.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3]
 	return ok && delivery.Enabled && delivery.SupportedOnDevice &&
 		containsFoldV3(delivery.ValidatedClaims, ClaimClientManagedDynamicRangeV3)
@@ -494,6 +502,17 @@ func dolbyVisionBaseLayerRangeV3(compatID int) (string, bool) {
 	default:
 		return "", false
 	}
+}
+
+// crossCompatibleDVBaseLayerV3 reports whether a Dolby Vision base-layer
+// compatibility ID guarantees a decodable base layer (compatibility IDs 1,
+// 2, 4, or 6) that an executor can present without a specialized decoder.
+func crossCompatibleDVBaseLayerV3(compatID int) bool {
+	switch compatID {
+	case 1, 2, 4, 6:
+		return true
+	}
+	return false
 }
 
 // audioRenderModeV3 classifies how a client can render an audio codec without a
