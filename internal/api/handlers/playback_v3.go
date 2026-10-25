@@ -10556,7 +10556,21 @@ func seekReanchorIdentityChangesV3(record *playback.AttemptRecordV3, candidate *
 			changed = append(changed, name)
 		}
 	}
-	add("plan_id", candidate.PlanID != record.CurrentPlanID || candidate.PlanID != current.PlanID)
+	// Generation-scoped plan IDs rotate per transport; the seek-reanchor guard
+	// compares the canonical recipe identity so a new generation of the same
+	// recipe stays eligible. Plans without a canonical ID keep the exact
+	// generation comparison.
+	candidateIdentity := candidate.PlanID
+	if candidate.CanonicalPlanID != "" {
+		candidateIdentity = candidate.CanonicalPlanID
+	}
+	currentIdentity := current.PlanID
+	committedIdentity := record.CurrentPlanID
+	if current.CanonicalPlanID != "" {
+		currentIdentity = current.CanonicalPlanID
+		committedIdentity = current.CanonicalPlanID
+	}
+	add("plan_id", candidateIdentity != currentIdentity || candidateIdentity != committedIdentity)
 	add("requested_file_id", candidate.RequestedMediaFileID != record.RequestedMediaFileID)
 	add("effective_file_id", candidate.EffectiveMediaFileID != record.EffectiveMediaFileID)
 	add("delivery", candidate.Delivery != current.Delivery)
