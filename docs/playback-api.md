@@ -448,6 +448,18 @@ same headers. A refused start, or one that returns a terminal decision,
 registers nothing. These headers do not change the playback device that
 `X-Device-ID` names.
 
+An omitted `audio_track_index` / `carried_audio_track_id` and omitted subtitle
+selection are normally resolved by the server. When the same client (the same
+request IP and user agent) still has a live session for the same profile and
+file, a restarted start carries that session's explicit audio choice and its
+embedded subtitle selection instead of falling back to the profile default. The
+subtitle track is matched by language, codec and forced flag because the previous
+ordinal belongs to the previous candidate's transport; a selection that cannot
+be matched is reported as a degradation warning rather than silently planned
+off. There is no new request or response field: a client that always sends its
+own selection is unaffected, and a second device on the same profile never
+inherits another device's picks.
+
 Two terminal reasons describe a source without stream metadata.
 `source_metadata_incomplete` (`retryable: true`) means the file has not been
 probed yet, or its probe lacks a field a route needs; trying again after the

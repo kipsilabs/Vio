@@ -2333,7 +2333,8 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	// profile and file when the request names neither. An out-of-range carry is
 	// reported as a degradation warning instead of disappearing.
 	audioCarried, carrySubtitleUnavailable, audioUnavailable := h.carrySelectionsFromActiveSessionV3(
-		r.Context(), userID, profileID, requestedFile, &req)
+		r.Context(), userID, profileID, requestedFile, &req,
+		clientip.FromContext(r.Context()), playbackClientInfoFromRequest(r).UserAgent)
 	if audioCarried {
 		virtualDecision.startAudioSelectionOrigin = SelectionOriginExplicit
 	}
@@ -5904,6 +5905,12 @@ func (h *PlaybackHandler) preferredAudioTrackIndexV3(ctx context.Context, userID
 // audio switch") and drops the subtitle. Only an explicit audio choice is
 // carried; a server-resolved auto pick is re-resolved by the new start.
 //
+// The carry is scoped to the same client (IP and user agent) as the previous
+// session, so a second device on the same profile does not inherit another
+// device's explicit picks. An empty recorded or current identity leaves that
+// half of the fence open, which keeps sessions reconstructed before client
+// identity was stamped working.
+//
 // Subtitle ordinals are transport ordinals of the previous effective source, so
 // the track is matched onto the new file's inventory by language, codec and
 // forced flag rather than copied by number. When it cannot be matched,
@@ -5915,6 +5922,8 @@ func (h *PlaybackHandler) carrySelectionsFromActiveSessionV3(
 	profileID string,
 	file *models.MediaFile,
 	req *playback.StartRequestV3,
+	clientIP string,
+	userAgent string,
 ) (audioCarried, subtitleUnavailable, audioUnavailable bool) {
 	if h == nil || h.sessionMgr == nil || file == nil || req == nil {
 		return false, false, false
@@ -5925,12 +5934,20 @@ func (h *PlaybackHandler) carrySelectionsFromActiveSessionV3(
 	if !ok {
 		return false, false, false
 	}
+	clientIP = strings.TrimSpace(clientIP)
+	userAgent = strings.TrimSpace(userAgent)
 	var previous *playback.Session
 	for _, session := range lister.GetUserSessions(userID) {
 		if session == nil || session.ProfileID != profileID {
 			continue
 		}
 		if session.MediaFileID != file.ID && session.RequestedMediaFileID != file.ID {
+			continue
+		}
+		if clientIP != "" && session.ClientIP != "" && session.ClientIP != clientIP {
+			continue
+		}
+		if userAgent != "" && session.ClientUserAgent != "" && session.ClientUserAgent != userAgent {
 			continue
 		}
 		if previous == nil || session.LastActivityAt.After(previous.LastActivityAt) {
