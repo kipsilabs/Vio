@@ -437,7 +437,7 @@ func TestServeExtractFreshSourceRetryBypassesIdentityBackoff(t *testing.T) {
 	c.extractRetryDelays = []time.Duration{}
 	opts := windowResilienceOpts(source)
 	opts.CacheIdentity = "virtual-fresh-source"
-	const payload = "[Script Info]\nDialogue: 0,0:02:00.00,0:02:01.00,Default,,0,0,0,,hello\n"
+	const payload = "[Script Info]\nDialogue: 0,0:02:00.00,0:02:01.00,Default,,0,0,0,,hello\n" //nolint:misspell // ASS cue keyword.
 	const freshPath = "/relay/fresh-token"
 
 	var calls []string
