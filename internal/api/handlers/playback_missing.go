@@ -163,7 +163,7 @@ func markPlaybackFileMissing(
 		}
 	}
 
-	contentID := playbackProgressTarget(file)
+	contentID := playbackFileTarget(file)
 	if contentID != "" && eventsHub != nil {
 		publishEventMetadataUpdate(ctx, eventsHub, file.MediaFolderID, contentID)
 	}

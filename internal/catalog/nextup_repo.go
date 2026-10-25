@@ -716,11 +716,12 @@ func nextUpPageBelowThreshold(page userstore.NextUpStatePage, threshold time.Tim
 
 // nextUpEpisodeLookupQuery resolves a batch of media item ids to episode and
 // parent-series metadata. One query per state page; never per episode.
-const nextUpEpisodeLookupQuery = `
+var nextUpEpisodeLookupQuery = `
 	SELECT e.content_id, e.series_id, e.season_number, e.episode_number, si.title
 	FROM episodes e
 	JOIN media_items si ON si.content_id = e.series_id
-	WHERE e.content_id = ANY($1::text[])`
+	WHERE e.content_id = ANY($1::text[])
+	  AND ` + episodeAliasExclusionPredicateFor("e")
 
 // resolveNextUpEpisodes batch-resolves media item ids against the catalog.
 // Ids that are not episodes (or whose series row is absent) are simply absent
@@ -757,12 +758,13 @@ func (r *NextUpRepository) resolveNextUpEpisodes(ctx context.Context, contentIDs
 // content ids of every episode after it. The resolver asks the user store for
 // exact state on exactly those episodes, so a post-anchor watch is excluded no
 // matter how far down the recency-ordered page walk it sits.
-const nextUpPostAnchorEpisodesQuery = `
+var nextUpPostAnchorEpisodesQuery = `
 	SELECT e.content_id, e.series_id
 	FROM unnest($1::text[], $2::int[], $3::int[]) AS anchor(series_id, season_number, episode_number)
 	JOIN episodes e
 	  ON e.series_id = anchor.series_id
-	 AND (e.season_number, e.episode_number) > (anchor.season_number, anchor.episode_number)`
+	 AND (e.season_number, e.episode_number) > (anchor.season_number, anchor.episode_number)
+	WHERE ` + episodeAliasExclusionPredicateFor("e")
 
 // nextUpPostAnchorEpisodes returns episode content id -> parent series id for
 // every episode after each candidate's anchor. The caller feeds the ids to the
@@ -804,10 +806,11 @@ func (r *NextUpRepository) nextUpPostAnchorEpisodes(ctx context.Context, candida
 // nextUpSeriesEpisodesQuery resolves every episode content id for the given
 // series. The resumable gate needs a whole-series view: a completion anywhere
 // in the series disqualifies it from the resumable branch.
-const nextUpSeriesEpisodesQuery = `
+var nextUpSeriesEpisodesQuery = `
 	SELECT e.content_id, e.series_id
 	FROM episodes e
-	WHERE e.series_id = ANY($1::text[])`
+	WHERE e.series_id = ANY($1::text[])
+	  AND ` + episodeAliasExclusionPredicateFor("e")
 
 // nextUpSeriesEpisodes returns episode content id -> parent series id for every
 // episode of the given series.
@@ -836,15 +839,17 @@ func (r *NextUpRepository) nextUpSeriesEpisodes(ctx context.Context, seriesIDs [
 	return episodeToSeries, nil
 }
 
-// nextUpSuccessorQuery resolves, for every candidate anchor, the first episode
-// after it with an available (non-missing) file and no state row. The state
-// ids arrive as an array because they live behind the user store; the catalog
-// query only supplies the ordering and availability.
+// nextUpSuccessorQuery resolves, for every candidate anchor, the first canonical
+// episode after it with an available (non-missing) file and no state row. A
+// canonical episode qualifies when it owns a present file directly or through
+// one of its alias rows. The state ids arrive as an array because they live
+// behind the user store; the catalog query only supplies the ordering and
+// availability.
 //
 // The episode tie-break is (season, episode, content_id): episodes of one
 // series share the first two, and content_id keeps the pick stable when a
 // catalog somehow carries duplicate numbering.
-const nextUpSuccessorQuery = `
+var nextUpSuccessorQuery = `
 	SELECT anchor.series_id, next_ep.content_id, next_ep.season_number, next_ep.episode_number
 	FROM unnest($1::text[], $2::int[], $3::int[]) AS anchor(series_id, season_number, episode_number)
 	JOIN media_items si ON si.content_id = anchor.series_id
@@ -853,10 +858,8 @@ const nextUpSuccessorQuery = `
 		FROM episodes e2
 		WHERE e2.series_id = anchor.series_id
 		  AND (e2.season_number, e2.episode_number) > (anchor.season_number, anchor.episode_number)
-		  AND EXISTS (
-			  SELECT 1 FROM media_files mf
-			  WHERE mf.episode_id = e2.content_id AND mf.missing_since IS NULL
-		  )
+		  AND ` + episodeAliasExclusionPredicateFor("e2") + `
+		  AND ` + canonicalEpisodeFileExistsSQL("e2.content_id", "mf.missing_since IS NULL") + `
 		  AND NOT (e2.content_id = ANY($4::text[]))
 		ORDER BY e2.season_number, e2.episode_number, e2.content_id
 		LIMIT 1
