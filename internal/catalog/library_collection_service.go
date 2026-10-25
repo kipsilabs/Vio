@@ -649,7 +649,24 @@ type collectionVirtualVariantCache struct {
 // collection member. It wraps ErrProviderUnavailable so errors.Is matches both,
 // but lets acceptance distinguish member-level variant gaps from collection-level
 // release policy rejections.
-var ErrMemberVariantsUnavailable = fmt.Errorf("%w: virtual profile variants unavailable", ErrProviderUnavailable)
+var ErrMemberVariantsUnavailable = fmt.Errorf("%w: getting virtual profile variants", ErrProviderUnavailable)
+
+func (s *LibraryCollectionService) hasCommittedCollectionState(ctx context.Context, collectionID, itemID string) (bool, error) {
+	if s == nil || s.collections == nil || s.collections.pool == nil {
+		return false, nil
+	}
+	var hasState bool
+	err := s.collections.pool.QueryRow(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM library_collection_items WHERE collection_id=$1 AND media_item_id=$2
+		) AND EXISTS(
+			SELECT 1 FROM virtual_media_source_claims WHERE source_key=$3 AND content_id=$2
+		)`, collectionID, itemID, "collection:"+collectionID).Scan(&hasState)
+	if err != nil {
+		return false, fmt.Errorf("checking resident collection item state: %w", err)
+	}
+	return hasState, nil
+}
 
 func (s *LibraryCollectionService) findPhysicalContentMap(ctx context.Context, ids []string) (map[string]bool, error) {
 	rows, err := s.collections.pool.Query(ctx, `
@@ -691,17 +708,9 @@ func (s *LibraryCollectionService) resolveAcceptanceMember(
 			return preparedCollectionItem{}, false, "", tracker.err
 		}
 		if errors.Is(err, ErrMemberVariantsUnavailable) {
-			hasState := false
-			if s.collections != nil && s.collections.pool != nil {
-				scanErr := s.collections.pool.QueryRow(ctx, `
-					SELECT EXISTS(
-						SELECT 1 FROM library_collection_items WHERE collection_id=$1 AND media_item_id=$2
-					) AND EXISTS(
-						SELECT 1 FROM virtual_media_source_claims WHERE source_key=$3 AND content_id=$2
-					)`, collection.ID, member.MediaItemID, "collection:"+collection.ID).Scan(&hasState)
-				if scanErr != nil {
-					return preparedCollectionItem{}, false, "", fmt.Errorf("checking resident collection item state: %w", scanErr)
-				}
+			hasState, stateErr := s.hasCommittedCollectionState(ctx, collection.ID, member.MediaItemID)
+			if stateErr != nil {
+				return preparedCollectionItem{}, false, "", stateErr
 			}
 			warningMsg := fmt.Sprintf("materializing virtual item %q: %v", item.Title, err)
 			if hasState {
