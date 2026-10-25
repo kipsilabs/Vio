@@ -1,5 +1,5 @@
 import { renderHook } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, type Mock, vi } from "vitest";
 import { videoContentRect, type FitRect } from "../utils/videoFit";
 import type { PlayerSubtitleInfo } from "../types";
 import { pgsPlaneRect, placePGSObjects, usePGSSubtitles } from "./usePGSSubtitles";
@@ -307,6 +307,42 @@ describe("usePGSSubtitles fetcher", () => {
     await vi.waitFor(() => expect(onSourceChanged).toHaveBeenCalledTimes(1));
     expect(fetchMock).toHaveBeenCalledTimes(1);
     unmount();
+  });
+
+  it("re-evaluates the active window when playback resumes", async () => {
+    stubPlayerGlobals();
+    const fetchMock = vi.fn((_url: string, _init?: RequestInit) => emptyWindow());
+    vi.stubGlobal("fetch", fetchMock);
+    const onLoadState = vi.fn();
+    const video = fakeVideo();
+    const opts = { ...options(), videoRef: { current: video }, onLoadState };
+    const { unmount } = renderHook(() => usePGSSubtitles(opts));
+
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    const playListener = (video.addEventListener as unknown as Mock).mock.calls.find(
+      ([event]) => event === "play",
+    )?.[1] as (() => void) | undefined;
+    expect(playListener).toBeTypeOf("function");
+
+    // The pause outlasted the loaded slice: resuming fetches the window at the
+    // playhead again through the fetcher's own single-flight scheduler.
+    video.currentTime = 1_000;
+    playListener!();
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    expect(fetchMock.mock.calls[1]?.[0]).toContain("position=970");
+    // The second window committed before the next resume is evaluated.
+    await vi.waitFor(() => {
+      expect(onLoadState.mock.calls.length).toBeGreaterThanOrEqual(3);
+      expect(onLoadState).toHaveBeenLastCalledWith("ready");
+    });
+
+    // A second resume inside the covered window neither duplicates the request
+    // nor starts a retry loop of its own.
+    playListener!();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    unmount();
+    expect(video.removeEventListener).toHaveBeenCalledWith("play", playListener);
   });
 
   it("rebuilds the fetcher when a source revision changes", () => {

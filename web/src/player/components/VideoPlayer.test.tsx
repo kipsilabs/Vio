@@ -4956,6 +4956,47 @@ describe("VideoPlayer stale generation recovery", () => {
     expect(onPlanFailure).not.toHaveBeenCalled();
   });
 
+  it("routes a stale-sgen 412 after playback through playlist recovery, not connection loss", async () => {
+    const onConnectionLost = vi.fn();
+    const onPlanFailure = vi.fn();
+    // A nonzero media timeline offset must not leak into hls.js startPosition:
+    // that option uses the player/playlist clock, as the initial load does.
+    const plan = hlsTranscodePlan();
+    plan.timeline.timeline_offset_seconds = 1_800;
+    const { container } = renderPlayer({
+      plan,
+      streamUrl: transcodeStreamUrl,
+      onConnectionLost,
+      onPlanFailure,
+      shouldAutoPlay: false,
+    });
+    await waitFor(() => expect(hlsJS.errorHandler).toBeTypeOf("function"));
+    hlsJS.loadSource.mockClear();
+    hlsJS.startLoad.mockClear();
+
+    const video = container.querySelector("video");
+    if (!video) throw new Error("expected video element");
+    video.currentTime = 40;
+    // A frame has played, so a fatal network error would now be handed to the
+    // reconnect before reaching the stale-generation branch.
+    fireFrameTimeUpdate(video);
+    Object.defineProperty(video, "paused", { configurable: true, value: false });
+
+    act(() => {
+      hlsJS.errorHandler?.("error", staleSegfault());
+    });
+
+    // The fence is a deterministic redirect, not a transport failure: a far-seek
+    // 412 on a stream that already played must not replan the session.
+    expect(onConnectionLost).not.toHaveBeenCalled();
+    expect(hlsJS.loadSource).toHaveBeenCalledTimes(1);
+    expect(hlsJS.loadSource.mock.calls[0]?.[0]).toContain("master.m3u8");
+    const instance = hlsJS.latest as unknown as { config?: { startPosition?: number } };
+    expect(instance.config?.startPosition).toBe(40);
+    expect(hlsJS.startLoad).not.toHaveBeenCalled();
+    expect(onPlanFailure).not.toHaveBeenCalled();
+  });
+
   it("bounds consecutive stale-generation refetches and falls through to failure recovery", async () => {
     const onPlanFailure = vi.fn();
     renderPlayer({

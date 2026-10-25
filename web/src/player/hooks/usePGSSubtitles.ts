@@ -466,6 +466,11 @@ export function usePGSSubtitles({
 
     maybeFetch();
     videoEl.addEventListener("timeupdate", maybeFetch);
+    // Resuming re-evaluates the window at the current playhead: a pause can
+    // outlast the loaded slice, and nothing else fires until the next
+    // timeupdate. The fetcher itself keeps one window on the wire, so this
+    // never double-fetches or bypasses its backoff and failure budget.
+    videoEl.addEventListener("play", maybeFetch);
     videoEl.addEventListener("seeking", maybeFetchAfterSeek);
     videoEl.addEventListener("seeked", maybeFetchAfterSeek);
     frameRequest = requestAnimationFrame(renderFrame);
@@ -475,6 +480,7 @@ export function usePGSSubtitles({
       fetcher.dispose();
       if (frameRequest) cancelAnimationFrame(frameRequest);
       videoEl.removeEventListener("timeupdate", maybeFetch);
+      videoEl.removeEventListener("play", maybeFetch);
       videoEl.removeEventListener("seeking", maybeFetchAfterSeek);
       videoEl.removeEventListener("seeked", maybeFetchAfterSeek);
       canvasEl.getContext("2d")?.clearRect(0, 0, canvasEl.width, canvasEl.height);
