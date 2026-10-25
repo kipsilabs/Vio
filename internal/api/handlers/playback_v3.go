@@ -9211,6 +9211,12 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 					resolvedFile.VirtualOwnerInstallationID = resolved.OwnerID
 					currentEffectiveFile = &resolvedFile
 					replanVirtualProvenance = resolved.Provenance
+					// A failure recovery re-resolves the virtual candidate, and the resolver can
+					// return a row whose inventory lacks fields the running plan already proved.
+					// Carry only when the resolved candidate is the plan's own candidate: a
+					// rotated sibling, another owner, or a conflicting codec keeps the existing
+					// fail-closed metadata gate.
+					currentEffectiveFile = carryFailureRecoveryVirtualEvidenceV3(record, resolved.URI, currentEffectiveFile)
 				}
 			}
 		}
@@ -12016,6 +12022,24 @@ func (h *PlaybackHandler) frozenSeekCarrierV3(ctx context.Context, session *play
 		carrier.ProbeUpdatedAt = nil
 	}
 	return carryValidatedVirtualVideoEvidenceV3(&carrier, record.CurrentPlan.Source), nil
+}
+
+// carryFailureRecoveryVirtualEvidenceV3 tops up a rehydrated virtual candidate's
+// inventory with descriptor fields the running plan already proved, when
+// rehydration resolved the plan's own candidate.
+func carryFailureRecoveryVirtualEvidenceV3(record *playback.AttemptRecordV3, resolvedURI string, file *models.MediaFile) *models.MediaFile {
+	if record == nil || file == nil {
+		return file
+	}
+	// A failure recovery re-resolves the virtual candidate, and the resolver can
+	// return a row whose inventory lacks fields the running plan already proved.
+	// Carry only when the resolved candidate is the plan's own candidate: a
+	// rotated sibling, another owner, or a conflicting codec keeps the existing
+	// fail-closed metadata gate.
+	if sameVirtualCandidate(strings.TrimSpace(record.CurrentPlan.EffectiveVirtualURI), strings.TrimSpace(resolvedURI)) {
+		return carryValidatedVirtualVideoEvidenceV3(file, record.CurrentPlan.Source)
+	}
+	return file
 }
 
 // carryValidatedVirtualVideoEvidenceV3 tops up a carried pinned candidate's
