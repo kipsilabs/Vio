@@ -3108,8 +3108,10 @@ func (h *PlaybackHandler) retainedGenerationManifest(sessionID, segPrefix, rawQu
 // 1-2s; the wait is additionally stall-aware, so a dead encoder is reported
 // well before this ceiling. Exceeding it falls back to the stale-generation
 // verdict, which makes the client reload the playlist and retry once the
-// restart has produced it.
-const seekRestartServeTimeout = 10 * time.Second
+// restart has produced it. Kept below the 8s default HTTP read timeout of the
+// ExoPlayer-based clients so the held request still delivers headers before
+// their transport gives up.
+const seekRestartServeTimeout = 6 * time.Second
 
 // HandleGetTranscodeSegment handles GET /playback/transcode/{session_id}/segment/{name}.
 // Authorization follows the same negotiated legacy-versus-header-authenticated
@@ -3271,7 +3273,8 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 			segmentLease, err = retained.OpenSegmentForGeneration(segmentName, requestedGeneration)
 			servedSession = retained
 		} else if restartStart, restarted := transcodeSession.RestartedAtSegment(); restarted &&
-			requestedSegment >= 0 && requestedSegment >= restartStart {
+			((requestedSegment >= 0 && requestedSegment >= restartStart) ||
+				(requestedSegment < 0 && strings.EqualFold(segmentName, "init.mp4"))) {
 			slog.InfoContext(r.Context(), "transcode segment served from the live generation after an in-place restart",
 				"component", "api", "session", sessionID, "playback_session_id", sessionID,
 				"segment", segmentName, "requested_segment", requestedSegment,
