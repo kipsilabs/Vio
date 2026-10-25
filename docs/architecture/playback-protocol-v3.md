@@ -192,7 +192,11 @@ replays the original response verbatim. Reusing the id with a different body is
 this is, so reusing it for different intent is a client bug the server refuses to
 paper over. If the attempt is known but its session has since expired, the
 response is a `201` terminal with reason `session_expired` rather than a replay
-of a plan that no longer exists.
+of a plan that no longer exists. The same retryable terminal answers a stored
+decision whose `session_id` or plan `session_id` is not the session the attempt
+owns (possible after a mixed-version write): a plan for another session would be
+refused by the client's own plan-ownership check, so replaying it is never
+useful.
 
 Playable and terminal decisions are both durable attempts. A terminal start has
 no `session_id` or plan identity, but its response and ownership are retained
@@ -314,6 +318,14 @@ not exist answers `400`, not `404`.
 carrying the *same* `replan_request_id` while the lease is in flight gets `409
 replan_in_progress`; once the original completes, the same id replays its
 response verbatim. This is what makes a client's retry-on-timeout safe.
+
+A committed start fences the profile's other sessions: any replan lease still in
+flight for an earlier session of the same profile is retired, and its owner's
+commit loses the compare and answers `409 stale_playback_plan`. A client that
+already moved to the new session must not receive the earlier session's
+replacement plan, and a plan for a session it no longer owns reads as a
+replacement belonging to another session. Completed replans are untouched; they
+remain that session's replayable decision.
 
 Note the deliberate asymmetry with start: a store outage during replan is `500`,
 never `404`. Clients tear playback down on session-not-found, so a transient

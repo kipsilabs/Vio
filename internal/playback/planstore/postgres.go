@@ -506,6 +506,28 @@ func (s *Postgres) ReleaseReplan(ctx context.Context, sessionID, requestID, leas
 	return err
 }
 
+// FenceProfileReplanLeases implements playback.ReplanLeaseFencerV3. It deletes
+// only active leases; a completed lease is the durable decision of the session
+// that owns it and stays replayable there. The owner of a fenced lease finds
+// its CompleteReplan no longer matches an active row and loses to the
+// ErrReplanSupersededV3 compare, so nothing reaches the attempt.
+func (s *Postgres) FenceProfileReplanLeases(ctx context.Context, userID int, profileID, keepSessionID string) (int64, error) {
+	tag, err := s.db.Exec(ctx, `
+		DELETE FROM playback_v3_replans AS replan
+		USING playback_v3_attempts AS attempt
+		WHERE replan.session_id = attempt.session_id
+		  AND replan.state = 'active'
+		  AND attempt.user_id = $1
+		  AND attempt.profile_id = $2
+		  AND attempt.expires_at > NOW()
+		  AND attempt.session_id IS DISTINCT FROM NULLIF($3, '')::uuid`,
+		userID, profileID, keepSessionID)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
 func (s *Postgres) CompleteReplan(ctx context.Context, sessionID, requestID, leaseToken, baseReplanRequestID string, response json.RawMessage, record playback.AttemptRecordV3) error {
 	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
@@ -560,11 +582,12 @@ func (s *Postgres) CompleteReplan(ctx context.Context, sessionID, requestID, lea
 		return err
 	}
 	if replanResult.RowsAffected() != 1 {
-		var exists bool
-		if scanErr := tx.QueryRow(ctx, `SELECT true FROM playback_v3_replans WHERE session_id = $1::uuid AND replan_request_id = $2`, sessionID, requestID).Scan(&exists); scanErr == nil {
-			return playback.ErrReplanSupersededV3
-		}
-		return playback.ErrSessionNotFound
+		// A missing row is a fence: a newer start for the profile deleted this
+		// in-flight lease, or another writer superseded it. Either way the
+		// replacement is stale, not a missing session, so the caller can answer
+		// the retryable stale_playback_plan. The deferred rollback discards the
+		// attempt update above.
+		return playback.ErrReplanSupersededV3
 	}
 	return tx.Commit(ctx)
 }

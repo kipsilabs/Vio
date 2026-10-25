@@ -207,3 +207,65 @@ func TestMemoryPlanStoreV3ExpiredOwnerCannotMutateReclaimedLease(t *testing.T) {
 		t.Fatalf("current owner completion: %v", err)
 	}
 }
+
+// A new playback session retires the profile's in-flight replan leases. The
+// fenced owner can no longer commit (its row is gone, so CompleteReplan reports
+// a superseded replacement), while a completed lease stays as that session's
+// durable decision and another profile or user is untouched.
+func TestMemoryPlanStoreV3FencesPriorProfileReplanLeases(t *testing.T) {
+	store := NewMemoryPlanStoreV3()
+	ctx := context.Background()
+	expiresAt := time.Now().Add(time.Hour)
+	attempts := []AttemptRecordV3{
+		{PlaybackAttemptID: "attempt-prior", SessionID: "session-prior", UserID: 1, ProfileID: "profile-1", CurrentPlanID: "plan-prior", ExpiresAt: expiresAt},
+		{PlaybackAttemptID: "attempt-other-profile", SessionID: "session-other-profile", UserID: 1, ProfileID: "profile-2", CurrentPlanID: "plan-other-profile", ExpiresAt: expiresAt},
+		{PlaybackAttemptID: "attempt-other-user", SessionID: "session-other-user", UserID: 2, ProfileID: "profile-1", CurrentPlanID: "plan-other-user", ExpiresAt: expiresAt},
+		{PlaybackAttemptID: "attempt-new", SessionID: "session-new", UserID: 1, ProfileID: "profile-1", CurrentPlanID: "plan-new", ExpiresAt: expiresAt},
+	}
+	for _, record := range attempts {
+		if err := store.SaveAttempt(ctx, record); err != nil {
+			t.Fatal(err)
+		}
+	}
+	begin := func(sessionID, requestID string) ReplanLeaseV3 {
+		t.Helper()
+		lease, err := store.BeginReplan(ctx, sessionID, requestID, "digest-"+requestID, "", time.Now().Add(time.Minute))
+		if err != nil || lease.State != ReplanLeaseOwnedV3 {
+			t.Fatalf("lease %s/%s = %#v, err=%v", sessionID, requestID, lease, err)
+		}
+		return lease
+	}
+	stale := begin("session-prior", "replan-inflight")
+	completed := begin("session-prior", "replan-completed")
+	response := json.RawMessage(`{"protocol_version":3,"outcome":"playable"}`)
+	finished := attempts[0]
+	finished.CurrentReplanRequestID = "replan-completed"
+	if err := store.CompleteReplan(ctx, "session-prior", "replan-completed", completed.LeaseToken, "", response, finished); err != nil {
+		t.Fatalf("complete prior replan: %v", err)
+	}
+	begin("session-other-profile", "replan-other-profile")
+	begin("session-other-user", "replan-other-user")
+	begin("session-new", "replan-new")
+
+	fenced, err := store.FenceProfileReplanLeases(ctx, 1, "profile-1", "session-new")
+	if err != nil || fenced != 1 {
+		t.Fatalf("fenced = %d, err = %v; want only the prior session's in-flight lease", fenced, err)
+	}
+	// The attempt's revision now names the completed replan, so the fenced
+	// owner's failure below is the deleted lease row, not a base mismatch.
+	if err := store.CompleteReplan(ctx, "session-prior", "replan-inflight", stale.LeaseToken, "replan-completed", response, finished); !errors.Is(err, ErrReplanSupersededV3) {
+		t.Fatalf("fenced owner completion error = %v, want ErrReplanSupersededV3", err)
+	}
+	if lease, err := store.BeginReplan(ctx, "session-prior", "replan-completed", "digest-replan-completed", "", time.Now().Add(time.Minute)); err != nil || lease.State != ReplanLeaseCompletedV3 {
+		t.Fatalf("completed lease after fence = %#v, err=%v; want it preserved", lease, err)
+	}
+	for _, tc := range []struct{ sessionID, requestID string }{
+		{"session-other-profile", "replan-other-profile"},
+		{"session-other-user", "replan-other-user"},
+		{"session-new", "replan-new"},
+	} {
+		if lease, err := store.BeginReplan(ctx, tc.sessionID, tc.requestID, "digest-"+tc.requestID, "", time.Now().Add(time.Minute)); err != nil || lease.State != ReplanLeaseInFlightV3 {
+			t.Fatalf("lease %s/%s after fence = %#v, err=%v; want it still in flight", tc.sessionID, tc.requestID, lease, err)
+		}
+	}
+}
