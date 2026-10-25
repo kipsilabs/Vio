@@ -12,6 +12,8 @@ import {
   detectHLSSupport,
   type WebCapabilityProbe,
 } from "./client-context-v3";
+import { ENGINE_DV_BL_COMPAT_IDS, engineTransferForPlan } from "./engine/routing";
+import { fixturePlanV3 } from "./protocol-v3.fixtures";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -190,13 +192,20 @@ describe("browser decode engine capabilities", () => {
     hdr: true,
   };
 
-  it("widens only original_http and claims track selection and managed range", () => {
+  it("widens only original_http and claims track selection, managed range and supported DV ids", () => {
     const deliveries = buildDeliveriesV3(probe, "test", engine);
     expect(deliveries.original_http).toMatchObject({
       containers: ["mp4", "webm", "mkv"],
       video_codecs: ["h264", "av1", "hevc"],
       audio_decode_codecs: ["aac", "opus", "ac3", "eac3", "dts", "truehd"],
-      validated_claims: ["client_selected_audio_track_v1", "client_managed_dynamic_range_v1"],
+      validated_claims: [
+        "client_selected_audio_track_v1",
+        "client_managed_dynamic_range_v1",
+        "client_managed_dv_bl_compat_1_v1",
+        "client_managed_dv_bl_compat_6_v1",
+        "client_managed_dv_bl_compat_4_v1",
+        "client_managed_dv_bl_compat_2_v1",
+      ],
     });
     expect(deliveries.progressive?.audio_decode_codecs).toEqual(["aac", "opus"]);
     expect(deliveries.progressive?.validated_claims).toEqual([]);
@@ -223,7 +232,25 @@ describe("browser decode engine capabilities", () => {
     expect(buildClientCapabilitiesV3(probe).codecs_audio).toEqual(["aac", "opus"]);
     expect(
       buildClientPlaybackContextV3(probe, engine).deliveries.original_http?.validated_claims,
-    ).toHaveLength(2);
+    ).toHaveLength(6);
+  });
+
+  it("claims exactly the Dolby Vision ids routing can present", () => {
+    const claims = buildDeliveriesV3(probe, "test", engine).original_http?.validated_claims ?? [];
+    const dvClaims = claims.filter((claim) => claim.startsWith("client_managed_dv_bl_compat_"));
+    expect(dvClaims).toEqual(
+      ENGINE_DV_BL_COMPAT_IDS.map((id) => `client_managed_dv_bl_compat_${id}_v1`),
+    );
+    for (const id of ENGINE_DV_BL_COMPAT_IDS) {
+      const plan = fixturePlanV3();
+      plan.source = { ...plan.source, dynamic_range: "dolby_vision", dv_bl_compat_id: id };
+      expect(engineTransferForPlan(plan)).not.toBeNull();
+    }
+    for (const absent of [0, 3, 5]) {
+      const plan = fixturePlanV3();
+      plan.source = { ...plan.source, dynamic_range: "dolby_vision", dv_bl_compat_id: absent };
+      expect(engineTransferForPlan(plan)).toBeNull();
+    }
   });
 });
 

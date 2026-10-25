@@ -406,13 +406,42 @@ func outputRangeEligibleV3(source SourceDescriptorV3, request StartRequestV3) (b
 // says the original-file executor can inspect the source and choose its own
 // display presentation after delivery; it does not make the same HDR source
 // safe for a server-produced progressive or HLS stream.
+//
+// Dolby Vision takes a narrower path: presentation depends on a compatible
+// base layer, so the generic claim is not enough. The source row must prove its
+// base layer and carry an explicit compatibility id, and the client must claim
+// that exact id. An absent or unknown id has no claim and fails closed.
 func clientManagesOriginalDynamicRangeV3(source SourceDescriptorV3, request StartRequestV3) bool {
 	if source.DynamicRange == "" || source.DynamicRange == DynamicRangeSDRV3 {
 		return false
 	}
 	delivery, ok := request.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3]
 	return ok && delivery.Enabled && delivery.SupportedOnDevice &&
-		containsFoldV3(delivery.ValidatedClaims, ClaimClientManagedDynamicRangeV3)
+		deliveryManagesOriginalDynamicRangeV3(delivery, source)
+}
+
+// deliveryManagesOriginalDynamicRangeV3 is the single rule for the per-delivery
+// managed-range bypass. Planning and the finished-plan check in
+// deliverySupportsPlanV3 share it so a Dolby Vision source cannot reach direct
+// play on the generic claim alone.
+func deliveryManagesOriginalDynamicRangeV3(delivery DeliveryCapabilityV3, source SourceDescriptorV3) bool {
+	if source.DynamicRange == DynamicRangeDolbyVisionV3 {
+		return deliveryManagedDVBaseLayerV3(delivery, source)
+	}
+	return containsFoldV3(delivery.ValidatedClaims, ClaimClientManagedDynamicRangeV3)
+}
+
+// deliveryManagedDVBaseLayerV3 reports whether the executor claims the base
+// layer for this source's compatibility id. Profiles 7 and 8 are the composite
+// Dolby Vision profiles whose standard base layer an ordinary decoder can
+// present; profiles without a base layer, an unproven base-layer record, or an
+// id the client never claimed are all refused rather than assumed.
+func deliveryManagedDVBaseLayerV3(delivery DeliveryCapabilityV3, source SourceDescriptorV3) bool {
+	if !source.DVBaseLayerProven || (source.DVProfile != 7 && source.DVProfile != 8) {
+		return false
+	}
+	claim := ClientManagedDVBaseLayerClaimV3(source.DVBLCompatID)
+	return claim != "" && containsFoldV3(delivery.ValidatedClaims, claim)
 }
 
 // clientSelectsOriginalAudioTrackV3 is delivery-scoped because original HTTP

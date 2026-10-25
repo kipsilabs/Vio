@@ -660,12 +660,22 @@ always send `output.hdr_details` too, because a server without
 `client_capabilities.hdr_details`; the feature token tells the client whether
 the evidence tier is being honored.
 
-There are two delivery-scoped exceptions. An `original_http` capability
-carrying the validated claim `client_managed_dynamic_range_v1` asserts that its
-executor accepts the declared source range and resolves presentation against
-the live output after receiving the original bytes. The planner may therefore
-deliver HDR or Dolby Vision through that class even when the active sink does
-not natively advertise the source range.
+The first delivery-scoped exception is `client_managed_dynamic_range_v1` on
+`original_http`: it asserts that the executor accepts the declared **non-Dolby-
+Vision** HDR range and resolves presentation against the live output after
+receiving the original bytes. The planner may therefore deliver HDR10, HDR10+,
+HLG or an assumed-range `hdr_unknown` source through that class even when the
+active sink does not natively advertise the source range. It never covers
+Dolby Vision.
+
+Dolby Vision instead uses one claim per base-layer compatibility id:
+`client_managed_dv_bl_compat_<dv_bl_compat_id>_v1`. A client emits only the ids
+its executor can present, so an id the client never named has no claim. The
+server keeps the rest of the gate: the source must have a scan-proven base-layer
+record (a Dolby Vision configuration record, an explicit compatibility id and a
+present base layer), be Profile 7 or 8, and carry that exact id. Absent,
+unproven, mismatched, and profile-5 sources fail closed rather than being
+inferred from the device-level `hdr` boolean.
 
 The narrower claim `client_dv8_base_layer_fallback_v1`, also `original_http`
 only, asserts that the executor decodes a single-layer Dolby Vision Profile 8
@@ -717,8 +727,10 @@ carry `hdr10_max_width`, `hdr10_max_height`, `hdr10_max_frame_rate`, and
 `hdr10_max_bitrate_kbps`; these ceilings keep a successful format probe from
 admitting an untested stream class. When the viewer turns on the web player's
 browser decode engine, `original_http` instead carries
-`client_managed_dynamic_range_v1` (when its WebGPU presenter works) and the engine tone-maps the
-original itself; see [web-decode-engine.md](web-decode-engine.md).
+`client_managed_dynamic_range_v1` (when its WebGPU presenter works) plus one
+`client_managed_dv_bl_compat_<id>_v1` claim for each Dolby Vision base-layer
+compatibility id the engine routes, and the engine tone-maps the original
+itself; see [web-decode-engine.md](web-decode-engine.md).
 
 ---
 
@@ -782,8 +794,9 @@ because "the user turned HLS off" and "this device has no HLS player" call for
 different degradation warnings and different diagnostics. A class the client
 omits entirely is unavailable — the server will not guess.
 
-`client_managed_dynamic_range_v1` and `client_dv8_base_layer_fallback_v1` are
-valid only as `validated_claims` entries on `original_http`. Neither is a
+`client_managed_dynamic_range_v1`, its Dolby Vision per-id narrowing claims
+`client_managed_dv_bl_compat_<id>_v1`, and `client_dv8_base_layer_fallback_v1`
+are valid only as `validated_claims` entries on `original_http`. None is a
 selectable transformation: the server supplies the source and the client
 executor probes and routes it internally. If that
 executor later reports a typed load failure, normal attempted-plan-key

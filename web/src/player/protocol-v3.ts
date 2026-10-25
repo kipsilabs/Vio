@@ -187,10 +187,27 @@ export const FEATURE_DEFERRED_TRACK_INVENTORY_V3 = "deferred_track_inventory_v1"
 export const CLAIM_CLIENT_SELECTED_AUDIO_TRACK_V3 = "client_selected_audio_track_v1";
 
 /**
- * `original_http` validated claim: the client accepts HDR and Dolby Vision
- * originals and resolves presentation for the live output itself.
+ * `original_http` validated claim: the client accepts an HDR original and
+ * resolves presentation for the live output itself. It does not cover Dolby
+ * Vision; that source needs the per-compatibility-id claim below because the
+ * client's presentation depends on a base layer it may not carry.
  */
 export const CLAIM_CLIENT_MANAGED_DYNAMIC_RANGE_V3 = "client_managed_dynamic_range_v1";
+
+/**
+ * Prefix of the `original_http` validated claim that narrows managed dynamic
+ * range to one Dolby Vision base-layer compatibility id. The suffix is the
+ * numeric `dv_bl_compat_id` (`client_managed_dv_bl_compat_2_v1`). A client
+ * emits a claim only for an id it can present; an unknown or absent id has no
+ * claim, so the server must not infer support for it.
+ */
+export const CLAIM_CLIENT_MANAGED_DV_BASE_LAYER_PREFIX_V3 = "client_managed_dv_bl_compat_";
+
+/** The per-compatibility-id managed-range claim, or null when the id is absent. */
+export function claimClientManagedDVBaseLayerV3(compatID: number): string | null {
+  if (!Number.isInteger(compatID) || compatID <= 0) return null;
+  return `${CLAIM_CLIENT_MANAGED_DV_BASE_LAYER_PREFIX_V3}${compatID}_v1`;
+}
 
 /**
  * The source-preserving rung label. Vio keeps it as its own quality choice
