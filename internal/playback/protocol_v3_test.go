@@ -1411,8 +1411,33 @@ func TestPlanPlaybackV3RoutesExhaustedAfterAttemptHistory(t *testing.T) {
 		t.Fatalf("first plan = %s", ExplainPlannerResultV3(first))
 	}
 
+	// An intrinsically unplayable source (no video decode capability) keeps transcoding_disabled
+	// even when history is non-empty.
 	input.AttemptedKeys = []string{"v3:0000000000000001"}
-	exhausted := PlanPlaybackV3(input)
+	notExhausted := PlanPlaybackV3(input)
+	if notExhausted.Terminal == nil || notExhausted.Terminal.Reason != "transcoding_disabled" || notExhausted.Terminal.Retryable {
+		t.Fatalf("intrinsically unplayable with history = %s, want transcoding_disabled", ExplainPlannerResultV3(notExhausted))
+	}
+
+	// When video decode and HDR are supported, compatible copy routes exist. Exhausting them
+	// returns retryable routes_exhausted.
+	req.Capabilities.HDR = true
+	req.Capabilities.HDRDetails = &HDRCapabilitiesV3{HDR10: true}
+	req.ClientPlaybackContext.Output.HDRDetails = &HDRCapabilitiesV3{HDR10: true}
+	req.Capabilities.VideoDecode = []VideoDecodeCapabilityV3{{
+		Codec: "hevc", Profiles: []string{"main 10"}, Levels: []int{153}, BitDepths: []int{10},
+		MaxWidth: 3840, MaxHeight: 2160, MaxFrameRate: 60, MaxBitrateKbps: 80_000, Hardware: true,
+	}}
+	attemptedKeys := []string{}
+	var exhausted PlannerResultV3
+	for range 5 {
+		res := PlanPlaybackV3(PlannerInputV3{Request: req, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0, AttemptedKeys: attemptedKeys, Settings: PlannerSettingsV3{TranscodeEnabled: false, Allow4KTranscode: true}})
+		if res.Plan == nil {
+			exhausted = res
+			break
+		}
+		attemptedKeys = append(attemptedKeys, res.Plan.PlanAttemptKey)
+	}
 	if exhausted.Terminal == nil || exhausted.Terminal.Reason != TerminalRoutesExhaustedV3 || !exhausted.Terminal.Retryable {
 		t.Fatalf("after attempt history = %s", ExplainPlannerResultV3(exhausted))
 	}

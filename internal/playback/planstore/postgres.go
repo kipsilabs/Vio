@@ -199,7 +199,7 @@ func (s *Postgres) getAttempt(ctx context.Context, predicate string, value any) 
 		       current_plan_id, current_replan_request_id, current_plan, frozen_recipe,
 		       normalized_request, start_response, request_digest, expires_at, server_bitrate_cap_kbps,
 		       last_sequence, last_sample, stopped_at, COALESCE(stop_receipt->>'stop_id', ''), updated_at, recovery_state, recovery_revision,
-		       audio_selection, audio_reconcile_ledger
+		       audio_selection, audio_reconcile_ledger, stream_reissues, rendered_plan_keys
 		FROM playback_v3_attempts
 		WHERE `+predicate+` AND expires_at > NOW()`, value).Scan(
 		&record.PlaybackAttemptID, &record.SessionID, &record.UserID, &record.ProfileID,
@@ -208,7 +208,7 @@ func (s *Postgres) getAttempt(ctx context.Context, predicate string, value any) 
 		&requestJSON, &responseJSON, &record.RequestDigest, &record.ExpiresAt, &record.ServerBitrateCapKbps,
 		&record.LastSequence, &sampleJSON, &record.StoppedAt, &record.StopID, &record.LastSampleAt,
 		&recoveryJSON, &record.RecoveryRevision,
-		&selectionJSON, &ledgerJSON,
+		&selectionJSON, &ledgerJSON, &record.StreamReissues, &record.RenderedPlanKeys,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, playback.ErrSessionNotFound
@@ -536,9 +536,10 @@ func (s *Postgres) CompleteReplan(ctx context.Context, sessionID, requestID, lea
 		UPDATE playback_v3_attempts SET
 			effective_media_file_id = $2, current_plan_id = $3,
 			current_replan_request_id = $4, current_plan = $5, frozen_recipe = $6,
-			normalized_request = $7, start_response = $8, expires_at = $9, updated_at = NOW()
+			normalized_request = $7, start_response = $8, expires_at = $9,
+			stream_reissues = $11, updated_at = NOW()
 		WHERE session_id = $1::uuid AND current_replan_request_id = $10 AND stopped_at IS NULL`,
-		sessionID, record.EffectiveMediaFileID, record.CurrentPlanID, record.CurrentReplanRequestID, planJSON, recipeJSON, requestJSON, startResponseJSON, record.ExpiresAt, baseReplanRequestID)
+		sessionID, record.EffectiveMediaFileID, record.CurrentPlanID, record.CurrentReplanRequestID, planJSON, recipeJSON, requestJSON, startResponseJSON, record.ExpiresAt, baseReplanRequestID, record.StreamReissues)
 	if err != nil {
 		return err
 	}
@@ -599,6 +600,13 @@ func (s *Postgres) RecordRouteEvent(ctx context.Context, record playback.RouteEv
 		record.ClientBuild, record.ClientChannel, record.ClientModel, record.EventID)
 	if err != nil {
 		return false, err
+	}
+	if record.Event == playback.RouteEventFirstFrameV3 && record.PlanAttemptKey != "" {
+		_, _ = s.db.Exec(ctx, `
+			UPDATE playback_v3_attempts
+			SET rendered_plan_keys = array_append(rendered_plan_keys, $2)
+			WHERE playback_attempt_id = $1 AND NOT ($2 = ANY(rendered_plan_keys))`,
+			record.PlaybackAttemptID, record.PlanAttemptKey)
 	}
 	return tag.RowsAffected() == 1, nil
 }

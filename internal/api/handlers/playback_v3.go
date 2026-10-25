@@ -8792,23 +8792,28 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		}
 	}
 	start.ClientFeatures = withoutFailedSubtitleRoutesV3(start.ClientFeatures, record.NormalizedRequest.ClientFeatures, req.Failure.Classification)
-	// A failure recovery after durable progress is a lost connection, not a
-	// failed recipe: the transport already delivered frames, so the same
-	// delivery and recipe may be reissued once instead of retiring the route.
+	currentKey := playback.PlanAttemptKeyV3(record.CurrentPlan, record.NormalizedRequest.ClientPlaybackContext.Output.OutputContextID, req.LocalMutations)
+	unmutatedKey := playback.PlanAttemptKeyV3(record.CurrentPlan, record.NormalizedRequest.ClientPlaybackContext.Output.OutputContextID, nil)
+	// A failure recovery after the current transport showed frames and suffered
+	// a network connectivity loss (e.g. transport_stall) is a lost connection,
+	// not a failed recipe: the transport already delivered frames, so the same
+	// delivery and recipe may be reissued once instead of retiring the route (§6.2).
 	// Pre-first-frame failures keep the ordinary ladder because the route itself
-	// never proved it could reach this client. Failures that demote the whole
-	// delivery, a dead node, a proxy-origin retry, a decode rotation, and user
-	// intent all keep their existing recovery. The bound is the recovery chain's
-	// attempt_count: the reissued route fails on the next attempt, which retires
-	// it as today.
+	// never proved it could reach this client. Capability/engine rejections
+	// (such as browser_engine_unsupported_source), decode errors, and delivery
+	// demotions are not connectivity losses and must continue through route retirement.
+	currentTransportRendered := containsStringExactV3(record.RenderedPlanKeys, currentKey) || containsStringExactV3(record.RenderedPlanKeys, unmutatedKey)
 	progressReissue := operation == playback.ReplanOperationFailureRecoveryV3 &&
 		!intentChange &&
 		!proxyOriginRecovery &&
 		!nodeRecovery &&
 		!virtualDecodeRotation &&
-		!failureRecoveryAbandonedDeliveryV3(operation, req.Failure.Classification) &&
-		record.LastSequence > 0 &&
-		req.AttemptCount <= 1
+		connectivityFailureClassificationV3(req.Failure.Classification) &&
+		currentTransportRendered &&
+		record.StreamReissues < 1
+	if progressReissue {
+		record.StreamReissues++
+	}
 	requestedFallbackID := record.EffectiveMediaFileID
 	effectiveFallbackID := record.RequestedMediaFileID
 	if seekScopedRecovery {
@@ -9234,14 +9239,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 					// still describe the same bytes, exactly as the
 					// user-intent carry does. Without it the planner terminals
 					// source_metadata_incomplete on a route that just played.
-					carryProvenance := pinnedRowProvenance
-					if !carryProvenance && resolved.File != nil {
-						// The reloaded anchor row can be a stale or placeholder
-						// row while the resolver served the plan's own row. Judge
-						// provenance against the row actually being adopted; the
-						// candidate and installation checks below still fence it.
-						carryProvenance = sessionProvenanceMatchesPinnedRowV3(r.Context(), session, resolved.File, h.fileResolver)
-					}
+					carryProvenance := sessionProvenanceMatchesPinnedRowV3(r.Context(), session, resolved.File, h.fileResolver)
 					if sameCandidateFailureDescriptorCarryV3(operation, session, record, carryProvenance, resolved, virtualDecodeRotation) {
 						resolvedFile = *carryValidatedVirtualVideoEvidenceV3(&resolvedFile, record.CurrentPlan.Source)
 					}
@@ -9549,8 +9547,8 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			}
 		}
 		attemptedKeys = []string(nil)
-		currentKey := playback.PlanAttemptKeyV3(record.CurrentPlan, record.NormalizedRequest.ClientPlaybackContext.Output.OutputContextID, req.LocalMutations)
-		unmutatedKey := playback.PlanAttemptKeyV3(record.CurrentPlan, record.NormalizedRequest.ClientPlaybackContext.Output.OutputContextID, nil)
+		currentKey = playback.PlanAttemptKeyV3(record.CurrentPlan, record.NormalizedRequest.ClientPlaybackContext.Output.OutputContextID, req.LocalMutations)
+		unmutatedKey = playback.PlanAttemptKeyV3(record.CurrentPlan, record.NormalizedRequest.ClientPlaybackContext.Output.OutputContextID, nil)
 		if !intentChange && !seekReanchor && !userIntentOperation {
 			failedKey := strings.TrimSpace(req.PlanAttemptKey)
 			for _, key := range req.AttemptedPlanKeys {
@@ -12760,6 +12758,21 @@ var transportFailureClassificationsV3 = map[string]bool{
 // classification so the transport-failure lookup is spelling-insensitive.
 func failureClassificationKeyV3(classification string) string {
 	return strings.ToLower(strings.TrimSpace(classification))
+}
+
+// connectivityFailureClassificationsV3 are client classifications that mean
+// the network did not deliver bytes, so they do not indict the recipe. The
+// protocol requires the client to reconnect rather than report these through
+// failure_recovery (§6.2), but a client that reports one anyway must not spend
+// the route ladder on a transient loss.
+var connectivityFailureClassificationsV3 = map[string]bool{
+	"transport_stall": true,
+	"network_error":   true,
+	"network_failure": true,
+}
+
+func connectivityFailureClassificationV3(classification string) bool {
+	return connectivityFailureClassificationsV3[failureClassificationKeyV3(classification)]
 }
 
 // failureRecoveryAbandonedDeliveryV3 reports whether this replan is a failure

@@ -83,6 +83,23 @@ func progressReissueRequestV3(started playback.DecisionResponseV3, startRequest 
 	}
 }
 
+func applyReplanFirstFrameV3(t *testing.T, handler *PlaybackHandler, sessionID, attemptID, planID, planAttemptKey string) {
+	t.Helper()
+	_, err := handler.PlanStoreV3.RecordRouteEvent(context.Background(), playback.RouteEventRecordV3{
+		RouteEventV3: playback.RouteEventV3{
+			ProtocolVersion:   playback.ProtocolV3,
+			PlaybackAttemptID: attemptID,
+			SessionID:         sessionID,
+			PlanID:            planID,
+			PlanAttemptKey:    planAttemptKey,
+			Event:             playback.RouteEventFirstFrameV3,
+		},
+	})
+	if err != nil {
+		t.Fatalf("record first frame event: %v", err)
+	}
+}
+
 // A recovery after frames reissues the recipe that was playing, with a fresh
 // plan identity so the client does not mistake it for a cached failed plan. The
 // next failure of that reissue retires the route as before.
@@ -90,6 +107,7 @@ func TestHandleReplanPlaybackV3ReissuesRecipeAfterProgress(t *testing.T) {
 	handler := newProgressReissueHandlerV3(t)
 	started, startRequest := progressReissueStartV3(t, handler)
 	applyReplanProgressV3(t, handler, started.SessionID)
+	applyReplanFirstFrameV3(t, handler, started.SessionID, startRequest.PlaybackAttemptID, started.PlaybackPlan.PlanID, started.PlaybackPlan.PlanAttemptKey)
 
 	first := postPlaybackReplanV3(t, handler, started.SessionID, progressReissueRequestV3(started, startRequest, "replan-progress-reissue-0001", 1, []string{started.PlaybackPlan.PlanAttemptKey}))
 	if first.Terminal != nil || first.PlaybackPlan == nil {
@@ -114,6 +132,137 @@ func TestHandleReplanPlaybackV3ReissuesRecipeAfterProgress(t *testing.T) {
 	}))
 	if second.Terminal == nil || second.Terminal.Reason != playback.TerminalRoutesExhaustedV3 || !second.Terminal.Retryable {
 		t.Fatalf("second recovery = %#v terminal = %#v, want retryable routes_exhausted", second, second.Terminal)
+	}
+}
+
+// Plan A renders and records progress. A track change installs Plan B.
+// Plan B fails before its first frame: it must not be reissued using Plan A's progress.
+func TestHandleReplanPlaybackV3SuccessorTransportFailsBeforeFirstFrameNotReissued(t *testing.T) {
+	file := v3HandlerFixtureFile(t)
+	file.AudioTracks = append(file.AudioTracks, models.AudioTrack{Codec: "aac", Channels: 2, Layout: "stereo", Language: "fra"})
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), testPlaybackFileResolver{file: file})
+	stubCopySeekAnchorV3(handler)
+	handler.PlaybackConfig = playbackTestConfigNoTranscode(t.TempDir())
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"transcode_enabled": "false", "allow_4k_transcode": "false"}}
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+
+	startRequest := v3HandlerStartRequest()
+	startRequest.QualityPreference = "original"
+	orig := startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassOriginalHTTPV3]
+	orig.ValidatedClaims = []string{playback.ClaimClientSelectedAudioTrackV3}
+	startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassOriginalHTTPV3] = orig
+	startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassHLSV3] = playback.DeliveryCapabilityV3{
+		Enabled: true, SupportedOnDevice: true, Containers: []string{"hls"},
+		VideoCodecs: []string{"hevc"}, AudioDecodeCodecs: []string{"aac"},
+	}
+	started := startV3PlaybackForHandlerTest(t, handler, startRequest)
+	if started.PlaybackPlan == nil {
+		t.Fatalf("start plan = %#v", started)
+	}
+
+	applyReplanProgressV3(t, handler, started.SessionID)
+	applyReplanFirstFrameV3(t, handler, started.SessionID, startRequest.PlaybackAttemptID, started.PlaybackPlan.PlanID, started.PlaybackPlan.PlanAttemptKey)
+
+	// User track change to audio track 1 installs Plan B.
+	audioIdx1 := 1
+	trackChangeReq := playback.ReplanRequestV3{
+		ProtocolVersion:       playback.ProtocolV3,
+		Operation:             playback.ReplanOperationTrackChangeV3,
+		PlaybackAttemptID:     startRequest.PlaybackAttemptID,
+		ReplanRequestID:       "replan-track-change-001",
+		FailedPlanID:          started.PlaybackPlan.PlanID,
+		PlanAttemptID:         "plan-attempt-tc-001",
+		PlanAttemptKey:        started.PlaybackPlan.PlanAttemptKey,
+		AttemptCount:          1,
+		PositionSeconds:       10,
+		SelectedTracks:        playback.SelectedTracksV3{Audio: &playback.TrackIdentityV3{ID: "file:42:audio:1", Index: &audioIdx1}},
+		Capabilities:          startRequest.Capabilities,
+		ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	}
+	trackResp := postPlaybackReplanV3(t, handler, started.SessionID, trackChangeReq)
+	if trackResp.Outcome != playback.OutcomePlayableV3 || trackResp.PlaybackPlan == nil {
+		t.Fatalf("track change failed: %#v", trackResp)
+	}
+
+	planBKey := trackResp.PlaybackPlan.PlanAttemptKey
+	if planBKey == started.PlaybackPlan.PlanAttemptKey {
+		t.Fatalf("planBKey %q must differ from planAKey %q", planBKey, started.PlaybackPlan.PlanAttemptKey)
+	}
+
+	// Plan B fails before rendering a first frame.
+	replanReq := playback.ReplanRequestV3{
+		ProtocolVersion:       playback.ProtocolV3,
+		Operation:             playback.ReplanOperationFailureRecoveryV3,
+		PlaybackAttemptID:     startRequest.PlaybackAttemptID,
+		ReplanRequestID:       "replan-b-failed-pre-frame",
+		FailedPlanID:          trackResp.PlaybackPlan.PlanID,
+		PlanAttemptID:         "plan-attempt-b-fail",
+		PlanAttemptKey:        planBKey,
+		AttemptedPlanKeys:     []string{started.PlaybackPlan.PlanAttemptKey, planBKey},
+		AttemptCount:          1,
+		PositionSeconds:       10,
+		Failure:               playback.FailureV3{Classification: "transport_stall"},
+		SelectedTracks:        trackResp.PlaybackPlan.SelectedTracks,
+		Capabilities:          startRequest.Capabilities,
+		ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	}
+
+	resp := postPlaybackReplanV3(t, handler, started.SessionID, replanReq)
+	if resp.Terminal == nil || resp.Terminal.Reason != playback.TerminalRoutesExhaustedV3 || !resp.Terminal.Retryable {
+		t.Fatalf("Plan B failed before first frame, want routes_exhausted terminal, got: %#v", resp)
+	}
+}
+
+// Capability or execution failures (e.g. browser_engine_unsupported_source) must not
+// be reissued as transient connectivity losses even after earlier progress.
+func TestHandleReplanPlaybackV3UnsupportedSourceNotTreatedAsConnectivity(t *testing.T) {
+	handler := newProgressReissueHandlerV3(t)
+	started, startRequest := progressReissueStartV3(t, handler)
+	applyReplanProgressV3(t, handler, started.SessionID)
+	applyReplanFirstFrameV3(t, handler, started.SessionID, startRequest.PlaybackAttemptID, started.PlaybackPlan.PlanID, started.PlaybackPlan.PlanAttemptKey)
+
+	req := progressReissueRequestV3(started, startRequest, "replan-unsupported-source", 1, []string{started.PlaybackPlan.PlanAttemptKey})
+	req.Failure = playback.FailureV3{Classification: "browser_engine_unsupported_source"}
+
+	resp := postPlaybackReplanV3(t, handler, started.SessionID, req)
+	if resp.Terminal == nil || resp.Terminal.Reason != playback.TerminalRoutesExhaustedV3 || !resp.Terminal.Retryable {
+		t.Fatalf("unsupported source must not be reissued, got: %#v", resp)
+	}
+}
+
+// A client sending repeated count-1 requests cannot bypass the server-side reissue bound.
+func TestHandleReplanPlaybackV3RepeatedAttemptCountOneRefused(t *testing.T) {
+	handler := newProgressReissueHandlerV3(t)
+	started, startRequest := progressReissueStartV3(t, handler)
+	applyReplanProgressV3(t, handler, started.SessionID)
+	applyReplanFirstFrameV3(t, handler, started.SessionID, startRequest.PlaybackAttemptID, started.PlaybackPlan.PlanID, started.PlaybackPlan.PlanAttemptKey)
+
+	// First recovery reissues.
+	resp1 := postPlaybackReplanV3(t, handler, started.SessionID, progressReissueRequestV3(started, startRequest, "replan-reissue-001", 1, []string{started.PlaybackPlan.PlanAttemptKey}))
+	if resp1.Outcome != playback.OutcomePlayableV3 || resp1.PlaybackPlan == nil {
+		t.Fatalf("first recovery expected playable, got: %#v", resp1)
+	}
+
+	// Second recovery sending a new replan request ID with forged AttemptCount = 1 is refused by server state.
+	req2 := playback.ReplanRequestV3{
+		ProtocolVersion:       playback.ProtocolV3,
+		Operation:             playback.ReplanOperationFailureRecoveryV3,
+		PlaybackAttemptID:     startRequest.PlaybackAttemptID,
+		ReplanRequestID:       "replan-reissue-002-forged-count-1",
+		FailedPlanID:          resp1.PlaybackPlan.PlanID,
+		PlanAttemptID:         "plan-attempt-forged-count-1",
+		PlanAttemptKey:        resp1.PlaybackPlan.PlanAttemptKey,
+		AttemptedPlanKeys:     []string{started.PlaybackPlan.PlanAttemptKey, resp1.PlaybackPlan.PlanAttemptKey},
+		AttemptCount:          1,
+		PositionSeconds:       42,
+		Failure:               playback.FailureV3{Classification: "transport_stall"},
+		SelectedTracks:        resp1.PlaybackPlan.SelectedTracks,
+		Capabilities:          startRequest.Capabilities,
+		ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	}
+	resp2 := postPlaybackReplanV3(t, handler, started.SessionID, req2)
+	if resp2.Terminal == nil || resp2.Terminal.Reason != playback.TerminalRoutesExhaustedV3 || !resp2.Terminal.Retryable {
+		t.Fatalf("repeated count-1 recovery must be refused by server state, got: %#v", resp2)
 	}
 }
 
