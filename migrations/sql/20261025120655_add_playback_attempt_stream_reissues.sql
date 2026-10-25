@@ -1,9 +1,9 @@
 -- +goose Up
 ALTER TABLE playback_v3_attempts
     ADD COLUMN stream_reissues INTEGER NOT NULL DEFAULT 0,
-    ADD COLUMN rendered_plan_keys TEXT[] NOT NULL DEFAULT '{}';
+    ADD COLUMN current_transport_rendered BOOLEAN NOT NULL DEFAULT false;
 
 -- +goose Down
 ALTER TABLE playback_v3_attempts
     DROP COLUMN stream_reissues,
-    DROP COLUMN rendered_plan_keys;
+    DROP COLUMN current_transport_rendered;

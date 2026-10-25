@@ -213,6 +213,105 @@ func TestHandleReplanPlaybackV3SuccessorTransportFailsBeforeFirstFrameNotReissue
 	}
 }
 
+// Recipe A renders. The viewer changes tracks to Recipe B, which renders.
+// The viewer returns to Recipe A, opening a new transport.
+// If that new A fails before its first frame, it must not qualify for reissue using the earlier A transport.
+func TestHandleReplanPlaybackV3ReopenedRecipeFailsBeforeFirstFrameNotReissued(t *testing.T) {
+	file := v3HandlerFixtureFile(t)
+	file.AudioTracks = append(file.AudioTracks, models.AudioTrack{Codec: "aac", Channels: 2, Layout: "stereo", Language: "fra"})
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), testPlaybackFileResolver{file: file})
+	stubCopySeekAnchorV3(handler)
+	handler.PlaybackConfig = playbackTestConfigNoTranscode(t.TempDir())
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"transcode_enabled": "false", "allow_4k_transcode": "false"}}
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+
+	startRequest := v3HandlerStartRequest()
+	startRequest.QualityPreference = "original"
+	orig := startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassOriginalHTTPV3]
+	orig.ValidatedClaims = []string{playback.ClaimClientSelectedAudioTrackV3}
+	startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassOriginalHTTPV3] = orig
+	startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassHLSV3] = playback.DeliveryCapabilityV3{
+		Enabled: true, SupportedOnDevice: true, Containers: []string{"hls"},
+		VideoCodecs: []string{"hevc"}, AudioDecodeCodecs: []string{"aac"},
+	}
+	started := startV3PlaybackForHandlerTest(t, handler, startRequest)
+	if started.PlaybackPlan == nil {
+		t.Fatalf("start plan = %#v", started)
+	}
+
+	// 1. Recipe A starts and renders first frame.
+	applyReplanProgressV3(t, handler, started.SessionID)
+	applyReplanFirstFrameV3(t, handler, started.SessionID, startRequest.PlaybackAttemptID, started.PlaybackPlan.PlanID, started.PlaybackPlan.PlanAttemptKey)
+
+	// 2. Track change to audio track 1 installs Recipe B.
+	audioIdx1 := 1
+	trackChangeReq1 := playback.ReplanRequestV3{
+		ProtocolVersion:       playback.ProtocolV3,
+		Operation:             playback.ReplanOperationTrackChangeV3,
+		PlaybackAttemptID:     startRequest.PlaybackAttemptID,
+		ReplanRequestID:       "replan-tc-to-b",
+		FailedPlanID:          started.PlaybackPlan.PlanID,
+		PlanAttemptID:         "plan-attempt-tc-b",
+		PlanAttemptKey:        started.PlaybackPlan.PlanAttemptKey,
+		AttemptCount:          1,
+		PositionSeconds:       10,
+		SelectedTracks:        playback.SelectedTracksV3{Audio: &playback.TrackIdentityV3{ID: "file:42:audio:1", Index: &audioIdx1}},
+		Capabilities:          startRequest.Capabilities,
+		ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	}
+	respB := postPlaybackReplanV3(t, handler, started.SessionID, trackChangeReq1)
+	if respB.Outcome != playback.OutcomePlayableV3 || respB.PlaybackPlan == nil {
+		t.Fatalf("track change to B failed: %#v", respB)
+	}
+	// Recipe B renders first frame.
+	applyReplanFirstFrameV3(t, handler, started.SessionID, startRequest.PlaybackAttemptID, respB.PlaybackPlan.PlanID, respB.PlaybackPlan.PlanAttemptKey)
+
+	// 3. User returns to Recipe A (audio track 0). Reopening Recipe A installs a new transport generation.
+	audioIdx0 := 0
+	trackChangeReq2 := playback.ReplanRequestV3{
+		ProtocolVersion:       playback.ProtocolV3,
+		Operation:             playback.ReplanOperationTrackChangeV3,
+		PlaybackAttemptID:     startRequest.PlaybackAttemptID,
+		ReplanRequestID:       "replan-tc-return-to-a",
+		FailedPlanID:          respB.PlaybackPlan.PlanID,
+		PlanAttemptID:         "plan-attempt-tc-return-a",
+		PlanAttemptKey:        respB.PlaybackPlan.PlanAttemptKey,
+		AttemptCount:          1,
+		PositionSeconds:       15,
+		SelectedTracks:        playback.SelectedTracksV3{Audio: &playback.TrackIdentityV3{ID: "file:42:audio:0", Index: &audioIdx0}},
+		Capabilities:          startRequest.Capabilities,
+		ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	}
+	respA2 := postPlaybackReplanV3(t, handler, started.SessionID, trackChangeReq2)
+	if respA2.Outcome != playback.OutcomePlayableV3 || respA2.PlaybackPlan == nil {
+		t.Fatalf("return to Recipe A failed: %#v", respA2)
+	}
+
+	// 4. That new A transport fails before its first frame.
+	failA2Req := playback.ReplanRequestV3{
+		ProtocolVersion:       playback.ProtocolV3,
+		Operation:             playback.ReplanOperationFailureRecoveryV3,
+		PlaybackAttemptID:     startRequest.PlaybackAttemptID,
+		ReplanRequestID:       "replan-a2-fail-pre-frame",
+		FailedPlanID:          respA2.PlaybackPlan.PlanID,
+		PlanAttemptID:         "plan-attempt-a2-fail",
+		PlanAttemptKey:        respA2.PlaybackPlan.PlanAttemptKey,
+		AttemptedPlanKeys:     []string{respB.PlaybackPlan.PlanAttemptKey, respA2.PlaybackPlan.PlanAttemptKey},
+		AttemptCount:          1,
+		PositionSeconds:       15,
+		Failure:               playback.FailureV3{Classification: "transport_stall"},
+		SelectedTracks:        respA2.PlaybackPlan.SelectedTracks,
+		Capabilities:          startRequest.Capabilities,
+		ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	}
+
+	resp := postPlaybackReplanV3(t, handler, started.SessionID, failA2Req)
+	// Must NOT reissue because the new Recipe A transport never rendered a frame.
+	if resp.Terminal == nil || resp.Terminal.Reason != playback.TerminalRoutesExhaustedV3 || !resp.Terminal.Retryable {
+		t.Fatalf("reopened Recipe A transport failed pre-first-frame, want routes_exhausted terminal, got: %#v", resp)
+	}
+}
+
 // Capability or execution failures (e.g. browser_engine_unsupported_source) must not
 // be reissued as transient connectivity losses even after earlier progress.
 func TestHandleReplanPlaybackV3UnsupportedSourceNotTreatedAsConnectivity(t *testing.T) {

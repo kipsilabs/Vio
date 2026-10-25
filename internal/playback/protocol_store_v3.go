@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
-	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -208,9 +207,9 @@ type AttemptRecordV3 struct {
 	// StreamReissues records how many times this attempt reissued a recipe
 	// after mid-stream connectivity loss.
 	StreamReissues int `json:"stream_reissues,omitempty"`
-	// RenderedPlanKeys stores the plan attempt keys that have delivered a
-	// verified first_frame route event for this playback attempt.
-	RenderedPlanKeys []string `json:"rendered_plan_keys,omitempty"`
+	// CurrentTransportRendered records whether the active transport generation
+	// has delivered a verified first_frame route event.
+	CurrentTransportRendered bool `json:"current_transport_rendered,omitempty"`
 }
 
 // RecoveryStateV3 is the durable, attempt-scoped recovery memory. The
@@ -665,7 +664,7 @@ func (s *MemoryPlanStoreV3) SaveAttempt(_ context.Context, record AttemptRecordV
 		return ErrPlaybackAttemptExistsV3
 	}
 	record.LastSequence, record.LastSample, record.StoppedAt, record.StopID, record.StreamReissues = 0, nil, nil, "", 0
-	record.RenderedPlanKeys = nil
+	record.CurrentTransportRendered = false
 	s.attempts[record.PlaybackAttemptID] = record
 	return nil
 }
@@ -804,7 +803,7 @@ func (s *MemoryPlanStoreV3) CompleteReplan(_ context.Context, sessionID, request
 	// same way.
 	record.RecoveryState, record.RecoveryRevision = existing.RecoveryState, existing.RecoveryRevision
 	record.LastSequence, record.LastSample, record.StoppedAt, record.StopID = existing.LastSequence, existing.LastSample, existing.StoppedAt, existing.StopID
-	record.RenderedPlanKeys = existing.RenderedPlanKeys
+	record.CurrentTransportRendered = false
 	s.attempts[attemptID] = record
 	return nil
 }
@@ -836,10 +835,10 @@ func (s *MemoryPlanStoreV3) RecordRouteEvent(_ context.Context, record RouteEven
 		}
 	}
 	s.events = append(s.events, record)
-	if record.Event == RouteEventFirstFrameV3 && record.PlanAttemptKey != "" {
+	if record.Event == RouteEventFirstFrameV3 && record.PlanID != "" {
 		if att, ok := s.attempts[record.PlaybackAttemptID]; ok {
-			if !slices.Contains(att.RenderedPlanKeys, record.PlanAttemptKey) {
-				att.RenderedPlanKeys = append(att.RenderedPlanKeys, record.PlanAttemptKey)
+			if att.CurrentPlanID == record.PlanID {
+				att.CurrentTransportRendered = true
 				s.attempts[record.PlaybackAttemptID] = att
 			}
 		}

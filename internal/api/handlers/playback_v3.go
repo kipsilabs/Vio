@@ -8802,7 +8802,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	// never proved it could reach this client. Capability/engine rejections
 	// (such as browser_engine_unsupported_source), decode errors, and delivery
 	// demotions are not connectivity losses and must continue through route retirement.
-	currentTransportRendered := containsStringExactV3(record.RenderedPlanKeys, currentKey) || containsStringExactV3(record.RenderedPlanKeys, unmutatedKey)
+	currentTransportRendered := record.CurrentTransportRendered
 	progressReissue := operation == playback.ReplanOperationFailureRecoveryV3 &&
 		!intentChange &&
 		!proxyOriginRecovery &&
@@ -9245,12 +9245,6 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 					}
 					currentEffectiveFile = &resolvedFile
 					replanVirtualProvenance = resolved.Provenance
-					// A failure recovery re-resolves the virtual candidate, and the resolver can
-					// return a row whose inventory lacks fields the running plan already proved.
-					// Carry only when the resolved candidate is the plan's own candidate,
-					// matching the plan, the session anchor, the owner installation, and
-					// retained session provenance.
-					currentEffectiveFile = h.carryFailureRecoveryVirtualEvidenceV3(r.Context(), session, record, operation, resolved.URI, resolved.OwnerID, currentEffectiveFile)
 				}
 			}
 		}
@@ -12085,50 +12079,6 @@ func (h *PlaybackHandler) frozenSeekCarrierV3(ctx context.Context, session *play
 		carrier.ProbeUpdatedAt = nil
 	}
 	return carryValidatedVirtualVideoEvidenceV3(&carrier, record.CurrentPlan.Source), nil
-}
-
-// carryFailureRecoveryVirtualEvidenceV3 tops up a rehydrated virtual candidate's
-// inventory with descriptor fields the running plan already proved, when
-// rehydration resolved the plan's own candidate under matching owner installation
-// and session provenance.
-func (h *PlaybackHandler) carryFailureRecoveryVirtualEvidenceV3(
-	ctx context.Context,
-	session *playback.Session,
-	record *playback.AttemptRecordV3,
-	operation playback.ReplanOperationV3,
-	resolvedURI string,
-	resolvedOwnerID int,
-	file *models.MediaFile,
-) *models.MediaFile {
-	if record == nil || file == nil || session == nil {
-		return file
-	}
-	if !failureRecoveryOperationV3(operation) {
-		return file
-	}
-	planURI := strings.TrimSpace(record.CurrentPlan.EffectiveVirtualURI)
-	resolvedURI = strings.TrimSpace(resolvedURI)
-	sessionURI := strings.TrimSpace(session.VirtualSourceURI)
-	if planURI == "" || resolvedURI == "" || sessionURI == "" {
-		return file
-	}
-	// Installation ownership must agree with the session.
-	if resolvedOwnerID <= 0 || session.VirtualSourceOwnerInstallationID <= 0 || resolvedOwnerID != session.VirtualSourceOwnerInstallationID {
-		return file
-	}
-	// Candidate must match between the running plan, the resolved URI, and the session pin.
-	if !sameVirtualCandidate(planURI, resolvedURI) || !sameVirtualCandidate(planURI, sessionURI) {
-		return file
-	}
-	// Retained session provenance must match the row being adopted.
-	var resolver FilePathResolver
-	if h != nil {
-		resolver = h.fileResolver
-	}
-	if !sessionProvenanceMatchesPinnedRowV3(ctx, session, file, resolver) {
-		return file
-	}
-	return carryValidatedVirtualVideoEvidenceV3(file, record.CurrentPlan.Source)
 }
 
 // carryValidatedVirtualVideoEvidenceV3 tops up a carried pinned candidate's
