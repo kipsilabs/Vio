@@ -2324,6 +2324,22 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		req.AudioTrackID = ""
 		req.AudioTrackIndex = nil
 	}
+	// A session restart (the client tears down and starts a new playback
+	// attempt, e.g. after a recovery replan) historically dropped the viewer's
+	// explicit audio choice and subtitle selection because the new request
+	// carried neither: the plan fell back to the profile default and, when the
+	// carried subtitle ordinal did not exist on the new candidate, silently
+	// planned subtitles off. Carry both from the live session for the same
+	// profile and file when the request names neither. An out-of-range carry is
+	// reported as a degradation warning instead of disappearing.
+	audioCarried, carrySubtitleUnavailable, audioUnavailable := h.carrySelectionsFromActiveSessionV3(
+		r.Context(), userID, profileID, requestedFile, &req)
+	if audioCarried {
+		virtualDecision.startAudioSelectionOrigin = SelectionOriginExplicit
+	}
+	if audioUnavailable {
+		warnings = append(warnings, playback.AudioTrackUnavailableWarningV3())
+	}
 	timings.mark("file_load_probe")
 	audioIndex, audioDegraded, err := resolveV3AudioIndex(requestedFile, req.AudioTrackID, req.AudioTrackIndex)
 	if err != nil {
@@ -2742,6 +2758,13 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	}
 	result = escalated
 	timings.mark("remux_escalation")
+	// If a carried subtitle selection could not be mapped onto the new
+	// candidate and the plan plays without subtitles, say so: the viewer asked
+	// for a track and the server could not honor it, which must not look like a
+	// deliberate "off".
+	if carrySubtitleUnavailable && result.Plan != nil && result.Plan.SelectedTracks.Subtitle == nil {
+		warnings = append(warnings, playback.SubtitleTrackUnavailableWarningV3())
+	}
 	appendStartWarningsV3(&result, warnings)
 	if resolutionWasAssumed && result.Terminal == nil {
 		result.Plan.DegradationWarnings = append(result.Plan.DegradationWarnings, playback.DegradationWarningV3{
@@ -5870,6 +5893,108 @@ func (h *PlaybackHandler) preferredAudioTrackIndexV3(ctx context.Context, userID
 		seriesPref.AudioLanguage = preferredLang
 	}
 	return normalizeAudioTrackIndex(file, playback.SelectAudioTrack(file.AudioTracks, preferredLang, seriesPref)), preferredLang, nil
+}
+
+// carrySelectionsFromActiveSessionV3 copies an explicit audio selection and an
+// embedded subtitle selection from the profile's live session for the same
+// file onto a start request that names neither. A playback restart creates a
+// new attempt and a new session, and the client does not replay the track
+// choices it made through earlier track_change replans, so without this the new
+// plan silently falls back to the profile default (the production "spontaneous
+// audio switch") and drops the subtitle. Only an explicit audio choice is
+// carried; a server-resolved auto pick is re-resolved by the new start.
+//
+// Subtitle ordinals are transport ordinals of the previous effective source, so
+// the track is matched onto the new file's inventory by language, codec and
+// forced flag rather than copied by number. When it cannot be matched,
+// subtitleUnavailable reports the loss so the caller can warn instead of
+// silently planning subtitles off.
+func (h *PlaybackHandler) carrySelectionsFromActiveSessionV3(
+	ctx context.Context,
+	userID int,
+	profileID string,
+	file *models.MediaFile,
+	req *playback.StartRequestV3,
+) (audioCarried, subtitleUnavailable, audioUnavailable bool) {
+	if h == nil || h.sessionMgr == nil || file == nil || req == nil {
+		return false, false, false
+	}
+	lister, ok := h.sessionMgr.(interface {
+		GetUserSessions(userID int) []*playback.Session
+	})
+	if !ok {
+		return false, false, false
+	}
+	var previous *playback.Session
+	for _, session := range lister.GetUserSessions(userID) {
+		if session == nil || session.ProfileID != profileID {
+			continue
+		}
+		if session.MediaFileID != file.ID && session.RequestedMediaFileID != file.ID {
+			continue
+		}
+		if previous == nil || session.LastActivityAt.After(previous.LastActivityAt) {
+			previous = session
+		}
+	}
+	if previous == nil {
+		return false, false, false
+	}
+
+	if req.AudioTrackIndex == nil && req.AudioTrackID == "" && req.CarriedAudioTrackID == "" &&
+		previous.SelectionOrigin == SelectionOriginExplicit {
+		switch {
+		case previous.AudioTrackIndex >= 0 && previous.AudioTrackIndex < len(file.AudioTracks):
+			index := previous.AudioTrackIndex
+			req.AudioTrackIndex = &index
+			audioCarried = true
+		case previous.AudioTrackIndex >= 0:
+			// The viewer's explicit track does not exist on the release this
+			// start binds to. The plan must play something, but it must not
+			// pretend the choice was honored.
+			audioUnavailable = true
+		}
+	}
+
+	if req.SubtitleTrackIndex == nil && req.SubtitleTrackID == "" && previous.SubtitleTrackIndex >= 0 {
+		if index, matched := h.carriedSubtitleIndexV3(ctx, previous, file); matched {
+			req.SubtitleTrackIndex = &index
+		} else {
+			subtitleUnavailable = true
+		}
+	}
+	return audioCarried, subtitleUnavailable, audioUnavailable
+}
+
+// carriedSubtitleIndexV3 maps the previous session's embedded subtitle ordinal
+// onto file's published inventory by track identity (language, codec, forced
+// flag). The ordinal itself is source-space for the previous candidate and
+// cannot be reused across a candidate move.
+func (h *PlaybackHandler) carriedSubtitleIndexV3(ctx context.Context, previous *playback.Session, file *models.MediaFile) (int, bool) {
+	if previous == nil || file == nil || previous.SubtitleTrackIndex < 0 {
+		return 0, false
+	}
+	tracks := previous.VirtualSubtitleTracks
+	if len(tracks) == 0 && h.fileResolver != nil && previous.MediaFileID > 0 {
+		prior, err := h.fileResolver.GetByID(ctx, previous.MediaFileID)
+		if err == nil && prior != nil {
+			tracks = prior.SubtitleTracks
+		}
+	}
+	if previous.SubtitleTrackIndex >= len(tracks) {
+		return 0, false
+	}
+	want := tracks[previous.SubtitleTrackIndex]
+	for index, item := range playback.BuildSubtitleInventoryV3(file, nil) {
+		if item.Source != playback.SubtitleSourceEmbeddedV3 {
+			continue
+		}
+		if !strings.EqualFold(item.Language, want.Language) || !strings.EqualFold(item.Codec, want.Codec) || item.Forced != want.Forced {
+			continue
+		}
+		return index, true
+	}
+	return 0, false
 }
 
 // resumePositionV3 answers what an omitted `start_position` means: resume where
