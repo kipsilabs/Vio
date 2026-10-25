@@ -212,7 +212,7 @@ func TestReleaseLookupFailurePreventsCollectionAcceptance(t *testing.T) {
 			// and poisons the sync through the tracker.
 			tracker.err = ErrProviderUnavailable
 			service := &LibraryCollectionService{}
-			if err := service.acceptCollectionItems(ctx, nil, nil); !errors.Is(err, ErrProviderUnavailable) {
+			if _, _, err := service.acceptCollectionItems(ctx, nil, nil); !errors.Is(err, ErrProviderUnavailable) {
 				t.Fatalf("acceptance reached storage with incomplete evidence: %v", err)
 			}
 		})

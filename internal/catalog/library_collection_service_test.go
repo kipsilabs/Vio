@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/Silo-Server/silo-server/internal/collectionutil"
 	"github.com/Silo-Server/silo-server/internal/mdblist"
 	"github.com/Silo-Server/silo-server/internal/models"
@@ -832,11 +834,11 @@ func TestCollectionPreparationDoesNotRequireRepository(t *testing.T) {
 	service.VirtualVariants = func(context.Context, string, string) ([]VirtualPlaybackVariant, error) {
 		return nil, errors.New("profile preparation failed")
 	}
-	if _, err := service.createVirtualCollectionItem(ctx, collection, "series", "Failure", 2000, "tt7654321", 0, 0); err == nil {
-		t.Fatal("expected preparation failure")
+	if _, err := service.createVirtualCollectionItem(ctx, collection, "series", "Failure", 2000, "tt7654321", 0, 0); !errors.Is(err, ErrProviderUnavailable) {
+		t.Fatalf("expected member-scoped provider failure, got %v", err)
 	}
-	if err := service.acceptCollectionItems(ctx, collection, nil); err == nil || !strings.Contains(err.Error(), "profile preparation failed") {
-		t.Fatalf("acceptance did not fail before repository access: %v", err)
+	if tracker.err != nil {
+		t.Fatalf("one member's provider failure must not poison the collection run: %v", tracker.err)
 	}
 }
 
@@ -882,7 +884,7 @@ func TestAcceptPreparedItemsDisabledPlaybackClearsRetainedClaims(t *testing.T) {
 				return nil, errors.New("provider unavailable")
 			}
 			ctx = context.WithValue(ctx, collectionVirtualCreationTrackerKey{}, &collectionVirtualCreationTracker{})
-			if err := service.acceptCollectionItems(ctx, snapshot, []LibraryCollectionItemInput{{MediaItemID: "movie-accept-disabled", SourceRank: 7}}); err != nil {
+			if _, _, err := service.acceptCollectionItems(ctx, snapshot, []LibraryCollectionItemInput{{MediaItemID: "movie-accept-disabled", SourceRank: 7}}); err != nil {
 				t.Fatal(err)
 			}
 			var claims, fileClaims, members, files, owners int
@@ -955,6 +957,205 @@ func TestTMDBPresetSyncKeepsPhysicalMovieDuringProviderOutage(t *testing.T) {
 	}
 	if members != 1 {
 		t.Fatal("provider outage evicted a physical collection member")
+	}
+}
+
+// setupSkipUnresolvableSync seeds a three-entry TMDB preset collection whose
+// first member cannot resolve provider variants, and returns the service wired
+// with fakes plus the seeded collection row.
+func setupSkipUnresolvableSync(t *testing.T) (*pgxpool.Pool, context.Context, *LibraryCollectionService, *models.LibraryCollection) {
+	t.Helper()
+	pool := newVirtualMediaTestPool(t)
+	ctx := context.WithValue(context.Background(), collectionVirtualCreationTrackerKey{}, &collectionVirtualCreationTracker{})
+	ctx = context.WithValue(ctx, collectionVirtualVariantCacheKey{}, &collectionVirtualVariantCache{
+		entries: make(map[string][]VirtualPlaybackVariant, 2),
+	})
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO media_folders(id,name,type,enabled) VALUES(3301,'Skip Unresolvable','movies',true);
+		INSERT INTO library_collections(id,slug,title,collection_type,library_id,source_config)
+		VALUES('skip-unresolvable','skip-unresolvable','Skip Unresolvable','tmdb',3301,'{"mode":"tmdb_preset","preset":"popular","virtual_playback":true}');
+		INSERT INTO library_collection_libraries(collection_id,library_id) VALUES('skip-unresolvable',3301)`); err != nil {
+		t.Fatalf("seed collection: %v", err)
+	}
+
+	repo := NewLibraryCollectionRepository(pool)
+	service := NewLibraryCollectionService(repo, NewItemRepository(pool), NewLibraryItemRepository(pool), nil)
+	service.TMDBCollections = &fakeTMDBPresetFetcher{entries: []TMDBCollectionEntry{
+		{ID: 730001, MediaType: "movie", Title: "Unresolvable Member", ReleaseDate: "2010-05-15"},
+		{ID: 730002, MediaType: "movie", Title: "Second Member", ReleaseDate: "2011-05-15"},
+		{ID: 730003, MediaType: "movie", Title: "Third Member", ReleaseDate: "2012-05-15"},
+	}}
+	service.TMDBDigitalReleases = &fakeDigitalReleaseChecker{released: map[int]bool{730001: true, 730002: true, 730003: true}}
+	// The first member's provider cannot resolve variants. The run must not
+	// cache that failure, so the following members resolve normally.
+	service.VirtualVariants = func(_ context.Context, uri, _ string) ([]VirtualPlaybackVariant, error) {
+		if strings.Contains(uri, "730001") {
+			return nil, errors.New("provider connection refused")
+		}
+		return []VirtualPlaybackVariant{{OwnerInstallationID: 11, VirtualURI: uri}}, nil
+	}
+
+	collection, err := repo.GetByID(ctx, "skip-unresolvable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pool, ctx, service, collection
+}
+
+// collectCollectionMemberIDs returns the committed member media-item ids in
+// position order.
+func collectCollectionMemberIDs(t *testing.T, pool *pgxpool.Pool, ctx context.Context, collectionID string) []string {
+	t.Helper()
+	var members []string
+	rows, err := pool.Query(ctx, `SELECT media_item_id FROM library_collection_items WHERE collection_id=$1 ORDER BY position`, collectionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		members = append(members, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return members
+}
+
+// A member whose provider variants cannot be resolved is skipped with a run
+// warning; the other members still commit.
+func TestTMDBPresetSyncSkipsUnresolvableMember(t *testing.T) {
+	pool, ctx, service, collection := setupSkipUnresolvableSync(t)
+
+	run, err := service.syncTMDBPresetCollection(ctx, collection, libraryCollectionSourceConfig{
+		Preset: "popular", MediaType: "movie", VirtualPlayback: true,
+	}, SyncCollectionOptions{SkipCollage: true})
+	if err != nil {
+		t.Fatalf("one unresolvable member failed the collection sync: %v", err)
+	}
+	if run.Status != "warning" {
+		t.Fatalf("run status = %q, want warning", run.Status)
+	}
+	if run.ItemsMatched != 2 || run.ItemsUnmatched != 1 {
+		t.Fatalf("run matched=%d unmatched=%d, want 2/1", run.ItemsMatched, run.ItemsUnmatched)
+	}
+	if run.Message != "Matched 2 of 3 entries" {
+		t.Fatalf("run message = %q", run.Message)
+	}
+	var warnings []string
+	if err := json.Unmarshal(run.Warnings, &warnings); err != nil {
+		t.Fatalf("decode warnings: %v", err)
+	}
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "Unresolvable Member") || !strings.Contains(warnings[0], "provider connection refused") {
+		t.Fatalf("warnings = %v, want the skipped member and its provider error", warnings)
+	}
+
+	if members := collectCollectionMemberIDs(t, pool, ctx, collection.ID); len(members) != 2 || members[0] != "movie-tmdb-730002" || members[1] != "movie-tmdb-730003" {
+		t.Fatalf("members = %v, want [movie-tmdb-730002 movie-tmdb-730003]", members)
+	}
+	// The skipped member left no virtual state behind, so the next sync
+	// retries it from scratch instead of repairing a half-written item.
+	var files, claims int
+	if err := pool.QueryRow(ctx, `
+		SELECT
+		  (SELECT count(*) FROM media_files WHERE content_id='movie-tmdb-730001'),
+		  (SELECT count(*) FROM virtual_media_file_source_claims WHERE content_id='movie-tmdb-730001')`).Scan(&files, &claims); err != nil {
+		t.Fatal(err)
+	}
+	if files != 0 || claims != 0 {
+		t.Fatalf("skipped member files=%d claims=%d, want 0/0", files, claims)
+	}
+	var lastStatus string
+	if err := pool.QueryRow(ctx, `SELECT last_sync_status FROM library_collections WHERE id=$1`, collection.ID).Scan(&lastStatus); err != nil {
+		t.Fatal(err)
+	}
+	if lastStatus != "warning" {
+		t.Fatalf("last_sync_status = %q, want warning", lastStatus)
+	}
+}
+
+// A failure to read the collection itself is still a failed run, and it must
+// leave the accepted members in place.
+func TestTMDBPresetSyncListFailureKeepsMembers(t *testing.T) {
+	pool, ctx, service, collection := setupSkipUnresolvableSync(t)
+
+	if _, err := service.syncTMDBPresetCollection(ctx, collection, libraryCollectionSourceConfig{
+		Preset: "popular", MediaType: "movie", VirtualPlayback: true,
+	}, SyncCollectionOptions{SkipCollage: true}); err != nil {
+		t.Fatalf("preset sync failed: %v", err)
+	}
+	service.TMDBCollections = &fakeTMDBPresetFetcher{err: errors.New("tmdb upstream unavailable")}
+	run, err := service.SyncCollectionWithOptions(ctx, collection.ID, SyncCollectionOptions{SkipCollage: true})
+	if err == nil || run != nil {
+		t.Fatalf("provider list failure: run=%+v err=%v, want nil run and an error", run, err)
+	}
+	runs, err := NewLibraryCollectionRepository(pool).ListSyncRuns(ctx, collection.ID, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) == 0 || runs[0].Status != "failed" || !strings.Contains(runs[0].Message, "tmdb upstream unavailable") {
+		t.Fatalf("latest sync run = %+v, want a failed run naming the provider", runs)
+	}
+	var memberCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM library_collection_items WHERE collection_id=$1`, collection.ID).Scan(&memberCount); err != nil {
+		t.Fatal(err)
+	}
+	if memberCount != 2 {
+		t.Fatalf("provider list failure changed membership to %d, want 2", memberCount)
+	}
+}
+
+// An existing virtual member whose provider variants fail to refresh transiently
+// must preserve its collection membership and source claims, while the other members
+// commit.
+func TestTMDBPresetSyncPreservesExistingMemberOnTransientFailure(t *testing.T) {
+	pool, _, service, collection := setupSkipUnresolvableSync(t)
+	bgCtx := context.Background()
+
+	// First sync via public entry point succeeds for members 730002 and 730003.
+	if _, err := service.SyncCollectionWithOptions(bgCtx, collection.ID, SyncCollectionOptions{SkipCollage: true}); err != nil {
+		t.Fatalf("first sync failed: %v", err)
+	}
+
+	// Now member 730002 is an existing member with files and claims.
+	// Next sync includes 730002 and 730003, but 730002's provider variant refresh fails.
+	service.TMDBCollections = &fakeTMDBPresetFetcher{entries: []TMDBCollectionEntry{
+		{ID: 730002, MediaType: "movie", Title: "Second Member", ReleaseDate: "2011-05-15"},
+		{ID: 730003, MediaType: "movie", Title: "Third Member", ReleaseDate: "2012-05-15"},
+	}}
+	var failureCalls atomic.Int32
+	service.VirtualVariants = func(_ context.Context, uri, _ string) ([]VirtualPlaybackVariant, error) {
+		if strings.Contains(uri, "730002") {
+			failureCalls.Add(1)
+			return nil, errors.New("provider connection refused")
+		}
+		return []VirtualPlaybackVariant{{OwnerInstallationID: 11, VirtualURI: uri}}, nil
+	}
+
+	// Run second sync via public entry point with fresh context to ensure fresh tracker and variant cache.
+	run, err := service.SyncCollectionWithOptions(bgCtx, collection.ID, SyncCollectionOptions{SkipCollage: true})
+	if err != nil {
+		t.Fatalf("second sync failed: %v", err)
+	}
+	if failureCalls.Load() == 0 {
+		t.Fatal("expected failure callback to be called during second sync")
+	}
+	if run.Status != "warning" {
+		t.Fatalf("run status = %q, want warning", run.Status)
+	}
+	// Both members must remain in the collection.
+	members := collectCollectionMemberIDs(t, pool, bgCtx, collection.ID)
+	if len(members) != 2 || members[0] != "movie-tmdb-730002" || members[1] != "movie-tmdb-730003" {
+		t.Fatalf("members = %v, want both members preserved", members)
+	}
+	// 730002's claims must be preserved.
+	var claims int
+	if err := pool.QueryRow(bgCtx, `SELECT count(*) FROM virtual_media_file_source_claims WHERE content_id='movie-tmdb-730002' AND source_key=$1`, "collection:"+collection.ID).Scan(&claims); err != nil || claims == 0 {
+		t.Fatalf("existing member claims lost: claims=%d err=%v", claims, err)
 	}
 }
 
@@ -1097,7 +1298,7 @@ func TestCollectionAcceptanceBlocksAliasAttachedAfterPreparation(t *testing.T) {
 	}
 	// Acceptance must refuse the stale preparation with a retryable
 	// conflict rather than deciding on the changed alias set.
-	err = service.acceptCollectionItems(prepCtx, collection, []LibraryCollectionItemInput{{MediaItemID: movieID}})
+	_, _, err = service.acceptCollectionItems(prepCtx, collection, []LibraryCollectionItemInput{{MediaItemID: movieID}})
 	if err == nil || !errors.Is(err, ErrReleaseOverrideConflict) && !strings.Contains(err.Error(), "alias set changed") {
 		t.Fatalf("acceptance missed the attached alias: %v", err)
 	}
@@ -1244,7 +1445,8 @@ func TestMultiItemAcceptanceCompletesWithConcurrentOverrideMutation(t *testing.T
 	mutateDone := make(chan error, 3)
 	go func() {
 		<-start
-		acceptDone <- service.acceptCollectionItems(prepCtx, collection, []LibraryCollectionItemInput{{MediaItemID: movieA}, {MediaItemID: movieB}})
+		_, _, acceptErr := service.acceptCollectionItems(prepCtx, collection, []LibraryCollectionItemInput{{MediaItemID: movieA}, {MediaItemID: movieB}})
+		acceptDone <- acceptErr
 	}()
 	for i := 0; i < 3; i++ {
 		go func() {
@@ -1393,7 +1595,7 @@ func TestCollectionAcceptanceConflictsOnRemovedPermittingAlias(t *testing.T) {
 		DELETE FROM media_item_provider_ids WHERE content_id='`+movieID+`' AND provider='imdb'`); err != nil {
 		t.Fatalf("remove mistaken alias: %v", err)
 	}
-	err = service.acceptCollectionItems(prepCtx, collection, []LibraryCollectionItemInput{{MediaItemID: movieID}})
+	_, _, err = service.acceptCollectionItems(prepCtx, collection, []LibraryCollectionItemInput{{MediaItemID: movieID}})
 	if err == nil || !errors.Is(err, ErrReleaseOverrideConflict) && !strings.Contains(err.Error(), "alias set changed") {
 		t.Fatalf("acceptance used the removed alias: %v", err)
 	}
