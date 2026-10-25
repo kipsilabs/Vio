@@ -3142,18 +3142,20 @@ func (f *fakePresence) Lookup(_ context.Context, mediaType MediaType, candidates
 	for _, candidate := range candidates {
 		if f.available != nil && f.available[mediaType][candidate.TMDBID] {
 			out[candidate.TMDBID] = PresenceMatch{
-				Available:       true,
-				ContentID:       fakePresenceContentID(mediaType, candidate.TMDBID),
-				MatchedProvider: "tmdb",
+				Available:             true,
+				ContentID:             fakePresenceContentID(mediaType, candidate.TMDBID),
+				MatchedProvider:       "tmdb",
+				SeasonNumberingSource: SeasonSourceTMDB,
 			}
 			continue
 		}
 		if candidate.TVDBID != nil && f.byTVDB != nil {
 			if tmdbID, ok := f.byTVDB[mediaType][*candidate.TVDBID]; ok && tmdbID == candidate.TMDBID {
 				out[candidate.TMDBID] = PresenceMatch{
-					Available:       true,
-					ContentID:       fakePresenceTVDBContentID(mediaType, *candidate.TVDBID),
-					MatchedProvider: "tvdb",
+					Available:             true,
+					ContentID:             fakePresenceTVDBContentID(mediaType, *candidate.TVDBID),
+					MatchedProvider:       "tvdb",
+					SeasonNumberingSource: SeasonSourceTVDB,
 				}
 			}
 		}

@@ -213,6 +213,39 @@ func TestRunPassDefersPoisonItem(t *testing.T) {
 	}
 }
 
+// TestRunPassPersistsSameSourceProgressOnDeferredItem proves a frozen-source
+// traversal that times out keeps the episodes and season cursor it accumulated,
+// so the retry resumes instead of restarting from the first season.
+func TestRunPassPersistsSameSourceProgressOnDeferredItem(t *testing.T) {
+	m := newPassTestMonitor(t)
+	item := monitoredMedia{
+		Key: "series:tvdb:1", MediaType: "series", TVDBID: "1", MetadataSource: "tvdb",
+	}
+	m.evaluateFn = func(_ context.Context, item monitoredMedia) (monitoredMedia, string, error) {
+		item.Episodes = []virtualEpisode{{Season: 1, Episode: 1, Title: "Pilot"}}
+		item.MetadataNextSeason = 1
+		return item, "Selected metadata source unavailable; monitoring will retry", context.DeadlineExceeded
+	}
+
+	resp, err := m.runPass(context.Background(), []monitoredMedia{item}, &trackingRegistrar{})
+	if err != nil {
+		t.Fatalf("pass with deferred item returned error: %v", err)
+	}
+	if got := resp.Output["deferred"]; got != 1 {
+		t.Fatalf("deferred = %v, want 1", got)
+	}
+	persisted, ok := m.item(item.Key)
+	if !ok {
+		t.Fatal("deferred item was not persisted")
+	}
+	if len(persisted.Episodes) != 1 || persisted.Episodes[0].Title != "Pilot" {
+		t.Fatalf("episodes = %+v, want the same-source partial progress", persisted.Episodes)
+	}
+	if persisted.MetadataNextSeason != 1 {
+		t.Fatalf("metadata next season = %d, want the preserved cursor 1", persisted.MetadataNextSeason)
+	}
+}
+
 // TestRunPassReconcileFailureDoesNotFailPass proves a failing source
 // reconciliation is logged and retried later, not returned as a pass error.
 func TestRunPassReconcileFailureDoesNotFailPass(t *testing.T) {

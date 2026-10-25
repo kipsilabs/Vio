@@ -19,6 +19,11 @@ type PresenceMatch struct {
 	Available       bool
 	ContentID       string
 	MatchedProvider string
+	// SeasonNumberingSource is the catalog's persisted season-numbering
+	// provenance ("tvdb", "tmdb"), or empty when the item's imports did not
+	// record one. It is independent of MatchedProvider, which only names the
+	// external ID that found the item.
+	SeasonNumberingSource string
 }
 
 type PresenceResolver interface {
@@ -117,9 +122,10 @@ func (p *CatalogPresence) Lookup(ctx context.Context, mediaType MediaType, candi
 			continue
 		}
 		out[id] = PresenceMatch{
-			Available:       true,
-			ContentID:       row.MediaID,
-			MatchedProvider: row.MatchedProvider,
+			Available:             true,
+			ContentID:             row.MediaID,
+			MatchedProvider:       row.MatchedProvider,
+			SeasonNumberingSource: row.SeasonNumberingSource,
 		}
 		if row.MatchedProvider != SeasonSourceTMDB && p.tmdbBackfill != nil {
 			if err := p.tmdbBackfill.AttachTMDBID(ctx, row.MediaID, string(mediaType), id); err != nil {

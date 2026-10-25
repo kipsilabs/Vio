@@ -53,11 +53,12 @@ func (f *fakeTMDBBackfiller) AttachTMDBID(_ context.Context, contentID, itemType
 func TestCatalogPresenceMatchesByTVDBAndBackfillsTMDB(t *testing.T) {
 	tvdbID := 420105
 	lookup := &fakePresenceLookup{rows: []catalog.ExternalIDMatchRow{{
-		QueryTMDBID:     "201992",
-		MediaID:         "120983767174086659",
-		MatchedProvider: "tvdb",
-		LibraryID:       "2",
-		Title:           "The Rookie: Feds",
+		QueryTMDBID:           "201992",
+		MediaID:               "120983767174086659",
+		MatchedProvider:       "tvdb",
+		LibraryID:             "2",
+		Title:                 "The Rookie: Feds",
+		SeasonNumberingSource: "tmdb",
 	}}}
 	backfill := &fakeTMDBBackfiller{}
 	presence := &CatalogPresence{items: lookup, tmdbBackfill: backfill}
@@ -75,6 +76,9 @@ func TestCatalogPresenceMatchesByTVDBAndBackfillsTMDB(t *testing.T) {
 	}
 	if result[201992].MatchedProvider != "tvdb" {
 		t.Fatalf("matched provider = %q, want tvdb", result[201992].MatchedProvider)
+	}
+	if result[201992].SeasonNumberingSource != "tmdb" {
+		t.Fatalf("season numbering source = %q, want the persisted tmdb provenance", result[201992].SeasonNumberingSource)
 	}
 	if backfill.contentID != "120983767174086659" || backfill.itemType != "series" || backfill.tmdbID != 201992 {
 		t.Fatalf("backfill = %+v, want content 120983767174086659 series tmdb 201992", backfill)

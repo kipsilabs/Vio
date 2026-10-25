@@ -651,32 +651,52 @@ func TestSeasonCountsCompatibleUsesCatalogNumberingProvenance(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		fromTVDB   bool
-		contentID  string
+		numbering  string
 		compatible bool
 	}{
-		{name: "tvdb list against tvdb catalog", fromTVDB: true, contentID: "series-tvdb-42", compatible: true},
-		{name: "tmdb list against tvdb catalog", fromTVDB: false, contentID: "series-tvdb-42", compatible: false},
-		{name: "tvdb list against tmdb catalog", fromTVDB: true, contentID: "series-tmdb-42", compatible: false},
-		{name: "tmdb list against tmdb catalog", fromTVDB: false, contentID: "series-tmdb-42", compatible: true},
-		{name: "unknown catalog provenance fails closed", fromTVDB: true, contentID: "series-42", compatible: false},
+		{name: "tvdb list against tvdb catalog", fromTVDB: true, numbering: SeasonSourceTVDB, compatible: true},
+		{name: "tmdb list against tvdb catalog", fromTVDB: false, numbering: SeasonSourceTVDB, compatible: false},
+		{name: "tvdb list against tmdb catalog", fromTVDB: true, numbering: SeasonSourceTMDB, compatible: false},
+		{name: "tmdb list against tmdb catalog", fromTVDB: false, numbering: SeasonSourceTMDB, compatible: true},
+		{name: "unknown catalog provenance fails closed", fromTVDB: true, numbering: "", compatible: false},
+		{name: "tmdb identity does not imply tmdb numbering", fromTVDB: true, numbering: "", compatible: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := seasonCountsCompatible(tc.fromTVDB, PresenceMatch{ContentID: tc.contentID}); got != tc.compatible {
+			if got := seasonCountsCompatible(tc.fromTVDB, PresenceMatch{SeasonNumberingSource: tc.numbering}); got != tc.compatible {
 				t.Fatalf("seasonCountsCompatible = %v, want %v", got, tc.compatible)
 			}
 		})
 	}
-	if requestSeasonCountsCompatible("", PresenceMatch{ContentID: "series-42"}) {
+	if requestSeasonCountsCompatible("", PresenceMatch{SeasonNumberingSource: ""}) {
 		t.Fatal("requests must fail closed when catalog provenance is unknown")
 	}
-	if !requestSeasonCountsCompatible("", PresenceMatch{ContentID: "series-tvdb-42"}) {
+	if !requestSeasonCountsCompatible("", PresenceMatch{SeasonNumberingSource: SeasonSourceTVDB}) {
 		t.Fatal("legacy requests with known catalog provenance keep the historical join")
 	}
-	if !requestSeasonCountsCompatible("tvdb", PresenceMatch{ContentID: "series-tvdb-42"}) {
+	if !requestSeasonCountsCompatible("tvdb", PresenceMatch{SeasonNumberingSource: SeasonSourceTVDB}) {
 		t.Fatal("explicit TVDB requests must join a TVDB-numbered catalog")
 	}
-	if requestSeasonCountsCompatible("tvdb", PresenceMatch{ContentID: "series-tmdb-42"}) {
+	if requestSeasonCountsCompatible("tvdb", PresenceMatch{SeasonNumberingSource: SeasonSourceTMDB}) {
 		t.Fatal("explicit TVDB requests must not join a TMDB-numbered catalog")
+	}
+}
+
+func TestCatalogSeriesSeasonSourceIgnoresContentIDPrefix(t *testing.T) {
+	// A TVDB canonical content ID says nothing about which provider numbered
+	// the imported seasons: virtual import prefers TVDB identity even when the
+	// request explicitly imported TMDB-numbered seasons.
+	match := PresenceMatch{ContentID: "series-tvdb-42", SeasonNumberingSource: SeasonSourceTMDB}
+	if got := catalogSeriesSeasonSource(match); got != SeasonSourceTMDB {
+		t.Fatalf("catalogSeriesSeasonSource = %q, want the persisted tmdb source", got)
+	}
+	if requestSeasonCountsCompatible(SeasonSourceTVDB, match) {
+		t.Fatal("a TVDB request must not join TMDB-numbered catalog seasons under a series-tvdb ID")
+	}
+	if !requestSeasonCountsCompatible(SeasonSourceTMDB, match) {
+		t.Fatal("a TMDB request must join its own TMDB-numbered import under a series-tvdb ID")
+	}
+	if got := catalogSeriesSeasonSource(PresenceMatch{ContentID: "series-tvdb-42"}); got != "" {
+		t.Fatalf("catalogSeriesSeasonSource = %q, want unknown without persisted provenance", got)
 	}
 }
 

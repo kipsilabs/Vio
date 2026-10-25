@@ -988,6 +988,22 @@ func (m *mediaMonitor) remember(item monitoredMedia) error {
 	return nil
 }
 
+// rememberRetainedProgress persists the metadata cursor and episodes an
+// evaluation accumulated before a retryable failure. Without it, a frozen
+// request source that times out mid-traversal would discard its same-source
+// progress and restart from the first season on every retry.
+func (m *mediaMonitor) rememberRetainedProgress(before, after monitoredMedia) error {
+	if after.Key == "" {
+		return nil
+	}
+	if after.MetadataNextSeason == before.MetadataNextSeason &&
+		after.MetadataComplete == before.MetadataComplete &&
+		len(after.Episodes) <= len(before.Episodes) {
+		return nil
+	}
+	return m.remember(after)
+}
+
 // rememberSeriesEpisodes merges freshly evaluated episodes into the persisted
 // series item without dropping entries that are already registered, so the
 // monitor queue can keep tracking upcoming episodes for ongoing series.
@@ -2025,10 +2041,16 @@ func (m *mediaMonitor) runPass(ctx context.Context, items []monitoredMedia, regi
 			deferred++
 			reconcileSafeBySource[source] = false
 			advance = item.Key
+			if err := m.rememberRetainedProgress(item, updated); err != nil {
+				return nil, err
+			}
 		case itemFailed:
 			pending++
 			reconcileSafeBySource[source] = false
 			advance = item.Key
+			if err := m.rememberRetainedProgress(item, updated); err != nil {
+				return nil, err
+			}
 		case itemReady:
 			advance = item.Key
 			if err := m.remember(updated); err != nil {
@@ -2205,10 +2227,10 @@ func (m *mediaMonitor) processItem(ctx context.Context, item monitoredMedia) (mo
 			return item, "", itemBudgetExhausted
 		case itemCtx.Err() != nil, errors.Is(evaluationErr, context.Canceled), errors.Is(evaluationErr, context.DeadlineExceeded):
 			m.logger.DebugContext(itemCtx, "defer virtual media item; per-item budget elapsed", "key", item.Key)
-			return item, "", itemDeferred
+			return updated, "", itemDeferred
 		default:
 			m.logger.WarnContext(itemCtx, "evaluate virtual media", "key", item.Key, "error", evaluationErr)
-			return item, "", itemFailed
+			return updated, "", itemFailed
 		}
 	}
 	if updated.Ready && (strings.TrimSpace(updated.Title) == "" || (updated.MediaType == "series" && len(updated.Episodes) == 0)) {
@@ -2513,7 +2535,15 @@ func (m *mediaMonitor) resolveLibraryMetadata(
 		}
 		if strings.TrimSpace(item.MetadataSource) != "" {
 			// A frozen request source must not be replaced by a different
-			// provider's numbering. Leave the item queued for a retry.
+			// provider's numbering. Keep the same-source episodes the resolver
+			// already accumulated so the retry resumes instead of restarting
+			// the traversal, and leave the item queued.
+			if enriched.Key != "" {
+				if strings.TrimSpace(enriched.MetadataSource) == "" {
+					enriched.MetadataSource = item.MetadataSource
+				}
+				item = enriched
+			}
 			return item, "Selected metadata source unavailable; monitoring will retry", err
 		}
 		// Enrichment is optional. Keep whatever usable metadata the

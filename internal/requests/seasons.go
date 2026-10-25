@@ -269,15 +269,16 @@ func seasonCountsCompatible(fromTVDB bool, match PresenceMatch) bool {
 		(!fromTVDB && catalogSource == SeasonSourceTMDB)
 }
 
-// catalogSeriesSeasonSource reads numbering provenance from the catalog
-// content ID. PresenceMatch.MatchedProvider records the external ID that found
-// the item, which is not necessarily the provider whose seasons were indexed.
+// catalogSeriesSeasonSource reads the catalog's persisted season-numbering
+// provenance. It deliberately does not infer the source from the content ID:
+// canonical series identity prefers TVDB whenever a TVDB ID exists, even when
+// the imported seasons and episodes were numbered by TMDB. An item that never
+// recorded provenance stays unknown and therefore fails closed.
 func catalogSeriesSeasonSource(match PresenceMatch) string {
-	id := strings.ToLower(strings.TrimSpace(match.ContentID))
-	switch {
-	case strings.HasPrefix(id, "series-tvdb-"):
+	switch strings.ToLower(strings.TrimSpace(match.SeasonNumberingSource)) {
+	case SeasonSourceTVDB:
 		return SeasonSourceTVDB
-	case strings.HasPrefix(id, "series-tmdb-"):
+	case SeasonSourceTMDB:
 		return SeasonSourceTMDB
 	default:
 		return ""

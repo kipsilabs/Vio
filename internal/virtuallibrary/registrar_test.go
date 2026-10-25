@@ -189,6 +189,29 @@ func TestVirtualMediaRegistrationTrimsProviderWhitespace(t *testing.T) {
 	}
 }
 
+func TestVirtualMediaRegistrationPersistsSeasonNumberingSource(t *testing.T) {
+	for _, tc := range []struct {
+		source string
+		want   string
+	}{
+		{source: "tvdb", want: "tvdb"},
+		{source: " TMDB ", want: "tmdb"},
+		{source: "", want: ""},
+		{source: "imdb", want: ""},
+	} {
+		item := monitor.MonitoredMedia{
+			Key:            "series:tt100",
+			MediaType:      "series",
+			IMDbID:         "tt100",
+			MetadataSource: tc.source,
+			Episodes:       []monitor.VirtualEpisode{{Season: 1, Episode: 1, Title: "Pilot"}},
+		}
+		if got := virtualMediaRegistration(item, "2").SeasonNumberingSource; got != tc.want {
+			t.Fatalf("season numbering source for %q = %q, want %q", tc.source, got, tc.want)
+		}
+	}
+}
+
 func TestCatalogMonitorRegistrarEpisodeMapping(t *testing.T) {
 	// Verify that Register accurately maps all monitoredMedia fields including episodes
 	item := monitor.MonitoredMedia{

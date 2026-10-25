@@ -6423,6 +6423,9 @@ type ExternalIDMatchRow struct {
 	MatchedProvider string
 	LibraryID       string
 	Title           string
+	// SeasonNumberingSource is the provider whose season and episode numbers
+	// the item follows ("tvdb", "tmdb"), or empty when unknown.
+	SeasonNumberingSource string
 }
 
 // LookupTMDBIDs returns one row per matching media item that has its tmdb_id
@@ -6464,7 +6467,8 @@ func lookupExternalIDsSQL() string {
 			SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::int[])
 		),
 		direct_matches AS (
-			SELECT r.query_tmdb_id, mi.content_id, r.provider, mil.media_folder_id::text, mi.title, r.ord,
+			SELECT r.query_tmdb_id, mi.content_id, r.provider, mil.media_folder_id::text, mi.title,
+			       mi.season_numbering_source, r.ord,
 			       CASE r.provider WHEN 'tmdb' THEN 0 WHEN 'tvdb' THEN 1 WHEN 'imdb' THEN 2 ELSE 3 END AS provider_rank
 			FROM requested r
 			JOIN media_items mi
@@ -6487,7 +6491,8 @@ func lookupExternalIDsSQL() string {
 			  )
 		),
 		provider_matches AS (
-			SELECT r.query_tmdb_id, mi.content_id, r.provider, mil.media_folder_id::text, mi.title, r.ord,
+			SELECT r.query_tmdb_id, mi.content_id, r.provider, mil.media_folder_id::text, mi.title,
+			       mi.season_numbering_source, r.ord,
 			       CASE r.provider WHEN 'tmdb' THEN 0 WHEN 'tvdb' THEN 1 WHEN 'imdb' THEN 2 ELSE 3 END AS provider_rank
 			FROM requested r
 			JOIN media_item_provider_ids mip
@@ -6508,7 +6513,7 @@ func lookupExternalIDsSQL() string {
 			  )
 		)
 		SELECT DISTINCT ON (query_tmdb_id)
-		       query_tmdb_id, content_id, provider, media_folder_id, title
+		       query_tmdb_id, content_id, provider, media_folder_id, title, season_numbering_source
 		FROM (
 			SELECT * FROM direct_matches
 			UNION ALL
@@ -6560,7 +6565,7 @@ func (r *ItemRepository) LookupExternalIDs(
 	out := make([]ExternalIDMatchRow, 0)
 	for rows.Next() {
 		var row ExternalIDMatchRow
-		if err := rows.Scan(&row.QueryTMDBID, &row.MediaID, &row.MatchedProvider, &row.LibraryID, &row.Title); err != nil {
+		if err := rows.Scan(&row.QueryTMDBID, &row.MediaID, &row.MatchedProvider, &row.LibraryID, &row.Title, &row.SeasonNumberingSource); err != nil {
 			return nil, fmt.Errorf("scanning external id lookup row: %w", err)
 		}
 		out = append(out, row)
