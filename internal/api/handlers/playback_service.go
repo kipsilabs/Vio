@@ -453,9 +453,22 @@ func (h *PlaybackHandler) ApplyProgressV2(ctx context.Context, caller PlaybackCa
 	if receipt.Outcome != playback.ProgressAppliedV3 && receipt.Outcome != playback.ProgressReplayedV3 {
 		return view, nil
 	}
-	h.persistProgressV2(ctx, store, record, sessionID, sample)
+	// The row CAS is the durable truth and stays on the request context. The
+	// ordered side effects (user-store progress, admin session sync, scrobble)
+	// run behind their own bounded budget: a wedged writer used to hold the
+	// progress response for up to a minute while paused, blocking the next
+	// heartbeat (45s/60s holds observed in production). A timed-out writer is
+	// idempotent to replay, and the next sample re-runs it from the row.
+	sideEffectCtx, cancelSideEffects := context.WithTimeout(ctx, progressSideEffectBudget)
+	defer cancelSideEffects()
+	h.persistProgressV2(sideEffectCtx, store, record, sessionID, sample)
 	return view, nil
 }
+
+// progressSideEffectBudget bounds how long a progress response waits for its
+// ordered side effects after the row CAS has committed. It is a variable so a
+// test can shorten it.
+var progressSideEffectBudget = 5 * time.Second
 
 // maxProgressWritePassesV2 bounds how many times persistProgressV2 rewrites
 // the side effects after the row moved under it. Each extra pass needs the
