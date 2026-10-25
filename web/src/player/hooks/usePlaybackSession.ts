@@ -38,6 +38,8 @@ import { resolvePlanAudioIdentity } from "../utils/audioTrackMatch";
 import { buildPublishedSubtitleTracks } from "../utils/subtitleInventory";
 import { isBitmapCodec } from "../utils/subtitleCodecs";
 import { isInventoryProvisional } from "../utils/inventoryProvenance";
+import { isNeutralVirtualVersion } from "../utils/neutralVirtualVersion";
+import { normalizeSubtitleMode } from "../utils/subtitleMode";
 import {
   FEATURE_OUTPUT_CHANGE_V3,
   MAX_ATTEMPT_COUNT_V3,
@@ -45,10 +47,12 @@ import {
   QUALITY_ORIGINAL_V3,
   type DecisionResponseV3,
   type FailureV3,
+  type AudioTrackV3,
   type PlanV3,
   type RouteEventNameV3,
   type StartRequestV3,
   type SubtitleInventoryItemV3,
+  type TrackIdentityV3,
 } from "../protocol-v3";
 import {
   buildReplanRequestV3,
@@ -67,6 +71,7 @@ import type {
   PlayerPlaybackVariant,
   PlayerSubtitleInfo,
   ResumeHints,
+  SubtitleMode,
 } from "../types";
 
 /** Terminal reasons that mean the selected subtitle, not the release, blocked
@@ -649,13 +654,17 @@ export interface UsePlaybackSessionResult extends PlaybackSessionState {
    * already in flight or once a plan is playing.
    */
   retryStart: () => void;
-  /** `track_change` replan selecting another audio track by combined index. */
+  /**
+   * `track_change` replan selecting another audio track by combined index. A
+   * pick the plan's inventory cannot name is ignored rather than sent.
+   */
   switchAudioTrack: (index: number, currentPosition: number) => void;
   /**
    * `track_change` replan selecting (or clearing) the server-side subtitle
    * track. Only needed for tracks the server has to render — burn-in and
    * conversion. Sidecar tracks are fetched from the plan's inventory and drawn
-   * by the client without involving the server.
+   * by the client without involving the server. A stale ordinal the plan's
+   * inventory does not carry is reconciled by identity/language or ignored.
    */
   changeSubtitleTrack: (combinedIndex: number | null, currentPosition: number) => void;
   /** `quality_change` replan for a label taken from `plan.available_qualities`. */
@@ -893,6 +902,91 @@ function resolveCarriedSubtitleIndexAcrossVersions(
   return match?.index ?? null;
 }
 
+/**
+ * Resolves the audio identity to send for a menu pick, or null when the pick
+ * does not name a track in the current plan.
+ *
+ * The menu can be one inventory behind the plan: `applyAudioInventory` may
+ * replace it with a probed catalog list, a rotation may re-key the source, and
+ * a replacement plan may not carry the same tracks at all. The plan's stable
+ * `track_id` is reconciled first (the audio resolver also falls back to
+ * signature and language), and an ordinal that names no plan track is dropped
+ * instead of sent: the server has no such selection to resolve, and answering
+ * it only earns an `adaptation_unavailable` terminal.
+ *
+ * A plan that publishes no audio inventory is left alone, and an inventory
+ * with no `track_id`s at all (a legacy synthesized list) keeps its ordinal
+ * while it is a valid plan position: the server resolves it against the durable
+ * request and the effective file, and that is the only selection channel those
+ * plans have.
+ */
+function resolveAudioTrackChange(
+  planTracks: readonly AudioTrackV3[],
+  displayed: readonly PlayerAudioTrack[],
+  index: number,
+): TrackIdentityV3 | null {
+  if (!Number.isInteger(index) || index < 0) return null;
+  if (planTracks.length === 0) return { id: "", index };
+  if (index >= displayed.length) return null;
+
+  const identity = resolvePlanAudioIdentity(planTracks, displayed, index);
+  if (identity.id !== "" && planTracks.some((track) => track.track_id === identity.id)) {
+    // Keep the menu ordinal as the fallback exactly as the audio resolver
+    // always has: the id is the authority the server resolves.
+    return identity;
+  }
+
+  // The pick reconciled to nothing. A plan with stable identities has no
+  // counterpart for it, so sending an ordinal would select an unrelated
+  // language: drop it.
+  const hasStableIdentities = planTracks.some((track) => (track.track_id ?? "").trim() !== "");
+  if (hasStableIdentities) return null;
+
+  // A legacy synthesized inventory publishes no identities, so the ordinal is
+  // the only selection channel. Keep it while it is a valid plan position.
+  return index < planTracks.length ? { id: "", index } : null;
+}
+
+/**
+ * Resolves the subtitle identity to send for a menu pick, or null when the pick
+ * cannot be reconciled to the current plan's inventory.
+ *
+ * The picked ordinal is authoritative while the plan still publishes it. After
+ * a replacement or a source rotation the menu can still show the outgoing
+ * inventory, so the picked slot is reconciled by its stable `track_id`, then by
+ * language/signature (the same matcher version switches use); a slot with no
+ * counterpart is dropped rather than sent as an ordinal the server's inventory
+ * does not contain.
+ *
+ * A plan with no published inventory (deferred or legacy) keeps the ordinal:
+ * there is no list to validate against, and the server remaps or degrades the
+ * provisional pick.
+ */
+function resolveSubtitleTrackChange(
+  plan: PlanV3,
+  displayed: readonly PlayerSubtitleInfo[],
+  combinedIndex: number,
+): TrackIdentityV3 | null {
+  if (!Number.isInteger(combinedIndex) || combinedIndex < 0) return null;
+
+  const inventory = plan.subtitle.inventory;
+  if (inventory.length === 0) return { id: "", index: combinedIndex };
+
+  const exact = inventory.find((item) => item.combined_index === combinedIndex);
+  if (exact) return { id: exact.track_id, index: exact.combined_index };
+
+  const picked = displayed.find((item) => item.index === combinedIndex);
+  if (!picked) return null;
+  if (picked.track_id) {
+    const byId = inventory.find((item) => item.track_id === picked.track_id);
+    if (byId) return { id: byId.track_id, index: byId.combined_index };
+  }
+
+  const candidates = inventory.map((item) => ({ ...item, index: item.combined_index }));
+  const byLanguage = matchSubtitleTrackAcrossVersions(candidates, picked);
+  return byLanguage ? { id: byLanguage.track_id, index: byLanguage.combined_index } : null;
+}
+
 // Temporary client-side heuristic for A/V transport equivalence.
 // TODO: replace with a server-authoritative transport_generation on PlanV3
 // that bumps only when the A/V bytes change, so sidecar-only replans never
@@ -1078,6 +1172,10 @@ export function usePlaybackSession(
    *  unavailable version. */
   forceRelink = false,
   allowAlternateVersions = true,
+  /** The profile's subtitle mode. `auto`/`always` make a version that owns a
+   *  subtitle inventory preferable to one that does not when the start has no
+   *  explicit file. */
+  subtitleMode?: SubtitleMode | null,
 ): UsePlaybackSessionResult {
   const config = usePlayerConfig();
   const probe = useCodecDetection();
@@ -1868,19 +1966,76 @@ export function usePlaybackSession(
    * Picks which file to *request*. The server owns adaptation — this only
    * expresses which edition the viewer is resuming, which is knowledge the
    * server does not have.
+   *
+   * Resume hints are a request for the release the viewer last played, not for
+   * whatever candidate the server ranks now. A neutral `virtual://series/…` row
+   * names no release at all: it is the collapsed episode row the server
+   * re-resolves, so its effective candidate can lack the tracks the viewer
+   * expects. Such a hint is ignored, and an explicit `preferredFileId` stays
+   * authoritative.
    */
   const selectFileId = useCallback(
     (preferredFileId?: number) => {
+      // The viewer named this row, even a neutral virtual one: the server
+      // resolves it and the choice is not ours to second-guess.
       if (preferredFileId) return preferredFileId;
-      if (resumeHints?.lastFileId) {
-        const exact = versions.find((v) => v.file_id === resumeHints.lastFileId);
-        if (exact) return exact.file_id;
-      }
+
+      const mode = normalizeSubtitleMode(subtitleMode);
+      const lastFileId = resumeHints?.lastFileId;
+      const lastVersion =
+        lastFileId != null ? versions.find((version) => version.file_id === lastFileId) : undefined;
+      const resumedVersion =
+        lastVersion && !isNeutralVirtualVersion(lastVersion) ? lastVersion : undefined;
       const variantFileId = selectDefaultVariantFile(playbackVariants, versions, resumeHints);
-      if (variantFileId) return variantFileId;
-      return versions[0]?.file_id ?? null;
+      const variantFile =
+        variantFileId != null
+          ? versions.find((version) => version.file_id === variantFileId)
+          : undefined;
+
+      if (mode === "off") {
+        if (resumedVersion) return resumedVersion.file_id;
+        return variantFileId ?? versions[0]?.file_id ?? null;
+      }
+
+      // Subtitles are on. A concrete candidate that publishes a subtitle
+      // inventory is a better request than one that does not, because the
+      // candidate the server resolves then actually owns the tracks the viewer
+      // expects. The concrete resume target is the first choice: it keeps the
+      // release that was playing.
+      if (resumedVersion && hasSubtitleTracks(resumedVersion)) return resumedVersion.file_id;
+
+      // Anchor the search on the resumed edition/part, else on the variant's
+      // default edition/part. A different cut or another part of a multi-part
+      // presentation is not a subtitle fallback; it is a different thing to
+      // play, so the scope never widens past the anchor's presentation.
+      const anchor =
+        resumedVersion ??
+        (variantFile && !isNeutralVirtualVersion(variantFile) ? variantFile : undefined);
+      if (anchor) {
+        const subtitleSibling = versions.find(
+          (version) =>
+            version.file_id !== anchor.file_id &&
+            !isNeutralVirtualVersion(version) &&
+            isSamePresentation(version, anchor) &&
+            hasSubtitleTracks(version),
+        );
+        return subtitleSibling?.file_id ?? anchor.file_id;
+      }
+
+      // No concrete anchor to preserve. Take any concrete candidate that
+      // publishes subtitles, staying inside the resumed edition when the hints
+      // name one, then fall back to the default variant.
+      const editionScope = resumeHints?.lastEditionKey;
+      const subtitleCandidate = versions.find(
+        (version) =>
+          !isNeutralVirtualVersion(version) &&
+          hasSubtitleTracks(version) &&
+          (editionScope == null || version.edition_key === editionScope),
+      );
+      if (subtitleCandidate) return subtitleCandidate.file_id;
+      return variantFileId ?? versions[0]?.file_id ?? null;
     },
-    [playbackVariants, resumeHints, versions],
+    [playbackVariants, resumeHints, subtitleMode, versions],
   );
 
   const loadSession = useCallback(
@@ -2862,14 +3017,15 @@ export function usePlaybackSession(
       // replaced, whose ordering a probe repair can change. Carry the plan's
       // canonical identity for the picked track — matched by signature, then
       // by language family when the menu no longer shows the plan's own list —
-      // so a raw position cannot name a different language. The client ordinal
-      // stays as the request's index fallback when the identity cannot be
-      // named.
-      const audio = resolvePlanAudioIdentity(
+      // so a raw position cannot name a different language. A pick with no
+      // counterpart in the plan is dropped instead of sent as an ordinal the
+      // server cannot resolve.
+      const audio = resolveAudioTrackChange(
         plan.audio_tracks ?? [],
         stateRef.current.planAudioTracks,
         index,
       );
+      if (!audio) return;
       const current = plan.selected_tracks.audio;
       // Compare the resolved identity, not the menu position: after a probe
       // repair the already-playing track can sit at a different displayed
@@ -2912,10 +3068,19 @@ export function usePlaybackSession(
         });
         return;
       }
+      // Null is an explicit subtitles-off request. A concrete ordinal is
+      // resolved against the plan first, then reconciled from the menu's stale
+      // slot by identity/language; a slot the plan does not carry is dropped
+      // instead of sending an invalid `track_change`.
+      const subtitle =
+        combinedIndex == null
+          ? null
+          : resolveSubtitleTrackChange(plan, stateRef.current.subtitleUrls, combinedIndex);
+      if (combinedIndex != null && subtitle == null) return;
       void replan({
         operation: "track_change",
         positionSeconds: currentPosition,
-        subtitle: combinedIndex == null ? null : { id: "", index: combinedIndex },
+        subtitle,
       });
     },
     [loadOfferedRelease, replan],
@@ -4416,6 +4581,25 @@ export function usePlaybackSession(
     reportFirstFrame,
     reportEvent,
   };
+}
+
+/**
+ * Whether two candidates belong to the same edition and part of one item.
+ *
+ * A version search that wants a different attribute (subtitles, a codec) may
+ * substitute a candidate, but never another cut or another part of a multi-part
+ * presentation: that would play a different thing. Empty group keys compare
+ * equal, which is the ordinary single-file case.
+ */
+function isSamePresentation(a: PlayerFileVersion, b: PlayerFileVersion): boolean {
+  if ((a.edition_key ?? "") !== (b.edition_key ?? "")) return false;
+  if ((a.presentation_group_key ?? "") !== (b.presentation_group_key ?? "")) return false;
+  return (a.presentation_part_index ?? 0) === (b.presentation_part_index ?? 0);
+}
+
+/** Whether a version publishes any subtitle track in its declared inventory. */
+function hasSubtitleTracks(version: PlayerFileVersion): boolean {
+  return (version.subtitle_tracks?.length ?? 0) > 0;
 }
 
 /**

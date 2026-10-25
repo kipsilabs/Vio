@@ -388,6 +388,7 @@ function WatchPagePlayer({
     explicitFileSelection,
     forceRelink,
     !watchTogetherRoomId,
+    subtitleMode,
   );
 
   const sessionRef = useRef(session);
