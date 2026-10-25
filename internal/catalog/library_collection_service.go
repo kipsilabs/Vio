@@ -651,106 +651,136 @@ type collectionVirtualVariantCache struct {
 // release policy rejections.
 var ErrMemberVariantsUnavailable = fmt.Errorf("%w: virtual profile variants unavailable", ErrProviderUnavailable)
 
+func (s *LibraryCollectionService) findPhysicalContentMap(ctx context.Context, ids []string) (map[string]bool, error) {
+	rows, err := s.collections.pool.Query(ctx, `
+		SELECT DISTINCT mf.content_id FROM media_files mf
+		WHERE mf.content_id = ANY($1::text[])
+		  AND mf.container IS DISTINCT FROM 'virtual'
+		  AND mf.file_path NOT LIKE 'virtual://%'`, ids)
+	if err != nil {
+		return nil, err
+	}
+	physical := make(map[string]bool)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		physical[id] = true
+	}
+	rows.Close()
+	return physical, rows.Err()
+}
+
+func (s *LibraryCollectionService) resolveAcceptanceMember(
+	ctx context.Context,
+	collection *models.LibraryCollection,
+	member LibraryCollectionItemInput,
+	tracker *collectionVirtualCreationTracker,
+) (preparedCollectionItem, bool, string, error) {
+	if candidate, ok := tracker.items[member.MediaItemID]; ok {
+		return candidate, true, "", nil
+	}
+	item, err := s.items.GetByID(ctx, member.MediaItemID)
+	if err != nil {
+		return preparedCollectionItem{}, false, "", err
+	}
+	if _, err := s.EnsureCollectionItemMaterializedWithOptions(ctx, collection, item, VirtualMaterializeOptions{}); err != nil {
+		if tracker.err != nil {
+			return preparedCollectionItem{}, false, "", tracker.err
+		}
+		if errors.Is(err, ErrMemberVariantsUnavailable) {
+			hasState := false
+			if s.collections != nil && s.collections.pool != nil {
+				scanErr := s.collections.pool.QueryRow(ctx, `
+					SELECT EXISTS(
+						SELECT 1 FROM library_collection_items WHERE collection_id=$1 AND media_item_id=$2
+					) AND EXISTS(
+						SELECT 1 FROM virtual_media_source_claims WHERE source_key=$3 AND content_id=$2
+					)`, collection.ID, member.MediaItemID, "collection:"+collection.ID).Scan(&hasState)
+				if scanErr != nil {
+					return preparedCollectionItem{}, false, "", fmt.Errorf("checking resident collection item state: %w", scanErr)
+				}
+			}
+			warningMsg := fmt.Sprintf("materializing virtual item %q: %v", item.Title, err)
+			if hasState {
+				slog.WarnContext(ctx, "failed to refresh resident virtual item during acceptance; preserving existing valid state",
+					"component", "catalog", "collection_id", collection.ID, "title", item.Title, "error", err)
+				return preparedCollectionItem{}, true, warningMsg, nil
+			}
+			return preparedCollectionItem{}, false, warningMsg, nil
+		}
+		return preparedCollectionItem{}, false, "", err
+	}
+	return tracker.items[member.MediaItemID], true, "", nil
+}
+
+func (s *LibraryCollectionService) prepareVirtualAcceptanceMembers(
+	ctx context.Context,
+	collection *models.LibraryCollection,
+	matched []LibraryCollectionItemInput,
+	tracker *collectionVirtualCreationTracker,
+) ([]LibraryCollectionItemInput, map[string]preparedCollectionItem, []string, error) {
+	ids := make([]string, 0, len(matched))
+	for _, member := range matched {
+		ids = append(ids, member.MediaItemID)
+	}
+	physical, err := s.findPhysicalContentMap(ctx, ids)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	prepared := make(map[string]preparedCollectionItem, len(matched))
+	accepted := make([]LibraryCollectionItemInput, 0, len(matched))
+	var warnings []string
+	for _, member := range matched {
+		if physical[member.MediaItemID] {
+			accepted = append(accepted, member)
+			continue
+		}
+		itemCandidate, keep, warn, prepErr := s.resolveAcceptanceMember(ctx, collection, member, tracker)
+		if prepErr != nil {
+			return nil, nil, nil, prepErr
+		}
+		if warn != "" {
+			warnings = append(warnings, warn)
+		}
+		if keep {
+			if itemCandidate.item != nil {
+				prepared[member.MediaItemID] = itemCandidate
+			}
+			accepted = append(accepted, member)
+		}
+	}
+	return accepted, prepared, warnings, nil
+}
+
 func (s *LibraryCollectionService) acceptCollectionItems(ctx context.Context, collection *models.LibraryCollection, matched []LibraryCollectionItemInput) ([]LibraryCollectionItemInput, []string, error) {
 	tracker, _ := ctx.Value(collectionVirtualCreationTrackerKey{}).(*collectionVirtualCreationTracker)
 	if tracker == nil {
 		return nil, nil, errors.New("collection sync preparation is missing")
 	}
 	if tracker.err != nil {
-		// Only collection-level preparation failures poison the run: release
-		// evidence that cannot be evaluated (fail closed) and canonical alias
-		// conflicts. A member's own provider or variant failure is a per-entry
-		// warning, recorded by the sync loop, so the remaining members still
-		// commit.
 		return nil, nil, tracker.err
 	}
-	prepared := make(map[string]preparedCollectionItem, len(matched))
-	accepted := make([]LibraryCollectionItemInput, 0, len(matched))
-	var acceptanceWarnings []string
+	var (
+		prepared           = make(map[string]preparedCollectionItem, len(matched))
+		accepted           = matched
+		acceptanceWarnings []string
+		err                error
+	)
 	if collection != nil && sourceEnablesVirtualPlayback(collection.SourceConfig) {
-		ids := make([]string, 0, len(matched))
-		for _, member := range matched {
-			ids = append(ids, member.MediaItemID)
-		}
-		rows, err := s.collections.pool.Query(ctx, `
-			SELECT DISTINCT mf.content_id FROM media_files mf
-			WHERE mf.content_id = ANY($1::text[])
-			  AND mf.container IS DISTINCT FROM 'virtual'
-			  AND mf.file_path NOT LIKE 'virtual://%'`, ids)
+		accepted, prepared, acceptanceWarnings, err = s.prepareVirtualAcceptanceMembers(ctx, collection, matched, tracker)
 		if err != nil {
 			return nil, nil, err
 		}
-		physical := make(map[string]bool)
-		for rows.Next() {
-			var id string
-			if err := rows.Scan(&id); err != nil {
-				rows.Close()
-				return nil, nil, err
-			}
-			physical[id] = true
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return nil, nil, err
-		}
-		for _, member := range matched {
-			if physical[member.MediaItemID] {
-				// Retained physical members still need ownership reconciliation
-				// against current target libraries. Defer to post-acceptance repair.
-				accepted = append(accepted, member)
-				continue
-			}
-			candidate, ok := tracker.items[member.MediaItemID]
-			if !ok {
-				item, err := s.items.GetByID(ctx, member.MediaItemID)
-				if err != nil {
-					return nil, nil, err
-				}
-				if _, err := s.EnsureCollectionItemMaterializedWithOptions(ctx, collection, item, VirtualMaterializeOptions{}); err != nil {
-					if tracker.err != nil {
-						return nil, nil, tracker.err
-					}
-					if errors.Is(err, ErrMemberVariantsUnavailable) {
-						hasState := false
-						if s.collections != nil && s.collections.pool != nil {
-							scanErr := s.collections.pool.QueryRow(ctx, `
-								SELECT EXISTS(
-									SELECT 1 FROM library_collection_items WHERE collection_id=$1 AND media_item_id=$2
-								) AND EXISTS(
-									SELECT 1 FROM virtual_media_source_claims WHERE source_key=$3 AND content_id=$2
-								)`, collection.ID, member.MediaItemID, "collection:"+collection.ID).Scan(&hasState)
-							if scanErr != nil {
-								return nil, nil, fmt.Errorf("checking resident collection item state: %w", scanErr)
-							}
-						}
-						warningMsg := fmt.Sprintf("materializing virtual item %q: %v", item.Title, err)
-						acceptanceWarnings = append(acceptanceWarnings, warningMsg)
-						if hasState {
-							slog.WarnContext(ctx, "failed to refresh resident virtual item during acceptance; preserving existing valid state",
-								"component", "catalog", "collection_id", collection.ID, "title", item.Title, "error", err)
-							accepted = append(accepted, member)
-						}
-						continue
-					}
-					return nil, nil, err
-				}
-				candidate = tracker.items[member.MediaItemID]
-			}
-			prepared[member.MediaItemID] = candidate
-			accepted = append(accepted, member)
-		}
-	} else {
-		accepted = append(accepted, matched...)
 	}
-
 	if len(accepted) == 0 && len(matched) > 0 {
 		return nil, nil, ErrProviderUnavailable
 	}
-
 	for i := range accepted {
 		accepted[i].Position = i
 	}
-
 	if collection != nil && s.collections != nil {
 		if err := s.collections.AcceptPreparedItems(ctx, collection, accepted, prepared, s.items); err != nil {
 			slog.WarnContext(ctx, "collection sync accept failed", "component", "catalog",
