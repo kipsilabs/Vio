@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -332,7 +331,6 @@ func (m *TranscodeManager) SwapTranscodeSession(sessionID string, successor *Tra
 	predecessor := m.transcodes[sessionID]
 	m.transcodes[sessionID] = successor
 	m.transcodeMu.Unlock()
-	debug.PrintStack()
 	return predecessor, true
 }
 
