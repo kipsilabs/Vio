@@ -10196,10 +10196,11 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		}
 	}
 	result.Plan.Stream.URL = transport.url
-	if result.Plan != nil && !transportReused {
+	if result.Plan != nil && !seekReanchor {
 		// Give each newly installed replan transport a unique plan ID that
 		// cannot be confused with an earlier installation, while preserving
-		// the canonical recipe attempt key for loop retirement.
+		// the canonical recipe attempt key for loop retirement. A seek reanchor
+		// continues the running plan verbatim and must keep its plan ID.
 		finalizeReplanPlanIdentityV3(result.Plan, record.PlaybackAttemptID, req.ReplanRequestID, start.ClientPlaybackContext.Output.OutputContextID)
 		artifactRecipe.PlanID = result.Plan.PlanID
 	}
@@ -10207,16 +10208,15 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	updated := *record
 	updated.CurrentPlanID = result.Plan.PlanID
 	updated.CurrentPlan = *result.Plan
-	// A seek reanchor that reuses the transport replays the durable recipe
-	// verbatim; a rebuilt seek or newly planned replan binds the frozen
-	// recipe to the final installed plan ID so ValidFor remains true.
-	if !seekReanchor || !transportReused {
+	// A seek reanchor replays the durable recipe verbatim; any other replan
+	// binds the frozen recipe to the final installed plan ID so ValidFor remains true.
+	if !seekReanchor {
 		updated.FrozenRecipe = artifactRecipe
 	}
 	updated.NormalizedRequest = start
 	updated.EffectiveMediaFileID = effectiveFile.ID
 	updated.ExpiresAt = time.Now().Add(playback.MaxTokenTTL)
-	updated.CurrentTransportRendered = transportReused && record.CurrentTransportRendered
+	updated.CurrentTransportRendered = (seekReanchor || transportReused) && record.CurrentTransportRendered
 	if transportReused {
 		if expiresAt, parseErr := time.Parse(time.RFC3339, result.Plan.ExpiresAt); parseErr == nil {
 			updated.ExpiresAt = expiresAt
