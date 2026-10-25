@@ -4619,6 +4619,34 @@ func TestCombineTransportErrorsV3KeepsAnyRetryableValidationFailure(t *testing.T
 	}
 }
 
+func TestPrepareTransportTimelineV3StartsTranscodeAtResumePosition(t *testing.T) {
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	handler.copySeekAnchor = func(context.Context, string, string, float64, int) (float64, int, error) {
+		return 0, 0, errors.New("copy anchor must not resolve an encoded transcode")
+	}
+	plan := &playback.PlanV3{
+		Delivery: playback.DeliveryTranscodeHLSV3,
+		Timeline: playback.TimelineV3{SourceStartSeconds: 870.6},
+	}
+	result := playback.PlannerResultV3{
+		Plan:             plan,
+		TargetVideoCodec: "h264",
+		FrozenSourceMetadata: &playback.SourceExecutionMetadataV3{
+			DurationSeconds: 3000,
+		},
+	}
+
+	timeline, timelineErr := handler.prepareTransportTimelineV3(context.Background(), &playback.Session{ID: "resume-start"}, &models.MediaFile{ID: 91, FilePath: "/media/episode.mkv"}, result)
+	if timelineErr != nil {
+		t.Fatalf("prepare timeline: %v", timelineErr)
+	}
+	// 870.6s aligned down to the 2s segment grid, with absolute segment
+	// numbering: the generation starts at 870s/segment 435, not at zero.
+	if timeline.seekSeconds != 870 || timeline.startSegmentNumber != 435 {
+		t.Fatalf("resume timeline = %#v, want seek 870s at segment 435", timeline)
+	}
+}
+
 func TestConfigureHLSTimelineV3MatchesTransportSeekSemantics(t *testing.T) {
 	// A copy remux streams FFmpeg's growing playlist, so its seek window must
 	// stay open-ended even though the runtime is known. A bounded window reads
