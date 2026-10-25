@@ -906,6 +906,31 @@ describe("useSubtitleTracks", () => {
     expect(result.current).toEqual([{ text: "paused cue" }]);
   });
 
+  it("re-reads the active cues when playback resumes", async () => {
+    fetchMock.mockResolvedValue(
+      vttResponse("WEBVTT\n\n00:00:10.000 --> 00:00:12.000\nresumed cue\n\n"),
+    );
+    const videoRef = makeVideoRef(1);
+    videoRef.current!.currentTime = 11;
+    const { result } = renderHook(() =>
+      useSubtitleTracks(videoRef, [srtTrack], 1, 0, 0, { current: 7200 }, { current: 0 }),
+    );
+
+    await waitFor(() => expect(result.current).toEqual([{ text: "resumed cue" }]));
+
+    // The browser dropped the active cue while paused: no cuechange fires, so
+    // the display clears on the pause refresh and stays empty.
+    videoRef.current!.currentTime = 0;
+    act(() => videoRef.current!.dispatchEvent(new Event("pause")));
+    expect(result.current).toEqual([]);
+
+    // Resuming inside the cue re-reads the track instead of waiting for a
+    // cuechange that may never come.
+    videoRef.current!.currentTime = 11;
+    act(() => videoRef.current!.dispatchEvent(new Event("play")));
+    expect(result.current).toEqual([{ text: "resumed cue" }]);
+  });
+
   it("carries cue placement through to the display objects", async () => {
     fetchMock.mockResolvedValue(
       vttResponse("WEBVTT\n\n00:00:10.000 --> 00:00:12.000 align:right line:50%\nmiddle right\n\n"),
