@@ -1396,6 +1396,31 @@ func TestPlanPlaybackV3DirectRequiresDetailedEvidence(t *testing.T) {
 	}
 }
 
+// Attempt history that already retired the source-preserving routes must not be
+// blamed on the source needing adaptation. The terminal is retryable and names
+// the exhausted history, while a first plan keeps transcoding_disabled.
+func TestPlanPlaybackV3RoutesExhaustedAfterAttemptHistory(t *testing.T) {
+	file := detailedFixtureFileV3()
+	req := validStartRequestV3()
+	req.ClientFeatures = append(req.ClientFeatures, FeatureLayoutPassthrough)
+	req.Capabilities.VideoDecode = nil
+	input := PlannerInputV3{Request: req, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0, Settings: PlannerSettingsV3{TranscodeEnabled: false, Allow4KTranscode: true}}
+
+	first := PlanPlaybackV3(input)
+	if first.Terminal == nil || first.Terminal.Reason != "transcoding_disabled" || first.Terminal.Retryable {
+		t.Fatalf("first plan = %s", ExplainPlannerResultV3(first))
+	}
+
+	input.AttemptedKeys = []string{"v3:0000000000000001"}
+	exhausted := PlanPlaybackV3(input)
+	if exhausted.Terminal == nil || exhausted.Terminal.Reason != TerminalRoutesExhaustedV3 || !exhausted.Terminal.Retryable {
+		t.Fatalf("after attempt history = %s", ExplainPlannerResultV3(exhausted))
+	}
+	if !strings.Contains(exhausted.Terminal.Message, "already tried") {
+		t.Fatalf("terminal message = %q, want the exhausted history named", exhausted.Terminal.Message)
+	}
+}
+
 func TestRouteVideoMetadataGapsDetailV3NamesMissingFields(t *testing.T) {
 	source := SourceDescriptorV3{Width: 1920, Height: 1080}
 	if got := routeVideoMetadataGapsDetailV3(source); got != "missing: video codec, bit depth, frame rate, bitrate" {

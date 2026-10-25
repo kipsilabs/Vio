@@ -1274,6 +1274,12 @@ func planVideoTranscodeV3(input PlannerInputV3, base PlanV3, source SourceDescri
 		if subtitleForcedAdaptation {
 			return terminalPlannerResultV3("subtitle_conversion_unsupported", "The selected subtitle must be burned into the video, but transcoding is unavailable.", false)
 		}
+		// Attempt history already retired at least one source-preserving route,
+		// so claiming the source itself needs adaptation misattributes the
+		// blocker. Name the exhausted routes and keep the terminal retryable.
+		if len(input.AttemptedKeys) > 0 {
+			return terminalPlannerResultV3(TerminalRoutesExhaustedV3, "Compatible playback routes were already tried; the remaining route requires video adaptation, but transcoding is unavailable.", true)
+		}
 		return terminalPlannerResultV3("transcoding_disabled", "The source requires video adaptation, but transcoding is unavailable.", false)
 	}
 	var hlsRegistry *TransformationRegistryV3
