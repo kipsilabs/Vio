@@ -1146,7 +1146,10 @@ For failure recovery, `attempted_plan_keys` is the loop guard. The client sends
 back every `plan_attempt_key` it has already tried for this attempt (up to 16);
 the server will not hand back a plan whose key is in that list. `attempt_count`
 (1–8) bounds the whole recovery chain. Together they mean a device that fails
-every route reaches a terminal instead of cycling forever.
+every route reaches a terminal instead of cycling forever. The one server-side
+exception is the progress-based reissue in §6.2: after an accepted progress
+sample the current route is reissued once with a new plan id and key, and the
+reissued transport's next failure consumes the ordinary `attempt_count` step.
 
 **Decode-rejection rotation.** A release whose video decoder rejects the source
 answers the HLS manifest and segment routes with `422` and
@@ -1625,6 +1628,21 @@ failure path, even when an earlier transport of the same viewing played: the
 new route may be one this client cannot reach. If that recovery then cannot
 reach the server, it joins the reconnect and continues the same budget.
 
+The server applies the same distinction from its own evidence when a client
+reports the loss through `failure_recovery` anyway. A failure recovery on an
+attempt whose durable progress shows at least one accepted sample
+(`LastSequence > 0`) keeps the route that just played eligible for one reissue:
+same delivery and recipe, with a fresh plan id and stream token. The recovery
+chain's `attempt_count` bounds it, so the reissued transport's next failure
+retires the route as usual. A failure with no progress sample keeps the
+ordinary ladder, and a classification that retires the whole delivery
+(`decoder_failure`, `decode_error`, `player_failure`, `http_failure`,
+`parser_failure`) is not reissued. If that history already excluded the
+source-preserving routes and only video adaptation remains while transcoding is
+disabled, the terminal is the retryable `routes_exhausted`;
+`transcoding_disabled` stays reserved for a first plan whose source really
+needs an encode.
+
 ### 6.3 `source_committed_event_v1` — the committed version is published at commit
 
 A serve-layer rotation can move a live session to a sibling release without ever
@@ -1780,14 +1798,17 @@ help. Delivered inside a `201` (start) or `200` (replan), never a 4xx.
 
 *Planner:* `adaptation_exhausted`, `adaptation_unavailable`,
 `client_hls_unsupported`, `conversion_tool_unavailable`,
-`hdr_transcode_unsupported`, `no_alternate_version`,
+`hdr_transcode_unsupported`, `no_alternate_version`, `routes_exhausted`,
 `source_metadata_incomplete`, `source_unavailable`, `source_unreadable`,
 `audio_conversion_unsupported`, `video_conversion_unsupported`,
 `dv_conversion_unsupported`, `transcoding_disabled`,
 `subtitle_conversion_unsupported`. `audio_conversion_unsupported` is not
 retryable when the selected audio track has no codec FFmpeg can name, and so
 no decoder: the planner refuses it before any route is tried, and choosing
-another track is the remedy. `source_metadata_incomplete` is retryable:
+another track is the remedy. `routes_exhausted` is retryable: attempt history
+already retired the source-preserving routes, so only an encode remained and
+transcoding is disabled. `transcoding_disabled` stays for a first plan whose
+source genuinely requires adaptation. `source_metadata_incomplete` is retryable:
 the file has not been probed yet or lacks a field a route needs.
 `source_unreadable` is not: ffprobe rejected the effective file (empty,
 corrupt, truncated) and it carries no stream metadata. The scanner and the

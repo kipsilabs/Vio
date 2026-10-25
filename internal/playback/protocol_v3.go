@@ -418,6 +418,13 @@ const (
 // administrator's local or remote per-stream bitrate limit for this version.
 const TerminalBitratePolicyUnavailableV3 = "bitrate_policy_unavailable"
 
+// TerminalRoutesExhaustedV3 reports that video adaptation is the only route
+// left after attempt history already retired the source-preserving routes, but
+// transcoding is unavailable. Unlike transcoding_disabled, a first plan never
+// reaches this reason: it names recovery history as the blocker, so retrying is
+// meaningful once the transient cause clears or the operator enables encoding.
+const TerminalRoutesExhaustedV3 = "routes_exhausted"
+
 type SubtitleModeV3 string
 
 const (
