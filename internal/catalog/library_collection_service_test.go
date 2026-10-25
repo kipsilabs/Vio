@@ -884,7 +884,7 @@ func TestAcceptPreparedItemsDisabledPlaybackClearsRetainedClaims(t *testing.T) {
 				return nil, errors.New("provider unavailable")
 			}
 			ctx = context.WithValue(ctx, collectionVirtualCreationTrackerKey{}, &collectionVirtualCreationTracker{})
-			if err := service.acceptCollectionItems(ctx, snapshot, []LibraryCollectionItemInput{{MediaItemID: "movie-accept-disabled", SourceRank: 7}}); err != nil {
+			if _, err := service.acceptCollectionItems(ctx, snapshot, []LibraryCollectionItemInput{{MediaItemID: "movie-accept-disabled", SourceRank: 7}}); err != nil {
 				t.Fatal(err)
 			}
 			var claims, fileClaims, members, files, owners int
@@ -1109,6 +1109,53 @@ func TestTMDBPresetSyncListFailureKeepsMembers(t *testing.T) {
 	}
 }
 
+// An existing virtual member whose provider variants fail to refresh transiently
+// must preserve its collection membership and source claims, while the other members
+// commit.
+func TestTMDBPresetSyncPreservesExistingMemberOnTransientFailure(t *testing.T) {
+	pool, ctx, service, collection := setupSkipUnresolvableSync(t)
+
+	// First sync succeeds for members 730002 and 730003.
+	if _, err := service.syncTMDBPresetCollection(ctx, collection, libraryCollectionSourceConfig{
+		Preset: "popular", MediaType: "movie", VirtualPlayback: true,
+	}, SyncCollectionOptions{SkipCollage: true}); err != nil {
+		t.Fatalf("first sync failed: %v", err)
+	}
+
+	// Now member 730002 is an existing member with files and claims.
+	// Next sync includes 730002 and 730003, but 730002's provider variant refresh fails.
+	service.TMDBCollections = &fakeTMDBPresetFetcher{entries: []TMDBCollectionEntry{
+		{ID: 730002, MediaType: "movie", Title: "Second Member", ReleaseDate: "2011-05-15"},
+		{ID: 730003, MediaType: "movie", Title: "Third Member", ReleaseDate: "2012-05-15"},
+	}}
+	service.VirtualVariants = func(_ context.Context, uri, _ string) ([]VirtualPlaybackVariant, error) {
+		if strings.Contains(uri, "730002") {
+			return nil, errors.New("provider connection refused")
+		}
+		return []VirtualPlaybackVariant{{OwnerInstallationID: 11, VirtualURI: uri}}, nil
+	}
+
+	run, err := service.syncTMDBPresetCollection(ctx, collection, libraryCollectionSourceConfig{
+		Preset: "popular", MediaType: "movie", VirtualPlayback: true,
+	}, SyncCollectionOptions{SkipCollage: true})
+	if err != nil {
+		t.Fatalf("sync failed: %v", err)
+	}
+	if run.Status != "warning" {
+		t.Fatalf("run status = %q, want warning", run.Status)
+	}
+	// Both members must remain in the collection.
+	members := collectCollectionMemberIDs(t, pool, ctx, collection.ID)
+	if len(members) != 2 || members[0] != "movie-tmdb-730002" || members[1] != "movie-tmdb-730003" {
+		t.Fatalf("members = %v, want both members preserved", members)
+	}
+	// 730002's claims must be preserved.
+	var claims int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM virtual_media_file_source_claims WHERE content_id='movie-tmdb-730002' AND source_key=$1`, "collection:"+collection.ID).Scan(&claims); err != nil || claims == 0 {
+		t.Fatalf("existing member claims lost: claims=%d err=%v", claims, err)
+	}
+}
+
 func TestMaterializeVirtualPlaybackPropagatesError(t *testing.T) {
 	service := &LibraryCollectionService{
 		VirtualVariants: func(_ context.Context, _, _ string) ([]VirtualPlaybackVariant, error) {
@@ -1248,7 +1295,7 @@ func TestCollectionAcceptanceBlocksAliasAttachedAfterPreparation(t *testing.T) {
 	}
 	// Acceptance must refuse the stale preparation with a retryable
 	// conflict rather than deciding on the changed alias set.
-	err = service.acceptCollectionItems(prepCtx, collection, []LibraryCollectionItemInput{{MediaItemID: movieID}})
+	_, err = service.acceptCollectionItems(prepCtx, collection, []LibraryCollectionItemInput{{MediaItemID: movieID}})
 	if err == nil || !errors.Is(err, ErrReleaseOverrideConflict) && !strings.Contains(err.Error(), "alias set changed") {
 		t.Fatalf("acceptance missed the attached alias: %v", err)
 	}
@@ -1395,7 +1442,8 @@ func TestMultiItemAcceptanceCompletesWithConcurrentOverrideMutation(t *testing.T
 	mutateDone := make(chan error, 3)
 	go func() {
 		<-start
-		acceptDone <- service.acceptCollectionItems(prepCtx, collection, []LibraryCollectionItemInput{{MediaItemID: movieA}, {MediaItemID: movieB}})
+		_, acceptErr := service.acceptCollectionItems(prepCtx, collection, []LibraryCollectionItemInput{{MediaItemID: movieA}, {MediaItemID: movieB}})
+		acceptDone <- acceptErr
 	}()
 	for i := 0; i < 3; i++ {
 		go func() {
@@ -1544,7 +1592,7 @@ func TestCollectionAcceptanceConflictsOnRemovedPermittingAlias(t *testing.T) {
 		DELETE FROM media_item_provider_ids WHERE content_id='`+movieID+`' AND provider='imdb'`); err != nil {
 		t.Fatalf("remove mistaken alias: %v", err)
 	}
-	err = service.acceptCollectionItems(prepCtx, collection, []LibraryCollectionItemInput{{MediaItemID: movieID}})
+	_, err = service.acceptCollectionItems(prepCtx, collection, []LibraryCollectionItemInput{{MediaItemID: movieID}})
 	if err == nil || !errors.Is(err, ErrReleaseOverrideConflict) && !strings.Contains(err.Error(), "alias set changed") {
 		t.Fatalf("acceptance used the removed alias: %v", err)
 	}
