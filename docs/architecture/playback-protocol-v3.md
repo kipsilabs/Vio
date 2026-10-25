@@ -665,7 +665,10 @@ carrying the validated claim `client_managed_dynamic_range_v1` asserts that its
 executor accepts the declared source range and resolves presentation against
 the live output after receiving the original bytes. The planner may therefore
 deliver HDR or Dolby Vision through that class even when the active sink does
-not natively advertise the source range.
+not natively advertise the source range. For Dolby Vision, the source must
+carry a cross-compatible base layer (compatibility IDs 1, 2, 4, or 6). Sources
+without a decodable base layer (such as Profile 5 or unknown compatibility IDs)
+fail this gate and fall through to routes that carry a validated range.
 
 The narrower claim `client_dv8_base_layer_fallback_v1`, also `original_http`
 only, asserts that the executor decodes a single-layer Dolby Vision Profile 8
