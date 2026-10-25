@@ -803,7 +803,6 @@ func (s *MemoryPlanStoreV3) CompleteReplan(_ context.Context, sessionID, request
 	// same way.
 	record.RecoveryState, record.RecoveryRevision = existing.RecoveryState, existing.RecoveryRevision
 	record.LastSequence, record.LastSample, record.StoppedAt, record.StopID = existing.LastSequence, existing.LastSample, existing.StoppedAt, existing.StopID
-	record.CurrentTransportRendered = false
 	s.attempts[attemptID] = record
 	return nil
 }

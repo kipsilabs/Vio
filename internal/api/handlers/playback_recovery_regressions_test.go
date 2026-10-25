@@ -687,3 +687,76 @@ func TestHandleReplanPlaybackV3ReplanFailsWithIncompleteHistory(t *testing.T) {
 		t.Fatalf("incomplete history must not reselect failed recipe, got: %#v", failResp)
 	}
 }
+
+// End-to-end lifecycle regression covering: first frame -> successful seek reanchor -> connectivity failure.
+// Preserves rendered evidence when the existing transport is actually retained across seek.
+func TestHandleReplanPlaybackV3FirstFrameSeekReissueLifecycle(t *testing.T) {
+	handler := newProgressReissueHandlerV3(t)
+	started, startRequest := progressReissueStartV3(t, handler)
+	applyReplanProgressV3(t, handler, started.SessionID)
+	applyReplanFirstFrameV3(t, handler, started.SessionID, startRequest.PlaybackAttemptID, started.PlaybackPlan.PlanID, started.PlaybackPlan.PlanAttemptKey)
+
+	// Verify attempt has CurrentTransportRendered = true
+	rec, err := handler.PlanStoreV3.GetAttempt(context.Background(), started.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rec.CurrentTransportRendered {
+		t.Fatal("expected CurrentTransportRendered to be true after first_frame event")
+	}
+
+	// 1. Viewer seeks (seek_reanchor within active window retains the transport).
+	seekReq := playback.ReplanRequestV3{
+		ProtocolVersion:       playback.ProtocolV3,
+		Operation:             playback.ReplanOperationSeekReanchorV3,
+		PlaybackAttemptID:     startRequest.PlaybackAttemptID,
+		ReplanRequestID:       "replan-seek-001",
+		FailedPlanID:          started.PlaybackPlan.PlanID,
+		PlanAttemptID:         "plan-attempt-seek-001",
+		PlanAttemptKey:        started.PlaybackPlan.PlanAttemptKey,
+		AttemptCount:          1,
+		PositionSeconds:       20,
+		SelectedTracks:        started.PlaybackPlan.SelectedTracks,
+		Capabilities:          startRequest.Capabilities,
+		ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	}
+	seekResp := postPlaybackReplanV3(t, handler, started.SessionID, seekReq)
+	if seekResp.Outcome != playback.OutcomePlayableV3 || seekResp.PlaybackPlan == nil {
+		t.Fatalf("seek reanchor failed: %#v", seekResp)
+	}
+
+	// Verify rendered evidence was preserved across the retained transport.
+	recAfterSeek, err := handler.PlanStoreV3.GetAttempt(context.Background(), started.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !recAfterSeek.CurrentTransportRendered {
+		t.Fatal("expected CurrentTransportRendered to be preserved across retained seek transport")
+	}
+
+	// 2. Network connectivity failure occurs on the seeked stream.
+	recoveryReq := playback.ReplanRequestV3{
+		ProtocolVersion:       playback.ProtocolV3,
+		Operation:             playback.ReplanOperationFailureRecoveryV3,
+		PlaybackAttemptID:     startRequest.PlaybackAttemptID,
+		ReplanRequestID:       "replan-recovery-after-seek",
+		FailedPlanID:          seekResp.PlaybackPlan.PlanID,
+		PlanAttemptID:         "plan-attempt-rec-seek",
+		PlanAttemptKey:        seekResp.PlaybackPlan.PlanAttemptKey,
+		AttemptedPlanKeys:     []string{seekResp.PlaybackPlan.PlanAttemptKey},
+		AttemptCount:          1,
+		PositionSeconds:       20,
+		Failure:               playback.FailureV3{Classification: "transport_stall"},
+		SelectedTracks:        seekResp.PlaybackPlan.SelectedTracks,
+		Capabilities:          startRequest.Capabilities,
+		ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	}
+	reissueResp := postPlaybackReplanV3(t, handler, started.SessionID, recoveryReq)
+	// Because rendered evidence was preserved, the working recipe is reissued!
+	if reissueResp.Outcome != playback.OutcomePlayableV3 || reissueResp.PlaybackPlan == nil {
+		t.Fatalf("expected playable reissue after seek network failure, got: %#v", reissueResp)
+	}
+	if reissueResp.PlaybackPlan.PlanAttemptKey != seekResp.PlaybackPlan.PlanAttemptKey {
+		t.Fatalf("reissued attempt key %q does not match seek attempt key %q", reissueResp.PlaybackPlan.PlanAttemptKey, seekResp.PlaybackPlan.PlanAttemptKey)
+	}
+}

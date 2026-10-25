@@ -10219,6 +10219,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	updated.NormalizedRequest = start
 	updated.EffectiveMediaFileID = effectiveFile.ID
 	updated.ExpiresAt = time.Now().Add(playback.MaxTokenTTL)
+	updated.CurrentTransportRendered = (seekReanchor || transportReused) && record.CurrentTransportRendered
 	if transportReused {
 		if expiresAt, parseErr := time.Parse(time.RFC3339, result.Plan.ExpiresAt); parseErr == nil {
 			updated.ExpiresAt = expiresAt

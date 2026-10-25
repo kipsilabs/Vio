@@ -537,9 +537,9 @@ func (s *Postgres) CompleteReplan(ctx context.Context, sessionID, requestID, lea
 			effective_media_file_id = $2, current_plan_id = $3,
 			current_replan_request_id = $4, current_plan = $5, frozen_recipe = $6,
 			normalized_request = $7, start_response = $8, expires_at = $9,
-			stream_reissues = $11, current_transport_rendered = false, updated_at = NOW()
+			stream_reissues = $11, current_transport_rendered = $12, updated_at = NOW()
 		WHERE session_id = $1::uuid AND current_replan_request_id = $10 AND stopped_at IS NULL`,
-		sessionID, record.EffectiveMediaFileID, record.CurrentPlanID, record.CurrentReplanRequestID, planJSON, recipeJSON, requestJSON, startResponseJSON, record.ExpiresAt, baseReplanRequestID, record.StreamReissues)
+		sessionID, record.EffectiveMediaFileID, record.CurrentPlanID, record.CurrentReplanRequestID, planJSON, recipeJSON, requestJSON, startResponseJSON, record.ExpiresAt, baseReplanRequestID, record.StreamReissues, record.CurrentTransportRendered)
 	if err != nil {
 		return err
 	}
