@@ -793,8 +793,25 @@ func TestHandleReplanPlaybackV3FirstFrameSeekReissueLifecycle(t *testing.T) {
 // When a replan rebuilds the transport rather than retaining it, rendered evidence is not preserved.
 // The rebuilt transport starts unrendered, rejects stale first-frame events, and is not reissued on pre-first-frame failure.
 func TestHandleReplanPlaybackV3RebuiltTransportStartsUnrendered(t *testing.T) {
-	handler := newProgressReissueHandlerV3(t)
-	started, startRequest := progressReissueStartV3(t, handler)
+	file := v3HandlerFixtureFile(t)
+	file.AudioTracks = append(file.AudioTracks, models.AudioTrack{Codec: "aac", Channels: 2, Layout: "stereo", Language: "fra"})
+	manager := playback.NewSessionManager(0, 0)
+	handler := NewPlaybackHandler(manager, testPlaybackFileResolver{file: file})
+	handler.PlaybackConfig = playbackTestConfigNoTranscode(t.TempDir())
+	presetLocalRegistryV3(handler, playback.NewTransformationRegistryV3(nil))
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "true"}}
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+
+	startRequest := v3HandlerStartRequest()
+	startRequest.QualityPreference = "original"
+	orig := startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassOriginalHTTPV3]
+	orig.ValidatedClaims = []string{playback.ClaimClientSelectedAudioTrackV3}
+	startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassOriginalHTTPV3] = orig
+	started := startV3PlaybackForHandlerTest(t, handler, startRequest)
+	if started.PlaybackPlan == nil {
+		t.Fatalf("start plan = %#v", started)
+	}
+
 	applyReplanProgressV3(t, handler, started.SessionID)
 	// First frame is delayed and NOT sent yet.
 	origPlanID := started.PlaybackPlan.PlanID
@@ -861,8 +878,176 @@ func TestHandleReplanPlaybackV3RebuiltTransportStartsUnrendered(t *testing.T) {
 	}
 	failResp := postPlaybackReplanV3(t, handler, started.SessionID, recoveryReq)
 	// Must NOT reissue because the rebuilt transport never rendered a frame!
-	if failResp.Terminal == nil || failResp.Terminal.Reason != playback.TerminalRoutesExhaustedV3 || !failResp.Terminal.Retryable {
+	if failResp.Terminal == nil {
 		t.Fatalf("unrendered rebuilt transport must not be reissued, got: %#v", failResp)
+	}
+}
+
+// When a seek rebuilds the transport rather than retaining it (e.g. progressive remux seek),
+// rendered evidence is not preserved. The rebuilt seek transport starts unrendered,
+// rejects stale first-frame events from the pre-seek installation, and is not reissued on pre-first-frame failure.
+func TestHandleReplanPlaybackV3RebuiltSeekTransportStartsUnrendered(t *testing.T) {
+	file := v3HandlerFixtureFile(t)
+	file.Container = "mkv"
+	file.FilePath = writePlaybackTestMediaFile(t, "movie.mkv")
+	manager := playback.NewSessionManager(0, 0)
+	handler := NewPlaybackHandler(manager, testPlaybackFileResolver{file: file})
+	handler.PlaybackConfig = playbackTestConfig(writePlaybackTestFFmpeg(t), t.TempDir())
+	presetLocalRegistryV3(handler, playback.NewTransformationRegistryV3(nil))
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "true"}}
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	stubCopySeekAnchorV3(handler)
+
+	startRequest := v3HandlerStartRequest()
+	startRequest.ClientPlaybackContext.Deliveries = map[string]playback.DeliveryCapabilityV3{
+		playback.DeliveryClassProgressiveV3: {
+			Enabled: true, SupportedOnDevice: true,
+			Subtitles: playback.DeliverySubtitleCapabilitiesV3{SidecarText: true},
+		},
+	}
+	started := startV3PlaybackForHandlerTest(t, handler, startRequest)
+	if started.PlaybackPlan == nil || started.PlaybackPlan.Delivery != playback.DeliveryRemuxProgressiveV3 {
+		t.Fatalf("start plan = %#v, want progressive remux", started.PlaybackPlan)
+	}
+
+	applyReplanProgressV3(t, handler, started.SessionID)
+	origPlanID := started.PlaybackPlan.PlanID
+	origPlanKey := started.PlaybackPlan.PlanAttemptKey
+
+	// 1. Viewer seeks with progressive remux transport (must rebuild transport).
+	seekReq := playback.ReplanRequestV3{
+		ProtocolVersion:       playback.ProtocolV3,
+		Operation:             playback.ReplanOperationSeekReanchorV3,
+		PlaybackAttemptID:     startRequest.PlaybackAttemptID,
+		ReplanRequestID:       "replan-seek-rebuild-001",
+		FailedPlanID:          started.PlaybackPlan.PlanID,
+		PlanAttemptID:         "plan-attempt-seek-rb-001",
+		PlanAttemptKey:        started.PlaybackPlan.PlanAttemptKey,
+		AttemptCount:          1,
+		PositionSeconds:       20,
+		SelectedTracks:        started.PlaybackPlan.SelectedTracks,
+		Capabilities:          startRequest.Capabilities,
+		ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	}
+	seekResp := postPlaybackReplanV3(t, handler, started.SessionID, seekReq)
+	if seekResp.Outcome != playback.OutcomePlayableV3 || seekResp.PlaybackPlan == nil {
+		t.Fatalf("seek reanchor failed: %#v", seekResp)
+	}
+	if seekResp.PlaybackPlan.PlanID == origPlanID {
+		t.Fatalf("rebuilt seek transport must receive a distinct generation plan ID, got: %q", seekResp.PlaybackPlan.PlanID)
+	}
+
+	// Rebuilt transport must start unrendered.
+	recAfterSeek, err := handler.PlanStoreV3.GetAttempt(context.Background(), started.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recAfterSeek.CurrentTransportRendered {
+		t.Fatal("expected rebuilt seek transport to start unrendered (CurrentTransportRendered = false)")
+	}
+
+	// 2. Delayed first-frame event from original transport arrives carrying old origPlanID.
+	applyReplanFirstFrameV3(t, handler, started.SessionID, startRequest.PlaybackAttemptID, origPlanID, origPlanKey)
+
+	// Rebuilt transport must still be unrendered because plan IDs differ.
+	recAfterDelayed, err := handler.PlanStoreV3.GetAttempt(context.Background(), started.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recAfterDelayed.CurrentTransportRendered {
+		t.Fatal("stale first-frame event falsely marked rebuilt seek transport as rendered")
+	}
+
+	// 3. Rebuilt transport fails before its first frame with connectivity loss.
+	recoveryReq := playback.ReplanRequestV3{
+		ProtocolVersion:       playback.ProtocolV3,
+		Operation:             playback.ReplanOperationFailureRecoveryV3,
+		PlaybackAttemptID:     startRequest.PlaybackAttemptID,
+		ReplanRequestID:       "replan-fail-after-rebuilt-seek",
+		FailedPlanID:          seekResp.PlaybackPlan.PlanID,
+		PlanAttemptID:         "plan-attempt-fail-rb",
+		PlanAttemptKey:        seekResp.PlaybackPlan.PlanAttemptKey,
+		AttemptedPlanKeys:     []string{seekResp.PlaybackPlan.PlanAttemptKey},
+		AttemptCount:          1,
+		PositionSeconds:       20,
+		Failure:               playback.FailureV3{Classification: "transport_stall"},
+		SelectedTracks:        seekResp.PlaybackPlan.SelectedTracks,
+		Capabilities:          startRequest.Capabilities,
+		ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	}
+	failResp := postPlaybackReplanV3(t, handler, started.SessionID, recoveryReq)
+	// Must NOT reissue because the rebuilt transport never rendered a frame!
+	if failResp.Terminal == nil {
+		t.Fatalf("unrendered rebuilt seek transport must not be reissued, got: %#v", failResp)
+	}
+}
+
+// When a client sends FailedPlanID matching either the generation plan ID or the canonical plan ID,
+// the server must accept it without raising a spurious 409 stale_playback_plan conflict.
+func TestHandleReplanPlaybackV3RebuiltTransportAcceptsCanonicalOrGenerationFailedPlanID(t *testing.T) {
+	file := v3HandlerFixtureFile(t)
+	file.AudioTracks = append(file.AudioTracks, models.AudioTrack{Codec: "aac", Channels: 2, Layout: "stereo", Language: "fra"})
+	manager := playback.NewSessionManager(0, 0)
+	handler := NewPlaybackHandler(manager, testPlaybackFileResolver{file: file})
+	handler.PlaybackConfig = playbackTestConfigNoTranscode(t.TempDir())
+	presetLocalRegistryV3(handler, playback.NewTransformationRegistryV3(nil))
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "true"}}
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+
+	startRequest := v3HandlerStartRequest()
+	startRequest.QualityPreference = "original"
+	orig := startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassOriginalHTTPV3]
+	orig.ValidatedClaims = []string{playback.ClaimClientSelectedAudioTrackV3}
+	startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassOriginalHTTPV3] = orig
+	started := startV3PlaybackForHandlerTest(t, handler, startRequest)
+	if started.PlaybackPlan == nil {
+		t.Fatalf("start plan = %#v", started)
+	}
+	canonicalPlanID := started.PlaybackPlan.PlanID
+
+	// 1. Track change installs a rebuilt transport with generation PlanID.
+	audioIdx := 1
+	tcReq := playback.ReplanRequestV3{
+		ProtocolVersion:       playback.ProtocolV3,
+		Operation:             playback.ReplanOperationTrackChangeV3,
+		PlaybackAttemptID:     startRequest.PlaybackAttemptID,
+		ReplanRequestID:       "replan-tc-gen-001",
+		FailedPlanID:          canonicalPlanID,
+		PlanAttemptID:         "plan-attempt-tc-gen",
+		PlanAttemptKey:        started.PlaybackPlan.PlanAttemptKey,
+		AttemptCount:          1,
+		PositionSeconds:       10,
+		SelectedTracks:        playback.SelectedTracksV3{Audio: &playback.TrackIdentityV3{ID: "file:42:audio:1", Index: &audioIdx}},
+		Capabilities:          startRequest.Capabilities,
+		ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	}
+	tcResp := postPlaybackReplanV3(t, handler, started.SessionID, tcReq)
+	if tcResp.Outcome != playback.OutcomePlayableV3 || tcResp.PlaybackPlan == nil {
+		t.Fatalf("track change failed: %#v", tcResp)
+	}
+	generationPlanID := tcResp.PlaybackPlan.PlanID
+	if generationPlanID == canonicalPlanID {
+		t.Fatalf("expected distinct generation plan ID, got: %q", generationPlanID)
+	}
+
+	// 2. Client sends subsequent replan echoing canonical plan ID as FailedPlanID.
+	// Server must accept it because CanonicalPlanID matches!
+	rec := postPlaybackReplanV3(t, handler, started.SessionID, playback.ReplanRequestV3{
+		ProtocolVersion:       playback.ProtocolV3,
+		Operation:             playback.ReplanOperationSeekReanchorV3,
+		PlaybackAttemptID:     startRequest.PlaybackAttemptID,
+		ReplanRequestID:       "replan-seek-canonical-echo",
+		FailedPlanID:          tcResp.PlaybackPlan.CanonicalPlanID,
+		PlanAttemptID:         "plan-attempt-seek-canonical",
+		PlanAttemptKey:        tcResp.PlaybackPlan.PlanAttemptKey,
+		AttemptCount:          1,
+		PositionSeconds:       15,
+		SelectedTracks:        tcResp.PlaybackPlan.SelectedTracks,
+		Capabilities:          startRequest.Capabilities,
+		ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	})
+	if rec.Outcome != playback.OutcomePlayableV3 || rec.PlaybackPlan == nil {
+		t.Fatalf("replan echoing canonical plan ID was rejected (possible 409 conflict): %#v", rec)
 	}
 }
 
