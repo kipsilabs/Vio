@@ -7651,8 +7651,7 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 			slog.ErrorContext(r.Context(), "protocol v3 replan lease release failed", "component", "api", "session", sessionID, "replan_request_id", req.ReplanRequestID, "error", err)
 		}
 	}()
-	if record.CurrentPlanID != req.FailedPlanID &&
-		(record.CurrentPlan.CanonicalPlanID == "" || record.CurrentPlan.CanonicalPlanID != req.FailedPlanID) {
+	if record.CurrentPlanID != req.FailedPlanID {
 		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusConflict, "stale_playback_plan", "The failed plan is no longer current")
 	}
 	// The replan budget must cover the declared virtual resolution budgets

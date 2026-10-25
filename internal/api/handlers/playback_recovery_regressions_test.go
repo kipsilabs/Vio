@@ -2,7 +2,11 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/Silo-Server/silo-server/internal/models"
@@ -982,72 +986,55 @@ func TestHandleReplanPlaybackV3RebuiltSeekTransportStartsUnrendered(t *testing.T
 	}
 }
 
-// When a client sends FailedPlanID matching either the generation plan ID or the canonical plan ID,
-// the server must accept it without raising a spurious 409 stale_playback_plan conflict.
-func TestHandleReplanPlaybackV3RebuiltTransportAcceptsCanonicalOrGenerationFailedPlanID(t *testing.T) {
-	file := v3HandlerFixtureFile(t)
-	file.AudioTracks = append(file.AudioTracks, models.AudioTrack{Codec: "aac", Channels: 2, Layout: "stereo", Language: "fra"})
-	manager := playback.NewSessionManager(0, 0)
-	handler := NewPlaybackHandler(manager, testPlaybackFileResolver{file: file})
-	handler.PlaybackConfig = playbackTestConfigNoTranscode(t.TempDir())
-	presetLocalRegistryV3(handler, playback.NewTransformationRegistryV3(nil))
-	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "true"}}
-	handler.ItemAccess = allowAllPlaybackItemAccess{}
+// Delayed failure from an initial plan arriving after a same-recipe reissue must fail with 409 stale_playback_plan
+// and must NOT modify the current reissued plan.
+func TestHandleReplanPlaybackV3DelayedPredecessorFailureFailsStale(t *testing.T) {
+	handler := newProgressReissueHandlerV3(t)
+	started, startRequest := progressReissueStartV3(t, handler)
+	applyReplanProgressV3(t, handler, started.SessionID)
+	applyReplanFirstFrameV3(t, handler, started.SessionID, startRequest.PlaybackAttemptID, started.PlaybackPlan.PlanID, started.PlaybackPlan.PlanAttemptKey)
 
-	startRequest := v3HandlerStartRequest()
-	startRequest.QualityPreference = "original"
-	orig := startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassOriginalHTTPV3]
-	orig.ValidatedClaims = []string{playback.ClaimClientSelectedAudioTrackV3}
-	startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassOriginalHTTPV3] = orig
-	started := startV3PlaybackForHandlerTest(t, handler, startRequest)
-	if started.PlaybackPlan == nil {
-		t.Fatalf("start plan = %#v", started)
-	}
-	canonicalPlanID := started.PlaybackPlan.PlanID
+	initialPlanID := started.PlaybackPlan.PlanID
 
-	// 1. Track change installs a rebuilt transport with generation PlanID.
-	audioIdx := 1
-	tcReq := playback.ReplanRequestV3{
-		ProtocolVersion:       playback.ProtocolV3,
-		Operation:             playback.ReplanOperationTrackChangeV3,
-		PlaybackAttemptID:     startRequest.PlaybackAttemptID,
-		ReplanRequestID:       "replan-tc-gen-001",
-		FailedPlanID:          canonicalPlanID,
-		PlanAttemptID:         "plan-attempt-tc-gen",
-		PlanAttemptKey:        started.PlaybackPlan.PlanAttemptKey,
-		AttemptCount:          1,
-		PositionSeconds:       10,
-		SelectedTracks:        playback.SelectedTracksV3{Audio: &playback.TrackIdentityV3{ID: "file:42:audio:1", Index: &audioIdx}},
-		Capabilities:          startRequest.Capabilities,
-		ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	// 1. Same-recipe reissue succeeds after connectivity loss.
+	recoveryReq := progressReissueRequestV3(started, startRequest, "replan-initial-reissue", 1, []string{started.PlaybackPlan.PlanAttemptKey})
+	reissuedResp := postPlaybackReplanV3(t, handler, started.SessionID, recoveryReq)
+	if reissuedResp.Outcome != playback.OutcomePlayableV3 || reissuedResp.PlaybackPlan == nil {
+		t.Fatalf("expected playable reissue, got: %#v", reissuedResp)
 	}
-	tcResp := postPlaybackReplanV3(t, handler, started.SessionID, tcReq)
-	if tcResp.Outcome != playback.OutcomePlayableV3 || tcResp.PlaybackPlan == nil {
-		t.Fatalf("track change failed: %#v", tcResp)
-	}
-	generationPlanID := tcResp.PlaybackPlan.PlanID
-	if generationPlanID == canonicalPlanID {
-		t.Fatalf("expected distinct generation plan ID, got: %q", generationPlanID)
+	currentGenerationPlanID := reissuedResp.PlaybackPlan.PlanID
+	if currentGenerationPlanID == initialPlanID {
+		t.Fatalf("reissued plan ID %q must differ from initial plan ID %q", currentGenerationPlanID, initialPlanID)
 	}
 
-	// 2. Client sends subsequent replan echoing canonical plan ID as FailedPlanID.
-	// Server must accept it because CanonicalPlanID matches!
-	rec := postPlaybackReplanV3(t, handler, started.SessionID, playback.ReplanRequestV3{
-		ProtocolVersion:       playback.ProtocolV3,
-		Operation:             playback.ReplanOperationSeekReanchorV3,
-		PlaybackAttemptID:     startRequest.PlaybackAttemptID,
-		ReplanRequestID:       "replan-seek-canonical-echo",
-		FailedPlanID:          tcResp.PlaybackPlan.CanonicalPlanID,
-		PlanAttemptID:         "plan-attempt-seek-canonical",
-		PlanAttemptKey:        tcResp.PlaybackPlan.PlanAttemptKey,
-		AttemptCount:          1,
-		PositionSeconds:       15,
-		SelectedTracks:        tcResp.PlaybackPlan.SelectedTracks,
-		Capabilities:          startRequest.Capabilities,
-		ClientPlaybackContext: startRequest.ClientPlaybackContext,
-	})
-	if rec.Outcome != playback.OutcomePlayableV3 || rec.PlaybackPlan == nil {
-		t.Fatalf("replan echoing canonical plan ID was rejected (possible 409 conflict): %#v", rec)
+	// 2. Delayed failure from the initial installation arrives with FailedPlanID = initialPlanID and a new request ID.
+	delayedReq := progressReissueRequestV3(started, startRequest, "replan-delayed-old-fail", 1, []string{started.PlaybackPlan.PlanAttemptKey})
+	delayedReq.FailedPlanID = initialPlanID
+
+	body, err := json.Marshal(delayedReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/"+started.SessionID+"/replan", strings.NewReader(string(body))).WithContext(newAuthorizedPlaybackContext())
+	req = withPlaybackRouteParam(req, "session_id", started.SessionID)
+	rr := httptest.NewRecorder()
+	handler.HandleReplanPlaybackV3(rr, req)
+
+	// Server must reject with 409 StatusConflict and stale_playback_plan!
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("replan status = %d, want 409 conflict, body: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "stale_playback_plan") {
+		t.Fatalf("expected error stale_playback_plan, got: %s", rr.Body.String())
+	}
+
+	// 3. Verify current plan is completely unchanged.
+	rec, err := handler.PlanStoreV3.GetAttempt(context.Background(), started.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.CurrentPlanID != currentGenerationPlanID {
+		t.Fatalf("current plan ID was modified: %q != %q", rec.CurrentPlanID, currentGenerationPlanID)
 	}
 }
 
