@@ -2178,8 +2178,9 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 			// replacement belonging to another session. Refuse the replay as a
 			// retryable terminal so the client mints a fresh attempt id; the
 			// replan path guards the same invariant in
-			// completedReplanResponseMatchesAttemptV3.
-			return playback.NewTerminalResponseV3("session_expired", "The playback plan for this attempt does not belong to its session.", true), nil
+			// completedReplanResponseMatchesAttemptV3. The two concurrent
+			// start-recovery branches apply the same guard.
+			return foreignAttemptSessionDecisionV3(), nil
 		}
 		if existing.StoppedAt != nil {
 			return playback.NewTerminalResponseV3("session_expired", "The playback session for this attempt has ended.", true), nil
@@ -3842,7 +3843,19 @@ func (h *PlaybackHandler) startPlannedPlaybackV3(r *http.Request, userID int, pr
 				if _, sessionErr := h.sessionMgr.GetSession(existing.SessionID); sessionErr != nil {
 					return playback.DecisionResponseV3{}, &transportErrorV3{reason: "session_expired", message: "The playback session for this attempt has ended.", retryable: true}
 				}
-				return decisionResponseFromAttemptV3(existing), nil
+				// The losing request has already rolled its own session back
+				// above. A durable decision that names another session is not
+				// this attempt's plan to replay: refuse it as the retryable
+				// terminal the ordinary replay path returns, so the client
+				// mints a fresh attempt instead of adopting a plan that the
+				// transport guard would reject as belonging to another session.
+				// A stored terminal publishes no plan and replays as-is, the
+				// same ordering the ordinary replay path uses.
+				existingResponse := decisionResponseFromAttemptV3(existing)
+				if existingResponse.Terminal == nil && !startReplayResponseBelongsToAttemptV3(existingResponse, existing) {
+					return foreignAttemptSessionDecisionV3(), nil
+				}
+				return existingResponse, nil
 			}
 			if errors.Is(err, playback.ErrIdempotencyKeyReusedV3) {
 				return playback.DecisionResponseV3{}, &transportErrorV3{reason: "playback_attempt_reused", message: "The playback attempt ID was reused with different input."}
@@ -13050,6 +13063,15 @@ func (h *PlaybackHandler) persistTerminalStartDecisionV3(ctx context.Context, us
 		if err := requireAttemptAPISurfaceV3(ctx, existing, req.ClientFeatures); err != nil {
 			return playback.DecisionResponseV3{}, err
 		}
+		// A playable winner is only replayable while the durable decision
+		// describes the session the attempt owns. A record left describing
+		// another session by a mixed-version or partially applied writer must
+		// not hand the losing request a plan it can never stream; refuse it as
+		// a retryable terminal so the client mints a fresh attempt, exactly as
+		// the ordinary start-replay path does.
+		if !startReplayResponseBelongsToAttemptV3(existingResponse, existing) {
+			return foreignAttemptSessionDecisionV3(), nil
+		}
 	}
 	// A publication failure can leave a durable attempt whose session was
 	// aborted. A terminal-save collision must not resurrect that playable plan.
@@ -13108,6 +13130,15 @@ func startReplayResponseBelongsToAttemptV3(response playback.DecisionResponseV3,
 	return response.PlaybackPlan == nil || response.PlaybackPlan.SessionID == record.SessionID
 }
 
+// foreignAttemptSessionDecisionV3 is the retryable terminal every cached start
+// replay returns when the durable decision names a session other than the one
+// its attempt owns. Terminals are session-less, so the client rebuilds from
+// this decision and mints a fresh playback attempt instead of adopting a plan
+// the transport guard would reject as belonging to another session.
+func foreignAttemptSessionDecisionV3() playback.DecisionResponseV3 {
+	return playback.NewTerminalResponseV3("session_expired", "The playback plan for this attempt does not belong to its session.", true)
+}
+
 func normalizeDecisionResponseV3(response playback.DecisionResponseV3) playback.DecisionResponseV3 {
 	if response.ServerFeatures == nil {
 		response.ServerFeatures = playback.ServerFeaturesV3()
@@ -13150,8 +13181,11 @@ func completedReplanResponseMatchesAttemptV3(raw json.RawMessage, record *playba
 	}
 	if response.PlaybackPlan == nil {
 		// Terminal responses deliberately leave the attempt plan untouched. Their
-		// freshness is carried by CurrentReplanRequestID (and its DB trigger).
-		return response.Terminal != nil
+		// freshness is carried by CurrentReplanRequestID (and its DB trigger). A
+		// terminal is session-less by construction; one that names another
+		// session was written by a different attempt and must not be replayed
+		// across the session boundary either.
+		return response.Terminal != nil && (response.SessionID == "" || response.SessionID == record.SessionID)
 	}
 	if response.SessionID != record.SessionID || response.PlaybackPlan.SessionID != record.SessionID {
 		return false

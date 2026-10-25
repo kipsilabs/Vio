@@ -18,8 +18,10 @@ var ErrIdempotencyKeyReusedV3 = errors.New("idempotency key reused")
 var ErrPlaybackAttemptExistsV3 = errors.New("playback attempt already exists")
 var ErrStaleReplanLeaseV3 = errors.New("stale replan lease")
 
-// ErrReplanSupersededV3 means a CompleteReplan lost the revision compare: a
-// newer replan already moved the attempt past the caller's base revision.
+// ErrReplanSupersededV3 means a CompleteReplan lost the revision compare, or
+// found no lease row left to commit: a newer replan already moved the attempt
+// past the caller's base revision, or the caller's lease was released or
+// cleaned up before the commit.
 var ErrReplanSupersededV3 = errors.New("replan superseded")
 
 // ErrRecoveryRevisionConflictV3 means an AppendRecoveryExclusions lost the
@@ -775,7 +777,11 @@ func (s *MemoryPlanStoreV3) CompleteReplan(_ context.Context, sessionID, request
 	key := sessionID + ":" + requestID
 	entry, ok := s.replans[key]
 	if !ok {
-		return ErrSessionNotFound
+		// The attempt exists but its lease row does not: it was released or
+		// cleaned up before this commit. That is a superseded replacement, not a
+		// missing session, so the caller answers the retryable
+		// stale_playback_plan the client recovers from.
+		return ErrReplanSupersededV3
 	}
 	if entry.completed || entry.leaseToken != leaseToken {
 		return ErrReplanSupersededV3

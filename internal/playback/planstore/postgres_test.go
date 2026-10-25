@@ -729,6 +729,42 @@ func TestPostgresPlanStore(t *testing.T) {
 		}
 	})
 
+	t.Run("CompleteReplanMissingLeaseIsSuperseded", func(t *testing.T) {
+		sessionID := uuid.NewString()
+		if err := store.SaveAttempt(ctx, f.attemptRecord(sessionID, "att-missing-lease-"+sessionID, "digest-missing-lease")); err != nil {
+			t.Fatalf("SaveAttempt: %v", err)
+		}
+		record, err := store.GetAttempt(ctx, sessionID)
+		if err != nil {
+			t.Fatalf("GetAttempt: %v", err)
+		}
+		lease, err := store.BeginReplan(ctx, sessionID, "rq-missing", "rq-digest-missing", record.CurrentReplanRequestID, time.Now().Add(time.Minute))
+		if err != nil || lease.State != playback.ReplanLeaseOwnedV3 {
+			t.Fatalf("lease = %#v, err=%v", lease, err)
+		}
+		if err := store.ReleaseReplan(ctx, sessionID, "rq-missing", lease.LeaseToken); err != nil {
+			t.Fatalf("ReleaseReplan: %v", err)
+		}
+		// The attempt still exists, so a commit without a lease row reports a
+		// superseded replacement rather than a missing session, and the deferred
+		// rollback discards the attempt update.
+		updated := *record
+		updated.CurrentPlanID = "plan-missing-lease"
+		updated.CurrentPlan.PlanID = "plan-missing-lease"
+		updated.CurrentReplanRequestID = "rq-missing"
+		response := json.RawMessage(`{"plan_id":"plan-missing-lease"}`)
+		if err := store.CompleteReplan(ctx, sessionID, "rq-missing", lease.LeaseToken, record.CurrentReplanRequestID, response, updated); !errors.Is(err, playback.ErrReplanSupersededV3) {
+			t.Fatalf("missing-lease completion error = %v, want ErrReplanSupersededV3", err)
+		}
+		stored, err := store.GetAttempt(ctx, sessionID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stored.CurrentPlanID != record.CurrentPlanID || stored.CurrentReplanRequestID != record.CurrentReplanRequestID {
+			t.Fatalf("missing-lease completion changed the attempt to plan %q revision %q", stored.CurrentPlanID, stored.CurrentReplanRequestID)
+		}
+	})
+
 	t.Run("CleanupExpired", func(t *testing.T) {
 		sessionID := uuid.NewString()
 		attemptID := "att-cleanup-" + sessionID

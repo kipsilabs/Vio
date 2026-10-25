@@ -207,3 +207,44 @@ func TestMemoryPlanStoreV3ExpiredOwnerCannotMutateReclaimedLease(t *testing.T) {
 		t.Fatalf("current owner completion: %v", err)
 	}
 }
+
+// A lease row can disappear before its owner commits: it was released, cleaned
+// up, or superseded. The attempt still exists, so the missing lease is a
+// superseded replacement rather than a missing session, and the caller answers
+// the retryable stale_playback_plan instead of tearing the session down.
+func TestMemoryPlanStoreV3CompleteReplanMissingLeaseIsSuperseded(t *testing.T) {
+	store := NewMemoryPlanStoreV3()
+	ctx := context.Background()
+	record := AttemptRecordV3{
+		PlaybackAttemptID: "attempt-missing-lease",
+		SessionID:         "session-missing-lease",
+		UserID:            1,
+		ProfileID:         "profile-1",
+		CurrentPlanID:     "plan-1",
+		ExpiresAt:         time.Now().Add(time.Hour),
+	}
+	if err := store.SaveAttempt(ctx, record); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := store.BeginReplan(ctx, record.SessionID, "replan-1", "digest-1", "", time.Now().Add(time.Minute))
+	if err != nil || lease.State != ReplanLeaseOwnedV3 {
+		t.Fatalf("BeginReplan = %#v, err=%v", lease, err)
+	}
+	if err := store.ReleaseReplan(ctx, record.SessionID, "replan-1", lease.LeaseToken); err != nil {
+		t.Fatalf("ReleaseReplan: %v", err)
+	}
+	updated := record
+	updated.CurrentPlanID = "plan-2"
+	updated.CurrentReplanRequestID = "replan-1"
+	err = store.CompleteReplan(ctx, record.SessionID, "replan-1", lease.LeaseToken, "", json.RawMessage(`{"protocol_version":3}`), updated)
+	if !errors.Is(err, ErrReplanSupersededV3) {
+		t.Fatalf("missing-lease completion error = %v, want ErrReplanSupersededV3", err)
+	}
+	stored, err := store.GetAttempt(ctx, record.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.CurrentPlanID != record.CurrentPlanID || stored.CurrentReplanRequestID != record.CurrentReplanRequestID {
+		t.Fatalf("missing-lease completion changed the attempt to plan %q revision %q", stored.CurrentPlanID, stored.CurrentReplanRequestID)
+	}
+}

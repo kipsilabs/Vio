@@ -560,11 +560,12 @@ func (s *Postgres) CompleteReplan(ctx context.Context, sessionID, requestID, lea
 		return err
 	}
 	if replanResult.RowsAffected() != 1 {
-		var exists bool
-		if scanErr := tx.QueryRow(ctx, `SELECT true FROM playback_v3_replans WHERE session_id = $1::uuid AND replan_request_id = $2`, sessionID, requestID).Scan(&exists); scanErr == nil {
-			return playback.ErrReplanSupersededV3
-		}
-		return playback.ErrSessionNotFound
+		// The lease row is gone: it was released or cleaned up, or another
+		// writer superseded it. Either way the replacement is stale, not a
+		// missing session, so the caller can answer the retryable
+		// stale_playback_plan. The deferred rollback discards the attempt update
+		// above.
+		return playback.ErrReplanSupersededV3
 	}
 	return tx.Commit(ctx)
 }
