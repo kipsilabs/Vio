@@ -703,26 +703,27 @@ func (s *LibraryCollectionService) resolveAcceptanceMember(
 	if err != nil {
 		return preparedCollectionItem{}, false, "", err
 	}
-	if _, err := s.EnsureCollectionItemMaterializedWithOptions(ctx, collection, item, VirtualMaterializeOptions{}); err != nil {
-		if tracker.err != nil {
-			return preparedCollectionItem{}, false, "", tracker.err
-		}
-		if errors.Is(err, ErrMemberVariantsUnavailable) {
-			hasState, stateErr := s.hasCommittedCollectionState(ctx, collection.ID, member.MediaItemID)
-			if stateErr != nil {
-				return preparedCollectionItem{}, false, "", stateErr
-			}
-			warningMsg := fmt.Sprintf("materializing virtual item %q: %v", item.Title, err)
-			if hasState {
-				slog.WarnContext(ctx, "failed to refresh resident virtual item during acceptance; preserving existing valid state",
-					"component", "catalog", "collection_id", collection.ID, "title", item.Title, "error", err)
-				return preparedCollectionItem{}, true, warningMsg, nil
-			}
-			return preparedCollectionItem{}, false, warningMsg, nil
-		}
+	_, err = s.EnsureCollectionItemMaterializedWithOptions(ctx, collection, item, VirtualMaterializeOptions{})
+	if err == nil {
+		return tracker.items[member.MediaItemID], true, "", nil
+	}
+	if tracker.err != nil {
+		return preparedCollectionItem{}, false, "", tracker.err
+	}
+	if !errors.Is(err, ErrMemberVariantsUnavailable) {
 		return preparedCollectionItem{}, false, "", err
 	}
-	return tracker.items[member.MediaItemID], true, "", nil
+	hasState, stateErr := s.hasCommittedCollectionState(ctx, collection.ID, member.MediaItemID)
+	if stateErr != nil {
+		return preparedCollectionItem{}, false, "", stateErr
+	}
+	warningMsg := fmt.Sprintf("materializing virtual item %q: %v", item.Title, err)
+	if hasState {
+		slog.WarnContext(ctx, "failed to refresh resident virtual item during acceptance; preserving existing valid state",
+			"component", "catalog", "collection_id", collection.ID, "title", item.Title, "error", err)
+		return preparedCollectionItem{}, true, warningMsg, nil
+	}
+	return preparedCollectionItem{}, false, warningMsg, nil
 }
 
 func (s *LibraryCollectionService) prepareVirtualAcceptanceMembers(
