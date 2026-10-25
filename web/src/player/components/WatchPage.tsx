@@ -358,6 +358,20 @@ function WatchPagePlayer({
   const [realtimeConnectionState, setRealtimeConnectionState] = useState<
     "disconnected" | "connecting" | "connected"
   >("disconnected");
+  // Only a reconnection needs the player to re-read its watch detail. The
+  // first "connected" is the socket this player just opened, at the same moment
+  // the mounted detail query fetched; reconciling there duplicated that read.
+  // An epoch counts reconnections and the reconcile below consumes it once.
+  const realtimeConnectedOnceRef = useRef(false);
+  const [realtimeReconnectEpoch, setRealtimeReconnectEpoch] = useState(0);
+  useEffect(() => {
+    if (realtimeConnectionState !== "connected") return;
+    if (!realtimeConnectedOnceRef.current) {
+      realtimeConnectedOnceRef.current = true;
+      return;
+    }
+    setRealtimeReconnectEpoch((epoch) => epoch + 1);
+  }, [realtimeConnectionState]);
   const watchTogetherConnection = useWatchTogetherRoomConnection({
     roomId: watchTogetherRoomId,
     roomToken: watchTogetherRoomToken,
@@ -1161,9 +1175,12 @@ function WatchPagePlayer({
     playbackVersions,
   ]);
 
+  const handledRealtimeReconnectRef = useRef(0);
   useEffect(() => {
     if (
       realtimeConnectionState !== "connected" ||
+      realtimeReconnectEpoch === 0 ||
+      handledRealtimeReconnectRef.current === realtimeReconnectEpoch ||
       !session.sessionId ||
       !session.mediaFileId ||
       session.loading ||
@@ -1171,6 +1188,9 @@ function WatchPagePlayer({
     ) {
       return;
     }
+    // Claim the reconnect before the request so a versions or liveness identity
+    // change while it is in flight cannot start a second one.
+    handledRealtimeReconnectRef.current = realtimeReconnectEpoch;
 
     let cancelled = false;
     // Same key as the mounted `useWatchDetail` query, but always read fresh: a
@@ -1219,6 +1239,7 @@ function WatchPagePlayer({
     libraryId,
     queryClient,
     realtimeConnectionState,
+    realtimeReconnectEpoch,
     session.loading,
     session.mediaFileId,
     session.replacing,

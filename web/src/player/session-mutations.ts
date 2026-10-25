@@ -127,6 +127,9 @@ export function sendSessionProgress(
   sessionId: string,
   sample: ProgressSample,
   keepalive = false,
+  // A caller that deliberately reports a state other than the live one (the
+  // pause a teardown forces) keeps its sample instead of the live read.
+  options?: { pinned?: boolean },
 ): Promise<void> {
   const state = sessions.get(sessionId);
   if (!state) return Promise.reject(new Error("Playback session authority is unavailable."));
@@ -134,14 +137,22 @@ export function sendSessionProgress(
   if (!Number.isSafeInteger(state.sequence + 1))
     return Promise.reject(new Error("Playback progress sequence exhausted"));
   state.latestSample = sample;
-  const body = JSON.stringify({
-    ...sample,
-    sequence: ++state.sequence,
-    installation_id: state.installationId,
-  });
+  const sequence = ++state.sequence;
   const pending = state.tail
     .catch(() => {})
     .then(async () => {
+      // Read the player's current sample when this request's turn arrives
+      // rather than when it was queued. A progress reply can be held for a
+      // minute, and a sample built at enqueue time would then report the
+      // position and paused state from a minute earlier. The body is fixed here
+      // so a retry replays exactly what was sent.
+      const sent = options?.pinned ? sample : (state.readSample?.() ?? sample);
+      state.latestSample = sent;
+      const body = JSON.stringify({
+        ...sent,
+        sequence,
+        installation_id: state.installationId,
+      });
       for (let attempt = 0; ; attempt++) {
         try {
           await mutationFetch(
