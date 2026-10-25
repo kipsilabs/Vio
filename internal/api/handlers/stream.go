@@ -3512,6 +3512,62 @@ func virtualCandidateDeliveryEvidence(statusCode int, bytesWritten int64) bool {
 	return bytesWritten > 0
 }
 
+// shouldRetryVirtualSubtitleWithFreshSource reports whether a virtual subtitle
+// extraction failed with an upstream 5xx before the response committed. That is
+// the one failure a fresh provider URL can recover: the extraction command and
+// the relay are fine, but the stored provider URL or its candidate answered
+// 5xx. A committed response (notably a PGS .sup 200) must never be retried,
+// because the client already owns those bytes. A map failure stays a rotation
+// first even when the same attempt also 5xxed, so the existing re-probe path
+// keeps that case.
+func shouldRetryVirtualSubtitleWithFreshSource(virtual bool, status int, err error) bool {
+	return virtual && status == 0 &&
+		playback.IsSubtitleUpstreamError(err) &&
+		!playback.IsSubtitleStreamMapError(err)
+}
+
+// retryVirtualSubtitleWithFreshSource performs the one bounded recovery after
+// a virtual subtitle extraction fails on an upstream 5xx before writing bytes.
+// It resolves the source again with forceRefresh and a fresh relay
+// registration, releases the failed registration, replaces InputPath, and
+// retries the extraction once. CacheIdentity is left untouched: it is the
+// credential-free file/session/track key, so the retry lands under the same
+// entry and only that identity's backoff is bypassed for this call.
+//
+// retried reports whether the extraction actually ran again. On a resolve
+// failure the original release is returned unchanged, retried is false, and
+// err describes the resolve failure; the caller keeps its original extraction
+// error as the response cause.
+func (h *StreamHandler) retryVirtualSubtitleWithFreshSource(
+	ctx context.Context,
+	file *models.MediaFile,
+	session *playback.Session,
+	opts *playback.StreamExtractOpts,
+	releaseInput func(),
+	retry func(playback.StreamExtractOpts) error,
+) (release func(), retried bool, err error) {
+	if h == nil || file == nil || session == nil || opts == nil || retry == nil {
+		return releaseInput, false, errors.New("fresh virtual subtitle retry requires a file, session, options, and retry")
+	}
+	resolved, cleanup, resolveErr := h.resolveVirtualInputURI(
+		withVirtualRelayFreshRegistration(ctx), file, session.UserID, session.ProfileID, true)
+	if resolveErr != nil {
+		return releaseInput, false, resolveErr
+	}
+	// The failed registration must not stay live while the retry opens the
+	// provider again.
+	if releaseInput != nil {
+		releaseInput()
+	}
+	opts.InputPath = resolved.URL
+	retryOpts := *opts
+	retryOpts.FreshSourceRetry = true
+	slog.InfoContext(ctx, "retrying virtual subtitle extraction with a fresh source registration", "component", "api",
+		"file_id", file.ID,
+		"track", opts.TrackIndex)
+	return cleanup, true, retry(retryOpts)
+}
+
 // streamEmbeddedSubtitle runs a dedicated ffmpeg for a single embedded
 // track, optionally windowed by explicit client parameters, and pipes its
 // stdout directly to w. Because this ffmpeg is independent of the video
@@ -3572,7 +3628,9 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 		releaseInput = cleanup
 		virtualResolved = true
 	}
-	defer releaseInput()
+	// Read the release through the variable: the bounded fresh-source retry
+	// below replaces it with the retry registration's release.
+	defer func() { releaseInput() }()
 	if len(requestedFormat) > 0 && requestedFormat[0] == "vtt" {
 		// Only text sources can be converted to WebVTT. A bitmap track (PGS
 		// reaches here because it is deliverable as .sup; DVD/DVB are rejected
@@ -3693,6 +3751,34 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 		h.applyImplicitVirtualWindow(&opts, file, session, virtualActive)
 		playback.SetSubtitleCoverageHeader(w.Header(), opts)
 		_, extractErr = h.SubtitleCache.ServeExtractWithResult(response, r, opts, playback.StreamExtractSubtitle)
+	}
+	if extractErr != nil {
+		// A virtual source's stored provider URL (or the candidate it names)
+		// can answer 5xx while the extraction command and the relay are fine.
+		// The cache's in-request retries reused that same URL and relay token,
+		// so one bounded re-resolve with forceRefresh and a fresh registration
+		// is the recovery left here. Never retry after the response committed:
+		// a PGS .sup already sent its 200 and the client owns those bytes.
+		if r.Context().Err() == nil && shouldRetryVirtualSubtitleWithFreshSource(virtualResolved && session != nil, response.Status(), extractErr) {
+			freshRelease, retried, freshErr := h.retryVirtualSubtitleWithFreshSource(
+				r.Context(), file, session, &opts, releaseInput,
+				func(retryOpts playback.StreamExtractOpts) error {
+					_, retryServeErr := h.SubtitleCache.ServeExtractWithResult(response, r, retryOpts, playback.StreamExtractSubtitle)
+					return retryServeErr
+				},
+			)
+			releaseInput = freshRelease
+			if retried {
+				extractErr = freshErr
+			} else if freshErr != nil {
+				// Keep the original extraction failure as the response cause;
+				// the resolve failure only explains why the retry never ran.
+				slog.WarnContext(r.Context(), "virtual subtitle fresh source resolution failed", "component", "api",
+					"file_id", file.ID,
+					"track", embeddedIndex,
+					"error", logredact.SanitizeURLError(freshErr))
+			}
+		}
 	}
 	if extractErr != nil {
 		var extractionRetry *playback.SubtitleExtractionRetryError
@@ -3838,10 +3924,16 @@ var virtualSubtitleWarmResolveTimeout = 2 * time.Minute
 // is released exactly once when the warm settles.
 
 // virtualSubtitleWarmAllowed reports whether a full-track virtual subtitle
-// warm may run now. The session copy on the serve request predates the latest
-// progress sample, so prefer the live session when the handler has a manager.
-// A nil manager keeps the copy's state for minimal handlers/tests.
-func (h *StreamHandler) virtualSubtitleWarmAllowed(session *playback.Session) bool {
+// warm may run now for the given source codec. Text sidecars (SRT, VTT,
+// ASS/SSA, and every other non-bitmap text codec) produce a small artifact and
+// may warm while playback is running: the client's next pause/resume then reads
+// the committed artifact instead of paying a cold whole-track provider demux.
+// Bitmap classes (PGS and every burn-in-only codec) still require a paused
+// session because their full-track read is large and competes with the playing
+// pipeline. The session copy on the serve request predates the latest progress
+// sample, so prefer the live session when the handler has a manager. A nil
+// manager keeps the copy's state for minimal handlers/tests.
+func (h *StreamHandler) virtualSubtitleWarmAllowed(session *playback.Session, codec string) bool {
 	if session == nil {
 		return false
 	}
@@ -3853,22 +3945,25 @@ func (h *StreamHandler) virtualSubtitleWarmAllowed(session *playback.Session) bo
 		}
 		live = current
 	}
-	return live.IsPaused
+	if playback.NeedsBurnIn(codec) {
+		return live.IsPaused
+	}
+	return true
 }
 
 func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(file *models.MediaFile, session *playback.Session, opts playback.StreamExtractOpts, virtualActive bool, requestID string) {
 	if h == nil || h.SubtitleCache == nil || file == nil || session == nil || !virtualActive {
 		return
 	}
-	// A full-track warm is a second read of the remote source. Running it while
-	// the viewer is playing competes with the transcode and with the next
-	// window/seek; the production trace showed a 53 s warm overlapping playback
-	// and ending just before the video source failed. Window slices already
-	// populate the small result cache, so only warm the full track while the
-	// session is paused. A resumed session keeps the window path.
-	if !h.virtualSubtitleWarmAllowed(session) {
-		slog.DebugContext(context.Background(), "virtual subtitle warm skipped: session is playing",
-			"component", "api", "session", session.ID, "file_id", file.ID)
+	// A full-track warm is a second read of the remote source. Text warms are
+	// small enough to run during playback and are the fix for a resume that
+	// otherwise pays a cold provider demux; bitmap warms remain paused-only
+	// because a full .sup read is large and competes with the playing pipeline.
+	// Window slices already populate the small result cache, so the text warm
+	// is what turns the next pause/resume into a cheap cache hit.
+	if !h.virtualSubtitleWarmAllowed(session, opts.SourceCodec) {
+		slog.DebugContext(context.Background(), "virtual subtitle warm skipped: bitmap track requires a paused session",
+			"component", "api", "session", session.ID, "file_id", file.ID, "codec", opts.SourceCodec)
 		return
 	}
 	if opts.CacheIdentity == "" {
@@ -3916,7 +4011,7 @@ func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(file *models.MediaFil
 						case <-warmCtx.Done():
 							return
 						case <-ticker.C:
-							if !h.virtualSubtitleWarmAllowed(session) {
+							if !h.virtualSubtitleWarmAllowed(session, opts.SourceCodec) {
 								cancelWarm()
 								return
 							}
@@ -3944,14 +4039,16 @@ func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(file *models.MediaFil
 }
 
 // Defaults for the implicit first window served to a cold whole-track subtitle
-// request against a large/unknown virtual/remote source. The web player asks
-// for its own 120 s windows; this legacy implicit bound stays at 600 s for
-// clients that request a whole track and have no windowing contract, so a
-// native client that does not refetch cannot lose subtitles after two minutes.
-// The backoff pulls the window start behind the session position so a small
-// scrub back stays covered, mirroring the player's SEEK_BACKOFF.
+// request against a large/unknown virtual/remote source. The bound matches the
+// web player's own 120 s window: long enough that a native client which never
+// refetches still has two minutes of cues past a resume, but short enough that
+// a 4K provider demux finishes inside the client's fetch deadline. The measured
+// 10-minute window read ~1.15 GB in 33.5 s, which the player timed out and
+// dropped; 120 s reads roughly a fifth of that. The backoff pulls the window
+// start behind the session position so a small scrub back stays covered,
+// mirroring the player's SEEK_BACKOFF.
 const (
-	virtualSubtitleImplicitWindowSeconds        = 600.0
+	virtualSubtitleImplicitWindowSeconds        = 120.0
 	virtualSubtitleImplicitWindowBackoffSeconds = 2.0
 	// virtualSubtitleImplicitWindowMinSourceBytes is the source size above
 	// which a whole-track virtual read is considered untenable and is bounded

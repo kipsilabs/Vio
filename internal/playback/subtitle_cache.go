@@ -377,7 +377,7 @@ func (c *SubtitleCache) ServeExtractWithResult(w http.ResponseWriter, r *http.Re
 		}
 		// A cached artifact is the best last-good copy; only consult the
 		// failure backoff when there is nothing to serve.
-		if retryAfter, cooling := c.extractionCoolingDown(opts, format); cooling {
+		if retryAfter, cooling := c.extractionCoolingDownFor(opts, format); cooling {
 			return result, &SubtitleExtractionRetryError{RetryAfter: retryAfter}
 		}
 		var wait <-chan struct{}
@@ -454,7 +454,7 @@ func (c *SubtitleCache) ServeExtractWithResult(w http.ResponseWriter, r *http.Re
 			// No last-good copy: suppress a provider retry that is known to be
 			// inside its backoff window. An artifact-backed extraction reads a
 			// local file, so a previous source failure does not apply to it.
-			if retryAfter, cooling := c.extractionCoolingDown(opts, format); cooling {
+			if retryAfter, cooling := c.extractionCoolingDownFor(opts, format); cooling {
 				return result, &SubtitleExtractionRetryError{RetryAfter: retryAfter}
 			}
 			if !opts.DisableBackgroundWarm {
@@ -483,7 +483,7 @@ func (c *SubtitleCache) ServeExtractWithResult(w http.ResponseWriter, r *http.Re
 					return result, nil
 				}
 				if !result.ServedCommittedArtifact {
-					if retryAfter, cooling := c.extractionCoolingDown(opts, format); cooling {
+					if retryAfter, cooling := c.extractionCoolingDownFor(opts, format); cooling {
 						return result, &SubtitleExtractionRetryError{RetryAfter: retryAfter}
 					}
 				}
@@ -845,6 +845,17 @@ func (c *SubtitleCache) waitForWindowFlight(ctx context.Context, wait <-chan str
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// extractionCoolingDownFor is extractionCoolingDown with the fresh-source
+// retry exemption: a caller that replaced InputPath with a newly resolved URL
+// (FreshSourceRetry) is deliberately re-opening the provider for the same
+// identity, so the failed attempt's backoff must not suppress it.
+func (c *SubtitleCache) extractionCoolingDownFor(opts StreamExtractOpts, format string) (time.Duration, bool) {
+	if opts.FreshSourceRetry {
+		return 0, false
+	}
+	return c.extractionCoolingDown(opts, format)
 }
 
 // extractionCoolingDown reports the remaining per-identity backoff after a
@@ -1212,7 +1223,7 @@ func (c *SubtitleCache) serveWindowedSUP(w http.ResponseWriter, r *http.Request,
 		// No last-good copy: suppress an extract that is known to be inside
 		// its backoff window before any header or provider read, so the
 		// handler can answer 503 + Retry-After.
-		if retryAfter, cooling := c.extractionCoolingDown(sourceOpts, subtitleFormatSUP); cooling {
+		if retryAfter, cooling := c.extractionCoolingDownFor(sourceOpts, subtitleFormatSUP); cooling {
 			return &SubtitleExtractionRetryError{RetryAfter: retryAfter}
 		}
 		if !opts.DisableBackgroundWarm {
@@ -1242,7 +1253,7 @@ func (c *SubtitleCache) serveWindowedSUP(w http.ResponseWriter, r *http.Request,
 			return nil
 		}
 		if !artifactBacked {
-			if retryAfter, cooling := c.extractionCoolingDown(sourceOpts, subtitleFormatSUP); cooling {
+			if retryAfter, cooling := c.extractionCoolingDownFor(sourceOpts, subtitleFormatSUP); cooling {
 				return &SubtitleExtractionRetryError{RetryAfter: retryAfter}
 			}
 		}

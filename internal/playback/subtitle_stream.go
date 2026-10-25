@@ -79,6 +79,13 @@ type StreamExtractOpts struct {
 	// (StreamHandler.warmVirtualSubtitleAfterWindowMiss). Local files leave
 	// this false and retain the normal cache-warm behavior.
 	DisableBackgroundWarm bool
+	// FreshSourceRetry marks a caller's bounded retry after it replaced
+	// InputPath with a newly resolved URL for the same cache identity. The
+	// per-identity extraction backoff exists to stop repeated client retries
+	// from re-opening a dead provider URL; a deliberate fresh-source retry
+	// must not be suppressed by the failure it is recovering from. Only the
+	// backoff check is skipped; a failure here still advances the streak.
+	FreshSourceRetry bool
 	// InputIsExtractedSup marks InputPath as a cached full-track .sup
 	// elementary stream (a previous unseeked full extract, so its
 	// timestamps are on the playback timeline) rather than the original
