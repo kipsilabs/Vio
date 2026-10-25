@@ -54,9 +54,8 @@ func newVirtualSubtitleWindowFixture(t *testing.T, dir, ffmpegScript string) (*S
 	session := &playback.Session{
 		ID: "sess-window", UserID: 1, ProfileID: "profile-1", MediaFileID: file.ID,
 		VirtualSourceURI: virtualURI, VirtualSubtitleTracks: file.SubtitleTracks,
-		// The fixture starts paused so PGS warm tests exercise the paused-only
-		// bitmap path; text warm tests clear this to prove they run while
-		// playback is active.
+		// Full-track virtual warms are opportunistic and only run while the
+		// viewer is paused; the window-miss tests exercise that paused path.
 		IsPaused: true,
 	}
 	// The window-miss warm is detached; wait for it to settle before the
@@ -324,39 +323,10 @@ func TestVirtualTextWindowWarmSkipsNonVirtual(t *testing.T) {
 	}
 }
 
-// A playing session still warms a text sidecar: the artifact is small and is
-// exactly what makes the next pause/resume a local cache hit instead of a cold
-// whole-track provider demux.
-func TestVirtualTextWindowWarmRunsDuringActivePlayback(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("shell script test helper is unix-only")
-	}
-	dir := t.TempDir()
-	argsLog := filepath.Join(dir, "ffmpeg.args")
-	handler, session, file, virtualURI := newVirtualSubtitleWindowFixture(t, dir,
-		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\ncat <<'VTT'\n"+warmSubtitleVTT+"VTT\n")
-	session.IsPaused = false
-	identity := playback.VirtualSubtitleCacheIdentity(file.ID, virtualURI, 0)
-
-	handler.warmVirtualSubtitleAfterWindowMiss(file, session, playback.StreamExtractOpts{
-		InputPath:       "unused",
-		CacheIdentity:   identity,
-		TrackIndex:      0,
-		SourceCodec:     "subrip",
-		SeekSeconds:     100,
-		DurationSeconds: 120,
-		FFmpegPath:      filepath.Join(dir, "ffmpeg"),
-	}, true, "")
-
-	waitForCommittedTextEntry(t, handler.SubtitleCache, identity, 0, "subrip")
-	if _, warm := ffmpegLogLines(t, argsLog); warm != 1 {
-		t.Fatalf("full-track text warms while playing = %d, want 1", warm)
-	}
-}
-
-// Bitmap tracks keep the pause gate: a full .sup read while the session is
-// playing is the large second remote read the gate exists to avoid.
-func TestVirtualBitmapWindowWarmSkipsActivePlayback(t *testing.T) {
+// A playing session must not start the second full-source read. The window
+// result cache and the client's next window are enough while playback is
+// active; the full-track warm is reserved for the paused path.
+func TestVirtualTextWindowWarmSkipsActivePlayback(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell script test helper is unix-only")
 	}
@@ -371,40 +341,14 @@ func TestVirtualBitmapWindowWarmSkipsActivePlayback(t *testing.T) {
 		InputPath:       "unused",
 		CacheIdentity:   identity,
 		TrackIndex:      0,
-		SourceCodec:     "hdmv_pgs_subtitle",
+		SourceCodec:     "subrip",
 		SeekSeconds:     100,
 		DurationSeconds: 120,
 		FFmpegPath:      filepath.Join(dir, "ffmpeg"),
 	}, true, "")
 
 	if _, err := os.Stat(argsLog); !os.IsNotExist(err) {
-		t.Fatalf("bitmap warm ran while the session was playing: %v", err)
-	}
-}
-
-// The warm gate is codec-based: every non-bitmap text class is eligible during
-// playback, every bitmap class still requires a paused session, and a resumed
-// bitmap session cancels its warm exactly as before.
-func TestVirtualSubtitleWarmGateByCodec(t *testing.T) {
-	handler := &StreamHandler{}
-	playing := &playback.Session{ID: "sess-gate"}
-	paused := &playback.Session{ID: "sess-gate", IsPaused: true}
-
-	for _, codec := range []string{"subrip", "webvtt", "ass", "ssa", "mov_text", "text"} {
-		if !handler.virtualSubtitleWarmAllowed(playing, codec) {
-			t.Fatalf("text codec %q was not warm-eligible during playback", codec)
-		}
-	}
-	for _, codec := range []string{"hdmv_pgs_subtitle", "pgssub", "dvd_subtitle", "dvdsub", "dvb_subtitle", "dvbsub"} {
-		if handler.virtualSubtitleWarmAllowed(playing, codec) {
-			t.Fatalf("bitmap codec %q warmed during playback", codec)
-		}
-		if !handler.virtualSubtitleWarmAllowed(paused, codec) {
-			t.Fatalf("bitmap codec %q was not warm-eligible while paused", codec)
-		}
-	}
-	if handler.virtualSubtitleWarmAllowed(nil, "subrip") {
-		t.Fatal("a nil session was warm-eligible")
+		t.Fatalf("no warm should run while the session is playing: %v", err)
 	}
 }
 
@@ -433,8 +377,8 @@ func TestVirtualPGSWholeTrackFetchServesImplicitWindowThenWarms(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("PGS whole-track fetch = %d %q", rec.Code, rec.Body.String())
 	}
-	if got := rec.Header().Get(playback.SubtitleCoverageHeader); got != "0.000-120.000" {
-		t.Fatalf("PGS windowed coverage header = %q, want 0.000-120.000", got)
+	if got := rec.Header().Get(playback.SubtitleCoverageHeader); got != "0.000-600.000" {
+		t.Fatalf("PGS windowed coverage header = %q, want 0.000-600.000", got)
 	}
 
 	waitForWarmInvocation(t, argsLog)
@@ -473,11 +417,11 @@ func TestVirtualImplicitWindowAppliesToASS(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("ASS whole-track fetch = %d %q", rec.Code, rec.Body.String())
 	}
-	if got := rec.Header().Get(playback.SubtitleCoverageHeader); got != "0.000-120.000" {
-		t.Fatalf("ASS windowed coverage header = %q, want 0.000-120.000", got)
+	if got := rec.Header().Get(playback.SubtitleCoverageHeader); got != "0.000-600.000" {
+		t.Fatalf("ASS windowed coverage header = %q, want 0.000-600.000", got)
 	}
 	windowLine := windowedFFmpegArgs(t, argsLog)
-	for _, want := range []string{"-ss 0.000", "-to 120.000", "-copyts", "-c:s copy", "-f ass pipe:1"} {
+	for _, want := range []string{"-ss 0.000", "-to 600.000", "-copyts", "-c:s copy", "-f ass pipe:1"} {
 		if !strings.Contains(windowLine, want) {
 			t.Fatalf("implicit ASS window args %q missing %q", windowLine, want)
 		}
@@ -828,8 +772,8 @@ func TestVirtualWholeTrackTextFetchServesImplicitWindowThenWarms(t *testing.T) {
 	}
 	// A whole-track request served only a window must say so, or the client
 	// cannot know it needs to request subsequent windows.
-	if got := rec.Header().Get(playback.SubtitleCoverageHeader); got != "0.000-120.000" {
-		t.Fatalf("windowed coverage header = %q, want 0.000-120.000", got)
+	if got := rec.Header().Get(playback.SubtitleCoverageHeader); got != "0.000-600.000" {
+		t.Fatalf("windowed coverage header = %q, want 0.000-600.000", got)
 	}
 	if got := rec.Header().Get(playback.SubtitleWindowedHeader); got != "true" {
 		t.Fatalf("windowed marker = %q, want true", got)
@@ -860,8 +804,8 @@ func TestVirtualWholeTrackTextFetchServesImplicitWindowThenWarms(t *testing.T) {
 			windowLine = line
 		}
 	}
-	if !strings.Contains(windowLine, "-ss 0.000") || !strings.Contains(windowLine, "-to 120.000") {
-		t.Fatalf("implicit window args = %q, want -ss 0.000 -to 120.000", windowLine)
+	if !strings.Contains(windowLine, "-ss 0.000") || !strings.Contains(windowLine, "-to 600.000") {
+		t.Fatalf("implicit window args = %q, want -ss 0.000 -to 600.000", windowLine)
 	}
 
 	// Warm regression: once the detached warm has committed, a second
@@ -1013,8 +957,8 @@ func TestVirtualPositionWithoutDurationClampsToImplicitWindow(t *testing.T) {
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "WEBVTT") {
 		t.Fatalf("position-only fetch = %d %q", rec.Code, rec.Body.String())
 	}
-	if got := rec.Header().Get(playback.SubtitleCoverageHeader); got != "0.000-120.000" {
-		t.Fatalf("position-only coverage header = %q, want 0.000-120.000", got)
+	if got := rec.Header().Get(playback.SubtitleCoverageHeader); got != "0.000-600.000" {
+		t.Fatalf("position-only coverage header = %q, want 0.000-600.000", got)
 	}
 	if got := rec.Header().Get(playback.SubtitleWindowedHeader); got != "true" {
 		t.Fatalf("position-only windowed marker = %q, want true", got)
@@ -1022,7 +966,7 @@ func TestVirtualPositionWithoutDurationClampsToImplicitWindow(t *testing.T) {
 	// The advertised range must match the ffmpeg command: the open `-ss 0`
 	// without a `-to` was the unbounded extract this finding is about.
 	windowLine := windowedFFmpegArgs(t, argsLog)
-	for _, want := range []string{"-ss 0.000", "-to 120.000"} {
+	for _, want := range []string{"-ss 0.000", "-to 600.000"} {
 		if !strings.Contains(windowLine, want) {
 			t.Fatalf("position-only window args %q missing %q", windowLine, want)
 		}
@@ -1121,13 +1065,13 @@ func TestSubtitleUpstreamFailureAnswersRetryableAndBacksOff(t *testing.T) {
 	}
 }
 
-// The implicit window duration is the measured bound, not the legacy
-// ten-minute read: 120 s matches the web player's window and keeps a 4K
-// provider demux inside the client deadline. A resumed position still gets the
-// small SEEK_BACKOFF lead-in on top of the duration.
+// The implicit window stays the legacy 600 s bound for whole-track clients
+// without a windowing contract, so a native client that does not refetch does
+// not lose subtitles after two minutes. A resumed position still gets the small
+// SEEK_BACKOFF lead-in on top of the duration.
 func TestVirtualSubtitleImplicitWindowDurationAndResumeStart(t *testing.T) {
-	if virtualSubtitleImplicitWindowSeconds != 120 {
-		t.Fatalf("implicit window = %vs, want 120s", virtualSubtitleImplicitWindowSeconds)
+	if virtualSubtitleImplicitWindowSeconds != 600 {
+		t.Fatalf("implicit window = %vs, want 600s", virtualSubtitleImplicitWindowSeconds)
 	}
 	handler := &StreamHandler{}
 	opts := playback.StreamExtractOpts{TrackIndex: 0, SourceCodec: "subrip"}
@@ -1138,8 +1082,8 @@ func TestVirtualSubtitleImplicitWindowDurationAndResumeStart(t *testing.T) {
 	if opts.SeekSeconds != 3598 {
 		t.Fatalf("implicit start = %v, want the resumed position minus backoff (3598)", opts.SeekSeconds)
 	}
-	if opts.DurationSeconds != 120 {
-		t.Fatalf("implicit duration = %v, want 120", opts.DurationSeconds)
+	if opts.DurationSeconds != 600 {
+		t.Fatalf("implicit duration = %v, want 600", opts.DurationSeconds)
 	}
 }
 

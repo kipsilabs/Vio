@@ -3947,16 +3947,10 @@ var virtualSubtitleWarmResolveTimeout = 2 * time.Minute
 // is released exactly once when the warm settles.
 
 // virtualSubtitleWarmAllowed reports whether a full-track virtual subtitle
-// warm may run now for the given source codec. Text sidecars (SRT, VTT,
-// ASS/SSA, and every other non-bitmap text codec) produce a small artifact and
-// may warm while playback is running: the client's next pause/resume then reads
-// the committed artifact instead of paying a cold whole-track provider demux.
-// Bitmap classes (PGS and every burn-in-only codec) still require a paused
-// session because their full-track read is large and competes with the playing
-// pipeline. The session copy on the serve request predates the latest progress
-// sample, so prefer the live session when the handler has a manager. A nil
-// manager keeps the copy's state for minimal handlers/tests.
-func (h *StreamHandler) virtualSubtitleWarmAllowed(session *playback.Session, codec string) bool {
+// warm may run now. The session copy on the serve request predates the latest
+// progress sample, so prefer the live session when the handler has a manager.
+// A nil manager keeps the copy's state for minimal handlers/tests.
+func (h *StreamHandler) virtualSubtitleWarmAllowed(session *playback.Session) bool {
 	if session == nil {
 		return false
 	}
@@ -3968,25 +3962,22 @@ func (h *StreamHandler) virtualSubtitleWarmAllowed(session *playback.Session, co
 		}
 		live = current
 	}
-	if playback.NeedsBurnIn(codec) {
-		return live.IsPaused
-	}
-	return true
+	return live.IsPaused
 }
 
 func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(file *models.MediaFile, session *playback.Session, opts playback.StreamExtractOpts, virtualActive bool, requestID string) {
 	if h == nil || h.SubtitleCache == nil || file == nil || session == nil || !virtualActive {
 		return
 	}
-	// A full-track warm is a second read of the remote source. Text warms are
-	// small enough to run during playback and are the fix for a resume that
-	// otherwise pays a cold provider demux; bitmap warms remain paused-only
-	// because a full .sup read is large and competes with the playing pipeline.
-	// Window slices already populate the small result cache, so the text warm
-	// is what turns the next pause/resume into a cheap cache hit.
-	if !h.virtualSubtitleWarmAllowed(session, opts.SourceCodec) {
-		slog.DebugContext(context.Background(), "virtual subtitle warm skipped: bitmap track requires a paused session",
-			"component", "api", "session", session.ID, "file_id", file.ID, "codec", opts.SourceCodec)
+	// A full-track warm is a second read of the remote source. Running it while
+	// the viewer is playing competes with the transcode and with the next
+	// window/seek; the production trace showed a 53 s warm overlapping playback
+	// and ending just before the video source failed. Window slices already
+	// populate the small result cache, so only warm the full track while the
+	// session is paused. A resumed session keeps the window path.
+	if !h.virtualSubtitleWarmAllowed(session) {
+		slog.DebugContext(context.Background(), "virtual subtitle warm skipped: session is playing",
+			"component", "api", "session", session.ID, "file_id", file.ID)
 		return
 	}
 	if opts.CacheIdentity == "" {
@@ -4034,7 +4025,7 @@ func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(file *models.MediaFil
 						case <-warmCtx.Done():
 							return
 						case <-ticker.C:
-							if !h.virtualSubtitleWarmAllowed(session, opts.SourceCodec) {
+							if !h.virtualSubtitleWarmAllowed(session) {
 								cancelWarm()
 								return
 							}
@@ -4062,16 +4053,14 @@ func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(file *models.MediaFil
 }
 
 // Defaults for the implicit first window served to a cold whole-track subtitle
-// request against a large/unknown virtual/remote source. The bound matches the
-// web player's own 120 s window: long enough that a native client which never
-// refetches still has two minutes of cues past a resume, but short enough that
-// a 4K provider demux finishes inside the client's fetch deadline. The measured
-// 10-minute window read ~1.15 GB in 33.5 s, which the player timed out and
-// dropped; 120 s reads roughly a fifth of that. The backoff pulls the window
-// start behind the session position so a small scrub back stays covered,
-// mirroring the player's SEEK_BACKOFF.
+// request against a large/unknown virtual/remote source. The web player asks
+// for its own 120 s windows; this legacy implicit bound stays at 600 s for
+// clients that request a whole track and have no windowing contract, so a
+// native client that does not refetch cannot lose subtitles after two minutes.
+// The backoff pulls the window start behind the session position so a small
+// scrub back stays covered, mirroring the player's SEEK_BACKOFF.
 const (
-	virtualSubtitleImplicitWindowSeconds        = 120.0
+	virtualSubtitleImplicitWindowSeconds        = 600.0
 	virtualSubtitleImplicitWindowBackoffSeconds = 2.0
 	// virtualSubtitleImplicitWindowMinSourceBytes is the source size above
 	// which a whole-track virtual read is considered untenable and is bounded
