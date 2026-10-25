@@ -509,14 +509,14 @@ type pendingAsyncRestart struct {
 	segNum int
 }
 
-// RestartSegmentAsync runs RestartSegmentLocked on its own goroutine so the
-// segment request that triggered a far-seek recovery is not held for the whole
-// restart. The generation rotates on restart, so the triggering request's token
-// can never serve the bytes the restart produces (the generation fence would
-// refuse them); the caller answers it the stale-generation verdict immediately
-// and this worker makes the next request on the new generation succeed. The
-// context is detached from the request so a client that disconnects after the
-// verdict does not cancel the restart the next request depends on.
+// RestartSegmentAsync runs RestartSegmentLocked on its own goroutine so a
+// far-seek restart is not serialized behind the request that triggered it. The
+// generation rotates on restart, so the triggering request's token no longer
+// names the bytes the restart produces; the serve handler waits for the
+// restarted generation's segment and serves it through the absolute-segment
+// continuity rule (see HandleGetTranscodeSegment). The context is detached from
+// the request so a client that disconnects does not cancel a restart another
+// request may still depend on.
 //
 // Concurrent far-seeks to different positions on one session coalesce onto a
 // single worker that ends at the latest requested segment, so a burst of seeks
