@@ -633,10 +633,19 @@ terminated session answers `410 playback_session_ended`.
 
 Segment URLs the manifest exposes carry an opaque `sgen` generation token. A
 segment request whose token names a generation the server no longer serves —
-neither the live FFmpeg timeline nor a retained switchover predecessor —
-answers `412 stale_generation`; the client reloads the manifest and re-addresses
-the segment to the current generation. A request without `sgen`, minted before
-the token existed, keeps the legacy behavior.
+neither the live FFmpeg timeline nor a retained switchover predecessor — answers
+`412 stale_generation`; the client reloads the manifest and re-addresses the
+segment to the current generation. A request without `sgen`, minted before the
+token existed, keeps the legacy behavior.
+
+An in-place restart (a far seek or a switchover) rotates the generation but
+continues the same absolute segmented timeline: segment numbers are absolute, so
+a request whose token names the displaced generation is served from the live
+generation when the live generation restarted at or before the requested segment
+number. A segment before the restart point still answers `412`, because the live
+generation never produced that position. This keeps a client that has not yet
+refetched the playlist playing through the restart instead of exhausting its
+fragment retry budget against a URL the server replaced.
 
 Subtitle inventory URLs in v2 playback responses use the `/api/v2/stream/`
 mount, including relative `/stream/` values produced by the shared inventory

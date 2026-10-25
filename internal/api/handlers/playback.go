@@ -3103,6 +3103,14 @@ func (h *PlaybackHandler) retainedGenerationManifest(sessionID, segPrefix, rawQu
 	return manifest, true
 }
 
+// seekRestartServeTimeout bounds how long a far-seek segment request waits for
+// the restart it scheduled to produce its segment. FFmpeg spawn is normally
+// 1-2s; the wait is additionally stall-aware, so a dead encoder is reported
+// well before this ceiling. Exceeding it falls back to the stale-generation
+// verdict, which makes the client reload the playlist and retry once the
+// restart has produced it.
+const seekRestartServeTimeout = 10 * time.Second
+
 // HandleGetTranscodeSegment handles GET /playback/transcode/{session_id}/segment/{name}.
 // Authorization follows the same negotiated legacy-versus-header-authenticated
 // rule as the manifest endpoint above.
@@ -3248,15 +3256,29 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 	// generation.
 	servedSession := transcodeSession
 	// A URL minted against an older generation is only answerable by a retained
-	// generation that explicitly owns that token. Anything else is a stale read
-	// that would silently mix generations, so refuse it before touching the
-	// filesystem.
+	// generation that explicitly owns that token, or by the live generation when
+	// it restarted in place at or before the requested segment: segment numbers
+	// are absolute in the HLS timeline, so the live generation at that index is
+	// the same timeline position the displaced playlist asked for. In that case
+	// the request continues down the ordinary open/wait/restart path with no
+	// token, and the final fence is skipped for it (the generation rotation is
+	// the server's own response to the seek, not a different stream).
+	continuationServe := false
 	var segmentLease *playback.SegmentLease
 	var err error
 	if requestedGeneration != "" && !transcodeSession.MatchesGenerationToken(requestedGeneration) {
 		if retained := h.tm.GetRetainedTranscodeSession(sessionID); retained != nil && retained.MatchesGenerationToken(requestedGeneration) {
 			segmentLease, err = retained.OpenSegmentForGeneration(segmentName, requestedGeneration)
 			servedSession = retained
+		} else if restartStart, restarted := transcodeSession.RestartedAtSegment(); restarted &&
+			requestedSegment >= 0 && requestedSegment >= restartStart {
+			slog.InfoContext(r.Context(), "transcode segment served from the live generation after an in-place restart",
+				"component", "api", "session", sessionID, "playback_session_id", sessionID,
+				"segment", segmentName, "requested_segment", requestedSegment,
+				"restart_start_segment", restartStart)
+			continuationServe = true
+			requestedGeneration = ""
+			segmentLease, err = transcodeSession.OpenSegmentForGeneration(segmentName, "")
 		} else {
 			err = playback.ErrStaleSegmentGeneration
 		}
@@ -3401,7 +3423,30 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 						"playback_session_id", sessionID,
 					)
 					h.tm.RestartSegmentAsync(sessionID, transcodeSession, segNum)
-					err = playback.ErrStaleSegmentGeneration
+					// Hold this request through the restart it just scheduled
+					// instead of answering the stale-generation verdict. The
+					// restart rotates the generation and produces exactly the
+					// absolute segment this request names, so waiting here turns
+					// the client's seek into data after one FFmpeg restart. The
+					// previous detached answer made hls.js retry the same stale
+					// URL four times (its fragment retry budget) before it
+					// refetched the playlist, costing ~4s of dead air per seek.
+					// The wait is bounded and stall-aware, and a failed restart
+					// still surfaces its terminal verdict.
+					waitTimeout := seekRestartServeTimeout
+					segmentLease, err = transcodeSession.WaitForOpenSegmentWithStall(
+						segmentName, waitTimeout, playback.SegmentStallTimeoutFor(transcodeSession.Opts()))
+					if err == nil {
+						continuationServe = true
+					} else if restartErr := transcodeSession.AsyncRestartFailure(); restartErr != nil {
+						// The restart failed for a reason the next request must
+						// see (a demux verdict, a source rejection). Surface it
+						// now instead of answering stale_generation and spending
+						// another request to discover it.
+						err = restartErr
+					} else if errors.Is(err, playback.ErrSegmentNotFound) || errors.Is(err, playback.ErrSegmentStalled) {
+						err = playback.ErrStaleSegmentGeneration
+					}
 				} else {
 					target, ok, restartErr := h.tm.RestartSegmentLocked(
 						r.Context(),
@@ -3468,8 +3513,10 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 	// Any recovery path above (a wait or a restart) can return a lease from a
 	// different generation than the URL named. Re-apply the fence before serving
 	// so a request minted against one generation is never answered with another's
-	// bytes.
-	if err == nil {
+	// bytes. The one exception is a continuation serve: the request itself
+	// scheduled (or arrived after) an in-place restart at or before its absolute
+	// segment, so the rotated generation is the stream it asked for.
+	if err == nil && !continuationServe {
 		if segmentLease, err = playback.FenceSegmentLease(segmentLease, requestedGeneration); err != nil {
 			segmentLease = nil
 		}

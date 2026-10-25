@@ -290,6 +290,14 @@ type TranscodeSession struct {
 	copyTimeline         observedCopyTimeline
 	segmentGeneration    uint64
 	segmentIncarnation   string
+	// restartStartSegment is the absolute HLS segment number the most recent
+	// in-place restart began producing at. Zero means no restart has happened
+	// (or the restart cut from zero, as a planned copy stream does), so segment
+	// numbering after it cannot be assumed to continue the previous generation's
+	// timeline. The serve layer uses it to answer a stale `sgen` request from the
+	// live generation only when that generation provably owns the same absolute
+	// timeline position (see TranscodeSession.RestartedAtSegment).
+	restartStartSegment int
 	// runningRecipe is the emitted-byte recipe of the currently-running ffmpeg
 	// process. It is frozen when the process is spawned and is deliberately not
 	// updated by SetAudioTrackIndex / SetSourceAudioChannels, which mutate opts
@@ -4342,6 +4350,11 @@ func (s *TranscodeSession) restart(
 		}
 	}
 	s.segmentGeneration++
+	// Record the absolute segment the replacement generation starts producing
+	// at. A client still holding the displaced generation's playlist can then be
+	// served from this generation for segments at or after this number, because
+	// absolute segment numbering makes them the same timeline position.
+	s.restartStartSegment = startSegment
 	s.segmentPruneRunning = false
 	preStartRangePrunable := opts.SegmentRetentionSeconds > 0 && s.lastPruneFloor < startSegment
 	s.lastRequestedSegment = startSegment
@@ -5183,6 +5196,22 @@ func (s *TranscodeSession) MatchesGenerationToken(token string) bool {
 		return false
 	}
 	return token == s.segmentGenerationTokenLocked()
+}
+
+// RestartedAtSegment reports the absolute segment number the live generation
+// started producing at when the session last restarted in place, and false when
+// no restart has run (or the restart cut from zero). A segment request for a
+// number at or after the reported segment therefore names the same timeline
+// position in the live generation as it did in the displaced one, which is what
+// lets the serve layer answer a stale playlist during a seek/switchover instead
+// of refusing it with a generation verdict.
+func (s *TranscodeSession) RestartedAtSegment() (int, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.restartStartSegment <= 0 {
+		return 0, false
+	}
+	return s.restartStartSegment, true
 }
 
 func (s *TranscodeSession) segmentGenerationTokenLocked() string {
