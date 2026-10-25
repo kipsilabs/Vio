@@ -17,6 +17,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/collectionutil"
 	"github.com/Silo-Server/silo-server/internal/mdblist"
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func TestMDBListEntryItemTypeSeries(t *testing.T) {
@@ -958,10 +959,11 @@ func TestTMDBPresetSyncKeepsPhysicalMovieDuringProviderOutage(t *testing.T) {
 	}
 }
 
-// A member whose provider variants cannot be resolved is skipped with a run
-// warning; the other members still commit. Only a failure to read the
-// collection itself fails the run.
-func TestTMDBPresetSyncSkipsUnresolvableMember(t *testing.T) {
+// setupSkipUnresolvableSync seeds a three-entry TMDB preset collection whose
+// first member cannot resolve provider variants, and returns the service wired
+// with fakes plus the seeded collection row.
+func setupSkipUnresolvableSync(t *testing.T) (*pgxpool.Pool, context.Context, *LibraryCollectionService, *models.LibraryCollection) {
+	t.Helper()
 	pool := newVirtualMediaTestPool(t)
 	ctx := context.WithValue(context.Background(), collectionVirtualCreationTrackerKey{}, &collectionVirtualCreationTracker{})
 	ctx = context.WithValue(ctx, collectionVirtualVariantCacheKey{}, &collectionVirtualVariantCache{
@@ -996,6 +998,38 @@ func TestTMDBPresetSyncSkipsUnresolvableMember(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	return pool, ctx, service, collection
+}
+
+// collectCollectionMemberIDs returns the committed member media-item ids in
+// position order.
+func collectCollectionMemberIDs(t *testing.T, pool *pgxpool.Pool, ctx context.Context, collectionID string) []string {
+	t.Helper()
+	var members []string
+	rows, err := pool.Query(ctx, `SELECT media_item_id FROM library_collection_items WHERE collection_id=$1 ORDER BY position`, collectionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		members = append(members, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return members
+}
+
+// A member whose provider variants cannot be resolved is skipped with a run
+// warning; the other members still commit.
+func TestTMDBPresetSyncSkipsUnresolvableMember(t *testing.T) {
+	pool, ctx, service, collection := setupSkipUnresolvableSync(t)
+
 	run, err := service.syncTMDBPresetCollection(ctx, collection, libraryCollectionSourceConfig{
 		Preset: "popular", MediaType: "movie", VirtualPlayback: true,
 	}, SyncCollectionOptions{SkipCollage: true})
@@ -1019,25 +1053,8 @@ func TestTMDBPresetSyncSkipsUnresolvableMember(t *testing.T) {
 		t.Fatalf("warnings = %v, want the skipped member and its provider error", warnings)
 	}
 
-	var members []string
-	rows, err := pool.Query(ctx, `SELECT media_item_id FROM library_collection_items WHERE collection_id=$1 ORDER BY position`, collection.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			t.Fatal(err)
-		}
-		members = append(members, id)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		t.Fatal(err)
-	}
-	if want := []string{"movie-tmdb-730002", "movie-tmdb-730003"}; len(members) != len(want) || members[0] != want[0] || members[1] != want[1] {
-		t.Fatalf("members = %v, want %v", members, want)
+	if members := collectCollectionMemberIDs(t, pool, ctx, collection.ID); len(members) != 2 || members[0] != "movie-tmdb-730002" || members[1] != "movie-tmdb-730003" {
+		t.Fatalf("members = %v, want [movie-tmdb-730002 movie-tmdb-730003]", members)
 	}
 	// The skipped member left no virtual state behind, so the next sync
 	// retries it from scratch instead of repairing a half-written item.
@@ -1058,15 +1075,24 @@ func TestTMDBPresetSyncSkipsUnresolvableMember(t *testing.T) {
 	if lastStatus != "warning" {
 		t.Fatalf("last_sync_status = %q, want warning", lastStatus)
 	}
+}
 
-	// A failure to read the collection itself is still a failed run, and it
-	// must leave the accepted members in place.
+// A failure to read the collection itself is still a failed run, and it must
+// leave the accepted members in place.
+func TestTMDBPresetSyncListFailureKeepsMembers(t *testing.T) {
+	pool, ctx, service, collection := setupSkipUnresolvableSync(t)
+
+	if _, err := service.syncTMDBPresetCollection(ctx, collection, libraryCollectionSourceConfig{
+		Preset: "popular", MediaType: "movie", VirtualPlayback: true,
+	}, SyncCollectionOptions{SkipCollage: true}); err != nil {
+		t.Fatalf("preset sync failed: %v", err)
+	}
 	service.TMDBCollections = &fakeTMDBPresetFetcher{err: errors.New("tmdb upstream unavailable")}
-	run, err = service.SyncCollectionWithOptions(ctx, collection.ID, SyncCollectionOptions{SkipCollage: true})
+	run, err := service.SyncCollectionWithOptions(ctx, collection.ID, SyncCollectionOptions{SkipCollage: true})
 	if err == nil || run != nil {
 		t.Fatalf("provider list failure: run=%+v err=%v, want nil run and an error", run, err)
 	}
-	runs, err := repo.ListSyncRuns(ctx, collection.ID, 5)
+	runs, err := NewLibraryCollectionRepository(pool).ListSyncRuns(ctx, collection.ID, 5)
 	if err != nil {
 		t.Fatal(err)
 	}
