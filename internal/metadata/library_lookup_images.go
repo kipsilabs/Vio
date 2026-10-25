@@ -160,6 +160,16 @@ func (s *MetadataService) EnqueueLibraryItemImages(
 	return nil
 }
 
+// EnqueueLibrarySeasonImages queues cache jobs for season posters persisted by
+// virtual registration. It is the season-level counterpart of
+// EnqueueLibraryItemImages and is non-fatal to its caller.
+func (s *MetadataService) EnqueueLibrarySeasonImages(ctx context.Context, seriesID string, inputs []EnqueueImageCacheJobInput) error {
+	if s == nil || len(inputs) == 0 {
+		return nil
+	}
+	return s.enqueueImageCacheJobs(ctx, "season", seriesID, inputs)
+}
+
 // EnqueueLibraryItemImage is an alias for EnqueueLibraryItemImages.
 func (s *MetadataService) EnqueueLibraryItemImage(
 	ctx context.Context,

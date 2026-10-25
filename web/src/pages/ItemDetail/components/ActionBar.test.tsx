@@ -92,6 +92,30 @@ describe("ActionBar", () => {
     invalidate.mockRestore();
   });
 
+  it("shows Refresh List for a virtual item with one version", async () => {
+    discoveryMocks.capability.mockResolvedValue({ discover_before_playback: false });
+    const version = { ...selectedVersion, file_path: "virtual://series/tt123/1/2" };
+    renderActionBar({
+      contentId: "episode-1",
+      versions: [version],
+      selectedVersion: version,
+      hasVirtualSource: true,
+      onSelectVersion: vi.fn(),
+    });
+
+    expect(screen.getByRole("button", { name: /Version/ })).toBeInTheDocument();
+  });
+
+  it("shows Refresh List for a virtual item with no versions", async () => {
+    discoveryMocks.capability.mockResolvedValue({ discover_before_playback: false });
+    renderActionBar({
+      contentId: "episode-1",
+      hasVirtualSource: true,
+    });
+
+    expect(screen.getByRole("button", { name: /Refresh List/ })).toBeInTheDocument();
+  });
+
   it("keeps playback-time discovery when the option is off", async () => {
     discoveryMocks.capability.mockResolvedValue({ discover_before_playback: false });
     const version = { ...selectedVersion, file_path: "virtual://movie/tt123" };

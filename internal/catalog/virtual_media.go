@@ -160,6 +160,11 @@ type VirtualEpisode struct {
 	AudioLanguages                         []string
 	SubtitleLanguages                      []string
 	Variants                               []VirtualMediaVariant
+	// Season artwork is repeated per episode so the season upsert can keep a
+	// poster even though registration is episode-based.
+	SeasonPosterPath       string
+	SeasonPosterSourcePath string
+	SeasonPosterThumbhash  string
 }
 
 type VirtualMedia struct {
@@ -234,6 +239,36 @@ func (r *VirtualMediaRegistrar) Pool() *pgxpool.Pool {
 		return nil
 	}
 	return r.pool
+}
+
+// SeasonContentIDs returns the persisted content IDs for a series' seasons.
+// Season rows can predate virtual registration and carry IDs that are not
+// derived from the series ID, so artwork jobs must address the real row.
+func (r *VirtualMediaRegistrar) SeasonContentIDs(ctx context.Context, seriesID string, seasonNumbers []int) (map[int]string, error) {
+	out := make(map[int]string, len(seasonNumbers))
+	if r == nil || r.pool == nil || strings.TrimSpace(seriesID) == "" || len(seasonNumbers) == 0 {
+		return out, nil
+	}
+	rows, err := r.pool.Query(ctx, `
+		SELECT season_number, content_id
+		FROM seasons
+		WHERE series_id = $1 AND season_number = ANY($2)`, seriesID, seasonNumbers)
+	if err != nil {
+		return nil, fmt.Errorf("list season content ids: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var number int
+		var contentID string
+		if err := rows.Scan(&number, &contentID); err != nil {
+			return nil, fmt.Errorf("scan season content id: %w", err)
+		}
+		out[number] = contentID
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate season content ids: %w", err)
+	}
+	return out, nil
 }
 
 func (r *VirtualMediaRegistrar) Upsert(ctx context.Context, in VirtualMedia) (*VirtualMediaResult, error) {
@@ -1509,6 +1544,15 @@ func validateVirtualEpisode(ep VirtualEpisode, index int, seenURIs map[string]st
 	if err := validateVirtualText(fmt.Sprintf("episodes[%d].still_path", index), ep.StillPath, maxVirtualArtworkPathBytes, false, false); err != nil {
 		return err
 	}
+	if err := validateVirtualText(fmt.Sprintf("episodes[%d].season_poster_path", index), ep.SeasonPosterPath, maxVirtualArtworkPathBytes, false, false); err != nil {
+		return err
+	}
+	if err := validateVirtualText(fmt.Sprintf("episodes[%d].season_poster_source_path", index), ep.SeasonPosterSourcePath, maxVirtualArtworkPathBytes, false, false); err != nil {
+		return err
+	}
+	if err := validateVirtualText(fmt.Sprintf("episodes[%d].season_poster_thumbhash", index), ep.SeasonPosterThumbhash, maxVirtualArtworkPathBytes, false, false); err != nil {
+		return err
+	}
 	if ep.RuntimeMinutes < 0 || ep.RuntimeMinutes > 24*60 {
 		return fmt.Errorf("%w: episodes[%d].runtime_minutes is out of range", ErrInvalidVirtualMedia, index)
 	}
@@ -1746,14 +1790,23 @@ func upsertVirtualEpisode(ctx context.Context, tx pgx.Tx, seriesID string, folde
 	episodeID := fmt.Sprintf("%s-%d-%d", strings.Replace(seriesID, "series-", "episode-", 1), ep.SeasonNumber, ep.EpisodeNumber)
 	var persistedSeasonID string
 	if err := tx.QueryRow(ctx, `
-		INSERT INTO seasons(content_id,series_id,season_number,title,air_date,metadata_source)
-		VALUES($1,$2,$3,$4,$5,'provider')
+		INSERT INTO seasons(content_id,series_id,season_number,title,air_date,poster_path,poster_source_path,poster_thumbhash,metadata_source)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,'provider')
 		ON CONFLICT(series_id,season_number) DO UPDATE SET
-			title=CASE WHEN $6 THEN EXCLUDED.title ELSE seasons.title END,
-			air_date=CASE WHEN $6 THEN COALESCE(EXCLUDED.air_date,seasons.air_date) ELSE seasons.air_date END,
-			updated_at=CASE WHEN $6 THEN NOW() ELSE seasons.updated_at END
+			title=CASE WHEN $9 THEN EXCLUDED.title ELSE seasons.title END,
+			air_date=CASE WHEN $9 THEN COALESCE(EXCLUDED.air_date,seasons.air_date) ELSE seasons.air_date END,
+			poster_path=CASE WHEN $9 AND EXCLUDED.poster_path<>'' THEN EXCLUDED.poster_path ELSE seasons.poster_path END,
+			poster_source_path=CASE WHEN $9 AND EXCLUDED.poster_source_path<>'' THEN EXCLUDED.poster_source_path ELSE seasons.poster_source_path END,
+			poster_thumbhash=CASE
+				WHEN $9 AND EXCLUDED.poster_path<>''
+				  AND (EXCLUDED.poster_thumbhash<>'' OR EXCLUDED.poster_path IS DISTINCT FROM seasons.poster_path)
+				THEN EXCLUDED.poster_thumbhash
+				ELSE seasons.poster_thumbhash
+			END,
+			updated_at=CASE WHEN $9 THEN NOW() ELSE seasons.updated_at END
 		RETURNING content_id`,
-		seasonID, seriesID, ep.SeasonNumber, fmt.Sprintf("Season %d", ep.SeasonNumber), nullTime(ep.AirDate), ownsItemMetadata,
+		seasonID, seriesID, ep.SeasonNumber, fmt.Sprintf("Season %d", ep.SeasonNumber), nullTime(ep.AirDate),
+		ep.SeasonPosterPath, ep.SeasonPosterSourcePath, ep.SeasonPosterThumbhash, ownsItemMetadata,
 	).Scan(&persistedSeasonID); err != nil {
 		return false, nil, fmt.Errorf("upsert virtual season: %w", err)
 	}
