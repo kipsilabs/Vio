@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -305,84 +304,5 @@ func TestCompletedReplanResponseMatchesAttemptV3RequiresSessionOwnership(t *test
 				t.Fatalf("completedReplanResponseMatchesAttemptV3 = %v, want %v", got, tc.want)
 			}
 		})
-	}
-}
-
-// A committed start supersedes the profile's earlier playback. Any replan lease
-// still in flight for an older session must be fenced so its result cannot
-// commit after the viewer adopted the new session; a completed lease stays as
-// that older session's durable decision.
-func TestStartPlaybackV3FencesPriorProfileReplanLeases(t *testing.T) {
-	file := v3HandlerFixtureFile(t)
-	manager := playback.NewSessionManager(0, 0)
-	handler := NewPlaybackHandler(manager, testPlaybackFileResolver{file: file})
-	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{}}
-	handler.ItemAccess = allowAllPlaybackItemAccess{}
-	store := handler.PlanStoreV3.(*playback.MemoryPlanStoreV3)
-
-	start := func(attemptID string) playback.DecisionResponseV3 {
-		t.Helper()
-		request := v3HandlerStartRequest()
-		request.PlaybackAttemptID = attemptID
-		rr := httptest.NewRecorder()
-		handler.HandleStartPlayback(rr, httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", strings.NewReader(marshalV3StartRequest(t, request))).WithContext(newAuthorizedPlaybackContext()))
-		if rr.Code != http.StatusCreated {
-			t.Fatalf("start %q status = %d, body = %s", attemptID, rr.Code, rr.Body.String())
-		}
-		var response playback.DecisionResponseV3
-		if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil || response.SessionID == "" {
-			t.Fatalf("start %q response: err=%v response=%#v", attemptID, err, response)
-		}
-		return response
-	}
-
-	prior := start("attempt-fence-0001")
-	ctx := context.Background()
-	staleLease, err := store.BeginReplan(ctx, prior.SessionID, "prior-replan-inflight", "digest-inflight", "", time.Now().Add(time.Minute))
-	if err != nil || staleLease.State != playback.ReplanLeaseOwnedV3 {
-		t.Fatalf("seed in-flight prior lease = %#v, err=%v", staleLease, err)
-	}
-	record, err := store.GetAttempt(ctx, prior.SessionID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	completed, err := store.BeginReplan(ctx, prior.SessionID, "prior-replan-completed", "digest-completed", record.CurrentReplanRequestID, time.Now().Add(time.Minute))
-	if err != nil || completed.State != playback.ReplanLeaseOwnedV3 {
-		t.Fatalf("seed completed prior lease = %#v, err=%v", completed, err)
-	}
-	completedResponse := json.RawMessage(`{"protocol_version":3,"outcome":"playable"}`)
-	finished := *record
-	finished.CurrentReplanRequestID = "prior-replan-completed"
-	if err := store.CompleteReplan(ctx, prior.SessionID, "prior-replan-completed", completed.LeaseToken, record.CurrentReplanRequestID, completedResponse, finished); err != nil {
-		t.Fatalf("seed completed prior replan: %v", err)
-	}
-
-	next := start("attempt-fence-0002")
-	if next.SessionID == prior.SessionID {
-		t.Fatalf("second start reused the prior session %q", prior.SessionID)
-	}
-	// The durable revision after the seeded completion, so the fenced owner's
-	// failure below is the missing lease row and not a base-revision mismatch.
-	postCompletionRevision := "prior-replan-completed"
-	// The fenced owner cannot commit: its lease row is gone, which the store
-	// reports as a superseded replacement so the handler answers 409 instead of
-	// committing a stale plan across the session boundary.
-	if err := store.CompleteReplan(ctx, prior.SessionID, "prior-replan-inflight", staleLease.LeaseToken, postCompletionRevision, completedResponse, *record); !errors.Is(err, playback.ErrReplanSupersededV3) {
-		t.Fatalf("stale owner completion error = %v, want ErrReplanSupersededV3", err)
-	}
-	// The same request now begins a fresh lease instead of reporting an
-	// in-flight one, so a client still on the prior session can replan again.
-	fenced, err := store.BeginReplan(ctx, prior.SessionID, "prior-replan-inflight", "digest-inflight", postCompletionRevision, time.Now().Add(time.Minute))
-	if err != nil || fenced.State != playback.ReplanLeaseOwnedV3 {
-		t.Fatalf("prior in-flight lease survived the new start: %#v, err=%v", fenced, err)
-	}
-	// A completed lease is the prior session's durable decision and stays.
-	replayed, err := store.BeginReplan(ctx, prior.SessionID, "prior-replan-completed", "digest-completed", postCompletionRevision, time.Now().Add(time.Minute))
-	if err != nil || replayed.State != playback.ReplanLeaseCompletedV3 || string(replayed.Response) != string(completedResponse) {
-		t.Fatalf("completed prior lease = %#v, err=%v; want it preserved", replayed, err)
-	}
-	// The new session's own leases are unaffected by its start.
-	if lease, err := store.BeginReplan(ctx, next.SessionID, "next-replan-inflight", "digest-next", "", time.Now().Add(time.Minute)); err != nil || lease.State != playback.ReplanLeaseOwnedV3 {
-		t.Fatalf("new session lease = %#v, err=%v", lease, err)
 	}
 }

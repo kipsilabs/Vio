@@ -317,15 +317,15 @@ not exist answers `400`, not `404`.
 **Leases.** A replan takes a 15-second lease on the session. A second request
 carrying the *same* `replan_request_id` while the lease is in flight gets `409
 replan_in_progress`; once the original completes, the same id replays its
-response verbatim. This is what makes a client's retry-on-timeout safe.
+response verbatim. This is what makes a client's retry-on-timeout safe. A commit
+that finds its lease row already released or cleaned up answers `409
+stale_playback_plan`, not `404`: the attempt still exists.
 
-A committed start fences the profile's other sessions: any replan lease still in
-flight for an earlier session of the same profile is retired, and its owner's
-commit loses the compare and answers `409 stale_playback_plan`. A client that
-already moved to the new session must not receive the earlier session's
-replacement plan, and a plan for a session it no longer owns reads as a
-replacement belonging to another session. Completed replans are untouched; they
-remain that session's replayable decision.
+**Session ownership.** A completed replan's cached decision is replayed only
+when it names the session it was committed for. A cached decision that names
+another session is refused with `409 stale_playback_plan` instead of being
+returned to the client: a plan for a session the client no longer owns would
+read as a replacement belonging to another session.
 
 Note the deliberate asymmetry with start: a store outage during replan is `500`,
 never `404`. Clients tear playback down on session-not-found, so a transient

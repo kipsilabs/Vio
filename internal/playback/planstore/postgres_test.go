@@ -729,74 +729,39 @@ func TestPostgresPlanStore(t *testing.T) {
 		}
 	})
 
-	t.Run("FenceProfileReplanLeases", func(t *testing.T) {
-		priorSession := uuid.NewString()
-		priorAttempt := "att-fence-prior-" + priorSession
-		if err := store.SaveAttempt(ctx, f.attemptRecord(priorSession, priorAttempt, "digest-fence-prior")); err != nil {
-			t.Fatalf("SaveAttempt prior: %v", err)
+	t.Run("CompleteReplanMissingLeaseIsSuperseded", func(t *testing.T) {
+		sessionID := uuid.NewString()
+		if err := store.SaveAttempt(ctx, f.attemptRecord(sessionID, "att-missing-lease-"+sessionID, "digest-missing-lease")); err != nil {
+			t.Fatalf("SaveAttempt: %v", err)
 		}
-		prior, err := store.GetAttempt(ctx, priorSession)
+		record, err := store.GetAttempt(ctx, sessionID)
 		if err != nil {
-			t.Fatalf("GetAttempt prior: %v", err)
+			t.Fatalf("GetAttempt: %v", err)
 		}
-		inflight, err := store.BeginReplan(ctx, priorSession, "rq-inflight", "rq-digest-inflight", "", time.Now().Add(time.Minute))
-		if err != nil || inflight.State != playback.ReplanLeaseOwnedV3 {
-			t.Fatalf("in-flight lease = %#v, err=%v", inflight, err)
+		lease, err := store.BeginReplan(ctx, sessionID, "rq-missing", "rq-digest-missing", record.CurrentReplanRequestID, time.Now().Add(time.Minute))
+		if err != nil || lease.State != playback.ReplanLeaseOwnedV3 {
+			t.Fatalf("lease = %#v, err=%v", lease, err)
 		}
-		completed, err := store.BeginReplan(ctx, priorSession, "rq-completed", "rq-digest-completed", prior.CurrentReplanRequestID, time.Now().Add(time.Minute))
-		if err != nil || completed.State != playback.ReplanLeaseOwnedV3 {
-			t.Fatalf("completed lease = %#v, err=%v", completed, err)
+		if err := store.ReleaseReplan(ctx, sessionID, "rq-missing", lease.LeaseToken); err != nil {
+			t.Fatalf("ReleaseReplan: %v", err)
 		}
-		completedRecord := *prior
-		completedRecord.CurrentReplanRequestID = "rq-completed"
-		completedResponse := json.RawMessage(`{"plan_id":"plan-2"}`)
-		if err := store.CompleteReplan(ctx, priorSession, "rq-completed", completed.LeaseToken, prior.CurrentReplanRequestID, completedResponse, completedRecord); err != nil {
-			t.Fatalf("CompleteReplan prior: %v", err)
+		// The attempt still exists, so a commit without a lease row reports a
+		// superseded replacement rather than a missing session, and the deferred
+		// rollback discards the attempt update.
+		updated := *record
+		updated.CurrentPlanID = "plan-missing-lease"
+		updated.CurrentPlan.PlanID = "plan-missing-lease"
+		updated.CurrentReplanRequestID = "rq-missing"
+		response := json.RawMessage(`{"plan_id":"plan-missing-lease"}`)
+		if err := store.CompleteReplan(ctx, sessionID, "rq-missing", lease.LeaseToken, record.CurrentReplanRequestID, response, updated); !errors.Is(err, playback.ErrReplanSupersededV3) {
+			t.Fatalf("missing-lease completion error = %v, want ErrReplanSupersededV3", err)
 		}
-		// Another profile's in-flight lease must survive the fence.
-		otherProfileSession := uuid.NewString()
-		otherProfile := f.attemptRecord(otherProfileSession, "att-fence-other-"+otherProfileSession, "digest-fence-other")
-		otherProfile.ProfileID = "profile-2"
-		if err := store.SaveAttempt(ctx, otherProfile); err != nil {
-			t.Fatalf("SaveAttempt other profile: %v", err)
+		stored, err := store.GetAttempt(ctx, sessionID)
+		if err != nil {
+			t.Fatal(err)
 		}
-		if _, err := store.BeginReplan(ctx, otherProfileSession, "rq-other", "rq-digest-other", "", time.Now().Add(time.Minute)); err != nil {
-			t.Fatalf("BeginReplan other profile: %v", err)
-		}
-		keepSession := uuid.NewString()
-		if err := store.SaveAttempt(ctx, f.attemptRecord(keepSession, "att-fence-keep-"+keepSession, "digest-fence-keep")); err != nil {
-			t.Fatalf("SaveAttempt keep: %v", err)
-		}
-		if _, err := store.BeginReplan(ctx, keepSession, "rq-keep", "rq-digest-keep", "", time.Now().Add(time.Minute)); err != nil {
-			t.Fatalf("BeginReplan keep: %v", err)
-		}
-
-		// Earlier subtests may still hold in-flight leases for this profile, so
-		// the fence count is not asserted exactly; the named sessions are.
-		if fenced, err := store.FenceProfileReplanLeases(ctx, f.userID, "profile-1", keepSession); err != nil || fenced < 1 {
-			t.Fatalf("fenced = %d, err = %v; want at least the prior session's in-flight lease", fenced, err)
-		}
-		// The fenced owner loses the compare: its replan row is gone. The
-		// attempt's revision already names the completed replan, so this is not
-		// a base-revision rejection.
-		if err := store.CompleteReplan(ctx, priorSession, "rq-inflight", inflight.LeaseToken, "rq-completed", completedResponse, *prior); !errors.Is(err, playback.ErrReplanSupersededV3) {
-			t.Fatalf("fenced owner completion error = %v, want ErrReplanSupersededV3", err)
-		}
-		if lease, err := store.BeginReplan(ctx, priorSession, "rq-completed", "rq-digest-completed", prior.CurrentReplanRequestID, time.Now().Add(time.Minute)); err != nil || lease.State != playback.ReplanLeaseCompletedV3 {
-			t.Fatalf("completed lease after fence = %#v, err=%v; want it preserved", lease, err)
-		} else {
-			// JSONB round-trips its own formatting, so compare the decoded
-			// decision rather than the raw bytes.
-			var preserved map[string]any
-			if err := json.Unmarshal(lease.Response, &preserved); err != nil || preserved["plan_id"] != "plan-2" {
-				t.Fatalf("completed lease response = %s (err=%v), want the plan-2 decision", lease.Response, err)
-			}
-		}
-		if lease, err := store.BeginReplan(ctx, otherProfileSession, "rq-other", "rq-digest-other", "", time.Now().Add(time.Minute)); err != nil || lease.State != playback.ReplanLeaseInFlightV3 {
-			t.Fatalf("other profile lease after fence = %#v, err=%v; want it still in flight", lease, err)
-		}
-		if lease, err := store.BeginReplan(ctx, keepSession, "rq-keep", "rq-digest-keep", "", time.Now().Add(time.Minute)); err != nil || lease.State != playback.ReplanLeaseInFlightV3 {
-			t.Fatalf("kept session lease after fence = %#v, err=%v; want it still in flight", lease, err)
+		if stored.CurrentPlanID != record.CurrentPlanID || stored.CurrentReplanRequestID != record.CurrentReplanRequestID {
+			t.Fatalf("missing-lease completion changed the attempt to plan %q revision %q", stored.CurrentPlanID, stored.CurrentReplanRequestID)
 		}
 	})
 

@@ -3868,12 +3868,6 @@ func (h *PlaybackHandler) startPlannedPlaybackV3(r *http.Request, userID int, pr
 		abort()
 		return playback.DecisionResponseV3{}, commitErr
 	}
-	// The new session is now the caller's active playback. Retire any replan
-	// lease still in flight for an earlier session on the same profile: a stale
-	// replan must not commit, or hand its client a replacement plan, after the
-	// viewer has already moved to this session. A failed start fences nothing,
-	// so a start that never materialized cannot disturb a playing session.
-	h.fencePriorProfileReplanLeasesV3(r.Context(), userID, profileID, session.ID)
 	h.recordSessionRecipeV3(r.Context(), result.Plan.PlanID, &transport)
 	// Start-side effects belong after both the attempt and transport commits:
 	// retries that lose the idempotency race must not emit duplicate provider
@@ -3895,32 +3889,6 @@ func (h *PlaybackHandler) startPlannedPlaybackV3(r *http.Request, userID int, pr
 	h.enqueuePlaybackStartSideEffectsV3(r.Context(), session, effectiveFile, userID, profileID, plannedAudioTrackIndexV3(result, audioIndex))
 	h.enqueueRouteEventV3(playback.RouteEventRecordV3{RouteEventV3: playback.RouteEventV3{ProtocolVersion: playback.ProtocolV3, PlaybackAttemptID: req.PlaybackAttemptID, SessionID: session.ID, PlanID: result.Plan.PlanID, Event: playback.RouteEventPlanSelectedV3, AppliedQuirkIDs: appliedQuirkIDsV3(result.Plan), QuirkRegistryRevision: appliedQuirkRevisionV3(result.Plan), OutputContextID: req.ClientPlaybackContext.Output.OutputContextID}, UserID: userID, ProfileID: profileID, ClientName: clientInfo.Name, ClientVersion: clientInfo.Version, ClientBuild: clientInfo.Build, ClientChannel: clientInfo.Channel, ClientModel: req.ClientPlaybackContext.Device.Model})
 	return response, nil
-}
-
-// fencePriorProfileReplanLeasesV3 retires the in-flight replan leases of the
-// profile's earlier sessions after a start has committed its own session. The
-// fencing is best-effort on the response path: CompleteReplan's compare-and-swap
-// and the attempt's stopped_at fence remain the durable guards, so a store that
-// cannot fence (or a transient write failure) degrades to today's behavior
-// instead of failing a playback that has already started successfully.
-func (h *PlaybackHandler) fencePriorProfileReplanLeasesV3(ctx context.Context, userID int, profileID, keepSessionID string) {
-	fencer, ok := h.PlanStoreV3.(playback.ReplanLeaseFencerV3)
-	if !ok || userID == 0 || profileID == "" || keepSessionID == "" {
-		return
-	}
-	fenceCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), replanReleaseTimeoutV3)
-	defer cancel()
-	fenced, err := fencer.FenceProfileReplanLeases(fenceCtx, userID, profileID, keepSessionID)
-	if err != nil {
-		slog.WarnContext(ctx, "protocol v3 start could not fence prior session replan leases",
-			"component", "api", "session", keepSessionID, "error", err)
-		return
-	}
-	if fenced == 0 {
-		return
-	}
-	slog.InfoContext(ctx, "protocol v3 start fenced prior session replan leases",
-		"component", "api", "session", keepSessionID, "fenced_leases", fenced)
 }
 
 func (h *PlaybackHandler) enqueuePlaybackStartSideEffectsV3(ctx context.Context, session *playback.Session, file *models.MediaFile, userID int, profileID string, audioTrackIndex int) {
