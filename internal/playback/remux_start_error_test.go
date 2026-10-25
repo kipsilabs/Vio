@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // failoverResponseWriter mirrors the v2 stream response writer's commitment
@@ -175,6 +176,38 @@ func TestServeRemuxPreBodyFailureWritesErrorWhenNotDeferred(t *testing.T) {
 	}
 	if recorder.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want 502 for a non-deferring caller", recorder.Code)
+	}
+}
+
+// A relay that accepts the request but never produces a media byte must not
+// park the response until the client stops the session (a dead virtual candidate
+// hung a production media request for 38.9s). The first-output budget closes the
+// process and returns the same no-output error a fast failure produces, so the
+// caller can rotate candidates or fail fast.
+func TestServeRemuxFirstOutputTimeoutFailsFast(t *testing.T) {
+	source := remuxSourceFile(t)
+	w := &failoverResponseWriter{}
+	request := httptest.NewRequest(http.MethodGet, "/api/v2/stream/session-1", nil)
+
+	started := time.Now()
+	err := ServeRemuxWithOptions(w, request, source, "mp4", 0, false, 0, 0, RemuxServeOptions{
+		FFmpegPath:         remuxFakeFFmpeg(t, "exec sleep 30\n"),
+		DeferStartError:    true,
+		FirstOutputTimeout: 100 * time.Millisecond,
+	})
+	elapsed := time.Since(started)
+
+	if err == nil {
+		t.Fatal("a remux that never produced a byte returned no error")
+	}
+	if !errors.Is(err, errRemuxNoOutput) {
+		t.Fatalf("error = %v, want it to identify the no-output failure", err)
+	}
+	if elapsed > 3*time.Second {
+		t.Fatalf("first-output timeout took %s, want a prompt failure", elapsed)
+	}
+	if w.status != 0 || w.rejected || w.body.Len() != 0 {
+		t.Fatalf("timeout committed status=%d rejected=%v body=%q", w.status, w.rejected, w.body.String())
 	}
 }
 
