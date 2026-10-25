@@ -8792,8 +8792,6 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		}
 	}
 	start.ClientFeatures = withoutFailedSubtitleRoutesV3(start.ClientFeatures, record.NormalizedRequest.ClientFeatures, req.Failure.Classification)
-	currentKey := playback.PlanAttemptKeyV3(record.CurrentPlan, record.NormalizedRequest.ClientPlaybackContext.Output.OutputContextID, req.LocalMutations)
-	unmutatedKey := playback.PlanAttemptKeyV3(record.CurrentPlan, record.NormalizedRequest.ClientPlaybackContext.Output.OutputContextID, nil)
 	// A failure recovery after the current transport showed frames and suffered
 	// a network connectivity loss (e.g. transport_stall) is a lost connection,
 	// not a failed recipe: the transport already delivered frames, so the same
@@ -9541,8 +9539,8 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			}
 		}
 		attemptedKeys = []string(nil)
-		currentKey = playback.PlanAttemptKeyV3(record.CurrentPlan, record.NormalizedRequest.ClientPlaybackContext.Output.OutputContextID, req.LocalMutations)
-		unmutatedKey = playback.PlanAttemptKeyV3(record.CurrentPlan, record.NormalizedRequest.ClientPlaybackContext.Output.OutputContextID, nil)
+		currentKey := playback.PlanAttemptKeyV3(record.CurrentPlan, record.NormalizedRequest.ClientPlaybackContext.Output.OutputContextID, req.LocalMutations)
+		unmutatedKey := playback.PlanAttemptKeyV3(record.CurrentPlan, record.NormalizedRequest.ClientPlaybackContext.Output.OutputContextID, nil)
 		if !intentChange && !seekReanchor && !userIntentOperation {
 			failedKey := strings.TrimSpace(req.PlanAttemptKey)
 			for _, key := range req.AttemptedPlanKeys {
@@ -12713,15 +12711,23 @@ func failureClassificationKeyV3(classification string) string {
 	return strings.ToLower(strings.TrimSpace(classification))
 }
 
+// connectivityFailureClassificationsV3 use named constants so the repeated
+// client-reported strings do not trip the repeated-string lint.
+const (
+	connectivityTransportStallV3 = "transport_stall"
+	connectivityNetworkErrorV3   = "network_error"
+	connectivityNetworkFailureV3 = "network_failure"
+)
+
 // connectivityFailureClassificationsV3 are client classifications that mean
 // the network did not deliver bytes, so they do not indict the recipe. The
 // protocol requires the client to reconnect rather than report these through
 // failure_recovery (§6.2), but a client that reports one anyway must not spend
 // the route ladder on a transient loss.
 var connectivityFailureClassificationsV3 = map[string]bool{
-	"transport_stall": true,
-	"network_error":   true,
-	"network_failure": true,
+	connectivityTransportStallV3: true,
+	connectivityNetworkErrorV3:   true,
+	connectivityNetworkFailureV3: true,
 }
 
 func connectivityFailureClassificationV3(classification string) bool {

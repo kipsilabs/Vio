@@ -1263,25 +1263,39 @@ func hlsDeliveryVideoCodecsV3(request StartRequestV3) []string {
 // playback, so a refusal must name the subtitle: an HDR or version reason
 // sends the user chasing a problem that is not blocking them. Retryable
 // infrastructure failures and the client-route terminal keep their own reasons.
-func planVideoTranscodeV3(input PlannerInputV3, base PlanV3, source SourceDescriptorV3, quality QualityResultV3, subtitle SubtitlePolicyResultV3, reasonOverride string, subtitleForcedAdaptation bool, compatibleRouteExcluded bool) PlannerResultV3 {
+// planVideoTranscodeUnavailableV3 reports the terminal for a transcode route
+// that can never execute: HLS unsupported, a failed subtitle policy, or
+// encoding disabled. It returns nil when planning should continue.
+func planVideoTranscodeUnavailableV3(input PlannerInputV3, subtitle SubtitlePolicyResultV3, subtitleForcedAdaptation bool, compatibleRouteExcluded bool) *PlannerResultV3 {
 	if !deliveryAvailableV3(input.Request, DeliveryClassHLSV3) {
-		return terminalPlannerResultV3("client_hls_unsupported", "The client cannot execute the required HLS adaptation route.", false)
+		result := terminalPlannerResultV3("client_hls_unsupported", "The client cannot execute the required HLS adaptation route.", false)
+		return &result
 	}
 	if subtitle.Terminal != nil {
-		return PlannerResultV3{Terminal: subtitle.Terminal, SubtitleTrackIndex: -1, SubtitleTransportTrackIndex: -1}
+		return &PlannerResultV3{Terminal: subtitle.Terminal, SubtitleTrackIndex: -1, SubtitleTransportTrackIndex: -1}
 	}
 	if !input.Settings.TranscodeEnabled {
 		if subtitleForcedAdaptation {
-			return terminalPlannerResultV3("subtitle_conversion_unsupported", "The selected subtitle must be burned into the video, but transcoding is unavailable.", false)
+			result := terminalPlannerResultV3("subtitle_conversion_unsupported", "The selected subtitle must be burned into the video, but transcoding is unavailable.", false)
+			return &result
 		}
 		// Attempt history already retired at least one source-preserving route,
 		// so claiming the source itself needs adaptation misattributes the
 		// blocker. Name the exhausted routes and keep the terminal retryable.
 		if compatibleRouteExcluded {
-			return terminalPlannerResultV3(TerminalRoutesExhaustedV3, "Compatible playback routes were already tried; the remaining route requires video adaptation, but transcoding is unavailable.", true)
+			result := terminalPlannerResultV3(TerminalRoutesExhaustedV3, "Compatible playback routes were already tried; the remaining route requires video adaptation, but transcoding is unavailable.", true)
+			return &result
 		}
-		return terminalPlannerResultV3("transcoding_disabled", "The source requires video adaptation, but transcoding is unavailable.", false)
+		result := terminalPlannerResultV3("transcoding_disabled", "The source requires video adaptation, but transcoding is unavailable.", false)
+		return &result
 	}
+	return nil
+}
+
+// resolveTranscodeVideoTargetV3 selects the transcode video codec and registry
+// for an available transcode route. It returns a terminal when the source or
+// toolchain rules the route out before any recipe is built.
+func resolveTranscodeVideoTargetV3(input PlannerInputV3, source SourceDescriptorV3, subtitle SubtitlePolicyResultV3, subtitleForcedAdaptation bool) (targetVideoSelectionV3, resolvedToneMapRecipeV3, *PlannerResultV3) {
 	var hlsRegistry *TransformationRegistryV3
 	toneMapRecipe := resolvedToneMapRecipeV3{}
 	if source.DynamicRange != "" && source.DynamicRange != DynamicRangeSDRV3 {
@@ -1290,21 +1304,26 @@ func planVideoTranscodeV3(input PlannerInputV3, base PlanV3, source SourceDescri
 	}
 	if source.DynamicRange != "" && source.DynamicRange != DynamicRangeSDRV3 && !toneMapRecipe.ok {
 		if subtitleForcedAdaptation {
-			return terminalPlannerResultV3("subtitle_conversion_unsupported", "The selected subtitle must be burned into the video, but this HDR source cannot be re-encoded.", false)
+			result := terminalPlannerResultV3("subtitle_conversion_unsupported", "The selected subtitle must be burned into the video, but this HDR source cannot be re-encoded.", false)
+			return targetVideoSelectionV3{}, toneMapRecipe, &result
 		}
-		return terminalPlannerResultV3(TerminalHDRTranscodeUnsupportedV3, "This HDR source requires video encoding, but no validated HDR-preserving or tone-map recipe is installed.", false)
+		result := terminalPlannerResultV3(TerminalHDRTranscodeUnsupportedV3, "This HDR source requires video encoding, but no validated HDR-preserving or tone-map recipe is installed.", false)
+		return targetVideoSelectionV3{}, toneMapRecipe, &result
 	}
 	if is4KSourceV3(input.EffectiveFile, source) && !input.Settings.Allow4KTranscode {
 		if subtitleForcedAdaptation {
-			return terminalPlannerResultV3("subtitle_conversion_unsupported", "The selected subtitle must be burned into the video, but 4K transcoding is disabled.", false)
+			result := terminalPlannerResultV3("subtitle_conversion_unsupported", "The selected subtitle must be burned into the video, but 4K transcoding is disabled.", false)
+			return targetVideoSelectionV3{}, toneMapRecipe, &result
 		}
-		return terminalPlannerResultV3("no_alternate_version", TerminalMessage4KTranscodeDisabledV3, false)
+		result := terminalPlannerResultV3("no_alternate_version", TerminalMessage4KTranscodeDisabledV3, false)
+		return targetVideoSelectionV3{}, toneMapRecipe, &result
 	}
 	if hlsRegistry == nil {
 		hlsRegistry = input.hlsVideoRegistry()
 	}
 	if hlsRegistry == nil || !hlsRegistry.Available(TransformationAudioToAACV3) {
-		return terminalPlannerResultV3("conversion_tool_unavailable", "The required validated video/AAC conversion toolchain is unavailable.", true)
+		result := terminalPlannerResultV3("conversion_tool_unavailable", "The required validated video/AAC conversion toolchain is unavailable.", true)
+		return targetVideoSelectionV3{}, toneMapRecipe, &result
 	}
 	var targetVideo targetVideoSelectionV3
 	var videoTranscodeOK bool
@@ -1314,7 +1333,127 @@ func planVideoTranscodeV3(input PlannerInputV3, base PlanV3, source SourceDescri
 		targetVideo, videoTranscodeOK = selectTargetVideoCodecV3(input, hlsRegistry)
 	}
 	if !videoTranscodeOK {
-		return terminalPlannerResultV3("conversion_tool_unavailable", "The required validated video/AAC conversion toolchain is unavailable.", true)
+		result := terminalPlannerResultV3("conversion_tool_unavailable", "The required validated video/AAC conversion toolchain is unavailable.", true)
+		return targetVideoSelectionV3{}, toneMapRecipe, &result
+	}
+	return targetVideo, toneMapRecipe, nil
+}
+
+// applyTranscodeAudioBudgetV3 reserves the AAC track inside the server bitrate
+// cap and narrows the video budget to fit. It returns the audio bitrate and a
+// terminal when the cap is too low for a playable stream.
+func applyTranscodeAudioBudgetV3(input PlannerInputV3, source SourceDescriptorV3, quality *QualityResultV3) (int, *PlannerResultV3) {
+	targetAudioBitrateKbps := 0
+	if input.ServerBitrateCapKbps > 0 {
+		channels := aacOutputChannelsV3(input.Request, DeliveryClassHLSV3, source.AudioChannels, true)
+		_, defaultAudioBitrateKbps := ResolveAACOutputV3(channels, 0)
+		budget := optionalValueV3(input.Request.BandwidthCapKbps) * 95 / 100
+		targetAudioBitrateKbps = min(defaultAudioBitrateKbps, max(64, budget/4))
+		if budget-targetAudioBitrateKbps < 64 {
+			result := terminalPlannerResultV3(TerminalBitratePolicyUnavailableV3, "The server bitrate limit is too low for a playable video stream.", false)
+			return 0, &result
+		}
+		quality.BitrateKbps = min(quality.BitrateKbps, budget-targetAudioBitrateKbps)
+	}
+	return targetAudioBitrateKbps, nil
+}
+
+// transcodeToneMapV3 carries the tone-map execution facts a transcode plan
+// freezes into its recipe.
+type transcodeToneMapV3 struct {
+	policy     tonemap.Policy
+	mode       tonemap.Mode
+	sourceKind tonemap.SourceKind
+	ok         bool
+	resolution tonemap.SourceResolution
+	revision   tonemap.SourceRevision
+}
+
+// applyTranscodeToneMapV3 appends the HDR tone-map transformation (or resets
+// the execution policy for SDR) and reports the facts the plan freezes.
+func applyTranscodeToneMapV3(source SourceDescriptorV3, plan *PlanV3, recipe resolvedToneMapRecipeV3) transcodeToneMapV3 {
+	toneMap := transcodeToneMapV3{
+		policy:     recipe.policy,
+		mode:       recipe.mode,
+		sourceKind: recipe.resolution.Kind,
+		ok:         recipe.ok,
+		resolution: recipe.resolution,
+		revision:   recipe.revision,
+	}
+	if source.DynamicRange != "" && source.DynamicRange != DynamicRangeSDRV3 {
+		plan.Transformations = append(plan.Transformations, TransformationV3{
+			Name: TransformationHDRToSDRToneMapV3, Executor: ExecutorServerV3,
+			RecipeVersion:   TransformationHDRToSDRToneMapRecipeVersionV3,
+			ValidatedClaims: []string{ClaimHDRMetadataRemovedV3, ClaimSDRBT709OutputV3},
+		})
+		plan.DegradationWarnings = append(plan.DegradationWarnings, DegradationWarningV3{
+			Code: DegradationWarningHDRToneMappedV3, Message: "HDR video is tone-mapped to SDR for this playback route.",
+		})
+		return toneMap
+	}
+	// A non-tone-mapped recipe has no execution policy. Keeping PolicyNone
+	// here would turn an ordinary SDR encode into a partial frozen recipe at
+	// the FFmpeg execution boundary.
+	toneMap.policy = ""
+	toneMap.sourceKind = ""
+	toneMap.resolution = tonemap.SourceResolution{}
+	toneMap.revision = tonemap.SourceRevision{}
+	return toneMap
+}
+
+// downgradeTranscodePlanV3 applies the transcode fallback ladder: a failed
+// codec attempt steps down to the H.264 floor, and a failed subtitle rendition
+// falls back to the sidecar. It returns the updated target, whether the
+// rendition survived, and a terminal when every recipe is exhausted.
+func downgradeTranscodePlanV3(input PlannerInputV3, subtitle SubtitlePolicyResultV3, plan *PlanV3, targetVideo targetVideoSelectionV3) (targetVideoSelectionV3, bool, *PlannerResultV3) {
+	outputContextID := input.Request.ClientPlaybackContext.Output.OutputContextID
+	// A failed HEVC attempt does not exhaust the H.264 route, and a failed AV1
+	// attempt does not exhaust either fallback. Rebuild the candidate before
+	// checking exhaustion so recovery can downgrade codecs on the same HLS
+	// delivery without changing source/remux behavior.
+	if targetVideo.codec != TargetVideoCodecH264V3 && planAttemptedV3(*plan, outputContextID, input.AttemptedKeys) {
+		targetVideo = targetVideoFloorV3
+		plan.EffectiveRecipe.VideoCodec = targetVideo.codec
+		plan.EffectiveRecipe.VideoSampleEntry = ""
+		plan.Transformations = replaceVideoTransformationV3(plan.Transformations, targetVideo)
+		if !deliverySupportsPlanV3(input.Request, DeliveryClassHLSV3, *plan) {
+			result := terminalPlannerResultV3("adaptation_unavailable", "The HLS delivery cannot decode the H.264 fallback recipe.", false)
+			return targetVideo, false, &result
+		}
+		finalizePlanIdentityV3(plan, input.Request.PlaybackAttemptID, outputContextID)
+	}
+	subtitleRendition := false
+	if hlsSubtitleRenditionEligibleV3(input, subtitle, targetVideo.codec) {
+		applyHLSSubtitleRenditionV3(plan)
+		finalizePlanIdentityV3(plan, input.Request.PlaybackAttemptID, outputContextID)
+		subtitleRendition = true
+		// A rendition that already failed falls back to the sidecar rather
+		// than exhausting the route: the two are different recipes.
+		if planAttemptedV3(*plan, outputContextID, input.AttemptedKeys) {
+			applySubtitleDecisionV3(plan, subtitle.Decision)
+			plan.Claims.Subtitles = subtitle.Claims
+			finalizePlanIdentityV3(plan, input.Request.PlaybackAttemptID, outputContextID)
+			subtitleRendition = false
+		}
+	}
+	if planAttemptedV3(*plan, outputContextID, input.AttemptedKeys) {
+		if input.DecodeAttemptDetail != "" {
+			result := terminalPlannerResultV3WithDetail("adaptation_exhausted", "All compatible playback recipes have already failed for this output route.", input.DecodeAttemptDetail, false)
+			return targetVideo, subtitleRendition, &result
+		}
+		result := terminalPlannerResultV3("adaptation_exhausted", "All compatible playback recipes have already failed for this output route.", false)
+		return targetVideo, subtitleRendition, &result
+	}
+	return targetVideo, subtitleRendition, nil
+}
+
+func planVideoTranscodeV3(input PlannerInputV3, base PlanV3, source SourceDescriptorV3, quality QualityResultV3, subtitle SubtitlePolicyResultV3, reasonOverride string, subtitleForcedAdaptation bool, compatibleRouteExcluded bool) PlannerResultV3 {
+	if terminal := planVideoTranscodeUnavailableV3(input, subtitle, subtitleForcedAdaptation, compatibleRouteExcluded); terminal != nil {
+		return *terminal
+	}
+	targetVideo, toneMapRecipe, terminal := resolveTranscodeVideoTargetV3(input, source, subtitle, subtitleForcedAdaptation)
+	if terminal != nil {
+		return *terminal
 	}
 	// HEVC needs the server opt-in plus the detailed output-capability check:
 	// flat codec lists can describe source copy support without proving the
@@ -1355,16 +1494,9 @@ func planVideoTranscodeV3(input PlannerInputV3, base PlanV3, source SourceDescri
 	plan.EffectiveRecipe.SoftwareVideoDecode = base.EffectiveRecipe.SoftwareVideoDecode || input.ForceSoftwareVideoDecode
 	plan.EffectiveRecipe.Width = intPointerV3(quality.Width)
 	plan.EffectiveRecipe.Height = intPointerV3(quality.Height)
-	targetAudioBitrateKbps := 0
-	if input.ServerBitrateCapKbps > 0 {
-		channels := aacOutputChannelsV3(input.Request, DeliveryClassHLSV3, source.AudioChannels, true)
-		_, defaultAudioBitrateKbps := ResolveAACOutputV3(channels, 0)
-		budget := optionalValueV3(input.Request.BandwidthCapKbps) * 95 / 100
-		targetAudioBitrateKbps = min(defaultAudioBitrateKbps, max(64, budget/4))
-		if budget-targetAudioBitrateKbps < 64 {
-			return terminalPlannerResultV3(TerminalBitratePolicyUnavailableV3, "The server bitrate limit is too low for a playable video stream.", false)
-		}
-		quality.BitrateKbps = min(quality.BitrateKbps, budget-targetAudioBitrateKbps)
+	targetAudioBitrateKbps, terminal := applyTranscodeAudioBudgetV3(input, source, &quality)
+	if terminal != nil {
+		return *terminal
 	}
 
 	plan.EffectiveRecipe.BitrateKbps = intPointerV3(quality.BitrateKbps)
@@ -1378,30 +1510,7 @@ func planVideoTranscodeV3(input PlannerInputV3, base PlanV3, source SourceDescri
 		TransformationV3{Name: targetVideo.transformation, Executor: ExecutorServerV3, RecipeVersion: targetVideo.recipeVersion, ValidatedClaims: []string{targetVideo.claim}},
 		TransformationV3{Name: TransformationAudioToAACV3, Executor: ExecutorServerV3, RecipeVersion: TransformationAudioToAACRecipeVersionV3, ValidatedClaims: []string{ClaimAudioDecodeV3}},
 	)
-	toneMapPolicy := toneMapRecipe.policy
-	toneMapMode := toneMapRecipe.mode
-	toneMapResolution := toneMapRecipe.resolution
-	toneMapRevision := toneMapRecipe.revision
-	toneMapOK := toneMapRecipe.ok
-	toneMapSourceKind := toneMapResolution.Kind
-	if source.DynamicRange != "" && source.DynamicRange != DynamicRangeSDRV3 {
-		plan.Transformations = append(plan.Transformations, TransformationV3{
-			Name: TransformationHDRToSDRToneMapV3, Executor: ExecutorServerV3,
-			RecipeVersion:   TransformationHDRToSDRToneMapRecipeVersionV3,
-			ValidatedClaims: []string{ClaimHDRMetadataRemovedV3, ClaimSDRBT709OutputV3},
-		})
-		plan.DegradationWarnings = append(plan.DegradationWarnings, DegradationWarningV3{
-			Code: DegradationWarningHDRToneMappedV3, Message: "HDR video is tone-mapped to SDR for this playback route.",
-		})
-	} else {
-		// A non-tone-mapped recipe has no execution policy. Keeping PolicyNone
-		// here would turn an ordinary SDR encode into a partial frozen recipe at
-		// the FFmpeg execution boundary.
-		toneMapPolicy = ""
-		toneMapSourceKind = ""
-		toneMapResolution = tonemap.SourceResolution{}
-		toneMapRevision = tonemap.SourceRevision{}
-	}
+	toneMap := applyTranscodeToneMapV3(source, &plan, toneMapRecipe)
 	plan.Claims.Audio = AudioClaimsV3{Codec: "aac", Passthrough: false, AtmosPreserved: false, Reason: "server_audio_adaptation"}
 	applySubtitleDecisionV3(&plan, subtitle.Decision)
 	plan.Claims.Subtitles = subtitle.Claims
@@ -1419,41 +1528,11 @@ func planVideoTranscodeV3(input PlannerInputV3, base PlanV3, source SourceDescri
 		return terminalPlannerResultV3("adaptation_unavailable", "The HLS delivery cannot decode the planned transcode recipe.", false)
 	}
 	finalizePlanIdentityV3(&plan, input.Request.PlaybackAttemptID, input.Request.ClientPlaybackContext.Output.OutputContextID)
-	// A failed HEVC attempt does not exhaust the H.264 route, and a failed AV1
-	// attempt does not exhaust either fallback. Rebuild the candidate before
-	// checking exhaustion so recovery can downgrade codecs on the same HLS
-	// delivery without changing source/remux behavior.
-	if targetVideo.codec != TargetVideoCodecH264V3 && planAttemptedV3(plan, input.Request.ClientPlaybackContext.Output.OutputContextID, input.AttemptedKeys) {
-		targetVideo = targetVideoFloorV3
-		plan.EffectiveRecipe.VideoCodec = targetVideo.codec
-		plan.EffectiveRecipe.VideoSampleEntry = ""
-		plan.Transformations = replaceVideoTransformationV3(plan.Transformations, targetVideo)
-		if !deliverySupportsPlanV3(input.Request, DeliveryClassHLSV3, plan) {
-			return terminalPlannerResultV3("adaptation_unavailable", "The HLS delivery cannot decode the H.264 fallback recipe.", false)
-		}
-		finalizePlanIdentityV3(&plan, input.Request.PlaybackAttemptID, input.Request.ClientPlaybackContext.Output.OutputContextID)
+	targetVideo, subtitleRendition, terminal := downgradeTranscodePlanV3(input, subtitle, &plan, targetVideo)
+	if terminal != nil {
+		return *terminal
 	}
-	subtitleRendition := false
-	if hlsSubtitleRenditionEligibleV3(input, subtitle, targetVideo.codec) {
-		applyHLSSubtitleRenditionV3(&plan)
-		finalizePlanIdentityV3(&plan, input.Request.PlaybackAttemptID, input.Request.ClientPlaybackContext.Output.OutputContextID)
-		subtitleRendition = true
-		// A rendition that already failed falls back to the sidecar rather
-		// than exhausting the route: the two are different recipes.
-		if planAttemptedV3(plan, input.Request.ClientPlaybackContext.Output.OutputContextID, input.AttemptedKeys) {
-			applySubtitleDecisionV3(&plan, subtitle.Decision)
-			plan.Claims.Subtitles = subtitle.Claims
-			finalizePlanIdentityV3(&plan, input.Request.PlaybackAttemptID, input.Request.ClientPlaybackContext.Output.OutputContextID)
-			subtitleRendition = false
-		}
-	}
-	if planAttemptedV3(plan, input.Request.ClientPlaybackContext.Output.OutputContextID, input.AttemptedKeys) {
-		if input.DecodeAttemptDetail != "" {
-			return terminalPlannerResultV3WithDetail("adaptation_exhausted", "All compatible playback recipes have already failed for this output route.", input.DecodeAttemptDetail, false)
-		}
-		return terminalPlannerResultV3("adaptation_exhausted", "All compatible playback recipes have already failed for this output route.", false)
-	}
-	return PlannerResultV3{SubtitleRendition: subtitleRendition, Plan: &plan, PlayMethod: PlayTranscode, TranscodeAudio: true, TargetVideoCodec: targetVideo.codec, TargetAudioCodec: "aac", SourceAudioChannels: stereoDownmixSourceChannelsV3(source.AudioChannels, targetAudioChannels, true), TargetAudioChannels: targetAudioChannels, TargetAudioBitrateKbps: targetAudioBitrateKbps, TargetResolution: quality.Label, TargetBitrateKbps: quality.BitrateKbps, SourceFrameRate: source.FrameRate, SourceHeight: source.Height, SubtitleTrackIndex: subtitle.SelectedIndex, SubtitleTransportTrackIndex: subtitle.TransportIndex, SubtitleBurnIn: subtitle.RequiresBurn, SubtitleCodec: subtitle.Codec, DownloadedSubtitleID: subtitle.DownloadedSubtitleID, ToneMapPolicy: toneMapPolicy, ToneMapMode: toneMapMode, ToneMapSourceKind: toneMapSourceKind, ToneMapRecipeVersion: toneMapRecipeVersionV3(toneMapOK), ToneMapPreflightRequired: toneMapResolution.PreflightRequired, ToneMapSourceRevision: toneMapRevision, ToneMapVPPEnabled: toneMapOK && input.Settings.VPPToneMapEnabled}
+	return PlannerResultV3{SubtitleRendition: subtitleRendition, Plan: &plan, PlayMethod: PlayTranscode, TranscodeAudio: true, TargetVideoCodec: targetVideo.codec, TargetAudioCodec: "aac", SourceAudioChannels: stereoDownmixSourceChannelsV3(source.AudioChannels, targetAudioChannels, true), TargetAudioChannels: targetAudioChannels, TargetAudioBitrateKbps: targetAudioBitrateKbps, TargetResolution: quality.Label, TargetBitrateKbps: quality.BitrateKbps, SourceFrameRate: source.FrameRate, SourceHeight: source.Height, SubtitleTrackIndex: subtitle.SelectedIndex, SubtitleTransportTrackIndex: subtitle.TransportIndex, SubtitleBurnIn: subtitle.RequiresBurn, SubtitleCodec: subtitle.Codec, DownloadedSubtitleID: subtitle.DownloadedSubtitleID, ToneMapPolicy: toneMap.policy, ToneMapMode: toneMap.mode, ToneMapSourceKind: toneMap.sourceKind, ToneMapRecipeVersion: toneMapRecipeVersionV3(toneMap.ok), ToneMapPreflightRequired: toneMap.resolution.PreflightRequired, ToneMapSourceRevision: toneMap.revision, ToneMapVPPEnabled: toneMap.ok && input.Settings.VPPToneMapEnabled}
 }
 
 func videoTransformationForCodecV3(sel targetVideoSelectionV3) TransformationV3 {
