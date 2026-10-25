@@ -29,6 +29,25 @@ export function containerDefaultAudioOrdinal(audioTracks: readonly PlayerAudioTr
 }
 
 /**
+ * The Dolby Vision base-layer compatibility ids the engine presents.
+ * Profile 8.1 and Profile 7 carry HDR10 (ids 1 and 6), 8.4 carries HLG (4) and
+ * 8.2 carries SDR (2). Profile 5 has no compatible base layer. Capability
+ * claims derive from this map, so the list the server sees cannot drift from
+ * the ids routing accepts.
+ */
+const DV_BASE_LAYER_TRANSFERS: ReadonlyMap<number, EngineTransfer> = new Map([
+  [1, "pq"],
+  [6, "pq"],
+  [4, "hlg"],
+  [2, "sdr"],
+]);
+
+/** The ids in {@link DV_BASE_LAYER_TRANSFERS}; safe to publish as claims. */
+export const ENGINE_DV_BL_COMPAT_IDS: readonly number[] = Array.from(
+  DV_BASE_LAYER_TRANSFERS.keys(),
+);
+
+/**
  * Maps a plan's dynamic range onto the transfer the engine presents, or null
  * when no route can present it. Dolby Vision is played through its
  * standards-compatible base layer: Profile 8.1 and Profile 7 carry HDR10, 8.4
@@ -47,17 +66,7 @@ export function engineTransferForPlan(plan: PlanV3): EngineTransfer | null {
     case "hlg":
       return "hlg";
     case "dolby_vision":
-      switch (plan.source.dv_bl_compat_id) {
-        case 1:
-        case 6:
-          return "pq";
-        case 4:
-          return "hlg";
-        case 2:
-          return "sdr";
-        default:
-          return null;
-      }
+      return DV_BASE_LAYER_TRANSFERS.get(plan.source.dv_bl_compat_id ?? -1) ?? null;
     default:
       return null;
   }

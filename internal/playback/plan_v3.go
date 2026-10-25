@@ -2708,7 +2708,7 @@ func deliverySupportsPlanV3(request StartRequestV3, deliveryClass string, plan P
 	}
 	clientManagedOriginalRange := deliveryClass == DeliveryClassOriginalHTTPV3 &&
 		len(plan.Transformations) == 0 &&
-		containsFoldV3(capability.ValidatedClaims, ClaimClientManagedDynamicRangeV3)
+		deliveryManagesOriginalDynamicRangeV3(capability, plan.Source)
 	if capability.HDRDetails != nil && !hdrDetailsSupportPlanV3(*capability.HDRDetails, plan) && !clientManagedOriginalRange {
 		return false
 	}

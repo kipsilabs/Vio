@@ -16,6 +16,7 @@ import {
   CLAIM_CLIENT_MANAGED_DYNAMIC_RANGE_V3,
   CLAIM_CLIENT_SELECTED_AUDIO_TRACK_V3,
   PROTOCOL_V3,
+  claimClientManagedDVBaseLayerV3,
   type ClientCodecCapabilitiesV3,
   type ClientPlaybackContextV3,
   type DeliveryCapabilityV3,
@@ -30,6 +31,7 @@ import {
 } from "./bandwidth-probe";
 import { isSafariBrowserV3 } from "./utils/hlsEngine";
 import type { EngineCapabilities } from "./engine/capabilities";
+import { ENGINE_DV_BL_COMPAT_IDS } from "./engine/routing";
 
 /** App version reported to the server for diagnostics. */
 const WEB_APP_VERSION = "web";
@@ -169,16 +171,28 @@ function buildDeliveryCapability(
 /**
  * The browser decode engine's additions to the `original_http` class: what it
  * decodes on top of the media element, the audio track it can pick from the
- * whole file, and, when its WebGPU presenter works and the display is SDR, HDR and
- * Dolby Vision originals (see docs/architecture/web-decode-engine.md). The
- * engine only presents SDR, so on an HDR display the claim stays off and HDR
+ * whole file, and, when its WebGPU presenter works and the display is SDR, HDR
+ * and Dolby Vision originals (see docs/architecture/web-decode-engine.md). The
+ * engine only presents SDR, so on an HDR display the claims stay off and HDR
  * sources keep the routes that preserve HDR.
+ *
+ * Dolby Vision gets one claim per base-layer compatibility id the engine routes
+ * ({@link ENGINE_DV_BL_COMPAT_IDS}), never the blanket managed-range claim
+ * alone: the engine presents a source's compatible base layer, and a source
+ * whose id is absent or unknown is not evidence that any base layer exists.
  */
 function engineOriginalOverrides(
   probe: WebCapabilityProbe,
   original: Partial<DeliveryCapabilityV3>,
   engine: EngineCapabilities,
 ): Partial<DeliveryCapabilityV3> {
+  const toneMapsHDR = engine.hdr && !probe.hdr;
+  const dvClaims = toneMapsHDR
+    ? ENGINE_DV_BL_COMPAT_IDS.flatMap((compatID) => {
+        const claim = claimClientManagedDVBaseLayerV3(compatID);
+        return claim ? [claim] : [];
+      })
+    : [];
   return {
     ...original,
     containers: union(probe.containers, engine.containers),
@@ -186,7 +200,8 @@ function engineOriginalOverrides(
     audio_decode_codecs: union(probe.codecsAudio, engine.audioCodecs),
     validated_claims: [
       CLAIM_CLIENT_SELECTED_AUDIO_TRACK_V3,
-      ...(engine.hdr && !probe.hdr ? [CLAIM_CLIENT_MANAGED_DYNAMIC_RANGE_V3] : []),
+      ...(toneMapsHDR ? [CLAIM_CLIENT_MANAGED_DYNAMIC_RANGE_V3] : []),
+      ...dvClaims,
     ],
   };
 }

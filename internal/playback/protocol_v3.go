@@ -130,11 +130,21 @@ const (
 	ClientDVTransformVersionV3      = "1"
 	// ClaimClientManagedDynamicRangeV3 is scoped to the original_http
 	// delivery. A client that advertises it accepts responsibility for mapping
-	// any source dynamic range it declares decodable onto the active output;
-	// the server must not require native sink-HDR support before delivering the
-	// original bytes. Packaged server deliveries remain output-gated.
+	// a non-Dolby-Vision HDR source it declares decodable onto the active
+	// output; the server must not require native sink-HDR support before
+	// delivering the original bytes. Dolby Vision needs the per-compatibility
+	// claim below, because presenting it depends on a base layer whose presence
+	// the source row must prove. Packaged server deliveries remain
+	// output-gated.
 	ClaimClientManagedDynamicRangeV3 = "client_managed_dynamic_range_v1"
 	ClaimClientSelectedAudioTrackV3  = "client_selected_audio_track_v1"
+	// ClaimClientManagedDVBaseLayerV3Prefix names the per-compatibility-id
+	// validated claim that narrows ClaimClientManagedDynamicRangeV3 for Dolby
+	// Vision: a client emits
+	// "client_managed_dv_bl_compat_<dv_bl_compat_id>_v1" only for an id whose
+	// standards-compatible base layer its original_http executor presents.
+	// Unknown or absent ids have no claim, so they fail closed.
+	ClaimClientManagedDVBaseLayerV3Prefix = "client_managed_dv_bl_compat_"
 	// ClaimClientDV8BaseLayerFallbackV3 is scoped to the original_http
 	// delivery. The executor decodes a single-layer Dolby Vision Profile 8
 	// stream through an ordinary HEVC decoder and presents its
@@ -150,6 +160,18 @@ const (
 	ClientSurfaceRecoveryV3           = "client_surface_recovery_v1"
 	DeviceQuirkRegistryRevisionV3     = "2026-07-13.1"
 )
+
+// ClientManagedDVBaseLayerClaimV3 returns the validated claim a client uses to
+// attest that its original_http executor presents the standards-compatible base
+// layer of a Dolby Vision source with [compatID]. It returns "" for an absent or
+// non-positive id: there is no claim for "unknown", and the caller must fail
+// closed rather than infer one.
+func ClientManagedDVBaseLayerClaimV3(compatID int) string {
+	if compatID <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s%d_v1", ClaimClientManagedDVBaseLayerV3Prefix, compatID)
+}
 
 // Worker transport features are protocol capabilities rather than media
 // transformations. They let route planning exclude an older worker before a
