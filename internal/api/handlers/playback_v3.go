@@ -5916,6 +5916,31 @@ func (h *PlaybackHandler) preferredAudioTrackIndexV3(ctx context.Context, userID
 // forced flag rather than copied by number. When it cannot be matched,
 // subtitleUnavailable reports the loss so the caller can warn instead of
 // silently planning subtitles off.
+// findCarryCandidateSessionV3 returns the most recently active session of the
+// same profile and file from the same client, if any. Matching by network and
+// client identity keeps one device's explicit picks from leaking onto another.
+func findCarryCandidateSessionV3(sessions []*playback.Session, profileID string, fileID int, clientIP, userAgent string) *playback.Session {
+	var previous *playback.Session
+	for _, session := range sessions {
+		if session == nil || session.ProfileID != profileID {
+			continue
+		}
+		if session.MediaFileID != fileID && session.RequestedMediaFileID != fileID {
+			continue
+		}
+		if clientIP != "" && session.ClientIP != "" && session.ClientIP != clientIP {
+			continue
+		}
+		if userAgent != "" && session.ClientUserAgent != "" && session.ClientUserAgent != userAgent {
+			continue
+		}
+		if previous == nil || session.LastActivityAt.After(previous.LastActivityAt) {
+			previous = session
+		}
+	}
+	return previous
+}
+
 func (h *PlaybackHandler) carrySelectionsFromActiveSessionV3(
 	ctx context.Context,
 	userID int,
@@ -5936,24 +5961,7 @@ func (h *PlaybackHandler) carrySelectionsFromActiveSessionV3(
 	}
 	clientIP = strings.TrimSpace(clientIP)
 	userAgent = strings.TrimSpace(userAgent)
-	var previous *playback.Session
-	for _, session := range lister.GetUserSessions(userID) {
-		if session == nil || session.ProfileID != profileID {
-			continue
-		}
-		if session.MediaFileID != file.ID && session.RequestedMediaFileID != file.ID {
-			continue
-		}
-		if clientIP != "" && session.ClientIP != "" && session.ClientIP != clientIP {
-			continue
-		}
-		if userAgent != "" && session.ClientUserAgent != "" && session.ClientUserAgent != userAgent {
-			continue
-		}
-		if previous == nil || session.LastActivityAt.After(previous.LastActivityAt) {
-			previous = session
-		}
-	}
+	previous := findCarryCandidateSessionV3(lister.GetUserSessions(userID), profileID, file.ID, clientIP, userAgent)
 	if previous == nil {
 		return false, false, false
 	}
