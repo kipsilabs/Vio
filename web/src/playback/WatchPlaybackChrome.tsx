@@ -773,7 +773,9 @@ function WatchPlaybackHostContent() {
         contentId,
         positionSeconds: exitState.positionSeconds,
         durationSeconds: exitState.durationSeconds,
-        lastFileId: exitState.lastFileId,
+        // Persist the viewer's chosen row, not the server's substitution: the
+        // next mount must not present the substituted file as if they picked it.
+        lastFileId: exitState.selectedFileId ?? exitState.lastFileId,
         lastResolution: exitState.lastResolution,
         lastHDR: exitState.lastHDR,
         lastCodecVideo: exitState.lastCodecVideo,
