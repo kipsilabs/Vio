@@ -1137,17 +1137,8 @@ func (h *PlaybackHandler) GetPlaybackInventoryV2(ctx context.Context, caller Pla
 		return playback.PlaybackInventoryV3{}, playbackStoreOperationError()
 	}
 	inventory, invErr := h.playbackInventoryForSession(ctx, session, record)
-	if errors.Is(invErr, errPlaybackInventorySubtitlesUnavailable) {
-		return playback.PlaybackInventoryV3{}, playbackStoreOperationError()
-	}
 	return inventory, invErr
 }
-
-// errPlaybackInventorySubtitlesUnavailable marks a live-inventory read that
-// failed because the subtitle inventory dependency was unavailable. The v2 and
-// v1 readers map it to their own established problem shapes; the sentinel keeps
-// the shared resolver from picking one.
-var errPlaybackInventorySubtitlesUnavailable = errors.New("playback inventory subtitle load failed")
 
 // playbackInventoryForSession resolves the live inventory and the effective
 // version identity for an active session. Both the v2 and v3 readers call it so
@@ -1204,8 +1195,15 @@ func (h *PlaybackHandler) playbackInventoryForFileV3(ctx context.Context, sessio
 
 	audioTracks := playback.AudioInventoryV3(file)
 	additional, subErr := h.downloadedSubtitleInventoryWithErrorV3(ctx, file)
-	if subErr != nil {
-		return playback.PlaybackInventoryV3{}, errPlaybackInventorySubtitlesUnavailable
+	inventoryRetryable := subErr != nil
+	if inventoryRetryable {
+		// Download/AI subtitle rows are an extension of the base inventory. A
+		// failed read must not turn the whole menu into a 503 the client renders
+		// as "no subtitles": serve the embedded and external tracks now and mark
+		// the read retryable so the next poll can pick the extension up.
+		additional = nil
+		slog.WarnContext(ctx, "live inventory: downloaded subtitle rows unavailable; serving the base inventory",
+			"component", "api", "session", session.ID, "file_id", catalogFileIDOrZero(file), "error", subErr)
 	}
 	subtitleInventory := playback.ScopeSubtitleInventoryV3(session.ID, file, playback.BuildSubtitleInventoryV3(file, additional), clientFeatures)
 
@@ -1235,6 +1233,12 @@ func (h *PlaybackHandler) playbackInventoryForFileV3(ctx context.Context, sessio
 		case probeOutcomeFailed:
 			status = string(ProbeProvenanceFailed)
 		}
+	}
+	if inventoryRetryable {
+		// The base inventory is complete but the downloaded extension could not
+		// be read. Report pending (not failed) so the client keeps polling for
+		// the missing rows instead of treating the menu as final.
+		status = probeOutcomePending
 	}
 
 	effectiveFileID := 0
@@ -1315,6 +1319,16 @@ func (h *PlaybackHandler) inventoryEffectiveFile(ctx context.Context, file *mode
 		placeholder.SubtitleTracks = nil
 		placeholder.ExternalSubtitles = nil
 		placeholder.ProbeUpdatedAt = nil
+		// No catalog row names the bound candidate, so no row's inventory may
+		// speak for it. The plan-time inventory the session carries is the only
+		// evidence that describes what the plan was built against; serve it
+		// instead of an empty placeholder so the overlay menu is not blank. This
+		// is a read-only overlay: the catalog and the transport are untouched.
+		if session != nil && session.VirtualSubtitleEvidenceSet {
+			placeholder.AudioTracks = session.VirtualAudioTracks
+			placeholder.SubtitleTracks = session.VirtualSubtitleTracks
+			placeholder.ExternalSubtitles = session.VirtualExternalSubtitles
+		}
 		base = &placeholder
 		// Name the fail-closed decision so an operator can correlate an empty
 		// menu with the reason it is empty: no catalog row names the bound
@@ -1322,7 +1336,7 @@ func (h *PlaybackHandler) inventoryEffectiveFile(ctx context.Context, file *mode
 		// candidate URI is not logged raw — its query can carry provider
 		// identifiers — so the log carries the provider-neutral path and the
 		// concrete candidate id instead.
-		slog.InfoContext(ctx, "virtual inventory serving fail-closed placeholder: no catalog row names the bound candidate",
+		slog.InfoContext(ctx, "virtual inventory serving session evidence fallback: no catalog row names the bound candidate",
 			"component", "api",
 			"file_id", file.ID,
 			"base_id", placeholder.ID,

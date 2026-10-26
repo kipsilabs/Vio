@@ -37,7 +37,18 @@ with. A client polls this endpoint (or consumes the realtime `source_committed`
 event) to follow the streamed version. The response's inventory is the committed
 release's own; a rotated session whose new release is not yet probed reports
 `inventory_status: declared` and that release's declared (possibly empty)
-tracks, never the previous release's.
+tracks, never the previous release's. When no catalog row names the bound
+candidate at all, the response falls back to the inventory the running plan
+carried for that binding instead of an empty placeholder, so the player's
+overlay menu still lists what the plan committed to; the catalog is not
+rewritten by that read.
+
+The downloaded/AI subtitle rows are an extension of the base inventory. If that
+extension cannot be read, the endpoint still answers `200` with the embedded and
+external tracks and reports `inventory_status: pending`, rather than failing the
+whole menu with `503`. Clients should keep the current menu and poll again; a
+later successful read includes the downloaded rows and reports a new
+`inventory_revision`.
 
 ### Deferred track inventory
 
@@ -471,6 +482,15 @@ server carries nothing rather than guessing. The field is additive: older client
 that omit it keep the legacy behavior, and a client that always sends its own
 selection is unaffected.
 
+Selected track ids (`audio_track_id`, `subtitle_track_id`) embed the catalog row
+the plan minted them against, which is the plan's `effective_media_file_id` and
+can differ from the `file_id` a client re-sends on a restart. The server accepts
+an echoed id when the embedded row names the same virtual candidate, or when it
+is one of the same client's committed restart rows (the predecessor attempt's
+requested/effective row or the matching live session's rows), and re-keys it onto
+the row being validated. A row naming a different release is still treated as a
+stale selection and degrades to the default pipeline.
+
 Client guidance for resume and restarts:
 
 - Send `start_position` when the player already knows where to begin, or omit it
@@ -683,6 +703,14 @@ handler can retry a cached copy or fail over to a sibling release first; that
 502 is what remains once failover is exhausted. Relays and other non-deferred
 paths answer it directly. Clients should treat it as retryable: retry or replan
 to another candidate rather than waiting for the stream to start.
+
+A transport failover that lands on a genuinely different release probes that
+replacement before starting it. The viewer's audio selection is re-identified on
+the replacement's inventory (the same language/codec/layout match a version
+switch uses) instead of silently resetting to the first stream. A subtitle
+selection has no cross-release identity matcher yet, so the fallback starts with
+subtitles off and logs the reset; the client keeps the requested subtitle
+identity in its own state and can reselect it from the replacement's inventory.
 
 A seek is one server operation. Issue a single media request for the new
 position; sending the same seek twice (or aborting and immediately re-sending an

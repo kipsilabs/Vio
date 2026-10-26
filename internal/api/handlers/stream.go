@@ -2741,10 +2741,25 @@ func (h *StreamHandler) acceptedSubtitleSourceFileID(ctx context.Context, raw st
 	if lookupErr != nil || row == nil {
 		return 0, err
 	}
-	if !isVirtualPlaybackFile(row) || !sameVirtualCandidate(candidateURI, row.FilePath) {
+	if !isVirtualPlaybackFile(row) {
 		return 0, err
 	}
-	return requested, nil
+	// The row the session captured its evidence from is citable even after the
+	// row's path was adopted or renumbered: the URL was minted from that row's
+	// advertised inventory, and the evidence anchor is the durable name for it.
+	if evidenceID := session.VirtualSubtitleEvidenceFileID; evidenceID > 0 && requested == evidenceID {
+		return requested, nil
+	}
+	if sameVirtualCandidate(candidateURI, row.FilePath) {
+		return requested, nil
+	}
+	// A session whose binding URI was rewritten (or a legacy session with only
+	// an evidence URI) still admits the row that names its evidence candidate.
+	evidenceURI := strings.TrimSpace(session.VirtualSubtitleEvidenceURI)
+	if evidenceURI != "" && sameVirtualCandidate(evidenceURI, row.FilePath) {
+		return requested, nil
+	}
+	return 0, err
 }
 
 // SubtitleFontRequest identifies the session and frozen subtitle inventory
