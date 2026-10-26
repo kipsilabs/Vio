@@ -6051,9 +6051,16 @@ describe("VideoPlayer translation handoff", () => {
       // no warm fetch fires.
       expect(fetchMock).not.toHaveBeenCalled();
 
-      // A transport-changing replan (same URL, bumped revision) warms the
-      // stream exactly once, before the transport effect reloads the element.
-      rerenderPlayer({ planRevision: 2, transportRevision: 2 });
+      // A transport-changing replan (a different delivery and bumped revision)
+      // warms the stream exactly once, before the transport effect reloads the
+      // element.
+      const remuxPlan = fixturePlanV3({
+        ...directPlan,
+        delivery: "server_remux_progressive",
+        plan_id: "plan:remux",
+        plan_attempt_key: "v3:remux",
+      });
+      rerenderPlayer({ plan: remuxPlan, planRevision: 2, transportRevision: 2 });
       expect(fetchMock).toHaveBeenCalledTimes(1);
       expect(fetchMock).toHaveBeenCalledWith(
         "/api/v1/stream/session-1?token=token",
@@ -6066,23 +6073,67 @@ describe("VideoPlayer translation handoff", () => {
 
       // The same transportRevision across a further plan revision must not
       // refire the warm fetch.
-      rerenderPlayer({ planRevision: 3, transportRevision: 2 });
+      rerenderPlayer({ plan: remuxPlan, planRevision: 3, transportRevision: 2 });
       expect(fetchMock).toHaveBeenCalledTimes(1);
 
       // A seek reanchor bumps the transport revision and mints a new stream
       // URL, but its route is unchanged. The element's own load is the only
       // request the seek needs; warming it would spawn a second remux seek.
       const seekPlan = fixturePlanV3({
-        ...directPlan,
+        ...remuxPlan,
         plan_id: "plan:seek",
         plan_attempt_key: "v3:seek",
-        stream: { ...directPlan.stream, url: "/stream/session-1?seek=900" },
+        stream: { ...remuxPlan.stream, url: "/stream/session-1?seek=900" },
       });
       rerenderPlayer({
         plan: seekPlan,
         streamUrl: "/api/v1/stream/session-1?seek=900&token=token",
         planRevision: 4,
         transportRevision: 3,
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
+  it("skips the first position-only seek and still warms a new session", async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(null, { status: 200 }));
+    try {
+      const { rerenderPlayer } = renderPlayer({
+        planRevision: 1,
+        transportRevision: 0,
+      });
+      // Mount is the element's own load: no warm, and the mounted route is the
+      // baseline.
+      expect(fetchMock).not.toHaveBeenCalled();
+
+      // The first position-only seek bumps the revision but keeps the route.
+      // A null baseline used to read this as a transition and fire a duplicate
+      // warm GET alongside the element's own seek request.
+      const seekPlan = fixturePlanV3({
+        ...directPlan,
+        plan_id: "plan:first-seek",
+        plan_attempt_key: "v3:first-seek",
+        stream: { ...directPlan.stream, url: "/stream/session-1?seek=42" },
+      });
+      rerenderPlayer({
+        plan: seekPlan,
+        streamUrl: "/api/v1/stream/session-1?seek=42&token=token",
+        planRevision: 2,
+        transportRevision: 1,
+      });
+      expect(fetchMock).not.toHaveBeenCalled();
+
+      // A new session is a new server-side transport even on the same route.
+      rerenderPlayer({
+        plan: seekPlan,
+        streamUrl: "/api/v1/stream/session-1?seek=42&token=token",
+        planRevision: 3,
+        transportRevision: 2,
+        sessionId: "session-2",
       });
       expect(fetchMock).toHaveBeenCalledTimes(1);
     } finally {

@@ -2773,7 +2773,10 @@ export function VideoPlayer({
     () => `${sessionId}:${buildWarmTransportRouteKey(plan)}`,
     [plan, sessionId],
   );
-  const warmTransportRouteKeyRef = useRef<string | null>(null);
+  // Seed the baseline with the route this player mounted on. The element's own
+  // load starts that first transport, so a position-only seek (new revision,
+  // same route) must compare equal here instead of looking like a transition.
+  const warmTransportRouteKeyRef = useRef<string | null>(warmRouteKey);
   const transportRevisionRef = useRef<number | null>(null);
   useEffect(() => {
     const url = effectiveStreamUrl;
