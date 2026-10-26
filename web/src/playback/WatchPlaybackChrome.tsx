@@ -43,6 +43,7 @@ import { useVersionLiveness } from "@/hooks/queries/versionLiveness";
 import { useStampedVersions } from "./useStampedVersions";
 import { catalogKeys } from "@/hooks/queries/keys";
 import { applyPlaybackProgressToCache } from "@/hooks/queries/playbackProgressCache";
+import { readRequestedFileId, rememberRequestedFileId } from "./requestedVersion";
 import { invalidatePlaybackSurfaceQueries } from "@/hooks/queries/playbackSurfaceRefresh";
 import { useAuth } from "@/hooks/useAuth";
 import { useCurrentProfile } from "@/hooks/useCurrentProfile";
@@ -765,7 +766,17 @@ function WatchPlaybackHostContent() {
   const applyExitStateToCache = useCallback(
     (exitState?: PlaybackExitState) => {
       const contentId = activeItem?.content_id ?? activeRequest?.contentId;
-      if (!contentId || !exitState || exitState.positionSeconds <= 0) {
+      if (!contentId || !exitState) {
+        return;
+      }
+
+      // The viewer's own pick is durable, independent of the row the server
+      // records as last played: progress and history name the row that served
+      // the bytes, so a substitution would otherwise become the selected
+      // version on the next load.
+      rememberRequestedFileId(contentId, exitState.selectedFileId);
+
+      if (exitState.positionSeconds <= 0) {
         return;
       }
 
@@ -773,7 +784,9 @@ function WatchPlaybackHostContent() {
         contentId,
         positionSeconds: exitState.positionSeconds,
         durationSeconds: exitState.durationSeconds,
-        lastFileId: exitState.lastFileId,
+        // Persist the viewer's chosen row, not the server's substitution: the
+        // next mount must not present the substituted file as if they picked it.
+        lastFileId: exitState.selectedFileId ?? exitState.lastFileId,
         lastResolution: exitState.lastResolution,
         lastHDR: exitState.lastHDR,
         lastCodecVideo: exitState.lastCodecVideo,
@@ -976,6 +989,9 @@ function WatchPlaybackHostContent() {
       // what plays next.
       if (!activeItem?.series_id && !activeRequest?.shuffleId) {
         if (activeRequest) {
+          // A finished watch still records the row the viewer requested, so a
+          // substitution does not become the selected version on the page.
+          applyExitStateToCache(exitState);
           stopPlayback();
           navigate(buildWatchItemHref(activeRequest), { up: true });
         }
@@ -1123,6 +1139,12 @@ function WatchPlaybackHostContent() {
     ...activeItem,
     versions: stampedVersions,
   };
+  // The viewer's own pick for this title, from the device store. Progress
+  // persistence and history record the row that served the bytes, so the stored
+  // request is the only durable record of their choice. Read inline rather than
+  // memoized: this render path is not the time-tick lane, and the read must not
+  // add a hook after this component's conditional returns.
+  const requestedFileId = activeRequest ? readRequestedFileId(activeRequest.contentId) : null;
   const watchPageProps = buildWatchPageProps({
     request: activeRequest,
     item: itemForPlayer,
@@ -1132,6 +1154,7 @@ function WatchPlaybackHostContent() {
     // Undefined until the read resolves, which leaves the profile-column
     // fallback in place rather than blocking playback on a settings fetch.
     qualityPreference: canonicalQuality,
+    requestedFileId,
   });
   // The resolved answer already folds in the profile layer, so the props built
   // from the profile record are only the pre-resolution fallback.

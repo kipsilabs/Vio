@@ -289,7 +289,11 @@ interface VideoPlayerProps {
   /** `quality_change` replan for a label taken from `plan.available_qualities`. */
   onQualitySelect?: (label: string, currentPosition: number) => void;
   /** `track_change` replan for a subtitle the server has to render. */
-  onSubtitleTrackChange?: (combinedIndex: number | null, currentPosition: number) => void;
+  onSubtitleTrackChange?: (
+    combinedIndex: number | null,
+    currentPosition: number,
+    displayedTrack?: PlayerSubtitleInfo | null,
+  ) => void;
   /** `failure_recovery` replan after the client could not play the plan. */
   onPlanFailure?: (failure: FailureV3, currentPosition: number) => void;
   /**
@@ -820,6 +824,10 @@ export function VideoPlayer({
       `${plan.effective_media_file_id}|${plan.effective_virtual_uri ?? ""}|${plan.virtual_source_revision ?? ""}`,
   );
   const lastSubtitleIndexRef = useRef<number | null>(null);
+  // The plan whose committed subtitle selection the marker has reconciled to.
+  // A successful replan can re-mint combined ordinals without changing the
+  // asset, so the optimistic index must follow the committed plan.
+  const lastSubtitlePlanIdRef = useRef(plan.plan_id);
   const subtitleSelectionWasManualRef = useRef(false);
   const subtitleSelectionWasManualOffRef = useRef(false);
   const consumedInitialSubtitleErrorKeyRef = useRef<string | null>(null);
@@ -1155,18 +1163,20 @@ export function VideoPlayer({
   // one that was asked for. When the plan resolved a neutral virtual row to a
   // concrete candidate, `effective_virtual_uri` names that candidate by path;
   // matching there is what makes the version menu light the working row.
+  // A list miss is a real miss: falling back to the selected row would light
+  // the viewer's pick as "Playing" while the server serves another candidate,
+  // which is exactly the silent substitution this surface must not show.
   const effectiveVersion = useMemo(
     () =>
       resolveEffectiveVersion(versions, {
         mediaFileId: activeFileId ?? plan.effective_media_file_id,
         effectiveVirtualUri: activeVirtualUri ?? plan.effective_virtual_uri ?? null,
-      }) ?? selectedVersion,
+      }) ?? undefined,
     [
       activeFileId,
       activeVirtualUri,
       plan.effective_media_file_id,
       plan.effective_virtual_uri,
-      selectedVersion,
       versions,
     ],
   );
@@ -2020,6 +2030,14 @@ export function VideoPlayer({
       positionSeconds,
       durationSeconds,
       lastFileId: effectiveVersion?.file_id ?? activeFileId ?? selectedVersion?.file_id,
+      // The request's row is the viewer's pick; the effective row above is
+      // whatever the server actually served. Persisting the pick keeps a
+      // substitution from becoming the selected version after exit.
+      selectedFileId:
+        plan.requested_media_file_id ??
+        effectiveVersion?.file_id ??
+        activeFileId ??
+        selectedVersion?.file_id,
       lastResolution: selectedVersion?.resolution,
       lastHDR: selectedVersion?.hdr,
       lastCodecVideo: selectedVersion?.codec_video,
@@ -2031,6 +2049,7 @@ export function VideoPlayer({
     duration,
     effectiveVersion,
     elementMediaPosition,
+    plan.requested_media_file_id,
     selectedVersion,
   ]);
 
@@ -4306,11 +4325,18 @@ export function VideoPlayer({
       currentTimeRef.current,
       subtitleFetchAnchorRef.current,
     );
-    onSubtitleTrackChange?.(desiredServerIndex, position);
+    onSubtitleTrackChange?.(
+      desiredServerIndex,
+      position,
+      desiredServerIndex === null
+        ? null
+        : (effectiveSubtitleTracks.find((track) => track.index === desiredServerIndex) ?? null),
+    );
   }, [
     activeSubtitleIdentity,
     activeSubtitleIndex,
     activeSubtitleSourceKey,
+    effectiveSubtitleTracks,
     initialSubtitleError,
     onSubtitleTrackChange,
     planSelectedSubtitleIdentity,
@@ -4346,6 +4372,55 @@ export function VideoPlayer({
       });
     }
   }, [plan.selected_tracks.subtitle?.index, replanError, replanErrorTitle, replanning]);
+
+  // A successful replan is authoritative for the marker. The inventory can be
+  // re-minted at new combined ordinals for the same asset, and the optimistic
+  // click index belongs to the outgoing plan. Reconcile the marker to the
+  // committed selection whenever a new plan with the same source lands; a
+  // source change is owned by the identity remap below.
+  const lastSubtitleResyncSourceRef = useRef(
+    `${plan.effective_media_file_id}|${plan.effective_virtual_uri ?? ""}|${plan.virtual_source_revision ?? ""}`,
+  );
+  useEffect(() => {
+    const sourceKey = `${plan.effective_media_file_id}|${plan.effective_virtual_uri ?? ""}|${plan.virtual_source_revision ?? ""}`;
+    if (lastSubtitleResyncSourceRef.current !== sourceKey) {
+      lastSubtitleResyncSourceRef.current = sourceKey;
+      return;
+    }
+    if (lastSubtitlePlanIdRef.current === plan.plan_id) return;
+    if (replanning || subtitleHandoverPending) return;
+    lastSubtitlePlanIdRef.current = plan.plan_id;
+    if (activeSubtitleIndex === LIVE_SUBTITLE_INDEX) return;
+    const currentRefusalKey = initialSubtitleError
+      ? `${sessionId}|${plan.plan_attempt_key}|${initialSubtitleError}`
+      : null;
+    if (initialSubtitleError && consumedInitialSubtitleErrorKeyRef.current !== currentRefusalKey) {
+      return;
+    }
+    const nextIndex = plan.selected_tracks.subtitle?.index;
+    // Only a committed track can re-mint an ordinal. A plan with no subtitle
+    // selection is not evidence the viewer wants subtitles off: the failure
+    // rollback above owns refusals, and the auto-select/version-switch effects
+    // own an empty committed selection.
+    if (nextIndex == null || nextIndex < 0) return;
+    if (nextIndex !== activeSubtitleIndex) {
+      setActiveSubtitleIndex(nextIndex);
+      lastSubtitleIndexRef.current = nextIndex;
+    }
+    subtitleSelectionWasManualOffRef.current = false;
+  }, [
+    activeSubtitleIndex,
+    initialSubtitleError,
+    plan.effective_media_file_id,
+    plan.effective_virtual_uri,
+    plan.plan_attempt_key,
+    plan.plan_id,
+    plan.selected_tracks.subtitle?.index,
+    plan.virtual_source_revision,
+    replanning,
+    sessionId,
+    subtitleHandoverPending,
+  ]);
 
   // When a start or version switch falls back to subtitles-off after a subtitle-bearing
   // start was refused, pin selection Off so manual remapping does not re-request the dropped subtitle.

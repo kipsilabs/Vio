@@ -141,6 +141,7 @@ function playbackSession(
     retrying: false,
     initialSubtitleErrorTitle: null,
     initialSubtitleError: null,
+    trackSelectionNotice: null,
     connectionStatus: "connected",
     connectionErrorTitle: null,
     connectionError: null,
@@ -452,6 +453,35 @@ describe("WatchPage playback state", () => {
 
     expect(updatePlaybackState).toHaveBeenCalledWith(321, true);
     expect(onPlaybackStateChange).toHaveBeenCalledWith(state);
+  });
+});
+
+describe("WatchPage exit selection", () => {
+  it("carries the requested file beside the effective one on end", async () => {
+    const onEnded = vi.fn();
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        plan: fixturePlanV3({ requested_media_file_id: 7, effective_media_file_id: 8 }),
+        mediaFileId: 8,
+      }),
+    );
+    render(
+      createElement(WatchPage, {
+        ...watchPageProps,
+        fileId: 7,
+        onEnded,
+      }),
+    );
+    await waitFor(() => expect(videoPlayerMock).toHaveBeenCalled());
+    const props = videoPlayerMock.mock.calls.at(-1)?.[0] as { onEnded?: () => void };
+    act(() => props.onEnded?.());
+
+    expect(onEnded).toHaveBeenCalledWith(
+      expect.objectContaining({
+        lastFileId: 8,
+        selectedFileId: 7,
+      }),
+    );
   });
 });
 

@@ -129,6 +129,7 @@ function playbackSession(
     retrying: false,
     initialSubtitleErrorTitle: null,
     initialSubtitleError: null,
+    trackSelectionNotice: null,
     connectionStatus: "connected",
     connectionErrorTitle: null,
     connectionError: null,

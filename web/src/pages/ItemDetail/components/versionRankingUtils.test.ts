@@ -2,7 +2,11 @@
 
 import { describe, expect, it } from "vitest";
 import type { FileVersion } from "@/api/types";
-import { pickBestAttributes, selectDefaultVersion } from "./versionRankingUtils";
+import {
+  pickBestAttributes,
+  selectDefaultPlaybackVariantVersion,
+  selectDefaultVersion,
+} from "./versionRankingUtils";
 
 function makeVersion(overrides: Partial<FileVersion> = {}): FileVersion {
   return {
@@ -154,5 +158,95 @@ describe("selectDefaultVersion audio matching", () => {
       ],
     });
     expect(selectDefaultVersion([plain, atmos])?.file_id).toBe(2);
+  });
+});
+
+describe("persisted version selection", () => {
+  const theatrical = makeVersion({
+    file_id: 11,
+    resolution: "1080p",
+    codec_audio: "aac",
+    edition_key: "theatrical",
+  });
+  const extended = makeVersion({
+    file_id: 22,
+    resolution: "2160p",
+    codec_audio: "eac3",
+    edition_key: "extended",
+  });
+
+  it("keeps the last watched row even when its edition no longer matches the preference", () => {
+    expect(
+      selectDefaultVersion(
+        [theatrical, extended],
+        { last_file_id: 11, last_edition_key: "extended" } as never,
+        "2160p",
+        "extended",
+      )?.file_id,
+    ).toBe(11);
+  });
+
+  it("keeps the last watched row even when a variant filter moved the candidate set", () => {
+    expect(
+      selectDefaultPlaybackVariantVersion(
+        [theatrical, extended],
+        [
+          {
+            id: "extended",
+            edition_key: "extended",
+            parts: [{ part_index: 0, versions: [extended] }],
+          },
+          {
+            id: "theatrical",
+            edition_key: "theatrical",
+            parts: [{ part_index: 0, versions: [theatrical] }],
+          },
+        ] as never,
+        { last_file_id: 11, last_edition_key: "extended" } as never,
+        "2160p",
+        "extended",
+      )?.file_id,
+    ).toBe(11);
+  });
+
+  it("prefers the device's requested row over the last watched substitute", () => {
+    const variants = [
+      {
+        id: "extended",
+        edition_key: "extended",
+        parts: [{ part_index: 0, versions: [extended] }],
+      },
+      {
+        id: "theatrical",
+        edition_key: "theatrical",
+        parts: [{ part_index: 0, versions: [theatrical] }],
+      },
+    ] as never;
+
+    // Progress persistence stored the row that served the bytes (11); the
+    // viewer asked for 22.
+    expect(
+      selectDefaultPlaybackVariantVersion(
+        [theatrical, extended],
+        variants,
+        { last_file_id: 11, last_edition_key: "extended" } as never,
+        "2160p",
+        "extended",
+        22,
+      )?.file_id,
+    ).toBe(22);
+  });
+
+  it("falls back to the last watched row when the requested row left the catalog", () => {
+    expect(
+      selectDefaultPlaybackVariantVersion(
+        [theatrical, extended],
+        undefined,
+        { last_file_id: 22 } as never,
+        "2160p",
+        null,
+        999,
+      )?.file_id,
+    ).toBe(22);
   });
 });

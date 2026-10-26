@@ -4,6 +4,7 @@ import { act, render } from "@testing-library/react";
 import { MemoryRouter } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { FileVersion, ItemDetail } from "@/api/types";
+import { readRequestedFileId, rememberRequestedFileId } from "@/playback/requestedVersion";
 import MovieContent from "./MovieContent";
 
 const mocks = vi.hoisted(() => {
@@ -278,6 +279,7 @@ function makeMovieItem(overrides: Partial<ItemDetail & { type: "movie" }> = {}):
 
 describe("MovieContent", () => {
   beforeEach(() => {
+    localStorage.clear();
     mocks.capturedActionBarProps.value = null;
     mocks.capturedMetadataBadgesProps.value = null;
     mocks.capturedQualityBadgesProps.value = null;
@@ -359,6 +361,78 @@ describe("MovieContent", () => {
         videoRangeLabel: "",
         audioLabel: "DTS",
       },
+    });
+  });
+
+  // Exiting a substituted playback writes the requested row to the device
+  // store; a fresh server-backed detail still names the effective candidate in
+  // `last_file_id` (progress and history record the row that served the bytes).
+  it("keeps the viewer's requested row selected over a fresh last-played substitute", () => {
+    const substitute = makeFileVersion({ file_id: 1, resolution: "2160p" });
+    const requested = makeFileVersion({ file_id: 2, resolution: "1080p" });
+    rememberRequestedFileId("movie-1", requested.file_id);
+
+    render(
+      <MemoryRouter initialEntries={["/item/movie-1"]}>
+        <MovieContent
+          item={makeMovieItem({
+            versions: [substitute, requested],
+            user_data: {
+              played: false,
+              position_seconds: 600,
+              duration_seconds: 7200,
+              last_file_id: substitute.file_id,
+            },
+          })}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(mocks.capturedActionBarProps.value).toMatchObject({
+      selectedVersion: expect.objectContaining({ file_id: requested.file_id }),
+      selectedVersionMissing: false,
+    });
+  });
+
+  it("remembers an explicit pick as the requested row", () => {
+    const first = makeFileVersion({ file_id: 1 });
+    const second = makeFileVersion({ file_id: 2, resolution: "1080p" });
+
+    render(
+      <MemoryRouter initialEntries={["/item/movie-1"]}>
+        <MovieContent item={makeMovieItem({ versions: [first, second] })} />
+      </MemoryRouter>,
+    );
+
+    act(() => {
+      const selectVersion = mocks.capturedActionBarProps.value?.onSelectVersion as
+        | ((version: FileVersion) => void)
+        | undefined;
+      selectVersion?.(second);
+    });
+
+    expect(readRequestedFileId("movie-1")).toBe(second.file_id);
+    expect(mocks.capturedActionBarProps.value).toMatchObject({
+      selectedVersion: expect.objectContaining({ file_id: second.file_id }),
+    });
+  });
+
+  it("asks for a replacement pick when the requested row is gone", () => {
+    rememberRequestedFileId("movie-1", 3);
+
+    render(
+      <MemoryRouter initialEntries={["/item/movie-1"]}>
+        <MovieContent
+          item={makeMovieItem({
+            versions: [makeFileVersion({ file_id: 1 }), makeFileVersion({ file_id: 2 })],
+          })}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(mocks.capturedActionBarProps.value).toMatchObject({
+      selectedVersion: null,
+      selectedVersionMissing: true,
     });
   });
 
