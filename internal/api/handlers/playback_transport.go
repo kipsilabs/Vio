@@ -526,18 +526,10 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 			// pinned release's audio selection is remapped by identity rather
 			// than silently reset to the container default. A selection with no
 			// equivalent on the replacement still degrades, but the reset is
-			// logged (and the plan keeps the requested identity for the client).
-			remappedAudioIndex := remapFallbackAudioIndexV3(file, probedFacts, opts.AudioTrackIndex)
+			// warned (and the plan keeps the requested identity for the client).
+			remappedAudioIndex, audioCarry := remapFallbackAudioIndexV3(file, probedFacts, opts.AudioTrackIndex)
 			attemptOpts.AudioTrackIndex = remappedAudioIndex
-			if remappedAudioIndex >= 0 {
-				logCrossReleaseAudioCarry(startupCtx, file, probedFacts, opts.AudioTrackIndex, remappedAudioIndex, resolvedMedia.CandidateID)
-			}
-			if probedFacts == nil && opts.AudioTrackIndex >= 0 {
-				slog.WarnContext(startupCtx, "cross-release virtual fallback could not probe the replacement; using its default audio track",
-					"component", "api", "file_id", catalogFileIDOrZero(file),
-					"requested_audio_index", opts.AudioTrackIndex,
-					"candidate_id", resolvedMedia.CandidateID)
-			}
+			logCrossReleaseAudioCarry(startupCtx, file, probedFacts, opts.AudioTrackIndex, remappedAudioIndex, audioCarry, resolvedMedia.CandidateID)
 			if opts.SubtitleTrackIndex >= 0 {
 				slog.WarnContext(startupCtx, "cross-release virtual fallback reset the subtitle selection to off",
 					"component", "api", "file_id", catalogFileIDOrZero(file),
@@ -697,27 +689,119 @@ func (h *PlaybackHandler) probeVirtualFallbackSource(ctx context.Context, resolv
 	return probed
 }
 
+// fallbackAudioCarryV3 classifies the outcome of carrying the pinned release's
+// audio selection onto the replacement a cross-release fallback probed. The
+// caller needs the distinction to keep an informational log on a true identity
+// carry and warn when the viewer is about to hear the container default instead
+// of the selected track.
+type fallbackAudioCarryV3 int
+
+const (
+	// fallbackAudioCarryNone means the request had no audio selection to carry.
+	fallbackAudioCarryNone fallbackAudioCarryV3 = iota
+	// fallbackAudioCarryMatched means the selected track family was found on the
+	// replacement and remapped to its ordinal.
+	fallbackAudioCarryMatched
+	// fallbackAudioCarryDegraded means a selection existed but the replacement's
+	// inventory could not honor it, so playback falls back to its default track.
+	fallbackAudioCarryDegraded
+)
+
 // remapFallbackAudioIndexV3 carries the pinned release's audio selection onto the
 // replacement a cross-release fallback probed. It returns -1 (the container
-// default) only when the request had no audio selection or nothing could be
-// probed; otherwise the selected track family is matched by identity, exactly
-// like a version switch, so a fallback does not silently change the language the
-// viewer hears.
-func remapFallbackAudioIndexV3(pinned, probed *models.MediaFile, requestedIndex int) int {
+// default) when there is no selection to carry, and an explicit degraded result
+// when a selection existed but the replacement could not honor it, so the caller
+// can warn instead of logging a successful carry.
+func remapFallbackAudioIndexV3(pinned, probed *models.MediaFile, requestedIndex int) (int, fallbackAudioCarryV3) {
 	if requestedIndex < 0 || pinned == nil || len(pinned.AudioTracks) == 0 {
-		return -1
+		return -1, fallbackAudioCarryNone
 	}
 	if probed == nil || len(probed.AudioTracks) == 0 {
-		return -1
+		return -1, fallbackAudioCarryDegraded
 	}
-	return playback.MatchAudioTrackAcrossVersions(pinned.AudioTracks, probed.AudioTracks, requestedIndex)
+	index := playback.MatchAudioTrackAcrossVersions(pinned.AudioTracks, probed.AudioTracks, requestedIndex)
+	if index < 0 {
+		return -1, fallbackAudioCarryDegraded
+	}
+	if index < len(probed.AudioTracks) &&
+		fallbackAudioCarryMatchesV3(pinned.AudioTracks[requestedIndex], probed.AudioTracks[index]) {
+		return index, fallbackAudioCarryMatched
+	}
+	// The matcher chose a default/nearest track the selection's languages do not
+	// name. The index is still the right transport choice (playability wins),
+	// but the caller must warn that the viewer hears another stream.
+	return index, fallbackAudioCarryDegraded
 }
 
-// logCrossReleaseAudioCarry records the pinned→replacement audio mapping of a
-// successful cross-release fallback carry. The language/index pair on each side
-// is what an operator needs to tell a correct identity carry from a near-match;
-// a degrade to the container default stays with the caller's warning.
-func logCrossReleaseAudioCarry(ctx context.Context, pinned, probed *models.MediaFile, requestedIndex, remappedIndex int, candidateID string) {
+const (
+	audioLanguageUndetermined = "und"
+	audioLanguageMulti        = "mul"
+	audioLanguageMultiLong    = "multi"
+	audioLanguageDual         = "dual"
+)
+
+// placeholderAudioLanguageTokensV3 are the values a track carries instead of a
+// concrete language. They name no identity a selection carry can match, so they
+// are skipped when deciding whether a remapped track still names the selection.
+var placeholderAudioLanguageTokensV3 = map[string]bool{
+	"":                        true,
+	audioLanguageUndetermined: true,
+	audioLanguageMulti:        true,
+	audioLanguageMultiLong:    true,
+	audioLanguageDual:         true,
+}
+
+// fallbackAudioCarryMatchesV3 reports whether the replacement track the remap
+// selected still carries a concrete language the selected track named. Codec and
+// channel differences are expected across releases and do not refute identity;
+// a track with no concrete language on either side cannot prove a mismatch, so
+// it is treated as a match rather than warning on a selection that carried no
+// identity evidence to begin with.
+func fallbackAudioCarryMatchesV3(selected, candidate models.AudioTrack) bool {
+	codes := make([]string, 0, len(selected.Languages)+1)
+	codes = append(codes, selected.Language)
+	codes = append(codes, selected.Languages...)
+	concrete := 0
+	for _, code := range codes {
+		if placeholderAudioLanguageTokensV3[strings.ToLower(strings.TrimSpace(code))] {
+			continue
+		}
+		concrete++
+		if playback.TrackCarriesLanguage(candidate, code) {
+			return true
+		}
+	}
+	return concrete == 0
+}
+
+// logCrossReleaseAudioCarry records the outcome of carrying the pinned release's
+// audio selection onto the replacement. A true identity carry is informational;
+// a degradation to the container default warns because the plan keeps the
+// requested identity for the client while the transport plays another stream,
+// and that divergence must be visible to an operator.
+func logCrossReleaseAudioCarry(ctx context.Context, pinned, probed *models.MediaFile, requestedIndex, remappedIndex int, carry fallbackAudioCarryV3, candidateID string) {
+	switch carry {
+	case fallbackAudioCarryMatched:
+		logMatchedCrossReleaseAudioCarry(ctx, pinned, probed, requestedIndex, remappedIndex, candidateID)
+	case fallbackAudioCarryDegraded:
+		probedTracks := 0
+		if probed != nil {
+			probedTracks = len(probed.AudioTracks)
+		}
+		slog.WarnContext(ctx, "cross-release virtual fallback could not carry the audio selection; using its default audio track",
+			"component", "api",
+			"file_id", catalogFileIDOrZero(pinned),
+			"requested_audio_index", requestedIndex,
+			"probed_audio_tracks", probedTracks,
+			"candidate_id", candidateID)
+	}
+}
+
+// logMatchedCrossReleaseAudioCarry records the pinned→replacement audio mapping
+// of a successful cross-release fallback carry. The language/index pair on each
+// side is what an operator needs to tell a correct identity carry from a
+// near-match; a degenerate probed inventory has no languages to name.
+func logMatchedCrossReleaseAudioCarry(ctx context.Context, pinned, probed *models.MediaFile, requestedIndex, remappedIndex int, candidateID string) {
 	if pinned == nil || probed == nil || requestedIndex < 0 || remappedIndex < 0 {
 		return
 	}
