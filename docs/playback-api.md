@@ -697,6 +697,10 @@ playlist (or the manifest URL the client loaded) and retry the same position
 with the new URLs. Do not count the `412` against the fragment retry budget and
 do not tear down the session for it.
 
+A segment request for a generation whose decoder rejected the source answers
+`422 decode_failed`, the same permanent verdict the manifest path publishes;
+replan to another candidate instead of retrying the segment.
+
 An in-place restart (a far seek or a switchover) rotates the generation but
 continues the same absolute segmented timeline. Only the exact generation token
 displaced by the most recent restart is served from the live generation, and

@@ -3064,7 +3064,10 @@ func writePlaybackDecodeError(w http.ResponseWriter) {
 // failure the client can recover from on the next segment request (provider
 // relists renumber ids), so it is a retryable 503 with a
 // virtual_resolve_failed problem code instead of a fatal 500 the player
-// treats as a dead generation. Everything else is an unexpected server error.
+// treats as a dead generation. A generation whose decoder rejected the source
+// answers the same permanent 422 decode_failed verdict as the manifest path and
+// the remote node (writePlaybackDecodeError) instead of a retryable 500.
+// Everything else is an unexpected server error.
 func writePlaybackSegmentError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, playback.ErrSegmentNotFound), errors.Is(err, playback.ErrTranscodeFailed),
@@ -3081,6 +3084,12 @@ func writePlaybackSegmentError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusPreconditionFailed, "stale_generation", "Segment generation is stale")
 	case errors.Is(err, playback.ErrManifestNotReady):
 		writeError(w, http.StatusServiceUnavailable, "unavailable", "Transcode session is temporarily unavailable")
+	case errors.Is(err, playback.ErrSourceDecodeRejected):
+		// A revoked generation cannot produce a playable segment. The manifest
+		// path and the remote node already answer the permanent decode verdict,
+		// so the segment path must not turn a terminal decode failure into a
+		// retryable 500 the player treats as a dead generation.
+		writePlaybackDecodeError(w)
 	case errors.Is(err, virtuallibrary.ErrSessionBoundCandidateAbsent), errors.Is(err, virtuallibrary.ErrPersistedCandidateTrusted):
 		writeError(w, http.StatusServiceUnavailable, "virtual_resolve_failed", "Failed to resolve virtual source")
 	default:
@@ -3111,7 +3120,8 @@ func (h *PlaybackHandler) retainedGenerationManifest(sessionID, segPrefix, rawQu
 // missing or cannot be reconstructed, or the segment does not exist, or the
 // transcode process exited before the segment materialized (including a stop
 // that killed ffmpeg mid-request); 503 (unavailable) while the transcode is
-// temporarily unavailable; and — for tone-map execution failures — 422
+// temporarily unavailable; 422 (decode_failed) when the running decoder has
+// permanently rejected the source; and — for tone-map execution failures — 422
 // (unsupported) with an X-Vio-Tone-Map-Execution-Error header of
 // source_revision_changed or source_preflight_rejected. The 422 responses are
 // additive to the existing 404 and 503 cases; the Jellyfin-compatible 415
