@@ -458,7 +458,10 @@ replica or has already stopped. Both tracks are matched by identity — audio by
 language, codec and layout; subtitles by language, codec and forced flag — because
 the previous ordinal belongs to the previous candidate's transport. A selection
 that cannot be matched is reported as a degradation warning rather than silently
-planning the wrong track or subtitles off.
+planning the wrong track or subtitles off. A strict match can also warn when the
+new inventory is less complete than the predecessor's (for example after a
+virtual rotation with degraded probe data); operators should watch the warning
+rate for this signature rather than treating every warning as a client error.
 
 A client that already replays its own audio and subtitle selection needs no
 carry. Without `previous_playback_attempt_id`, the legacy fallback matches exactly

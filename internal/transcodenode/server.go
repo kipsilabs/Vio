@@ -2966,6 +2966,10 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 			writeToneMapRecipeError(w, restartErr)
 			return
 		}
+		if errors.Is(restartErr, playback.ErrSourceDecodeRejected) {
+			writeSourceDecodeRejected(w)
+			return
+		}
 		if errors.Is(restartErr, playback.ErrStaleSegmentGeneration) {
 			http.Error(w, "segment generation is stale", http.StatusPreconditionFailed)
 			return
@@ -3170,6 +3174,10 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if isToneMapRecipeError(err) {
 			writeToneMapRecipeError(w, err)
+			return
+		}
+		if errors.Is(err, playback.ErrSourceDecodeRejected) {
+			writeSourceDecodeRejected(w)
 			return
 		}
 		if errors.Is(err, playback.ErrStaleSegmentGeneration) {

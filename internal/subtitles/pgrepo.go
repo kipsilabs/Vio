@@ -98,7 +98,7 @@ func (r *PgRepository) GetDownloadedSubtitle(ctx context.Context, id int) (*Down
 func (r *PgRepository) ListDownloadedSubtitles(ctx context.Context, mediaFileID int) ([]DownloadedSubtitle, error) {
 	rows, err := r.pool.Query(ctx,
 		`SELECT `+downloadedSubtitleColumns+` FROM downloaded_subtitles WHERE media_file_id = $1
-		ORDER BY created_at`, mediaFileID)
+		ORDER BY created_at, id`, mediaFileID)
 	if err != nil {
 		return nil, fmt.Errorf("list downloaded subtitles: %w", err)
 	}
