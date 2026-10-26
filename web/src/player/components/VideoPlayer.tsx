@@ -976,6 +976,18 @@ export function VideoPlayer({
     ];
   }, [subtitleUrls, liveTranslation]);
 
+  // Whether the plan's own inventory offers a row the menu can act on. A
+  // non-empty inventory without a selectable entry is a declared placeholder
+  // for a probe that has not landed; the menu is showing watch-detail fallback
+  // rows then, whose ordinals are menu positions rather than plan ordinals.
+  const planHasSelectableSubtitles = useMemo(
+    () =>
+      plan.subtitle.inventory.some(
+        (track) => (track.url ?? "").trim() !== "" || track.delivery === "burn_in_only",
+      ),
+    [plan.subtitle.inventory],
+  );
+
   // -- Plan-derived transport --
   // The plan names its own protocol and timeline; nothing here is inferred from
   // codec strings or from what the engine reports.
@@ -4403,6 +4415,11 @@ export function VideoPlayer({
     // rollback above owns refusals, and the auto-select/version-switch effects
     // own an empty committed selection.
     if (nextIndex == null || nextIndex < 0) return;
+    // A committed ordinal names a row in the plan's own inventory. When that
+    // inventory has no selectable entry the menu is showing watch-detail
+    // fallback rows, whose indexes are menu positions: stamping the plan value
+    // would mark an unrelated (or placeholder) row.
+    if (!planHasSelectableSubtitles) return;
     if (nextIndex !== activeSubtitleIndex) {
       setActiveSubtitleIndex(nextIndex);
       lastSubtitleIndexRef.current = nextIndex;
@@ -4417,6 +4434,7 @@ export function VideoPlayer({
     plan.plan_id,
     plan.selected_tracks.subtitle?.index,
     plan.virtual_source_revision,
+    planHasSelectableSubtitles,
     replanning,
     sessionId,
     subtitleHandoverPending,

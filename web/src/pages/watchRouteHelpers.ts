@@ -324,20 +324,23 @@ export function buildWatchPageProps({
     item.versions[0];
   // One shared derivation for every ordinal the client computes; see
   // subtitleInventory.ts. Watch detail carries the file's own tracks, so the
-  // published ordinals match the server's for the same inventory.
+  // published ordinals match the server's for the same inventory. An older
+  // detail that omits `subtitle_tracks` only has the item's subtitle rows;
+  // they go through the same rule so their menu ordinals stay dense and
+  // gap-free instead of trusting the array position.
   const subtitles: PlayerSubtitleInfo[] =
     requestedVersion?.subtitle_tracks !== undefined
       ? buildPublishedSubtitleTracks(requestedVersion.subtitle_tracks)
-      : item.subtitles.map((subtitle, index) => ({
-          index,
-          language: subtitle.language,
-          codec: subtitle.codec,
-          label: subtitle.title || subtitle.language,
-          source: subtitle.source === "external" ? "external" : "embedded",
-          forced: subtitle.forced,
-          hearing_impaired: subtitle.hearing_impaired,
-          url: "",
-        }));
+      : buildPublishedSubtitleTracks(
+          item.subtitles.map((subtitle) => ({
+            language: subtitle.language,
+            codec: subtitle.codec,
+            title: subtitle.title || subtitle.language,
+            forced: subtitle.forced,
+            hearing_impaired: subtitle.hearing_impaired,
+            external: subtitle.source === "external",
+          })),
+        );
   const preferredSubtitleTrackSignature: PlayerSubtitleTrackSignature | null =
     item.effective_subtitle_track_signature
       ? {
