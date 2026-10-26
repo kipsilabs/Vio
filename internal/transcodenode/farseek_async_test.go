@@ -74,7 +74,7 @@ func TestNodeFarSeekServesAfterAsyncRestart(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatal("fake transcode never produced the initial segments")
 		}
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond) //nolint:forbidigo // Segment files are the fake encoder's observable output.
 	}
 
 	const segmentName = "seg_00452.ts"
@@ -173,7 +173,7 @@ func TestNodeSegmentContinuationAcrossTwoRotationsAnswersStaleGeneration(t *test
 		if time.Now().After(deadline) {
 			t.Fatal("fake transcode never produced the initial segments")
 		}
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond) //nolint:forbidigo // Segment files are the fake encoder's observable output.
 	}
 
 	const segmentName = "seg_00455.ts"

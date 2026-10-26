@@ -83,7 +83,7 @@ func TestFarSeekBeyondProducedWindowServesAfterAsyncRestart(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatal("fake transcode never produced the initial segments")
 		}
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond) //nolint:forbidigo // Segment files are the fake encoder's observable output.
 	}
 
 	sessions := playback.NewSessionManager(0, 0)
@@ -272,7 +272,7 @@ func startFarSeekHandlerSession(t *testing.T, sessionID, ffmpegPath, outputDir s
 		if time.Now().After(deadline) {
 			t.Fatal("fake transcode never produced the initial segments")
 		}
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond) //nolint:forbidigo // Segment files are the fake encoder's observable output.
 	}
 
 	sessions := playback.NewSessionManager(0, 0)
@@ -410,7 +410,7 @@ func TestFarSeekAsyncFailureDoesNotStaleGenerationLoop(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatal("session never stamped its source candidate demux-failed")
 		}
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond) //nolint:forbidigo // Segment files are the fake encoder's observable output.
 	}
 
 	const segmentName = "seg_00452.m4s"
@@ -432,7 +432,7 @@ func TestFarSeekAsyncFailureDoesNotStaleGenerationLoop(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatal("the detached restart never latched its demux verdict")
 		}
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond) //nolint:forbidigo // Segment files are the fake encoder's observable output.
 	}
 
 	second := farSeekServe(t, handler, "farseek-demux", segmentName)
@@ -598,7 +598,7 @@ func TestFarSeekContinuationExpiryRecoversWithOnePlaylistReload(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatal("released restart never produced the requested segment")
 		}
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond) //nolint:forbidigo // Segment files are the fake encoder's observable output.
 	}
 
 	manifestRec := httptest.NewRecorder()
@@ -653,7 +653,7 @@ func TestFarSeekStalledHeadSharesOneContinuationBudget(t *testing.T) {
 			progress := transcodeSession.SegmentProgress(time.Now())
 			t.Fatalf("session never observed the initial produced head: %+v", progress)
 		}
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond) //nolint:forbidigo // Segment files are the fake encoder's observable output.
 	}
 
 	start := time.Now()
@@ -673,6 +673,6 @@ func TestFarSeekStalledHeadSharesOneContinuationBudget(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatal("stalled-head restart never produced the requested segment")
 		}
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond) //nolint:forbidigo // Segment files are the fake encoder's observable output.
 	}
 }
