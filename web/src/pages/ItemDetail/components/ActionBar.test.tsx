@@ -203,6 +203,45 @@ describe("ActionBar", () => {
     const arg = startPlayback.mock.calls[0]?.[0] as { forceRelink?: boolean } | undefined;
     expect(arg?.forceRelink).toBeUndefined();
   });
+
+  it("sends forceRelink from the overflow restart path too", () => {
+    const unavailableVersion: FileVersion = { ...selectedVersion, available: false };
+    const secondVersion: FileVersion = { ...selectedVersion, file_id: 2, resolution: "2160p" };
+    renderActionBar({
+      selectedVersion: unavailableVersion,
+      versions: [unavailableVersion, secondVersion],
+      contentId: "movie-1",
+      playHref: "/watch/movie-1",
+      playLabel: "Resume",
+      restartHref: "/watch/movie-1?restart=1",
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "More actions" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Play from Beginning" }));
+
+    expect(startPlayback).toHaveBeenCalledOnce();
+    const arg = startPlayback.mock.calls[0]?.[0] as
+      | { fileId?: number; forceRelink?: boolean }
+      | undefined;
+
+    expect(arg?.fileId).toBe(unavailableVersion.file_id);
+    expect(arg?.forceRelink).toBe(true);
+  });
+
+  it("blocks Play and asks the viewer to pick again when the chosen row vanished", () => {
+    renderActionBar({
+      contentId: "movie-1",
+      playHref: "/watch/movie-1",
+      selectedVersion: null,
+      selectedVersionMissing: true,
+    });
+
+    expect(screen.getByRole("button", { name: "Version unavailable" })).toBeDisabled();
+    expect(
+      screen.getByText("The selected version is no longer available. Pick a version to play."),
+    ).toBeInTheDocument();
+    expect(startPlayback).not.toHaveBeenCalled();
+  });
 });
 
 it("keeps compact secondary actions available in the overflow menu", () => {

@@ -307,7 +307,14 @@ export interface ResumeHints {
 export interface PlaybackExitState {
   positionSeconds: number;
   durationSeconds?: number;
+  /** The row that actually served the bytes. */
   lastFileId?: number | null;
+  /**
+   * The row the viewer chose for this playback. Persisted as the resume
+   * selection so a server-side substitution never becomes the new "chosen"
+   * version on the next mount. Falls back to `lastFileId` when absent.
+   */
+  selectedFileId?: number | null;
   lastResolution?: string;
   lastHDR?: boolean;
   lastCodecVideo?: string;

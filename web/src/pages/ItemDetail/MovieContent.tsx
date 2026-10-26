@@ -145,13 +145,28 @@ export default function MovieContent({
   );
 
   const [manualSelectedFileId, setManualSelectedFileId] = useState<number | null>(null);
-  const selectedVersion = useMemo(
-    () =>
-      (manualSelectedFileId != null
-        ? (sortedVersions.find((version) => version.file_id === manualSelectedFileId) ?? null)
-        : null) ?? defaultSelectedVersion,
-    [defaultSelectedVersion, manualSelectedFileId, sortedVersions],
-  );
+  // A chosen row that the enrichment refresh no longer carries is a pick-again
+  // state, not permission to silently show and play another version. The same
+  // applies to the persisted last-watched row on a fresh mount.
+  const persistedSelectedFileId =
+    manualSelectedFileId ??
+    (userData && "last_file_id" in userData ? (userData.last_file_id ?? null) : null);
+  const selectedVersionMissing =
+    persistedSelectedFileId != null &&
+    !versionsWithLiveness.some((version) => version.file_id === persistedSelectedFileId);
+  const selectedVersion = useMemo(() => {
+    if (selectedVersionMissing) return null;
+    if (manualSelectedFileId != null) {
+      return (
+        versionsWithLiveness.find((version) => version.file_id === manualSelectedFileId) ?? null
+      );
+    }
+    return defaultSelectedVersion
+      ? (versionsWithLiveness.find(
+          (version) => version.file_id === defaultSelectedVersion.file_id,
+        ) ?? defaultSelectedVersion)
+      : null;
+  }, [defaultSelectedVersion, manualSelectedFileId, selectedVersionMissing, versionsWithLiveness]);
   const selectedMediaSummary = useMemo(
     () => resolveSelectedMediaSummary(selectedVersion, item.playback_variants, item.runtime ?? 0),
     [item.playback_variants, item.runtime, selectedVersion],
@@ -373,6 +388,7 @@ export default function MovieContent({
               hasVirtualSource={item.has_virtual_source === true}
               playbackVariants={item.playback_variants}
               selectedVersion={selectedVersion}
+              selectedVersionMissing={selectedVersionMissing}
               onSelectVersion={handleSelectVersion}
               onVersionPickerOpenChange={handleVersionPickerOpenChange}
               explicitFileSelection={manualSelectedFileId != null}

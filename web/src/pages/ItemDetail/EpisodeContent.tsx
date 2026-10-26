@@ -125,13 +125,21 @@ export default function EpisodeContent({
     ],
   );
   const [manualSelectedFileId, setManualSelectedFileId] = useState<number | null>(null);
-  const selectedVersion = useMemo(
-    () =>
-      (manualSelectedFileId != null
-        ? (sortedVersions.find((version) => version.file_id === manualSelectedFileId) ?? null)
-        : null) ?? defaultSelectedVersion,
-    [defaultSelectedVersion, manualSelectedFileId, sortedVersions],
-  );
+  // A chosen row that an enrichment refresh no longer carries is a pick-again
+  // state, not permission to silently show and play another version.
+  const persistedSelectedFileId =
+    manualSelectedFileId ??
+    (userData && "last_file_id" in userData ? (userData.last_file_id ?? null) : null);
+  const selectedVersionMissing =
+    persistedSelectedFileId != null &&
+    !sortedVersions.some((version) => version.file_id === persistedSelectedFileId);
+  const selectedVersion = useMemo(() => {
+    if (selectedVersionMissing) return null;
+    if (manualSelectedFileId != null) {
+      return sortedVersions.find((version) => version.file_id === manualSelectedFileId) ?? null;
+    }
+    return defaultSelectedVersion;
+  }, [defaultSelectedVersion, manualSelectedFileId, selectedVersionMissing, sortedVersions]);
   const selectedMediaSummary = useMemo(
     () => resolveSelectedMediaSummary(selectedVersion, item.playback_variants, item.runtime ?? 0),
     [item.playback_variants, item.runtime, selectedVersion],
@@ -448,6 +456,7 @@ export default function EpisodeContent({
               versions={item.versions ?? []}
               playbackVariants={item.playback_variants}
               selectedVersion={selectedVersion}
+              selectedVersionMissing={selectedVersionMissing}
               explicitFileSelection={manualSelectedFileId != null}
               onSelectVersion={handleSelectVersion}
               onDownload={
