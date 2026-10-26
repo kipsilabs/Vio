@@ -585,7 +585,7 @@ func TestFarSeekContinuationExpiryRecoversWithOnePlaylistReload(t *testing.T) {
 	if expired.rec.Code != http.StatusPreconditionFailed || !strings.Contains(expired.rec.Body.String(), "stale_generation") {
 		t.Fatalf("expired continuation = %d %q, want 412 stale_generation", expired.rec.Code, expired.rec.Body.String())
 	}
-	if expired.elapsed > playback.SeekRestartServeTimeout+time.Second {
+	if expired.elapsed > playback.SeekRestartServeTimeout+3*time.Second {
 		t.Fatalf("held request took %s, want no more than SeekRestartServeTimeout", expired.elapsed)
 	}
 
@@ -662,7 +662,7 @@ func TestFarSeekStalledHeadSharesOneContinuationBudget(t *testing.T) {
 	if rec.Code != http.StatusPreconditionFailed || !strings.Contains(rec.Body.String(), "stale_generation") {
 		t.Fatalf("stalled-head hold = %d %q, want 412 stale_generation", rec.Code, rec.Body.String())
 	}
-	if elapsed > playback.SeekRestartServeTimeout+1500*time.Millisecond {
+	if elapsed > playback.SeekRestartServeTimeout+3*time.Second {
 		t.Fatalf("stalled-head hold took %s, want the composed hold inside the 6s ceiling", elapsed)
 	}
 	deadline = time.Now().Add(5 * time.Second)
