@@ -204,6 +204,41 @@ func TestEffectiveAudioTrackIndex_PrefersSeriesAudioPreferenceOverLibraryAndProf
 	}
 }
 
+// A movie's content-scoped audio preference is keyed by the movie's content id,
+// the same scope the playback start path uses (see
+// TestPreferredAudioTrackIndexScopesMovieByContentID in internal/api/handlers).
+// The two must agree or the version picker marks one track and the plan plays
+// another.
+func TestEffectiveAudioTrackIndex_ScopesMovieByContentID(t *testing.T) {
+	store := newDetailTestStore(t)
+	setScopedAudioLanguage(t, store, settingscontract.ScopeProfileSeries, "movie-1", 0, "fr")
+	if err := store.SetAudioPreference(context.Background(), userstore.AudioPreference{
+		ProfileID:       "profile-1",
+		SeriesID:        "movie-1",
+		AudioTrackIndex: 1,
+		AudioLanguage:   "fr",
+	}); err != nil {
+		t.Fatalf("SetAudioPreference: %v", err)
+	}
+	service := &DetailService{}
+	service.SetUserStoreProvider(testDetailUserStoreProvider{store: store})
+
+	index := service.effectiveAudioTrackIndex(context.Background(), AccessFilter{
+		UserID:    1,
+		ProfileID: "profile-1",
+	}, "movie-1", &models.MediaFile{
+		ContentID:     "movie-1",
+		MediaFolderID: 12,
+		AudioTracks: []models.AudioTrack{
+			{Language: "en", Codec: "aac", Channels: 2, Default: true},
+			{Language: "fr", Codec: "aac", Channels: 2},
+		},
+	})
+	if index != 1 {
+		t.Fatalf("effectiveAudioTrackIndex() = %d, want the content-scoped French track (1)", index)
+	}
+}
+
 func TestEffectiveAudioTrackIndex_ResolvesDeviceLanguageWithCanonicalPrecedence(t *testing.T) {
 	store := newDetailTestStore(t)
 	setProfileAudioLanguage(t, store, "en")

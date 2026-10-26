@@ -4964,13 +4964,13 @@ func TestResolveCarriedAudioTrackV3DegradesWhenSourceMissing(t *testing.T) {
 		{Codec: "aac", Default: true}, {Codec: "ac3"},
 	}}
 	handler := &PlaybackHandler{}
-	if got, ok := handler.resolveCarriedAudioTrackV3(context.Background(), playback.TrackIDV3(target.ID, "audio", 1), target); !ok || got != 1 {
+	if got, ok := handler.resolveCarriedAudioTrackV3(context.Background(), playback.TrackIDV3(target.ID, "audio", 1), target, nil); !ok || got != 1 {
 		t.Fatalf("same-file carried audio = (%d, %v), want (1, true)", got, ok)
 	}
-	if got, ok := handler.resolveCarriedAudioTrackV3(context.Background(), playback.TrackIDV3(999, "audio", 0), target); ok {
+	if got, ok := handler.resolveCarriedAudioTrackV3(context.Background(), playback.TrackIDV3(999, "audio", 0), target, nil); ok {
 		t.Fatalf("missing source version = (%d, true), want ok=false", got)
 	}
-	if _, ok := handler.resolveCarriedAudioTrackV3(context.Background(), "not-a-track-id", target); ok {
+	if _, ok := handler.resolveCarriedAudioTrackV3(context.Background(), "not-a-track-id", target, nil); ok {
 		t.Fatal("malformed carried identity must not resolve")
 	}
 }

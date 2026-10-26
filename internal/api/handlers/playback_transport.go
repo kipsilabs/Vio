@@ -496,15 +496,14 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 		// replacement is probed synchronously under the remaining startup
 		// budget, and the session is built on the probed facts — source
 		// codecs, audio layout/channels, HDR range — instead of the pinned
-		// release's. Selections reset to the container default (audio and
-		// subtitle -1, no burn-in): the client starts from a valid track on
-		// the replacement rather than an ordinal that means something else
-		// (or nothing) there. The first attempt (the pinned release itself)
-		// keeps the plan's selections untouched. A probe failure does not
-		// fail the fallback: the attempt proceeds on reset-to-default opts
-		// (the pre-#118 behavior) so a slow prober cannot wedge startup.
+		// release's. The audio selection is re-identified on the probed
+		// replacement; a subtitle selection has no cross-release identity
+		// matcher yet, so it is reset to off and the reset is logged. The first
+		// attempt (the pinned release itself) keeps the plan's selections
+		// untouched. A probe failure does not fail the fallback: the attempt
+		// proceeds on declared facts and the replacement's default audio (the
+		// pre-#118 behavior) so a slow prober cannot wedge startup.
 		if attempt > 0 {
-			attemptOpts.AudioTrackIndex = -1
 			attemptOpts.SubtitleTrackIndex = -1
 			attemptOpts.SubtitleBurnIn = false
 			attemptOpts.SourceVideoCodec = ""
@@ -516,11 +515,30 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 			// already fall through to declared metadata, so this stays
 			// best-effort and never fails the fallback.
 			h.fireExpiredVirtualRefresh(startupCtx, file, ownerInstallationID, userID, profileID, resolvedMedia.ExpiresAt)
-			if probedFacts := h.probeVirtualFallbackSource(startupCtx, resolvedMedia, file); probedFacts != nil {
+			probedFacts := h.probeVirtualFallbackSource(startupCtx, resolvedMedia, file)
+			if probedFacts != nil {
 				attemptOpts.SourceVideoCodec = probedFacts.CodecVideo
 				attemptOpts.SourceVideoProfile = virtualFallbackVideoProfile(probedFacts)
 				attemptOpts.SourceVideoBitDepth = virtualFallbackVideoBitDepth(probedFacts)
 				attemptOpts.SourceAudioChannels = virtualFallbackAudioChannels(probedFacts)
+			}
+			// The replacement's inventory is what its ordinals address, so the
+			// pinned release's audio selection is remapped by identity rather
+			// than silently reset to the container default. A selection with no
+			// equivalent on the replacement still degrades, but the reset is
+			// logged (and the plan keeps the requested identity for the client).
+			attemptOpts.AudioTrackIndex = remapFallbackAudioIndexV3(file, probedFacts, opts.AudioTrackIndex)
+			if probedFacts == nil && opts.AudioTrackIndex >= 0 {
+				slog.WarnContext(startupCtx, "cross-release virtual fallback could not probe the replacement; using its default audio track",
+					"component", "api", "file_id", catalogFileIDOrZero(file),
+					"requested_audio_index", opts.AudioTrackIndex,
+					"candidate_id", resolvedMedia.CandidateID)
+			}
+			if opts.SubtitleTrackIndex >= 0 {
+				slog.WarnContext(startupCtx, "cross-release virtual fallback reset the subtitle selection to off",
+					"component", "api", "file_id", catalogFileIDOrZero(file),
+					"reset_subtitle_index", opts.SubtitleTrackIndex,
+					"candidate_id", resolvedMedia.CandidateID)
 			}
 		}
 		session, startErr := h.startTranscodeSession(transcodeCtx, attemptOpts)
@@ -673,6 +691,22 @@ func (h *PlaybackHandler) probeVirtualFallbackSource(ctx context.Context, resolv
 	}
 	mergeVirtualCandidateTracks(probed, probeCand)
 	return probed
+}
+
+// remapFallbackAudioIndexV3 carries the pinned release's audio selection onto the
+// replacement a cross-release fallback probed. It returns -1 (the container
+// default) only when the request had no audio selection or nothing could be
+// probed; otherwise the selected track family is matched by identity, exactly
+// like a version switch, so a fallback does not silently change the language the
+// viewer hears.
+func remapFallbackAudioIndexV3(pinned, probed *models.MediaFile, requestedIndex int) int {
+	if requestedIndex < 0 || pinned == nil || len(pinned.AudioTracks) == 0 {
+		return -1
+	}
+	if probed == nil || len(probed.AudioTracks) == 0 {
+		return -1
+	}
+	return playback.MatchAudioTrackAcrossVersions(pinned.AudioTracks, probed.AudioTracks, requestedIndex)
 }
 
 // fireExpiredVirtualRefresh renews a lapsed virtual candidate's stored URL in

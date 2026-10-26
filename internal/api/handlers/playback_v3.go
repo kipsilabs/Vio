@@ -2119,6 +2119,21 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	if err := req.ValidateSelectedTrackStructureV3(); err != nil {
 		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusBadRequest, "bad_request", err.Error())
 	}
+	profileID := apimw.GetProfileID(r.Context())
+	if profileID == "" {
+		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusBadRequest, "bad_request", "X-Profile-Id header is required")
+	}
+	if req.ProfileID != profileID {
+		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusBadRequest, "bad_request", "profile_id must match X-Profile-Id")
+	}
+	userID := apimw.GetUserID(r.Context())
+	deviceID := deviceMetadataFromRequest(r).DeviceID
+	// The plan publishes track identities minted against the effective row, but
+	// a restart echoes them alongside the requested file_id. Normalize an echo
+	// onto the requested row before validation; a truly foreign row still falls
+	// through to the stale-identity drop inside NormalizeAndValidate.
+	h.rekeyStartTrackIdentitiesV3(r.Context(), &req, userID, profileID,
+		clientip.FromContext(r.Context()), playbackClientInfoFromRequest(r).UserAgent)
 	dropStaleRequestTrackIdentitiesV3(r.Context(), &req)
 	warnings, err := req.NormalizeAndValidate()
 	if err != nil {
@@ -2133,15 +2148,6 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		req.ClientFeatures = playback.WithoutFeatureV3(req.ClientFeatures, playback.FeatureHLSSubtitleRenditionsV3)
 	}
 	timings.mark("decode_validate")
-	profileID := apimw.GetProfileID(r.Context())
-	if profileID == "" {
-		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusBadRequest, "bad_request", "X-Profile-Id header is required")
-	}
-	if req.ProfileID != profileID {
-		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusBadRequest, "bad_request", "profile_id must match X-Profile-Id")
-	}
-	userID := apimw.GetUserID(r.Context())
-	deviceID := deviceMetadataFromRequest(r).DeviceID
 	requestDigests := newPlaybackStartRequestDigestsV3(body, deviceID)
 	resolutionWasAssumed := false
 	// resolutionProvenance is the virtual resolver's provenance for the source
@@ -2350,7 +2356,9 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		// Version switch: the viewer made an explicit audio choice on the previous
 		// version; carry it onto the requested file by track family rather than
 		// letting the server's preference override an explicit choice.
-		if carriedIndex, ok := h.resolveCarriedAudioTrackV3(r.Context(), req.CarriedAudioTrackID, requestedFile); ok {
+		carriedSource := h.carriedAudioSourceV3(r.Context(), &req, requestedFile, userID, profileID,
+			clientip.FromContext(r.Context()), playbackClientInfoFromRequest(r).UserAgent)
+		if carriedIndex, ok := h.resolveCarriedAudioTrackV3(r.Context(), req.CarriedAudioTrackID, requestedFile, carriedSource); ok {
 			audioIndex = carriedIndex
 			req.AudioTrackIndex = &carriedIndex
 			req.AudioTrackID = ""
@@ -5850,12 +5858,21 @@ func (h *PlaybackHandler) preferredAudioTrackIndexV3(ctx context.Context, userID
 		slog.ErrorContext(ctx, "protocol v3 start: audio preference store lookup failed", "component", "api", "user_id", userID, "error", err)
 		return 0, "", err
 	}
-	seriesID := h.resolveSeriesID(ctx, file)
+	// The content scope is the parent series for an episode and the content id
+	// for everything else. The catalog picker scopes the same way when it
+	// publishes effective_audio_track_index, so the marker and the plan agree.
+	contentID := strings.TrimSpace(h.resolveSeriesID(ctx, file))
+	if contentID == "" && strings.TrimSpace(file.EpisodeID) == "" {
+		// Movies and other item-level content scope by their own content id,
+		// matching the catalog picker. An episode whose parent series could not
+		// be resolved must not suddenly scope by the episode id.
+		contentID = strings.TrimSpace(file.ContentID)
+	}
 	var seriesPref *playback.AudioTrackPreference
-	if seriesID != "" {
-		stored, prefErr := store.GetAudioPreference(ctx, profileID, seriesID)
+	if contentID != "" {
+		stored, prefErr := store.GetAudioPreference(ctx, profileID, contentID)
 		if prefErr != nil {
-			slog.ErrorContext(ctx, "protocol v3 start: series audio preference lookup failed", "component", "api", "profile_id", profileID, "series_id", seriesID, "error", prefErr)
+			slog.ErrorContext(ctx, "protocol v3 start: content audio preference lookup failed", "component", "api", "profile_id", profileID, "content_id", contentID, "error", prefErr)
 			return 0, "", prefErr
 		}
 		if stored != nil {
@@ -5867,8 +5884,8 @@ func (h *PlaybackHandler) preferredAudioTrackIndexV3(ctx context.Context, userID
 		DeviceID:   deviceID,
 		LibraryIDs: []int{file.MediaFolderID},
 	}
-	if seriesID != "" {
-		rc.SeriesIDs = []string{seriesID}
+	if contentID != "" {
+		rc.SeriesIDs = []string{contentID}
 	}
 	preferredLang, err := resolvedPlaybackAudioLanguage(ctx, store, rc)
 	if err != nil {
@@ -5893,7 +5910,12 @@ func (h *PlaybackHandler) preferredAudioTrackIndexV3(ctx context.Context, userID
 		// settings own the language and its scope precedence.
 		seriesPref.AudioLanguage = preferredLang
 	}
-	return normalizeAudioTrackIndex(file, playback.SelectAudioTrack(file.AudioTracks, preferredLang, seriesPref)), preferredLang, nil
+	// Resolve against the same backfilled language view the catalog picker
+	// publishes, so a MULTI/DUAL title whose language lives only in the embedded
+	// title cannot select one track in the marker and another in the plan.
+	backfilled := *file
+	backfilled.AudioTracks = playback.BackfillAudioTrackLanguages(append([]models.AudioTrack(nil), file.AudioTracks...))
+	return normalizeAudioTrackIndex(file, playback.SelectAudioTrack(backfilled.AudioTracks, preferredLang, seriesPref)), preferredLang, nil
 }
 
 // carrySelectionsFromActiveSessionV3 copies an explicit audio selection and a
@@ -9965,6 +9987,11 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				message: "The requested seek position is beyond the end of the selected media source.",
 			}
 		}
+		// The client echoes identities minted by the running plan, which can
+		// name the session's current effective row after a serve association
+		// moved it without rewriting the durable record. Normalize those onto
+		// the row this replan validates against; a foreign row is still dropped.
+		h.rekeyReplanTrackIdentitiesV3(r.Context(), &start, effectiveFile, session)
 		warnings, err := start.NormalizeAndValidate()
 		if err != nil {
 			return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: "invalid_replan", message: err.Error()}
@@ -12939,22 +12966,67 @@ func remapAudioSelectionV3(source, target *models.MediaFile, request *playback.S
 	return nil
 }
 
+// carriedAudioSourceV3 loads the inventory the carried audio identity was
+// minted against. A predecessor attempt names it durably; otherwise the uniquely
+// matching live session on this replica carries it. Evidence from either source
+// is what lets a same-row id be remapped when enrichment re-probed that row in
+// place (same id, different release) instead of trusting a stale ordinal.
+func (h *PlaybackHandler) carriedAudioSourceV3(ctx context.Context, req *playback.StartRequestV3, target *models.MediaFile, userID int, profileID, clientIP, userAgent string) *models.MediaFile {
+	if req == nil || target == nil {
+		return nil
+	}
+	if predecessorID := strings.TrimSpace(req.PreviousPlaybackAttemptID); predecessorID != "" && h.PlanStoreV3 != nil {
+		record, err := h.PlanStoreV3.GetAttemptByPlaybackAttemptID(ctx, predecessorID)
+		if err == nil && record != nil && record.UserID == userID && record.ProfileID == profileID &&
+			(record.RequestedMediaFileID == target.ID || record.EffectiveMediaFileID == target.ID) {
+			source := &models.MediaFile{ID: record.EffectiveMediaFileID, AudioTracks: audioTracksFromInventoryV3(record.CurrentPlan.AudioTracks)}
+			if len(source.AudioTracks) > 0 {
+				return source
+			}
+		}
+	}
+	lister, ok := h.sessionMgr.(interface {
+		GetUserSessions(userID int) []*playback.Session
+	})
+	if !ok {
+		return nil
+	}
+	previous := findCarryCandidateSessionV3(lister.GetUserSessions(userID), profileID, target.ID, clientIP, userAgent)
+	if previous == nil {
+		return nil
+	}
+	source := &models.MediaFile{ID: previous.MediaFileID, AudioTracks: h.previousAudioTracksV3(ctx, previous)}
+	if source.ID <= 0 || len(source.AudioTracks) == 0 {
+		return nil
+	}
+	return source
+}
+
 // resolveCarriedAudioTrackV3 re-resolves the viewer's audio selection from a
 // previous version onto the requested file. The carried identity is file-bound,
 // so its ordinal is remapped by codec/language family (MatchAudioTrackAcrossVersions),
-// not by raw position, which is unstable across encodes. Falls back (ok=false)
-// to the server's preference when the source version is gone or the identity
-// cannot be parsed; the caller keeps its already-resolved index, so a stale
-// carried selection degrades rather than terminating.
-func (h *PlaybackHandler) resolveCarriedAudioTrackV3(ctx context.Context, carriedID string, target *models.MediaFile) (int, bool) {
+// not by raw position, which is unstable across encodes. A same-row id is only
+// reused directly when the source evidence still describes the target's layout:
+// enrichment can re-probe the row in place, and row-id equality alone would then
+// apply the old ordinal to a different release. Falls back (ok=false) to the
+// server's preference when the source version is gone or the identity cannot be
+// parsed; the caller keeps its already-resolved index, so a stale carried
+// selection degrades rather than terminating.
+func (h *PlaybackHandler) resolveCarriedAudioTrackV3(ctx context.Context, carriedID string, target *models.MediaFile, source *models.MediaFile) (int, bool) {
 	srcID, kind, ordinal, ok := playback.ParseTrackIDV3(carriedID)
 	if !ok || kind != "audio" || target == nil {
 		slog.InfoContext(ctx, "carried audio selection is invalid for the effective file; using resolved track",
 			"component", "playback", "carried_track_id", carriedID)
 		return 0, false
 	}
+	if source != nil && source.ID == srcID && len(source.AudioTracks) > 0 {
+		if srcID == target.ID && playback.AudioLayoutsEqual(source.AudioTracks, target.AudioTracks) {
+			return normalizeAudioTrackIndex(target, ordinal), true
+		}
+		return playback.MatchAudioTrackAcrossVersions(source.AudioTracks, target.AudioTracks, ordinal), true
+	}
 	if srcID == target.ID {
-		// Same file: the ordinal is directly usable (normalize bounds).
+		// No generation evidence: keep the legacy ordinal reuse.
 		return normalizeAudioTrackIndex(target, ordinal), true
 	}
 	if h.fileResolver == nil {
@@ -12962,13 +13034,13 @@ func (h *PlaybackHandler) resolveCarriedAudioTrackV3(ctx context.Context, carrie
 			"component", "playback", "carried_file_id", srcID, "target_file_id", target.ID)
 		return 0, false
 	}
-	source, err := h.fileResolver.GetByID(ctx, srcID)
-	if err != nil || source == nil {
+	sourceRow, err := h.fileResolver.GetByID(ctx, srcID)
+	if err != nil || sourceRow == nil {
 		slog.InfoContext(ctx, "carried audio source version could not be loaded; using resolved track",
 			"component", "playback", "carried_file_id", srcID, "target_file_id", target.ID)
 		return 0, false
 	}
-	return playback.MatchAudioTrackAcrossVersions(source.AudioTracks, target.AudioTracks, ordinal), true
+	return playback.MatchAudioTrackAcrossVersions(sourceRow.AudioTracks, target.AudioTracks, ordinal), true
 }
 
 // errSubtitleUnavailableInTargetV3 reports that the target media file has no

@@ -55,10 +55,6 @@ func (h *PlaybackHandler) HandleGetPlaybackInventoryV3(w http.ResponseWriter, r 
 	}
 	inventory, invErr := h.playbackInventoryForSession(r.Context(), session, record)
 	if invErr != nil {
-		if errors.Is(invErr, errPlaybackInventorySubtitlesUnavailable) {
-			writeError(w, http.StatusServiceUnavailable, "dependency_unavailable", "Failed to load subtitle inventory")
-			return
-		}
 		writePlaybackOperationError(w, invErr)
 		return
 	}
