@@ -1,5 +1,3 @@
-import { storage } from "@/utils/storage";
-
 /**
  * The video version the viewer asked to play, kept apart from the row that
  * actually served the bytes.
@@ -28,9 +26,16 @@ interface RequestedVersionEntry {
 
 type RequestedVersionMap = Record<string, RequestedVersionEntry>;
 
-function entryKey(contentId: string): string {
-  // Profiles share a browser, so one profile's pick must not become another's.
-  return `${storage.get(storage.KEYS.PROFILE_ID) ?? "device"}:${contentId}`;
+/**
+ * The storage key for one profile's pick. `profileId` is the *resolved* active
+ * profile, never the raw storage marker: on a hard refresh the marker can be
+ * absent until the profile load commits, and falling back to a shared
+ * `"device"` bucket there would hand one profile's pick to another. A caller
+ * with no resolved profile has nothing to key on and must defer the read.
+ */
+function entryKey(contentId: string, profileId: string | null): string | null {
+  if (!profileId) return null;
+  return `${profileId}:${contentId}`;
 }
 
 function readMap(): RequestedVersionMap {
@@ -59,11 +64,14 @@ function readMap(): RequestedVersionMap {
 
 /**
  * The row the viewer last requested for `contentId`, or null when they never
- * picked one. The caller falls back to the server's `last_file_id`.
+ * picked one (or their profile has not resolved yet). The caller falls back to
+ * the server's `last_file_id`.
  */
-export function readRequestedFileId(contentId: string): number | null {
+export function readRequestedFileId(contentId: string, profileId: string | null): number | null {
   if (!contentId) return null;
-  return readMap()[entryKey(contentId)]?.fileId ?? null;
+  const key = entryKey(contentId, profileId);
+  if (!key) return null;
+  return readMap()[key]?.fileId ?? null;
 }
 
 /**
@@ -74,11 +82,13 @@ export function readRequestedFileId(contentId: string): number | null {
 export function rememberRequestedFileId(
   contentId: string,
   fileId: number | null | undefined,
+  profileId: string | null,
 ): void {
   if (!contentId || fileId == null || !Number.isFinite(fileId) || fileId <= 0) return;
 
   const map = readMap();
-  const key = entryKey(contentId);
+  const key = entryKey(contentId, profileId);
+  if (!key) return;
   // Re-insert so the map keeps most-recently-used order before trimming.
   delete map[key];
   map[key] = { fileId, updatedAt: Date.now() };

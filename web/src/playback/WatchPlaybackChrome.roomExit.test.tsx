@@ -146,7 +146,7 @@ describe("WatchPlaybackHost end of an episode", () => {
       }),
     );
 
-    expect(readRequestedFileId("episode-1")).toBe(2);
+    expect(readRequestedFileId("episode-1", "profile-1")).toBe(2);
   });
 
   it("keeps a room member in the player and returns it to the room when the room leaves playback", async () => {
