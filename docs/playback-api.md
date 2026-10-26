@@ -675,8 +675,11 @@ A progressive remux commits its body only after FFmpeg produces a media byte.
 If no byte arrives within 15 seconds (a provider candidate that accepts the
 connection but never serves), the server closes the process and answers a
 pre-body failure (502 / retryable dependency problem) instead of holding the
-response. Clients should treat that as retryable: retry or replan to another
-candidate rather than waiting for the stream to start.
+response. On the v2 virtual-candidate stream the failure is deferred so the
+handler can retry a cached copy or fail over to a sibling release first; that
+502 is what remains once failover is exhausted. Relays and other non-deferred
+paths answer it directly. Clients should treat it as retryable: retry or replan
+to another candidate rather than waiting for the stream to start.
 
 A seek is one server operation. Issue a single media request for the new
 position; sending the same seek twice (or aborting and immediately re-sending an

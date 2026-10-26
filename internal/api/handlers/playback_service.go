@@ -561,8 +561,10 @@ func (h *PlaybackHandler) writeProgressSideEffectsV2(ctx context.Context, record
 			// the admin session sync and the user-store write, which are both
 			// slower and retryable, so a wedged sync can no longer consume the
 			// side-effect budget and silently drop the scrobble. The row CAS is
-			// already durable; a persistence write skipped after an expired
-			// budget is replayed from the row by the next sample.
+			// already durable, so a persistence write skipped after an expired
+			// budget is replayed from the row by the next sample. The admin
+			// session sync is not replayed by that path: it heals only on the
+			// periodic reconcile tick or the next pause/resume transition.
 			h.scrobblePauseTransitionV2(ctx, current, wasPaused)
 			h.persistProgress(ctx, current)
 			h.syncSessionsOnPauseChange(ctx, wasPaused, current.IsPaused)
