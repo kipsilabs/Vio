@@ -7,6 +7,7 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
+	"github.com/Silo-Server/silo-server/internal/subtitles"
 )
 
 func selectionCarryFixtureSession(t *testing.T, manager *playback.SessionManager, fileID int) *playback.Session {
@@ -299,5 +300,227 @@ func TestCarrySelectionsUsesExplicitPredecessorAttempt(t *testing.T) {
 	}
 	if request.SubtitleTrackIndex == nil || *request.SubtitleTrackIndex != 1 {
 		t.Fatalf("carried subtitle index = %v, want 1", request.SubtitleTrackIndex)
+	}
+}
+
+// Duplicate audio identities are ambiguous, not a first-match choice. Carrying
+// either stream would silently move the transport onto a different one.
+func TestCarrySelectionsFailsClosedOnDuplicateAudioIdentity(t *testing.T) {
+	manager := playback.NewSessionManager(0, 0)
+	file := &models.MediaFile{
+		ID: 91,
+		AudioTracks: []models.AudioTrack{
+			{Language: "en", Codec: "aac", Layout: "stereo"},
+			{Language: "en", Codec: "aac", Layout: "stereo"},
+		},
+	}
+	previous := selectionCarryFixtureSession(t, manager, file.ID)
+	previous.SelectionOrigin = SelectionOriginExplicit
+	previous.AudioTrackIndex = 0
+	previous.VirtualAudioTracks = []models.AudioTrack{{Language: "en", Codec: "aac", Layout: "stereo"}}
+
+	handler := NewPlaybackHandler(manager)
+	request := playback.StartRequestV3{FileID: file.ID, ProfileID: "profile-1"}
+	audioCarried, _, audioUnavailable := handler.carrySelectionsFromActiveSessionV3(
+		context.Background(), 1, "profile-1", file, &request, "", "")
+
+	if audioCarried || !audioUnavailable || request.AudioTrackIndex != nil {
+		t.Fatalf("duplicate audio identity = carried:%v unavailable:%v index:%v, want unavailable",
+			audioCarried, audioUnavailable, request.AudioTrackIndex)
+	}
+}
+
+// The subtitle carry ignores authored titles, so two same-language/format/flags
+// tracks are ambiguous. It must report unavailable rather than take the first.
+func TestCarrySelectionsFailsClosedOnDuplicateSubtitleIdentity(t *testing.T) {
+	manager := playback.NewSessionManager(0, 0)
+	file := &models.MediaFile{
+		ID: 91,
+		SubtitleTracks: []models.SubtitleTrack{
+			{Language: "en", Codec: "subrip", Title: "Full"},
+			{Language: "en", Codec: "subrip", Title: "Signs"},
+		},
+	}
+	previous := selectionCarryFixtureSession(t, manager, file.ID)
+	previous.SubtitleTrackIndex = 0
+	previous.VirtualSubtitleTracks = []models.SubtitleTrack{{Language: "en", Codec: "subrip"}}
+
+	handler := NewPlaybackHandler(manager)
+	request := playback.StartRequestV3{FileID: file.ID, ProfileID: "profile-1"}
+	_, subtitleUnavailable, _ := handler.carrySelectionsFromActiveSessionV3(
+		context.Background(), 1, "profile-1", file, &request, "", "")
+
+	if !subtitleUnavailable || request.SubtitleTrackIndex != nil {
+		t.Fatalf("duplicate subtitle identity = unavailable:%v index:%v, want unavailable",
+			subtitleUnavailable, request.SubtitleTrackIndex)
+	}
+}
+
+// An external subtitle selected on the predecessor plan is carried by identity,
+// not dropped because the session's transport index is -1 for non-embedded
+// tracks.
+func TestCarrySubtitleFromPlanCarriesExternalTrack(t *testing.T) {
+	prior := &models.MediaFile{
+		ID: 91,
+		ExternalSubtitles: []models.ExternalSubtitle{
+			{Language: "fr", Format: "srt", Path: "/subs/fr.srt"},
+		},
+	}
+	file := &models.MediaFile{
+		ID: 91,
+		ExternalSubtitles: []models.ExternalSubtitle{
+			{Language: "en", Format: "srt", Path: "/subs/en.srt"},
+			{Language: "fr", Format: "srt", Path: "/subs/fr-commentary.srt"},
+		},
+	}
+	index := 0
+	plan := playback.PlanV3{
+		SelectedTracks: playback.SelectedTracksV3{
+			Subtitle: &playback.TrackIdentityV3{ID: playback.TrackIDV3(prior.ID, "subtitle", index), Index: &index},
+		},
+		Subtitle: playback.SubtitleDecisionV3{
+			TrackID:   playback.TrackIDV3(prior.ID, "subtitle", index),
+			Inventory: playback.BuildSubtitleInventoryV3(prior, nil),
+		},
+	}
+
+	handler := &PlaybackHandler{}
+	request := playback.StartRequestV3{FileID: file.ID}
+	if unavailable := handler.carrySubtitleFromPlanV3(context.Background(), &request, plan, file); unavailable {
+		t.Fatal("external subtitle carry reported unavailable for a track present on the target")
+	}
+	if request.SubtitleTrackIndex == nil || *request.SubtitleTrackIndex != 1 {
+		t.Fatalf("carried subtitle index = %v, want the target's fr external track at 1", request.SubtitleTrackIndex)
+	}
+}
+
+// A downloaded selection carries through its durable row id, never by the
+// combined ordinal or a same-language sibling.
+func TestCarrySubtitleFromPlanCarriesDownloadedTrack(t *testing.T) {
+	prior := &models.MediaFile{ID: 91}
+	file := &models.MediaFile{ID: 92}
+	repo := downloadedSubtitleRepoByFile{byFile: map[int][]subtitles.DownloadedSubtitle{
+		prior.ID: {{ID: 71, MediaFileID: prior.ID, Language: "eng", Format: subtitles.FormatSRT}},
+		file.ID: {
+			{ID: 72, MediaFileID: file.ID, Language: "eng", Format: subtitles.FormatSRT},
+			{ID: 71, MediaFileID: file.ID, Language: "eng", Format: subtitles.FormatSRT},
+		},
+	}}
+	index := 0
+	plan := playback.PlanV3{
+		SelectedTracks: playback.SelectedTracksV3{
+			Subtitle: &playback.TrackIdentityV3{ID: playback.TrackIDV3(prior.ID, "subtitle", index), Index: &index},
+		},
+		Subtitle: playback.SubtitleDecisionV3{
+			TrackID: playback.TrackIDV3(prior.ID, "subtitle", index),
+			Inventory: playback.BuildSubtitleInventoryV3(prior, []playback.SubtitleInventoryEntryV3{{
+				DownloadedSubtitleID: 71,
+				Language:             "eng",
+				Codec:                "srt",
+				Source:               playback.SubtitleSourceDownloadedV3,
+			}}),
+		},
+	}
+	handler := &PlaybackHandler{SubtitleRepo: repo}
+	request := playback.StartRequestV3{FileID: file.ID}
+	if unavailable := handler.carrySubtitleFromPlanV3(context.Background(), &request, plan, file); unavailable {
+		t.Fatal("downloaded subtitle carry reported unavailable for a row present on the target")
+	}
+	if request.SubtitleTrackIndex == nil || *request.SubtitleTrackIndex != 1 {
+		t.Fatalf("carried subtitle index = %v, want the id-matched downloaded row at 1", request.SubtitleTrackIndex)
+	}
+}
+
+// The legacy live-session fallback has no combined ordinal in the session
+// (transport -1 covers every non-embedded selection), but the durable attempt
+// does. It must carry an external selection instead of silently dropping it.
+func TestCarrySelectionsUsesAttemptPlanForExternalSubtitle(t *testing.T) {
+	manager := playback.NewSessionManager(0, 0)
+	prior := &models.MediaFile{
+		ID: 91,
+		ExternalSubtitles: []models.ExternalSubtitle{
+			{Language: "fr", Format: "srt", Path: "/subs/fr.srt"},
+		},
+	}
+	file := &models.MediaFile{
+		ID: 91,
+		ExternalSubtitles: []models.ExternalSubtitle{
+			{Language: "en", Format: "srt", Path: "/subs/en.srt"},
+			{Language: "fr", Format: "srt", Path: "/subs/fr.srt"},
+		},
+	}
+	previous := selectionCarryFixtureSession(t, manager, file.ID)
+	previous.SubtitleTrackIndex = -1
+	index := 0
+	plan := playback.PlanV3{
+		SelectedTracks: playback.SelectedTracksV3{
+			Subtitle: &playback.TrackIdentityV3{ID: playback.TrackIDV3(prior.ID, "subtitle", index), Index: &index},
+		},
+		Subtitle: playback.SubtitleDecisionV3{
+			TrackID:   playback.TrackIDV3(prior.ID, "subtitle", index),
+			Inventory: playback.BuildSubtitleInventoryV3(prior, nil),
+		},
+	}
+	handler := NewPlaybackHandler(manager)
+	handler.PlanStoreV3 = playback.NewMemoryPlanStoreV3()
+	if err := handler.PlanStoreV3.SaveAttempt(context.Background(), playback.AttemptRecordV3{
+		PlaybackAttemptID:    "attempt-external-subtitle",
+		SessionID:            previous.ID,
+		UserID:               previous.UserID,
+		ProfileID:            previous.ProfileID,
+		RequestedMediaFileID: prior.ID,
+		EffectiveMediaFileID: prior.ID,
+		CurrentPlan:          plan,
+		SelectionOrigin:      SelectionOriginExplicit,
+		ExpiresAt:            time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("save predecessor attempt: %v", err)
+	}
+
+	request := playback.StartRequestV3{FileID: file.ID, ProfileID: previous.ProfileID}
+	_, subtitleUnavailable, _ := handler.carrySelectionsFromActiveSessionV3(
+		context.Background(), previous.UserID, previous.ProfileID, file, &request, "", "")
+
+	if subtitleUnavailable {
+		t.Fatal("external subtitle carry reported unavailable for a track present on the target")
+	}
+	if request.SubtitleTrackIndex == nil || *request.SubtitleTrackIndex != 1 {
+		t.Fatalf("carried subtitle index = %v, want the target's fr external track at 1", request.SubtitleTrackIndex)
+	}
+}
+
+// A probed container index names a track only inside its own file. When the
+// target inventory differs, carrying another version's index verbatim can land
+// on a different language at the same position; the carry must remap by
+// signature instead.
+func TestCarrySelectionsIgnoresContainerIndexAcrossDifferentInventory(t *testing.T) {
+	manager := playback.NewSessionManager(0, 0)
+	previousTracks := []models.AudioTrack{
+		{Index: 0, Language: "ja", Codec: "aac", Layout: "stereo"},
+		{Index: 1, Language: "en", Codec: "ac3", Layout: "5.1"},
+	}
+	file := &models.MediaFile{
+		ID: 91,
+		AudioTracks: []models.AudioTrack{
+			{Index: 0, Language: "ja", Codec: "aac", Layout: "stereo"},
+			{Index: 1, Language: "fr", Codec: "ac3", Layout: "5.1"},
+			{Index: 2, Language: "en", Codec: "ac3", Layout: "5.1"},
+		},
+	}
+	previous := selectionCarryFixtureSession(t, manager, file.ID)
+	previous.SelectionOrigin = SelectionOriginExplicit
+	previous.AudioTrackIndex = 1 // en/ac3/5.1 at container index 1 in the old file
+	previous.VirtualAudioTracks = previousTracks
+
+	handler := NewPlaybackHandler(manager)
+	request := playback.StartRequestV3{FileID: file.ID, ProfileID: "profile-1"}
+	audioCarried, _, audioUnavailable := handler.carrySelectionsFromActiveSessionV3(
+		context.Background(), 1, "profile-1", file, &request, "", "")
+
+	if !audioCarried || audioUnavailable {
+		t.Fatalf("audio carry = %v unavailable=%v, want the signature match", audioCarried, audioUnavailable)
+	}
+	if request.AudioTrackIndex == nil || *request.AudioTrackIndex != 2 {
+		t.Fatalf("carried audio index = %v, want 2 (en at container index 2, not fr at 1)", request.AudioTrackIndex)
 	}
 }

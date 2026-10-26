@@ -5896,12 +5896,12 @@ func (h *PlaybackHandler) preferredAudioTrackIndexV3(ctx context.Context, userID
 	return normalizeAudioTrackIndex(file, playback.SelectAudioTrack(file.AudioTracks, preferredLang, seriesPref)), preferredLang, nil
 }
 
-// carrySelectionsFromActiveSessionV3 copies an explicit audio selection and an
-// embedded subtitle selection from the attempt the caller names as this
-// restart's predecessor (or, for a client that predates that field, from the
-// profile's uniquely matching live session) onto a start request that names
-// neither. A playback restart creates a new attempt and a new session, and the
-// client does not replay the track choices it made through earlier track_change
+// carrySelectionsFromActiveSessionV3 copies an explicit audio selection and a
+// subtitle selection from the attempt the caller names as this restart's
+// predecessor (or, for a client that predates that field, from the profile's
+// uniquely matching live session) onto a start request that names neither. A
+// playback restart creates a new attempt and a new session, and the client does
+// not replay the track choices it made through earlier track_change
 // replans, so without this the new plan silently falls back to the profile
 // default (the production "spontaneous audio switch") and drops the subtitle.
 // Only an explicit audio choice is carried; a server-resolved auto pick is
@@ -5915,12 +5915,17 @@ func (h *PlaybackHandler) preferredAudioTrackIndexV3(ctx context.Context, userID
 // replica; an ambiguous match (two tabs or devices sharing an address) carries
 // nothing rather than guessing.
 //
-// Audio and subtitle ordinals are transport ordinals of the previous effective
-// source, so both are matched onto the new file's inventory by track identity
-// (audio: language, codec and layout; subtitle: language, codec and forced
-// flag) rather than copied by number. When a track cannot be matched the
-// corresponding unavailable result reports the loss so the caller can warn
-// instead of silently planning the wrong track or subtitles off.
+// The previous ordinals name tracks on the previous effective source, so both
+// are matched onto the new file's inventory by track identity rather than
+// copied by number: audio uses the strict signature remap (container index,
+// then a unique full signature, then unique transport facts) and subtitles use
+// source, language, codec, forced and hearing-impaired flags. A duplicate
+// identity is ambiguous and is reported unavailable, never matched first-wins.
+// Subtitles also cover external and downloaded tracks: the durable plan records
+// the selected combined ordinal, while the live session's transport index is -1
+// for anything non-embedded. When a track cannot be matched the corresponding
+// unavailable result reports the loss so the caller can warn instead of
+// silently planning the wrong track or subtitles off.
 func findCarryCandidateSessionV3(sessions []*playback.Session, profileID string, fileID int, clientIP, userAgent string) *playback.Session {
 	var previous *playback.Session
 	matches := 0
@@ -5952,67 +5957,91 @@ func findCarryCandidateSessionV3(sessions []*playback.Session, profileID string,
 	return previous
 }
 
-type audioTrackIdentityV3 struct {
-	language string
-	codec    string
-	layout   string
-}
-
-func audioTrackIdentityOfMediaTrackV3(track models.AudioTrack) audioTrackIdentityV3 {
-	return audioTrackIdentityV3{
-		language: strings.ToLower(strings.TrimSpace(track.Language)),
-		codec:    strings.ToLower(strings.TrimSpace(track.Codec)),
-		layout:   strings.ToLower(strings.TrimSpace(track.Layout)),
-	}
-}
-
-func carriedAudioIndexV3(want audioTrackIdentityV3, file *models.MediaFile) (int, bool) {
+// remapCarriedAudioIndexV3 re-identifies an explicit audio selection on the
+// target inventory. When the inventories are the same layout the ordinal is
+// still valid and is reused directly; otherwise the container index is not an
+// identity across files, so the strict signature/facts remap decides. Duplicate
+// signatures remain ambiguous (-1) and report unavailable.
+func remapCarriedAudioIndexV3(previous []models.AudioTrack, selectedIndex int, file *models.MediaFile) int {
 	if file == nil {
-		return 0, false
+		return -1
 	}
-	for index, track := range file.AudioTracks {
-		if audioTrackIdentityOfMediaTrackV3(track) == want {
-			return index, true
+	if playback.AudioLayoutsEqual(previous, file.AudioTracks) &&
+		selectedIndex >= 0 && selectedIndex < len(file.AudioTracks) {
+		return selectedIndex
+	}
+	return playback.RemapAudioSelectionIndexBySignature(previous, selectedIndex, file.AudioTracks)
+}
+
+func audioTracksFromInventoryV3(items []playback.AudioInventoryItemV3) []models.AudioTrack {
+	if len(items) == 0 {
+		return nil
+	}
+	tracks := make([]models.AudioTrack, len(items))
+	for i, item := range items {
+		tracks[i] = models.AudioTrack{
+			Index:         item.Index,
+			Title:         item.Title,
+			EmbeddedTitle: item.EmbeddedTitle,
+			Language:      item.Language,
+			Languages:     item.Languages,
+			Codec:         item.Codec,
+			Layout:        item.Layout,
+			Channels:      item.Channels,
 		}
 	}
-	return 0, false
+	return tracks
 }
 
 type subtitleTrackIdentityV3 struct {
-	language string
-	codec    string
-	forced   bool
+	source          string
+	language        string
+	codec           string
+	forced          bool
+	hearingImpaired bool
 }
 
 func subtitleTrackIdentityOfMediaTrackV3(track models.SubtitleTrack) subtitleTrackIdentityV3 {
 	return subtitleTrackIdentityV3{
-		language: strings.ToLower(strings.TrimSpace(track.Language)),
-		codec:    strings.ToLower(strings.TrimSpace(track.Codec)),
-		forced:   track.Forced,
+		source:          playback.SubtitleSourceEmbeddedV3,
+		language:        strings.ToLower(strings.TrimSpace(track.Language)),
+		codec:           strings.ToLower(strings.TrimSpace(track.Codec)),
+		forced:          track.Forced,
+		hearingImpaired: track.HearingImpaired,
 	}
 }
 
 func subtitleTrackIdentityOfInventoryV3(item playback.SubtitleInventoryItemV3) subtitleTrackIdentityV3 {
 	return subtitleTrackIdentityV3{
-		language: strings.ToLower(strings.TrimSpace(item.Language)),
-		codec:    strings.ToLower(strings.TrimSpace(item.Codec)),
-		forced:   item.Forced,
+		source:          item.Source,
+		language:        strings.ToLower(strings.TrimSpace(item.Language)),
+		codec:           strings.ToLower(strings.TrimSpace(item.Codec)),
+		forced:          item.Forced,
+		hearingImpaired: item.HearingImpaired,
 	}
 }
 
+// carriedSubtitleIndexV3 resolves the published ordinal of the one target
+// track whose identity matches want. Duplicate identities are ambiguous and
+// report no match: carrying either would silently change the viewer's subtitle.
 func carriedSubtitleIndexV3(want subtitleTrackIdentityV3, file *models.MediaFile) (int, bool) {
 	if file == nil {
 		return 0, false
 	}
+	matched := -1
 	for index, item := range playback.BuildSubtitleInventoryV3(file, nil) {
-		if item.Source != playback.SubtitleSourceEmbeddedV3 {
+		if subtitleTrackIdentityOfInventoryV3(item) != want {
 			continue
 		}
-		if subtitleTrackIdentityOfInventoryV3(item) == want {
-			return index, true
+		if matched >= 0 {
+			return 0, false
 		}
+		matched = index
 	}
-	return 0, false
+	if matched < 0 {
+		return 0, false
+	}
+	return matched, true
 }
 
 func (h *PlaybackHandler) previousAudioTracksV3(ctx context.Context, previous *playback.Session) []models.AudioTrack {
@@ -6057,11 +6086,11 @@ func (h *PlaybackHandler) carryAudioFromSessionV3(ctx context.Context, req *play
 		previous.SelectionOrigin != SelectionOriginExplicit || previous.AudioTrackIndex < 0 {
 		return false, false
 	}
+	// Strict remap, not a first-match scan: a duplicated language/codec/layout
+	// identity is ambiguous, and carrying either one would silently switch the
+	// viewer's stream. Ambiguity reports unavailable below.
 	tracks := h.previousAudioTracksV3(ctx, previous)
-	if previous.AudioTrackIndex >= len(tracks) {
-		return false, true
-	}
-	if index, matched := carriedAudioIndexV3(audioTrackIdentityOfMediaTrackV3(tracks[previous.AudioTrackIndex]), file); matched {
+	if index := remapCarriedAudioIndexV3(tracks, previous.AudioTrackIndex, file); index >= 0 {
 		req.AudioTrackIndex = &index
 		return true, false
 	}
@@ -6071,11 +6100,28 @@ func (h *PlaybackHandler) carryAudioFromSessionV3(ctx context.Context, req *play
 	return false, true
 }
 
-// carrySubtitleFromSessionV3 carries the previous session's embedded subtitle
-// pick onto the start request by track identity.
+// carrySubtitleFromSessionV3 carries the previous session's subtitle pick onto
+// the start request by track identity. It reports whether the viewer must be
+// told their track is unavailable.
 func (h *PlaybackHandler) carrySubtitleFromSessionV3(ctx context.Context, req *playback.StartRequestV3, previous *playback.Session, file *models.MediaFile) bool {
-	if req.SubtitleTrackIndex != nil || req.SubtitleTrackID != "" || previous.SubtitleTrackIndex < 0 {
+	if req.SubtitleTrackIndex != nil || req.SubtitleTrackID != "" {
 		return false
+	}
+	if previous.SubtitleTrackIndex < 0 {
+		// A transport index of -1 means no embedded subtitle; it conflates
+		// subtitles-off with an external/downloaded selection. The durable
+		// attempt records the selected combined ordinal, so use its plan when
+		// this predecessor has one. Without it the legacy session carries no
+		// evidence either way and must not invent a selection.
+		if h.PlanStoreV3 == nil || previous.ID == "" {
+			return false
+		}
+		record, err := h.PlanStoreV3.GetAttempt(ctx, previous.ID)
+		if err != nil || record == nil || record.UserID != previous.UserID || record.ProfileID != previous.ProfileID ||
+			(record.RequestedMediaFileID != file.ID && record.EffectiveMediaFileID != file.ID) {
+			return false
+		}
+		return h.carrySubtitleFromPlanV3(ctx, req, record.CurrentPlan, file)
 	}
 	tracks := h.previousSubtitleTracksV3(ctx, previous)
 	if previous.SubtitleTrackIndex >= len(tracks) {
@@ -6083,6 +6129,7 @@ func (h *PlaybackHandler) carrySubtitleFromSessionV3(ctx context.Context, req *p
 	}
 	if index, matched := carriedSubtitleIndexV3(subtitleTrackIdentityOfMediaTrackV3(tracks[previous.SubtitleTrackIndex]), file); matched {
 		req.SubtitleTrackIndex = &index
+		req.SubtitleTrackID = playback.TrackIDV3(file.ID, "subtitle", index)
 		return false
 	}
 	return true
@@ -6096,52 +6143,105 @@ func carryAudioFromPlanV3(req *playback.StartRequestV3, plan playback.PlanV3, ex
 		return false, false
 	}
 	previousIndex := *plan.SelectedTracks.Audio.Index
-	if previousIndex < 0 || previousIndex >= len(plan.AudioTracks) {
-		return false, true
-	}
-	want := audioTrackIdentityV3{
-		language: strings.ToLower(strings.TrimSpace(plan.AudioTracks[previousIndex].Language)),
-		codec:    strings.ToLower(strings.TrimSpace(plan.AudioTracks[previousIndex].Codec)),
-		layout:   strings.ToLower(strings.TrimSpace(plan.AudioTracks[previousIndex].Layout)),
-	}
-	if index, matched := carriedAudioIndexV3(want, file); matched {
+	if index := remapCarriedAudioIndexV3(audioTracksFromInventoryV3(plan.AudioTracks), previousIndex, file); index >= 0 {
 		req.AudioTrackIndex = &index
 		return true, false
 	}
 	return false, true
 }
 
-// findPreviousEmbeddedSubtitleV3 resolves the predecessor plan's embedded
-// subtitle selection to a matchable identity.
-func findPreviousEmbeddedSubtitleV3(plan playback.PlanV3, trackID string) (subtitleTrackIdentityV3, bool) {
-	for _, item := range plan.Subtitle.Inventory {
-		if item.Source != playback.SubtitleSourceEmbeddedV3 || item.TrackID != trackID {
-			continue
+// previousSubtitleSelectionIndexV3 returns the predecessor plan's selected
+// combined subtitle ordinal. Plans persisted by the planner always carry the
+// index; older records fall back to the track ID's ordinal.
+func previousSubtitleSelectionIndexV3(plan playback.PlanV3) (int, bool) {
+	if selected := plan.SelectedTracks.Subtitle; selected != nil {
+		if selected.Index != nil {
+			return *selected.Index, true
 		}
-		return subtitleTrackIdentityOfInventoryV3(item), true
-	}
-	return subtitleTrackIdentityV3{}, false
-}
-
-// carrySubtitleFromPlanV3 carries the predecessor plan's embedded subtitle pick
-// onto the start request by track identity.
-func carrySubtitleFromPlanV3(req *playback.StartRequestV3, plan playback.PlanV3, file *models.MediaFile) bool {
-	if req.SubtitleTrackIndex != nil || req.SubtitleTrackID != "" || plan.SelectedTracks.Subtitle == nil {
-		return false
+		if _, kind, ordinal, ok := playback.ParseTrackIDV3(selected.ID); ok && kind == subtitleTrackKindV3 {
+			return ordinal, true
+		}
 	}
 	trackID := strings.TrimSpace(plan.Subtitle.TrackID)
 	if trackID == "" {
-		trackID = strings.TrimSpace(plan.SelectedTracks.Subtitle.ID)
+		return 0, false
 	}
-	want, matchedPrevious := findPreviousEmbeddedSubtitleV3(plan, trackID)
-	if !matchedPrevious {
+	_, kind, ordinal, ok := playback.ParseTrackIDV3(trackID)
+	if !ok || kind != subtitleTrackKindV3 {
+		return 0, false
+	}
+	return ordinal, true
+}
+
+func subtitleInventoryItemAtV3(inventory []playback.SubtitleInventoryItemV3, index int) (playback.SubtitleInventoryItemV3, bool) {
+	for _, item := range inventory {
+		if item.CombinedIndex == index {
+			return item, true
+		}
+	}
+	return playback.SubtitleInventoryItemV3{}, false
+}
+
+// carrySubtitleFromPlanV3 carries the predecessor plan's subtitle pick onto the
+// start request by track identity. Embedded and external tracks match on the
+// target's published inventory; a downloaded selection is re-resolved through
+// the durable subtitle rows. It reports whether the viewer must be told their
+// track is unavailable.
+func (h *PlaybackHandler) carrySubtitleFromPlanV3(ctx context.Context, req *playback.StartRequestV3, plan playback.PlanV3, file *models.MediaFile) bool {
+	if req.SubtitleTrackIndex != nil || req.SubtitleTrackID != "" {
+		return false
+	}
+	previousIndex, ok := previousSubtitleSelectionIndexV3(plan)
+	if !ok || previousIndex < 0 {
+		return false
+	}
+	item, ok := subtitleInventoryItemAtV3(plan.Subtitle.Inventory, previousIndex)
+	if !ok {
 		return true
 	}
-	if index, matched := carriedSubtitleIndexV3(want, file); matched {
+	if item.Source == playback.SubtitleSourceDownloadedV3 {
+		return h.carryDownloadedSubtitleFromPlanV3(ctx, req, item, file)
+	}
+	if index, matched := carriedSubtitleIndexV3(subtitleTrackIdentityOfInventoryV3(item), file); matched {
 		req.SubtitleTrackIndex = &index
+		req.SubtitleTrackID = playback.TrackIDV3(file.ID, "subtitle", index)
 		return false
 	}
 	return true
+}
+
+// carryDownloadedSubtitleFromPlanV3 re-resolves a downloaded selection by its
+// durable row id: that id is the only stable name for a downloaded track, and a
+// same-language sibling must not be substituted. The target's downloaded rows
+// follow its own published inventory, so the matched position is published base
+// plus row position. Any failure is reported unavailable rather than carried by
+// the combined ordinal.
+func (h *PlaybackHandler) carryDownloadedSubtitleFromPlanV3(ctx context.Context, req *playback.StartRequestV3, item playback.SubtitleInventoryItemV3, file *models.MediaFile) bool {
+	downloadedID := item.DownloadedSubtitleIDV3()
+	if downloadedID <= 0 || h.SubtitleRepo == nil || file == nil {
+		return true
+	}
+	downloaded, err := h.SubtitleRepo.ListDownloadedSubtitles(ctx, file.ID)
+	if err != nil {
+		return true
+	}
+	base := len(playback.BuildSubtitleInventoryV3(file, nil))
+	matched := -1
+	for position, candidate := range downloaded {
+		if candidate.ID != downloadedID {
+			continue
+		}
+		if matched >= 0 {
+			return true
+		}
+		matched = base + position
+	}
+	if matched < 0 {
+		return true
+	}
+	req.SubtitleTrackIndex = &matched
+	req.SubtitleTrackID = playback.TrackIDV3(file.ID, "subtitle", matched)
+	return false
 }
 
 func (h *PlaybackHandler) carrySelectionsFromActiveSessionV3(
@@ -6213,7 +6313,7 @@ func (h *PlaybackHandler) carrySelectionsFromPredecessorAttemptV3(
 	plan := record.CurrentPlan
 	audioCarried, audioUnavailable = carryAudioFromPlanV3(req, plan, record.SelectionOrigin == SelectionOriginExplicit, file)
 
-	if carrySubtitleFromPlanV3(req, plan, file) {
+	if h.carrySubtitleFromPlanV3(ctx, req, plan, file) {
 		subtitleUnavailable = true
 	}
 	return audioCarried, subtitleUnavailable, audioUnavailable
