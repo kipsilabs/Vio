@@ -3177,7 +3177,7 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 	// that displaced the request's token. If another restart landed while the
 	// request waited, its lease is a later generation and the old token no
 	// longer names that timeline.
-	if err == nil && continuationSuccessorToken != "" {
+	if continuationSuccessorToken != "" {
 		if segmentLease == nil || segmentLease.GenerationToken != continuationSuccessorToken {
 			if segmentLease != nil {
 				_ = segmentLease.Close()
