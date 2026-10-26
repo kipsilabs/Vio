@@ -39,7 +39,7 @@ import {
   resolveAudioPickIdentity,
   resolvePlanAudioIdentity,
 } from "../utils/audioTrackMatch";
-import { buildPublishedSubtitleTracks } from "../utils/subtitleInventory";
+import { buildPublishedSubtitleTracks, subtitleLanguageBase } from "../utils/subtitleInventory";
 import { isBitmapCodec } from "../utils/subtitleCodecs";
 import { isInventoryProvisional } from "../utils/inventoryProvenance";
 import { isNeutralVirtualVersion } from "../utils/neutralVirtualVersion";
@@ -959,6 +959,76 @@ function resolveAudioTrackChange(
 }
 
 /**
+ * Describes the plan inventory a queued pick was captured against. A subtitle
+ * `track_id` is generated from the file id and published ordinal, so an equal
+ * id only names the same asset while the inventory it was read from is still
+ * the current one.
+ */
+function subtitleInventoryIdentity(inventory: readonly SubtitleInventoryItemV3[]): string {
+  return JSON.stringify(
+    inventory.map((item) => [
+      item.combined_index,
+      item.track_id,
+      item.source,
+      item.codec ?? null,
+      item.language ?? null,
+      item.label ?? null,
+      item.forced,
+      item.hearing_impaired,
+      item.sync_key ?? null,
+    ]),
+  );
+}
+
+/**
+ * A descriptor that names the same subtitle asset after the inventory re-keys.
+ * Language, flags, codec, source, and label are the evidence the menus show the
+ * viewer; unlike the ordinal-derived `track_id` they survive a slot move.
+ */
+function subtitleDescriptorKey(track: {
+  language?: string | null;
+  codec?: string | null;
+  label?: string | null;
+  source?: string | null;
+  forced?: boolean | null;
+  hearing_impaired?: boolean | null;
+}): string {
+  const source = (track.source ?? "").trim().toLowerCase();
+  const knownSource =
+    source === "external" || source === "embedded" || source === "downloaded" ? source : "";
+  return [
+    subtitleLanguageBase(track.language),
+    track.forced ? "forced" : "full",
+    track.hearing_impaired ? "hi" : "plain",
+    (track.codec ?? "").trim().toLowerCase(),
+    knownSource,
+    // The player maps a missing label from the language, so compare the same
+    // fallback instead of an empty label against that synthesized one.
+    (track.label ?? track.language ?? "").trim().toLowerCase(),
+  ].join("|");
+}
+
+/** The captured sidecar row survives a re-key through its stable sync key. */
+function matchSubtitleByAsset(
+  inventory: readonly SubtitleInventoryItemV3[],
+  picked: PlayerSubtitleInfo,
+): SubtitleInventoryItemV3 | null {
+  const syncKey = (picked.sync_key ?? "").trim();
+  if (!syncKey) return null;
+  const matches = inventory.filter((item) => (item.sync_key ?? "").trim() === syncKey);
+  return matches.length === 1 ? (matches[0] ?? null) : null;
+}
+
+function matchSubtitleByDescriptor(
+  inventory: readonly SubtitleInventoryItemV3[],
+  picked: PlayerSubtitleInfo,
+): SubtitleInventoryItemV3 | null {
+  const key = subtitleDescriptorKey(picked);
+  const matches = inventory.filter((item) => subtitleDescriptorKey(item) === key);
+  return matches.length === 1 ? (matches[0] ?? null) : null;
+}
+
+/**
  * Resolves the subtitle identity to send for a menu pick, or null when the pick
  * cannot be reconciled to the current plan's inventory.
  *
@@ -969,6 +1039,13 @@ function resolveAudioTrackChange(
  * the menu can still show the outgoing inventory, and the plan can publish a
  * *different* track at that same ordinal. Trusting the ordinal there would
  * switch to a language the viewer never asked for.
+ *
+ * `trustPickedTrackId` is false for a queued pick whose captured inventory has
+ * since been replaced. The server derives subtitle ids from the file id and
+ * ordinal, so an equal id in the new inventory can name another language. The
+ * captured row is then matched by its stable sync key or an unambiguous
+ * descriptor instead; when neither names exactly one track the pick is
+ * dropped rather than replayed against the old slot.
  *
  * A pick with a stable identity and no counterpart in the plan is dropped
  * rather than sent. The plan's exact ordinal is used only when there is no
@@ -984,6 +1061,7 @@ function resolveSubtitleTrackChange(
   displayed: readonly PlayerSubtitleInfo[],
   combinedIndex: number,
   pickedTrack?: PlayerSubtitleInfo | null,
+  trustPickedTrackId = true,
 ): TrackIdentityV3 | null {
   if (!Number.isInteger(combinedIndex) || combinedIndex < 0) return null;
 
@@ -995,9 +1073,20 @@ function resolveSubtitleTrackChange(
       ? pickedTrack
       : displayed.find((item) => item.index === combinedIndex);
   if (picked) {
-    if (picked.track_id) {
+    if (trustPickedTrackId && picked.track_id) {
       const byId = inventory.find((item) => item.track_id === picked.track_id);
       if (byId) return { id: byId.track_id, index: byId.combined_index };
+    }
+    if (!trustPickedTrackId) {
+      const byAsset = matchSubtitleByAsset(inventory, picked);
+      if (byAsset) return { id: byAsset.track_id, index: byAsset.combined_index };
+      const byDescriptor = matchSubtitleByDescriptor(inventory, picked);
+      if (byDescriptor) {
+        return { id: byDescriptor.track_id, index: byDescriptor.combined_index };
+      }
+      // The inventory moved and the clicked row has no unambiguous
+      // counterpart. Its old slot now names whichever track moved into it.
+      return null;
     }
     const candidates = inventory.map((item) => ({ ...item, index: item.combined_index }));
     const byLanguage = matchSubtitleTrackAcrossVersions(candidates, picked);
@@ -1034,6 +1123,8 @@ type PendingTrackPick =
       index: number | null;
       positionSeconds: number;
       track: PlayerSubtitleInfo | undefined;
+      /** The inventory the picked row was read from, captured with the pick. */
+      inventoryIdentity: string;
       refreshAttempted: boolean;
     };
 
@@ -1050,7 +1141,13 @@ function trackPickOptions(plan: PlanV3, pick: PendingTrackPick): ReplanOptions |
   if (pick.index === null) {
     return { operation: "track_change", positionSeconds: pick.positionSeconds, subtitle: null };
   }
-  const subtitle = resolveSubtitleTrackChange(plan, [], pick.index, pick.track);
+  const subtitle = resolveSubtitleTrackChange(
+    plan,
+    [],
+    pick.index,
+    pick.track,
+    pick.inventoryIdentity === subtitleInventoryIdentity(plan.subtitle.inventory),
+  );
   if (!subtitle) return null;
   return {
     operation: "track_change",
@@ -3277,6 +3374,7 @@ export function usePlaybackSession(
           combinedIndex == null
             ? undefined
             : stateRef.current.subtitleUrls.find((item) => item.index === combinedIndex),
+        inventoryIdentity: subtitleInventoryIdentity(plan.subtitle.inventory),
         refreshAttempted: false,
       };
       if (switchingRef.current || replanInFlightRef.current) {
