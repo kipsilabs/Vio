@@ -480,6 +480,70 @@ describe("subtitle marker reconciliation", () => {
     await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(1));
   });
 
+  it("does not stamp a placeholder plan ordinal onto watch-detail fallback rows", async () => {
+    const english: PlayerSubtitleInfo = {
+      index: 0,
+      media_file_id: 7,
+      language: "eng",
+      codec: "srt",
+      label: "English",
+      source: "external",
+      url: "/api/v2/stream/session/subtitles/en.vtt?file_id=7",
+    };
+    const french: PlayerSubtitleInfo = {
+      ...english,
+      index: 1,
+      language: "fra",
+      label: "French",
+      url: "/api/v2/stream/session/subtitles/fr.vtt?file_id=7",
+    };
+    // A published-but-unselectable entry: the probe has not landed, so the
+    // plan's inventory is a declared placeholder with no sidecar to fetch.
+    const placeholder = fixtureSubtitleInventoryItemV3({
+      track_id: "file:7:subtitle:9",
+      combined_index: 9,
+      language: "eng",
+      label: "English",
+      delivery: "sidecar",
+      url: "",
+    });
+    const deferredPlan = fixturePlanV3({
+      ...directPlan,
+      subtitle: { mode: "off", inventory: [] },
+    });
+    const placeholderPlan = fixturePlanV3({
+      ...directPlan,
+      plan_id: "plan:subtitle-placeholder",
+      plan_attempt_key: "v3:subtitle-placeholder",
+      subtitle: { mode: "render", track_id: placeholder.track_id, inventory: [placeholder] },
+      selected_tracks: {
+        audio: { id: "file:7:audio:0", index: 0 },
+        subtitle: { id: placeholder.track_id, index: 9 },
+      },
+    });
+    const { rerenderPlayer } = renderPlayer({
+      plan: deferredPlan,
+      subtitleUrls: [english, french],
+      subtitleMode: "off",
+    });
+
+    // The viewer picks a watch-detail fallback row while the plan inventory is
+    // still deferred; the marker is manual from here on.
+    act(() => controls.current?.onSubtitleSelect?.(0));
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
+
+    rerenderPlayer({
+      plan: placeholderPlan,
+      subtitleUrls: [english, french],
+      subtitleMode: "off",
+    });
+    await act(async () => {});
+
+    // Ordinal 9 names no fallback row, and the plan has no selectable entry to
+    // re-mint: the marker must stay on the viewer's row.
+    expect(controls.current?.activeSubtitleIndex).toBe(0);
+  });
+
   it("forwards the watch-detail fallback row a queued subtitle pick was made from", async () => {
     const onSubtitleTrackChange = vi.fn();
     // The plan's probe is deferred, so its inventory is empty and the menu is
