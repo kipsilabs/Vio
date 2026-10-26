@@ -39,6 +39,11 @@ func TestRemapFallbackAudioIndexCarriesSelectionByIdentity(t *testing.T) {
 	if got, carry := remapFallbackAudioIndexV3(pinned, otherLanguage, 1); got != 0 || carry != fallbackAudioCarryDegraded {
 		t.Fatalf("remapped index with no equivalent = %d carry = %v, want 0/degraded (default track, warned)", got, carry)
 	}
+	// An ordinal past the pinned inventory names no stream; it must not index
+	// the slice or claim a carry.
+	if got, carry := remapFallbackAudioIndexV3(pinned, replacement, 2); got != -1 || carry != fallbackAudioCarryDegraded {
+		t.Fatalf("remapped index past the pinned inventory = %d carry = %v, want -1/degraded", got, carry)
+	}
 }
 
 // A successful cross-release carry names both sides of the remap so a

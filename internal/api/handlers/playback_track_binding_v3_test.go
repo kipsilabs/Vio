@@ -276,3 +276,30 @@ func TestRekeyReplanRemapsCarriedOrdinalOntoEffectiveCandidate(t *testing.T) {
 		t.Fatalf("replan subtitle ordinal = %d, want 0 (English on the effective inventory)", ordinal)
 	}
 }
+
+// A same-row rotation that swaps two tracks agreeing on language, codec,
+// channels, layout, and index is only visible in their titles. The fast path
+// must not treat the row id as proof that the carried ordinal still names the
+// selected stream; it has to remap onto the title the viewer chose.
+func TestRemapAudioSelectionSameRowTitleOnlyReorder(t *testing.T) {
+	mainTrack := func(index int) models.AudioTrack {
+		return models.AudioTrack{Index: index, Codec: "aac", Language: "eng", Layout: "stereo", Channels: 2, Title: "Main"}
+	}
+	commentary := func(index int) models.AudioTrack {
+		return models.AudioTrack{Index: index, Codec: "aac", Language: "eng", Layout: "stereo", Channels: 2, Title: "Commentary"}
+	}
+	source := &models.MediaFile{ID: 7, AudioTracks: []models.AudioTrack{mainTrack(0), commentary(1)}}
+	target := &models.MediaFile{ID: 7, AudioTracks: []models.AudioTrack{commentary(0), mainTrack(1)}}
+
+	request := playback.StartRequestV3{AudioTrackID: playback.TrackIDV3(7, "audio", 1)}
+	if err := remapAudioSelectionV3(source, target, &request); err != nil {
+		t.Fatalf("remapAudioSelectionV3: %v", err)
+	}
+	if request.AudioTrackIndex == nil || *request.AudioTrackIndex != 0 {
+		t.Fatalf("remapped audio index = %v, want 0 (the commentary track after the swap)", request.AudioTrackIndex)
+	}
+	_, kind, ordinal, ok := playback.ParseTrackIDV3(request.AudioTrackID)
+	if !ok || kind != "audio" || ordinal != 0 {
+		t.Fatalf("remapped audio id = %q, want ordinal 0", request.AudioTrackID)
+	}
+}
