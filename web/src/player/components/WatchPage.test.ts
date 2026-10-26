@@ -2636,6 +2636,68 @@ describe("WatchPage realtime reconnect reconcile", () => {
       expect(props.versions?.some((row) => row.file_id === 7)).toBe(true);
     });
   });
+
+  it("keeps a reconcile that is in flight while the version list and liveness change", async () => {
+    playbackSessionMock.mockReturnValue(playbackSession({ mediaFileId: 7 }));
+    queryClientOverride.current = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    let resolveDetail!: (detail: { versions: PlayerFileVersion[] }) => void;
+    fetchWatchDetailMock.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveDetail = resolve;
+        }),
+    );
+
+    const firstVersion: PlayerFileVersion = { ...version, file_id: 7, resolution: "1080p" };
+    const { rerender } = render(
+      createElement(WatchPage, { ...watchPageProps, versions: [firstVersion] }),
+    );
+
+    const connProps = videoPlayerMock.mock.calls.at(-1)?.[0] as {
+      onRealtimeConnectionStateChange?: (state: "connected" | "connecting") => void;
+    };
+    act(() => {
+      connProps.onRealtimeConnectionStateChange?.("connected");
+    });
+    act(() => {
+      connProps.onRealtimeConnectionStateChange?.("connecting");
+    });
+    act(() => {
+      connProps.onRealtimeConnectionStateChange?.("connected");
+    });
+    await waitFor(() => expect(fetchWatchDetailMock).toHaveBeenCalledTimes(1));
+
+    // The parent's version list and liveness verdicts move while the reconcile
+    // read is still in flight. The reconnect epoch is already claimed, so a
+    // cancelled response would be lost for this reconnect for good.
+    rerender(
+      createElement(WatchPage, {
+        ...watchPageProps,
+        versions: [{ ...firstVersion, resolution: "2160p" }],
+        versionLiveness: new Map([[9, false]]),
+      }),
+    );
+
+    await act(async () => {
+      resolveDetail({
+        versions: [{ ...version, file_id: 9, resolution: "720p" }],
+      });
+      await Promise.resolve();
+    });
+
+    // The fresh row lands, stamped with the liveness the parent holds now.
+    await waitFor(() => {
+      const props = videoPlayerMock.mock.calls.at(-1)?.[0] as {
+        versions?: PlayerFileVersion[];
+      };
+      expect(props.versions?.find((row) => row.file_id === 9)).toMatchObject({
+        available: false,
+      });
+    });
+    expect(fetchWatchDetailMock).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("WatchPage chapter refresh", () => {
