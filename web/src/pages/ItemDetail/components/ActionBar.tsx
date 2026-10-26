@@ -1129,8 +1129,10 @@ export default function ActionBar({
   );
 
   // The subtitle control is available even when the selected file has no
-  // embedded tracks because downloaded subtitles are loaded on demand.
-  const hasStreamControls = Boolean(selectedVersion);
+  // embedded tracks because downloaded subtitles are loaded on demand. A
+  // missing pick still owns this row: it holds the replacement picker.
+  const hasReplacementVersion = selectedVersionMissing && (versions?.length ?? 0) > 0;
+  const hasStreamControls = Boolean(selectedVersion) || hasReplacementVersion;
 
   return (
     <div className="detail-action-bar space-y-2.5" data-compact-mobile={compactMobile || undefined}>
@@ -1449,13 +1451,15 @@ export default function ActionBar({
             </span>
           )}
           {versions &&
-            (hasMultipleVersions || virtualDetail) &&
-            selectedVersion &&
+            versions.length > 0 &&
+            (hasMultipleVersions || virtualDetail || selectedVersionMissing) &&
+            (selectedVersion || selectedVersionMissing) &&
             onSelectVersion && (
               <VersionDropdown
                 versions={versions}
                 playbackVariants={playbackVariants}
                 selectedVersion={selectedVersionWithTracks}
+                selectionMissing={selectedVersionMissing}
                 onSelectVersion={onSelectVersion}
                 contentId={contentId}
                 onOpenChange={onVersionPickerOpenChange}
