@@ -6311,8 +6311,14 @@ describe("usePlaybackSession plan audio inventory", () => {
     };
     const verifiedAudioTracks = [englishTrack, spanishTrack];
     // The replan was built before the probe persisted, so it carries the older
-    // declared order and marks itself provisional.
-    const reorderedPlanTracks = [spanishTrack, englishTrack];
+    // declared order and marks itself provisional. The server mints ids from
+    // the file id and published ordinal, so the reordered list re-mints them:
+    // Spanish now occupies slot 0 and English slot 1. Keeping each track's old
+    // id, as this test used to, does not reproduce what the server sends.
+    const reorderedPlanTracks = [
+      { ...spanishTrack, track_id: "file:7:audio:0", selection_index: 0 },
+      { ...englishTrack, track_id: "file:7:audio:1", selection_index: 1 },
+    ];
     const replanBodies: Array<Record<string, unknown>> = [];
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
@@ -6347,7 +6353,7 @@ describe("usePlaybackSession plan audio inventory", () => {
             inventory_provenance: "declared",
             tracks_pending: true,
             audio_tracks: reorderedPlanTracks,
-            selected_tracks: { audio: { id: "file:7:audio:0", index: 1 } },
+            selected_tracks: { audio: { id: "file:7:audio:1", index: 1 } },
           }),
         });
       }

@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createWatchRouteRequest, type WatchPlaybackStartInput } from "@/pages/watchRouteHelpers";
 import type { WatchPage } from "@/player/components/WatchPage";
 import { WatchPlaybackHost, WatchPlaybackProvider } from "./WatchPlaybackChrome";
+import { readRequestedFileId } from "./requestedVersion";
 import {
   useWatchPlaybackController,
   type WatchPlaybackControllerValue,
@@ -115,6 +116,7 @@ async function renderEpisode(input: WatchPlaybackStartInput) {
 
 describe("WatchPlaybackHost end of an episode", () => {
   beforeEach(() => {
+    localStorage.clear();
     mocks.navigate.mockReset();
     mocks.player.props = null;
   });
@@ -126,6 +128,25 @@ describe("WatchPlaybackHost end of an episode", () => {
     episode.nearEnd();
 
     expect(episode.controller().state.mode).toBe("post-roll");
+  });
+
+  it("remembers a version switched during the episode when it completes into post-roll", async () => {
+    const episode = await renderEpisode({ contentId: "episode-1", libraryId: 1 });
+    // Post-roll opens before the end, then the real `ended` event reports the
+    // switch: row 1 served the bytes, but the viewer asked for row 2.
+    episode.nearEnd();
+    expect(episode.controller().state.mode).toBe("post-roll");
+
+    act(() =>
+      episode.player().onEnded?.({
+        positionSeconds: DURATION,
+        durationSeconds: DURATION,
+        lastFileId: 1,
+        selectedFileId: 2,
+      }),
+    );
+
+    expect(readRequestedFileId("episode-1")).toBe(2);
   });
 
   it("keeps a room member in the player and returns it to the room when the room leaves playback", async () => {

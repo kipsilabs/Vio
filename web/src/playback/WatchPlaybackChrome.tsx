@@ -763,6 +763,22 @@ function WatchPlaybackHostContent() {
     });
   }, [navigate, request, state.mode, state.shouldReturnToWatchPage]);
 
+  // The viewer's own pick is durable, independent of the row the server records
+  // as last played: progress and history name the row that served the bytes, so
+  // a substitution would otherwise become the selected version on the next
+  // load. Completion paths write this even when they do not persist progress.
+  const rememberRequestedVersion = useCallback(
+    (exitState?: PlaybackExitState) => {
+      const contentId = activeItem?.content_id ?? activeRequest?.contentId;
+      if (!contentId || !exitState) {
+        return;
+      }
+
+      rememberRequestedFileId(contentId, exitState.selectedFileId);
+    },
+    [activeItem, activeRequest],
+  );
+
   const applyExitStateToCache = useCallback(
     (exitState?: PlaybackExitState) => {
       const contentId = activeItem?.content_id ?? activeRequest?.contentId;
@@ -770,11 +786,7 @@ function WatchPlaybackHostContent() {
         return;
       }
 
-      // The viewer's own pick is durable, independent of the row the server
-      // records as last played: progress and history name the row that served
-      // the bytes, so a substitution would otherwise become the selected
-      // version on the next load.
-      rememberRequestedFileId(contentId, exitState.selectedFileId);
+      rememberRequestedVersion(exitState);
 
       if (exitState.positionSeconds <= 0) {
         return;
@@ -793,7 +805,7 @@ function WatchPlaybackHostContent() {
         lastEditionKey: exitState.lastEditionKey,
       });
     },
-    [activeItem, activeRequest, queryClient],
+    [activeItem, activeRequest, queryClient, rememberRequestedVersion],
   );
 
   const handleExit = useCallback(
@@ -948,6 +960,12 @@ function WatchPlaybackHostContent() {
   const handleEnded = useCallback(
     (exitState?: PlaybackExitState) => {
       if (!requestKeyValue) return;
+      // Record the requested row before any completion branch. Post-roll, a
+      // room exit, and automatic continuation do not all pass through the
+      // ordinary exit path, but a version switched during playback must survive
+      // the episode finishing. Progress persistence stays separate: some of
+      // these paths deliberately leave the completed position to history.
+      rememberRequestedVersion(exitState);
       if (activeRequest?.roomId && activeRequest.roomToken) {
         stopPlayback();
         const roomReturn = buildRoomReturnNavigation(activeRequest);
@@ -1009,6 +1027,7 @@ function WatchPlaybackHostContent() {
       activeRequest,
       activeItem,
       applyExitStateToCache,
+      rememberRequestedVersion,
       stopPlayback,
       navigate,
       controller,
