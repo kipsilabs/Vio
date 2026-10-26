@@ -4028,6 +4028,117 @@ describe("usePlaybackSession replans", () => {
     unmount();
   });
 
+  it("re-resolves a queued subtitle pick when the replacement inventory reuses its ordinal", async () => {
+    const english = fixtureSubtitleInventoryItemV3({
+      track_id: "file:7:subtitle:0",
+      combined_index: 0,
+      source: "external",
+      codec: "srt",
+      language: "eng",
+      label: "English",
+      url: "/stream/session-1/subtitles/0.vtt?file_id=7",
+    });
+    const french = fixtureSubtitleInventoryItemV3({
+      track_id: "file:7:subtitle:1",
+      combined_index: 1,
+      source: "external",
+      codec: "srt",
+      language: "fra",
+      label: "French",
+      url: "/stream/session-1/subtitles/1.vtt?file_id=7",
+    });
+    const initialPlan = fixturePlanV3({
+      subtitle: { mode: "off", inventory: [english, french] },
+    });
+    // The replacement reuses the ordinal-derived ids in the opposite slots:
+    // file:7:subtitle:0 now names French, so trusting the captured id would
+    // replay the click as the wrong language.
+    const replannedPlan = fixturePlanV3({
+      plan_id: "plan:subtitle-swap-01",
+      plan_attempt_key: "v3:subtitle-swap-01",
+      subtitle: {
+        mode: "off",
+        inventory: [
+          { ...french, track_id: "file:7:subtitle:0", combined_index: 0 },
+          { ...english, track_id: "file:7:subtitle:1", combined_index: 1 },
+        ],
+      },
+    });
+    const replanBodies: Array<Record<string, unknown>> = [];
+    let resolveFirstReplan: ((response: Response) => void) | undefined;
+    const firstReplanResponse = new Promise<Response>((resolve) => {
+      resolveFirstReplan = resolve;
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: initialPlan,
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/session-1/replan")) {
+        replanBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        if (replanBodies.length === 1) return firstReplanResponse;
+        return jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "playable",
+          session_id: "session-1",
+          playback_plan: replannedPlan,
+        });
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+    expect(result.current.subtitleUrls.map((track) => track.language)).toEqual(["eng", "fra"]);
+
+    act(() => {
+      void result.current.refreshSubtitles(120);
+    });
+    await waitFor(() => expect(replanBodies).toHaveLength(1));
+
+    // The viewer clicks English while the replacement plan is in flight.
+    act(() => result.current.changeSubtitleTrack(0, 130));
+    expect(replanBodies).toHaveLength(1);
+
+    await act(async () => {
+      resolveFirstReplan?.(
+        jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "playable",
+          session_id: "session-1",
+          playback_plan: replannedPlan,
+        }),
+      );
+      await firstReplanResponse;
+    });
+
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe("plan:subtitle-swap-01"));
+    await waitFor(() => expect(replanBodies).toHaveLength(2));
+    expect(replanBodies[1]).toMatchObject({
+      operation: "track_change",
+      selected_tracks: { subtitle: { id: "file:7:subtitle:1", index: 1 } },
+    });
+
+    unmount();
+  });
+
   it("surfaces a queued pick the refreshed plan still cannot reconcile after a rotation", async () => {
     const initialPlan = fixturePlanV3({
       audio_tracks: [
