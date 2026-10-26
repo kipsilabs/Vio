@@ -208,4 +208,45 @@ describe("persisted version selection", () => {
       )?.file_id,
     ).toBe(11);
   });
+
+  it("prefers the device's requested row over the last watched substitute", () => {
+    const variants = [
+      {
+        id: "extended",
+        edition_key: "extended",
+        parts: [{ part_index: 0, versions: [extended] }],
+      },
+      {
+        id: "theatrical",
+        edition_key: "theatrical",
+        parts: [{ part_index: 0, versions: [theatrical] }],
+      },
+    ] as never;
+
+    // Progress persistence stored the row that served the bytes (11); the
+    // viewer asked for 22.
+    expect(
+      selectDefaultPlaybackVariantVersion(
+        [theatrical, extended],
+        variants,
+        { last_file_id: 11, last_edition_key: "extended" } as never,
+        "2160p",
+        "extended",
+        22,
+      )?.file_id,
+    ).toBe(22);
+  });
+
+  it("falls back to the last watched row when the requested row left the catalog", () => {
+    expect(
+      selectDefaultPlaybackVariantVersion(
+        [theatrical, extended],
+        undefined,
+        { last_file_id: 22 } as never,
+        "2160p",
+        null,
+        999,
+      )?.file_id,
+    ).toBe(22);
+  });
 });

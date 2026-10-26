@@ -287,6 +287,31 @@ describe("buildWatchPageProps", () => {
     });
   });
 
+  it("prefers the device's requested row over the server's last-played substitute", () => {
+    const props = buildWatchPageProps({
+      request: makeRequest(),
+      item: makeWatchDetail({
+        user_data: {
+          played: false,
+          is_in_progress: true,
+          position_seconds: 120,
+          duration_seconds: 3600,
+          last_file_id: 77,
+          last_resolution: "2160p",
+        },
+      }),
+      currentProfile: profile,
+      requestedFileId: 88,
+    });
+
+    expect(props).toMatchObject({
+      resumeHints: {
+        lastFileId: 88,
+        lastResolution: "2160p",
+      },
+    });
+  });
+
   it("forces a session-scoped restart when restart=1 is present", () => {
     const props = buildWatchPageProps({
       request: makeRequest("restart=1"),
