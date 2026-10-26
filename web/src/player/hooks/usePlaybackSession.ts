@@ -1903,6 +1903,14 @@ export function usePlaybackSession(
           next.inventoryFailed = false;
           next.planAudioTracks = current.planAudioTracks;
           next.subtitleUrls = current.subtitleUrls;
+          // The preserved list is the applied menu, not the replan's own
+          // (possibly reordered) ordinals: keep the marker on the row that
+          // names the committed track instead of the plan position.
+          next.audioTrackIndex = resolveAppliedAudioIndex(
+            plan.audio_tracks ?? [],
+            current.planAudioTracks,
+            plan.selected_tracks.audio,
+          );
           if (current.inventoryRevision != null) {
             next.inventoryRevision = current.inventoryRevision;
           }
