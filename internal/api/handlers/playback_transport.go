@@ -716,6 +716,12 @@ func remapFallbackAudioIndexV3(pinned, probed *models.MediaFile, requestedIndex 
 	if requestedIndex < 0 || pinned == nil || len(pinned.AudioTracks) == 0 {
 		return -1, fallbackAudioCarryNone
 	}
+	// An ordinal outside the pinned inventory names no stream to carry. The
+	// stored plan is already inconsistent; degrade to the replacement default
+	// instead of indexing past the inventory or matching an unrelated track.
+	if requestedIndex >= len(pinned.AudioTracks) {
+		return -1, fallbackAudioCarryDegraded
+	}
 	if probed == nil || len(probed.AudioTracks) == 0 {
 		return -1, fallbackAudioCarryDegraded
 	}

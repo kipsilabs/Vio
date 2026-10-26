@@ -250,18 +250,22 @@ func (h *PlaybackHandler) constrainRekeyedStartTracksV3(ctx context.Context, req
 // resolvedRekeyedAudioOrdinalV3 returns the ordinal in target that names the
 // same audio stream the source ordinal named. An identical inventory proves the
 // ordinal still addresses the selected track; a different inventory is
-// re-identified by signature and fails closed when no unique equivalent exists.
+// re-identified by the shared carried-index remap and fails closed when no
+// unique equivalent exists. Both sides empty means neither inventory was probed:
+// there is no contradictory track, so the caller's ordinal is kept for the
+// downstream resolver exactly as before, rather than reporting a degradation the
+// evidence cannot support.
 func resolvedRekeyedAudioOrdinalV3(source, target *models.MediaFile, ordinal int) (int, bool) {
-	if source == nil || target == nil || ordinal < 0 {
+	if source == nil || target == nil {
 		return 0, false
 	}
 	if playback.AudioLayoutsEqual(source.AudioTracks, target.AudioTracks) {
-		return ordinal, true
-	}
-	if len(source.AudioTracks) == 0 || len(target.AudioTracks) == 0 {
+		if len(target.AudioTracks) == 0 || (ordinal >= 0 && ordinal < len(target.AudioTracks)) {
+			return ordinal, true
+		}
 		return 0, false
 	}
-	remapped := playback.RemapAudioSelectionIndexBySignature(source.AudioTracks, ordinal, target.AudioTracks)
+	remapped := remapCarriedAudioIndexV3(source.AudioTracks, ordinal, target)
 	if remapped < 0 {
 		return 0, false
 	}
