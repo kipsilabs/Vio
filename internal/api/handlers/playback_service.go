@@ -556,9 +556,16 @@ func (h *PlaybackHandler) writeProgressSideEffectsV2(ctx context.Context, record
 			slog.WarnContext(ctx, "failed to update live playback progress", "component", "api", "session", sessionID, "playback_session_id", sessionID, "error", updateErr)
 		}
 		if current, getErr := h.sessionMgr.GetSession(sessionID); getErr == nil && current != nil {
-			h.syncSessionsOnPauseChange(ctx, wasPaused, current.IsPaused)
-			h.persistProgress(ctx, current)
+			// A pause/resume transition can only be emitted once: the next
+			// heartbeat sees wasPaused == IsPaused and skips it. Run it before
+			// the admin session sync and the user-store write, which are both
+			// slower and retryable, so a wedged sync can no longer consume the
+			// side-effect budget and silently drop the scrobble. The row CAS is
+			// already durable; a persistence write skipped after an expired
+			// budget is replayed from the row by the next sample.
 			h.scrobblePauseTransitionV2(ctx, current, wasPaused)
+			h.persistProgress(ctx, current)
+			h.syncSessionsOnPauseChange(ctx, wasPaused, current.IsPaused)
 			return
 		}
 	}

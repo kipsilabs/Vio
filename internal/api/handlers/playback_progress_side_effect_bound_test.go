@@ -56,3 +56,41 @@ func TestApplyProgressV2BoundsSideEffectHold(t *testing.T) {
 		t.Fatalf("progress response held for %s, want it bounded by the side-effect budget", elapsed)
 	}
 }
+
+// A pause scrobble is emitted once: the next heartbeat sees no transition and
+// will not send it again. It must therefore run before a slow admin session
+// sync can consume the side-effect budget, not after it.
+func TestApplyProgressV2PauseScrobbleSurvivesSlowSessionSync(t *testing.T) {
+	f := newPlaybackServiceFixture(t)
+	syncer := &blockingSessionSyncer{started: make(chan struct{}, 1)}
+	f.handler.SessionSyncer = syncer
+	scrobbler := &contextCheckingPauseScrobbler{}
+	f.handler.WatchScrobbler = scrobbler
+
+	previousBudget := progressSideEffectBudget
+	progressSideEffectBudget = 100 * time.Millisecond
+	t.Cleanup(func() { progressSideEffectBudget = previousBudget })
+
+	view, err := f.handler.ApplyProgressV2(f.ctx, f.caller, f.session.ID, PlaybackProgressCommand{
+		Sequence: 1,
+		Position: 42,
+		IsPaused: true,
+	})
+	if err != nil {
+		t.Fatalf("progress: %v", err)
+	}
+	if view.Accepted == nil {
+		t.Fatalf("progress view = %+v, want the sample accepted", view)
+	}
+	select {
+	case <-syncer.started:
+	default:
+		t.Fatal("the pause flip never reached the session syncer")
+	}
+	if len(scrobbler.pauses) != 1 {
+		t.Fatalf("pause scrobbles = %d, want 1 even though the session sync blocked", len(scrobbler.pauses))
+	}
+	if scrobbler.pauseContextErr != nil {
+		t.Fatalf("pause scrobble ran on an expired context: %v", scrobbler.pauseContextErr)
+	}
+}

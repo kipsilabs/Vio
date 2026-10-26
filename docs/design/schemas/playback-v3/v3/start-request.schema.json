@@ -33,6 +33,10 @@
     "playback_attempt_id": {
       "$ref": "#/$defs/bounded_identifier"
     },
+    "previous_playback_attempt_id": {
+      "$ref": "#/$defs/bounded_identifier",
+      "description": "Optional. The attempt whose explicit audio and subtitle selections a restart should carry when this request names neither. Resolved from the durable attempt store, so it works across replicas and after the predecessor session stopped; omit it to use the legacy unique-live-session match."
+    },
     "quality_preference": {
       "type": "string",
       "description": "Free-form and deliberately unbounded: the server normalizes an unrecognized value to \"auto\" and returns a quality_preference_normalized degradation warning rather than rejecting the request. Values that survive include auto, original, the plain resolution preferences, and compound menu rungs such as 2160p-medium and 1080p-low."

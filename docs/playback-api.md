@@ -449,16 +449,24 @@ registers nothing. These headers do not change the playback device that
 `X-Device-ID` names.
 
 An omitted `audio_track_index` / `carried_audio_track_id` and omitted subtitle
-selection are normally resolved by the server. When the same client (the same
-request IP and user agent) still has a live session for the same profile and
-file, a restarted start carries that session's explicit audio choice and its
-embedded subtitle selection instead of falling back to the profile default. The
-subtitle track is matched by language, codec and forced flag because the previous
-ordinal belongs to the previous candidate's transport; a selection that cannot
-be matched is reported as a degradation warning rather than silently planned
-off. There is no new request or response field: a client that always sends its
-own selection is unaffected, and a second device on the same profile never
-inherits another device's picks.
+selection are normally resolved by the server. A restarted start can carry the
+previous attempt's explicit audio choice and embedded subtitle selection instead
+of falling back to the profile default. Name the predecessor with the optional
+`previous_playback_attempt_id` field: the server resolves that attempt from its
+durable store, so the carry works when the predecessor session ran on another
+replica or has already stopped. Both tracks are matched by identity — audio by
+language, codec and layout; subtitles by language, codec and forced flag — because
+the previous ordinal belongs to the previous candidate's transport. A selection
+that cannot be matched is reported as a degradation warning rather than silently
+planning the wrong track or subtitles off.
+
+A client that already replays its own audio and subtitle selection needs no
+carry. Without `previous_playback_attempt_id`, the legacy fallback matches exactly
+one live session for the same profile and file on the same replica; two tabs or
+devices behind one NAT address and user agent make that match ambiguous, so the
+server carries nothing rather than guessing. The field is additive: older clients
+that omit it keep the legacy behavior, and a client that always sends its own
+selection is unaffected.
 
 Client guidance for resume and restarts:
 
@@ -468,9 +476,10 @@ Client guidance for resume and restarts:
 - Do not start at zero and seek afterwards. That fetches the head of the
   timeline, then forces a second generation to be produced at the real position
   and costs the same seek recovery a direct start avoids.
-- On a restart or reconnect, resend the viewer's audio and subtitle selection.
-  The server carries it for the same client, but an explicit request is
-  authoritative and survives a client identity that the server cannot match.
+- On a restart or reconnect, resend the viewer's audio and subtitle selection,
+  or send `previous_playback_attempt_id` naming the attempt being replaced. An
+  explicit selection is authoritative; the attempt id survives a client identity
+  the server cannot match, including a different replica.
 
 Two terminal reasons describe a source without stream metadata.
 `source_metadata_incomplete` (`retryable: true`) means the file has not been
@@ -581,7 +590,9 @@ global position through `POST /api/v2/sync/progress`.
 The progress response is an acknowledgement, not a long-poll or a state feed.
 Post-CAS side effects run under a bounded budget, so a slow writer cannot hold
 the receipt; keep the heartbeat at its normal cadence and never derive pause or
-play state from how long the receipt took.
+play state from how long the receipt took. A pause/resume transition is emitted
+before the retryable user-store write and the admin session sync, so a slow sync
+cannot consume the budget and drop the one-shot scrobble.
 
 Stop accepts `{installation_id, stop_id}` plus an optional final sample
 `{sequence, position, is_paused}`; `sequence` and `position` appear together or
@@ -687,20 +698,21 @@ with the new URLs. Do not count the `412` against the fragment retry budget and
 do not tear down the session for it.
 
 An in-place restart (a far seek or a switchover) rotates the generation but
-continues the same absolute segmented timeline: segment numbers are absolute, so
-a request whose token names the displaced generation is served from the live
-generation when the live generation restarted at or before the requested segment
-number. A segment before the restart point still answers `412`, because the live
-generation never produced that position. This keeps a client that has not yet
-refetched the playlist playing through the restart instead of exhausting its
-fragment retry budget against a URL the server replaced. The `init.mp4` segment
-is generation-independent for the same recipe and is served through the rotation
-too.
+continues the same absolute segmented timeline. Only the exact generation token
+displaced by the most recent restart is served from the live generation, and
+only when that restart kept the emitted-byte recipe; segment numbers alone do not
+prove codec, track or init compatibility. A request at or after the restart point
+continues; a segment before the restart point, an older generation's token, or a
+recipe-changing restart answers `412`. This keeps a client that has not yet
+refetched the playlist playing through the restart without mixing generations.
+The `init.mp4` segment is generation-independent for an unchanged recipe and is
+served through the rotation too.
 
 A far-seek segment request that schedules a restart is held for the restarted
-generation's output (bounded to 6 seconds and stall-aware) and then served.
-Clients should let that request finish; if it still answers `412`, refetch the
-playlist as above.
+generation's output (bounded to 6 seconds and stall-aware) and then served. The
+API server and a remote transcode node use the same continuation logic, so a
+cluster seek behaves like a single-node seek. Clients should let that request
+finish; if it still answers `412`, refetch the playlist as above.
 
 Subtitle inventory URLs in v2 playback responses use the `/api/v2/stream/`
 mount, including relative `/stream/` values produced by the shared inventory

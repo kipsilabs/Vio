@@ -5897,30 +5897,33 @@ func (h *PlaybackHandler) preferredAudioTrackIndexV3(ctx context.Context, userID
 }
 
 // carrySelectionsFromActiveSessionV3 copies an explicit audio selection and an
-// embedded subtitle selection from the profile's live session for the same
-// file onto a start request that names neither. A playback restart creates a
-// new attempt and a new session, and the client does not replay the track
-// choices it made through earlier track_change replans, so without this the new
-// plan silently falls back to the profile default (the production "spontaneous
-// audio switch") and drops the subtitle. Only an explicit audio choice is
-// carried; a server-resolved auto pick is re-resolved by the new start.
+// embedded subtitle selection from the attempt the caller names as this
+// restart's predecessor (or, for a client that predates that field, from the
+// profile's uniquely matching live session) onto a start request that names
+// neither. A playback restart creates a new attempt and a new session, and the
+// client does not replay the track choices it made through earlier track_change
+// replans, so without this the new plan silently falls back to the profile
+// default (the production "spontaneous audio switch") and drops the subtitle.
+// Only an explicit audio choice is carried; a server-resolved auto pick is
+// re-resolved by the new start.
 //
-// The carry is scoped to the same client (IP and user agent) as the previous
-// session, so a second device on the same profile does not inherit another
-// device's explicit picks. An empty recorded or current identity leaves that
-// half of the fence open, which keeps sessions reconstructed before client
-// identity was stamped working.
+// An explicit previous_playback_attempt_id is authoritative: it is resolved
+// through the durable attempt store, so it works when the predecessor ran on
+// another replica or has already stopped, and a second device behind the same
+// NAT address and user agent cannot inherit the choice. The legacy fallback
+// matches exactly one live session for the same profile and file on this
+// replica; an ambiguous match (two tabs or devices sharing an address) carries
+// nothing rather than guessing.
 //
-// Subtitle ordinals are transport ordinals of the previous effective source, so
-// the track is matched onto the new file's inventory by language, codec and
-// forced flag rather than copied by number. When it cannot be matched,
-// subtitleUnavailable reports the loss so the caller can warn instead of
-// silently planning subtitles off.
-// findCarryCandidateSessionV3 returns the most recently active session of the
-// same profile and file from the same client, if any. Matching by network and
-// client identity keeps one device's explicit picks from leaking onto another.
+// Audio and subtitle ordinals are transport ordinals of the previous effective
+// source, so both are matched onto the new file's inventory by track identity
+// (audio: language, codec and layout; subtitle: language, codec and forced
+// flag) rather than copied by number. When a track cannot be matched the
+// corresponding unavailable result reports the loss so the caller can warn
+// instead of silently planning the wrong track or subtitles off.
 func findCarryCandidateSessionV3(sessions []*playback.Session, profileID string, fileID int, clientIP, userAgent string) *playback.Session {
 	var previous *playback.Session
+	matches := 0
 	for _, session := range sessions {
 		if session == nil || session.ProfileID != profileID {
 			continue
@@ -5934,11 +5937,116 @@ func findCarryCandidateSessionV3(sessions []*playback.Session, profileID string,
 		if userAgent != "" && session.ClientUserAgent != "" && session.ClientUserAgent != userAgent {
 			continue
 		}
+		matches++
 		if previous == nil || session.LastActivityAt.After(previous.LastActivityAt) {
 			previous = session
 		}
 	}
+	if matches != 1 {
+		// Two live sessions from the same client identity are ambiguous (two
+		// tabs, or devices behind one NAT); inheriting either one's pick can
+		// silently change the other's audio. The client must replay its
+		// selection or name the predecessor attempt explicitly.
+		return nil
+	}
 	return previous
+}
+
+type audioTrackIdentityV3 struct {
+	language string
+	codec    string
+	layout   string
+}
+
+func audioTrackIdentityOfMediaTrackV3(track models.AudioTrack) audioTrackIdentityV3 {
+	return audioTrackIdentityV3{
+		language: strings.ToLower(strings.TrimSpace(track.Language)),
+		codec:    strings.ToLower(strings.TrimSpace(track.Codec)),
+		layout:   strings.ToLower(strings.TrimSpace(track.Layout)),
+	}
+}
+
+func carriedAudioIndexV3(want audioTrackIdentityV3, file *models.MediaFile) (int, bool) {
+	if file == nil {
+		return 0, false
+	}
+	for index, track := range file.AudioTracks {
+		if audioTrackIdentityOfMediaTrackV3(track) == want {
+			return index, true
+		}
+	}
+	return 0, false
+}
+
+type subtitleTrackIdentityV3 struct {
+	language string
+	codec    string
+	forced   bool
+}
+
+func subtitleTrackIdentityOfMediaTrackV3(track models.SubtitleTrack) subtitleTrackIdentityV3 {
+	return subtitleTrackIdentityV3{
+		language: strings.ToLower(strings.TrimSpace(track.Language)),
+		codec:    strings.ToLower(strings.TrimSpace(track.Codec)),
+		forced:   track.Forced,
+	}
+}
+
+func subtitleTrackIdentityOfInventoryV3(item playback.SubtitleInventoryItemV3) subtitleTrackIdentityV3 {
+	return subtitleTrackIdentityV3{
+		language: strings.ToLower(strings.TrimSpace(item.Language)),
+		codec:    strings.ToLower(strings.TrimSpace(item.Codec)),
+		forced:   item.Forced,
+	}
+}
+
+func carriedSubtitleIndexV3(want subtitleTrackIdentityV3, file *models.MediaFile) (int, bool) {
+	if file == nil {
+		return 0, false
+	}
+	for index, item := range playback.BuildSubtitleInventoryV3(file, nil) {
+		if item.Source != playback.SubtitleSourceEmbeddedV3 {
+			continue
+		}
+		if subtitleTrackIdentityOfInventoryV3(item) == want {
+			return index, true
+		}
+	}
+	return 0, false
+}
+
+func (h *PlaybackHandler) previousAudioTracksV3(ctx context.Context, previous *playback.Session) []models.AudioTrack {
+	if previous == nil {
+		return nil
+	}
+	if len(previous.VirtualAudioTracks) > 0 {
+		return previous.VirtualAudioTracks
+	}
+	if h.fileResolver == nil || previous.MediaFileID <= 0 {
+		return nil
+	}
+	prior, err := h.fileResolver.GetByID(ctx, previous.MediaFileID)
+	if err != nil || prior == nil {
+		return nil
+	}
+	return prior.AudioTracks
+}
+
+func (h *PlaybackHandler) previousSubtitleTracksV3(ctx context.Context, previous *playback.Session) []models.SubtitleTrack {
+	if previous == nil {
+		return nil
+	}
+	if len(previous.VirtualSubtitleTracks) > 0 {
+		return previous.VirtualSubtitleTracks
+	}
+	if h.fileResolver == nil || previous.MediaFileID <= 0 {
+		return nil
+	}
+	prior, err := h.fileResolver.GetByID(ctx, previous.MediaFileID)
+	if err != nil || prior == nil {
+		return nil
+	}
+	return prior.SubtitleTracks
 }
 
 func (h *PlaybackHandler) carrySelectionsFromActiveSessionV3(
@@ -5952,6 +6060,9 @@ func (h *PlaybackHandler) carrySelectionsFromActiveSessionV3(
 ) (audioCarried, subtitleUnavailable, audioUnavailable bool) {
 	if h == nil || h.sessionMgr == nil || file == nil || req == nil {
 		return false, false, false
+	}
+	if strings.TrimSpace(req.PreviousPlaybackAttemptID) != "" {
+		return h.carrySelectionsFromPredecessorAttemptV3(ctx, userID, profileID, file, req)
 	}
 	lister, ok := h.sessionMgr.(interface {
 		GetUserSessions(userID int) []*playback.Session
@@ -5967,23 +6078,31 @@ func (h *PlaybackHandler) carrySelectionsFromActiveSessionV3(
 	}
 
 	if req.AudioTrackIndex == nil && req.AudioTrackID == "" && req.CarriedAudioTrackID == "" &&
-		previous.SelectionOrigin == SelectionOriginExplicit {
-		switch {
-		case previous.AudioTrackIndex >= 0 && previous.AudioTrackIndex < len(file.AudioTracks):
-			index := previous.AudioTrackIndex
-			req.AudioTrackIndex = &index
-			audioCarried = true
-		case previous.AudioTrackIndex >= 0:
-			// The viewer's explicit track does not exist on the release this
-			// start binds to. The plan must play something, but it must not
-			// pretend the choice was honored.
+		previous.SelectionOrigin == SelectionOriginExplicit && previous.AudioTrackIndex >= 0 {
+		tracks := h.previousAudioTracksV3(ctx, previous)
+		if previous.AudioTrackIndex < len(tracks) {
+			if index, matched := carriedAudioIndexV3(audioTrackIdentityOfMediaTrackV3(tracks[previous.AudioTrackIndex]), file); matched {
+				req.AudioTrackIndex = &index
+				audioCarried = true
+			} else {
+				// The viewer's explicit track does not exist on the release this
+				// start binds to. The plan must play something, but it must not
+				// pretend the choice was honored.
+				audioUnavailable = true
+			}
+		} else {
 			audioUnavailable = true
 		}
 	}
 
 	if req.SubtitleTrackIndex == nil && req.SubtitleTrackID == "" && previous.SubtitleTrackIndex >= 0 {
-		if index, matched := h.carriedSubtitleIndexV3(ctx, previous, file); matched {
-			req.SubtitleTrackIndex = &index
+		tracks := h.previousSubtitleTracksV3(ctx, previous)
+		if previous.SubtitleTrackIndex < len(tracks) {
+			if index, matched := carriedSubtitleIndexV3(subtitleTrackIdentityOfMediaTrackV3(tracks[previous.SubtitleTrackIndex]), file); matched {
+				req.SubtitleTrackIndex = &index
+			} else {
+				subtitleUnavailable = true
+			}
 		} else {
 			subtitleUnavailable = true
 		}
@@ -5991,35 +6110,84 @@ func (h *PlaybackHandler) carrySelectionsFromActiveSessionV3(
 	return audioCarried, subtitleUnavailable, audioUnavailable
 }
 
-// carriedSubtitleIndexV3 maps the previous session's embedded subtitle ordinal
-// onto file's published inventory by track identity (language, codec, forced
-// flag). The ordinal itself is source-space for the previous candidate and
-// cannot be reused across a candidate move.
-func (h *PlaybackHandler) carriedSubtitleIndexV3(ctx context.Context, previous *playback.Session, file *models.MediaFile) (int, bool) {
-	if previous == nil || file == nil || previous.SubtitleTrackIndex < 0 {
-		return 0, false
+// carrySelectionsFromPredecessorAttemptV3 resolves the named predecessor attempt
+// from the durable store and carries its explicit selection by identity. The
+// store lookup is what makes this work across replicas and after the predecessor
+// session stopped; it also keeps two clients behind one NAT from inheriting
+// each other's choices because nothing else is used to identify the predecessor.
+func (h *PlaybackHandler) carrySelectionsFromPredecessorAttemptV3(
+	ctx context.Context,
+	userID int,
+	profileID string,
+	file *models.MediaFile,
+	req *playback.StartRequestV3,
+) (audioCarried, subtitleUnavailable, audioUnavailable bool) {
+	if h == nil || h.PlanStoreV3 == nil || file == nil || req == nil {
+		return false, false, false
 	}
-	tracks := previous.VirtualSubtitleTracks
-	if len(tracks) == 0 && h.fileResolver != nil && previous.MediaFileID > 0 {
-		prior, err := h.fileResolver.GetByID(ctx, previous.MediaFileID)
-		if err == nil && prior != nil {
-			tracks = prior.SubtitleTracks
+	predecessorID := strings.TrimSpace(req.PreviousPlaybackAttemptID)
+	if predecessorID == "" {
+		return false, false, false
+	}
+	record, err := h.PlanStoreV3.GetAttemptByPlaybackAttemptID(ctx, predecessorID)
+	if err != nil || record == nil {
+		return false, false, false
+	}
+	if record.UserID != userID || record.ProfileID != profileID {
+		return false, false, false
+	}
+	if record.RequestedMediaFileID != file.ID && record.EffectiveMediaFileID != file.ID {
+		return false, false, false
+	}
+
+	plan := record.CurrentPlan
+	if req.AudioTrackIndex == nil && req.AudioTrackID == "" && req.CarriedAudioTrackID == "" &&
+		record.SelectionOrigin == SelectionOriginExplicit && plan.SelectedTracks.Audio != nil &&
+		plan.SelectedTracks.Audio.Index != nil {
+		previousIndex := *plan.SelectedTracks.Audio.Index
+		if previousIndex >= 0 && previousIndex < len(plan.AudioTracks) {
+			want := audioTrackIdentityV3{
+				language: strings.ToLower(strings.TrimSpace(plan.AudioTracks[previousIndex].Language)),
+				codec:    strings.ToLower(strings.TrimSpace(plan.AudioTracks[previousIndex].Codec)),
+				layout:   strings.ToLower(strings.TrimSpace(plan.AudioTracks[previousIndex].Layout)),
+			}
+			if index, matched := carriedAudioIndexV3(want, file); matched {
+				req.AudioTrackIndex = &index
+				audioCarried = true
+			} else {
+				audioUnavailable = true
+			}
+		} else {
+			audioUnavailable = true
 		}
 	}
-	if previous.SubtitleTrackIndex >= len(tracks) {
-		return 0, false
-	}
-	want := tracks[previous.SubtitleTrackIndex]
-	for index, item := range playback.BuildSubtitleInventoryV3(file, nil) {
-		if item.Source != playback.SubtitleSourceEmbeddedV3 {
-			continue
+
+	if req.SubtitleTrackIndex == nil && req.SubtitleTrackID == "" && plan.SelectedTracks.Subtitle != nil {
+		trackID := strings.TrimSpace(plan.Subtitle.TrackID)
+		if trackID == "" {
+			trackID = strings.TrimSpace(plan.SelectedTracks.Subtitle.ID)
 		}
-		if !strings.EqualFold(item.Language, want.Language) || !strings.EqualFold(item.Codec, want.Codec) || item.Forced != want.Forced {
-			continue
+		var want subtitleTrackIdentityV3
+		matchedPrevious := false
+		for _, item := range plan.Subtitle.Inventory {
+			if item.Source != playback.SubtitleSourceEmbeddedV3 || item.TrackID != trackID {
+				continue
+			}
+			want = subtitleTrackIdentityOfInventoryV3(item)
+			matchedPrevious = true
+			break
 		}
-		return index, true
+		if matchedPrevious {
+			if index, matched := carriedSubtitleIndexV3(want, file); matched {
+				req.SubtitleTrackIndex = &index
+			} else {
+				subtitleUnavailable = true
+			}
+		} else {
+			subtitleUnavailable = true
+		}
 	}
-	return 0, false
+	return audioCarried, subtitleUnavailable, audioUnavailable
 }
 
 // resumePositionV3 answers what an omitted `start_position` means: resume where

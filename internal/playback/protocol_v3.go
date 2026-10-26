@@ -742,7 +742,15 @@ type StartRequestV3 struct {
 	FileID            int      `json:"file_id"`
 	ProfileID         string   `json:"profile_id"`
 	PlaybackAttemptID string   `json:"playback_attempt_id"`
-	QualityPreference string   `json:"quality_preference"`
+	// PreviousPlaybackAttemptID is the attempt whose explicit audio/subtitle
+	// selection a restart should carry when this start names neither. It is
+	// optional and additive: absent preserves the legacy client-identity carry.
+	// The referenced attempt is resolved from the durable attempt store, so a
+	// restart on another replica (or after the predecessor session stopped)
+	// still carries the viewer's choice, and devices that share one NAT address
+	// and user agent never inherit each other's picks.
+	PreviousPlaybackAttemptID string `json:"previous_playback_attempt_id,omitempty"`
+	QualityPreference         string `json:"quality_preference"`
 	// False pins the source file through start and every replan. Encoding and
 	// delivery can still adapt to the viewer without changing the timeline.
 	AllowAlternateVersions     *bool                 `json:"allow_alternate_versions,omitempty"`
@@ -1477,6 +1485,9 @@ func (r *StartRequestV3) NormalizeAndValidate() ([]DegradationWarningV3, error) 
 	}
 	if !boundedIdentifierV3.MatchString(r.PlaybackAttemptID) {
 		return nil, errors.New("playback_attempt_id is invalid")
+	}
+	if r.PreviousPlaybackAttemptID != "" && !boundedIdentifierV3.MatchString(r.PreviousPlaybackAttemptID) {
+		return nil, errors.New("previous_playback_attempt_id is invalid")
 	}
 	if r.ClientPlaybackContext.ProtocolVersion != ProtocolV3 {
 		return nil, errors.New("client_playback_context.protocol_version must be 3")
