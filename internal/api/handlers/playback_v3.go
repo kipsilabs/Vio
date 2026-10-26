@@ -2132,7 +2132,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	// a restart echoes them alongside the requested file_id. Normalize an echo
 	// onto the requested row before validation; a truly foreign row still falls
 	// through to the stale-identity drop inside NormalizeAndValidate.
-	h.rekeyStartTrackIdentitiesV3(r.Context(), &req, userID, profileID,
+	startTrackRekeys := h.rekeyStartTrackIdentitiesV3(r.Context(), &req, userID, profileID,
 		clientip.FromContext(r.Context()), playbackClientInfoFromRequest(r).UserAgent)
 	dropStaleRequestTrackIdentitiesV3(r.Context(), &req)
 	warnings, err := req.NormalizeAndValidate()
@@ -2325,6 +2325,17 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 				requestedFile.Duration = item.Runtime * 60
 			}
 		}
+	}
+	// The re-keyed identities were normalized onto the requested row before
+	// virtual resolution. Re-check their ordinals against the candidate the
+	// resolver actually served: a substitution can reorder its tracks, and an
+	// ordinal kept across that change would silently play another stream.
+	startAudioUnavailable, startSubtitleUnavailable := h.constrainRekeyedStartTracksV3(r.Context(), &req, requestedFile, startTrackRekeys)
+	if startAudioUnavailable {
+		warnings = append(warnings, playback.AudioTrackUnavailableWarningV3())
+	}
+	if startSubtitleUnavailable {
+		warnings = append(warnings, playback.SubtitleTrackUnavailableWarningV3())
 	}
 	if dropStaleAudioTrackIdentityV3(r.Context(), requestedFile, req.AudioTrackID) {
 		req.AudioTrackID = ""
@@ -9991,10 +10002,19 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		// name the session's current effective row after a serve association
 		// moved it without rewriting the durable record. Normalize those onto
 		// the row this replan validates against; a foreign row is still dropped.
-		h.rekeyReplanTrackIdentitiesV3(r.Context(), &start, effectiveFile, session)
+		replanAudioUnavailable, replanSubtitleUnavailable := h.rekeyReplanTrackIdentitiesV3(r.Context(), &start, effectiveFile, session)
 		warnings, err := start.NormalizeAndValidate()
 		if err != nil {
 			return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: "invalid_replan", message: err.Error()}
+		}
+		// A re-keyed identity whose ordinal could not be proven against the
+		// effective row's inventory was cleared above; report the degradation
+		// instead of letting it disappear as an omitted selection.
+		if replanAudioUnavailable {
+			warnings = append(warnings, playback.AudioTrackUnavailableWarningV3())
+		}
+		if replanSubtitleUnavailable {
+			warnings = append(warnings, playback.SubtitleTrackUnavailableWarningV3())
 		}
 		// This is the single normalization of the merged start request. Keep
 		// its degradation warnings, including the drop of a client

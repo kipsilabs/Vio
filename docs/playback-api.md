@@ -502,6 +502,15 @@ requested/effective row or the matching live session's rows), and re-keys it ont
 the row being validated. A row naming a different release is still treated as a
 stale selection and degrades to the default pipeline.
 
+Re-keying does not trust the carried ordinal positionally. Virtual resolution can
+serve a different candidate than the row the request names, and that candidate
+can order its tracks differently. The ordinal is therefore reused only when the
+served inventory matches the inventory the identity was minted against; a
+different inventory is re-identified by track identity (audio includes language,
+codec, layout and titles) or reported as an audio/subtitle-unavailable
+degradation warning instead of being applied to whichever track now occupies the
+old position.
+
 Client guidance for resume and restarts:
 
 - Send `start_position` when the player already knows where to begin, or omit it

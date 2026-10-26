@@ -20,12 +20,12 @@ func BackfillAudioTrackLanguages(tracks []models.AudioTrack) []models.AudioTrack
 		if len(track.Languages) > 0 {
 			continue
 		}
-		if track.Language != "" && track.Language != "und" && track.Language != "mul" {
+		if track.Language != "" && track.Language != langUndetermined && track.Language != langMulti {
 			continue
 		}
 		if languages := lang.ParseLanguages(track.EmbeddedTitle); len(languages) > 0 {
 			track.Languages = languages
-			if track.Language == "" || track.Language == "und" || track.Language == "mul" {
+			if track.Language == "" || track.Language == langUndetermined || track.Language == langMulti {
 				track.Language = languages[0]
 			}
 		}
