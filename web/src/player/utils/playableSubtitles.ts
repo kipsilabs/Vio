@@ -32,8 +32,18 @@ export function resolvePlayableSubtitles(
   if (selectableSessionTracks.length > 0) {
     return selectableSessionTracks;
   }
-  // The watch-detail fallback is not an inventory: it carries no delivery
-  // information, so a track without a URL there is simply unplayable.
+  if (sessionTracks.length === 0) {
+    // The plan published no inventory at all (deferred probe, or an effective
+    // candidate the plan has not learned yet). The watch detail is the only
+    // session evidence available; list it so the overlay menu is useful, and
+    // let the bounded catalog poll repair the plan with real URLs. A track
+    // without a URL is still selectable here: the server mints the sidecar when
+    // the track change replans.
+    return fallbackTracks;
+  }
+  // A non-empty plan list that is merely unselectable is a declared
+  // placeholder, not evidence the file has tracks. The watch-detail fallback
+  // carries no delivery information, so only rows with a URL are playable.
   return fallbackTracks.filter(hasPlayableUrl);
 }
 

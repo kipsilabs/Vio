@@ -126,7 +126,10 @@ function VersionDropdown({
   // virtual ranking; both live on the watch detail. Read it lazily when the
   // picker opens (the same query the player uses) and merge by file id, so the
   // rows show the score and the ranking the server actually applied.
-  const { data: watch } = useWatchDetail(contentId, undefined, undefined, {
+  // The same cache key the ActionBar reads for the selected row: one watch
+  // detail per selection, so the picker's badges and the popovers below it can
+  // never disagree about the row's tracks.
+  const { data: watch } = useWatchDetail(contentId, selectedVersion?.file_id, undefined, {
     enabled: versionOpen && !!contentId,
   });
   // Indexer releases are read from the same watch detail the picker already

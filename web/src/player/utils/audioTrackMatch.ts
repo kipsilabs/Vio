@@ -17,6 +17,8 @@ export interface AudioInventoryTrack {
   channels?: number;
   /** Canonical per-track identity (`file:<id>:audio:<selection_index>`). */
   track_id?: string;
+  /** The plan ordinal this track is selected by (`selected_tracks.audio.index`). */
+  selection_index?: number;
 }
 
 function normalize(value: string | undefined | null): string {
@@ -81,15 +83,32 @@ function matchPlanTrack(
 }
 
 /**
+ * The identity a plan track must be selected by: its stable `track_id` and the
+ * ordinal the server publishes beside it. The ordinal is the plan's own
+ * `selection_index`, never the menu position the viewer clicked.
+ */
+function planTrackIdentity(
+  planTracks: readonly AudioInventoryTrack[],
+  planTrack: AudioInventoryTrack,
+): TrackIdentityV3 {
+  const index = planTracks.indexOf(planTrack);
+  return {
+    id: planTrack.track_id?.trim() ?? "",
+    index: planTrack.selection_index ?? (index >= 0 ? index : 0),
+  };
+}
+
+/**
  * Resolves the identity to send for an explicit audio pick.
  *
  * The menu renders `displayed`, which `applyAudioInventory` may have replaced
  * with the probed catalog list. A probe repair can reorder the effective
  * file's tracks, so a bare position no longer names the picked language. Send
- * the plan inventory's canonical `track_id` for the picked track — matched by
- * stable signature, then by language family when the menu no longer shows the
- * plan's own list — and keep the client's own ordinal as the request's index
- * fallback for when the identity cannot be named.
+ * the plan inventory's canonical `track_id` and the plan ordinal that id
+ * encodes — matched by stable signature, then by language family when the menu
+ * no longer shows the plan's own list. Keeping the client's menu ordinal would
+ * make the pair internally inconsistent, and the server rejects a `track_id`
+ * whose encoded ordinal differs from the accompanying index.
  */
 export function resolvePlanAudioIdentity(
   planTracks: readonly AudioInventoryTrack[],
@@ -100,5 +119,71 @@ export function resolvePlanAudioIdentity(
     displayed === planTracks
       ? planTracks[clientIndex]
       : matchPlanTrack(planTracks, displayed[clientIndex]);
-  return { id: planTrack?.track_id?.trim() ?? "", index: clientIndex };
+  if (!planTrack) return { id: "", index: clientIndex };
+  const identity = planTrackIdentity(planTracks, planTrack);
+  return identity.id === "" ? { id: "", index: clientIndex } : identity;
+}
+
+/**
+ * Resolves a menu row captured at pick time against the plan that is current
+ * when the pick is finally dispatched. Queued picks outlive the plan they were
+ * clicked against (a seek reanchor or a version switch adopts a new plan), so
+ * the menu ordinal cannot be trusted; the row's stable descriptor is matched
+ * against the new plan's inventory instead.
+ */
+export function resolveAudioPickIdentity(
+  planTracks: readonly AudioInventoryTrack[],
+  picked: AudioInventoryTrack | undefined,
+  fallbackIndex: number,
+): TrackIdentityV3 | null {
+  if (planTracks.length === 0) {
+    return Number.isInteger(fallbackIndex) && fallbackIndex >= 0
+      ? { id: "", index: fallbackIndex }
+      : null;
+  }
+  const planTrack = matchPlanTrack(planTracks, picked);
+  if (planTrack) {
+    const identity = planTrackIdentity(planTracks, planTrack);
+    if (identity.id !== "") return identity;
+  }
+  const hasStableIdentities = planTracks.some((track) => (track.track_id ?? "").trim() !== "");
+  if (hasStableIdentities) return null;
+  return fallbackIndex >= 0 && fallbackIndex < planTracks.length
+    ? { id: "", index: fallbackIndex }
+    : null;
+}
+
+/**
+ * Maps the committed plan selection onto the inventory the menu currently
+ * renders. `applyAudioInventory` can replace that list with probed catalog rows
+ * that carry no stable id, so the marker follows the matched row (signature
+ * first, then language) rather than the plan ordinal. `-1` means no row in the
+ * applied list is the committed track: lighting an unrelated row would be worse
+ * than showing no marker.
+ */
+export function resolveAppliedAudioIndex(
+  planTracks: readonly AudioInventoryTrack[],
+  displayed: readonly AudioInventoryTrack[],
+  selected: { id?: string; index?: number } | null | undefined,
+): number {
+  if (!selected) return displayed.length > 0 ? 0 : -1;
+  if (displayed === planTracks && selected.index != null) return selected.index;
+
+  const selectedId = (selected.id ?? "").trim();
+  const planTrack =
+    (selectedId
+      ? planTracks.find((track) => (track.track_id ?? "").trim() === selectedId)
+      : null) ?? (selected.index != null ? planTracks[selected.index] : undefined);
+  if (!planTrack) {
+    return selected.index != null && selected.index < displayed.length ? selected.index : -1;
+  }
+
+  const directId = displayed.findIndex(
+    (track) => (track.track_id ?? "").trim() === (planTrack.track_id ?? "").trim(),
+  );
+  if (directId >= 0) return directId;
+
+  const matched = matchPlanTrack(displayed, planTrack);
+  if (matched) return displayed.indexOf(matched);
+  return -1;
 }

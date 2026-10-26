@@ -28,15 +28,17 @@ vi.mock("@/hooks/useVersionSortPreference", () => ({
 // still drive the payload.
 const watchDetailMock = vi.hoisted(() => ({
   current: undefined as unknown,
+  lastFileId: undefined as number | undefined,
   lastOptions: undefined as unknown,
 }));
 vi.mock("@/hooks/queries/items", () => ({
   useWatchDetail: (
     _id: string | undefined,
-    _fileId?: number,
+    fileId?: number,
     _libraryId?: number,
     options?: { enabled?: boolean },
   ) => {
+    watchDetailMock.lastFileId = fileId;
     watchDetailMock.lastOptions = options;
     return { data: watchDetailMock.current, isLoading: false };
   },
@@ -58,6 +60,7 @@ beforeEach(() => {
   versionSortMock.apply.mockReset();
   versionSortMock.reset.mockReset();
   watchDetailMock.current = undefined;
+  watchDetailMock.lastFileId = undefined;
   watchDetailMock.lastOptions = undefined;
   capabilityMock.mockReset().mockResolvedValue({
     state: "available",
@@ -408,6 +411,16 @@ describe("VersionDropdown indexer releases", () => {
 });
 
 describe("VersionDropdown score and size", () => {
+  it("reads the selected row's watch detail, the same key the ActionBar uses", () => {
+    openPicker([makeVersion({ file_id: 1 }), makeVersion({ file_id: 2 })], {
+      selectedVersion: makeVersion({ file_id: 2 }),
+      contentId: "movie-1",
+    });
+
+    expect(watchDetailMock.lastFileId).toBe(2);
+    expect(watchDetailMock.lastOptions).toEqual({ enabled: true });
+  });
+
   it("shows the format score badge on scored rows only", () => {
     const dialog = openPicker([
       makeVersion({ file_id: 1, resolution: "2160p", format_score: 850 }),

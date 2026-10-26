@@ -276,6 +276,12 @@ export interface ActionBarProps {
   hasVirtualSource?: boolean;
   playbackVariants?: PlaybackVariant[];
   selectedVersion?: FileVersion | null;
+  /**
+   * The version the viewer picked is no longer in the refreshed row set. Play
+   * is blocked until they pick again instead of silently starting another
+   * version.
+   */
+  selectedVersionMissing?: boolean;
   onSelectVersion?: (version: FileVersion) => void;
   /** Fired when a version picker popover opens or closes (open=true on open). */
   onVersionPickerOpenChange?: (open: boolean) => void;
@@ -350,6 +356,7 @@ export default function ActionBar({
   hasVirtualSource = false,
   playbackVariants,
   selectedVersion,
+  selectedVersionMissing = false,
   onSelectVersion,
   onVersionPickerOpenChange,
   onDownload,
@@ -502,6 +509,10 @@ export default function ActionBar({
     () => `${location.pathname}${location.search}`,
     [location.pathname, location.search],
   );
+  // One policy for every start path: a row the liveness check marked
+  // unavailable is re-linked rather than replaying a stale provider pin. Play,
+  // Resume and the overflow "Play from Beginning" must not disagree about it.
+  const forceRelinkForSelectedVersion = selectedVersion?.available === false ? true : undefined;
   const buildPrePlayStartInput = useCallback(
     (base: {
       contentId: string;
@@ -533,6 +544,9 @@ export default function ActionBar({
   );
   const startPlaybackFromHref = useCallback(
     (href: string, restartOverride?: boolean) => {
+      // A vanished explicit selection is a pick-again state, not permission to
+      // start whatever the server chooses.
+      if (selectedVersionMissing) return;
       const parsed = parseWatchHref(href);
       if (!parsed) {
         navigate(href);
@@ -546,11 +560,20 @@ export default function ActionBar({
           libraryId: parsed.libraryId,
           restart: restartOverride ?? parsed.restart,
           returnHref: currentHref,
+          forceRelink: forceRelinkForSelectedVersion,
         }),
         "viewer",
       );
     },
-    [buildPrePlayStartInput, currentHref, navigate, playbackController, selectedVersion?.file_id],
+    [
+      buildPrePlayStartInput,
+      currentHref,
+      forceRelinkForSelectedVersion,
+      navigate,
+      playbackController,
+      selectedVersion?.file_id,
+      selectedVersionMissing,
+    ],
   );
   const handleResumePlayback = () => {
     if (!playHref) return;
@@ -800,7 +823,8 @@ export default function ActionBar({
     items[nextIndex]?.focus({ preventScroll: true });
   };
   // With one version, Play already asks whether to resume or start over.
-  const showRestartInMenu = Boolean(restartHref) && !showPlayChoiceDialog;
+  const showRestartInMenu =
+    Boolean(restartHref) && !showPlayChoiceDialog && !selectedVersionMissing;
   const playbackItems = [
     onShuffle && (
       <DetailOverflowMenuItem key="shuffle" closeMenu={closeOverflowMenu} onAction={onShuffle}>
@@ -1089,12 +1113,19 @@ export default function ActionBar({
           fileId: selectedVersion.file_id,
           restart,
           returnHref: currentHref,
-          forceRelink: selectedVersion.available === false ? true : undefined,
+          forceRelink: forceRelinkForSelectedVersion,
         }),
         "viewer",
       );
     },
-    [buildPrePlayStartInput, contentId, currentHref, playbackController, selectedVersion],
+    [
+      buildPrePlayStartInput,
+      contentId,
+      currentHref,
+      forceRelinkForSelectedVersion,
+      playbackController,
+      selectedVersion,
+    ],
   );
 
   // The subtitle control is available even when the selected file has no
@@ -1109,7 +1140,15 @@ export default function ActionBar({
         {primaryAction ? (
           <PrimaryActionButton action={primaryAction} />
         ) : playHref ? (
-          showPlayChoiceDialog ? (
+          selectedVersionMissing ? (
+            <Button
+              disabled
+              className="h-11 gap-2.5 rounded-full px-8 text-[0.9375rem] font-bold tracking-wide"
+            >
+              <Play className="size-[18px] fill-current" />
+              Version unavailable
+            </Button>
+          ) : showPlayChoiceDialog ? (
             <Button
               onClick={openPlayChoiceDialog}
               className={`${responsivePlayActionClass} relative h-11 cursor-pointer gap-2.5 overflow-hidden rounded-full px-8 text-[0.9375rem] font-bold tracking-wide shadow-md`}
@@ -1379,6 +1418,12 @@ export default function ActionBar({
           />
         )}
       </div>
+
+      {selectedVersionMissing ? (
+        <p role="status" className="text-destructive text-xs">
+          The selected version is no longer available. Pick a version to play.
+        </p>
+      ) : null}
 
       {/* ── Stream info controls (second row) ──────────────── */}
       {/* flex-wrap matters: without it this row's min-content width (two or

@@ -39,7 +39,7 @@ describe("resolvePlayableSubtitles", () => {
     expect(resolvePlayableSubtitles([sessionTrack], [detailTrack])).toEqual([sessionTrack]);
   });
 
-  it("drops watch-detail subtitle tracks that have no playable url", () => {
+  it("falls back to watch-detail evidence when the plan inventory is empty", () => {
     const detailTrack = makeSubtitle({
       index: 0,
       source: "embedded",
@@ -47,7 +47,16 @@ describe("resolvePlayableSubtitles", () => {
       url: "",
     });
 
-    expect(resolvePlayableSubtitles([], [detailTrack])).toEqual([]);
+    // The plan published no inventory at all; the watch detail is the only
+    // evidence, so the menu lists it and the bounded poll repairs the plan.
+    expect(resolvePlayableSubtitles([], [detailTrack])).toEqual([detailTrack]);
+  });
+
+  it("keeps filtering unplayable fallback rows when the plan published a placeholder", () => {
+    const placeholder = makeSubtitle({ index: 0, url: "" });
+    const detailTrack = makeSubtitle({ index: 1, source: "embedded", url: "" });
+
+    expect(resolvePlayableSubtitles([placeholder], [detailTrack])).toEqual([]);
   });
 
   it("keeps burn-in-only session tracks even though they have no url", () => {

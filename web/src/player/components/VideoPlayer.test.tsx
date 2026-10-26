@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { PlayerConfigProvider, type PlayerConfig } from "../context/PlayerConfigContext";
 import type { WatchTogetherRoomConnectionResult } from "../hooks/useWatchTogetherRoomConnection";
-import { fixturePlanV3 } from "../protocol-v3.fixtures";
+import { fixturePlanV3, fixtureSubtitleInventoryItemV3 } from "../protocol-v3.fixtures";
 import type {
   PlaybackRealtimeCommandEnvelope,
   PlaybackRealtimeEventEnvelope,
@@ -408,6 +408,76 @@ describe("PGS render mode", () => {
     expect(pgsHook.options?.enabled).toBe(false);
 
     unmount();
+  });
+});
+
+describe("subtitle marker reconciliation", () => {
+  it("follows a successful replan that re-mints the combined ordinal", async () => {
+    const french = fixtureSubtitleInventoryItemV3({
+      track_id: "file:7:subtitle:1",
+      combined_index: 1,
+      language: "fra",
+      label: "French",
+    });
+    const english = fixtureSubtitleInventoryItemV3({
+      track_id: "file:7:subtitle:0",
+      combined_index: 0,
+      language: "eng",
+      label: "English",
+    });
+    const basePlan = fixturePlanV3({
+      ...directPlan,
+      subtitle: { mode: "render", track_id: english.track_id, inventory: [english, french] },
+      selected_tracks: {
+        audio: { id: "file:7:audio:0", index: 0 },
+        subtitle: { id: english.track_id, index: 0 },
+      },
+    });
+    const toPlayerTrack = (
+      item: ReturnType<typeof fixtureSubtitleInventoryItemV3>,
+    ): PlayerSubtitleInfo => ({
+      index: item.combined_index,
+      media_file_id: 7,
+      track_id: item.track_id,
+      language: item.language ?? "",
+      codec: item.codec,
+      label: item.label ?? "",
+      source: "embedded",
+      url: item.url ?? "",
+    });
+
+    const { rerenderPlayer } = renderPlayer({
+      plan: basePlan,
+      subtitleUrls: [toPlayerTrack(english), toPlayerTrack(french)],
+      subtitleMode: "always",
+      preferredSubtitleLanguage: "eng",
+    });
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
+
+    // The same English asset comes back at a new ordinal (1); the optimistic
+    // marker still names the outgoing plan's 0, which now means French.
+    const shiftedEnglish = { ...english, combined_index: 1, track_id: "file:7:subtitle:1" };
+    const shiftedFrench = { ...french, combined_index: 0, track_id: "file:7:subtitle:0" };
+    rerenderPlayer({
+      plan: fixturePlanV3({
+        ...directPlan,
+        plan_id: "plan:subtitle-remint",
+        plan_attempt_key: "v3:subtitle-remint",
+        subtitle: {
+          mode: "render",
+          track_id: shiftedEnglish.track_id,
+          inventory: [shiftedFrench, shiftedEnglish],
+        },
+        selected_tracks: {
+          audio: { id: "file:7:audio:0", index: 0 },
+          subtitle: { id: shiftedEnglish.track_id, index: 1 },
+        },
+      }),
+      subtitleUrls: [toPlayerTrack(shiftedFrench), toPlayerTrack(shiftedEnglish)],
+      subtitleMode: "always",
+    });
+
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(1));
   });
 });
 
