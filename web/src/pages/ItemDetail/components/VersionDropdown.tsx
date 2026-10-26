@@ -118,9 +118,13 @@ function VersionDropdown({
     new Set(editionOptions.map((option) => option.label.toLowerCase())).size > 1 &&
     hasNamedEditions;
 
-  const selectedEdition = showEditionDropdown
-    ? resolveSelectedEditionOption(editionOptions, selectedVersion)
-    : null;
+  // A vanished pick is not evidence that the first edition is the chosen one:
+  // scoping the list to it would hide every other edition's survivors and
+  // checkmark an edition the page never selected.
+  const selectedEdition =
+    showEditionDropdown && !selectionMissing
+      ? resolveSelectedEditionOption(editionOptions, selectedVersion)
+      : null;
   const activeVersions = selectedEdition?.versions ?? sorted;
   // A vanished pick has no current row. Rendering the first remaining row as
   // selected would make the menu claim a choice the page never made.
