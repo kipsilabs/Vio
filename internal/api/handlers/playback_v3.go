@@ -2330,7 +2330,13 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	// virtual resolution. Re-check their ordinals against the candidate the
 	// resolver actually served: a substitution can reorder its tracks, and an
 	// ordinal kept across that change would silently play another stream.
-	startAudioUnavailable, startSubtitleUnavailable := h.constrainRekeyedStartTracksV3(r.Context(), &req, requestedFile, startTrackRekeys)
+	startAudioUnavailable, startSubtitleUnavailable, startConstrainErr := h.constrainRekeyedStartTracksV3(r.Context(), &req, requestedFile, startTrackRekeys)
+	if startConstrainErr != nil {
+		// The subtitle store could not prove whether the selection survived the
+		// candidate change. Reusing the old ordinal would silently play another
+		// track, so surface the dependency failure instead of degrading.
+		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusServiceUnavailable, "subtitle_unavailable", "The selected subtitle track could not be verified; retry shortly.")
+	}
 	if startAudioUnavailable {
 		warnings = append(warnings, playback.AudioTrackUnavailableWarningV3())
 	}
@@ -10002,7 +10008,16 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		// name the session's current effective row after a serve association
 		// moved it without rewriting the durable record. Normalize those onto
 		// the row this replan validates against; a foreign row is still dropped.
-		replanAudioUnavailable, replanSubtitleUnavailable := h.rekeyReplanTrackIdentitiesV3(r.Context(), &start, effectiveFile, session)
+		replanAudioUnavailable, replanSubtitleUnavailable, rekeyErr := h.rekeyReplanTrackIdentitiesV3(r.Context(), &start, effectiveFile, session)
+		if rekeyErr != nil {
+			// A subtitle-store failure cannot prove the carried track is absent.
+			// Keep the playing plan authoritative and let the viewer retry
+			// instead of reinterpreting the old ordinal on unverified evidence.
+			if errors.Is(rekeyErr, errSubtitleStoreUnavailableV3) {
+				return playback.DecisionResponseV3{}, *record, nil, subtitleArtifactErrorV3("Downloaded subtitles are temporarily unavailable.", rekeyErr)
+			}
+			return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: trackUnavailableReasonV3, message: rekeyErr.Error()}
+		}
 		warnings, err := start.NormalizeAndValidate()
 		if err != nil {
 			return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: "invalid_replan", message: err.Error()}
