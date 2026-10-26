@@ -113,8 +113,14 @@ export default function MovieContent({
     item.user_data && "position_seconds" in item.user_data ? item.user_data : undefined;
   // The viewer's own pick, remembered on this device. It outlives the server's
   // `last_file_id`, which names whichever row actually served the bytes after
-  // a substitution. Read on mount: a pick made in place is held in state below.
-  const requestedFileId = useMemo(() => readRequestedFileId(item.content_id), [item.content_id]);
+  // a substitution. Read on mount, but only once the profile has resolved: the
+  // store is profile-scoped, and a pre-resolution read would alias another
+  // profile's pick. A pick made in place is held in state below.
+  const requestedProfileId = currentProfile?.id ?? null;
+  const requestedFileId = useMemo(
+    () => (requestedProfileId ? readRequestedFileId(item.content_id, requestedProfileId) : null),
+    [item.content_id, requestedProfileId],
+  );
   const defaultSelectedVersion = useMemo(
     () =>
       selectDefaultPlaybackVariantVersion(
@@ -211,13 +217,13 @@ export default function MovieContent({
       setManualSelectedFileId(version.file_id);
       // Remember the pick across reloads: the server records the row that
       // actually plays, which may be a substitute for this one.
-      rememberRequestedFileId(item.content_id, version.file_id);
+      rememberRequestedFileId(item.content_id, version.file_id, requestedProfileId);
       setAudioSelectionMode("auto");
       setExplicitAudioTrackIndex(null);
       setSubtitleSelectionMode("auto");
       setExplicitSubtitleSelection(null);
     },
-    [item.content_id],
+    [item.content_id, requestedProfileId],
   );
 
   const handleSelectAudioTrack = useCallback((trackIndex: number) => {

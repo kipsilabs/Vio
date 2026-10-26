@@ -90,6 +90,10 @@ vi.mock("@/hooks/queries/admin/libraries", () => ({
   useLibraryCapabilities: mocks.useLibraryCapabilities,
 }));
 
+// The requested-version store is profile-scoped; these tests render with the
+// account's resolved profile.
+const PROFILE_ID = "profile-test";
+
 const resetProgressMocks = vi.hoisted(() => ({
   useResetProgressAction: vi.fn((): (() => void) | undefined => undefined),
 }));
@@ -368,9 +372,10 @@ describe("MovieContent", () => {
   // store; a fresh server-backed detail still names the effective candidate in
   // `last_file_id` (progress and history record the row that served the bytes).
   it("keeps the viewer's requested row selected over a fresh last-played substitute", () => {
+    mocks.useCurrentProfile.mockReturnValue({ profile: { id: PROFILE_ID } });
     const substitute = makeFileVersion({ file_id: 1, resolution: "2160p" });
     const requested = makeFileVersion({ file_id: 2, resolution: "1080p" });
-    rememberRequestedFileId("movie-1", requested.file_id);
+    rememberRequestedFileId("movie-1", requested.file_id, PROFILE_ID);
 
     render(
       <MemoryRouter initialEntries={["/item/movie-1"]}>
@@ -395,6 +400,7 @@ describe("MovieContent", () => {
   });
 
   it("remembers an explicit pick as the requested row", () => {
+    mocks.useCurrentProfile.mockReturnValue({ profile: { id: PROFILE_ID } });
     const first = makeFileVersion({ file_id: 1 });
     const second = makeFileVersion({ file_id: 2, resolution: "1080p" });
 
@@ -411,14 +417,15 @@ describe("MovieContent", () => {
       selectVersion?.(second);
     });
 
-    expect(readRequestedFileId("movie-1")).toBe(second.file_id);
+    expect(readRequestedFileId("movie-1", PROFILE_ID)).toBe(second.file_id);
     expect(mocks.capturedActionBarProps.value).toMatchObject({
       selectedVersion: expect.objectContaining({ file_id: second.file_id }),
     });
   });
 
   it("asks for a replacement pick when the requested row is gone", () => {
-    rememberRequestedFileId("movie-1", 3);
+    mocks.useCurrentProfile.mockReturnValue({ profile: { id: PROFILE_ID } });
+    rememberRequestedFileId("movie-1", 3, PROFILE_ID);
 
     render(
       <MemoryRouter initialEntries={["/item/movie-1"]}>

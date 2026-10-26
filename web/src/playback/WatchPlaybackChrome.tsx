@@ -774,9 +774,9 @@ function WatchPlaybackHostContent() {
         return;
       }
 
-      rememberRequestedFileId(contentId, exitState.selectedFileId);
+      rememberRequestedFileId(contentId, exitState.selectedFileId, currentProfile?.id ?? null);
     },
-    [activeItem, activeRequest],
+    [activeItem, activeRequest, currentProfile?.id],
   );
 
   const applyExitStateToCache = useCallback(
@@ -1163,7 +1163,9 @@ function WatchPlaybackHostContent() {
   // request is the only durable record of their choice. Read inline rather than
   // memoized: this render path is not the time-tick lane, and the read must not
   // add a hook after this component's conditional returns.
-  const requestedFileId = activeRequest ? readRequestedFileId(activeRequest.contentId) : null;
+  const requestedFileId = activeRequest
+    ? readRequestedFileId(activeRequest.contentId, currentProfile?.id ?? null)
+    : null;
   const watchPageProps = buildWatchPageProps({
     request: activeRequest,
     item: itemForPlayer,

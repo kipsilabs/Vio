@@ -112,7 +112,7 @@ describe("WatchPlaybackHost requested version", () => {
     // The viewer asked for row 2 and the server served row 1 instead; progress
     // and history will record the effective row, so only the requested one can
     // keep the picker on the viewer's choice after a reload.
-    expect(readRequestedFileId("movie-1")).toBeNull();
+    expect(readRequestedFileId("movie-1", "profile-1")).toBeNull();
 
     act(() =>
       player().onExit?.({
@@ -123,6 +123,6 @@ describe("WatchPlaybackHost requested version", () => {
       }),
     );
 
-    expect(readRequestedFileId("movie-1")).toBe(2);
+    expect(readRequestedFileId("movie-1", "profile-1")).toBe(2);
   });
 });
