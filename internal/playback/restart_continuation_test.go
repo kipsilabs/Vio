@@ -1,6 +1,10 @@
 package playback
 
-import "testing"
+import (
+	"errors"
+	"testing"
+	"time"
+)
 
 // markRestartContinuationForTest mirrors the bookkeeping a successful in-place
 // restart performs. Keeping it in one place lets the fencing tests exercise the
@@ -105,5 +109,33 @@ func TestRestartContinuationRetiredOnStop(t *testing.T) {
 	}
 	if _, _, ok := session.RestartContinuationSegment(tokenA, "seg_00010.ts"); ok {
 		t.Fatal("a stopped generation still offered restart continuation")
+	}
+}
+
+// A request that already spent the continuation budget must answer the stale
+// verdict immediately; the detached restart keeps producing for the playlist
+// reload. This is the bound that keeps a stalled-head wait plus a restart from
+// composing to roughly twice the client's read timeout.
+func TestWaitForRestartContinuationSpentBudgetFailsFast(t *testing.T) {
+	session := testContinuationSession()
+	start := time.Now()
+	_, err := session.WaitForRestartContinuationWithin("seg_00010.ts", RestartContinuationRemaining(start.Add(-2*SeekRestartServeTimeout)))
+	if !errors.Is(err, ErrStaleSegmentGeneration) {
+		t.Fatalf("spent-budget continuation error = %v, want ErrStaleSegmentGeneration", err)
+	}
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Fatalf("spent-budget continuation waited %s, want an immediate verdict", elapsed)
+	}
+}
+
+func TestRestartContinuationRemainingAndStallBudgets(t *testing.T) {
+	if remaining := RestartContinuationRemaining(time.Now().Add(-5 * time.Second)); remaining <= 0 || remaining > time.Second {
+		t.Fatalf("remaining after 5s = %s, want the last second of the 6s ceiling", remaining)
+	}
+	if remaining := RestartContinuationRemaining(time.Now().Add(-10 * time.Second)); remaining != 0 {
+		t.Fatalf("remaining after 10s = %s, want 0", remaining)
+	}
+	if SeekRestartStallTimeout >= SeekRestartServeTimeout {
+		t.Fatalf("stall watchdog %s must be below the %s continuation ceiling", SeekRestartStallTimeout, SeekRestartServeTimeout)
 	}
 }

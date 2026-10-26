@@ -5266,15 +5266,41 @@ func (s *TranscodeSession) RestartContinuationSegment(token, segmentName string)
 }
 
 // SeekRestartServeTimeout bounds how long a far-seek segment request waits for
-// the restart it scheduled to produce its segment. FFmpeg spawn is normally
-// 1-2s; the wait is additionally stall-aware, so a dead encoder is reported
-// well before this ceiling. Exceeding it falls back to the stale-generation
-// verdict, which makes the client reload the playlist and retry once the
-// restart has produced it. Kept below the 8s default HTTP read timeout of the
-// ExoPlayer-based clients so the held request still delivers headers before
-// their transport gives up. Shared by the API and remote-node segment handlers
-// so both deployment shapes hold a seek for the same bound.
+// the restart it scheduled to produce its segment, measured from the start of
+// the request's recovery rather than from the moment the detached restart was
+// scheduled. FFmpeg spawn is normally 1-2s, but a request that already waited
+// for a stalled head passes only the remainder of this budget to the
+// continuation, so the composed hold cannot roughly double. Exceeding it falls
+// back to the stale-generation verdict, which makes the client reload the
+// playlist and retry once the restart has produced it. Kept below the 8s
+// default HTTP read timeout of the ExoPlayer-based clients so the held request
+// still delivers headers before their transport gives up. Shared by the API and
+// remote-node segment handlers so both deployment shapes hold a seek for the
+// same bound.
 const SeekRestartServeTimeout = 6 * time.Second
+
+// SeekRestartStallTimeout is the produced-head watchdog during a restart
+// continuation. It is deliberately shorter than SeekRestartServeTimeout: the
+// ordinary SegmentStallTimeout floor is six seconds, which equals the whole
+// continuation ceiling, so a stall detector using it could never fire before
+// the timeout. Three seconds reports a dead restart well before the client's
+// read timeout while still leaving room for a normal spawn plus first segment.
+const SeekRestartStallTimeout = 3 * time.Second
+
+// RestartContinuationRemaining returns the part of SeekRestartServeTimeout a
+// held segment request may still spend on the restart continuation. started is
+// when the request began its recovery (before any stalled-head wait), so the
+// wait before the restart and the wait after it draw from one budget instead of
+// composing to roughly twice the client's premise. A non-positive result means
+// the restart keeps running detached and the request answers the stale-
+// generation verdict immediately.
+func RestartContinuationRemaining(started time.Time) time.Duration {
+	remaining := SeekRestartServeTimeout - time.Since(started)
+	if remaining <= 0 {
+		return 0
+	}
+	return remaining
+}
 
 // WaitForRestartContinuation waits for the segment an asynchronous seek
 // restart was scheduled to produce. A successful restart is served through the
@@ -5283,7 +5309,27 @@ const SeekRestartServeTimeout = 6 * time.Second
 // so the client refetches the playlist. Sharing this sequence keeps the API
 // handler and the remote transcode node handler on one implementation.
 func (s *TranscodeSession) WaitForRestartContinuation(name string) (*SegmentLease, error) {
-	lease, err := s.WaitForOpenSegmentWithStall(name, SeekRestartServeTimeout, SegmentStallTimeoutFor(s.Opts()))
+	return s.WaitForRestartContinuationWithin(name, SeekRestartServeTimeout)
+}
+
+// WaitForRestartContinuationWithin is WaitForRestartContinuation with an
+// explicit remaining budget. Callers that already spent request time waiting
+// for a stalled head use it so the composed hold stays inside
+// SeekRestartServeTimeout. A spent budget answers the stale-generation verdict
+// without waiting; the detached restart still produces the segment for the
+// client's playlist reload.
+func (s *TranscodeSession) WaitForRestartContinuationWithin(name string, budget time.Duration) (*SegmentLease, error) {
+	if budget <= 0 {
+		if restartErr := s.AsyncRestartFailure(); restartErr != nil {
+			return nil, restartErr
+		}
+		return nil, ErrStaleSegmentGeneration
+	}
+	stall := SeekRestartStallTimeout
+	if budget < stall {
+		stall = budget
+	}
+	lease, err := s.WaitForOpenSegmentWithStall(name, budget, stall)
 	if err == nil {
 		return lease, nil
 	}

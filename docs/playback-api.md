@@ -709,10 +709,15 @@ The `init.mp4` segment is generation-independent for an unchanged recipe and is
 served through the rotation too.
 
 A far-seek segment request that schedules a restart is held for the restarted
-generation's output (bounded to 6 seconds and stall-aware) and then served. The
-API server and a remote transcode node use the same continuation logic, so a
-cluster seek behaves like a single-node seek. Clients should let that request
-finish; if it still answers `412`, refetch the playlist as above.
+generation's output and then served. A 6-second ceiling, below the 8s default
+HTTP read timeout of ExoPlayer-based clients, bounds the restart phase from the
+start of the request's recovery: a stalled-head wait before the restart draws
+from the same ceiling, so the continuation only gets the remainder, and the
+produced-head watchdog during the continuation is 3 seconds. The API server and
+a remote transcode node use the same continuation logic, so a cluster seek
+behaves like a single-node seek. Clients should let that request finish; if the
+ceiling expires it answers `412` while the restart keeps producing, so refetch
+the playlist as above.
 
 Subtitle inventory URLs in v2 playback responses use the `/api/v2/stream/`
 mount, including relative `/stream/` values produced by the shared inventory

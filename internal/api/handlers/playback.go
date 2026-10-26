@@ -3314,6 +3314,10 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 	if err != nil && errors.Is(err, playback.ErrSegmentNotFound) {
 		segNum, parseErr := playback.ParseSegmentNumber(segmentName)
 		if parseErr == nil {
+			// The restart clock starts here, before any stalled-head wait, so a
+			// wait followed by the restart continuation draws from one bounded
+			// budget instead of composing two full timeouts.
+			recoveryStarted := time.Now()
 			now := time.Now()
 			decision := transcodeSession.SegmentRecoveryDecision(segNum, now)
 			segmentStalled := false
@@ -3390,20 +3394,16 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 			// current manifest window.
 			if err != nil && errors.Is(err, playback.ErrSegmentNotFound) && decision.RestartOnTimeout {
 				// A far seek past the produced window is recovered by a seek
-				// restart, and any restart rotates the generation. Holding this
-				// request for the restart's bytes is pure latency: a request that
-				// named the old generation is refused by the final fence, and a
-				// tokenless request would otherwise be served bytes from a
-				// restart it never addressed. Either way the player sits waiting
-				// on a segment the server already knows it cannot serve under
-				// this request's generation. The restart is an encode-level
-				// operation, so trigger it detached from the request and answer
-				// the stale-generation verdict now; the client reloads the
-				// manifest, adopts the new generation, and the segment is served
-				// once produced. Copy-mode sessions stay on the synchronous path:
-				// their target resolution reads the live manifest under the
-				// lifecycle lock and can legitimately report an unresolved
-				// target.
+				// restart, and any restart rotates the generation. The restart
+				// itself runs detached because it is an encode-level operation
+				// that must survive this request, but the request then holds for
+				// the segment the restart produces: absolute segment numbering
+				// makes it the same timeline position the client asked for, so
+				// serving it avoids hls.js retrying a superseded URL four times
+				// (its fragment retry budget) before refetching the playlist.
+				// Copy-mode sessions stay on the synchronous path: their target
+				// resolution reads the live manifest under the lifecycle lock and
+				// can legitimately report an unresolved target.
 				if (decision.Reason == playback.SegmentRecoveryFarSeekReason || segmentStalled) && !transcodeSession.IsCopyVideo() {
 					slog.InfoContext(r.Context(), "transcode seek restart scheduled", "component", "api",
 						"segment", segmentName,
@@ -3424,9 +3424,13 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 					// previous detached answer made hls.js retry the same stale
 					// URL four times (its fragment retry budget) before it
 					// refetched the playlist, costing ~4s of dead air per seek.
-					// The wait is bounded and stall-aware, and a failed restart
-					// still surfaces its terminal verdict.
-					segmentLease, err = transcodeSession.WaitForRestartContinuation(segmentName)
+					// The wait spends only the request's remaining hold budget
+					// (a stalled-head wait above may already have consumed part
+					// of it) and still surfaces a failed restart's verdict.
+					segmentLease, err = transcodeSession.WaitForRestartContinuationWithin(
+						segmentName,
+						playback.RestartContinuationRemaining(recoveryStarted),
+					)
 					if err == nil {
 						if requestedGeneration != "" {
 							if _, successorToken, ok := transcodeSession.RestartContinuationSegment(requestedGeneration, segmentName); ok {
