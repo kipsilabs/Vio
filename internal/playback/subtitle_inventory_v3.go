@@ -498,6 +498,14 @@ func embeddedSubtitleIdentityV3(track models.SubtitleTrack) string {
 	return "stream:" + strconv.Itoa(track.Index)
 }
 
+// DownloadedSubtitleIDV3 returns the durable downloaded-subtitle row id an
+// inventory entry was built from, or zero for tracks that are not downloaded.
+// A selection carry or remap uses it as the only stable identity for a
+// downloaded track, since its language/format/label can collide across rows.
+func (i SubtitleInventoryItemV3) DownloadedSubtitleIDV3() int {
+	return i.downloadedSubtitleID
+}
+
 // SubtitleInventoryOwnSourceIndexV3 maps a published combined ordinal to the
 // source-space ordinal of the file's own external or embedded track it names.
 // It reports false for an out-of-range ordinal or one that addresses a

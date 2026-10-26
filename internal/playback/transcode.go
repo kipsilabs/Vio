@@ -290,6 +290,26 @@ type TranscodeSession struct {
 	copyTimeline         observedCopyTimeline
 	segmentGeneration    uint64
 	segmentIncarnation   string
+	// restartStartSegment is the absolute HLS segment number the most recent
+	// in-place restart began producing at. Zero means no restart has happened
+	// (or the restart cut from zero, as a planned copy stream does), so segment
+	// numbering after it cannot be assumed to continue the previous generation's
+	// timeline. The serve layer uses it to answer a stale `sgen` request from the
+	// live generation only when that generation provably owns the same absolute
+	// timeline position (see TranscodeSession.RestartContinuationSegment).
+	restartStartSegment int
+	// restartPredecessorToken is the exact generation token displaced by the
+	// most recent in-place restart. Only this immediate predecessor may be
+	// served from the live generation: an older token from generation A is not
+	// evidence that generation C emits the same codec, track or init segment,
+	// even when the requested segment number is at or after C's restart point.
+	// Empty means no restart continuity is available. Guarded by mu.
+	restartPredecessorToken string
+	// restartRecipeStable reports that the restart kept the emitted-byte
+	// recipe. Segment numbers only describe the same timeline when the codec,
+	// audio selection, burn-in and packaging did not change; an init segment or
+	// segment from a different recipe is not interchangeable.
+	restartRecipeStable bool
 	// runningRecipe is the emitted-byte recipe of the currently-running ffmpeg
 	// process. It is frozen when the process is spawned and is deliberately not
 	// updated by SetAudioTrackIndex / SetSourceAudioChannels, which mutate opts
@@ -3939,6 +3959,12 @@ func (s *TranscodeSession) shutdownProcess(removeOutput, bumpGeneration bool) er
 	})
 	if bumpGeneration {
 		s.segmentGeneration++
+		// A stopped/closed generation is not a restart successor: the old
+		// playlist's timeline ended here, so retire any continuation lease
+		// rather than letting a token from the last in-place restart cross it.
+		s.restartStartSegment = 0
+		s.restartPredecessorToken = ""
+		s.restartRecipeStable = false
 	}
 	s.segmentPruneRunning = false
 
@@ -4341,7 +4367,24 @@ func (s *TranscodeSession) restart(
 			s.opts.InputCleanup = refreshedCleanup
 		}
 	}
+	nextRecipe := emittedRecipeOf(opts)
+	recipeUnchanged := previousRecipe == nextRecipe
+	// Record the exact generation this restart displaces. Continuation serving
+	// is fenced on this relationship rather than on the segment number alone:
+	// only the immediate predecessor can be the same timeline, and only a
+	// restart that kept the emitted recipe can reuse its init/track identity.
+	if s.segmentIncarnation == "" {
+		s.segmentIncarnation = uuid.NewString()
+	}
+	predecessorToken := s.segmentGenerationTokenLocked()
 	s.segmentGeneration++
+	s.restartPredecessorToken = predecessorToken
+	// Record the absolute segment the replacement generation starts producing
+	// at. A client still holding the displaced generation's playlist can then be
+	// served from this generation for segments at or after this number, because
+	// absolute segment numbering makes them the same timeline position.
+	s.restartStartSegment = startSegment
+	s.restartRecipeStable = recipeUnchanged
 	s.segmentPruneRunning = false
 	preStartRangePrunable := opts.SegmentRetentionSeconds > 0 && s.lastPruneFloor < startSegment
 	s.lastRequestedSegment = startSegment
@@ -4381,7 +4424,6 @@ func (s *TranscodeSession) restart(
 	// have to go before the replacement process starts. The comparison uses the
 	// running process's frozen recipe, not the caller's opts (which already
 	// carry any pre-restart audio selection mutation).
-	nextRecipe := emittedRecipeOf(opts)
 	if s.cleanStaleOutputForRestart(nextRecipe, startSegment) {
 		log.Printf("playback: cleaned stale transcode output at/after segment %d before restart (video %q -> %q)",
 			startSegment, previousRecipe.videoCodec, opts.TargetCodecVideo)
@@ -5183,6 +5225,121 @@ func (s *TranscodeSession) MatchesGenerationToken(token string) bool {
 		return false
 	}
 	return token == s.segmentGenerationTokenLocked()
+}
+
+// RestartContinuationSegment reports the absolute segment the live generation
+// started producing at when token names the exact generation displaced by the
+// most recent in-place restart and that restart kept the emitted-byte recipe.
+// Segment numbers are absolute in the HLS timeline, so a request at or after
+// this point names the same timeline position in the successor. Requiring the
+// immediate predecessor token — not merely a segment number — keeps an older
+// generation's token from being answered by a later generation whose codec,
+// selected track, or init segment may differ. It returns false for an empty or
+// unrelated token, for a restart that changed the recipe, and after the session
+// stopped (which retires the relationship).
+//
+// successorToken names the one generation allowed to answer the request. The
+// serve path must re-check the lease against it after any wait or recovery: a
+// second restart while that request was waiting displaces the successor, so the
+// older token no longer names the live timeline even though it is still the
+// predecessor of the generation that replaced its successor.
+func (s *TranscodeSession) RestartContinuationSegment(token, segmentName string) (startSegment int, successorToken string, ok bool) {
+	if token == "" || segmentName == "" {
+		return 0, "", false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.restartStartSegment <= 0 || !s.restartRecipeStable ||
+		s.restartPredecessorToken == "" || token != s.restartPredecessorToken {
+		return 0, "", false
+	}
+	startSegment = s.restartStartSegment
+	successorToken = s.segmentGenerationTokenLocked()
+	if strings.EqualFold(segmentName, "init.mp4") {
+		return startSegment, successorToken, true
+	}
+	requestedSegment, err := ParseSegmentNumber(segmentName)
+	if err != nil || requestedSegment < startSegment {
+		return 0, "", false
+	}
+	return startSegment, successorToken, true
+}
+
+// SeekRestartServeTimeout bounds how long a far-seek segment request waits for
+// the restart it scheduled to produce its segment, measured from the start of
+// the request's recovery rather than from the moment the detached restart was
+// scheduled. FFmpeg spawn is normally 1-2s, but a request that already waited
+// for a stalled head passes only the remainder of this budget to the
+// continuation, so the composed hold cannot roughly double. Exceeding it falls
+// back to the stale-generation verdict, which makes the client reload the
+// playlist and retry once the restart has produced it. Kept below the 8s
+// default HTTP read timeout of the ExoPlayer-based clients so the held request
+// still delivers headers before their transport gives up. Shared by the API and
+// remote-node segment handlers so both deployment shapes hold a seek for the
+// same bound.
+const SeekRestartServeTimeout = 6 * time.Second
+
+// SeekRestartStallTimeout is the produced-head watchdog during a restart
+// continuation. It is deliberately shorter than SeekRestartServeTimeout: the
+// ordinary SegmentStallTimeout floor is six seconds, which equals the whole
+// continuation ceiling, so a stall detector using it could never fire before
+// the timeout. Three seconds reports a dead restart well before the client's
+// read timeout while still leaving room for a normal spawn plus first segment.
+const SeekRestartStallTimeout = 3 * time.Second
+
+// RestartContinuationRemaining returns the part of SeekRestartServeTimeout a
+// held segment request may still spend on the restart continuation. started is
+// when the request began its recovery (before any stalled-head wait), so the
+// wait before the restart and the wait after it draw from one budget instead of
+// composing to roughly twice the client's premise. A non-positive result means
+// the restart keeps running detached and the request answers the stale-
+// generation verdict immediately.
+func RestartContinuationRemaining(started time.Time) time.Duration {
+	remaining := SeekRestartServeTimeout - time.Since(started)
+	if remaining <= 0 {
+		return 0
+	}
+	return remaining
+}
+
+// WaitForRestartContinuation waits for the segment an asynchronous seek
+// restart was scheduled to produce. A successful restart is served through the
+// absolute-segment continuity rule; a terminal restart failure is surfaced
+// immediately, and a wait timeout or stall becomes the stale-generation verdict
+// so the client refetches the playlist. Sharing this sequence keeps the API
+// handler and the remote transcode node handler on one implementation.
+func (s *TranscodeSession) WaitForRestartContinuation(name string) (*SegmentLease, error) {
+	return s.WaitForRestartContinuationWithin(name, SeekRestartServeTimeout)
+}
+
+// WaitForRestartContinuationWithin is WaitForRestartContinuation with an
+// explicit remaining budget. Callers that already spent request time waiting
+// for a stalled head use it so the composed hold stays inside
+// SeekRestartServeTimeout. A spent budget answers the stale-generation verdict
+// without waiting; the detached restart still produces the segment for the
+// client's playlist reload.
+func (s *TranscodeSession) WaitForRestartContinuationWithin(name string, budget time.Duration) (*SegmentLease, error) {
+	if budget <= 0 {
+		if restartErr := s.AsyncRestartFailure(); restartErr != nil {
+			return nil, restartErr
+		}
+		return nil, ErrStaleSegmentGeneration
+	}
+	stall := SeekRestartStallTimeout
+	if budget < stall {
+		stall = budget
+	}
+	lease, err := s.WaitForOpenSegmentWithStall(name, budget, stall)
+	if err == nil {
+		return lease, nil
+	}
+	if restartErr := s.AsyncRestartFailure(); restartErr != nil {
+		return nil, restartErr
+	}
+	if errors.Is(err, ErrSegmentNotFound) || errors.Is(err, ErrSegmentStalled) {
+		return nil, ErrStaleSegmentGeneration
+	}
+	return nil, err
 }
 
 func (s *TranscodeSession) segmentGenerationTokenLocked() string {

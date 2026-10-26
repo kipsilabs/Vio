@@ -28033,6 +28033,8 @@ export interface components {
       metered?: boolean;
       offered_virtual_uri?: string;
       playback_attempt_id: string;
+      /** @description The attempt whose explicit audio and subtitle selections this restart should carry when the request names neither. Omit it for legacy client-identity carry. */
+      previous_playback_attempt_id?: string;
       /**
        * @description Opaque identifier
        * @example 1

@@ -191,6 +191,12 @@ func TestWritePlaybackSegmentErrorMapping(t *testing.T) {
 			wantCode:   "unavailable",
 		},
 		{
+			name:       "decoder rejected the source",
+			err:        fmt.Errorf("wait for segment: %w", playback.ErrSourceDecodeRejected),
+			wantStatus: http.StatusUnprocessableEntity,
+			wantCode:   "decode_failed",
+		},
+		{
 			name:       "session-bound candidate absent during restart",
 			err:        fmt.Errorf("refresh transcode input: %w", fmt.Errorf("resolve virtual input: %w", virtuallibrary.ErrSessionBoundCandidateAbsent)),
 			wantStatus: http.StatusServiceUnavailable,

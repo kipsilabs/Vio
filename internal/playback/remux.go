@@ -542,7 +542,20 @@ type RemuxServeOptions struct {
 	// TimingStart is when the serving request arrived, used only for the
 	// per-seek timing log. Zero omits the handler-setup segment.
 	TimingStart time.Time
+	// FirstOutputTimeout bounds how long the transport waits for FFmpeg's first
+	// media byte. Zero selects remuxFirstOutputTimeout. A relay or provider that
+	// accepts the connection but never produces bytes (a dead candidate) would
+	// otherwise park the response until the client stops the session (39s was
+	// observed in production). On timeout the process is closed and the call
+	// returns errRemuxNoOutput, so the caller can rotate or fail fast.
+	FirstOutputTimeout time.Duration
 }
+
+// remuxFirstOutputTimeout is the default first-media-byte budget for a remux.
+// A healthy remote source produces a byte within a few hundred milliseconds;
+// this is deliberately loose enough for a slow provider open yet far below the
+// time a client will wait before giving up.
+var remuxFirstOutputTimeout = 15 * time.Second
 
 // RemuxContentType returns the override required for an audio-only fMP4.
 func RemuxContentType(audioOnly bool) string {
@@ -662,20 +675,44 @@ func ServeRemuxWithOptions(w http.ResponseWriter, r *http.Request, filePath, out
 	// failure is therefore still safe for the handler to retry.
 	var first []byte
 	var firstByteAt time.Time
-	for len(first) == 0 {
+	firstOutputTimeout := opts.FirstOutputTimeout
+	if firstOutputTimeout <= 0 {
+		firstOutputTimeout = remuxFirstOutputTimeout
+	}
+	// The read blocks on the FFmpeg output pipe. Bound it: a dead remote
+	// candidate can hold the pipe open without ever writing a byte, which used
+	// to keep the response (and the client) waiting until the session was
+	// stopped. Closing the session on timeout unblocks the read.
+	type remuxReadResult struct {
+		n   int
+		err error
+	}
+	firstRead := make(chan remuxReadResult, 1)
+	go func() {
 		n, readErr := session.Read(buf)
-		if n > 0 {
-			first = buf[:n]
-			firstByteAt = time.Now()
-		}
-		if readErr != nil {
-			if len(first) == 0 {
-				_ = session.Close()
-				writeStartError(w, opts.DeferStartError, "failed to start remux", http.StatusBadGateway)
-				return fmt.Errorf("%w: %w", errRemuxNoOutput, readErr)
-			}
-			break
-		}
+		firstRead <- remuxReadResult{n: n, err: readErr}
+	}()
+	firstOutputTimer := time.NewTimer(firstOutputTimeout)
+	defer firstOutputTimer.Stop()
+	var readResult remuxReadResult
+	select {
+	case readResult = <-firstRead:
+	case <-firstOutputTimer.C:
+		_ = session.Close()
+		// The closed pipe makes the pending read return; collect it so the
+		// goroutine cannot outlive this call.
+		<-firstRead
+		writeStartError(w, opts.DeferStartError, "failed to start remux", http.StatusBadGateway)
+		return fmt.Errorf("%w: no media byte within %s", errRemuxNoOutput, firstOutputTimeout)
+	}
+	if readResult.n > 0 {
+		first = buf[:readResult.n]
+		firstByteAt = time.Now()
+	}
+	if readResult.err != nil && len(first) == 0 {
+		_ = session.Close()
+		writeStartError(w, opts.DeferStartError, "failed to start remux", http.StatusBadGateway)
+		return fmt.Errorf("%w: %w", errRemuxNoOutput, readResult.err)
 	}
 	logRemuxSeekTiming(r.Context(), seekSeconds, filePath, outputFormat, opts.TimingStart, spawnStart, spawnDone, firstByteAt)
 

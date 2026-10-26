@@ -255,6 +255,16 @@ before. It is not feature-gated; any v3 client may send it. When the carried
 identity cannot be resolved (the source version is gone, or the identity does
 not parse), the server falls back to its normal preference resolution.
 
+**Carrying selections across a restart.** `previous_playback_attempt_id` is the
+optional attempt whose explicit audio and subtitle selections a restart should
+carry when the request names neither. The server resolves it from the durable
+attempt store, so the carry works across replicas and after the predecessor
+session stopped. Audio is matched onto the new file by language, codec and
+layout; an embedded subtitle by language, codec and forced flag. Without the
+field, the legacy fallback matches exactly one live session for the same profile
+and file; an ambiguous client identity (two tabs, or devices behind one NAT)
+carries nothing.
+
 **Pinning an explicit version pick.** `file_selection` distinguishes an explicit
 user version pick from an auto/default selection. `explicit` pins the requested
 `file_id`: the start-path alternate-version fallback is disabled, and a terminal

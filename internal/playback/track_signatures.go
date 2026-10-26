@@ -62,7 +62,7 @@ func AudioTrackSignatureFromTrack(track models.AudioTrack) *userstore.AudioTrack
 // inventory" and keep serving the track the plan already committed.
 //
 // Probe-derived re-identification stays on the strict matchers
-// (audioTrackMatchesSignature, matchExactAudioTrack, remapAudioSelectionIndex),
+// (audioTrackMatchesSignature, matchExactAudioTrack, RemapAudioSelectionIndex),
 // which fail closed on ambiguity. This is deliberately a separate entry point:
 // it never feeds those matchers, and they never call it.
 func ClientAudioSignatureMatchesTrack(track models.AudioTrack, sig *userstore.AudioTrackSignature) bool {
@@ -258,11 +258,12 @@ func trackStringEqual(a, b string) bool {
 	return strings.EqualFold(strings.TrimSpace(a), strings.TrimSpace(b))
 }
 
-// remapAudioSelectionIndex returns the position in next that names the same
+// RemapAudioSelectionIndex returns the position in next that names the same
 // audio track the session had selected at prev[selectedIndex], so replacing the
 // carried inventory cannot silently move the transport's derived 0:a:N ordinal
 // onto a different stream when the verified list reorders or trims the plan-time
-// list.
+// list. It is exported for the start-time selection carry, which must obey the
+// same fail-closed rule rather than matching language/codec/layout first-wins.
 //
 // Identity matching here is deliberately stricter than the preference matcher:
 // a transport that is already muxing a stream must keep that stream or fail
@@ -278,7 +279,21 @@ func trackStringEqual(a, b string) bool {
 // canonically equivalent (e.g. "en" and "eng"), or an ambiguous fallback. The
 // caller then records a server-enforced invalid selection rather than leaving
 // the plan-time position in place to name whichever track now occupies it.
-func remapAudioSelectionIndex(prev []models.AudioTrack, selectedIndex int, next []models.AudioTrack) int {
+func RemapAudioSelectionIndex(prev []models.AudioTrack, selectedIndex int, next []models.AudioTrack) int {
+	return remapAudioSelectionIndex(prev, selectedIndex, next, true)
+}
+
+// RemapAudioSelectionIndexBySignature is RemapAudioSelectionIndex for a
+// selection carried between different inventories (another file version, or a
+// re-probed candidate): an absolute container stream index only names a track
+// inside the probed file it came from, so trusting it across inventories can
+// land on a different language at the same position. The unique full signature
+// and the conservative transport-fact fallback still fail closed on ambiguity.
+func RemapAudioSelectionIndexBySignature(prev []models.AudioTrack, selectedIndex int, next []models.AudioTrack) int {
+	return remapAudioSelectionIndex(prev, selectedIndex, next, false)
+}
+
+func remapAudioSelectionIndex(prev []models.AudioTrack, selectedIndex int, next []models.AudioTrack, trustContainerIndex bool) int {
 	if selectedIndex < 0 || selectedIndex >= len(prev) {
 		return -1
 	}
@@ -289,7 +304,7 @@ func remapAudioSelectionIndex(prev []models.AudioTrack, selectedIndex int, next 
 	// and recorded a real index for the selected stream, that index is the
 	// strongest identity: if no candidate carries it the stream is gone (or the
 	// file changed), and no weaker match may stand in for it.
-	if audioInventoryProbed(prev) && selected.Index >= 0 {
+	if trustContainerIndex && audioInventoryProbed(prev) && selected.Index >= 0 {
 		for i, track := range next {
 			if track.Index == selected.Index {
 				return i

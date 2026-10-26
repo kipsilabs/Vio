@@ -3064,7 +3064,10 @@ func writePlaybackDecodeError(w http.ResponseWriter) {
 // failure the client can recover from on the next segment request (provider
 // relists renumber ids), so it is a retryable 503 with a
 // virtual_resolve_failed problem code instead of a fatal 500 the player
-// treats as a dead generation. Everything else is an unexpected server error.
+// treats as a dead generation. A generation whose decoder rejected the source
+// answers the same permanent 422 decode_failed verdict as the manifest path and
+// the remote node (writePlaybackDecodeError) instead of a retryable 500.
+// Everything else is an unexpected server error.
 func writePlaybackSegmentError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, playback.ErrSegmentNotFound), errors.Is(err, playback.ErrTranscodeFailed),
@@ -3081,6 +3084,12 @@ func writePlaybackSegmentError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusPreconditionFailed, "stale_generation", "Segment generation is stale")
 	case errors.Is(err, playback.ErrManifestNotReady):
 		writeError(w, http.StatusServiceUnavailable, "unavailable", "Transcode session is temporarily unavailable")
+	case errors.Is(err, playback.ErrSourceDecodeRejected):
+		// A revoked generation cannot produce a playable segment. The manifest
+		// path and the remote node already answer the permanent decode verdict,
+		// so the segment path must not turn a terminal decode failure into a
+		// retryable 500 the player treats as a dead generation.
+		writePlaybackDecodeError(w)
 	case errors.Is(err, virtuallibrary.ErrSessionBoundCandidateAbsent), errors.Is(err, virtuallibrary.ErrPersistedCandidateTrusted):
 		writeError(w, http.StatusServiceUnavailable, "virtual_resolve_failed", "Failed to resolve virtual source")
 	default:
@@ -3111,7 +3120,8 @@ func (h *PlaybackHandler) retainedGenerationManifest(sessionID, segPrefix, rawQu
 // missing or cannot be reconstructed, or the segment does not exist, or the
 // transcode process exited before the segment materialized (including a stop
 // that killed ffmpeg mid-request); 503 (unavailable) while the transcode is
-// temporarily unavailable; and — for tone-map execution failures — 422
+// temporarily unavailable; 422 (decode_failed) when the running decoder has
+// permanently rejected the source; and — for tone-map execution failures — 422
 // (unsupported) with an X-Vio-Tone-Map-Execution-Error header of
 // source_revision_changed or source_preflight_rejected. The 422 responses are
 // additive to the existing 404 and 503 cases; the Jellyfin-compatible 415
@@ -3248,15 +3258,30 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 	// generation.
 	servedSession := transcodeSession
 	// A URL minted against an older generation is only answerable by a retained
-	// generation that explicitly owns that token. Anything else is a stale read
-	// that would silently mix generations, so refuse it before touching the
-	// filesystem.
+	// generation that explicitly owns that token, or by the live generation when
+	// it restarted in place at or before the requested segment: segment numbers
+	// are absolute in the HLS timeline, so the live generation at that index is
+	// the same timeline position the displaced playlist asked for. In that case
+	// the request continues down the ordinary open/wait/restart path with no
+	// token, and the final fence is skipped for it (the generation rotation is
+	// the server's own response to the seek, not a different stream).
+	continuationServe := false
+	continuationSuccessorToken := ""
 	var segmentLease *playback.SegmentLease
 	var err error
 	if requestedGeneration != "" && !transcodeSession.MatchesGenerationToken(requestedGeneration) {
 		if retained := h.tm.GetRetainedTranscodeSession(sessionID); retained != nil && retained.MatchesGenerationToken(requestedGeneration) {
 			segmentLease, err = retained.OpenSegmentForGeneration(segmentName, requestedGeneration)
 			servedSession = retained
+		} else if restartStart, successorToken, ok := transcodeSession.RestartContinuationSegment(requestedGeneration, segmentName); ok {
+			slog.InfoContext(r.Context(), "transcode segment served from the live generation after an in-place restart",
+				"component", "api", "session", sessionID, "playback_session_id", sessionID,
+				"segment", segmentName, "requested_segment", requestedSegment,
+				"restart_start_segment", restartStart)
+			continuationServe = true
+			continuationSuccessorToken = successorToken
+			requestedGeneration = ""
+			segmentLease, err = transcodeSession.OpenSegmentForGeneration(segmentName, "")
 		} else {
 			err = playback.ErrStaleSegmentGeneration
 		}
@@ -3299,6 +3324,10 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 	if err != nil && errors.Is(err, playback.ErrSegmentNotFound) {
 		segNum, parseErr := playback.ParseSegmentNumber(segmentName)
 		if parseErr == nil {
+			// The restart clock starts here, before any stalled-head wait, so a
+			// wait followed by the restart continuation draws from one bounded
+			// budget instead of composing two full timeouts.
+			recoveryStarted := time.Now()
 			now := time.Now()
 			decision := transcodeSession.SegmentRecoveryDecision(segNum, now)
 			segmentStalled := false
@@ -3375,20 +3404,16 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 			// current manifest window.
 			if err != nil && errors.Is(err, playback.ErrSegmentNotFound) && decision.RestartOnTimeout {
 				// A far seek past the produced window is recovered by a seek
-				// restart, and any restart rotates the generation. Holding this
-				// request for the restart's bytes is pure latency: a request that
-				// named the old generation is refused by the final fence, and a
-				// tokenless request would otherwise be served bytes from a
-				// restart it never addressed. Either way the player sits waiting
-				// on a segment the server already knows it cannot serve under
-				// this request's generation. The restart is an encode-level
-				// operation, so trigger it detached from the request and answer
-				// the stale-generation verdict now; the client reloads the
-				// manifest, adopts the new generation, and the segment is served
-				// once produced. Copy-mode sessions stay on the synchronous path:
-				// their target resolution reads the live manifest under the
-				// lifecycle lock and can legitimately report an unresolved
-				// target.
+				// restart, and any restart rotates the generation. The restart
+				// itself runs detached because it is an encode-level operation
+				// that must survive this request, but the request then holds for
+				// the segment the restart produces: absolute segment numbering
+				// makes it the same timeline position the client asked for, so
+				// serving it avoids hls.js retrying a superseded URL four times
+				// (its fragment retry budget) before refetching the playlist.
+				// Copy-mode sessions stay on the synchronous path: their target
+				// resolution reads the live manifest under the lifecycle lock and
+				// can legitimately report an unresolved target.
 				if (decision.Reason == playback.SegmentRecoveryFarSeekReason || segmentStalled) && !transcodeSession.IsCopyVideo() {
 					slog.InfoContext(r.Context(), "transcode seek restart scheduled", "component", "api",
 						"segment", segmentName,
@@ -3401,7 +3426,37 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 						"playback_session_id", sessionID,
 					)
 					h.tm.RestartSegmentAsync(sessionID, transcodeSession, segNum)
-					err = playback.ErrStaleSegmentGeneration
+					// Hold this request through the restart it just scheduled
+					// instead of answering the stale-generation verdict. The
+					// restart rotates the generation and produces exactly the
+					// absolute segment this request names, so waiting here turns
+					// the client's seek into data after one FFmpeg restart. The
+					// previous detached answer made hls.js retry the same stale
+					// URL four times (its fragment retry budget) before it
+					// refetched the playlist, costing ~4s of dead air per seek.
+					// The wait spends only the request's remaining hold budget
+					// (a stalled-head wait above may already have consumed part
+					// of it) and still surfaces a failed restart's verdict.
+					segmentLease, err = transcodeSession.WaitForRestartContinuationWithin(
+						segmentName,
+						playback.RestartContinuationRemaining(recoveryStarted),
+					)
+					if err == nil {
+						if requestedGeneration != "" {
+							if _, successorToken, ok := transcodeSession.RestartContinuationSegment(requestedGeneration, segmentName); ok {
+								continuationSuccessorToken = successorToken
+							} else if transcodeSession.MatchesGenerationToken(requestedGeneration) {
+								continuationSuccessorToken = requestedGeneration
+							} else {
+								_ = segmentLease.Close()
+								segmentLease = nil
+								err = playback.ErrStaleSegmentGeneration
+							}
+						}
+					}
+					if err == nil {
+						continuationServe = true
+					}
 				} else {
 					target, ok, restartErr := h.tm.RestartSegmentLocked(
 						r.Context(),
@@ -3468,8 +3523,20 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 	// Any recovery path above (a wait or a restart) can return a lease from a
 	// different generation than the URL named. Re-apply the fence before serving
 	// so a request minted against one generation is never answered with another's
-	// bytes.
-	if err == nil {
+	// bytes. A continuation serve is the exception only for the exact successor
+	// generation that displaced the request's token; if another restart landed
+	// while this request waited, the lease is a later generation and the token
+	// no longer names its timeline.
+	if err == nil && continuationSuccessorToken != "" {
+		if segmentLease == nil || segmentLease.GenerationToken != continuationSuccessorToken {
+			if segmentLease != nil {
+				_ = segmentLease.Close()
+			}
+			segmentLease = nil
+			err = playback.ErrStaleSegmentGeneration
+		}
+	}
+	if err == nil && !continuationServe {
 		if segmentLease, err = playback.FenceSegmentLease(segmentLease, requestedGeneration); err != nil {
 			segmentLease = nil
 		}

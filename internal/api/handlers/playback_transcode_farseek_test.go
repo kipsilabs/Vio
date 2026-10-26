@@ -27,9 +27,11 @@ func writePlaybackTestFFmpegFarSeek(t *testing.T) string {
 		"for arg in \"$@\"; do last=\"$arg\"; done\n" +
 		"case \" $* \" in *\" -bsfs \"*|*\" -encoders \"*|*\" -f null - \"*) exit 0 ;; esac\n" +
 		"case \"$last\" in\n" +
-		"  *.m3u8) out=\"$(dirname \"$last\")\"; mkdir -p \"$out\"; " +
+		"  *.m3u8) out=\"$(dirname \"$last\")\"; mkdir -p \"$out\"; echo \"start=$start\" >> \"$out/.invocations\"; " +
 		"printf x > \"$out/init.mp4\"; printf x > \"$out/seg_0.m4s\"; " +
 		"printf x > \"$out/seg_1.m4s\"; printf x > \"$out/seg_2.m4s\"; " +
+		"printf x > \"$out/seg_0.ts\"; printf x > \"$out/seg_1.ts\"; printf x > \"$out/seg_2.ts\"; " +
+		"printf x > \"$out/seg_00000.ts\"; printf x > \"$out/seg_00001.ts\"; printf x > \"$out/seg_00002.ts\"; " +
 		"printf '#EXTM3U\\n#EXT-X-VERSION:7\\n#EXT-X-TARGETDURATION:2\\n" +
 		"#EXT-X-MEDIA-SEQUENCE:0\\n#EXT-X-MAP:URI=\"init.mp4\"\\n" +
 		"#EXTINF:2.0,\\nseg_0.m4s\\n#EXTINF:2.0,\\nseg_1.m4s\\n" +
@@ -43,13 +45,15 @@ func writePlaybackTestFFmpegFarSeek(t *testing.T) string {
 	return path
 }
 
-// TestFarSeekBeyondProducedWindowAnswersStaleGenerationImmediately pins the
-// fast-start seek fix: a request for a segment far past the produced window is
-// recovered by an asynchronous seek restart, so the triggering request must not
-// be held for the restart's bytes (which its own generation fence would refuse).
-// It answers the stale-generation verdict immediately and a later request for
-// the same segment is served once the restart has produced it.
-func TestFarSeekBeyondProducedWindowAnswersStaleGenerationImmediately(t *testing.T) {
+// TestFarSeekBeyondProducedWindowServesAfterAsyncRestart pins the seek fix: a
+// request for a segment far past the produced window schedules an asynchronous
+// seek restart and then waits for the restart's own segment instead of answering
+// the stale-generation verdict. The old verdict made hls.js burn its four-attempt
+// fragment retry budget on the same stale URL before refetching the playlist,
+// which cost ~4s of dead air per far seek. The restart targets exactly the
+// requested absolute segment, so the rotated generation's bytes are the stream
+// this request asked for and the response is servable.
+func TestFarSeekBeyondProducedWindowServesAfterAsyncRestart(t *testing.T) {
 	outputDir := t.TempDir()
 	ffmpegPath := writePlaybackTestFFmpegFarSeek(t)
 
@@ -79,7 +83,7 @@ func TestFarSeekBeyondProducedWindowAnswersStaleGenerationImmediately(t *testing
 		if time.Now().After(deadline) {
 			t.Fatal("fake transcode never produced the initial segments")
 		}
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond) //nolint:forbidigo // Segment files are the fake encoder's observable output.
 	}
 
 	sessions := playback.NewSessionManager(0, 0)
@@ -111,48 +115,40 @@ func TestFarSeekBeyondProducedWindowAnswersStaleGenerationImmediately(t *testing
 	first := serve()
 	elapsed := time.Since(start)
 
-	if first.Code != http.StatusPreconditionFailed {
-		t.Fatalf("far-seek status = %d body=%q, want %d (stale generation)", first.Code, first.Body.String(), http.StatusPreconditionFailed)
+	if first.Code != http.StatusOK {
+		t.Fatalf("far-seek status = %d body=%q, want 200 served by the restarted generation", first.Code, first.Body.String())
 	}
-	if !strings.Contains(first.Body.String(), "stale_generation") {
-		t.Fatalf("far-seek body = %q, want the stale_generation code", first.Body.String())
+	if first.Body.String() != "far-seek-bytes" {
+		t.Fatalf("far-seek body = %q, want the restarted generation's bytes", first.Body.String())
 	}
-	if elapsed > 100*time.Millisecond {
-		t.Fatalf("far-seek request held for %s, want an immediate stale-generation answer (<100ms)", elapsed)
-	}
-
-	// The restart runs detached; wait on the observable output (the segment on
-	// disk), not a fixed sleep.
-	deadline = time.Now().Add(5 * time.Second)
-	for {
-		if _, statErr := os.Stat(filepath.Join(outputDir, segmentName)); statErr == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("asynchronous seek restart never produced the requested segment")
-		}
-		time.Sleep(5 * time.Millisecond)
+	if elapsed > 5*time.Second {
+		t.Fatalf("far-seek request held for %s, want the restart's segment within the serve bound", elapsed)
 	}
 
+	// The triggering request now waits through the restart instead of being
+	// refused, so the segment it asked for exists by the time it returns.
+	if _, statErr := os.Stat(filepath.Join(outputDir, segmentName)); statErr != nil {
+		t.Fatalf("far-seek response returned before the restart produced %s: %v", segmentName, statErr)
+	}
+
+	// A repeat request on the rotated generation's own token serves the same
+	// bytes without another restart.
 	second := serve()
-	if second.Code != http.StatusOK {
-		t.Fatalf("post-restart status = %d body=%q, want 200 once the segment is produced", second.Code, second.Body.String())
-	}
-	if second.Body.String() != "far-seek-bytes" {
-		t.Fatalf("post-restart body = %q, want the restarted generation's bytes", second.Body.String())
+	if second.Code != http.StatusOK || second.Body.String() != "far-seek-bytes" {
+		t.Fatalf("repeat far-seek = %d %q, want 200 far-seek-bytes", second.Code, second.Body.String())
 	}
 }
 
-// TestFarSeekSignedGenerationRecoversWithinBudget drives the client recovery
-// contract the web player depends on: a request signed with the generation it
-// holds (sgen) gets the 412 stale-generation verdict, the playlist is refetched
-// once per recovery, and the replacement generation serves the sought segment —
-// all inside the two-consecutive-recovery budget from #323
-// (MAX_STALE_GENERATION_RECOVERIES = 2 on the client). The restart is held on the
-// session's lifecycle lock so its rotation cannot race the first reload, which
-// proves the loop consumes exactly the budget the client allows instead of
-// polling an unbounded number of manifests for one "recovery".
-func TestFarSeekSignedGenerationRecoversWithinBudget(t *testing.T) {
+// TestFarSeekStaleGenerationAfterRestartServesFromLiveGeneration replays the
+// production seek sequence: the client holds a playlist minted before a far-seek
+// restart, and every segment URI in it still names the displaced generation. The
+// triggering request itself now waits through the restart and is served, so the
+// client never sees the 412; requests for segments at or after the restart's
+// start segment are likewise served from the live generation because absolute
+// segment numbering makes them the same timeline position. A segment before the
+// restart point still gets the stale-generation verdict: the live generation
+// never produced it, so answering it would mix timelines.
+func TestFarSeekStaleGenerationAfterRestartServesFromLiveGeneration(t *testing.T) {
 	outputDir := t.TempDir()
 	const sessionID = "farseek-sgen"
 	handler, transcodeSession := startFarSeekHandlerSession(t, sessionID, writePlaybackTestFFmpegFarSeek(t), outputDir, playback.TranscodeOpts{
@@ -168,105 +164,68 @@ func TestFarSeekSignedGenerationRecoversWithinBudget(t *testing.T) {
 	const segmentName = "seg_00452.m4s"
 	staleToken := transcodeSession.GenerationToken()
 
-	// Hold the restart before it can rotate the generation, so the client's
-	// first playlist refetch still advertises the stale token and its next
-	// segment request is refused again: two consecutive recoveries, exactly the
-	// budget from #323.
-	unblockRestart := handler.TranscodeManager().LockSessionLifecycle(sessionID)
-	restartReleased := false
-	releaseRestart := func() {
-		if !restartReleased {
-			restartReleased = true
-			unblockRestart()
-		}
-	}
-	defer releaseRestart()
-
-	segmentRequest := func(token string) *httptest.ResponseRecorder {
+	segmentRequest := func(name, token string) *httptest.ResponseRecorder {
 		rec := httptest.NewRecorder()
 		handler.HandleGetTranscodeSegment(rec, playbackTestRequest(
 			http.MethodGet,
-			"/api/v1/playback/transcode/"+sessionID+"/segment/"+segmentName+"?sgen="+url.QueryEscape(token),
+			"/api/v1/playback/transcode/"+sessionID+"/segment/"+name+"?sgen="+url.QueryEscape(token),
 			nil,
-			map[string]string{"session_id": sessionID, "name": segmentName},
+			map[string]string{"session_id": sessionID, "name": name},
 		))
 		return rec
 	}
-	// reloadManifest consumes exactly one playlist refetch — the client's unit
-	// of recovery — and returns the generation token it advertises.
-	reloadManifest := func() string {
-		rec := httptest.NewRecorder()
-		handler.HandleGetTranscodeManifest(rec, playbackTestRequest(
-			http.MethodGet,
-			"/api/v1/playback/transcode/"+sessionID+"/master.m3u8",
-			nil,
-			map[string]string{"session_id": sessionID},
-		))
-		if rec.Code != http.StatusOK {
-			t.Fatalf("manifest reload status = %d body=%q, want 200", rec.Code, rec.Body.String())
-		}
-		return manifestGenerationToken(t, rec.Body.Bytes())
-	}
 
-	deadline := time.Now().Add(10 * time.Second)
-	currentToken := staleToken
-	for recoveries := 0; ; {
-		if time.Now().After(deadline) {
-			t.Fatalf("far-seek recovery did not complete within #323's budget after %d recoveries", recoveries)
-		}
-		seg := segmentRequest(currentToken)
-		if seg.Code == http.StatusOK {
-			if seg.Body.String() != "far-seek-bytes" {
-				t.Fatalf("sought segment body = %q, want the restarted generation's bytes", seg.Body.String())
-			}
-			break
-		}
-		if seg.Code != http.StatusPreconditionFailed || !strings.Contains(seg.Body.String(), "stale_generation") {
-			t.Fatalf("signed far-seek status = %d body=%q, want 200 or %d stale_generation", seg.Code, seg.Body.String(), http.StatusPreconditionFailed)
-		}
-		if recoveries >= 2 {
-			t.Fatal("far-seek exceeded #323's two-consecutive-recovery budget")
-		}
-		recoveries++
-		currentToken = reloadManifest()
-		if recoveries == 1 {
-			// The first recovery must observe the generation the held restart has
-			// not yet replaced; that is what makes the second recovery necessary.
-			if currentToken != staleToken {
-				t.Fatalf("first reload token = %q, want the stale token %q before the restart rotates", currentToken, staleToken)
-			}
-			// Release the restart so the generation rotates and the sought segment
-			// is produced; wait on that output so the second reload adopts the
-			// replacement rather than racing it, leaving the final request servable
-			// end to end.
-			releaseRestart()
-			restartDeadline := time.Now().Add(5 * time.Second)
-			for {
-				if _, statErr := os.Stat(filepath.Join(outputDir, segmentName)); statErr == nil {
-					break
-				}
-				if time.Now().After(restartDeadline) {
-					t.Fatal("asynchronous seek restart never produced the requested segment")
-				}
-				time.Sleep(5 * time.Millisecond)
-			}
-		}
+	// The triggering request names the still-live generation and is held through
+	// the far-seek restart it schedules.
+	first := segmentRequest(segmentName, staleToken)
+	if first.Code != http.StatusOK || first.Body.String() != "far-seek-bytes" {
+		t.Fatalf("triggering far-seek = %d %q, want 200 far-seek-bytes", first.Code, first.Body.String())
 	}
+	currentToken := transcodeSession.GenerationToken()
 	if currentToken == staleToken {
-		t.Fatal("the recovery loop ended on the stale generation token")
+		t.Fatal("the generation token did not rotate across the far-seek restart")
 	}
 
-	// The replacement generation serves the init segment under the token the
-	// second reload advertised.
-	initRec := httptest.NewRecorder()
-	handler.HandleGetTranscodeSegment(initRec, playbackTestRequest(
-		http.MethodGet,
-		"/api/v1/playback/transcode/"+sessionID+"/segment/init.mp4?sgen="+url.QueryEscape(currentToken),
-		nil,
-		map[string]string{"session_id": sessionID, "name": "init.mp4"},
-	))
+	// The client has not refetched the playlist yet, so it still names the
+	// displaced generation. At and after the restart's start segment the live
+	// generation owns the same absolute position and must serve it.
+	stale := segmentRequest(segmentName, staleToken)
+	if stale.Code != http.StatusOK || stale.Body.String() != "far-seek-bytes" {
+		t.Fatalf("stale-token continuation = %d %q, want 200 far-seek-bytes", stale.Code, stale.Body.String())
+	}
+
+	// Before the restart point the live generation never produced the segment,
+	// so the same stale token must still be refused rather than answered with
+	// another timeline's bytes.
+	beforeRestart := segmentRequest("seg_00001.m4s", staleToken)
+	if beforeRestart.Code != http.StatusPreconditionFailed || !strings.Contains(beforeRestart.Body.String(), "stale_generation") {
+		t.Fatalf("pre-restart stale token = %d %q, want the stale_generation verdict", beforeRestart.Code, beforeRestart.Body.String())
+	}
+
+	// The init segment is generation-independent for the same recipe, so a
+	// playlist fetched before the rotation keeps working through it.
+	staleInit := segmentRequest("init.mp4", staleToken)
+	if staleInit.Code != http.StatusOK {
+		t.Fatalf("stale-token init = %d %q, want 200 from the live generation", staleInit.Code, staleInit.Body.String())
+	}
+
+	// The replacement generation's own token serves the rest of its playlist.
+	initRec := segmentRequest("init.mp4", currentToken)
 	if initRec.Code != http.StatusOK {
 		t.Fatalf("replacement init status = %d body=%q, want 200", initRec.Code, initRec.Body.String())
+	}
+	manifestRec := httptest.NewRecorder()
+	handler.HandleGetTranscodeManifest(manifestRec, playbackTestRequest(
+		http.MethodGet,
+		"/api/v1/playback/transcode/"+sessionID+"/master.m3u8",
+		nil,
+		map[string]string{"session_id": sessionID},
+	))
+	if manifestRec.Code != http.StatusOK {
+		t.Fatalf("manifest status = %d body=%q, want 200", manifestRec.Code, manifestRec.Body.String())
+	}
+	if manifestToken := manifestGenerationToken(t, manifestRec.Body.Bytes()); manifestToken != currentToken {
+		t.Fatalf("manifest token = %q, want the live generation %q", manifestToken, currentToken)
 	}
 }
 
@@ -313,7 +272,7 @@ func startFarSeekHandlerSession(t *testing.T, sessionID, ffmpegPath, outputDir s
 		if time.Now().After(deadline) {
 			t.Fatal("fake transcode never produced the initial segments")
 		}
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond) //nolint:forbidigo // Segment files are the fake encoder's observable output.
 	}
 
 	sessions := playback.NewSessionManager(0, 0)
@@ -343,9 +302,9 @@ func farSeekServe(t *testing.T, handler *PlaybackHandler, sessionID, segmentName
 	return rec
 }
 
-// TestFarSeekAsyncRestartRotatesGeneration pins that the detached far-seek
-// restart actually rotates the generation token, which is why the triggering
-// request cannot be held for the restart's bytes.
+// TestFarSeekAsyncRestartRotatesGeneration pins that the far-seek restart
+// rotates the generation token and that the triggering request is served from
+// the rotated generation it created.
 func TestFarSeekAsyncRestartRotatesGeneration(t *testing.T) {
 	outputDir := t.TempDir()
 	handler, transcodeSession := startFarSeekHandlerSession(t, "farseek-rotate", writePlaybackTestFFmpegFarSeek(t), outputDir, playback.TranscodeOpts{
@@ -360,25 +319,17 @@ func TestFarSeekAsyncRestartRotatesGeneration(t *testing.T) {
 
 	const segmentName = "seg_00452.m4s"
 	before := transcodeSession.GenerationToken()
-	if first := farSeekServe(t, handler, "farseek-rotate", segmentName); first.Code != http.StatusPreconditionFailed {
-		t.Fatalf("far-seek status = %d body=%q, want 412 before the restart", first.Code, first.Body.String())
-	}
-
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		if _, statErr := os.Stat(filepath.Join(outputDir, segmentName)); statErr == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("asynchronous seek restart never produced the requested segment")
-		}
-		time.Sleep(5 * time.Millisecond)
+	if first := farSeekServe(t, handler, "farseek-rotate", segmentName); first.Code != http.StatusOK || first.Body.String() != "far-seek-bytes" {
+		t.Fatalf("far-seek status = %d body=%q, want 200 far-seek-bytes served through the restart", first.Code, first.Body.String())
 	}
 	if after := transcodeSession.GenerationToken(); after == before {
 		t.Fatalf("generation token = %q, want it to rotate across the restart", after)
 	}
 	if transcodeSession.MatchesGenerationToken(before) {
 		t.Fatal("the pre-restart generation token still matched after the restart")
+	}
+	if _, statErr := os.Stat(filepath.Join(outputDir, segmentName)); statErr != nil {
+		t.Fatalf("restart did not produce %s: %v", segmentName, statErr)
 	}
 }
 
@@ -424,6 +375,8 @@ func writePlaybackTestFFmpegFarSeekDemux(t *testing.T) string {
 		"  *.m3u8) out=\"$(dirname \"$last\")\"; mkdir -p \"$out\"; " +
 		"printf x > \"$out/init.mp4\"; printf x > \"$out/seg_0.m4s\"; " +
 		"printf x > \"$out/seg_1.m4s\"; printf x > \"$out/seg_2.m4s\"; " +
+		"printf x > \"$out/seg_0.ts\"; printf x > \"$out/seg_1.ts\"; printf x > \"$out/seg_2.ts\"; " +
+		"printf x > \"$out/seg_00000.ts\"; printf x > \"$out/seg_00001.ts\"; printf x > \"$out/seg_00002.ts\"; " +
 		"printf '#EXTM3U\\n#EXT-X-VERSION:7\\n#EXT-X-TARGETDURATION:2\\n" +
 		"#EXT-X-MEDIA-SEQUENCE:0\\n#EXT-X-MAP:URI=\"init.mp4\"\\n" +
 		"#EXTINF:2.0,\\nseg_0.m4s\\n#EXTINF:2.0,\\nseg_1.m4s\\n" +
@@ -457,23 +410,29 @@ func TestFarSeekAsyncFailureDoesNotStaleGenerationLoop(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatal("session never stamped its source candidate demux-failed")
 		}
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond) //nolint:forbidigo // Segment files are the fake encoder's observable output.
 	}
 
 	const segmentName = "seg_00452.m4s"
-	if first := farSeekServe(t, handler, "farseek-demux", segmentName); first.Code != http.StatusPreconditionFailed {
-		t.Fatalf("first far-seek status = %d body=%q, want 412", first.Code, first.Body.String())
+	// The triggering request now waits through the restart, so it surfaces the
+	// terminal demux verdict directly instead of answering 412 and letting the
+	// next request discover it.
+	first := farSeekServe(t, handler, "farseek-demux", segmentName)
+	if first.Code == http.StatusPreconditionFailed || strings.Contains(first.Body.String(), "stale_generation") {
+		t.Fatalf("first far-seek looped on stale_generation: %d %q", first.Code, first.Body.String())
+	}
+	if first.Code != http.StatusNotFound {
+		t.Fatalf("first far-seek status = %d body=%q, want the terminal demux verdict (404)", first.Code, first.Body.String())
 	}
 
 	// The latch is recorded by the detached worker; wait for the observable
-	// verdict before the retry, mirroring a client that reloads the manifest
-	// after the 412.
+	// verdict before the retry.
 	deadline = time.Now().Add(5 * time.Second)
 	for transcodeSession.AsyncRestartFailure() == nil {
 		if time.Now().After(deadline) {
 			t.Fatal("the detached restart never latched its demux verdict")
 		}
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond) //nolint:forbidigo // Segment files are the fake encoder's observable output.
 	}
 
 	second := farSeekServe(t, handler, "farseek-demux", segmentName)
@@ -482,5 +441,238 @@ func TestFarSeekAsyncFailureDoesNotStaleGenerationLoop(t *testing.T) {
 	}
 	if second.Code != http.StatusNotFound {
 		t.Fatalf("second request status = %d body=%q, want the terminal demux verdict (404)", second.Code, second.Body.String())
+	}
+}
+
+// writePlaybackTestFFmpegTwoRotation writes a fake ffmpeg that emits the segment
+// named by each restart's `-start_number`, so a second generation rotation can
+// produce the segment a held request is waiting for.
+func writePlaybackTestFFmpegTwoRotation(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "fake-ffmpeg-two-rotation.sh")
+	script := "#!/bin/sh\n" +
+		"last=\"\"; start=\"\"; prev=\"\"\n" +
+		"for arg in \"$@\"; do last=\"$arg\"; if [ \"$prev\" = \"-start_number\" ]; then start=\"$arg\"; fi; prev=\"$arg\"; done\n" +
+		"case \" $* \" in *\" -bsfs \"*|*\" -encoders \"*|*\" -f null - \"*) exit 0 ;; esac\n" +
+		"case \"$last\" in\n" +
+		"  *.m3u8) out=\"$(dirname \"$last\")\"; mkdir -p \"$out\"; " +
+		"printf x > \"$out/init.mp4\"; printf x > \"$out/seg_0.m4s\"; " +
+		"printf x > \"$out/seg_1.m4s\"; printf x > \"$out/seg_2.m4s\"; " +
+		"printf x > \"$out/seg_0.ts\"; printf x > \"$out/seg_1.ts\"; printf x > \"$out/seg_2.ts\"; " +
+		"printf x > \"$out/seg_00000.ts\"; printf x > \"$out/seg_00001.ts\"; printf x > \"$out/seg_00002.ts\"; " +
+		"printf '#EXTM3U\\n#EXT-X-VERSION:7\\n#EXT-X-TARGETDURATION:2\\n" +
+		"#EXT-X-MEDIA-SEQUENCE:0\\n#EXT-X-MAP:URI=\"init.mp4\"\\n" +
+		"#EXTINF:2.0,\\nseg_0.m4s\\n#EXTINF:2.0,\\nseg_1.m4s\\n" +
+		"#EXTINF:2.0,\\nseg_2.m4s\\n' > \"$last\"; " +
+		"if [ -n \"$start\" ]; then printf 'far-seek-bytes' > \"$out/$(printf 'seg_%05d.m4s' \"$start\")\"; " +
+		"printf 'far-seek-bytes' > \"$out/$(printf 'seg_%05d.ts' \"$start\")\"; fi ;;\n" +
+		"esac\n" +
+		"exec sleep 30\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake ffmpeg: %v", err)
+	}
+	return path
+}
+
+// TestSegmentContinuationAcrossTwoRotationsAnswersStaleGeneration is the
+// regression for the node/API final-fence panic: a request whose stale token
+// was already accepted as the predecessor of generation B enters the wait path
+// for a segment B has not produced yet. A second in-place restart (B to C)
+// lands while it waits, so the lease names C and the fence must answer 412
+// instead of dereferencing the lease it just cleared.
+func TestSegmentContinuationAcrossTwoRotationsAnswersStaleGeneration(t *testing.T) {
+	outputDir := t.TempDir()
+	handler, transcodeSession := startFarSeekHandlerSession(t, "farseek-two-rotations", writePlaybackTestFFmpegTwoRotation(t), outputDir, playback.TranscodeOpts{
+		InputPath:          "/media/movie.mkv",
+		TargetCodecVideo:   "h264",
+		TargetCodecAudio:   "aac",
+		SegmentDuration:    2,
+		AudioTrackIndex:    -1,
+		SubtitleTrackIndex: -1,
+		TotalDuration:      1200,
+	})
+	const segmentName = "seg_00455.m4s"
+	staleToken := transcodeSession.GenerationToken()
+
+	// Establish generation B with a restart to the timeline this test requests.
+	// B produces its own start segment (452), not the requested 455, so the
+	// request still enters the continuation wait. The predecessor relationship
+	// A -> B is now what a held request sees.
+	if err := transcodeSession.Restart(context.Background(), 904, 452); err != nil {
+		t.Fatalf("first restart: %v", err)
+	}
+	if transcodeSession.GenerationToken() == staleToken {
+		t.Fatal("first restart did not rotate the generation")
+	}
+	if _, statErr := os.Stat(filepath.Join(outputDir, segmentName)); statErr == nil {
+		t.Fatal("the first restart unexpectedly produced the requested segment")
+	}
+
+	rec := httptest.NewRecorder()
+	handler.HandleGetTranscodeSegment(rec, playbackTestRequest(
+		http.MethodGet,
+		"/api/v1/playback/transcode/farseek-two-rotations/segment/"+segmentName+"?sgen="+url.QueryEscape(staleToken),
+		nil,
+		map[string]string{"session_id": "farseek-two-rotations", "name": segmentName},
+	))
+	// The request accepted A as B's predecessor, then waited while B -> C
+	// rotated. It must fail closed, not panic, and not serve C's bytes under
+	// B's continuation identity.
+	if rec.Code != http.StatusPreconditionFailed || !strings.Contains(rec.Body.String(), "stale_generation") {
+		t.Fatalf("two-rotation continuation = %d %q, want 412 stale_generation", rec.Code, rec.Body.String())
+	}
+	if _, statErr := os.Stat(filepath.Join(outputDir, segmentName)); statErr != nil {
+		t.Fatalf("the second restart did not produce the requested segment: %v", statErr)
+	}
+}
+
+// TestFarSeekContinuationExpiryRecoversWithOnePlaylistReload replaces the
+// deleted two-recovery budget test: the held request itself is now the first
+// recovery, so an expired hold must answer one 412, and exactly one playlist
+// reload must adopt the generation that eventually serves the seek. The hold
+// stays inside SeekRestartServeTimeout rather than extending past the client's
+// read premise.
+func TestFarSeekContinuationExpiryRecoversWithOnePlaylistReload(t *testing.T) {
+	outputDir := t.TempDir()
+	const sessionID = "farseek-budget"
+	handler, transcodeSession := startFarSeekHandlerSession(t, sessionID, writePlaybackTestFFmpegFarSeek(t), outputDir, playback.TranscodeOpts{
+		InputPath:          "/media/movie.mkv",
+		TargetCodecVideo:   "h264",
+		TargetCodecAudio:   "aac",
+		SegmentDuration:    2,
+		AudioTrackIndex:    -1,
+		SubtitleTrackIndex: -1,
+		TotalDuration:      1200,
+	})
+	const segmentName = "seg_00452.m4s"
+	staleToken := transcodeSession.GenerationToken()
+
+	// Hold the restart on the lifecycle lock so the request's continuation can
+	// only time out.
+	unblockRestart := handler.TranscodeManager().LockSessionLifecycle(sessionID)
+	released := false
+	releaseRestart := func() {
+		if !released {
+			released = true
+			unblockRestart()
+		}
+	}
+	defer releaseRestart()
+
+	type result struct {
+		rec     *httptest.ResponseRecorder
+		elapsed time.Duration
+	}
+	done := make(chan result, 1)
+	go func() {
+		start := time.Now()
+		rec := httptest.NewRecorder()
+		handler.HandleGetTranscodeSegment(rec, playbackTestRequest(
+			http.MethodGet,
+			"/api/v1/playback/transcode/"+sessionID+"/segment/"+segmentName+"?sgen="+url.QueryEscape(staleToken),
+			nil,
+			map[string]string{"session_id": sessionID, "name": segmentName},
+		))
+		done <- result{rec: rec, elapsed: time.Since(start)}
+	}()
+
+	var expired result
+	select {
+	case expired = <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("held far-seek request did not answer within the recovery bound")
+	}
+	if expired.rec.Code != http.StatusPreconditionFailed || !strings.Contains(expired.rec.Body.String(), "stale_generation") {
+		t.Fatalf("expired continuation = %d %q, want 412 stale_generation", expired.rec.Code, expired.rec.Body.String())
+	}
+	if expired.elapsed > playback.SeekRestartServeTimeout+3*time.Second {
+		t.Fatalf("held request took %s, want no more than SeekRestartServeTimeout", expired.elapsed)
+	}
+
+	releaseRestart()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, statErr := os.Stat(filepath.Join(outputDir, segmentName)); statErr == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("released restart never produced the requested segment")
+		}
+		time.Sleep(5 * time.Millisecond) //nolint:forbidigo // Segment files are the fake encoder's observable output.
+	}
+
+	manifestRec := httptest.NewRecorder()
+	handler.HandleGetTranscodeManifest(manifestRec, playbackTestRequest(
+		http.MethodGet,
+		"/api/v1/playback/transcode/"+sessionID+"/master.m3u8",
+		nil,
+		map[string]string{"session_id": sessionID},
+	))
+	if manifestRec.Code != http.StatusOK {
+		t.Fatalf("manifest reload = %d %q, want 200", manifestRec.Code, manifestRec.Body.String())
+	}
+	currentToken := manifestGenerationToken(t, manifestRec.Body.Bytes())
+	if currentToken == staleToken {
+		t.Fatalf("manifest reload kept the expired generation %q", currentToken)
+	}
+
+	rec := httptest.NewRecorder()
+	handler.HandleGetTranscodeSegment(rec, playbackTestRequest(
+		http.MethodGet,
+		"/api/v1/playback/transcode/"+sessionID+"/segment/"+segmentName+"?sgen="+url.QueryEscape(currentToken),
+		nil,
+		map[string]string{"session_id": sessionID, "name": segmentName},
+	))
+	if rec.Code != http.StatusOK || rec.Body.String() != "far-seek-bytes" {
+		t.Fatalf("post-reload segment = %d %q, want 200 far-seek-bytes", rec.Code, rec.Body.String())
+	}
+}
+
+// TestFarSeekStalledHeadSharesOneContinuationBudget proves the composed hold:
+// the stalled-head wait and the restart continuation draw from the same 6s
+// ceiling, so a dead produced head answers one 412 instead of waiting out the
+// 12s active wait and then another 6s for the restart.
+func TestFarSeekStalledHeadSharesOneContinuationBudget(t *testing.T) {
+	outputDir := t.TempDir()
+	const sessionID = "farseek-stalled-head"
+	handler, transcodeSession := startFarSeekHandlerSession(t, sessionID, writePlaybackTestFFmpegTwoRotation(t), outputDir, playback.TranscodeOpts{
+		InputPath:          "/media/movie.mkv",
+		TargetCodecVideo:   "h264",
+		TargetCodecAudio:   "aac",
+		SegmentDuration:    2,
+		AudioTrackIndex:    -1,
+		SubtitleTrackIndex: -1,
+		TotalDuration:      1200,
+	})
+	// Near the produced head, so the request waits on the stall watchdog rather
+	// than scheduling an immediate far-seek restart.
+	const segmentName = "seg_00003.m4s"
+	deadline := time.Now().Add(5 * time.Second)
+	for transcodeSession.SegmentProgress(time.Now()).ProducedHead < 2 {
+		if time.Now().After(deadline) {
+			progress := transcodeSession.SegmentProgress(time.Now())
+			t.Fatalf("session never observed the initial produced head: %+v", progress)
+		}
+		time.Sleep(5 * time.Millisecond) //nolint:forbidigo // Segment files are the fake encoder's observable output.
+	}
+
+	start := time.Now()
+	rec := farSeekServe(t, handler, sessionID, segmentName)
+	elapsed := time.Since(start)
+	if rec.Code != http.StatusPreconditionFailed || !strings.Contains(rec.Body.String(), "stale_generation") {
+		t.Fatalf("stalled-head hold = %d %q, want 412 stale_generation", rec.Code, rec.Body.String())
+	}
+	if elapsed > playback.SeekRestartServeTimeout+3*time.Second {
+		t.Fatalf("stalled-head hold took %s, want the composed hold inside the 6s ceiling", elapsed)
+	}
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		if _, statErr := os.Stat(filepath.Join(outputDir, segmentName)); statErr == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("stalled-head restart never produced the requested segment")
+		}
+		time.Sleep(5 * time.Millisecond) //nolint:forbidigo // Segment files are the fake encoder's observable output.
 	}
 }

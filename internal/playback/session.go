@@ -2107,7 +2107,7 @@ func (m *SessionManager) SetVirtualProbeVerifiedInventoryIfBinding(sessionID str
 	// names a different track. The transport fails closed on that flag and the
 	// client replans; the default-audio reconcile that ran before this write
 	// against the plan-time selection has already issued the correction.
-	if remapped := remapAudioSelectionIndex(s.VirtualAudioTracks, s.AudioTrackIndex, audio); remapped >= 0 {
+	if remapped := RemapAudioSelectionIndex(s.VirtualAudioTracks, s.AudioTrackIndex, audio); remapped >= 0 {
 		s.AudioTrackIndex = remapped
 		s.VirtualAudioSelectionInvalid = false
 	} else if s.AudioTrackIndex >= 0 && s.AudioTrackIndex < len(s.VirtualAudioTracks) {

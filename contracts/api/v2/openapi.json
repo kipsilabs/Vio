@@ -40207,6 +40207,10 @@
           "playback_attempt_id": {
             "type": "string"
           },
+          "previous_playback_attempt_id": {
+            "description": "The attempt whose explicit audio and subtitle selections this restart should carry when the request names neither. Omit it for legacy client-identity carry.",
+            "type": "string"
+          },
           "profile_id": {
             "description": "Opaque identifier",
             "examples": [

@@ -91,3 +91,39 @@ func TestNodeMediaRoutesReportDecoderRejectedSource(t *testing.T) {
 		})
 	}
 }
+
+// TestNodeSegmentLatchedDecodeRejectionAnswersUnprocessableEntity proves a
+// latched async-restart decode failure surfaces the permanent decode verdict
+// (422) on the segment path instead of a 404 that would invite the player to
+// retry a source this node cannot decode.
+func TestNodeSegmentLatchedDecodeRejectionAnswersUnprocessableEntity(t *testing.T) {
+	const sessionID = "decode-rejected-latched-session"
+	server := newTestServer(t)
+	session, err := playback.StartTranscode(context.Background(), playback.TranscodeOpts{
+		SessionID:               sessionID,
+		OutputDir:               t.TempDir(),
+		FFmpegPath:              writeNodeFarSeekAnyStartFFmpeg(t),
+		TargetCodecVideo:        "h264",
+		TargetCodecAudio:        "aac",
+		SegmentDuration:         2,
+		SegmentRetentionSeconds: 600,
+	})
+	if err != nil {
+		t.Fatalf("StartTranscode: %v", err)
+	}
+	t.Cleanup(func() { _ = session.Close() })
+	server.sessions[sessionID] = session
+	server.lastAccess[sessionID] = time.Now()
+
+	session.RecordAsyncRestartFailure(playback.ErrSourceDecodeRejected)
+
+	target := "/transcode/" + sessionID + "/segment/seg_0.ts"
+	rr := httptest.NewRecorder()
+	server.handleSegment(rr, withNodeRouteParams(httptest.NewRequest(http.MethodGet, target, nil), map[string]string{"session_id": sessionID, "name": "seg_0.ts"}))
+	if rr.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want %d; body = %q", rr.Code, http.StatusUnprocessableEntity, rr.Body.String())
+	}
+	if got := rr.Header().Get(playback.DecodeErrorHeader); got != playback.DecodeErrorSourceRejectedCode {
+		t.Fatalf("%s = %q, want %q", playback.DecodeErrorHeader, got, playback.DecodeErrorSourceRejectedCode)
+	}
+}

@@ -21,7 +21,7 @@ func TestRemapAudioSelectionIndexReidentifiesCommittedTrack(t *testing.T) {
 		{Index: 3, Language: "pt", Codec: "eac3", Channels: 6, Layout: "5.1"},
 		{Index: 1, Language: "en", Codec: "aac", Channels: 2, Layout: "stereo"},
 	}
-	if got := remapAudioSelectionIndex(plan, 1, verified); got != 0 {
+	if got := RemapAudioSelectionIndex(plan, 1, verified); got != 0 {
 		t.Fatalf("remapped position = %d, want 0 (the reordered pt track)", got)
 	}
 }
@@ -41,7 +41,7 @@ func TestRemapAudioSelectionIndexMissingProbedIndexFailsClosed(t *testing.T) {
 		{Index: 1, Language: "en", Codec: "aac", Channels: 2, Layout: "stereo"},
 		{Index: 4, Language: "pt", Codec: "eac3", Channels: 6, Layout: "5.1"},
 	}
-	if got := remapAudioSelectionIndex(plan, 1, verified); got != -1 {
+	if got := RemapAudioSelectionIndex(plan, 1, verified); got != -1 {
 		t.Fatalf("remapped position = %d, want -1; a missing probed index must not fall through to another index", got)
 	}
 }
@@ -58,7 +58,7 @@ func TestRemapAudioSelectionIndexRemovalReturnsInvalid(t *testing.T) {
 	verified := []models.AudioTrack{
 		{Index: 1, Language: "en", Codec: "aac", Channels: 2, Layout: "stereo"},
 	}
-	if got := remapAudioSelectionIndex(plan, 1, verified); got != -1 {
+	if got := RemapAudioSelectionIndex(plan, 1, verified); got != -1 {
 		t.Fatalf("remapped position = %d, want -1 for a removed committed track", got)
 	}
 }
@@ -76,7 +76,7 @@ func TestRemapAudioSelectionIndexDuplicateSignatureFailsClosed(t *testing.T) {
 		{Index: 0, Language: "en", Codec: "aac", Channels: 2, Layout: "stereo"},
 		{Index: 1, Language: "en", Codec: "aac", Channels: 2, Layout: "stereo"},
 	}
-	if got := remapAudioSelectionIndex(plan, 0, verified); got != -1 {
+	if got := RemapAudioSelectionIndex(plan, 0, verified); got != -1 {
 		t.Fatalf("remapped position = %d, want -1 for a duplicate signature", got)
 	}
 }
@@ -95,7 +95,7 @@ func TestRemapAudioSelectionIndexAmbiguousExactMatchFailsClosed(t *testing.T) {
 		{Index: 0, Language: "en", Codec: "aac", Channels: 2, Layout: "stereo"},
 		{Index: 0, Language: "eng", Codec: "aac", Channels: 2, Layout: "stereo"},
 	}
-	if got := remapAudioSelectionIndex(plan, 0, verified); got != -1 {
+	if got := RemapAudioSelectionIndex(plan, 0, verified); got != -1 {
 		t.Fatalf("remapped position = %d, want -1: en/eng are canonically equal, so the exact match is ambiguous and must not fall through to the raw-string fallback", got)
 	}
 }
@@ -112,7 +112,7 @@ func TestRemapAudioSelectionIndexUniqueSignatureMatches(t *testing.T) {
 		{Index: 2, Language: "en", Codec: "aac", Channels: 2, Layout: "stereo", Title: "Commentary"},
 		{Index: 4, Language: "en", Codec: "eac3", Channels: 6, Layout: "5.1", Title: "Director"},
 	}
-	if got := remapAudioSelectionIndex(plan, 0, verified); got != 1 {
+	if got := RemapAudioSelectionIndex(plan, 0, verified); got != 1 {
 		t.Fatalf("remapped position = %d, want 1 (the Director track)", got)
 	}
 }
@@ -170,7 +170,7 @@ func TestRemapAudioSelectionIndexFallbackRejectsConflictingIdentity(t *testing.T
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := remapAudioSelectionIndex([]models.AudioTrack{tc.selected}, 0, tc.verified); got != tc.wantIndex {
+			if got := RemapAudioSelectionIndex([]models.AudioTrack{tc.selected}, 0, tc.verified); got != tc.wantIndex {
 				t.Fatalf("remapped position = %d, want %d (selected %+v, verified %+v)", got, tc.wantIndex, tc.selected, tc.verified)
 			}
 		})
@@ -578,7 +578,7 @@ func TestClientAudioSignatureMatchesTrackStrictMatchersUntouched(t *testing.T) {
 		{Index: 0, Language: "en", Codec: "aac", Channels: 2},
 		{Index: 0, Language: "eng", Codec: "aac", Channels: 2},
 	}
-	if got := remapAudioSelectionIndex(plan, 0, verified); got != -1 {
+	if got := RemapAudioSelectionIndex(plan, 0, verified); got != -1 {
 		t.Fatalf("remapped position = %d, want -1: probe-derived re-identification must stay fail-closed", got)
 	}
 }
