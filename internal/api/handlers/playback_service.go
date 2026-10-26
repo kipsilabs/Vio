@@ -1198,9 +1198,10 @@ func (h *PlaybackHandler) playbackInventoryForFileV3(ctx context.Context, sessio
 	inventoryRetryable := subErr != nil
 	if inventoryRetryable {
 		// Download/AI subtitle rows are an extension of the base inventory. A
-		// failed read must not turn the whole menu into a 503 the client renders
-		// as "no subtitles": serve the embedded and external tracks now and mark
-		// the read retryable so the next poll can pick the extension up.
+		// failed read means the base inventory is complete but the extension is
+		// missing, so it must not turn the whole menu into a 503 the client
+		// renders as "no subtitles": serve the embedded and external tracks now
+		// and mark the read retryable so the next poll can pick the extension up.
 		additional = nil
 		slog.WarnContext(ctx, "live inventory: downloaded subtitle rows unavailable; serving the base inventory",
 			"component", "api", "session", session.ID, "file_id", catalogFileIDOrZero(file), "error", subErr)
@@ -1236,8 +1237,11 @@ func (h *PlaybackHandler) playbackInventoryForFileV3(ctx context.Context, sessio
 	}
 	if inventoryRetryable {
 		// The base inventory is complete but the downloaded extension could not
-		// be read. Report pending (not failed) so the client keeps polling for
-		// the missing rows instead of treating the menu as final.
+		// be read: pending here means "base complete, extension missing", not
+		// "the probe has not landed". Report pending (not failed) so the client
+		// keeps its current menu and retries the extension with backoff instead
+		// of treating the menu as final. See docs/playback-api.md for the poll
+		// contract; do not busy-poll this endpoint.
 		status = probeOutcomePending
 	}
 
@@ -1320,11 +1324,14 @@ func (h *PlaybackHandler) inventoryEffectiveFile(ctx context.Context, file *mode
 		placeholder.ExternalSubtitles = nil
 		placeholder.ProbeUpdatedAt = nil
 		// No catalog row names the bound candidate, so no row's inventory may
-		// speak for it. The plan-time inventory the session carries is the only
-		// evidence that describes what the plan was built against; serve it
-		// instead of an empty placeholder so the overlay menu is not blank. This
-		// is a read-only overlay: the catalog and the transport are untouched.
-		if session != nil && session.VirtualSubtitleEvidenceSet {
+		// speak for it. The plan-time inventory the session carries describes
+		// that candidate only while its evidence URI still names the live
+		// binding; evidence captured before a binding rotation belongs to the
+		// previous release and is not overlaid under the new identity. This is
+		// a read-only overlay: the catalog and the transport are untouched.
+		evidenceNamesCandidate := session != nil && session.VirtualSubtitleEvidenceSet &&
+			sameVirtualCandidate(session.VirtualSubtitleEvidenceURI, candidateURI)
+		if evidenceNamesCandidate {
 			placeholder.AudioTracks = session.VirtualAudioTracks
 			placeholder.SubtitleTracks = session.VirtualSubtitleTracks
 			placeholder.ExternalSubtitles = session.VirtualExternalSubtitles
@@ -1336,12 +1343,18 @@ func (h *PlaybackHandler) inventoryEffectiveFile(ctx context.Context, file *mode
 		// candidate URI is not logged raw — its query can carry provider
 		// identifiers — so the log carries the provider-neutral path and the
 		// concrete candidate id instead.
-		slog.InfoContext(ctx, "virtual inventory serving session evidence fallback: no catalog row names the bound candidate",
+		logFields := []any{
 			"component", "api",
 			"file_id", file.ID,
 			"base_id", placeholder.ID,
 			"candidate_path", virtualPlaybackNeutralKey(candidateURI),
-			"candidate_id", virtualResultCandidateID(candidateURI))
+			"candidate_id", virtualResultCandidateID(candidateURI),
+		}
+		if evidenceNamesCandidate {
+			slog.InfoContext(ctx, "virtual inventory serving session evidence fallback: no catalog row names the bound candidate", logFields...)
+		} else {
+			slog.InfoContext(ctx, "virtual inventory serving fail-closed placeholder: no catalog row names the bound candidate", logFields...)
+		}
 	}
 	return bindSessionVirtualSourceWithTracks(ctx, base, session, h.fileResolver)
 }

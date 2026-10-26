@@ -527,7 +527,11 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 			// than silently reset to the container default. A selection with no
 			// equivalent on the replacement still degrades, but the reset is
 			// logged (and the plan keeps the requested identity for the client).
-			attemptOpts.AudioTrackIndex = remapFallbackAudioIndexV3(file, probedFacts, opts.AudioTrackIndex)
+			remappedAudioIndex := remapFallbackAudioIndexV3(file, probedFacts, opts.AudioTrackIndex)
+			attemptOpts.AudioTrackIndex = remappedAudioIndex
+			if remappedAudioIndex >= 0 {
+				logCrossReleaseAudioCarry(startupCtx, file, probedFacts, opts.AudioTrackIndex, remappedAudioIndex, resolvedMedia.CandidateID)
+			}
 			if probedFacts == nil && opts.AudioTrackIndex >= 0 {
 				slog.WarnContext(startupCtx, "cross-release virtual fallback could not probe the replacement; using its default audio track",
 					"component", "api", "file_id", catalogFileIDOrZero(file),
@@ -707,6 +711,31 @@ func remapFallbackAudioIndexV3(pinned, probed *models.MediaFile, requestedIndex 
 		return -1
 	}
 	return playback.MatchAudioTrackAcrossVersions(pinned.AudioTracks, probed.AudioTracks, requestedIndex)
+}
+
+// logCrossReleaseAudioCarry records the pinned→replacement audio mapping of a
+// successful cross-release fallback carry. The language/index pair on each side
+// is what an operator needs to tell a correct identity carry from a near-match;
+// a degrade to the container default stays with the caller's warning.
+func logCrossReleaseAudioCarry(ctx context.Context, pinned, probed *models.MediaFile, requestedIndex, remappedIndex int, candidateID string) {
+	if pinned == nil || probed == nil || requestedIndex < 0 || remappedIndex < 0 {
+		return
+	}
+	fromLanguage, toLanguage := "", ""
+	if requestedIndex < len(pinned.AudioTracks) {
+		fromLanguage = strings.TrimSpace(pinned.AudioTracks[requestedIndex].Language)
+	}
+	if remappedIndex < len(probed.AudioTracks) {
+		toLanguage = strings.TrimSpace(probed.AudioTracks[remappedIndex].Language)
+	}
+	slog.InfoContext(ctx, "cross-release virtual fallback carried the audio selection",
+		"component", "api",
+		"file_id", catalogFileIDOrZero(pinned),
+		"from_audio_index", requestedIndex,
+		"from_audio_language", fromLanguage,
+		"to_audio_index", remappedIndex,
+		"to_audio_language", toLanguage,
+		"candidate_id", candidateID)
 }
 
 // fireExpiredVirtualRefresh renews a lapsed virtual candidate's stored URL in
