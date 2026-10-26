@@ -19,6 +19,14 @@ import (
 // It supports HTTP conditional requests via ETag and If-None-Match: when the
 // client's cached inventory revision matches the server's current revision,
 // it responds with 304 Not Modified.
+//
+// A 200 response may carry inventory_status "pending" for two different
+// reasons: a deferred probe is still outstanding, or the base inventory is
+// complete and only the downloaded/AI subtitle extension could not be read.
+// Clients keep the current menu and poll again with backoff — about 2 seconds
+// for the first retry, backing off to at most one request every 20 seconds —
+// honoring ETag/If-None-Match. Do not busy-poll: the extension-side pending
+// state lasts as long as the subtitle store is unavailable.
 func (h *PlaybackHandler) HandleGetPlaybackInventoryV3(w http.ResponseWriter, r *http.Request) {
 	userID := apimw.GetUserID(r.Context())
 	if userID == 0 {

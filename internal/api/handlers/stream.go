@@ -2744,19 +2744,25 @@ func (h *StreamHandler) acceptedSubtitleSourceFileID(ctx context.Context, raw st
 	if !isVirtualPlaybackFile(row) {
 		return 0, err
 	}
-	// The row the session captured its evidence from is citable even after the
-	// row's path was adopted or renumbered: the URL was minted from that row's
-	// advertised inventory, and the evidence anchor is the durable name for it.
-	if evidenceID := session.VirtualSubtitleEvidenceFileID; evidenceID > 0 && requested == evidenceID {
+	// The row the session captured its evidence from is citable even after it
+	// was renumbered, but an evidence row id is not a content fingerprint: an
+	// in-place enrichment re-probe keeps the id while rewriting the path to a
+	// different result. The URL was minted from that row's advertised
+	// inventory, so it is admitted only while the row still names the
+	// session's live bound candidate.
+	namesBoundCandidate := sameVirtualCandidate(candidateURI, row.FilePath)
+	if evidenceID := session.VirtualSubtitleEvidenceFileID; evidenceID > 0 && requested == evidenceID && namesBoundCandidate {
 		return requested, nil
 	}
-	if sameVirtualCandidate(candidateURI, row.FilePath) {
+	if namesBoundCandidate {
 		return requested, nil
 	}
-	// A session whose binding URI was rewritten (or a legacy session with only
-	// an evidence URI) still admits the row that names its evidence candidate.
+	// A legacy session with only an evidence URI still admits a row that names
+	// its evidence candidate, but only while the evidence URI agrees with the
+	// live binding. A stale evidence anchor from a previous release must not
+	// widen the window after the session rotated.
 	evidenceURI := strings.TrimSpace(session.VirtualSubtitleEvidenceURI)
-	if evidenceURI != "" && sameVirtualCandidate(evidenceURI, row.FilePath) {
+	if evidenceURI != "" && sameVirtualCandidate(candidateURI, evidenceURI) && sameVirtualCandidate(evidenceURI, row.FilePath) {
 		return requested, nil
 	}
 	return 0, err

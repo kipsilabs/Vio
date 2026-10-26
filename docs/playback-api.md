@@ -41,14 +41,25 @@ tracks, never the previous release's. When no catalog row names the bound
 candidate at all, the response falls back to the inventory the running plan
 carried for that binding instead of an empty placeholder, so the player's
 overlay menu still lists what the plan committed to; the catalog is not
-rewritten by that read.
+rewritten by that read. That overlay is served only while the session's
+evidence URI still names the bound candidate. Evidence captured before a
+binding rotation belongs to the previous release, so the response keeps the
+empty fail-closed placeholder rather than presenting the old tracks under the
+new identity.
 
 The downloaded/AI subtitle rows are an extension of the base inventory. If that
 extension cannot be read, the endpoint still answers `200` with the embedded and
 external tracks and reports `inventory_status: pending`, rather than failing the
-whole menu with `503`. Clients should keep the current menu and poll again; a
+whole menu with `503`. Here `pending` means the base inventory is complete and
+only the extension is missing; it does not mean the base menu is unusable.
+Clients keep the current menu, honor the response `ETag` with `If-None-Match`,
+and retry with backoff: about 2 seconds for the first poll, backing off to at
+most one request every 20 seconds, and stopping on a terminal status or the
+realtime `inventory_updated` event. Do not busy-poll: while the subtitle store
+is unavailable the extension stays pending, and a tight loop only adds load. A
 later successful read includes the downloaded rows and reports a new
-`inventory_revision`.
+`inventory_revision`, so a client holding the degraded menu can replace it
+instead of staying on `304 Not Modified`.
 
 ### Deferred track inventory
 
