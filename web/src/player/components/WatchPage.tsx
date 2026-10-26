@@ -358,6 +358,20 @@ function WatchPagePlayer({
   const [realtimeConnectionState, setRealtimeConnectionState] = useState<
     "disconnected" | "connecting" | "connected"
   >("disconnected");
+  // Only a reconnection needs the player to re-read its watch detail. The
+  // first "connected" is the socket this player just opened, at the same moment
+  // the mounted detail query fetched; reconciling there duplicated that read.
+  // An epoch counts reconnections and the reconcile below consumes it once.
+  const realtimeConnectedOnceRef = useRef(false);
+  const [realtimeReconnectEpoch, setRealtimeReconnectEpoch] = useState(0);
+  useEffect(() => {
+    if (realtimeConnectionState !== "connected") return;
+    if (!realtimeConnectedOnceRef.current) {
+      realtimeConnectedOnceRef.current = true;
+      return;
+    }
+    setRealtimeReconnectEpoch((epoch) => epoch + 1);
+  }, [realtimeConnectionState]);
   const watchTogetherConnection = useWatchTogetherRoomConnection({
     roomId: watchTogetherRoomId,
     roomToken: watchTogetherRoomToken,
@@ -1161,9 +1175,23 @@ function WatchPagePlayer({
     playbackVersions,
   ]);
 
+  const handledRealtimeReconnectRef = useRef(0);
+  // A reconcile belongs to one content and reconnect generation. Keep the
+  // latest parent inputs in refs so a versions or liveness change landing while
+  // the read is in flight updates what the answer is stamped with instead of
+  // canceling the effect and discarding the reconcile.
+  const versionsRef = useRef(versions);
+  versionsRef.current = versions;
+  const versionLivenessRef = useRef(versionLiveness);
+  versionLivenessRef.current = versionLiveness;
+  const reconcileGeneration = `${contentId}\u0000${fileId ?? ""}\u0000${libraryId ?? ""}\u0000${realtimeReconnectEpoch}`;
+  const reconcileGenerationRef = useRef(reconcileGeneration);
+  reconcileGenerationRef.current = reconcileGeneration;
   useEffect(() => {
     if (
       realtimeConnectionState !== "connected" ||
+      realtimeReconnectEpoch === 0 ||
+      handledRealtimeReconnectRef.current === realtimeReconnectEpoch ||
       !session.sessionId ||
       !session.mediaFileId ||
       session.loading ||
@@ -1171,8 +1199,11 @@ function WatchPagePlayer({
     ) {
       return;
     }
+    // Claim the reconnect before the request so a versions or liveness identity
+    // change while it is in flight cannot start a second one.
+    handledRealtimeReconnectRef.current = realtimeReconnectEpoch;
 
-    let cancelled = false;
+    const generation = reconcileGeneration;
     // Same key as the mounted `useWatchDetail` query, but always read fresh: a
     // cached payload can predate a server-side inventory change. The fresh rows
     // carry no liveness, so the verdicts the parent stamped on its own copy are
@@ -1184,47 +1215,47 @@ function WatchPagePlayer({
         staleTime: 0,
       })
       .then((detail) => {
-        if (!cancelled) {
-          // The fresh server rows carry no liveness verdict; re-stamp the
-          // parent's checked verdicts onto them before replacing the list so
-          // the menu keeps its `available: false` warnings rather than dropping
-          // them until another projection fires.
-          const stamped = applyVersionAvailability(detail.versions, versionLiveness);
-          // A serve-layer rotation during the disconnect can move the effective
-          // source without changing the collapsed file id. Re-key the committed
-          // live source into the fresh list the same way a manual refresh does,
-          // so `activeVersion` follows the rotation instead of falling through
-          // to the first row.
-          const live = sessionRef.current;
-          setPlaybackVersions(
-            mergeResolvedLiveVersion(
-              stamped,
-              live.mediaFileId,
-              { mediaFileId: live.mediaFileId, effectiveVirtualUri: live.effectiveVirtualUri },
-              versions,
-            ),
-          );
-        }
+        // Only a newer content target or reconnect generation obsoletes this
+        // answer. Session, versions, and liveness movement while the read was
+        // in flight must not lose the reconcile for the generation that claimed
+        // it.
+        if (reconcileGenerationRef.current !== generation) return;
+
+        // The fresh server rows carry no liveness verdict; re-stamp the
+        // parent's current checked verdicts onto them before replacing the list
+        // so the menu keeps its `available: false` warnings rather than
+        // dropping them until another projection fires.
+        const stamped = applyVersionAvailability(detail.versions, versionLivenessRef.current);
+        // A serve-layer rotation during the disconnect can move the effective
+        // source without changing the collapsed file id. Re-key the committed
+        // live source into the fresh list the same way a manual refresh does,
+        // so `activeVersion` follows the rotation instead of falling through
+        // to the first row.
+        const live = sessionRef.current;
+        setPlaybackVersions(
+          mergeResolvedLiveVersion(
+            stamped,
+            live.mediaFileId,
+            { mediaFileId: live.mediaFileId, effectiveVirtualUri: live.effectiveVirtualUri },
+            versionsRef.current,
+          ),
+        );
       })
       .catch(() => {
         // Reconcile again on the next connection; keep the current markers meanwhile.
       });
-
-    return () => {
-      cancelled = true;
-    };
   }, [
     contentId,
     fileId,
     libraryId,
     queryClient,
     realtimeConnectionState,
+    realtimeReconnectEpoch,
+    reconcileGeneration,
     session.loading,
     session.mediaFileId,
     session.replacing,
     session.sessionId,
-    versionLiveness,
-    versions,
   ]);
 
   const handleRealtimeEvent = useCallback(

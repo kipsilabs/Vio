@@ -104,6 +104,10 @@ export function useWatchProgress(
           is_paused: options?.isPaused ?? snapshot.isPaused,
         },
         options?.keepalive,
+        // A forced pause (flush before stop, final keepalive) is the caller's
+        // answer, not the element's current one; the queue must not replace it
+        // with the live sample when its turn arrives.
+        { pinned: options?.isPaused !== undefined },
       );
     },
     [getProgressSnapshot, sessionId],

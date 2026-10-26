@@ -78,6 +78,7 @@ import {
 } from "../utils/bufferPolicy";
 import { isFirefoxUserAgent } from "../utils/browser";
 import { normalizeSubtitleMode } from "../utils/subtitleMode";
+import { buildWarmTransportRouteKey } from "../utils/warmTransport";
 import {
   markerOccurrenceAtTime,
   resolveAutoplayMarker,
@@ -2760,16 +2761,31 @@ export function VideoPlayer({
   // adopts, before the transport-init effect below tears down the element.
   // A copy remux's first bytes cost a cold ffmpeg start (1-3s); firing the
   // request now means the element's own load hits a warm remux.
-  const warmTransportUrlRef = useRef<string | null>(null);
+  //
+  // The warm is one extra connection to the transport, so it is limited to
+  // changes that need a server-side start: the same route at a new position
+  // (every seek reanchor) opens its own connection from the element a moment
+  // later, and a warm there spawns a second, identical remux seek. HLS needs
+  // none at all: hls.js fetches the playlist itself right after the transport
+  // is built, and the transcode has already been started by the plan.
+  // A new session is a new server-side transport even on the same route.
+  const warmRouteKey = useMemo(
+    () => `${sessionId}:${buildWarmTransportRouteKey(plan)}`,
+    [plan, sessionId],
+  );
+  // Seed the baseline with the route this player mounted on. The element's own
+  // load starts that first transport, so a position-only seek (new revision,
+  // same route) must compare equal here instead of looking like a transition.
+  const warmTransportRouteKeyRef = useRef<string | null>(warmRouteKey);
   const transportRevisionRef = useRef<number | null>(null);
   useEffect(() => {
     const url = effectiveStreamUrl;
-    if (!url || !isPlayerReady) return;
-    if (warmTransportUrlRef.current === url) return;
+    if (!url || !isPlayerReady || isHlsStream) return;
     if (!transportRevision || effectiveTransportRevision === transportRevisionRef.current) return; // unchanged transport
+    if (warmTransportRouteKeyRef.current === warmRouteKey) return; // same route, new position only
     transportRevisionRef.current = effectiveTransportRevision;
+    warmTransportRouteKeyRef.current = warmRouteKey;
     const controller = new AbortController();
-    warmTransportUrlRef.current = url;
     // Ask only for a small prefix and cancel after the first chunk. A plain
     // GET here downloads the whole remux (tens of megabytes per transport
     // change) in parallel with the element that is about to play it, which
@@ -2799,7 +2815,15 @@ export function VideoPlayer({
       clearTimeout(timer);
       controller.abort();
     };
-  }, [effectiveStreamUrl, effectiveTransportRevision, isPlayerReady, transportRevision]);
+  }, [
+    effectiveStreamUrl,
+    effectiveTransportRevision,
+    isHlsStream,
+    isPlayerReady,
+    sessionId,
+    transportRevision,
+    warmRouteKey,
+  ]);
   // Read by the transport effect, which reruns on planRevision rather than on
   // every input the original-file route depends on.
   const originalRouteInputRef = useRef({ plan, browserEngine, nativeOriginalSupport, audioTracks });
@@ -3502,13 +3526,21 @@ export function VideoPlayer({
       }
     };
 
+    // The icon is the element's state, never the player's wish: reading
+    // `paused` here keeps the two from drifting when a pause comes from
+    // somewhere other than the controls (a teardown's load, the startup guard
+    // refusing a play, the browser itself), whatever event happened to fire.
+    const reconcilePlaying = () => {
+      setPlaying(!video.paused && !video.ended);
+    };
     const onPlay = () => {
       // Nothing can play until the reconnect hands over a new transport.
       if (connectionReplacedRef.current || connectionStatusRef.current !== "connected") {
         video.pause();
+        reconcilePlaying();
         return;
       }
-      setPlaying(true);
+      reconcilePlaying();
       applyPrefetchTarget();
       const idleSince = transportIdleSinceRef.current;
       transportIdleSinceRef.current = null;
@@ -3518,7 +3550,7 @@ export function VideoPlayer({
     };
     const onPause = () => {
       resetRoomCatchupRate();
-      setPlaying(false);
+      reconcilePlaying();
       applyPrefetchTarget();
       // Only a stream that played or has opened. The pause a teardown queues
       // arrives after the next transport has started over, before it has
@@ -3561,6 +3593,7 @@ export function VideoPlayer({
       if (remainingRoomHeldSeek(roomHeldSeekRef.current, actualTime) === null) holdRoomSeek(null);
     };
     const onTimeUpdate = () => {
+      reconcilePlaying();
       const nextTime = toMediaTime(video.currentTime, timelineOffsetRef.current);
       releaseHeldSeekAt(nextTime);
       const resolved = resolveSeekAt(nextTime);
@@ -3630,6 +3663,9 @@ export function VideoPlayer({
       persistVolume(video.volume, viewerMuted);
     };
     const onWaiting = () => {
+      // A stall is not a pause: keep the icon on the element's own answer and
+      // only correct it if the element says it stopped.
+      reconcilePlaying();
       // Delay showing the spinner so brief buffering between segments
       // or during initial HLS startup doesn't flash a spinner.
       if (!bufferingTimerRef.current) {
@@ -3649,6 +3685,7 @@ export function VideoPlayer({
       }
     };
     const onPlaying = () => {
+      reconcilePlaying();
       clearBuffering();
       markPlaybackStarted();
       if (roomReadinessPending && watchTogetherSync.attachedSessionId === sessionId) {
@@ -3675,6 +3712,7 @@ export function VideoPlayer({
       }
     };
     const onVideoEnded = () => {
+      reconcilePlaying();
       // The stream finished, so there is nothing left to reopen.
       transportIdleSinceRef.current = null;
       if (endedFiredRef.current) return;
@@ -3689,8 +3727,16 @@ export function VideoPlayer({
       onEndedRef.current?.();
     };
 
+    // A transport teardown (`removeAttribute("src")` + `load()`) pauses the
+    // element as it resets it. Re-read the element at that boundary too, so a
+    // rebuilt transport starts from a truthful icon instead of the previous
+    // one's last state.
+    const onMediaReset = () => reconcilePlaying();
+
     video.addEventListener("play", onPlay);
     video.addEventListener("pause", onPause);
+    video.addEventListener("emptied", onMediaReset);
+    video.addEventListener("loadstart", onMediaReset);
     video.addEventListener("timeupdate", onTimeUpdate);
     video.addEventListener("seeking", onSeeking);
     video.addEventListener("seeked", onSeeked);
@@ -3709,6 +3755,8 @@ export function VideoPlayer({
     return () => {
       video.removeEventListener("play", onPlay);
       video.removeEventListener("pause", onPause);
+      video.removeEventListener("emptied", onMediaReset);
+      video.removeEventListener("loadstart", onMediaReset);
       video.removeEventListener("timeupdate", onTimeUpdate);
       video.removeEventListener("seeking", onSeeking);
       video.removeEventListener("seeked", onSeeked);
