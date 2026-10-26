@@ -4,6 +4,7 @@ import { act, render } from "@testing-library/react";
 import { MemoryRouter } from "react-router";
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import type { FileVersion, ItemDetail, Season } from "@/api/types";
+import { rememberRequestedFileId } from "@/playback/requestedVersion";
 import EpisodeContent from "./EpisodeContent";
 
 const mocks = vi.hoisted(() => {
@@ -349,6 +350,7 @@ describe("EpisodeContent", () => {
   });
 
   beforeEach(() => {
+    localStorage.clear();
     mocks.capturedActionBarProps.value = null;
     mocks.capturedDetailHeroProps.value = null;
     mocks.capturedMetadataBadgesProps.value = null;
@@ -432,6 +434,37 @@ describe("EpisodeContent", () => {
         videoRangeLabel: "",
         audioLabel: "AAC",
       },
+    });
+  });
+
+  // Completing an episode writes the viewer's requested row to the device
+  // store; a fresh server-backed detail still names the effective candidate in
+  // `last_file_id` because progress and history record the row that served the
+  // bytes. The page must keep the viewer's own pick selected instead.
+  it("keeps the viewer's requested row selected over a fresh last-played substitute", () => {
+    const substitute = makeFileVersion({ file_id: 1, resolution: "2160p" });
+    const requested = makeFileVersion({ file_id: 2, resolution: "1080p" });
+    rememberRequestedFileId("episode-1", requested.file_id);
+
+    render(
+      <MemoryRouter initialEntries={["/item/episode-1"]}>
+        <EpisodeContent
+          item={makeEpisodeItem({
+            versions: [substitute, requested],
+            user_data: {
+              played: false,
+              position_seconds: 600,
+              duration_seconds: 2520,
+              last_file_id: substitute.file_id,
+            },
+          })}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(mocks.capturedActionBarProps.value).toMatchObject({
+      selectedVersion: expect.objectContaining({ file_id: requested.file_id }),
+      selectedVersionMissing: false,
     });
   });
 

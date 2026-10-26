@@ -40,6 +40,11 @@ interface VersionDropdownProps {
   versions: FileVersion[];
   playbackVariants?: PlaybackVariant[];
   selectedVersion: FileVersion | null;
+  /**
+   * The previously selected row is gone. Keep the menu open for a replacement
+   * without treating any remaining row as the current selection.
+   */
+  selectionMissing?: boolean;
   onSelectVersion: (version: FileVersion) => void;
   /**
    * The item content id. When present, opening the picker reads the watch
@@ -75,6 +80,7 @@ function VersionDropdown({
   versions,
   playbackVariants,
   selectedVersion,
+  selectionMissing = false,
   onSelectVersion,
   contentId,
   onOpenChange,
@@ -112,12 +118,19 @@ function VersionDropdown({
     new Set(editionOptions.map((option) => option.label.toLowerCase())).size > 1 &&
     hasNamedEditions;
 
-  const selectedEdition = showEditionDropdown
-    ? resolveSelectedEditionOption(editionOptions, selectedVersion)
-    : null;
+  // A vanished pick is not evidence that the first edition is the chosen one:
+  // scoping the list to it would hide every other edition's survivors and
+  // checkmark an edition the page never selected.
+  const selectedEdition =
+    showEditionDropdown && !selectionMissing
+      ? resolveSelectedEditionOption(editionOptions, selectedVersion)
+      : null;
   const activeVersions = selectedEdition?.versions ?? sorted;
-  const activeVersion =
-    selectedVersion ?? selectedEdition?.defaultVersion ?? activeVersions[0] ?? null;
+  // A vanished pick has no current row. Rendering the first remaining row as
+  // selected would make the menu claim a choice the page never made.
+  const activeVersion = selectionMissing
+    ? null
+    : (selectedVersion ?? selectedEdition?.defaultVersion ?? activeVersions[0] ?? null);
 
   // The viewer's per-profile display order. It only re-orders the list below;
   // the server's auto-pick is untouched.
@@ -126,7 +139,10 @@ function VersionDropdown({
   // virtual ranking; both live on the watch detail. Read it lazily when the
   // picker opens (the same query the player uses) and merge by file id, so the
   // rows show the score and the ranking the server actually applied.
-  const { data: watch } = useWatchDetail(contentId, undefined, undefined, {
+  // The same cache key the ActionBar reads for the selected row: one watch
+  // detail per selection, so the picker's badges and the popovers below it can
+  // never disagree about the row's tracks.
+  const { data: watch } = useWatchDetail(contentId, selectedVersion?.file_id, undefined, {
     enabled: versionOpen && !!contentId,
   });
   // Indexer releases are read from the same watch detail the picker already
@@ -138,7 +154,10 @@ function VersionDropdown({
   // A title with nothing but indexer releases still gets the picker, so the
   // viewer can request one even before any playable version exists.
   const showVersionDropdown =
-    activeVersions.length > 1 || indexerReleases.length > 0 || !!onRefreshVersions;
+    activeVersions.length > 1 ||
+    indexerReleases.length > 0 ||
+    !!onRefreshVersions ||
+    (selectionMissing && activeVersions.length > 0);
   const serverRanking = useMemo(
     () =>
       serverRankingFromVersions(

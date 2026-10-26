@@ -47,14 +47,18 @@ const selectedVersion: FileVersion = {
   bitrate: 0,
 };
 
-function renderActionBar(overrides: Partial<ActionBarProps> = {}) {
-  return render(
+function actionBarUi(overrides: Partial<ActionBarProps> = {}) {
+  return (
     <QueryClientProvider client={new QueryClient()}>
       <MemoryRouter>
         <ActionBar playHref="/watch/movie-1" {...overrides} />
       </MemoryRouter>
-    </QueryClientProvider>,
+    </QueryClientProvider>
   );
+}
+
+function renderActionBar(overrides: Partial<ActionBarProps> = {}) {
+  return render(actionBarUi(overrides));
 }
 
 describe("ActionBar", () => {
@@ -202,6 +206,71 @@ describe("ActionBar", () => {
     expect(startPlayback).toHaveBeenCalledOnce();
     const arg = startPlayback.mock.calls[0]?.[0] as { forceRelink?: boolean } | undefined;
     expect(arg?.forceRelink).toBeUndefined();
+  });
+
+  it("sends forceRelink from the overflow restart path too", () => {
+    const unavailableVersion: FileVersion = { ...selectedVersion, available: false };
+    const secondVersion: FileVersion = { ...selectedVersion, file_id: 2, resolution: "2160p" };
+    renderActionBar({
+      selectedVersion: unavailableVersion,
+      versions: [unavailableVersion, secondVersion],
+      contentId: "movie-1",
+      playHref: "/watch/movie-1",
+      playLabel: "Resume",
+      restartHref: "/watch/movie-1?restart=1",
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "More actions" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Play from Beginning" }));
+
+    expect(startPlayback).toHaveBeenCalledOnce();
+    const arg = startPlayback.mock.calls[0]?.[0] as
+      | { fileId?: number; forceRelink?: boolean }
+      | undefined;
+
+    expect(arg?.fileId).toBe(unavailableVersion.file_id);
+    expect(arg?.forceRelink).toBe(true);
+  });
+
+  it("offers a replacement row when the chosen version vanished", () => {
+    const replacement = { ...selectedVersion, file_id: 2, resolution: "2160p" };
+    const onSelectVersion = vi.fn();
+    const view = renderActionBar({
+      playHref: "/watch/movie-1",
+      selectedVersion: null,
+      selectedVersionMissing: true,
+      versions: [replacement],
+      onSelectVersion,
+    });
+
+    expect(screen.getByRole("button", { name: "Version unavailable" })).toBeDisabled();
+    expect(
+      screen.getByText("The selected version is no longer available. Pick a version to play."),
+    ).toBeInTheDocument();
+    expect(startPlayback).not.toHaveBeenCalled();
+
+    // The picker is reachable even though only one replacement remains, and it
+    // does not pretend that row is already selected.
+    fireEvent.click(screen.getByRole("button", { name: "Version" }));
+    fireEvent.click(screen.getByRole("button", { name: /2160p/ }));
+    expect(onSelectVersion).toHaveBeenCalledWith(replacement);
+    expect(startPlayback).not.toHaveBeenCalled();
+
+    // The page applies the pick: Play becomes available and starts that row.
+    view.rerender(
+      actionBarUi({
+        contentId: "movie-1",
+        playHref: "/watch/movie-1",
+        selectedVersion: replacement,
+        selectedVersionMissing: false,
+        versions: [replacement],
+        onSelectVersion,
+      }),
+    );
+    const play = screen.getByRole("button", { name: "Play" });
+    expect(play).toBeEnabled();
+    fireEvent.click(play);
+    expect(startPlayback).toHaveBeenCalledOnce();
   });
 });
 
