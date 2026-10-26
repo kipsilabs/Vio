@@ -36,6 +36,7 @@ import MediaInfoDialog from "./components/MediaInfoDialog";
 import SubtitleSearchDialog from "./components/SubtitleSearchDialog";
 import { sortByResolution } from "./components/VersionFlyout";
 import { selectDefaultPlaybackVariantVersion } from "./components/versionRankingUtils";
+import { readRequestedFileId, rememberRequestedFileId } from "@/playback/requestedVersion";
 import { resolveSelectedMediaSummary } from "./components/selectedMediaSummary";
 import { RecommendationGridSkeleton } from "./components/SectionSkeletons";
 import { resolveLeafPrimaryAction } from "./itemDetailLayout";
@@ -110,6 +111,10 @@ export default function MovieContent({
   const sortedVersions = useMemo(() => sortByResolution(item.versions), [item.versions]);
   const userData =
     item.user_data && "position_seconds" in item.user_data ? item.user_data : undefined;
+  // The viewer's own pick, remembered on this device. It outlives the server's
+  // `last_file_id`, which names whichever row actually served the bytes after
+  // a substitution. Read on mount: a pick made in place is held in state below.
+  const requestedFileId = useMemo(() => readRequestedFileId(item.content_id), [item.content_id]);
   const defaultSelectedVersion = useMemo(
     () =>
       selectDefaultPlaybackVariantVersion(
@@ -118,11 +123,13 @@ export default function MovieContent({
         userData,
         qualityPreference,
         item.effective_version_edition_key,
+        requestedFileId,
       ),
     [
       qualityPreference,
       item.effective_version_edition_key,
       item.playback_variants,
+      requestedFileId,
       sortedVersions,
       userData,
     ],
@@ -147,9 +154,12 @@ export default function MovieContent({
   const [manualSelectedFileId, setManualSelectedFileId] = useState<number | null>(null);
   // A chosen row that the enrichment refresh no longer carries is a pick-again
   // state, not permission to silently show and play another version. The same
-  // applies to the persisted last-watched row on a fresh mount.
+  // applies to the persisted last-watched row on a fresh mount. The device's
+  // requested row is checked first: it is the viewer's pick, while the server's
+  // last file names whatever served the bytes after a substitution.
   const persistedSelectedFileId =
     manualSelectedFileId ??
+    requestedFileId ??
     (userData && "last_file_id" in userData ? (userData.last_file_id ?? null) : null);
   const selectedVersionMissing =
     persistedSelectedFileId != null &&
@@ -196,13 +206,19 @@ export default function MovieContent({
     setSubtitleSelectionMode("auto");
     setExplicitSubtitleSelection(null);
   }
-  const handleSelectVersion = useCallback((version: FileVersion) => {
-    setManualSelectedFileId(version.file_id);
-    setAudioSelectionMode("auto");
-    setExplicitAudioTrackIndex(null);
-    setSubtitleSelectionMode("auto");
-    setExplicitSubtitleSelection(null);
-  }, []);
+  const handleSelectVersion = useCallback(
+    (version: FileVersion) => {
+      setManualSelectedFileId(version.file_id);
+      // Remember the pick across reloads: the server records the row that
+      // actually plays, which may be a substitute for this one.
+      rememberRequestedFileId(item.content_id, version.file_id);
+      setAudioSelectionMode("auto");
+      setExplicitAudioTrackIndex(null);
+      setSubtitleSelectionMode("auto");
+      setExplicitSubtitleSelection(null);
+    },
+    [item.content_id],
+  );
 
   const handleSelectAudioTrack = useCallback((trackIndex: number) => {
     setAudioSelectionMode("explicit");

@@ -234,7 +234,20 @@ export function selectDefaultPlaybackVariantVersion(
   userData?: LeafItemUserData,
   qualityPreference?: string | null,
   preferredEditionKey?: string | null,
+  requestedFileId?: number | null,
 ): FileVersion | null {
+  // The viewer's own request outranks every server hint: progress persistence
+  // records the row that actually served the bytes, so `last_file_id` can name
+  // a substitute for the neutral or requested row they picked. Keep the request
+  // while the catalog still carries it; a row it dropped stays missing so the
+  // page asks for a new pick rather than choosing silently.
+  if (requestedFileId != null) {
+    const requested = versions.find((version) => version.file_id === requestedFileId);
+    if (requested) {
+      return requested;
+    }
+  }
+
   if (!playbackVariants || playbackVariants.length === 0) {
     return selectDefaultVersion(versions, userData, qualityPreference, preferredEditionKey);
   }
