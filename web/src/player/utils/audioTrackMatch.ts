@@ -59,6 +59,34 @@ function sameSignature(a: AudioInventoryTrack, b: AudioInventoryTrack): boolean 
   );
 }
 
+/** Raw language tags, order-insensitive, keeping und/mul that `languageSet` drops. */
+function sameRawLanguages(a: AudioInventoryTrack, b: AudioInventoryTrack): boolean {
+  const raw = (track: AudioInventoryTrack) =>
+    (track.languages?.length ? track.languages : track.language ? [track.language] : [])
+      .map(normalize)
+      .filter(Boolean)
+      .sort();
+  const left = raw(a);
+  const right = raw(b);
+  return left.length === right.length && left.every((code, index) => code === right[index]);
+}
+
+/**
+ * Compares two rows that already share an id. Unlike `sameSignature`, this
+ * keeps undetermined/multiple language tags: those carry no matching intent for
+ * a pick, but they are still identity evidence for a known id pair.
+ */
+function sameTrackDescriptor(a: AudioInventoryTrack, b: AudioInventoryTrack): boolean {
+  return (
+    normalize(a.codec) === normalize(b.codec) &&
+    normalize(a.layout) === normalize(b.layout) &&
+    (a.channels ?? 0) === (b.channels ?? 0) &&
+    normalize(a.title) === normalize(b.title) &&
+    normalize(a.embedded_title) === normalize(b.embedded_title) &&
+    sameRawLanguages(a, b)
+  );
+}
+
 /** The sole index matching `predicate`, or null when none or several do. */
 function uniqueMatch<T>(items: readonly T[], predicate: (item: T) => boolean): number | null {
   let found: number | null = null;
@@ -154,12 +182,47 @@ export function resolveAudioPickIdentity(
 }
 
 /**
+ * Whether a direct `track_id` lookup can be trusted across the two lists.
+ *
+ * The server derives an audio id from the file id and the track's published
+ * ordinal, so a replacement inventory can reuse the same ids for different
+ * tracks. A lookup is only an identity match when every non-empty id in the
+ * plan appears in the displayed list and names the track with the same
+ * descriptor. An ID-less list shares no identity mapping.
+ */
+function sharesAudioIdMapping(
+  planTracks: readonly AudioInventoryTrack[],
+  displayed: readonly AudioInventoryTrack[],
+): boolean {
+  if (displayed === planTracks) return true;
+
+  const planById = new Map<string, AudioInventoryTrack>();
+  for (const track of planTracks) {
+    const id = (track.track_id ?? "").trim();
+    if (id) planById.set(id, track);
+  }
+  if (planById.size === 0) return false;
+
+  let seen = 0;
+  for (const track of displayed) {
+    const id = (track.track_id ?? "").trim();
+    if (!id) return false;
+    const planTrack = planById.get(id);
+    if (!planTrack || !sameTrackDescriptor(planTrack, track)) return false;
+    seen += 1;
+  }
+  return seen === planById.size;
+}
+
+/**
  * Maps the committed plan selection onto the inventory the menu currently
  * renders. `applyAudioInventory` can replace that list with probed catalog rows
  * that carry no stable id, so the marker follows the matched row (signature
- * first, then language) rather than the plan ordinal. `-1` means no row in the
- * applied list is the committed track: lighting an unrelated row would be worse
- * than showing no marker.
+ * first, then language) rather than the plan ordinal. A direct id lookup is
+ * only used when both lists agree on what each id names; otherwise a re-minted
+ * replacement id could mark an unrelated track. `-1` means no row in the
+ * applied list is the committed track: lighting an unrelated row would be
+ * worse than showing no marker.
  */
 export function resolveAppliedAudioIndex(
   planTracks: readonly AudioInventoryTrack[],
@@ -178,10 +241,10 @@ export function resolveAppliedAudioIndex(
     return selected.index != null && selected.index < displayed.length ? selected.index : -1;
   }
 
-  const directId = displayed.findIndex(
-    (track) => (track.track_id ?? "").trim() === (planTrack.track_id ?? "").trim(),
-  );
-  if (directId >= 0) return directId;
+  if (selectedId !== "" && sharesAudioIdMapping(planTracks, displayed)) {
+    const directId = displayed.findIndex((track) => (track.track_id ?? "").trim() === selectedId);
+    if (directId >= 0) return directId;
+  }
 
   const matched = matchPlanTrack(displayed, planTrack);
   if (matched) return displayed.indexOf(matched);

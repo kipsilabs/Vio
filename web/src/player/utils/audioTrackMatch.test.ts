@@ -177,4 +177,59 @@ describe("resolveAppliedAudioIndex", () => {
     ];
     expect(resolveAppliedAudioIndex(plan, displayed, { id: "file:7:audio:0", index: 0 })).toBe(-1);
   });
+
+  it("matches by track evidence when a replacement re-mints ids in swapped slots", () => {
+    // The server derives an audio id from the file id and the published
+    // ordinal. A replacement inventory therefore reuses the same ids with the
+    // languages swapped: English's old id now names Spanish.
+    const reminted: AudioInventoryTrack[] = [
+      {
+        codec: "ac3",
+        channels: 2,
+        layout: "stereo",
+        language: "spa",
+        track_id: "file:7:audio:0",
+      },
+      {
+        codec: "eac3",
+        channels: 6,
+        layout: "5.1",
+        language: "eng",
+        track_id: "file:7:audio:1",
+      },
+    ];
+
+    expect(resolveAppliedAudioIndex(plan, reminted, { id: "file:7:audio:0", index: 0 })).toBe(1);
+  });
+
+  it("trusts a shared id mapping when the language is undetermined", () => {
+    // und/mul names carry no language intent for descriptor matching, but the
+    // same id and fields are still enough to know both lists name one track.
+    const undPlan: AudioInventoryTrack[] = [
+      { codec: "ac3", channels: 2, language: "und", track_id: "file:7:audio:0" },
+    ];
+    const undDisplayed: AudioInventoryTrack[] = [
+      { codec: "ac3", channels: 2, language: "und", track_id: "file:7:audio:0" },
+    ];
+
+    expect(
+      resolveAppliedAudioIndex(undPlan, undDisplayed, { id: "file:7:audio:0", index: 0 }),
+    ).toBe(0);
+  });
+
+  it("does not treat two missing ids as an identity match", () => {
+    // Both inventories are ID-less. The committed selection is Spanish at plan
+    // index 1, but a direct id lookup compares empty strings and would
+    // otherwise mark the first displayed row (English).
+    const idlessPlan: AudioInventoryTrack[] = [
+      { codec: "eac3", channels: 6, layout: "5.1", language: "eng" },
+      { codec: "ac3", channels: 2, layout: "stereo", language: "spa" },
+    ];
+    const idlessDisplayed: AudioInventoryTrack[] = [
+      { codec: "eac3", channels: 6, layout: "5.1", language: "eng" },
+      { codec: "ac3", channels: 2, layout: "stereo", language: "spa" },
+    ];
+
+    expect(resolveAppliedAudioIndex(idlessPlan, idlessDisplayed, { id: "", index: 1 })).toBe(1);
+  });
 });
