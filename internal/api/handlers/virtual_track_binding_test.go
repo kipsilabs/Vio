@@ -10,6 +10,64 @@ import (
 	"github.com/Silo-Server/silo-server/internal/playback"
 )
 
+// A re-key accepts an echoed identity only when its row may describe the same
+// release. Pin the neutral-row breadth both ways: the same candidate path is
+// accepted, a different concrete result= path is rejected, and a provider-
+// neutral requested row accepts any concrete sibling within its profile scope.
+func TestVirtualRowsNameSameReleaseNeutralRowBreadth(t *testing.T) {
+	neutral := &models.MediaFile{ID: 100, Container: "virtual", FilePath: "virtual://movie/tt?profile=hd"}
+	shared := &models.MediaFile{ID: 200, Container: "virtual", FilePath: "virtual://movie/tt?profile=hd&result=abc"}
+	sibling := &models.MediaFile{ID: 300, Container: "virtual", FilePath: "virtual://movie/tt?profile=hd&result=xyz"}
+	concrete := &models.MediaFile{ID: 201, Container: "virtual", FilePath: "virtual://movie/tt?profile=hd&result=abc"}
+	otherProfile := &models.MediaFile{ID: 400, Container: "virtual", FilePath: "virtual://movie/tt?profile=sd&result=abc"}
+	otherTitle := &models.MediaFile{ID: 500, Container: "virtual", FilePath: "virtual://movie/other?profile=hd&result=abc"}
+
+	if !virtualRowsNameSameReleaseV3(neutral, shared) {
+		t.Fatal("neutral requested row rejected a concrete sibling in its profile scope")
+	}
+	if !virtualRowsNameSameReleaseV3(neutral, sibling) {
+		t.Fatal("neutral requested row rejected another concrete sibling in its profile scope")
+	}
+	if virtualRowsNameSameReleaseV3(neutral, otherProfile) {
+		t.Fatal("neutral requested row accepted a different profile scope")
+	}
+	if virtualRowsNameSameReleaseV3(neutral, otherTitle) {
+		t.Fatal("neutral requested row accepted a different content path")
+	}
+	if !virtualRowsNameSameReleaseV3(concrete, shared) {
+		t.Fatal("same concrete result= path was not accepted")
+	}
+	if virtualRowsNameSameReleaseV3(concrete, sibling) {
+		t.Fatal("a different concrete result= path was accepted as the same release")
+	}
+	if !virtualRowsNameSameReleaseV3(neutral, &models.MediaFile{ID: 202, Container: "virtual", FilePath: "virtual://movie/tt?profile=hd&result=abc"}) {
+		t.Fatal("duplicate concrete rows for one result= path were rejected")
+	}
+	local := &models.MediaFile{ID: 600, FilePath: "/media/movie.mkv"}
+	if virtualRowsNameSameReleaseV3(local, local) {
+		t.Fatal("a local file was accepted as a virtual candidate row")
+	}
+}
+
+// Concrete siblings are interchangeable only when the requested row is neutral.
+// Once the viewer pinned a concrete result= pick, another sibling is a release
+// substitution, even though both share one provider-neutral profile scope.
+func TestVirtualRowsNameSameReleaseSiblingSemantics(t *testing.T) {
+	pinnedA := &models.MediaFile{ID: 200, Container: "virtual", FilePath: "virtual://movie/tt?profile=hd&result=a"}
+	pinnedB := &models.MediaFile{ID: 201, Container: "virtual", FilePath: "virtual://movie/tt?profile=hd&result=b"}
+	neutral := &models.MediaFile{ID: 100, Container: "virtual", FilePath: "virtual://movie/tt?profile=hd"}
+
+	if virtualRowsNameSameReleaseV3(pinnedA, pinnedB) {
+		t.Fatal("concrete siblings with different result= ids were treated as one release")
+	}
+	if virtualRowsNameSameReleaseV3(pinnedB, neutral) {
+		t.Fatal("a neutral row was accepted as the concrete pinned release's sibling")
+	}
+	if !virtualRowsNameSameReleaseV3(neutral, pinnedB) {
+		t.Fatal("the neutral row did not accept the concrete sibling it may resolve to")
+	}
+}
+
 // The serve overlay must carry the session's plan-time audio inventory with the
 // subtitle inventory. The bound row here is a placeholder with no audio of its
 // own; before the fix the overlay applied subtitles only, so the serve and
@@ -270,7 +328,7 @@ func TestReplanRemapSourceUsesPlanTimeEvidence(t *testing.T) {
 	}
 	handler := &PlaybackHandler{}
 
-	source := handler.replanRemapSourceV3(reloadedRow, session)
+	source := handler.replanRemapSourceV3(reloadedRow, session, nil)
 	if source.ID != reloadedRow.ID {
 		t.Fatalf("remap source id = %d, want the same catalog row", source.ID)
 	}
@@ -302,10 +360,10 @@ func TestReplanRemapSourceUsesPlanTimeEvidence(t *testing.T) {
 func TestReplanRemapSourceFallsBackToLoadedRow(t *testing.T) {
 	row := &models.MediaFile{ID: 7, AudioTracks: []models.AudioTrack{{Codec: "aac"}}}
 	handler := &PlaybackHandler{}
-	if got := handler.replanRemapSourceV3(row, &playback.Session{}); got != row {
+	if got := handler.replanRemapSourceV3(row, &playback.Session{}, nil); got != row {
 		t.Fatalf("remap source = %v, want the loaded row", got)
 	}
-	if got := handler.replanRemapSourceV3(row, nil); got != row {
+	if got := handler.replanRemapSourceV3(row, nil, nil); got != row {
 		t.Fatalf("remap source with nil session = %v, want the loaded row", got)
 	}
 }
@@ -324,7 +382,7 @@ func TestReplanRemapSourceUsesEvidenceAcrossCandidates(t *testing.T) {
 		VirtualAudioTracks:         []models.AudioTrack{{Codec: "aac", Language: "fra"}},
 	}
 	handler := &PlaybackHandler{}
-	source := handler.replanRemapSourceV3(row, session)
+	source := handler.replanRemapSourceV3(row, session, nil)
 	if source == row {
 		t.Fatal("a remap must use the plan-time evidence, not the reloaded row")
 	}
@@ -344,7 +402,7 @@ func TestReplanRemapSourceIgnoresEvidenceForLocalFile(t *testing.T) {
 		VirtualAudioTracks:         []models.AudioTrack{{Codec: "aac", Language: "fra"}},
 	}
 	handler := &PlaybackHandler{}
-	if got := handler.replanRemapSourceV3(row, session); got != row {
+	if got := handler.replanRemapSourceV3(row, session, nil); got != row {
 		t.Fatalf("local file remapped from virtual evidence: %+v", got.AudioTracks)
 	}
 }
@@ -510,7 +568,7 @@ func TestReplanRemapSourceUsesCapturedEmptyEvidence(t *testing.T) {
 	}
 	handler := &PlaybackHandler{}
 
-	source := handler.replanRemapSourceV3(row, session)
+	source := handler.replanRemapSourceV3(row, session, nil)
 	if source == row {
 		t.Fatal("captured-empty evidence fell back to the newly populated row")
 	}
@@ -537,7 +595,7 @@ func TestReplanRemapSourceAbsentEvidenceFallsBackToRow(t *testing.T) {
 		VirtualSubtitleEvidenceSet: false,
 	}
 	handler := &PlaybackHandler{}
-	if got := handler.replanRemapSourceV3(row, session); got != row {
+	if got := handler.replanRemapSourceV3(row, session, nil); got != row {
 		t.Fatalf("absent evidence remap source = %+v, want the loaded row", got)
 	}
 }
@@ -561,7 +619,7 @@ func TestReplanRemapSourcePopulatedEvidenceAgainstNewlyPopulatedRow(t *testing.T
 	}
 	handler := &PlaybackHandler{}
 
-	source := handler.replanRemapSourceV3(row, session)
+	source := handler.replanRemapSourceV3(row, session, nil)
 	if source == row {
 		t.Fatal("populated evidence fell back to the newly populated row")
 	}
@@ -610,7 +668,7 @@ func TestReplanRemapSourceAudioAndSubtitleEvidenceIndependent(t *testing.T) {
 		session := baseSession()
 		session.VirtualSubtitleTracks = []models.SubtitleTrack{{Index: 1, Codec: "subrip", Language: "fra"}}
 		row := newRow()
-		source := handler.replanRemapSourceV3(row, session)
+		source := handler.replanRemapSourceV3(row, session, nil)
 		if len(source.AudioTracks) != 0 {
 			t.Fatalf("captured-empty audio was repopulated from the row: %+v", source.AudioTracks)
 		}
@@ -634,7 +692,7 @@ func TestReplanRemapSourceAudioAndSubtitleEvidenceIndependent(t *testing.T) {
 		session := baseSession()
 		session.VirtualAudioTracks = []models.AudioTrack{{Codec: "aac", Language: "fra", Channels: 2}}
 		row := newRow()
-		source := handler.replanRemapSourceV3(row, session)
+		source := handler.replanRemapSourceV3(row, session, nil)
 		if len(source.AudioTracks) != 1 || source.AudioTracks[0].Language != "fra" {
 			t.Fatalf("captured audio was lost: %+v", source.AudioTracks)
 		}
@@ -672,7 +730,7 @@ func TestCapturedEmptyEvidenceDoesNotInventOldSelection(t *testing.T) {
 		VirtualSubtitleEvidenceURI: "virtual://movie/tt-row?result=candidate-a",
 	}
 	handler := &PlaybackHandler{}
-	source := handler.replanRemapSourceV3(row, session)
+	source := handler.replanRemapSourceV3(row, session, nil)
 
 	index := 0
 	request := playback.StartRequestV3{

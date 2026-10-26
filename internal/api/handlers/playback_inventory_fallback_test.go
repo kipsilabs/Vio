@@ -127,6 +127,42 @@ func TestPlaybackInventoryRevisionChangesWhenDownloadedExtensionRecovers(t *test
 	}
 }
 
+// The reverse transition must also move the revision: a healthy inventory whose
+// downloaded extension becomes unreadable reports pending and a different
+// revision, so a client holding the healthy ETag cannot keep the stale menu.
+func TestPlaybackInventoryRevisionChangesWhenDownloadedExtensionDegrades(t *testing.T) {
+	file := v3HandlerFixtureFile(t)
+	file.SubtitleTracks = []models.SubtitleTrack{{Index: 0, Language: "en", Codec: "subrip"}}
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), testPlaybackFileResolver{file: file})
+	repo := newMockSubtitleRepoForHandler()
+	handler.SubtitleRepo = repo
+	session := &playback.Session{ID: "session-degrade", MediaFileID: file.ID}
+
+	repo.list = []subtitles.DownloadedSubtitle{{ID: 71, MediaFileID: file.ID, Format: subtitles.FormatSRT, Language: "eng"}}
+	healthy, err := handler.playbackInventoryForFileV3(context.Background(), session, nil, file, "")
+	if err != nil {
+		t.Fatalf("healthy inventory returned %v", err)
+	}
+	if healthy.InventoryStatus == probeOutcomePending {
+		t.Fatalf("healthy inventory_status = %q, want a terminal status", healthy.InventoryStatus)
+	}
+
+	repo.listErr = errors.New("downloaded subtitle store unavailable")
+	degraded, err := handler.playbackInventoryForFileV3(context.Background(), session, nil, file, "")
+	if err != nil {
+		t.Fatalf("degraded inventory returned %v", err)
+	}
+	if degraded.InventoryStatus != probeOutcomePending {
+		t.Fatalf("degraded inventory_status = %q, want pending", degraded.InventoryStatus)
+	}
+	if degraded.InventoryRevision == healthy.InventoryRevision {
+		t.Fatalf("inventory revision stayed %q after the downloaded extension became unreadable", degraded.InventoryRevision)
+	}
+	if len(degraded.SubtitleInventory) >= len(healthy.SubtitleInventory) {
+		t.Fatalf("degraded subtitle inventory = %+v, want the downloaded row removed from the base", degraded.SubtitleInventory)
+	}
+}
+
 // A subtitle URL minted from the row the session captured evidence from stays
 // admissible only while that row still names the live bound candidate. Row ids
 // are not content fingerprints: an in-place enrichment re-probe keeps the id
