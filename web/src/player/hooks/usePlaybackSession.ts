@@ -1218,6 +1218,7 @@ function planToSessionState(
   autoFallback: boolean,
   config: PlayerConfig,
 ): PlaybackSessionState {
+  const planAudioTracks = plan.audio_tracks ?? [];
   return {
     plan,
     planRevision,
@@ -1235,9 +1236,17 @@ function planToSessionState(
     inventoryPending: plan.tracks_pending === true,
     inventoryFailed: plan.inventory_status === "failed" || plan.inventory_provenance === "failed",
     initialPosition: plan.timeline.player_start_seconds,
-    audioTrackIndex: plan.selected_tracks.audio?.index ?? 0,
+    // The marker is the applied row, not the raw plan ordinal: the same
+    // resolver the inventory folds use (the plan is both sides here, so it
+    // short-circuits to the committed ordinal). A plan with no committed
+    // selection reports no marker instead of defaulting onto row 0.
+    audioTrackIndex: resolveAppliedAudioIndex(
+      planAudioTracks,
+      planAudioTracks,
+      plan.selected_tracks.audio,
+    ),
     durationSeconds: plan.source.duration_seconds ?? null,
-    planAudioTracks: plan.audio_tracks ?? [],
+    planAudioTracks,
     // tracks_pending is the explicit deferred signal and wins over the
     // stamp/provenance fallback: the server sets it exactly when the plan's
     // inventory is the provisional recipe and a follow-up is promised.
@@ -1271,6 +1280,10 @@ function planToSessionState(
     retrying: false,
     initialSubtitleErrorTitle: null,
     initialSubtitleError: null,
+    // A track notice describes a pick that could not be reconciled against the
+    // plan it was made for. Adopting a plan settles that pick (accepted, or
+    // surfaced once after the bounded refresh), so the notice is one adoption
+    // old at most and never outlives the request that produced it.
     trackSelectionNotice: null,
     // A plan was just handed out, so the server is reachable.
     connectionStatus: "connected",
@@ -2137,6 +2150,10 @@ export function usePlaybackSession(
       deferredPushesRef.current = [];
       transitionSourceIdentity(null, null);
       pendingSeekRef.current = null;
+      // A held pick belongs to the session being retired. Replaying it against
+      // whatever plan replaces this one would dispatch a track change the
+      // viewer never made for that session.
+      pendingTrackPicksRef.current = [];
       lastVerifiedIdentityRef.current = null;
       inventoryPendingRef.current = false;
       setState((current) => {
@@ -2632,6 +2649,14 @@ export function usePlaybackSession(
     transitionSourceIdentity(null, null);
     // A remembered mid-switch seek belongs to the request this effect resets.
     pendingSeekRef.current = null;
+    // So does a track pick held for that request: replaying it against this
+    // request's plan would switch a track the viewer did not pick here.
+    pendingTrackPicksRef.current = [];
+    // The notice belongs to the previous request's plan. Leaving it set makes
+    // the next mount of this hook replay a stale track toast.
+    setState((current) =>
+      current.trackSelectionNotice === null ? current : { ...current, trackSelectionNotice: null },
+    );
     lastVerifiedIdentityRef.current = null;
     // A new request re-derives Auto intent from its own props: without this,
     // the previous request's armed/disarmed state leaks into the new session.
@@ -2678,6 +2703,8 @@ export function usePlaybackSession(
       // instead of adopting it into an abandoned player.
       loadSequenceRef.current += 1;
       pendingSeekRef.current = null;
+      // A held pick dies with the player: nothing will fold its plan.
+      pendingTrackPicksRef.current = [];
       // A viewer who leaves while the player reconnects stops the retries.
       endReconnect(false);
       const sid = sessionIdRef.current;
@@ -3172,10 +3199,19 @@ export function usePlaybackSession(
     const sourceMoved =
       menuIdentity.fileId !== plan.effective_media_file_id ||
       (menuIdentity.uri != null && menuIdentity.uri !== (plan.effective_virtual_uri ?? null));
-    if (!pick.refreshAttempted && sourceMoved) {
-      // The menu followed a rotated source the plan has not refreshed yet. One
-      // no-op replan re-reads it; a pick that still has no counterpart then
-      // surfaces below instead of looping or vanishing.
+    // A provisional inventory is the same race on a stationary source: the
+    // probe has published menu rows the plan still describes as declared
+    // metadata, and the enumeration it owes is what this pick needs. One
+    // no-op replan re-reads it before the pick surfaces.
+    const provisionalInventory =
+      plan.tracks_pending === true ||
+      isInventoryProvisional(plan.inventory_status, plan.inventory_provenance) ||
+      stateRef.current.audioInventoryProvisional ||
+      stateRef.current.subtitleInventoryProvisional;
+    if (!pick.refreshAttempted && (sourceMoved || provisionalInventory)) {
+      // The menu followed a rotated source (or a probe the plan has not
+      // refreshed yet). One no-op replan re-reads it; a pick that still has no
+      // counterpart then surfaces below instead of looping or vanishing.
       pendingTrackPicksRef.current = [
         { ...pick, refreshAttempted: true },
         ...pendingTrackPicksRef.current.slice(1),
