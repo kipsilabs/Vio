@@ -289,7 +289,11 @@ interface VideoPlayerProps {
   /** `quality_change` replan for a label taken from `plan.available_qualities`. */
   onQualitySelect?: (label: string, currentPosition: number) => void;
   /** `track_change` replan for a subtitle the server has to render. */
-  onSubtitleTrackChange?: (combinedIndex: number | null, currentPosition: number) => void;
+  onSubtitleTrackChange?: (
+    combinedIndex: number | null,
+    currentPosition: number,
+    displayedTrack?: PlayerSubtitleInfo | null,
+  ) => void;
   /** `failure_recovery` replan after the client could not play the plan. */
   onPlanFailure?: (failure: FailureV3, currentPosition: number) => void;
   /**
@@ -4321,11 +4325,18 @@ export function VideoPlayer({
       currentTimeRef.current,
       subtitleFetchAnchorRef.current,
     );
-    onSubtitleTrackChange?.(desiredServerIndex, position);
+    onSubtitleTrackChange?.(
+      desiredServerIndex,
+      position,
+      desiredServerIndex === null
+        ? null
+        : (effectiveSubtitleTracks.find((track) => track.index === desiredServerIndex) ?? null),
+    );
   }, [
     activeSubtitleIdentity,
     activeSubtitleIndex,
     activeSubtitleSourceKey,
+    effectiveSubtitleTracks,
     initialSubtitleError,
     onSubtitleTrackChange,
     planSelectedSubtitleIdentity,

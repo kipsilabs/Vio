@@ -675,8 +675,17 @@ export interface UsePlaybackSessionResult extends PlaybackSessionState {
    * conversion. Sidecar tracks are fetched from the plan's inventory and drawn
    * by the client without involving the server. A stale ordinal the plan's
    * inventory does not carry is reconciled by identity/language or ignored.
+   *
+   * `displayedTrack` is the row the viewer clicked when the menu lists
+   * watch-detail fallback rows the session inventory does not carry yet (an
+   * empty inventory while the probe is deferred). Without it a click during an
+   * inventory refresh would be captured with no identity at all.
    */
-  changeSubtitleTrack: (combinedIndex: number | null, currentPosition: number) => void;
+  changeSubtitleTrack: (
+    combinedIndex: number | null,
+    currentPosition: number,
+    displayedTrack?: PlayerSubtitleInfo | null,
+  ) => void;
   /** `quality_change` replan for a label taken from `plan.available_qualities`. */
   changeQuality: (label: string, currentPosition: number) => void;
   /** `failure_recovery` replan after the client could not play the plan. */
@@ -1099,6 +1108,9 @@ function resolveSubtitleTrackChange(
 
   // No stable picked identity to reconcile from: the ordinal is the only
   // channel the menu offers, so keep it while the plan publishes that slot.
+  // That reasoning only holds for the inventory the pick was captured against;
+  // once it was replaced, the same slot names whichever track moved into it.
+  if (!trustPickedTrackId) return null;
   const exact = inventory.find((item) => item.combined_index === combinedIndex);
   return exact ? { id: exact.track_id, index: exact.combined_index } : null;
 }
@@ -3338,9 +3350,22 @@ export function usePlaybackSession(
   );
 
   const changeSubtitleTrack = useCallback(
-    (combinedIndex: number | null, currentPosition: number) => {
+    (
+      combinedIndex: number | null,
+      currentPosition: number,
+      displayedTrack?: PlayerSubtitleInfo | null,
+    ) => {
       const plan = planRef.current;
       if (!plan) return;
+      // The menu can list watch-detail fallback rows before the session
+      // publishes its own inventory. Capture the row the viewer clicked from
+      // the menu when the session list cannot name that slot, so a pick made
+      // during a refresh still carries an identity to reconcile later.
+      const clickedTrack =
+        combinedIndex == null
+          ? undefined
+          : (stateRef.current.subtitleUrls.find((item) => item.index === combinedIndex) ??
+            (displayedTrack?.index === combinedIndex ? displayedTrack : undefined));
       // A pick against a still-deferred inventory names a provisional slot:
       // replan validation runs against the plan's declared list, and the
       // server remaps or degrades there. The follow-up verified inventory
@@ -3350,10 +3375,7 @@ export function usePlaybackSession(
         // picked subtitle identity. Null is an explicit subtitles-off request;
         // passing a `tracks` object with no subtitle index keeps it off instead
         // of falling back to the new plan's initial subtitle.
-        const track =
-          combinedIndex == null
-            ? undefined
-            : stateRef.current.subtitleUrls.find((item) => item.index === combinedIndex);
+        const track = clickedTrack;
         loadOfferedRelease(currentPosition, {
           audioIndex: plan.selected_tracks.audio?.index,
           carriedAudioTrackId: plan.selected_tracks.audio?.id,
@@ -3370,10 +3392,7 @@ export function usePlaybackSession(
         kind: "subtitle",
         index: combinedIndex,
         positionSeconds: currentPosition,
-        track:
-          combinedIndex == null
-            ? undefined
-            : stateRef.current.subtitleUrls.find((item) => item.index === combinedIndex),
+        track: clickedTrack,
         inventoryIdentity: subtitleInventoryIdentity(plan.subtitle.inventory),
         refreshAttempted: false,
       };

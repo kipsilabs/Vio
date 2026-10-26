@@ -479,6 +479,48 @@ describe("subtitle marker reconciliation", () => {
 
     await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(1));
   });
+
+  it("forwards the watch-detail fallback row a queued subtitle pick was made from", async () => {
+    const onSubtitleTrackChange = vi.fn();
+    // The plan's probe is deferred, so its inventory is empty and the menu is
+    // showing the watch detail's own rows, which carry no session identity.
+    const englishFallback: PlayerSubtitleInfo = {
+      index: 0,
+      media_file_id: 7,
+      language: "eng",
+      codec: "srt",
+      label: "English",
+      source: "external",
+      url: "",
+    };
+    const frenchFallback: PlayerSubtitleInfo = {
+      ...englishFallback,
+      index: 1,
+      language: "fra",
+      label: "French",
+    };
+    renderPlayer({
+      plan: fixturePlanV3({
+        ...directPlan,
+        plan_id: "plan:deferred-subtitles",
+        plan_attempt_key: "v3:deferred-subtitles",
+        subtitle: { mode: "off", inventory: [] },
+      }),
+      subtitleUrls: [englishFallback, frenchFallback],
+      subtitleMode: "off",
+      onSubtitleTrackChange,
+    });
+
+    act(() => {
+      controls.current?.onSubtitleSelect?.(1);
+    });
+
+    // The row itself travels with the request so the session can reconcile it
+    // against the inventory that replaces this one.
+    await waitFor(() =>
+      expect(onSubtitleTrackChange).toHaveBeenCalledWith(1, expect.any(Number), frenchFallback),
+    );
+  });
 });
 
 function planInvalidatedCommand(
@@ -4039,7 +4081,7 @@ describe("VideoPlayer plan failure recovery", () => {
     });
 
     await waitFor(() => expect(onSubtitleTrackChange).toHaveBeenCalledOnce());
-    expect(onSubtitleTrackChange).toHaveBeenCalledWith(2, 0);
+    expect(onSubtitleTrackChange).toHaveBeenCalledWith(2, 0, expect.objectContaining({ index: 2 }));
 
     rerenderPlayer({ replanError: "Silo could not apply the subtitle selection." });
 
@@ -4056,7 +4098,11 @@ describe("VideoPlayer plan failure recovery", () => {
 
     await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(2));
     expect(onSubtitleTrackChange).toHaveBeenCalledTimes(2);
-    expect(onSubtitleTrackChange).toHaveBeenLastCalledWith(2, 0);
+    expect(onSubtitleTrackChange).toHaveBeenLastCalledWith(
+      2,
+      0,
+      expect.objectContaining({ index: 2 }),
+    );
   });
 
   // The rollback is otherwise silent: the refusal only renders inside the
@@ -4153,7 +4199,7 @@ describe("VideoPlayer plan failure recovery", () => {
     });
 
     await waitFor(() => expect(onSubtitleTrackChange).toHaveBeenCalledTimes(1));
-    expect(onSubtitleTrackChange).toHaveBeenCalledWith(2, 0);
+    expect(onSubtitleTrackChange).toHaveBeenCalledWith(2, 0, expect.objectContaining({ index: 2 }));
 
     // The server resolved the selection to `off`/absent, so the UI identity is
     // still outstanding. A replan that only mints a new plan id must not send
@@ -6007,7 +6053,11 @@ describe("VideoPlayer translation handoff", () => {
     });
 
     await waitFor(() => expect(onSubtitleChanged).toHaveBeenCalledWith(4, undefined));
-    expect(onSubtitleTrackChange).toHaveBeenCalledWith(4, expect.any(Number));
+    expect(onSubtitleTrackChange).toHaveBeenCalledWith(
+      4,
+      expect.any(Number),
+      expect.objectContaining({ index: 4 }),
+    );
     expect(controls.current?.activeSubtitleIndex).toBe(4);
     expect(controls.current?.subtitleTracks).toEqual([downloadedTrack]);
   });
@@ -7311,7 +7361,11 @@ describe("VideoPlayer version switch UX", () => {
     });
     await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
     await waitFor(() => expect(onSubtitleTrackChange).toHaveBeenCalledTimes(1));
-    expect(onSubtitleTrackChange).toHaveBeenCalledWith(0, expect.anything());
+    expect(onSubtitleTrackChange).toHaveBeenCalledWith(
+      0,
+      expect.anything(),
+      expect.objectContaining({ index: 0 }),
+    );
     onSubtitleTrackChange.mockClear();
 
     // Another version switch encounters the identical refusal text on a new plan attempt
@@ -7559,7 +7613,11 @@ describe("VideoPlayer version switch UX", () => {
     await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
     // Stale outgoing index (1, which is English in rev-2) must never be dispatched!
     expect(onSubtitleTrackChange).not.toHaveBeenCalledWith(1, expect.anything());
-    expect(onSubtitleTrackChange).toHaveBeenCalledWith(0, expect.anything());
+    expect(onSubtitleTrackChange).toHaveBeenCalledWith(
+      0,
+      expect.anything(),
+      expect.objectContaining({ index: 0 }),
+    );
   });
 
   it("preserves manual Off selection across version changes even when auto-select would pick a track", async () => {
@@ -7714,7 +7772,11 @@ describe("VideoPlayer version switch UX", () => {
     await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
     // Must never dispatch the stale outgoing index (1, which is English in new candidate).
     expect(onSubtitleTrackChange).not.toHaveBeenCalledWith(1, expect.anything());
-    expect(onSubtitleTrackChange).toHaveBeenCalledWith(0, expect.anything());
+    expect(onSubtitleTrackChange).toHaveBeenCalledWith(
+      0,
+      expect.anything(),
+      expect.objectContaining({ index: 0 }),
+    );
   });
 
   it("selects descriptor-identical track_id-less subtitles independently", async () => {
@@ -7740,7 +7802,13 @@ describe("VideoPlayer version switch UX", () => {
       onSubtitleTrackChange,
     });
 
-    await waitFor(() => expect(onSubtitleTrackChange).toHaveBeenCalledWith(0, expect.anything()));
+    await waitFor(() =>
+      expect(onSubtitleTrackChange).toHaveBeenCalledWith(
+        0,
+        expect.anything(),
+        expect.objectContaining({ index: 0 }),
+      ),
+    );
     const callsAfterAutoSelect = onSubtitleTrackChange.mock.calls.length;
 
     // The server acknowledges the auto-selection by ordinal. Its inventory
@@ -7798,7 +7866,11 @@ describe("VideoPlayer version switch UX", () => {
     await waitFor(() =>
       expect(onSubtitleTrackChange.mock.calls.length).toBeGreaterThan(callsAfterAutoSelect),
     );
-    expect(onSubtitleTrackChange).toHaveBeenLastCalledWith(1, expect.anything());
+    expect(onSubtitleTrackChange).toHaveBeenLastCalledWith(
+      1,
+      expect.anything(),
+      expect.objectContaining({ index: 1 }),
+    );
   });
 
   it("toggles video fit and resets it for a new playback session", () => {
@@ -8388,7 +8460,7 @@ describe("VideoPlayer lost connection", () => {
         controls.current as unknown as { onSubtitleSelect: (i: number | null) => void }
       ).onSubtitleSelect(null),
     );
-    await waitFor(() => expect(onSubtitleTrackChange).toHaveBeenCalledWith(null, 0));
+    await waitFor(() => expect(onSubtitleTrackChange).toHaveBeenCalledWith(null, 0, null));
     rerenderPlayer({ plan: directPlan, planRevision: 2 });
 
     // The server restarts: the reconnect starts session-2 with no subtitle.
@@ -8411,7 +8483,7 @@ describe("VideoPlayer lost connection", () => {
     // The turn-off must be the last word: an adopt echo for the initial
     // selection may precede it now that inventory resolves in stages, but no
     // later call may re-enable a track after the reconnect.
-    expect(onSubtitleTrackChange).toHaveBeenLastCalledWith(null, 0);
+    expect(onSubtitleTrackChange).toHaveBeenLastCalledWith(null, 0, null);
   });
 
   it("hands a fatal hls.js network error on a stream that played to the reconnect", async () => {
