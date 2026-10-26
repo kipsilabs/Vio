@@ -6055,6 +6055,94 @@ describe("usePlaybackSession plan audio inventory", () => {
     unmount();
   });
 
+  it("keeps the audio marker on its matched row when an adopted replan reorders its inventory", async () => {
+    const englishTrack = {
+      codec: "eac3",
+      channels: 6,
+      layout: "5.1",
+      language: "eng",
+      default: true,
+      track_id: "file:7:audio:0",
+      selection_index: 0,
+    };
+    const spanishTrack = {
+      codec: "ac3",
+      channels: 2,
+      layout: "stereo",
+      language: "spa",
+      default: false,
+      track_id: "file:7:audio:1",
+      selection_index: 1,
+    };
+    const verifiedAudioTracks = [englishTrack, spanishTrack];
+    // The replan was built before the probe persisted, so it carries the older
+    // declared order and marks itself provisional.
+    const reorderedPlanTracks = [spanishTrack, englishTrack];
+    const replanBodies: Array<Record<string, unknown>> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3({
+              inventory_status: "verified",
+              inventory_provenance: "verified",
+              audio_tracks: verifiedAudioTracks,
+              selected_tracks: { audio: { id: "file:7:audio:1", index: 1 } },
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/session-1/replan")) {
+        replanBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        return jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "playable",
+          session_id: "session-1",
+          playback_plan: fixturePlanV3({
+            plan_id: "plan:reordered000000001",
+            plan_attempt_key: "v3:reordered000000001",
+            inventory_status: "declared",
+            inventory_provenance: "declared",
+            tracks_pending: true,
+            audio_tracks: reorderedPlanTracks,
+            selected_tracks: { audio: { id: "file:7:audio:0", index: 1 } },
+          }),
+        });
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+    expect(result.current.planAudioTracks).toEqual(verifiedAudioTracks);
+    expect(result.current.audioTrackIndex).toBe(1);
+
+    // Pick the English row at displayed index 0. The replan answers with the
+    // same track at its own (reordered) ordinal 1.
+    act(() => result.current.switchAudioTrack(0, 120));
+    await waitFor(() => expect(replanBodies).toHaveLength(1));
+
+    // The verified list survives the provisional replan, and the marker must
+    // follow the row naming the committed track (English at displayed 0) rather
+    // than the plan ordinal 1, which now names the Spanish row.
+    expect(result.current.planAudioTracks).toEqual(verifiedAudioTracks);
+    expect(result.current.audioTrackIndex).toBe(0);
+    unmount();
+  });
+
   it("carries the plan's audio identity for a pick from a repaired inventory", async () => {
     const planAudioTracks = [
       {
