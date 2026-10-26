@@ -591,12 +591,13 @@ type pendingNodeAsyncRestart struct {
 }
 
 // restartSegmentAsync runs restartSegmentLocked on its own goroutine so a
-// far-seek segment request is not held for the whole restart. The restart
-// rotates the generation, so the triggering request's token can never serve the
-// bytes it produces; the handler answers the stale-generation verdict at once
-// and this worker makes the next request on the new generation succeed. The
-// context is detached from the request so a client disconnect after the verdict
-// does not cancel the restart the next request depends on.
+// far-seek segment request is not held for the whole restart and a client
+// disconnect cannot cancel it. The triggering request then waits for the
+// absolute segment the restart produces (see WaitForRestartContinuationWithin)
+// and serves it under the successor generation; the detached worker is what
+// keeps the restart alive when that hold expires or the request goes away. The
+// context is detached from the request for the same reason: the next request
+// depends on the restart even when the trigger is gone.
 //
 // Concurrent far-seeks to different positions on one session coalesce onto a
 // single worker that ends at the latest requested segment, so a burst of seeks
@@ -3009,6 +3010,9 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 	if err != nil && errors.Is(err, playback.ErrSegmentNotFound) {
 		segNum, parseErr := playback.ParseSegmentNumber(name)
 		if parseErr == nil {
+			// The restart clock starts before any stalled-head wait so that
+			// wait and the restart continuation share one bounded budget.
+			recoveryStarted := time.Now()
 			now := time.Now()
 			decision := session.SegmentRecoveryDecision(segNum, now)
 			segmentStalled := false
@@ -3073,12 +3077,13 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
-			if err != nil && err == playback.ErrSegmentNotFound && decision.RestartOnTimeout {
+			if err != nil && errors.Is(err, playback.ErrSegmentNotFound) && decision.RestartOnTimeout {
 				// A far seek past the produced window is recovered by a seek
 				// restart. The restart is spawned detached (it must survive the
 				// triggering request's context), but the request is held for the
-				// restarted generation's segment on the same bounded, stall-aware
-				// continuation the API handler uses. Copy-mode stays synchronous:
+				// restarted generation's segment on the same bounded continuation
+				// the API handler uses, including its remaining-budget timeout
+				// and 3s produced-head watchdog. Copy-mode stays synchronous:
 				// its target resolution reads the live manifest.
 				if (decision.Reason == playback.SegmentRecoveryFarSeekReason || segmentStalled) && !session.IsCopyVideo() {
 					slog.InfoContext(r.Context(), "transcode node seek restart scheduled", "component", "transcodenode",
@@ -3097,9 +3102,12 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 					// same continuation contract as the API segment handler:
 					// cluster deployments must not answer a far seek with a
 					// stale-generation verdict while a single-node server
-					// serves it. The wait is bounded and stall-aware; a failed
-					// restart still surfaces its terminal verdict.
-					segmentLease, err = session.WaitForRestartContinuation(name)
+					// serves it. The wait spends only the request's remaining
+					// hold budget and still surfaces a failed restart's verdict.
+					segmentLease, err = session.WaitForRestartContinuationWithin(
+						name,
+						playback.RestartContinuationRemaining(recoveryStarted),
+					)
 					if err == nil {
 						if requestedGeneration != "" {
 							if _, successorToken, ok := session.RestartContinuationSegment(requestedGeneration, name); ok {
@@ -3186,7 +3194,15 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 			err = playback.ErrStaleSegmentGeneration
 		}
 	}
-	if err == nil && !continuationServe {
+	// The fence above can only produce the stale-generation verdict, and it
+	// deliberately clears the lease. Answer it here exactly as the API handler
+	// does; falling through would dereference a nil lease below when a second
+	// in-place restart lands while this request is held.
+	if err != nil {
+		http.Error(w, "segment generation is stale", http.StatusPreconditionFailed)
+		return
+	}
+	if !continuationServe {
 		if segmentLease, err = playback.FenceSegmentLease(segmentLease, requestedGeneration); err != nil {
 			http.Error(w, "segment generation is stale", http.StatusPreconditionFailed)
 			return
