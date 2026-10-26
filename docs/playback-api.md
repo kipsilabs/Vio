@@ -731,8 +731,11 @@ to another candidate rather than waiting for the stream to start.
 
 A transport failover that lands on a genuinely different release probes that
 replacement before starting it. The viewer's audio selection is re-identified on
-the replacement's inventory (the same language/codec/layout match a version
-switch uses) instead of silently resetting to the first stream. A subtitle
+the replacement's inventory by the concrete language it carries (the same
+language-carriage rule a version switch uses); codec and channel layout may
+differ between releases and are not required to match. When no track carries
+that language, the fallback starts on the replacement's default and reports an
+audio-unavailable degradation warning instead of silently resetting. A subtitle
 selection has no cross-release identity matcher yet, so the fallback starts with
 subtitles off and logs the reset; the client keeps the requested subtitle
 identity in its own state and can reselect it from the replacement's inventory.

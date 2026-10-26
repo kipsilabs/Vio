@@ -4935,6 +4935,71 @@ func TestRemapSubtitleSelectionV3MissSignalsDegrade(t *testing.T) {
 	}
 }
 
+// Two sidecars in the same language/format/flags are distinct physical tracks.
+// The edition-switch matcher must prefer the one whose displayed title the
+// viewer selected instead of collapsing onto the first identity match.
+func TestRemapSubtitleSelectionV3UsesTitleTiebreakForExternalTracks(t *testing.T) {
+	source := &models.MediaFile{ID: 1, ExternalSubtitles: []models.ExternalSubtitle{
+		{Path: "/subs/a.en.srt", Language: "eng", Format: "srt", Title: "Commentary"},
+	}}
+	target := &models.MediaFile{ID: 2, ExternalSubtitles: []models.ExternalSubtitle{
+		{Path: "/subs/main.en.srt", Language: "eng", Format: "srt", Title: "Main"},
+		{Path: "/subs/commentary.en.srt", Language: "eng", Format: "srt", Title: "Commentary"},
+	}}
+	handler := &PlaybackHandler{}
+	request := playback.StartRequestV3{
+		SubtitleTrackIndex: new(0),
+		SubtitleTrackID:    playback.TrackIDV3(source.ID, "subtitle", 0),
+	}
+	if _, err := handler.remapSubtitleSelectionV3(context.Background(), source, target, &request); err != nil {
+		t.Fatalf("remap: %v", err)
+	}
+	if request.SubtitleTrackIndex == nil || *request.SubtitleTrackIndex != 1 {
+		t.Fatalf("external remap index = %v, want 1 (the Commentary sidecar, not the first English one)", request.SubtitleTrackIndex)
+	}
+}
+
+func TestRemapSubtitleSelectionV3UsesTitleTiebreakForEmbeddedTracks(t *testing.T) {
+	source := &models.MediaFile{ID: 1, SubtitleTracks: []models.SubtitleTrack{
+		{Index: 0, Language: "eng", Codec: "subrip", Title: "Commentary"},
+	}}
+	target := &models.MediaFile{ID: 2, SubtitleTracks: []models.SubtitleTrack{
+		{Index: 0, Language: "eng", Codec: "subrip", Title: "Main"},
+		{Index: 1, Language: "eng", Codec: "subrip", Title: "Commentary"},
+	}}
+	handler := &PlaybackHandler{}
+	request := playback.StartRequestV3{
+		SubtitleTrackIndex: new(0),
+		SubtitleTrackID:    playback.TrackIDV3(source.ID, "subtitle", 0),
+	}
+	if _, err := handler.remapSubtitleSelectionV3(context.Background(), source, target, &request); err != nil {
+		t.Fatalf("remap: %v", err)
+	}
+	if request.SubtitleTrackIndex == nil || *request.SubtitleTrackIndex != 1 {
+		t.Fatalf("embedded remap index = %v, want 1 (the Commentary track, not the first English one)", request.SubtitleTrackIndex)
+	}
+}
+
+// An untitled selection carries no title evidence, so the historical
+// first-identity-match behavior remains.
+func TestRemapSubtitleSelectionV3UntitledSelectionKeepsFirstMatch(t *testing.T) {
+	source := &models.MediaFile{ID: 1, SubtitleTracks: []models.SubtitleTrack{
+		{Index: 0, Language: "eng", Codec: "subrip"},
+	}}
+	target := &models.MediaFile{ID: 2, SubtitleTracks: []models.SubtitleTrack{
+		{Index: 0, Language: "eng", Codec: "subrip", Title: "Main"},
+		{Index: 1, Language: "eng", Codec: "subrip", Title: "Commentary"},
+	}}
+	handler := &PlaybackHandler{}
+	request := playback.StartRequestV3{SubtitleTrackIndex: new(0)}
+	if _, err := handler.remapSubtitleSelectionV3(context.Background(), source, target, &request); err != nil {
+		t.Fatalf("remap: %v", err)
+	}
+	if request.SubtitleTrackIndex == nil || *request.SubtitleTrackIndex != 0 {
+		t.Fatalf("untitled remap index = %v, want 0 (first identity match)", request.SubtitleTrackIndex)
+	}
+}
+
 // A carried audio ordinal from a richer version (or an explicit pick the
 // effective edition lacks) degrades to the file's default track instead of
 // failing the start. Only a malformed identity stays a client error.
@@ -4972,6 +5037,70 @@ func TestResolveCarriedAudioTrackV3DegradesWhenSourceMissing(t *testing.T) {
 	}
 	if _, ok := handler.resolveCarriedAudioTrackV3(context.Background(), "not-a-track-id", target, nil); ok {
 		t.Fatal("malformed carried identity must not resolve")
+	}
+}
+
+// The start path must surface the lost explicit choice as a degradation
+// warning: a carried English selection on a version that only has French plays
+// that version's default, but the client is told the selection was not honored.
+func TestHandleStartPlaybackV3WarnsWhenCarriedAudioHasNoEquivalent(t *testing.T) {
+	source := v3HandlerFixtureFile(t)
+	source.ID = 100
+	source.AudioTracks = []models.AudioTrack{{Index: 0, Language: "en", Codec: "aac", Channels: 2, Default: true}}
+	target := v3HandlerFixtureFile(t)
+	target.ID = 200
+	target.AudioTracks = []models.AudioTrack{{Index: 0, Language: "fr", Codec: "aac", Channels: 2, Default: true}}
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), mapPlaybackFileResolver{files: map[int]*models.MediaFile{source.ID: source, target.ID: target}})
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	handler.FileVersionFetcher = testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{"movie-1": {source, target}}}
+
+	request := v3HandlerStartRequest()
+	request.FileID = target.ID
+	request.FileSelection = playback.FileSelectionExplicitV3
+	request.CarriedAudioTrackID = playback.TrackIDV3(source.ID, "audio", 0)
+	started := startV3PlaybackForHandlerTest(t, handler, request)
+	if started.PlaybackPlan == nil || started.PlaybackPlan.SelectedTracks.Audio == nil ||
+		started.PlaybackPlan.SelectedTracks.Audio.Index == nil || *started.PlaybackPlan.SelectedTracks.Audio.Index != 0 {
+		t.Fatalf("plan audio = %#v, want the target's default track at 0", started.PlaybackPlan)
+	}
+	found := false
+	for _, warning := range started.PlaybackPlan.DegradationWarnings {
+		if warning.Code == playback.DegradationWarningAudioTrackUnavailableV3 {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("degradation warnings = %+v, want audio_track_unavailable for the lost carried choice", started.PlaybackPlan.DegradationWarnings)
+	}
+}
+
+// A version switch carries the viewer's explicit audio choice by language
+// family. When the target has no track carrying that language,
+// MatchAudioTrackAcrossVersions falls back to the target's default; reporting
+// that as a successful carry would play another language silently. The carry
+// must fail so the caller degrades with a warning.
+func TestResolveCarriedAudioTrackV3DegradesWhenVersionLacksSelection(t *testing.T) {
+	source := &models.MediaFile{ID: 100, AudioTracks: []models.AudioTrack{
+		{Index: 0, Language: "en", Codec: "aac", Channels: 2},
+		{Index: 1, Language: "ja", Codec: "aac", Channels: 2},
+	}}
+	missing := &models.MediaFile{ID: 200, AudioTracks: []models.AudioTrack{
+		{Index: 0, Language: "fr", Codec: "ac3", Channels: 6, Default: true},
+	}}
+	handler := &PlaybackHandler{}
+	if got, ok := handler.resolveCarriedAudioTrackV3(context.Background(), playback.TrackIDV3(source.ID, "audio", 0), missing, source); ok {
+		t.Fatalf("carried English onto a French-only version = (%d, true), want ok=false", got)
+	}
+
+	// A different codec/layout is fine: identity is the concrete language.
+	sameLanguage := &models.MediaFile{ID: 300, AudioTracks: []models.AudioTrack{
+		{Index: 0, Language: "ja", Codec: "aac", Channels: 2, Default: true},
+		{Index: 1, Language: "en", Codec: "ac3", Channels: 6},
+	}}
+	got, ok := handler.resolveCarriedAudioTrackV3(context.Background(), playback.TrackIDV3(source.ID, "audio", 0), sameLanguage, source)
+	if !ok || got != 1 {
+		t.Fatalf("carried English onto an English AC3 track = (%d, %v), want (1, true)", got, ok)
 	}
 }
 
@@ -8566,6 +8695,94 @@ func TestHandleReplanPlaybackV3RehydratesPinnedVirtualSourceBeforePlanning(t *te
 	// invisible to the client.
 	if response.PlaybackPlan.EffectiveMediaFileID != servedCandidateID || response.PlaybackPlan.Source.MediaFileID != servedCandidateID {
 		t.Fatalf("virtual replan identity = effective %d source %d, want the served row %d", response.PlaybackPlan.EffectiveMediaFileID, response.PlaybackPlan.Source.MediaFileID, servedCandidateID)
+	}
+}
+
+// A seek-only or recovery replan does not change the viewer's intent, but it
+// still plans against the effective row. When enrichment re-probed that row in
+// place (same id, different release), the carried English@1 ordinal names a
+// different stream on the new inventory. The drift remap must run without an
+// intent change and select English@0 instead of reusing the ordinal positionally
+// (which would now be Japanese). Covers the same-row-rotation-without-intent gap.
+func TestHandleReplanPlaybackV3RecoveryRemapsSameRowRotationWithoutIntentChange(t *testing.T) {
+	file := v3HandlerFixtureFile(t)
+	file.ID = 500
+	file.FilePath = "virtual://movie/tt-same-row-rotation?result=abc"
+	file.Container = "virtual"
+	file.VirtualOwnerInstallationID = 5
+	file.AudioTracks = []models.AudioTrack{
+		{Index: 0, Language: "ja", Codec: "aac", Channels: 2},
+		{Index: 1, Language: "en", Codec: "aac", Channels: 2, Default: true},
+	}
+	probedAt := time.Now().Add(-time.Hour)
+	file.ProbeUpdatedAt = &probedAt
+	files := map[int]*models.MediaFile{file.ID: file}
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), mapPlaybackFileResolver{files: files})
+	stubCopySeekAnchorV3(handler)
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "true"}}
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	handler.FileVersionFetcher = testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{"movie-1": {file}}}
+	handler.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(func(_ context.Context, path string, _ int, _ string, _ int) (string, error) {
+		return "http://127.0.0.1:8080/stream?path=" + path, nil
+	})
+	handler.VirtualCandidateFileLookup = func(_ context.Context, path, _ string, _ string, _ int) (*models.MediaFile, error) {
+		candidate := *file
+		candidate.FilePath = path
+		return &candidate, nil
+	}
+
+	startRequest := v3HandlerStartRequest()
+	startRequest.FileID = file.ID
+	startRequest.QualityPreference = "auto"
+	startRequest.AudioTrackIndex = new(1)
+	startRequest.AudioTrackID = playback.TrackIDV3(file.ID, "audio", 1)
+	startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassHLSV3] = playback.DeliveryCapabilityV3{
+		Enabled: true, SupportedOnDevice: true, Containers: []string{"hls"}, VideoCodecs: []string{"h264"}, AudioDecodeCodecs: []string{"aac"},
+	}
+	startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassProgressiveV3] = playback.DeliveryCapabilityV3{
+		Enabled: true, SupportedOnDevice: true, Containers: []string{"mp4"}, VideoCodecs: []string{"h264"}, AudioDecodeCodecs: []string{"aac"},
+	}
+	started := startV3PlaybackForHandlerTest(t, handler, startRequest)
+	if started.PlaybackPlan == nil || started.PlaybackPlan.SelectedTracks.Audio == nil ||
+		started.PlaybackPlan.SelectedTracks.Audio.Index == nil || *started.PlaybackPlan.SelectedTracks.Audio.Index != 1 {
+		t.Fatalf("start did not select English@1: %#v", started.PlaybackPlan)
+	}
+
+	// Enrichment re-probes the same row in place: same id and URI, reversed audio.
+	file.AudioTracks = []models.AudioTrack{
+		{Index: 0, Language: "en", Codec: "aac", Channels: 2, Default: true},
+		{Index: 1, Language: "ja", Codec: "aac", Channels: 2},
+	}
+
+	failedKey := playback.PlanAttemptKeyV3(*started.PlaybackPlan, startRequest.ClientPlaybackContext.Output.OutputContextID, nil)
+	response := postPlaybackReplanV3(t, handler, started.SessionID, playback.ReplanRequestV3{
+		ProtocolVersion:       playback.ProtocolV3,
+		Operation:             playback.ReplanOperationFailureRecoveryV3,
+		PlaybackAttemptID:     startRequest.PlaybackAttemptID,
+		ReplanRequestID:       "replan-same-row-rotation-0001",
+		FailedPlanID:          started.PlaybackPlan.PlanID,
+		PlanAttemptID:         "plan-attempt-same-row-rotation-0001",
+		PlanAttemptKey:        failedKey,
+		AttemptedPlanKeys:     []string{failedKey},
+		AttemptCount:          1,
+		QualityPreference:     "auto",
+		PositionSeconds:       12,
+		Failure:               playback.FailureV3{Classification: "playback_error"},
+		Capabilities:          startRequest.Capabilities,
+		ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	})
+	if response.Terminal != nil || response.PlaybackPlan == nil {
+		t.Fatalf("same-row rotation replan = %#v terminal=%+v", response.PlaybackPlan, response.Terminal)
+	}
+	selected := response.PlaybackPlan.SelectedTracks.Audio
+	if selected == nil || selected.Index == nil {
+		t.Fatalf("replan audio selection = %#v, want an ordinal", selected)
+	}
+	if *selected.Index != 0 {
+		t.Fatalf("replan audio index = %d, want 0 (English on the re-probed row, not Japanese@1)", *selected.Index)
+	}
+	if want := playback.TrackIDV3(file.ID, "audio", 0); selected.ID != want {
+		t.Fatalf("replan audio id = %q, want %q", selected.ID, want)
 	}
 }
 

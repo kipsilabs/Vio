@@ -70,7 +70,7 @@ func TestRekeyReplanTrackIdentitiesAcceptsSessionEffectiveRow(t *testing.T) {
 		FileID:       200,
 		AudioTrackID: playback.TrackIDV3(201, "audio", 1),
 	}
-	if _, _, err := handler.rekeyReplanTrackIdentitiesV3(context.Background(), &start, effective, &playback.Session{MediaFileID: 201, RequestedMediaFileID: 100}); err != nil {
+	if _, _, err := handler.rekeyReplanTrackIdentitiesV3(context.Background(), &start, effective, &playback.Session{MediaFileID: 201, RequestedMediaFileID: 100}, nil); err != nil {
 		t.Fatalf("rekeyReplanTrackIdentitiesV3: %v", err)
 	}
 
@@ -79,7 +79,7 @@ func TestRekeyReplanTrackIdentitiesAcceptsSessionEffectiveRow(t *testing.T) {
 	}
 
 	start.AudioTrackID = playback.TrackIDV3(300, "audio", 0)
-	if _, _, err := handler.rekeyReplanTrackIdentitiesV3(context.Background(), &start, effective, &playback.Session{MediaFileID: 201}); err != nil {
+	if _, _, err := handler.rekeyReplanTrackIdentitiesV3(context.Background(), &start, effective, &playback.Session{MediaFileID: 201}, nil); err != nil {
 		t.Fatalf("rekeyReplanTrackIdentitiesV3: %v", err)
 	}
 	if start.AudioTrackID != playback.TrackIDV3(300, "audio", 0) {
@@ -114,6 +114,65 @@ func TestResolveCarriedAudioTrackRemapsSameRowAfterInPlaceReprobe(t *testing.T) 
 	got, ok = handler.resolveCarriedAudioTrackV3(context.Background(), playback.TrackIDV3(77, "audio", 1), same, source)
 	if !ok || got != 1 {
 		t.Fatalf("unchanged evidence: index=%d ok=%v, want the original ordinal 1", got, ok)
+	}
+}
+
+// A version switch carries an explicit audio choice from the previous effective
+// row, which is a different file from the requested target. The durable
+// predecessor evidence describes the source row's layout, so it must be keyed
+// by the row embedded in the carried identity; keying it by the target can
+// never match and leaves the carry to a mutable catalog row (or to nothing when
+// no live session remains on this replica).
+func TestCarriedAudioSourceUsesPredecessorEvidenceAcrossVersions(t *testing.T) {
+	prior := &models.MediaFile{ID: 100, ContentID: "movie-1", Container: "virtual", FilePath: "virtual://movie/tt?result=old",
+		AudioTracks: []models.AudioTrack{
+			{Index: 0, Language: "ja", Codec: "aac", Channels: 2},
+			{Index: 1, Language: "en", Codec: "aac", Channels: 2, Default: true},
+		},
+	}
+	target := &models.MediaFile{ID: 200, ContentID: "movie-1", Container: "virtual", FilePath: "virtual://movie/tt?result=new",
+		AudioTracks: []models.AudioTrack{
+			{Index: 0, Language: "en", Codec: "aac", Channels: 2, Default: true},
+			{Index: 1, Language: "ja", Codec: "aac", Channels: 2},
+		},
+	}
+	store := playback.NewMemoryPlanStoreV3()
+	record := playback.AttemptRecordV3{
+		PlaybackAttemptID:    "attempt-cross-version-carry",
+		SessionID:            "cross-version-session",
+		UserID:               1,
+		ProfileID:            "profile-1",
+		RequestedMediaFileID: prior.ID,
+		EffectiveMediaFileID: prior.ID,
+		CurrentPlan: playback.PlanV3{
+			AudioTracks: playback.AudioInventoryV3(prior),
+		},
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	if err := store.SaveAttempt(context.Background(), record); err != nil {
+		t.Fatalf("SaveAttempt: %v", err)
+	}
+	handler := &PlaybackHandler{PlanStoreV3: store}
+	req := playback.StartRequestV3{
+		FileID:                    target.ID,
+		CarriedAudioTrackID:       playback.TrackIDV3(prior.ID, "audio", 1),
+		PreviousPlaybackAttemptID: record.PlaybackAttemptID,
+	}
+
+	source := handler.carriedAudioSourceV3(context.Background(), &req, target, 1, "profile-1", "", "")
+	if source == nil {
+		t.Fatal("cross-version carried audio found no durable evidence for the source row")
+	}
+	if source.ID != prior.ID || len(source.AudioTracks) != 2 || source.AudioTracks[1].Language != "en" {
+		t.Fatalf("source evidence = id %d tracks %+v, want the predecessor's English@1 inventory", source.ID, source.AudioTracks)
+	}
+	index, ok := handler.resolveCarriedAudioTrackV3(context.Background(), req.CarriedAudioTrackID, target, source)
+	if !ok {
+		t.Fatal("cross-version English carry was dropped")
+	}
+	if index != 0 || target.AudioTracks[index].Language != "en" {
+		t.Fatalf("cross-version carry = %d/%q, want 0/en (not the Japanese track now at ordinal 1)",
+			index, target.AudioTracks[index].Language)
 	}
 }
 
@@ -288,7 +347,7 @@ func TestRekeyReplanRemapsCarriedOrdinalOntoEffectiveCandidate(t *testing.T) {
 	start.SubtitleTrackID = playback.TrackIDV3(200, "subtitle", 1)
 	start.SubtitleTrackIndex = new(1)
 	session := &playback.Session{MediaFileID: 200, RequestedMediaFileID: 100}
-	audioUnavailable, subtitleUnavailable, err := handler.rekeyReplanTrackIdentitiesV3(context.Background(), &start, effective, session)
+	audioUnavailable, subtitleUnavailable, err := handler.rekeyReplanTrackIdentitiesV3(context.Background(), &start, effective, session, nil)
 	if err != nil {
 		t.Fatalf("rekeyReplanTrackIdentitiesV3: %v", err)
 	}
@@ -432,7 +491,7 @@ func TestRekeyReplanClearsSubtitleMissingFromEffectiveCandidate(t *testing.T) {
 	start.SubtitleTrackID = playback.TrackIDV3(200, "subtitle", 1)
 	start.SubtitleTrackIndex = new(1)
 
-	audioUnavailable, subtitleUnavailable, err := handler.rekeyReplanTrackIdentitiesV3(context.Background(), &start, effective, &playback.Session{MediaFileID: 200, RequestedMediaFileID: 100})
+	audioUnavailable, subtitleUnavailable, err := handler.rekeyReplanTrackIdentitiesV3(context.Background(), &start, effective, &playback.Session{MediaFileID: 200, RequestedMediaFileID: 100}, nil)
 	if err != nil {
 		t.Fatalf("rekeyReplanTrackIdentitiesV3: %v", err)
 	}
@@ -508,12 +567,117 @@ func TestRekeyReplanPropagatesDownloadedSubtitleLookupFailure(t *testing.T) {
 	start.SubtitleTrackID = playback.TrackIDV3(200, "subtitle", 0)
 	start.SubtitleTrackIndex = new(0)
 
-	_, _, err := handler.rekeyReplanTrackIdentitiesV3(context.Background(), &start, effective, &playback.Session{MediaFileID: 200, RequestedMediaFileID: 100})
+	_, _, err := handler.rekeyReplanTrackIdentitiesV3(context.Background(), &start, effective, &playback.Session{MediaFileID: 200, RequestedMediaFileID: 100}, nil)
 	if err == nil {
 		t.Fatal("a failed downloaded-subtitle lookup was treated as a track miss")
 	}
 	if !errors.Is(err, errSubtitleStoreUnavailableV3) {
 		t.Fatalf("error = %v, want a wrapped subtitle store failure", err)
+	}
+}
+
+// The durable subtitle rebuild must keep the source fields the wire inventory
+// omits and leave downloaded entries as an opaque tail: a downloaded ordinal
+// must still address the downloaded segment after the rebuild, and embedded
+// tracks must keep their container index rather than publishing the menu
+// ordinal as one.
+func TestSubtitleLayoutFromPlanInventoryPreservesSourceFieldsAndDownloadedTail(t *testing.T) {
+	items := []playback.SubtitleInventoryItemV3{
+		{TrackID: "file:42:subtitle:0", CombinedIndex: 0, Source: playback.SubtitleSourceExternalV3,
+			Language: "eng", Codec: "srt", Label: "English", Default: true},
+		{TrackID: "file:42:subtitle:1", CombinedIndex: 1, Source: playback.SubtitleSourceEmbeddedV3,
+			Language: "eng", Codec: "subrip", Label: "Signs", Default: true,
+			URL: "/stream/sess/subtitles/1.vtt?file_id=42&embedded_stream_index=7"},
+		{TrackID: "file:42:subtitle:2", CombinedIndex: 2, Source: playback.SubtitleSourceDownloadedV3,
+			Language: "spa", Codec: "srt", Label: "Spanish"},
+	}
+	live := &models.MediaFile{ID: 42,
+		ExternalSubtitles: []models.ExternalSubtitle{
+			{Path: "/subs/english.srt", Language: "eng", Format: "srt", Title: "English", Default: true},
+		},
+		SubtitleTracks: []models.SubtitleTrack{
+			{Index: 7, ContainerTrackID: "cid-7", Language: "eng", Codec: "subrip", Title: "Signs", Default: true},
+		},
+	}
+
+	external, embedded, downloaded := subtitleLayoutFromPlanInventoryV3(items, live)
+	if len(external) != 1 || external[0].Path != "/subs/english.srt" || !external[0].Default {
+		t.Fatalf("external rebuild = %+v, want the live path and the plan default", external)
+	}
+	if len(embedded) != 1 || embedded[0].Index != 7 || embedded[0].ContainerTrackID != "cid-7" || !embedded[0].Default {
+		t.Fatalf("embedded rebuild = %+v, want container index 7, its ID and the plan default", embedded)
+	}
+	if len(downloaded) != 1 || downloaded[0].TrackID != "file:42:subtitle:2" {
+		t.Fatalf("downloaded tail = %+v, want the published downloaded entry preserved", downloaded)
+	}
+
+	rebuilt := &models.MediaFile{ID: live.ID, ExternalSubtitles: external, SubtitleTracks: embedded}
+	if location, ok := classifySubtitleIndexV3(rebuilt, 2); !ok || location.source != playback.SubtitleSourceDownloadedV3 || location.offset != 0 {
+		t.Fatalf("downloaded ordinal 2 classified as %+v (ok=%v), want downloaded offset 0", location, ok)
+	}
+
+	// Without a live row the container index still comes from the scoped URL,
+	// never from the published menu position.
+	_, embeddedOnly, downloadedOnly := subtitleLayoutFromPlanInventoryV3(items, nil)
+	if len(embeddedOnly) != 1 || embeddedOnly[0].Index != 7 {
+		t.Fatalf("embedded rebuild without live row = %+v, want container index 7 from the URL", embeddedOnly)
+	}
+	if len(downloadedOnly) != 1 || downloadedOnly[0].CombinedIndex != 2 {
+		t.Fatalf("downloaded tail without live row = %+v, want the downloaded entry preserved", downloadedOnly)
+	}
+}
+
+// A replan validates its carried selection against the effective row, which can
+// be the same row the plan was minted on after enrichment re-probed it in place.
+// When no live session survives on this replica, the durable attempt plan is
+// the only evidence of the old ordering: English at ordinal 1 must remap to 0,
+// not be reused positionally onto whatever now sits at ordinal 1.
+func TestReplanSameRowReprobeUsesPredecessorInventoryWithoutLiveSession(t *testing.T) {
+	prior := &models.MediaFile{ID: 100, ContentID: "movie-1", Container: "virtual", FilePath: "virtual://movie/tt?result=abc",
+		AudioTracks: []models.AudioTrack{
+			{Index: 0, Language: "ja", Codec: "aac", Channels: 2},
+			{Index: 1, Language: "en", Codec: "aac", Channels: 2, Default: true},
+		},
+	}
+	current := &models.MediaFile{ID: 100, ContentID: "movie-1", Container: "virtual", FilePath: "virtual://movie/tt?result=abc",
+		AudioTracks: []models.AudioTrack{
+			{Index: 0, Language: "en", Codec: "aac", Channels: 2, Default: true},
+			{Index: 1, Language: "ja", Codec: "aac", Channels: 2},
+		},
+	}
+	record := playback.AttemptRecordV3{
+		PlaybackAttemptID:    "attempt-replan-reprobe",
+		SessionID:            "replan-session",
+		UserID:               1,
+		ProfileID:            "profile-1",
+		RequestedMediaFileID: prior.ID,
+		EffectiveMediaFileID: prior.ID,
+		CurrentPlan: playback.PlanV3{
+			AudioTracks: playback.AudioInventoryV3(prior),
+		},
+	}
+	durable := replanDurableInventoryV3(&record)
+	if inv, ok := durable[current.ID]; !ok || !inv.audioKnown || len(inv.audio) != 2 || inv.audio[1].Language != "en" {
+		t.Fatalf("durable inventory = %+v, want the predecessor's English@1 audio", durable[current.ID])
+	}
+	handler := &PlaybackHandler{}
+	source := handler.replanRemapSourceV3(current, nil, durable)
+	if sameMediaInventoryV3(source, current) {
+		t.Fatal("remap source reported the re-probed row as unchanged; the stale ordinal would be reused")
+	}
+	index := 1
+	start := playback.StartRequestV3{
+		AudioTrackIndex: &index,
+		AudioTrackID:    playback.TrackIDV3(current.ID, "audio", 1),
+	}
+	if err := remapAudioSelectionV3(source, current, &start); err != nil {
+		t.Fatalf("remapAudioSelectionV3: %v", err)
+	}
+	if start.AudioTrackIndex == nil || *start.AudioTrackIndex != 0 {
+		t.Fatalf("replan audio index = %v, want 0 (English on the re-probed row)", start.AudioTrackIndex)
+	}
+	if start.AudioTrackID != playback.TrackIDV3(current.ID, "audio", 0) {
+		t.Fatalf("replan audio id = %q, want ordinal 0", start.AudioTrackID)
 	}
 }
 

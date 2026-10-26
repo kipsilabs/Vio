@@ -4,6 +4,10 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/url"
+	"path/filepath"
+	"strconv"
+	"strings"
 
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
@@ -87,10 +91,17 @@ func virtualRowsNameSameReleaseV3(requested, candidate *models.MediaFile) bool {
 // captured plan inventory is. A nil source slice means the record predates that
 // inventory and the caller may fall back to the mutable catalog row.
 type predecessorPlanInventoryV3 struct {
-	audio         []models.AudioTrack
-	audioKnown    bool
-	subtitle      []models.SubtitleTrack
-	external      []models.ExternalSubtitle
+	audio      []models.AudioTrack
+	audioKnown bool
+	// subtitleItems is the durable published inventory. It is rebuilt into
+	// file-shaped layouts against the row it is compared with so the source
+	// fields the wire inventory does not carry (external path, embedded
+	// container index/ID) can be recovered from the uncooked row.
+	subtitleItems []playback.SubtitleInventoryItemV3
+	// downloaded is the opaque tail segment: downloaded entries have no
+	// models.MediaFile representation and stay addressable through the subtitle
+	// repository and their stable row IDs, exactly as before.
+	downloaded    []playback.SubtitleInventoryItemV3
 	subtitleKnown bool
 }
 
@@ -188,58 +199,205 @@ func predecessorPlanInventoryFromRecordV3(record *playback.AttemptRecordV3) pred
 	}
 	if plan.Subtitle.Inventory != nil {
 		inventory.subtitleKnown = true
-		inventory.external, inventory.subtitle = subtitleLayoutFromPlanInventoryV3(plan.Subtitle.Inventory)
+		inventory.subtitleItems = plan.Subtitle.Inventory
+		for _, item := range plan.Subtitle.Inventory {
+			if item.Source == playback.SubtitleSourceDownloadedV3 {
+				inventory.downloaded = append(inventory.downloaded, item)
+			}
+		}
 	}
 	return inventory
+}
+
+// replanDurableInventoryV3 reads the durable track inventory of the plan being
+// replanned, keyed by the effective row its selected identities were minted
+// against. A replan validates identities against the effective row, so that is
+// the entry the rekey and the drift remap need; the requested row is included
+// only when it is the same row, matching the predecessor-restart evidence.
+func replanDurableInventoryV3(record *playback.AttemptRecordV3) map[int]predecessorPlanInventoryV3 {
+	if record == nil || record.EffectiveMediaFileID <= 0 {
+		return nil
+	}
+	inventory := predecessorPlanInventoryFromRecordV3(record)
+	if !inventory.anyKnown() {
+		return nil
+	}
+	durable := map[int]predecessorPlanInventoryV3{record.EffectiveMediaFileID: inventory}
+	if record.RequestedMediaFileID > 0 && record.RequestedMediaFileID == record.EffectiveMediaFileID {
+		durable[record.RequestedMediaFileID] = inventory
+	}
+	return durable
 }
 
 // subtitleLayoutFromPlanInventoryV3 rebuilds the external and embedded track
 // arrays from a plan's published inventory. The published list is already
 // deduplicated and dense, so its per-segment order is the source order the
-// combined ordinal addresses. Downloaded entries have no models track
-// representation and stay in the subtitle repository, exactly as the remap
-// path expects.
-func subtitleLayoutFromPlanInventoryV3(items []playback.SubtitleInventoryItemV3) ([]models.ExternalSubtitle, []models.SubtitleTrack) {
+// combined ordinal addresses. The wire inventory carries the identity fields a
+// remap needs (language, codec/format, label, flags, default) but not the
+// uncooked source fields. When live still names the same track at that
+// published ordinal, its path / container index / container track ID are copied
+// through so an unchanged row compares equal and a reorder still fails closed.
+// Downloaded entries have no models track representation; they are returned as
+// the opaque tail segment and stay addressable through the subtitle repository,
+// exactly as the remap path expects.
+func subtitleLayoutFromPlanInventoryV3(items []playback.SubtitleInventoryItemV3, live *models.MediaFile) ([]models.ExternalSubtitle, []models.SubtitleTrack, []playback.SubtitleInventoryItemV3) {
 	var external []models.ExternalSubtitle
 	var embedded []models.SubtitleTrack
+	var downloaded []playback.SubtitleInventoryItemV3
+	var liveInventory []playback.SubtitleInventoryItemV3
+	if live != nil {
+		liveInventory = playback.BuildSubtitleInventoryV3(live, nil)
+	}
 	for _, item := range items {
 		switch item.Source {
 		case playback.SubtitleSourceExternalV3:
-			external = append(external, models.ExternalSubtitle{
+			sub := models.ExternalSubtitle{
 				Language:        item.Language,
 				Format:          item.Codec,
 				Title:           item.Label,
 				Forced:          item.Forced,
 				Default:         item.Default,
 				HearingImpaired: item.HearingImpaired,
-			})
+			}
+			if source, ok := subtitlePlanLiveExternalV3(item, liveInventory, live); ok {
+				sub.Path = source.Path
+				sub.Title = source.Title
+				sub.EmbeddedTitle = source.EmbeddedTitle
+				sub.Resolution = source.Resolution
+			}
+			external = append(external, sub)
 		case playback.SubtitleSourceEmbeddedV3:
-			embedded = append(embedded, models.SubtitleTrack{
-				Index:           item.CombinedIndex,
+			track := models.SubtitleTrack{
+				Index:           subtitlePlanEmbeddedIndexV3(item),
 				Language:        item.Language,
 				Codec:           item.Codec,
 				Title:           item.Label,
 				Forced:          item.Forced,
 				Default:         item.Default,
 				HearingImpaired: item.HearingImpaired,
-			})
+			}
+			if source, ok := subtitlePlanLiveEmbeddedV3(item, liveInventory, live); ok {
+				track.Index = source.Index
+				track.ContainerTrackID = source.ContainerTrackID
+				track.Title = source.Title
+				track.EmbeddedTitle = source.EmbeddedTitle
+				track.Resolution = source.Resolution
+			}
+			embedded = append(embedded, track)
+		case playback.SubtitleSourceDownloadedV3:
+			downloaded = append(downloaded, item)
 		}
 	}
-	return external, embedded
+	return external, embedded, downloaded
 }
 
-// rekeySourceFileV3 loads the inventory a track identity's ordinal was minted
-// against. The catalog row is the base; when the id names the session's own
-// effective or evidence row, the session's retained inventory is preferred
-// because an in-place re-probe can rewrite the row under the same id.
-func (h *PlaybackHandler) rekeySourceFileV3(ctx context.Context, fileID int, session *playback.Session) *models.MediaFile {
-	return h.rekeySourceFileWithInventoryV3(ctx, fileID, session, nil)
+// subtitlePlanLiveExternalV3 returns the live sidecar the plan item still
+// names, if any. Identity must agree on every attribute the plan published; a
+// reordered or re-probed row therefore keeps the plan-derived values and lets
+// the fingerprint report drift instead of borrowing the new path.
+func subtitlePlanLiveExternalV3(item playback.SubtitleInventoryItemV3, liveInventory []playback.SubtitleInventoryItemV3, live *models.MediaFile) (models.ExternalSubtitle, bool) {
+	if live == nil || item.CombinedIndex < 0 || item.CombinedIndex >= len(liveInventory) {
+		return models.ExternalSubtitle{}, false
+	}
+	if liveInventory[item.CombinedIndex].Source != playback.SubtitleSourceExternalV3 {
+		return models.ExternalSubtitle{}, false
+	}
+	sourceIndex, ok := playback.SubtitleInventoryOwnSourceIndexV3(live, item.CombinedIndex)
+	if !ok || sourceIndex < 0 || sourceIndex >= len(live.ExternalSubtitles) {
+		return models.ExternalSubtitle{}, false
+	}
+	source := live.ExternalSubtitles[sourceIndex]
+	if !strings.EqualFold(source.Language, item.Language) ||
+		!strings.EqualFold(source.Format, item.Codec) ||
+		source.Forced != item.Forced || source.HearingImpaired != item.HearingImpaired ||
+		!strings.EqualFold(subtitleExternalLiveLabelV3(source), item.Label) {
+		return models.ExternalSubtitle{}, false
+	}
+	return source, true
 }
 
-// rekeySourceFileWithInventoryV3 is rekeySourceFileV3 with the predecessor
-// plan's durable inventory available. Durable evidence wins over a live session
-// or the catalog row because the request names that exact attempt: the row
-// under the same id may have been re-probed since the identity was minted.
+// subtitlePlanLiveEmbeddedV3 is the embedded counterpart of
+// subtitlePlanLiveExternalV3.
+func subtitlePlanLiveEmbeddedV3(item playback.SubtitleInventoryItemV3, liveInventory []playback.SubtitleInventoryItemV3, live *models.MediaFile) (models.SubtitleTrack, bool) {
+	if live == nil || item.CombinedIndex < 0 || item.CombinedIndex >= len(liveInventory) {
+		return models.SubtitleTrack{}, false
+	}
+	if liveInventory[item.CombinedIndex].Source != playback.SubtitleSourceEmbeddedV3 {
+		return models.SubtitleTrack{}, false
+	}
+	sourceIndex, ok := playback.SubtitleInventoryOwnSourceIndexV3(live, item.CombinedIndex)
+	if !ok || sourceIndex < len(live.ExternalSubtitles) {
+		return models.SubtitleTrack{}, false
+	}
+	sourceIndex -= len(live.ExternalSubtitles)
+	if sourceIndex < 0 || sourceIndex >= len(live.SubtitleTracks) {
+		return models.SubtitleTrack{}, false
+	}
+	source := live.SubtitleTracks[sourceIndex]
+	if !strings.EqualFold(source.Language, item.Language) ||
+		!strings.EqualFold(source.Codec, item.Codec) ||
+		source.Forced != item.Forced || source.HearingImpaired != item.HearingImpaired ||
+		!strings.EqualFold(subtitleEmbeddedLiveLabelV3(source), item.Label) {
+		return models.SubtitleTrack{}, false
+	}
+	return source, true
+}
+
+func subtitleExternalLiveLabelV3(sub models.ExternalSubtitle) string {
+	for _, value := range []string{sub.Title, sub.EmbeddedTitle, filepathBaseV3(sub.Path), sub.Language} {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func subtitleEmbeddedLiveLabelV3(track models.SubtitleTrack) string {
+	for _, value := range []string{track.Title, track.EmbeddedTitle, track.Language} {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+// subtitlePlanEmbeddedIndexV3 recovers the container stream index from the
+// session-scoped sidecar URL the scoped plan inventory carries. Without it the
+// published combined ordinal is only a menu position and must not be mistaken
+// for the container index the extraction path addresses.
+func subtitlePlanEmbeddedIndexV3(item playback.SubtitleInventoryItemV3) int {
+	if item.URL == "" {
+		return item.CombinedIndex
+	}
+	parsed, err := url.Parse(item.URL)
+	if err != nil {
+		return item.CombinedIndex
+	}
+	raw := parsed.Query().Get(playback.EmbeddedSubtitleStreamIndexParamV3)
+	if raw == "" {
+		return item.CombinedIndex
+	}
+	index, err := strconv.Atoi(raw)
+	if err != nil || index < 0 {
+		return item.CombinedIndex
+	}
+	return index
+}
+
+func filepathBaseV3(path string) string {
+	if path == "" {
+		return ""
+	}
+	return filepath.Base(path)
+}
+
+// rekeySourceFileWithInventoryV3 loads the inventory a track identity's ordinal
+// was minted against. The catalog row is the base; when the id names the
+// session's own effective or evidence row, the session's retained inventory is
+// preferred because an in-place re-probe can rewrite the row under the same id.
+// A predecessor plan's durable inventory wins over both because the request
+// names that exact attempt: the row under the same id may have been re-probed
+// since the identity was minted.
 func (h *PlaybackHandler) rekeySourceFileWithInventoryV3(ctx context.Context, fileID int, session *playback.Session, durable map[int]predecessorPlanInventoryV3) *models.MediaFile {
 	if fileID <= 0 {
 		return nil
@@ -261,8 +419,10 @@ func (h *PlaybackHandler) rekeySourceFileWithInventoryV3(ctx context.Context, fi
 			evidence.AudioTracks = inventory.audio
 		}
 		if inventory.subtitleKnown {
-			evidence.SubtitleTracks = inventory.subtitle
-			evidence.ExternalSubtitles = inventory.external
+			// Recover the uncooked source fields from the row that still names the
+			// same inventory; the opaque downloaded tail is deliberately not mapped
+			// onto file tracks.
+			evidence.ExternalSubtitles, evidence.SubtitleTracks, _ = subtitleLayoutFromPlanInventoryV3(inventory.subtitleItems, source)
 		}
 		return evidence
 	}
@@ -464,8 +624,11 @@ func (h *PlaybackHandler) constrainRekeyedSubtitleSelectionV3(ctx context.Contex
 // name the same candidate or are rows the session itself carries, but re-check
 // the carried ordinal against the effective row's inventory exactly like the
 // start path: row acceptance alone does not prove the ordinal addresses the
-// same stream, because a substituted candidate can reorder its tracks.
-func (h *PlaybackHandler) rekeyReplanTrackIdentitiesV3(ctx context.Context, start *playback.StartRequestV3, file *models.MediaFile, session *playback.Session) (audioUnavailable, subtitleUnavailable bool, err error) {
+// same stream, because a substituted candidate can reorder its tracks. durable
+// carries the plan's captured inventory so an echoed identity on another
+// committed row is interpreted against that generation, not a mutated catalog
+// row; a same-row identity is normalized by the caller's drift remap instead.
+func (h *PlaybackHandler) rekeyReplanTrackIdentitiesV3(ctx context.Context, start *playback.StartRequestV3, file *models.MediaFile, session *playback.Session, durable map[int]predecessorPlanInventoryV3) (audioUnavailable, subtitleUnavailable bool, err error) {
 	if h == nil || h.fileResolver == nil || start == nil || file == nil {
 		return false, false, nil
 	}
@@ -485,11 +648,14 @@ func (h *PlaybackHandler) rekeyReplanTrackIdentitiesV3(ctx context.Context, star
 		}
 	}
 	acceptedSource := func(kind, trackID string) (*models.MediaFile, int, bool) {
+		// A same-row identity is not re-keyed here: it is still minted against
+		// this row, and an in-place re-probe is repaired by the caller's drift
+		// remap, which prefers the same durable inventory before this check.
 		embeddedFileID, embeddedKind, ordinal, ok := playback.ParseTrackIDV3(trackID)
 		if !ok || embeddedKind != kind || embeddedFileID == file.ID {
 			return nil, 0, false
 		}
-		source := h.rekeySourceFileV3(ctx, embeddedFileID, session)
+		source := h.rekeySourceFileWithInventoryV3(ctx, embeddedFileID, session, durable)
 		accepted := committed[embeddedFileID]
 		if !accepted && source != nil {
 			accepted = virtualRowsNameSameReleaseV3(file, source)
