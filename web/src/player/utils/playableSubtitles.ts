@@ -32,8 +32,18 @@ export function resolvePlayableSubtitles(
   if (selectableSessionTracks.length > 0) {
     return selectableSessionTracks;
   }
-  // The watch-detail fallback is not an inventory: it carries no delivery
-  // information, so a track without a URL there is simply unplayable.
+  if (sessionTracks.length === 0) {
+    // The plan published no inventory at all (deferred probe, or an effective
+    // candidate the plan has not learned yet). The watch detail is the only
+    // session evidence available; list it so the overlay menu is useful, and
+    // let the bounded catalog poll repair the plan with real URLs. A track
+    // without a URL is still selectable here: the server mints the sidecar when
+    // the track change replans.
+    return fallbackTracks;
+  }
+  // A non-empty plan list that is merely unselectable is a declared
+  // placeholder, not evidence the file has tracks. The watch-detail fallback
+  // carries no delivery information, so only rows with a URL are playable.
   return fallbackTracks.filter(hasPlayableUrl);
 }
 
@@ -181,6 +191,63 @@ export function isSameSubtitleTrack(a: SubtitleTrackIdentity, b: SubtitleTrackId
   const bTrackId = normalizeIdentityValue(b.trackId);
   if (aTrackId && bTrackId) return aTrackId === bTrackId;
   return subtitleDescriptorKey(a) === subtitleDescriptorKey(b);
+}
+
+/**
+ * Whether the identity carries any descriptor evidence at all. An identity
+ * built only from a committed ordinal and a re-mintable id cannot name a row
+ * against a different inventory, so it must not fall through to a match on
+ * empty descriptor fields.
+ */
+function hasSubtitleDescriptor(identity: SubtitleTrackIdentity): boolean {
+  return (
+    normalizeIdentityValue(identity.language) !== "" ||
+    normalizeIdentityValue(identity.codec) !== "" ||
+    identity.forced === true ||
+    identity.hearingImpaired === true ||
+    normalizeIdentityValue(identity.source) !== "" ||
+    identity.streamIndex != null ||
+    normalizeIdentityValue(identity.artifactId) !== ""
+  );
+}
+
+/**
+ * Maps the committed subtitle selection onto the inventory the menu currently
+ * renders.
+ *
+ * A committed ordinal names a row in the plan's own inventory. A replacement
+ * plan can re-mint the ordinals, and adoption can preserve the verified rows
+ * while the incoming plan publishes a different order, so stamping the plan
+ * ordinal onto the displayed rows can light (and request) another language.
+ * The asset identity is the authority: a direct `track_id` lookup is only
+ * accepted when the descriptor agrees, and a descriptor is only accepted when
+ * it names exactly one displayed row. `null` means no unambiguous row matches,
+ * which must hold outbound selection rather than guess.
+ */
+export function resolveAppliedSubtitleIndex(
+  displayed: readonly SubtitleTrackIdentity[],
+  selected: SubtitleTrackIdentity | null | undefined,
+): number | null {
+  if (!selected || !hasSubtitleDescriptor(selected)) return null;
+  const selectedId = normalizeIdentityValue(selected.trackId);
+  let idMatch: number | null = null;
+  let idMatches = 0;
+  let descriptorMatch: number | null = null;
+  let descriptorMatches = 0;
+  for (let index = 0; index < displayed.length; index += 1) {
+    const candidate = displayed[index]!;
+    const sameDescriptor = subtitleDescriptorKey(candidate) === subtitleDescriptorKey(selected);
+    if (!sameDescriptor) continue;
+    descriptorMatches += 1;
+    descriptorMatch = index;
+    if (selectedId && normalizeIdentityValue(candidate.trackId) === selectedId) {
+      idMatches += 1;
+      idMatch = index;
+    }
+  }
+  if (idMatches === 1) return displayed[idMatch!]!.index;
+  if (descriptorMatches === 1) return displayed[descriptorMatch!]!.index;
+  return null;
 }
 
 /**
