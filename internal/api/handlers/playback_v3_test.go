@@ -8856,6 +8856,75 @@ func TestHandleReplanPlaybackV3RecoveryDropsSubtitleLostInSameRowReprobe(t *test
 	}
 }
 
+// An output change falls back to the edition already playing when the
+// requested one cannot honor the selected subtitle. That fallback row can
+// itself have been re-probed in place, so it must be re-checked too: keeping
+// the carried ordinal there would play whatever now occupies it under the same
+// file id.
+func TestHandleReplanPlaybackV3OutputChangeFallbackDropsSubtitleLostInReprobe(t *testing.T) {
+	file := v3HandlerFixtureFile(t)
+	file.SubtitleTracks = []models.SubtitleTrack{
+		{Index: 0, Language: "ja", Codec: "subrip"},
+		{Index: 1, Language: "en", Codec: "subrip"},
+	}
+	files := map[int]*models.MediaFile{file.ID: file}
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), mapPlaybackFileResolver{files: files})
+	stubCopySeekAnchorV3(handler)
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "true"}}
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+
+	startRequest := v3HandlerStartRequest()
+	startRequest.QualityPreference = "auto"
+	subtitleIndex := 1
+	startRequest.SubtitleTrackIndex = &subtitleIndex
+	startRequest.SubtitleTrackID = playback.TrackIDV3(file.ID, "subtitle", subtitleIndex)
+	started := startV3PlaybackForHandlerTest(t, handler, startRequest)
+	if started.PlaybackPlan == nil || started.PlaybackPlan.SelectedTracks.Subtitle == nil {
+		t.Fatalf("start did not select the subtitle: %#v", started.PlaybackPlan)
+	}
+
+	// The playing row is re-probed in place and keeps ordinal 1 with French
+	// behind it.
+	file.SubtitleTracks = []models.SubtitleTrack{
+		{Index: 0, Language: "ja", Codec: "subrip"},
+		{Index: 1, Language: "fr", Codec: "subrip"},
+	}
+
+	response := postPlaybackReplanV3(t, handler, started.SessionID, playback.ReplanRequestV3{
+		ProtocolVersion:       playback.ProtocolV3,
+		Operation:             playback.ReplanOperationOutputChangeV3,
+		PlaybackAttemptID:     startRequest.PlaybackAttemptID,
+		ReplanRequestID:       "replan-output-subtitle-drift-0001",
+		FailedPlanID:          started.PlaybackPlan.PlanID,
+		PlanAttemptID:         "plan-attempt-output-subtitle-drift-0001",
+		PlanAttemptKey:        started.PlaybackPlan.PlanAttemptKey,
+		AttemptCount:          1,
+		QualityPreference:     "auto",
+		PositionSeconds:       12,
+		SelectedTracks:        started.PlaybackPlan.SelectedTracks,
+		Capabilities:          startRequest.Capabilities,
+		ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	})
+	if response.Terminal != nil || response.PlaybackPlan == nil {
+		t.Fatalf("output change replan = %#v terminal=%+v", response.PlaybackPlan, response.Terminal)
+	}
+	if response.PlaybackPlan.EffectiveMediaFileID != file.ID {
+		t.Fatalf("effective file = %d, want the kept active row %d", response.PlaybackPlan.EffectiveMediaFileID, file.ID)
+	}
+	if selected := response.PlaybackPlan.SelectedTracks.Subtitle; selected != nil {
+		t.Fatalf("fallback subtitle selection = %#v, want the lost selection dropped", selected)
+	}
+	dropped := false
+	for _, warning := range response.PlaybackPlan.DegradationWarnings {
+		if warning.Code == playback.DegradationWarningSubtitleTrackUnavailableV3 {
+			dropped = true
+		}
+	}
+	if !dropped {
+		t.Fatalf("fallback did not report the dropped subtitle: %#v", response.PlaybackPlan.DegradationWarnings)
+	}
+}
+
 // An unchanged virtual candidate whose catalog row already carries complete
 // probed evidence must skip the synchronous re-probe on replan: no provider
 // round-trip, no probe, and the loaded row is used directly.
