@@ -88,6 +88,84 @@ func TestHandleReplanPlaybackV3DeadSessionFailsFastWithoutReplanSlot(t *testing.
 	}
 }
 
+// A replan for a session that has already ended must return the same fast 404
+// as an unknown session: the attempt row can outlive a finished play, and the
+// handler must reject it before the slot, mutex, and advisory lock.
+func TestHandleReplanPlaybackV3EndedSessionFailsFastWithoutReplanSlot(t *testing.T) {
+	manager := playback.NewSessionManager(0, 0)
+	file := v3HandlerFixtureFile(t)
+	handler := NewPlaybackHandler(manager, testPlaybackFileResolver{file: file})
+
+	live, err := manager.StartSession(1, "profile-1", file.ID, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("start session: %v", err)
+	}
+	sessionID := live.ID
+	const attemptID = "attempt-ended-session-0001"
+	if err := handler.PlanStoreV3.SaveAttempt(context.Background(), playback.AttemptRecordV3{
+		SessionID:         sessionID,
+		PlaybackAttemptID: attemptID,
+		UserID:            1,
+		ProfileID:         "profile-1",
+		ExpiresAt:         time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("save attempt: %v", err)
+	}
+	if err := manager.FinishSession(context.Background(), sessionID); err != nil {
+		t.Fatalf("finish session: %v", err)
+	}
+
+	// Saturate the replan slot budget exactly as the dead-session test does; a
+	// request that reaches the queue would block until its context expires.
+	handler.v3ReplanSlotsOnce.Do(func() { handler.v3ReplanSlots = make(chan struct{}, 1) })
+	handler.v3ReplanSlots <- struct{}{}
+
+	base := v3HandlerStartRequest()
+	replan := playback.ReplanRequestV3{
+		ProtocolVersion:       playback.ProtocolV3,
+		Operation:             playback.ReplanOperationFailureRecoveryV3,
+		PlaybackAttemptID:     attemptID,
+		ReplanRequestID:       "replan-ended-session-0001",
+		FailedPlanID:          "plan-failed-0001",
+		PlanAttemptID:         "plan-attempt-0001",
+		PlanAttemptKey:        "v3:plan-attempt-key-0001",
+		AttemptCount:          1,
+		PositionSeconds:       1,
+		Failure:               playback.FailureV3{Classification: "transcode_start_failed"},
+		Capabilities:          base.Capabilities,
+		ClientPlaybackContext: base.ClientPlaybackContext,
+	}
+	body, err := json.Marshal(replan)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(newAuthorizedPlaybackContext(), 5*time.Second)
+	defer cancel()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/"+sessionID+"/replan", strings.NewReader(string(body))).WithContext(ctx)
+	req = withPlaybackRouteParam(req, "session_id", sessionID)
+	rr := httptest.NewRecorder()
+
+	started := time.Now()
+	handler.HandleReplanPlaybackV3(rr, req)
+	elapsed := time.Since(started)
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body = %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), playbackSessionNotFoundErrorCode) {
+		t.Fatalf("body = %s, want %s", rr.Body.String(), playbackSessionNotFoundErrorCode)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("ended-session replan took %v; it queued for a replan slot instead of failing fast", elapsed)
+	}
+	select {
+	case handler.v3ReplanSlots <- struct{}{}:
+		t.Fatal("ended-session replan consumed the saturated replan slot")
+	default:
+	}
+}
+
 // reapingAfterFirstGetAttemptPlanStoreV3 models a stop landing while a replan
 // request waits on the replan slot and the per-session locks: the pre-lock read
 // sees the session live, and the post-lock re-read reaps it from the in-memory

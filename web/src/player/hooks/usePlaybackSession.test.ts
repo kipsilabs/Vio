@@ -13333,3 +13333,179 @@ describe("usePlaybackSession track change guards", () => {
     unmount();
   });
 });
+
+describe("usePlaybackSession terminal refusals", () => {
+  it("retires a broken plan and surfaces a retryable error card on adaptation_unavailable", async () => {
+    let starts = 0;
+    let replans = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        starts += 1;
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3(),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/session-1/replan")) {
+        replans += 1;
+        return jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "adaptation_unavailable",
+          terminal: {
+            reason: "adaptation_unavailable",
+            message: "No validated playback route is available for this source and output route.",
+            retryable: false,
+          },
+        });
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    act(() => {
+      result.current.recoverFromFailure({ classification: "decoder_error" }, 30);
+    });
+
+    // The broken transport stays broken: a refusal that names no playable
+    // adaptation leaves nothing to render, so the player must stop showing a
+    // spinner over a plan the server cannot serve.
+    await waitFor(() => expect(result.current.errorTitle).toBe("No playable version found"));
+    expect(result.current.plan).toBeNull();
+    expect(result.current.loading).toBe(false);
+    expect(result.current.errorReason).toBe("adaptation_unavailable");
+    expect(replans).toBe(1);
+
+    // Retry is a fresh start, not a replan against the broken route.
+    act(() => result.current.retryStart());
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+    expect(starts).toBe(2);
+
+    unmount();
+  });
+
+  it("keeps the playing plan when a quality change is refused with adaptation_unavailable", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3(),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/session-1/replan")) {
+        return jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "adaptation_unavailable",
+          terminal: {
+            reason: "adaptation_unavailable",
+            message: "No validated playback route is available for this source and output route.",
+            retryable: false,
+          },
+        });
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    act(() => result.current.changeQuality("720p", 30));
+    await waitFor(() => expect(result.current.errorReason).toBe("adaptation_unavailable"));
+
+    // A refused quality change is not a failed transport: the old stream is
+    // still the viewer's, so only the refusal surfaces (the menu owns the copy).
+    expect(result.current.plan).not.toBeNull();
+    expect(result.current.errorTitle).toBe("No playable version found");
+
+    unmount();
+  });
+
+  it("enters the session-gone state and restarts with a fresh start", async () => {
+    const startBodies: Array<Record<string, unknown>> = [];
+    const replanBodies: Array<Record<string, unknown>> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        startBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        const sessionId = `session-${startBodies.length}`;
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: sessionId,
+            playback_plan: fixturePlanV3({ session_id: sessionId }),
+          },
+          { status: 201 },
+        );
+      }
+      const replanMatch = /\/playback\/([^/]+)\/replan$/.exec(url);
+      if (replanMatch) {
+        replanBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        return jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "playable",
+          session_id: replanMatch[1]!,
+          playback_plan: fixturePlanV3({ session_id: replanMatch[1]! }),
+        });
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan?.session_id).toBe("session-1"));
+    act(() => result.current.updatePlaybackState(120, true));
+
+    // A control-ticket mint (or a stream/subtitle fetch) proved the session is
+    // gone. No replan may be issued against the dead id.
+    act(() => result.current.markSessionGone());
+    expect(result.current.connectionStatus).toBe("gone");
+    expect(result.current.connectionErrorTitle).toBe("Playback session expired");
+
+    act(() => result.current.restartPlayback());
+    await waitFor(() => expect(result.current.plan?.session_id).toBe("session-2"));
+    expect(result.current.connectionStatus).toBe("connected");
+    expect(replanBodies).toHaveLength(0);
+    expect(startBodies).toHaveLength(2);
+    // The restart resumes where the viewer was, not at the request's origin.
+    expect(startBodies[1]).toMatchObject({ start_position: 120 });
+
+    unmount();
+  });
+});

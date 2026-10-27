@@ -8838,6 +8838,24 @@ describe("VideoPlayer lost connection", () => {
     expect(screen.getByRole("button", { name: "Go Back" })).toBeInTheDocument();
   });
 
+  it("offers Restart playback for a session answered gone", () => {
+    const onRestartPlayback = vi.fn();
+    renderPlayer({
+      onRestartPlayback,
+      connectionStatus: "gone",
+      connectionErrorTitle: "Playback session expired",
+      connectionError:
+        "This playback session is no longer active. Start it again to keep watching.",
+    });
+
+    expect(screen.getByRole("alert")).toHaveTextContent("Playback session expired");
+    // A dead session is never reconnected or replanned in place.
+    expect(screen.queryByText("Try again")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Restart playback" }));
+    expect(onRestartPlayback).toHaveBeenCalledOnce();
+    expect(screen.getByRole("button", { name: "Go Back" })).toBeInTheDocument();
+  });
+
   it("keeps subtitles off when a reconnect had to start a new session", async () => {
     const onSubtitleTrackChange = vi.fn();
     const sidecarTrack: PlayerSubtitleInfo = {

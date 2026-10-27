@@ -158,6 +158,8 @@ function playbackSession(
     retryConnection: vi.fn(),
     expediteReconnect: vi.fn(),
     reportSessionLost: vi.fn(),
+    markSessionGone: vi.fn(),
+    restartPlayback: vi.fn(),
     invalidatePlan: vi.fn().mockResolvedValue(true),
     reanchorSeek: vi.fn().mockResolvedValue(true),
     refreshSubtitles: vi.fn(),
@@ -381,6 +383,56 @@ describe("WatchPage playback errors", () => {
     fireEvent.click(screen.getByRole("button", { name: "Try again" }));
     expect(retryStart).toHaveBeenCalledTimes(1);
     expect(screen.getByRole("button", { name: "Go Back" })).toBeInTheDocument();
+  });
+
+  it("offers Try again for an adaptation refusal the server marked non-retryable", () => {
+    const retryStart = vi.fn();
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        plan: null,
+        streamUrl: null,
+        sessionId: null,
+        mediaFileId: null,
+        errorTitle: "No playable version found",
+        error: "Vio couldn't find a way to play this file on this device.",
+        errorReason: "adaptation_unavailable",
+        errorRetryable: false,
+        retryStart,
+      }),
+    );
+
+    render(createElement(WatchPage, watchPageProps));
+
+    expect(screen.getByText("No playable version found")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    expect(retryStart).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("button", { name: "Go Back" })).toBeInTheDocument();
+  });
+
+  it("offers Restart playback for a session the server answered gone", () => {
+    const restartPlayback = vi.fn();
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        plan: null,
+        streamUrl: null,
+        sessionId: null,
+        mediaFileId: null,
+        errorTitle: null,
+        error: null,
+        connectionStatus: "gone",
+        connectionErrorTitle: "Playback session expired",
+        connectionError:
+          "This playback session is no longer active. Start it again to keep watching.",
+        restartPlayback,
+      }),
+    );
+
+    render(createElement(WatchPage, watchPageProps));
+
+    expect(screen.getByText("Playback session expired")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Try again" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Restart playback" }));
+    expect(restartPlayback).toHaveBeenCalledTimes(1);
   });
 
   it("keeps a non-retryable terminal a Go Back-only dead-end", () => {

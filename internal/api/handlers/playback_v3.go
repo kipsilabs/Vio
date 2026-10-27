@@ -42,6 +42,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/tonemap"
 	"github.com/Silo-Server/silo-server/internal/transcodenode"
 	"github.com/Silo-Server/silo-server/internal/userstore"
+	"github.com/Silo-Server/silo-server/internal/virtuallibrary/resolver"
 )
 
 const (
@@ -7575,8 +7576,138 @@ func (h *PlaybackHandler) v3SessionStreamState(ctx context.Context, session *pla
 			evidenceSet = session.VirtualSubtitleEvidenceSet
 		}
 		state.VirtualSubtitleEvidenceSet = evidenceSet
+		// The new evidence generation is committed with this write, so the
+		// viewer's subtitle position must be re-keyed onto it in the same
+		// commit. A recorded rotation (the replan drift carry, or a candidate
+		// move this request did not evaluate itself) either commits the carried
+		// ordinal or records the one it could not preserve; a second rotation then
+		// re-keys from the carried position.
+		state.VirtualSubtitleSelectionIndex = result.SubtitleTrackIndex
+		state.VirtualSubtitleSelectionSet = true
+		if outcome, ok := subtitleRotationOutcomeFromContextV3(ctx); ok && outcome.ToFileID == file.ID {
+			if outcome.Matched {
+				if outcome.ToIndex == result.SubtitleTrackIndex {
+					state.VirtualSubtitleCarryFromIndex = outcome.FromIndex
+					state.VirtualSubtitleCarryToIndex = outcome.ToIndex
+					state.VirtualSubtitleCarrySet = true
+					if !outcome.Exact {
+						appendSubtitleCarryWarningV3(result.Plan)
+					}
+				}
+			} else {
+				// A confirmed miss is terminal for that ordinal even when the
+				// planner installed some other subtitle in the same commit; the
+				// pre-rotation URL must not be reinterpreted positionally.
+				state.VirtualSubtitleCarryLostIndex = outcome.FromIndex
+				state.VirtualSubtitleCarryLostSet = true
+			}
+		} else if h.virtualEvidenceMovedV3(session, file, virtualURI) {
+			// The request did not evaluate the carry (for example a rehydrated
+			// replan that resolved a refreshed candidate directly). Re-derive it
+			// from the session's retained evidence at the commit so the new
+			// generation still records the carried position or its loss.
+			h.commitDerivedSubtitleRotationCarryV3(ctx, session, file, &state, result)
+		} else if session.VirtualSubtitleCarryLostSet && result.SubtitleTrackIndex < 0 {
+			// The verdict outlives later non-rotation commits while the viewer
+			// still has subtitles off. A commit that installs a subtitle is a
+			// fresh selection against the current inventory and clears it.
+			state.VirtualSubtitleCarryLostIndex = session.VirtualSubtitleCarryLostIndex
+			state.VirtualSubtitleCarryLostSet = true
+		}
 	}
 	return state
+}
+
+// virtualEvidenceMovedV3 reports whether the session's retained subtitle
+// evidence belongs to a different candidate or layout than the file being
+// committed. It is the rotation signal the stream-state commit needs when no
+// replan drift pass already evaluated the carry.
+func (h *PlaybackHandler) virtualEvidenceMovedV3(session *playback.Session, file *models.MediaFile, virtualURI string) bool {
+	if session == nil || file == nil || !session.VirtualSubtitleEvidenceSet {
+		return false
+	}
+	if evidenceID := session.VirtualSubtitleEvidenceFileID; evidenceID > 0 && evidenceID != file.ID {
+		return true
+	}
+	evidenceURI := strings.TrimSpace(session.VirtualSubtitleEvidenceURI)
+	if evidenceURI != "" && !sameVirtualCandidate(evidenceURI, virtualURI) {
+		return true
+	}
+	return !playback.SubtitleLayoutsEqualIncludingExternal(
+		file.SubtitleTracks, file.ExternalSubtitles, session.VirtualSubtitleTracks, session.VirtualExternalSubtitles)
+}
+
+// commitDerivedSubtitleRotationCarryV3 carries the session's committed subtitle
+// position from the evidence generation it was minted on onto the candidate
+// this commit installs. It writes the same carry/loss state the explicit replan
+// path records, so both entry points leave an in-flight subtitle request with a
+// committed answer.
+func (h *PlaybackHandler) commitDerivedSubtitleRotationCarryV3(ctx context.Context, session *playback.Session, file *models.MediaFile, state *playback.SessionStreamState, result playback.PlannerResultV3) {
+	if session == nil || file == nil || state == nil || !session.VirtualSubtitleSelectionSet || session.VirtualSubtitleSelectionIndex < 0 {
+		return
+	}
+	evidenceID := session.VirtualSubtitleEvidenceFileID
+	if evidenceID <= 0 {
+		evidenceID = file.ID
+	}
+	// Authority is the same as the replan remap source: the durable plan that
+	// minted the ordinal first, the session's retained evidence second, and the
+	// live row only when neither exists.
+	var durable map[int]predecessorPlanInventoryV3
+	if h.PlanStoreV3 != nil {
+		if record, err := h.PlanStoreV3.GetAttempt(ctx, session.ID); err == nil && record != nil {
+			durable = replanDurableInventoryV3(record)
+		}
+	}
+	carry := h.rekeySourceFileWithInventoryV3(ctx, evidenceID, session, durable)
+	if carry.subtitleEvidenceErr != nil {
+		slog.WarnContext(ctx, "cannot commit the carried subtitle position: the evidence tail is unreadable",
+			"component", "playback", "session", session.ID, "file_id", file.ID, "error", carry.subtitleEvidenceErr)
+		return
+	}
+	key, published, exact, matched, err := h.carrySubtitleSelectionAcrossRotationV3(ctx, session, carry, file, session.VirtualSubtitleSelectionIndex)
+	if err != nil {
+		slog.WarnContext(ctx, "cannot commit the carried subtitle position: the downloaded subtitle list is unreadable",
+			"component", "playback", "session", session.ID, "file_id", file.ID, "error", err)
+		return
+	}
+	fromIndex := session.VirtualSubtitleSelectionIndex
+	if matched && published == result.SubtitleTrackIndex {
+		state.VirtualSubtitleCarryFromIndex = fromIndex
+		state.VirtualSubtitleCarryToIndex = published
+		state.VirtualSubtitleCarrySet = true
+		if !exact {
+			appendSubtitleCarryWarningV3(result.Plan)
+		}
+		return
+	}
+	if !matched && result.SubtitleTrackIndex < 0 {
+		state.VirtualSubtitleCarryLostIndex = fromIndex
+		state.VirtualSubtitleCarryLostSet = true
+		slog.InfoContext(ctx, "subtitle selection is unavailable after the candidate rotation",
+			"component", "playback", "event", "subtitle_unavailable_after_rotation",
+			"playback_session_id", session.ID,
+			"from_candidate_id", virtualResultCandidateID(session.VirtualSubtitleEvidenceURI),
+			"to_candidate_id", virtualResultCandidateID(file.FilePath),
+			"carried_index", fromIndex,
+			"carried_muxer_class", key.MuxerClass)
+	}
+}
+
+// appendSubtitleCarryWarningV3 adds the fuzzy-carry degradation warning to a
+// plan at most once. The warning is additive: playback keeps the viewer's
+// subtitle, and the client learns that the rotated release's track differs on a
+// tiebreak rather than being told the selection is gone.
+func appendSubtitleCarryWarningV3(plan *playback.PlanV3) {
+	if plan == nil {
+		return
+	}
+	for _, warning := range plan.DegradationWarnings {
+		if warning.Code == playback.DegradationWarningSubtitleCarryV3 {
+			return
+		}
+	}
+	plan.DegradationWarnings = append(plan.DegradationWarnings, playback.SubtitleCarryWarningV3())
 }
 
 func (h *PlaybackHandler) updateV3SessionState(ctx context.Context, session *playback.Session, file *models.MediaFile, result playback.PlannerResultV3, transport preparedTransportV3, mode mediaAuthModeV3) error {
@@ -8464,6 +8595,32 @@ func candidateSubtitleLocalFailureV3(err *candidateErrorV3) bool {
 		return true
 	}
 	return err.Stage == candidateStageSubtitleArtifact
+}
+
+// virtualReplanRotationExhaustedV3 reports whether a failed virtual replan
+// rehydration has already proved that no provider candidate can serve the
+// session's release. The rotation retry marks its own failure, and a
+// provider-wide outage or a candidate walk that produced no usable stream
+// carries the same meaning. A release verdict (an absent pin, a marked-failed
+// candidate) is deliberately not exhaustion: rotation may have found a
+// genuinely different release and refused to substitute it, which leaves the
+// sibling-edition walk as the correct recovery for an auto selection.
+func virtualReplanRotationExhaustedV3(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, errVirtualRotationExhaustedV3) {
+		return true
+	}
+	if errors.Is(err, resolver.ErrProviderUnavailable) {
+		return true
+	}
+	if isVirtualCandidateDeadError(err) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "no streams available from provider") ||
+		strings.Contains(msg, "provider unavailable")
 }
 
 func classifyVirtualReplanExhaustionV3(initialVirtualErr error, candidateErrs []*candidateErrorV3) *transportErrorV3 {
@@ -9774,6 +9931,15 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			reason: "replan_virtual_input_timeout", message: "Virtual stream input resolution was interrupted during replan.", retryable: true, cause: virtualRehydrationErr,
 		}
 	}
+	// The virtual resolver has already walked every provider candidate for this
+	// release (and its stale-source fallback) without a usable source, or the
+	// provider itself is down. The sibling-edition walk below would resolve each
+	// alternate through the same provider, so it can only re-pay the resolve and
+	// probe budgets before reaching this verdict again. Answer with the same
+	// classified terminal now; only the time to reach it changes.
+	if virtualRehydrationFailed && !virtualDecodeRotation && virtualReplanRotationExhaustedV3(virtualRehydrationErr) {
+		return playback.DecisionResponseV3{}, *record, nil, classifyVirtualReplanExhaustionV3(virtualRehydrationErr, nil)
+	}
 
 	var result playback.PlannerResultV3
 	var toneMapCapabilityErr error
@@ -9978,18 +10144,89 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		// positionally. A track change is excluded because the client's new
 		// selection was made against the current inventory, not the plan-time
 		// one.
+		// A recorded candidate rotation is the one case where the carried
+		// subtitle ordinal must be re-identified with the strict release matcher
+		// at the commit, not with the generic edition-switch remap below. The
+		// verdict travels with the request so the stream-state commit can record
+		// the new position and answer pre-rotation subtitle URLs.
+		rotationRecorded := !trackChange && virtualCandidateRotationRecordedV3(r.Context(), session, currentEffectiveFile, h.fileResolver)
+		subtitleRotationCarry := subtitleRotationOutcomeV3{}
+		// The carried ordinal was minted against the durable plan inventory when
+		// this replica has it; otherwise the session's retained evidence (with
+		// the downloaded tail recovered from its attempt plan) is the authority.
+		// The live row speaks only when neither exists, which a recorded rotation
+		// never allows.
+		rotationCarryID := currentEffectiveFile.ID
+		if _, durableKnown := durableInventory[rotationCarryID]; !durableKnown && session != nil && session.VirtualSubtitleEvidenceFileID > 0 {
+			rotationCarryID = session.VirtualSubtitleEvidenceFileID
+		}
+		rotationCarry := h.rekeySourceFileWithInventoryV3(r.Context(), rotationCarryID, session, durableInventory)
 		if !trackChange && (intentChange && currentEffectiveFile.ID != effectiveFile.ID ||
 			!sameMediaInventoryV3(remapSource, effectiveFile) ||
-			virtualCandidateRotationRecordedV3(r.Context(), session, currentEffectiveFile, h.fileResolver)) {
+			rotationRecorded) {
 			candidateStart := start
 			remapErr := remapAudioSelectionV3(remapSource, effectiveFile, &candidateStart)
 			subtitleReconciled := false
+			// carrySubtitleSelectionV3 reconciles the carried ordinal against the
+			// candidate this attempt will serve. It returns the outcome so the
+			// commit can record it; a fuzzy match keeps the selection and reports
+			// one warning, a miss is reported through the existing unavailable
+			// sentinel and degrade paths.
+			carrySubtitleSelectionV3 := func(target *models.MediaFile, request *playback.StartRequestV3) (bool, error) {
+				from, to, exact, matched, attempted, carryErr := h.reconcileRotationSubtitleSelectionV3(r.Context(), session, rotationCarry, target, request)
+				if !attempted {
+					// The ordinal does not classify against the evidence (a
+					// captured-empty inventory, or a downloaded ordinal without
+					// its captured tail). Leave it to the historical remap,
+					// whose captured-empty and no-tail rules already fail closed.
+					return false, nil
+				}
+				subtitleRotationCarry = subtitleRotationOutcomeV3{
+					Recorded:         true,
+					FromIndex:        from,
+					ToIndex:          to,
+					Matched:          matched,
+					Exact:            exact,
+					ToFileID:         target.ID,
+					ToCandidateURI:   strings.TrimSpace(target.FilePath),
+					FromCandidateURI: strings.TrimSpace(session.VirtualSubtitleEvidenceURI),
+				}
+				if carryErr != nil {
+					return true, carryErr
+				}
+				if matched {
+					return true, nil
+				}
+				slog.InfoContext(r.Context(), "subtitle selection is unavailable after the candidate rotation",
+					"component", "playback", "event", "subtitle_unavailable_after_rotation",
+					"playback_session_id", session.ID,
+					"from_candidate_id", virtualResultCandidateID(session.VirtualSubtitleEvidenceURI),
+					"to_candidate_id", virtualResultCandidateID(target.FilePath),
+					"carried_index", from)
+				return true, errSubtitleUnavailableInTargetV3
+			}
 			if remapErr == nil && (candidateStart.SubtitleTrackIndex != nil || candidateStart.SubtitleTrackID != "") {
-				_, remapErr = h.remapSubtitleSelectionWithCarryV3(r.Context(), remapCarry, effectiveFile, &candidateStart)
-				// A successful remap leaves the ordinal addressing the effective
-				// row's current inventory. Re-checking it through the plan-time
-				// tail in the re-key step below would remap it a second time.
-				subtitleReconciled = remapErr == nil
+				// The same-inventory fast path still runs first: when the rotated
+				// release publishes exactly the evidence layout, the carried
+				// ordinal already names the same position and no identity carry
+				// (which could fail closed on an otherwise harmless duplicate) is
+				// needed. Only a genuinely different inventory is re-identified
+				// with the strict rotation matcher.
+				if rotationRecorded && (remapCarry.file == nil || !sameSubtitleInventoryV3(remapCarry.file, effectiveFile)) {
+					attempted, carryErr := carrySubtitleSelectionV3(effectiveFile, &candidateStart)
+					if attempted {
+						remapErr = carryErr
+					} else {
+						_, remapErr = h.remapSubtitleSelectionWithCarryV3(r.Context(), remapCarry, effectiveFile, &candidateStart)
+					}
+					// A successful carry leaves the ordinal addressing the
+					// effective row's current inventory; the re-key step below must
+					// not read it through the plan-time tail a second time.
+					subtitleReconciled = remapErr == nil
+				} else {
+					_, remapErr = h.remapSubtitleSelectionWithCarryV3(r.Context(), remapCarry, effectiveFile, &candidateStart)
+					subtitleReconciled = remapErr == nil
+				}
 			}
 			if remapErr != nil && outputChange {
 				// An output refresh may make the requested edition viable again,
@@ -10002,12 +10239,20 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				// tracks under the same id. Re-check the selection against the row
 				// actually kept, or the fallback would play whatever now occupies
 				// the old ordinal.
-				if !trackChange && !sameMediaInventoryV3(remapSource, effectiveFile) {
+				if !trackChange && (!sameMediaInventoryV3(remapSource, effectiveFile) || rotationRecorded) {
 					fallbackStart := start
 					fallbackErr := remapAudioSelectionV3(remapSource, effectiveFile, &fallbackStart)
 					fallbackSubtitleReconciled := false
 					if fallbackErr == nil && (fallbackStart.SubtitleTrackIndex != nil || fallbackStart.SubtitleTrackID != "") {
-						_, fallbackErr = h.remapSubtitleSelectionWithCarryV3(r.Context(), remapCarry, effectiveFile, &fallbackStart)
+						if rotationRecorded && (remapCarry.file == nil || !sameSubtitleInventoryV3(remapCarry.file, effectiveFile)) {
+							if attempted, carryErr := carrySubtitleSelectionV3(effectiveFile, &fallbackStart); attempted {
+								fallbackErr = carryErr
+							} else {
+								_, fallbackErr = h.remapSubtitleSelectionWithCarryV3(r.Context(), remapCarry, effectiveFile, &fallbackStart)
+							}
+						} else {
+							_, fallbackErr = h.remapSubtitleSelectionWithCarryV3(r.Context(), remapCarry, effectiveFile, &fallbackStart)
+						}
 						fallbackSubtitleReconciled = fallbackErr == nil
 					}
 					switch {
@@ -10064,6 +10309,12 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				subtitleSelectionCurrent = subtitleReconciled
 			}
 		}
+		// Only a verdict that belongs to the candidate this replan actually
+		// commits may travel to the stream state; a later fallback that kept a
+		// different row supersedes it and records its own.
+		if subtitleRotationCarry.Recorded && subtitleRotationCarry.ToFileID == effectiveFile.ID {
+			r = r.WithContext(withSubtitleRotationOutcomeV3(r.Context(), subtitleRotationCarry))
+		}
 		start.FileID = effectiveFile.ID
 		if err := preflightPlaybackFile(r.Context(), effectiveFile, h.MissingMarker, h.EventsHub); err != nil {
 			return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{
@@ -10086,7 +10337,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		// name the session's current effective row after a serve association
 		// moved it without rewriting the durable record. Normalize those onto
 		// the row this replan validates against; a foreign row is still dropped.
-		replanAudioUnavailable, replanSubtitleUnavailable, rekeyErr := h.rekeyReplanTrackIdentitiesV3(r.Context(), &start, effectiveFile, session, durableInventory, subtitleSelectionCurrent)
+		replanAudioUnavailable, replanSubtitleUnavailable, rekeyErr := h.rekeyReplanTrackIdentitiesWithRotationV3(r.Context(), &start, effectiveFile, session, durableInventory, subtitleSelectionCurrent, rotationRecorded && !subtitleRotationCarry.Recorded)
 		if rekeyErr != nil {
 			// A subtitle-store failure cannot prove the carried track is absent.
 			// Keep the playing plan authoritative and let the viewer retry

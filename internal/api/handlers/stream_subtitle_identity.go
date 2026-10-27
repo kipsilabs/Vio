@@ -16,6 +16,12 @@ import (
 var (
 	errSubtitleIdentityInvalid     = errors.New("invalid subtitle identity")
 	errSubtitleIdentityUnavailable = errors.New("the selected subtitle identity is unavailable")
+	// errSubtitleSourceChangedAfterRotation reports a subtitle URL minted before
+	// a virtual candidate rotation whose carried ordinal the rotation could not
+	// preserve. The serve path answers the existing retryable
+	// subtitle_source_changed 409 without resolving the dead pin or spawning
+	// ffmpeg; the client replans and re-selects from the rotated inventory.
+	errSubtitleSourceChangedAfterRotation = errors.New("the selected subtitle changed after a candidate rotation")
 )
 
 // resolveSubtitleEditionSwitch re-maps a subtitle request that names the
@@ -269,6 +275,22 @@ func (h *StreamHandler) resolveSubtitleSourceRequest(
 	// independently callable use; invalid pins are returned, never remapped.
 	if err := validateSubtitleIdentityPinShape(query); err != nil {
 		return nil, 0, err
+	}
+	// A committed candidate rotation carried the viewer's subtitle selection to
+	// a new ordinal. A URL minted before the rotation still names the old one,
+	// so it is answered on the carried ordinal; when the rotation could not
+	// preserve the selection, that exact ordinal is terminal and answers the
+	// retryable source-changed verdict instead of resolving the dead candidate.
+	// A stable identity pin is a fresh address minted from the current
+	// inventory, so it is never rewritten by a committed carry.
+	if !hasSubtitleIdentityPin(query) {
+		if session.VirtualSubtitleCarryLostSet && index == session.VirtualSubtitleCarryLostIndex {
+			return nil, 0, errSubtitleSourceChangedAfterRotation
+		}
+		if session.VirtualSubtitleCarrySet && index == session.VirtualSubtitleCarryFromIndex &&
+			session.VirtualSubtitleCarryFromIndex != session.VirtualSubtitleCarryToIndex {
+			index = session.VirtualSubtitleCarryToIndex
+		}
 	}
 	// After an edition switch the session's effective file differs from the
 	// requested edition. A request naming the requested (old) edition must not

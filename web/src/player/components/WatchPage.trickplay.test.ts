@@ -146,6 +146,8 @@ function playbackSession(
     retryConnection: vi.fn(),
     expediteReconnect: vi.fn(),
     reportSessionLost: vi.fn(),
+    markSessionGone: vi.fn(),
+    restartPlayback: vi.fn(),
     invalidatePlan: vi.fn().mockResolvedValue(true),
     reanchorSeek: vi.fn().mockResolvedValue(true),
     refreshSubtitles: vi.fn(),

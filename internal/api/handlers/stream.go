@@ -2381,6 +2381,13 @@ func (h *StreamHandler) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 	// the session's planned candidate at the same time.
 	file, trackIndex, err = h.resolveSubtitleSourceRequest(r.Context(), file, session, trackIndex, r.URL.Query())
 	if err != nil {
+		if errors.Is(err, errSubtitleSourceChangedAfterRotation) {
+			// The rotation already proved this ordinal cannot be carried. Fail
+			// closed before any source resolve or ffmpeg spawn; the client
+			// replans and re-selects from the rotated inventory.
+			writeSubtitleSourceChanged(w)
+			return
+		}
 		if errors.Is(err, errSubtitleIdentityInvalid) {
 			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		} else {
@@ -2823,6 +2830,10 @@ func (h *StreamHandler) SubtitleFonts(ctx context.Context, in SubtitleFontReques
 	}
 	file, trackIndex, err = h.resolveSubtitleSourceRequest(ctx, file, session, trackIndex, in.Query)
 	if err != nil {
+		if errors.Is(err, errSubtitleSourceChangedAfterRotation) {
+			return nil, false, apiError(http.StatusConflict, "subtitle_source_changed",
+				"The selected subtitle track changed on the media source; retry")
+		}
 		if errors.Is(err, errSubtitleIdentityInvalid) {
 			return nil, false, apiError(http.StatusBadRequest, "bad_request", err.Error())
 		}
@@ -3047,6 +3058,10 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 	// virtual candidate so the same release the plan probed is extracted.
 	file, trackIndex, err = h.resolveSubtitleSourceRequest(r.Context(), file, session, trackIndex, r.URL.Query())
 	if err != nil {
+		if errors.Is(err, errSubtitleSourceChangedAfterRotation) {
+			writeSubtitleSourceChanged(w)
+			return
+		}
 		if errors.Is(err, errSubtitleIdentityInvalid) {
 			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		} else {
@@ -4331,6 +4346,10 @@ func writeVirtualAudioSelectionInvalid(w http.ResponseWriter) {
 // retryable 4xx, never a 500 or an ambiguous partial stream.
 func writeSubtitleSourceChanged(w http.ResponseWriter) {
 	clearSubtitleCoverageHeaders(w.Header())
+	// A compliant client waits before replaying the same subtitle request; the
+	// rotation verdict is final for that ordinal, so an immediate retry can only
+	// re-earn it. Clients that ignore the header keep their existing cadence.
+	w.Header().Set("Retry-After", strconv.Itoa(subtitleSourceRetryAfterSeconds))
 	writeError(w, http.StatusConflict, "subtitle_source_changed",
 		"The selected subtitle track changed on the media source; retry")
 }
