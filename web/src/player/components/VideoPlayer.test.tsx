@@ -446,11 +446,13 @@ describe("subtitle marker reconciliation", () => {
       url: item.url ?? "",
     });
 
+    const onSubtitleTrackChange = vi.fn();
     const { rerenderPlayer } = renderPlayer({
       plan: basePlan,
       subtitleUrls: [toPlayerTrack(english), toPlayerTrack(french)],
       subtitleMode: "always",
       preferredSubtitleLanguage: "eng",
+      onSubtitleTrackChange,
     });
     await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
 
@@ -478,6 +480,130 @@ describe("subtitle marker reconciliation", () => {
     });
 
     await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(1));
+    // The first render of the replacement plan still had the outgoing ordinal
+    // (0), which now names French. Reconciliation must not dispatch that row
+    // before moving the marker onto the committed English asset.
+    expect(onSubtitleTrackChange).not.toHaveBeenCalled();
+
+    // A later render of the settled plan must not fall back to the outgoing
+    // ordinal either.
+    rerenderPlayer({
+      plan: fixturePlanV3({
+        ...directPlan,
+        plan_id: "plan:subtitle-remint",
+        plan_attempt_key: "v3:subtitle-remint",
+        subtitle: {
+          mode: "render",
+          track_id: shiftedEnglish.track_id,
+          inventory: [shiftedFrench, shiftedEnglish],
+        },
+        selected_tracks: {
+          audio: { id: "file:7:audio:0", index: 0 },
+          subtitle: { id: shiftedEnglish.track_id, index: 1 },
+        },
+      }),
+      subtitleUrls: [toPlayerTrack(shiftedFrench), toPlayerTrack(shiftedEnglish)],
+      subtitleMode: "always",
+    });
+    await act(async () => {});
+    expect(controls.current?.activeSubtitleIndex).toBe(1);
+    expect(onSubtitleTrackChange).not.toHaveBeenCalled();
+  });
+
+  it("keeps the committed subtitle when adoption preserves verified rows in another order", async () => {
+    const english = fixtureSubtitleInventoryItemV3({
+      track_id: "file:7:subtitle:0",
+      combined_index: 0,
+      language: "eng",
+      label: "English",
+    });
+    const french = fixtureSubtitleInventoryItemV3({
+      track_id: "file:7:subtitle:1",
+      combined_index: 1,
+      language: "fra",
+      label: "French",
+    });
+    const toPlayerTrack = (
+      item: ReturnType<typeof fixtureSubtitleInventoryItemV3>,
+    ): PlayerSubtitleInfo => ({
+      index: item.combined_index,
+      media_file_id: 7,
+      track_id: item.track_id,
+      language: item.language ?? "",
+      codec: item.codec,
+      label: item.label ?? "",
+      source: "embedded",
+      url: item.url ?? "",
+    });
+    const basePlan = fixturePlanV3({
+      ...directPlan,
+      subtitle: { mode: "render", track_id: english.track_id, inventory: [english, french] },
+      selected_tracks: {
+        audio: { id: "file:7:audio:0", index: 0 },
+        subtitle: { id: english.track_id, index: 0 },
+      },
+    });
+    const onSubtitleTrackChange = vi.fn();
+    const { rerenderPlayer } = renderPlayer({
+      plan: basePlan,
+      subtitleUrls: [toPlayerTrack(english), toPlayerTrack(french)],
+      subtitleMode: "always",
+      preferredSubtitleLanguage: "eng",
+      onSubtitleTrackChange,
+    });
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
+
+    // Adoption keeps the verified rows (English at 0) while the incoming
+    // provisional plan publishes them reordered and selects English at 1. The
+    // marker must follow the preserved row, not the plan's ordinal.
+    const shiftedEnglish = { ...english, combined_index: 1, track_id: "file:7:subtitle:1" };
+    const shiftedFrench = { ...french, combined_index: 0, track_id: "file:7:subtitle:0" };
+    rerenderPlayer({
+      plan: fixturePlanV3({
+        ...directPlan,
+        plan_id: "plan:subtitle-preserved-adoption",
+        plan_attempt_key: "v3:subtitle-preserved-adoption",
+        subtitle: {
+          mode: "render",
+          track_id: shiftedEnglish.track_id,
+          inventory: [shiftedFrench, shiftedEnglish],
+        },
+        selected_tracks: {
+          audio: { id: "file:7:audio:0", index: 0 },
+          subtitle: { id: shiftedEnglish.track_id, index: 1 },
+        },
+      }),
+      subtitleUrls: [toPlayerTrack(english), toPlayerTrack(french)],
+      subtitleMode: "always",
+    });
+
+    await act(async () => {});
+    expect(controls.current?.activeSubtitleIndex).toBe(0);
+    expect(onSubtitleTrackChange).not.toHaveBeenCalled();
+
+    // Re-render the settled plan; the preserved row is still the committed
+    // asset even though its ordinal and derived id differ from the plan's.
+    rerenderPlayer({
+      plan: fixturePlanV3({
+        ...directPlan,
+        plan_id: "plan:subtitle-preserved-adoption",
+        plan_attempt_key: "v3:subtitle-preserved-adoption",
+        subtitle: {
+          mode: "render",
+          track_id: shiftedEnglish.track_id,
+          inventory: [shiftedFrench, shiftedEnglish],
+        },
+        selected_tracks: {
+          audio: { id: "file:7:audio:0", index: 0 },
+          subtitle: { id: shiftedEnglish.track_id, index: 1 },
+        },
+      }),
+      subtitleUrls: [toPlayerTrack(english), toPlayerTrack(french)],
+      subtitleMode: "always",
+    });
+    await act(async () => {});
+    expect(controls.current?.activeSubtitleIndex).toBe(0);
+    expect(onSubtitleTrackChange).not.toHaveBeenCalled();
   });
 
   it("does not stamp a placeholder plan ordinal onto watch-detail fallback rows", async () => {
