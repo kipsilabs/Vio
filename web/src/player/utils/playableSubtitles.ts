@@ -193,6 +193,40 @@ export function isSameSubtitleTrack(a: SubtitleTrackIdentity, b: SubtitleTrackId
   return subtitleDescriptorKey(a) === subtitleDescriptorKey(b);
 }
 
+/** The asset a server track id names, without the trailing combined ordinal. */
+function subtitleTrackIdAssetKey(trackId: string): string {
+  return trackId.replace(/:\d+$/, "");
+}
+
+/**
+ * Whether the plan's committed selection acknowledges a pending manual pick.
+ *
+ * `track_id` embeds the plan's combined ordinal, so a plan that reorders its
+ * inventory re-mints the id for the same asset: French at `…:1` comes back at
+ * `…:0`. `isSameSubtitleTrack` alone reads that acknowledgment as a different
+ * pick, leaving the optimistic marker to resolve against whatever row inherited
+ * the captured ordinal. The descriptor names the asset itself, so it decides
+ * when both rows carry one, and the id may then differ only in its trailing
+ * ordinal. A pick whose descriptor differs stays pending.
+ */
+export function subtitleSelectionAcknowledgesPending(
+  planSelected: SubtitleTrackIdentity | null,
+  pending: SubtitleTrackIdentity,
+): boolean {
+  if (planSelected === null) return false;
+  if (!hasSubtitleDescriptor(planSelected) || !hasSubtitleDescriptor(pending)) {
+    return isSameSubtitleTrack(planSelected, pending);
+  }
+  if (subtitleDescriptorKey(planSelected) !== subtitleDescriptorKey(pending)) return false;
+  const selectedId = normalizeIdentityValue(planSelected.trackId);
+  const pendingId = normalizeIdentityValue(pending.trackId);
+  if (selectedId && pendingId) {
+    // Same asset; only the ordinal the plan assigned it may have moved.
+    return subtitleTrackIdAssetKey(selectedId) === subtitleTrackIdAssetKey(pendingId);
+  }
+  return true;
+}
+
 /**
  * Whether the identity carries any descriptor evidence at all. An identity
  * built only from a committed ordinal and a re-mintable id cannot name a row
