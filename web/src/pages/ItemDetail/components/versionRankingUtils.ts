@@ -190,10 +190,12 @@ export function selectDefaultVersion(
 
   const effectiveEditionKey = preferredEditionKey ?? userData?.last_edition_key;
 
-  // Prefer the version they last watched.
+  // Prefer the version they last watched, even when the enrichment refresh has
+  // changed its edition metadata. A persisted pick that still exists must not
+  // be silently replaced by another row because an edition key moved.
   if (userData?.last_file_id != null) {
     const matching = versions.find((v) => v.file_id === userData.last_file_id);
-    if (matching && (!effectiveEditionKey || matching.edition_key === effectiveEditionKey)) {
+    if (matching) {
       return matching;
     }
   }
@@ -232,7 +234,20 @@ export function selectDefaultPlaybackVariantVersion(
   userData?: LeafItemUserData,
   qualityPreference?: string | null,
   preferredEditionKey?: string | null,
+  requestedFileId?: number | null,
 ): FileVersion | null {
+  // The viewer's own request outranks every server hint: progress persistence
+  // records the row that actually served the bytes, so `last_file_id` can name
+  // a substitute for the neutral or requested row they picked. Keep the request
+  // while the catalog still carries it; a row it dropped stays missing so the
+  // page asks for a new pick rather than choosing silently.
+  if (requestedFileId != null) {
+    const requested = versions.find((version) => version.file_id === requestedFileId);
+    if (requested) {
+      return requested;
+    }
+  }
+
   if (!playbackVariants || playbackVariants.length === 0) {
     return selectDefaultVersion(versions, userData, qualityPreference, preferredEditionKey);
   }
@@ -258,14 +273,13 @@ export function selectDefaultPlaybackVariantVersion(
     );
   }
 
+  // The persisted pick wins even when an edition filter above moved the
+  // candidate set: choosing a different edition silently would be a server
+  // substitution in the page's own selection logic.
   if (userData?.last_file_id != null) {
-    for (const variant of candidateVariants) {
-      for (const part of variant.parts ?? []) {
-        const matching = part.versions.find((version) => version.file_id === userData.last_file_id);
-        if (matching) {
-          return matching;
-        }
-      }
+    const matching = versions.find((version) => version.file_id === userData.last_file_id);
+    if (matching) {
+      return matching;
     }
   }
 
