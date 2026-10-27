@@ -779,6 +779,19 @@ function WatchPlaybackHostContent() {
     [activeItem, activeRequest, currentProfile?.id],
   );
 
+  // A version switch inside the player is committed as soon as the server's
+  // plan names the requested row. Persist that change here rather than only on
+  // an exit state: post-roll close and next-episode navigation never reach
+  // `handleEnded`.
+  const handleRequestedVersionChange = useCallback(
+    (fileId: number | null) => {
+      const contentId = activeItem?.content_id ?? activeRequest?.contentId;
+      if (!contentId || fileId == null) return;
+      rememberRequestedFileId(contentId, fileId, currentProfile?.id ?? null);
+    },
+    [activeItem, activeRequest, currentProfile?.id],
+  );
+
   const applyExitStateToCache = useCallback(
     (exitState?: PlaybackExitState) => {
       const contentId = activeItem?.content_id ?? activeRequest?.contentId;
@@ -1237,6 +1250,7 @@ function WatchPlaybackHostContent() {
           playbackRequestKey={requestKeyValue}
           onNavigateEpisode={handleNavigateEpisode}
           onEnded={handleEnded}
+          onRequestedVersionChange={handleRequestedVersionChange}
           onExit={handleExit}
           onMinimize={handleMinimize}
           displayMode={playerDisplayMode}

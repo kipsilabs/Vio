@@ -483,6 +483,41 @@ describe("WatchPage exit selection", () => {
       }),
     );
   });
+
+  it("reports a committed requested version change to the host", async () => {
+    const onRequestedVersionChange = vi.fn();
+    playbackSessionMock.mockReturnValue(
+      playbackSession({ plan: fixturePlanV3({ requested_media_file_id: 7 }) }),
+    );
+    const { rerender } = render(
+      createElement(WatchPage, {
+        ...watchPageProps,
+        onRequestedVersionChange,
+      }),
+    );
+    await waitFor(() => expect(videoPlayerMock).toHaveBeenCalled());
+    // Mounting on the current row is not a switch.
+    expect(onRequestedVersionChange).not.toHaveBeenCalled();
+
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        plan: fixturePlanV3({
+          plan_id: "plan:version-switch",
+          requested_media_file_id: 8,
+          effective_media_file_id: 8,
+        }),
+        mediaFileId: 8,
+      }),
+    );
+    rerender(
+      createElement(WatchPage, {
+        ...watchPageProps,
+        onRequestedVersionChange,
+      }),
+    );
+
+    await waitFor(() => expect(onRequestedVersionChange).toHaveBeenCalledWith(8));
+  });
 });
 
 describe("WatchPage audio menu", () => {

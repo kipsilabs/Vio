@@ -420,6 +420,13 @@ export interface WatchPageProps {
   seriesContext?: SeriesContext;
   onNavigateEpisode?: (contentId: string, trigger: PlaybackStartTrigger) => void;
   onEnded?: (state?: PlaybackExitState) => void | Promise<void>;
+  /**
+   * Fires when the committed requested version changes during playback (a
+   * version switch or a server-resolved replacement). The host persists the
+   * viewer's request, because completion paths such as post-roll close and
+   * next-episode navigation do not pass through `onEnded`.
+   */
+  onRequestedVersionChange?: (fileId: number | null) => void;
   onExit: (state?: PlaybackExitState) => void | Promise<void>;
   onMinimize?: (state?: PlaybackExitState) => void | Promise<void>;
   resumeHints?: ResumeHints;
