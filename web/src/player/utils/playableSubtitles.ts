@@ -194,6 +194,63 @@ export function isSameSubtitleTrack(a: SubtitleTrackIdentity, b: SubtitleTrackId
 }
 
 /**
+ * Whether the identity carries any descriptor evidence at all. An identity
+ * built only from a committed ordinal and a re-mintable id cannot name a row
+ * against a different inventory, so it must not fall through to a match on
+ * empty descriptor fields.
+ */
+function hasSubtitleDescriptor(identity: SubtitleTrackIdentity): boolean {
+  return (
+    normalizeIdentityValue(identity.language) !== "" ||
+    normalizeIdentityValue(identity.codec) !== "" ||
+    identity.forced === true ||
+    identity.hearingImpaired === true ||
+    normalizeIdentityValue(identity.source) !== "" ||
+    identity.streamIndex != null ||
+    normalizeIdentityValue(identity.artifactId) !== ""
+  );
+}
+
+/**
+ * Maps the committed subtitle selection onto the inventory the menu currently
+ * renders.
+ *
+ * A committed ordinal names a row in the plan's own inventory. A replacement
+ * plan can re-mint the ordinals, and adoption can preserve the verified rows
+ * while the incoming plan publishes a different order, so stamping the plan
+ * ordinal onto the displayed rows can light (and request) another language.
+ * The asset identity is the authority: a direct `track_id` lookup is only
+ * accepted when the descriptor agrees, and a descriptor is only accepted when
+ * it names exactly one displayed row. `null` means no unambiguous row matches,
+ * which must hold outbound selection rather than guess.
+ */
+export function resolveAppliedSubtitleIndex(
+  displayed: readonly SubtitleTrackIdentity[],
+  selected: SubtitleTrackIdentity | null | undefined,
+): number | null {
+  if (!selected || !hasSubtitleDescriptor(selected)) return null;
+  const selectedId = normalizeIdentityValue(selected.trackId);
+  let idMatch: number | null = null;
+  let idMatches = 0;
+  let descriptorMatch: number | null = null;
+  let descriptorMatches = 0;
+  for (let index = 0; index < displayed.length; index += 1) {
+    const candidate = displayed[index]!;
+    const sameDescriptor = subtitleDescriptorKey(candidate) === subtitleDescriptorKey(selected);
+    if (!sameDescriptor) continue;
+    descriptorMatches += 1;
+    descriptorMatch = index;
+    if (selectedId && normalizeIdentityValue(candidate.trackId) === selectedId) {
+      idMatches += 1;
+      idMatch = index;
+    }
+  }
+  if (idMatches === 1) return displayed[idMatch!]!.index;
+  if (descriptorMatches === 1) return displayed[descriptorMatch!]!.index;
+  return null;
+}
+
+/**
  * Returns the selection that must be sent to settle the plan's authoritative
  * selected_tracks state, or undefined when the current plan already matches
  * the UI. Sidecar selections are included: the server owns durable track
