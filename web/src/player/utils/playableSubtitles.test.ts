@@ -479,6 +479,29 @@ describe("pendingServerSubtitleSelection", () => {
     ).toBeUndefined();
   });
 
+  it("does not settle an equal ordinal-derived id that names another language", () => {
+    // The menu kept verified rows (English at 0, French at 1) while the
+    // replacement plan re-minted the same ids in the other order and selects
+    // English at 1. The clicked French row carries `:1` too; the id alone
+    // would read the pick as already playing and send nothing.
+    const planSelectedEnglish = identity({
+      index: 1,
+      trackId: "file:7:subtitle:1",
+      language: "eng",
+      codec: "subrip",
+      source: "embedded",
+    });
+    const displayedFrench = identity({
+      index: 1,
+      trackId: "file:7:subtitle:1",
+      language: "fra",
+      codec: "subrip",
+      source: "embedded",
+    });
+    expect(isSameSubtitleTrack(planSelectedEnglish, displayedFrench)).toBe(true);
+    expect(pendingServerSubtitleSelection(planSelectedEnglish, displayedFrench)).toBe(1);
+  });
+
   it("offers the selection when the server resolved it to off (caller guard dedupes)", () => {
     expect(
       pendingServerSubtitleSelection(null, identity({ index: 2, trackId: "file:7:subtitle:2" })),

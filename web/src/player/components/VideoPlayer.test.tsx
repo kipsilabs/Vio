@@ -604,6 +604,22 @@ describe("subtitle marker reconciliation", () => {
     await act(async () => {});
     expect(controls.current?.activeSubtitleIndex).toBe(0);
     expect(onSubtitleTrackChange).not.toHaveBeenCalled();
+
+    // A manual pick on the preserved rows must still reach the session. The
+    // displayed French row carries `file:7:subtitle:1`, which is the id the
+    // plan assigned to English; comparing ids alone would read the click as
+    // already playing and send nothing while the marker moved to French. The
+    // request carries the clicked row, so the session resolver names the
+    // plan's French row (`file:7:subtitle:0`).
+    act(() => controls.current?.onSubtitleSelect?.(1));
+    await waitFor(() =>
+      expect(onSubtitleTrackChange).toHaveBeenCalledWith(
+        1,
+        expect.anything(),
+        expect.objectContaining({ language: "fra" }),
+      ),
+    );
+    expect(controls.current?.activeSubtitleIndex).toBe(1);
   });
 
   it("keeps a manual pick when its acknowledging plan re-mints the ordinal", async () => {
