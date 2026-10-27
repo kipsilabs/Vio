@@ -4419,6 +4419,85 @@ describe("VideoPlayer plan failure recovery", () => {
     );
   });
 
+  it("rolls a refused manual subtitle pick back to the accepted track without retrying", async () => {
+    const english = fixtureSubtitleInventoryItemV3({
+      track_id: "file:7:subtitle:0",
+      combined_index: 0,
+      language: "eng",
+      label: "English",
+    });
+    const french = fixtureSubtitleInventoryItemV3({
+      track_id: "file:7:subtitle:1",
+      combined_index: 1,
+      language: "fra",
+      label: "French",
+    });
+    const toPlayerTrack = (
+      item: ReturnType<typeof fixtureSubtitleInventoryItemV3>,
+    ): PlayerSubtitleInfo => ({
+      index: item.combined_index,
+      media_file_id: 7,
+      track_id: item.track_id,
+      language: item.language ?? "",
+      codec: item.codec,
+      label: item.label ?? "",
+      source: item.source === "external" || item.source === "downloaded" ? item.source : "embedded",
+      url: item.url ?? "",
+    });
+    const onSubtitleTrackChange = vi.fn();
+    const acceptedPlan = fixturePlanV3({
+      ...directPlan,
+      subtitle: { mode: "render", track_id: english.track_id, inventory: [english, french] },
+      selected_tracks: {
+        audio: { id: "file:7:audio:0", index: 0 },
+        subtitle: { id: english.track_id, index: 0 },
+      },
+    });
+    const { rerenderPlayer } = renderPlayer({
+      plan: acceptedPlan,
+      subtitleUrls: [toPlayerTrack(english), toPlayerTrack(french)],
+      subtitleMode: "always",
+      preferredSubtitleLanguage: "eng",
+      onSubtitleTrackChange,
+    });
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
+    expect(onSubtitleTrackChange).not.toHaveBeenCalled();
+
+    // The viewer picks French, and the server refuses that track without a
+    // replacement plan. The accepted English row must stay committed and the
+    // rejected pick must not be replayed by the outbound effect.
+    act(() => controls.current?.onSubtitleSelect?.(1));
+    await waitFor(() => expect(onSubtitleTrackChange).toHaveBeenCalledOnce());
+    expect(onSubtitleTrackChange).toHaveBeenLastCalledWith(
+      1,
+      expect.anything(),
+      expect.objectContaining({ index: 1 }),
+    );
+
+    rerenderPlayer({ replanError: "Silo could not apply the subtitle selection." });
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
+    expect(onSubtitleTrackChange).toHaveBeenCalledOnce();
+
+    // Extra renders of the same refusal must not arm the rejected pick again.
+    rerenderPlayer({ replanError: "Silo could not apply the subtitle selection." });
+    await act(async () => {});
+    expect(controls.current?.activeSubtitleIndex).toBe(0);
+    expect(onSubtitleTrackChange).toHaveBeenCalledOnce();
+
+    rerenderPlayer({ replanError: null });
+    await act(async () => {});
+    expect(onSubtitleTrackChange).toHaveBeenCalledOnce();
+
+    // Only a new user action retries the track.
+    act(() => controls.current?.onSubtitleSelect?.(1));
+    await waitFor(() => expect(onSubtitleTrackChange).toHaveBeenCalledTimes(2));
+    expect(onSubtitleTrackChange).toHaveBeenLastCalledWith(
+      1,
+      expect.anything(),
+      expect.objectContaining({ index: 1 }),
+    );
+  });
+
   // The rollback is otherwise silent: the refusal only renders inside the
   // quality menu, which a user who just picked a subtitle never opens.
   it("toasts the server's refusal when a subtitle change is rolled back", async () => {
@@ -7926,7 +8005,7 @@ describe("VideoPlayer version switch UX", () => {
 
     await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
     // Stale outgoing index (1, which is English in rev-2) must never be dispatched!
-    expect(onSubtitleTrackChange).not.toHaveBeenCalledWith(1, expect.anything());
+    expect(onSubtitleTrackChange).not.toHaveBeenCalledWith(1, expect.anything(), expect.anything());
     expect(onSubtitleTrackChange).toHaveBeenCalledWith(
       0,
       expect.anything(),
@@ -8085,7 +8164,7 @@ describe("VideoPlayer version switch UX", () => {
 
     await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
     // Must never dispatch the stale outgoing index (1, which is English in new candidate).
-    expect(onSubtitleTrackChange).not.toHaveBeenCalledWith(1, expect.anything());
+    expect(onSubtitleTrackChange).not.toHaveBeenCalledWith(1, expect.anything(), expect.anything());
     expect(onSubtitleTrackChange).toHaveBeenCalledWith(
       0,
       expect.anything(),
