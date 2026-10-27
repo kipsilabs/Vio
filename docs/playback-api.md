@@ -512,7 +512,10 @@ degradation warning instead of being applied to whichever track now occupies the
 old position. When the request names `previous_playback_attempt_id`, that
 attempt's captured plan inventory is the historical record even if the catalog
 row under the same id was re-probed since; the mutable row is never treated as
-proof of the old ordering. A re-key that cannot read the subtitle store fails retryably
+proof of the old ordering. Without a predecessor id, the single matching live
+session's durable attempt plan is read the same way when it is available,
+including the downloaded subtitle tail a file-shaped inventory comparison cannot
+see. A re-key that cannot read the subtitle store fails retryably
 instead of guessing from unverified evidence or leaving the old ordinal to land
 on another track.
 

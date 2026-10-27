@@ -525,7 +525,43 @@ func (h *PlaybackHandler) rekeySourceFileWithInventoryV3(ctx context.Context, fi
 	evidence.AudioTracks = session.VirtualAudioTracks
 	evidence.SubtitleTracks = session.VirtualSubtitleTracks
 	evidence.ExternalSubtitles = session.VirtualExternalSubtitles
-	return carriedInventorySourceV3{file: evidence}
+	carry := carriedInventorySourceV3{file: evidence}
+	// The session evidence arrays describe the file-shaped inventory but cannot
+	// describe the downloaded tail. Without it a carried downloaded ordinal is
+	// indistinguishable from an unchanged one and would be reused positionally
+	// onto whatever row now occupies it. The session's durable attempt plan is
+	// the same captured inventory the evidence was written from, so recover the
+	// tail there.
+	if downloaded, known := h.sessionEvidenceDownloadedTailV3(ctx, session, fileID); known {
+		carry.downloaded = downloaded
+		carry.downloadedKnown = true
+	}
+	return carry
+}
+
+// sessionEvidenceDownloadedTailV3 returns the downloaded tail the session's
+// durable attempt plan published for fileID. The plan inventory is only usable
+// when it names the same effective row the session evidence covers; a plan for
+// another row orders unrelated subtitles, so its tail is not evidence for this
+// ordinal. An absent or unreadable record keeps the historic unknown-tail
+// behavior rather than inventing an empty tail, which would clear every
+// downloaded carry.
+func (h *PlaybackHandler) sessionEvidenceDownloadedTailV3(ctx context.Context, session *playback.Session, fileID int) ([]playback.SubtitleInventoryItemV3, bool) {
+	if h == nil || h.PlanStoreV3 == nil || session == nil || session.ID == "" || fileID <= 0 {
+		return nil, false
+	}
+	record, err := h.PlanStoreV3.GetAttempt(ctx, session.ID)
+	if err != nil || record == nil {
+		return nil, false
+	}
+	if record.UserID != session.UserID || record.ProfileID != session.ProfileID || record.EffectiveMediaFileID != fileID {
+		return nil, false
+	}
+	if record.CurrentPlan.Subtitle.Inventory == nil {
+		return nil, false
+	}
+	_, _, downloaded := subtitleLayoutFromPlanInventoryV3(record.CurrentPlan.Subtitle.Inventory, nil)
+	return downloaded, true
 }
 
 // rekeyStartTrackIdentitiesV3 normalizes a start request's selected track
