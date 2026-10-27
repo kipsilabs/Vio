@@ -665,6 +665,11 @@ export function VideoPlayer({
 }: VideoPlayerProps) {
   const playerConfig = usePlayerConfig();
   const isDetached = displayMode !== "foreground";
+  // `resolveAppliedAudioIndex` returns -1 when the committed selection has no
+  // row in the applied inventory. Normalize it to "no row" before indexing the
+  // menu list or asking the version for a language; -1 names no track.
+  const appliedAudioIndex =
+    activeAudioIndex != null && activeAudioIndex >= 0 ? activeAudioIndex : null;
 
   // Refs
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -4826,8 +4831,8 @@ export function VideoPlayer({
 
     const effectiveMode = normalizeSubtitleMode(subtitleMode);
     const audioLang =
-      audioTracks[activeAudioIndex]?.language?.trim() ||
-      resolveVersionAudioLanguage(effectiveVersion, activeAudioIndex);
+      (appliedAudioIndex != null ? audioTracks[appliedAudioIndex]?.language?.trim() : null) ||
+      resolveVersionAudioLanguage(effectiveVersion, appliedAudioIndex);
 
     const match = resolveSubtitleAutoSelect({
       mode: effectiveMode,
@@ -4855,7 +4860,7 @@ export function VideoPlayer({
     showForcedSubtitles,
     profileLanguage,
     audioTracks,
-    activeAudioIndex,
+    appliedAudioIndex,
     effectiveVersion,
     sessionId,
   ]);
@@ -6445,7 +6450,7 @@ export function VideoPlayer({
           onSubtitleJobAccepted={handleSubtitleJobAccepted}
           subtitleSync={subtitleSync}
           audioTracks={audioTracks}
-          activeAudioIndex={activeAudioIndex}
+          activeAudioIndex={appliedAudioIndex}
           onAudioSelect={onAudioSelect}
           trackMenusLocked={replacing || replanning}
           audioInventoryProvisional={audioInventoryProvisional}

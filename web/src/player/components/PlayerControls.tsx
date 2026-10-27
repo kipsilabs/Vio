@@ -95,7 +95,8 @@ interface PlayerControlsProps {
   subtitleSync?: SubtitleSync;
   // Audio
   audioTracks: PlayerAudioTrack[];
-  activeAudioIndex: number;
+  /** The applied row, or null when no row matched the committed selection. */
+  activeAudioIndex: number | null;
   onAudioSelect?: (index: number, currentPosition: number) => void;
   /**
    * True while a replace or replan is in flight and the on-screen track
@@ -238,6 +239,10 @@ export function PlayerControls({
   const controlsRef = useRef<HTMLDivElement>(null);
   const [narrowPlayer, setNarrowPlayer] = useState(false);
   const compactControls = isCoarsePointer || narrowPlayer;
+  // Defensive normalization for callers that still carry the -1 marker: the
+  // menu's contract is "a row, or null", and -1 is not a row.
+  const appliedAudioIndex =
+    activeAudioIndex != null && activeAudioIndex >= 0 ? activeAudioIndex : null;
 
   useLayoutEffect(() => {
     const element = controlsRef.current;
@@ -570,7 +575,7 @@ export function PlayerControls({
               {onAudioSelect && (
                 <AudioTrackMenu
                   tracks={audioTracks}
-                  activeIndex={activeAudioIndex}
+                  activeIndex={appliedAudioIndex}
                   onSelect={onAudioSelect}
                   currentPosition={currentTime}
                   locked={trackMenusLocked}
@@ -786,7 +791,7 @@ export function PlayerControls({
       {compactControls && onAudioSelect && (
         <AudioTrackMenu
           tracks={audioTracks}
-          activeIndex={activeAudioIndex}
+          activeIndex={appliedAudioIndex}
           onSelect={onAudioSelect}
           currentPosition={currentTime}
           open={audioOpen}

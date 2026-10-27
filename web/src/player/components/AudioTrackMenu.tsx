@@ -13,7 +13,8 @@ import { ProvisionalTrackBadge } from "./ProvisionalTrackBadge";
 
 interface AudioTrackMenuProps {
   tracks: PlayerAudioTrack[];
-  activeIndex: number;
+  /** The applied row, or null when no row matched the committed selection. */
+  activeIndex: number | null;
   onSelect: (index: number, currentPosition: number) => void;
   currentPosition: number;
   open?: boolean;
