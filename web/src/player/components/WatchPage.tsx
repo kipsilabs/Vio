@@ -333,6 +333,7 @@ function WatchPagePlayer({
   seriesContext,
   onNavigateEpisode,
   onEnded,
+  onRequestedVersionChange,
   onExit,
   onMinimize,
   resumeHints,
@@ -473,6 +474,15 @@ function WatchPagePlayer({
     });
   }, [session.initialSubtitleError, session.initialSubtitleErrorTitle, session.playbackAttemptId]);
 
+  const trackSelectionNotice = session.trackSelectionNotice;
+  useEffect(() => {
+    if (!trackSelectionNotice) return;
+    toast.error(trackSelectionNotice.title, {
+      id: `track-selection-${trackSelectionNotice.id}`,
+      description: trackSelectionNotice.message,
+    });
+  }, [trackSelectionNotice]);
+
   const activeVersion = useMemo(() => {
     const resolved = resolveEffectiveVersion(playbackVersions, session);
     if (resolved) return resolved;
@@ -510,6 +520,10 @@ function WatchPagePlayer({
     return subtitles;
   }, [activeVersion, subtitles]);
 
+  // Merge point for the two gated fallbacks above: the audio menu's
+  // `audioTracks` and the subtitle menu's `versionSubtitles`. Both read catalog
+  // metadata only when the plan publishes no inventory, and both must switch
+  // back to plan evidence as soon as it lands — keep their gates aligned.
   const playableSubtitles = useMemo(
     () => resolvePlayableSubtitles(session.subtitleUrls, versionSubtitles),
     [session.subtitleUrls, versionSubtitles],
@@ -655,12 +669,32 @@ function WatchPagePlayer({
       positionSeconds: session.durationSeconds ?? 0,
       durationSeconds: session.durationSeconds ?? undefined,
       lastFileId: session.mediaFileId,
+      selectedFileId: session.plan?.requested_media_file_id ?? fileId ?? session.mediaFileId,
       lastResolution: activePlaybackVersion?.resolution,
       lastHDR: activePlaybackVersion?.hdr,
       lastCodecVideo: activePlaybackVersion?.codec_video,
       lastEditionKey: activePlaybackVersion?.edition_key,
     });
-  }, [activePlaybackVersion, onEnded, session.durationSeconds, session.mediaFileId]);
+  }, [
+    activePlaybackVersion,
+    fileId,
+    onEnded,
+    session.durationSeconds,
+    session.mediaFileId,
+    session.plan?.requested_media_file_id,
+  ]);
+
+  // The committed request row changes when the viewer switches version in the
+  // player. Persist it as soon as the server acknowledges the switch: post-roll
+  // close and next-episode navigation do not wait for `onEnded`, so a viewer
+  // who leaves through those controls would otherwise lose the switch.
+  const committedRequestedFileId = session.plan?.requested_media_file_id ?? null;
+  const lastRequestedFileIdRef = useRef(committedRequestedFileId);
+  useEffect(() => {
+    if (lastRequestedFileIdRef.current === committedRequestedFileId) return;
+    lastRequestedFileIdRef.current = committedRequestedFileId;
+    onRequestedVersionChange?.(committedRequestedFileId);
+  }, [committedRequestedFileId, onRequestedVersionChange]);
 
   const handleSwitchAudio = useCallback(
     (index: number, currentPosition: number) => {
@@ -825,7 +859,11 @@ function WatchPagePlayer({
     // declared metadata, not on whether the plan published any entry: a
     // non-selectable placeholder must not suppress the poll, and a provisional
     // list must keep polling until a verified one clears the badge.
-    const needsSubtitles = playableSubtitles.length === 0 || session.subtitleInventoryProvisional;
+    // Gate on the plan's own inventory, not the rendered menu: an empty plan
+    // now shows the watch-detail evidence as a fallback, and the bounded poll
+    // is still the repair that mints real sidecar URLs and permissions.
+    const needsSubtitles =
+      !hasSelectableSessionSubtitles(session.subtitleUrls) || session.subtitleInventoryProvisional;
     if (!needsAudio && !needsSubtitles) return;
 
     // This poll is a fresh discovery round. If a previous round (the deferred

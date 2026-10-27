@@ -36,6 +36,7 @@ import MediaInfoDialog from "./components/MediaInfoDialog";
 import SubtitleSearchDialog from "./components/SubtitleSearchDialog";
 import { sortByResolution } from "./components/VersionFlyout";
 import { selectDefaultPlaybackVariantVersion } from "./components/versionRankingUtils";
+import { readRequestedFileId, rememberRequestedFileId } from "@/playback/requestedVersion";
 import { resolveSelectedMediaSummary } from "./components/selectedMediaSummary";
 import { EpisodeCarouselSkeleton } from "./components/SectionSkeletons";
 import {
@@ -51,6 +52,7 @@ import {
 import { isEpisodeUnwatched } from "@/lib/episodeSpoilers";
 import { formatRuntimeMinutes } from "@/lib/mediaFormat";
 import { useQualityPreference } from "@/hooks/queries/qualityPreference";
+import { applyVersionAvailability, useVersionLiveness } from "@/hooks/queries/versionLiveness";
 import { CalendarClock } from "lucide-react";
 import {
   formatCalendarDate,
@@ -101,6 +103,16 @@ export default function EpisodeContent({
   const sortedVersions = useMemo(() => sortByResolution(item.versions ?? []), [item.versions]);
   const userData =
     item.user_data && "position_seconds" in item.user_data ? item.user_data : undefined;
+  // The viewer's own pick, remembered on this device. It outlives the server's
+  // `last_file_id`, which names whichever row actually served the bytes after
+  // a substitution. Read on mount, but only once the profile has resolved: the
+  // store is profile-scoped, and a pre-resolution read would alias another
+  // profile's pick. A pick made in place is held in state below.
+  const requestedProfileId = currentProfile?.id ?? null;
+  const requestedFileId = useMemo(
+    () => (requestedProfileId ? readRequestedFileId(item.content_id, requestedProfileId) : null),
+    [item.content_id, requestedProfileId],
+  );
   const { hideOverviews } = useEpisodeSpoilerPrefs();
   // Keyed by episode so a reveal survives an on-view translation of the same
   // episode but not navigation to the next one.
@@ -115,23 +127,67 @@ export default function EpisodeContent({
         userData,
         qualityPreference,
         item.effective_version_edition_key,
+        requestedFileId,
       ),
     [
       qualityPreference,
       item.effective_version_edition_key,
       item.playback_variants,
+      requestedFileId,
       sortedVersions,
       userData,
     ],
   );
   const [manualSelectedFileId, setManualSelectedFileId] = useState<number | null>(null);
-  const selectedVersion = useMemo(
+  // Tracks whether a version picker has been opened; the picker-open path
+  // widens the liveness probe from the default version to the whole list.
+  const [versionPickersOpened, setVersionPickersOpened] = useState(false);
+  const handleVersionPickerOpenChange = useCallback((open: boolean) => {
+    if (open) {
+      setVersionPickersOpened(true);
+    }
+  }, []);
+
+  // Check the default-selected version as soon as the page mounts so it can't
+  // sit as an unavailable row before any liveness result exists. Only that one
+  // version is probed until a picker opens, at which point the full chunked
+  // check takes over (results are cached for 5 minutes, so re-opening does not
+  // re-fetch). The stamped rows are what the ActionBar derives its
+  // force-relink decision from: reading a stale `available` flag would replay
+  // a provider pin the server already knows is gone.
+  const livenessVersions = useMemo(
     () =>
-      (manualSelectedFileId != null
-        ? (sortedVersions.find((version) => version.file_id === manualSelectedFileId) ?? null)
-        : null) ?? defaultSelectedVersion,
-    [defaultSelectedVersion, manualSelectedFileId, sortedVersions],
+      versionPickersOpened ? item.versions : defaultSelectedVersion ? [defaultSelectedVersion] : [],
+    [defaultSelectedVersion, item.versions, versionPickersOpened],
   );
+  const versionLiveness = useVersionLiveness(livenessVersions, true);
+  const versionsWithLiveness = useMemo(
+    () => applyVersionAvailability(sortedVersions, versionLiveness),
+    [sortedVersions, versionLiveness],
+  );
+
+  // A chosen row that an enrichment refresh no longer carries is a pick-again
+  // state, not permission to silently show and play another version. The
+  // device's requested row is the viewer's own pick, ahead of the server's
+  // last-file hint.
+  const persistedSelectedFileId =
+    manualSelectedFileId ?? requestedFileId ?? userData?.last_file_id ?? null;
+  const selectedVersionMissing =
+    persistedSelectedFileId != null &&
+    !versionsWithLiveness.some((version) => version.file_id === persistedSelectedFileId);
+  const selectedVersion = useMemo(() => {
+    if (selectedVersionMissing) return null;
+    if (manualSelectedFileId != null) {
+      return (
+        versionsWithLiveness.find((version) => version.file_id === manualSelectedFileId) ?? null
+      );
+    }
+    return defaultSelectedVersion
+      ? (versionsWithLiveness.find(
+          (version) => version.file_id === defaultSelectedVersion.file_id,
+        ) ?? defaultSelectedVersion)
+      : null;
+  }, [defaultSelectedVersion, manualSelectedFileId, selectedVersionMissing, versionsWithLiveness]);
   const selectedMediaSummary = useMemo(
     () => resolveSelectedMediaSummary(selectedVersion, item.playback_variants, item.runtime ?? 0),
     [item.playback_variants, item.runtime, selectedVersion],
@@ -162,13 +218,19 @@ export default function EpisodeContent({
     setExplicitSubtitleSelection(null);
   }
 
-  const handleSelectVersion = useCallback((version: FileVersion) => {
-    setManualSelectedFileId(version.file_id);
-    setAudioSelectionMode("auto");
-    setExplicitAudioTrackIndex(null);
-    setSubtitleSelectionMode("auto");
-    setExplicitSubtitleSelection(null);
-  }, []);
+  const handleSelectVersion = useCallback(
+    (version: FileVersion) => {
+      setManualSelectedFileId(version.file_id);
+      // Remember the pick across reloads: the server records the row that
+      // actually plays, which may be a substitute for this one.
+      rememberRequestedFileId(item.content_id, version.file_id, requestedProfileId);
+      setAudioSelectionMode("auto");
+      setExplicitAudioTrackIndex(null);
+      setSubtitleSelectionMode("auto");
+      setExplicitSubtitleSelection(null);
+    },
+    [item.content_id, requestedProfileId],
+  );
 
   const handleSelectAudioTrack = useCallback((trackIndex: number) => {
     setAudioSelectionMode("explicit");
@@ -445,9 +507,11 @@ export default function EpisodeContent({
                   ? () => openMediaInfo()
                   : undefined
               }
-              versions={item.versions ?? []}
+              versions={versionsWithLiveness}
               playbackVariants={item.playback_variants}
               selectedVersion={selectedVersion}
+              selectedVersionMissing={selectedVersionMissing}
+              onVersionPickerOpenChange={handleVersionPickerOpenChange}
               explicitFileSelection={manualSelectedFileId != null}
               onSelectVersion={handleSelectVersion}
               onDownload={

@@ -32,8 +32,18 @@ export function resolvePlayableSubtitles(
   if (selectableSessionTracks.length > 0) {
     return selectableSessionTracks;
   }
-  // The watch-detail fallback is not an inventory: it carries no delivery
-  // information, so a track without a URL there is simply unplayable.
+  if (sessionTracks.length === 0) {
+    // The plan published no inventory at all (deferred probe, or an effective
+    // candidate the plan has not learned yet). The watch detail is the only
+    // session evidence available; list it so the overlay menu is useful, and
+    // let the bounded catalog poll repair the plan with real URLs. A track
+    // without a URL is still selectable here: the server mints the sidecar when
+    // the track change replans.
+    return fallbackTracks;
+  }
+  // A non-empty plan list that is merely unselectable is a declared
+  // placeholder, not evidence the file has tracks. The watch-detail fallback
+  // carries no delivery information, so only rows with a URL are playable.
   return fallbackTracks.filter(hasPlayableUrl);
 }
 
@@ -183,6 +193,110 @@ export function isSameSubtitleTrack(a: SubtitleTrackIdentity, b: SubtitleTrackId
   return subtitleDescriptorKey(a) === subtitleDescriptorKey(b);
 }
 
+/** The asset a server track id names, without the trailing combined ordinal. */
+function subtitleTrackIdAssetKey(trackId: string): string {
+  return trackId.replace(/:\d+$/, "");
+}
+
+/**
+ * Whether the plan's committed row and a row on screen name the same logical
+ * subtitle asset.
+ *
+ * `track_id` embeds the ordinal of the inventory it was minted from, so an
+ * equal id is only evidence while both rows were read from the same inventory.
+ * A plan that reorders its inventory re-mints every id: the same asset moves
+ * from `…:1` to `…:0`, and the slot that inherited `…:1` is a different
+ * language. The descriptor names the asset itself, so it decides when both rows
+ * carry one, and the id may then differ only in its trailing ordinal. A row
+ * whose descriptor differs is another asset, whatever its id says.
+ */
+export function subtitleIdentitiesNameSameAsset(
+  committed: SubtitleTrackIdentity,
+  row: SubtitleTrackIdentity,
+): boolean {
+  if (!hasSubtitleDescriptor(committed) || !hasSubtitleDescriptor(row)) {
+    return isSameSubtitleTrack(committed, row);
+  }
+  if (subtitleDescriptorKey(committed) !== subtitleDescriptorKey(row)) return false;
+  const committedId = normalizeIdentityValue(committed.trackId);
+  const rowId = normalizeIdentityValue(row.trackId);
+  if (committedId && rowId) {
+    // Same asset; only the ordinal the plan assigned it may have moved.
+    return subtitleTrackIdAssetKey(committedId) === subtitleTrackIdAssetKey(rowId);
+  }
+  return true;
+}
+
+/**
+ * Whether the plan's committed selection acknowledges a pending manual pick.
+ * See `subtitleIdentitiesNameSameAsset`: the descriptor decides, so a pick the
+ * acknowledging plan re-minted onto another ordinal still counts as settled.
+ */
+export function subtitleSelectionAcknowledgesPending(
+  planSelected: SubtitleTrackIdentity | null,
+  pending: SubtitleTrackIdentity,
+): boolean {
+  if (planSelected === null) return false;
+  return subtitleIdentitiesNameSameAsset(planSelected, pending);
+}
+
+/**
+ * Whether the identity carries any descriptor evidence at all. An identity
+ * built only from a committed ordinal and a re-mintable id cannot name a row
+ * against a different inventory, so it must not fall through to a match on
+ * empty descriptor fields.
+ */
+function hasSubtitleDescriptor(identity: SubtitleTrackIdentity): boolean {
+  return (
+    normalizeIdentityValue(identity.language) !== "" ||
+    normalizeIdentityValue(identity.codec) !== "" ||
+    identity.forced === true ||
+    identity.hearingImpaired === true ||
+    normalizeIdentityValue(identity.source) !== "" ||
+    identity.streamIndex != null ||
+    normalizeIdentityValue(identity.artifactId) !== ""
+  );
+}
+
+/**
+ * Maps the committed subtitle selection onto the inventory the menu currently
+ * renders.
+ *
+ * A committed ordinal names a row in the plan's own inventory. A replacement
+ * plan can re-mint the ordinals, and adoption can preserve the verified rows
+ * while the incoming plan publishes a different order, so stamping the plan
+ * ordinal onto the displayed rows can light (and request) another language.
+ * The asset identity is the authority: a direct `track_id` lookup is only
+ * accepted when the descriptor agrees, and a descriptor is only accepted when
+ * it names exactly one displayed row. `null` means no unambiguous row matches,
+ * which must hold outbound selection rather than guess.
+ */
+export function resolveAppliedSubtitleIndex(
+  displayed: readonly SubtitleTrackIdentity[],
+  selected: SubtitleTrackIdentity | null | undefined,
+): number | null {
+  if (!selected || !hasSubtitleDescriptor(selected)) return null;
+  const selectedId = normalizeIdentityValue(selected.trackId);
+  let idMatch: number | null = null;
+  let idMatches = 0;
+  let descriptorMatch: number | null = null;
+  let descriptorMatches = 0;
+  for (let index = 0; index < displayed.length; index += 1) {
+    const candidate = displayed[index]!;
+    const sameDescriptor = subtitleDescriptorKey(candidate) === subtitleDescriptorKey(selected);
+    if (!sameDescriptor) continue;
+    descriptorMatches += 1;
+    descriptorMatch = index;
+    if (selectedId && normalizeIdentityValue(candidate.trackId) === selectedId) {
+      idMatches += 1;
+      idMatch = index;
+    }
+  }
+  if (idMatches === 1) return displayed[idMatch!]!.index;
+  if (descriptorMatches === 1) return displayed[descriptorMatch!]!.index;
+  return null;
+}
+
 /**
  * Returns the selection that must be sent to settle the plan's authoritative
  * selected_tracks state, or undefined when the current plan already matches
@@ -210,8 +324,10 @@ export function pendingServerSubtitleSelection(
 
   // The plan already carries the requested logical track. Its ordinal may
   // differ from the UI index after a re-mint or reorder; that is not a reason
-  // to replan again.
-  if (planSelected !== null && isSameSubtitleTrack(planSelected, active)) {
+  // to replan again. An equal ordinal-derived id is not enough on its own:
+  // adoption can keep verified rows whose ids the plan re-minted onto another
+  // language, so the descriptor has to name the same asset too.
+  if (planSelected !== null && subtitleIdentitiesNameSameAsset(planSelected, active)) {
     return undefined;
   }
 

@@ -43,6 +43,7 @@ import { useVersionLiveness } from "@/hooks/queries/versionLiveness";
 import { useStampedVersions } from "./useStampedVersions";
 import { catalogKeys } from "@/hooks/queries/keys";
 import { applyPlaybackProgressToCache } from "@/hooks/queries/playbackProgressCache";
+import { readRequestedFileId, rememberRequestedFileId } from "./requestedVersion";
 import { invalidatePlaybackSurfaceQueries } from "@/hooks/queries/playbackSurfaceRefresh";
 import { useAuth } from "@/hooks/useAuth";
 import { useCurrentProfile } from "@/hooks/useCurrentProfile";
@@ -259,6 +260,20 @@ function playbackUnavailableMessage(error: Error): string {
     return "This title isn't available. It may have been removed, or you may not have access to it.";
   }
   return error.message || "Item not found";
+}
+
+/**
+ * A direct watch URL names no row of its own, so the session falls back to the
+ * plan's default when the device's stored pick has left the catalog. The item
+ * page already treats that as pick-again; send the viewer there instead of
+ * silently playing a version they did not choose.
+ */
+function RequestedVersionMissingRedirect({ href }: { href: string }) {
+  const navigate = useViewTransitionNavigate();
+  useEffect(() => {
+    navigate(href, { replace: true });
+  }, [href, navigate]);
+  return null;
 }
 
 function PlaybackUnavailableScreen({ error, onBack }: { error: Error; onBack: () => void }) {
@@ -762,10 +777,45 @@ function WatchPlaybackHostContent() {
     });
   }, [navigate, request, state.mode, state.shouldReturnToWatchPage]);
 
+  // The viewer's own pick is durable, independent of the row the server records
+  // as last played: progress and history name the row that served the bytes, so
+  // a substitution would otherwise become the selected version on the next
+  // load. Completion paths write this even when they do not persist progress.
+  const rememberRequestedVersion = useCallback(
+    (exitState?: PlaybackExitState) => {
+      const contentId = activeItem?.content_id ?? activeRequest?.contentId;
+      if (!contentId || !exitState) {
+        return;
+      }
+
+      rememberRequestedFileId(contentId, exitState.selectedFileId, currentProfile?.id ?? null);
+    },
+    [activeItem, activeRequest, currentProfile?.id],
+  );
+
+  // A version switch inside the player is committed as soon as the server's
+  // plan names the requested row. Persist that change here rather than only on
+  // an exit state: post-roll close and next-episode navigation never reach
+  // `handleEnded`.
+  const handleRequestedVersionChange = useCallback(
+    (fileId: number | null) => {
+      const contentId = activeItem?.content_id ?? activeRequest?.contentId;
+      if (!contentId || fileId == null) return;
+      rememberRequestedFileId(contentId, fileId, currentProfile?.id ?? null);
+    },
+    [activeItem, activeRequest, currentProfile?.id],
+  );
+
   const applyExitStateToCache = useCallback(
     (exitState?: PlaybackExitState) => {
       const contentId = activeItem?.content_id ?? activeRequest?.contentId;
-      if (!contentId || !exitState || exitState.positionSeconds <= 0) {
+      if (!contentId || !exitState) {
+        return;
+      }
+
+      rememberRequestedVersion(exitState);
+
+      if (exitState.positionSeconds <= 0) {
         return;
       }
 
@@ -773,14 +823,16 @@ function WatchPlaybackHostContent() {
         contentId,
         positionSeconds: exitState.positionSeconds,
         durationSeconds: exitState.durationSeconds,
-        lastFileId: exitState.lastFileId,
+        // Persist the viewer's chosen row, not the server's substitution: the
+        // next mount must not present the substituted file as if they picked it.
+        lastFileId: exitState.selectedFileId ?? exitState.lastFileId,
         lastResolution: exitState.lastResolution,
         lastHDR: exitState.lastHDR,
         lastCodecVideo: exitState.lastCodecVideo,
         lastEditionKey: exitState.lastEditionKey,
       });
     },
-    [activeItem, activeRequest, queryClient],
+    [activeItem, activeRequest, queryClient, rememberRequestedVersion],
   );
 
   const handleExit = useCallback(
@@ -935,6 +987,12 @@ function WatchPlaybackHostContent() {
   const handleEnded = useCallback(
     (exitState?: PlaybackExitState) => {
       if (!requestKeyValue) return;
+      // Record the requested row before any completion branch. Post-roll, a
+      // room exit, and automatic continuation do not all pass through the
+      // ordinary exit path, but a version switched during playback must survive
+      // the episode finishing. Progress persistence stays separate: some of
+      // these paths deliberately leave the completed position to history.
+      rememberRequestedVersion(exitState);
       if (activeRequest?.roomId && activeRequest.roomToken) {
         stopPlayback();
         const roomReturn = buildRoomReturnNavigation(activeRequest);
@@ -976,6 +1034,9 @@ function WatchPlaybackHostContent() {
       // what plays next.
       if (!activeItem?.series_id && !activeRequest?.shuffleId) {
         if (activeRequest) {
+          // A finished watch still records the row the viewer requested, so a
+          // substitution does not become the selected version on the page.
+          applyExitStateToCache(exitState);
           stopPlayback();
           navigate(buildWatchItemHref(activeRequest), { up: true });
         }
@@ -993,6 +1054,7 @@ function WatchPlaybackHostContent() {
       activeRequest,
       activeItem,
       applyExitStateToCache,
+      rememberRequestedVersion,
       stopPlayback,
       navigate,
       controller,
@@ -1123,6 +1185,27 @@ function WatchPlaybackHostContent() {
     ...activeItem,
     versions: stampedVersions,
   };
+  // The viewer's own pick for this title, from the device store. Progress
+  // persistence and history record the row that served the bytes, so the stored
+  // request is the only durable record of their choice. Read inline rather than
+  // memoized: this render path is not the time-tick lane, and the read must not
+  // add a hook after this component's conditional returns.
+  const requestedFileId = activeRequest
+    ? readRequestedFileId(activeRequest.contentId, currentProfile?.id ?? null)
+    : null;
+  // The URL names no row, the viewer picked one on this device, and the
+  // catalog no longer carries it. `selectFileId` would fall through to the
+  // plan's default, so return to the item page's pick-again state instead.
+  // A Watch Together room or an explicit `fileId` owns its selection.
+  const requestedVersionMissing =
+    activeRequest.fileId == null &&
+    activeRequest.roomId == null &&
+    requestedFileId != null &&
+    (activeItem.versions?.length ?? 0) > 0 &&
+    !activeItem.versions.some((version) => version.file_id === requestedFileId);
+  if (requestedVersionMissing) {
+    return <RequestedVersionMissingRedirect href={buildWatchItemHref(activeRequest)} />;
+  }
   const watchPageProps = buildWatchPageProps({
     request: activeRequest,
     item: itemForPlayer,
@@ -1132,6 +1215,7 @@ function WatchPlaybackHostContent() {
     // Undefined until the read resolves, which leaves the profile-column
     // fallback in place rather than blocking playback on a settings fetch.
     qualityPreference: canonicalQuality,
+    requestedFileId,
   });
   // The resolved answer already folds in the profile layer, so the props built
   // from the profile record are only the pre-resolution fallback.
@@ -1193,6 +1277,7 @@ function WatchPlaybackHostContent() {
           playbackRequestKey={requestKeyValue}
           onNavigateEpisode={handleNavigateEpisode}
           onEnded={handleEnded}
+          onRequestedVersionChange={handleRequestedVersionChange}
           onExit={handleExit}
           onMinimize={handleMinimize}
           displayMode={playerDisplayMode}
