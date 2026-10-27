@@ -287,6 +287,31 @@ describe("buildWatchPageProps", () => {
     });
   });
 
+  it("prefers the device's requested row over the server's last-played substitute", () => {
+    const props = buildWatchPageProps({
+      request: makeRequest(),
+      item: makeWatchDetail({
+        user_data: {
+          played: false,
+          is_in_progress: true,
+          position_seconds: 120,
+          duration_seconds: 3600,
+          last_file_id: 77,
+          last_resolution: "2160p",
+        },
+      }),
+      currentProfile: profile,
+      requestedFileId: 88,
+    });
+
+    expect(props).toMatchObject({
+      resumeHints: {
+        lastFileId: 88,
+        lastResolution: "2160p",
+      },
+    });
+  });
+
   it("forces a session-scoped restart when restart=1 is present", () => {
     const props = buildWatchPageProps({
       request: makeRequest("restart=1"),
@@ -473,5 +498,61 @@ describe("buildWatchPageProps", () => {
 
     expect(props.initialSubtitleTrackIndexByFileId).toEqual({ 42: 0 });
     expect(props.initialBitmapSubtitleTrackIndexByFileId).toEqual({});
+  });
+
+  // An older watch detail omits the version's `subtitle_tracks`, leaving only
+  // the item's subtitle rows as menu evidence. Those rows still have to use the
+  // shared published-ordinal rule: the server's combined ordinal space is
+  // external-first and dense after de-duplication, not the array position.
+  it("derives fallback subtitle ordinals through the published inventory rule", () => {
+    const props = buildWatchPageProps({
+      request: createWatchRouteRequest({ contentId: "movie-1", fileId: 42 }),
+      item: makeWatchDetail({
+        versions: [
+          {
+            file_id: 42,
+            resolution: "1080p",
+            codec_video: "h264",
+            codec_audio: "aac",
+            hdr: false,
+            container: "mkv",
+            file_size: 1,
+            duration: 120,
+            bitrate: 8_000,
+          },
+        ],
+        subtitles: [
+          // The duplicate collapses against the first row, so the third row's
+          // published ordinal is 1 while its array position is 2.
+          {
+            source: "external",
+            language: "en",
+            codec: "subrip",
+            forced: false,
+            title: "English",
+          },
+          {
+            source: "external",
+            language: "en",
+            codec: "subrip",
+            forced: false,
+            title: "English",
+          },
+          {
+            source: "external",
+            language: "fr",
+            codec: "subrip",
+            forced: false,
+            title: "French",
+          },
+        ],
+      }),
+      currentProfile: profile,
+    });
+
+    expect(props.subtitles.map(({ index, language }) => ({ index, language }))).toEqual([
+      { index: 0, language: "en" },
+      { index: 1, language: "fr" },
+    ]);
   });
 });
