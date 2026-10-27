@@ -821,3 +821,134 @@ func TestRekeyStartResolvesDownloadedSubtitleByIdentityAcrossCommittedRows(t *te
 		t.Fatalf("subtitle id = %q, want %q", req.SubtitleTrackID, want)
 	}
 }
+
+// A start that echoes a downloaded subtitle identity and has only live session
+// evidence (no previous_playback_attempt_id) must still re-check the downloaded
+// tail. The file-shaped evidence cannot see it, so the session's durable attempt
+// plan supplies the published tail; otherwise a churned downloaded list leaves
+// the ordinal naming whatever row now occupies the old position.
+func TestRekeyStartSessionEvidenceRechecksDownloadedTail(t *testing.T) {
+	tests := []struct {
+		name            string
+		planRowID       int
+		planLanguage    string
+		liveRowID       int
+		liveLanguage    string
+		wantUnavailable bool
+	}{
+		{
+			name:         "unchanged tail keeps the carried downloaded row",
+			planRowID:    11,
+			planLanguage: "eng",
+			liveRowID:    11,
+			liveLanguage: "eng",
+		},
+		{
+			name:            "churned tail cannot reuse the ordinal",
+			planRowID:       11,
+			planLanguage:    "eng",
+			liveRowID:       12,
+			liveLanguage:    "fra",
+			wantUnavailable: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			fixture := newSessionDownloadedTailFixtureV3(t, ctx, tc.planRowID, tc.planLanguage, tc.liveRowID, tc.liveLanguage)
+			req := fixture.req
+			rekeys := fixture.handler.rekeyStartTrackIdentitiesV3(ctx, &req, 1, "profile-1", "", "")
+
+			served := *fixture.file
+			_, subtitleUnavailable, err := fixture.handler.constrainRekeyedStartTracksV3(ctx, &req, &served, rekeys)
+			if err != nil {
+				t.Fatalf("constrainRekeyedStartTracksV3: %v", err)
+			}
+			if subtitleUnavailable != tc.wantUnavailable {
+				t.Fatalf("subtitle unavailable = %v, want %v (id=%q index=%v)", subtitleUnavailable, tc.wantUnavailable, req.SubtitleTrackID, req.SubtitleTrackIndex)
+			}
+			if tc.wantUnavailable {
+				if req.SubtitleTrackID != "" || req.SubtitleTrackIndex != nil {
+					t.Fatalf("churned downloaded selection was kept: id=%q index=%v", req.SubtitleTrackID, req.SubtitleTrackIndex)
+				}
+				return
+			}
+			if req.SubtitleTrackID != playback.TrackIDV3(fixture.file.ID, "subtitle", 1) || req.SubtitleTrackIndex == nil || *req.SubtitleTrackIndex != 1 {
+				t.Fatalf("unchanged downloaded selection = id %q index %v, want ordinal 1", req.SubtitleTrackID, req.SubtitleTrackIndex)
+			}
+		})
+	}
+}
+
+type sessionDownloadedTailFixtureV3 struct {
+	handler *PlaybackHandler
+	file    *models.MediaFile
+	req     playback.StartRequestV3
+}
+
+// newSessionDownloadedTailFixtureV3 builds the session-only carry scenario: one
+// live session holding subtitle evidence, a durable attempt plan with a
+// downloaded tail, and a downloaded repository list the plan tail may or may
+// not still match.
+func newSessionDownloadedTailFixtureV3(t *testing.T, ctx context.Context, planRowID int, planLanguage string, liveRowID int, liveLanguage string) sessionDownloadedTailFixtureV3 {
+	t.Helper()
+	file := &models.MediaFile{
+		ID:        100,
+		ContentID: "movie-1",
+		Container: "virtual",
+		FilePath:  "virtual://movie/tt?result=a",
+		ExternalSubtitles: []models.ExternalSubtitle{
+			{Path: "/subs/english.srt", Language: "eng", Format: "srt", Title: "English"},
+		},
+	}
+	manager := playback.NewSessionManager(0, 0)
+	session, err := manager.StartSessionWithFilesContext(ctx, 1, "profile-1", file.ID, file.ID, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("StartSessionWithFilesContext: %v", err)
+	}
+	if err := manager.UpdateStreamState(session.ID, playback.SessionStreamState{
+		VirtualSourceSet:              true,
+		VirtualSourceURI:              file.FilePath,
+		VirtualSourceRevision:         "rev-1",
+		VirtualSubtitleEvidenceURI:    file.FilePath,
+		VirtualSubtitleEvidenceFileID: file.ID,
+		VirtualSubtitleEvidenceSet:    true,
+		VirtualExternalSubtitles:      file.ExternalSubtitles,
+		SubtitleTrackIndex:            -1,
+	}); err != nil {
+		t.Fatalf("UpdateStreamState: %v", err)
+	}
+
+	store := playback.NewMemoryPlanStoreV3()
+	if err := store.SaveAttempt(ctx, playback.AttemptRecordV3{
+		PlaybackAttemptID:    "attempt-session-downloaded-tail",
+		SessionID:            session.ID,
+		UserID:               1,
+		ProfileID:            "profile-1",
+		RequestedMediaFileID: file.ID,
+		EffectiveMediaFileID: file.ID,
+		CurrentPlan: playback.PlanV3{Subtitle: playback.SubtitleDecisionV3{Inventory: []playback.SubtitleInventoryItemV3{
+			{TrackID: "file:100:subtitle:0", CombinedIndex: 0, Source: playback.SubtitleSourceExternalV3,
+				Language: "eng", Codec: "srt", Label: "English"},
+			{TrackID: "file:100:subtitle:1", CombinedIndex: 1, Source: playback.SubtitleSourceDownloadedV3,
+				Language: planLanguage, Codec: "srt", Label: planLanguage, SyncKey: subtitles.StoredSyncKey(planRowID)},
+		}}},
+		ExpiresAt: time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("SaveAttempt: %v", err)
+	}
+
+	handler := &PlaybackHandler{
+		sessionMgr:   manager,
+		fileResolver: mapPlaybackFileResolver{files: map[int]*models.MediaFile{file.ID: file}},
+		SubtitleRepo: downloadedSubtitleRepoByFile{byFile: map[int][]subtitles.DownloadedSubtitle{
+			file.ID: {{ID: liveRowID, MediaFileID: file.ID, Language: liveLanguage, Format: subtitles.FormatSRT}},
+		}},
+		PlanStoreV3: store,
+	}
+	req := v3HandlerStartRequest()
+	req.FileID = file.ID
+	req.SubtitleTrackID = playback.TrackIDV3(file.ID, "subtitle", 1)
+	req.SubtitleTrackIndex = new(1)
+	return sessionDownloadedTailFixtureV3{handler: handler, file: file, req: req}
+}
