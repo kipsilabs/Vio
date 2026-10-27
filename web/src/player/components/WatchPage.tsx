@@ -520,6 +520,10 @@ function WatchPagePlayer({
     return subtitles;
   }, [activeVersion, subtitles]);
 
+  // Merge point for the two gated fallbacks above: the audio menu's
+  // `audioTracks` and the subtitle menu's `versionSubtitles`. Both read catalog
+  // metadata only when the plan publishes no inventory, and both must switch
+  // back to plan evidence as soon as it lands — keep their gates aligned.
   const playableSubtitles = useMemo(
     () => resolvePlayableSubtitles(session.subtitleUrls, versionSubtitles),
     [session.subtitleUrls, versionSubtitles],

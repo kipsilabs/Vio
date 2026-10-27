@@ -419,6 +419,9 @@ function identityMatchesPlan(identity: SourceIdentity, plan: PlanV3): boolean {
     return true;
   }
   // A file-only push cannot be tied to a candidate when the plan names one.
+  // When the plan names none, the file is the only key: an unknown candidate
+  // means the same source. See the companion baseline rule in
+  // `deferredIdentityIsAdmissible`.
   return (
     plan.effective_virtual_uri == null &&
     identity.fileId != null &&
@@ -604,6 +607,8 @@ function deferredIdentityIsAdmissible(
     if (baseline.uri == null) continue;
     // An unknown file on either side is treated as the same file: neither can
     // prove a different source, so a differing concrete URI is a collision.
+    // Companion to the file-only branch in `identityMatchesPlan`: both read an
+    // absent key as the same source, never as proof of a different one.
     const sameFile =
       baseline.fileId == null || identity.fileId == null || baseline.fileId === identity.fileId;
     if (!sameFile) continue;
@@ -1099,7 +1104,15 @@ function subtitleIdNamesPickedAsset(
  *
  * A plan with no published inventory (deferred or legacy) keeps the ordinal:
  * there is no list to validate against, and the server remaps or degrades the
- * provisional pick.
+ * provisional pick. Confirmed server-side: `applySelectedTracksToStartV3`
+ * copies the bare positive ordinal onto the start request, then
+ * `ResolveSubtitlePolicyV3` resolves it against the effective file's own
+ * external, embedded, and downloaded inventory. On a live session, an ordinal
+ * that inventory does not carry (the deferred probe has not landed) degrades
+ * to subtitles-off, never track 0 and never a 400. Audio behaves the same way through
+ * `resolveV3AudioIndex`: a bare `{id: "", index}` is resolved against the
+ * effective file's tracks, and an out-of-range index degrades to its default
+ * track. See docs/playback-api.md#deferred-track-inventory.
  */
 function resolveSubtitleTrackChange(
   plan: PlanV3,

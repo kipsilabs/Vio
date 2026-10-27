@@ -107,6 +107,17 @@ menu and audio selection without issuing a replan; and drop the marker on any
 plan replacement. Until they do, they must not send
 `deferred_track_inventory_v1`.
 
+A menu pick made while the inventory is still deferred may carry only the
+ordinal it displayed, because the plan has no list to reconcile against. That is
+safe: a `track_change` sends the bare positive ordinal, and the server resolves
+it against the effective file's own inventory (external, then embedded, then
+downloaded subtitles; the effective file's audio tracks). On a live session, an
+ordinal that inventory does not carry — the deferred probe has not landed, or
+the selection names a track the file lacks — degrades to subtitles-off rather
+than selecting track 0, and an out-of-range audio index degrades to the file's
+default track; neither is a `400`. Once the plan publishes an inventory,
+reconcile by `track_id` first rather than by ordinal.
+
 ## Capabilities
 
 The response is `{installation_id, revision, state, allowed, protocol_versions,
