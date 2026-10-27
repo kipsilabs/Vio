@@ -8786,6 +8786,76 @@ func TestHandleReplanPlaybackV3RecoveryRemapsSameRowRotationWithoutIntentChange(
 	}
 }
 
+// The same in-place re-probe can keep an ordinal while replacing the language
+// behind it. The viewer selected English@1; the re-probed row has Japanese at
+// ordinal 1. The failed drift remap must drop the selection and report it, not
+// restore the old ordinal for validation to accept against the unchanged row
+// id and play the Japanese track under the English pick.
+func TestHandleReplanPlaybackV3RecoveryDropsSubtitleLostInSameRowReprobe(t *testing.T) {
+	file := v3HandlerFixtureFile(t)
+	file.SubtitleTracks = []models.SubtitleTrack{
+		{Index: 0, Language: "ja", Codec: "subrip"},
+		{Index: 1, Language: "en", Codec: "subrip"},
+	}
+	files := map[int]*models.MediaFile{file.ID: file}
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), mapPlaybackFileResolver{files: files})
+	stubCopySeekAnchorV3(handler)
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "true"}}
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+
+	startRequest := v3HandlerStartRequest()
+	startRequest.QualityPreference = "auto"
+	subtitleIndex := 1
+	startRequest.SubtitleTrackIndex = &subtitleIndex
+	startRequest.SubtitleTrackID = playback.TrackIDV3(file.ID, "subtitle", subtitleIndex)
+	started := startV3PlaybackForHandlerTest(t, handler, startRequest)
+	if started.PlaybackPlan == nil || started.PlaybackPlan.SelectedTracks.Subtitle == nil ||
+		started.PlaybackPlan.SelectedTracks.Subtitle.Index == nil || *started.PlaybackPlan.SelectedTracks.Subtitle.Index != 1 {
+		t.Fatalf("start did not select English@1: %#v", started.PlaybackPlan)
+	}
+
+	// Enrichment re-probes the row in place: same id, English@1 replaced by
+	// French@1, so the ordinal still exists but names another language.
+	file.SubtitleTracks = []models.SubtitleTrack{
+		{Index: 0, Language: "ja", Codec: "subrip"},
+		{Index: 1, Language: "fr", Codec: "subrip"},
+	}
+
+	failedKey := playback.PlanAttemptKeyV3(*started.PlaybackPlan, startRequest.ClientPlaybackContext.Output.OutputContextID, nil)
+	response := postPlaybackReplanV3(t, handler, started.SessionID, playback.ReplanRequestV3{
+		ProtocolVersion:       playback.ProtocolV3,
+		Operation:             playback.ReplanOperationQualityChangeV3,
+		PlaybackAttemptID:     startRequest.PlaybackAttemptID,
+		ReplanRequestID:       "replan-subtitle-drift-0001",
+		FailedPlanID:          started.PlaybackPlan.PlanID,
+		PlanAttemptID:         "plan-attempt-subtitle-drift-0001",
+		PlanAttemptKey:        failedKey,
+		AttemptCount:          1,
+		QualityPreference:     "1080p",
+		SelectedTracks:        playback.SelectedTracksV3{Audio: started.PlaybackPlan.SelectedTracks.Audio},
+		Capabilities:          startRequest.Capabilities,
+		ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	})
+	if response.Terminal != nil || response.PlaybackPlan == nil {
+		t.Fatalf("subtitle drift replan = %#v terminal=%+v", response.PlaybackPlan, response.Terminal)
+	}
+	if selected := response.PlaybackPlan.SelectedTracks.Subtitle; selected != nil {
+		t.Fatalf("replan subtitle selection = %#v, want the lost selection dropped instead of reusing ordinal 1", selected)
+	}
+	if response.PlaybackPlan.Subtitle.Mode != playback.SubtitleOffV3 {
+		t.Fatalf("replan subtitle mode = %q, want off", response.PlaybackPlan.Subtitle.Mode)
+	}
+	dropped := false
+	for _, warning := range response.PlaybackPlan.DegradationWarnings {
+		if warning.Code == playback.DegradationWarningSubtitleTrackUnavailableV3 {
+			dropped = true
+		}
+	}
+	if !dropped {
+		t.Fatalf("replan did not report the dropped subtitle: %#v", response.PlaybackPlan.DegradationWarnings)
+	}
+}
+
 // An unchanged virtual candidate whose catalog row already carries complete
 // probed evidence must skip the synchronous re-probe on replan: no provider
 // round-trip, no probe, and the loaded row is used directly.

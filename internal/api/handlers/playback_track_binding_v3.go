@@ -11,6 +11,7 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
+	"github.com/Silo-Server/silo-server/internal/subtitles"
 )
 
 // The plan mints selected track identities against the effective media file
@@ -27,14 +28,104 @@ import (
 // stale-identity guard.
 
 // rekeyedTrackSelectionV3 records one explicit track identity whose ordinal was
-// minted against source. Resolution may serve a candidate with a different
+// minted against carry. Resolution may serve a candidate with a different
 // inventory, so the ordinal is only reusable once it has been checked against
 // the served tracks; active is false for a malformed identity or a foreign row
 // the stale guard must still drop.
 type rekeyedTrackSelectionV3 struct {
 	active  bool
 	ordinal int
-	source  *models.MediaFile
+	carry   carriedInventorySourceV3
+}
+
+// carriedInventorySourceV3 is the inventory a carried track ordinal was minted
+// against, together with the downloaded subtitle entries that inventory
+// published. A models.MediaFile has no representation for downloaded tracks, so
+// the file alone cannot prove an ordinal past its embedded/external inventory
+// still names the same downloaded row after the repository list changed under
+// the same id.
+type carriedInventorySourceV3 struct {
+	file *models.MediaFile
+	// downloaded is the published downloaded tail in combined-ordinal order. It
+	// is only meaningful when downloadedKnown is set: an unknown tail means the
+	// evidence predates the capture and the live repository list is the
+	// fallback, while a known-empty tail is genuine evidence the source
+	// published none.
+	downloaded      []playback.SubtitleInventoryItemV3
+	downloadedKnown bool
+}
+
+// subtitleSelectionOrdinalV3 returns the combined subtitle ordinal a request
+// carries, from either the index or the identity.
+func subtitleSelectionOrdinalV3(file *models.MediaFile, request *playback.StartRequestV3) (int, bool) {
+	if file == nil || request == nil {
+		return 0, false
+	}
+	if request.SubtitleTrackIndex != nil {
+		return *request.SubtitleTrackIndex, true
+	}
+	if request.SubtitleTrackID == "" {
+		return 0, false
+	}
+	_, kind, ordinal, ok := playback.ParseTrackIDV3(request.SubtitleTrackID)
+	if !ok || kind != subtitleTrackKindV3 {
+		return 0, false
+	}
+	return ordinal, true
+}
+
+// namesDownloadedSubtitleV3 reports whether the request's subtitle selection
+// addresses the published downloaded tail of the carry source rather than one
+// of its embedded or external tracks.
+func (c carriedInventorySourceV3) namesDownloadedSubtitleV3(request *playback.StartRequestV3) bool {
+	ordinal, ok := subtitleSelectionOrdinalV3(c.file, request)
+	return ok && c.namesDownloadedOrdinalV3(ordinal)
+}
+
+// namesDownloadedOrdinalV3 reports whether ordinal addresses the published
+// downloaded tail of the carry source.
+func (c carriedInventorySourceV3) namesDownloadedOrdinalV3(ordinal int) bool {
+	location, classified := classifySubtitleIndexV3(c.file, ordinal)
+	return classified && location.source == playback.SubtitleSourceDownloadedV3
+}
+
+// downloadedSubtitleCarryIDV3 returns the durable downloaded-subtitle row a
+// captured inventory item names. The in-memory row id is lost when a plan is
+// decoded from JSON, but the sync key serialized alongside it names the same
+// row.
+func downloadedSubtitleCarryIDV3(item playback.SubtitleInventoryItemV3) int {
+	if id := item.DownloadedSubtitleIDV3(); id > 0 {
+		return id
+	}
+	if id, _, ok := subtitles.ParseSyncKey(item.SyncKey); ok {
+		return id
+	}
+	return 0
+}
+
+// downloadedTailChangedV3 reports whether target still publishes the captured
+// downloaded rows in the same order. The downloaded segment is the part of a
+// plan inventory a file-shaped comparison cannot see: a row added, removed, or
+// reordered behind an unchanged id rewrites every ordinal after it, and an
+// unprovable identity counts as a change so the caller remaps instead of
+// reusing a position it cannot verify.
+func (h *PlaybackHandler) downloadedTailChangedV3(ctx context.Context, carry carriedInventorySourceV3, target *models.MediaFile) (bool, error) {
+	if !carry.downloadedKnown || target == nil {
+		return false, nil
+	}
+	live, err := h.listDownloadedSubtitlesV3(ctx, target)
+	if err != nil {
+		return false, err
+	}
+	if len(carry.downloaded) != len(live) {
+		return true, nil
+	}
+	for index, item := range carry.downloaded {
+		if id := downloadedSubtitleCarryIDV3(item); id <= 0 || id != live[index].DownloadedSubtitleID {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // startTrackRekeysV3 is the per-kind state captured before virtual resolution
@@ -98,10 +189,6 @@ type predecessorPlanInventoryV3 struct {
 	// fields the wire inventory does not carry (external path, embedded
 	// container index/ID) can be recovered from the uncooked row.
 	subtitleItems []playback.SubtitleInventoryItemV3
-	// downloaded is the opaque tail segment: downloaded entries have no
-	// models.MediaFile representation and stay addressable through the subtitle
-	// repository and their stable row IDs, exactly as before.
-	downloaded    []playback.SubtitleInventoryItemV3
 	subtitleKnown bool
 }
 
@@ -200,11 +287,6 @@ func predecessorPlanInventoryFromRecordV3(record *playback.AttemptRecordV3) pred
 	if plan.Subtitle.Inventory != nil {
 		inventory.subtitleKnown = true
 		inventory.subtitleItems = plan.Subtitle.Inventory
-		for _, item := range plan.Subtitle.Inventory {
-			if item.Source == playback.SubtitleSourceDownloadedV3 {
-				inventory.downloaded = append(inventory.downloaded, item)
-			}
-		}
 	}
 	return inventory
 }
@@ -397,10 +479,11 @@ func filepathBaseV3(path string) string {
 // preferred because an in-place re-probe can rewrite the row under the same id.
 // A predecessor plan's durable inventory wins over both because the request
 // names that exact attempt: the row under the same id may have been re-probed
-// since the identity was minted.
-func (h *PlaybackHandler) rekeySourceFileWithInventoryV3(ctx context.Context, fileID int, session *playback.Session, durable map[int]predecessorPlanInventoryV3) *models.MediaFile {
+// since the identity was minted. The captured downloaded tail is returned
+// alongside the file-shaped evidence because the latter cannot describe it.
+func (h *PlaybackHandler) rekeySourceFileWithInventoryV3(ctx context.Context, fileID int, session *playback.Session, durable map[int]predecessorPlanInventoryV3) carriedInventorySourceV3 {
 	if fileID <= 0 {
-		return nil
+		return carriedInventorySourceV3{}
 	}
 	var source *models.MediaFile
 	if h.fileResolver != nil {
@@ -415,22 +498,24 @@ func (h *PlaybackHandler) rekeySourceFileWithInventoryV3(ctx context.Context, fi
 			evidence = &cloned
 		}
 		evidence.ID = fileID
+		carry := carriedInventorySourceV3{file: evidence}
 		if inventory.audioKnown {
 			evidence.AudioTracks = inventory.audio
 		}
 		if inventory.subtitleKnown {
 			// Recover the uncooked source fields from the row that still names the
 			// same inventory; the opaque downloaded tail is deliberately not mapped
-			// onto file tracks.
-			evidence.ExternalSubtitles, evidence.SubtitleTracks, _ = subtitleLayoutFromPlanInventoryV3(inventory.subtitleItems, source)
+			// onto file tracks but carried beside them.
+			evidence.ExternalSubtitles, evidence.SubtitleTracks, carry.downloaded = subtitleLayoutFromPlanInventoryV3(inventory.subtitleItems, source)
+			carry.downloadedKnown = true
 		}
-		return evidence
+		return carry
 	}
 	if session == nil || !session.VirtualSubtitleEvidenceSet {
-		return source
+		return carriedInventorySourceV3{file: source}
 	}
 	if fileID != session.MediaFileID && fileID != session.VirtualSubtitleEvidenceFileID {
-		return source
+		return carriedInventorySourceV3{file: source}
 	}
 	evidence := &models.MediaFile{ID: fileID}
 	if source != nil {
@@ -440,7 +525,7 @@ func (h *PlaybackHandler) rekeySourceFileWithInventoryV3(ctx context.Context, fi
 	evidence.AudioTracks = session.VirtualAudioTracks
 	evidence.SubtitleTracks = session.VirtualSubtitleTracks
 	evidence.ExternalSubtitles = session.VirtualExternalSubtitles
-	return evidence
+	return carriedInventorySourceV3{file: evidence}
 }
 
 // rekeyStartTrackIdentitiesV3 normalizes a start request's selected track
@@ -476,15 +561,15 @@ func (h *PlaybackHandler) rekeyStartTrackIdentitiesV3(ctx context.Context, req *
 		// may have been re-probed in place since the identity was minted.
 		if embeddedFileID == req.FileID {
 			source := h.rekeySourceFileWithInventoryV3(ctx, embeddedFileID, committed.session, committed.durable)
-			if source == nil {
-				source = requested
+			if source.file == nil {
+				source = carriedInventorySourceV3{file: requested}
 			}
-			return trackID, rekeyedTrackSelectionV3{active: true, ordinal: ordinal, source: source}
+			return trackID, rekeyedTrackSelectionV3{active: true, ordinal: ordinal, carry: source}
 		}
 		source := h.rekeySourceFileWithInventoryV3(ctx, embeddedFileID, committed.session, committed.durable)
 		accepted := committed.rows[embeddedFileID]
-		if !accepted && source != nil {
-			accepted = virtualRowsNameSameReleaseV3(requested, source)
+		if !accepted && source.file != nil {
+			accepted = virtualRowsNameSameReleaseV3(requested, source.file)
 		}
 		if !accepted {
 			return trackID, rekeyedTrackSelectionV3{}
@@ -496,7 +581,7 @@ func (h *PlaybackHandler) rekeyStartTrackIdentitiesV3(ctx context.Context, req *
 		slog.InfoContext(ctx, "selected track identity re-keyed onto the requested row",
 			"component", "playback", "kind", kind, "sent_track_id", trackID,
 			"requested_file_id", req.FileID, "effective_file_id", embeddedFileID)
-		return rekeyed, rekeyedTrackSelectionV3{active: true, ordinal: ordinal, source: source}
+		return rekeyed, rekeyedTrackSelectionV3{active: true, ordinal: ordinal, carry: source}
 	}
 	req.AudioTrackID, captured.audio = rekey("audio", req.AudioTrackID)
 	req.SubtitleTrackID, captured.subtitle = rekey("subtitle", req.SubtitleTrackID)
@@ -515,7 +600,7 @@ func (h *PlaybackHandler) constrainRekeyedStartTracksV3(ctx context.Context, req
 		return false, false, nil
 	}
 	if captured.audio.active {
-		index, available := resolvedRekeyedAudioOrdinalV3(captured.audio.source, target, captured.audio.ordinal)
+		index, available := resolvedRekeyedAudioOrdinalV3(captured.audio.carry.file, target, captured.audio.ordinal)
 		audioUnavailable = applyRekeyedAudioOrdinalV3(req, target, index, available)
 		if audioUnavailable {
 			slog.InfoContext(ctx, "re-keyed audio selection is unavailable on the resolved candidate; using the default track",
@@ -524,7 +609,7 @@ func (h *PlaybackHandler) constrainRekeyedStartTracksV3(ctx context.Context, req
 		}
 	}
 	if captured.subtitle.active {
-		subtitleUnavailable, err = h.constrainRekeyedSubtitleSelectionV3(ctx, req, captured.subtitle.source, target)
+		subtitleUnavailable, err = h.constrainRekeyedSubtitleSelectionV3(ctx, req, captured.subtitle.carry, target)
 	}
 	return audioUnavailable, subtitleUnavailable, err
 }
@@ -580,19 +665,32 @@ func resolvedRekeyedAudioOrdinalV3(source, target *models.MediaFile, ordinal int
 // audio, a changed inventory is remapped by the existing edition-switch
 // language/format matcher; when no equivalent exists the selection is cleared
 // and reported unavailable rather than reinterpreted against the new order.
-func (h *PlaybackHandler) constrainRekeyedSubtitleSelectionV3(ctx context.Context, req *playback.StartRequestV3, source, target *models.MediaFile) (unavailable bool, err error) {
+// The downloaded tail counts as part of the inventory even though it has no
+// file representation: a carried downloaded ordinal is re-checked against the
+// captured rows even when the embedded/external tracks compare equal.
+func (h *PlaybackHandler) constrainRekeyedSubtitleSelectionV3(ctx context.Context, req *playback.StartRequestV3, carry carriedInventorySourceV3, target *models.MediaFile) (unavailable bool, err error) {
 	if req == nil {
 		return false, nil
 	}
+	source := carry.file
 	if source == nil {
 		req.SubtitleTrackID = ""
 		req.SubtitleTrackIndex = nil
 		return true, nil
 	}
 	if sameSubtitleInventoryV3(source, target) {
-		return false, nil
+		if !carry.namesDownloadedSubtitleV3(req) {
+			return false, nil
+		}
+		changed, tailErr := h.downloadedTailChangedV3(ctx, carry, target)
+		if tailErr != nil {
+			return false, tailErr
+		}
+		if !changed {
+			return false, nil
+		}
 	}
-	if _, remapErr := h.remapSubtitleSelectionV3(ctx, source, target, req); remapErr != nil {
+	if _, remapErr := h.remapSubtitleSelectionWithCarryV3(ctx, carry, target, req); remapErr != nil {
 		if !errors.Is(remapErr, errSubtitleUnavailableInTargetV3) {
 			// A failed subtitle-store lookup cannot prove the track is absent;
 			// keeping the old ordinal would reinterpret it against an inventory
@@ -627,7 +725,9 @@ func (h *PlaybackHandler) constrainRekeyedSubtitleSelectionV3(ctx context.Contex
 // same stream, because a substituted candidate can reorder its tracks. durable
 // carries the plan's captured inventory so an echoed identity on another
 // committed row is interpreted against that generation, not a mutated catalog
-// row; a same-row identity is normalized by the caller's drift remap instead.
+// row. A same-row subtitle identity that names a downloaded track is the
+// exception: the downloaded tail is invisible to the caller's file-shaped drift
+// remap, so it is re-checked against the captured rows here.
 func (h *PlaybackHandler) rekeyReplanTrackIdentitiesV3(ctx context.Context, start *playback.StartRequestV3, file *models.MediaFile, session *playback.Session, durable map[int]predecessorPlanInventoryV3) (audioUnavailable, subtitleUnavailable bool, err error) {
 	if h == nil || h.fileResolver == nil || start == nil || file == nil {
 		return false, false, nil
@@ -647,27 +747,38 @@ func (h *PlaybackHandler) rekeyReplanTrackIdentitiesV3(ctx context.Context, star
 			}
 		}
 	}
-	acceptedSource := func(kind, trackID string) (*models.MediaFile, int, bool) {
+	acceptedSource := func(kind, trackID string) (carriedInventorySourceV3, int, bool) {
 		// A same-row identity is not re-keyed here: it is still minted against
 		// this row, and an in-place re-probe is repaired by the caller's drift
-		// remap, which prefers the same durable inventory before this check.
+		// remap, which prefers the same durable inventory before this check. The
+		// downloaded subtitle tail is the exception, because the drift remap
+		// compares file-shaped inventories and cannot see it.
 		embeddedFileID, embeddedKind, ordinal, ok := playback.ParseTrackIDV3(trackID)
-		if !ok || embeddedKind != kind || embeddedFileID == file.ID {
-			return nil, 0, false
+		if !ok || embeddedKind != kind {
+			return carriedInventorySourceV3{}, 0, false
+		}
+		if embeddedFileID == file.ID && kind != subtitleTrackKindV3 {
+			return carriedInventorySourceV3{}, 0, false
 		}
 		source := h.rekeySourceFileWithInventoryV3(ctx, embeddedFileID, session, durable)
+		if embeddedFileID == file.ID {
+			if !source.downloadedKnown || !source.namesDownloadedOrdinalV3(ordinal) {
+				return carriedInventorySourceV3{}, 0, false
+			}
+			return source, ordinal, true
+		}
 		accepted := committed[embeddedFileID]
-		if !accepted && source != nil {
-			accepted = virtualRowsNameSameReleaseV3(file, source)
+		if !accepted && source.file != nil {
+			accepted = virtualRowsNameSameReleaseV3(file, source.file)
 		}
 		if !accepted {
-			return nil, 0, false
+			return carriedInventorySourceV3{}, 0, false
 		}
 		return source, ordinal, true
 	}
 	if source, ordinal, ok := acceptedSource("audio", start.AudioTrackID); ok {
 		sentTrackID := start.AudioTrackID
-		index, available := resolvedRekeyedAudioOrdinalV3(source, file, ordinal)
+		index, available := resolvedRekeyedAudioOrdinalV3(source.file, file, ordinal)
 		audioUnavailable = applyRekeyedAudioOrdinalV3(start, file, index, available)
 		if audioUnavailable {
 			slog.InfoContext(ctx, "replan audio selection is unavailable on the effective row; using the default track",
