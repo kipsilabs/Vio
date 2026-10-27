@@ -333,6 +333,7 @@ function WatchPagePlayer({
   seriesContext,
   onNavigateEpisode,
   onEnded,
+  onRequestedVersionChange,
   onExit,
   onMinimize,
   resumeHints,
@@ -678,6 +679,18 @@ function WatchPagePlayer({
     session.mediaFileId,
     session.plan?.requested_media_file_id,
   ]);
+
+  // The committed request row changes when the viewer switches version in the
+  // player. Persist it as soon as the server acknowledges the switch: post-roll
+  // close and next-episode navigation do not wait for `onEnded`, so a viewer
+  // who leaves through those controls would otherwise lose the switch.
+  const committedRequestedFileId = session.plan?.requested_media_file_id ?? null;
+  const lastRequestedFileIdRef = useRef(committedRequestedFileId);
+  useEffect(() => {
+    if (lastRequestedFileIdRef.current === committedRequestedFileId) return;
+    lastRequestedFileIdRef.current = committedRequestedFileId;
+    onRequestedVersionChange?.(committedRequestedFileId);
+  }, [committedRequestedFileId, onRequestedVersionChange]);
 
   const handleSwitchAudio = useCallback(
     (index: number, currentPosition: number) => {
