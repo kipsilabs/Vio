@@ -70,7 +70,7 @@ func TestRekeyReplanTrackIdentitiesAcceptsSessionEffectiveRow(t *testing.T) {
 		FileID:       200,
 		AudioTrackID: playback.TrackIDV3(201, "audio", 1),
 	}
-	if _, _, err := handler.rekeyReplanTrackIdentitiesV3(context.Background(), &start, effective, &playback.Session{MediaFileID: 201, RequestedMediaFileID: 100}, nil); err != nil {
+	if _, _, err := handler.rekeyReplanTrackIdentitiesV3(context.Background(), &start, effective, &playback.Session{MediaFileID: 201, RequestedMediaFileID: 100}, nil, false); err != nil {
 		t.Fatalf("rekeyReplanTrackIdentitiesV3: %v", err)
 	}
 
@@ -79,7 +79,7 @@ func TestRekeyReplanTrackIdentitiesAcceptsSessionEffectiveRow(t *testing.T) {
 	}
 
 	start.AudioTrackID = playback.TrackIDV3(300, "audio", 0)
-	if _, _, err := handler.rekeyReplanTrackIdentitiesV3(context.Background(), &start, effective, &playback.Session{MediaFileID: 201}, nil); err != nil {
+	if _, _, err := handler.rekeyReplanTrackIdentitiesV3(context.Background(), &start, effective, &playback.Session{MediaFileID: 201}, nil, false); err != nil {
 		t.Fatalf("rekeyReplanTrackIdentitiesV3: %v", err)
 	}
 	if start.AudioTrackID != playback.TrackIDV3(300, "audio", 0) {
@@ -347,7 +347,7 @@ func TestRekeyReplanRemapsCarriedOrdinalOntoEffectiveCandidate(t *testing.T) {
 	start.SubtitleTrackID = playback.TrackIDV3(200, "subtitle", 1)
 	start.SubtitleTrackIndex = new(1)
 	session := &playback.Session{MediaFileID: 200, RequestedMediaFileID: 100}
-	audioUnavailable, subtitleUnavailable, err := handler.rekeyReplanTrackIdentitiesV3(context.Background(), &start, effective, session, nil)
+	audioUnavailable, subtitleUnavailable, err := handler.rekeyReplanTrackIdentitiesV3(context.Background(), &start, effective, session, nil, false)
 	if err != nil {
 		t.Fatalf("rekeyReplanTrackIdentitiesV3: %v", err)
 	}
@@ -491,7 +491,7 @@ func TestRekeyReplanClearsSubtitleMissingFromEffectiveCandidate(t *testing.T) {
 	start.SubtitleTrackID = playback.TrackIDV3(200, "subtitle", 1)
 	start.SubtitleTrackIndex = new(1)
 
-	audioUnavailable, subtitleUnavailable, err := handler.rekeyReplanTrackIdentitiesV3(context.Background(), &start, effective, &playback.Session{MediaFileID: 200, RequestedMediaFileID: 100}, nil)
+	audioUnavailable, subtitleUnavailable, err := handler.rekeyReplanTrackIdentitiesV3(context.Background(), &start, effective, &playback.Session{MediaFileID: 200, RequestedMediaFileID: 100}, nil, false)
 	if err != nil {
 		t.Fatalf("rekeyReplanTrackIdentitiesV3: %v", err)
 	}
@@ -567,7 +567,7 @@ func TestRekeyReplanPropagatesDownloadedSubtitleLookupFailure(t *testing.T) {
 	start.SubtitleTrackID = playback.TrackIDV3(200, "subtitle", 0)
 	start.SubtitleTrackIndex = new(0)
 
-	_, _, err := handler.rekeyReplanTrackIdentitiesV3(context.Background(), &start, effective, &playback.Session{MediaFileID: 200, RequestedMediaFileID: 100}, nil)
+	_, _, err := handler.rekeyReplanTrackIdentitiesV3(context.Background(), &start, effective, &playback.Session{MediaFileID: 200, RequestedMediaFileID: 100}, nil, false)
 	if err == nil {
 		t.Fatal("a failed downloaded-subtitle lookup was treated as a track miss")
 	}

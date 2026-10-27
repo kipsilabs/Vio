@@ -9939,6 +9939,14 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		durableInventory := replanDurableInventoryV3(record)
 		remapCarry := h.replanRemapSourceV3(currentEffectiveFile, session, durableInventory)
 		remapSource := remapCarry.file
+		// A track_change replaces the seeded selection with the viewer's choice
+		// from the current menu, so its ordinals already address the live
+		// inventory. Every other replan carries the plan-time ordinal and relies
+		// on the drift remap below to reconcile it into the effective row's
+		// inventory. Track both so the re-key step applies predecessor inventory
+		// to a carried ordinal exactly once, never to a fresh or already
+		// reconciled one.
+		subtitleSelectionCurrent := trackChange
 		currentEffectiveStart := start
 		if intentChange && !trackChange {
 			// Prefer returning to the requested edition, but a quality/output/track
@@ -9971,8 +9979,13 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			virtualCandidateRotationRecordedV3(r.Context(), session, currentEffectiveFile, h.fileResolver)) {
 			candidateStart := start
 			remapErr := remapAudioSelectionV3(remapSource, effectiveFile, &candidateStart)
+			subtitleReconciled := false
 			if remapErr == nil && (candidateStart.SubtitleTrackIndex != nil || candidateStart.SubtitleTrackID != "") {
 				_, remapErr = h.remapSubtitleSelectionWithCarryV3(r.Context(), remapCarry, effectiveFile, &candidateStart)
+				// A successful remap leaves the ordinal addressing the effective
+				// row's current inventory. Re-checking it through the plan-time
+				// tail in the re-key step below would remap it a second time.
+				subtitleReconciled = remapErr == nil
 			}
 			if remapErr != nil && outputChange {
 				// An output refresh may make the requested edition viable again,
@@ -9988,12 +10001,15 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				if !trackChange && !sameMediaInventoryV3(remapSource, effectiveFile) {
 					fallbackStart := start
 					fallbackErr := remapAudioSelectionV3(remapSource, effectiveFile, &fallbackStart)
+					fallbackSubtitleReconciled := false
 					if fallbackErr == nil && (fallbackStart.SubtitleTrackIndex != nil || fallbackStart.SubtitleTrackID != "") {
 						_, fallbackErr = h.remapSubtitleSelectionWithCarryV3(r.Context(), remapCarry, effectiveFile, &fallbackStart)
+						fallbackSubtitleReconciled = fallbackErr == nil
 					}
 					switch {
 					case fallbackErr == nil:
 						start = fallbackStart
+						subtitleSelectionCurrent = fallbackSubtitleReconciled
 					case errors.Is(fallbackErr, errSubtitleUnavailableInTargetV3):
 						// The kept row lost the selected subtitle in the same
 						// reprobe. Clearing both fields keeps the fallback off
@@ -10041,6 +10057,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: trackUnavailableReasonV3, message: remapErr.Error()}
 			} else {
 				start = candidateStart
+				subtitleSelectionCurrent = subtitleReconciled
 			}
 		}
 		start.FileID = effectiveFile.ID
@@ -10065,7 +10082,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		// name the session's current effective row after a serve association
 		// moved it without rewriting the durable record. Normalize those onto
 		// the row this replan validates against; a foreign row is still dropped.
-		replanAudioUnavailable, replanSubtitleUnavailable, rekeyErr := h.rekeyReplanTrackIdentitiesV3(r.Context(), &start, effectiveFile, session, durableInventory)
+		replanAudioUnavailable, replanSubtitleUnavailable, rekeyErr := h.rekeyReplanTrackIdentitiesV3(r.Context(), &start, effectiveFile, session, durableInventory, subtitleSelectionCurrent)
 		if rekeyErr != nil {
 			// A subtitle-store failure cannot prove the carried track is absent.
 			// Keep the playing plan authoritative and let the viewer retry
