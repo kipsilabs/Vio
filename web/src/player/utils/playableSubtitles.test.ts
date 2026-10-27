@@ -8,6 +8,7 @@ import {
   pendingServerSubtitleSelection,
   resolvePlayableSubtitles,
   subtitleArtifactIdentity,
+  subtitleSelectionAcknowledgesPending,
   subtitleTrackIdentityFromInfo,
   subtitleTrackIdentityKey,
   type SubtitleTrackIdentity,
@@ -213,6 +214,108 @@ describe("subtitle track identity", () => {
       streamIndex: 2,
     });
     expect(isSameSubtitleTrack(planSelected, active)).toBe(true);
+  });
+});
+
+describe("subtitleSelectionAcknowledgesPending", () => {
+  function identity(overrides: Partial<SubtitleTrackIdentity> = {}): SubtitleTrackIdentity {
+    return { index: 0, ...overrides };
+  }
+
+  it("acknowledges a manual pick after the plan re-mints its combined ordinal", () => {
+    // Viewer picked French at slot 1; the plan committed the same asset at 0.
+    expect(
+      subtitleSelectionAcknowledgesPending(
+        identity({
+          index: 0,
+          trackId: "file:7:subtitle:0",
+          language: "fra",
+          codec: "subrip",
+          source: "embedded",
+        }),
+        identity({
+          index: 1,
+          trackId: "file:7:subtitle:1",
+          language: "fra",
+          codec: "subrip",
+          source: "embedded",
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  it("does not acknowledge a different-language row that inherited the clicked ordinal", () => {
+    expect(
+      subtitleSelectionAcknowledgesPending(
+        identity({
+          index: 1,
+          trackId: "file:7:subtitle:1",
+          language: "eng",
+          codec: "subrip",
+          source: "embedded",
+        }),
+        identity({
+          index: 1,
+          trackId: "file:7:subtitle:1",
+          language: "fra",
+          codec: "subrip",
+          source: "embedded",
+        }),
+      ),
+    ).toBe(false);
+  });
+
+  it("does not acknowledge a sibling asset in the same id family", () => {
+    expect(
+      subtitleSelectionAcknowledgesPending(
+        identity({
+          index: 0,
+          trackId: "file:7:subtitle:0",
+          language: "eng",
+          codec: "subrip",
+          source: "embedded",
+          streamIndex: 0,
+        }),
+        identity({
+          index: 1,
+          trackId: "file:7:subtitle:1",
+          language: "eng",
+          codec: "subrip",
+          source: "embedded",
+          streamIndex: 1,
+        }),
+      ),
+    ).toBe(false);
+  });
+
+  it("acknowledges a re-minted sidecar by its artifact identity", () => {
+    expect(
+      subtitleSelectionAcknowledgesPending(
+        identity({
+          index: 0,
+          language: "fra",
+          codec: "subrip",
+          source: "external",
+          artifactId: "fr-key",
+        }),
+        identity({
+          index: 2,
+          language: "fra",
+          codec: "subrip",
+          source: "external",
+          artifactId: "fr-key",
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  it("does not acknowledge without a committed plan selection", () => {
+    expect(
+      subtitleSelectionAcknowledgesPending(
+        null,
+        identity({ index: 1, trackId: "file:7:subtitle:1", language: "fra" }),
+      ),
+    ).toBe(false);
   });
 });
 

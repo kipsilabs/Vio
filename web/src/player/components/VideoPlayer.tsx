@@ -120,10 +120,10 @@ import {
   toPlayerTime,
 } from "../utils/mediaTimeline";
 import {
-  isSameSubtitleTrack,
   pendingServerSubtitleSelection,
   resolveAppliedSubtitleIndex,
   subtitleArtifactIdentity,
+  subtitleSelectionAcknowledgesPending,
   subtitleTrackIdentityFromInfo,
   subtitleTrackIdentityKey,
   type SubtitleTrackIdentity,
@@ -4345,18 +4345,23 @@ export function VideoPlayer({
     const planSubtitlesChanged = lastSubtitlePlanIdRef.current !== plan.plan_id;
     const planAcknowledgesPendingSubtitle =
       pendingManualSubtitle === null ||
-      (planSelectedSubtitleIdentity !== null &&
-        isSameSubtitleTrack(planSelectedSubtitleIdentity, pendingManualSubtitle));
+      subtitleSelectionAcknowledgesPending(planSelectedSubtitleIdentity, pendingManualSubtitle);
+    // Acknowledged manual pick, or the plan's own committed selection. With
+    // neither there is nothing to reconcile, and the auto-select path keeps
+    // owning the outbound request.
+    const subtitleIntent = pendingManualSubtitle ?? planSelectedSubtitleIdentity;
     if (
       planSubtitlesChanged &&
       !replanning &&
       planAcknowledgesPendingSubtitle &&
       planHasSelectableSubtitles &&
-      planSelectedSubtitleIdentity !== null
+      subtitleIntent !== null
     ) {
+      // Resolve the viewer's own asset, not the plan ordinal, so a re-minted
+      // track id cannot hand the marker another row.
       const reconciledIndex = resolveAppliedSubtitleIndex(
         effectiveSubtitleTracks.map(subtitleTrackIdentityFromInfo),
-        planSelectedSubtitleIdentity,
+        subtitleIntent,
       );
       // No unambiguous row: keep holding outbound selection instead of letting
       // the stale marker resolve against the replacement inventory.
@@ -4387,9 +4392,31 @@ export function VideoPlayer({
       return;
     }
 
+    // A pending manual pick is the viewer's intent, even while the marker still
+    // names the outgoing plan's ordinal. Resolve it against the rows on screen
+    // first so no outbound request can carry whichever track inherited that
+    // ordinal; a pick the displayed inventory cannot name holds the request.
+    let outboundIdentity = activeSubtitleIdentity;
+    if (pendingManualSubtitle !== null) {
+      const pendingIndex = resolveAppliedSubtitleIndex(
+        effectiveSubtitleTracks.map(subtitleTrackIdentityFromInfo),
+        pendingManualSubtitle,
+      );
+      if (pendingIndex === null) return;
+      const pendingRow =
+        effectiveSubtitleTracks.find((track) => track.index === pendingIndex) ?? null;
+      outboundIdentity = pendingRow
+        ? subtitleTrackIdentityFromInfo(pendingRow)
+        : { index: pendingIndex };
+      if (pendingIndex !== activeSubtitleIndex) {
+        setActiveSubtitleIndex(pendingIndex);
+        lastSubtitleIndexRef.current = pendingIndex;
+      }
+    }
+
     const desiredServerIndex = pendingServerSubtitleSelection(
       planSelectedSubtitleIdentity,
-      activeSubtitleIdentity,
+      outboundIdentity,
     );
     if (desiredServerIndex === undefined) {
       requestedSubtitleTrackChangeRef.current = null;
@@ -4402,9 +4429,9 @@ export function VideoPlayer({
     // plan. A settled plan clears the ref above, so a later user action on the
     // same identity can still request once.
     const requestIdentity =
-      desiredServerIndex === null || activeSubtitleIdentity === null
+      desiredServerIndex === null || outboundIdentity === null
         ? "off"
-        : `track:${subtitleTrackIdentityKey(activeSubtitleIdentity)}`;
+        : `track:${subtitleTrackIdentityKey(outboundIdentity)}`;
     const requestKey = `${subtitleSourceGeneration}:${requestIdentity}`;
     if (requestedSubtitleTrackChangeRef.current === requestKey) return;
     requestedSubtitleTrackChangeRef.current = requestKey;
@@ -4505,8 +4532,7 @@ export function VideoPlayer({
     const pendingManualSubtitle = pendingManualSubtitleIdentityRef.current;
     if (
       pendingManualSubtitle !== null &&
-      (planSelectedSubtitleIdentity === null ||
-        !isSameSubtitleTrack(planSelectedSubtitleIdentity, pendingManualSubtitle))
+      !subtitleSelectionAcknowledgesPending(planSelectedSubtitleIdentity, pendingManualSubtitle)
     ) {
       // The viewer's pick is newer than this plan; leave the optimistic marker
       // for the outbound effect to send instead of pulling it back.
@@ -4515,10 +4541,11 @@ export function VideoPlayer({
     }
     // Resolve the committed asset against the rows actually displayed. The
     // plan ordinal alone is wrong when adoption preserved a verified inventory
-    // in a different order.
+    // in a different order, and an acknowledged pick's captured id can still
+    // carry the outgoing plan's ordinal.
     const reconciledIndex = resolveAppliedSubtitleIndex(
       effectiveSubtitleTracks.map(subtitleTrackIdentityFromInfo),
-      planSelectedSubtitleIdentity,
+      pendingManualSubtitle ?? planSelectedSubtitleIdentity,
     );
     if (reconciledIndex === null) return;
     lastSubtitlePlanIdRef.current = plan.plan_id;
@@ -4551,6 +4578,9 @@ export function VideoPlayer({
     if (initialSubtitleError) {
       consumedInitialSubtitleErrorKeyRef.current = `${sessionId}|${plan.plan_attempt_key}|${initialSubtitleError}`;
       subtitleRemapRef.current = null;
+      // The refused pick is gone; a pin to Off must not resurrect it as a
+      // pending intent for the next plan.
+      pendingManualSubtitleIdentityRef.current = null;
       subtitleSelectionWasManualRef.current = false;
       subtitleSelectionWasManualOffRef.current = true;
       setActiveSubtitleIndex(null);
