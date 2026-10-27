@@ -1,11 +1,13 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
@@ -179,5 +181,108 @@ func TestHandleReplanPlaybackV3TrackChangeSelectsAppendedDownloadedRow(t *testin
 	if row := selectedDownloadedSubtitleRowV3(t, response.PlaybackPlan); row != 72 {
 		t.Fatalf("track change selected downloaded row %d, want 72 (Japanese); subtitle=%+v inventory=%+v",
 			row, response.PlaybackPlan.SelectedTracks.Subtitle, response.PlaybackPlan.Subtitle.Inventory)
+	}
+}
+
+// A track_change can name a row other than the one the replan validates
+// against: the live menu publishes the requested row while the session is
+// served by its effective row. The fresh ordinal belongs to the row that
+// published it, so a downloaded row inserted ahead of the captured pick must be
+// mapped by identity onto the effective row instead of being read through the
+// predecessor tail.
+func TestHandleReplanPlaybackV3TrackChangeCrossRowDownloadedInsertion(t *testing.T) {
+	const publishedRowID, effectiveRowID = 201, 200
+	// Downloaded rows are file-bound, so each catalog row owns its own ids.
+	const publishedEnglishRowID, publishedJapaneseRowID = 171, 172
+	const effectiveEnglishRowID, effectiveJapaneseRowID = 71, 72
+
+	published := v3HandlerFixtureFile(t)
+	published.ID = publishedRowID
+	published.ContentID = "movie-cross-row-downloaded"
+	published.FilePath = "virtual://movie/tt-cross-row-downloaded?result=cand"
+	published.VirtualOwnerInstallationID = 5
+	published.SubtitleTracks = []models.SubtitleTrack{{Index: 0, Language: "eng", Codec: "subrip"}}
+	probedAt := time.Now().Add(-time.Hour)
+	published.ProbeUpdatedAt = &probedAt
+
+	repo := downloadedSubtitleRepoByFile{byFile: map[int][]subtitles.DownloadedSubtitle{
+		publishedRowID: {{ID: publishedEnglishRowID, MediaFileID: publishedRowID, Language: "eng", Format: subtitles.FormatSRT}},
+	}}
+	files := map[int]*models.MediaFile{publishedRowID: published}
+	manager := playback.NewSessionManager(0, 0)
+	handler := NewPlaybackHandler(manager, mapPlaybackFileResolver{files: files})
+	stubCopySeekAnchorV3(handler)
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "true"}}
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	handler.SubtitleRepo = repo
+	handler.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(func(_ context.Context, path string, _ int, _ string, _ int) (string, error) {
+		return "http://127.0.0.1:9/stream?path=" + path, nil
+	})
+
+	start := v3HandlerStartRequest()
+	start.FileID = publishedRowID
+	start.QualityPreference = "auto"
+	direct := start.ClientPlaybackContext.Deliveries[playback.DeliveryClassOriginalHTTPV3]
+	direct.ValidatedClaims = append(direct.ValidatedClaims, playback.ClaimClientSelectedAudioTrackV3)
+	start.ClientPlaybackContext.Deliveries[playback.DeliveryClassOriginalHTTPV3] = direct
+	start.ClientPlaybackContext.Deliveries[playback.DeliveryClassHLSV3] = playback.DeliveryCapabilityV3{
+		Enabled: true, SupportedOnDevice: true, Containers: []string{"hls"}, VideoCodecs: []string{"h264"}, AudioDecodeCodecs: []string{"aac"},
+	}
+	start.ClientPlaybackContext.Deliveries[playback.DeliveryClassProgressiveV3] = playback.DeliveryCapabilityV3{
+		Enabled: true, SupportedOnDevice: true, Containers: []string{"mp4"}, VideoCodecs: []string{"h264"}, AudioDecodeCodecs: []string{"aac"},
+	}
+	startedOrdinal := 1
+	start.SubtitleTrackIndex = &startedOrdinal
+	start.SubtitleTrackID = playback.TrackIDV3(publishedRowID, "subtitle", 1)
+	started := startV3PlaybackForHandlerTest(t, handler, start)
+
+	// The replan validates the session's effective row, which is a distinct
+	// catalog row with the same release bytes. The session and menu still name
+	// the requested row.
+	effective := *published
+	effective.ID = effectiveRowID
+	files[effectiveRowID] = &effective
+	store, ok := handler.PlanStoreV3.(*playback.MemoryPlanStoreV3)
+	if !ok {
+		t.Fatalf("plan store = %T, want *playback.MemoryPlanStoreV3", handler.PlanStoreV3)
+	}
+	record, err := store.GetAttempt(context.Background(), started.SessionID)
+	if err != nil {
+		t.Fatalf("GetAttempt: %v", err)
+	}
+	record.EffectiveMediaFileID = effectiveRowID
+	store.ReplaceAttempt(context.Background(), *record)
+
+	// A Japanese subtitle is downloaded and sorted ahead of the captured
+	// English row in the published menu. The effective row keeps English first.
+	repo.byFile[publishedRowID] = []subtitles.DownloadedSubtitle{
+		{ID: publishedJapaneseRowID, MediaFileID: publishedRowID, Language: "jpn", Format: subtitles.FormatSRT},
+		{ID: publishedEnglishRowID, MediaFileID: publishedRowID, Language: "eng", Format: subtitles.FormatSRT},
+	}
+	repo.byFile[effectiveRowID] = []subtitles.DownloadedSubtitle{
+		{ID: effectiveEnglishRowID, MediaFileID: effectiveRowID, Language: "eng", Format: subtitles.FormatSRT},
+		{ID: effectiveJapaneseRowID, MediaFileID: effectiveRowID, Language: "jpn", Format: subtitles.FormatSRT},
+	}
+
+	current := started.PlaybackPlan
+	requested := 1
+	response := postPlaybackReplanV3(t, handler, started.SessionID, playback.ReplanRequestV3{
+		ProtocolVersion: playback.ProtocolV3, Operation: playback.ReplanOperationTrackChangeV3,
+		PlaybackAttemptID: start.PlaybackAttemptID, ReplanRequestID: "downloaded-cross-row-insert-0001",
+		FailedPlanID: current.PlanID, PlanAttemptID: "downloaded-cross-row-insert-attempt-0001",
+		PlanAttemptKey: current.PlanAttemptKey, AttemptCount: 1, PositionSeconds: 30,
+		QualityPreference: "original",
+		SelectedTracks: playback.SelectedTracksV3{
+			Audio:    current.SelectedTracks.Audio,
+			Subtitle: &playback.TrackIdentityV3{ID: playback.TrackIDV3(publishedRowID, "subtitle", requested), Index: &requested},
+		},
+		Capabilities: start.Capabilities, ClientPlaybackContext: start.ClientPlaybackContext,
+	})
+	if response.PlaybackPlan == nil || response.Terminal != nil {
+		t.Fatalf("cross-row track change = plan %#v terminal %#v", response.PlaybackPlan, response.Terminal)
+	}
+	if row := selectedDownloadedSubtitleRowV3(t, response.PlaybackPlan); row != effectiveJapaneseRowID {
+		t.Fatalf("cross-row track change selected downloaded row %d, want %d (Japanese); subtitle=%+v inventory=%+v",
+			row, effectiveJapaneseRowID, response.PlaybackPlan.SelectedTracks.Subtitle, response.PlaybackPlan.Subtitle.Inventory)
 	}
 }
