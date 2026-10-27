@@ -796,6 +796,45 @@ describe("subtitle marker reconciliation", () => {
       expect(onSubtitleTrackChange).toHaveBeenCalledWith(1, expect.any(Number), frenchFallback),
     );
   });
+
+  it("requests the clicked row when two fallback rows look identical", async () => {
+    const onSubtitleTrackChange = vi.fn();
+    // Neither row carries an id, a URL or a stream index, so the descriptor
+    // cannot tell them apart; the marker still names the row that was clicked.
+    const englishFallback: PlayerSubtitleInfo = {
+      index: 0,
+      media_file_id: 7,
+      language: "eng",
+      codec: "srt",
+      label: "English",
+      source: "embedded",
+      url: "",
+    };
+    const secondEnglishFallback = { ...englishFallback, index: 1 };
+    renderPlayer({
+      plan: fixturePlanV3({
+        ...directPlan,
+        plan_id: "plan:deferred-identical-subtitles",
+        plan_attempt_key: "v3:deferred-identical-subtitles",
+        subtitle: { mode: "off", inventory: [] },
+      }),
+      subtitleUrls: [englishFallback, secondEnglishFallback],
+      subtitleMode: "off",
+      onSubtitleTrackChange,
+    });
+
+    act(() => {
+      controls.current?.onSubtitleSelect?.(1);
+    });
+
+    await waitFor(() =>
+      expect(onSubtitleTrackChange).toHaveBeenCalledWith(
+        1,
+        expect.any(Number),
+        secondEnglishFallback,
+      ),
+    );
+  });
 });
 
 function planInvalidatedCommand(

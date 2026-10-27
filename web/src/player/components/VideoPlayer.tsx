@@ -120,6 +120,7 @@ import {
   toPlayerTime,
 } from "../utils/mediaTimeline";
 import {
+  isSameSubtitleTrack,
   pendingServerSubtitleSelection,
   resolveAppliedSubtitleIndex,
   subtitleArtifactIdentity,
@@ -4395,13 +4396,21 @@ export function VideoPlayer({
     // A pending manual pick is the viewer's intent, even while the marker still
     // names the outgoing plan's ordinal. Resolve it against the rows on screen
     // first so no outbound request can carry whichever track inherited that
-    // ordinal; a pick the displayed inventory cannot name holds the request.
+    // ordinal. When the evidence cannot single out a row (two tracks that look
+    // alike), the marker still names the row the viewer clicked as long as that
+    // row is the same asset; otherwise the pick has lost its row and the
+    // request holds instead of guessing.
     let outboundIdentity = activeSubtitleIdentity;
     if (pendingManualSubtitle !== null) {
-      const pendingIndex = resolveAppliedSubtitleIndex(
-        effectiveSubtitleTracks.map(subtitleTrackIdentityFromInfo),
-        pendingManualSubtitle,
-      );
+      const displayedIdentities = effectiveSubtitleTracks.map(subtitleTrackIdentityFromInfo);
+      const resolvedIndex = resolveAppliedSubtitleIndex(displayedIdentities, pendingManualSubtitle);
+      const markerRow =
+        displayedIdentities.find((row) => row.index === pendingManualSubtitle.index) ?? null;
+      const pendingIndex =
+        resolvedIndex ??
+        (markerRow !== null && isSameSubtitleTrack(markerRow, pendingManualSubtitle)
+          ? markerRow.index
+          : null);
       if (pendingIndex === null) return;
       const pendingRow =
         effectiveSubtitleTracks.find((track) => track.index === pendingIndex) ?? null;
