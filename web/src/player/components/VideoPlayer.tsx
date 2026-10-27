@@ -4496,13 +4496,35 @@ export function VideoPlayer({
     if (requestedSubtitleTrackChangeRef.current && replanError && !replanning) {
       subtitleSelectionWasManualRef.current = true;
       subtitleSelectionWasManualOffRef.current = false;
-      setActiveSubtitleIndex(plan.selected_tracks.subtitle?.index ?? null);
+      // The refused pick is no longer the viewer's intent. Leaving it pending
+      // would let the outbound effect re-resolve and re-send the rejected track
+      // on the next render, as soon as clearing the request guard below lets it.
+      pendingManualSubtitleIdentityRef.current = null;
+      // Roll back to the accepted asset on the rows the menu actually shows.
+      // The plan ordinal names a row in the plan's own inventory, which
+      // adoption may have reordered under the preserved verified list.
+      const rollbackIndex =
+        resolveAppliedSubtitleIndex(
+          effectiveSubtitleTracks.map(subtitleTrackIdentityFromInfo),
+          planSelectedSubtitleIdentity,
+        ) ??
+        plan.selected_tracks.subtitle?.index ??
+        null;
+      setActiveSubtitleIndex(rollbackIndex);
+      if (rollbackIndex !== null) lastSubtitleIndexRef.current = rollbackIndex;
       requestedSubtitleTrackChangeRef.current = null;
       toast.error(replanErrorTitle ?? "That subtitle track can't be used", {
         description: replanError,
       });
     }
-  }, [plan.selected_tracks.subtitle?.index, replanError, replanErrorTitle, replanning]);
+  }, [
+    effectiveSubtitleTracks,
+    plan.selected_tracks.subtitle?.index,
+    planSelectedSubtitleIdentity,
+    replanError,
+    replanErrorTitle,
+    replanning,
+  ]);
 
   // A successful replan is authoritative for the marker. The inventory can be
   // re-minted at new combined ordinals for the same asset, and the optimistic

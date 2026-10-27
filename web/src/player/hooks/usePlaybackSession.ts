@@ -1038,6 +1038,38 @@ function matchSubtitleByDescriptor(
 }
 
 /**
+ * Whether a plan row carrying the clicked row's `track_id` can stand in for it.
+ *
+ * The id embeds the plan's ordinal, so it only names the clicked asset while
+ * the plan publishes the order the menu was read from. Adoption can preserve
+ * verified rows under a provisional plan that publishes another order, which
+ * re-mints every id: the equal id then names a different language. Language,
+ * flags, codec, source, and label are the evidence the menus show, so a row
+ * that disagrees on any of them is a different asset. A label the player
+ * synthesized (from the language, or a slot default) must not veto an
+ * otherwise identical row.
+ */
+function subtitleIdNamesPickedAsset(
+  planRow: SubtitleInventoryItemV3,
+  picked: PlayerSubtitleInfo,
+): boolean {
+  if (subtitleLanguageBase(planRow.language) !== subtitleLanguageBase(picked.language))
+    return false;
+  if ((planRow.codec ?? "").trim().toLowerCase() !== (picked.codec ?? "").trim().toLowerCase()) {
+    return false;
+  }
+  if (Boolean(planRow.forced) !== Boolean(picked.forced)) return false;
+  if (Boolean(planRow.hearing_impaired) !== Boolean(picked.hearing_impaired)) return false;
+  const planSource = (planRow.source ?? "").trim().toLowerCase();
+  const pickedSource = (picked.source ?? "").trim().toLowerCase();
+  if (planSource && pickedSource && planSource !== pickedSource) return false;
+  const planLabel = (planRow.label ?? "").trim().toLowerCase();
+  const pickedLabel = (picked.label ?? "").trim().toLowerCase();
+  if (planLabel && pickedLabel && planLabel !== pickedLabel) return false;
+  return true;
+}
+
+/**
  * Resolves the subtitle identity to send for a menu pick, or null when the pick
  * cannot be reconciled to the current plan's inventory.
  *
@@ -1054,7 +1086,11 @@ function matchSubtitleByDescriptor(
  * ordinal, so an equal id in the new inventory can name another language. The
  * captured row is then matched by its stable sync key or an unambiguous
  * descriptor instead; when neither names exactly one track the pick is
- * dropped rather than replayed against the old slot.
+ * dropped rather than replayed against the old slot. An immediate pick trusts
+ * its id only while the plan row that carries it still agrees with the clicked
+ * row's descriptor: adoption preserves verified rows under a plan that can
+ * publish another order, and the re-minted ids would otherwise name the track
+ * that inherited the slot.
  *
  * A pick with a stable identity and no counterpart in the plan is dropped
  * rather than sent. The plan's exact ordinal is used only when there is no
@@ -1082,11 +1118,22 @@ function resolveSubtitleTrackChange(
       ? pickedTrack
       : displayed.find((item) => item.index === combinedIndex);
   if (picked) {
+    // An equal `track_id` is only evidence while the plan publishes the same
+    // order the menu was read from. When the row it names has another
+    // language/flags, the click came from an inventory the plan reordered
+    // (adoption preserves verified rows under a provisional plan), so the id
+    // must not be replayed against the slot that inherited it.
+    let idNamesAnotherAsset = false;
     if (trustPickedTrackId && picked.track_id) {
       const byId = inventory.find((item) => item.track_id === picked.track_id);
-      if (byId) return { id: byId.track_id, index: byId.combined_index };
+      if (byId) {
+        if (subtitleIdNamesPickedAsset(byId, picked)) {
+          return { id: byId.track_id, index: byId.combined_index };
+        }
+        idNamesAnotherAsset = true;
+      }
     }
-    if (!trustPickedTrackId) {
+    if (!trustPickedTrackId || idNamesAnotherAsset) {
       const byAsset = matchSubtitleByAsset(inventory, picked);
       if (byAsset) return { id: byAsset.track_id, index: byAsset.combined_index };
       const byDescriptor = matchSubtitleByDescriptor(inventory, picked);

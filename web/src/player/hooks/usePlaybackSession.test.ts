@@ -7994,7 +7994,31 @@ describe("usePlaybackSession plan audio inventory", () => {
   });
 
   it("preserves verified inventory across a stale pending replan and re-clears pending on redelivery", async () => {
+    // The probe verified these rows against the playing source: English at the
+    // first slot, French at the second.
+    const verifiedSubtitles = [
+      fixtureSubtitleInventoryItemV3({
+        track_id: "file:7:subtitle:0",
+        combined_index: 0,
+        language: "eng",
+        label: "English",
+      }),
+      fixtureSubtitleInventoryItemV3({
+        track_id: "file:7:subtitle:1",
+        combined_index: 1,
+        language: "fra",
+        label: "French",
+      }),
+    ];
+    // The replan was built before the probe persisted, so it still publishes
+    // the declared order and re-mints the ordinal-derived ids: French now
+    // occupies slot 0 and English slot 1.
+    const reorderedPlanSubtitles = [
+      { ...verifiedSubtitles[1]!, track_id: "file:7:subtitle:0", combined_index: 0 },
+      { ...verifiedSubtitles[0]!, track_id: "file:7:subtitle:1", combined_index: 1 },
+    ];
     let replanCalled = false;
+    const replanBodies: Array<Record<string, unknown>> = [];
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       if (url.endsWith("/playback/start")) {
@@ -8021,6 +8045,7 @@ describe("usePlaybackSession plan audio inventory", () => {
       }
       if (url.endsWith("/replan")) {
         replanCalled = true;
+        replanBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
         // Server replan returns a plan that still echoes the older provisional/pending inventory
         return jsonResponse({
           protocol_version: 3,
@@ -8038,6 +8063,12 @@ describe("usePlaybackSession plan audio inventory", () => {
             audio_tracks: [
               { codec: "aac", channels: 2, layout: "stereo", language: "eng", default: true },
             ],
+            subtitle: { mode: "render", inventory: reorderedPlanSubtitles },
+            selected_tracks: {
+              audio: { id: "file:7:audio:0", index: 0 },
+              // English, at the ordinal the reordered plan assigned it.
+              subtitle: { id: "file:7:subtitle:1", index: 1 },
+            },
           }),
         });
       }
@@ -8049,12 +8080,7 @@ describe("usePlaybackSession plan audio inventory", () => {
           effective_media_file_id: 7,
           effective_virtual_uri: "virtual://movie/test?result=c1",
           audio_tracks: verifiedAudio,
-          subtitle_inventory: [
-            fixtureSubtitleInventoryItemV3({
-              track_id: "file:7:subtitle:0",
-              language: "deu",
-            }),
-          ],
+          subtitle_inventory: verifiedSubtitles,
         });
       }
       if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
@@ -8082,12 +8108,7 @@ describe("usePlaybackSession plan audio inventory", () => {
         effective_media_file_id: 7,
         effective_virtual_uri: "virtual://movie/test?result=c1",
         audio_tracks: verifiedAudio,
-        subtitle_inventory: [
-          fixtureSubtitleInventoryItemV3({
-            track_id: "file:7:subtitle:0",
-            language: "deu",
-          }),
-        ],
+        subtitle_inventory: verifiedSubtitles,
       });
     });
 
@@ -8105,6 +8126,26 @@ describe("usePlaybackSession plan audio inventory", () => {
     expect(result.current.inventoryPending).toBe(false);
     expect(result.current.audioInventoryProvisional).toBe(false);
     expect(result.current.planAudioTracks).toHaveLength(2);
+    // The menu keeps the verified rows in their verified order, even though the
+    // adopted provisional plan publishes another one.
+    expect(result.current.subtitleUrls.map((track) => track.language)).toEqual(["eng", "fra"]);
+
+    // A manual pick from the preserved rows must name the clicked asset, not
+    // whichever track inherited its ordinal in the adopted plan. Displayed
+    // French still carries `file:7:subtitle:1`, but the plan's French row is
+    // `file:7:subtitle:0`; trusting the equal-looking id would switch language.
+    act(() => result.current.changeSubtitleTrack(1, 130));
+    await waitFor(() => expect(replanBodies).toHaveLength(2));
+    const planFrench = result.current.plan?.subtitle.inventory.find(
+      (item) => item.language === "fra",
+    );
+    expect(planFrench).toMatchObject({ track_id: "file:7:subtitle:0", combined_index: 0 });
+    expect(replanBodies[1]).toMatchObject({
+      operation: "track_change",
+      selected_tracks: {
+        subtitle: { id: planFrench?.track_id, index: planFrench?.combined_index },
+      },
+    });
 
     // Step 3: redelivery of inv:verified-1 terminal update reconciles successfully
     let accepted = false;
@@ -8116,12 +8157,7 @@ describe("usePlaybackSession plan audio inventory", () => {
         effective_media_file_id: 7,
         effective_virtual_uri: "virtual://movie/test?result=c1",
         audio_tracks: verifiedAudio,
-        subtitle_inventory: [
-          fixtureSubtitleInventoryItemV3({
-            track_id: "file:7:subtitle:0",
-            language: "deu",
-          }),
-        ],
+        subtitle_inventory: verifiedSubtitles,
       });
     });
 
