@@ -9,7 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createWatchRouteRequest, type WatchPlaybackStartInput } from "@/pages/watchRouteHelpers";
 import type { WatchPage } from "@/player/components/WatchPage";
 import { WatchPlaybackHost, WatchPlaybackProvider } from "./WatchPlaybackChrome";
-import { readRequestedFileId } from "./requestedVersion";
+import { readRequestedFileId, rememberRequestedFileId } from "./requestedVersion";
 import {
   useWatchPlaybackController,
   type WatchPlaybackControllerValue,
@@ -17,20 +17,21 @@ import {
 
 type WatchPageProps = ComponentProps<typeof WatchPage>;
 
-const mocks = vi.hoisted(() => ({
-  navigate: vi.fn(),
-  player: { props: null as WatchPageProps | null },
-  // One object for every render, as the query cache would return.
-  detail: {
-    data: {
-      content_id: "movie-1",
-      title: "The Movie",
-      year: 2024,
-      versions: [],
-    },
-    error: null,
-  },
-}));
+const mocks = vi.hoisted(() => {
+  // One object for every render, as the query cache would return. Kept
+  // mutable so a test can describe a catalog with rows.
+  const data = {
+    content_id: "movie-1",
+    title: "The Movie",
+    year: 2024,
+    versions: [] as Array<Record<string, unknown>>,
+  };
+  return {
+    navigate: vi.fn(),
+    player: { props: null as WatchPageProps | null },
+    detail: { data, error: null },
+  };
+});
 
 vi.mock("@/hooks/useViewTransition", () => ({
   useViewTransitionNavigate: () => mocks.navigate,
@@ -72,7 +73,7 @@ vi.mock("@/player/components/WatchPage", () => ({
   },
 }));
 
-async function renderMovie(input: WatchPlaybackStartInput) {
+async function mountMovie(input: WatchPlaybackStartInput) {
   const controllerRef: { current: WatchPlaybackControllerValue | null } = { current: null };
   function ControllerProbe() {
     const controller = useWatchPlaybackController();
@@ -94,6 +95,12 @@ async function renderMovie(input: WatchPlaybackStartInput) {
   );
   await waitFor(() => expect(controllerRef.current).not.toBeNull());
   act(() => controllerRef.current!.syncRouteRequest(createWatchRouteRequest(input)));
+
+  return controllerRef;
+}
+
+async function renderMovie(input: WatchPlaybackStartInput) {
+  await mountMovie(input);
   await screen.findByTestId("player");
 
   return { player: () => mocks.player.props! };
@@ -104,8 +111,25 @@ describe("WatchPlaybackHost requested version", () => {
     localStorage.clear();
     mocks.navigate.mockReset();
     mocks.player.props = null;
+    mocks.detail.data.versions.length = 0;
   });
   afterEach(cleanup);
+
+  it("returns a direct watch URL to the item page when the stored row left the catalog", async () => {
+    // The device remembers row 2, but the enrichment refresh dropped it. The
+    // watch URL names no row of its own, so the session's fallback would play
+    // row 1 and contradict the item page's pick-again promise.
+    mocks.detail.data.versions.push({ file_id: 1 });
+    rememberRequestedFileId("movie-1", 2, "profile-1");
+
+    await mountMovie({ contentId: "movie-1", libraryId: 1 });
+
+    await waitFor(() =>
+      expect(mocks.navigate).toHaveBeenCalledWith("/item/movie-1?libraryId=1", expect.anything()),
+    );
+    expect(screen.queryByTestId("player")).toBeNull();
+    expect(mocks.player.props).toBeNull();
+  });
 
   it("keeps the requested row after exiting a substituted playback", async () => {
     const { player } = await renderMovie({ contentId: "movie-1", libraryId: 1 });
