@@ -87,6 +87,74 @@ func TestRekeyReplanTrackIdentitiesAcceptsSessionEffectiveRow(t *testing.T) {
 	}
 }
 
+// A track_change is minted against the live menu, even when the selected
+// identity names an accepted row other than the one this replan validates
+// against. The fresh ordinal must be read through the row that published it and
+// then remapped by identity; applying the predecessor inventory would select
+// whoever occupied that position when the plan was captured.
+func TestRekeyReplanTrackChangeCrossRowUsesPublishingInventory(t *testing.T) {
+	const englishID, japaneseID = 71, 72
+	// The replan validates the session's effective row 200.
+	effective := &models.MediaFile{
+		ID: 200, ContentID: "movie-1", Container: "virtual", FilePath: "virtual://movie/tt?result=abc",
+		ExternalSubtitles: []models.ExternalSubtitle{{Path: "/subs/english.srt", Language: "eng", Format: "srt", Title: "English"}},
+	}
+	// The live menu published row 201, an accepted session/evidence row that
+	// lists the newly downloaded Japanese subtitle first.
+	published := &models.MediaFile{
+		ID: 201, ContentID: "movie-1", Container: "virtual", FilePath: "virtual://movie/tt?result=abc",
+		ExternalSubtitles: []models.ExternalSubtitle{{Path: "/subs/english.srt", Language: "eng", Format: "srt", Title: "English"}},
+	}
+	handler := &PlaybackHandler{
+		fileResolver: mapPlaybackFileResolver{files: map[int]*models.MediaFile{200: effective, 201: published}},
+		SubtitleRepo: downloadedSubtitleRepoByFile{byFile: map[int][]subtitles.DownloadedSubtitle{
+			effective.ID: {
+				{ID: englishID, MediaFileID: effective.ID, Language: "eng", Format: subtitles.FormatSRT},
+				{ID: japaneseID, MediaFileID: effective.ID, Language: "jpn", Format: subtitles.FormatSRT},
+			},
+			published.ID: {
+				{ID: japaneseID, MediaFileID: published.ID, Language: "jpn", Format: subtitles.FormatSRT},
+				{ID: englishID, MediaFileID: published.ID, Language: "eng", Format: subtitles.FormatSRT},
+			},
+		}},
+	}
+	session := &playback.Session{
+		MediaFileID:                published.ID,
+		RequestedMediaFileID:       100,
+		VirtualSubtitleEvidenceSet: true,
+		VirtualExternalSubtitles:   published.ExternalSubtitles,
+	}
+	start := v3HandlerStartRequest()
+	start.FileID = effective.ID
+	start.SubtitleTrackID = playback.TrackIDV3(published.ID, "subtitle", 1)
+	start.SubtitleTrackIndex = new(1)
+
+	_, subtitleUnavailable, err := handler.rekeyReplanTrackIdentitiesV3(context.Background(), &start, effective, session, nil, true)
+	if err != nil {
+		t.Fatalf("rekeyReplanTrackIdentitiesV3: %v", err)
+	}
+	if subtitleUnavailable {
+		t.Fatalf("fresh cross-row Japanese selection was reported unavailable: id=%q index=%v", start.SubtitleTrackID, start.SubtitleTrackIndex)
+	}
+	_, kind, ordinal, ok := playback.ParseTrackIDV3(start.SubtitleTrackID)
+	if !ok || kind != subtitleTrackKindV3 || ordinal != 2 || start.SubtitleTrackIndex == nil || *start.SubtitleTrackIndex != 2 {
+		t.Fatalf("re-keyed subtitle = id %q index %v, want ordinal 2 (Japanese on row %d)",
+			start.SubtitleTrackID, start.SubtitleTrackIndex, effective.ID)
+	}
+	if start.SubtitleTrackID != playback.TrackIDV3(effective.ID, "subtitle", 2) {
+		t.Fatalf("re-keyed subtitle id = %q, want %q", start.SubtitleTrackID, playback.TrackIDV3(effective.ID, "subtitle", 2))
+	}
+	live, err := handler.listDownloadedSubtitlesV3(context.Background(), effective)
+	if err != nil {
+		t.Fatalf("listDownloadedSubtitlesV3: %v", err)
+	}
+	// The target's downloaded tail starts after its own published external
+	// track, so ordinal 2 is the second downloaded row.
+	if len(live) < 2 || live[1].DownloadedSubtitleID != japaneseID {
+		t.Fatalf("target downloaded tail = %+v, want Japanese row %d at ordinal 2", live, japaneseID)
+	}
+}
+
 // Enrichment can re-probe a catalog row in place (same id, different release).
 // A carried audio id that only names that row must be remapped from the
 // evidence generation the selection was minted against, not reused by row-id
@@ -834,7 +902,9 @@ func TestRekeyStartSessionEvidenceRechecksDownloadedTail(t *testing.T) {
 		planLanguage    string
 		liveRowID       int
 		liveLanguage    string
+		breakEvidence   string
 		wantUnavailable bool
+		wantErr         bool
 	}{
 		{
 			name:         "unchanged tail keeps the carried downloaded row",
@@ -851,16 +921,70 @@ func TestRekeyStartSessionEvidenceRechecksDownloadedTail(t *testing.T) {
 			liveLanguage:    "fra",
 			wantUnavailable: true,
 		},
+		{
+			// A session-only restart whose attempt row is gone cannot prove
+			// what the echoed downloaded ordinal named. Reusing the position
+			// would select whatever row the repository now lists there.
+			name:            "absent attempt cannot prove the carried tail",
+			planRowID:       11,
+			planLanguage:    "eng",
+			liveRowID:       12,
+			liveLanguage:    "fra",
+			breakEvidence:   "absent",
+			wantUnavailable: true,
+		},
+		{
+			// A store outage is a dependency failure, not evidence that the
+			// track is gone; retry instead of clearing or reusing the ordinal.
+			name:          "failed attempt lookup fails retryably",
+			planRowID:     11,
+			planLanguage:  "eng",
+			liveRowID:     12,
+			liveLanguage:  "fra",
+			breakEvidence: "failed",
+			wantErr:       true,
+		},
+		{
+			// A plan for a different effective row orders unrelated
+			// subtitles, so its tail is not evidence for this ordinal.
+			name:            "mismatched effective row cannot prove the carried tail",
+			planRowID:       11,
+			planLanguage:    "eng",
+			liveRowID:       12,
+			liveLanguage:    "fra",
+			breakEvidence:   "mismatched-row",
+			wantUnavailable: true,
+		},
+		{
+			// An older attempt without a captured inventory has no tail.
+			name:            "attempt without inventory cannot prove the carried tail",
+			planRowID:       11,
+			planLanguage:    "eng",
+			liveRowID:       12,
+			liveLanguage:    "fra",
+			breakEvidence:   "no-inventory",
+			wantUnavailable: true,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
 			fixture := newSessionDownloadedTailFixtureV3(t, ctx, tc.planRowID, tc.planLanguage, tc.liveRowID, tc.liveLanguage)
+			breakSessionTailEvidenceV3(t, ctx, fixture, tc.breakEvidence)
 			req := fixture.req
 			rekeys := fixture.handler.rekeyStartTrackIdentitiesV3(ctx, &req, 1, "profile-1", "", "")
 
 			served := *fixture.file
 			_, subtitleUnavailable, err := fixture.handler.constrainRekeyedStartTracksV3(ctx, &req, &served, rekeys)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("unprovable tail was treated as a track miss instead of a dependency failure")
+				}
+				if !errors.Is(err, errSubtitleStoreUnavailableV3) {
+					t.Fatalf("error = %v, want a retryable subtitle-dependency failure", err)
+				}
+				return
+			}
 			if err != nil {
 				t.Fatalf("constrainRekeyedStartTracksV3: %v", err)
 			}
@@ -869,7 +993,7 @@ func TestRekeyStartSessionEvidenceRechecksDownloadedTail(t *testing.T) {
 			}
 			if tc.wantUnavailable {
 				if req.SubtitleTrackID != "" || req.SubtitleTrackIndex != nil {
-					t.Fatalf("churned downloaded selection was kept: id=%q index=%v", req.SubtitleTrackID, req.SubtitleTrackIndex)
+					t.Fatalf("unprovable downloaded selection was kept: id=%q index=%v", req.SubtitleTrackID, req.SubtitleTrackIndex)
 				}
 				return
 			}
@@ -880,9 +1004,46 @@ func TestRekeyStartSessionEvidenceRechecksDownloadedTail(t *testing.T) {
 	}
 }
 
+// breakSessionTailEvidenceV3 removes or corrupts the durable attempt evidence
+// the session-only carry reads its downloaded tail from, modeling a restart
+// after the attempt row expired, a plan-store outage, and a record written for
+// another effective row.
+func breakSessionTailEvidenceV3(t *testing.T, ctx context.Context, fixture sessionDownloadedTailFixtureV3, mode string) {
+	t.Helper()
+	store, ok := fixture.handler.PlanStoreV3.(*playback.MemoryPlanStoreV3)
+	if !ok {
+		t.Fatalf("fixture plan store = %T, want *playback.MemoryPlanStoreV3", fixture.handler.PlanStoreV3)
+	}
+	switch mode {
+	case "":
+		return
+	case "absent":
+		fixture.handler.PlanStoreV3 = playback.NewMemoryPlanStoreV3()
+	case "failed":
+		fixture.handler.PlanStoreV3 = &failingGetAttemptPlanStoreV3{
+			PlanStoreV3: store,
+			err:         errors.New("plan store unavailable"),
+		}
+	case "mismatched-row", "no-inventory":
+		record, err := store.GetAttempt(ctx, fixture.session.ID)
+		if err != nil {
+			t.Fatalf("GetAttempt: %v", err)
+		}
+		if mode == "mismatched-row" {
+			record.EffectiveMediaFileID = fixture.file.ID + 1
+		} else {
+			record.CurrentPlan.Subtitle.Inventory = nil
+		}
+		store.ReplaceAttempt(ctx, *record)
+	default:
+		t.Fatalf("unknown evidence break %q", mode)
+	}
+}
+
 type sessionDownloadedTailFixtureV3 struct {
 	handler *PlaybackHandler
 	file    *models.MediaFile
+	session *playback.Session
 	req     playback.StartRequestV3
 }
 
@@ -950,5 +1111,5 @@ func newSessionDownloadedTailFixtureV3(t *testing.T, ctx context.Context, planRo
 	req.FileID = file.ID
 	req.SubtitleTrackID = playback.TrackIDV3(file.ID, "subtitle", 1)
 	req.SubtitleTrackIndex = new(1)
-	return sessionDownloadedTailFixtureV3{handler: handler, file: file, req: req}
+	return sessionDownloadedTailFixtureV3{handler: handler, file: file, session: session, req: req}
 }

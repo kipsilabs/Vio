@@ -513,11 +513,17 @@ old position. When the request names `previous_playback_attempt_id`, that
 attempt's captured plan inventory is the historical record even if the catalog
 row under the same id was re-probed since; the mutable row is never treated as
 proof of the old ordering. Without a predecessor id, the single matching live
-session's durable attempt plan is read the same way when it is available,
-including the downloaded subtitle tail a file-shaped inventory comparison cannot
-see. A re-key that cannot read the subtitle store fails retryably
-instead of guessing from unverified evidence or leaving the old ordinal to land
-on another track.
+session's durable attempt plan is read the same way, including the downloaded
+subtitle tail a file-shaped inventory comparison cannot see. A downloaded
+ordinal whose historical inventory cannot be proven — no attempt row, no
+captured inventory, or a plan for another effective row — is cleared with the
+degradation warning instead of being reused by position. A track_change
+selection is minted against the current menu, so it is read through the
+inventory that published it, including when the identity names another accepted
+row, and then mapped onto the validated row without the predecessor ordering. A
+re-key that cannot read the subtitle evidence fails retryably instead of
+guessing from unverified evidence or leaving the old ordinal to land on another
+track.
 
 Client guidance for resume and restarts:
 
