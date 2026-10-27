@@ -661,7 +661,7 @@ func TestReplanSameRowReprobeUsesPredecessorInventoryWithoutLiveSession(t *testi
 		t.Fatalf("durable inventory = %+v, want the predecessor's English@1 audio", durable[current.ID])
 	}
 	handler := &PlaybackHandler{}
-	source := handler.replanRemapSourceV3(current, nil, durable)
+	source := handler.replanRemapSourceV3(current, nil, durable).file
 	if sameMediaInventoryV3(source, current) {
 		t.Fatal("remap source reported the re-probed row as unchanged; the stale ordinal would be reused")
 	}
@@ -740,5 +740,84 @@ func TestRekeyStartUsesPredecessorPlanInventoryAfterSameRowReprobe(t *testing.T)
 	}
 	if req.AudioTrackIndex != nil && *req.AudioTrackIndex != 0 {
 		t.Fatalf("audio index = %v, want 0", req.AudioTrackIndex)
+	}
+}
+
+// A restart across committed rows carries a downloaded subtitle selection. Its
+// published ordinal only addresses the downloaded tail of the plan that minted
+// it: the same-language base tracks can compare equal while the repository list
+// gained a row ahead of the selection, moving the ordinal onto another subtitle.
+// The captured row id, not the ordinal, must decide what the ordinal now names.
+func TestRekeyStartResolvesDownloadedSubtitleByIdentityAcrossCommittedRows(t *testing.T) {
+	baseTracks := []models.SubtitleTrack{{Index: 0, Language: "en", Codec: "subrip"}}
+	requested := &models.MediaFile{ID: 100, ContentID: "movie-1", Container: "virtual",
+		FilePath: "virtual://movie/tt?profile=hd", SubtitleTracks: baseTracks}
+	effective := &models.MediaFile{ID: 200, ContentID: "movie-1", Container: "virtual",
+		FilePath: "virtual://movie/tt?profile=hd&result=abc", SubtitleTracks: baseTracks}
+
+	// The predecessor plan published embedded English@0 and downloaded English
+	// (row 71)@1. A stored plan is decoded from JSON, so the in-memory row id
+	// is gone and only the sync key still names the row.
+	store := playback.NewMemoryPlanStoreV3()
+	record := playback.AttemptRecordV3{
+		PlaybackAttemptID:    "attempt-downloaded-carry",
+		SessionID:            "predecessor-session",
+		UserID:               1,
+		ProfileID:            "profile-1",
+		RequestedMediaFileID: requested.ID,
+		EffectiveMediaFileID: effective.ID,
+		CurrentPlan: playback.PlanV3{
+			AudioTracks: playback.AudioInventoryV3(effective),
+			Subtitle: playback.SubtitleDecisionV3{
+				Inventory: append(playback.BuildSubtitleInventoryV3(effective, nil),
+					playback.SubtitleInventoryItemV3{
+						TrackID:       "file:200:subtitle:1",
+						CombinedIndex: 1,
+						Source:        playback.SubtitleSourceDownloadedV3,
+						Codec:         "srt",
+						Language:      "eng",
+						Label:         "English",
+						SyncKey:       subtitles.StoredSyncKey(71),
+					}),
+			},
+		},
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	if err := store.SaveAttempt(context.Background(), record); err != nil {
+		t.Fatalf("SaveAttempt: %v", err)
+	}
+	// Today's repository list holds the same rows with a Japanese subtitle
+	// inserted ahead of the English pick, so ordinal 1 is now Japanese.
+	repo := newMockSubtitleRepoForHandler()
+	repo.list = []subtitles.DownloadedSubtitle{
+		{ID: 72, MediaFileID: requested.ID, Format: subtitles.FormatSRT, Language: "jpn", ReleaseName: "movie.jpn.srt"},
+		{ID: 71, MediaFileID: requested.ID, Format: subtitles.FormatSRT, Language: "eng", ReleaseName: "movie.eng.srt"},
+	}
+	handler := &PlaybackHandler{
+		fileResolver: mapPlaybackFileResolver{files: map[int]*models.MediaFile{requested.ID: requested, effective.ID: effective}},
+		PlanStoreV3:  store,
+		SubtitleRepo: repo,
+	}
+	req := v3HandlerStartRequest()
+	req.FileID = requested.ID
+	req.SubtitleTrackID = playback.TrackIDV3(effective.ID, "subtitle", 1)
+	req.PreviousPlaybackAttemptID = record.PlaybackAttemptID
+
+	rekeys := handler.rekeyStartTrackIdentitiesV3(context.Background(), &req, 1, "profile-1", "", "")
+	if !rekeys.subtitle.active || !rekeys.subtitle.carry.downloadedKnown || len(rekeys.subtitle.carry.downloaded) != 1 {
+		t.Fatalf("rekey evidence = %+v, want the predecessor plan's downloaded tail", rekeys.subtitle.carry)
+	}
+	_, subtitleUnavailable, err := handler.constrainRekeyedStartTracksV3(context.Background(), &req, requested, rekeys)
+	if err != nil {
+		t.Fatalf("constrainRekeyedStartTracksV3: %v", err)
+	}
+	if subtitleUnavailable {
+		t.Fatal("the downloaded English selection is still present and was reported unavailable")
+	}
+	if req.SubtitleTrackIndex == nil || *req.SubtitleTrackIndex != 2 {
+		t.Fatalf("subtitle index = %v, want 2 (English row 71 after the Japanese row was inserted)", req.SubtitleTrackIndex)
+	}
+	if want := playback.TrackIDV3(requested.ID, "subtitle", 2); req.SubtitleTrackID != want {
+		t.Fatalf("subtitle id = %q, want %q", req.SubtitleTrackID, want)
 	}
 }
