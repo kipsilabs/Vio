@@ -15,6 +15,7 @@ import { getLanguageName } from "@/player/utils/languageNames";
 import { normalizeSubtitleMode } from "@/player/utils/subtitleMode";
 import { resolveSubtitleAutoSelect } from "@/player/utils/subtitleSort";
 import { getSubtitleFormatLabel } from "@/player/utils/subtitleCodecs";
+import { buildPublishedSubtitleTracks } from "@/player/utils/subtitleInventory";
 import { audioTrackLabel, formatChannels } from "@/lib/mediaFormat";
 import {
   buildVersionSubtitleInventory,
@@ -185,26 +186,23 @@ export function buildPrePlaySubtitleCandidates(
   const inventory = buildVersionSubtitleInventory(tracks, downloaded);
   const all: PrePlaySubtitleCandidate[] = [];
 
-  // Dense combined ordinals, mirroring the server's BuildSubtitleInventoryV3
-  // order (external → embedded → downloaded): the ordinal is the candidate's
-  // position in that combined list, computed over the UNSORTED catalog order.
-  // Never the container stream index. Keys mirror VersionSubtitleInventoryRow
-  // identity (`source:index`) with the catalog enumeration index as the
-  // no-explicit-index fallback, so lookups always hit.
+  // The same single ordinal derivation the watch route and the player use:
+  // external → embedded → downloaded, de-duplicated and dense. Keys mirror
+  // VersionSubtitleInventoryRow identity (`source:index` / downloaded row id)
+  // with the catalog enumeration index as the no-explicit-index fallback, so
+  // lookups always hit the row the published ordinal was assigned to.
   const trackList = tracks ?? [];
   const denseOrdinalByKey = new Map<string, number>();
-  const externalCount = trackList.filter((track) => track.external).length;
-  let externalOrdinal = 0;
-  let embeddedOrdinal = 0;
-  for (const [catalogIndex, track] of trackList.entries()) {
-    const source = track.external ? "external" : "embedded";
-    const dense = source === "external" ? externalOrdinal++ : externalCount + embeddedOrdinal++;
-    denseOrdinalByKey.set(`${source}:${track.index ?? catalogIndex}`, dense);
-  }
-  let nextOrdinal = trackList.length;
-  for (const subtitle of downloaded ?? []) {
-    denseOrdinalByKey.set(`downloaded:${subtitle.id}`, nextOrdinal);
-    nextOrdinal++;
+  for (const track of buildPublishedSubtitleTracks(trackList, downloaded)) {
+    if (track.source === "downloaded") {
+      if (track.downloadedSubtitleId != null) {
+        denseOrdinalByKey.set(`downloaded:${track.downloadedSubtitleId}`, track.index);
+      }
+      continue;
+    }
+    if (track.containerIndex != null) {
+      denseOrdinalByKey.set(`${track.source}:${track.containerIndex}`, track.index);
+    }
   }
 
   const denseOrdinalFor = (row: VersionSubtitleInventoryRow): number | undefined => {

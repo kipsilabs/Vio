@@ -284,6 +284,7 @@ export function buildWatchPageProps({
   currentProfile,
   seriesEpisodes,
   qualityPreference = currentProfileQualityFallback(currentProfile),
+  requestedFileId = null,
 }: {
   request: WatchRouteRequest;
   item: WatchDetail;
@@ -296,6 +297,14 @@ export function buildWatchPageProps({
    * it falls back to is no longer updated by that picker.
    */
   qualityPreference?: string | null;
+  /**
+   * The row the viewer last requested for this item, from the client's
+   * durable selection store. The server's `last_file_id` names the row that
+   * actually served the bytes, which can be a substitute; resuming must ask
+   * for the viewer's own pick. Passed in for the same purity reason as the
+   * quality cap.
+   */
+  requestedFileId?: number | null;
 }): DerivedWatchPageProps {
   const basePreferredSubtitleLanguage =
     item.effective_subtitle_language !== undefined
@@ -315,20 +324,23 @@ export function buildWatchPageProps({
     item.versions[0];
   // One shared derivation for every ordinal the client computes; see
   // subtitleInventory.ts. Watch detail carries the file's own tracks, so the
-  // published ordinals match the server's for the same inventory.
+  // published ordinals match the server's for the same inventory. An older
+  // detail that omits `subtitle_tracks` only has the item's subtitle rows;
+  // they go through the same rule so their menu ordinals stay dense and
+  // gap-free instead of trusting the array position.
   const subtitles: PlayerSubtitleInfo[] =
     requestedVersion?.subtitle_tracks !== undefined
       ? buildPublishedSubtitleTracks(requestedVersion.subtitle_tracks)
-      : item.subtitles.map((subtitle, index) => ({
-          index,
-          language: subtitle.language,
-          codec: subtitle.codec,
-          label: subtitle.title || subtitle.language,
-          source: subtitle.source === "external" ? "external" : "embedded",
-          forced: subtitle.forced,
-          hearing_impaired: subtitle.hearing_impaired,
-          url: "",
-        }));
+      : buildPublishedSubtitleTracks(
+          item.subtitles.map((subtitle) => ({
+            language: subtitle.language,
+            codec: subtitle.codec,
+            title: subtitle.title || subtitle.language,
+            forced: subtitle.forced,
+            hearing_impaired: subtitle.hearing_impaired,
+            external: subtitle.source === "external",
+          })),
+        );
   const preferredSubtitleTrackSignature: PlayerSubtitleTrackSignature | null =
     item.effective_subtitle_track_signature
       ? {
@@ -397,18 +409,23 @@ export function buildWatchPageProps({
   // point — including a rewatch in flight (played stays true).
   const initialPosition = request.restart ? 0 : (item.user_data?.position_seconds ?? 0);
 
+  // Recognition of the release to ask for: the viewer's requested row when the
+  // client remembers one, else the row the server says actually played. A
+  // substitution must not replace the release they picked.
+  const userData = item.user_data;
+  const resumeFileId = requestedFileId ?? userData?.last_file_id;
   const resumeHints: ResumeHints | undefined =
-    item.user_data?.last_file_id != null ||
-    item.user_data?.last_resolution != null ||
-    item.user_data?.last_hdr != null ||
-    item.user_data?.last_codec_video != null ||
-    item.user_data?.last_edition_key != null
+    resumeFileId != null ||
+    userData?.last_resolution != null ||
+    userData?.last_hdr != null ||
+    userData?.last_codec_video != null ||
+    userData?.last_edition_key != null
       ? {
-          lastFileId: item.user_data.last_file_id,
-          lastResolution: item.user_data.last_resolution,
-          lastHDR: item.user_data.last_hdr,
-          lastCodecVideo: item.user_data.last_codec_video,
-          lastEditionKey: item.user_data.last_edition_key,
+          lastFileId: resumeFileId ?? undefined,
+          lastResolution: userData?.last_resolution,
+          lastHDR: userData?.last_hdr,
+          lastCodecVideo: userData?.last_codec_video,
+          lastEditionKey: userData?.last_edition_key,
         }
       : item.effective_version_resolution !== undefined ||
           item.effective_version_hdr !== undefined ||

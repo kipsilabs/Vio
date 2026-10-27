@@ -4,7 +4,12 @@ import { act, render } from "@testing-library/react";
 import { MemoryRouter } from "react-router";
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import type { FileVersion, ItemDetail, Season } from "@/api/types";
+import { rememberRequestedFileId } from "@/playback/requestedVersion";
 import EpisodeContent from "./EpisodeContent";
+
+// The requested-version store is profile-scoped; these tests render with the
+// account's resolved profile.
+const PROFILE_ID = "profile-test";
 
 const mocks = vi.hoisted(() => {
   let capturedActionBarProps: Record<string, unknown> | null = null;
@@ -59,6 +64,7 @@ const mocks = vi.hoisted(() => {
     useSetRating: vi.fn(),
     useDeleteRating: vi.fn(),
     useOnViewTranslation: vi.fn(),
+    useVersionLiveness: vi.fn(),
     setRatingMutate: vi.fn(),
     deleteRatingMutate: vi.fn(),
     startPlayback: vi.fn(),
@@ -97,6 +103,13 @@ vi.mock("@/hooks/queries/qualityPreference", () => ({
 
 vi.mock("@/hooks/useCurrentProfile", () => ({
   useCurrentProfile: mocks.useCurrentProfile,
+}));
+
+// These tests render without a QueryClient; the liveness check is a no-op that
+// leaves item metadata untouched unless a test supplies a verdict.
+vi.mock("@/hooks/queries/versionLiveness", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/hooks/queries/versionLiveness")>()),
+  useVersionLiveness: (...args: unknown[]) => mocks.useVersionLiveness(...args),
 }));
 
 vi.mock("@/hooks/useOnViewTranslation", () => ({
@@ -349,6 +362,7 @@ describe("EpisodeContent", () => {
   });
 
   beforeEach(() => {
+    localStorage.clear();
     mocks.capturedActionBarProps.value = null;
     mocks.capturedDetailHeroProps.value = null;
     mocks.capturedMetadataBadgesProps.value = null;
@@ -370,6 +384,8 @@ describe("EpisodeContent", () => {
     });
     mocks.useAdminMarkerCapabilities.mockReturnValue({ data: undefined });
     mocks.useLibraryCapabilities.mockReturnValue({ data: undefined });
+    mocks.useVersionLiveness.mockClear();
+    mocks.useVersionLiveness.mockReturnValue(new Map<number, boolean>());
     mocks.useWatchedStateMutation.mockReturnValue({
       mutate: vi.fn(),
       isPending: false,
@@ -432,6 +448,76 @@ describe("EpisodeContent", () => {
         videoRangeLabel: "",
         audioLabel: "AAC",
       },
+    });
+  });
+
+  // The episode page passes the version rows to ActionBar, which derives the
+  // force-relink decision from `available`. A row whose provider pin is gone
+  // must carry the server's verdict before that decision, exactly like the
+  // movie page.
+  it("checks liveness for the default-selected version before any picker opens", () => {
+    const standard = makeFileVersion({ file_id: 1, resolution: "1080p" });
+    const uhd = makeFileVersion({ file_id: 2, resolution: "2160p" });
+
+    render(
+      <MemoryRouter initialEntries={["/item/episode-1"]}>
+        <EpisodeContent item={makeEpisodeItem({ versions: [standard, uhd] })} />
+      </MemoryRouter>,
+    );
+
+    const firstCall = mocks.useVersionLiveness.mock.calls[0];
+    expect(firstCall?.[0]).toEqual([expect.objectContaining({ file_id: 2 })]);
+    expect(firstCall?.[1]).toBe(true);
+  });
+
+  it("stamps a stale selected version's availability for the action bar", () => {
+    const standard = makeFileVersion({ file_id: 1, resolution: "1080p" });
+    const stale = makeFileVersion({ file_id: 2, resolution: "2160p" });
+    mocks.useVersionLiveness.mockReturnValue(new Map([[stale.file_id, false]]));
+
+    render(
+      <MemoryRouter initialEntries={["/item/episode-1"]}>
+        <EpisodeContent item={makeEpisodeItem({ versions: [standard, stale] })} />
+      </MemoryRouter>,
+    );
+
+    expect(mocks.capturedActionBarProps.value).toMatchObject({
+      selectedVersion: expect.objectContaining({ file_id: stale.file_id, available: false }),
+      versions: expect.arrayContaining([
+        expect.objectContaining({ file_id: stale.file_id, available: false }),
+      ]),
+    });
+  });
+
+  // Completing an episode writes the viewer's requested row to the device
+  // store; a fresh server-backed detail still names the effective candidate in
+  // `last_file_id` because progress and history record the row that served the
+  // bytes. The page must keep the viewer's own pick selected instead.
+  it("keeps the viewer's requested row selected over a fresh last-played substitute", () => {
+    mocks.useCurrentProfile.mockReturnValue({ profile: { id: PROFILE_ID } });
+    const substitute = makeFileVersion({ file_id: 1, resolution: "2160p" });
+    const requested = makeFileVersion({ file_id: 2, resolution: "1080p" });
+    rememberRequestedFileId("episode-1", requested.file_id, PROFILE_ID);
+
+    render(
+      <MemoryRouter initialEntries={["/item/episode-1"]}>
+        <EpisodeContent
+          item={makeEpisodeItem({
+            versions: [substitute, requested],
+            user_data: {
+              played: false,
+              position_seconds: 600,
+              duration_seconds: 2520,
+              last_file_id: substitute.file_id,
+            },
+          })}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(mocks.capturedActionBarProps.value).toMatchObject({
+      selectedVersion: expect.objectContaining({ file_id: requested.file_id }),
+      selectedVersionMissing: false,
     });
   });
 
