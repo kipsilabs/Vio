@@ -378,6 +378,11 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 	}
 	failedCandidateIDs := make([]string, 0)
 	for attempt := 0; attempt < maxAttempts; attempt++ {
+		// audioCarry records this attempt's cross-release audio outcome. Only a
+		// degraded fallback that actually becomes the committed transport is
+		// reported on the plan; an attempt that fails and rotates away leaves
+		// its verdict behind with it.
+		audioCarry := fallbackAudioCarryNone
 		targetURI := canonicalPath
 		if attempt > 0 {
 			targetURI = neutralPath
@@ -527,7 +532,8 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 			// than silently reset to the container default. A selection with no
 			// equivalent on the replacement still degrades, but the reset is
 			// warned (and the plan keeps the requested identity for the client).
-			remappedAudioIndex, audioCarry := remapFallbackAudioIndexV3(file, probedFacts, opts.AudioTrackIndex)
+			var remappedAudioIndex int
+			remappedAudioIndex, audioCarry = remapFallbackAudioIndexV3(file, probedFacts, opts.AudioTrackIndex)
 			attemptOpts.AudioTrackIndex = remappedAudioIndex
 			logCrossReleaseAudioCarry(startupCtx, file, probedFacts, opts.AudioTrackIndex, remappedAudioIndex, audioCarry, resolvedMedia.CandidateID)
 			if opts.SubtitleTrackIndex >= 0 {
@@ -554,6 +560,13 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 			_, readyErr := session.WaitForManifestContext(startupCtx, playback.ManifestStartupTimeout)
 			addTransportPhaseDurationV3(ctx, transportPhaseManifestV3, time.Since(manifestStart))
 			if readyErr == nil {
+				// A fallback that could not carry the viewer's audio is now the
+				// committed transport. Record the degradation on the plan so the
+				// client learns it is hearing the replacement's default track
+				// while the plan keeps naming the requested one.
+				if audioCarry == fallbackAudioCarryDegraded {
+					appendCrossReleaseAudioFallbackWarningV3(startupCtx)
+				}
 				winningURI := resolvedMedia.URI
 				if winningURI == "" || winningURI == neutralPath {
 					if resolvedMedia.CandidateID != "" {
@@ -687,6 +700,38 @@ func (h *PlaybackHandler) probeVirtualFallbackSource(ctx context.Context, resolv
 	}
 	mergeVirtualCandidateTracks(probed, probeCand)
 	return probed
+}
+
+// crossReleaseAudioPlanKeyV3 carries the plan a transport start may annotate
+// when a cross-release fallback degrades the viewer's audio selection. The
+// transport has no other handle on the plan: it starts a session and returns
+// before the caller publishes the plan, so the degradation travels beside the
+// start request and is recorded by the transport that actually committed.
+type crossReleaseAudioPlanKeyV3 struct{}
+
+type crossReleaseAudioPlanV3 struct {
+	plan *playback.PlanV3
+}
+
+func withCrossReleaseAudioPlanV3(ctx context.Context, plan *playback.PlanV3) context.Context {
+	if ctx == nil || plan == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, crossReleaseAudioPlanKeyV3{}, &crossReleaseAudioPlanV3{plan: plan})
+}
+
+// appendCrossReleaseAudioFallbackWarningV3 reports a committed fallback that
+// could not carry the requested audio. It is a no-op when no plan is attached
+// (a direct transport test or a non-plan start).
+func appendCrossReleaseAudioFallbackWarningV3(ctx context.Context) {
+	if ctx == nil {
+		return
+	}
+	carrier, ok := ctx.Value(crossReleaseAudioPlanKeyV3{}).(*crossReleaseAudioPlanV3)
+	if !ok || carrier == nil || carrier.plan == nil {
+		return
+	}
+	carrier.plan.DegradationWarnings = append(carrier.plan.DegradationWarnings, playback.AudioTrackUnavailableWarningV3())
 }
 
 // fallbackAudioCarryV3 classifies the outcome of carrying the pinned release's
