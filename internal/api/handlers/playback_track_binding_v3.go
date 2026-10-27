@@ -727,8 +727,9 @@ func (h *PlaybackHandler) constrainRekeyedSubtitleSelectionV3(ctx context.Contex
 // committed row is interpreted against that generation, not a mutated catalog
 // row. A same-row subtitle identity that names a downloaded track is the
 // exception: the downloaded tail is invisible to the caller's file-shaped drift
-// remap, so it is re-checked against the captured rows here.
-func (h *PlaybackHandler) rekeyReplanTrackIdentitiesV3(ctx context.Context, start *playback.StartRequestV3, file *models.MediaFile, session *playback.Session, durable map[int]predecessorPlanInventoryV3) (audioUnavailable, subtitleUnavailable bool, err error) {
+// remap, so it is re-checked against the captured rows here — unless the caller
+// already reconciled the ordinal, see subtitleSelectionCurrent.
+func (h *PlaybackHandler) rekeyReplanTrackIdentitiesV3(ctx context.Context, start *playback.StartRequestV3, file *models.MediaFile, session *playback.Session, durable map[int]predecessorPlanInventoryV3, subtitleSelectionCurrent bool) (audioUnavailable, subtitleUnavailable bool, err error) {
 	if h == nil || h.fileResolver == nil || start == nil || file == nil {
 		return false, false, nil
 	}
@@ -752,21 +753,27 @@ func (h *PlaybackHandler) rekeyReplanTrackIdentitiesV3(ctx context.Context, star
 		// this row, and an in-place re-probe is repaired by the caller's drift
 		// remap, which prefers the same durable inventory before this check. The
 		// downloaded subtitle tail is the exception, because the drift remap
-		// compares file-shaped inventories and cannot see it.
+		// compares file-shaped inventories and cannot see it — but only for a
+		// carried ordinal. subtitleSelectionCurrent marks a fresh choice from the
+		// current menu, or a carried ordinal the drift remap already reconciled
+		// into this row's inventory; either addresses the live list, so reading it
+		// through the predecessor tail would name another downloaded row or clear
+		// an appended one the old tail never published.
 		embeddedFileID, embeddedKind, ordinal, ok := playback.ParseTrackIDV3(trackID)
 		if !ok || embeddedKind != kind {
 			return carriedInventorySourceV3{}, 0, false
 		}
-		if embeddedFileID == file.ID && kind != subtitleTrackKindV3 {
-			return carriedInventorySourceV3{}, 0, false
-		}
-		source := h.rekeySourceFileWithInventoryV3(ctx, embeddedFileID, session, durable)
 		if embeddedFileID == file.ID {
+			if kind != subtitleTrackKindV3 || subtitleSelectionCurrent {
+				return carriedInventorySourceV3{}, 0, false
+			}
+			source := h.rekeySourceFileWithInventoryV3(ctx, embeddedFileID, session, durable)
 			if !source.downloadedKnown || !source.namesDownloadedOrdinalV3(ordinal) {
 				return carriedInventorySourceV3{}, 0, false
 			}
 			return source, ordinal, true
 		}
+		source := h.rekeySourceFileWithInventoryV3(ctx, embeddedFileID, session, durable)
 		accepted := committed[embeddedFileID]
 		if !accepted && source.file != nil {
 			accepted = virtualRowsNameSameReleaseV3(file, source.file)
