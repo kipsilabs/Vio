@@ -8,7 +8,9 @@ import {
   CONNECTION_LOST_ERROR,
   describePlanTerminal,
   describePlaybackTransportError,
+  isAdaptationUnavailableReason,
   isDeadPlaybackSessionError,
+  PLAYBACK_SESSION_GONE_ERROR,
   type PlaybackPolicyErrorDescription,
 } from "../playback-errors";
 import {
@@ -243,9 +245,12 @@ interface PlaybackSessionState {
 
 /**
  * `ended` means the server ended the session for good (an administrator
- * stopped it); the player exits rather than reconnecting.
+ * stopped it); the player exits rather than reconnecting. `gone` means a
+ * session-scoped answer proved the session no longer exists (a reaped or
+ * expired session); the player stops using it and offers a fresh start at the
+ * same position instead.
  */
-export type PlaybackConnectionStatus = "connected" | "reconnecting" | "lost" | "ended";
+export type PlaybackConnectionStatus = "connected" | "reconnecting" | "lost" | "ended" | "gone";
 
 // Mid-stream reconnect backoff: 1s, 2s, 4s, 8s, then every 15s, for about two
 // and a quarter minutes in total before the player gives up and asks the
@@ -720,6 +725,19 @@ export interface UsePlaybackSessionResult extends PlaybackSessionState {
    * reconnect cannot run (no played stream to reposition).
    */
   reportSessionLost: () => void;
+  /**
+   * Enters the session-gone state: a session-scoped call (a control-ticket
+   * mint, a stream/subtitle fetch, or a replan) proved the playback session no
+   * longer exists. The player stops using the dead session instead of
+   * retrying it, and offers `restartPlayback`.
+   */
+  markSessionGone: () => void;
+  /**
+   * Starts a fresh playback session at the current position after the old one
+   * was answered gone. This is a new start (the server re-plans from scratch),
+   * never a replan against the dead session.
+   */
+  restartPlayback: () => void;
   /**
    * `failure_recovery` replan for a plan the *server* invalidated over the
    * realtime `plan_invalidated` command. Resolves to whether a replacement plan
@@ -1363,6 +1381,21 @@ function describeDecisionWithoutPlan(decision: DecisionResponseV3): PlaybackSess
   if (decision.terminal) {
     return describePlanTerminal(decision.terminal);
   }
+  // A server may publish the outcome without a terminal. An outcome that names
+  // no playable adaptation is still a player-facing refusal, and retrying it as
+  // a fresh start is meaningful (the provider may re-list or re-resolve the
+  // source), so it must not fall through to the generic server-busy copy.
+  if (isAdaptationUnavailableReason(decision.outcome)) {
+    return {
+      ...describePlanTerminal({
+        reason: decision.outcome,
+        message: "",
+        retryable: true,
+      }),
+      reason: decision.outcome,
+      retryable: true,
+    };
+  }
   return {
     title: "Playback unavailable",
     message: "This server is not accepting playback requests right now.",
@@ -1510,6 +1543,10 @@ export function usePlaybackSession(
   // the state carrying it renders, so a caller acting on an older render
   // cannot start a reconnect against it.
   const sessionEndedRef = useRef(false);
+  // Set when a session-scoped answer proves the session no longer exists, for
+  // the same reason: a stale render must not replan or reconnect against it.
+  // Cleared by a fresh start (`restartPlayback` or a newly adopted plan).
+  const sessionGoneRef = useRef(false);
   // The live effective source identity, folded through the same commits and
   // rotations as `state` but readable synchronously inside callbacks. Deferring
   // a push still moves where the stream actually is; later decisions (a queued
@@ -1997,6 +2034,9 @@ export function usePlaybackSession(
       planAttemptIdRef.current = randomUUID();
       planRef.current = plan;
       sessionEndedRef.current = false;
+      // A plan for this session proves the server still holds it, so a gone
+      // verdict from an earlier replica miss no longer applies.
+      sessionGoneRef.current = false;
       sessionIdRef.current = sessionId ?? null;
       // The adopted plan is the new live source; a rotation deferred before it
       // landed is superseded by what the plan itself names.
@@ -2246,6 +2286,30 @@ export function usePlaybackSession(
     },
     [stopSession, transitionSourceIdentity],
   );
+
+  /**
+   * Enters the session-gone state after a session-scoped answer proved the
+   * playback session no longer exists (a control-ticket mint, a stream or
+   * subtitle fetch, or a replan). No reconnect and no replan can repair a
+   * session the server does not hold, so the player stops using it and offers
+   * `restartPlayback` instead.
+   */
+  const markSessionGone = useCallback(() => {
+    if (sessionGoneRef.current) return;
+    sessionGoneRef.current = true;
+    endReconnect(false);
+    setState((current) => ({
+      ...current,
+      loading: false,
+      replacing: false,
+      replanning: false,
+      replanningQuality: false,
+      pendingSwitchFileId: null,
+      connectionStatus: "gone",
+      connectionErrorTitle: PLAYBACK_SESSION_GONE_ERROR.title,
+      connectionError: PLAYBACK_SESSION_GONE_ERROR.message,
+    }));
+  }, [endReconnect]);
 
   /**
    * Picks which file to *request*. The server owns adaptation — this only
@@ -2802,6 +2866,9 @@ export function usePlaybackSession(
       const sessionId = sessionIdRef.current;
       const playbackAttemptId = playbackAttemptIdRef.current;
       if (!plan || !sessionId || !playbackAttemptId) return false;
+      // A session answered gone cannot be replanned; every retry earns the same
+      // answer. The restart action starts a new session instead.
+      if (sessionGoneRef.current) return false;
       // A switch is replacing the whole session and about to retire the plan
       // below. A replan built from that outgoing plan would be stamped with the
       // switch's sequence once the switch lands, so it could clobber the
@@ -2966,6 +3033,19 @@ export function usePlaybackSession(
         );
         if (
           !adopted &&
+          isFailureRecovery &&
+          isAdaptationUnavailableReason(decision.terminal?.reason ?? decision.outcome)
+        ) {
+          // The transport already failed and the server can build no route for
+          // it. There is nothing left to render, so retire the broken plan:
+          // keeping it would leave the player spinning over a stream the server
+          // refuses to serve. The refusal itself is the error card's copy, and
+          // its Retry re-issues a fresh start.
+          retireActiveSession(sessionId);
+          return false;
+        }
+        if (
+          !adopted &&
           options.operation === "seek_reanchor" &&
           decision.terminal?.reason?.trim() === SEEK_REANCHOR_EVIDENCE_UNAVAILABLE_REASON
         ) {
@@ -3109,8 +3189,10 @@ export function usePlaybackSession(
         if (deadSession) {
           // Already rebuilt once for this session. Retire the plan it left
           // behind and fall through to surface the copy rather than starting
-          // again in a loop.
+          // again in a loop. The session is gone, so the player offers a fresh
+          // start instead of retrying the dead id.
           retireActiveSession(sessionId);
+          markSessionGone();
         }
         if (retireSessionOnRefusal && !deadSession) {
           console.error("Failed to refresh playback output", err);
@@ -3203,6 +3285,7 @@ export function usePlaybackSession(
       endAdoption,
       explicitFileSelection,
       loadSession,
+      markSessionGone,
       maxBitrateKbps,
       retireActiveSession,
     ],
@@ -3704,9 +3787,10 @@ export function usePlaybackSession(
 
   const recoverConnection = useCallback(
     (positionSeconds: number, resume: boolean) => {
-      // Only a stream that exists can lose its connection, and a session an
-      // administrator ended stays ended.
+      // Only a stream that exists can lose its connection, and a session the
+      // server ended or answered gone stays that way.
       if (!planRef.current || !sessionIdRef.current || sessionEndedRef.current) return;
+      if (sessionGoneRef.current) return;
       beginReconnect(positionSeconds, resume, false);
     },
     [beginReconnect],
@@ -3754,6 +3838,56 @@ export function usePlaybackSession(
     reconnect.resume = planAutoPlayRef.current;
     giveUpReconnect(CONNECTION_LOST_ERROR);
   }, [giveUpReconnect]);
+
+  /**
+   * Starts a fresh session at the position the viewer reached after the old
+   * session was answered gone. A new start re-plans server-side from scratch;
+   * a replan against the dead session could only answer the same way again.
+   */
+  const restartPlayback = useCallback(() => {
+    const plan = planRef.current;
+    const played = hasAdoptedPlanRef.current || plan !== null;
+    const position = played ? playbackPositionRef.current : startIntentRef.current.position;
+    const forceStartPosition = played ? true : startIntentRef.current.forceStartPosition;
+    const deadSessionId = sessionIdRef.current;
+    sessionGoneRef.current = false;
+    sessionEndedRef.current = false;
+    endReconnect(false);
+    if (deadSessionId) {
+      // The stop is best effort: a reaped session answers 404, which is exactly
+      // the verdict that brought the viewer here.
+      retireActiveSession(deadSessionId);
+    }
+    setState((current) => ({
+      ...current,
+      loading: true,
+      errorTitle: null,
+      error: null,
+      errorReason: null,
+      errorRetryable: false,
+      connectionStatus: "connected",
+      connectionErrorTitle: null,
+      connectionError: null,
+    }));
+    void loadSession({
+      preferredFileId: plan?.requested_media_file_id ?? stateRef.current.mediaFileId ?? undefined,
+      position,
+      forceStartPosition,
+      allowPreserveExistingSessionOnError: false,
+      replacementErrorMessage: "Failed to restart playback",
+      initialErrorMessage: "Failed to restart playback",
+      carriedAudioTrackId: plan?.selected_tracks.audio?.id ?? null,
+      carriedSubtitleTrackIndex: plan?.selected_tracks.subtitle?.index ?? null,
+      offeredVirtualURI:
+        retryTargetRef.current?.offeredVirtualURI ?? offeredVirtualUriRef.current ?? undefined,
+      // Preserve the viewer's version choice: a restart is not a licence for
+      // the server to substitute another edition behind the dead session.
+      fileSelection: autoFallbackRef.current
+        ? "auto"
+        : (retryTargetRef.current?.fileSelection ?? (explicitFileSelection ? "explicit" : "auto")),
+      intentAt: null,
+    });
+  }, [endReconnect, explicitFileSelection, loadSession, retireActiveSession]);
 
   // Coming back online is the best moment to try again.
   const reconnecting = state.connectionStatus === "reconnecting";
@@ -5020,6 +5154,8 @@ export function usePlaybackSession(
     retryConnection,
     expediteReconnect,
     reportSessionLost,
+    markSessionGone,
+    restartPlayback,
     invalidatePlan,
     reanchorSeek,
     refreshSubtitles,

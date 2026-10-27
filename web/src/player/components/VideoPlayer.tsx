@@ -314,6 +314,17 @@ interface VideoPlayerProps {
    */
   onSessionLost?: () => void;
   /**
+   * A session-scoped call proved the playback session no longer exists (a
+   * control-ticket mint, a stream/subtitle fetch, or a replan). The player
+   * stops using the dead session and offers `onRestartPlayback`.
+   */
+  onSessionGone?: () => void;
+  /**
+   * Starts a fresh session at the current position after the old one was
+   * answered gone.
+   */
+  onRestartPlayback?: () => void;
+  /**
    * A session-scoped call answered that the session is gone while a reconnect
    * was already running. The reconnect is the recovery, but the server has
    * confirmed the session it is rebuilding no longer exists, so run its next
@@ -610,6 +621,8 @@ export function VideoPlayer({
   onConnectionLost,
   onRetryConnection,
   onSessionLost,
+  onSessionGone,
+  onRestartPlayback,
   onExpediteReconnect,
   connectionStatus = "connected",
   connectionErrorTitle = null,
@@ -1111,6 +1124,9 @@ export function VideoPlayer({
    */
   const handleSessionGone = useCallback(() => {
     if (sessionGoneReportedRef.current) return;
+    // A session already answered gone stays gone: its restart action is the
+    // only recovery, and a lost/reconnecting cycle would reuse the dead id.
+    if (connectionStatusRef.current === "gone") return;
     sessionGoneReportedRef.current = true;
     if (reportConnectionLostRef.current()) {
       if (connectionStatusRef.current === "reconnecting") onExpediteReconnectRef.current?.();
@@ -4152,6 +4168,7 @@ export function VideoPlayer({
     subtitleRefreshRevision,
     engineTransportRevision,
     replayRevision,
+    onSessionGone,
   );
 
   // Group cues by the vertical band their source cue declares (`line`), so a
@@ -5872,6 +5889,10 @@ export function VideoPlayer({
     onEvent: handleRealtimeEvent,
     supportedCommands: VIDEO_PLAYBACK_COMMANDS,
     recoveryRevision: planRevision,
+    // A ticket mint that keeps answering 404 proves this player cannot control
+    // the session. Enter the session-gone state; a fresh start is the only
+    // recovery, so never reconnect or replan the dead id.
+    onSessionGone,
   });
 
   useEffect(() => {
@@ -6184,6 +6205,16 @@ export function VideoPlayer({
               </p>
             </div>
             <div className="flex gap-2">
+              {connectionStatus === "gone" && onRestartPlayback && (
+                <button
+                  onClick={onRestartPlayback}
+                  disabled={isLeaving}
+                  type="button"
+                  className="rounded bg-white px-4 py-2 text-sm font-medium text-black hover:bg-white/90"
+                >
+                  Restart playback
+                </button>
+              )}
               {connectionStatus === "lost" && onRetryConnection && (
                 <button
                   onClick={onRetryConnection}

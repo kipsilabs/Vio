@@ -206,6 +206,12 @@ const (
 	// A carried-over subtitle selection has no equivalent on the effective
 	// file, so the plan starts with subtitles off instead of refusing to start.
 	DegradationWarningSubtitleTrackUnavailableV3 = "subtitle_track_unavailable"
+	// A subtitle selection was carried across a virtual release rotation by its
+	// language/format identity, but at least one tiebreak (codec spelling or
+	// displayed title) differs on the rotated release. Playback keeps the
+	// viewer's choice; the warning tells a client the track behind the same
+	// selection is not byte-for-byte the one the previous release offered.
+	DegradationWarningSubtitleCarryV3 = "subtitle_carry_warning"
 )
 
 // AudioTrackUnavailableWarningV3 reports an audio selection that fell back to
@@ -218,6 +224,15 @@ func AudioTrackUnavailableWarningV3() DegradationWarningV3 {
 // dropped because the effective file has no equivalent track.
 func SubtitleTrackUnavailableWarningV3() DegradationWarningV3 {
 	return DegradationWarningV3{Code: DegradationWarningSubtitleTrackUnavailableV3, Message: "The selected subtitle track is not on this file; starting without it."}
+}
+
+// SubtitleCarryWarningV3 reports a subtitle selection that was carried across a
+// virtual release rotation by language and format while a codec or title
+// tiebreak differs. The plan keeps the viewer's subtitle; the warning is
+// additive and distinct from "unavailable" so a client can keep the selection
+// and merely surface that the rotated release's track differs.
+func SubtitleCarryWarningV3() DegradationWarningV3 {
+	return DegradationWarningV3{Code: DegradationWarningSubtitleCarryV3, Message: "The selected subtitle was carried to the rotated release by language and format."}
 }
 
 // SubtitleNotShownWarningV3 reports a selected subtitle that is on the file

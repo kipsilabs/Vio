@@ -10,6 +10,7 @@ import type { PlayerSubtitleInfo } from "../types";
 import { isASSCodec, isBitmapCodec } from "../utils/subtitleCodecs";
 import { toMediaTime } from "../utils/mediaTimeline";
 import { isSubtitleSourceChanged } from "../utils/subtitleSourceChanged";
+import { isPlaybackSessionGoneResponse } from "../playback-errors";
 
 // Explicitly bound each subtitle fetch to this many source-time seconds. A
 // cold remote 600 s window takes ~18-24 s to read; the client displays cues as
@@ -275,12 +276,19 @@ export function useSubtitleTracks(
   // too.
   transportRevision = 0,
   replayRevision = 0,
+  // Fired once when a window fetch is answered that the playback session no
+  // longer exists (a 410 on a session-scoped subtitle route, or a 404 naming
+  // the session). No retry of the same URL can succeed, so the fetcher parks
+  // and the caller offers a fresh start instead of polling the dead session.
+  onSessionGone?: () => void,
 ): ActiveSubtitleCue[] {
   const [activeCues, setActiveCues] = useState<ActiveSubtitleCue[]>([]);
   const onLoadStateRef = useRef(onLoadState);
   onLoadStateRef.current = onLoadState;
   const onSourceChangedRef = useRef(onSourceChanged);
   onSourceChangedRef.current = onSourceChanged;
+  const onSessionGoneRef = useRef(onSessionGone);
+  onSessionGoneRef.current = onSessionGone;
   // The source generation that already emitted a source-changed signal. Held in
   // a ref (unlike the per-effect `sourceChangedSignaled`) so a rebuilt track
   // from the refresh's own replan does not signal the same rotation again.
@@ -455,6 +463,10 @@ export function useSubtitleTracks(
     // rotated under this plan and the URL is stale, so the failure branch must
     // not schedule a backoff retry of a URL that can never succeed.
     let sourceChangedSignaled = false;
+    // Set when a window fetch proves the playback session itself is gone. The
+    // session is not coming back under this id, so no retry is scheduled and
+    // the caller is told once.
+    let sessionGoneSignaled = false;
     // Consecutive window failures since the last success (seeks superseding a
     // fetch do not count). Once it reaches FETCH_MAX_CONSECUTIVE_FAILURES the
     // fetcher stops scheduling retries for this mount — same terminal-budget
@@ -599,7 +611,15 @@ export function useSubtitleTracks(
         const resp = await fetch(url, { signal: controller.signal });
         if (!resp.ok || !resp.body) {
           lastResponseStatus = resp.status;
-          if (await isSubtitleSourceChanged(resp)) {
+          if (await isPlaybackSessionGoneResponse(resp)) {
+            // A response that lands after the track was rebuilt belongs to the
+            // session this fetch was minted for, not the one on screen now.
+            if (!controller.signal.aborted) {
+              sessionGoneSignaled = true;
+              onLoadStateRef.current?.("error");
+              onSessionGoneRef.current?.();
+            }
+          } else if (await isSubtitleSourceChanged(resp)) {
             sourceChangedSignaled = true;
             // One signal per source generation: the refresh replan adopts a new
             // plan whose rebuilt fetcher would otherwise signal the same
@@ -701,7 +721,7 @@ export function useSubtitleTracks(
           // source change is not a retryable failure: the replan will re-mint
           // the URL, so no backoff is scheduled here. Guarded inline rather
           // than with a `return` — this block runs inside a finally.
-          if (!sourceChangedSignaled) {
+          if (!sourceChangedSignaled && !sessionGoneSignaled) {
             lastFetchFailureAt = Date.now();
             onLoadStateRef.current?.("error");
             if (isRetryableSubtitleStatus(lastResponseStatus)) {
@@ -747,6 +767,7 @@ export function useSubtitleTracks(
     // one, so it is allowed to reset the failure budget.
     function maybeFetch(seeked = false) {
       if (sourceChangedSignaled) return; // stale URL; waiting for replan
+      if (sessionGoneSignaled) return; // the session is gone; offer a restart
       if (cancelled) return;
       // Until the element has media loaded, currentTime reads 0 rather than
       // the position playback will actually start at (resume target, or a

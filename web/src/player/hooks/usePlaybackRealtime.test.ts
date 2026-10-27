@@ -139,32 +139,40 @@ it("retries a replica-local mint 404 with backoff instead of treating it as gone
   expect(result.current.connectionState).toBe("disconnected");
 });
 
-it("degrades quietly after the bounded mint 404s and re-arms on a recovery revision", async () => {
+it("reports session gone after the bounded mint 404s and re-arms on a recovery revision", async () => {
   vi.useFakeTimers();
   mocks.mint.mockRejectedValue(notFoundProblem());
+  const onSessionGone = vi.fn();
   const { result, rerender } = renderHook(
     ({ revision }: { revision: number }) =>
-      usePlaybackRealtime({ sessionId: "session", onCommand: vi.fn(), recoveryRevision: revision }),
+      usePlaybackRealtime({
+        sessionId: "session",
+        onCommand: vi.fn(),
+        recoveryRevision: revision,
+        onSessionGone,
+      }),
     { wrapper, initialProps: { revision: 0 } },
   );
 
-  // Bounded retries, then the lane stops: it never tears the player down and
-  // reports nothing, because a local miss cannot establish that playback ended.
+  // A short backoff ladder, then the lane concludes the session is gone and
+  // hands the player its restart action. It never keeps minting forever.
   await act(async () => {
-    await vi.advanceTimersByTimeAsync(60_000);
+    await vi.advanceTimersByTimeAsync(1_600);
   });
   expect(mocks.mint).toHaveBeenCalledTimes(SESSION_GONE_MINT_RETRY_LIMIT);
+  expect(onSessionGone).toHaveBeenCalledTimes(1);
   expect(result.current.connectionState).toBe("disconnected");
 
-  // Degraded quietly: no further mint and no reconnect timer left armed.
+  // No further mint and no reconnect timer left armed.
   await act(async () => {
     await vi.advanceTimersByTimeAsync(60_000);
   });
   expect(mocks.mint).toHaveBeenCalledTimes(SESSION_GONE_MINT_RETRY_LIMIT);
+  expect(onSessionGone).toHaveBeenCalledTimes(1);
   expect(vi.getTimerCount()).toBe(0);
 
   // An adopted plan (a recovery under the same session id) re-arms the lane; a
-  // second loss degrades it again.
+  // second loss reports it again.
   rerender({ revision: 1 });
   await act(async () => {
     await vi.advanceTimersByTimeAsync(0);
@@ -174,6 +182,7 @@ it("degrades quietly after the bounded mint 404s and re-arms on a recovery revis
     await vi.advanceTimersByTimeAsync(60_000);
   });
   expect(mocks.mint).toHaveBeenCalledTimes(SESSION_GONE_MINT_RETRY_LIMIT * 2);
+  expect(onSessionGone).toHaveBeenCalledTimes(2);
   expect(result.current.connectionState).toBe("disconnected");
   expect(vi.getTimerCount()).toBe(0);
 });

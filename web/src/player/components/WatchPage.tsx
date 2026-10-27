@@ -11,6 +11,7 @@ import type {
 } from "../realtime-protocol";
 import type { SubtitleInventoryItemV3 } from "../protocol-v3";
 import { usePlaybackSession } from "../hooks/usePlaybackSession";
+import { isAdaptationUnavailableReason } from "../playback-errors";
 import { usePlayerConfig } from "../context/PlayerConfigContext";
 import {
   hasSelectableSessionSubtitles,
@@ -1375,9 +1376,17 @@ function WatchPagePlayer({
 
   // The server tells us whether a terminal is worth retrying. A retryable
   // virtual-source refusal gets a Try again action; every other terminal keeps
-  // the plain Go Back dead-end.
+  // the plain Go Back dead-end. An adaptation refusal always offers the action:
+  // the server marks it non-retryable because replaying the same plan cannot
+  // work, but a *fresh start* can re-list and re-resolve the source.
   const canRetryTerminal =
-    !session.plan && session.errorReason === "virtual_source_unavailable" && session.errorRetryable;
+    !session.plan &&
+    (session.errorReason === "virtual_source_unavailable"
+      ? session.errorRetryable
+      : isAdaptationUnavailableReason(session.errorReason));
+  // A session answered gone cannot be replanned or reconnected. The only
+  // recovery is a new start at the position the viewer reached.
+  const canRestartSession = !session.plan && session.connectionStatus === "gone";
   const retryInFlight = session.retrying;
 
   // The plan is the player's contract: without one there is no transport, no
@@ -1401,14 +1410,24 @@ function WatchPagePlayer({
         <div className="surface-panel-subtle flex max-w-md flex-col items-center gap-4 rounded-[1.8rem] px-8 py-8 text-center">
           <div className="space-y-2">
             <p className="text-base font-semibold text-white">
-              {session.errorTitle ?? "Playback unavailable"}
+              {session.errorTitle ?? session.connectionErrorTitle ?? "Playback unavailable"}
             </p>
             <p className="text-sm text-white/60">
-              {session.error ?? "Vio could not start playback."}
+              {session.error ?? session.connectionError ?? "Vio could not start playback."}
             </p>
           </div>
           <div className="flex flex-col items-center gap-2">
-            {canRetryTerminal ? (
+            {canRestartSession ? (
+              <button
+                onClick={() => {
+                  session.restartPlayback();
+                }}
+                type="button"
+                className="rounded-[0.95rem] bg-white px-4 py-2 text-sm font-semibold text-black transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                Restart playback
+              </button>
+            ) : canRetryTerminal ? (
               <button
                 onClick={() => {
                   session.retryStart();
@@ -1594,6 +1613,8 @@ function WatchPagePlayer({
         onConnectionLost={session.recoverConnection}
         onRetryConnection={session.retryConnection}
         onSessionLost={session.reportSessionLost}
+        onSessionGone={session.markSessionGone}
+        onRestartPlayback={session.restartPlayback}
         onExpediteReconnect={session.expediteReconnect}
         connectionStatus={session.connectionStatus}
         connectionErrorTitle={session.connectionErrorTitle}

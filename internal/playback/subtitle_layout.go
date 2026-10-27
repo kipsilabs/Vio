@@ -316,6 +316,284 @@ func SubtitleExtractMuxer(codec, targetFormat string) string {
 	return muxer
 }
 
+// SubtitleCarryGenerationV3 names the evidence generation a carried subtitle
+// selection was minted against. It travels with the carry key so a warning or a
+// log can say which candidate, catalog row and source revision the ordinal
+// belonged to; it is never used to widen a match across releases.
+type SubtitleCarryGenerationV3 struct {
+	CandidateURI   string
+	EvidenceRowID  int
+	SourceRevision string
+}
+
+// SubtitleCarryKeyV3 is the identity of one selected subtitle track as it was
+// minted against an evidence generation. A virtual release rotation replaces
+// the inventory behind the same catalog row, so the selection has to be carried
+// by identity rather than by its old ordinal.
+//
+// The gates are deliberately narrow and fail closed:
+//
+//   - Source is a hard gate: external, embedded and downloaded tracks are never
+//     crossed for one another.
+//   - MuxerClass is a hard gate and must be one of webvtt, ass, or sup: the
+//     subtitle URL extension was minted at plan time, so a carried selection may
+//     only land on a codec that extracts to the same muxer family.
+//   - Language is a hard gate (canonical form; an empty language matches only an
+//     empty language).
+//   - Forced and HearingImpaired are hard gates.
+//   - CodecNormalized and Title are tiebreaks only. They can disambiguate
+//     several tracks that already agree on every hard gate, but a difference in
+//     either produces a fuzzy carry, never a miss.
+//
+// Downloaded subtitles have no file-shaped representation and are resolved by
+// their stable row id first (DownloadedRowID), then by language and codec.
+type SubtitleCarryKeyV3 struct {
+	Source          string
+	Language        string
+	MuxerClass      string
+	CodecNormalized string
+	Forced          bool
+	HearingImpaired bool
+	Title           string
+	// DownloadedRowID is the durable downloaded-subtitle row the selection
+	// names. It is the only stable identity for a downloaded entry; its
+	// language, codec and label can collide across rows.
+	DownloadedRowID int
+	Generation      SubtitleCarryGenerationV3
+}
+
+// SubtitleCarryMuxerClassV3 maps a subtitle codec (or sidecar format) to the
+// output muxer family a carry may preserve. It mirrors subtitleLayoutClass, so
+// an unrenderable codec has no class and can never be carried onto a deliverable
+// one.
+func SubtitleCarryMuxerClassV3(codec string) string {
+	return subtitleLayoutClass(codec)
+}
+
+// SubtitleCarryCodecV3 normalizes a subtitle codec for the carry's codec
+// tiebreak. The matcher normalizes both sides again, so this is a convenience
+// for callers building a key.
+func SubtitleCarryCodecV3(codec string) string {
+	return normalizeCodecV3(codec)
+}
+
+// SubtitleCarryExternalLabelV3 is the displayed label of an external sidecar.
+// It mirrors the inventory label so a key built from a file row compares equal
+// to one built from published evidence.
+func SubtitleCarryExternalLabelV3(sub models.ExternalSubtitle) string {
+	for _, value := range []string{sub.Title, sub.EmbeddedTitle, filepath.Base(sub.Path), sub.Language} {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+// SubtitleCarryEmbeddedLabelV3 is the displayed label of an embedded track.
+func SubtitleCarryEmbeddedLabelV3(track models.SubtitleTrack) string {
+	for _, value := range []string{track.Title, track.EmbeddedTitle, track.Language} {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+// MatchSubtitleCarryTrackV3 finds the unique track on target that carries the
+// wanted selection across a virtual release rotation. It reports the target's
+// published combined ordinal, whether the match is exact (both tiebreaks agree)
+// and whether a unique match exists. Ambiguity is a miss, never a guess: two
+// tracks that agree on every hard gate and both tiebreaks cannot be told apart,
+// so the caller must fail closed rather than serve whichever one sorts first.
+//
+// targetDownloaded is the target's live downloaded tail in repository order; it
+// is only consulted for a downloaded selection, which is resolved by stable row
+// id first and then by language + codec (never by title).
+func MatchSubtitleCarryTrackV3(wanted SubtitleCarryKeyV3, target *models.MediaFile, targetDownloaded []SubtitleInventoryEntryV3) (publishedOrdinal int, exact bool, ok bool) {
+	if target == nil {
+		return 0, false, false
+	}
+	switch wanted.Source {
+	case SubtitleSourceExternalV3, SubtitleSourceEmbeddedV3:
+		return matchOwnedSubtitleCarryV3(wanted, target)
+	case SubtitleSourceDownloadedV3:
+		return matchDownloadedSubtitleCarryV3(wanted, target, targetDownloaded)
+	default:
+		return 0, false, false
+	}
+}
+
+// subtitleCarryCandidateV3 is one target track reduced to the attributes the
+// carry matches on.
+type subtitleCarryCandidateV3 struct {
+	published int
+	language  string
+	muxer     string
+	codec     string
+	forced    bool
+	hi        bool
+	title     string
+}
+
+func matchOwnedSubtitleCarryV3(wanted SubtitleCarryKeyV3, target *models.MediaFile) (int, bool, bool) {
+	wantedLanguage := lang.Canonical(wanted.Language)
+	wantedMuxer := strings.TrimSpace(wanted.MuxerClass)
+	if wantedMuxer == "" {
+		return 0, false, false
+	}
+	candidates := make([]subtitleCarryCandidateV3, 0, len(target.ExternalSubtitles)+len(target.SubtitleTracks))
+	for index, sub := range target.ExternalSubtitles {
+		published, mapped := SubtitleInventoryOwnPublishedIndexV3(target, index)
+		if !mapped {
+			continue
+		}
+		candidates = append(candidates, subtitleCarryCandidateV3{
+			published: published,
+			language:  lang.Canonical(sub.Language),
+			muxer:     subtitleLayoutClass(sub.Format),
+			codec:     normalizeCodecV3(sub.Format),
+			forced:    sub.Forced,
+			hi:        sub.HearingImpaired,
+			title:     SubtitleCarryExternalLabelV3(sub),
+		})
+	}
+	for index, track := range target.SubtitleTracks {
+		published, mapped := SubtitleInventoryOwnPublishedIndexV3(target, len(target.ExternalSubtitles)+index)
+		if !mapped {
+			continue
+		}
+		candidates = append(candidates, subtitleCarryCandidateV3{
+			published: published,
+			language:  lang.Canonical(track.Language),
+			muxer:     subtitleLayoutClass(track.Codec),
+			codec:     normalizeCodecV3(track.Codec),
+			forced:    track.Forced,
+			hi:        track.HearingImpaired,
+			title:     SubtitleCarryEmbeddedLabelV3(track),
+		})
+	}
+	survivors := make([]subtitleCarryCandidateV3, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidate.muxer == "" || candidate.muxer != wantedMuxer {
+			continue
+		}
+		if candidate.language != wantedLanguage {
+			continue
+		}
+		if candidate.forced != wanted.Forced || candidate.hi != wanted.HearingImpaired {
+			continue
+		}
+		survivors = append(survivors, candidate)
+	}
+	return resolveSubtitleCarrySurvivorsV3(wanted, survivors)
+}
+
+// resolveSubtitleCarrySurvivorsV3 applies the codec and title tiebreaks in that
+// order. A unique survivor is a match even when a tiebreak differs (fuzzy); a
+// tiebreak that still leaves several candidates is fail-closed.
+func resolveSubtitleCarrySurvivorsV3(wanted SubtitleCarryKeyV3, survivors []subtitleCarryCandidateV3) (int, bool, bool) {
+	wantedCodec := normalizeCodecV3(wanted.CodecNormalized)
+	wantedTitle := wanted.Title
+	exactWith := func(candidate subtitleCarryCandidateV3) bool {
+		return candidate.codec == wantedCodec && subtitleCarryTitleEqualV3(candidate.title, wantedTitle)
+	}
+	switch len(survivors) {
+	case 0:
+		return 0, false, false
+	case 1:
+		return survivors[0].published, exactWith(survivors[0]), true
+	}
+	codecMatches := make([]subtitleCarryCandidateV3, 0, len(survivors))
+	for _, candidate := range survivors {
+		if candidate.codec == wantedCodec {
+			codecMatches = append(codecMatches, candidate)
+		}
+	}
+	switch len(codecMatches) {
+	case 0:
+		// Every surviving track has a different codec. Only a unique title can
+		// still identify the selection, and that is a fuzzy carry.
+	case 1:
+		return codecMatches[0].published, subtitleCarryTitleEqualV3(codecMatches[0].title, wantedTitle), true
+	default:
+		survivors = codecMatches
+	}
+	titleMatches := make([]subtitleCarryCandidateV3, 0, len(survivors))
+	for _, candidate := range survivors {
+		if subtitleCarryTitleEqualV3(candidate.title, wantedTitle) {
+			titleMatches = append(titleMatches, candidate)
+		}
+	}
+	if len(titleMatches) == 1 {
+		return titleMatches[0].published, titleMatches[0].codec == wantedCodec, true
+	}
+	return 0, false, false
+}
+
+// matchDownloadedSubtitleCarryV3 resolves a downloaded selection against the
+// target's live tail. The stable row id is the identity; when the row was
+// dropped or renumbered, only an exact language + codec match may carry it, and
+// two such rows are ambiguous and fail closed. Title is never a tiebreak for a
+// downloaded row (labels are provider-authored and collide).
+func matchDownloadedSubtitleCarryV3(wanted SubtitleCarryKeyV3, target *models.MediaFile, targetDownloaded []SubtitleInventoryEntryV3) (int, bool, bool) {
+	// Downloaded rows carry no forced disposition; a requested forced carry has
+	// no representable identity here.
+	if wanted.Forced {
+		return 0, false, false
+	}
+	wantedLanguage := lang.Canonical(wanted.Language)
+	wantedCodec := normalizeCodecV3(wanted.CodecNormalized)
+	type downloadedCandidate struct {
+		published int
+		index     int
+	}
+	candidates := make([]downloadedCandidate, 0, len(targetDownloaded))
+	for index, entry := range targetDownloaded {
+		if entry.Source != "" && entry.Source != SubtitleSourceDownloadedV3 {
+			continue
+		}
+		if entry.HearingImpaired != wanted.HearingImpaired {
+			continue
+		}
+		candidates = append(candidates, downloadedCandidate{published: index, index: index})
+	}
+	if len(candidates) == 0 {
+		return 0, false, false
+	}
+	base := len(BuildSubtitleInventoryV3(target, nil))
+	if wanted.DownloadedRowID > 0 {
+		for _, candidate := range candidates {
+			entry := targetDownloaded[candidate.index]
+			if entry.DownloadedSubtitleID == wanted.DownloadedRowID {
+				return base + candidate.published, true, true
+			}
+		}
+	}
+	languageMatches := make([]downloadedCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		entry := targetDownloaded[candidate.index]
+		if lang.Canonical(entry.Language) != wantedLanguage {
+			continue
+		}
+		if normalizeCodecV3(entry.Codec) != wantedCodec {
+			continue
+		}
+		languageMatches = append(languageMatches, candidate)
+	}
+	if len(languageMatches) != 1 {
+		// Zero: no equivalent. More than one: two rows share the language and
+		// format, so the carry cannot prove which row the viewer picked.
+		return 0, false, false
+	}
+	return base + languageMatches[0].published, false, true
+}
+
+// subtitleCarryTitleEqualV3 compares displayed labels for the title tiebreak.
+// An empty label matches only an empty label.
+func subtitleCarryTitleEqualV3(a, b string) bool {
+	return strings.EqualFold(strings.TrimSpace(a), strings.TrimSpace(b))
+}
+
 // subtitleLayoutClass returns the deliverable class a codec extracts as, or ""
 // for codecs with no sidecar representation. It deliberately mirrors the
 // stream handler's output mapping (webvtt for text, ass-copy for ASS/SSA,
