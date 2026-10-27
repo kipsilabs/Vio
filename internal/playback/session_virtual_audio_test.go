@@ -117,6 +117,57 @@ func TestVirtualProbeOverlayClearsInvalidMarkerOnSuccessfulRemap(t *testing.T) {
 	}
 }
 
+// TestVirtualProbeOverlayResolvesSyntheticPlaceholderToVerifiedDefault pins the
+// other half: a plan-time inventory that is only a synthesized placeholder
+// ({Index: -1, Default: true}) carries no identity, so the verified swap must
+// re-resolve the committed "default" intent against the real list instead of
+// tying every track and invalidating the selection the client still shows.
+func TestVirtualProbeOverlayResolvesSyntheticPlaceholderToVerifiedDefault(t *testing.T) {
+	manager := NewSessionManager(0, 0)
+	session, err := manager.StartSession(1, "profile-1", 9, PlayRemux, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	uri := "virtual://movie/tt-synthetic?result=cand-1"
+	if err := manager.SetVirtualSource(session.ID, uri, 5); err != nil {
+		t.Fatalf("SetVirtualSource: %v", err)
+	}
+	if err := manager.UpdateStreamState(session.ID, SessionStreamState{
+		AudioTrackIndex:               0,
+		VirtualSourceSet:              true,
+		VirtualSourceOwnershipSet:     true,
+		VirtualSourceURI:              uri,
+		VirtualSubtitleEvidenceSet:    true,
+		VirtualAudioTracks:            []models.AudioTrack{{Index: -1, Default: true}},
+		VirtualSubtitleEvidenceURI:    uri,
+		VirtualSubtitleEvidenceFileID: 9,
+	}); err != nil {
+		t.Fatalf("UpdateStreamState: %v", err)
+	}
+	binding, err := manager.VirtualSourceBinding(session.ID)
+	if err != nil {
+		t.Fatalf("VirtualSourceBinding: %v", err)
+	}
+	verified := []models.AudioTrack{
+		{Index: 0, Language: "en", Codec: "aac", Channels: 2, Layout: "stereo", Default: true},
+		{Index: 1, Language: "ja", Codec: "aac", Channels: 2, Layout: "stereo"},
+	}
+	applied, err := manager.SetVirtualProbeVerifiedInventoryIfBinding(session.ID, binding, "rev-synthetic", verified, nil, nil)
+	if err != nil || !applied {
+		t.Fatalf("SetVirtualProbeVerifiedInventoryIfBinding = %v, %v; want applied", applied, err)
+	}
+	live, err := manager.GetSession(session.ID)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if live.VirtualAudioSelectionInvalid {
+		t.Fatal("a synthesized default placeholder was invalidated instead of resolved to the verified default")
+	}
+	if live.AudioTrackIndex != 0 || !live.VirtualAudioTracks[live.AudioTrackIndex].Default {
+		t.Fatalf("resolved index = %d, want the verified default track", live.AudioTrackIndex)
+	}
+}
+
 // TestVirtualStreamStateCarriesDeclaredAudioWithoutEvidence pins the deferred
 // audio retention: a virtual snapshot with no probe evidence must still leave
 // the plan-time audio inventory and its provenance anchor on the session, so

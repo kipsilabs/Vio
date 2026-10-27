@@ -2119,6 +2119,21 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	if err := req.ValidateSelectedTrackStructureV3(); err != nil {
 		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusBadRequest, "bad_request", err.Error())
 	}
+	profileID := apimw.GetProfileID(r.Context())
+	if profileID == "" {
+		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusBadRequest, "bad_request", "X-Profile-Id header is required")
+	}
+	if req.ProfileID != profileID {
+		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusBadRequest, "bad_request", "profile_id must match X-Profile-Id")
+	}
+	userID := apimw.GetUserID(r.Context())
+	deviceID := deviceMetadataFromRequest(r).DeviceID
+	// The plan publishes track identities minted against the effective row, but
+	// a restart echoes them alongside the requested file_id. Normalize an echo
+	// onto the requested row before validation; a truly foreign row still falls
+	// through to the stale-identity drop inside NormalizeAndValidate.
+	startTrackRekeys := h.rekeyStartTrackIdentitiesV3(r.Context(), &req, userID, profileID,
+		clientip.FromContext(r.Context()), playbackClientInfoFromRequest(r).UserAgent)
 	dropStaleRequestTrackIdentitiesV3(r.Context(), &req)
 	warnings, err := req.NormalizeAndValidate()
 	if err != nil {
@@ -2133,15 +2148,6 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		req.ClientFeatures = playback.WithoutFeatureV3(req.ClientFeatures, playback.FeatureHLSSubtitleRenditionsV3)
 	}
 	timings.mark("decode_validate")
-	profileID := apimw.GetProfileID(r.Context())
-	if profileID == "" {
-		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusBadRequest, "bad_request", "X-Profile-Id header is required")
-	}
-	if req.ProfileID != profileID {
-		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusBadRequest, "bad_request", "profile_id must match X-Profile-Id")
-	}
-	userID := apimw.GetUserID(r.Context())
-	deviceID := deviceMetadataFromRequest(r).DeviceID
 	requestDigests := newPlaybackStartRequestDigestsV3(body, deviceID)
 	resolutionWasAssumed := false
 	// resolutionProvenance is the virtual resolver's provenance for the source
@@ -2320,6 +2326,23 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 			}
 		}
 	}
+	// The re-keyed identities were normalized onto the requested row before
+	// virtual resolution. Re-check their ordinals against the candidate the
+	// resolver actually served: a substitution can reorder its tracks, and an
+	// ordinal kept across that change would silently play another stream.
+	startAudioUnavailable, startSubtitleUnavailable, startConstrainErr := h.constrainRekeyedStartTracksV3(r.Context(), &req, requestedFile, startTrackRekeys)
+	if startConstrainErr != nil {
+		// The subtitle store could not prove whether the selection survived the
+		// candidate change. Reusing the old ordinal would silently play another
+		// track, so surface the dependency failure instead of degrading.
+		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusServiceUnavailable, "subtitle_unavailable", "The selected subtitle track could not be verified; retry shortly.")
+	}
+	if startAudioUnavailable {
+		warnings = append(warnings, playback.AudioTrackUnavailableWarningV3())
+	}
+	if startSubtitleUnavailable {
+		warnings = append(warnings, playback.SubtitleTrackUnavailableWarningV3())
+	}
 	if dropStaleAudioTrackIdentityV3(r.Context(), requestedFile, req.AudioTrackID) {
 		req.AudioTrackID = ""
 		req.AudioTrackIndex = nil
@@ -2350,10 +2373,17 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		// Version switch: the viewer made an explicit audio choice on the previous
 		// version; carry it onto the requested file by track family rather than
 		// letting the server's preference override an explicit choice.
-		if carriedIndex, ok := h.resolveCarriedAudioTrackV3(r.Context(), req.CarriedAudioTrackID, requestedFile); ok {
+		carriedSource := h.carriedAudioSourceV3(r.Context(), &req, requestedFile, userID, profileID,
+			clientip.FromContext(r.Context()), playbackClientInfoFromRequest(r).UserAgent)
+		if carriedIndex, ok := h.resolveCarriedAudioTrackV3(r.Context(), req.CarriedAudioTrackID, requestedFile, carriedSource); ok {
 			audioIndex = carriedIndex
 			req.AudioTrackIndex = &carriedIndex
 			req.AudioTrackID = ""
+		} else {
+			// The viewer made an explicit choice on the previous version and the
+			// requested one has no equivalent. Report the loss instead of letting
+			// the server preference play another stream silently.
+			audioDegraded = true
 		}
 	}
 	if audioDegraded {
@@ -5850,12 +5880,21 @@ func (h *PlaybackHandler) preferredAudioTrackIndexV3(ctx context.Context, userID
 		slog.ErrorContext(ctx, "protocol v3 start: audio preference store lookup failed", "component", "api", "user_id", userID, "error", err)
 		return 0, "", err
 	}
-	seriesID := h.resolveSeriesID(ctx, file)
+	// The content scope is the parent series for an episode and the content id
+	// for everything else. The catalog picker scopes the same way when it
+	// publishes effective_audio_track_index, so the marker and the plan agree.
+	contentID := strings.TrimSpace(h.resolveSeriesID(ctx, file))
+	if contentID == "" && strings.TrimSpace(file.EpisodeID) == "" {
+		// Movies and other item-level content scope by their own content id,
+		// matching the catalog picker. An episode whose parent series could not
+		// be resolved must not suddenly scope by the episode id.
+		contentID = strings.TrimSpace(file.ContentID)
+	}
 	var seriesPref *playback.AudioTrackPreference
-	if seriesID != "" {
-		stored, prefErr := store.GetAudioPreference(ctx, profileID, seriesID)
+	if contentID != "" {
+		stored, prefErr := store.GetAudioPreference(ctx, profileID, contentID)
 		if prefErr != nil {
-			slog.ErrorContext(ctx, "protocol v3 start: series audio preference lookup failed", "component", "api", "profile_id", profileID, "series_id", seriesID, "error", prefErr)
+			slog.ErrorContext(ctx, "protocol v3 start: content audio preference lookup failed", "component", "api", "profile_id", profileID, "content_id", contentID, "error", prefErr)
 			return 0, "", prefErr
 		}
 		if stored != nil {
@@ -5867,8 +5906,8 @@ func (h *PlaybackHandler) preferredAudioTrackIndexV3(ctx context.Context, userID
 		DeviceID:   deviceID,
 		LibraryIDs: []int{file.MediaFolderID},
 	}
-	if seriesID != "" {
-		rc.SeriesIDs = []string{seriesID}
+	if contentID != "" {
+		rc.SeriesIDs = []string{contentID}
 	}
 	preferredLang, err := resolvedPlaybackAudioLanguage(ctx, store, rc)
 	if err != nil {
@@ -5893,7 +5932,12 @@ func (h *PlaybackHandler) preferredAudioTrackIndexV3(ctx context.Context, userID
 		// settings own the language and its scope precedence.
 		seriesPref.AudioLanguage = preferredLang
 	}
-	return normalizeAudioTrackIndex(file, playback.SelectAudioTrack(file.AudioTracks, preferredLang, seriesPref)), preferredLang, nil
+	// Resolve against the same backfilled language view the catalog picker
+	// publishes, so a MULTI/DUAL title whose language lives only in the embedded
+	// title cannot select one track in the marker and another in the plan.
+	backfilled := *file
+	backfilled.AudioTracks = playback.BackfillAudioTrackLanguages(append([]models.AudioTrack(nil), file.AudioTracks...))
+	return normalizeAudioTrackIndex(file, playback.SelectAudioTrack(backfilled.AudioTracks, preferredLang, seriesPref)), preferredLang, nil
 }
 
 // carrySelectionsFromActiveSessionV3 copies an explicit audio selection and a
@@ -6598,6 +6642,10 @@ func (h *PlaybackHandler) startReadyAutoLocalPlaybackTransportV3(ctx context.Con
 
 // prepareLocalTransportV3 starts a local HLS generation for the selected plan.
 func (h *PlaybackHandler) prepareLocalTransportV3(r *http.Request, session *playback.Session, file *models.MediaFile, result playback.PlannerResultV3, timeline preparedTimelineV3, mode mediaAuthModeV3) (preparedTransportV3, *transportErrorV3) {
+	// A cross-release fallback can only carry the requested audio by identity;
+	// when it cannot, the transport records the degradation on the plan it is
+	// preparing. Attach the plan so the start path can reach it.
+	r = r.WithContext(withCrossReleaseAudioPlanV3(r.Context(), result.Plan))
 	cfg := h.playbackConfig()
 	if err := os.MkdirAll(cfg.TranscodeDir, 0o755); err != nil {
 		return preparedTransportV3{}, &transportErrorV3{reason: "internal_error", message: "Failed to prepare the transcode directory.", cause: err}
@@ -8623,8 +8671,8 @@ func (h *PlaybackHandler) evaluatePreparedReplanCandidateV3(
 	// the loaded candidate row may have been re-probed in place (same id,
 	// different release), in which case source==target by id but the ordinal
 	// still names the previous release's track.
-	remapSource := h.replanRemapSourceV3(sourceFile, session)
-	if err := remapAudioSelectionV3(remapSource, candidateFile, &candidateStart); err != nil {
+	remapCarry := h.replanRemapSourceV3(sourceFile, session, replanDurableInventoryV3(record))
+	if err := remapAudioSelectionV3(remapCarry.file, candidateFile, &candidateStart); err != nil {
 		return nil, &candidateErrorV3{Stage: candidateStageAudioRemap, Message: fmt.Sprintf("candidate %d audio remap failed", candidateFile.ID), Err: err}
 	}
 	candidateAudioIndex, _, err := resolveV3AudioIndex(candidateFile, candidateStart.AudioTrackID, candidateStart.AudioTrackIndex)
@@ -8640,11 +8688,11 @@ func (h *PlaybackHandler) evaluatePreparedReplanCandidateV3(
 	// non-virtual files, where a stable row id means a stable release;
 	// virtual rows rotate releases under a fixed id, so they keep the
 	// evidence-anchored remap above.
-	subtitleRemapSource := remapSource
+	subtitleRemapCarry := remapCarry
 	if selFileID, selKind, _, selOK := playback.ParseTrackIDV3(candidateStart.SubtitleTrackID); selOK && selKind == subtitleTrackKindV3 && selFileID == candidateFile.ID && !isVirtualPlaybackFile(candidateFile) {
-		subtitleRemapSource = candidateFile
+		subtitleRemapCarry = carriedInventorySourceV3{file: candidateFile}
 	}
-	if _, err := h.remapSubtitleSelectionV3(r.Context(), subtitleRemapSource, candidateFile, &candidateStart); err != nil {
+	if _, err := h.remapSubtitleSelectionWithCarryV3(r.Context(), subtitleRemapCarry, candidateFile, &candidateStart); err != nil {
 		candidateResult = playback.PlannerResultV3{Terminal: &playback.TerminalV3{
 			Reason:    terminalSubtitleUnavailableInVersionV3,
 			Message:   "The selected subtitle track is unavailable in the fallback media version.",
@@ -9768,6 +9816,10 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	// drop anything still naming another file. A plan that plays on without
 	// the viewer's subtitle reports it instead of going quiet.
 	detourDroppedSubtitle := false
+	// driftSubtitleUnavailable remembers a selection the active row itself lost
+	// when it was re-probed in place. There is no fallback version holding it,
+	// so the drop is reported unconditionally.
+	driftSubtitleUnavailable := false
 	// reportDetourSubtitleDrop appends the dropped-subtitle warning when
 	// a speculative detour cost the viewer a selection no played version
 	// honors. It runs on the final plan, so a fallback that keeps the
@@ -9882,11 +9934,23 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	} else {
 		effectiveFile = currentEffectiveFile
 		// A replan's carried selection was minted against the plan-time
-		// inventory, which the session still holds as virtual evidence. When
-		// the catalog row was re-probed in place (same id, different release)
-		// the freshly loaded effective file's tracks no longer describe what
-		// the ordinal names, so remap from the evidence rather than the row.
-		remapSource := h.replanRemapSourceV3(currentEffectiveFile, session)
+		// inventory. The plan being replanned is the strongest evidence (the
+		// request names that exact attempt); otherwise a virtual session's
+		// captured evidence stands in. When the catalog row was re-probed in
+		// place (same id, different release) the freshly loaded effective
+		// file's tracks no longer describe what the ordinal names, so remap
+		// from the evidence rather than the row.
+		durableInventory := replanDurableInventoryV3(record)
+		remapCarry := h.replanRemapSourceV3(currentEffectiveFile, session, durableInventory)
+		remapSource := remapCarry.file
+		// A track_change replaces the seeded selection with the viewer's choice
+		// from the current menu, so its ordinals already address the live
+		// inventory. Every other replan carries the plan-time ordinal and relies
+		// on the drift remap below to reconcile it into the effective row's
+		// inventory. Track both so the re-key step applies predecessor inventory
+		// to a carried ordinal exactly once, never to a fresh or already
+		// reconciled one.
+		subtitleSelectionCurrent := trackChange
 		currentEffectiveStart := start
 		if intentChange && !trackChange {
 			// Prefer returning to the requested edition, but a quality/output/track
@@ -9897,54 +9961,107 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			if !isVirtualPlaybackFile(currentEffectiveFile) && requestedEditionResolved && preflightPlaybackFile(r.Context(), requestedFile, h.MissingMarker, h.EventsHub) == nil {
 				effectiveFile = requestedFile
 			}
-			// Track identities only need remapping when the effective inventory
-			// actually changes. Remapping within an unchanged inventory would
-			// degrade an exact selection to a best-match lookup — e.g. moving a
-			// listener from an eng/ac3 commentary track to the identically-shaped
-			// main track on a quality change. A same-row candidate rotation keeps
-			// the id but replaces the tracks, so the guard is the union of an id
-			// change (a real edition switch, which always remaps), an inventory
-			// fingerprint change under a fixed id, and a recorded candidate
-			// rotation (a moved revision) whose tracks happen to compare equal.
-			if currentEffectiveFile.ID != effectiveFile.ID ||
-				!sameMediaInventoryV3(remapSource, effectiveFile) ||
-				virtualCandidateRotationRecordedV3(r.Context(), session, currentEffectiveFile, h.fileResolver) {
-				candidateStart := start
-				remapErr := remapAudioSelectionV3(remapSource, effectiveFile, &candidateStart)
-				if remapErr == nil && (candidateStart.SubtitleTrackIndex != nil || candidateStart.SubtitleTrackID != "") {
-					_, remapErr = h.remapSubtitleSelectionV3(r.Context(), remapSource, effectiveFile, &candidateStart)
+		}
+		// Track identities only need remapping when the effective inventory
+		// actually changes. Remapping within an unchanged inventory would
+		// degrade an exact selection to a best-match lookup — e.g. moving a
+		// listener from an eng/ac3 commentary track to the identically-shaped
+		// main track on a quality change. A same-row candidate rotation keeps
+		// the id but replaces the tracks, so the guard is the union of an id
+		// change (a real edition switch, which always remaps), an inventory
+		// fingerprint change under a fixed id, and a recorded candidate
+		// rotation (a moved revision) whose tracks happen to compare equal.
+		//
+		// The fingerprint and rotation guard run for every replan that keeps
+		// the carried selection, not only an intent change: a seek-only or
+		// recovery replan after an in-place rotation was reusing its ordinal
+		// positionally. A track change is excluded because the client's new
+		// selection was made against the current inventory, not the plan-time
+		// one.
+		if !trackChange && (intentChange && currentEffectiveFile.ID != effectiveFile.ID ||
+			!sameMediaInventoryV3(remapSource, effectiveFile) ||
+			virtualCandidateRotationRecordedV3(r.Context(), session, currentEffectiveFile, h.fileResolver)) {
+			candidateStart := start
+			remapErr := remapAudioSelectionV3(remapSource, effectiveFile, &candidateStart)
+			subtitleReconciled := false
+			if remapErr == nil && (candidateStart.SubtitleTrackIndex != nil || candidateStart.SubtitleTrackID != "") {
+				_, remapErr = h.remapSubtitleSelectionWithCarryV3(r.Context(), remapCarry, effectiveFile, &candidateStart)
+				// A successful remap leaves the ordinal addressing the effective
+				// row's current inventory. Re-checking it through the plan-time
+				// tail in the re-key step below would remap it a second time.
+				subtitleReconciled = remapErr == nil
+			}
+			if remapErr != nil && outputChange {
+				// An output refresh may make the requested edition viable again,
+				// but it must not retire a healthy active alternate merely because
+				// the viewer selected a track unique to that alternate.
+				outputChangeKeptActiveForSubtitle = requestedFile != nil && requestedFile.ID != currentEffectiveFile.ID
+				effectiveFile = currentEffectiveFile
+				// The row being kept is not necessarily the inventory the carried
+				// ordinal was minted against: an in-place re-probe replaces its
+				// tracks under the same id. Re-check the selection against the row
+				// actually kept, or the fallback would play whatever now occupies
+				// the old ordinal.
+				if !trackChange && !sameMediaInventoryV3(remapSource, effectiveFile) {
+					fallbackStart := start
+					fallbackErr := remapAudioSelectionV3(remapSource, effectiveFile, &fallbackStart)
+					fallbackSubtitleReconciled := false
+					if fallbackErr == nil && (fallbackStart.SubtitleTrackIndex != nil || fallbackStart.SubtitleTrackID != "") {
+						_, fallbackErr = h.remapSubtitleSelectionWithCarryV3(r.Context(), remapCarry, effectiveFile, &fallbackStart)
+						fallbackSubtitleReconciled = fallbackErr == nil
+					}
+					switch {
+					case fallbackErr == nil:
+						start = fallbackStart
+						subtitleSelectionCurrent = fallbackSubtitleReconciled
+					case errors.Is(fallbackErr, errSubtitleUnavailableInTargetV3):
+						// The kept row lost the selected subtitle in the same
+						// reprobe. Clearing both fields keeps the fallback off
+						// that ordinal and reports the loss below.
+						fallbackStart.SubtitleTrackIndex = nil
+						fallbackStart.SubtitleTrackID = ""
+						start = fallbackStart
+						driftSubtitleUnavailable = true
+					case errors.Is(fallbackErr, errSubtitleStoreUnavailableV3):
+						return playback.DecisionResponseV3{}, *record, nil, subtitleArtifactErrorV3("Downloaded subtitles are temporarily unavailable.", fallbackErr)
+					default:
+						return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: trackUnavailableReasonV3, message: fallbackErr.Error()}
+					}
 				}
-				if remapErr != nil && outputChange {
-					// An output refresh may make the requested edition viable again,
-					// but it must not retire a healthy active alternate merely because
-					// the viewer selected a track unique to that alternate.
-					outputChangeKeptActiveForSubtitle = requestedFile != nil && requestedFile.ID != currentEffectiveFile.ID
-					effectiveFile = currentEffectiveFile
-				} else if errors.Is(remapErr, errSubtitleUnavailableInTargetV3) {
-					// The target edition has no equivalent track. Playability wins:
-					// plan it with subtitles off instead of terminalling. The
-					// cleared selection is scoped to this speculative detour:
-					// start keeps the carried selection (with the remapped
-					// audio) so a failed detour falls back with the viewer's
-					// pick intact instead of losing it to a version that was
-					// never going to play; the detour plan itself degrades the
-					// stale selection gracefully through the subtitle policy.
-					// Remember the drop for the warning below.
+			} else if errors.Is(remapErr, errSubtitleUnavailableInTargetV3) {
+				// The target has no equivalent track. Playability wins: plan it
+				// with subtitles off instead of terminalling.
+				candidateStart.SubtitleTrackIndex = nil
+				candidateStart.SubtitleTrackID = ""
+				if effectiveFile.ID != currentEffectiveFile.ID {
+					// A speculative detour to another edition keeps the carried
+					// selection (with the remapped audio) so a failed detour
+					// falls back with the viewer's pick intact; the detour plan
+					// itself degrades the stale selection through the subtitle
+					// policy and reports the drop below.
 					detourDroppedSubtitle = true
 					candidateStart.SubtitleTrackIndex = start.SubtitleTrackIndex
 					candidateStart.SubtitleTrackID = start.SubtitleTrackID
-					start = candidateStart
-				} else if errors.Is(remapErr, errSubtitleStoreUnavailableV3) {
-					// A failed lookup says nothing about whether the selected track
-					// exists on the target edition, so it is not a track miss. The
-					// playing plan keeps its subtitle; the change can be repeated
-					// once the downloaded subtitles can be read.
-					return playback.DecisionResponseV3{}, *record, nil, subtitleArtifactErrorV3("Downloaded subtitles are temporarily unavailable.", remapErr)
-				} else if remapErr != nil {
-					return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: trackUnavailableReasonV3, message: remapErr.Error()}
 				} else {
-					start = candidateStart
+					// The active row itself was re-probed in place. Its old
+					// ordinal now names whatever track occupies it, and
+					// validation would accept it because the file id still
+					// matches, so the selection must be dropped and reported
+					// instead of restored.
+					driftSubtitleUnavailable = true
 				}
+				start = candidateStart
+			} else if errors.Is(remapErr, errSubtitleStoreUnavailableV3) {
+				// A failed lookup says nothing about whether the selected track
+				// exists on the target edition, so it is not a track miss. The
+				// playing plan keeps its subtitle; the change can be repeated
+				// once the downloaded subtitles can be read.
+				return playback.DecisionResponseV3{}, *record, nil, subtitleArtifactErrorV3("Downloaded subtitles are temporarily unavailable.", remapErr)
+			} else if remapErr != nil {
+				return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: trackUnavailableReasonV3, message: remapErr.Error()}
+			} else {
+				start = candidateStart
+				subtitleSelectionCurrent = subtitleReconciled
 			}
 		}
 		start.FileID = effectiveFile.ID
@@ -9965,9 +10082,32 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				message: "The requested seek position is beyond the end of the selected media source.",
 			}
 		}
+		// The client echoes identities minted by the running plan, which can
+		// name the session's current effective row after a serve association
+		// moved it without rewriting the durable record. Normalize those onto
+		// the row this replan validates against; a foreign row is still dropped.
+		replanAudioUnavailable, replanSubtitleUnavailable, rekeyErr := h.rekeyReplanTrackIdentitiesV3(r.Context(), &start, effectiveFile, session, durableInventory, subtitleSelectionCurrent)
+		if rekeyErr != nil {
+			// A subtitle-store failure cannot prove the carried track is absent.
+			// Keep the playing plan authoritative and let the viewer retry
+			// instead of reinterpreting the old ordinal on unverified evidence.
+			if errors.Is(rekeyErr, errSubtitleStoreUnavailableV3) {
+				return playback.DecisionResponseV3{}, *record, nil, subtitleArtifactErrorV3("Downloaded subtitles are temporarily unavailable.", rekeyErr)
+			}
+			return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: trackUnavailableReasonV3, message: rekeyErr.Error()}
+		}
 		warnings, err := start.NormalizeAndValidate()
 		if err != nil {
 			return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: "invalid_replan", message: err.Error()}
+		}
+		// A re-keyed identity whose ordinal could not be proven against the
+		// effective row's inventory was cleared above; report the degradation
+		// instead of letting it disappear as an omitted selection.
+		if replanAudioUnavailable {
+			warnings = append(warnings, playback.AudioTrackUnavailableWarningV3())
+		}
+		if replanSubtitleUnavailable || driftSubtitleUnavailable {
+			warnings = append(warnings, playback.SubtitleTrackUnavailableWarningV3())
 		}
 		// This is the single normalization of the merged start request. Keep
 		// its degradation warnings, including the drop of a client
@@ -12396,28 +12536,51 @@ func sameMediaInventoryV3(a, b *models.MediaFile) bool {
 }
 
 // replanRemapSourceV3 returns the file whose inventory a carried selection was
-// minted against. For a virtual session the plan-time evidence is the source of
-// truth: the loaded catalog row may have been re-probed in place (same id,
-// different release) after the selection was made, so only the session's
-// captured audio and subtitle inventories describe what the carried ordinal
-// actually names. The evidence is used regardless of which candidate it is
-// anchored to — unlike serving, where a provenance mismatch means the evidence
-// must be discarded, a remap needs exactly the inventory the ordinal was minted
-// against. Presence is decided by the evidence-set flag, not by slice length:
-// a captured-empty inventory is genuine evidence (the old candidate had no such
-// track), and only absent evidence permits falling back to the loaded row.
-func (h *PlaybackHandler) replanRemapSourceV3(effectiveFile *models.MediaFile, session *playback.Session) *models.MediaFile {
-	if effectiveFile == nil || session == nil || !session.VirtualSubtitleEvidenceSet {
-		return effectiveFile
+// minted against. The plan being replanned is the strongest evidence: the
+// request names that exact attempt, and its captured audio and subtitle
+// inventories are what the echoed ordinals were minted against even when no
+// live session survives on this replica. Without durable evidence, a virtual
+// session's plan-time evidence is the fallback for the same reason; either way
+// the loaded catalog row may have been re-probed in place (same id, different
+// release) after the selection was made. Evidence is used regardless of which
+// candidate it is anchored to — unlike serving, where a provenance mismatch
+// means the evidence must be discarded, a remap needs exactly the inventory the
+// ordinal was minted against. Presence is decided by the known flag, not by
+// slice length: a captured-empty inventory is genuine evidence (the old
+// candidate had no such track), and only absent evidence permits falling back
+// to the loaded row. The captured downloaded tail is returned beside the
+// file-shaped evidence because no models.MediaFile can describe it.
+func (h *PlaybackHandler) replanRemapSourceV3(effectiveFile *models.MediaFile, session *playback.Session, durable map[int]predecessorPlanInventoryV3) carriedInventorySourceV3 {
+	if effectiveFile == nil {
+		return carriedInventorySourceV3{}
+	}
+	if inventory, ok := durable[effectiveFile.ID]; ok && inventory.anyKnown() {
+		evidence := *effectiveFile
+		carry := carriedInventorySourceV3{file: &evidence}
+		if inventory.audioKnown {
+			evidence.AudioTracks = inventory.audio
+		}
+		if inventory.subtitleKnown {
+			// The live row is the uncooked source for path/container identity the
+			// wire inventory omits; mismatching tracks keep the plan-derived values
+			// so the fingerprint still reports drift. The downloaded tail has no
+			// file-shaped form and is carried beside the evidence.
+			evidence.ExternalSubtitles, evidence.SubtitleTracks, carry.downloaded = subtitleLayoutFromPlanInventoryV3(inventory.subtitleItems, effectiveFile)
+			carry.downloadedKnown = true
+		}
+		return carry
+	}
+	if session == nil || !session.VirtualSubtitleEvidenceSet {
+		return carriedInventorySourceV3{file: effectiveFile}
 	}
 	if !isVirtualPlaybackFile(effectiveFile) {
-		return effectiveFile
+		return carriedInventorySourceV3{file: effectiveFile}
 	}
 	evidence := *effectiveFile
 	evidence.AudioTracks = session.VirtualAudioTracks
 	evidence.SubtitleTracks = session.VirtualSubtitleTracks
 	evidence.ExternalSubtitles = session.VirtualExternalSubtitles
-	return &evidence
+	return carriedInventorySourceV3{file: &evidence}
 }
 
 // virtualCandidateRotationRecordedV3 reports whether the session recorded a
@@ -12939,22 +13102,84 @@ func remapAudioSelectionV3(source, target *models.MediaFile, request *playback.S
 	return nil
 }
 
+// carriedAudioSourceV3 loads the inventory the carried audio identity was
+// minted against. The identity is file-bound: its embedded row is the effective
+// row the previous plan selected on, which is the inventory the ordinal names.
+// Evidence is therefore keyed by that source row, not by the target, because a
+// version switch has a different target by definition and keying on it would
+// never find the evidence that makes the carry safe. A predecessor attempt
+// names the evidence durably; otherwise the uniquely matching live session on
+// this replica carries it. Evidence from either source is what lets a same-row
+// id be remapped when enrichment re-probed that row in place (same id, different
+// release) instead of trusting a stale ordinal.
+func (h *PlaybackHandler) carriedAudioSourceV3(ctx context.Context, req *playback.StartRequestV3, target *models.MediaFile, userID int, profileID, clientIP, userAgent string) *models.MediaFile {
+	if req == nil || target == nil {
+		return nil
+	}
+	srcID, kind, _, ok := playback.ParseTrackIDV3(strings.TrimSpace(req.CarriedAudioTrackID))
+	if !ok || kind != "audio" || srcID <= 0 {
+		return nil
+	}
+	if predecessorID := strings.TrimSpace(req.PreviousPlaybackAttemptID); predecessorID != "" && h.PlanStoreV3 != nil {
+		record, err := h.PlanStoreV3.GetAttemptByPlaybackAttemptID(ctx, predecessorID)
+		if err == nil && record != nil && record.UserID == userID && record.ProfileID == profileID &&
+			record.EffectiveMediaFileID == srcID {
+			source := &models.MediaFile{ID: srcID, AudioTracks: audioTracksFromInventoryV3(record.CurrentPlan.AudioTracks)}
+			if len(source.AudioTracks) > 0 {
+				return source
+			}
+		}
+	}
+	lister, ok := h.sessionMgr.(interface {
+		GetUserSessions(userID int) []*playback.Session
+	})
+	if !ok {
+		return nil
+	}
+	previous := findCarryCandidateSessionV3(lister.GetUserSessions(userID), profileID, srcID, clientIP, userAgent)
+	if previous == nil || previous.MediaFileID != srcID {
+		// A session matched only through its requested row carries the effective
+		// candidate's tracks, which are not the inventory srcID names. Leave the
+		// catalog row to resolve it rather than mislabeling another layout.
+		return nil
+	}
+	source := &models.MediaFile{ID: srcID, AudioTracks: h.previousAudioTracksV3(ctx, previous)}
+	if len(source.AudioTracks) == 0 {
+		return nil
+	}
+	return source
+}
+
 // resolveCarriedAudioTrackV3 re-resolves the viewer's audio selection from a
 // previous version onto the requested file. The carried identity is file-bound,
 // so its ordinal is remapped by codec/language family (MatchAudioTrackAcrossVersions),
-// not by raw position, which is unstable across encodes. Falls back (ok=false)
-// to the server's preference when the source version is gone or the identity
-// cannot be parsed; the caller keeps its already-resolved index, so a stale
-// carried selection degrades rather than terminating.
-func (h *PlaybackHandler) resolveCarriedAudioTrackV3(ctx context.Context, carriedID string, target *models.MediaFile) (int, bool) {
+// not by raw position, which is unstable across encodes. A same-row id is only
+// reused directly when the source evidence still describes the target's layout:
+// enrichment can re-probe the row in place, and row-id equality alone would then
+// apply the old ordinal to a different release. A remapped index is only a hit
+// when the matched track still carries a concrete language the selection named.
+// MatchAudioTrackAcrossVersions deliberately falls back to the target's default
+// when no equivalent exists; reporting that as a successful carry would play
+// another language under the viewer's explicit choice with no degradation
+// warning. Falls back (ok=false) to the server's preference when the source
+// version is gone, the identity cannot be parsed, or no equivalent exists; the
+// caller keeps its already-resolved index, so a stale carried selection degrades
+// rather than terminating.
+func (h *PlaybackHandler) resolveCarriedAudioTrackV3(ctx context.Context, carriedID string, target *models.MediaFile, source *models.MediaFile) (int, bool) {
 	srcID, kind, ordinal, ok := playback.ParseTrackIDV3(carriedID)
 	if !ok || kind != "audio" || target == nil {
 		slog.InfoContext(ctx, "carried audio selection is invalid for the effective file; using resolved track",
 			"component", "playback", "carried_track_id", carriedID)
 		return 0, false
 	}
+	if source != nil && source.ID == srcID && len(source.AudioTracks) > 0 {
+		if srcID == target.ID && playback.AudioLayoutsEqual(source.AudioTracks, target.AudioTracks) {
+			return normalizeAudioTrackIndex(target, ordinal), true
+		}
+		return carriedAudioMatchV3(ctx, source.AudioTracks, target, ordinal, srcID)
+	}
 	if srcID == target.ID {
-		// Same file: the ordinal is directly usable (normalize bounds).
+		// No generation evidence: keep the legacy ordinal reuse.
 		return normalizeAudioTrackIndex(target, ordinal), true
 	}
 	if h.fileResolver == nil {
@@ -12962,13 +13187,33 @@ func (h *PlaybackHandler) resolveCarriedAudioTrackV3(ctx context.Context, carrie
 			"component", "playback", "carried_file_id", srcID, "target_file_id", target.ID)
 		return 0, false
 	}
-	source, err := h.fileResolver.GetByID(ctx, srcID)
-	if err != nil || source == nil {
+	sourceRow, err := h.fileResolver.GetByID(ctx, srcID)
+	if err != nil || sourceRow == nil {
 		slog.InfoContext(ctx, "carried audio source version could not be loaded; using resolved track",
 			"component", "playback", "carried_file_id", srcID, "target_file_id", target.ID)
 		return 0, false
 	}
-	return playback.MatchAudioTrackAcrossVersions(source.AudioTracks, target.AudioTracks, ordinal), true
+	return carriedAudioMatchV3(ctx, sourceRow.AudioTracks, target, ordinal, srcID)
+}
+
+// carriedAudioMatchV3 maps a carried ordinal onto target and verifies the result
+// still names the selection's concrete language. An out-of-range ordinal or an
+// unverifiable target inventory is a miss, not a silent default.
+func carriedAudioMatchV3(ctx context.Context, source []models.AudioTrack, target *models.MediaFile, ordinal, srcID int) (int, bool) {
+	if ordinal < 0 || ordinal >= len(source) || target == nil || len(target.AudioTracks) == 0 {
+		slog.InfoContext(ctx, "carried audio selection has no equivalent on the effective file; using resolved track",
+			"component", "playback", "carried_file_id", srcID, "target_file_id", target.ID, "carried_audio_index", ordinal)
+		return 0, false
+	}
+	index := playback.MatchAudioTrackAcrossVersions(source, target.AudioTracks, ordinal)
+	if index < 0 || index >= len(target.AudioTracks) ||
+		!fallbackAudioCarryMatchesV3(source[ordinal], target.AudioTracks[index]) {
+		slog.InfoContext(ctx, "carried audio selection has no equivalent on the effective file; using resolved track",
+			"component", "playback", "carried_file_id", srcID, "target_file_id", target.ID,
+			"carried_audio_index", ordinal, "matched_audio_index", index)
+		return 0, false
+	}
+	return index, true
 }
 
 // errSubtitleUnavailableInTargetV3 reports that the target media file has no
@@ -12980,6 +13225,15 @@ func (h *PlaybackHandler) resolveCarriedAudioTrackV3(ctx context.Context, carrie
 var errSubtitleUnavailableInTargetV3 = errors.New("no equivalent subtitle track in the target file version")
 
 func (h *PlaybackHandler) remapSubtitleSelectionV3(ctx context.Context, source, target *models.MediaFile, request *playback.StartRequestV3) (bool, error) {
+	return h.remapSubtitleSelectionWithCarryV3(ctx, carriedInventorySourceV3{file: source}, target, request)
+}
+
+// remapSubtitleSelectionWithCarryV3 is remapSubtitleSelectionV3 with the
+// inventory's captured downloaded tail. That segment has no models.MediaFile
+// representation, so a file-shaped source cannot prove an ordinal in it still
+// names the same downloaded row; the carry can.
+func (h *PlaybackHandler) remapSubtitleSelectionWithCarryV3(ctx context.Context, carry carriedInventorySourceV3, target *models.MediaFile, request *playback.StartRequestV3) (bool, error) {
+	source := carry.file
 	if request == nil || source == nil || target == nil {
 		return false, nil
 	}
@@ -12995,9 +13249,21 @@ func (h *PlaybackHandler) remapSubtitleSelectionV3(ctx context.Context, source, 
 	// place (same id, different release), so a fingerprint match — not id
 	// equality — decides whether the carried ordinal still names the same
 	// track. When the inventory differs, the selection remaps by
-	// language/format/forced/HI exactly like an edition switch.
+	// language/format/forced/HI exactly like an edition switch. The downloaded
+	// tail is not part of that fingerprint, so a carried downloaded ordinal is
+	// re-checked against the captured rows even when the file-shaped
+	// inventories compare equal.
 	if source.ID == target.ID && sameSubtitleInventoryV3(source, target) {
-		return false, nil
+		if !carry.namesDownloadedSubtitleV3(request) {
+			return false, nil
+		}
+		changed, tailErr := h.downloadedTailChangedV3(ctx, carry, target)
+		if tailErr != nil {
+			return false, fmt.Errorf("load downloaded subtitles: %w", tailErr)
+		}
+		if !changed {
+			return false, nil
+		}
 	}
 	// A source with no subtitle inventory has nothing to remap FROM. That is
 	// either a virtual parent row (virtual://movie/ttNNNN with no result= param)
@@ -13010,7 +13276,12 @@ func (h *PlaybackHandler) remapSubtitleSelectionV3(ctx context.Context, source, 
 	// resolveV3AudioIndex's graceful empty-tracks fallback.
 	if len(source.ExternalSubtitles) == 0 && len(source.SubtitleTracks) == 0 {
 		noDownloaded := h.SubtitleRepo == nil
-		if !noDownloaded {
+		if carry.downloadedKnown {
+			// The captured tail is the authority for an inventory the file
+			// cannot describe; the live list may have changed since it was
+			// published.
+			noDownloaded = len(carry.downloaded) == 0
+		} else if !noDownloaded {
 			downloaded, err := h.SubtitleRepo.ListDownloadedSubtitles(ctx, source.ID)
 			if err != nil {
 				// A failed lookup says nothing about whether the track exists;
@@ -13063,68 +13334,14 @@ func (h *PlaybackHandler) remapSubtitleSelectionV3(ctx context.Context, source, 
 	var wantForced, wantHearingImpaired bool
 	switch sourceLocation.source {
 	case playback.SubtitleSourceExternalV3:
-		wanted := source.ExternalSubtitles[sourceLocation.offset]
-		wantLanguage, wantTitle, wantForced, wantHearingImpaired = wanted.Language, displayedSubtitleTitleV3(wanted.Title, wanted.EmbeddedTitle), wanted.Forced, wanted.HearingImpaired
-		for candidateIndex, candidate := range target.ExternalSubtitles {
-			if !strings.EqualFold(candidate.Language, wanted.Language) || !strings.EqualFold(candidate.Format, wanted.Format) || candidate.Forced != wanted.Forced || candidate.HearingImpaired != wanted.HearingImpaired {
-				continue
-			}
-			if published, mapped := playback.SubtitleInventoryOwnPublishedIndexV3(target, candidateIndex); mapped {
-				targetIndex = published
-				break
-			}
-		}
+		targetIndex, wantLanguage, wantTitle, wantForced, wantHearingImpaired = remapExternalSubtitleIndexV3(source, target, sourceLocation)
 	case playback.SubtitleSourceEmbeddedV3:
-		wanted := source.SubtitleTracks[sourceLocation.offset]
-		wantLanguage, wantTitle, wantForced, wantHearingImpaired = wanted.Language, displayedSubtitleTitleV3(wanted.Title, wanted.EmbeddedTitle), wanted.Forced, wanted.HearingImpaired
-		for candidateIndex, candidate := range target.SubtitleTracks {
-			if !strings.EqualFold(candidate.Language, wanted.Language) || !strings.EqualFold(candidate.Codec, wanted.Codec) || candidate.Forced != wanted.Forced || candidate.HearingImpaired != wanted.HearingImpaired {
-				continue
-			}
-			if published, mapped := playback.SubtitleInventoryOwnPublishedIndexV3(target, len(target.ExternalSubtitles)+candidateIndex); mapped {
-				targetIndex = published
-				break
-			}
-		}
+		targetIndex, wantLanguage, wantTitle, wantForced, wantHearingImpaired = remapEmbeddedSubtitleIndexV3(source, target, sourceLocation)
 	default:
-		if h.SubtitleRepo != nil {
-			sourceDownloaded, sourceErr := h.SubtitleRepo.ListDownloadedSubtitles(ctx, source.ID)
-			targetDownloaded, targetErr := h.SubtitleRepo.ListDownloadedSubtitles(ctx, target.ID)
-			if err := errors.Join(sourceErr, targetErr); err != nil {
-				// A failed lookup says nothing about whether the track exists;
-				// dropping the selection here would store subtitles-off for the
-				// rest of the session over a transient error.
-				return false, fmt.Errorf("load downloaded subtitles: %w", wrapSubtitleStoreErrorV3(err))
-			}
-			downloadedIndex := sourceLocation.offset
-			if downloadedIndex >= 0 && downloadedIndex < len(sourceDownloaded) {
-				wanted := sourceDownloaded[downloadedIndex]
-				base := len(playback.BuildSubtitleInventoryV3(target, nil))
-				// The stable downloaded-subtitle row id (carried in the plan
-				// inventory) is the only reliable identity here. Virtual rows
-				// persist release_name as "" (see ReplaceVirtualCandidates and
-				// upsertVirtualFileVariant), so two same-language/format
-				// downloaded tracks are indistinguishable by ReleaseName and a
-				// first-match scan would collapse them onto one target row.
-				// Resolve the id first, then fall back to the historical
-				// language/format/ReleaseName match for rows that carry no id.
-				if wanted.ID > 0 {
-					for candidateIndex, candidate := range targetDownloaded {
-						if candidate.ID == wanted.ID {
-							targetIndex = base + candidateIndex
-							break
-						}
-					}
-				}
-				if targetIndex < 0 {
-					for candidateIndex, candidate := range targetDownloaded {
-						if strings.EqualFold(candidate.Language, wanted.Language) && strings.EqualFold(string(candidate.Format), string(wanted.Format)) && strings.EqualFold(candidate.ReleaseName, wanted.ReleaseName) {
-							targetIndex = base + candidateIndex
-							break
-						}
-					}
-				}
-			}
+		var remapErr error
+		targetIndex, remapErr = h.remapDownloadedSubtitleIndexV3(ctx, carry, target, sourceLocation.offset)
+		if remapErr != nil {
+			return false, remapErr
 		}
 	}
 	if targetIndex < 0 && wantLanguage != "" {
@@ -13148,6 +13365,155 @@ func (h *PlaybackHandler) remapSubtitleSelectionV3(ctx context.Context, source, 
 	request.SubtitleTrackIndex = &targetIndex
 	request.SubtitleTrackID = playback.TrackIDV3(target.ID, "subtitle", targetIndex)
 	return false, nil
+}
+
+// remapExternalSubtitleIndexV3 returns the target's published ordinal for the
+// external track location names, plus the selection identity the cross-format
+// fallback needs. Language/format/flags can name several physical tracks (two
+// sidecars for one language). Prefer the one whose displayed title the viewer
+// selected; otherwise keep the first identity match as the historical fallback
+// rather than reporting a miss.
+func remapExternalSubtitleIndexV3(source, target *models.MediaFile, location subtitleIndexLocationV3) (targetIndex int, language, title string, forced, hearingImpaired bool) {
+	wanted := source.ExternalSubtitles[location.offset]
+	language = wanted.Language
+	title = displayedSubtitleTitleV3(wanted.Title, wanted.EmbeddedTitle)
+	forced, hearingImpaired = wanted.Forced, wanted.HearingImpaired
+	fallback := -1
+	for candidateIndex, candidate := range target.ExternalSubtitles {
+		if !strings.EqualFold(candidate.Language, wanted.Language) || !strings.EqualFold(candidate.Format, wanted.Format) || candidate.Forced != wanted.Forced || candidate.HearingImpaired != wanted.HearingImpaired {
+			continue
+		}
+		published, mapped := playback.SubtitleInventoryOwnPublishedIndexV3(target, candidateIndex)
+		if !mapped {
+			continue
+		}
+		if subtitleRemapTitleMatchesV3(title, displayedSubtitleTitleV3(candidate.Title, candidate.EmbeddedTitle)) {
+			return published, language, title, forced, hearingImpaired
+		}
+		if fallback < 0 {
+			fallback = published
+		}
+	}
+	return fallback, language, title, forced, hearingImpaired
+}
+
+// remapEmbeddedSubtitleIndexV3 is the embedded counterpart of
+// remapExternalSubtitleIndexV3.
+func remapEmbeddedSubtitleIndexV3(source, target *models.MediaFile, location subtitleIndexLocationV3) (targetIndex int, language, title string, forced, hearingImpaired bool) {
+	wanted := source.SubtitleTracks[location.offset]
+	language = wanted.Language
+	title = displayedSubtitleTitleV3(wanted.Title, wanted.EmbeddedTitle)
+	forced, hearingImpaired = wanted.Forced, wanted.HearingImpaired
+	fallback := -1
+	for candidateIndex, candidate := range target.SubtitleTracks {
+		if !strings.EqualFold(candidate.Language, wanted.Language) || !strings.EqualFold(candidate.Codec, wanted.Codec) || candidate.Forced != wanted.Forced || candidate.HearingImpaired != wanted.HearingImpaired {
+			continue
+		}
+		published, mapped := playback.SubtitleInventoryOwnPublishedIndexV3(target, len(target.ExternalSubtitles)+candidateIndex)
+		if !mapped {
+			continue
+		}
+		if subtitleRemapTitleMatchesV3(title, displayedSubtitleTitleV3(candidate.Title, candidate.EmbeddedTitle)) {
+			return published, language, title, forced, hearingImpaired
+		}
+		if fallback < 0 {
+			fallback = published
+		}
+	}
+	return fallback, language, title, forced, hearingImpaired
+}
+
+// remapDownloadedSubtitleIndexV3 maps a downloaded-subtitle ordinal from the
+// carry source onto target and returns the target's published combined ordinal,
+// or -1 when no equivalent exists. The published position is only a menu
+// ordinal: a row added, removed, or reordered ahead of it moves every ordinal
+// after it without changing the row the viewer picked, so a captured inventory
+// is resolved by its stable subtitle row instead.
+func (h *PlaybackHandler) remapDownloadedSubtitleIndexV3(ctx context.Context, carry carriedInventorySourceV3, target *models.MediaFile, downloadedIndex int) (int, error) {
+	if downloadedIndex < 0 {
+		return -1, nil
+	}
+	if carry.downloadedKnown {
+		return h.capturedDownloadedSubtitleIndexV3(ctx, carry, target, downloadedIndex)
+	}
+	// Evidence that predates the captured tail falls back to the historic match
+	// against the live repository lists of the two rows.
+	return h.remapDownloadedSubtitleFromLiveSourceV3(ctx, carry.file, target, downloadedIndex)
+}
+
+// capturedDownloadedSubtitleIndexV3 resolves a downloaded ordinal against the
+// stable subtitle row id the plan published, not against whatever occupies its
+// old position today.
+func (h *PlaybackHandler) capturedDownloadedSubtitleIndexV3(ctx context.Context, carry carriedInventorySourceV3, target *models.MediaFile, downloadedIndex int) (int, error) {
+	if downloadedIndex >= len(carry.downloaded) {
+		return -1, nil
+	}
+	id := downloadedSubtitleCarryIDV3(carry.downloaded[downloadedIndex])
+	if id <= 0 {
+		// The captured item carries no durable identity (it predates the row id
+		// or its format has no sync key). The live source row is then the only
+		// identity available.
+		return h.remapDownloadedSubtitleFromLiveSourceV3(ctx, carry.file, target, downloadedIndex)
+	}
+	targetDownloaded, err := h.listDownloadedSubtitlesV3(ctx, target)
+	if err != nil {
+		return -1, fmt.Errorf("load downloaded subtitles: %w", err)
+	}
+	base := len(playback.BuildSubtitleInventoryV3(target, nil))
+	for candidateIndex, candidate := range targetDownloaded {
+		if candidate.DownloadedSubtitleID == id {
+			return base + candidateIndex, nil
+		}
+	}
+	// A downloaded row is file-bound, so a version switch never carries the id
+	// itself. Keep the viewer's language and format then — never the old
+	// position, which is what a reordered list rewrites onto another row.
+	wanted := carry.downloaded[downloadedIndex]
+	for candidateIndex, candidate := range targetDownloaded {
+		if strings.EqualFold(candidate.Language, wanted.Language) && strings.EqualFold(candidate.Codec, wanted.Codec) {
+			return base + candidateIndex, nil
+		}
+	}
+	return -1, nil
+}
+
+// remapDownloadedSubtitleFromLiveSourceV3 is the historic downloaded-subtitle
+// identity match against the repository lists of source and target. Virtual
+// rows persist release_name as "" (see ReplaceVirtualCandidates and
+// upsertVirtualFileVariant), so two same-language/format downloaded tracks are
+// indistinguishable by ReleaseName and a first-match scan would collapse them
+// onto one target row; the row id is resolved first, and the
+// language/format/ReleaseName match remains for rows that carry no id.
+func (h *PlaybackHandler) remapDownloadedSubtitleFromLiveSourceV3(ctx context.Context, source, target *models.MediaFile, downloadedIndex int) (int, error) {
+	if h.SubtitleRepo == nil || source == nil || target == nil {
+		return -1, nil
+	}
+	sourceDownloaded, sourceErr := h.SubtitleRepo.ListDownloadedSubtitles(ctx, source.ID)
+	targetDownloaded, targetErr := h.SubtitleRepo.ListDownloadedSubtitles(ctx, target.ID)
+	if err := errors.Join(sourceErr, targetErr); err != nil {
+		// A failed lookup says nothing about whether the track exists;
+		// dropping the selection here would store subtitles-off for the
+		// rest of the session over a transient error.
+		return -1, fmt.Errorf("load downloaded subtitles: %w", wrapSubtitleStoreErrorV3(err))
+	}
+	if downloadedIndex >= len(sourceDownloaded) {
+		return -1, nil
+	}
+	wanted := sourceDownloaded[downloadedIndex]
+	base := len(playback.BuildSubtitleInventoryV3(target, nil))
+	if wanted.ID > 0 {
+		for candidateIndex, candidate := range targetDownloaded {
+			if candidate.ID == wanted.ID {
+				return base + candidateIndex, nil
+			}
+		}
+	}
+	for candidateIndex, candidate := range targetDownloaded {
+		if strings.EqualFold(candidate.Language, wanted.Language) && strings.EqualFold(string(candidate.Format), string(wanted.Format)) && strings.EqualFold(candidate.ReleaseName, wanted.ReleaseName) {
+			return base + candidateIndex, nil
+		}
+	}
+	return -1, nil
 }
 
 // transportFailureClassificationsV3 are the client failure classifications
@@ -13554,6 +13920,18 @@ func displayedSubtitleTitleV3(title, embeddedTitle string) string {
 		return title
 	}
 	return embeddedTitle
+}
+
+// subtitleRemapTitleMatchesV3 is the tiebreak when a language/format/flags
+// match names more than one physical subtitle track. An untitled selection has
+// no title evidence and therefore accepts the first identity match, preserving
+// the historical behavior; a titled selection only prefers the track that
+// carries the same displayed title.
+func subtitleRemapTitleMatchesV3(want, got string) bool {
+	if strings.TrimSpace(want) == "" {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(want), strings.TrimSpace(got))
 }
 
 func subtitleVariantIndexV3(file *models.MediaFile, language, title string, forced, hearingImpaired bool) int {

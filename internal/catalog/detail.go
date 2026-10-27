@@ -4390,22 +4390,10 @@ func sortAudiobookMediaFiles(files []*models.MediaFile) {
 // support were scanned with an empty array; re-deriving it at read time keeps
 // the version flyout complete until the probe-version re-probe catches up.
 func ensureTrackLanguages(tracks []models.AudioTrack) []models.AudioTrack {
-	for i := range tracks {
-		track := &tracks[i]
-		if len(track.Languages) > 0 {
-			continue
-		}
-		if track.Language != "" && track.Language != "und" && track.Language != "mul" {
-			continue
-		}
-		if languages := lang.ParseLanguages(track.EmbeddedTitle); len(languages) > 0 {
-			track.Languages = languages
-			if track.Language == "" || track.Language == "und" || track.Language == "mul" {
-				track.Language = languages[0]
-			}
-		}
-	}
-	return tracks
+	// One implementation shared with the playback start path: the picker marker
+	// and the planner's audio selection must resolve MULTI/DUAL titles from the
+	// same backfilled language view.
+	return playback.BackfillAudioTrackLanguages(tracks)
 }
 
 // virtualMediaContainer is the container sentinel a provider-backed virtual

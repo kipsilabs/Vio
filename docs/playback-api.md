@@ -37,7 +37,29 @@ with. A client polls this endpoint (or consumes the realtime `source_committed`
 event) to follow the streamed version. The response's inventory is the committed
 release's own; a rotated session whose new release is not yet probed reports
 `inventory_status: declared` and that release's declared (possibly empty)
-tracks, never the previous release's.
+tracks, never the previous release's. When no catalog row names the bound
+candidate at all, the response falls back to the inventory the running plan
+carried for that binding instead of an empty placeholder, so the player's
+overlay menu still lists what the plan committed to; the catalog is not
+rewritten by that read. That overlay is served only while the session's
+evidence URI still names the bound candidate. Evidence captured before a
+binding rotation belongs to the previous release, so the response keeps the
+empty fail-closed placeholder rather than presenting the old tracks under the
+new identity.
+
+The downloaded/AI subtitle rows are an extension of the base inventory. If that
+extension cannot be read, the endpoint still answers `200` with the embedded and
+external tracks and reports `inventory_status: pending`, rather than failing the
+whole menu with `503`. Here `pending` means the base inventory is complete and
+only the extension is missing; it does not mean the base menu is unusable.
+Clients keep the current menu, honor the response `ETag` with `If-None-Match`,
+and retry with backoff: about 2 seconds for the first poll, backing off to at
+most one request every 20 seconds, and stopping on a terminal status or the
+realtime `inventory_updated` event. Do not busy-poll: while the subtitle store
+is unavailable the extension stays pending, and a tight loop only adds load. A
+later successful read includes the downloaded rows and reports a new
+`inventory_revision`, so a client holding the degraded menu can replace it
+instead of staying on `304 Not Modified`.
 
 ### Deferred track inventory
 
@@ -471,6 +493,38 @@ server carries nothing rather than guessing. The field is additive: older client
 that omit it keep the legacy behavior, and a client that always sends its own
 selection is unaffected.
 
+Selected track ids (`audio_track_id`, `subtitle_track_id`) embed the catalog row
+the plan minted them against, which is the plan's `effective_media_file_id` and
+can differ from the `file_id` a client re-sends on a restart. The server accepts
+an echoed id when the embedded row names the same virtual candidate, or when it
+is one of the same client's committed restart rows (the predecessor attempt's
+requested/effective row or the matching live session's rows), and re-keys it onto
+the row being validated. A row naming a different release is still treated as a
+stale selection and degrades to the default pipeline.
+
+Re-keying does not trust the carried ordinal positionally. Virtual resolution can
+serve a different candidate than the row the request names, and that candidate
+can order its tracks differently. The ordinal is therefore reused only when the
+served inventory matches the inventory the identity was minted against; a
+different inventory is re-identified by track identity (audio includes language,
+codec, layout and titles) or reported as an audio/subtitle-unavailable
+degradation warning instead of being applied to whichever track now occupies the
+old position. When the request names `previous_playback_attempt_id`, that
+attempt's captured plan inventory is the historical record even if the catalog
+row under the same id was re-probed since; the mutable row is never treated as
+proof of the old ordering. Without a predecessor id, the single matching live
+session's durable attempt plan is read the same way, including the downloaded
+subtitle tail a file-shaped inventory comparison cannot see. A downloaded
+ordinal whose historical inventory cannot be proven — no attempt row, no
+captured inventory, or a plan for another effective row — is cleared with the
+degradation warning instead of being reused by position. A track_change
+selection is minted against the current menu, so it is read through the
+inventory that published it, including when the identity names another accepted
+row, and then mapped onto the validated row without the predecessor ordering. A
+re-key that cannot read the subtitle evidence fails retryably instead of
+guessing from unverified evidence or leaving the old ordinal to land on another
+track.
+
 Client guidance for resume and restarts:
 
 - Send `start_position` when the player already knows where to begin, or omit it
@@ -683,6 +737,17 @@ handler can retry a cached copy or fail over to a sibling release first; that
 502 is what remains once failover is exhausted. Relays and other non-deferred
 paths answer it directly. Clients should treat it as retryable: retry or replan
 to another candidate rather than waiting for the stream to start.
+
+A transport failover that lands on a genuinely different release probes that
+replacement before starting it. The viewer's audio selection is re-identified on
+the replacement's inventory by the concrete language it carries (the same
+language-carriage rule a version switch uses); codec and channel layout may
+differ between releases and are not required to match. When no track carries
+that language, the fallback starts on the replacement's default and reports an
+audio-unavailable degradation warning instead of silently resetting. A subtitle
+selection has no cross-release identity matcher yet, so the fallback starts with
+subtitles off and logs the reset; the client keeps the requested subtitle
+identity in its own state and can reselect it from the replacement's inventory.
 
 A seek is one server operation. Issue a single media request for the new
 position; sending the same seek twice (or aborting and immediately re-sending an
