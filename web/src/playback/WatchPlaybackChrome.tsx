@@ -262,6 +262,20 @@ function playbackUnavailableMessage(error: Error): string {
   return error.message || "Item not found";
 }
 
+/**
+ * A direct watch URL names no row of its own, so the session falls back to the
+ * plan's default when the device's stored pick has left the catalog. The item
+ * page already treats that as pick-again; send the viewer there instead of
+ * silently playing a version they did not choose.
+ */
+function RequestedVersionMissingRedirect({ href }: { href: string }) {
+  const navigate = useViewTransitionNavigate();
+  useEffect(() => {
+    navigate(href, { replace: true });
+  }, [href, navigate]);
+  return null;
+}
+
 function PlaybackUnavailableScreen({ error, onBack }: { error: Error; onBack: () => void }) {
   return (
     <div className="bg-background fixed inset-0 z-50 flex items-center justify-center px-6">
@@ -1179,6 +1193,19 @@ function WatchPlaybackHostContent() {
   const requestedFileId = activeRequest
     ? readRequestedFileId(activeRequest.contentId, currentProfile?.id ?? null)
     : null;
+  // The URL names no row, the viewer picked one on this device, and the
+  // catalog no longer carries it. `selectFileId` would fall through to the
+  // plan's default, so return to the item page's pick-again state instead.
+  // A Watch Together room or an explicit `fileId` owns its selection.
+  const requestedVersionMissing =
+    activeRequest.fileId == null &&
+    activeRequest.roomId == null &&
+    requestedFileId != null &&
+    (activeItem.versions?.length ?? 0) > 0 &&
+    !activeItem.versions.some((version) => version.file_id === requestedFileId);
+  if (requestedVersionMissing) {
+    return <RequestedVersionMissingRedirect href={buildWatchItemHref(activeRequest)} />;
+  }
   const watchPageProps = buildWatchPageProps({
     request: activeRequest,
     item: itemForPlayer,
