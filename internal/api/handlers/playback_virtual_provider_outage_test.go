@@ -293,6 +293,7 @@ func TestVirtualProviderListingOutageClassification(t *testing.T) {
 		{"provider sentinel", provider502(), true},
 		{"empty listing", providerEmptyListing(), true},
 		{"trusted persisted absent", fmt.Errorf("no longer listed: %w", virtuallibrary.ErrPersistedCandidateTrusted), true},
+		{"title without streams", fmt.Errorf("resolve: %w", virtuallibrary.ErrTitleWithoutStreams), true},
 		{"session-bound absent renumber artifact", absentSessionPinError("pinned"), true},
 		{"nil", nil, false},
 		{"other", errors.New("boom"), false},

@@ -549,6 +549,9 @@ func (s *Service) ResolveDetailed(
 	if s == nil || s.Resolver == nil {
 		return ResolvedVirtualStream{}, ErrVirtualLibraryUnavailable
 	}
+	if s.emptyTitleMarked(virtualPath) {
+		return ResolvedVirtualStream{}, fmt.Errorf("%w: title %s", ErrTitleWithoutStreams, neutralVirtualPathKey(virtualPath))
+	}
 
 	parsedURI, parseErr := url.Parse(virtualPath)
 	resultID := ""
@@ -580,8 +583,10 @@ func (s *Service) ResolveDetailed(
 	}
 
 	if len(candidates) == 0 {
+		s.noteEmptyTitleListing(virtualPath)
 		return ResolvedVirtualStream{}, fmt.Errorf("no streams available from provider")
 	}
+	s.noteNonEmptyTitleListing(virtualPath)
 
 	// Rank through the same helper ListStreams uses, so the version list and
 	// the resolver agree on order and on the rejected verdict. Reject is
