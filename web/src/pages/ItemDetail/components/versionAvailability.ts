@@ -60,7 +60,9 @@ export function useVersionVisibility(
   }
 
   return useMemo(() => {
-    const alive = versions.filter((version) => !isVersionFailed(version) || version.file_id === activeFileId);
+    const alive = versions.filter(
+      (version) => !isVersionFailed(version) || version.file_id === activeFileId,
+    );
     const list = alive.length > 0 ? alive : versions;
     const unavailable = list.filter(isVersionUnavailable);
     const allUnavailable = unavailable.length > 0 && unavailable.length === list.length;

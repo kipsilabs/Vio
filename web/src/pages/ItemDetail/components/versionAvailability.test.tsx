@@ -221,7 +221,8 @@ describe("useVersionVisibility failed rows", () => {
   }
 
   const live = (id: number): FileVersion => makeVersion({ file_id: id });
-  const dead = (id: number): FileVersion => makeVersion({ file_id: id, available: false, failed: true });
+  const dead = (id: number): FileVersion =>
+    makeVersion({ file_id: id, available: false, failed: true });
   const stale = (id: number): FileVersion => makeVersion({ file_id: id, available: false });
 
   it("removes failed rows instead of hiding them behind the toggle", () => {
