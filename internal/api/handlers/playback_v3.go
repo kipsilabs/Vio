@@ -9616,6 +9616,11 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	// and the live session already serve. It suppresses the decision line so the
 	// entry point can answer it as an unchanged replan instead.
 	seekNoMovement := false
+	// seekSubtitleDegraded marks a seek reanchor whose carried subtitle no
+	// longer binds to the effective file. The seek still moves: a requested
+	// position outranks subtitle fidelity, so the replan drops the selection
+	// once and keeps video and audio intact.
+	seekSubtitleDegraded := false
 	seekFailureRecovery := operation == playback.ReplanOperationSeekFailureRecoveryV3
 	seekScopedRecovery := seekReanchor || seekFailureRecovery
 	// A seek reanchor must keep its route; every other replan first finds out
@@ -10688,9 +10693,24 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			// Keep the playing plan authoritative and let the viewer retry
 			// instead of reinterpreting the old ordinal on unverified evidence.
 			if errors.Is(rekeyErr, errSubtitleStoreUnavailableV3) {
-				return playback.DecisionResponseV3{}, *record, nil, subtitleArtifactErrorV3("Downloaded subtitles are temporarily unavailable.", rekeyErr)
+				if !seekReanchor {
+					return playback.DecisionResponseV3{}, *record, nil, subtitleArtifactErrorV3("Downloaded subtitles are temporarily unavailable.", rekeyErr)
+				}
+				// A seek must not terminal on a subtitle it cannot verify while
+				// the store is down. Drop the carried selection and keep moving
+				// at the requested position; the plan records the loss once.
+				start.SubtitleTrackID = ""
+				start.SubtitleTrackIndex = nil
+				replanSubtitleUnavailable = true
+				slog.InfoContext(r.Context(), "seek reanchor subtitle inventory is temporarily unavailable; continuing with subtitles off",
+					logComponentKey, "playback",
+					"session_id", record.SessionID,
+					"effective_file_id", effectiveFile.ID,
+					"error", logredact.SanitizeURLError(rekeyErr),
+				)
+			} else {
+				return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: trackUnavailableReasonV3, message: rekeyErr.Error()}
 			}
-			return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: trackUnavailableReasonV3, message: rekeyErr.Error()}
 		}
 		warnings, err := start.NormalizeAndValidate()
 		if err != nil {
@@ -10780,9 +10800,6 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			plannerSettings, plannerSettingsErr = h.plannerSettingsV3Result(r.Context())
 		}
 		if seekReanchor {
-			if err := h.validateFrozenSubtitleIdentityV3(r.Context(), effectiveFile, record.FrozenRecipe); err != nil {
-				return playback.DecisionResponseV3{}, *record, nil, subtitleArtifactErrorV3("The selected subtitle is no longer available at its frozen route.", err)
-			}
 			var frozenErr error
 			result, frozenErr = frozenSeekReanchorResultV3(record, req.PositionSeconds, time.Now())
 			if frozenErr != nil {
@@ -10791,6 +10808,24 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 					message:   "The active playback recipe cannot be reopened; start a new playback attempt.",
 					retryable: true,
 				}
+			}
+			// A carried subtitle that no longer binds to the effective file is
+			// not a reason to refuse the position: the file was substituted, the
+			// pick went stale, or its artifact moved. Drop the subtitle for this
+			// replan and keep moving with video and audio untouched. Only a
+			// recipe that cannot be replayed at all (the check above) stays
+			// terminal, because the stream itself cannot be reopened.
+			if replanSubtitleUnavailable || driftSubtitleUnavailable {
+				seekSubtitleDegraded = true
+			} else if err := h.validateFrozenSubtitleIdentityV3(r.Context(), effectiveFile, record.FrozenRecipe); err != nil {
+				seekSubtitleDegraded = true
+				slog.InfoContext(r.Context(), "seek reanchor subtitle no longer binds to the effective file; continuing with subtitles off",
+					logComponentKey, "playback",
+					"session_id", record.SessionID,
+					"requested_file_id", record.RequestedMediaFileID,
+					"effective_file_id", effectiveFile.ID,
+					"error", logredact.SanitizeURLError(err),
+				)
 			}
 			seekNoMovement = seekReanchorNoMovementV3(record, session, req.PositionSeconds)
 		} else {
@@ -11223,6 +11258,13 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	result.Plan.SessionID = session.ID
 	result.Plan.InventoryURL = "/api/v2/playback/" + session.ID + "/inventory"
 	artifactRecipe = record.FrozenRecipe
+	if seekReanchor && seekSubtitleDegraded {
+		// Replay the same route with the subtitle selection cleared. Clearing
+		// the subtitle identity off the frozen recipe too is what stops later
+		// seeks from re-checking a selection this attempt already dropped, so
+		// the warning and its log line are recorded once, not once per seek.
+		artifactRecipe = degradeSeekReanchorSubtitleV3(record.FrozenRecipe, &result)
+	}
 	if !seekReanchor {
 		frozenRecipe, frozenErr := h.freezeExecutableRecipeV3(r.Context(), effectiveFile, result)
 		if frozenErr != nil {
@@ -11241,10 +11283,53 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	// the feature beside WebVTT URLs.
 	artifactFeatures := replanSubtitleFeaturesV3(record, start.ClientFeatures)
 	if err := h.attachSubtitleArtifactV3(r.Context(), session.ID, effectiveFile, result.Plan, result.SubtitleTrackIndex, &artifactRecipe, artifactFeatures); err != nil {
-		return playback.DecisionResponseV3{}, *record, nil, subtitleArtifactErrorV3("Failed to prepare the selected subtitle artifact.", err)
+		if !seekReanchor {
+			return playback.DecisionResponseV3{}, *record, nil, subtitleArtifactErrorV3("Failed to prepare the selected subtitle artifact.", err)
+		}
+		// The subtitle artifact itself is missing, moved, or unreadable. A seek
+		// must still reach the requested position without it; only the
+		// selection is lost, and the plan reports that once.
+		slog.InfoContext(r.Context(), "seek reanchor subtitle artifact is unavailable; continuing with subtitles off",
+			logComponentKey, "playback",
+			"session_id", record.SessionID,
+			"requested_file_id", record.RequestedMediaFileID,
+			"effective_file_id", effectiveFile.ID,
+			"error", logredact.SanitizeURLError(err),
+		)
+		seekSubtitleDegraded = true
+		artifactRecipe = degradeSeekReanchorSubtitleV3(artifactRecipe, &result)
+		if retryErr := h.attachSubtitleArtifactV3(r.Context(), session.ID, effectiveFile, result.Plan, result.SubtitleTrackIndex, &artifactRecipe, artifactFeatures); retryErr != nil {
+			// The menu could not be republished from the current store. The
+			// plan is subtitles-off either way, so serve the position instead
+			// of failing the seek over an advisory inventory.
+			slog.WarnContext(r.Context(), "seek reanchor subtitle inventory could not be republished; continuing with subtitles off",
+				logComponentKey, "playback",
+				"session_id", record.SessionID,
+				"effective_file_id", effectiveFile.ID,
+				"error", logredact.SanitizeURLError(retryErr),
+			)
+		}
+	}
+	if seekSubtitleDegraded {
+		// The durable request must not keep a selection this seek dropped:
+		// later replans seed their carried tracks from it.
+		start.SubtitleTrackID = ""
+		start.SubtitleTrackIndex = nil
 	}
 	if seekReanchor {
-		if err := validateSeekReanchorPlanV3(record, result.Plan); err != nil {
+		// The route-identity guard proves the frozen route did not drift. A
+		// subtitle degrade is this replan's own, deliberate outcome, so compare
+		// against the same subtitles-off baseline on both sides: every other
+		// identity field must still match the running plan exactly.
+		validationRecord := record
+		if seekSubtitleDegraded {
+			baseline := *record
+			baselinePlan := record.CurrentPlan
+			clearPlanSubtitleV3(&baselinePlan)
+			baseline.CurrentPlan = baselinePlan
+			validationRecord = &baseline
+		}
+		if err := validateSeekReanchorPlanV3(validationRecord, result.Plan); err != nil {
 			changedFields := seekReanchorIdentityChangesV3(record, result.Plan)
 			slog.ErrorContext(r.Context(), "protocol v3 seek reanchor changed route identity",
 				"session", record.SessionID,
@@ -11412,8 +11497,11 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	updated.CurrentPlan = *result.Plan
 	// A seek reanchor that reuses the transport replays the durable recipe
 	// verbatim; a rebuilt seek or newly planned replan binds the frozen
-	// recipe to the final installed plan ID so ValidFor remains true.
-	if !seekReanchor || !transportReused {
+	// recipe to the final installed plan ID so ValidFor remains true. A seek
+	// that dropped its subtitle must rewrite the recipe even when the
+	// transport is reused, or the next seek re-validates the selection this
+	// attempt already dropped and warns again.
+	if !seekReanchor || !transportReused || seekSubtitleDegraded {
 		updated.FrozenRecipe = artifactRecipe
 	}
 	updated.NormalizedRequest = start
@@ -11747,6 +11835,77 @@ func (h *PlaybackHandler) validateFrozenSubtitleIdentityV3(ctx context.Context, 
 		return errors.New("the frozen subtitle identity is unrecognized")
 	}
 	return nil
+}
+
+// subtitleBurnInDecisionReasonV3 marks a plan encoded only because the selected
+// subtitle had to be rendered into the video. A seek that drops that subtitle
+// must not keep advertising the burn-in.
+const subtitleBurnInDecisionReasonV3 = "subtitle_burn_in_required"
+
+// subtitleBurnInWarningCodeV3 is the degradation warning a burn-in plan carries.
+const subtitleBurnInWarningCodeV3 = "subtitle_burn_in"
+
+// clearPlanSubtitleV3 publishes a plan as subtitles-off while keeping the
+// inventory it already carries, so the client menu survives the degrade. It
+// clears every part of the selection together — the decision, the selected
+// track identity, the subtitle claims, and burn-in evidence — because a plan
+// that says "off" next to a selected track or a rendered overlay is exactly the
+// stale pairing clients alias wrong.
+func clearPlanSubtitleV3(plan *playback.PlanV3) {
+	if plan == nil {
+		return
+	}
+	inventory := plan.Subtitle.Inventory
+	plan.Subtitle = playback.SubtitleDecisionV3{Mode: playback.SubtitleOffV3, Inventory: inventory}
+	plan.SelectedTracks.Subtitle = nil
+	plan.Claims.Subtitles = playback.SubtitleClaimsV3{}
+	// Rebuild rather than filter in place: the plan is a shallow copy of the
+	// durable record's plan, so an in-place delete would rewrite the record's
+	// warning slice through the shared backing array.
+	warnings := make([]playback.DegradationWarningV3, 0, len(plan.DegradationWarnings))
+	for _, warning := range plan.DegradationWarnings {
+		if warning.Code != subtitleBurnInWarningCodeV3 {
+			warnings = append(warnings, warning)
+		}
+	}
+	plan.DegradationWarnings = warnings
+	if plan.DecisionReason == subtitleBurnInDecisionReasonV3 {
+		plan.DecisionReason = "subtitle_unavailable"
+	}
+}
+
+// degradeSeekReanchorSubtitleV3 drops a seek reanchor's subtitle from the
+// replayed plan and its frozen recipe. A seek's requested position outranks
+// subtitle fidelity: when the carried selection cannot bind to the effective
+// file (a substituted release, a stale pick, or a missing artifact) the replan
+// continues with video and audio intact and records the existing
+// subtitle-unavailable warning once. The recipe's subtitle identity is cleared
+// with the plan so the same failure is not re-discovered on the next seek.
+func degradeSeekReanchorSubtitleV3(recipe playback.ExecutableRecipeV3, result *playback.PlannerResultV3) playback.ExecutableRecipeV3 {
+	recipe.SubtitleTrackIndex = -1
+	recipe.SubtitleTransportTrackIndex = -1
+	recipe.SubtitleBurnIn = false
+	recipe.SubtitleCodec = ""
+	recipe.SubtitleRendition = false
+	recipe.SubtitleSource = ""
+	recipe.ExternalSubtitlePath = ""
+	recipe.EmbeddedStreamIndex = 0
+	recipe.DownloadedSubtitleID = 0
+	if result == nil {
+		return recipe
+	}
+	result.SubtitleTrackIndex = -1
+	result.SubtitleTransportTrackIndex = -1
+	result.SubtitleBurnIn = false
+	result.SubtitleCodec = ""
+	result.SubtitleRendition = false
+	result.DownloadedSubtitleID = 0
+	if result.Plan == nil {
+		return recipe
+	}
+	clearPlanSubtitleV3(result.Plan)
+	appendStartWarningsV3(result, []playback.DegradationWarningV3{playback.SubtitleTrackUnavailableWarningV3()})
+	return recipe
 }
 
 func validateSeekRecoveryRequestV3(record *playback.AttemptRecordV3, req playback.ReplanRequestV3) error {
