@@ -172,6 +172,11 @@ export function AudioTrackMenu({
   // entry keeps its original inventory position so selection still names the
   // track the server has at that slot.
   const dedupedTracks = dedupeAudioTracks(tracks);
+  // Declared or pending rows are placeholders for the effective file, so they
+  // stay out of the menu until probe evidence lands. A terminal failure keeps
+  // the list under its explicit "discovery did not complete" notice instead of
+  // leaving the menu empty.
+  const displayedTracks = provisional && !failed ? [] : dedupedTracks;
 
   return (
     <div ref={menuRef} className="relative" onBlur={handleBlur}>
@@ -223,7 +228,7 @@ export function AudioTrackMenu({
           {dedupedTracks.length === 0 && !provisional && (
             <div className="px-3 py-2 text-xs text-white/40">No audio tracks available</div>
           )}
-          {dedupedTracks.map(({ track, index }) => {
+          {displayedTracks.map(({ track, index }) => {
             const descriptor = describeTrack(track, index);
             const isActive = index === activeIndex;
             return (

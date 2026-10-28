@@ -36,3 +36,26 @@ export function isInventoryProvisional(
   }
   return status === "declared";
 }
+
+/**
+ * Whether the player overlay's track rows are still placeholders rather than
+ * probe evidence for the effective file.
+ *
+ * `planProvisional` is the plan's own verdict from `isInventoryProvisional`.
+ * When it is false, rows can still be the catalog fallback the menus use before
+ * a plan publishes selectable inventory for the effective source. Those rows
+ * are pre-probe metadata, not evidence the file carries them, so they stay
+ * provisional until the session or plan publishes its own inventory.
+ *
+ * Empty rows are never stale data: they keep the final empty state even when
+ * the plan had to fall back, so the menu can say "No subtitles available"
+ * instead of spinning forever.
+ */
+export function isOverlayInventoryProvisional(
+  planProvisional: boolean,
+  publishedRows: boolean,
+  rowCount: number,
+): boolean {
+  if (planProvisional) return true;
+  return rowCount > 0 && !publishedRows;
+}
