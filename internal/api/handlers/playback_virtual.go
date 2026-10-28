@@ -6578,6 +6578,15 @@ func (h *PlaybackHandler) fallbackResolveStaleVirtualSource(
 		if !elig.allowsSibling() && !reconcileCollection {
 			return nil
 		}
+		// A cancelled request must stop the walk, not fail every remaining
+		// sibling: each resolve errors instantly on the dead context and the
+		// per-sibling lines below would turn one abandoned client into an
+		// ERROR storm.
+		if ctx.Err() != nil {
+			slog.InfoContext(ctx, "virtual stale fallback: walk abandoned, client gone",
+				"component", "api", "file_id", file.ID)
+			return nil
+		}
 		attempts++
 		if attempts > maxAttempts {
 			break
@@ -6750,11 +6759,21 @@ func (h *PlaybackHandler) fallbackResolveStaleVirtualSource(
 			// try other siblings while the catalog is unhealthy, and treating
 			// the unknown verdict as a dead candidate could substitute one the
 			// verdict system never cleared. Fail the whole fallback closed.
-			slog.ErrorContext(ctx, "virtual stale fallback: refusing to substitute while the candidate verdict is unknown",
+			// A cancelled scan is the client going away, not a server fault:
+			// do not page on it.
+			level := slog.LevelError
+			if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+				level = slog.LevelWarn
+			}
+			slog.Log(ctx, level, "virtual stale fallback: refusing to substitute while the candidate verdict is unknown",
 				"component", "api", "candidate", stream.URI, "error", err)
 			return nil
 		}
-		slog.ErrorContext(ctx, "virtual stale fallback: candidate failed", "component", "api", "candidate", stream.URI, "error", err)
+		level := slog.LevelError
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+			level = slog.LevelWarn
+		}
+		slog.Log(ctx, level, "virtual stale fallback: candidate failed", "component", "api", "candidate", stream.URI, "error", err)
 	}
 	return nil
 }
