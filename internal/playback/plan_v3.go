@@ -1321,6 +1321,29 @@ func planVideoTranscodeUnavailableV3(input PlannerInputV3, subtitle SubtitlePoli
 	return nil
 }
 
+// describeToneMapBlockerV3 names the first check that left the tone-map
+// recipe unavailable, in resolveToneMapRecipeV3 order, so an
+// hdr_transcode_unsupported terminal carries the actual missing piece
+// instead of a generic recipe claim.
+func describeToneMapBlockerV3(recipe resolvedToneMapRecipeV3) string {
+	if recipe.policy == tonemap.PolicyNone {
+		return "tone-mapping disabled by policy"
+	}
+	if recipe.resolution.Kind == "" {
+		return "unresolvable HDR source signal"
+	}
+	if recipe.hlsRegistry == nil {
+		return "no HLS video registry"
+	}
+	if !recipe.hlsRegistry.Available(TransformationHDRToSDRToneMapV3) {
+		return "registry lacks validated HDR-to-SDR transform"
+	}
+	if recipe.mode == "" {
+		return "no preferred tone-map mode for the policy and signal"
+	}
+	return "unknown tone-map blocker"
+}
+
 // resolveTranscodeVideoTargetV3 selects the transcode video codec and registry
 // for an available transcode route. It returns a terminal when the source or
 // toolchain rules the route out before any recipe is built.
@@ -1336,7 +1359,7 @@ func resolveTranscodeVideoTargetV3(input PlannerInputV3, source SourceDescriptor
 			result := terminalPlannerResultV3("subtitle_conversion_unsupported", "The selected subtitle must be burned into the video, but this HDR source cannot be re-encoded.", false)
 			return targetVideoSelectionV3{}, toneMapRecipe, &result
 		}
-		result := terminalPlannerResultV3(TerminalHDRTranscodeUnsupportedV3, "This HDR source requires video encoding, but no validated HDR-preserving or tone-map recipe is installed.", false)
+		result := terminalPlannerResultV3WithDetail(TerminalHDRTranscodeUnsupportedV3, "This HDR source requires video encoding, but no validated HDR-preserving or tone-map recipe is installed.", describeToneMapBlockerV3(toneMapRecipe), false)
 		return targetVideoSelectionV3{}, toneMapRecipe, &result
 	}
 	if is4KSourceV3(input.EffectiveFile, source) && !input.Settings.Allow4KTranscode {
