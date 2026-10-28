@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -8331,11 +8332,120 @@ func (h *PlaybackHandler) HandleReplanPlaybackV3(w http.ResponseWriter, r *http.
 	writeJSON(w, http.StatusOK, response)
 }
 
+// replanAnswerAuditV3 carries the facts the replan entry point needs to account
+// for an answer the decision log did not cover: the operation, the durable
+// attempt, and whether executeReplanV3 emitted the decision line. Every field
+// comes from a read the request already performs, so the answer line costs no
+// extra store round trip.
+type replanAnswerAuditV3 struct {
+	sessionID      string
+	operation      playback.ReplanOperationV3
+	record         *playback.AttemptRecordV3
+	decisionLogged bool
+	replayed       bool
+}
+
+type replanAnswerAuditContextKeyV3 struct{}
+
+func withReplanAnswerAuditV3(ctx context.Context, audit *replanAnswerAuditV3) context.Context {
+	return context.WithValue(ctx, replanAnswerAuditContextKeyV3{}, audit)
+}
+
+func markReplanDecisionLoggedV3(ctx context.Context) {
+	if audit, ok := ctx.Value(replanAnswerAuditContextKeyV3{}).(*replanAnswerAuditV3); ok && audit != nil {
+		audit.decisionLogged = true
+	}
+}
+
+// logReplanAnsweredUnchangedV3 emits the one line that accounts for a replan
+// response the decision log did not cover: an idempotent replay of a committed
+// decision, a seek that resolves to the position the plan already serves, or a
+// request refused before execution. Production saw 46 of 48 replan calls answer
+// 200 with no line at all, which made a client's seek loop impossible to
+// reconstruct from server logs alone.
+func logReplanAnsweredUnchangedV3(ctx context.Context, audit *replanAnswerAuditV3, response playback.DecisionResponseV3, err error, elapsed time.Duration) {
+	if audit == nil {
+		return
+	}
+	outcome := "no_change"
+	reason := "no_decision"
+	var status int
+	switch {
+	case err != nil:
+		outcome = "error"
+		reason = "internal_error"
+		var operationErr *PlaybackOperationError
+		if errors.As(err, &operationErr) {
+			reason = operationErr.Code
+			status = operationErr.Status
+		}
+	case response.Outcome == playback.OutcomeSeekNoMovementV3:
+		reason = string(playback.OutcomeSeekNoMovementV3)
+	case audit.replayed && response.PlaybackPlan != nil:
+		outcome = "plan"
+		reason = "idempotent_replay"
+	case audit.replayed && response.Terminal != nil:
+		outcome = "terminal"
+		reason = "idempotent_replay"
+	case response.Terminal != nil:
+		// A terminal executeReplanV3 chose but did not route through its
+		// decision line (the candidate-rotation exhaustion path).
+		outcome = "terminal"
+		reason = response.Terminal.Reason
+	case response.PlaybackPlan != nil:
+		outcome = "plan"
+		reason = "no_decision_logged"
+	}
+	decisionReason := ""
+	requestedFileID, effectiveFileID := 0, 0
+	if response.PlaybackPlan != nil {
+		decisionReason = response.PlaybackPlan.DecisionReason
+		requestedFileID = response.PlaybackPlan.RequestedMediaFileID
+		effectiveFileID = response.PlaybackPlan.EffectiveMediaFileID
+	}
+	if audit.record != nil {
+		if requestedFileID <= 0 {
+			requestedFileID = audit.record.RequestedMediaFileID
+		}
+		if effectiveFileID <= 0 {
+			effectiveFileID = audit.record.EffectiveMediaFileID
+		}
+	}
+	attrs := []any{
+		logComponentKey, "playback",
+		"outcome", outcome,
+		"reason", reason,
+		"decision_reason", decisionReason,
+		"operation", string(audit.operation),
+		"session_id", audit.sessionID,
+		"requested_file_id", requestedFileID,
+		"effective_file_id", effectiveFileID,
+		"duration_ms", elapsed.Milliseconds(),
+	}
+	if status != 0 {
+		attrs = append(attrs, "status", status)
+	}
+	slog.InfoContext(ctx, "playback replan answered unchanged", attrs...)
+}
+
 // replanPlaybackApplicationV3 is the replan application shared by the v1
 // handler and the v2 service seam: idempotent on replan_request_id + body
 // digest, serialized per session, and atomic between the durable plan and the
 // live transport. Errors are *PlaybackOperationError.
-func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID string, body []byte) (playback.DecisionResponseV3, error) {
+//
+// Exactly one decision line is emitted per response: executeReplanV3 logs
+// "playback replan decided" for a route it actually chose, and this entry point
+// logs "playback replan answered unchanged" for everything else.
+func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID string, body []byte) (response playback.DecisionResponseV3, err error) {
+	started := time.Now()
+	audit := &replanAnswerAuditV3{sessionID: sessionID}
+	r = r.WithContext(withReplanAnswerAuditV3(r.Context(), audit))
+	defer func() {
+		if audit.decisionLogged {
+			return
+		}
+		logReplanAnsweredUnchangedV3(r.Context(), audit, response, err, time.Since(started))
+	}()
 	userID := apimw.GetUserID(r.Context())
 	profileID := apimw.GetProfileID(r.Context())
 	if userID == 0 || profileID == "" {
@@ -8345,6 +8455,7 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 	if err := json.Unmarshal(body, &req); err != nil {
 		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusBadRequest, "bad_request", "Invalid replan request")
 	}
+	audit.operation = req.EffectiveOperation()
 	// Automatic marks a server-built reconciliation replan. It is internal
 	// provenance: a client that forges it would suppress preference
 	// persistence and impersonate reconciliation, so strip whatever the
@@ -8383,6 +8494,7 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 		}
 		return playback.DecisionResponseV3{}, replanSessionNotFoundV3()
 	}
+	audit.record = record
 	if record.UserID != userID || record.ProfileID != profileID {
 		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusForbidden, "forbidden", "Session belongs to another profile")
 	}
@@ -8440,6 +8552,7 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 		}
 		return playback.DecisionResponseV3{}, replanSessionNotFoundV3()
 	}
+	audit.record = record
 	// The durable attempt can outlive the in-memory session: a stop or an idle
 	// reap can land while this request waits on the replan slot and the
 	// per-session locks, between the pre-lock check and here. Re-check now so it
@@ -8491,6 +8604,7 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 		if !isNativeAPIV2(r.Context()) && replay.PlaybackPlan != nil {
 			replay.PlaybackPlan.DeliveryChange = nil
 		}
+		audit.replayed = true
 		return replay, nil
 	}
 	leaseCompleted := false
@@ -9498,6 +9612,10 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	start := record.NormalizedRequest
 	operation := req.EffectiveOperation()
 	seekReanchor := operation == playback.ReplanOperationSeekReanchorV3
+	// seekNoMovement marks a frozen seek that resolves to the timeline the plan
+	// and the live session already serve. It suppresses the decision line so the
+	// entry point can answer it as an unchanged replan instead.
+	seekNoMovement := false
 	seekFailureRecovery := operation == playback.ReplanOperationSeekFailureRecoveryV3
 	seekScopedRecovery := seekReanchor || seekFailureRecovery
 	// A seek reanchor must keep its route; every other replan first finds out
@@ -10674,6 +10792,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 					retryable: true,
 				}
 			}
+			seekNoMovement = seekReanchorNoMovementV3(record, session, req.PositionSeconds)
 		} else {
 			additional, inventoryErr := h.listDownloadedSubtitlesV3(r.Context(), effectiveFile)
 			if inventoryErr != nil && (trackChange || qualityChange) && selectsDownloadedSubtitleV3(effectiveFile, start) {
@@ -11017,6 +11136,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			"software_video_decode", forceSoftwareDecode,
 			"decode_failure_count", decodeFailureCount,
 		}, clientInfo.LogAttrs()...)...)
+		markReplanDecisionLoggedV3(r.Context())
 		return playback.NewTerminalResponseFromTerminalV3(result.Terminal), *record, nil, nil
 	}
 	// Surface the warnings from the merged start request's single
@@ -11094,7 +11214,10 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	if result.StickyDeliveryKept {
 		replanLogAttrs = append(replanLogAttrs, "sticky_delivery", result.Plan.Delivery)
 	}
-	slog.InfoContext(r.Context(), "playback replan decided", append(replanLogAttrs, clientInfo.LogAttrs()...)...)
+	if !seekNoMovement {
+		slog.InfoContext(r.Context(), "playback replan decided", append(replanLogAttrs, clientInfo.LogAttrs()...)...)
+		markReplanDecisionLoggedV3(r.Context())
+	}
 	mode = headerAuthenticatedMediaV3(start.ClientFeatures)
 	_, reservationHeld = h.sessionMgr.(replacementReservationCancellerV3)
 	result.Plan.SessionID = session.ID
@@ -11278,6 +11401,12 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		artifactRecipe.PlanID = result.Plan.PlanID
 	}
 	response := playback.DecisionResponseV3{ProtocolVersion: playback.ProtocolV3, ServerFeatures: serverFeaturesForRequestV3(r.Context()), Outcome: playback.OutcomePlayableV3, SessionID: session.ID, PlaybackPlan: result.Plan}
+	if seekNoMovement {
+		// The frozen rebuild is byte-identical to the route already playing:
+		// answer it explicitly so the client does not treat the same timeline as
+		// a fresh seek and snap back to it.
+		response.Outcome = playback.OutcomeSeekNoMovementV3
+	}
 	updated := *record
 	updated.CurrentPlanID = result.Plan.PlanID
 	updated.CurrentPlan = *result.Plan
@@ -11444,6 +11573,29 @@ func applyTransportToneMapModeV3(result *playback.PlannerResultV3, transport pre
 	if result != nil && transport.toneMapMode != "" {
 		result.ToneMapMode = transport.toneMapMode
 	}
+}
+
+// seekNoMovementToleranceSecondsV3 is the slack a seek target may differ from
+// the anchored position and still count as "already there". Sub-quarter-second
+// seeks are not visible to a viewer, and the client echoes the plan's own float.
+const seekNoMovementToleranceSecondsV3 = 0.25
+
+// seekReanchorNoMovementV3 reports whether a seek reanchor asks for the
+// position the durable plan and the live session are already serving, so the
+// frozen rebuild would hand back the same timeline and nothing would move.
+//
+// The plan anchor alone cannot answer this: after a viewer has watched past the
+// anchor, a deliberate rewind to that anchor is a real move. Requiring the live
+// position to match too keeps that rewind working while catching a repeated
+// seek to where playback already is.
+func seekReanchorNoMovementV3(record *playback.AttemptRecordV3, session *playback.Session, position float64) bool {
+	if record == nil {
+		return false
+	}
+	if math.Abs(record.CurrentPlan.Timeline.SourceStartSeconds-position) > seekNoMovementToleranceSecondsV3 {
+		return false
+	}
+	return session == nil || math.Abs(session.Position-position) <= seekNoMovementToleranceSecondsV3
 }
 
 func frozenSeekReanchorResultV3(record *playback.AttemptRecordV3, position float64, now time.Time) (playback.PlannerResultV3, error) {
