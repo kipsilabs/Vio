@@ -7,6 +7,7 @@ import {
   buildVersionStatusLabels,
   QualityMenu,
   REFRESH_VERSIONS_ERROR,
+  removeFailedVersions,
   type VersionInfo,
 } from "./QualityMenu";
 import type { PlayerIndexerRelease } from "../types";
@@ -891,4 +892,46 @@ it("keeps provider enrichment in the keyboard order before refresh and Auto", ()
   expect(screen.getAllByRole("menuitem", { name: /Refresh List/ })[0]).toHaveFocus();
   fireEvent.keyDown(document.activeElement!, { key: "ArrowDown" });
   expect(screen.getByRole("menuitemradio", { name: /Auto/ })).toHaveFocus();
+});
+
+describe("removeFailedVersions", () => {
+  const base: VersionInfo = {
+    fileId: 1,
+    label: "1080p",
+    isCurrentSource: false,
+    isRequestedSource: false,
+  };
+
+  it("removes failed rows while keeping playable ones", () => {
+    const rows = removeFailedVersions([
+      { ...base, fileId: 1 },
+      { ...base, fileId: 2, failed: true },
+      { ...base, fileId: 3 },
+    ]);
+    expect(rows.map((v) => v.fileId)).toEqual([1, 3]);
+  });
+
+  it("keeps the current source even when it failed", () => {
+    const rows = removeFailedVersions([
+      { ...base, fileId: 1, failed: true, isCurrentSource: true },
+      { ...base, fileId: 2 },
+    ]);
+    expect(rows.map((v) => v.fileId)).toEqual([1, 2]);
+  });
+
+  it("renders the full list instead of an empty menu when everything failed", () => {
+    const rows = removeFailedVersions([
+      { ...base, fileId: 1, failed: true },
+      { ...base, fileId: 2, failed: true },
+    ]);
+    expect(rows.map((v) => v.fileId)).toEqual([1, 2]);
+  });
+
+  it("leaves transiently unavailable rows alone", () => {
+    const rows = removeFailedVersions([
+      { ...base, fileId: 1, unavailable: true },
+      { ...base, fileId: 2 },
+    ]);
+    expect(rows.map((v) => v.fileId)).toEqual([1, 2]);
+  });
 });
