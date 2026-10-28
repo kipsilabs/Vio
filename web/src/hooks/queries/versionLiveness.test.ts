@@ -36,6 +36,7 @@ function makeVersion(overrides: Partial<FileVersion> = {}): FileVersion {
     bitrate: overrides.bitrate ?? 0,
     file_path: overrides.file_path,
     available: overrides.available,
+    failed: overrides.failed,
   };
 }
 
@@ -102,7 +103,7 @@ describe("chunkVirtualFileIds", () => {
 describe("mergeVersionLiveness", () => {
   it("marks a version unavailable from item metadata", () => {
     const versions = [makeVersion({ file_id: 1, available: false })];
-    expect(mergeVersionLiveness(versions, undefined).get(1)).toBe(false);
+    expect(mergeVersionLiveness(versions, undefined).get(1)?.available).toBe(false);
   });
 
   it("marks a version unavailable from a check result", () => {
@@ -110,7 +111,7 @@ describe("mergeVersionLiveness", () => {
     const merged = mergeVersionLiveness(versions, {
       results: [{ file_id: 1, available: false }],
     });
-    expect(merged.get(1)).toBe(false);
+    expect(merged.get(1)?.available).toBe(false);
   });
 
   it("keeps a version available when the check reports it so", () => {
@@ -118,7 +119,7 @@ describe("mergeVersionLiveness", () => {
     const merged = mergeVersionLiveness(versions, {
       results: [{ file_id: 1, available: true }],
     });
-    expect(merged.get(1)).toBe(true);
+    expect(merged.get(1)?.available).toBe(true);
   });
 
   it("recovers a version the metadata marked unavailable when the check reports it available", () => {
@@ -126,7 +127,7 @@ describe("mergeVersionLiveness", () => {
     const merged = mergeVersionLiveness(versions, {
       results: [{ file_id: 1, available: true }],
     });
-    expect(merged.get(1)).toBe(true);
+    expect(merged.get(1)?.available).toBe(true);
   });
 
   it("keeps a version unavailable when the check confirms the metadata", () => {
@@ -134,7 +135,7 @@ describe("mergeVersionLiveness", () => {
     const merged = mergeVersionLiveness(versions, {
       results: [{ file_id: 1, available: false }],
     });
-    expect(merged.get(1)).toBe(false);
+    expect(merged.get(1)?.available).toBe(false);
   });
 
   it("marks a version unavailable when the check reports it so despite metadata saying available", () => {
@@ -142,7 +143,7 @@ describe("mergeVersionLiveness", () => {
     const merged = mergeVersionLiveness(versions, {
       results: [{ file_id: 1, available: false }],
     });
-    expect(merged.get(1)).toBe(false);
+    expect(merged.get(1)?.available).toBe(false);
   });
 
   it("leaves virtual versions without a result unknown (absent from the map)", () => {
@@ -187,7 +188,7 @@ describe("useVersionLiveness", () => {
       wrapper: createWrapper(createQueryClient()),
     });
 
-    await waitFor(() => expect(result.current.get(2)).toBe(false));
+    await waitFor(() => expect(result.current.get(2)?.available).toBe(false));
 
     expect(mocks.api).toHaveBeenCalledTimes(1);
     expect(mocks.api).toHaveBeenCalledWith("/catalog/versions/check", {
@@ -195,7 +196,7 @@ describe("useVersionLiveness", () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ file_ids: [1, 2] }),
     });
-    expect(result.current.get(1)).toBe(true);
+    expect(result.current.get(1)?.available).toBe(true);
     expect(result.current.has(3)).toBe(false);
   });
 
@@ -215,11 +216,11 @@ describe("useVersionLiveness", () => {
       wrapper: createWrapper(createQueryClient()),
     });
 
-    await waitFor(() => expect(result.current.get(2)).toBe(false));
+    await waitFor(() => expect(result.current.get(2)?.available).toBe(false));
 
     // The check ran after the item snapshot, so its result wins: the version
     // the metadata marked unavailable is recovered.
-    expect(result.current.get(1)).toBe(true);
+    expect(result.current.get(1)?.available).toBe(true);
   });
 
   it("caches results across re-enables (no second request while fresh)", async () => {
@@ -235,13 +236,13 @@ describe("useVersionLiveness", () => {
       },
     );
 
-    await waitFor(() => expect(result.current.get(1)).toBe(false));
+    await waitFor(() => expect(result.current.get(1)?.available).toBe(false));
     expect(mocks.api).toHaveBeenCalledTimes(1);
 
     rerender({ enabled: false });
     rerender({ enabled: true });
 
-    await waitFor(() => expect(result.current.get(1)).toBe(false));
+    await waitFor(() => expect(result.current.get(1)?.available).toBe(false));
     expect(mocks.api).toHaveBeenCalledTimes(1);
   });
 });
@@ -253,8 +254,8 @@ describe("applyVersionAvailability", () => {
     const next = applyVersionAvailability(
       versions,
       new Map([
-        [1, false],
-        [2, true],
+        [1, { available: false }],
+        [2, { available: true }],
       ]),
     );
 
@@ -274,6 +275,49 @@ describe("applyVersionAvailability", () => {
   it("keeps the list identity when nothing changed", () => {
     const versions = [makeVersion({ file_id: 1, available: true })];
 
-    expect(applyVersionAvailability(versions, new Map([[1, true]]))).toBe(versions);
+    expect(applyVersionAvailability(versions, new Map([[1, { available: true }]]))).toBe(versions);
+  });
+});
+
+describe("mergeVersionLiveness failed verdicts", () => {
+  it("carries a failed flag from the check result", () => {
+    const versions = [makeVersion({ file_id: 1 })];
+    const merged = mergeVersionLiveness(versions, {
+      results: [{ file_id: 1, available: false, failed: true }],
+    });
+    expect(merged.get(1)).toEqual({ available: false, failed: true });
+  });
+
+  it("an available check clears a stale failed flag", () => {
+    const versions = [makeVersion({ file_id: 1, available: false, failed: true })];
+    const merged = mergeVersionLiveness(versions, {
+      results: [{ file_id: 1, available: true }],
+    });
+    expect(merged.get(1)).toEqual({ available: true, failed: undefined });
+  });
+});
+
+describe("applyVersionAvailability failed verdicts", () => {
+  it("stamps failed onto the row", () => {
+    const versions = [makeVersion({ file_id: 1 })];
+    const next = applyVersionAvailability(
+      versions,
+      new Map([[1, { available: false, failed: true }]]),
+    );
+    expect(next[0]?.available).toBe(false);
+    expect(next[0]?.failed).toBe(true);
+  });
+
+  it("clears failed when the check reports the row available", () => {
+    const versions = [makeVersion({ file_id: 1, available: false, failed: true })];
+    const next = applyVersionAvailability(versions, new Map([[1, { available: true }]]));
+    expect(next[0]?.available).toBe(true);
+    expect(next[0]?.failed).toBe(false);
+  });
+
+  it("keeps a prior failed flag on an unavailable verdict without one", () => {
+    const versions = [makeVersion({ file_id: 1, available: false, failed: true })];
+    const next = applyVersionAvailability(versions, new Map([[1, { available: false }]]));
+    expect(next[0]?.failed).toBe(true);
   });
 });

@@ -30,7 +30,10 @@ import {
 } from "../utils/resolveEffectiveVersion";
 import { VideoPlayer } from "./VideoPlayer";
 import { fetchWatchDetail } from "@/hooks/queries/items";
-import { applyVersionAvailability } from "@/hooks/queries/versionLiveness";
+import {
+  applyVersionAvailability,
+  type VersionLivenessVerdict,
+} from "@/hooks/queries/versionLiveness";
 import {
   awaitVirtualCandidatesRefresh,
   cancelVirtualCandidatesRefresh,
@@ -299,7 +302,7 @@ const EMPTY_PLAYBACK_VARIANTS: PlayerPlaybackVariant[] = [];
 // The liveness verdicts are optional so WatchPage can render without the
 // item-page check (watch-party tests, standalone renders). An empty map leaves
 // every row's own metadata flag untouched.
-const EMPTY_VERSION_LIVENESS = new Map<number, boolean>();
+const EMPTY_VERSION_LIVENESS = new Map<number, VersionLivenessVerdict>();
 
 function WatchPagePlayer({
   contentId,

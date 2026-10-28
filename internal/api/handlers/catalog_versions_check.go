@@ -39,6 +39,12 @@ type versionCheckRequest struct {
 type versionCheckResult struct {
 	FileID    int  `json:"file_id"`
 	Available bool `json:"available"`
+	// Failed is true when the row carries a durable failed verdict (either
+	// from before this round or stamped by it). Unlike available=false,
+	// which can mean a transient outage, failed means the release is
+	// confirmed unservable: menus remove the row instead of offering a
+	// retry-able pick.
+	Failed bool `json:"failed,omitempty"`
 }
 
 type versionCheckResponse struct {
@@ -170,10 +176,12 @@ func (h *CatalogResourceHandler) HandleCheckVersions(w http.ResponseWriter, r *h
 	}
 	results := make([]versionCheckResult, 0, len(final))
 	for _, outcome := range final {
+		stamped := false
 		if _, ok := stampByID[outcome.fileID]; ok {
 			h.stampVirtualCandidateFailed(ctx, outcome.fileID, outcome.file)
+			stamped = true
 		}
-		results = append(results, versionCheckResult{FileID: outcome.fileID, Available: outcome.available})
+		results = append(results, versionCheckResult{FileID: outcome.fileID, Available: outcome.available, Failed: versionCheckFailed(outcome, stamped)})
 	}
 
 	writeJSON(w, http.StatusOK, versionCheckResponse{Results: results})
@@ -189,6 +197,18 @@ func (h *CatalogResourceHandler) HandleCheckVersions(w http.ResponseWriter, r *h
 // Ambiguous provider errors (timeout, network, resolver not configured) leave
 // the stamp unchanged and report the row's current computed availability, so
 // a provider outage cannot mass-tag versions as dead.
+// versionCheckFailed reports whether a checked row carries a durable failed
+// verdict: either it entered the round already failed, or this round
+// stamped one. Title-empty and ambiguous outcomes never set it: only an
+// identity-grounded dead pin counts, so menus remove genuinely dead
+// releases without hiding rows that may recover on a fresh listing.
+func versionCheckFailed(outcome versionCheckOutcome, stamped bool) bool {
+	if stamped {
+		return true
+	}
+	return outcome.file != nil && outcome.file.FailedAt != nil
+}
+
 func (h *CatalogResourceHandler) checkVersion(ctx context.Context, fileID int) versionCheckOutcome {
 	outcome := versionCheckOutcome{fileID: fileID}
 	if h == nil || h.FileResolver == nil {
@@ -281,6 +301,17 @@ func (h *CatalogResourceHandler) checkVersion(ctx context.Context, fileID int) v
 		if _, hasIdentity := persistedVirtualIdentity(file); hasIdentity {
 			outcome.stamp = true
 		}
+		outcome.available = false
+		return outcome
+	}
+	if errors.Is(err, virtuallibrary.ErrTitleWithoutStreams) {
+		// The title is consecutively empty across more than one provider
+		// cache entry: there is nothing to resolve, so report the row
+		// unavailable without visiting the provider again. Never a stamp:
+		// this is a title-wide outage verdict, not evidence about the pin,
+		// and stamping it would brick the row for a day on a transient
+		// provider gap.
+		outcome.checked = true
 		outcome.available = false
 		return outcome
 	}

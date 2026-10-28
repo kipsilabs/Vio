@@ -55,6 +55,18 @@ export interface VersionInfo {
   unavailable?: boolean;
 }
 
+/**
+ * Confirmed-dead rows leave the version list instead of hiding behind the
+ * unavailable treatment: offering them again would only replay a known-dead
+ * release. The current source stays so a mid-playback verdict cannot yank
+ * the playing row, and an all-failed list still renders rather than an
+ * empty menu.
+ */
+export function removeFailedVersions(versions: VersionInfo[]): VersionInfo[] {
+  const alive = versions.filter((version) => !version.failed || version.isCurrentSource);
+  return alive.length > 0 ? alive : versions;
+}
+
 interface QualityMenuProps {
   options: QualityOption[];
   activeId: string;
@@ -149,10 +161,12 @@ export function QualityMenu({
   const effectiveCriteria = userCriteria.length > 0 ? userCriteria : serverRanking.criteria;
   const orderedVersions = useMemo(
     () =>
-      sortVersionsByCriteria(
-        versions ?? [],
-        effectiveCriteria,
-        (version) => version.sortable ?? {},
+      removeFailedVersions(
+        sortVersionsByCriteria(
+          versions ?? [],
+          effectiveCriteria,
+          (version) => version.sortable ?? {},
+        ),
       ),
     [versions, effectiveCriteria],
   );

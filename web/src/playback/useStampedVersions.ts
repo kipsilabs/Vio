@@ -3,6 +3,7 @@ import { useMemo } from "react";
 import {
   applyVersionAvailability,
   type VersionLivenessCandidate,
+  type VersionLivenessVerdict,
 } from "@/hooks/queries/versionLiveness";
 
 const EMPTY_VERSION_ROWS: never[] = [];
@@ -22,7 +23,7 @@ const EMPTY_VERSION_ROWS: never[] = [];
  */
 export function useStampedVersions<T extends VersionLivenessCandidate>(
   versions: readonly T[] | undefined,
-  liveness: Map<number, boolean>,
+  liveness: Map<number, VersionLivenessVerdict>,
 ): T[] {
   // `applyVersionAvailability` only reads (it maps to a new array), so the
   // readonly input is safe to pass through.

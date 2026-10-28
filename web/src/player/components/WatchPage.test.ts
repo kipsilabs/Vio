@@ -947,7 +947,7 @@ describe("WatchPage version list refresh", () => {
       createElement(WatchPage, {
         ...watchPageProps,
         versions: [firstVersion, secondVersion],
-        versionLiveness: new Map([[9, false]]),
+        versionLiveness: new Map([[9, { available: false }]]),
       }),
     );
 
@@ -2781,7 +2781,7 @@ describe("WatchPage realtime reconnect reconcile", () => {
       createElement(WatchPage, {
         ...watchPageProps,
         versions: [{ ...virtualVersion, available: false }],
-        versionLiveness: new Map([[7, false]]),
+        versionLiveness: new Map([[7, { available: false }]]),
       }),
     );
 
@@ -2900,7 +2900,7 @@ describe("WatchPage realtime reconnect reconcile", () => {
       createElement(WatchPage, {
         ...watchPageProps,
         versions: [{ ...firstVersion, resolution: "2160p" }],
-        versionLiveness: new Map([[9, false]]),
+        versionLiveness: new Map([[9, { available: false }]]),
       }),
     );
 

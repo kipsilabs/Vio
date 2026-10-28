@@ -16,6 +16,20 @@ export interface VersionLivenessCandidate {
   container?: string;
   file_path?: string;
   available?: boolean;
+  /** Durable failed verdict (confirmed unservable). Menus remove rows with
+   * this flag instead of offering them; absent means not failed. */
+  failed?: boolean;
+}
+
+/**
+ * A liveness verdict for one file: whether the version is currently
+ * servable, plus whether the server confirmed the row dead (durable failed
+ * verdict). A dead row never recovers without a fresh successful resolve;
+ * an unavailable row without the flag may be transient.
+ */
+export interface VersionLivenessVerdict {
+  available: boolean;
+  failed?: boolean;
 }
 
 /** Maximum file_ids per versions/check request. */
@@ -69,18 +83,18 @@ export function chunkVirtualFileIds(versions: VersionLivenessCandidate[]): numbe
 export function mergeVersionLiveness(
   versions: VersionLivenessCandidate[],
   results: VersionLivenessResponse | undefined,
-): Map<number, boolean> {
-  const availability = new Map<number, boolean>();
+): Map<number, VersionLivenessVerdict> {
+  const availability = new Map<number, VersionLivenessVerdict>();
   for (const version of versions) {
     if (version.available === false) {
-      availability.set(version.file_id, false);
+      availability.set(version.file_id, { available: false, failed: version.failed });
     }
   }
   for (const result of results?.results ?? []) {
     // The check ran after the item snapshot was fetched, so its result wins
     // for the file_ids it reports — including recovering a version the
     // metadata marked unavailable.
-    availability.set(result.file_id, result.available);
+    availability.set(result.file_id, { available: result.available, failed: result.failed });
   }
   return availability;
 }
@@ -95,7 +109,7 @@ export function mergeVersionLiveness(
 export function useVersionLiveness(
   versions: VersionLivenessCandidate[],
   enabled: boolean,
-): Map<number, boolean> {
+): Map<number, VersionLivenessVerdict> {
   const chunks = useMemo(() => chunkVirtualFileIds(versions), [versions]);
 
   const queryResults = useQueries({
@@ -131,16 +145,27 @@ export function useVersionLiveness(
  */
 export function applyVersionAvailability<T extends VersionLivenessCandidate>(
   versions: T[],
-  availability: Map<number, boolean>,
+  availability: Map<number, VersionLivenessVerdict>,
 ): T[] {
   let changed = false;
   const next = versions.map((version) => {
-    const available = availability.get(version.file_id);
-    if (available === undefined || version.available === available) {
+    const verdict = availability.get(version.file_id);
+    if (verdict === undefined) {
+      return version;
+    }
+    // A failed flag is only ever written when there is something to say: an
+    // explicit flag from the check, or clearing a stale one after a
+    // successful resolve. Rows that never carried the field keep their
+    // identity so downstream memoization does not churn.
+    let failed = verdict.failed;
+    if (failed === undefined) {
+      failed = verdict.available && version.failed === true ? false : version.failed;
+    }
+    if (version.available === verdict.available && version.failed === failed) {
       return version;
     }
     changed = true;
-    return { ...version, available };
+    return { ...version, available: verdict.available, failed };
   });
   return changed ? next : versions;
 }

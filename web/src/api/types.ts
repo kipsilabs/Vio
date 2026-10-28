@@ -929,6 +929,10 @@ export interface FileVersion {
    *  means the version is currently unavailable (e.g. the provider no longer
    *  serves it). Populated by the catalog versions/check endpoint. */
   available?: boolean;
+  /** True when the server confirmed this row dead (durable failed verdict):
+   *  menus remove the row instead of offering it. Absent means not failed;
+   *  an unavailable row without this flag may recover and stays listed. */
+  failed?: boolean;
   added_at?: string;
   edition_raw?: string;
   edition_key?: string;
@@ -989,6 +993,11 @@ export interface WatchIndexerRelease {
 export interface VersionLivenessResult {
   file_id: number;
   available: boolean;
+  /** True when the row carries a durable failed verdict (confirmed
+   * unservable), as opposed to a merely unavailable row that may recover.
+   * Menus remove failed rows instead of offering them. Absent means not
+   * failed. */
+  failed?: boolean;
 }
 
 export interface VersionLivenessResponse {
