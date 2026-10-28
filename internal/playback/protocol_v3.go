@@ -298,6 +298,13 @@ type DecisionOutcomeV3 string
 const (
 	OutcomePlayableV3              DecisionOutcomeV3 = "playable"
 	OutcomeAdaptationUnavailableV3 DecisionOutcomeV3 = "adaptation_unavailable"
+	// OutcomeSeekNoMovementV3 answers a seek_reanchor whose target is the
+	// position the durable plan and the live session already serve. It is not
+	// a refusal: the response still carries the current plan unchanged, but it
+	// tells the client that this seek has nowhere to move, so a player can
+	// stop re-anchoring the same timeline in a snap-back loop and report that
+	// the target is already playing.
+	OutcomeSeekNoMovementV3 DecisionOutcomeV3 = "seek_no_movement"
 )
 
 type DeliveryV3 string
