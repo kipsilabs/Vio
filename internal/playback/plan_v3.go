@@ -137,6 +137,14 @@ type PlannerInputV3 struct {
 	// every existing delivery gate honors it and the caller's map is never
 	// mutated.
 	DeliveryAllowList []string
+	// PreviousSubtitleEvaluation is the predecessor plan's degraded subtitle
+	// outcome for the same selection and effective inventory (see
+	// PreviousSubtitleEvaluationV3). When it matches this plan's request and
+	// inventory, the planner republishes that outcome without re-running the
+	// out-of-range disable, so a replan retry storm cannot re-log a warning the
+	// first plan already recorded. Nil for a fresh start and for any replan that
+	// changes the selection or could change the inventory.
+	PreviousSubtitleEvaluation *SubtitleEvaluationV3
 }
 
 // SourceExecutionMetadataV3 is the immutable source probe snapshot used to
@@ -271,6 +279,28 @@ func (input PlannerInputV3) hlsToneMapCapabilities() tonemap.Capabilities {
 	return input.ToneMapCapabilities
 }
 
+// resolvePlanSubtitlePoliciesV3 resolves the selected subtitle for each delivery
+// class, reusing the predecessor plan's degraded outcome when this plan carries
+// the identical selection against the identical effective inventory. The reuse
+// path skips the out-of-range disable (and its warning) entirely: the first plan
+// already recorded it, and nothing about the choice has changed. A changed pick,
+// a changed inventory, or a candidate rotation falls through to the normal
+// per-delivery resolution, so a real switch still behaves exactly as before.
+//
+// The inventory is passed in because it is also the plan's published inventory;
+// computing it once keeps the reuse comparison and the published entry list from
+// ever disagreeing about what this plan offers.
+func resolvePlanSubtitlePoliciesV3(input PlannerInputV3, file *models.MediaFile, inventory []SubtitleInventoryItemV3) (original, progressive, hls SubtitlePolicyResultV3) {
+	if reused, ok := reusedSubtitleDegradeV3(input, file, inventory); ok {
+		// Every delivery class degrades the same out-of-range selection to
+		// subtitles-off, so one reused outcome answers all three.
+		return reused, reused, reused
+	}
+	return ResolveSubtitlePolicyV3(file, input.Request, input.Settings.TranscodeEnabled, DeliveryClassOriginalHTTPV3, input.AdditionalSubtitles),
+		ResolveSubtitlePolicyV3(file, input.Request, input.Settings.TranscodeEnabled, DeliveryClassProgressiveV3, input.AdditionalSubtitles),
+		ResolveSubtitlePolicyV3(file, input.Request, input.Settings.TranscodeEnabled, DeliveryClassHLSV3, input.AdditionalSubtitles)
+}
+
 // PlanPlaybackV3 chooses a playable protocol-v3 route from source and client facts.
 func PlanPlaybackV3(input PlannerInputV3) (result PlannerResultV3) {
 	result = planPlaybackOnceV3(input)
@@ -372,9 +402,8 @@ func planPlaybackOnceV3(input PlannerInputV3) (result PlannerResultV3) {
 	// validated against the capabilities of the delivery class that would
 	// execute it. A refusal on original_http must not suppress a viable
 	// progressive or HLS subtitle renderer.
-	subtitle := ResolveSubtitlePolicyV3(file, input.Request, input.Settings.TranscodeEnabled, DeliveryClassOriginalHTTPV3, input.AdditionalSubtitles)
-	remuxSubtitle := ResolveSubtitlePolicyV3(file, input.Request, input.Settings.TranscodeEnabled, DeliveryClassProgressiveV3, input.AdditionalSubtitles)
-	hlsSubtitle := ResolveSubtitlePolicyV3(file, input.Request, input.Settings.TranscodeEnabled, DeliveryClassHLSV3, input.AdditionalSubtitles)
+	subtitleInventory := BuildSubtitleInventoryV3(file, input.AdditionalSubtitles)
+	subtitle, remuxSubtitle, hlsSubtitle := resolvePlanSubtitlePoliciesV3(input, file, subtitleInventory)
 	if subtitle.Terminal != nil && remuxSubtitle.Terminal != nil && hlsSubtitle.Terminal != nil {
 		return PlannerResultV3{Terminal: subtitle.Terminal, SubtitleTrackIndex: -1, SubtitleTransportTrackIndex: -1}
 	}
@@ -512,7 +541,7 @@ func planPlaybackOnceV3(input PlannerInputV3) (result PlannerResultV3) {
 		Timeline:               TimelineV3{SourceStartSeconds: floatOrZeroV3(input.Request.StartPosition), PlayerStartSeconds: floatOrZeroV3(input.Request.StartPosition), CanSeekAnywhere: true, SeekRestoration: "player_position"},
 	}
 	base.AvailableQualities = availableQualitiesV3(input, source)
-	base.Subtitle.Inventory = BuildSubtitleInventoryV3(file, input.AdditionalSubtitles)
+	base.Subtitle.Inventory = subtitleInventory
 	// Authoritative per-track audio inventory of the effective source; clients
 	// should prefer it over item metadata, which can be stale after a version
 	// fallback rehydrates a different candidate under the same catalog row.

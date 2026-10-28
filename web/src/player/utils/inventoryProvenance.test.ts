@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { isInventoryProvisional, isOverlayInventoryProvisional } from "./inventoryProvenance";
+import {
+  PROVISIONAL_INVENTORY_TIMEOUT_MS,
+  isInventoryProvisional,
+  isOverlayInventoryProvisional,
+  isProvisionalInventoryExpired,
+} from "./inventoryProvenance";
 
 describe("isInventoryProvisional", () => {
   it("is provisional while the stamp-derived status is declared", () => {
@@ -59,5 +64,35 @@ describe("isOverlayInventoryProvisional", () => {
   it("keeps an empty verified inventory final so the menu can show its empty state", () => {
     expect(isOverlayInventoryProvisional(false, false, 0)).toBe(false);
     expect(isOverlayInventoryProvisional(false, true, 0)).toBe(false);
+  });
+});
+
+describe("isProvisionalInventoryExpired", () => {
+  const since = 1_000_000;
+
+  it("keeps the spinner inside the discovery window", () => {
+    expect(isProvisionalInventoryExpired(true, since, since + 1)).toBe(false);
+    expect(
+      isProvisionalInventoryExpired(true, since, since + PROVISIONAL_INVENTORY_TIMEOUT_MS - 1),
+    ).toBe(false);
+  });
+
+  it("offers a retry once the window lapses", () => {
+    expect(
+      isProvisionalInventoryExpired(true, since, since + PROVISIONAL_INVENTORY_TIMEOUT_MS),
+    ).toBe(true);
+    expect(
+      isProvisionalInventoryExpired(true, since, since + PROVISIONAL_INVENTORY_TIMEOUT_MS + 5_000),
+    ).toBe(true);
+  });
+
+  it("never expires a menu that is not provisional", () => {
+    expect(isProvisionalInventoryExpired(false, since, since + 60_000)).toBe(false);
+    expect(isProvisionalInventoryExpired(true, null, since + 60_000)).toBe(false);
+  });
+
+  it("honors a caller's shorter bound", () => {
+    expect(isProvisionalInventoryExpired(true, since, since + 2_000, 2_000)).toBe(true);
+    expect(isProvisionalInventoryExpired(true, since, since + 1_999, 2_000)).toBe(false);
   });
 });

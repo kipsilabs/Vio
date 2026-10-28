@@ -411,6 +411,16 @@ function WatchPagePlayer({
   const sessionRef = useRef(session);
   sessionRef.current = session;
 
+  // A manual retry from a stalled track menu re-arms the bounded discovery
+  // rounds below and makes one immediate inventory read. The menus restart
+  // their own bound, so the retry shows progress instead of failing at once.
+  const [inventoryRetryNonce, setInventoryRetryNonce] = useState(0);
+  const handleRetryInventory = useCallback(() => {
+    sessionRef.current.markInventoryRetrying();
+    setInventoryRetryNonce((current) => current + 1);
+    void sessionRef.current.pollInventory();
+  }, []);
+
   const fallbackHandledRef = useRef<string | null>(null);
   const [pendingFallbackKey, setPendingFallbackKey] = useState<string | null>(null);
   const fallbackRoom = watchTogetherConnection.room;
@@ -850,6 +860,7 @@ function WatchPagePlayer({
   }, [
     session.inventoryPending,
     session.inventoryUrl,
+    inventoryRetryNonce,
     session.loading,
     session.mediaFileId,
     session.replacing,
@@ -1104,6 +1115,7 @@ function WatchPagePlayer({
     applyAudioInventory,
     applyInventoryUpdate,
     contentId,
+    inventoryRetryNonce,
     isVirtualActiveFile,
     libraryId,
     queryClient,
@@ -1695,6 +1707,7 @@ function WatchPagePlayer({
         subtitleInventoryProvisional={subtitleMenuProvisional}
         inventoryPending={session.inventoryPending}
         inventoryFailed={session.inventoryFailed}
+        onRetryInventory={handleRetryInventory}
         onSubtitleChanged={handleSubtitleChanged}
         onReturnFromPostRoll={onReturnFromPostRoll}
         watchTogetherRoomId={watchTogetherRoomId}

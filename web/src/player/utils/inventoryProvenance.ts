@@ -59,3 +59,28 @@ export function isOverlayInventoryProvisional(
   if (planProvisional) return true;
   return rowCount > 0 && !publishedRows;
 }
+
+/**
+ * How long a provisional menu may spin before it stops implying progress and
+ * offers an explicit retry. A deferred probe usually lands in seconds; a menu
+ * that is still provisional after this long is a stuck discovery the viewer
+ * must be able to act on rather than watch forever.
+ */
+export const PROVISIONAL_INVENTORY_TIMEOUT_MS = 15_000;
+
+/**
+ * Whether a provisional menu has outlived the bound at `now`.
+ *
+ * `provisionalSince` is the moment the current provisional stretch began, or
+ * null when the menu is not provisional. Callers that render a spinner reset
+ * it when the stretch ends or the viewer retries.
+ */
+export function isProvisionalInventoryExpired(
+  provisional: boolean,
+  provisionalSince: number | null,
+  now: number,
+  timeoutMs: number = PROVISIONAL_INVENTORY_TIMEOUT_MS,
+): boolean {
+  if (!provisional || provisionalSince === null) return false;
+  return now - provisionalSince >= timeoutMs;
+}

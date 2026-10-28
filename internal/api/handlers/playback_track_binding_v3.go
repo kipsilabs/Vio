@@ -67,6 +67,23 @@ type carriedInventorySourceV3 struct {
 	subtitleEvidenceErr error
 }
 
+// previousSubtitleEvaluationV3 recovers the predecessor plan's degraded subtitle
+// outcome for the replan track path. When a retry re-sends the identical pick
+// against the identical effective inventory, the planner republishes the
+// subtitles-off outcome instead of re-running (and re-logging) the out-of-range
+// disable the first plan already recorded. A changed pick, a changed inventory,
+// or a rotation makes the evaluation nil or non-matching, so the normal policy
+// runs unchanged.
+func previousSubtitleEvaluationV3(record *playback.AttemptRecordV3) *playback.SubtitleEvaluationV3 {
+	if record == nil {
+		return nil
+	}
+	// The durable normalized request is the request that produced CurrentPlan:
+	// every successful replan writes the seeded start back together with the new
+	// plan, so both halves describe the same selection and inventory.
+	return playback.PreviousSubtitleEvaluationV3(record.NormalizedRequest, record.CurrentPlan)
+}
+
 // subtitleSelectionOrdinalV3 returns the combined subtitle ordinal a request
 // carries, from either the index or the identity.
 func subtitleSelectionOrdinalV3(file *models.MediaFile, request *playback.StartRequestV3) (int, bool) {
