@@ -546,11 +546,14 @@ func (s *Service) ResolveDetailed(
 	if len(allowCandidateSubstitution) > 0 {
 		allowSubstitution = allowCandidateSubstitution[0]
 	}
-	if s == nil || s.Resolver == nil {
+	if s == nil {
 		return ResolvedVirtualStream{}, ErrVirtualLibraryUnavailable
 	}
 	if s.emptyTitleMarked(virtualPath) {
 		return ResolvedVirtualStream{}, fmt.Errorf("%w: title %s", ErrTitleWithoutStreams, neutralVirtualPathKey(virtualPath))
+	}
+	if s.Resolver == nil {
+		return ResolvedVirtualStream{}, ErrVirtualLibraryUnavailable
 	}
 
 	parsedURI, parseErr := url.Parse(virtualPath)
