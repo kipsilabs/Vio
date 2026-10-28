@@ -112,6 +112,11 @@ export function SubtitleMenu({
   // indexes; the menu shows one row per distinct descriptor, keeping the first
   // ordinal for selection. Differing forced/hearing-impaired/flag rows stay.
   const sortedTracks = useMemo(() => dedupeSubtitleTracks(sortSubtitlesBySource(tracks)), [tracks]);
+  // Declared or pending rows are placeholders for the effective file, so they
+  // stay out of the menu until probe evidence lands. A terminal failure keeps
+  // the list under its explicit "discovery did not complete" notice instead of
+  // leaving the menu empty.
+  const displayedTracks = provisional && !failed ? [] : sortedTracks;
 
   // Discover whether the server has AI subtitle translation configured, so we
   // only surface the entry point when it can actually do something. This is a
@@ -314,7 +319,7 @@ export function SubtitleMenu({
             {sortedTracks.length === 0 && !provisional && (
               <div className="px-3 py-2 text-xs text-white/40">No subtitles available</div>
             )}
-            {sortedTracks.map((track) => {
+            {displayedTracks.map((track) => {
               const isActive = track.index === activeIndex;
               const languageName = getLanguageName(track.language);
               const sourceLabel = SOURCE_LABELS[track.source ?? "embedded"] ?? "Embedded";

@@ -208,7 +208,7 @@ describe("SubtitleMenu", () => {
     expect(screen.queryByText("Discovering subtitles…")).toBeNull();
   });
 
-  it("shows discovery banner even when declared tracks are present while provisional", () => {
+  it("gates declared track rows behind the discovery state while provisional", () => {
     render(
       createElement(SubtitleMenu, {
         tracks: [subtitleTrack()],
@@ -223,7 +223,42 @@ describe("SubtitleMenu", () => {
     fireEvent.click(screen.getByRole("button", { name: /(Enable|Disable) captions/ }));
 
     expect(screen.getByText("Discovering subtitles…")).toBeTruthy();
+    // The declared rows are pre-probe placeholders for the effective file, so
+    // they must not sit in the menu as if they were the file's real tracks.
+    expect(screen.queryByText("English")).toBeNull();
+  });
+
+  it("swaps in live rows when the probed inventory arrives", () => {
+    const track = subtitleTrack();
+    const view = render(
+      createElement(SubtitleMenu, {
+        tracks: [track],
+        activeIndex: null,
+        onSelect: () => {},
+        delayMs: 0,
+        onDelayChange: () => {},
+        mediaFileId: 42,
+        provisional: true,
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /(Enable|Disable) captions/ }));
+    expect(screen.queryByText("English")).toBeNull();
+
+    view.rerender(
+      createElement(SubtitleMenu, {
+        tracks: [track],
+        activeIndex: null,
+        onSelect: () => {},
+        delayMs: 0,
+        onDelayChange: () => {},
+        mediaFileId: 42,
+        provisional: false,
+      }),
+    );
+
     expect(screen.getByText("English")).toBeTruthy();
+    expect(screen.queryByText("Discovering subtitles…")).toBeNull();
+    expect(screen.queryByText("Unverified")).toBeNull();
   });
 
   it("shows failure banner even when declared tracks are present", () => {

@@ -295,7 +295,7 @@ describe("AudioTrackMenu", () => {
     expect(screen.queryByText("Discovering audio tracks…")).toBeNull();
   });
 
-  it("shows discovery banner even when declared tracks are present while provisional", () => {
+  it("gates declared track rows behind the discovery state while provisional", () => {
     render(
       createElement(AudioTrackMenu, {
         tracks: [{ title: "English", codec: "aac", channels: 2 }],
@@ -310,7 +310,29 @@ describe("AudioTrackMenu", () => {
     );
 
     expect(screen.getByText("Discovering audio tracks…")).toBeTruthy();
+    expect(screen.queryByText("English")).toBeNull();
+  });
+
+  it("swaps in live rows when the probed inventory arrives", () => {
+    const tracks = [{ title: "English", codec: "aac", channels: 2 }];
+    const props = {
+      tracks,
+      activeIndex: 0,
+      onSelect: () => {},
+      currentPosition: 0,
+      open: true,
+      onOpenChange: () => {},
+      hideTrigger: false,
+      provisional: true,
+    };
+    const view = render(createElement(AudioTrackMenu, props));
+    expect(screen.queryByText("English")).toBeNull();
+
+    view.rerender(createElement(AudioTrackMenu, { ...props, provisional: false }));
+
     expect(screen.getByText("English")).toBeTruthy();
+    expect(screen.queryByText("Discovering audio tracks…")).toBeNull();
+    expect(screen.queryByText("Unverified")).toBeNull();
   });
 
   it("shows failure banner even when declared tracks are present", () => {
