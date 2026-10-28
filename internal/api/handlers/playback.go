@@ -841,6 +841,17 @@ type PlaybackHandler struct {
 	// map after any wake.
 	deferredPublishDone chan struct{}
 
+	// subtitleWaits records, per session, when a subtitle-inventory wait first
+	// started and which gate was holding it (see noteSubtitleInventoryWaitStart).
+	// It is observability only and never changes what is served: the wait ends at
+	// the first inventory_updated delivery, which logs the start and blocker
+	// fields alongside the existing delivery line. Entries are dropped on
+	// delivery and on session teardown, and an entry older than
+	// subtitleWaitStaleBound is pruned on insert, so the map is bounded by
+	// outstanding waits rather than by every session the process ever served.
+	subtitleWaitsMu sync.Mutex
+	subtitleWaits   map[string]subtitleInventoryWaitV3
+
 	// deferredProbeWatchdogOnce guards the lazy start of the deferred-probe
 	// convergence watchdog (see startDeferredProbeWatchdog). It fails a session
 	// whose deferred probe has stayed pending past the convergence bound, so

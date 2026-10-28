@@ -58,6 +58,7 @@ import {
   mergePlaybackInventory,
   usePlaybackInventoryMirror,
 } from "@/player/playbackInventoryMirror";
+import { isOverlayInventoryProvisional } from "@/player/utils/inventoryProvenance";
 import { cn } from "@/lib/utils";
 import AddToCollectionDialog from "@/components/AddToCollectionDialog";
 import { Button } from "@/components/ui/button";
@@ -450,17 +451,26 @@ export default function ActionBar({
   // the pre-play menus, so the media page offers the same tracks as the player
   // rather than the pre-probe placeholders. The zero stale time is deliberate:
   // this read may follow the probe that populated those lists.
-  const { data: selectedWatch } = useWatchDetail(contentId, selectedVersion?.file_id, undefined, {
-    enabled: !!contentId && !!selectedVersion,
-    staleTime: 0,
-  });
+  const { data: selectedWatch, refetch: refetchSelectedWatch } = useWatchDetail(
+    contentId,
+    selectedVersion?.file_id,
+    undefined,
+    {
+      enabled: !!contentId && !!selectedVersion,
+      staleTime: 0,
+    },
+  );
   const playerInventory = usePlaybackInventoryMirror(selectedVersion?.file_id);
+  const selectedWatchVersion = useMemo(
+    () =>
+      selectedVersion
+        ? selectedWatch?.versions?.find((version) => version.file_id === selectedVersion.file_id)
+        : undefined,
+    [selectedVersion, selectedWatch],
+  );
   const selectedVersionWithTracks = useMemo(() => {
     if (!selectedVersion) return null;
-    const watchVersion = selectedWatch?.versions?.find(
-      (version) => version.file_id === selectedVersion.file_id,
-    );
-    if (!watchVersion) return selectedVersion;
+    if (!selectedWatchVersion) return selectedVersion;
     // An empty watch-detail list can be an unprobed row, not evidence that the
     // selected version has no tracks. Keep the catalog lists until the probe
     // actually supplies a non-empty inventory, so a cold page does not hide its
@@ -469,17 +479,45 @@ export default function ActionBar({
       {
         ...selectedVersion,
         audio_tracks:
-          (watchVersion.audio_tracks?.length ?? 0) > 0
-            ? watchVersion.audio_tracks
+          (selectedWatchVersion.audio_tracks?.length ?? 0) > 0
+            ? selectedWatchVersion.audio_tracks
             : selectedVersion.audio_tracks,
         subtitle_tracks:
-          (watchVersion.subtitle_tracks?.length ?? 0) > 0
-            ? watchVersion.subtitle_tracks
+          (selectedWatchVersion.subtitle_tracks?.length ?? 0) > 0
+            ? selectedWatchVersion.subtitle_tracks
             : selectedVersion.subtitle_tracks,
       },
       playerInventory,
     );
-  }, [playerInventory, selectedVersion, selectedWatch]);
+  }, [playerInventory, selectedVersion, selectedWatchVersion]);
+  // Those catalog lists are the same pre-probe fallback the player overlay
+  // gates: rows the version row carries, not evidence the file has them. Until
+  // the watch detail read (or the player's own mirror) supplies probed rows for
+  // this file, the pre-play menus withhold them and say they are discovering,
+  // so a start cannot carry a pick the file does not have. The verdict is the
+  // overlay's, not a second rule.
+  const audioRowsPublished =
+    (selectedWatchVersion?.audio_tracks?.length ?? 0) > 0 ||
+    (playerInventory?.audioTracks.length ?? 0) > 0;
+  const subtitleRowsPublished =
+    (selectedWatchVersion?.subtitle_tracks?.length ?? 0) > 0 ||
+    (playerInventory?.subtitleTracks.length ?? 0) > 0;
+  const audioInventoryProvisional = isOverlayInventoryProvisional(
+    false,
+    audioRowsPublished,
+    selectedVersionWithTracks?.audio_tracks?.length ?? 0,
+  );
+  const subtitleInventoryProvisional = isOverlayInventoryProvisional(
+    false,
+    subtitleRowsPublished,
+    selectedVersionWithTracks?.subtitle_tracks?.length ?? 0,
+  );
+  // The watch detail read is the page's discovery path: the server persists
+  // probed tracks there. Retrying re-reads it for the selected file; Play stays
+  // available throughout, so a slow probe never blocks starting playback.
+  const handleRetryInventory = useCallback(() => {
+    void refetchSelectedWatch();
+  }, [refetchSelectedWatch]);
   const showMarkerEditor = canEditMarkers && !!contentId;
   const hasMultipleVersions = (playbackVariants?.length ?? 0) > 1 || (versions?.length ?? 0) > 1;
   const showPlayChoiceDialog =
@@ -1483,6 +1521,8 @@ export default function ActionBar({
                 version={selectedVersionWithTracks}
                 selectionMode={audioSelectionMode}
                 explicitTrackIndex={explicitAudioTrackIndex}
+                inventoryProvisional={audioInventoryProvisional}
+                onRetryInventory={handleRetryInventory}
                 onSelectTrack={onSelectAudioTrack}
                 onResetSelection={onResetAudioSelection}
               />
@@ -1500,6 +1540,8 @@ export default function ActionBar({
               activeAudioTrackIndex={
                 audioSelectionMode === "explicit" ? explicitAudioTrackIndex : null
               }
+              inventoryProvisional={subtitleInventoryProvisional}
+              onRetryInventory={handleRetryInventory}
               onSelectSubtitle={onSelectSubtitle}
               onSelectSubtitleOff={onSelectSubtitleOff}
               onResetSelection={onResetSubtitleSelection}

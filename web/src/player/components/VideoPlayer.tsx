@@ -398,6 +398,8 @@ interface VideoPlayerProps {
   inventoryPending?: boolean;
   /** True when track discovery terminally failed or timed out. */
   inventoryFailed?: boolean;
+  /** Re-runs track discovery for a stalled or failed provisional inventory. */
+  onRetryInventory?: () => void;
   onSubtitleChanged?: (index: number | null, inventoryTrack?: SubtitleInventoryItemV3) => void;
   onExit: (state?: PlaybackExitState) => void | Promise<void>;
   onMinimize?: (state?: PlaybackExitState) => void | Promise<void>;
@@ -659,6 +661,7 @@ export function VideoPlayer({
   subtitleInventoryProvisional = false,
   inventoryPending = false,
   inventoryFailed = false,
+  onRetryInventory,
   onSubtitleChanged,
   onExit,
   onMinimize,
@@ -6487,6 +6490,7 @@ export function VideoPlayer({
           audioInventoryProvisional={audioInventoryProvisional}
           inventoryPending={inventoryPending}
           inventoryFailed={inventoryFailed}
+          onRetryInventory={onRetryInventory}
           qualityOptions={qualityOptions}
           activeQualityId={activeQualityId}
           deliveredRecipe={plan.effective_recipe}

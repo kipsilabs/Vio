@@ -85,6 +85,12 @@ interface PlayerControlsProps {
   inventoryPending?: boolean;
   /** True when track discovery terminally failed or timed out. */
   inventoryFailed?: boolean;
+  /**
+   * Re-runs track discovery for both menus after a stalled or failed
+   * provisional inventory. Absent means the menu only restarts its own
+   * discovery window.
+   */
+  onRetryInventory?: () => void;
   preferredSubtitleLanguage?: string | null;
   mediaFileId?: number;
   playerConfig?: PlayerConfig;
@@ -188,6 +194,7 @@ export function PlayerControls({
   subtitleInventoryProvisional = false,
   inventoryPending = false,
   inventoryFailed = false,
+  onRetryInventory,
   preferredSubtitleLanguage,
   mediaFileId,
   playerConfig,
@@ -401,6 +408,7 @@ export function PlayerControls({
               provisional={subtitleInventoryProvisional}
               pending={inventoryPending}
               failed={inventoryFailed}
+              onRetryDiscovery={onRetryInventory}
               mediaFileId={mediaFileId}
               playerConfig={playerConfig}
               onRefreshSubtitles={onRefreshSubtitles}
@@ -582,6 +590,7 @@ export function PlayerControls({
                   provisional={audioInventoryProvisional}
                   pending={inventoryPending}
                   failed={inventoryFailed}
+                  onRetryDiscovery={onRetryInventory}
                 />
               )}
 
@@ -597,6 +606,7 @@ export function PlayerControls({
                 provisional={subtitleInventoryProvisional}
                 pending={inventoryPending}
                 failed={inventoryFailed}
+                onRetryDiscovery={onRetryInventory}
                 mediaFileId={mediaFileId}
                 playerConfig={playerConfig}
                 onRefreshSubtitles={onRefreshSubtitles}
@@ -801,6 +811,7 @@ export function PlayerControls({
           provisional={audioInventoryProvisional}
           pending={inventoryPending}
           failed={inventoryFailed}
+          onRetryDiscovery={onRetryInventory}
         />
       )}
       {compactControls && (

@@ -2866,6 +2866,12 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		}
 		deferred.sessionID = sessionID
 		timings.mark("post_commit_probe_scheduled")
+		// The deferred enumeration is where this session first needs a verified
+		// subtitle inventory, and the transport commit is what deferred it. Record
+		// the wait start here (before the probe is armed) so the evidence
+		// delivery line can report how long the menu stayed provisional; the
+		// blocker is the relay the probe waits on, not the provider.
+		h.noteSubtitleInventoryWaitStart(r.Context(), sessionID, deferred.file, probeOutcomePending, subtitleWaitBlockerRelay)
 		h.enqueueDeferredVirtualProbeV3(r.Context(), deferred)
 	}
 	// Split the composite commit measurement into attributable sub-phases: the
@@ -10678,7 +10684,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				// and the viewer can repeat the change.
 				return playback.DecisionResponseV3{}, *record, nil, subtitleArtifactErrorV3("Downloaded subtitles are temporarily unavailable.", inventoryErr)
 			}
-			result, toneMapCapabilityErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: start, RequestedFile: plannerRequestedFile, EffectiveFile: effectiveFile, ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), AudioTrackIndex: audioIndex, Settings: plannerSettings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: attemptedKeys, AdditionalSubtitles: additional, ForceSoftwareVideoDecode: forceSoftwareDecode, DecodeAttemptDetail: decodeAttemptDetail, StickyDelivery: replanStickyDeliveryV3(operation, record.CurrentPlan.Delivery), InventoryProvenance: string(replanVirtualProvenance)})
+			result, toneMapCapabilityErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: start, RequestedFile: plannerRequestedFile, EffectiveFile: effectiveFile, ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), AudioTrackIndex: audioIndex, Settings: plannerSettings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: attemptedKeys, AdditionalSubtitles: additional, ForceSoftwareVideoDecode: forceSoftwareDecode, DecodeAttemptDetail: decodeAttemptDetail, StickyDelivery: replanStickyDeliveryV3(operation, record.CurrentPlan.Delivery), InventoryProvenance: string(replanVirtualProvenance), PreviousSubtitleEvaluation: previousSubtitleEvaluationV3(record)})
 			clampPlannerTargetResolution(&result, effectiveFile)
 			reportDetourSubtitleDrop()
 		}
@@ -10981,6 +10987,10 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			func() playback.PlannerInputV3 {
 				input := h.plannerInputV3(r.Context(), start, plannerRequestedFile, effectiveFile, audioIndex, attemptedKeys, replanVirtualProvenance)
 				input.LowerVersion = lowerVersionForFileV3(lowerVersion, effectiveFile)
+				// An escalation replans the same selection against the same
+				// inventory, so it reuses the predecessor's degraded subtitle
+				// outcome exactly as the primary plan did.
+				input.PreviousSubtitleEvaluation = previousSubtitleEvaluationV3(record)
 				return input
 			}, result)
 		if escalateErr != nil {
