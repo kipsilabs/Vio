@@ -1,6 +1,8 @@
 package virtuallibrary
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -88,5 +90,37 @@ func TestEmptyTitleTrackerNilSafe(t *testing.T) {
 	tracker.noteNonEmptyListing("k")
 	if neutralVirtualPathKey("virtual://series/tt1/2/3?result=abc") != "virtual://series/tt1/2/3" {
 		t.Fatal("neutral key keeps the result token")
+	}
+}
+
+// A marked title fails fast without touching the provider.
+func TestResolveDetailedMarkedTitleSkipsProvider(t *testing.T) {
+	svc := &Service{cfg: Config{CacheTTLMinutes: 10}, emptyTitles: newEmptyTitleTracker()}
+	base := time.Now()
+	key := "virtual://series/tt1/2/3"
+	for i := 0; i < 3; i++ {
+		svc.noteEmptyTitleListing(key + "?result=abc")
+	}
+	// Backdate the streak so it spans the cache TTL without waiting.
+	svc.emptyTitles.mu.Lock()
+	st := svc.emptyTitles.streaks[key]
+	st.first = base.Add(-11 * time.Minute)
+	st.last = base
+	svc.emptyTitles.mu.Unlock()
+	if !svc.emptyTitleMarked(key + "?result=xyz") {
+		t.Fatal("query string should not shard the mark")
+	}
+	_, err := svc.ResolveDetailed(context.Background(), key+"?result=xyz", false, nil, "", false)
+	if !errors.Is(err, ErrTitleWithoutStreams) {
+		t.Fatalf("marked resolve = %v, want %v", err, ErrTitleWithoutStreams)
+	}
+}
+
+// A non-empty listing clears the mark so recovery is immediate.
+func TestResolveDetailedNonEmptyClearsMark(t *testing.T) {
+	svc := &Service{cfg: Config{CacheTTLMinutes: 10}, emptyTitles: newEmptyTitleTracker()}
+	svc.noteNonEmptyTitleListing("virtual://series/tt1/2/3?result=abc")
+	if svc.emptyTitleMarked("virtual://series/tt1/2/3") {
+		t.Fatal("fresh service reports a mark")
 	}
 }
