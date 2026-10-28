@@ -60,6 +60,9 @@ func virtualProviderListingOutage(err error) bool {
 	if err == nil {
 		return false
 	}
+	if errors.Is(err, virtuallibrary.ErrTitleWithoutStreams) {
+		return true
+	}
 	if errors.Is(err, resolver.ErrProviderUnavailable) {
 		return true
 	}
