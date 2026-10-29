@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/catalog"
@@ -48,7 +49,42 @@ func (h *ItemsHandler) WatchDetail(ctx context.Context, userID int, profileID, c
 		detail.UserData = h.leafUserData(ctx, userID, profileID, detail.ContentID, detail.Type)
 		applyEffectiveEditionPreference(detail.UserData, &detail.EffectiveVersionEditionKey)
 	}
+	h.scheduleSelectedVirtualProbe(detail, filter)
 	return detail, nil
+}
+
+// scheduleSelectedVirtualProbe schedules the pre-play probe chain when a
+// watch-detail read names one virtual version whose track inventory has not
+// been enumerated yet. Selecting a non-default row previously left its
+// audio/subtitle menus unknown until the row played, because only the
+// discovery path scheduled a probe and it targets the default. The chain
+// re-reads the row under the same access filter and skips a row that is
+// already probed, so a fresh selection schedules nothing; a bare listing or
+// polling read carries no selection and schedules nothing either.
+func (h *ItemsHandler) scheduleSelectedVirtualProbe(detail *catalog.WatchDetail, filter catalog.AccessFilter) {
+	if h == nil || h.virtualSelectionProber == nil || detail == nil || filter.SelectedFileID <= 0 {
+		return
+	}
+	if detail.Type != itemTypeMovie && detail.Type != itemTypeEpisode {
+		return
+	}
+	for i := range detail.Versions {
+		version := &detail.Versions[i]
+		if version.FileID != filter.SelectedFileID {
+			continue
+		}
+		// Only a virtual row has provider bytes to enumerate, and only an
+		// unstamped row still needs them. A local row and a probed row both
+		// leave nothing to schedule.
+		if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(version.FilePath)), virtualPlaybackPrefix) {
+			return
+		}
+		if version.ProbedAt != nil {
+			return
+		}
+		h.virtualSelectionProber.ScheduleSelectedFileProbe(detail.ContentID, version.FileID, filter)
+		return
+	}
 }
 
 func (h *ItemsHandler) populateWatchMarkers(ctx context.Context, detail *catalog.WatchDetail, selectedFileID int) {
