@@ -613,28 +613,82 @@ func (h *PlaybackHandler) runFileProbeChain(ctx context.Context, contentID strin
 	}
 }
 
+// virtualChainStoredURLMaxAge bounds how long a pre-play probe may trust a
+// row's persisted ResolvedURL that carries no expiry of its own.
+//
+// A nil expiry is an unknown lifetime, not an unlimited one: the provider
+// declared no lifetime for the token, so the row can only be trusted while it
+// is demonstrably recent. The listing that mints such a token is cached by the
+// resolver for virtual_library.cache_ttl_minutes (ten minutes by default), and
+// a provider such as AltMount issues short-lived release tokens that it
+// re-mints on every listing — once one lapses, the provider falls back to
+// title-based recovery server-side. Three listing windows is the cap: long
+// enough that browsing then playing reuses the token the last listing minted,
+// short enough that under the default cache the re-resolve reaches the provider
+// instead of the listing that produced the stale token.
+//
+// The clock is row.UpdatedAt: the row's only persisted freshness evidence.
+// A provider re-list and a stored-URL refresh both advance it, and those are
+// the writes that carry a newly minted token. Other metadata writes advance it
+// too, so the bound approximates the token's age instead of proving it; what it
+// rules out is the case this exists for — a row minted long ago whose URL
+// carries no expiry and was therefore trusted forever.
+var virtualChainStoredURLMaxAge = 30 * time.Minute
+
+// virtualChainStoredURLTrusted reports whether the pre-play probe may open the
+// row's persisted ResolvedURL now. The stored URL is stale — and the chain must
+// resolve afresh exactly as if the row carried no URL — when its own expiry has
+// passed, when the matched listing entry says the provider's copy of this
+// row's URL has already lapsed, or when the row carries no expiry and is older
+// than virtualChainStoredURLMaxAge (no timestamp at all is not evidence of
+// freshness).
+func virtualChainStoredURLTrusted(row *models.MediaFile, now time.Time, listingExpired bool) bool {
+	if row == nil || strings.TrimSpace(row.ResolvedURL) == "" || listingExpired {
+		return false
+	}
+	if row.ResolvedURLExpiresAt != nil {
+		return row.ResolvedURLExpiresAt.After(now)
+	}
+	if row.UpdatedAt.IsZero() {
+		return false
+	}
+	return !now.After(row.UpdatedAt.Add(virtualChainStoredURLMaxAge))
+}
+
 // virtualChainProbeURL resolves the HTTP source the pre-play probe must open.
 // The catalog row and the discovery listing both name the candidate by its
 // durable virtual URI; that URI is not a provider transport and must never be
 // handed to ffprobe. The fresh listing's resolved URL is preferred, then the
-// row's stored URL while unexpired, then a fresh resolve under the same access
-// filter that authorized discovery.
+// row's stored URL while it is still trusted (see
+// virtualChainStoredURLTrusted), then a fresh resolve under the same access
+// filter that authorized discovery. A fresh resolve's URL is persisted back
+// onto the row through the existing stored-URL refresh write, so the next
+// chain, probe, or play reuses the newly minted token instead of minting
+// another.
 func (h *PlaybackHandler) virtualChainProbeURL(ctx context.Context, row *models.MediaFile, cand VirtualPlaybackStream, filter catalog.AccessFilter) (string, map[string]string, bool) {
 	if row == nil {
 		return "", nil, false
 	}
 	now := time.Now()
+	rowURL := strings.TrimSpace(row.ResolvedURL)
+	// The matched listing entry is the provider's own view of this row's URL.
+	// When it has already lapsed, a token minted from the same listing cannot
+	// be trusted either, so the stored URL is stale too.
+	candExpired := cand.ProviderExpiresAt != nil && !cand.ProviderExpiresAt.After(now)
 	// A persisted candidate copied from a selected row carries that row's signed
-	// URL too. It must obey the same expiry fence as the row fallback below;
-	// otherwise a vanished profile variant with an expired URL is probed instead
-	// of being resolved freshly, and the probe failure damages the candidate.
+	// URL too. It must obey the same staleness fence as the row fallback below;
+	// otherwise a vanished profile variant with an expired or ancient URL is
+	// probed instead of being resolved freshly, and the probe failure damages
+	// the candidate. A candidate minted by the fresh listing (a different URL)
+	// keeps its first preference.
 	if url := strings.TrimSpace(cand.ProviderURL); url != "" &&
 		(cand.ProviderExpiresAt == nil || cand.ProviderExpiresAt.After(now)) {
-		return url, maps.Clone(cand.RequestHeaders), true
+		if url != rowURL || virtualChainStoredURLTrusted(row, now, candExpired) {
+			return url, maps.Clone(cand.RequestHeaders), true
+		}
 	}
-	if url := strings.TrimSpace(row.ResolvedURL); url != "" &&
-		(row.ResolvedURLExpiresAt == nil || row.ResolvedURLExpiresAt.After(now)) {
-		return url, maps.Clone(row.ProviderRequestHeaders), true
+	if rowURL != "" && virtualChainStoredURLTrusted(row, now, candExpired) {
+		return rowURL, maps.Clone(row.ProviderRequestHeaders), true
 	}
 	if h.VirtualMediaDetailedResolver == nil {
 		return "", nil, false
@@ -646,6 +700,12 @@ func (h *PlaybackHandler) virtualChainProbeURL(ctx context.Context, row *models.
 	if err != nil || strings.TrimSpace(resolved.URL) == "" {
 		return "", nil, false
 	}
+	// Record the freshly minted token through the Phase-1 stored-URL write, so
+	// a long-lived stale row stops paying a provider round-trip on every
+	// browse-then-play. The write is the ordinary CAS-fenced refresh: it
+	// refuses a resolution for a substituted sibling and never touches probe
+	// evidence. Best-effort: the URL is already in hand.
+	_, _ = refreshStoredVirtualResolution(ctx, row, resolved, h.VirtualFileMetadataSaver, h.VirtualFileSaver)
 	return resolved.URL, maps.Clone(resolved.RequestHeaders), true
 }
 
