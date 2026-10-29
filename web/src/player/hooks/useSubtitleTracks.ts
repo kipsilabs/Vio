@@ -342,11 +342,32 @@ export function useSubtitleTracks(
   // effect's cleanup and consumed by the next build when the subtitle URL is
   // unchanged (a rebuild forced by a stream reload rather than a track switch).
   const carryoverRef = useRef<SubtitleTrackCarryover | null>(null);
+  // URL of a track the server answered 404 for. A 404 on a subtitle fetch means
+  // the track does not exist for this file — an embedded index the plan never
+  // probed resolves to nothing — so every window of the same track identity
+  // (same URL, hence the same file_id, embedded_stream_index, and track
+  // ordinal) answers 404 too. Held in a ref rather than per-mount state so a
+  // rebuild that keeps the URL (stream reload, source refresh, retime) stays
+  // parked, while a track, version, or session change — each of which mints a
+  // new URL — clears the latch as a deliberate fresh attempt.
+  const parkedTrackUrlRef = useRef<string | null>(null);
 
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
     const videoEl: HTMLVideoElement = video;
+
+    // A parked (404) track is parked only for its own identity. Selecting a
+    // different track, version, or playback session mints a different URL, so
+    // its mount clears the latch and fetches normally; selecting the same one
+    // again after switching away is a fresh attempt too, because the mount in
+    // between already cleared it. Rebuilds that keep the URL (seek-driven
+    // window advance, stream reload, source refresh, retime) leave it parked.
+    if (parkedTrackUrlRef.current !== null && parkedTrackUrlRef.current !== activeUrl) {
+      parkedTrackUrlRef.current = null;
+    }
+    // Reads the park latch against the identity this mount fetches for.
+    const isParked = () => activeUrl !== null && parkedTrackUrlRef.current === activeUrl;
 
     // A refresh revision bump means the inventory behind this track was just
     // re-read after a source-changed 409. Consume it here so only the rebuild
@@ -632,11 +653,24 @@ export function useSubtitleTracks(
             // loading. The refreshRevision rebuild sets "loading" again when it
             // retries the re-minted URL.
             onLoadStateRef.current?.("error");
+          } else if (resp.status === 404) {
+            // Terminal: the server says this track does not exist for this
+            // file. Every window of the same track identity would answer the
+            // same 404, so park the track instead of backing off forever (a
+            // window loop with no cues used to re-ask the identical URL
+            // indefinitely). The overlay then presents the track the way a
+            // track with no cues does: no "loading" or "couldn't load" chrome
+            // and no retry action, because no retry can succeed. The latch is
+            // cleared by the next track, version, or session selection.
+            if (!controller.signal.aborted) {
+              parkedTrackUrlRef.current = activeUrl;
+              onLoadStateRef.current?.(hasFetched ? "ready" : "idle");
+            }
           } else {
-            // Non-ok responses (including 404/415) fall through to the finally
-            // block, which schedules a bounded exponential-backoff retry. A
-            // silent return here would let every timeupdate re-trigger the
-            // fetch and storm the server.
+            // Other non-ok responses (415, 5xx outside the retryable set) fall
+            // through to the finally block, which schedules a bounded
+            // exponential-backoff retry. A silent return here would let every
+            // timeupdate re-trigger the fetch and storm the server.
             console.error(`[useSubtitleTracks] Failed to fetch ${url}: ${resp.status}`);
           }
         } else {
@@ -719,9 +753,11 @@ export function useSubtitleTracks(
           // Genuine failure (error, stall, or non-ok response) rather than a
           // seek superseding this fetch — back off before retrying. A signaled
           // source change is not a retryable failure: the replan will re-mint
-          // the URL, so no backoff is scheduled here. Guarded inline rather
-          // than with a `return` — this block runs inside a finally.
-          if (!sourceChangedSignaled && !sessionGoneSignaled) {
+          // the URL, so no backoff is scheduled here. Nor is a parked track: a
+          // 404 proved the track missing, so no retry can succeed. Guarded
+          // inline rather than with a `return` — this block runs inside a
+          // finally.
+          if (!sourceChangedSignaled && !sessionGoneSignaled && !isParked()) {
             lastFetchFailureAt = Date.now();
             onLoadStateRef.current?.("error");
             if (isRetryableSubtitleStatus(lastResponseStatus)) {
@@ -768,6 +804,7 @@ export function useSubtitleTracks(
     function maybeFetch(seeked = false) {
       if (sourceChangedSignaled) return; // stale URL; waiting for replan
       if (sessionGoneSignaled) return; // the session is gone; offer a restart
+      if (isParked()) return; // the track is missing for this file; stay parked
       if (cancelled) return;
       // Until the element has media loaded, currentTime reads 0 rather than
       // the position playback will actually start at (resume target, or a
