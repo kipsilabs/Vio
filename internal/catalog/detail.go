@@ -4526,20 +4526,38 @@ func probedCollapsesAgainstProbedRelease(f *models.MediaFile, kept []*models.Med
 	if f == nil {
 		return false
 	}
-	size := virtualDeclaredProviderSize(f)
 	for _, k := range kept {
-		if k == nil {
-			continue
+		if VirtualRowsShareRelease(f, k) {
+			return true
 		}
-		if size != virtualDeclaredProviderSize(k) {
-			continue
-		}
-		if virtualProviderIdentityConflicts(f, k) {
-			continue
-		}
-		return true
 	}
 	return false
+}
+
+// VirtualRowsShareRelease reports whether two virtual catalog rows are the same
+// release under the version list's grouping rule: the same provider-neutral
+// release path, an equal declared size, and no conflicting durable provider
+// identity tier. It is the rule that collapses duplicate rows for one release
+// into a single version, exported so a caller holding a release's sibling rows
+// can decide "same release, different row" without inventing a second
+// normalization.
+//
+// A concrete `result=` pick is deliberately not part of the identity test: the
+// neutral path strips it precisely because a provider re-list churns result ids
+// for one release, and different indexers offering the same release each mint
+// their own concrete pick. Local files never share a release by this rule.
+func VirtualRowsShareRelease(a, b *models.MediaFile) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	key := virtualNeutralReleaseKey(a)
+	if key == "" || key != virtualNeutralReleaseKey(b) {
+		return false
+	}
+	if virtualDeclaredProviderSize(a) != virtualDeclaredProviderSize(b) {
+		return false
+	}
+	return !virtualProviderIdentityConflicts(a, b)
 }
 
 // unprobedCollapsesAgainstProbedRelease reports whether an unprobed virtual

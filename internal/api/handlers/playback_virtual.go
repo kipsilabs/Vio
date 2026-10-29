@@ -20,6 +20,7 @@ import (
 	"time"
 
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
+	"github.com/Silo-Server/silo-server/internal/catalog"
 	langpkg "github.com/Silo-Server/silo-server/internal/lang"
 	"github.com/Silo-Server/silo-server/internal/logredact"
 	"github.com/Silo-Server/silo-server/internal/models"
@@ -3806,6 +3807,20 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				h.unpinVirtualSticky(stickyKey, candidate.URI)
 				attemptErr = errors.Join(attemptErr, fmt.Errorf("candidate %s served %d bytes for a declared %d-byte release",
 					candidate.URI, result.File.ProbedFormatSize, result.File.FileSize))
+				// The same release is usually offered by several indexers under
+				// separate candidate ids. Each is an independent dice roll at
+				// the provider's cache, so probe the release's siblings before
+				// this start gives up; a sibling's verified inventory is
+				// persisted onto the sibling row, never this one.
+				if sibling := h.fallbackSameReleaseAfterServedSizeMismatch(
+					attemptCtx, file, candidate, candidates, resolveAndProbe, stickyKey, generation,
+				); sibling != nil {
+					return *sibling, nil
+				}
+				// A sibling probe can itself hit a repeat-play fast path and set
+				// the loop's fastPathHit flag; it did not select this candidate,
+				// so the outer loop must not consume it on the next iteration.
+				fastPathHit = false
 				continue
 			}
 			if !virtualRuntimePlausible(result.File.Duration, expectedRuntimeMinutes) {
@@ -3908,6 +3923,141 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	return resolvedVirtualPlaybackSource{}, attemptErr
 }
 
+// virtualServedSizeMismatchFallbackLimit bounds how many same-release sibling
+// candidates one served-size-mismatch fallback may probe. A release can be
+// offered by many indexers, each row an independent roll of the provider's
+// cache dice, but every attempt costs a provider resolve plus ffprobe, so the
+// fallback stops here rather than multiplying probe work with the indexer
+// count.
+const virtualServedSizeMismatchFallbackLimit = 3
+
+// fallbackSameReleaseAfterServedSizeMismatch probes the mismatched candidate's
+// same-release siblings in picker order, stopping at the first whose served
+// bytes match its own declared size. The candidate loop's outer behavior is
+// unchanged: this runs only on a mismatch, is bounded, and returns nil when no
+// sibling matches so the caller continues exactly as before.
+//
+// A verified sibling's bytes belong to the sibling's row, never the selected
+// row's, so the matched inventory is persisted against the sibling row through
+// the existing evidence sink and the sibling becomes the effective source.
+// The selected row keeps the short wrong-source damper armed by its caller;
+// each mismatching sibling arms the same short damper, and none is stamped
+// failed_at — the release is not dead, the provider's cache served the wrong
+// file.
+func (h *PlaybackHandler) fallbackSameReleaseAfterServedSizeMismatch(
+	ctx context.Context,
+	file *models.MediaFile,
+	anchor VirtualPlaybackStream,
+	candidates []VirtualPlaybackStream,
+	resolveAndProbe func(int, VirtualPlaybackStream) (*resolvedVirtualPlaybackSource, error),
+	stickyKey string,
+	generation uint64,
+) *resolvedVirtualPlaybackSource {
+	if h == nil || file == nil {
+		return nil
+	}
+	anchorRow := virtualCandidateReleaseRow(file, anchor)
+	attempted := map[string]struct{}{anchor.URI: {}}
+	probes := 0
+	for i := range candidates {
+		if probes >= virtualServedSizeMismatchFallbackLimit {
+			break
+		}
+		sibling := candidates[i]
+		if sibling.URI == "" {
+			continue
+		}
+		if _, done := attempted[sibling.URI]; done {
+			continue
+		}
+		// The version list's own release grouping decides which rows are
+		// siblings; a different quality/release is never substituted here.
+		if !catalog.VirtualRowsShareRelease(anchorRow, virtualCandidateReleaseRow(file, sibling)) {
+			continue
+		}
+		ownerID := effectiveVirtualOwner(sibling.OwnerInstallationID, file.VirtualOwnerInstallationID)
+		siblingRow, found, lookupErr := h.lookupVirtualCandidateRowDetailed(
+			ctx, sibling.URI, file.ContentID, file.EpisodeID, ownerID,
+		)
+		if lookupErr != nil || !found || siblingRow == nil || siblingRow.ID <= 0 ||
+			strings.TrimSpace(siblingRow.FilePath) != strings.TrimSpace(sibling.URI) {
+			continue
+		}
+		attempted[sibling.URI] = struct{}{}
+		probes++
+		slog.WarnContext(ctx, "virtual probe served size mismatch: trying same-release sibling",
+			"component", "api", "file_id", file.ID, "sibling_file_id", siblingRow.ID,
+			"indexer", virtualCandidateIndexerLabel(sibling), "candidate_uri", anchor.URI,
+			"sibling_uri", sibling.URI)
+		result, err := resolveAndProbe(i, sibling)
+		if err != nil || result == nil || result.File == nil ||
+			result.Provenance != ProbeProvenanceVerified {
+			continue
+		}
+		// Only a result that still names the sibling's own candidate may write
+		// the sibling's inventory; a resolver substitution names other bytes.
+		if !sameVirtualCandidate(result.URI, sibling.URI) ||
+			(result.File.ID > 0 && result.File.ID != siblingRow.ID) {
+			continue
+		}
+		if scanner.VirtualServedSizeMismatch(result.File.FileSize, result.File.ProbedFormatSize) {
+			virtualProbeFailures.markSizeMismatch(virtualProbeFailureKey(sibling.URI, ownerID))
+			logVirtualProbeSizeMismatch(ctx, siblingRow.ID, sibling.URI, result.File.FileSize, result.File.ProbedFormatSize)
+			h.unpinVirtualSticky(stickyKey, sibling.URI)
+			continue
+		}
+		h.persistVirtualProbeEvidence(ctx, siblingRow, result.File.FilePath, result.File,
+			resolvedSourceIdentity(result).tiers(), true, true)
+		h.pinVirtualStickyAt(stickyKey, sibling.URI, generation)
+		result.CandidateRank = i
+		result.CandidateCount = len(candidates)
+		slog.WarnContext(ctx, "virtual probe served size mismatch: adopted same-release sibling",
+			"component", "api", "file_id", file.ID, "sibling_file_id", siblingRow.ID,
+			"indexer", virtualCandidateIndexerLabel(sibling), "candidate_uri", anchor.URI,
+			"sibling_uri", sibling.URI)
+		return result
+	}
+	return nil
+}
+
+// virtualCandidateReleaseRow projects a picker candidate onto the catalog-row
+// shape the version list's release grouping compares, so sibling matching uses
+// that rule rather than a second identity normalization.
+func virtualCandidateReleaseRow(file *models.MediaFile, candidate VirtualPlaybackStream) *models.MediaFile {
+	row := &models.MediaFile{
+		FilePath:                   candidate.URI,
+		Container:                  "virtual",
+		FileSize:                   candidate.FileSize,
+		ProviderReleaseSize:        candidate.FileSize,
+		ProviderVideoHash:          candidate.ProviderVideoHash,
+		ProviderGUID:               candidate.ProviderGUID,
+		ProviderReleaseName:        candidate.ProviderReleaseName,
+		VirtualOwnerInstallationID: candidate.OwnerInstallationID,
+	}
+	if file != nil {
+		row.ContentID = file.ContentID
+		row.EpisodeID = file.EpisodeID
+		row.MediaFolderID = file.MediaFolderID
+		if row.VirtualOwnerInstallationID <= 0 {
+			row.VirtualOwnerInstallationID = file.VirtualOwnerInstallationID
+		}
+	}
+	return row
+}
+
+// virtualCandidateIndexerLabel names the indexer/source behind a picker
+// candidate for fallback logging. The provider-neutral candidate shape carries
+// no dedicated indexer field, so the concrete candidate id (which each indexer
+// offer mints) and the URI's result id are preferred, then the release name.
+func virtualCandidateIndexerLabel(candidate VirtualPlaybackStream) string {
+	for _, value := range []string{candidate.ID, virtualResultCandidateID(candidate.URI), candidate.ProviderReleaseName, candidate.Label} {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
 // virtualDeliveredWithinGrace reports whether the row's last transport
 // delivery is inside the scanner's delivery grace. A nil stamp means the row
 // never delivered, so the start path must resolve synchronously.
@@ -3967,6 +4117,180 @@ func (h *PlaybackHandler) virtualExpectedRuntimeMinutes(ctx context.Context, fil
 		}
 	}
 	return expected
+}
+
+// virtualSiblingProbe is one same-release sibling row that served bytes
+// matching its own declared size. It is the probe chain's new target: the row,
+// its candidate, the probe input, and the enumerated bytes all belong to the
+// sibling, never the row the probe was originally asked about.
+type virtualSiblingProbe struct {
+	row       *models.MediaFile
+	cand      VirtualPlaybackStream
+	transient models.MediaFile
+	probed    *models.MediaFile
+	identity  resolver.PersistedIdentityTiers
+}
+
+// matchSameReleaseSiblingProbe probes the selected row's same-release sibling
+// rows in picker order, stopping at the first whose served bytes match its own
+// declared size. The version list supplies both the order and the release
+// grouping, so this does not invent a second identity rule. It returns nil when
+// no sibling matches, leaving the caller's original failure path untouched.
+//
+// Every attempt is bounded by the caller's existing probe context: no new
+// timeout is introduced. A sibling whose bytes also mismatch arms the same
+// short wrong-source damper; no sibling is ever stamped failed_at.
+func (h *PlaybackHandler) matchSameReleaseSiblingProbe(ctx context.Context, anchor *models.MediaFile, anchorCand VirtualPlaybackStream, ownerInstallationID int) *virtualSiblingProbe {
+	rows := h.sameReleaseSiblingRows(ctx, anchor, anchorCand)
+	for i, row := range rows {
+		if i >= virtualServedSizeMismatchFallbackLimit {
+			break
+		}
+		cand := virtualPlaybackStreamFromFile(row)
+		if cand == nil || virtualResultCandidateID(strings.TrimSpace(row.FilePath)) == "" {
+			continue
+		}
+		cand.OwnerInstallationID = effectiveVirtualOwner(cand.OwnerInstallationID, ownerInstallationID)
+		// The stream builder copies the transport-facing fields; the durable
+		// provider identity the evidence write and the same-release grouping
+		// need stays on the row.
+		cand.ProviderVideoHash = row.ProviderVideoHash
+		cand.ProviderGUID = row.ProviderGUID
+		cand.ProviderReleaseName = row.ProviderReleaseName
+		if cand.FileSize <= 0 {
+			cand.FileSize = row.ProviderReleaseSize
+		}
+		probeURL, probeHeaders, ok := h.siblingProbeURL(ctx, row)
+		if !ok {
+			continue
+		}
+		cand.RequestHeaders = probeHeaders
+		slog.WarnContext(ctx, "virtual probe served size mismatch: trying same-release sibling",
+			"component", "api", "file_id", catalogFileIDOrZero(anchor), "sibling_file_id", row.ID,
+			"indexer", virtualCandidateIndexerLabel(*cand), "candidate_uri", anchorCand.URI,
+			"sibling_uri", cand.URI)
+		transient := cloneVirtualProbeTransient(*row)
+		// Zero the duration so the sibling's probe measures the empirical
+		// duration instead of inheriting the catalog value.
+		transient.Duration = 0
+		forwardVirtualCandidateDeclaredAudio(&transient, *cand)
+		probed, err := h.probeVirtualSource(ctx, probeURL, &transient, probeHeaders)
+		if err != nil || probed == nil {
+			continue
+		}
+		if scanner.VirtualServedSizeMismatch(transient.FileSize, probed.ProbedFormatSize) {
+			virtualProbeFailures.markSizeMismatch(virtualProbeFailureKey(cand.URI, cand.OwnerInstallationID))
+			logVirtualProbeSizeMismatch(ctx, row.ID, cand.URI, transient.FileSize, probed.ProbedFormatSize)
+			continue
+		}
+		return &virtualSiblingProbe{
+			row:       row,
+			cand:      *cand,
+			transient: transient,
+			probed:    probed,
+			identity:  resolver.NewPersistedIdentityTiers(cand.ProviderVideoHash, cand.ProviderGUID, cand.ProviderReleaseName, cand.FileSize),
+		}
+	}
+	return nil
+}
+
+// sameReleaseSiblingRows returns the selected row's same-release sibling rows in
+// catalog order, capped at the fallback probe bound. The rows are the same
+// pre-collapse set the version list builds from, and catalog.VirtualRowsShareRelease
+// is the rule it uses to group them into one release, so "sibling" means exactly
+// the rows the picker groups under this release. The selected row itself and the
+// provider-neutral group row are never returned as concrete probe targets.
+func (h *PlaybackHandler) sameReleaseSiblingRows(ctx context.Context, anchor *models.MediaFile, anchorCand VirtualPlaybackStream) []*models.MediaFile {
+	if h == nil || anchor == nil || h.FileVersionFetcher == nil {
+		return nil
+	}
+	var rows []*models.MediaFile
+	var err error
+	switch {
+	case strings.TrimSpace(anchor.EpisodeID) != "":
+		rows, err = h.FileVersionFetcher.GetByEpisodeID(ctx, anchor.EpisodeID)
+	case strings.TrimSpace(anchor.ContentID) != "":
+		rows, err = h.FileVersionFetcher.GetByContentID(ctx, anchor.ContentID)
+	default:
+		return nil
+	}
+	if err != nil || len(rows) == 0 {
+		return nil
+	}
+	anchorRow := *anchor
+	if anchorRow.FileSize <= 0 && anchorCand.FileSize > 0 {
+		anchorRow.FileSize = anchorCand.FileSize
+	}
+	if anchorRow.ProviderReleaseSize <= 0 && anchorCand.FileSize > 0 {
+		anchorRow.ProviderReleaseSize = anchorCand.FileSize
+	}
+	if strings.TrimSpace(anchorRow.ProviderVideoHash) == "" {
+		anchorRow.ProviderVideoHash = anchorCand.ProviderVideoHash
+	}
+	if strings.TrimSpace(anchorRow.ProviderGUID) == "" {
+		anchorRow.ProviderGUID = anchorCand.ProviderGUID
+	}
+	if strings.TrimSpace(anchorRow.ProviderReleaseName) == "" {
+		anchorRow.ProviderReleaseName = anchorCand.ProviderReleaseName
+	}
+	siblings := make([]*models.MediaFile, 0, virtualServedSizeMismatchFallbackLimit)
+	for _, row := range rows {
+		if len(siblings) >= virtualServedSizeMismatchFallbackLimit {
+			break
+		}
+		if row == nil || row.ID <= 0 || row.ID == anchor.ID || row.FilePath == anchor.FilePath {
+			continue
+		}
+		if !catalog.VirtualRowsShareRelease(&anchorRow, row) {
+			continue
+		}
+		siblings = append(siblings, row)
+	}
+	return siblings
+}
+
+// siblingProbeURL resolves the transport a same-release sibling's probe must
+// open. The row's stored URL is preferred while unexpired; otherwise the same
+// provider resolver the serve path uses is asked for the row's candidate. The
+// caller's existing probe budget bounds the resolve and the probe.
+func (h *PlaybackHandler) siblingProbeURL(ctx context.Context, row *models.MediaFile) (string, map[string]string, bool) {
+	if row == nil {
+		return "", nil, false
+	}
+	now := time.Now()
+	if url := strings.TrimSpace(row.ResolvedURL); url != "" &&
+		(row.ResolvedURLExpiresAt == nil || row.ResolvedURLExpiresAt.After(now)) {
+		return url, cloneHeaderMap(row.ProviderRequestHeaders), true
+	}
+	if h.VirtualMediaDetailedResolver != nil {
+		resolved, err := h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
+			ctx, row.FilePath, row.VirtualOwnerInstallationID, 0, "", false, nil, "",
+		)
+		if err == nil && strings.TrimSpace(resolved.URL) != "" {
+			return resolved.URL, cloneHeaderMap(resolved.RequestHeaders), true
+		}
+	}
+	if h.VirtualPlaybackResolver != nil {
+		url, err := h.VirtualPlaybackResolver.ResolveVirtualPlayback(
+			ctx, row.FilePath, 0, "", row.VirtualOwnerInstallationID,
+		)
+		if err == nil && strings.TrimSpace(url) != "" {
+			return url, nil, true
+		}
+	}
+	return "", nil, false
+}
+
+// logVirtualSiblingProbeAdopted records that the size-mismatch fallback adopted
+// a same-release sibling as the chain's effective row, so the verified
+// inventory belongs to the sibling's bytes.
+func logVirtualSiblingProbeAdopted(ctx context.Context, anchorFileID int, sibling *virtualSiblingProbe) {
+	if sibling == nil {
+		return
+	}
+	slog.WarnContext(ctx, "virtual probe served size mismatch: adopted same-release sibling",
+		"component", "api", "file_id", anchorFileID, "sibling_file_id", catalogFileIDOrZero(sibling.row),
+		"indexer", virtualCandidateIndexerLabel(sibling.cand), "sibling_uri", sibling.cand.URI)
 }
 
 // probeVirtualSourceAndPersist probes an already-resolved provider URL and
@@ -4084,6 +4408,8 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 		}
 		return probeOutcomeFailed, virtualCommittedProbeInventory{}
 	}
+	anchorFileID := catalogFileIDOrZero(catalogFile)
+	var adoptedSibling *virtualSiblingProbe
 	if scanner.VirtualServedSizeMismatch(probeTransient.FileSize, probed.ProbedFormatSize) {
 		// The container was readable but it is not the release the row
 		// declares: the provider is serving a different file under this URL
@@ -4094,9 +4420,25 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 		// because it belongs to the row whose bytes were probed, including a
 		// resolver-substituted candidate's own row.
 		virtualProbeFailures.markSizeMismatch(probeKey)
-		logVirtualProbeSizeMismatch(bgCtx, catalogFile.ID, probeCand.URI, probeTransient.FileSize, probed.ProbedFormatSize)
+		logVirtualProbeSizeMismatch(bgCtx, anchorFileID, probeCand.URI, probeTransient.FileSize, probed.ProbedFormatSize)
 		h.unpinVirtualSticky(stickyKey, probeCand.URI)
-		return probeOutcomeFailed, virtualCommittedProbeInventory{}
+		// The same release is usually offered by several indexers, each its own
+		// candidate id and its own dice roll at the provider's cache. Probe the
+		// release's sibling rows before giving up. A sibling that matches
+		// re-points the chain at that row: the verified inventory below is the
+		// sibling's bytes and is written to the sibling's row only, never the
+		// selected row's. The selected row keeps the short damper armed above.
+		sibling := h.matchSameReleaseSiblingProbe(bgCtx, catalogFile, probeCand, ownerInstallationID)
+		if sibling == nil {
+			return probeOutcomeFailed, virtualCommittedProbeInventory{}
+		}
+		catalogFile = sibling.row
+		probeCand = sibling.cand
+		probeTransient = sibling.transient
+		probed = sibling.probed
+		candidate = sibling.identity
+		probeKey = virtualProbeFailureKey(probeCand.URI, probeCand.OwnerInstallationID)
+		adoptedSibling = sibling
 	}
 	if !virtualRuntimePlausible(probed.Duration, expectedRuntimeMinutes) {
 		virtualProbeFailures.mark(probeKey)
@@ -4132,6 +4474,7 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 				"component", "api", "candidate_uri", probeCand.URI, "file_id", catalogFile.ID)
 			return probeOutcomeFailed, virtualCommittedProbeInventory{}
 		}
+		logVirtualSiblingProbeAdopted(bgCtx, anchorFileID, adoptedSibling)
 		// The durable write committed a verified inventory for a session whose
 		// committed recipe was built from declared metadata, so a reorder can
 		// leave the executable default-audio selection on the wrong language.
@@ -4142,6 +4485,7 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 		return probeOutcomeVerified, committedInv
 	}
 	h.persistVirtualProbeEvidence(bgCtx, catalogFile, probeCand.URI, probed, candidate, true, false)
+	logVirtualSiblingProbeAdopted(bgCtx, anchorFileID, adoptedSibling)
 	return probeOutcomeVerified, virtualCommittedProbeInventory{}
 }
 
