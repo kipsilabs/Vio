@@ -81,6 +81,14 @@ const (
 	// cache.
 	virtualProbeFailureTTL    = 5 * time.Minute
 	virtualProbeFailureMaxTTL = 60 * time.Minute
+	// virtualProbeSizeMismatchTTL is the wrong-source backoff. A probe that
+	// finds a different release than the row declares is not a dead candidate:
+	// the provider cache is serving the wrong bytes and may heal within
+	// minutes. The marker lives under its own key (see
+	// virtualProbeSizeMismatchKey) and uses this short fixed window instead of
+	// the dead-candidate exponential backoff, so the row is re-probed promptly
+	// once the provider serves the release again.
+	virtualProbeSizeMismatchTTL = time.Minute
 	// virtualProbeFailureRepeatThreshold is the number of consecutive failures
 	// for one candidate before an unpin is allowed. A single transient failure
 	// (outer budget fired, provider RPC timeout) leaves the candidate's health
@@ -216,6 +224,14 @@ func (c *virtualProbeFailureCache) sweepLocked(now time.Time) {
 }
 
 func (c *virtualProbeFailureCache) mark(key string) {
+	c.markFor(key, virtualProbeFailureTTL, virtualProbeFailureMaxTTL)
+}
+
+// markFor records a failure for key with base as the first backoff window and
+// maxTTL as the cap, doubling the window on every repeat. Callers that need a
+// different backoff posture (the wrong-source damper) use this directly
+// instead of mark.
+func (c *virtualProbeFailureCache) markFor(key string, baseTTL, maxTTL time.Duration) {
 	if c == nil || key == "" {
 		return
 	}
@@ -238,13 +254,13 @@ func (c *virtualProbeFailureCache) mark(key string) {
 			delete(c.marks, k)
 		}
 	}
-	ttl := virtualProbeFailureTTL
+	ttl := baseTTL
 	failures := 1
 	if prev, ok := c.marks[key]; ok {
 		failures = prev.failures + 1
 		ttl = prev.ttl * 2
-		if ttl > virtualProbeFailureMaxTTL {
-			ttl = virtualProbeFailureMaxTTL
+		if ttl > maxTTL {
+			ttl = maxTTL
 		}
 	}
 	c.marks[key] = virtualProbeFailureMark{ttl: ttl, expiresAt: now.Add(ttl), failures: failures}
@@ -303,6 +319,40 @@ func (c *virtualProbeFailureCache) bumpPartial(key string) int {
 // once a complete enumeration lands so a later partial starts a fresh streak.
 func (c *virtualProbeFailureCache) clearPartial(key string) {
 	c.clear(virtualProbePartialKey(key))
+}
+
+// virtualProbeSizeMismatchKey namespaces the wrong-source damper for a
+// candidate. It is separate from the candidate's failure key on purpose: a
+// probe that read a different release's bytes says the provider cache is stale,
+// not that the release is dead, so it must never feed the dead-candidate
+// backoff or its repeat threshold.
+func virtualProbeSizeMismatchKey(key string) string {
+	if key == "" {
+		return ""
+	}
+	return key + "\x00size-mismatch"
+}
+
+// markSizeMismatch arms the short wrong-source damper for a candidate. It uses
+// one fixed window (virtualProbeSizeMismatchTTL) rather than the dead-candidate
+// exponential backoff, so the row is re-probed promptly once the provider serves
+// the release again.
+func (c *virtualProbeFailureCache) markSizeMismatch(key string) {
+	c.markFor(virtualProbeSizeMismatchKey(key), virtualProbeSizeMismatchTTL, virtualProbeSizeMismatchTTL)
+}
+
+// clearSizeMismatch drops a candidate's wrong-source marker after a probe
+// accepted the bytes it served.
+func (c *virtualProbeFailureCache) clearSizeMismatch(key string) {
+	c.clear(virtualProbeSizeMismatchKey(key))
+}
+
+// virtualProbeBackedOff reports whether either probe damper currently suppresses
+// a new probe for key: the dead-candidate failure damper or the shorter
+// wrong-file-served damper. Keep the two markers distinct so a stale provider
+// cache cannot keep a live release out for the dead-source backoff.
+func virtualProbeBackedOff(key string) bool {
+	return virtualProbeFailures.recent(key) || virtualProbeFailures.recent(virtualProbeSizeMismatchKey(key))
 }
 
 // virtualProbeVerdictUnknown reports whether an error leaves the candidate's
@@ -3437,7 +3487,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				// Zero the duration so the deferred probe measures the
 				// empirical duration instead of inheriting the catalog value.
 				probeTransient.Duration = 0
-				if virtualProbeFailures.recent(probeKey) {
+				if virtualProbeBackedOff(probeKey) {
 					// A fresh failure already consumed the probe budget. The
 					// inner probe may still have completed and landed in the
 					// cache, so try a cache-only recovery before falling back
@@ -3544,7 +3594,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				transient.HDR = true
 			}
 			h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
-			if virtualProbeFailures.recent(probeKey) {
+			if virtualProbeBackedOff(probeKey) {
 				// Damper armed: a recent failure already consumed the probe
 				// budget. No new probe is admitted; try cache-only recovery
 				// and serve declared metadata immediately.
@@ -3568,7 +3618,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenanceDeclared, ResolutionAssumed: resolutionAssumed,
 			}, resolvedIdentity, resolvedRematched), nil
 		}
-		if virtualProbeFailures.recent(probeKey) {
+		if virtualProbeBackedOff(probeKey) {
 			// A recent probe failure already consumed the probe budget. A
 			// completed inner probe may still be cached; recover it before
 			// settling for the candidate-declared metadata.
@@ -3649,6 +3699,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			return declaredFallback()
 		}
 		virtualProbeFailures.clear(probeKey)
+		virtualProbeFailures.clearSizeMismatch(probeKey)
 		if transient.ID > 0 {
 			probed.ID = transient.ID
 			probed.MediaFolderID = transient.MediaFolderID
@@ -3738,6 +3789,24 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				if item, itemErr := h.ItemLookup.GetByID(r.Context(), file.ContentID); itemErr == nil && item != nil {
 					expectedRuntimeMinutes = item.Runtime
 				}
+			}
+			if scanner.VirtualServedSizeMismatch(result.File.FileSize, result.File.ProbedFormatSize) {
+				// The probe read a readable container that is not the release
+				// this row declares. Rotate to a sibling instead of persisting
+				// a different release's inventory, but keep the wrong-source
+				// damper short so this row is retried promptly once the provider
+				// serves it again. The row is never stamped failed here: the
+				// release is not dead.
+				ownerID := candidate.OwnerInstallationID
+				if ownerID <= 0 {
+					ownerID = file.VirtualOwnerInstallationID
+				}
+				virtualProbeFailures.markSizeMismatch(virtualProbeFailureKey(candidate.URI, ownerID))
+				logVirtualProbeSizeMismatch(r.Context(), file.ID, candidate.URI, result.File.FileSize, result.File.ProbedFormatSize)
+				h.unpinVirtualSticky(stickyKey, candidate.URI)
+				attemptErr = errors.Join(attemptErr, fmt.Errorf("candidate %s served %d bytes for a declared %d-byte release",
+					candidate.URI, result.File.ProbedFormatSize, result.File.FileSize))
+				continue
 			}
 			if !virtualRuntimePlausible(result.File.Duration, expectedRuntimeMinutes) {
 				slog.WarnContext(r.Context(), "virtual candidate rejected: probed duration implausible",
@@ -4015,6 +4084,20 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 		}
 		return probeOutcomeFailed, virtualCommittedProbeInventory{}
 	}
+	if scanner.VirtualServedSizeMismatch(probeTransient.FileSize, probed.ProbedFormatSize) {
+		// The container was readable but it is not the release the row
+		// declares: the provider is serving a different file under this URL
+		// (a stale cache fill, typically). Do not persist this inventory and do
+		// not stamp the row failed — the release is not dead, the cache is stale
+		// — so the row stays eligible and is re-probed on the short wrong-source
+		// backoff. The probe input's declared size is the comparison basis
+		// because it belongs to the row whose bytes were probed, including a
+		// resolver-substituted candidate's own row.
+		virtualProbeFailures.markSizeMismatch(probeKey)
+		logVirtualProbeSizeMismatch(bgCtx, catalogFile.ID, probeCand.URI, probeTransient.FileSize, probed.ProbedFormatSize)
+		h.unpinVirtualSticky(stickyKey, probeCand.URI)
+		return probeOutcomeFailed, virtualCommittedProbeInventory{}
+	}
 	if !virtualRuntimePlausible(probed.Duration, expectedRuntimeMinutes) {
 		virtualProbeFailures.mark(probeKey)
 		slog.WarnContext(bgCtx, "background virtual probe rejected: probed duration implausible",
@@ -4025,6 +4108,7 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 	}
 	virtualProbeFailures.clear(probeKey)
 	virtualProbeFailures.clearPartial(probeKey)
+	virtualProbeFailures.clearSizeMismatch(probeKey)
 	if probeTransient.ID > 0 {
 		probed.ID = probeTransient.ID
 		probed.MediaFolderID = probeTransient.MediaFolderID
@@ -4204,7 +4288,18 @@ func (h *PlaybackHandler) virtualProbeFromCache(
 	if probed == nil {
 		return nil
 	}
+	if scanner.VirtualServedSizeMismatch(probeFile.FileSize, probed.ProbedFormatSize) {
+		// The cached evidence measured a different release's bytes. Replaying
+		// it would persist exactly the inventory the probe persist path
+		// refuses, so the hit is discarded and the row is left unprobed. The
+		// short wrong-source damper keeps the cache from being replayed on
+		// every start until the provider heals.
+		virtualProbeFailures.markSizeMismatch(virtualProbeFailureKey(probeCand.URI, ownerInstallationID))
+		logVirtualProbeSizeMismatch(ctx, catalogFile.ID, probeCand.URI, probeFile.FileSize, probed.ProbedFormatSize)
+		return nil
+	}
 	virtualProbeFailures.clear(virtualProbeFailureKey(probeCand.URI, ownerInstallationID))
+	virtualProbeFailures.clearSizeMismatch(virtualProbeFailureKey(probeCand.URI, ownerInstallationID))
 	if probeFile.ID > 0 {
 		probed.ID = probeFile.ID
 		probed.MediaFolderID = probeFile.MediaFolderID
@@ -4343,7 +4438,7 @@ func (h *PlaybackHandler) revalidateVirtualCandidateBackground(
 		}
 		probeTransient.FilePath = cand.URI
 		probeTransient.VirtualOwnerInstallationID = oid
-		if virtualProbeFailures.recent(virtualProbeFailureKey(cand.URI, oid)) {
+		if virtualProbeBackedOff(virtualProbeFailureKey(cand.URI, oid)) {
 			// The damper would skip the probe, but a completed inner probe may
 			// already be cached. Recover it so the row is not left unprobed.
 			h.recoverVirtualProbeFromCache(bgCtx, file, streamURL, probeTransient, cand, resolvedIdentity.tiers(), oid)
@@ -5601,6 +5696,12 @@ func (h *PlaybackHandler) probeVirtualCandidateForegroundFallback(
 			"component", "api", "candidate_uri", probeCand.URI, "error", probeErr)
 		return
 	}
+	if scanner.VirtualServedSizeMismatch(probeTransient.FileSize, probed.ProbedFormatSize) {
+		virtualProbeFailures.markSizeMismatch(probeKey)
+		logVirtualProbeSizeMismatch(requestCtx, catalogFile.ID, probeCand.URI, probeTransient.FileSize, probed.ProbedFormatSize)
+		h.unpinVirtualSticky(stickyKey, probeCand.URI)
+		return
+	}
 	if !virtualRuntimePlausible(probed.Duration, expectedRuntimeMinutes) {
 		virtualProbeFailures.mark(probeKey)
 		slog.WarnContext(requestCtx, "virtual foreground probe fallback rejected: probed duration implausible",
@@ -5609,6 +5710,7 @@ func (h *PlaybackHandler) probeVirtualCandidateForegroundFallback(
 		return
 	}
 	virtualProbeFailures.clear(probeKey)
+	virtualProbeFailures.clearSizeMismatch(probeKey)
 	if probeTransient.ID > 0 {
 		probed.ID = probeTransient.ID
 		probed.MediaFolderID = probeTransient.MediaFolderID
@@ -7227,7 +7329,7 @@ func (h *PlaybackHandler) virtualDeferredProbeForUnstampedRow(
 	// Zero the duration so the deferred probe measures the empirical duration
 	// instead of inheriting the catalog value.
 	probeTransient.Duration = 0
-	if virtualProbeFailures.recent(virtualProbeFailureKey(cand.URI, oid)) {
+	if virtualProbeBackedOff(virtualProbeFailureKey(cand.URI, oid)) {
 		// Damper armed: a recent failure already consumed the probe budget, so
 		// no worker is admitted. An inner probe may still have completed and
 		// landed in the cache, so recover it before declining; the caller
@@ -8183,6 +8285,15 @@ func virtualRuntimePlausible(probedSeconds, runtimeMinutes int) bool {
 	expected := float64(runtimeMinutes) * 60
 	diff := math.Abs(float64(probedSeconds) - expected)
 	return diff <= expected*virtualRuntimeTolerance
+}
+
+// logVirtualProbeSizeMismatch records a probe whose served container size does
+// not match the row's declared release size. It is distinct from the duration
+// rejection so the cause is obvious while debugging a provider's stale cache.
+func logVirtualProbeSizeMismatch(ctx context.Context, fileID int, candidateURI string, declaredBytes, servedBytes int64) {
+	slog.WarnContext(ctx, "background virtual probe rejected: served size mismatch",
+		"component", "api", "file_id", fileID, "candidate_uri", candidateURI,
+		"served_bytes", servedBytes, "declared_bytes", declaredBytes)
 }
 
 // peekVirtualSticky returns the pinned candidate URI for key, if fresh.

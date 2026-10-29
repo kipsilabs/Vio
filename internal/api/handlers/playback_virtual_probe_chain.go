@@ -548,7 +548,7 @@ func (h *PlaybackHandler) runFileProbeChain(ctx context.Context, contentID strin
 			virtualProbeChainReasonNoExactCandidate, "", virtualEvidenceLogKeyFileID, row.ID)
 		return
 	}
-	if virtualProbeFailures.recent(virtualProbeFailureKey(probeCand.URI, oid)) {
+	if virtualProbeBackedOff(virtualProbeFailureKey(probeCand.URI, oid)) {
 		logVirtualProbeChainSkip(ctx, slog.LevelDebug, trigger, contentID,
 			virtualProbeChainReasonRecentlyFailed, "", virtualEvidenceLogKeyFileID, row.ID)
 		return

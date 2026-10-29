@@ -65,6 +65,11 @@ type ProbeData struct {
 	SubtitleTracks []SubtitleTrackInfo
 	Chapters       []ChapterInfo
 	FormatTags     map[string]string // format-level tags from ffprobe (title, artist, album, date, etc.)
+	// FormatSize is ffprobe's format.size: the byte count of the container it
+	// actually read. Zero when ffprobe did not report one. Virtual playback
+	// compares it with the catalog row's declared file size to detect a
+	// provider serving a different release under the row's URL.
+	FormatSize int64
 }
 
 // VideoTrackInfo describes a probed video track.
