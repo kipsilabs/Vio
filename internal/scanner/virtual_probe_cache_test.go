@@ -124,6 +124,51 @@ func TestVirtualProbeCacheSeparatesExpectedAudioExpectations(t *testing.T) {
 	}
 }
 
+// A probe that read a different release's bytes must not be cached: the
+// playback path rejects it, and a cached entry would keep replaying that
+// rejection for the cache TTL without ever reaching fresh provider bytes.
+func TestVirtualProbeCacheDoesNotStoreServedSizeMismatch(t *testing.T) {
+	cache := NewVirtualProbeCache(time.Minute, 4)
+	file := &models.MediaFile{ID: 7, FilePath: "virtual://movie/tt7", FileSize: 8_449_999_999}
+	var mismatchedCalls atomic.Int32
+	mismatched := func(_ context.Context, _ string, input *models.MediaFile) (*models.MediaFile, error) {
+		mismatchedCalls.Add(1)
+		result := *input
+		result.ProbedFormatSize = 7_427_636_945
+		return &result, nil
+	}
+	if _, err := cache.Probe(context.Background(), "https://provider.example/video.mkv", file, mismatched); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cache.Probe(context.Background(), "https://provider.example/video.mkv", file, mismatched); err != nil {
+		t.Fatal(err)
+	}
+	if mismatchedCalls.Load() != 2 {
+		t.Fatalf("mismatched probe calls=%d, want 2: the wrong file was cached", mismatchedCalls.Load())
+	}
+	if cached := cache.Lookup("https://provider.example/video.mkv", file); cached != nil {
+		t.Fatalf("wrong-file probe result was cached: %#v", cached)
+	}
+
+	// A matching size is cached normally.
+	var matchedCalls atomic.Int32
+	matched := func(_ context.Context, _ string, input *models.MediaFile) (*models.MediaFile, error) {
+		matchedCalls.Add(1)
+		result := *input
+		result.ProbedFormatSize = 8_449_000_000
+		return &result, nil
+	}
+	if _, err := cache.Probe(context.Background(), "https://provider.example/video.mkv", file, matched); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cache.Probe(context.Background(), "https://provider.example/video.mkv", file, matched); err != nil {
+		t.Fatal(err)
+	}
+	if matchedCalls.Load() != 1 {
+		t.Fatalf("matching probe calls=%d, want 1 from the cache", matchedCalls.Load())
+	}
+}
+
 func TestVirtualProbeCacheIsBounded(t *testing.T) {
 	cache := NewVirtualProbeCache(time.Minute, 2)
 	probe := func(_ context.Context, _ string, input *models.MediaFile) (*models.MediaFile, error) {
