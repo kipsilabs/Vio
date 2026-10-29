@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math"
 	"net/http"
 	"net/url"
 	"reflect"
@@ -3664,6 +3663,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		trace.probeRan = true
 		probeStart := time.Now()
 		forwardVirtualCandidateDeclaredAudio(&syncProbeFile, cand)
+		syncProbeFile.VirtualExpectedRuntimeMinutes = h.virtualExpectedRuntimeMinutes(attemptCtx, file)
 		probed, probeErr := h.probeVirtualSource(probeCtx, streamURL, &syncProbeFile, cand.RequestHeaders)
 		trace.probe += time.Since(probeStart)
 		probeCancel()
@@ -3791,17 +3791,20 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 					expectedRuntimeMinutes = item.Runtime
 				}
 			}
-			if scanner.VirtualServedSizeMismatch(result.File.FileSize, result.File.ProbedFormatSize) {
+			ownerID := candidate.OwnerInstallationID
+			if ownerID <= 0 {
+				ownerID = file.VirtualOwnerInstallationID
+			}
+			// Size and duration decide identity together: a short posting of the
+			// right content keeps the item's runtime and is accepted, while a
+			// different file fails the duration check independently of size.
+			if scanner.VirtualServedEvidenceRejected(result.File.FileSize, result.File.ProbedFormatSize, result.File.Duration, expectedRuntimeMinutes) {
 				// The probe read a readable container that is not the release
 				// this row declares. Rotate to a sibling instead of persisting
 				// a different release's inventory, but keep the wrong-source
 				// damper short so this row is retried promptly once the provider
 				// serves it again. The row is never stamped failed here: the
 				// release is not dead.
-				ownerID := candidate.OwnerInstallationID
-				if ownerID <= 0 {
-					ownerID = file.VirtualOwnerInstallationID
-				}
 				virtualProbeFailures.markSizeMismatch(virtualProbeFailureKey(candidate.URI, ownerID))
 				logVirtualProbeSizeMismatch(r.Context(), file.ID, candidate.URI, result.File.FileSize, result.File.ProbedFormatSize)
 				h.unpinVirtualSticky(stickyKey, candidate.URI)
@@ -3822,6 +3825,10 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				// so the outer loop must not consume it on the next iteration.
 				fastPathHit = false
 				continue
+			}
+			if scanner.VirtualServedSizeMismatch(result.File.FileSize, result.File.ProbedFormatSize) {
+				logVirtualProbeSizeMismatchAccepted(r.Context(), file.ID, candidate.URI, result.File.FileSize, result.File.ProbedFormatSize, result.File.Duration, expectedRuntimeMinutes)
+				virtualProbeFailures.clearSizeMismatch(virtualProbeFailureKey(candidate.URI, ownerID))
 			}
 			if !virtualRuntimePlausible(result.File.Duration, expectedRuntimeMinutes) {
 				slog.WarnContext(r.Context(), "virtual candidate rejected: probed duration implausible",
@@ -3933,15 +3940,16 @@ const virtualServedSizeMismatchFallbackLimit = 3
 
 // fallbackSameReleaseAfterServedSizeMismatch probes the mismatched candidate's
 // same-release siblings in picker order, stopping at the first whose served
-// bytes match its own declared size. The candidate loop's outer behavior is
+// bytes are accepted for that row — equal to its declared size, or short of it
+// with a duration that proves identity. The candidate loop's outer behavior is
 // unchanged: this runs only on a mismatch, is bounded, and returns nil when no
-// sibling matches so the caller continues exactly as before.
+// sibling is accepted so the caller continues exactly as before.
 //
 // A verified sibling's bytes belong to the sibling's row, never the selected
 // row's, so the matched inventory is persisted against the sibling row through
 // the existing evidence sink and the sibling becomes the effective source.
 // The selected row keeps the short wrong-source damper armed by its caller;
-// each mismatching sibling arms the same short damper, and none is stamped
+// each rejected sibling arms the same short damper, and none is stamped
 // failed_at — the release is not dead, the provider's cache served the wrong
 // file.
 func (h *PlaybackHandler) fallbackSameReleaseAfterServedSizeMismatch(
@@ -4000,11 +4008,16 @@ func (h *PlaybackHandler) fallbackSameReleaseAfterServedSizeMismatch(
 			(result.File.ID > 0 && result.File.ID != siblingRow.ID) {
 			continue
 		}
-		if scanner.VirtualServedSizeMismatch(result.File.FileSize, result.File.ProbedFormatSize) {
+		siblingExpectedRuntimeMinutes := h.virtualExpectedRuntimeMinutes(ctx, siblingRow)
+		if scanner.VirtualServedEvidenceRejected(result.File.FileSize, result.File.ProbedFormatSize, result.File.Duration, siblingExpectedRuntimeMinutes) {
 			virtualProbeFailures.markSizeMismatch(virtualProbeFailureKey(sibling.URI, ownerID))
 			logVirtualProbeSizeMismatch(ctx, siblingRow.ID, sibling.URI, result.File.FileSize, result.File.ProbedFormatSize)
 			h.unpinVirtualSticky(stickyKey, sibling.URI)
 			continue
+		}
+		if scanner.VirtualServedSizeMismatch(result.File.FileSize, result.File.ProbedFormatSize) {
+			logVirtualProbeSizeMismatchAccepted(ctx, siblingRow.ID, sibling.URI, result.File.FileSize, result.File.ProbedFormatSize, result.File.Duration, siblingExpectedRuntimeMinutes)
+			virtualProbeFailures.clearSizeMismatch(virtualProbeFailureKey(sibling.URI, ownerID))
 		}
 		h.persistVirtualProbeEvidence(ctx, siblingRow, result.File.FilePath, result.File,
 			resolvedSourceIdentity(result).tiers(), true, true)
@@ -4119,10 +4132,11 @@ func (h *PlaybackHandler) virtualExpectedRuntimeMinutes(ctx context.Context, fil
 	return expected
 }
 
-// virtualSiblingProbe is one same-release sibling row that served bytes
-// matching its own declared size. It is the probe chain's new target: the row,
-// its candidate, the probe input, and the enumerated bytes all belong to the
-// sibling, never the row the probe was originally asked about.
+// virtualSiblingProbe is one same-release sibling row whose served bytes are
+// accepted for that row: either matching its own declared size or short of it
+// with a duration that proves identity. It is the probe chain's new target: the
+// row, its candidate, the probe input, and the enumerated bytes all belong to
+// the sibling, never the row the probe was originally asked about.
 type virtualSiblingProbe struct {
 	row       *models.MediaFile
 	cand      VirtualPlaybackStream
@@ -4132,14 +4146,15 @@ type virtualSiblingProbe struct {
 }
 
 // matchSameReleaseSiblingProbe probes the selected row's same-release sibling
-// rows in picker order, stopping at the first whose served bytes match its own
-// declared size. The version list supplies both the order and the release
-// grouping, so this does not invent a second identity rule. It returns nil when
-// no sibling matches, leaving the caller's original failure path untouched.
+// rows in picker order, stopping at the first whose served bytes are accepted
+// for that row (size match, or a short posting whose duration proves identity).
+// The version list supplies both the order and the release grouping, so this
+// does not invent a second identity rule. It returns nil when no sibling is
+// accepted, leaving the caller's original failure path untouched.
 //
 // Every attempt is bounded by the caller's existing probe context: no new
-// timeout is introduced. A sibling whose bytes also mismatch arms the same
-// short wrong-source damper; no sibling is ever stamped failed_at.
+// timeout is introduced. A sibling whose bytes are rejected arms the same short
+// wrong-source damper; no sibling is ever stamped failed_at.
 func (h *PlaybackHandler) matchSameReleaseSiblingProbe(ctx context.Context, anchor *models.MediaFile, anchorCand VirtualPlaybackStream, ownerInstallationID int) *virtualSiblingProbe {
 	rows := h.sameReleaseSiblingRows(ctx, anchor, anchorCand)
 	for i, row := range rows {
@@ -4173,15 +4188,20 @@ func (h *PlaybackHandler) matchSameReleaseSiblingProbe(ctx context.Context, anch
 		// Zero the duration so the sibling's probe measures the empirical
 		// duration instead of inheriting the catalog value.
 		transient.Duration = 0
+		transient.VirtualExpectedRuntimeMinutes = h.virtualExpectedRuntimeMinutes(ctx, row)
 		forwardVirtualCandidateDeclaredAudio(&transient, *cand)
 		probed, err := h.probeVirtualSource(ctx, probeURL, &transient, probeHeaders)
 		if err != nil || probed == nil {
 			continue
 		}
-		if scanner.VirtualServedSizeMismatch(transient.FileSize, probed.ProbedFormatSize) {
+		if scanner.VirtualServedEvidenceRejected(transient.FileSize, probed.ProbedFormatSize, probed.Duration, transient.VirtualExpectedRuntimeMinutes) {
 			virtualProbeFailures.markSizeMismatch(virtualProbeFailureKey(cand.URI, cand.OwnerInstallationID))
 			logVirtualProbeSizeMismatch(ctx, row.ID, cand.URI, transient.FileSize, probed.ProbedFormatSize)
 			continue
+		}
+		if scanner.VirtualServedSizeMismatch(transient.FileSize, probed.ProbedFormatSize) {
+			logVirtualProbeSizeMismatchAccepted(ctx, row.ID, cand.URI, transient.FileSize, probed.ProbedFormatSize, probed.Duration, transient.VirtualExpectedRuntimeMinutes)
+			virtualProbeFailures.clearSizeMismatch(virtualProbeFailureKey(cand.URI, cand.OwnerInstallationID))
 		}
 		return &virtualSiblingProbe{
 			row:       row,
@@ -4359,6 +4379,9 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 	// as verified. It is a no-op for the deferred and declared paths, whose
 	// probe input the resolve already merged the candidate onto.
 	forwardVirtualCandidateDeclaredAudio(&probeTransient, probeCand)
+	// Carry the expected runtime on the probe input so the probe cache applies
+	// the same size/duration identity rule it is stored under.
+	probeTransient.VirtualExpectedRuntimeMinutes = expectedRuntimeMinutes
 	probeCtx, probeCancel := context.WithTimeout(bgCtx, virtualBackgroundProbeBudget)
 	probed, probeErr := h.probeVirtualSource(probeCtx, probeURL, &probeTransient, probeCand.RequestHeaders)
 	probeCancel()
@@ -4410,7 +4433,13 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 	}
 	anchorFileID := catalogFileIDOrZero(catalogFile)
 	var adoptedSibling *virtualSiblingProbe
-	if scanner.VirtualServedSizeMismatch(probeTransient.FileSize, probed.ProbedFormatSize) {
+	// Size and duration decide identity together. A served container that
+	// disagrees with the row's declared release size is only a different
+	// release when its measured duration cannot prove otherwise: a release
+	// posted short of the indexer's advertised size still carries the item's
+	// runtime, while a different file (a remux of another title, say) fails
+	// the duration check independently of its size.
+	if scanner.VirtualServedEvidenceRejected(probeTransient.FileSize, probed.ProbedFormatSize, probed.Duration, expectedRuntimeMinutes) {
 		// The container was readable but it is not the release the row
 		// declares: the provider is serving a different file under this URL
 		// (a stale cache fill, typically). Do not persist this inventory and do
@@ -4439,6 +4468,12 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersistWith(
 		candidate = sibling.identity
 		probeKey = virtualProbeFailureKey(probeCand.URI, probeCand.OwnerInstallationID)
 		adoptedSibling = sibling
+	} else if scanner.VirtualServedSizeMismatch(probeTransient.FileSize, probed.ProbedFormatSize) {
+		// The posting is short of what the indexer advertised but the duration
+		// proves the content: accept the evidence so the row gets its real
+		// inventory. The size disagreement stays logged so a short posting is
+		// still visible to an operator.
+		logVirtualProbeSizeMismatchAccepted(bgCtx, anchorFileID, probeCand.URI, probeTransient.FileSize, probed.ProbedFormatSize, probed.Duration, expectedRuntimeMinutes)
 	}
 	if !virtualRuntimePlausible(probed.Duration, expectedRuntimeMinutes) {
 		virtualProbeFailures.mark(probeKey)
@@ -4632,15 +4667,21 @@ func (h *PlaybackHandler) virtualProbeFromCache(
 	if probed == nil {
 		return nil
 	}
-	if scanner.VirtualServedSizeMismatch(probeFile.FileSize, probed.ProbedFormatSize) {
+	expectedRuntimeMinutes := h.virtualExpectedRuntimeMinutes(ctx, catalogFile)
+	if scanner.VirtualServedEvidenceRejected(probeFile.FileSize, probed.ProbedFormatSize, probed.Duration, expectedRuntimeMinutes) {
 		// The cached evidence measured a different release's bytes. Replaying
 		// it would persist exactly the inventory the probe persist path
 		// refuses, so the hit is discarded and the row is left unprobed. The
 		// short wrong-source damper keeps the cache from being replayed on
-		// every start until the provider heals.
+		// every start until the provider heals. A size mismatch whose duration
+		// proves the content is a short posting, not a wrong file, and is used
+		// normally below.
 		virtualProbeFailures.markSizeMismatch(virtualProbeFailureKey(probeCand.URI, ownerInstallationID))
 		logVirtualProbeSizeMismatch(ctx, catalogFile.ID, probeCand.URI, probeFile.FileSize, probed.ProbedFormatSize)
 		return nil
+	}
+	if scanner.VirtualServedSizeMismatch(probeFile.FileSize, probed.ProbedFormatSize) {
+		logVirtualProbeSizeMismatchAccepted(ctx, catalogFile.ID, probeCand.URI, probeFile.FileSize, probed.ProbedFormatSize, probed.Duration, expectedRuntimeMinutes)
 	}
 	virtualProbeFailures.clear(virtualProbeFailureKey(probeCand.URI, ownerInstallationID))
 	virtualProbeFailures.clearSizeMismatch(virtualProbeFailureKey(probeCand.URI, ownerInstallationID))
@@ -6028,6 +6069,7 @@ func (h *PlaybackHandler) probeVirtualCandidateForegroundFallback(
 	probeCtx, probeCancel := context.WithTimeout(context.WithoutCancel(requestCtx), virtualEvidenceFallbackBudget)
 	defer probeCancel()
 	forwardVirtualCandidateDeclaredAudio(&probeTransient, probeCand)
+	probeTransient.VirtualExpectedRuntimeMinutes = expectedRuntimeMinutes
 	probed, probeErr := h.probeVirtualSource(probeCtx, probeURL, &probeTransient, probeCand.RequestHeaders)
 	if probeErr != nil || probed == nil {
 		// A short-budget fallback timeout leaves the verdict unknown: do not
@@ -6040,11 +6082,14 @@ func (h *PlaybackHandler) probeVirtualCandidateForegroundFallback(
 			"component", "api", "candidate_uri", probeCand.URI, "error", probeErr)
 		return
 	}
-	if scanner.VirtualServedSizeMismatch(probeTransient.FileSize, probed.ProbedFormatSize) {
+	if scanner.VirtualServedEvidenceRejected(probeTransient.FileSize, probed.ProbedFormatSize, probed.Duration, expectedRuntimeMinutes) {
 		virtualProbeFailures.markSizeMismatch(probeKey)
 		logVirtualProbeSizeMismatch(requestCtx, catalogFile.ID, probeCand.URI, probeTransient.FileSize, probed.ProbedFormatSize)
 		h.unpinVirtualSticky(stickyKey, probeCand.URI)
 		return
+	}
+	if scanner.VirtualServedSizeMismatch(probeTransient.FileSize, probed.ProbedFormatSize) {
+		logVirtualProbeSizeMismatchAccepted(requestCtx, catalogFile.ID, probeCand.URI, probeTransient.FileSize, probed.ProbedFormatSize, probed.Duration, expectedRuntimeMinutes)
 	}
 	if !virtualRuntimePlausible(probed.Duration, expectedRuntimeMinutes) {
 		virtualProbeFailures.mark(probeKey)
@@ -8609,35 +8654,35 @@ const (
 	virtualStickyMaxPins = 4096
 )
 
-// virtualRuntimeTolerance is the maximum fraction a probed candidate duration
-// may deviate from the catalog runtime before the candidate is treated as
-// mislabeled content rather than a legitimate release.
-//
-// 0.30 accommodates anime and international content where fansub groups trim
-// OP/ED sequences and streaming cuts differ from broadcast metadata by 3–5
-// minutes on a typical 24-minute episode. Genuinely wrong content (a trailer,
-// a sample, or a different show) differs by far more than this.
-const virtualRuntimeTolerance = 0.30
-
 // virtualRuntimePlausible reports whether a probed candidate's duration is
-// consistent with the item's catalog runtime. Unknown values pass: the gate
-// only rejects when both sides are known and clearly disagree.
+// consistent with the item's catalog runtime. The tolerance lives in
+// scanner.VirtualRuntimeTolerance so the probe cache and the persist paths
+// share one rule.
 func virtualRuntimePlausible(probedSeconds, runtimeMinutes int) bool {
-	if probedSeconds <= 0 || runtimeMinutes <= 0 {
-		return true
-	}
-	expected := float64(runtimeMinutes) * 60
-	diff := math.Abs(float64(probedSeconds) - expected)
-	return diff <= expected*virtualRuntimeTolerance
+	return scanner.VirtualRuntimePlausible(probedSeconds, runtimeMinutes)
 }
 
 // logVirtualProbeSizeMismatch records a probe whose served container size does
-// not match the row's declared release size. It is distinct from the duration
-// rejection so the cause is obvious while debugging a provider's stale cache.
+// not match the row's declared release size and whose duration did not prove
+// identity. It is distinct from the duration rejection so the cause is obvious
+// while debugging a provider's stale cache.
 func logVirtualProbeSizeMismatch(ctx context.Context, fileID int, candidateURI string, declaredBytes, servedBytes int64) {
 	slog.WarnContext(ctx, "background virtual probe rejected: served size mismatch",
 		"component", "api", "file_id", fileID, "candidate_uri", candidateURI,
 		"served_bytes", servedBytes, "declared_bytes", declaredBytes)
+}
+
+// logVirtualProbeSizeMismatchAccepted records a probe whose served container
+// size does not match the row's declared release size but whose measured
+// duration proves the content is the right one. The release was posted short
+// of what the indexer advertised; the bytes are kept, and the warning keeps the
+// posting discrepancy visible instead of hiding it.
+func logVirtualProbeSizeMismatchAccepted(ctx context.Context, fileID int, candidateURI string, declaredBytes, servedBytes int64, probedSeconds, expectedRuntimeMinutes int) {
+	slog.WarnContext(ctx, "background virtual probe accepted despite size mismatch",
+		"component", "api", "file_id", fileID, "candidate_uri", candidateURI,
+		"served_bytes", servedBytes, "declared_bytes", declaredBytes,
+		"probed_duration_seconds", probedSeconds,
+		"expected_runtime_minutes", expectedRuntimeMinutes)
 }
 
 // peekVirtualSticky returns the pinned candidate URI for key, if fresh.
