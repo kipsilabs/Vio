@@ -891,3 +891,113 @@ func TestDefaultProbeChainAdmissionCancelsLiveChain(t *testing.T) {
 		t.Fatal("chain context was not canceled")
 	}
 }
+
+// TestScheduleSelectedFileProbeProbesTheSelectedRow pins probe-on-select: an
+// explicit selection schedules the shared chain for the row it names, never the
+// resolved default, and a row that already carries probe evidence schedules no
+// probe at all.
+func TestScheduleSelectedFileProbeProbesTheSelectedRow(t *testing.T) {
+	defaultRow := probeChainRow(740, "virtual://movie/probe-chain?result=default", nil)
+	selectedRow := probeChainRow(741, "virtual://movie/probe-chain?result=selected", nil)
+	reader := &probeChainVersionReader{
+		files: []*models.MediaFile{defaultRow, selectedRow},
+		rows:  map[int]*models.MediaFile{defaultRow.ID: defaultRow, selectedRow.ID: selectedRow},
+	}
+	prober := &recordingProber{}
+	h := &PlaybackHandler{
+		ServiceContext:              context.Background(),
+		DefaultProbeTarget:          NewVirtualDefaultProbeTarget(reader, reader),
+		VirtualPlaybackSourceProber: prober.probe,
+	}
+
+	h.ScheduleSelectedFileProbe(probeChainTestContent, selectedRow.ID, catalog.AccessFilter{AllowedLibraryIDs: []int{77}})
+	h.probeChainWG.Wait()
+
+	if prober.count() != 1 || prober.last() != probeChainProviderURL(selectedRow) {
+		t.Fatalf("probes = %d, last = %q; want exactly the selected row %q", prober.count(), prober.last(), probeChainProviderURL(selectedRow))
+	}
+	if _, reads := reader.snapshot(); len(reads) != 1 || reads[0] != selectedRow.ID {
+		t.Fatalf("file rows read = %v, want only the selected row %d", reads, selectedRow.ID)
+	}
+
+	// Fresh inventory: the same selection must schedule nothing to probe.
+	probedAt := time.Now()
+	selectedRow.ProbeUpdatedAt = &probedAt
+	h.ScheduleSelectedFileProbe(probeChainTestContent, selectedRow.ID, catalog.AccessFilter{AllowedLibraryIDs: []int{77}})
+	h.probeChainWG.Wait()
+	if prober.count() != 1 {
+		t.Fatalf("probes after a selected row with fresh inventory = %d, want no new probe", prober.count())
+	}
+}
+
+type selectionProbeCall struct {
+	contentID string
+	fileID    int
+	filter    catalog.AccessFilter
+}
+
+// recordingSelectionProber records what the watch-detail trigger hands to the
+// probe scheduler.
+type recordingSelectionProber struct {
+	mu    sync.Mutex
+	calls []selectionProbeCall
+}
+
+func (r *recordingSelectionProber) ScheduleSelectedFileProbe(contentID string, fileID int, filter catalog.AccessFilter) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = append(r.calls, selectionProbeCall{contentID: contentID, fileID: fileID, filter: filter})
+}
+
+func (r *recordingSelectionProber) snapshot() []selectionProbeCall {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Clone(r.calls)
+}
+
+// TestWatchDetailSelectionSchedulesProbeOnlyForUnprobedVirtualRow pins the
+// trigger rule: only a read that names an explicit, virtual, still-unprobed
+// version schedules a probe. A bare read, a local selection, and a selection
+// with fresh inventory all schedule nothing.
+func TestWatchDetailSelectionSchedulesProbeOnlyForUnprobedVirtualRow(t *testing.T) {
+	prober := &recordingSelectionProber{}
+	h := &ItemsHandler{virtualSelectionProber: prober}
+	detail := &catalog.WatchDetail{
+		ContentID: "episode-select",
+		Type:      itemTypeEpisode,
+		Versions: []catalog.FileVersion{
+			{FileID: 21, FilePath: "/media/local/episode.mkv"},
+			{FileID: 22, FilePath: "virtual://series/show/s01e01?result=lupins03e01hdr2160pwebh265edith"},
+		},
+	}
+
+	// A bare read carries no selection: nothing is scheduled.
+	h.scheduleSelectedVirtualProbe(detail, catalog.AccessFilter{})
+	if got := prober.snapshot(); len(got) != 0 {
+		t.Fatalf("bare read scheduled %d probes, want none", len(got))
+	}
+
+	// An explicit selection of the virtual row schedules exactly that row.
+	h.scheduleSelectedVirtualProbe(detail, catalog.AccessFilter{SelectedFileID: 22})
+	got := prober.snapshot()
+	if len(got) != 1 {
+		t.Fatalf("explicit selection scheduled %d probes, want 1", len(got))
+	}
+	if got[0].contentID != detail.ContentID || got[0].fileID != 22 || got[0].filter.SelectedFileID != 22 {
+		t.Fatalf("scheduled probe = %+v, want content %q file 22 with its selection", got[0], detail.ContentID)
+	}
+
+	// Selecting a local row has no provider bytes to enumerate.
+	h.scheduleSelectedVirtualProbe(detail, catalog.AccessFilter{SelectedFileID: 21})
+	if got := prober.snapshot(); len(got) != 1 {
+		t.Fatalf("local selection scheduled %d probes, want none", len(got)-1)
+	}
+
+	// A selected row with fresh inventory needs no probe.
+	probedAt := time.Now()
+	detail.Versions[1].ProbedAt = &probedAt
+	h.scheduleSelectedVirtualProbe(detail, catalog.AccessFilter{SelectedFileID: 22})
+	if got := prober.snapshot(); len(got) != 1 {
+		t.Fatalf("fresh selection scheduled %d probes, want none", len(got)-1)
+	}
+}

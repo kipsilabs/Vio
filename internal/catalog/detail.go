@@ -648,6 +648,11 @@ type FileVersion struct {
 	// replaced. Jellyfin PlaybackInfo leaves such versions out. Neither the v1
 	// nor the v2 view carries the flag.
 	Unreadable bool `json:"-"`
+	// ProbedAt is when ffprobe last enumerated the file's real stream table;
+	// nil means the row still carries declared metadata only. Server-side
+	// only: the pre-play probe scheduler uses it to leave a selected row with
+	// fresh inventory alone.
+	ProbedAt *time.Time `json:"-"`
 }
 
 // SetMarkers refreshes the marker projection without rebuilding file metadata.
@@ -4763,6 +4768,7 @@ func (s *DetailService) buildPlaybackInfoWith(
 				return s.PresignURLsWithExpiry(ctx, paths, "card")
 			}),
 			Unreadable: f.ProbeRejected(),
+			ProbedAt:   f.ProbeUpdatedAt,
 		})
 
 		for _, sub := range f.SubtitleTracks {
