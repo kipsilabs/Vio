@@ -466,40 +466,34 @@ func virtualProbeStreamSnapshot(base VirtualPlaybackStream) VirtualPlaybackStrea
 	return clone
 }
 
-// runFileProbeChain is the body of one admitted chain. It probes either the
-// item's default version (discovery trigger) or one explicitly selected
-// version (selection trigger); the authorization read, the virtual guard, the
-// probe stamp, the failure damper, the detached gate, the durable evidence
-// write, and the versions_updated publish are the same for both. Every step is
-// bounded by the chain context; a failure or an unsafe target leaves one
-// structured skip line naming the reason (see logVirtualProbeChainSkip).
-func (h *PlaybackHandler) runFileProbeChain(ctx context.Context, contentID string, source *models.MediaFile, streams []VirtualPlaybackStream, filter catalog.AccessFilter, trigger string, explicitSelection bool) {
+// resolveFileProbeTarget re-reads and authorizes the row one admitted chain may
+// probe, logging the reason and returning ok=false for every refusal. The
+// target is never the request-time row: discovery may have replaced the rows
+// between the listing and the persistence of this chain's inputs, so it is
+// whatever the catalog serves now for this item, under the triggering request's
+// access filter. A selection chain carries its file id in that filter, so the
+// same read resolves the row the viewer picked (see VirtualDefaultProbeTarget).
+func (h *PlaybackHandler) resolveFileProbeTarget(ctx context.Context, contentID string, filter catalog.AccessFilter, trigger string, explicitSelection bool) (*models.MediaFile, bool) {
 	if err := ctx.Err(); err != nil {
 		logVirtualProbeChainSkip(ctx, slog.LevelInfo, trigger, contentID,
 			virtualProbeChainReasonBudgetExpired, "chain_start", virtualEvidenceLogKeyError, err)
-		return
+		return nil, false
 	}
-	// Re-read the persisted target. Discovery may have replaced the rows
-	// between the listing and the persistence of this chain's inputs, so the
-	// target is never the request-time row: it is whatever the catalog
-	// serves now for this item, under the triggering request's access filter.
-	// A selection chain carries its file id in that filter, so the same read
-	// resolves the row the viewer picked (see VirtualDefaultProbeTarget).
 	row, err := h.DefaultProbeTarget.DefaultVirtualProbeTarget(ctx, contentID, filter)
 	if err != nil {
 		if ctx.Err() != nil {
 			logVirtualProbeChainSkip(ctx, slog.LevelInfo, trigger, contentID,
 				virtualProbeChainReasonBudgetExpired, "target_read", virtualEvidenceLogKeyError, ctx.Err())
-			return
+			return nil, false
 		}
 		logVirtualProbeChainSkip(ctx, slog.LevelInfo, trigger, contentID,
 			virtualProbeChainReasonDefaultUnavailable, "target_read", virtualEvidenceLogKeyError, err)
-		return
+		return nil, false
 	}
 	if ctx.Err() != nil {
 		logVirtualProbeChainSkip(ctx, slog.LevelInfo, trigger, contentID,
 			virtualProbeChainReasonBudgetExpired, "target_read", virtualEvidenceLogKeyError, ctx.Err())
-		return
+		return nil, false
 	}
 	if row == nil {
 		reason := virtualProbeChainReasonNoDefaultVersion
@@ -508,18 +502,33 @@ func (h *PlaybackHandler) runFileProbeChain(ctx context.Context, contentID strin
 		}
 		logVirtualProbeChainSkip(ctx, slog.LevelDebug, trigger, contentID,
 			reason, "")
-		return
+		return nil, false
 	}
 	// A selection chain must probe the row it names. A target that resolves
 	// anything else never authorizes speculative bytes on the viewer's behalf.
 	if explicitSelection && row.ID != filter.SelectedFileID {
 		logVirtualProbeChainSkip(ctx, slog.LevelDebug, trigger, contentID,
 			virtualProbeChainReasonNoExactCandidate, "selection_mismatch", virtualEvidenceLogKeyFileID, row.ID)
-		return
+		return nil, false
 	}
 	if !isVirtualPlaybackFile(row) {
 		logVirtualProbeChainSkip(ctx, slog.LevelDebug, trigger, contentID,
 			virtualProbeChainReasonNotVirtual, "")
+		return nil, false
+	}
+	return row, true
+}
+
+// runFileProbeChain is the body of one admitted chain. It probes either the
+// item's default version (discovery trigger) or one explicitly selected
+// version (selection trigger); the authorization read, the virtual guard, the
+// probe stamp, the failure damper, the detached gate, the durable evidence
+// write, and the versions_updated publish are the same for both. Every step is
+// bounded by the chain context; a failure or an unsafe target leaves one
+// structured skip line naming the reason (see logVirtualProbeChainSkip).
+func (h *PlaybackHandler) runFileProbeChain(ctx context.Context, contentID string, source *models.MediaFile, streams []VirtualPlaybackStream, filter catalog.AccessFilter, trigger string, explicitSelection bool) {
+	row, ok := h.resolveFileProbeTarget(ctx, contentID, filter, trigger, explicitSelection)
+	if !ok {
 		return
 	}
 	// Stamp skip and damper check happen inside admitted work — the admission
