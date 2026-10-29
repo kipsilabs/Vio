@@ -241,6 +241,15 @@ func (m *mapper) itemFromDetail(item upstreamItemDetail, isFavorite bool, progre
 // parameter — matching Jellyfin's opt-in semantics for People, MediaSources,
 // MediaStreams, and Chapters.
 func (m *mapper) itemFromDetailWithFields(item upstreamItemDetail, isFavorite bool, progress *upstreamProgress, requestedFields map[string]bool) baseItemDTO {
+	return m.itemFromDetailWithFieldsSelected(item, 0, isFavorite, progress, requestedFields)
+}
+
+// itemFromDetailWithFieldsSelected is itemFromDetailWithFields with an explicit
+// active version. selectedFileID is the version the request is built around
+// (the media-source id in the item position, when a client uses one); it is
+// protected from the durable-failed filter so a dead verdict cannot remove the
+// row the client is already on.
+func (m *mapper) itemFromDetailWithFieldsSelected(item upstreamItemDetail, selectedFileID int, isFavorite bool, progress *upstreamProgress, requestedFields map[string]bool) baseItemDTO {
 	allFields := requestedFields == nil
 	wantField := func(name string) bool {
 		return allFields || requestedFields[name]
@@ -348,9 +357,10 @@ func (m *mapper) itemFromDetailWithFields(item upstreamItemDetail, isFavorite bo
 	} else if item.Year > 0 {
 		dto.PremiereDate = syntheticPremiereDate(item.Year)
 	}
-	if isPlayableItemType(item.Type) && len(item.Versions) > 0 {
-		dto.MediaSourceCount = len(item.Versions)
-		firstVersion := item.Versions[0]
+	versions := compatLiveVersions(item.Versions, selectedFileID)
+	if isPlayableItemType(item.Type) && len(versions) > 0 {
+		dto.MediaSourceCount = len(versions)
+		firstVersion := versions[0]
 		if firstVersion.Duration > 0 {
 			dto.RunTimeTicks = secondsToTicks(float64(firstVersion.Duration))
 		}
@@ -359,7 +369,7 @@ func (m *mapper) itemFromDetailWithFields(item upstreamItemDetail, isFavorite bo
 		// (Static=true streaming) of items it believes it cannot download.
 		// The flag is backed by the /Items/{id}/Download route (streams.go).
 		dto.CanDownload = true
-		dto.HasSubtitles = versionsHaveSubtitles(item.Versions)
+		dto.HasSubtitles = versionsHaveSubtitles(versions)
 		dto.SupportsSync = false
 		dto.Container = strings.ToLower(firstVersion.Container)
 		applyPlayableLocation(&dto, true)
@@ -375,13 +385,13 @@ func (m *mapper) itemFromDetailWithFields(item upstreamItemDetail, isFavorite bo
 		// among them) render versions from the item DTO rather than issuing a
 		// separate PlaybackInfo call, so omitting the field leaves their version
 		// menu empty while single-version clients see no difference.
-		wantMediaSources := wantField("mediasources") || len(item.Versions) > 1
+		wantMediaSources := wantField("mediasources") || len(versions) > 1
 		wantMediaStreams := wantField("mediastreams")
 		if wantMediaSources {
-			dto.MediaSources = make([]mediaSourceDTO, 0, len(item.Versions))
+			dto.MediaSources = make([]mediaSourceDTO, 0, len(versions))
 		}
 		if wantMediaSources || wantMediaStreams {
-			for _, version := range item.Versions {
+			for _, version := range versions {
 				sourceID := m.codec.EncodeIntID(EncodedIDMediaSource, int64(version.FileID))
 				streams := buildMediaStreams(routeItemID, sourceID, version)
 				if wantMediaStreams {
@@ -396,7 +406,7 @@ func (m *mapper) itemFromDetailWithFields(item upstreamItemDetail, isFavorite bo
 			dto.Chapters = compatChapters(firstVersion.Chapters, firstVersion.AddedAt)
 		}
 		if wantField("trickplay") {
-			dto.Trickplay = m.compatTrickplay(item.Versions)
+			dto.Trickplay = m.compatTrickplay(versions)
 		}
 	} else if isPlayableItemType(item.Type) {
 		// Provider-metadata-only (unaired/missing) item: version data is
@@ -409,7 +419,7 @@ func (m *mapper) itemFromDetailWithFields(item upstreamItemDetail, isFavorite bo
 		"type", item.Type,
 		"is_folder", dto.IsFolder,
 		"media_type", dto.MediaType,
-		"versions", len(item.Versions),
+		"versions", len(versions),
 		"media_sources", len(dto.MediaSources),
 	)
 	return dto

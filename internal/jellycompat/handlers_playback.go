@@ -2417,6 +2417,20 @@ func (h *PlaybackHandler) HandlePlaybackInfo(w http.ResponseWriter, r *http.Requ
 			req.MediaSourceID = pathMediaSourceID
 		}
 	}
+	// The requested media source is the active version for this negotiation. A
+	// failed verdict must not remove it mid-session, so it is the one row the
+	// dead-version filter protects; with no request source, an all-failed list
+	// still comes back whole instead of as an empty PlaybackInfo.
+	selectedFileID := 0
+	if req.MediaSourceID != "" {
+		for _, version := range detail.Versions {
+			if mediaSourceIDsEqual(h.codec.EncodeIntID(EncodedIDMediaSource, int64(version.FileID)), req.MediaSourceID) {
+				selectedFileID = version.FileID
+				break
+			}
+		}
+	}
+	detail.Versions = compatLiveVersions(detail.Versions, selectedFileID)
 	hadVirtualPrepErr := false
 	unreadableSkipped := false
 	for _, version := range detail.Versions {
