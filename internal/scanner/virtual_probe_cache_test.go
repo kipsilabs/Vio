@@ -169,6 +169,82 @@ func TestVirtualProbeCacheDoesNotStoreServedSizeMismatch(t *testing.T) {
 	}
 }
 
+// A short-posted release is the right content even though its served container
+// is smaller than the row declares. The cache keeps that evidence when the
+// measured duration proves identity, so the playback path reuses it instead of
+// re-probing the provider on every start.
+func TestVirtualProbeCacheStoresServedSizeMismatchWhenDurationProvesIdentity(t *testing.T) {
+	cache := NewVirtualProbeCache(time.Minute, 4)
+	file := &models.MediaFile{
+		ID: 7, FilePath: "virtual://movie/tt7", FileSize: 6_330_000_000,
+		VirtualExpectedRuntimeMinutes: 51,
+	}
+	var calls atomic.Int32
+	probe := func(_ context.Context, _ string, input *models.MediaFile) (*models.MediaFile, error) {
+		calls.Add(1)
+		result := *input
+		result.ProbedFormatSize = 5_570_000_000 // 12% short posting
+		result.Duration = 3072                  // 51.2 minutes: identity proven
+		return &result, nil
+	}
+	if _, err := cache.Probe(context.Background(), "https://provider.example/video.mkv", file, probe); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cache.Probe(context.Background(), "https://provider.example/video.mkv", file, probe); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("short-posting probe calls=%d, want 1 from the cache", calls.Load())
+	}
+	if cached := cache.Lookup("https://provider.example/video.mkv", file); cached == nil {
+		t.Fatal("duration-proven short posting was not cached")
+	}
+}
+
+// The cache mirrors the persist path's rejection rule: a size mismatch is only a
+// wrong file when the duration cannot prove identity, so unknown or implausible
+// duration evidence is never cached.
+func TestVirtualProbeCacheDoesNotStoreServedSizeMismatchWithoutDurationProof(t *testing.T) {
+	tests := []struct {
+		name          string
+		expectedMins  int
+		probedSeconds int
+	}{
+		{name: "expected runtime unknown", expectedMins: 0, probedSeconds: 3072},
+		{name: "probed duration unknown", expectedMins: 39, probedSeconds: 0},
+		{name: "probed duration implausible", expectedMins: 39, probedSeconds: 3072},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cache := NewVirtualProbeCache(time.Minute, 4)
+			file := &models.MediaFile{
+				ID: 7, FilePath: "virtual://movie/tt7", FileSize: 8_449_999_999,
+				VirtualExpectedRuntimeMinutes: tt.expectedMins,
+			}
+			var calls atomic.Int32
+			probe := func(_ context.Context, _ string, input *models.MediaFile) (*models.MediaFile, error) {
+				calls.Add(1)
+				result := *input
+				result.ProbedFormatSize = 7_427_636_945
+				result.Duration = tt.probedSeconds
+				return &result, nil
+			}
+			if _, err := cache.Probe(context.Background(), "https://provider.example/video.mkv", file, probe); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := cache.Probe(context.Background(), "https://provider.example/video.mkv", file, probe); err != nil {
+				t.Fatal(err)
+			}
+			if calls.Load() != 2 {
+				t.Fatalf("probe calls=%d, want 2: unproven wrong-file evidence was cached", calls.Load())
+			}
+			if cached := cache.Lookup("https://provider.example/video.mkv", file); cached != nil {
+				t.Fatalf("unproven wrong-file probe result was cached: %#v", cached)
+			}
+		})
+	}
+}
+
 func TestVirtualProbeCacheIsBounded(t *testing.T) {
 	cache := NewVirtualProbeCache(time.Minute, 2)
 	probe := func(_ context.Context, _ string, input *models.MediaFile) (*models.MediaFile, error) {

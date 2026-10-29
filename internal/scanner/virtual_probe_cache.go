@@ -24,7 +24,10 @@ const (
 
 // VirtualServedSizeTolerance is the maximum relative difference between the
 // bytes ffprobe read from a virtual candidate and the size its catalog row
-// declares before the served stream is treated as a different release.
+// declares before the served stream is treated as a release-size discrepancy.
+// A discrepancy is not by itself a rejection: VirtualServedEvidenceRejected
+// accepts it when the measured duration proves the content is the right
+// release, because a posting can be short of the indexer's advertised size.
 //
 // 0.05 accommodates legitimate variance between what an indexer advertises and
 // what Usenet par2 repair or rounding actually delivers. A different release
@@ -117,13 +120,15 @@ func (c *VirtualProbeCache) Probe(
 		if err != nil || probed == nil {
 			return probed, err
 		}
-		if VirtualServedSizeMismatch(inputSnapshot.FileSize, probed.ProbedFormatSize) {
+		if VirtualServedEvidenceRejected(inputSnapshot.FileSize, probed.ProbedFormatSize, probed.Duration, inputSnapshot.VirtualExpectedRuntimeMinutes) {
 			// A readable container that is not the release the row declares
 			// must not be cached: the playback path rejects it, and replaying
 			// it for the cache TTL would keep rejecting without ever contacting
 			// the provider again. Returning it uncached lets the row's short
 			// wrong-source backoff reach fresh provider bytes on its next
-			// attempt.
+			// attempt. A size mismatch whose measured duration proves the
+			// content is the right (short-posted) release is not a wrong file,
+			// so it takes the normal cache path below.
 			return cloneVirtualProbeFile(probed), nil
 		}
 		c.store(key, probed, time.Now())

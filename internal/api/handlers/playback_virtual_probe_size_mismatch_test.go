@@ -11,7 +11,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/notifications"
 )
 
 // captureVirtualProbeLogs installs a JSON slog handler for the duration of the
@@ -25,29 +27,31 @@ func captureVirtualProbeLogs(t *testing.T) *bytes.Buffer {
 	return logs
 }
 
-// A probe can read a perfectly valid container whose bytes are a different
-// release than the row declares: the provider's cache served a stale fill.
-// The persistence path must reject it by size before the duration guard runs,
-// because the observed failure shares the item's real runtime across releases.
-// The release is not dead, so the row keeps its failure state, the short
-// wrong-source damper is used instead of the dead-candidate damper, and the pin
-// is released so the next start re-ranks.
-func TestBackgroundProbeRejectsServedSizeMismatch(t *testing.T) {
+// A release can be posted short of the size the indexer advertised while still
+// being the right content: production served 5.57 GB for a release declared at
+// 6.33 GB, and the provider's own completed download was short too. The measured
+// duration is the identity proof, so the persistence path must accept that
+// evidence, write the inventory, and clear the wrong-source damper — while a
+// warning keeps the posting discrepancy visible.
+func TestBackgroundProbeAcceptsServedSizeMismatchWhenDurationMatches(t *testing.T) {
 	const (
-		declaredBytes = int64(8_449_999_999)
-		servedBytes   = int64(7_427_636_945) // 12% short
+		declaredBytes = int64(6_330_000_000)
+		servedBytes   = int64(5_570_000_000) // 12% short: the posting itself is short
+		expectedMins  = 51
+		probedSeconds = 3072 // 51.2 minutes
 	)
 	uri := "virtual://movie/tt-size-mismatch?result=cand-1"
 	key := virtualProbeFailureKey(uri, 5)
 	virtualProbeFailures.clear(key)
 	virtualProbeFailures.clearSizeMismatch(key)
+	virtualProbeFailures.markSizeMismatch(key) // a previous stale fill armed the wrong-source damper
 	t.Cleanup(func() {
 		virtualProbeFailures.clear(key)
 		virtualProbeFailures.clearSizeMismatch(key)
 	})
 	logs := captureVirtualProbeLogs(t)
 
-	persisted := false
+	var saved []models.VirtualFilePersistArgs
 	failStamped := false
 	h := &PlaybackHandler{
 		VirtualPlaybackSourceProber: func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
@@ -55,14 +59,12 @@ func TestBackgroundProbeRejectsServedSizeMismatch(t *testing.T) {
 			f.AudioTracks = []models.AudioTrack{{Codec: "eac3", Channels: 6, Language: "eng"}}
 			f.CodecVideo, f.CodecAudio, f.Resolution, f.Container = "hevc", "eac3", "2160p", "mkv"
 			f.ProbedFormatSize = servedBytes
-			// The same runtime as the real release: the duration guard would
-			// accept this probe, so only the size gate can catch it.
-			f.Duration = 3072
+			f.Duration = probedSeconds
 			return f, nil
 		},
-		VirtualFileSaver: func(context.Context, models.VirtualFilePersistArgs) (int64, error) {
-			persisted = true
-			return 1, nil
+		VirtualFileMetadataSaver: func(_ context.Context, args models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error) {
+			saved = append(saved, args)
+			return VirtualFileMetadataUpdateResult{MetadataUpdated: true, RowsAffected: 1}, nil
 		},
 		VirtualCandidateFailMarker: func(context.Context, int, string, *time.Time) error {
 			failStamped = true
@@ -82,44 +84,212 @@ func TestBackgroundProbeRejectsServedSizeMismatch(t *testing.T) {
 
 	outcome, committed := h.probeVirtualSourceAndPersistWith(
 		context.Background(), stickyKey, file, "http://provider.example/stream", *file, cand,
-		noCandidateIdentity, 51, 5, true, nil,
+		noCandidateIdentity, expectedMins, 5, true, nil,
 	)
-	if outcome != probeOutcomeFailed {
-		t.Fatalf("outcome = %q, want failed", outcome)
+	if outcome != probeOutcomeVerified {
+		t.Fatalf("outcome = %q, want verified for a short posting whose duration matches", outcome)
 	}
-	if len(committed.audio) != 0 || len(committed.subtitles) != 0 {
-		t.Fatal("a rejected served-size mismatch must not carry a committed inventory")
+	if !committed.committed() || committed.fileID != file.ID {
+		t.Fatalf("committed inventory = %+v, want the probed row %d", committed, file.ID)
 	}
-	if persisted {
-		t.Fatal("a served-size mismatch must not persist probe evidence")
+	if len(saved) != 1 {
+		t.Fatalf("persisted %d inventories, want exactly one on the row: %+v", len(saved), saved)
 	}
-	if failStamped {
-		t.Fatal("a served-size mismatch must not stamp failed_at: the release is not dead")
+	if saved[0].FileID != file.ID {
+		t.Fatalf("inventory persisted on file %d, want %d", saved[0].FileID, file.ID)
 	}
-	if file.FailedAt != nil {
-		t.Fatal("a served-size mismatch wrote a failed_at verdict onto the row")
+	if saved[0].Duration != probedSeconds {
+		t.Fatalf("persisted duration = %d, want the measured %d", saved[0].Duration, probedSeconds)
 	}
-	if got := h.peekVirtualSticky(stickyKey); got != "" {
-		t.Fatalf("served-size mismatch kept the sticky pin: %q", got)
+	if failStamped || file.FailedAt != nil {
+		t.Fatal("accepted short posting stamped a failed_at verdict")
 	}
 	if virtualProbeFailures.recent(key) {
-		t.Fatal("served-size mismatch fed the dead-candidate failure damper")
+		t.Fatal("accepted short posting fed the dead-candidate failure damper")
+	}
+	if virtualProbeFailures.recent(virtualProbeSizeMismatchKey(key)) {
+		t.Fatal("accepted short posting kept the wrong-source damper armed")
+	}
+
+	logged := logs.String()
+	if !strings.Contains(logged, "background virtual probe accepted despite size mismatch") {
+		t.Fatalf("missing short-posting acceptance warning:\n%s", logged)
+	}
+	if strings.Contains(logged, "background virtual probe rejected: served size mismatch") {
+		t.Fatalf("accepted short posting was logged as a rejection:\n%s", logged)
+	}
+	for _, attr := range []string{`"file_id":601`, `"served_bytes":5570000000`, `"declared_bytes":6330000000`, `"probed_duration_seconds":3072`, `"expected_runtime_minutes":51`} {
+		if !strings.Contains(logged, attr) {
+			t.Fatalf("acceptance warning is missing %s:\n%s", attr, logged)
+		}
+	}
+}
+
+// The wrong file must still be rejected: the production remux of another title
+// served 7.43 GB for a row declaring 8.45 GB AND ran 3072s against a 2340s
+// expectation (+31%). Its duration fails plausibility independently of size, so
+// the historical rejection keeps its exact behavior: no persist, no failed_at,
+// short wrong-source damper, pin released.
+func TestBackgroundProbeRejectsServedSizeMismatchWithImplausibleDuration(t *testing.T) {
+	const (
+		declaredBytes = int64(8_449_999_999)
+		servedBytes   = int64(7_427_636_945) // 12% short
+		expectedMins  = 39                   // 2340s expected
+		probedSeconds = 3072                 // +31%: a different title's runtime
+	)
+	uri := "virtual://movie/tt-wrong-file?result=cand-1"
+	key := virtualProbeFailureKey(uri, 5)
+	virtualProbeFailures.clear(key)
+	virtualProbeFailures.clearSizeMismatch(key)
+	t.Cleanup(func() {
+		virtualProbeFailures.clear(key)
+		virtualProbeFailures.clearSizeMismatch(key)
+	})
+	logs := captureVirtualProbeLogs(t)
+
+	persisted := false
+	failStamped := false
+	h := &PlaybackHandler{
+		VirtualPlaybackSourceProber: func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
+			f.VideoTracks = []models.VideoTrack{{Codec: "hevc", Width: 3840, Height: 2160}}
+			f.AudioTracks = []models.AudioTrack{{Codec: "eac3", Channels: 6, Language: "eng"}}
+			f.CodecVideo, f.CodecAudio, f.Resolution, f.Container = "hevc", "eac3", "2160p", "mkv"
+			f.ProbedFormatSize = servedBytes
+			f.Duration = probedSeconds
+			return f, nil
+		},
+		VirtualFileSaver: func(context.Context, models.VirtualFilePersistArgs) (int64, error) {
+			persisted = true
+			return 1, nil
+		},
+		VirtualCandidateFailMarker: func(context.Context, int, string, *time.Time) error {
+			failStamped = true
+			return nil
+		},
+	}
+	stickyKey := "sticky-wrong-file"
+	h.pinVirtualSticky(stickyKey, uri)
+	file := &models.MediaFile{
+		ID:                         603,
+		ContentID:                  "movie-tt",
+		FilePath:                   uri,
+		FileSize:                   declaredBytes,
+		VirtualOwnerInstallationID: 5,
+	}
+	cand := VirtualPlaybackStream{ID: "cand-1", URI: uri}
+
+	outcome, committed := h.probeVirtualSourceAndPersistWith(
+		context.Background(), stickyKey, file, "http://provider.example/stream", *file, cand,
+		noCandidateIdentity, expectedMins, 5, true, nil,
+	)
+	if outcome != probeOutcomeFailed {
+		t.Fatalf("outcome = %q, want failed for a wrong file", outcome)
+	}
+	if len(committed.audio) != 0 || len(committed.subtitles) != 0 {
+		t.Fatal("a wrong file must not carry a committed inventory")
+	}
+	if persisted {
+		t.Fatal("a wrong file must not persist probe evidence")
+	}
+	if failStamped || file.FailedAt != nil {
+		t.Fatal("a wrong file must not stamp failed_at: the release is not dead")
+	}
+	if got := h.peekVirtualSticky(stickyKey); got != "" {
+		t.Fatalf("wrong file kept the sticky pin: %q", got)
+	}
+	if virtualProbeFailures.recent(key) {
+		t.Fatal("wrong file fed the dead-candidate failure damper")
 	}
 	if !virtualProbeFailures.recent(virtualProbeSizeMismatchKey(key)) {
-		t.Fatal("served-size mismatch did not arm the short wrong-source damper")
+		t.Fatal("wrong file did not arm the short wrong-source damper")
 	}
 
 	logged := logs.String()
 	if !strings.Contains(logged, "background virtual probe rejected: served size mismatch") {
 		t.Fatalf("missing distinct size-mismatch warning:\n%s", logged)
 	}
-	if strings.Contains(logged, "probed duration implausible") {
-		t.Fatalf("size mismatch reached the duration guard instead of being rejected first:\n%s", logged)
+	if strings.Contains(logged, "accepted despite size mismatch") {
+		t.Fatalf("a wrong file was accepted:\n%s", logged)
 	}
-	for _, attr := range []string{`"file_id":601`, `"candidate_uri":"` + uri + `"`, `"served_bytes":7427636945`, `"declared_bytes":8449999999`} {
-		if !strings.Contains(logged, attr) {
-			t.Fatalf("size-mismatch warning is missing %s:\n%s", attr, logged)
-		}
+}
+
+// Without a duration on either side there is no identity proof, so a served-size
+// mismatch keeps the historical rejection even though the sizes disagree by the
+// same amount as an acceptable short posting.
+func TestBackgroundProbeRejectsServedSizeMismatchWithoutDurationEvidence(t *testing.T) {
+	const (
+		declaredBytes = int64(6_330_000_000)
+		servedBytes   = int64(5_570_000_000)
+	)
+	tests := []struct {
+		name          string
+		expectedMins  int
+		probedSeconds int
+	}{
+		{name: "expected runtime unknown", expectedMins: 0, probedSeconds: 3072},
+		{name: "probed duration unknown", expectedMins: 51, probedSeconds: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			uri := "virtual://movie/tt-no-duration?result=cand-1"
+			key := virtualProbeFailureKey(uri, 5)
+			virtualProbeFailures.clear(key)
+			virtualProbeFailures.clearSizeMismatch(key)
+			t.Cleanup(func() {
+				virtualProbeFailures.clear(key)
+				virtualProbeFailures.clearSizeMismatch(key)
+			})
+			logs := captureVirtualProbeLogs(t)
+
+			persisted := false
+			h := &PlaybackHandler{
+				VirtualPlaybackSourceProber: func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
+					f.VideoTracks = []models.VideoTrack{{Codec: "hevc", Width: 3840, Height: 2160}}
+					f.AudioTracks = []models.AudioTrack{{Codec: "eac3", Channels: 6, Language: "eng"}}
+					f.CodecVideo, f.CodecAudio, f.Resolution, f.Container = "hevc", "eac3", "2160p", "mkv"
+					f.ProbedFormatSize = servedBytes
+					f.Duration = tt.probedSeconds
+					return f, nil
+				},
+				VirtualFileSaver: func(context.Context, models.VirtualFilePersistArgs) (int64, error) {
+					persisted = true
+					return 1, nil
+				},
+			}
+			stickyKey := "sticky-no-duration"
+			h.pinVirtualSticky(stickyKey, uri)
+			file := &models.MediaFile{
+				ID:                         604,
+				ContentID:                  "movie-tt",
+				FilePath:                   uri,
+				FileSize:                   declaredBytes,
+				VirtualOwnerInstallationID: 5,
+			}
+			cand := VirtualPlaybackStream{ID: "cand-1", URI: uri}
+
+			outcome, _ := h.probeVirtualSourceAndPersistWith(
+				context.Background(), stickyKey, file, "http://provider.example/stream", *file, cand,
+				noCandidateIdentity, tt.expectedMins, 5, true, nil,
+			)
+			if outcome != probeOutcomeFailed {
+				t.Fatalf("outcome = %q, want failed without a duration identity proof", outcome)
+			}
+			if persisted {
+				t.Fatal("evidence without a duration identity proof must not be persisted")
+			}
+			if got := h.peekVirtualSticky(stickyKey); got != "" {
+				t.Fatalf("rejection kept the sticky pin: %q", got)
+			}
+			if virtualProbeFailures.recent(key) {
+				t.Fatal("size-mismatch rejection fed the dead-candidate failure damper")
+			}
+			if !virtualProbeFailures.recent(virtualProbeSizeMismatchKey(key)) {
+				t.Fatal("rejection did not arm the short wrong-source damper")
+			}
+			if logged := logs.String(); strings.Contains(logged, "accepted despite size mismatch") {
+				t.Fatalf("evidence without a duration identity proof was accepted:\n%s", logged)
+			}
+		})
 	}
 }
 
@@ -472,5 +642,58 @@ func TestBackgroundProbeServedSizeMismatchAdoptsSameReleaseSibling(t *testing.T)
 	defer mu.Unlock()
 	if len(saved) != 1 || saved[0].FileID != rowB.ID {
 		t.Fatalf("saved = %+v, want exactly one inventory on the sibling row %d", saved, rowB.ID)
+	}
+}
+
+// staticRuntimeItemLookup answers the catalog runtime the probe path compares a
+// measured duration against.
+type staticRuntimeItemLookup struct{ runtime int }
+
+func (s staticRuntimeItemLookup) GetByID(context.Context, string) (*models.MediaItem, error) {
+	return &models.MediaItem{Runtime: s.runtime}, nil
+}
+
+// An accepted short posting is ordinary verified evidence: the pre-play probe
+// chain writes its inventory and publishes versions_updated, so an open detail
+// page refreshes exactly as it would for a size-matching release.
+func TestScheduleDefaultFileProbePublishesAfterAcceptedSizeMismatch(t *testing.T) {
+	const (
+		declaredBytes = int64(6_330_000_000)
+		servedBytes   = int64(5_570_000_000)
+	)
+	row := probeChainRow(740, "virtual://movie/probe-chain?result=short", nil)
+	row.FileSize = declaredBytes
+	reader := &probeChainVersionReader{
+		files: []*models.MediaFile{row},
+		rows:  map[int]*models.MediaFile{row.ID: row},
+	}
+	bus := &recordingEventBus{}
+	hub := notifications.NewHub("probe-chain-short-posting", bus)
+	var saved []models.VirtualFilePersistArgs
+	h := &PlaybackHandler{
+		ServiceContext:     context.Background(),
+		EventsHub:          hub.EventsHub(),
+		ItemLookup:         staticRuntimeItemLookup{runtime: 51},
+		DefaultProbeTarget: NewVirtualDefaultProbeTarget(reader, reader),
+		VirtualPlaybackSourceProber: func(_ context.Context, sourceURL string, f *models.MediaFile) (*models.MediaFile, error) {
+			f.ProbedFormatSize = servedBytes
+			f.Duration = 3072
+			f.VideoTracks = []models.VideoTrack{{Codec: "hevc", Width: 3840, Height: 2160}}
+			f.AudioTracks = []models.AudioTrack{{Codec: "eac3", Channels: 6, Language: "eng"}}
+			f.CodecVideo, f.CodecAudio, f.Resolution, f.Container = "hevc", "eac3", "2160p", "mkv"
+			return f, nil
+		},
+		VirtualFileMetadataSaver: func(_ context.Context, args models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error) {
+			saved = append(saved, args)
+			return VirtualFileMetadataUpdateResult{MetadataUpdated: true, RowsAffected: 1}, nil
+		},
+	}
+	h.ScheduleDefaultFileProbe(probeChainTestContent, probeChainSourceRow(), probeChainStreams(row), catalog.AccessFilter{SelectedFileID: row.ID, AllowedLibraryIDs: []int{77}})
+	h.probeChainWG.Wait()
+	if payload := waitForRecordingEvent(t, bus, 2*time.Second, "catalog.item.changed", "versions_updated", probeChainTestContent); payload == "" {
+		t.Fatal("accepted short posting did not publish versions_updated")
+	}
+	if len(saved) != 1 || saved[0].FileID != row.ID {
+		t.Fatalf("saved = %+v, want one inventory on the short-posting row %d", saved, row.ID)
 	}
 }
