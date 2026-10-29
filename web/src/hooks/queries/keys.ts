@@ -68,6 +68,9 @@ export const catalogKeys = {
   itemDetail: (id: string, libraryId?: number) =>
     ["catalog", "items", id, "detail", libraryId ?? "default"] as const,
   itemVersions: (id: string) => ["catalog", "items", id, "versions"] as const,
+  // Batched liveness verdicts for a set of file_ids (see versionLiveness.ts).
+  // Prefix-matched to invalidate every mounted batch at once.
+  versionLiveness: ["catalog", "versions", "check"] as const,
   audiobookGroups: (libraryId: number, groupBy: string, sort: string, search: string) =>
     ["catalog", "audiobookGroups", libraryId, groupBy, sort, search] as const,
   itemEpisodes: (id: string, libraryId?: number) =>

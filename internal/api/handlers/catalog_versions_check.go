@@ -362,12 +362,39 @@ func (h *CatalogResourceHandler) checkVersion(ctx context.Context, fileID int) v
 // computed. It is a no-op when no stamp callback is wired or the row already
 // carries a verdict, and the fenced write (expectedFilePath + observedFailedAt)
 // rejects a row that rotated or gained a newer verdict while resolution was in
-// flight.
+// flight. A verdict that actually lands publishes the versions_updated catalog
+// event, so every client drops the row from the version list immediately
+// instead of waiting for its cache to expire.
 func (h *CatalogResourceHandler) stampVirtualCandidateFailed(ctx context.Context, fileID int, file *models.MediaFile) {
 	if h == nil || h.MarkVirtualFailed == nil || file == nil || file.FailedAt != nil {
 		return
 	}
-	_ = h.MarkVirtualFailed(context.WithoutCancel(ctx), fileID, file.FilePath, file.FailedAt)
+	if err := h.MarkVirtualFailed(context.WithoutCancel(ctx), fileID, file.FilePath, file.FailedAt); err != nil {
+		return
+	}
+	h.publishVirtualCandidateFailed(ctx, file)
+}
+
+// publishVirtualCandidateFailed announces that a freshly stamped row is gone
+// from the version list, through the shared event authority the Refresh List
+// executor and the first-playback sink use.
+//
+// The publish is detached from request cancellation for the same reason the
+// stamp is: the row is already committed when the client's request ends. The
+// scope mirrors what the refresh path publishes for the same row: an episode
+// virtual row carries content_id = series id and episode_id = episode id while
+// the refresh request names the episode, so both ids are announced (each is
+// cheap and the helper is nil-safe).
+func (h *CatalogResourceHandler) publishVirtualCandidateFailed(ctx context.Context, file *models.MediaFile) {
+	if h == nil || h.Events == nil || file == nil {
+		return
+	}
+	publishCtx := context.WithoutCancel(ctx)
+	hub := h.Events.EventsHub()
+	publishVirtualVersionsUpdatedEvent(publishCtx, nil, hub, file.ContentID)
+	if file.EpisodeID != "" && file.EpisodeID != file.ContentID {
+		publishVirtualVersionsUpdatedEvent(publishCtx, nil, hub, file.EpisodeID)
+	}
 }
 
 // clearVirtualCandidateIfFailed applies the recovery half of a healthy liveness

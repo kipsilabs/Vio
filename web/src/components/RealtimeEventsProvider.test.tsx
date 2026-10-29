@@ -987,6 +987,86 @@ describe("RealtimeEventsProvider", () => {
     expect(queryClient.getQueryData(otherKey)).toBeDefined();
   });
 
+  it("re-checks version liveness as soon as a versions_updated catalog event arrives", async () => {
+    const queryClient = new QueryClient();
+    const livenessKey = [...catalogKeys.versionLiveness, [11, 12]];
+    const detailKey = catalogKeys.itemDetail("movie-1");
+    const versionsKey = catalogKeys.itemVersions("movie-1");
+    const watchKey = itemKeys.watchDetail("movie-1");
+    queryClient.setQueryData(livenessKey, { results: [] });
+    queryClient.setQueryData(detailKey, { content_id: "movie-1" });
+    queryClient.setQueryData(versionsKey, { versions: [] });
+    queryClient.setQueryData(watchKey, { content_id: "movie-1" });
+    const invalidate = vi.spyOn(queryClient, "invalidateQueries");
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <RealtimeEventsProvider>
+          <div />
+        </RealtimeEventsProvider>
+      </QueryClientProvider>,
+    );
+
+    await act(async () => {});
+    await act(async () => {
+      FakeWebSocket.instances[0]?.emitMessage({
+        type: "event",
+        channel: "catalog",
+        event: "catalog.item.changed",
+        data: { content_id: "movie-1", change: "versions_updated" },
+      });
+    });
+
+    // The liveness checks are re-run directly, not through the catalog sweep:
+    // their verdict is trusted for minutes and a menu drops the dead row only
+    // once it is refreshed. Active queries refetch, so no refetchType: "none".
+    const livenessCalls = invalidate.mock.calls.filter(
+      ([filters]) =>
+        JSON.stringify(filters?.queryKey) === JSON.stringify(catalogKeys.versionLiveness),
+    );
+    expect(livenessCalls).toHaveLength(1);
+    expect(livenessCalls[0]?.[0]).not.toMatchObject({ refetchType: "none" });
+    expect(queryClient.getQueryState(livenessKey)?.isInvalidated).toBe(true);
+
+    // Both menus read the row's failed flag from cached metadata, so the item
+    // detail, its version list and the player's watch detail refresh too.
+    expect(queryClient.getQueryState(detailKey)?.isInvalidated).toBe(true);
+    expect(queryClient.getQueryState(versionsKey)?.isInvalidated).toBe(true);
+    expect(queryClient.getQueryState(watchKey)?.isInvalidated).toBe(true);
+  });
+
+  it("does not re-check version liveness by key for other catalog changes", async () => {
+    const queryClient = new QueryClient();
+    const livenessKey = [...catalogKeys.versionLiveness, [11, 12]];
+    queryClient.setQueryData(livenessKey, { results: [] });
+    const invalidate = vi.spyOn(queryClient, "invalidateQueries");
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <RealtimeEventsProvider>
+          <div />
+        </RealtimeEventsProvider>
+      </QueryClientProvider>,
+    );
+
+    await act(async () => {});
+    await act(async () => {
+      FakeWebSocket.instances[0]?.emitMessage({
+        type: "event",
+        channel: "catalog",
+        event: "catalog.item.changed",
+        data: { content_id: "movie-1", change: "metadata" },
+      });
+    });
+
+    expect(
+      invalidate.mock.calls.filter(
+        ([filters]) =>
+          JSON.stringify(filters?.queryKey) === JSON.stringify(catalogKeys.versionLiveness),
+      ),
+    ).toHaveLength(0);
+  });
+
   it("refetches request state once per burst of request notifications, for any profile", async () => {
     const queryClient = new QueryClient();
     const refreshed = [
