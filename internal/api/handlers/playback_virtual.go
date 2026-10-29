@@ -6578,7 +6578,7 @@ func (h *PlaybackHandler) fallbackResolveStaleVirtualSource(
 		if !elig.allowsSibling() && !reconcileCollection {
 			return nil
 		}
-		// A cancelled request must stop the walk, not fail every remaining
+		// A canceled request must stop the walk, not fail every remaining
 		// sibling: each resolve errors instantly on the dead context and the
 		// per-sibling lines below would turn one abandoned client into an
 		// ERROR storm.
@@ -6759,7 +6759,7 @@ func (h *PlaybackHandler) fallbackResolveStaleVirtualSource(
 			// try other siblings while the catalog is unhealthy, and treating
 			// the unknown verdict as a dead candidate could substitute one the
 			// verdict system never cleared. Fail the whole fallback closed.
-			// A cancelled scan is the client going away, not a server fault:
+			// A canceled scan is the client going away, not a server fault:
 			// do not page on it.
 			level := slog.LevelError
 			if ctx.Err() != nil || errors.Is(err, context.Canceled) {

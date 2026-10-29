@@ -49,15 +49,21 @@ func rotationExhaustedReplanFixture(t *testing.T, pinnedErr, alternateErr error)
 
 	var providerDown atomic.Bool
 	alternateResolves := &atomic.Int32{}
+	// providerFailure is the error the downed provider returns for a path: the
+	// alternate edition's own error, otherwise the pinned release's. The
+	// sibling count records every alternate-edition resolve, which only the
+	// alternate-version walk performs.
+	providerFailure := func(path string) error {
+		if strings.Contains(path, fmt.Sprintf("alt-%d", rotationExhaustedAlternateID)) {
+			alternateResolves.Add(1)
+			return alternateErr
+		}
+		return pinnedErr
+	}
 	handler.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(func(_ context.Context, path string, _ int, _ string, _ int) (string, error) {
 		if providerDown.Load() {
-			if strings.Contains(path, fmt.Sprintf("alt-%d", rotationExhaustedAlternateID)) {
-				alternateResolves.Add(1)
-				if alternateErr != nil {
-					return "", alternateErr
-				}
-			} else if pinnedErr != nil {
-				return "", pinnedErr
+			if err := providerFailure(path); err != nil {
+				return "", err
 			}
 		}
 		return "http://127.0.0.1:8080/stream?path=" + path, nil
