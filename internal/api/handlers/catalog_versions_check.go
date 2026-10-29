@@ -178,8 +178,10 @@ func (h *CatalogResourceHandler) HandleCheckVersions(w http.ResponseWriter, r *h
 	for _, outcome := range final {
 		stamped := false
 		if _, ok := stampByID[outcome.fileID]; ok {
-			h.stampVirtualCandidateFailed(ctx, outcome.fileID, outcome.file)
-			stamped = true
+			// A nil error from the fenced write is not proof it landed (the
+			// repository no-ops on a delivery-grace skip or a rotated row), so
+			// report a new failure only for the confirmed post-write state.
+			stamped = h.stampVirtualCandidateFailed(ctx, outcome.fileID, outcome.file)
 		}
 		results = append(results, versionCheckResult{FileID: outcome.fileID, Available: outcome.available, Failed: versionCheckFailed(outcome, stamped)})
 	}
@@ -197,18 +199,6 @@ func (h *CatalogResourceHandler) HandleCheckVersions(w http.ResponseWriter, r *h
 // Ambiguous provider errors (timeout, network, resolver not configured) leave
 // the stamp unchanged and report the row's current computed availability, so
 // a provider outage cannot mass-tag versions as dead.
-// versionCheckFailed reports whether a checked row carries a durable failed
-// verdict: either it entered the round already failed, or this round
-// stamped one. Title-empty and ambiguous outcomes never set it: only an
-// identity-grounded dead pin counts, so menus remove genuinely dead
-// releases without hiding rows that may recover on a fresh listing.
-func versionCheckFailed(outcome versionCheckOutcome, stamped bool) bool {
-	if stamped {
-		return true
-	}
-	return outcome.file != nil && outcome.file.FailedAt != nil
-}
-
 func (h *CatalogResourceHandler) checkVersion(ctx context.Context, fileID int) versionCheckOutcome {
 	outcome := versionCheckOutcome{fileID: fileID}
 	if h == nil || h.FileResolver == nil {
@@ -218,13 +208,15 @@ func (h *CatalogResourceHandler) checkVersion(ctx context.Context, fileID int) v
 	if err != nil || file == nil {
 		return outcome
 	}
-	outcome.file = file
-	outcome.durableAlive = file.FailedAt == nil
 	if !h.fileAccessible(ctx, file) {
 		// Denied by the profile's catalog/library access policy: report the
-		// same shape as an unknown ID and never resolve or stamp.
+		// same shape as an unknown ID and never resolve or stamp. The row is
+		// deliberately not attached to the outcome, so its durable failed_at
+		// stays indistinguishable from a nonexistent ID's.
 		return outcome
 	}
+	outcome.file = file
+	outcome.durableAlive = file.FailedAt == nil
 	if !isVirtualPlaybackFile(file) {
 		outcome.available = file.MissingSince == nil
 		return outcome
@@ -272,7 +264,9 @@ func (h *CatalogResourceHandler) checkVersion(ctx context.Context, fileID int) v
 		if resolvedIdentityMatches(resolved, requestedCandidateID) || resolvedMatchesPersistedIdentity(resolved, file) {
 			// A healthy liveness observation for the same identity clears a
 			// stale failed_at so the auto-pick considers the release again.
-			h.clearVirtualCandidateIfFailed(ctx, fileID, file)
+			// The response carries the confirmed post-clear row, so a recovered
+			// version is not still reported (and hidden) as failed.
+			outcome.file = h.clearVirtualCandidateIfFailed(ctx, fileID, file)
 			if resolved.IdentityRematched {
 				// Adopt the new ?result= identity through the same CAS-fenced
 				// Phase-1 write the playback path uses, so the row moves with
@@ -289,7 +283,7 @@ func (h *CatalogResourceHandler) checkVersion(ctx context.Context, fileID int) v
 		if requestedCandidateID == "" {
 			// The row carries no concrete pin (profile-neutral row): any
 			// resolution of its identity is listing evidence. Report live.
-			h.clearVirtualCandidateIfFailed(ctx, fileID, file)
+			outcome.file = h.clearVirtualCandidateIfFailed(ctx, fileID, file)
 			outcome.available = true
 			return outcome
 		}
@@ -358,21 +352,57 @@ func (h *CatalogResourceHandler) checkVersion(ctx context.Context, fileID int) v
 	return outcome
 }
 
+// versionCheckFailed reports whether a checked row carries a durable failed
+// verdict: either it entered the round already failed, or this round verifiably
+// stamped one. Title-empty and ambiguous outcomes never set it: only an
+// identity-grounded dead pin counts, so menus remove genuinely dead releases
+// without hiding rows that may recover on a fresh listing. The outcome's file
+// is the confirmed post-write state, so a row this round recovered reports
+// failed=false.
+func versionCheckFailed(outcome versionCheckOutcome, stamped bool) bool {
+	if stamped {
+		return true
+	}
+	return outcome.file != nil && outcome.file.FailedAt != nil
+}
+
 // stampVirtualCandidateFailed applies the fenced failed_at verdict the check
 // computed. It is a no-op when no stamp callback is wired or the row already
 // carries a verdict, and the fenced write (expectedFilePath + observedFailedAt)
 // rejects a row that rotated or gained a newer verdict while resolution was in
-// flight. A verdict that actually lands publishes the versions_updated catalog
-// event, so every client drops the row from the version list immediately
-// instead of waiting for its cache to expire.
-func (h *CatalogResourceHandler) stampVirtualCandidateFailed(ctx context.Context, fileID int, file *models.MediaFile) {
+// flight.
+//
+// A nil error alone does not prove the write landed: the repository also
+// returns nil for a fenced-out write and for a delivery-grace skip (see
+// FileRepository.MarkVirtualCandidateFailed), so a healthy or concurrently
+// replaced row would be mis-reported as durably failed. The row is re-read and
+// the call reports true — and publishes the versions_updated event, so every
+// client drops the row from the version list immediately — only when the
+// confirmed post-write state carries this identity's verdict.
+func (h *CatalogResourceHandler) stampVirtualCandidateFailed(ctx context.Context, fileID int, file *models.MediaFile) bool {
 	if h == nil || h.MarkVirtualFailed == nil || file == nil || file.FailedAt != nil {
-		return
+		return false
 	}
-	if err := h.MarkVirtualFailed(context.WithoutCancel(ctx), fileID, file.FilePath, file.FailedAt); err != nil {
-		return
+	stampCtx := context.WithoutCancel(ctx)
+	if err := h.MarkVirtualFailed(stampCtx, fileID, file.FilePath, file.FailedAt); err != nil {
+		return false
+	}
+	confirmed, err := h.reloadVirtualFileAfterWrite(stampCtx, fileID)
+	if err != nil || confirmed == nil || confirmed.FilePath != file.FilePath || confirmed.FailedAt == nil {
+		return false
 	}
 	h.publishVirtualCandidateFailed(ctx, file)
+	return true
+}
+
+// reloadVirtualFileAfterWrite re-reads the row a fenced health write touched so
+// the caller can report and publish the persisted state instead of the write
+// attempt. It returns nil when no resolver is wired or the row vanished.
+func (h *CatalogResourceHandler) reloadVirtualFileAfterWrite(ctx context.Context, fileID int) (*models.MediaFile, error) {
+	if h == nil || h.FileResolver == nil {
+		return nil, nil
+	}
+	return h.FileResolver.GetByID(ctx, fileID)
 }
 
 // publishVirtualCandidateFailed announces that a freshly stamped row is gone
@@ -403,11 +433,25 @@ func (h *CatalogResourceHandler) publishVirtualCandidateFailed(ctx context.Conte
 // and observed verdict as the stamp, so a concurrent rotation or newer failure
 // survives. It is a no-op when the row carries no verdict or no clear callback
 // is wired.
-func (h *CatalogResourceHandler) clearVirtualCandidateIfFailed(ctx context.Context, fileID int, file *models.MediaFile) {
+//
+// The returned row is the confirmed post-write state when the clear verifiably
+// landed: the write returns nil even for a fenced-out no-op, so the row is
+// re-read and replaces the caller's snapshot only when it still names the same
+// identity without a verdict. Otherwise the original snapshot is returned and
+// the response keeps reporting its durable failure.
+func (h *CatalogResourceHandler) clearVirtualCandidateIfFailed(ctx context.Context, fileID int, file *models.MediaFile) *models.MediaFile {
 	if h == nil || h.ClearVirtualFailed == nil || file == nil || file.FailedAt == nil {
-		return
+		return file
 	}
-	_ = h.ClearVirtualFailed(context.WithoutCancel(ctx), fileID, file.FilePath, file.FailedAt)
+	clearCtx := context.WithoutCancel(ctx)
+	if err := h.ClearVirtualFailed(clearCtx, fileID, file.FilePath, file.FailedAt); err != nil {
+		return file
+	}
+	confirmed, err := h.reloadVirtualFileAfterWrite(clearCtx, fileID)
+	if err != nil || confirmed == nil || confirmed.FilePath != file.FilePath || confirmed.FailedAt != nil {
+		return file
+	}
+	return confirmed
 }
 
 // resolvedIdentityMatches reports whether the resolver's answer named the
