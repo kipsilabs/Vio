@@ -237,6 +237,11 @@ type Registry struct {
 	// evidence. The map is bounded and entries are only a short-lived hint.
 	preplayDiscoveryMu   sync.Mutex
 	preplayDiscoverySeen map[string]time.Time
+	// preplayDiscoveryRunning marks the same keys while a detached listing for
+	// them is still running. A catalog detail read never waits for discovery,
+	// so without it a page refresh during a cold provider scrape would start a
+	// second listing for work that is already in flight.
+	preplayDiscoveryRunning map[string]struct{}
 }
 
 // Declared is what the registry recorded for one operation; the runtime

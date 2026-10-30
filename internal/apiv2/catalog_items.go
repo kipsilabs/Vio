@@ -1244,27 +1244,20 @@ func (reg *Registry) getCatalogItem(ctx context.Context, in *CatalogItemDeviceIn
 		return nil, serviceProblem(err)
 	}
 	// A leaf detail (movie or individual episode, never a series, season or
-	// list) may discover and persist the item's provider versions in the same
-	// answer, so clients that only read catalog detail — Android among them —
-	// still see versions before pressing Play. Discovery failure keeps the
-	// original detail; a detached shared listing becomes visible on a later
-	// read. The eligibility read the discovery performs also feeds the
-	// detail's has_virtual_source hint, which exists independently of whether
-	// discovery is enabled.
+	// list) may start the item's provider version discovery, but the answer
+	// never waits for it: the response is built from the already-persisted
+	// version list and the detached run publishes the existing versions_updated
+	// catalog event when its listing lands, so an open detail page still
+	// refreshes. A slow provider therefore costs a client nothing — before
+	// this, a 10 s discovery budget made a 10 s detail read.
+	//
+	// The eligibility read also feeds the detail's has_virtual_source hint,
+	// which exists independently of whether discovery is enabled.
 	var virtualSource *bool
 	if detail != nil {
-		discovered, hasVirtualSource := reg.discoverDetailVersions(ctx, detail.ContentID, detail.Type, viewer.Access, "catalog_detail", reg.preplayDiscoveryCatalogBudgetFor(ctx))
-		if hasVirtualSource {
-			source := hasVirtualSource
+		if reg.startDetailVersionDiscovery(ctx, detail.ContentID, detail.Type, viewer.Access, "catalog_detail", reg.preplayDiscoveryCatalogBudgetFor(ctx)) {
+			source := true
 			virtualSource = &source
-		}
-		if discovered {
-			refreshed, refreshErr := svc.ItemDetail(ctx, viewer, in.ID)
-			if refreshErr == nil && refreshed != nil {
-				detail = refreshed
-			} else {
-				slog.WarnContext(ctx, "pre-play version discovery detail reload failed", "component", "apiv2", "item_id", detail.ContentID, "trigger", "catalog_detail")
-			}
 		}
 	}
 	out := catalogItemDetailOf(detail, reg.ratingSelection(ctx), virtualSource)

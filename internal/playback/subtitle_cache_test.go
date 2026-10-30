@@ -13,6 +13,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Silo-Server/silo-server/internal/models"
 )
 
 func TestServeExtractTextCacheVariants(t *testing.T) {
@@ -435,6 +437,40 @@ func TestHasCommittedEntryAllFormats(t *testing.T) {
 // HasCommittedTextEntry is identity-keyed for a virtual source: the same
 // generation bucket and identity that a warm commits under is what the serve
 // path queries, so a handler can trust a hit to be the artifact it will read.
+// The cache identity carries the row's probed subtitle layout, so an artifact
+// committed against one inventory is not served under another. An unchanged
+// layout keeps the same identity (the cache survives ordinary re-probing);
+// a changed one re-keys it.
+func TestVirtualSubtitleCacheIdentityTracksProbedInventory(t *testing.T) {
+	const uri = "virtual://movie/tt0113277?result=candidate"
+	first := []models.SubtitleTrack{
+		{Index: 0, Language: "eng", Codec: "subrip"},
+		{Index: 1, Language: "fra", Codec: "ass"},
+	}
+	sameLayoutOtherTitles := []models.SubtitleTrack{
+		{Index: 0, Language: "ENG", Codec: "SubRip", Title: "English SDH"},
+		{Index: 1, Language: "fra", Codec: "ass", ContainerTrackID: "9"},
+	}
+	changedLayout := []models.SubtitleTrack{
+		{Index: 0, Language: "fra", Codec: "ass"},
+		{Index: 1, Language: "eng", Codec: "subrip"},
+	}
+
+	base := VirtualSubtitleCacheIdentity(42, uri, 0, SubtitleInventoryToken(first))
+	if got := VirtualSubtitleCacheIdentity(42, uri, 0, SubtitleInventoryToken(sameLayoutOtherTitles)); got != base {
+		t.Fatalf("identity changed for cosmetic metadata: %s vs %s", got, base)
+	}
+	if got := VirtualSubtitleCacheIdentity(42, uri, 0, SubtitleInventoryToken(changedLayout)); got == base {
+		t.Fatal("a changed probed inventory kept the cache identity")
+	}
+	if got := VirtualSubtitleCacheIdentity(42, uri, 1, SubtitleInventoryToken(first)); got == base {
+		t.Fatal("a different track ordinal kept the cache identity")
+	}
+	if got := VirtualSubtitleCacheIdentity(43, uri, 0, SubtitleInventoryToken(first)); got == base {
+		t.Fatal("a different file id kept the cache identity")
+	}
+}
+
 func TestHasCommittedTextEntryVirtualIdentity(t *testing.T) {
 	c, source := newTestCache(t)
 	const identity = "virtual-result-window-1"
@@ -457,10 +493,82 @@ func TestHasCommittedTextEntryVirtualIdentity(t *testing.T) {
 	}
 }
 
-// A full-track request that misses the cache while another fill for the same
-// key is in flight must wait for that fill and serve its committed bytes — a
-// plan-time warm is not duplicated by the first client fetch. Exactly one
-// extract (the warm) runs.
+// A duplicate request that joins an in-flight fill which outlives its bounded
+// wait must answer retryable instead of holding the connection open and then
+// stacking a second full extract for the same key. This is the production
+// shape: a 16 s remote demux and a client that refetches the same track.
+func TestServeExtractTextBusyFillAnswersRetryableWithoutStacking(t *testing.T) {
+	c, source := newTestCache(t)
+	c.fillWaitTimeout = 30 * time.Millisecond
+	opts := StreamExtractOpts{InputPath: source, SourceCodec: "subrip"}
+
+	held := c.beginFill(source, "", 0, SubtitleFormatVTTV3)
+	if held == nil {
+		t.Fatal("failed to hold the in-flight fill")
+	}
+	defer held.Discard()
+
+	extracted := false
+	err := c.ServeExtract(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/subtitle", nil), opts,
+		func(context.Context, StreamExtractOpts) error {
+			extracted = true
+			return nil
+		})
+	var retry *SubtitleExtractionRetryError
+	if !errors.As(err, &retry) {
+		t.Fatalf("duplicate extract error = %v, want the retryable busy answer", err)
+	}
+	if retry.RetryAfter != subtitleFillBusyRetryAfter {
+		t.Fatalf("Retry-After = %s, want %s", retry.RetryAfter, subtitleFillBusyRetryAfter)
+	}
+	if extracted {
+		t.Fatal("the duplicate request ran its own extraction while another fill was in flight")
+	}
+	select {
+	case <-held.done:
+		t.Fatal("the duplicate request settled the fill it was waiting on")
+	default:
+	}
+}
+
+// The cached VTT is served without running ffmpeg again: the identity that
+// committed the artifact is the identity the next request resolves.
+func TestServeExtractTextCachedArtifactSkipsExtract(t *testing.T) {
+	c, source := newTestCache(t)
+	opts := StreamExtractOpts{InputPath: source, SourceCodec: "subrip"}
+	const payload = "WEBVTT\n\n00:00.000 --> 00:01.000\ncached\n"
+
+	calls := 0
+	first := httptest.NewRecorder()
+	if err := c.ServeExtract(first, httptest.NewRequest(http.MethodGet, "/subtitle", nil), opts,
+		func(_ context.Context, o StreamExtractOpts) error {
+			calls++
+			_, err := io.WriteString(o.Writer, payload)
+			return err
+		}); err != nil {
+		t.Fatal(err)
+	}
+
+	second := httptest.NewRecorder()
+	if err := c.ServeExtract(second, httptest.NewRequest(http.MethodGet, "/subtitle", nil), opts,
+		func(context.Context, StreamExtractOpts) error {
+			calls++
+			return errors.New("the cached artifact must be served without a re-extract")
+		}); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("extract calls = %d, want 1 (the fill)", calls)
+	}
+	if got := second.Body.String(); got != payload {
+		t.Fatalf("cached body = %q, want %q", got, payload)
+	}
+}
+
+// A fill that misses the cache while another fill for the same key is in flight
+// must wait for that fill and serve its committed bytes — a plan-time warm is
+// not duplicated by the first client fetch. Exactly one extract (the warm)
+// runs.
 func TestServeExtractTextWaitsForInFlightFillAndServesCommitted(t *testing.T) {
 	c, source := newTestCache(t)
 	opts := StreamExtractOpts{InputPath: source, SourceCodec: "subrip"}

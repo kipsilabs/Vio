@@ -628,6 +628,18 @@ func (h *SettingValuesHandler) clearSettingValue(
 			publishUserSettingsEvent(ctx, h.EventsHub,
 				eventUserID, identity.ProfileID, mirrorKey, string(identity.Scope))
 		}
+		if subtitlePreferenceClearsIdempotently(identity.Key) {
+			// Clearing a subtitle preference is "inherit the profile default
+			// again", and the end state it names is exactly what an absent row
+			// already is. Clients reset these per series when the viewer picks
+			// Auto, so the common case is a series with no override at all; the
+			// 404 that used to come back made an ordinary reset look like a
+			// failed request on every item the viewer never overrode.
+			slog.DebugContext(ctx, "clearing a subtitle preference that was already unset",
+				"component", "api", "key", identity.Key,
+				"scope", string(identity.Scope))
+			return nil
+		}
 		return apiError(http.StatusNotFound, policyErrorNotFound, "No value is set at this scope")
 	}
 	auditSettingsForOther(ctx, settingsAuditRecord{
@@ -644,6 +656,23 @@ func (h *SettingValuesHandler) clearSettingValue(
 		eventUserID, identity.ProfileID, identity.Key, string(identity.Scope))
 	notifyScopeSettingChanged(ctx, h.RecWorker, eventUserID, identity.ProfileID, identity.Key)
 	return nil
+}
+
+// subtitlePreferenceClearsIdempotently reports whether a DELETE of this key at
+// a scope with no stored row is the state the caller asked for rather than a
+// missing resource. These are the canonical series subtitle preferences the
+// player and the item page's "Auto" reset clear (SERIES_SUBTITLE_SETTING_KEYS
+// on the client): an absent row already means "inherit the profile default",
+// so answering 204 makes the reset idempotent for every series the viewer never
+// overrode. Every other key keeps the 404 that tells a caller its unset was
+// aimed at nothing.
+func subtitlePreferenceClearsIdempotently(key string) bool {
+	switch key {
+	case settingskeys.PlaybackSubtitleLanguage, settingskeys.PlaybackSubtitleMode:
+		return true
+	default:
+		return false
+	}
 }
 
 // setNavigationShortcut applies one desired-state edit to the shared profile
