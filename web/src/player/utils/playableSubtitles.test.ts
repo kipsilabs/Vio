@@ -8,6 +8,7 @@ import {
   pendingServerSubtitleSelection,
   resolvePlayableSubtitles,
   subtitleArtifactIdentity,
+  subtitleIdentitiesNameSameAsset,
   subtitleSelectionAcknowledgesPending,
   subtitleTrackIdentityFromInfo,
   subtitleTrackIdentityKey,
@@ -214,6 +215,63 @@ describe("subtitle track identity", () => {
       streamIndex: 2,
     });
     expect(isSameSubtitleTrack(planSelected, active)).toBe(true);
+  });
+
+  it("keeps the ordinal of a same-language sibling the inventory still lists", () => {
+    const first = identity({
+      index: 0,
+      trackId: "file:7:subtitle:0",
+      language: "eng",
+      codec: "pgs",
+      burnInOnly: true,
+      source: "embedded",
+    });
+    const second = identity({
+      index: 1,
+      trackId: "file:7:subtitle:1",
+      language: "eng",
+      codec: "pgs",
+      burnInOnly: true,
+      source: "embedded",
+    });
+    // Both ids are rows of one inventory, so the ordinal is the asset's and
+    // not the plan's: two burn-in tracks, not one track re-minted.
+    expect(subtitleIdentitiesNameSameAsset(first, second, [first, second])).toBe(false);
+    // Only the ordinal moved across a replacement inventory that no longer
+    // lists the committed ordinal: the descriptor fallback still settles it.
+    expect(subtitleIdentitiesNameSameAsset(first, second, [second])).toBe(true);
+  });
+
+  it("settles a pick the plan acknowledged by re-minting another language slot", () => {
+    const committedFrench = identity({
+      index: 0,
+      trackId: "file:7:subtitle:0",
+      language: "fra",
+      codec: "subrip",
+      source: "embedded",
+    });
+    const pendingFrench = identity({
+      index: 1,
+      trackId: "file:7:subtitle:1",
+      language: "fra",
+      codec: "subrip",
+      source: "embedded",
+    });
+    const shiftedEnglish = identity({
+      index: 1,
+      trackId: "file:7:subtitle:1",
+      language: "eng",
+      codec: "subrip",
+      source: "embedded",
+    });
+    // The inventory's `:1` is English, so the captured French id no longer
+    // names a row of its own: this is the re-mint, not a sibling.
+    expect(
+      subtitleSelectionAcknowledgesPending(committedFrench, pendingFrench, [
+        committedFrench,
+        shiftedEnglish,
+      ]),
+    ).toBe(true);
   });
 });
 
@@ -500,6 +558,56 @@ describe("pendingServerSubtitleSelection", () => {
     });
     expect(isSameSubtitleTrack(planSelectedEnglish, displayedFrench)).toBe(true);
     expect(pendingServerSubtitleSelection(planSelectedEnglish, displayedFrench)).toBe(1);
+  });
+
+  it("requests the other burn-in track when two same-language rows share every descriptor", () => {
+    // Two embedded bitmap tracks with the same language, codec and flags: the
+    // trailing ordinal is the only difference, and both are real tracks of the
+    // inventory the menu lists.
+    const first = identity({
+      index: 0,
+      trackId: "file:7:subtitle:0",
+      language: "eng",
+      codec: "pgs",
+      burnInOnly: true,
+      source: "embedded",
+    });
+    const second = identity({
+      index: 1,
+      trackId: "file:7:subtitle:1",
+      language: "eng",
+      codec: "pgs",
+      burnInOnly: true,
+      source: "embedded",
+    });
+    const inventory = [first, second];
+    // Picking the second while the plan burns in the first must reach the
+    // server; reading the two ids as one asset would drop the request and keep
+    // the first track burning.
+    expect(pendingServerSubtitleSelection(first, second, inventory)).toBe(1);
+    expect(pendingServerSubtitleSelection(second, first, inventory)).toBe(0);
+  });
+
+  it("settles a burn-in row the inventory re-minted onto another ordinal", () => {
+    const committed = identity({
+      index: 2,
+      trackId: "file:7:subtitle:2",
+      language: "eng",
+      codec: "pgs",
+      burnInOnly: true,
+      source: "embedded",
+    });
+    const reminted = identity({
+      index: 3,
+      trackId: "file:7:subtitle:3",
+      language: "eng",
+      codec: "pgs",
+      burnInOnly: true,
+      source: "embedded",
+    });
+    // The plan's ordinal is gone from the replacement inventory, so the row is
+    // the same asset at a new ordinal and no request is needed.
+    expect(pendingServerSubtitleSelection(committed, reminted, [reminted])).toBeUndefined();
   });
 
   it("offers the selection when the server resolved it to off (caller guard dedupes)", () => {
