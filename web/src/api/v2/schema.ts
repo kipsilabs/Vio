@@ -23947,6 +23947,7 @@ export interface components {
        */
       added_at: string;
       audio_tracks?: components["schemas"]["AudioTrack"][];
+      available?: boolean;
       /**
        * Format: int64
        * @description Kilobits per second
@@ -23970,6 +23971,7 @@ export interface components {
       effective_audio_language?: string;
       /** Format: int64 */
       effective_audio_track_index?: number;
+      failed?: boolean;
       /**
        * @description Opaque identifier
        * @example 120
@@ -23996,9 +23998,15 @@ export interface components {
       /** Format: int64 */
       presentation_part_total?: number;
       preview?: components["schemas"]["Marker"];
+      /**
+       * Format: date-time
+       * @description RFC 3339 instant in UTC with millisecond precision
+       */
+      probed_at?: string;
       recap?: components["schemas"]["Marker"];
       /** @example 2160p */
       resolution: string;
+      source_mismatch?: components["schemas"]["VersionSourceMismatch"];
       subtitle_tracks?: components["schemas"]["VersionSubtitleTrack"][];
       video_tracks?: components["schemas"]["VideoTrack"][];
     };
@@ -31708,6 +31716,18 @@ export interface components {
       thumbnail_thumbhash?: string;
       thumbnail_url?: string;
       title: string;
+    };
+    VersionSourceMismatch: {
+      /**
+       * Format: int64
+       * @example 8449999999
+       */
+      declared_bytes: number;
+      /**
+       * Format: int64
+       * @example 7427636945
+       */
+      served_bytes: number;
     };
     VersionSubtitleTrack: {
       codec?: string;
