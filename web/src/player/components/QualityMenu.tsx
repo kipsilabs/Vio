@@ -53,6 +53,9 @@ export interface VersionInfo {
   /** The catalog currently reports this version's source as gone. It stays
    *  selectable because a play can force a re-link and retry it. */
   unavailable?: boolean;
+  /** A recent probe read bytes that differ from the declared release. The
+   *  release is alive; only the provider's served bytes were wrong. */
+  sourceMismatch?: { servedBytes: number; declaredBytes: number };
 }
 
 /**
@@ -594,6 +597,12 @@ function versionHealthOf(version: VersionInfo) {
   return deriveVersionHealth({
     failed: version.failed,
     available: version.unavailable === true ? false : undefined,
+    source_mismatch: version.sourceMismatch
+      ? {
+          served_bytes: version.sourceMismatch.servedBytes,
+          declared_bytes: version.sourceMismatch.declaredBytes,
+        }
+      : undefined,
   });
 }
 

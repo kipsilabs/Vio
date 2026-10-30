@@ -53,6 +53,26 @@ Clients remove failed rows from version pickers instead of offering them;
 rows that are merely `available: false` without `failed` may recover and stay
 listed. Unknown or deleted file IDs are reported as `available: false`.
 
+A result optionally carries `source_mismatch` while the API process still holds
+a recent playback probe's wrong-source verdict for that row:
+
+```json
+{
+  "file_id": 789,
+  "available": true,
+  "source_mismatch": { "served_bytes": 7427636945, "declared_bytes": 8449999999 }
+}
+```
+
+It means a probe read a different release's bytes than the row declares. It is
+advisory, not a liveness verdict: the release remains `available`, is never
+`failed`, and clients should show it as a distinct "source mismatch — served X
+of declared Y" state rather than the generic unavailable/retry copy. The signal
+is process-local and transient (the short wrong-source backoff window); it is
+absent after a restart, on a node that did not run the probe, and once a later
+probe accepts the served bytes. A row without the field keeps the generic
+unprobed presentation.
+
 ## Multi-audio language support and release metadata
 
 MULTi/DUAL releases — a single audio stream tagged `und`/`mul`/empty whose

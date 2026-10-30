@@ -1267,6 +1267,16 @@ export function VideoPlayer({
           // server's versions/check answer. Surface it so a version the media
           // page hides as unavailable is not selectable here with no warning.
           unavailable: v.available === false,
+          // A recent probe rejected the bytes the provider served for this
+          // release. The row stays available and selectable; the badge explains
+          // why a play is retrying the link rather than showing the generic
+          // unavailable copy.
+          sourceMismatch: v.source_mismatch
+            ? {
+                servedBytes: v.source_mismatch.served_bytes,
+                declaredBytes: v.source_mismatch.declared_bytes,
+              }
+            : undefined,
         };
       }),
     [versions, virtualRanking, effectiveFileId, plan.requested_media_file_id, pendingSwitchFileId],
