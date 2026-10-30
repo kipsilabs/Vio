@@ -59,6 +59,10 @@ export interface PlayerFileVersion {
    * derived from the client's own playback failures.
    */
   available?: boolean;
+  /** A recent server probe rejected the provider's bytes as a different
+   *  release than this row declares; the release itself is still available.
+   *  Stamped from the same versions/check answer as `available`. */
+  source_mismatch?: { served_bytes: number; declared_bytes: number };
   edition_key?: string;
   release_name?: string;
   /** Provider display label for a virtual candidate; the wire's release-name
@@ -374,7 +378,14 @@ export interface WatchPageProps {
    * same map to keep the `available: false` / failed badges on the rows it
    * replaces.
    */
-  versionLiveness?: Map<number, { available: boolean; failed?: boolean }>;
+  versionLiveness?: Map<
+    number,
+    {
+      available: boolean;
+      failed?: boolean;
+      sourceMismatch?: { servedBytes: number; declaredBytes: number };
+    }
+  >;
   playbackVariants?: PlayerPlaybackVariant[];
   /**
    * Releases that exist on the indexers but are not downloaded on the provider.

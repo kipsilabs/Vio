@@ -851,6 +851,76 @@ describe("subtitle marker reconciliation", () => {
       ),
     );
   });
+
+  it("requests the second burn-in track when two same-language rows look identical", async () => {
+    const onSubtitleTrackChange = vi.fn();
+    // A release with two embedded English bitmap subtitles: same language, same
+    // codec, same flags, no URL (they only exist as burned-in video). Only the
+    // trailing ordinal of the track id tells them apart.
+    const firstBurnIn = fixtureSubtitleInventoryItemV3({
+      track_id: "file:7:subtitle:0",
+      combined_index: 0,
+      language: "eng",
+      codec: "hdmv_pgs_subtitle",
+      label: "English",
+      delivery: "burn_in_only",
+      url: "",
+    });
+    const secondBurnIn = {
+      ...firstBurnIn,
+      track_id: "file:7:subtitle:1",
+      combined_index: 1,
+    };
+    const toPlayerTrack = (item: typeof firstBurnIn): PlayerSubtitleInfo => ({
+      index: item.combined_index,
+      media_file_id: 7,
+      track_id: item.track_id,
+      burn_in_only: item.delivery === "burn_in_only",
+      language: item.language ?? "",
+      codec: item.codec,
+      label: item.label ?? "",
+      source: "embedded",
+      url: "",
+    });
+    renderPlayer({
+      plan: fixturePlanV3({
+        ...directPlan,
+        plan_id: "plan:two-burn-in-tracks",
+        plan_attempt_key: "v3:two-burn-in-tracks",
+        subtitle: {
+          mode: "burn_in",
+          track_id: firstBurnIn.track_id,
+          inventory: [firstBurnIn, secondBurnIn],
+        },
+        selected_tracks: {
+          audio: { id: "file:7:audio:0", index: 0 },
+          subtitle: { id: firstBurnIn.track_id, index: 0 },
+        },
+      }),
+      subtitleUrls: [toPlayerTrack(firstBurnIn), toPlayerTrack(secondBurnIn)],
+      subtitleMode: "always",
+      preferredSubtitleLanguage: "eng",
+      onSubtitleTrackChange,
+    });
+
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
+    expect(onSubtitleTrackChange).not.toHaveBeenCalled();
+
+    act(() => {
+      controls.current?.onSubtitleSelect?.(1);
+    });
+
+    // The plan still burns in the first track until the server replans, so the
+    // pick of the sibling has to be sent even though every descriptor matches.
+    await waitFor(() =>
+      expect(onSubtitleTrackChange).toHaveBeenCalledWith(
+        1,
+        expect.any(Number),
+        expect.objectContaining({ track_id: "file:7:subtitle:1", burn_in_only: true }),
+      ),
+    );
+    expect(controls.current?.activeSubtitleIndex).toBe(1);
+  });
 });
 
 function planInvalidatedCommand(
