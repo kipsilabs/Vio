@@ -4039,7 +4039,7 @@ func (h *PlaybackHandler) fallbackSameReleaseAfterServedSizeMismatch(
 func virtualCandidateReleaseRow(file *models.MediaFile, candidate VirtualPlaybackStream) *models.MediaFile {
 	row := &models.MediaFile{
 		FilePath:                   candidate.URI,
-		Container:                  "virtual",
+		Container:                  virtualURIScheme,
 		FileSize:                   candidate.FileSize,
 		ProviderReleaseSize:        candidate.FileSize,
 		ProviderVideoHash:          candidate.ProviderVideoHash,
