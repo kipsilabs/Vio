@@ -199,6 +199,35 @@ function subtitleTrackIdAssetKey(trackId: string): string {
 }
 
 /**
+ * Whether the inventory being compared holds `committed` and `row` as two
+ * separate entries of its own.
+ *
+ * Two descriptor-equal tracks in one file (a release with two `eng|subrip`
+ * streams, say) are only distinguishable by their identity, so the inventory is
+ * what tells a sibling apart from a re-minted id: when both ids are present as
+ * distinct rows, they name distinct assets however alike they look.
+ */
+function inventoryNamesTwoDistinctRows(
+  inventory: readonly SubtitleTrackIdentity[],
+  committed: SubtitleTrackIdentity,
+  row: SubtitleTrackIdentity,
+): boolean {
+  const entryAt = (target: SubtitleTrackIdentity): number => {
+    const targetId = normalizeIdentityValue(target.trackId);
+    const targetKey = subtitleDescriptorKey(target);
+    return inventory.findIndex(
+      (entry) =>
+        normalizeIdentityValue(entry.trackId) === targetId &&
+        subtitleDescriptorKey(entry) === targetKey,
+    );
+  };
+  const committedAt = entryAt(committed);
+  if (committedAt < 0) return false;
+  const rowAt = entryAt(row);
+  return rowAt >= 0 && rowAt !== committedAt;
+}
+
+/**
  * Whether the plan's committed row and a row on screen name the same logical
  * subtitle asset.
  *
@@ -207,12 +236,16 @@ function subtitleTrackIdAssetKey(trackId: string): string {
  * A plan that reorders its inventory re-mints every id: the same asset moves
  * from `…:1` to `…:0`, and the slot that inherited `…:1` is a different
  * language. The descriptor names the asset itself, so it decides when both rows
- * carry one, and the id may then differ only in its trailing ordinal. A row
- * whose descriptor differs is another asset, whatever its id says.
+ * carry one, and the id may then differ only in its trailing ordinal — but only
+ * when the inventory does not list both ids as its own rows. Two same-language
+ * burn-in tracks share every descriptor, and the ordinal is the only thing
+ * telling them apart, so moving it is not allowed to merge them.
+ * `inventory` is the rows on screen, when the caller has them.
  */
 export function subtitleIdentitiesNameSameAsset(
   committed: SubtitleTrackIdentity,
   row: SubtitleTrackIdentity,
+  inventory?: readonly SubtitleTrackIdentity[],
 ): boolean {
   if (!hasSubtitleDescriptor(committed) || !hasSubtitleDescriptor(row)) {
     return isSameSubtitleTrack(committed, row);
@@ -221,8 +254,12 @@ export function subtitleIdentitiesNameSameAsset(
   const committedId = normalizeIdentityValue(committed.trackId);
   const rowId = normalizeIdentityValue(row.trackId);
   if (committedId && rowId) {
-    // Same asset; only the ordinal the plan assigned it may have moved.
-    return subtitleTrackIdAssetKey(committedId) === subtitleTrackIdAssetKey(rowId);
+    if (committedId === rowId) return true;
+    // Same asset; only the ordinal the plan assigned it may have moved. The
+    // inventory decides: when both ids are its own rows the ordinal is the
+    // asset's, not the plan's, and this is another track.
+    if (subtitleTrackIdAssetKey(committedId) !== subtitleTrackIdAssetKey(rowId)) return false;
+    if (inventory && inventoryNamesTwoDistinctRows(inventory, committed, row)) return false;
   }
   return true;
 }
@@ -230,14 +267,16 @@ export function subtitleIdentitiesNameSameAsset(
 /**
  * Whether the plan's committed selection acknowledges a pending manual pick.
  * See `subtitleIdentitiesNameSameAsset`: the descriptor decides, so a pick the
- * acknowledging plan re-minted onto another ordinal still counts as settled.
+ * acknowledging plan re-minted onto another ordinal still counts as settled,
+ * unless the inventory lists the clicked row as its own separate track.
  */
 export function subtitleSelectionAcknowledgesPending(
   planSelected: SubtitleTrackIdentity | null,
   pending: SubtitleTrackIdentity,
+  inventory?: readonly SubtitleTrackIdentity[],
 ): boolean {
   if (planSelected === null) return false;
-  return subtitleIdentitiesNameSameAsset(planSelected, pending);
+  return subtitleIdentitiesNameSameAsset(planSelected, pending, inventory);
 }
 
 /**
@@ -308,11 +347,14 @@ export function resolveAppliedSubtitleIndex(
  * index) must not restart the request. A plan that resolved the selection to
  * `off`/absent is treated as settled by the caller's per-identity request
  * guard, so one user action produces at most one request until the plan
- * acknowledges it.
+ * acknowledges it. `inventory` is the rows the viewer can pick from, and it
+ * keeps two same-language tracks apart: their ids differ only by ordinal, so
+ * only the inventory can say whether that ordinal moved or names a sibling.
  */
 export function pendingServerSubtitleSelection(
   planSelected: SubtitleTrackIdentity | null,
   active: SubtitleTrackIdentity | null,
+  inventory?: readonly SubtitleTrackIdentity[],
 ): number | null | undefined {
   // Nothing selected in the UI. Asking the server to clear a selection it does
   // not have would replan on every plan; only an outstanding server selection
@@ -326,8 +368,9 @@ export function pendingServerSubtitleSelection(
   // differ from the UI index after a re-mint or reorder; that is not a reason
   // to replan again. An equal ordinal-derived id is not enough on its own:
   // adoption can keep verified rows whose ids the plan re-minted onto another
-  // language, so the descriptor has to name the same asset too.
-  if (planSelected !== null && subtitleIdentitiesNameSameAsset(planSelected, active)) {
+  // language, so the descriptor has to name the same asset too, and the
+  // inventory has to agree the id is not one of its own other rows.
+  if (planSelected !== null && subtitleIdentitiesNameSameAsset(planSelected, active, inventory)) {
     return undefined;
   }
 
