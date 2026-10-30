@@ -1600,6 +1600,11 @@ func newChiRouter(deps Dependencies) chi.Router {
 					// and the file repository.
 					if detailSvc != nil && deps.FileRepo != nil {
 						virtualCandidatesRefresh.ScheduleDefaultFileProbe = playbackHandler.ScheduleDefaultFileProbe
+						// The same detail discovery resolves the default version
+						// the watch page will play. Warm its provider fetch from
+						// the resolved row, reusing the explicit-selection
+						// warm-up entry point so admission and fill are identical.
+						virtualCandidatesRefresh.ScheduleDefaultFileWarm = playbackHandler.ScheduleDefaultFileWarm
 						playbackHandler.DefaultProbeTarget = handlers.NewVirtualDefaultProbeTarget(detailSvc, deps.FileRepo)
 					}
 					// The indexer-release read/request surface and the async

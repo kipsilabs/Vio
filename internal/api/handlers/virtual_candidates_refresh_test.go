@@ -143,6 +143,130 @@ func TestVirtualCandidatesDiscoveryEmptyListingIsEmptySuccess(t *testing.T) {
 	}
 }
 
+// TestVirtualCandidatesDiscoveryWarmsTheResolvedDefaultOnlyForDetailReads
+// pins the default warm-up boundary: a detail read without an explicit
+// selection warms the top-sorted version it resolved, while a selection read
+// (owned by the watch-detail select path), a listing-only read, and a refresh
+// job schedule nothing.
+func TestVirtualCandidatesDiscoveryWarmsTheResolvedDefaultOnlyForDetailReads(t *testing.T) {
+	type warmCall struct {
+		contentID string
+		fileID    int
+		filter    catalog.AccessFilter
+	}
+	cases := []struct {
+		name       string
+		selectedID int
+		run        func(*VirtualCandidatesRefreshService, catalog.AccessFilter) error
+		wantWarm   bool
+	}{
+		{
+			name: "detail default",
+			run: func(s *VirtualCandidatesRefreshService, filter catalog.AccessFilter) error {
+				_, err := s.DiscoverVirtualCandidates(context.Background(), 1, "profile", "movie:x", filter, VirtualDiscoveryDetail)
+				return err
+			},
+			wantWarm: true,
+		},
+		{
+			name:       "detail explicit selection is owned by the select path",
+			selectedID: 8,
+			run: func(s *VirtualCandidatesRefreshService, filter catalog.AccessFilter) error {
+				_, err := s.DiscoverVirtualCandidates(context.Background(), 1, "profile", "movie:x", filter, VirtualDiscoveryDetail)
+				return err
+			},
+		},
+		{
+			name: "listing only",
+			run: func(s *VirtualCandidatesRefreshService, filter catalog.AccessFilter) error {
+				_, err := s.DiscoverVirtualCandidates(context.Background(), 1, "profile", "movie:x", filter, VirtualDiscoveryListingOnly)
+				return err
+			},
+		},
+		{
+			name: "refresh job",
+			run: func(s *VirtualCandidatesRefreshService, filter catalog.AccessFilter) error {
+				_, err := s.RefreshVirtualCandidates(context.Background(), 1, "profile", "movie:x", filter)
+				return err
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			source := refreshTestSource(7, "movie:x", "virtual://movie/x")
+			detail := refreshTestDetail()
+			detail.Type = "movie"
+			detail.Versions[0].FilePath = "virtual://movie/x?result=default"
+			var warmCalls []warmCall
+			service := &VirtualCandidatesRefreshService{
+				Detail: &fakeRefreshDetail{detail: detail, post: detail},
+				ListCached: VirtualPlaybackStreamListerFunc(func(context.Context, string, int, string, int) ([]VirtualPlaybackStream, error) {
+					return []VirtualPlaybackStream{{ID: "candidate", URI: "virtual://movie/x?result=candidate"}}, nil
+				}),
+				ListFresh: VirtualPlaybackStreamListerFunc(func(context.Context, string, int, string, int) ([]VirtualPlaybackStream, error) {
+					return []VirtualPlaybackStream{{ID: "candidate", URI: "virtual://movie/x?result=candidate"}}, nil
+				}),
+				ContentFiles: func(context.Context, string) ([]*models.MediaFile, error) {
+					return []*models.MediaFile{source}, nil
+				},
+				Persist: func(context.Context, *models.MediaFile, []VirtualPlaybackStream) error {
+					return nil
+				},
+				ScheduleDefaultFileWarm: func(contentID string, fileID int, filter catalog.AccessFilter) {
+					warmCalls = append(warmCalls, warmCall{contentID: contentID, fileID: fileID, filter: filter})
+				},
+			}
+			if err := tc.run(service, catalog.AccessFilter{SelectedFileID: tc.selectedID}); err != nil {
+				t.Fatalf("discovery: %v", err)
+			}
+			if !tc.wantWarm {
+				if len(warmCalls) != 0 {
+					t.Fatalf("warm calls = %+v, want none", warmCalls)
+				}
+				return
+			}
+			if len(warmCalls) != 1 {
+				t.Fatalf("warm calls = %+v, want exactly one", warmCalls)
+			}
+			got := warmCalls[0]
+			if got.contentID != "movie:x" || got.fileID != detail.Versions[0].FileID {
+				t.Fatalf("warm call = %+v, want content movie:x and the resolved default file %d", got, detail.Versions[0].FileID)
+			}
+			if got.filter.SelectedFileID != 0 {
+				t.Fatalf("warm filter selected_file_id = %d, want the detail read's empty selection", got.filter.SelectedFileID)
+			}
+		})
+	}
+}
+
+// TestVirtualCandidatesDiscoveryDoesNotWarmWithoutAResolvedDefault pins that a
+// detail read whose final version list is empty has no default row to warm.
+func TestVirtualCandidatesDiscoveryDoesNotWarmWithoutAResolvedDefault(t *testing.T) {
+	source := refreshTestSource(7, "movie:x", "virtual://movie/x")
+	detail := refreshTestDetail()
+	detail.Type = "movie"
+	detailReader := &fakeRefreshDetail{detail: detail}
+	detailReader.post = &catalog.WatchDetail{Type: "movie"}
+	service := &VirtualCandidatesRefreshService{
+		Detail: detailReader,
+		ListCached: VirtualPlaybackStreamListerFunc(func(context.Context, string, int, string, int) ([]VirtualPlaybackStream, error) {
+			return []VirtualPlaybackStream{{ID: "candidate", URI: "virtual://movie/x?result=candidate"}}, nil
+		}),
+		ContentFiles: func(context.Context, string) ([]*models.MediaFile, error) {
+			return []*models.MediaFile{source}, nil
+		},
+		Persist: func(context.Context, *models.MediaFile, []VirtualPlaybackStream) error {
+			return nil
+		},
+		ScheduleDefaultFileWarm: func(string, int, catalog.AccessFilter) {
+			t.Fatal("a detail with no resolved default must not schedule a warm-up")
+		},
+	}
+	if _, err := service.DiscoverVirtualCandidates(context.Background(), 1, "profile", "movie:x", catalog.AccessFilter{}, VirtualDiscoveryDetail); err != nil {
+		t.Fatalf("discovery: %v", err)
+	}
+}
+
 // TestVirtualCandidatesDiscoverySchedulesProbeAfterPersist pins the ordering
 // the pre-play probe chain depends on: a non-empty discovery persists the
 // listing first and schedules the chain from inside the shared work afterwards.

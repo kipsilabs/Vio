@@ -164,6 +164,16 @@ type VirtualCandidatesRefreshService struct {
 	// same visible default the discovery response offered.
 	// PlaybackHandler.ScheduleDefaultFileProbe implements this.
 	ScheduleDefaultFileProbe func(contentID string, source *models.MediaFile, streams []VirtualPlaybackStream, filter catalog.AccessFilter)
+	// ScheduleDefaultFileWarm, when non-nil, is called after a detail-page
+	// discovery resolves the item's default version, so the provider-side fetch
+	// for the row a play would use starts before the play press. It is the
+	// explicit-selection warm-up entry point with the resolved default file id:
+	// the same fill, admission key, slots, short damper and no-state-write rule.
+	// It is scheduled only for VirtualDiscoveryDetail without an explicit
+	// selection; a selection read is already owned by the watch-detail select
+	// path, and refresh/listing-only runs warm nothing.
+	// PlaybackHandler.ScheduleDefaultFileWarm implements this.
+	ScheduleDefaultFileWarm func(contentID string, fileID int, filter catalog.AccessFilter)
 	// Events, when non-nil, publishes the versions_updated catalog event after a
 	// detail-page discovery persists a listing. Discovery completes detached
 	// from the request that started it (catalog detail does not wait), so
@@ -320,7 +330,37 @@ func (s *VirtualCandidatesRefreshService) listVirtualCandidates(ctx context.Cont
 	if err != nil {
 		return nil, err
 	}
+	// A detail read that resolved the default version should start the same
+	// provider fetch a play would, not wait for the play press. The file id is
+	// the top-sorted row the default-probe target resolves, so the warm uses
+	// the explicit-selection entry point unchanged: same fill, admission key,
+	// slots, damper and no-state-write. An explicit selection is already owned
+	// by the watch-detail select path, so this never schedules a second warm;
+	// listing-only and refresh runs never reach this branch at all.
+	if mode == VirtualDiscoveryDetail && filter.SelectedFileID <= 0 && s.ScheduleDefaultFileWarm != nil {
+		if fileID, ok := defaultVirtualWarmFileID(detail); ok {
+			s.ScheduleDefaultFileWarm(contentID, fileID, filter)
+		}
+	}
 	return detail.Versions, nil
+}
+
+// defaultVirtualWarmFileID returns the top-sorted virtual version a detail read
+// resolved as its default, the same row the default probe chain targets. A
+// local row has no provider fetch to warm, and a detail with no versions has no
+// resolved default, so both report false.
+func defaultVirtualWarmFileID(detail *catalog.WatchDetail) (int, bool) {
+	if detail == nil || len(detail.Versions) == 0 {
+		return 0, false
+	}
+	version := detail.Versions[0]
+	if version.FileID <= 0 {
+		return 0, false
+	}
+	if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(version.FilePath)), virtualPlaybackPrefix) {
+		return 0, false
+	}
+	return version.FileID, true
 }
 
 // RefreshSources force-lists and persists every virtual source of the item
