@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -88,8 +89,69 @@ func TestHandleReplanPlaybackV3DeadSessionFailsFastWithoutReplanSlot(t *testing.
 	}
 }
 
-// A replan for a session that has already ended must return the same fast 404
-// as an unknown session: the attempt row can outlive a finished play, and the
+// The dead-session 404 is the correct fail-fast answer to a client that
+// replanned a session another replica already retired, so it must be accounted
+// for at info. A warning here is what turned a client's ordinary replan loop
+// into operator pages.
+func TestReplanDeadSessionIsLoggedAtInfoNotWarn(t *testing.T) {
+	capture := &levelRecordingHandler{}
+	previous := slog.Default()
+	slog.SetDefault(slog.New(capture))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	manager := playback.NewSessionManager(0, 0)
+	handler := NewPlaybackHandler(manager, testPlaybackFileResolver{file: v3HandlerFixtureFile(t)})
+
+	const sessionID = "22222222-2222-2222-2222-222222222222"
+	const attemptID = "attempt-dead-session-log-0001"
+	if err := handler.PlanStoreV3.SaveAttempt(context.Background(), playback.AttemptRecordV3{
+		SessionID:         sessionID,
+		PlaybackAttemptID: attemptID,
+		UserID:            1,
+		ProfileID:         "profile-1",
+		ExpiresAt:         time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("save attempt: %v", err)
+	}
+
+	base := v3HandlerStartRequest()
+	body, err := json.Marshal(playback.ReplanRequestV3{
+		ProtocolVersion:       playback.ProtocolV3,
+		Operation:             playback.ReplanOperationFailureRecoveryV3,
+		PlaybackAttemptID:     attemptID,
+		ReplanRequestID:       "replan-dead-session-log-0001",
+		FailedPlanID:          "plan-failed-0001",
+		PlanAttemptID:         "plan-attempt-0001",
+		PlanAttemptKey:        "v3:plan-attempt-key-0001",
+		AttemptCount:          1,
+		PositionSeconds:       1,
+		Failure:               playback.FailureV3{Classification: "transcode_start_failed"},
+		Capabilities:          base.Capabilities,
+		ClientPlaybackContext: base.ClientPlaybackContext,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/"+sessionID+"/replan", strings.NewReader(string(body))).
+		WithContext(newAuthorizedPlaybackContext())
+	req = withPlaybackRouteParam(req, "session_id", sessionID)
+	rr := httptest.NewRecorder()
+	handler.HandleReplanPlaybackV3(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want the fast 404; body = %s", rr.Code, rr.Body.String())
+	}
+
+	if !capture.has(slog.LevelInfo, "playback replan answered unchanged") {
+		t.Fatalf("dead-session replan was not accounted for at info; records = %v", capture.messages())
+	}
+	for _, message := range capture.messagesAt(slog.LevelWarn) {
+		if strings.Contains(message, "replan") || strings.Contains(message, "session") {
+			t.Fatalf("dead-session replan logged a warning: %q", message)
+		}
+	}
+}
+
+// A replan for a session that has already ended must return the same fast 404// as an unknown session: the attempt row can outlive a finished play, and the
 // handler must reject it before the slot, mutex, and advisory lock.
 func TestHandleReplanPlaybackV3EndedSessionFailsFastWithoutReplanSlot(t *testing.T) {
 	manager := playback.NewSessionManager(0, 0)

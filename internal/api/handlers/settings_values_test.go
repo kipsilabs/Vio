@@ -883,6 +883,45 @@ func (l settingValuesLibraryLookup) GetByID(_ context.Context, id int) (*models.
 	return &models.MediaFolder{ID: id}, nil
 }
 
+// Resetting a series' subtitle preference is idempotent: the player and the
+// item page's "Auto" clear a per-series language/mode override for every title
+// the viewer touches, and a series that was never overridden already resolves
+// the profile default. Answering 404 there turned a working reset into a
+// failed request on every such title. Other keys keep the 404.
+func TestDeleteValueSubtitlePreferenceIsIdempotent(t *testing.T) {
+	handler, _ := newValuesTestHandler(t)
+
+	for _, test := range []struct{ key, value string }{
+		{settingskeys.PlaybackSubtitleLanguage, `{"value":"ja"}`},
+		{settingskeys.PlaybackSubtitleMode, `{"value":"always"}`},
+	} {
+		t.Run(test.key, func(t *testing.T) {
+			query := "scope=profile_series&series_id=series-1"
+			if rec := routeValues(t, handler, http.MethodDelete, test.key, query, nil); rec.Code != http.StatusNoContent {
+				t.Fatalf("DELETE with nothing stored = %d, want 204: %s", rec.Code, rec.Body.String())
+			}
+			// A stored override still clears normally, and a repeated clear is
+			// still a no-op success.
+			if rec := routeValues(t, handler, http.MethodPut, test.key, query, []byte(test.value)); rec.Code != http.StatusOK {
+				t.Fatalf("PUT = %d: %s", rec.Code, rec.Body.String())
+			}
+			if rec := routeValues(t, handler, http.MethodDelete, test.key, query, nil); rec.Code != http.StatusNoContent {
+				t.Fatalf("DELETE after write = %d, want 204: %s", rec.Code, rec.Body.String())
+			}
+			if rec := routeValues(t, handler, http.MethodDelete, test.key, query, nil); rec.Code != http.StatusNoContent {
+				t.Fatalf("repeated DELETE = %d, want 204: %s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+
+	// The idempotent answer is scoped to the subtitle preferences: every other
+	// key still reports that nothing was set at the addressed scope.
+	if rec := routeValues(t, handler, http.MethodDelete, settingskeys.PlaybackIntroSkipMode,
+		"scope=profile", nil); rec.Code != http.StatusNotFound {
+		t.Fatalf("DELETE of an unset non-subtitle key = %d, want 404: %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestSettingValuesRejectNonexistentLibraryContext(t *testing.T) {
 	handler, store := newValuesTestHandler(t)
 	handler.SetLibraryLookup(settingValuesLibraryLookup{existing: map[int]bool{7: true}})

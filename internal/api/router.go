@@ -1590,6 +1590,11 @@ func newChiRouter(deps Dependencies) chi.Router {
 						ContentFiles: deps.FileRepo.GetByContentID,
 						EpisodeFiles: deps.FileRepo.GetByEpisodeID,
 						Detail:       itemsHandler,
+						// Catalog detail answers from the persisted list and lets
+						// this discovery finish detached, so the persisted listing
+						// must announce itself: the versions_updated event is what
+						// refreshes an open detail page.
+						Events: deps.RealtimeHub,
 					}
 					// The discovery path schedules the pre-play probe chain
 					// after a successful detached persistence. Both sides stay

@@ -45,6 +45,30 @@ func (h *levelRecordingHandler) has(level slog.Level, msg string) bool {
 	return false
 }
 
+// messages lists every captured record message, in arrival order.
+func (h *levelRecordingHandler) messages() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make([]string, 0, len(h.records))
+	for _, record := range h.records {
+		out = append(out, record.Message)
+	}
+	return out
+}
+
+// messagesAt lists the captured messages emitted at exactly level.
+func (h *levelRecordingHandler) messagesAt(level slog.Level) []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var out []string
+	for _, record := range h.records {
+		if record.Level == level {
+			out = append(out, record.Message)
+		}
+	}
+	return out
+}
+
 func TestIsClientCancellation(t *testing.T) {
 	canceledCtx, cancel := context.WithCancel(context.Background())
 	cancel()
