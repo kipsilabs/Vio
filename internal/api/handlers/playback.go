@@ -607,7 +607,21 @@ type PlaybackHandler struct {
 	defaultProbeChains defaultProbeChainAdmission
 	// probeChainWG tracks live pre-play probe chains so tests can wait for
 	// them to settle. Production never waits.
-	probeChainWG            sync.WaitGroup
+	probeChainWG sync.WaitGroup
+	// VirtualReleaseCacheWarmup starts a provider-side fetch for an explicitly
+	// selected virtual release before playback. It is the same fill/listing
+	// call playback start issues (see StreamHandler.VirtualReleaseCacheFiller),
+	// so a selection warms the bytes without inventing a second download path.
+	// Nil disables selection warm-ups while leaving playback fills intact.
+	VirtualReleaseCacheWarmup VirtualReleaseCacheFillFunc
+	// selectedWarmChains admits and deduplicates explicit-selection warm-ups.
+	// Its own instance keeps a warm-up from consuming the probe chain's slots;
+	// the keys are namespaced so a warm and a probe for the same row never
+	// collide. Zero value is ready to use.
+	selectedWarmChains defaultProbeChainAdmission
+	// warmChainWG tracks live selection warm-ups so tests can wait for them to
+	// settle. Production never waits.
+	warmChainWG             sync.WaitGroup
 	VirtualSubtitleSearcher SubtitleSearchTrigger
 	SubtitleSearchInFlight  *sync.Map
 	DeviceCapabilitySource  DeviceCapabilityProfileSource

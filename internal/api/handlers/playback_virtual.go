@@ -1093,8 +1093,9 @@ func (h *PlaybackHandler) runVirtualPrefetchWorker() {
 // cache and the handler best-result cache, and never touches a candidate's
 // media URL (no resolve, no anchor probe, no range fetch, no ffprobe). Opening
 // a ProviderURL can activate the provider (an AltMount Stremio link starts
-// fetching on first access), so any bytes-touching warm must wait for an
-// explicit Play of one candidate.
+// fetching on first access), so a bytes-touching warm belongs to an explicit
+// version selection (ScheduleSelectedFileWarm) or an explicit Play, never to a
+// browse-driven prefetch.
 func (h *PlaybackHandler) prefetchOne(task virtualPrefetchTask) {
 	gate := h.detachedGate()
 	if !gate.tryAcquire() {
