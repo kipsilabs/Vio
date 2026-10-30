@@ -394,6 +394,32 @@ export function buildWatchPageProps({
     profileLanguage,
     showForcedSubtitles,
   });
+  // A pre-play pick names its row by the dense combined ordinal the popover
+  // rendered, not just by descriptors. Resolving it through the signature again
+  // would hand playback the first track whose language and codec match, so two
+  // same-language streams (two German SRT tracks in one release) both start the
+  // first one. The viewer's ordinal is authoritative for the version they chose;
+  // other versions still fall back to the signature for server-side adaptation.
+  const explicitRequestedTrackIndex =
+    request.prePlaySubtitleMode === "explicit" &&
+    requestSubtitleSelection != null &&
+    requestSubtitleSelection.source !== "downloaded" &&
+    requestSubtitleSelection.track_index != null &&
+    requestedVersion != null &&
+    subtitles.some((track) => track.index === requestSubtitleSelection.track_index)
+      ? requestSubtitleSelection.track_index
+      : null;
+  if (explicitRequestedTrackIndex !== null && requestedVersion) {
+    const fileId = requestedVersion.file_id;
+    initialSubtitleTrackIndexes.start[fileId] = explicitRequestedTrackIndex;
+    const requestedTrack =
+      subtitles.find((track) => track.index === explicitRequestedTrackIndex) ?? null;
+    if (requestedTrack && subtitleNeedsBurnIn(requestedTrack)) {
+      initialSubtitleTrackIndexes.bitmap[fileId] = explicitRequestedTrackIndex;
+    } else {
+      delete initialSubtitleTrackIndexes.bitmap[fileId];
+    }
+  }
 
   const intro: PlayerTimeRange | null = item.intro ?? null;
   const credits: PlayerTimeRange | null = item.credits ?? null;

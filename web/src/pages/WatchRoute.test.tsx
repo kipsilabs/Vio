@@ -500,6 +500,61 @@ describe("buildWatchPageProps", () => {
     expect(props.initialBitmapSubtitleTrackIndexByFileId).toEqual({});
   });
 
+  it("starts the exact same-language track the viewer picked, not the first match", () => {
+    // Two German SRT streams with identical codec and title at container
+    // indexes 3 and 4. Only the first is the container default, so a
+    // language/codec signature alone resolves both rows to the first ordinal.
+    const item = makeWatchDetail({
+      versions: [
+        {
+          file_id: 42,
+          resolution: "1080p",
+          codec_video: "h264",
+          codec_audio: "aac",
+          hdr: false,
+          container: "mkv",
+          file_size: 1,
+          duration: 120,
+          bitrate: 8_000,
+          effective_audio_track_index: 0,
+          effective_audio_language: "en",
+          subtitle_tracks: [
+            {
+              index: 3,
+              language: "de",
+              codec: "srt",
+              title: "German",
+              default: true,
+            },
+            { index: 4, language: "de", codec: "srt", title: "German" },
+            { index: 5, language: "en", codec: "srt", title: "English" },
+          ],
+        },
+      ],
+    });
+    const build = (trackIndex: number) =>
+      buildWatchPageProps({
+        request: createWatchRouteRequest({
+          contentId: "movie-1",
+          fileId: 42,
+          prePlaySubtitleMode: "explicit",
+          prePlaySubtitleSelection: {
+            source: "embedded",
+            language: "de",
+            codec: "srt",
+            label: "German",
+            track_index: trackIndex,
+          },
+        }),
+        item,
+        currentProfile: profile,
+      });
+
+    // Dense ordinals follow container order: 3 → 0, 4 → 1, 5 → 2.
+    expect(build(1).initialSubtitleTrackIndexByFileId).toEqual({ 42: 1 });
+    expect(build(0).initialSubtitleTrackIndexByFileId).toEqual({ 42: 0 });
+  });
+
   // An older watch detail omits the version's `subtitle_tracks`, leaving only
   // the item's subtitle rows as menu evidence. Those rows still have to use the
   // shared published-ordinal rule: the server's combined ordinal space is

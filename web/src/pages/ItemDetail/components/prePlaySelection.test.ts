@@ -5,6 +5,7 @@ import {
   formatAudioTrackSummary,
   formatSubtitlePillSummary,
   inferSubtitleFlagsFromTitle,
+  subtitleSelectionEquals,
 } from "./prePlaySelection";
 import type { DownloadedSubtitle, VersionSubtitleTrack } from "@/api/types";
 
@@ -176,5 +177,58 @@ describe("buildPrePlaySubtitleCandidates track_index", () => {
     const byLanguage = new Map(all.map((c) => [c.language, c.selection.track_index]));
     expect(byLanguage.get("de")).toBe(0);
     expect(byLanguage.get("en")).toBe(1);
+  });
+});
+
+describe("subtitleSelectionEquals", () => {
+  // A release carries two German SRT streams at container indexes 3 and 4 with
+  // identical codec and title; only the first is the container default. The
+  // dense combined ordinals are 0 and 1, in container order.
+  const germanTracks: VersionSubtitleTrack[] = [
+    { index: 3, language: "de", codec: "srt", title: "German", default: true },
+    { index: 4, language: "de", codec: "srt", title: "German" },
+    { index: 5, language: "en", codec: "srt", title: "English" },
+  ];
+
+  it("separates same-language rows by their published ordinal", () => {
+    const { embedded } = buildPrePlaySubtitleCandidates(germanTracks, undefined);
+    const germanRows = embedded.filter((row) => row.language === "de");
+    expect(germanRows).toHaveLength(2);
+    expect(germanRows.map((row) => row.selection.track_index)).toEqual([0, 1]);
+    expect(germanRows.map((row) => Boolean(row.default))).toEqual([true, false]);
+
+    // Picking the second German row checks that row only.
+    expect(subtitleSelectionEquals(germanRows[1]?.selection, germanRows[1]?.selection)).toBe(true);
+    expect(subtitleSelectionEquals(germanRows[1]?.selection, germanRows[0]?.selection)).toBe(false);
+    expect(subtitleSelectionEquals(germanRows[0]?.selection, germanRows[1]?.selection)).toBe(false);
+  });
+
+  it("still matches rows whose duplicate collapsed and therefore has no ordinal", () => {
+    const { external } = buildPrePlaySubtitleCandidates(
+      [
+        {
+          index: 1,
+          external: true,
+          language: "en",
+          codec: "srt",
+          file_name: "same.srt",
+          title: "English",
+        },
+        {
+          index: 2,
+          external: true,
+          language: "en",
+          codec: "srt",
+          file_name: "same.srt",
+          title: "English duplicate",
+        },
+      ],
+      undefined,
+    );
+    const withoutOrdinal = external.find((row) => row.selection.track_index == null);
+    expect(withoutOrdinal).toBeDefined();
+    expect(subtitleSelectionEquals(withoutOrdinal?.selection, withoutOrdinal?.selection)).toBe(
+      true,
+    );
   });
 });

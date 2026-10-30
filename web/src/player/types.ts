@@ -215,6 +215,12 @@ export interface PlayerSubtitleInfo {
   source?: "external" | "embedded" | "downloaded";
   forced?: boolean;
   hearing_impaired?: boolean;
+  /**
+   * The inventory marks this stream as the file's default subtitle. Two
+   * same-language streams can differ only here, so the menu badges it instead
+   * of rendering identical rows.
+   */
+  default?: boolean;
   /** Names the track to the subtitle sync operations; absent when it can't be synced. */
   sync_key?: string;
   url: string;
